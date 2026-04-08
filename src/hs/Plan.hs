@@ -44,6 +44,11 @@ import Network.Socket hiding (close)
 import qualified Network.Socket.Internal as NS
 import qualified Network.Socket as NS (close, Socket)
 import qualified Network.Socket.ByteString as NSB
+import qualified Rex.Tree2 as RexTr
+import qualified Rex.Rex as Rex
+import qualified Rex.Error as RexErr
+import qualified Rex.Lex as RexLex
+import qualified Rex.PrintRex as RexPrint
 
 import Types
 import Print
@@ -150,6 +155,134 @@ loadCapsRow _        = []
 loadCap :: Val -> Maybe Int
 loadCap (N i) | i<=maxint = Just (fromIntegral i)
 loadCap _                 = Nothing
+
+-- ── Rex Bindings ─────────────────────────────────────────────────────────────
+
+rexToVal :: Rex.Rex -> Val
+rexToVal = \case
+    Rex.LEAF sp sh s       -> array ["leaf", rexSpanToVal sp, rexLeafShapeToVal sh, N (strNat s)]
+    Rex.NEST sp c r kids   -> array ["nest", rexSpanToVal sp, rexColorToVal c, N (strNat r), array (map rexToVal kids)]
+    Rex.EXPR sp c kids     -> array ["expr", rexSpanToVal sp, rexColorToVal c, array (map rexToVal kids)]
+    Rex.PREF sp r kid      -> array ["pref", rexSpanToVal sp, N (strNat r), rexToVal kid]
+    Rex.TYTE sp r kids     -> array ["tyte", rexSpanToVal sp, N (strNat r), array (map rexToVal kids)]
+    Rex.BLOC sp c r hd xs  -> array ["bloc", rexSpanToVal sp, rexColorToVal c, N (strNat r), rexToVal hd, array (map rexToVal xs)]
+    Rex.OPEN sp r kids     -> array ["open", rexSpanToVal sp, N (strNat r), array (map rexToVal kids)]
+    Rex.JUXT sp kids       -> array ["juxt", rexSpanToVal sp, array (map rexToVal kids)]
+    Rex.HEIR sp kids       -> array ["heir", rexSpanToVal sp, array (map rexToVal kids)]
+
+valToRex :: Val -> Maybe Rex.Rex
+valToRex v = case rexListFromVal v of
+    Just [tag, sp, sh, N s] | tag=="leaf" ->
+        Rex.LEAF <$> rexSpanFromVal sp <*> rexLeafShapeFromVal sh <*> pure (natStr s)
+    Just [tag, sp, c, r, kids] | tag=="nest" ->
+        Rex.NEST <$> rexSpanFromVal sp <*> rexColorFromVal c <*> rexStringFromVal r <*> rexListMap valToRex kids
+    Just [tag, sp, c, kids] | tag=="expr" ->
+        Rex.EXPR <$> rexSpanFromVal sp <*> rexColorFromVal c <*> rexListMap valToRex kids
+    Just [tag, sp, r, kid] | tag=="pref" ->
+        Rex.PREF <$> rexSpanFromVal sp <*> rexStringFromVal r <*> valToRex kid
+    Just [tag, sp, r, kids] | tag=="tyte" ->
+        Rex.TYTE <$> rexSpanFromVal sp <*> rexStringFromVal r <*> rexListMap valToRex kids
+    Just [tag, sp, c, r, hd, xs] | tag=="bloc" ->
+        Rex.BLOC <$> rexSpanFromVal sp <*> rexColorFromVal c <*> rexStringFromVal r <*> valToRex hd <*> rexListMap valToRex xs
+    Just [tag, sp, r, kids] | tag=="open" ->
+        Rex.OPEN <$> rexSpanFromVal sp <*> rexStringFromVal r <*> rexListMap valToRex kids
+    Just [tag, sp, kids] | tag=="juxt" ->
+        Rex.JUXT <$> rexSpanFromVal sp <*> rexListMap valToRex kids
+    Just [tag, sp, kids] | tag=="heir" ->
+        Rex.HEIR <$> rexSpanFromVal sp <*> rexListMap valToRex kids
+    _ -> Nothing
+
+rexSpanToVal :: RexLex.Span -> Val
+rexSpanToVal (RexLex.Span l c o n) = array [N (fromIntegral l), N (fromIntegral c), N (fromIntegral o), N (fromIntegral n)]
+
+rexSpanFromVal :: Val -> Maybe RexLex.Span
+rexSpanFromVal v = do
+    [l, c, o, n] <- rexListFromVal v
+    RexLex.Span <$> rexIntFromVal l <*> rexIntFromVal c <*> rexIntFromVal o <*> rexIntFromVal n
+
+rexColorToVal :: Rex.Color -> Val
+rexColorToVal = \case
+    Rex.PAREN -> "paren"
+    Rex.BRACK -> "brack"
+    Rex.CURLY -> "curly"
+    Rex.CLEAR -> "clear"
+
+rexColorFromVal :: Val -> Maybe Rex.Color
+rexColorFromVal = \case
+    "paren" -> Just Rex.PAREN
+    "brack" -> Just Rex.BRACK
+    "curly" -> Just Rex.CURLY
+    "clear" -> Just Rex.CLEAR
+    _       -> Nothing
+
+rexLeafShapeToVal :: Rex.LeafShape -> Val
+rexLeafShapeToVal = \case
+    Rex.WORD  -> "word"
+    Rex.QUIP  -> "quip"
+    Rex.CORD  -> "cord"
+    Rex.TAPE  -> "tape"
+    Rex.PAGE  -> "page"
+    Rex.SPAN  -> "span"
+    Rex.SLUG  -> "slug"
+    Rex.BAD r -> array ["bad", rexBadReasonToVal r]
+
+rexLeafShapeFromVal :: Val -> Maybe Rex.LeafShape
+rexLeafShapeFromVal = \case
+    "word" -> Just Rex.WORD
+    "quip" -> Just Rex.QUIP
+    "cord" -> Just Rex.CORD
+    "tape" -> Just Rex.TAPE
+    "page" -> Just Rex.PAGE
+    "span" -> Just Rex.SPAN
+    "slug" -> Just Rex.SLUG
+    v                -> do
+        [tag, why] <- rexListFromVal v
+        guard (tag == "bad")
+        Rex.BAD <$> rexBadReasonFromVal why
+
+rexBadReasonToVal :: RexErr.BadReason -> Val
+rexBadReasonToVal = \case
+    RexErr.InvalidChar       -> "invalid-char"
+    RexErr.UnclosedTrad      -> "unclosed-trad"
+    RexErr.UnclosedUgly      -> "unclosed-ugly"
+    RexErr.MismatchedBracket -> "mismatched-bracket"
+    RexErr.InvalidPage       -> "invalid-page"
+    RexErr.InvalidSpan       -> "invalid-span"
+
+rexBadReasonFromVal :: Val -> Maybe RexErr.BadReason
+rexBadReasonFromVal = \case
+    "invalid-char"       -> Just RexErr.InvalidChar
+    "unclosed-trad"      -> Just RexErr.UnclosedTrad
+    "unclosed-ugly"      -> Just RexErr.UnclosedUgly
+    "mismatched-bracket" -> Just RexErr.MismatchedBracket
+    "invalid-page"       -> Just RexErr.InvalidPage
+    "invalid-span"       -> Just RexErr.InvalidSpan
+    _                    -> Nothing
+
+rexStringFromVal :: Val -> Maybe String
+rexStringFromVal (N s) = Just (natStr s)
+rexStringFromVal _     = Nothing
+
+rexListFromVal :: Val -> Maybe [Val]
+rexListFromVal (A (N 0) xs) = Just (V.toList xs)
+rexListFromVal _            = Nothing
+
+rexListMap :: (Val -> Maybe a) -> Val -> Maybe [a]
+rexListMap f v = rexListFromVal v >>= traverse f
+
+rexIntFromVal :: Val -> Maybe Int
+rexIntFromVal (N n) | n <= maxint = Just (fromIntegral n)
+rexIntFromVal _                   = Nothing
+
+parseRex :: Val -> Maybe Val
+parseRex (N src) =
+    case RexTr.parseRex (natStr src) of
+        [(slice, tree)] -> rexToVal <$> Rex.rexFromBlockTree slice tree
+        _               -> Nothing
+parseRex _ = Nothing
+
+printRex :: Val -> Maybe Val
+printRex = fmap (N . strNat . RexPrint.printRex 80) . valToRex
 
 -- ── Actor Ops ─────────────────────────────────────────────────────────────────
 
@@ -295,6 +428,8 @@ collectSubPins = go
     go (L _ m b) = go m <> go b
     go (A f xs)  = go f <> concatMap go (V.toList xs)
     go (N _)     = []
+
+
 
 -- Smart constructor: pretty-print the value, SHA-256 hash it, collect
 -- sub-pins, and wrap in P.
@@ -467,6 +602,9 @@ op 66 ["Init", x]      = case x of A f x | length x==1 -> f
                                    A f x               -> A f (V.init x)
                                    _                   -> N 0
 op 66 ["Equal",x,y] = planBit (x `deepseq` y `deepseq` (x==y))
+
+op 66 ["ParseRex", x] = case parseRex x of Just r -> r; Nothing -> error ("bad rex parse")
+op 66 ["PrintRex", x] = case printRex x of Just r -> r; Nothing -> error ("bad rex print")
 
 op 82 x = unsafePerformIO (rplan x)
 
