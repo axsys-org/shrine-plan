@@ -1,7 +1,11 @@
 {
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+  inputs.rex = {
+    url = "github:sol-plunder/rex";
+    flake = false;
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rex }:
     let
       systems = [
         "x86_64-linux"
@@ -14,20 +18,29 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          ghcEnv = pkgs.haskellPackages.ghcWithPackages (hp: with hp; [
-            text primitive pretty-show containers deepseq
-            optics ghc-prim mtl transformers cryptohash-sha256
-            base58-bytestring vector network
-          ]);
+
+          hsPkgs = pkgs.haskellPackages.override {
+            overrides = hfinal: hprev: {
+              rex = hfinal.callCabal2nix "rex" rex {};
+              plan-assembler = hfinal.callCabal2nix "plan-assembler" ./. {};
+              # if rex.cabal is in a subdir, use:
+              # rex = hfinal.callCabal2nix "rex" (rex + "/subdir") {};
+            };
+          };
         in {
-          default = pkgs.mkShell {
-            packages = [
-              ghcEnv
+          default = hsPkgs.shellFor {
+            packages = hp: [ hp.plan-assembler ];
+            nativeBuildInputs = [
+              hsPkgs.ghcid
+              hsPkgs.stylish-haskell
+              hsPkgs.cabal-install
               pkgs.rlwrap
-              pkgs.haskellPackages.ghcid
-              pkgs.haskellPackages.stylish-haskell
-              pkgs.haskellPackages.cabal-install
             ];
+            # buildInputs = with hsPkgs; [
+            #   text primitive pretty-show containers deepseq
+            #   optics ghc-prim mtl transformers cryptohash-sha256
+            #   base58-bytestring vector network rex
+            # ];
           };
         });
     };
