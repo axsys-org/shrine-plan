@@ -1,7 +1,7 @@
 {
   inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
   inputs.rex = {
-    url = "github:sol-plunder/rex";
+    url = "github:liam-fitzgerald/rex/lf/remove-quip-poems";
     flake = false;
   };
 
