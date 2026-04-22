@@ -9,15 +9,62 @@
 (#bind print (#module print))
 (#import print)
 
-
+(define new-demo "
++  add
+  |  a=nat  b=nat
+  ^  nat
+  %  (if (eq a 0) b)
+  (add (dec a) (inc b))
+  +  add_one
+    |  a=nat
+    ^  nat
+    (inc a)
+  +  add_two
+    |  a=nat
+    ^  nat
+    (inc (inc a))
+    ")
 
 (define demo "
-' test
 +  add
-|  a=nat  b=nat
-^  nat
-%  (if (eq a 0) b)
-(add (dec a) (inc b))")
+  |  a=nat  b=nat
+  ^  nat
+  %  (if b (eq a 0))
+  (add (dec a) (inc b))")
+
+(define types-demo "
++  point
+  $  [x=nat y=nat]
+")
+
+
+
+
+
+(define tvar-demo "
++  maybe
+  '  @ introduces type var
+  @  x
+  '  & is sum type
+  &  [#some x]
+     #none
+  '  functions
+  +  map
+    @  x  y
+    |  f={(maybe x) (maybe y)}
+    ^  (maybe y)
+    ?  a
+      >  [#some v=x]  [#some (f v)]
+      >  #none        #none
+  '  note receiver last to enable currying
+  +  or_else
+    @  x
+    |  def=x  a=(maybe x)
+    ^  x
+    ?  a
+      >  [#some v=x]  v
+      >  'none        def
+  ")
 
 (define pattern-demo "
 ' test
@@ -68,6 +115,7 @@
 (define (id x) x)
 
 (define (get-leaf-str node)
+  (print node)
   assert(Eq "leaf" (_0 node))
   (_3 node))
 
@@ -80,25 +128,40 @@
 
 (define empty (Row 0 0))
 
-
-
-
-
 (define (parse-leaf leaf)
   (cond
     ((str-numeric? leaf) ["lit" "num" (parse-nat leaf)])
-    (else ["ref" leaf])))
+    (else ["ref" [leaf]])))
 
 
 
+
+(define (split-once f x)
+  (define (go acc r[x xs])
+    (Ifz r [(rowify (lflop acc)) 0]
+    (If (f x)
+      [(rowify (lflop acc)) (rowify r)]
+      (go (lcons x acc) xs))))
+  (go 0 (stream x)))
+
+(ParseRex types-demo)
 (define (rex-to-ast r)
-  ;; constructors
+  ;; a heir node implies a rune poem + possible children
+  ;; accumulate until we see a new decl, return [self kids]
+  (define (split-heir xs)
+    (split-once (lambda (x) (or (Eq (_0 x) "open") (Eq (_0 x) "heir"))) xs))
+
+  (define (split-word xs)
+    (split-once (lambda (x) (and (Eq (_0 x) "leaf") (Eq (_2 "word")))) xs))
+  (define (split-decl xs) (split-once (is-rune "+") xs))
+  (define (make-call-direct hed tel) ["call" (rex-to-ast hed) (rex-to-ast tel)])
+
   (define (parse-type-word x)
     (cond ((Eq x "'@") "nat")
           ((Eq x "':") "row")
           ((Eq x "'#") "pin")
           ((Eq x "'$") "fun")
-          (else ["ref" x])))
+          (else ["ref" [x]])))
 
   (define (parse-type-tyte rune kids cont)
     (cond
@@ -113,58 +176,74 @@
           (else ["bad" x])))
 
 
-  ;; cast:  [type val]
-  (define (make-cast hed rest cont)
-    ["cast" (parse-type (_0 hed)) (cont rest)])
+  (define (parse-decl-name x)
+    (define r[name rest] (split-word x))
+    (get-leaf-str name))
 
-  (define (make-func hed rest cont)
-    ["func" (map parse-type hed) (cont rest)])
+  (define (parse-type-bind parse-type-decl kids)
+    assert(Eq (Sz kids) 2)
+    ["bind" (get-leaf-str (_0 kids)) (parse-type-decl (_1 kids))])
 
-  (define (make-call hed rest cont)
-    ; (print ["make-call" hed rest])
-    ["call" (rex-to-ast (_0 hed)) (cont rest)])
-  (define (make-call-direct hed tel)
-    ["call" (rex-to-ast hed) (rex-to-ast tel)])
-  ;; parsers
+  (define (parse-type-decl-tyte parse-type-decl x)
+    (define rune (_2 x))
+    (cond
+      ((Eq rune "=") (parse-type-bind parse-type-decl (_3 x)))
+      (else (error "bad-ty-decl-tyte"))))
 
+  (define (parse-type-decl-expr parse-type-decl brak x)
+    (cond
+      ((Eq "brack" brak)
+        ["row" (map parse-type-decl x)])
+        (else (error "weird-brak"))))
 
-  (define (parse-expr brak kids cont)
+  (define (parse-type-decl x)
+    (define (hd-is y) (Eq (_0 x) y))
+    (cond
+      ((hd-is "expr") (parse-type-decl-expr parse-type-decl (_2 x) (_3 x)))
+      ((hd-is "tyte") (parse-type-decl-tyte parse-type-decl x))
+      ((hd-is "leaf") ["ref" (_3 x)])
+      (else (error [x "wack ast"]))))
+
+  (define (fold-body body[x xs])
+    (define (hd-rune r) (is-rune r x))
+    (define kids)
+    (Ifz body "fold-empty-body"
+      (cond
+        ((hd-rune "$") ["span" (parse-type-decl (_0 (_3 x)))])
+        ((hd-rune "|") ["func" (map parse-type (_3 x)) (fold-body xs)])
+        ((hd-rune "%") ["call" (rex-to-ast (_0 (_3 x))) (fold-body xs)])
+        ((hd-rune "^") ["cast" (parse-type (_0 (_3 x))) (fold-body xs)])
+        (else (rex-to-ast x)))))
+
+  ;; a decl is ["decl" self kids]
+  (define (make-decl x)
+    (define c[name contents] (split-heir x))
+    (define contents-list
+      (If (Eq (_0 (_0 contents)) "heir")
+          (_2 (_0 contents))
+          contents))
+    (define fam[self kids] (split-decl contents-list))
+    ["decl" (parse-decl-name (_0 name))
+     (fold-body (stream self))
+     (map rex-to-ast kids)])
+
+  (define (parse-expr brak kids)
     (cond
       ((Eq "paren" brak)
-        ; (define kids1 (map cont kids))
         (foldl make-call-direct (_0 kids) (drop 1 kids)))
         (else (error "weird-brak"))))
-          ; (If (Eq 2 (Sz kids))
-          ;     (make-call-direct (cont (_0 kids)) (cont (_1 kids)))
-          ;     ; (make-call-direct (cont (_0 kids)) (parse-expr brak (drop 1 kids)
-          ;     (make-call-direct (parse-expr brak (drop 1 kids)
-          ;       cont) (cont (rear kids)))))
-                ; (else "weird brak")))
-  ;;
-  (define (merge-heir els)
-    (If (Eq 0 (Sz els)) "ret"
-      (let ((hed (_0 els)))
-      (cond
-        ((Eq "leaf" (_0 hed)) (merge-heir (drop 1 els)))
-        ((is-rune "+" hed) (make-decl (_3 hed) (drop 1 els) merge-heir))
-        ((is-rune "|" hed) (make-func (_3 hed) (drop 1 els) merge-heir))
-        ((is-rune "^" hed) (make-cast (_3 hed) (drop 1 els) merge-heir))
-        ((is-rune "%" hed) (make-call (_3 hed) (drop 1 els) merge-heir))
-        ((Eq "expr" (_0 hed)) (rex-to-ast hed))
-         (else [(strWeld "untagged" (_0 hed)) els])))))
-        ;; (begin (print ["expr" hed]) (make-call-direct (_3 hed))))
 
-  ;; body
+
+  (define (is-hd x) (Eq (_0 r) x))
   (cond
-    ((Eq "heir" (_0 r)) (merge-heir (_2 r)))
-    ((Eq "slug" (_0 r)) "slug")
-    ((Eq "expr" (_0 r)) (parse-expr (_2 r) (_3 r) rex-to-ast))
-    ((Eq "leaf" (_0 r)) (parse-leaf (get-leaf-str r)))
-    ((Eq "open" (_0 r)) (rune-to-ast (_2 r) (_3 r)))
+    ((is-rune "+" r) (make-decl (_3 r)))
+    ((is-hd "expr") (parse-expr (_2 r) (_3 r)))
+    ((is-hd "leaf") (parse-leaf (get-leaf-str r)))
     (else r)))
 
-; (define (make-context))
-
+(define (parse-ast src)
+  (rex-to-ast (ParseRex src)))
+(print (ParseRex types-demo))
 
 (define y 1)
 (define n 0)
@@ -173,28 +252,23 @@
   (If (Eq count 0) ""
       (strWeld (reap str (Dec count)) str)))
 
-; (define (spaces count) (reap " " count))
-
 (define spaces (reap " "))
-
-
 ;; Maybe
 (define (SOME x) ["some" x])
 (define NONE 0)
 
 (define TYPE "type")
 
-
 (define (TNAT cube) [TYPE "TNAT" cube])
 (define (TSUM opts) [TYPE "TSUM" opts])
-(define THOL  [TYPE "THOL"])
+(define (TQUA name) [TYPE "TQUA" name])
+(define (TNOM ref args) [TYPE "TNOM" ref args])
 (define (TVAR idx) [TYPE "TVAR" idx])
 (define (TFUN args ret) [TYPE "TFUN" (Sz args) args ret])
 ;;
-(define (is-tfun? x) (Eq (_1 x) "TFUN"))
-(define (tfun-ari x) (_2 x))
-(define (tfun-args x) (_3 x))
-(define (tfun-ret x) (_3 x))
+(define (is-tfun? x) (Eq (_1 x) "TFUN")) (define (tfun-ari x) (_2 x))
+(define (tfun-args x) (_3 x)) (define (tfun-ret x) (_4 x))
+
 (define (TFAC fac val) [TYPE "TFAC" fac val])
 (define (TROW vals) [TYPE "TROW" vals])
 (define (TUNI lvl) [TYPE "TUNI" lvl])
@@ -204,64 +278,39 @@
 (define (TBOX val) [TYPE "TBOX" val])
 (define (TARR item) [TYPE "TARR" item])
 
-(define (type-nests? sup sub) y)
-
-(define (type-apply f x)
-  (If (Eq 0 (is-tfun? f))
-      (TBAD ["applying" f x])
-      (If (Eq 1 (tfun-ari f))
-          (If (type-nests? (_0 (tfun-args f) x))
-              (tfun-ret f)
-              (TFUN (drop 1 (tfun-args f)) (tfun-ret f))))))
-
-
-(define ENTRY "ENTRY")
-(define (make-entry key val exp ty) [ENTRY key val exp ty])
-(define bind-key  Ix1) (define set-bind-key  (Up 1))
-(define bind-val  Ix2) (define set-bind-val  (Up 2))
-(define bind-expr Ix3) (define set-bind-expr (Up 3))
-(define bind-ty Ix4) (define set-bind-ty (Up 4))
-(define bind-ns Ix5) (define set-bind-ns (Up 5))
-
-; Subject ::
-; tag=%sut
-; frames=(row frame) ;; outer first, inner last
-; locals=(row local) ;; inner last (de-brujin)
-
-
-(define empty-subject
-  ["SUT" 0 0 TANY ""])
-
-(define (make-ns self tree)
-  ("NS" self tree))
-
 (define ax-self [0])
 (define ax-kid [1])
 (define empty-ax ("AX" 0 0))
 
-(define (print-path x)
-  (foldl strWeld "" (map (cork print-nat (strWeld "/")) x)))
+(define empty-subject
+  ("SUT" empty-ax 0 0 0))
+
+(define subject-loc (Ix 2))
+(define set-subject-loc (Up 2))
+(define sut-tvar (Ix 3))
+(define set-sut-tvar (Up 3))
 
 
+; data Either = Left a | Right
+(define (left x) ("left" x)) (define (right x) ("right" x))
+(define (is-left? x) (Eq (Hd x) "left")) (define (is-right? x) (Eq (Hd x) "right"))
+(define (either-seq f a b) (If (is-left? a) a))
 
-;; setf :: [Nat] -> a -> b
-;; treats nat list as an axis into b, replacing it with a
+;; setf :: [Nat] -> a -> b -> a ; treats nat list as an axis into b, replacing it with a
 (define (setf road new val)
   (Ifz road new
     (snap (_0 road) (setf (drop 1 road) new)) val))
 
 
-
-;; setf :: [Nat] -> (a -> b) -> c
+;; updf :: [Nat] -> (a -> b) -> c -> c
 ;; treats nat list as an axis into c,
 ;; replacing it with the application of the func
-
 (define (updf road f val)
   (Ifz road (f val)
     (snap (_0 road) (lambda (x) (updf (drop 1 road) f x)) val)))
 
-;; setf :: [Nat] -> a
-;; treats nat list as an axis into a returning resulting
+;; get :: [Nat] -> a -> b
+;; treats nat list as an axis into a returning result
 (define (getf road val)
   (Ifz road val
     (getf (drop 1 road) (Ix (_0 road) val))))
@@ -277,17 +326,21 @@ assert(Eq 4 (getf [1] test))
 (define (getax path ax)
   (getf ax-self (dipax path ax)))
 
-(define (gotax path ax)
-  (need (getax path ax)))
+(define (gotax path ax) (need (getax path ax)))
 
-(define (gutax path def ax)
-  (fall def (getax path ax)))
+(define (gutax path def ax) (fall def (getax path ax)))
 
 (define (putax path val ax)
   (Ifz path (setf ax-self (0 val) ax)
     (updf ax-kid
       (lambda (kid)
         (bst-ups (_0 path) empty-ax (putax (drop 1 path) val) kid)) ax)))
+
+(define (mapax f ax)
+  (define ret ("AX"
+    (Ifz (_0 ax) 0 (0 (f (_0 (_0 ax)))))
+    (bst-map (mapax f) (_1 ax))))
+  ret)
 
 ;
 
@@ -298,15 +351,11 @@ assert(Eq 4 (getf [1] test))
     (putax ["baz"] "baz")
     (putax ["foo" "bar" "qux"] "qux")))
 
-; (print test-ax)
 ;
 assert(Eq "test" (gotax ["foo" "bar"] test-ax))
 assert(Eq "foo" (gotax ["foo"] test-ax))
 assert(Eq "baz" (gotax ["baz"] test-ax))
 assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
- ; assert(Eq 1 (gotax [1] test-ax))
- ; assert(Eq 2 (gotax [2] test-ax))
- ; assert(Eq 4 (gotax [1 3 4] test-ax))
 
 
 (define (tapax-go ax here)
@@ -319,60 +368,174 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
       kids)))
   (define rec (recurse (getf ax-kid ax)))
   (Ifz fat rec (lcons [here (_0 fat)] rec)))
-  ; (lweld (Ifz fat 0 (lcons [here (_0 fat)] 0))
-    ; (Seq rec rec)))
-;    (recurse (getf ax-kid ax))))
 
 (define (tapax ax)
   (define ls (tapax-go ax 0))
   ls)
 
-(define (pretty-entry x[k v])
-  (pretty-pair (dtext (print-path k)) (dtext (print-nat v))))
+(define (print-path x)
+  (foldl strWeld "" (map (cork print-nat (strWeld "/")) x)))
 
-(define (pretty-ax ax)
+(define (pretty-kv f x[k v])
+  (pretty-pair (dtext (print-path k)) (f v)))
+
+(define (pretty-ax f ax)
   (define entries (tapax ax))
   (define len (llen entries))
   (define pentries
     (join-with
       (dcat (dtext ", ") dline)
-      (lmap pretty-entry entries)))
+      (lmap (pretty-kv f) entries)))
+  (dgroup (foldl dcat dempty
+    [(dtext "{") (dnest 2 (dcat dline pentries)) dline (dtext "}")])))
+
+(define ENTRY "ENTRY")
+(define (make-entry key val exp ty) [ENTRY key val exp ty])
+(define bind-key  Ix1) (define set-bind-key  (Up 1))
+(define bind-val  Ix2) (define set-bind-val  (Up 2))
+(define bind-expr Ix3) (define set-bind-expr (Up 3))
+(define bind-ty Ix4) (define set-bind-ty (Up 4))
+(define bind-ns Ix5) (define set-bind-ns (Up 5))
+
+
+(define (pretty-kv k v)
+  (dcat
+    (dcat (dtext k) (dcat (dtext "=") softline)) v))
+
+
+(define (pretty-entry ent)
+  (define key (pretty-kv "key" (dtext (print-path (bind-key ent)))))
+  (define val
+    (pretty-kv "val" (dtext (Ifz (bind-val ent) "missing" "exists"))))
+  (define expr
+    (pretty-kv
+      "expr"
+      (dtext (Ifz (bind-expr ent) "missing" "exists"))))
+  (define pentries
+    (join-with (dcat (dtext ", ") dline) (stream [key val expr])))
   (dgroup (foldl dcat dempty
     [(dtext "{") (dnest 2 (dcat dline pentries)) dline (dtext "}")])))
 
 
+(define (print-globals s) (drender 80 ((pretty-ax pretty-entry) (_0 s))))
+
+(define (pretty-subject sut)
+  (dgroup (foldl dcat dempty
+    [(dtext "sut=[")
+     softline
+     (dtext "entries=")
+     softline
+     (pretty-ax (lambda (x) (dtext (print-nat x))) (_0 sut))
+     (dtext "local=")
+     softline
+     (dtext "uimpl")
+   ])))
+
+(define (print-subject sut) (print (drender 80 (pretty-subject sut))))
+
 (define lss (tapax test-ax))
 (define ax-len (llen lss))
 (print (Row 0 4 lss))
-; (print "start")
-; (Seq (foreach print (tapax test-ax)) 0)
-; (print "done")
-(define p-ax (pretty-ax test-ax))
-; (print p-ax)
-(print (drender 80 p-ax))
-
-; assert(0)
 
 
+(define (sut-get-tvar? tvar sut) (find-idx (Eq tvar) (sut-tvar sut)))
+(define (sut-put-tvar tvar sut) (snap 3 (snoc tvar) sut))
+
+(define (get-const name sut) (getax name (_0 sut)))
+(define (got-const name sut) (need (get-const name sut)))
+
+(define (check-type-wf sut x[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (check-type-wf sut))
+  (define (check-tfun-args args)
+    (define res (filter is-left? (map (check-type-wf sut) args)))
+    (Ifz (Sz res) (right 0) (_0 res)))
+  (define (type-and x y) (If (is-left? x) x y))
+  (cond
+    ((tag-is "TVAR")
+     (Ifz (sut-get-tvar? (_2 x)) (left "unbound ty var") (right 0)))
+     ((tag-is "TFUN")
+       (type-and (check-tfun-args (tfun-args x)) (recur (tfun-ret x))))
+     ((tag-is "TNOM") (Ifz (get-const (_2 x) sut) (left "bad type reference")
+         (right 0)))
+     ((tag-is "TFAC") (check-type-wf (_3 x)))
+     ((tag-is "TNAT") (right 0))
+     ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
+     ((tag-is "TSUM") (check-tfun-args (_2 x)))
+     ((tag-is "TROW") (check-tfun-args (_2 x)))
+     (else (print "unhandled") (right 0))))
 
 
-;      (bst- (getf ax-self ax) (_0 path)))))
+(define (subst-type name repl ty[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (subst-type name repl))
+  (cond
+    ((tag-is "TVAR") (If (Eq (_2 ty) name) repl ty))
+    ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+    ((tag-is "TNOM") (TNOM (_2 ty) (map recur (_3 ty))))
+    ((tag-is "TFAC") (TFAC (_2 ty) (recur (_3 ty))))
+    ((tag-is "TNAT") ty)
+    ((tag-is "TQUA") (If (Eq (_2 ty) name) ty (TQUA (_2 ty) (recur (_3 ty)))))
+    ((tag-is "TSUM") (TSUM (map recur (_2 ty))))
+    ((tag-is "TROW") (map recur (_2 ty)))
+    (else (print [ty "unhandled"]) (right 0))))
+
+(define (binder b x) (Eq b (Ix 0 x))) ;
+(define (find-bind-idx b sut) (find-idx (binder b) (rev (Ix 1 sut))))
+
+(define (find-bind-idx-norm b sut) (find-idx (binder b) (Ix 1 sut)))
+
+(define (lookup-name name sut)
+  (define gval[gres] (get-const name sut))
+  (define lval[lres]
+    (If
+      (Eq 1 (Sz name))
+      (find-bind-idx-norm (_0 name) sut)
+      0))
+  (Ifz lval
+       (Ifz gval 0
+         [(bind-ty gres)])
+         (_1 (Ix gres (_1 sut)))))
 
 
+(define (type-nests? sup sub) (or (Eq sup sub) (Eq (_1 sup) "TANY") (Eq (_1 sub) "TANY")))
+(define (ty-match name x) (And (Eq (_1 x) "TVAR") (Eq (_2 x) name)))
+(define (find-tvar name args) (find-idx (ty-match name) args))
 
-
-
-; (define (dip-ns path ns)
-;   (define inner (I))
-;   (Ifz path ns
-;     (dip-ns (drop 1 path) (kid-ns ))
-;
-; (define (dip-ns tree path))
-
+(define (type-apply f x)
+  ;; just try and expand this easy case
+  ;; combined with the UFCS should get 90% of polymorphism
+  (define (type-apply-qua f x)
+    (define name (_2 f))
+    (define fun (_3 f))
+    (define first-arg[idx] (find-tvar name (tfun-args fun)))
+    (define result
+      (subst-type name x fun))
+    (unless
+      (Eq (_1 fun) "TFUN")
+      (TBAD ["too complicated" f x])
+      (Ifz first-arg
+           (TBAD ["failed to resolve polymorphism by arguments, please specify"
+                  f x])
+           (unless (Eq 0 idx)
+             (TBAD ["polymorphism not first arg" f x])
+               (type-apply result x)))))
+  (define (f-hd y) (Eq (_1 f) y))
+  (define (type-apply-fun args ret x)
+    ;(print ["apply fun" args ret x])
+    (If (type-nests? (_0 args) x)
+        (If (Eq 1 (Sz args)) ret
+          (TFUN (drop 1 args) ret))
+        (TBAD ["nest-fail" (_0 args) x])))
+  (cond
+    ((f-hd "TQUA") (type-apply-qua f x))
+    ((f-hd "TFUN") (type-apply-fun (tfun-args f) (tfun-ret f) x))
+    ((f-hd "TBAD") f)
+    (else (TBAD ["weird apply" f x]))))
 
 (define (insert-const name val exp ty sut)
   (define ent (make-entry name val exp ty))
-  (snap 2 (bst-insert name ent) sut))
+  (snap 0 (putax name ent) sut))
 
 (define (insert-const-ty name ty sut)
   (insert-const name 0 0 ty sut))
@@ -384,38 +547,29 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 (define (insert-const-ffi name val ty sut)
   (insert-const name val 0 ty sut))
 
+(define (bizarre-if x pred y) (If pred x y))
 (define if-ty
-  (TFUN [TANY (TNAT 0) (TNAT 0)] (TNAT 0)))
+  (TQUA "a" (TFUN [(TVAR "a") (TNAT 0) (TVAR "a")] (TVAR "a"))))
 
 (define unary-nat-ty (TFUN [(TNAT NONE)] (TNAT NONE)))
+(define binary-nat-ty (TFUN [(TNAT NONE) (TNAT NONE)] (TNAT NONE)))
 (define eq-ty (TFUN [TANY TANY] (TNAT NONE)))
 
 
 (define default-subject
    (pipe empty-subject
-     (insert-const-ty "nat" (TNAT 0))
-     (insert-const-ffi "if" If if-ty)
-     (insert-const-ffi "inc" Inc unary-nat-ty)
-     (insert-const-ffi "dec" Dec unary-nat-ty)
-     (insert-const-ffi "eq" Eq eq-ty)))
-
-
-(define (get-const name sut) (bst-search name (_2 sut)))
-(define (got-const name sut) (_0 (get-const name sut)))
-
-assert(Eq (got-const "if" default-subject) if-ty)
-
-assert(Eq (TNAT NONE) (_0 (get-const "nat" default-subject)))
+     (insert-const-ty ["nat"] (TNAT 0))
+     (insert-const-ffi ["if"] If if-ty)
+     (insert-const-ffi ["inc"] Inc unary-nat-ty)
+     (insert-const-ffi ["dec"] Dec unary-nat-ty)
+     (insert-const-ffi ["eq"] Eq eq-ty)))
 
 (define (get-prod sut)
   (_3 sut))
 
-(define (get-name sut) (_4 sut))
-(define (set-name name sut) (Up 4 name sut))
+(define (get-name sut) (_2 sut))
+(define (set-name name sut) (Up 2 name sut))
 ;
-(define (set-sut-prod prod sut) (Up 3 prod sut))
-
-
 
 (define (V n) ["V_" n]) ;; local ref (de bruijn)
 (define (K v) ["K_" v]) ;; constant
@@ -450,15 +604,15 @@ assert(Eq (TNAT NONE) (_0 (get-const "nat" default-subject)))
 (define (APP f x) ["APP" f x])
 
 
-
-
+; sut -> ast -> [sut IR Ty]
 (define (elaborate sut ast)
-  ; (print ["elaborate" sut ast])
   ;; retrieve type
   (define (get-type node sut-new)
+    (define ret
     (cond
-      ((Eq "ref" (_0 node)) (got-const (_1 node) sut-new))
+      ((Eq "ref" (_0 node)) (bind-ty (got-const (_1 node) sut-new)))
       (else TANY)))
+      (print ["get-type" node ret]) ret)
   (define (put-bind bind t sut-new)
     (bst-insert (_1 bind) (get-type (_2 bind) sut-new) t))
   (define (bind-to-type sut bind)
@@ -468,87 +622,90 @@ assert(Eq (TNAT NONE) (_0 (get-const "nat" default-subject)))
     (define entry [(_2 b) (_3 b)])
     (snap 1 (lambda (x) (weld x [entry])) sut))
 
-  ; (define ex (cork (Eq b) (Ix )))
-  (define (binder b x) ((Eq b) (Ix 0 x)))
 
-;
+  (define (got-bind idx sut) (Ix idx (_1 sut)))
+  (define (elaborate-kids args[x xs] sut)
+    (Ifz args sut
+      (elaborate-kids xs (_0 (elaborate sut x)))))
 
-  (define (find-bind-idx b sut)
-    (find-idx (binder b) (rev (Ix 1 sut))))
-  ;
+  (define (update-self ty sut)
+    (define res[idx] (find-bind-idx-norm (rear (subject-loc sut)) sut))
+    (define old[face old-ty] (Ix idx (_1 sut)))
+    (define new-ty (Up 4 ty old-ty))
+    (define new [face new-ty])
+    (snap 1 (Up idx new) sut))
 
+    ;; -> [sut ty ir]
+  (define (elaborate-decl name body rest sut-new)
+    (define old-loc (subject-loc sut-new))
+    (define loc (Weld (subject-loc sut-new) [name]))
+    (define r[inner-sut decl-ty ir]
+      (elaborate (set-subject-loc loc sut-new) body))
+    (define new-sut
+      (set-subject-loc old-loc (elaborate-kids (stream rest) inner-sut)))
 
-  (define (got-bind idx sut)
-    (Ix idx (_1 sut)))
+    [(insert-const-ir loc ir decl-ty new-sut) decl-ty ir])
 
-  (define (elaborate-decl name rest sut-new)
-    ;; two-pass, fix
-    (define stub (insert-const-ty name TANY sut-new))
-    (define r[inner-sut ir] (elaborate (set-name name stub) rest))
-    [(insert-const-ir name ir (got-const name inner-sut) sut-new) ir])
-
+  ;; -> [sut ty ir]
   (define (elaborate-func args body sut-new)
-    (define name (get-name sut-new))
+    (define name (subject-loc sut-new))
     (define argty (map (bind-to-type sut-new) args))
-    (define selfty (TFAC name TANY))
+    (define selfty (TFAC (rear name) (TFUN argty TANY)))
     (define inner-ty
       (foldl insert-type-bind (insert-type-bind sut-new selfty) argty))
-    (define prod[sut-prod body-ir] (elaborate inner-ty body))
-    (define funty (TFUN argty (get-prod sut-prod)))
+    (define prod[sut-prod prod-ty body-ir] (elaborate inner-ty body))
+    (define funty (TFUN argty prod-ty))
     (define fun-ir
        (F y y y name (Sz argty) body-ir))
-    [(insert-const (get-name sut-new) funty sut-new) fun-ir])
+  [sut-new funty fun-ir])
 
-  ;; todo: typecheck inner
+  ;; todo: this is a fucked up hack to tie the knot
+  ;; probably should just fold call and cast at ast creation
   (define (elaborate-cast ty val sut-new)
-    (define r[s ir] (elaborate sut-new val))
-    (define prod-ty (get-type ty sut-new))
-    ;; assert(nest prod-ty (get-prod s))
-    [(set-sut-prod (get-type ty sut-new) sut-new) ir])
+    (define casted (get-type ty sut-new))
+    (define sut1 (update-self casted sut-new))
+    (define r[s prod-ty ir] (elaborate sut1 val))
+    assert(type-nests? casted prod-ty)
+    [sut-new prod-ty ir])
 
   (define (elaborate-call f x sut-new)
-    (define ef[f-sut fir] (elaborate sut-new f))
-    (define ex[x-sut xir] (elaborate sut-new x))
-    (define fty (get-prod f-sut))
-    (define xty (get-prod x-sut))
+    (define ef[f-sut fty fir] (elaborate sut-new f))
+    (define ex[x-sut xty xir] (elaborate sut-new x))
     (define resty (type-apply fty xty))
     (define resir (A fir xir))
-    [(set-sut-prod resty sut-new) resir])
+    [sut-new resty resir])
 ;
   (define (elaborate-ref face sut-new)
     (define gval[gres] (get-const face sut-new))
-    (define lval (find-bind-idx face sut-new))
-    (cond
-      ((Truth lval) [(set-sut-prod (got-bind lval) sut-new) (V (_0 lval))])
-      ((Truth gval) [(set-sut-prod (bind-ty gres) sut-new) (G gres)])
-      (else [TBAD ["missing-face" face]])))
+    (define lval[idx] (find-bind-idx-norm (rear face) sut-new))
+    (define result[sut ty ir]
+      (cond
+      ((Truth lval) [sut-new (_1 (got-bind idx sut-new)) (V (_0 lval))])
+      ((Truth gval) [sut-new (bind-ty gres) (G gres)])
+      (else (error ["failed ref" face]))))
+    (print ["ref" face ty])
+    result)
+
 
   (define (elaborate-lit tag lit sut-new)
     (cond
       ((Eq tag "num")
         (define ty (TNAT (SOME lit)))
-        [(set-sut-prod ty sut-new) (K lit)])
+        [sut-new ty (K lit)])
       (else (error "wack"))))
-
   (cond
-    ((Eq "decl" (_0 ast))
-      (elaborate-decl (get-decl-name ast) (get-decl-rest ast) sut))
-    ((Eq "func" (_0 ast))
-      (elaborate-func (_1 ast) (_2 ast) sut))
-    ((Eq "func" (_0 ast))
-      (elaborate-func (_1 ast) (_2 ast) sut))
-    ((Eq "cast" (_0 ast))
-      (elaborate-cast (_1 ast) (_2 ast) sut))
+    ((Eq "decl" (_0 ast)) (elaborate-decl (_1 ast) (_2 ast) (_3 ast) sut))
+    ((Eq "func" (_0 ast)) (elaborate-func (_1 ast) (_2 ast) sut))
+    ((Eq "func" (_0 ast)) (elaborate-func (_1 ast) (_2 ast) sut))
+    ((Eq "cast" (_0 ast)) (elaborate-cast (_1 ast) (_2 ast) sut))
     ((Eq "call" (_0 ast))
       (If (Gt (Sz ast) 3)
         (error ["bad call"])
       (elaborate-call (_1 ast) (_2 ast) sut)))
-    ((Eq "ref" (_0 ast))
-      (elaborate-ref (_1 ast) sut))
-    ((Eq "lit" (_0 ast))
-      (elaborate-lit (_1 ast) (_2 ast) sut))
-    (else
-      (begin (print ["ast" ast]) [(set-sut-prod TBAD sut) 0]))))
+    ((Eq "ref" (_0 ast)) (elaborate-ref (_1 ast) sut))
+    ((Eq "lit" (_0 ast)) (elaborate-lit (_1 ast) (_2 ast) sut))
+    (else (error ["ast" ast]))))
+
 
 ;; ====== CODEGEN =======
 
@@ -901,29 +1058,29 @@ assert(Eq (Law 1 "rec" 0)
     (_1 bod)
     (compile-dummy-function res 0)))
 
-
-
-
-
-
-;(print (ParseRex demo))
-(print (rex-to-ast (ParseRex demo)))
 (define elab (elaborate default-subject (rex-to-ast (ParseRex demo))))
-(define result (compile-expr (_1 elab)))
+; (define result (compile-expr (_2 elab)))
+
+(define (compile-sut sut src)
+  (define ast (rex-to-ast (ParseRex src)))
+  (define res[nex ty ir] (elaborate sut ast))
+  (Up 0 (mapax
+    (lambda (entry)
+      (define plan (compile-expr (bind-expr entry)))
+      (define ret (set-bind-val plan entry))
+      ret) (_0 nex)) nex))
 
 (define (compile-cairn src)
   (define ast (rex-to-ast (ParseRex src)))
-  (define sut (elaborate default-subject ast))
-  (define result (compile-expr (_1 sut)))
+  (define res[sut ty ir] (elaborate default-subject ast))
+  (define result (compile-expr (_2 sut)))
   result)
-(define result-two (compile-cairn demo))
-
-(print demo)
-(print result)
-(print (result 3 4))
-(print "test")
+(define result-two (compile-sut default-subject demo))
 
 (#export
+ parse-ast
+ types-demo
+ new-demo
   demo
   mk-doccord
   rune-to-ast
@@ -956,11 +1113,13 @@ assert(Eq (Law 1 "rec" 0)
   insert-const
   default-subject
   get-const
-  get-prod
   get-name
   set-name
-  compile-cairn
+  result-two
+  ;compile-cairn
   test-ax
   print-path
-  set-sut-prod)
+  getax
+  putax
+  )
 
