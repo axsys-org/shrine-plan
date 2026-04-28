@@ -117,7 +117,6 @@
 (define (id x) x)
 
 (define (get-leaf-str node)
-  (print node)
   assert(Eq "leaf" (_0 node))
   (_3 node))
 
@@ -203,7 +202,7 @@
     (cond
       ((hd-is "expr") (parse-type-decl-expr parse-type-decl (_2 x) (_3 x)))
       ((hd-is "tyte") (parse-type-decl-tyte parse-type-decl x))
-      ((hd-is "leaf") ["ref" (_3 x)])
+      ((hd-is "leaf") ["ref" [(_3 x)]])
       (else (error [x "wack ast"]))))
 
       ;; % (f x)  y -> (f x y)
@@ -256,8 +255,7 @@
     ((is-hd "leaf") (parse-leaf (get-leaf-str r)))
     (else r)))
 
-(define (parse-ast src)
-  (rex-to-ast (ParseRex src)))
+(define (parse-ast src) (rex-to-ast (ParseRex src)))
 (print (parse-ast demo))
 
 ; assert(0)
@@ -276,11 +274,17 @@
 
 (define TYPE "type")
 
+;; natural, optionally constant
 (define (TNAT cube) [TYPE "TNAT" cube])
+;; sum type
 (define (TSUM opts) [TYPE "TSUM" opts])
-(define (TQUA name) [TYPE "TQUA" name])
+;; qualify name in body
+(define (TQUA name body) [TYPE "TQUA" name body])
+;; nominal reference, possibly applied
 (define (TNOM ref args) [TYPE "TNOM" ref args])
+;; type variable
 (define (TVAR idx) [TYPE "TVAR" idx])
+;;
 (define (TFUN args ret) [TYPE "TFUN" (Sz args) args ret])
 ;;
 (define (is-tfun? x) (Eq (_1 x) "TFUN")) (define (tfun-ari x) (_2 x))
@@ -291,6 +295,7 @@
 (define (TUNI lvl) [TYPE "TUNI" lvl])
 (define (TPIN box) [TYPE "TPIN" box])
 (define TANY [TYPE "TANY"])
+(define (TTYP typ) [TYPE "TTYP" typ])
 (define TBAD [TYPE "TBAD"])
 (define (TBOX val) [TYPE "TBOX" val])
 (define (TARR item) [TYPE "TARR" item])
@@ -406,13 +411,20 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
   (dgroup (foldl dcat dempty
     [(dtext "{") (dnest 2 (dcat dline pentries)) dline (dtext "}")])))
 
-(define ENTRY "ENTRY")
-(define (make-entry key val exp ty) [ENTRY key val exp ty])
+(define VAL "VAL")
+(define DECL "DECL")
+
+(define (make-val key val exp ty) [VAL key val exp ty])
+(define (make-decl key params val) [DECL key params val])
 (define bind-key  Ix1) (define set-bind-key  (Up 1))
 (define bind-val  Ix2) (define set-bind-val  (Up 2))
 (define bind-expr Ix3) (define set-bind-expr (Up 3))
 (define bind-ty Ix4) (define set-bind-ty (Up 4))
-(define bind-ns Ix5) (define set-bind-ns (Up 5))
+(define bind-type-decl Ix5) (define set-bind-ty-decl (Up 5))
+
+(define (bind-span x)
+  (define ty[_ tag val] (bind-ty x))
+  (If (Eq tag "TTYP") val 0))
 
 
 (define (pretty-kv k v)
@@ -460,6 +472,15 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 
 (define (get-const name sut) (getax name (_0 sut)))
 (define (got-const name sut) (need (get-const name sut)))
+(define (get-span name sut)
+  (define entry (get-const name sut))
+  (Ifz entry 0
+    (bind-span (_0 entry))))
+
+(define (got-span name sut)
+  (define res (get-span name sut))
+  (Ifz res (error ["bad span lookup" name sut])
+    res))
 
 (define (check-type-wf sut x[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -553,7 +574,7 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
     (else (TBAD ["weird apply" f x])))))
 
 (define (insert-const name val exp ty sut)
-  (define ent (make-entry name val exp ty))
+  (define ent (make-val name val exp ty))
   (snap 0 (putax name ent) sut))
 
 (define (insert-const-ty name ty sut)
@@ -562,6 +583,8 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 (define (insert-const-ir name exp ty sut)
   (insert-const name 0 exp ty sut))
 
+(define (insert-const-type name ty sut)
+  (insert-const name 0 0 (TTYP ty) sut))
 
 (define (insert-const-ffi name val ty sut)
   (insert-const name val 0 ty sut))
@@ -577,7 +600,7 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 
 (define default-subject
    (pipe empty-subject
-     (insert-const-ty ["nat"] (TNAT 0))
+     (insert-const-ty ["nat"] (TTYP (TNAT 0)))
      (insert-const-ffi ["if"] If if-ty)
      (insert-const-ffi ["inc"] Inc unary-nat-ty)
      (insert-const-ffi ["dec"] Dec unary-nat-ty)
@@ -622,21 +645,26 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 (define (VAR n) ["VAR" n])
 (define (APP f x) ["APP" f x])
 
+(define (resolve-type sut tyast)
+  (define (tag-is x) (Eq (_0 tyast) x))
+  (cond
+    ((tag-is "ref") (got-span (_1 tyast) sut))
+    ((tag-is "bind") (TFAC (_1 tyast) (resolve-type sut (_2 tyast))))
+    ((tag-is "row") (TROW (map (resolve-type sut) (drop 1 tyast))))
+
+    (else
+      (error ["bad type ast" tyast]))))
+
+
+
 
 ; sut -> ast -> [sut IR Ty]
 (define (elaborate sut ast)
   ;; retrieve type
-  (define (get-type node sut-new)
-    (define ret
-    (cond
-      ((Eq "ref" (_0 node)) (bind-ty (got-const (_1 node) sut-new)))
-      (else TANY)))
-      (print ["get-type" node ret]) ret)
-  (define (put-bind bind t sut-new)
-    (bst-insert (_1 bind) (get-type (_2 bind) sut-new) t))
+  (define (put-bind bind t sut)
+    (bst-insert (_1 bind) (resolve-type sut (_2 bind)) t))
   (define (bind-to-type sut bind)
-    (TFAC (_1 bind) (get-type (_2 bind) sut)))
-
+    (TFAC (_1 bind) (resolve-type sut (_2 bind))))
   (define (insert-type-bind sut b)
     (define entry [(_2 b) (_3 b)])
     (snap 1 (lambda (x) (weld [entry] x)) sut))
@@ -654,72 +682,74 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
     (define new [face new-ty])
     (snap 1 (Up idx new) sut))
 
-    ;; -> [sut ty ir]
-  (define (elaborate-decl name body rest sut-new)
-    (define old-loc (subject-loc sut-new))
-    (define loc (Weld (subject-loc sut-new) [name]))
-    (define r[inner-sut decl-ty ir]
-      (elaborate (set-subject-loc loc sut-new) body))
-    (define new-sut
-      (set-subject-loc old-loc (elaborate-kids (stream rest) inner-sut)))
-
-    [(insert-const-ir loc ir decl-ty new-sut) decl-ty ir])
 
   ;; -> [sut ty ir]
-  (define (elaborate-func args body sut-new)
-    (define name (subject-loc sut-new))
-    (define argty (map (bind-to-type sut-new) args))
-    (define selfty (TFAC (rear name) (TFUN argty TANY)))
-    (define inner-ty
-      (foldl insert-type-bind (insert-type-bind sut-new selfty) argty))
-    (define prod[sut-prod prod-ty body-ir] (elaborate inner-ty body))
-    (define funty (TFUN argty prod-ty))
-    (define fun-ir
-       (F y y y name (Sz argty) body-ir))
-  [sut-new funty fun-ir])
-
-  ;; todo: this is a fucked up hack to tie the knot
-  ;; probably should just fold call and cast at ast creation
-  (define (elaborate-cast ty val sut-new)
-    (define casted (get-type ty sut-new))
-    (define sut1 (update-self casted sut-new))
-    (define r[s prod-ty ir] (elaborate sut1 val))
-    assert(type-nests? casted prod-ty)
-    [sut-new prod-ty ir])
-
-  (define (fold-app f xs)
-    (Ifz xs f
-      (fold-app (A f (_0 xs)) (drop 1 xs))))
-
-  (define (elaborate-call f xs sut-new)
-    (print ["f" f])
-    (print ["xs" xs])
-    (define ef[f-sut fty fir] (elaborate sut-new f))
-    (define exs (map (elaborate sut-new) xs))
-    (define resty (type-apply fty (map Ix1 exs)))
-    (define resir (fold-app fir (map Ix2 exs)))
-    [sut-new resty resir])
-;
-  (define (elaborate-ref face sut-new)
-    (define gval[gres] (get-const face sut-new))
-    (define lval[idx] (find-bind-idx-norm (rear face) sut-new))
-    (define result[sut ty ir]
-      (cond
-      ((Truth lval) [sut-new (_1 (got-bind idx sut-new)) (V (_0 lval))])
-      ((Truth gval) [sut-new (bind-ty gres) (G gres)])
-      (else (error ["failed ref" face]))))
-    (print ["ref" face ty])
-    result)
 
 
-  (define (elaborate-lit tag lit sut-new)
+  (define (elaborate-span sut span[tag one two tri])
+    (define (tag-is x) (Eq tag x))
+    (define (on-row items)
+      (TROW (map (elaborate-span sut) items)))
+    (define (on-bind name ty)
+      (TFAC name (elaborate-span sut ty)))
     (cond
-      ((Eq tag "num")
-        (define ty (TNAT (SOME lit)))
-        [sut-new ty (K lit)])
-      (else (error "wack"))))
-  (cond
-    ((Eq "decl" (_0 ast)) (elaborate-decl (_1 ast) (_2 ast) (_3 ast) sut))
+      ((tag-is "row") (on-row one))
+      ((tag-is "bind") (on-bind one two))
+      ((tag-is "ref") (got-span one sut))
+      (else (error ["bad type" span]))))
+
+  ;; returns [sut ty ir]
+  (define (elaborate-val sut ast)
+    (define (elaborate-func args body sut-new)
+      (define name (subject-loc sut-new))
+      (define argty (map (bind-to-type sut-new) args))
+      (define selfty (TFAC (rear name) (TFUN argty TANY)))
+      (define inner-ty
+        (foldl insert-type-bind (insert-type-bind sut-new selfty) argty))
+      (define prod[sut-prod prod-ty body-ir] (elaborate-val inner-ty body))
+      (define funty (TFUN argty prod-ty))
+      (define fun-ir
+         (F y y y name (Sz argty) body-ir))
+      [sut-new funty fun-ir])
+
+    ;; todo: this is a fucked up hack to tie the knot
+    ;; probably should just fold call and cast at ast creation
+    (define (elaborate-cast ty val sut-new)
+      (define casted (resolve-type sut-new ty))
+      (define sut1 (update-self casted sut-new))
+      (define r[s prod-ty ir] (elaborate-val sut1 val))
+      assert(type-nests? casted prod-ty)
+      [sut-new prod-ty ir])
+
+    (define (fold-app f xs)
+      (Ifz xs f
+        (fold-app (A f (_0 xs)) (drop 1 xs))))
+
+    (define (elaborate-call f xs sut-new)
+      (define ef[f-sut fty fir] (elaborate-val sut-new f))
+      (define exs (map (elaborate-val sut-new) xs))
+      (define resty (type-apply fty (map Ix1 exs)))
+      (define resir (fold-app fir (map Ix2 exs)))
+      [sut-new resty resir])
+  ;
+    (define (elaborate-ref face sut-new)
+      (define gval[gres] (get-const face sut-new))
+      (define lval[idx] (find-bind-idx-norm (rear face) sut-new))
+      (define result[sut ty ir]
+        (cond
+        ((Truth lval) [sut-new (_1 (got-bind idx sut-new)) (V (_0 lval))])
+        ((Truth gval) [sut-new (bind-ty gres) (G gres)])
+        (else (error ["failed ref" face]))))
+      result)
+
+    (define (elaborate-lit tag lit sut-new)
+      (cond
+        ((Eq tag "num")
+          (define ty (TNAT (SOME lit)))
+          [sut-new ty (K lit)])
+        (else (error "wack"))))
+
+    (cond
     ((Eq "func" (_0 ast)) (elaborate-func (_1 ast) (_2 ast) sut))
     ((Eq "func" (_0 ast)) (elaborate-func (_1 ast) (_2 ast) sut))
     ((Eq "cast" (_0 ast)) (elaborate-cast (_1 ast) (_2 ast) sut))
@@ -729,6 +759,37 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
       (elaborate-call (_1 ast) (drop 2 ast) sut)))
     ((Eq "ref" (_0 ast)) (elaborate-ref (_1 ast) sut))
     ((Eq "lit" (_0 ast)) (elaborate-lit (_1 ast) (_2 ast) sut))
+    (else (error ["bad val elab" ast]))))
+
+
+  (define (elaborate-val-decl body sut)
+    (define r[inner-sut decl-ty ir]
+      (elaborate-val sut body))
+    (insert-const-ir (subject-loc sut) ir decl-ty sut))
+
+  (define (elaborate-span-decl body sut-new)
+    (define span (elaborate-span sut-new body))
+    (print ["span" span])
+    (insert-const-type (subject-loc sut-new) span sut-new))
+
+    ;; -> [sut ty ir]
+  (define (elaborate-decl name body[tag] rest sut-new)
+    (print ["decl" name body])
+    (define old-loc (subject-loc sut-new))
+    (define loc (Weld (subject-loc sut-new) [name]))
+    (define sut-loc (set-subject-loc loc sut-new))
+    (define inner-sut
+      (If (Eq tag "span")
+        (elaborate-span-decl (_1 body) sut-loc)
+        (elaborate-val-decl body sut-loc)))
+    (set-subject-loc old-loc (elaborate-kids (stream rest) inner-sut)))
+
+
+
+
+  (print ast)
+  (cond
+    ((Eq "decl" (_0 ast)) (elaborate-decl (_1 ast) (_2 ast) (_3 ast) sut))
     (else (error ["ast" ast]))))
 
 
@@ -1090,21 +1151,24 @@ assert(Eq (Law 1 "rec" 0)
 
 (define (compile-sut sut src)
   (define ast (rex-to-ast (ParseRex src)))
-  (define res[nex ty ir] (elaborate sut ast))
+  (define res (elaborate sut ast))
   (Up 0 (mapax
     (lambda (entry)
       (define plan (compile-expr (bind-expr entry)))
       (define ret (set-bind-val plan entry))
-      ret) (_0 nex)) nex))
+      (print ["entry" entry ret])
+      ret) (_0 res)) res))
 
 (define (compile-cairn src)
   (define ast (rex-to-ast (ParseRex src)))
   (define res[sut ty ir] (elaborate default-subject ast))
   (define result (compile-expr (_2 sut)))
   result)
+
 (define result-two (compile-sut default-subject demo))
 
 (#export
+ compile-sut
  parse-ast
  types-demo
  new-demo
@@ -1148,5 +1212,6 @@ assert(Eq (Law 1 "rec" 0)
   print-path
   getax
   putax
+  elaborate
   )
 
