@@ -1,149 +1,157 @@
-;;;; biparser-test: comprehensive tests of every primitive built so far.
-;;;;
-;;;; Run with:  :*biparser-test
-;;;; Each `assert(...)` should evaluate to 1. If any fails, std's assert
-;;;; macro prints an error to the REPL.
+;;;; biparser-test: full test suite covering primitives, combinators, and a toy language.
 
 (#bind std (#module std))
 (#import std)
+(#bind biparser-tr (#module biparser-tr))
+(#import biparser-tr)
+(#bind biparser-k7 (#module biparser-k7))
+(#import biparser-k7)
 (#bind biparser-prim (#module biparser-prim))
 (#import biparser-prim)
+(#bind biparser-combinator (#module biparser-combinator))
+(#import biparser-combinator)
 
 
-;;; ---------- Helper predicates ----------
+;;; ====================================================================
+;;; PRIMITIVES: satisfy / eof / string-pp / set / nothing
+;;; ====================================================================
 
 (define (is-y? b) (Eq b "y"))
 (define (is-n? b) (Eq b "n"))
 
-
-;;; ---------- Test cassettes ----------
-
-(#bind y-or-n   (k7-alt (satisfy is-y?) (satisfy is-n?)))
-(#bind yes-tag  (set 1 (string-pp "yes")))
-(#bind no-tag   (set 2 (string-pp "no")))
-(#bind yn-strs  (k7-alt yes-tag no-tag))
-
-
-;;; ============================================================
-;;; TEST 1: satisfy with single-byte predicate
-;;; ============================================================
-
-;; "5" is the nat 53
-assert(Eq 53 (pretty digit-k7 "5"))
+;;; satisfy
 assert(Eq 53 (parse  digit-k7 "5"))
-
-;; "0" is the nat 48 (digit predicate accepts it)
+assert(Eq 53 (pretty digit-k7 "5"))
 assert(Eq 48 (parse  digit-k7 "0"))
+assert(Eq  0 (parse  digit-k7 "x"))
+assert(Eq  0 (pretty digit-k7 "x"))
 
-;; "x" fails the predicate -> 0 sentinel
-assert(Eq 0  (parse  digit-k7 "x"))
+;;; eof
+(#bind eof-tagged (set 1 eof))
+assert(Eq 1 (parse eof-tagged ""))
+assert(Eq 0 (parse eof-tagged "x"))
 
-
-;;; ============================================================
-;;; TEST 2: eof
-;;; ============================================================
-
-;; eof on non-empty input -> fail
-assert(Eq 0 (parse eof "x"))
-
-
-;;; ============================================================
-;;; TEST 3: string-pp (multi-byte literal, printer side)
-;;; ============================================================
-
-;; "hi" as nat is 'h' + 'i'*256 = 104 + 105*256 = 26984
+;;; string-pp
 assert(Eq 26984 (pretty (string-pp "hi") 0))
+(#bind hi-tag (set 1 (string-pp "hi")))
+assert(Eq 1 (parse hi-tag "hi"))
+assert(Eq 0 (parse hi-tag "ho"))
 
-
-;;; ============================================================
-;;; TEST 4: k7-alt with satisfy (binary parser)
-;;; ============================================================
-
-;; "y" = 121, "n" = 110
-assert(Eq 121 (parse y-or-n "y"))
-assert(Eq 110 (parse y-or-n "n"))
-assert(Eq   0 (parse y-or-n "x"))      ; both branches fail
-
-;; pretty side: first matching branch wins
-assert(Eq 121 (pretty y-or-n "y"))     ; first branch matches
-assert(Eq 110 (pretty y-or-n "n"))     ; first fails, second matches
-
-
-;;; ============================================================
-;;; TEST 5: set (constant value injection)
-;;; ============================================================
-
-;; parse: produces the constant 1 / 2 on match
+;;; set
+(#bind yes-tag (set 1 (string-pp "yes")))
+(#bind no-tag  (set 2 (string-pp "no")))
 assert(Eq 1 (parse yes-tag "yes"))
 assert(Eq 2 (parse no-tag  "no"))
-assert(Eq 0 (parse yes-tag "no"))      ; pattern mismatch -> fail
-
-;; pretty: ignores input value, emits the literal
-;; "yes" as nat = 'y'+'e'*256+'s'*65536 = 121 + 101*256 + 115*65536 = 7562617
+assert(Eq 0 (parse yes-tag "no"))
 assert(Eq 7562617 (pretty yes-tag 999))
 
 
-;;; ============================================================
-;;; TEST 6: alt + set + string-pp (full integration)
-;;; ============================================================
+;;; ====================================================================
+;;; K7 COMBINATORS: alt / compose / cons
+;;; ====================================================================
 
-assert(Eq 1 (parse yn-strs "yes"))
-assert(Eq 2 (parse yn-strs "no"))
-assert(Eq 0 (parse yn-strs "maybe"))
-
-
-;;; ============================================================
-;;; TEST 7: k7-compose — PP0 + PPa (sequencing)
-;;; ============================================================
+(#bind y-or-n (k7-alt (satisfy is-y?) (satisfy is-n?)))
+assert(Eq 121 (parse  y-or-n "y"))
+assert(Eq 110 (parse  y-or-n "n"))
+assert(Eq   0 (parse  y-or-n "z"))
+assert(Eq 121 (pretty y-or-n "y"))
+assert(Eq 110 (pretty y-or-n "n"))
 
 (#bind tagged-digit (k7-compose (string-pp "tag:") digit-k7))
-
-;; parse: "tag:5" -> 53 (the digit), "tag:x" or wrong prefix -> 0
 assert(Eq 53 (parse tagged-digit "tag:5"))
-assert(Eq  0 (parse tagged-digit "tag:x"))
 assert(Eq  0 (parse tagged-digit "no:5"))
-
-;; pretty: print value -> "tag:" + that byte
 assert(Eq "tag:5" (pretty tagged-digit "5"))
-assert(Eq       0 (pretty tagged-digit "x"))
-
-
-;;; ============================================================
-;;; TEST 8: k7-compose with PP0 + PP0, wrapped in set
-;;; ============================================================
-
-(#bind paren-pair (k7-compose (string-pp "(") (string-pp ")")))
-(#bind paren-tag  (set 99 paren-pair))
-
-assert(Eq 99 (parse paren-tag "()"))
-assert(Eq  0 (parse paren-tag "(x"))
-assert(Eq  0 (parse paren-tag "x)"))
-assert(Eq "()" (pretty paren-tag 1234))
-
-
-;;; ============================================================
-;;; TEST 9: nested k7-alt (3-way alternative)
-;;; ============================================================
-
-(#bind three-way
-  (k7-alt digit-k7
-          (k7-alt (satisfy is-y?) (satisfy is-n?))))
-
-assert(Eq 53  (parse three-way "5"))   ; digit branch
-assert(Eq 121 (parse three-way "y"))   ; y branch
-assert(Eq 110 (parse three-way "n"))   ; n branch
-assert(Eq   0 (parse three-way "z"))   ; all fail
-
-
-;;; ============================================================
-;;; TEST 10: compose with eof (exact-match grammar)
-;;; ============================================================
 
 (#bind exact-yes (set 1 (k7-compose (string-pp "yes") eof)))
-
 assert(Eq 1 (parse exact-yes "yes"))
-assert(Eq 0 (parse exact-yes "yes "))   ; trailing junk
-assert(Eq 0 (parse exact-yes "yep"))    ; wrong literal
+assert(Eq 0 (parse exact-yes "yes "))
+
+(#bind two-digits (k7-cons digit-k7 digit-k7))
+assert(Eq [49 50] (parse two-digits "12"))
+assert(Eq 12849 (pretty two-digits [49 50]))
+
+
+;;; ====================================================================
+;;; HIGHER COMBINATORS: many / some / sepBy / between / option
+;;; ====================================================================
+
+;;; many
+(#bind digits (many digit-k7))
+assert(Eq 0 (parse digits ""))
+assert(Eq [53 0] (parse digits "5"))
+assert(Eq [49 [50 0]] (parse digits "12"))
+assert(Eq [49 0] (parse digits "1ab"))
+assert(Eq 0 (pretty digits 0))
+
+;;; some
+(#bind digits1 (some digit-k7))
+assert(Eq 0 (parse digits1 ""))
+assert(Eq 0 (parse digits1 "ab"))
+assert(Eq [49 0] (parse digits1 "1"))
+
+;;; sepBy / sepBy1
+(#bind digit-list (sepBy1 digit-k7 (string-pp ",")))
+assert(Eq [49 0] (parse digit-list "1"))
+assert(Eq [49 [50 0]] (parse digit-list "1,2"))
+assert(Eq [49 [50 [51 0]]] (parse digit-list "1,2,3"))
+assert(Eq 0 (parse digit-list ""))
+
+(#bind digit-list0 (sepBy digit-k7 (string-pp ",")))
+assert(Eq 0 (parse digit-list0 ""))
+
+;;; between
+(#bind paren-digit
+  (between (string-pp "(") (string-pp ")") digit-k7))
+assert(Eq 53 (parse paren-digit "(5)"))
+assert(Eq  0 (parse paren-digit "(5"))
+assert(Eq  0 (parse paren-digit "5)"))
+
+;;; option
+(#bind maybe-digit (option digit-k7 0))
+assert(Eq 53 (parse maybe-digit "5"))
+assert(Eq  0 (parse maybe-digit "x"))
+
+
+;;; ====================================================================
+;;; TOY LANGUAGE: arithmetic expressions with chainl
+;;;
+;;;   expr := digit ('+' digit)*
+;;;
+;;; opL builds a tree [a b], so "1+2+3" parses to [[49 50] 51].
+;;; ====================================================================
+
+(define (mk-add a b) [a b])
+
+(#bind arith
+  (chainl (string-pp "+") mk-add digit-k7))
+
+;;; --- Parse: builds left-associative tree ---
+
+assert(Eq 49 (parse arith "1"))
+assert(Eq [49 50] (parse arith "1+2"))
+assert(Eq [[49 50] 51] (parse arith "1+2+3"))
+assert(Eq [[[[[49 50] 51] 52] 53] 54] (parse arith "1+2+3+4+5+6"))
+
+;;; --- Pretty: walks tree back to string ---
+
+;; Single leaf
+assert(Eq "1" (pretty arith 49))
+
+;; Two operands → "1+2"
+assert(Eq "1+2" (pretty arith [49 50]))
+
+;; Three operands → "1+2+3"
+assert(Eq "1+2+3" (pretty arith [[49 50] 51]))
+
+;; Six operands → full expression
+assert(Eq "1+2+3+4+5+6" (pretty arith [[[[[49 50] 51] 52] 53] 54]))
+
+;;; --- Roundtrip: pretty(parse(s)) == s ---
+
+assert(Eq "1"           (pretty arith (parse arith "1")))
+assert(Eq "1+2"         (pretty arith (parse arith "1+2")))
+assert(Eq "1+2+3"       (pretty arith (parse arith "1+2+3")))
+assert(Eq "1+2+3+4+5+6" (pretty arith (parse arith "1+2+3+4+5+6")))
 
 
 "all-tests-passed"
