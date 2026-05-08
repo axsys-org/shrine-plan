@@ -215,7 +215,6 @@
         ["row" (map parse-type-decl x)])
       ((Eq "paren" brak)
         (parse-type-decl-paren parse-type-decl x))
-
         (else (error "weird-brak"))))
 
   (define (parse-type-decl x)
@@ -227,7 +226,6 @@
       (else (error [x "wack ast"]))))
 
       ;; % (f x)  y -> (f x y)
-
   (define (uncurry-cen call rest)
     (define inner (rex-to-ast call))
     (If
@@ -336,25 +334,49 @@
 (define NONE 0)
 
 (define TYPE "type")
-
+;; bottom type
+;; TBOT obeys distribution
+;; TBAD should not
+;; i.e. A | TBOT = A
+;; but A | TBAD = TBAD
+(define TBOT [TYPE "TBOT"])
 ;; natural, optionally constant
 (define (TNAT cube) [TYPE "TNAT" cube])
+(define (type-not-bottom? x[_ tag]) (Ne tag "TBOT"))
 ;; sum type
-(define (TSUM opts) [TYPE "TSUM" opts])
+(define (TSUM opts)
+  (define canon (filter type-not-bottom? opts))
+  (print ("sum" opts canon))
+  (If (Equal canon opts) 0 (print ("mismatch" opts canon)))
+  (define sz (Sz canon))
+  (cond
+    ((Eq 1 sz) (_0 canon))
+    ((Eq 0 sz) TBOT)
+    ;; TODO: walk, flatten
+    (else [TYPE "TSUM" (sort cmp-total canon)])))
+(define tsum-opts (Ix 2)) ;
 ;; qualify name in body
 (define (TQUA name body) [TYPE "TQUA" name body])
 ;; nominal reference, possibly applied
 (define (TNOM ref args) [TYPE "TNOM" ref args])
+(define tnom-ref (Ix 2))
 ;; type variable
 (define (TVAR idx) [TYPE "TVAR" idx])
-;;
+;; structural type tag (existential)
+(define (TEXI nam) [TYPE "TEXI" nam])
+;; function
 (define (TFUN args ret) [TYPE "TFUN" (Sz args) args ret])
+;; is
+(define (TSELF x) [TYPE "TSELF" x])
+(define tself-val Ix2)
 ;;
 (define (is-tfun? x) (Eq (_1 x) "TFUN")) (define (tfun-ari x) (_2 x))
 (define (tfun-args x) (_3 x)) (define (tfun-ret x) (_4 x))
 
 (define (TFAC fac val) [TYPE "TFAC" fac val])
+(define tfac-val (Ix 3))
 (define (TROW vals) [TYPE "TROW" vals])
+(define trow-vals (Ix 2))
 (define (TUNI lvl) [TYPE "TUNI" lvl])
 (define (TPIN box) [TYPE "TPIN" box])
 (define TANY [TYPE "TANY"])
@@ -421,12 +443,19 @@ assert(Eq 4 (getf [1] test))
 (define (getax path ax)
   (getf ax-self (dipax path ax)))
 
-(define (gotax path ax) (need (getax path ax)))
+(define (gotax path ax) (needful ["gotax" path ax] (getax path ax)))
 
 (define (gutax path def ax) (fall def (getax path ax)))
 
 (define (putax path val ax)
   (define ret (Ifz path (Up 0 [val] ax)
+    (updf ax-kid
+      (lambda (kid)
+        (bst-ups (_0 path) empty-ax (putax (drop 1 path) val) kid)) ax)))
+        ret)
+
+(define (delax path val ax)
+  (define ret (Ifz path (Up 1 (_1 ax) empty-ax)
     (updf ax-kid
       (lambda (kid)
         (bst-ups (_0 path) empty-ax (putax (drop 1 path) val) kid)) ax)))
@@ -472,6 +501,8 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 
 (define (print-path x)
   (foldl strWeld "" (map (cork print-nat (strWeld "/")) x)))
+(define (print-ref x)
+  (foldl strWeld "" (map (cork print-nat (strWeld ":")) x)))
 
 (define (pretty-kv f x[k v])
   (pretty-pair (dtext (print-path k)) (f v)))
@@ -489,7 +520,7 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
 (define VAL "VAL")
 (define DECL "DECL")
 
-(define (make-val key val exp ty) [VAL key val exp ty])
+(define (make-val key val tc exp ty) [VAL key val tc exp ty])
 (define (make-decl key params val) [DECL key params val])
 (define bind-key  Ix1) (define set-bind-key  (Up 1))
 (define bind-val  Ix2) (define set-bind-val  (Up 2))
@@ -644,13 +675,18 @@ assert(Eq "qux" (gotax ["foo" "bar" "qux"] test-ax))
   (Ifz x f
   (cond
     ((f-hd "TQUA") (type-apply-qua f x))
+    ((f-hd "TFAC") (type-apply (_3 f) x))
+    ((f-hd "TSELF") (type-apply (tself-val x)))
     ((f-hd "TFUN")
       (type-apply (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
     ((f-hd "TBAD") f)
     (else (TBAD ["weird apply" f x])))))
 
+
+
+
 (define (insert-const name val exp ty sut)
-  (define ent (make-val name val exp ty))
+  (define ent (make-val name val 0 exp ty))
   (snap 0 (putax name ent) sut))
 (define (insert-const-ent name ent sut)
   (snap 0 (putax name ent) sut))
@@ -828,7 +864,7 @@ assert(Eq  (is-code? 0 5 6)       0 )
         (Ix a table)))
     ((tag-is "APP") (0 (cgen 0 table counts maxref fn a)
       (cgen 0 table counts maxref fn b)))
-    (else (error "bad tag cgen" t))))
+    (else (error ("bad tag cgen" s)))))
 
 (define (genlet-step table counts maxref fn k rest)
   (1 (cgen 1 table counts maxref fn (Ix k (fun-binds fn)))
@@ -1097,6 +1133,9 @@ assert(Eq (Law 1 "rec" 0)
     (_1 bod)
     (compile-dummy-function res 0)))
 
+(define (fold-app f xs)
+      (Ifz xs f
+        (fold-app (A f (_0 xs)) (drop 1 xs))))
 (define (insert-const-ir name exp ty sut)
   (insert-const name (compile-expr exp) exp ty sut))
 ; sut -> ast -> [sut IR Ty]
@@ -1163,20 +1202,18 @@ assert(Eq (Law 1 "rec" 0)
       assert(type-nests? casted prod-ty)
       [sut-new casted ir])
 
-    (define (fold-app f xs)
-      (Ifz xs f
-        (fold-app (A f (_0 xs)) (drop 1 xs))))
+
     (define (elaborate-row r sut-new)
       (define items (map (elaborate-val sut-new) r))
       (define ty (TROW (map Ix1 items)))
       (define val (fold-app (K 0) (map Ix2 items)))
       [sut-new ty val])
 
-    (define (elaborate-arms ))
-
-    (define (elaborate-switch scr pats sut-new)
-      (define sc[scr-sut scty scir] (elaborate-val sut-new scr))
-      (define )
+    ; (define (elaborate-arms ))
+    ;
+    ; (define (elaborate-switch scr pats sut-new)
+    ;   (define sc[scr-sut scty scir] (elaborate-val sut-new scr))
+    ;   (define ))
 
 
 
@@ -1230,7 +1267,7 @@ assert(Eq (Law 1 "rec" 0)
       (If (Lt (Sz ast) 2)
         (error ["bad call"])
       (elaborate-row (drop 1 ast) sut)))
-    ((Eq "switch" (_0 ast)) (elaborate-switch (_1 ast) (drop 2 ast)))
+    ; ((Eq "switch" (_0 ast)) (elaborate-switch (_1 ast) (drop 2 ast)))
 
     ((Eq "ref" (_0 ast)) (elaborate-ref (_1 ast) sut))
     ((Eq "lit" (_0 ast)) (elaborate-lit (_1 ast) (_2 ast) sut))
@@ -1250,7 +1287,7 @@ assert(Eq (Law 1 "rec" 0)
     (define (go sut arg[idx fac ty])
       (define new-loc (Weld loc [fac]))
       ; (print ["new-loc" idx new-loc])
-      (define typ (TFUN [(TNOM loc)] ty))
+      (define typ (TFUN [(TNOM loc 0)] ty))
       (insert-const-ffi new-loc (Ix idx) typ sut))
     (foldl go sut faces))
 
@@ -1375,7 +1412,12 @@ assert(Eq (Law 1 "rec" 0)
   TUNI
   TPIN
   TANY
+  TFAC
+  TSELF
+  TNOM
   TBAD
+  type-apply
+  type-nests?
   TBOX
   TARR
   empty-subject
@@ -1387,6 +1429,7 @@ assert(Eq (Law 1 "rec" 0)
   ;compile-cairn
   test-ax
   print-path
+  print-ref
   getax
   putax
   elaborate
@@ -1394,5 +1437,25 @@ assert(Eq (Law 1 "rec" 0)
   empty-ax
   bind-key
   tapax
+  TTYP
+  TQUA
+  TVAR
+  TFUN
+  gotax
+  tsum-opts
+  trow-vals
+  tfac-val
+  TBOT
+  tnom-ref
+  tself-val
+  V
+  K
+  G
+  A
+  L
+  R
+  M
+  F
+  compile-expr
   )
 
