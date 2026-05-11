@@ -12,6 +12,86 @@
 (#bind cairn (#module cairn))
 (#import cairn)
 
+(define (pin-arity x)
+  (define i (Unpin x))
+  (If (IsLaw i) (Arity i) 1))
+
+(define (compile-church-boolean v t f)
+  (If (Eq v "true") t f))
+
+(define (law-var? arity body) (And (IsNat body) (lte body arity)))
+(define (law-call? arity body) (And (Eq 2 (Sz body)) (Eq (Hd body) 0)))
+(define (law-lit? arity body)
+  (Nil (Or (law-call? arity body) (law-var? arity body))))
+
+(define (get-const arity body)
+  (define rec (get-const arity))
+  (define (on-app f x)
+    (define ff (rec f))
+    (define xx (rec x))
+    (and ff xx ((_0 ff) (_0 xx))))
+  (cond
+    ((law-var? arity body) 0)
+    ((law-call? arity body) (And (rec (_0 body)) (rec (_1 body))))
+    (else [body])))
+
+(define (lift-call arity f x)
+  (If (law-call? arity f)
+    ((lift-call arity (_0 f) (_1 f)) x)
+    [f x]))
+
+(define (subst-body-var arity arg body)
+  (define rec (subst-body-var arity arg))
+  (define is-var? (law-var? arity body))
+  (cond
+    ((Eq 1 body) arg)
+    ((law-var? arity body) (Dec body))
+    ((law-call? arity body) (map rec body))
+    (else body)))
+
+(define (subst-body-vars arity vars body)
+  (Ifz vars body
+    (subst-body-vars (Dec arity) (drop 1 vars)
+      (subst-body-var arity (_0 vars) body))))
+
+(define (plan-arity x)
+  (Case4 (Type x)
+     0
+     (pin-arity x)
+     (Arity x)
+     (Dec (plan-arity (Init x)))))
+
+(define (is-const v)
+  (Nil (law-var? v)))
+
+(define (constant-fold arity body)
+  (define rec (constant-fold arity))
+  (define (on-app f x)
+    (define ff (rec f))
+    (define xx (rec x))
+    (define lifted[func] (lift-call arity ff xx))
+    (If
+      (Or (Nil lifted) (all is-const lifted))
+      (0 f x)
+      (let ((arity (plan-arity func)))
+        (If (Eq arity (Dec (Sz lifted)))
+          (Coup func (drop 1 lifted))
+          (0 f x)))))
+  (cond
+    ((law-var? arity body) body)
+    ((law-call? arity body) (on-app (_0 body) (_1 body)))
+    (else body)))
+
+(define (partial-eval app)
+  (define hd (Hd app))
+  (define law (If (IsPin hd) (Unpin hd) hd))
+  (define appl (Sz app))
+  (define arity (Sub (Arity law) appl))
+  (define name (strWeld "eval" (Name law)))
+  (Law (Dec arity) name
+       (constant-fold arity
+         (subst-body-vars (Arity law) app (Body law)))))
+
 
 (define (get-foil fnam)
   (read-text-file (strcat ["foil/" fnam ".foil"])))
@@ -197,7 +277,6 @@
   (define (homo-nom x[_ _ x-nom] y[_ _ y-nom])
     (define x-typ[_ x-tag] (got-type x-nom sut))
     (define y-typ[_ y-tag] (got-type y-nom sut))
-    (print ("homo nom" x x-typ y y-typ))
     (cond
       ((And (Eq x-tag "TSUM") (Eq y-tag "TSUM")) (type-meet sut x-typ y-typ))
       ((Eq x-tag "TSUM") (type-meet sut x-typ y))
@@ -212,19 +291,15 @@
       ((tag-is "TNOM") (homo-nom x y))
       (else TBOT)))
   (define (distr-sum sum[_ _ opts] other)
-    (print ("sum" opts))
     (TSUM (map (type-meet sut other) opts)))
   (define (distr-face face[_ _ face val] other)
-    (print ("face" face val other))
     (TFAC face (type-meet sut val other)))
   (define (handle-nom nom[_ _ nam] other[_ other-tag])
     (define typ[_ tag] (got-type nam sut))
-    (Force (print ("resolved nom" nom other typ)))
     ;; XX: this is a smell, should probably treat
     (cond
       ((Eq tag "TSUM") (distr-sum typ other))
       (else TBOT)))
-  (define ret
     (Force (cond
     ((Equal x y) x)
     ((Eq xtag ytag) (homo-meet xtag x y))
@@ -235,8 +310,6 @@
     ((Eq xtag "TNOM") (handle-nom x y))
     ((Eq ytag "TNOM") (handle-nom y x))
     (else TBOT))))
-    (Force (print ("ret-meet" x y ret xtag ytag)))
-    ret)
 
 (begin
   (define g-nat (TFAC "g" (TNAT 0)))
@@ -295,7 +368,7 @@
     ;; or a type constructor
     ; (error ("uimpl tapp")))
 
-  (define ret (cond
+(cond
     ((tag-is "s_trow")
       (TTYP (TROW (map (elab-type sut) (surf-row-kids wav)))))
 
@@ -306,15 +379,12 @@
       (TROW (map (elab-type sut) (surf-row-kids wav))))
     ((tag-is "s_union")
       (define ret (TSUM (map (elab-type sut) (surf-union-opts wav))))
-      (print ("Union" wav ret))
       (TTYP ret))
     ((tag-is "s_ref")
       (TNOM (surf-ref-val wav) 0))
     ((tag-is "s_tapp")
       (on-tapp (surf-tapp-kids wav)))
-  (else (error ("unimpl type elab" wav)))))
-  (print ("elab" wav ret))
-  ret)
+      (else (error ("unimpl type elab" wav)))))
 
 
 (define (push-local-env env ty)
@@ -373,7 +443,6 @@
   (define outer-ty (tc-ty obj))
   (define ty[_ tag nom] (burp-face (tc-ty obj)))
   (define sel (snoc meth nom))
-  (print ("sel" meth nom sel ty))
   (If (Eq tag "TNOM") (got-entry-tc sel sut)
     (error ("bad dot call" obj meth))))
 
@@ -384,7 +453,6 @@
   (define elab-ty (elab-type sut))
   (define (elab-fun f[_ args body])
     (define argty (map elab-ty args))
-    (print ("elab" argty))
     (define frame (Weld [(self-ty sut env argty body)] argty))
     (define inner-env (push-locals env frame))
     (define val (elab-val sut inner-env body))
@@ -420,7 +488,7 @@
     (define idx (find-idx (match-face face) (env-locals env)))
     (Ifz idx
       (begin
-        (print ("fallthrough" face env))
+        ; (print ("fallthrough" face env))
         (elab-ref ["s_ref" [face]]))
       (on-var face (_0 idx))))
   (define (elab-lit l[_ val])
@@ -428,19 +496,16 @@
   (define (elab-meth-go rcvr els)
     (define f (score-meth rcvr (_0 els) sut))
     (Ifz els rcvr
-      (begin (print ("scored" f rcvr els))
-        (elab-meth-go (on-call f [rcvr]) (drop 1 els)))))
+        (elab-meth-go (on-call f [rcvr]) (drop 1 els))))
   (define (elab-meth m[_ els])
     assert(Nil (Eq 0 (Sz els)))
     (define head (_0 els))
     (define head-tc (elab-var [0 (_0 els)]))
-    (print ("meth head" head-tc))
     (elab-meth-go head-tc (drop 1 els)))
   ;; scrutinee gets let bound by case
   ;; so push a local representing the type
   (define (elab-arm scr-ty a[_ pat val])
     (define ty (type-meet sut scr-ty (elab-ty pat)))
-    (print ("elab meet" scr-ty (elab-ty pat) ty))
     (define res (elab-val sut (push-local-env env ty) val))
     (tc-arm (tc-ty res) ty res))
   ;;
@@ -451,7 +516,6 @@
       (If (Eq "no-heir" fall)
         (tc-mean "unreachable")
         (elab-val sut env fall)))
-    (print ("arms" (map tc-ty arms)))
     (define out-ty (foldl (type-join sut) fall1 (map tc-ty arms)))
     (tc-match out-ty scrut arms1 fall1))
   (define (elab-self s[_ xs])
