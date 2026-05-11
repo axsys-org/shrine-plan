@@ -30,7 +30,7 @@ import Control.Exception
 import Data.Functor ((<&>))
 import System.IO (stdin, stdout, stderr, Handle, hFlush)
 import Numeric.Natural (Natural)
-import System.Directory (doesFileExist, createDirectoryIfMissing, getModificationTime)
+import System.Directory (doesFileExist, createDirectoryIfMissing, getModificationTime, listDirectory)
 import System.FilePath ((</>))
 import Data.Time.Clock.POSIX (getPOSIXTime, utcTimeToPOSIXSeconds)
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -347,21 +347,21 @@ opAccept h = do
 
 opRead :: Int -> Natural -> IO Val
 opRead h n = do
-    print ("opread")
+    -- print ("opread")
     sock <- gGetSocket h
-    print ("opread", sock)
+    -- print ("opread", sock)
     bs   <- NSB.recv sock (fromIntegral n)
-    print ("opread", bs)
+    -- print ("opread", bs)
     if BS.null bs then pure (N 0) else pure (N $ bytesBar bs)
 
 opWrite :: Int -> Natural -> IO Val
 opWrite h dat = do
-    print ("opWrite")
+    -- print ("opWrite")
     sock <- gGetSocket h
-    print ("opWrite", sock)
-    print ("opWrite", natBytes dat)
+    -- print ("opWrite", sock)
+    -- print ("opWrite", natBytes dat)
     NSB.sendAll sock (natBytes dat)
-    print ("opWrite", "done")
+    -- print ("opWrite", "done")
     NS.close sock
     pure (N 0)
 
@@ -531,7 +531,10 @@ op 66 ["Load8", ni, n] = N $ (nat n `shiftR` (8*i)) .&. 0xFF where i = toix (nat
 op 66 ["Store8", i, b, n] = N $ writeByte (nat n) (ix i) (word8 b)
   where ix = toix . nat
         word8 = fromIntegral . (fromIntegral :: Natural -> Word8) . nat
-
+-- fails
+op 66 ["LoadVar", o, w, n] = N $ (nat n `shiftR` (8*off)) .&. pred (bit (8*wid))
+  where off = toix (nat o)
+        wid = toix (nat w)
 op 66 ["Set", i, n]    = N $ setBit (nat n) (toix (nat i))
 op 66 ["Clear", i, n]  = N $ clearBit (nat n) (toix (nat i))
 op 66 ["Bex", n]       = N $ bit (toix (nat n))
@@ -603,7 +606,7 @@ op 66 ["Init", x]      = case x of A f x | length x==1 -> f
                                    _                   -> N 0
 op 66 ["Equal",x,y] = planBit (x `deepseq` y `deepseq` (x==y))
 
-op 66 ["ParseRex", x] = case parseRex x of Just r -> r; Nothing -> error ("bad rex parse")
+op 66 ["ParseRex", x] = case parseRex x of Just r -> r; Nothing -> throw $! PLAN_EXN $! N "bad rex parse"
 op 66 ["PrintRex", x] = case printRex x of Just r -> r; Nothing -> error ("bad rex print")
 
 op 82 x = unsafePerformIO (rplan x)
@@ -629,6 +632,10 @@ rplan args = do
             try (BS.readFile (srcFile p)) <&> \case
                 Left  (_ :: IOException) -> N 0
                 Right contents           -> N (bytesBar contents)
+        ["ReadFolder", N p] ->
+            try (listDirectory (srcFile p)) <&> \case
+              Left (_ :: IOException) -> N 0
+              Right contents -> array $ map (N . strNat) contents
         ["Print", N s]    -> do putStr (natStr s); pure (N 0)
         ["Stamp", N n]    ->
             try (getModificationTime (srcFile n)) <&> \case
