@@ -1,0 +1,179 @@
+
+; @yyyy.mm.dd..hh.MM.ss..hex-fractional - single precision time (64bit, milli)
+; @@yyyy.mm.dd..hh.MM.ss..hex-fractional` double precision time (128bit, femto)
+; foo - any alphabetic char begins a symbol (alphanumerics + _ )
+; 31 - any numeric char (except 0) begins a number
+; 0 - just 0
+; %!<base64> - arbitrary run of unicode, encoded as base64
+; %<chars> - arbitrary run of ascii (no spaces, control codes)
+; #3 - path length indicator
+; 0w<base-64> binary data in base64
+; 0x<base-16> hex data
+
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind print (#module print))
+(#import print)
+
+(#bind bits (#module bits))
+(#import bits)
+
+(#bind parse (#module parse))
+(#import parse)
+(#bind apollo (#module apollo))
+(#import apollo)
+
+(define (base64-decode-char ch)
+  (define hi (size-nat 4 (Rsh ch 4)))
+  (cond
+    ((Eq ch "-") 62)
+    ((Eq ch "_") 63)
+    ((Eq hi 3) (Add 4 ch))
+    ((Eq hi 4) (Sub ch 65))
+    ((Eq hi 5) (Sub ch 65))
+    ((Eq hi 6) (Sub ch 71))
+    ((Eq hi 7) (Sub ch 71))
+    (else (error ("bad base64-decode-char" ch)))))
+
+(define (base64-encode-char a)
+  (cond
+    ((Lt a 26) (Add "A" a))
+    ((Lt a 52) (Add "a" (Sub a 26)))
+    ((Lt a 62) (Add "0" (Sub a 52)))
+    ((Eq a 62) "-")
+    ((Eq a 63) "_")
+    (else (error "bad sextet"))))
+
+
+(define sexs (Row 0 64 (lrange 0)))
+(define (does-invert x)
+  (Eq x (base64-decode-char (base64-encode-char x))))
+assert(all does-invert sexs)
+
+(define (base64-dec str)
+  (define r[strip str1]
+    (cond
+      ((Eq "==" (slice-r 0 2 str)) [2 (byte-trunc-by 2 str)])
+      ((Eq "=" (slice-r 0 1 str))  [1 (byte-trunc-by 1 str)])
+      (else [0 str])))
+  (define output (lfoldl1 (bloq-weld 6)
+                   ;(lambda (acc arg) (Add acc (Mul 64 arg)))
+    (lrev (lmap base64-decode-char (lexplode str1)))))
+  (bytes-swp (Rsh output (Mul 2 strip))))
+
+(define (load-bytes-to-sex bytes[one two tri])
+  (define fst (Rsh one 2))
+  (define snd (Add (Lsh (Mod one 4) 4) (Rsh two 4)))
+  (define thd (Add (Lsh (Mod two 16) 2) (Rsh tri 6)))
+  (define qua (Mod tri 64))
+  [fst snd thd qua])
+
+(define (base64-enc byts)
+  (define len (berm-met 8 byts))
+  assert(Ne 0 len)
+  (define pad (reap "=" (Mod len 4)))
+  (define (go buf idx iter iter-count)
+    (define iter1 (Up iter-count (berm-load8 idx buf) iter))
+    (define last (Eq (Inc idx) len))
+    (If (Eq iter-count 2)
+      (Weld (map base64-encode-char (load-bytes-to-sex iter1))
+        (If last 0
+          (go buf (Inc idx) [0 0 0] 0)))
+          (If last
+              (map base64-encode-char
+                (drop-r (Sub 2 iter-count) (load-bytes-to-sex iter1)))
+            (go buf (Inc idx) iter1 (Inc iter-count)))))
+  (define res (crip (go byts 0 [0 0 0] 0)))
+  (strWeld res (reap "=" (Sub 4 (Mod (Bytes res) 4)))))
+
+(define (base64-enc-str str)
+  (base64-enc (make-berm8 str)))
+
+(define hex-chars (Row 0 16 (lexplode "0123456789ABCDEF")))
+(define (hex-enc byts)
+  (define len (berm-met 8 byts))
+  (define (go buf idx)
+    (define byt (berm-load8 idx byts))
+    (define hi (Rsh byt 4))
+    (define lo (Mod byt 16))
+    (If (Eq idx len) 0
+      [(Ix hi hex-chars) [(Ix lo hex-chars) (go buf (Inc idx))]]))
+  (lcrip (go byts 0)))
+
+(define (hex-dec-nibble nib)
+  (define ret (cond
+    ((gte nib "a") (Add 10 (Sub nib "a")))
+    ((gte nib "A") (Add 10 (Sub nib "A")))
+    (else (Sub nib "0"))))
+  assert(Lt ret 16)
+  ret)
+
+(define (hex-dec str)
+  (define nibs (lmap hex-dec-nibble (lexplode str)))
+  (define byts (chunks 2 nibs))
+  (define (hex-dec-byt byt[hi lo])
+    (Add (Lsh hi 4) lo))
+    (lfoldr strWeld 0 (lmap hex-dec-byt byts)))
+
+(define (parse-time str)
+  (define t[date time frac] (split-str ".." str))
+  (define d[y m d] (split-str "." date))
+  (define ti[h mm s] (split-str "." time))
+  (define hex (hex-dec frac))
+  (define unix (cal-to-unix [y m d h mm s hex]))
+  (define apollo (unix-to-apollo unix))
+  (i128-add hex apollo))
+
+
+(define (parse-rec str)
+  ("r" (parse-nat str)))
+
+(define (parse-num str)
+  (define tag (Load8 0 str))
+  (define tag-is (Eq tag))
+  (define rest (Rsh str 8))
+  (cond
+    ((Eq rest 0) ("u" 0))
+    ((tag-is "w") ("w" (base64-dec rest)))
+    ((tag-is "x") ("x" (hex-dec rest)))
+    (else (error ("Bad tag parse-num" tag)))))
+
+(define (parse-str str)
+  (define tag (Load8 0 str))
+  (define tag-is (Eq tag))
+  (define rest (Rsh str 8))
+  (cond
+    ((tag-is "!") ("tu" (base64-dec rest)))
+    (else ("ta" str))))
+
+(define (parse-quip str)
+  (define tag (Load8 0 str))
+  (define tag-is (Eq tag))
+  (cond
+    ((tag-is "@")  ("ds" (parse-time (Rsh str 8))))
+    ((tag-is "0")  (parse-num (Rsh str 8)))
+    ((tag-is "%")  (parse-str (Rsh str 8)))
+    ((tag-is "#")  (parse-rec (Rsh str 8)))
+    ((is-sym str) ("ts" str))
+    (else
+      (begin
+        assert(is-numeric str)
+        ("u" str)))))
+
+(define (print-quip qp[val])
+  (define hd (Hd qp))
+  (define hd-is (Eq hd))
+  (cond
+    ((hd-is "ds") (print-time val))
+    ((hd-is "x") (strWeld "0x" (hex-enc val)))
+    ((hd-is "w") (strWeld "0w" (base64-enc val)))
+    ((hd-is "u") (showNat val))
+    ((hd-is "ta") (strWeld "%" val))
+    ((hd-is "tu") (strWeld "%!" (base64-enc-str val)))
+    ((hd-is "ts") val)
+    ((hd-is "r") (strWeld "#" (showNat val)))
+    (else (error ("unknown aura" hd)))))
+
+
