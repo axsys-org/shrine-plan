@@ -1,0 +1,307 @@
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(define TYPE "type")
+;; bottom type
+;; TBOT obeys distribution
+;; TBAD should not
+;; i.e. A | TBOT = A
+;; but A | TBAD = TBAD
+(define TBOT [TYPE "TBOT"])
+;; natural, optionally constant
+(define (TNAT cube) [TYPE "TNAT" cube])
+(define (type-not-bottom? x[_ tag]) (Ne tag "TBOT"))
+;; sum type
+(define (TSUM opts)
+  (define canon (filter type-not-bottom? opts))
+  ; (print ("sum" opts canon))
+  (If (Equal canon opts) 0 (print ("mismatch" opts canon)))
+  (define sz (Sz canon))
+  (cond
+    ((Eq 1 sz) (_0 canon))
+    ((Eq 0 sz) TBOT)
+    ;; TODO: walk, flatten
+    (else [TYPE "TSUM" (sort cmp-total canon)])))
+(define tsum-opts (Ix 2)) ;
+;; qualify name in body
+(define (TQUA name body) [TYPE "TQUA" name body])
+;; nominal reference, possibly applied
+(define (TNOM ref args) [TYPE "TNOM" ref args])
+(define tnom-ref (Ix 2))
+;; type variable
+(define (TVAR idx) [TYPE "TVAR" idx])
+;; structural type tag (existential)
+(define (TEXI nam) [TYPE "TEXI" nam])
+;; function
+(define (TFUN args ret) [TYPE "TFUN" (Sz args) args ret])
+;; is
+(define (TSELF x) [TYPE "TSELF" x])
+(define tself-val Ix2)
+;;
+(define (is-tfun? x) (Eq (_1 x) "TFUN")) (define (tfun-ari x) (_2 x))
+(define (tfun-args x) (_3 x)) (define (tfun-ret x) (_4 x))
+
+(define (TFAC fac val) [TYPE "TFAC" fac val])
+(define tfac-val (Ix 3))
+(define (TROW vals) [TYPE "TROW" vals])
+(define trow-vals (Ix 2))
+(define (TUNI lvl) [TYPE "TUNI" lvl])
+(define (TPIN box) [TYPE "TPIN" box])
+(define TANY [TYPE "TANY"])
+(define (TTYP typ) [TYPE "TTYP" typ])
+(define TBAD [TYPE "TBAD"])
+(define (TBOX val) [TYPE "TBOX" val])
+(define (TARR item) [TYPE "TARR" item])
+
+; data Either = Left a | Right
+(define (left x) ("left" x)) (define (right x) ("right" x))
+(define (is-left? x) (Eq (Hd x) "left")) (define (is-right? x) (Eq (Hd x) "right"))
+(define (either-seq f a b) (If (is-left? a) a))
+
+
+(define (check-type-wf sut x[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (check-type-wf sut))
+  (define (check-tfun-args args)
+    (define res (filter is-left? (map (check-type-wf sut) args)))
+    (Ifz (Sz res) (right 0) (_0 res)))
+  (define (type-and x y) (If (is-left? x) x y))
+  (cond
+    ((tag-is "TVAR")
+     (Ifz (sut-get-tvar? (_2 x)) (left "unbound ty var") (right 0)))
+     ((tag-is "TFUN")
+       (type-and (check-tfun-args (tfun-args x)) (recur (tfun-ret x))))
+     ((tag-is "TNOM") (Ifz (get-const (_2 x) sut) (left "bad type reference")
+         (right 0)))
+     ((tag-is "TFAC") (check-type-wf (_3 x)))
+     ((tag-is "TNAT") (right 0))
+     ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
+     ((tag-is "TSUM") (check-tfun-args (_2 x)))
+     ((tag-is "TROW") (check-tfun-args (_2 x)))
+     (else (print "unhandled") (right 0))))
+
+
+(define (subst-type name repl ty[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (subst-type name repl))
+  (cond
+    ((tag-is "TVAR") (If (Eq (_2 ty) name) repl ty))
+    ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+    ((tag-is "TNOM") (TNOM (_2 ty) (map recur (_3 ty))))
+    ((tag-is "TFAC") (TFAC (_2 ty) (recur (_3 ty))))
+    ((tag-is "TNAT") ty)
+    ((tag-is "TQUA") (If (Eq (_2 ty) name) ty (TQUA (_2 ty) (recur (_3 ty)))))
+    ((tag-is "TSUM") (TSUM (map recur (_2 ty))))
+    ((tag-is "TROW") (map recur (_2 ty)))
+    (else (print [ty "unhandled"]) (right 0))))
+
+
+(define (type-nests? sup sub) (or (Eq sup sub) (Eq (_1 sup) "TANY") (Eq (_1 sub) "TANY")))
+(define (ty-match name x) (And (Eq (_1 x) "TVAR") (Eq (_2 x) name)))
+(define (find-tvar name args) (find-idx (ty-match name) args))
+
+(define (type-apply f x)
+  ;; just try and expand this easy case
+  ;; combined with the UFCS should get 90% of polymorphism
+  (define (type-apply-qua f x)
+    (define name (_2 f))
+    (define fun (_3 f))
+    (define first-arg[idx] (find-tvar name (tfun-args fun)))
+    (define result
+      (subst-type name x fun))
+    (unless
+      (Eq (_1 fun) "TFUN")
+      (TBAD ["too complicated" f x])
+      (Ifz first-arg
+           (TBAD ["failed to resolve polymorphism by arguments, please specify"
+                  f x])
+           (If (Lt idx (Sz x))
+             (type-apply (subst-type name (Ix idx x) fun) x)
+             (TBAD ["polymorphism not first arg" f x])))))
+  (define (f-hd y) (Eq (_1 f) y))
+  (define (type-apply-fun args ret x)
+    ;(print ["apply fun" args ret x])
+    (If (type-nests? (_0 args) x)
+        (If (Eq 1 (Sz args)) ret
+          (TFUN (drop 1 args) ret))
+        (TBAD ["nest-fail" (_0 args) x])))
+  (Ifz x f
+  (cond
+    ((f-hd "TQUA") (type-apply-qua f x))
+    ((f-hd "TFAC") (type-apply (_3 f) x))
+    ((f-hd "TSELF") (type-apply (tself-val x)))
+    ((f-hd "TFUN")
+      (type-apply (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
+    ((f-hd "TBAD") f)
+    (else (TBAD ["weird apply" f x])))))
+
+;; type union
+(define (type-join sut x[_ xtag] y[_ ytag])
+  (define (homo-join tag x y)
+    (define (tag-is z) (Eq tag z))
+    (cond
+      ((tag-is "TNAT") (TNAT 0))
+      ((tag-is "TSUM")
+       (TSUM (Weld (tsum-opts x) (tsum-opts y))))
+      ((And (tag-is "TROW") (Eq (Sz (trow-vals x)) (Sz (trow-vals y))))
+        (TROW (map (uncurry (type-join sut)) (zip (trow-vals x) (trow-vals y)))))
+      (else (TSUM [x y]))))
+  (define (flat-sum sum[_ _ opts] other)
+    (TSUM (snoc other opts)))
+  (cond
+    ((Equal x y) x)
+    ((Eq xtag ytag) (homo-join xtag x y))
+    ((Eq xtag "TSUM") (flat-sum x y))
+    ((Eq ytag "TSUM") (flat-sum y x))
+    (else (TSUM [x y]))))
+
+;; type intersection
+(define (type-meet sut x[_ xtag] y[_ ytag])
+  (define (homo-nom x[_ _ x-nom] y[_ _ y-nom])
+    (define x-typ[_ x-tag] (got-type x-nom sut))
+    (define y-typ[_ y-tag] (got-type y-nom sut))
+    (cond
+      ((And (Eq x-tag "TSUM") (Eq y-tag "TSUM")) (type-meet sut x-typ y-typ))
+      ((Eq x-tag "TSUM") (type-meet sut x-typ y))
+      ((Eq y-tag "TSUM") (type-meet sut y-typ x))
+      (else TBOT)))
+  (define (homo-meet tag x y)
+    (define (tag-is z) (Eq tag z))
+    (cond
+      ;; should be caught be deepeq
+      ((tag-is "TNAT") TBOT)
+      ((tag-is "TSUM") (TSUM (intersect Equal (tsum-opts x) (tsum-opts y))))
+      ((tag-is "TNOM") (homo-nom x y))
+      (else TBOT)))
+  (define (distr-sum sum[_ _ opts] other)
+    (TSUM (map (type-meet sut other) opts)))
+  (define (distr-face face[_ _ face val] other)
+    (TFAC face (type-meet sut val other)))
+  (define (handle-nom nom[_ _ nam] other[_ other-tag])
+    (define typ[_ tag] (got-type nam sut))
+    ;; XX: this is a smell, should probably treat
+    (cond
+      ((Eq tag "TSUM") (distr-sum typ other))
+      (else TBOT)))
+    (Force (cond
+    ((Equal x y) x)
+    ((Eq xtag ytag) (homo-meet xtag x y))
+    ((Eq xtag "TFAC") (distr-face x y))
+    ((Eq ytag "TFAC") (distr-face y x))
+    ((Eq xtag "TSUM") (distr-sum x y))
+    ((Eq ytag "TSUM") (distr-sum y x))
+    ((Eq xtag "TNOM") (handle-nom x y))
+    ((Eq ytag "TNOM") (handle-nom y x))
+    (else TBOT))))
+
+(define (fits-err err)
+  (1 [err]))
+(define (fits-weld a[ae] b[be])
+  (1 (Weld ae be)))
+(define (fits-or a b)
+  (Ifz a 0 b))
+(define (fits-and a b)
+  (Ifz a b
+    (Ifz b a
+      (fits-weld a b))))
+(define (type-fits sut ty[_ tag] val)
+  (define (tag-is x) (Eq x tag))
+  (define (try-recur ty1 val) ((Try (type-fits sut)) ty val))
+  (define recur (type-fits sut))
+  (define recur-row (uncurry (type-fits sut)))
+  (define (row-fits tys val)
+    (cond
+      ((Nil (IsApp val)) (fits-err "fit row into bottom"))
+      ((Ne (Sz tys) (Sz val)) (fits-err "fit row into bad size"))
+      (else (foldr fits-and 0 (map recur-row (zip tys val))))))
+  (define (handle-nom nom val)
+    (define typ (got-type sut nom))
+    (unless (Eq (Hd val) (print-path nom))
+      (fits-err "bad type constructor")
+      (recur sut typ val)))
+  (cond
+    ((tag-is "TBOT") (fits-err "nothing fits bottom"))
+    ((tag-is "TROW") (row-fits (trow-vals ty) val))
+    ((tag-is "TFAC") (recur (tfac-val ty) val))
+    ((tag-is "TSUM")
+      (foldl fits-or
+             (fits-err "fell through sum")
+             (map recur-row (late-zip val (tsum-opts ty)))))
+    ((tag-is "TNOM") (handle-nom (tnom-ref ty) val))
+    ((tag-is "TNAT") (If (IsNat val) 0 (fits-err "not nat")))
+    (else (fits-err ["fallthrough uimpl" tag]))))
+
+
+(define tc-poison
+  (tc "POISON" TBAD))
+(define (tc-ttyp typ)
+  (tc-typ (TTYP typ)))
+(define (insert-typ key span typ sut)
+  (define ent (make-tc-entry key span (tc-ttyp typ)))
+  (insert-entry-sut key ent sut))
+
+(define (insert-typ-ffi key typ sut)
+  (insert-typ key wack-span typ sut))
+(define (resolve-type sut tyast)
+  (define (tag-is x) (Eq (_0 tyast) x))
+  (cond
+    ((tag-is "ref") (got-span (_1 tyast) sut) (TNOM (_1 tyast) 0))
+    ((tag-is "bind") (TFAC (_1 tyast) (resolve-type sut (_2 tyast))))
+    ((tag-is "row") (TROW (map (resolve-type sut) (drop 1 tyast))))
+
+    (else
+      (error ["bad type ast" tyast]))))
+
+(define (collect-faces items)
+  (define (go acc[idx ls] arg[_ tag face ty])
+    [(Inc idx)
+    (unless (Eq tag "TFAC")
+      ls
+      (snoc [idx face ty] ls))])
+  (_1 (foldl go [0 0] items)))
+(#export
+ type-join
+ type-meet
+ type-fits
+ type-nests?
+ insert-typ
+ insert-typ-ffi
+
+TBOT
+;; natural, optionally constant
+TNAT
+type-not-bottom?
+TSUM
+tsum-opts
+TQUA
+TNOM
+tnom-ref
+TVAR
+TEXI
+TFUN
+
+TSELF
+tself-val
+
+is-tfun?
+tfun-ari
+tfun-args
+tfun-ret
+TFAC
+tfac-val
+TROW
+trow-vals
+TUNI
+TPIN
+TANY
+TTYP
+TBAD
+TBOX
+TARR
+)
