@@ -1,21 +1,30 @@
 
 (#bind bst (#module bst))
 (#import bst)
+(print "bst")
+
 (#bind std (#module std))
 (#import std)
 
+(print "std")
 (#bind reef (#module reef))
 (#import reef)
+(print "reef")
 (#bind foil-sast (#module foil-sast))
 (#import foil-sast)
+(print "sast")
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
+(print "sut")
 
 (#bind ty (#module foil-types))
+(print "ty")
 (#bind cgen (#module codegen))
+(print "cgen")
 
 (#bind cairn (#module cairn))
 (#import cairn)
+(print "cairn")
 
 
 (define (get-foil fnam)
@@ -97,13 +106,13 @@
 
   (cond
     ((tag-is "s_trow")
-      (ty:TTYP (ty:TROW (map (elab-type sut) (surf-row-kids wav)))))
+      (ty:TTYP (ty:TROW 0 (map (elab-type sut) (surf-row-kids wav)))))
 
     ((tag-is "s_face")
      (ty:TFAC (surf-face-name wav)
        (elab-type sut (surf-face-kid wav))))
     ((tag-is "s_row")
-      (ty:TROW (map (elab-type sut) (surf-row-kids wav))))
+      (ty:TROW 0 (map (elab-type sut) (surf-row-kids wav))))
     ((tag-is "s_union")
       (define ret (ty:TSUM (map (elab-type sut) (surf-union-opts wav))))
       (ty:TTYP ret))
@@ -185,20 +194,22 @@
     (define inner-env (push-locals env frame))
     (define val (elab-val sut inner-env body))
     (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
-  (define (elab-cast c[_ ty body])
-    (define want (elab-ty ty))
-    (define env1 (set-env-goal want env))
-    (define ret (elab-val sut env1 body))
-    assert(ty:type-nests? want (tc-ty ret))
-    (set-tc-ty want ret))
-  (define (elab-row r[_ items])
-    (define els (map (elab-val sut env) items))
-    (define ty (ty:TROW (map tc-ty els) 0 els))
-    (tc-row ty 0 els))
+	  (define (elab-cast c[_ ty body])
+	    (define want (elab-ty ty))
+	    (define env1 (set-env-goal want env))
+	    (define ret (elab-val sut env1 body))
+	    assert(ty:type-nests? sut want (tc-ty ret))
+	    (set-tc-ty want ret))
+	  (define (elab-row r[_ items])
+	    (define els (map (elab-val sut env) items))
+	    (define goal-span (ty:mold-to-span sut (env-goal env)))
+	    (define cstr (If (Eq (_1 goal-span) "TROW") (ty:trow-cstr goal-span) 0))
+	    (define ty (ty:TROW cstr (map tc-ty els)))
+	    (tc-row ty 0 els))
   (define (on-call f xs)
     ;; UGLY HACK, PLS FIX!
     (define xs-ty (map (cork burp-face tc-ty) xs))
-    (define ty[_ tag] (ty:type-apply (tc-ty f) xs-ty))
+	    (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
     (define app (tc-fold-app f xs))
     (If (Eq tag "TBAD") (error ("bad apply" ty (tc-ty f) xs-ty))
       (set-tc-ty ty app)))
@@ -272,19 +283,23 @@
     (else (error ("uimpl" surf)))))
 
 (define (can-gen-accessors? tc[ty])
-  (If (and (Eq (Hd tc) "TC_TYP")
-       (Eq (_1 ty) "TTYP")
-       (Eq (_1 (_2 ty)) "TROW"))
-       (_2 (_2 ty))
-       0))
+	  (If (and (Eq (Hd tc) "TC_TYP")
+	       (Eq (_1 ty) "TTYP")
+	       (Eq (_1 (_2 ty)) "TROW"))
+	       (ty:trow-vals (_2 ty))
+	       0))
 
 
 ;; ->
 (define (elab-mod sut mod)
+  (define (insert-elab-tc name span tc sut)
+    (If (Eq (Hd tc) "TC_TYP")
+      (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
+      (insert-tc name span tc sut)))
   (define (elab-entry sut ent[_ name span body])
     (define tc (elab-val sut (set-env-name name empty-env) body))
     (define acc? (can-gen-accessors? tc))
-    (define sut1 (insert-tc name span tc sut))
+    (define sut1 (insert-elab-tc name span tc sut))
     ; (print ("name" name acc?))
     (Ifz acc? sut1
       (gen-accessors name acc? sut1)))
@@ -306,21 +321,22 @@
   (define (lower-lam lam)
     (define body (lower-tc sut (tc-lam-body lam)))
     (cgen:F y y y "LAM" (tc-lam-arity val) body))
-  (define (get-hd typ[_ tag])
-    (define (tag-is x) (Eq tag x))
-    (cond
-      ((tag-is "TNOM") (print-ref (ty:tnom-ref typ)))
-      (else
-        (begin (print ("fallthrough" typ))
-          0))))
+    (define (get-hd typ[_ tag])
+      (define span[_ stag] (ty:mold-to-span sut typ))
+      (define (tag-is x) (Eq stag x))
+      (cond
+        ((tag-is "TROW") (ty:trow-cstr span))
+        (else
+          (begin (print ("fallthrough" typ))
+            0))))
   (define (lower-arms fall arms)
-    (Ifz arms (lower-tc fall)
+    (Ifz arms (lower-tc sut fall)
       (letrec
         ((arm (_0 arms))
-         (pat-tc (lower-tc (tc-arm-pat arm)))
-         (leg-tc (lower-tc (tc-arm-val arm)))
+         (pat-ty (tc-arm-pat arm))
+         (leg-tc (lower-tc sut (tc-arm-val arm)))
          ;; we test the let binding we made in lower-match
-         (test-ir (cgen:A (cgen:K (ty:type-fits sut (tc-ty pat-tc)) (ty:V 0)))))
+         (test-ir (cgen:A (cgen:K (ty:type-fits sut pat-ty)) (cgen:V 0))))
          (cgen:A
            (cgen:A (cgen:A (cgen:K Ifz) test-ir) ;; if match
              leg-tc ;; then execute pattern
@@ -344,6 +360,7 @@
     ((tag-is "TC_ROW")    (lower-row val))
     ((tag-is "TC_TYP")    (cgen:K val))
     ((tag-is "TC_MATCH")  (lower-match val))
+    ((tag-is "TC_MEAN")   (cgen:A (cgen:K error) (cgen:K "unreachable")))
     (else (error ("lowering" val)))))
 
 
