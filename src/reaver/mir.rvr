@@ -1,0 +1,359 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind print (#module print))
+(#import print)
+(#bind parse (#module parse))
+(#bind bst (#module bst))
+(#bind pe (#module pe))
+(#import pe)
+
+; Stmt =
+;
+; Atom  = Env(slot) | Lit(value) | Tmp(id)
+(define env-at "ENV") ; de-brujin
+(define lit-at "LIT") ; literal
+(define tmp "TMP") ; tmp
+(define close "CLOSE") ;     Close Atom [Atom]
+(define delay "DELAY") ;    Delay Proc
+(define force "FORCE") ;   Force Atom
+(define eval "EVAL") ;   Eval Atom
+(define prim "PRIM") ;   | Prim PrimOp [Atom]
+; CallKind = Prim | CallKnown | CallUnknown | CallSelf | CallPrimPin
+(define call "CALL") ;   | Call CallKind Atom [Atom]
+
+(define let-st "LET") ;     Let Tmp Rhs
+(define letrec-st "LETREC") ;   | LetRec [(Tmp, Alloc)]
+(define proc "PROC") ;   | Proc ProcId Proc
+(define br "BR") ;   | Br Atom Proc Proc
+(define ret "RET") ;   | Ret Atom
+
+(define (law-let? body) (and (IsApp body) (Eq (Hd body) 1) (Eq (Sz body) 2)))
+(define (law-let-count body)
+  (Ifz (law-let? body) 0 (Inc (law-let-count (_1 body)))))
+
+(define (countup x) [x (countup (Inc x))])
+
+(define empty-ctx [0 0]) ;; [bind-count proc]
+(define (ctx-at count) [count 0]) ;; [bind-count proc]
+(define set-ctx-count (Up 0))
+(define bind-count (Ix 0))
+(define ctx-mir (Ix 1))
+(define (ctx-let ctx[count mir] bind)
+  [(tmp count) [(Inc count) (snoc (let-st count bind) mir)]])
+(define (ctx-proc ctx[count mir] bind)
+  [(tmp count) [(Inc count) (snoc (proc bind))]])
+(define (ctx-to-proc ctx inner-ctx[count mir] r-at)
+  (ctx-let (set-ctx-count count ctx) (delay (Weld mir [(ret r-at)]))))
+
+; (define (ctx-letrec ctx[count mir] binds)
+;   (define let-s (Sz binds))
+;   [(Add count let-s) (letrec-st (lzip (Row 0 let-s (countup count)) binds))])
+
+
+(define (lower-raw-body arity ctx body)
+  (define recurse (lower-raw-body arity))
+  (define let-count (law-let-count body))
+  (define depth (Add arity let-count))
+  (define (make-thk f x)
+    (define thk-ctx (ctx-at (bind-count ctx)))
+    (define a[f-at ctx1] (recurse thk-ctx f))
+    (define b[ff-at ctx2] (ctx-let ctx1 (force f-at)))
+    (define c[x-at ctx3] (recurse ctx2 x))
+    (define d[xx-at ctx4] (ctx-let ctx3 (force x-at)))
+    (define e[r-at ctx5] (ctx-let ctx4 (call "unk" ff-at [xx-at])))
+    (ctx-to-proc ctx ctx5 r-at))
+
+  (define (lower-call body[f x])
+    (make-thk f x))
+
+
+  (cond
+    ((law-var? depth body) [(env-at body) ctx])
+    ((law-call? depth body) (lower-call body))
+    (else [(lit-at (pull-const body)) ctx])))
+
+(define (lower-law ll)
+  (define l (If (IsPin ll) (Unpin ll) ll))
+  (lower-raw-body (Arity l) empty-ctx (Body l)))
+
+
+(define (normalize-mir mir))
+
+
+
+
+;;; MIR pretty-printer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (mir-atom? x)
+  (And (IsApp x)
+    (or
+      (Eq (Hd x) env-at)
+      (Eq (Hd x) lit-at)
+      (Eq (Hd x) tmp))))
+
+(define (tmp-name n) (strcat ["t" (showNat n)]))
+
+(define (pp-nat n) (print-nat n))
+
+(define (str-join-go sep acc xs)
+  (Ifz (Sz xs) acc
+    (str-join-go sep (strcat [acc sep (_0 xs)]) (drop 1 xs))))
+
+(define (str-join sep xs)
+  (Ifz (Sz xs) ""
+    (str-join-go sep (_0 xs) (drop 1 xs))))
+
+(define (pp-plan x)
+  (define (pp-plan-row vals)
+    (str-join " " (map pp-plan vals)))
+  (cond
+    ((IsNat x) (pp-nat x))
+    ((IsLaw x)
+      (strcat ["#<law " (print-nat (Name x)) "/" (showNat (Arity x)) ">"]))
+    ((IsPin x)
+      (strcat ["#<pin " (pp-plan (Unpin x)) ">"]))
+    ((IsApp x)
+      (strcat
+        ["(" (pp-plan (Hd x))
+         (Ifz (Sz x) "" (strcat [" " (pp-plan-row x)]))
+         ")"]))
+    (else "#<unknown>")))
+
+(define comma-space (dcat comma softline))
+
+(define (pretty-block body)
+  (foldl dcat dempty
+    [(dtext "{")
+     (dnest 2 (dcat dline body))
+     dline
+     (dtext "}")]))
+
+(define (pretty-mir-node mode x)
+  (define (mode-is m) (Eq mode m))
+  (cond
+    ((mode-is "atom")
+      (cond
+        ((tagged? env-at x)
+          (dtext (strcat ["env[" (showNat (_0 x)) "]"])))
+        ((tagged? lit-at x)
+          (dtext (strcat ["lit(" (pp-plan (_0 x)) ")"])))
+        ((tagged? tmp x)
+          (dtext (tmp-name (_0 x))))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "atom-row")
+      (dgroup (foldl dcat dempty
+        [(dtext "[")
+         (join-with comma-space
+           (stream (map (pretty-mir-node "atom") x)))
+         (dtext "]")])))
+    ((mode-is "call-rhs")
+      (dgroup (foldl dcat dempty
+        [(dtext "call/")
+         (dtext (print-nat (_0 x)))
+         softline
+         (pretty-mir-node "atom" (_1 x))
+         (dtext "(")
+         (join-with comma-space
+           (stream (map (pretty-mir-node "atom") (_2 x))))
+         (dtext ")")])))
+    ((mode-is "proc")
+      (pretty-block (pretty-mir-node "stmts" x)))
+    ((mode-is "rhs")
+      (cond
+        ((mir-atom? x) (pretty-mir-node "atom" x))
+        ((tagged? close x)
+          (dgroup (foldl dcat dempty
+            [(dtext "close ")
+             (pretty-mir-node "atom" (_0 x))
+             softline
+             (pretty-mir-node "atom-row" (_1 x))])))
+        ((tagged? delay x)
+          (dcat (dtext "delay ") (pretty-mir-node "proc" (_0 x))))
+        ((tagged? force x)
+          (dcat (dtext "force ") (pretty-mir-node "atom" (_0 x))))
+        ((tagged? eval x)
+          (dcat (dtext "eval ") (pretty-mir-node "atom" (_0 x))))
+        ((tagged? prim x)
+          (dgroup (foldl dcat dempty
+            [(dtext "prim/")
+             (dtext (print-nat (_0 x)))
+             (dtext "(")
+             (join-with comma-space
+               (stream (map (pretty-mir-node "atom") (_1 x))))
+             (dtext ")")])))
+        ((tagged? call x) (pretty-mir-node "call-rhs" x))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "let")
+      (foldl dcat dempty
+        [(dtext (tmp-name (_0 x)))
+         softline
+         (dtext "=")
+         softline
+         (pretty-mir-node "rhs" (_1 x))]))
+    ((mode-is "ret")
+      (dcat (dtext "ret ") (pretty-mir-node "atom" (_0 x))))
+    ((mode-is "br")
+      (foldl dcat dempty
+        [(dtext "br ")
+         (pretty-mir-node "atom" (_0 x))
+         softline
+         (pretty-mir-node "proc" (_1 x))
+         softline
+         (pretty-mir-node "proc" (_2 x))]))
+    ((mode-is "letrec")
+      (dgroup (dcat (dtext "letrec ") (dtext (pp-plan (_0 x))))))
+    ((mode-is "proc-st")
+      (dgroup (dcat (dtext "proc ") (dtext (pp-plan x)))))
+    ((mode-is "stmt")
+      (cond
+        ((tagged? let-st x) (pretty-mir-node "let" x))
+        ((tagged? letrec-st x) (pretty-mir-node "letrec" x))
+        ((tagged? proc x) (pretty-mir-node "proc-st" x))
+        ((tagged? br x) (pretty-mir-node "br" x))
+        ((tagged? ret x) (pretty-mir-node "ret" x))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "stmts")
+      (join-with dline (stream (map (pretty-mir-node "stmt") x))))
+    ((mode-is "mir")
+      (pretty-block
+        (join-with dline
+          (stream
+            (Weld
+              (map (pretty-mir-node "stmt") (ctx-mir (_1 x)))
+              [(dgroup
+                 (dcat
+                   (dtext "result ")
+                   (pretty-mir-node "atom" (_0 x))))])))))
+    (else (dtext (pp-plan x)))))
+
+(define (pretty-mir mir)
+  (pretty-mir-node "mir" mir))
+
+(define (pp-mir-render mode ind x)
+  (define (mode-is m) (Eq mode m))
+  (define pad (reap " " ind))
+  (define (line text) (strcat [pad text]))
+  (cond
+    ((mode-is "atom")
+      (cond
+        ((tagged? env-at x) (strcat ["env[" (showNat (_0 x)) "]"]))
+        ((tagged? lit-at x) (strcat ["lit(" (pp-plan (_0 x)) ")"]))
+        ((tagged? tmp x)    (tmp-name (_0 x)))
+        (else               (pp-plan x))))
+    ((mode-is "atom-row")
+      (strcat
+        ["["
+         (str-join ", " (map (pp-mir-render "atom" ind) x))
+         "]"]))
+    ((mode-is "call-rhs")
+      (strcat
+        ["call/"
+         (print-nat (_0 x))
+         " "
+         (pp-mir-render "atom" ind (_1 x))
+         "("
+         (str-join ", " (map (pp-mir-render "atom" ind) (_2 x)))
+         ")"]))
+    ((mode-is "proc")
+      (strcat
+        ["{"
+         newline
+         (pp-mir-render "stmts" (Add ind 2) x)
+         newline
+         pad
+         "}"]))
+    ((mode-is "rhs")
+      (cond
+        ((mir-atom? x) (pp-mir-render "atom" ind x))
+        ((tagged? close x)
+          (strcat
+            ["close "
+             (pp-mir-render "atom" ind (_0 x))
+             " "
+             (pp-mir-render "atom-row" ind (_1 x))]))
+        ((tagged? delay x)
+          (strcat ["delay " (pp-mir-render "proc" ind (_0 x))]))
+        ((tagged? force x)
+          (strcat ["force " (pp-mir-render "atom" ind (_0 x))]))
+        ((tagged? eval x)
+          (strcat ["eval " (pp-mir-render "atom" ind (_0 x))]))
+        ((tagged? prim x)
+          (strcat
+            ["prim/"
+             (print-nat (_0 x))
+             "("
+             (str-join ", " (map (pp-mir-render "atom" ind) (_1 x)))
+             ")"]))
+        ((tagged? call x) (pp-mir-render "call-rhs" ind x))
+        (else (pp-plan x))))
+    ((mode-is "let")
+      (line
+        (strcat
+          [(tmp-name (_0 x))
+           " = "
+           (pp-mir-render "rhs" ind (_1 x))])))
+    ((mode-is "ret")
+      (line (strcat ["ret " (pp-mir-render "atom" ind (_0 x))])))
+    ((mode-is "br")
+      (line
+        (strcat
+          ["br "
+           (pp-mir-render "atom" ind (_0 x))
+           " "
+           (pp-mir-render "proc" ind (_1 x))
+           " "
+           (pp-mir-render "proc" ind (_2 x))])))
+    ((mode-is "letrec")
+      (line (strcat ["letrec " (pp-plan (_0 x))])))
+    ((mode-is "proc-st")
+      (line (strcat ["proc " (pp-plan x)])))
+    ((mode-is "stmt")
+      (cond
+        ((tagged? let-st x)    (pp-mir-render "let" ind x))
+        ((tagged? letrec-st x) (pp-mir-render "letrec" ind x))
+        ((tagged? proc x)      (pp-mir-render "proc-st" ind x))
+        ((tagged? br x)        (pp-mir-render "br" ind x))
+        ((tagged? ret x)       (pp-mir-render "ret" ind x))
+        (else                  (line (pp-plan x)))))
+    ((mode-is "stmts")
+      (str-join newline (map (pp-mir-render "stmt" ind) x)))
+    ((mode-is "mir")
+      (strcat
+        ["{"
+         newline
+         (str-join
+           newline
+           (Weld
+             (map (pp-mir-render "stmt" 2) (ctx-mir (_1 x)))
+             [(strcat
+                [(reap " " 2)
+                 "result "
+                 (pp-mir-render "atom" 2 (_0 x))])]))
+         newline
+         "}"]))
+    (else (pp-plan x))))
+
+
+
+
+(define (pp-mir mir)
+  (pp-mir-render "mir" 0 mir))
+
+(define (trace-mir mir)
+  (define strs (stream (parse:split-str 10 (pp-mir mir))))
+  (define (go ls[x xs])
+    (Ifz ls 0
+      (begin (print x) (go xs))))
+  (go strs))
+
+  ;; (trace-mir fib-lower)
+
+(define (fib n) (If (Lt n 2) 1 (Add (fib (Dec n)) (fib (Sub n 2)))))
+
+(define fib-lower (lower-law fib))
+
