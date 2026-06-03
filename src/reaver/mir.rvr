@@ -209,9 +209,289 @@
   (define stmts (lcatmap (normalize-stmt normalize-proc mir counts proc) (stream proc)))
   (Row 0 (llen stmts) stmts))
 
-(define (normalize-mir mir[result ctx])
+(define (normalize-dethunk-mir mir[result ctx])
   (define counts (refcounts mir))
   [result [(bind-count ctx) (normalize-proc mir counts (ctx-mir ctx))]])
+
+(define (alias-lookup tmp-id aliases[entry rest])
+  (And aliases
+    (If (Eq tmp-id (_0 entry))
+      [(_1 entry)]
+      (alias-lookup tmp-id rest))))
+
+(define (normalize-cleanup-atom aliases atom)
+  (define hit
+    (And (tmp-atom? atom)
+      (alias-lookup (_0 atom) aliases)))
+  (Ifz hit atom
+    (normalize-cleanup-atom aliases (_0 hit))))
+
+(define (lit-atom? x)
+  (And (IsApp x) (Eq lit-at (Hd x))))
+
+(define (normalize-cleanup-rhs rec aliases rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((uses-atom-atom? rhs)
+      (normalize-cleanup-atom aliases rhs))
+    ((hd? eval)
+      (let1 atom (normalize-cleanup-atom aliases (_0 rhs))
+        (If (lit-atom? atom) atom (eval atom))))
+    ((hd? force)
+      (force (normalize-cleanup-atom aliases (_0 rhs))))
+    ((hd? delay)
+      (delay (_1 (rec aliases (_0 rhs)))))
+    ((hd? close)
+      (close (normalize-cleanup-atom aliases (_0 rhs))
+             (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? unkapp)
+      (unkapp (normalize-cleanup-atom aliases (_0 rhs))
+              (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? prim)
+      (prim (_0 rhs)
+            (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? call)
+      (call (_0 rhs)
+            (normalize-cleanup-atom aliases (_1 rhs))
+            (map (normalize-cleanup-atom aliases) (_2 rhs))))
+    (else rhs)))
+
+(define (normalize-cleanup-stmt rec state[aliases stmts] stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (let1 rhs (normalize-cleanup-rhs rec aliases (_1 stmt))
+        (If (uses-atom-atom? rhs)
+          [[[(_0 stmt) rhs] aliases] stmts]
+          [aliases (snoc (let-st (_0 stmt) rhs) stmts)])))
+    ((hd? br)
+      (let1 true-proc (_1 (rec aliases (_1 stmt)))
+        (let1 false-proc (_1 (rec aliases (_2 stmt)))
+          [aliases
+           (snoc (br (normalize-cleanup-atom aliases (_0 stmt))
+                     true-proc
+                     false-proc)
+                 stmts)])))
+    ((hd? ret)
+      [aliases (snoc (ret (normalize-cleanup-atom aliases (_0 stmt))) stmts)])
+    (else [aliases (snoc stmt stmts)])))
+
+(define (normalize-cleanup-proc aliases proc)
+  (foldl (normalize-cleanup-stmt normalize-cleanup-proc) [aliases []] proc))
+
+(define (normalize-cleanup-mir mir[result ctx])
+  (define clean[aliases proc] (normalize-cleanup-proc 0 (ctx-mir ctx)))
+  [(normalize-cleanup-atom aliases result) [(bind-count ctx) proc]])
+
+(define partial-app "PARTIAL")
+(define exact-app "EXACT")
+(define over-app "OVER")
+
+(define (partial-info kind fn args arity)
+  (partial-app kind fn args arity))
+(define exact-info (exact-app 0))
+(define (over-info base args) (over-app base args))
+
+(define (known-call-arity atom)
+  (And (lit-atom? atom)
+    (let1 arity (plan-arity (_0 atom))
+      (And (Gt arity 0) [arity]))))
+
+(define (single-use-tmp? counts atom)
+  (And (tmp-atom? atom)
+    (Eq 1 (Ix (_0 atom) counts))))
+
+(define (known-call-info atom infos)
+  (And (tmp-atom? atom)
+    (alias-lookup (_0 atom) infos)))
+
+(define (known-call-keep? removed stmt)
+  (Or (Nil (Eq let-st (Hd stmt)))
+      (Nil (lhas (_0 stmt) removed))))
+
+(define (known-call-emit-stmt state[next infos removed stmts] stmt)
+  [next infos removed (snoc stmt stmts)])
+
+(define (known-call-emit-let state[next infos removed stmts] tmp-id rhs info)
+  [next
+   (Ifz info infos [[tmp-id info] infos])
+   removed
+   (snoc (let-st tmp-id rhs) stmts)])
+
+(define (known-call-remove tmp-id state[next infos removed stmts])
+  [next infos [tmp-id removed] stmts])
+
+(define (known-call-emit-known state[next infos removed stmts]
+                               tmp-id kind fn args arity)
+  (define argc (Sz args))
+  (cond
+    ((Lt argc arity)
+      (known-call-emit-let state tmp-id
+        (close fn args)
+        (partial-info kind fn args arity)))
+    ((Eq argc arity)
+      (known-call-emit-let state tmp-id
+        (call kind fn args)
+        exact-info))
+    (else
+      (define exact-id next)
+      (define exact-args (take arity args))
+      (define rest-args (drop arity args))
+      (define state1
+        [(Inc next)
+         infos
+         removed
+         (snoc (let-st exact-id (call kind fn exact-args)) stmts)])
+      (known-call-emit-let state1 tmp-id
+        (close (tmp exact-id) rest-args)
+        (over-info (tmp exact-id) rest-args)))))
+
+(define (normalize-known-call counts state[next infos removed stmts] tmp-id rhs)
+  (define kind (_0 rhs))
+  (define fn (_1 rhs))
+  (define args (_2 rhs))
+  (define arity-hit (known-call-arity fn))
+  (define info-hit
+    (And (single-use-tmp? counts fn)
+      (known-call-info fn infos)))
+  (cond
+    (arity-hit
+      (known-call-emit-known state tmp-id kind fn args (_0 arity-hit)))
+    (info-hit
+      (define info (_0 info-hit))
+      (define tag (Hd info))
+      (cond
+        ((Eq tag partial-app)
+          (define state1 (known-call-remove (_0 fn) state))
+          (known-call-emit-known state1 tmp-id
+            (_0 info)
+            (_1 info)
+            (Weld (_2 info) args)
+            (_3 info)))
+        ((Eq tag exact-app)
+          (known-call-emit-let state tmp-id
+            (close fn args)
+            (over-info fn args)))
+        ((Eq tag over-app)
+          (define state1 (known-call-remove (_0 fn) state))
+          (define all-args (Weld (_1 info) args))
+          (known-call-emit-let state1 tmp-id
+            (close (_0 info) all-args)
+            (over-info (_0 info) all-args)))
+        (else
+          (known-call-emit-let state tmp-id rhs 0))))
+    (else
+      (known-call-emit-let state tmp-id rhs 0))))
+
+(define (normalize-known-calls-rhs rec counts state[next infos removed stmts] rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? delay)
+      (define nested[next1 proc1]
+        (rec counts next (_0 rhs)))
+      [[next1 infos removed stmts] (delay proc1)])
+    (else [state rhs])))
+
+(define (normalize-known-calls-stmt rec counts state[next infos removed stmts] stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (define tmp-id (_0 stmt))
+      (define normalized[state1 rhs]
+        (normalize-known-calls-rhs rec counts state (_1 stmt)))
+      (If (rhs-tagged? call rhs)
+        (normalize-known-call counts state1 tmp-id rhs)
+        (known-call-emit-let state1 tmp-id rhs 0)))
+    ((hd? br)
+      (define true-branch[next1 true-proc]
+        (rec counts next (_1 stmt)))
+      (define false-branch[next2 false-proc]
+        (rec counts next1 (_2 stmt)))
+      (known-call-emit-stmt [next2 infos removed stmts]
+        (br (_0 stmt) true-proc false-proc)))
+    (else
+      (known-call-emit-stmt state stmt))))
+
+(define (normalize-known-calls-proc counts next proc)
+  (define state[next1 infos removed stmts]
+    (foldl (normalize-known-calls-stmt normalize-known-calls-proc counts)
+           [next 0 0 []]
+           proc))
+  [next1 (filter (known-call-keep? removed) stmts)])
+
+(define (normalize-known-calls-mir mir[result ctx])
+  (define counts (refcounts mir))
+  (define normalized[next proc]
+    (normalize-known-calls-proc counts (bind-count ctx) (ctx-mir ctx)))
+  [result [next proc]])
+
+(define (normalize-mir mir)
+  (normalize-cleanup-mir
+    (normalize-known-calls-mir
+      (normalize-cleanup-mir
+        (normalize-dethunk-mir
+          (normalize-cleanup-mir mir))))))
+
+(define normalize-test-eval-lit
+  [(tmp 0) [1 [(let-st 0 (eval (lit-at 42)))]]])
+
+assert(Equal
+  [(lit-at 42) [1 []]]
+  (normalize-mir normalize-test-eval-lit))
+
+(define normalize-test-copy
+  [(tmp 1) [2 [(let-st 0 (force (env-at 0)))
+               (let-st 1 (tmp 0))]]])
+
+assert(Equal
+  [(tmp 0) [2 [(let-st 0 (force (env-at 0)))]]]
+  (normalize-mir normalize-test-copy))
+
+(define normalize-test-copy-in-delay
+  [(tmp 2) [3 [(let-st 0 (force (env-at 0)))
+               (let-st 1 (tmp 0))
+               (let-st 2 (delay [(ret (tmp 1))]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(let-st 0 (force (env-at 0)))
+               (let-st 2 (delay [(ret (tmp 0))]))]]]
+  (normalize-mir normalize-test-copy-in-delay))
+
+(define normalize-test-copy-before-eval
+  [(tmp 2) [3 [(let-st 0 (delay [(ret (lit-at 7))]))
+               (let-st 1 (tmp 0))
+               (let-st 2 (eval (tmp 1)))]]])
+
+assert(Equal
+  [(lit-at 7) [3 []]]
+  (normalize-mir normalize-test-copy-before-eval))
+
+(define normalize-test-known-under
+  [(tmp 0) [1 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))]]])
+
+assert(Equal
+  [(tmp 0) [1 [(let-st 0 (close (lit-at Add) [(env-at 1)]))]]]
+  (normalize-mir normalize-test-known-under))
+
+(define normalize-test-known-exact
+  [(tmp 1) [2 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))
+               (let-st 1 (call "unk" (tmp 0) [(lit-at 2)]))]]])
+
+assert(Equal
+  [(tmp 1) [2 [(let-st 1 (call "unk" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))]]]
+  (normalize-mir normalize-test-known-exact))
+
+(define normalize-test-known-over
+  [(tmp 2) [3 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))
+               (let-st 1 (call "unk" (tmp 0) [(lit-at 2)]))
+               (let-st 2 (call "unk" (tmp 1) [(lit-at 3)]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(let-st 1 (call "unk" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))
+               (let-st 2 (close (tmp 1) [(lit-at 3)]))]]]
+  (normalize-mir normalize-test-known-over))
 
 
 
