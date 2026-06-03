@@ -16,6 +16,7 @@
 (define lit-at "LIT") ; literal
 (define tmp "TMP") ; tmp
 (define close "CLOSE") ;     Close Atom [Atom]
+(define unkapp "UNKAPP") ;     Close Atom [Atom]
 (define delay "DELAY") ;    Delay Proc
 (define force "FORCE") ;   Force Atom
 (define eval "EVAL") ;   Eval Atom
@@ -59,16 +60,13 @@
   (define (make-thk f x)
     (define thk-ctx (ctx-at (bind-count ctx)))
     (define a[f-at ctx1] (recurse thk-ctx f))
-    (define b[ff-at ctx2] (ctx-let ctx1 (force f-at)))
+    (define b[ff-at ctx2] (ctx-let ctx1 (eval f-at)))
     (define c[x-at ctx3] (recurse ctx2 x))
-    (define d[xx-at ctx4] (ctx-let ctx3 (force x-at)))
+    (define d[xx-at ctx4] (ctx-let ctx3 (eval x-at)))
     (define e[r-at ctx5] (ctx-let ctx4 (call "unk" ff-at [xx-at])))
     (ctx-to-proc ctx ctx5 r-at))
 
-  (define (lower-call body[f x])
-    (make-thk f x))
-
-
+  (define (lower-call body[f x]) (make-thk f x))
   (cond
     ((law-var? depth body) [(env-at body) ctx])
     ((law-call? depth body) (lower-call body))
@@ -78,8 +76,144 @@
   (define l (If (IsPin ll) (Unpin ll) ll))
   (lower-raw-body (Arity l) empty-ctx (Body l)))
 
+(define (uses-atom-atom? x)
+  (And (IsApp x)
+    (or
+      (Eq (Hd x) env-at)
+      (Eq (Hd x) lit-at)
+      (Eq (Hd x) tmp))))
 
-(define (normalize-mir mir))
+(define (uses-atom-rhs rec atom rhs)
+  (define hd? (Eq (Hd rhs)))
+  (define want (Equal atom))
+  (cond
+    ((uses-atom-atom? rhs) (want rhs))
+    ((hd? eval)  (want (_0 rhs)))
+    ((hd? force) (want (_0 rhs)))
+    ((hd? delay) (foldl (rec atom) 0 (_0 rhs)))
+    ((hd? close) (Add (want (_0 rhs)) (sum (map want (_1 rhs)))))
+    ((hd? unkapp) (Add (want (_0 rhs)) (sum (map want (_1 rhs)))))
+    ((hd? prim) (sum (map want (_1 rhs))))
+    ((hd? call) (Add (want (_1 rhs)) (sum (map want (_2 rhs)))))
+    (else 0)))
+(define (uses-atom atom acc stmt)
+  (define hd? (Eq (Hd stmt)))
+  (define want (Equal atom))
+  (Add acc
+    (cond
+      ((hd? let-st) (uses-atom-rhs uses-atom atom (_1 stmt)))
+      ((hd? br)
+        (Add (want (_0 stmt))
+             (Add (foldl (uses-atom atom) 0 (_1 stmt))
+                  (foldl (uses-atom atom) 0 (_2 stmt)))))
+      ((hd? ret) (want (_0 stmt)))
+      (else 0))))
+
+(define (refcount mir[result ctx] tmp-id)
+  (define want (tmp tmp-id))
+  (Add ((Equal want) result)
+       (foldl (uses-atom want) 0 (ctx-mir ctx))))
+
+(define (refcounts mir[result ctx])
+  (define n (bind-count ctx))
+  (Row 0 n (lgen n (refcount mir))))
+
+(define (rhs-tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (tmp-atom? x)
+  (And (IsApp x) (Eq tmp (Hd x))))
+
+(define (delay-proc-in-stmt tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (And (hd? let-st)
+       (And (Eq tmp-id (_0 stmt))
+            (And (rhs-tagged? delay (_1 stmt)) [(_0 (_1 stmt))]))))
+
+(define (delay-proc-in-step tmp-id acc stmt)
+  (Or acc (delay-proc-in-stmt tmp-id stmt)))
+
+(define (delay-proc-in-proc tmp-id proc)
+  (foldl (delay-proc-in-step tmp-id) 0 proc))
+
+(define (eval-use-rhs? tmp-id rhs)
+  (And (rhs-tagged? eval rhs)
+       (And (tmp-atom? (_0 rhs))
+            (Eq tmp-id (_0 (_0 rhs))))))
+
+(define (has-eval-use-stmt tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (And (hd? let-st) (eval-use-rhs? tmp-id (_1 stmt))))
+
+(define (has-eval-use-step tmp-id acc stmt)
+  (Or acc (has-eval-use-stmt tmp-id stmt)))
+
+(define (has-eval-use-in-proc? tmp-id proc)
+  (foldl (has-eval-use-step tmp-id) 0 proc))
+
+(define (dethunkable? counts proc tmp-id)
+  (And (Eq 1 (Ix tmp-id counts))
+       (And (delay-proc-in-proc tmp-id proc)
+            (has-eval-use-in-proc? tmp-id proc))))
+
+(define (skip-delay-stmt? counts proc stmt)
+  (And (Eq let-st (Hd stmt))
+       (And (rhs-tagged? delay (_1 stmt))
+            (dethunkable? counts proc (_0 stmt)))))
+
+(define (eval-delay-proc counts proc rhs)
+  (define atom (_0 rhs))
+  (And (rhs-tagged? eval rhs)
+       (And (tmp-atom? atom)
+            (And (dethunkable? counts proc (_0 atom))
+                 (delay-proc-in-proc (_0 atom) proc)))))
+
+(define (retarget-stmt rec tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? ret) (let-st tmp-id (_0 stmt)))
+    ((hd? br) (br (_0 stmt)
+                  (rec tmp-id (_1 stmt))
+                  (rec tmp-id (_2 stmt))))
+    (else stmt)))
+
+(define (retarget-proc tmp-id proc)
+  (map (retarget-stmt retarget-proc tmp-id) proc))
+
+(define (normalize-rhs rec mir counts rhs)
+  (If (rhs-tagged? delay rhs)
+      (delay (rec mir counts (_0 rhs)))
+      rhs))
+
+(define (normalize-stmt-one rec mir counts stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st) (let-st (_0 stmt) (normalize-rhs rec mir counts (_1 stmt))))
+    ((hd? br) (br (_0 stmt)
+                  (rec mir counts (_1 stmt))
+                  (rec mir counts (_2 stmt))))
+    (else stmt)))
+
+(define (normalize-stmt rec mir counts proc stmt)
+  (define eval-proc
+    (If (Eq let-st (Hd stmt))
+        (eval-delay-proc counts proc (_1 stmt))
+        0))
+  (cond
+    ((skip-delay-stmt? counts proc stmt) 0)
+    (eval-proc (stream (retarget-proc (_0 stmt)
+                                      (rec mir counts (_0 eval-proc)))))
+    (else [(normalize-stmt-one rec mir counts stmt)])))
+
+(define (normalize-proc mir counts proc)
+  (define stmts (lcatmap (normalize-stmt normalize-proc mir counts proc) (stream proc)))
+  (Row 0 (llen stmts) stmts))
+
+(define (normalize-mir mir[result ctx])
+  (define counts (refcounts mir))
+  [result [(bind-count ctx) (normalize-proc mir counts (ctx-mir ctx))]])
+
+
 
 
 
@@ -357,3 +491,6 @@
 
 (define fib-lower (lower-law fib))
 
+(define (count-tmps mir[result ctx])
+  (define n (bind-count ctx))
+  (Row 0 n (lzip (naturals 0) (stream (refcounts mir)))))
