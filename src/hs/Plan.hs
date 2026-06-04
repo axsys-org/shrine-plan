@@ -390,25 +390,41 @@ clz f        x = A f (V.singleton x)
 
 exec :: InActor => Val -> [Val] -> Val
 exec (P _ _ (N o))       e = op o (unapp (e!!0))
-exec (A f x)         e = exec f (V.toList x <> e)
+exec (A f x)         e = exec f (prependArgs x e)
 exec f@(L a m b)     e = judge a (reverse (f : e)) b
 exec f@(P _ _ (L a m b)) e = judge a (reverse (f : e)) b
 exec (P _ _ A{})         _ = error "tried to run a pinned app"
 exec (P _ _ P{})         _ = error "tried to run a pinned pin"
 
+prependArgs :: Vector Val -> [Val] -> [Val]
+prependArgs xs rest = V.foldr (:) rest xs
+
+
 kal :: InActor => Natural -> [Val] -> Val -> Val
-kal n e expr = case unapp expr of
-    [N b] | b<=n -> e !! fromIntegral (n-b)
-    [N 0, f, x]  -> (kal n e f % kal n e x)
-    [N 0, x]     -> x
-    _            -> expr
+kal n e expr = case expr of
+    N b | b<=n -> e !! fromIntegral (n-b)
+    A f xs ->
+        case V.length xs of
+            0 -> case f of
+                N b | b<=n -> e !! fromIntegral (n-b)
+                _          -> expr
+            1 -> case f of
+                N 0 -> xs `V.unsafeIndex` 0
+                _   -> expr
+            2 -> case f of
+                N 0 -> kal n e (xs `V.unsafeIndex` 0) % kal n e (xs `V.unsafeIndex` 1)
+                _   -> expr
+            _ -> expr
+    _ -> expr
 
 judge :: InActor => Natural -> [Val] -> Val -> Val
 judge args ie body = res
   where (n, e, res::Val) = go args ie body
-        go i acc x = case unapp x of
-            [N 1, v, k] -> go (i+1) (kal n e v : acc) k
-            _           -> (i, acc, kal n e x)
+        go i acc x = case x of
+            A (N 1) xs | V.length xs == 2 ->
+                go (i+1) (kal n e (xs `V.unsafeIndex` 0) : acc) (xs `V.unsafeIndex` 1)
+            _ -> (i, acc, kal n e x)
+
 
 data PlanExn = PLAN_EXN !Val
   deriving (Exception)
@@ -664,10 +680,12 @@ planTry f x = unsafePerformIO do
 
 bytesBar :: BS.ByteString -> Natural
 bytesBar bs =
-    let len = BS.length bs
-        body = BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral b) 0
-                 (BS.reverse bs)
+    let !len  = BS.length bs
+        !body = BS.foldr' step 0 bs
     in body .|. (1 `shiftL` (len * 8))
+  where
+    step :: Word8 -> Natural -> Natural
+    step b !acc = (acc `shiftL` 8) .|. fromIntegral b
 
 output :: Handle -> Val -> IO Val
 output h x = do
@@ -683,10 +701,6 @@ planSz _        = N 0
 planBit True  = N 1
 planBit False = N 0
 
-planCoup hd x = case x of
-    A f x | arity hd > fromIntegral (length x) -> A hd x
-    A f x | otherwise                          -> apple (hd : V.toList x)
-    _                                          -> hd
 
 natix = toix . nat
 
@@ -708,30 +722,45 @@ planWeld x y = A (N 0) (toRow x <> toRow y)
 toRow (A _ xs) = xs
 toRow _        = mempty
 
+planRep :: Val -> Val -> Val -> Val
 planRep hd item sz = case nat sz of
-    0 -> N $ nat hd
-    n -> A (N $ nat hd) $ V.fromList $ take (toix n) (repeat item)
+    0 -> N (nat hd)
+    n -> A (N (nat hd)) $ V.replicate (toix n) item
 
+planRow :: Val -> Val -> Val -> Val
 planRow hd sz xs = case nat sz of
-    0 -> N $ nat hd
-    n -> A (N $ nat hd) $ V.fromList $ take (toix n) (stream xs)
-           where stream x = ix0 x : stream (ix1 x)
+    0 -> N (nat hd)
+    n -> A (N (nat hd)) $
+           V.unfoldrN (toix n) (\x -> Just (ix0 x, ix1 x)) xs
 
-planUp ix v r = case r of
-    A f xs | i < length xs -> A f (xs V.// [(i, v)])
-    _                      -> r
-  where !i = natix ix
-
+planCoup :: InActor => Val -> Val -> Val
+planCoup hd x = case x of
+    A _ xs
+      | arity hd > fromIntegral (V.length xs) -> A hd xs
+      | otherwise                             -> V.foldl' (%) hd xs
+    _ -> hd
 
 planIx :: Val -> Val -> Val
-planIx ix r = case r of A f xs | i < length xs -> xs!i
-                        _                      -> N 0
-  where !i = natix ix
+planIx ix r = case r of
+    A _ xs | i < V.length xs -> V.unsafeIndex xs i
+    _                        -> N 0
+  where
+    !i = natix ix
+
+planUp :: Val -> Val -> Val -> Val
+planUp ix v r = case r of
+    A hd xs | i < V.length xs -> A hd $ xs V.// [(i, v)]
+    _                        -> r
+  where
+    !i = natix ix
 
 
 ix0, ix1 :: Val -> Val
-ix0 (A _ x) = x!0;               ix0 _ = N 0
-ix1 (A _ x) | length x >1 = x!1; ix1 _ = N 0
+ix0 (A _ xs) = V.unsafeIndex xs 0
+ix0 _        = N 0
+
+ix1 (A _ xs) | V.length xs > 1 = V.unsafeIndex xs 1
+ix1 _                          = N 0
 
 adt :: Natural -> [Val] -> Val
 adt n [] = N n
