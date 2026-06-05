@@ -22,14 +22,14 @@
 (define OP_PUSH_LIT_TAG 1)
 (define OP_MK_APP_TAG 2)
 (define OP_CALLF_TAG 3)
-(define OP_CALLU_TAG 4)
+(define OP_CALLS_TAG 4)
 (define OP_PUSH_SELF_TAG 5)
 (define OP_EVAL_TAG 6)
 (define OP_TAIL_EVAL_TAG 7)
 (define OP_FORCE_TAG 8)
 (define OP_DROP_TAG 9)
 (define OP_ROTATE_TAG 10)
-(define OP_JUMP_IF_ZERO_TAG 11)
+(define OP_JMP_TAG 11)
 (define OP_JUMP_IF_TAG 12)
 (define OP_ADD_NAT_TAG 13)
 (define OP_PIN_TAG 14)
@@ -85,21 +85,23 @@
 (define OP_LE_TAG 64)
 (define OP_CMP_TAG 65)
 (define OP_RET_TAG 66)
-(define OP_CALLP_TAG 67)
-(define OP_COUNT 68)
+(define OP_APPLY_UNK_TAG 67)
+(define OP_APPLY_FAST_TAG 68)
+(define OP_MAKE_SUSP_TAG 69)
+(define OP_COUNT 70)
 
 (define (OP_PUSH_VAR slot) ("OP_PUSH_VAR" slot))
 (define (OP_PUSH_LIT val) ("OP_PUSH_LIT" val))
 (define (OP_MK_APP count) ("OP_MK_APP" (byte-u32! "OP_MK_APP" count)))
 (define (OP_CALLF argc) ("OP_CALLF" (byte-u32! "OP_CALLF" argc)))
-(define (OP_CALLU argc) ("OP_CALLU" (byte-u32! "OP_CALLU" argc)))
+(define (OP_CALLS argc) ("OP_CALLS" (byte-u32! "OP_CALLS" argc)))
 (define OP_PUSH_SELF ("OP_PUSH_SELF" 0))
 (define OP_EVAL ("OP_EVAL" 0))
 (define OP_TAIL_EVAL ("OP_TAIL_EVAL" 0))
 (define OP_FORCE ("OP_FORCE" 0))
 (define OP_DROP ("OP_DROP" 0))
 (define (OP_ROTATE n) ("OP_ROTATE" (byte-u32! "OP_ROTATE" n)))
-(define (OP_JUMP_IF_ZERO label) ("OP_JUMP_IF_ZERO" (byte-u32! "OP_JUMP_IF_ZERO" label)))
+(define (OP_JMP label) ("OP_JMP" (byte-u32! "OP_JMP" label)))
 (define (OP_JUMP_IF label) ("OP_JUMP_IF" (byte-u32! "OP_JUMP_IF" label)))
 (define OP_ADD_NAT ("OP_ADD_NAT" 0))
 (define OP_PIN ("OP_PIN" 0))
@@ -155,7 +157,9 @@
 (define OP_LE ("OP_LE" 0))
 (define OP_CMP ("OP_CMP" 0))
 (define OP_RET ("OP_RET" 0))
-(define OP_CALLP ("OP_CALLP" 0))
+(define (OP_APPLY_UNK count) ("OP_APPLY_UNK" (byte-u32! "OP_APPLY_UNK" count)))
+(define (OP_APPLY_FAST count) ("OP_APPLY_FAST" (byte-u32! "OP_APPLY_FAST" count)))
+(define (OP_MAKE_SUSP label) ("OP_MAKE_SUSP" (byte-u32! "OP_MAKE_SUSP" label)))
 
 (define ARG_L 0)
 (define ARG_W 1)
@@ -380,13 +384,12 @@
 
 (define (call-builder known-fun argc tail c)
   (define fun-arity (known-arity known-fun))
-  (define thunk (If (Or (Nil known-fun) (Gt argc fun-arity)) 1
-                  (If (Lt argc fun-arity) 0 1)))
+  (define thunk (If (Or (Nil known-fun) (Gt argc fun-arity)) 1 0))
   (define op (If (Or (Nil known-fun) (Gt argc fun-arity))
-               (OP_CALLU argc)
+               (OP_APPLY_UNK (Inc argc))
                (If (Lt argc fun-arity)
                  (OP_MK_APP (Inc argc))
-                 (OP_CALLF argc))))
+                 (OP_CALLS argc))))
   (emit-tail-eval-if tail thunk (comp-append-one op c)))
 
 (define (emit-rotate-repeat span count c)
@@ -436,11 +439,11 @@
         (comp (comp-next true-body) (comp-labels true-body) saved-code)))
     (define cond-code (as-expr (_0 args) 0 with-true))
     (define eval-code (comp-append-one OP_EVAL cond-code))
-    (define jump-op
+    (define test-code
       (If (Eq (prim-name route) "Ifz")
-        (OP_JUMP_IF_ZERO true-label)
-        (OP_JUMP_IF true-label)))
-    (define jump-code (comp-append-one jump-op eval-code))
+        (comp-append-one OP_NOT eval-code)
+        eval-code))
+    (define jump-code (comp-append-one (OP_JUMP_IF true-label) test-code))
     (as-expr (_2 args) 1 jump-code))
   (define (compile-primitive-call route head args tail? acc)
     (define argc (Sz args))
@@ -465,7 +468,8 @@
         (define c2 (emit-primitive-arg-evals route c1))
         (define c3 (comp-append-one (prim-op route) c2))
         (define c4 (compile-value-row rest-args c3))
-        (emit-tail-eval-if tail? 1 (comp-append-one (OP_CALLU (Sub argc primc)) c4)))))
+        (emit-tail-eval-if tail? 1
+          (comp-append-one (OP_APPLY_UNK (Inc (Sub argc primc))) c4)))))
   (define (compile-plain-call head args tail? acc)
     (define argc (Sz args))
     (define lit (byte-pull-const head))
@@ -484,7 +488,7 @@
         (define c2 (as-app-value (_0 args) c1))
         (define c3 (compile-value-row (drop 1 args) c2))
         (If (Eq argc 1)
-          (emit-tail-eval-if tail? 1 (comp-append-one OP_CALLP c2))
+          (emit-tail-eval-if tail? 1 (comp-append-one (OP_APPLY_UNK 2) c2))
           (call-builder (known 1) argc tail? c3)))
       ((byte-law-call? lit)
         (error ("literal-call-head" lit)))
@@ -520,7 +524,7 @@
             (comp-append-one OP_PUSH_SELF acc)
             (as-value head acc)))
         (define c2 (compile-value-row args c1))
-        (comp-append-one (OP_CALLU (Sz args)) c2))
+        (comp-append-one (OP_APPLY_UNK (Inc (Sz args))) c2))
       ((And (IsApp e) (Nil (byte-law-quote? e)))
         (define c1 (as-value (Hd e) acc))
         (define c2 (compile-value-row e c1))
@@ -585,9 +589,9 @@
 (#export
  BYTE_U32_MAX
  OP_COUNT
- OP_PUSH_VAR_TAG OP_PUSH_LIT_TAG OP_MK_APP_TAG OP_CALLF_TAG OP_CALLU_TAG
+ OP_PUSH_VAR_TAG OP_PUSH_LIT_TAG OP_MK_APP_TAG OP_CALLF_TAG OP_CALLS_TAG
  OP_PUSH_SELF_TAG OP_EVAL_TAG OP_TAIL_EVAL_TAG OP_FORCE_TAG OP_DROP_TAG
- OP_ROTATE_TAG OP_JUMP_IF_ZERO_TAG OP_JUMP_IF_TAG OP_ADD_NAT_TAG
+ OP_ROTATE_TAG OP_JMP_TAG OP_JUMP_IF_TAG OP_ADD_NAT_TAG
  OP_PIN_TAG OP_LAW_TAG OP_ELIM_TAG OP_INC_TAG OP_DEC_TAG OP_NAM_TAG
  OP_BODY_TAG OP_NAT_TAG OP_ARI_TAG OP_UNPIN_TAG OP_SZ_TAG OP_LAST_TAG
  OP_INIT_TAG OP_ADD_TAG OP_SUB_TAG OP_RSH_TAG OP_LSH_TAG OP_DIV_TAG
@@ -597,18 +601,20 @@
  OP_TRUNC8_TAG OP_TRUNC16_TAG OP_TRUNC32_TAG OP_TRUNC64_TAG OP_REP_TAG
  OP_SLICE_TAG OP_WELD_TAG OP_UP_TAG OP_COUP_TAG OP_HD_TAG OP_IX_TAG
  OP_NOT_TAG OP_TRU_TAG OP_OR_TAG OP_AND_TAG OP_EQ_TAG OP_LE_TAG OP_CMP_TAG
- OP_RET_TAG OP_CALLP_TAG
- OP_PUSH_VAR OP_PUSH_LIT OP_MK_APP OP_CALLF OP_CALLU OP_PUSH_SELF
- OP_EVAL OP_TAIL_EVAL OP_FORCE OP_DROP OP_ROTATE OP_JUMP_IF_ZERO
+ OP_RET_TAG OP_APPLY_UNK_TAG OP_APPLY_FAST_TAG OP_MAKE_SUSP_TAG
+ OP_PUSH_VAR OP_PUSH_LIT OP_MK_APP OP_CALLF OP_CALLS OP_PUSH_SELF
+ OP_EVAL OP_TAIL_EVAL OP_FORCE OP_DROP OP_ROTATE OP_JMP
  OP_JUMP_IF OP_ADD_NAT OP_PIN OP_LAW OP_ELIM OP_INC OP_DEC OP_NAM
  OP_BODY OP_NAT OP_ARI OP_UNPIN OP_SZ OP_LAST OP_INIT OP_ADD OP_SUB
  OP_RSH OP_LSH OP_DIV OP_MUL OP_MOD OP_TEST OP_LOADN OP_LOAD OP_STOREN
  OP_STORE OP_TRUNCN OP_TRUNC OP_MET OP_MET_DYN OP_BEX OP_BITS OP_BYTES
  OP_LOAD8 OP_STORE8 OP_TRUNC8 OP_TRUNC16 OP_TRUNC32 OP_TRUNC64 OP_REP
  OP_SLICE OP_WELD OP_UP OP_COUP OP_HD OP_IX OP_NOT OP_TRU OP_OR OP_AND
- OP_EQ OP_LE OP_CMP OP_RET OP_CALLP
+ OP_EQ OP_LE OP_CMP OP_RET OP_APPLY_UNK OP_APPLY_FAST OP_MAKE_SUSP
  byte-law byte-law-name byte-law-body byte-law-arity byte-law-let-d
  byte-law-bc-s byte-law-labels byte-label-code
+ ARG_L ARG_W ARG_N
+ prim-name prim-arity prim-op prim-evals
  byte-pull-const byte-quote byte-law-var? byte-law-call? byte-lift-call
  byte-known-arity byte-primitive-key byte-primitive-for-head
  byte-direct-primitive-wrapper byte-prims
