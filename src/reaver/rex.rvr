@@ -1,0 +1,1488 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+;;; Rex implemented in Reaver.  The public representation matches the
+;;; Haskell bridge that used to live in Plan.hs:
+;;;
+;;;   ["leaf" span shape text]
+;;;   ["nest" span color rune kids]
+;;;   ["expr" span color kids]
+;;;   ["pref" span rune kid]
+;;;   ["tyte" span rune kids]
+;;;   ["bloc" span color rune head items]
+;;;   ["open" span rune kids]
+;;;   ["juxt" span kids]
+;;;   ["heir" span kids]
+
+;;; Basic helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define REX_MAX_INT 9223372036854775807)
+(define REX_DQUOTE 34)
+
+(define (rex-not x) (Nil x))
+(define (rex-bool x) (Truth x))
+(define (rex-some x) [x])
+(define (rex-none? x) (Nil x))
+(define (rex-from-some x) (_0 x))
+
+(define (rex-error msg)
+  (error ("rex" msg)))
+
+(define (rex-str-slice off len src)
+  (LoadVar off len src))
+
+(define (rex-str-drop off src)
+  (rex-str-slice off (Sub (Bytes src) off) src))
+
+(define (rex-str-take len src)
+  (rex-str-slice 0 len src))
+
+(define (rex-char-at src i)
+  (Load8 i src))
+
+(define (rex-eof-at? src i)
+  (Ge i (Bytes src)))
+
+(define (rex-string-empty? s)
+  (Eq 0 (Bytes s)))
+
+(define (rex-str-prefix? pre s)
+  (define n (Bytes pre))
+  (And (Le n (Bytes s))
+       (Eq pre (rex-str-slice 0 n s))))
+
+(define (rex-str-suffix? suf s)
+  (define n (Bytes suf))
+  (define m (Bytes s))
+  (And (Le n m)
+       (Eq suf (rex-str-slice (Sub m n) n s))))
+
+(define (rex-char-in-loop ch chars i)
+  (And (Lt i (Bytes chars))
+       (Or (Eq ch (Load8 i chars))
+           (rex-char-in-loop ch chars (Inc i)))))
+
+(define (rex-char-in? ch chars)
+  (rex-char-in-loop ch chars 0))
+
+(define (rex-is-space? ch)
+  (Or (Eq ch " ") (Eq ch 9)))
+
+(define (rex-is-eol? ch)
+  (Eq ch 10))
+
+(define (rex-is-alpha-num? ch)
+  (Or (And (Ge ch "a") (Le ch "z"))
+      (Or (And (Ge ch "A") (Le ch "Z"))
+          (And (Ge ch "0") (Le ch "9")))))
+
+(define (rex-is-word? ch)
+  (Or (rex-is-alpha-num? ch) (Eq ch "_")))
+
+(define rex-rune-chars ";,:#$`~@?\\|^&=!<>+-*/%!.")
+
+(define (rex-is-rune? ch)
+  (rex-char-in? ch rex-rune-chars))
+
+(define (rex-is-open? ch)
+  (Or (Eq ch "(") (Or (Eq ch "[") (Eq ch "{"))))
+
+(define (rex-is-close? ch)
+  (Or (Eq ch ")") (Or (Eq ch "]") (Eq ch "}"))))
+
+(define (rex-is-free-after? src i)
+  (Or (rex-eof-at? src i)
+      (let* ((ch (rex-char-at src i)))
+        (Or (Eq ch " ")
+            (Or (Eq ch 10)
+                (rex-is-close? ch))))))
+
+(define (rex-span lin col off len)
+  [lin col off len])
+
+(define (rex-span-line sp) (_0 sp))
+(define (rex-span-col sp)  (_1 sp))
+(define (rex-span-off sp)  (_2 sp))
+(define (rex-span-len sp)  (_3 sp))
+
+(define (rex-span-end sp)
+  (Add (rex-span-off sp) (rex-span-len sp)))
+
+(define rex-no-span [0 0 0 0])
+
+(define (rex-tok ty lin col off len text)
+  [ty lin col off len text])
+
+(define rex-tok-ty _0)
+(define rex-tok-lin _1)
+(define rex-tok-col _2)
+(define rex-tok-off _3)
+(define rex-tok-len _4)
+(define rex-tok-text _5)
+
+(define (rex-tok-span t)
+  (rex-span (rex-tok-lin t) (rex-tok-col t) (rex-tok-off t) (rex-tok-len t)))
+
+(define (rex-tok-end t)
+  (Add (rex-tok-off t) (rex-tok-len t)))
+
+(define (rex-span-while pred src i)
+  (If (And (Lt i (Bytes src)) (pred (rex-char-at src i)))
+      (rex-span-while pred src (Inc i))
+      i))
+
+(define (rex-lines-go src start i acc)
+  (cond
+    ((Gt i (Bytes src)) (rowify (lrev acc)))
+    ((Eq i (Bytes src))
+      (rowify (lrev (lcons (rex-str-slice start (Sub i start) src) acc))))
+    ((Eq 10 (rex-char-at src i))
+      (rex-lines-go src (Inc i) (Inc i)
+        (lcons (rex-str-slice start (Sub i start) src) acc)))
+    (else
+      (rex-lines-go src start (Inc i) acc))))
+
+(define (rex-lines src)
+  (If (Eq 0 (Bytes src)) [] (rex-lines-go src 0 0 0)))
+
+(define (rex-unlines-go lines)
+  (cond
+    ((Eq 0 (Sz lines)) "")
+    ((Eq 1 (Sz lines)) (_0 lines))
+    (else (strcat [(_0 lines) "\n" (rex-unlines-go (drop 1 lines))]))))
+
+(define rex-unlines rex-unlines-go)
+
+(define (rex-all-spaces? s)
+  (all (lambda (c) (Eq c " ")) (trip s)))
+
+(define (rex-leading-spaces-go s i)
+  (If (And (Lt i (Bytes s)) (Eq " " (rex-char-at s i)))
+      (rex-leading-spaces-go s (Inc i))
+      i))
+
+(define (rex-leading-spaces s)
+  (rex-leading-spaces-go s 0))
+
+(define (rex-strip-n n s)
+  (If (Eq n 0) s
+      (If (And (Gt (Bytes s) 0) (Eq " " (rex-char-at s 0)))
+          (rex-strip-n (Dec n) (rex-str-drop 1 s))
+          s)))
+
+(define (rex-min-nonblank-indent-go lines i best)
+  (If (Ge i (Sz lines)) best
+      (let* ((line (Ix i lines)))
+        (rex-min-nonblank-indent-go lines (Inc i)
+          (If (rex-all-spaces? line) best
+              (min best (rex-leading-spaces line)))))))
+
+(define (rex-normalize-quip-indent s)
+  (If (Nil (find (lambda (c) (Eq c 10)) (trip s))) s
+      (let* ((ls (rex-lines s))
+             (first (_0 ls))
+             (rest (drop 1 ls))
+             (min-indent (rex-min-nonblank-indent-go rest 0 REX_MAX_INT)))
+        (strcat [first
+                 (foldl (lambda (acc line)
+                          (strcat [acc "\n" (rex-strip-n min-indent line)]))
+                        ""
+                        rest)]))))
+
+;;; Lexer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-lex-trad src sl sc so i lin col)
+  (define tok-off (Dec so))
+  (cond
+    ((rex-eof-at? src i)
+      [ (rex-tok "BAD" sl sc tok-off (Sub i tok-off)
+                 (rex-str-slice tok-off (Sub i tok-off) src))
+        i col lin ])
+    ((And (Eq REX_DQUOTE (rex-char-at src i))
+          (And (Lt (Inc i) (Bytes src))
+               (Eq REX_DQUOTE (rex-char-at src (Inc i)))))
+      (rex-lex-trad src sl sc so (Add i 2) lin (Add col 2)))
+    ((Eq REX_DQUOTE (rex-char-at src i))
+      [ (rex-tok "TRAD" sl sc tok-off (Sub (Inc i) tok-off)
+                 (rex-str-slice tok-off (Sub (Inc i) tok-off) src))
+        (Inc i) (Inc col) lin ])
+    ((Eq 10 (rex-char-at src i))
+      (rex-lex-trad src sl sc so (Inc i) (Inc lin) 0))
+    (else
+      (rex-lex-trad src sl sc so (Inc i) lin (Inc col)))))
+
+(define (rex-lex-note src sl sc so i)
+  (define end (rex-span-while (lambda (ch) (Ne ch 10)) src i))
+  (define n (Sub end so))
+  [ (rex-tok "WYTE" sl sc so n (rex-str-slice so n src))
+    end
+    (If (rex-eof-at? src end) (Add sc n) 0)
+    sl ])
+
+(define (rex-lex-slug-continue? src tcol i)
+  (define sp-end (rex-span-while (lambda (ch) (Eq ch " ")) src i))
+  (define col (Inc (Sub sp-end i)))
+  (If (And (Eq col tcol)
+           (And (Lt sp-end (Bytes src))
+                (And (Eq "'" (rex-char-at src sp-end))
+                     (Or (Eq (Inc sp-end) (Bytes src))
+                         (Or (Eq " " (rex-char-at src (Inc sp-end)))
+                             (Eq 10 (rex-char-at src (Inc sp-end))))))))
+      [(Sub sp-end i) (Inc sp-end)]
+      0))
+
+(define (rex-lex-slug-go src tcol start i lin)
+  (define line-end (rex-span-while (lambda (ch) (Ne ch 10)) src i))
+  (If (rex-eof-at? src line-end)
+      [(Sub line-end start) line-end lin]
+      (let* ((cont (rex-lex-slug-continue? src tcol (Inc line-end))))
+        (If cont
+            (rex-lex-slug-go src tcol start (_1 cont) (Inc lin))
+            [(Sub line-end start) line-end lin]))))
+
+(define (rex-lex-slug src tlin tcol tok-off i)
+  (let* ((r (rex-lex-slug-go src tcol tok-off i tlin))
+         (n (_0 r))
+         (end (_1 r))
+         (lin-end (_2 r)))
+    [(rex-tok "SLUG" tlin tcol tok-off n (rex-str-slice tok-off n src))
+     end
+     (Add tcol n)
+     lin-end]))
+
+(define (rex-scan-ugly src n i lin col run)
+  (cond
+    ((rex-eof-at? src i) [i lin col 0])
+    ((Eq "'" (rex-char-at src i))
+      (let* ((run1 (Inc run))
+             (i1 (Inc i))
+             (col1 (Inc col)))
+        (If (Eq run1 n)
+            [i1 lin col1 1]
+            (rex-scan-ugly src n i1 lin col1 run1))))
+    ((Eq 10 (rex-char-at src i))
+      (rex-scan-ugly src n (Inc i) (Inc lin) 0 0))
+    (else
+      (rex-scan-ugly src n (Inc i) lin (Inc col) 0))))
+
+(define (rex-lex-ugly src tlin tcol tok-off n col0 off0)
+  (let* ((r (rex-scan-ugly src n off0 tlin (Dec col0) 0))
+         (end (_0 r))
+         (lin-end (_1 r))
+         (col-end (_2 r))
+         (closed (_3 r))
+         (ty (If closed "UGLY" "BAD")))
+    [(rex-tok ty tlin tcol tok-off (Sub end tok-off)
+              (rex-str-slice tok-off (Sub end tok-off) src))
+     end col-end lin-end]))
+
+(define (rex-count-quotes src i)
+  (If (And (Lt i (Bytes src)) (Eq "'" (rex-char-at src i)))
+      (Inc (rex-count-quotes src (Inc i)))
+      0))
+
+(define (rex-lex-tick src tlin tcol to)
+  (define tick-off (Dec to))
+  (cond
+    ((rex-eof-at? src to)
+      [[(rex-tok "QUIP" tlin tcol tick-off 1 "'")] to tcol tlin])
+    ((Or (Eq " " (rex-char-at src to)) (Eq 10 (rex-char-at src to)))
+      (let* ((r (rex-lex-slug src tlin tcol tick-off to)))
+        [[(_0 r)] (_1 r) (_2 r) (_3 r)]))
+    ((Eq "'" (rex-char-at src to))
+      (let* ((qs (rex-count-quotes src to))
+             (n (Inc qs))
+             (col0 (Add tcol n))
+             (off0 (Add to qs))
+             (r (rex-lex-ugly src tlin tcol tick-off n col0 off0)))
+        [[(_0 r)] (_1 r) (_2 r) (_3 r)]))
+    ((rex-is-close? (rex-char-at src to))
+      (let* ((r (rex-lex-note src tlin tcol tick-off to)))
+        [[(_0 r)] (_1 r) (_2 r) (_3 r)]))
+    (else
+      [[(rex-tok "QUIP" tlin tcol tick-off 1 "'")] to tcol tlin])))
+
+(define (rex-lex-go src lin col off)
+  (If (rex-eof-at? src off)
+      [(rex-tok "EOF" 1 0 off 0 "") 0]
+      (let* ((ch (rex-char-at src off)))
+        (cond
+          ((Eq ch 10)
+            [(rex-tok "EOL" lin 0 off 1 "\n")
+             (rex-lex-go src (Inc lin) 0 (Inc off))])
+          ((rex-is-space? ch)
+            (let* ((end (rex-span-while rex-is-space? src off))
+                   (n (Sub end off)))
+              [(rex-tok "WYTE" lin (Inc col) off n (rex-str-slice off n src))
+               (rex-lex-go src lin (Add col n) end)]))
+          ((rex-is-open? ch)
+            [(rex-tok "BEGIN" lin (Inc col) off 1 (rex-str-slice off 1 src))
+             (rex-lex-go src lin (Inc col) (Inc off))])
+          ((rex-is-close? ch)
+            [(rex-tok "END" lin (Inc col) off 1 (rex-str-slice off 1 src))
+             (rex-lex-go src lin (Inc col) (Inc off))])
+          ((Eq ch REX_DQUOTE)
+            (let* ((r (rex-lex-trad src lin (Inc col) (Inc off) (Inc off) lin (Inc col))))
+              [(_0 r) (rex-lex-go src (_3 r) (_2 r) (_1 r))]))
+          ((Eq ch "'")
+            (let* ((r (rex-lex-tick src lin (Inc col) (Inc off))))
+              (lweld (_0 r) (rex-lex-go src (_3 r) (_2 r) (_1 r)))))
+          ((rex-is-rune? ch)
+            (let* ((end (rex-span-while rex-is-rune? src off))
+                   (n (Sub end off))
+                   (ty (If (rex-is-free-after? src end) "FREE" "CLMP")))
+              [(rex-tok ty lin (Inc col) off n (rex-str-slice off n src))
+               (rex-lex-go src lin (Add col n) end)]))
+          ((rex-is-word? ch)
+            (let* ((end (rex-span-while rex-is-word? src off))
+                   (n (Sub end off)))
+              [(rex-tok "WORD" lin (Inc col) off n (rex-str-slice off n src))
+               (rex-lex-go src lin (Add col n) end)]))
+          (else
+            [(rex-tok "BAD" lin (Inc col) off 1 (rex-str-slice off 1 src))
+             (rex-lex-go src lin (Inc col) (Inc off))])))))
+
+(define (rex-lex src)
+  (rex-lex-go src 1 0 0))
+
+;;; Block splitting ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-open-close s)
+  (cond
+    ((Eq s "(") ")")
+    ((Eq s "[") "]")
+    ((Eq s "{") "}")
+    (else ")")))
+
+(define (rex-step-nest stk tok)
+  (cond
+    ((Eq (rex-tok-ty tok) "BEGIN")
+      [tok (lcons (rex-open-close (rex-tok-text tok)) stk)])
+    ((Eq (rex-tok-ty tok) "END")
+      (If (And stk (Eq (_0 stk) (rex-tok-text tok)))
+          [tok (_1 stk)]
+          [(Up 0 "BAD" tok) stk]))
+    (else [tok stk])))
+
+(define (rex-content-token? ty)
+  (Nil (Or (Eq ty "EOL")
+           (Or (Eq ty "WYTE")
+               (Or (Eq ty "EOF") (Eq ty "EOB"))))))
+
+(define (rex-bsplit-step-mode mode stk eol was-rune was-slug tok)
+  (define ty (rex-tok-ty tok))
+  (cond
+    ((Eq mode "OUTSIDE")
+      [[tok]
+       (cond
+         ((Eq ty "FREE") "BLK")
+         ((rex-content-token? ty) "SINGLE")
+         (else "OUTSIDE"))])
+    ((Eq mode "SINGLE")
+      (If (And (Nil stk) (And (Eq ty "EOL") (Eq eol 1)))
+          (If (Or was-rune was-slug)
+              [[tok] "BLK"]
+              [[(rex-tok "EOB" (rex-tok-lin tok) 0 (rex-tok-off tok) 0 "")] "OUTSIDE"])
+          [[tok] "SINGLE"]))
+    (else
+      (If (And (Nil stk) (And (Eq ty "EOL") (Eq eol 2)))
+          [[(rex-tok "EOB" (rex-tok-lin tok) 0 (rex-tok-off tok) 0 "")] "OUTSIDE"]
+          [[tok] "BLK"]))))
+
+(define (rex-bsplit-go toks mode stk eol was-rune was-slug)
+  (Ifz toks 0
+    (let* ((tok0 (_0 toks))
+           (nest (rex-step-nest stk tok0))
+           (tok (_0 nest))
+           (stk1 (_1 nest))
+           (eol1 (If (Eq (rex-tok-ty tok) "EOL") (Inc eol) 0))
+           (sm (rex-bsplit-step-mode mode stk1 eol1 was-rune was-slug tok))
+           (out (_0 sm))
+           (mode1 (_1 sm))
+           (ty (rex-tok-ty tok))
+           (was-rune1 (Or (Eq ty "CLMP") (Eq ty "FREE")))
+           (was-slug1 (Eq ty "SLUG")))
+      (lweld (stream out)
+        (rex-bsplit-go (_1 toks) mode1 stk1 eol1 was-rune1 was-slug1)))))
+
+(define (rex-bsplit toks)
+  (rex-bsplit-go toks "OUTSIDE" 0 0 0 0))
+
+;;; Tree model and parser ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-node-rune sp r) ["rune" sp r])
+(define (rex-node-leaf sp lf) ["leaf-node" sp lf])
+(define (rex-node-child tr) ["child" tr])
+
+(define (rex-tree shape color span nodes)
+  ["tree" shape color span nodes])
+
+(define rex-tree-shape _1)
+(define rex-tree-color _2)
+(define rex-tree-span _3)
+(define rex-tree-nodes _4)
+(define (rex-tree-pos t) (rex-span-col (rex-tree-span t)))
+(define (rex-tree-off t) (rex-span-off (rex-tree-span t)))
+(define (rex-tree-len t) (rex-span-len (rex-tree-span t)))
+
+(define (rex-node-tag n) (_0 n))
+(define (rex-node-span n)
+  (cond
+    ((Eq (_0 n) "rune") (_1 n))
+    ((Eq (_0 n) "leaf-node") (_1 n))
+    (else (rex-tree-span (_1 n)))))
+
+(define (rex-node-col n)
+  (rex-span-col (rex-node-span n)))
+
+(define (rex-leaf ltag s) [ltag s])
+(define (rex-leaf-tag lf) (_0 lf))
+(define (rex-leaf-text lf) (_1 lf))
+
+(define (rex-ctx ty color lin pos off end nodes-rev first-col rune-cnt last-rune)
+  [ty color lin pos off end nodes-rev first-col rune-cnt last-rune])
+
+(define rex-ctx-ty _0)
+(define rex-ctx-color _1)
+(define rex-ctx-lin _2)
+(define rex-ctx-pos _3)
+(define rex-ctx-off _4)
+(define rex-ctx-end _5)
+(define rex-ctx-nodes-rev _6)
+(define rex-ctx-first-col _7)
+(define rex-ctx-rune-cnt _8)
+(define rex-ctx-last-rune _9)
+
+(define (rex-ctx-empty? c)
+  (Nil (rex-ctx-nodes-rev c)))
+
+(define (rex-mk-ctx ty color lin pos off)
+  (rex-ctx ty color lin pos off off 0 0 0 0))
+
+(define rex-root-ctx
+  (rex-ctx "nest" "clear" 1 0 REX_MAX_INT 0 0 0 0 0))
+
+(define (rex-ctx-nodes c)
+  (rowify (lrev (rex-ctx-nodes-rev c))))
+
+(define (rex-append-node n nlin noff end c)
+  (define is-rune (Eq (rex-node-tag n) "rune"))
+  (rex-ctx
+    (rex-ctx-ty c)
+    (rex-ctx-color c)
+    (If (Eq (rex-ctx-off c) REX_MAX_INT) nlin (rex-ctx-lin c))
+    (rex-ctx-pos c)
+    (If (Eq (rex-ctx-off c) REX_MAX_INT) noff (rex-ctx-off c))
+    (max (rex-ctx-end c) end)
+    (lcons n (rex-ctx-nodes-rev c))
+    (If (rex-ctx-first-col c) (rex-ctx-first-col c) [(rex-node-col n)])
+    (Add (rex-ctx-rune-cnt c) (If is-rune 1 0))
+    is-rune))
+
+(define (rex-finalize c)
+  (let* ((off (If (Eq (rex-ctx-off c) REX_MAX_INT) 0 (rex-ctx-off c))))
+    (rex-tree (rex-ctx-ty c)
+              (rex-ctx-color c)
+              (rex-span (rex-ctx-lin c)
+                        (rex-ctx-pos c)
+                        off
+                        (max 0 (Sub (rex-ctx-end c) off)))
+              (rex-ctx-nodes c))))
+
+(define (rex-stack-ctx c) ["ctx" c])
+(define (rex-stack-quip lin col off) ["quip" lin col off])
+(define (rex-stack-tag x) (_0 x))
+(define (rex-stack-val x) (_1 x))
+
+(define (rex-leaf-token? ty)
+  (Or (Eq ty "WORD")
+      (Or (Eq ty "TRAD")
+          (Or (Eq ty "UGLY")
+              (Or (Eq ty "SLUG") (Eq ty "BAD"))))))
+
+(define (rex-mk-leaf tok)
+  (define ty (rex-tok-ty tok))
+  (rex-node-leaf (rex-tok-span tok)
+    (cond
+      ((Eq ty "WORD") (rex-leaf "word" (rex-tok-text tok)))
+      ((Eq ty "TRAD") (rex-leaf "trad" (rex-tok-text tok)))
+      ((Eq ty "UGLY") (rex-leaf "ugly" (rex-tok-text tok)))
+      ((Eq ty "SLUG") (rex-leaf "slug" (rex-tok-text tok)))
+      (else           (rex-leaf "bad"  (rex-tok-text tok))))))
+
+(define (rex-free-pos tok)
+  (Add (Dec (rex-tok-col tok)) (rex-tok-len tok)))
+
+(define (rex-free-node tok)
+  (rex-node-rune (rex-span (rex-tok-lin tok) (rex-free-pos tok)
+                           (rex-tok-off tok) (rex-tok-len tok))
+                 (rex-tok-text tok)))
+
+(define (rex-clmp-node tok)
+  (rex-node-rune (rex-tok-span tok) (rex-tok-text tok)))
+
+(define (rex-open-color text)
+  (cond
+    ((Eq text "(") "paren")
+    ((Eq text "[") "brack")
+    ((Eq text "{") "curly")
+    (else "paren")))
+
+(define (rex-push-into node nlin noff end st)
+  (define top (_0 st))
+  (If (Eq (rex-stack-tag top) "ctx")
+      (lcons (rex-stack-ctx (rex-append-node node nlin noff end (rex-stack-val top)))
+             (_1 st))
+      (lcons top (rex-push-into node nlin noff end (_1 st)))))
+
+(define (rex-open-clump lin col coff st)
+  (define top (_0 st))
+  (If (And (Eq (rex-stack-tag top) "ctx")
+           (Eq (rex-ctx-ty (rex-stack-val top)) "clump"))
+      st
+      (lcons (rex-stack-ctx (rex-mk-ctx "clump" "clear" lin col coff)) st)))
+
+(define (rex-push-leaf node nlin noff end st)
+  (rex-push-into node nlin noff end
+    (rex-open-clump nlin (rex-node-col node) noff st)))
+
+(define (rex-pop st)
+  (define top (_0 st))
+  (define rest (_1 st))
+  (If (Eq (rex-stack-tag top) "ctx")
+      (let* ((k (rex-stack-val top)))
+        (cond
+          ((And rest (Eq (rex-stack-tag (_0 rest)) "quip"))
+            (let* ((q (_0 rest))
+                   (qrest (_1 rest))
+                   (tree (rex-finalize k))
+                   (qlin (_1 q))
+                   (qcol (_2 q))
+                   (qoff (_3 q))
+                   (quip (rex-tree "quip" "clear"
+                                    (rex-span qlin qcol qoff (Sub (rex-ctx-end k) qoff))
+                                    [(rex-node-child tree)])))
+              (rex-push-leaf (rex-node-child quip) qlin qoff (rex-ctx-end k) qrest)))
+          ((And (Eq (rex-ctx-ty k) "block") (rex-ctx-empty? k))
+            rest)
+          ((Eq (rex-ctx-ty k) "nest")
+            (let* ((t (rex-finalize k)))
+              (rex-push-leaf (rex-node-child t)
+                             (rex-span-line (rex-tree-span t))
+                             (rex-tree-off t)
+                             (rex-ctx-end k)
+                             rest)))
+          (else
+            (let* ((t (rex-finalize k)))
+              (rex-push-into (rex-node-child t)
+                             (rex-span-line (rex-tree-span t))
+                             (rex-tree-off t)
+                             (rex-ctx-end k)
+                             rest)))))
+      (rex-error ["bad-pop" st])))
+
+(define (rex-pop-all st)
+  (If (And (Eq (rex-stack-tag (_0 st)) "ctx") (Nil (_1 st)))
+      st
+      (rex-pop-all (rex-pop st))))
+
+(define (rex-close-clump st)
+  (define top (_0 st))
+  (If (And (Eq (rex-stack-tag top) "ctx")
+           (Eq (rex-ctx-ty (rex-stack-val top)) "clump"))
+      (rex-pop st)
+      st))
+
+(define (rex-update-top-end end st)
+  (define top (_0 st))
+  (If (Eq (rex-stack-tag top) "ctx")
+      (lcons (rex-stack-ctx
+               (Up 5 (max end (rex-ctx-end (rex-stack-val top)))
+                   (rex-stack-val top)))
+             (_1 st))
+      st))
+
+(define (rex-try-open-block st)
+  (define top (_0 st))
+  (If (Eq (rex-stack-tag top) "ctx")
+      (let* ((c (rex-stack-val top)))
+        (If (And (Or (Eq (rex-ctx-ty c) "nest") (Eq (rex-ctx-ty c) "item"))
+                 (And (Nil (rex-ctx-empty? c))
+                      (And (rex-ctx-last-rune c)
+                           (And (Eq (rex-ctx-rune-cnt c) 1)
+                                (rex-ctx-first-col c)))))
+            (lcons (rex-stack-ctx
+                     (rex-mk-ctx "block" "clear"
+                                 (rex-ctx-lin c)
+                                 (Inc (_0 (rex-ctx-first-col c)))
+                                 (rex-ctx-end c)))
+                   st)
+            st))
+      st))
+
+(define (rex-real-token? ty)
+  (Or (rex-leaf-token? ty)
+      (Or (Eq ty "CLMP")
+          (Or (Eq ty "FREE")
+              (Or (Eq ty "BEGIN")
+                  (Or (Eq ty "QUIP") (Eq ty "END")))))))
+
+(define (rex-step-clump dispatch tok ctx rest)
+  (let* ((ty (rex-tok-ty tok)))
+    (cond
+      ((rex-leaf-token? ty)
+        (lcons (rex-stack-ctx
+                 (rex-append-node (rex-mk-leaf tok)
+                                  (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok) ctx))
+               rest))
+      ((Eq ty "CLMP")
+        (lcons (rex-stack-ctx
+                 (rex-append-node (rex-clmp-node tok)
+                                  (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok) ctx))
+               rest))
+      ((Eq ty "BEGIN")
+        (lcons (rex-stack-ctx
+                 (rex-mk-ctx "nest" (rex-open-color (rex-tok-text tok))
+                             (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+               (lcons (rex-stack-ctx ctx) rest)))
+      (else
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest)))))))
+
+(define (rex-step-quip dispatch tok qlin qcol qoff rest)
+  (let* ((ty (rex-tok-ty tok)))
+    (cond
+      ((rex-leaf-token? ty)
+        (rex-push-into (rex-mk-leaf tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+          (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                          (lcons (rex-stack-quip qlin qcol qoff) rest))))
+      ((Eq ty "CLMP")
+        (rex-push-into (rex-clmp-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+          (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                          (lcons (rex-stack-quip qlin qcol qoff) rest))))
+      ((Eq ty "FREE")
+        (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+                 (lcons (rex-stack-quip qlin qcol qoff) rest))))
+      ((Eq ty "BEGIN")
+        (lcons (rex-stack-ctx
+                 (rex-mk-ctx "nest" (rex-open-color (rex-tok-text tok))
+                             (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+               (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                               (lcons (rex-stack-quip qlin qcol qoff) rest))))
+      ((Eq ty "QUIP")
+        (lcons (rex-stack-quip (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok))
+               (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                               (lcons (rex-stack-quip qlin qcol qoff) rest))))
+      ((Or (Eq ty "WYTE") (Eq ty "EOL"))
+        (lcons (rex-stack-quip qlin qcol qoff) rest))
+      ((Eq ty "END")
+        (dispatch tok rest))
+      (else
+        (dispatch tok rest)))))
+
+(define (rex-step-poem dispatch tok ctx rest)
+  (let* ((ty (rex-tok-ty tok))
+         (is-real (rex-real-token? ty))
+         (heir-rune (And (Eq ty "FREE") (Eq (rex-free-pos tok) (rex-ctx-pos ctx)))))
+    (If (And is-real (And (Lt (rex-tok-col tok) (rex-ctx-pos ctx)) (Nil heir-rune)))
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest)))
+        (cond
+          ((rex-leaf-token? ty)
+            (rex-push-leaf (rex-mk-leaf tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+                           (lcons (rex-stack-ctx ctx) rest)))
+          ((Eq ty "CLMP")
+            (rex-push-into (rex-clmp-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+              (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                              (lcons (rex-stack-ctx ctx) rest))))
+          ((Eq ty "FREE")
+            (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+                     (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
+          ((Eq ty "BEGIN")
+            (lcons (rex-stack-ctx
+                     (rex-mk-ctx "nest" (rex-open-color (rex-tok-text tok))
+                                 (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+                   (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                                   (lcons (rex-stack-ctx ctx) rest))))
+          ((Eq ty "QUIP")
+            (lcons (rex-stack-quip (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok))
+                   (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
+          ((Eq ty "END")
+            (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+          ((Or (Eq ty "WYTE") (Eq ty "EOL"))
+            (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))
+          (else
+            (lcons (rex-stack-ctx ctx) rest))))))
+
+(define (rex-step-spaced dispatch tok ctx rest)
+  (let* ((ty (rex-tok-ty tok)))
+    (cond
+      ((Eq ty "SLUG")
+        (rex-push-into (rex-mk-leaf tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+                 (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
+      ((rex-leaf-token? ty)
+        (rex-push-leaf (rex-mk-leaf tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+                       (lcons (rex-stack-ctx ctx) rest)))
+      ((Eq ty "CLMP")
+        (rex-push-into (rex-clmp-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+          (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                          (lcons (rex-stack-ctx ctx) rest))))
+      ((Eq ty "FREE")
+        (If (Or (rex-ctx-empty? ctx) (rex-ctx-last-rune ctx))
+            (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+                     (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
+            (lcons (rex-stack-ctx
+                     (rex-append-node (rex-free-node tok) (rex-tok-lin tok)
+                                      (rex-tok-off tok) (rex-tok-end tok) ctx))
+                   rest)))
+      ((Eq ty "BEGIN")
+        (lcons (rex-stack-ctx
+                 (rex-mk-ctx "nest" (rex-open-color (rex-tok-text tok))
+                             (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+               (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
+                               (lcons (rex-stack-ctx ctx) rest))))
+      ((Eq ty "END")
+        (rex-pop (rex-update-top-end (rex-tok-end tok)
+                  (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
+      ((Eq ty "QUIP")
+        (lcons (rex-stack-quip (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok))
+               (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
+      ((Eq ty "WYTE")
+        (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))
+      ((Eq ty "EOL")
+        (rex-try-open-block (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
+      (else
+        (lcons (rex-stack-ctx ctx) rest)))))
+
+(define (rex-step-item dispatch tok ctx rest)
+  (let* ((ty (rex-tok-ty tok))
+         (is-real (rex-real-token? ty)))
+    (cond
+      ((And is-real (Lt (rex-tok-col tok) (rex-ctx-pos ctx)))
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+      ((And is-real (And (Eq (rex-tok-col tok) (rex-ctx-pos ctx)) (Nil (rex-ctx-empty? ctx))))
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+      ((Eq ty "END")
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+      (else
+        (rex-step-spaced dispatch tok ctx rest)))))
+
+(define (rex-step-block dispatch tok ctx rest)
+  (let* ((ty (rex-tok-ty tok))
+         (is-real (Or (rex-leaf-token? ty)
+                      (Or (Eq ty "CLMP")
+                          (Or (Eq ty "FREE")
+                              (Or (Eq ty "BEGIN") (Eq ty "QUIP")))))))
+    (cond
+      ((And is-real (Lt (rex-tok-col tok) (rex-ctx-pos ctx)))
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+      ((And is-real (Ge (rex-tok-col tok) (rex-ctx-pos ctx)))
+        (let* ((ctx1 (Up 3 (rex-tok-col tok) ctx)))
+          (dispatch tok
+            (lcons (rex-stack-ctx (rex-mk-ctx "item" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+                   (lcons (rex-stack-ctx ctx1) rest)))))
+      ((Eq ty "END")
+        (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
+      (else
+        (lcons (rex-stack-ctx ctx) rest)))))
+
+(define (rex-dispatch tok st)
+  (let* ((top (_0 st))
+         (rest (_1 st)))
+    (If (Eq (rex-stack-tag top) "ctx")
+        (let* ((ctx (rex-stack-val top))
+               (ty (rex-ctx-ty ctx)))
+          (cond
+            ((Eq ty "clump") (rex-step-clump rex-dispatch tok ctx rest))
+            ((Eq ty "poem")  (rex-step-poem rex-dispatch tok ctx rest))
+            ((Eq ty "block") (rex-step-block rex-dispatch tok ctx rest))
+            ((Eq ty "item")  (rex-step-item rex-dispatch tok ctx rest))
+            (else            (rex-step-spaced rex-dispatch tok ctx rest))))
+        (rex-step-quip rex-dispatch tok (_1 top) (_2 top) (_3 top) rest))))
+
+(define (rex-emit-root reset p)
+  (let* ((st (rex-pop-all (_0 p)))
+         (out (_1 p))
+         (root (rex-stack-val (_0 st)))
+         (tree (rex-finalize root))
+         (st-next (If reset [(rex-stack-ctx rex-root-ctx)] st)))
+    [st-next (lcons tree out)]))
+
+(define (rex-tree-step p tok)
+  (define ty (rex-tok-ty tok))
+  (If (Or (Eq ty "EOF") (Eq ty "EOB"))
+      (rex-emit-root 1 p)
+      [(rex-dispatch tok (_0 p)) (_1 p)]))
+
+(define (rex-parse-trees toks)
+  (lrev (_1 (lfoldl rex-tree-step [[(rex-stack-ctx rex-root-ctx)] 0] toks))))
+
+;;; Rex normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-leaf-shape-bad reason)
+  ["bad" reason])
+
+(define (rex-classify-bad-leaf sp s)
+  ["leaf" sp
+   (rex-leaf-shape-bad
+     (cond
+       ((And (rex-str-prefix? REX_DQUOTE s) (Nil (rex-str-suffix? REX_DQUOTE s))) "unclosed-trad")
+       ((And (rex-str-prefix? "''" s) (Nil (rex-str-suffix? "''" s))) "unclosed-ugly")
+       (else "invalid-char")))
+   s])
+
+(define (rex-unescape-quotes s)
+  (define (go i)
+    (cond
+      ((Ge i (Bytes s)) "")
+      ((And (Eq REX_DQUOTE (rex-char-at s i))
+            (And (Lt (Inc i) (Bytes s))
+                 (Eq REX_DQUOTE (rex-char-at s (Inc i)))))
+        (strcat [REX_DQUOTE (go (Add i 2))]))
+      (else
+        (strcat [(rex-str-slice i 1 s) (go (Inc i))]))))
+  (go 0))
+
+(define (rex-valid-page-line? depth line)
+  (Or (rex-all-spaces? line)
+      (And (Ge (Bytes line) depth)
+           (Eq (reap " " depth) (rex-str-slice 0 depth line)))))
+
+(define (rex-valid-span-line? depth line)
+  (Ge (rex-leading-spaces line) depth))
+
+(define (rex-strip-line-for-page depth line)
+  (If (rex-all-spaces? line) "" (rex-strip-n depth line)))
+
+(define (rex-remove-last-char s)
+  (rex-str-slice 0 (Dec (Bytes s)) s))
+
+(define (rex-strip-cord sp s after-open)
+  (define body (If (rex-str-suffix? REX_DQUOTE after-open)
+                   (rex-remove-last-char after-open)
+                   after-open))
+  (define content-col (rex-span-col sp))
+  (define ls (rex-lines body))
+  (cond
+    ((Eq 0 (Sz ls)) ["ok" ""])
+    ((Eq 1 (Sz ls)) ["ok" (rex-unescape-quotes (_0 ls))])
+    ((all (lambda (line) (rex-valid-span-line? content-col line)) (drop 1 ls))
+      ["ok" (rex-unlines
+              (cons (rex-unescape-quotes (_0 ls))
+                    (map (lambda (line) (rex-unescape-quotes (rex-strip-n content-col line)))
+                         (drop 1 ls))))])
+    (else ["bad" "invalid-span"])))
+
+(define (rex-strip-tape s col rest)
+  (define ls (rex-lines rest))
+  (If (Eq 0 (Sz ls))
+      ["ok" ""]
+      (let* ((last-line (Last ls))
+             (body (snip ls))
+             (strip-depth (rex-leading-spaces last-line))
+             (after (rex-strip-n strip-depth last-line)))
+        (If (And (Eq after REX_DQUOTE)
+                 (all (lambda (line) (rex-valid-page-line? strip-depth line)) body))
+            ["ok" (rex-unlines
+                    (map (lambda (line)
+                           (rex-unescape-quotes
+                             (rex-strip-line-for-page strip-depth line)))
+                         body))]
+            ["bad" "invalid-page"]))))
+
+(define (rex-trad-to-rex sp s)
+  (If (rex-str-prefix? REX_DQUOTE s)
+      (let* ((after-open (rex-str-drop 1 s)))
+        (If (rex-str-prefix? "\n" after-open)
+            (let* ((r (rex-strip-tape s (rex-span-col sp) (rex-str-drop 1 after-open))))
+              (If (Eq (_0 r) "ok")
+                  ["leaf" sp "tape" (_1 r)]
+                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))
+            (let* ((r (rex-strip-cord sp s after-open)))
+              (If (Eq (_0 r) "ok")
+                  ["leaf" sp "cord" (_1 r)]
+                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))))
+      ["leaf" sp "cord" s]))
+
+(define (rex-remove-closing ticks s)
+  (If (rex-str-suffix? ticks s)
+      (rex-str-slice 0 (Sub (Bytes s) (Bytes ticks)) s)
+      s))
+
+(define (rex-strip-span sp n content)
+  (define ticks (reap "'" n))
+  (define body (rex-remove-closing ticks content))
+  (define content-col (Sub (Add (rex-span-col sp) n) 1))
+  (define ls (rex-lines body))
+  (cond
+    ((Eq 0 (Sz ls)) ["ok" ""])
+    ((Eq 1 (Sz ls)) ["ok" (rex-unescape-quotes (_0 ls))])
+    ((all (lambda (line) (rex-valid-span-line? content-col line)) (drop 1 ls))
+      ["ok" (rex-unlines
+              (cons (rex-unescape-quotes (_0 ls))
+                    (map (lambda (line) (rex-unescape-quotes (rex-strip-n content-col line)))
+                         (drop 1 ls))))])
+    (else ["bad" "invalid-span"])))
+
+(define (rex-strip-page n content)
+  (define ls (rex-lines content))
+  (define close-ticks (reap "'" n))
+  (If (Eq 0 (Sz ls))
+      ["ok" ""]
+      (let* ((last-line (Last ls))
+             (body (snip ls))
+             (strip-depth (rex-leading-spaces last-line))
+             (after (rex-strip-n strip-depth last-line)))
+        (If (And (Eq after close-ticks)
+                 (all (lambda (line) (rex-valid-page-line? strip-depth line)) body))
+            ["ok" (rex-unlines (map (lambda (line) (rex-strip-line-for-page strip-depth line)) body))]
+            ["bad" "invalid-page"]))))
+
+(define (rex-ugly-to-rex sp s)
+  (define n (rex-count-quotes s 0))
+  (If (Ge n 2)
+      (let* ((after-open (rex-str-drop n s)))
+        (If (rex-str-prefix? "\n" after-open)
+            (let* ((r (rex-strip-page n (rex-str-drop 1 after-open))))
+              (If (Eq (_0 r) "ok")
+                  ["leaf" sp "page" (_1 r)]
+                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))
+            (let* ((r (rex-strip-span sp n after-open)))
+              (If (Eq (_0 r) "ok")
+                  ["leaf" sp "span" (_1 r)]
+                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))))
+      ["leaf" sp "span" s]))
+
+(define (rex-strip-slug-line s)
+  (cond
+    ((rex-str-prefix? "' " s) (rex-str-drop 2 s))
+    ((rex-str-prefix? "'" s)  (rex-str-drop 1 s))
+    (else s)))
+
+(define (rex-strip-slug s)
+  (rex-unlines (map rex-strip-slug-line (rex-lines s))))
+
+(define (rex-leaf-to-rex sp lf)
+  (define tag (rex-leaf-tag lf))
+  (define s (rex-leaf-text lf))
+  (cond
+    ((Eq tag "word") ["leaf" sp "word" s])
+    ((Eq tag "trad") (rex-trad-to-rex sp s))
+    ((Eq tag "ugly") (rex-ugly-to-rex sp s))
+    ((Eq tag "slug") ["leaf" sp "slug" (rex-strip-slug s)])
+    (else (rex-classify-bad-leaf sp s))))
+
+(define rex-rune-seq ";,:#$`~@?\\|^&=!<>+-*/%!.")
+
+(define (rex-rune-prec ch)
+  (define (go i)
+    (If (Ge i (Bytes rex-rune-seq)) i
+        (If (Eq ch (rex-char-at rex-rune-seq i)) i (go (Inc i)))))
+  (go 0))
+
+(define (rex-pack-rune-go s i acc)
+  (If (Eq i 13) acc
+      (let* ((code (If (Lt i (Bytes s)) (rex-rune-prec (rex-char-at s i)) 23)))
+        (rex-pack-rune-go s (Inc i) (Add (Mul acc 25) code)))))
+
+(define (rex-pack-rune s)
+  ;; Haskell uses foldr over the first thirteen precedence codes.  Building
+  ;; from the right would require a list; the numeric ordering is equivalent
+  ;; for fixed-width base-25 words.
+  (rex-pack-rune-go s 0 0))
+
+(define (rex-rune-cmp a b)
+  (Cmp (rex-pack-rune a) (rex-pack-rune b)))
+
+(define (rex-insert-rune r sorted)
+  (Ifz sorted [r 0]
+    (let* ((s (_0 sorted)))
+      (cond
+        ((Eq r s) sorted)
+        ((Eq 2 (rex-rune-cmp r s)) [s (rex-insert-rune r (_1 sorted))])
+        (else [r sorted])))))
+
+(define (rex-sorted-runes elems)
+  (Ifz elems 0
+    (let* ((e (_0 elems))
+           (tail (rex-sorted-runes (_1 elems))))
+      (If (Eq (_0 e) "rune-elem")
+          (rex-insert-rune (_1 e) tail)
+          tail))))
+
+(define (rex-elem-rune r) ["rune-elem" r])
+(define (rex-elem-rex r)  ["rex-elem" r])
+(define (rex-elem-block items) ["block-elem" items])
+
+(define (rex-split-on-rune rune elems)
+  (define (go acc xs)
+    (Ifz xs [(lrev acc) 0]
+      (let* ((e (_0 xs)))
+        (If (And (Eq (_0 e) "rune-elem") (Eq (_1 e) rune))
+            [(lrev acc) (go 0 (_1 xs))]
+            (go (lcons e acc) (_1 xs))))))
+  (go 0 elems))
+
+(define (rex-apply-color sp color rex)
+  (If (Eq color "clear") rex
+      (cond
+        ((And (Eq (_0 rex) "nest") (Eq (_2 rex) "clear"))
+          ["nest" sp color (_3 rex) (_4 rex)])
+        ((And (Eq (_0 rex) "expr") (Eq (_2 rex) "clear"))
+          ["expr" sp color (_3 rex)])
+        ((And (Eq (_0 rex) "bloc") (Eq (_2 rex) "clear"))
+          ["bloc" sp color (_3 rex) (_4 rex) (_5 rex)])
+        (else ["expr" sp color [rex]]))))
+
+(define (rex-node-to-elem convert src block-off node)
+  (cond
+    ((Eq (_0 node) "rune")
+      (rex-elem-rune (_2 node)))
+    ((Eq (_0 node) "leaf-node")
+      (rex-elem-rex (rex-leaf-to-rex (_1 node) (_2 node))))
+    (else
+      (let* ((tree (_1 node)))
+        (If (Eq (rex-tree-shape tree) "block")
+            (rex-elem-block (map _1 (filter (lambda (n) (Eq (_0 n) "child"))
+                                            (rex-tree-nodes tree))))
+            (rex-elem-rex (convert src block-off tree)))))))
+
+(define (rex-convert-node convert src block-off node)
+  (cond
+    ((Eq (_0 node) "leaf-node") (rex-leaf-to-rex (_1 node) (_2 node)))
+    ((Eq (_0 node) "child") (convert src block-off (_1 node)))
+    (else (rex-error ["bare-rune" node]))))
+
+(define (rex-merge-blocks-go convert src block-off acc xs)
+  (cond
+    ((Nil xs) (lrev acc))
+    ((And (Eq (_0 (_0 xs)) "rex-elem")
+          (And (_1 xs)
+               (And (Eq (_0 (_0 (_1 xs))) "rune-elem")
+                    (And (_1 (_1 xs))
+                         (Eq (_0 (_0 (_1 (_1 xs)))) "block-elem")))))
+      (let* ((hd (_1 (_0 xs)))
+             (r (_1 (_0 (_1 xs))))
+             (items (_1 (_0 (_1 (_1 xs)))))
+             (bloc ["bloc" rex-no-span "clear" r hd
+                    (Row 0 (llen items)
+                         (lmap (lambda (t) (convert src block-off t)) items))]))
+        (rex-merge-blocks-go convert src block-off
+                             (lcons (rex-elem-rex bloc) acc)
+                             (_1 (_1 (_1 xs))))))
+    ((And (Eq (_0 (_0 xs)) "rune-elem")
+          (And (_1 xs) (Eq (_0 (_0 (_1 xs))) "block-elem")))
+      (let* ((r (_1 (_0 xs)))
+             (items (_1 (_0 (_1 xs))))
+             (bloc ["bloc" rex-no-span "clear" r ["expr" rex-no-span "clear" []]
+                    (Row 0 (llen items)
+                         (lmap (lambda (t) (convert src block-off t)) items))]))
+        (rex-merge-blocks-go convert src block-off
+                             (lcons (rex-elem-rex bloc) acc)
+                             (_1 (_1 xs)))))
+    (else
+      (rex-merge-blocks-go convert src block-off (lcons (_0 xs) acc) (_1 xs)))))
+
+(define (rex-merge-blocks convert src block-off elems)
+  (rex-merge-blocks-go convert src block-off 0 elems))
+
+(define (rex-infix-recur sp runes elems)
+  (cond
+    ((And (Eq 1 (llen elems)) (Eq (_0 (_0 elems)) "rex-elem"))
+      (_1 (_0 elems)))
+    ((Nil runes)
+      (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+        (If (Eq 1 (llen rs)) (_0 rs)
+            ["expr" sp "clear" (rowify rs)])))
+    (else
+      (let* ((rune (_0 runes))
+             (groups (rex-split-on-rune rune elems)))
+        (If (Nil (_1 groups))
+            (rex-infix-recur sp (_1 runes) (_0 groups))
+            (let* ((parts (lfilter (lambda (g) (Nil (Nil g))) groups)))
+              ["nest" sp "clear" rune
+               (Row 0 (llen parts)
+                    (lmap (lambda (g) (rex-infix-recur sp (_1 runes) g))
+                          parts))]))))))
+
+(define (rex-spaced-group convert src block-off sp color nodes)
+  (let* ((elems (rex-merge-blocks convert src block-off
+                  (lmap (lambda (n) (rex-node-to-elem convert src block-off n))
+                        (stream nodes))))
+         (runes (rex-sorted-runes elems)))
+    (If (Nil runes)
+        (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+          (cond
+            ((Nil rs) ["expr" sp color []])
+            ((Nil (_1 rs)) (rex-apply-color sp color (_0 rs)))
+            (else ["expr" sp color (rowify rs)])))
+        (rex-apply-color sp color (rex-infix-recur sp runes elems)))))
+
+(define (rex-extract-block nodes)
+  (If (Lt (Sz nodes) 2) 0
+      (let* ((last-node (Last nodes))
+             (prev (Ix (Sub (Sz nodes) 2) nodes)))
+        (If (And (Eq (_0 last-node) "child")
+                 (And (Eq (rex-tree-shape (_1 last-node)) "block")
+                      (Eq (_0 prev) "rune")))
+            [(take (Sub (Sz nodes) 2) nodes)
+             (_2 prev)
+             (map _1 (filter (lambda (n) (Eq (_0 n) "child"))
+                             (rex-tree-nodes (_1 last-node))))]
+            0))))
+
+(define (rex-spaced-head convert src block-off nodes)
+  (cond
+    ((Eq 0 (Sz nodes)) ["expr" rex-no-span "clear" []])
+    ((Eq 1 (Sz nodes)) (rex-convert-node convert src block-off (_0 nodes)))
+    (else (rex-spaced-group convert src block-off rex-no-span "clear" nodes))))
+
+(define (rex-convert-spaced convert src block-off sp color nodes)
+  (let* ((blk (rex-extract-block nodes)))
+    (If blk
+        (let* ((head-nodes (_0 blk))
+               (rune (_1 blk))
+               (block-children (_2 blk)))
+          ["bloc" sp color rune
+           (rex-spaced-head convert src block-off head-nodes)
+           (map (lambda (t) (convert src block-off t)) block-children)])
+        (rex-spaced-group convert src block-off sp color nodes))))
+
+(define (rex-convert-nest convert src block-off sp color nodes)
+  (cond
+    ((Eq 0 (Sz nodes)) ["expr" sp color []])
+    ((Eq 1 (Sz nodes)) (rex-apply-color sp color (rex-convert-node convert src block-off (_0 nodes))))
+    (else (rex-convert-spaced convert src block-off sp color nodes))))
+
+(define (rex-juxt-collapse sp acc rest)
+  (cond
+    ((Nil acc) rest)
+    ((Nil (_1 acc)) (lcons (rex-elem-rex (_0 acc)) rest))
+    (else (lcons (rex-elem-rex ["juxt" sp (rowify (lrev acc))]) rest))))
+
+(define (rex-clump-juxt sp acc elems)
+  (Ifz elems
+      (rex-juxt-collapse sp acc 0)
+      (let* ((e (_0 elems)))
+        (cond
+          ((Eq (_0 e) "rune-elem")
+            (rex-juxt-collapse sp acc (lcons e (rex-clump-juxt sp 0 (_1 elems)))))
+          ((Eq (_0 e) "rex-elem")
+            (rex-clump-juxt sp (lcons (_1 e) acc) (_1 elems)))
+          (else
+            (rex-clump-juxt sp acc (_1 elems)))))))
+
+(define (rex-clump-tight-go sp runes elems)
+  (cond
+    ((And (Eq 1 (llen elems)) (Eq (_0 (_0 elems)) "rex-elem")) (_1 (_0 elems)))
+    ((Nil runes)
+      (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+        (If (Nil (_1 rs)) (_0 rs) ["expr" sp "clear" (rowify rs)])))
+    (else
+      (let* ((kids (lmap (lambda (g) (rex-clump-tight-go sp (_1 runes) g))
+                         (rex-split-on-rune (_0 runes) elems))))
+        (If (Nil (_1 kids)) (_0 kids) ["tyte" sp (_0 runes) (rowify kids)])))))
+
+(define (rex-clump-tight sp elems)
+  (let* ((runes (rex-sorted-runes elems)))
+    (If (Nil runes)
+        (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+          (If (Nil (_1 rs)) (_0 rs) ["expr" sp "clear" (rowify rs)]))
+        (rex-clump-tight-go sp runes elems))))
+
+(define (rex-convert-clump-top sp es)
+  (cond
+    ((And (Eq 1 (llen es)) (Eq (_0 (_0 es)) "rex-elem"))
+      (_1 (_0 es)))
+    ((And (Eq (_0 (_0 es)) "rune-elem")
+          (And (_1 es) (Eq (_0 (_0 (_1 es))) "rex-elem")))
+      (rex-convert-clump-top sp
+        (lcons (rex-elem-rex ["pref" sp (_1 (_0 es)) (_1 (_0 (_1 es)))])
+               (_1 (_1 es)))))
+    ((Eq (_0 (_0 es)) "rune-elem")
+      ["pref" sp (_1 (_0 es)) (rex-convert-clump-top sp (_1 es))])
+    (else
+      (let* ((collapsed (rex-clump-juxt sp 0 es)))
+        (If (And (Eq 1 (llen collapsed)) (Eq (_0 (_0 collapsed)) "rex-elem"))
+            (_1 (_0 collapsed))
+            (rex-clump-tight sp collapsed))))))
+
+(define (rex-convert-clump convert src block-off sp nodes)
+  (let* ((elems (lmap (lambda (n) (rex-node-to-elem convert src block-off n)) (stream nodes))))
+    (If (Eq 0 (Sz nodes)) (rex-error "empty-clump") (rex-convert-clump-top sp elems))))
+
+(define (rex-split-heir-go pos acc rest)
+  (Ifz rest [(rowify (lrev acc)) []]
+    (If (Le (rex-node-col (_0 rest)) pos)
+        [(rowify (lrev acc)) (rowify rest)]
+        (rex-split-heir-go pos (lcons (_0 rest) acc) (_1 rest)))))
+
+(define (rex-split-heir pos nodes)
+  (rex-split-heir-go pos 0 (stream nodes)))
+
+(define (rex-flatten-heir r)
+  (If (Eq (_0 r) "heir") (stream (_2 r)) [r 0]))
+
+(define (rex-concat-flattened rs)
+  (lcat (lmap rex-flatten-heir rs)))
+
+(define (rex-mk-heir sp rs)
+  (If (Nil (_1 rs)) (_0 rs) ["heir" sp (rowify rs)]))
+
+(define (rex-convert-poem convert src block-off sp pos nodes)
+  (If (Eq 0 (Sz nodes))
+      (rex-error "empty-poem")
+      (let* ((first (_0 nodes)))
+        (cond
+          ((Eq (_0 first) "rune")
+            (let* ((split (rex-split-heir pos (drop 1 nodes)))
+                   (children (_0 split))
+                   (heir-nodes (_1 split))
+                   (open ["open" sp (_2 first)
+                          (map (lambda (n) (rex-convert-node convert src block-off n)) children)]))
+              (If (Eq 0 (Sz heir-nodes))
+                  open
+                  (rex-mk-heir sp
+                    (lcons open
+                      (rex-concat-flattened
+                        (lmap (lambda (n) (rex-convert-node convert src block-off n))
+                              (stream heir-nodes))))))))
+          ((Eq (_0 first) "leaf-node")
+            (let* ((slug (rex-leaf-to-rex (_1 first) (_2 first)))
+                   (flattened (rex-concat-flattened
+                                (lmap (lambda (n) (rex-convert-node convert src block-off n))
+                                      (stream (drop 1 nodes))))))
+              (rex-mk-heir sp (lcons slug flattened))))
+          (else (rex-error "poem-start"))))))
+
+(define (rex-quip-to-rex src block-off tree)
+  (let* ((qoff (rex-tree-off tree))
+         (qlen (rex-tree-len tree))
+         (s (rex-str-slice (Sub qoff block-off) qlen src)))
+    ["leaf" (rex-tree-span tree) "quip" (rex-normalize-quip-indent s)]))
+
+(define (rex-convert-with src block-off tree)
+  (let* ((sh (rex-tree-shape tree))
+         (sp (rex-tree-span tree))
+         (nodes (rex-tree-nodes tree)))
+    (cond
+      ((Eq sh "nest")  (rex-convert-nest rex-convert-with src block-off sp (rex-tree-color tree) nodes))
+      ((Eq sh "clump") (rex-convert-clump rex-convert-with src block-off sp nodes))
+      ((Eq sh "poem")  (rex-convert-poem rex-convert-with src block-off sp (rex-tree-pos tree) nodes))
+      ((Eq sh "item")  (rex-convert-spaced rex-convert-with src block-off sp "clear" nodes))
+      ((Eq sh "quip")  (rex-quip-to-rex src block-off tree))
+      (else (rex-error ["bad-tree-shape" sh])))))
+
+(define (rex-from-block-tree src tree)
+  (If (And (Eq (rex-tree-shape tree) "nest") (Eq (rex-tree-color tree) "clear"))
+      (If (Eq 0 (Sz (rex-tree-nodes tree)))
+          0
+          [(rex-convert-spaced rex-convert-with src (rex-tree-off tree)
+                               (rex-tree-span tree) "clear" (rex-tree-nodes tree))])
+      (rex-error "top-level-tree-not-clear")))
+
+(define (rex-parse-src src)
+  (define trees (rex-parse-trees (rex-bsplit (rex-lex src))))
+  (If (Eq 1 (llen trees))
+      (let* ((tree (_0 trees))
+             (slice (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src)))
+        (rex-from-block-tree slice tree))
+      0))
+
+(define (ParseRex src)
+  (define r (rex-parse-src src))
+  (If r (_0 r) (Throw "bad rex parse")))
+
+;;; Printer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-escape-quotes s)
+  (define (go i)
+    (If (Ge i (Bytes s)) ""
+        (let* ((ch (rex-str-slice i 1 s)))
+          (strcat [(If (Eq ch REX_DQUOTE)
+                       (strcat [REX_DQUOTE REX_DQUOTE])
+                       ch)
+                   (go (Inc i))]))))
+  (go 0))
+
+(define (rex-leaf-width shape s)
+  (cond
+    ((Eq shape "word") (Bytes s))
+    ((Eq shape "quip") (Inc (Bytes s)))
+    ((Eq shape "cord") (Add 2 (Bytes (rex-escape-quotes s))))
+    ((Eq shape "tape") (Add 2 (Bytes s)))
+    ((Eq shape "page") (Add 6 (Bytes s)))
+    ((Eq shape "span") (Add 6 (Bytes s)))
+    ((Eq shape "slug") (Add 2 (Bytes s)))
+    (else (Bytes s))))
+
+(define (rex-children-width width kids)
+  (If (Eq 0 (Sz kids)) 0
+      (Add (sum (map width kids)) (Dec (Sz kids)))))
+
+(define (rex-min-width r)
+  (define tag (_0 r))
+  (cond
+    ((Eq tag "leaf") (rex-leaf-width (_2 r) (_3 r)))
+    ((Eq tag "nest") (Add (Add 3 (Bytes (_3 r))) (rex-children-width rex-min-width (_4 r))))
+    ((Eq tag "expr") (Add 2 (rex-children-width rex-min-width (_3 r))))
+    ((Eq tag "pref") (Add (Bytes (_2 r)) (rex-min-width (_3 r))))
+    ((Eq tag "tyte") (Add (sum (map rex-min-width (_3 r)))
+                          (Mul (Bytes (_2 r)) (Dec (Sz (_3 r))))))
+    ((Eq tag "bloc") (Add (Add (Bytes (_3 r)) 1)
+                          (Add (rex-min-width (_4 r)) (rex-children-width rex-min-width (_5 r)))))
+    ((Eq tag "open") (Add (Add (Bytes (_2 r)) 1) (rex-children-width rex-min-width (_3 r))))
+    ((Eq tag "juxt") (sum (map rex-min-width (_2 r))))
+    ((Eq tag "heir") (rex-children-width rex-min-width (_2 r)))
+    (else 0)))
+
+(define (rex-bracket-open color)
+  (cond
+    ((Eq color "paren") "(")
+    ((Eq color "brack") "[")
+    ((Eq color "curly") "{")
+    (else "")))
+
+(define (rex-bracket-close color)
+  (cond
+    ((Eq color "paren") ")")
+    ((Eq color "brack") "]")
+    ((Eq color "curly") "}")
+    (else "")))
+
+(define (rex-indent n)
+  (reap " " n))
+
+(define (rex-lines-prefix prefix lines)
+  (map (lambda (line) (strcat [prefix line])) lines))
+
+(define (rex-join-str sep row)
+  (cond
+    ((Eq 0 (Sz row)) "")
+    ((Eq 1 (Sz row)) (_0 row))
+    (else (strcat [(_0 row) sep (rex-join-str sep (drop 1 row))]))))
+
+(define (rex-format-slug s)
+  (If (Nil (find (lambda (c) (Eq c 10)) (trip s)))
+      (strcat ["' " s])
+      (rex-join-str "\n" (rex-lines-prefix "' " (rex-lines s)))))
+
+(define (rex-format-cord s)
+  (If (Nil (find (lambda (c) (Eq c 10)) (trip s)))
+      (strcat [REX_DQUOTE (rex-escape-quotes s) REX_DQUOTE])
+      (strcat [REX_DQUOTE (rex-join-str "\n" (map rex-escape-quotes (rex-lines s))) REX_DQUOTE])))
+
+(define (rex-format-tape s)
+  (strcat [REX_DQUOTE "\n" (rex-join-str "\n" (map rex-escape-quotes (rex-lines s))) "\n" REX_DQUOTE]))
+
+(define (rex-format-page s)
+  (strcat ["'''\n" (rex-join-str "\n" (rex-lines s)) "\n'''"]))
+
+(define (rex-format-span s)
+  (strcat ["'''" s "'''"]))
+
+(define (rex-format-quip s)
+  s)
+
+(define (rex-print-leaf shape s)
+  (cond
+    ((Eq shape "word") s)
+    ((Eq shape "quip") (rex-format-quip s))
+    ((Eq shape "cord") (rex-format-cord s))
+    ((Eq shape "tape") (rex-format-tape s))
+    ((Eq shape "page") (rex-format-page s))
+    ((Eq shape "span") (rex-format-span s))
+    ((Eq shape "slug") (rex-format-slug s))
+    (else s)))
+
+(define (rex-closed? r)
+  (define tag (_0 r))
+  (Or (Eq tag "leaf")
+      (Or (Eq tag "nest")
+          (Or (Eq tag "expr")
+              (Or (Eq tag "pref")
+                  (Or (Eq tag "tyte") (Eq tag "juxt")))))))
+
+(define (rex-force-vertical? r)
+  (Or (And (Eq (_0 r) "leaf") (Eq (_2 r) "slug"))
+      (Or (Eq (_0 r) "open")
+          (Or (Eq (_0 r) "bloc") (Eq (_0 r) "heir")))))
+
+(define (rex-any-open-then-more kids)
+  (If (Le (Sz kids) 1) 0
+      (Or (rex-force-vertical? (_0 kids))
+          (rex-any-open-then-more (drop 1 kids)))))
+
+(define (rex-print-tight print r)
+  (If (rex-closed? r)
+      (print r)
+      (strcat ["(" (print r) ")"])))
+
+(define (rex-join-printed print sep kids tight?)
+  (rex-join-str sep (map (If tight? (rex-print-tight print) print) kids)))
+
+(define (rex-print-nest print color rune kids)
+  (If (Eq color "clear")
+      (If (And (Eq (Sz kids) 1) (Nil (rex-string-empty? rune)))
+          (strcat [(print (_0 kids)) " " rune])
+          (rex-join-printed print (strcat [" " rune " "]) kids 0))
+      (let* ((op (rex-bracket-open color))
+             (cl (rex-bracket-close color)))
+        (cond
+          ((Eq 0 (Sz kids)) (strcat [op cl]))
+          ((Eq 1 (Sz kids)) (strcat [op (rex-print-tight print (_0 kids)) " " rune cl]))
+          (else (strcat [op (rex-join-printed print (strcat [" " rune " "]) kids 1) cl]))))))
+
+(define (rex-print-expr print color kids)
+  (If (Eq color "clear")
+      (rex-join-printed print " " kids 0)
+      (strcat [(rex-bracket-open color)
+               (rex-join-printed print " " kids 0)
+               (rex-bracket-close color)])))
+
+(define (rex-print-open print rune kids)
+  (If (Eq 0 (Sz kids))
+      rune
+      (let* ((flat (strcat [rune " " (rex-join-printed print " " kids 0)])))
+        (If (And (Le (Bytes flat) 80) (Nil (rex-any-open-then-more kids)))
+            flat
+            (strcat [rune " "
+                     (rex-join-str "\n"
+                       (cons (print (_0 kids))
+                             (map (lambda (k) (strcat ["  " (print k)]))
+                                  (drop 1 kids))))])))))
+
+(define (rex-print-heir print kids)
+  (rex-join-str "\n" (map print kids)))
+
+(define (rex-print-bloc print color rune hd items)
+  (let* ((body (strcat [(print hd) " " rune
+                        (If (Eq 0 (Sz items)) ""
+                            (strcat ["\n    " (rex-join-str "\n" (map print items))]))])))
+    (If (Eq color "clear") body
+        (strcat [(rex-bracket-open color) body (rex-bracket-close color)]))))
+
+(define (rex-print r)
+  (define tag (_0 r))
+  (cond
+    ((Eq tag "leaf") (rex-print-leaf (_2 r) (_3 r)))
+    ((Eq tag "nest") (rex-print-nest rex-print (_2 r) (_3 r) (_4 r)))
+    ((Eq tag "expr") (rex-print-expr rex-print (_2 r) (_3 r)))
+    ((Eq tag "pref") (strcat [(_2 r) (rex-print-tight rex-print (_3 r))]))
+    ((Eq tag "tyte") (rex-join-printed rex-print (_2 r) (_3 r) 1))
+    ((Eq tag "juxt") (rex-join-printed rex-print "" (_2 r) 1))
+    ((Eq tag "open") (rex-print-open rex-print (_2 r) (_3 r)))
+    ((Eq tag "heir") (rex-print-heir rex-print (_2 r)))
+    ((Eq tag "bloc") (rex-print-bloc rex-print (_2 r) (_3 r) (_4 r) (_5 r)))
+    (else (rex-error ["bad-rex-print" r]))))
+
+(define PrintRex rex-print)
