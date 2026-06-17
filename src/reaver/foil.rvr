@@ -26,13 +26,15 @@
 (#import cairn)
 (print "cairn")
 
+(#bind rex (#module rex))
+
 
 (define (get-foil fnam)
   (read-text-file (strcat ["foil/" fnam ".foil"])))
 (define (parse-foil fnam)
-  (parse-module-sast 0 (ParseRex (get-foil fnam))))
+  (parse-module-sast 0 (rex:ParseRexNorm (get-foil fnam))))
 
-(define (parse-foil-val txt) (parse-val-sast (ParseRex txt)))
+(define (parse-foil-val txt) (parse-val-sast (rex:ParseRexNorm txt)))
 
 
 
@@ -73,6 +75,10 @@
 
 (define if-ty
   (ty:TQUA "a" (ty:TFUN [(ty:TNAT 0) (ty:TVAR "a") (ty:TVAR "a")] (ty:TVAR "a"))))
+(define pin-ty
+  (ty:TQUA "a" (ty:TFUN [(ty:TVAR "a")] (ty:TPIN (ty:TVAR "a")))))
+(define unpin-ty
+  (ty:TQUA "a" (ty:TFUN [(ty:TPIN (ty:TVAR "a"))] (ty:TVAR "a"))))
 
 (define unary-nat-ty (ty:TFUN [(ty:TNAT NONE)] (ty:TNAT NONE)))
 (define binary-nat-ty (ty:TFUN [(ty:TNAT NONE) (ty:TNAT NONE)] (ty:TNAT NONE)))
@@ -83,6 +89,8 @@
   (pipe empty-subject
     (ty:insert-typ-ffi ["nat"] (ty:TNAT 0))
     (insert-ffi ["if"] If if-ty)
+    (insert-ffi ["pin"] Pin pin-ty)
+    (insert-ffi ["unpin"] Unpin unpin-ty)
     (insert-ffi ["eq"] Eq eq-ty)
     (insert-ffi ["inc"] Inc unary-nat-ty)
     (insert-ffi ["mul"] Mul binary-nat-ty)
@@ -97,9 +105,15 @@
   (define (tag-is x) (Eq tag x))
   (define (on-tapp items[f])
     (define fields (map (elab-type sut) (drop 1 items)))
-    (If (Eq "s_variant" (_0 f))
-      (ty:TROW (_1 f) fields)
-      (ty:TBAD "uimpl tapp")))
+    (cond
+      ((Eq "s_variant" (_0 f))
+        (ty:TROW (_1 f) fields))
+      ((And (Eq "s_ref" (_0 f)) (Equal ["pin"] (surf-ref-path f)))
+        (unless (Eq 1 (Sz fields))
+          (ty:TBAD ["bad-pin-arity" fields])
+          (ty:TPIN (_0 fields))))
+      (else
+        (ty:TBAD "uimpl tapp"))))
 
   (cond
     ((tag-is "s_trow")
@@ -294,10 +308,13 @@
       (on-var face (_0 found))))
   (define (elab-lit l[_ val])
     (tc-lit (ty:TNAT 0) val))
+  (define (elab-meth-step rcvr seg)
+    (define f (score-meth rcvr (surf-mseg-name seg) sut))
+    (define args (map (elab-val sut env) (surf-mseg-args seg)))
+    (on-call f (snoc rcvr args)))
   (define (elab-meth-go rcvr els)
-    (define f (score-meth rcvr (_0 els) sut))
     (Ifz els rcvr
-        (elab-meth-go (on-call f [rcvr]) (drop 1 els))))
+        (elab-meth-go (elab-meth-step rcvr (_0 els)) (drop 1 els))))
   (define (elab-meth m[_ els])
     assert(Nil (Eq 0 (Sz els)))
     (define head (_0 els))
@@ -340,6 +357,11 @@
     ((tag-is "s_span") (elab-val sut env (burp-span surf)))
     ((tag-is "s_meth") (elab-meth surf))
     ((tag-is "s_self") (elab-self surf))
+    ((tag-is "s_tvars") (error ["unsupported-foil-syntax" "type-vars" surf]))
+    ((tag-is "s_letrec") (error ["unsupported-foil-syntax" "letrec" surf]))
+    ((tag-is "s_ufcs_put") (error ["unsupported-foil-syntax" "ufcs-put" surf]))
+    ((tag-is "s_ufcs_over") (error ["unsupported-foil-syntax" "ufcs-over" surf]))
+    ((tag-is "s_literal") (error ["unsupported-foil-syntax" "literal" surf]))
     ((or
        (tag-is "s_trow")
        (tag-is "s_tfun")
@@ -401,7 +423,7 @@
          (pat-ty (tc-arm-pat arm))
          (leg-tc (lower-tc sut (tc-arm-val arm)))
          ;; we test the let binding we made in lower-match
-         (test-ir (cgen:A (cgen:K (ty:type-fits sut pat-ty)) (cgen:V 0))))
+         (test-ir (cgen:A (cgen:K (Pin (ty:type-fits sut pat-ty))) (cgen:V 0))))
          (cgen:A
            (cgen:A (cgen:A (cgen:K Ifz) test-ir) ;; if match
              leg-tc ;; then execute pattern

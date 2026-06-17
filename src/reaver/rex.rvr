@@ -36,7 +36,7 @@
   (error ("rex" msg)))
 
 (define (rex-str-slice off len src)
-  (LoadVar off len src))
+  (Trunc (Mul 8 len) (Rsh src (Mul 8 off))))
 
 (define (rex-str-drop off src)
   (rex-str-slice off (Sub (Bytes src) off) src))
@@ -1302,6 +1302,65 @@
   (define r (rex-parse-src src))
   (If r (_0 r) (Throw "bad rex parse")))
 
+;;; Final three-case normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (rex-normal-empty-clear-nest? r)
+  (And (Eq (_0 r) "nest")
+       (And (Eq (_2 r) "clear")
+            (And (Eq (_3 r) "")
+                 (Eq 0 (Sz (_4 r)))))))
+
+(define (rex-normal-clear-nest? r)
+  (And (Eq (_0 r) "nest") (Eq (_2 r) "clear")))
+
+(define (rex-normalize-juxt-kid norm r)
+  (let* ((n (norm r)))
+    (If (Eq (_0 n) "juxt") (stream (_2 n)) (lcons n 0))))
+
+(define (rex-normalize-juxt norm sp kids)
+  ["juxt" sp (rowify (lcat (lmap (rex-normalize-juxt-kid norm) (stream kids))))])
+
+(define (rex-normalize-expr norm sp color kids)
+  (let* ((norm-kids (map norm kids)))
+    (If (And (Eq 1 (Sz norm-kids))
+             (rex-normal-clear-nest? (_0 norm-kids)))
+        (let* ((kid (_0 norm-kids)))
+          ["nest" sp color (_3 kid) (_4 kid)])
+        ["nest" sp color "" norm-kids])))
+
+(define (rex-normalize-bloc norm sp color rune head items)
+  (let* ((norm-head (norm head))
+         (norm-items (map norm items))
+         (kids (If (rex-normal-empty-clear-nest? norm-head)
+                   norm-items
+                   (rowify (lcons norm-head (stream norm-items))))))
+    ["nest" sp color rune kids]))
+
+(define (NormalizeRex r)
+  (define tag (_0 r))
+  (cond
+    ((Eq tag "leaf") r)
+    ((Eq tag "nest")
+      ["nest" (_1 r) (_2 r) (_3 r) (map NormalizeRex (_4 r))])
+    ((Eq tag "expr")
+      (rex-normalize-expr NormalizeRex (_1 r) (_2 r) (_3 r)))
+    ((Eq tag "pref")
+      ["nest" (_1 r) "clear" (_2 r) [(NormalizeRex (_3 r))]])
+    ((Eq tag "tyte")
+      ["nest" (_1 r) "clear" (_2 r) (map NormalizeRex (_3 r))])
+    ((Eq tag "bloc")
+      (rex-normalize-bloc NormalizeRex (_1 r) (_2 r) (_3 r) (_4 r) (_5 r)))
+    ((Eq tag "open")
+      ["nest" (_1 r) "clear" (_2 r) (map NormalizeRex (_3 r))])
+    ((Eq tag "juxt")
+      (rex-normalize-juxt NormalizeRex (_1 r) (_2 r)))
+    ((Eq tag "heir")
+      (rex-normalize-juxt NormalizeRex (_1 r) (_2 r)))
+    (else (rex-error ["bad-rex-normalize" r]))))
+
+(define (ParseRexNorm src)
+  (NormalizeRex (ParseRex src)))
+
 ;;; Printer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (rex-escape-quotes s)
@@ -1431,16 +1490,22 @@
   (rex-join-str sep (map (If tight? (rex-print-tight print) print) kids)))
 
 (define (rex-print-nest print color rune kids)
-  (If (Eq color "clear")
-      (If (And (Eq (Sz kids) 1) (Nil (rex-string-empty? rune)))
-          (strcat [(print (_0 kids)) " " rune])
-          (rex-join-printed print (strcat [" " rune " "]) kids 0))
-      (let* ((op (rex-bracket-open color))
-             (cl (rex-bracket-close color)))
-        (cond
-          ((Eq 0 (Sz kids)) (strcat [op cl]))
-          ((Eq 1 (Sz kids)) (strcat [op (rex-print-tight print (_0 kids)) " " rune cl]))
-          (else (strcat [op (rex-join-printed print (strcat [" " rune " "]) kids 1) cl]))))))
+  (If (rex-string-empty? rune)
+      (If (Eq color "clear")
+          (rex-join-printed print " " kids 0)
+          (strcat [(rex-bracket-open color)
+                   (rex-join-printed print " " kids 0)
+                   (rex-bracket-close color)]))
+      (If (Eq color "clear")
+          (If (Eq (Sz kids) 1)
+              (strcat [(print (_0 kids)) " " rune])
+              (rex-join-printed print (strcat [" " rune " "]) kids 0))
+          (let* ((op (rex-bracket-open color))
+                 (cl (rex-bracket-close color)))
+            (cond
+              ((Eq 0 (Sz kids)) (strcat [op cl]))
+              ((Eq 1 (Sz kids)) (strcat [op (rex-print-tight print (_0 kids)) " " rune cl]))
+              (else (strcat [op (rex-join-printed print (strcat [" " rune " "]) kids 1) cl])))))))
 
 (define (rex-print-expr print color kids)
   (If (Eq color "clear")
@@ -1486,3 +1551,9 @@
     (else (rex-error ["bad-rex-print" r]))))
 
 (define PrintRex rex-print)
+
+(#export
+  ParseRex
+  ParseRexNorm
+  NormalizeRex
+  PrintRex)
