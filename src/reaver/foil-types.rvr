@@ -7,6 +7,8 @@
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
+;;; Type constructors and accessors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 (define TYPE "type")
 ;; bottom type
 ;; TBOT obeys distribution
@@ -65,11 +67,14 @@
 (define (TBOX val) [TYPE "TBOX" val])
 (define (TARR item) [TYPE "TARR" item])
 
+;;; Result helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 ; data Either = Left a | Right
 (define (left x) ("left" x)) (define (right x) ("right" x))
 (define (is-left? x) (Eq (Hd x) "left")) (define (is-right? x) (Eq (Hd x) "right"))
 (define (either-seq f a b) (If (is-left? a) a))
 
+;;; Well-formedness and substitution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (check-type-wf sut x[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -114,6 +119,7 @@
     ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
     (else (print [ty "unhandled"]) (right 0))))
 
+;;; Span nesting and type application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (type-nests-span? sup sub)
   (define stag (_1 sup))
@@ -142,6 +148,7 @@
     ((Eq stag "TPIN") (pin-law-nests? sup sub))
     ((Eq subtag "TPIN") (pin-law-nests? sub sup))
     ((and (Eq stag "TROW") (Eq subtag "TROW")) (row-nests? sup sub))
+    ((and (Eq stag "TSUM") (Eq subtag "TSUM")) (all sup-has-opt (tsum-opts sub)))
     ((Eq stag "TSUM") (any opt-has-sub (tsum-opts sup)))
     ((Eq subtag "TSUM") (all sup-has-opt (tsum-opts sub)))
     ((and (Eq stag "TNAT") (Eq subtag "TNAT"))
@@ -209,13 +216,13 @@
       (Eq (_1 fun) "TFUN")
       (TBAD ["too complicated" f x])
       (Ifz first-arg
-		           (Ifz inferred
-		             (TBAD ["failed to resolve polymorphism by arguments, please specify"
-		                    f x])
-		             (type-apply-span (subst-type name (_0 inferred) fun) x))
-		           (If (Lt idx (Sz x))
-		             (type-apply-span (subst-type name (Ix idx x) fun) x)
-		             (TBAD ["polymorphism not first arg" f x])))))
+        (Ifz inferred
+          (TBAD ["failed to resolve polymorphism by arguments, please specify"
+                 f x])
+          (type-apply-span (subst-type name (_0 inferred) fun) x))
+        (If (Lt idx (Sz x))
+          (type-apply-span (subst-type name (Ix idx x) fun) x)
+          (TBAD ["polymorphism not first arg" f x])))))
   (define (f-hd y) (Eq (_1 f) y))
   (define (type-apply-fun args ret x)
     ;(print ["apply fun" args ret x])
@@ -224,7 +231,7 @@
           (TFUN (drop 1 args) ret))
         (TBAD ["nest-fail" (_0 args) x])))
   (Ifz x f
-  (cond
+    (cond
     ((f-hd "TQUA") (type-apply-qua f x))
     ((f-hd "TFAC") (type-apply-span (_3 f) x))
     ((f-hd "TPIN")
@@ -237,21 +244,26 @@
     ((f-hd "TBAD") f)
     (else (TBAD ["weird apply" f x])))))
 
+;;; Mold/span conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 (define (name-row-span name span[_ tag])
   (If (Eq tag "TROW")
     (TROW (print-path name) (trow-vals span))
     span))
 
-(define (mold-to-span sut ty[_ tag])
+(define (mold-to-span-seen sut seen ty[_ tag])
   (define (tag-is y) (Eq y tag))
-  (define recur (mold-to-span sut))
+  (define recur (mold-to-span-seen sut seen))
   (cond
     ((tag-is "TNOM")
       (define ref (tnom-ref ty))
       (define args (_3 ty))
-      (define base (recur (got-type ref sut)))
-      (define applied (type-apply-span base (map recur args)))
-      (name-row-span ref applied))
+      (If (find (Equal ref) seen)
+        ty
+        (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
+              (applied-args (map recur args)))
+          (define applied (type-apply-span base applied-args))
+          (name-row-span ref applied))))
     ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
     ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
@@ -263,48 +275,79 @@
     ((tag-is "TARR") (TARR (recur (_2 ty))))
     (else ty)))
 
+(define (mold-to-span sut ty)
+  (mold-to-span-seen sut 0 ty))
+
+(define (mold-rec-seed ty[_ tag])
+  (cond
+    ((Eq tag "TNOM") [(tnom-ref ty)])
+    ((Eq tag "TFAC") (mold-rec-seed (tfac-val ty)))
+    ((Eq tag "TPIN") (mold-rec-seed (tpin-val ty)))
+    ((Eq tag "TSELF") (mold-rec-seed (tself-val ty)))
+    (else 0)))
+
 (define (type-entry? path sut)
   (Eq (Hd (got-entry-tc path sut)) "TC_TYP"))
 
-(define (find-row-name-for-span sut span)
-  (define cstr (trow-cstr span))
+(define (find-type-name-for-span sut span[_ tag])
   (define (matches path)
-    (If (Ne cstr (print-path path))
+    (If (Nil (type-entry? path sut))
       0
-      (If (Nil (type-entry? path sut))
-        0
-        (Equal span (name-row-span path (mold-to-span sut (got-type path sut)))))))
-  (find matches (subject-order sut)))
+      (Equal span (mold-to-span sut (TNOM path 0)))))
+  (If (or (Eq tag "TROW") (Eq tag "TSUM"))
+    (find matches (subject-order sut))
+    0))
 
 (define (span-to-mold sut ty[_ tag])
   (define (tag-is y) (Eq y tag))
   (define recur (span-to-mold sut))
-  (cond
-    ((tag-is "TROW")
-      (define nom (find-row-name-for-span sut ty))
-      (Ifz nom
-        (TROW (trow-cstr ty) (map recur (trow-vals ty)))
-        (TNOM (_0 nom) 0)))
-    ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
-    ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
-    ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
-    ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
-    ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
-    ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
-    ((tag-is "TTYP") (TTYP (recur (_2 ty))))
-    ((tag-is "TARR") (TARR (recur (_2 ty))))
-    (else ty)))
+  (define nom (find-type-name-for-span sut ty))
+  (Ifz nom
+    (cond
+      ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
+      ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+      ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
+      ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
+      ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
+      ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
+      ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
+      ((tag-is "TTYP") (TTYP (recur (_2 ty))))
+      ((tag-is "TARR") (TARR (recur (_2 ty))))
+      (else ty))
+    (TNOM (_0 nom) 0)))
 
 (define (type-apply sut f x)
+  (define (arg-seeds ty[_ tag])
+    (cond
+      ((Eq tag "TFUN") (map mold-rec-seed (tfun-args ty)))
+      ((Eq tag "TFAC") (arg-seeds (tfac-val ty)))
+      ((Eq tag "TPIN") (arg-seeds (tpin-val ty)))
+      ((Eq tag "TSELF") (arg-seeds (tself-val ty)))
+      ((Eq tag "TQUA") (arg-seeds (_3 ty)))
+      (else 0)))
+  (define (expand-args seeds xs)
+    (Ifz xs 0
+      (let ((x (_0 xs)))
+        (Weld [(If (Eq "TNOM" (_1 x))
+                  (mold-to-span sut x)
+                  (mold-to-span-seen sut (Ifz seeds 0 (_0 seeds)) x))]
+        (expand-args (Ifz seeds 0 (drop 1 seeds)) (drop 1 xs))))))
   (span-to-mold sut
     (type-apply-span
       (mold-to-span sut f)
-      (map (mold-to-span sut) x))))
+      (expand-args (arg-seeds f) x))))
 
 (define (type-nests? sut sup sub)
-  (type-nests-span?
-    (mold-to-span sut sup)
-    (mold-to-span sut sub)))
+  (cond
+    ((Equal sup sub) 1)
+    ((Eq (_1 sup) "TFAC") (type-nests? sut (tfac-val sup) sub))
+    ((Eq (_1 sub) "TFAC") (type-nests? sut sup (tfac-val sub)))
+    (else
+      (type-nests-span?
+        (mold-to-span sut sup)
+        (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
+
+;;; Joins, meets, and fit checks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; type union
 (define (type-join-span sut x[_ xtag] y[_ ytag])
@@ -372,7 +415,7 @@
   (span-to-mold sut
     (type-meet-span sut
       (mold-to-span sut x)
-      (mold-to-span sut y))))
+      (mold-to-span-seen sut (mold-rec-seed x) y))))
 
 (define (fits-err err)
   (1 [err]))
@@ -424,6 +467,7 @@
 (define (type-fits sut ty val)
   (type-fits-span sut (mold-to-span sut ty) val))
 
+;;; Subject insertion and type AST conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define tc-poison
   (tc "POISON" TBAD))
@@ -449,6 +493,8 @@
     (else
       (error ["bad type ast" tyast]))))
 
+;;; Row face helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 (define (collect-faces items)
   (define (go acc[idx ls] arg[_ tag face ty])
     [(Inc idx)
@@ -456,6 +502,9 @@
       ls
       (snoc [idx face ty] ls))])
   (_1 (foldl go [0 0] items)))
+
+;;; Public exports ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 (#export
  check-type-wf
  subst-type

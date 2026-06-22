@@ -35,6 +35,7 @@
               hsPkgs.stylish-haskell
               hsPkgs.cabal-install
               pkgs.rlwrap
+              pkgs.samply
             ];
             # buildInputs = with hsPkgs; [
             #   text primitive pretty-show containers deepseq
