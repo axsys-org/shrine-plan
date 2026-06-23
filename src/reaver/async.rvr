@@ -1,0 +1,164 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+
+;;; Message tags ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define ASYNC-FUTURE "future")
+(define ASYNC-AWAIT  "await")
+(define ASYNC-STOP   "stop")
+(define ASYNC-CONT   "cont")
+
+
+;;; Actor basics ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define self-handle 0)
+(define self self-handle)
+
+(define (recv)      (Recv self-handle))
+(define (recv-msg)  (Ix0 (recv)))
+(define (recv-caps) (Ix1 (recv)))
+
+(define (spawn fn) (Spawn fn))
+
+(define (cast actor msg)
+  (Send actor msg))
+
+(define (cast-caps actor msg caps)
+  (SendCaps actor msg caps))
+
+(define (reply caps msg)
+  (Send (Ix0 caps) msg))
+
+(define (reply-caps caps msg out-caps)
+  (SendCaps (Ix0 caps) msg out-caps))
+
+(define (ask actor msg)
+  (SendCaps actor msg [self-handle]))
+
+(define (call actor msg)
+  (SendCaps actor msg [self-handle])
+  (Ix0 (Recv self-handle)))
+
+(define (receive-one handler)
+  ((lambda (msg-caps)
+     (handler (Ix0 msg-caps) (Ix1 msg-caps)))
+   (recv)))
+
+(define (cont state) [ASYNC-CONT state])
+(define (stop reason) [ASYNC-STOP reason])
+
+(define (actor-loop state step self)
+  ((lambda (msg-caps)
+     (define next (step state (Ix0 msg-caps) (Ix1 msg-caps)))
+     (If (Equal ASYNC-STOP (Ix0 next))
+       (Ix1 next)
+       (actor-loop (Ix1 next) step self)))
+   (recv)))
+
+(define (spawn-loop state step)
+  (Spawn (actor-loop state step)))
+
+(define (close actor)
+  (CloseHandle actor))
+
+
+;;; Futures ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (future handle) [ASYNC-FUTURE handle])
+(define future-handle Ix1)
+
+(define (future? x)
+  (And (Nil (IsNat x))
+       (Equal ASYNC-FUTURE (Ix0 x))))
+
+(define (try-ok? result)
+  (Nil (Hd result)))
+
+(define try-value Ix0)
+(define try-error Ix0)
+
+(define (future-ready result self)
+  (define msg-caps (Recv self-handle))
+  (define msg (Ix0 msg-caps))
+  (cond
+    ((Equal ASYNC-AWAIT msg)
+      (Send (Ix0 (Ix1 msg-caps)) result)
+      (future-ready result self))
+    ((Equal ASYNC-STOP msg)
+      result)
+    (else
+      (future-ready result self))))
+
+(define (future-run f arg self)
+  (define result (Try f arg))
+  (future-ready result self))
+
+(define (async f arg)
+  (future (Spawn (future-run f arg))))
+
+(define (async0 thunk)
+  (async thunk 0))
+
+(define (await-try fut)
+  (SendCaps (future-handle fut) ASYNC-AWAIT [self-handle])
+  (Ix0 (Recv self-handle)))
+
+(define (await fut)
+  (define result (await-try fut))
+  (If (try-ok? result)
+    (try-value result)
+    (Throw (try-error result))))
+
+(define (cancel fut)
+  (cast (future-handle fut) ASYNC-STOP))
+
+(define (await-try-all futures)
+  (map await-try futures))
+
+(define (await-all futures)
+  (map await futures))
+
+(define (async-map-list f xs i rem)
+  (Ifz rem NIL
+    (let1 fut (async f (Ix i xs))
+      (Seq fut
+        [fut (async-map-list f xs (Inc i) (Dec rem))]))))
+
+(define (async-map f xs)
+  (Row 0 (Sz xs) (async-map-list f xs 0 (Sz xs))))
+
+(define (async-all f xs)
+  (await-all (async-map f xs)))
+
+
+;;; Fan-out helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (broadcast-loop actors msg i rem)
+  (Ifz rem 0
+    (Seq (Send (Ix i actors) msg)
+      (broadcast-loop actors msg (Inc i) (Dec rem)))))
+
+(define (broadcast actors msg)
+  (broadcast-loop actors msg 0 (Sz actors)))
+
+(define (ask-all-loop actors msg i rem)
+  (Ifz rem 0
+    (Seq (SendCaps (Ix i actors) msg [self-handle])
+      (ask-all-loop actors msg (Inc i) (Dec rem)))))
+
+(define (ask-all actors msg)
+  (ask-all-loop actors msg 0 (Sz actors)))
+
+(define (recv-n n)
+  (Ifz n []
+    (cons (Ix0 (Recv self-handle))
+      (recv-n (Dec n)))))
+
+(define (call-all actors msg)
+  (ask-all actors msg)
+  (recv-n (Sz actors)))
