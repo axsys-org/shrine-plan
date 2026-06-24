@@ -1,0 +1,1072 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind milton (#module milton))
+
+
+;;; HTML helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (attr key val) [key val])
+(define (cls val)      (attr "class" val))
+(define (id val)       (attr "id" val))
+(define no-attrs 0)
+
+(define (node tag attrs children) [tag attrs children])
+(define (leaf tag attrs text)     (node tag attrs [text]))
+
+(define (h1 text) (leaf "h1" no-attrs text))
+(define (h2 text) (leaf "h2" no-attrs text))
+(define (h3 text) (leaf "h3" no-attrs text))
+(define (p text)  (leaf "p"  no-attrs text))
+
+(define (button attrs text)
+  (leaf "button" attrs text))
+
+(define (pre attrs text)
+  (leaf "pre" attrs text))
+
+(define (textarea attrs text)
+  (leaf "textarea" attrs text))
+
+(define (input attrs)
+  (node "input" attrs []))
+
+(define (span attrs text)
+  (leaf "span" attrs text))
+
+(define (div attrs children)
+  (node "div" attrs children))
+
+(define (section attrs children)
+  (node "section" attrs children))
+
+(define (details attrs summary children)
+  (node "details" attrs
+    (Weld [(leaf "summary" no-attrs summary)] children)))
+
+(define (script js)
+  (node "script" no-attrs [js]))
+
+(define (script-module src)
+  (node "script" [(attr "type" "module") (attr "src" src)] []))
+
+(define (style css)
+  (node "style" no-attrs [css]))
+
+(define (hx-button url target text)
+  (button
+    [(attr "type" "button")
+     (cls "list-item")
+     (attr "hx-get" url)
+     (attr "hx-target" target)]
+    text))
+
+(define (list-button text)
+  (button [(attr "type" "button") (cls "list-item passive")] text))
+
+(define (browser-pane title content)
+  (section [(cls "browser-pane")]
+    [(h2 title)
+     content]))
+
+
+;;; Text and value rendering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (str-slice off len src)
+  (Trunc (Mul 8 len) (Rsh src (Mul 8 off))))
+
+(define (str-drop off src)
+  (str-slice off (Sub (Bytes src) off) src))
+
+(define (str-prefix? pre src)
+  (define len (Bytes pre))
+  (And (Le len (Bytes src))
+       (Eq pre (str-slice 0 len src))))
+
+(define (drop-suffix len str)
+  (str-slice 0 (Sub (Bytes str) len) str))
+
+(define (foil-file-stem file)
+  (drop-suffix 5 file))
+
+(define (reaver-file-stem file)
+  (drop-suffix 4 file))
+
+(define (path-segments target)
+  (split-byte "/" (Ix0 (split-byte "?" target))))
+
+(define (path-segment idx segs)
+  (If (Gt (Sz segs) idx) (Ix idx segs) 0))
+
+(define (or-default val fallback)
+  (If val val fallback))
+
+(define (request-body-start input i)
+  (If (Lt (Add i 3) (Bytes input))
+    (If (And (Eq 13 (Load8 i input))
+          (And (Eq 10 (Load8 (Inc i) input))
+            (And (Eq 13 (Load8 (Add i 2) input))
+                 (Eq 10 (Load8 (Add i 3) input)))))
+      (Add i 4)
+      (request-body-start input (Inc i)))
+    0))
+
+(define (request-body input)
+  (define start (request-body-start input 0))
+  (If start (str-drop start input) ""))
+
+(define (print-val val)
+  (define (print-pin p)
+    (If (IsLaw p)
+      (strcat ["#(" (Name p) ")"])
+      (strcat ["#pin(" (print-val p) ")"])))
+  (define (print-law a m b)
+      (strcat ["{" (showNat a) " " (showNat m) " "
+             (print-val b) "}"]))
+  (define (print-app a)
+    (strcat ["(" (print-val (Hd a)) " "
+             (join-str " " (map print-val a)) ")"]))
+  (cond
+    ((IsPin val) (print-pin (Unpin val)))
+    ((IsLaw val) (print-law (Arity val) (Name val) (Body val)))
+    ((IsApp val) (print-app val))
+    (else (showNat val))))
+
+
+;;; Foil browser shell ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (foil-inspector-shell mod)
+  (section [(cls "foil-browser") (attr "data-foil-browser" mod)]
+    [(div [(cls "pane-head compact-head")]
+       [(div [(cls "pane-title")]
+          [(h2 "Definitions")
+           (p (strcat ["entries for foil/" mod ".foil"]))])
+        (div [(cls "tools")]
+          [(span [(cls "status")
+                  (attr "data-status" "saved")
+                  (attr "data-entry-count" "1")]
+             "0 entries")])])
+     (div [(cls "entry-browser")]
+       [(div [(cls "entry-toolbar")]
+          [(input [(attr "type" "search")
+                   (attr "placeholder" "filter entries")
+                   (attr "data-entry-filter" "1")])])
+        (div [(cls "entry-layout")]
+          [(div [(cls "entry-list") (attr "data-entry-list" "1")] [])
+           (div [(id "entry-detail") (cls "entry-detail-stack")
+                 (attr "data-entry-detail" "1")]
+             [(pre [(cls "mono")] "Select a Foil entry.")])])])]))
+
+
+;;; Foil panes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define foil-files
+  ["bst.foil"
+   "demo.foil"])
+
+(define (foil-file-link file)
+  (define stem (foil-file-stem file))
+  (hx-button (strcat ["/foil/" stem]) "#workspace" file))
+
+(define (foil-file-list _)
+  (div [(cls "stack")]
+    (map foil-file-link foil-files)))
+
+(define (source-editor area mod title source)
+  (node "form"
+    [(cls "editor-form")
+     (attr "method" "post")
+     (attr "action" (strcat ["/save/" area "/" mod]))
+     (attr "data-editor-form" "1")]
+    [(div [(cls "pane-head")]
+       [(div [(cls "pane-title")]
+          [(h2 title)
+           (p (strcat ["protocol: source  category: " area]))])
+        (div [(cls "tools")]
+          [(span [(cls "status") (attr "data-status" "clean")] "unchanged")
+           (button [(attr "type" "submit") (cls "save-button")] "accept")])])
+     (node "spine-code-editor"
+       [(attr "name" "source")
+        (attr "mite" "/text/reaver")
+        (attr "vim" "true")
+        (attr "lineNumbers" "true")
+        (attr "pairMatching" "true")]
+       [(node "script" [(attr "type" "text/plain")] [source])])]))
+
+(define (foil-panel mod)
+  (define file (strcat ["foil/" mod ".foil"]))
+  (section [(cls "pane")]
+    [(div [(cls "foil-tool")]
+        [(source-editor "foil" mod
+          (strcat ["foil/" mod ".foil"])
+          (read-text-file file))
+        (foil-inspector-shell mod)])]))
+
+
+;;; Reaver panes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define reaver-files
+  ["actor-demo.rvr"
+   "apollo.rvr"
+   "app-todo.rvr"
+   "async.rvr"
+   "bits.rvr"
+   "bplan.rvr"
+   "bst.rvr"
+   "byte-compiler-tests.rvr"
+   "byte-compiler.rvr"
+   "byte-tests.rvr"
+   "byte.rvr"
+   "cairn-old.rvr"
+   "cairn.rvr"
+   "codegen.rvr"
+   "dev-env.rvr"
+   "feather.rvr"
+   "foil-builtins.rvr"
+   "foil-elab.rvr"
+   "foil-integration-tests.rvr"
+   "foil-lower.rvr"
+   "foil-rex.rvr"
+   "foil-sast-tests.rvr"
+   "foil-sast.rvr"
+   "foil-subject-tests.rvr"
+   "foil-subject.rvr"
+   "foil-surface.rvr"
+   "foil-tests.rvr"
+   "foil-types-tests.rvr"
+   "foil-types.rvr"
+   "foil.rvr"
+   "http-demo.rvr"
+   "http-docs.rvr"
+   "milton.rvr"
+   "mir.rvr"
+   "parse.rvr"
+   "pe.rvr"
+   "print.rvr"
+   "prop.rvr"
+   "quip.rvr"
+   "reef.rvr"
+   "rex-tests.rvr"
+   "rex.rvr"
+   "rope.rvr"
+   "rplan.rvr"
+   "scratch.rvr"
+   "std.rvr"
+   "test-badcode.rvr"
+   "test-badlex.rvr"
+   "test-basic.rvr"
+   "test-scratch.rvr"
+   "todo-quasi.rvr"
+   "u128.rvr"])
+
+(define (reaver-file-link file)
+  (define stem (reaver-file-stem file))
+  (hx-button (strcat ["/reaver/" stem]) "#workspace" file))
+
+(define (reaver-file-list _)
+  (div [(cls "stack")]
+    (map reaver-file-link reaver-files)))
+
+(define (reaver-panel mod)
+  (define file (strcat ["reaver/" mod ".rvr"]))
+  (section [(cls "pane")]
+    [(source-editor "reaver" mod
+       (strcat ["src/reaver/" mod ".rvr"])
+       (read-text-file file))]))
+
+
+;;; Page shell ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define dev-css "
+:root {
+  --dev-bg: #d7dde1;
+  --dev-panel: #f3f5f4;
+  --dev-panel-2: #e7ecea;
+  --dev-border: #8c969b;
+  --dev-text: #1f2528;
+  --dev-muted: #59666c;
+  --dev-accent: #247869;
+  --dev-warn: #9b6500;
+  --dev-error: #b23b30;
+  --b0: var(--dev-bg);
+  --b1: var(--dev-panel);
+  --b2: var(--dev-panel-2);
+  --b3: #2f363f;
+  --b4: var(--dev-border);
+  --f-1: var(--dev-accent);
+  --f0: var(--dev-text);
+  --f1: #d7e2e8;
+  --f2: var(--dev-muted);
+  --f3: var(--dev-accent);
+  --f4: #7fc9c2;
+  --focus-color: var(--dev-accent);
+}
+body {
+  height: 100vh;
+  background: var(--dev-bg);
+  color: var(--dev-text);
+  font-family: Arial, sans-serif;
+}
+button {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--dev-border);
+  background: var(--dev-panel);
+  color: var(--dev-text);
+  text-align: left;
+  font-size: 13px;
+}
+button:hover { border-color: var(--dev-accent); }
+.app {
+  display: grid;
+  grid-template-rows: 34vh minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+.browser-strip {
+  display: grid;
+  grid-template-columns: 180px minmax(150px, 0.55fr) minmax(260px, 1fr) 180px;
+  min-height: 0;
+  border-bottom: 1px solid var(--dev-border);
+  background: var(--dev-panel-2);
+}
+.browser-pane {
+  min-height: 0;
+  border-right: 1px solid var(--dev-border);
+  overflow: auto;
+  padding: 8px;
+}
+.browser-pane h2 {
+  margin-bottom: 8px;
+  color: var(--dev-muted);
+  font-size: 11px;
+  font-weight: normal;
+  text-transform: lowercase;
+}
+.list-item {
+  min-height: 28px;
+  background: #fbfcfb;
+}
+.list-item:hover,
+.list-item:focus {
+  background: #eef6f3;
+}
+.list-item.passive {
+  color: var(--dev-muted);
+}
+.workspace {
+  overflow: auto;
+  padding: 10px;
+}
+.pane-head p {
+  color: var(--dev-muted);
+  font-size: 13px;
+}
+.stack {
+  display: grid;
+  gap: 4px;
+}
+.pane {
+  min-height: calc(66vh - 20px);
+}
+.pane-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  padding: 6px 8px;
+  background: var(--dev-panel);
+  border: 1px solid var(--dev-border);
+  border-bottom: 1px solid var(--dev-border);
+  margin-bottom: 8px;
+}
+.pane-head h2 { font-size: 18px; }
+.pane-title {
+  display: grid;
+  gap: 4px;
+}
+.tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status {
+  min-width: 88px;
+  padding: 4px 8px;
+  border: 1px solid var(--dev-border);
+  color: var(--dev-muted);
+  font-size: 12px;
+  text-align: center;
+}
+.status[data-status='dirty'] {
+  border-color: var(--dev-warn);
+  color: var(--dev-warn);
+}
+.status[data-status='saved'] {
+  border-color: var(--dev-accent);
+  color: var(--dev-accent);
+}
+.save-button {
+  width: auto;
+  min-width: 74px;
+  text-align: center;
+  border-color: var(--dev-accent);
+}
+.editor-form {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: calc(66vh - 20px);
+}
+.foil-tool {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.95fr) minmax(360px, 1.05fr);
+  gap: 10px;
+  min-height: calc(66vh - 20px);
+  align-items: stretch;
+}
+.foil-tool .editor-form,
+.foil-browser {
+  min-height: calc(66vh - 20px);
+}
+spine-code-editor {
+  display: block;
+  min-height: calc(66vh - 86px);
+  border: 1px solid var(--dev-border);
+  background: var(--dev-panel);
+  overflow: hidden;
+}
+.foil-tool spine-code-editor {
+  min-height: calc(66vh - 86px);
+}
+.compact-head {
+  min-height: 52px;
+}
+.foil-browser {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.entry-browser {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  gap: 8px;
+}
+.entry-toolbar input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--dev-border);
+  background: #fbfcfb;
+  color: var(--dev-text);
+  font-size: 13px;
+}
+.entry-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.45fr) minmax(260px, 0.55fr);
+  gap: 8px;
+  min-height: 0;
+}
+.entry-list,
+.entry-detail-stack {
+  min-height: 0;
+  overflow: auto;
+}
+.entry-list {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+.entry-row {
+  display: grid;
+  gap: 3px;
+  min-height: 62px;
+  padding: 7px 8px;
+  background: #fbfcfb;
+}
+.entry-row.is-active {
+  border-color: var(--dev-accent);
+  background: #e9f4f1;
+}
+.entry-row-path {
+  font-size: 13px;
+  color: var(--dev-text);
+  overflow-wrap: anywhere;
+}
+.entry-row-type {
+  color: var(--dev-muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.entry-row-kind {
+  color: var(--dev-accent);
+  font-size: 11px;
+}
+.entry-card {
+  display: none;
+  border: 1px solid var(--dev-border);
+  background: var(--dev-panel);
+}
+.entry-card.is-active {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+.entry-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: start;
+}
+.entry-path {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+.entry-chip {
+  padding: 3px 6px;
+  border: 1px solid var(--dev-border);
+  color: var(--dev-muted);
+  font-size: 11px;
+}
+.type-render {
+  padding: 8px;
+  border: 1px solid var(--dev-accent);
+  background: #edf7f4;
+  color: var(--dev-text);
+  font-family: monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.entry-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.entry-kv {
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--dev-border);
+  background: #fbfcfb;
+}
+.entry-label {
+  color: var(--dev-muted);
+  font-size: 11px;
+}
+.entry-value {
+  overflow-wrap: anywhere;
+}
+.raw-drawer {
+  border: 1px solid var(--dev-border);
+  background: #fbfcfb;
+}
+.raw-drawer summary {
+  padding: 7px 8px;
+  color: var(--dev-accent);
+  cursor: pointer;
+}
+.raw-drawer pre {
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  background: var(--dev-panel-2);
+}
+.split {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+.source,
+.mono {
+  font-family: monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.source {
+  width: 100%;
+  min-height: calc(66vh - 96px);
+  border: 1px solid var(--dev-border);
+  background: var(--dev-panel);
+  color: var(--dev-text);
+  padding: 12px;
+}
+.entries {
+  display: grid;
+  gap: 8px;
+}
+.entry {
+  border: 1px solid var(--dev-border);
+  background: var(--dev-panel);
+}
+.entry summary {
+  padding: 8px 10px;
+  color: var(--dev-accent);
+}
+.entry pre,
+.error {
+  overflow: auto;
+  padding: 10px;
+  background: var(--dev-panel-2);
+}
+.error {
+  border: 1px solid var(--dev-error);
+  color: var(--dev-error);
+}
+@media (max-width: 900px) {
+  .app { grid-template-rows: 48vh minmax(0, 1fr); }
+  .browser-strip { grid-template-columns: 1fr 1fr; }
+  .browser-pane { border-bottom: 1px solid var(--dev-border); }
+  .foil-tool,
+  .entry-layout { grid-template-columns: 1fr; }
+  .entry-grid { grid-template-columns: 1fr; }
+  .split { grid-template-columns: 1fr; }
+}
+")
+
+(define mini-htmx-js "
+async function reaverHx(el) {
+  const target = document.querySelector(el.getAttribute('hx-target') || '#workspace');
+  if (!target) return;
+  target.setAttribute('aria-busy', 'true');
+  try {
+    const res = await fetch(el.getAttribute('hx-get'));
+    target.innerHTML = await res.text();
+    hydrateWorkspace(target);
+  } finally {
+    target.removeAttribute('aria-busy');
+  }
+}
+document.addEventListener('click', event => {
+  const el = event.target.closest('[hx-get]');
+  if (!el) return;
+  event.preventDefault();
+  reaverHx(el);
+});
+function editorValue(form) {
+  return form.querySelector('spine-code-editor')?.value ?? '';
+}
+function leadingSpaces(line) {
+  let idx = 0;
+  while (idx < line.length && line.charCodeAt(idx) === 32) idx += 1;
+  return idx;
+}
+function firstToken(text) {
+  const trimmed = text.trim();
+  let split = -1;
+  for (let idx = 0; idx < trimmed.length; idx += 1) {
+    const code = trimmed.charCodeAt(idx);
+    if (code === 32 || code === 9) {
+      split = idx;
+      break;
+    }
+  }
+  if (split < 0) return [trimmed, ''];
+  return [trimmed.slice(0, split), trimmed.slice(split).trim()];
+}
+function payloadBlock(lines, code) {
+  const stopCodes = [43, 92, 124, 94, 36, 38, 63, 37, 62];
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const trimmed = lines[idx].trimStart();
+    if (trimmed.charCodeAt(0) !== code) continue;
+    const parts = [];
+    const first = trimmed.slice(1).trim();
+    if (first) parts.push(first);
+    if (code === 92 || code === 124 || code === 94) return first;
+    for (let j = idx + 1; j < lines.length; j += 1) {
+      const next = lines[j].trimStart();
+      if (!next) continue;
+      if (stopCodes.includes(next.charCodeAt(0))) break;
+      parts.push(next.trim());
+    }
+    return parts.join(code === 38 ? ' | ' : ', ');
+  }
+  return '';
+}
+function parseFoil(source) {
+  const lines = source.replaceAll(String.fromCharCode(13), '').split(String.fromCharCode(10));
+  const entries = [];
+  const stack = [];
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    const indent = leadingSpaces(line);
+    const trimmed = line.trimStart();
+    if (trimmed.charCodeAt(0) !== 43) continue;
+    const afterPlus = trimmed.slice(1).trimStart();
+    if (!afterPlus) continue;
+    const [name, header] = firstToken(afterPlus);
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+    const pathParts = stack.map(item => item.name).concat([name]);
+    const entry = {name, header, indent, line: idx + 1, path: '/' + pathParts.join('/'), start: idx};
+    entries.push(entry);
+    stack.push({indent, name});
+  }
+  entries.forEach((entry, idx) => {
+    let end = lines.length;
+    for (let j = idx + 1; j < entries.length; j += 1) {
+      if (entries[j].indent <= entry.indent) {
+        end = entries[j].start;
+        break;
+      }
+    }
+    entry.bodyLines = lines.slice(entry.start + 1, end);
+    entry.body = entry.bodyLines.join(String.fromCharCode(10)).trimEnd();
+    const row = payloadBlock(entry.bodyLines, 36);
+    const union = payloadBlock(entry.bodyLines, 38);
+    const args = payloadBlock(entry.bodyLines, 92) || payloadBlock(entry.bodyLines, 124);
+    const ret = payloadBlock(entry.bodyLines, 94);
+    entry.kind = row ? 'row type' : union ? 'sum type' : args ? 'method' : ret ? 'value' : entry.header ? 'value' : 'entry';
+    entry.type = row ? 'type row ' + row
+      : union ? 'type union ' + union
+      : args && ret ? '(' + args + ') -> ' + ret
+      : args ? '(' + args + ') -> inferred'
+      : ret ? ret
+      : entry.header ? 'value ' + entry.header
+      : 'inferred';
+  });
+  return entries;
+}
+function entryButton(entry, index) {
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'entry-row';
+  row.dataset.entryIndex = String(index);
+  const path = document.createElement('span');
+  path.className = 'entry-row-path mono';
+  path.textContent = entry.path;
+  const type = document.createElement('span');
+  type.className = 'entry-row-type';
+  type.textContent = entry.type;
+  const kind = document.createElement('span');
+  kind.className = 'entry-row-kind';
+  kind.textContent = entry.kind + '  line ' + entry.line;
+  row.append(path, type, kind);
+  return row;
+}
+function detailLine(label, value) {
+  const box = document.createElement('div');
+  box.className = 'entry-kv';
+  const key = document.createElement('span');
+  key.className = 'entry-label';
+  key.textContent = label;
+  const val = document.createElement('span');
+  val.className = 'entry-value mono';
+  val.textContent = value;
+  box.append(key, val);
+  return box;
+}
+function selectFoilEntry(browser, index) {
+  const entry = browser._entries?.[index];
+  const detail = browser.querySelector('[data-entry-detail]');
+  browser.querySelectorAll('.entry-row').forEach(row => {
+    row.classList.toggle('is-active', Number(row.dataset.entryIndex) === index);
+  });
+  if (!entry || !detail) return;
+  browser.dataset.activeEntry = String(index);
+  detail.innerHTML = '';
+  const card = document.createElement('section');
+  card.className = 'entry-card is-active';
+  const head = document.createElement('div');
+  head.className = 'entry-card-head';
+  const path = document.createElement('div');
+  path.className = 'entry-path mono';
+  path.textContent = entry.path;
+  const chip = document.createElement('span');
+  chip.className = 'entry-chip';
+  chip.textContent = entry.kind;
+  head.append(path, chip);
+  const type = document.createElement('div');
+  type.className = 'type-render';
+  type.textContent = entry.type;
+  const grid = document.createElement('div');
+  grid.className = 'entry-grid';
+  grid.append(
+    detailLine('name', entry.name),
+    detailLine('line', String(entry.line)),
+    detailLine('header', entry.header || 'none'),
+    detailLine('path', entry.path)
+  );
+  const drawer = document.createElement('details');
+  drawer.className = 'raw-drawer';
+  const summary = document.createElement('summary');
+  summary.textContent = 'source block';
+  const pre = document.createElement('pre');
+  pre.className = 'mono';
+  pre.textContent = entry.body || entry.header || entry.path;
+  drawer.append(summary, pre);
+  card.append(head, type, grid, drawer);
+  detail.append(card);
+}
+function applyEntryFilter(browser) {
+  const filter = browser.querySelector('[data-entry-filter]');
+  const needle = (filter?.value || '').toLowerCase();
+  let firstVisible = -1;
+  browser.querySelectorAll('.entry-row').forEach(row => {
+    const visible = row.textContent.toLowerCase().includes(needle);
+    row.hidden = !visible;
+    if (visible && firstVisible < 0) firstVisible = Number(row.dataset.entryIndex);
+  });
+  const active = Number(browser.dataset.activeEntry || 0);
+  const activeRow = Array.from(browser.querySelectorAll('[data-entry-index]'))
+    .find(row => Number(row.dataset.entryIndex) === active);
+  if (!activeRow || activeRow.hidden) selectFoilEntry(browser, firstVisible);
+}
+function renderFoilBrowser(browser) {
+  const tool = browser.closest('.foil-tool');
+  const form = tool?.querySelector('[data-editor-form]');
+  const list = browser.querySelector('[data-entry-list]');
+  const count = browser.querySelector('[data-entry-count]');
+  if (!form || !list) return;
+  const activePath = browser._entries?.[Number(browser.dataset.activeEntry || 0)]?.path;
+  const entries = parseFoil(editorValue(form));
+  browser._entries = entries;
+  list.innerHTML = '';
+  entries.forEach((entry, index) => list.append(entryButton(entry, index)));
+  if (count) count.textContent = entries.length + ' entries';
+  let active = entries.findIndex(entry => entry.path === activePath);
+  if (active < 0) active = entries.length ? 0 : -1;
+  if (active >= 0) selectFoilEntry(browser, active);
+  applyEntryFilter(browser);
+}
+function refreshFoilBrowsers(root) {
+  root.querySelectorAll('[data-foil-browser]').forEach(renderFoilBrowser);
+}
+function hydrateWorkspace(root) {
+  refreshFoilBrowsers(root);
+}
+function queueFoilRefresh(form) {
+  if (!form || !form.getAttribute('action')?.includes('/save/foil/')) return;
+  clearTimeout(form._foilRefreshTimer);
+  form._foilRefreshTimer = setTimeout(() => {
+    const browser = form.closest('.foil-tool')?.querySelector('[data-foil-browser]');
+    if (browser) renderFoilBrowser(browser);
+  }, 120);
+}
+function markDirty(form) {
+  const status = form.querySelector('[data-status]');
+  if (!status || status.dataset.status === 'dirty') return;
+  status.dataset.status = 'dirty';
+  status.textContent = 'changed';
+}
+function markSaved(form) {
+  const status = form.querySelector('[data-status]');
+  if (!status) return;
+  status.dataset.status = 'saved';
+  status.textContent = 'accepted';
+}
+document.addEventListener('input', event => {
+  const form = event.target.closest?.('[data-editor-form]');
+  if (form) {
+    markDirty(form);
+    queueFoilRefresh(form);
+  }
+  const filter = event.target.closest?.('[data-entry-filter]');
+  if (filter) {
+    const browser = filter.closest('.entry-browser');
+    applyEntryFilter(browser.closest('[data-foil-browser]'));
+  }
+});
+document.addEventListener('click', event => {
+  const row = event.target.closest?.('[data-entry-index]');
+  if (!row) return;
+  event.preventDefault();
+  selectFoilEntry(row.closest('[data-foil-browser]'), Number(row.dataset.entryIndex));
+});
+document.addEventListener('keydown', event => {
+  const form = event.target.closest?.('[data-editor-form]');
+  if (!form) return;
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    form.requestSubmit();
+  } else if (event.key.length === 1 || event.key === 'Backspace' || event.key === 'Delete' || event.key === 'Enter' || event.key === 'Tab') {
+    markDirty(form);
+    queueFoilRefresh(form);
+  }
+});
+document.addEventListener('submit', async event => {
+  const form = event.target.closest('[data-editor-form]');
+  if (!form) return;
+  event.preventDefault();
+  const target = document.querySelector('#workspace');
+  const button = form.querySelector('button[type=submit]');
+  button?.setAttribute('disabled', 'disabled');
+  try {
+    const res = await fetch(form.getAttribute('action'), {
+      method: 'POST',
+      headers: {'content-type': 'text/plain; charset=utf-8'},
+      body: editorValue(form)
+    });
+    if (!res.ok) throw new Error('save failed');
+    target.innerHTML = await res.text();
+    hydrateWorkspace(target);
+    markSaved(target.querySelector('[data-editor-form]'));
+  } finally {
+    button?.removeAttribute('disabled');
+  }
+});
+document.addEventListener('DOMContentLoaded', () => hydrateWorkspace(document));
+")
+
+(define (category-list _)
+  (div [(cls "stack")]
+    [(list-button "Reaver-Core")
+     (list-button "Foil-Models")
+     (list-button "Compiler-Image")
+     (list-button "HTTP-Tools")]))
+
+(define (protocol-list _)
+  (div [(cls "stack")]
+    [(list-button "source")
+     (list-button "tests")
+     (list-button "actors")
+     (list-button "compiler")
+     (list-button "browser")]))
+
+(define (system-browser _)
+  (section [(cls "browser-strip")]
+    [(browser-pane "system categories" (category-list 0))
+     (browser-pane "foil classes" (foil-file-list 0))
+     (browser-pane "reaver classes" (reaver-file-list 0))
+     (browser-pane "protocols" (protocol-list 0))]))
+
+(define (welcome-panel _)
+  (section [(cls "pane")]
+    [(div [(cls "pane-head")]
+       [(div [(cls "pane-title")]
+          [(h2 "Workspace")
+           (p "Reaver image")])
+        (div [(cls "tools")]
+          [(span [(cls "status") (attr "data-status" "saved")] "ready")])])
+     (div [(cls "split")]
+       [(section [(cls "entry")]
+          [(leaf "summary" no-attrs "workspace")
+           (pre [(cls "mono")]
+             "ReaverImage current browse.\nSystemBrowser openOn: #reaver.\nTranscript cr; show: 'ready'.")])
+        (section [(cls "entry")]
+          [(leaf "summary" no-attrs "transcript")
+           (pre [(cls "mono")]
+             "Reaver / Foil image ready\nclasses loaded\nchanges accepted into source files")])])]))
+
+(define (dev-page _)
+  (node "html" no-attrs
+    [(node "head" no-attrs
+       [(node "meta" [(attr "charset" "utf-8")] [])
+        (node "meta" [(attr "name" "viewport")
+                      (attr "content" "width=device-width, initial-scale=1")] [])
+        (script-module "/web/code-editor-dev-3.js")
+        (style dev-css)
+        (script mini-htmx-js)])
+     (node "body" no-attrs
+       [(div [(cls "app")]
+          [(system-browser 0)
+           (div [(id "workspace") (cls "workspace")]
+             [(welcome-panel 0)])])])]))
+
+
+;;; HTTP server ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define cr 13)
+(define lf 10)
+(define crlf (strWeld cr lf))
+
+(define (http-response content-type body)
+  (lstrcat
+    ~["HTTP/1.0 200 OK" crlf
+      "Content-Type: " content-type crlf crlf
+      body]))
+
+(define (html-response tree)
+  (http-response "text/html; charset=utf-8" (milton:milton-print tree)))
+
+(define (js-response js)
+  (http-response "application/javascript; charset=utf-8" js))
+
+(define (code-editor-js _)
+  (read-text-file "web/code-editor.js"))
+
+(define (feather-js _)
+  (strcat
+    ["import { css } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js';"
+     lf
+     "export const feather = css`"
+     (read-text-file "web/feather.css")
+     "`;"
+     lf]))
+
+(define (not-found target)
+  (html-response
+    (section [(cls "pane")]
+      [(h2 "Not found")
+       (pre [(cls "mono")] target)])))
+
+(define (save-foil mod body)
+  (define file (strcat ["foil/" mod ".foil"]))
+  (If body
+    (Seq
+      (write-text-file file body)
+      (html-response (foil-panel mod)))
+    (html-response (foil-panel mod))))
+
+(define (save-reaver mod body)
+  (define file (strcat ["reaver/" mod ".rvr"]))
+  (If body
+    (Seq
+      (write-text-file file body)
+      (html-response (reaver-panel mod)))
+    (html-response (reaver-panel mod))))
+
+(define (route method target body)
+  (cond
+    ((Eq "/web/code-editor-dev-3.js" target) (js-response (code-editor-js 0)))
+    ((Eq "/web/feather.js" target) (js-response (feather-js 0)))
+    ((And (Eq "POST" method) (str-prefix? "/save/foil/" target))
+      (save-foil (str-drop (Bytes "/save/foil/") target) body))
+    ((And (Eq "POST" method) (str-prefix? "/save/reaver/" target))
+      (save-reaver (str-drop (Bytes "/save/reaver/") target) body))
+    ((Eq "/" target) (html-response (dev-page 0)))
+    ((Eq "" target)  (html-response (dev-page 0)))
+    ((str-prefix? "/foil/" target)
+      (html-response
+        (foil-panel (str-drop (Bytes "/foil/") target))))
+    ((str-prefix? "/reaver/" target)
+      (html-response
+        (reaver-panel (str-drop (Bytes "/reaver/") target))))
+    (else (not-found target))))
+
+(define (request-target input)
+  (define parsed (Try milton:parse-http-request input))
+  (If (Nil (Hd parsed))
+    (Ix1 (Ix0 parsed))
+    "/"))
+
+(define (request-method input)
+  (define parsed (Try milton:parse-http-request input))
+  (If (Nil (Hd parsed))
+    (Ix0 (Ix0 parsed))
+    "GET"))
+
+(define (handle-connection conn)
+  (define input (Read conn 65536))
+  (Write conn (route (request-method input) (request-target input) (request-body input)))
+  (CloseFd conn))
+
+(define (listener-loop listen)
+  (define conn (Accept listen))
+  (Spawn (handle-connection conn))
+  (listener-loop listen))
+
+(define (run-dev-env port)
+  (listener-loop (Listen port)))
+
+(define (serve-dev-env port)
+  (Spawn (run-dev-env port)))

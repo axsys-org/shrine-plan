@@ -4,7 +4,7 @@
 
 import * as SC from 'https://nyc3.digitaloceanspaces.com/drain/hawk/1745077162763.mjs'
 import { LitElement, html, css } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js';
-import { feather } from '/apps/hawk/system/web/components/feather/?code';
+import { feather } from '/web/feather.js';
 
 const hoonParser = {
   startState() {
@@ -109,9 +109,7 @@ class SpineCodeEditor extends LitElement {
 
   connectedCallback() {
     super.connectedCallback()
-    $(this).on('focus', function(e) {
-      this.editor.focus();
-    })
+    this.addEventListener('focus', () => this.editor?.focus());
   }
   
   save() {
@@ -175,8 +173,8 @@ class SpineCodeEditor extends LitElement {
     SC.Vim.defineAction("save-and-close", (e) => {
       let that = e?.cm6.dom?.getRootNode().host;
       that?.save()
-      if (closeTabs) {
-        closeTabs()
+      if (globalThis.closeTabs) {
+        globalThis.closeTabs()
       }
     });
 
@@ -194,7 +192,7 @@ class SpineCodeEditor extends LitElement {
       });
     }
 
-    this.foldAll()
+    this.loadTextFromNodes(Array.from(this.childNodes));
   }
 
   updated(changedProperties) {
@@ -410,8 +408,8 @@ class SpineCodeEditor extends LitElement {
     `
   }
   
-  handleSlotchange(e) {
-    const childNodes = e.target.assignedNodes({flatten: true});
+  loadTextFromNodes(childNodes) {
+    if (!this.editor) return;
     let text = childNodes.map((node) => {
       return node.textContent ? node.textContent : ''
     }).join('');
@@ -423,6 +421,10 @@ class SpineCodeEditor extends LitElement {
       },
     });
     this.editor.dispatch(transaction);
+  }
+
+  handleSlotchange(e) {
+    this.loadTextFromNodes(e.target.assignedNodes({flatten: true}));
   }
 }
 
