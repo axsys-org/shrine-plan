@@ -1,0 +1,197 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind byte (#module byte))
+(#import byte)
+(#bind mir (#module mir))
+(#bind bc (#module byte-compiler))
+
+(define (compiled info)
+  (bc:compile-mir-law info))
+
+(define (label-of law idx)
+  (byte-label-code (byte-law-labels law) idx))
+
+(define std-entry [(mir:jmp 0 [])])
+
+;;; Simple returns.
+
+(define simple-lit
+  (compiled
+    (mir:mir-law "simple-lit" 0 []
+      [[(mir:ret (mir:lit-at 7))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_LIT 7) OP_RET]
+  (label-of simple-lit 0))
+
+(define simple-env
+  (compiled
+    (mir:mir-law "simple-env" 1 []
+      [[(mir:ret (mir:env-at 1))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_VAR 1) OP_RET]
+  (label-of simple-env 0))
+
+;;; Strict-on-use entry adaptation without an env-update opcode.
+
+(define strict-env
+  (compiled
+    (mir:mir-law "strict-env" 1 [1]
+      [[(mir:eval-inplace-st 1)
+        (mir:ret (mir:env-at 1))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_VAR 1) OP_EVAL OP_RET]
+  (label-of strict-env 0))
+
+;;; Fast primitive calls.
+
+(define fast-add
+  (compiled
+    (mir:mir-law "fast-add" 0 []
+      [[(mir:let-st 0
+          (mir:call "fast" (mir:lit-at Add)
+            [(mir:lit-at 1) (mir:lit-at 2)]))
+        (mir:ret (mir:tmp 0))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_LIT 1) (OP_PUSH_LIT 2)
+   (OP_ROTATE 2) OP_EVAL (OP_ROTATE 2) OP_EVAL
+   OP_ADD OP_RET]
+  (label-of fast-add 0))
+
+(define fast-dec
+  (compiled
+    (mir:mir-law "fast-dec" 0 []
+      [[(mir:let-st 0
+          (mir:call "fast" (mir:lit-at Dec)
+            [(mir:lit-at 3)]))
+        (mir:ret (mir:tmp 0))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_LIT 3) OP_EVAL OP_DEC OP_RET]
+  (label-of fast-dec 0))
+
+;;; Unknown tail call fusion.
+
+(define unk-tail
+  (compiled
+    (mir:mir-law "unk-tail" 0 []
+      [[(mir:let-st 0
+          (mir:call "unk" (mir:lit-at Add)
+            [(mir:lit-at 1)]))
+        (mir:ret (mir:tmp 0))]
+       std-entry])))
+
+assert(Equal
+  [(OP_PUSH_LIT Add) (OP_PUSH_LIT 1)
+   (OP_APPLY_UNK 2) OP_TAIL_EVAL OP_RET]
+  (label-of unk-tail 0))
+
+;;; Delay creates a law-local suspension label.
+
+(define delay-law
+  (compiled
+    (mir:mir-law "delay-law" 0 []
+      [[(mir:let-st 0
+          (mir:delay [(mir:ret (mir:lit-at 8))]))
+        (mir:ret (mir:tmp 0))]
+       std-entry])))
+
+assert(Equal 3 (byte-law-bc-s delay-law))
+assert(Equal
+  [(OP_MAKE_SUSP 2) OP_RET]
+  (label-of delay-law 0))
+assert(Equal
+  [(OP_PUSH_LIT 8) OP_RET]
+  (label-of delay-law 2))
+
+;;; Branches lower to bytecode labels.
+
+(define branch-law
+  (compiled
+    (mir:mir-law "branch-law" 0 []
+      [[(mir:br (mir:lit-at 1)
+          [(mir:ret (mir:lit-at 7))]
+          [(mir:ret (mir:lit-at 9))])]
+       std-entry])))
+
+assert(Equal 3 (byte-law-bc-s branch-law))
+assert(Equal
+  [(OP_PUSH_LIT 1) OP_EVAL (OP_JUMP_IF 2)
+   (OP_PUSH_LIT 9) OP_RET]
+  (label-of branch-law 0))
+assert(Equal
+  [(OP_PUSH_LIT 7) OP_RET]
+  (label-of branch-law 2))
+
+;;; Captured jumps make captures available to the destination's virtual stack.
+
+(define captured-jmp
+  (compiled
+    (mir:mir-law "captured-jmp" 0 []
+      [[(mir:let-st 0
+          (mir:call "fast" (mir:lit-at Add)
+            [(mir:lit-at 1) (mir:lit-at 2)]))
+        (mir:jmp 2 [(mir:tmp 0)])]
+       std-entry
+       [(mir:ret (mir:env-at 1))]])))
+
+assert(Equal
+  [(OP_PUSH_LIT 1) (OP_PUSH_LIT 2)
+   (OP_ROTATE 2) OP_EVAL (OP_ROTATE 2) OP_EVAL
+   OP_ADD (OP_JMP 2)]
+  (label-of captured-jmp 0))
+assert(Equal
+  [OP_RET]
+  (label-of captured-jmp 2))
+
+;;; Conservative rejection paths.
+
+(define multi-use-bad
+  (mir:mir-law "multi-use-bad" 0 []
+    [[(mir:let-st 0 (mir:close (mir:lit-at Add) []))
+      (mir:let-st 1 (mir:close (mir:tmp 0) []))
+      (mir:ret (mir:tmp 0))]
+     std-entry]))
+
+(define multi-use-err
+  (Try (lambda (x) (bc:compile-mir-law multi-use-bad)) 0))
+
+assert(Eq 1 (Hd multi-use-err))
+
+(define nonterminal-branch-bad
+  (mir:mir-law "nonterminal-branch-bad" 0 []
+    [[(mir:br (mir:lit-at 1)
+        [(mir:ret (mir:lit-at 7))]
+        [(mir:ret (mir:lit-at 9))])
+      (mir:ret (mir:lit-at 0))]
+     std-entry]))
+
+(define nonterminal-branch-err
+  (Try (lambda (x) (bc:compile-mir-law nonterminal-branch-bad)) 0))
+
+assert(Eq 1 (Hd nonterminal-branch-err))
+
+(define captured-delay-bad
+  (mir:mir-law "captured-delay-bad" 0 []
+    [[(mir:jmp 2 [(mir:lit-at 7)])]
+     std-entry
+     [(mir:let-st 0
+        (mir:delay [(mir:ret (mir:env-at 1))]))
+      (mir:ret (mir:tmp 0))]]))
+
+(define captured-delay-err
+  (Try (lambda (x) (bc:compile-mir-law captured-delay-bad)) 0))
+
+assert(Eq 1 (Hd captured-delay-err))
+
+(print "byte compiler tests passed")

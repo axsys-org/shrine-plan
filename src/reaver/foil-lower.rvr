@@ -1,0 +1,99 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind ty (#module foil-types))
+(#bind cgen (#module codegen))
+
+;;; Lowered module entries ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (make-ir-entry key span val tc ir)
+  ("IR_ENTRY" key span val tc ir))
+(define ir-entry-val (Ix 2))
+(define ir-entry-tc (Ix 3))
+(define ir-entry-ir (Ix 4))
+
+;;; TC lowering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (fold-app f xs)
+  (Ifz xs f
+    (fold-app (cgen:A f (_0 xs)) (drop 1 xs))))
+
+(define (lower-tc sut val)
+  (define (tag-is x) (Eq (Hd val) x))
+  (define (lower-lam lam)
+    (define body (lower-tc sut (tc-lam-body lam)))
+    (cgen:F y y y "LAM" (tc-lam-arity val) body))
+  (define (get-hd typ[_ tag])
+    (define span[_ stag] (ty:mold-to-span sut typ))
+    (define (tag-is x) (Eq stag x))
+    (cond
+      ((tag-is "TROW") (ty:trow-cstr span))
+      (else
+        (begin (print ("fallthrough" typ))
+          0))))
+  (define (lower-arms fall arms)
+    (Ifz arms (lower-tc sut fall)
+      (letrec
+        ((arm (_0 arms))
+         (pat-ty (tc-arm-pat arm))
+         (leg-tc (lower-tc sut (tc-arm-val arm)))
+         (test-ir (cgen:A (cgen:K (Pin (ty:type-fits sut pat-ty))) (cgen:V 0))))
+         (cgen:A
+           (cgen:A (cgen:A (cgen:K Ifz) test-ir)
+             leg-tc)
+            (lower-arms fall (drop 1 arms))))))
+  (define (lower-match val)
+    (cgen:L (tc-match-scrut val)
+      (lower-arms (tc-match-fall val) (tc-match-arms val))))
+  (define (lower-row row)
+    (fold-app
+      (cgen:K (tc-row-hd row))
+      (map (lower-tc sut) (tc-row-items row))))
+  (define (lower-local-path path)
+    (define (go acc idx)
+      (cgen:A (cgen:A (cgen:K Ix) (cgen:K idx)) acc))
+    (foldl go (cgen:V (_0 path)) (drop 1 path)))
+  (define (lower-local slot)
+    (If (IsApp slot)
+      (If (Eq 1 (Sz slot))
+        (cgen:V (_0 slot))
+        (lower-local-path slot))
+      (cgen:V slot)))
+  (cond
+    ((tag-is "TC_LOCAL")  (lower-local (tc-local-slot val)))
+    ((tag-is "TC_GLOBAL") (cgen:G (got-const (tc-global-path val))))
+    ((tag-is "TC_LIT")    (cgen:K (tc-lit-val val)))
+    ((tag-is "TC_FFI")    (cgen:K (tc-ffi-val val)))
+    ((tag-is "TC_APP")    (cgen:A (lower-tc sut (tc-app-f val))
+                             (lower-tc sut (tc-app-x val))))
+    ((tag-is "TC_LAM")    (lower-lam val))
+    ((tag-is "TC_ROW")    (lower-row val))
+    ((tag-is "TC_TYP")    (cgen:K val))
+    ((tag-is "TC_MATCH")  (lower-match val))
+    ((tag-is "TC_MEAN")   (cgen:A (cgen:K error) (cgen:K "unreachable")))
+    (else (error ("lowering" val)))))
+
+(define (lower-tc-entry sut key ent)
+  (define tc (tc-entry-contents ent))
+  (define ir (lower-tc sut tc))
+  (define span (tc-entry-span ent))
+  (define val (cgen:compile-expr ir))
+  (define ent1 (make-ir-entry key span val tc ir))
+  (insert-entry-sut key ent1 sut))
+
+(define (lower-tc-mod sut out)
+  (define n[next sut1] (pop-subject-order sut))
+  (define entry (got-entry next sut))
+  (Ifz (subject-order sut) out
+    (let ((out1 (lower-tc-entry out next entry)))
+      (lower-tc-mod sut1 out1))))

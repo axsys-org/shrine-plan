@@ -4,8 +4,11 @@
     url = "github:liam-fitzgerald/rex/lf/remove-quip-poems";
     flake = false;
   };
+  inputs.enki = {
+    url = "github:axsys-org/enki/main";
+  };
 
-  outputs = { self, nixpkgs, rex }:
+  outputs = { self, nixpkgs, rex, enki }:
     let
       systems = [
         "x86_64-linux"
@@ -18,6 +21,8 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          enkiPkg = enki.packages.${system}.default;
+
 
           hsPkgs = pkgs.haskellPackages.override {
             overrides = hfinal: hprev: {
@@ -35,6 +40,8 @@
               hsPkgs.stylish-haskell
               hsPkgs.cabal-install
               pkgs.rlwrap
+              pkgs.samply
+              enkiPkg
             ];
             # buildInputs = with hsPkgs; [
             #   text primitive pretty-show containers deepseq

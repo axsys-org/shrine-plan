@@ -1,0 +1,598 @@
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+;;; Type constructors and accessors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define TYPE "type")
+;; bottom type
+;; TBOT obeys distribution
+;; TBAD should not
+;; i.e. A | TBOT = A
+;; but A | TBAD = TBAD
+(define TBOT [TYPE "TBOT"])
+;; natural, optionally constant
+(define (TNAT cube) [TYPE "TNAT" cube])
+(define (type-not-bottom? x[_ tag]) (Ne tag "TBOT"))
+;; sum type
+(define (TSUM opts)
+  (define canon (filter type-not-bottom? opts))
+  ; (print ("sum" opts canon))
+  (If (Equal canon opts) 0 (print ("mismatch" opts canon)))
+  (define sz (Sz canon))
+  (cond
+    ((Eq 1 sz) (_0 canon))
+    ((Eq 0 sz) TBOT)
+    ;; TODO: walk, flatten
+    (else [TYPE "TSUM" (sort cmp-total canon)])))
+(define tsum-opts (Ix 2)) ;
+;; qualify name in body
+(define (TQUA name body) [TYPE "TQUA" name body])
+;; nominal reference, possibly applied
+(define (TNOM ref args) [TYPE "TNOM" ref args])
+(define tnom-ref (Ix 2))
+;; type variable
+(define (TVAR idx) [TYPE "TVAR" idx])
+;; structural type tag (existential)
+(define (TEXI nam) [TYPE "TEXI" nam])
+;; function
+(define (TFUN args ret) [TYPE "TFUN" (Sz args) args ret])
+;; is
+(define (TSELF x) [TYPE "TSELF" x])
+(define tself-val Ix2)
+;;
+(define (is-tfun? x) (Eq (_1 x) "TFUN")) (define (tfun-ari x) (_2 x))
+(define (tfun-args x) (_3 x)) (define (tfun-ret x) (_4 x))
+
+(define (TFAC fac val) [TYPE "TFAC" fac val])
+(define tfac-val (Ix 3))
+(define (type-row-cstr? cstr) (IsNat cstr))
+(define (TROW cstr vals)
+  (unless (type-row-cstr? cstr)
+    (error ["bad-row-constructor" cstr])
+    [TYPE "TROW" cstr vals]))
+(define trow-cstr (Ix 2))
+(define trow-vals (Ix 3))
+(define (TUNI lvl) [TYPE "TUNI" lvl])
+(define (TPIN box) [TYPE "TPIN" box])
+(define tpin-val (Ix 2))
+(define TANY [TYPE "TANY"])
+(define (TTYP typ) [TYPE "TTYP" typ])
+(define TBAD [TYPE "TBAD"])
+(define (TBOX val) [TYPE "TBOX" val])
+(define (TARR item) [TYPE "TARR" item])
+
+;;; Result helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; data Either = Left a | Right
+(define (left x) ("left" x)) (define (right x) ("right" x))
+(define (is-left? x) (Eq (Hd x) "left")) (define (is-right? x) (Eq (Hd x) "right"))
+(define (either-seq f a b) (If (is-left? a) a))
+
+;;; Well-formedness and substitution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (check-type-wf sut x[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (check-type-wf sut))
+  (define (check-tfun-args args)
+    (define res (filter is-left? (map (check-type-wf sut) args)))
+    (Ifz (Sz res) (right 0) (_0 res)))
+  (define (type-and x y) (If (is-left? x) x y))
+  (cond
+    ((tag-is "TVAR")
+     (Ifz (sut-get-tvar? (_2 x)) (left "unbound ty var") (right 0)))
+     ((tag-is "TFUN")
+       (type-and (check-tfun-args (tfun-args x)) (recur (tfun-ret x))))
+     ((tag-is "TNOM") (Ifz (get-const (_2 x) sut) (left "bad type reference")
+         (right 0)))
+     ((tag-is "TFAC") (recur (_3 x)))
+     ((tag-is "TPIN") (recur (tpin-val x)))
+     ((tag-is "TARR") (recur (_2 x)))
+     ((tag-is "TNAT") (right 0))
+     ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
+     ((tag-is "TSUM") (check-tfun-args (_2 x)))
+     ((tag-is "TROW")
+       (type-and
+         (If (type-row-cstr? (trow-cstr x))
+           (right 0)
+           (left "bad row constructor"))
+         (check-tfun-args (trow-vals x))))
+     (else (print "unhandled") (right 0))))
+
+
+(define (subst-type name repl ty[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (subst-type name repl))
+  (cond
+    ((tag-is "TVAR") (If (Eq (_2 ty) name) repl ty))
+    ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+    ((tag-is "TNOM") (TNOM (_2 ty) (map recur (_3 ty))))
+    ((tag-is "TFAC") (TFAC (_2 ty) (recur (_3 ty))))
+    ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
+    ((tag-is "TARR") (TARR (recur (_2 ty))))
+    ((tag-is "TNAT") ty)
+    ((tag-is "TQUA") (If (Eq (_2 ty) name) ty (TQUA (_2 ty) (recur (_3 ty)))))
+    ((tag-is "TSUM") (TSUM (map recur (_2 ty))))
+    ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
+    (else (print [ty "unhandled"]) (right 0))))
+
+(define (type-specialize-span f args)
+  (Ifz args
+    f
+    (cond
+      ((Eq (_1 f) "TQUA")
+        (type-specialize-span
+          (subst-type (_2 f) (_0 args) (_3 f))
+          (drop 1 args)))
+      ((Eq (_1 f) "TFAC")
+        (TFAC (_2 f) (type-specialize-span (tfac-val f) args)))
+      ((Eq (_1 f) "TSELF")
+        (TSELF (type-specialize-span (tself-val f) args)))
+      (else (TBAD ["bad-explicit-specialization" f args])))))
+
+;;; Span nesting and type application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (type-nests-span? sup sub)
+  (define stag (_1 sup))
+  (define subtag (_1 sub))
+  (define (opt-has-sub opt) (type-nests-span? opt sub))
+  (define (sup-has-opt opt) (type-nests-span? sup opt))
+  (define (row-nests? a b)
+    (and (Eq (trow-cstr a) (trow-cstr b))
+      (and (Eq (Sz (trow-vals a)) (Sz (trow-vals b)))
+        (all (uncurry type-nests-span?)
+          (zip (trow-vals a) (trow-vals b))))))
+  (define (arr-nests-row? arr row)
+    (And (Eq 0 (trow-cstr row))
+      (all (type-nests-span? (_2 arr)) (trow-vals row))))
+  (define (law-type? ty)
+    (Eq "TFUN" (_1 ty)))
+  (define (pin-law-nests? pin other)
+    (And (law-type? (tpin-val pin))
+      (type-nests-span? (tpin-val pin) other)))
+  (cond
+    ((Equal sup sub) 1)
+    ((Eq stag "TANY") 1)
+    ((Eq subtag "TANY") 1)
+    ((Eq subtag "TBOT") 1)
+    ((Eq stag "TFAC") (type-nests-span? (tfac-val sup) sub))
+    ((Eq subtag "TFAC") (type-nests-span? sup (tfac-val sub)))
+    ((And (Eq stag "TPIN") (Eq subtag "TPIN"))
+      (type-nests-span? (tpin-val sup) (tpin-val sub)))
+    ((and (Eq stag "TARR") (Eq subtag "TARR"))
+      (type-nests-span? (_2 sup) (_2 sub)))
+    ((and (Eq stag "TARR") (Eq subtag "TROW"))
+      (arr-nests-row? sup sub))
+    ((Eq stag "TPIN") (pin-law-nests? sup sub))
+    ((Eq subtag "TPIN") (pin-law-nests? sub sup))
+    ((and (Eq stag "TROW") (Eq subtag "TROW")) (row-nests? sup sub))
+    ((and (Eq stag "TSUM") (Eq subtag "TSUM")) (all sup-has-opt (tsum-opts sub)))
+    ((Eq stag "TSUM") (any opt-has-sub (tsum-opts sup)))
+    ((Eq subtag "TSUM") (all sup-has-opt (tsum-opts sub)))
+    ((and (Eq stag "TNAT") (Eq subtag "TNAT"))
+      (or (Eq 0 (_2 sup)) (Eq (_2 sup) (_2 sub))))
+    (else 0)))
+(define (ty-match name x) (And (Eq (_1 x) "TVAR") (Eq (_2 x) name)))
+(define (find-tvar name args) (find-idx (ty-match name) args))
+(define (find-inferred-tvar name wants gots)
+  (define (first-some xs)
+    (find (lambda (x) x) xs))
+  (define (infer want[_ wtag] got[_ gtag])
+    (cond
+      ((ty-match name want) [got])
+      ((Eq wtag "TFAC") (infer (tfac-val want) got))
+      ((Eq gtag "TFAC") (infer want (tfac-val got)))
+      ((And (Eq wtag "TPIN") (Eq gtag "TPIN"))
+        (infer (tpin-val want) (tpin-val got)))
+      ((And (Eq wtag "TFUN") (Eq gtag "TFUN"))
+        (first-some
+          (Weld
+            (map (uncurry infer) (zip (tfun-args want) (tfun-args got)))
+            [(infer (tfun-ret want) (tfun-ret got))])))
+      ((And (Eq wtag "TROW") (Eq gtag "TROW"))
+        (first-some
+          (map (uncurry infer) (zip (trow-vals want) (trow-vals got)))))
+      ((And (Eq wtag "TARR") (Eq gtag "TARR"))
+        (infer (_2 want) (_2 got)))
+      ((And (Eq wtag "TARR") (Eq gtag "TROW"))
+        (first-some
+          (map (infer (_2 want)) (trow-vals got))))
+      (else 0)))
+  (first-some (map (uncurry infer) (zip wants gots))))
+
+(define (type-apply-span f x)
+  (define (unface-fun ty[_ tag])
+    (cond
+      ((Eq tag "TFAC") (unface-fun (tfac-val ty)))
+      ((Eq tag "TFUN") (TFUN (map unface-fun (tfun-args ty)) (unface-fun (tfun-ret ty))))
+      (else ty)))
+  (define (fun-shaped? ty)
+    (Eq "TFUN" (_1 (unface-fun ty))))
+  (define (arg-nests? want got)
+    (If (type-nests-span? want got)
+      1
+      (If (And (fun-shaped? want) (fun-shaped? got))
+        (Equal (unface-fun want) (unface-fun got))
+        0)))
+  ;; just try and expand this easy case
+  ;; combined with the UFCS should get 90% of polymorphism
+  (define (type-apply-qua f x)
+    (define name (_2 f))
+    (define fun (_3 f))
+    (define first-arg[idx] (find-tvar name (tfun-args fun)))
+    (define (infer-first-pin)
+      (Ifz x 0
+        (Ifz (tfun-args fun) 0
+          (let ((want (_0 (tfun-args fun)))
+                (got (_0 x)))
+            (If (And (Eq "TPIN" (_1 want))
+                  (And (Eq "TPIN" (_1 got))
+                    (ty-match name (tpin-val want))))
+              [(tpin-val got)]
+              0)))))
+    (define inferred
+      (Or (infer-first-pin)
+        (find-inferred-tvar name (tfun-args fun) x)))
+    (define result
+      (subst-type name x fun))
+    (unless
+      (Eq (_1 fun) "TFUN")
+      (TBAD ["too complicated" f x])
+      (Ifz first-arg
+        (Ifz inferred
+          (TBAD ["failed to resolve polymorphism by arguments, please specify"
+                 f x])
+          (type-apply-span (subst-type name (_0 inferred) fun) x))
+        (If (Lt idx (Sz x))
+          (type-apply-span (subst-type name (Ix idx x) fun) x)
+          (TBAD ["polymorphism not first arg" f x])))))
+  (define (f-hd y) (Eq (_1 f) y))
+  (define (type-apply-fun args ret x)
+    ;(print ["apply fun" args ret x])
+    (If (arg-nests? (_0 args) x)
+        (If (Eq 1 (Sz args)) ret
+          (TFUN (drop 1 args) ret))
+        (TBAD ["nest-fail" (_0 args) x])))
+  (Ifz x f
+    (cond
+    ((f-hd "TQUA") (TBAD ["explicit-specialization-required" f]))
+    ((f-hd "TFAC") (type-apply-span (_3 f) x))
+    ((f-hd "TPIN")
+      (If (Eq "TFUN" (_1 (tpin-val f)))
+        (type-apply-span (tpin-val f) x)
+        (TBAD ["pinned non-law apply" f x])))
+    ((f-hd "TSELF") (type-apply-span (tself-val f) x))
+    ((f-hd "TFUN")
+      (type-apply-span (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
+    ((f-hd "TBAD") f)
+    (else (TBAD ["weird apply" f x])))))
+
+;;; Mold/span conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (name-row-span name span[_ tag])
+  (If (Eq tag "TROW")
+    (TROW (print-path name) (trow-vals span))
+    span))
+
+(define (mold-to-span-seen sut seen ty[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (mold-to-span-seen sut seen))
+  (cond
+    ((tag-is "TNOM")
+      (define ref (tnom-ref ty))
+      (define args (_3 ty))
+      (If (find (Equal ref) seen)
+        ty
+        (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
+              (applied-args (map recur args)))
+          (define applied (type-specialize-span base applied-args))
+          (name-row-span ref applied))))
+    ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+    ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
+    ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
+    ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
+    ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
+    ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
+    ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
+    ((tag-is "TTYP") (TTYP (recur (_2 ty))))
+    ((tag-is "TARR") (TARR (recur (_2 ty))))
+    (else ty)))
+
+(define (mold-to-span sut ty)
+  (mold-to-span-seen sut 0 ty))
+
+(define (mold-rec-seed ty[_ tag])
+  (cond
+    ((Eq tag "TNOM") [(tnom-ref ty)])
+    ((Eq tag "TFAC") (mold-rec-seed (tfac-val ty)))
+    ((Eq tag "TPIN") (mold-rec-seed (tpin-val ty)))
+    ((Eq tag "TSELF") (mold-rec-seed (tself-val ty)))
+    (else 0)))
+
+(define (type-entry? path sut)
+  (Eq (Hd (got-entry-tc path sut)) "TC_TYP"))
+
+(define (find-type-name-for-span sut span[_ tag])
+  (define (matches path)
+    (If (Nil (type-entry? path sut))
+      0
+      (Equal span (mold-to-span sut (TNOM path 0)))))
+  (If (or (Eq tag "TROW") (Eq tag "TSUM"))
+    (find matches (subject-order sut))
+    0))
+
+(define (span-to-mold sut ty[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (span-to-mold sut))
+  (define nom (find-type-name-for-span sut ty))
+  (Ifz nom
+    (cond
+      ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
+      ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
+      ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
+      ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
+      ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
+      ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
+      ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
+      ((tag-is "TTYP") (TTYP (recur (_2 ty))))
+      ((tag-is "TARR") (TARR (recur (_2 ty))))
+      (else ty))
+    (TNOM (_0 nom) 0)))
+
+(define (type-apply sut f x)
+  (define (arg-seeds ty[_ tag])
+    (cond
+      ((Eq tag "TFUN") (map mold-rec-seed (tfun-args ty)))
+      ((Eq tag "TFAC") (arg-seeds (tfac-val ty)))
+      ((Eq tag "TPIN") (arg-seeds (tpin-val ty)))
+      ((Eq tag "TSELF") (arg-seeds (tself-val ty)))
+      ((Eq tag "TQUA") (arg-seeds (_3 ty)))
+      (else 0)))
+  (define (expand-args seeds xs)
+    (Ifz xs 0
+      (let ((x (_0 xs)))
+        (Weld [(If (Eq "TNOM" (_1 x))
+                  (mold-to-span sut x)
+                  (mold-to-span-seen sut (Ifz seeds 0 (_0 seeds)) x))]
+        (expand-args (Ifz seeds 0 (drop 1 seeds)) (drop 1 xs))))))
+  (span-to-mold sut
+    (type-apply-span
+      (mold-to-span sut f)
+      (expand-args (arg-seeds f) x))))
+
+(define (type-specialize sut f args)
+  (type-specialize-span f args))
+
+(define (type-nests? sut sup sub)
+  (cond
+    ((Equal sup sub) 1)
+    ((Eq (_1 sup) "TFAC") (type-nests? sut (tfac-val sup) sub))
+    ((Eq (_1 sub) "TFAC") (type-nests? sut sup (tfac-val sub)))
+    (else
+      (type-nests-span?
+        (mold-to-span sut sup)
+        (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
+
+;;; Joins, meets, and fit checks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; type union
+(define (type-join-span sut x[_ xtag] y[_ ytag])
+  (define (homo-join tag x y)
+    (define (tag-is z) (Eq tag z))
+    (cond
+      ((tag-is "TNAT") (TNAT 0))
+      ((tag-is "TSUM")
+       (TSUM (Weld (tsum-opts x) (tsum-opts y))))
+      ((And (tag-is "TROW")
+         (And (Eq (trow-cstr x) (trow-cstr y))
+           (Eq (Sz (trow-vals x)) (Sz (trow-vals y)))))
+        (TROW (trow-cstr x)
+          (map (uncurry (type-join-span sut)) (zip (trow-vals x) (trow-vals y)))))
+      ((tag-is "TARR")
+        (TARR (type-join-span sut (_2 x) (_2 y))))
+      (else (TSUM [x y]))))
+  (define (flat-sum sum[_ _ opts] other)
+    (TSUM (snoc other opts)))
+  (cond
+    ((Equal x y) x)
+    ((Eq xtag "TFAC") (type-join-span sut (tfac-val x) y))
+    ((Eq ytag "TFAC") (type-join-span sut x (tfac-val y)))
+    ((And (Eq xtag "TPIN") (Eq ytag "TPIN"))
+      (TPIN (type-join-span sut (tpin-val x) (tpin-val y))))
+    ((Eq xtag ytag) (homo-join xtag x y))
+    ((Eq xtag "TSUM") (flat-sum x y))
+    ((Eq ytag "TSUM") (flat-sum y x))
+    (else (TSUM [x y]))))
+
+(define (type-join sut x y)
+  (span-to-mold sut
+    (type-join-span sut
+      (mold-to-span sut x)
+      (mold-to-span sut y))))
+
+;; type intersection
+(define (type-meet-span sut x[_ xtag] y[_ ytag])
+  (define (homo-meet tag x y)
+    (define (tag-is z) (Eq tag z))
+    (cond
+      ;; should be caught be deepeq
+      ((tag-is "TNAT") TBOT)
+      ((tag-is "TSUM") (TSUM (intersect Equal (tsum-opts x) (tsum-opts y))))
+      ((And (tag-is "TROW")
+         (And (Eq (trow-cstr x) (trow-cstr y))
+           (Eq (Sz (trow-vals x)) (Sz (trow-vals y)))))
+        (TROW (trow-cstr x)
+          (map (uncurry (type-meet-span sut)) (zip (trow-vals x) (trow-vals y)))))
+      ((tag-is "TARR")
+        (TARR (type-meet-span sut (_2 x) (_2 y))))
+      (else TBOT)))
+  (define (distr-sum sum[_ _ opts] other)
+    (TSUM (map (type-meet-span sut other) opts)))
+  (define (distr-face face[_ _ face val] other)
+    (TFAC face (type-meet-span sut val other)))
+    (Force (cond
+    ((Equal x y) x)
+    ((And (Eq xtag "TPIN") (Eq ytag "TPIN"))
+      (TPIN (type-meet-span sut (tpin-val x) (tpin-val y))))
+    ((Eq xtag ytag) (homo-meet xtag x y))
+    ((Eq xtag "TFAC") (distr-face x y))
+    ((Eq ytag "TFAC") (distr-face y x))
+    ((Eq xtag "TSUM") (distr-sum x y))
+    ((Eq ytag "TSUM") (distr-sum y x))
+    (else TBOT))))
+
+(define (type-meet sut x y)
+  (span-to-mold sut
+    (type-meet-span sut
+      (mold-to-span sut x)
+      (mold-to-span-seen sut (mold-rec-seed x) y))))
+
+(define (fits-err err)
+  (1 [err]))
+(define (fits-weld a[ae] b[be])
+  (1 (Weld ae be)))
+(define (fits-or a b)
+  (Ifz a 0 b))
+(define (fits-and a b)
+  (Ifz a b
+    (Ifz b a
+      (fits-weld a b))))
+(define (type-fits-span sut ty[_ tag] val)
+  (define (tag-is x) (Eq x tag))
+  (define recur (type-fits-span sut))
+  (define recur-row (uncurry (type-fits-span sut)))
+  (define (law-like? x)
+    (Or (IsLaw x)
+      (And (IsPin x) (IsLaw (Unpin x)))))
+  (define (fun-fits ty val)
+    (Ifz (law-like? val)
+      (fits-err "not law")
+      0))
+  (define (pin-fits inner val)
+    (If (And (Eq "TFUN" (_1 inner)) (law-like? val))
+      (fun-fits inner val)
+      (Ifz (IsPin val)
+        (fits-err "not pin")
+        (recur inner (Unpin val)))))
+  (define (row-fits cstr tys val)
+    (cond
+      ((And (Eq 0 (Sz tys)) (Eq cstr val)) 0)
+      ((Nil (IsApp val)) (fits-err "fit row into bottom"))
+      ((Ne cstr (Hd val)) (fits-err "bad type constructor"))
+      ((Ne (Sz tys) (Sz val)) (fits-err "fit row into bad size"))
+      (else (foldr fits-and 0 (map recur-row (zip tys val))))))
+  (define (arr-fits item val)
+    (cond
+      ((Nil (is-row? val)) (fits-err "not row"))
+      (else (foldr fits-and 0 (map (recur item) val)))))
+  (cond
+    ((tag-is "TBOT") (fits-err "nothing fits bottom"))
+    ((tag-is "TROW") (row-fits (trow-cstr ty) (trow-vals ty) val))
+    ((tag-is "TFAC") (recur (tfac-val ty) val))
+    ((tag-is "TPIN") (pin-fits (tpin-val ty) val))
+    ((tag-is "TFUN") (fun-fits ty val))
+    ((tag-is "TARR") (arr-fits (_2 ty) val))
+    ((tag-is "TSUM")
+      (foldl fits-or
+             (fits-err "fell through sum")
+             (map recur-row (late-zip val (tsum-opts ty)))))
+    ((tag-is "TNAT") (If (IsNat val) 0 (fits-err "not nat")))
+    (else (fits-err ["fallthrough uimpl" tag]))))
+
+(define (type-fits sut ty val)
+  (type-fits-span sut (mold-to-span sut ty) val))
+
+;;; Subject insertion and type AST conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define tc-poison
+  (tc "POISON" TBAD))
+(define (tc-ttyp typ)
+  (tc-typ (TTYP typ)))
+(define (name-top-row key typ[_ tag])
+  (If (Eq tag "TROW")
+    (TROW (print-path key) (trow-vals typ))
+    typ))
+(define (insert-typ key span typ sut)
+  (define ent (make-tc-entry key span (tc-ttyp (name-top-row key typ))))
+  (insert-entry-sut key ent sut))
+
+(define (insert-typ-ffi key typ sut)
+  (insert-typ key wack-span typ sut))
+(define (resolve-type sut tyast)
+  (define (tag-is x) (Eq (_0 tyast) x))
+  (cond
+    ((tag-is "ref") (got-span (_1 tyast) sut) (TNOM (_1 tyast) 0))
+    ((tag-is "bind") (TFAC (_1 tyast) (resolve-type sut (_2 tyast))))
+    ((tag-is "row") (TROW 0 (map (resolve-type sut) (drop 1 tyast))))
+
+    (else
+      (error ["bad type ast" tyast]))))
+
+;;; Row face helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (collect-faces items)
+  (define (go acc[idx ls] arg[_ tag face ty])
+    [(Inc idx)
+    (unless (Eq tag "TFAC")
+      ls
+      (snoc [idx face ty] ls))])
+  (_1 (foldl go [0 0] items)))
+
+;;; Public exports ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(#export
+ check-type-wf
+ subst-type
+ mold-to-span
+ span-to-mold
+ type-apply
+ type-specialize
+ type-join
+ type-meet
+ type-fits
+ type-nests?
+ insert-typ
+ insert-typ-ffi
+ resolve-type
+ collect-faces
+
+TBOT
+;; natural, optionally constant
+TNAT
+type-not-bottom?
+TSUM
+tsum-opts
+TQUA
+TNOM
+tnom-ref
+TVAR
+TEXI
+TFUN
+
+TSELF
+tself-val
+
+is-tfun?
+tfun-ari
+tfun-args
+tfun-ret
+TFAC
+tfac-val
+type-row-cstr?
+TROW
+trow-cstr
+trow-vals
+TUNI
+TPIN
+tpin-val
+TANY
+TTYP
+TBAD
+TBOX
+TARR
+)

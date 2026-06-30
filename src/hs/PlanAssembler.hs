@@ -375,7 +375,13 @@ logCached _mod = pure () -- putStrLn ("cached:" <> _mod)
 logFinish _mod = pure () -- putStrLn ("</LOAD " <> _mod <> ">")
 
 loadAssembly :: InActor => FilePath -> String -> Maybe String -> IO Val
-loadAssembly srcDir mod mFn = preserveState do
+loadAssembly = loadAssemblyWith True
+
+loadAssemblyQuiet :: InActor => FilePath -> String -> Maybe String -> IO Val
+loadAssemblyQuiet = loadAssemblyWith False
+
+loadAssemblyWith :: InActor => Bool -> FilePath -> String -> Maybe String -> IO Val
+loadAssemblyWith emitTopLevel srcDir mod mFn = preserveState do
     writeIORef vMode (if srcDir == "snap" then RPLAN else BPLAN)
     writeIORef (rtsEnv ?actorSt) Empty
     processFile mod
@@ -415,7 +421,8 @@ loadAssembly srcDir mod mFn = preserveState do
             expo <- macroexpand [] form
             unless (expo == N 0) do
                 out <- thunk expo
-                hPutStrLn stderr $ force $ showVal out
+                when emitTopLevel do
+                    hPutStrLn stderr $ force $ showVal out
 
     okFileChar c = isAlphaNum c || c `elem` ("_-" :: String)
 

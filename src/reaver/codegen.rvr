@@ -1,0 +1,414 @@
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(define (V n) ["V_" n]) ;; local ref (de bruijn)
+(define (K v) ["K_" v]) ;; constant
+(define (G v) ["G_" v]) ;; name
+(define (A f x) ["A_" f x]) ;; app
+(define (L v b) ["L_" v b]) ;; let
+(define (R vs b) ["R_" vs b]) ;; letrec
+(define (M s) ["M_" s]) ;; mark
+;; function
+(define (F pin mark rec name arity body) ["F_" pin mark rec name arity body])
+
+(define f-pinned (Ix 1)) (define set-f-pinned (Up 1))
+(define f-pinned (Ix 1)) (define set-f-pinned (Up 1))
+(define f-marked (Ix 2)) (define set-f-marked (Up 2))
+(define f-recur (Ix 3)) (define set-f-recur (Up 3))
+(define f-name (Ix 4)) (define set-f-name (Up 4))
+(define f-arity (Ix 5)) (define set-f-arity (Up 5))
+(define f-body (Ix 6)) (define set-f-body (Up 6))
+
+(define (FUN pinned name self args binds body)
+  ["FUN" pinned name self args binds body])
+
+(define fun-pinned (Ix 1))
+(define fun-name   (Ix 2))
+(define fun-self   (Ix 3)) (define set-fun-self  (Up 3))
+(define fun-args   (Ix 4)) (define set-fun-args  (Up 4))
+(define fun-binds  (Ix 5)) (define set-fun-binds (Up 5))
+(define fun-body   (Ix 6)) (define set-fun-body (Up 6))
+
+(define (VAL v) ["VAL" v])
+(define (VAR n) ["VAR" n])
+(define (APP f x) ["APP" f x])
+
+
+
+
+;; ====== CODEGEN =======
+
+(define (is-ref-let-bound? fun ref)
+  (Ix ref (fun-binds fun)))
+
+assert(Eq (VAR 5) (is-ref-let-bound? (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+assert(Eq 0       (is-ref-let-bound? (FUN 0 0 0 0 [0 (VAR 5)] 0) 0))
+
+(define (bump k st)
+  (define count (Inc (Ix k st)))
+  (Seq count (Up k count st)))
+
+(define (is-unseen-ref-to-let ref fun st[seen])
+  (And (Nil (Test ref (Hd st)))
+    (is-ref-let-bound? fun ref)))
+
+(define (countloop fun st[seen] sx[tag a b])
+   (define tag-is (Eq tag))
+   (cond
+     ((tag-is "VAL") st)
+     ((tag-is "APP" (countloop fun (countloop fun st a) b)))
+     ((tag-is "VAR") (bump a
+                        (Ifz (is-unseen-ref-to-let a fun st) st
+                             (countloop fun
+                               (Coup (Set a (Hd st)) st)
+                               (Ix a (fun-binds fun))))))))
+
+(define (refcount fun)
+  (countloop fun
+    (Rep 0 0 (Sz (fun-binds fun)))
+    (fun-body fun)))
+
+(define (is-single-use-let? counts fun ref)
+  (And
+    (is-ref-let-bound? fun ref)
+    (Eq 1 (Ix ref counts))))
+
+assert(Eq 1 (is-single-use-let? [0 1] (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+assert(Eq 0 (is-single-use-let? [0 2] (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+assert(Eq 0 (is-single-use-let? [0 1] (FUN 0 0 0 0 [0 0]       0) 1))
+
+
+(define (should-keep-bind? counts fn ref)
+  (And (Ix ref (fun-binds fn))
+    (Gt (Ix ref counts) 1)))
+
+assert(Eq 1 (should-keep-bind? [0 2] (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+assert(Eq 0 (should-keep-bind? [0 1] (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+assert(Eq 0 (should-keep-bind? [0 2] (FUN 0 0 0 0 [0 0]       0) 1))
+assert(Eq 0 (should-keep-bind? [0 0] (FUN 0 0 0 0 [0 (VAR 5)] 0) 1))
+
+(define (app-is-code? outer x)
+  (define hx (Hd x))
+  (Case3 (Dec (Sz x))
+    (Nil hx) ; -> 0[a] -> 1
+    (Or (Nil hx) (and outer (Eq 1 hx)));  ->
+    0))
+
+(define (is-code? outer maxref v)
+  (Case4 (Type v)
+         (Le v maxref) ;; nat
+         0 0 ;;  pin/law
+         (app-is-code? outer v)))
+
+assert(Eq  (is-code? 0 5 (1 9))   0 )
+assert(Eq  (is-code? 0 5 (0 9))   1 )
+assert(Eq  (is-code? 1 5 (1 0 0)) 1 )
+assert(Eq  (is-code? 0 5 (1 0 0)) 0 )
+assert(Eq  (is-code? 1 5 (0 0 0)) 1 )
+assert(Eq  (is-code? 0 5 (0 0 0)) 1 )
+assert(Eq  (is-code? 0 5 0)       1 )
+assert(Eq  (is-code? 0 5 5)       1 )
+assert(Eq  (is-code? 0 5 6)       0 )
+
+(define (cgen outer table counts maxref fn s[t a b])
+  (define tag-is (Eq t))
+  (cond
+    ((tag-is "VAL")
+      (If (is-code? outer maxref a) (0 a) a))
+    ((tag-is "VAR")
+      (If (is-single-use-let? counts fn a)
+        (cgen outer table counts maxref fn (Ix a (fun-binds fn)))
+        (Ix a table)))
+    ((tag-is "APP") (0 (cgen 0 table counts maxref fn a)
+      (cgen 0 table counts maxref fn b)))
+    (else (error ("bad tag cgen" s)))))
+
+(define (genlet-step table counts maxref fn k rest)
+  (1 (cgen 1 table counts maxref fn (Ix k (fun-binds fn)))
+    rest))
+
+(define (codegen fn counts)
+  (define n-bind (Sz (fun-binds fn)))
+  (define f-arg (fun-args fn))
+  (define f-self (fun-self fn))
+  (define binds (lfilter (should-keep-bind? counts fn)
+    (ltake n-bind (lrange 0))))
+  (define n-keep (llen binds))
+  (define n-arg (llen f-arg))
+  (define maxref (Inc (Add n-arg n-keep)))
+  (define scope (lcons f-self (lweld f-arg binds)))
+  (define table
+    (lfoldl
+      (lambda (t kv) (Up (_0 kv) (_1 kv) t))
+      (Rep 0 0 n-bind)
+      (lzip scope (ltake maxref (lrange 0)))))
+  (define law
+    (Law (Dec n-arg)
+         (fun-name fn)
+         (lfoldr (genlet-step table counts maxref fn)
+                 (cgen 1 table counts maxref fn (fun-body fn))
+                 binds)))
+  (If (fun-pinned fn) (Pin law) law))
+
+
+(define (is-free? fn ref)
+  (Nor (Eq (fun-self fn) ref)
+    (or (Ix ref (fun-binds fn))
+      (lhas ref (fun-args fn)))))
+
+(define (cf-step rc fun k)
+  (And (Ix k rc)
+    (is-free? fun k)))
+
+(define (compile f0[_ pin0 tag0 slf0 arg0 bin0 bod0])
+  (define rc0 (refcount f0))
+  (define n0 (Sz bin0))
+  (define free (lfilter (cf-step rc0 f0) (countdown n0)))
+  (define new-self (lfoldl APP (VAR n0) (lmap VAR free)))
+  (define f1
+    (pipe f0
+          (set-fun-self n0)
+          (set-fun-args (lweld free arg0))
+          (set-fun-binds (Up slf0 new-self (snoc bin0 0)))))
+  (Seq rc0
+    [(codegen
+       (Ifz free f0 f1)
+       (Ifz free rc0 (refcount f1)))
+       free]))
+
+
+; assert(Equal (Law 1 "k" 42)
+ ; (codegen (FUN 0 "k" 0 ~[1 2] [0 0 0] (VAL 42))
+   ; [0 0 0]))
+
+;; Body returns an argument.
+
+(print (codegen (FUN 0 "id" 0 ~[1 2] [0 0 0] (VAR 2))
+  [0 0 1]))
+; (error "FINITE")
+; (print (Law 1 "id" 2))
+assert(Equal
+  (Law 1 "id" 2)
+   (codegen (FUN 0 "id" 0 ~[1 2] [0 0 0] (VAR 2))
+     [0 0 1]))
+
+;; Single-use binding is inlined at reference site.
+
+; (tests
+;   ((#law "f" (f x y) (#(Inc) #(2)))
+;    (codegen
+;      (FUN 0 "f" 0 ~[1 2] [0 0 0 (APP (VAL Inc) (VAR 2))] (VAR 3))
+;      [0 0 1 1])))
+;
+;; Multi-use binding is kept as a let-binding.
+
+; (tests
+;   ((#law "f" (f x y) z(#(Inc) #(2)) (z z))
+;    (codegen
+;      (FUN 0 "f" 0 ~[1 2] [0 0 0 (APP (VAL Inc) (VAR 2))]
+;        (APP (VAR 3) (VAR 3)))
+;      [0 0 1 2])))
+;
+; ;; Unreferenced binding is eliminated.
+;
+; (tests
+;   ((#law "f" (f x y) y)
+;    (codegen
+;      (FUN 0 "f" 0 ~[1 2] [0 0 0 (APP (VAL Inc) (VAR 2))] (VAR 2))
+;      [0 0 1 0])))
+;
+; ;; Body returns self-reference.
+;
+
+assert(Eq (Law 1 "rec" 0)
+   (codegen (FUN 0 "rec" 0 ~[1 2] [0 0 0] (VAR 0))
+     [1 0 0]))
+;
+; ;; Pinned law.
+;
+; (tests
+;   ((Pin (#law "p" (p a b) b))
+;    (codegen (FUN 1 "p" 0 ~[1 2] [0 0 0] (VAR 2))
+;      [0 0 1])))
+;
+; ;; Multiple kept bindings get correct variable positions.
+;
+; (tests
+;   ((#law "f" (f a)
+;      x(#(Inc) a)
+;      y(#(Dec) a)
+;      ((x x) (y y)))
+;    (codegen
+;      (FUN 0 "f" 0 ~[1]
+;        [0 0 (APP (VAL Inc) (VAR 1)) (APP (VAL Dec) (VAR 1))]
+;        (APP (APP (VAR 2) (VAR 2)) (APP (VAR 3) (VAR 3))))
+;      [0 2 2 2])))
+;
+; ;; Mixed single-use and multi-use.
+;
+; (tests
+;   ((#law "g" (g a)
+;      x(#(Inc) a)
+;      ((x x) (x #(5))))
+;    (codegen
+;      (FUN 0 "g" 0 ~[1]
+;        [0 0 (APP (VAL Inc) (VAR 1)) (APP (VAR 2) (VAL 5))]
+;        (APP (APP (VAR 2) (VAR 2)) (VAR 3)))
+;      [0 1 3 1])))
+;
+; ;; Constant quoting: 0 looks like a variable reference and must be
+; ;; quoted.
+;
+; (tests
+;   ((#law "z" (z a b) 0)
+;    (codegen (FUN 0 "z" 0 ~[1 2] [0 0 0] (VAL 0))
+;      [0 0 0])))
+
+
+(define (pin-arity x)
+  (define i (Unpin x))
+  (If (IsLaw i) (Arity i) 1))
+
+(define (plan-arity x)
+  (Case4 (Type x)
+     0
+     (pin-arity x)
+     (Arity x)
+     (Dec (plan-arity (Init x)))))
+
+
+(define (is-constant-app f x)
+ (and (Eq "VAL" (_0 f)) (Eq "VAL" (_0 x)) (Ne 1 (plan-arity (_1 f)))))
+
+(define (folding-apply f x)
+  (If (is-constant-app f x)
+    (VAL ((_1 f) (_1 x)))
+    (APP f x)))
+
+(define (ingest-mark ingest compile s env m[_ x])
+  (ingest compile s x env))
+
+
+;; =ingest-local= just translates the reference into the new
+;; representation (unique key per binding) by indexing into a stack.
+(define (ingest-local ingest compile s env l[_ i])
+  [env (lix-error "ingest-local" i s)])
+
+
+;; =ingest-global= just produces a constant.
+(define (ingest-global ingest compile s env l[_ g])
+  (define val (If (IsPin g) (Unpin g) g))
+  ; (print ("global" (bind-val val)))
+  (Ifz (_2 val) (error ("wack global" val))
+    [env (VAL (_2 val))]))
+
+(define (ingest-constant ingest compile s env l[_ c])
+  [env (VAL c)])
+
+(define (ingest-apply ingest compile s env0 app[_ fa xa])
+  (define one[env1 f] (ingest compile s fa env0))
+  (define two[env2 x] (ingest compile s xa env1))
+  [env2 (folding-apply f x)])
+
+
+
+(define (ingest-let ingest compile s env0 l[v b])
+  (define ilet[env1 vr] (ingest compile s v env0))
+  (define nex1 (Sz env1))
+  (define is-app (Eq "APP" (_0 vr)))
+  (define s2 (lcons (If is-app (VAR nex1) vr) s))
+  (define env2 (If is-app (snoc env1 vr) env1))
+  (ingest compile s2 b env2))
+
+(define (ingest-letrec-step ingest compile s env0 l[_ vx k])
+  (define one[env1 vr] (ingest compile s vx env0))
+  (Up k vr env1))
+
+(define (ingest-letrec ingest compile s env0 l[_ vs b])
+  (define n-binds (Sz vs))
+  (define nex0 (Sz env0))
+  (define ks (gen n-binds (Add nex0)))
+  (define env1 (resize (Add nex0 n-binds) env0))
+  (define s2 (lweld (stream map VAR ks) s))
+  (ingest compile s2 b
+    (foldl (ingest-letrec-step ingest compile s2) env1 (zip vs ks))))
+
+
+
+(define (ingest-lambda ingest compile s env0 lam)
+  (define selfkey (Sz env0))
+  (define argkey1 (Inc selfkey))
+  (define argkeys (lgen (f-arity lam) (Add argkey1)))
+  (define nex2    (Add argkey1 (f-arity lam)))
+  (define one[bin bod]
+    (ingest compile
+      (lweld (lrev (lmap VAR argkeys)) (lcons (VAR selfkey) s))
+      (f-body lam)
+      (Rep 0 0 nex2)))
+  (define nex3 (Sz bin))
+  (define two[cns free] (compile (FUN (f-pinned lam) (f-name lam) selfkey
+                                      argkeys bin bod)))
+
+  [env0 (lfoldl APP (Sap VAL cns) (lmap VAR free))])
+
+
+(define (ingest compile scope ir env)
+  (define hed-eq (Eq (_0 ir)))
+  ((cond
+    ((hed-eq "M_") ingest-mark)
+    ((hed-eq "V_") ingest-local)
+    ((hed-eq "G_") ingest-global)
+    ((hed-eq "K_") ingest-constant)
+    ((hed-eq "A_") ingest-apply)
+    ((hed-eq "L_") ingest-local)
+    ((hed-eq "R_") ingest-letrec)
+    ((hed-eq "F_") ingest-lambda)) ingest compile scope env ir))
+
+
+
+(define (ingest-expr x)
+  (ingest compile NIL x []))
+
+
+
+(define (expr-is-value? x[xk])
+  (Eq "VAL" xk))
+
+(define (make-dummy-function b[bin bod])
+  (define nex (Sz bin))
+  (FUN 0 "dummy" nex (lsing (Inc nex)) bin bod))
+
+(define (compile-dummy-function b[bin bod])
+  (define nex (Sz bin))
+  (_0
+    (compile
+      (FUN 0 "dummy" nex (lsing (Inc nex)) bin bod))))
+
+(define (compile-expr x)
+  (define res[bin bod] (ingest-expr x))
+  ; (print ("compile" bod x))
+  (If (expr-is-value? bod)
+    (_1 bod)
+    (compile-dummy-function res 0)))
+
+(define (fold-app f xs)
+      (Ifz xs f
+        (fold-app (A f (_0 xs)) (drop 1 xs))))
+
+(#export
+ V
+ K
+ G
+ A
+ L
+ R
+ M
+ F
+ compile-expr
+ fold-app
+ plan-arity
+ pin-arity)
+

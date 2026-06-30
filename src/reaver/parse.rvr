@@ -1,0 +1,231 @@
+
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bits (#module bits))
+(#import bits)
+
+(define (make-cursor str)
+  ("CUR" str 0 0))
+
+(define (make-parsed val cur) ("RES" val cur))
+(define (make-err err)
+  ("ERR" err))
+(define (is-err val) (Eq (Hd val) "ERR"))
+(define (is-res val) (Eq (Hd val) "RES"))
+(define (unwrap-res val)
+  (If (is-err val) (error val) val))
+
+
+
+(define cursor-str Ix0)
+(define cursor-idx Ix1) (define cursor-idx! (Up 1)) (define cursor-idx% (snap 1))
+(define cursor-mark Ix2) (define cursor-mark! (Up 2))
+(define cursor-fail Ix3) (define cursor-fail! (Up 3))
+
+(define (cursor-byte cur)
+  (Load8 (cursor-idx cur) (cursor-str cur)))
+(define (cursor-done? cur)
+  (Eq (cursor-idx cur) (Bytes (cursor-str cur))))
+
+(define (cursor-advance! cur)
+  (cursor-idx% Inc cur))
+
+(define (cursor-next! cur)
+  (define val (cursor-byte cur))
+  (make-parsed val (cursor-advance! cur)))
+
+(define (cursor-last a b)
+  (If (Gt (cursor-idx a) (cursor-idx b)) a b))
+
+(define (cook f parser cur)
+  (define ran (parser cur))
+  (If (is-err ran)
+    ran
+    (snap 0 f ran)))
+
+(define (shim lo hi cur)
+  (define ran[val cur1] (cursor-next! cur))
+  (unless (or (is-err ran) (And (gte val lo) (lte val hi)))
+    (make-err ["shim" lo hi val])
+    ran))
+
+(define (just-byte byt cur)
+  (define ran[val cur1] (cursor-next! cur))
+  (If (Eq val byt) ran (make-err ["just-mismatch" byt val])))
+
+(define ace (just-byte " "))
+(define bar (just-byte "|"))
+(define pat (just-byte "@"))
+
+
+(define (plug-two l r cur)
+  (define lres[lval cur1] (l cur))
+  (define rres[rval cur2] (r cur1))
+  (If (is-err lres) lres
+    (If (is-err rres) rres
+      (make-parsed [lval rval] cur2))))
+
+; (define (plug-kli l[sin cur] f)
+;   (define r[dex cur1] (f cur))
+;   (cond
+;     ((is-err l) l)
+;     ((is-err r) r)
+;     (else (make-parsed [sin dex] (cursor-last cur1 cur)))))
+
+(define (bung-kli l[sin cur] f)
+  (define r[dex cur1] (f cur))
+  (define (lift x) (If (is-row? x) x [x]))
+  (cond
+    ((is-err l) l)
+    ((is-err r) r)
+    (else (make-parsed (Weld (lift sin) (lift dex)) (cursor-last cur1 cur)))))
+(define (plug-kli l[sin cur] f)
+  (define r[dex cur1] (f cur))
+  (cond
+    ((is-err l) l)
+    ((is-err r) r)
+    (else (make-parsed (dex sin) (cursor-last cur1 cur)))))
+
+
+(define (glue-two sep l r cur)
+  (define lres[lval cur1] (l cur))
+  (define sepres[sepval cur2] (sep cur1))
+  (define rres[rval cur3] (r cur2))
+  (If (is-err lres) lres
+    (If (is-err sepres) sepres
+    (If (is-err rres) rres
+      (make-parsed (stream [lval rval] cur3))))))
+
+
+
+(define (lstar f cur)
+  (define next[val cur1] (f cur))
+  (define rec[inner cur2] (lstar f cur1))
+  (If (is-err next) (make-parsed 0 cur)
+    (make-parsed (lcons val inner) cur2)))
+
+(define (lplus f cur)
+  (plug-two f (lstar f) cur))
+
+(define (plus rule cur)
+  (cook rowify (lplus rule) cur))
+
+(define (pose-two l r cur)
+  (define sin (l cur))
+  (If (is-res sin) sin (r cur)))
+
+(define (easy x cur)
+  (make-parsed x cur))
+
+(define (fixup-row row)
+  (define hd (Hd row))
+  (Row 0 (Inc (Sz row)) (lrev (lcons hd (stream row)))))
+
+(define (ltuple bind items)
+  ; (cook fixup-row (pine-row bind items)))
+  (pine-row bind items))
+
+(define (mask chars cur)
+  (define res[byte cur1] (cursor-next! cur))
+  (define err (make-err ["failed mask" chars]))
+  (define (go chars[fst res])
+    (Ifz chars err
+      (If (Eq fst byte) (make-parsed byte cur1) (go res))))
+  (go (lexplode chars)))
+
+(define (lbass-str rule)
+  (cook (lfoldl strWeld "") rule))
+
+(define (pfix l value cur)
+  (define ran[val cur1] (plug-two l value cur))
+  (If (is-err ran) ran
+    (make-parsed (_1 val) cur1)))
+(define (sfix value r cur)
+  (define ran[val cur1] (plug-two value r cur))
+  (If (is-err ran) ran
+    (make-parsed (_0 val) cur1)))
+
+(define (lmost sep val)
+  (plug-two val (lstar (pfix sep val))))
+
+(define (lmore sep val)
+  (pose-two (lmost sep val) (easy 0)))
+
+(define-syntax (lplug form)
+  (foldr (lambda (acc arg) [(1 plug-two) acc arg]) (1 (easy 0)) (drop 1 form)))
+(define-syntax (plug form)
+  [(1 cook) (1 rowify)
+    (foldr (lambda (acc arg) [(1 plug-two) acc arg]) (1 (easy 0)) (drop 1 form))])
+(define-syntax (lglue form)
+  ;[(1 cook) (1 lzing)
+  (lfoldl
+    (lambda (acc arg) [(1 glue-two) (_1 form) acc arg])
+    (_2 form)
+    (stream (drop 3 form))
+  ))
+
+(define-syntax (pose form)
+  (foldr (lambda (acc arg) [(1 pose-two) acc arg]) (_1 form) (drop 2 form)))
+
+
+(define (cursor-eof cur)
+  (Lt (Bytes (cursor-str cur)) (cursor-idx cur)))
+
+(define (glue sep l f)
+  (bung-kli l (pfix sep f)))
+
+(define barpat (plug-two bar pat))
+
+(define hep (just-byte "-"))
+(define low (shim "a" "z"))
+(define hig (shim "A" "Z"))
+(define nud (shim "0" "9"))
+(define alf (pose low hig))
+(define aln (pose low hig nud))
+(define alp (pose low hig nud hep))
+(define ace (just-byte " "))
+(define tab (just-byte 9))
+(define cr (just-byte 13))
+(define lf (just-byte 10))
+(define crlf (plug-two cr lf))
+
+
+(define (split-byte sep str)
+  (define (cursor-from start cursor)
+    (define w (Sub (cursor-idx cursor) start))
+    (LoadVar start w (cursor-str cursor)))
+    ;;  [a b c]
+    ;;  [a]
+  (define (go last cur)
+    (define done (cursor-done? cur))
+    (define cur1 (cursor-advance! cur))
+    (define (next l) (go l cur1))
+    (If (Or (Eq sep (cursor-byte cur)) done)
+      (Weld [(cursor-from last cur)]
+        (If done 0 (next (cursor-idx cur1))))
+        (next last)))
+  (go 0 (make-cursor str)))
+
+(define (join-str sep row[fst snd])
+  (cond
+    ((Eq 0 (Sz row)) 0)
+    ((Eq 1 (Sz row)) fst)
+    (else (strcat [fst sep (join-str sep (drop 1 row))]))))
+
+
+(define (split-str sep str)
+  (define siz (Bytes sep))
+  (define len (Bytes str))
+  (define (go prev-idx idx)
+    (define next (LoadVar idx siz str))
+    (define next-idx (Add idx siz))
+    (If (Gt idx len)
+      [(slice-to prev-idx idx str) 0]
+    (If (Equal next sep)
+      (begin (print ("next" next-idx))
+      [(slice-to prev-idx idx str) (go next-idx next-idx)])
+        (go prev-idx (Inc idx)))))
+  (rowify (go 0 0)))
+assert(Equal ["foo" "bar" "baz"] (split-str "::" "foo::bar::baz"))

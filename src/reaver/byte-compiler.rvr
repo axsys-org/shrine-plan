@@ -1,0 +1,621 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#bind byte (#module byte))
+(#bind mir (#module mir))
+
+;;; MIR to symbolic bytecode lowering.
+;;;
+;;; This compiler targets the law-local bytecode model in byte.rvr.  MIR temps
+;;; and capture labels are represented only by the operand stack while compiling;
+;;; unsupported shapes fail instead of inventing runtime temp/capture storage.
+
+(define (bc-error ctx x)
+  (error ("byte-compiler" ctx x)))
+
+(define (tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (atom-tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (bc-state next labels code stack stricts caps source-labels used)
+  [next labels code stack stricts caps source-labels used])
+
+(define bc-next (Ix 0)) (define set-bc-next (Up 0))
+(define bc-labels (Ix 1)) (define set-bc-labels (Up 1))
+(define bc-code (Ix 2)) (define set-bc-code (Up 2))
+(define bc-stack (Ix 3)) (define set-bc-stack (Up 3))
+(define bc-stricts (Ix 4)) (define set-bc-stricts (Up 4))
+(define bc-caps (Ix 5)) (define set-bc-caps (Up 5))
+(define bc-source-labels (Ix 6)) (define set-bc-source-labels (Up 6))
+(define bc-used (Ix 7)) (define set-bc-used (Up 7))
+
+(define (bc-empty source-labels caps)
+  (bc-state (Sz source-labels) bst:E [] [] [] caps source-labels []))
+
+(define (bc-append op st)
+  (set-bc-code (snoc op (bc-code st)) st))
+
+(define (bc-append-row ops st)
+  (set-bc-code (Weld (bc-code st) ops) st))
+
+(define (row-drop-right n row)
+  (Row 0 (Sub (Sz row) n) (stream row)))
+
+(define (entry-has? atom entry)
+  (any (Equal atom) entry))
+
+(define (stack-find-from atom idx stack)
+  (Ifz stack 0
+    (If (entry-has? atom (_0 stack))
+      [idx]
+      (stack-find-from atom (Inc idx) (drop 1 stack)))))
+
+(define (stack-find atom stack)
+  (stack-find-from atom 0 stack))
+
+(define (stack-window-rotate-left idx stack)
+  (define prefix (take idx stack))
+  (define window (drop idx stack))
+  (Weld prefix (Weld (drop 1 window) [(_0 window)])))
+
+(define (bc-rotate-index idx st)
+  (define stack (bc-stack st))
+  (define span (Sub (Sz stack) idx))
+  (If (Eq span 1) st
+    (set-bc-stack
+      (stack-window-rotate-left idx stack)
+      (bc-append (byte:OP_ROTATE span) st))))
+
+(define (bc-rotate-top-span span st)
+  (If (Le span 1) st
+    (bc-rotate-index (Sub (Sz (bc-stack st)) span) st)))
+
+(define (bc-push-entry entry st)
+  (set-bc-stack (snoc entry (bc-stack st)) st))
+
+(define (bc-pop n st)
+  (set-bc-stack (row-drop-right n (bc-stack st)) st))
+
+(define (bc-consume-produce count entry st)
+  (bc-push-entry entry (bc-pop count st)))
+
+(define (bc-add-top-alias atom st)
+  (define stack (bc-stack st))
+  (Ifz stack (bc-error "alias-empty-stack" atom)
+    (let1 idx (Dec (Sz stack))
+      (let1 top (Ix idx stack)
+        (set-bc-stack
+          (Weld (take idx stack) [(snoc atom top)])
+          st)))))
+
+(define (bc-mark-used tmp-id st)
+  (If (lhas tmp-id (bc-used st))
+    (bc-error "multi-use-temp" tmp-id)
+    (set-bc-used [tmp-id (bc-used st)] st)))
+
+(define (bc-find-or-push-env use-stricts st slot atom)
+  (define hit (stack-find atom (bc-stack st)))
+  (If hit
+    (bc-rotate-index (_0 hit) st)
+    (let1 pushed
+      (bc-push-entry [atom]
+        (bc-append (byte:OP_PUSH_VAR slot) st))
+      (If (And use-stricts (lhas slot (bc-stricts st)))
+        (bc-append byte:OP_EVAL pushed)
+        pushed))))
+
+(define (bc-push-lit st val atom)
+  (bc-push-entry [atom]
+    (bc-append (byte:OP_PUSH_LIT val) st)))
+
+(define (compile-atom-with use-stricts st atom)
+  (cond
+    ((atom-tagged? mir:lit-at atom)
+      (bc-push-lit st (_0 atom) atom))
+    ((atom-tagged? mir:env-at atom)
+      (bc-find-or-push-env use-stricts st (_0 atom) atom))
+    ((atom-tagged? mir:tmp atom)
+      (define hit (stack-find atom (bc-stack st)))
+      (Ifz hit
+        (bc-error "tmp-not-on-stack" atom)
+        (bc-mark-used (_0 atom) (bc-rotate-index (_0 hit) st))))
+    (else (bc-error "bad-atom" atom))))
+
+(define (compile-atom st atom)
+  (compile-atom-with 1 st atom))
+
+(define (compile-atoms-with use-stricts st atoms)
+  (foldl (compile-atom-with use-stricts) st atoms))
+
+(define (compile-atoms st atoms)
+  (compile-atoms-with 1 st atoms))
+
+(define (emit-rotate-repeat span count st)
+  (Ifz count st
+    (emit-rotate-repeat span (Dec count)
+      (bc-rotate-top-span span st))))
+
+(define (emit-arg-eval need span st)
+  (define st0
+    (If (And (Ne need byte:ARG_L) (Gt span 1))
+      (bc-rotate-top-span span st)
+      st))
+  (define op (If (Eq need byte:ARG_N) byte:OP_FORCE byte:OP_EVAL))
+  (define st1 (If (Eq need byte:ARG_L) st0 (bc-append op st0)))
+  (If (Eq need byte:ARG_L) st1
+    (emit-rotate-repeat span (Dec span) st1)))
+
+(define (emit-primitive-arg-evals-loop evals span st)
+  (Ifz evals st
+    (emit-primitive-arg-evals-loop (drop 1 evals) (Dec span)
+      (emit-arg-eval (_0 evals) span st))))
+
+(define (emit-primitive-arg-evals route st)
+  (emit-primitive-arg-evals-loop
+    (byte:prim-evals route)
+    (byte:prim-arity route)
+    st))
+
+(define (literal-atom-value atom)
+  (And (atom-tagged? mir:lit-at atom) [(_0 atom)]))
+
+(define (primitive-route-for-atom atom)
+  (let1 hit (literal-atom-value atom)
+    (And hit
+      (let1 found (byte:byte-primitive-for-head (_0 hit))
+        (And found [(_0 found)])))))
+
+(define (if-route? route)
+  (Or (Eq (byte:prim-name route) "If")
+      (Eq (byte:prim-name route) "Ifz")))
+
+(define (compile-primitive-call st route args)
+  (define argc (Sz args))
+  (cond
+    ((Ne argc (byte:prim-arity route))
+      (bc-error "primitive-arity" [route args]))
+    ((if-route? route)
+      (bc-error "if-call-not-tail" [route args]))
+    ((Nil (byte:prim-op route))
+      (bc-error "primitive-no-op" route))
+    (else
+      (define st1 (compile-atoms st args))
+      (define st2 (emit-primitive-arg-evals route st1))
+      (bc-consume-produce argc []
+        (bc-append (byte:prim-op route) st2)))))
+
+(define (compile-call-values st fn args)
+  (compile-atoms (compile-atom st fn) args))
+
+(define (compile-self-call-values st args)
+  (compile-atoms
+    (bc-push-entry [(mir:env-at 0)]
+      (bc-append byte:OP_PUSH_SELF st))
+    args))
+
+(define (compile-known-call st kind fn args)
+  (define route (primitive-route-for-atom fn))
+  (cond
+    ((And route (Eq kind "fast"))
+      (compile-primitive-call st (_0 route) args))
+    ((Eq kind "self")
+      (let1 st1 (compile-self-call-values st args)
+        (bc-consume-produce (Inc (Sz args)) []
+          (bc-append (byte:OP_CALLF (Sz args)) st1))))
+    ((Eq kind "fast")
+      (let1 st1 (compile-call-values st fn args)
+        (bc-consume-produce (Inc (Sz args)) []
+          (bc-append (byte:OP_CALLF (Sz args)) st1))))
+    ((Eq kind "std")
+      (let1 st1 (compile-call-values st fn args)
+        (bc-consume-produce (Inc (Sz args)) []
+          (bc-append (byte:OP_CALLS (Sz args)) st1))))
+    (else (bc-error "bad-known-call-kind" kind))))
+
+(define (compile-unk-call st fn args)
+  (define count (Inc (Sz args)))
+  (define st1 (compile-call-values st fn args))
+  (define st2
+    (bc-consume-produce count []
+      (bc-append (byte:OP_APPLY_UNK count) st1)))
+  (bc-append byte:OP_EVAL st2))
+
+(define (compile-close st fn args)
+  (Ifz (Sz args)
+    (compile-atom st fn)
+    (let1 count (Inc (Sz args))
+      (let1 st1 (compile-call-values st fn args)
+        (bc-consume-produce count []
+          (bc-append (byte:OP_APPLY_UNK count) st1))))))
+
+(define (proc-uses-free-tmp? defs proc)
+  (define (atom-free? atom)
+    (And (atom-tagged? mir:tmp atom)
+         (Nil (lhas (_0 atom) defs))))
+  (define (atoms-free? atoms)
+    (any atom-free? atoms))
+  (define (rhs-free? rec rhs)
+    (define hd? (Eq (Hd rhs)))
+    (cond
+      ((mir:uses-atom-atom? rhs) (atom-free? rhs))
+      ((hd? mir:eval) (atom-free? (_0 rhs)))
+      ((hd? mir:force) (atom-free? (_0 rhs)))
+      ((hd? mir:delay) (rec defs (_0 rhs)))
+      ((hd? mir:close)
+        (Or (atom-free? (_0 rhs)) (atoms-free? (_1 rhs))))
+      ((hd? mir:unkapp)
+        (Or (atom-free? (_0 rhs)) (atoms-free? (_1 rhs))))
+      ((hd? mir:call)
+        (Or (atom-free? (_1 rhs)) (atoms-free? (_2 rhs))))
+      (else 0)))
+  (define (stmt-free? rec defs stmt)
+    (define hd? (Eq (Hd stmt)))
+    (cond
+      ((hd? mir:let-st)
+        (Or (rhs-free? rec (_1 stmt))
+            0))
+      ((hd? mir:br)
+        (Or (atom-free? (_0 stmt))
+            (Or (rec defs (_1 stmt))
+                (rec defs (_2 stmt)))))
+      ((hd? mir:ret) (atom-free? (_0 stmt)))
+      ((hd? mir:jmp) (atoms-free? (_1 stmt)))
+      (else 0)))
+  (define (go defs proc)
+    (foldl
+      (lambda (acc stmt)
+        (define defs1
+          (If (Eq mir:let-st (Hd stmt))
+            [(_0 stmt) defs]
+            defs))
+        (Or acc (stmt-free? go defs stmt)))
+      0
+      proc))
+  (go defs proc))
+
+(define (proc-uses-captured-env? cap-count proc)
+  (define (atom-hit? atom)
+    (And (atom-tagged? mir:env-at atom)
+         (And (Gt (_0 atom) 0)
+              (Le (_0 atom) cap-count))))
+  (define (atoms-hit? atoms) (any atom-hit? atoms))
+  (define (rhs-hit? rec rhs)
+    (define hd? (Eq (Hd rhs)))
+    (cond
+      ((mir:uses-atom-atom? rhs) (atom-hit? rhs))
+      ((hd? mir:eval) (atom-hit? (_0 rhs)))
+      ((hd? mir:force) (atom-hit? (_0 rhs)))
+      ((hd? mir:delay) (rec cap-count (_0 rhs)))
+      ((hd? mir:close)
+        (Or (atom-hit? (_0 rhs)) (atoms-hit? (_1 rhs))))
+      ((hd? mir:unkapp)
+        (Or (atom-hit? (_0 rhs)) (atoms-hit? (_1 rhs))))
+      ((hd? mir:call)
+        (Or (atom-hit? (_1 rhs)) (atoms-hit? (_2 rhs))))
+      (else 0)))
+  (define (stmt-hit? rec cap-count stmt)
+    (define hd? (Eq (Hd stmt)))
+    (cond
+      ((hd? mir:let-st) (rhs-hit? rec (_1 stmt)))
+      ((hd? mir:br)
+        (Or (atom-hit? (_0 stmt))
+            (Or (rec cap-count (_1 stmt))
+                (rec cap-count (_2 stmt)))))
+      ((hd? mir:ret) (atom-hit? (_0 stmt)))
+      ((hd? mir:jmp) (atoms-hit? (_1 stmt)))
+      ((hd? mir:eval-inplace-st)
+        (And (Gt (_0 stmt) 0) (Le (_0 stmt) cap-count)))
+      (else 0)))
+  (define (go cap-count proc)
+    (foldl
+      (lambda (acc stmt)
+        (Or acc (stmt-hit? go cap-count stmt)))
+      0
+      proc))
+  (go cap-count proc))
+
+(define (capture-init-entry idx)
+  [(mir:env-at (Inc idx))])
+
+(define (capture-init-stack count)
+  (Row 0 count (lgen count capture-init-entry)))
+
+(define (capture-count-for-label caps label)
+  (fall 0 (bst:bst-search label caps)))
+
+(define (compile-label-with compile-proc st label proc init-stack cap-count)
+  (define saved-code (bc-code st))
+  (define saved-stack (bc-stack st))
+  (define saved-stricts (bc-stricts st))
+  (define saved-used (bc-used st))
+  (define sub
+    (set-bc-used []
+      (set-bc-stricts (bc-stricts st)
+        (set-bc-stack init-stack
+          (set-bc-code [] st)))))
+  (define done (compile-proc sub proc))
+  (define labels1
+    (bst:bst-insert label (bc-code done) (bc-labels done)))
+  (set-bc-used saved-used
+    (set-bc-stricts saved-stricts
+      (set-bc-stack saved-stack
+        (set-bc-code saved-code
+          (set-bc-labels labels1 done))))))
+
+(define (compile-extra-label compile-proc st label proc init-stack cap-count)
+  (compile-label-with compile-proc st label proc init-stack cap-count))
+
+(define (compile-delay compile-proc st proc)
+  (define cap-count (Sz (bc-stack st)))
+  (If (proc-uses-free-tmp? [] proc)
+    (bc-error "captured-delay-temp" proc)
+    (If (proc-uses-captured-env? cap-count proc)
+      (bc-error "captured-delay-env" proc)
+      (let1 label (bc-next st)
+        (let1 st1 (set-bc-next (Inc label) st)
+          (let1 st2
+            (compile-extra-label compile-proc st1 label proc [] 0)
+            (bc-push-entry []
+              (bc-append (byte:OP_MAKE_SUSP label) st2))))))))
+
+(define (compile-rhs compile-proc st rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((mir:uses-atom-atom? rhs) (compile-atom st rhs))
+    ((hd? mir:eval)
+      (bc-append byte:OP_EVAL (compile-atom st (_0 rhs))))
+    ((hd? mir:force)
+      (bc-append byte:OP_FORCE (compile-atom st (_0 rhs))))
+    ((hd? mir:delay)
+      (compile-delay compile-proc st (_0 rhs)))
+    ((hd? mir:close)
+      (compile-close st (_0 rhs) (_1 rhs)))
+    ((hd? mir:unkapp)
+      (compile-close st (_0 rhs) (_1 rhs)))
+    ((hd? mir:call)
+      (let1 kind (_0 rhs)
+        (If (Eq kind "unk")
+          (compile-unk-call st (_1 rhs) (_2 rhs))
+          (compile-known-call st kind (_1 rhs) (_2 rhs)))))
+    ((hd? mir:prim)
+      (bc-error "unsupported-prim-rhs" rhs))
+    (else (bc-error "bad-rhs" rhs))))
+
+(define (emit-keep-top-n n st)
+  (define size (Sz (bc-stack st)))
+  (cond
+    ((Lt size n) (bc-error "stack-underflow-keep" [n (bc-stack st)]))
+    ((Eq size n) st)
+    ((Eq n 0)
+      (emit-keep-top-n 0
+        (bc-pop 1 (bc-append byte:OP_DROP st))))
+    (else
+      (emit-keep-top-n n
+        (bc-pop 1
+          (bc-append byte:OP_DROP
+            (bc-rotate-top-span size st)))))))
+
+(define (compile-ret st atom)
+  (bc-append byte:OP_RET
+    (emit-keep-top-n 1
+      (compile-atom st atom))))
+
+(define (compile-tail-unk-call st fn args)
+  (define count (Inc (Sz args)))
+  (define st1 (compile-call-values st fn args))
+  (define st2
+    (bc-consume-produce count []
+      (bc-append (byte:OP_APPLY_UNK count) st1)))
+  (bc-append byte:OP_RET
+    (bc-append byte:OP_TAIL_EVAL
+      (emit-keep-top-n 1 st2))))
+
+(define (compile-tail-if-call compile-proc st route args)
+  (define true-label (bc-next st))
+  (define st0 (set-bc-next (Inc true-label) st))
+  (define st1 (compile-atom st0 (_0 args)))
+  (define st2 (bc-append byte:OP_EVAL st1))
+  (define st3
+    (If (Eq (byte:prim-name route) "Ifz")
+      (bc-append byte:OP_NOT st2)
+      st2))
+  (define before (bc-pop 1 st3))
+  (define jump (bc-append (byte:OP_JUMP_IF true-label) before))
+  (define false-done (compile-ret jump (_2 args)))
+  (compile-extra-label compile-proc false-done true-label [(mir:ret (_1 args))]
+    (bc-stack before)
+    (Sz (bc-stack before))))
+
+(define (tail-ret-tmp? tmp-id rest[stmt tail])
+  (And rest
+    (And (Nil tail)
+      (And (Eq mir:ret (Hd stmt))
+        (Equal (mir:tmp tmp-id) (_0 stmt))))))
+
+(define (compile-tail-let-ret compile-proc st stmt rest)
+  (define tmp-id (_0 stmt))
+  (define rhs (_1 stmt))
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((And (hd? mir:call) (Eq "unk" (_0 rhs)))
+      (compile-tail-unk-call st (_1 rhs) (_2 rhs)))
+    ((And (hd? mir:call) (Eq "fast" (_0 rhs)))
+      (define route (primitive-route-for-atom (_1 rhs)))
+      (If (And route (if-route? (_0 route)))
+        (compile-tail-if-call compile-proc st (_0 route) (_2 rhs))
+        (compile-ret
+          (bc-add-top-alias (mir:tmp tmp-id)
+            (compile-rhs compile-proc st rhs))
+          (mir:tmp tmp-id))))
+    (else
+      (compile-ret
+        (bc-add-top-alias (mir:tmp tmp-id)
+          (compile-rhs compile-proc st rhs))
+        (mir:tmp tmp-id)))))
+
+(define (compile-eval-inplace st slot)
+  (define atom (mir:env-at slot))
+  (define st0
+    (If (lhas slot (bc-stricts st))
+      st
+      (set-bc-stricts [slot (bc-stricts st)] st)))
+  (define hit (stack-find atom (bc-stack st0)))
+  (If hit
+    (bc-append byte:OP_EVAL (bc-rotate-index (_0 hit) st0))
+    st0))
+
+(define (compile-jmp compile-proc st label captures)
+  (Ifz label
+    (If (Or (bc-stricts st) captures)
+      (compile-proc st (Ix 0 (bc-source-labels st)))
+      (bc-append (byte:OP_JMP 0) st))
+    (let1 want (capture-count-for-label (bc-caps st) label)
+      (If (Ne want (Sz captures))
+        (bc-error "bad-capture-count" [label want captures])
+        (bc-append (byte:OP_JMP label)
+          (emit-keep-top-n (Sz captures)
+            (compile-atoms st captures)))))))
+
+(define (compile-branch compile-proc st stmt)
+  (define true-label (bc-next st))
+  (define st0 (set-bc-next (Inc true-label) st))
+  (define st1 (compile-atom st0 (_0 stmt)))
+  (define st2 (bc-append byte:OP_EVAL st1))
+  (define before (bc-pop 1 st2))
+  (define jump (bc-append (byte:OP_JUMP_IF true-label) before))
+  (define false-done (compile-proc jump (_2 stmt)))
+  (compile-extra-label compile-proc false-done true-label (_1 stmt)
+    (bc-stack before)
+    (Sz (bc-stack before))))
+
+(define (compile-terminal compile-proc st stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? mir:ret) (compile-ret st (_0 stmt)))
+    ((hd? mir:jmp) (compile-jmp compile-proc st (_0 stmt) (_1 stmt)))
+    ((hd? mir:br) (compile-branch compile-proc st stmt))
+    (else (bc-error "bad-terminal" stmt))))
+
+(define (compile-nonterminal compile-proc st stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? mir:let-st)
+      (bc-add-top-alias (mir:tmp (_0 stmt))
+        (compile-rhs compile-proc st (_1 stmt))))
+    ((hd? mir:eval-inplace-st)
+      (compile-eval-inplace st (_0 stmt)))
+    ((hd? mir:br)
+      (bc-error "non-terminal-branch" stmt))
+    ((hd? mir:ret)
+      (bc-error "non-terminal-ret" stmt))
+    ((hd? mir:jmp)
+      (bc-error "non-terminal-jmp" stmt))
+    ((hd? mir:letrec-st)
+      (bc-error "unsupported-letrec" stmt))
+    ((hd? mir:proc)
+      (bc-error "unsupported-proc-stmt" stmt))
+    (else (bc-error "bad-stmt" stmt))))
+
+(define (compile-proc-go compile-proc st stmts[stmt rest])
+  (Ifz stmts
+    (bc-error "missing-terminal" 0)
+    (Ifz rest
+      (compile-terminal compile-proc st stmt)
+      (If (And (Eq mir:let-st (Hd stmt))
+               (tail-ret-tmp? (_0 stmt) rest))
+        (compile-tail-let-ret compile-proc st stmt rest)
+        (compile-proc-go
+          compile-proc
+          (compile-nonterminal compile-proc st stmt)
+          rest)))))
+
+(define (compile-proc st proc)
+  (compile-proc-go compile-proc st (stream proc)))
+
+(define (compile-source-label compile-proc st idx labels)
+  (define cap-count
+    (If (Gt idx 1)
+      (capture-count-for-label (bc-caps st) idx)
+      0))
+  (compile-label-with compile-proc st idx (Ix idx labels)
+    (capture-init-stack cap-count)
+    cap-count))
+
+(define (compile-source-labels compile-proc st idx labels)
+  (If (Eq idx (Sz labels)) st
+    (compile-source-labels
+      compile-proc
+      (compile-source-label compile-proc st idx labels)
+      (Inc idx)
+      labels)))
+
+(define (dense-label-code labels label)
+  (define found (bst:bst-search label labels))
+  (Ifz found
+    (bc-error "missing-label" label)
+    (_0 found)))
+
+(define (dense-labels labels count)
+  (gen count (dense-label-code labels)))
+
+(define (caps-add label count caps)
+  (Ifz label caps
+    (let1 found (bst:bst-search label caps)
+      (cond
+        ((Nil found) (bst:bst-insert label count caps))
+        ((Eq (_0 found) count) caps)
+        (else (bc-error "inconsistent-capture-count" [label count (_0 found)]))))))
+
+(define (capture-counts-atoms caps atoms) caps)
+
+(define (capture-counts-rhs rec caps rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? mir:delay) (rec caps (_0 rhs)))
+    (else caps)))
+
+(define (capture-counts-stmt rec caps stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? mir:let-st)
+      (capture-counts-rhs rec caps (_1 stmt)))
+    ((hd? mir:br)
+      (rec (rec caps (_1 stmt)) (_2 stmt)))
+    ((hd? mir:jmp)
+      (caps-add (_0 stmt) (Sz (_1 stmt)) caps))
+    (else caps)))
+
+(define (capture-counts-proc caps proc)
+  (foldl (capture-counts-stmt capture-counts-proc) caps proc))
+
+(define (capture-counts-labels labels)
+  (foldl capture-counts-proc bst:E labels))
+
+(define (compile-mir-law info)
+  (define labels (mir:mir-law-labels info))
+  (define caps (capture-counts-labels labels))
+  (define st0 (bc-empty labels caps))
+  (define st1 (compile-source-labels compile-proc st0 0 labels))
+  (define count (bc-next st1))
+  (byte:byte-law
+    (mir:mir-law-name info)
+    info
+    (mir:mir-law-arity info)
+    0
+    count
+    (dense-labels (bc-labels st1) count)))
+
+(define (compile-law-via-mir-with strict-env law)
+  (compile-mir-law (mir:analyze-law-with strict-env law)))
+
+(define (compile-law-via-mir law)
+  (compile-law-via-mir-with 0 law))
+
+(#export
+ compile-mir-law
+ compile-law-via-mir
+ compile-law-via-mir-with)

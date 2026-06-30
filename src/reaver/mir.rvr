@@ -1,0 +1,2000 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind print (#module print))
+(#import print)
+(#bind parse (#module parse))
+(#bind bst (#module bst))
+(#bind pe (#module pe))
+(#import pe)
+
+; Stmt =
+;
+; Atom  = Env(slot) | Lit(value) | Tmp(id)
+(define env-at "ENV") ; de-brujin
+(define lit-at "LIT") ; literal
+(define tmp "TMP") ; tmp
+(define close "CLOSE") ;     Close Atom [Atom]
+(define unkapp "UNKAPP") ;     Close Atom [Atom]
+(define delay "DELAY") ;    Delay Proc
+(define force "FORCE") ;   Force Atom
+(define eval "EVAL") ;   Eval Atom
+(define prim "PRIM") ;   | Prim PrimOp [Atom]
+; CallKind = Prim | CallKnown | CallUnknown | CallSelf | CallPrimPin
+(define call "CALL") ;   | Call CallKind Atom [Atom]
+
+(define let-st "LET") ;     Let Tmp Rhs
+(define letrec-st "LETREC") ;   | LetRec [(Tmp, Alloc)]
+(define proc "PROC") ;   | Proc ProcId Proc
+(define br "BR") ;   | Br Atom Proc Proc
+(define ret "RET") ;   | Ret Atom
+(define jmp "JUMP") ;   | Jump Label [Atom]
+(define eval-inplace-st "EVAL-INPLACE") ;   | EvalInplace EnvSlot
+
+(define mir-law "MIR-LAW")
+(define (mir-law-name x) (_0 x))
+(define (mir-law-arity x) (_1 x))
+(define (mir-law-stricts x) (_2 x))
+(define (mir-law-labels x) (_3 x))
+
+(define (law-let? body) (and (IsApp body) (Eq (Hd body) 1) (Eq (Sz body) 2)))
+(define (law-let-count body)
+  (Ifz (law-let? body) 0 (Inc (law-let-count (_1 body)))))
+
+(define (countup x) [x (countup (Inc x))])
+
+(define empty-ctx [0 0]) ;; [bind-count proc]
+(define (ctx-at count) [count 0]) ;; [bind-count proc]
+(define set-ctx-count (Up 0))
+(define bind-count (Ix 0))
+(define ctx-mir (Ix 1))
+(define (ctx-let ctx[count mir] bind)
+  [(tmp count) [(Inc count) (snoc (let-st count bind) mir)]])
+(define (ctx-proc ctx[count mir] bind)
+  [(tmp count) [(Inc count) (snoc (proc bind))]])
+(define (ctx-to-proc ctx inner-ctx[count mir] r-at)
+  (ctx-let (set-ctx-count count ctx) (delay (Weld mir [(ret r-at)]))))
+
+; (define (ctx-letrec ctx[count mir] binds)
+;   (define let-s (Sz binds))
+;   [(Add count let-s) (letrec-st (lzip (Row 0 let-s (countup count)) binds))])
+
+
+(define (lower-raw-body arity ctx body)
+  (define recurse (lower-raw-body arity))
+  (define let-count (law-let-count body))
+  (define depth (Add arity let-count))
+  (define (make-thk f x)
+    (define thk-ctx (ctx-at (bind-count ctx)))
+    (define a[f-at ctx1] (recurse thk-ctx f))
+    ;; (define b[ff-at ctx2] (ctx-let ctx1 (eval f-at)))
+    (define c[x-at ctx2] (recurse ctx1 x))
+    ;; (define d[xx-at ctx4] (ctx-let ctx3 (eval x-at)))
+    (define e[r-at ctx3] (ctx-let ctx2 (call "unk" f-at [x-at])))
+    (ctx-to-proc ctx ctx3 r-at))
+
+  (define (lower-call body[f x]) (make-thk f x))
+  (cond
+    ((law-var? depth body) [(env-at body) ctx])
+    ((law-call? depth body) (lower-call body))
+    (else [(lit-at (pull-const body)) ctx])))
+
+(define (lower-law ll)
+  (define l (If (IsPin ll) (Unpin ll) ll))
+  (lower-raw-body (Arity l) empty-ctx (Body l)))
+
+(define (uses-atom-atom? x)
+  (And (IsApp x)
+    (or
+      (Eq (Hd x) env-at)
+      (Eq (Hd x) lit-at)
+      (Eq (Hd x) tmp))))
+
+(define (uses-atom-rhs rec atom rhs)
+  (define hd? (Eq (Hd rhs)))
+  (define want (Equal atom))
+  (cond
+    ((uses-atom-atom? rhs) (want rhs))
+    ((hd? eval)  (want (_0 rhs)))
+    ((hd? force) (want (_0 rhs)))
+    ((hd? delay) (foldl (rec atom) 0 (_0 rhs)))
+    ((hd? close) (Add (want (_0 rhs)) (sum (map want (_1 rhs)))))
+    ((hd? unkapp) (Add (want (_0 rhs)) (sum (map want (_1 rhs)))))
+    ((hd? prim) (sum (map want (_1 rhs))))
+    ((hd? call) (Add (want (_1 rhs)) (sum (map want (_2 rhs)))))
+    (else 0)))
+(define (uses-atom atom acc stmt)
+  (define hd? (Eq (Hd stmt)))
+  (define want (Equal atom))
+  (Add acc
+    (cond
+      ((hd? let-st) (uses-atom-rhs uses-atom atom (_1 stmt)))
+      ((hd? br)
+        (Add (want (_0 stmt))
+             (Add (foldl (uses-atom atom) 0 (_1 stmt))
+                  (foldl (uses-atom atom) 0 (_2 stmt)))))
+      ((hd? ret) (want (_0 stmt)))
+      ((hd? jmp) (sum (map want (_1 stmt))))
+      (else 0))))
+
+(define (refcount mir[result ctx] tmp-id)
+  (define want (tmp tmp-id))
+  (Add ((Equal want) result)
+       (foldl (uses-atom want) 0 (ctx-mir ctx))))
+
+(define (refcounts mir[result ctx])
+  (define n (bind-count ctx))
+  (Row 0 n (lgen n (refcount mir))))
+
+(define (rhs-tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (tmp-atom? x)
+  (And (IsApp x) (Eq tmp (Hd x))))
+
+(define (delay-proc-in-stmt tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (And (hd? let-st)
+       (And (Eq tmp-id (_0 stmt))
+            (And (rhs-tagged? delay (_1 stmt)) [(_0 (_1 stmt))]))))
+
+(define (delay-proc-in-step tmp-id acc stmt)
+  (Or acc (delay-proc-in-stmt tmp-id stmt)))
+
+(define (delay-proc-in-proc tmp-id proc)
+  (foldl (delay-proc-in-step tmp-id) 0 proc))
+
+(define (eval-use-rhs? tmp-id rhs)
+  (And (rhs-tagged? eval rhs)
+       (And (tmp-atom? (_0 rhs))
+            (Eq tmp-id (_0 (_0 rhs))))))
+
+(define (has-eval-use-stmt tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (And (hd? let-st) (eval-use-rhs? tmp-id (_1 stmt))))
+
+(define (has-eval-use-step tmp-id acc stmt)
+  (Or acc (has-eval-use-stmt tmp-id stmt)))
+
+(define (has-eval-use-in-proc? tmp-id proc)
+  (foldl (has-eval-use-step tmp-id) 0 proc))
+
+(define (dethunkable? counts proc tmp-id)
+  (And (Eq 1 (Ix tmp-id counts))
+       (And (delay-proc-in-proc tmp-id proc)
+            (has-eval-use-in-proc? tmp-id proc))))
+
+(define (skip-delay-stmt? counts proc stmt)
+  (And (Eq let-st (Hd stmt))
+       (And (rhs-tagged? delay (_1 stmt))
+            (dethunkable? counts proc (_0 stmt)))))
+
+(define (eval-delay-proc counts proc rhs)
+  (define atom (_0 rhs))
+  (And (rhs-tagged? eval rhs)
+       (And (tmp-atom? atom)
+            (And (dethunkable? counts proc (_0 atom))
+                 (delay-proc-in-proc (_0 atom) proc)))))
+
+(define (retarget-stmt rec tmp-id stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? ret) (let-st tmp-id (_0 stmt)))
+    ((hd? br) (br (_0 stmt)
+                  (rec tmp-id (_1 stmt))
+                  (rec tmp-id (_2 stmt))))
+    (else stmt)))
+
+(define (retarget-proc tmp-id proc)
+  (map (retarget-stmt retarget-proc tmp-id) proc))
+
+(define (normalize-rhs rec mir counts rhs)
+  (If (rhs-tagged? delay rhs)
+      (delay (rec mir counts (_0 rhs)))
+      rhs))
+
+(define (normalize-stmt-one rec mir counts stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st) (let-st (_0 stmt) (normalize-rhs rec mir counts (_1 stmt))))
+    ((hd? br) (br (_0 stmt)
+                  (rec mir counts (_1 stmt))
+                  (rec mir counts (_2 stmt))))
+    (else stmt)))
+
+(define (normalize-stmt rec mir counts proc stmt)
+  (define eval-proc
+    (If (Eq let-st (Hd stmt))
+        (eval-delay-proc counts proc (_1 stmt))
+        0))
+  (cond
+    ((skip-delay-stmt? counts proc stmt) 0)
+    (eval-proc (stream (retarget-proc (_0 stmt)
+                                      (rec mir counts (_0 eval-proc)))))
+    (else [(normalize-stmt-one rec mir counts stmt)])))
+
+(define (normalize-proc mir counts proc)
+  (define stmts (lcatmap (normalize-stmt normalize-proc mir counts proc) (stream proc)))
+  (Row 0 (llen stmts) stmts))
+
+(define (normalize-dethunk-mir mir[result ctx])
+  (define counts (refcounts mir))
+  [result [(bind-count ctx) (normalize-proc mir counts (ctx-mir ctx))]])
+
+(define (alias-lookup tmp-id aliases[entry rest])
+  (And aliases
+    (If (Eq tmp-id (_0 entry))
+      [(_1 entry)]
+      (alias-lookup tmp-id rest))))
+
+(define (normalize-cleanup-atom aliases atom)
+  (define hit
+    (And (tmp-atom? atom)
+      (alias-lookup (_0 atom) aliases)))
+  (Ifz hit atom
+    (normalize-cleanup-atom aliases (_0 hit))))
+
+(define (lit-atom? x)
+  (And (IsApp x) (Eq lit-at (Hd x))))
+
+(define (env-atom? x)
+  (And (IsApp x) (Eq env-at (Hd x))))
+
+(define (env0-atom? x)
+  (And (env-atom? x) (Eq 0 (_0 x))))
+
+(define (nf-atom? x)
+  (Or (lit-atom? x) (env0-atom? x)))
+
+(define (eval-lookup atom evals[entry rest])
+  (And evals
+    (If (Equal atom (_0 entry))
+      [(_1 entry)]
+      (eval-lookup atom rest))))
+
+(define (evals-add tmp-id rhs evals)
+  (If (rhs-tagged? eval rhs)
+    [[(_0 rhs) (tmp tmp-id)] [[(tmp tmp-id) (tmp tmp-id)] evals]]
+    evals))
+
+(define (eval-inplace-evals-add slot evals)
+  [[(env-at slot) (env-at slot)] evals])
+
+(define (eval-env-slot rhs)
+  (And (rhs-tagged? eval rhs)
+    (let1 atom (_0 rhs)
+      (And (env-atom? atom)
+        (And (Gt (_0 atom) 0) [(_0 atom)])))))
+
+(define (normalize-cleanup-rhs rec aliases evals rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((uses-atom-atom? rhs)
+      (normalize-cleanup-atom aliases rhs))
+    ((hd? eval)
+      (define atom (normalize-cleanup-atom aliases (_0 rhs)))
+      (define hit (eval-lookup atom evals))
+      (cond
+        ((nf-atom? atom) atom)
+        (hit (_0 hit))
+        (else (eval atom))))
+    ((hd? force)
+      (force (normalize-cleanup-atom aliases (_0 rhs))))
+    ((hd? delay)
+      (delay (_2 (rec aliases evals (_0 rhs)))))
+    ((hd? close)
+      (close (normalize-cleanup-atom aliases (_0 rhs))
+             (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? unkapp)
+      (unkapp (normalize-cleanup-atom aliases (_0 rhs))
+              (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? prim)
+      (prim (_0 rhs)
+            (map (normalize-cleanup-atom aliases) (_1 rhs))))
+    ((hd? call)
+      (define kind (_0 rhs))
+      (define fn (normalize-cleanup-atom aliases (_1 rhs)))
+      (call (If (And (Eq "unk" kind) (env0-atom? fn)) "self" kind)
+            fn
+            (map (normalize-cleanup-atom aliases) (_2 rhs))))
+    (else rhs)))
+
+(define (normalize-cleanup-stmt rec state[aliases evals stmts] stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (let1 rhs (normalize-cleanup-rhs rec aliases evals (_1 stmt))
+        (define env-slot (eval-env-slot rhs))
+        (cond
+          ((uses-atom-atom? rhs)
+            [[[(_0 stmt) rhs] aliases] evals stmts])
+          (env-slot
+            (define slot (_0 env-slot))
+            (define atom (env-at slot))
+            [[[(_0 stmt) atom] aliases]
+             (eval-inplace-evals-add slot evals)
+             (If (eval-lookup atom evals)
+               stmts
+               (snoc (eval-inplace-st slot) stmts))])
+          (else
+            [aliases
+             (evals-add (_0 stmt) rhs evals)
+             (snoc (let-st (_0 stmt) rhs) stmts)]))))
+    ((hd? br)
+      (let1 true-proc (_2 (rec aliases evals (_1 stmt)))
+        (let1 false-proc (_2 (rec aliases evals (_2 stmt)))
+          [aliases
+           evals
+           (snoc (br (normalize-cleanup-atom aliases (_0 stmt))
+                     true-proc
+                     false-proc)
+                 stmts)])))
+    ((hd? ret)
+      [aliases evals (snoc (ret (normalize-cleanup-atom aliases (_0 stmt))) stmts)])
+    ((hd? jmp)
+      [aliases evals
+       (snoc (jmp (_0 stmt)
+                  (map (normalize-cleanup-atom aliases) (_1 stmt)))
+             stmts)])
+    ((hd? eval-inplace-st)
+      (define slot (_0 stmt))
+      (define atom (env-at slot))
+      [aliases
+       (eval-inplace-evals-add slot evals)
+       (If (eval-lookup atom evals)
+         stmts
+         (snoc stmt stmts))])
+    (else [aliases evals (snoc stmt stmts)])))
+
+(define (normalize-cleanup-proc aliases evals proc)
+  (foldl (normalize-cleanup-stmt normalize-cleanup-proc) [aliases evals []] proc))
+
+(define (normalize-cleanup-mir mir[result ctx])
+  (define clean[aliases evals proc] (normalize-cleanup-proc 0 0 (ctx-mir ctx)))
+  [(normalize-cleanup-atom aliases result) [(bind-count ctx) proc]])
+
+(define partial-app "PARTIAL")
+(define exact-app "EXACT")
+(define over-app "OVER")
+(define value-app "VALUE")
+
+(define (partial-info kind fn args arity)
+  (partial-app kind fn args arity []))
+(define (partial-info-hoist kind fn args arity hoist)
+  (partial-app kind fn args arity hoist))
+(define exact-info (exact-app []))
+(define (exact-info-hoist hoist) (exact-app hoist))
+(define (over-info base args) (over-app base args []))
+(define (over-info-hoist base args hoist) (over-app base args hoist))
+(define (value-info atom hoist) (value-app atom hoist))
+
+(define (known-call-info-hoist info)
+  (define tag (Hd info))
+  (cond
+    ((Eq tag partial-app) (_4 info))
+    ((Eq tag exact-app) (_0 info))
+    ((Eq tag over-app) (_2 info))
+    (else [])))
+
+(define (known-call-info-with-hoist info hoist)
+  (define tag (Hd info))
+  (cond
+    ((Eq tag partial-app)
+      (partial-info-hoist (_0 info) (_1 info) (_2 info) (_3 info) hoist))
+    ((Eq tag exact-app) (exact-info-hoist hoist))
+    ((Eq tag over-app) (over-info-hoist (_0 info) (_1 info) hoist))
+    (else info)))
+
+(define (known-call-arity atom)
+  (And (lit-atom? atom)
+    (let1 arity (plan-arity (_0 atom))
+      (And (Gt arity 0) [arity]))))
+
+(define (single-use-tmp? counts atom)
+  (And (tmp-atom? atom)
+    (Eq 1 (Ix (_0 atom) counts))))
+
+(define (known-call-info atom infos)
+  (And (tmp-atom? atom)
+    (alias-lookup (_0 atom) infos)))
+
+(define (known-call-value atom values)
+  (And (tmp-atom? atom)
+    (alias-lookup (_0 atom) values)))
+
+(define (strict-slot-add slot slots)
+  (If (lhas slot slots) slots [slot slots]))
+
+(define (strict-slot-union a b)
+  (lfoldl (lambda (acc slot) (strict-slot-add slot acc)) b a))
+
+(define (strict-slot-intersect a b)
+  (lfilter (lambda (slot) (lhas slot b)) a))
+
+(define (strictness-entry key stricts)
+  [key stricts])
+
+(define (strictness-lookup key env[entry rest])
+  (And env
+    (If (Equal key (_0 entry))
+      [(_1 entry)]
+      (strictness-lookup key rest))))
+
+(define (known-law-value lit)
+  (cond
+    ((IsLaw lit) [lit])
+    ((And (IsPin lit) (IsLaw (Unpin lit))) [(Unpin lit)])
+    (else 0)))
+
+(define (known-call-law-key fn)
+  (And (lit-atom? fn)
+    (let1 law (known-law-value (_0 fn))
+      (And law [(Name (_0 law))]))))
+
+(define (all-strictness arity)
+  (Row 0 arity (lgen arity (lambda (i) 1))))
+
+(define (known-call-strictness-info strict-env fn arity)
+  (define key (known-call-law-key fn))
+  (define meta (And key (strictness-lookup (_0 key) strict-env)))
+  (cond
+    (meta [(_0 meta) 1])
+    ((And (lit-atom? fn)
+       (Or (Equal If (_0 fn)) (Equal Ifz (_0 fn))))
+      [[1 0 0] 0])
+    (else [(all-strictness arity) 0])))
+
+(define (known-call-strictness strict-env fn arity)
+  (_0 (known-call-strictness-info strict-env fn arity)))
+
+(define (no-strictness arity)
+  (Row 0 arity (lgen arity (lambda (i) 0))))
+
+(define (known-call-strictness-for-usage strict-env fn arity)
+  (If (lit-atom? fn)
+    (known-call-strictness strict-env fn arity)
+    (no-strictness arity)))
+
+(define (known-call-direct-value? atom)
+  (nf-atom? atom))
+
+(define (strict-usage-slot state[delays forced stricts lazies] mode slot)
+  (If (lhas slot forced)
+    state
+    (If mode
+      [delays forced (strict-slot-add slot stricts) lazies]
+      [delays forced stricts (strict-slot-add slot lazies)])))
+
+(define (strict-usage-force-slot state[delays forced stricts lazies] mode slot)
+  (If (lhas slot forced)
+    state
+    (If mode
+      [delays
+       (strict-slot-add slot forced)
+       (strict-slot-add slot stricts)
+       lazies]
+      [delays
+       (strict-slot-add slot forced)
+       stricts
+       (strict-slot-add slot lazies)])))
+
+(define (strict-usage-atom rec strict-env mode state[delays forced stricts lazies] atom)
+  (cond
+    ((And (env-atom? atom) (Gt (_0 atom) 0))
+      (strict-usage-slot state mode (_0 atom)))
+    ((tmp-atom? atom)
+      (define hit (alias-lookup (_0 atom) delays))
+      (Ifz hit state (rec strict-env mode state (_0 hit))))
+    (else state)))
+
+(define (strict-usage-args rec strict-env mode state stricts args)
+  (cond
+    ((Nil args) state)
+    (else
+      (define arg-mode (And mode (_0 stricts)))
+      (strict-usage-args rec strict-env mode
+        (strict-usage-atom rec strict-env arg-mode state (_0 args))
+        (_1 stricts)
+        (_1 args)))))
+
+(define (strict-usage-rhs rec strict-env mode state[delays forced stricts lazies] tmp-id rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? delay)
+      [[[tmp-id (_0 rhs)] delays] forced stricts lazies])
+    ((hd? eval)
+      (strict-usage-atom rec strict-env mode state (_0 rhs)))
+    ((hd? force)
+      (strict-usage-atom rec strict-env mode state (_0 rhs)))
+    ((hd? close)
+      (define state1
+        (strict-usage-atom rec strict-env 0 state (_0 rhs)))
+      (foldl (strict-usage-atom rec strict-env 0) state1 (_1 rhs)))
+    ((hd? unkapp)
+      (define state1
+        (strict-usage-atom rec strict-env 0 state (_0 rhs)))
+      (foldl (strict-usage-atom rec strict-env 0) state1 (_1 rhs)))
+    ((hd? prim)
+      (foldl (strict-usage-atom rec strict-env mode) state (_1 rhs)))
+    ((hd? call)
+      (define fn (_1 rhs))
+      (define args (_2 rhs))
+      (define state1
+        (strict-usage-atom rec strict-env mode state fn))
+      (define stricts1 (known-call-strictness-for-usage strict-env fn (Sz args)))
+      (strict-usage-args rec strict-env mode state1
+        (stream stricts1)
+        (stream args)))
+    ((uses-atom-atom? rhs)
+      (strict-usage-atom rec strict-env 0 state rhs))
+    (else state)))
+
+(define (strict-usage-branch rec strict-env mode state stmt)
+  (define state0[delays0 forced0 stricts0 lazies0]
+    (strict-usage-atom rec strict-env mode state (_0 stmt)))
+  (define true-state[true-delays true-forced true-stricts true-lazies]
+    (rec strict-env mode state0 (_1 stmt)))
+  (define false-state[false-delays false-forced false-stricts false-lazies]
+    (rec strict-env mode state0 (_2 stmt)))
+  [delays0
+   (strict-slot-intersect true-forced false-forced)
+   (If mode (strict-slot-intersect true-stricts false-stricts) stricts0)
+   (strict-slot-union true-lazies false-lazies)])
+
+(define (strict-usage-stmt rec strict-env mode state stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (strict-usage-rhs rec strict-env mode state (_0 stmt) (_1 stmt)))
+    ((hd? br)
+      (strict-usage-branch rec strict-env mode state stmt))
+    ((hd? eval-inplace-st)
+      (strict-usage-force-slot state mode (_0 stmt)))
+    ((hd? ret)
+      (strict-usage-atom rec strict-env 0 state (_0 stmt)))
+    ((hd? jmp)
+      (foldl (strict-usage-atom rec strict-env mode) state (_1 stmt)))
+    (else state)))
+
+(define (strict-usage-proc strict-env mode state proc)
+  (foldl (strict-usage-stmt strict-usage-proc strict-env mode) state proc))
+
+(define (strict-row-from-slots arity stricts lazies)
+  (Row 0 arity
+    (lgen arity
+      (lambda (idx)
+        (let1 slot (Inc idx)
+          (And (lhas slot stricts)
+               (Nil (lhas slot lazies))))))))
+
+(define (strictness-row-for-proc strict-env arity proc)
+  (define state[delays forced stricts lazies]
+    (strict-usage-proc strict-env 1 [0 [] [] []] proc))
+  (strict-row-from-slots arity stricts lazies))
+
+(define (atom-fast-safe? strict-env counts proc atom)
+  (cond
+    ((known-call-direct-value? atom) 1)
+    ((And (tmp-atom? atom) (single-use-tmp? counts atom)) 1)
+    ((And (env-atom? atom) (Gt (_0 atom) 0))
+      (define state[delays forced stricts lazies]
+        (strict-usage-proc strict-env 1 [0 [] [] []] proc))
+      (Nil (lhas (_0 atom) lazies)))
+    (else 0)))
+
+(define (known-call-ret-value-info proc)
+  (And (Gt (Sz proc) 0)
+    (let1 stmt (Last proc)
+      (And (Eq ret (Hd stmt))
+        (value-info
+          (_0 stmt)
+          (filter (lambda (stmt) (Nil (Eq ret (Hd stmt)))) proc))))))
+
+(define (known-call-rhs-value tmp-id rhs)
+  (define hd? (Eq (Hd rhs)))
+  (If (Or (hd? call)
+        (Or (hd? close)
+          (Or (hd? eval)
+            (Or (hd? force)
+              (Or (hd? prim) (hd? unkapp))))))
+    (value-info (tmp tmp-id) [])
+    0))
+
+(define (known-call-stmt-value stmt)
+  (And (Eq let-st (Hd stmt))
+    (let1 rhs (_1 stmt)
+      (If (rhs-tagged? delay rhs)
+        (known-call-ret-value-info (_0 rhs))
+        (known-call-rhs-value (_0 stmt) rhs)))))
+
+(define (known-call-hoist-value-step values stmt)
+  (define value (known-call-stmt-value stmt))
+  (Ifz value values [[(_0 stmt) value] values]))
+
+(define (known-call-hoist-values values hoist)
+  (foldl known-call-hoist-value-step values hoist))
+
+(define (known-call-hoist state[next infos values removed stmts] hoist)
+  [next
+   infos
+   (known-call-hoist-values values hoist)
+   removed
+   (Weld stmts hoist)])
+
+(define (known-call-eval-atom state[next infos values removed stmts] atom)
+  (If (And (env-atom? atom) (Gt (_0 atom) 0))
+    [[next
+      infos
+      values
+      removed
+      (snoc (eval-inplace-st (_0 atom)) stmts)]
+     atom
+     1]
+    (let1 eval-id next
+      [[(Inc next)
+        infos
+        [[eval-id (value-info (tmp eval-id) [])] values]
+        removed
+        (snoc (let-st eval-id (eval atom)) stmts)]
+       (tmp eval-id)
+       1])))
+
+(define (known-call-eval-if-safe strict-env counts proc metadata?
+                                 state[next infos values removed stmts] atom)
+  (If (Or (Nil metadata?) (atom-fast-safe? strict-env counts proc atom))
+    (known-call-eval-atom state atom)
+    [state atom 0]))
+
+(define (known-call-strict-value strict-env counts proc metadata?
+                                 state[next infos values removed stmts] atom)
+  (define hit (known-call-value atom values))
+  (cond
+    ((known-call-direct-value? atom) [state atom 1])
+    ((And hit (single-use-tmp? counts atom))
+      (define info (_0 hit))
+      [(known-call-hoist state (_1 info)) (_0 info) 1])
+    (hit
+      (define info (_0 hit))
+      (If (Nil (_1 info))
+        [state (_0 info) 1]
+        (known-call-eval-if-safe strict-env counts proc metadata? state atom)))
+    (else (known-call-eval-if-safe strict-env counts proc metadata? state atom))))
+
+(define (known-call-adapt-arg strict-env counts proc metadata? state strict? atom)
+  (Ifz strict?
+    [state atom 1]
+    (known-call-strict-value strict-env counts proc metadata? state atom)))
+
+(define (known-call-adapt-args-go strict-env counts proc metadata? state stricts args)
+  (cond
+    ((Nil args) [state [] 1])
+    (else
+      (define adapted[state1 arg1 ok1]
+        (known-call-adapt-arg strict-env counts proc metadata?
+          state (_0 stricts) (_0 args)))
+      (define rest[state2 args2 ok2]
+        (known-call-adapt-args-go strict-env counts proc metadata?
+          state1 (_1 stricts) (_1 args)))
+      [state2 [arg1 args2] (And ok1 ok2)])))
+
+(define (known-call-adapt-args strict-env counts proc state fn args arity)
+  (define strict-info[stricts metadata?]
+    (known-call-strictness-info strict-env fn arity))
+  (define adapted[state1 args1 ok]
+    (known-call-adapt-args-go strict-env counts proc metadata?
+      state
+      (stream stricts)
+      (stream args)))
+  [state1 (Row 0 (Sz args) args1) ok])
+
+(define (known-call-info-apply info args)
+  (define tag (Hd info))
+  (cond
+    ((Eq tag partial-app)
+      (define all-args (Weld (_2 info) args))
+      (define arity (_3 info))
+      (cond
+        ((Lt (Sz all-args) arity)
+          (partial-info-hoist
+            (_0 info) (_1 info) all-args arity (_4 info)))
+        (else (exact-info-hoist (_4 info)))))
+    ((Eq tag over-app)
+      (over-info-hoist (_0 info) (Weld (_1 info) args) (_2 info)))
+    (else info)))
+
+(define (known-call-atom-info infos atom)
+  (define arity-hit (known-call-arity atom))
+  (define info-hit (known-call-info atom infos))
+  (cond
+    (arity-hit (partial-info "unk" atom [] (_0 arity-hit)))
+    (info-hit (_0 info-hit))
+    (else 0)))
+
+(define (known-call-ret-info infos proc)
+  (And (Gt (Sz proc) 0)
+    (let1 stmt (Last proc)
+      (And (Eq ret (Hd stmt))
+        (let1 info (known-call-atom-info infos (_0 stmt))
+          (And info
+            (known-call-info-with-hoist
+              info
+              (filter (lambda (stmt) (Nil (Eq ret (Hd stmt)))) proc))))))))
+
+(define (known-call-keep? removed stmt)
+  (Or (Nil (Eq let-st (Hd stmt)))
+      (Nil (lhas (_0 stmt) removed))))
+
+(define (known-call-emit-stmt state[next infos values removed stmts] stmt)
+  [next infos values removed (snoc stmt stmts)])
+
+(define (known-call-emit-let state[next infos values removed stmts]
+                             tmp-id rhs info value)
+  [next
+   (Ifz info infos [[tmp-id info] infos])
+   (Ifz value values [[tmp-id value] values])
+   removed
+   (snoc (let-st tmp-id rhs) stmts)])
+
+(define (known-call-remove tmp-id state[next infos values removed stmts])
+  [next infos values [tmp-id removed] stmts])
+
+(define (known-call-emit-exact strict-env counts proc state tmp-id fn args arity)
+  (define adapted[state1 args1 ok]
+    (known-call-adapt-args strict-env counts proc state fn args arity))
+  (If ok
+    (known-call-emit-let state1 tmp-id
+      (call "fast" fn args1)
+      exact-info
+      (value-info (tmp tmp-id) []))
+    (known-call-emit-let state tmp-id
+      (call "std" fn args)
+      exact-info
+      (value-info (tmp tmp-id) []))))
+
+(define (known-call-emit-known strict-env counts proc state[next infos values removed stmts]
+                               tmp-id kind fn args arity)
+  (define argc (Sz args))
+  (cond
+    ((Lt argc arity)
+      (known-call-emit-let state tmp-id
+        (close fn args)
+        (partial-info kind fn args arity)
+        (value-info (tmp tmp-id) [])))
+    ((Eq argc arity)
+      (known-call-emit-exact strict-env counts proc state tmp-id fn args arity))
+    (else
+      (define exact-args (take arity args))
+      (define rest-args (drop arity args))
+      (define adapted[state1 exact-args1 ok]
+        (known-call-adapt-args strict-env counts proc state fn exact-args arity))
+      (define call-kind (If ok "fast" "std"))
+      (define call-args (If ok exact-args1 exact-args))
+      (define state2[next2 infos2 values2 removed2 stmts2]
+        (If ok state1 state))
+      (define exact-id next2)
+      (define state3
+        [(Inc next2)
+         infos2
+         [[exact-id (value-info (tmp exact-id) [])] values2]
+         removed2
+         (snoc (let-st exact-id (call call-kind fn call-args)) stmts2)])
+      (known-call-emit-let state3 tmp-id
+        (close (tmp exact-id) rest-args)
+        (over-info (tmp exact-id) rest-args)
+        (value-info (tmp tmp-id) [])))))
+
+(define (normalize-known-call strict-env counts proc
+                              state[next infos values removed stmts]
+                              tmp-id rhs)
+  (define kind (_0 rhs))
+  (define fn (_1 rhs))
+  (define args (_2 rhs))
+  (define arity-hit (known-call-arity fn))
+  (define info-hit
+    (And (single-use-tmp? counts fn)
+      (known-call-info fn infos)))
+  (cond
+    (arity-hit
+      (known-call-emit-known strict-env counts proc state tmp-id kind fn args (_0 arity-hit)))
+    (info-hit
+      (define info (_0 info-hit))
+      (define tag (Hd info))
+      (cond
+        ((Eq tag partial-app)
+          (define state1
+            (known-call-remove (_0 fn)
+              (known-call-hoist state (known-call-info-hoist info))))
+          (known-call-emit-known strict-env counts proc state1 tmp-id
+            (_0 info)
+            (_1 info)
+            (Weld (_2 info) args)
+            (_3 info)))
+        ((Eq tag exact-app)
+          (known-call-emit-let state tmp-id
+            (close fn args)
+            (over-info fn args)
+            (value-info (tmp tmp-id) [])))
+        ((Eq tag over-app)
+          (define state1
+            (known-call-remove (_0 fn)
+              (known-call-hoist state (known-call-info-hoist info))))
+          (define all-args (Weld (_1 info) args))
+          (known-call-emit-let state1 tmp-id
+            (close (_0 info) all-args)
+            (over-info (_0 info) all-args)
+            (value-info (tmp tmp-id) [])))
+        (else
+          (known-call-emit-let state tmp-id rhs 0 (known-call-rhs-value tmp-id rhs)))))
+    (else
+      (known-call-emit-let state tmp-id rhs 0 (known-call-rhs-value tmp-id rhs)))))
+
+(define (normalize-known-calls-rhs rec strict-env counts state[next infos values removed stmts] rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? delay)
+      (define nested[next1 proc1 info1 value1]
+        (rec strict-env counts next (_0 rhs)))
+      [[next1 infos values removed stmts] (delay proc1) info1 value1])
+    (else [state rhs 0 0])))
+
+(define (normalize-known-calls-stmt rec strict-env counts proc
+                                    state[next infos values removed stmts]
+                                    stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (define tmp-id (_0 stmt))
+      (define normalized[state1 rhs info value]
+        (normalize-known-calls-rhs rec strict-env counts state (_1 stmt)))
+      (If (rhs-tagged? call rhs)
+        (normalize-known-call strict-env counts proc state1 tmp-id rhs)
+        (known-call-emit-let state1 tmp-id rhs info
+          (Ifz value (known-call-rhs-value tmp-id rhs) value))))
+    ((hd? br)
+      (define true-branch[next1 true-proc true-info true-value]
+        (rec strict-env counts next (_1 stmt)))
+      (define false-branch[next2 false-proc false-info false-value]
+        (rec strict-env counts next1 (_2 stmt)))
+      (known-call-emit-stmt [next2 infos values removed stmts]
+        (br (_0 stmt) true-proc false-proc)))
+    (else
+      (known-call-emit-stmt state stmt))))
+
+(define (normalize-known-calls-proc strict-env counts next proc)
+  (define state[next1 infos values removed stmts]
+    (foldl (normalize-known-calls-stmt normalize-known-calls-proc strict-env counts proc)
+           [next 0 0 0 []]
+           proc))
+  (define proc1 (filter (known-call-keep? removed) stmts))
+  [next1
+   proc1
+   (known-call-ret-info infos proc1)
+   (known-call-ret-value-info proc1)])
+
+(define (normalize-known-calls-mir-with strict-env mir[result ctx])
+  (define counts (refcounts mir))
+  (define normalized[next proc info value]
+    (normalize-known-calls-proc strict-env counts (bind-count ctx) (ctx-mir ctx)))
+  [result [next proc]])
+
+(define (normalize-known-calls-mir mir)
+  (normalize-known-calls-mir-with 0 mir))
+
+(define (delay-proc-lookup tmp-id stmts[stmt rest])
+  (And stmts
+    (If (And (Eq let-st (Hd stmt))
+          (And (Eq tmp-id (_0 stmt))
+               (rhs-tagged? delay (_1 stmt))))
+      [(_0 (_1 stmt))]
+      (delay-proc-lookup tmp-id rest))))
+
+(define (strict-slots-without-lazy stricts lazies)
+  (lfilter (lambda (slot) (Nil (lhas slot lazies))) stricts))
+
+(define (strict-slots-for-proc strict-env proc)
+  (define state[delays forced stricts lazies]
+    (strict-usage-proc strict-env 1 [0 [] [] []] proc))
+  (strict-slots-without-lazy stricts lazies))
+
+(define (self-strictness-mir-with strict-env mir[result ctx])
+  (define hit
+    (And (tmp-atom? result)
+      (delay-proc-lookup (_0 result) (stream (ctx-mir ctx)))))
+  (Ifz hit [] (strict-slots-for-proc strict-env (_0 hit))))
+
+(define (self-strictness-mir mir)
+  (self-strictness-mir-with 0 mir))
+
+(define (self-call-strict? self-slots idx)
+  (lhas (Inc idx) self-slots))
+
+(define (self-call-hoist state[values stmts] hoist)
+  [(known-call-hoist-values values hoist) (Weld stmts hoist)])
+
+(define (self-call-adapt-arg counts state[values stmts] strict? atom)
+  (define hit (known-call-value atom values))
+  (cond
+    ((Nil strict?) [state atom])
+    ((known-call-direct-value? atom) [state atom])
+    ((And hit (single-use-tmp? counts atom))
+      (define info (_0 hit))
+      [(self-call-hoist state (_1 info)) (_0 info)])
+    (else [state atom])))
+
+(define (self-call-adapt-args-go counts self-slots state idx args)
+  (cond
+    ((Nil args) [state []])
+    (else
+      (define adapted[state1 arg1]
+        (self-call-adapt-arg counts state
+          (self-call-strict? self-slots idx)
+          (_0 args)))
+      (define rest[state2 args2]
+        (self-call-adapt-args-go counts self-slots state1 (Inc idx) (_1 args)))
+      [state2 [arg1 args2]])))
+
+(define (self-call-adapt-args counts self-slots state args)
+  (define adapted[state1 args1]
+    (self-call-adapt-args-go counts self-slots state 0 (stream args)))
+  [state1 (Row 0 (Sz args) args1)])
+
+(define (normalize-self-rhs rec counts self-slots state[values stmts] rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? delay)
+      (define nested[proc1 value1]
+        (rec counts self-slots (_0 rhs)))
+      [state (delay proc1) value1])
+    ((hd? call)
+      (define kind (_0 rhs))
+      (define fn (_1 rhs))
+      (define args (_2 rhs))
+      (cond
+        ((And (Eq "self" kind) (env0-atom? fn))
+          (define adapted[state1 args1]
+            (self-call-adapt-args counts self-slots state args))
+          [state1 (call kind fn args1) 0])
+        (else [state rhs 0])))
+    (else [state rhs 0])))
+
+(define (normalize-self-emit-let state[values stmts] tmp-id rhs value)
+  [(Ifz value
+     (let1 rhs-value (known-call-rhs-value tmp-id rhs)
+       (Ifz rhs-value values [[tmp-id rhs-value] values]))
+     [[tmp-id value] values])
+   (snoc (let-st tmp-id rhs) stmts)])
+
+(define (normalize-self-stmt rec counts self-slots state[values stmts] stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (define normalized[state1 rhs value]
+        (normalize-self-rhs rec counts self-slots state (_1 stmt)))
+      (normalize-self-emit-let state1 (_0 stmt) rhs value))
+    ((hd? br)
+      (define true-branch[true-proc true-value]
+        (rec counts self-slots (_1 stmt)))
+      (define false-branch[false-proc false-value]
+        (rec counts self-slots (_2 stmt)))
+      [values (snoc (br (_0 stmt) true-proc false-proc) stmts)])
+    (else [values (snoc stmt stmts)])))
+
+(define (normalize-self-proc counts self-slots proc)
+  (define state[values stmts]
+    (foldl (normalize-self-stmt normalize-self-proc counts self-slots)
+           [0 []]
+           proc))
+  [stmts (known-call-ret-value-info stmts)])
+
+(define (normalize-dead-rhs rec counts rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((hd? delay) (delay (rec counts (_0 rhs))))
+    (else rhs)))
+
+(define (normalize-dead-stmt rec counts stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (If (Eq 0 (Ix (_0 stmt) counts))
+        []
+        [(let-st (_0 stmt) (normalize-dead-rhs rec counts (_1 stmt)))]))
+    ((hd? br)
+      [(br (_0 stmt)
+           (rec counts (_1 stmt))
+           (rec counts (_2 stmt)))])
+    ((hd? jmp)
+      [(jmp (_0 stmt) (_1 stmt))])
+    (else [stmt])))
+
+(define (normalize-dead-proc counts proc)
+  (define stmts
+    (lcatmap (normalize-dead-stmt normalize-dead-proc counts)
+             (stream proc)))
+  (Row 0 (llen stmts) stmts))
+
+(define (normalize-dead-mir mir[result ctx])
+  (define counts (refcounts mir))
+  [result [(bind-count ctx) (normalize-dead-proc counts (ctx-mir ctx))]])
+
+(define (normalize-self-calls-mir-with strict-env raw)
+  (define mir[result ctx]
+    (normalize-cleanup-mir (normalize-dead-mir raw)))
+  (define counts (refcounts mir))
+  (define self-slots (self-strictness-mir-with strict-env mir))
+  (define normalized[proc value]
+    (normalize-self-proc counts self-slots (ctx-mir ctx)))
+  [result [(bind-count ctx) proc]])
+
+(define (normalize-self-calls-mir raw)
+  (normalize-self-calls-mir-with 0 raw))
+
+(define (normalize-mir-loop-with strict-env mir)
+  (define mir1 (normalize-cleanup-mir mir))
+  (define mir2 (normalize-dethunk-mir mir1))
+  (define mir3 (normalize-known-calls-mir-with strict-env mir2))
+  (define mir4 (normalize-cleanup-mir mir3))
+  (define mir5 (normalize-dead-mir mir4))
+  (define mir6 (normalize-self-calls-mir-with strict-env mir5))
+  (define mir7 (normalize-cleanup-mir mir6))
+  (normalize-dead-mir mir7))
+
+(define (normalize-mir-loop mir)
+  (normalize-mir-loop-with 0 mir))
+
+(define (normalize-mir-with strict-env mir)
+  (define mir1 (normalize-mir-loop-with strict-env mir))
+  (If (Equal mir1 mir) mir
+    (normalize-mir-with strict-env mir1)))
+
+(define (normalize-mir mir)
+  (normalize-mir-with 0 mir))
+
+(define (mir-entry-proc mir[result ctx])
+  (define hit
+    (And (tmp-atom? result)
+      (delay-proc-lookup (_0 result) (stream (ctx-mir ctx)))))
+  (Ifz hit
+    (Weld (ctx-mir ctx) [(ret result)])
+    (_0 hit)))
+
+(define (std-entry-go next idx arity stricts stmts args)
+  (If (Eq idx arity)
+    [next (snoc (jmp 0 args) stmts)]
+    (let1 slot (Inc idx)
+      (If (Ix idx stricts)
+        (std-entry-go next (Inc idx) arity stricts
+          (snoc (eval-inplace-st slot) stmts)
+          (snoc (env-at slot) args))
+        (std-entry-go next (Inc idx) arity stricts
+          stmts
+          (snoc (env-at slot) args))))))
+
+(define (build-std-entry next arity stricts)
+  (std-entry-go next 0 arity stricts [] []))
+
+(define (nat-max a b)
+  (If (Gt a b) a b))
+
+(define (capture-add-env state[envs max-env tmp-uses tmp-defs] slot)
+  [(strict-slot-add slot envs)
+   (nat-max max-env slot)
+   tmp-uses
+   tmp-defs])
+
+(define (capture-add-tmp-use state[envs max-env tmp-uses tmp-defs] id)
+  [envs max-env (strict-slot-add id tmp-uses) tmp-defs])
+
+(define (capture-add-tmp-def state[envs max-env tmp-uses tmp-defs] id)
+  [envs max-env tmp-uses (strict-slot-add id tmp-defs)])
+
+(define (capture-atom state atom)
+  (cond
+    ((And (env-atom? atom) (Gt (_0 atom) 0))
+      (capture-add-env state (_0 atom)))
+    ((tmp-atom? atom)
+      (capture-add-tmp-use state (_0 atom)))
+    (else state)))
+
+(define (capture-atoms state atoms)
+  (foldl capture-atom state atoms))
+
+(define (capture-rhs rec state rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((uses-atom-atom? rhs) (capture-atom state rhs))
+    ((hd? eval)  (capture-atom state (_0 rhs)))
+    ((hd? force) (capture-atom state (_0 rhs)))
+    ((hd? delay) (rec state (_0 rhs)))
+    ((hd? close)
+      (capture-atoms (capture-atom state (_0 rhs)) (_1 rhs)))
+    ((hd? unkapp)
+      (capture-atoms (capture-atom state (_0 rhs)) (_1 rhs)))
+    ((hd? prim) (capture-atoms state (_1 rhs)))
+    ((hd? call)
+      (capture-atoms (capture-atom state (_1 rhs)) (_2 rhs)))
+    (else state)))
+
+(define (capture-stmt rec state stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (capture-rhs rec
+        (capture-add-tmp-def state (_0 stmt))
+        (_1 stmt)))
+    ((hd? br)
+      (rec
+        (rec (capture-atom state (_0 stmt)) (_1 stmt))
+        (_2 stmt)))
+    ((hd? ret) (capture-atom state (_0 stmt)))
+    ((hd? jmp) (capture-atoms state (_1 stmt)))
+    ((hd? eval-inplace-st) (capture-add-env state (_0 stmt)))
+    (else state)))
+
+(define (capture-proc state proc)
+  (foldl (capture-stmt capture-proc) state proc))
+
+(define (ids-ascending max ids)
+  (lfilter (lambda (id) (lhas id ids))
+    (stream (Row 0 max (lgen max (lambda (idx) idx))))))
+
+(define (env-slots-ascending max ids)
+  (lfilter (lambda (id) (lhas id ids))
+    (stream (Row 0 max (lgen max (lambda (idx) (Inc idx)))))))
+
+(define (free-tmp-ids temp-count uses defs)
+  (lfilter
+    (lambda (id) (And (lhas id uses) (Nil (lhas id defs))))
+    (stream (Row 0 temp-count (lgen temp-count (lambda (idx) idx))))))
+
+(define (capture-map-env idx slots[slot rest])
+  (And slots
+    [[(env-at slot) (env-at idx)]
+     (capture-map-env (Inc idx) rest)]))
+
+(define (capture-map-tmp idx ids[id rest])
+  (And ids
+    [[(tmp id) (env-at idx)]
+     (capture-map-tmp (Inc idx) rest)]))
+
+(define (capture-map-lookup atom maps[entry rest])
+  (And maps
+    (If (Equal atom (_0 entry))
+      [(_1 entry)]
+      (capture-map-lookup atom rest))))
+
+(define (capture-info temp-count proc)
+  (define state[envs max-env tmp-uses tmp-defs]
+    (capture-proc [[] 0 [] []] proc))
+  (define env-slots (env-slots-ascending max-env envs))
+  (define tmp-ids (free-tmp-ids temp-count tmp-uses tmp-defs))
+  (define captures
+    (lweld
+      (lmap (lambda (slot) (env-at slot)) env-slots)
+      (lmap (lambda (id) (tmp id)) tmp-ids)))
+  (define maps
+    (lweld
+      (capture-map-env 1 env-slots)
+      (capture-map-tmp (Inc (llen env-slots)) tmp-ids)))
+  [(Row 0 (llen captures) captures) maps])
+
+(define (capture-rewrite-atom maps atom)
+  (define hit (capture-map-lookup atom maps))
+  (Ifz hit atom (_0 hit)))
+
+(define (capture-rewrite-atoms maps atoms)
+  (map (capture-rewrite-atom maps) atoms))
+
+(define (capture-rewrite-rhs rec maps rhs)
+  (define hd? (Eq (Hd rhs)))
+  (cond
+    ((uses-atom-atom? rhs) (capture-rewrite-atom maps rhs))
+    ((hd? eval) (eval (capture-rewrite-atom maps (_0 rhs))))
+    ((hd? force) (force (capture-rewrite-atom maps (_0 rhs))))
+    ((hd? delay) (delay (rec maps (_0 rhs))))
+    ((hd? close)
+      (close (capture-rewrite-atom maps (_0 rhs))
+             (capture-rewrite-atoms maps (_1 rhs))))
+    ((hd? unkapp)
+      (unkapp (capture-rewrite-atom maps (_0 rhs))
+              (capture-rewrite-atoms maps (_1 rhs))))
+    ((hd? prim)
+      (prim (_0 rhs) (capture-rewrite-atoms maps (_1 rhs))))
+    ((hd? call)
+      (call (_0 rhs)
+            (capture-rewrite-atom maps (_1 rhs))
+            (capture-rewrite-atoms maps (_2 rhs))))
+    (else rhs)))
+
+(define (capture-rewrite-inplace-slot maps slot)
+  (define atom (capture-rewrite-atom maps (env-at slot)))
+  (If (env-atom? atom) (_0 atom) slot))
+
+(define (capture-rewrite-stmt rec maps stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st) (let-st (_0 stmt) (capture-rewrite-rhs rec maps (_1 stmt))))
+    ((hd? br)
+      (br (capture-rewrite-atom maps (_0 stmt))
+          (rec maps (_1 stmt))
+          (rec maps (_2 stmt))))
+    ((hd? ret) (ret (capture-rewrite-atom maps (_0 stmt))))
+    ((hd? jmp)
+      (jmp (_0 stmt) (capture-rewrite-atoms maps (_1 stmt))))
+    ((hd? eval-inplace-st)
+      (eval-inplace-st (capture-rewrite-inplace-slot maps (_0 stmt))))
+    (else stmt)))
+
+(define (capture-rewrite-proc maps proc)
+  (map (capture-rewrite-stmt capture-rewrite-proc maps) proc))
+
+(define (proc-atom-refcount proc atom)
+  (foldl (uses-atom atom) 0 proc))
+
+(define (single-use-delay-hit proc atom)
+  (And (tmp-atom? atom)
+    (And (Eq 1 (proc-atom-refcount proc atom))
+      (delay-proc-in-proc (_0 atom) proc))))
+
+(define (delay-atom-hit proc atom)
+  (And (tmp-atom? atom)
+    (delay-proc-in-proc (_0 atom) proc)))
+
+(define (if-tail-call proc)
+  (And (Gt (Sz proc) 1)
+    (let1 ret-stmt (Last proc)
+      (And (Eq ret (Hd ret-stmt))
+        (let1 call-stmt (Ix (Dec (Dec (Sz proc))) proc)
+          (And (Eq let-st (Hd call-stmt))
+            (let1 rhs (_1 call-stmt)
+              (And (rhs-tagged? call rhs)
+                (And (Eq "fast" (_0 rhs))
+                  (And (lit-atom? (_1 rhs))
+                    (And (Or (Equal If (_0 (_1 rhs)))
+                             (Equal Ifz (_0 (_1 rhs))))
+                      (And (Eq 3 (Sz (_2 rhs)))
+                        (And (Equal (tmp (_0 call-stmt)) (_0 ret-stmt))
+                          [(take (Dec (Dec (Sz proc))) proc)
+                           (_2 rhs)])))))))))))))
+
+(define (lower-delay-keep? removed stmt)
+  (Or (Nil (Eq let-st (Hd stmt)))
+      (Nil (lhas (_0 stmt) removed))))
+
+(define (lower-delay-branch rec temp-count source-proc state[next labels] atom)
+  (define delay-hit (delay-atom-hit source-proc atom))
+  (cond
+    ((Nil delay-hit)
+      [state [(ret atom)] [] 1])
+    ((single-use-delay-hit source-proc atom)
+      (define label next)
+      (define info[captures maps] (capture-info temp-count (_0 delay-hit)))
+      (define rewritten (capture-rewrite-proc maps (_0 delay-hit)))
+      (define lowered (rec temp-count [(Inc label) []] rewritten))
+      (define state1 (_0 lowered))
+      (define next1 (_0 state1))
+      (define labels1 (_1 state1))
+      (define proc1 (_1 lowered))
+      [[next1 (Weld labels (Weld [proc1] labels1))]
+       [(jmp label captures)]
+       [(_0 atom)]
+       1])
+    (else [state 0 [] 0])))
+
+(define (lower-delay-stmt rec temp-count state stmt)
+  (define hd? (Eq (Hd stmt)))
+  (cond
+    ((hd? let-st)
+      (define rhs (_1 stmt))
+      (If (rhs-tagged? delay rhs)
+        (let1 lowered (rec temp-count state (_0 rhs))
+          [(_0 lowered) (let-st (_0 stmt) (delay (_1 lowered)))])
+        [state stmt]))
+    ((hd? br)
+      (define true-lower[state1 true-proc]
+        (rec temp-count state (_1 stmt)))
+      (define false-lower[state2 false-proc]
+        (rec temp-count state1 (_2 stmt)))
+      [state2 (br (_0 stmt) true-proc false-proc)])
+    (else [state stmt])))
+
+(define (lower-delay-stmts rec temp-count state-stmts[state stmts] stmt)
+  (define lowered[state1 stmt1]
+    (lower-delay-stmt rec temp-count state stmt))
+  [state1 (snoc stmt1 stmts)])
+
+(define (lower-delay-plain-proc rec temp-count state proc)
+  (foldl (lower-delay-stmts rec temp-count)
+         [state []]
+         proc))
+
+(define (lower-delay-tail-if rec temp-count state proc hit[prefix args])
+  (define cond-atom (_0 args))
+  (define true-atom (_1 args))
+  (define false-atom (_2 args))
+  (define true-lower[state1 true-proc true-remove true-ok]
+    (lower-delay-branch rec temp-count proc state true-atom))
+  (define false-lower[state2 false-proc false-remove false-ok]
+    (lower-delay-branch rec temp-count proc state1 false-atom))
+  (If (And true-ok false-ok)
+    (let1 kept-prefix (filter (lower-delay-keep? (Weld true-remove false-remove)) prefix)
+      (let1 lowered-prefix (lower-delay-plain-proc rec temp-count state2 kept-prefix)
+        [(_0 lowered-prefix)
+         (snoc (br cond-atom true-proc false-proc)
+               (_1 lowered-prefix))]))
+    (lower-delay-plain-proc rec temp-count state proc)))
+
+(define (lower-delay-proc temp-count state proc)
+  (define hit (if-tail-call proc))
+  (Ifz hit
+    (lower-delay-plain-proc lower-delay-proc temp-count state proc)
+    (lower-delay-tail-if lower-delay-proc temp-count state proc hit)))
+
+(define (lower-single-use-delay-labels-info temp-count info)
+  (define labels (mir-law-labels info))
+  (define lowered0[state0 proc0]
+    (lower-delay-proc temp-count [2 []] (Ix 0 labels)))
+  (define lowered1 (lower-delay-proc temp-count state0 (Ix 1 labels)))
+  (define state1 (_0 lowered1))
+  (define labels1 (_1 state1))
+  (define proc1 (_1 lowered1))
+  (mir-law
+    (mir-law-name info)
+    (mir-law-arity info)
+    (mir-law-stricts info)
+    (Weld [proc0 proc1] labels1)))
+
+(define (lower-single-use-delay-labels temp-count info)
+  (lower-single-use-delay-labels-info temp-count info))
+
+(define (analyze-mir-fields strict-env name arity raw)
+  (define normalized[result ctx] (normalize-mir-with strict-env raw))
+  (define fast-proc (mir-entry-proc normalized))
+  (define stricts (strictness-row-for-proc strict-env arity fast-proc))
+  (define std-entry[next std-proc]
+    (build-std-entry (bind-count ctx) arity stricts))
+  (lower-single-use-delay-labels next
+    (mir-law name arity stricts [fast-proc std-proc])))
+
+(define (analyze-law-with strict-env ll)
+  (define l (If (IsPin ll) (Unpin ll) ll))
+  (analyze-mir-fields strict-env (Name l) (Arity l)
+    (lower-raw-body (Arity l) empty-ctx (Body l))))
+
+(define (analyze-law ll)
+  (analyze-law-with 0 ll))
+
+(define (mir-law-strict-entry info)
+  (strictness-entry (mir-law-name info) (mir-law-stricts info)))
+
+(define (mir-laws-strict-env infos)
+  (lmap mir-law-strict-entry (stream infos)))
+
+(define normalize-test-eval-lit
+  [(tmp 0) [1 [(let-st 0 (eval (lit-at 42)))]]])
+
+assert(Equal
+  [(lit-at 42) [1 []]]
+  (normalize-mir normalize-test-eval-lit))
+
+(define normalize-test-eval-env0
+  [(tmp 1) [2 [(let-st 0 (eval (env-at 0)))
+               (let-st 1 (call "unk" (tmp 0) [(lit-at 7)]))]]])
+
+assert(Equal
+  [(tmp 1) [2 [(let-st 1 (call "self" (env-at 0) [(lit-at 7)]))]]]
+  (normalize-mir normalize-test-eval-env0))
+
+(define normalize-test-eval-once
+  [(tmp 2) [3 [(let-st 0 (eval (env-at 1)))
+               (let-st 1 (eval (env-at 1)))
+               (let-st 2 (call "unk" (tmp 1) [(tmp 0)]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(eval-inplace-st 1)
+               (let-st 2 (call "unk" (env-at 1) [(env-at 1)]))]]]
+  (normalize-mir normalize-test-eval-once))
+
+(define normalize-test-copy
+  [(tmp 1) [2 [(let-st 0 (force (env-at 0)))
+               (let-st 1 (tmp 0))]]])
+
+assert(Equal
+  [(tmp 0) [2 [(let-st 0 (force (env-at 0)))]]]
+  (normalize-mir normalize-test-copy))
+
+(define normalize-test-copy-in-delay
+  [(tmp 2) [3 [(let-st 0 (force (env-at 0)))
+               (let-st 1 (tmp 0))
+               (let-st 2 (delay [(ret (tmp 1))]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(let-st 0 (force (env-at 0)))
+               (let-st 2 (delay [(ret (tmp 0))]))]]]
+  (normalize-mir normalize-test-copy-in-delay))
+
+(define normalize-test-copy-before-eval
+  [(tmp 2) [3 [(let-st 0 (delay [(ret (lit-at 7))]))
+               (let-st 1 (tmp 0))
+               (let-st 2 (eval (tmp 1)))]]])
+
+assert(Equal
+  [(lit-at 7) [3 []]]
+  (normalize-mir normalize-test-copy-before-eval))
+
+(define normalize-test-known-under
+  [(tmp 0) [1 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))]]])
+
+assert(Equal
+  [(tmp 0) [1 [(let-st 0 (close (lit-at Add) [(env-at 1)]))]]]
+  (normalize-mir normalize-test-known-under))
+
+(define normalize-test-known-exact
+  [(tmp 1) [2 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))
+               (let-st 1 (call "unk" (tmp 0) [(lit-at 2)]))]]])
+
+assert(Equal
+  [(tmp 1) [2 [(eval-inplace-st 1)
+               (let-st 1 (call "fast" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))]]]
+  (normalize-mir normalize-test-known-exact))
+
+(define normalize-test-known-over
+  [(tmp 2) [3 [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))
+               (let-st 1 (call "unk" (tmp 0) [(lit-at 2)]))
+               (let-st 2 (call "unk" (tmp 1) [(lit-at 3)]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(eval-inplace-st 1)
+               (let-st 1 (call "fast" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))
+               (let-st 2 (close (tmp 1) [(lit-at 3)]))]]]
+  (normalize-mir normalize-test-known-over))
+
+(define normalize-test-known-direct-over
+  [(tmp 0) [1 [(let-st 0 (call "unk" (lit-at Add)
+                               [(env-at 1) (lit-at 2) (lit-at 3)]))]]])
+
+assert(Equal
+  [(tmp 0) [2 [(eval-inplace-st 1)
+               (let-st 1 (call "fast" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))
+               (let-st 0 (close (tmp 1) [(lit-at 3)]))]]]
+  (normalize-mir normalize-test-known-direct-over))
+
+
+(define normalize-test-known-delay-exact
+  [(tmp 2) [3 [(let-st 1
+                 (delay [(let-st 0 (call "unk" (lit-at Add) [(env-at 1)]))
+                         (ret (tmp 0))]))
+               (let-st 2 (call "unk" (tmp 1) [(lit-at 2)]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(eval-inplace-st 1)
+               (let-st 2 (call "fast" (lit-at Add)
+                               [(env-at 1) (lit-at 2)]))]]]
+  (normalize-mir normalize-test-known-delay-exact))
+
+(define normalize-test-known-delay-capture
+  [(tmp 4) [6 [(let-st 3
+                 (delay [(let-st 1
+                           (delay [(let-st 0
+                                     (call "unk" (lit-at Lt) [(env-at 1)]))
+                                   (ret (tmp 0))]))
+                         (let-st 2 (call "unk" (tmp 1) [(lit-at 2)]))
+                         (let-st 5 (call "unk" (lit-at If) [(tmp 2)]))
+                         (ret (tmp 5))]))
+               (let-st 4 (call "unk" (tmp 3) [(lit-at 1)]))]]])
+
+assert(Equal
+  [(tmp 4) [6 [(eval-inplace-st 1)
+               (let-st 2 (call "fast" (lit-at Lt)
+                               [(env-at 1) (lit-at 2)]))
+               (let-st 4 (close (lit-at If) [(tmp 2) (lit-at 1)]))]]]
+  (normalize-mir normalize-test-known-delay-capture))
+
+(define normalize-test-known-std-strict
+  [(tmp 2) [3 [(let-st 0 (delay [(ret (lit-at 7))]))
+               (let-st 1 (call "unk" (lit-at Add) [(tmp 0)]))
+               (let-st 2 (call "unk" (tmp 1) [(tmp 0)]))]]])
+
+assert(Equal
+  [(tmp 2) [3 [(let-st 2 (call "fast" (lit-at Add)
+                               [(lit-at 7) (lit-at 7)]))]]]
+  (normalize-mir normalize-test-known-std-strict))
+
+(define normalize-test-known-if-fast
+  [(tmp 6) [7 [(let-st 1
+                 (delay [(let-st 0 (call "unk" (lit-at Lt) [(env-at 1)]))
+                         (let-st 2 (call "unk" (tmp 0) [(lit-at 2)]))
+                         (ret (tmp 2))]))
+               (let-st 3 (delay [(ret (lit-at 9))]))
+               (let-st 4 (call "unk" (lit-at If) [(tmp 1)]))
+               (let-st 5 (call "unk" (tmp 4) [(lit-at 1)]))
+               (let-st 6 (call "unk" (tmp 5) [(tmp 3)]))]]])
+
+assert(Equal
+  [(tmp 6) [7 [(let-st 3 (delay [(ret (lit-at 9))]))
+               (eval-inplace-st 1)
+               (let-st 2 (call "fast" (lit-at Lt)
+                               [(env-at 1) (lit-at 2)]))
+               (let-st 6 (call "fast" (lit-at If)
+                               [(tmp 2) (lit-at 1) (tmp 3)]))]]]
+  (normalize-mir normalize-test-known-if-fast))
+
+(define normalize-test-self-after-known-hoist
+  [(tmp 20) [21 [(let-st 20
+                   (delay [(let-st 2 (call "fast" (lit-at Lt)
+                                           [(env-at 1) (lit-at 2)]))
+                           (let-st 11
+                             (delay [(let-st 9
+                                       (delay [(let-st 8
+                                                 (call "fast" (lit-at Dec)
+                                                       [(env-at 1)]))
+                                               (ret (tmp 8))]))
+                                     (let-st 10
+                                       (call "self" (env-at 0) [(tmp 9)]))
+                                     (ret (tmp 10))]))
+                           (let-st 12 (call "fast" (lit-at Add)
+                                            [(tmp 2) (tmp 11)]))
+                           (ret (tmp 12))]))]]])
+
+assert(Equal
+  [(tmp 20) [21 [(let-st 20
+                   (delay [(eval-inplace-st 1)
+                           (let-st 2 (call "fast" (lit-at Lt)
+                                           [(env-at 1) (lit-at 2)]))
+                           (let-st 8 (call "fast" (lit-at Dec)
+                                           [(env-at 1)]))
+                           (let-st 10 (call "self" (env-at 0) [(tmp 8)]))
+                           (let-st 12 (call "fast" (lit-at Add)
+                                            [(tmp 2) (tmp 10)]))
+                           (ret (tmp 12))]))]]]
+  (normalize-mir normalize-test-self-after-known-hoist))
+
+(define strictness-test-strict
+  [(eval-inplace-st 1)
+   (ret (env-at 1))])
+
+assert(Equal [1] (strictness-row-for-proc 0 1 strictness-test-strict))
+
+(define strictness-test-mixed
+  [(let-st 0 (close (env-at 1) []))
+   (eval-inplace-st 1)
+   (ret (env-at 1))])
+
+assert(Equal [0] (strictness-row-for-proc 0 1 strictness-test-mixed))
+
+(define strictness-test-branch-only
+  [(br (lit-at 1)
+       [(eval-inplace-st 1)
+        (ret (env-at 1))]
+       [(ret (lit-at 0))])])
+
+assert(Equal [0] (strictness-row-for-proc 0 1 strictness-test-branch-only))
+
+(define std-entry-test
+  (build-std-entry 5 3 [1 0 1]))
+
+assert(Equal 5 (_0 std-entry-test))
+assert(Equal
+  [(eval-inplace-st 1)
+   (eval-inplace-st 3)
+   (jmp 0 [(env-at 1) (env-at 2) (env-at 3)])]
+  (_1 std-entry-test))
+
+(define analyze-test-raw
+  [(tmp 1)
+   [2 [(let-st 1
+         (delay [(let-st 0 (eval (env-at 1)))
+                 (ret (tmp 0))]))]]])
+
+(define analyze-test-info
+  (analyze-mir-fields 0 "strict-one" 1 analyze-test-raw))
+
+assert(Equal "strict-one" (mir-law-name analyze-test-info))
+assert(Equal 1 (mir-law-arity analyze-test-info))
+assert(Equal [1] (mir-law-stricts analyze-test-info))
+assert(Equal
+  [(eval-inplace-st 1)
+   (ret (env-at 1))]
+  (Ix 0 (mir-law-labels analyze-test-info)))
+assert(Equal
+  [(eval-inplace-st 1)
+   (jmp 0 [(env-at 1)])]
+  (Ix 1 (mir-law-labels analyze-test-info)))
+
+(define mir-meta-callee (Law 1 "meta-callee" 0))
+(define mir-meta-env [(strictness-entry "meta-callee" [1 0]) 0])
+
+(define normalize-test-metadata-fast
+  [(tmp 0) [1 [(let-st 0
+                 (call "unk" (lit-at mir-meta-callee)
+                       [(env-at 1) (env-at 2)]))]]])
+
+assert(Equal
+  [(tmp 0) [1 [(eval-inplace-st 1)
+               (let-st 0
+                 (call "fast" (lit-at mir-meta-callee)
+                       [(env-at 1) (env-at 2)]))]]]
+  (normalize-mir-with mir-meta-env normalize-test-metadata-fast))
+
+(define normalize-test-metadata-mixed
+  [(tmp 1) [2 [(let-st 0
+                 (call "unk" (lit-at mir-meta-callee)
+                       [(env-at 1) (env-at 2)]))
+               (let-st 1 (close (env-at 1) [(tmp 0)]))]]])
+
+assert(Equal
+  [(tmp 1) [2 [(let-st 0
+                 (call "std" (lit-at mir-meta-callee)
+                       [(env-at 1) (env-at 2)]))
+               (let-st 1 (close (env-at 1) [(tmp 0)]))]]]
+  (normalize-mir-with mir-meta-env normalize-test-metadata-mixed))
+
+(define delay-label-env-info
+  (lower-single-use-delay-labels 2
+    (mir-law "delay-label-env" 0 []
+      [[(let-st 0 (delay [(ret (env-at 1))]))
+        (let-st 1 (call "fast" (lit-at If)
+                        [(lit-at 1) (lit-at 7) (tmp 0)]))
+        (ret (tmp 1))]
+       []])))
+
+assert(Equal 3 (Sz (mir-law-labels delay-label-env-info)))
+assert(Equal
+  [(br (lit-at 1)
+       [(ret (lit-at 7))]
+       [(jmp 2 [(env-at 1)])])]
+  (Ix 0 (mir-law-labels delay-label-env-info)))
+assert(Equal
+  [(ret (env-at 1))]
+  (Ix 2 (mir-law-labels delay-label-env-info)))
+
+(define delay-label-tmp-info
+  (lower-single-use-delay-labels 4
+    (mir-law "delay-label-tmp" 0 []
+      [[(let-st 0 (call "fast" (lit-at Add)
+                        [(env-at 1) (lit-at 2)]))
+        (let-st 1
+          (delay [(let-st 2 (call "fast" (lit-at Dec) [(tmp 0)]))
+                  (ret (tmp 2))]))
+        (let-st 3 (call "fast" (lit-at If)
+                        [(lit-at 0) (lit-at 9) (tmp 1)]))
+        (ret (tmp 3))]
+       []])))
+
+assert(Equal
+  [(let-st 0 (call "fast" (lit-at Add) [(env-at 1) (lit-at 2)]))
+   (br (lit-at 0)
+       [(ret (lit-at 9))]
+       [(jmp 2 [(tmp 0)])])]
+  (Ix 0 (mir-law-labels delay-label-tmp-info)))
+assert(Equal
+  [(let-st 2 (call "fast" (lit-at Dec) [(env-at 1)]))
+   (ret (tmp 2))]
+  (Ix 2 (mir-law-labels delay-label-tmp-info)))
+
+(define delay-label-multi-use-info
+  (lower-single-use-delay-labels 3
+    (mir-law "delay-label-multi" 0 []
+      [[(let-st 0 (delay [(ret (lit-at 8))]))
+        (let-st 1 (close (tmp 0) []))
+        (let-st 2 (call "fast" (lit-at If)
+                        [(lit-at 1) (lit-at 7) (tmp 0)]))
+        (ret (tmp 2))]
+       []])))
+
+assert(Equal 2 (Sz (mir-law-labels delay-label-multi-use-info)))
+assert(Equal
+  [(let-st 0 (delay [(ret (lit-at 8))]))
+   (let-st 1 (close (tmp 0) []))
+   (let-st 2 (call "fast" (lit-at If)
+                   [(lit-at 1) (lit-at 7) (tmp 0)]))
+   (ret (tmp 2))]
+  (Ix 0 (mir-law-labels delay-label-multi-use-info)))
+
+
+
+
+;;; MIR pretty-printer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (tagged? tag x)
+  (And (IsApp x) (Eq tag (Hd x))))
+
+(define (mir-atom? x)
+  (And (IsApp x)
+    (or
+      (Eq (Hd x) env-at)
+      (Eq (Hd x) lit-at)
+      (Eq (Hd x) tmp))))
+
+(define (tmp-name n) (strcat ["t" (showNat n)]))
+
+(define (pp-nat n) (print-nat n))
+
+(define (str-join-go sep acc xs)
+  (Ifz (Sz xs) acc
+    (str-join-go sep (strcat [acc sep (_0 xs)]) (drop 1 xs))))
+
+(define (str-join sep xs)
+  (Ifz (Sz xs) ""
+    (str-join-go sep (_0 xs) (drop 1 xs))))
+
+(define (pp-plan x)
+  (define (pp-plan-row vals)
+    (str-join " " (map pp-plan vals)))
+  (cond
+    ((IsNat x) (pp-nat x))
+    ((IsLaw x)
+      (strcat ["#<law " (print-nat (Name x)) "/" (showNat (Arity x)) ">"]))
+    ((IsPin x)
+      (strcat ["#<pin " (pp-plan (Unpin x)) ">"]))
+    ((IsApp x)
+      (strcat
+        ["(" (pp-plan (Hd x))
+         (Ifz (Sz x) "" (strcat [" " (pp-plan-row x)]))
+         ")"]))
+    (else "#<unknown>")))
+
+(define comma-space (dcat comma softline))
+
+(define (pretty-block body)
+  (foldl dcat dempty
+    [(dtext "{")
+     (dnest 2 (dcat dline body))
+     dline
+     (dtext "}")]))
+
+(define (pretty-mir-node mode x)
+  (define (mode-is m) (Eq mode m))
+  (cond
+    ((mode-is "atom")
+      (cond
+        ((tagged? env-at x)
+          (dtext (strcat ["env[" (showNat (_0 x)) "]"])))
+        ((tagged? lit-at x)
+          (dtext (strcat ["lit(" (pp-plan (_0 x)) ")"])))
+        ((tagged? tmp x)
+          (dtext (tmp-name (_0 x))))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "atom-row")
+      (dgroup (foldl dcat dempty
+        [(dtext "[")
+         (join-with comma-space
+           (stream (map (pretty-mir-node "atom") x)))
+         (dtext "]")])))
+    ((mode-is "call-rhs")
+      (dgroup (foldl dcat dempty
+        [(dtext "call/")
+         (dtext (_0 x))
+         softline
+         (pretty-mir-node "atom" (_1 x))
+         (dtext "(")
+         (join-with comma-space
+           (stream (map (pretty-mir-node "atom") (_2 x))))
+         (dtext ")")])))
+    ((mode-is "proc")
+      (pretty-block (pretty-mir-node "stmts" x)))
+    ((mode-is "rhs")
+      (cond
+        ((mir-atom? x) (pretty-mir-node "atom" x))
+        ((tagged? close x)
+          (dgroup (foldl dcat dempty
+            [(dtext "close ")
+             (pretty-mir-node "atom" (_0 x))
+             softline
+             (pretty-mir-node "atom-row" (_1 x))])))
+        ((tagged? delay x)
+          (dcat (dtext "delay ") (pretty-mir-node "proc" (_0 x))))
+        ((tagged? force x)
+          (dcat (dtext "force ") (pretty-mir-node "atom" (_0 x))))
+        ((tagged? eval x)
+          (dcat (dtext "eval ") (pretty-mir-node "atom" (_0 x))))
+        ((tagged? prim x)
+          (dgroup (foldl dcat dempty
+            [(dtext "prim/")
+             (dtext (print-nat (_0 x)))
+             (dtext "(")
+             (join-with comma-space
+               (stream (map (pretty-mir-node "atom") (_1 x))))
+             (dtext ")")])))
+        ((tagged? call x) (pretty-mir-node "call-rhs" x))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "let")
+      (foldl dcat dempty
+        [(dtext (tmp-name (_0 x)))
+         softline
+         (dtext "=")
+         softline
+         (pretty-mir-node "rhs" (_1 x))]))
+    ((mode-is "ret")
+      (dcat (dtext "ret ") (pretty-mir-node "atom" (_0 x))))
+    ((mode-is "br")
+      (foldl dcat dempty
+        [(dtext "br ")
+         (pretty-mir-node "atom" (_0 x))
+         softline
+         (pretty-mir-node "proc" (_1 x))
+         softline
+         (pretty-mir-node "proc" (_2 x))]))
+    ((mode-is "jmp")
+      (foldl dcat dempty
+        [(dtext "jump ")
+         (dtext (print-nat (_0 x)))
+         softline
+         (pretty-mir-node "atom-row" (_1 x))]))
+    ((mode-is "eval-inplace")
+      (foldl dcat dempty
+        [(dtext "eval-inplace ")
+         (dtext (print-nat (_0 x)))]))
+    ((mode-is "letrec")
+      (dgroup (dcat (dtext "letrec ") (dtext (pp-plan (_0 x))))))
+    ((mode-is "proc-st")
+      (dgroup (dcat (dtext "proc ") (dtext (pp-plan x)))))
+    ((mode-is "stmt")
+      (cond
+        ((tagged? let-st x) (pretty-mir-node "let" x))
+        ((tagged? letrec-st x) (pretty-mir-node "letrec" x))
+        ((tagged? proc x) (pretty-mir-node "proc-st" x))
+        ((tagged? br x) (pretty-mir-node "br" x))
+        ((tagged? ret x) (pretty-mir-node "ret" x))
+        ((tagged? jmp x) (pretty-mir-node "jmp" x))
+        ((tagged? eval-inplace-st x) (pretty-mir-node "eval-inplace" x))
+        (else (dtext (pp-plan x)))))
+    ((mode-is "stmts")
+      (join-with dline (stream (map (pretty-mir-node "stmt") x))))
+    ((mode-is "mir")
+      (pretty-block
+        (join-with dline
+          (stream
+            (Weld
+              (map (pretty-mir-node "stmt") (ctx-mir (_1 x)))
+              [(dgroup
+                 (dcat
+                   (dtext "result ")
+                   (pretty-mir-node "atom" (_0 x))))])))))
+    (else (dtext (pp-plan x)))))
+
+(define (pretty-mir mir)
+  (pretty-mir-node "mir" mir))
+
+(define (pp-mir-render mode ind x)
+  (define (mode-is m) (Eq mode m))
+  (define pad (reap " " ind))
+  (define (line text) (strcat [pad text]))
+  (cond
+    ((mode-is "atom")
+      (cond
+        ((tagged? env-at x) (strcat ["env[" (showNat (_0 x)) "]"]))
+        ((tagged? lit-at x) (strcat ["lit(" (pp-plan (_0 x)) ")"]))
+        ((tagged? tmp x)    (tmp-name (_0 x)))
+        (else               (pp-plan x))))
+    ((mode-is "atom-row")
+      (strcat
+        ["["
+         (str-join ", " (map (pp-mir-render "atom" ind) x))
+         "]"]))
+    ((mode-is "call-rhs")
+      (strcat
+        ["call/"
+         (_0 x)
+         " "
+         (pp-mir-render "atom" ind (_1 x))
+         "("
+         (str-join ", " (map (pp-mir-render "atom" ind) (_2 x)))
+         ")"]))
+    ((mode-is "proc")
+      (strcat
+        ["{"
+         newline
+         (pp-mir-render "stmts" (Add ind 2) x)
+         newline
+         pad
+         "}"]))
+    ((mode-is "rhs")
+      (cond
+        ((mir-atom? x) (pp-mir-render "atom" ind x))
+        ((tagged? close x)
+          (strcat
+            ["close "
+             (pp-mir-render "atom" ind (_0 x))
+             " "
+             (pp-mir-render "atom-row" ind (_1 x))]))
+        ((tagged? delay x)
+          (strcat ["delay " (pp-mir-render "proc" ind (_0 x))]))
+        ((tagged? force x)
+          (strcat ["force " (pp-mir-render "atom" ind (_0 x))]))
+        ((tagged? eval x)
+          (strcat ["eval " (pp-mir-render "atom" ind (_0 x))]))
+        ((tagged? prim x)
+          (strcat
+            ["prim/"
+             (print-nat (_0 x))
+             "("
+             (str-join ", " (map (pp-mir-render "atom" ind) (_1 x)))
+             ")"]))
+        ((tagged? call x) (pp-mir-render "call-rhs" ind x))
+        (else (pp-plan x))))
+    ((mode-is "let")
+      (line
+        (strcat
+          [(tmp-name (_0 x))
+           " = "
+           (pp-mir-render "rhs" ind (_1 x))])))
+    ((mode-is "ret")
+      (line (strcat ["ret " (pp-mir-render "atom" ind (_0 x))])))
+    ((mode-is "br")
+      (line
+        (strcat
+          ["br "
+           (pp-mir-render "atom" ind (_0 x))
+           " "
+           (pp-mir-render "proc" ind (_1 x))
+           " "
+           (pp-mir-render "proc" ind (_2 x))])))
+    ((mode-is "jmp")
+      (line
+        (strcat
+          ["jump "
+           (print-nat (_0 x))
+           " "
+           (pp-mir-render "atom-row" ind (_1 x))])))
+    ((mode-is "eval-inplace")
+      (line (strcat ["eval-inplace " (print-nat (_0 x))])))
+    ((mode-is "letrec")
+      (line (strcat ["letrec " (pp-plan (_0 x))])))
+    ((mode-is "proc-st")
+      (line (strcat ["proc " (pp-plan x)])))
+    ((mode-is "stmt")
+      (cond
+        ((tagged? let-st x)    (pp-mir-render "let" ind x))
+        ((tagged? letrec-st x) (pp-mir-render "letrec" ind x))
+        ((tagged? proc x)      (pp-mir-render "proc-st" ind x))
+        ((tagged? br x)        (pp-mir-render "br" ind x))
+        ((tagged? ret x)       (pp-mir-render "ret" ind x))
+        ((tagged? jmp x)       (pp-mir-render "jmp" ind x))
+        ((tagged? eval-inplace-st x)
+          (pp-mir-render "eval-inplace" ind x))
+        (else                  (line (pp-plan x)))))
+    ((mode-is "stmts")
+      (str-join newline (map (pp-mir-render "stmt" ind) x)))
+    ((mode-is "mir")
+      (strcat
+        ["{"
+         newline
+         (str-join
+           newline
+           (Weld
+             (map (pp-mir-render "stmt" 2) (ctx-mir (_1 x)))
+             [(strcat
+                [(reap " " 2)
+                 "result "
+                 (pp-mir-render "atom" 2 (_0 x))])]))
+         newline
+         "}"]))
+    (else (pp-plan x))))
+
+
+
+
+(define (pp-mir mir)
+  (pp-mir-render "mir" 0 mir))
+
+(define (trace-mir mir)
+  (define strs (stream (parse:split-str 10 (pp-mir mir))))
+  (define (go ls[x xs])
+    (Ifz ls 0
+      (begin (print x) (go xs))))
+  (go strs))
+
+  ;; (trace-mir (normalize-mir fib-lower))
+
+(define (fib n) (If (Lt n 2) 1 (Add (fib (Dec n)) (fib (Sub n 2)))))
+
+(define fib-lower (lower-law fib))
+
+(define (count-tmps mir[result ctx])
+  (define n (bind-count ctx))
+  (Row 0 n (lzip (naturals 0) (stream (refcounts mir)))))
