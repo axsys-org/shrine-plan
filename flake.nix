@@ -50,5 +50,28 @@
             # ];
           };
         });
+      checks = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          enkiPkg = enki.packages.${system}.default;
+          runReaverTest = module: pkgs.runCommand "reaver-${module}" {
+            nativeBuildInputs = [ enkiPkg ];
+          } ''
+            cp -R ${self} repo
+            chmod -R u+w repo
+            cd repo
+            x/test ${module} 2>&1 | tee test.log
+
+            if grep -q '"ERROR"' test.log; then
+              echo "bar"
+              tail -200 test.log
+              exit 1
+            fi
+            echo "baz"
+            touch $out
+          '';
+        in {
+          foil-bst-tests = runReaverTest "foil-bst-tests";
+        });
     };
 }
