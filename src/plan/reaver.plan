@@ -7,6 +7,161 @@
 @global
 @read
 
+(bplan (Install compiler))
+
+(define OP_PUSH_VAR 0)
+(define OP_PUSH_LIT 1)
+(define OP_MK_THK 2)
+(define OP_EVAL 3)
+(define OP_CALL 4)
+(define OP_TAILCALL 5)
+(define OP_INTERP 6)
+(define OP_RET 7)
+(define OP_MK_APP 8)
+
+(define BANE_FAST 1)
+(define BANE_SLOW 2)
+(define BANE_PRIM 3)
+(define BANE_PRIM_KNOWN 4)
+; typedef enum pl_op {
+;   OP_PUSH_VAR = 0,
+;   OP_PUSH_LIT = 1,
+;   OP_MK_THK = 2,
+;   OP_EVAL = 3,
+;   OP_CALL = 4,
+;   OP_TAILCALL = 5,
+;   OP_INTERP = 6,
+;   OP_RET = 7,
+;   OP_MK_APP = 8
+; } pl_op;
+;; The compiler mirrors kal, the law-body interpreter: a law body is
+;; made of variable references (nats <= depth), calls (0 f x), quotes
+;; (0 x), and literals (everything else, INCLUDING apps whose elements
+;; happen to look like variables or calls -- kal never recurses into
+;; them).
+
+(define (drop-lets arity body)
+  (Ifz (And (Eq 2 (Sz body)) (Eq 1 (Hd body))) [arity body]
+    (drop-lets (Inc arity) (.1 body))))
+
+(define (law-var? depth body)
+  (And (IsNat body) (Le body depth)))
+(define (law-quote? depth body)
+  (If (IsApp body)
+    (If (And (Sz body) (Nil (Dec (Sz body))))
+      (Nil (Hd body))
+      0)
+    0))
+(define (.law-const depth body)
+  (If (law-quote? depth body) (.0 body) body))
+;; NB: the head test must be exact.  Eq is nat comparison and COERCES
+;; non-nats to 0, so (Eq 0 (Hd body)) is true for partial-application
+;; literals like (fpin x y) whose head is a pin.  Nil compares raw.
+(define (law-call? depth body)
+  (And (IsApp body)
+  (And (Nil (Hd body))
+       (Eq 2 (Sz body)))))
+(define (law-const? depth body)
+  (Nil (Or (law-var? depth body) (law-call? depth body))))
+
+(define BAD_ARITY 10000)
+
+(define (unwind depth body args)
+  (cond
+    ((law-call? depth body) (unwind depth (.0 body) (cons (.1 body) args)))
+    (else [body args])))
+
+;; Arity of a call head; unwind never returns a call in head position,
+;; so a head is either a variable (arity unknown) or a constant.
+
+(define (get-arity depth body)
+  (If (law-var? depth body) BAD_ARITY
+    (planArity (.law-const depth body))))
+
+(define (partial-app? depth hd)
+    (Ifz (law-const? depth hd) 0 (IsApp (.law-const depth hd))))
+(define (primop-val? val) (And (IsPin val) (IsNat (Unpin val))))
+(define (primop? depth hd)
+  (And (law-const? depth hd) (primop-val? (.law-const depth hd))))
+
+;; A primop argument is usually a row expression [OpName args...]: a
+;; call spine whose head constant has arity 0, so the app can be built
+;; eagerly (its elements stay lazy) and never forms an unevaluated
+;; redex.  Anything else compiles generically.
+
+(define (row-expr? depth body)
+  (Ifz (law-call? depth body)
+    0
+    (let1 @[head args] (unwind depth body [])
+      (Ifz (law-var? depth head)
+        (Nil (planArity (.law-const depth head)))
+        0))))
+
+(define (compile-row compile depth body)
+  (Ifz (row-expr? depth body)
+    (compile depth body)
+    (let1 @[head args] (unwind depth body [])
+      (Weld [OP_PUSH_LIT (.law-const depth head)]
+      (Weld (cat (map (compile depth) args))
+            [OP_MK_APP (Sz args)])))))
+
+(define (compile-call compile depth body)
+  (define @[head args] (unwind depth body []))
+  (define hd-arity (get-arity depth head))
+  (define argc (Sz args))
+  (define is-prim (And (primop? depth head) (Eq 1 argc)))
+
+  ;; A "known" primop call is the simple wrapper shape
+  ;; (0 <oppin> (0 "Name" args..)): the op name is a nat constant, so
+  ;; the whole (opset, name, argc) triple is static.  The compiler only
+  ;; checks the SHAPE; the runtime resolves the triple to an op handle
+  ;; once, at bytecode ingest.
+  (define known-row  ; [name relems] when the shape matches, else 0
+    (Ifz is-prim 0
+      (Ifz (law-call? depth (.0 args)) 0
+        (let1 @[rhead relems] (unwind depth (.0 args) [])
+          (Ifz (law-var? depth rhead)
+            (If (IsNat (.law-const depth rhead))
+              [(.law-const depth rhead) relems]
+              0)
+            0)))))
+
+  (define arg-code
+    (If is-prim
+      (compile-row compile depth (.0 args))
+      (cat (map (compile depth) args))))
+  (define is-fast
+    (And (Nil (primop? depth head))
+    (And (Nil (partial-app? depth head))
+         (Eq hd-arity argc))))
+  (define bane
+    (If is-prim BANE_PRIM (If is-fast BANE_FAST BANE_SLOW)))
+
+  (If known-row
+    (let1 @[name relems] known-row
+      (Weld (cat (map (compile depth) relems))
+            [OP_MK_THK (Sz relems) BANE_PRIM_KNOWN
+             (.law-const depth head) name]))
+    (Weld (compile depth head)
+    (Weld arg-code
+          [OP_MK_THK (Inc argc) bane]))))
+
+(define (compile-calls depth body)
+  (cond
+    ((law-var? depth body) [OP_PUSH_VAR body])
+    ((law-call? depth body) (compile-call compile-calls depth body))
+    (else [OP_PUSH_LIT (.law-const depth body)])))
+
+(define (compile l)
+  (define la (If (IsPin l) (Unpin l) l))
+  (define arity (Arity la))
+  (define body (Body la))
+  (define @[depth calls] (drop-lets arity body))
+  (Weld (compile-calls depth calls) [OP_RET]))
+
+((#pin "B") ("Install" compile))
+
+
 ;;;; The Reaver compiler: from Reaver S-expressions to de Bruijn indexed
 ;;;; LExpr.
 ;;;;
@@ -561,7 +716,10 @@
             (print val)
             (repl cache uniq glo rest))))))
 
-  (repl cache uniq glo (readAll 1 (read-stdin 65536))))
+  ;; the installed compiler is process state, not snapshot state:
+  ;; re-install it on every resume so restored sessions keep compiling
+  (Seq (Install compile)
+    (repl cache uniq glo (readAll 1 (read-stdin 65536)))))
 
 (define (main args)
   (Save (Pin (repl-main EMPTY-CACHE
