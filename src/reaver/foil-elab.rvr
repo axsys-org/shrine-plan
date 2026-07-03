@@ -34,7 +34,7 @@
       (else ty)))
   ret)
 
-(define empty-env [0 0 ty:TANY 0 0])
+(define empty-env [0 0 ty:TANY 0 0 0])
 (define env-locals (Ix 0)) (define set-env-locals (Up 0))
 (define env-diags (Ix 1))
 (define env-goal (Ix 2)) (define set-env-goal (Up 2))
@@ -45,6 +45,22 @@
   [(peek-env-goal env) (snap 2 (drop 1) env)])
 (define env-name (Ix 3)) (define set-env-name (Up 3))
 (define env-tvars (Ix 4)) (define set-env-tvars (Up 4))
+;; Nearest enclosing source span (set by s_span nodes on the way down);
+;; used to locate elaboration errors.
+(define env-span (Ix 5)) (define set-env-span (Up 5))
+
+;;; Located errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (span-blurb span)
+  (Ifz span "unknown-location"
+    ["line" (Ix 0 span) "col" (Ix 1 span)]))
+
+(define (elab-error env what detail)
+  (error ["foil-elab-error" what ["at" (span-blurb (env-span env))] detail]))
+
+(define (elab-unsupported env feature)
+  (elab-error env ["unsupported syntax" feature]
+    "specified but not yet implemented"))
 
 (define (push-env-tvars vars env)
   (set-env-tvars (Weld vars (env-tvars env)) env))
@@ -187,7 +203,8 @@
     (define env1 (set-env-goal want env))
     (define ret (elab-val sut env1 body))
     (unless (ty:type-nests? sut want (tc-ty ret))
-      (error ["bad-cast" want (tc-ty ret) ret])
+      (elab-error env "cast (^) target does not accept the value's type"
+        ["want" want "got" (tc-ty ret)])
       (set-tc-ty want ret)))
   (define (elab-row r[_ items])
     (define els (map (elab-val sut env) items))
@@ -215,13 +232,16 @@
     (define pairs (zip fields got))
     (unless (and (Eq (Sz fields) (Sz got))
               (all (uncurry (ty:type-nests? sut)) pairs))
-      (error ["bad-constructor-call" row got])
+      (elab-error env "constructor call does not match its row type"
+        ["want" row "got" got])
       (tc-row (ty:span-to-mold sut row-span) (ty:trow-cstr row-span) xs)))
   (define (on-call f xs)
     (define xs-ty (map (cork burp-face tc-ty) xs))
     (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
     (define app (tc-fold-app f xs))
-    (If (Eq tag "TBAD") (error ("bad apply" ty (tc-ty f) xs-ty))
+    (If (Eq tag "TBAD")
+      (elab-error env "cannot apply function to these arguments"
+        ["fun" (tc-ty f) "args" xs-ty "because" ty])
       (set-tc-ty ty app)))
   (define (elab-spec s[_ val args])
     (define base (elab-val sut env val))
@@ -233,11 +253,11 @@
     (If (Eq "TC_TYP" (Hd base))
       (let ((typ (specialize (_2 (tc-typ-inner base)))))
         (If (bad-type? typ)
-          (error ["bad-specialization" typ val args])
+          (elab-error env "bad specialization" ["got" typ "args" args])
           (tc-typ (ty:TTYP typ))))
       (let ((typ (specialize (tc-ty base))))
         (If (bad-type? typ)
-          (error ["bad-specialization" typ val args])
+          (elab-error env "bad specialization" ["got" typ "args" args])
           (set-tc-ty typ base)))))
   (define (elab-call c[_ f xs])
     (define exs (map (elab-val sut env) xs))
@@ -350,20 +370,21 @@
     ((tag-is "s_var") (elab-var surf))
     ((tag-is "s_case") (elab-case surf))
     ((tag-is "s_if") (elab-if surf))
-    ((tag-is "s_span") (elab-val sut env (burp-span surf)))
+    ((tag-is "s_span")
+      (elab-val sut (set-env-span (_1 surf) env) (burp-span surf)))
     ((tag-is "s_meth") (elab-meth surf))
     ((tag-is "s_self") (elab-self surf))
     ((tag-is "s_tvars") (elab-tvars surf))
-    ((tag-is "s_letrec") (error ["unsupported-foil-syntax" "letrec" surf]))
-    ((tag-is "s_ufcs_put") (error ["unsupported-foil-syntax" "ufcs-put" surf]))
-    ((tag-is "s_ufcs_over") (error ["unsupported-foil-syntax" "ufcs-over" surf]))
-    ((tag-is "s_literal") (error ["unsupported-foil-syntax" "literal" surf]))
+    ((tag-is "s_letrec") (elab-unsupported env "letrec bindings (=)"))
+    ((tag-is "s_ufcs_put") (elab-unsupported env "UFCS put (.#)"))
+    ((tag-is "s_ufcs_over") (elab-unsupported env "UFCS update (.%)"))
+    ((tag-is "s_literal") (elab-unsupported env "text literals"))
     ((or
        (tag-is "s_trow")
        (tag-is "s_tfun")
        (tag-is "s_union"))
        (tc-typ (elab-ty surf)))
-    (else (error ("uimpl" surf)))))
+    (else (elab-error env "unimplemented surface form" surf))))
 
 ;;; Module elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -373,6 +394,37 @@
        (Eq (_1 (_2 ty)) "TROW"))
        (ty:trow-vals (_2 ty))
        0))
+
+;;; Unsupported-syntax scan ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Before elaborating a module we sweep every declaration body for
+;; surface forms the elaborator does not implement yet, and report all
+;; of them at once — located — instead of dying mid-elaboration on the
+;; first one with a raw AST dump.  (Diagnostics for *type* errors are
+;; still fail-fast; accumulating those into env-diags needs elab-val to
+;; return diagnostics, a larger refactor.)
+
+(define unsupported-tags
+  [["s_letrec" "letrec bindings (=)"]
+   ["s_ufcs_put" "UFCS put (.#)"]
+   ["s_ufcs_over" "UFCS update (.%)"]
+   ["s_literal" "text literals"]])
+
+(define (scan-unsupported span0 top)
+  (define (fold-kids f acc row)
+    (define (go i acc)
+      (If (Ge i (Sz row)) acc (go (Inc i) (f acc (Ix i row)))))
+    (go 0 acc))
+  (define (go span acc node)
+    (Ifz (IsApp node) acc
+      (If (Eq "s_span" (_0 node))
+        (go (_1 node) acc (_2 node))
+        (letrec
+          ((hit (find (lambda (p) (Eq (_0 p) (_0 node))) unsupported-tags))
+           (acc1 (Ifz hit acc
+                   (snoc ["unsupported" (_1 (_0 hit)) (span-blurb span)] acc))))
+          (fold-kids (go span) acc1 node)))))
+  (go span0 [] top))
 
 (define (elab-mod sut mod)
   (define (insert-elab-tc name span tc sut)
@@ -385,4 +437,10 @@
     (define sut1 (insert-elab-tc name span tc sut))
     (Ifz acc? sut1
       (gen-accessors name acc? sut1)))
-  (foldl elab-entry sut mod))
+  (define (scan-entry diags ent[_ name span body])
+    (Weld diags
+      (map (lambda (d) ["in-decl" name d]) (scan-unsupported span body))))
+  (define diags (foldl scan-entry [] mod))
+  (Ifz (Sz diags)
+    (foldl elab-entry sut mod)
+    (error ["foil-unsupported" diags])))
