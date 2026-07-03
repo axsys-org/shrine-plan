@@ -172,30 +172,45 @@ All four landed (see `doc/aar/p3-*.md`), with two design changes:
 Each of these is a *decision* item — keep-and-finish or delete — because the
 half-state is what breeds P0/P1-class bugs.
 
-- [ ] **[design] `TANY` is both top and bottom** (`foil-types.rvr:158-159`),
+- [x] **[design] `TANY` is both top and bottom**
+      *(decided: it is the gradual/dynamic type — named, fenced, and given
+      deliberate meet/join behavior; `doc/aar/p4-tany-dynamic.md`)* (`foil-types.rvr:158-159`),
       a deliberate soundness escape hatch that also backs `empty-env`'s goal.
       Name it, comment it, and decide where it is allowed to appear.
-- [ ] **[design] No `TFUN` variance** — functions nest only via `Equal`, with
+- [x] **[design] No `TFUN` variance**
+      *(implemented: args contravariant, returns covariant; unface-fun
+      hack deleted; `doc/aar/p4-tfun-variance.md`)* — functions nest only via `Equal`, with
       the `unface-fun` equality hack in `type-apply-span`. Either implement
       co/contravariance or document the restriction.
-- [ ] **[design] Globals are inlined by value** (`elab-ref` embeds the whole
+- [x] **[design] Globals are inlined by value**
+      *(decided: function refs are by-name TC_GLOBALs linked via pins at
+      lowering; other entries stay inline; `doc/aar/p4-tc-global-linking.md`)* (`elab-ref` embeds the whole
       referee TC, `foil-elab.rvr:253`): no linking, no by-name recursion,
       copies everywhere. Fine for now — but it should be a stated decision,
       and it interacts with any future incremental-compilation story (perf:
       it also bloats every compiled law that references a big function).
-- [ ] **[design] Vestigial bidirectional checking** — `env-goal`
+- [x] **[design] Vestigial bidirectional checking**
+      *(removed; source comment marks where checking-mode belongs;
+      `doc/aar/p4-tany-dynamic.md`)* — `env-goal`
       push/peek/pop exists, `elab-cast` writes it, nothing reads it. Commit to
       checking-mode elaboration or remove the machinery.
-- [ ] **[cleanliness] Dead/broken lattice code**: `check-type-wf` (never
+- [x] **[cleanliness] Dead/broken lattice code**
+      *(deleted, except `check-type-wf` — fixed and enabled as an
+      elab-mod post-pass, and `TC_GLOBAL` — now load-bearing;
+      `doc/aar/p4-wf-checks.md`, `doc/aar/p4-booleans-and-dead-code.md`)*: `check-type-wf` (never
       called), `resolve-type` (legacy tags), `either-seq` (missing else
       branch), `tc-global`/`TC_GLOBAL` (never constructed; its lowering at
       `foil-lower.rvr:97` calls `got-const` missing the `sut` arg),
       `TUNI`/`TBOX`/`TEXI` (exported, never built).
-- [ ] **[cleanliness] Footgun globals in reef**: `(define y 1)` *and*
+- [x] **[cleanliness] Footgun globals in reef**
+      *(yes/no with no=0; fixing it activated print.rvr line-wrapping
+      for the first time; `doc/aar/p4-booleans-and-dead-code.md`)*: `(define y 1)` *and*
       `(define n 1)` — `n` is a truthy "no". Replace `y`/`n` with named
       booleans (or fix `n` to 0 and grep every use); stop passing `y y y`
       as flags (`foil-lower.rvr:36`).
-- [ ] **[cleanliness] Duplication**: `fold-app` (codegen + foil-lower), double
+- [x] **[cleanliness] Duplication**
+      *(deduped, except the foil.rvr façade — kept deliberately as the
+      stable public surface; `doc/aar/p4-booleans-and-dead-code.md`)*: `fold-app` (codegen + foil-lower), double
       `f-pinned` (`codegen.rvr:17-18`), double `pipe` macro (`reef.rvr:28-32`),
       `surf-ref-val`/`surf-ref-path` aliases, the ~50-line re-export façade in
       `foil.rvr`.
@@ -204,14 +219,20 @@ half-state is what breeds P0/P1-class bugs.
 
 ## P5 — Performance (after correctness locks)
 
-- [ ] **[perf]** Index `span-to-mold`'s reverse lookup — today a linear scan
-      of the whole subject order with re-expansion per candidate
-      (`foil-types.rvr:318-325`), hit on every join/meet/apply.
-- [ ] **[perf]** Memoize `mold-to-span` (cycle-guarded but uncached).
-- [ ] **[perf]** Skip re-lowering builtin entries in `lower-tc-mod` (see P1)
-      — also a compile-time win on large subjects.
-- [ ] **[perf]** Revisit global-by-value inlining (P4) once a linking story
-      exists.
+All four items resolved — measurements and the rejected-experiment
+writeup in `doc/aar/p5-perf-measurements.md`:
+
+- [x] **[perf]** Index `span-to-mold`'s reverse lookup — *implemented,
+      measured ~5% net regression at current module sizes, dropped.*
+      The premise didn't hold: wall clock is dominated by wisp module
+      compilation, not foil elaboration. Revisit with measurements when
+      subjects grow.
+- [x] **[perf]** Memoize `mold-to-span` — *same experiment, same
+      verdict.*
+- [x] **[perf]** Skip re-lowering builtin entries in `lower-tc-mod` —
+      *done in P1.*
+- [x] **[perf]** Revisit global-by-value inlining (P4) once a linking story
+      exists — *done: TC_GLOBAL by-name references (P4).*
 
 ---
 
