@@ -332,17 +332,39 @@
     (define ty (ty:type-meet sut scr-ty (elab-ty pat)))
     (define res (elab-val sut (push-local-env env ty) val))
     (tc-arm (tc-ty res) ty res))
+  ;; Lowered arm tests dispatch on constructor head + arity only
+  ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
+  ;; would silently shadow each other.  Reject them here instead.
+  (define (arm-key arm)
+    (define span (burp-face (ty:mold-to-span sut (tc-arm-pat arm))))
+    (If (Eq "TROW" (_1 span))
+      ["key" (ty:trow-cstr span) (Sz (ty:trow-vals span))]
+      0))
+  (define (check-arms-distinct arms1)
+    (define (dup-key keys)
+      (Ifz keys 0
+        (Or (And (_0 keys) (includes (Equal (_0 keys)) (drop 1 keys)))
+          (dup-key (drop 1 keys)))))
+    (define dup (dup-key (map arm-key arms1)))
+    (Ifz dup 0
+      (elab-error env
+        "match arms indistinguishable at runtime (same constructor and arity)"
+        (map tc-arm-pat arms1))))
   (define (elab-case c[_ scr arms fall])
     (define scrut (elab-val sut env scr))
     (define arms1 (map (elab-arm (burp-face (tc-ty scrut))) arms))
+    ;; The fallthrough leg is lowered *inside* the match's let (the
+    ;; scrutinee slot), so it must be elaborated with that local in
+    ;; scope or its de-bruijn references come out shifted by one.
     (define fall1
       (If (Eq foil-no-heir fall)
         (tc-mean "unreachable")
-        (elab-val sut env fall)))
+        (elab-val sut (push-local-env env (burp-face (tc-ty scrut))) fall)))
     (define fall-ty
       (If (Eq foil-no-heir fall) ty:TBOT (tc-ty fall1)))
     (define out-ty (foldl (ty:type-join sut) fall-ty (map tc-ty arms1)))
-    (tc-match out-ty scrut arms1 fall1))
+    (Seq (check-arms-distinct arms1)
+      (tc-match out-ty scrut arms1 fall1)))
   (define (elab-if i[_ scr tru fall])
     (define scrut (elab-val sut env scr))
     (define tru1 (elab-val sut env tru))
