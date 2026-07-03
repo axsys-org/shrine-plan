@@ -59,7 +59,11 @@ assert(Eq 0       (is-ref-let-bound? (FUN 0 0 0 0 [0 (VAR 5)] 0) 0))
    (define tag-is (Eq tag))
    (cond
      ((tag-is "VAL") st)
-     ((tag-is "APP" (countloop fun (countloop fun st a) b)))
+     ;; NB: test and body are separate clause elements — the recursion
+     ;; used to sit *inside* the test, which made refcount return an
+     ;; empty count row for any body containing an application, so
+     ;; every let binding was silently dropped.
+     ((tag-is "APP") (countloop fun (countloop fun st a) b))
      ((tag-is "VAR") (bump a
                         (Ifz (is-unseen-ref-to-let a fun st) st
                              (countloop fun
@@ -70,6 +74,19 @@ assert(Eq 0       (is-ref-let-bound? (FUN 0 0 0 0 [0 (VAR 5)] 0) 0))
   (countloop fun
     (Rep 0 0 (Sz (fun-binds fun)))
     (fun-body fun)))
+
+;; refcount pins the fixed clause: an app body counts its var refs, and
+;; referencing a let counts the refs inside its bound value.  (The row
+;; head doubles as the seen-let bitmask: bit 3 -> head 8 below.)
+
+assert(Equal [0 2 0 0]
+  (refcount
+    (FUN 0 "f" 0 ~[1 2] [0 0 0 0]
+      (APP (APP (VAL Add) (VAR 1)) (VAR 1)))))
+assert(Equal (Coup 8 [0 1 1 2])
+  (refcount
+    (FUN 0 "f" 0 ~[1 2] [0 0 0 (APP (VAR 1) (VAR 2))]
+      (APP (VAR 3) (VAR 3)))))
 
 (define (is-single-use-let? counts fun ref)
   (And
@@ -172,7 +189,7 @@ assert(Eq  (is-code? 0 5 6)       0 )
     (pipe f0
           (set-fun-self n0)
           (set-fun-args (lweld free arg0))
-          (set-fun-binds (Up slf0 new-self (snoc bin0 0)))))
+          (set-fun-binds (Up slf0 new-self (snoc 0 bin0)))))
   (Seq rc0
     [(codegen
        (Ifz free f0 f1)
@@ -318,7 +335,10 @@ assert(Eq (Law 1 "rec" 0)
   (define nex1 (Sz env1))
   (define is-app (Eq "APP" (_0 vr)))
   (define s2 (lcons (If is-app (VAR nex1) vr) s))
-  (define env2 (If is-app (snoc env1 vr) env1))
+  ;; NB: snoc is (snoc x xs) — the flipped call (snoc env1 vr) used to
+  ;; apply the bind value to the env, mangling the binds row whenever a
+  ;; let bound an application (every lowered match scrutinee).
+  (define env2 (If is-app (snoc vr env1) env1))
   (ingest compile s2 b env2))
 
 (define (ingest-letrec-step ingest compile s env0 l[_ vx k])
