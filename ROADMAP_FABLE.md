@@ -148,13 +148,22 @@ All P2 items done — see `doc/aar/p2-*.md`.
 
 ## P3 — Completeness for real programs
 
-Same list and rationale as ROADMAP.md Stage 3, dependency-ordered:
+Same list and rationale as ROADMAP.md Stage 3, dependency-ordered.
+All four landed (see `doc/aar/p3-*.md`), with two design changes:
 
-1. Local bindings / `letrec` (their absence blocks realistic programs).
-2. Functional record update `.%` / `.#` (needed by `bst.foil` / `axal.foil`).
-3. Text literals + a string type (today every literal is `TNAT 0`,
-   `foil-elab.rvr:293`).
-4. Match exhaustiveness checking (pairs with the P1 arm-test invariant).
+1. ~~Local bindings / `letrec`~~ **done** — `=` bindings elaborate as
+   sequential lets (`doc/aar/p3-local-bindings.md`); truly recursive
+   local bindings remain future work.
+2. ~~Functional record update `.%` / `.#`~~ **done, redesigned** —
+   plain `.` UFCS instead of new runes: every generated accessor now
+   comes with `set_<face>` / `over_<face>` methods
+   (`doc/aar/p3-record-update.md`).  `.%`/`.#` stay rejected.
+3. ~~Text literals + a string type~~ **done** — `'`-prefixed rex quips
+   typed by the `quip` aura sum from `quip.rvr`
+   (`doc/aar/p3-quip-literals.md`).
+4. ~~Match exhaustiveness checking~~ **done** — fall-less matches must
+   cover every option of the scrutinee sum
+   (`doc/aar/p3-exhaustiveness.md`).
 
 ---
 
