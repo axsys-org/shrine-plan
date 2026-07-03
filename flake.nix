@@ -74,6 +74,7 @@
           foil-bst-tests = runReaverTest "foil-bst-tests";
           foil-exec-tests = runReaverTest "foil-exec-tests";
           foil-async-tests = runReaverTest "foil-async-tests";
+          buddy-tests = runReaverTest "buddy-tests";
           forge-tests = runReaverTest "forge-tests";
         });
     };

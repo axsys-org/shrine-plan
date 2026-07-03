@@ -1,0 +1,208 @@
+;;;; The compile buddy — the forge for a terminal next to your editor.
+;;;; One resident session that is a compiler (auto-resync on save), a
+;;;; repl (bare expressions evaluate against the focused module's live
+;;;; subject), and a test harness (doctests run on every resync).
+;;;;
+;;;; Two source actors feed the main loop: one pumps stdin lines, one
+;;;;  accepts "poke" connections (wire :w in vim to nc — see doc/buddy.md)
+;;;; so saves resync without touching the buddy. See doc/buddy.md.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind async (#module async))
+(#bind foil (#module foil))
+(#bind forge (#module forge))
+(#bind forge-cli (#module forge-cli))
+
+
+(define NL (strcat [10]))
+(define ESC 27)
+(define (ansi code s) (strcat [ESC "[" code "m" s ESC "[0m"]))
+(define (green s) (ansi "32" s))
+(define (red s)   (ansi "31" s))
+(define (dim s)   (ansi "2" s))
+
+;;; Sync: recompile what changed on disk ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (mod-src mod)
+  (read-text-file (strcat ["foil/" mod ".foil"])))
+
+(define (mod-bundle fst mod)
+  (find (lambda (b) (Eq mod (forge:bundle-mod b))) (forge:st-bundles fst)))
+
+(define (mod-stale? fst mod)
+  (define hit (mod-bundle fst mod))
+  (Or (Nil hit)
+    (Nil (Equal (forge:bundle-src (_0 hit)) (mod-src mod)))))
+
+(define (insert-bundle fst b)
+  (snap 1 (snoc b) (forge:state-evict fst (forge:bundle-mod b))))
+
+(define (run-tests sut lore)
+  (foldl (lambda (acc l)
+           (Weld acc (map (forge:run-doctest sut) (forge:lore-tests l))))
+    [] lore))
+
+(define (doctest-chip results fails)
+  (define n (Sz results))
+  (define nf (Sz fails))
+  (cond
+    ((Nil n) "")
+    (nf (red (strcat [(showNat nf) " of " (showNat n) " doctests failing"])))
+    (else (green (strcat [(showNat n) "/" (showNat n) " doctests pass"])))))
+
+(define (bundle-report b)
+  (define mod (forge:bundle-mod b))
+  (If (Nil (forge:bundle-ok? b))
+    (Weld [(strcat [mod ": " (red "does not compile")])]
+      [(strcat ["  " (forge:render-plain (forge:bundle-err b))])])
+    (let* ((results (run-tests (forge:bundle-sut b) (forge:bundle-lore b)))
+           (fails (filter (lambda (r) (Ne "pass" (_0 r))) results))
+           (chip (doctest-chip results fails)))
+      (Weld
+        [(strcat [mod ": " (green "compiled")
+                  (Ifz (Bytes chip) "" (strcat ["  " chip]))])]
+        (map forge-cli:dt-res-line fails)))))
+
+;; Recompile every module whose source bytes changed — one actor per
+;; module — and report compile status + doctest results for each.
+(define (sync fst)
+  (define changed (filter (mod-stale? fst) forge:forge-mods))
+  (Ifz (Sz changed)
+    [fst [(dim "up to date")]]
+    (let ((bundles (async:async-all-deep forge:load-bundle changed)))
+      [(foldl insert-bundle fst bundles)
+       (foldl (lambda (acc b) (Weld acc (bundle-report b))) [] bundles)])))
+
+;;; The command step: (state, line) -> [state' rows quit?] ;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (bud fst focus) ["BUD" fst focus])
+(define bud-fst (Ix 1))
+(define bud-focus (Ix 2))
+
+(define help-rows
+  ["the compile buddy"
+   ""
+   "  <expr>        evaluate against the focused module"
+   "  <enter>       resync: recompile changed modules, run their doctests"
+   "  :m <mod>      switch focus"
+   "  :ls           entries of the focused module"
+   "  :s <dotted>   inspect one entry (type, lore, refs, law, source)"
+   "  :r <dotted>   who-calls / called-by"
+   "  :t            run every doctest in the focused module"
+   "  :h            this help"
+   "  :q            quit"])
+
+(define (strip-prefix pre s)
+  (forge:str-drop (Bytes pre) s))
+
+(define (via-cli b r[fst text _bad])
+  [(bud fst (bud-focus b)) [text] 0])
+
+(define (buddy-step b line)
+  (define fst (bud-fst b))
+  (define focus (bud-focus b))
+  (cond
+    ((Eq line ":q") [b [(dim "bye")] 1])
+    ((Eq line ":h") [b help-rows 0])
+    ((Eq line "")
+      (let ((r (sync fst)))
+        [(bud (_0 r) focus) (_1 r) 0]))
+    ((forge:str-prefix? ":m " line)
+      (let ((m (strip-prefix ":m " line)))
+        [(bud fst m) [(strcat ["focus: " m])] 0]))
+    ((Eq line ":ls")
+      (via-cli b (forge-cli:cmd-ls fst focus)))
+    ((forge:str-prefix? ":s " line)
+      (via-cli b (forge-cli:cmd-show fst focus (strip-prefix ":s " line))))
+    ((forge:str-prefix? ":r " line)
+      (via-cli b (forge-cli:cmd-refs fst focus (strip-prefix ":r " line))))
+    ((Eq line ":t")
+      (via-cli b (forge-cli:cmd-doctest fst focus)))
+    (else
+      (via-cli b (forge-cli:cmd-eval fst focus line)))))
+
+;;; Source actors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Pump stdin lines to the main loop; ["eof"] on ctrl-d.
+(define (stdin-pump self)
+  (define mc (Recv 0))
+  (define out (Ix0 (Ix1 mc)))
+  (define (loop z)
+    (define chunk (foil:read-stdin 384))
+    (Ifz chunk
+      (Send out ["eof"])
+      (Seq (Send out ["line" (foil:read-until 10 chunk)])
+        (loop z))))
+  (loop 0))
+
+;; Accept-and-close on the poke port; each connection means "something
+;; was saved" (wire your editor's write hook to it).
+(define (poke-pump port self)
+  (define mc (Recv 0))
+  (define out (Ix0 (Ix1 mc)))
+  (define listen (Try Listen port))
+  (If (Eq 1 (Hd listen))
+    (Send out ["nopoke"])
+    (let ((fd (_0 listen)))
+      (define (loop z)
+        (define conn (Accept fd))
+        (Seq (CloseFd conn)
+          (Seq (Send out ["poke"])
+            (loop z))))
+      (loop 0))))
+
+;;; The resident loop ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Write consumes bar-encoded nats (the sentinel top byte is dropped
+;; on write — natBytes, the inverse of bytesBar); a raw string loses
+;; its final byte.
+(define (put s)
+  (Write 1 (strWeld s 1)))
+
+(define (emit rows)
+  (put (join-str NL (Weld rows [""]))))
+
+(define (emit-prompt b)
+  (put (strcat [(bud-focus b) "> "])))
+
+(define (buddy-loop b)
+  (define mc (Recv 0))
+  (define msg (Ix0 mc))
+  (define kind (_0 msg))
+  (cond
+    ((Eq kind "line")
+      (let ((r (buddy-step b (_1 msg))))
+        (Seq (emit (_1 r))
+          (If (_2 r) 0
+            (Seq (emit-prompt (_0 r))
+              (buddy-loop (_0 r)))))))
+    ((Eq kind "poke")
+      (let ((r (sync (bud-fst b))))
+        (let ((b1 (bud (_0 r) (bud-focus b))))
+          (Seq (emit (Weld ["" (dim "── save")] (_1 r)))
+            (Seq (emit-prompt b1)
+              (buddy-loop b1))))))
+    ((Eq kind "nopoke")
+      (Seq (emit [(dim "(poke port busy — resync with <enter> only)")])
+        (buddy-loop b)))
+    (else (emit [(dim "bye")]))))
+
+(define (run-buddy port)
+  (define warm (sync forge:empty-state))
+  (define b (bud (_0 warm) "bst"))
+  (Seq (DeepSeq warm warm)
+    (Seq (emit (Weld ["the compile buddy — :h for help" ""] (_1 warm)))
+      (let* ((sin (Spawn stdin-pump))
+             (pok (Spawn (poke-pump port))))
+        (Seq (SendCaps sin ["go"] [0])
+          (Seq (SendCaps pok ["go"] [0])
+            (Seq (emit-prompt b)
+              (buddy-loop b))))))))
