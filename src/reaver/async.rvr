@@ -94,12 +94,23 @@
     (else
       (future-ready result self))))
 
+;; Force the result BEFORE parking in future-ready's Recv: `define` is
+;; a lazy slot, and an unforced Try rides along until the awaiter's
+;; message arrives — at which point the reply's deep-normalization does
+;; all the work, serially, at await time. The Seq is what makes the
+;; child actually compute concurrently.
 (define (future-run f arg self)
   (define result (Try f arg))
-  (future-ready result self))
+  (Seq result
+    (future-ready result self)))
 
+;; The Spawn must fire *now*, not when the handle is first demanded:
+;; the future row is lazy in its elements, so without the Seq the spawn
+;; of each future would ride along unforced until its await — and a
+;; row of "parallel" futures would run strictly one after another.
 (define (async f arg)
-  (future (Spawn (future-run f arg))))
+  (let1 h (Spawn (future-run f arg))
+    (Seq h (future h))))
 
 (define (async0 thunk)
   (async thunk 0))
@@ -123,17 +134,42 @@
 (define (await-all futures)
   (map await futures))
 
+;;; Deep-forcing variants ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; A future's work must happen in the child: without a deep force the
+;;; child parks a structure in WHNF and the *awaiting* actor pays for
+;;; the rest of the evaluation. These variants normalize the result
+;;; inside the future before it is sent back.
+
+(define (call-deep f x)
+  (let1 r (f x)
+    (DeepSeq r r)))
+
+(define (async-deep f arg)
+  (async (call-deep f) arg))
+
 (define (async-map-list f xs i rem)
   (Ifz rem NIL
     (let1 fut (async f (Ix i xs))
       (Seq fut
         [fut (async-map-list f xs (Inc i) (Dec rem))]))))
 
+;; DeepSeq the row: Row answers Sz from its length argument without
+;; traversing the spine, so nothing else forces the elements — and an
+;; unforced element is an unfired Spawn. Forcing here is what makes the
+;; map actually parallel instead of one-spawn-per-await.
 (define (async-map f xs)
-  (Row 0 (Sz xs) (async-map-list f xs 0 (Sz xs))))
+  (define futs (Row 0 (Sz xs) (async-map-list f xs 0 (Sz xs))))
+  (DeepSeq futs futs))
 
 (define (async-all f xs)
   (await-all (async-map f xs)))
+
+(define (async-map-deep f xs)
+  (async-map (call-deep f) xs))
+
+(define (async-all-deep f xs)
+  (await-all (async-map-deep f xs)))
 
 
 ;;; Fan-out helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
