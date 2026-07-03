@@ -16,6 +16,9 @@
 (#bind parse (#module parse))
 (#import parse)
 
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
 (#bind async (#module async))
 (#bind foil (#module foil))
 (#bind forge (#module forge))
@@ -83,14 +86,81 @@
 
 ;;; The command step: (state, line) -> [state' rows quit?] ;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (bud fst focus) ["BUD" fst focus])
+(define (mk-bud fst focus vars) ["BUD" fst focus vars])
+(define (bud fst focus) (mk-bud fst focus []))
 (define bud-fst (Ix 1))
 (define bud-focus (Ix 2))
+(define bud-vars (Ix 3))
+
+;;; Repl variables: grafted onto the focused subject at each eval as
+;;; FFI entries (a runtime value with a type), so bare names resolve
+;;; exactly like sibling module declarations — and they survive
+;;; resyncs, since the graft happens against whatever bundle is
+;;; current. `name = expr` binds; :vars lists.
+
+(define (graft-vars sut vars)
+  (foldl (lambda (s v) (insert-ffi [(_0 v)] (_1 v) (_2 v) s)) sut vars))
+
+(define (ident-char? c)
+  (Or (And (Ge c 97) (Le c 122))
+    (Or (And (Ge c 65) (Le c 90))
+      (Or (And (Ge c 48) (Le c 57)) (Eq c 95)))))
+
+;; "name = expr" with a plain identifier before the =; 0 otherwise.
+(define (bind-split line)
+  (define n (Bytes line))
+  (define (ident-end i)
+    (If (And (Lt i n) (ident-char? (Load8 i line))) (ident-end (Inc i)) i))
+  (define i (ident-end 0))
+  (define rest (forge:str-drop i line))
+  (If (And (Gt i 0) (And (forge:str-prefix? " = " rest) (Gt n (Add i 3))))
+    [(forge:str-slice 0 i line) (forge:str-drop (Add i 3) line)]
+    0))
+
+(define (var-line v)
+  (strcat [(_0 v) " : " (forge:ty-text (_2 v)) " = " (forge:render-plain (_1 v))]))
+
+(define (eval-grafted b expr k)
+  (forge-cli:with-bundle (bud-fst b) (bud-focus b)
+    (lambda (fst1 bun)
+      (define res (forge:eval-text (graft-vars (forge:bundle-sut bun) (bud-vars b)) expr))
+      (If (Eq 1 (Hd res))
+        [fst1 (strcat ["error:" NL (forge:render-plain (_0 res))]) 1]
+        (k fst1 (_0 (_0 res)) (_1 (_0 res)))))))
+
+(define (cmd-eval-vars b expr)
+  (define r
+    (eval-grafted b expr
+      (lambda (fst1 val ty)
+        [fst1
+         (join-str NL
+           (Weld [(strcat ["value: " (forge:render-plain val)])
+                  (strcat ["type:  " (forge:ty-text ty)])]
+             (If (forge:law-like? val) ["" (forge:render-law val)] [])))
+         0])))
+  [(mk-bud (_0 r) (bud-focus b) (bud-vars b)) [(_1 r)] 0])
+
+(define (cmd-bind b name expr)
+  (define r
+    (eval-grafted b expr
+      (lambda (fst1 val ty) [fst1 [name val ty] 0])))
+  (If (_2 r)
+    [(mk-bud (_0 r) (bud-focus b) (bud-vars b)) [(_1 r)] 0]
+    (let* ((v (_1 r))
+           (vars (snoc v (filter (lambda (w) (Ne name (_0 w))) (bud-vars b)))))
+      [(mk-bud (_0 r) (bud-focus b) vars) [(var-line v)] 0])))
+
+(define (cmd-vars b)
+  (Ifz (Sz (bud-vars b))
+    [b [(dim "no variables — bind with: name = expr")] 0]
+    [b (map var-line (bud-vars b)) 0]))
 
 (define help-rows
   ["the compile buddy"
    ""
    "  <expr>        evaluate against the focused module"
+   "  name = expr   bind a repl variable (usable in later expressions)"
+   "  :vars         list bound variables"
    "  <enter>       resync: recompile changed modules, run their doctests"
    "  :m <mod>      switch focus"
    "  :ls           entries of the focused module"
@@ -104,7 +174,7 @@
   (forge:str-drop (Bytes pre) s))
 
 (define (via-cli b r[fst text _bad])
-  [(bud fst (bud-focus b)) [text] 0])
+  [(mk-bud fst (bud-focus b) (bud-vars b)) [text] 0])
 
 (define (buddy-step b line)
   (define fst (bud-fst b))
@@ -114,10 +184,11 @@
     ((Eq line ":h") [b help-rows 0])
     ((Eq line "")
       (let ((r (sync fst)))
-        [(bud (_0 r) focus) (_1 r) 0]))
+        [(mk-bud (_0 r) focus (bud-vars b)) (_1 r) 0]))
+    ((Eq line ":vars") (cmd-vars b))
     ((forge:str-prefix? ":m " line)
       (let ((m (strip-prefix ":m " line)))
-        [(bud fst m) [(strcat ["focus: " m])] 0]))
+        [(mk-bud fst m (bud-vars b)) [(strcat ["focus: " m])] 0]))
     ((Eq line ":ls")
       (via-cli b (forge-cli:cmd-ls fst focus)))
     ((forge:str-prefix? ":s " line)
@@ -127,7 +198,10 @@
     ((Eq line ":t")
       (via-cli b (forge-cli:cmd-doctest fst focus)))
     (else
-      (via-cli b (forge-cli:cmd-eval fst focus line)))))
+      (let ((bs (bind-split line)))
+        (Ifz bs
+          (cmd-eval-vars b line)
+          (cmd-bind b (_0 bs) (_1 bs)))))))
 
 ;;; Source actors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -186,7 +260,7 @@
               (buddy-loop (_0 r)))))))
     ((Eq kind "poke")
       (let ((r (sync (bud-fst b))))
-        (let ((b1 (bud (_0 r) (bud-focus b))))
+        (let ((b1 (mk-bud (_0 r) (bud-focus b) (bud-vars b))))
           (Seq (emit (Weld ["" (dim "── save")] (_1 r)))
             (Seq (emit-prompt b1)
               (buddy-loop b1))))))
