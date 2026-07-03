@@ -402,6 +402,31 @@
       (elab-error env
         "match arms indistinguishable at runtime (same constructor and arity)"
         (map tc-arm-pat arms1))))
+  ;; A match without a fallthrough must cover every option of its
+  ;; scrutinee's sum (by the same head+arity key the lowered tests
+  ;; dispatch on).
+  (define (check-exhaustive scrut-ty arms1)
+    (define span (burp-face (ty:mold-to-span sut scrut-ty)))
+    (define keys (map arm-key arms1))
+    (define (opt-key o)
+      (define s (burp-face o))
+      (If (Eq "TROW" (_1 s))
+        ["key" (ty:trow-cstr s) (Sz (ty:trow-vals s))]
+        0))
+    (define (uncovered? o)
+      (define k (opt-key o))
+      (Ifz k 1 (Nil (includes (Equal k) keys))))
+    (define opts
+      (cond
+        ((Eq "TSUM" (_1 span)) (ty:tsum-opts span))
+        ((Eq "TROW" (_1 span)) [span])
+        (else 0)))
+    (Ifz opts
+      (elab-error env "match without fallthrough on a non-sum scrutinee"
+        scrut-ty)
+      (let ((missing (filter uncovered? opts)))
+        (Ifz (Sz missing) 0
+          (elab-error env "non-exhaustive match" ["missing" missing])))))
   (define (elab-case c[_ scr arms fall])
     (define scrut (elab-val sut env scr))
     (define arms1 (map (elab-arm (burp-face (tc-ty scrut))) arms))
@@ -416,7 +441,10 @@
       (If (Eq foil-no-heir fall) ty:TBOT (tc-ty fall1)))
     (define out-ty (foldl (ty:type-join sut) fall-ty (map tc-ty arms1)))
     (Seq (check-arms-distinct arms1)
-      (tc-match out-ty scrut arms1 fall1)))
+      (Seq (If (Eq foil-no-heir fall)
+             (check-exhaustive (tc-ty scrut) arms1)
+             0)
+        (tc-match out-ty scrut arms1 fall1))))
   (define (elab-if i[_ scr tru fall])
     (define scrut (elab-val sut env scr))
     (define tru1 (elab-val sut env tru))
