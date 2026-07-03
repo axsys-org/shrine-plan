@@ -72,6 +72,7 @@
           '';
         in {
           foil-bst-tests = runReaverTest "foil-bst-tests";
+          foil-exec-tests = runReaverTest "foil-exec-tests";
         });
     };
 }

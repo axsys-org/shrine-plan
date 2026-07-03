@@ -1,0 +1,128 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind foil-sast (#module foil-sast))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+
+;;; End-to-end execution tests: compile Foil and *run* the compiled PLAN.
+;;; Everything else in the suite asserts on IR shape; these asserts pin
+;;; the calling convention (self=0, args in application order) by
+;;; observing results.
+
+(define (compile-inline txt)
+  (define mod (foil-sast:parse-module-sast 0 (rex:ParseRexNorm txt)))
+  (define elabbed (foil:elab-mod foil:default-subject mod))
+  (foil:lower-tc-mod elabbed elabbed))
+
+(define (lowered path sut)
+  (foil:ir-entry-val (got-entry path sut)))
+
+
+;;; Argument order ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define order-sut (compile-inline "
++  sub2
+  \  a=nat b=nat
+  ^  nat
+  (sub a b)
++  apart
+  \  a=nat b=nat
+  ^  nat
+  ?  (lt a b)
+     (sub b a)
+  (sub a b)
+"))
+
+(define sub2 (lowered ["sub2"] order-sut))
+assert(Eq 4 (sub2 5 1))
+assert(Eq 2 (sub2 3 1))
+
+(define apart (lowered ["apart"] order-sut))
+assert(Eq 4 (apart 1 5))
+assert(Eq 4 (apart 5 1))
+
+
+;;; Recursion through ~ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define rec-sut (compile-inline "
++  triangle
+  \  x=nat
+  ^  nat
+  ?  x
+     (add x (~ (dec x)))
+  0
+"))
+
+(define triangle (lowered ["triangle"] rec-sut))
+assert(Eq 0 (triangle 0))
+assert(Eq 6 (triangle 3))
+assert(Eq 15 (triangle 5))
+
+
+;;; Match arms and fallthrough ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define match-sut (compile-inline "
++  pmaybe
+  &  ($some nat)
+     $none
++  pick
+  \  m=pmaybe d=nat
+  ^  nat
+  ?  m
+   > ($some v=nat)  v
+  d
+"))
+
+(define pick (lowered ["pick"] match-sut))
+assert(Eq 7 (pick ("some" 7) 3))
+;; The fallthrough leg must still see the function's own arguments.
+assert(Eq 3 (pick "none" 3))
+
+
+;;; The bst.foil canary, executed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define bst-sut (foil:compile-mod foil:default-subject "bst"))
+
+(define bst-sing (lowered ["bst" "sing"] bst-sut))
+(define bst-insert (lowered ["bst" "insert"] bst-sut))
+(define bst-size (lowered ["bst" "size"] bst-sut))
+(define bst-got (lowered ["bst" "got"] bst-sut))
+(define bst-has (lowered ["bst" "has"] bst-sut))
+
+(define tree0 (bst-sing 2 20))
+(define tree2
+  (bst-insert 3 30 (bst-insert 1 10 tree0)))
+
+assert(Eq 1 (bst-size tree0))
+assert(Eq 3 (bst-size tree2))
+assert(Eq 10 (bst-got 1 tree2))
+assert(Eq 20 (bst-got 2 tree2))
+assert(Eq 30 (bst-got 3 tree2))
+assert(Eq 0 (bst-got 9 tree2))
+assert(Eq 1 (bst-has 3 tree2))
+assert(Eq 0 (bst-has 9 tree2))
+
+;; Enough inserts to run the balance/rotate paths.
+(define (build n tree)
+  (Ifz n tree (build (Dec n) (bst-insert n (Mul 10 n) tree))))
+(define tree10 (build 10 (bst-sing 0 0)))
+assert(Eq 11 (bst-size tree10))
+assert(Eq 70 (bst-got 7 tree10))
+assert(Eq 100 (bst-got 10 tree10))
+assert(Eq 0 (bst-has 42 tree10))
+
+(print "foil-exec tests passed")
