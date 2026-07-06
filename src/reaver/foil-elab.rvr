@@ -145,15 +145,20 @@
 (define (row-over-at idx f rcvr)
   (Up idx (f (Ix idx rcvr)) rcvr))
 
-(define (gen-accessors loc items sut)
+;; For a generic row the accessors are quantified too: the receiver is
+;; TNOM loc [vars], the fun type is TQUA-wrapped, and score-meth's
+;; receiver-argument specialization instantiates them at use.
+(define (gen-accessors loc vars items sut)
   (define faces (ty:collect-faces items))
-  (define self-ty (ty:TNOM loc 0))
+  (define self-ty (ty:TNOM loc (Ifz vars 0 (map ty:TVAR vars))))
+  (define (qua typ) (wrap-tquas (Ifz vars 0 vars) typ))
   (define (go sut arg[idx fac ty])
-    (define get-tc (tc-ffi (ty:TFUN [self-ty] ty) (Ix idx)))
+    (define get-tc (tc-ffi (qua (ty:TFUN [self-ty] ty)) (Ix idx)))
     (define set-tc
-      (tc-ffi (ty:TFUN [ty self-ty] self-ty) (row-set-at idx)))
+      (tc-ffi (qua (ty:TFUN [ty self-ty] self-ty)) (row-set-at idx)))
     (define over-tc
-      (tc-ffi (ty:TFUN [(ty:TFUN [ty] ty) self-ty] self-ty) (row-over-at idx)))
+      (tc-ffi (qua (ty:TFUN [(ty:TFUN [ty] ty) self-ty] self-ty))
+        (row-over-at idx)))
     (pipe sut
       (insert-tc (Weld loc [fac]) wack-span get-tc)
       (insert-tc (Weld loc [(strWeld "set_" fac)]) wack-span set-tc)
@@ -193,8 +198,6 @@
     (Ifz args tc
       (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
         (If (Eq "TBAD" (_1 typ)) tc (set-tc-ty typ tc)))))
-  (define (score-nom)
-    (by-name sel (specialize-method (got-entry-tc sel sut) (_3 ty))))
   (define (row-item-type row)
     (Ifz (ty:trow-vals row)
       ty:TANY
@@ -209,6 +212,25 @@
     (Ifz hit
       (row-method)
       (accessor (_0 hit))))
+  ;; Nominal receivers keep their names now (type-meet preserves
+  ;; molds), so face access on them arrives here: when there is no
+  ;; declared method under the receiver's path, fall back to the
+  ;; expanded row shape and its faces.
+  (define (score-nom)
+    (If (get-const sel sut)
+      (by-name sel (specialize-method (got-entry-tc sel sut) (_3 ty)))
+      ;; Face access: use the *declared* row specialized by the
+      ;; receiver's type arguments — expanding the whole receiver would
+      ;; hand the accessor a denormalized face type.
+      (let ((decl (If (And (get-const nom sut) (ty:type-entry? nom sut))
+                    (ty:type-specialize sut (got-type nom sut) (_3 ty))
+                    ty:TBAD)))
+        (If (Eq "TROW" (_1 decl))
+          (row-meth decl)
+          (let ((span (ty:mold-to-span sut ty)))
+            (If (Eq "TROW" (_1 span))
+              (row-meth span)
+              (error ("bad dot call" obj meth))))))))
   (cond
     ((Eq tag "TNOM") (score-nom))
     ((Eq tag "TROW") (row-meth ty))
@@ -250,17 +272,33 @@
           (_2 typ)
           0))
       0))
-  (define (elab-type-call tc xs)
+  ;; A constructor call's result type is the NOMINAL type when the
+  ;; callee is a (possibly specialized) reference to a named type —
+  ;; taken from the callee's surface, since the TC has shed the path.
+  ;; The old span roundtrip recovered the name only for
+  ;; unparameterized types and denormalized everything else.
+  (define (construction-nom fsurf)
+    (cond
+      ((Eq "s_ref" (_0 fsurf))
+        (ty:TNOM (surf-ref-path fsurf) 0))
+      ;; bare names reach constructors as s_var (a type callee cannot
+      ;; be a local, so the name is the path)
+      ((Eq "s_var" (_0 fsurf))
+        (ty:TNOM [(_1 fsurf)] 0))
+      ((And (Eq "s_spec" (_0 fsurf)) (Eq "s_ref" (_0 (_1 fsurf))))
+        (ty:TNOM (surf-ref-path (_1 fsurf)) (map elab-ty (_2 fsurf))))
+      (else 0)))
+  (define (elab-type-call fsurf tc xs)
     (define row (tc-type-row tc))
-    (define row-span (ty:mold-to-span sut row))
     (define fields (ty:trow-vals row))
     (define got (map (cork burp-face tc-ty) xs))
     (define pairs (zip fields got))
+    (define nom (construction-nom fsurf))
     (unless (and (Eq (Sz fields) (Sz got))
               (all (uncurry (ty:type-nests? sut)) pairs))
       (elab-error env "constructor call does not match its row type"
         ["want" row "got" got])
-      (tc-row (ty:span-to-mold sut row-span) (ty:trow-cstr row-span) xs)))
+      (tc-row (Ifz nom row nom) (ty:trow-cstr row) xs)))
   (define (on-call f xs)
     (define xs-ty (map (cork burp-face tc-ty) xs))
     (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
@@ -293,7 +331,7 @@
       (If variant-call?
         (elab-variant-call (_1 f) exs)
       (If (tc-type-row tc-f)
-        (elab-type-call tc-f exs)
+        (elab-type-call f tc-f exs)
         (on-call tc-f exs))))
     ret)
   ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
@@ -520,12 +558,17 @@
 
 ;;; Module elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; Row type declarations get accessors, quantified or not: returns
+;; [tvars row-items] (tvars 0 when the row is not generic), or 0.
 (define (can-gen-accessors? tc[ty])
-  (If (and (Eq (Hd tc) "TC_TYP")
-       (Eq (_1 ty) "TTYP")
-       (Eq (_1 (_2 ty)) "TROW"))
-       (ty:trow-vals (_2 ty))
-       0))
+  (define (unwrap vars typ)
+    (cond
+      ((Eq (_1 typ) "TQUA") (unwrap (snoc (_2 typ) vars) (_3 typ)))
+      ((Eq (_1 typ) "TROW") [(Ifz (Sz vars) 0 vars) (ty:trow-vals typ)])
+      (else 0)))
+  (If (and (Eq (Hd tc) "TC_TYP") (Eq (_1 ty) "TTYP"))
+    (unwrap [] (_2 ty))
+    0))
 
 ;;; Unsupported-syntax scan ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -573,7 +616,7 @@
     (define acc? (can-gen-accessors? tc))
     (define sut1 (insert-elab-tc name span tc sut))
     (Ifz acc? sut1
-      (gen-accessors name acc? sut1)))
+      (gen-accessors name (_0 acc?) (_1 acc?) sut1)))
   (define (scan-entry diags ent[_ name span body])
     (Weld diags
       (map (lambda (d) ["in-decl" name d]) (scan-unsupported span body))))

@@ -347,6 +347,16 @@
       (else ty))
     (TNOM (_0 nom) 0)))
 
+(define (type-nests? sut sup sub)
+  (cond
+    ((Equal sup sub) 1)
+    ((Eq (_1 sup) "TFAC") (type-nests? sut (tfac-val sup) sub))
+    ((Eq (_1 sub) "TFAC") (type-nests? sut sup (tfac-val sub)))
+    (else
+      (type-nests-span?
+        (mold-to-span sut sup)
+        (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
+
 (define (type-apply sut f x)
   (define (arg-seeds ty[_ tag])
     (cond
@@ -363,23 +373,42 @@
                   (mold-to-span sut x)
                   (mold-to-span-seen sut (Ifz seeds 0 (_0 seeds)) x))]
         (expand-args (Ifz seeds 0 (drop 1 seeds)) (drop 1 xs))))))
-  (span-to-mold sut
-    (type-apply-span
-      (mold-to-span sut f)
-      (expand-args (arg-seeds f) x))))
+  ;; Unspecialized quantified functions still go through the span
+  ;; pipeline — that is where inference-by-first-argument lives.
+  (define (qua-apply f x)
+    (span-to-mold sut
+      (type-apply-span
+        (mold-to-span sut f)
+        (expand-args (arg-seeds f) x))))
+  ;; Everything else applies at the MOLD level: arguments are checked
+  ;; with type-nests? (span comparison inside, robust to expansion
+  ;; asymmetry) and the result is the fun's *declared* return mold —
+  ;; span-roundtripping the return denormalizes parameterized nominal
+  ;; types.
+  (define (go f x)
+    (Ifz x f
+      (let ((tag (_1 f)))
+        (cond
+          ((Eq tag "TQUA") (qua-apply f x))
+          ((Eq tag "TFAC") (go (tfac-val f) x))
+          ((Eq tag "TPIN")
+            (If (Eq "TFUN" (_1 (tpin-val f)))
+              (go (tpin-val f) x)
+              (TBAD ["pinned non-law apply" f x])))
+          ((Eq tag "TSELF") (go (tself-val f) x))
+          ((Eq tag "TFUN")
+            (If (type-nests? sut (_0 (tfun-args f)) (_0 x))
+              (go (If (Eq 1 (Sz (tfun-args f)))
+                    (tfun-ret f)
+                    (TFUN (drop 1 (tfun-args f)) (tfun-ret f)))
+                (drop 1 x))
+              (TBAD ["nest-fail" (_0 (tfun-args f)) (_0 x)])))
+          ((Eq tag "TBAD") f)
+          (else (TBAD ["weird apply" f x]))))))
+  (go f x))
 
 (define (type-specialize sut f args)
   (type-specialize-span f args))
-
-(define (type-nests? sut sup sub)
-  (cond
-    ((Equal sup sub) 1)
-    ((Eq (_1 sup) "TFAC") (type-nests? sut (tfac-val sup) sub))
-    ((Eq (_1 sub) "TFAC") (type-nests? sut sup (tfac-val sub)))
-    (else
-      (type-nests-span?
-        (mold-to-span sut sup)
-        (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
 
 ;;; Joins, meets, and fit checks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -415,11 +444,22 @@
     ((Eq ytag "TSUM") (flat-sum y x))
     (else (TSUM [x y]))))
 
+;; Identical molds join to themselves — the span roundtrip is lossy for
+;; parameterized nominal types (span-to-mold's name recovery only
+;; matches unparameterized ones), so avoid it when there is nothing to
+;; join.
 (define (type-join sut x y)
-  (span-to-mold sut
-    (type-join-span sut
-      (mold-to-span sut x)
-      (mold-to-span sut y))))
+  (cond
+    ((Equal x y) x)
+    ;; Bottom is the join identity (elab-case seeds its arm fold with
+    ;; TBOT when there is no fallthrough).
+    ((Eq (_1 x) "TBOT") y)
+    ((Eq (_1 y) "TBOT") x)
+    (else
+      (span-to-mold sut
+        (type-join-span sut
+          (mold-to-span sut x)
+          (mold-to-span sut y))))))
 
 ;; type intersection
 (define (type-meet-span sut x[_ xtag] y[_ ytag])
@@ -461,11 +501,24 @@
     ((Eq ytag "TSUM") (distr-sum y x))
     (else TBOT))))
 
+;; When one side nests in the other, the meet IS the nested mold — and
+;; keeping the nominal mold matters: the span roundtrip denormalizes
+;; parameterized nominal types (span-to-mold's name recovery only
+;; matches unparameterized ones), which poisons everything derived from
+;; the result (match-arm locals, their faces, applications of them).
 (define (type-meet sut x y)
-  (span-to-mold sut
-    (type-meet-span sut
-      (mold-to-span sut x)
-      (mold-to-span-seen sut (mold-rec-seed x) y))))
+  (cond
+    ;; TANY is dynamic, not a lattice element: it nests both ways but
+    ;; must refine away in meets.
+    ((Eq (_1 x) "TANY") y)
+    ((Eq (_1 y) "TANY") x)
+    ((type-nests? sut x y) y)
+    ((type-nests? sut y x) x)
+    (else
+      (span-to-mold sut
+        (type-meet-span sut
+          (mold-to-span sut x)
+          (mold-to-span-seen sut (mold-rec-seed x) y))))))
 
 (define (fits-err err)
   (1 [err]))
@@ -529,10 +582,13 @@
   (tc "POISON" TBAD))
 (define (tc-ttyp typ)
   (tc-typ (TTYP typ)))
+;; Quantifiers are transparent to naming: a generic row declaration
+;; (TQUA v (TROW ...)) is still nominally the declared constructor.
 (define (name-top-row key typ[_ tag])
-  (If (Eq tag "TROW")
-    (TROW (print-path key) (trow-vals typ))
-    typ))
+  (cond
+    ((Eq tag "TROW") (TROW (print-path key) (trow-vals typ)))
+    ((Eq tag "TQUA") (TQUA (_2 typ) (name-top-row key (_3 typ))))
+    (else typ)))
 (define (insert-typ key span typ sut)
   (define ent (make-tc-entry key span (tc-ttyp (name-top-row key typ))))
   (insert-entry-sut key ent sut))
