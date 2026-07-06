@@ -75,6 +75,36 @@
 (define (left x) ("left" x)) (define (right x) ("right" x))
 (define (is-left? x) (Eq (Hd x) "left")) (define (is-right? x) (Eq (Hd x) "right"))
 
+;;; /ty-ap paths <-> types ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Specialized generics are encoded as paths (see foil-subject.rvr):
+;; the type argument of an application must itself be path-shaped.
+
+(define (path-to-ty p)
+  (If (ty-var-path? p) (TVAR (Ix 1 p)) (TNOM p 0)))
+
+;; -> the path for an encodable type argument, 0 otherwise.
+(define (ty-to-path t[_ tag])
+  (cond
+    ((Eq tag "TNOM") (Ifz (Sz (_3 t)) (_2 t) 0))
+    ((Eq tag "TVAR") [ty-var-tag (_2 t)])
+    ((Eq tag "TNAT") (Ifz (_2 t) ["nat"] 0))
+    (else 0)))
+
+;; Substitute a tvar inside an encoded path's arguments.
+(define (subst-path name repl path)
+  (Ifz (ty-ap-path? path) path
+    (let ((parts (ty-ap-decode path)))
+      (Ifz parts path
+        (ty-ap-encode
+          (map (lambda (p)
+                 (cond
+                   ((And (ty-var-path? p) (Eq name (Ix 1 p)))
+                     (let ((rp (ty-to-path repl))) (Ifz rp p rp)))
+                   ((ty-ap-path? p) (subst-path name repl p))
+                   (else p)))
+            parts))))))
+
 ;;; Well-formedness and substitution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (check-type-wf sut x[_ tag])
@@ -115,7 +145,7 @@
   (cond
     ((tag-is "TVAR") (If (Eq (_2 ty) name) repl ty))
     ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
-    ((tag-is "TNOM") (TNOM (_2 ty) (map recur (_3 ty))))
+    ((tag-is "TNOM") (TNOM (subst-path name repl (_2 ty)) (map recur (_3 ty))))
     ((tag-is "TFAC") (TFAC (_2 ty) (recur (_3 ty))))
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
     ((tag-is "TARR") (TARR (recur (_2 ty))))
@@ -288,13 +318,26 @@
   (cond
     ((tag-is "TNOM")
       (define ref (tnom-ref ty))
-      (define args (_3 ty))
+      ;; /ty-ap refs carry their type arguments in the path. The
+      ;; arguments substitute into the generic's mold BEFORE expansion
+      ;; — the body's recursive references then carry the instantiated
+      ;; paths and the seen-cut (keyed on the full encoded path) fires;
+      ;; substituting after expansion recurses with the declared tvar
+      ;; and never matches seen. Rows are named by the GENERIC (the
+      ;; declared row's baked constructor); the arguments live in the
+      ;; field types.
       (If (find (Equal ref) seen)
         ty
-        (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
-              (applied-args (map recur args)))
-          (define applied (type-specialize-span base applied-args))
-          (name-row-span ref applied))))
+        (If (ty-ap-path? ref)
+          (let* ((parts (ty-ap-decode ref))
+                 (applied-mold
+                   (type-specialize-span (got-type ref sut)
+                     (map path-to-ty (drop 1 parts)))))
+            (name-row-span (Ix 0 parts)
+              (mold-to-span-seen sut (snoc ref seen) applied-mold)))
+          (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
+                (applied-args (map recur (_3 ty))))
+            (name-row-span ref (type-specialize-span base applied-args))))))
     ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
     ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
@@ -611,6 +654,10 @@
 (#export
  check-type-wf
  subst-type
+ path-to-ty
+ ty-to-path
+ subst-path
+ type-entry?
  mold-to-span
  span-to-mold
  type-apply

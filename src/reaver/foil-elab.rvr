@@ -75,6 +75,36 @@
 (define (as-ttyp typ)
   (If (Eq "TTYP" (_1 typ)) typ (ty:TTYP typ)))
 
+;;; /ty-ap resolution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; The subject resolves an instantiation path to its generic's entry;
+;; here — where types are in play — the decoded arguments specialize
+;; the entry's type.
+
+(define (applied-type sut path)
+  (If (ty-ap-path? path)
+    (let ((parts (ty-ap-decode path)))
+      (ty:type-specialize sut (got-type (Ix 0 parts) sut)
+        (map ty:path-to-ty (drop 1 parts))))
+    (got-type path sut)))
+
+(define (applied-entry-tc sut path)
+  (define tc (got-entry-tc path sut))
+  (If (ty-ap-path? path)
+    (let ((parts (ty-ap-decode path)))
+      (let ((typ (ty:type-specialize sut (tc-ty tc)
+                   (map ty:path-to-ty (drop 1 parts)))))
+        (If (Eq "TBAD" (_1 typ)) tc (set-tc-ty typ tc))))
+    tc))
+
+;; Encode a specialization as a /ty-ap path: 0 if an argument type is
+;; not path-shaped.
+(define (spec-encode path targs)
+  (define argps (map ty:ty-to-path targs))
+  (If (any Nil argps)
+    0
+    (ty-ap-encode (Weld [path] argps))))
+
 ;;; Type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (elab-type-env sut env wav[tag])
@@ -89,7 +119,10 @@
           (ty:TBAD ["bad-pin-arity" fields])
           (ty:TPIN (_0 fields))))
       ((Eq "s_ref" (_0 f))
-        (ty:TNOM (surf-ref-path f) fields))
+        (let ((enc (spec-encode (surf-ref-path f) fields)))
+          (Ifz enc
+            (ty:TBAD ["type argument not path-shaped" fields])
+            (ty:TNOM enc 0))))
       (else
         (ty:TBAD "uimpl tapp"))))
 
@@ -150,7 +183,12 @@
 ;; receiver-argument specialization instantiates them at use.
 (define (gen-accessors loc vars items sut)
   (define faces (ty:collect-faces items))
-  (define self-ty (ty:TNOM loc (Ifz vars 0 (map ty:TVAR vars))))
+  (define self-ty
+    (Ifz vars
+      (ty:TNOM loc 0)
+      (ty:TNOM
+        (ty-ap-encode (Weld [loc] (map (lambda (v) [ty-var-tag v]) vars)))
+        0)))
   (define (qua typ) (wrap-tquas (Ifz vars 0 vars) typ))
   (define (go sut arg[idx fac ty])
     (define get-tc (tc-ffi (qua (ty:TFUN [self-ty] ty)) (Ix idx)))
@@ -188,7 +226,14 @@
 (define (score-meth obj meth sut)
   (define outer-ty (tc-ty obj))
   (define ty[_ tag nom] (burp-face (tc-ty obj)))
-  (define sel (snoc meth nom))
+  ;; A member of an instantiation is the instantiation of the member:
+  ;; the method path rides inside the /ty-ap encoding with the same
+  ;; arguments.
+  (define sel
+    (If (ty-ap-path? nom)
+      (let ((parts (ty-ap-decode nom)))
+        (ty-ap-encode (Weld [(snoc meth (Ix 0 parts))] (drop 1 parts))))
+      (snoc meth nom)))
   ;; Law-valued methods are referenced by name, mirroring elab-ref.
   (define (by-name path tc)
     (If (Eq "TC_LAM" (Hd tc))
@@ -218,12 +263,12 @@
   ;; expanded row shape and its faces.
   (define (score-nom)
     (If (get-const sel sut)
-      (by-name sel (specialize-method (got-entry-tc sel sut) (_3 ty)))
+      (by-name sel (applied-entry-tc sut sel))
       ;; Face access: use the *declared* row specialized by the
       ;; receiver's type arguments — expanding the whole receiver would
       ;; hand the accessor a denormalized face type.
       (let ((decl (If (And (get-const nom sut) (ty:type-entry? nom sut))
-                    (ty:type-specialize sut (got-type nom sut) (_3 ty))
+                    (applied-type sut nom)
                     ty:TBAD)))
         (If (Eq "TROW" (_1 decl))
           (row-meth decl)
@@ -264,13 +309,21 @@
   (define (elab-variant-call tag xs)
     (define ty (ty:TROW tag (map (cork burp-face tc-ty) xs)))
     (tc-row ty (ty:trow-cstr ty) xs))
+  ;; -> [row result-nom] for a constructible type callee, else 0. A
+  ;; TTYP wrapping a /ty-ap nominal resolves through the applied view;
+  ;; the nominal rides along as the construction's result type.
   (define (tc-type-row tc)
     (If (Eq "TC_TYP" (Hd tc))
       (let ((typ (tc-typ-inner tc)))
-        (If (and (Eq (_1 typ) "TTYP")
-              (Eq (_1 (_2 typ)) "TROW"))
-          (_2 typ)
-          0))
+        (If (Nil (Eq (_1 typ) "TTYP"))
+          0
+          (let ((inner (_2 typ)))
+            (cond
+              ((Eq (_1 inner) "TROW") [inner 0])
+              ((Eq (_1 inner) "TNOM")
+                (let ((decl (applied-type sut (_2 inner))))
+                  (If (Eq (_1 decl) "TROW") [decl inner] 0)))
+              (else 0)))))
       0))
   ;; A constructor call's result type is the NOMINAL type when the
   ;; callee is a (possibly specialized) reference to a named type —
@@ -288,12 +341,12 @@
       ((And (Eq "s_spec" (_0 fsurf)) (Eq "s_ref" (_0 (_1 fsurf))))
         (ty:TNOM (surf-ref-path (_1 fsurf)) (map elab-ty (_2 fsurf))))
       (else 0)))
-  (define (elab-type-call fsurf tc xs)
-    (define row (tc-type-row tc))
+  (define (elab-type-call fsurf rown xs)
+    (define row (Ix 0 rown))
     (define fields (ty:trow-vals row))
     (define got (map (cork burp-face tc-ty) xs))
     (define pairs (zip fields got))
-    (define nom (construction-nom fsurf))
+    (define nom (If (Ix 1 rown) (Ix 1 rown) (construction-nom fsurf)))
     (unless (and (Eq (Sz fields) (Sz got))
               (all (uncurry (ty:type-nests? sut)) pairs))
       (elab-error env "constructor call does not match its row type"
@@ -314,11 +367,19 @@
       (Eq (_1 typ) "TBAD"))
     (define (specialize typ)
       (ty:type-specialize sut typ targs))
+    ;; A specialized named type IS its /ty-ap path.
+    (define (nom-spec)
+      (If (Eq "s_ref" (_0 val))
+        (spec-encode (surf-ref-path val) targs)
+        0))
     (If (Eq "TC_TYP" (Hd base))
-      (let ((typ (specialize (_2 (tc-typ-inner base)))))
-        (If (bad-type? typ)
-          (elab-error env "bad specialization" ["got" typ "args" args])
-          (tc-typ (ty:TTYP typ))))
+      (let ((enc (nom-spec)))
+        (If enc
+          (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+          (let ((typ (specialize (_2 (tc-typ-inner base)))))
+            (If (bad-type? typ)
+              (elab-error env "bad specialization" ["got" typ "args" args])
+              (tc-typ (ty:TTYP typ))))))
       (let ((typ (specialize (tc-ty base))))
         (If (bad-type? typ)
           (elab-error env "bad specialization" ["got" typ "args" args])
@@ -330,9 +391,10 @@
     (define ret
       (If variant-call?
         (elab-variant-call (_1 f) exs)
-      (If (tc-type-row tc-f)
-        (elab-type-call f tc-f exs)
-        (on-call tc-f exs))))
+      (let ((rown (tc-type-row tc-f)))
+        (If rown
+          (elab-type-call f rown exs)
+          (on-call tc-f exs)))))
     ret)
   ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
   ;; referee's type): lowering links the referee's compiled pin in by
