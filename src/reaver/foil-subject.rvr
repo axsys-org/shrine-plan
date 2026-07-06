@@ -103,9 +103,71 @@
 
 (define (unpin-soft x)
   (If (IsPin x) (Unpin x) x))
+
+;;; The /ty-ap namespace ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; A specialized generic IS a path: bst[nat] is /ty-ap/1/bst/1/nat — a
+;; length-prefixed list of paths (the generic first, then each type
+;; argument), self-delimiting so applications nest
+;; (bst[list[nat]] = /ty-ap/1/bst/5/ty-ap/1/list/1/nat). Type variables
+;; get their own sub-namespace, /ty-var/<name>, so bst[v] inside a
+;; generic body is also just a path. The subject resolves /ty-ap paths
+;; to the generic's entry; the type layers specialize by the decoded
+;; arguments where types are in play (expansion, reference lookup).
+
+(define ty-ap-tag "ty-ap")
+(define ty-var-tag "ty-var")
+
+(define (ty-ap-path? path)
+  (And (IsApp path) (And (Gt (Sz path) 0) (Eq ty-ap-tag (Ix 0 path)))))
+
+(define (ty-var-path? path)
+  (And (IsApp path) (And (Eq 2 (Sz path)) (Eq ty-var-tag (Ix 0 path)))))
+
+(define (ty-ap-encode paths)
+  (foldl (lambda (acc p) (Weld acc (Weld [(Sz p)] p))) [ty-ap-tag] paths))
+
+;; -> row of paths (generic first, then args), or 0 if malformed.
+;; (the empty row is not an app, so malformed-ness needs a sentinel)
+(define ty-ap-bad "ty-ap-bad")
+(define (ty-ap-decode path)
+  (define n (Sz path))
+  (define (walk i)
+    (If (Ge i n) []
+      (let ((len (Ix i path)))
+        (If (Gt (Add (Inc i) len) n)
+          ty-ap-bad
+          (let ((rest (walk (Add (Inc i) len))))
+            (If (Eq ty-ap-bad rest)
+              ty-ap-bad
+              (Weld [(take len (drop (Inc i) path))] rest)))))))
+  (Ifz (ty-ap-path? path) 0
+    (let ((parts (walk 1)))
+      (If (Eq ty-ap-bad parts) 0 parts))))
+
+assert(Equal ["ty-ap" 1 "bst" 1 "nat"]
+  (ty-ap-encode [["bst"] ["nat"]]))
+assert(Equal [["bst"] ["nat"]]
+  (ty-ap-decode ["ty-ap" 1 "bst" 1 "nat"]))
+assert(Equal [["bst"] ["ty-ap" 1 "list" 1 "nat"]]
+  (ty-ap-decode (ty-ap-encode [["bst"] (ty-ap-encode [["list"] ["nat"]])])))
+assert(Equal 0 (ty-ap-decode ["ty-ap" 9 "bst"]))
+assert(ty-var-path? ["ty-var" "v"])
+
+;; Entry lookup is /ty-ap-transparent: an instantiation resolves to its
+;; generic's entry (same compiled value; the type layers specialize).
+(define (ty-ap-base path)
+  (define parts (ty-ap-decode path))
+  (Ifz parts 0 (Ix 0 parts)))
+
+(define (resolve-path path)
+  (If (ty-ap-path? path)
+    (ty-ap-base path)
+    path))
+
 (define (got-entry path sut)
-  (unpin-soft (gotax path (_0 sut))))
-(define (get-const name sut) (getax name (_0 sut)))
+  (unpin-soft (gotax (resolve-path path) (_0 sut))))
+(define (get-const name sut) (getax (resolve-path name) (_0 sut)))
 (define (got-const name sut) (need (get-const name sut)))
 
 (define (got-entry-tc path sut)
@@ -203,6 +265,14 @@
  got-entry
  get-const
  got-const
+ ty-ap-tag
+ ty-var-tag
+ ty-ap-path?
+ ty-var-path?
+ ty-ap-encode
+ ty-ap-decode
+ ty-ap-base
+ resolve-path
  got-entry-tc
  got-type
  print-path
