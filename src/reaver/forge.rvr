@@ -450,6 +450,88 @@
 
 (define (render-plain v) (render-plain-d 5 v))
 
+;;; Diagnostic rendering — pretty compiler errors for the terminal ;;;;;;;;;;;;;;
+
+(define diag-nl (strcat [10]))
+
+(define (ty-node? v)
+  (And (IsApp v) (And (Gt (Sz v) 1) (Eq "type" (Ix 0 v)))))
+
+;; The head tag of an error payload: apps carry it in Hd; rows have a
+;; zero head, their tag sits at Ix 0.
+(define (diag-tag v)
+  (And (IsApp v)
+    (If (And (IsNat (Hd v)) (Hd v))
+      (Hd v)
+      (And (Gt (Sz v) 0) (Ix 0 v)))))
+
+;; "at" blurbs from elab/sast errors: ["line" l "col" c] or a marker.
+(define (at-text blurb)
+  (If (IsApp blurb)
+    (strcat ["line " (showNat (Ix 1 blurb)) ", col " (showNat (Ix 3 blurb))])
+    "unknown location"))
+
+;; One payload value, prettily: types and tagged paths decode, rows
+;; recurse shallowly, atoms print as themselves.
+(define (diag-val v)
+  (cond
+    ((ty-node? v) (ty-text v))
+    ((And (IsApp v) (And (Eq 2 (Sz v)) (Eq "path" (Ix 0 v))))
+      (path-text (Ix 1 v)))
+    ((IsNat v) (atom-str v))
+    (else
+      (strcat
+        ["(" (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+         ")"]))))
+
+;; A message that may be a bare string or a row of message parts.
+(define (diag-flat v)
+  (If (And (IsApp v) (Nil (ty-node? v)))
+    (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+    (diag-val v)))
+
+;; Details shaped as label/value pairs get an aligned line each;
+;; anything else renders on a single line.  0 means "no detail".
+(define (detail-lines detail)
+  (define (labels? v)
+    (Ifz (Sz v) 1
+      (And (Gt (Sz v) 1)
+        (And (IsNat (_0 v)) (labels? (drop 2 v))))))
+  (define (pair-lines v)
+    (Ifz (Sz v) []
+      (cons (strcat ["  " (atom-str (_0 v)) ": " (diag-val (_1 v))])
+        (pair-lines (drop 2 v)))))
+  (cond
+    ((Ifz detail 1 0) [])
+    ((And (IsApp detail) (labels? detail)) (pair-lines detail))
+    (else [(strcat ["  " (diag-flat detail)])])))
+
+;; Module-pass diagnostics: ["in-decl" name msg blurb].
+(define (in-decl-line d)
+  (strcat ["  in " (path-text (Ix 1 d)) " (" (at-text (Ix 3 d)) "): "
+           (diag-flat (Ix 2 d))]))
+
+;; Pretty lines for a compiler error payload; anything unrecognized
+;; falls back to the plain structural rendering.
+(define (diag-lines e)
+  (define tag (diag-tag e))
+  (cond
+    ((Eq tag "foil-elab-error")
+      (Weld
+        [(diag-flat (Ix 1 e))
+         (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])]
+        (detail-lines (Ix 3 e))))
+    ((Eq tag "foil-sast-error")
+      [(diag-flat (Ix 1 e))
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-type-wf")
+      (cons "types are not well-formed" (map in-decl-line (Ix 1 e))))
+    ((Eq tag "foil-unsupported")
+      (cons "unsupported syntax" (map in-decl-line (Ix 1 e))))
+    (else [(render-plain e)])))
+
+(define (diag-text e) (join-str diag-nl (diag-lines e)))
+
 ;; Decompile a law body back to readable form: 0=self, 1..a=args
 ;; (a b c ...), a+i = let refs (x1 x2 ...), (0 x) quotes, (0 f x) apps.
 (define (render-law-body name arity nlets body)
@@ -566,8 +648,10 @@
 
 (define (diag-pane title err)
   (div [(cls "diag")]
-    [(h2 title)
-     (render-tree 1 err)]))
+    (Weld
+      [(h2 title)]
+      (map (lambda (l) (div no-attrs [(span no-attrs (esc l))]))
+        (diag-lines err)))))
 
 (define (lore-doctests-pane sut lore)
   (define tests (lore-tests lore))
