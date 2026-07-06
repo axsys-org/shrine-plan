@@ -107,37 +107,13 @@
 
 ;;; Well-formedness and substitution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (check-type-wf sut x[_ tag])
-  (define (tag-is y) (Eq y tag))
-  (define recur (check-type-wf sut))
-  (define (check-tfun-args args)
-    (define res (filter is-left? (map (check-type-wf sut) args)))
-    (Ifz (Sz res) (right 0) (_0 res)))
-  (define (type-and x y) (If (is-left? x) x y))
-  (cond
-    ((tag-is "TVAR")
-     (Ifz (sut-get-tvar? (_2 x)) (left "unbound ty var") (right 0)))
-     ((tag-is "TFUN")
-       (type-and (check-tfun-args (tfun-args x)) (recur (tfun-ret x))))
-     ((tag-is "TNOM") (Ifz (get-const (_2 x) sut) (left "bad type reference")
-         (right 0)))
-     ((tag-is "TFAC") (recur (_3 x)))
-     ((tag-is "TPIN") (recur (tpin-val x)))
-     ((tag-is "TARR") (recur (_2 x)))
-     ((tag-is "TNAT") (right 0))
-     ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
-     ((tag-is "TSUM") (check-tfun-args (_2 x)))
-     ((tag-is "TROW")
-       (type-and
-         (If (type-row-cstr? (trow-cstr x))
-           (right 0)
-           (left "bad row constructor"))
-         (check-tfun-args (trow-vals x))))
-     ((tag-is "TSELF") (recur (tself-val x)))
-     ((tag-is "TTYP") (recur (_2 x)))
-     ;; Remaining tags (TANY, TBOT, TBAD) are leaves.
-     (else (right 0))))
+;; check-type-wf lives after mold-to-span (its sum check expands
+;; options) — see below.
 
+;; Deep search for a TVAR node; fences substitution capture.
+(define (type-has-tvar? v x)
+  (If (Equal (TVAR v) x) 1
+    (If (IsApp x) (any (type-has-tvar? v) x) 0)))
 
 (define (subst-type name repl ty[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -150,7 +126,13 @@
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
     ((tag-is "TARR") (TARR (recur (_2 ty))))
     ((tag-is "TNAT") ty)
-    ((tag-is "TQUA") (If (Eq (_2 ty) name) ty (TQUA (_2 ty) (recur (_3 ty)))))
+    ((tag-is "TQUA")
+      (cond
+        ((Eq (_2 ty) name) ty)
+        ((type-has-tvar? (_2 ty) repl)
+          ;; substituting under this binder would capture repl's variable
+          (error ("subst-type capture" (_2 ty) name repl)))
+        (else (TQUA (_2 ty) (recur (_3 ty))))))
     ((tag-is "TSUM") (TSUM (map recur (_2 ty))))
     ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
     ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
@@ -362,6 +344,92 @@
 
 (define (type-entry? path sut)
   (Eq (Hd (got-entry-tc path sut)) "TC_TYP"))
+
+;; The arity of a generic: TQUA binders wrapping the type (skipping
+;; TFAC/TSELF, mirroring type-specialize-span's traversal).
+(define (count-tqua ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (Inc (count-tqua (_3 ty))))
+    ((Eq tag "TFAC") (count-tqua (tfac-val ty)))
+    ((Eq tag "TSELF") (count-tqua (tself-val ty)))
+    (else 0)))
+
+(define (check-type-wf sut x[_ tag])
+  (define (tag-is y) (Eq y tag))
+  (define recur (check-type-wf sut))
+  (define (check-tfun-args args)
+    (define res (filter is-left? (map (check-type-wf sut) args)))
+    (Ifz (Sz res) (right 0) (_0 res)))
+  (define (type-and x y) (If (is-left? x) x y))
+  ;; A nominal ref may be a /ty-var path, a /ty-ap application (whose
+  ;; base must be a type of matching arity and whose argument paths must
+  ;; themselves be well-formed), or a plain path.
+  (define (check-nom-ref ref)
+    (cond
+      ((ty-var-path? ref)
+        (Ifz (sut-get-tvar? (Ix 1 ref) sut)
+          (left "unbound ty var in type application")
+          (right 0)))
+      ((ty-ap-path? ref)
+        (let ((parts (ty-ap-decode ref)))
+          (Ifz parts
+            (left "malformed type application path")
+            (let* ((base (Ix 0 parts))
+                   (targs (drop 1 parts)))
+              (cond
+                ((Nil (get-const base sut)) (left "bad type reference"))
+                ((Nil (type-entry? base sut))
+                  (left "type application of a non-type"))
+                ((Ne (count-tqua (got-type base sut)) (Sz targs))
+                  (left "wrong number of type arguments"))
+                (else
+                  (let ((bad (filter is-left? (map check-nom-ref targs))))
+                    (Ifz (Sz bad) (right 0) (_0 bad)))))))))
+      (else
+        (Ifz (get-const ref sut) (left "bad type reference") (right 0)))))
+  ;; Lowered match tests dispatch on constructor head + arity only, so a
+  ;; sum whose options agree on both is unmatchable — reject at the type.
+  (define (strip-fac t)
+    (cond
+      ((Eq (_1 t) "TFAC") (strip-fac (tfac-val t)))
+      ((Eq (_1 t) "TSELF") (strip-fac (tself-val t)))
+      (else t)))
+  (define (opt-key o)
+    (define s (strip-fac (mold-to-span sut o)))
+    (If (Eq "TROW" (_1 s))
+      ["key" (trow-cstr s) (Sz (trow-vals s))]
+      0))
+  (define (dup-key keys)
+    (Ifz keys 0
+      (Or (And (_0 keys) (includes (Equal (_0 keys)) (drop 1 keys)))
+        (dup-key (drop 1 keys)))))
+  (define (check-sum-opts opts)
+    (If (dup-key (map opt-key opts))
+      (left "sum options collide on constructor+arity")
+      (right 0)))
+  (cond
+    ((tag-is "TVAR")
+     (Ifz (sut-get-tvar? (_2 x) sut) (left "unbound ty var") (right 0)))
+     ((tag-is "TFUN")
+       (type-and (check-tfun-args (tfun-args x)) (recur (tfun-ret x))))
+     ((tag-is "TNOM") (check-nom-ref (_2 x)))
+     ((tag-is "TFAC") (recur (_3 x)))
+     ((tag-is "TPIN") (recur (tpin-val x)))
+     ((tag-is "TARR") (recur (_2 x)))
+     ((tag-is "TNAT") (right 0))
+     ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
+     ((tag-is "TSUM")
+       (type-and (check-tfun-args (_2 x)) (check-sum-opts (_2 x))))
+     ((tag-is "TROW")
+       (type-and
+         (If (type-row-cstr? (trow-cstr x))
+           (right 0)
+           (left "bad row constructor"))
+         (check-tfun-args (trow-vals x))))
+     ((tag-is "TSELF") (recur (tself-val x)))
+     ((tag-is "TTYP") (recur (_2 x)))
+     ;; Remaining tags (TANY, TBOT, TBAD) are leaves.
+     (else (right 0))))
 
 (define (find-type-name-for-span sut span[_ tag])
   (define (matches path)
@@ -653,6 +721,7 @@
 
 (#export
  check-type-wf
+ count-tqua
  subst-type
  path-to-ty
  ty-to-path

@@ -92,9 +92,15 @@
   (define tc (got-entry-tc path sut))
   (If (ty-ap-path? path)
     (let ((parts (ty-ap-decode path)))
-      (let ((typ (ty:type-specialize sut (tc-ty tc)
-                   (map ty:path-to-ty (drop 1 parts)))))
-        (If (Eq "TBAD" (_1 typ)) tc (set-tc-ty typ tc))))
+      ;; A monomorphic member of a generic has nothing to specialize;
+      ;; past that, a failed specialization is an error, not a fallback.
+      (Ifz (ty:count-tqua (tc-ty tc))
+        tc
+        (let ((typ (ty:type-specialize sut (tc-ty tc)
+                     (map ty:path-to-ty (drop 1 parts)))))
+          (If (Eq "TBAD" (_1 typ))
+            (error ("cannot specialize entry" path typ))
+            (set-tc-ty typ tc)))))
     tc))
 
 ;; Encode a specialization as a /ty-ap path: 0 if an argument type is
@@ -241,8 +247,12 @@
       tc))
   (define (specialize-method tc args)
     (Ifz args tc
-      (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
-        (If (Eq "TBAD" (_1 typ)) tc (set-tc-ty typ tc)))))
+      (Ifz (ty:count-tqua (tc-ty tc))
+        tc
+        (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
+          (If (Eq "TBAD" (_1 typ))
+            (error ("cannot specialize method" meth typ))
+            (set-tc-ty typ tc))))))
   (define (row-item-type row)
     (Ifz (ty:trow-vals row)
       ty:TANY
@@ -373,13 +383,19 @@
         (spec-encode (surf-ref-path val) targs)
         0))
     (If (Eq "TC_TYP" (Hd base))
-      (let ((enc (nom-spec)))
-        (If enc
-          (tc-typ (ty:TTYP (ty:TNOM enc 0)))
-          (let ((typ (specialize (_2 (tc-typ-inner base)))))
-            (If (bad-type? typ)
-              (elab-error env "bad specialization" ["got" typ "args" args])
-              (tc-typ (ty:TTYP typ))))))
+      ;; The /ty-ap encoding shortcut below never runs type-specialize,
+      ;; so check the argument count against the generic's arity here.
+      (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
+        (If (Ne quas (Sz targs))
+          (elab-error env "wrong number of type arguments"
+            ["want" quas "got" (Sz targs)])
+          (let ((enc (nom-spec)))
+            (If enc
+              (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+              (let ((typ (specialize (_2 (tc-typ-inner base)))))
+                (If (bad-type? typ)
+                  (elab-error env "bad specialization" ["got" typ "args" args])
+                  (tc-typ (ty:TTYP typ))))))))
       (let ((typ (specialize (tc-ty base))))
         (If (bad-type? typ)
           (elab-error env "bad specialization" ["got" typ "args" args])
@@ -492,9 +508,16 @@
     (define head-tc (elab-var [0 (_0 els)]))
     (elab-meth-go head-tc (drop 1 els)))
   (define (elab-arm scr-ty a[_ pat val])
-    (define ty (ty:type-meet sut scr-ty (elab-ty pat)))
-    (define res (elab-val sut (push-local-env env ty) val))
-    (tc-arm (tc-ty res) ty res))
+    (define pat-ty (elab-ty pat))
+    (define ty (ty:type-meet sut scr-ty pat-ty))
+    ;; Lowered arm tests dispatch on constructor head + arity; a pattern
+    ;; that doesn't narrow the scrutinee to a row has no such key.
+    (define span (burp-face (ty:mold-to-span sut ty)))
+    (unless (Eq "TROW" (_1 span))
+      (elab-error env "match arm pattern is not a row (constructor) type"
+        ["pattern" pat-ty "narrowed" ty])
+      (let ((res (elab-val sut (push-local-env env ty) val)))
+        (tc-arm (tc-ty res) ty res))))
   ;; Lowered arm tests dispatch on constructor head + arity only
   ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
   ;; would silently shadow each other.  Reject them here instead.
@@ -687,12 +710,10 @@
   ;; follow them, so checking at insert time is too early).
   (define (wf-entry sut1 diags ent[_ name span body])
     (define entry-tc (got-entry-tc name sut1))
-    (Ifz (Eq "TC_TYP" (Hd entry-tc))
-      diags
-      (let ((res (ty:check-type-wf sut1 (got-type name sut1))))
-        (If (Eq "left" (Hd res))
-          (snoc ["in-decl" name (_0 res) (span-blurb span)] diags)
-          diags))))
+    (define res (ty:check-type-wf sut1 (tc-ty entry-tc)))
+    (If (Eq "left" (Hd res))
+      (snoc ["in-decl" name (_0 res) (span-blurb span)] diags)
+      diags))
   (define diags (foldl scan-entry [] mod))
   (Ifz (Sz diags)
     (let ((sut1 (foldl elab-entry sut mod)))
