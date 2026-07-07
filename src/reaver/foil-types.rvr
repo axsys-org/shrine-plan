@@ -157,58 +157,6 @@
 
 ;;; Span nesting and type application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (type-nests-span? sup sub)
-  (define stag (_1 sup))
-  (define subtag (_1 sub))
-  (define (opt-has-sub opt) (type-nests-span? opt sub))
-  (define (sup-has-opt opt) (type-nests-span? sup opt))
-  (define (row-nests? a b)
-    (and (Eq (trow-cstr a) (trow-cstr b))
-      (and (Eq (Sz (trow-vals a)) (Sz (trow-vals b)))
-        (all (uncurry type-nests-span?)
-          (zip (trow-vals a) (trow-vals b))))))
-  (define (arr-nests-row? arr row)
-    (And (Eq 0 (trow-cstr row))
-      (all (type-nests-span? (_2 arr)) (trow-vals row))))
-  (define (law-type? ty)
-    (Eq "TFUN" (_1 ty)))
-  (define (pin-law-nests? pin other)
-    (And (law-type? (tpin-val pin))
-      (type-nests-span? (tpin-val pin) other)))
-  ;; Functions: arguments are contravariant (the subtype's parameters
-  ;; must accept everything the supertype's do), returns covariant.
-  ;; The TFAC cases above make faces transparent on both sides.
-  (define (fun-nests? sup sub)
-    (and (Eq (tfun-ari sup) (tfun-ari sub))
-      (and (all (uncurry (flip type-nests-span?))
-             (zip (tfun-args sup) (tfun-args sub)))
-        (type-nests-span? (tfun-ret sup) (tfun-ret sub)))))
-  (cond
-    ((Equal sup sub) 1)
-    ((Eq stag "TANY") 1)
-    ((Eq subtag "TANY") 1)
-    ((Eq subtag "TBOT") 1)
-    ((Eq stag "TFAC") (type-nests-span? (tfac-val sup) sub))
-    ((Eq subtag "TFAC") (type-nests-span? sup (tfac-val sub)))
-    ((And (Eq stag "TPIN") (Eq subtag "TPIN"))
-      (type-nests-span? (tpin-val sup) (tpin-val sub)))
-    ((and (Eq stag "TARR") (Eq subtag "TARR"))
-      (type-nests-span? (_2 sup) (_2 sub)))
-    ((and (Eq stag "TARR") (Eq subtag "TROW"))
-      (arr-nests-row? sup sub))
-    ((and (Eq stag "TFUN") (Eq subtag "TFUN")) (fun-nests? sup sub))
-    ((and (Eq stag "TROW") (Eq subtag "TROW")) (row-nests? sup sub))
-    ;; Sums dispatch before the lone-TPIN pin-law cases: a sum
-    ;; supertype must check its options against a pinned subtype
-    ;; (pin-law-nests? only understands pinned laws and would veto).
-    ((and (Eq stag "TSUM") (Eq subtag "TSUM")) (all sup-has-opt (tsum-opts sub)))
-    ((Eq stag "TSUM") (any opt-has-sub (tsum-opts sup)))
-    ((Eq subtag "TSUM") (all sup-has-opt (tsum-opts sub)))
-    ((Eq stag "TPIN") (pin-law-nests? sup sub))
-    ((Eq subtag "TPIN") (pin-law-nests? sub sup))
-    ((and (Eq stag "TNAT") (Eq subtag "TNAT"))
-      (or (Eq 0 (_2 sup)) (Eq (_2 sup) (_2 sub))))
-    (else 0)))
 (define (ty-match name x) (And (Eq (_1 x) "TVAR") (Eq (_2 x) name)))
 (define (find-tvar name args) (find-idx (ty-match name) args))
 (define (find-inferred-tvar name wants gots)
@@ -239,63 +187,6 @@
           (map (infer (_2 want)) (trow-vals got))))
       (else 0)))
   (first-some (map (uncurry infer) (zip wants gots))))
-
-(define (type-apply-span f x)
-  ;; just try and expand this easy case
-  ;; combined with the UFCS should get 90% of polymorphism
-  (define (type-apply-qua f x)
-    (define name (_2 f))
-    (define fun (_3 f))
-    (define first-arg[idx] (find-tvar name (tfun-args fun)))
-    (define (infer-first-pin)
-      (Ifz x 0
-        (Ifz (tfun-args fun) 0
-          (let ((want (_0 (tfun-args fun)))
-                (got (_0 x)))
-            (If (And (Eq "TPIN" (_1 want))
-                  (And (Eq "TPIN" (_1 got))
-                    (ty-match name (tpin-val want))))
-              [(tpin-val got)]
-              0)))))
-    (define inferred
-      (Or (infer-first-pin)
-        (find-inferred-tvar name (tfun-args fun) x)))
-    (define result
-      (subst-type name x fun))
-    (unless
-      (Eq (_1 fun) "TFUN")
-      (TBAD ["too complicated" f x])
-      (Ifz first-arg
-        (Ifz inferred
-          (TBAD ["failed to resolve polymorphism by arguments, please specify"
-                 f x])
-          (type-apply-span (subst-type name (_0 inferred) fun) x))
-        (If (Lt idx (Sz x))
-          (type-apply-span (subst-type name (Ix idx x) fun) x)
-          (TBAD ["polymorphism not first arg" f x])))))
-  (define (f-hd y) (Eq (_1 f) y))
-  (define (type-apply-fun args ret x)
-    (If (type-nests-span? (_0 args) x)
-        (If (Eq 1 (Sz args)) ret
-          (TFUN (drop 1 args) ret))
-        (TBAD ["nest-fail" (_0 args) x])))
-  (Ifz x f
-    (cond
-    ;; Quantified: infer the variable from the arguments (first-arg or
-    ;; structural inference); explicit specialization is the fallback
-    ;; error inside, not the first answer.
-    ((f-hd "TQUA") (type-apply-qua f x))
-    ((f-hd "TFAC") (type-apply-span (_3 f) x))
-    ((f-hd "TPIN")
-      (If (Eq "TFUN" (_1 (tpin-val f)))
-        (type-apply-span (tpin-val f) x)
-        (TBAD ["pinned non-law apply" f x])))
-    ((f-hd "TSELF") (type-apply-span (tself-val f) x))
-    ((f-hd "TFUN")
-      (type-apply-span (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
-    ((f-hd "TBAD") f)
-    (else (TBAD ["weird apply" f x])))))
-
 ;;; Mold/span conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (name-row-span name span[_ tag])
@@ -362,6 +253,128 @@
     ((Eq tag "TFAC") (count-tqua (tfac-val ty)))
     ((Eq tag "TSELF") (count-tqua (tself-val ty)))
     (else 0)))
+
+
+;; Coinductive span subtyping: /ty-ap TNOM residues (seen-cuts, join
+;; embeddings) unfold on demand, and a revisited (sup, sub) pair is
+;; success — the standard equirecursive construction, so unrolling
+;; offsets never matter.
+(define (type-nests-span? sut seen sup[_ stag] sub[_ subtag])
+  (define (recur a b) (type-nests-span? sut seen a b))
+  (define (opt-has-sub opt) (recur opt sub))
+  (define (sup-has-opt opt) (recur sup opt))
+  (define (row-nests? a b)
+    (and (Eq (trow-cstr a) (trow-cstr b))
+      (and (Eq (Sz (trow-vals a)) (Sz (trow-vals b)))
+        (all (uncurry recur)
+          (zip (trow-vals a) (trow-vals b))))))
+  (define (arr-nests-row? arr row)
+    (And (Eq 0 (trow-cstr row))
+      (all (recur (_2 arr)) (trow-vals row))))
+  (define (law-type? ty)
+    (Eq "TFUN" (_1 ty)))
+  (define (pin-law-nests? pin other)
+    (And (law-type? (tpin-val pin))
+      (recur (tpin-val pin) other)))
+  ;; Functions: arguments are contravariant (the subtype's parameters
+  ;; must accept everything the supertype's do), returns covariant.
+  ;; The TFAC cases above make faces transparent on both sides.
+  (define (fun-nests? sup sub)
+    (and (Eq (tfun-ari sup) (tfun-ari sub))
+      (and (all (uncurry (flip recur))
+             (zip (tfun-args sup) (tfun-args sub)))
+        (recur (tfun-ret sup) (tfun-ret sub)))))
+  (define (unfold t)
+    (If (Eq (_1 t) "TNOM") (mold-to-span sut t) t))
+  (cond
+    ((Equal sup sub) 1)
+    ((Eq stag "TANY") 1)
+    ((Eq subtag "TANY") 1)
+    ((Eq subtag "TBOT") 1)
+    ((Eq stag "TFAC") (recur (tfac-val sup) sub))
+    ((Eq subtag "TFAC") (recur sup (tfac-val sub)))
+    ((Or (Eq stag "TNOM") (Eq subtag "TNOM"))
+      (let ((key [sup sub]))
+        (If (includes (Equal key) seen)
+          1
+          (type-nests-span? sut (snoc key seen)
+            (unfold sup) (unfold sub)))))
+    ((And (Eq stag "TPIN") (Eq subtag "TPIN"))
+      (recur (tpin-val sup) (tpin-val sub)))
+    ((and (Eq stag "TARR") (Eq subtag "TARR"))
+      (recur (_2 sup) (_2 sub)))
+    ((and (Eq stag "TARR") (Eq subtag "TROW"))
+      (arr-nests-row? sup sub))
+    ((and (Eq stag "TFUN") (Eq subtag "TFUN")) (fun-nests? sup sub))
+    ((and (Eq stag "TROW") (Eq subtag "TROW")) (row-nests? sup sub))
+    ;; Sums dispatch before the lone-TPIN pin-law cases: a sum
+    ;; supertype must check its options against a pinned subtype
+    ;; (pin-law-nests? only understands pinned laws and would veto).
+    ((and (Eq stag "TSUM") (Eq subtag "TSUM")) (all sup-has-opt (tsum-opts sub)))
+    ((Eq stag "TSUM") (any opt-has-sub (tsum-opts sup)))
+    ((Eq subtag "TSUM") (all sup-has-opt (tsum-opts sub)))
+    ((Eq stag "TPIN") (pin-law-nests? sup sub))
+    ((Eq subtag "TPIN") (pin-law-nests? sub sup))
+    ((and (Eq stag "TNAT") (Eq subtag "TNAT"))
+      (or (Eq 0 (_2 sup)) (Eq (_2 sup) (_2 sub))))
+    (else 0)))
+
+(define (type-apply-span sut f x)
+  ;; just try and expand this easy case
+  ;; combined with the UFCS should get 90% of polymorphism
+  (define (type-apply-qua f x)
+    (define name (_2 f))
+    (define fun (_3 f))
+    (define first-arg[idx] (find-tvar name (tfun-args fun)))
+    (define (infer-first-pin)
+      (Ifz x 0
+        (Ifz (tfun-args fun) 0
+          (let ((want (_0 (tfun-args fun)))
+                (got (_0 x)))
+            (If (And (Eq "TPIN" (_1 want))
+                  (And (Eq "TPIN" (_1 got))
+                    (ty-match name (tpin-val want))))
+              [(tpin-val got)]
+              0)))))
+    (define inferred
+      (Or (infer-first-pin)
+        (find-inferred-tvar name (tfun-args fun) x)))
+    (define result
+      (subst-type name x fun))
+    (unless
+      (Eq (_1 fun) "TFUN")
+      (TBAD ["too complicated" f x])
+      (Ifz first-arg
+        (Ifz inferred
+          (TBAD ["failed to resolve polymorphism by arguments, please specify"
+                 f x])
+          (type-apply-span sut (subst-type name (_0 inferred) fun) x))
+        (If (Lt idx (Sz x))
+          (type-apply-span sut (subst-type name (Ix idx x) fun) x)
+          (TBAD ["polymorphism not first arg" f x])))))
+  (define (f-hd y) (Eq (_1 f) y))
+  (define (type-apply-fun args ret x)
+    (If (type-nests-span? sut [] (_0 args) x)
+        (If (Eq 1 (Sz args)) ret
+          (TFUN (drop 1 args) ret))
+        (TBAD ["nest-fail" (_0 args) x])))
+  (Ifz x f
+    (cond
+    ;; Quantified: infer the variable from the arguments (first-arg or
+    ;; structural inference); explicit specialization is the fallback
+    ;; error inside, not the first answer.
+    ((f-hd "TQUA") (type-apply-qua f x))
+    ((f-hd "TFAC") (type-apply-span sut (_3 f) x))
+    ((f-hd "TPIN")
+      (If (Eq "TFUN" (_1 (tpin-val f)))
+        (type-apply-span sut (tpin-val f) x)
+        (TBAD ["pinned non-law apply" f x])))
+    ((f-hd "TSELF") (type-apply-span sut (tself-val f) x))
+    ((f-hd "TFUN")
+      (type-apply-span sut
+        (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
+    ((f-hd "TBAD") f)
+    (else (TBAD ["weird apply" f x])))))
 
 (define (check-type-wf sut x[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -450,7 +463,36 @@
      ;; Remaining tags (TANY, TBOT, TBAD) are leaves.
      (else (right 0))))
 
-(define (find-type-name-for-span sut span[_ tag])
+;; Binder names of a generic's TQUA chain, outermost first (skipping
+;; faces/self, mirroring count-tqua's traversal).
+(define (tqua-names ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (Weld [(_2 ty)] (tqua-names (_3 ty))))
+    ((Eq tag "TFAC") (tqua-names (tfac-val ty)))
+    ((Eq tag "TSELF") (tqua-names (tself-val ty)))
+    (else [])))
+
+;; The body under the binders (same unwrap).
+(define (tqua-body ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (tqua-body (_3 ty)))
+    ((Eq tag "TFAC") (tqua-body (tfac-val ty)))
+    ((Eq tag "TSELF") (tqua-body (tself-val ty)))
+    (else ty)))
+
+;; A recovered argument path must be expandable before the acceptance
+;; check expands it: ty-to-path mints ["nat"] from a bare TNAT span and
+;; nothing guarantees the subject binds it.
+(define (inst-path-ok? sut p)
+  (cond
+    ((ty-var-path? p) 1)
+    ((ty-ap-path? p)
+      (let ((parts (ty-ap-decode p)))
+        (Ifz parts 0 (all (lambda (q) (inst-path-ok? sut q)) parts))))
+    (else
+      (Ifz (get-const p sut) 0 (type-entry? p sut)))))
+
+(define (find-exact-name-for-span sut span[_ tag])
   (define (matches path)
     (If (Nil (type-entry? path sut))
       0
@@ -458,6 +500,146 @@
   (If (or (Eq tag "TROW") (Eq tag "TSUM"))
     (find matches (subject-order sut))
     0))
+
+;; An instantiation g[args] has no subject entry (the /ty-ap namespace
+;; is virtual), so its expansion needs recovery: for each generic type
+;; entry whose declared body head matches the span's shape, unify the
+;; generic's SELF-instantiation template (g[v1..vn], tvars in place —
+;; the same span gen-accessors' self-ty produces) against the span.
+;; Template tvars solve to argument paths; every occurrence must agree;
+;; the recovered application must expand back to exactly this span.
+;; -> 0 | [encoded-path], boxed like find-exact-name-for-span.
+(define (find-inst-name-for-span sut span[_ tag])
+  ;; Path of a concrete sub-span standing where a template tvar is:
+  ;; leaf paths directly, named/instantiation spans by (recursive)
+  ;; recovery.  -> path | 0.
+  (define (span-arg-path got)
+    (define direct (ty-to-path got))
+    (define gtag (_1 got))
+    (If direct
+      direct
+      (If (Or (Eq gtag "TSUM")
+            (And (Eq gtag "TROW") (Nil (Eq 0 (trow-cstr got)))))
+        (let ((exact (find-exact-name-for-span sut got)))
+          (Ifz exact
+            (let ((rec (find-inst-name-for-span sut got)))
+              (Ifz rec 0 (_0 rec)))
+            (_0 exact)))
+        0)))
+  ;; Unify template vs concrete span.  sols: row of [name path];
+  ;; -> 0 | [sols].  Strict and symmetric outside tvar positions.
+  (define (unify vars tmpl[_ ttag] got[_ gtag] sols)
+    (define (var-name t)
+      (If (And (Eq "TVAR" (_1 t)) (includes (Eq (_2 t)) vars)) (_2 t) 0))
+    (define (bind name path s)
+      (define hit (find (lambda (b) (Eq name (_0 b))) s))
+      (Ifz hit
+        [(snoc [name path] s)]
+        (If (Equal path (_1 (_0 hit))) [s] 0)))
+    (define (go-row ts gs s)
+      (Ifz (Sz ts) [s]
+        (let ((r (unify vars (_0 ts) (_0 gs) s)))
+          (Ifz r 0 (go-row (drop 1 ts) (drop 1 gs) (_0 r))))))
+    (define (go-path tp gp s)
+      (define (walk tps gps s1)
+        (Ifz (Sz tps) [s1]
+          (let ((r (go-path (_0 tps) (_0 gps) s1)))
+            (Ifz r 0 (walk (drop 1 tps) (drop 1 gps) (_0 r))))))
+      (cond
+        ((And (ty-var-path? tp) (includes (Eq (Ix 1 tp)) vars))
+          (bind (Ix 1 tp) gp s))
+        ((Equal tp gp) [s])
+        ((And (ty-ap-path? tp) (ty-ap-path? gp))
+          (let ((tparts (ty-ap-decode tp))
+                (gparts (ty-ap-decode gp)))
+            (cond
+              ((Ifz tparts 1 (Ifz gparts 1 0)) 0)
+              ((Ne (Sz tparts) (Sz gparts)) 0)
+              ((Nil (Equal (Ix 0 tparts) (Ix 0 gparts))) 0)
+              (else (walk (drop 1 tparts) (drop 1 gparts) s)))))
+        (else 0)))
+    (cond
+      ((var-name tmpl)
+        (let ((p (span-arg-path got)))
+          (Ifz p 0 (bind (var-name tmpl) p sols))))
+      ((And (Eq ttag "TROW") (Eq gtag "TROW"))
+        (If (And (Equal (trow-cstr tmpl) (trow-cstr got))
+              (Eq (Sz (trow-vals tmpl)) (Sz (trow-vals got))))
+          (go-row (trow-vals tmpl) (trow-vals got) sols)
+          0))
+      ((And (Eq ttag "TSUM") (Eq gtag "TSUM"))
+        ;; Both sides are TSUM-canonical; wf sums order their options
+        ;; content-independently (cstr decides, then arity), so
+        ;; positional matching aligns.  The acceptance check backstops.
+        (If (Eq (Sz (tsum-opts tmpl)) (Sz (tsum-opts got)))
+          (go-row (tsum-opts tmpl) (tsum-opts got) sols)
+          0))
+      ((And (Eq ttag "TNOM") (Eq gtag "TNOM"))
+        (go-path (tnom-ref tmpl) (tnom-ref got) sols))
+      ((And (Eq ttag "TFAC") (Eq gtag "TFAC"))
+        (If (Eq (_2 tmpl) (_2 got))
+          (unify vars (tfac-val tmpl) (tfac-val got) sols)
+          0))
+      ((And (Eq ttag "TPIN") (Eq gtag "TPIN"))
+        (unify vars (tpin-val tmpl) (tpin-val got) sols))
+      ((And (Eq ttag "TARR") (Eq gtag "TARR"))
+        (unify vars (_2 tmpl) (_2 got) sols))
+      ((And (Eq ttag "TFUN") (Eq gtag "TFUN"))
+        (If (Eq (tfun-ari tmpl) (tfun-ari got))
+          (let ((r (go-row (tfun-args tmpl) (tfun-args got) sols)))
+            (Ifz r 0 (unify vars (tfun-ret tmpl) (tfun-ret got) (_0 r))))
+          0))
+      ((Equal tmpl got) [sols])
+      (else 0)))
+  ;; Cheap shape prefilter on the DECLARED body — cstrs are baked
+  ;; constants (name-top-row), and option counts survive substitution
+  ;; (wf forbids same-cstr+same-arity options, so none can collapse).
+  (define (head-ok? body[_ btag])
+    (cond
+      ((And (Eq tag "TROW") (Eq btag "TROW"))
+        (And (Equal (trow-cstr span) (trow-cstr body))
+          (Eq (Sz (trow-vals span)) (Sz (trow-vals body)))))
+      ((And (Eq tag "TSUM") (Eq btag "TSUM"))
+        (Eq (Sz (tsum-opts span)) (Sz (tsum-opts body))))
+      (else 0)))
+  (define (attempt path)
+    (define decl (got-type path sut))
+    (define vars (tqua-names decl))
+    (define (solved sols v)
+      (define hit (find (lambda (b) (Eq v (_0 b))) sols))
+      (Ifz hit 0 (_1 (_0 hit))))
+    (define (accept enc)
+      (If (Equal span (mold-to-span sut (TNOM enc 0))) [enc] 0))
+    (cond
+      ((Eq 0 (Sz vars)) 0)
+      ((Nil (head-ok? (tqua-body decl))) 0)
+      (else
+        (let* ((self-enc
+                 (ty-ap-encode
+                   (Weld [path] (map (lambda (v) [ty-var-tag v]) vars))))
+               (tmpl (mold-to-span sut (TNOM self-enc 0)))
+               (res (unify vars tmpl span 0)))
+          (Ifz res 0
+            (let ((args (map (solved (_0 res)) vars)))
+              (If (any Nil args)
+                0
+                (If (all (lambda (a) (inst-path-ok? sut a)) args)
+                  (accept (ty-ap-encode (Weld [path] args)))
+                  0))))))))
+  (define (scan order)
+    (Ifz (Sz order) 0
+      (If (Nil (type-entry? (_0 order) sut))
+        (scan (drop 1 order))
+        (let ((r (attempt (_0 order))))
+          (Ifz r (scan (drop 1 order)) r)))))
+  (If (Or (Eq tag "TSUM")
+        (And (Eq tag "TROW") (Nil (Eq 0 (trow-cstr span)))))
+    (scan (subject-order sut))
+    0))
+
+(define (find-type-name-for-span sut span)
+  (define exact (find-exact-name-for-span sut span))
+  (Ifz exact (find-inst-name-for-span sut span) exact))
 
 (define (span-to-mold sut ty[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -483,7 +665,11 @@
     ((Eq (_1 sup) "TFAC") (type-nests? sut (tfac-val sup) sub))
     ((Eq (_1 sub) "TFAC") (type-nests? sut sup (tfac-val sub)))
     (else
-      (type-nests-span?
+      ;; The span comparison is coinductive: residual /ty-ap TNOMs
+      ;; unfold on demand with a pair memo, so unrolling offsets
+      ;; (a join result embedding a cut vs a comparand cut at its own
+      ;; top) never matter.
+      (type-nests-span? sut []
         (mold-to-span sut sup)
         (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
 
@@ -507,7 +693,7 @@
   ;; pipeline — that is where inference-by-first-argument lives.
   (define (qua-apply f x)
     (span-to-mold sut
-      (type-apply-span
+      (type-apply-span sut
         (mold-to-span sut f)
         (expand-args (arg-seeds f) x))))
   ;; Everything else applies at the MOLD level: arguments are checked
@@ -751,6 +937,8 @@
 (#export
  check-type-wf
  count-tqua
+ tqua-names
+ tqua-body
  subst-type
  path-to-ty
  ty-to-path
