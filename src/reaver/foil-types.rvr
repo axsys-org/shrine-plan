@@ -241,6 +241,50 @@
     (TROW (print-path name) (trow-vals span))
     span))
 
+;; The arity of a generic: TQUA binders wrapping the type (skipping
+;; TFAC/TSELF, mirroring type-specialize-span's traversal).
+(define (count-tqua ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (Inc (count-tqua (_3 ty))))
+    ((Eq tag "TFAC") (count-tqua (tfac-val ty)))
+    ((Eq tag "TSELF") (count-tqua (tself-val ty)))
+    (else 0)))
+
+;; The const-parameter layers of a generic's type: [[name cty] ...] in
+;; declared order (descending through TQUA/TFAC/TSELF).
+(define (cqua-pairs ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (cqua-pairs (_3 ty)))
+    ((Eq tag "TCQUA") (Weld [[(_2 ty) (_3 ty)]] (cqua-pairs (_4 ty))))
+    ((Eq tag "TFAC") (cqua-pairs (tfac-val ty)))
+    ((Eq tag "TSELF") (cqua-pairs (tself-val ty)))
+    (else [])))
+
+(define (count-cqua ty) (Sz (cqua-pairs ty)))
+
+;; Remove the TCQUA layers along the TQUA/TFAC/TSELF spine (the shape
+;; consumers see once an instantiation has supplied the constants).
+(define (strip-cquas ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (TQUA (_2 ty) (strip-cquas (_3 ty))))
+    ((Eq tag "TCQUA") (strip-cquas (_4 ty)))
+    ((Eq tag "TFAC") (TFAC (_2 ty) (strip-cquas (tfac-val ty))))
+    ((Eq tag "TSELF") (TSELF (strip-cquas (tself-val ty))))
+    (else ty)))
+
+;; Substitute supplied const-argument paths for the parameter names'
+;; /ty-var segments (used after the TCQUA layers strip, so member
+;; return types like map[k lt] become ground once lt is supplied).
+(define (subst-const-args names cargs typ)
+  (foldl (lambda (acc pr) (subst-type (_0 pr) (path-to-ty (_1 pr)) acc))
+    typ (zip names cargs)))
+
+(define (wrap-tcquas pairs typ)
+  (Ifz (Sz pairs)
+    typ
+    (TCQUA (_0 (_0 pairs)) (_1 (_0 pairs))
+      (wrap-tcquas (drop 1 pairs) typ))))
+
 (define (mold-to-span-seen sut seen ty[_ tag])
   (define (tag-is y) (Eq y tag))
   (define recur (mold-to-span-seen sut seen))
@@ -259,9 +303,17 @@
         ty
         (If (ty-ap-path? ref)
           (let* ((parts (ty-ap-decode ref))
+                 (gty (got-type ref sut))
+                 (nt (count-tqua gty))
+                 ;; type args only — const args ride the path but never
+                 ;; substitute into the type; the TCQUA layers strip.
+                 (rest (drop 1 parts))
+                 (cnames (map (Ix 0) (cqua-pairs gty)))
                  (applied-mold
-                   (type-specialize-span (got-type ref sut)
-                     (map path-to-ty (drop 1 parts)))))
+                   (subst-const-args cnames (drop nt rest)
+                     (strip-cquas
+                       (type-specialize-span gty
+                         (map path-to-ty (take (min nt (Sz rest)) rest)))))))
             (name-row-span (Ix 0 parts)
               (mold-to-span-seen sut (snoc ref seen) applied-mold)))
           (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
@@ -292,15 +344,6 @@
 
 (define (type-entry? path sut)
   (Eq (Hd (got-entry-tc path sut)) "TC_TYP"))
-
-;; The arity of a generic: TQUA binders wrapping the type (skipping
-;; TFAC/TSELF, mirroring type-specialize-span's traversal).
-(define (count-tqua ty[_ tag])
-  (cond
-    ((Eq tag "TQUA") (Inc (count-tqua (_3 ty))))
-    ((Eq tag "TFAC") (count-tqua (tfac-val ty)))
-    ((Eq tag "TSELF") (count-tqua (tself-val ty)))
-    (else 0)))
 
 
 ;; Coinductive span subtyping: /ty-ap TNOM residues (seen-cuts, join
@@ -423,34 +466,6 @@
         (type-apply-fun (tfun-args f) (tfun-ret f) (_0 x)) (drop 1 x)))
     ((f-hd "TBAD") f)
     (else (TBAD ["weird apply" f x])))))
-
-;; The const-parameter layers of a generic's type: [[name cty] ...] in
-;; declared order (descending through TQUA/TFAC/TSELF).
-(define (cqua-pairs ty[_ tag])
-  (cond
-    ((Eq tag "TQUA") (cqua-pairs (_3 ty)))
-    ((Eq tag "TCQUA") (Weld [[(_2 ty) (_3 ty)]] (cqua-pairs (_4 ty))))
-    ((Eq tag "TFAC") (cqua-pairs (tfac-val ty)))
-    ((Eq tag "TSELF") (cqua-pairs (tself-val ty)))
-    (else [])))
-
-(define (count-cqua ty) (Sz (cqua-pairs ty)))
-
-;; Remove the TCQUA layers along the TQUA/TFAC/TSELF spine (the shape
-;; consumers see once an instantiation has supplied the constants).
-(define (strip-cquas ty[_ tag])
-  (cond
-    ((Eq tag "TQUA") (TQUA (_2 ty) (strip-cquas (_3 ty))))
-    ((Eq tag "TCQUA") (strip-cquas (_4 ty)))
-    ((Eq tag "TFAC") (TFAC (_2 ty) (strip-cquas (tfac-val ty))))
-    ((Eq tag "TSELF") (TSELF (strip-cquas (tself-val ty))))
-    (else ty)))
-
-(define (wrap-tcquas pairs typ)
-  (Ifz (Sz pairs)
-    typ
-    (TCQUA (_0 (_0 pairs)) (_1 (_0 pairs))
-      (wrap-tcquas (drop 1 pairs) typ))))
 
 (define (check-type-wf sut x[_ tag])
   (define (tag-is y) (Eq y tag))
@@ -1048,6 +1063,7 @@
  cqua-pairs
  count-cqua
  strip-cquas
+ subst-const-args
  wrap-tcquas
  subst-type
  path-to-ty

@@ -143,6 +143,24 @@
     ((rx-juxt? ty) (on-juxt ty))
     (else (sast-error "bad type rex" ty))))
 
+;; Kids of an @ / @@ variable list: bare words declare type vars;
+;; faced kids (name={k k; nat}) declare compile-time-constant
+;; parameters with their types.  -> [vars consts].
+(define (parse-tvar-kids ctx kids)
+  (define (faced? k) (rx-rune? "=" k))
+  (define (bad? k) (Nil (Or (rx-word? k) (faced? k))))
+  (define checked
+    (unless (Nil (any bad? kids))
+      (sast-error "bad type-var declaration" ctx)
+      kids))
+  (define vars (map rx-word-str! (filter rx-word? checked)))
+  (define (parse-const k)
+    (define fk (hr-stem (rx-rune-kids k)))
+    (unless (And (Eq 2 (Sz fk)) (rx-word? (_0 fk)))
+      (sast-error "bad const parameter declaration" ctx)
+      [(rx-word-str! (_0 fk)) (parse-type-sast (_1 fk))]))
+  [vars (map parse-const (filter faced? checked))])
+
 ;;; Value parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (uncurry-call call rest)
@@ -195,8 +213,9 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
 
 (define (parse-val-sast val)
   (define (parse-doc-tvar kids heir)
-    (define vars (map rx-word-str! kids))
-    (surf-tvars vars heir))
+    (define vc[vars consts] (parse-tvar-kids val kids))
+    (surf-tvars vars
+      (Ifz (Sz consts) heir (surf-cvars consts heir))))
   (define (parse-spec kids)
     (surf-spec
       (parse-val-sast (_0 kids))
@@ -412,23 +431,29 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     ;; unused (elab-tvars).
     (define (tvar-kids item)
       (If (rx-rune? "@@" item) (rx-rune-kids item) (rx-nest-kids item)))
-    (define scoped-vars
+    (define scoped-vc
       (foldl
         (lambda (acc it)
-          (Weld acc (map rx-word-str! (hr-stem (tvar-kids it)))))
-        [] tvs))
+          (let ((r (parse-tvar-kids dec (hr-stem (tvar-kids it)))))
+            [(Weld (_0 acc) (_0 r)) (Weld (_1 acc) (_1 r))]))
+        [[] []] tvs))
+    (define scoped-vars (_0 scoped-vc))
+    (define scoped-consts (_1 scoped-vc))
     (define (dup-in? xs)
       (Ifz (Sz xs) 0
         (Or (includes (Eq (_0 xs)) (drop 1 xs)) (dup-in? (drop 1 xs)))))
     (define checked-vars
-      (unless (Nil (dup-in? scoped-vars))
+      (unless (Nil (dup-in? (Weld scoped-vars (map (Ix 0) scoped-consts))))
         (sast-error "duplicate (@@) variable" dec)
         scoped-vars))
     (define (wrap-span-tvars spannode)
       (surf-span (Ix 1 spannode)
-        (surf-tvars checked-vars (Ix 2 spannode))))
+        (surf-tvars checked-vars
+          (Ifz (Sz scoped-consts)
+            (Ix 2 spannode)
+            (surf-cvars scoped-consts (Ix 2 spannode))))))
     (define (wrap-decl-rows rows)
-      (Ifz (Sz checked-vars)
+      (If (And (Ifz (Sz checked-vars) 1 0) (Ifz (Sz scoped-consts) 1 0))
         rows
         (map (lambda (row)
                (If (Eq "s_decl" (_0 row))

@@ -11,6 +11,9 @@
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
+(#bind cairn (#module cairn))
+(#import cairn)
+
 (#bind ty (#module foil-types))
 (#bind cgen (#module codegen))
 
@@ -134,12 +137,132 @@
   (insert-entry-sut key ent1 out))
 
 ;; FFI entries are already runtime values, type entries have no runtime
-;; representation, and IR entries were lowered previously: none of them
-;; need (re-)lowering.
+;; representation, IR entries were lowered previously, and members that
+;; reference const generic parameters cannot lower at the base — their
+;; instantiations materialize (materialize-consts) and lower instead.
 (define (lowerable-entry? ent)
   (define tc (tc-entry-contents ent))
   (And (Eq (Hd ent) "TC")
-    (Nil (Or (Eq (Hd tc) "TC_FFI") (Eq (Hd tc) "TC_TYP")))))
+    (Nil (Or (Eq (Hd tc) "TC_FFI")
+           (Or (Eq (Hd tc) "TC_TYP") (tc-has-cparam? tc))))))
+
+;;; Const-parameter materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; A generic member that uses const parameters keeps its base entry as
+;; a TC (skipped above).  Every GROUND instantiation referenced
+;; anywhere in the module gets a real entry at its full /ty-ap key:
+;; the member's TC with the parameters substituted (a placeholder
+;; becomes the concrete constant; internal /ty-ap references rewrite
+;; their /ty-var segments), inserted into the order immediately before
+;; its first referrer, transitive dependencies first.
+
+;; Does a path contain no /ty-var segments (recursively)?
+(define (path-ground? p)
+  (If (ty-ap-path? p)
+    (let ((parts (ty-ap-decode p)))
+      (Ifz parts 0 (all path-ground? parts)))
+    (Nil (ty-var-path? p))))
+
+;; Rewrite the /ty-var segments of a path per mapping [[name path] ..].
+(define (subst-path-args mapping p)
+  (cond
+    ((ty-var-path? p)
+      (let ((hit (find (lambda (m) (Eq (Ix 1 p) (_0 m))) mapping)))
+        (Ifz hit p (_1 (_0 hit)))))
+    ((ty-ap-path? p)
+      (let ((parts (ty-ap-decode p)))
+        (Ifz parts p
+          (ty-ap-encode (map (lambda (q) (subst-path-args mapping q)) parts)))))
+    (else p)))
+
+;; Substitute concrete const arguments into a member's TC.
+(define (subst-tc mapping sut tc)
+  (define (tag-is x) (And (IsApp tc) (Eq (Hd tc) x)))
+  (define recur (subst-tc mapping sut))
+  (cond
+    ((tag-is "TC_CPARAM")
+      (let ((hit (find (lambda (m) (Eq (tc-cparam-name tc) (_0 m))) mapping)))
+        (Ifz hit
+          (error ["unsubstituted const parameter" (tc-cparam-name tc)])
+          (let ((arg (_1 (_0 hit))))
+            (If (ty-val-path? arg)
+              (tc-lit (ty:TNAT (Ix 1 arg)) (Ix 1 arg))
+              (let ((referee (got-entry-tc arg sut)))
+                (If (Eq "TC_LAM" (Hd referee))
+                  (tc-global (tc-ty referee) arg)
+                  referee)))))))
+    ((tag-is "TC_GLOBAL")
+      (tc-global (tc-ty tc) (subst-path-args mapping (tc-global-path tc))))
+    ((tag-is "TC_APP")
+      (tc-app (tc-ty tc) (recur (tc-app-f tc)) (recur (tc-app-x tc))))
+    ((tag-is "TC_LAM")
+      (tc-lam (tc-ty tc) (Ix 1 tc) (tc-lam-args tc) (recur (tc-lam-body tc))))
+    ((tag-is "TC_ROW")
+      (tc-row (tc-ty tc) (tc-row-hd tc) (map recur (tc-row-items tc))))
+    ((tag-is "TC_MATCH")
+      (tc-match (tc-ty tc) (recur (tc-match-scrut tc))
+        (map recur (tc-match-arms tc))
+        (let ((f (tc-match-fall tc))) (Ifz f 0 (recur f)))))
+    ((tag-is "TC_ARM")
+      (tc-arm (tc-ty tc) (tc-arm-pat tc) (recur (tc-arm-val tc))))
+    ((tag-is "TC_LET")
+      (tc-letrec (tc-ty tc) (map recur (tc-letrec-binds tc))
+        (recur (tc-letrec-body tc))))
+    (else tc)))
+
+;; The ground const-bearing /ty-ap paths a TC references.
+(define (const-deps sut x)
+  (define (dep? p)
+    (And (ty-ap-path? p)
+      (And (path-ground? p)
+        (Ifz (get-const (ty-ap-base p) sut)
+          0
+          (tc-has-cparam? (got-entry-tc (ty-ap-base p) sut))))))
+  (define (go x)
+    (If (IsApp x)
+      (If (And (Eq "TC_GLOBAL" (Hd x)) (dep? (tc-global-path x)))
+        [(tc-global-path x)]
+        (foldl (lambda (acc i) (Weld acc (go (Ix i x))))
+          [] (gen (Sz x) (lambda (i) i))))
+      []))
+  (foldl (lambda (acc d) (If (includes (Equal d) acc) acc (snoc d acc)))
+    [] (go x)))
+
+;; Materialize every referenced ground instantiation: walk the order;
+;; before each referrer, DFS-insert its (transitive) materializations.
+(define (materialize-consts sut)
+  (define (member-mapping key)
+    (define base (ty-ap-base key))
+    (define bty (tc-ty (got-entry-tc base sut)))
+    (define names
+      (Weld (ty:tqua-names bty) (map (Ix 0) (ty:cqua-pairs bty))))
+    (zip names (drop 1 (ty-ap-decode key))))
+  (define (materialize st key)
+    (define ax (_0 st))
+    (define done (_1 st))
+    (define order (_2 st))
+    (If (includes (Equal key) done)
+      st
+      (let* ((base (ty-ap-base key))
+             (bent (unpin-soft (need (getax base ax))))
+             (btc (tc-entry-contents bent))
+             (mtc (subst-tc (member-mapping key) sut btc))
+             (st1 (foldl materialize [ax (snoc key done) order]
+                    (const-deps sut mtc))))
+        [(putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
+           (_0 st1))
+         (_1 st1)
+         (snoc key (_2 st1))])))
+  (define (walk st key)
+    (define ent (unpin-soft (need (getax key (_0 st)))))
+    (define st1
+      (If (Eq (Hd ent) "TC")
+        (foldl materialize st (const-deps sut (tc-entry-contents ent)))
+        st))
+    [(_0 st1) (_1 st1) (snoc key (_2 st1))])
+  (define final
+    (foldl walk [(_0 sut) [] []] (subject-order sut)))
+  (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
 
 (define (lower-tc-mod-go sut out)
   (define n[next sut1] (pop-subject-order sut))

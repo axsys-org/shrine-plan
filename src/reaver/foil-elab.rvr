@@ -40,7 +40,7 @@
 ;; elab-cast, read by nothing) was removed; when checking-mode
 ;; elaboration happens for real it belongs in elab-call's argument
 ;; positions and elab-fun's parameter inference.
-(define empty-env [0 0 0 0 0])
+(define empty-env [0 0 0 0 0 0])
 (define env-locals (Ix 0)) (define set-env-locals (Up 0))
 (define env-diags (Ix 1))
 (define env-name (Ix 2)) (define set-env-name (Up 2))
@@ -48,6 +48,8 @@
 ;; Nearest enclosing source span (set by s_span nodes on the way down);
 ;; used to locate elaboration errors.
 (define env-span (Ix 4)) (define set-env-span (Up 4))
+;; Const generic parameters in scope: [[name declared-type] ...].
+(define env-consts (Ix 5)) (define set-env-consts (Up 5))
 
 ;;; Located errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -83,24 +85,50 @@
 
 (define (applied-type sut path)
   (If (ty-ap-path? path)
-    (let ((parts (ty-ap-decode path)))
-      (ty:type-specialize sut (got-type (Ix 0 parts) sut)
-        (map ty:path-to-ty (drop 1 parts))))
+    (let* ((parts (ty-ap-decode path))
+           (gty (got-type (Ix 0 parts) sut))
+           (nt (ty:count-tqua gty)))
+      ;; type args substitute; const args don't change the type but DO
+      ;; ground its /ty-var segments (member return types like
+      ;; map[k lt]) once the TCQUA layers strip.
+      (ty:subst-const-args
+        (map (Ix 0) (ty:cqua-pairs gty))
+        (drop nt (drop 1 parts))
+        (ty:strip-cquas
+          (ty:type-specialize sut gty
+            (map ty:path-to-ty
+              (take (min nt (Sz (drop 1 parts))) (drop 1 parts)))))))
     (got-type path sut)))
 
 (define (applied-entry-tc sut path)
   (define tc (got-entry-tc path sut))
   (If (ty-ap-path? path)
-    (let ((parts (ty-ap-decode path)))
-      ;; A monomorphic member of a generic has nothing to specialize;
-      ;; past that, a failed specialization is an error, not a fallback.
-      (Ifz (ty:count-tqua (tc-ty tc))
-        tc
-        (let ((typ (ty:type-specialize sut (tc-ty tc)
-                     (map ty:path-to-ty (drop 1 parts)))))
-          (If (Eq "TBAD" (_1 typ))
-            (error ("cannot specialize entry" path typ))
-            (set-tc-ty typ tc)))))
+    (let* ((parts (ty-ap-decode path))
+           (nt (ty:count-tqua (tc-ty tc)))
+           (nc (ty:count-cqua (tc-ty tc)))
+           (supplied-c (Sub (Sub (Sz parts) 1) nt)))
+      ;; A member's const params must all be supplied by the path —
+      ;; there is no inference for constants.
+      (If (Lt supplied-c nc)
+        (error ["member with const parameters requires explicit specialization"
+                ["path" path]])
+        ;; A monomorphic member of a generic has nothing to specialize;
+        ;; past that, a failed specialization is an error, not a
+        ;; fallback.
+        (let* ((cnames (map (Ix 0) (ty:cqua-pairs (tc-ty tc))))
+               (cargs (drop nt (drop 1 parts)))
+               (ground (lambda (typ)
+                         (ty:subst-const-args cnames cargs
+                           (ty:strip-cquas typ)))))
+          (Ifz nt
+            (set-tc-ty (ground (tc-ty tc)) tc)
+            (let ((typ (ty:type-specialize sut (tc-ty tc)
+                         (map ty:path-to-ty
+                           (take (min nt (Sz (drop 1 parts)))
+                             (drop 1 parts))))))
+              (If (Eq "TBAD" (_1 typ))
+                (error ("cannot specialize entry" path typ))
+                (set-tc-ty (ground typ) tc)))))))
     tc))
 
 ;; Encode a specialization as a /ty-ap path: 0 if an argument type is
@@ -152,11 +180,20 @@
         (elab-type-env sut env (surf-fun-ret wav))))
     ((tag-is "s_ref")
       (define path (surf-ref-path wav))
-      (If (And (Eq 1 (Sz path)) (env-has-tvar? (_0 path) env))
-        (ty:TVAR (_0 path))
-        ;; Mounted import names normalize to the entry's canonical
-        ;; path: nominal identity is independent of the written name.
-        (ty:TNOM (canon-path path sut) 0)))
+      (define nm (_0 path))
+      (cond
+        ((And (Eq 1 (Sz path)) (env-has-tvar? nm env)) (ty:TVAR nm))
+        ;; const parameters ride the /ty-var namespace in encodings
+        ((And (Eq 1 (Sz path))
+           (find (lambda (pr) (Eq nm (_0 pr))) (env-consts env)))
+          (ty:TVAR nm))
+        ;; nat literals as const arguments (map[nat 3])
+        ((And (Eq 1 (Sz path)) (str-numeric? nm))
+          (ty:TNAT (parse-nat nm)))
+        (else
+          ;; Mounted import names normalize to the entry's canonical
+          ;; path: nominal identity is independent of the written name.
+          (ty:TNOM (canon-path path sut) 0))))
     ((tag-is "s_variant")
       (ty:TROW (_1 wav) []))
     ((tag-is "s_tapp")
@@ -193,15 +230,17 @@
 ;; For a generic row the accessors are quantified too: the receiver is
 ;; TNOM loc [vars], the fun type is TQUA-wrapped, and score-meth's
 ;; receiver-argument specialization instantiates them at use.
-(define (gen-accessors loc vars items sut)
+(define (gen-accessors loc vars cparams items sut)
   (define faces (ty:collect-faces items))
+  (define param-segs
+    (Weld (map (lambda (v) [ty-var-tag v]) (Ifz vars [] vars))
+      (map (lambda (c) [ty-var-tag (_0 c)]) cparams)))
   (define self-ty
-    (Ifz vars
+    (Ifz (Sz param-segs)
       (ty:TNOM loc 0)
-      (ty:TNOM
-        (ty-ap-encode (Weld [loc] (map (lambda (v) [ty-var-tag v]) vars)))
-        0)))
-  (define (qua typ) (wrap-tquas (Ifz vars 0 vars) typ))
+      (ty:TNOM (ty-ap-encode (Weld [loc] param-segs)) 0)))
+  (define (qua typ)
+    (wrap-tquas (Ifz vars 0 vars) (ty:wrap-tcquas cparams typ)))
   (define (go sut arg[idx fac ty])
     (define get-tc (tc-ffi (qua (ty:TFUN [self-ty] ty)) (Ix idx)))
     (define set-tc
@@ -253,8 +292,12 @@
              (mpath (snoc meth base)))
         (Ifz (get-const mpath sut)
           mpath
-          (let* ((pnames (ty:tqua-names (got-type base sut)))
-                 (mnames (ty:tqua-names (tc-ty (got-entry-tc mpath sut))))
+          (let* ((param-names
+                   (lambda (ty)
+                     (Weld (ty:tqua-names ty)
+                       (map (Ix 0) (ty:cqua-pairs ty)))))
+                 (pnames (param-names (got-type base sut)))
+                 (mnames (param-names (tc-ty (got-entry-tc mpath sut))))
                  (kept (filter (lambda (pr) (includes (Eq (_0 pr)) mnames))
                          (zip pnames (drop 1 parts)))))
             (Ifz (Sz kept)
@@ -400,7 +443,11 @@
       (set-tc-ty ty app)))
   (define (elab-spec s[_ val args])
     (define base (elab-val sut env val))
-    (define targs (map elab-ty args))
+    (define bty0
+      (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
+    (define cpairs (ty:cqua-pairs bty0))
+    (define nt0 (ty:count-tqua bty0))
+    (define targs (map elab-ty (take nt0 args)))
     (define (bad-type? typ)
       (Eq (_1 typ) "TBAD"))
     (define (specialize typ)
@@ -415,7 +462,76 @@
         ((Eq "s_var" (_0 val))
           (spec-encode sut [(_1 val)] targs))
         (else 0)))
-    (If (Eq "TC_TYP" (Hd base))
+    ;; --- const-bearing generics: full explicit spec, values checked
+    ;; against their declared types (with the instantiation's type args
+    ;; substituted in), the reference rewritten to the full /ty-ap key.
+    (define (subst-cty cty)
+      (foldl (lambda (acc pr) (ty:subst-type (_0 pr) (_1 pr) acc))
+        cty (zip (ty:tqua-names bty0) targs)))
+    (define (const-arg-path a cty)
+      (If (Nil (Eq "s_ref" (_0 a)))
+        (elab-error env "const argument must be a name or nat literal" a)
+        (let* ((path (surf-ref-path a))
+               (nm (_0 path))
+               (chit (And (Eq 1 (Sz path))
+                       (find (lambda (pr) (Eq nm (_0 pr))) (env-consts env)))))
+          (cond
+            (chit
+              (unless (ty:type-nests? sut cty (_1 (_0 chit)))
+                (elab-error env "const argument type mismatch"
+                  ["want" cty "got" (_1 (_0 chit))])
+                [ty-var-tag nm]))
+            ((And (Eq 1 (Sz path)) (str-numeric? nm))
+              (unless (ty:type-nests? sut cty (ty:TNAT (parse-nat nm)))
+                (elab-error env "const argument type mismatch"
+                  ["want" cty "got" (ty:TNAT (parse-nat nm))])
+                [ty-val-tag (parse-nat nm)]))
+            (else
+              (let ((cp (canon-path path sut)))
+                (Ifz (get-const cp sut)
+                  (elab-error env "unbound const argument" ["path" cp])
+                  (let ((rty (tc-ty (got-entry-tc cp sut))))
+                    (unless (ty:type-nests? sut cty rty)
+                      (elab-error env "const argument type mismatch"
+                        ["want" cty "got" rty])
+                      cp)))))))))
+    (define (base-entry-path)
+      (cond
+        ((Eq "TC_GLOBAL" (Hd base)) (tc-global-path base))
+        ((Eq "s_ref" (_0 val)) (canon-path (surf-ref-path val) sut))
+        ((Eq "s_var" (_0 val)) (canon-path [(_1 val)] sut))
+        (else 0)))
+    (define (const-spec)
+      (If (Ne (Sz args) (Add nt0 (Sz cpairs)))
+        (elab-error env "wrong number of type arguments"
+          ["want" (Add nt0 (Sz cpairs)) "got" (Sz args)])
+        (let* ((bpath (base-entry-path))
+               (targ-paths (map ty:ty-to-path targs))
+               (cpaths
+                 (map (lambda (pr)
+                        (const-arg-path (_0 pr) (subst-cty (_1 (_1 pr)))))
+                   (zip (drop nt0 args) cpairs))))
+          (cond
+            ((Ifz bpath 1 0)
+              (elab-error env
+                "const-parameter generics require a named base" s))
+            ((any Nil targ-paths)
+              (elab-error env
+                "type arguments of a const-parameter generic must be path-shaped"
+                targs))
+            (else
+              (let ((enc (ty-ap-encode (Weld [bpath] (Weld targ-paths cpaths)))))
+                (If (Eq "TC_TYP" (Hd base))
+                  (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+                  (let ((typ (ty:subst-const-args
+                               (map (Ix 0) cpairs) cpaths
+                               (ty:strip-cquas (specialize bty0)))))
+                    (If (bad-type? typ)
+                      (elab-error env "bad specialization" ["got" typ "args" args])
+                      (tc-global typ enc))))))))))
+    (If (Sz cpairs)
+      (const-spec)
+      (If (Eq "TC_TYP" (Hd base))
       ;; The /ty-ap encoding shortcut below never runs type-specialize,
       ;; so check the argument count against the generic's arity here.
       (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
@@ -432,7 +548,7 @@
       (let ((typ (specialize (tc-ty base))))
         (If (bad-type? typ)
           (elab-error env "bad specialization" ["got" typ "args" args])
-          (set-tc-ty typ base)))))
+          (set-tc-ty typ base))))))
   (define (elab-call c[_ f xs])
     (define exs (map (elab-val sut env) xs))
     (define variant-call? (Eq "s_variant" (_0 f)))
@@ -496,7 +612,10 @@
   (define (elab-var v[_ face])
     (define found (find-local-face face))
     (Ifz found
-      (elab-ref ["s_ref" [face]])
+      (let ((chit (find (lambda (p) (Eq face (_0 p))) (env-consts env))))
+        (Ifz chit
+          (elab-ref ["s_ref" [face]])
+          (tc-cparam (_1 (_0 chit)) face)))
       (on-var face (_0 found))))
   (define (elab-lit l[_ val])
     (tc-lit (ty:TNAT 0) val))
@@ -652,6 +771,23 @@
         (tc-typ (ty:TTYP (wrap-tquas (kept inner) inner))))
       (let ((typ (tc-ty tc)))
         (set-tc-ty (wrap-tquas (kept typ) typ) tc))))
+  ;; Const generic parameters: elab the declared types (under the tvar
+  ;; env — they may mention sibling tvars), make the names visible to
+  ;; the body, and keep only the params the result uses.
+  (define (elab-cvars t[_ consts body])
+    (define pairs
+      (map (lambda (c[name tysast]) [name (elab-ty tysast)]) consts))
+    (define env1 (set-env-consts (Weld pairs (env-consts env)) env))
+    (define tc (elab-val sut env1 body))
+    (define typ0
+      (If (Eq "TC_TYP" (Hd tc)) (_2 (tc-typ-inner tc)) (tc-ty tc)))
+    (define (kept-const? p)
+      (Or (tc-uses-cparam? (_0 p) tc)
+        (ty:type-mentions-var? (_0 p) typ0)))
+    (define kept (filter kept-const? pairs))
+    (If (Eq "TC_TYP" (Hd tc))
+      (tc-typ (ty:TTYP (ty:wrap-tcquas kept typ0)))
+      (set-tc-ty (ty:wrap-tcquas kept typ0) tc)))
   (cond
     ((tag-is "s_fun")  (elab-fun surf))
     ((tag-is "s_cast") (elab-cast surf))
@@ -669,6 +805,7 @@
     ((tag-is "s_meth") (elab-meth surf))
     ((tag-is "s_self") (elab-self surf))
     ((tag-is "s_tvars") (elab-tvars surf))
+    ((tag-is "s_cvars") (elab-cvars surf))
     ((tag-is "s_letrec") (elab-letrec surf))
     ((tag-is "s_ufcs_put")
       (elab-unsupported env "UFCS put (.#) — use .set_<face>(val)"))
@@ -688,15 +825,18 @@
 ;;; Module elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Row type declarations get accessors, quantified or not: returns
-;; [tvars row-items] (tvars 0 when the row is not generic), or 0.
+;; [tvars cparams row-items] (tvars 0 when the row is not generic), or 0.
 (define (can-gen-accessors? tc[ty])
-  (define (unwrap vars typ)
+  (define (unwrap vars cps typ)
     (cond
-      ((Eq (_1 typ) "TQUA") (unwrap (snoc (_2 typ) vars) (_3 typ)))
-      ((Eq (_1 typ) "TROW") [(Ifz (Sz vars) 0 vars) (ty:trow-vals typ)])
+      ((Eq (_1 typ) "TQUA") (unwrap (snoc (_2 typ) vars) cps (_3 typ)))
+      ((Eq (_1 typ) "TCQUA")
+        (unwrap vars (snoc [(_2 typ) (_3 typ)] cps) (_4 typ)))
+      ((Eq (_1 typ) "TROW")
+        [(Ifz (Sz vars) 0 vars) cps (ty:trow-vals typ)])
       (else 0)))
   (If (and (Eq (Hd tc) "TC_TYP") (Eq (_1 ty) "TTYP"))
-    (unwrap [] (_2 ty))
+    (unwrap [] [] (_2 ty))
     0))
 
 ;;; Unsupported-syntax scan ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -761,7 +901,7 @@
              (acc? (can-gen-accessors? tc))
              (sut1 (insert-elab-tc name span tc sut)))
         [(Ifz acc? sut1
-           (gen-accessors name (_0 acc?) (_1 acc?) sut1))
+           (gen-accessors name (_0 acc?) (_1 acc?) (_2 acc?) sut1))
          diags])))
   (define (scan-entry diags ent[_ name span body])
     ;; Imports are resolved by compile-mod before elaboration; one
