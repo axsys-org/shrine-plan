@@ -242,6 +242,8 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (cond
       ((Eq "@" rune)
         (parse-doc-tvar kids heir))
+      ((Eq "@@" rune)
+        (sast-error "(@@) is only allowed directly in a declaration" val))
       ((Eq "$" rune)
         (unless (Eq 1 (Sz kids))
           (sast-error "bad dollar form" val)
@@ -397,23 +399,53 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     ;; them.  elab-mod backstops synthetic module rows.
     (define e[name contents0] (split-decl-name (hr-stem (rx-rune-kids dec))))
     (define contents (hr-stem (rx-juxt-flat contents0)))
-    (define (sort-content acc[self kids imps] item)
+    (define (sort-content acc[self kids imps tvs] item)
       (cond
-        ((rx-rune? "+" item) [self (snoc item kids) imps])
-        ((rx-rune? "-" item) [self kids (snoc item imps)])
-        (else [(snoc item self) kids imps])))
-    (define sorted[self kids imps] (foldl sort-content [0 0 0] contents))
+        ((rx-rune? "+" item) [self (snoc item kids) imps tvs])
+        ((rx-rune? "-" item) [self kids (snoc item imps) tvs])
+        ((Or (rx-nest-is? "paren" "@@" item) (rx-rune? "@@" item))
+          [self kids imps (snoc item tvs)])
+        (else [(snoc item self) kids imps tvs])))
+    (define sorted[self kids imps tvs] (foldl sort-content [0 0 0 0] contents))
+    ;; (@@ vars): namespace-scoped type variables — declared once,
+    ;; visible to this decl and every descendant, dropped per-decl if
+    ;; unused (elab-tvars).
+    (define (tvar-kids item)
+      (If (rx-rune? "@@" item) (rx-rune-kids item) (rx-nest-kids item)))
+    (define scoped-vars
+      (foldl
+        (lambda (acc it)
+          (Weld acc (map rx-word-str! (hr-stem (tvar-kids it)))))
+        [] tvs))
+    (define (dup-in? xs)
+      (Ifz (Sz xs) 0
+        (Or (includes (Eq (_0 xs)) (drop 1 xs)) (dup-in? (drop 1 xs)))))
+    (define checked-vars
+      (unless (Nil (dup-in? scoped-vars))
+        (sast-error "duplicate (@@) variable" dec)
+        scoped-vars))
+    (define (wrap-span-tvars spannode)
+      (surf-span (Ix 1 spannode)
+        (surf-tvars checked-vars (Ix 2 spannode))))
+    (define (wrap-decl-rows rows)
+      (Ifz (Sz checked-vars)
+        rows
+        (map (lambda (row)
+               (If (Eq "s_decl" (_0 row))
+                 (Up 3 (wrap-span-tvars (Ix 3 row)) row)
+                 row))
+          rows)))
     (define here1 (snoc name here))
     (define conspan (Ifz self (rx-span dec) (span-join-row self)))
     (define clause (parse-val-sast ["nest" conspan "clear" "" self]))
-    ;; An import-only decl is a pure mount point: no entry of its own.
+    ;; An import-only or scope-only decl is a pure namespace: no entry.
     (define decrow
-      (If (And (Ifz self 1 0) (Sz imps))
+      (If (And (Ifz self 1 0) (Or (Sz imps) (Sz tvs)))
         []
         [(surf-decl here1 span (surf-span conspan clause))]))
-    (Weld decrow
+    (Weld (wrap-decl-rows decrow)
       (Weld (foldl Weld [] (map (on-import here1) imps))
-        (on-dec-list here1 kids))))
+        (wrap-decl-rows (on-dec-list here1 kids)))))
 
   (cond
     ((rx-juxt? val)     (on-dec-list here (rx-juxt-kids val)))
