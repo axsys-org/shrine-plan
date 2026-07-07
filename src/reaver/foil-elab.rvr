@@ -699,12 +699,29 @@
     (If (Eq (Hd tc) "TC_TYP")
       (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
       (insert-tc name span tc sut)))
-  (define (elab-entry sut ent[_ name span body])
-    (define tc (elab-val sut (set-env-name name empty-env) body))
-    (define acc? (can-gen-accessors? tc))
-    (define sut1 (insert-elab-tc name span tc sut))
-    (Ifz acc? sut1
-      (gen-accessors name (_0 acc?) (_1 acc?) sut1)))
+  ;; Each declaration elaborates under its own Try, so one failure does
+  ;; not hide the next decl's: the error is collected, a TC_MEAN poison
+  ;; entry stands in (referees of the failed decl fail their own Try),
+  ;; and the module reports every failed decl at once.  The TC is
+  ;; deep-forced inside the Try — elaboration is lazy enough that an
+  ;; unforced error would otherwise fire in a neighbor's context.
+  (define (elab-entry acc ent[_ name span body])
+    (define sut (_0 acc))
+    (define diags (_1 acc))
+    (define r
+      (Try (lambda (z)
+             (let ((tc (elab-val sut (set-env-name name empty-env) body)))
+               (DeepSeq tc tc)))
+        0))
+    (If (Eq 1 (Hd r))
+      [(insert-tc name span (tc-mean ["elab failed" name]) sut)
+       (snoc [name (_0 r)] diags)]
+      (let* ((tc (_0 r))
+             (acc? (can-gen-accessors? tc))
+             (sut1 (insert-elab-tc name span tc sut)))
+        [(Ifz acc? sut1
+           (gen-accessors name (_0 acc?) (_1 acc?) sut1))
+         diags])))
   (define (scan-entry diags ent[_ name span body])
     ;; Imports are resolved by compile-mod before elaboration; one
     ;; reaching here means an inline module tried to import.
@@ -712,6 +729,9 @@
       ((Eq "s_import" (_0 ent))
         (snoc ["in-decl" [(_3 ent)] "unresolved import (inline modules cannot import)"]
           diags))
+      ;; A decl the parser could not parse (per-decl recovery).
+      ((Eq "s_bad" (_0 ent))
+        (snoc ["in-decl" name body (span-blurb span)] diags))
       ;; Backstop for the parse-level fence: the type-application
       ;; namespaces are not declarable.
       ((And (Sz name)
@@ -734,9 +754,11 @@
       diags))
   (define diags (foldl scan-entry [] mod))
   (Ifz (Sz diags)
-    (let ((sut1 (foldl elab-entry sut mod)))
-      (let ((wf-diags (foldl (wf-entry sut1) [] mod)))
-        (Ifz (Sz wf-diags)
-          sut1
-          (error ["foil-type-wf" wf-diags]))))
+    (let ((r (foldl elab-entry [sut []] mod)))
+      (Ifz (Sz (_1 r))
+        (let ((wf-diags (foldl (wf-entry (_0 r)) [] mod)))
+          (Ifz (Sz wf-diags)
+            (_0 r)
+            (error ["foil-type-wf" wf-diags])))
+        (error ["foil-elab-errors" (_1 r)])))
     (error ["foil-unsupported" diags])))
