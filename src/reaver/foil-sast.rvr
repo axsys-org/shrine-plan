@@ -46,6 +46,27 @@
   (sast-error-at val what val))
 
 ;;; Type parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; '$foo — a constant symbol type literal.  The leaf text includes the
+;; quote; the symbol is the text after the '$ prefix.
+(define (sym-lit? lef)
+  (And (rx-leaf? lef)
+    (And (Eq "quip" (rx-leaf-shape lef))
+      (Eq "'$" (lstrcat (ltake 2 (ltrip (rx-leaf-str lef))))))))
+(define (sym-lit-nat lef)
+  (lstrcat (ldrop 2 (ltrip (rx-leaf-str lef)))))
+
+;; The autonamer: a 1-kid = nest (written =foo) names a face after its
+;; word.  In a path (=foo/bar arrives as a /-nest whose head is that =
+;; nest) the face takes the FIRST segment: foo=foo/bar.
+(define (autoname-head? k)
+  (And (rx-rune? "=" k)
+    (let ((fk (hr-stem (rx-rune-kids k))))
+      (And (Eq 1 (Sz fk)) (rx-word? (_0 fk))))))
+(define (autoname-word k)
+  (rx-word-str! (_0 (hr-stem (rx-rune-kids k)))))
+(define (autoname-inner k)
+  (_0 (hr-stem (rx-rune-kids k))))
+
 
 ;; Type paths, with specialization on the last segment: bst/node[v]
 ;; arrives as (/ bst (juxt node [v])) — juxtaposition binds tighter
@@ -60,6 +81,12 @@
         (And (rx-plain? "brack" (_1 jkids))
           (all rx-word? (Init kids))))))
   (cond
+    ;; =foo/bar — the autonamer wraps the whole path in a face named
+    ;; after the first segment.
+    ((And (Gt (Sz kids) 0) (autoname-head? (_0 kids)))
+      (surf-face (autoname-word (_0 kids))
+        (parse-type-path cont
+          (Weld [(autoname-inner (_0 kids))] (drop 1 kids)))))
     ((And (Gt (Sz kids) 0) (all rx-word? kids)) (parse-road kids))
     ((And (Gt (Sz kids) 1) (And (rx-juxt? last) (spec-tail (rx-juxt-kids last))))
       (let ((jkids (rx-juxt-kids last)))
@@ -72,10 +99,16 @@
   assert(rx-word? x)
   (surf-variant (rx-leaf-str x)))
 
+
 (define (parse-type-sast ty)
   (define (on-face kids)
-    assert(Eq 2 (Sz kids))
-    (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_1 kids))))
+    (cond
+      ;; =name — the autonamer: the face takes the type's own name.
+      ((And (Eq 1 (Sz kids)) (rx-word? (_0 kids)))
+        (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_0 kids))))
+      ((Eq 2 (Sz kids))
+        (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_1 kids))))
+      (else (sast-error "bad face" (_0 kids)))))
   (define (on-clear exp)
     (define rune (rx-nest-rune exp))
     (define kids (rx-nest-kids exp))
@@ -126,6 +159,7 @@
   (define (on-leaf lef)
     (cond
       ((rx-word? lef) (surf-ref [(rx-leaf-str lef)])) ;; local
+      ((sym-lit? lef) (surf-tsym (sym-lit-nat lef)))
       (else (sast-error "bad leaf type" lef))))
   (define (on-juxt jux)
     (define kids (rx-juxt-kids jux))
@@ -343,7 +377,9 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             (surf-self (drop 1 kids))
             (surf-app (_0 kids) (drop 1 kids)))))
       ((Eq "/" (rx-nest-rune nes))
-        (surf-app (parse-road (rx-nest-kids nes)) []))
+        ;; a zero-arg call of a path — possibly spec-tailed:
+        ;; (labeled/tagof['$foo])
+        (surf-app (parse-path-val (rx-nest-kids nes)) []))
       ((Eq "." (rx-nest-rune nes))
         (parse-meth parse-val-sast (rx-nest-kids nes)))
       (else (handle-rune (rx-nest-rune nes) (rx-nest-kids nes) foil-no-heir))))

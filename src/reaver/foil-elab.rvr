@@ -152,6 +152,10 @@
         (unless (Eq 1 (Sz fields))
           (ty:TBAD ["bad-pin-arity" fields])
           (ty:TPIN (_0 fields))))
+      ;; ('$foo) — a parenthesized constant symbol (the face position
+      ;; x=('$foo); rex can't take a bare quip as a rune operand).
+      ((And (Eq "s_tsym" (_0 f)) (Ifz (Sz fields) 1 0))
+        (ty:TNAT (_1 f)))
       ((Eq "s_ref" (_0 f))
         (let ((enc (spec-encode sut (surf-ref-path f) fields)))
           (Ifz enc
@@ -196,6 +200,8 @@
           (ty:TNOM (canon-path path sut) 0))))
     ((tag-is "s_variant")
       (ty:TROW (_1 wav) []))
+    ((tag-is "s_tsym")
+      (ty:TNAT (_1 wav)))
     ((tag-is "s_tapp")
       (on-tapp (surf-tapp-kids wav)))
       (else (error ("unimpl type elab" wav)))))
@@ -469,8 +475,14 @@
       (foldl (lambda (acc pr) (ty:subst-type (_0 pr) (_1 pr) acc))
         cty (zip (ty:tqua-names bty0) targs)))
     (define (const-arg-path a cty)
+      (If (Eq "s_tsym" (_0 a))
+        (let ((n (_1 a)))
+          (unless (ty:type-nests? sut cty (ty:TNAT n))
+            (elab-error env "const argument type mismatch"
+              ["want" cty "got" (ty:TNAT n)])
+            [ty-val-tag n]))
       (If (Nil (Eq "s_ref" (_0 a)))
-        (elab-error env "const argument must be a name or nat literal" a)
+        (elab-error env "const argument must be a name or literal" a)
         (let* ((path (surf-ref-path a))
                (nm (_0 path))
                (chit (And (Eq 1 (Sz path))
@@ -494,7 +506,7 @@
                     (unless (ty:type-nests? sut cty rty)
                       (elab-error env "const argument type mismatch"
                         ["want" cty "got" rty])
-                      cp)))))))))
+                      cp))))))))))
     (define (base-entry-path)
       (cond
         ((Eq "TC_GLOBAL" (Hd base)) (tc-global-path base))
@@ -617,14 +629,20 @@
           (elab-ref ["s_ref" [face]])
           (tc-cparam (_1 (_0 chit)) face)))
       (on-var face (_0 found))))
+  ;; A literal knows its value: TNAT with the constant cube (0 stays
+  ;; the whole nat span — the one ambiguous literal).
   (define (elab-lit l[_ val])
-    (tc-lit (ty:TNAT 0) val))
+    (tc-lit (ty:TNAT val) val))
   ;; '-prefixed literals carry a quip aura: the runtime value is the
   ;; tagged pair from quip:parse-quip, typed by the builtin quip sum.
   (define (elab-literal l[_ shape text])
-    (If (Eq shape "quip")
-      (tc-lit (ty:TNOM ["quip"] 0) (quip:parse-quip text))
-      (elab-unsupported env ["non-quip literal" shape])))
+    (cond
+      ((Eq shape "quip")
+        (tc-lit (ty:TNOM ["quip"] 0) (quip:parse-quip text)))
+      ;; A cord is a bare text nat, typed by its constant.
+      ((Eq shape "cord")
+        (tc-lit (ty:TNAT text) text))
+      (else (elab-unsupported env ["non-quip literal" shape]))))
   ;; Local bindings: sequential lets — each binding sees the previous
   ;; ones; recursive references are not supported (bindings elaborate
   ;; before their name enters scope).
@@ -863,7 +881,8 @@
         (go (_1 node) acc (_2 node))
         (letrec
           ((tag (_0 node))
-           (lit-bad (And (Eq tag "s_literal") (Ne "quip" (_1 node))))
+           (lit-bad (And (Eq tag "s_literal")
+                      (Nil (Or (Eq "quip" (_1 node)) (Eq "cord" (_1 node))))))
            (hit (find (lambda (p) (Eq (_0 p) tag)) unsupported-tags))
            (acc1 (cond
                    (lit-bad
