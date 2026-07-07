@@ -33,6 +33,11 @@
 (define tsum-opts (Ix 2)) ;
 ;; qualify name in body
 (define (TQUA name body) [TYPE "TQUA" name body])
+;; A const generic parameter layer: name, its declared type (which may
+;; mention sibling tvars), body.  Sits inside the TQUA chain; carries
+;; no quantification of its own (the constant's VALUE rides the /ty-ap
+;; path, its type does not change) — count-tqua stops at it.
+(define (TCQUA name cty body) [TYPE "TCQUA" name cty body])
 ;; nominal reference, possibly applied
 (define (TNOM ref args) [TYPE "TNOM" ref args])
 (define tnom-ref (Ix 2))
@@ -81,14 +86,17 @@
 ;; the type argument of an application must itself be path-shaped.
 
 (define (path-to-ty p)
-  (If (ty-var-path? p) (TVAR (Ix 1 p)) (TNOM p 0)))
+  (cond
+    ((ty-var-path? p) (TVAR (Ix 1 p)))
+    ((ty-val-path? p) (TNAT (Ix 1 p)))
+    (else (TNOM p 0))))
 
 ;; -> the path for an encodable type argument, 0 otherwise.
 (define (ty-to-path t[_ tag])
   (cond
     ((Eq tag "TNOM") (Ifz (Sz (_3 t)) (_2 t) 0))
     ((Eq tag "TVAR") [ty-var-tag (_2 t)])
-    ((Eq tag "TNAT") (Ifz (_2 t) ["nat"] 0))
+    ((Eq tag "TNAT") (Ifz (_2 t) ["nat"] [ty-val-tag (_2 t)]))
     (else 0)))
 
 ;; Substitute a tvar inside an encoded path's arguments.
@@ -134,6 +142,9 @@
     ((Eq tag "TNOM")
       (Or (path-mentions-var? v (_2 x)) (any recur (_3 x))))
     ((Eq tag "TQUA") (And (Nil (Eq (_2 x) v)) (recur (_3 x))))
+    ((Eq tag "TCQUA")
+      (Or (recur (_3 x))
+        (And (Nil (Eq (_2 x) v)) (recur (_4 x)))))
     ((Eq tag "TFUN")
       (Or (any recur (tfun-args x)) (recur (tfun-ret x))))
     ((Eq tag "TROW") (any recur (trow-vals x)))
@@ -163,6 +174,12 @@
           ;; substituting under this binder would capture repl's variable
           (error ("subst-type capture" (_2 ty) name repl)))
         (else (TQUA (_2 ty) (recur (_3 ty))))))
+    ((tag-is "TCQUA")
+      ;; the const name lives in the same /ty-var namespace: shadow it,
+      ;; but its declared type still specializes by sibling tvars.
+      (If (Eq (_2 ty) name)
+        (TCQUA (_2 ty) (recur (_3 ty)) (_4 ty))
+        (TCQUA (_2 ty) (recur (_3 ty)) (recur (_4 ty)))))
     ((tag-is "TSUM") (TSUM (map recur (_2 ty))))
     ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
     ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
@@ -255,6 +272,7 @@
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
     ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
     ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
+    ((tag-is "TCQUA") (TCQUA (_2 ty) (recur (_3 ty)) (recur (_4 ty))))
     ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
     ((tag-is "TROW") (TROW (trow-cstr ty) (map recur (trow-vals ty))))
     ((tag-is "TTYP") (TTYP (recur (_2 ty))))
@@ -406,6 +424,34 @@
     ((f-hd "TBAD") f)
     (else (TBAD ["weird apply" f x])))))
 
+;; The const-parameter layers of a generic's type: [[name cty] ...] in
+;; declared order (descending through TQUA/TFAC/TSELF).
+(define (cqua-pairs ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (cqua-pairs (_3 ty)))
+    ((Eq tag "TCQUA") (Weld [[(_2 ty) (_3 ty)]] (cqua-pairs (_4 ty))))
+    ((Eq tag "TFAC") (cqua-pairs (tfac-val ty)))
+    ((Eq tag "TSELF") (cqua-pairs (tself-val ty)))
+    (else [])))
+
+(define (count-cqua ty) (Sz (cqua-pairs ty)))
+
+;; Remove the TCQUA layers along the TQUA/TFAC/TSELF spine (the shape
+;; consumers see once an instantiation has supplied the constants).
+(define (strip-cquas ty[_ tag])
+  (cond
+    ((Eq tag "TQUA") (TQUA (_2 ty) (strip-cquas (_3 ty))))
+    ((Eq tag "TCQUA") (strip-cquas (_4 ty)))
+    ((Eq tag "TFAC") (TFAC (_2 ty) (strip-cquas (tfac-val ty))))
+    ((Eq tag "TSELF") (TSELF (strip-cquas (tself-val ty))))
+    (else ty)))
+
+(define (wrap-tcquas pairs typ)
+  (Ifz (Sz pairs)
+    typ
+    (TCQUA (_0 (_0 pairs)) (_1 (_0 pairs))
+      (wrap-tcquas (drop 1 pairs) typ))))
+
 (define (check-type-wf sut x[_ tag])
   (define (tag-is y) (Eq y tag))
   (define recur (check-type-wf sut))
@@ -416,6 +462,16 @@
   ;; A nominal ref may be a /ty-var path, a /ty-ap application (whose
   ;; base must be a type of matching arity and whose argument paths must
   ;; themselves be well-formed), or a plain path.
+  (define (check-const-arg p)
+    (cond
+      ((ty-var-path? p)
+        (Ifz (sut-get-tvar? (Ix 1 p) sut)
+          (left ["unbound const parameter" (Ix 1 p)])
+          (right 0)))
+      ((ty-val-path? p) (right 0))
+      ((Ifz (get-const p sut) 1 0)
+        (left ["bad const argument reference" ["path" p]]))
+      (else (right 0))))
   (define (check-nom-ref ref)
     (cond
       ((ty-var-path? ref)
@@ -433,13 +489,25 @@
                   (left ["bad type reference" ["path" base]]))
                 ((Nil (type-entry? base sut))
                   (left ["type application of a non-type" ["path" base]]))
-                ((Ne (count-tqua (got-type base sut)) (Sz targs))
-                  (left ["wrong number of type arguments" ["path" ref]
-                         "want" (count-tqua (got-type base sut))
-                         "got" (Sz targs)]))
                 (else
-                  (let ((bad (filter is-left? (map check-nom-ref targs))))
-                    (Ifz (Sz bad) (right 0) (_0 bad)))))))))
+                  ;; type args first, then const args, declared order;
+                  ;; consts are values (bound names, literals, declared
+                  ;; entries) — elab-spec does the deep cty check with
+                  ;; located errors.
+                  (let* ((gty (got-type base sut))
+                         (nt (count-tqua gty))
+                         (nc (count-cqua gty)))
+                    (If (Ne (Add nt nc) (Sz targs))
+                      (left ["wrong number of type arguments" ["path" ref]
+                             "want" (Add nt nc) "got" (Sz targs)])
+                      (let* ((bad-t (filter is-left?
+                                      (map check-nom-ref (take nt targs))))
+                             (bad-c (filter is-left?
+                                      (map check-const-arg (drop nt targs)))))
+                        (cond
+                          ((Sz bad-t) (_0 bad-t))
+                          ((Sz bad-c) (_0 bad-c))
+                          (else (right 0))))))))))))
       (else
         (Ifz (get-const ref sut)
           (left ["bad type reference" ["path" ref]])
@@ -480,6 +548,9 @@
      ((tag-is "TARR") (recur (_2 x)))
      ((tag-is "TNAT") (right 0))
      ((tag-is "TQUA") (check-type-wf (sut-put-tvar (_2 x) sut) (_3 x)))
+     ((tag-is "TCQUA")
+       (type-and (recur (_3 x))
+         (check-type-wf (sut-put-tvar (_2 x) sut) (_4 x))))
      ((tag-is "TSUM")
        (type-and (check-tfun-args (_2 x)) (check-sum-opts (_2 x))))
      ((tag-is "TROW")
@@ -683,6 +754,7 @@
       ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
       ((tag-is "TSELF") (TSELF (recur (tself-val ty))))
       ((tag-is "TQUA") (TQUA (_2 ty) (recur (_3 ty))))
+      ((tag-is "TCQUA") (TCQUA (_2 ty) (recur (_3 ty)) (recur (_4 ty))))
       ((tag-is "TSUM") (TSUM (map recur (tsum-opts ty))))
       ((tag-is "TTYP") (TTYP (recur (_2 ty))))
       ((tag-is "TARR") (TARR (recur (_2 ty))))
@@ -711,6 +783,7 @@
       ((Eq tag "TPIN") (arg-seeds (tpin-val ty)))
       ((Eq tag "TSELF") (arg-seeds (tself-val ty)))
       ((Eq tag "TQUA") (arg-seeds (_3 ty)))
+      ((Eq tag "TCQUA") (arg-seeds (_4 ty)))
       (else 0)))
   (define (expand-args seeds xs)
     (Ifz xs 0
@@ -944,6 +1017,7 @@
   (cond
     ((Eq tag "TROW") (TROW (print-path key) (trow-vals typ)))
     ((Eq tag "TQUA") (TQUA (_2 typ) (name-top-row key (_3 typ))))
+    ((Eq tag "TCQUA") (TCQUA (_2 typ) (_3 typ) (name-top-row key (_4 typ))))
     (else typ)))
 (define (insert-typ key span typ sut)
   (define ent (make-tc-entry key span (tc-ttyp (name-top-row key typ))))
@@ -970,6 +1044,11 @@
  tqua-names
  tqua-body
  type-mentions-var?
+ TCQUA
+ cqua-pairs
+ count-cqua
+ strip-cquas
+ wrap-tcquas
  subst-type
  path-to-ty
  ty-to-path
