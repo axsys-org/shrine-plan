@@ -364,6 +364,15 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
 
 (define (parse-module-sast here val)
   (define span (rx-span val))
+  ;; - imports the named modules; the mount is the path the rune
+  ;; appears under ([] at module top level).
+  (define (on-import here imp)
+    (define (one w)
+      (unless (rx-word? w)
+        (sast-error "bad import (expected module names)" imp)
+        (surf-import here (rx-span imp) (rx-word-str! w))))
+    (map one (hr-stem (rx-rune-kids imp))))
+
   ; A namespace module is either a flat stack of decls, a single decl, or a value.
   (define (on-dec-list here decs)
     (define (pop-next acc dec)
@@ -373,20 +382,28 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
   (define (on-decl dec)
     (define e[name contents0] (split-decl-name (hr-stem (rx-rune-kids dec))))
     (define contents (hr-stem (rx-juxt-flat contents0)))
-    (define (sort-content acc[self kids] item)
-      (If (rx-rune? "+" item)
-        [self (snoc item kids)]
-        [(snoc item self) kids]))
-    (define sorted[self kids] (foldl sort-content [0 0] contents))
+    (define (sort-content acc[self kids imps] item)
+      (cond
+        ((rx-rune? "+" item) [self (snoc item kids) imps])
+        ((rx-rune? "-" item) [self kids (snoc item imps)])
+        (else [(snoc item self) kids imps])))
+    (define sorted[self kids imps] (foldl sort-content [0 0 0] contents))
     (define here1 (snoc name here))
     (define conspan (Ifz self (rx-span dec) (span-join-row self)))
     (define clause (parse-val-sast ["nest" conspan "clear" "" self]))
-    (Weld [(surf-decl here1 span (surf-span conspan clause))]
-      (on-dec-list here1 kids)))
+    ;; An import-only decl is a pure mount point: no entry of its own.
+    (define decrow
+      (If (And (Ifz self 1 0) (Sz imps))
+        []
+        [(surf-decl here1 span (surf-span conspan clause))]))
+    (Weld decrow
+      (Weld (foldl Weld [] (map (on-import here1) imps))
+        (on-dec-list here1 kids))))
 
   (cond
     ((rx-juxt? val)     (on-dec-list here (rx-juxt-kids val)))
     ((rx-rune? "+" val) (on-decl val))
+    ((rx-rune? "-" val) (on-import here val))
     ((And (rx-rune? "" val) (Eq "clear" (rx-nest-color val)))
       (on-dec-list here (rx-nest-kids val)))
     (else (sast-error "wack module" val))))

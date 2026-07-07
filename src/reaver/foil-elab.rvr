@@ -105,11 +105,11 @@
 
 ;; Encode a specialization as a /ty-ap path: 0 if an argument type is
 ;; not path-shaped.
-(define (spec-encode path targs)
+(define (spec-encode sut path targs)
   (define argps (map ty:ty-to-path targs))
   (If (any Nil argps)
     0
-    (ty-ap-encode (Weld [path] argps))))
+    (ty-ap-encode (Weld [(canon-path path sut)] argps))))
 
 ;;; Type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -125,7 +125,7 @@
           (ty:TBAD ["bad-pin-arity" fields])
           (ty:TPIN (_0 fields))))
       ((Eq "s_ref" (_0 f))
-        (let ((enc (spec-encode (surf-ref-path f) fields)))
+        (let ((enc (spec-encode sut (surf-ref-path f) fields)))
           (Ifz enc
             (ty:TBAD ["type argument not path-shaped" fields])
             (ty:TNOM enc 0))))
@@ -150,7 +150,9 @@
       (define path (surf-ref-path wav))
       (If (And (Eq 1 (Sz path)) (env-has-tvar? (_0 path) env))
         (ty:TVAR (_0 path))
-        (ty:TNOM path 0)))
+        ;; Mounted import names normalize to the entry's canonical
+        ;; path: nominal identity is independent of the written name.
+        (ty:TNOM (canon-path path sut) 0)))
     ((tag-is "s_variant")
       (ty:TROW (_1 wav) []))
     ((tag-is "s_tapp")
@@ -343,13 +345,14 @@
   (define (construction-nom fsurf)
     (cond
       ((Eq "s_ref" (_0 fsurf))
-        (ty:TNOM (surf-ref-path fsurf) 0))
+        (ty:TNOM (canon-path (surf-ref-path fsurf) sut) 0))
       ;; bare names reach constructors as s_var (a type callee cannot
       ;; be a local, so the name is the path)
       ((Eq "s_var" (_0 fsurf))
-        (ty:TNOM [(_1 fsurf)] 0))
+        (ty:TNOM (canon-path [(_1 fsurf)] sut) 0))
       ((And (Eq "s_spec" (_0 fsurf)) (Eq "s_ref" (_0 (_1 fsurf))))
-        (ty:TNOM (surf-ref-path (_1 fsurf)) (map elab-ty (_2 fsurf))))
+        (ty:TNOM (canon-path (surf-ref-path (_1 fsurf)) sut)
+          (map elab-ty (_2 fsurf))))
       (else 0)))
   (define (elab-type-call fsurf rown xs)
     (define row (Ix 0 rown))
@@ -380,7 +383,7 @@
     ;; A specialized named type IS its /ty-ap path.
     (define (nom-spec)
       (If (Eq "s_ref" (_0 val))
-        (spec-encode (surf-ref-path val) targs)
+        (spec-encode sut (surf-ref-path val) targs)
         0))
     (If (Eq "TC_TYP" (Hd base))
       ;; The /ty-ap encoding shortcut below never runs type-specialize,
@@ -703,8 +706,13 @@
     (Ifz acc? sut1
       (gen-accessors name (_0 acc?) (_1 acc?) sut1)))
   (define (scan-entry diags ent[_ name span body])
-    (Weld diags
-      (map (lambda (d) ["in-decl" name d]) (scan-unsupported span body))))
+    ;; Imports are resolved by compile-mod before elaboration; one
+    ;; reaching here means an inline module tried to import.
+    (If (Eq "s_import" (_0 ent))
+      (snoc ["in-decl" [(_3 ent)] "unresolved import (inline modules cannot import)"]
+        diags)
+      (Weld diags
+        (map (lambda (d) ["in-decl" name d]) (scan-unsupported span body)))))
   ;; Post-pass: every type declared by the module must be well-formed
   ;; against the *final* subject (types may reference declarations that
   ;; follow them, so checking at insert time is too early).
