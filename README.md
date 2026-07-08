@@ -8,6 +8,12 @@ Probably the best way to jump into Reaver dev is to look at the
 stdlib, and just start extending that.  I also write up a quick manual
 [here](doc/reaver.md).
 
+Foil and its live Forge browser are documented in
+[doc/getting-started.md](doc/getting-started.md),
+[doc/foil-semantics.md](doc/foil-semantics.md), and
+[doc/forge.md](doc/forge.md); design notes live under
+[doc/aar/](doc/aar/).
+
 This will eventually be integrated with the production runtime
 (https://github.com/xocore-tech/PLAN), but isn't yet.
 
