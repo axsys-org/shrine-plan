@@ -643,10 +643,10 @@
 
 ;;; Image bundles and forge state ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define forge-mods ["bst" "demo" "axal"])
+(define forge-mods ["bst" "demo" "axal" "mapx" "mapuser"])
 
 (define (compile-forced mod)
-  (define s (foil:compile-mod foil:default-subject mod))
+  (define s (foil:compile-mod-info foil:default-subject mod))
   (DeepSeq s s))
 
 ;; Transitive import closure of a module, by parsing import runes.
@@ -674,9 +674,18 @@
   (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
   (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
   (define compiled (Try compile-forced mod))
+  (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  (define own-keys
+    (If (Eq 1 (Hd compiled))
+      []
+      (let ((sut (_0 (_0 compiled))))
+        (filter
+          (lambda (k)
+            (Ifz imported 1 (Nil (includes (Equal k) imported))))
+          (foil:module-decl-keys sut)))))
   (define refs
-    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 compiled))))
-  ["BUNDLE" mod src lore compiled refs (import-snapshot mod)])
+    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 (_0 compiled)))))
+  ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys])
 
 (define bundle-mod (Ix 1))
 (define bundle-src (Ix 2))
@@ -684,8 +693,9 @@
 (define bundle-compiled (Ix 4))
 (define bundle-refs (Ix 5))
 (define bundle-imports (Ix 6))
+(define bundle-own-keys (Ix 7))
 (define (bundle-ok? b) (Eq 0 (Hd (bundle-compiled b))))
-(define (bundle-sut b) (_0 (bundle-compiled b)))
+(define (bundle-sut b) (_0 (_0 (bundle-compiled b))))
 (define (bundle-err b) (_0 (bundle-compiled b)))
 
 (define empty-state ["ST" [] []])
@@ -704,6 +714,60 @@
 
 (define (state-log st entry)
   (snap 2 (lambda (evs) (take (min 8 (Inc (Sz evs))) (Weld [entry] evs))) st))
+
+
+;;; Namespace index ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (browse-roster _)
+  (foldl
+    (lambda (acc mod)
+      (foldl (lambda (seen name) (snoc-new name seen))
+        acc
+        (Weld [mod] (import-closure mod))))
+    []
+    forge-mods))
+
+(define (state-load-all st)
+  (foldl (lambda (acc mod) (_0 (state-bundle acc mod))) st (browse-roster 0)))
+
+(define (path-root key) (Ifz (Sz key) "" (Ix 0 key)))
+
+(define builtin-roots
+  (foldl (lambda (acc root) (snoc-new root acc))
+    []
+    (map path-root builtin-paths)))
+
+(define (builtin-root? root)
+  (includes (Eq root) builtin-roots))
+
+(define (ns-key? key)
+  (And (Sz key) (Nil (ty-ap-path? key))))
+
+(define (bundle-ns-rows b)
+  (If (Nil (bundle-ok? b))
+    []
+    (map (lambda (key) [(path-root key) key (bundle-mod b)])
+      (filter ns-key? (bundle-own-keys b)))))
+
+(define (ns-rows st)
+  (foldl (lambda (acc b) (Weld acc (bundle-ns-rows b))) [] (st-bundles st)))
+
+(define (ns-roots rows)
+  (foldl (lambda (acc row) (snoc-new (_0 row) acc)) [] rows))
+
+(define (ns-root-rows rows root)
+  (filter (lambda (row) (Eq root (_0 row))) rows))
+
+(define (ns-root-files rows root)
+  (foldl (lambda (acc row) (snoc-new (_2 row) acc))
+    [] (ns-root-rows rows root)))
+
+(define (bundle-for st mod)
+  (define hit (find (lambda (b) (Eq mod (bundle-mod b))) (st-bundles st)))
+  (Ifz hit 0 (_0 hit)))
+
+(define (broken-bundles st)
+  (filter (lambda (b) (Nil (bundle-ok? b))) (st-bundles st)))
 
 
 ;;; Panels ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -849,6 +913,70 @@
                  "diagnostics"))])
       body])])
 
+(define (ns-link root text)
+  (hx-link (strcat ["/ns/" root]) "#main" text))
+
+(define (ns-index-row rows root)
+  (define rrows (ns-root-rows rows root))
+  (define files (ns-root-files rows root))
+  (div [(cls "ns-row")]
+    (Weld
+      [(ns-link root (strcat ["/" root]))
+       (chip "count" (strcat [(showNat (Sz rrows)) " entries"]))]
+      (Weld
+        (If (builtin-root? root) [(chip "builtin" "builtin")] [])
+        (map (lambda (mod) (chip "file" (strcat [mod ".foil"]))) files)))))
+
+(define (broken-note b)
+  (div [(cls "ref-row")]
+    [(chip "err" "broken")
+     (span no-attrs
+       (esc (strcat ["broken bundle: " (bundle-mod b) ".foil does not compile"])))]))
+
+(define (ns-index-panel st)
+  (define st1 (state-load-all st))
+  (define rows (ns-rows st1))
+  (define roots (ns-roots rows))
+  [st1
+   (div [(cls "nspane")]
+     [(div [(cls "pane-head")]
+        [(h2 "namespaces")
+         (chip "count" (strcat [(showNat (Sz roots)) " roots"]))])
+      (div [(cls "entry-list")]
+        (map (ns-index-row rows) roots))
+      (div [(cls "diag")]
+        (Weld [(h2 "broken bundles")]
+          (map broken-note (broken-bundles st1))))])])
+
+(define (entry-main-link mod path text)
+  (hx-link (entry-url mod path) "#main" text))
+
+(define (ns-entry-row st row[root key mod])
+  (define b (bundle-for st mod))
+  (define sut (bundle-sut b))
+  (define tc (got-entry-tc key sut))
+  (define l (lore-for (bundle-lore b) key))
+  (div [(cls "entry-row")]
+    [(entry-main-link mod key (path-text key))
+     (chip "kind" (entry-kind sut key tc))
+     (chip "file" (strcat ["defined in " mod ".foil"]))
+     (If l
+       (span [(cls "muted")] (esc (lore-head (_0 l))))
+       (span no-attrs ""))]))
+
+(define (ns-root-panel st root)
+  (define st1 (state-load-all st))
+  (define rows (ns-root-rows (ns-rows st1) root))
+  [st1
+   (div [(cls "nspane")]
+     [(div [(cls "pane-head")]
+        [(h2 (strcat ["/" root]))
+         (chip "count" (strcat [(showNat (Sz rows)) " entries"]))
+         (If (builtin-root? root) (chip "builtin" "builtin") (span no-attrs ""))])
+      (Ifz (Sz rows)
+        (para [(cls "muted")] [(span no-attrs "no entries")])
+        (div [(cls "entry-list")] (map (ns-entry-row st1) rows)))])])
+
 (define (transcript-pane evs)
   (div [(cls "transcript")]
     (map
@@ -943,6 +1071,9 @@ h2 { font-size:13px; color:#f0b429; font-weight:normal; }
 .entry-list { display:grid; gap:2px; max-height:34vh; overflow:auto; border:1px solid #2a333b; padding:4px; }
 .entry-row { display:flex; gap:8px; align-items:baseline; padding:2px 4px; }
 .entry-row:hover { background:#161c22; }
+.ns-row { display:flex; gap:8px; align-items:baseline; padding:3px 4px; }
+.ns-row:hover { background:#161c22; }
+.nspane .entry-list { max-height:none; }
 .detail { overflow:auto; border:1px solid #2a333b; padding:8px; min-height:40vh; }
 .entry-head { display:flex; gap:10px; align-items:baseline; margin-bottom:6px; }
 .path { color:#f0b429; font-size:14px; }
@@ -1001,6 +1132,7 @@ document.addEventListener('submit', ev => {
       {method:'POST', body: f.querySelector('[name=expr]').value});
   }
 });
+document.addEventListener('DOMContentLoaded', () => swap('/ns', '#main'));
 ")
 
 (define (mod-link mod)
@@ -1032,6 +1164,7 @@ document.addEventListener('submit', ev => {
        [(div [(cls "app")]
           [(div [(cls "side")]
              [(leaf "h1" no-attrs "forge")
+              (div [(cls "mods")] [(hx-link "/ns" "#main" "namespaces")])
               (div [(cls "mods")] (map mod-link forge-mods))
               (workspace-form 0)])
            (div [(attr "id" "main") (cls "main")]
@@ -1083,6 +1216,12 @@ document.addEventListener('submit', ev => {
     (cond
       ((Or (Eq "/" target) (Eq "" target))
         [st (html-response (shell 0))])
+      ((Eq "/ns" target)
+        (let ((rr (ns-index-panel st)))
+          [(_0 rr) (html-response (_1 rr))]))
+      ((str-prefix? "/ns/" target)
+        (let ((rr (ns-root-panel st (str-drop 4 target))))
+          [(_0 rr) (html-response (_1 rr))]))
       ((str-prefix? "/mod/" target)
         (let ((rr (module-panel st (str-drop 5 target))))
           [(_0 rr) (html-response (_1 rr))]))
@@ -1167,4 +1306,3 @@ document.addEventListener('submit', ev => {
     (Seq (DeepSeq st st)
       (Seq (print ("forge listening on port" port "— bundles warm"))
         (serve-loop listen st)))))
-
