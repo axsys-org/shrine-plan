@@ -10,6 +10,12 @@
 
 (#bind milton (#module milton))
 
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind helm (#module helm))
+
 
 ;;; The HTTP driver: a helm worker whose requests ride the namespace.
 ;;; An incoming request is WRITTEN as a record at a fresh path under
@@ -47,10 +53,10 @@
   (define (go i)
     (cond
       ((Ge (Add i 3) n) 0)
-      ((and (Eq 13 (Load8 input i))
-         (and (Eq 10 (Load8 input (Add i 1)))
-           (and (Eq 13 (Load8 input (Add i 2)))
-             (Eq 10 (Load8 input (Add i 3))))))
+      ((and (Eq 13 (Load8 i input))
+         (and (Eq 10 (Load8 (Add i 1) input))
+           (and (Eq 13 (Load8 (Add i 2) input))
+             (Eq 10 (Load8 (Add i 3) input)))))
         (Add i 4))
       (else (go (Inc i)))))
   (go 0))
@@ -66,17 +72,45 @@
     ((Eq status 500) "HTTP/1.0 500 Internal Server Error")
     (else (strcat ["HTTP/1.0 " (showNat status) " Status"]))))
 
-(define (http-res status body)
+(define (http-res status ctype body)
   (lstrcat
     ~[(status-line status) crlf
-      "Content-Type: text/plain; charset=utf-8" crlf
+      "Content-Type: " ctype crlf
       crlf body]))
+
+;; "/ns/a/b" -> [("ts" "a") ("ts" "b")]; "/", "/ns" -> [].  A leading
+;; "ns" segment is the explorer's own prefix and is dropped.
+(define (str-slice off len src)
+  (Mod (Rsh src (Mul 8 off)) (Lsh 1 (Mul 8 len))))
+
+(define (split-ch ch s)
+  (define n (Bytes s))
+  (define (go i start acc)
+    (If (Ge i n)
+      (snoc (str-slice start (Sub i start) s) acc)
+      (If (Eq ch (Load8 i s))
+        (go (Inc i) (Inc i) (snoc (str-slice start (Sub i start) s) acc))
+        (go (Inc i) start acc))))
+  (go 0 0 []))
+
+(define (url-target u)
+  (define parts (filter (lambda (x) (Nil (Eq 0 (Bytes x)))) (split-ch 47 u)))
+  (define parts2
+    (If (And (Sz parts) (Equal "ns" (Ix 0 parts)))
+      (drop 1 parts)
+      parts))
+  (map (lambda (t) ("ts" t)) parts2))
 
 ;;; Socket layer (thin; blocking IO lives in its own actors) ;;;;;;;;;;;;;;;;;;;;;;;
 
-;; One actor per connection: read, parse, ask the worker, write the
-;; response (with the sentinel byte — Write drops the top byte), close.
-(define (conn-actor fd wh self)
+;; One actor per connection: handshake for the worker handle (handles
+;; are per-actor capabilities — they only cross actors through caps,
+;; never through closures), then read, parse, ask the worker, write
+;; the response (with the sentinel byte — Write drops the top byte),
+;; close.
+(define (conn-actor fd self)
+  (define mc (Recv 0))
+  (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
   (define input (Read fd 65536))
   (define parsed (Try milton:parse-http-request input))
   (define method (If (Eq 1 (Hd parsed)) "GET" (Ix 0 (_0 parsed))))
@@ -86,23 +120,26 @@
   (Seq (DeepSeq m m)
     (Seq (SendCaps wh m [0])
       (let ((r (Ix 0 (Recv 0))))
-        (Seq (Write fd (strWeld (http-res (_1 r) (_2 r)) 1))
+        (Seq (Write fd (strWeld (http-res (_1 r) (_3 r) (_2 r)) 1))
           (CloseFd fd))))))
 
 ;; Accept loop: handshake for the worker handle, then one actor per
-;; connection.
+;; connection — the worker cap is re-delegated to each via SendCaps.
 (define (listener-pump port self)
   (define mc (Recv 0))
-  (define wh (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
+  (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
   (define listenx (Try Listen port))
   (If (Eq 1 (Hd listenx))
-    (Send wh ["noport" port])
+    (Seq (Trace ["pump: listen failed" port (_0 listenx)] 0)
+      (Send wh ["noport" port]))
     (let ((fd (_0 listenx)))
       (define (loop z)
         (define conn (Accept fd))
-        (Seq (Spawn (conn-actor conn wh))
+        (Seq (let ((c (Spawn (conn-actor conn))))
+               (SendCaps c ["go"] [wh]))
           (loop z)))
-      (Seq wh (loop 0)))))
+      (Seq (Trace ["pump: listening" port] 0)
+        (Seq wh (loop 0))))))
 
 ;;; The worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -119,12 +156,17 @@
 (define (pend-drop pending pax)
   (filter (lambda (e) (Nil (Equal pax (_0 e)))) pending))
 
-;; The record's response, if the serving behavior wrote it yet.
+;; The record's response, if the serving behavior wrote it yet:
+;; [status body ctype].
 (define (res-of hs resrec)
   (If (Eq "known" (Hd resrec))
     (let ((m (_0 resrec)))
       (let ((status ((h-slot hs) [("ts" "res_status")] 0 m)))
-        (Ifz status 0 [status ((h-slot hs) [("ts" "res_body")] 0 m)])))
+        (Ifz status
+          0
+          [status
+           ((h-slot hs) [("ts" "res_body")] 0 m)
+           ((h-slot hs) [("ts" "res_ctype")] "text/plain; charset=utf-8" m)])))
     0))
 
 (define (mk-http-worker hs name self)
@@ -152,7 +194,7 @@
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
         (let* ((pax (rpath serial))
-               (record ((h-req hs) (_1 msg) (_2 msg) (_3 msg)))
+               (record ((h-req hs) (_1 msg) (_2 msg) (_3 msg) (url-target (_2 msg))))
                (task ((h-make hs) pax record))
                (sm ["spy" name pax])
                (cm ["cmd" name task]))
@@ -176,7 +218,7 @@
                     (Seq (Send coord sm)
                       (loop serial pending queue))))
                 (let ((cm ["cmd" name ((h-cull hs) pax)])
-                      (rm ["res" (_0 r) (_1 r)]))
+                      (rm ["res" (_0 r) (_1 r) (_2 r)]))
                   (Seq (DeepSeq cm (DeepSeq rm rm))
                     (Seq (Send coord cm)
                       (Seq (Send (_1 (_0 hit)) rm)
@@ -193,7 +235,7 @@
               (let ((hit (pend-get pending (_0 head))))
                 (Ifz hit
                   (loop serial pending rest)
-                  (let ((rm ["res" 500 (_0 (_0 rsvp))]))
+                  (let ((rm ["res" 500 (_0 (_0 rsvp)) "text/plain; charset=utf-8"]))
                     (Seq (DeepSeq rm rm)
                       (Seq (Send (_1 (_0 hit)) rm)
                         (loop serial (pend-drop pending (_0 head)) rest)))))))
@@ -211,3 +253,50 @@
            (let ((pump (Spawn (listener-pump port))))
              (SendCaps pump ["go"] [0])))
       (loop 0 [] []))))
+
+;;; Boot ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The live stack, end to end: compile the helm chain, spawn the
+;; coordinator with this HTTP worker, seed a little namespace to
+;; explore, make /io/http with the explorer kook + a real port, then
+;; park.  Everything after boot is namespace-driven: the serving kook
+;; installs the responder, crews hydrate views, the cycle cascades.
+(define (run-lain port)
+  ;; Warm the socket path in MAIN: spawned actors have no compiler,
+  ;; so any lazily-expanded define first demanded inside one dies
+  ;; with "no compiler set".  DeepSeq stops at pins, so the warmup
+  ;; CALLS each path once — executing in main compiles the whole
+  ;; call graph the pump and connection actors will touch.
+  (define warm
+    (DeepSeq
+      [(DeepSeq [conn-actor listener-pump mk-http-worker res-of
+                 pend-get pend-drop] 0)
+       (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
+       (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
+       (url-target "/ns/a/b")
+       (http-res 200 "text/plain" "hi")
+       (http-res 500 "text/plain" "no")
+       (request-body (strcat ["GET / HTTP/1.0" crlf crlf "body"]))]
+      0))
+  (define core (Seq warm (helm:load-helm-mod "helmapp")))
+  (define (app path) (helm:core-ent core path))
+  (define sov0 ((app ["seeded"]) 0))
+  (define t-data (app ["t_data"]))
+  (define vine-make (app ["vine_make"]))
+  (define cfg-port (app ["http_cfg_port"]))
+  (define helpers
+    ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
+  (define (mk-worker n) (mk-http-worker helpers n))
+  (define coord (Spawn (helm:helm-actor core mk-worker sov0)))
+  (define (inject t)
+    (Seq (SendCaps coord (DeepSeq t ["task" t]) [0])
+      (Recv 0)))
+  ;; something to look at
+  (Seq (inject (vine-make [("ts" "data") ("ts" "hello")] (t-data [("ts" "num")] 41)))
+    (Seq (inject (vine-make [("ts" "data") ("ts" "hello") ("ts" "world")] (t-data [("ts" "num")] 42)))
+      ;; the driver: explorer responder, real listener
+      (Seq (inject (vine-make [("ts" "io") ("ts" "http")] (cfg-port ("ts" "hex") port)))
+        (Seq (Trace ["lain listening" port] 0)
+          ;; park: the coordinator and its actors do the work now
+          (let ((park (lambda (go z) (Seq (Recv 0) (go go z)))))
+            (park park 0)))))))

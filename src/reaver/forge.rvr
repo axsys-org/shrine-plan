@@ -658,6 +658,10 @@
   (define s (foil:compile-mod-info foil:default-subject mod))
   (DeepSeq s s))
 
+(define (compile-forced-cached cache mod)
+  (define s (foil:compile-mod-info-cached cache foil:default-subject mod))
+  (DeepSeq s s))
+
 ;; Transitive import closure of a module, by parsing import runes.
 (define (import-closure mod)
   (define (go seen pend)
@@ -677,6 +681,31 @@
     (lambda (n)
       [n (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0)])
     (import-closure mod)))
+
+;; load-bundle with a shared compile cache: [cache' bundle].  The
+;; cache is compile-mod-go's [[name subject] ..] — each imported
+;; module's compiled subject — so sibling loads sharing an import
+;; chain walk it once.
+(define (load-bundle-cached cache mod)
+  (define src (read-text-file (strcat ["foil/" mod ".foil"])))
+  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
+  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+  (define cr (Try (compile-forced-cached cache) mod))
+  (define cache2 (If (Eq 1 (Hd cr)) cache (_0 (_0 cr))))
+  (define compiled (If (Eq 1 (Hd cr)) cr [(_1 (_0 cr))]))
+  (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  (define own-keys
+    (If (Eq 1 (Hd compiled))
+      []
+      (let ((sut (_0 (_0 compiled))))
+        (filter
+          (lambda (k)
+            (Ifz imported 1 (Nil (includes (Equal k) imported))))
+          (foil:module-decl-keys sut)))))
+  (define refs
+    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 (_0 compiled)))))
+  [cache2
+   ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys]])
 
 (define (load-bundle mod)
   (define src (read-text-file (strcat ["foil/" mod ".foil"])))
@@ -707,15 +736,43 @@
 (define (bundle-sut b) (_0 (_0 (bundle-compiled b))))
 (define (bundle-err b) (_0 (bundle-compiled b)))
 
-(define empty-state ["ST" [] []])
+(define empty-state ["ST" [] [] 0])
 (define st-bundles (Ix 1))
 (define st-evals (Ix 2))
+(define st-cache (Ix 3))
+
+;;; The persistent compile cache: st-cache holds [[name snapshot
+;;; subject] ..] — every module ever compiled as an import, with the
+;;; byte snapshot (own source + import closure) it was compiled
+;;; against.  Prune drops entries whose sources moved; strip yields
+;;; the [[name subject] ..] shape compile-mod-go threads; wrap
+;;; re-stamps a fresh cache for persisting.
+
+(define (cache-snap mod)
+  [(Try (lambda (z) (read-text-file (strcat ["foil/" mod ".foil"]))) 0)
+   (import-snapshot mod)])
+
+(define (cache-prune entries)
+  (filter (lambda (e) (Equal (_1 e) (cache-snap (_0 e)))) entries))
+
+(define (cache-strip entries)
+  (map (lambda (e) [(_0 e) (_2 e)]) entries))
+
+(define (cache-wrap cache)
+  (map (lambda (e) [(_0 e) (cache-snap (_0 e)) (_1 e)]) cache))
+
+(define (st-live-cache st)
+  (cache-strip (cache-prune (st-cache st))))
+
+(define (set-st-cache cache st)
+  (snap 3 (lambda (z) cache) st))
 
 (define (state-bundle st mod)
   (define hit (find (lambda (b) (Eq mod (bundle-mod b))) (st-bundles st)))
   (Ifz hit
-    (let ((b (load-bundle mod)))
-      [(snap 1 (snoc b) st) b])
+    (let ((cb (load-bundle-cached (st-live-cache st) mod)))
+      [(set-st-cache (cache-wrap (_0 cb)) (snap 1 (snoc (_1 cb)) st))
+       (_1 cb)])
     [st (_0 hit)]))
 
 (define (state-evict st mod)
@@ -1312,7 +1369,7 @@ document.addEventListener('DOMContentLoaded', () => swap('/ns', '#main'));
 ;;; default boot stays sequential.
 
 (define (warm-state-par mods)
-  ["ST" (async:async-all-deep load-bundle mods) []])
+  ["ST" (async:async-all-deep load-bundle mods) [] 0])
 
 (define (run-forge-par port)
   (define listen (Listen port))
