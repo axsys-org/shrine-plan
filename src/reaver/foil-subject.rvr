@@ -83,13 +83,21 @@
 
 
 
-;; A subject is ("SUT" ax order tvars).
+;; A subject is ("SUT" ax order tvars root).  The root is the
+;; compilation's namespace prefix: entry keys are stored rooted, source
+;; references resolve relative to it (canon-path), and row brands are
+;; therefore real namespace paths.  The boot process (builtins and the
+;; modules compiled against them) lives at /boot; an empty root is the
+;; unrooted (test/legacy) subject.
 (define sut-tvar (Ix 2))
 (define set-sut-tvar (Up 2))
 (define (sut-get-tvar? tvar sut) (find-idx (Eq tvar) (sut-tvar sut)))
 (define (sut-put-tvar tvar sut) (snap 2 (snoc tvar) sut))
+(define sut-root (Ix 3))
+(define set-sut-root (Up 3))
+(define (root-path sut p) (Weld (sut-root sut) p))
 
-(define (make-subject ax) ("SUT" ax 0 0))
+(define (make-subject ax) ("SUT" ax 0 0 []))
 (define subject-order Ix1)
 (define set-subject-order (Up 1))
 (define (push-subject-order name sut)
@@ -118,6 +126,12 @@
 (define (insert-ffi key val ty sut)
   (define tc (tc-ffi ty val))
   (insert-tc key wack-span tc sut))
+
+;; A navigation-only alias: the entry pinned at target also resolves
+;; at key.  Mount-style — the alias never joins the order, and
+;; canon-path normalizes through it to the target's canonical name.
+(define (alias-entry key target sut)
+  (snap 0 (putax key (gotax target (Ix 0 sut))) sut))
 
 (define (unpin-soft x)
   (If (IsPin x) (Unpin x) x))
@@ -250,11 +264,20 @@ assert(ty-var-path? ["ty-var" "v"])
           path
           (ty-ap-encode (map (lambda (p) (canon-path p sut)) parts)))))
     (else
-      ;; get-const yields a maybe of the pinned entry.
-      (let ((got (get-const path sut)))
-        (Ifz got
-          path
-          (_0 (unpin-soft (_0 got))))))))
+      ;; Rooted-first: a compilation-local declaration shadows a
+      ;; substrate builtin of the same name (matching the pre-root
+      ;; replace-at-insert semantics).  A miss both ways is a forward
+      ;; reference to a declaration of this compilation, which will be
+      ;; inserted rooted — so the rooted guess IS its canonical name
+      ;; (the wf post-pass still catches genuinely unbound paths).
+      (let ((rooted (root-path sut path)))
+        (let ((rgot (If (Equal rooted path) 0 (get-const rooted sut))))
+          (Ifz rgot
+            (let ((got (get-const path sut)))
+              (Ifz got
+                (If (Equal rooted path) path rooted)
+                (_0 (unpin-soft (_0 got)))))
+            (_0 (unpin-soft (_0 rgot)))))))))
 
 ;; Merge a compiled module's declared entries into sut at their
 ;; canonical paths.  An identical entry at an occupied path is the
@@ -279,9 +302,14 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; entries are already lowered under their canonical names) and types
 ;; written through them normalize via canon-path.
 (define (mount-subject blurb prefix keys imp sut)
+  ;; Mounted names live under the root like everything else: the
+  ;; canonical key is root ++ decl-path, so the mount is
+  ;; root ++ prefix ++ decl-path (source `vec/x` resolves through the
+  ;; canon-path root retry).
+  (define root (sut-root sut))
   (define (mount-one acc key)
     (define pin (gotax key (_0 imp)))
-    (define mkey (Weld prefix key))
+    (define mkey (Weld root (Weld prefix (drop (Sz root) key))))
     (define mine (getax mkey (_0 acc)))
     (cond
       ((Ifz mine 1 0) (snap 0 (putax mkey pin) acc))
@@ -336,6 +364,9 @@ assert(ty-var-path? ["ty-var" "v"])
  set-sut-tvar
  sut-get-tvar?
  sut-put-tvar
+ sut-root
+ set-sut-root
+ root-path
  make-subject
  subject-order
  set-subject-order
@@ -349,6 +380,7 @@ assert(ty-var-path? ["ty-var" "v"])
  insert-tc
  wack-span
  insert-ffi
+ alias-entry
  got-entry
  get-const
  got-const

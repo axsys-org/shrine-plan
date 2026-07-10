@@ -169,8 +169,12 @@
         (ty:TBAD "uimpl tapp"))))
 
   (cond
+    ;; An anonymous structural row: bare TROW with cstr 0, never
+    ;; TTYP-wrapped here — declaration sites re-wrap via as-ttyp and
+    ;; brand the cstr at insert-typ; type-use positions get the bare
+    ;; row (runtime head 0, outside UFCS).
     ((tag-is "s_trow")
-      (ty:TTYP (ty:TROW 0 (map (elab-type-env sut env) (surf-row-kids wav)))))
+      (ty:TROW 0 (map (elab-type-env sut env) (surf-row-kids wav))))
     ((tag-is "s_face")
      (ty:TFAC (surf-face-name wav)
        (elab-type-env sut env (surf-face-kid wav))))
@@ -291,11 +295,14 @@
   ;; parent's declared var names with the ridden args, keep the args
   ;; whose name appears in the member's own chain.  Downstream
   ;; positional consumers are then correct by construction.
-  (define sel
+  (define (sel-for nom)
     (If (ty-ap-path? nom)
       (let* ((parts (ty-ap-decode nom))
              (base (Ix 0 parts))
-             (mpath (snoc meth base)))
+             ;; Reopened members of builtin types insert rooted while
+             ;; the builtin's own path is substrate (unrooted): resolve
+             ;; the member path canonically.
+             (mpath (canon-path (snoc meth base) sut)))
         (Ifz (get-const mpath sut)
           mpath
           (let* ((param-names
@@ -309,7 +316,7 @@
             (Ifz (Sz kept)
               mpath
               (ty-ap-encode (Weld [mpath] (map (Ix 1) kept)))))))
-      (snoc meth nom)))
+      (canon-path (snoc meth nom) sut)))
   ;; Law-valued methods are referenced by name, mirroring elab-ref.
   (define (by-name path tc)
     (If (Eq "TC_LAM" (Hd tc))
@@ -329,7 +336,7 @@
       (foldl (ty:type-join sut) (_0 (ty:trow-vals row)) (drop 1 (ty:trow-vals row)))))
   ;; A method that isn't declared is a user typo, not a bad entry.
   (define (builtin-meth prefix)
-    (define bsel (Weld prefix [meth]))
+    (define bsel (canon-path (Weld prefix [meth]) sut))
     (Ifz (get-const bsel sut)
       (error ["no such method" ["path" bsel]])
       (got-entry-tc bsel sut)))
@@ -342,32 +349,51 @@
       (tc-ffi (ty:TFUN [ty] (_2 arg)) (Ix (_0 arg))))
     (Ifz hit
       (row-method)
-      (accessor (_0 hit))))
+      ;; Anonymous rows (cstr 0) are outside UFCS by design: no face
+      ;; accessors, no set_/over_.  The row/* builtins above still
+      ;; apply where the receiver nests as an array.
+      (If (Eq 0 (ty:trow-cstr row))
+        (error ["anonymous row types are outside UFCS - bind the value to a local (=  > x ...) and use the bare face name" ["face" meth]])
+        (accessor (_0 hit)))))
   ;; Nominal receivers keep their names now (type-meet preserves
   ;; molds), so face access on them arrives here: when there is no
   ;; declared method under the receiver's path, fall back to the
-  ;; expanded row shape and its faces.
-  (define (score-nom)
-    (If (get-const sel sut)
-      (by-name sel (applied-entry-tc sut sel))
-      ;; Face access: use the *declared* row specialized by the
-      ;; receiver's type arguments — expanding the whole receiver would
-      ;; hand the accessor a denormalized face type.
-      (let ((decl (If (And (get-const nom sut) (ty:type-entry? nom sut))
-                    (applied-type sut nom)
-                    ty:TBAD)))
-        (If (Eq "TROW" (_1 decl))
-          (row-meth decl)
-          (let ((span (ty:mold-to-span sut ty)))
-            (If (Eq "TROW" (_1 span))
-              (row-meth span)
-              (error ("bad dot call" obj meth))))))))
-  (cond
-    ((Eq tag "TNOM") (score-nom))
-    ((Eq tag "TROW") (row-meth ty))
-    ((Eq tag "TARR") (specialize-method (builtin-meth ["row"]) [(_2 ty)]))
-    ((Eq tag "TNAT") (builtin-meth ["uint"]))
-    (else (error ("bad dot call" obj meth)))))
+  ;; expanded row shape and its faces.  A nominal whose entry holds
+  ;; *another type* is an alias (+ path row[quip]): its own declared
+  ;; methods win, then lookup re-dispatches on the unfolded type.
+  (define (score-ty t)
+    (define (score-nom t)
+      (define nom (_2 t))
+      (define sel (sel-for nom))
+      (If (get-const sel sut)
+        (by-name sel (applied-entry-tc sut sel))
+        ;; Face access: use the *declared* row specialized by the
+        ;; receiver's type arguments — expanding the whole receiver
+        ;; would hand the accessor a denormalized face type.  An
+        ;; entry holding another NOMINAL is an alias link: follow it
+        ;; before falling back to the expanded row shape, so the
+        ;; target's declared methods win over its span's faces.
+        (let ((decl (If (And (get-const nom sut) (ty:type-entry? nom sut))
+                      (applied-type sut nom)
+                      ty:TBAD)))
+          (cond
+            ((Eq "TROW" (_1 decl)) (row-meth decl))
+            ((And (Eq "TNOM" (_1 decl)) (Nil (Equal decl t)))
+              (score-ty decl))
+            (else
+              (let ((span (ty:mold-to-span sut t)))
+                (If (Eq "TROW" (_1 span))
+                  (row-meth span)
+                  (If (Or (Eq "TBAD" (_1 decl)) (Equal decl t))
+                    (error ("bad dot call" obj meth))
+                    (score-ty decl)))))))))
+    (cond
+      ((Eq (_1 t) "TNOM") (score-nom t))
+      ((Eq (_1 t) "TROW") (row-meth t))
+      ((Eq (_1 t) "TARR") (specialize-method (builtin-meth ["row"]) [(_2 t)]))
+      ((Eq (_1 t) "TNAT") (builtin-meth ["uint"]))
+      (else (error ("bad dot call" obj meth)))))
+  (score-ty ty))
 
 (define (elab-val sut env surf)
   (define (tag-is x) (Eq x (_0 surf)))
@@ -447,6 +473,23 @@
       (elab-error env "cannot apply function to these arguments"
         ["fun" (tc-ty f) "args" xs-ty "because" ty])
       (set-tc-ty ty app)))
+  ;; A loop (|) is an immediately-applied anonymous lambda: params come
+  ;; from the arm patterns, inits elaborate in the OUTER env (parallel
+  ;; binding — it's one call), and (_ ...) re-enters through the self
+  ;; slot.  Without a ^ cast the self return type is TBOT — a self-call
+  ;; joins away against the base-case branches, so the loop's type is
+  ;; the join of its non-recursive exits (the same trick no-fallthrough
+  ;; matches use for their missing heir).
+  (define (elab-loop l[_ arms body])
+    (define argty (map (lambda (a) (elab-ty (_1 a))) arms))
+    (define inits (map (lambda (a) (elab-val sut env (_2 a))) arms))
+    (define ret0 (peek-ret-cast sut env body))
+    (define ret (If (Equal ty:TBAD ret0) ty:TBOT ret0))
+    (define frame (Weld [(ty:TSELF (ty:TFUN argty ret))] argty))
+    (define inner-env (push-locals env frame))
+    (define val (elab-val sut inner-env body))
+    (define lam (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
+    (on-call lam inits))
   (define (elab-spec s[_ val args])
     (define base (elab-val sut env val))
     (define bty0
@@ -582,10 +625,13 @@
   (define (elab-ref r[_ path])
     ;; An unbound name is the single most common user error: a located
     ;; diagnostic, never a bare ("bad entry" ...) from the lookup.
-    (unless (Nil (get-const path sut))
-      (let ((referee (got-entry-tc path sut)))
+    ;; Source paths are root-relative; the canonical (rooted) name is
+    ;; what the entry and the global link carry.
+    (define cpath (canon-path path sut))
+    (unless (Nil (get-const cpath sut))
+      (let ((referee (got-entry-tc cpath sut)))
         (If (Eq "TC_LAM" (Hd referee))
-          (tc-global (tc-ty referee) path)
+          (tc-global (tc-ty referee) cpath)
           referee))
       (elab-error env "unbound reference" ["path" path])))
   (define (slot-path path)
@@ -607,7 +653,17 @@
           0))
       (cond
         ((Eq tag "TFAC")
-          (If (Eq face (_2 ty)) [[ty path]] 0))
+          (If (Eq face (_2 ty))
+            [[ty path]]
+            ;; Anonymous rows are transparent aggregates: bare faces
+            ;; resolve through a faced local holding one.  Named molds
+            ;; stay opaque here (their faces are reached via UFCS) —
+            ;; recursing into them would silently rebind bare words
+            ;; like key/val inside match arms.
+            (let ((inner (ty:tfac-val ty)))
+              (If (And (Eq "TROW" (_1 inner)) (Eq 0 (ty:trow-cstr inner)))
+                (scan-ty inner path)
+                0))))
         ((Eq tag "TROW")
           (scan-row (ty:trow-vals ty)))
         ((Eq tag "TNOM")
@@ -638,7 +694,7 @@
   (define (elab-literal l[_ shape text])
     (cond
       ((Eq shape "quip")
-        (tc-lit (ty:TNOM ["quip"] 0) (quip:parse-quip text)))
+        (tc-lit (ty:TNOM (canon-path ["quip"] sut) 0) (quip:parse-quip text)))
       ;; A cord is a bare text nat, typed by its constant.
       ((Eq shape "cord")
         (tc-lit (ty:TNAT text) text))
@@ -687,10 +743,28 @@
     ;; Lowered arm tests dispatch on constructor head + arity; a pattern
     ;; that doesn't narrow the scrutinee to a row has no such key.
     (define span (burp-face (ty:mold-to-span sut ty)))
+    ;; A binderless anonymous-row pattern binds through its own faces:
+    ;; the meet burps mismatched faces, so re-impose the pattern's on
+    ;; the narrowed local — the arm body's bare names then resolve to
+    ;; the pattern's fields.  Named patterns are untouched.
+    (define (impose-faces met)
+      (ty:TROW (ty:trow-cstr met)
+        (map (lambda (pr)
+               (If (Eq "TFAC" (_1 (_0 pr)))
+                 (ty:TFAC (_2 (_0 pr)) (burp-face (_1 pr)))
+                 (_1 pr)))
+          (zip (ty:trow-vals pat-ty) (ty:trow-vals met)))))
+    (define local-ty
+      (If (And (Eq "TROW" (_1 pat-ty))
+            (And (Eq 0 (ty:trow-cstr pat-ty))
+              (And (Eq "TROW" (_1 ty))
+                (Eq (Sz (ty:trow-vals pat-ty)) (Sz (ty:trow-vals ty))))))
+        (impose-faces ty)
+        ty))
     (unless (Eq "TROW" (_1 span))
       (elab-error env "match arm pattern is not a row (constructor) type"
         ["pattern" pat-ty "narrowed" ty])
-      (let ((res (elab-val sut (push-local-env env ty) val)))
+      (let ((res (elab-val sut (push-local-env env local-ty) val)))
         (tc-arm (tc-ty res) ty res))))
   ;; Lowered arm tests dispatch on constructor head + arity only
   ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
@@ -759,7 +833,7 @@
     (define fall1 (elab-val sut env fall))
     (define out-ty (ty:type-join sut (tc-ty tru1) (tc-ty fall1)))
     (define if-ty (ty:TFUN [(ty:TNAT 0) out-ty out-ty] out-ty))
-    (define if-tc (set-tc-ty if-ty (got-entry-tc ["if"] sut)))
+    (define if-tc (set-tc-ty if-ty (got-entry-tc (canon-path ["if"] sut) sut)))
     (on-call if-tc [scrut tru1 fall1]))
   (define (elab-self s[_ xs])
     (define found (find-idx match-self (env-locals env)))
@@ -825,6 +899,7 @@
     ((tag-is "s_tvars") (elab-tvars surf))
     ((tag-is "s_cvars") (elab-cvars surf))
     ((tag-is "s_letrec") (elab-letrec surf))
+    ((tag-is "s_loop") (elab-loop surf))
     ((tag-is "s_ufcs_put")
       (elab-unsupported env "UFCS put (.#) — use .set_<face>(val)"))
     ((tag-is "s_ufcs_over")
@@ -905,9 +980,12 @@
   ;; and the module reports every failed decl at once.  The TC is
   ;; deep-forced inside the Try — elaboration is lazy enough that an
   ;; unforced error would otherwise fire in a neighbor's context.
-  (define (elab-entry acc ent[_ name span body])
+  (define (elab-entry acc ent[_ name0 span body])
     (define sut (_0 acc))
     (define diags (_1 acc))
+    ;; Declarations insert at their rooted (canonical) key; source
+    ;; references stay relative and resolve through canon-path.
+    (define name (root-path sut name0))
     (define r
       (Try (lambda (z)
              (let ((tc (elab-val sut (set-env-name name empty-env) body)))
@@ -947,7 +1025,7 @@
   ;; against the *final* subject (types may reference declarations that
   ;; follow them, so checking at insert time is too early).
   (define (wf-entry sut1 diags ent[_ name span body])
-    (define entry-tc (got-entry-tc name sut1))
+    (define entry-tc (got-entry-tc (root-path sut1 name) sut1))
     (define res (ty:check-type-wf sut1 (tc-ty entry-tc)))
     (If (Eq "left" (Hd res))
       (snoc ["in-decl" name (_0 res) (span-blurb span)] diags)

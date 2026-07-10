@@ -26,6 +26,20 @@
 (define (parse-road els)
   (surf-ref (map rx-word-str! els)))
 
+;; A specialization bracket.  Rex normalization absorbs the rune of a
+;; bracket wrapping a single rune expression ([uon/kv[v]] arrives as a
+;; "/"-runed brack), so a spec bracket is any brack-colored nest.
+(define (spec-brack? b)
+  (And (rx-nest? b) (Eq "brack" (rx-nest-color b))))
+
+;; Bracket arguments of a specialization: a plain brack holds one kid
+;; per argument; a runed brack is a single argument — the rune
+;; expression, reconstituted as a clear nest.
+(define (brack-args cont b)
+  (If (Eq "" (rx-nest-rune b))
+    (map cont (rx-nest-kids b))
+    [(cont ["nest" (rx-span b) "clear" (rx-nest-rune b) (rx-nest-kids b)])]))
+
 ;;; Located parse errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Every rex node carries its source span at Ix 1: [line col off len].
@@ -78,7 +92,7 @@
   (define (spec-tail jkids)
     (And (Eq 2 (Sz jkids))
       (And (rx-word? (_0 jkids))
-        (And (rx-plain? "brack" (_1 jkids))
+        (And (spec-brack? (_1 jkids))
           (all rx-word? (Init kids))))))
   (cond
     ;; =foo/bar — the autonamer wraps the whole path in a face named
@@ -92,7 +106,7 @@
       (let ((jkids (rx-juxt-kids last)))
         (surf-tapp
           (Weld [(parse-road (Weld (Init kids) [(_0 jkids)]))]
-            (map cont (rx-nest-kids (_1 jkids)))))))
+            (brack-args cont (_1 jkids))))))
     (else (sast-error-at (And (Sz kids) (_0 kids)) "bad type path" kids))))
 
 (define (parse-anon-variant x)
@@ -142,9 +156,8 @@
       ((And (Eq "paren" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-tapp kids))
-      ((And (Eq "curly" (rx-nest-color nes))
-         (Eq "" (rx-nest-rune nes)))
-        (surf-trow kids))
+      ;; Plain-curly rows are retired: curly is function types only;
+      ;; anonymous structural rows are spelled with brackets.
       ((And (Eq "curly" (rx-nest-color nes))
          (Eq ";" (rx-nest-rune nes)))
         (unless (Gt (Sz kids) 1)
@@ -166,10 +179,10 @@
     (cond
       ((And (Eq 2 (Sz kids))
          (And (rx-word? (_0 kids))
-           (rx-plain? "brack" (_1 kids))))
+           (spec-brack? (_1 kids))))
         (surf-tapp
           (Weld [(surf-ref [(rx-word-str! (_0 kids))])]
-            (map parse-type-sast (rx-nest-kids (_1 kids))))))
+            (brack-args parse-type-sast (_1 kids)))))
       (else (sast-error "bad type juxt" jux))))
   (cond
     ((rx-nest? ty) (on-nest ty))
@@ -253,10 +266,10 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
   (define (parse-spec kids)
     (surf-spec
       (parse-val-sast (_0 kids))
-      (map parse-type-sast (rx-nest-kids (_1 kids)))))
+      (brack-args parse-type-sast (_1 kids))))
   (define (spec-juxt? kids)
     (And (Eq 2 (Sz kids))
-      (And (rx-plain? "brack" (_1 kids))
+      (And (spec-brack? (_1 kids))
         (Nil (And (rx-nest? (_0 kids))
           (Eq "clear" (rx-nest-color (_0 kids))))))))
   (define (parse-path-val kids)
@@ -267,11 +280,33 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
               (all rx-word? (Weld (Init kids) [(_0 jkids)])))
           (surf-spec
             (parse-road (Weld (Init kids) [(_0 jkids)]))
-            (map parse-type-sast (rx-nest-kids (_1 jkids))))
+            (brack-args parse-type-sast (_1 jkids)))
           (parse-road kids)))
       (parse-road kids)))
   (define (parse-letrec kids heir)
     (surf-letrec (map (parse-arm parse-val-sast) kids) heir))
+  ;; Loop (|) parameter arms.  One arm is `> face=type init`; arms on
+  ;; one line chain (rex packs the next > nest as a kid of the
+  ;; previous), stacked > lines arrive as flat sibling kids.
+  (define (loop-arm-of ks)
+    (unless (Eq 2 (Sz ks))
+      (sast-error "bad loop parameter arm" val)
+      (surf-arm (parse-type-sast (_0 ks)) (parse-val-sast (_1 ks)))))
+  (define (loop-arm-chain nest acc)
+    (define (go own rest)
+      (Ifz rest
+        (snoc (loop-arm-of own) acc)
+        (If (rx-rune? ">" (_0 rest))
+          (loop-arm-chain (_0 rest) (snoc (loop-arm-of own) acc))
+          (go (snoc (_0 rest) own) (drop 1 rest)))))
+    (go [] (rx-rune-kids nest)))
+  (define (parse-loop-arms kids)
+    (foldl
+      (lambda (acc k)
+        (If (rx-rune? ">" k)
+          (loop-arm-chain k acc)
+          (sast-error "loop (|) parameters must be > arms" val)))
+      [] (rx-juxt-flat kids)))
   (define (body-flat items)
     (define (flat-one acc item)
       (Weld acc
@@ -302,7 +337,14 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           (sast-error "bad dollar form" val)
           (If (And (rx-word? (_0 kids)) (Eq foil-no-heir heir))
             (parse-anon-variant (_0 kids))
-            (parse-type-sast (_0 kids)))))
+            ;; Row declarations migrated to the tall : form; a bracket
+            ;; here is stale syntax, not an anonymous row.
+            (If (And (rx-nest? (_0 kids))
+                  (Eq "brack" (rx-nest-color (_0 kids))))
+              (sast-error-at (_0 kids)
+                "row declarations moved to ':' - write `:  foo=bar ...` instead of `$  [foo=bar ...]`"
+                (_0 kids))
+              (parse-type-sast (_0 kids))))))
       ((Eq "\" rune)
         (surf-fun (map parse-type-sast kids) heir))
       ((Eq "%" rune)
@@ -325,6 +367,30 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             heir)))
       ((Eq "=" rune)
         (parse-letrec kids heir))
+      ;; Loop: `|  > foo=nat 3` declares loop params with initial
+      ;; values; the heir is the body, re-entered via (_ ...).  Arms
+      ;; written on one line chain (the next > nest rides as a kid of
+      ;; the previous), so unchain; stacked > lines arrive flat.
+      ((Eq "|" rune)
+        (unless (Nil (Eq foil-no-heir heir))
+          (sast-error "loop (|) requires a body" val)
+          (let ((arms (parse-loop-arms kids)))
+            (unless (Gt (Sz arms) 0)
+              (sast-error "loop (|) requires at least one > parameter arm" val)
+              (surf-loop arms heir)))))
+      ;; Tall row type declaration: `:  foo=bar baz=qux`.  Kids are the
+      ;; faced field types; a lone `:` is the empty row (and `:  []` is
+      ;; accepted as its bracketed spelling).
+      ((Eq ":" rune)
+        (unless (Eq foil-no-heir heir)
+          (sast-error "row type declaration (:) does not take a body" val)
+          (surf-trow
+            (map parse-type-sast
+              (If (And (Eq 1 (Sz kids))
+                    (And (rx-plain? "brack" (_0 kids))
+                      (Eq 0 (Sz (rx-nest-kids (_0 kids))))))
+                []
+                kids)))))
       (else (sast-error "wack rune" val))))
   (define (parse-body items)
     (define kids (body-flat items))
@@ -341,8 +407,10 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             ((rx-rune? "%" body) (handle-rune "%" (rx-rune-kids body) hair))
             ((rx-rune? "^" body) (handle-rune "^" (rx-rune-kids body) hair))
             ((rx-rune? "&" body) (handle-rune "&" (rx-rune-kids body) hair))
+            ((rx-rune? ":" body) (handle-rune ":" (rx-rune-kids body) hair))
             ((rx-rune? "?" body) (handle-rune "?" (rx-rune-kids body) hair))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
+            ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
             ((And (rx-nest-is? "paren" "@" body) (Ne foil-no-heir hair))
               (parse-doc-tvar (rx-nest-kids body) hair))
             ((And (rx-nest-is? "paren" "=" body) (Ne foil-no-heir hair))
@@ -402,6 +470,14 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
       ((And (Eq "brack" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-row (map parse-val-sast (rx-nest-kids nes))))
+      ;; A bracket wrapping a single rune expression absorbs the rune
+      ;; during rex normalization ([h.key] arrives as a "."-runed
+      ;; brack): a one-element row of that expression.
+      ((Eq "brack" (rx-nest-color nes))
+        (surf-row
+          [(parse-val-sast
+             ["nest" (rx-span nes) "clear" (rx-nest-rune nes)
+              (rx-nest-kids nes)])]))
       (else (sast-error "bad rex val nest" val))))
   (cond
     ((rx-nest? val) (on-nest val))

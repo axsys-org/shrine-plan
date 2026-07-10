@@ -30,7 +30,7 @@
   (foil:lower-tc-mod final final))
 
 (define (lowered path sut)
-  (foil:ir-entry-val (got-entry path sut)))
+  (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
 
 
 ;;; Argument order ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -147,7 +147,7 @@ assert(Eq 3 (lets 0))
 
 (define upd-sut (compile-inline "
 +  pt
-  $  [x=nat y=nat]
+  :  x=nat y=nat
 +  mk
   \  x=nat y=nat
   ^  pt
@@ -279,7 +279,7 @@ assert(Eq 1 (Hd non-row-arm-err))
 (define sum-collide-err
   (Try (lambda (x) (compile-inline "
 +  cpt
-  $  [x=nat y=nat]
+  :  x=nat y=nat
 +  clash
   &  ($a nat)
      ($a cpt)
@@ -314,7 +314,7 @@ assert(Eq 1 (Hd under-spec-err))
   (@ v)
   +  cell
     (@ v)
-    $  [val=v]
+    :  val=v
   &  box/cell[v]
 +  bad_over
   ^  nat
@@ -381,7 +381,7 @@ assert(Eq 1 (Hd inline-import-err))
 (define fnarg-sut (compile-inline "
 +  pbox
   (@ v)
-  $  [val=v]
+  :  val=v
 +  fnbox
   \  b=pbox[{nat; nat}]
   ^  nat
@@ -564,13 +564,13 @@ assert(Eq 4 (lowered ["mapuser_rev"] mapuser-rev-sut))
 ;; materialization shape: the full key is a real lowered entry, the
 ;; const-bearing base member stays a TC (skipped by base lowering)
 (define map-insert-lt-key
-  (ty-ap-encode [["map" "insert"] ["nat"] ["lt"]]))
+  (ty-ap-encode [["boot" "map" "insert"] ["nat"] ["lt"]]))
 assert(Eq "IR_ENTRY" (Hd (got-entry map-insert-lt-key map-sut)))
-assert(Eq "TC" (Hd (got-entry ["map" "insert"] map-sut)))
+assert(Eq "TC" (Hd (got-entry ["boot" "map" "insert"] map-sut)))
 (define map-has-lt-key
-  (ty-ap-encode [["map" "has"] ["nat"] ["lt"]]))
+  (ty-ap-encode [["boot" "map" "has"] ["nat"] ["lt"]]))
 assert(Eq "IR_ENTRY" (Hd (got-entry map-has-lt-key mapuser-sut)))
-assert(Eq "TC" (Hd (got-entry ["map" "has"] mapuser-sut)))
+assert(Eq "TC" (Hd (got-entry ["boot" "map" "has"] mapuser-sut)))
 
 
 ;;; Constant symbols, literal precision, the autonamer ;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -622,9 +622,9 @@ assert(Eq 1 (Hd wrong-const-err))
 ;; the autonamer names row fields and accessors after the type
 (define autoname-sut (compile-inline "
 +  point
-  $  [x=nat y=nat]
+  :  x=nat y=nat
 +  holder
-  $  [=point tag=nat]
+  :  =point tag=nat
 +  getp
   \  h=holder
   ^  nat
@@ -742,5 +742,398 @@ assert(Eq 3 (lowered ["mk"] autoname-sut))
 
 (define crash-leaks (filter (lambda (x) x) (map crash-one crash-corpus)))
 assert(Eq 0 (Sz crash-leaks))
+
+
+;;; Anonymous structural rows ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; [..] in type position is a bare cstr-0 row: runtime head literally
+;; 0 (PLAN row rep), outside UFCS; consumed by binding + bare faces,
+;; match arms, or host-side Ix.
+
+(define anon-sut (compile-inline "
++  pmaybe
+  &  ($some nat)
+     $none
++  mk
+  \  k=nat
+  ^  [found=pmaybe rest=nat]
+  [($some k) (add k 1)]
++  use
+  \  k=nat
+  ^  nat
+  =  > res (mk k)
+  ?  found
+   > ($some v=nat)  (add v rest)
+   > $none  0
++  fst2
+  \  p=[a=nat b=nat]
+  ^  nat
+  a
++  splitn
+  \  n=nat
+  ^  [lo=nat hi=nat]
+  ?  (lt n 10)
+     [n 0]
+  =  > r (_ (sub n 10))
+  [lo (add 1 hi)]
++  arm_use
+  \  p=[a=nat b=nat]
+  ^  nat
+  ?  p
+   > r=[x=nat y=nat]  (add x y)
++  arm_free
+  \  p=[a=nat b=nat]
+  ^  nat
+  ?  p
+   > [x=nat y=nat]  (add x (add x y))
++  addpairs
+  \  xs=row[[a=nat b=nat]]
+  ^  nat
+  ?  (eq 0 xs.len)
+     0
+  =  > h xs.at(0)
+  (add (add a b) (_ xs.drop(1)))
++  litlen
+  ^  nat
+  =  > r [1 2 3]
+  r.len
+"))
+
+;; runtime head is literally 0: the value IS a PLAN row
+(define anon-mk (lowered ["mk"] anon-sut))
+assert(Equal [("some" 5) 6] (anon-mk 5))
+assert(Eq 0 (Hd (anon-mk 5)))
+assert(Equal ("some" 5) (_0 (anon-mk 5)))
+assert(Eq 6 (_1 (anon-mk 5)))
+
+;; bare faces resolve through a letrec-bound anonymous row
+(define anon-use (lowered ["use"] anon-sut))
+assert(Eq 11 (anon-use 5))
+
+;; ... and through a TFAC-wrapped anonymous-row parameter
+(define anon-fst2 (lowered ["fst2"] anon-sut))
+assert(Eq 7 (anon-fst2 [7 9]))
+
+;; self-recursion under an anonymous return cast
+(define anon-splitn (lowered ["splitn"] anon-sut))
+assert(Equal [3 0] (anon-splitn 3))
+assert(Equal [3 2] (anon-splitn 23))
+
+;; match arm on an anonymous row: key (0, arity)
+(define anon-arm (lowered ["arm_use"] anon-sut))
+assert(Eq 12 (anon-arm [5 7]))
+
+;; binderless arm patterns bind through the pattern's own faces
+(define anon-arm-free (lowered ["arm_free"] anon-sut))
+assert(Eq 17 (anon-arm-free [5 7]))
+
+;; anonymous rows as spec arguments: row[[a=nat b=nat]]
+(define anon-addpairs (lowered ["addpairs"] anon-sut))
+assert(Eq 10 (anon-addpairs [[1 2] [3 4]]))
+
+;; row builtins still reach cstr-0 receivers that nest as arrays
+(define anon-litlen (lowered ["litlen"] anon-sut))
+assert(Eq 3 anon-litlen)
+
+;; UFCS face access on an anonymous row is rejected
+(define anon-ufcs-err
+  (Try (lambda (x) (compile-inline "
++  bad
+  \  p=[a=nat b=nat]
+  ^  nat
+  p.a
+")) 0))
+assert(Eq 1 (Hd anon-ufcs-err))
+
+;; named and anonymous rows do not cross-flow, either direction
+(define named-into-anon-err
+  (Try (lambda (x) (compile-inline "
++  pt
+  :  x=nat y=nat
++  bad2
+  \  q=pt
+  ^  [x=nat y=nat]
+  q
+")) 0))
+assert(Eq 1 (Hd named-into-anon-err))
+(define anon-into-named-err
+  (Try (lambda (x) (compile-inline "
++  pt
+  :  x=nat y=nat
++  bad3
+  \  q=[x=nat y=nat]
+  ^  pt
+  q
+")) 0))
+assert(Eq 1 (Hd anon-into-named-err))
+
+;; stale $ [..] row declarations get the migration diagnostic
+(define dollar-row-err
+  (Try (lambda (x) (compile-inline "
++  pt2
+  $  [x=nat y=nat]
+")) 0))
+assert(Eq 1 (Hd dollar-row-err))
+
+
+;;; Loops (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; An immediately-applied lambda: > arms declare typed loop params with
+;; initial values; (_ ...) re-enters; no ^ cast needed (the loop's type
+;; is the join of its non-recursive exits).
+
+(define loop-sut (compile-inline "
++  countdown
+  \  n=nat
+  ^  nat
+  |  > foo=nat n
+  ?  (eq 0 foo)
+     foo
+  (_ (dec foo))
++  triangle
+  \  n=nat
+  ^  nat
+  |  > i=nat n  > acc=nat 0
+  ?  (eq 0 i)
+     acc
+  (_ (dec i) (add acc i))
++  scaled_triangle
+  \  n=nat k=nat
+  ^  nat
+  |  > i=nat n  > acc=nat 0
+  ?  (eq 0 i)
+     acc
+  (_ (dec i) (add acc (mul k i)))
++  cast_loop
+  \  n=nat
+  ^  nat
+  |  > i=nat n
+  ^  nat
+  ?  (le i 1)
+     1
+  (mul i (_ (dec i)))
++  nested_loops
+  \  n=nat
+  ^  nat
+  |  > i=nat n  > outer_acc=nat 0
+  ?  (eq 0 i)
+     outer_acc
+  =  > rowsum
+       |  > j=nat i  > acc=nat 0
+       ?  (eq 0 j)
+          acc
+       (_ (dec j) (add acc j))
+  (_ (dec i) (add outer_acc rowsum))
+"))
+
+;; the motivating example: counts down to 0
+(define loop-countdown (lowered ["countdown"] loop-sut))
+assert(Eq 0 (loop-countdown 3))
+assert(Eq 0 (loop-countdown 0))
+
+;; two loop params, accumulator shape
+(define loop-triangle (lowered ["triangle"] loop-sut))
+assert(Eq 0 (loop-triangle 0))
+assert(Eq 6 (loop-triangle 3))
+assert(Eq 15 (loop-triangle 5))
+
+;; the loop body captures an enclosing fn param (k): lambda-lift path
+(define loop-scaled (lowered ["scaled_triangle"] loop-sut))
+assert(Eq 30 (loop-scaled 5 2))
+assert(Eq 45 (loop-scaled 5 3))
+
+;; an explicit ^ cast as the loop body's first form still works —
+;; needed when the recursive result is consumed (not in tail position)
+(define loop-cast (lowered ["cast_loop"] loop-sut))
+assert(Eq 120 (loop-cast 5))
+
+;; nested loops: (_ ...) binds the innermost loop
+(define loop-nested (lowered ["nested_loops"] loop-sut))
+assert(Eq 0 (loop-nested 0))
+assert(Eq 10 (loop-nested 3))
+
+;; a self-call arity mismatch inside a loop is rejected
+(define loop-arity-err
+  (Try (lambda (x) (compile-inline "
++  bad_loop
+  \  n=nat
+  ^  nat
+  |  > i=nat n
+  (_ i i)
+")) 0))
+assert(Eq 1 (Hd loop-arity-err))
+
+;;; The pail universe ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; `pail` is the open union of nominal row types: any declared row
+;; value flows into a pail position, and matches dispatch by branded
+;; head — with a mandatory fallthrough (open universe).
+
+(define pail-sut (compile-inline "
++  kook
+  :  ids=row[quip]
++  npail
+  :  n=nat
++  mk_n
+  \  x=nat
+  ^  pail
+  (npail x)
++  mk_k
+  \  ids=row[quip]
+  ^  pail
+  (kook ids)
++  disc
+  \  p=pail
+  ^  nat
+  ?  p
+   > k=kook  k.ids.len
+   > x=npail  x.n
+  99
++  many
+  \  ps=row[pail]
+  ^  nat
+  |  > i=nat 0  > acc=nat 0
+  ?  (eq i ps.len)
+     acc
+  =  > h ps.at(i)
+  (_ i.inc (add acc (disc h)))
++  boxed
+  :  slot=pail
++  reslot
+  \  b=boxed
+  ^  nat
+  ?  b.slot
+   > x=npail  x.n
+  0
+"))
+(define mk-n (lowered ["mk_n"] pail-sut))
+(define mk-k (lowered ["mk_k"] pail-sut))
+(define p-disc (lowered ["disc"] pail-sut))
+(define p-many (lowered ["many"] pail-sut))
+(define p-reslot (lowered ["reslot"] pail-sut))
+
+;; runtime heads are the declaration brands
+(define np7 (mk-n 7))
+assert(Eq "/boot/npail" (Hd np7))
+assert(Eq 7 (_0 np7))
+;; dispatch by branded head, fallthrough for the open remainder
+assert(Eq 7 (p-disc np7))
+assert(Eq 2 (p-disc (mk-k [("ts" "a") ("ts" "b")])))
+;; heterogeneous pail rows
+assert(Eq 3 (p-many [(mk-n 2) (mk-k [("ts" "a")])]))
+;; pail-typed fields in rows (boxed values built host-side by brand)
+assert(Eq 5 (p-reslot ("/boot/boxed" (mk-n 5))))
+assert(Eq 0 (p-reslot ("/boot/boxed" (mk-k []))))
+
+;; anonymous rows do not inhabit pail
+(define anon-pail-err
+  (Try (lambda (x) (compile-inline "
++  bad
+  \  x=nat
+  ^  pail
+  [x]
+")) 0))
+assert(Eq 1 (Hd anon-pail-err))
+
+;; sums do not inhabit pail
+(define sum-pail-err
+  (Try (lambda (x) (compile-inline "
++  pm
+  &  ($some nat)
+     $none
++  bad2
+  \  x=pm
+  ^  pail
+  x
+")) 0))
+assert(Eq 1 (Hd sum-pail-err))
+
+;; a match on a pail without fallthrough is rejected (open universe)
+(define pail-exhaust-err
+  (Try (lambda (x) (compile-inline "
++  npail2
+  :  n=nat
++  bad3
+  \  p=pail
+  ^  nat
+  ?  p
+   > x=npail2  x.n
+")) 0))
+assert(Eq 1 (Hd pail-exhaust-err))
+
+;;; Type aliases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; A + declaration whose body is a type expression is a transparent
+;; alias: no new nominal identity (only `:` and `&` mint), values flow
+;; both directions, and UFCS unfolds the alias to the target's method
+;; set — after the alias's own declared methods.
+
+(define alias-sut (compile-inline "
++  path
+  row[quip]
++  path
+  +  depth
+    \  p=path
+    ^  nat
+    p.size
++  plen
+  \  p=path
+  ^  nat
+  p.size
++  both
+  \  p=path
+  ^  nat
+  (add p.depth p.size)
++  mk3
+  \  q=quip
+  ^  path
+  [q q q]
++  back
+  \  p=path
+  ^  row[quip]
+  p
++  pt
+  :  x=nat y=nat
++  spot
+  pt
++  getx
+  \  s=spot
+  ^  nat
+  s.x
++  myn
+  nat
++  bump
+  \  n=myn
+  ^  myn
+  n.add(1)
+"))
+
+;; runtime rep is the bare row: no wrapper, no brand
+(define al-plen (lowered ["plen"] alias-sut))
+(define al-mk3 (lowered ["mk3"] alias-sut))
+(define al-back (lowered ["back"] alias-sut))
+assert(Eq 2 (al-plen [("ts" "a") ("ts" "b")]))
+assert(Equal [("ts" "q") ("ts" "q") ("ts" "q")] (al-back (al-mk3 ("ts" "q"))))
+;; the alias's own methods win; the target's are still reachable
+assert(Eq 4 ((lowered ["both"] alias-sut) [("ts" "a") ("ts" "b")]))
+;; face access unfolds through an alias of a named row
+assert(Eq 7 ((lowered ["getx"] alias-sut) ("/boot/pt" 7 9)))
+;; bare-word alias of a builtin: methods route to the target's set
+assert(Eq 8 ((lowered ["bump"] alias-sut) 7))
+
+;; generic instantiations at the alias and at the target interoperate
+(define alias-gen-sut (compile-inline "
++  path
+  row[quip]
++  mk
+  \  p=path
+  ^  list[path]
+  (list/cons[path] p (list/nil[path]))
++  take
+  \  l=list[row[quip]]
+  ^  nat
+  1
++  use
+  \  p=path
+  ^  nat
+  (take (mk p))
+"))
+assert(Eq 1 ((lowered ["use"] alias-gen-sut) [("ts" "a")]))
 
 (print "foil-exec tests passed")

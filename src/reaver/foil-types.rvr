@@ -70,6 +70,18 @@
 ;; empty-row element type); elaboration must never infer it into a
 ;; user-written declaration.
 (define TANY [TYPE "TANY"])
+;; TPAIL is the pail type: the open union of every nominal row type in
+;; the namespace, tagged by name — the head of a nominal row value IS
+;; the print-path brand of its declaration, so TPAIL dispatches by
+;; branded head.  Supertype only (it nests into nothing but TANY), it
+;; does not absorb joins of non-members, and — being an open universe —
+;; a match on it always requires a fallthrough.  Sums do not inhabit
+;; it: a sum value's head is its option tag, not a type path.
+(define TPAIL [TYPE "TPAIL"])
+;; A declaration brand: print-path cords carry a leading "/" (47),
+;; which no variant option tag or bare word does.
+(define (branded-cstr? c)
+  (And (Nil (Eq 0 c)) (Eq 47 (Mod c 256))))
 (define (TTYP typ) [TYPE "TTYP" typ])
 (define TBAD [TYPE "TBAD"])
 (define (TARR item) [TYPE "TARR" item])
@@ -316,9 +328,16 @@
                          (map path-to-ty (take (min nt (Sz rest)) rest)))))))
             (name-row-span (Ix 0 parts)
               (mold-to-span-seen sut (snoc ref seen) applied-mold)))
-          (let ((base (mold-to-span-seen sut (snoc ref seen) (got-type ref sut)))
-                (applied-args (map recur (_3 ty))))
-            (name-row-span ref (type-specialize-span base applied-args))))))
+          (let ((stored (got-type ref sut)))
+            ;; An entry holding another NOMINAL is an alias link — a
+            ;; reference, not a definition: expand to the target's
+            ;; span WITHOUT re-branding, so alias and target spans
+            ;; stay identical (row cstrs compare by brand).
+            (If (And (Eq "TNOM" (_1 stored)) (Ifz (Sz (_3 ty)) 1 0))
+              (mold-to-span-seen sut (snoc ref seen) stored)
+              (let ((base (mold-to-span-seen sut (snoc ref seen) stored))
+                    (applied-args (map recur (_3 ty))))
+                (name-row-span ref (type-specialize-span base applied-args))))))))
     ((tag-is "TFUN") (TFUN (map recur (tfun-args ty)) (recur (tfun-ret ty))))
     ((tag-is "TFAC") (TFAC (_2 ty) (recur (tfac-val ty))))
     ((tag-is "TPIN") (TPIN (recur (tpin-val ty))))
@@ -390,6 +409,11 @@
           1
           (type-nests-span? sut (snoc key seen)
             (unfold sup) (unfold sub)))))
+    ;; TPAIL: a row inhabits the pail universe iff its cstr is a
+    ;; declaration brand.  (TNOM subs unfolded above; sums fall
+    ;; through — their options are tagged, not branded.)
+    ((Eq stag "TPAIL")
+      (And (Eq subtag "TROW") (branded-cstr? (trow-cstr sub))))
     ((And (Eq stag "TPIN") (Eq subtag "TPIN"))
       (recur (tpin-val sup) (tpin-val sub)))
     ((and (Eq stag "TARR") (Eq subtag "TARR"))
@@ -635,7 +659,11 @@
   ;; leaf paths directly, named/instantiation spans by (recursive)
   ;; recovery.  -> path | 0.
   (define (span-arg-path got)
-    (define direct (ty-to-path got))
+    ;; Minted leaf paths (ty-to-path's bare ["nat"]) normalize to the
+    ;; subject's canonical name so recovered encodings match the
+    ;; elaborator's rooted ones.
+    (define direct0 (ty-to-path got))
+    (define direct (Ifz direct0 0 (canon-path direct0 sut)))
     (define gtag (_1 got))
     (If direct
       direct
@@ -874,6 +902,10 @@
     ;; TANY (dynamic) absorbs in joins.
     ((Eq xtag "TANY") x)
     ((Eq ytag "TANY") y)
+    ;; TPAIL absorbs joins with its members only; non-members fall
+    ;; through to a genuine sum.
+    ((And (Eq xtag "TPAIL") (type-nests-span? sut [] x y)) x)
+    ((And (Eq ytag "TPAIL") (type-nests-span? sut [] y x)) y)
     ((Eq xtag "TFAC") (type-join-span sut (tfac-val x) y))
     ((Eq ytag "TFAC") (type-join-span sut x (tfac-val y)))
     ((And (Eq xtag "TPIN") (Eq ytag "TPIN"))
@@ -931,6 +963,9 @@
     ;; TANY (dynamic) refines away in meets.
     ((Eq xtag "TANY") y)
     ((Eq ytag "TANY") x)
+    ;; TPAIL refines to its member on the other side.
+    ((And (Eq xtag "TPAIL") (type-nests-span? sut [] x y)) y)
+    ((And (Eq ytag "TPAIL") (type-nests-span? sut [] y x)) x)
     ((And (Eq xtag "TPIN") (Eq ytag "TPIN"))
       (TPIN (type-meet-span sut (tpin-val x) (tpin-val y))))
     ((Eq xtag ytag) (homo-meet xtag x y))
@@ -1020,6 +1055,13 @@
              (fits-err "fell through sum")
              (map recur-row (late-zip val (tsum-opts ty)))))
     ((tag-is "TNAT") (If (IsNat val) 0 (fits-err "not nat")))
+    ;; A pail value carries a branded head: an app headed by a
+    ;; print-path cord, or (arity-0 rows) the bare brand itself.
+    ((tag-is "TPAIL")
+      (If (Or (And (IsApp val) (branded-cstr? (Hd val)))
+            (And (IsNat val) (branded-cstr? val)))
+        0
+        (fits-err "not a pail (unbranded head)")))
     (else (fits-err ["fallthrough uimpl" tag]))))
 
 (define (type-fits sut ty val)
@@ -1115,6 +1157,8 @@ trow-vals
 TPIN
 tpin-val
 TANY
+TPAIL
+branded-cstr?
 TTYP
 TBAD
 TARR

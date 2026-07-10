@@ -1,0 +1,341 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+
+;;; sept.foil: the sept.hoon uon/axal/of machinery, compiled and run.
+;;; Keys are quips (runtime shape ("aura" payload), see quip.rvr);
+;;; piths are rows of quips; options are ("some" x) / "none".
+
+(define sept-sut (foil:compile-mod foil:default-subject "sept"))
+(define (sept path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) sept-sut)))
+
+
+;;; Ordering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define lte-iota (sept ["lte_iota"]))
+;; same aura, numeric payloads
+assert(Eq 1 (lte-iota ("u" 1) ("u" 2)))
+assert(Eq 0 (lte-iota ("u" 2) ("u" 1)))
+assert(Eq 1 (lte-iota ("u" 5) ("u" 5)))
+;; same aura, text payloads: byte-lexicographic, not numeric
+assert(Eq 1 (lte-iota ("ts" "bar") ("ts" "foo")))
+assert(Eq 1 (lte-iota ("ts" "aa") ("ts" "b")))
+assert(Eq 0 (lte-iota ("ts" "b") ("ts" "aa")))
+assert(Eq 1 (lte-iota ("ts" "ab") ("ts" "abc")))
+;; differing auras order by aura-name rank: ds < r < ta < ts < tu < u < w < x
+assert(Eq 1 (lte-iota ("ds" 999999) ("u" 0)))
+assert(Eq 1 (lte-iota ("ta" "z") ("ts" "a")))
+assert(Eq 0 (lte-iota ("x" 0) ("u" 999)))
+
+
+;;; uon: ordered map ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define uput (sept ["uon" "put"]))
+(define ugut (sept ["uon" "gut"]))
+(define uhas (sept ["uon" "has"]))
+(define using (sept ["uon" "sing"]))
+(define usize (sept ["uon" "size"]))
+(define ukeys (sept ["uon" "keys"]))
+(define uvals (sept ["uon" "vals"]))
+(define uapt (sept ["uon" "apt"]))
+(define udel2 (sept ["uon" "del2"]))
+(define uuni (sept ["uon" "uni"]))
+(define urun (sept ["uon" "run"]))
+(define ugas (sept ["uon" "gas"]))
+(define utap (sept ["uon" "tap"]))
+
+;; an empty uon, bootstrapped by deleting a singleton's only key
+(define uon-empty (udel2 ("u" 1) (using ("u" 1) 0)))
+assert(Eq 0 (usize uon-empty))
+assert(Eq 1 (uapt uon-empty))
+
+(define (build-uon pairs m)
+  (foldl (lambda (acc p) (uput (_0 p) (_1 p) acc)) m pairs))
+
+;; mixed-aura keys, inserted out of order
+(define t5
+  (build-uon
+    [[("u" 2) 20] [("ts" "b") 2] [("u" 1) 10] [("ta" "z") 26] [("ts" "a") 1]]
+    uon-empty))
+
+assert(Eq 5 (usize t5))
+assert(Eq 1 (uapt t5))
+assert(Eq 20 (ugut ("u" 2) 0 t5))
+assert(Eq 26 (ugut ("ta" "z") 0 t5))
+assert(Eq 0 (ugut ("u" 99) 0 t5))
+assert(Eq 1 (uhas ("ts" "a") t5))
+assert(Eq 0 (uhas ("ts" "zz") t5))
+;; ascending key order under lte_iota
+assert(Equal [("ta" "z") ("ts" "a") ("ts" "b") ("u" 1) ("u" 2)] (ukeys t5))
+assert(Equal [26 1 2 10 20] (uvals t5))
+
+;; overwrite replaces
+(define t5b (uput ("u" 2) 99 t5))
+assert(Eq 5 (usize t5b))
+assert(Eq 99 (ugut ("u" 2) 0 t5b))
+
+;; enough monotone inserts to run the rotate paths, both directions
+(define (seq-uon n m)
+  (Ifz n m (seq-uon (Dec n) (uput ("u" n) (Mul 10 n) m))))
+(define t20 (seq-uon 20 uon-empty))
+assert(Eq 20 (usize t20))
+assert(Eq 1 (uapt t20))
+assert(Eq 130 (ugut ("u" 13) 0 t20))
+(define (seq-uon-up n m)
+  (If (Gt n 20) m (seq-uon-up (Inc n) (uput ("u" n) n m))))
+(define t20r (seq-uon-up 1 uon-empty))
+assert(Eq 20 (usize t20r))
+assert(Eq 1 (uapt t20r))
+
+;; delete: hit shrinks and keeps order; miss is a no-op
+(define t4 (udel2 ("ts" "a") t5))
+assert(Eq 4 (usize t4))
+assert(Eq 1 (uapt t4))
+assert(Eq 0 (uhas ("ts" "a") t4))
+assert(Eq 20 (ugut ("u" 2) 0 t4))
+assert(Equal [("ta" "z") ("ts" "b") ("u" 1) ("u" 2)] (ukeys t4))
+assert(Eq 4 (usize (udel2 ("u" 77) t4)))
+
+;; uni is right-biased: b's value wins on collision
+(define ta (build-uon [[("u" 1) 1] [("u" 2) 2]] uon-empty))
+(define tb (build-uon [[("u" 2) 22] [("u" 3) 33]] uon-empty))
+(define tu (uuni tb ta))
+assert(Eq 3 (usize tu))
+assert(Eq 1 (ugut ("u" 1) 0 tu))
+assert(Eq 22 (ugut ("u" 2) 0 tu))
+assert(Eq 33 (ugut ("u" 3) 0 tu))
+assert(Eq 1 (uapt tu))
+
+;; run maps values, preserving keys and size
+(define t5run (urun (Add 100) t5))
+assert(Eq 5 (usize t5run))
+assert(Equal [126 101 102 110 120] (uvals t5run))
+assert(Equal (ukeys t5) (ukeys t5run))
+
+;; gas of a tap rebuilds the same map
+(define t5gas (ugas (utap t5) uon-empty))
+assert(Eq 1 (uapt t5gas))
+assert(Equal (ukeys t5) (ukeys t5gas))
+assert(Equal (uvals t5) (uvals t5gas))
+
+
+;;; axal: the path-tree with the of door ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define anew (sept ["axal" "new"]))
+(define aput (sept ["axal" "put"]))
+(define aget (sept ["axal" "get"]))
+(define agut (sept ["axal" "gut"]))
+(define ahas (sept ["axal" "has"]))
+(define adip (sept ["axal" "dip"]))
+(define afit (sept ["axal" "fit"]))
+(define adel (sept ["axal" "del"]))
+(define alop (sept ["axal" "lop"]))
+(define arep (sept ["axal" "rep"]))
+(define akeys (sept ["axal" "keys"]))
+(define avals (sept ["axal" "vals"]))
+(define agas (sept ["axal" "gas"]))
+(define atap (sept ["axal" "tap"]))
+(define awyt (sept ["axal" "wyt"]))
+(define arun (sept ["axal" "run"]))
+(define auni (sept ["axal" "uni"]))
+
+(define ax0 (anew "none"))
+assert(Eq 0 (awyt ax0))
+assert(Equal [] (akeys ax0))
+
+;; a small namespace:
+;;   /            -> (nothing)
+;;   /chat        -> 100
+;;   /chat/room   -> 1
+;;   /chat/alice  -> 2
+;;   /sys/hand    -> 3
+(define chat ("ts" "chat"))
+(define room ("ts" "room"))
+(define alice ("ts" "alice"))
+(define sys ("ts" "sys"))
+(define hand ("ts" "hand"))
+
+(define (build-axal entries ax)
+  (foldl (lambda (acc e) (aput (_0 e) (_1 e) acc)) ax entries))
+
+(define ns
+  (build-axal
+    [[[chat room] 1] [[chat] 100] [[sys hand] 3] [[chat alice] 2]]
+    ax0))
+
+;; get / gut / has
+assert(Eq 100 (agut [chat] 0 ns))
+assert(Eq 1 (agut [chat room] 0 ns))
+assert(Eq 2 (agut [chat alice] 0 ns))
+assert(Eq 3 (agut [sys hand] 0 ns))
+assert(Eq 0 (agut [sys] 0 ns))
+assert(Eq 0 (agut [chat room ("u" 9)] 0 ns))
+assert(Eq 1 (ahas [chat room] ns))
+assert(Eq 0 (ahas [sys] ns))
+assert(Eq 0 (ahas [] ns))
+assert(Equal ("some" 100) (aget [chat] ns))
+assert(Equal "none" (aget [sys] ns))
+
+;; wyt counts every fil
+assert(Eq 4 (awyt ns))
+
+;; keys in tap order: parent before kids, kids ascending
+assert(Equal [[chat] [chat alice] [chat room] [sys hand]] (akeys ns))
+assert(Equal [100 2 1 3] (avals ns))
+
+;; dip descends; paths inside are relative
+(define chat-sub (adip [chat] ns))
+assert(Eq 100 (agut [] 0 chat-sub))
+assert(Eq 1 (agut [room] 0 chat-sub))
+;; /sys has no fil of its own, one kid with a fil
+assert(Eq 1 (awyt (adip [sys] ns)))
+
+;; delete returns an anonymous row: literally a PLAN row (0 found rest)
+(define udel (sept ["uon" "del"]))
+(define delres (udel ("ts" "a") t5))
+assert(Eq 0 (Hd delres))
+assert(Equal ("some" 1) (_0 delres))
+assert(Eq 4 (usize (_1 delres)))
+assert(Equal "none" (_0 (udel ("u" 77) t5)))
+
+;; fit: longest existing prefix; the result is an anonymous row
+;; (0 rem fil), host-projectable with _0/_1
+(define fitres (afit [chat room ("u" 7)] ns))
+assert(Eq 0 (Hd fitres))
+assert(Equal [("u" 7)] (_0 fitres))
+assert(Equal ("some" 1) (_1 fitres))
+(define fitres2 (afit [chat room] ns))
+assert(Equal [] (_0 fitres2))
+assert(Equal ("some" 1) (_1 fitres2))
+(define fitres3 (afit [("ts" "nosuch") ("u" 1)] ns))
+assert(Equal [("ts" "nosuch") ("u" 1)] (_0 fitres3))
+assert(Equal "none" (_1 fitres3))
+
+;; del clears the fil but keeps descendants
+(define ns-del (adel [chat] ns))
+assert(Eq 0 (agut [chat] 0 ns-del))
+assert(Eq 1 (agut [chat room] 0 ns-del))
+assert(Eq 3 (awyt ns-del))
+;; del of a missing path is a no-op
+assert(Eq 4 (awyt (adel [("u" 42)] ns)))
+
+;; lop removes the whole subtree, node and all (Hoon of/lop deletes
+;; the kid entry itself)
+(define ns-lop (alop [chat] ns))
+assert(Eq 0 (agut [chat] 0 ns-lop))
+assert(Eq 0 (agut [chat room] 0 ns-lop))
+assert(Eq 0 (agut [chat alice] 0 ns-lop))
+assert(Eq 3 (agut [sys hand] 0 ns-lop))
+assert(Eq 1 (awyt ns-lop))
+
+;; rep replaces the subtree at a path
+(define fresh (aput [] 55 (aput [("ts" "new")] 56 ax0)))
+(define ns-rep (arep [chat] fresh ns))
+assert(Eq 55 (agut [chat] 0 ns-rep))
+assert(Eq 56 (agut [chat ("ts" "new")] 0 ns-rep))
+assert(Eq 0 (agut [chat room] 0 ns-rep))
+assert(Eq 3 (agut [sys hand] 0 ns-rep))
+
+;; tap entries are anonymous [pith value] rows
+assert(Eq 0 (Hd (Ix 0 (atap ns))))
+assert(Equal [chat] (_0 (Ix 0 (atap ns))))
+assert(Eq 100 (_1 (Ix 0 (atap ns))))
+
+;; gas of a tap rebuilds the same tree
+(define ns-gas (agas (atap ns) ax0))
+assert(Equal (akeys ns) (akeys ns-gas))
+assert(Equal (avals ns) (avals ns-gas))
+assert(Eq 4 (awyt ns-gas))
+
+;; run maps every value
+(define ns-run (arun (Add 1000) ns))
+assert(Equal [1100 1002 1001 1003] (avals ns-run))
+assert(Equal (akeys ns) (akeys ns-run))
+
+;; pith helpers
+(define lte-pith (sept ["lte_pith"]))
+(define eq-pith (sept ["eq_pith"]))
+(define pith-prefix (sept ["pith_prefix"]))
+assert(Eq 1 (lte-pith [] [("ts" "a")]))
+assert(Eq 1 (lte-pith [("ts" "a")] [("ts" "a") ("ts" "b")]))
+assert(Eq 0 (lte-pith [("ts" "a") ("ts" "b")] [("ts" "a")]))
+assert(Eq 1 (lte-pith [("ts" "a") ("ts" "b")] [("ts" "a") ("ts" "c")]))
+assert(Eq 1 (lte-pith [("ta" "z") ("u" 9)] [("ts" "a")]))
+assert(Eq 1 (lte-pith [("ts" "a")] [("ts" "a")]))
+assert(Eq 1 (eq-pith [("ts" "a") ("u" 2)] [("ts" "a") ("u" 2)]))
+assert(Eq 0 (eq-pith [("ts" "a")] [("ts" "a") ("u" 2)]))
+assert(Eq 0 (eq-pith [("ts" "a")] [("ts" "b")]))
+assert(Eq 1 (pith-prefix [] [("ts" "a")]))
+assert(Eq 1 (pith-prefix [("ts" "a")] [("ts" "a") ("ts" "b")]))
+assert(Eq 1 (pith-prefix [("ts" "a") ("ts" "b")] [("ts" "a") ("ts" "b")]))
+assert(Eq 0 (pith-prefix [("ts" "a") ("ts" "c")] [("ts" "a") ("ts" "b") ("ts" "d")]))
+assert(Eq 0 (pith-prefix [("ts" "a") ("ts" "b")] [("ts" "a")]))
+
+;; snip: care-y restriction — root + direct-kid values only
+(define asnip (sept ["axal" "snip"]))
+(define ns-snip (asnip ns))
+assert(Equal [[chat]] (akeys ns-snip))
+assert(Eq 100 (agut [chat] 0 ns-snip))
+assert(Eq 0 (agut [chat room] 0 ns-snip))
+(define chat-snip (asnip (adip [chat] ns)))
+assert(Equal [[] [alice] [room]] (akeys chat-snip))
+
+;; floor: greatest entry at or below a key (maybe of an anonymous row)
+(define ufloor (sept ["uon" "floor"]))
+assert(Equal "none" (ufloor ("u" 5) uon-empty))
+assert(Equal ("some" [("u" 1) 10]) (ufloor ("u" 1) t5))
+assert(Equal ("some" [("ts" "a") 1]) (ufloor ("ts" "aa") t5))
+assert(Equal "none" (ufloor ("ds" 0) t5))
+assert(Equal ("some" [("u" 2) 20]) (ufloor ("x" 99) t5))
+
+;; zipper: down/up/top round-trips
+(define azipper (sept ["axal" "zipper"]))
+(define zdown (sept ["axal" "zip" "down"]))
+(define zup (sept ["axal" "zip" "up"]))
+(define ztop (sept ["axal" "zip" "top"]))
+assert(Equal ns (ztop (azipper ns)))
+;; focus after down carries the kid's fil (zip = (cstr focus spine),
+;; axal = (cstr fil kid): project with _0)
+assert(Equal ("some" 100) (_0 (_0 (zdown chat (azipper ns)))))
+assert(Equal ("some" 1) (_0 (_0 (zdown room (zdown chat (azipper ns))))))
+;; up inverts down; top from any depth reattaches everything.  The
+;; kid maps may rebalance (down deletes, up reinserts), so compare
+;; behaviorally, not structurally.
+(define ns-rt1 (ztop (zup (zdown chat (azipper ns)))))
+assert(Equal (akeys ns) (akeys ns-rt1))
+assert(Equal (avals ns) (avals ns-rt1))
+(define ns-rt2 (ztop (zdown room (zdown chat (azipper ns)))))
+assert(Equal (akeys ns) (akeys ns-rt2))
+assert(Equal (avals ns) (avals ns-rt2))
+assert(Eq 1 (agut [chat room] 0 ns-rt2))
+;; down into an absent kid creates an empty spine node: values and
+;; structure-with-values are preserved
+(define ns-spined (ztop (zdown ("ts" "ghost") (azipper ns))))
+assert(Equal (akeys ns) (akeys ns-spined))
+assert(Equal (avals ns) (avals ns-spined))
+assert(Eq 4 (awyt ns-spined))
+
+;; uni: fat's fils win on collision; disjoint parts merge
+(define other
+  (build-axal
+    [[[chat] 777] [[("ts" "blog")] 9] [[sys] 8]]
+    ax0))
+(define ns-uni (auni other ns))
+assert(Eq 100 (agut [chat] 0 ns-uni))
+assert(Eq 9 (agut [("ts" "blog")] 0 ns-uni))
+assert(Eq 8 (agut [sys] 0 ns-uni))
+assert(Eq 3 (agut [sys hand] 0 ns-uni))
+assert(Eq 1 (agut [chat room] 0 ns-uni))
+assert(Eq 6 (awyt ns-uni))
