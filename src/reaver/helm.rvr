@@ -1,4 +1,4 @@
-;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; Copyright (c) 2026 Axiomatic Systems
 ;;;; SPDX-License-Identifier: MIT
 ;;;; See LICENSE for full terms.
 
@@ -41,13 +41,15 @@
 
 ;; Compile a helm-importing module once; returns the core functions
 ;; the shell needs plus the compiled subject (so callers can pull
-;; their own app entries from the SAME compilation — one chain walk):
-;; ["HELM" boot exec x-query spy sut].
+;; their own app entries from the SAME compilation — one chain walk)
+;; and the per-module compile cache (so the /boot mirror knows which
+;; file declared which entry): ["HELM" boot exec x-query spy sut cache].
 (define (load-helm-mod mod)
-  (define sut (foil:compile-mod foil:default-subject mod))
+  (define r (foil:compile-mod-cached 0 foil:default-subject mod))
+  (define sut (_1 r))
   (define (ent path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
   ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["sov" "x_query"])
-   (ent ["helm" "spy"]) sut])
+   (ent ["helm" "spy"]) sut (_0 r)])
 
 ;; The bare driver chain.  The argument is ignored (a zero-argument
 ;; define does not reduce when applied).
@@ -59,10 +61,87 @@
 (define (core-xq c) (Ix 3 c))
 (define (core-spy c) (Ix 4 c))
 (define (core-sut c) (Ix 5 c))
+(define (core-cache c) (Ix 6 c))
 
 ;; An app entry from the core's own compilation.
 (define (core-ent core path)
   (foil:ir-entry-val (got-entry (Weld ["boot"] path) (core-sut core))))
+
+;;; The /boot mirror ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The boot image, materialized into the namespace so the system can
+;; introspect its own code:
+;;   /boot                   documentation of the subnamespace
+;;   /boot/f                 module f's source text, in [src]
+;;   /boot/f/n/[...name]     the entry declared at /[...name] (n
+;;                           segments): [kind] and [src] always,
+;;                           [code] when lowering produced a value
+;; Needs a core compiled from a module that imports lainapp — the
+;; record constructors (boot_doc_t &c) live there.
+
+(define (ts s) ("ts" s))
+
+(define boot-doc-text
+  (strcat
+    ["the boot image: the system's own compiled code. "
+     "each kid is a module; /boot/f holds its source text in [src]; "
+     "/boot/f/n/[...name] holds the entry declared at /[...name] "
+     "(n path segments) - its kind in [kind], its own source in "
+     "[src], and its compiled value in [code] when lowering "
+     "produced one."]))
+
+;; One vine_make task per mirrored node: /boot first, then each
+;; module's file node followed by its entries.  A module's own keys
+;; are its cache entry's decl keys minus its imported keys — both
+;; stored on the entry ([name subject decl-keys imported-keys]).
+(define (boot-mirror-tasks core)
+  (define cache (core-cache core))
+  (define vine-make (core-ent core ["vine_make"]))
+  (define doc-t (core-ent core ["boot_doc_t"]))
+  (define src-t (core-ent core ["boot_src_t"]))
+  (define ent-t (core-ent core ["boot_ent_t"]))
+  (define (mod-tasks me)
+    (define mod (_0 me))
+    (define sut (_1 me))
+    (define imported (_3 me))
+    (define src (foil:get-foil mod))
+    ;; materialized const-generic instantiations carry /ty-ap-encoded
+    ;; keys (not namespace paths, and their value is the generic's) —
+    ;; the mirror skips them, like forge's ns index
+    (define own
+      (filter
+        (lambda (k)
+          (And (Nil (ty-ap-path? k))
+            (Nil (includes (Equal k) imported))))
+        (_2 me)))
+    (define (ent-task k)
+      (define e (foil:entry-parts sut k))
+      (define kind (foil:entry-kind sut k (foil:ent-tc e)))
+      (define slice (foil:source-slice src (foil:ent-span e)))
+      (define name (drop 1 k))
+      (define node
+        (Weld [(ts "boot") (ts mod) (ts (showNat (Sz name)))] (map ts name)))
+      (vine-make node (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e))))
+    (Weld [(vine-make [(ts "boot") (ts mod)] (src-t src))]
+      (map ent-task own)))
+  (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
+    (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache)))
+
+;; Fold tasks into a sovereign through the compiled kernel: every node
+;; arrives as an ordinary committed event.  A failed event dies loudly
+;; — threading its $fail on as the sovereign would corrupt the fold.
+(define (seed-tasks core sov tasks)
+  (define run-event (core-ent core ["run_event"]))
+  (foldl
+    (lambda (s t)
+      (let ((o (run-event t 0 s)))
+        (If (Eq "ripe" (Hd o))
+          (Ix 0 o)
+          (error ["seed-task-failed" (Ix 0 t) o]))))
+    sov tasks))
+
+(define (seed-boot core sov)
+  (seed-tasks core sov (boot-mirror-tasks core)))
 
 ;;; Duty application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

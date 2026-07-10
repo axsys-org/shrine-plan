@@ -77,24 +77,34 @@
                   (Ifz (Bytes chip) "" (strcat ["  " chip]))])]
         (map forge-cli:dt-res-line fails)))))
 
-;; Recompile every module whose source bytes changed, sequentially
-;; through the persistent compile cache — an edited module's
-;; unchanged imports come from the cache instead of recompiling, so
-;; a save deep in a long import chain only pays for the tips.
-;; (Sequential beats one-actor-per-module here: the win is sharing
-;; the chain, and the common case is a single changed module.)
+;; Recompile every module whose source bytes changed, one actor per
+;; module, all seeded with the same pruned persistent cache — an
+;; edited module's unchanged imports come from the cache instead of
+;; recompiling, and independent modules compile concurrently.  The
+;; per-actor caches merge back by name (entries for the same module
+;; compiled from the same bytes are identical).
+(define (cache-merge base caches)
+  (foldl
+    (lambda (acc c)
+      (foldl
+        (lambda (a e)
+          (If (includes (lambda (x) (Eq (_0 e) (_0 x))) a)
+            a
+            (snoc e a)))
+        acc c))
+    base caches))
+
 (define (sync fst)
   (define changed (filter (mod-stale? fst) forge:forge-mods))
   (Ifz (Sz changed)
     [fst [(dim "up to date")]]
-    (let* ((r (foldl
-                (lambda (acc mod)
-                  (let ((cb (forge:load-bundle-cached (_0 acc) mod)))
-                    [(_0 cb) (snoc (_1 cb) (_1 acc))]))
-                [(forge:st-live-cache fst) []]
-                changed))
-           (bundles (_1 r))
-           (fst2 (forge:set-st-cache (forge:cache-wrap (_0 r)) fst)))
+    (let* ((seed (forge:st-live-cache fst))
+           (rs (async:async-all-deep
+                 (lambda (mod) (forge:load-bundle-cached seed mod))
+                 changed))
+           (bundles (map (Ix 1) rs))
+           (cache2 (cache-merge seed (map (Ix 0) rs)))
+           (fst2 (forge:set-st-cache (forge:cache-wrap cache2) fst)))
       [(foldl insert-bundle fst2 bundles)
        (foldl (lambda (acc b) (Weld acc (bundle-report b))) [] bundles)])))
 

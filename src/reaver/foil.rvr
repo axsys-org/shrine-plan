@@ -9,6 +9,7 @@
 (#import reef)
 
 (#bind async (#module async))
+(#bind cairn (#module cairn))
 (#bind rex (#module rex))
 (#bind foil-subject (#module foil-subject))
 (#bind foil-sast (#module foil-sast))
@@ -78,9 +79,14 @@
 
 ;; Compile a module by name, resolving its imports first.  Imports are
 ;; order-independent: all of them merge (and mount, when nested under a
-;; +) before any declaration elaborates.  cache is [[name subject] ..]
-;; so diamond imports compile once; stack is the import chain, for
-;; cycle detection.  Returns [cache' compiled imported-keys].
+;; +) before any declaration elaborates.  cache is
+;; [[name subject decl-keys imported-keys] ..] so diamond imports
+;; compile once and a hit pays neither the recompile nor the decl-key
+;; derivation; stack is the import chain, for cycle detection.
+;; Returns [cache' compiled imported-keys].
+(define (cache-entry name compiled imported)
+  [name compiled (module-decl-keys compiled) imported])
+
 (define (compile-mod-go stack cache0 sut0 mod)
   (define rows (parse-foil mod))
   (define imps (filter mod-import? rows))
@@ -102,10 +108,12 @@
                   (let ((c (Try compile-import 0)))
                     (If (Eq 1 (Hd c))
                       (error ["foil-in-module" name (_0 c)])
-                      [(snoc [name (_1 (_0 c))] (_0 (_0 c))) (_1 (_0 c))]))
-                  [cache (_1 (_0 hit))]))
+                      (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c)))))
+                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e)])))
+                  (let ((e (_0 hit)))
+                    [cache (_1 e) (_2 e)])))
              (imped (_1 r))
-             (keys (module-decl-keys imped))
+             (keys (_2 r))
              (sut1 (foil-subject:merge-subject blurb keys imped sut))
              (sut2 (Ifz (Sz mount)
                      sut1
@@ -114,16 +122,20 @@
   (define merged (foldl apply-import [cache0 sut0 0] imps))
   ;; A declaration whose path an import or earlier local declaration
   ;; already occupies would silently shadow at insert time.  Imported
-  ;; keys are rooted; local decl paths are source-relative.
+  ;; keys are rooted; local decl paths are source-relative.  Both
+  ;; checks go through indexed sets — per-decl scans over the imported
+  ;; key row made this O(decls * imports).
   (define root (foil-subject:sut-root sut0))
+  (define imp-ax
+    (foldl (lambda (a k) (cairn:putax k 1 a)) cairn:empty-ax (_2 merged)))
   (define (check-collision seen d[_ name span body])
     (cond
-      ((includes (Equal (Weld root name)) (_2 merged))
+      ((Ifz (cairn:getax (Weld root name) imp-ax) 0 1)
         (error ["foil-import-collision" ["path" name] ["at" (import-blurb span)]]))
-      ((includes (Equal name) seen)
+      ((Ifz (cairn:getax name seen) 0 1)
         (error ["foil-duplicate-decl" ["path" name] ["at" (import-blurb span)]]))
-      (else (snoc name seen))))
-  (define checked (foldl check-collision [] decls))
+      (else (cairn:putax name 1 seen))))
+  (define checked (foldl check-collision cairn:empty-ax decls))
   (define elabbed (Seq checked (elab-mod (_1 merged) decls)))
   ;; Materialize every referenced ground instantiation of const-param
   ;; generics before lowering (their base members skip lowering).
@@ -139,17 +151,21 @@
     (_1 (_0 r))))
 
 ;; Compile with a persistent cache: returns [cache' compiled].  The
-;; cache ([[name subject] ..], seed with 0) carries every imported
-;; module's compiled subject ACROSS calls, so sibling top-level
-;; compiles sharing an import chain (helm + lainapp over
-;; sept/shrine/lain) walk it once.  Entries are compiled against
-;; default-subject — only thread the cache between compiles that
-;; also start from it.
+;; cache ([[name subject decl-keys imported-keys] ..], seed with 0)
+;; carries every compiled module's subject ACROSS calls, so sibling
+;; top-level compiles sharing an import chain (helm + lainapp over
+;; sept/shrine/lain) walk it once, and re-requesting a cached module
+;; returns it outright.  Entries are compiled against default-subject
+;; — only thread the cache between compiles that also start from it.
 (define (compile-mod-cached cache sut mod)
-  (define r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0))
-  (If (Eq 1 (Hd r))
-    (error ["foil-in-module" mod (_0 r)])
-    [(snoc [mod (_1 (_0 r))] (_0 (_0 r))) (_1 (_0 r))]))
+  (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
+  (Ifz hit
+    (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
+      (If (Eq 1 (Hd r))
+        (error ["foil-in-module" mod (_0 r)])
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
+         (_1 (_0 r))]))
+    [cache (_1 (_0 hit))]))
 
 (define (compile-mod-info sut mod)
   (define r (Try (lambda (z) (compile-mod-go [mod] 0 sut mod)) 0))
@@ -159,11 +175,52 @@
 
 ;; The cached compile-mod-info: [cache' [compiled imported-keys]].
 (define (compile-mod-info-cached cache sut mod)
-  (define r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0))
-  (If (Eq 1 (Hd r))
-    (error ["foil-in-module" mod (_0 r)])
-    [(snoc [mod (_1 (_0 r))] (_0 (_0 r)))
-     [(_1 (_0 r)) (_2 (_0 r))]]))
+  (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
+  (Ifz hit
+    (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
+      (If (Eq 1 (Hd r))
+        (error ["foil-in-module" mod (_0 r)])
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
+         [(_1 (_0 r)) (_2 (_0 r))]]))
+    [cache [(_1 (_0 hit)) (_3 (_0 hit))]]))
+
+;;; Entry inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A subject entry decomposed either way it is stored:
+;; -> ["ENT" path tc span ir val lowered?].  Const-generic base
+;; members skip lowering and stay ("TC" key tc span); everything else
+;; is an IR_ENTRY.
+(define (entry-parts sut path)
+  (define ent (foil-subject:got-entry path sut))
+  (If (Eq (Hd ent) "IR_ENTRY")
+    ["ENT" path (Ix 3 ent) (Ix 1 ent) (Ix 4 ent) (Ix 2 ent) 1]
+    ["ENT" path (Ix 1 ent) (Ix 2 ent) 0 0 0]))
+
+(define ent-tc (Ix 2))
+(define ent-span (Ix 3))
+(define ent-ir (Ix 4))
+(define ent-val (Ix 5))
+(define ent-lowered (Ix 6))
+
+(define (entry-kind sut path tc)
+  (define hd (Hd tc))
+  (cond
+    ((Eq hd "TC_TYP")
+      (If (Eq "TSUM" (_1 (_2 (foil-subject:tc-typ-inner tc)))) "sum type" "row type"))
+    ((Eq hd "TC_LAM") "function")
+    ((Eq hd "TC_FFI") "generated")
+    ((Eq hd "TC_LIT") "literal")
+    ((Eq hd "TC_ROW") "value")
+    ((Eq hd "TC_LET") "value")
+    ((Eq hd "TC_APP") "value")
+    (else "entry")))
+
+;; An entry's own source text, from its span's offset/len into the
+;; module source.
+(define (source-slice src espan)
+  (define off (Ix 2 espan))
+  (define len (Ix 3 espan))
+  (If len (Trunc (Mul 8 len) (Rsh src (Mul 8 off))) ""))
 
 ;; Compile several modules in parallel actors, one future per module,
 ;; each deep-forced in its child. Deterministic: results are Equal to

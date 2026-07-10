@@ -285,11 +285,18 @@
     (subject-order sut)))
 
 ;; Row of [src-path kind dst-path] over the module's entries.
+;; References to generic members ride /ty-ap-encoded selectors
+;; (bst/size[v]) — normalize dst to the base entry so who-calls
+;; matches the entry pages, and dedupe the instantiation spellings
+;; that collapse together.
 (define (ref-table sut)
   (define (entry-refs acc path)
-    (Weld acc
-      (map (lambda (r) [path (_0 r) (_1 r)])
-        (collect-refs (got-entry-tc path sut)))))
+    (define rows
+      (map (lambda (r) [path (_0 r) (resolve-path (_1 r))])
+        (collect-refs (got-entry-tc path sut))))
+    (foldl
+      (lambda (a r) (If (includes (Equal r) a) a (snoc r a)))
+      acc rows))
   (foldl entry-refs [] (module-paths sut)))
 
 (define (refs-from table path)
@@ -300,31 +307,15 @@
 
 ;;; Entry access ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; -> ["ENT" path tc span ir val lowered?]
-(define (entry-parts sut path)
-  (define ent (got-entry path sut))
-  (If (Eq (Hd ent) "IR_ENTRY")
-    ["ENT" path (Ix 3 ent) (Ix 1 ent) (Ix 4 ent) (Ix 2 ent) 1]
-    ["ENT" path (Ix 1 ent) (Ix 2 ent) 0 0 0]))
-
-(define ent-tc (Ix 2))
-(define ent-span (Ix 3))
-(define ent-ir (Ix 4))
-(define ent-val (Ix 5))
-(define ent-lowered (Ix 6))
-
-(define (entry-kind sut path tc)
-  (define hd (Hd tc))
-  (cond
-    ((Eq hd "TC_TYP")
-      (If (Eq "TSUM" (_1 (_2 (tc-typ-inner tc)))) "sum type" "row type"))
-    ((Eq hd "TC_LAM") "function")
-    ((Eq hd "TC_FFI") "generated")
-    ((Eq hd "TC_LIT") "literal")
-    ((Eq hd "TC_ROW") "value")
-    ((Eq hd "TC_LET") "value")
-    ((Eq hd "TC_APP") "value")
-    (else "entry")))
+;; -> ["ENT" path tc span ir val lowered?]; shared with the /boot
+;; mirror, so the implementations live in foil.rvr.
+(define entry-parts foil:entry-parts)
+(define ent-tc foil:ent-tc)
+(define ent-span foil:ent-span)
+(define ent-ir foil:ent-ir)
+(define ent-val foil:ent-val)
+(define ent-lowered foil:ent-lowered)
+(define entry-kind foil:entry-kind)
 
 
 ;;; Type rendering — molds as linked HTML ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -742,24 +733,67 @@
 (define st-cache (Ix 3))
 
 ;;; The persistent compile cache: st-cache holds [[name snapshot
-;;; subject] ..] — every module ever compiled as an import, with the
-;;; byte snapshot (own source + import closure) it was compiled
-;;; against.  Prune drops entries whose sources moved; strip yields
-;;; the [[name subject] ..] shape compile-mod-go threads; wrap
-;;; re-stamps a fresh cache for persisting.
+;;; subject decl-keys imported-keys] ..] — every module ever
+;;; compiled, with the byte snapshot (own source + import closure) it
+;;; was compiled against.  Prune drops entries whose sources moved;
+;;; strip yields the [[name subject decl-keys imported-keys] ..]
+;;; shape compile-mod-go threads; wrap re-stamps fresh snapshots for
+;;; persisting.  Both read/parse each file once per call, shared
+;;; across entries — per-entry recomputation made validating an
+;;; N-module chain O(N^2) file reads.
 
-(define (cache-snap mod)
-  [(Try (lambda (z) (read-text-file (strcat ["foil/" mod ".foil"]))) 0)
-   (import-snapshot mod)])
+(define (try-read-mod n)
+  (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0))
 
+;; An entry is fresh iff its own bytes and every file in its STORED
+;; closure snapshot are unchanged.  Equivalent to recomputing the
+;; snapshot: unchanged own source implies an unchanged import list,
+;; and recursively (every closure file checked) an unchanged closure.
 (define (cache-prune entries)
-  (filter (lambda (e) (Equal (_1 e) (cache-snap (_0 e)))) entries))
+  (define names
+    (foldl
+      (lambda (acc e)
+        (foldl (lambda (a p) (snoc-new (_0 p) a))
+          (snoc-new (_0 e) acc)
+          (_1 (_1 e))))
+      [] entries))
+  (define table (map (lambda (n) [n (try-read-mod n)]) names))
+  (define (cur n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) table)))
+      (Ifz h 0 (_1 (_0 h)))))
+  (define (fresh? e)
+    (And (Equal (_0 (_1 e)) (cur (_0 e)))
+      (Nil (includes (lambda (p) (Nil (Equal (_1 p) (cur (_0 p))))) (_1 (_1 e))))))
+  (filter fresh? entries))
 
 (define (cache-strip entries)
-  (map (lambda (e) [(_0 e) (_2 e)]) entries))
+  (map (lambda (e) [(_0 e) (_2 e) (_3 e) (_4 e)]) entries))
 
 (define (cache-wrap cache)
-  (map (lambda (e) [(_0 e) (cache-snap (_0 e)) (_1 e)]) cache))
+  (define names (map (Ix 0) cache))
+  (define imps (map (lambda (n) [n (foil:module-imports n)]) names))
+  (define bytes (map (lambda (n) [n (try-read-mod n)]) names))
+  (define (imports-of n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) imps)))
+      (Ifz h (foil:module-imports n) (_1 (_0 h)))))
+  (define (bytes-of n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) bytes)))
+      (Ifz h (try-read-mod n) (_1 (_0 h)))))
+  ;; import-closure's BFS, imports from the shared table (every
+  ;; closure member of a cached module is itself cached)
+  (define (closure mod)
+    (define (go seen pend)
+      (Ifz (Sz pend)
+        seen
+        (let* ((name (_0 pend))
+               (rest (drop 1 pend)))
+          (If (includes (Eq name) seen)
+            (go seen rest)
+            (go (snoc name seen) (Weld rest (imports-of name)))))))
+    (go [] (imports-of mod)))
+  (define (snap-of mod)
+    [(bytes-of mod) (map (lambda (n) [n (bytes-of n)]) (closure mod))])
+  (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e)]) cache))
 
 (define (st-live-cache st)
   (cache-strip (cache-prune (st-cache st))))
@@ -898,10 +932,7 @@
      (fold-out 1 [(span no-attrs (strcat ["referenced by (" (showNat (Sz in)) ")"]))]
        [(div no-attrs (map ref-row in))])]))
 
-(define (source-slice src espan)
-  (define off (Ix 2 espan))
-  (define len (Ix 3 espan))
-  (If len (str-slice off len src) ""))
+(define source-slice foil:source-slice)
 
 (define (entry-panel st mod path)
   (define r[st1 b] (state-bundle st mod))
