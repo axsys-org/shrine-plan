@@ -1,0 +1,108 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind helm (#module helm))
+(#bind helm-http (#module helm-http))
+
+
+;;; The HTTP driver end-to-end, minus sockets (no outbound-connect
+;;; primitive exists): main impersonates connection actors, sending
+;;; ["req" method url body] straight to the worker and receiving
+;;; ["res" status body] — the same seam the socket layer uses.  The
+;;; request cycle inside one event: the bare request record is made
+;;; under /io/http, the SERVING kook installed there receives the
+;;; kid-add gift and pokes the configured responder kook onto the
+;;; request node, whose talk writes the response slots; the driver's
+;;; spy then delivers the finished record.  Every wait is causal.
+
+(define core (helm:load-helm 0))
+
+(define app-sut (foil:compile-mod foil:default-subject "lainapp"))
+(define (app path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) app-sut)))
+(define demo-reg ((app ["demo_reg"]) 0))
+(define sov0 ((app ["sov0"]) 0))
+(define t-data (app ["t_data"]))
+(define vine-make (app ["vine_make"]))
+(define vine-poke (app ["vine_poke"]))
+(define http-cfg (app ["http_cfg"]))
+
+(define helpers
+  ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
+
+(define (mk-worker n) (helm-http:mk-http-worker helpers n))
+
+(define coord (Spawn (helm:helm-actor core mk-worker demo-reg sov0)))
+
+(define (ask m)
+  (Seq (SendCaps coord (DeepSeq m m) [0])
+    (Recv 0)))
+(define (inject t)
+  (Ix 0 (ask ["task" t])))
+
+(define tio ("ts" "io"))
+(define thttp ("ts" "http"))
+
+;;; 1. make /io/http with the serving kook installed: the driver is born ;;;;;;;;;;;;
+
+assert(Equal ["done"] (inject (vine-make [tio thttp] (http-cfg ("ts" "hrespond")))))
+assert(Equal [thttp] (Ix 0 (ask ["crew"])))
+(define hr (ask ["handle" thttp]))
+assert(Equal ["handle"] (Ix 0 hr))
+(define wh (Ix 0 (Ix 1 hr)))
+
+;;; 2. a request rides the namespace and comes back 200, echoed ;;;;;;;;;;;;;;;;;;;;
+
+(SendCaps wh ["req" "GET" "/ping" "hello"] [0])
+(define r1 (Ix 0 (Recv 0)))
+assert(Eq "res" (_0 r1))
+assert(Eq 200 (_1 r1))
+assert(Equal "hello" (_2 r1))
+
+;;; 3. a second request gets a fresh serial; both nodes were culled ;;;;;;;;;;;;;;;;;
+
+(SendCaps wh ["req" "POST" "/again" "world"] [0])
+(define r2 (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 r2))
+assert(Equal "world" (_2 r2))
+
+;; barrier, then look for tombstones where the request nodes lived
+assert(Equal ["done"] (inject (vine-poke [tio thttp] (t-data [("ts" "keep")] 1))))
+assert(Equal "null" (Ix 0 (ask ["query" [tio thttp ("ts" "r0")]])))
+assert(Equal "null" (Ix 0 (ask ["query" [tio thttp ("ts" "r1")]])))
+
+;;; 4. an unknown responder fails the installing poke: the event dies, 500 ;;;;;;;;;;
+
+(define tbad ("ts" "bad"))
+assert(Equal ["done"] (inject (vine-make [tio tbad] (http-cfg ("ts" "zzz")))))
+(define hr2 (ask ["handle" tbad]))
+(define wh2 (Ix 0 (Ix 1 hr2)))
+(SendCaps wh2 ["req" "GET" "/nope" ""] [0])
+(define r3 (Ix 0 (Recv 0)))
+assert(Eq "res" (_0 r3))
+assert(Eq 500 (_1 r3))
+assert(Equal "kook_unknown" (_2 r3))
+
+;;; 5. the response builder speaks HTTP ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (starts-with pre s)
+  (Eq pre (Mod s (Lsh 1 (Mul 8 (Bytes pre))))))
+(define resp (helm-http:http-res 200 "hi"))
+assert(Eq 1 (starts-with "HTTP/1.0 200 OK" resp))
+assert(Eq 1 (starts-with "HTTP/1.0 500" (helm-http:http-res 500 "boom")))
+
+;;; 6. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
+
+(print "helm-http tests passed")

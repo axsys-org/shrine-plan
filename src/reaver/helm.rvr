@@ -1,0 +1,166 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+
+;;; The IO driver shell: real enki actors around the pure helm core
+;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
+;;; and a roster of one worker actor per /io name; it executes the
+;;; core's duties and shuttles messages.  All decisions are the
+;;; core's.
+;;;
+;;; Coordinator mailbox protocol (msg, caps):
+;;;   ["cmd" name task]   from a worker: run the task, ack the worker
+;;;   ["task" task]       external injection; replies ["done"] to the
+;;;                       cap — the synchronous barrier drivers use
+;;;   ["query" path]      replies the committed record (res shape)
+;;;   ["crew" ]           replies the roster's names
+;;;   ["handle" name]     replies ["handle"] with the worker handle as
+;;;                       a capability (or ["nohandle"])
+;;;   ["stop"]            kills the roster, replies ["bye"], exits
+;;;
+;;; Worker protocol (coordinator -> worker):
+;;;   ["go" res]     first message; caps = [coordinator-handle]
+;;;   ["change" res] the name's new committed record
+;;;   ["ack" rsvp]   the outcome of a command this worker sent
+;;;   ["die"]        the name was removed
+;;; Workers send ["cmd" name task] to the coordinator handle.
+
+;;; Core loading ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Compile the helm chain once; returns the core functions the shell
+;; needs: ["HELM" boot exec x-query spy].  The argument is ignored (a
+;; zero-argument define does not reduce when applied).
+(define (load-helm z)
+  (define sut (foil:compile-mod foil:default-subject "helm"))
+  (define (ent path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
+  ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["sov" "x_query"])
+   (ent ["helm" "spy"])])
+
+(define (core-boot c) (Ix 1 c))
+(define (core-exec c) (Ix 2 c))
+(define (core-xq c) (Ix 3 c))
+(define (core-spy c) (Ix 4 c))
+
+;;; Duty application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (roster-get roster n)
+  (find (lambda (e) (Equal n (_0 e))) roster))
+
+(define (roster-drop roster n)
+  (filter (lambda (e) (Nil (Equal n (_0 e)))) roster))
+
+;; One duty against the roster, from inside the coordinator actor
+;; (handle 0 below is the coordinator's own inbox).  Payloads are
+;; deep-forced before every send — the receiver must not inherit our
+;; thunks.
+(define (apply-duty mk-worker roster d)
+  (define kind (Hd d))
+  (cond
+    ((Eq kind "birth")
+      (let ((w (Spawn (mk-worker (_0 d)))))
+        (Seq (SendCaps w (DeepSeq d ["go" (_1 d)]) [0])
+          (snoc [(_0 d) w] roster))))
+    ((Eq kind "fell")
+      (let ((hit (roster-get roster (_0 d))))
+        (Ifz hit
+          roster
+          (Seq (Send (_1 (_0 hit)) ["die"])
+            (roster-drop roster (_0 d))))))
+    ((Eq kind "tell")
+      (let ((hit (roster-get roster (_0 d))))
+        (Ifz hit
+          roster
+          (Seq (Send (_1 (_0 hit)) (DeepSeq d ["change" (_1 d) (_2 d)]))
+            roster))))
+    ((Eq kind "ack")
+      (let ((hit (roster-get roster (_0 d))))
+        (Ifz hit
+          roster
+          (Seq (Send (_1 (_0 hit)) (DeepSeq d ["ack" (_1 d)]))
+            roster))))
+    (else roster)))
+
+(define (apply-duties mk-worker roster ds)
+  (foldl (apply-duty mk-worker) roster ds))
+
+;;; The coordinator ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (helm-loop core mk-worker st)
+  (define hm (_0 st))
+  (define roster (_1 st))
+  (define mc (Recv 0))
+  (define msg (Ix 0 mc))
+  (define caps (Ix 1 mc))
+  (define kind (_0 msg))
+  ;; The duty Sends live inside the apply-duties fold: every turn's
+  ;; new state is deep-forced BEFORE anything else happens, so all
+  ;; effects land within the turn (a lazy fold would defer the Sends
+  ;; to the next Recv — a deadlock).
+  (define (turn src task)
+    (define r ((core-exec core) src task hm))
+    (define roster2 (apply-duties mk-worker roster (_1 r)))
+    (define st2 [(_0 r) roster2])
+    (DeepSeq st2 st2))
+  (cond
+    ((Eq kind "cmd")
+      (let ((st2 (turn ("some" (_1 msg)) (_2 msg))))
+        (Seq st2
+          (helm-loop core mk-worker st2))))
+    ((Eq kind "task")
+      (let ((st2 (turn "none" (_1 msg))))
+        (Seq st2
+          (Seq (Send (Ix 0 caps) ["done"])
+            (helm-loop core mk-worker st2)))))
+    ((Eq kind "query")
+      (let ((s (_0 hm)))
+        (Seq (Send (Ix 0 caps)
+               (DeepSeq msg ((core-xq core) (Ix 2 s) (_1 msg) s)))
+          (helm-loop core mk-worker st))))
+    ((Eq kind "spy")
+      ;; ["spy" name path] — arm a one-shot watch for a worker.  No
+      ;; reply: worker->coordinator sends are FIFO, so a spy followed
+      ;; by a cmd from the same worker is armed before the cmd runs.
+      (let ((hm2 ((core-spy core) (_1 msg) (_2 msg) hm)))
+        (Seq (DeepSeq hm2 hm2)
+          (helm-loop core mk-worker [hm2 roster]))))
+    ((Eq kind "read")
+      ;; ["read" path] — the committed record, tagged for multiplexed
+      ;; worker mailboxes.
+      (let ((s (_0 hm)))
+        (let ((res ((core-xq core) (Ix 2 s) (_1 msg) s)))
+          (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
+            (helm-loop core mk-worker st)))))
+    ((Eq kind "crew")
+      (Seq (Send (Ix 0 caps) (map (Ix 0) roster))
+        (helm-loop core mk-worker st)))
+    ((Eq kind "handle")
+      (let ((hit (roster-get roster (_1 msg))))
+        (Seq (Ifz hit
+               (Send (Ix 0 caps) ["nohandle"])
+               (SendCaps (Ix 0 caps) ["handle"] [(_1 (_0 hit))]))
+          (helm-loop core mk-worker st))))
+    ((Eq kind "stop")
+      (let ((dies (map (lambda (e) (Send (_1 e) ["die"])) roster)))
+        (Seq (DeepSeq dies dies)
+          (Send (Ix 0 caps) ["bye"]))))
+    (else (helm-loop core mk-worker st))))
+
+;; The coordinator actor body: boot the helm, apply the initial
+;; births, loop.  Spawn as (Spawn (helm-actor core mk-worker reg s0)).
+(define (helm-actor core mk-worker reg s0 self)
+  (define b ((core-boot core) reg s0))
+  (define roster (apply-duties mk-worker [] (_1 b)))
+  (Seq (DeepSeq roster roster)
+    (helm-loop core mk-worker [(_0 b) roster])))

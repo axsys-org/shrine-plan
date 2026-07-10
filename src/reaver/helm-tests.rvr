@@ -1,0 +1,130 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind helm (#module helm))
+
+
+;;; The helm shell end-to-end, with real actors (needs the enki
+;;; actor-request fix, like foil-async-tests).  Determinism: every
+;;; interaction is a synchronous barrier — coordinator injections
+;;; reply ["done"], and the worker's ["get" n] defers its reply until
+;;; n acks have landed, which is causally downstream of the whole
+;;; change -> cmd -> exec -> ack chain.
+
+;;; The scripted worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; On its first ["change"] it sends one canned command to the
+;; coordinator; it records changes and acks, and answers ["get" n]
+;; with [sent changes acks] once n acks are in.
+(define (test-worker cmd-task name self)
+  ;; the go-handshake Recv MUST be forced before the loop's first
+  ;; Recv, or the loop consumes ["go"] and coord binds a later
+  ;; message's cap (defines are lazy)
+  (define mc (Recv 0))
+  (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
+  (define (loop sent changes acks pend)
+    (define m (Recv 0))
+    (define msg (Ix 0 m))
+    (define caps (Ix 1 m))
+    (define kind (_0 msg))
+    (cond
+      ((Eq kind "change")
+        (Seq (If sent 0 (Send coord (DeepSeq cmd-task ["cmd" name cmd-task])))
+          (loop 1 (Inc changes) acks pend)))
+      ((Eq kind "ack")
+        (let ((acks2 (snoc (_1 msg) acks)))
+          (Ifz pend
+            (loop sent changes acks2 0)
+            (If (Ge (Sz acks2) (_1 pend))
+              (Seq (Send (_0 pend) [sent changes acks2])
+                (loop sent changes acks2 0))
+              (loop sent changes acks2 pend)))))
+      ((Eq kind "get")
+        (If (Ge (Sz acks) (_1 msg))
+          (Seq (Send (Ix 0 caps) [sent changes acks])
+            (loop sent changes acks pend))
+          (loop sent changes acks [(Ix 0 caps) (_1 msg)])))
+      ((Eq kind "die") ["dead"])
+      (else (loop sent changes acks pend))))
+  (Seq coord
+    (loop 0 0 [] 0)))
+
+;;; Fixtures ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define core (helm:load-helm 0))
+
+(define app-sut (foil:compile-mod foil:default-subject "lainapp"))
+(define (app path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) app-sut)))
+(define demo-reg ((app ["demo_reg"]) 0))
+(define sov0 ((app ["sov0"]) 0))
+(define t-data (app ["t_data"]))
+(define vine-make (app ["vine_make"]))
+(define vine-poke (app ["vine_poke"]))
+(define vine-cull (app ["vine_cull"]))
+
+(define tio ("ts" "io"))
+(define techo ("ts" "echo"))
+(define tdata ("ts" "data"))
+(define tout ("ts" "out"))
+(define slot [("ts" "s")])
+(define wslot [("ts" "w")])
+
+;; the worker's one command: write a record at /data/out
+(define canned (vine-make [tdata tout] (t-data wslot 42)))
+(define (mk-worker n) (test-worker canned n))
+
+(define coord (Spawn (helm:helm-actor core mk-worker demo-reg sov0)))
+
+;; synchronous barriers against the coordinator (main is actor 0)
+(define (ask m)
+  (Seq (SendCaps coord (DeepSeq m m) [0])
+    (Recv 0)))
+(define (inject t)
+  (Ix 0 (ask ["task" t])))
+
+;;; 1. making /io/echo births a worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["done"] (inject (vine-make [tio techo] (t-data slot 5))))
+assert(Equal [techo] (Ix 0 (ask ["crew"])))
+
+(define hr (ask ["handle" techo]))
+assert(Equal ["handle"] (Ix 0 hr))
+(define wh (Ix 0 (Ix 1 hr)))
+
+;;; 2. a change reaches the worker; its command runs and is acked ;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["done"] (inject (vine-poke [tio techo] (t-data slot 6))))
+
+(SendCaps wh ["get" 1] [0])
+(define tr (Ix 0 (Recv 0)))
+assert(Eq 1 (_0 tr))
+assert(Eq 1 (_1 tr))
+assert(Eq 1 (Sz (_2 tr)))
+assert(Equal ("ok" ("some" [tdata tout])) (Ix 0 (_2 tr)))
+
+;; the worker's write landed in the namespace
+(define q (Ix 0 (ask ["query" [tdata tout]])))
+assert(Eq "known" (Hd q))
+
+;;; 3. culling the name fells the worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["done"] (inject (vine-cull [tio techo])))
+assert(Equal [] (Ix 0 (ask ["crew"])))
+assert(Equal ["nohandle"] (Ix 0 (ask ["handle" techo])))
+
+;;; 4. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
+
+(print "helm tests passed")
