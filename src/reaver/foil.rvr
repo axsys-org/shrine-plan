@@ -8,7 +8,10 @@
 (#bind reef (#module reef))
 (#import reef)
 
+(#bind async (#module async))
+(#bind cairn (#module cairn))
 (#bind rex (#module rex))
+(#bind foil-subject (#module foil-subject))
 (#bind foil-sast (#module foil-sast))
 (#bind foil-builtins (#module foil-builtins))
 (#bind foil-elab (#module foil-elab))
@@ -33,17 +36,12 @@
 (define env-locals foil-elab:env-locals)
 (define set-env-locals foil-elab:set-env-locals)
 (define env-diags foil-elab:env-diags)
-(define env-goal foil-elab:env-goal)
-(define set-env-goal foil-elab:set-env-goal)
 (define env-name foil-elab:env-name)
 (define set-env-name foil-elab:set-env-name)
 (define env-tvars foil-elab:env-tvars)
 
 (define burp-self foil-elab:burp-self)
 (define burp-face foil-elab:burp-face)
-(define push-env-goal foil-elab:push-env-goal)
-(define peek-env-goal foil-elab:peek-env-goal)
-(define pop-env-goal foil-elab:pop-env-goal)
 (define elab-type foil-elab:elab-type)
 (define elab-val foil-elab:elab-val)
 (define elab-mod foil-elab:elab-mod)
@@ -55,14 +53,187 @@
 (define lower-tc foil-lower:lower-tc)
 (define lower-tc-entry foil-lower:lower-tc-entry)
 (define lower-tc-mod foil-lower:lower-tc-mod)
+(define materialize-consts foil-lower:materialize-consts)
+
+;;; Imports ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (mod-import? row) (Eq "s_import" (_0 row)))
+
+(define (import-blurb span)
+  (Ifz span "unknown-location" ["line" (Ix 0 span) "col" (Ix 1 span)]))
+
+;; Direct import names of a module, by name; [] when the file is
+;; missing or unparsable (the compile proper will say why).
+(define (module-imports mod)
+  (define rowsx
+    (Try (lambda (z) (map (Ix 3) (filter mod-import? (parse-foil mod)))) 0))
+  (If (Eq 1 (Hd rowsx)) [] (_0 rowsx)))
+
+;; The keys a compiled module declared (directly or via its own
+;; imports): its order minus the builtin baseline.
+(define (module-decl-keys imp)
+  (define base (foil-subject:subject-order default-subject))
+  (filter
+    (lambda (k) (Nil (includes (Equal k) base)))
+    (foil-subject:subject-order imp)))
+
+;; Compile a module by name, resolving its imports first.  Imports are
+;; order-independent: all of them merge (and mount, when nested under a
+;; +) before any declaration elaborates.  cache is
+;; [[name subject decl-keys imported-keys] ..] so diamond imports
+;; compile once and a hit pays neither the recompile nor the decl-key
+;; derivation; stack is the import chain, for cycle detection.
+;; Returns [cache' compiled imported-keys].
+(define (cache-entry name compiled imported)
+  [name compiled (module-decl-keys compiled) imported])
+
+(define (compile-mod-go stack cache0 sut0 mod)
+  (define rows (parse-foil mod))
+  (define imps (filter mod-import? rows))
+  (define decls (filter (lambda (r) (Nil (mod-import? r))) rows))
+  (define (apply-import st imp[_ mount span name])
+    (define cache (_0 st))
+    (define sut (_1 st))
+    (define seen (_2 st))
+    (define blurb (import-blurb span))
+    (define hit (find (lambda (e) (Eq name (_0 e))) cache))
+    ;; The imported module compiles under a Try so its failure carries
+    ;; its name: ["foil-in-module" name err].  Chains nest — a failure
+    ;; three imports deep reads in-module a > in-module b > the error.
+    (define (compile-import z)
+      (compile-mod-go (snoc name stack) cache default-subject name))
+    (If (includes (Eq name) stack)
+      (error ["foil-import-cycle" ["module" name] ["at" blurb]])
+      (let* ((r (Ifz hit
+                  (let ((c (Try compile-import 0)))
+                    (If (Eq 1 (Hd c))
+                      (error ["foil-in-module" name (_0 c)])
+                      (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c)))))
+                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e)])))
+                  (let ((e (_0 hit)))
+                    [cache (_1 e) (_2 e)])))
+             (imped (_1 r))
+             (keys (_2 r))
+             (sut1 (foil-subject:merge-subject blurb keys imped sut))
+             (sut2 (Ifz (Sz mount)
+                     sut1
+                     (foil-subject:mount-subject blurb mount keys imped sut1))))
+        [(_0 r) sut2 (Weld seen keys)])))
+  (define merged (foldl apply-import [cache0 sut0 0] imps))
+  ;; A declaration whose path an import or earlier local declaration
+  ;; already occupies would silently shadow at insert time.  Imported
+  ;; keys are rooted; local decl paths are source-relative.  Both
+  ;; checks go through indexed sets — per-decl scans over the imported
+  ;; key row made this O(decls * imports).
+  (define root (foil-subject:sut-root sut0))
+  (define imp-ax
+    (foldl (lambda (a k) (cairn:putax k 1 a)) cairn:empty-ax (_2 merged)))
+  (define (check-collision seen d[_ name span body])
+    (cond
+      ((Ifz (cairn:getax (Weld root name) imp-ax) 0 1)
+        (error ["foil-import-collision" ["path" name] ["at" (import-blurb span)]]))
+      ((Ifz (cairn:getax name seen) 0 1)
+        (error ["foil-duplicate-decl" ["path" name] ["at" (import-blurb span)]]))
+      (else (cairn:putax name 1 seen))))
+  (define checked (foldl check-collision cairn:empty-ax decls))
+  (define elabbed (Seq checked (elab-mod (_1 merged) decls)))
+  ;; Materialize every referenced ground instantiation of const-param
+  ;; generics before lowering (their base members skip lowering).
+  (define final (foil-lower:materialize-consts elabbed))
+  [(_0 merged) (lower-tc-mod final final) (_2 merged)])
 
 ;;; Public compile API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (compile-mod sut mod)
-  (lower-tc-mod (elab-mod sut (parse-foil mod)) sut))
+  (define r (Try (lambda (z) (compile-mod-go [mod] 0 sut mod)) 0))
+  (If (Eq 1 (Hd r))
+    (error ["foil-in-module" mod (_0 r)])
+    (_1 (_0 r))))
+
+;; Compile with a persistent cache: returns [cache' compiled].  The
+;; cache ([[name subject decl-keys imported-keys] ..], seed with 0)
+;; carries every compiled module's subject ACROSS calls, so sibling
+;; top-level compiles sharing an import chain (helm + lainapp over
+;; sept/shrine/lain) walk it once, and re-requesting a cached module
+;; returns it outright.  Entries are compiled against default-subject
+;; — only thread the cache between compiles that also start from it.
+(define (compile-mod-cached cache sut mod)
+  (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
+  (Ifz hit
+    (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
+      (If (Eq 1 (Hd r))
+        (error ["foil-in-module" mod (_0 r)])
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
+         (_1 (_0 r))]))
+    [cache (_1 (_0 hit))]))
+
+(define (compile-mod-info sut mod)
+  (define r (Try (lambda (z) (compile-mod-go [mod] 0 sut mod)) 0))
+  (If (Eq 1 (Hd r))
+    (error ["foil-in-module" mod (_0 r)])
+    [(_1 (_0 r)) (_2 (_0 r))]))
+
+;; The cached compile-mod-info: [cache' [compiled imported-keys]].
+(define (compile-mod-info-cached cache sut mod)
+  (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
+  (Ifz hit
+    (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
+      (If (Eq 1 (Hd r))
+        (error ["foil-in-module" mod (_0 r)])
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
+         [(_1 (_0 r)) (_2 (_0 r))]]))
+    [cache [(_1 (_0 hit)) (_3 (_0 hit))]]))
+
+;;; Entry inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A subject entry decomposed either way it is stored:
+;; -> ["ENT" path tc span ir val lowered?].  Const-generic base
+;; members skip lowering and stay ("TC" key tc span); everything else
+;; is an IR_ENTRY.
+(define (entry-parts sut path)
+  (define ent (foil-subject:got-entry path sut))
+  (If (Eq (Hd ent) "IR_ENTRY")
+    ["ENT" path (Ix 3 ent) (Ix 1 ent) (Ix 4 ent) (Ix 2 ent) 1]
+    ["ENT" path (Ix 1 ent) (Ix 2 ent) 0 0 0]))
+
+(define ent-tc (Ix 2))
+(define ent-span (Ix 3))
+(define ent-ir (Ix 4))
+(define ent-val (Ix 5))
+(define ent-lowered (Ix 6))
+
+(define (entry-kind sut path tc)
+  (define hd (Hd tc))
+  (cond
+    ((Eq hd "TC_TYP")
+      (If (Eq "TSUM" (_1 (_2 (foil-subject:tc-typ-inner tc)))) "sum type" "row type"))
+    ((Eq hd "TC_LAM") "function")
+    ((Eq hd "TC_FFI") "generated")
+    ((Eq hd "TC_LIT") "literal")
+    ((Eq hd "TC_ROW") "value")
+    ((Eq hd "TC_LET") "value")
+    ((Eq hd "TC_APP") "value")
+    (else "entry")))
+
+;; An entry's own source text, from its span's offset/len into the
+;; module source.
+(define (source-slice src espan)
+  (define off (Ix 2 espan))
+  (define len (Ix 3 espan))
+  (If len (Trunc (Mul 8 len) (Rsh src (Mul 8 off))) ""))
+
+;; Compile several modules in parallel actors, one future per module,
+;; each deep-forced in its child. Deterministic: results are Equal to
+;; sequential compile-mod output. Needs enki with the actor-request
+;; fix (merged July 2026; doc/enki-actor-report.md).
+(define (compile-mods-par mods)
+  (async:async-all-deep (lambda (m) (compile-mod default-subject m)) mods))
 
 ;;; REPL helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; Input blocks are treated as bar-encoded: the empty bar is 1, and no
+;; nonempty bar is <= 1 (a lone 0x01 content byte encodes as 0x101).
+;; A raw 0 (plain EOF) is also "empty" under Le 1.
 (define (bytes-is-empty? bytes)
   (Le bytes 1))
 
@@ -74,19 +245,10 @@
 
 (define (read-until stop input)
   (define (go input[ch chs])
-    (If (Eq ch stop) 0
-      [ch (go chs)]))
+    (Ifz input 0
+      (If (Eq ch stop) 0
+        [ch (go chs)])))
   (lstrcat (go input)))
 
-(define (foil-repl mod)
-  (define sut (compile-mod default-subject mod))
-  (define (repl input)
-    (define ast (parse-foil-val input))
-    (define tc  (elab-val sut empty-env ast))
-    (print ("tc" tc))
-    (define val (lower-tc sut tc))
-    (If (Eq "q" input) 0
-      (begin
-        (print val)
-        (repl (read-until 10 (read-stdin 384))))))
-  (repl (read-until 10 (read-stdin 384))))
+assert(Equal "ab" (read-until 10 [97 [98 [10 [99 0]]]]))
+assert(Equal "ab" (read-until 10 [97 [98 0]]))

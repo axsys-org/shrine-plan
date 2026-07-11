@@ -20,7 +20,7 @@
   (parse-type-sast (rex:ParseRexNorm src)))
 
 assert(Equal (surf-ref ["foo" "bar" "baz"])
-  (parse-type "foo:bar:baz"))
+  (parse-type "foo/bar/baz"))
 
 assert(Equal (surf-ref ["baz"])
   (parse-type "baz"))
@@ -29,7 +29,20 @@ assert(Equal (surf-face "foo" (surf-ref ["bar"]))
   (parse-type "foo=bar"))
 
 assert(Equal (surf-face "n" (surf-ref ["bst" "node"]))
-  (parse-type "n=bst:node"))
+  (parse-type "n=bst/node"))
+
+assert(Equal
+  (surf-tapp [(surf-ref ["bst" "node"]) (surf-ref ["v"])])
+  (parse-type "bst/node[v]"))
+
+assert(Equal
+  (surf-face "n" (surf-tapp [(surf-ref ["bst" "node"]) (surf-ref ["v"])]))
+  (parse-type "n=bst/node[v]"))
+
+;; a single-field row: the bracket absorbs the = rune
+assert(Equal
+  (surf-trow [(surf-face "val" (surf-ref ["a"]))])
+  (parse-type "[val=a]"))
 
 assert(Equal
   (surf-tapp [(surf-ref ["foo"]) (surf-ref ["bar"])])
@@ -57,10 +70,10 @@ assert(Equal
   (surf-tfun [(surf-ref ["nat"]) (surf-ref ["nat"])] (surf-ref ["nat"]))
   (parse-type "{nat; nat; nat}"))
 
-assert(Equal
-  (surf-trow [(surf-face "x" (surf-ref ["nat"]))
-              (surf-face "y" (surf-ref ["nat"]))])
-  (parse-type "{x=nat y=nat}"))
+;; plain-curly rows are retired: curly is function types only
+(define curly-row-err
+  (Try (lambda (x) (parse-type "{x=nat y=nat}")) 0))
+assert(Eq 1 (Hd curly-row-err))
 
 assert(Equal
   (surf-tapp [(surf-ref ["maybe"]) (surf-ref ["nat"])])
@@ -79,7 +92,7 @@ assert(Equal (surf-var "foo")
   (parse-val "foo"))
 
 assert(Equal (surf-ref ["foo" "bar"])
-  (parse-val "foo:bar"))
+  (parse-val "foo/bar"))
 
 assert(Equal (surf-meth ["foo" (surf-mseg "bar" [])])
   (parse-val "foo.bar"))
@@ -103,7 +116,7 @@ assert(Equal
 
 assert(Equal
   (surf-spec (surf-ref ["list" "nil"]) [(surf-ref ["nat"])])
-  (parse-val "list:nil[nat]"))
+  (parse-val "list/nil[nat]"))
 
 assert(Equal
   (surf-if (surf-var "x") (surf-lit 1) (surf-lit 0))
@@ -120,16 +133,16 @@ assert(Equal
 
 assert(Equal
   (surf-app (surf-ref ["foo" "bar"]) [])
-  (parse-val "(foo:bar)"))
+  (parse-val "(foo/bar)"))
 
 assert(Equal
   (surf-app (surf-ref ["bst" "empty"]) [])
-  (parse-val "(bst:empty)"))
+  (parse-val "(bst/empty)"))
 
 assert(Equal
   (surf-app (surf-ref ["bst" "node"])
     [(surf-lit 1) (surf-lit 2) (surf-lit 3)])
-  (parse-val "(bst:node 1 2 3)"))
+  (parse-val "(bst/node 1 2 3)"))
 
 assert(Equal
   (surf-row [(surf-lit 1) (surf-var "foo")])
@@ -144,6 +157,15 @@ assert(Equal (surf-variant "none_value")
 assert(Equal
   (surf-app (surf-variant "some") [(surf-lit 3)])
   (parse-val "($some 3)"))
+
+;; (_ args...) is the self-call; _ elsewhere is an ordinary word
+assert(Equal
+  (surf-self [(surf-lit 1) (surf-var "x")])
+  (parse-val "(_ 1 x)"))
+
+assert(Equal
+  (surf-app (surf-var "f") [(surf-var "_")])
+  (parse-val "(f _)"))
 
 assert(Equal
   (surf-literal "cord" "hello")
@@ -217,5 +239,238 @@ assert(Equal ["outer"] (_1 (_0 parsed-apex-after-child)))
 assert(Equal ["outer" "child"] (_1 (_1 parsed-apex-after-child)))
 assert(Equal (surf-lit 2) (_2 (_3 (_0 parsed-apex-after-child))))
 assert(Equal (surf-lit 1) (_2 (_3 (_1 parsed-apex-after-child))))
+
+;; A stack of bare words is not a body: bodies chain only through the
+;; declaration runes.  Per-decl recovery turns the malformed decl into
+;; an s_bad row carrying the parse error — and its neighbors still
+;; parse, so a module reports every parse error at once.
+(define bad-body-rows
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  broken
+  foo
+  bar
++  fine
+  1
+")))
+assert(Equal 2 (Sz bad-body-rows))
+assert(Equal "s_bad" (_0 (_0 bad-body-rows)))
+assert(Equal "foil-sast-error" (Ix 0 (_3 (_0 bad-body-rows))))
+assert(Equal ["fine"] (_1 (_1 bad-body-rows)))
+
+;; Imports: `-` at top level mounts at [], inside a + at that decl's
+;; path; several names on one rune are several imports.
+(define parsed-imports
+  (parse-module-sast 0 (rex:ParseRexNorm "
+-  vec
++  app
+  -  util
+  1
+")))
+assert(Equal 3 (Sz parsed-imports))
+assert(Equal "s_import" (_0 (_0 parsed-imports)))
+assert(Equal [] (_1 (_0 parsed-imports)))
+assert(Equal "vec" (_3 (_0 parsed-imports)))
+assert(Equal "s_decl" (_0 (_1 parsed-imports)))
+assert(Equal ["app"] (_1 (_1 parsed-imports)))
+assert(Equal "s_import" (_0 (_2 parsed-imports)))
+assert(Equal ["app"] (_1 (_2 parsed-imports)))
+assert(Equal "util" (_3 (_2 parsed-imports)))
+
+(define parsed-multi-import
+  (parse-module-sast 0 (rex:ParseRexNorm "
+-  alpha beta
+")))
+assert(Equal 2 (Sz parsed-multi-import))
+assert(Equal "alpha" (_3 (_0 parsed-multi-import)))
+assert(Equal "beta" (_3 (_1 parsed-multi-import)))
+
+;; An import-only decl is a pure mount point — no entry of its own.
+(define parsed-mount-only
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  dep
+  -  vec
+")))
+assert(Equal 1 (Sz parsed-mount-only))
+assert(Equal "s_import" (_0 (_0 parsed-mount-only)))
+assert(Equal ["dep"] (_1 (_0 parsed-mount-only)))
+
+;; The reserved /ty-ap namespace is unwritable from source: `-` is a
+;; rune character, so `+ ty-ap` lexes as a decl named `ty` (whose body
+;; starts with an import rune), never as the reserved word.
+(define hyphen-decl
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  ty-ap
+  1
+")))
+assert(Eq 0
+  (Sz (filter (lambda (d) (includes (Eq "ty-ap") (_1 d))) hyphen-decl)))
+
+;; (@@ vars) scopes type variables over the decl and its descendants:
+;; every decl row's span wraps an s_tvars; the vars themselves add no
+;; row.
+(define atat-rows
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  g
+  (@@ v)
+  1
+  +  m
+    2
+")))
+assert(Equal 2 (Sz atat-rows))
+assert(Equal "s_tvars" (_0 (_2 (_3 (_0 atat-rows)))))
+assert(Equal ["v"] (_1 (_2 (_3 (_0 atat-rows)))))
+assert(Equal ["g" "m"] (_1 (_1 atat-rows)))
+assert(Equal "s_tvars" (_0 (_2 (_3 (_1 atat-rows)))))
+
+;; a scope-only decl emits no row of its own
+(define atat-scope-only
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  g
+  (@@ v)
+  +  m
+    1
+")))
+assert(Equal 1 (Sz atat-scope-only))
+assert(Equal ["g" "m"] (_1 (_0 atat-scope-only)))
+
+;; Any bodiless decl is a pure namespace: no root row, only its
+;; concrete descendants. Reopening the same namespace keeps child paths
+;; absolute.
+(define pure-kid-only
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  quip
+  +  frob
+    1
++  quip
+  +  inner
+    +  zap
+      2
+")))
+assert(Equal 2 (Sz pure-kid-only))
+assert(Equal ["quip" "frob"] (_1 (_0 pure-kid-only)))
+assert(Equal ["quip" "inner" "zap"] (_1 (_1 pure-kid-only)))
+assert(Nil (includes (Equal ["quip"]) (map (Ix 1) pure-kid-only)))
+
+;; duplicate scoped vars are rejected
+(define atat-dup-err
+  (Try (lambda (x)
+    (DeepSeq (parse-module-sast 0 (rex:ParseRexNorm "
++  g
+  (@@ v v)
+  1
+")) 0)) 0))
+assert(Eq 1 (Hd atat-dup-err))
+
+;; @@ buried in an expression is an error, not a scope
+(define atat-body-err
+  (Try (lambda (x)
+    (DeepSeq (parse-module-sast 0 (rex:ParseRexNorm "
++  f
+  ^  nat
+  (add (@@ v) 1)
+")) 0)) 0))
+assert(Eq 1 (Hd atat-body-err))
+
+;; Const parameters in the var list: faced kids carry their types.
+(define atat-const-rows
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  g
+  (@@ k lt={k; k; nat})
+  1
+")))
+assert(Equal 1 (Sz atat-const-rows))
+(define atat-const-tvars (_2 (_3 (_0 atat-const-rows))))
+assert(Equal "s_tvars" (_0 atat-const-tvars))
+assert(Equal ["k"] (_1 atat-const-tvars))
+assert(Equal "s_cvars" (_0 (_2 atat-const-tvars)))
+assert(Equal "lt" (_0 (_0 (_1 (_2 atat-const-tvars)))))
+
+;; '$foo is a constant symbol type
+assert(Equal (surf-tsym "foo") (parse-type "'$foo"))
+
+;; the autonamer: =name / =first/rest name the face after the first
+;; segment
+assert(Equal (surf-face "foo" (surf-ref ["foo"]))
+  (parse-type "=foo"))
+assert(Equal (surf-face "foo" (surf-ref ["foo" "bar"]))
+  (parse-type "=foo/bar"))
+assert(Equal
+  (surf-face "bst" (surf-tapp [(surf-ref ["bst" "node"]) (surf-ref ["v"])]))
+  (parse-type "=bst/node[v]"))
+assert(Equal
+  (surf-trow [(surf-face "foo" (surf-ref ["foo"]))
+              (surf-face "y" (surf-ref ["nat"]))])
+  (parse-type "[=foo y=nat]"))
+
+
+;;; Row type declarations (:) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal
+  (surf-trow [(surf-face "x" (surf-ref ["nat"]))
+              (surf-face "y" (surf-ref ["nat"]))])
+  (parse-val ":  x=nat y=nat"))
+
+assert(Equal
+  (surf-trow [(surf-face "x" (surf-ref ["nat"]))])
+  (parse-val ":  x=nat"))
+
+;; the autonamer works in : fields
+assert(Equal
+  (surf-trow [(surf-face "point" (surf-ref ["point"]))
+              (surf-face "tag" (surf-ref ["nat"]))])
+  (parse-val ":  =point tag=nat"))
+
+;; `:  []` is the bracketed spelling of the empty row
+assert(Equal (surf-trow []) (parse-val ":  []"))
+
+;; a lone `:` decl body is the empty row; module-level round trip
+(define colon-module
+  (parse-module-sast 0 (rex:ParseRexNorm "
++  pt
+  :  x=nat y=nat
++  emptyrow
+  :
+")))
+assert(Equal 2 (Sz colon-module))
+assert(Equal ["pt"] (_1 (_0 colon-module)))
+assert(Equal ["emptyrow"] (_1 (_1 colon-module)))
+
+;; a : row does not take a body
+(define colon-heir-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm ":  x=nat
+5"))) 0))
+assert(Eq 1 (Hd colon-heir-err))
+
+
+;;; Loops (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; single param arm, body as heir
+assert(Equal
+  (surf-loop
+    [(surf-arm (surf-face "foo" (surf-ref ["nat"])) (surf-lit 3))]
+    (surf-var "foo"))
+  (parse-val "|  > foo=nat 3
+foo"))
+
+;; two param arms on one line
+assert(Equal
+  (surf-loop
+    [(surf-arm (surf-face "a" (surf-ref ["nat"])) (surf-lit 1))
+     (surf-arm (surf-face "b" (surf-ref ["nat"])) (surf-lit 2))]
+    (surf-var "a"))
+  (parse-val "|  > a=nat 1  > b=nat 2
+a"))
+
+;; a loop without a body is an error
+(define loop-nobody-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|  > foo=nat 3"))) 0))
+assert(Eq 1 (Hd loop-nobody-err))
+
+;; a loop without parameter arms is an error
+(define loop-noarm-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|
+5"))) 0))
+assert(Eq 1 (Hd loop-noarm-err))
+
 
 (print "foil-sast tests passed")

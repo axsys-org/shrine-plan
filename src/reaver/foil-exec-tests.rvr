@@ -1,0 +1,1139 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind foil-sast (#module foil-sast))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+
+;;; End-to-end execution tests: compile Foil and *run* the compiled PLAN.
+;;; Everything else in the suite asserts on IR shape; these asserts pin
+;;; the calling convention (self=0, args in application order) by
+;;; observing results.
+
+(define (compile-inline txt)
+  (define mod (foil-sast:parse-module-sast 0 (rex:ParseRexNorm txt)))
+  (define elabbed (foil:elab-mod foil:default-subject mod))
+  (define final (foil:materialize-consts elabbed))
+  (foil:lower-tc-mod final final))
+
+(define (lowered path sut)
+  (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
+
+
+;;; Argument order ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define order-sut (compile-inline "
++  sub2
+  \  a=nat b=nat
+  ^  nat
+  (sub a b)
++  apart
+  \  a=nat b=nat
+  ^  nat
+  ?  (lt a b)
+     (sub b a)
+  (sub a b)
+"))
+
+(define sub2 (lowered ["sub2"] order-sut))
+assert(Eq 4 (sub2 5 1))
+assert(Eq 2 (sub2 3 1))
+
+(define apart (lowered ["apart"] order-sut))
+assert(Eq 4 (apart 1 5))
+assert(Eq 4 (apart 5 1))
+
+
+;;; Recursion through ~ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define rec-sut (compile-inline "
++  triangle
+  \  x=nat
+  ^  nat
+  ?  x
+     (add x (_ (dec x)))
+  0
+"))
+
+(define triangle (lowered ["triangle"] rec-sut))
+assert(Eq 0 (triangle 0))
+assert(Eq 6 (triangle 3))
+assert(Eq 15 (triangle 5))
+
+
+;;; Match arms and fallthrough ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define match-sut (compile-inline "
++  pmaybe
+  &  ($some nat)
+     $none
++  pick
+  \  m=pmaybe d=nat
+  ^  nat
+  ?  m
+   > ($some v=nat)  v
+  d
+"))
+
+(define pick (lowered ["pick"] match-sut))
+assert(Eq 7 (pick ("some" 7) 3))
+;; The fallthrough leg must still see the function's own arguments.
+assert(Eq 3 (pick "none" 3))
+
+
+;;; The bst.foil canary, executed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define bst-sut (foil:compile-mod foil:default-subject "bst"))
+
+(define bst-sing (lowered ["bst" "sing"] bst-sut))
+(define bst-insert (lowered ["bst" "insert"] bst-sut))
+(define bst-size (lowered ["bst" "size"] bst-sut))
+(define bst-got (lowered ["bst" "got"] bst-sut))
+(define bst-has (lowered ["bst" "has"] bst-sut))
+
+(define tree0 (bst-sing 2 20))
+(define tree2
+  (bst-insert 3 30 (bst-insert 1 10 tree0)))
+
+assert(Eq 1 (bst-size tree0))
+assert(Eq 3 (bst-size tree2))
+assert(Eq 10 (bst-got 1 0 tree2))
+assert(Eq 20 (bst-got 2 0 tree2))
+assert(Eq 30 (bst-got 3 0 tree2))
+assert(Eq 0 (bst-got 9 0 tree2))
+assert(Eq 1 (bst-has 3 tree2))
+assert(Eq 0 (bst-has 9 tree2))
+
+;; Enough inserts to run the balance/rotate paths.
+(define (build n tree)
+  (Ifz n tree (build (Dec n) (bst-insert n (Mul 10 n) tree))))
+(define tree10 (build 10 (bst-sing 0 0)))
+assert(Eq 11 (bst-size tree10))
+assert(Eq 70 (bst-got 7 0 tree10))
+assert(Eq 100 (bst-got 10 0 tree10))
+assert(Eq 0 (bst-has 42 tree10))
+
+
+;;; Local bindings (=) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define let-sut (compile-inline "
++  lets
+  \  x=nat
+  ^  nat
+  =  > a=nat (add x 1)
+  =  > b (add a a)
+  (add a b)
+"))
+
+(define lets (lowered ["lets"] let-sut))
+assert(Eq 12 (lets 3))
+assert(Eq 3 (lets 0))
+
+
+;;; Record update via generated set_/over_ methods ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define upd-sut (compile-inline "
++  pt
+  :  x=nat y=nat
++  mk
+  \  x=nat y=nat
+  ^  pt
+  (pt x y)
++  setx
+  \  p=pt v=nat
+  ^  pt
+  p.set_x(v)
++  bumpy
+  \  p=pt
+  ^  pt
+  p.over_y(inc)
++  gety
+  \  p=pt
+  ^  nat
+  p.y
+"))
+
+(define mk (lowered ["mk"] upd-sut))
+(define setx (lowered ["setx"] upd-sut))
+(define bumpy (lowered ["bumpy"] upd-sut))
+(define gety (lowered ["gety"] upd-sut))
+(define p12 (mk 1 2))
+assert(Eq 2 (gety p12))
+assert(Equal (mk 9 2) (setx p12 9))
+assert(Equal (mk 1 3) (bumpy p12))
+;; update is functional: the original is untouched
+assert(Equal (mk 1 2) p12)
+
+
+;;; Quip literals ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define quip-sut (compile-inline "
++  greeting
+  ^  quip
+  '%hello
++  name_sym
+  ^  quip
+  'foo
++  hexy
+  ^  quip
+  '0x1F
++  quip_tag
+  \  q=quip
+  ^  nat
+  ?  q
+   > ($ta t=nat)  1
+   > ($ts t=nat)  2
+  0
+"))
+
+assert(Equal ("ta" "hello") (lowered ["greeting"] quip-sut))
+assert(Equal ("ts" "foo") (lowered ["name_sym"] quip-sut))
+assert(Equal ("x" 31) (lowered ["hexy"] quip-sut))
+
+(define quip-tag (lowered ["quip_tag"] quip-sut))
+assert(Eq 1 (quip-tag ("ta" "hello")))
+assert(Eq 2 (quip-tag ("ts" "foo")))
+assert(Eq 0 (quip-tag ("u" 5)))
+
+
+;;; Function-argument variance + by-name linking ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; sum_len accepts the whole sum, use_some only requires a function on
+;; the $vsome option — contravariance makes the call legal, and the
+;; function argument links by name through a TC_GLOBAL.
+
+(define var-sut (compile-inline "
++  vm
+  &  ($vsome nat)
+     $vnone
++  use_some
+  \  f={($vsome nat); nat} v=nat
+  ^  nat
+  (f ($vsome v))
++  sum_len
+  \  m=vm
+  ^  nat
+  ?  m
+   > ($vsome x=nat)  x
+   > $vnone  0
++  varcall
+  ^  nat
+  (use_some sum_len 5)
+"))
+
+assert(Eq 5 (lowered ["varcall"] var-sut))
+(define use-some-fn (lowered ["use_some"] var-sut))
+(define sum-len-fn (lowered ["sum_len"] var-sut))
+assert(Eq 7 (use-some-fn sum-len-fn 7))
+assert(Eq 0 (sum-len-fn "vnone"))
+
+;;; Row builtins, executed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; row.drop used to keep the first Sz-n elements (dropped from the
+;; wrong end); only its *type* was ever asserted.
+(define rowops-sut (compile-inline "
++  cut
+  \  xs=row[nat]
+  ^  row[nat]
+  xs.drop(1)
++  front
+  \  xs=row[nat]
+  ^  row[nat]
+  xs.take(2)
+"))
+(define rowops-cut (lowered ["cut"] rowops-sut))
+(define rowops-front (lowered ["front"] rowops-sut))
+assert(Equal [8 9] (rowops-cut [7 8 9]))
+assert(Equal [7 8] (rowops-front [7 8 9]))
+
+
+;;; Elaboration rejections (review round) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A match arm whose pattern is not a row type has no constructor+arity
+;; key; it used to miscompile to an `== 0` scrutinee test.
+(define non-row-arm-err
+  (Try (lambda (x) (compile-inline "
++  bad_arm
+  \  x=nat
+  ^  nat
+  ?  x
+   > n=nat (add n 1)
+  0
+")) 0))
+assert(Eq 1 (Hd non-row-arm-err))
+
+;; Sum options that collide on constructor+arity are unmatchable.
+(define sum-collide-err
+  (Try (lambda (x) (compile-inline "
++  cpt
+  :  x=nat y=nat
++  clash
+  &  ($a nat)
+     ($a cpt)
+")) 0))
+assert(Eq 1 (Hd sum-collide-err))
+
+;; Undefined types inside /ty-ap arguments on a *value* entry are
+;; caught by the module wf pass (which now visits every entry).
+(define lam-wf-err
+  (Try (lambda (x) (compile-inline "
++  bad_lam
+  \  xs=list[bogus]
+  ^  nat
+  0
+")) 0))
+assert(Eq 1 (Hd lam-wf-err))
+
+;; Wrong number of type arguments: under-application (either wants 2)
+;; and over-application at an explicit spec site.
+(define under-spec-err
+  (Try (lambda (x) (compile-inline "
++  bad_under
+  \  x=either[nat]
+  ^  nat
+  0
+")) 0))
+assert(Eq 1 (Hd under-spec-err))
+
+(define over-spec-err
+  (Try (lambda (x) (compile-inline "
++  box
+  (@ v)
+  +  cell
+    (@ v)
+    :  val=v
+  &  box/cell[v]
++  bad_over
+  ^  nat
+  ((box/cell[nat nat] 5).val)
+")) 0))
+assert(Eq 1 (Hd over-spec-err))
+
+;;; Imports (- rune): merge, mount, cycles, collisions ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define vecapp-sut (foil:compile-mod foil:default-subject "vecapp"))
+
+;; canonical use of an imported type + method
+(define vmain (lowered ["main"] vecapp-sut))
+assert(Eq 11 (vmain 1 2 10 20))
+
+;; a canonical vec satisfies a parameter typed through the mount
+;; (nominal identity normalizes through canon-path)
+(define vcross (lowered ["cross"] vecapp-sut))
+assert(Eq 4 (vcross 3 4))
+
+;; constructing through the mounted path yields the canonical row
+(define vmounted (lowered ["mounted_make"] vecapp-sut))
+assert(Eq 7 (vmounted 7 9))
+
+;; import cycles are a diagnostic, not a hang — and compile failures
+;; carry the module name
+(define import-cycle-err
+  (Try (lambda (x) (foil:compile-mod foil:default-subject "cyca")) 0))
+assert(Eq 1 (Hd import-cycle-err))
+assert(Eq "foil-in-module" (Ix 0 (_0 import-cycle-err)))
+assert(Eq "cyca" (Ix 1 (_0 import-cycle-err)))
+
+;; declaring a path an import already occupies is a collision
+(define import-collide-err
+  (Try (lambda (x) (foil:compile-mod foil:default-subject "collide")) 0))
+assert(Eq 1 (Hd import-collide-err))
+
+;; Reopening is additive, but redefining an imported member still
+;; collides at the member path.
+(define imported-member-collide-err
+  (Try (lambda (x) (foil:compile-mod foil:default-subject "mapcollide")) 0))
+assert(Eq 1 (Hd imported-member-collide-err))
+assert(Eq "foil-import-collision" (Ix 0 (Ix 2 (_0 imported-member-collide-err))))
+
+;; Duplicating a declaration path within one module is rejected before
+;; insert-entry-sut can silently keep the later value.
+(define duplicate-decl-err
+  (Try (lambda (x) (foil:compile-mod foil:default-subject "dupdecl")) 0))
+assert(Eq 1 (Hd duplicate-decl-err))
+assert(Eq "foil-duplicate-decl" (Ix 0 (Ix 2 (_0 duplicate-decl-err))))
+
+;; inline modules cannot import (no file resolution)
+(define inline-import-err
+  (Try (lambda (x) (compile-inline "
+-  vec
++  f
+  ^  nat
+  0
+")) 0))
+assert(Eq 1 (Hd inline-import-err))
+
+;; Type arguments with no path form (function types) specialize
+;; structurally instead of erroring — they can't ride a /ty-ap name.
+(define fnarg-sut (compile-inline "
++  pbox
+  (@ v)
+  :  val=v
++  fnbox
+  \  b=pbox[{nat; nat}]
+  ^  nat
+  0
+"))
+assert(Eq "SUT" (Hd fnarg-sut))
+
+;; ... but a *recursive* generic's recursive occurrence needs the
+;; argument as a path; the leftover variable is a located wf error.
+(define fnarg-rec-err
+  (Try (lambda (x) (compile-inline "
++  fnlist
+  \  fs=list[{nat; nat}]
+  ^  nat
+  0
+")) 0))
+assert(Eq 1 (Hd fnarg-rec-err))
+
+;; Every failed decl is reported, not just the first.
+(define multi-elab-err
+  (Try (lambda (x) (compile-inline "
++  bad_one
+  ^  nat
+  (nosuch 1)
++  bad_two
+  ^  nat
+  (alsonosuch 2)
+")) 0))
+assert(Eq 1 (Hd multi-elab-err))
+assert(Eq "foil-elab-errors" (Ix 0 (_0 multi-elab-err)))
+assert(Eq 2 (Sz (Ix 1 (_0 multi-elab-err))))
+
+;;; Every builtin, executed by value ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; The row.drop lesson: a builtin whose only test is its type can be
+;; arbitrarily wrong.  One module sweeps the whole default subject.
+
+(define builtin-sut (compile-inline "
++  bump
+  \  x=nat
+  ^  nat
+  (add x 1)
++  even
+  \  x=nat
+  ^  nat
+  (eq 0 (mod x 2))
++  addf
+  \  z=nat x=nat
+  ^  nat
+  (add z x)
++  arith
+  \  a=nat b=nat
+  ^  row[nat]
+  [(add a b) (sub a b) (mul a b) (div a b) (mod a b) (inc a) (dec a)
+   (lt a b) (le a b) (ge a b) (gt a b) (eq a b)]
++  marith
+  \  a=nat b=nat
+  ^  row[nat]
+  [a.add(b) a.sub(b) a.mul(b) a.div(b) a.mod(b) a.inc a.dec
+   a.lt(b) a.le(b) a.ge(b) a.gt(b) a.eq(b)]
++  rowops
+  \  xs=row[nat]
+  ^  row[nat]
+  = > t (xs.take(2))
+  = > d (xs.drop(1))
+  = > w (xs.weld(xs))
+  = > ap (xs.append(xs))
+  = > c (xs.cons(9))
+  = > s (xs.snoc(9))
+  = > m (xs.map(bump))
+  = > f (xs.filter(even))
+  = > r (xs.rev)
+  [xs.size xs.len (xs.get(0)) (xs.at(2))
+   t.size (d.get(0)) w.size ap.size (c.get(0)) (s.get(3))
+   (m.get(0)) f.size (r.get(0))
+   (xs.fold(addf 0)) (xs.find(even 99)) (xs.any(even)) (xs.all(even))]
++  listops
+  ^  row[nat]
+  = > l0 list/nil[nat]
+  = > l2 (list/cons[nat] 1 (list/cons[nat] 2 list/nil[nat]))
+  = > m2 (l2.map(bump))
+  [l2.head l2.tail.head l2.is_nil l2.is_cons m2.head l0.is_nil]
++  eitherops
+  ^  row[nat]
+  = > l (either/left[nat nat] 5)
+  = > r (either/right[nat nat] 7)
+  [l.is_left l.is_right l.left_val r.is_right r.right_val]
++  rootops
+  \  a=nat
+  ^  row[nat]
+  = > p (pin a)
+  [(if a 1 2) (if 0 1 2) (eq a a) (unpin p)]
+"))
+
+assert(Equal [10 4 21 2 1 8 6 0 0 1 1 0]
+  ((lowered ["arith"] builtin-sut) 7 3))
+assert(Equal [10 4 21 2 1 8 6 0 0 1 1 0]
+  ((lowered ["marith"] builtin-sut) 7 3))
+assert(Equal [3 3 5 7 2 6 6 6 9 9 6 1 7 18 6 1 0]
+  ((lowered ["rowops"] builtin-sut) [5 6 7]))
+assert(Equal [1 2 0 1 2 1] (lowered ["listops"] builtin-sut))
+assert(Equal [1 0 5 1 7] (lowered ["eitherops"] builtin-sut))
+assert(Equal [1 2 1 5] ((lowered ["rootops"] builtin-sut) 5))
+
+;; Inline modules cannot import, but they can reopen builtin
+;; namespaces because builtins are already in the default subject.
+(define builtin-ext-sut (compile-inline "
++  list
+  (@@ a)
+  +  frob
+    \  xs=list[a]
+    ^  nat
+    xs.is_nil
++  use_frob_nil
+  ^  nat
+  = > xs list/nil[nat]
+  xs.frob
++  use_frob_cons
+  ^  nat
+  = > xs (list/cons[nat] 1 list/nil[nat])
+  xs.frob
+"))
+assert(Eq 1 (lowered ["use_frob_nil"] builtin-ext-sut))
+assert(Eq 0 (lowered ["use_frob_cons"] builtin-ext-sut))
+
+;; Synthetic module rows cannot declare into the reserved
+;; type-application namespaces (source can't even spell them — `-` is
+;; a rune character — but elab backstops constructed rows).
+(define reserved-decl-err
+  (Try (lambda (x)
+    (foil:elab-mod foil:default-subject
+      [["s_decl" ["ty-ap"] [1 1 0 0] ["s_lit" 1]]])) 0))
+assert(Eq 1 (Hd reserved-decl-err))
+
+;;; @@ scoped type vars: drop-if-unused, subset members ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define atat-sut (compile-inline "
++  pairbox
+  (@@ a b)
+  +  fst_id
+    \  x=a
+    ^  a
+    x
+  +  snd_id
+    \  y=b
+    ^  b
+    y
+  +  plain
+    \  n=nat
+    ^  nat
+    n
++  use_snd
+  ^  nat
+  (pairbox/snd_id[nat] 5)
++  use_plain
+  ^  nat
+  (pairbox/plain 7)
+"))
+;; a member using only the SECOND scoped var keeps exactly [b] —
+;; explicit spec supplies one argument, and a var-free member is plain.
+assert(Eq 5 (lowered ["use_snd"] atat-sut))
+assert(Eq 7 (lowered ["use_plain"] atat-sut))
+
+
+;;; Const generic parameters: map.foil end to end ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define map-sut (foil:compile-mod foil:default-subject "map"))
+(define mapuser-sut (foil:compile-mod foil:default-subject "mapuser"))
+(define mapuser-rev-sut (foil:compile-mod foil:default-subject "mapuser_rev"))
+
+;; explicit-spec use, two DISTINCT instantiations of the same generic
+assert(Eq 20 (lowered ["mapuse"] map-sut))
+assert(Eq 20 (lowered ["mapuse_gt"] map-sut))
+;; method-call form: the receiver's /ty-ap path carries the constant
+assert(Eq 60 (lowered ["mapmeth"] map-sut))
+;; reopened cross-file members dispatch as methods and explicit specs
+;; under both import orders.
+assert(Eq 4 (lowered ["mapuser"] mapuser-sut))
+assert(Eq 4 (lowered ["mapuser_rev"] mapuser-rev-sut))
+
+;; materialization shape: the full key is a real lowered entry, the
+;; const-bearing base member stays a TC (skipped by base lowering)
+(define map-insert-lt-key
+  (ty-ap-encode [["boot" "map" "insert"] ["nat"] ["lt"]]))
+assert(Eq "IR_ENTRY" (Hd (got-entry map-insert-lt-key map-sut)))
+assert(Eq "TC" (Hd (got-entry ["boot" "map" "insert"] map-sut)))
+(define map-has-lt-key
+  (ty-ap-encode [["boot" "map" "has"] ["nat"] ["lt"]]))
+assert(Eq "IR_ENTRY" (Hd (got-entry map-has-lt-key mapuser-sut)))
+assert(Eq "TC" (Hd (got-entry ["boot" "map" "has"] mapuser-sut)))
+
+
+;;; Constant symbols, literal precision, the autonamer ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define symconst-src (strcat ["
++  labeled
+  (@@ s=nat)
+  +  tagof
+    ^  nat
+    s
++  use_foo
+  ^  nat
+  (labeled/tagof['$foo])
++  want3
+  \  x=3
+  ^  nat
+  x
++  give3
+  ^  nat
+  (want3 3)
++  wantsym
+  \  x=('$foo)
+  ^  nat
+  1
++  givesym
+  ^  nat
+  (wantsym " 34 "foo" 34 ")
+"]))
+(define symconst-sut (compile-inline symconst-src))
+;; a symbol const generic parameter materializes to the bare symbol
+assert(Equal "foo" (lowered ["use_foo"] symconst-sut))
+;; literals know their constants; singleton params accept them
+assert(Eq 3 (lowered ["give3"] symconst-sut))
+assert(Eq 1 (lowered ["givesym"] symconst-sut))
+
+;; ... and reject the wrong constant
+(define wrong-const-err
+  (Try (lambda (x) (compile-inline "
++  want3
+  \  x=3
+  ^  nat
+  x
++  give4
+  ^  nat
+  (want3 4)
+")) 0))
+assert(Eq 1 (Hd wrong-const-err))
+
+;; the autonamer names row fields and accessors after the type
+(define autoname-sut (compile-inline "
++  point
+  :  x=nat y=nat
++  holder
+  :  =point tag=nat
++  getp
+  \  h=holder
+  ^  nat
+  h.point.x
++  mk
+  ^  nat
+  (getp (holder (point 3 4) 9))
+"))
+assert(Eq 3 (lowered ["mk"] autoname-sut))
+
+
+;;; Crash-vs-diagnostic sweep ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Anything a .foil source can trigger must land in a recognized
+;; diagnostic shape — a raw internal tuple is a compiler bug.  "bad rex
+;; parse" is the lexer's own failure (a bare string; compile-mod
+;; attributes it to a module).
+
+(define diag-tags
+  ["foil-sast-error" "foil-elab-error" "foil-elab-errors" "foil-type-wf"
+   "foil-unsupported" "foil-import-cycle" "foil-import-collision"
+   "foil-duplicate-decl" "foil-in-module"])
+
+(define (recognized-diag? e)
+  (Or (Eq e "bad rex parse")
+    (And (IsApp e) (includes (Eq (Ix 0 e)) diag-tags))))
+
+(define crash-corpus
+  ["
++  a
+  foo
+  bar
+" "
++  a
+  ^  nat
+  (wat 1)
+" "
++  a
+  \  x=wat
+  ^  nat
+  0
+" "
++  a
+  \  x=row[nat]
+  ^  nat
+  (x.wat)
+" "
++  a
+  \  n=nat
+  ^  nat
+  (n.wat(1))
+" "
++  a
+  \  x=list[nat nat]
+  ^  nat
+  0
+" "
++  a
+  \  x=either[nat]
+  ^  nat
+  0
+" "
++  a
+  &  ($k nat)
+     ($k unit)
+" "
++  a
+  \  x=nat
+  ^  nat
+  ?  x
+   > n=nat  1
+  0
+" "
++  a
+  ^
+  1
+" "
++  a
+  ()
+" "
++  a
+  $  x y
+" "
++  a
+  ^  nat
+  (5[nat] 1)
+" "
++  a
+  = > x 1
+" "
++  a
+  (@ v)
+" "
++  a
+  (_ 1)
+" "
++  a
+  \  x=nat
+  ^  nat
+  ((1).x)
+" "
++
+  1
+" "
++  a
+  ^  nat
+  [1 [2 [3
+"])
+
+(define (crash-one src)
+  (define r (Try (lambda (x) (compile-inline src)) 0))
+  (cond
+    ((Nil (Eq 1 (Hd r))) ["compiled" src])
+    ((recognized-diag? (_0 r)) 0)
+    (else ["leak" src (_0 r)])))
+
+(define crash-leaks (filter (lambda (x) x) (map crash-one crash-corpus)))
+assert(Eq 0 (Sz crash-leaks))
+
+
+;;; Anonymous structural rows ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; [..] in type position is a bare cstr-0 row: runtime head literally
+;; 0 (PLAN row rep), outside UFCS; consumed by binding + bare faces,
+;; match arms, or host-side Ix.
+
+(define anon-sut (compile-inline "
++  pmaybe
+  &  ($some nat)
+     $none
++  mk
+  \  k=nat
+  ^  [found=pmaybe rest=nat]
+  [($some k) (add k 1)]
++  use
+  \  k=nat
+  ^  nat
+  =  > res (mk k)
+  ?  found
+   > ($some v=nat)  (add v rest)
+   > $none  0
++  fst2
+  \  p=[a=nat b=nat]
+  ^  nat
+  a
++  splitn
+  \  n=nat
+  ^  [lo=nat hi=nat]
+  ?  (lt n 10)
+     [n 0]
+  =  > r (_ (sub n 10))
+  [lo (add 1 hi)]
++  arm_use
+  \  p=[a=nat b=nat]
+  ^  nat
+  ?  p
+   > r=[x=nat y=nat]  (add x y)
++  arm_free
+  \  p=[a=nat b=nat]
+  ^  nat
+  ?  p
+   > [x=nat y=nat]  (add x (add x y))
++  addpairs
+  \  xs=row[[a=nat b=nat]]
+  ^  nat
+  ?  (eq 0 xs.len)
+     0
+  =  > h xs.at(0)
+  (add (add a b) (_ xs.drop(1)))
++  litlen
+  ^  nat
+  =  > r [1 2 3]
+  r.len
+"))
+
+;; runtime head is literally 0: the value IS a PLAN row
+(define anon-mk (lowered ["mk"] anon-sut))
+assert(Equal [("some" 5) 6] (anon-mk 5))
+assert(Eq 0 (Hd (anon-mk 5)))
+assert(Equal ("some" 5) (_0 (anon-mk 5)))
+assert(Eq 6 (_1 (anon-mk 5)))
+
+;; bare faces resolve through a letrec-bound anonymous row
+(define anon-use (lowered ["use"] anon-sut))
+assert(Eq 11 (anon-use 5))
+
+;; ... and through a TFAC-wrapped anonymous-row parameter
+(define anon-fst2 (lowered ["fst2"] anon-sut))
+assert(Eq 7 (anon-fst2 [7 9]))
+
+;; self-recursion under an anonymous return cast
+(define anon-splitn (lowered ["splitn"] anon-sut))
+assert(Equal [3 0] (anon-splitn 3))
+assert(Equal [3 2] (anon-splitn 23))
+
+;; match arm on an anonymous row: key (0, arity)
+(define anon-arm (lowered ["arm_use"] anon-sut))
+assert(Eq 12 (anon-arm [5 7]))
+
+;; binderless arm patterns bind through the pattern's own faces
+(define anon-arm-free (lowered ["arm_free"] anon-sut))
+assert(Eq 17 (anon-arm-free [5 7]))
+
+;; anonymous rows as spec arguments: row[[a=nat b=nat]]
+(define anon-addpairs (lowered ["addpairs"] anon-sut))
+assert(Eq 10 (anon-addpairs [[1 2] [3 4]]))
+
+;; row builtins still reach cstr-0 receivers that nest as arrays
+(define anon-litlen (lowered ["litlen"] anon-sut))
+assert(Eq 3 anon-litlen)
+
+;; UFCS face access on an anonymous row is rejected
+(define anon-ufcs-err
+  (Try (lambda (x) (compile-inline "
++  bad
+  \  p=[a=nat b=nat]
+  ^  nat
+  p.a
+")) 0))
+assert(Eq 1 (Hd anon-ufcs-err))
+
+;; named and anonymous rows do not cross-flow, either direction
+(define named-into-anon-err
+  (Try (lambda (x) (compile-inline "
++  pt
+  :  x=nat y=nat
++  bad2
+  \  q=pt
+  ^  [x=nat y=nat]
+  q
+")) 0))
+assert(Eq 1 (Hd named-into-anon-err))
+(define anon-into-named-err
+  (Try (lambda (x) (compile-inline "
++  pt
+  :  x=nat y=nat
++  bad3
+  \  q=[x=nat y=nat]
+  ^  pt
+  q
+")) 0))
+assert(Eq 1 (Hd anon-into-named-err))
+
+;; stale $ [..] row declarations get the migration diagnostic
+(define dollar-row-err
+  (Try (lambda (x) (compile-inline "
++  pt2
+  $  [x=nat y=nat]
+")) 0))
+assert(Eq 1 (Hd dollar-row-err))
+
+
+;;; Loops (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; An immediately-applied lambda: > arms declare typed loop params with
+;; initial values; (_ ...) re-enters; no ^ cast needed (the loop's type
+;; is the join of its non-recursive exits).
+
+(define loop-sut (compile-inline "
++  countdown
+  \  n=nat
+  ^  nat
+  |  > foo=nat n
+  ?  (eq 0 foo)
+     foo
+  (_ (dec foo))
++  triangle
+  \  n=nat
+  ^  nat
+  |  > i=nat n  > acc=nat 0
+  ?  (eq 0 i)
+     acc
+  (_ (dec i) (add acc i))
++  scaled_triangle
+  \  n=nat k=nat
+  ^  nat
+  |  > i=nat n  > acc=nat 0
+  ?  (eq 0 i)
+     acc
+  (_ (dec i) (add acc (mul k i)))
++  cast_loop
+  \  n=nat
+  ^  nat
+  |  > i=nat n
+  ^  nat
+  ?  (le i 1)
+     1
+  (mul i (_ (dec i)))
++  nested_loops
+  \  n=nat
+  ^  nat
+  |  > i=nat n  > outer_acc=nat 0
+  ?  (eq 0 i)
+     outer_acc
+  =  > rowsum
+       |  > j=nat i  > acc=nat 0
+       ?  (eq 0 j)
+          acc
+       (_ (dec j) (add acc j))
+  (_ (dec i) (add outer_acc rowsum))
+"))
+
+;; the motivating example: counts down to 0
+(define loop-countdown (lowered ["countdown"] loop-sut))
+assert(Eq 0 (loop-countdown 3))
+assert(Eq 0 (loop-countdown 0))
+
+;; two loop params, accumulator shape
+(define loop-triangle (lowered ["triangle"] loop-sut))
+assert(Eq 0 (loop-triangle 0))
+assert(Eq 6 (loop-triangle 3))
+assert(Eq 15 (loop-triangle 5))
+
+;; the loop body captures an enclosing fn param (k): lambda-lift path
+(define loop-scaled (lowered ["scaled_triangle"] loop-sut))
+assert(Eq 30 (loop-scaled 5 2))
+assert(Eq 45 (loop-scaled 5 3))
+
+;; an explicit ^ cast as the loop body's first form still works —
+;; needed when the recursive result is consumed (not in tail position)
+(define loop-cast (lowered ["cast_loop"] loop-sut))
+assert(Eq 120 (loop-cast 5))
+
+;; nested loops: (_ ...) binds the innermost loop
+(define loop-nested (lowered ["nested_loops"] loop-sut))
+assert(Eq 0 (loop-nested 0))
+assert(Eq 10 (loop-nested 3))
+
+;; a self-call arity mismatch inside a loop is rejected
+(define loop-arity-err
+  (Try (lambda (x) (compile-inline "
++  bad_loop
+  \  n=nat
+  ^  nat
+  |  > i=nat n
+  (_ i i)
+")) 0))
+assert(Eq 1 (Hd loop-arity-err))
+
+;;; The pail universe ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; `pail` is the open union of nominal row types: any declared row
+;; value flows into a pail position, and matches dispatch by branded
+;; head — with a mandatory fallthrough (open universe).
+
+(define pail-sut (compile-inline "
++  kook
+  :  ids=row[quip]
++  npail
+  :  n=nat
++  mk_n
+  \  x=nat
+  ^  pail
+  (npail x)
++  mk_k
+  \  ids=row[quip]
+  ^  pail
+  (kook ids)
++  disc
+  \  p=pail
+  ^  nat
+  ?  p
+   > k=kook  k.ids.len
+   > x=npail  x.n
+  99
++  many
+  \  ps=row[pail]
+  ^  nat
+  |  > i=nat 0  > acc=nat 0
+  ?  (eq i ps.len)
+     acc
+  =  > h ps.at(i)
+  (_ i.inc (add acc (disc h)))
++  boxed
+  :  slot=pail
++  reslot
+  \  b=boxed
+  ^  nat
+  ?  b.slot
+   > x=npail  x.n
+  0
+"))
+(define mk-n (lowered ["mk_n"] pail-sut))
+(define mk-k (lowered ["mk_k"] pail-sut))
+(define p-disc (lowered ["disc"] pail-sut))
+(define p-many (lowered ["many"] pail-sut))
+(define p-reslot (lowered ["reslot"] pail-sut))
+
+;; runtime heads are the declaration brands
+(define np7 (mk-n 7))
+assert(Eq "/boot/npail" (Hd np7))
+assert(Eq 7 (_0 np7))
+;; dispatch by branded head, fallthrough for the open remainder
+assert(Eq 7 (p-disc np7))
+assert(Eq 2 (p-disc (mk-k [("ts" "a") ("ts" "b")])))
+;; heterogeneous pail rows
+assert(Eq 3 (p-many [(mk-n 2) (mk-k [("ts" "a")])]))
+;; pail-typed fields in rows (boxed values built host-side by brand)
+assert(Eq 5 (p-reslot ("/boot/boxed" (mk-n 5))))
+assert(Eq 0 (p-reslot ("/boot/boxed" (mk-k []))))
+
+;; anonymous rows do not inhabit pail
+(define anon-pail-err
+  (Try (lambda (x) (compile-inline "
++  bad
+  \  x=nat
+  ^  pail
+  [x]
+")) 0))
+assert(Eq 1 (Hd anon-pail-err))
+
+;; sums do not inhabit pail
+(define sum-pail-err
+  (Try (lambda (x) (compile-inline "
++  pm
+  &  ($some nat)
+     $none
++  bad2
+  \  x=pm
+  ^  pail
+  x
+")) 0))
+assert(Eq 1 (Hd sum-pail-err))
+
+;; a match on a pail without fallthrough is rejected (open universe)
+(define pail-exhaust-err
+  (Try (lambda (x) (compile-inline "
++  npail2
+  :  n=nat
++  bad3
+  \  p=pail
+  ^  nat
+  ?  p
+   > x=npail2  x.n
+")) 0))
+assert(Eq 1 (Hd pail-exhaust-err))
+
+;;; Type aliases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; A + declaration whose body is a type expression is a transparent
+;; alias: no new nominal identity (only `:` and `&` mint), values flow
+;; both directions, and UFCS unfolds the alias to the target's method
+;; set — after the alias's own declared methods.
+
+(define alias-sut (compile-inline "
++  path
+  row[quip]
++  path
+  +  depth
+    \  p=path
+    ^  nat
+    p.size
++  plen
+  \  p=path
+  ^  nat
+  p.size
++  both
+  \  p=path
+  ^  nat
+  (add p.depth p.size)
++  mk3
+  \  q=quip
+  ^  path
+  [q q q]
++  back
+  \  p=path
+  ^  row[quip]
+  p
++  pt
+  :  x=nat y=nat
++  spot
+  pt
++  getx
+  \  s=spot
+  ^  nat
+  s.x
++  myn
+  nat
++  bump
+  \  n=myn
+  ^  myn
+  n.add(1)
+"))
+
+;; runtime rep is the bare row: no wrapper, no brand
+(define al-plen (lowered ["plen"] alias-sut))
+(define al-mk3 (lowered ["mk3"] alias-sut))
+(define al-back (lowered ["back"] alias-sut))
+assert(Eq 2 (al-plen [("ts" "a") ("ts" "b")]))
+assert(Equal [("ts" "q") ("ts" "q") ("ts" "q")] (al-back (al-mk3 ("ts" "q"))))
+;; the alias's own methods win; the target's are still reachable
+assert(Eq 4 ((lowered ["both"] alias-sut) [("ts" "a") ("ts" "b")]))
+;; face access unfolds through an alias of a named row
+assert(Eq 7 ((lowered ["getx"] alias-sut) ("/boot/pt" 7 9)))
+;; bare-word alias of a builtin: methods route to the target's set
+assert(Eq 8 ((lowered ["bump"] alias-sut) 7))
+
+;; generic instantiations at the alias and at the target interoperate
+(define alias-gen-sut (compile-inline "
++  path
+  row[quip]
++  mk
+  \  p=path
+  ^  list[path]
+  (list/cons[path] p (list/nil[path]))
++  take
+  \  l=list[row[quip]]
+  ^  nat
+  1
++  use
+  \  p=path
+  ^  nat
+  (take (mk p))
+"))
+assert(Eq 1 ((lowered ["use"] alias-gen-sut) [("ts" "a")]))
+
+(print "foil-exec tests passed")

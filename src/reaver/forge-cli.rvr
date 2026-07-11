@@ -1,0 +1,250 @@
+;;;; The Forge, ported to the command line.  Same image bundles, lore,
+;;;; doctests, references and evaluation as the HTTP forge — rendered
+;;;; as text.  Everything except main is pure: render-cmd threads the
+;;;; same state the HTTP route does and returns [state' text bad].
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind forge (#module forge))
+
+
+(define NL (strcat [10]))
+(define (lines rows) (join-str NL rows))
+
+(define usage-text
+  (lines
+    ["the forge, on the command line"
+     ""
+     "  x/forge-cli mods                    list modules"
+     "  x/forge-cli ns                      list namespaces"
+     "  x/forge-cli ns <root>               entries in a namespace"
+     "  x/forge-cli ls <mod>                entries of the live subject"
+     "  x/forge-cli show <mod> <dotted>     inspect one entry (bst.size)"
+     "  x/forge-cli refs <mod> <dotted>     who-calls / called-by"
+     "  x/forge-cli doctest <mod>           run every doctest in the lore"
+     "  x/forge-cli eval <mod> <expr>       evaluate against the subject"]))
+
+;; Compile-or-explain wrapper shared by every command.
+(define (with-bundle st mod k)
+  (define r[st1 b] (forge:state-bundle st mod))
+  (If (forge:bundle-ok? b)
+    (k st1 b)
+    [st1
+     (strcat [mod " does not compile:" NL
+              (forge:diag-text (forge:bundle-err b))])
+     1]))
+
+(define (cmd-mods st)
+  [st (lines forge:forge-mods) 0])
+
+(define (ns-root-line rows root)
+  (define files (forge:ns-root-files rows root))
+  (strcat
+    [(strcat ["/" root]) "  "
+     (showNat (Sz (forge:ns-root-rows rows root))) " entries"
+     (If (forge:builtin-root? root) "  builtin" "")
+     "  " (join-str " " (map (lambda (m) (strcat [m ".foil"])) files))]))
+
+(define (ns-entry-line st row[root key mod])
+  (define b (forge:bundle-for st mod))
+  (define sut (forge:bundle-sut b))
+  (define rkey (forge:unroot key))
+  (define tc (got-entry-tc key sut))
+  (define l (forge:lore-for (forge:bundle-lore b) rkey))
+  (strcat
+    ["  " (forge:path-text rkey)
+     "  [" (forge:entry-kind sut key tc) "]"
+     "  defined in " mod ".foil"
+     (Ifz l "" (strcat ["  " (forge:lore-head (_0 l))]))]))
+
+(define (broken-line b)
+  (strcat ["  broken bundle: " (forge:bundle-mod b) ".foil does not compile"]))
+
+(define (cmd-ns st root)
+  (define st1 (forge:state-load-all st))
+  (define rows (forge:ns-rows st1))
+  (Ifz (Bytes root)
+    (let ((roots (forge:ns-roots rows)))
+      [st1
+       (lines
+         (Weld ["namespaces"]
+           (Weld (map (ns-root-line rows) roots)
+             (Weld ["" "broken bundles"] (map broken-line (forge:broken-bundles st1))))))
+       0])
+    (let ((rrows (forge:ns-root-rows rows root)))
+      [st1
+       (lines
+         (Weld [(strcat ["/" root])]
+           (Ifz (Sz rrows)
+             ["  no entries"]
+             (map (ns-entry-line st1) rrows))))
+       0])))
+
+(define (entry-line sut lore path)
+  (define rpath (forge:unroot path))
+  (define tc (got-entry-tc path sut))
+  (define l (forge:lore-for lore rpath))
+  (strcat
+    ["  " (print-path rpath)
+     "  [" (forge:entry-kind sut path tc) "]"
+     (Ifz l "" (strcat ["  " (forge:lore-head (_0 l))]))]))
+
+(define (cmd-ls st mod)
+  (with-bundle st mod
+    (lambda (st1 b)
+      (define sut (forge:bundle-sut b))
+      [st1
+       (lines
+         (map (entry-line sut (forge:bundle-lore b))
+           (forge:module-paths sut)))
+       0])))
+
+;; Doctest values render numerically unless they are readable text —
+;; render-plain alone shows nat 99 as "c".
+(define (dt-val v)
+  (If (And (IsNat v) (Nil (And (forge:printable-text? v) (Gt (Bytes v) 1))))
+    (showNat v)
+    (forge:render-plain v)))
+
+(define (dt-res-line r[status line got want])
+  (strcat
+    ["  " status "  " line
+     (If (Eq "fail" status)
+       (strcat ["    got " (dt-val got) "  want " (dt-val want)])
+       "")]))
+
+(define (ref-line r)
+  (strcat ["  " (_1 r) "  " (print-path (_0 r))
+           " -> " (print-path (_2 r))]))
+
+(define (cmd-show st mod dotted)
+  (with-bundle st mod
+    (lambda (st1 b)
+      (define sut (forge:bundle-sut b))
+      (define path (forge:undot dotted))
+      (define cpath (canon-path path sut))
+      (define e (forge:entry-parts sut cpath))
+      (define l (forge:lore-for (forge:bundle-lore b) path))
+      (define refs (forge:bundle-refs b))
+      (define head-row
+        [(strcat [(print-path path)
+                  "  [" (forge:entry-kind sut cpath (forge:ent-tc e)) "]"
+                  "  line " (showNat (Ix 0 (forge:ent-span e)))])
+         (strcat ["type: " (forge:ty-text (tc-ty (forge:ent-tc e)))])])
+      (define lore-rows
+        (Ifz l []
+          (Weld [""]
+            (Weld (map (lambda (bl) (strcat ["  " bl]))
+                    (forge:lore-body (_0 l)))
+              (map (lambda (dt)
+                     (dt-res-line (forge:run-doctest sut dt)))
+                (forge:lore-tests (_0 l)))))))
+      (define ref-rows
+        (Weld ["" "references:"]
+          (Weld (map ref-line (forge:refs-from refs cpath))
+            (Weld ["referenced by:"]
+              (map ref-line (forge:refs-to refs cpath))))))
+      (define law-rows
+        (If (forge:ent-lowered e)
+          ["" "compiled:"
+           (If (forge:law-like? (forge:ent-val e))
+             (forge:render-law (forge:ent-val e))
+             (forge:render-plain (forge:ent-val e)))]
+          []))
+      (define src-rows
+        (let ((slice (forge:source-slice (forge:bundle-src b)
+                       (forge:ent-span e))))
+          (Ifz (Bytes slice) [] ["" "source:" slice])))
+      [st1
+       (lines (Weld head-row (Weld lore-rows (Weld ref-rows
+                (Weld law-rows src-rows)))))
+       0])))
+
+(define (cmd-refs st mod dotted)
+  (with-bundle st mod
+    (lambda (st1 b)
+      (define path (canon-path (forge:undot dotted) (forge:bundle-sut b)))
+      (define refs (forge:bundle-refs b))
+      [st1
+       (lines
+         (Weld ["references:"]
+           (Weld (map ref-line (forge:refs-from refs path))
+             (Weld ["referenced by:"]
+               (map ref-line (forge:refs-to refs path))))))
+       0])))
+
+(define (cmd-doctest st mod)
+  (with-bundle st mod
+    (lambda (st1 b)
+      (define sut (forge:bundle-sut b))
+      (define entries
+        (filter (lambda (l) (Sz (forge:lore-tests l)))
+          (forge:bundle-lore b)))
+      (define (entry-rows l)
+        (Weld [(print-path (forge:lore-path l))]
+          (map (lambda (dt) (dt-res-line (forge:run-doctest sut dt)))
+            (forge:lore-tests l))))
+      (define results
+        (foldl (lambda (acc l)
+                 (Weld acc (map (forge:run-doctest sut)
+                             (forge:lore-tests l))))
+          [] entries))
+      (define nfail
+        (Sz (filter (lambda (r) (Ne "pass" (_0 r))) results)))
+      (define report
+        (lines
+          (Weld (foldl (lambda (acc l) (Weld acc (entry-rows l))) [] entries)
+            [""
+             (strcat [(showNat (Sub (Sz results) nfail)) " passed, "
+                      (showNat nfail) " failed"])])))
+      [st1 report (Ifz nfail 0 1)])))
+
+(define (cmd-eval st mod expr)
+  (with-bundle st mod
+    (lambda (st1 b)
+      (define res (forge:eval-text (forge:bundle-sut b) expr))
+      (If (Eq 1 (Hd res))
+        [st1
+         (strcat ["error:" NL (forge:diag-text (_0 res))])
+         1]
+        (let ((val (_0 (_0 res))))
+          [st1
+           (lines
+             (Weld
+               [(strcat ["value: " (forge:render-plain val)])
+                (strcat ["type:  " (forge:ty-text (_1 (_0 res)))])]
+               (If (forge:law-like? val) ["" (forge:render-law val)] [])))
+           0])))))
+
+;; (state, args-row) -> [state' text bad]
+(define (render-cmd st args0)
+  (define args (filter Bytes args0))
+  (define (arg i) (If (Gt (Sz args) i) (Ix i args) ""))
+  (define cmd (arg 0))
+  (cond
+    ((Eq cmd "mods") (cmd-mods st))
+    ((Eq cmd "ns") (cmd-ns st (arg 1)))
+    ((Eq cmd "ls") (cmd-ls st (arg 1)))
+    ((Eq cmd "show") (cmd-show st (arg 1) (arg 2)))
+    ((Eq cmd "refs") (cmd-refs st (arg 1) (arg 2)))
+    ((Eq cmd "doctest") (cmd-doctest st (arg 1)))
+    ((Eq cmd "eval") (cmd-eval st (arg 1) (arg 2)))
+    (else [st usage-text (Ifz (Sz args) 0 1)])))
+
+;; The sentinel lines let the launcher cut the answer out of the repl's
+;; evaluation echo.
+(define (main args)
+  (define r (render-cmd forge:empty-state args))
+  (Seq
+    (Write 1 (strWeld (strcat ["--FORGE--" NL (_1 r) NL "--FORGE--" NL]) 1))
+    (Ifz (_2 r) 0 (error "forge-cli-failed"))))

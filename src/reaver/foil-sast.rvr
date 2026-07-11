@@ -26,42 +26,118 @@
 (define (parse-road els)
   (surf-ref (map rx-word-str! els)))
 
-;;; Type parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; A specialization bracket.  Rex normalization absorbs the rune of a
+;; bracket wrapping a single rune expression ([uon/kv[v]] arrives as a
+;; "/"-runed brack), so a spec bracket is any brack-colored nest.
+(define (spec-brack? b)
+  (And (rx-nest? b) (Eq "brack" (rx-nest-color b))))
 
-(define (parse-type-path kids)
+;; Bracket arguments of a specialization: a plain brack holds one kid
+;; per argument; a runed brack is a single argument — the rune
+;; expression, reconstituted as a clear nest.
+(define (brack-args cont b)
+  (If (Eq "" (rx-nest-rune b))
+    (map cont (rx-nest-kids b))
+    [(cont ["nest" (rx-span b) "clear" (rx-nest-rune b) (rx-nest-kids b)])]))
+
+;;; Located parse errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Every rex node carries its source span at Ix 1: [line col off len].
+;; Cite it, so parse errors land next to the offending source instead of
+;; as bare tuples.
+(define (rex-blurb v)
+  (define sp (And (IsApp v) (rx-span v)))
+  (If (And (IsApp sp)
+        (And (Eq 4 (Sz sp))
+          (And (IsNat (Ix 0 sp)) (IsNat (Ix 1 sp)))))
+    ["line" (Ix 0 sp) "col" (Ix 1 sp)]
+    "unknown-location"))
+
+(define (sast-error-at loc what val)
+  (error ["foil-sast-error" what ["at" (rex-blurb loc)] val]))
+
+(define (sast-error what val)
+  (sast-error-at val what val))
+
+;;; Type parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; '$foo — a constant symbol type literal.  The leaf text includes the
+;; quote; the symbol is the text after the '$ prefix.
+(define (sym-lit? lef)
+  (And (rx-leaf? lef)
+    (And (Eq "quip" (rx-leaf-shape lef))
+      (Eq "'$" (lstrcat (ltake 2 (ltrip (rx-leaf-str lef))))))))
+(define (sym-lit-nat lef)
+  (lstrcat (ldrop 2 (ltrip (rx-leaf-str lef)))))
+
+;; The autonamer: a 1-kid = nest (written =foo) names a face after its
+;; word.  In a path (=foo/bar arrives as a /-nest whose head is that =
+;; nest) the face takes the FIRST segment: foo=foo/bar.
+(define (autoname-head? k)
+  (And (rx-rune? "=" k)
+    (let ((fk (hr-stem (rx-rune-kids k))))
+      (And (Eq 1 (Sz fk)) (rx-word? (_0 fk))))))
+(define (autoname-word k)
+  (rx-word-str! (_0 (hr-stem (rx-rune-kids k)))))
+(define (autoname-inner k)
+  (_0 (hr-stem (rx-rune-kids k))))
+
+
+;; Type paths, with specialization on the last segment: bst/node[v]
+;; arrives as (/ bst (juxt node [v])) — juxtaposition binds tighter
+;; than any rune — and becomes a type application of the whole road.
+;; cont parses the bracket's argument types (parse-type-sast; passed in
+;; because it is defined later).
+(define (parse-type-path cont kids)
+  (define last (Last kids))
+  (define (spec-tail jkids)
+    (And (Eq 2 (Sz jkids))
+      (And (rx-word? (_0 jkids))
+        (And (spec-brack? (_1 jkids))
+          (all rx-word? (Init kids))))))
   (cond
+    ;; =foo/bar — the autonamer wraps the whole path in a face named
+    ;; after the first segment.
+    ((And (Gt (Sz kids) 0) (autoname-head? (_0 kids)))
+      (surf-face (autoname-word (_0 kids))
+        (parse-type-path cont
+          (Weld [(autoname-inner (_0 kids))] (drop 1 kids)))))
     ((And (Gt (Sz kids) 0) (all rx-word? kids)) (parse-road kids))
-    ((And (Gt (Sz kids) 0) (rx-rune? "=" (_0 kids)))
-      (let ((face (rx-rune-kids (_0 kids))))
-        (unless (Eq 2 (Sz face))
-          (error ("bad path face" (_0 kids)))
-          (surf-face (rx-word-str! (_0 face))
-            (parse-type-path (Weld [(_1 face)] (drop 1 kids)))))))
-    (else (error ("bad type path" kids)))))
+    ((And (Gt (Sz kids) 1) (And (rx-juxt? last) (spec-tail (rx-juxt-kids last))))
+      (let ((jkids (rx-juxt-kids last)))
+        (surf-tapp
+          (Weld [(parse-road (Weld (Init kids) [(_0 jkids)]))]
+            (brack-args cont (_1 jkids))))))
+    (else (sast-error-at (And (Sz kids) (_0 kids)) "bad type path" kids))))
 
 (define (parse-anon-variant x)
   assert(rx-word? x)
   (surf-variant (rx-leaf-str x)))
 
+
 (define (parse-type-sast ty)
   (define (on-face kids)
-    assert(Eq 2 (Sz kids))
-    (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_1 kids))))
+    (cond
+      ;; =name — the autonamer: the face takes the type's own name.
+      ((And (Eq 1 (Sz kids)) (rx-word? (_0 kids)))
+        (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_0 kids))))
+      ((Eq 2 (Sz kids))
+        (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_1 kids))))
+      (else (sast-error "bad face" (_0 kids)))))
   (define (on-clear exp)
     (define rune (rx-nest-rune exp))
     (define kids (rx-nest-kids exp))
     (cond
       ((Eq "" rune)
         (unless (Eq 1 (Sz kids))
-          (error ("bad type sequence" exp))
+          (sast-error "bad type sequence" exp)
           (parse-type-sast (_0 kids))))
-      ((Eq ":" rune) (parse-type-path kids))
+      ((Eq "/" rune) (parse-type-path parse-type-sast kids))
       ((Eq "=" rune) (on-face kids))
       ((Eq "$" rune)
         (unless (Eq 1 (Sz kids))
-          (error ("bad variant type" exp))
+          (sast-error "bad variant type" exp)
           (parse-anon-variant (_0 kids))))
-      (else (error ("bad type rune" exp)))))
+      (else (sast-error "bad type rune" exp))))
   (define (on-nest nes)
     (define kids (map parse-type-sast (rx-nest-kids nes)))
     (cond
@@ -69,42 +145,68 @@
       ((And (Eq "brack" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-trow kids))
+      ;; A bracket wrapping a single rune expression absorbs the rune
+      ;; during rex normalization ([val=a] arrives as an "="-runed
+      ;; brack): one-element row of that expression.
+      ((Eq "brack" (rx-nest-color nes))
+        (surf-trow
+          [(parse-type-sast
+             ["nest" (rx-span nes) "clear" (rx-nest-rune nes)
+              (rx-nest-kids nes)])]))
       ((And (Eq "paren" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-tapp kids))
-      ((And (Eq "curly" (rx-nest-color nes))
-         (Eq "" (rx-nest-rune nes)))
-        (surf-trow kids))
+      ;; Plain-curly rows are retired: curly is function types only;
+      ;; anonymous structural rows are spelled with brackets.
       ((And (Eq "curly" (rx-nest-color nes))
          (Eq ";" (rx-nest-rune nes)))
         (unless (Gt (Sz kids) 1)
-          (error ("bad function type" nes))
+          (sast-error "bad function type" nes)
           (surf-tfun (Init kids) (Last kids))))
       ((And (Eq "curly" (rx-nest-color nes))
          (Eq "%" (rx-nest-rune nes)))
         (unless (Gt (Sz kids) 1)
-          (error ("bad function type" nes))
+          (sast-error "bad function type" nes)
           (surf-tfun (Init kids) (Last kids))))
-      (else (error ("bad type nest" nes)))))
+      (else (sast-error "bad type nest" nes))))
   (define (on-leaf lef)
     (cond
       ((rx-word? lef) (surf-ref [(rx-leaf-str lef)])) ;; local
-      (else (error ("bad leaf type" lef)))))
+      ((sym-lit? lef) (surf-tsym (sym-lit-nat lef)))
+      (else (sast-error "bad leaf type" lef))))
   (define (on-juxt jux)
     (define kids (rx-juxt-kids jux))
     (cond
       ((And (Eq 2 (Sz kids))
          (And (rx-word? (_0 kids))
-           (rx-plain? "brack" (_1 kids))))
+           (spec-brack? (_1 kids))))
         (surf-tapp
           (Weld [(surf-ref [(rx-word-str! (_0 kids))])]
-            (map parse-type-sast (rx-nest-kids (_1 kids))))))
-      (else (error ("bad type juxt" jux)))))
+            (brack-args parse-type-sast (_1 kids)))))
+      (else (sast-error "bad type juxt" jux))))
   (cond
     ((rx-nest? ty) (on-nest ty))
     ((rx-leaf? ty) (on-leaf ty))
     ((rx-juxt? ty) (on-juxt ty))
-    (else (error ("bad type rex" ty)))))
+    (else (sast-error "bad type rex" ty))))
+
+;; Kids of an @ / @@ variable list: bare words declare type vars;
+;; faced kids (name={k k; nat}) declare compile-time-constant
+;; parameters with their types.  -> [vars consts].
+(define (parse-tvar-kids ctx kids)
+  (define (faced? k) (rx-rune? "=" k))
+  (define (bad? k) (Nil (Or (rx-word? k) (faced? k))))
+  (define checked
+    (unless (Nil (any bad? kids))
+      (sast-error "bad type-var declaration" ctx)
+      kids))
+  (define vars (map rx-word-str! (filter rx-word? checked)))
+  (define (parse-const k)
+    (define fk (hr-stem (rx-rune-kids k)))
+    (unless (And (Eq 2 (Sz fk)) (rx-word? (_0 fk)))
+      (sast-error "bad const parameter declaration" ctx)
+      [(rx-word-str! (_0 fk)) (parse-type-sast (_1 fk))]))
+  [vars (map parse-const (filter faced? checked))])
 
 ;;; Value parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -112,8 +214,14 @@
   (define ret (If
     (Eq "s_app" (_0 call))
     (snap 2 (lambda (x) (Weld x [rest])) call)
-    (surf-app call rest)))
+    ;; s_app takes a *row* of arguments; rest is a single SAST node.
+    (surf-app call [rest])))
     ret)
+
+assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 3)])
+  (uncurry-call (surf-ref ["f"]) (surf-lit 3)))
+assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
+  (uncurry-call (surf-app (surf-ref ["f"]) [(surf-lit 1)]) (surf-lit 2)))
 
 ;;; Arms, methods, and body chains ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -121,14 +229,19 @@
   assert(rx-rune? ">" rex)
   (define kids (rx-rune-kids rex))
   (unless (Eq 2 (Sz kids))
-    (error ("bad case arm" rex))
+    (sast-error "bad case arm" rex)
     (surf-arm (parse-type-sast (_0 kids)) (cont (_1 kids)))))
 
 (define (parse-meth cont els)
+  ;; A paren wrapping a single rune expression absorbs the rune during
+  ;; rex normalization — foo(x.y) arrives as a "."-runed paren. Such a
+  ;; paren is one argument, not an argument list.
   (define (call-args exp)
-    (unless (rx-plain? "paren" exp)
-      (error ("bad method call" exp))
-      (map cont (rx-nest-kids exp))))
+    (unless (And (rx-nest? exp) (Eq "paren" (rx-nest-color exp)))
+      (sast-error "bad method call" exp)
+      (If (Eq "" (rx-nest-rune exp))
+        (map cont (rx-nest-kids exp))
+        [(cont exp)])))
   (define (parse-seg seg)
     (cond
       ((rx-word? seg)
@@ -136,26 +249,27 @@
       ((rx-juxt? seg)
         (let ((kids (rx-juxt-kids seg)))
           (unless (And (Gt (Sz kids) 1) (rx-word? (_0 kids)))
-            (error ("bad method segment" seg))
+            (sast-error "bad method segment" seg)
             (surf-mseg (rx-word-str! (_0 kids))
               (foldl Weld [] (map call-args (drop 1 kids)))))))
-      (else (error ("bad method segment" seg)))))
+      (else (sast-error "bad method segment" seg))))
   (unless (And (Gt (Sz els) 1) (rx-word? (_0 els)))
-    (error ("bad method receiver" els))
+    (sast-error-at (And (Sz els) (_0 els)) "bad method receiver" els)
     (surf-meth (Weld [(rx-word-str! (_0 els))]
       (map parse-seg (drop 1 els))))))
 
 (define (parse-val-sast val)
   (define (parse-doc-tvar kids heir)
-    (define vars (map rx-word-str! kids))
-    (surf-tvars vars heir))
+    (define vc[vars consts] (parse-tvar-kids val kids))
+    (surf-tvars vars
+      (Ifz (Sz consts) heir (surf-cvars consts heir))))
   (define (parse-spec kids)
     (surf-spec
       (parse-val-sast (_0 kids))
-      (map parse-type-sast (rx-nest-kids (_1 kids)))))
+      (brack-args parse-type-sast (_1 kids))))
   (define (spec-juxt? kids)
     (And (Eq 2 (Sz kids))
-      (And (rx-plain? "brack" (_1 kids))
+      (And (spec-brack? (_1 kids))
         (Nil (And (rx-nest? (_0 kids))
           (Eq "clear" (rx-nest-color (_0 kids))))))))
   (define (parse-path-val kids)
@@ -166,11 +280,33 @@
               (all rx-word? (Weld (Init kids) [(_0 jkids)])))
           (surf-spec
             (parse-road (Weld (Init kids) [(_0 jkids)]))
-            (map parse-type-sast (rx-nest-kids (_1 jkids))))
+            (brack-args parse-type-sast (_1 jkids)))
           (parse-road kids)))
       (parse-road kids)))
   (define (parse-letrec kids heir)
     (surf-letrec (map (parse-arm parse-val-sast) kids) heir))
+  ;; Loop (|) parameter arms.  One arm is `> face=type init`; arms on
+  ;; one line chain (rex packs the next > nest as a kid of the
+  ;; previous), stacked > lines arrive as flat sibling kids.
+  (define (loop-arm-of ks)
+    (unless (Eq 2 (Sz ks))
+      (sast-error "bad loop parameter arm" val)
+      (surf-arm (parse-type-sast (_0 ks)) (parse-val-sast (_1 ks)))))
+  (define (loop-arm-chain nest acc)
+    (define (go own rest)
+      (Ifz rest
+        (snoc (loop-arm-of own) acc)
+        (If (rx-rune? ">" (_0 rest))
+          (loop-arm-chain (_0 rest) (snoc (loop-arm-of own) acc))
+          (go (snoc (_0 rest) own) (drop 1 rest)))))
+    (go [] (rx-rune-kids nest)))
+  (define (parse-loop-arms kids)
+    (foldl
+      (lambda (acc k)
+        (If (rx-rune? ">" k)
+          (loop-arm-chain k acc)
+          (sast-error "loop (|) parameters must be > arms" val)))
+      [] (rx-juxt-flat kids)))
   (define (body-flat items)
     (define (flat-one acc item)
       (Weld acc
@@ -179,27 +315,43 @@
           ((rx-plain? "clear" item) (rx-nest-kids item))
           (else [item]))))
     (hr-stem (foldl flat-one 0 items)))
+  ;; A ? with match arms has a >-rune (single arm) or a juxt starting
+  ;; with one (several arms) as its second kid; anything else with a
+  ;; heir is a truthy-if.
+  (define (arm-ish? k)
+    (Or (rx-rune? ">" k)
+      (And (rx-juxt? k)
+        (rx-rune? ">" (_0 (rx-juxt-kids k))))))
   (define (truthy-if? kids heir)
     (And (Eq 2 (Sz kids))
       (And (Ne foil-no-heir heir)
-        (Nil (rx-rune? ">" (_1 kids))))))
+        (Nil (arm-ish? (_1 kids))))))
   (define (handle-rune rune kids heir)
     (cond
       ((Eq "@" rune)
         (parse-doc-tvar kids heir))
+      ((Eq "@@" rune)
+        (sast-error "(@@) is only allowed directly in a declaration" val))
       ((Eq "$" rune)
         (unless (Eq 1 (Sz kids))
-          (error ("bad dollar form" val))
+          (sast-error "bad dollar form" val)
           (If (And (rx-word? (_0 kids)) (Eq foil-no-heir heir))
             (parse-anon-variant (_0 kids))
-            (parse-type-sast (_0 kids)))))
+            ;; Row declarations migrated to the tall : form; a bracket
+            ;; here is stale syntax, not an anonymous row.
+            (If (And (rx-nest? (_0 kids))
+                  (Eq "brack" (rx-nest-color (_0 kids))))
+              (sast-error-at (_0 kids)
+                "row declarations moved to ':' - write `:  foo=bar ...` instead of `$  [foo=bar ...]`"
+                (_0 kids))
+              (parse-type-sast (_0 kids))))))
       ((Eq "\" rune)
         (surf-fun (map parse-type-sast kids) heir))
       ((Eq "%" rune)
         (uncurry-call (parse-val-sast (_0 kids)) heir))
       ((Eq "^" rune)
         (unless (Eq 1 (Sz kids))
-          (error ("bad cast" val))
+          (sast-error "bad cast" val)
           (surf-cast (parse-type-sast (_0 kids)) heir)))
       ((Eq "&" rune)
         (surf-union (map parse-type-sast kids)))
@@ -213,11 +365,33 @@
             (parse-val-sast (_0 kids))
             (map (parse-arm parse-val-sast) (rx-juxt-flat (drop 1 kids)))
             heir)))
-      ((Eq "~" rune)
-        (surf-self (map parse-val-sast kids)))
       ((Eq "=" rune)
         (parse-letrec kids heir))
-      (else (error ("wack rune" val)))))
+      ;; Loop: `|  > foo=nat 3` declares loop params with initial
+      ;; values; the heir is the body, re-entered via (_ ...).  Arms
+      ;; written on one line chain (the next > nest rides as a kid of
+      ;; the previous), so unchain; stacked > lines arrive flat.
+      ((Eq "|" rune)
+        (unless (Nil (Eq foil-no-heir heir))
+          (sast-error "loop (|) requires a body" val)
+          (let ((arms (parse-loop-arms kids)))
+            (unless (Gt (Sz arms) 0)
+              (sast-error "loop (|) requires at least one > parameter arm" val)
+              (surf-loop arms heir)))))
+      ;; Tall row type declaration: `:  foo=bar baz=qux`.  Kids are the
+      ;; faced field types; a lone `:` is the empty row (and `:  []` is
+      ;; accepted as its bracketed spelling).
+      ((Eq ":" rune)
+        (unless (Eq foil-no-heir heir)
+          (sast-error "row type declaration (:) does not take a body" val)
+          (surf-trow
+            (map parse-type-sast
+              (If (And (Eq 1 (Sz kids))
+                    (And (rx-plain? "brack" (_0 kids))
+                      (Eq 0 (Sz (rx-nest-kids (_0 kids))))))
+                []
+                kids)))))
+      (else (sast-error "wack rune" val))))
   (define (parse-body items)
     (define kids (body-flat items))
     (cond
@@ -233,40 +407,56 @@
             ((rx-rune? "%" body) (handle-rune "%" (rx-rune-kids body) hair))
             ((rx-rune? "^" body) (handle-rune "^" (rx-rune-kids body) hair))
             ((rx-rune? "&" body) (handle-rune "&" (rx-rune-kids body) hair))
+            ((rx-rune? ":" body) (handle-rune ":" (rx-rune-kids body) hair))
             ((rx-rune? "?" body) (handle-rune "?" (rx-rune-kids body) hair))
-            ((rx-rune? "~" body) (handle-rune "~" (rx-rune-kids body) hair))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
+            ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
             ((And (rx-nest-is? "paren" "@" body) (Ne foil-no-heir hair))
               (parse-doc-tvar (rx-nest-kids body) hair))
             ((And (rx-nest-is? "paren" "=" body) (Ne foil-no-heir hair))
               (parse-letrec (rx-nest-kids body) hair))
-            (else foil-no-heir))))))
+            (else (sast-error "unrecognized body form" body)))))))
   (define (on-word wor)
     (cond
       ((str-numeric? wor) (surf-lit (parse-nat wor)))
       ;; variable lookup
       (else (surf-var wor))))
+  (define (on-literal lef)
+    (define shape (rx-leaf-shape lef))
+    (define text (rx-leaf-str lef))
+    ;; Quip leaves keep their leading tick in the rex text; strip it so
+    ;; the SAST carries only the aura payload.
+    (surf-literal shape (If (Eq shape "quip") (Rsh text 8) text)))
   (define (on-leaf lef)
     (cond
       ((rx-word? lef) (on-word (rx-word-str! lef)))
-      ((rx-literal? lef) (surf-literal (rx-leaf-shape lef) (rx-leaf-str lef)))
-      (else (error ("bad leaf val" lef)))))
+      ((rx-literal? lef) (on-literal lef))
+      (else (sast-error "bad leaf val" lef))))
   (define (on-paren nes)
     (define kids (map parse-val-sast (rx-nest-kids nes)))
     (cond
       ((Eq "" (rx-nest-rune nes))
         (unless (Gt (Sz kids) 0)
-          (error ("bad empty call" nes))
-          (surf-app (_0 kids) (drop 1 kids))))
-      ((Eq ":" (rx-nest-rune nes))
-        (surf-app (parse-road (rx-nest-kids nes)) []))
+          (sast-error "bad empty call" nes)
+          ;; (_ args...) recurses: _ is a word, not a rune, so the
+          ;; self-call marker is an application whose head is the
+          ;; word _.
+          (If (Equal (surf-var "_") (_0 kids))
+            (surf-self (drop 1 kids))
+            (surf-app (_0 kids) (drop 1 kids)))))
+      ((Eq "/" (rx-nest-rune nes))
+        ;; a zero-arg call of a path — possibly spec-tailed:
+        ;; (labeled/tagof['$foo])
+        (surf-app (parse-path-val (rx-nest-kids nes)) []))
+      ((Eq "." (rx-nest-rune nes))
+        (parse-meth parse-val-sast (rx-nest-kids nes)))
       (else (handle-rune (rx-nest-rune nes) (rx-nest-kids nes) foil-no-heir))))
   (define (on-clear nes)
     (define rune (rx-nest-rune nes))
     (define kids (rx-nest-kids nes))
     (cond
       ((Eq "" rune) (parse-body kids))
-      ((Eq ":" rune) (parse-path-val kids))
+      ((Eq "/" rune) (parse-path-val kids))
       ((Eq "." rune) (parse-meth parse-val-sast kids))
       ((Eq ".#" rune)
         (surf-ufcs-put (_0 kids) (_1 kids)))
@@ -280,7 +470,15 @@
       ((And (Eq "brack" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-row (map parse-val-sast (rx-nest-kids nes))))
-      (else (error "bad rex val nest" val))))
+      ;; A bracket wrapping a single rune expression absorbs the rune
+      ;; during rex normalization ([h.key] arrives as a "."-runed
+      ;; brack): a one-element row of that expression.
+      ((Eq "brack" (rx-nest-color nes))
+        (surf-row
+          [(parse-val-sast
+             ["nest" (rx-span nes) "clear" (rx-nest-rune nes)
+              (rx-nest-kids nes)])]))
+      (else (sast-error "bad rex val nest" val))))
   (cond
     ((rx-nest? val) (on-nest val))
     ((rx-leaf? val) (on-leaf val))
@@ -289,7 +487,7 @@
         (If (spec-juxt? kids)
           (parse-spec kids)
           (parse-body kids))))
-    (else (error ("weird node" val)))))
+    (else (sast-error "weird node" val))))
 
 ;;; Module declaration parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -299,29 +497,115 @@
 
 (define (parse-module-sast here val)
   (define span (rx-span val))
+  ;; - imports the named modules; the mount is the path the rune
+  ;; appears under ([] at module top level).
+  (define (on-import here imp)
+    (define (one w)
+      (unless (rx-word? w)
+        (sast-error "bad import (expected module names)" imp)
+        (surf-import here (rx-span imp) (rx-word-str! w))))
+    (map one (hr-stem (rx-rune-kids imp))))
+
   ; A namespace module is either a flat stack of decls, a single decl, or a value.
+  ;; Each decl parses under its own Try (deep-forced — the rows are
+  ;; lazy), so one malformed decl becomes an s_bad row and its
+  ;; neighbors still parse: the module reports every parse error at
+  ;; once (elab-mod's scan pass collects s_bad rows into diagnostics).
   (define (on-dec-list here decs)
-    (define (pop-next acc dec)
-      (Weld acc (parse-module-sast here dec)))
-    (foldl pop-next 0 (hr-stem (rx-juxt-flat decs))))
+    (define ds (hr-stem (rx-juxt-flat decs)))
+    (define n (Sz ds))
+    ;; Rex rune spans run through their heir chains, so a decl's raw
+    ;; span swallows every following sibling (a top-level decl's ran
+    ;; to end of file).  Cap each sibling's rows — its own decl and
+    ;; everything nested under it — at the next sibling's offset; the
+    ;; recursion applies the same cap at every nesting level.
+    (define (cap limit row)
+      (If (And limit (Eq "s_decl" (Ix 0 row)))
+        (let* ((sp (Ix 2 row))
+               (off (Ix 2 sp)))
+          (If (Gt (Add off (Ix 3 sp)) limit)
+            (Up 2 [(Ix 0 sp) (Ix 1 sp) off (Sub limit off)] row)
+            row))
+        row))
+    (define (pop-one i)
+      (define dec (Ix i ds))
+      (define limit
+        (If (Lt (Inc i) n) (Ix 2 (rx-span (Ix (Inc i) ds))) 0))
+      (define r
+        (Try (lambda (z)
+               (let ((rows (parse-module-sast here dec)))
+                 (DeepSeq rows rows)))
+          0))
+      (If (Eq 1 (Hd r))
+        [["s_bad" here (rx-span dec) (_0 r)]]
+        (map (cap limit) (_0 r))))
+    (foldl (lambda (acc i) (Weld acc (pop-one i))) 0 (gen n (lambda (i) i))))
 
   (define (on-decl dec)
+    ;; Note: the reserved /ty-ap and /ty-var namespaces need no parse
+    ;; fence — `-` is a rune character, so no source word can spell
+    ;; them.  elab-mod backstops synthetic module rows.
     (define e[name contents0] (split-decl-name (hr-stem (rx-rune-kids dec))))
     (define contents (hr-stem (rx-juxt-flat contents0)))
-    (define (sort-content acc[self kids] item)
-      (If (rx-rune? "+" item)
-        [self (snoc item kids)]
-        [(snoc item self) kids]))
-    (define sorted[self kids] (foldl sort-content [0 0] contents))
+    (define (sort-content acc[self kids imps tvs] item)
+      (cond
+        ((rx-rune? "+" item) [self (snoc item kids) imps tvs])
+        ((rx-rune? "-" item) [self kids (snoc item imps) tvs])
+        ((Or (rx-nest-is? "paren" "@@" item) (rx-rune? "@@" item))
+          [self kids imps (snoc item tvs)])
+        (else [(snoc item self) kids imps tvs])))
+    (define sorted[self kids imps tvs] (foldl sort-content [0 0 0 0] contents))
+    ;; (@@ vars): namespace-scoped type variables — declared once,
+    ;; visible to this decl and every descendant, dropped per-decl if
+    ;; unused (elab-tvars).
+    (define (tvar-kids item)
+      (If (rx-rune? "@@" item) (rx-rune-kids item) (rx-nest-kids item)))
+    (define scoped-vc
+      (foldl
+        (lambda (acc it)
+          (let ((r (parse-tvar-kids dec (hr-stem (tvar-kids it)))))
+            [(Weld (_0 acc) (_0 r)) (Weld (_1 acc) (_1 r))]))
+        [[] []] tvs))
+    (define scoped-vars (_0 scoped-vc))
+    (define scoped-consts (_1 scoped-vc))
+    (define (dup-in? xs)
+      (Ifz (Sz xs) 0
+        (Or (includes (Eq (_0 xs)) (drop 1 xs)) (dup-in? (drop 1 xs)))))
+    (define checked-vars
+      (unless (Nil (dup-in? (Weld scoped-vars (map (Ix 0) scoped-consts))))
+        (sast-error "duplicate (@@) variable" dec)
+        scoped-vars))
+    (define (wrap-span-tvars spannode)
+      (surf-span (Ix 1 spannode)
+        (surf-tvars checked-vars
+          (Ifz (Sz scoped-consts)
+            (Ix 2 spannode)
+            (surf-cvars scoped-consts (Ix 2 spannode))))))
+    (define (wrap-decl-rows rows)
+      (If (And (Ifz (Sz checked-vars) 1 0) (Ifz (Sz scoped-consts) 1 0))
+        rows
+        (map (lambda (row)
+               (If (Eq "s_decl" (_0 row))
+                 (Up 3 (wrap-span-tvars (Ix 3 row)) row)
+                 row))
+          rows)))
     (define here1 (snoc name here))
     (define conspan (Ifz self (rx-span dec) (span-join-row self)))
     (define clause (parse-val-sast ["nest" conspan "clear" "" self]))
-    (Weld [(surf-decl here1 span (surf-span conspan clause))]
-      (on-dec-list here1 kids)))
+    ;; A bodiless named decl is a pure namespace: no entry of its own.
+    ;; Numeric "names" should still surface as malformed declarations.
+    (define decrow
+      (If (And (Ifz self 1 0) (Nil (str-numeric? name)))
+        []
+        [(surf-decl here1 span (surf-span conspan clause))]))
+    (Weld (wrap-decl-rows decrow)
+      (Weld (foldl Weld [] (map (on-import here1) imps))
+        (wrap-decl-rows (on-dec-list here1 kids)))))
 
   (cond
     ((rx-juxt? val)     (on-dec-list here (rx-juxt-kids val)))
     ((rx-rune? "+" val) (on-decl val))
+    ((rx-rune? "-" val) (on-import here val))
     ((And (rx-rune? "" val) (Eq "clear" (rx-nest-color val)))
       (on-dec-list here (rx-nest-kids val)))
-    (else (error ("wack module" val)))))
+    (else (sast-error "wack module" val))))

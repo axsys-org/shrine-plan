@@ -11,6 +11,9 @@
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
+(#bind cairn (#module cairn))
+(#import cairn)
+
 (#bind ty (#module foil-types))
 (#bind cgen (#module codegen))
 
@@ -24,37 +27,71 @@
 
 ;;; TC lowering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (fold-app f xs)
-  (Ifz xs f
-    (fold-app (cgen:A f (_0 xs)) (drop 1 xs))))
+(define fold-app cgen:fold-app)
 
 (define (lower-tc sut val)
   (define (tag-is x) (Eq (Hd val) x))
   (define (lower-lam lam)
     (define body (lower-tc sut (tc-lam-body lam)))
-    (cgen:F y y y "LAM" (tc-lam-arity val) body))
-  (define (get-hd typ[_ tag])
-    (define span[_ stag] (ty:mold-to-span sut typ))
+    ;; tc-lam-args holds the whole frame (self + args); the PLAN law
+    ;; arity is the argument count only.  Flags: pinned, marked, recur.
+    (cgen:F yes yes yes "LAM" (Dec (tc-lam-arity val)) body))
+  (define (get-row typ[_ tag])
+    (define typ1 (If (Eq tag "TFAC") (ty:tfac-val typ) typ))
+    (define span[_ stag] (ty:mold-to-span sut typ1))
     (define (tag-is x) (Eq stag x))
     (cond
-      ((tag-is "TROW") (ty:trow-cstr span))
-      (else
-        (begin (print ("fallthrough" typ))
-          0))))
+      ((tag-is "TROW") span)
+      ;; elab-arm rejects non-row patterns; reaching here is a compiler
+      ;; bug, not a user error — fail loudly instead of miscompiling.
+      (else (error ("match arm pattern is not a row type" typ)))))
+  (define (get-hd typ)
+    (ty:trow-cstr (get-row typ)))
+  (define (call1 f a)
+    (cgen:A (cgen:K f) a))
+  (define (call2 f a b)
+    (cgen:A (call1 f a) b))
+  (define (call3 f a b c)
+    (cgen:A (call2 f a b) c))
+  ;; The generated test only checks constructor head + arity.  This is
+  ;; sound because elaboration rejects matches over sums whose options
+  ;; are indistinguishable by (head, arity) — see check-arms-distinct in
+  ;; foil-elab.rvr.
+  (define (lower-arm-test pat-ty)
+    (define row (get-row pat-ty))
+    (define cstr (ty:trow-cstr row))
+    (define arity (Sz (ty:trow-vals row)))
+    (define val (cgen:V 0))
+    (Ifz arity
+      (call2 Ne val (cgen:K cstr))
+      (call3 If
+        (call1 IsApp val)
+        (call2 Or
+          (call2 Ne (call1 Hd val) (cgen:K cstr))
+          (call2 Ne (call1 Sz val) (cgen:K arity)))
+        (cgen:K 1))))
   (define (lower-arms fall arms)
     (Ifz arms (lower-tc sut fall)
       (letrec
         ((arm (_0 arms))
          (pat-ty (tc-arm-pat arm))
          (leg-tc (lower-tc sut (tc-arm-val arm)))
-         (test-ir (cgen:A (cgen:K (Pin (ty:type-fits sut pat-ty))) (cgen:V 0))))
+         (test-ir (lower-arm-test pat-ty)))
          (cgen:A
            (cgen:A (cgen:A (cgen:K Ifz) test-ir)
              leg-tc)
             (lower-arms fall (drop 1 arms))))))
   (define (lower-match val)
-    (cgen:L (tc-match-scrut val)
+    (cgen:L (lower-tc sut (tc-match-scrut val))
       (lower-arms (tc-match-fall val) (tc-match-arms val))))
+  ;; Local bindings lower to nested lets: binding i's value sits inside
+  ;; i enclosing lets, matching the one-local-per-binding elaboration.
+  (define (lower-let val)
+    (define (go bs)
+      (Ifz bs
+        (lower-tc sut (tc-letrec-body val))
+        (cgen:L (lower-tc sut (_0 bs)) (go (drop 1 bs)))))
+    (go (tc-letrec-binds val)))
   (define (lower-row row)
     (fold-app
       (cgen:K (tc-row-hd row))
@@ -71,7 +108,10 @@
       (cgen:V slot)))
   (cond
     ((tag-is "TC_LOCAL")  (lower-local (tc-local-slot val)))
-    ((tag-is "TC_GLOBAL") (cgen:G (got-const (tc-global-path val))))
+    ;; Global refs link against the referee's already-lowered entry, so
+    ;; lowering must run against the progressively-lowered subject (see
+    ;; lower-tc-entry) and referees must precede referrers.
+    ((tag-is "TC_GLOBAL") (cgen:G (got-const (tc-global-path val) sut)))
     ((tag-is "TC_LIT")    (cgen:K (tc-lit-val val)))
     ((tag-is "TC_FFI")    (cgen:K (tc-ffi-val val)))
     ((tag-is "TC_APP")    (cgen:A (lower-tc sut (tc-app-f val))
@@ -80,20 +120,171 @@
     ((tag-is "TC_ROW")    (lower-row val))
     ((tag-is "TC_TYP")    (cgen:K val))
     ((tag-is "TC_MATCH")  (lower-match val))
+    ((tag-is "TC_LET")    (lower-let val))
     ((tag-is "TC_MEAN")   (cgen:A (cgen:K error) (cgen:K "unreachable")))
     (else (error ("lowering" val)))))
 
-(define (lower-tc-entry sut key ent)
+;; Lowering resolves TC_GLOBAL references from =out= — the subject that
+;; accumulates IR entries — so a referee's compiled value is available
+;; by the time its referrers lower (declaration order is
+;; define-before-use, enforced by elaboration).
+(define (lower-tc-entry out key ent)
   (define tc (tc-entry-contents ent))
-  (define ir (lower-tc sut tc))
+  (define ir (lower-tc out tc))
   (define span (tc-entry-span ent))
   (define val (cgen:compile-expr ir))
   (define ent1 (make-ir-entry key span val tc ir))
-  (insert-entry-sut key ent1 sut))
+  (insert-entry-sut key ent1 out))
 
-(define (lower-tc-mod sut out)
+;; FFI entries are already runtime values, type entries have no runtime
+;; representation, IR entries were lowered previously, and members that
+;; reference const generic parameters cannot lower at the base — their
+;; instantiations materialize (materialize-consts) and lower instead.
+(define (const-param-base-tc? tc)
+  (Or (tc-has-cparam? tc) (Lt 0 (ty:count-cqua (tc-ty tc)))))
+
+(define (lowerable-entry? ent)
+  (define tc (tc-entry-contents ent))
+  (And (Eq (Hd ent) "TC")
+    (Nil (Or (Eq (Hd tc) "TC_FFI")
+           (Or (Eq (Hd tc) "TC_TYP")
+             (Or (tc-has-cparam? tc)
+               (And (Nil (ty-ap-path? (_0 ent)))
+                 (Lt 0 (ty:count-cqua (tc-ty tc))))))))))
+
+;;; Const-parameter materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; A generic member that uses const parameters keeps its base entry as
+;; a TC (skipped above).  Every GROUND instantiation referenced
+;; anywhere in the module gets a real entry at its full /ty-ap key:
+;; the member's TC with the parameters substituted (a placeholder
+;; becomes the concrete constant; internal /ty-ap references rewrite
+;; their /ty-var segments), inserted into the order immediately before
+;; its first referrer, transitive dependencies first.
+
+;; Does a path contain no /ty-var segments (recursively)?
+(define (path-ground? p)
+  (If (ty-ap-path? p)
+    (let ((parts (ty-ap-decode p)))
+      (Ifz parts 0 (all path-ground? parts)))
+    (Nil (ty-var-path? p))))
+
+;; Rewrite the /ty-var segments of a path per mapping [[name path] ..].
+(define (subst-path-args mapping p)
+  (cond
+    ((ty-var-path? p)
+      (let ((hit (find (lambda (m) (Eq (Ix 1 p) (_0 m))) mapping)))
+        (Ifz hit p (_1 (_0 hit)))))
+    ((ty-ap-path? p)
+      (let ((parts (ty-ap-decode p)))
+        (Ifz parts p
+          (ty-ap-encode (map (lambda (q) (subst-path-args mapping q)) parts)))))
+    (else p)))
+
+;; Substitute concrete const arguments into a member's TC.
+(define (subst-tc mapping sut tc)
+  (define (tag-is x) (And (IsApp tc) (Eq (Hd tc) x)))
+  (define recur (subst-tc mapping sut))
+  (cond
+    ((tag-is "TC_CPARAM")
+      (let ((hit (find (lambda (m) (Eq (tc-cparam-name tc) (_0 m))) mapping)))
+        (Ifz hit
+          (error ["unsubstituted const parameter" (tc-cparam-name tc)])
+          (let ((arg (_1 (_0 hit))))
+            (If (ty-val-path? arg)
+              (tc-lit (ty:TNAT (Ix 1 arg)) (Ix 1 arg))
+              (let ((referee (got-entry-tc arg sut)))
+                (If (Eq "TC_LAM" (Hd referee))
+                  (tc-global (tc-ty referee) arg)
+                  referee)))))))
+    ((tag-is "TC_GLOBAL")
+      (tc-global (tc-ty tc) (subst-path-args mapping (tc-global-path tc))))
+    ((tag-is "TC_APP")
+      (tc-app (tc-ty tc) (recur (tc-app-f tc)) (recur (tc-app-x tc))))
+    ((tag-is "TC_LAM")
+      (tc-lam (tc-ty tc) (Ix 1 tc) (tc-lam-args tc) (recur (tc-lam-body tc))))
+    ((tag-is "TC_ROW")
+      (tc-row (tc-ty tc) (tc-row-hd tc) (map recur (tc-row-items tc))))
+    ((tag-is "TC_MATCH")
+      (tc-match (tc-ty tc) (recur (tc-match-scrut tc))
+        (map recur (tc-match-arms tc))
+        (let ((f (tc-match-fall tc))) (Ifz f 0 (recur f)))))
+    ((tag-is "TC_ARM")
+      (tc-arm (tc-ty tc) (tc-arm-pat tc) (recur (tc-arm-val tc))))
+    ((tag-is "TC_LET")
+      (tc-letrec (tc-ty tc) (map recur (tc-letrec-binds tc))
+        (recur (tc-letrec-body tc))))
+    (else tc)))
+
+;; The ground const-bearing /ty-ap paths a TC references.
+(define (const-deps sut x)
+  (define (dep? p)
+    (And (ty-ap-path? p)
+      (And (path-ground? p)
+        (Ifz (get-const (ty-ap-base p) sut)
+          0
+          (const-param-base-tc? (got-entry-tc (ty-ap-base p) sut))))))
+  (define (go x)
+    (If (IsApp x)
+      (If (And (Eq "TC_GLOBAL" (Hd x)) (dep? (tc-global-path x)))
+        [(tc-global-path x)]
+        (foldl (lambda (acc i) (Weld acc (go (Ix i x))))
+          [] (gen (Sz x) (lambda (i) i))))
+      []))
+  (foldl (lambda (acc d) (If (includes (Equal d) acc) acc (snoc d acc)))
+    [] (go x)))
+
+;; Materialize every referenced ground instantiation: walk the order;
+;; before each referrer, DFS-insert its (transitive) materializations.
+(define (materialize-consts sut)
+  (define (member-mapping key)
+    (define base (ty-ap-base key))
+    (define bty (tc-ty (got-entry-tc base sut)))
+    (define names
+      (Weld (ty:tqua-names bty) (map (Ix 0) (ty:cqua-pairs bty))))
+    (zip names (drop 1 (ty-ap-decode key))))
+  (define (materialize st key)
+    (define ax (_0 st))
+    (define done (_1 st))
+    (define order (_2 st))
+    (cond
+      ((includes (Equal key) done) st)
+      ;; An imported subject already materialized (and lowered) this
+      ;; exact instantiation: reuse its entry.  Overwriting it with a
+      ;; fresh TC would lower it a second time and duplicate its key
+      ;; in the order.
+      ((Ifz (getax key ax) 0 1)
+        [ax (snoc key done) order])
+      (else
+        (let* ((base (ty-ap-base key))
+               (bent (unpin-soft (need (getax base ax))))
+               (btc (tc-entry-contents bent))
+               (mtc (subst-tc (member-mapping key) sut btc))
+               (st1 (foldl materialize [ax (snoc key done) order]
+                      (const-deps sut mtc))))
+          [(putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
+             (_0 st1))
+           (_1 st1)
+           (snoc key (_2 st1))]))))
+  (define (walk st key)
+    (define ent (unpin-soft (need (getax key (_0 st)))))
+    (define st1
+      (If (Eq (Hd ent) "TC")
+        (foldl materialize st (const-deps sut (tc-entry-contents ent)))
+        st))
+    [(_0 st1) (_1 st1) (snoc key (_2 st1))])
+  (define final
+    (foldl walk [(_0 sut) [] []] (subject-order sut)))
+  (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
+
+(define (lower-tc-mod-go sut out)
   (define n[next sut1] (pop-subject-order sut))
   (define entry (got-entry next sut))
   (Ifz (subject-order sut) out
-    (let ((out1 (lower-tc-entry out next entry)))
-      (lower-tc-mod sut1 out1))))
+    (let ((out1 (If (lowerable-entry? entry)
+                  (lower-tc-entry out next entry)
+                  out)))
+      (lower-tc-mod-go sut1 out1))))
+
+(define (lower-tc-mod sut out)
+  (lower-tc-mod-go sut out))

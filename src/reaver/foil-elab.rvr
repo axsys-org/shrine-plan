@@ -16,6 +16,8 @@
 
 (#bind ty (#module foil-types))
 
+(#bind quip (#module quip))
+
 ;;; Elaboration environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (burp-self type[_ tag f val])
@@ -34,17 +36,33 @@
       (else ty)))
   ret)
 
-(define empty-env [0 0 ty:TANY 0 0])
+;; The env-goal slot (vestigial bidirectional checking: written by
+;; elab-cast, read by nothing) was removed; when checking-mode
+;; elaboration happens for real it belongs in elab-call's argument
+;; positions and elab-fun's parameter inference.
+(define empty-env [0 0 0 0 0 0])
 (define env-locals (Ix 0)) (define set-env-locals (Up 0))
 (define env-diags (Ix 1))
-(define env-goal (Ix 2)) (define set-env-goal (Up 2))
-(define (push-env-goal x env) (snap 2 (cons x) env))
-(define (peek-env-goal env)
-  (_0 (env-goal env)))
-(define (pop-env-goal env)
-  [(peek-env-goal env) (snap 2 (drop 1) env)])
-(define env-name (Ix 3)) (define set-env-name (Up 3))
-(define env-tvars (Ix 4)) (define set-env-tvars (Up 4))
+(define env-name (Ix 2)) (define set-env-name (Up 2))
+(define env-tvars (Ix 3)) (define set-env-tvars (Up 3))
+;; Nearest enclosing source span (set by s_span nodes on the way down);
+;; used to locate elaboration errors.
+(define env-span (Ix 4)) (define set-env-span (Up 4))
+;; Const generic parameters in scope: [[name declared-type] ...].
+(define env-consts (Ix 5)) (define set-env-consts (Up 5))
+
+;;; Located errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (span-blurb span)
+  (Ifz span "unknown-location"
+    ["line" (Ix 0 span) "col" (Ix 1 span)]))
+
+(define (elab-error env what detail)
+  (error ["foil-elab-error" what ["at" (span-blurb (env-span env))] detail]))
+
+(define (elab-unsupported env feature)
+  (elab-error env ["unsupported syntax" feature]
+    "specified but not yet implemented"))
 
 (define (push-env-tvars vars env)
   (set-env-tvars (Weld vars (env-tvars env)) env))
@@ -54,6 +72,72 @@
 (define (wrap-tquas vars typ)
   (Ifz vars typ
     (ty:TQUA (_0 vars) (wrap-tquas (drop 1 vars) typ))))
+
+;; Normalize a type-valued elaboration to a TTYP wrapper (idempotent).
+(define (as-ttyp typ)
+  (If (Eq "TTYP" (_1 typ)) typ (ty:TTYP typ)))
+
+;;; /ty-ap resolution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; The subject resolves an instantiation path to its generic's entry;
+;; here — where types are in play — the decoded arguments specialize
+;; the entry's type.
+
+(define (applied-type sut path)
+  (If (ty-ap-path? path)
+    (let* ((parts (ty-ap-decode path))
+           (gty (got-type (Ix 0 parts) sut))
+           (nt (ty:count-tqua gty)))
+      ;; type args substitute; const args don't change the type but DO
+      ;; ground its /ty-var segments (member return types like
+      ;; map[k lt]) once the TCQUA layers strip.
+      (ty:subst-const-args
+        (map (Ix 0) (ty:cqua-pairs gty))
+        (drop nt (drop 1 parts))
+        (ty:strip-cquas
+          (ty:type-specialize sut gty
+            (map ty:path-to-ty
+              (take (min nt (Sz (drop 1 parts))) (drop 1 parts)))))))
+    (got-type path sut)))
+
+(define (applied-entry-tc sut path)
+  (define tc (got-entry-tc path sut))
+  (If (ty-ap-path? path)
+    (let* ((parts (ty-ap-decode path))
+           (nt (ty:count-tqua (tc-ty tc)))
+           (nc (ty:count-cqua (tc-ty tc)))
+           (supplied-c (Sub (Sub (Sz parts) 1) nt)))
+      ;; A member's const params must all be supplied by the path —
+      ;; there is no inference for constants.
+      (If (Lt supplied-c nc)
+        (error ["member with const parameters requires explicit specialization"
+                ["path" path]])
+        ;; A monomorphic member of a generic has nothing to specialize;
+        ;; past that, a failed specialization is an error, not a
+        ;; fallback.
+        (let* ((cnames (map (Ix 0) (ty:cqua-pairs (tc-ty tc))))
+               (cargs (drop nt (drop 1 parts)))
+               (ground (lambda (typ)
+                         (ty:subst-const-args cnames cargs
+                           (ty:strip-cquas typ)))))
+          (Ifz nt
+            (set-tc-ty (ground (tc-ty tc)) tc)
+            (let ((typ (ty:type-specialize sut (tc-ty tc)
+                         (map ty:path-to-ty
+                           (take (min nt (Sz (drop 1 parts)))
+                             (drop 1 parts))))))
+              (If (Eq "TBAD" (_1 typ))
+                (error ("cannot specialize entry" path typ))
+                (set-tc-ty (ground typ) tc)))))))
+    tc))
+
+;; Encode a specialization as a /ty-ap path: 0 if an argument type is
+;; not path-shaped.
+(define (spec-encode sut path targs)
+  (define argps (map ty:ty-to-path targs))
+  (If (any Nil argps)
+    0
+    (ty-ap-encode (Weld [(canon-path path sut)] argps))))
 
 ;;; Type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -68,14 +152,29 @@
         (unless (Eq 1 (Sz fields))
           (ty:TBAD ["bad-pin-arity" fields])
           (ty:TPIN (_0 fields))))
+      ;; ('$foo) — a parenthesized constant symbol (the face position
+      ;; x=('$foo); rex can't take a bare quip as a rune operand).
+      ((And (Eq "s_tsym" (_0 f)) (Ifz (Sz fields) 1 0))
+        (ty:TNAT (_1 f)))
       ((Eq "s_ref" (_0 f))
-        (ty:TNOM (surf-ref-path f) fields))
+        (let ((enc (spec-encode sut (surf-ref-path f) fields)))
+          (Ifz enc
+            ;; Arguments with no path form (function types, anonymous
+            ;; rows) can't ride a /ty-ap name: specialize structurally.
+            (ty:type-specialize sut
+              (got-type (canon-path (surf-ref-path f) sut) sut)
+              fields)
+            (ty:TNOM enc 0))))
       (else
         (ty:TBAD "uimpl tapp"))))
 
   (cond
+    ;; An anonymous structural row: bare TROW with cstr 0, never
+    ;; TTYP-wrapped here — declaration sites re-wrap via as-ttyp and
+    ;; brand the cstr at insert-typ; type-use positions get the bare
+    ;; row (runtime head 0, outside UFCS).
     ((tag-is "s_trow")
-      (ty:TTYP (ty:TROW 0 (map (elab-type-env sut env) (surf-row-kids wav)))))
+      (ty:TROW 0 (map (elab-type-env sut env) (surf-row-kids wav))))
     ((tag-is "s_face")
      (ty:TFAC (surf-face-name wav)
        (elab-type-env sut env (surf-face-kid wav))))
@@ -88,12 +187,25 @@
       (ty:TFUN (map (elab-type-env sut env) (surf-fun-args wav))
         (elab-type-env sut env (surf-fun-ret wav))))
     ((tag-is "s_ref")
-      (define path (surf-ref-val wav))
-      (If (And (Eq 1 (Sz path)) (env-has-tvar? (_0 path) env))
-        (ty:TVAR (_0 path))
-        (ty:TNOM path 0)))
+      (define path (surf-ref-path wav))
+      (define nm (_0 path))
+      (cond
+        ((And (Eq 1 (Sz path)) (env-has-tvar? nm env)) (ty:TVAR nm))
+        ;; const parameters ride the /ty-var namespace in encodings
+        ((And (Eq 1 (Sz path))
+           (find (lambda (pr) (Eq nm (_0 pr))) (env-consts env)))
+          (ty:TVAR nm))
+        ;; nat literals as const arguments (map[nat 3])
+        ((And (Eq 1 (Sz path)) (str-numeric? nm))
+          (ty:TNAT (parse-nat nm)))
+        (else
+          ;; Mounted import names normalize to the entry's canonical
+          ;; path: nominal identity is independent of the written name.
+          (ty:TNOM (canon-path path sut) 0))))
     ((tag-is "s_variant")
       (ty:TROW (_1 wav) []))
+    ((tag-is "s_tsym")
+      (ty:TNAT (_1 wav)))
     ((tag-is "s_tapp")
       (on-tapp (surf-tapp-kids wav)))
       (else (error ("unimpl type elab" wav)))))
@@ -113,13 +225,43 @@
     (elab-type-env sut env (surf-cast-ty body))
     ty:TBAD))
 
-(define (gen-accessors loc items sut)
+;;; Field accessors and functional update ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; For every face =x= of a named row type =T= we generate three UFCS
+;; methods: =v.x= (get), =v.set_x(new)= (replace), and =v.over_x(fun)=
+;; (apply a function to the field).  All are ordinary FFI entries, so
+;; the regular =.= method machinery resolves them.
+
+(define (row-set-at idx val rcvr)
+  (Up idx val rcvr))
+(define (row-over-at idx f rcvr)
+  (Up idx (f (Ix idx rcvr)) rcvr))
+
+;; For a generic row the accessors are quantified too: the receiver is
+;; TNOM loc [vars], the fun type is TQUA-wrapped, and score-meth's
+;; receiver-argument specialization instantiates them at use.
+(define (gen-accessors loc vars cparams items sut)
   (define faces (ty:collect-faces items))
+  (define param-segs
+    (Weld (map (lambda (v) [ty-var-tag v]) (Ifz vars [] vars))
+      (map (lambda (c) [ty-var-tag (_0 c)]) cparams)))
+  (define self-ty
+    (Ifz (Sz param-segs)
+      (ty:TNOM loc 0)
+      (ty:TNOM (ty-ap-encode (Weld [loc] param-segs)) 0)))
+  (define (qua typ)
+    (wrap-tquas (Ifz vars 0 vars) (ty:wrap-tcquas cparams typ)))
   (define (go sut arg[idx fac ty])
-    (define new-loc (Weld loc [fac]))
-    (define typ (ty:TFUN [(ty:TNOM loc 0)] ty))
-    (define tc (tc-ffi typ (Ix idx)))
-    (insert-tc new-loc wack-span tc sut))
+    (define get-tc (tc-ffi (qua (ty:TFUN [self-ty] ty)) (Ix idx)))
+    (define set-tc
+      (tc-ffi (qua (ty:TFUN [ty self-ty] self-ty)) (row-set-at idx)))
+    (define over-tc
+      (tc-ffi (qua (ty:TFUN [(ty:TFUN [ty] ty) self-ty] self-ty))
+        (row-over-at idx)))
+    (pipe sut
+      (insert-tc (Weld loc [fac]) wack-span get-tc)
+      (insert-tc (Weld loc [(strWeld "set_" fac)]) wack-span set-tc)
+      (insert-tc (Weld loc [(strWeld "over_" fac)]) wack-span over-tc)))
   (foldl go sut faces))
 
 (define (self-ty sut env args body)
@@ -145,19 +287,61 @@
 (define (score-meth obj meth sut)
   (define outer-ty (tc-ty obj))
   (define ty[_ tag nom] (burp-face (tc-ty obj)))
-  (define sel (snoc meth nom))
+  ;; A member of an instantiation is the instantiation of the member:
+  ;; the method path rides inside the /ty-ap encoding with the same
+  ;; arguments.
+  ;; A member of an instantiation is the instantiation of the member —
+  ;; but only over the vars the member kept (drop-if-unused): pair the
+  ;; parent's declared var names with the ridden args, keep the args
+  ;; whose name appears in the member's own chain.  Downstream
+  ;; positional consumers are then correct by construction.
+  (define (sel-for nom)
+    (If (ty-ap-path? nom)
+      (let* ((parts (ty-ap-decode nom))
+             (base (Ix 0 parts))
+             ;; Reopened members of builtin types insert rooted while
+             ;; the builtin's own path is substrate (unrooted): resolve
+             ;; the member path canonically.
+             (mpath (canon-path (snoc meth base) sut)))
+        (Ifz (get-const mpath sut)
+          mpath
+          (let* ((param-names
+                   (lambda (ty)
+                     (Weld (ty:tqua-names ty)
+                       (map (Ix 0) (ty:cqua-pairs ty)))))
+                 (pnames (param-names (got-type base sut)))
+                 (mnames (param-names (tc-ty (got-entry-tc mpath sut))))
+                 (kept (filter (lambda (pr) (includes (Eq (_0 pr)) mnames))
+                         (zip pnames (drop 1 parts)))))
+            (Ifz (Sz kept)
+              mpath
+              (ty-ap-encode (Weld [mpath] (map (Ix 1) kept)))))))
+      (canon-path (snoc meth nom) sut)))
+  ;; Law-valued methods are referenced by name, mirroring elab-ref.
+  (define (by-name path tc)
+    (If (Eq "TC_LAM" (Hd tc))
+      (tc-global (tc-ty tc) path)
+      tc))
   (define (specialize-method tc args)
     (Ifz args tc
-      (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
-        (If (Eq "TBAD" (_1 typ)) tc (set-tc-ty typ tc)))))
-  (define (score-nom)
-    (specialize-method (got-entry-tc sel sut) (_3 ty)))
+      (Ifz (ty:count-tqua (tc-ty tc))
+        tc
+        (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
+          (If (Eq "TBAD" (_1 typ))
+            (error ("cannot specialize method" meth typ))
+            (set-tc-ty typ tc))))))
   (define (row-item-type row)
     (Ifz (ty:trow-vals row)
       ty:TANY
       (foldl (ty:type-join sut) (_0 (ty:trow-vals row)) (drop 1 (ty:trow-vals row)))))
+  ;; A method that isn't declared is a user typo, not a bad entry.
+  (define (builtin-meth prefix)
+    (define bsel (canon-path (Weld prefix [meth]) sut))
+    (Ifz (get-const bsel sut)
+      (error ["no such method" ["path" bsel]])
+      (got-entry-tc bsel sut)))
   (define (row-method)
-    (specialize-method (got-entry-tc ["row" meth] sut) [(row-item-type ty)]))
+    (specialize-method (builtin-meth ["row"]) [(row-item-type ty)]))
   (define (row-meth row)
     (define faces (ty:collect-faces (ty:trow-vals row)))
     (define hit (find (lambda (arg) (Eq meth (_1 arg))) faces))
@@ -165,13 +349,51 @@
       (tc-ffi (ty:TFUN [ty] (_2 arg)) (Ix (_0 arg))))
     (Ifz hit
       (row-method)
-      (accessor (_0 hit))))
-  (cond
-    ((Eq tag "TNOM") (score-nom))
-    ((Eq tag "TROW") (row-meth ty))
-    ((Eq tag "TARR") (specialize-method (got-entry-tc ["row" meth] sut) [(_2 ty)]))
-    ((Eq tag "TNAT") (got-entry-tc ["uint" meth] sut))
-    (else (error ("bad dot call" obj meth)))))
+      ;; Anonymous rows (cstr 0) are outside UFCS by design: no face
+      ;; accessors, no set_/over_.  The row/* builtins above still
+      ;; apply where the receiver nests as an array.
+      (If (Eq 0 (ty:trow-cstr row))
+        (error ["anonymous row types are outside UFCS - bind the value to a local (=  > x ...) and use the bare face name" ["face" meth]])
+        (accessor (_0 hit)))))
+  ;; Nominal receivers keep their names now (type-meet preserves
+  ;; molds), so face access on them arrives here: when there is no
+  ;; declared method under the receiver's path, fall back to the
+  ;; expanded row shape and its faces.  A nominal whose entry holds
+  ;; *another type* is an alias (+ path row[quip]): its own declared
+  ;; methods win, then lookup re-dispatches on the unfolded type.
+  (define (score-ty t)
+    (define (score-nom t)
+      (define nom (_2 t))
+      (define sel (sel-for nom))
+      (If (get-const sel sut)
+        (by-name sel (applied-entry-tc sut sel))
+        ;; Face access: use the *declared* row specialized by the
+        ;; receiver's type arguments — expanding the whole receiver
+        ;; would hand the accessor a denormalized face type.  An
+        ;; entry holding another NOMINAL is an alias link: follow it
+        ;; before falling back to the expanded row shape, so the
+        ;; target's declared methods win over its span's faces.
+        (let ((decl (If (And (get-const nom sut) (ty:type-entry? nom sut))
+                      (applied-type sut nom)
+                      ty:TBAD)))
+          (cond
+            ((Eq "TROW" (_1 decl)) (row-meth decl))
+            ((And (Eq "TNOM" (_1 decl)) (Nil (Equal decl t)))
+              (score-ty decl))
+            (else
+              (let ((span (ty:mold-to-span sut t)))
+                (If (Eq "TROW" (_1 span))
+                  (row-meth span)
+                  (If (Or (Eq "TBAD" (_1 decl)) (Equal decl t))
+                    (error ("bad dot call" obj meth))
+                    (score-ty decl)))))))))
+    (cond
+      ((Eq (_1 t) "TNOM") (score-nom t))
+      ((Eq (_1 t) "TROW") (row-meth t))
+      ((Eq (_1 t) "TARR") (specialize-method (builtin-meth ["row"]) [(_2 t)]))
+      ((Eq (_1 t) "TNAT") (builtin-meth ["uint"]))
+      (else (error ("bad dot call" obj meth)))))
+  (score-ty ty))
 
 (define (elab-val sut env surf)
   (define (tag-is x) (Eq x (_0 surf)))
@@ -184,10 +406,10 @@
     (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
   (define (elab-cast c[_ ty body])
     (define want (elab-ty ty))
-    (define env1 (set-env-goal want env))
-    (define ret (elab-val sut env1 body))
+    (define ret (elab-val sut env body))
     (unless (ty:type-nests? sut want (tc-ty ret))
-      (error ["bad-cast" want (tc-ty ret) ret])
+      (elab-error env "cast (^) target does not accept the value's type"
+        ["want" want "got" (tc-ty ret)])
       (set-tc-ty want ret)))
   (define (elab-row r[_ items])
     (define els (map (elab-val sut env) items))
@@ -199,46 +421,189 @@
   (define (elab-variant-call tag xs)
     (define ty (ty:TROW tag (map (cork burp-face tc-ty) xs)))
     (tc-row ty (ty:trow-cstr ty) xs))
+  ;; -> [row result-nom] for a constructible type callee, else 0. A
+  ;; TTYP wrapping a /ty-ap nominal resolves through the applied view;
+  ;; the nominal rides along as the construction's result type.
   (define (tc-type-row tc)
     (If (Eq "TC_TYP" (Hd tc))
       (let ((typ (tc-typ-inner tc)))
-        (If (and (Eq (_1 typ) "TTYP")
-              (Eq (_1 (_2 typ)) "TROW"))
-          (_2 typ)
-          0))
+        (If (Nil (Eq (_1 typ) "TTYP"))
+          0
+          (let ((inner (_2 typ)))
+            (cond
+              ((Eq (_1 inner) "TROW") [inner 0])
+              ((Eq (_1 inner) "TNOM")
+                (let ((decl (applied-type sut (_2 inner))))
+                  (If (Eq (_1 decl) "TROW") [decl inner] 0)))
+              (else 0)))))
       0))
-  (define (elab-type-call tc xs)
-    (define row (tc-type-row tc))
-    (define row-span (ty:mold-to-span sut row))
+  ;; A constructor call's result type is the NOMINAL type when the
+  ;; callee is a (possibly specialized) reference to a named type —
+  ;; taken from the callee's surface, since the TC has shed the path.
+  ;; The old span roundtrip recovered the name only for
+  ;; unparameterized types and denormalized everything else.
+  (define (construction-nom fsurf)
+    (cond
+      ((Eq "s_ref" (_0 fsurf))
+        (ty:TNOM (canon-path (surf-ref-path fsurf) sut) 0))
+      ;; bare names reach constructors as s_var (a type callee cannot
+      ;; be a local, so the name is the path)
+      ((Eq "s_var" (_0 fsurf))
+        (ty:TNOM (canon-path [(_1 fsurf)] sut) 0))
+      ((And (Eq "s_spec" (_0 fsurf)) (Eq "s_ref" (_0 (_1 fsurf))))
+        (ty:TNOM (canon-path (surf-ref-path (_1 fsurf)) sut)
+          (map elab-ty (_2 fsurf))))
+      (else 0)))
+  (define (elab-type-call fsurf rown xs)
+    (define row (Ix 0 rown))
     (define fields (ty:trow-vals row))
     (define got (map (cork burp-face tc-ty) xs))
     (define pairs (zip fields got))
+    (define nom (If (Ix 1 rown) (Ix 1 rown) (construction-nom fsurf)))
     (unless (and (Eq (Sz fields) (Sz got))
               (all (uncurry (ty:type-nests? sut)) pairs))
-      (error ["bad-constructor-call" row got])
-      (tc-row (ty:span-to-mold sut row-span) (ty:trow-cstr row-span) xs)))
+      (elab-error env "constructor call does not match its row type"
+        ["want" row "got" got])
+      (tc-row (Ifz nom row nom) (ty:trow-cstr row) xs)))
   (define (on-call f xs)
     (define xs-ty (map (cork burp-face tc-ty) xs))
     (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
     (define app (tc-fold-app f xs))
-    (If (Eq tag "TBAD") (error ("bad apply" ty (tc-ty f) xs-ty))
+    (If (Eq tag "TBAD")
+      (elab-error env "cannot apply function to these arguments"
+        ["fun" (tc-ty f) "args" xs-ty "because" ty])
       (set-tc-ty ty app)))
+  ;; A loop (|) is an immediately-applied anonymous lambda: params come
+  ;; from the arm patterns, inits elaborate in the OUTER env (parallel
+  ;; binding — it's one call), and (_ ...) re-enters through the self
+  ;; slot.  Without a ^ cast the self return type is TBOT — a self-call
+  ;; joins away against the base-case branches, so the loop's type is
+  ;; the join of its non-recursive exits (the same trick no-fallthrough
+  ;; matches use for their missing heir).
+  (define (elab-loop l[_ arms body])
+    (define argty (map (lambda (a) (elab-ty (_1 a))) arms))
+    (define inits (map (lambda (a) (elab-val sut env (_2 a))) arms))
+    (define ret0 (peek-ret-cast sut env body))
+    (define ret (If (Equal ty:TBAD ret0) ty:TBOT ret0))
+    (define frame (Weld [(ty:TSELF (ty:TFUN argty ret))] argty))
+    (define inner-env (push-locals env frame))
+    (define val (elab-val sut inner-env body))
+    (define lam (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
+    (on-call lam inits))
   (define (elab-spec s[_ val args])
     (define base (elab-val sut env val))
-    (define targs (map elab-ty args))
+    (define bty0
+      (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
+    (define cpairs (ty:cqua-pairs bty0))
+    (define nt0 (ty:count-tqua bty0))
+    (define targs (map elab-ty (take nt0 args)))
     (define (bad-type? typ)
       (Eq (_1 typ) "TBAD"))
     (define (specialize typ)
       (ty:type-specialize sut typ targs))
-    (If (Eq "TC_TYP" (Hd base))
-      (let ((typ (specialize (_2 (tc-typ-inner base)))))
-        (If (bad-type? typ)
-          (error ["bad-specialization" typ val args])
-          (tc-typ (ty:TTYP typ))))
+    ;; A specialized named type IS its /ty-ap path.  Bare names arrive
+    ;; as s_var; the base elaborated to a type entry, so the name is a
+    ;; root path — value position is nominal exactly like type position.
+    (define (nom-spec)
+      (cond
+        ((Eq "s_ref" (_0 val))
+          (spec-encode sut (surf-ref-path val) targs))
+        ((Eq "s_var" (_0 val))
+          (spec-encode sut [(_1 val)] targs))
+        (else 0)))
+    ;; --- const-bearing generics: full explicit spec, values checked
+    ;; against their declared types (with the instantiation's type args
+    ;; substituted in), the reference rewritten to the full /ty-ap key.
+    (define (subst-cty cty)
+      (foldl (lambda (acc pr) (ty:subst-type (_0 pr) (_1 pr) acc))
+        cty (zip (ty:tqua-names bty0) targs)))
+    (define (const-arg-path a cty)
+      (If (Eq "s_tsym" (_0 a))
+        (let ((n (_1 a)))
+          (unless (ty:type-nests? sut cty (ty:TNAT n))
+            (elab-error env "const argument type mismatch"
+              ["want" cty "got" (ty:TNAT n)])
+            [ty-val-tag n]))
+      (If (Nil (Eq "s_ref" (_0 a)))
+        (elab-error env "const argument must be a name or literal" a)
+        (let* ((path (surf-ref-path a))
+               (nm (_0 path))
+               (chit (And (Eq 1 (Sz path))
+                       (find (lambda (pr) (Eq nm (_0 pr))) (env-consts env)))))
+          (cond
+            (chit
+              (unless (ty:type-nests? sut cty (_1 (_0 chit)))
+                (elab-error env "const argument type mismatch"
+                  ["want" cty "got" (_1 (_0 chit))])
+                [ty-var-tag nm]))
+            ((And (Eq 1 (Sz path)) (str-numeric? nm))
+              (unless (ty:type-nests? sut cty (ty:TNAT (parse-nat nm)))
+                (elab-error env "const argument type mismatch"
+                  ["want" cty "got" (ty:TNAT (parse-nat nm))])
+                [ty-val-tag (parse-nat nm)]))
+            (else
+              (let ((cp (canon-path path sut)))
+                (Ifz (get-const cp sut)
+                  (elab-error env "unbound const argument" ["path" cp])
+                  (let ((rty (tc-ty (got-entry-tc cp sut))))
+                    (unless (ty:type-nests? sut cty rty)
+                      (elab-error env "const argument type mismatch"
+                        ["want" cty "got" rty])
+                      cp))))))))))
+    (define (base-entry-path)
+      (cond
+        ((Eq "TC_GLOBAL" (Hd base)) (tc-global-path base))
+        ((Eq "s_ref" (_0 val)) (canon-path (surf-ref-path val) sut))
+        ((Eq "s_var" (_0 val)) (canon-path [(_1 val)] sut))
+        (else 0)))
+    (define (const-spec)
+      (If (Ne (Sz args) (Add nt0 (Sz cpairs)))
+        (elab-error env "wrong number of type arguments"
+          ["want" (Add nt0 (Sz cpairs)) "got" (Sz args)])
+        (let* ((bpath (base-entry-path))
+               (targ-paths (map ty:ty-to-path targs))
+               (cpaths
+                 (map (lambda (pr)
+                        (const-arg-path (_0 pr) (subst-cty (_1 (_1 pr)))))
+                   (zip (drop nt0 args) cpairs))))
+          (cond
+            ((Ifz bpath 1 0)
+              (elab-error env
+                "const-parameter generics require a named base" s))
+            ((any Nil targ-paths)
+              (elab-error env
+                "type arguments of a const-parameter generic must be path-shaped"
+                targs))
+            (else
+              (let ((enc (ty-ap-encode (Weld [bpath] (Weld targ-paths cpaths)))))
+                (If (Eq "TC_TYP" (Hd base))
+                  (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+                  (let ((typ (ty:subst-const-args
+                               (map (Ix 0) cpairs) cpaths
+                               (ty:strip-cquas (specialize bty0)))))
+                    (If (bad-type? typ)
+                      (elab-error env "bad specialization" ["got" typ "args" args])
+                      (tc-global typ enc))))))))))
+    (If (Sz cpairs)
+      (const-spec)
+      (If (Eq "TC_TYP" (Hd base))
+      ;; The /ty-ap encoding shortcut below never runs type-specialize,
+      ;; so check the argument count against the generic's arity here.
+      (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
+        (If (Ne quas (Sz targs))
+          (elab-error env "wrong number of type arguments"
+            ["want" quas "got" (Sz targs)])
+          (let ((enc (nom-spec)))
+            (If enc
+              (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+              (let ((typ (specialize (_2 (tc-typ-inner base)))))
+                (If (bad-type? typ)
+                  (elab-error env "bad specialization" ["got" typ "args" args])
+                  (tc-typ (ty:TTYP typ))))))))
       (let ((typ (specialize (tc-ty base))))
         (If (bad-type? typ)
-          (error ["bad-specialization" typ val args])
-          (set-tc-ty typ base)))))
+          (elab-error env "bad specialization" ["got" typ "args" args])
+          (set-tc-ty typ base))))))
   (define (elab-call c[_ f xs])
     (define exs (map (elab-val sut env) xs))
     (define variant-call? (Eq "s_variant" (_0 f)))
@@ -246,12 +611,29 @@
     (define ret
       (If variant-call?
         (elab-variant-call (_1 f) exs)
-      (If (tc-type-row tc-f)
-        (elab-type-call tc-f exs)
-        (on-call tc-f exs))))
+      (let ((rown (tc-type-row tc-f)))
+        (If rown
+          (elab-type-call f rown exs)
+          (on-call tc-f exs)))))
     ret)
+  ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
+  ;; referee's type): lowering links the referee's compiled pin in by
+  ;; path.  Embedding the whole referee TC — the old behavior — made
+  ;; every referrer's TC tree carry copies of its transitive callees.
+  ;; Non-function entries (FFI values, types, literal-ish TCs) stay
+  ;; inline; they are small and some consumers need their structure.
   (define (elab-ref r[_ path])
-    (got-entry-tc path sut))
+    ;; An unbound name is the single most common user error: a located
+    ;; diagnostic, never a bare ("bad entry" ...) from the lookup.
+    ;; Source paths are root-relative; the canonical (rooted) name is
+    ;; what the entry and the global link carry.
+    (define cpath (canon-path path sut))
+    (unless (Nil (get-const cpath sut))
+      (let ((referee (got-entry-tc cpath sut)))
+        (If (Eq "TC_LAM" (Hd referee))
+          (tc-global (tc-ty referee) cpath)
+          referee))
+      (elab-error env "unbound reference" ["path" path])))
   (define (slot-path path)
     (If (Eq 1 (Sz path)) (_0 path) path))
   (define (find-local-face face)
@@ -271,7 +653,17 @@
           0))
       (cond
         ((Eq tag "TFAC")
-          (If (Eq face (_2 ty)) [[ty path]] 0))
+          (If (Eq face (_2 ty))
+            [[ty path]]
+            ;; Anonymous rows are transparent aggregates: bare faces
+            ;; resolve through a faced local holding one.  Named molds
+            ;; stay opaque here (their faces are reached via UFCS) —
+            ;; recursing into them would silently rebind bare words
+            ;; like key/val inside match arms.
+            (let ((inner (ty:tfac-val ty)))
+              (If (And (Eq "TROW" (_1 inner)) (Eq 0 (ty:trow-cstr inner)))
+                (scan-ty inner path)
+                0))))
         ((Eq tag "TROW")
           (scan-row (ty:trow-vals ty)))
         ((Eq tag "TNOM")
@@ -288,10 +680,51 @@
   (define (elab-var v[_ face])
     (define found (find-local-face face))
     (Ifz found
-      (elab-ref ["s_ref" [face]])
+      (let ((chit (find (lambda (p) (Eq face (_0 p))) (env-consts env))))
+        (Ifz chit
+          (elab-ref ["s_ref" [face]])
+          (tc-cparam (_1 (_0 chit)) face)))
       (on-var face (_0 found))))
+  ;; A literal knows its value: TNAT with the constant cube (0 stays
+  ;; the whole nat span — the one ambiguous literal).
   (define (elab-lit l[_ val])
-    (tc-lit (ty:TNAT 0) val))
+    (tc-lit (ty:TNAT val) val))
+  ;; '-prefixed literals carry a quip aura: the runtime value is the
+  ;; tagged pair from quip:parse-quip, typed by the builtin quip sum.
+  (define (elab-literal l[_ shape text])
+    (cond
+      ((Eq shape "quip")
+        (tc-lit (ty:TNOM (canon-path ["quip"] sut) 0) (quip:parse-quip text)))
+      ;; A cord is a bare text nat, typed by its constant.
+      ((Eq shape "cord")
+        (tc-lit (ty:TNAT text) text))
+      (else (elab-unsupported env ["non-quip literal" shape]))))
+  ;; Local bindings: sequential lets — each binding sees the previous
+  ;; ones; recursive references are not supported (bindings elaborate
+  ;; before their name enters scope).
+  (define (elab-letrec l[_ arms body])
+    (define (bind-ty env1 pat val-tc)
+      (define tag (_0 pat))
+      (cond
+        ((Eq tag "s_face")
+          (let ((want (elab-type-env sut env1 (surf-face-kid pat))))
+            (unless (ty:type-nests? sut want (burp-face (tc-ty val-tc)))
+              (elab-error env1 "local binding value does not fit its declared type"
+                ["want" want "got" (tc-ty val-tc)])
+              (ty:TFAC (surf-face-name pat) want))))
+        ((And (Eq tag "s_ref") (Eq 1 (Sz (surf-ref-path pat))))
+          (ty:TFAC (_0 (surf-ref-path pat)) (burp-face (tc-ty val-tc))))
+        (else
+          (elab-error env1 "unsupported local binding pattern" pat))))
+    (define (step acc[env1 binds] arm[_ pat val])
+      (define val-tc (elab-val sut env1 val))
+      (define bty (bind-ty env1 pat val-tc))
+      [(push-local-env env1 bty) (snoc val-tc binds)])
+    (define res[env2 binds] (foldl step [env []] arms))
+    (unless (Ne foil-no-heir body)
+      (elab-error env "local bindings (=) require a body" 0)
+      (let ((btc (elab-val sut env2 body)))
+        (tc-letrec (tc-ty btc) binds btc))))
   (define (elab-meth-step rcvr seg)
     (define f (score-meth rcvr (surf-mseg-name seg) sut))
     (define args (map (elab-val sut env) (surf-mseg-args seg)))
@@ -305,39 +738,148 @@
     (define head-tc (elab-var [0 (_0 els)]))
     (elab-meth-go head-tc (drop 1 els)))
   (define (elab-arm scr-ty a[_ pat val])
-    (define ty (ty:type-meet sut scr-ty (elab-ty pat)))
-    (define res (elab-val sut (push-local-env env ty) val))
-    (tc-arm (tc-ty res) ty res))
+    (define pat-ty (elab-ty pat))
+    (define ty (ty:type-meet sut scr-ty pat-ty))
+    ;; Lowered arm tests dispatch on constructor head + arity; a pattern
+    ;; that doesn't narrow the scrutinee to a row has no such key.
+    (define span (burp-face (ty:mold-to-span sut ty)))
+    ;; A binderless anonymous-row pattern binds through its own faces:
+    ;; the meet burps mismatched faces, so re-impose the pattern's on
+    ;; the narrowed local — the arm body's bare names then resolve to
+    ;; the pattern's fields.  Named patterns are untouched.
+    (define (impose-faces met)
+      (ty:TROW (ty:trow-cstr met)
+        (map (lambda (pr)
+               (If (Eq "TFAC" (_1 (_0 pr)))
+                 (ty:TFAC (_2 (_0 pr)) (burp-face (_1 pr)))
+                 (_1 pr)))
+          (zip (ty:trow-vals pat-ty) (ty:trow-vals met)))))
+    (define local-ty
+      (If (And (Eq "TROW" (_1 pat-ty))
+            (And (Eq 0 (ty:trow-cstr pat-ty))
+              (And (Eq "TROW" (_1 ty))
+                (Eq (Sz (ty:trow-vals pat-ty)) (Sz (ty:trow-vals ty))))))
+        (impose-faces ty)
+        ty))
+    (unless (Eq "TROW" (_1 span))
+      (elab-error env "match arm pattern is not a row (constructor) type"
+        ["pattern" pat-ty "narrowed" ty])
+      (let ((res (elab-val sut (push-local-env env local-ty) val)))
+        (tc-arm (tc-ty res) ty res))))
+  ;; Lowered arm tests dispatch on constructor head + arity only
+  ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
+  ;; would silently shadow each other.  Reject them here instead.
+  (define (arm-key arm)
+    (define span (burp-face (ty:mold-to-span sut (tc-arm-pat arm))))
+    (If (Eq "TROW" (_1 span))
+      ["key" (ty:trow-cstr span) (Sz (ty:trow-vals span))]
+      0))
+  (define (check-arms-distinct arms1)
+    (define (dup-key keys)
+      (Ifz keys 0
+        (Or (And (_0 keys) (includes (Equal (_0 keys)) (drop 1 keys)))
+          (dup-key (drop 1 keys)))))
+    (define dup (dup-key (map arm-key arms1)))
+    (Ifz dup 0
+      (elab-error env
+        "match arms indistinguishable at runtime (same constructor and arity)"
+        (map tc-arm-pat arms1))))
+  ;; A match without a fallthrough must cover every option of its
+  ;; scrutinee's sum (by the same head+arity key the lowered tests
+  ;; dispatch on).
+  (define (check-exhaustive scrut-ty arms1)
+    (define span (burp-face (ty:mold-to-span sut scrut-ty)))
+    (define keys (map arm-key arms1))
+    (define (opt-key o)
+      (define s (burp-face o))
+      (If (Eq "TROW" (_1 s))
+        ["key" (ty:trow-cstr s) (Sz (ty:trow-vals s))]
+        0))
+    (define (uncovered? o)
+      (define k (opt-key o))
+      (Ifz k 1 (Nil (includes (Equal k) keys))))
+    (define opts
+      (cond
+        ((Eq "TSUM" (_1 span)) (ty:tsum-opts span))
+        ((Eq "TROW" (_1 span)) [span])
+        (else 0)))
+    (Ifz opts
+      (elab-error env "match without fallthrough on a non-sum scrutinee"
+        scrut-ty)
+      (let ((missing (filter uncovered? opts)))
+        (Ifz (Sz missing) 0
+          (elab-error env "non-exhaustive match" ["missing" missing])))))
   (define (elab-case c[_ scr arms fall])
     (define scrut (elab-val sut env scr))
     (define arms1 (map (elab-arm (burp-face (tc-ty scrut))) arms))
+    ;; The fallthrough leg is lowered *inside* the match's let (the
+    ;; scrutinee slot), so it must be elaborated with that local in
+    ;; scope or its de-bruijn references come out shifted by one.
     (define fall1
       (If (Eq foil-no-heir fall)
         (tc-mean "unreachable")
-        (elab-val sut env fall)))
+        (elab-val sut (push-local-env env (burp-face (tc-ty scrut))) fall)))
     (define fall-ty
       (If (Eq foil-no-heir fall) ty:TBOT (tc-ty fall1)))
     (define out-ty (foldl (ty:type-join sut) fall-ty (map tc-ty arms1)))
-    (tc-match out-ty scrut arms1 fall1))
+    (Seq (check-arms-distinct arms1)
+      (Seq (If (Eq foil-no-heir fall)
+             (check-exhaustive (tc-ty scrut) arms1)
+             0)
+        (tc-match out-ty scrut arms1 fall1))))
   (define (elab-if i[_ scr tru fall])
     (define scrut (elab-val sut env scr))
     (define tru1 (elab-val sut env tru))
     (define fall1 (elab-val sut env fall))
     (define out-ty (ty:type-join sut (tc-ty tru1) (tc-ty fall1)))
     (define if-ty (ty:TFUN [(ty:TNAT 0) out-ty out-ty] out-ty))
-    (define if-tc (set-tc-ty if-ty (got-entry-tc ["if"] sut)))
+    (define if-tc (set-tc-ty if-ty (got-entry-tc (canon-path ["if"] sut) sut)))
     (on-call if-tc [scrut tru1 fall1]))
   (define (elab-self s[_ xs])
+    (define found (find-idx match-self (env-locals env)))
     (define idx
-      (needful "missing self" (find-idx match-self (env-locals env))))
+      (Ifz found
+        (elab-error env "recursive call (_) outside of a function body" 0)
+        (_0 found)))
+    (define fun-ty (burp-face (burp-self (Ix idx (env-locals env)))))
+    ;; peek-ret-cast leaves TBAD when the enclosing function carries no
+    ;; ^ return cast; catch that here rather than failing on the apply.
+    (unless (And (ty:is-tfun? fun-ty) (Equal ty:TBAD (ty:tfun-ret fun-ty)))
 	    (on-call (on-var 0 [(Ix idx (env-locals env)) [idx]])
-	      (map (elab-val sut env) xs)))
+	      (map (elab-val sut env) xs))
+      (elab-error env
+        "recursive call (_) requires the enclosing function to declare its return type with a ^ cast"
+        0)))
+  ;; A declared variable the elaborated type never mentions is dropped
+  ;; (no TQUA) — uniform for @ and @@, so namespace-scoped vars cost
+  ;; nothing on members that don't use them.
   (define (elab-tvars t[_ vars body])
     (define env1 (push-env-tvars vars env))
     (define tc (elab-val sut env1 body))
+    (define (kept typ)
+      (filter (lambda (v) (ty:type-mentions-var? v typ)) vars))
     (If (Eq "TC_TYP" (Hd tc))
-      (tc-typ (ty:TTYP (wrap-tquas vars (_2 (tc-typ-inner tc)))))
-      (set-tc-ty (wrap-tquas vars (tc-ty tc)) tc)))
+      (let ((inner (_2 (tc-typ-inner tc))))
+        (tc-typ (ty:TTYP (wrap-tquas (kept inner) inner))))
+      (let ((typ (tc-ty tc)))
+        (set-tc-ty (wrap-tquas (kept typ) typ) tc))))
+  ;; Const generic parameters: elab the declared types (under the tvar
+  ;; env — they may mention sibling tvars), make the names visible to
+  ;; the body, and keep only the params the result uses.
+  (define (elab-cvars t[_ consts body])
+    (define pairs
+      (map (lambda (c[name tysast]) [name (elab-ty tysast)]) consts))
+    (define env1 (set-env-consts (Weld pairs (env-consts env)) env))
+    (define tc (elab-val sut env1 body))
+    (define typ0
+      (If (Eq "TC_TYP" (Hd tc)) (_2 (tc-typ-inner tc)) (tc-ty tc)))
+    (define (kept-const? p)
+      (Or (tc-uses-cparam? (_0 p) tc)
+        (ty:type-mentions-var? (_0 p) typ0)))
+    (define kept (filter kept-const? pairs))
+    (If (Eq "TC_TYP" (Hd tc))
+      (tc-typ (ty:TTYP (ty:wrap-tcquas kept typ0)))
+      (set-tc-ty (ty:wrap-tcquas kept typ0) tc)))
   (cond
     ((tag-is "s_fun")  (elab-fun surf))
     ((tag-is "s_cast") (elab-cast surf))
@@ -350,39 +892,151 @@
     ((tag-is "s_var") (elab-var surf))
     ((tag-is "s_case") (elab-case surf))
     ((tag-is "s_if") (elab-if surf))
-    ((tag-is "s_span") (elab-val sut env (burp-span surf)))
+    ((tag-is "s_span")
+      (elab-val sut (set-env-span (_1 surf) env) (burp-span surf)))
     ((tag-is "s_meth") (elab-meth surf))
     ((tag-is "s_self") (elab-self surf))
     ((tag-is "s_tvars") (elab-tvars surf))
-    ((tag-is "s_letrec") (error ["unsupported-foil-syntax" "letrec" surf]))
-    ((tag-is "s_ufcs_put") (error ["unsupported-foil-syntax" "ufcs-put" surf]))
-    ((tag-is "s_ufcs_over") (error ["unsupported-foil-syntax" "ufcs-over" surf]))
-    ((tag-is "s_literal") (error ["unsupported-foil-syntax" "literal" surf]))
+    ((tag-is "s_cvars") (elab-cvars surf))
+    ((tag-is "s_letrec") (elab-letrec surf))
+    ((tag-is "s_loop") (elab-loop surf))
+    ((tag-is "s_ufcs_put")
+      (elab-unsupported env "UFCS put (.#) — use .set_<face>(val)"))
+    ((tag-is "s_ufcs_over")
+      (elab-unsupported env "UFCS update (.%) — use .over_<face>(fun)"))
+    ((tag-is "s_literal") (elab-literal surf))
     ((or
        (tag-is "s_trow")
        (tag-is "s_tfun")
        (tag-is "s_union"))
-       (tc-typ (elab-ty surf)))
-    (else (error ("uimpl" surf)))))
+       ;; Every type-valued elaboration is normalized to TTYP so the
+       ;; declaration path stores the type itself, not (say) a TFUN
+       ;; whose _2 slot is its arity.
+       (tc-typ (as-ttyp (elab-ty surf))))
+    (else (elab-error env "unimplemented surface form" surf))))
 
 ;;; Module elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; Row type declarations get accessors, quantified or not: returns
+;; [tvars cparams row-items] (tvars 0 when the row is not generic), or 0.
 (define (can-gen-accessors? tc[ty])
-  (If (and (Eq (Hd tc) "TC_TYP")
-       (Eq (_1 ty) "TTYP")
-       (Eq (_1 (_2 ty)) "TROW"))
-       (ty:trow-vals (_2 ty))
-       0))
+  (define (unwrap vars cps typ)
+    (cond
+      ((Eq (_1 typ) "TQUA") (unwrap (snoc (_2 typ) vars) cps (_3 typ)))
+      ((Eq (_1 typ) "TCQUA")
+        (unwrap vars (snoc [(_2 typ) (_3 typ)] cps) (_4 typ)))
+      ((Eq (_1 typ) "TROW")
+        [(Ifz (Sz vars) 0 vars) cps (ty:trow-vals typ)])
+      (else 0)))
+  (If (and (Eq (Hd tc) "TC_TYP") (Eq (_1 ty) "TTYP"))
+    (unwrap [] [] (_2 ty))
+    0))
+
+;;; Unsupported-syntax scan ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Before elaborating a module we sweep every declaration body for
+;; surface forms the elaborator does not implement yet, and report all
+;; of them at once — located — instead of dying mid-elaboration on the
+;; first one with a raw AST dump.  (Diagnostics for *type* errors are
+;; still fail-fast; accumulating those into env-diags needs elab-val to
+;; return diagnostics, a larger refactor.)
+
+(define unsupported-tags
+  [["s_ufcs_put" "UFCS put (.#) — use .set_<face>(val)"]
+   ["s_ufcs_over" "UFCS update (.%) — use .over_<face>(fun)"]])
+
+(define (scan-unsupported span0 top)
+  (define (fold-kids f acc row)
+    (define (go i acc)
+      (If (Ge i (Sz row)) acc (go (Inc i) (f acc (Ix i row)))))
+    (go 0 acc))
+  (define (go span acc node)
+    (Ifz (IsApp node) acc
+      (If (Eq "s_span" (_0 node))
+        (go (_1 node) acc (_2 node))
+        (letrec
+          ((tag (_0 node))
+           (lit-bad (And (Eq tag "s_literal")
+                      (Nil (Or (Eq "quip" (_1 node)) (Eq "cord" (_1 node))))))
+           (hit (find (lambda (p) (Eq (_0 p) tag)) unsupported-tags))
+           (acc1 (cond
+                   (lit-bad
+                     (snoc ["unsupported" ["non-quip literal" (_1 node)]
+                            (span-blurb span)] acc))
+                   (hit
+                     (snoc ["unsupported" (_1 (_0 hit)) (span-blurb span)] acc))
+                   (else acc))))
+          (fold-kids (go span) acc1 node)))))
+  (go span0 [] top))
 
 (define (elab-mod sut mod)
   (define (insert-elab-tc name span tc sut)
     (If (Eq (Hd tc) "TC_TYP")
       (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
       (insert-tc name span tc sut)))
-  (define (elab-entry sut ent[_ name span body])
-    (define tc (elab-val sut (set-env-name name empty-env) body))
-    (define acc? (can-gen-accessors? tc))
-    (define sut1 (insert-elab-tc name span tc sut))
-    (Ifz acc? sut1
-      (gen-accessors name acc? sut1)))
-  (foldl elab-entry sut mod))
+  ;; Each declaration elaborates under its own Try, so one failure does
+  ;; not hide the next decl's: the error is collected, a TC_MEAN poison
+  ;; entry stands in (referees of the failed decl fail their own Try),
+  ;; and the module reports every failed decl at once.  The TC is
+  ;; deep-forced inside the Try — elaboration is lazy enough that an
+  ;; unforced error would otherwise fire in a neighbor's context.
+  (define (elab-entry acc ent[_ name0 span body])
+    (define sut (_0 acc))
+    (define diags (_1 acc))
+    ;; Declarations insert at their rooted (canonical) key; source
+    ;; references stay relative and resolve through canon-path.
+    (define name (root-path sut name0))
+    (define r
+      (Try (lambda (z)
+             (let ((tc (elab-val sut (set-env-name name empty-env) body)))
+               (DeepSeq tc tc)))
+        0))
+    (If (Eq 1 (Hd r))
+      [(insert-tc name span (tc-mean ["elab failed" name]) sut)
+       (snoc [name (_0 r)] diags)]
+      (let* ((tc (_0 r))
+             (acc? (can-gen-accessors? tc))
+             (sut1 (insert-elab-tc name span tc sut)))
+        [(Ifz acc? sut1
+           (gen-accessors name (_0 acc?) (_1 acc?) (_2 acc?) sut1))
+         diags])))
+  (define (scan-entry diags ent[_ name span body])
+    ;; Imports are resolved by compile-mod before elaboration; one
+    ;; reaching here means an inline module tried to import.
+    (cond
+      ((Eq "s_import" (_0 ent))
+        (snoc ["in-decl" [(_3 ent)] "unresolved import (inline modules cannot import)"]
+          diags))
+      ;; A decl the parser could not parse (per-decl recovery).
+      ((Eq "s_bad" (_0 ent))
+        (snoc ["in-decl" name body (span-blurb span)] diags))
+      ;; Backstop for the parse-level fence: the type-application
+      ;; namespaces are not declarable.
+      ((And (Sz name)
+         (Or (Eq ty-ap-tag (Ix 0 name)) (Eq ty-var-tag (Ix 0 name))))
+        (snoc ["in-decl" name
+               "reserved name: /ty-ap and /ty-var belong to the type system"
+               (span-blurb span)]
+          diags))
+      (else
+        (Weld diags
+          (map (lambda (d) ["in-decl" name d]) (scan-unsupported span body))))))
+  ;; Post-pass: every type declared by the module must be well-formed
+  ;; against the *final* subject (types may reference declarations that
+  ;; follow them, so checking at insert time is too early).
+  (define (wf-entry sut1 diags ent[_ name span body])
+    (define entry-tc (got-entry-tc (root-path sut1 name) sut1))
+    (define res (ty:check-type-wf sut1 (tc-ty entry-tc)))
+    (If (Eq "left" (Hd res))
+      (snoc ["in-decl" name (_0 res) (span-blurb span)] diags)
+      diags))
+  (define diags (foldl scan-entry [] mod))
+  (Ifz (Sz diags)
+    (let ((r (foldl elab-entry [sut []] mod)))
+      (Ifz (Sz (_1 r))
+        (let ((wf-diags (foldl (wf-entry (_0 r)) [] mod)))
+          (Ifz (Sz wf-diags)
+            (_0 r)
+            (error ["foil-type-wf" wf-diags])))
+        (error ["foil-elab-errors" (_1 r)])))
+    (error ["foil-unsupported" diags])))

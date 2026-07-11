@@ -1,0 +1,189 @@
+-  lain
+'  helm: the IO driver core — a pure state machine between the lain
+'  kernel and the host's actors.  The shell executes duties and
+'  shuttles messages; it decides nothing.
+'  .
+'  The helm tracks the /io subnamespace, one actor per name under it:
+'  a name's birth spawns an actor (carrying its record), a change
+'  tells the actor its new record, a removal fells it.  Actors send
+'  tasks back through the shell into the full namespace, and every
+'  task is acked to its sender — the command's path tag, or the
+'  failure.  Watching rides /react: one-shot eyes on /io (membership,
+'  y care) and on each /io name (content, x care), re-armed every
+'  pulse.  Outbound kernel moves are dropped in this port (xeno
+'  delivery is a later round).
++  rsvp
+  '  The ack an actor receives for its command.
+  &  ($ok maybe[path])
+     ($no quip)
++  duty
+  '  One command to the shell: spawn an actor for a name (with its
+  '  record), kill one, deliver a change (which watched path fired,
+  '  and its record), or deliver an ack.
+  &  ($birth quip res[myth])
+     ($fell quip)
+     ($tell quip path res[myth])
+     ($ack quip rsvp)
++  io_root
+  '  Where the driver looks.  The argument is ignored.
+  \  x=nat
+  ^  path
+  ['io]
++  io_path
+  '  The namespace path of one driven name.
+  \  n=quip
+  ^  path
+  ['io n]
++  has_name
+  \  n=quip names=path
+  ^  nat
+  |  > i=nat 0
+  ?  (eq i names.len)
+     0
+  ?  (eq_iota names.at(i) n)
+     1
+  (_ i.inc)
++  helm
+  '  Driver state: the sovereign, the armed
+  '  watches, and the live-name set (a uon keyed by name; the value
+  '  is unused).
+  :  =sov =eyes crew=uon[nat]
+  +  scan
+    '  The live names under /io — peek already drops tombstones.
+    \  s=sov
+    ^  path
+    =  > sub (peek (io_root 0) s)
+    =  > k sub.kid
+    k.keys
+  +  crew_of
+    \  names=path
+    ^  uon[nat]
+    |  > i=nat 0  > acc=uon[nat] (uon/empty)
+    ?  (eq i names.len)
+       acc
+    (_ i.inc acc.put(names.at(i) 0))
+  +  arm
+    '  Watches for the crew: membership on /io (y: kids moving),
+    '  content on each name (x: its own data).  Puts are idempotent
+    '  over surviving entries.
+    \  names=path ey=eyes
+    ^  eyes
+    =  > root (io_root 0)
+    =  > e1 ey.put(root [(dep $y root)])
+    |  > i=nat 0  > acc=eyes e1
+    ?  (eq i names.len)
+       acc
+    =  > pn (io_path names.at(i))
+    (_ i.inc acc.put(pn [(dep $x pn)]))
+  +  boot
+    '  Take the helm: birth an actor for every existing name, arm
+    '  the watches.
+    \  s=sov
+    ^  [hm=helm out=row[duty]]
+    =  > names (helm/scan s)
+    =  > outs
+         |  > i=nat 0  > acc=row[duty] []
+         ?  (eq i names.len)
+            acc
+         =  > n names.at(i)
+         =  > r s.x_query(s.top (io_path n))
+         (_ i.inc acc.snoc(($birth n r)))
+    =  > ey (helm/arm names (axal/new[row[dep]] $none))
+    [(helm s ey (helm/crew_of names)) outs]
+  +  pulse
+    '  Digest one event's signs: membership first (fells, then
+    '  births), tells for surviving fired names, and re-arm every
+    '  fired watch.
+    \  signs=axal[sign] h=helm
+    ^  [hm=helm out=row[duty]]
+    =  > rr (react signs h.eyes)
+    =  > s h.sov
+    =  > root (io_root 0)
+    =  > olds h.crew.keys
+    =  > memb
+         ?  news.get(root)
+          > ($some ds=row[dep])  1
+          > $none  0
+    =  > names2
+         ?  memb
+            (helm/scan s)
+         olds
+    =  > fells
+         |  > i=nat 0  > acc=row[duty] []
+         ?  (eq i olds.len)
+            acc
+         =  > n olds.at(i)
+         ?  (has_name n names2)
+            (_ i.inc acc)
+         (_ i.inc acc.snoc(($fell n)))
+    =  > births
+         |  > i=nat 0  > acc=row[duty] []
+         ?  (eq i names2.len)
+            acc
+         =  > n names2.at(i)
+         ?  h.crew.has(n)
+            (_ i.inc acc)
+         =  > r s.x_query(s.top (io_path n))
+         (_ i.inc acc.snoc(($birth n r)))
+    =  > tells
+         =  > es news.tap
+         |  > i=nat 0  > acc=row[duty] []
+         ?  (eq i es.len)
+            acc
+         =  > h2 es.at(i)
+         =  > wat p
+         =  > acc2
+              |  > j=nat 0  > a2=row[duty] acc
+              ?  (eq j q.len)
+                 a2
+              =  > e q.at(j)
+              =  > w e.p
+              ?  (eq 2 w.len)
+                 ?  (eq_iota w.at(0) 'io)
+                    =  > n w.at(1)
+                    ?  (has_name n names2)
+                       =  > r s.x_query(s.top wat)
+                       (_ j.inc a2.snoc(($tell n wat r)))
+                    (_ j.inc a2)
+                 (_ j.inc a2)
+              (_ j.inc a2)
+         (_ i.inc acc2)
+    =  > ey2 (helm/arm names2 rest)
+    =  > d1 fells.weld(births)
+    =  > d2 d1.weld(tells)
+    [(helm s ey2 (helm/crew_of names2)) d2]
+  +  spy
+    '  Arm a one-shot watch for a named actor on any path: the next
+    '  change there tells n once, then the watch is consumed —
+    '  workers re-spy for more (lazy reactivity).
+    \  n=quip pax=path h=helm
+    ^  helm
+    h.set_eyes(h.eyes.put(pax [(dep $x (io_path n))]))
+  +  exec
+    '  Run one task through the reactive cycle (crew-derived hears
+    '  cascade until quiet, fuel 8): the sovereign advances, every
+    '  round's signs pulse the driver's own eyes, and the source
+    '  actor (when named) is acked last.
+    \  src=maybe[quip] t=task h=helm
+    ^  [hm=helm out=row[duty]]
+    ?  (cycle t 0 8 h.sov)
+     > ($fail e=quip)
+       ?  src
+        > ($some n=quip)
+          =  > d0 [($ack n ($no e))]
+          [h d0]
+        > $none  [h []]
+     > ($spun s2=sov fx=row[move] rounds=row[axal[sign]] a=maybe[path])
+       =  > h1 h.set_sov(s2)
+       =  > pr
+            |  > i=nat 0  > hh=helm h1  > ds=row[duty] []
+            ^  [h2=helm ds2=row[duty]]
+            ?  (eq i rounds.len)
+               [hh ds]
+            =  > r2 (helm/pulse rounds.at(i) hh)
+            (_ i.inc hm ds.weld(out))
+       ?  src
+        > ($some n=quip)
+          =  > d3 ds2.snoc(($ack n ($ok a)))
+          [h2 d3]
+        > $none  [h2 ds2]

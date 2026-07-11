@@ -17,17 +17,32 @@
 
 (define NONE 0)
 
+;; Compiled declarations live under the compilation root — the boot
+;; process is fiat /boot.  The primitives below are the substrate
+;; (Layer 0): their canonical names stay unrooted, so type-argument
+;; encodings minted without a subject in reach (ty-to-path's bare
+;; ["nat"]) agree with source-written ones.  canon-path's root retry
+;; makes both spellings resolve.
+(define boot-root ["boot"])
+
 (define nat-ty (ty:TNOM ["nat"] 0))
 (define uint-ty (ty:TNOM ["uint"] 0))
 (define unit-cstr (print-path ["unit"]))
 (define unit-ty (ty:TNOM ["unit"] 0))
 
+;; Applications are /ty-ap paths (see foil-subject.rvr) — the
+;; argument types must be path-shaped.
+(define (applied-of base items)
+  (ty:TNOM (ty-ap-encode (Weld [base] (map ty:ty-to-path items))) 0))
+;; row is structurally an array: building the FFI signatures on TARR
+;; (rather than a /ty-ap path) keeps substitution structural, so item
+;; types with no path form — anonymous rows — specialize fine.
 (define (row-of item)
-  (ty:TNOM ["row"] [item]))
+  (ty:TARR item))
 (define (list-of item)
-  (ty:TNOM ["list"] [item]))
+  (applied-of ["list"] [item]))
 (define (either-of left right)
-  (ty:TNOM ["either"] [left right]))
+  (applied-of ["either"] [left right]))
 
 (define row-typ
   (ty:TQUA "a" (ty:TARR (ty:TVAR "a"))))
@@ -42,6 +57,19 @@
       (ty:TSUM
         [(ty:TROW "left" [(ty:TVAR "a")])
          (ty:TROW "right" [(ty:TVAR "b")])]))))
+
+;; The quip aura type (quip.rvr): a '-prefixed literal parses to a
+;; tagged value, one option per aura.
+(define quip-typ
+  (ty:TSUM
+    [(ty:TROW "ds" [nat-ty])   ;; absolute time
+     (ty:TROW "u" [nat-ty])    ;; decimal number
+     (ty:TROW "w" [nat-ty])    ;; 0w base64 data
+     (ty:TROW "x" [nat-ty])    ;; 0x hex data
+     (ty:TROW "ta" [nat-ty])   ;; %ascii text
+     (ty:TROW "tu" [nat-ty])   ;; %!unicode text
+     (ty:TROW "ts" [nat-ty])   ;; symbol
+     (ty:TROW "r" [nat-ty])])) ;; #path-length
 
 (define if-ty
   (ty:TQUA "a" (ty:TFUN [(ty:TNAT 0) (ty:TVAR "a") (ty:TVAR "a")] (ty:TVAR "a"))))
@@ -72,6 +100,29 @@
     (ty:TQUA "b"
       (ty:TFUN [(ty:TFUN [(ty:TVAR "a")] (ty:TVAR "b")) (row-of (ty:TVAR "a"))]
         (row-of (ty:TVAR "b"))))))
+(define row-filter-ty
+  (ty:TQUA "a"
+    (ty:TFUN [(ty:TFUN [(ty:TVAR "a")] (ty:TNAT NONE)) (row-of (ty:TVAR "a"))]
+      (row-of (ty:TVAR "a")))))
+(define row-fold-ty
+  (ty:TQUA "a"
+    (ty:TQUA "b"
+      (ty:TFUN [(ty:TFUN [(ty:TVAR "b") (ty:TVAR "a")] (ty:TVAR "b"))
+                (ty:TVAR "b")
+                (row-of (ty:TVAR "a"))]
+        (ty:TVAR "b")))))
+(define row-find-ty
+  (ty:TQUA "a"
+    (ty:TFUN [(ty:TFUN [(ty:TVAR "a")] (ty:TNAT NONE))
+              (ty:TVAR "a")
+              (row-of (ty:TVAR "a"))]
+      (ty:TVAR "a"))))
+(define row-rev-ty
+  (ty:TQUA "a" (ty:TFUN [(row-of (ty:TVAR "a"))] (row-of (ty:TVAR "a")))))
+(define row-pred-ty
+  (ty:TQUA "a"
+    (ty:TFUN [(ty:TFUN [(ty:TVAR "a")] (ty:TNAT NONE)) (row-of (ty:TVAR "a"))]
+      (ty:TNAT NONE))))
 
 (define list-nil-ty
   (ty:TQUA "a" (list-of (ty:TVAR "a"))))
@@ -122,8 +173,16 @@
 (define (row-cons x xs) (cons x xs))
 (define (row-snoc x xs) (snoc x xs))
 (define (row-take n xs) (take n xs))
-(define (row-drop n xs) (drop-r n xs))
+(define (row-drop n xs) (drop n xs))
 (define (row-map f xs) (map f xs))
+(define (row-filter f xs) (filter f xs))
+(define (row-fold f z xs) (foldl f z xs))
+(define (row-find f def xs)
+  (define hit (find f xs))
+  (Ifz hit def (_0 hit)))
+(define (row-rev xs) (rev xs))
+(define (row-any f xs) (any f xs))
+(define (row-all f xs) (all f xs))
 
 (define list-nil "nil")
 (define (list-cons x xs) ("cons" x xs))
@@ -143,6 +202,7 @@
 (define (either-left-val x) (_0 x))
 (define (either-right-val x) (_0 x))
 
+
 (define (insert-uint-methods prefix sut)
   (pipe sut
     (insert-ffi (Weld prefix ["add"]) uint-add-m binary-uint-ty)
@@ -159,10 +219,14 @@
     (insert-ffi (Weld prefix ["gt"]) uint-gt-m cmp-uint-ty)))
 
 (define default-subject
-  (pipe empty-subject
+  (pipe (set-sut-root boot-root empty-subject)
+    ;; pipe applies bottom-up: these aliases run LAST, over the full
+    ;; subject below.
     (ty:insert-typ-ffi ["nat"] (ty:TNAT 0))
     (ty:insert-typ-ffi ["uint"] (ty:TNAT 0))
     (ty:insert-typ-ffi ["unit"] (ty:TROW unit-cstr []))
+    (ty:insert-typ-ffi ["quip"] quip-typ)
+    (ty:insert-typ-ffi ["pail"] ty:TPAIL)
     (ty:insert-typ-ffi ["row"] row-typ)
     (ty:insert-typ-ffi ["list"] list-typ)
     (ty:insert-typ-ffi ["either"] either-typ)
@@ -181,6 +245,12 @@
     (insert-ffi ["div"] Div binary-nat-ty)
     (insert-ffi ["mod"] Mod binary-nat-ty)
     (insert-ffi ["dec"] Dec unary-nat-ty)
+    ;; native byte-width and shifts: cord code (weft &c) would
+    ;; otherwise recount lengths and rebuild 256^n by repeated
+    ;; division/multiplication — quadratic per append
+    (insert-ffi ["wid"] Bytes unary-nat-ty)
+    (insert-ffi ["lsh"] Lsh binary-nat-ty)
+    (insert-ffi ["rsh"] Rsh binary-nat-ty)
     (insert-uint-methods ["nat"])
     (insert-uint-methods ["uint"])
     (insert-ffi ["unit" "unit"] unit-cstr unit-ty)
@@ -195,6 +265,12 @@
     (insert-ffi ["row" "cons"] row-cons row-cons-ty)
     (insert-ffi ["row" "snoc"] row-snoc row-cons-ty)
     (insert-ffi ["row" "map"] row-map row-map-ty)
+    (insert-ffi ["row" "filter"] row-filter row-filter-ty)
+    (insert-ffi ["row" "fold"] row-fold row-fold-ty)
+    (insert-ffi ["row" "find"] row-find row-find-ty)
+    (insert-ffi ["row" "rev"] row-rev row-rev-ty)
+    (insert-ffi ["row" "any"] row-any row-pred-ty)
+    (insert-ffi ["row" "all"] row-all row-pred-ty)
     (insert-ffi ["nil"] list-nil list-nil-ty)
     (insert-ffi ["cons"] list-cons list-cons-ty)
     (insert-ffi ["list" "nil"] list-nil list-nil-ty)

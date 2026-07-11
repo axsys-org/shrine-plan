@@ -24,6 +24,24 @@
 (define (tc-const ty val)
   (tc "CONST" ty val))
 (define tc-const-val (Ix 1))
+;; A const generic parameter reference inside a generic body — a typed
+;; placeholder.  Deliberately has NO lowering case: one leaking past
+;; materialization fails loudly.
+(define (tc-cparam ty name)
+  (tc "CPARAM" ty name))
+(define tc-cparam-name (Ix 1))
+(define (tc-has-cparam? x)
+  (If (IsApp x)
+    (If (Eq "TC_CPARAM" (Hd x))
+      1
+      (any tc-has-cparam? (gen (Sz x) (lambda (i) (Ix i x)))))
+    0))
+(define (tc-uses-cparam? name x)
+  (If (IsApp x)
+    (If (Eq "TC_CPARAM" (Hd x))
+      (Eq name (Ix 1 x))
+      (any (tc-uses-cparam? name) (gen (Sz x) (lambda (i) (Ix i x)))))
+    0))
 (define (tc-ffi ty val)
   (tc "FFI" ty val))
 (define tc-ffi-val (Ix 1))
@@ -45,6 +63,8 @@
 
 (define (tc-letrec ty binds body)
   (tc "LET" ty binds body))
+(define tc-letrec-binds (Ix 1))
+(define tc-letrec-body (Ix 2))
 
 (define (tc-row ty hd row)
   (tc "ROW" ty hd row))
@@ -63,12 +83,21 @@
 
 
 
-(define sut-tvar (Ix 3))
-(define set-sut-tvar (Up 3))
+;; A subject is ("SUT" ax order tvars root).  The root is the
+;; compilation's namespace prefix: entry keys are stored rooted, source
+;; references resolve relative to it (canon-path), and row brands are
+;; therefore real namespace paths.  The boot process (builtins and the
+;; modules compiled against them) lives at /boot; an empty root is the
+;; unrooted (test/legacy) subject.
+(define sut-tvar (Ix 2))
+(define set-sut-tvar (Up 2))
 (define (sut-get-tvar? tvar sut) (find-idx (Eq tvar) (sut-tvar sut)))
-(define (sut-put-tvar tvar sut) (snap 3 (snoc tvar) sut))
+(define (sut-put-tvar tvar sut) (snap 2 (snoc tvar) sut))
+(define sut-root (Ix 3))
+(define set-sut-root (Up 3))
+(define (root-path sut p) (Weld (sut-root sut) p))
 
-(define (make-subject ax) ("SUT" ax 0))
+(define (make-subject ax) ("SUT" ax 0 0 []))
 (define subject-order Ix1)
 (define set-subject-order (Up 1))
 (define (push-subject-order name sut)
@@ -77,10 +106,20 @@
   (define ord (subject-order sut))
   [(_0 ord) (set-subject-order (drop 1 ord) sut)])
 (define empty-subject (make-subject empty-ax))
+;; Replacing an existing entry must not duplicate its key in the order:
+;; the order is a set, and passes that walk it (e.g. lowering) rely on
+;; visiting each entry once.  A key absent from the ax cannot be in the
+;; order (the order is a subset of the ax keys), so the fresh-key path
+;; — every new declaration and generated accessor — skips the linear
+;; order scan; only genuine replacements (reopens, materializations
+;; over aliases) pay it.
 (define (insert-entry-sut key val sut)
-  (pipe sut
-    (snap 0 (putax key (Pin val)))
-    (push-subject-order key)))
+  (define fresh (Ifz (getax key (Ix 0 sut)) 1 0))
+  (define sut1 (snap 0 (putax key (Pin val)) sut))
+  (cond
+    (fresh (push-subject-order key sut1))
+    ((includes (Equal key) (subject-order sut1)) sut1)
+    (else (push-subject-order key sut1))))
 (define (make-tc-entry key span tc)
   ("TC" key tc span))
 (define tc-entry-contents (Ix 1))
@@ -94,11 +133,93 @@
   (define tc (tc-ffi ty val))
   (insert-tc key wack-span tc sut))
 
+;; A navigation-only alias: the entry pinned at target also resolves
+;; at key.  Mount-style — the alias never joins the order, and
+;; canon-path normalizes through it to the target's canonical name.
+(define (alias-entry key target sut)
+  (snap 0 (putax key (gotax target (Ix 0 sut))) sut))
+
 (define (unpin-soft x)
   (If (IsPin x) (Unpin x) x))
+
+;;; The /ty-ap namespace ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; A specialized generic IS a path: bst[nat] is /ty-ap/1/bst/1/nat — a
+;; length-prefixed list of paths (the generic first, then each type
+;; argument), self-delimiting so applications nest
+;; (bst[list[nat]] = /ty-ap/1/bst/5/ty-ap/1/list/1/nat). Type variables
+;; get their own sub-namespace, /ty-var/<name>, so bst[v] inside a
+;; generic body is also just a path. The subject resolves /ty-ap paths
+;; to the generic's entry; the type layers specialize by the decoded
+;; arguments where types are in play (expansion, reference lookup).
+
+(define ty-ap-tag "ty-ap")
+(define ty-var-tag "ty-var")
+;; /ty-val/<nat>: a compile-time-constant nat literal riding a /ty-ap
+;; path as an argument (const generic parameters).
+(define ty-val-tag "ty-val")
+
+(define (ty-ap-path? path)
+  (And (IsApp path) (And (Gt (Sz path) 0) (Eq ty-ap-tag (Ix 0 path)))))
+
+(define (ty-var-path? path)
+  (And (IsApp path) (And (Eq 2 (Sz path)) (Eq ty-var-tag (Ix 0 path)))))
+
+(define (ty-val-path? path)
+  (And (IsApp path) (And (Eq 2 (Sz path)) (Eq ty-val-tag (Ix 0 path)))))
+
+(define (ty-ap-encode paths)
+  (foldl (lambda (acc p) (Weld acc (Weld [(Sz p)] p))) [ty-ap-tag] paths))
+
+;; -> row of paths (generic first, then args), or 0 if malformed.
+;; (the empty row is not an app, so malformed-ness needs a sentinel)
+(define ty-ap-bad "ty-ap-bad")
+(define (ty-ap-decode path)
+  (define n (Sz path))
+  (define (walk i)
+    (If (Ge i n) []
+      (let ((len (Ix i path)))
+        (If (Gt (Add (Inc i) len) n)
+          ty-ap-bad
+          (let ((rest (walk (Add (Inc i) len))))
+            (If (Eq ty-ap-bad rest)
+              ty-ap-bad
+              (Weld [(take len (drop (Inc i) path))] rest)))))))
+  (Ifz (ty-ap-path? path) 0
+    (let ((parts (walk 1)))
+      (If (Eq ty-ap-bad parts) 0 parts))))
+
+assert(Equal ["ty-ap" 1 "bst" 1 "nat"]
+  (ty-ap-encode [["bst"] ["nat"]]))
+assert(Equal [["bst"] ["nat"]]
+  (ty-ap-decode ["ty-ap" 1 "bst" 1 "nat"]))
+assert(Equal [["bst"] ["ty-ap" 1 "list" 1 "nat"]]
+  (ty-ap-decode (ty-ap-encode [["bst"] (ty-ap-encode [["list"] ["nat"]])])))
+assert(Equal 0 (ty-ap-decode ["ty-ap" 9 "bst"]))
+assert(ty-var-path? ["ty-var" "v"])
+
+;; Entry lookup is /ty-ap-transparent: an instantiation resolves to its
+;; generic's entry (same compiled value; the type layers specialize).
+(define (ty-ap-base path)
+  (define parts (ty-ap-decode path))
+  (Ifz parts 0 (Ix 0 parts)))
+
+(define (resolve-path path)
+  (If (ty-ap-path? path)
+    (ty-ap-base path)
+    path))
+
+;; Full-key-first: a materialized instantiation entry (const generic
+;; params) at the exact /ty-ap key wins; otherwise the virtual view
+;; resolves to the generic's base entry.  No full keys exist before
+;; materialization, so elaboration semantics are unchanged.
+(define (get-const name sut)
+  (If (ty-ap-path? name)
+    (let ((direct (getax name (_0 sut))))
+      (Ifz direct (getax (ty-ap-base name) (_0 sut)) direct))
+    (getax name (_0 sut))))
 (define (got-entry path sut)
-  (unpin-soft (gotax path (_0 sut))))
-(define (get-const name sut) (getax name (_0 sut)))
+  (unpin-soft (need (get-const path sut))))
 (define (got-const name sut) (need (get-const name sut)))
 
 (define (got-entry-tc path sut)
@@ -107,12 +228,12 @@
     ((Eq (Hd ent) "TC") (_1 ent))
     ((Eq (Hd ent) "IR_ENTRY") (_3 ent))
     (else
-      (error ("bad entry" path ent)))))
+      (error ("bad entry" path)))))
 
 (define (got-type path sut)
   (define tc (got-entry-tc path sut))
   (define ent (got-entry path sut))
-  (unless (Eq (Hd tc) "TC_TYP") (error ("bad type" tc ent path sut))
+  (unless (Eq (Hd tc) "TC_TYP") (error ("bad type" path (Hd tc)))
     (_2 (tc-typ-inner tc))))
 
 (define (print-path x)
@@ -131,8 +252,77 @@
 
 (define (got-span name sut)
   (define res (get-span name sut))
-  (Ifz res (error ["bad span lookup" name sut])
+  (Ifz res (error ["bad span lookup" name])
     res))
+
+;;; Imports: merge, mount, canonical names ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Normalize a written path to the entry's own (canonical) name — a
+;; mounted import resolves to the same pinned entry, and nominal type
+;; identity must not depend on which name the source used.  Entries
+;; carry their canonical key at Ix 0 ("TC" and "IR_ENTRY" alike).
+(define (canon-path path sut)
+  (cond
+    ((ty-var-path? path) path)
+    ((ty-ap-path? path)
+      (let ((parts (ty-ap-decode path)))
+        (Ifz parts
+          path
+          (ty-ap-encode (map (lambda (p) (canon-path p sut)) parts)))))
+    (else
+      ;; Rooted-first: a compilation-local declaration shadows a
+      ;; substrate builtin of the same name (matching the pre-root
+      ;; replace-at-insert semantics).  A miss both ways is a forward
+      ;; reference to a declaration of this compilation, which will be
+      ;; inserted rooted — so the rooted guess IS its canonical name
+      ;; (the wf post-pass still catches genuinely unbound paths).
+      (let ((rooted (root-path sut path)))
+        (let ((rgot (If (Equal rooted path) 0 (get-const rooted sut))))
+          (Ifz rgot
+            (let ((got (get-const path sut)))
+              (Ifz got
+                (If (Equal rooted path) path rooted)
+                (_0 (unpin-soft (_0 got)))))
+            (_0 (unpin-soft (_0 rgot)))))))))
+
+;; Merge a compiled module's declared entries into sut at their
+;; canonical paths.  An identical entry at an occupied path is the
+;; diamond-import case and dedupes; a differing one is a collision.
+(define (merge-subject blurb keys imp sut)
+  (define (merge-one acc key)
+    (define pin (gotax key (_0 imp)))
+    (define mine (getax key (_0 acc)))
+    (cond
+      ((Ifz mine 1 0)
+        ;; The order is a subset of the ax keys, so a key absent from
+        ;; the ax cannot be in the order — push without scanning it
+        ;; (the scan made merging K keys O(K^2)).
+        (push-subject-order key (snap 0 (putax key pin) acc)))
+      ((Equal (need mine) pin) acc)
+      (else
+        (error ["foil-import-collision" ["path" key] ["at" blurb]]))))
+  (foldl merge-one sut keys))
+
+;; Mount: the same pinned entries additionally reachable under a path
+;; prefix.  Navigation only — mounted names never join the order (the
+;; entries are already lowered under their canonical names) and types
+;; written through them normalize via canon-path.
+(define (mount-subject blurb prefix keys imp sut)
+  ;; Mounted names live under the root like everything else: the
+  ;; canonical key is root ++ decl-path, so the mount is
+  ;; root ++ prefix ++ decl-path (source `vec/x` resolves through the
+  ;; canon-path root retry).
+  (define root (sut-root sut))
+  (define (mount-one acc key)
+    (define pin (gotax key (_0 imp)))
+    (define mkey (Weld root (Weld prefix (drop (Sz root) key))))
+    (define mine (getax mkey (_0 acc)))
+    (cond
+      ((Ifz mine 1 0) (snap 0 (putax mkey pin) acc))
+      ((Equal (need mine) pin) acc)
+      (else
+        (error ["foil-import-collision" ["path" mkey] ["at" blurb]]))))
+  (foldl mount-one sut keys))
 
 
 
@@ -164,6 +354,8 @@
  tc-lam-arity
  tc-lam-body
  tc-letrec
+ tc-letrec-binds
+ tc-letrec-body
  tc-row
  tc-row-hd
  tc-row-items
@@ -178,6 +370,9 @@
  set-sut-tvar
  sut-get-tvar?
  sut-put-tvar
+ sut-root
+ set-sut-root
+ root-path
  make-subject
  subject-order
  set-subject-order
@@ -191,9 +386,28 @@
  insert-tc
  wack-span
  insert-ffi
+ alias-entry
  got-entry
  get-const
  got-const
+ unpin-soft
+ canon-path
+ merge-subject
+ mount-subject
+ tc-cparam
+ tc-cparam-name
+ tc-has-cparam?
+ tc-uses-cparam?
+ ty-ap-tag
+ ty-val-tag
+ ty-val-path?
+ ty-var-tag
+ ty-ap-path?
+ ty-var-path?
+ ty-ap-encode
+ ty-ap-decode
+ ty-ap-base
+ resolve-path
  got-entry-tc
  got-type
  print-path

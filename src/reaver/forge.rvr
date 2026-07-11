@@ -1,0 +1,1411 @@
+;;;; The Forge — a live environment for the Foil image.
+;;;; See doc/forge.md.  The image that serves the page is the compiler:
+;;;; every pane is rendered from live PLAN values — the elaborated
+;;;; subject, typed cores, lowered IR, compiled laws, runtime values,
+;;;; captured lore and executed doctests.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind rex (#module rex))
+
+(#bind foil-rex (#module foil-rex))
+(#import foil-rex)
+
+(#bind foil-sast (#module foil-sast))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind ty (#module foil-types))
+
+(#bind cgen (#module codegen))
+
+(#bind foil (#module foil))
+
+(#bind async (#module async))
+
+(#bind milton (#module milton))
+
+
+;;; String helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (str-slice off len src)
+  (Trunc (Mul 8 len) (Rsh src (Mul 8 off))))
+
+(define (str-drop off src)
+  (str-slice off (Sub (Bytes src) off) src))
+
+(define (str-prefix? pre src)
+  (define len (Bytes pre))
+  (And (Le len (Bytes src))
+       (Eq pre (str-slice 0 len src))))
+
+;; Byte-by-byte on purpose: wisp's LoadVar returns wrong values on
+;; larger heaps (see doc/wisp-session-leak.md); Load8 is reliable.
+(define (str-contains? needle hay)
+  (define nl (Bytes needle))
+  (define hb (Bytes hay))
+  (define (match-at i j)
+    (Or (Ge j nl)
+      (And (Eq (Load8 j needle) (Load8 (Add i j) hay))
+        (match-at i (Inc j)))))
+  (define (go i)
+    (If (Gt (Add i nl) hb) 0
+      (If (match-at i 0) 1 (go (Inc i)))))
+  (Ifz nl 1 (go 0)))
+
+;; HTML-escape dynamic text (milton's escape is a no-op by design so
+;; script/style children stay raw; we escape at construction sites).
+(define (esc s)
+  (define (go i)
+    (If (Ge i (Bytes s)) 0
+      (let ((c (Load8 i s)))
+        (lcons
+          (cond
+            ((Eq c "&") "&amp;")
+            ((Eq c "<") "&lt;")
+            ((Eq c ">") "&gt;")
+            ((Eq c 34) "&quot;")
+            (else c))
+          (go (Inc i))))))
+  (lstrcat (go 0)))
+
+(define (printable-text? v)
+  (define (go i)
+    (Or (Ge i (Bytes v))
+      (And (let ((c (Load8 i v))) (And (Ge c 32) (Le c 126)))
+        (go (Inc i)))))
+  (And (IsNat v) (And (Gt (Bytes v) 0) (go 0))))
+
+(define (atom-str v)
+  (If (printable-text? v) v (showNat v)))
+
+(define (dotted path) (join-str "." path))
+
+;; Load8-based splitter: parse.rvr's byte splitter slices via LoadVar,
+;; which returns garbage on larger heaps (doc/wisp-session-leak.md).
+(define (split-ch ch s)
+  (define n (Bytes s))
+  (define (slice a b) (str-slice a (Sub b a) s))
+  (define (go start i acc)
+    (If (Ge i n)
+      (snoc (slice start i) acc)
+      (If (Eq ch (Load8 i s))
+        (go (Inc i) (Inc i) (snoc (slice start i) acc))
+        (go start (Inc i) acc))))
+  (go 0 0 []))
+
+(define (strip-spaces-at i line)
+  (If (And (Lt i (Bytes line)) (Eq " " (Load8 i line)))
+    (strip-spaces-at (Inc i) line)
+    i))
+
+
+;;; HTML construction (milton node trees) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (attr key val) [key val])
+(define (cls val)      (attr "class" val))
+(define no-attrs 0)
+
+(define (node tag attrs children) [tag attrs children])
+(define (leaf tag attrs text)     (node tag attrs [text]))
+(define (div attrs children)  (node "div" attrs children))
+(define (span attrs text)     (leaf "span" attrs text))
+(define (pre attrs text)      (leaf "pre" attrs text))
+(define (h2 text)             (leaf "h2" no-attrs (esc text)))
+(define (para attrs kids)     (node "p" attrs kids))
+
+(define (chip kind text)
+  (span [(cls (strcat ["chip " kind]))] (esc text)))
+
+(define (hx-link url target text)
+  (leaf "a"
+    [(attr "href" "#") (attr "hx-get" url) (attr "hx-target" target)]
+    (esc text)))
+
+(define (entry-url mod path)
+  (strcat ["/entry/" mod "/" (dotted path)]))
+
+(define (entry-link mod path text)
+  (hx-link (entry-url mod path) "#detail" text))
+
+(define (fold-out open summary kids)
+  (node "details" (If open [(attr "open" "open")] no-attrs)
+    (Weld [(node "summary" no-attrs summary)] kids)))
+
+
+;;; Lore capture (doc/foil-lore.md section 7, steps 1-3, done as a pure ;;;;;;;;;;
+;;; rex walk so the compiler carries no new parser risk) ;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Strip a slug line down to its text: leading spaces, one tick,
+;; trailing spaces after the tick.
+(define (strip-tick line)
+  (define i (strip-spaces-at 0 line))
+  (define j (If (And (Lt i (Bytes line)) (Eq "'" (Load8 i line))) (Inc i) i))
+  (str-drop (strip-spaces-at j line) line))
+
+(define (is-doctest-line? l) (str-prefix? "?=" l))
+
+(define (parse-doctest line)
+  (define src (str-drop (strip-spaces-at 2 line) line))
+  (define parsed (Try rex:ParseRexNorm src))
+  (If (Eq 1 (Hd parsed))
+    ["DTBAD" line 0 0]
+    (let ((n (_0 parsed)))
+      (If (And (rx-nest? n) (Eq 2 (Sz (rx-nest-kids n))))
+        ["DT" line (_0 (rx-nest-kids n)) (_1 (rx-nest-kids n))]
+        ["DTBAD" line 0 0]))))
+
+;; Slug leaves encode line breaks as a backslash run + n (the run
+;; length grows with nesting depth); treat any such run as a newline.
+(define (split-slug-lines s)
+  (define n (Bytes s))
+  (define (slice a b) (str-slice a (Sub b a) s))
+  (define (bs-run i)
+    (If (And (Lt i n) (Eq 92 (Load8 i s)))
+      (Inc (bs-run (Inc i)))
+      0))
+  (define (go start i acc)
+    (If (Ge i n)
+      (snoc (slice start i) acc)
+      (let ((k (bs-run i)))
+        (If (And k (And (Lt (Add i k) n) (Eq "n" (Load8 (Add i k) s))))
+          (go (Add (Add i k) 1) (Add (Add i k) 1) (snoc (slice start i) acc))
+          (go start (Inc i) acc)))))
+  (go 0 0 []))
+
+(define (parse-lore e[path text lspan])
+  (define lines (map strip-tick (split-slug-lines text)))
+  (define tests (map parse-doctest (filter is-doctest-line? lines)))
+  (define body
+    (filter (lambda (l) (And (Bytes l) (Nil (is-doctest-line? l)))) lines))
+  (define head (Ifz (Sz body) "" (_0 body)))
+  ["LORE" path head body tests lspan])
+
+(define lore-path (Ix 1))
+(define lore-head (Ix 2))
+(define lore-body (Ix 3))
+(define lore-tests (Ix 4))
+
+(define (capture-lore rexn)
+  (define (kids-of n)
+    (cond
+      ((rx-nest? n) (rx-nest-kids n))
+      ((rx-juxt? n) (rx-juxt-kids n))
+      (else 0)))
+  (define (decl-name kids)
+    (define hit (find rx-word? kids))
+    (Ifz hit 0 (rx-leaf-str (_0 hit))))
+  (define (go path acc n)
+    (cond
+      ((And (rx-leaf? n) (Eq "slug" (rx-leaf-shape n)))
+        (snoc [path (rx-leaf-str n) (rx-span n)] acc))
+      ((rx-rune? "+" n)
+        (let ((nm (decl-name (rx-nest-kids n))))
+          (let ((path1 (Ifz nm path (snoc nm path))))
+            (foldl (go path1) acc (kids-of n)))))
+      (else (foldl (go path) acc (kids-of n)))))
+  (map parse-lore (go [] [] rexn)))
+
+(define (lore-for lore path)
+  (find (lambda (l) (Equal path (lore-path l))) lore))
+
+
+;;; Evaluation against the live subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; rex node -> [value type], deep-forced so errors surface inside Try.
+(define (eval-rex sut rexn)
+  (define ast (foil-sast:parse-val-sast rexn))
+  (define tc (foil:elab-val sut foil:empty-env ast))
+  (define ir (foil:lower-tc sut tc))
+  (define val (cgen:compile-expr ir))
+  (DeepSeq val [val (tc-ty tc)]))
+
+(define (eval-text sut txt)
+  (define parsed (Try rex:ParseRexNorm txt))
+  (If (Eq 1 (Hd parsed))
+    (1 ["rex-parse-failed" (_0 parsed)])
+    (Try (eval-rex sut) (_0 parsed))))
+
+(define (run-doctest sut dt[_ line srcx expx])
+  (If (Eq "DTBAD" (Hd dt))
+    ["broken" line 0 0]
+    (let ((got (Try (eval-rex sut) srcx))
+          (want (Try (eval-rex sut) expx)))
+      (cond
+        ((Eq 1 (Hd got))  ["error" line (_0 got) 0])
+        ((Eq 1 (Hd want)) ["error" line (_0 want) 0])
+        ((Equal (_0 (_0 got)) (_0 (_0 want)))
+          ["pass" line (_0 (_0 got)) (_0 (_0 want))])
+        (else ["fail" line (_0 (_0 got)) (_0 (_0 want))])))))
+
+
+;;; Reference index — who-calls as a query over the TCs ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (fold-kids f acc row)
+  (define (go i acc)
+    (If (Ge i (Sz row)) acc (go (Inc i) (f acc (Ix i row)))))
+  (go 0 acc))
+
+(define (snoc-new x xs)
+  (If (includes (Equal x) xs) xs (snoc x xs)))
+
+;; Collect ["call" path] (TC_GLOBAL) and ["type" path] (TNOM) refs.
+(define (collect-refs tcv)
+  (define (go acc v)
+    (Ifz (IsApp v) acc
+      (cond
+        ((Eq (Hd v) "TC_GLOBAL")
+          (snoc-new ["call" (tc-global-path v)] acc))
+        ((And (Eq (_0 v) "type") (Eq (_1 v) "TNOM"))
+          (fold-kids go (snoc-new ["type" (ty:tnom-ref v)] acc) v))
+        (else (fold-kids go acc v)))))
+  (go [] tcv))
+
+(define builtin-paths (subject-order foil:default-subject))
+
+;; Compiled declarations live under the compilation root (/boot);
+;; source-facing names (URLs, lore keys, ns grouping) are relative.
+(define comp-root (sut-root foil:default-subject))
+(define (unroot p)
+  (If (And (Ge (Sz p) (Sz comp-root))
+        (Equal comp-root (take (Sz comp-root) p)))
+    (drop (Sz comp-root) p)
+    p))
+
+(define (module-paths sut)
+  (filter (lambda (p) (Nil (includes (Equal p) builtin-paths)))
+    (subject-order sut)))
+
+;; Row of [src-path kind dst-path] over the module's entries.
+;; References to generic members ride /ty-ap-encoded selectors
+;; (bst/size[v]) — normalize dst to the base entry so who-calls
+;; matches the entry pages, and dedupe the instantiation spellings
+;; that collapse together.
+(define (ref-table sut)
+  (define (entry-refs acc path)
+    (define rows
+      (map (lambda (r) [path (_0 r) (resolve-path (_1 r))])
+        (collect-refs (got-entry-tc path sut))))
+    (foldl
+      (lambda (a r) (If (includes (Equal r) a) a (snoc r a)))
+      acc rows))
+  (foldl entry-refs [] (module-paths sut)))
+
+(define (refs-from table path)
+  (filter (lambda (r) (Equal path (_0 r))) table))
+(define (refs-to table path)
+  (filter (lambda (r) (Equal path (_2 r))) table))
+
+
+;;; Entry access ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; -> ["ENT" path tc span ir val lowered?]; shared with the /boot
+;; mirror, so the implementations live in foil.rvr.
+(define entry-parts foil:entry-parts)
+(define ent-tc foil:ent-tc)
+(define ent-span foil:ent-span)
+(define ent-ir foil:ent-ir)
+(define ent-val foil:ent-val)
+(define ent-lowered foil:ent-lowered)
+(define entry-kind foil:entry-kind)
+
+
+;;; Type rendering — molds as linked HTML ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (joined sep kids)
+  (define (go i acc)
+    (If (Ge i (Sz kids)) acc
+      (go (Inc i)
+        (If (Sz acc)
+          (snoc (Ix i kids) (snoc (span no-attrs sep) acc))
+          (snoc (Ix i kids) acc)))))
+  (go 0 []))
+
+;; /ty-ap paths display as applications: bst[nat], bst[row[nat]],
+;; bst[@v]. (print-path on the raw encoding would try to print the
+;; length markers.)
+(define (path-text p)
+  (define parts (ty-ap-decode p))
+  (Ifz parts
+    (cond
+      ((ty-var-path? p) (strcat ["@" (Ix 1 p)]))
+      ((ty-val-path? p)
+        (If (printable-text? (Ix 1 p))
+          (strcat ["'$" (Ix 1 p)])
+          (showNat (Ix 1 p))))
+      (else (print-path p)))
+    (strcat
+      [(path-text (Ix 0 parts)) "["
+       (join-str " " (map path-text (drop 1 parts))) "]"])))
+
+(define (render-ty mod t)
+  (define tag (_1 t))
+  (define (many ts) (map (render-ty mod) ts))
+  (cond
+    ((Eq tag "TNOM")
+      (let ((ref (ty:tnom-ref t)))
+        (entry-link mod (resolve-path ref) (path-text ref))))
+    ((Eq tag "TNAT")
+      (If (_2 t)
+        (span [(cls "ty-const")] (esc (showNat (_2 t))))
+        (span [(cls "ty-base")] "nat")))
+    ((Eq tag "TFUN")
+      (node "span" no-attrs
+        (Weld [(span no-attrs "{")]
+          (Weld (joined " " (many (ty:tfun-args t)))
+            (Weld [(span no-attrs "; ")]
+              [(render-ty mod (ty:tfun-ret t)) (span no-attrs "}")])))))
+    ((Eq tag "TROW")
+      (node "span" no-attrs
+        (Weld
+          (If (ty:trow-cstr t)
+            [(span [(cls "ty-cstr")] (esc (atom-str (ty:trow-cstr t))))]
+            [])
+          (Weld [(span no-attrs "[")]
+            (Weld (joined " " (many (ty:trow-vals t)))
+              [(span no-attrs "]")])))))
+    ((Eq tag "TSUM")
+      (node "span" no-attrs
+        (Weld [(span no-attrs "(")]
+          (Weld (joined " | " (many (ty:tsum-opts t)))
+            [(span no-attrs ")")]))))
+    ((Eq tag "TFAC")
+      (node "span" no-attrs
+        [(span [(cls "ty-face")] (esc (strcat [(atom-str (_2 t)) "="])))
+         (render-ty mod (ty:tfac-val t))]))
+    ((Eq tag "TQUA")
+      (node "span" no-attrs
+        [(span [(cls "ty-face")] (esc (strcat ["@" (atom-str (_2 t)) " "])))
+         (render-ty mod (_3 t))]))
+    ((Eq tag "TVAR")
+      (span [(cls "ty-face")] (esc (strcat ["@" (atom-str (_2 t))]))))
+    ((Eq tag "TPIN")
+      (node "span" no-attrs
+        [(span no-attrs "pin[") (render-ty mod (ty:tpin-val t))
+         (span no-attrs "]")]))
+    ((Eq tag "TSELF")
+      (node "span" no-attrs
+        [(span no-attrs "self[") (render-ty mod (ty:tself-val t))
+         (span no-attrs "]")]))
+    ((Eq tag "TARR")
+      (node "span" no-attrs
+        [(span no-attrs "row[") (render-ty mod (_2 t)) (span no-attrs "]")]))
+    ((Eq tag "TANY") (span [(cls "ty-base")] "any"))
+    ((Eq tag "TBOT") (span [(cls "ty-base")] "bot"))
+    ((Eq tag "TTYP")
+      (node "span" no-attrs
+        [(span [(cls "ty-base")] "type ") (render-ty mod (_2 t))]))
+    (else (span [(cls "ty-base")] (esc "?")))))
+
+
+;; Textual type rendering (the CLI's counterpart to render-ty).
+(define (ty-text t)
+  (define tag (_1 t))
+  (define (many sep ts) (join-str sep (map ty-text ts)))
+  (cond
+    ((Eq tag "TNOM") (path-text (ty:tnom-ref t)))
+    ((Eq tag "TNAT")
+      (cond
+        ((Ifz (_2 t) 1 0) "nat")
+        ((printable-text? (_2 t)) (strcat ["'$" (_2 t)]))
+        (else (showNat (_2 t)))))
+    ((Eq tag "TFUN")
+      (strcat ["{" (many " " (ty:tfun-args t)) "; "
+               (ty-text (ty:tfun-ret t)) "}"]))
+    ((Eq tag "TROW")
+      (strcat [(If (ty:trow-cstr t) (atom-str (ty:trow-cstr t)) "")
+               "[" (many " " (ty:trow-vals t)) "]"]))
+    ((Eq tag "TSUM") (strcat ["(" (many " | " (ty:tsum-opts t)) ")"]))
+    ((Eq tag "TFAC")
+      (strcat [(atom-str (_2 t)) "=" (ty-text (ty:tfac-val t))]))
+    ((Eq tag "TQUA") (strcat ["@" (atom-str (_2 t)) " " (ty-text (_3 t))]))
+    ((Eq tag "TVAR") (strcat ["@" (atom-str (_2 t))]))
+    ((Eq tag "TPIN") (strcat ["pin[" (ty-text (ty:tpin-val t)) "]"]))
+    ((Eq tag "TSELF") (strcat ["self[" (ty-text (ty:tself-val t)) "]"]))
+    ((Eq tag "TARR") (strcat ["row[" (ty-text (_2 t)) "]"]))
+    ((Eq tag "TANY") "any")
+    ((Eq tag "TBOT") "bot")
+    ((Eq tag "TTYP") (strcat ["type " (ty-text (_2 t))]))
+    (else "?")))
+
+;;; PLAN value rendering — one renderer for every stage ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (law-of v) (If (IsPin v) (Unpin v) v))
+(define (law-like? v)
+  (Or (IsLaw v) (And (IsPin v) (IsLaw (Unpin v)))))
+
+;; Plain textual rendering with a depth budget.
+(define (render-plain-d d v)
+  (cond
+    ((IsNat v) (atom-str v))
+    ((law-like? v) (strcat ["#law:" (atom-str (Name (law-of v)))]))
+    ((IsPin v) (strcat ["#pin(" (render-plain-d (Dec d) (Unpin v)) ")"]))
+    ((Ifz d 1 0) "...")
+    (else
+      (strcat
+        ["(" (render-plain-d (Dec d) (Hd v)) " "
+         (join-str " "
+           (map (render-plain-d (Dec d)) (gen (Sz v) (lambda (i) (Ix i v)))))
+         ")"]))))
+
+(define (render-plain v) (render-plain-d 5 v))
+
+;;; Diagnostic rendering — pretty compiler errors for the terminal ;;;;;;;;;;;;;;
+
+(define diag-nl (strcat [10]))
+
+(define (ty-node? v)
+  (And (IsApp v) (And (Gt (Sz v) 1) (Eq "type" (Ix 0 v)))))
+
+;; The head tag of an error payload: apps carry it in Hd; rows have a
+;; zero head, their tag sits at Ix 0.
+(define (diag-tag v)
+  (And (IsApp v)
+    (If (And (IsNat (Hd v)) (Hd v))
+      (Hd v)
+      (And (Gt (Sz v) 0) (Ix 0 v)))))
+
+;; "at" blurbs from elab/sast errors: ["line" l "col" c] or a marker.
+(define (at-text blurb)
+  (If (IsApp blurb)
+    (strcat ["line " (showNat (Ix 1 blurb)) ", col " (showNat (Ix 3 blurb))])
+    "unknown location"))
+
+;; One payload value, prettily: types and tagged paths decode, rows
+;; recurse shallowly, atoms print as themselves.
+(define (diag-val v)
+  (cond
+    ((ty-node? v) (ty-text v))
+    ((And (IsApp v) (And (Eq 2 (Sz v)) (Eq "path" (Ix 0 v))))
+      (path-text (Ix 1 v)))
+    ((IsNat v) (atom-str v))
+    (else
+      (strcat
+        ["(" (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+         ")"]))))
+
+;; A message that may be a bare string or a row of message parts.
+(define (diag-flat v)
+  (If (And (IsApp v) (Nil (ty-node? v)))
+    (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+    (diag-val v)))
+
+;; Details shaped as label/value pairs get an aligned line each;
+;; anything else renders on a single line.  0 means "no detail".
+(define (detail-lines detail)
+  (define (labels? v)
+    (Ifz (Sz v) 1
+      (And (Gt (Sz v) 1)
+        (And (IsNat (_0 v)) (labels? (drop 2 v))))))
+  (define (pair-lines v)
+    (Ifz (Sz v) []
+      (cons (strcat ["  " (atom-str (_0 v)) ": " (diag-val (_1 v))])
+        (pair-lines (drop 2 v)))))
+  (cond
+    ((Ifz detail 1 0) [])
+    ((And (IsApp detail) (labels? detail)) (pair-lines detail))
+    (else [(strcat ["  " (diag-flat detail)])])))
+
+;; Module-pass diagnostics: ["in-decl" name msg blurb].  The msg may
+;; itself be a located error payload (per-decl parse recovery); then
+;; its own message and location win.
+(define (in-decl-line d)
+  (define msg (Ix 2 d))
+  (define tag (diag-tag msg))
+  (If (Or (Eq tag "foil-sast-error") (Eq tag "foil-elab-error"))
+    (strcat ["  in " (path-text (Ix 1 d)) " (" (at-text (Ix 1 (Ix 2 msg)))
+             "): " (diag-flat (Ix 1 msg))])
+    (strcat ["  in " (path-text (Ix 1 d)) " (" (at-text (Ix 3 d)) "): "
+             (diag-flat msg)])))
+
+;; Pretty lines for a compiler error payload; anything unrecognized
+;; falls back to the plain structural rendering.
+(define (diag-lines e)
+  (define tag (diag-tag e))
+  (cond
+    ((Eq tag "foil-elab-error")
+      (Weld
+        [(diag-flat (Ix 1 e))
+         (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])]
+        (detail-lines (Ix 3 e))))
+    ((Eq tag "foil-sast-error")
+      [(diag-flat (Ix 1 e))
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-import-cycle")
+      [(strcat ["import cycle: module " (diag-val (Ix 1 (Ix 1 e)))
+                " is already being imported"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-import-collision")
+      [(strcat ["import collision: " (path-text (Ix 1 (Ix 1 e)))
+                " is declared more than once"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-duplicate-decl")
+      [(strcat ["duplicate declaration: " (path-text (Ix 1 (Ix 1 e)))
+                " is declared more than once"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-type-wf")
+      (cons "types are not well-formed" (map in-decl-line (Ix 1 e))))
+    ((Eq tag "foil-unsupported")
+      (cons "unsupported syntax" (map in-decl-line (Ix 1 e))))
+    ;; Per-decl elaboration failures: [[name err] ...], every failed
+    ;; decl of the module at once.
+    ((Eq tag "foil-elab-errors")
+      (cons "the module does not elaborate"
+        (foldl
+          (lambda (acc d)
+            (Weld acc
+              (cons (strcat ["  in " (path-text (Ix 0 d)) ":"])
+                (map (strWeld "    ") (diag-lines (Ix 1 d))))))
+          []
+          (Ix 1 e))))
+    ((Eq tag "foil-in-module")
+      (cons (strcat ["in module " (atom-str (Ix 1 e)) ":"])
+        (map (strWeld "  ") (diag-lines (Ix 2 e)))))
+    (else [(render-plain e)])))
+
+(define (diag-text e) (join-str diag-nl (diag-lines e)))
+
+;; Decompile a law body back to readable form: 0=self, 1..a=args
+;; (a b c ...), a+i = let refs (x1 x2 ...), (0 x) quotes, (0 f x) apps.
+(define (render-law-body name arity nlets body)
+  (define maxref (Add arity nlets))
+  (define (ref-name r)
+    (cond
+      ((Eq r 0) (atom-str name))
+      ((Le r arity) (strcat [(Add 96 r)]))
+      (else (strcat ["x" (showNat (Sub r arity))]))))
+  (define (go b)
+    (cond
+      ((And (IsNat b) (Le b maxref)) (ref-name b))
+      ((IsNat b) (atom-str b))
+      ((And (IsApp b) (And (Eq (Hd b) 0) (Eq 1 (Sz b))))
+        (render-plain (_0 b)))
+      ((And (IsApp b) (Eq (Hd b) 0))
+        (strcat
+          ["(" (join-str " " (map go (gen (Sz b) (lambda (i) (Ix i b))))) ")"]))
+      (else (render-plain b))))
+  (go body))
+
+(define (law-lets body acc)
+  (If (And (IsApp body) (And (Eq (Hd body) 1) (Eq 2 (Sz body))))
+    (law-lets (_1 body) (snoc (_0 body) acc))
+    [acc body]))
+
+(define (render-law v)
+  (define l (law-of v))
+  (define a (Arity l))
+  (define parts (law-lets (Body l) []))
+  (define lets (_0 parts))
+  (define inner (_1 parts))
+  (define nlets (Sz lets))
+  (define args
+    (join-str " " (gen a (lambda (i) (strcat [(Add 97 i)])))))
+  (define let-strs
+    (gen nlets
+      (lambda (i)
+        (strcat ["  x" (showNat (Inc i)) " := "
+                 (render-law-body (Name l) a nlets (Ix i lets)) 10]))))
+  (strcat
+    [(If (IsPin v) "#pin " "") "law " (atom-str (Name l)) "(" args ")" 10
+     (strcat let-strs)
+     "  " (render-law-body (Name l) a nlets inner)]))
+
+;; Structural fold-out tree for TCs, IR, and arbitrary values, with a
+;; depth/width budget so panels stay small.
+(define (render-tree-d d open v)
+  (cond
+    ((IsNat v) (span [(cls "atom")] (esc (atom-str v))))
+    ((law-like? v)
+      (pre [(cls "law")] (esc (render-law v))))
+    ((Ifz d 1 0)
+      (span [(cls "atom muted")] (esc (render-plain-d 2 v))))
+    ((IsPin v)
+      (fold-out 0 [(span [(cls "atom")] "#pin")]
+        [(render-tree-d (Dec d) 0 (Unpin v))]))
+    (else
+      (fold-out open
+        [(span [(cls "atom")]
+           (esc (If (IsNat (Hd v)) (atom-str (Hd v)) "(...)")))]
+        [(div [(cls "tree-kids")]
+           (gen (min 24 (Sz v))
+             (lambda (i) (render-tree-d (Dec d) 0 (Ix i v)))))]))))
+
+(define (render-tree open v) (render-tree-d 7 open v))
+
+
+;;; Image bundles and forge state ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define forge-mods ["bst" "demo" "axal" "mapx" "mapuser"])
+
+(define (compile-forced mod)
+  (define s (foil:compile-mod-info foil:default-subject mod))
+  (DeepSeq s s))
+
+(define (compile-forced-cached cache mod)
+  (define s (foil:compile-mod-info-cached cache foil:default-subject mod))
+  (DeepSeq s s))
+
+;; Transitive import closure of a module, by parsing import runes.
+(define (import-closure mod)
+  (define (go seen pend)
+    (Ifz (Sz pend)
+      seen
+      (let* ((name (_0 pend))
+             (rest (drop 1 pend)))
+        (If (includes (Eq name) seen)
+          (go seen rest)
+          (go (snoc name seen) (Weld rest (foil:module-imports name)))))))
+  (go [] (foil:module-imports mod)))
+
+;; Byte snapshot of everything a module's compile read besides its own
+;; source; a bundle is stale when any of these change on disk.
+(define (import-snapshot mod)
+  (map
+    (lambda (n)
+      [n (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0)])
+    (import-closure mod)))
+
+;; load-bundle with a shared compile cache: [cache' bundle].  The
+;; cache is compile-mod-go's [[name subject] ..] — each imported
+;; module's compiled subject — so sibling loads sharing an import
+;; chain walk it once.
+(define (load-bundle-cached cache mod)
+  (define src (read-text-file (strcat ["foil/" mod ".foil"])))
+  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
+  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+  (define cr (Try (compile-forced-cached cache) mod))
+  (define cache2 (If (Eq 1 (Hd cr)) cache (_0 (_0 cr))))
+  (define compiled (If (Eq 1 (Hd cr)) cr [(_1 (_0 cr))]))
+  (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  (define own-keys
+    (If (Eq 1 (Hd compiled))
+      []
+      (let ((sut (_0 (_0 compiled))))
+        (filter
+          (lambda (k)
+            (Ifz imported 1 (Nil (includes (Equal k) imported))))
+          (foil:module-decl-keys sut)))))
+  (define refs
+    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 (_0 compiled)))))
+  [cache2
+   ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys]])
+
+(define (load-bundle mod)
+  (define src (read-text-file (strcat ["foil/" mod ".foil"])))
+  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
+  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+  (define compiled (Try compile-forced mod))
+  (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  (define own-keys
+    (If (Eq 1 (Hd compiled))
+      []
+      (let ((sut (_0 (_0 compiled))))
+        (filter
+          (lambda (k)
+            (Ifz imported 1 (Nil (includes (Equal k) imported))))
+          (foil:module-decl-keys sut)))))
+  (define refs
+    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 (_0 compiled)))))
+  ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys])
+
+(define bundle-mod (Ix 1))
+(define bundle-src (Ix 2))
+(define bundle-lore (Ix 3))
+(define bundle-compiled (Ix 4))
+(define bundle-refs (Ix 5))
+(define bundle-imports (Ix 6))
+(define bundle-own-keys (Ix 7))
+(define (bundle-ok? b) (Eq 0 (Hd (bundle-compiled b))))
+(define (bundle-sut b) (_0 (_0 (bundle-compiled b))))
+(define (bundle-err b) (_0 (bundle-compiled b)))
+
+(define empty-state ["ST" [] [] 0])
+(define st-bundles (Ix 1))
+(define st-evals (Ix 2))
+(define st-cache (Ix 3))
+
+;;; The persistent compile cache: st-cache holds [[name snapshot
+;;; subject decl-keys imported-keys] ..] — every module ever
+;;; compiled, with the byte snapshot (own source + import closure) it
+;;; was compiled against.  Prune drops entries whose sources moved;
+;;; strip yields the [[name subject decl-keys imported-keys] ..]
+;;; shape compile-mod-go threads; wrap re-stamps fresh snapshots for
+;;; persisting.  Both read/parse each file once per call, shared
+;;; across entries — per-entry recomputation made validating an
+;;; N-module chain O(N^2) file reads.
+
+(define (try-read-mod n)
+  (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0))
+
+;; An entry is fresh iff its own bytes and every file in its STORED
+;; closure snapshot are unchanged.  Equivalent to recomputing the
+;; snapshot: unchanged own source implies an unchanged import list,
+;; and recursively (every closure file checked) an unchanged closure.
+(define (cache-prune entries)
+  (define names
+    (foldl
+      (lambda (acc e)
+        (foldl (lambda (a p) (snoc-new (_0 p) a))
+          (snoc-new (_0 e) acc)
+          (_1 (_1 e))))
+      [] entries))
+  (define table (map (lambda (n) [n (try-read-mod n)]) names))
+  (define (cur n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) table)))
+      (Ifz h 0 (_1 (_0 h)))))
+  (define (fresh? e)
+    (And (Equal (_0 (_1 e)) (cur (_0 e)))
+      (Nil (includes (lambda (p) (Nil (Equal (_1 p) (cur (_0 p))))) (_1 (_1 e))))))
+  (filter fresh? entries))
+
+(define (cache-strip entries)
+  (map (lambda (e) [(_0 e) (_2 e) (_3 e) (_4 e)]) entries))
+
+(define (cache-wrap cache)
+  (define names (map (Ix 0) cache))
+  (define imps (map (lambda (n) [n (foil:module-imports n)]) names))
+  (define bytes (map (lambda (n) [n (try-read-mod n)]) names))
+  (define (imports-of n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) imps)))
+      (Ifz h (foil:module-imports n) (_1 (_0 h)))))
+  (define (bytes-of n)
+    (let ((h (find (lambda (r) (Eq n (_0 r))) bytes)))
+      (Ifz h (try-read-mod n) (_1 (_0 h)))))
+  ;; import-closure's BFS, imports from the shared table (every
+  ;; closure member of a cached module is itself cached)
+  (define (closure mod)
+    (define (go seen pend)
+      (Ifz (Sz pend)
+        seen
+        (let* ((name (_0 pend))
+               (rest (drop 1 pend)))
+          (If (includes (Eq name) seen)
+            (go seen rest)
+            (go (snoc name seen) (Weld rest (imports-of name)))))))
+    (go [] (imports-of mod)))
+  (define (snap-of mod)
+    [(bytes-of mod) (map (lambda (n) [n (bytes-of n)]) (closure mod))])
+  (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e)]) cache))
+
+(define (st-live-cache st)
+  (cache-strip (cache-prune (st-cache st))))
+
+(define (set-st-cache cache st)
+  (snap 3 (lambda (z) cache) st))
+
+(define (state-bundle st mod)
+  (define hit (find (lambda (b) (Eq mod (bundle-mod b))) (st-bundles st)))
+  (Ifz hit
+    (let ((cb (load-bundle-cached (st-live-cache st) mod)))
+      [(set-st-cache (cache-wrap (_0 cb)) (snap 1 (snoc (_1 cb)) st))
+       (_1 cb)])
+    [st (_0 hit)]))
+
+(define (state-evict st mod)
+  (snap 1 (filter (lambda (b) (Ne mod (bundle-mod b)))) st))
+
+(define (state-log st entry)
+  (snap 2 (lambda (evs) (take (min 8 (Inc (Sz evs))) (Weld [entry] evs))) st))
+
+
+;;; Namespace index ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (browse-roster _)
+  (foldl
+    (lambda (acc mod)
+      (foldl (lambda (seen name) (snoc-new name seen))
+        acc
+        (Weld [mod] (import-closure mod))))
+    []
+    forge-mods))
+
+(define (state-load-all st)
+  (foldl (lambda (acc mod) (_0 (state-bundle acc mod))) st (browse-roster 0)))
+
+(define (path-root key0)
+  (define key (unroot key0))
+  (Ifz (Sz key) "" (Ix 0 key)))
+
+(define builtin-roots
+  (foldl (lambda (acc root) (snoc-new root acc))
+    []
+    (map path-root builtin-paths)))
+
+(define (builtin-root? root)
+  (includes (Eq root) builtin-roots))
+
+(define (ns-key? key)
+  (And (Sz key) (Nil (ty-ap-path? key))))
+
+(define (bundle-ns-rows b)
+  (If (Nil (bundle-ok? b))
+    []
+    (map (lambda (key) [(path-root key) key (bundle-mod b)])
+      (filter ns-key? (bundle-own-keys b)))))
+
+(define (ns-rows st)
+  (foldl (lambda (acc b) (Weld acc (bundle-ns-rows b))) [] (st-bundles st)))
+
+(define (ns-roots rows)
+  (foldl (lambda (acc row) (snoc-new (_0 row) acc)) [] rows))
+
+(define (ns-root-rows rows root)
+  (filter (lambda (row) (Eq root (_0 row))) rows))
+
+(define (ns-root-files rows root)
+  (foldl (lambda (acc row) (snoc-new (_2 row) acc))
+    [] (ns-root-rows rows root)))
+
+(define (bundle-for st mod)
+  (define hit (find (lambda (b) (Eq mod (bundle-mod b))) (st-bundles st)))
+  (Ifz hit 0 (_0 hit)))
+
+(define (broken-bundles st)
+  (filter (lambda (b) (Nil (bundle-ok? b))) (st-bundles st)))
+
+
+;;; Panels ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (diag-pane title err)
+  (div [(cls "diag")]
+    (Weld
+      [(h2 title)]
+      (map (lambda (l) (div no-attrs [(span no-attrs (esc l))]))
+        (diag-lines err)))))
+
+(define (lore-doctests-pane sut lore)
+  (define tests (lore-tests lore))
+  (Ifz (Sz tests) []
+    [(div [(cls "doctests")]
+       (map
+         (lambda (dt)
+           (let ((r (run-doctest sut dt)))
+             (div [(cls (strcat ["doctest dt-" (_0 r)]))
+                   ]
+               [(chip (strcat ["dt-" (_0 r)]) (_0 r))
+                (span [(cls "mono")] (esc (_1 r)))
+                (If (Eq "fail" (_0 r))
+                  (span [(cls "mono dt-detail")]
+                    (esc (strcat ["got " (render-plain (_2 r))
+                                  "  want " (render-plain (_3 r))])))
+                  (span no-attrs ""))])))
+         tests))]))
+
+(define (linkify-doc-line mod line)
+  (define words (split-ch " " line))
+  (node "div" [(cls "doc-line")]
+    (joined " "
+      (map
+        (lambda (w)
+          (If (And (Gt (Bytes w) 1) (Eq "/" (Load8 0 w)))
+            (entry-link mod (drop 1 (split-ch "/" w)) w)
+            (span no-attrs (esc w))))
+        words))))
+
+(define (lore-pane mod sut lore)
+  (Ifz lore []
+    [(div [(cls "lore")]
+       (Weld
+         (map (linkify-doc-line mod) (lore-body (_0 lore)))
+         (lore-doctests-pane sut (_0 lore))))]))
+
+(define (refs-pane mod refs path)
+  (define out (refs-from refs path))
+  (define in (refs-to refs path))
+  (define (ref-row r)
+    (div [(cls "ref-row")]
+      [(chip (_1 r) (_1 r))
+       (entry-link mod (_0 r) (print-path (_0 r)))
+       (span no-attrs " → ")
+       (entry-link mod (_2 r) (print-path (_2 r)))]))
+  (div [(cls "refs")]
+    [(fold-out 1 [(span no-attrs (strcat ["references (" (showNat (Sz out)) ")"]))]
+       [(div no-attrs (map ref-row out))])
+     (fold-out 1 [(span no-attrs (strcat ["referenced by (" (showNat (Sz in)) ")"]))]
+       [(div no-attrs (map ref-row in))])]))
+
+(define source-slice foil:source-slice)
+
+(define (entry-panel st mod path)
+  (define r[st1 b] (state-bundle st mod))
+  (If (Nil (bundle-ok? b))
+    [st1 (diag-pane (strcat [mod " does not compile"]) (bundle-err b))]
+    (let ((sut (bundle-sut b)))
+      ;; URLs carry the relative name; subject entries live rooted.
+      (let ((cpath (canon-path path sut)))
+      (let ((e (entry-parts sut cpath)))
+        [st1
+         (div [(cls "entry")]
+           [(div [(cls "entry-head")]
+              [(span [(cls "path mono")] (esc (print-path path)))
+               (chip "kind" (entry-kind sut cpath (ent-tc e)))
+               (span [(cls "muted")]
+                 (esc (strcat ["line " (showNat (Ix 0 (ent-span e)))])))])
+            (div [(cls "ty-render")]
+              [(render-ty mod (tc-ty (ent-tc e)))])
+            (node "div" no-attrs (lore-pane mod sut (lore-for (bundle-lore b) path)))
+            (refs-pane mod (bundle-refs b) cpath)
+            (fold-out 0 [(span no-attrs "source")]
+              [(pre [(cls "mono src")] (esc (source-slice (bundle-src b) (ent-span e))))])
+            (fold-out 0 [(span no-attrs "typed core (TC)")]
+              [(render-tree 0 (ent-tc e))])
+            (If (ent-lowered e)
+              (fold-out 0 [(span no-attrs "lowered IR")]
+                [(render-tree 0 (ent-ir e))])
+              (span no-attrs ""))
+            (If (ent-lowered e)
+              (fold-out 1 [(span no-attrs "compiled value")]
+                [(If (law-like? (ent-val e))
+                   (pre [(cls "law")] (esc (render-law (ent-val e))))
+                   (pre [(cls "mono")] (esc (render-plain (ent-val e)))))])
+              (span no-attrs ""))])])))))
+
+(define (entry-row mod sut lore path)
+  (define rpath (unroot path))
+  (define tc (got-entry-tc path sut))
+  (define l (lore-for lore rpath))
+  (div [(cls "entry-row")]
+    [(entry-link mod rpath (print-path rpath))
+     (chip "kind" (entry-kind sut path tc))
+     (If l
+       (span [(cls "muted")] (esc (lore-head (_0 l))))
+       (span no-attrs ""))]))
+
+(define (editor-pane mod src)
+  (node "form"
+    [(cls "editor") (attr "data-save" (strcat ["/save/" mod]))]
+    [(div [(cls "pane-head")]
+       [(h2 (strcat ["foil/" mod ".foil"]))
+        (leaf "button" [(attr "type" "submit")] "accept")])
+     (leaf "textarea"
+       [(attr "name" "source") (cls "mono srcedit")
+        (attr "spellcheck" "false")]
+       (esc src))]))
+
+(define (module-panel st mod)
+  (define r[st1 b] (state-bundle st mod))
+  (define body
+    (If (bundle-ok? b)
+      (let ((sut (bundle-sut b)))
+        (div [(cls "cols")]
+          [(editor-pane mod (bundle-src b))
+           (div [(cls "browser")]
+             [(div [(cls "entry-list")]
+                (map (entry-row mod sut (bundle-lore b)) (module-paths sut)))
+              (div [(attr "id" "detail") (cls "detail")]
+                [(para no-attrs [(span no-attrs "select an entry")])])])]))
+      (div [(cls "cols")]
+        [(editor-pane mod (bundle-src b))
+         (diag-pane (strcat [mod " does not compile"]) (bundle-err b))])))
+  [st1
+   (div [(cls "modpane")]
+     [(div [(cls "pane-head")]
+        [(h2 (strcat ["module " mod]))
+         (chip (If (bundle-ok? b) "ok" "err")
+               (If (bundle-ok? b)
+                 (strcat [(showNat (Sz (module-paths (bundle-sut b)))) " entries"])
+                 "diagnostics"))])
+      body])])
+
+(define (ns-link root text)
+  (hx-link (strcat ["/ns/" root]) "#main" text))
+
+(define (ns-index-row rows root)
+  (define rrows (ns-root-rows rows root))
+  (define files (ns-root-files rows root))
+  (div [(cls "ns-row")]
+    (Weld
+      [(ns-link root (strcat ["/" root]))
+       (chip "count" (strcat [(showNat (Sz rrows)) " entries"]))]
+      (Weld
+        (If (builtin-root? root) [(chip "builtin" "builtin")] [])
+        (map (lambda (mod) (chip "file" (strcat [mod ".foil"]))) files)))))
+
+(define (broken-note b)
+  (div [(cls "ref-row")]
+    [(chip "err" "broken")
+     (span no-attrs
+       (esc (strcat ["broken bundle: " (bundle-mod b) ".foil does not compile"])))]))
+
+(define (ns-index-panel st)
+  (define st1 (state-load-all st))
+  (define rows (ns-rows st1))
+  (define roots (ns-roots rows))
+  [st1
+   (div [(cls "nspane")]
+     [(div [(cls "pane-head")]
+        [(h2 "namespaces")
+         (chip "count" (strcat [(showNat (Sz roots)) " roots"]))])
+      (div [(cls "entry-list")]
+        (map (ns-index-row rows) roots))
+      (div [(cls "diag")]
+        (Weld [(h2 "broken bundles")]
+          (map broken-note (broken-bundles st1))))])])
+
+(define (entry-main-link mod path text)
+  (hx-link (entry-url mod path) "#main" text))
+
+(define (ns-entry-row st row[root key mod])
+  (define b (bundle-for st mod))
+  (define sut (bundle-sut b))
+  (define rkey (unroot key))
+  (define tc (got-entry-tc key sut))
+  (define l (lore-for (bundle-lore b) rkey))
+  (div [(cls "entry-row")]
+    [(entry-main-link mod rkey (path-text rkey))
+     (chip "kind" (entry-kind sut key tc))
+     (chip "file" (strcat ["defined in " mod ".foil"]))
+     (If l
+       (span [(cls "muted")] (esc (lore-head (_0 l))))
+       (span no-attrs ""))]))
+
+(define (ns-root-panel st root)
+  (define st1 (state-load-all st))
+  (define rows (ns-root-rows (ns-rows st1) root))
+  [st1
+   (div [(cls "nspane")]
+     [(div [(cls "pane-head")]
+        [(h2 (strcat ["/" root]))
+         (chip "count" (strcat [(showNat (Sz rows)) " entries"]))
+         (If (builtin-root? root) (chip "builtin" "builtin") (span no-attrs ""))])
+      (Ifz (Sz rows)
+        (para [(cls "muted")] [(span no-attrs "no entries")])
+        (div [(cls "entry-list")] (map (ns-entry-row st1) rows)))])])
+
+(define (transcript-pane evs)
+  (div [(cls "transcript")]
+    (map
+      (lambda (e)
+        (div [(cls "xcript-row")]
+          [(span [(cls "mono muted")] (esc (_0 e)))
+           (span [(cls "mono")] (esc (_1 e)))]))
+      evs)))
+
+(define (eval-panel st mod text)
+  (define r[st1 b] (state-bundle st mod))
+  (If (Nil (bundle-ok? b))
+    [st1 (diag-pane (strcat [mod " does not compile"]) (bundle-err b))]
+    (let ((res (eval-text (bundle-sut b) text)))
+      (If (Eq 1 (Hd res))
+        [(state-log st1 [text "error"])
+         (div [(cls "evalpane")]
+           [(diag-pane "evaluation error" (_0 res))
+            (transcript-pane (st-evals st1))])]
+        (let ((val (_0 (_0 res))))
+          (let ((st2 (state-log st1 [text (render-plain val)])))
+            [st2
+             (div [(cls "evalpane")]
+               [(div [(cls "pane-head")]
+                  [(h2 "result")
+                   (span [(cls "ty-render")]
+                     "")])
+                (div [(cls "ty-render")]
+                  [(span [(cls "muted")] "type ")
+                   (render-ty mod (_1 (_0 res)))])
+                (If (law-like? val)
+                  (pre [(cls "law")] (esc (render-law val)))
+                  (pre [(cls "mono result")] (esc (render-plain val))))
+                (render-tree 0 val)
+                (transcript-pane (st-evals st2))])]))))))
+
+;; Structural changeset: compare compiled entry values by Equal.
+(define (changeset-panel old new)
+  (define (val-of b path)
+    (let ((e (entry-parts (bundle-sut b) path)))
+      (If (ent-lowered e) (ent-val e) (ent-tc e))))
+  (define old-paths (If (bundle-ok? old) (module-paths (bundle-sut old)) []))
+  (define new-paths (If (bundle-ok? new) (module-paths (bundle-sut new)) []))
+  (define (in? p ps) (includes (Equal p) ps))
+  (define added (filter (lambda (p) (Nil (in? p old-paths))) new-paths))
+  (define removed (filter (lambda (p) (Nil (in? p new-paths))) old-paths))
+  (define kept (filter (lambda (p) (in? p old-paths)) new-paths))
+  (define changed
+    (filter (lambda (p) (Nil (Equal (val-of old p) (val-of new p)))) kept))
+  (define (path-rows kind ps)
+    (map (lambda (p)
+           (div [(cls "ref-row")]
+             [(chip kind kind) (span [(cls "mono")] (esc (print-path p)))]))
+      ps))
+  (div [(cls "changeset")]
+    [(h2 "changeset")
+     (para no-attrs
+       [(span no-attrs
+          (esc (strcat [(showNat (Sz changed)) " changed, "
+                        (showNat (Sz added)) " added, "
+                        (showNat (Sz removed)) " removed, "
+                        (showNat (Sub (Sz kept) (Sz changed))) " unchanged"])))])
+     (node "div" no-attrs
+       (Weld (path-rows "changed" changed)
+         (Weld (path-rows "added" added) (path-rows "removed" removed))))]))
+
+
+;;; Shell ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define forge-css "
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background:#101418; color:#cfd8dc; font-family: monospace; font-size:13px; }
+a { color:#7fd4c1; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.app { display:grid; grid-template-columns: 230px 1fr; height:100vh; }
+.side { border-right:1px solid #2a333b; padding:10px; overflow:auto; background:#0c1013; }
+.side h1 { font-size:14px; color:#f0b429; margin-bottom:10px; }
+.side .mods { display:grid; gap:4px; margin-bottom:14px; }
+.main { overflow:auto; padding:12px; }
+.pane-head { display:flex; gap:10px; align-items:baseline; margin-bottom:8px; }
+h2 { font-size:13px; color:#f0b429; font-weight:normal; }
+.chip { border:1px solid #2a333b; padding:1px 6px; font-size:11px; color:#8fa1ab; }
+.chip.ok, .chip.dt-pass { color:#58d68d; border-color:#2c5e44; }
+.chip.err, .chip.dt-fail, .chip.dt-error, .chip.dt-broken { color:#e07b6a; border-color:#6e352d; }
+.chip.call { color:#7fd4c1; }
+.chip.type { color:#c39bd3; }
+.cols { display:grid; grid-template-columns: minmax(320px,0.9fr) minmax(380px,1.1fr); gap:10px; }
+.editor { display:grid; grid-template-rows:auto 1fr; gap:6px; }
+.editor textarea { width:100%; min-height:78vh; background:#0c1013; color:#cfd8dc; border:1px solid #2a333b; padding:8px; font-size:12.5px; line-height:1.4; }
+.editor button { background:#182028; color:#f0b429; border:1px solid #2a333b; padding:3px 12px; cursor:pointer; }
+.browser { display:grid; grid-template-rows:auto 1fr; gap:8px; }
+.entry-list { display:grid; gap:2px; max-height:34vh; overflow:auto; border:1px solid #2a333b; padding:4px; }
+.entry-row { display:flex; gap:8px; align-items:baseline; padding:2px 4px; }
+.entry-row:hover { background:#161c22; }
+.ns-row { display:flex; gap:8px; align-items:baseline; padding:3px 4px; }
+.ns-row:hover { background:#161c22; }
+.nspane .entry-list { max-height:none; }
+.detail { overflow:auto; border:1px solid #2a333b; padding:8px; min-height:40vh; }
+.entry-head { display:flex; gap:10px; align-items:baseline; margin-bottom:6px; }
+.path { color:#f0b429; font-size:14px; }
+.muted { color:#66757f; }
+.mono { font-family:monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.ty-render { border:1px solid #2a5e50; background:#0e1a16; padding:6px 8px; margin:6px 0; line-height:1.5; }
+.ty-const { color:#f0b429; } .ty-base { color:#8fa1ab; } .ty-cstr { color:#c39bd3; } .ty-face { color:#88b0c9; }
+.lore { border-left:2px solid #f0b429; padding:6px 8px; margin:6px 0; color:#b8c4ca; }
+.doc-line { line-height:1.5; }
+.doctests { display:grid; gap:3px; margin-top:6px; }
+.doctest { display:flex; gap:8px; align-items:baseline; }
+.dt-detail { color:#e07b6a; }
+details { border:1px solid #2a333b; margin:6px 0; }
+details > summary { cursor:pointer; padding:4px 8px; color:#8fa1ab; background:#12181d; }
+details[open] > summary { color:#f0b429; }
+.tree-kids { display:grid; gap:2px; padding:2px 0 2px 16px; border-left:1px solid #1d252c; }
+.atom { color:#cfd8dc; padding-left:8px; }
+.law { background:#0e1a16; border:1px solid #2a5e50; padding:8px; margin:4px 8px; white-space:pre-wrap; }
+.src { background:#12181d; padding:8px; margin:4px 8px; }
+.refs { margin:6px 0; }
+.ref-row { display:flex; gap:8px; padding:2px 8px; align-items:baseline; }
+.workspace textarea { width:100%; min-height:90px; background:#0c1013; color:#cfd8dc; border:1px solid #2a333b; padding:6px; }
+.workspace button { background:#182028; color:#f0b429; border:1px solid #2a333b; padding:3px 12px; margin-top:4px; cursor:pointer; }
+.workspace input { width:100%; background:#0c1013; color:#8fa1ab; border:1px solid #2a333b; padding:3px 6px; margin-bottom:4px; }
+.transcript { margin-top:10px; display:grid; gap:4px; }
+.xcript-row { display:grid; border-top:1px solid #1d252c; padding:3px 0; }
+.diag { border:1px solid #6e352d; padding:8px; }
+.diag h2 { color:#e07b6a; }
+.result { font-size:14px; color:#58d68d; }
+.changeset { margin-bottom:10px; border:1px solid #2a5e50; padding:8px; }
+.evalpane, .modpane { display:grid; }
+")
+
+(define forge-js "
+async function swap(url, target, opts) {
+  const el = document.querySelector(target);
+  if (!el) return;
+  const res = await fetch(url, opts);
+  el.innerHTML = await res.text();
+}
+document.addEventListener('click', ev => {
+  const a = ev.target.closest('[hx-get]');
+  if (!a) return;
+  ev.preventDefault();
+  swap(a.getAttribute('hx-get'), a.getAttribute('hx-target') || '#main');
+});
+document.addEventListener('submit', ev => {
+  const f = ev.target;
+  ev.preventDefault();
+  if (f.dataset.save) {
+    swap(f.dataset.save, '#main',
+      {method:'POST', body: f.querySelector('[name=source]').value});
+  } else if (f.dataset.eval) {
+    const mod = f.querySelector('[name=mod]').value || 'bst';
+    swap('/eval/' + mod, '#main',
+      {method:'POST', body: f.querySelector('[name=expr]').value});
+  }
+});
+document.addEventListener('DOMContentLoaded', () => swap('/ns', '#main'));
+")
+
+(define (mod-link mod)
+  (hx-link (strcat ["/mod/" mod]) "#main" mod))
+
+(define (workspace-form _)
+  (node "form" [(cls "workspace") (attr "data-eval" "1")]
+    [(h2 "workspace")
+     (node "input" [(attr "name" "mod") (attr "value" "bst")] [])
+     (leaf "textarea" [(attr "name" "expr") (attr "spellcheck" "false")]
+       "(bst/got[nat] 2 0 (bst/duo[nat] 1 10 2 20))")
+     (leaf "button" [(attr "type" "submit")] "do it")]))
+
+(define (welcome _)
+  (div no-attrs
+    [(h2 "the forge")
+     (para [(cls "muted")]
+       [(span no-attrs "The image serving this page is the compiler.  ")
+        (span no-attrs "Pick a module; every pane is computed from the live subject: ")
+        (span no-attrs "types, references, docs, doctests, IR, laws, values.")])]))
+
+(define (shell _)
+  (node "html" no-attrs
+    [(node "head" no-attrs
+       [(node "meta" [(attr "charset" "utf-8")] [])
+        (node "style" no-attrs [forge-css])
+        (node "script" no-attrs [forge-js])])
+     (node "body" no-attrs
+       [(div [(cls "app")]
+          [(div [(cls "side")]
+             [(leaf "h1" no-attrs "forge")
+              (div [(cls "mods")] [(hx-link "/ns" "#main" "namespaces")])
+              (div [(cls "mods")] (map mod-link forge-mods))
+              (workspace-form 0)])
+           (div [(attr "id" "main") (cls "main")]
+             [(welcome 0)])])])]))
+
+
+;;; HTTP plumbing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define crlf (strWeld 13 10))
+
+(define (http-response body)
+  (lstrcat
+    ~["HTTP/1.0 200 OK" crlf
+      "Content-Type: text/html; charset=utf-8" crlf crlf
+      body]))
+
+(define (html-response tree)
+  (http-response (milton:milton-print tree)))
+
+(define (request-body-start input i)
+  (If (Lt (Add i 3) (Bytes input))
+    (If (And (Eq 13 (Load8 i input))
+          (And (Eq 10 (Load8 (Inc i) input))
+            (And (Eq 13 (Load8 (Add i 2) input))
+                 (Eq 10 (Load8 (Add i 3) input)))))
+      (Add i 4)
+      (request-body-start input (Inc i)))
+    0))
+
+(define (request-body input)
+  (define start (request-body-start input 0))
+  (If start (str-drop start input) ""))
+
+(define (request-target input)
+  (define parsed (Try milton:parse-http-request input))
+  (If (Nil (Hd parsed)) (Ix1 (Ix0 parsed)) "/"))
+
+(define (request-method input)
+  (define parsed (Try milton:parse-http-request input))
+  (If (Nil (Hd parsed)) (Ix0 (Ix0 parsed)) "GET"))
+
+
+;;; Routing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (undot s) (split-ch "." s))
+
+(define (route st method target body)
+  (define r
+    (cond
+      ((Or (Eq "/" target) (Eq "" target))
+        [st (html-response (shell 0))])
+      ((Eq "/ns" target)
+        (let ((rr (ns-index-panel st)))
+          [(_0 rr) (html-response (_1 rr))]))
+      ((str-prefix? "/ns/" target)
+        (let ((rr (ns-root-panel st (str-drop 4 target))))
+          [(_0 rr) (html-response (_1 rr))]))
+      ((str-prefix? "/mod/" target)
+        (let ((rr (module-panel st (str-drop 5 target))))
+          [(_0 rr) (html-response (_1 rr))]))
+      ((str-prefix? "/entry/" target)
+        (let ((segs (split-ch "/" (str-drop 7 target))))
+          (let ((rr (entry-panel st (Ix 0 segs) (undot (Ix 1 segs)))))
+            [(_0 rr) (html-response (_1 rr))])))
+      ((And (Eq "POST" method) (str-prefix? "/eval/" target))
+        (let ((rr (eval-panel st (str-drop 6 target) body)))
+          [(_0 rr) (html-response (_1 rr))]))
+      ((And (Eq "POST" method) (str-prefix? "/save/" target))
+        (let ((mod (str-drop 6 target)))
+          (let ((old (_1 (state-bundle st mod))))
+            ;; Force the old bundle *before* the write — it reads the
+            ;; source file lazily, and the diff must see the old image.
+            (Seq (DeepSeq old old)
+              (Seq
+                (write-text-file (strcat ["foil/" mod ".foil"]) body)
+                (let ((st1 (state-evict st mod)))
+                  (let ((rr (state-bundle st1 mod)))
+                    (let ((mp (module-panel (_0 rr) mod)))
+                      [(_0 mp)
+                       (html-response
+                         (div no-attrs
+                           [(changeset-panel old (_1 rr))
+                            (_1 mp)]))]))))))))
+      (else
+        [st (html-response
+              (div [(cls "diag")] [(h2 "not found") (pre no-attrs (esc target))]))])))
+  (DeepSeq (_1 r) r))
+
+
+;;; Server ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Sequential accept loop; the image state threads functionally.  The
+;; route runs under Try so a crash renders as a pane instead of killing
+;; the environment.
+(define (handle st conn)
+  (define input (Read conn 65536))
+  (print ("read" input))
+  (define tried
+    (Try (route st (request-method input) (request-target input))
+         (request-body input)))
+  (define r
+    (If (Eq 1 (Hd tried))
+      [st (html-response
+            (div [(cls "diag")]
+              [(h2 "pane crashed — the forge survives")
+               (render-tree 1 (_0 tried))]))]
+      (_0 tried)))
+  (Seq (Write conn (strWeld (_1 r) 1))
+    (Seq (CloseFd conn)
+      (_0 r))))
+
+(define (serve-loop listen st)
+  (define conn (Accept listen))
+  (define new-st (handle st conn))
+  (Seq new-st
+    (serve-loop listen new-st)))
+
+(define (run-forge port)
+  (define listen (Listen port))
+  (Seq listen
+    (Seq (print ("forge listening on port" port))
+      (serve-loop listen empty-state))))
+
+;;; Parallel warmup ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Compile every module's bundle in its own actor and boot with the
+;;; state pre-seeded, instead of compiling lazily on first visit.
+;;; Needs enki with the actor-request fix (merged July 2026;
+;;; doc/enki-actor-report.md); older runtimes abort on Spawn, so the
+;;; default boot stays sequential.
+
+(define (warm-state-par mods)
+  ["ST" (async:async-all-deep load-bundle mods) [] 0])
+
+(define (run-forge-par port)
+  (define listen (Listen port))
+  (define st (warm-state-par forge-mods))
+  (Seq listen
+    (Seq (DeepSeq st st)
+      (Seq (print ("forge listening on port" port "— bundles warm"))
+        (serve-loop listen st)))))
