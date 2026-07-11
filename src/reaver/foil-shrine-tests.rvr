@@ -49,6 +49,52 @@
 (define (grades nt) [(_0 nt) (_1 nt) (_2 nt)])
 
 
+;;; y is a frontier care: hollow intermediates pass through.  The ;;;;;;;;;;;;;;;;;;
+;;; checks run inside ONE compiled function: the same expressions
+;;; evaluated as top-level repl asserts deterministically hit the
+;;; known session-leak interpreter corruption (see x/test's note and
+;;; doc/wisp-session-leak.md) — and the flag row keeps the giant
+;;; intermediates out of the journal.
+
+(define (frontier-checks z)
+  (define kfoo ("ts" "foo"))
+  (define kbar ("ts" "bar"))
+  (define kbaz ("ts" "baz"))
+  (define rf1 (sstep (aput [kfoo] ("/boot/note/make" 10) (anew "none")) 0 0 (snew 0)))
+  (define rf2 (sstep (aput [kfoo kbar kbaz] ("/boot/note/make" 11) (anew "none")) 0 0 (_0 rf1)))
+  (define sf2 (_0 rf2))
+  (define yf (yq 2 [kfoo] sf2))
+  (define rf3 (sstep (aput [kfoo kbar kbaz] ("/boot/note/poke" 12) (anew "none")) 0 0 sf2))
+  (define sf3 (_0 rf3))
+  (define rf4 (sstep (aput [kfoo kbar] ("/boot/note/make" 13) (anew "none")) 0 0 sf3))
+  (define rf5 (sstep (aput [kfoo kbar kbaz] ("/boot/note/poke" 14) (anew "none")) 0 0 (_0 rf4)))
+  (define sf5 (_0 rf5))
+  (define yf5 (yq 5 [kfoo] sf5))
+  [;; the frontier member shows in /foo's y epic at its full pith
+   (Eq "known" (Hd yf))
+   (Equal [[] [kbar kbaz]] (akeys (_0 yf)))
+   (Eq 11 (agut [kbar kbaz] 0 (_0 yf)))
+   ;; the deep make moved /foo's y (the cached lock, via spine re-mint)
+   (Equal ("some" 2) (yc 2 [kfoo] sf2))
+   (Equal ("some" 1) (yc 1 [kfoo] sf2))
+   ;; the sign rippled through the hollow bar up to /foo
+   (Equal [0 2 2] (grades (sign-of [kfoo] (_1 rf2))))
+   (Equal [0 2 2] (grades (sign-of [kfoo kbar] (_1 rf2))))
+   ;; a poke at baz moves /foo's y data, not its shape
+   (Equal ("some" 3) (yc 3 [kfoo] sf3))
+   (Equal [0 1 1] (grades (sign-of [kfoo] (_1 rf3))))
+   ;; an asserted node absorbs: once bar itself is made, baz stops
+   ;; reaching /foo's y (bar hears it; /foo only in z)
+   (Equal [0 1 1] (grades (sign-of [kfoo kbar] (_1 rf5))))
+   (Equal [0 0 1] (grades (sign-of [kfoo] (_1 rf5))))
+   (Equal ("some" 4) (yc 5 [kfoo] sf5))
+   ;; and /foo's y epic now shows bar itself, baz hidden behind it
+   (Equal [[] [kbar]] (akeys (_0 yf5)))])
+
+assert(Equal [1 1 1 1 1 1 1 1 1 1 1 1 1] (frontier-checks 0))
+
+
+
 ;;; empty sovereign ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define s0 (snew 0))
@@ -158,6 +204,28 @@ assert(Eq 2 (agut [room] 0 ze2e))
 assert(Equal [[]] (akeys ze3e))
 
 
+;;; step 4: tombstones carry locks — the dead node's y and z advance ;;;;;;;;;;;;;;;
+;;; with its subtree, its x stays at the mint, and it re-mints on the
+;;; spine like any live ancestor
+
+(define sub ("ts" "sub"))
+(define r4 (sstep (aput [chat room sub] ("/boot/note/make" 7) (anew "none")) 0 0 s3))
+(define s4 (_0 r4))
+assert(Eq 4 (_2 s4))
+;; still a tombstone at 4 — the re-mint rides the nul through
+assert(Equal "null" (xq 4 [chat room] s4))
+;; its own data never moved after the cull...
+assert(Equal ("some" 3) (xc 4 [chat room] s4))
+;; ...but the kid's make advanced its y and z locks
+assert(Equal ("some" 4) (yc 4 [chat room] s4))
+assert(Equal ("some" 4) (zc 4 [chat room] s4))
+;; the new kid resolves under the dead parent
+assert(Equal ("known" 7) (xq 4 [chat room sub] s4))
+;; history at the old cases is untouched
+assert(Equal ("known" 2) (xq 2 [chat room] s4))
+assert(Equal ("some" 2) (yc 2 [chat] s4))
+
+
 ;;; spine paths: deep creation notifies without inventing nodes ;;;;;;;;;;;;;;;;;;;
 
 (define ka ("ts" "a"))
@@ -166,15 +234,21 @@ assert(Equal [[]] (akeys ze3e))
 (define rdeep (sstep (aput [ka kb kc] ("/boot/note/make" 9) (anew "none")) 0 0 (snew 0)))
 (define sdeep (_0 rdeep))
 (define ndeep (_1 rdeep))
+;; y is a frontier care: the creation ripples its y grade through the
+;; hollow spine (every hollow ancestor would show the new record in
+;; its y shell)
 assert(Equal [2 2 2] (grades (sign-of [ka kb kc] ndeep)))
 assert(Equal [0 2 2] (grades (sign-of [ka kb] ndeep)))
-assert(Equal [0 0 2] (grades (sign-of [ka] ndeep)))
-assert(Equal [0 0 2] (grades (sign-of [] ndeep)))
+assert(Equal [0 2 2] (grades (sign-of [ka] ndeep)))
+assert(Equal [0 2 2] (grades (sign-of [] ndeep)))
 ;; the spine carries no assertions: not nodes, no x anywhere on it
 assert(Equal "unknown" (xq 1 [ka] sdeep))
 assert(Equal "unknown" (xq 1 [ka kb] sdeep))
 assert(Equal ("known" 9) (xq 1 [ka kb kc] sdeep))
 assert(Equal "unknown" (yq 1 [ka] sdeep))
+;; a hollow path's y case recomputes from its frontier
+assert(Equal ("some" 1) (yc 1 [ka] sdeep))
+assert(Equal ("some" 1) (yc 1 [ka kb] sdeep))
 
 
 ;;; referential transparency: minting never changes a past answer ;;;;;;;;;;;;;;;;;
