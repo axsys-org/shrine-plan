@@ -698,6 +698,31 @@
   [cache2
    ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys]])
 
+(define (load-bundle-artifact-cached cache mod)
+  (define src (read-text-file (strcat ["foil/" mod ".foil"])))
+  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
+  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+  (define cr
+    (Try (lambda (z)
+           (foil:compile-mod-info-artifact-cached
+             cache foil:default-subject 0 mod))
+      0))
+  (define cache2 (If (Eq 1 (Hd cr)) cache (_0 (_0 cr))))
+  (define compiled (If (Eq 1 (Hd cr)) cr [(_1 (_0 cr))]))
+  (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  (define own-keys
+    (If (Eq 1 (Hd compiled))
+      []
+      (let ((sut (_0 (_0 compiled))))
+        (filter
+          (lambda (k)
+            (Ifz imported 1 (Nil (includes (Equal k) imported))))
+          (foil:module-decl-keys sut)))))
+  (define refs
+    (If (Eq 1 (Hd compiled)) [] (ref-table (_0 (_0 compiled)))))
+  [cache2
+   ["BUNDLE" mod src lore compiled refs (import-snapshot mod) own-keys]])
+
 (define (load-bundle mod)
   (define src (read-text-file (strcat ["foil/" mod ".foil"])))
   (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
@@ -728,6 +753,7 @@
 (define (bundle-err b) (_0 (bundle-compiled b)))
 
 (define empty-state ["ST" [] [] 0])
+(define (empty-state-with-artifact-cache cache) ["ST" [] [] cache])
 (define st-bundles (Ix 1))
 (define st-evals (Ix 2))
 (define st-cache (Ix 3))
@@ -796,7 +822,10 @@
   (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e)]) cache))
 
 (define (st-live-cache st)
-  (cache-strip (cache-prune (st-cache st))))
+  (define cache (st-cache st))
+  (If (And (IsApp cache) (Eq "FOIL_ARTIFACT_CACHE" (Hd cache)))
+    (foil:artifact-cache-normalize cache 0)
+    (cache-strip (cache-prune cache))))
 
 (define (set-st-cache cache st)
   (snap 3 (lambda (z) cache) st))
@@ -804,9 +833,13 @@
 (define (state-bundle st mod)
   (define hit (find (lambda (b) (Eq mod (bundle-mod b))) (st-bundles st)))
   (Ifz hit
-    (let ((cb (load-bundle-cached (st-live-cache st) mod)))
-      [(set-st-cache (cache-wrap (_0 cb)) (snap 1 (snoc (_1 cb)) st))
-       (_1 cb)])
+    (let* ((live (st-live-cache st))
+           (artifact? (And (IsApp live) (Eq "FOIL_ARTIFACT_CACHE" (Hd live))))
+           (cb (If artifact?
+                 (load-bundle-artifact-cached live mod)
+                 (load-bundle-cached live mod)))
+           (stored (If artifact? (_0 cb) (cache-wrap (_0 cb)))))
+      [(set-st-cache stored (snap 1 (snoc (_1 cb)) st)) (_1 cb)])
     [st (_0 hit)]))
 
 (define (state-evict st mod)
@@ -1390,6 +1423,23 @@ document.addEventListener('DOMContentLoaded', () => swap('/ns', '#main'));
   (Seq listen
     (Seq (print ("forge listening on port" port))
       (serve-loop listen empty-state))))
+
+(define (run-forge-artifact-cached port cache)
+  (define listen (Listen port))
+  (define st (empty-state-with-artifact-cache cache))
+  (Seq listen
+    (Seq (print ("forge listening on port" port))
+      (serve-loop listen st))))
+
+(define (run-forge-par-artifact-cached port cache)
+  ;; Artifact hits only replay pinned deltas, so deterministic sequential
+  ;; warming is cheaper than spawning actors and merging duplicate caches.
+  (define listen (Listen port))
+  (define st (state-load-all (empty-state-with-artifact-cache cache)))
+  (Seq listen
+    (Seq (DeepSeq st st)
+      (Seq (print ("forge listening on port" port "— artifacts warm"))
+        (serve-loop listen st)))))
 
 ;;; Parallel warmup ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;

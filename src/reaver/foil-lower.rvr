@@ -16,6 +16,7 @@
 
 (#bind ty (#module foil-types))
 (#bind cgen (#module codegen))
+(#bind profile-zone (#module profile-zone))
 
 ;;; Lowered module entries ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -136,6 +137,22 @@
   (define ent1 (make-ir-entry key span val tc ir))
   (insert-entry-sut key ent1 out))
 
+;; Profiling keeps lowering and PLAN code generation separate.  The final
+;; subject insertion is intentionally outside either forced zone so we do not
+;; repeatedly deep-force the cumulative module subject.
+(define (lower-tc-entry-profiled out key ent)
+  (define label (print-path key))
+  (define tc (tc-entry-contents ent))
+  (define ir
+    (profile-zone:force-zone (strcat ["foil.lower.ir." label])
+      (lower-tc out tc)))
+  (define span (tc-entry-span ent))
+  (define val
+    (profile-zone:force-zone (strcat ["foil.lower.codegen." label])
+      (cgen:compile-expr ir)))
+  (define ent1 (make-ir-entry key span val tc ir))
+  (insert-entry-sut key ent1 out))
+
 ;; FFI entries are already runtime values, type entries have no runtime
 ;; representation, IR entries were lowered previously, and members that
 ;; reference const generic parameters cannot lower at the base — their
@@ -236,7 +253,7 @@
 
 ;; Materialize every referenced ground instantiation: walk the order;
 ;; before each referrer, DFS-insert its (transitive) materializations.
-(define (materialize-consts sut)
+(define (materialize-consts-go sut profiled?)
   (define (member-mapping key)
     (define base (ty-ap-base key))
     (define bty (tc-ty (got-entry-tc base sut)))
@@ -259,7 +276,12 @@
         (let* ((base (ty-ap-base key))
                (bent (unpin-soft (need (getax base ax))))
                (btc (tc-entry-contents bent))
-               (mtc (subst-tc (member-mapping key) sut btc))
+               (mtc0 (subst-tc (member-mapping key) sut btc))
+               (mtc (If profiled?
+                      (profile-zone:force-zone
+                        (strcat ["foil.materialize.const." (print-path key)])
+                        mtc0)
+                      mtc0))
                (st1 (foldl materialize [ax (snoc key done) order]
                       (const-deps sut mtc))))
           [(putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
@@ -277,6 +299,12 @@
     (foldl walk [(_0 sut) [] []] (subject-order sut)))
   (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
 
+(define (materialize-consts sut)
+  (materialize-consts-go sut 0))
+
+(define (materialize-consts-profiled sut)
+  (materialize-consts-go sut 1))
+
 (define (lower-tc-mod-go sut out)
   (define n[next sut1] (pop-subject-order sut))
   (define entry (got-entry next sut))
@@ -288,3 +316,15 @@
 
 (define (lower-tc-mod sut out)
   (lower-tc-mod-go sut out))
+
+(define (lower-tc-mod-profiled-go sut out)
+  (define n[next sut1] (pop-subject-order sut))
+  (define entry (got-entry next sut))
+  (Ifz (subject-order sut) out
+    (let ((out1 (If (lowerable-entry? entry)
+                  (lower-tc-entry-profiled out next entry)
+                  out)))
+      (lower-tc-mod-profiled-go sut1 out1))))
+
+(define (lower-tc-mod-profiled sut out)
+  (lower-tc-mod-profiled-go sut out))

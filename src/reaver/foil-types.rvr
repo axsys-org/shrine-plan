@@ -4,6 +4,12 @@
 (#bind reef (#module reef))
 (#import reef)
 
+(#bind cairn (#module cairn))
+
+;; Kept qualified and dormant for normal contexts.  Profiling contexts are
+;; created only by the opt-in compiler in foil-profile.rvr.
+(#bind profile-zone (#module profile-zone))
+
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
@@ -325,6 +331,52 @@
 (define (mold-to-span sut ty)
   (mold-to-span-seen sut 0 ty))
 
+;;; Phase-local type-operation context ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; The compiler is pure, so memo tables are threaded explicitly.  Only a
+;;; top-level TNOM expansion is cached: recursive expansions depend on their
+;;; seen cut and deliberately continue through mold-to-span-seen directly.
+
+(define (make-type-context sut)
+  ["TYCTX" sut 0 cairn:empty-ax [] 0])
+(define (make-profile-type-context sut)
+  ["TYCTX" sut 0 cairn:empty-ax [] 1])
+(define type-context-sut (Ix 1))
+(define type-context-generation (Ix 2))
+(define type-context-expansions (Ix 3))
+(define type-context-nests (Ix 4))
+(define type-context-profiled? (Ix 5))
+
+(define (profile-type-context-result ctx label result)
+  (If (type-context-profiled? ctx)
+    (profile-zone:force-pair-value-zone label result)
+    result))
+
+(define (type-context-with-subject ctx sut type-env-changed?)
+  (If type-env-changed?
+    ["TYCTX" sut (Inc (type-context-generation ctx))
+     cairn:empty-ax [] (type-context-profiled? ctx)]
+    (snap 1 (lambda (z) sut) ctx)))
+
+(define (mold-to-span-context ctx ty[_ tag])
+  ;; The common applied-nominal representation carries every argument in its
+  ;; flat /ty-ap reference path.  Legacy TNOMs with a separate args row are
+  ;; expanded normally: their structured args are not valid Cairn key segments.
+  (define result
+    (If (Or (Nil (Eq tag "TNOM")) (Sz (_3 ty)))
+      [ctx (mold-to-span (type-context-sut ctx) ty)]
+      ;; /ty-ap paths are length-prefixed flat rows, so the entire nominal path
+      ;; can safely become Cairn path segments without losing identity.
+      (let* ((key (Weld [(type-context-generation ctx) "nom"] (tnom-ref ty)))
+             (hit (cairn:getax key (type-context-expansions ctx))))
+        (If hit
+          [ctx (_0 hit)]
+          (let ((span (mold-to-span (type-context-sut ctx) ty)))
+            [(snap 3
+               (cairn:putax key span) ctx)
+             span])))))
+  (profile-type-context-result ctx "foil.type.expand" result))
+
 (define (mold-rec-seed ty[_ tag])
   (cond
     ((Eq tag "TNOM") [(tnom-ref ty)])
@@ -548,8 +600,27 @@
       (Ifz (get-const p sut) 0 (type-entry? p sut)))))
 
 (define (find-exact-name-for-span sut span[_ tag])
+  ;; Reject declarations whose stored head cannot possibly recover this
+  ;; row/sum.  Transparent nominal aliases remain candidates; generics are
+  ;; handled by find-inst-name-for-span below.
+  (define (head-ok? path)
+    (define decl (got-type path sut))
+    (define body (tqua-body decl))
+    (define btag (_1 body))
+    (And (Eq 0 (count-tqua decl))
+      (cond
+        ((Eq btag "TNOM") 1)
+        ((And (Eq tag "TROW") (Eq btag "TROW"))
+          ;; Legacy/raw TC_TYP entries may still store a zero row head;
+          ;; nominal expansion brands that head with the declaration path.
+          (And (Equal (trow-cstr span)
+                 (Ifz (trow-cstr body) (print-path path) (trow-cstr body)))
+            (Eq (Sz (trow-vals span)) (Sz (trow-vals body)))))
+        ((And (Eq tag "TSUM") (Eq btag "TSUM"))
+          (Eq (Sz (tsum-opts span)) (Sz (tsum-opts body))))
+        (else 0))))
   (define (matches path)
-    (If (Nil (type-entry? path sut))
+    (If (Or (Nil (type-entry? path sut)) (Nil (head-ok? path)))
       0
       (Equal span (mold-to-span sut (TNOM path 0)))))
   (If (or (Eq tag "TROW") (Eq tag "TSUM"))
@@ -654,12 +725,21 @@
   ;; constants (name-top-row), and option counts survive substitution
   ;; (wf forbids same-cstr+same-arity options, so none can collapse).
   (define (head-ok? body[_ btag])
+    (define (row-key x)
+      (define y (If (Eq "TFAC" (_1 x)) (tfac-val x) x))
+      (If (Eq "TROW" (_1 y))
+        [(trow-cstr y) (Sz (trow-vals y))]
+        0))
+    (define (sum-shape x)
+      (map row-key (tsum-opts x)))
     (cond
       ((And (Eq tag "TROW") (Eq btag "TROW"))
         (And (Equal (trow-cstr span) (trow-cstr body))
           (Eq (Sz (trow-vals span)) (Sz (trow-vals body)))))
       ((And (Eq tag "TSUM") (Eq btag "TSUM"))
-        (Eq (Sz (tsum-opts span)) (Sz (tsum-opts body))))
+        (And (Eq (Sz (tsum-opts span)) (Sz (tsum-opts body)))
+          (let ((ss (sum-shape span)) (bs (sum-shape body)))
+            (If (Or (any Nil ss) (any Nil bs)) 1 (Equal ss bs)))))
       (else 0)))
   (define (attempt path)
     (define decl (got-type path sut))
@@ -719,6 +799,12 @@
       (else ty))
     (TNOM (_0 nom) 0)))
 
+(define (span-to-mold-context ctx span)
+  (If (type-context-profiled? ctx)
+    (profile-zone:force-zone "foil.type.reverse-recovery"
+      (span-to-mold (type-context-sut ctx) span))
+    (span-to-mold (type-context-sut ctx) span)))
+
 (define (type-nests? sut sup sub)
   (cond
     ((Equal sup sub) 1)
@@ -732,6 +818,27 @@
       (type-nests-span? sut []
         (mold-to-span sut sup)
         (mold-to-span-seen sut (mold-rec-seed sup) sub)))))
+
+(define (type-nests-context ctx sup sub)
+  ;; Pair keys contain arbitrary type trees.  Pins compare by content hash, so
+  ;; the association scan stays shallow instead of repeatedly walking both
+  ;; recursive types (Cairn ordering only supports atomic path segments).
+  (define key (Pin [(type-context-generation ctx) sup sub]))
+  (define hit
+    (find (lambda (e) (Equal key (_0 e))) (type-context-nests ctx)))
+  (define result
+    (If hit
+      [ctx (_1 (_0 hit))]
+      (let* ((sx (mold-to-span-context ctx sup))
+             (ctx1 (_0 sx))
+             ;; The RHS cut is relative to the LHS nominal seed.  It is
+             ;; intentionally not put in the top-level expansion cache: recursive
+             ;; comparisons can reach the same nominal at different cut points.
+             (sy (mold-to-span-seen (type-context-sut ctx1)
+                   (mold-rec-seed sup) sub))
+             (res (type-nests-span? (type-context-sut ctx1) [] (_1 sx) sy)))
+        [(snap 4 (snoc [key res]) ctx1) res])))
+  (profile-type-context-result ctx "foil.type.nests" result))
 
 (define (type-apply sut f x)
   ;; The first successful occurrence wins, exactly as in the old span
@@ -970,10 +1077,37 @@
     ((Eq (_1 x) "TBOT") y)
     ((Eq (_1 y) "TBOT") x)
     (else
-      (span-to-mold sut
-        (type-join-span sut
-          (mold-to-span sut x)
-          (mold-to-span sut y))))))
+      (let* ((xs (mold-to-span sut x))
+             (ys (mold-to-span sut y))
+             (joined (type-join-span sut xs ys))
+             (is-x (Equal joined xs))
+             (is-y (Equal joined ys)))
+        (cond
+          ((And is-x (Nil is-y)) x)
+          ((And is-y (Nil is-x)) y)
+          (else (span-to-mold sut joined)))))))
+
+(define (type-join-context ctx x y)
+  (define result
+    (cond
+      ((Equal x y) [ctx x])
+      ((Eq (_1 x) "TBOT") [ctx y])
+      ((Eq (_1 y) "TBOT") [ctx x])
+      (else
+        (let* ((xr (mold-to-span-context ctx x))
+               (yr (mold-to-span-context (_0 xr) y))
+               (ctx1 (_0 yr))
+               (xs (_1 xr))
+               (ys (_1 yr))
+               (joined (type-join-span (type-context-sut ctx1) xs ys))
+               (is-x (Equal joined xs))
+               (is-y (Equal joined ys)))
+          [ctx1
+           (cond
+             ((And is-x (Nil is-y)) x)
+             ((And is-y (Nil is-x)) y)
+             (else (span-to-mold-context ctx1 joined)))]))))
+  (profile-type-context-result ctx "foil.type.join" result))
 
 ;; type intersection
 (define (type-meet-span sut x[_ xtag] y[_ ytag])
@@ -1018,37 +1152,70 @@
     ((Eq ytag "TSUM") (distr-sum y x))
     (else TBOT))))
 
+;; Meet using already-expanded operands.  The pair return lets match
+;; elaboration reuse the narrowed span for runtime keys and exhaustiveness.
+(define (type-meet-expanded-go sut profiled? x xspan y yspan)
+  (define nests-xy (type-nests-span? sut [] xspan yspan))
+  (define nests-yx (type-nests-span? sut [] yspan xspan))
+  (cond
+    ((Eq (_1 x) "TANY") [y yspan])
+    ((Eq (_1 y) "TANY") [x xspan])
+    ((And nests-xy nests-yx)
+      (cond
+        ((Equal x y) [x xspan])
+        ((And (Eq (_1 x) "TFAC") (Eq (_1 y) "TFAC"))
+          (type-meet-expanded-go sut profiled?
+            (tfac-val x)
+            (If (Eq "TFAC" (_1 xspan)) (tfac-val xspan) xspan)
+            (tfac-val y)
+            (If (Eq "TFAC" (_1 yspan)) (tfac-val yspan) yspan)))
+        ((Eq (_1 y) "TFAC") [y yspan])
+        (else [x xspan])))
+    (nests-xy [y yspan])
+    (nests-yx [x xspan])
+    (else
+      (let ((span (type-meet-span sut xspan yspan)))
+        [(If profiled?
+           (profile-zone:force-zone "foil.type.reverse-recovery"
+             (span-to-mold sut span))
+           (span-to-mold sut span))
+         span]))))
+
+(define (type-meet-expanded sut x xspan y yspan)
+  (type-meet-expanded-go sut 0 x xspan y yspan))
+
 ;; When one side nests in the other, the meet IS the nested mold — and
 ;; keeping the nominal mold matters: the span roundtrip denormalizes
 ;; parameterized nominal types (span-to-mold's name recovery only
 ;; matches unparameterized ones), which poisons everything derived from
 ;; the result (match-arm locals, their faces, applications of them).
 (define (type-meet sut x y)
-  (define nests-xy (type-nests? sut x y))
-  (define nests-yx (type-nests? sut y x))
+  ;; Keep the old cheap mold-level cases ahead of any forward expansion.
+  ;; These dominate face-heavy elaboration and are also the strongest form of
+  ;; operand identity preservation.
   (cond
-    ;; TANY is dynamic, not a lattice element: it nests both ways but
-    ;; must refine away in meets.
+    ((Equal x y) x)
     ((Eq (_1 x) "TANY") y)
     ((Eq (_1 y) "TANY") x)
-    ;; Mutual nesting means equal up to faces; pick canonically so the
-    ;; meet commutes: a lone face annotation survives, two conflicting
-    ;; ones cancel.  Each direction expands recursive nominals, so bind
-    ;; both once — laziness computes each at most once across the arms.
-    ((And nests-xy nests-yx)
-      (cond
-        ((Equal x y) x)
-        ((And (Eq (_1 x) "TFAC") (Eq (_1 y) "TFAC"))
-          (type-meet sut (tfac-val x) (tfac-val y)))
-        ((Eq (_1 y) "TFAC") y)
-        (else x)))
-    (nests-xy y)
-    (nests-yx x)
+    ((And (Eq (_1 x) "TFAC") (Eq (_1 y) "TFAC"))
+      (type-meet sut (tfac-val x) (tfac-val y)))
+    ((And (Eq (_1 x) "TFAC") (Equal (tfac-val x) y)) x)
+    ((And (Eq (_1 y) "TFAC") (Equal x (tfac-val y))) y)
     (else
-      (span-to-mold sut
-        (type-meet-span sut
-          (mold-to-span sut x)
-          (mold-to-span-seen sut (mold-rec-seed x) y))))))
+      (_0 (type-meet-expanded sut x (mold-to-span sut x) y
+            (mold-to-span-seen sut (mold-rec-seed x) y))))))
+
+(define (type-meet-context ctx x y)
+  (define result
+    (let* ((xr (mold-to-span-context ctx x))
+           (ctx1 (_0 xr))
+           ;; As in type-nests-context, this expansion's recursive cut depends on
+           ;; the opposite operand and therefore stays local to the comparison.
+           (ys (mold-to-span-seen (type-context-sut ctx1) (mold-rec-seed x) y))
+           (res (type-meet-expanded-go (type-context-sut ctx1)
+                  (type-context-profiled? ctx1) x (_1 xr) y ys)))
+      [ctx1 res]))
+  (profile-type-context-result ctx "foil.type.meet" result))
 
 (define (fits-err err)
   (1 [err]))
@@ -1164,13 +1331,23 @@
  subst-path
  type-entry?
  mold-to-span
+ make-type-context
+ make-profile-type-context
+ type-context-sut
+ type-context-generation
+ type-context-with-subject
+ mold-to-span-context
  span-to-mold
  type-apply
  type-specialize
  type-join
+ type-join-context
  type-meet
+ type-meet-expanded
+ type-meet-context
  type-fits
  type-nests?
+ type-nests-context
  insert-typ
  insert-typ-ffi
  collect-faces

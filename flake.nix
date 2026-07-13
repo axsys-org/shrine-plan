@@ -5,7 +5,7 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/lf/http-drivers";
+    url = "github:axsys-org/enki/lf/profiling";
   };
 
   outputs = { self, nixpkgs, rex, enki }:

@@ -184,6 +184,201 @@
          [(_1 (_0 r)) (_2 (_0 r))]]))
     [cache [(_1 (_0 hit)) (_3 (_0 hit))]]))
 
+;;; Content-addressed module artifacts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Unlike compile-mod-cached's process-local cumulative subjects, these
+;;; entries contain only a module's pinned subject additions.  The cache value
+;;; itself is ordinary PLAN data, so putting it in a Reaver top-level binding
+;;; makes it survive in the existing content-addressed snapshot graph.
+
+(define artifact-schema 1)
+
+(define (artifact-compiler-token z)
+  ;; A source/compiler change alters one of these transitive pinned closures.
+  ;; artifact-schema covers payload/replay changes in this section itself.
+  (Pin [artifact-schema compile-mod-go foil-elab:elab-mod
+        foil-lower:materialize-consts foil-lower:lower-tc-mod
+        foil-subject:subject-entry-delta foil-subject:apply-entry-delta
+        default-subject]))
+
+(define (make-artifact-cache flags)
+  ["FOIL_ARTIFACT_CACHE" artifact-schema (artifact-compiler-token 0) flags []])
+
+(define artifact-cache-flags (Ix 3))
+(define artifact-cache-entries (Ix 4))
+
+(define (artifact-cache-normalize cache flags)
+  (If (And (IsApp cache)
+        (And (Eq "FOIL_ARTIFACT_CACHE" (Hd cache))
+          (And (Eq artifact-schema (Ix 1 cache))
+            (And (Equal (artifact-compiler-token 0) (Ix 2 cache))
+              (Equal flags (artifact-cache-flags cache))))))
+    cache
+    (make-artifact-cache flags)))
+
+;; Artifact body:
+;; [tag schema name source compiler-token initial-subject-pin flags
+;;  [[import-sast artifact-pin] ..] imported-keys decl-keys entry-delta]
+(define artifact-name (Ix 2))
+(define artifact-source (Ix 3))
+(define artifact-compiler (Ix 4))
+(define artifact-initial (Ix 5))
+(define artifact-flags (Ix 6))
+(define artifact-direct (Ix 7))
+(define artifact-imported (Ix 8))
+(define artifact-decl-keys (Ix 9))
+(define artifact-delta (Ix 10))
+
+(define (artifact-body art)
+  (If (IsPin art) (Unpin art) 0))
+
+(define (artifact-shaped? art)
+  (define b (artifact-body art))
+  (And (IsApp b)
+    (And (Eq "FOIL_ARTIFACT" (Hd b))
+      (Eq artifact-schema (Ix 1 b)))))
+
+(define (artifact-cache-find cache mod)
+  (find (lambda (e) (Eq mod (_0 e))) (artifact-cache-entries cache)))
+
+(define (artifact-cache-put cache mod art)
+  (snap 4
+    (lambda (entries)
+      (snoc [mod art]
+        (filter (lambda (e) (Ne mod (_0 e))) entries)))
+    cache))
+
+(define (legacy-cache-merge base more)
+  (foldl
+    (lambda (acc e)
+      (If (includes (lambda (x) (Eq (_0 e) (_0 x))) acc)
+        acc
+        (snoc e acc)))
+    base more))
+
+(define (artifact-base-valid? art mod src compiler init flags)
+  (Ifz (artifact-shaped? art)
+    0
+    (let ((b (artifact-body art)))
+      (And (Eq mod (artifact-name b))
+        (And (Equal src (artifact-source b))
+          (And (Equal compiler (artifact-compiler b))
+            (And (Equal init (artifact-initial b))
+              (Equal flags (artifact-flags b)))))))))
+
+(define (artifact-valid? art mod src compiler init flags direct)
+  (And (artifact-base-valid? art mod src compiler init flags)
+    (Equal (map (Ix 1) direct)
+      (map (Ix 1) (artifact-direct (artifact-body art))))))
+
+;; -> [cache artifact compiled imported-keys legacy-cache]
+(define (compile-artifact-go stack cache0 sut0 flags mod)
+  (define src (get-foil mod))
+  (define compiler (artifact-compiler-token 0))
+  (define init (Pin sut0))
+  (define found (artifact-cache-find cache0 mod))
+  (define art (Ifz found 0 (_1 (_0 found))))
+  ;; An exact source/compiler/subject hit can trust the import SAST stored in
+  ;; the pinned artifact.  That is what lets a warm module skip lexing and
+  ;; parsing altogether; dependency pins are checked after resolving imports.
+  (define candidate? (artifact-base-valid? art mod src compiler init flags))
+  (define imps
+    (If candidate?
+      (map (Ix 0) (artifact-direct (artifact-body art)))
+      (filter mod-import?
+        (foil-sast:parse-module-sast 0 (rex:ParseRexNorm src)))))
+  (define (apply-import st[cache sut seen direct legacy] imp[_ mount span name])
+    (define blurb (import-blurb span))
+    (If (includes (Eq name) stack)
+      (error ["foil-import-cycle" ["module" name] ["at" blurb]])
+      (let* ((r (compile-artifact-go (snoc name stack) cache
+                   default-subject flags name))
+             (cache1 (_0 r))
+             (art (_1 r))
+             (imped (_2 r))
+             (keys (artifact-decl-keys (artifact-body art)))
+             (legacy1 (legacy-cache-merge legacy (Ix 4 r)))
+             (sut1 (foil-subject:merge-subject blurb keys imped sut))
+             (sut2 (Ifz (Sz mount)
+                     sut1
+                     (foil-subject:mount-subject blurb mount keys imped sut1))))
+        [cache1 sut2 (Weld seen keys) (snoc [imp art] direct) legacy1])))
+  (define merged
+    (foldl apply-import [cache0 sut0 0 [] []] imps))
+  (define cache (_0 merged))
+  (define pre (_1 merged))
+  (define direct (_3 merged))
+  (define legacy (Ix 4 merged))
+  (If (artifact-valid? art mod src compiler init flags direct)
+    (let* ((body (artifact-body art))
+           (compiled
+             (foil-subject:apply-entry-delta
+               ["cached module" mod] (artifact-delta body) pre))
+           (imported (artifact-imported body))
+           (legacy1
+             (snoc (cache-entry mod compiled imported)
+               (filter (lambda (e) (Ne mod (_0 e))) legacy))))
+      [cache art compiled imported legacy1])
+    ;; Imports have already been resolved to cumulative subjects above.
+    ;; Seed the old in-process cache with them so the cold module compile
+    ;; does not elaborate the import graph a second time.
+    (let* ((cold (compile-mod-go stack legacy sut0 mod))
+           (compiled (_1 cold))
+           (imported (_2 cold))
+           (decl-keys (module-decl-keys compiled))
+           (delta (foil-subject:subject-entry-delta pre compiled))
+           (body ["FOIL_ARTIFACT" artifact-schema mod src compiler init flags
+                  direct imported decl-keys delta])
+           (art1 (Pin body))
+           (cache1 (artifact-cache-put cache mod art1))
+           (legacy1
+             (snoc (cache-entry mod compiled imported)
+               (filter (lambda (e) (Ne mod (_0 e))) (_0 cold)))))
+      [cache1 art1 compiled imported legacy1])))
+
+(define (compile-mod-artifact-cached cache sut flags mod)
+  (define cache0 (artifact-cache-normalize cache flags))
+  (define r
+    (Try (lambda (z) (compile-artifact-go [mod] cache0 sut flags mod)) 0))
+  (If (Eq 1 (Hd r))
+    (error ["foil-in-module" mod (_0 r)])
+    [(_0 (_0 r)) (_2 (_0 r))]))
+
+(define (compile-mod-info-artifact-cached cache sut flags mod)
+  (define cache0 (artifact-cache-normalize cache flags))
+  (define r
+    (Try (lambda (z) (compile-artifact-go [mod] cache0 sut flags mod)) 0))
+  (If (Eq 1 (Hd r))
+    (error ["foil-in-module" mod (_0 r)])
+    [(_0 (_0 r)) [(_2 (_0 r)) (_3 (_0 r))]]))
+
+(define (artifact-module-closure mods)
+  (define (go seen pending)
+    (Ifz (Sz pending)
+      seen
+      (let* ((mod (_0 pending))
+             (rest (drop 1 pending)))
+        (If (includes (Eq mod) seen)
+          (go seen rest)
+          (go (snoc mod seen) (Weld rest (module-imports mod)))))))
+  (go [] mods))
+
+(define (artifact-cache-drop cache names)
+  (snap 4
+    (filter (lambda (e) (Nil (includes (Eq (_0 e)) names))))
+    cache))
+
+(define (warm-mod-artifacts cache sut flags mods fresh?)
+  (define cache0 (artifact-cache-normalize cache flags))
+  (define cache1
+    (If fresh?
+      (artifact-cache-drop cache0 (artifact-module-closure mods))
+      cache0))
+  (foldl
+    (lambda (acc mod)
+      (_0 (compile-mod-artifact-cached acc sut flags mod)))
+    cache1 mods))
+
 ;;; Entry inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; A subject entry decomposed either way it is stored:

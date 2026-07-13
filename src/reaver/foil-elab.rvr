@@ -18,6 +18,9 @@
 
 (#bind quip (#module quip))
 
+;; Qualified so the ordinary elaborator never evaluates profiler effects.
+(#bind profile-zone (#module profile-zone))
+
 ;;; Elaboration environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (burp-self type[_ tag f val])
@@ -395,29 +398,48 @@
       (else (error ("bad dot call" obj meth)))))
   (score-ty ty))
 
-(define (elab-val sut env surf)
+(define (elab-val-context ctx env surf)
+  (define sut (ty:type-context-sut ctx))
   (define (tag-is x) (Eq x (_0 surf)))
   (define elab-ty (elab-type-env sut env))
+  ;; State-threaded traversal for sibling expressions.  The TC row is kept
+  ;; separate from the type-operation context so public TC shapes do not move.
+  (define (elab-vals ctx0 env0 surfs)
+    (foldl
+      (lambda (st s)
+        (let ((r (elab-val-context (_0 st) env0 s)))
+          [(_0 r) (snoc (_1 r) (_1 st))]))
+      [ctx0 []] surfs))
+  (define (nests-pairs ctx0 pairs)
+    (foldl
+      (lambda (st pr)
+        (Ifz (_1 st) st
+          (ty:type-nests-context (_0 st) (_0 pr) (_1 pr))))
+      [ctx0 1] pairs))
   (define (elab-fun f[_ args body])
     (define argty (map elab-ty args))
     (define frame (Weld [(self-ty sut env argty body)] argty))
     (define inner-env (push-locals env frame))
-    (define val (elab-val sut inner-env body))
-    (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
+    (define r (elab-val-context ctx inner-env body))
+    (define val (_1 r))
+    [(_0 r) (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val)])
   (define (elab-cast c[_ ty body])
     (define want (elab-ty ty))
-    (define ret (elab-val sut env body))
-    (unless (ty:type-nests? sut want (tc-ty ret))
+    (define r (elab-val-context ctx env body))
+    (define ret (_1 r))
+    (define nr (ty:type-nests-context (_0 r) want (tc-ty ret)))
+    (unless (_1 nr)
       (elab-error env "cast (^) target does not accept the value's type"
         ["want" want "got" (tc-ty ret)])
-      (set-tc-ty want ret)))
+      [(_0 nr) (set-tc-ty want ret)]))
   (define (elab-row r[_ items])
-    (define els (map (elab-val sut env) items))
+    (define er (elab-vals ctx env items))
+    (define els (_1 er))
     (define ty (ty:TROW 0 (map tc-ty els)))
-    (tc-row ty (ty:trow-cstr ty) els))
+    [(_0 er) (tc-row ty (ty:trow-cstr ty) els)])
   (define (elab-variant v[_ tag])
     (define ty (ty:TROW tag []))
-    (tc-row ty (ty:trow-cstr ty) []))
+    [ctx (tc-row ty (ty:trow-cstr ty) [])])
   (define (elab-variant-call tag xs)
     (define ty (ty:TROW tag (map (cork burp-face tc-ty) xs)))
     (tc-row ty (ty:trow-cstr ty) xs))
@@ -454,25 +476,28 @@
         (ty:TNOM (canon-path (surf-ref-path (_1 fsurf)) sut)
           (map elab-ty (_2 fsurf))))
       (else 0)))
-  (define (elab-type-call fsurf rown xs)
+  (define (elab-type-call ctx0 fsurf rown xs)
     (define row (Ix 0 rown))
     (define fields (ty:trow-vals row))
     (define got (map (cork burp-face tc-ty) xs))
     (define pairs (zip fields got))
     (define nom (If (Ix 1 rown) (Ix 1 rown) (construction-nom fsurf)))
-    (unless (and (Eq (Sz fields) (Sz got))
-              (all (uncurry (ty:type-nests? sut)) pairs))
+    (define nr
+      (If (Eq (Sz fields) (Sz got))
+        (nests-pairs ctx0 pairs)
+        [ctx0 0]))
+    (unless (_1 nr)
       (elab-error env "constructor call does not match its row type"
         ["want" row "got" got])
-      (tc-row (Ifz nom row nom) (ty:trow-cstr row) xs)))
-  (define (on-call f xs)
+      [(_0 nr) (tc-row (Ifz nom row nom) (ty:trow-cstr row) xs)]))
+  (define (on-call ctx0 f xs)
     (define xs-ty (map (cork burp-face tc-ty) xs))
     (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
     (define app (tc-fold-app f xs))
     (If (Eq tag "TBAD")
       (elab-error env "cannot apply function to these arguments"
         ["fun" (tc-ty f) "args" xs-ty "because" ty])
-      (set-tc-ty ty app)))
+      [ctx0 (set-tc-ty ty app)]))
   ;; A loop (|) is an immediately-applied anonymous lambda: params come
   ;; from the arm patterns, inits elaborate in the OUTER env (parallel
   ;; binding — it's one call), and (_ ...) re-enters through the self
@@ -482,16 +507,19 @@
   ;; matches use for their missing heir).
   (define (elab-loop l[_ arms body])
     (define argty (map (lambda (a) (elab-ty (_1 a))) arms))
-    (define inits (map (lambda (a) (elab-val sut env (_2 a))) arms))
+    (define ir (elab-vals ctx env (map (Ix 2) arms)))
+    (define inits (_1 ir))
     (define ret0 (peek-ret-cast sut env body))
     (define ret (If (Equal ty:TBAD ret0) ty:TBOT ret0))
     (define frame (Weld [(ty:TSELF (ty:TFUN argty ret))] argty))
     (define inner-env (push-locals env frame))
-    (define val (elab-val sut inner-env body))
+    (define vr (elab-val-context (_0 ir) inner-env body))
+    (define val (_1 vr))
     (define lam (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
-    (on-call lam inits))
+    (on-call (_0 vr) lam inits))
   (define (elab-spec s[_ val args])
-    (define base (elab-val sut env val))
+    (define br (elab-val-context ctx env val))
+    (define base (_1 br))
     (define bty0
       (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
     (define cpairs (ty:cqua-pairs bty0))
@@ -584,38 +612,39 @@
                     (If (bad-type? typ)
                       (elab-error env "bad specialization" ["got" typ "args" args])
                       (tc-global typ enc))))))))))
-    (If (Sz cpairs)
-      (const-spec)
-      (If (Eq "TC_TYP" (Hd base))
-      ;; The /ty-ap encoding shortcut below never runs type-specialize,
-      ;; so check the argument count against the generic's arity here.
-      (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
-        (If (Ne quas (Sz targs))
-          (elab-error env "wrong number of type arguments"
-            ["want" quas "got" (Sz targs)])
-          (let ((enc (nom-spec)))
-            (If enc
-              (tc-typ (ty:TTYP (ty:TNOM enc 0)))
-              (let ((typ (specialize (_2 (tc-typ-inner base)))))
-                (If (bad-type? typ)
-                  (elab-error env "bad specialization" ["got" typ "args" args])
-                  (tc-typ (ty:TTYP typ))))))))
-      (let ((typ (specialize (tc-ty base))))
-        (If (bad-type? typ)
-          (elab-error env "bad specialization" ["got" typ "args" args])
-          (set-tc-ty typ base))))))
+    [(_0 br)
+     (If (Sz cpairs)
+       (const-spec)
+       (If (Eq "TC_TYP" (Hd base))
+       ;; The /ty-ap encoding shortcut below never runs type-specialize,
+       ;; so check the argument count against the generic's arity here.
+       (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
+         (If (Ne quas (Sz targs))
+           (elab-error env "wrong number of type arguments"
+             ["want" quas "got" (Sz targs)])
+           (let ((enc (nom-spec)))
+             (If enc
+               (tc-typ (ty:TTYP (ty:TNOM enc 0)))
+               (let ((typ (specialize (_2 (tc-typ-inner base)))))
+                 (If (bad-type? typ)
+                   (elab-error env "bad specialization" ["got" typ "args" args])
+                   (tc-typ (ty:TTYP typ))))))))
+       (let ((typ (specialize (tc-ty base))))
+         (If (bad-type? typ)
+           (elab-error env "bad specialization" ["got" typ "args" args])
+           (set-tc-ty typ base)))))])
   (define (elab-call c[_ f xs])
-    (define exs (map (elab-val sut env) xs))
+    (define er (elab-vals ctx env xs))
+    (define exs (_1 er))
     (define variant-call? (Eq "s_variant" (_0 f)))
-    (define tc-f (If variant-call? 0 (elab-val sut env f)))
-    (define ret
-      (If variant-call?
-        (elab-variant-call (_1 f) exs)
-      (let ((rown (tc-type-row tc-f)))
+    (If variant-call?
+      [(_0 er) (elab-variant-call (_1 f) exs)]
+      (let* ((fr (elab-val-context (_0 er) env f))
+             (tc-f (_1 fr))
+             (rown (tc-type-row tc-f)))
         (If rown
-          (elab-type-call f rown exs)
-          (on-call tc-f exs)))))
-    ret)
+          (elab-type-call (_0 fr) f rown exs)
+          (on-call (_0 fr) tc-f exs)))))
   ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
   ;; referee's type): lowering links the referee's compiled pin in by
   ;; path.  Embedding the whole referee TC — the old behavior — made
@@ -703,46 +732,63 @@
   ;; ones; recursive references are not supported (bindings elaborate
   ;; before their name enters scope).
   (define (elab-letrec l[_ arms body])
-    (define (bind-ty env1 pat val-tc)
+    (define (bind-ty ctx0 env1 pat val-tc)
       (define tag (_0 pat))
       (cond
         ((Eq tag "s_face")
-          (let ((want (elab-type-env sut env1 (surf-face-kid pat))))
-            (unless (ty:type-nests? sut want (burp-face (tc-ty val-tc)))
+          (let* ((want (elab-type-env sut env1 (surf-face-kid pat)))
+                 (nr (ty:type-nests-context ctx0 want
+                       (burp-face (tc-ty val-tc)))))
+            (unless (_1 nr)
               (elab-error env1 "local binding value does not fit its declared type"
                 ["want" want "got" (tc-ty val-tc)])
-              (ty:TFAC (surf-face-name pat) want))))
+              [(_0 nr) (ty:TFAC (surf-face-name pat) want)])))
         ((And (Eq tag "s_ref") (Eq 1 (Sz (surf-ref-path pat))))
-          (ty:TFAC (_0 (surf-ref-path pat)) (burp-face (tc-ty val-tc))))
+          [ctx0 (ty:TFAC (_0 (surf-ref-path pat)) (burp-face (tc-ty val-tc)))])
         (else
           (elab-error env1 "unsupported local binding pattern" pat))))
-    (define (step acc[env1 binds] arm[_ pat val])
-      (define val-tc (elab-val sut env1 val))
-      (define bty (bind-ty env1 pat val-tc))
-      [(push-local-env env1 bty) (snoc val-tc binds)])
-    (define res[env2 binds] (foldl step [env []] arms))
+    (define (step acc[ctx1 env1 binds] arm[_ pat val])
+      (define vr (elab-val-context ctx1 env1 val))
+      (define val-tc (_1 vr))
+      (define br (bind-ty (_0 vr) env1 pat val-tc))
+      [(_0 br) (push-local-env env1 (_1 br)) (snoc val-tc binds)])
+    (define res[ctx2 env2 binds] (foldl step [ctx env []] arms))
     (unless (Ne foil-no-heir body)
       (elab-error env "local bindings (=) require a body" 0)
-      (let ((btc (elab-val sut env2 body)))
-        (tc-letrec (tc-ty btc) binds btc))))
-  (define (elab-meth-step rcvr seg)
+      (let* ((br (elab-val-context ctx2 env2 body))
+             (btc (_1 br)))
+        [(_0 br) (tc-letrec (tc-ty btc) binds btc)])))
+  (define (elab-meth-step st[ctx0 rcvr] seg)
     (define f (score-meth rcvr (surf-mseg-name seg) sut))
-    (define args (map (elab-val sut env) (surf-mseg-args seg)))
-    (on-call f (snoc rcvr args)))
-  (define (elab-meth-go rcvr els)
-    (Ifz els rcvr
-        (elab-meth-go (elab-meth-step rcvr (_0 els)) (drop 1 els))))
+    (define ar (elab-vals ctx0 env (surf-mseg-args seg)))
+    (on-call (_0 ar) f (snoc rcvr (_1 ar))))
+  (define (elab-meth-go st els)
+    (Ifz els st
+        (elab-meth-go (elab-meth-step st (_0 els)) (drop 1 els))))
   (define (elab-meth m[_ els])
     assert(Nil (Eq 0 (Sz els)))
     (define head (_0 els))
     (define head-tc (elab-var [0 (_0 els)]))
-    (elab-meth-go head-tc (drop 1 els)))
-  (define (elab-arm scr-ty a[_ pat val])
+    (elab-meth-go [ctx head-tc] (drop 1 els)))
+  (define (arm-span-key span)
+    (If (Eq "TROW" (_1 span))
+      ["key" (ty:trow-cstr span) (Sz (ty:trow-vals span))]
+      0))
+  ;; During case elaboration an arm temporarily carries its one expanded
+  ;; narrowed span and runtime key alongside the unchanged TC_ARM.
+  (define arm-info-tc (Ix 0))
+  (define arm-info-span (Ix 1))
+  (define arm-info-key (Ix 2))
+  (define (elab-arm scr-ty st[ctx infos] a[_ pat val])
     (define pat-ty (elab-ty pat))
-    (define ty (ty:type-meet sut scr-ty pat-ty))
+    (define met
+      (ty:type-meet-context ctx scr-ty pat-ty))
+    (define ctx1 (_0 met))
+    (define narrowed (_1 met))
+    (define ty (_0 narrowed))
     ;; Lowered arm tests dispatch on constructor head + arity; a pattern
     ;; that doesn't narrow the scrutinee to a row has no such key.
-    (define span (burp-face (ty:mold-to-span sut ty)))
+    (define span (burp-face (_1 narrowed)))
     ;; A binderless anonymous-row pattern binds through its own faces:
     ;; the meet burps mismatched faces, so re-impose the pattern's on
     ;; the narrowed local — the arm body's bare names then resolve to
@@ -764,32 +810,29 @@
     (unless (Eq "TROW" (_1 span))
       (elab-error env "match arm pattern is not a row (constructor) type"
         ["pattern" pat-ty "narrowed" ty])
-      (let ((res (elab-val sut (push-local-env env local-ty) val)))
-        (tc-arm (tc-ty res) ty res))))
+      (let* ((rr (elab-val-context ctx1 (push-local-env env local-ty) val))
+             (res (_1 rr)))
+        [(_0 rr)
+         (snoc [(tc-arm (tc-ty res) ty res) span (arm-span-key span)] infos)])))
   ;; Lowered arm tests dispatch on constructor head + arity only
   ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
   ;; would silently shadow each other.  Reject them here instead.
-  (define (arm-key arm)
-    (define span (burp-face (ty:mold-to-span sut (tc-arm-pat arm))))
-    (If (Eq "TROW" (_1 span))
-      ["key" (ty:trow-cstr span) (Sz (ty:trow-vals span))]
-      0))
-  (define (check-arms-distinct arms1)
+  (define (check-arms-distinct infos)
     (define (dup-key keys)
       (Ifz keys 0
         (Or (And (_0 keys) (includes (Equal (_0 keys)) (drop 1 keys)))
           (dup-key (drop 1 keys)))))
-    (define dup (dup-key (map arm-key arms1)))
+    (define dup (dup-key (map arm-info-key infos)))
     (Ifz dup 0
       (elab-error env
         "match arms indistinguishable at runtime (same constructor and arity)"
-        (map tc-arm-pat arms1))))
+        (map (lambda (i) (tc-arm-pat (arm-info-tc i))) infos))))
   ;; A match without a fallthrough must cover every option of its
   ;; scrutinee's sum (by the same head+arity key the lowered tests
   ;; dispatch on).
-  (define (check-exhaustive scrut-ty arms1)
-    (define span (burp-face (ty:mold-to-span sut scrut-ty)))
-    (define keys (map arm-key arms1))
+  (define (check-exhaustive scrut-ty scrut-span infos)
+    (define span (burp-face scrut-span))
+    (define keys (map arm-info-key infos))
     (define (opt-key o)
       (define s (burp-face o))
       (If (Eq "TROW" (_1 s))
@@ -810,31 +853,49 @@
         (Ifz (Sz missing) 0
           (elab-error env "non-exhaustive match" ["missing" missing])))))
   (define (elab-case c[_ scr arms fall])
-    (define scrut (elab-val sut env scr))
-    (define arms1 (map (elab-arm (burp-face (tc-ty scrut))) arms))
+    (define sr (elab-val-context ctx env scr))
+    (define scrut (_1 sr))
+    (define scr-expanded
+      (ty:mold-to-span-context (_0 sr) (burp-face (tc-ty scrut))))
+    (define arm-state
+      (foldl (elab-arm (burp-face (tc-ty scrut))) [(_0 scr-expanded) []] arms))
+    (define infos (_1 arm-state))
+    (define arms1 (map arm-info-tc infos))
     ;; The fallthrough leg is lowered *inside* the match's let (the
     ;; scrutinee slot), so it must be elaborated with that local in
     ;; scope or its de-bruijn references come out shifted by one.
-    (define fall1
+    (define fallr
       (If (Eq foil-no-heir fall)
-        (tc-mean "unreachable")
-        (elab-val sut (push-local-env env (burp-face (tc-ty scrut))) fall)))
+        [(_0 arm-state) (tc-mean "unreachable")]
+        (elab-val-context (_0 arm-state)
+          (push-local-env env (burp-face (tc-ty scrut))) fall)))
+    (define fall1 (_1 fallr))
     (define fall-ty
       (If (Eq foil-no-heir fall) ty:TBOT (tc-ty fall1)))
-    (define out-ty (foldl (ty:type-join sut) fall-ty (map tc-ty arms1)))
-    (Seq (check-arms-distinct arms1)
+    (define joined
+      (foldl
+        (lambda (st arm)
+          (ty:type-join-context (_0 st) (_1 st) (tc-ty arm)))
+        [(_0 fallr) fall-ty]
+        arms1))
+    (define out-ty (_1 joined))
+    (Seq (check-arms-distinct infos)
       (Seq (If (Eq foil-no-heir fall)
-             (check-exhaustive (tc-ty scrut) arms1)
+             (check-exhaustive (tc-ty scrut) (_1 scr-expanded) infos)
              0)
-        (tc-match out-ty scrut arms1 fall1))))
+        [(_0 joined) (tc-match out-ty scrut arms1 fall1)])))
   (define (elab-if i[_ scr tru fall])
-    (define scrut (elab-val sut env scr))
-    (define tru1 (elab-val sut env tru))
-    (define fall1 (elab-val sut env fall))
-    (define out-ty (ty:type-join sut (tc-ty tru1) (tc-ty fall1)))
+    (define sr (elab-val-context ctx env scr))
+    (define tr (elab-val-context (_0 sr) env tru))
+    (define fr (elab-val-context (_0 tr) env fall))
+    (define scrut (_1 sr))
+    (define tru1 (_1 tr))
+    (define fall1 (_1 fr))
+    (define jr (ty:type-join-context (_0 fr) (tc-ty tru1) (tc-ty fall1)))
+    (define out-ty (_1 jr))
     (define if-ty (ty:TFUN [(ty:TNAT 0) out-ty out-ty] out-ty))
     (define if-tc (set-tc-ty if-ty (got-entry-tc (canon-path ["if"] sut) sut)))
-    (on-call if-tc [scrut tru1 fall1]))
+    (on-call (_0 jr) if-tc [scrut tru1 fall1]))
   (define (elab-self s[_ xs])
     (define found (find-idx match-self (env-locals env)))
     (define idx
@@ -845,8 +906,9 @@
     ;; peek-ret-cast leaves TBAD when the enclosing function carries no
     ;; ^ return cast; catch that here rather than failing on the apply.
     (unless (And (ty:is-tfun? fun-ty) (Equal ty:TBAD (ty:tfun-ret fun-ty)))
-	    (on-call (on-var 0 [(Ix idx (env-locals env)) [idx]])
-	      (map (elab-val sut env) xs))
+	    (let ((ar (elab-vals ctx env xs)))
+          (on-call (_0 ar) (on-var 0 [(Ix idx (env-locals env)) [idx]])
+	        (_1 ar)))
       (elab-error env
         "recursive call (_) requires the enclosing function to declare its return type with a ^ cast"
         0)))
@@ -855,14 +917,16 @@
   ;; nothing on members that don't use them.
   (define (elab-tvars t[_ vars body])
     (define env1 (push-env-tvars vars env))
-    (define tc (elab-val sut env1 body))
+    (define r (elab-val-context ctx env1 body))
+    (define tc (_1 r))
     (define (kept typ)
       (filter (lambda (v) (ty:type-mentions-var? v typ)) vars))
-    (If (Eq "TC_TYP" (Hd tc))
-      (let ((inner (_2 (tc-typ-inner tc))))
-        (tc-typ (ty:TTYP (wrap-tquas (kept inner) inner))))
-      (let ((typ (tc-ty tc)))
-        (set-tc-ty (wrap-tquas (kept typ) typ) tc))))
+    [(_0 r)
+     (If (Eq "TC_TYP" (Hd tc))
+       (let ((inner (_2 (tc-typ-inner tc))))
+         (tc-typ (ty:TTYP (wrap-tquas (kept inner) inner))))
+       (let ((typ (tc-ty tc)))
+         (set-tc-ty (wrap-tquas (kept typ) typ) tc)))])
   ;; Const generic parameters: elab the declared types (under the tvar
   ;; env — they may mention sibling tvars), make the names visible to
   ;; the body, and keep only the params the result uses.
@@ -870,30 +934,32 @@
     (define pairs
       (map (lambda (c[name tysast]) [name (elab-ty tysast)]) consts))
     (define env1 (set-env-consts (Weld pairs (env-consts env)) env))
-    (define tc (elab-val sut env1 body))
+    (define r (elab-val-context ctx env1 body))
+    (define tc (_1 r))
     (define typ0
       (If (Eq "TC_TYP" (Hd tc)) (_2 (tc-typ-inner tc)) (tc-ty tc)))
     (define (kept-const? p)
       (Or (tc-uses-cparam? (_0 p) tc)
         (ty:type-mentions-var? (_0 p) typ0)))
     (define kept (filter kept-const? pairs))
-    (If (Eq "TC_TYP" (Hd tc))
-      (tc-typ (ty:TTYP (ty:wrap-tcquas kept typ0)))
-      (set-tc-ty (ty:wrap-tcquas kept typ0) tc)))
+    [(_0 r)
+     (If (Eq "TC_TYP" (Hd tc))
+       (tc-typ (ty:TTYP (ty:wrap-tcquas kept typ0)))
+       (set-tc-ty (ty:wrap-tcquas kept typ0) tc))])
   (cond
     ((tag-is "s_fun")  (elab-fun surf))
     ((tag-is "s_cast") (elab-cast surf))
     ((tag-is "s_row") (elab-row surf))
-    ((tag-is "s_lit") (elab-lit surf))
+    ((tag-is "s_lit") [ctx (elab-lit surf)])
     ((tag-is "s_variant") (elab-variant surf))
     ((tag-is "s_app") (elab-call surf))
     ((tag-is "s_spec") (elab-spec surf))
-    ((tag-is "s_ref") (elab-ref surf))
-    ((tag-is "s_var") (elab-var surf))
+    ((tag-is "s_ref") [ctx (elab-ref surf)])
+    ((tag-is "s_var") [ctx (elab-var surf)])
     ((tag-is "s_case") (elab-case surf))
     ((tag-is "s_if") (elab-if surf))
     ((tag-is "s_span")
-      (elab-val sut (set-env-span (_1 surf) env) (burp-span surf)))
+      (elab-val-context ctx (set-env-span (_1 surf) env) (burp-span surf)))
     ((tag-is "s_meth") (elab-meth surf))
     ((tag-is "s_self") (elab-self surf))
     ((tag-is "s_tvars") (elab-tvars surf))
@@ -904,7 +970,7 @@
       (elab-unsupported env "UFCS put (.#) — use .set_<face>(val)"))
     ((tag-is "s_ufcs_over")
       (elab-unsupported env "UFCS update (.%) — use .over_<face>(fun)"))
-    ((tag-is "s_literal") (elab-literal surf))
+    ((tag-is "s_literal") [ctx (elab-literal surf)])
     ((or
        (tag-is "s_trow")
        (tag-is "s_tfun")
@@ -912,8 +978,13 @@
        ;; Every type-valued elaboration is normalized to TTYP so the
        ;; declaration path stores the type itself, not (say) a TFUN
        ;; whose _2 slot is its arity.
-       (tc-typ (as-ttyp (elab-ty surf))))
+       [ctx (tc-typ (as-ttyp (elab-ty surf)))])
     (else (elab-error env "unimplemented surface form" surf))))
+
+;; Public compatibility wrapper: the context and its memo tables are internal;
+;; callers still receive exactly the historical TC value.
+(define (elab-val sut env surf)
+  (_1 (elab-val-context (ty:make-type-context sut) env surf)))
 
 ;;; Module elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -969,7 +1040,7 @@
           (fold-kids (go span) acc1 node)))))
   (go span0 [] top))
 
-(define (elab-mod sut mod)
+(define (elab-mod-go sut mod profiled?)
   (define (insert-elab-tc name span tc sut)
     (If (Eq (Hd tc) "TC_TYP")
       (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
@@ -983,23 +1054,41 @@
   (define (elab-entry acc ent[_ name0 span body])
     (define sut (_0 acc))
     (define diags (_1 acc))
+    (define ctx (_2 acc))
     ;; Declarations insert at their rooted (canonical) key; source
     ;; references stay relative and resolve through canon-path.
     (define name (root-path sut name0))
     (define r
       (Try (lambda (z)
-             (let ((tc (elab-val sut (set-env-name name empty-env) body)))
-               (DeepSeq tc tc)))
+             (let* ((er0
+                      (elab-val-context ctx
+                        (set-env-name name empty-env) body))
+                    (tc
+                      (If profiled?
+                        (profile-zone:force-zone
+                          (strcat ["foil.elab.decl." (print-path name0)])
+                          (_1 er0))
+                        (_1 er0)))
+                    (er [(_0 er0) tc]))
+               ;; Force the public TC exactly as before.  The context contains
+               ;; memo payloads (often large recursive spans); deep-forcing the
+               ;; cache itself at every declaration defeats the memoization.
+               (DeepSeq tc er)))
         0))
     (If (Eq 1 (Hd r))
-      [(insert-tc name span (tc-mean ["elab failed" name]) sut)
-       (snoc [name (_0 r)] diags)]
-      (let* ((tc (_0 r))
+      (let ((sut1 (insert-tc name span (tc-mean ["elab failed" name]) sut)))
+        [sut1 (snoc [name (_0 r)] diags)
+         (ty:type-context-with-subject ctx sut1 0)])
+      (let* ((er (_0 r))
+             (ctx1 (_0 er))
+             (tc (_1 er))
              (acc? (can-gen-accessors? tc))
-             (sut1 (insert-elab-tc name span tc sut)))
-        [(Ifz acc? sut1
-           (gen-accessors name (_0 acc?) (_1 acc?) (_2 acc?) sut1))
-         diags])))
+             (sut1 (insert-elab-tc name span tc sut))
+             (sut2 (Ifz acc? sut1
+                     (gen-accessors name (_0 acc?) (_1 acc?) (_2 acc?) sut1)))
+             (type-env-changed? (Eq (Hd tc) "TC_TYP")))
+        [sut2 diags
+         (ty:type-context-with-subject ctx1 sut2 type-env-changed?)])))
   (define (scan-entry diags ent[_ name span body])
     ;; Imports are resolved by compile-mod before elaboration; one
     ;; reaching here means an inline module tried to import.
@@ -1026,13 +1115,26 @@
   ;; follow them, so checking at insert time is too early).
   (define (wf-entry sut1 diags ent[_ name span body])
     (define entry-tc (got-entry-tc (root-path sut1 name) sut1))
-    (define res (ty:check-type-wf sut1 (tc-ty entry-tc)))
+    (define res0 (ty:check-type-wf sut1 (tc-ty entry-tc)))
+    (define res
+      (If profiled?
+        (profile-zone:force-zone
+          (strcat ["foil.elab.well-formed." (print-path name)]) res0)
+        res0))
     (If (Eq "left" (Hd res))
       (snoc ["in-decl" name (_0 res) (span-blurb span)] diags)
       diags))
-  (define diags (foldl scan-entry [] mod))
+  (define diags0 (foldl scan-entry [] mod))
+  (define diags
+    (If profiled?
+      (profile-zone:force-zone "foil.elab.unsupported-scan" diags0)
+      diags0))
   (Ifz (Sz diags)
-    (let ((r (foldl elab-entry [sut []] mod)))
+    (let ((r (foldl elab-entry
+               [sut [] (If profiled?
+                         (ty:make-profile-type-context sut)
+                         (ty:make-type-context sut))]
+               mod)))
       (Ifz (Sz (_1 r))
         (let ((wf-diags (foldl (wf-entry (_0 r)) [] mod)))
           (Ifz (Sz wf-diags)
@@ -1040,3 +1142,9 @@
             (error ["foil-type-wf" wf-diags])))
         (error ["foil-elab-errors" (_1 r)])))
     (error ["foil-unsupported" diags])))
+
+(define (elab-mod sut mod)
+  (elab-mod-go sut mod 0))
+
+(define (elab-mod-profiled sut mod)
+  (elab-mod-go sut mod 1))
