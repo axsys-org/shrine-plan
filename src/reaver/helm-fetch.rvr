@@ -1,0 +1,195 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind http-client (#module http-client))
+(#import http-client)
+
+
+;;; The outbound-HTTP driver: a helm worker whose requests ride the
+;;; namespace.  A fetch request is a record MADE at a fresh path under
+;;; the driver's name (/io/<name>/<kid>, any kid); the fetch_take kook
+;;; on the driver node marks it ['fresh <kid>] on the driver record,
+;;; and — because helm x-watches each /io name's own record — that
+;;; write is the worker's notification.  The worker reads the request
+;;; record, spawns one actor per request (Fetch parks its caller; the
+;;; worker itself never fetches), and pokes the res_* slots back onto
+;;; the request node — the requester's own kook (or a crew dep on the
+;;; node) consumes them.  The requester owns the node: the driver
+;;; never culls it.
+;;;
+;;; v1 limitation: behaviors cannot CREATE records under /io from
+;;; outside that subtree (outside-subtree cards route up as moves,
+;;; which the shell drops) — requests enter via injected tasks
+;;; (["task" (vine_make [io <name> <kid>] (fetch_req ..))]) or worker
+;;; cmds.  Behaviors can still consume responses reactively.
+;;;
+;;; Worker mailbox:
+;;;   from the coordinator: ["go" res] ["change" pax res]
+;;;                         ["qres" pax res] ["ack" rsvp] ["die"]
+;;;   from fetch actors: ["fres" kid result]
+;;;
+;;; Ack correlation: worker->coordinator sends are FIFO and the
+;;; coordinator acks each cmd within its turn, so acks return in cmd
+;;; order — a queue of [kid kind] entries (kinds "res" "clear") pairs
+;;; each ack with its command.
+;;;
+;;; helpers = ["F" tslot fetch_fresh fetch_hdrs fetch_res_ok
+;;;            fetch_res_err put_nat t0 vine_poke] — compiled lainapp
+;;; entries, supplied by whoever spawns the coordinator.
+
+(define (f-slot fs) (Ix 1 fs))
+(define (f-fresh fs) (Ix 2 fs))
+(define (f-hdrs fs) (Ix 3 fs))
+(define (f-ok fs) (Ix 4 fs))
+(define (f-err fs) (Ix 5 fs))
+(define (f-put fs) (Ix 6 fs))
+(define (f-t0 fs) (Ix 7 fs))
+(define (f-poke fs) (Ix 8 fs))
+
+(define crlf (strWeld 13 10))
+
+;; Response headers ride one encoded slot: "Name: value" CRLF each.
+(define (join-hdrs hs)
+  (strcat (map (lambda (h) (lstrcat ~[(Ix 0 h) ": " (Ix 1 h) crlf])) hs)))
+
+(define (row-has k xs)
+  (includes (Equal k) xs))
+
+(define (row-drop k xs)
+  (filter (lambda (e) (Nil (Equal k e))) xs))
+
+(define (row-weld a b)
+  (foldl (flip snoc) a b))
+
+;; One actor per request: handshake for the worker handle, park in
+;; the transfer, hand the result back.
+(define (fetch-actor req cfg kid self)
+  (define mc (Recv 0))
+  (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
+  (define r (Fetch req cfg))
+  (define m ["fres" kid r])
+  (Seq (DeepSeq m m)
+    (Send wh m)))
+
+(define (mk-fetch-worker fs name self)
+  (define mc (Recv 0))
+  (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
+  (define rec0 (_1 (Ix 0 mc)))
+  (define dpath [("ts" "io") name])
+  (define (rpath kid) [("ts" "io") name kid])
+  ;; the unclaimed fresh kids of a driver record
+  (define (fresh-kids claimed m)
+    (filter (lambda (k) (Nil (row-has k claimed))) ((f-fresh fs) m)))
+  ;; ask for each new request record; replies arrive as ["qres" ..]
+  (define (read-kids kids)
+    (map (lambda (k) (SendCaps coord (DeepSeq k ["read" (rpath k)]) [0]))
+      kids))
+  (define (mk-resmyth r)
+    (If (fetch-ok? r)
+      ((f-ok fs) (res-status r) (res-url r)
+        (join-hdrs (res-headers r)) (res-body r))
+      ((f-err fs) (fetch-err r))))
+  ;; the marker-clear poke payload: ['fresh <kid>] back to 0
+  (define (mk-clear kid)
+    ((f-put fs) ((f-t0 fs) 0) [("ts" "fresh") kid] 0))
+  ;; state: claimed = kids acted on (dedup against re-tells), reading =
+  ;; kids awaiting ["qres"], pending = kids with a fetch actor in
+  ;; flight, queue = [[kid kind] ..] ack correlation
+  (define (loop claimed reading pending queue)
+    (define m (Recv 0))
+    (define msg (Ix 0 m))
+    (define kind (_0 msg))
+    ;; poke the response onto the request node, then clear its marker
+    (define (respond kid resmyth reading2 pending2)
+      (let ((cm1 ["cmd" name ((f-poke fs) (rpath kid) resmyth)])
+            (cm2 ["cmd" name ((f-poke fs) dpath (mk-clear kid))]))
+        (Seq (DeepSeq cm1 (DeepSeq cm2 cm2))
+          (Seq (Send coord cm1)
+            (Seq (Send coord cm2)
+              (loop claimed reading2 pending2
+                (snoc [kid "clear"] (snoc [kid "res"] queue))))))))
+    (cond
+      ((Eq kind "change")
+        ;; only the driver node's own record carries fresh markers
+        (let ((res (_2 msg)))
+          (If (Or (Nil (Equal dpath (_1 msg)))
+                (Nil (Eq "known" (Hd res))))
+            (loop claimed reading pending queue)
+            (let ((kids (fresh-kids claimed (_0 res))))
+              (let ((sends (read-kids kids)))
+                (Seq (DeepSeq sends sends)
+                  (loop (row-weld claimed kids) (row-weld reading kids)
+                    pending queue)))))))
+      ((Eq kind "qres")
+        ;; a request record arrived: build the transfer, or answer the
+        ;; malformed/vanished ones immediately
+        (let ((kid (Ix 2 (_1 msg)))
+              (res (_2 msg)))
+          (If (Nil (row-has kid reading))
+            (loop claimed reading pending queue)
+            (let ((reading2 (row-drop kid reading)))
+              (If (Nil (Eq "known" (Hd res)))
+                ;; culled before the read: nothing to answer, just
+                ;; clear the marker
+                (let ((cm ["cmd" name ((f-poke fs) dpath (mk-clear kid))]))
+                  (Seq (DeepSeq cm cm)
+                    (Seq (Send coord cm)
+                      (loop claimed reading2 pending
+                        (snoc [kid "clear"] queue)))))
+                (let* ((rec (_0 res))
+                       (slot (f-slot fs))
+                       (method (slot [("ts" "method")] 0 rec))
+                       (url (slot [("ts" "url")] 0 rec)))
+                  (If (Or (Nil method) (Nil url))
+                    ;; not a fetch request: answer bad-url in place
+                    (respond kid ((f-err fs) err-bad-url) reading2 pending)
+                    (let* ((body (slot [("ts" "body")] 0 rec))
+                           (deadline (slot [("ts" "deadline")]
+                                       default-deadline-ms rec))
+                           (connect (slot [("ts" "connect")] 0 rec))
+                           (redirects (slot [("ts" "redirects")] 0 rec))
+                           (maxbody (slot [("ts" "maxbody")]
+                                      default-max-body rec))
+                           (req (mk-req method url ((f-hdrs fs) rec) body))
+                           (cfg (mk-cfg connect deadline redirects maxbody)))
+                      (Seq (DeepSeq req (DeepSeq cfg cfg))
+                        (Seq (let ((fa (Spawn (fetch-actor req cfg kid))))
+                               (SendCaps fa ["go"] [0]))
+                          (loop claimed reading2 (snoc kid pending)
+                            queue)))))))))))
+      ((Eq kind "fres")
+        (let ((kid (_1 msg)))
+          (respond kid (mk-resmyth (_2 msg)) reading
+            (row-drop kid pending))))
+      ((Eq kind "ack")
+        ;; acks return in cmd order: pop the queue head
+        (let ((head (Ix 0 queue))
+              (rest (drop 1 queue))
+              (rsvp (_1 msg)))
+          (cond
+            ((Eq "no" (Hd rsvp))
+              ;; the poke failed (requester culled, or the driver node
+              ;; vanished): nothing to unwind — on a failed clear the
+              ;; kid stays claimed, which is the safe side
+              (Seq (Trace ["fetch: cmd failed" (_0 head) (_1 head)] 0)
+                (loop claimed reading pending rest)))
+            ((Equal "clear" (_1 head))
+              ;; marker cleared: forget the kid (a re-made kid of the
+              ;; same name is a fresh request)
+              (loop (row-drop (_0 head) claimed) reading pending rest))
+            (else (loop claimed reading pending rest)))))
+      ((Eq kind "die") ["dead"])
+      (else (loop claimed reading pending queue))))
+  (define kids0
+    (If (Eq "known" (Hd rec0)) (fresh-kids [] (_0 rec0)) []))
+  (define sends0 (read-kids kids0))
+  (Seq coord
+    (Seq (DeepSeq kids0 (DeepSeq sends0 sends0))
+      (loop kids0 kids0 [] []))))

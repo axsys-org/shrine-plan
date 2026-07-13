@@ -15,6 +15,8 @@
 
 (#bind foil (#module foil))
 (#bind helm (#module helm))
+(#bind http-client (#module http-client))
+(#bind helm-fetch (#module helm-fetch))
 
 
 ;;; The HTTP driver: a helm worker whose requests ride the namespace.
@@ -111,7 +113,10 @@
 (define (conn-actor fd self)
   (define mc (Recv 0))
   (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
-  (define input (Read fd 65536))
+  ;; Read returns a bar (data then a 0x01 terminator): strip the
+  ;; terminator, or a request body would carry a stray trailing 0x01
+  (define raw (Read fd 65536))
+  (define input (str-slice 0 (Dec (Bytes raw)) raw))
   (define parsed (Try milton:parse-http-request input))
   (define method (If (Eq 1 (Hd parsed)) "GET" (Ix 0 (_0 parsed))))
   (define target (If (Eq 1 (Hd parsed)) "/" (Ix 1 (_0 parsed))))
@@ -270,13 +275,19 @@
   (define warm
     (DeepSeq
       [(DeepSeq [conn-actor listener-pump mk-http-worker res-of
-                 pend-get pend-drop] 0)
+                 pend-get pend-drop
+                 helm-fetch:mk-fetch-worker helm-fetch:fetch-actor] 0)
        (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
        (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
        (url-target "/ns/a/b")
        (http-res 200 "text/plain" "hi")
        (http-res 500 "text/plain" "no")
-       (request-body (strcat ["GET / HTTP/1.0" crlf crlf "body"]))]
+       (request-body (strcat ["GET / HTTP/1.0" crlf crlf "body"]))
+       (helm-fetch:join-hdrs [["a" "b"]])
+       (helm-fetch:row-has 1 [1 2])
+       (helm-fetch:row-drop 1 [1 2])
+       (helm-fetch:row-weld [1] [2])
+       (http-client:fetch-warm 0)]
       0))
   (define core (Seq warm (helm:load-helm-mod "helmapp")))
   (define (app path) (helm:core-ent core path))
@@ -291,7 +302,14 @@
   (define cfg-port (app ["http_cfg_port"]))
   (define helpers
     ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
-  (define (mk-worker n) (mk-http-worker helpers n))
+  (define fhelpers
+    ["F" (app ["tslot"]) (app ["fetch_fresh"]) (app ["fetch_hdrs"])
+     (app ["fetch_res_ok"]) (app ["fetch_res_err"]) (app ["put_nat"])
+     (app ["t0"]) (app ["vine_poke"])])
+  (define (mk-worker n)
+    (If (Equal n ("ts" "http-client"))
+      (helm-fetch:mk-fetch-worker fhelpers n)
+      (mk-http-worker helpers n)))
   ;; seed in MAIN (DeepSeq before Spawn): the reef seeding code cannot
   ;; compile-on-demand inside the coordinator ("no compiler set")
   (define coord
@@ -303,9 +321,11 @@
   ;; something to look at
   (Seq (inject (vine-make [("ts" "data") ("ts" "hello")] (t-data [("ts" "num")] 41)))
     (Seq (inject (vine-make [("ts" "data") ("ts" "hello") ("ts" "world")] (t-data [("ts" "num")] 42)))
-      ;; the driver: explorer responder, real listener
+      ;; the drivers: explorer responder on a real listener, plus the
+      ;; outbound fetch driver at /io/http-client
       (Seq (inject (vine-make [("ts" "io") ("ts" "http")] (cfg-port ("ts" "hex") port)))
+        (Seq (inject (vine-make [("ts" "io") ("ts" "http-client")] ((app ["fetch_cfg"]) 0)))
         (Seq (Trace ["lain listening" port] 0)
           ;; park: the coordinator and its actors do the work now
           (let ((park (lambda (go z) (Seq (Recv 0) (go go z)))))
-            (park park 0)))))))
+            (park park 0))))))))

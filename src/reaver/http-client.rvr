@@ -1,0 +1,120 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+
+;;; The outbound-HTTP op: enki's op 83, a coordination effect like
+;;; Recv — the calling actor parks while libcurl runs the transfer;
+;;; other actors execute meanwhile.  One fetch per actor at a time.
+;;;
+;;;   Result   = (0 response) | (1 errCode)
+;;;   Response = [status urlBar headersRow bodyBar]  (final response
+;;;              of the redirect chain; the body arrives decoded even
+;;;              when Content-Encoding says otherwise)
+;;;   Request  = [methodBar urlBar headersRow bodyMaybe]
+;;;   Config   = [connectMsMaybe deadlineMs redirects bodyMode]
+;;;     where Maybe x = 0 | [x], headersRow = 0 | [[nameBar valBar]..],
+;;;     bodyMode = [maxBytes] (buffered; the only mode in v1)
+;;;
+;;; A bar is a byte string as a nat: the data bytes then a 0x01
+;;; terminator (so trailing NULs survive the nat encoding).  Requests
+;;; are validated at service time: a zero deadline, a non-http(s) or
+;;; relative url, a bad method token, or CR/LF/NUL in a header all
+;;; return (1 err-bad-url) without any transfer.
+
+(#bind S (#pin 83))
+
+(#bind Fetch
+  (#fun pin noinline "Fetch" (Fetch req cfg)
+    (S ("Fetch" req cfg))))
+
+
+;;; Bars ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (mk-bar s)
+  (strWeld s 1))
+
+;; Strip exactly the top (sentinel) byte, keeping embedded and
+;; trailing NULs in the data.
+(define (un-bar b)
+  (Mod b (Lsh 1 (Mul 8 (Dec (Bytes b))))))
+
+
+;;; Requests ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; [[name val]..] -> headersRow; the empty row is nat 0 already.
+(define (mk-headers pairs)
+  (Ifz pairs 0
+    (map (lambda (h) [(mk-bar (Ix 0 h)) (mk-bar (Ix 1 h))]) pairs)))
+
+;; body 0 = no body (a POST with a genuinely empty body is not
+;; expressible in this convention; send a placeholder if you need it).
+(define (mk-req method url headers body)
+  [(mk-bar method) (mk-bar url) (mk-headers headers)
+   (Ifz body 0 [(mk-bar body)])])
+
+;; connect 0 = none (the runtime's default, 10s).  deadline must be
+;; nonzero.  redirects 0 = no follow.  maxbytes caps the buffered
+;; response body (err-too-large beyond it).
+(define (mk-cfg connect deadline redirects maxbytes)
+  [(Ifz connect 0 [connect]) deadline redirects [maxbytes]])
+
+(define default-deadline-ms 30000)
+(define default-max-body 1048576)
+
+(define (cfg-simple z)
+  (mk-cfg 0 default-deadline-ms 0 default-max-body))
+
+
+;;; Results ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (fetch-ok? r) (Eq 0 (Hd r)))
+(define (fetch-err r) (_0 r))
+
+(define (res-status r) (Ix 0 (_0 r)))
+(define (res-url r) (un-bar (Ix 1 (_0 r))))
+(define (res-body r) (un-bar (Ix 3 (_0 r))))
+
+(define (res-headers r)
+  (define hrow (Ix 2 (_0 r)))
+  (Ifz hrow []
+    (map (lambda (h) [(un-bar (Ix 0 h)) (un-bar (Ix 1 h))]) hrow)))
+
+;; The error taxonomy (stable ABI).
+(define err-bad-url   0)
+(define err-dns       1)
+(define err-connect   2)
+(define err-tls       3)
+(define err-deadline  4)
+(define err-redirects 5)
+(define err-too-large 6)
+(define err-protocol  7)
+
+
+;;; Warmup ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Call every pure codec once: spawned actors have no compiler, so a
+;; main-actor warm list must compile the graph fetch actors will
+;; touch.  DeepSeq stops at pins, so Fetch itself is referenced, not
+;; invoked.
+(define (fetch-warm z)
+  (define fake-ok
+    [[200 (mk-bar "http://x/") [[(mk-bar "n") (mk-bar "v")]]
+      (mk-bar "body")]])
+  [Fetch
+   (mk-req "GET" "http://x/" [["a" "b"]] "hi")
+   (mk-req "GET" "http://x/" [] 0)
+   (cfg-simple 0)
+   (mk-cfg 500 1000 3 4096)
+   (un-bar (mk-bar "roundtrip"))
+   (fetch-ok? fake-ok)
+   (res-status fake-ok)
+   (res-url fake-ok)
+   (res-body fake-ok)
+   (res-headers fake-ok)])

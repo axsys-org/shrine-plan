@@ -1,0 +1,264 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind http-client (#module http-client))
+(#import http-client)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind milton (#module milton))
+(#bind helm (#module helm))
+(#bind helm-http (#module helm-http))
+(#bind helm-fetch (#module helm-fetch))
+
+
+;;; Requires an enki with the op-83 HTTP driver (the lf/http-drivers
+;;; flake input): every Fetch below that fails validation returns
+;;; (1 err-bad-url) at the service point, without any transfer.
+
+;;; A. codecs ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal "hi" (un-bar (mk-bar "hi")))
+assert(Equal "" (un-bar (mk-bar "")))
+assert(Equal [(mk-bar "GET") (mk-bar "http://x/") 0 0]
+             (mk-req "GET" "http://x/" [] 0))
+assert(Equal [(mk-bar "POST") (mk-bar "http://x/")
+              [[(mk-bar "a") (mk-bar "b")]] [(mk-bar "hi")]]
+             (mk-req "POST" "http://x/" [["a" "b"]] "hi"))
+assert(Equal [0 30000 0 [1048576]] (cfg-simple 0))
+assert(Equal [[250] 1000 3 [4096]] (mk-cfg 250 1000 3 4096))
+
+;;; A. validation failures — no network, no transfer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (bad? r)
+  (And (Eq 1 (Hd r)) (Eq err-bad-url (fetch-err r))))
+
+;; a zero deadline is an unbounded suspension: rejected
+assert(Eq 1 (bad? (Fetch (mk-req "GET" "http://example.com/" [] 0)
+                         (mk-cfg 0 0 0 1024))))
+
+;; only http(s), only absolute
+assert(Eq 1 (bad? (Fetch (mk-req "GET" "ftp://example.com/" [] 0)
+                         (cfg-simple 0))))
+assert(Eq 1 (bad? (Fetch (mk-req "GET" "/relative" [] 0)
+                         (cfg-simple 0))))
+
+;; Spooled body mode is reserved
+assert(Eq 1 (bad? (Fetch (mk-req "GET" "http://example.com/" [] 0)
+                         [0 5000 0 1])))
+
+;; header values must not carry CR/LF; methods must be tokens
+assert(Eq 1 (bad? (Fetch (mk-req "GET" "http://example.com/"
+                                 [["x-a" (strWeld "v" 10)]] 0)
+                         (cfg-simple 0))))
+assert(Eq 1 (bad? (Fetch (mk-req (strWeld "GE" (strWeld " " "T"))
+                                 "http://example.com/" [] 0)
+                         (cfg-simple 0))))
+
+;;; B. boot: coordinator + both drivers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; The inbound /io/http driver on a real loopback port is the server
+;;; the outbound driver fetches from.  Spawned actors have no
+;;; compiler, so the socket paths and the fetch paths are warmed in
+;;; MAIN first (run-lain's pattern; Part A above already exercised
+;;; the http-client codecs here).
+
+(define crlf helm-http:crlf)
+
+(define warm
+  (DeepSeq
+    [(DeepSeq [helm-http:conn-actor helm-http:listener-pump
+               helm-http:mk-http-worker helm-http:res-of
+               helm-http:pend-get helm-http:pend-drop
+               helm-fetch:mk-fetch-worker helm-fetch:fetch-actor] 0)
+     (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
+     (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
+     (helm-http:url-target "/ns/a/b")
+     (helm-http:http-res 200 "text/plain" "hi")
+     (helm-http:http-res 500 "text/plain" "no")
+     (helm-http:request-body (strcat ["GET / HTTP/1.0" crlf crlf "body"]))
+     (helm-fetch:join-hdrs [["a" "b"]])
+     (helm-fetch:row-has 1 [1 2])
+     (helm-fetch:row-drop 1 [1 2])
+     (helm-fetch:row-weld [1] [2])
+     (fetch-warm 0)]
+    0))
+
+(define core (Seq warm (helm:load-helm-mod "helmapp")))
+
+(define (app path) (helm:core-ent core path))
+(define t-data (app ["t_data"]))
+(define vine-make (app ["vine_make"]))
+(define http-cfg-port (app ["http_cfg_port"]))
+(define fetch-cfg (app ["fetch_cfg"]))
+(define fetch-req (app ["fetch_req"]))
+(define put-nat (app ["put_nat"]))
+(define tslotf (app ["tslot"]))
+
+(define helpers
+  ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
+(define fhelpers
+  ["F" (app ["tslot"]) (app ["fetch_fresh"]) (app ["fetch_hdrs"])
+   (app ["fetch_res_ok"]) (app ["fetch_res_err"]) (app ["put_nat"])
+   (app ["t0"]) (app ["vine_poke"])])
+
+(define tio ("ts" "io"))
+(define thttp ("ts" "http"))
+(define thc ("ts" "http-client"))
+
+(define (mk-worker n)
+  (If (Equal n thc)
+    (helm-fetch:mk-fetch-worker fhelpers n)
+    (helm-http:mk-http-worker helpers n)))
+
+(define coord
+  (let ((s ((app ["seeded"]) 0)))
+    (Seq (DeepSeq s s)
+      (Spawn (helm:helm-actor core mk-worker s)))))
+
+(define (ask m)
+  (Seq (SendCaps coord (DeepSeq m m) [0])
+    (Recv 0)))
+(define (inject t)
+  (Ix 0 (ask ["task" t])))
+
+(define port 18473)
+(define base-url "http://127.0.0.1:18473")
+
+;; the loopback server: the namespace explorer on a real port — its
+;; responses need no request body (the naive single-Read socket layer
+;; can race a POST body into a second segment), and they are large,
+;; so the too-large cap below is deterministic
+assert(Equal ["done"] (inject (vine-make [tio thttp]
+                                (http-cfg-port ("ts" "hex") port))))
+;; the outbound driver
+assert(Equal ["done"] (inject (vine-make [tio thc] (fetch-cfg 0))))
+
+;;; C1. the op end-to-end, library-level (isolates op from driver) ;;;;;;;;;;;;;;
+
+;; the listener binds asynchronously: retry connect-refused until up
+(define (fetch-until-up req cfg fuel)
+  (define r (Fetch req cfg))
+  (cond
+    ((fetch-ok? r) r)
+    ((Eq 0 fuel) r)
+    ((Eq err-connect (fetch-err r)) (fetch-until-up req cfg (Dec fuel)))
+    (else r)))
+
+(define (starts-with pre s)
+  (Eq pre (Mod s (Lsh 1 (Mul 8 (Bytes pre))))))
+(define (contains? needle hay)
+  (define nb (Bytes needle))
+  (define hb (Bytes hay))
+  (define (go i)
+    (cond
+      ((Gt (Add i nb) hb) 0)
+      ((Eq needle (Mod (Rsh hay (Mul 8 i)) (Lsh 1 (Mul 8 nb)))) 1)
+      (else (go (Inc i)))))
+  (go 0))
+
+(define c1 (fetch-until-up (mk-req "GET" (strWeld base-url "/ns") [] 0)
+                           (cfg-simple 0) 1000))
+assert(Eq 1 (fetch-ok? c1))
+assert(Eq 200 (res-status c1))
+assert(Eq 1 (starts-with "<!doctype html>" (res-body c1)))
+assert(Eq 1 (contains? "/ns/io" (res-body c1)))
+assert(Equal (strWeld base-url "/ns") (res-url c1))
+assert(Eq 1 (includes (lambda (h) (Equal "Content-Type" (Ix 0 h)))
+              (res-headers c1)))
+
+;;; C2. through the namespace driver ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; poll the committed record until the driver wrote ['res_done]
+(define (poll pax fuel)
+  (define q (Ix 0 (ask ["query" pax])))
+  (cond
+    ((Eq 0 fuel) (error ["poll-timeout" pax]))
+    ((And (Eq "known" (Hd q)) (tslotf [("ts" "res_done")] 0 (_0 q)))
+      (_0 q))
+    (else (poll pax (Dec fuel)))))
+
+(define (rslot m s d) (tslotf [("ts" s)] d m))
+
+(define tq0 ("ts" "q0"))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq0]
+            (fetch-req "GET" (strWeld base-url "/ns") 0 5000))))
+(define m0 (poll [tio thc tq0] 20000))
+assert(Eq 1 (rslot m0 "res_ok" 0))
+assert(Eq 200 (rslot m0 "res_status" 0))
+assert(Eq 1 (starts-with "<!doctype html>" (rslot m0 "res_body" 0)))
+assert(Eq 1 (contains? "text/html" (rslot m0 "res_hdrs" 0)))
+
+;; the fresh marker on the driver node polls back to 0
+(define (poll-clear kid fuel)
+  (define q (Ix 0 (ask ["query" [tio thc]])))
+  (cond
+    ((Eq 0 fuel) (error ["clear-timeout" kid]))
+    ((And (Eq "known" (Hd q))
+       (Eq 0 (tslotf [("ts" "fresh") kid] 1 (_0 q))))
+      1)
+    (else (poll-clear kid (Dec fuel)))))
+assert(Eq 1 (poll-clear tq0 20000))
+
+;;; C3. failure taxonomy through the driver ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; the buffered cap trips: too-large
+(define tq1 ("ts" "q1"))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq1]
+            (put-nat (fetch-req "GET" (strWeld base-url "/ns") 0 5000)
+              [("ts" "maxbody")] 2))))
+(define m1 (poll [tio thc tq1] 20000))
+assert(Eq 0 (rslot m1 "res_ok" 9))
+assert(Eq err-too-large (rslot m1 "res_err" 9))
+
+;; nobody listens on port 1: connect refused (a paranoid sandbox
+;; could surface err-deadline instead; loopback refusal is immediate)
+(define tq2 ("ts" "q2"))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq2]
+            (fetch-req "GET" "http://127.0.0.1:1/" 0 2000))))
+(define m2 (poll [tio thc tq2] 20000))
+assert(Eq 0 (rslot m2 "res_ok" 9))
+assert(Eq err-connect (rslot m2 "res_err" 9))
+
+;; validation failures ride the record path too
+(define tq3 ("ts" "q3"))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq3] (fetch-req "GET" "ftp://x/" 0 2000))))
+(define m3 (poll [tio thc tq3] 20000))
+assert(Eq 0 (rslot m3 "res_ok" 9))
+assert(Eq err-bad-url (rslot m3 "res_err" 9))
+
+;;; C4. concurrent requests ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define tq4 ("ts" "q4"))
+(define tq5 ("ts" "q5"))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq4]
+            (fetch-req "GET" (strWeld base-url "/ns") 0 5000))))
+assert(Equal ["done"]
+  (inject (vine-make [tio thc tq5]
+            (fetch-req "GET" (strWeld base-url "/ns/io") 0 5000))))
+(define m4 (poll [tio thc tq4] 20000))
+(define m5 (poll [tio thc tq5] 20000))
+assert(Eq 200 (rslot m4 "res_status" 0))
+assert(Eq 200 (rslot m5 "res_status" 0))
+assert(Eq 1 (contains? "/ns/io" (rslot m4 "res_body" 0)))
+assert(Eq 1 (contains? "/ns/io/http" (rslot m5 "res_body" 0)))
+
+;;; D. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
+
+(print "http-client tests passed")
