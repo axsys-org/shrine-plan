@@ -79,6 +79,57 @@
 (define (core-ent core path)
   (foil:ir-entry-val (got-entry (Weld ["boot"] path) (core-sut core))))
 
+;;; Persistent precompiled image ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A helm core wrapped with enough provenance to know when it is stale:
+;; the foil compiler token plus this loader chain, and the source bytes
+;; of the module's whole import closure.  The launcher binds the image
+;; to a snapshot top level (x/lain: _lain_image_v1); Reaver's snapshot
+;; continuation persists it, so a later process boots from the compiled
+;; core without compiling anything (the same free persistence ride
+;; foil-cache.rvr uses for per-module artifacts).
+
+(define image-schema 1)
+
+(define (image-token z)
+  ;; A compiler or loader change must invalidate the image; source
+  ;; changes are caught by image-sources below.
+  (Pin [image-schema (foil:artifact-compiler-token 0) load-helm-mod]))
+
+(define (image-sources mod)
+  (map (lambda (m) [m (foil:get-foil m)])
+    (foil:artifact-module-closure [mod])))
+
+(define (make-helm-image mod)
+  (define core (load-helm-mod mod))
+  (define img ["HELM_IMAGE" mod (image-token 0) (image-sources mod) core])
+  (DeepSeq core (Pin img)))
+
+(define (helm-image-body img)
+  (If (IsPin img) (Unpin img) 0))
+
+(define (helm-image-core img)
+  (Ix 4 (helm-image-body img)))
+
+(define (helm-image-valid? img mod)
+  (define b (helm-image-body img))
+  (And (IsApp b)
+    (And (Eq "HELM_IMAGE" (_0 b))
+      (And (Eq mod (Ix 1 b))
+        (And (Equal (image-token 0) (Ix 2 b))
+          (all (lambda (e) (Equal (_1 e) (foil:get-foil (_0 e))))
+            (Ix 3 b)))))))
+
+;; Reuse a valid image; rebuild otherwise.  Validation runs under Try
+;; so a malformed image (or a deleted source file) is a rebuild, not a
+;; wedge.  An import-graph change always shows up as changed bytes in
+;; some already-listed source, so the stored closure stays sound.
+(define (helm-image-refresh img mod)
+  (define v (Try (lambda (z) (helm-image-valid? img mod)) 0))
+  (If (And (Nil (Eq 1 (Hd v))) (_0 v))
+    img
+    (make-helm-image mod)))
+
 ;;; The /boot mirror ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; The boot image, materialized into the namespace so the system can
@@ -109,7 +160,7 @@
 (define (boot-mirror-tasks core)
   (define raw-cache (core-cache core))
   (define cache
-    (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (Hd raw-cache)))
+    (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
       (map
         (lambda (ce)
           (let ((body (foil:artifact-body (_1 ce))))

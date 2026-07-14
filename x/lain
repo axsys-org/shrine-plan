@@ -2,10 +2,21 @@
 # HTTP driver at /io/http, and the weft namespace explorer — on port
 # 8090.  Builds the snapshot first if needed (same staging as x/test).
 #
-#   x/lain          # port 8090
-#   x/lain 9000     # custom port
+#   x/lain            # port 8090
+#   x/lain 9000       # custom port
+#   x/lain --fresh    # rebuild the precompiled image even if valid
 #
 # Then browse http://localhost:<port>/ns
+#
+# Startup is two sessions.  The warm session refreshes _lain_image_v1
+# (a precompiled helm core — helm.rvr "Persistent precompiled image")
+# and exits, which persists it through the ordinary top-of-loop
+# snapshot save; the serve session then boots from the image without
+# compiling anything.  The compile only reruns when a foil source in
+# helmapp's import closure, the compiler, or the loader changed.  The
+# serve session itself never persists: the repl saves before
+# evaluating run-lain-image and the serve form parks forever, so
+# killing and restarting the server replays the image, not the build.
 
 set -ex
 
@@ -44,12 +55,47 @@ if [ ! -e snap/root.plan ]
 then reset; load_stdlib; load_quip
 fi
 
-# x/foil-cache ${FRESH} helmapp
+# One snapshot warmer at a time (shared with x/foil-cache: concurrent
+# resumed sessions would interleave their snapshot appends).
+lock=snap/.foil-artifact-cache.lock
+while ! mkdir "$lock" 2>/dev/null; do sleep 1; done
+log="${TMPDIR:-/tmp}/lain-warm-$$.log"
+cleanup() {
+  rmdir "$lock" 2>/dev/null || true
+  rm -f "$log"
+}
+trap cleanup EXIT INT TERM
+
+warm () {
+  repl >"$log" 2>&1 <<EOF
+(#bind helm (#module helm))
+(#bind _lain_image_v1 (helm:helm-image-refresh $1 "helmapp"))
+EOF
+}
+
+echo "warming lain image (a source change means a full rebuild)" >&2
+warm_status=0
+if [ -n "$FRESH" ]; then
+  warm 0 || warm_status=$?
+else
+  warm _lain_image_v1 || warm_status=$?
+  # First run against a snapshot that has never bound the image.
+  if grep -q '"ERROR"' "$log" && grep -q '"unbound"' "$log"; then
+    warm_status=0
+    warm 0 || warm_status=$?
+  fi
+fi
+if [ "$warm_status" -ne 0 ] || grep -q '"ERROR"' "$log"; then
+  tail -80 "$log" >&2
+  exit 1
+fi
+
+rmdir "$lock" 2>/dev/null || true
+trap 'rm -f "$log"' EXIT INT TERM
 
 echo "lain exploring on http://localhost:${PORT}/ns" >&2
 
 repl <<EOF
 (#bind helm-http (#module helm-http))
-(helm-http:run-lain ${PORT})
+(helm-http:run-lain-image ${PORT} _lain_image_v1)
 EOF
-# (helm-http:run-lain-artifact-cached ${PORT} _foil_artifact_cache_v1)

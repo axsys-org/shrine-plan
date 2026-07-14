@@ -34,7 +34,7 @@ definition is in the body.
 | title      | a name's full history — the stream of its moments                     |
 | `$pail`    | a `Dynamic`: a value carrying its own (namespace) type tag            |
 | `$myth`    | the record/document at a name: a map of slots to values               |
-| `$aeon`    | the version header: history position + signature + content hash       |
+| `$aeon`    | the version header: path-local care locks + time + security metadata   |
 | `$saga`    | the data at a version: `(myth, aeon)`                                 |
 | `$epic`    | a consistent snapshot of part of the namespace                        |
 | care       | read depth: this node / + children / whole subtree (`cat`/`ls`/`ls -R`)|
@@ -163,10 +163,12 @@ dynamic object keyed by well-known names than to a struct.
 ### `$aeon` — metadata
 
 An **`$aeon`** is the versioning header for a name. It carries: the version
-information needed to locate the name temporally (its position in the title),
+information needed to locate the name temporally (its path-local care locks),
 a **content hash** of the myth, and a **signature**. The hash content-addresses
-the myth (enabling pinning and dedup); the signature is the sovereign's
-signature over the name, version, and hash (see Top-level names).
+the myth; the signature is the sovereign's signature over the name, version,
+and hash (see Top-level names). The current Foil port records the three care
+locks plus mint time and blockheight in `$yuga`; its oath fields are still
+placeholders.
 
 > **Design note — aeons do not chain.** Deliberately, an `$aeon` does *not* commit
 > to its predecessor's hash, so a title is not a hash-chain. The reason is
@@ -194,11 +196,87 @@ open question for this document.)
 ## Invariants
 
 The deep invariant is **monotonicity**: a title is an append-only stream of
-moments. Publishing new data adds a moment; it never destroys an earlier one.
+moments. Publishing changed data adds a moment; it never destroys an earlier one.
 This is why an `$aeon` carries version information, why a `look` can return a
 temporally consistent `$epic`, and why subscriptions can be made sound. It is
 also why `Cull` (below) publishes an *empty* moment rather than deleting: a
 tombstone preserves history.
+
+### Internal epochs and public cases
+
+Shrine uses two temporal coordinates, and they must not be conflated:
+
+- An **epoch** is the sovereign-wide commit order. `sov.top` advances exactly
+  once for every accepted `sov/step`, including an accepted event whose resolved
+  values are all unchanged. Epochs key the raw event journal (`rec`) and the
+  assertion history (`idx`), and are used internally to read one coherent
+  snapshot. They are not public versions.
+- A **case** is a public, path-local version number. Every `(path, care)` has an
+  independent data counter and shape counter, both initially zero. Unrelated
+  paths and other cares cannot advance either counter.
+
+For one `(path, care)`, a changed view advances `data`; a changed live domain
+advances `shape` and also advances `data`. A data-only change leaves `shape`
+alone. Thus create → changed poke → cull is `data=3, shape=2`. Each counter can
+advance at most once in one committed step, even when that step contains several
+relevant writes. Shape is a count, not a position on the data history; historical
+queries are addressed only by data case.
+
+The care domains are precise:
+
+- `x` is the exact node.
+- `y` is the node plus the frontier of nearest live descendants. Transparent
+  structural paths pass through; a live frontier node hides deeper descendants.
+- `z` is every live assertion in the subtree.
+
+A changed assertion advances its own x/y/z data cases. It advances an ancestor's
+y only when that ancestor's frontier view changes, and every ancestor's z.
+Creation and removal advance shape for every care whose live domain changes. A
+new child therefore advances its parent's y/z but not its x. Only explicitly
+asserted paths—live records or tombstones—own ledgers. A structural path that
+exists only to reach descendants is transparent: it has no cases, assertion
+history, signs, timestamps, or `/h/v` record. If later asserted, all three care
+clocks begin at one; earlier descendant activity is not inherited.
+
+Tombstones retain all counters. Revival continues the same title rather than
+resetting it. Culling an unknown path is a data change from unknown to tombstone,
+but not a live-shape change; culling that tombstone again is unchanged. Cull is
+recursive: the target and every currently live descendant become tombstones in
+one epoch, so no child is revealed or reparented through a dead node. An
+ancestor cull dominates descendant writes in the same event. A later live write
+below a tombstone is rejected unless every tombstoned prefix is explicitly
+revived in that event; rejection advances no epoch and records nothing.
+
+Every minted local data case records the internal epoch at which it arose. Local
+cases are dense and exact: case zero, a missing case, or a future case resolves
+to unknown. Resolving a valid case first selects its recorded epoch and then
+reads the care at that coherent snapshot, so later epochs cannot alter its
+answer.
+
+Accepted writes are normalized before cases or notifications: culls dominate
+and expand recursively, while the original diff tree remains in `rec` for audit.
+Writes are then deduplicated by their resolved value before cases or
+notifications are minted. `Make` compares its replacement myth with the current
+myth; `Poke` melds first and compares the result; repeated `Cull` compares equal to the
+existing tombstone. Deep structural equality is used. An equal result creates no
+assertion, local case, sign, timestamp, or notification. The accepted raw event
+is nevertheless retained in `rec`, and the internal epoch still advances for
+ordering and audit.
+
+The historical overlay is `/h/<care>/<case>/<len>/<target...>/<relative...>`.
+Here `case` is the complete target's local **data** case for that care; Shrine
+resolves it to an epoch before reading the snapshot. Because the target follows
+the case in this URL, `/h/<care>` and incomplete target prefixes cannot enumerate
+meaningful cases and expose only explanatory structural markers. The target-first
+`/h/v/<len>/<target...>` view reports the six independent current counters. The
+explorer renders separate x/y/z history links from `1` through that care's data
+counter. There is no sovereign-wide public case list, and old numeric `/h` URLs
+have no global-case compatibility interpretation.
+
+The current sovereign runtime shape is `[rec, idx, top, cases]`, with `top`
+deliberately retained at positional field `_2`. This is ABI-incompatible with
+older serialized sovereign values; ephemeral boot state must be rebuilt rather
+than migrated.
 
 ## Querying
 
@@ -207,7 +285,7 @@ tombstone preserves history.
 A **care** says how much of the tree to read. It is one of `x`, `y`, or `z`:
 
 - `x` — the value at the name only. (`cat`)
-- `y` — the value at the name and its immediate children. (`ls`)
+- `y` — the value at the name and its nearest live descendant frontier. (`ls`)
 - `z` — the entire subtree rooted at the name. (`ls -R`)
 
 A name can simultaneously hold a value *and* have children — care `y` implies it.
@@ -263,7 +341,7 @@ A **command** is a write request directed at a name:
 data Cmd
   = Poke Name Myth  -- shallow per-slot merge into the existing myth
   | Make Name Myth  -- overwrite / create
-  | Cull Name       -- publish a new, empty version (tombstone)
+  | Cull Name       -- recursively tombstone the name and live subtree
 ```
 
 `Poke` merges the supplied myth into the name's current myth as maps, right-biased
@@ -271,7 +349,10 @@ on slot collision: a colliding slot takes the incoming pail wholesale — a shal
 per-slot merge, with no recursion into pail structure. `Make` replaces the myth
 wholesale, and an **empty `Make` is illegal** — `Make` requires a non-empty myth.
 `Cull` is the only way to publish an empty moment, and that empty moment is the
-**tombstone**; there is therefore no `Make Name {}` to confuse it with.
+**tombstone**; there is therefore no `Make Name {}` to confuse it with. The cull
+also tombstones every currently live descendant in the same epoch. A live write
+cannot cross a tombstoned prefix unless that prefix is revived in the same
+transaction.
 
 A **fact** is a notification that a name changed. At the kernel level it carries
 no data — just which name changed and its new version:
@@ -400,9 +481,10 @@ The cycle, from **START**:
    phase, **re-merge** the stashed gifts with any gifts newly generated during the
    cascade and **re-sort** the whole set deepest-first before resuming delivery.
 5. When every gift has been delivered and no effects remain, the transaction is
-   at fixpoint. The runtime **finalizes**: all pending changes are written and
-   assigned version numbers — and *that* is when **facts** are emitted for the
-   now-finalized changes.
+   at fixpoint. The runtime **finalizes**: changed resolved views are written,
+   their path-local care cases are assigned, and *that* is when **facts** are
+   emitted. An accepted write that resolves equal still occupies an internal
+   epoch but emits no fact.
 
 Dispatch is **fully deterministic**: the runtime imposes a fixed total order over
 effects and over children, so replaying the same inputs cannot diverge — essential
@@ -518,5 +600,3 @@ receives an acknowledgement (or rejection). For a command to self or to a kid
 there is no separate ack: a kid's effect is acknowledged by the **gift** that
 flows back up when the kid changes (the gift is, in effect, the ack), and a
 self-command resolves within the same transaction.
-
-

@@ -5,7 +5,7 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/lf/profiling";
+    url = "github:axsys-org/enki/lf/silo";
   };
 
   outputs = { self, nixpkgs, rex, enki }:
