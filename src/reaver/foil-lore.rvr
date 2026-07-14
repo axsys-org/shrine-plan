@@ -1,0 +1,118 @@
+;;;; Lore capture (doc/foil-lore.md section 7, steps 1-3, done as a pure
+;;;; rex walk so the compiler carries no new parser risk).  Hoisted out
+;;;; of forge so the compiler can capture lore at compile time
+;;;; (doc/shrine-apps.md section 4.1); forge rebinds these names.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind foil-rex (#module foil-rex))
+(#import foil-rex)
+
+
+;;; String helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (str-slice off len src)
+  (Trunc (Mul 8 len) (Rsh src (Mul 8 off))))
+
+(define (str-drop off src)
+  (str-slice off (Sub (Bytes src) off) src))
+
+(define (str-prefix? pre src)
+  (define len (Bytes pre))
+  (And (Le len (Bytes src))
+       (Eq pre (str-slice 0 len src))))
+
+(define (strip-spaces-at i line)
+  (If (And (Lt i (Bytes line)) (Eq " " (Load8 i line)))
+    (strip-spaces-at (Inc i) line)
+    i))
+
+
+;;; Lore capture ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Strip a slug line down to its text: leading spaces, one tick,
+;; trailing spaces after the tick.
+(define (strip-tick line)
+  (define i (strip-spaces-at 0 line))
+  (define j (If (And (Lt i (Bytes line)) (Eq "'" (Load8 i line))) (Inc i) i))
+  (str-drop (strip-spaces-at j line) line))
+
+(define (is-doctest-line? l) (str-prefix? "?=" l))
+
+(define (parse-doctest line)
+  (define src (str-drop (strip-spaces-at 2 line) line))
+  (define parsed (Try rex:ParseRexNorm src))
+  (If (Eq 1 (Hd parsed))
+    ["DTBAD" line 0 0]
+    (let ((n (_0 parsed)))
+      (If (And (rx-nest? n) (Eq 2 (Sz (rx-nest-kids n))))
+        ["DT" line (_0 (rx-nest-kids n)) (_1 (rx-nest-kids n))]
+        ["DTBAD" line 0 0]))))
+
+;; Slug leaves encode line breaks as a backslash run + n (the run
+;; length grows with nesting depth); treat any such run as a newline.
+(define (split-slug-lines s)
+  (define n (Bytes s))
+  (define (slice a b) (str-slice a (Sub b a) s))
+  (define (bs-run i)
+    (If (And (Lt i n) (Eq 92 (Load8 i s)))
+      (Inc (bs-run (Inc i)))
+      0))
+  (define (go start i acc)
+    (If (Ge i n)
+      (snoc (slice start i) acc)
+      (let ((k (bs-run i)))
+        (If (And k (And (Lt (Add i k) n) (Eq "n" (Load8 (Add i k) s))))
+          (go (Add (Add i k) 1) (Add (Add i k) 1) (snoc (slice start i) acc))
+          (go start (Inc i) acc)))))
+  (go 0 0 []))
+
+(define (parse-lore e[path text lspan])
+  (define lines (map strip-tick (split-slug-lines text)))
+  (define tests (map parse-doctest (filter is-doctest-line? lines)))
+  (define body
+    (filter (lambda (l) (And (Bytes l) (Nil (is-doctest-line? l)))) lines))
+  (define head (Ifz (Sz body) "" (_0 body)))
+  ["LORE" path head body tests lspan])
+
+(define lore-path (Ix 1))
+(define lore-head (Ix 2))
+(define lore-body (Ix 3))
+(define lore-tests (Ix 4))
+
+(define (capture-lore rexn)
+  (define (kids-of n)
+    (cond
+      ((rx-nest? n) (rx-nest-kids n))
+      ((rx-juxt? n) (rx-juxt-kids n))
+      (else 0)))
+  (define (decl-name kids)
+    (define hit (find rx-word? kids))
+    (Ifz hit 0 (rx-leaf-str (_0 hit))))
+  (define (go path acc n)
+    (cond
+      ((And (rx-leaf? n) (Eq "slug" (rx-leaf-shape n)))
+        (snoc [path (rx-leaf-str n) (rx-span n)] acc))
+      ((rx-rune? "+" n)
+        (let ((nm (decl-name (rx-nest-kids n))))
+          (let ((path1 (Ifz nm path (snoc nm path))))
+            (foldl (go path1) acc (kids-of n)))))
+      (else (foldl (go path) acc (kids-of n)))))
+  (map parse-lore (go [] [] rexn)))
+
+(define (lore-for lore path)
+  (find (lambda (l) (Equal path (lore-path l))) lore))
+
+;; The doctests as source-text pairs [[src want] ..] for consumers that
+;; want text rather than parsed rex (the /boot mirror's lore pail);
+;; DTBAD lines carry no usable halves and are skipped.  ((_0 dt), not
+;; (Hd dt): rows carry their tag at slot 0, Hd is the app spine head.)
+(define (lore-test-pairs l)
+  (map (lambda (dt) [(rex:PrintRex (Ix 2 dt)) (rex:PrintRex (Ix 3 dt))])
+    (filter (lambda (dt) (Eq "DT" (_0 dt))) (lore-tests l))))

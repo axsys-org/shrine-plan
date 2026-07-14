@@ -29,6 +29,8 @@
 
 (#bind foil (#module foil))
 
+(#bind foil-lore (#module foil-lore))
+
 (#bind async (#module async))
 
 (#bind milton (#module milton))
@@ -36,16 +38,12 @@
 
 ;;; String helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (str-slice off len src)
-  (Trunc (Mul 8 len) (Rsh src (Mul 8 off))))
-
-(define (str-drop off src)
-  (str-slice off (Sub (Bytes src) off) src))
-
-(define (str-prefix? pre src)
-  (define len (Bytes pre))
-  (And (Le len (Bytes src))
-       (Eq pre (str-slice 0 len src))))
+;; Moved to foil-lore with the lore capture (compile-time lore,
+;; doc/shrine-apps.md section 4.1); rebound so forge: names survive.
+(define str-slice foil-lore:str-slice)
+(define str-drop foil-lore:str-drop)
+(define str-prefix? foil-lore:str-prefix?)
+(define strip-spaces-at foil-lore:strip-spaces-at)
 
 ;; Byte-by-byte on purpose: wisp's LoadVar returns wrong values on
 ;; larger heaps (see doc/wisp-session-leak.md); Load8 is reliable.
@@ -102,11 +100,6 @@
         (go start (Inc i) acc))))
   (go 0 0 []))
 
-(define (strip-spaces-at i line)
-  (If (And (Lt i (Bytes line)) (Eq " " (Load8 i line)))
-    (strip-spaces-at (Inc i) line)
-    i))
-
 
 ;;; HTML construction (milton node trees) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -141,81 +134,21 @@
     (Weld [(node "summary" no-attrs summary)] kids)))
 
 
-;;; Lore capture (doc/foil-lore.md section 7, steps 1-3, done as a pure ;;;;;;;;;;
-;;; rex walk so the compiler carries no new parser risk) ;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Lore capture — moved to foil-lore so the compiler captures at ;;;;;;;;;;;;;;;;
+;;; compile time (doc/shrine-apps.md section 4.1); rebound so the ;;;;;;;;;;;;;;;;
+;;; forge:lore-* names survive for forge-cli and buddy ;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; Strip a slug line down to its text: leading spaces, one tick,
-;; trailing spaces after the tick.
-(define (strip-tick line)
-  (define i (strip-spaces-at 0 line))
-  (define j (If (And (Lt i (Bytes line)) (Eq "'" (Load8 i line))) (Inc i) i))
-  (str-drop (strip-spaces-at j line) line))
-
-(define (is-doctest-line? l) (str-prefix? "?=" l))
-
-(define (parse-doctest line)
-  (define src (str-drop (strip-spaces-at 2 line) line))
-  (define parsed (Try rex:ParseRexNorm src))
-  (If (Eq 1 (Hd parsed))
-    ["DTBAD" line 0 0]
-    (let ((n (_0 parsed)))
-      (If (And (rx-nest? n) (Eq 2 (Sz (rx-nest-kids n))))
-        ["DT" line (_0 (rx-nest-kids n)) (_1 (rx-nest-kids n))]
-        ["DTBAD" line 0 0]))))
-
-;; Slug leaves encode line breaks as a backslash run + n (the run
-;; length grows with nesting depth); treat any such run as a newline.
-(define (split-slug-lines s)
-  (define n (Bytes s))
-  (define (slice a b) (str-slice a (Sub b a) s))
-  (define (bs-run i)
-    (If (And (Lt i n) (Eq 92 (Load8 i s)))
-      (Inc (bs-run (Inc i)))
-      0))
-  (define (go start i acc)
-    (If (Ge i n)
-      (snoc (slice start i) acc)
-      (let ((k (bs-run i)))
-        (If (And k (And (Lt (Add i k) n) (Eq "n" (Load8 (Add i k) s))))
-          (go (Add (Add i k) 1) (Add (Add i k) 1) (snoc (slice start i) acc))
-          (go start (Inc i) acc)))))
-  (go 0 0 []))
-
-(define (parse-lore e[path text lspan])
-  (define lines (map strip-tick (split-slug-lines text)))
-  (define tests (map parse-doctest (filter is-doctest-line? lines)))
-  (define body
-    (filter (lambda (l) (And (Bytes l) (Nil (is-doctest-line? l)))) lines))
-  (define head (Ifz (Sz body) "" (_0 body)))
-  ["LORE" path head body tests lspan])
-
-(define lore-path (Ix 1))
-(define lore-head (Ix 2))
-(define lore-body (Ix 3))
-(define lore-tests (Ix 4))
-
-(define (capture-lore rexn)
-  (define (kids-of n)
-    (cond
-      ((rx-nest? n) (rx-nest-kids n))
-      ((rx-juxt? n) (rx-juxt-kids n))
-      (else 0)))
-  (define (decl-name kids)
-    (define hit (find rx-word? kids))
-    (Ifz hit 0 (rx-leaf-str (_0 hit))))
-  (define (go path acc n)
-    (cond
-      ((And (rx-leaf? n) (Eq "slug" (rx-leaf-shape n)))
-        (snoc [path (rx-leaf-str n) (rx-span n)] acc))
-      ((rx-rune? "+" n)
-        (let ((nm (decl-name (rx-nest-kids n))))
-          (let ((path1 (Ifz nm path (snoc nm path))))
-            (foldl (go path1) acc (kids-of n)))))
-      (else (foldl (go path) acc (kids-of n)))))
-  (map parse-lore (go [] [] rexn)))
-
-(define (lore-for lore path)
-  (find (lambda (l) (Equal path (lore-path l))) lore))
+(define strip-tick foil-lore:strip-tick)
+(define is-doctest-line? foil-lore:is-doctest-line?)
+(define parse-doctest foil-lore:parse-doctest)
+(define split-slug-lines foil-lore:split-slug-lines)
+(define parse-lore foil-lore:parse-lore)
+(define lore-path foil-lore:lore-path)
+(define lore-head foil-lore:lore-head)
+(define lore-body foil-lore:lore-body)
+(define lore-tests foil-lore:lore-tests)
+(define capture-lore foil-lore:capture-lore)
+(define lore-for foil-lore:lore-for)
 
 
 ;;; Evaluation against the live subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -679,12 +612,18 @@
 ;; chain walk it once.
 (define (load-bundle-cached cache mod)
   (define src (read-text-file (strcat ["foil/" mod ".foil"])))
-  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
-  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
   (define cr (Try (compile-forced-cached cache) mod))
   (define cache2 (If (Eq 1 (Hd cr)) cache (_0 (_0 cr))))
   (define compiled (If (Eq 1 (Hd cr)) cr [(_1 (_0 cr))]))
   (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  ;; Lore rides the compile now; a module broken at elaboration still
+  ;; shows its lore through the direct capture (parsing is independent
+  ;; of compile success).
+  (define lore
+    (If (Eq 1 (Hd compiled))
+      (let ((lorex (Try (cork capture-lore rex:ParseRexNorm) src)))
+        (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+      (_2 (_0 compiled))))
   (define own-keys
     (If (Eq 1 (Hd compiled))
       []
@@ -725,10 +664,15 @@
 
 (define (load-bundle mod)
   (define src (read-text-file (strcat ["foil/" mod ".foil"])))
-  (define lorex (Try (cork capture-lore rex:ParseRexNorm) src))
-  (define lore (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
   (define compiled (Try compile-forced mod))
   (define imported (If (Eq 1 (Hd compiled)) 0 (_1 (_0 compiled))))
+  ;; Lore rides the compile; direct capture only for failed compiles
+  ;; (same rationale as load-bundle-cached).
+  (define lore
+    (If (Eq 1 (Hd compiled))
+      (let ((lorex (Try (cork capture-lore rex:ParseRexNorm) src)))
+        (If (Eq 1 (Hd lorex)) [] (_0 lorex)))
+      (_2 (_0 compiled))))
   (define own-keys
     (If (Eq 1 (Hd compiled))
       []
@@ -759,10 +703,10 @@
 (define st-cache (Ix 3))
 
 ;;; The persistent compile cache: st-cache holds [[name snapshot
-;;; subject decl-keys imported-keys] ..] — every module ever
+;;; subject decl-keys imported-keys lore] ..] — every module ever
 ;;; compiled, with the byte snapshot (own source + import closure) it
 ;;; was compiled against.  Prune drops entries whose sources moved;
-;;; strip yields the [[name subject decl-keys imported-keys] ..]
+;;; strip yields the [[name subject decl-keys imported-keys lore] ..]
 ;;; shape compile-mod-go threads; wrap re-stamps fresh snapshots for
 ;;; persisting.  Both read/parse each file once per call, shared
 ;;; across entries — per-entry recomputation made validating an
@@ -787,13 +731,17 @@
   (define (cur n)
     (let ((h (find (lambda (r) (Eq n (_0 r))) table)))
       (Ifz h 0 (_1 (_0 h)))))
+  ;; The width check drops entries persisted before the lore field
+  ;; existed — otherwise a stale 5-wide entry would silently serve
+  ;; lore 0 for a warm module instead of recompiling.
   (define (fresh? e)
-    (And (Equal (_0 (_1 e)) (cur (_0 e)))
-      (Nil (includes (lambda (p) (Nil (Equal (_1 p) (cur (_0 p))))) (_1 (_1 e))))))
+    (And (Eq 6 (Sz e))
+      (And (Equal (_0 (_1 e)) (cur (_0 e)))
+        (Nil (includes (lambda (p) (Nil (Equal (_1 p) (cur (_0 p))))) (_1 (_1 e)))))))
   (filter fresh? entries))
 
 (define (cache-strip entries)
-  (map (lambda (e) [(_0 e) (_2 e) (_3 e) (_4 e)]) entries))
+  (map (lambda (e) [(_0 e) (_2 e) (_3 e) (_4 e) (Ix 5 e)]) entries))
 
 (define (cache-wrap cache)
   (define names (map (Ix 0) cache))
@@ -819,7 +767,8 @@
     (go [] (imports-of mod)))
   (define (snap-of mod)
     [(bytes-of mod) (map (lambda (n) [n (bytes-of n)]) (closure mod))])
-  (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e)]) cache))
+  (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e) (Ix 4 e)])
+    cache))
 
 (define (st-live-cache st)
   (define cache (st-cache st))

@@ -16,6 +16,7 @@
 (#bind foil-builtins (#module foil-builtins))
 (#bind foil-elab (#module foil-elab))
 (#bind foil-lower (#module foil-lower))
+(#bind foil-lore (#module foil-lore))
 
 ;;; Public parsing API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -80,15 +81,19 @@
 ;; Compile a module by name, resolving its imports first.  Imports are
 ;; order-independent: all of them merge (and mount, when nested under a
 ;; +) before any declaration elaborates.  cache is
-;; [[name subject decl-keys imported-keys] ..] so diamond imports
+;; [[name subject decl-keys imported-keys lore] ..] so diamond imports
 ;; compile once and a hit pays neither the recompile nor the decl-key
 ;; derivation; stack is the import chain, for cycle detection.
-;; Returns [cache' compiled imported-keys].
-(define (cache-entry name compiled imported)
-  [name compiled (module-decl-keys compiled) imported])
+;; Returns [cache' compiled imported-keys lore].
+(define (cache-entry name compiled imported lore)
+  [name compiled (module-decl-keys compiled) imported lore])
 
 (define (compile-mod-go stack cache0 sut0 mod)
-  (define rows (parse-foil mod))
+  ;; parse-foil's two steps inlined so the raw rex is in scope for lore
+  ;; capture (doc/shrine-apps.md section 4.1) without a second parse.
+  (define rexn (rex:ParseRexNorm (get-foil mod)))
+  (define rows (foil-sast:parse-module-sast 0 rexn))
+  (define lore (foil-lore:capture-lore rexn))
   (define imps (filter mod-import? rows))
   (define decls (filter (lambda (r) (Nil (mod-import? r))) rows))
   (define (apply-import st imp[_ mount span name])
@@ -108,7 +113,8 @@
                   (let ((c (Try compile-import 0)))
                     (If (Eq 1 (Hd c))
                       (error ["foil-in-module" name (_0 c)])
-                      (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c)))))
+                      (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c))
+                                 (_3 (_0 c)))))
                         [(snoc e (_0 (_0 c))) (_1 e) (_2 e)])))
                   (let ((e (_0 hit)))
                     [cache (_1 e) (_2 e)])))
@@ -136,11 +142,14 @@
         (error ["foil-duplicate-decl" ["path" name] ["at" (import-blurb span)]]))
       (else (cairn:putax name 1 seen))))
   (define checked (foldl check-collision cairn:empty-ax decls))
-  (define elabbed (Seq checked (elab-mod (_1 merged) decls)))
+  ;; Force the lore here so the cache entry carries plain data — an
+  ;; unforced capture would pin the module's whole rex tree in every
+  ;; long-lived cache.
+  (define elabbed (Seq checked (DeepSeq lore (elab-mod (_1 merged) decls))))
   ;; Materialize every referenced ground instantiation of const-param
   ;; generics before lowering (their base members skip lowering).
   (define final (foil-lower:materialize-consts elabbed))
-  [(_0 merged) (lower-tc-mod final final) (_2 merged)])
+  [(_0 merged) (lower-tc-mod final final) (_2 merged) lore])
 
 ;;; Public compile API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -151,7 +160,7 @@
     (_1 (_0 r))))
 
 ;; Compile with a persistent cache: returns [cache' compiled].  The
-;; cache ([[name subject decl-keys imported-keys] ..], seed with 0)
+;; cache ([[name subject decl-keys imported-keys lore] ..], seed with 0)
 ;; carries every compiled module's subject ACROSS calls, so sibling
 ;; top-level compiles sharing an import chain (helm + lainapp over
 ;; sept/shrine/lain) walk it once, and re-requesting a cached module
@@ -163,7 +172,8 @@
     (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
       (If (Eq 1 (Hd r))
         (error ["foil-in-module" mod (_0 r)])
-        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r)))
+           (_0 (_0 r)))
          (_1 (_0 r))]))
     [cache (_1 (_0 hit))]))
 
@@ -171,18 +181,19 @@
   (define r (Try (lambda (z) (compile-mod-go [mod] 0 sut mod)) 0))
   (If (Eq 1 (Hd r))
     (error ["foil-in-module" mod (_0 r)])
-    [(_1 (_0 r)) (_2 (_0 r))]))
+    [(_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r))]))
 
-;; The cached compile-mod-info: [cache' [compiled imported-keys]].
+;; The cached compile-mod-info: [cache' [compiled imported-keys lore]].
 (define (compile-mod-info-cached cache sut mod)
   (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
   (Ifz hit
     (let ((r (Try (lambda (z) (compile-mod-go [mod] cache sut mod)) 0)))
       (If (Eq 1 (Hd r))
         (error ["foil-in-module" mod (_0 r)])
-        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r))) (_0 (_0 r)))
-         [(_1 (_0 r)) (_2 (_0 r))]]))
-    [cache [(_1 (_0 hit)) (_3 (_0 hit))]]))
+        [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r)))
+           (_0 (_0 r)))
+         [(_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r))]]))
+    [cache [(_1 (_0 hit)) (_3 (_0 hit)) (Ix 4 (_0 hit))]]))
 
 ;;; Content-addressed module artifacts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -318,8 +329,10 @@
              (foil-subject:apply-entry-delta
                ["cached module" mod] (artifact-delta body) pre))
            (imported (artifact-imported body))
+           ;; Pinned artifacts carry no lore field yet — a warm hit
+           ;; degrades to no lore (bump artifact-schema to store it).
            (legacy1
-             (snoc (cache-entry mod compiled imported)
+             (snoc (cache-entry mod compiled imported [])
                (filter (lambda (e) (Ne mod (_0 e))) legacy))))
       [cache art compiled imported legacy1])
     ;; Imports have already been resolved to cumulative subjects above.
@@ -335,7 +348,7 @@
            (art1 (Pin body))
            (cache1 (artifact-cache-put cache mod art1))
            (legacy1
-             (snoc (cache-entry mod compiled imported)
+             (snoc (cache-entry mod compiled imported (_3 cold))
                (filter (lambda (e) (Ne mod (_0 e))) (_0 cold)))))
       [cache1 art1 compiled imported legacy1])))
 
