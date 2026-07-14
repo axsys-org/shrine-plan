@@ -14,6 +14,7 @@
 (#bind foil (#module foil))
 (#bind helm (#module helm))
 (#bind helm-http (#module helm-http))
+(#bind helm-doctest (#module helm-doctest))
 
 
 ;;; The HTTP driver end-to-end, minus sockets (no outbound-connect
@@ -38,7 +39,16 @@
 (define helpers
   ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
 
-(define (mk-worker n) (helm-http:mk-http-worker helpers n))
+(define dhelpers
+  ["D" (helm:core-sut core) (helm:mirror-cache (helm:core-cache core) core)
+   (app ["pail_slot"]) (app ["fetch_fresh"]) (app ["put_nat"])
+   (app ["t0"]) (app ["vine_poke"]) (app ["dt_card_t"])
+   (app ["vine_make"])])
+
+(define (mk-worker n)
+  (If (Equal n ("ts" "doctest"))
+    (helm-doctest:mk-doctest-worker dhelpers n)
+    (helm-http:mk-http-worker helpers n)))
 
 ;; the registry plus the /boot mirror: the explorer fixtures browse
 ;; the system's own code.  Seeded and deep-forced HERE in main — a
@@ -244,7 +254,51 @@ assert(Eq 1 (contains? "/ns/kook/count" (_2 rh6)))
 assert(Eq 1 (starts-with "HTTP/1.0 200 OK" resp))
 assert(Eq 1 (starts-with "HTTP/1.0 500" (helm-http:http-res 500 "text/plain" "boom")))
 
-;;; 7. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 7. the doctest driver end to end: request in, verdict kid out ;;;;;;;;;;;;;;;;;;;
+;;; One check function, one flag-row assert — top-level asserts over
+;;; the deep records corrupt (session-leak notes).
+
+(define tdt ("ts" "doctest"))
+(define eqp-node
+  [("ts" "boot") ("ts" "sept") ("ts" "1") ("ts" "eq_pith")])
+assert(Equal ["done"] (inject (vine-make [tio tdt] ((app ["dtest_cfg"]) 0))))
+assert(Equal ["done"]
+  (inject (vine-make [tio tdt ("ts" "r1")] ((app ["dt_req"]) eqp-node))))
+
+(define (doctest-driver-checks z)
+  (define tslot-f (app ["tslot"]))
+  (define has-slot-f (app ["has_slot"]))
+  ;; the worker answers asynchronously; each ask is a synchronous
+  ;; barrier, so a bounded poll converges — the chain is a few turns
+  (define (poll-done kid tries)
+    (If (Eq 0 tries)
+      0
+      (let ((r (Ix 0 (ask ["query" [tio tdt kid]]))))
+        (If (And (Eq "known" (Hd r))
+              (Eq 1 (tslot-f [("ts" "res_done")] 0 (_0 r))))
+          (_0 r)
+          (poll-done kid (Sub tries 1))))))
+  (define done-rec (poll-done ("ts" "r1") 64))
+  (define vq (Ix 0 (ask ["query" (snoc ("ts" "dt") eqp-node)])))
+  (define done2
+    (Seq (inject (vine-make [tio tdt ("ts" "r2")] ((app ["dt_req"]) eqp-node)))
+      (poll-done ("ts" "r2") 64)))
+  [;; the request completed, both eq_pith doctests passed.  (IsApp,
+   ;; not an Eq-0 check: shallow Eq against the deep record misreads
+   ;; here — same corruption family as the top-level-assert notes.)
+   (If (IsApp done-rec) 1 0)
+   (Eq 2 (tslot-f [("ts" "passed")] 99 done-rec))
+   (Eq 0 (tslot-f [("ts" "failed")] 99 done-rec))
+   ;; the verdict rides the entry's dt kid, the entry stays untouched
+   (Eq "known" (Hd vq))
+   (has-slot-f [("ts" "dt")] (_0 vq))
+   ;; a second request re-runs (the dt kid pokes, not re-makes)
+   (If (IsApp done2) 1 0)
+   (Eq 2 (tslot-f [("ts" "passed")] 99 done2))])
+
+assert(Equal [1 1 1 1 1 1 1] (doctest-driver-checks 0))
+
+;;; 8. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
 

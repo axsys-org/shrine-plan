@@ -17,6 +17,8 @@
 (#bind helm (#module helm))
 (#bind http-client (#module http-client))
 (#bind helm-fetch (#module helm-fetch))
+(#bind helm-doctest (#module helm-doctest))
+(#bind doctest (#module doctest))
 
 
 ;;; The HTTP driver: a helm worker whose requests ride the namespace.
@@ -278,7 +280,11 @@
     (DeepSeq
       [(DeepSeq [conn-actor listener-pump mk-http-worker res-of
                  pend-get pend-drop
-                 helm-fetch:mk-fetch-worker helm-fetch:fetch-actor] 0)
+                 helm-fetch:mk-fetch-worker helm-fetch:fetch-actor
+                 helm-doctest:mk-doctest-worker] 0)
+       ;; one real evaluation compiles the doctest eval pipeline in
+       ;; MAIN — the worker only replays compiled paths
+       (doctest:eval-text (helm:core-sut core0) "(add 1 1)")
        (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
        (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
        (url-target "/ns/a/b")
@@ -306,6 +312,12 @@
   (define sov2
     (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
       (helm:mount-apps core sov1 (_1 ar))))
+  ;; optional: boot born-verified (helm:doctest-sweep?)
+  (define sov3
+    (If helm:doctest-sweep?
+      (Seq (Trace ["doctest sweep"] 0)
+        (helm:seed-doctests (_0 ar) core sov2))
+      sov2))
   (define t-data (app ["t_data"]))
   (define vine-make (app ["vine_make"]))
   (define cfg-port (app ["http_cfg_port"]))
@@ -315,15 +327,23 @@
     ["F" (app ["tslot"]) (app ["fetch_fresh"]) (app ["fetch_hdrs"])
      (app ["fetch_res_ok"]) (app ["fetch_res_err"]) (app ["put_nat"])
      (app ["t0"]) (app ["vine_poke"])])
+  (define dhelpers
+    ["D" (helm:core-sut core) (helm:mirror-cache (_0 ar) core)
+     (app ["pail_slot"]) (app ["fetch_fresh"]) (app ["put_nat"])
+     (app ["t0"]) (app ["vine_poke"]) (app ["dt_card_t"])
+     (app ["vine_make"])])
   (define (mk-worker n)
-    (If (Equal n ("ts" "http-client"))
-      (helm-fetch:mk-fetch-worker fhelpers n)
-      (mk-http-worker helpers n)))
+    (cond
+      ((Equal n ("ts" "http-client"))
+        (helm-fetch:mk-fetch-worker fhelpers n))
+      ((Equal n ("ts" "doctest"))
+        (helm-doctest:mk-doctest-worker dhelpers n))
+      (else (mk-http-worker helpers n))))
   ;; seed in MAIN (DeepSeq before Spawn): the reef seeding code cannot
   ;; compile-on-demand inside the coordinator ("no compiler set")
   (define coord
-    (Seq (DeepSeq sov2 sov2)
-      (Spawn (helm:helm-actor core mk-worker sov2))))
+    (Seq (DeepSeq sov3 sov3)
+      (Spawn (helm:helm-actor core mk-worker sov3))))
   (define (inject t)
     (Seq (SendCaps coord (DeepSeq t ["task" t]) [0])
       (Recv 0)))
@@ -334,10 +354,11 @@
       ;; outbound fetch driver at /io/http-client
       (Seq (inject (vine-make [("ts" "io") ("ts" "http")] (cfg-port ("ts" "hex") port)))
         (Seq (inject (vine-make [("ts" "io") ("ts" "http-client")] ((app ["fetch_cfg"]) 0)))
+        (Seq (inject (vine-make [("ts" "io") ("ts" "doctest")] ((app ["dtest_cfg"]) 0)))
         (Seq (Trace ["lain listening" port] 0)
           ;; park: the coordinator and its actors do the work now
           (let ((park (lambda (go z) (Seq (Recv 0) (go go z)))))
-            (park park 0))))))))
+            (park park 0)))))))))
 
 (define (run-lain port)
   (run-lain-boot port (helm:load-helm-mod "helmapp")))

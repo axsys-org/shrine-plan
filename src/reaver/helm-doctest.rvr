@@ -1,0 +1,294 @@
+;;;; The doctest driver: a helm worker that evaluates documented
+;;;; entries' doctests against the live image's own compiled subject
+;;;; and pokes verdicts onto the documented nodes
+;;;; (doc/doctest-runner-explorer.md part I).
+;;;;
+;;;; Requests ride the namespace like fetch's: a dt_req record MADE
+;;;; under /io/doctest (via injected task or worker cmd) carries a
+;;;; ['target] mirror path — an exact documented node, or a /boot
+;;;; prefix to sweep.  The dtake kook marks it fresh on the driver
+;;;; record; helm x-watches each /io name's record, so that write is
+;;;; the notification.  For each job the worker asks the node's
+;;;; current version (["case"] — the verdict's staleness anchor),
+;;;; evaluates, and pokes ['dt] onto the node; when a request's jobs
+;;;; drain it pokes ['res_done]/['passed]/['failed] onto the request
+;;;; node and clears the marker.
+;;;;
+;;;; Worker mailbox:
+;;;;   from the coordinator: ["go" res] ["change" pax res]
+;;;;     ["qres" pax res] ["cres" pax c] ["ack" rsvp] ["die"]
+;;;;
+;;;; Correlation: worker->coordinator sends are FIFO and the
+;;;; coordinator replies within its turn, so "cres" replies return in
+;;;; job order and acks in cmd order — two FIFO queues.
+;;;;
+;;;; ds = ["D" sut mcache path_slot fetch_fresh put_nat t0 vine_poke
+;;;;       dt_card_t] — the core's subject, the mirror-shaped cache,
+;;;;       and compiled lainapp/pact entries, supplied by the spawner.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-lore (#module foil-lore))
+
+(#bind doctest (#module doctest))
+
+(#bind helm (#module helm))
+
+(define (d-sut ds) (Ix 1 ds))
+(define (d-cache ds) (Ix 2 ds))
+(define (d-pslot ds) (Ix 3 ds))
+(define (d-fresh ds) (Ix 4 ds))
+(define (d-put ds) (Ix 5 ds))
+(define (d-t0 ds) (Ix 6 ds))
+(define (d-poke ds) (Ix 7 ds))
+(define (d-card ds) (Ix 8 ds))
+(define (d-make ds) (Ix 9 ds))
+
+(define (ts s) ("ts" s))
+
+(define (row-has k xs) (includes (Equal k) xs))
+(define (row-drop k xs) (filter (lambda (e) (Nil (Equal k e))) xs))
+(define (row-weld a b) (foldl (flip snoc) a b))
+
+;; "12" -> [1 12]; anything non-decimal -> [0 0]
+(define (cord-nat s)
+  (define n (Bytes s))
+  (define (go i acc)
+    (If (Ge i n)
+      [1 acc]
+      (let ((c (Load8 i s)))
+        (If (And (Ge c 48) (Le c 57))
+          (go (Inc i) (Add (Mul 10 acc) (Sub c 48)))
+          [0 0]))))
+  (If (Eq 0 n) [0 0] (go 0 0)))
+
+(define (join-slash segs)
+  (strcat
+    (foldl
+      (lambda (acc s) (If (Sz acc) (snoc s (snoc "/" acc)) [s]))
+      [] segs)))
+
+;; A failing doctest's got text, capped (doc provisional: ~500 bytes).
+(define (cap-got s)
+  (If (And (IsNat s) (Gt (Bytes s) 500))
+    (strcat [(foil-lore:str-slice 0 500 s) ".."])
+    s))
+
+(define (cap-results rs)
+  (map (lambda (r) [(Ix 0 r) (Ix 1 r) (cap-got (Ix 2 r))]) rs))
+
+;; The documented-node jobs a target names: [[node lore] ..].  An
+;; exact entry path ([boot ..modsegs n ..name]) is one job; anything
+;; else is a prefix sweep over the cache — module headers and own
+;; entries whose lore carries tests.  The cache is the index of
+;; documented nodes; no namespace walk.
+(define (jobs-for ds tgt)
+  (define cache (d-cache ds))
+  (define cords (map (Ix 0) tgt))
+  (define (entry-job z)
+    ;; find the count segment: cords = boot ..mod.. n ..name..
+    (define n (Sz cords))
+    (define (try i)
+      (If (Ge i n)
+        0
+        (let ((cn (cord-nat (Ix i cords))))
+          (If (And (Ix 0 cn) (Eq (Sub n (Inc i)) (Ix 1 cn)))
+            (let* ((mod (join-slash (drop 1 (take i cords))))
+                   (name (drop (Inc i) cords))
+                   (hit (find (lambda (me) (Eq mod (_0 me))) cache)))
+              (Ifz hit
+                (try (Inc i))
+                (let ((l (foil-lore:lore-for (helm:entry-lore (_0 hit)) name)))
+                  (Ifz l (try (Inc i)) [[tgt (_0 l)]]))))
+            (try (Inc i))))))
+    (If (Lt n 3) 0 (try 2)))
+  (define (tested l) (Gt (Sz (foil-lore:lore-tests l)) 0))
+  (define (sweep z)
+    (foldl
+      (lambda (acc me)
+        (let* ((bsegs (Weld [(ts "boot")] (map ts (helm:mod-segs (_0 me)))))
+               (lore (helm:entry-lore me)))
+          (If (Nil (Equal tgt (take (Sz tgt) bsegs)))
+            acc
+            (let* ((mh (foil-lore:lore-for lore []))
+                   (acc1
+                     (If (And mh (tested (_0 mh)))
+                       (snoc [bsegs (_0 mh)] acc)
+                       acc)))
+              (foldl
+                (lambda (a k)
+                  (let* ((name (drop 1 k))
+                         (hit (foil-lore:lore-for lore name)))
+                    (If (And hit (tested (_0 hit)))
+                      (snoc
+                        [(Weld bsegs
+                           (Weld [(ts (showNat (Sz name)))] (map ts name)))
+                         (_0 hit)]
+                        a)
+                      a)))
+                acc1 (helm:entry-own-keys me))))))
+      [] cache))
+  (define ej (entry-job 0))
+  (cond
+    ((Nil (Equal (ts "boot") (Ix 0 tgt))) [])
+    (ej ej)
+    (else (sweep 0))))
+
+(define (mk-doctest-worker ds name self)
+  (define mc (Recv 0))
+  (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
+  (define rec0 (_1 (Ix 0 mc)))
+  (define dpath [(ts "io") name])
+  (define (rpath kid) [(ts "io") name kid])
+  (define (fresh-kids claimed m)
+    (filter (lambda (k) (Nil (row-has k claimed))) ((d-fresh ds) m)))
+  (define (read-kids kids)
+    (map (lambda (k) (SendCaps coord (DeepSeq k ["read" (rpath k)]) [0]))
+      kids))
+  ;; the request node's completion record
+  (define (mk-done passed failed)
+    ((d-put ds)
+      ((d-put ds)
+        ((d-put ds) ((d-t0 ds) 0) [(ts "res_done")] 1)
+        [(ts "passed")] passed)
+      [(ts "failed")] failed))
+  (define (mk-clear kid)
+    ((d-put ds) ((d-t0 ds) 0) [(ts "fresh") kid] 0))
+  ;; state: claimed/reading as fetch; jobs = FIFO [kid node lore]
+  ;; awaiting "cres"; counts = [[kid pending passed failed] ..];
+  ;; queue = [[kid kind] ..] ack correlation
+  ;; the queue is forced before every Recv: send-cmd's Sends ride the
+  ;; queue value, and an unforced queue is a command never sent
+  (define (loop claimed reading jobs counts queue)
+    (define m (Seq (DeepSeq queue queue) (Recv 0)))
+    (define msg (Ix 0 m))
+    (define kind (_0 msg))
+    (define (send-cmd kid ckind extra task queue2)
+      (let ((cm ["cmd" name task]))
+        (Seq (DeepSeq cm cm)
+          (Seq (Send coord cm)
+            (snoc [kid ckind extra] queue2)))))
+    ;; a request finishes: done poke + marker clear
+    (define (finish kid passed failed queue2)
+      (send-cmd kid "clear" 0 ((d-poke ds) dpath (mk-clear kid))
+        (send-cmd kid "res" 0 ((d-poke ds) (rpath kid) (mk-done passed failed))
+          queue2)))
+    (cond
+      ((Eq kind "change")
+        (let ((res (_2 msg)))
+          (If (Or (Nil (Equal dpath (_1 msg)))
+                (Nil (Eq "known" (Hd res))))
+            (loop claimed reading jobs counts queue)
+            (let* ((kids (fresh-kids claimed (_0 res)))
+                   (sends (read-kids kids)))
+              (Seq (DeepSeq sends sends)
+                (loop (row-weld claimed kids) (row-weld reading kids)
+                  jobs counts queue))))))
+      ((Eq kind "qres")
+        (let ((kid (Ix 2 (_1 msg)))
+              (res (_2 msg)))
+          (If (Nil (row-has kid reading))
+            (loop claimed reading jobs counts queue)
+            (let ((reading2 (row-drop kid reading)))
+              (If (Nil (Eq "known" (Hd res)))
+                ;; culled before the read: just clear the marker
+                (loop claimed reading2 jobs counts
+                  (send-cmd kid "clear" 0 ((d-poke ds) dpath (mk-clear kid))
+                    queue))
+                (let* ((tgtp ((d-pslot ds) [(ts "target")] (_0 res)))
+                       (tgt (If (Eq "/boot/ppail" (Hd tgtp)) (_0 tgtp) []))
+                       (js (Ifz (Sz tgt) [] (jobs-for ds tgt))))
+                  (If (Eq 0 (Sz js))
+                    ;; nothing documented there: answer done, all zero
+                    (loop claimed reading2 jobs counts
+                      (finish kid 0 0 queue))
+                    (let ((sends
+                            (map
+                              (lambda (j)
+                                (SendCaps coord
+                                  (DeepSeq j ["case" (Ix 0 j)]) [0]))
+                              js)))
+                      (Seq (DeepSeq sends sends)
+                        (loop claimed reading2
+                          (row-weld jobs
+                            (map (lambda (j) [kid (Ix 0 j) (Ix 1 j)]) js))
+                          (snoc [kid (Sz js) 0 0] counts)
+                          queue))))))))))
+      ((Eq kind "cres")
+        ;; FIFO: this reply answers the head job
+        (let* ((job (Ix 0 jobs))
+               (jobs2 (drop 1 jobs))
+               (kid (Ix 0 job))
+               (node (Ix 1 job))
+               (lore (Ix 2 job))
+               (c (_2 msg))
+               (ct (find (lambda (e) (Equal kid (Ix 0 e))) counts))
+               (cte (_0 ct))
+               ;; evaluation under Try: a doctest that kills the eval
+               ;; must not kill the driver — it reports empty results
+               (rs (If (Eq "some" (Hd c))
+                     (let ((rx (Try (lambda (zz)
+                                      (let ((rr (cap-results
+                                                  (doctest:run-lore
+                                                    (d-sut ds) lore))))
+                                        (DeepSeq rr rr)))
+                                 0)))
+                       (If (Eq 1 (Hd rx))
+                         (Seq (Trace ["doctest: eval failed" (_0 rx)] 0) [])
+                         (_0 rx)))
+                     []))
+               (np (foldl (lambda (a r) (If (Ix 1 r) (Inc a) a)) 0 rs))
+               (nf (Sub (Sz rs) np))
+               (passed (Add (Ix 2 cte) np))
+               (failed (Add (Ix 3 cte) nf))
+               (pending (Sub (Ix 1 cte) 1))
+               (counts2
+                 (filter (lambda (e) (Nil (Equal kid (Ix 0 e)))) counts))
+               ;; the verdict rides a child node — the documented
+               ;; node's version stays clean as the staleness anchor.
+               ;; Try make first; an "already exists" ack retries as
+               ;; a poke (see the "ack" branch).
+               (queue2
+                 (If (Eq "some" (Hd c))
+                   (let* ((dtnode (snoc (ts "dt") node))
+                          (card ((d-card ds) (Now 0) (_0 c) rs)))
+                     (send-cmd kid "dtm" [dtnode card]
+                       ((d-make ds) dtnode card)
+                       queue))
+                   queue)))
+          (If (Eq 0 pending)
+            (loop claimed reading jobs2 counts2
+              (finish kid passed failed queue2))
+            (loop claimed reading jobs2
+              (snoc [kid pending passed failed] counts2)
+              queue2))))
+      ((Eq kind "ack")
+        (let ((head (Ix 0 queue))
+              (rest (drop 1 queue))
+              (rsvp (_1 msg)))
+          (cond
+            ((And (Eq "no" (Hd rsvp)) (Equal "dtm" (Ix 1 head)))
+              ;; the dt child already exists: re-send as a poke
+              (let ((extra (Ix 2 head)))
+                (loop claimed reading jobs counts
+                  (send-cmd (Ix 0 head) "dtp" 0
+                    ((d-poke ds) (Ix 0 extra) (Ix 1 extra))
+                    rest))))
+            ((Eq "no" (Hd rsvp))
+              (Seq (Trace ["doctest: cmd failed" (Ix 0 head) (Ix 1 head)] 0)
+                (loop claimed reading jobs counts rest)))
+            ((Equal "clear" (Ix 1 head))
+              (loop (row-drop (Ix 0 head) claimed) reading jobs counts rest))
+            (else (loop claimed reading jobs counts rest)))))
+      ((Eq kind "die") ["dead"])
+      (else (loop claimed reading jobs counts queue))))
+  (define kids0
+    (If (Eq "known" (Hd rec0)) (fresh-kids [] (_0 rec0)) []))
+  (define sends0 (read-kids kids0))
+  (Seq coord
+    (Seq (DeepSeq kids0 (DeepSeq sends0 sends0))
+      (loop kids0 kids0 [] [] []))))

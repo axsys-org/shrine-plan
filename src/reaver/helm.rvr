@@ -15,6 +15,8 @@
 
 (#bind foil-lore (#module foil-lore))
 
+(#bind doctest (#module doctest))
+
 
 ;;; The IO driver shell: real enki actors around the pure helm core
 ;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
@@ -27,6 +29,8 @@
 ;;;   ["task" task]       external injection; replies ["done"] to the
 ;;;                       cap — the synchronous barrier drivers use
 ;;;   ["query" path]      replies the committed record (res shape)
+;;;   ["case" path]       replies ["cres" path maybe[nat]] — the
+;;;                       node's current version
 ;;;   ["crew" ]           replies the roster's names
 ;;;   ["handle" name]     replies ["handle"] with the worker handle as
 ;;;                       a capability (or ["nohandle"])
@@ -185,6 +189,17 @@
 (define (entry-lore me)
   (If (Lt 4 (Sz me)) (Ix 4 me) []))
 
+;; A mirror-shaped entry's own keys: declared, minus imports, minus
+;; materialized const-generic instantiations (/ty-ap-encoded keys are
+;; not namespace paths) — the mirror's and the doctest driver's
+;; shared notion of "documented entries".
+(define (entry-own-keys me)
+  (filter
+    (lambda (k)
+      (And (Nil (ty-ap-path? k))
+        (Nil (includes (Equal k) (_3 me)))))
+    (_2 me)))
+
 ;; A lore-for hit (0 or singleton) -> the four constructor arguments
 ;; [lo lh lb lt] the boot_*_t records take.
 (define (lore-args hit)
@@ -198,22 +213,27 @@
 ;; module's file node followed by its entries.  A module's own keys
 ;; are its cache entry's decl keys minus its imported keys — both
 ;; stored on the entry ([name subject decl-keys imported-keys lore]).
+;; The cache in mirror shape ([name subject decl-keys imported lore]
+;; rows) regardless of flavor; artifacts carry no lore yet — empty
+;; 5th field.  The mirror builds from this, and the doctest driver
+;; resolves target paths against it.
+(define (mirror-cache raw-cache core)
+  (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
+    (map
+      (lambda (ce)
+        (let ((body (foil:artifact-body (_1 ce))))
+          [(_0 ce) (core-sut core)
+           (foil:artifact-decl-keys body)
+           (foil:artifact-imported body)
+           []]))
+      (foil:artifact-cache-entries raw-cache))
+    raw-cache))
+
 ;; The cache passed explicitly: the app pipeline compiles apps into
 ;; the core's cache first, then mirrors from the extended cache so
 ;; app modules mirror (lore included) like kernel code.
 (define (boot-mirror-tasks-lore-with lore? raw-cache core)
-  (define cache
-    (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
-      (map
-        (lambda (ce)
-          (let ((body (foil:artifact-body (_1 ce))))
-            ;; artifacts carry no lore yet — empty 5th field
-            [(_0 ce) (core-sut core)
-             (foil:artifact-decl-keys body)
-             (foil:artifact-imported body)
-             []]))
-        (foil:artifact-cache-entries raw-cache))
-      raw-cache))
+  (define cache (mirror-cache raw-cache core))
   (define vine-make (core-ent core ["vine_make"]))
   (define doc-t (core-ent core ["boot_doc_t"]))
   (define src-t (core-ent core ["boot_src_t"]))
@@ -224,15 +244,7 @@
     (define imported (_3 me))
     (define src (foil:get-foil mod))
     (define lore (If lore? (entry-lore me) []))
-    ;; materialized const-generic instantiations carry /ty-ap-encoded
-    ;; keys (not namespace paths, and their value is the generic's) —
-    ;; the mirror skips them, like forge's ns index
-    (define own
-      (filter
-        (lambda (k)
-          (And (Nil (ty-ap-path? k))
-            (Nil (includes (Equal k) imported))))
-        (_2 me)))
+    (define own (entry-own-keys me))
     (define mnode (Weld [(ts "boot")] (map ts (mod-segs mod))))
     (define (ent-task k)
       (define e (foil:entry-parts sut k))
@@ -370,6 +382,58 @@
 (define (mount-apps core sov apps)
   (foldl (lambda (s e) (mount-app core s (_0 e) (_1 e))) sov apps))
 
+;;; Boot-time doctest sweep (doc/doctest-runner-explorer.md part I) ;;;;;;;;;;;;;;;;;
+
+;; Off by default: the sweep is a pure function of the mirror and can
+;; always be run later through /io/doctest; flip to boot born-verified.
+(define doctest-sweep? 0)
+
+;; Verdicts for every documented entry with tests, evaluated against
+;; the core's own subject and poked onto the mirror nodes.  Tolerant:
+;; a failed poke traces and moves on — verdicts are data, not gates.
+(define (seed-doctests raw-cache core sov)
+  (define sut (core-sut core))
+  (define cache (mirror-cache raw-cache core))
+  (define vine-poke (core-ent core ["vine_poke"]))
+  (define vine-make (core-ent core ["vine_make"]))
+  (define dt-card (core-ent core ["dt_card_t"]))
+  (define run-event (core-ent core ["run_event"]))
+  (define xcase (core-ent core ["x_case_h"]))
+  (define (tested l) (Gt (Sz (foil-lore:lore-tests l)) 0))
+  ;; the verdict rides a child node — the documented node's version
+  ;; stays clean as the staleness anchor (doctest-runner-explorer I.3)
+  (define (poke1 s node l)
+    (define c (xcase 0 node s))
+    (If (Nil (Eq "some" (Hd c)))
+      s
+      (let* ((rs (doctest:run-lore sut l))
+             (dtnode (snoc (ts "dt") node))
+             (card (dt-card (Now 0) (_0 c) rs))
+             (task (If (Eq "some" (Hd (xcase 0 dtnode s)))
+                     (vine-poke dtnode card)
+                     (vine-make dtnode card)))
+             (o (Try (lambda (z) (run-event task 0 s)) 0)))
+        (If (And (Eq 0 (Hd o)) (Eq "ripe" (Hd (_0 o))))
+          (Ix 0 (_0 o))
+          (Seq (Trace ["doctest-sweep: poke failed" node] 0) s)))))
+  (define (mod-sweep s me)
+    (define bsegs (Weld [(ts "boot")] (map ts (mod-segs (_0 me)))))
+    (define lore (entry-lore me))
+    (define s1
+      (let ((mh (foil-lore:lore-for lore [])))
+        (If (And mh (tested (_0 mh))) (poke1 s bsegs (_0 mh)) s)))
+    (foldl
+      (lambda (s2 k)
+        (let* ((name (drop 1 k))
+               (hit (foil-lore:lore-for lore name)))
+          (If (And hit (tested (_0 hit)))
+            (poke1 s2
+              (Weld bsegs (Weld [(ts (showNat (Sz name)))] (map ts name)))
+              (_0 hit))
+            s2)))
+      s1 (entry-own-keys me)))
+  (foldl mod-sweep sov cache))
+
 ;;; Duty application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (roster-get roster n)
@@ -458,6 +522,14 @@
       (let ((s (_0 hm)))
         (let ((res ((core-xq core) (Ix 2 s) (_1 msg) s)))
           (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
+            (helm-loop core mk-worker st)))))
+    ((Eq kind "case")
+      ;; ["case" path] — the node's current version (maybe[nat]),
+      ;; tagged for multiplexed worker mailboxes.  The doctest
+      ;; driver's staleness anchor.
+      (let ((s (_0 hm)))
+        (let ((c ((core-ent core ["x_case_h"]) 0 (_1 msg) s)))
+          (Seq (Send (Ix 0 caps) (DeepSeq c ["cres" (_1 msg) c]))
             (helm-loop core mk-worker st)))))
     ((Eq kind "crew")
       (Seq (Send (Ix 0 caps) (map (Ix 0) roster))
