@@ -13,6 +13,8 @@
 
 (#bind foil (#module foil))
 
+(#bind foil-lore (#module foil-lore))
+
 
 ;;; The IO driver shell: real enki actors around the pure helm core
 ;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
@@ -153,20 +155,41 @@
      "[src], and its compiled value in [code] when lowering "
      "produced one."]))
 
+;; Lore mirroring is a pure function of the already-mirrored [src]
+;; (doc/shrine-apps.md section 4.3) — flip to 0 to shed the seeding
+;; cost without losing information.
+(define mirror-lore? 1)
+
+;; The 5th cache field when present; legacy 4-field and
+;; artifact-derived entries degrade to no lore.
+(define (entry-lore me)
+  (If (Lt 4 (Sz me)) (Ix 4 me) []))
+
+;; A lore-for hit (0 or singleton) -> the four constructor arguments
+;; [lo lh lb lt] the boot_*_t records take.
+(define (lore-args hit)
+  (Ifz hit
+    [0 0 [] []]
+    (let ((l (_0 hit)))
+      [1 (foil-lore:lore-head l) (foil-lore:lore-body l)
+       (foil-lore:lore-test-pairs l)])))
+
 ;; One vine_make task per mirrored node: /boot first, then each
 ;; module's file node followed by its entries.  A module's own keys
 ;; are its cache entry's decl keys minus its imported keys — both
-;; stored on the entry ([name subject decl-keys imported-keys]).
-(define (boot-mirror-tasks core)
+;; stored on the entry ([name subject decl-keys imported-keys lore]).
+(define (boot-mirror-tasks-lore lore? core)
   (define raw-cache (core-cache core))
   (define cache
     (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
       (map
         (lambda (ce)
           (let ((body (foil:artifact-body (_1 ce))))
+            ;; artifacts carry no lore yet — empty 5th field
             [(_0 ce) (core-sut core)
              (foil:artifact-decl-keys body)
-             (foil:artifact-imported body)]))
+             (foil:artifact-imported body)
+             []]))
         (foil:artifact-cache-entries raw-cache))
       raw-cache))
   (define vine-make (core-ent core ["vine_make"]))
@@ -178,6 +201,7 @@
     (define sut (_1 me))
     (define imported (_3 me))
     (define src (foil:get-foil mod))
+    (define lore (If lore? (entry-lore me) []))
     ;; materialized const-generic instantiations carry /ty-ap-encoded
     ;; keys (not namespace paths, and their value is the generic's) —
     ;; the mirror skips them, like forge's ns index
@@ -194,11 +218,22 @@
       (define name (drop 1 k))
       (define node
         (Weld [(ts "boot") (ts mod) (ts (showNat (Sz name)))] (map ts name)))
-      (vine-make node (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e))))
-    (Weld [(vine-make [(ts "boot") (ts mod)] (src-t src))]
+      ;; entry keys are rooted, capture-lore paths source-relative —
+      ;; name (the rootless key) is the lookup key for both
+      (define la (lore-args (foil-lore:lore-for lore name)))
+      (vine-make node
+        (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e)
+          (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la))))
+    ;; the module header's own slugs capture at path []
+    (define mla (lore-args (foil-lore:lore-for lore [])))
+    (Weld [(vine-make [(ts "boot") (ts mod)]
+             (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)))]
       (map ent-task own)))
   (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
     (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache)))
+
+(define (boot-mirror-tasks core)
+  (boot-mirror-tasks-lore mirror-lore? core))
 
 ;; Fold tasks into a sovereign through the compiled kernel: every node
 ;; arrives as an ordinary committed event.  A failed event dies loudly
