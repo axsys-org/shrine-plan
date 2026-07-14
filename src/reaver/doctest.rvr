@@ -1,0 +1,87 @@
+;;;; Doctest evaluation against a live compiled subject
+;;;; (doc/doctest-runner-explorer.md part I).  Hoisted out of forge so
+;;;; the /io/doctest driver and forge share one eval core; forge
+;;;; rebinds these names (the same move as foil-lore).
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind foil-sast (#module foil-sast))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+(#bind cgen (#module codegen))
+
+(#bind foil-lore (#module foil-lore))
+
+
+;; rex node -> [value type], deep-forced so errors surface inside Try.
+(define (eval-rex sut rexn)
+  (define ast (foil-sast:parse-val-sast rexn))
+  (define tc (foil:elab-val sut foil:empty-env ast))
+  (define ir (foil:lower-tc sut tc))
+  (define val (cgen:compile-expr ir))
+  (DeepSeq val [val (tc-ty tc)]))
+
+(define (eval-text sut txt)
+  (define parsed (Try rex:ParseRexNorm txt))
+  (If (Eq 1 (Hd parsed))
+    (1 ["rex-parse-failed" (_0 parsed)])
+    (Try (eval-rex sut) (_0 parsed))))
+
+;; One doctest: ["pass"|"fail"|"error"|"broken" line got want].
+;; ((_0 dt), not (Hd dt): rows carry their tag at slot 0 — the old
+;; forge copy read Hd and sent DTBAD rows through eval by accident.)
+(define (run-doctest sut dt[_ line srcx expx])
+  (If (Eq "DTBAD" (_0 dt))
+    ["broken" line 0 0]
+    (let ((got (Try (eval-rex sut) srcx))
+          (want (Try (eval-rex sut) expx)))
+      (cond
+        ((Eq 1 (Hd got))  ["error" line (_0 got) 0])
+        ((Eq 1 (Hd want)) ["error" line (_0 want) 0])
+        ((Equal (_0 (_0 got)) (_0 (_0 want)))
+          ["pass" line (_0 (_0 got)) (_0 (_0 want))])
+        (else ["fail" line (_0 (_0 got)) (_0 (_0 want))])))))
+
+;; Best-effort text for a failing doctest's actual value: printable
+;; cords verbatim, other nats as decimals, structure declined.  The
+;; driver caps the length (doc provisional: ~500 bytes).
+(define (printable? v)
+  (define (go i)
+    (Or (Ge i (Bytes v))
+      (And (let ((c (Load8 i v))) (And (Ge c 32) (Le c 126)))
+        (go (Inc i)))))
+  (And (IsNat v) (And (Gt (Bytes v) 0) (go 0))))
+
+(define (val-text v)
+  (cond
+    ((printable? v) v)
+    ((IsNat v) (showNat v))
+    (else "opaque value")))
+
+;; The verdict results for one lore record: index-aligned with its
+;; tests row ([[i pass got] ..]); got carries text only on failure
+;; (doc/doctest-runner-explorer.md I.3).
+(define (run-lore sut l)
+  (define dts (foil-lore:lore-tests l))
+  (define (go i acc)
+    (If (Ge i (Sz dts))
+      acc
+      (let ((r (run-doctest sut (Ix i dts))))
+        (go (Inc i)
+          (snoc
+            (cond
+              ((Equal "pass" (_0 r)) [i 1 0])
+              ((Equal "fail" (_0 r)) [i 0 (val-text (Ix 2 r))])
+              (else [i 0 (strcat ["doctest " (_0 r)])]))
+            acc)))))
+  (go 0 []))
