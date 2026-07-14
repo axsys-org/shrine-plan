@@ -146,6 +146,19 @@
 
 (define (ts s) ("ts" s))
 
+;; Module names split into namespace segments: apps mirror at
+;; /boot/apps/<name>/main, kernel modules keep their single segment.
+(define (mod-segs mod)
+  (define n (Bytes mod))
+  (define (slice a b) (Trunc (Mul 8 (Sub b a)) (Rsh mod (Mul 8 a))))
+  (define (go start i acc)
+    (If (Ge i n)
+      (snoc (slice start i) acc)
+      (If (Eq "/" (Load8 i mod))
+        (go (Inc i) (Inc i) (snoc (slice start i) acc))
+        (go start (Inc i) acc))))
+  (go 0 0 []))
+
 (define boot-doc-text
   (strcat
     ["the boot image: the system's own compiled code. "
@@ -185,8 +198,10 @@
 ;; module's file node followed by its entries.  A module's own keys
 ;; are its cache entry's decl keys minus its imported keys — both
 ;; stored on the entry ([name subject decl-keys imported-keys lore]).
-(define (boot-mirror-tasks-lore lore? core)
-  (define raw-cache (core-cache core))
+;; The cache passed explicitly: the app pipeline compiles apps into
+;; the core's cache first, then mirrors from the extended cache so
+;; app modules mirror (lore included) like kernel code.
+(define (boot-mirror-tasks-lore-with lore? raw-cache core)
   (define cache
     (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
       (map
@@ -218,13 +233,14 @@
           (And (Nil (ty-ap-path? k))
             (Nil (includes (Equal k) imported))))
         (_2 me)))
+    (define mnode (Weld [(ts "boot")] (map ts (mod-segs mod))))
     (define (ent-task k)
       (define e (foil:entry-parts sut k))
       (define kind (foil:entry-kind sut k (foil:ent-tc e)))
       (define slice (foil:source-slice src (foil:ent-span e)))
       (define name (drop 1 k))
       (define node
-        (Weld [(ts "boot") (ts mod) (ts (showNat (Sz name)))] (map ts name)))
+        (Weld mnode (Weld [(ts (showNat (Sz name)))] (map ts name))))
       ;; entry keys are rooted, capture-lore paths source-relative —
       ;; name (the rootless key) is the lookup key for both
       (define la (lore-args (foil-lore:lore-for lore name)))
@@ -233,14 +249,20 @@
           (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la))))
     ;; the module header's own slugs capture at path []
     (define mla (lore-args (foil-lore:lore-for lore [])))
-    (Weld [(vine-make [(ts "boot") (ts mod)]
+    (Weld [(vine-make mnode
              (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)))]
       (map ent-task own)))
   (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
     (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache)))
 
+(define (boot-mirror-tasks-lore lore? core)
+  (boot-mirror-tasks-lore-with lore? (core-cache core) core))
+
 (define (boot-mirror-tasks core)
   (boot-mirror-tasks-lore mirror-lore? core))
+
+(define (boot-mirror-tasks-with raw-cache core)
+  (boot-mirror-tasks-lore-with mirror-lore? raw-cache core))
 
 ;; Fold tasks into a sovereign through the compiled kernel: every node
 ;; arrives as an ordinary committed event.  A failed event dies loudly
@@ -257,6 +279,96 @@
 
 (define (seed-boot core sov)
   (seed-tasks core sov (boot-mirror-tasks core)))
+
+;;; Application mounting (doc/shrine-apps.md section 6) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; App names discovered on disk: one folder per app under foil/apps
+;; (module apps/<name>/main).  ReadFolder rides the event log, so a
+;; recorded boot replays the same scan; 0 means no apps.
+(define (discover-apps z)
+  (define r (ReadFolder "foil/apps"))
+  (Ifz r [] (map (Ix 1) (filter (lambda (e) (Eq 1 (Ix 0 e))) r))))
+
+;; Compile one app module against the shared core cache and pull its
+;; manifest.  The whole step runs under Try — one bad app never costs
+;; the boot.  mani-ok is the core's own brand gate (brands are shared
+;; through the cache, so the core's pact_form applies to the app's
+;; mani directly).  -> [cache' ["OK" mani] | ["ERR" err]]
+(define (compile-app core cache mod)
+  (define mani-ok (core-ent core ["mani_ok"]))
+  (define r
+    (Try
+      (lambda (z)
+        (let* ((cr (If (And (IsApp cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 cache)))
+                     (foil:compile-mod-artifact-cached
+                       cache foil:default-subject 0 mod)
+                     (foil:compile-mod-cached cache foil:default-subject mod)))
+               (sut (_1 cr))
+               (m ((foil:ir-entry-val (got-entry ["boot" "app"] sut)) 0)))
+          (Seq (If (Eq 1 (mani-ok m)) 0 (error ["app-entry-not-mani" mod]))
+            [(_0 cr) m])))
+      0))
+  (If (Eq 1 (Hd r))
+    [cache ["ERR" (_0 r)]]
+    [(_0 (_0 r)) ["OK" (_1 (_0 r))]]))
+
+;; Discover and compile every app: [cache' [[name res] ..]].  Runs
+;; before the mirror is built so app modules mirror like kernel code.
+(define (compile-apps core cache names)
+  (foldl
+    (lambda (st name)
+      (let ((r (compile-app core (_0 st) (strcat ["apps/" name "/main"]))))
+        [(_0 r) (snoc [name (_1 r)] (_1 st))]))
+    [cache []] names))
+
+;; Best-effort error text for the fail card; the Trace carries the
+;; full value.
+(define (err-cord e)
+  (define (go d v)
+    (cond
+      ((IsNat v) v)
+      ((Ge d 4) "..")
+      ((And (IsApp v) (Eq 0 (Hd v)))
+        (strcat (foldl (lambda (acc k) (snoc (go (Inc d) k) (snoc " " acc))) [] v)))
+      (else "opaque")))
+  (go 0 e))
+
+;; Mount one compiled app at ['app <name>]: a single make whose card
+;; carries the manifest — the in-kernel pact_form expansion commits
+;; the whole app subtree in that one epoch, and a failed worm commits
+;; nothing, so there is never a partial subtree.  Any failure
+;; (compile, brand gate, mount outcome, root collision — a make on a
+;; live root fails the event) leaves an app_fail_t tombstone at the
+;; root instead: a broken app is a visible namespace citizen.
+(define (mount-app core sov name res)
+  (define vine-make (core-ent core ["vine_make"]))
+  (define run-event (core-ent core ["run_event"]))
+  (define root [(ts "app") (ts name)])
+  (define (fail err)
+    (define fail-t (core-ent core ["app_fail_t"]))
+    (define o
+      (Try (lambda (z)
+             (run-event (vine-make root (fail-t (err-cord err))) 0 sov))
+        0))
+    (Seq (Trace ["app-mount-failed" name err] 0)
+      (If (And (Eq 0 (Hd o)) (Eq "ripe" (Hd (_0 o))))
+        (Ix 0 (_0 o))
+        sov)))
+  (If (Eq "ERR" (_0 res))
+    (fail (_1 res))
+    (let* ((app-card (core-ent core ["app_card_t"]))
+           (mod (strcat ["apps/" name "/main"]))
+           (o (Try (lambda (z)
+                     (run-event (vine-make root (app-card (_1 res) mod)) 0 sov))
+                0)))
+      (If (Eq 1 (Hd o))
+        (fail (_0 o))
+        (If (Eq "ripe" (Hd (_0 o)))
+          (Ix 0 (_0 o))
+          (fail ["mount-not-ripe" (_0 o)]))))))
+
+(define (mount-apps core sov apps)
+  (foldl (lambda (s e) (mount-app core s (_0 e) (_1 e))) sov apps))
 
 ;;; Duty application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
