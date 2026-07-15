@@ -565,9 +565,12 @@
                 (zip kids (ty:trow-vals frow))))
             (elab-error env "row pattern does not match the field's row"
               ["field" fm "pattern" argp]))))
+      ;; A binding position has no else leg, so a variant pattern (a
+      ;; runtime test that can fail) cannot appear here — only in a
+      ;; match arm, where pat-deep handles it.
       ((relvar-pat? argp)
         (elab-error env
-          "nested variant patterns are not supported yet - bind a name and match again"
+          "variant patterns cannot bind unconditionally - match (?) or guard (?>) on the value instead"
           argp))
       (else (elab-error env "unsupported pattern element" argp))))
   ;; Checking mode: when the context expects a function type of
@@ -1136,32 +1139,78 @@
         (elab-val-context ctx (clear-env-goal env) head)
         [ctx (elab-var [0 head])]))
     (elab-meth-go hr (drop 1 els)))
+  ;; ["key" cstr arity kids] — kids all 0 for a flat pattern (no
+  ;; nested constraints); pat-deep fills them for nested variants.
   (define (arm-span-key span)
     (If (Eq "TROW" (_1 span))
-      ["key" (ty:trow-cstr span) (Sz (ty:trow-vals span))]
+      (let ((n (Sz (ty:trow-vals span))))
+        ["key" (ty:trow-cstr span) n (gen n (lambda (i) 0))])
       0))
   ;; During case elaboration an arm temporarily carries its one expanded
   ;; narrowed span and runtime key alongside the unchanged TC_ARM.
   (define arm-info-tc (Ix 0))
   (define arm-info-span (Ix 1))
   (define arm-info-key (Ix 2))
-  ;; -> [ctx local-ty]: local-ty doubles as the arm's span/key source
-  ;; (a TROW with the member's runtime cstr and arity).
-  (define (elab-relvar-arm ctx0 scr-ty pat)
-    (define bare? (Eq "s_relvar" (_0 pat)))
-    (define tag
-      (If bare? (_1 pat) (_1 (_0 (surf-tapp-kids pat)))))
-    (define argps (If bare? [] (drop 1 (surf-tapp-kids pat))))
-    (define mr (relvar-member ctx0 tag scr-ty "a pattern"))
-    (define fields (Ix 1 mr))
-    (define cstr (Ix 2 mr))
-    (If (Ne (Sz argps) (Sz fields))
-      (elab-error env ["member arity mismatch in pattern" tag]
-        ["want" (Sz fields) "got" (Sz argps)])
-      [(Ix 0 mr)
-       (ty:TROW cstr
-         (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
-           (zip argps fields)))]))
+  ;; Deep pattern imposition for match arms -> [ctx local-ty key].
+  ;; Like relvar-pat-field, but nested variant patterns are allowed:
+  ;; each resolved variant narrows its position to the member's row
+  ;; (its binders type as the member's fields) and contributes a
+  ;; ["key" cstr arity kids] node to the arm's runtime key tree, which
+  ;; lower-arm-test turns into Ix-chain probes.  An anonymous-row
+  ;; pattern needs no test of its own (the type guarantees its shape)
+  ;; but keys a node anyway when a nested variant sits inside it.
+  (define (pat-deep ctx0 argp field)
+    (define fm (burp-face field))
+    (define (deep-kids ctx1 argps fields)
+      (foldl
+        (lambda (st pr)
+          (let ((r (pat-deep (Ix 0 st) (_0 pr) (_1 pr))))
+            [(Ix 0 r) (snoc (Ix 1 r) (Ix 1 st)) (snoc (Ix 2 r) (Ix 2 st))]))
+        [ctx1 [] []] (zip argps fields)))
+    (cond
+      ((Eq "s_hole" (_0 argp)) [ctx0 (ty:TFAC 0 fm) 0])
+      ((And (Eq "s_ref" (_0 argp)) (Eq 1 (Sz (surf-ref-path argp))))
+        [ctx0 (ty:TFAC (_0 (surf-ref-path argp)) fm) 0])
+      ((Eq "s_face" (_0 argp))
+        [ctx0 (ty:TFAC (surf-face-name argp) (elab-ty (surf-face-kid argp))) 0])
+      ((relvar-pat? argp)
+        (let* ((bare? (Eq "s_relvar" (_0 argp)))
+               (tag (If bare? (_1 argp) (_1 (_0 (surf-tapp-kids argp)))))
+               (argps (If bare? [] (drop 1 (surf-tapp-kids argp))))
+               (mr (relvar-member ctx0 tag fm "a pattern"))
+               (fields (Ix 1 mr))
+               (cstr (Ix 2 mr)))
+          (If (Ne (Sz argps) (Sz fields))
+            (elab-error env ["member arity mismatch in pattern" tag]
+              ["want" (Sz fields) "got" (Sz argps)])
+            (let ((kr (deep-kids (Ix 0 mr) argps fields)))
+              [(Ix 0 kr)
+               (ty:TROW cstr (Ix 1 kr))
+               ["key" cstr (Sz fields) (Ix 2 kr)]]))))
+      ((Eq "s_trow" (_0 argp))
+        (let ((frow
+                (cond
+                  ((Eq "TROW" (_1 fm)) fm)
+                  ((Eq "TNOM" (_1 fm))
+                    (let ((d (burp-face (applied-type sut (_2 fm)))))
+                      (If (Eq "TROW" (_1 d))
+                        d
+                        (burp-face (ty:mold-to-span sut fm)))))
+                  (else (burp-face (ty:mold-to-span sut fm)))))
+              (kids (_1 argp)))
+          (If (And (Eq "TROW" (_1 frow))
+                (Eq (Sz kids) (Sz (ty:trow-vals frow))))
+            (let* ((kr (deep-kids ctx0 kids (ty:trow-vals frow)))
+                   (keys (Ix 2 kr))
+                   (span (burp-face (ty:mold-to-span sut fm))))
+              [(Ix 0 kr)
+               (ty:TROW (ty:trow-cstr frow) (Ix 1 kr))
+               (Ifz (find (lambda (k) (Ifz k 0 1)) keys)
+                 0
+                 ["key" (ty:trow-cstr span) (Sz kids) keys])])
+            (elab-error env "row pattern does not match the field's row"
+              ["field" fm "pattern" argp]))))
+      (else (elab-error env "unsupported pattern element" argp))))
   (define (elab-arm-classic scr-ty st[ctx infos] a[_ pat val])
     (define pat-ty (elab-ty pat))
     (define met
@@ -1194,45 +1243,68 @@
       (elab-error env "match arm pattern is not a row (constructor) type"
         ["pattern" pat-ty "narrowed" ty])
       (let* ((rr (elab-val-context ctx1 (push-local-env env local-ty) val))
-             (res (_1 rr)))
+             (res (_1 rr))
+             (key (arm-span-key span)))
         [(_0 rr)
-         (snoc [(tc-arm (tc-ty res) ty res) span (arm-span-key span)] infos)])))
+         (snoc [(tc-arm (tc-ty res) ty res key) span key] infos)])))
+  ;; An anonymous-row pattern with a variant inside ([(./known x) ..])
+  ;; takes the deep path; a plain one keeps the classic meet.
+  (define (pat-nested? pat)
+    (Or (relvar-pat? pat)
+      (And (Eq "s_trow" (_0 pat))
+        (Ifz (find pat-nested? (_1 pat)) 0 1))))
   (define (elab-arm scr-ty st[ctx infos] a[_ pat val])
-    (If (relvar-pat? pat)
-      (let* ((ar (elab-relvar-arm ctx scr-ty pat))
+    (If (pat-nested? pat)
+      (let* ((ar (pat-deep ctx pat scr-ty))
              (lty (Ix 1 ar))
+             (key (Ix 2 ar))
              (rr (elab-val-context (Ix 0 ar) (push-local-env env lty) val))
              (res (_1 rr)))
         [(_0 rr)
-         (snoc [(tc-arm (tc-ty res) lty res) lty (arm-span-key lty)] infos)])
+         (snoc [(tc-arm (tc-ty res) lty res key) lty key] infos)])
       (elab-arm-classic scr-ty st a)))
-  ;; Lowered arm tests dispatch on constructor head + arity only
-  ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
-  ;; would silently shadow each other.  Reject them here instead.
+  ;; Lowered arm tests dispatch on the key tree (lower-arm-test in
+  ;; foil-lower.rvr).  An arm whose key SUBSUMES a later arm's — same
+  ;; constructor and arity, every sub-key at least as general — matches
+  ;; everything the later arm matches, so the later arm is dead code.
+  ;; Reject that here (equal keys, the old check, subsume mutually).
+  (define (key-subsumes? a b)
+    (cond
+      ((Ifz a 1 0) 1)
+      ((Ifz b 1 0) 0)
+      (else
+        (And (Eq (_1 a) (_1 b))
+          (And (Eq (_2 a) (_2 b))
+            (all (lambda (pr) (key-subsumes? (_0 pr) (_1 pr)))
+              (zip (Ix 3 a) (Ix 3 b))))))))
   (define (check-arms-distinct infos)
-    (define (dup-key keys)
+    (define (shadowed keys)
       (Ifz keys 0
-        (Or (And (_0 keys) (includes (Equal (_0 keys)) (drop 1 keys)))
-          (dup-key (drop 1 keys)))))
-    (define dup (dup-key (map arm-info-key infos)))
-    (Ifz dup 0
+        (Or (And (_0 keys)
+              (Ifz (find (key-subsumes? (_0 keys)) (drop 1 keys)) 0 1))
+          (shadowed (drop 1 keys)))))
+    (Ifz (shadowed (map arm-info-key infos)) 0
       (elab-error env
-        "match arms indistinguishable at runtime (same constructor and arity)"
+        "match arm unreachable (an earlier arm already matches everything it matches)"
         (map (lambda (i) (tc-arm-pat (arm-info-tc i))) infos))))
   ;; A match without a fallthrough must cover every option of its
-  ;; scrutinee's sum (by the same head+arity key the lowered tests
-  ;; dispatch on).
+  ;; scrutinee's sum.  An arm covers an option when its key subsumes
+  ;; the option's (all-binder) key — so an arm with nested variant
+  ;; constraints does NOT cover its option, and a match using nested
+  ;; patterns needs an explicit fallthrough (or flat companion arms).
   (define (check-exhaustive scrut-ty scrut-span infos)
     (define span (burp-face scrut-span))
     (define keys (map arm-info-key infos))
     (define (opt-key o)
       (define s (burp-face o))
       (If (Eq "TROW" (_1 s))
-        ["key" (ty:trow-cstr s) (Sz (ty:trow-vals s))]
+        (arm-span-key s)
         0))
     (define (uncovered? o)
       (define k (opt-key o))
-      (Ifz k 1 (Nil (includes (Equal k) keys))))
+      (Ifz k 1
+        (Nil (includes (lambda (ak) (And (Truth ak) (key-subsumes? ak k)))
+               keys))))
     (define opts
       (cond
         ((Eq "TSUM" (_1 span)) (ty:tsum-opts span))

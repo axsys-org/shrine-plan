@@ -37,47 +37,50 @@
     ;; tc-lam-args holds the whole frame (self + args); the PLAN law
     ;; arity is the argument count only.  Flags: pinned, marked, recur.
     (cgen:F yes yes yes "LAM" (Dec (tc-lam-arity val)) body))
-  (define (get-row typ[_ tag])
-    (define typ1 (If (Eq tag "TFAC") (ty:tfac-val typ) typ))
-    (define span[_ stag] (ty:mold-to-span sut typ1))
-    (define (tag-is x) (Eq stag x))
-    (cond
-      ((tag-is "TROW") span)
-      ;; elab-arm rejects non-row patterns; reaching here is a compiler
-      ;; bug, not a user error — fail loudly instead of miscompiling.
-      (else (error ("match arm pattern is not a row type" typ)))))
-  (define (get-hd typ)
-    (ty:trow-cstr (get-row typ)))
   (define (call1 f a)
     (cgen:A (cgen:K f) a))
   (define (call2 f a b)
     (cgen:A (call1 f a) b))
   (define (call3 f a b c)
     (cgen:A (call2 f a b) c))
-  ;; The generated test only checks constructor head + arity.  This is
-  ;; sound because elaboration rejects matches over sums whose options
-  ;; are indistinguishable by (head, arity) — see check-arms-distinct in
-  ;; foil-elab.rvr.
-  (define (lower-arm-test pat-ty)
-    (define row (get-row pat-ty))
-    (define cstr (ty:trow-cstr row))
-    (define arity (Sz (ty:trow-vals row)))
-    (define val (cgen:V 0))
-    (Ifz arity
-      (call2 Ne val (cgen:K cstr))
-      (call3 If
-        (call1 IsApp val)
-        (call2 Or
-          (call2 Ne (call1 Hd val) (cgen:K cstr))
-          (call2 Ne (call1 Sz val) (cgen:K arity)))
-        (cgen:K 1))))
+  ;; The generated test walks the arm's key tree ["key" cstr arity
+  ;; kids]: constructor head + arity at each node, recursing into
+  ;; constrained fields (nested variant patterns) through Ix probes.
+  ;; This is sound because elaboration rejects arms an earlier arm's
+  ;; key subsumes — see check-arms-distinct in foil-elab.rvr.
+  ;; Nonzero result = no match (arms chain through Ifz).
+  (define (lower-arm-test key)
+    (define (probe val key)
+      (define cstr (_1 key))
+      (define arity (_2 key))
+      (define kid-tests
+        (foldl
+          (lambda (acc i)
+            (let ((k (Ix i (Ix 3 key))))
+              (Ifz k acc
+                (snoc (probe (call2 Ix (cgen:K i) val) k) acc))))
+          [] (gen arity (lambda (i) i))))
+      (Ifz arity
+        (call2 Ne val (cgen:K cstr))
+        (call3 If
+          (call1 IsApp val)
+          (foldl (lambda (acc t) (call2 Or acc t))
+            (call2 Or
+              (call2 Ne (call1 Hd val) (cgen:K cstr))
+              (call2 Ne (call1 Sz val) (cgen:K arity)))
+            kid-tests)
+          (cgen:K 1))))
+    (Ifz key
+      ;; elaboration keys every arm; a keyless arm is a compiler bug,
+      ;; not a user error — fail loudly instead of miscompiling.
+      (error ("match arm without a dispatch key" key))
+      (probe (cgen:V 0) key)))
   (define (lower-arms fall arms)
     (Ifz arms (lower-tc sut fall)
       (letrec
         ((arm (_0 arms))
-         (pat-ty (tc-arm-pat arm))
          (leg-tc (lower-tc sut (tc-arm-val arm)))
-         (test-ir (lower-arm-test pat-ty)))
+         (test-ir (lower-arm-test (tc-arm-key arm))))
          (cgen:A
            (cgen:A (cgen:A (cgen:K Ifz) test-ir)
              leg-tc)
@@ -227,7 +230,8 @@
         (map recur (tc-match-arms tc))
         (let ((f (tc-match-fall tc))) (Ifz f 0 (recur f)))))
     ((tag-is "TC_ARM")
-      (tc-arm (tc-ty tc) (tc-arm-pat tc) (recur (tc-arm-val tc))))
+      (tc-arm (tc-ty tc) (tc-arm-pat tc) (recur (tc-arm-val tc))
+        (tc-arm-key tc)))
     ((tag-is "TC_LET")
       (tc-letrec (tc-ty tc) (map recur (tc-letrec-binds tc))
         (recur (tc-letrec-body tc))))
