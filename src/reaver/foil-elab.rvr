@@ -218,6 +218,15 @@
       (ty:TNAT (_1 wav)))
     ((tag-is "s_tapp")
       (on-tapp (surf-tapp-kids wav)))
+    ;; Relative variants and wildcards reach type elaboration only when
+    ;; written outside a pattern (elab-pat intercepts them there).
+    ((tag-is "s_relvar")
+      (error ["foil-elab-error"
+              "relative variant (.tag) is only meaningful in pattern or value position"
+              ["tag" (_1 wav)]]))
+    ((tag-is "s_hole")
+      (error ["foil-elab-error"
+              "wildcard (_) is only meaningful inside a match pattern" 0]))
       (else (error ("unimpl type elab" wav)))))
 
 (define (elab-type sut wav)
@@ -473,6 +482,84 @@
   (define (elab-variant-call tag xs)
     (define ty (ty:TROW tag (map (cork burp-face tc-ty) xs)))
     (tc-row ty (ty:trow-cstr ty) xs))
+  ;;; Relative variants: .tag / (./tag args) resolve against the type
+  ;;; the context expects — the goal in expression position, the
+  ;;; scrutinee in patterns.  Resolution IS the narrowing: the member
+  ;;; is found among the expected union's own declared options, so no
+  ;;; member-nests-into-parent reasoning is needed (which also
+  ;;; sidesteps generic nominal members, whose instantiations do not
+  ;;; nest into the instantiated parent today).
+  (define (path-last-seg ref)
+    (If (ty-ap-path? ref)
+      (rear (Ix 0 (ty-ap-decode ref)))
+      (rear ref)))
+  (define (relvar-opt-tag o)
+    (define b (burp-face o))
+    (cond
+      ((Eq "TROW" (_1 b)) (ty:trow-cstr b))
+      ((Eq "TNOM" (_1 b)) (path-last-seg (_2 b)))
+      (else 0)))
+  ;; The declared option molds of an expected union type, instantiated
+  ;; (applied-type substitutes /ty-ap arguments); alias links chase.
+  (define (relvar-opts expect)
+    (define (chase m fuel)
+      (cond
+        ((Eq 0 fuel) 0)
+        ((Eq "TSUM" (_1 m)) (ty:tsum-opts m))
+        ((Eq "TROW" (_1 m)) [m])
+        ((Eq "TNOM" (_1 m))
+          (chase (burp-face (applied-type sut (_2 m))) (Dec fuel)))
+        (else 0)))
+    (chase (burp-face expect) 8))
+  ;; -> [ctx fields cstr arity]: the member's positional field molds
+  ;; (declared molds, not span roundtrips — binder nominality survives)
+  ;; and its runtime constructor key (from the span, which carries the
+  ;; brand for nominal members).
+  (define (relvar-member ctx0 tag expect what)
+    (define opts (relvar-opts expect))
+    (define hit
+      (Ifz opts 0 (find (lambda (o) (Eq tag (relvar-opt-tag o))) opts)))
+    (Ifz hit
+      (elab-error env ["no member named" tag "in the expected type"]
+        ["expected" expect "resolving" what])
+      (let* ((o (burp-face (_0 hit)))
+             (fields
+               (If (Eq "TNOM" (_1 o))
+                 (let ((m (burp-face (applied-type sut (_2 o)))))
+                   (If (Eq "TROW" (_1 m))
+                     (ty:trow-vals m)
+                     (elab-error env ["member is not a row type" tag] m)))
+                 (ty:trow-vals o)))
+             (sr (ty:mold-to-span-context ctx0 o))
+             (span (burp-face (_1 sr))))
+        (unless (Eq "TROW" (_1 span))
+          (elab-error env ["member has no runtime constructor" tag] span)
+          [(_0 sr) fields (ty:trow-cstr span) (Sz (ty:trow-vals span))]))))
+  ;; Expression position: arguments fill the member's fields
+  ;; positionally; the construction is typed as the EXPECTED type (the
+  ;; union), so casts and call-argument checks pass without a
+  ;; member-into-union nest.
+  (define (elab-relvar-call ctx0 tag xs)
+    (define goal (env-goal env))
+    (Ifz goal
+      (elab-error env
+        "relative variant (.tag) needs an expected type here - add a ^ cast or an annotation"
+        ["tag" tag])
+      (let* ((mr (relvar-member ctx0 tag goal "a value"))
+             (fields (Ix 1 mr))
+             (cstr (Ix 2 mr)))
+        (If (Ne (Sz xs) (Sz fields))
+          (elab-error env ["member arity mismatch" tag]
+            ["want" (Sz fields) "got" (Sz xs)])
+          (let* ((er (elab-vals-goals (Ix 0 mr) env xs fields))
+                 (exs (_1 er))
+                 (pairs (zip fields (map (cork burp-face tc-ty) exs)))
+                 (nr (nests-pairs (_0 er) pairs)))
+            (unless (_1 nr)
+              (elab-error env
+                ["member fields do not accept the arguments" tag]
+                ["want" fields "got" (map tc-ty exs)])
+              [(_0 nr) (tc-row (burp-face goal) cstr exs)]))))))
   ;; -> [row result-nom] for a constructible type callee, else 0. A
   ;; TTYP wrapping a /ty-ap nominal resolves through the applied view;
   ;; the nominal rides along as the construction's result type.
@@ -675,23 +762,31 @@
                (set-tc-ty typ base)))))))])
   ;; Callee first: its parameter (or constructor field) types become
   ;; the arguments' goals.
+  (define (elab-call-fun f xs)
+    (let* ((fr (elab-val-context ctx (clear-env-goal env) f))
+           (tc-f (_1 fr))
+           (rown (tc-type-row tc-f))
+           (goals
+             (If rown
+               (let ((fields (ty:trow-vals (Ix 0 rown))))
+                 (If (Eq (Sz xs) (Sz fields)) fields 0))
+               (fun-arg-goals (tc-ty tc-f) (Sz xs))))
+           (er (elab-vals-goals (_0 fr) env xs goals))
+           (exs (_1 er)))
+      (If rown
+        (elab-type-call (_0 er) f rown exs)
+        (on-call (_0 er) tc-f exs))))
   (define (elab-call c[_ f xs])
-    (If (Eq "s_variant" (_0 f))
-      (let ((er (elab-vals ctx env xs)))
-        [(_0 er) (elab-variant-call (_1 f) (_1 er))])
-      (let* ((fr (elab-val-context ctx (clear-env-goal env) f))
-             (tc-f (_1 fr))
-             (rown (tc-type-row tc-f))
-             (goals
-               (If rown
-                 (let ((fields (ty:trow-vals (Ix 0 rown))))
-                   (If (Eq (Sz xs) (Sz fields)) fields 0))
-                 (fun-arg-goals (tc-ty tc-f) (Sz xs))))
-             (er (elab-vals-goals (_0 fr) env xs goals))
-             (exs (_1 er)))
-        (If rown
-          (elab-type-call (_0 er) f rown exs)
-          (on-call (_0 er) tc-f exs)))))
+    (cond
+      ((Eq "s_variant" (_0 f))
+        (let ((er (elab-vals ctx env xs)))
+          [(_0 er) (elab-variant-call (_1 f) (_1 er))]))
+      ;; a relative-variant callee resolves against the CALL's own
+      ;; expected type (env still carries it here)
+      ((Eq "s_relvar" (_0 f))
+        (elab-relvar-call ctx (_1 f) xs))
+      (else
+        (elab-call-fun f xs))))
   ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
   ;; referee's type): lowering links the referee's compiled pin in by
   ;; path.  Embedding the whole referee TC — the old behavior — made
@@ -846,7 +941,57 @@
   (define arm-info-tc (Ix 0))
   (define arm-info-span (Ix 1))
   (define arm-info-key (Ix 2))
-  (define (elab-arm scr-ty st[ctx infos] a[_ pat val])
+  ;; Relative-variant patterns: (./tag binders) and bare .tag.
+  ;; Binders are positional over the member's declared fields; the
+  ;; resolution against the scrutinee's own options replaces the
+  ;; pattern/scrutinee meet.
+  (define (relvar-pat? pat)
+    (Or (Eq "s_relvar" (_0 pat))
+      (And (Eq "s_tapp" (_0 pat))
+        (Eq "s_relvar" (_0 (_0 (surf-tapp-kids pat)))))))
+  (define (relvar-pat-field argp field)
+    (define fm (burp-face field))
+    (cond
+      ((Eq "s_hole" (_0 argp)) fm)
+      ((And (Eq "s_ref" (_0 argp)) (Eq 1 (Sz (surf-ref-path argp))))
+        (ty:TFAC (_0 (surf-ref-path argp)) fm))
+      ((Eq "s_face" (_0 argp))
+        (ty:TFAC (surf-face-name argp) (elab-ty (surf-face-kid argp))))
+      ;; a nested anonymous-row pattern destructures a row field by
+      ;; position (the field's shape is already guaranteed by type)
+      ((Eq "s_trow" (_0 argp))
+        (let ((fspan (burp-face (ty:mold-to-span sut fm)))
+              (kids (_1 argp)))
+          (If (And (Eq "TROW" (_1 fspan))
+                (Eq (Sz kids) (Sz (ty:trow-vals fspan))))
+            (ty:TROW (ty:trow-cstr fspan)
+              (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
+                (zip kids (ty:trow-vals fspan))))
+            (elab-error env "row pattern does not match the field's row"
+              ["field" fm "pattern" argp]))))
+      ((relvar-pat? argp)
+        (elab-error env
+          "nested variant patterns are not supported yet - bind a name and match again"
+          argp))
+      (else (elab-error env "unsupported pattern element" argp))))
+  ;; -> [ctx local-ty]: local-ty doubles as the arm's span/key source
+  ;; (a TROW with the member's runtime cstr and arity).
+  (define (elab-relvar-arm ctx0 scr-ty pat)
+    (define bare? (Eq "s_relvar" (_0 pat)))
+    (define tag
+      (If bare? (_1 pat) (_1 (_0 (surf-tapp-kids pat)))))
+    (define argps (If bare? [] (drop 1 (surf-tapp-kids pat))))
+    (define mr (relvar-member ctx0 tag scr-ty "a pattern"))
+    (define fields (Ix 1 mr))
+    (define cstr (Ix 2 mr))
+    (If (Ne (Sz argps) (Sz fields))
+      (elab-error env ["member arity mismatch in pattern" tag]
+        ["want" (Sz fields) "got" (Sz argps)])
+      [(Ix 0 mr)
+       (ty:TROW cstr
+         (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
+           (zip argps fields)))]))
+  (define (elab-arm-classic scr-ty st[ctx infos] a[_ pat val])
     (define pat-ty (elab-ty pat))
     (define met
       (ty:type-meet-context ctx scr-ty pat-ty))
@@ -881,6 +1026,15 @@
              (res (_1 rr)))
         [(_0 rr)
          (snoc [(tc-arm (tc-ty res) ty res) span (arm-span-key span)] infos)])))
+  (define (elab-arm scr-ty st[ctx infos] a[_ pat val])
+    (If (relvar-pat? pat)
+      (let* ((ar (elab-relvar-arm ctx scr-ty pat))
+             (lty (Ix 1 ar))
+             (rr (elab-val-context (Ix 0 ar) (push-local-env env lty) val))
+             (res (_1 rr)))
+        [(_0 rr)
+         (snoc [(tc-arm (tc-ty res) lty res) lty (arm-span-key lty)] infos)])
+      (elab-arm-classic scr-ty st a)))
   ;; Lowered arm tests dispatch on constructor head + arity only
   ;; (lower-arm-test in foil-lower.rvr), so two arms that agree on both
   ;; would silently shadow each other.  Reject them here instead.
@@ -1022,6 +1176,7 @@
     ((tag-is "s_row") (elab-row surf))
     ((tag-is "s_lit") [ctx (elab-lit surf)])
     ((tag-is "s_variant") (elab-variant surf))
+    ((tag-is "s_relvar") (elab-relvar-call ctx (_1 surf) []))
     ((tag-is "s_app") (elab-call surf))
     ((tag-is "s_spec") (elab-spec surf))
     ((tag-is "s_ref") [ctx (elab-ref surf)])
