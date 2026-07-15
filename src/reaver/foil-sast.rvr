@@ -113,6 +113,24 @@
   assert(rx-word? x)
   (surf-variant (rx-leaf-str x)))
 
+;; .tag / ./tag — a relative variant, resolved against the expected
+;; type at elaboration.  .true and .false are the nat literals in
+;; value position (primitives produce nats, so a distinct boolean
+;; member type would not compose with them).
+(define (parse-rel-variant x)
+  (unless (rx-word? x)
+    (sast-error "bad relative variant" x)
+    (surf-relvar (rx-leaf-str x))))
+
+(define (parse-rel-variant-val x)
+  (unless (rx-word? x)
+    (sast-error "bad relative variant" x)
+    (let ((tag (rx-leaf-str x)))
+      (cond
+        ((Eq "true" tag) (surf-lit 1))
+        ((Eq "false" tag) (surf-lit 0))
+        (else (surf-relvar tag))))))
+
 
 (define (parse-type-sast ty)
   (define (on-face kids)
@@ -137,6 +155,10 @@
         (unless (Eq 1 (Sz kids))
           (sast-error "bad variant type" exp)
           (parse-anon-variant (_0 kids))))
+      ((Or (Eq "." rune) (Eq "./" rune))
+        (unless (Eq 1 (Sz kids))
+          (sast-error "bad relative variant" exp)
+          (parse-rel-variant (_0 kids))))
       (else (sast-error "bad type rune" exp))))
   (define (on-nest nes)
     (define kids (map parse-type-sast (rx-nest-kids nes)))
@@ -171,6 +193,8 @@
       (else (sast-error "bad type nest" nes))))
   (define (on-leaf lef)
     (cond
+      ;; _ — the wildcard binder: matches and binds nothing.
+      ((And (rx-word? lef) (Eq "_" (rx-leaf-str lef))) surf-hole)
       ((rx-word? lef) (surf-ref [(rx-leaf-str lef)])) ;; local
       ((sym-lit? lef) (surf-tsym (sym-lit-nat lef)))
       (else (sast-error "bad leaf type" lef))))
@@ -334,6 +358,27 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (And (Eq 2 (Sz kids))
       (And (Ne foil-no-heir heir)
         (Nil (arm-ish? (_1 kids))))))
+  ;; A pipeline stage receives the accumulated value as its FIRST
+  ;; argument: |> x / f / g(a b)  =>  (g (f x) a b).  A call-shaped
+  ;; stage f(a b) is a juxt (word + arg parens), which no other body
+  ;; position accepts standalone — parse it here.
+  (define (pipe-args exp)
+    (unless (And (rx-nest? exp) (Eq "paren" (rx-nest-color exp)))
+      (sast-error "bad pipeline stage arguments" exp)
+      (If (Eq "" (rx-nest-rune exp))
+        (map parse-val-sast (rx-nest-kids exp))
+        [(parse-val-sast exp)])))
+  (define (pipe-stage acc stage)
+    (If (And (rx-juxt? stage)
+          (And (Gt (Sz (rx-juxt-kids stage)) 1)
+            (rx-word? (_0 (rx-juxt-kids stage)))))
+      (let ((jk (rx-juxt-kids stage)))
+        (surf-app (surf-var (rx-word-str! (_0 jk)))
+          (Weld [acc] (foldl Weld [] (map pipe-args (drop 1 jk))))))
+      (let ((s (parse-val-sast stage)))
+        (If (Eq "s_app" (_0 s))
+          ["s_app" (Ix 1 s) (Weld [acc] (Ix 2 s))]
+          (surf-app s [acc])))))
   (define (handle-rune rune kids heir)
     (cond
       ((Eq "@" rune)
@@ -353,6 +398,14 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                 "row declarations moved to ':' - write `:  foo=bar ...` instead of `$  [foo=bar ...]`"
                 (_0 kids))
               (parse-type-sast (_0 kids))))))
+      ((Eq "./" rune)
+        (unless (And (Eq 1 (Sz kids)) (Eq foil-no-heir heir))
+          (sast-error "bad relative variant" val)
+          (parse-rel-variant-val (_0 kids))))
+      ((Eq "|>" rune)
+        (unless (And (Gt (Sz kids) 1) (Eq foil-no-heir heir))
+          (sast-error "pipeline (|>) requires a seed and at least one stage" val)
+          (foldl pipe-stage (parse-val-sast (_0 kids)) (drop 1 kids))))
       ((Eq "\" rune)
         (surf-fun (map parse-type-sast kids) heir))
       ((Eq "%" rune)
@@ -413,7 +466,16 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             ((rx-rune? "$" body) (handle-rune "$" (rx-rune-kids body) hair))
             ((rx-rune? "\" body) (handle-rune "\" (rx-rune-kids body) hair))
             ((rx-rune? "%" body) (handle-rune "%" (rx-rune-kids body) hair))
-            ((rx-rune? "^" body) (handle-rune "^" (rx-rune-kids body) hair))
+            ;; A wide free rune (?>, |>) starting the body line after a
+            ;; cast cannot heir-chain (rex heirs align on free-pos, and
+            ;; the rune widths differ), so rex delivers it — and every
+            ;; body line after it — as trailing kids of the ^ poem.
+            ;; The tail is the body.
+            ((rx-rune? "^" body)
+              (let ((bk (rx-rune-kids body)))
+                (If (And (Gt (Sz bk) 1) (Eq foil-no-heir hair))
+                  (handle-rune "^" [(_0 bk)] (parse-body (drop 1 bk)))
+                  (handle-rune "^" bk hair))))
             ((rx-rune? "&" body) (handle-rune "&" (rx-rune-kids body) hair))
             ((rx-rune? ":" body) (handle-rune ":" (rx-rune-kids body) hair))
             ((rx-rune? "?" body) (handle-rune "?" (rx-rune-kids body) hair))
@@ -457,7 +519,9 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         ;; (labeled/tagof['$foo])
         (surf-app (parse-path-val (rx-nest-kids nes)) []))
       ((Eq "." (rx-nest-rune nes))
-        (parse-meth parse-val-sast (rx-nest-kids nes)))
+        (If (Eq 1 (Sz (rx-nest-kids nes)))
+          (parse-rel-variant-val (_0 (rx-nest-kids nes)))
+          (parse-meth parse-val-sast (rx-nest-kids nes))))
       (else (handle-rune (rx-nest-rune nes) (rx-nest-kids nes) foil-no-heir))))
   (define (on-clear nes)
     (define rune (rx-nest-rune nes))
@@ -465,7 +529,16 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (cond
       ((Eq "" rune) (parse-body kids))
       ((Eq "/" rune) (parse-path-val kids))
-      ((Eq "." rune) (parse-meth parse-val-sast kids))
+      ((Eq "." rune)
+        (If (Eq 1 (Sz kids))
+          (parse-rel-variant-val (_0 kids))
+          (parse-meth parse-val-sast kids)))
+      ;; Same trailing-kid repair as parse-body's ^ dispatch, for a ^
+      ;; poem in nested position (e.g. an arm value).
+      ((Eq "^" rune)
+        (If (Gt (Sz kids) 1)
+          (handle-rune "^" [(_0 kids)] (parse-body (drop 1 kids)))
+          (handle-rune "^" kids foil-no-heir)))
       ((Eq ".#" rune)
         (surf-ufcs-put (_0 kids) (_1 kids)))
       ((Eq ".%" rune)
