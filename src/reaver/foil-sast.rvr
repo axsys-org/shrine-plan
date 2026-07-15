@@ -402,6 +402,15 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         (unless (And (Eq 1 (Sz kids)) (Eq foil-no-heir heir))
           (sast-error "bad relative variant" val)
           (parse-rel-variant-val (_0 kids))))
+      ;; ?>  PAT SCRUT   bind-or-else: match SCRUT against PAT; on a
+      ;;     ELSE        match the rest of the body (the heir) runs
+      ;; REST...         with PAT's binders in scope, otherwise ELSE.
+      ((Eq "?>" rune)
+        (unless (And (Eq 3 (Sz kids)) (Ne foil-no-heir heir))
+          (sast-error "bad bind-or-else (?>) - needs a pattern, a value, an indented else, and a following body" val)
+          (surf-case (parse-val-sast (_1 kids))
+            [(surf-arm (parse-type-sast (_0 kids)) heir)]
+            (parse-val-sast (_2 kids)))))
       ((Eq "|>" rune)
         (unless (And (Gt (Sz kids) 1) (Eq foil-no-heir heir))
           (sast-error "pipeline (|>) requires a seed and at least one stage" val)
@@ -453,32 +462,43 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                 []
                 kids)))))
       (else (sast-error "wack rune" val))))
-  (define (parse-body items)
-    (define kids (body-flat items))
+  ;; The tail is a pre-parsed continuation riding as the heir of the
+  ;; last item — foil-no-heir for a whole body, or the enclosing
+  ;; chain's rest when a wide-rune repair re-enters mid-poem.
+  (define (parse-body-go kids tail)
     (cond
-      ((Eq 0 (Sz kids)) foil-no-heir)
-      ((spec-juxt? kids) (parse-spec kids))
-      ((Eq 1 (Sz kids)) (parse-val-sast (_0 kids)))
+      ((Eq 0 (Sz kids)) tail)
+      ((And (Eq foil-no-heir tail) (spec-juxt? kids)) (parse-spec kids))
+      ((And (Eq foil-no-heir tail) (Eq 1 (Sz kids)))
+        (parse-val-sast (_0 kids)))
       (else
         (let ((body (_0 kids))
-              (hair (parse-body (drop 1 kids))))
+              (hair (parse-body-go (drop 1 kids) tail)))
           (cond
             ((rx-rune? "$" body) (handle-rune "$" (rx-rune-kids body) hair))
             ((rx-rune? "\" body) (handle-rune "\" (rx-rune-kids body) hair))
             ((rx-rune? "%" body) (handle-rune "%" (rx-rune-kids body) hair))
             ;; A wide free rune (?>, |>) starting the body line after a
-            ;; cast cannot heir-chain (rex heirs align on free-pos, and
-            ;; the rune widths differ), so rex delivers it — and every
-            ;; body line after it — as trailing kids of the ^ poem.
-            ;; The tail is the body.
+            ;; cast or a truthy-? leg cannot heir-chain (rex heirs align
+            ;; on free-pos, and the rune widths differ), so rex delivers
+            ;; it — and the rest of the poem's body — as trailing kids.
+            ;; Split them back out; the poem's own slots keep their
+            ;; arity and the trailing kids chain before the outer hair.
             ((rx-rune? "^" body)
               (let ((bk (rx-rune-kids body)))
-                (If (And (Gt (Sz bk) 1) (Eq foil-no-heir hair))
-                  (handle-rune "^" [(_0 bk)] (parse-body (drop 1 bk)))
+                (If (Gt (Sz bk) 1)
+                  (handle-rune "^" [(_0 bk)]
+                    (parse-body-go (body-flat (drop 1 bk)) hair))
                   (handle-rune "^" bk hair))))
             ((rx-rune? "&" body) (handle-rune "&" (rx-rune-kids body) hair))
             ((rx-rune? ":" body) (handle-rune ":" (rx-rune-kids body) hair))
-            ((rx-rune? "?" body) (handle-rune "?" (rx-rune-kids body) hair))
+            ((rx-rune? "?" body)
+              (let ((bk (rx-rune-kids body)))
+                (If (And (Gt (Sz bk) 2) (Nil (arm-ish? (_1 bk))))
+                  (handle-rune "?" (take 2 bk)
+                    (parse-body-go (body-flat (drop 2 bk)) hair))
+                  (handle-rune "?" bk hair))))
+            ((rx-rune? "?>" body) (handle-rune "?>" (rx-rune-kids body) hair))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
             ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
             ((And (rx-nest-is? "paren" "@" body) (Ne foil-no-heir hair))
@@ -486,6 +506,8 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             ((And (rx-nest-is? "paren" "=" body) (Ne foil-no-heir hair))
               (parse-letrec (rx-nest-kids body) hair))
             (else (sast-error "unrecognized body form" body)))))))
+  (define (parse-body items)
+    (parse-body-go (body-flat items) foil-no-heir))
   (define (on-word wor)
     (cond
       ((str-numeric? wor) (surf-lit (parse-nat wor)))
@@ -533,12 +555,17 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         (If (Eq 1 (Sz kids))
           (parse-rel-variant-val (_0 kids))
           (parse-meth parse-val-sast kids)))
-      ;; Same trailing-kid repair as parse-body's ^ dispatch, for a ^
-      ;; poem in nested position (e.g. an arm value).
+      ;; Same trailing-kid repairs as parse-body's dispatch, for ^ and
+      ;; truthy-? poems in nested position (e.g. an arm value).
       ((Eq "^" rune)
         (If (Gt (Sz kids) 1)
           (handle-rune "^" [(_0 kids)] (parse-body (drop 1 kids)))
           (handle-rune "^" kids foil-no-heir)))
+      ((Eq "?" rune)
+        (If (And (Gt (Sz kids) 2) (Nil (arm-ish? (_1 kids))))
+          (handle-rune "?" (take 2 kids)
+            (parse-body-go (body-flat (drop 2 kids)) foil-no-heir))
+          (handle-rune "?" kids foil-no-heir)))
       ((Eq ".#" rune)
         (surf-ufcs-put (_0 kids) (_1 kids)))
       ((Eq ".%" rune)
