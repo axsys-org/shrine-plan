@@ -440,14 +440,167 @@
       (If (And (ty:is-tfun? b) (Eq n (Sz (ty:tfun-args b))))
         (ty:tfun-args b)
         0)))
+  ;; Resolve a generic callee's variables from everything already
+  ;; known — the non-lambda arguments (an empty row literal is
+  ;; uninformative and skipped), any trailing implicit arguments (the
+  ;; method receiver), and the CALL's own expected type against the
+  ;; declared return.  A synthetic generic whose parameters are the
+  ;; known positions and whose return is the whole signature row rides
+  ;; through type-apply's ordinary inference; the instantiated
+  ;; signature comes back in one piece.  -> instantiated TFUN or 0.
+  (define (empty-row-ty? t)
+    (And (Eq "TROW" (_1 t))
+      (And (Ifz (ty:trow-cstr t) 1 0) (Ifz (Sz (ty:trow-vals t)) 1 0))))
+  (define (resolve-generic fty known goal)
+    ;; known = [[idx ty] ...] over the declared parameter positions
+    (define use-goal (If goal (Ifz (Eq "TBAD" (_1 goal)) 1 0) 0))
+    (define (rewrap t)
+      (define tag (_1 t))
+      (cond
+        ((Eq tag "TQUA")
+          (let ((r (rewrap (_3 t)))) (Ifz r 0 (ty:TQUA (_2 t) r))))
+        ((Eq tag "TFAC") (rewrap (ty:tfac-val t)))
+        ((Eq tag "TSELF") (rewrap (ty:tself-val t)))
+        ((ty:is-tfun? t)
+          (let ((args (ty:tfun-args t)))
+            (ty:TFUN
+              (Weld (map (lambda (p) (Ix (_0 p) args)) known)
+                (If use-goal [(ty:tfun-ret t)] []))
+              (ty:TROW 0 (Weld args [(ty:tfun-ret t)])))))
+        (else 0)))
+    (define probe (rewrap fty))
+    (Ifz probe
+      0
+      (let ((r (ty:type-apply sut probe
+                 (Weld (map (Ix 1) known) (If use-goal [goal] [])))))
+        (If (Eq "TBAD" (_1 r))
+          0
+          (let ((vals (ty:trow-vals r)))
+            (ty:TFUN (Init vals) (Last vals)))))))
+  ;; Two-phase argument elaboration for a generic callee with lambda
+  ;; arguments: non-lambdas elaborate first (each under no goal), the
+  ;; generic resolves from them (plus receiver and call goal), and
+  ;; each lambda then checks against its instantiated parameter type.
+  ;; -> [ctx exs specialized-fun-ty-or-0]
+  (define (elab-vals-two-phase ctx0 env0 fty surfs post-tys)
+    (define n (Sz surfs))
+    (define goal
+      (Ifz (env-goal env0) 0 (burp-face (env-goal env0))))
+    (define (lam? i) (Eq "s_fun" (_0 (Ix i surfs))))
+    (define (pass keep? gfor st0)
+      (foldl
+        (lambda (st i)
+          (If (keep? i)
+            (let ((r (elab-val-context (_0 st)
+                       (set-env-goal (gfor i) env0) (Ix i surfs))))
+              [(_0 r) (snoc [i (_1 r)] (_1 st))])
+            st))
+        st0 (gen n (lambda (i) i))))
+    (define plain
+      (pass (lambda (i) (Nil (lam? i))) (lambda (i) 0) [ctx0 []]))
+    (define known
+      (Weld
+        (filter (lambda (p) (Nil (empty-row-ty? (_1 p))))
+          (map (lambda (p) [(_0 p) (burp-face (tc-ty (_1 p)))]) (_1 plain)))
+        (map (lambda (k) [(Add n k) (Ix k post-tys)])
+          (gen (Sz post-tys) (lambda (k) k)))))
+    (define spec (resolve-generic fty known goal))
+    (define lams
+      (pass lam?
+        (lambda (i) (Ifz spec 0 (Ix i (ty:tfun-args spec))))
+        [(_0 plain) (_1 plain)]))
+    (define done (_1 lams))
+    (define exs
+      (map (lambda (i) (_1 (_0 (find (lambda (p) (Eq i (_0 p))) done))))
+        (gen n (lambda (i) i))))
+    [(_0 lams) exs spec])
+  (define (has-quas? fty)
+    (Eq "TQUA" (_1 (burp-face fty))))
+  (define (any-lam? surfs)
+    (Truth (find (lambda (s) (Eq "s_fun" (_0 s))) surfs)))
   (define (nests-pairs ctx0 pairs)
     (foldl
       (lambda (st pr)
         (Ifz (_1 st) st
           (ty:type-nests-context (_0 st) (_0 pr) (_1 pr))))
       [ctx0 1] pairs))
+  ;; Positional binder imposition, shared by relative-variant patterns,
+  ;; positional = destructuring, and lambda row parameters.  Binders
+  ;; impose over declared field molds; _ leaves a field unfaced
+  ;; (invisible to bare-name resolution).
+  (define (relvar-pat? pat)
+    (Or (Eq "s_relvar" (_0 pat))
+      (And (Eq "s_tapp" (_0 pat))
+        (Eq "s_relvar" (_0 (_0 (surf-tapp-kids pat)))))))
+  (define (relvar-pat-field argp field)
+    (define fm (burp-face field))
+    (cond
+      ;; _ binds nothing: the 0-face is unfindable by name AND keeps
+      ;; the face scan from expanding a bare nominal field's span
+      ;; (which would leak its spread faces into scope).
+      ((Eq "s_hole" (_0 argp)) (ty:TFAC 0 fm))
+      ((And (Eq "s_ref" (_0 argp)) (Eq 1 (Sz (surf-ref-path argp))))
+        (ty:TFAC (_0 (surf-ref-path argp)) fm))
+      ((Eq "s_face" (_0 argp))
+        (ty:TFAC (surf-face-name argp) (elab-ty (surf-face-kid argp))))
+      ;; a nested anonymous-row pattern destructures a row field by
+      ;; position (the field's shape is already guaranteed by type).
+      ;; Prefer the field's DECLARED row over its span roundtrip so
+      ;; the binders keep nominal types (UFCS on them survives).
+      ((Eq "s_trow" (_0 argp))
+        (let ((frow
+                (cond
+                  ((Eq "TROW" (_1 fm)) fm)
+                  ((Eq "TNOM" (_1 fm))
+                    (let ((d (burp-face (applied-type sut (_2 fm)))))
+                      (If (Eq "TROW" (_1 d))
+                        d
+                        (burp-face (ty:mold-to-span sut fm)))))
+                  (else (burp-face (ty:mold-to-span sut fm)))))
+              (kids (_1 argp)))
+          (If (And (Eq "TROW" (_1 frow))
+                (Eq (Sz kids) (Sz (ty:trow-vals frow))))
+            (ty:TROW (ty:trow-cstr frow)
+              (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
+                (zip kids (ty:trow-vals frow))))
+            (elab-error env "row pattern does not match the field's row"
+              ["field" fm "pattern" argp]))))
+      ((relvar-pat? argp)
+        (elab-error env
+          "nested variant patterns are not supported yet - bind a name and match again"
+          argp))
+      (else (elab-error env "unsupported pattern element" argp))))
+  ;; Checking mode: when the context expects a function type of
+  ;; matching arity (a call argument's declared parameter), bare
+  ;; parameter names take their types from it, and [a b] parameters
+  ;; destructure the expected row positionally.  Annotated parameters
+  ;; and declaration heads (no goal in scope) elaborate as before.
   (define (elab-fun f[_ args body])
-    (define argty (map elab-ty args))
+    (define gfun
+      (Ifz (env-goal env) 0
+        (let ((b (burp-face (env-goal env))))
+          (If (And (ty:is-tfun? b) (Eq (Sz args) (Sz (ty:tfun-args b))))
+            b
+            0))))
+    (define (param-ty i)
+      (define a (Ix i args))
+      (define (goal-at)
+        (Ifz gfun
+          (elab-error env
+            "lambda parameter needs a type - annotate it or give the callee a visible parameter type"
+            a)
+          (Ix i (ty:tfun-args gfun))))
+      (cond
+        ((And (Eq "s_ref" (_0 a)) (Eq 1 (Sz (surf-ref-path a))))
+          (If gfun
+            (ty:TFAC (_0 (surf-ref-path a)) (burp-face (goal-at)))
+            (elab-ty a)))
+        ((Eq "s_trow" (_0 a))
+          (relvar-pat-field a (goal-at)))
+        ((Eq "s_hole" (_0 a))
+          (ty:TFAC 0 (burp-face (goal-at))))
+        (else (elab-ty a))))
+    (define argty (gen (Sz args) param-ty))
     (define frame (Weld [(self-ty sut env argty body)] argty))
     (define inner-env (push-locals (clear-env-goal env) frame))
     (define r (elab-val-context ctx inner-env body))
@@ -493,10 +646,21 @@
     (If (ty-ap-path? ref)
       (rear (Ix 0 (ty-ap-decode ref)))
       (rear ref)))
+  ;; A row constructor's tag: a branded cstr is a printed path — take
+  ;; the last /-segment (strings are little-endian byte nats, so
+  ;; dropping the prefix is a shift); a structural cstr is the tag.
+  (define (cstr-tag cstr)
+    (define n (Bytes cstr))
+    (define (go i last)
+      (If (Ge i n)
+        (Rsh cstr (Mul 8 last))
+        (go (Inc i)
+          (If (Eq 47 (Mod (Rsh cstr (Mul 8 i)) 256)) (Inc i) last))))
+    (go 0 0))
   (define (relvar-opt-tag o)
     (define b (burp-face o))
     (cond
-      ((Eq "TROW" (_1 b)) (ty:trow-cstr b))
+      ((Eq "TROW" (_1 b)) (cstr-tag (ty:trow-cstr b)))
       ((Eq "TNOM" (_1 b)) (path-last-seg (_2 b)))
       (else 0)))
   ;; The declared option molds of an expected union type, instantiated
@@ -525,7 +689,13 @@
       (let* ((o (burp-face (_0 hit)))
              (fields
                (If (Eq "TNOM" (_1 o))
-                 (let ((m (burp-face (applied-type sut (_2 o)))))
+                 ;; a legacy TNOM (structural arguments that cannot
+                 ;; ride a /ty-ap path) carries them in the args row
+                 (let* ((base (applied-type sut (_2 o)))
+                        (m0 (If (Sz (_3 o))
+                              (ty:type-specialize sut base (_3 o))
+                              base))
+                        (m (burp-face m0)))
                    (If (Eq "TROW" (_1 m))
                      (ty:trow-vals m)
                      (elab-error env ["member is not a row type" tag] m)))
@@ -771,11 +941,21 @@
                (let ((fields (ty:trow-vals (Ix 0 rown))))
                  (If (Eq (Sz xs) (Sz fields)) fields 0))
                (fun-arg-goals (tc-ty tc-f) (Sz xs))))
-           (er (elab-vals-goals (_0 fr) env xs goals))
-           (exs (_1 er)))
+           (two? (And (Ifz goals 1 0)
+                   (And (Ifz rown 1 0)
+                     (And (has-quas? (tc-ty tc-f)) (any-lam? xs)))))
+           (er
+             (If two?
+               (elab-vals-two-phase (_0 fr) env (burp-face (tc-ty tc-f)) xs [])
+               (elab-vals-goals (_0 fr) env xs goals)))
+           (exs (_1 er))
+           (tc-f2
+             (If (And two? (Truth (Ix 2 er)))
+               (set-tc-ty (Ix 2 er) tc-f)
+               tc-f)))
       (If rown
         (elab-type-call (_0 er) f rown exs)
-        (on-call (_0 er) tc-f exs))))
+        (on-call (_0 er) tc-f2 exs))))
   (define (elab-call c[_ f xs])
     (cond
       ((Eq "s_variant" (_0 f))
@@ -800,10 +980,16 @@
     ;; what the entry and the global link carry.
     (define cpath (canon-path path sut))
     (unless (Nil (get-const cpath sut))
-      (let ((referee (got-entry-tc cpath sut)))
-        (If (Eq "TC_LAM" (Hd referee))
-          (tc-global (tc-ty referee) cpath)
-          referee))
+      (let* ((referee (got-entry-tc cpath sut))
+             (h (Hd referee)))
+        ;; Value entries (nullary constants) reference by name too:
+        ;; lowering links the referee's FORCED compiled value, giving
+        ;; sharing instead of per-use recomputation.  FFI/type/literal
+        ;; entries stay inline — consumers need their structure and
+        ;; they are cheap.
+        (If (Or (Eq "TC_FFI" h) (Or (Eq "TC_TYP" h) (Eq "TC_LIT" h)))
+          referee
+          (tc-global (tc-ty referee) cpath)))
       (elab-error env "unbound reference" ["path" path])))
   (define (slot-path path)
     (If (Eq 1 (Sz path)) (_0 path) path))
@@ -894,6 +1080,11 @@
               [(_0 nr) (ty:TFAC (surf-face-name pat) want)])))
         ((And (Eq tag "s_ref") (Eq 1 (Sz (surf-ref-path pat))))
           [ctx0 (ty:TFAC (_0 (surf-ref-path pat)) (burp-face (tc-ty val-tc)))])
+        ;; = [a b c] value — positional destructure: binders impose
+        ;; over the value's row fields; the whole row is one local
+        ;; whose faces are the binders.
+        ((Eq tag "s_trow")
+          [ctx0 (relvar-pat-field pat (burp-face (tc-ty val-tc)))])
         (else
           (elab-error env1 "unsupported local binding pattern" pat))))
     (define (step acc[ctx1 env1 binds] arm[_ pat val])
@@ -909,15 +1100,28 @@
              (btc (_1 br)))
         [(_0 br) (tc-letrec (tc-ty btc) binds btc)])))
   ;; The receiver rides last, so written argument i pairs with the
-  ;; method's parameter i — goals come straight off the front.
+  ;; method's parameter i — goals come straight off the front.  For a
+  ;; generic method with lambda arguments, the receiver's (known) type
+  ;; joins the inference as the trailing implicit argument.
   (define (elab-meth-step st[ctx0 rcvr] seg)
     (define f (score-meth rcvr (surf-mseg-name seg) sut))
     (define margs (surf-mseg-args seg))
     (define goals
       (let ((g (fun-arg-goals (tc-ty f) (Inc (Sz margs)))))
         (Ifz g 0 (take (Sz margs) g))))
-    (define ar (elab-vals-goals ctx0 env margs goals))
-    (on-call (_0 ar) f (snoc rcvr (_1 ar))))
+    (define two?
+      (And (Ifz goals 1 0)
+        (And (has-quas? (tc-ty f)) (any-lam? margs))))
+    (define ar
+      (If two?
+        (elab-vals-two-phase ctx0 env (burp-face (tc-ty f)) margs
+          [(burp-face (tc-ty rcvr))])
+        (elab-vals-goals ctx0 env margs goals)))
+    (define f2
+      (If (And two? (Truth (Ix 2 ar)))
+        (set-tc-ty (Ix 2 ar) f)
+        f))
+    (on-call (_0 ar) f2 (snoc rcvr (_1 ar))))
   (define (elab-meth-go st els)
     (Ifz els st
         (elab-meth-go (elab-meth-step st (_0 els)) (drop 1 els))))
@@ -941,39 +1145,6 @@
   (define arm-info-tc (Ix 0))
   (define arm-info-span (Ix 1))
   (define arm-info-key (Ix 2))
-  ;; Relative-variant patterns: (./tag binders) and bare .tag.
-  ;; Binders are positional over the member's declared fields; the
-  ;; resolution against the scrutinee's own options replaces the
-  ;; pattern/scrutinee meet.
-  (define (relvar-pat? pat)
-    (Or (Eq "s_relvar" (_0 pat))
-      (And (Eq "s_tapp" (_0 pat))
-        (Eq "s_relvar" (_0 (_0 (surf-tapp-kids pat)))))))
-  (define (relvar-pat-field argp field)
-    (define fm (burp-face field))
-    (cond
-      ((Eq "s_hole" (_0 argp)) fm)
-      ((And (Eq "s_ref" (_0 argp)) (Eq 1 (Sz (surf-ref-path argp))))
-        (ty:TFAC (_0 (surf-ref-path argp)) fm))
-      ((Eq "s_face" (_0 argp))
-        (ty:TFAC (surf-face-name argp) (elab-ty (surf-face-kid argp))))
-      ;; a nested anonymous-row pattern destructures a row field by
-      ;; position (the field's shape is already guaranteed by type)
-      ((Eq "s_trow" (_0 argp))
-        (let ((fspan (burp-face (ty:mold-to-span sut fm)))
-              (kids (_1 argp)))
-          (If (And (Eq "TROW" (_1 fspan))
-                (Eq (Sz kids) (Sz (ty:trow-vals fspan))))
-            (ty:TROW (ty:trow-cstr fspan)
-              (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
-                (zip kids (ty:trow-vals fspan))))
-            (elab-error env "row pattern does not match the field's row"
-              ["field" fm "pattern" argp]))))
-      ((relvar-pat? argp)
-        (elab-error env
-          "nested variant patterns are not supported yet - bind a name and match again"
-          argp))
-      (else (elab-error env "unsupported pattern element" argp))))
   ;; -> [ctx local-ty]: local-ty doubles as the arm's span/key source
   ;; (a TROW with the member's runtime cstr and arity).
   (define (elab-relvar-arm ctx0 scr-ty pat)

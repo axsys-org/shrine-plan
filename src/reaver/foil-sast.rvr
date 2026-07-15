@@ -249,12 +249,23 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
 
 ;;; Arms, methods, and body chains ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (parse-arm cont rex)
-  assert(rx-rune? ">" rex)
+(define (parse-arm-go cont rex)
   (define kids (rx-rune-kids rex))
-  (unless (Eq 2 (Sz kids))
-    (sast-error "bad case arm" rex)
-    (surf-arm (parse-type-sast (_0 kids)) (cont (_1 kids)))))
+  (cond
+    ((Eq 2 (Sz kids))
+      (surf-arm (parse-type-sast (_0 kids)) (cont (_1 kids))))
+    ;; A wide free rune (?>, |>) in the arm's body is swallowed into
+    ;; the > poem as trailing kids; the tail after the pattern is the
+    ;; arm's body chain.
+    ((Gt (Sz kids) 2)
+      (surf-arm (parse-type-sast (_0 kids))
+        (cont ["nest" (rx-span (_1 kids)) "clear" "" (drop 1 kids)])))
+    (else (sast-error "bad case arm" rex))))
+
+(define (parse-arm cont rex)
+  (unless (rx-rune? ">" rex)
+    (sast-error "case arm must be a > poem" rex)
+    (parse-arm-go cont rex)))
 
 (define (parse-meth cont els)
   ;; A paren wrapping a single rune expression absorbs the rune during
@@ -263,9 +274,13 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
   (define (call-args exp)
     (unless (And (rx-nest? exp) (Eq "paren" (rx-nest-color exp)))
       (sast-error "bad method call" exp)
-      (If (Eq "" (rx-nest-rune exp))
-        (map cont (rx-nest-kids exp))
-        [(cont exp)])))
+      (cond
+        ((Eq "" (rx-nest-rune exp)) (map cont (rx-nest-kids exp)))
+        ;; f(a ; ...) — block-mode arguments: a trailing ; opens rex
+        ;; block mode, so a multi-line poem argument (an inline
+        ;; lambda) parses with layout instead of as spaced infix.
+        ((Eq ";" (rx-nest-rune exp)) (map cont (rx-nest-kids exp)))
+        (else [(cont exp)]))))
   (define (parse-seg seg)
     (cond
       ((rx-word? seg)
@@ -315,8 +330,54 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             (brack-args parse-type-sast (_1 jkids)))
           (parse-road kids)))
       (parse-road kids)))
+  ;; The text column an item starts at: a runed clear nest's span col
+  ;; is its free-pos (col + rune-width - 1), so normalize it back.
+  (define (item-col k)
+    (If (And (rx-nest? k)
+          (And (Eq "clear" (rx-nest-color k))
+            (Ifz (rx-nest-rune k) 0 1)))
+      (Inc (Sub (Ix 1 (rx-span k)) (Bytes (rx-nest-rune k))))
+      (Ix 1 (rx-span k))))
+  (define (synth-body items)
+    (If (Eq 1 (Sz items))
+      (_0 items)
+      ["nest" (rx-span (_0 items)) "clear" "" items]))
+  ;; Bindings come as > arms (typed, or match-bodied local functions)
+  ;; or as bare name/value pairs.  Chained heirs flatten a block into
+  ;; one item sequence, so bindings group by COLUMN: an item at the
+  ;; first binding's column starts a binding; deeper items are the
+  ;; current binding's value chain.
   (define (parse-letrec kids heir)
-    (surf-letrec (map (parse-arm parse-val-sast) kids) heir))
+    (define ks (hr-stem (rx-juxt-flat kids)))
+    (define bcol (Ifz (Sz ks) 0 (item-col (_0 ks))))
+    (define (val-of head rest)
+      (Ifz (Sz rest)
+        (sast-error "unpaired local binding (=)" head)
+        (parse-val-sast (synth-body rest))))
+    (define (grab rest acc)
+      (If (And (Sz rest) (Gt (item-col (_0 rest)) bcol))
+        (grab (drop 1 rest) (snoc (_0 rest) acc))
+        [acc rest]))
+    (define (go rest acc)
+      (Ifz (Sz rest)
+        acc
+        (let* ((head (_0 rest))
+               (gr (grab (drop 1 rest) []))
+               (chain (_0 gr))
+               (next (_1 gr)))
+          (If (rx-rune? ">" head)
+            ;; extra deeper items after a > arm rejoin its poem
+            (go next
+              (snoc ((parse-arm parse-val-sast)
+                      (Ifz (Sz chain)
+                        head
+                        ["nest" (rx-span head) "clear" ">"
+                         (Weld (rx-rune-kids head) chain)]))
+                acc))
+            (go next
+              (snoc (surf-arm (parse-type-sast head) (val-of head chain))
+                acc))))))
+    (surf-letrec (go ks []) heir))
   ;; Loop (|) parameter arms.  One arm is `> face=type init`; arms on
   ;; one line chain (rex packs the next > nest as a kid of the
   ;; previous), stacked > lines arrive as flat sibling kids.
@@ -446,8 +507,26 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         (unless (And (Gt (Sz kids) 1) (Eq foil-no-heir heir))
           (sast-error "pipeline (|>) requires a seed and at least one stage" val)
           (foldl pipe-stage (parse-val-sast (_0 kids)) (drop 1 kids))))
+      ;; A \ with a body chain (heir) is a declaration's parameter
+      ;; slot.  Without one it is an INLINE lambda: parameters are the
+      ;; kids on the rune's own line, the body is everything after
+      ;; (one-liners split before the last kid).  The body kids parse
+      ;; as a body chain through a synthetic clear nest.
       ((Eq "\" rune)
-        (surf-fun (map parse-type-sast kids) heir))
+        (If (Ne foil-no-heir heir)
+          (surf-fun (map parse-type-sast kids) heir)
+          (let* ((lin (Ifz (Sz kids) 0 (Ix 0 (rx-span (_0 kids)))))
+                 (line? (lambda (k) (Eq lin (Ix 0 (rx-span k)))))
+                 (same (filter line? kids))
+                 (later (filter (lambda (k) (Nil (line? k))) kids))
+                 (one-line? (Ifz (Sz later) 1 0))
+                 (params (If one-line? (Init same) same))
+                 (body (If one-line? [(Last same)] later)))
+            (unless (And (Gt (Sz kids) 1) (Gt (Sz params) 0))
+              (sast-error "inline lambda needs parameters and a body" val)
+              (surf-fun (map parse-type-sast params)
+                (parse-val-sast
+                  ["nest" (rx-span val) "clear" "" body]))))))
       ((Eq "%" rune)
         (uncurry-call (parse-val-sast (_0 kids)) heir))
       ((Eq "^" rune)
@@ -462,10 +541,21 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             (parse-val-sast (_0 kids))
             (parse-val-sast (_1 kids))
             heir)
-          (surf-case
-            (parse-val-sast (_0 kids))
-            (map (parse-arm parse-val-sast) (rx-juxt-flat (drop 1 kids)))
-            heir)))
+          ;; Trailing non-> items among the arms are the fallthrough
+          ;; chain (a fallthrough written at the arms' column rides
+          ;; inside the poem instead of chaining as the heir).
+          (let* ((items (hr-stem (rx-juxt-flat (drop 1 kids))))
+                 (na (find-idx (lambda (k) (Nil (rx-rune? ">" k))) items))
+                 (arms (Ifz na items (take (_0 na) items)))
+                 (trail (Ifz na [] (drop (_0 na) items))))
+            (unless (Or (Ifz (Sz trail) 1 0) (Eq foil-no-heir heir))
+              (sast-error
+                "match has both an indented fallthrough and a following body"
+                val)
+              (surf-case
+                (parse-val-sast (_0 kids))
+                (map (parse-arm parse-val-sast) arms)
+                (Ifz (Sz trail) heir (parse-val-sast (synth-body trail))))))))
       ((Eq "=" rune)
         (parse-letrec kids heir))
       ;; Loop: `|  > foo=nat 3` declares loop params with initial
@@ -493,6 +583,23 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                 []
                 kids)))))
       (else (sast-error "wack rune" val))))
+  ;; A truthy-? poem's trailing kids split by COLUMN: kids at the
+  ;; consequent's column (or deeper) are the consequent chain; kids
+  ;; strictly shallower are swallowed siblings (a wide rune could not
+  ;; heir-chain there) and belong to the else chain.  -> 0 when the
+  ;; poem needs no repair, else [cond+conseq els] (els possibly []).
+  (define (truthy-split bk)
+    (If (Or (Lt (Sz bk) 3) (arm-ish? (_1 bk)))
+      0
+      (let* ((ccol (item-col (_1 bk)))
+             (rest (drop 1 bk))
+             (shallow (find-idx (lambda (k) (Lt (item-col k) ccol)) rest)))
+        (Ifz shallow
+          [[(_0 bk) (synth-body rest)] []]
+          (let ((i (_0 shallow)))
+            (Ifz i
+              0
+              [[(_0 bk) (synth-body (take i rest))] (drop i rest)]))))))
   ;; The tail is a pre-parsed continuation riding as the heir of the
   ;; last item — foil-no-heir for a whole body, or the enclosing
   ;; chain's rest when a wide-rune repair re-enters mid-poem.
@@ -507,7 +614,20 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
               (hair (parse-body-go (drop 1 kids) tail)))
           (cond
             ((rx-rune? "$" body) (handle-rune "$" (rx-rune-kids body) hair))
-            ((rx-rune? "\" body) (handle-rune "\" (rx-rune-kids body) hair))
+            ;; A wide free rune (?>, |>) in a lambda's body is
+            ;; swallowed into the \ poem as trailing kids (rex heirs
+            ;; align on free-pos); split at the first wide-rune kid —
+            ;; everything from there chains before the heir.
+            ;; Multi-line PARAMETER lists stay whole.
+            ((rx-rune? "\" body)
+              (let* ((bk (rx-rune-kids body))
+                     (wide? (lambda (k)
+                              (Or (rx-rune? "?>" k) (rx-rune? "|>" k))))
+                     (cut (find-idx wide? bk)))
+                (If cut
+                  (handle-rune "\" (take (_0 cut) bk)
+                    (parse-body-go (body-flat (drop (_0 cut) bk)) hair))
+                  (handle-rune "\" bk hair))))
             ((rx-rune? "%" body) (handle-rune "%" (rx-rune-kids body) hair))
             ;; A wide free rune (?>, |>) starting the body line after a
             ;; cast or a truthy-? leg cannot heir-chain (rex heirs align
@@ -524,11 +644,11 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             ((rx-rune? "&" body) (handle-rune "&" (rx-rune-kids body) hair))
             ((rx-rune? ":" body) (handle-rune ":" (rx-rune-kids body) hair))
             ((rx-rune? "?" body)
-              (let ((bk (rx-rune-kids body)))
-                (If (And (Gt (Sz bk) 2) (Nil (arm-ish? (_1 bk))))
-                  (handle-rune "?" (take 2 bk)
-                    (parse-body-go (body-flat (drop 2 bk)) hair))
-                  (handle-rune "?" bk hair))))
+              (let ((ts (truthy-split (rx-rune-kids body))))
+                (Ifz ts
+                  (handle-rune "?" (rx-rune-kids body) hair)
+                  (handle-rune "?" (_0 ts)
+                    (parse-body-go (body-flat (_1 ts)) hair)))))
             ((rx-rune? "?>" body) (handle-rune "?>" (rx-rune-kids body) hair))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
             ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
@@ -593,10 +713,11 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           (handle-rune "^" [(_0 kids)] (parse-body (drop 1 kids)))
           (handle-rune "^" kids foil-no-heir)))
       ((Eq "?" rune)
-        (If (And (Gt (Sz kids) 2) (Nil (arm-ish? (_1 kids))))
-          (handle-rune "?" (take 2 kids)
-            (parse-body-go (body-flat (drop 2 kids)) foil-no-heir))
-          (handle-rune "?" kids foil-no-heir)))
+        (let ((ts (truthy-split kids)))
+          (Ifz ts
+            (handle-rune "?" kids foil-no-heir)
+            (handle-rune "?" (_0 ts)
+              (parse-body-go (body-flat (_1 ts)) foil-no-heir)))))
       ((Eq ".#" rune)
         (surf-ufcs-put (_0 kids) (_1 kids)))
       ((Eq ".%" rune)
