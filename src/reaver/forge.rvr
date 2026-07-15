@@ -558,7 +558,29 @@
 
 ;;; Image bundles and forge state ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define forge-mods ["bst" "demo" "axal" "mapx" "mapuser"])
+(define (get-extension fnam) (Last (split-str "." fnam)))
+
+;; "bst.foil" -> "bst" (only called on names known to end in .foil)
+(define (strip-foil fnam)
+  (str-slice 0 (Sub (Bytes fnam) 5) fnam))
+
+;; Module names under a file root: one per .foil file, named the way
+;; the compiler expects — relative to the root, no extension ("bst",
+;; "apps/life/main").
+(define (read-fs-tree root)
+  (define listing (ReadFolder root))
+  (foldl
+    (lambda (acc arg[folder? name])
+      (cond
+        (folder?
+          (Weld acc
+            (map (lambda (m) (strcat [name "/" m]))
+              (read-fs-tree (strcat [root "/" name])))))
+        ((Equal "foil" (get-extension name))
+          (snoc (strip-foil name) acc))
+        (else acc)))
+  [] listing))
+(define forge-mods (read-fs-tree "foil"))
 
 (define (compile-forced mod)
   (define s (foil:compile-mod-info foil:default-subject mod))
@@ -580,13 +602,29 @@
           (go (snoc name seen) (Weld rest (foil:module-imports name)))))))
   (go [] (foil:module-imports mod)))
 
-;; Byte snapshot of everything a module's compile read besides its own
-;; source; a bundle is stale when any of these change on disk.
+(define (mod-stamp n)
+  (Stamp (strcat ["foil/" n ".foil"])))
+
+;; Stamp snapshot of everything a module's compile reads: the module
+;; itself plus its transitive import closure, one [name mtime] pair
+;; each, under the second the snapshot was taken.  Fresh means every
+;; stamp is unchanged AND predates that second — mtimes are whole
+;; seconds, so a file rewritten within the second it was stamped
+;; keeps its stamp and cannot be trusted (make's rule; the cost is
+;; one spurious recompile, converging the next second).  The tag
+;; also retires entries persisted in the old byte-snapshot shape.
 (define (import-snapshot mod)
-  (map
-    (lambda (n)
-      [n (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0)])
-    (import-closure mod)))
+  ["STAMPS" (Now 0)
+   (map (lambda (n) [n (mod-stamp n)]) (snoc mod (import-closure mod)))])
+
+(define (snapshot-fresh? snap)
+  (And (IsApp snap)
+    (And (Eq "STAMPS" (_0 snap))
+      (let ((built (_1 snap)))
+        (Nil (includes
+               (lambda (p)
+                 (Or (Ge (_1 p) built) (Ne (_1 p) (mod-stamp (_0 p)))))
+               (_2 snap)))))))
 
 ;; load-bundle with a shared compile cache: [cache' bundle].  The
 ;; cache is compile-mod-go's [[name subject] ..] — each imported
@@ -686,57 +724,36 @@
 
 ;;; The persistent compile cache: st-cache holds [[name snapshot
 ;;; subject decl-keys imported-keys lore] ..] — every module ever
-;;; compiled, with the byte snapshot (own source + import closure) it
-;;; was compiled against.  Prune drops entries whose sources moved;
-;;; strip yields the [[name subject decl-keys imported-keys lore] ..]
-;;; shape compile-mod-go threads; wrap re-stamps fresh snapshots for
-;;; persisting.  Both read/parse each file once per call, shared
-;;; across entries — per-entry recomputation made validating an
-;;; N-module chain O(N^2) file reads.
+;;; compiled, with the stamp snapshot it was compiled against.
+;;; Prune drops entries whose sources moved; strip yields the
+;;; [[name subject decl-keys imported-keys lore] ..] shape
+;;; compile-mod-go threads; wrap re-stamps fresh snapshots for
+;;; persisting.
 
-(define (try-read-mod n)
-  (Try (lambda (z) (read-text-file (strcat ["foil/" n ".foil"]))) 0))
-
-;; An entry is fresh iff its own bytes and every file in its STORED
-;; closure snapshot are unchanged.  Equivalent to recomputing the
-;; snapshot: unchanged own source implies an unchanged import list,
-;; and recursively (every closure file checked) an unchanged closure.
+;; An entry is fresh iff its snapshot still holds: unchanged own
+;; stamp implies an unchanged import list, and recursively (every
+;; closure file stamped) an unchanged closure.  The width check
+;; drops entries persisted before the lore field existed — otherwise
+;; a stale 5-wide entry would silently serve lore 0 for a warm
+;; module instead of recompiling.
 (define (cache-prune entries)
-  (define names
-    (foldl
-      (lambda (acc e)
-        (foldl (lambda (a p) (snoc-new (_0 p) a))
-          (snoc-new (_0 e) acc)
-          (_1 (_1 e))))
-      [] entries))
-  (define table (map (lambda (n) [n (try-read-mod n)]) names))
-  (define (cur n)
-    (let ((h (find (lambda (r) (Eq n (_0 r))) table)))
-      (Ifz h 0 (_1 (_0 h)))))
-  ;; The width check drops entries persisted before the lore field
-  ;; existed — otherwise a stale 5-wide entry would silently serve
-  ;; lore 0 for a warm module instead of recompiling.
-  (define (fresh? e)
-    (And (Eq 6 (Sz e))
-      (And (Equal (_0 (_1 e)) (cur (_0 e)))
-        (Nil (includes (lambda (p) (Nil (Equal (_1 p) (cur (_0 p))))) (_1 (_1 e)))))))
-  (filter fresh? entries))
+  (filter
+    (lambda (e) (And (Eq 6 (Sz e)) (snapshot-fresh? (_1 e))))
+    entries))
 
 (define (cache-strip entries)
   (map (lambda (e) [(_0 e) (_2 e) (_3 e) (_4 e) (Ix 5 e)]) entries))
 
 (define (cache-wrap cache)
+  (define built (Now 0))
   (define names (map (Ix 0) cache))
+  ;; imports from a shared table (every closure member of a cached
+  ;; module is itself cached) — per-entry import-closure walks would
+  ;; re-parse each file O(N^2) times
   (define imps (map (lambda (n) [n (foil:module-imports n)]) names))
-  (define bytes (map (lambda (n) [n (try-read-mod n)]) names))
   (define (imports-of n)
     (let ((h (find (lambda (r) (Eq n (_0 r))) imps)))
       (Ifz h (foil:module-imports n) (_1 (_0 h)))))
-  (define (bytes-of n)
-    (let ((h (find (lambda (r) (Eq n (_0 r))) bytes)))
-      (Ifz h (try-read-mod n) (_1 (_0 h)))))
-  ;; import-closure's BFS, imports from the shared table (every
-  ;; closure member of a cached module is itself cached)
   (define (closure mod)
     (define (go seen pend)
       (Ifz (Sz pend)
@@ -748,7 +765,8 @@
             (go (snoc name seen) (Weld rest (imports-of name)))))))
     (go [] (imports-of mod)))
   (define (snap-of mod)
-    [(bytes-of mod) (map (lambda (n) [n (bytes-of n)]) (closure mod))])
+    ["STAMPS" built
+     (map (lambda (n) [n (mod-stamp n)]) (snoc mod (closure mod)))])
   (map (lambda (e) [(_0 e) (snap-of (_0 e)) (_1 e) (_2 e) (_3 e) (Ix 4 e)])
     cache))
 
