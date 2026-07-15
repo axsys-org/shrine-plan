@@ -39,11 +39,7 @@
       (else ty)))
   ret)
 
-;; The env-goal slot (vestigial bidirectional checking: written by
-;; elab-cast, read by nothing) was removed; when checking-mode
-;; elaboration happens for real it belongs in elab-call's argument
-;; positions and elab-fun's parameter inference.
-(define empty-env [0 0 0 0 0 0])
+(define empty-env [0 0 0 0 0 0 0])
 (define env-locals (Ix 0)) (define set-env-locals (Up 0))
 (define env-diags (Ix 1))
 (define env-name (Ix 2)) (define set-env-name (Up 2))
@@ -53,6 +49,17 @@
 (define env-span (Ix 4)) (define set-env-span (Up 4))
 ;; Const generic parameters in scope: [[name declared-type] ...].
 (define env-consts (Ix 5)) (define set-env-consts (Up 5))
+;; The expected type of the expression being elaborated (checking
+;; mode), or 0.  Set where the context declares a type — a cast body,
+;; a typed local binding, call arguments against the callee's
+;; parameters, constructor arguments against the row's fields, loop
+;; inits against the seed types — and cleared at every descent into a
+;; position whose expected type is unknown (scrutinees, callees,
+;; receivers), so a stale goal never mis-checks an inner expression.
+;; Read by relative-variant resolution and (later) checking-mode
+;; lambda parameter inference.
+(define env-goal (Ix 6)) (define set-env-goal (Up 6))
+(define (clear-env-goal env) (set-env-goal 0 env))
 
 ;;; Located errors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -404,12 +411,26 @@
   (define elab-ty (elab-type-env sut env))
   ;; State-threaded traversal for sibling expressions.  The TC row is kept
   ;; separate from the type-operation context so public TC shapes do not move.
-  (define (elab-vals ctx0 env0 surfs)
+  ;; goals pairs each expression with its expected type (0 = none); the
+  ;; plain elab-vals clears the goal for every sibling.
+  (define (elab-vals-goals ctx0 env0 surfs goals)
     (foldl
       (lambda (st s)
-        (let ((r (elab-val-context (_0 st) env0 s)))
+        (let* ((g (Ifz goals 0 (Ix (Sz (_1 st)) goals)))
+               (r (elab-val-context (_0 st) (set-env-goal g env0) s)))
           [(_0 r) (snoc (_1 r) (_1 st))]))
       [ctx0 []] surfs))
+  (define (elab-vals ctx0 env0 surfs)
+    (elab-vals-goals ctx0 env0 surfs 0))
+  ;; Per-argument goals for a call: the callee's declared parameter
+  ;; types when they are visible — a plain TFUN of matching arity.
+  ;; Generic (TQUA) callees resolve their quas only at apply time, so
+  ;; their parameters stay goalless for now.
+  (define (fun-arg-goals fty n)
+    (let ((b (burp-face fty)))
+      (If (And (ty:is-tfun? b) (Eq n (Sz (ty:tfun-args b))))
+        (ty:tfun-args b)
+        0)))
   (define (nests-pairs ctx0 pairs)
     (foldl
       (lambda (st pr)
@@ -419,21 +440,30 @@
   (define (elab-fun f[_ args body])
     (define argty (map elab-ty args))
     (define frame (Weld [(self-ty sut env argty body)] argty))
-    (define inner-env (push-locals env frame))
+    (define inner-env (push-locals (clear-env-goal env) frame))
     (define r (elab-val-context ctx inner-env body))
     (define val (_1 r))
     [(_0 r) (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val)])
   (define (elab-cast c[_ ty body])
     (define want (elab-ty ty))
-    (define r (elab-val-context ctx env body))
+    (define r (elab-val-context ctx (set-env-goal want env) body))
     (define ret (_1 r))
     (define nr (ty:type-nests-context (_0 r) want (tc-ty ret)))
     (unless (_1 nr)
       (elab-error env "cast (^) target does not accept the value's type"
         ["want" want "got" (tc-ty ret)])
       [(_0 nr) (set-tc-ty want ret)]))
+  ;; A row literal under a same-arity structural row goal checks each
+  ;; element against the corresponding field.
   (define (elab-row r[_ items])
-    (define er (elab-vals ctx env items))
+    (define goals
+      (Ifz (env-goal env) 0
+        (let ((gspan (burp-face (env-goal env))))
+          (If (And (Eq "TROW" (_1 gspan))
+                (Eq (Sz items) (Sz (ty:trow-vals gspan))))
+            (ty:trow-vals gspan)
+            0))))
+    (define er (elab-vals-goals ctx env items goals))
     (define els (_1 er))
     (define ty (ty:TROW 0 (map tc-ty els)))
     [(_0 er) (tc-row ty (ty:trow-cstr ty) els)])
@@ -507,18 +537,18 @@
   ;; matches use for their missing heir).
   (define (elab-loop l[_ arms body])
     (define argty (map (lambda (a) (elab-ty (_1 a))) arms))
-    (define ir (elab-vals ctx env (map (Ix 2) arms)))
+    (define ir (elab-vals-goals ctx env (map (Ix 2) arms) argty))
     (define inits (_1 ir))
     (define ret0 (peek-ret-cast sut env body))
     (define ret (If (Equal ty:TBAD ret0) ty:TBOT ret0))
     (define frame (Weld [(ty:TSELF (ty:TFUN argty ret))] argty))
-    (define inner-env (push-locals env frame))
+    (define inner-env (push-locals (clear-env-goal env) frame))
     (define vr (elab-val-context (_0 ir) inner-env body))
     (define val (_1 vr))
     (define lam (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val))
     (on-call (_0 vr) lam inits))
   (define (elab-spec s[_ val args])
-    (define br (elab-val-context ctx env val))
+    (define br (elab-val-context ctx (clear-env-goal env) val))
     (define base (_1 br))
     (define bty0
       (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
@@ -643,18 +673,25 @@
              (If (bad-type? typ)
                (elab-error env "bad specialization" ["got" typ "args" args])
                (set-tc-ty typ base)))))))])
+  ;; Callee first: its parameter (or constructor field) types become
+  ;; the arguments' goals.
   (define (elab-call c[_ f xs])
-    (define er (elab-vals ctx env xs))
-    (define exs (_1 er))
-    (define variant-call? (Eq "s_variant" (_0 f)))
-    (If variant-call?
-      [(_0 er) (elab-variant-call (_1 f) exs)]
-      (let* ((fr (elab-val-context (_0 er) env f))
+    (If (Eq "s_variant" (_0 f))
+      (let ((er (elab-vals ctx env xs)))
+        [(_0 er) (elab-variant-call (_1 f) (_1 er))])
+      (let* ((fr (elab-val-context ctx (clear-env-goal env) f))
              (tc-f (_1 fr))
-             (rown (tc-type-row tc-f)))
+             (rown (tc-type-row tc-f))
+             (goals
+               (If rown
+                 (let ((fields (ty:trow-vals (Ix 0 rown))))
+                   (If (Eq (Sz xs) (Sz fields)) fields 0))
+                 (fun-arg-goals (tc-ty tc-f) (Sz xs))))
+             (er (elab-vals-goals (_0 fr) env xs goals))
+             (exs (_1 er)))
         (If rown
-          (elab-type-call (_0 fr) f rown exs)
-          (on-call (_0 fr) tc-f exs)))))
+          (elab-type-call (_0 er) f rown exs)
+          (on-call (_0 er) tc-f exs)))))
   ;; Functions are referenced *by name* (TC_GLOBAL, carrying only the
   ;; referee's type): lowering links the referee's compiled pin in by
   ;; path.  Embedding the whole referee TC — the old behavior — made
@@ -742,13 +779,20 @@
   ;; ones; recursive references are not supported (bindings elaborate
   ;; before their name enters scope).
   (define (elab-letrec l[_ arms body])
-    (define (bind-ty ctx0 env1 pat val-tc)
+    (define outer-goal (env-goal env))
+    ;; A typed binding's declared type is elaborated before its value
+    ;; so the value checks against it (the goal); the binding's
+    ;; nests-check keeps the diagnostics.
+    (define (pat-goal env1 pat)
+      (If (Eq "s_face" (_0 pat))
+        (elab-type-env sut env1 (surf-face-kid pat))
+        0))
+    (define (bind-ty ctx0 env1 pat want val-tc)
       (define tag (_0 pat))
       (cond
         ((Eq tag "s_face")
-          (let* ((want (elab-type-env sut env1 (surf-face-kid pat)))
-                 (nr (ty:type-nests-context ctx0 want
-                       (burp-face (tc-ty val-tc)))))
+          (let ((nr (ty:type-nests-context ctx0 want
+                      (burp-face (tc-ty val-tc)))))
             (unless (_1 nr)
               (elab-error env1 "local binding value does not fit its declared type"
                 ["want" want "got" (tc-ty val-tc)])
@@ -758,19 +802,26 @@
         (else
           (elab-error env1 "unsupported local binding pattern" pat))))
     (define (step acc[ctx1 env1 binds] arm[_ pat val])
-      (define vr (elab-val-context ctx1 env1 val))
+      (define want (pat-goal env1 pat))
+      (define vr (elab-val-context ctx1 (set-env-goal want env1) val))
       (define val-tc (_1 vr))
-      (define br (bind-ty (_0 vr) env1 pat val-tc))
+      (define br (bind-ty (_0 vr) env1 pat want val-tc))
       [(_0 br) (push-local-env env1 (_1 br)) (snoc val-tc binds)])
     (define res[ctx2 env2 binds] (foldl step [ctx env []] arms))
     (unless (Ne foil-no-heir body)
       (elab-error env "local bindings (=) require a body" 0)
-      (let* ((br (elab-val-context ctx2 env2 body))
+      (let* ((br (elab-val-context ctx2 (set-env-goal outer-goal env2) body))
              (btc (_1 br)))
         [(_0 br) (tc-letrec (tc-ty btc) binds btc)])))
+  ;; The receiver rides last, so written argument i pairs with the
+  ;; method's parameter i — goals come straight off the front.
   (define (elab-meth-step st[ctx0 rcvr] seg)
     (define f (score-meth rcvr (surf-mseg-name seg) sut))
-    (define ar (elab-vals ctx0 env (surf-mseg-args seg)))
+    (define margs (surf-mseg-args seg))
+    (define goals
+      (let ((g (fun-arg-goals (tc-ty f) (Inc (Sz margs)))))
+        (Ifz g 0 (take (Sz margs) g))))
+    (define ar (elab-vals-goals ctx0 env margs goals))
     (on-call (_0 ar) f (snoc rcvr (_1 ar))))
   (define (elab-meth-go st els)
     (Ifz els st
@@ -783,7 +834,7 @@
     (define head (_0 els))
     (define hr
       (If (IsApp head)
-        (elab-val-context ctx env head)
+        (elab-val-context ctx (clear-env-goal env) head)
         [ctx (elab-var [0 head])]))
     (elab-meth-go hr (drop 1 els)))
   (define (arm-span-key span)
@@ -869,7 +920,7 @@
         (Ifz (Sz missing) 0
           (elab-error env "non-exhaustive match" ["missing" missing])))))
   (define (elab-case c[_ scr arms fall])
-    (define sr (elab-val-context ctx env scr))
+    (define sr (elab-val-context ctx (clear-env-goal env) scr))
     (define scrut (_1 sr))
     (define scr-expanded
       (ty:mold-to-span-context (_0 sr) (burp-face (tc-ty scrut))))
@@ -904,7 +955,7 @@
              0)
         [(_0 joined) (tc-match out-ty scrut arms1 fall1)])))
   (define (elab-if i[_ scr tru fall])
-    (define sr (elab-val-context ctx env scr))
+    (define sr (elab-val-context ctx (clear-env-goal env) scr))
     (define tr (elab-val-context (_0 sr) env tru))
     (define fr (elab-val-context (_0 tr) env fall))
     (define scrut (_1 sr))
@@ -925,7 +976,7 @@
     ;; peek-ret-cast leaves TBAD when the enclosing function carries no
     ;; ^ return cast; catch that here rather than failing on the apply.
     (unless (And (ty:is-tfun? fun-ty) (Equal ty:TBAD (ty:tfun-ret fun-ty)))
-	    (let ((ar (elab-vals ctx env xs)))
+	    (let ((ar (elab-vals-goals ctx env xs (fun-arg-goals fun-ty (Sz xs)))))
           (on-call (_0 ar) (on-var 0 [(Ix idx (env-locals env)) [idx]])
 	        (_1 ar)))
       (elab-error env
