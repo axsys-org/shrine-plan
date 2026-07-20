@@ -1,0 +1,190 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;;;; Unit-qualified storage keys and compiled-entry relocation.
+;;;;
+;;;; A mounted unit may use the same source-canonical paths as another unit.
+;;;; Storage therefore prefixes paths owned by the unit with its content pin.
+;;;; Source visibility remains a separate concern.  Relocation is pure: runtime
+;;;; values, lowered IR, source spans, row constructor brands, and references to
+;;;; paths outside the unit are retained exactly.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind subject (#module foil-subject))
+(#import subject)
+
+(#bind ty (#module foil-types))
+
+;;; Unit-qualified canonical paths ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Shape predicates/accessors come from foil-subject; this module owns only
+;; relocation policy.
+
+;; own-canonical-path? :: Row Path -> Path -> Bool
+(define (own-canonical-path? own-paths path)
+  (includes (Equal path) own-paths))
+
+;; qualify-canonical-path :: Row Path -> Pin -> Path -> Path
+;;
+;; Qualify a path iff it belongs to the unit.  A /ty-ap selector remains a
+;; valid /ty-ap encoding: its base is qualified when either the base or the
+;; materialized selector itself is owned, and owned path-shaped arguments are
+;; recursively qualified.  Calling this on an already-qualified path is
+;; idempotent.
+(define (qualify-canonical-path own-paths unit-id path)
+  (unless (IsPin unit-id)
+    (error ["foil-relocate-malformed-unit-id" unit-id])
+    (letrec
+      ((prefix
+         (lambda (p)
+           (If (unit-qualified-path? p)
+             p
+             (Weld [unit-storage-tag unit-id] p))))
+       ;; force? means the enclosing /ty-ap path itself is an owned concrete
+       ;; entry, so its base must acquire this unit's storage identity even if
+       ;; only the full materialized selector appears in own-paths.
+       (go
+         (lambda (force? p)
+           (cond
+             ((unit-qualified-path? p) p)
+             ((ty-ap-path? p)
+               (let ((parts (ty-ap-decode p)))
+                 (unless parts
+                   (error ["foil-relocate-malformed-ty-ap" p])
+                   (let* ((own-selector? (own-canonical-path? own-paths p))
+                          (base (go (Or force? own-selector?) (_0 parts)))
+                          (args (map (go 0) (drop 1 parts))))
+                     (ty-ap-encode (Weld [base] args))))))
+             ((Or force? (own-canonical-path? own-paths p)) (prefix p))
+             (else p)))))
+      (go 0 path))))
+
+;;; Type relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; relocate-type :: Row Path -> Pin -> Type -> Type
+;;
+;; Relocate every owned TNOM reference, including legacy TNOM argument rows.
+;; TROW's runtime constructor field is deliberately never rewritten; only its
+;; field types recurse.
+(define (relocate-type own-paths unit-id typ)
+  (unless (And (IsApp typ)
+            (And (Ge (Sz typ) 2) (Eq "type" (_0 typ))))
+    (error ["foil-relocate-malformed-type" typ])
+    (letrec
+      ((recur (relocate-type own-paths unit-id))
+       (tag (_1 typ)))
+      (cond
+        ((Eq tag "TNOM")
+          (Up 3 (map recur (_3 typ))
+            (Up 2 (qualify-canonical-path own-paths unit-id (_2 typ)) typ)))
+        ((Eq tag "TSUM") (Up 2 (map recur (_2 typ)) typ))
+        ((Eq tag "TQUA") (Up 3 (recur (_3 typ)) typ))
+        ((Eq tag "TCQUA")
+          (Up 4 (recur (_4 typ)) (Up 3 (recur (_3 typ)) typ)))
+        ((Eq tag "TFUN")
+          (Up 4 (recur (_4 typ)) (Up 3 (map recur (_3 typ)) typ)))
+        ((Eq tag "TSELF") (Up 2 (recur (_2 typ)) typ))
+        ((Eq tag "TFAC") (Up 3 (recur (_3 typ)) typ))
+        ;; Keep `_2` — the runtime constructor brand — byte-for-byte stable.
+        ((Eq tag "TROW") (Up 3 (map recur (_3 typ)) typ))
+        ((Eq tag "TPIN") (Up 2 (recur (_2 typ)) typ))
+        ((Eq tag "TTYP") (Up 2 (recur (_2 typ)) typ))
+        ((Eq tag "TARR") (Up 2 (recur (_2 typ)) typ))
+        ;; TNAT, TVAR, TANY, TPAIL, TBOT, and TBAD contain no type paths.
+        ((Or (Eq tag "TNAT")
+           (Or (Eq tag "TVAR")
+             (Or (Eq tag "TANY")
+               (Or (Eq tag "TPAIL")
+                 (Or (Eq tag "TBOT") (Eq tag "TBAD")))))) typ)
+        (else (error ["foil-relocate-unknown-type" tag typ]))))))
+
+;;; Typed-code relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; relocate-tc :: Row Path -> Pin -> TC -> TC
+;;
+;; Relocate every type annotation and owned TC_GLOBAL edge in a typed-code
+;; tree.  Runtime literals/FFIs, local slots, lambda metadata, TC_ROW heads,
+;; match dispatch keys, and diagnostics are retained unchanged.
+(define (relocate-tc own-paths unit-id code)
+  (unless (IsApp code)
+    (error ["foil-relocate-malformed-tc" code])
+    (letrec
+      ((tag (Hd code))
+       (recur (relocate-tc own-paths unit-id))
+       (rty (relocate-type own-paths unit-id))
+       (with-ty (lambda (x) (set-tc-ty (rty (tc-ty x)) x))))
+      (cond
+        ((Eq tag "TC_GLOBAL")
+          (Up 1
+            (qualify-canonical-path own-paths unit-id (tc-global-path code))
+            (with-ty code)))
+        ((Eq tag "TC_APP")
+          (Up 2 (recur (tc-app-x code))
+            (Up 1 (recur (tc-app-f code)) (with-ty code))))
+        ((Eq tag "TC_LAM")
+          (Up 3 (recur (tc-lam-body code))
+            (Up 2 (map rty (tc-lam-args code)) (with-ty code))))
+        ((Eq tag "TC_ROW")
+          ;; Keep tc-row-hd unchanged for the same reason TROW brands stay put.
+          (Up 2 (map recur (tc-row-items code)) (with-ty code)))
+        ((Eq tag "TC_MATCH")
+          (Up 3
+            (let ((fall (tc-match-fall code))) (Ifz fall 0 (recur fall)))
+            (Up 2 (map recur (tc-match-arms code))
+              (Up 1 (recur (tc-match-scrut code)) (with-ty code)))))
+        ((Eq tag "TC_ARM")
+          ;; The pattern is a Type; the dispatch key is a runtime shape tree.
+          (Up 2 (recur (tc-arm-val code))
+            (Up 1 (rty (tc-arm-pat code)) (with-ty code))))
+        ((Eq tag "TC_LET")
+          (Up 2 (recur (tc-letrec-body code))
+            (Up 1 (map recur (tc-letrec-binds code)) (with-ty code))))
+        ((Or (Eq tag "TC_LOCAL")
+           (Or (Eq tag "TC_LIT")
+             (Or (Eq tag "TC_CONST")
+               (Or (Eq tag "TC_CPARAM")
+                 (Or (Eq tag "TC_FFI") (Eq tag "TC_TYP"))))))
+          (with-ty code))
+        ;; TC_MEAN's payload is a diagnostic cause, not a Type.
+        ((Eq tag "TC_MEAN") code)
+        (else (error ["foil-relocate-unknown-tc" tag code]))))))
+
+;;; Pinned subject-entry cloning ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; clone-qualified-entry-pin :: Row Path -> Pin -> Pin Entry -> Pin Entry
+;;
+;; Clone a pinned `("TC" key tc span)` or
+;; `("IR_ENTRY" key span runtime-value tc ir)` at its unit-qualified key.
+;; Only the key and the TC tree are relocated.  The source span and, for an
+;; IR_ENTRY, its compiled runtime value and retained IR are shared unchanged.
+(define (clone-qualified-entry-pin own-paths unit-id entry-pin)
+  (unless (IsPin entry-pin)
+    (error ["foil-relocate-unpinned-entry" entry-pin])
+    (let* ((entry (Unpin entry-pin))
+           (tag (Hd entry))
+           (key (_0 entry))
+           (qualified (qualify-canonical-path own-paths unit-id key)))
+      (cond
+        ((Eq tag "TC")
+          (Pin (Up 1 (relocate-tc own-paths unit-id (_1 entry))
+                 (Up 0 qualified entry))))
+        ((Eq tag "IR_ENTRY")
+          (Pin (Up 3 (relocate-tc own-paths unit-id (_3 entry))
+                 (Up 0 qualified entry))))
+        (else (error ["foil-relocate-unsupported-entry" tag entry]))))))
+
+(#export
+ unit-storage-tag
+ unit-qualified-path?
+ unit-qualified-path-unit
+ unit-qualified-path-local
+ own-canonical-path?
+ qualify-canonical-path
+ relocate-type
+ relocate-tc
+ clone-qualified-entry-pin)

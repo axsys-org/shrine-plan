@@ -1,0 +1,481 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; A checked Reaver -> Foil FFI facade.  This is a macro library: checked
+;; definitions erase to ordinary Reaver and use the global Entry.typeInfo slot
+;; for compile-time metadata.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind cairn (#module cairn))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind ty (#module foil-types))
+(#bind core (#module foil-core-types))
+
+;;; Typed entry metadata ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Reaver's global-table helpers are compiler internals rather than ordinary
+;; Reaver globals.  The macro ABI deliberately hands transformers the table,
+;; so keep a small representation-compatible lookup/insert implementation
+;; here instead of adding a compiler primitive.
+(define entry-name (Ix 0))
+(define entry-val (Ix 1))
+(define entry-macro (Ix 2))
+(define entry-type (Ix 4))
+(define global-max-bucket-depth 5)
+(define global-entry-size 5)
+
+;; Compiler globals contain PLAN's compact BST nodes (size in the head), not
+;; the row-shaped nodes exported by reaver/bst.rvr.
+(define (tr-bst-search key tree)
+  (And tree
+    (Case3 (Cmp key (_0 tree))
+      (tr-bst-search key (_2 tree))
+      [(_1 tree)]
+      (tr-bst-search key (_3 tree)))))
+(define (tr-bst-idx key tree)
+  (_0 (tr-bst-search key tree)))
+
+(define (tr-global-look key bits global)
+  (define inner (Unpin global))
+  (And global
+    (Case3 (Cmp (Sz inner) global-entry-size)
+      (tr-bst-idx key inner)
+      (And (Eq key (entry-name inner)) global)
+      (tr-global-look key (Rsh bits 8) (Ix (Mod bits 16) inner)))))
+
+(define (tr-glookup key global)
+  (tr-global-look key (Trunc32 key) global))
+
+(define typed-info-tag "typed-reaver/v1")
+(define (typed-info typ) [typed-info-tag typ])
+(define (typed-info? x)
+  (And (IsApp x)
+    (And (Eq 2 (Sz x)) (Eq typed-info-tag (_0 x)))))
+(define typed-info-type (Ix 1))
+
+(define (typed-error ctx what detail)
+  (error ["typed-reaver" what ["at" ctx] detail]))
+
+(define (expect-size ctx what n x)
+  (unless (Eq n (Sz x))
+    (typed-error ctx ["bad" what "arity"] ["expected" n "form" x])
+    1))
+
+(define (ordinary-form? x)
+  (And (IsApp x) (Eq 0 (Hd x))))
+(define (form-is? name x)
+  (And (ordinary-form? x) (Eq name (_0 x))))
+
+;;; Type syntax ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (type-var? vars name)
+  (includes (Eq name) vars))
+
+(define (parse-type-vars ctx xs)
+  (define vars (Force (map (lambda (x)
+    (If (IsNat x) x
+      (typed-error ctx "bad type variable" x))) xs)))
+  (define (check-one i name)
+    (define first (find-idx (Eq name) vars))
+    (If (And first (Eq i (_0 first))) name
+      (typed-error ctx "duplicate type variable" name)))
+  (gen (Sz vars) (lambda (i) (check-one i (Ix i vars)))))
+
+(define (wrap-alls vars typ)
+  (foldr (lambda (v acc) (ty:TQUA v acc)) typ vars))
+
+(define (parse-type-go ctx vars form)
+  (define (recur x) (parse-type-go ctx vars x))
+  (define (compound tag arity make)
+    (unless (And (form-is? tag form) (Eq arity (Sz form)))
+      (typed-error ctx ["bad type constructor" tag] form)
+      (make 0)))
+  (cond
+    ((Eq form "Any") ty:TANY)
+    ((Eq form "Nat") (ty:TNAT 0))
+    ((Eq form "UInt") core:uint-ty)
+    ((Eq form "Bool") core:bool-ty)
+    ((Eq form "Unit") core:unit-ty)
+    ((Eq form "Quip") core:quip-ty)
+    ((Eq form "Pail") ty:TPAIL)
+    ((And (IsNat form) (type-var? vars form)) (ty:TVAR form))
+    ((form-is? "Row" form)
+      (compound "Row" 2 (lambda (z) (core:row-of (recur (_1 form))))))
+    ((form-is? "List" form)
+      (compound "List" 2 (lambda (z) (core:list-of (recur (_1 form))))))
+    ((form-is? "Either" form)
+      (compound "Either" 3
+        (lambda (z) (core:either-of (recur (_1 form)) (recur (_2 form))))))
+    ((form-is? "Pin" form)
+      (compound "Pin" 2 (lambda (z) (ty:TPIN (recur (_1 form))))))
+    ((form-is? "->" form)
+      (compound "->" 3
+        (lambda (z)
+          (define argsS (_1 form))
+          (unless (ordinary-form? argsS)
+            (typed-error ctx "function arguments must be a type list" argsS)
+            (ty:TFUN (map recur argsS) (recur (_2 form)))))))
+    ((form-is? "All" form)
+      (compound "All" 3
+        (lambda (z)
+          (define varsS (_1 form))
+          (unless (ordinary-form? varsS)
+            (typed-error ctx "All variables must be a list" varsS)
+            (let ((more (parse-type-vars ctx varsS)))
+              (wrap-alls more
+                (parse-type-go ctx (Weld more vars) (_2 form))))))))
+    (else (typed-error ctx "unknown type syntax" form))))
+
+(define (parse-type ctx form)
+  (define typ (parse-type-go ctx [] form))
+  (define wf (ty:check-type-wf core:core-subject typ))
+  (If (Eq "right" (Hd wf)) typ
+    (typed-error ctx "ill-formed type" wf)))
+
+;;; Trusted primitive prelude ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define nat (ty:TNAT 0))
+(define unary-nat (ty:TFUN [nat] nat))
+(define binary-nat (ty:TFUN [nat nat] nat))
+(define pred-any (ty:TFUN [ty:TANY] nat))
+(define if-type
+  (ty:TQUA "a" (ty:TFUN [nat (ty:TVAR "a") (ty:TVAR "a")] (ty:TVAR "a"))))
+(define pin-type
+  (ty:TQUA "a" (ty:TFUN [(ty:TVAR "a")] (ty:TPIN (ty:TVAR "a")))))
+(define unpin-type
+  (ty:TQUA "a" (ty:TFUN [(ty:TPIN (ty:TVAR "a"))] (ty:TVAR "a"))))
+(define equal-type
+  (ty:TQUA "a" (ty:TFUN [(ty:TVAR "a") (ty:TVAR "a")] nat)))
+(define map-type
+  (ty:TQUA "a"
+    (ty:TQUA "b"
+      (ty:TFUN
+        [(ty:TFUN [(ty:TVAR "a")] (ty:TVAR "b"))
+         (core:row-of (ty:TVAR "a"))]
+        (core:row-of (ty:TVAR "b"))))))
+
+;; This table is the Typed Reaver trusted computing base.  Missing globals do
+;; not silently become Any.
+(define trusted-prelude
+  [["Add" binary-nat] ["Sub" binary-nat] ["Mul" binary-nat]
+   ["Div" binary-nat] ["Mod" binary-nat] ["Lsh" binary-nat]
+   ["Rsh" binary-nat] ["Inc" unary-nat] ["Dec" unary-nat]
+   ["Bex" unary-nat] ["Bytes" unary-nat]
+   ["Eq" (ty:TFUN [ty:TANY ty:TANY] nat)] ["Equal" equal-type]
+   ["Lt" binary-nat] ["Le" binary-nat] ["Ge" binary-nat]
+   ["Gt" binary-nat] ["If" if-type] ["Pin" pin-type]
+   ["Unpin" unpin-type] ["IsNat" pred-any] ["IsApp" pred-any]
+   ["IsPin" pred-any] ["IsLaw" pred-any] ["Nil" pred-any]
+   ["Sz" (ty:TFUN [ty:TANY] nat)] ["map" map-type]])
+
+(define (trusted-type name)
+  (define hit (find (lambda (x) (Eq name (_0 x))) trusted-prelude))
+  (Ifz hit 0 (_1 (_0 hit))))
+
+;;; Static environments and globals ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (env-get env name)
+  (define hit (find (lambda (x) (Eq name (_0 x))) env))
+  (Ifz hit 0 (_1 (_0 hit))))
+(define (env-put name typ env)
+  (cons [name typ] env))
+(define (env-put-many names types env)
+  (foldl (lambda (acc pair) (env-put (_0 pair) (_1 pair) acc))
+    env (zip names types)))
+
+(define (global-entry-type ctx glo name)
+  (define trusted (trusted-type name))
+  (define ent (tr-glookup name glo))
+  (If trusted trusted
+    (Ifz ent
+      (typed-error ctx "unbound global" name)
+      (let ((info (entry-type (Unpin ent))))
+      (cond
+        ((typed-info? info) (typed-info-type info))
+        ((Eq "macro" (entry-macro (Unpin ent)))
+          (typed-error ctx "unsupported typed macro" name))
+        (else (typed-error ctx "untyped global" name)))))))
+
+;;; Bidirectional expression checker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (strip-quas typ[_ tag])
+  (cond
+    ((Eq tag "TQUA") (strip-quas (_3 typ)))
+    ((Eq tag "TFAC") (strip-quas (ty:tfac-val typ)))
+    ((Eq tag "TSELF") (strip-quas (ty:tself-val typ)))
+    (else typ)))
+
+(define (check-nests ctx want got form)
+  (If (ty:type-nests? core:core-subject want got)
+    want
+    (typed-error ctx "type mismatch" ["expected" want "got" got "in" form])))
+
+(define (literal-type val)
+  (cond
+    ((IsNat val) (ty:TNAT val))
+    ((is-row? val) (core:row-of ty:TANY))
+    (else ty:TANY)))
+
+(define (join-types xs)
+  (Ifz (Sz xs) (ty:TNAT 0)
+    (foldl (ty:type-join core:core-subject) (_0 xs) (drop 1 xs))))
+
+(define (synth-expr ctx glo env form)
+  (define (seq tenv forms)
+    (Ifz (Sz forms)
+      (ty:TNAT 0)
+      (let ((types (map (lambda (x) (synth-expr ctx glo tenv x)) forms)))
+        (_0 (rev types)))))
+  (define (slet sequential?)
+    (define binds (_1 form))
+    (define (step state bind)
+      (unless (And (ordinary-form? bind) (Eq 2 (Sz bind)))
+        (typed-error ctx "bad typed let binding" bind)
+        (let* ((tenv (_0 state))
+               (base (If sequential? tenv env))
+               (typ (synth-expr ctx glo base (_1 bind))))
+          [(env-put (_0 bind) typ tenv) typ])))
+    (define state (foldl step [env 0] binds))
+    (seq (_0 state) (drop 2 form)))
+  (define (scond clauses)
+    (define (clause-type clause)
+      (unless (ordinary-form? clause)
+        (typed-error ctx "bad cond clause" clause)
+        1)
+      (unless (Eq "else" (_0 clause))
+        (check-nests ctx nat (synth-expr ctx glo env (_0 clause)) (_0 clause))
+        1)
+      (seq env (drop 1 clause)))
+    (join-types (map clause-type clauses)))
+  (define (sapp)
+    (define head (_0 form))
+    (define gent (And (IsNat head) (tr-glookup head glo)))
+    (And gent
+      (Eq "macro" (entry-macro (Unpin gent)))
+      (typed-error ctx "unsupported typed macro" head))
+    (define fty (synth-expr ctx glo env head))
+    (define args
+      (map (lambda (x) (synth-expr ctx glo env x)) (drop 1 form)))
+    (define ret (ty:type-apply core:core-subject fty args))
+    (If (Eq "TBAD" (_1 ret))
+      (typed-error ctx "cannot apply"
+        ["operator" fty "arguments" args "detail" ret])
+      ret))
+  (cond
+    ((IsNat form)
+      (let ((local (env-get env form)))
+        (Ifz local (global-entry-type ctx glo form) local)))
+    ((Nil form) (ty:TNAT 0))
+    ((Eq 1 (Hd form)) (literal-type (_0 form)))
+    ((Nil (ordinary-form? form))
+      (typed-error ctx "unsupported typed expression" form))
+    ((includes (Eq (_0 form)) ["lambda" "pinlambda" "lambdarec" "pinlambdarec"])
+      (typed-error ctx "lambda needs an expected type" form))
+    ((form-is? "let" form) (slet 0))
+    ((form-is? "let*" form) (slet 1))
+    ((form-is? "letrec" form)
+      (typed-error ctx "unsupported typed form" "local letrec"))
+    ((form-is? "begin" form) (seq env (drop 1 form)))
+    ((form-is? "cond" form) (scond (drop 1 form)))
+    ((Or (form-is? "and" form) (form-is? "or" form))
+      (begin
+        (map (lambda (x)
+          (check-nests ctx nat (synth-expr ctx glo env x) x)) (drop 1 form))
+        nat))
+    ((form-is? "quote" form)
+      (begin (expect-size ctx "quote" 2 form) (literal-type (_1 form))))
+    ((form-is? "#brak" form)
+      (core:row-of
+        (join-types
+          (map (lambda (x) (synth-expr ctx glo env x)) (drop 1 form)))))
+    ((form-is? "define" form)
+      (typed-error ctx "unsupported typed form" "internal define"))
+    (else (sapp))))
+
+(define (synth-seq ctx glo env forms)
+  (Ifz (Sz forms)
+    (ty:TNAT 0)
+    (let ((types (map (lambda (x) (synth-expr ctx glo env x)) forms)))
+      (_0 (rev types)))))
+
+(define (check-lambda ctx glo env form want)
+  (define fun (strip-quas want))
+  (unless (Eq "TFUN" (_1 fun))
+    (typed-error ctx "lambda requires a function expectation" want)
+    1)
+  (define tag (_0 form))
+  (define rec? (Or (Eq tag "lambdarec") (Eq tag "pinlambdarec")))
+  (define sig (_1 form))
+  (unless (ordinary-form? sig)
+    (typed-error ctx "lambda arguments must be a list" sig)
+    1)
+  (define self (If rec? (_0 sig) 0))
+  (define args (If rec? (drop 1 sig) sig))
+  (define argtys (ty:tfun-args fun))
+  (unless (Eq (Sz args) (Sz argtys))
+    (typed-error ctx "lambda arity mismatch" [args argtys])
+    1)
+  (define env1 (Ifz self env (env-put self want env)))
+  (define env2 (env-put-many args argtys env1))
+  (define got (synth-seq ctx glo env2 (drop 2 form)))
+  (check-nests ctx (ty:tfun-ret fun) got form)
+  want)
+
+(define (check-expr ctx glo env form want)
+  (If (And (ordinary-form? form)
+        (includes (Eq (_0 form)) ["lambda" "pinlambda" "lambdarec" "pinlambdarec"]))
+    (check-lambda ctx glo env form want)
+    (check-nests ctx want (synth-expr ctx glo env form) form)))
+
+;;; define-typed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (typed-function-bind ctx glo sig typ bodies)
+  (define name (_0 sig))
+  (define args (drop 1 sig))
+  (define fun (strip-quas typ))
+  (unless (Eq "TFUN" (_1 fun))
+    (typed-error ctx "function definition needs a function type" typ)
+    1)
+  (unless (Eq (Sz args) (Sz (ty:tfun-args fun)))
+    (typed-error ctx "definition arity mismatch" [args typ])
+    1)
+  (define env (env-put-many args (ty:tfun-args fun) [[name typ]]))
+  (define got (synth-seq ctx glo env bodies))
+  (check-nests ctx (ty:tfun-ret fun) got bodies)
+  [name ["#fun" "pin" "noinline" (1 name) (cons name args) (unblock bodies)]])
+
+(define (define-typed-transformer ctx uniq glo locals depth form)
+  (And depth (typed-error ctx "define-typed is top-level only" form))
+  (unless (Ge (Sz form) 4)
+    (typed-error ctx "bad define-typed" form)
+    1)
+  (define sig (_1 form))
+  (define typ (parse-type ctx (_2 form)))
+  (define bind
+    (If (IsNat sig)
+      (begin
+        (expect-size ctx "value define-typed" 4 form)
+        (check-expr ctx glo [] (_3 form) typ)
+        [sig (_3 form)])
+      (typed-function-bind ctx glo sig typ (drop 3 form))))
+  (define name (_0 bind))
+  (define annotated-rhs
+    ["#typed-reaver-binding" (1 (typed-info typ)) (_1 bind)])
+  [uniq glo ["#bind" name annotated-rhs]])
+
+(#macro define-typed define-typed-transformer)
+(#macro define/typed define-typed-transformer)
+
+;;; Shallow checked Foil manifests ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (boundary-check sut path direction index typ val)
+  (define fit (ty:type-shape-fits sut typ val))
+  (Ifz fit val
+    (error ["typed-reaver-ffi"
+            ["path" path]
+            ["direction" direction]
+            ["index" index]
+            ["expected" typ]
+            ["actual" val]
+            ["detail" fit]])))
+
+(define (boundary-argument sut path index typ val)
+  (boundary-check sut path "input" index typ val))
+(define (boundary-result sut path typ val)
+  (boundary-check sut path "output" 0 typ val))
+
+(define (callable-type typ[_ tag])
+  (cond
+    ((Eq tag "TQUA") (callable-type (_3 typ)))
+    ((Eq tag "TFAC") (callable-type (ty:tfac-val typ)))
+    ((Eq tag "TSELF") (callable-type (ty:tself-val typ)))
+    (else typ)))
+
+(define (wrapper-factory-form path typ raw)
+  (define open (callable-type typ))
+  (define sut-name "__typed_reaver_sut")
+  (If (Eq "TFUN" (_1 open))
+    (let* ((argtys (ty:tfun-args open))
+           (arity (Sz argtys))
+           (args (gen arity
+                   (lambda (i) (strWeld "__typed_reaver_arg_" (showNat i)))))
+           (checked
+             (gen arity
+               (lambda (i)
+                 [(1 boundary-argument) sut-name (1 path) (1 i)
+                  (1 (Ix i argtys)) (Ix i args)])))
+           (raw-call (cons (1 raw) checked))
+           (body [(1 boundary-result) sut-name (1 path)
+                  (1 (ty:tfun-ret open)) raw-call]))
+      ["lambda" [sut-name] ["lambda" args body]])
+    ["lambda" [sut-name]
+      [(1 boundary-result) sut-name (1 path) (1 typ) (1 raw)]]))
+
+(define (parse-foil-path ctx form)
+  (unless (And (ordinary-form? form) (Eq "foil" (_0 form)))
+    (typed-error ctx "provide/foil path must be (foil path ...)" form)
+    1)
+  (define path (Force (drop 1 form)))
+  (unless (And (Lt 0 (Sz path)) (all IsNat path))
+    (typed-error ctx "bad Foil path" form)
+    1)
+  path)
+
+(define (provide-clause-form ctx glo clause)
+  (unless (And (ordinary-form? clause) (Eq 2 (Sz clause)))
+    (typed-error ctx "bad provide/foil clause" clause)
+    1)
+  (define name (_0 clause))
+  (define path (parse-foil-path ctx (_1 clause)))
+  (define ent (And (IsNat name) (tr-glookup name glo)))
+  (Ifz ent
+    (typed-error ctx "provide/foil unbound binding" name)
+    (let* ((inner (Unpin ent))
+           (info (entry-type inner)))
+      (unless (typed-info? info)
+        (typed-error ctx "provide/foil requires define/typed" name)
+        1)
+      (define typ (typed-info-type info))
+      (define raw (entry-val inner))
+      [0 (1 path) (1 typ) (wrapper-factory-form path typ raw)])))
+
+(define (duplicate-path paths)
+  (Ifz (Sz paths) 0
+    (If (includes (Equal (_0 paths)) (drop 1 paths))
+      (_0 paths)
+      (duplicate-path (drop 1 paths)))))
+
+(define (provide-foil-transformer ctx uniq glo locals depth form)
+  (define entries (map (provide-clause-form ctx glo) (drop 1 form)))
+  (define dup (duplicate-path (map _0 entries)))
+  (If dup
+    (typed-error ctx "duplicate provide/foil path" dup)
+    [uniq glo (cons 0 entries)]))
+
+(#macro provide-foil provide-foil-transformer)
+(#macro provide/foil provide-foil-transformer)
+
+(define (install-one-provide sut entry[path typ factory])
+  (And (cairn:getax path (Ix 0 sut))
+    (error ["typed-reaver-ffi" "path collision" path]))
+  (insert-ffi path (factory sut) typ sut))
+
+(define (install-foil-provides manifest sut)
+  (foldl install-one-provide sut manifest))
+
+(#export
+ typed-info-tag typed-info typed-info? typed-info-type
+ parse-type trusted-prelude trusted-type
+ synth-expr check-expr
+ boundary-check boundary-argument boundary-result
+ install-foil-provides
+ define-typed define/typed provide-foil provide/foil)

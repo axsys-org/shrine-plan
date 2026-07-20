@@ -72,8 +72,13 @@
           '';
         in {
           foil-bst-tests = runReaverTest "foil-bst-tests";
+          foil-env-tests = runReaverTest "foil-env-tests";
+          foil-relocate-tests = runReaverTest "foil-relocate-tests";
+          foil-provenance-tests = runReaverTest "foil-provenance-tests";
+          foil-env-integration-tests = runReaverTest "foil-env-integration-tests";
           foil-exec-tests = runReaverTest "foil-exec-tests";
           foil-async-tests = runReaverTest "foil-async-tests";
+          typed-reaver-tests = runReaverTest "typed-reaver-tests";
           buddy-tests = runReaverTest "buddy-tests";
           forge-tests = runReaverTest "forge-tests";
         });

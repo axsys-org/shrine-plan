@@ -8,11 +8,15 @@
 (#bind reef (#module reef))
 (#import reef)
 
+(#bind cairn (#module cairn))
+
 (#bind foil-surface (#module foil-surface))
 (#import foil-surface)
 
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
+
+(#bind foil-env (#module foil-env))
 
 (#bind ty (#module foil-types))
 
@@ -74,6 +78,37 @@
   (elab-error env ["unsupported syntax" feature]
     "specified but not yet implemented"))
 
+;; metadata-environment :: Data -> Maybe Environment
+;;
+;; Draft compilation carries an Environment directly; completed subjects carry
+;; the same sealed environment inside their Unit envelope.  Treat both forms as
+;; authoritative.  Only subjects with neither representation are legacy.
+(define (metadata-environment metadata)
+  (cond
+    ((foil-env:environment? metadata) metadata)
+    ((foil-env:unit? metadata) (foil-env:unit-environment metadata))
+    (else 0)))
+
+;; set-metadata-environment :: Environment -> Subject -> Subject
+;; Preserve a completed Unit envelope while refreshing its derived environment.
+(define (set-metadata-environment environment sut)
+  (define metadata (sut-unit sut))
+  (set-sut-unit
+    (If (foil-env:unit? metadata)
+      (foil-env:unit-with-environment environment metadata)
+      environment)
+    sut))
+
+;; retain-context-resolutions :: Subject -> TypeContext -> Subject
+(define (retain-context-resolutions sut ctx)
+  (define environment (metadata-environment (sut-unit sut)))
+  (Ifz environment
+    sut
+    (set-metadata-environment
+      (foil-env:environment-with-resolutions
+        (ty:type-context-resolutions ctx) environment)
+      sut)))
+
 (define (push-env-tvars vars env)
   (set-env-tvars (Weld vars (env-tvars env)) env))
 (define (env-has-tvar? var env)
@@ -86,6 +121,20 @@
 ;; Normalize a type-valued elaboration to a TTYP wrapper (idempotent).
 (define (as-ttyp typ)
   (If (Eq "TTYP" (_1 typ)) typ (ty:TTYP typ)))
+
+;; A sealed path whose declaration has no usable public signature.  TC_CONST
+;; is reserved for the predeclaration phase, and the payload distinguishes this
+;; case from a typed prototype.  Once the declaration elaborates, its ordinary
+;; TC replaces the marker; only a genuine forward/self reference can observe it.
+(define untyped-prototype-mark "FOIL_UNTYPED_PROTOTYPE")
+(define (untyped-prototype ignored)
+  (tc-const ty:TANY untyped-prototype-mark))
+(define (untyped-prototype? tc)
+  (If (IsApp tc)
+    (If (Eq "TC_CONST" (Hd tc))
+      (Eq untyped-prototype-mark (tc-const-val tc))
+      0)
+    0))
 
 ;;; /ty-ap resolution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -232,6 +281,188 @@
 (define (elab-type sut wav)
   (elab-type-env sut empty-env wav))
 
+;;; Source-reference provenance ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Value elaboration already threads a TypeContext, so resolved edges live in
+;;; that context alongside the type-operation memo tables.  Type elaboration
+;;; historically returned only a Type, however, and consequently every name
+;;; used *as a type* bypassed the environment authority and left no retained
+;;; edge.  Keep the public/pure type elaborator above, and pair it with this
+;;; small stateful walk at checked declaration sites.
+
+;; resolve-source-reference :: TypeContext -> Env -> Path -> TypeContext
+;;
+;; The retained foil-env value is the authority for source visibility and
+;; unknown-vs-cull diagnostics.  SUT remains only the typed/linking projection
+;; used after the winning layer has been established.
+(define (resolve-source-reference ctx env path)
+  (define metadata (sut-unit (ty:type-context-sut ctx)))
+  (define environment (metadata-environment metadata))
+  (Ifz environment
+    ;; Inline/legacy callers have no unit environment; retain their historic
+    ;; lookup behavior without manufacturing provenance.
+    ctx
+    (let* ((recorded
+             (foil-env:resolve-record (env-span env) path environment))
+           (environment1 (_0 recorded))
+           (resolution (_1 recorded)))
+      (cond
+        ((foil-env:res-unknown? resolution)
+          (elab-error env "unbound reference" ["path" path]))
+        ((foil-env:res-null? resolution)
+          (elab-error env "culled reference"
+            ["path" path]
+            ["culled-by"
+             (foil-env:from-label (foil-env:res-from resolution))]
+            ["layer" (foil-env:from-ref (foil-env:res-from resolution))]))
+        (else
+          (let ((resolutions
+                  (foil-env:environment-resolutions environment1)))
+            (ty:type-context-record-resolution
+              (_0 (rev resolutions)) ctx)))))))
+
+;; source-paths-for-canonical :: Path -> Subject -> Row Path
+;;
+;; Method dispatch selects a canonical (occasionally specialized) entry after
+;; receiver typing.  Provenance belongs to the source-visible spelling in the
+;; merged environment, so invert the subject's visibility projection before
+;; recording it.
+(define (source-paths-for-canonical canonical sut)
+  (define base
+    (If (ty-ap-path? canonical)
+      (let ((parts (ty-ap-decode canonical)))
+        (Ifz parts canonical (_0 parts)))
+      canonical))
+  (define vis (sut-visible sut))
+  (Ifz vis
+    []
+    (let* ((root (sut-root sut))
+           ;; Builtin row brands historically carry the compilation root even
+           ;; though their canonical substrate entries are stored unrooted.
+           ;; Match that representational alias through the same visibility
+           ;; index; unit-qualified hidden storage has no such root prefix and
+           ;; therefore remains sealed.
+           (unrooted
+             (If (foil-env:path-prefix? root base)
+               (drop (Sz root) base)
+               base)))
+      (map
+        (lambda (pair)
+          (let ((written (_0 pair)))
+            (If (foil-env:path-prefix? root written)
+              (drop (Sz root) written)
+              written)))
+        (filter (lambda (pair)
+                  (Or (Equal base (_1 pair))
+                    (Equal unrooted (_1 pair))))
+          (rowify (cairn:tapax vis)))))))
+
+;; record-canonical-reference :: TypeContext -> Env -> CanonPath -> TypeContext
+;; Compiler-synthesized structural accessors have no layer entry and therefore
+;; no namespace edge.  Declared/generated exported methods do; record those
+;; without turning a computed accessor into an artificial lookup failure.
+(define (record-canonical-reference ctx env canonical)
+  (define sources
+    (source-paths-for-canonical canonical (ty:type-context-sut ctx)))
+  ;; Repeated mounts may expose the same pinned definition at several paths.
+  ;; Prefer the alias through which this receiver's type/value was already
+  ;; resolved at the current site; otherwise Cairn's canonical traversal gives
+  ;; a deterministic representative of the same winning layer.
+  (define prior (ty:type-context-resolutions ctx))
+  (define preferred
+    (find
+      (lambda (source)
+        (let ((parent (Ifz (Sz source) [] (Init source))))
+          (Truth
+            (find (lambda (resolution)
+                    (And
+                      (Equal (env-span env)
+                        (foil-env:resolution-site resolution))
+                      (Or
+                        (Equal source (foil-env:resolution-path resolution))
+                        (Equal parent
+                          (foil-env:resolution-path resolution)))))
+              prior))))
+      sources))
+  (define source (Ifz preferred (Ifz sources 0 [(_0 sources)]) preferred))
+  (Ifz source
+    ctx
+    (let* ((metadata (sut-unit (ty:type-context-sut ctx)))
+           (environment (metadata-environment metadata))
+           (answer
+             (If environment
+               (foil-env:resolve (_0 source) environment)
+               0)))
+      (If (And answer (foil-env:res-known? answer))
+        (resolve-source-reference ctx env (_0 source))
+        ctx))))
+
+;; record-type-references :: TypeContext -> Env -> TypeSAST -> TypeContext
+;;
+;; This mirrors elab-type-env's accepted grammar.  Type/const binders and
+;; singleton/numeric type literals are lexical or literal forms, not namespace
+;; edges.  `pin` is likewise syntax in the type grammar rather than a lookup.
+(define (record-type-references ctx env wav[tag])
+  (define (record-many ctx0 xs)
+    (foldl (lambda (acc x) (record-type-references acc env x)) ctx0 xs))
+  (define (record-ref ctx0 ref)
+    (define path (surf-ref-path ref))
+    (define name (_0 path))
+    (If (And (Eq 1 (Sz path))
+          (Or (env-has-tvar? name env)
+            (Or (str-numeric? name)
+              (Truth
+                (find (lambda (pair) (Eq name (_0 pair)))
+                  (env-consts env))))))
+      ctx0
+      (resolve-source-reference ctx0 env path)))
+  (cond
+    ((Eq tag "s_ref") (record-ref ctx wav))
+    ((Or (Eq tag "s_trow") (Eq tag "s_row"))
+      (record-many ctx (surf-row-kids wav)))
+    ((Eq tag "s_face")
+      (record-type-references ctx env (surf-face-kid wav)))
+    ((Eq tag "s_union")
+      (record-many ctx (surf-union-opts wav)))
+    ((Eq tag "s_tfun")
+      (record-type-references
+        (record-many ctx (surf-fun-args wav)) env (surf-fun-ret wav)))
+    ((Eq tag "s_tapp")
+      (let* ((items (surf-tapp-kids wav))
+             (head (_0 items))
+             (ctx1
+               (If (And (Eq "s_ref" (_0 head))
+                     (Equal ["pin"] (surf-ref-path head)))
+                 ctx
+                 (If (Eq "s_ref" (_0 head))
+                   (record-ref ctx head)
+                   ctx))))
+        (record-many ctx1 (drop 1 items))))
+    ;; Constructors, singleton symbols, relative variants, and holes do not
+    ;; consult the unit namespace while elaborating a type.
+    (else ctx)))
+
+;; elab-type-context :: TypeContext -> Env -> TypeSAST -> [TypeContext Type]
+(define (elab-type-context ctx env wav)
+  [(record-type-references ctx env wav)
+   (elab-type-env (ty:type-context-sut ctx) env wav)])
+
+;; record-pattern-type-references :: TypeContext -> Env -> PatternSAST
+;;                                -> TypeContext
+;; Bare names in a pattern are binders.  Only faced annotations introduce a
+;; type edge; nested row/variant patterns are walked to find those faces.
+(define (record-pattern-type-references ctx env pat[tag])
+  (define (many ctx0 xs)
+    (foldl
+      (lambda (acc x) (record-pattern-type-references acc env x))
+      ctx0 xs))
+  (cond
+    ((Eq tag "s_face")
+      (record-type-references ctx env (surf-face-kid pat)))
+    ((Eq tag "s_trow") (many ctx (surf-row-kids pat)))
+    ((Eq tag "s_tapp") (many ctx (drop 1 (surf-tapp-kids pat))))
+    (else ctx)))
+
 ;;; Value elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (push-local-env env ty)
@@ -306,9 +537,34 @@
 (define (score-meth obj meth sut)
   (define outer-ty (tc-ty obj))
   (define ty[_ tag nom] (burp-face (tc-ty obj)))
-  ;; A member of an instantiation is the instantiation of the member:
-  ;; the method path rides inside the /ty-ap encoding with the same
-  ;; arguments.
+  ;; member-path :: CanonPath -> CanonPath
+  ;;
+  ;; A namespace may be reopened by an upper unit: the receiver's nominal
+  ;; entry then belongs to one unit while the selected member belongs to
+  ;; another.  Follow each source-visible alias first so the union overlay wins;
+  ;; a same-unit hidden member is the linking fallback when no visible layer
+  ;; reopens it.  This is the linking counterpart to union-mount provenance.
+  (define (member-path base)
+    (define raw (snoc meth base))
+    (define sources (source-paths-for-canonical base sut))
+    (define source
+      (find
+        (lambda (parent)
+          (get-const (canon-path (snoc meth parent) sut) sut))
+        sources))
+    (define selected
+      (Ifz source
+        (let ((hidden? (get-const raw sut)))
+          ;; A sealed unit cannot call an existing method merely because its
+          ;; target unit is present as hidden linking storage: source code must
+          ;; mount the exposing layer.  Absence is different—nominal aliases
+          ;; such as `path = row[quip]` must be allowed to fall through and
+          ;; redispatch on their unfolded representation.
+          (If (And hidden? (metadata-environment (sut-unit sut)))
+            (error ["no source-visible method" ["path" raw] ["method" meth]])
+            (If hidden? raw (canon-path raw sut))))
+        (canon-path (snoc meth (_0 source)) sut)))
+    selected)
   ;; A member of an instantiation is the instantiation of the member —
   ;; but only over the vars the member kept (drop-if-unused): pair the
   ;; parent's declared var names with the ridden args, keep the args
@@ -321,7 +577,7 @@
              ;; Reopened members of builtin types insert rooted while
              ;; the builtin's own path is substrate (unrooted): resolve
              ;; the member path canonically.
-             (mpath (canon-path (snoc meth base) sut)))
+             (mpath (member-path base)))
         (Ifz (get-const mpath sut)
           mpath
           (let* ((param-names
@@ -331,24 +587,30 @@
                  (pnames (param-names (got-type base sut)))
                  (mnames (param-names (tc-ty (got-entry-tc mpath sut))))
                  (kept (filter (lambda (pr) (includes (Eq (_0 pr)) mnames))
-                         (zip pnames (drop 1 parts)))))
-            (Ifz (Sz kept)
-              mpath
-              (ty-ap-encode (Weld [mpath] (map (Ix 1) kept)))))))
-      (canon-path (snoc meth nom) sut)))
+                         (zip pnames (drop 1 parts))))
+                 (selected
+                   (Ifz (Sz kept)
+                     mpath
+                     (ty-ap-encode (Weld [mpath] (map (Ix 1) kept))))))
+            selected)))
+      (member-path nom)))
   ;; Law-valued methods are referenced by name, mirroring elab-ref.
   (define (by-name path tc)
-    (If (Eq "TC_LAM" (Hd tc))
-      (tc-global (tc-ty tc) path)
-      tc))
-  (define (specialize-method tc args)
-    (Ifz args tc
+    [(If (Eq "TC_LAM" (Hd tc))
+       (tc-global (tc-ty tc) path)
+       tc)
+     path])
+  ;; Scored methods carry [TC canonical-path-or-0].  Keeping selection and
+  ;; provenance together avoids a second, subtly different dispatch walk.
+  (define (specialize-method scored args)
+    (define tc (_0 scored))
+    (Ifz args scored
       (Ifz (ty:count-tqua (tc-ty tc))
-        tc
+        scored
         (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
           (If (Eq "TBAD" (_1 typ))
             (error ("cannot specialize method" meth typ))
-            (set-tc-ty typ tc))))))
+            [(set-tc-ty typ tc) (_1 scored)])))))
   (define (row-item-type row)
     (Ifz (ty:trow-vals row)
       ty:TANY
@@ -358,14 +620,14 @@
     (define bsel (canon-path (Weld prefix [meth]) sut))
     (Ifz (get-const bsel sut)
       (error ["no such method" ["path" bsel]])
-      (got-entry-tc bsel sut)))
+      [(got-entry-tc bsel sut) bsel]))
   (define (row-method)
     (specialize-method (builtin-meth ["row"]) [(row-item-type ty)]))
   (define (row-meth row)
     (define faces (ty:collect-faces (ty:trow-vals row)))
     (define hit (find (lambda (arg) (Eq meth (_1 arg))) faces))
     (define (accessor arg)
-      (tc-ffi (ty:TFUN [ty] (_2 arg)) (Ix (_0 arg))))
+      [(tc-ffi (ty:TFUN [ty] (_2 arg)) (Ix (_0 arg))) 0])
     (Ifz hit
       (row-method)
       ;; Anonymous rows (cstr 0) are outside UFCS by design: no face
@@ -585,7 +847,7 @@
           (If (And (ty:is-tfun? b) (Eq (Sz args) (Sz (ty:tfun-args b))))
             b
             0))))
-    (define (param-ty i)
+    (define (param-ty ctx0 i)
       (define a (Ix i args))
       (define (goal-at)
         (Ifz gfun
@@ -596,22 +858,30 @@
       (cond
         ((And (Eq "s_ref" (_0 a)) (Eq 1 (Sz (surf-ref-path a))))
           (If gfun
-            (ty:TFAC (_0 (surf-ref-path a)) (burp-face (goal-at)))
-            (elab-ty a)))
+            [ctx0 (ty:TFAC (_0 (surf-ref-path a)) (burp-face (goal-at)))]
+            (elab-type-context ctx0 env a)))
         ((Eq "s_trow" (_0 a))
-          (relvar-pat-field a (goal-at)))
+          [(record-pattern-type-references ctx0 env a)
+           (relvar-pat-field a (goal-at))])
         ((Eq "s_hole" (_0 a))
-          (ty:TFAC 0 (burp-face (goal-at))))
-        (else (elab-ty a))))
-    (define argty (gen (Sz args) param-ty))
+          [ctx0 (ty:TFAC 0 (burp-face (goal-at)))])
+        (else (elab-type-context ctx0 env a))))
+    (define typed-args
+      (foldl
+        (lambda (st i)
+          (let ((r (param-ty (_0 st) i)))
+            [(_0 r) (snoc (_1 r) (_1 st))]))
+        [ctx []] (gen (Sz args) (lambda (i) i))))
+    (define argty (_1 typed-args))
     (define frame (Weld [(self-ty sut env argty body)] argty))
     (define inner-env (push-locals (clear-env-goal env) frame))
-    (define r (elab-val-context ctx inner-env body))
+    (define r (elab-val-context (_0 typed-args) inner-env body))
     (define val (_1 r))
     [(_0 r) (tc-lam (ty:TFUN argty (tc-ty val)) 0 frame val)])
   (define (elab-cast c[_ ty body])
-    (define want (elab-ty ty))
-    (define r (elab-val-context ctx (set-env-goal want env) body))
+    (define tr (elab-type-context ctx env ty))
+    (define want (_1 tr))
+    (define r (elab-val-context (_0 tr) (set-env-goal want env) body))
     (define ret (_1 r))
     (define nr (ty:type-nests-context (_0 r) want (tc-ty ret)))
     (unless (_1 nr)
@@ -690,6 +960,14 @@
       (elab-error env ["no member named" tag "in the expected type"]
         ["expected" expect "resolving" what])
       (let* ((o (burp-face (_0 hit)))
+             ;; A relative variant is a member-name reference selected from
+             ;; the expected type.  Nominal members have ordinary namespace
+             ;; entries, so retain the same provenance edge as an explicit
+             ;; constructor reference would; structural options have no path.
+             (ctx1
+               (If (Eq "TNOM" (_1 o))
+                 (record-canonical-reference ctx0 env (_2 o))
+                 ctx0))
              (fields
                (If (Eq "TNOM" (_1 o))
                  ;; a legacy TNOM (structural arguments that cannot
@@ -703,7 +981,7 @@
                      (ty:trow-vals m)
                      (elab-error env ["member is not a row type" tag] m)))
                  (ty:trow-vals o)))
-             (sr (ty:mold-to-span-context ctx0 o))
+             (sr (ty:mold-to-span-context ctx1 o))
              (span (burp-face (_1 sr))))
         (unless (Eq "TROW" (_1 span))
           (elab-error env ["member has no runtime constructor" tag] span)
@@ -796,8 +1074,15 @@
   ;; the join of its non-recursive exits (the same trick no-fallthrough
   ;; matches use for their missing heir).
   (define (elab-loop l[_ arms body])
-    (define argty (map (lambda (a) (elab-ty (_1 a))) arms))
-    (define ir (elab-vals-goals ctx env (map (Ix 2) arms) argty))
+    (define typed-arms
+      (foldl
+        (lambda (st arm)
+          (let ((tr (elab-type-context (_0 st) env (_1 arm))))
+            [(_0 tr) (snoc (_1 tr) (_1 st))]))
+        [ctx []] arms))
+    (define argty (_1 typed-arms))
+    (define ir
+      (elab-vals-goals (_0 typed-arms) env (map (Ix 2) arms) argty))
     (define inits (_1 ir))
     (define ret0 (peek-ret-cast sut env body))
     (define ret (If (Equal ty:TBAD ret0) ty:TBOT ret0))
@@ -814,7 +1099,27 @@
       (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
     (define cpairs (ty:cqua-pairs bty0))
     (define nt0 (ty:count-tqua bty0))
-    (define targs (map elab-ty (take nt0 args)))
+    (define typed-targs
+      (foldl
+        (lambda (st arg)
+          (let ((tr (elab-type-context (_0 st) env arg)))
+            [(_0 tr) (snoc (_1 tr) (_1 st))]))
+        [(_0 br) []] (take nt0 args)))
+    (define targs (_1 typed-targs))
+    (define (record-const-arg ctx0 arg)
+      (If (Nil (Eq "s_ref" (_0 arg)))
+        ctx0
+        (let* ((path (surf-ref-path arg))
+               (name (_0 path))
+               (local?
+                 (And (Eq 1 (Sz path))
+                   (Or (str-numeric? name)
+                     (Truth
+                       (find (lambda (pair) (Eq name (_0 pair)))
+                         (env-consts env)))))))
+          (If local? ctx0 (resolve-source-reference ctx0 env path)))))
+    (define spec-ctx
+      (foldl record-const-arg (_0 typed-targs) (drop nt0 args)))
     (define (bad-type? typ)
       (Eq (_1 typ) "TBAD"))
     (define (specialize typ)
@@ -902,7 +1207,7 @@
                     (If (bad-type? typ)
                       (elab-error env "bad specialization" ["got" typ "args" args])
                       (tc-global typ enc))))))))))
-    [(_0 br)
+    [spec-ctx
      (If (Sz cpairs)
        (const-spec)
        (If (Eq "TC_TYP" (Hd base))
@@ -981,18 +1286,23 @@
     ;; diagnostic, never a bare ("bad entry" ...) from the lookup.
     ;; Source paths are root-relative; the canonical (rooted) name is
     ;; what the entry and the global link carry.
-    (define cpath (canon-path path sut))
+    (define ctx1 (resolve-source-reference ctx env path))
+    (define cpath (canon-path path (ty:type-context-sut ctx1)))
     (unless (Nil (get-const cpath sut))
       (let* ((referee (got-entry-tc cpath sut))
              (h (Hd referee)))
-        ;; Value entries (nullary constants) reference by name too:
-        ;; lowering links the referee's FORCED compiled value, giving
-        ;; sharing instead of per-use recomputation.  FFI/type/literal
-        ;; entries stay inline — consumers need their structure and
-        ;; they are cheap.
-        (If (Or (Eq "TC_FFI" h) (Or (Eq "TC_TYP" h) (Eq "TC_LIT" h)))
-          referee
-          (tc-global (tc-ty referee) cpath)))
+        (If (untyped-prototype? referee)
+          (elab-error env
+            "forward reference requires an explicit type annotation"
+            ["path" path])
+          ;; Value entries (nullary constants) reference by name too:
+          ;; lowering links the referee's FORCED compiled value, giving
+          ;; sharing instead of per-use recomputation.  FFI/type/literal
+          ;; entries stay inline — consumers need their structure and
+          ;; they are cheap.
+          (If (Or (Eq "TC_FFI" h) (Or (Eq "TC_TYP" h) (Eq "TC_LIT" h)))
+            [ctx1 referee]
+            [ctx1 (tc-global (tc-ty referee) cpath)])))
       (elab-error env "unbound reference" ["path" path])))
   (define (slot-path path)
     (If (Eq 1 (Sz path)) (_0 path) path))
@@ -1043,8 +1353,8 @@
       (let ((chit (find (lambda (p) (Eq face (_0 p))) (env-consts env))))
         (Ifz chit
           (elab-ref ["s_ref" [face]])
-          (tc-cparam (_1 (_0 chit)) face)))
-      (on-var face (_0 found))))
+          [ctx (tc-cparam (_1 (_0 chit)) face)]))
+      [ctx (on-var face (_0 found))]))
   ;; A literal knows its value: TNAT with the constant cube (0 stays
   ;; the whole nat span — the one ambiguous literal).
   (define (elab-lit l[_ val])
@@ -1067,10 +1377,10 @@
     ;; A typed binding's declared type is elaborated before its value
     ;; so the value checks against it (the goal); the binding's
     ;; nests-check keeps the diagnostics.
-    (define (pat-goal env1 pat)
+    (define (pat-goal ctx0 env1 pat)
       (If (Eq "s_face" (_0 pat))
-        (elab-type-env sut env1 (surf-face-kid pat))
-        0))
+        (elab-type-context ctx0 env1 (surf-face-kid pat))
+        [(record-pattern-type-references ctx0 env1 pat) 0]))
     (define (bind-ty ctx0 env1 pat want val-tc)
       (define tag (_0 pat))
       (cond
@@ -1091,8 +1401,9 @@
         (else
           (elab-error env1 "unsupported local binding pattern" pat))))
     (define (step acc[ctx1 env1 binds] arm[_ pat val])
-      (define want (pat-goal env1 pat))
-      (define vr (elab-val-context ctx1 (set-env-goal want env1) val))
+      (define gr (pat-goal ctx1 env1 pat))
+      (define want (_1 gr))
+      (define vr (elab-val-context (_0 gr) (set-env-goal want env1) val))
       (define val-tc (_1 vr))
       (define br (bind-ty (_0 vr) env1 pat want val-tc))
       [(_0 br) (push-local-env env1 (_1 br)) (snoc val-tc binds)])
@@ -1107,7 +1418,13 @@
   ;; generic method with lambda arguments, the receiver's (known) type
   ;; joins the inference as the trailing implicit argument.
   (define (elab-meth-step st[ctx0 rcvr] seg)
-    (define f (score-meth rcvr (surf-mseg-name seg) sut))
+    (define method-name (surf-mseg-name seg))
+    (define scored (score-meth rcvr method-name sut))
+    (define f (_0 scored))
+    (define ctx1
+      (Ifz (_1 scored)
+        ctx0
+        (record-canonical-reference ctx0 env (_1 scored))))
     (define margs (surf-mseg-args seg))
     (define goals
       (let ((g (fun-arg-goals (tc-ty f) (Inc (Sz margs)))))
@@ -1117,9 +1434,9 @@
         (And (has-quas? (tc-ty f)) (any-lam? margs))))
     (define ar
       (If two?
-        (elab-vals-two-phase ctx0 env (burp-face (tc-ty f)) margs
+        (elab-vals-two-phase ctx1 env (burp-face (tc-ty f)) margs
           [(burp-face (tc-ty rcvr))])
-        (elab-vals-goals ctx0 env margs goals)))
+        (elab-vals-goals ctx1 env margs goals)))
     (define f2
       (If (And two? (Truth (Ix 2 ar)))
         (set-tc-ty (Ix 2 ar) f)
@@ -1137,7 +1454,7 @@
     (define hr
       (If (IsApp head)
         (elab-val-context ctx (clear-env-goal env) head)
-        [ctx (elab-var [0 head])]))
+        (elab-var [0 head])))
     (elab-meth-go hr (drop 1 els)))
   ;; ["key" cstr arity kids] — kids all 0 for a flat pattern (no
   ;; nested constraints); pat-deep fills them for nested variants.
@@ -1172,7 +1489,8 @@
       ((And (Eq "s_ref" (_0 argp)) (Eq 1 (Sz (surf-ref-path argp))))
         [ctx0 (ty:TFAC (_0 (surf-ref-path argp)) fm) 0])
       ((Eq "s_face" (_0 argp))
-        [ctx0 (ty:TFAC (surf-face-name argp) (elab-ty (surf-face-kid argp))) 0])
+        (let ((tr (elab-type-context ctx0 env (surf-face-kid argp))))
+          [(_0 tr) (ty:TFAC (surf-face-name argp) (_1 tr)) 0]))
       ((relvar-pat? argp)
         (let* ((bare? (Eq "s_relvar" (_0 argp)))
                (tag (If bare? (_1 argp) (_1 (_0 (surf-tapp-kids argp)))))
@@ -1212,9 +1530,10 @@
               ["field" fm "pattern" argp]))))
       (else (elab-error env "unsupported pattern element" argp))))
   (define (elab-arm-classic scr-ty st[ctx infos] a[_ pat val])
-    (define pat-ty (elab-ty pat))
+    (define ptr (elab-type-context ctx env pat))
+    (define pat-ty (_1 ptr))
     (define met
-      (ty:type-meet-context ctx scr-ty pat-ty))
+      (ty:type-meet-context (_0 ptr) scr-ty pat-ty))
     (define ctx1 (_0 met))
     (define narrowed (_1 met))
     (define ty (_0 narrowed))
@@ -1398,10 +1717,15 @@
   ;; env — they may mention sibling tvars), make the names visible to
   ;; the body, and keep only the params the result uses.
   (define (elab-cvars t[_ consts body])
-    (define pairs
-      (map (lambda (c[name tysast]) [name (elab-ty tysast)]) consts))
+    (define typed-consts
+      (foldl
+        (lambda (st c[name tysast])
+          (let ((tr (elab-type-context (_0 st) env tysast)))
+            [(_0 tr) (snoc [name (_1 tr)] (_1 st))]))
+        [ctx []] consts))
+    (define pairs (_1 typed-consts))
     (define env1 (set-env-consts (Weld pairs (env-consts env)) env))
-    (define r (elab-val-context ctx env1 body))
+    (define r (elab-val-context (_0 typed-consts) env1 body))
     (define tc (_1 r))
     (define typ0
       (If (Eq "TC_TYP" (Hd tc)) (_2 (tc-typ-inner tc)) (tc-ty tc)))
@@ -1422,8 +1746,8 @@
     ((tag-is "s_relvar") (elab-relvar-call ctx (_1 surf) []))
     ((tag-is "s_app") (elab-call surf))
     ((tag-is "s_spec") (elab-spec surf))
-    ((tag-is "s_ref") [ctx (elab-ref surf)])
-    ((tag-is "s_var") [ctx (elab-var surf)])
+    ((tag-is "s_ref") (elab-ref surf))
+    ((tag-is "s_var") (elab-var surf))
     ((tag-is "s_case") (elab-case surf))
     ((tag-is "s_if") (elab-if surf))
     ((tag-is "s_span")
@@ -1443,10 +1767,11 @@
        (tag-is "s_trow")
        (tag-is "s_tfun")
        (tag-is "s_union"))
-       ;; Every type-valued elaboration is normalized to TTYP so the
-       ;; declaration path stores the type itself, not (say) a TFUN
-       ;; whose _2 slot is its arity.
-       [ctx (tc-typ (as-ttyp (elab-ty surf)))])
+      ;; Every type-valued elaboration is normalized to TTYP so the
+      ;; declaration path stores the type itself, not (say) a TFUN
+      ;; whose _2 slot is its arity.
+       (let ((tr (elab-type-context ctx env surf)))
+         [(_0 tr) (tc-typ (as-ttyp (_1 tr)))]))
     (else (elab-error env "unimplemented surface form" surf))))
 
 ;; Public compatibility wrapper: the context and its memo tables are internal;
@@ -1513,6 +1838,139 @@
     (If (Eq (Hd tc) "TC_TYP")
       (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
       (insert-tc name span tc sut)))
+
+  ;; prototype-tc : Subject -> Env -> SAST -> TC
+  ;; Derive the part of a declaration's type that is visible without
+  ;; elaborating its body.  Keeping this deliberately signature-only is what
+  ;; makes the predeclaration pass a seal rather than an order-sensitive first
+  ;; elaboration.  A declaration with no explicit usable signature gets TANY;
+  ;; referencing that placeholder as a function still fails at the reference
+  ;; site's enclosing span when type-apply runs.
+  (define (prototype-tc psut env body[tag])
+    (define (recur env1 body1) (prototype-tc psut env1 body1))
+    (define (wrap-vars vars tc)
+      (If (Eq "TC_TYP" (Hd tc))
+        (let ((inner (_2 (tc-typ-inner tc))))
+          (tc-typ (ty:TTYP (wrap-tquas vars inner))))
+        (set-tc-ty (wrap-tquas vars (tc-ty tc)) tc)))
+    (define (wrap-consts pairs tc)
+      (If (Eq "TC_TYP" (Hd tc))
+        (let ((inner (_2 (tc-typ-inner tc))))
+          (tc-typ (ty:TTYP (ty:wrap-tcquas pairs inner))))
+        (set-tc-ty (ty:wrap-tcquas pairs (tc-ty tc)) tc)))
+    (cond
+      ((Eq tag "s_span")
+        (recur (set-env-span (_1 body) env) (_2 body)))
+      ((Eq tag "s_tvars")
+        (let* ((vars (_1 body))
+               (env1 (push-env-tvars vars env)))
+          (wrap-vars vars (recur env1 (_2 body)))))
+      ((Eq tag "s_cvars")
+        (let* ((pairs
+                 (map (lambda (c[name tysast])
+                        [name (elab-type-env psut env tysast)])
+                   (_1 body)))
+               (env1 (set-env-consts (Weld pairs (env-consts env)) env)))
+          (wrap-consts pairs (recur env1 (_2 body)))))
+      ((Eq tag "s_fun")
+        (let* ((args (map (elab-type-env psut env) (surf-fun-args body)))
+               (ret (peek-ret-cast psut env (surf-fun-ret body))))
+          ;; A forward call needs the declared return type.  Publishing a
+          ;; guessed TFUN here would let genuinely recursive untyped code pass
+          ;; through TANY; publishing TANY makes that call a located error.
+          (If (Equal ty:TBAD ret)
+            (untyped-prototype 0)
+            (tc-const (ty:TFUN args ret) 0))))
+      ((Eq tag "s_cast")
+        (tc-const (elab-type-env psut env (surf-cast-ty body)) 0))
+      ((Or (Eq tag "s_trow") (Or (Eq tag "s_tfun") (Eq tag "s_union")))
+        (tc-typ (as-ttyp (elab-type-env psut env body))))
+      (else (untyped-prototype 0))))
+
+  ;; type-prototype-form? : SAST -> Bool
+  ;; The placeholder pass must expose type declarations as TC_TYP entries so
+  ;; later prototype signatures can specialize them before any body runs.
+  (define (type-prototype-form? body[tag])
+    (cond
+      ((Eq tag "s_span") (type-prototype-form? (_2 body)))
+      ((Or (Eq tag "s_tvars") (Eq tag "s_cvars"))
+        (type-prototype-form? (_2 body)))
+      (else (Or (Eq tag "s_trow")
+              (Or (Eq tag "s_tfun") (Eq tag "s_union"))))))
+
+  ;; predeclare-module : Subject -> [SAST] -> Subject
+  ;; Insert every declaration path first, then refine signatures to a small
+  ;; fixed point.  Paths, not source position, determine insertion order, so
+  ;; replacing prototypes with actual entries cannot perturb subject-order.
+  (define (predeclare-module base rows)
+    (define decls
+      (sort (lambda (a b) (cmp-total (_1 a) (_1 b)))
+        (filter (lambda (r) (And (IsApp r) (Eq "s_decl" (_0 r)))) rows)))
+    (define (placeholder acc ent[_ name0 span body])
+      (define name (root-path acc name0))
+      (If (type-prototype-form? body)
+        (ty:insert-typ name span ty:TANY acc)
+        (insert-tc name span (untyped-prototype 0) acc)))
+    (define seeded (foldl placeholder base decls))
+    (define (refine acc ent[_ name0 span body])
+      (define name (root-path acc name0))
+      ;; Prototype inference is best-effort.  Malformed annotations are still
+      ;; diagnosed by the ordinary per-declaration elaboration pass; they must
+      ;; not prevent unrelated declarations from seeing the sealed path set.
+      (define pr
+        (Try (lambda (z)
+               (let ((tc (prototype-tc acc (set-env-name name empty-env) body)))
+                 (DeepSeq tc tc)))
+          0))
+      (define tc (If (Eq 1 (Hd pr)) (untyped-prototype 0) (_0 pr)))
+      (define acc1 (insert-elab-tc name span tc acc))
+      (define gen? (can-gen-accessors? tc))
+      (Ifz gen? acc1
+        (gen-accessors name (_0 gen?) (_1 gen?) (_2 gen?) acc1)))
+    ;; A chain of signatures may mention a generic declared later in canonical
+    ;; order.  N refinements suffice for an N-node dependency chain; replacement
+    ;; is idempotent once the prototypes stabilize.
+    (define (settle n acc)
+      (Ifz n acc (settle (Dec n) (foldl refine acc decls))))
+    (define sealed (settle (max 1 (Sz decls)) seeded))
+    ;; Prototype refinement also creates public row accessors.  They are
+    ;; derived declarations of this unit: make them source-visible in the same
+    ;; sealed world, with the original own-layer provenance, without adding
+    ;; them to the source layer or its unit identity.
+    (define environment (metadata-environment (sut-unit sealed)))
+    (Ifz environment
+      sealed
+      (let* ((root (sut-root sealed))
+             (local-path
+               (lambda (key)
+                 (If (foil-env:path-prefix? root key)
+                   (drop (Sz root) key)
+                   key)))
+             (derived
+               (filter
+                 (lambda (pair)
+                   (foil-env:res-unknown?
+                     (foil-env:resolve (local-path (_0 pair)) environment)))
+                 (subject-entry-delta base sealed))))
+        (Ifz derived
+          sealed
+          (let* ((layer
+                   (foil-env:make-layer ["derived-own"]
+                     (map
+                       (lambda (pair)
+                         (let ((key (_0 pair)))
+                           [(local-path key)
+                            (foil-env:note-make (_1 pair)
+                              (get-span key sealed))]))
+                       derived)))
+                 (environment1
+                   (foil-env:extend-own-derived layer environment))
+                 (sealed1 (set-metadata-environment environment1 sealed)))
+            (foldl
+              (lambda (acc pair)
+                (let ((key (_0 pair)))
+                  (mark-visible (root-path acc (local-path key)) key acc)))
+              sealed1 derived))))))
   ;; Each declaration elaborates under its own Try, so one failure does
   ;; not hide the next decl's: the error is collected, a TC_MEAN poison
   ;; entry stands in (referees of the failed decl fail their own Try),
@@ -1598,15 +2056,16 @@
       (profile-zone:force-zone "foil.elab.unsupported-scan" diags0)
       diags0))
   (Ifz (Sz diags)
-    (let ((r (foldl elab-entry
-               [sut [] (If profiled?
-                         (ty:make-profile-type-context sut)
-                         (ty:make-type-context sut))]
+    (let* ((sealed (predeclare-module sut mod))
+           (r (foldl elab-entry
+               [sealed [] (If profiled?
+                            (ty:make-profile-type-context sealed)
+                            (ty:make-type-context sealed))]
                mod)))
       (Ifz (Sz (_1 r))
         (let ((wf-diags (foldl (wf-entry (_0 r)) [] mod)))
           (Ifz (Sz wf-diags)
-            (_0 r)
+            (retain-context-resolutions (_0 r) (_2 r))
             (error ["foil-type-wf" wf-diags])))
         (error ["foil-elab-errors" (_1 r)])))
     (error ["foil-unsupported" diags])))

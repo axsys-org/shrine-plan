@@ -757,14 +757,91 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
 
 (define (parse-module-sast here val)
   (define span (rx-span val))
-  ;; - imports the named modules; the mount is the path the rune
-  ;; appears under ([] at module top level).
+  ;; Import options use the same faced-row spelling as Foil values/types:
+  ;;
+  ;;   - sept [order=10]       root union with explicit precedence
+  ;;   - vec  [at=deps/vec]    prefix mount
+  ;;
+  ;; A singleton faced bracket absorbs its `=` rune during Rex
+  ;; normalization, while a multi-option bracket contains one clear `=` nest
+  ;; per option.  Normalize both shapes before validating the fields.
+  (define (import-options? x)
+    (And (rx-nest? x) (Eq "brack" (rx-nest-color x))))
+
+  (define (parse-import-at ctx x)
+    (cond
+      ((rx-word? x) [(rx-word-str! x)])
+      ((And (rx-nest? x)
+         (And (Eq "brack" (rx-nest-color x))
+           (And (Eq "" (rx-nest-rune x)) (Ifz (Sz (rx-nest-kids x)) 1 0))))
+        [])
+      ((rx-rune? "/" x)
+        (let ((kids (hr-stem (rx-rune-kids x))))
+          (unless (And (Sz kids) (all rx-word? kids))
+            (sast-error-at x "bad import at path" ctx)
+            (map rx-word-str! kids))))
+      (else (sast-error-at x "bad import at path" ctx))))
+
+  (define (import-option-items opts)
+    (cond
+      ((Eq "" (rx-nest-rune opts)) (hr-stem (rx-nest-kids opts)))
+      ((Eq "=" (rx-nest-rune opts))
+        [["nest" (rx-span opts) "clear" "=" (rx-nest-kids opts)]])
+      (else (sast-error-at opts "bad import options" opts))))
+
+  ;; -> [at maybe-order], where maybe-order is 0 when absent and [n]
+  ;; when explicit.  The wrapper distinguishes explicit order zero from no
+  ;; order at all.
+  (define (parse-import-options inherited imp opts)
+    ;; state: [has-at at has-order order]
+    (define (step st item)
+      (unless (rx-rune? "=" item)
+        (sast-error-at item "bad import option" item)
+        (let ((kids (hr-stem (rx-rune-kids item))))
+          (unless (And (Eq 2 (Sz kids)) (rx-word? (_0 kids)))
+            (sast-error-at item "bad import option" item)
+            (let ((key (rx-word-str! (_0 kids)))
+                  (arg (_1 kids)))
+              (cond
+                ((Eq "at" key)
+                  (unless (Nil (_0 st))
+                    (sast-error-at item "duplicate import option" key)
+                    [1 (parse-import-at imp arg) (_2 st) (_3 st)]))
+                ((Eq "order" key)
+                  (unless (Nil (_2 st))
+                    (sast-error-at item "duplicate import option" key)
+                    (unless (And (rx-word? arg)
+                              (str-numeric? (rx-word-str! arg)))
+                      (sast-error-at arg "bad import order (expected nat)" arg)
+                      [(_0 st) (_1 st) 1 (parse-nat (rx-word-str! arg))])))
+                (else (sast-error-at item "unknown import option" key))))))))
+    (define parsed
+      (foldl step [0 inherited 0 0] (import-option-items opts)))
+    (define at (_1 parsed))
+    (define order (Ifz (_2 parsed) 0 [(_3 parsed)]))
+    (unless (Nil (And order (Sz at)))
+      (sast-error-at opts "import order is only valid for a root union" opts)
+      [at order]))
+
+  ;; `-` imports each bare module word.  An option row makes the declaration
+  ;; singular; old `- alpha beta` and nested `+ app / - vec` remain valid.
   (define (on-import here imp)
     (define (one w)
       (unless (rx-word? w)
         (sast-error "bad import (expected module names)" imp)
         (surf-import here (rx-span imp) (rx-word-str! w))))
-    (map one (hr-stem (rx-rune-kids imp))))
+    (define items (hr-stem (rx-rune-kids imp)))
+    (define opts (filter import-options? items))
+    (Ifz (Sz opts)
+      (map one items)
+      (unless (And (Eq 1 (Sz opts))
+                (And (Eq 2 (Sz items))
+                  (And (rx-word? (_0 items))
+                    (import-options? (_1 items)))))
+        (sast-error-at imp "bad import (options require exactly one module)" imp)
+        (let ((parsed (parse-import-options here imp (_1 items))))
+          [(surf-import-at-order (_0 parsed) (rx-span imp)
+             (rx-word-str! (_0 items)) (_1 parsed))]))))
 
   ; A namespace module is either a flat stack of decls, a single decl, or a value.
   ;; Each decl parses under its own Try (deep-forced — the rows are

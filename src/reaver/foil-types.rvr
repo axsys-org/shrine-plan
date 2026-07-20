@@ -242,7 +242,16 @@
 
 (define (name-row-span name span[_ tag])
   (If (Eq tag "TROW")
-    (TROW (print-path name) (trow-vals span))
+    ;; Storage identity is unit-qualified, but imported runtime row values were
+    ;; already lowered with their declaration-local brand.  Static TNOM edges
+    ;; retain the unit pin; only the erased constructor uses the local path so
+    ;; matches and constructors agree across a mount.
+    (TROW
+      (print-path
+        (If (unit-qualified-path? name)
+          (unit-qualified-path-local name)
+          name))
+      (trow-vals span))
     span))
 
 ;; The arity of a generic: TQUA binders wrapping the type (skipping
@@ -351,15 +360,28 @@
 ;;; top-level TNOM expansion is cached: recursive expansions depend on their
 ;;; seen cut and deliberately continue through mold-to-span-seen directly.
 
+;; A phase-local context also carries the resolved source edges accumulated by
+;; elaboration.  Keeping that row here reuses the context threading already
+;; required by type expansion and subtyping instead of introducing a second
+;; state-passing protocol through every value form.
 (define (make-type-context sut)
-  ["TYCTX" sut 0 cairn:empty-ax [] 0])
+  ["TYCTX" sut 0 cairn:empty-ax [] 0 []])
 (define (make-profile-type-context sut)
-  ["TYCTX" sut 0 cairn:empty-ax [] 1])
+  ["TYCTX" sut 0 cairn:empty-ax [] 1 []])
 (define type-context-sut (Ix 1))
 (define type-context-generation (Ix 2))
 (define type-context-expansions (Ix 3))
 (define type-context-nests (Ix 4))
 (define type-context-profiled? (Ix 5))
+;; type-context-resolutions :: TypeContext -> Row Resolution
+(define (type-context-resolutions ctx)
+  (If (Gt (Sz ctx) 6) (Ix 6 ctx) []))
+;; type-context-record-resolution :: Resolution -> TypeContext -> TypeContext
+(define (type-context-record-resolution resolution ctx)
+  (define prior (type-context-resolutions ctx))
+  (If (includes (Equal resolution) prior)
+    ctx
+    (Up 6 (snoc resolution prior) ctx)))
 
 (define (profile-type-context-result ctx label result)
   (If (type-context-profiled? ctx)
@@ -369,7 +391,8 @@
 (define (type-context-with-subject ctx sut type-env-changed?)
   (If type-env-changed?
     ["TYCTX" sut (Inc (type-context-generation ctx))
-     cairn:empty-ax [] (type-context-profiled? ctx)]
+     cairn:empty-ax [] (type-context-profiled? ctx)
+     (type-context-resolutions ctx)]
     (snap 1 (lambda (z) sut) ctx)))
 
 (define (mold-to-span-context ctx ty[_ tag])
@@ -1306,6 +1329,55 @@
 (define (type-fits sut ty val)
   (type-fits-span sut (mold-to-span sut ty) val))
 
+;;; Shallow runtime fit checks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Typed Reaver uses these at an untyped/typed boundary.  Unlike type-fits,
+;; this checks only the outer constructor of a value: it never walks row
+;; elements or wraps a nested function.  Nominals expand only far enough to
+;; discover that outer constructor.
+
+(define (type-shape-fits-span sut ty[_ tag] val)
+  (define (tag-is x) (Eq x tag))
+  (define recur (type-shape-fits-span sut))
+  (define (law-like? x)
+    (Or (IsLaw x)
+      (And (IsPin x) (IsLaw (Unpin x)))))
+  (define (row-shape cstr tys)
+    (cond
+      ((And (Eq 0 (Sz tys)) (Eq cstr val)) 0)
+      ((Nil (IsApp val)) (fits-err "not row"))
+      ((Ne cstr (Hd val)) (fits-err "bad type constructor"))
+      ((Ne (Sz tys) (Sz val)) (fits-err "bad row size"))
+      (else 0)))
+  (cond
+    ((tag-is "TANY") 0)
+    ((tag-is "TVAR") 0)
+    ((tag-is "TBOT") (fits-err "nothing fits bottom"))
+    ((tag-is "TBAD") (fits-err "invalid expected type"))
+    ((tag-is "TNAT") (If (IsNat val) 0 (fits-err "not nat")))
+    ((tag-is "TFUN") (If (law-like? val) 0 (fits-err "not law")))
+    ((tag-is "TPIN") (If (IsPin val) 0 (fits-err "not pin")))
+    ((tag-is "TARR") (If (is-row? val) 0 (fits-err "not row")))
+    ((tag-is "TROW") (row-shape (trow-cstr ty) (trow-vals ty)))
+    ((tag-is "TSUM")
+      (foldl fits-or (fits-err "fell through sum")
+        (map (lambda (opt) (recur opt val)) (tsum-opts ty))))
+    ((tag-is "TNOM") (recur (mold-to-span sut ty) val))
+    ((tag-is "TFAC") (recur (tfac-val ty) val))
+    ((tag-is "TSELF") (recur (tself-val ty) val))
+    ((tag-is "TQUA") (recur (_3 ty) val))
+    ((tag-is "TCQUA") (recur (_4 ty) val))
+    ((tag-is "TTYP") (recur (_2 ty) val))
+    ((tag-is "TPAIL")
+      (If (Or (And (IsApp val) (branded-cstr? (Hd val)))
+            (And (IsNat val) (branded-cstr? val)))
+        0
+        (fits-err "not a pail (unbranded head)")))
+    (else (fits-err ["shape-check uimpl" tag]))))
+
+(define (type-shape-fits sut typ val)
+  (type-shape-fits-span sut (mold-to-span sut typ) val))
+
 ;;; Subject insertion and type AST conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define tc-poison
@@ -1361,6 +1433,8 @@
  make-profile-type-context
  type-context-sut
  type-context-generation
+ type-context-resolutions
+ type-context-record-resolution
  type-context-with-subject
  mold-to-span-context
  span-to-mold
@@ -1372,6 +1446,7 @@
  type-meet-expanded
  type-meet-context
  type-fits
+ type-shape-fits
  type-nests?
  type-nests-context
  insert-typ

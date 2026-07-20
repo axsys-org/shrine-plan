@@ -1,0 +1,336 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind env (#module foil-env))
+
+;; sp :: Nat -> Span
+(define (sp line) [line 1 line 1])
+
+;; empty-layer :: Data -> Layer
+(define (empty-layer label) (env:make-layer label []))
+
+;;; Same-layer normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define dominated
+  (env:make-layer "dominated"
+    [[[] (env:note-cull (sp 1))]
+     [["x"] (env:note-make "unreachable" (sp 2))]
+     [["x" "kid"] (env:note-make "also-unreachable" (sp 3))]]))
+
+assert(Eq 1 (Sz (env:layer-entries dominated)))
+assert(env:note-cull? (env:layer-get [] dominated))
+
+(define duplicate-error
+  (Try (lambda (z)
+    (env:make-layer "duplicate"
+      [[["x"] (env:note-make 1 (sp 1))]
+       [["x"] (env:note-cull (sp 2))]])) 0))
+assert(Eq 1 (Hd duplicate-error))
+assert(Eq "foil-env-duplicate-layer-path" (_0 (_0 duplicate-error)))
+
+(define poke-error
+  (Try (lambda (z)
+    (env:make-layer "poke"
+      [[["x"] (env:note-poke 2 (sp 1))]])) 0))
+assert(Eq 1 (Hd poke-error))
+assert(Eq "foil-env-reserved-poke" (_0 (_0 poke-error)))
+
+;;; Whiteout, descendant null, unknown, and revival ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define base
+  (env:make-layer "base"
+    [[["x"] (env:note-make "base-x" (sp 1))]
+     [["x" "kid"] (env:note-make "base-kid" (sp 2))]
+     [["keep"] (env:note-make "kept" (sp 3))]]))
+
+(define whiteout
+  (env:make-layer "whiteout"
+    [[["x"] (env:note-cull (sp 4))]]))
+
+(define white-env
+  (env:build-environment
+    [(env:make-mount base [] (env:explicit-mount-order 0) (sp 10))]
+    whiteout))
+
+(define white-x (env:resolve ["x"] white-env))
+(define white-kid (env:resolve ["x" "kid"] white-env))
+(define white-missing (env:resolve ["never"] white-env))
+assert(env:res-null? white-x)
+assert(env:res-null? white-kid)
+assert(Eq "whiteout" (env:from-label (env:res-from white-kid)))
+assert(env:res-unknown? white-missing)
+assert(env:res-known? (env:resolve ["keep"] white-env))
+
+(define revived
+  (env:extend-environment
+    (env:make-layer "revival"
+      [[["x"] (env:note-make "alive-again" (sp 5))]])
+    white-env))
+
+assert(env:res-known? (env:resolve ["x"] revived))
+assert(Eq "alive-again" (env:res-value (env:resolve ["x"] revived)))
+assert(Eq "revival" (env:from-label (env:res-from (env:resolve ["x"] revived))))
+assert(env:res-null? (env:resolve ["x"] white-env))
+
+;;; Prefix mounts graft without leaking at root ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define prefixed
+  (env:build-environment
+    [(env:make-mount base ["sept"] env:no-mount-order (sp 20))]
+    (empty-layer "prefix-user")))
+
+assert(env:res-known? (env:resolve ["sept" "x"] prefixed))
+assert(Eq "base-x" (env:res-value (env:resolve ["sept" "x"] prefixed)))
+assert(env:res-unknown? (env:resolve ["x"] prefixed))
+
+(define overlap-error
+  (Try (lambda (z)
+    (env:build-environment
+      [(env:make-mount base ["a"] env:no-mount-order (sp 21))
+       (env:make-mount whiteout ["a" "b"] env:no-mount-order (sp 22))]
+      (empty-layer "overlap-user"))) 0))
+assert(Eq 1 (Hd overlap-error))
+assert(Eq "foil-env-overlapping-prefix-mount" (_0 (_0 overlap-error)))
+
+;; A root layer can already occupy a path later used as a mount point.  The
+;; prefix still wins, but that import/import occlusion must remain observable.
+(define mixed-root
+  (env:make-layer "mixed-root"
+    [[["nest" "x"] (env:note-make "root-x" (sp 23))]]))
+(define mixed-prefix
+  (env:make-layer "mixed-prefix"
+    [[["x"] (env:note-make "prefix-x" (sp 24))]]))
+(define mixed-env
+  (env:build-environment
+    [(env:make-mount mixed-root [] env:no-mount-order (sp 25))
+     (env:make-mount mixed-prefix ["nest"] env:no-mount-order (sp 26))]
+    (empty-layer "mixed-user")))
+assert(Eq "prefix-x" (env:res-value (env:resolve ["nest" "x"] mixed-env)))
+assert(Eq 1 (Sz (env:environment-warnings mixed-env)))
+assert(Equal ["nest" "x"]
+  (env:warning-path (_0 (env:environment-warnings mixed-env))))
+
+;; Mount constructors reject malformed public data before positional accessors
+;; can turn it into an unrelated low-level failure.
+(define malformed-order
+  (Try (lambda (z) (env:explicit-mount-order [1 2])) 0))
+assert(Eq 1 (Hd malformed-order))
+assert(Eq "foil-env-malformed-mount-order" (_0 (_0 malformed-order)))
+(define malformed-path
+  (Try (lambda (z)
+         (env:make-mount base 42 env:no-mount-order (sp 27)))
+    0))
+assert(Eq 1 (Hd malformed-path))
+assert(Eq "foil-env-malformed-mount" (_0 (_0 malformed-path)))
+(define malformed-order-shape
+  (Try (lambda (z)
+         (env:make-mount base [] (Pin "bad-order") (sp 28)))
+    0))
+assert(Eq 1 (Hd malformed-order-shape))
+assert(Eq "foil-env-malformed-mount" (_0 (_0 malformed-order-shape)))
+
+;;; Root-union ordering, warnings, and own shadowing ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define low
+  (env:make-layer "low"
+    [[["equal"] (env:note-make "low-equal" (sp 30))]]))
+(define high
+  (env:make-layer "high"
+    [[["equal"] (env:note-make "high-equal" (sp 31))]]))
+(define local
+  (env:make-layer "local"
+    [[["local"] (env:note-make "mine" (sp 32))]]))
+
+(define low-mount
+  (env:make-mount low [] (env:explicit-mount-order 10) (sp 40)))
+(define high-mount
+  (env:make-mount high [] (env:explicit-mount-order 20) (sp 41)))
+
+;; Input mount-line order is not semantic: explicit order seals the stack.
+(define ordered-a (env:build-environment [high-mount low-mount] local))
+(define ordered-b (env:build-environment [low-mount high-mount] local))
+assert(Eq "high-equal" (env:res-value (env:resolve ["equal"] ordered-a)))
+assert(Equal (env:environment-identity ordered-a)
+  (env:environment-identity ordered-b))
+assert(Eq 1 (Sz (env:environment-warnings ordered-a)))
+(define collision (_0 (env:environment-warnings ordered-a)))
+assert(Eq "foil-env-import-occlusion" (env:warning-tag collision))
+assert(Equal ["equal"] (env:warning-path collision))
+assert(Eq "low" (env:from-label (env:warning-occluded-from collision)))
+assert(Eq "high" (env:from-label (env:warning-winning-from collision)))
+
+(define unordered-error
+  (Try (lambda (z)
+    (env:build-environment
+      [(env:make-mount low [] env:no-mount-order (sp 42))
+       (env:make-mount high [] env:no-mount-order (sp 43))]
+      local)) 0))
+assert(Eq 1 (Hd unordered-error))
+assert(Eq "foil-env-unordered-root-union" (_0 (_0 unordered-error)))
+
+(define duplicate-order-error
+  (Try (lambda (z)
+    (env:build-environment
+      [(env:make-mount low [] (env:explicit-mount-order 7) (sp 44))
+       (env:make-mount high [] (env:explicit-mount-order 7) (sp 45))]
+      local)) 0))
+assert(Eq 1 (Hd duplicate-order-error))
+assert(Eq "foil-env-duplicate-root-order" (_0 (_0 duplicate-order-error)))
+
+(define own-shadow
+  (env:build-environment
+    [(env:make-mount low [] env:no-mount-order (sp 46))]
+    (env:make-layer "own-shadow"
+      [[["equal"] (env:note-make "own-equal" (sp 47))]])))
+assert(Eq "own-equal" (env:res-value (env:resolve ["equal"] own-shadow)))
+assert(Eq 0 (Sz (env:environment-warnings own-shadow)))
+assert(env:from-own? (env:res-from (env:resolve ["equal"] own-shadow)))
+
+;;; Provenance recording and replay ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define with-own
+  (env:extend-environment
+    (env:make-layer "latest"
+      [[["equal"] (env:note-make "latest-equal" (sp 50))]])
+    ordered-a))
+
+(define recorded-pair
+  (env:resolve-record (sp 99) ["equal"] with-own))
+(define recorded-env (_0 recorded-pair))
+(define recorded-res (_1 recorded-pair))
+assert(env:res-known? recorded-res)
+assert(Eq 1 (Sz (env:environment-resolutions recorded-env)))
+(define resolution (_0 (env:environment-resolutions recorded-env)))
+assert(Equal (sp 99) (env:resolution-site resolution))
+assert(Equal ["equal"] (env:resolution-path resolution))
+assert(Eq "latest" (env:from-label (env:resolution-from resolution)))
+
+(define history (env:replay ["equal"] with-own))
+assert(Eq 3 (Sz history))
+assert(Eq "latest-equal" (env:res-value (_0 history)))
+assert(Eq "high-equal" (env:res-value (_1 history)))
+assert(Eq "low-equal" (env:res-value (_2 history)))
+
+;;; Canonical identity and immutable interactive extension ;;;;;;;;;;;;;;;;;;;;;
+
+(define base-reordered
+  (env:make-layer "different-debug-label"
+    [[["keep"] (env:note-make "kept" (sp 300))]
+     [["x" "kid"] (env:note-make "base-kid" (sp 200))]
+     [["x"] (env:note-make "base-x" (sp 100))]]))
+
+assert(IsPin (env:layer-identity base))
+assert(Equal (env:layer-identity base) (env:layer-identity base-reordered))
+assert(IsPin (env:merged-identity ordered-a))
+assert(IsPin (env:environment-identity ordered-a))
+
+(define imported-unit-ref (Pin ["unit-ref" 1]))
+(define imported-view (env:layer-with-ref imported-unit-ref base))
+assert(Equal imported-unit-ref (env:layer-ref imported-view))
+assert(Equal (env:layer-identity base) (env:layer-identity imported-view))
+(define imported-view-env
+  (env:build-environment
+    [(env:make-mount imported-view ["view"] env:no-mount-order (sp 301))]
+    (empty-layer "view-user")))
+assert(Equal imported-unit-ref
+  (env:from-ref (env:res-from (env:resolve ["view" "x"] imported-view-env))))
+
+(define old-value (env:res-value (env:resolve ["equal"] ordered-a)))
+(define extended
+  (env:extend-environment
+    (env:make-layer "turn-2"
+      [[["equal"] (env:note-make "turn-2-equal" (sp 60))]])
+    ordered-a))
+assert(Eq "high-equal" old-value)
+assert(Eq "high-equal" (env:res-value (env:resolve ["equal"] ordered-a)))
+assert(Eq "turn-2-equal" (env:res-value (env:resolve ["equal"] extended)))
+assert(Nil (Equal (env:environment-identity ordered-a)
+  (env:environment-identity extended)))
+
+;; A later definition may retain the exact value/environment it resolved in an
+;; earlier turn.  Subsequent revival or cull produces a new environment value;
+;; neither rewrites that captured edge or either predecessor.
+(define captured
+  [(env:res-value (env:resolve ["equal"] ordered-a))
+   (env:environment-identity ordered-a)])
+(define with-captured-bar
+  (env:extend-environment
+    (env:make-layer "turn-bar"
+      [[["bar"] (env:note-make captured (sp 61))]])
+    ordered-a))
+(define after-redefine
+  (env:extend-environment
+    (env:make-layer "turn-redefine"
+      [[["equal"] (env:note-make "new-equal" (sp 62))]])
+    with-captured-bar))
+assert(Equal captured (env:res-value (env:resolve ["bar"] after-redefine)))
+assert(Eq "high-equal" (_0 (env:res-value (env:resolve ["bar"] after-redefine))))
+assert(Eq "new-equal" (env:res-value (env:resolve ["equal"] after-redefine)))
+(define after-cull
+  (env:extend-environment
+    (env:make-layer "turn-cull"
+      [[["equal"] (env:note-cull (sp 63))]])
+    after-redefine))
+assert(env:res-null? (env:resolve ["equal"] after-cull))
+assert(Eq "turn-cull"
+  (env:from-label (env:res-from (env:resolve ["equal"] after-cull))))
+assert(Eq "new-equal"
+  (env:res-value (env:resolve ["equal"] after-redefine)))
+assert(Equal captured (env:res-value (env:resolve ["bar"] after-cull)))
+
+;; Compiler-derived names share the semantic unit owner; they are not modeled
+;; as an extra user layer and therefore retain own provenance.
+(define with-derived
+  (env:extend-own-derived
+    (env:make-layer "generated"
+      [[["local" "field"] (env:note-make "accessor" (sp 64))]])
+    own-shadow))
+(define derived-answer (env:resolve ["local" "field"] with-derived))
+assert(env:res-known? derived-answer)
+assert(env:from-own? (env:res-from derived-answer))
+assert(Eq "own-shadow" (env:from-label (env:res-from derived-answer)))
+
+;;; Unit envelope identity excludes labels, spans, and compiled exports ;;;;;;;;
+
+(define exports-a
+  (env:make-layer "exports-a"
+    [[["equal"] (env:note-make (Pin "compiled-a") (sp 70))]]))
+(define exports-b
+  (env:make-layer "exports-b"
+    [[["equal"] (env:note-make (Pin "compiled-b") (sp 71))]]))
+(define unit-a
+  (env:make-unit "unit-a" [high-mount low-mount] local exports-a))
+(define unit-b
+  (env:make-unit "renamed-unit" [low-mount high-mount] local exports-b))
+(define unit-c
+  (env:make-unit "spans-changed"
+    [(env:make-mount low [] (env:explicit-mount-order 10) (sp 400))
+     (env:make-mount high [] (env:explicit-mount-order 20) (sp 401))]
+    local exports-b))
+(define unit-d
+  (env:make-unit "own-ref-ignored" [low-mount high-mount]
+    (env:layer-with-ref (Pin ["not-this-unit" 0]) local) exports-b))
+assert(env:unit? unit-a)
+assert(Eq "unit-a" (env:unit-label unit-a))
+assert(Equal (env:unit-identity unit-a) (env:unit-identity unit-b))
+assert(Equal (env:unit-identity unit-a) (env:unit-identity unit-c))
+assert(Equal (env:unit-identity unit-a) (env:unit-identity unit-d))
+assert(Nil (Equal (env:layer-ref (env:unit-export-layer unit-a))
+  (env:layer-ref (env:unit-export-layer unit-b))))
+assert(Equal (env:unit-identity unit-a)
+  (env:layer-ref (env:unit-mount-layer unit-a)))
+assert(env:note-make? (env:layer-get ["local"] (env:unit-mount-layer unit-a)))
+assert(env:note-make? (env:layer-get ["equal"] (env:unit-mount-layer unit-a)))
+assert(Equal (env:environment-identity ordered-a)
+  (env:environment-identity (env:unit-environment unit-a)))
+assert(Eq 1 (Sz (env:unit-warnings unit-a)))
+assert(Eq 0 (Sz (env:unit-resolutions unit-a)))
+
+(print "foil-env tests passed")

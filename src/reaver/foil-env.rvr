@@ -1,0 +1,880 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;;;; Pure compiler-side namespace layers and union mounts.
+;;;;
+;;;; This module deliberately does not depend on Foil's runtime /axal type.
+;;;; Compiler environments use Cairn AX trees, just like foil-subject.  Every
+;;;; public value has a tagged constructor/accessor API; Cairn and positional
+;;;; representation details stay inside this module.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind cairn (#module cairn))
+
+;;; Small path/tree helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; path-prefix? :: Path -> Path -> Bool
+(define (path-prefix? pre path)
+  (And (Le (Sz pre) (Sz path))
+    (Equal pre (take (Sz pre) path))))
+
+;; path-strict-prefix? :: Path -> Path -> Bool
+(define (path-strict-prefix? pre path)
+  (And (Lt (Sz pre) (Sz path)) (path-prefix? pre path)))
+
+;; pair-path :: [Path a] -> Path
+(define pair-path (Ix 0))
+
+;; pair-value :: [Path a] -> a
+(define pair-value (Ix 1))
+
+;; tree-get :: Path -> AX[a] -> Maybe a
+(define (tree-get path tree)
+  (define hit (cairn:getax path tree))
+  (Ifz hit 0 (_0 hit)))
+
+;; tree-entries :: AX[a] -> Row [Path a]
+(define (tree-entries tree)
+  (rowify (cairn:tapax tree)))
+
+;; entries-tree :: Row [Path a] -> AX[a]
+(define (entries-tree entries)
+  (foldl
+    (lambda (tree pair)
+      (cairn:putax (pair-path pair) (pair-value pair) tree))
+    cairn:empty-ax entries))
+
+;; entry-path-cmp :: [Path a] -> [Path b] -> Ordering
+(define (entry-path-cmp a b)
+  (cmp-total (pair-path a) (pair-path b)))
+
+;; canonical-entries :: AX[a] -> Row [Path a]
+(define (canonical-entries tree)
+  (sort entry-path-cmp (tree-entries tree)))
+
+;; tree-prune-below :: Path -> AX[a] -> AX[a]
+(define (tree-prune-below path tree)
+  (entries-tree
+    (filter
+      (lambda (pair)
+        (Nil (path-strict-prefix? path (pair-path pair))))
+      (canonical-entries tree))))
+
+;;; Notes and layers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define NOTE-MAKE "FOIL_ENV_NOTE_MAKE")
+(define NOTE-CULL "FOIL_ENV_NOTE_CULL")
+(define NOTE-POKE "FOIL_ENV_NOTE_POKE")
+
+;; note-make :: Def -> Span -> Note
+(define (note-make body span)
+  [NOTE-MAKE body span])
+
+;; note-cull :: Span -> Note
+(define (note-cull span)
+  [NOTE-CULL 0 span])
+
+;; note-poke :: Def -> Span -> Note
+(define (note-poke body span)
+  [NOTE-POKE body span])
+
+;; note-tag :: Note -> Cord
+(define note-tag (Ix 0))
+
+;; note-body :: Note -> Def
+(define note-body (Ix 1))
+
+;; note-span :: Note -> Span
+(define note-span (Ix 2))
+
+;; note-make? :: Note -> Bool
+(define (note-make? note) (Eq NOTE-MAKE (note-tag note)))
+
+;; note-cull? :: Note -> Bool
+(define (note-cull? note) (Eq NOTE-CULL (note-tag note)))
+
+;; note-poke? :: Note -> Bool
+(define (note-poke? note) (Eq NOTE-POKE (note-tag note)))
+
+;; note-semantic :: Note -> Data
+(define (note-semantic note)
+  (cond
+    ((note-make? note) [NOTE-MAKE (note-body note)])
+    ((note-cull? note) [NOTE-CULL])
+    ((note-poke? note) [NOTE-POKE (note-body note)])
+    (else (error ["foil-env-malformed-note" note]))))
+
+;; note-valid-for-layer :: Path -> Note -> Note
+(define (note-valid-for-layer path note)
+  (cond
+    ((note-poke? note)
+      (error ["foil-env-reserved-poke" ["path" path]
+              ["at" (note-span note)]
+              "poke across or within layers is reserved for a later revision"]))
+    ((Or (note-make? note) (note-cull? note)) note)
+    (else (error ["foil-env-malformed-note" ["path" path] note]))))
+
+;; validate-layer-entries :: Row [Path Note] -> Row [Path Note]
+(define (validate-layer-entries entries)
+  (define (step seen pair)
+    (define path (pair-path pair))
+    (define note (note-valid-for-layer path (pair-value pair)))
+    (Seq note
+      (If (cairn:getax path seen)
+        (error ["foil-env-duplicate-layer-path" ["path" path]
+                ["at" (note-span note)]])
+        (cairn:putax path 1 seen))))
+  (Seq (foldl step cairn:empty-ax entries) entries))
+
+;; entry-covered-by-cull? :: Row [Path Note] -> [Path Note] -> Bool
+(define (entry-covered-by-cull? entries pair)
+  (define path (pair-path pair))
+  (any
+    (lambda (other)
+      (And (note-cull? (pair-value other))
+        (path-strict-prefix? (pair-path other) path)))
+    entries))
+
+;; normalize-layer-entries :: Row [Path Note] -> Row [Path Note]
+(define (normalize-layer-entries raw)
+  (define checked (validate-layer-entries raw))
+  (sort entry-path-cmp
+    (filter
+      (lambda (pair) (Nil (entry-covered-by-cull? checked pair)))
+      checked)))
+
+(define LAYER-TAG "FOIL_ENV_LAYER")
+
+;; make-layer :: Data -> Row [Path Note] -> Layer
+(define (make-layer label entries)
+  [LAYER-TAG label (entries-tree (normalize-layer-entries entries)) 0])
+
+;; make-layer-ref :: Data -> Row [Path Note] -> LayerRef -> Layer
+(define (make-layer-ref label entries ref)
+  (unless (IsPin ref)
+    (error ["foil-env-malformed-layer-ref" ref])
+    [LAYER-TAG label (entries-tree (normalize-layer-entries entries)) ref]))
+
+;; make-layer-tree :: Data -> AX[Note] -> Layer
+(define (make-layer-tree label tree)
+  (make-layer label (tree-entries tree)))
+
+;; make-layer-tree-ref :: Data -> AX[Note] -> LayerRef -> Layer
+(define (make-layer-tree-ref label tree ref)
+  (make-layer-ref label (tree-entries tree) ref))
+
+;; layer? :: Data -> Bool
+(define (layer? layer)
+  (And (IsApp layer) (Eq LAYER-TAG (_0 layer))))
+
+;; layer-label :: Layer -> Data
+(define layer-label (Ix 1))
+
+;; layer-tree :: Layer -> AX[Note]
+(define layer-tree (Ix 2))
+
+;; layer-ref-override :: Layer -> Maybe LayerRef
+(define (layer-ref-override layer)
+  ;; Three-field layers were the initial standalone shape; treating their
+  ;; missing override as 0 keeps them valid across cached snapshots.
+  (If (Gt (Sz layer) 3) (Ix 3 layer) 0))
+
+;; layer-entries :: Layer -> Row [Path Note]
+(define (layer-entries layer)
+  (canonical-entries (layer-tree layer)))
+
+;; layer-get :: Path -> Layer -> Maybe Note
+(define (layer-get path layer)
+  (tree-get path (layer-tree layer)))
+
+;; layer-semantic-entries :: Layer -> Row [Path Data]
+(define (layer-semantic-entries layer)
+  (map
+    (lambda (pair)
+      [(pair-path pair) (note-semantic (pair-value pair))])
+    (layer-entries layer)))
+
+;; layer-identity :: Layer -> Pin
+(define (layer-identity layer)
+  (Pin ["foil-env-layer/v1" (layer-semantic-entries layer)]))
+
+;; layer-ref :: Layer -> Pin
+(define (layer-ref layer)
+  (Ifz (layer-ref-override layer)
+    (layer-identity layer)
+    (layer-ref-override layer)))
+
+;; layer-with-ref :: LayerRef -> Layer -> Layer
+(define (layer-with-ref ref layer)
+  (unless (IsPin ref)
+    (error ["foil-env-malformed-layer-ref" ref])
+    [LAYER-TAG (layer-label layer) (layer-tree layer) ref]))
+
+;;; Mounts and mount-table validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define MOUNT-TAG "FOIL_ENV_MOUNT")
+
+;; no-mount-order :: Maybe Nat
+(define no-mount-order 0)
+
+;; explicit-mount-order :: Nat -> Maybe Nat
+(define (explicit-mount-order order)
+  (unless (IsNat order)
+    (error ["foil-env-malformed-mount-order" order])
+    [order]))
+
+;; mount-order-shape? :: Data -> Bool
+(define (mount-order-shape? order)
+  (cond
+    ((IsPin order) 0)
+    ((Eq 0 order) 1)
+    ((Nil (IsApp order)) 0)
+    ((Ne 1 (Sz order)) 0)
+    (else (IsNat (_0 order)))))
+
+;; path-shape? :: Data -> Bool
+(define (path-shape? path)
+  (cond
+    ((IsPin path) 0)
+    ((Eq 0 path) 1)
+    ((Nil (IsApp path)) 0)
+    ((Nil (IsNat (_0 path))) 0)
+    (else (path-shape? (drop 1 path)))))
+
+;; make-mount :: Layer -> Path -> Maybe Nat -> Span -> Mount
+(define (make-mount layer at order span)
+  (unless (layer? layer)
+    (error ["foil-env-malformed-mount" ["layer" layer] ["at" span]])
+    (unless (path-shape? at)
+      (error ["foil-env-malformed-mount" ["path" at] ["at" span]])
+      (unless (mount-order-shape? order)
+        (error ["foil-env-malformed-mount" ["order" order] ["at" span]])
+        [MOUNT-TAG layer at order span]))))
+
+;; mount? :: Data -> Bool
+(define (mount? mount)
+  (And (IsApp mount) (Eq MOUNT-TAG (_0 mount))))
+
+;; mount-layer :: Mount -> Layer
+(define mount-layer (Ix 1))
+
+;; mount-at :: Mount -> Path
+(define mount-at (Ix 2))
+
+;; mount-order :: Mount -> Maybe Nat
+(define mount-order (Ix 3))
+
+;; mount-span :: Mount -> Span
+(define mount-span (Ix 4))
+
+;; mount-root? :: Mount -> Bool
+(define (mount-root? mount) (Eq 0 (Sz (mount-at mount))))
+
+;; mount-ordered? :: Mount -> Bool
+(define (mount-ordered? mount) (Truth (mount-order mount)))
+
+;; mount-order-value :: Mount -> Nat
+(define (mount-order-value mount)
+  (Ifz (mount-order mount) 0 (_0 (mount-order mount))))
+
+;; mount-identity :: Mount -> Pin
+(define (mount-identity mount)
+  (Pin ["foil-env-mount/v1" (layer-ref (mount-layer mount))
+        (mount-at mount) (mount-order mount)]))
+
+;; prefix-mounts-overlap? :: Mount -> Mount -> Bool
+(define (prefix-mounts-overlap? a b)
+  (Or (path-prefix? (mount-at a) (mount-at b))
+    (path-prefix? (mount-at b) (mount-at a))))
+
+;; check-prefix-mounts :: Row Mount -> Row Mount
+(define (check-prefix-mounts prefixes)
+  (define (go pending)
+    (Ifz (Sz pending)
+      prefixes
+      (let* ((one (_0 pending))
+             (rest (drop 1 pending))
+             (hit (find (prefix-mounts-overlap? one) rest)))
+        (Ifz hit
+          (go rest)
+          (error ["foil-env-overlapping-prefix-mount"
+                  ["first" (mount-at one)]
+                  ["second" (mount-at (_0 hit))]
+                  ["at" [(mount-span one) (mount-span (_0 hit))]]])))))
+  (go prefixes))
+
+;; check-root-mounts :: Row Mount -> Row Mount
+(define (check-root-mounts roots)
+  (define (check-orders seen pending)
+    (Ifz (Sz pending)
+      roots
+      (let* ((mount (_0 pending))
+             (rest (drop 1 pending))
+             (order (mount-order-value mount)))
+        (If (includes (Eq order) seen)
+          (error ["foil-env-duplicate-root-order" ["order" order]
+                  ["at" (mount-span mount)]])
+          (check-orders (snoc order seen) rest)))))
+  (If (And (Gt (Sz roots) 1) (any (cork Nil mount-ordered?) roots))
+    (error ["foil-env-unordered-root-union"
+            ["mounts" (map (cork layer-label mount-layer) roots)]])
+    (If (Gt (Sz roots) 1) (check-orders [] roots) roots)))
+
+;; mount-cmp :: Mount -> Mount -> Ordering
+(define (mount-cmp a b)
+  (cond
+    ((And (mount-root? a) (mount-root? b))
+      (Cmp (mount-order-value a) (mount-order-value b)))
+    ((mount-root? a) sym-lt)
+    ((mount-root? b) sym-gt)
+    (else (cmp-total (mount-at a) (mount-at b)))))
+
+;; validate-mounts :: Row Mount -> Row Mount
+(define (validate-mounts mounts)
+  (define malformed (find (cork Nil mount?) mounts))
+  (If malformed
+    (error ["foil-env-malformed-mount" (_0 malformed)])
+    (let* ((roots (filter mount-root? mounts))
+           (prefixes (filter (cork Nil mount-root?) mounts)))
+      (Seq (check-root-mounts roots)
+        (Seq (check-prefix-mounts prefixes)
+          (sort mount-cmp mounts))))))
+
+;;; Provenance, bindings, warnings, and resolution results ;;;;;;;;;;;;;;;;;;;;;
+
+(define FROM-IMPORT "FOIL_ENV_FROM_IMPORT")
+(define FROM-OWN "FOIL_ENV_FROM_OWN")
+(define FROM-BASE "FOIL_ENV_FROM_BASE")
+
+;; from-import :: Layer -> Provenance
+(define (from-import layer)
+  [FROM-IMPORT (layer-ref layer) (layer-label layer)])
+
+;; from-own :: Layer -> Provenance
+(define (from-own layer)
+  ;; Own provenance is intentionally content-symbolic.  A unit cannot stamp
+  ;; its own bindings with its final unit pin without creating a hash cycle.
+  [FROM-OWN (layer-identity layer) (layer-label layer)])
+
+;; from-base :: Layer -> Provenance
+;; The trusted compiler substrate is part of the sealed environment but is
+;; not a user-declared mount.  Its distinct provenance keeps the first root
+;; import from manufacturing an import/import occlusion warning.
+(define (from-base layer)
+  [FROM-BASE (layer-ref layer) (layer-label layer)])
+
+;; from-kind :: Provenance -> Cord
+(define from-kind (Ix 0))
+
+;; from-ref :: Provenance -> Pin
+(define from-ref (Ix 1))
+
+;; from-label :: Provenance -> Data
+(define from-label (Ix 2))
+
+;; from-import? :: Provenance -> Bool
+(define (from-import? from) (Eq FROM-IMPORT (from-kind from)))
+
+;; from-own? :: Provenance -> Bool
+(define (from-own? from) (Eq FROM-OWN (from-kind from)))
+
+;; from-base? :: Provenance -> Bool
+(define (from-base? from) (Eq FROM-BASE (from-kind from)))
+
+(define BIND-DEF "FOIL_ENV_BIND_DEF")
+(define BIND-TOMB "FOIL_ENV_BIND_TOMB")
+
+;; bind-def :: Def -> Span -> Provenance -> Bind
+(define (bind-def body span from)
+  [BIND-DEF body span from])
+
+;; bind-tomb :: Span -> Provenance -> Bind
+(define (bind-tomb span from)
+  [BIND-TOMB 0 span from])
+
+;; bind-tag :: Bind -> Cord
+(define bind-tag (Ix 0))
+
+;; bind-body :: Bind -> Def
+(define bind-body (Ix 1))
+
+;; bind-span :: Bind -> Span
+(define bind-span (Ix 2))
+
+;; bind-from :: Bind -> Provenance
+(define bind-from (Ix 3))
+
+;; bind-def? :: Bind -> Bool
+(define (bind-def? bind) (Eq BIND-DEF (bind-tag bind)))
+
+;; bind-tomb? :: Bind -> Bool
+(define (bind-tomb? bind) (Eq BIND-TOMB (bind-tag bind)))
+
+;; bind-semantic :: Bind -> Data
+(define (bind-semantic bind)
+  (If (bind-def? bind)
+    [BIND-DEF (bind-body bind) (from-kind (bind-from bind))
+     (from-ref (bind-from bind))]
+    [BIND-TOMB (from-kind (bind-from bind)) (from-ref (bind-from bind))]))
+
+;; make-occlusion-warning :: Path -> Bind -> Provenance -> Span -> Warning
+(define (make-occlusion-warning path old new span)
+  ["foil-env-import-occlusion" path (bind-from old) new span])
+
+;; warning-tag :: Warning -> Cord
+(define warning-tag (Ix 0))
+
+;; warning-path :: Warning -> Path
+(define warning-path (Ix 1))
+
+;; warning-occluded-from :: Warning -> Provenance
+(define warning-occluded-from (Ix 2))
+
+;; warning-winning-from :: Warning -> Provenance
+(define warning-winning-from (Ix 3))
+
+;; warning-span :: Warning -> Span
+(define warning-span (Ix 4))
+
+(define RES-KNOWN "FOIL_ENV_RES_KNOWN")
+(define RES-NULL "FOIL_ENV_RES_NULL")
+(define RES-UNKNOWN "FOIL_ENV_RES_UNKNOWN")
+
+;; res-known :: Path -> Provenance -> Def -> Res
+(define (res-known path from body) [RES-KNOWN path from body])
+
+;; res-null :: Path -> Provenance -> Res
+(define (res-null path from) [RES-NULL path from 0])
+
+;; res-unknown :: Path -> Res
+(define (res-unknown path) [RES-UNKNOWN path 0 0])
+
+;; res-tag :: Res -> Cord
+(define res-tag (Ix 0))
+
+;; res-path :: Res -> Path
+(define res-path (Ix 1))
+
+;; res-from :: Res -> Maybe Provenance
+(define res-from (Ix 2))
+
+;; res-value :: Res -> Maybe Def
+(define res-value (Ix 3))
+
+;; res-known? :: Res -> Bool
+(define (res-known? res) (Eq RES-KNOWN (res-tag res)))
+
+;; res-null? :: Res -> Bool
+(define (res-null? res) (Eq RES-NULL (res-tag res)))
+
+;; res-unknown? :: Res -> Bool
+(define (res-unknown? res) (Eq RES-UNKNOWN (res-tag res)))
+
+;; make-resolution :: Span -> Path -> Provenance -> Cord -> Resolution
+(define (make-resolution site path from kind)
+  ["FOIL_ENV_RESOLUTION" site path from kind])
+
+;; resolution-site :: Resolution -> Span
+(define resolution-site (Ix 1))
+
+;; resolution-path :: Resolution -> Path
+(define resolution-path (Ix 2))
+
+;; resolution-from :: Resolution -> Provenance
+(define resolution-from (Ix 3))
+
+;; resolution-kind :: Resolution -> Cord
+(define resolution-kind (Ix 4))
+
+;;; Sources and environments ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define SOURCE-TAG "FOIL_ENV_SOURCE")
+
+;; make-source :: Layer -> Path -> Maybe Nat -> Span -> Provenance -> Bool -> Source
+(define (make-source layer at order span from warn?)
+  [SOURCE-TAG layer at order span from warn?])
+
+;; source-layer :: Source -> Layer
+(define source-layer (Ix 1))
+
+;; source-at :: Source -> Path
+(define source-at (Ix 2))
+
+;; source-order :: Source -> Maybe Nat
+(define source-order (Ix 3))
+
+;; source-span :: Source -> Span
+(define source-span (Ix 4))
+
+;; source-from :: Source -> Provenance
+(define source-from (Ix 5))
+
+;; source-warns? :: Source -> Bool
+(define source-warns? (Ix 6))
+
+;; mount-source :: Mount -> Source
+(define (mount-source mount)
+  (define layer (mount-layer mount))
+  (make-source layer (mount-at mount) (mount-order mount) (mount-span mount)
+    ;; Root/prefix overlap is unusual but possible when a root layer already
+    ;; owns the prefix path.  It is still import/import occlusion and therefore
+    ;; must never be silent.
+    (from-import layer) 1))
+
+;; own-source :: Layer -> Source
+(define (own-source layer)
+  (make-source layer [] no-mount-order 0 (from-own layer) 0))
+
+;; base-source :: Layer -> Source
+;; The compiler substrate is an explicit fixed bottom layer.  It participates
+;; in identity and provenance, but is not a user-declared root union and does
+;; not produce import-occlusion warnings when a declared mount replaces it.
+(define (base-source layer)
+  (make-source layer [] no-mount-order 0 (from-base layer) 0))
+
+(define ENV-TAG "FOIL_ENVIRONMENT")
+
+;; make-environment-value :: AX[Bind] -> Row Warning -> Row Source -> Row Resolution -> Environment
+(define (make-environment-value tree warnings sources resolutions)
+  [ENV-TAG tree warnings sources resolutions])
+
+;; environment? :: Data -> Bool
+(define (environment? env)
+  (And (IsApp env) (Eq ENV-TAG (_0 env))))
+
+;; environment-tree :: Environment -> AX[Bind]
+(define environment-tree (Ix 1))
+
+;; environment-warnings :: Environment -> Row Warning
+(define environment-warnings (Ix 2))
+
+;; environment-sources :: Environment -> Row Source
+(define environment-sources (Ix 3))
+
+;; environment-resolutions :: Environment -> Row Resolution
+(define environment-resolutions (Ix 4))
+
+;; environment-with-resolutions :: Row Resolution -> Environment -> Environment
+(define (environment-with-resolutions resolutions env)
+  (Up 4 resolutions env))
+
+;; environment-bind :: Path -> Environment -> Maybe Bind
+(define (environment-bind path env)
+  (tree-get path (environment-tree env)))
+
+;; empty-environment :: Environment
+(define empty-environment
+  (make-environment-value cairn:empty-ax [] [] []))
+
+;; note-bind :: Note -> Provenance -> Bind
+(define (note-bind note from)
+  (cond
+    ((note-make? note) (bind-def (note-body note) (note-span note) from))
+    ((note-cull? note) (bind-tomb (note-span note) from))
+    (else
+      (error ["foil-env-reserved-poke" "poke survived layer normalization"]))))
+
+;; apply-source :: Source -> Environment -> Environment
+(define (apply-source source env)
+  (define from (source-from source))
+  (define at (source-at source))
+  (define (step state pair)
+    (define tree (_0 state))
+    (define warnings (_1 state))
+    (define note (pair-value pair))
+    (define path (Weld at (pair-path pair)))
+    (define old (tree-get path tree))
+    (define warnings1
+      (If (And (source-warns? source)
+            (And old (from-import? (bind-from old))))
+        (snoc (make-occlusion-warning path old from (source-span source)) warnings)
+        warnings))
+    (define tree1
+      (If (note-cull? note) (tree-prune-below path tree) tree))
+    [(cairn:putax path (note-bind note from) tree1) warnings1])
+  (define applied
+    (foldl step [(environment-tree env) (environment-warnings env)]
+      (layer-entries (source-layer source))))
+  (make-environment-value (_0 applied) (_1 applied)
+    (snoc source (environment-sources env))
+    (environment-resolutions env)))
+
+;; build-environment-validated :: Row Mount -> Layer -> Environment
+(define (build-environment-validated ordered own)
+  (define imported
+    (foldl (lambda (env mount) (apply-source (mount-source mount) env))
+      empty-environment ordered))
+  (apply-source (own-source own) imported))
+
+;; build-environment :: Row Mount -> Layer -> Environment
+(define (build-environment mounts own)
+  (build-environment-validated (validate-mounts mounts) own))
+
+;; build-environment-with-base :: Layer -> Row Mount -> Layer -> Environment
+(define (build-environment-with-base base mounts own)
+  (define seeded (apply-source (base-source base) empty-environment))
+  (define imported
+    (foldl (lambda (environment mount)
+             (apply-source (mount-source mount) environment))
+      seeded (validate-mounts mounts)))
+  (apply-source (own-source own) imported))
+
+;; extend-environment :: Layer -> Environment -> Environment
+(define (extend-environment layer env)
+  (apply-source (own-source layer) env))
+
+;; extend-own-derived :: Layer -> Environment -> Environment
+;; Compiler-generated declarations (row accessors and materializations) belong
+;; to the same source unit as the declaration that caused them.  Extend the
+;; sealed tree with their derived notes while retaining the original own-layer
+;; provenance, rather than manufacturing a second semantic owner.
+(define (extend-own-derived layer env)
+  (define own
+    (find (lambda (source) (from-own? (source-from source)))
+      (rev (environment-sources env))))
+  (Ifz own
+    (error ["foil-env-missing-own-source" (layer-label layer)])
+    (let ((source (_0 own)))
+      (apply-source
+        (make-source layer [] no-mount-order 0 (source-from source) 0)
+        env))))
+
+;; find-covering-tomb :: Path -> AX[Bind] -> Maybe Bind
+(define (find-covering-tomb path tree)
+  (define (go n)
+    (define found (tree-get (take n path) tree))
+    (cond
+      ((And found (bind-tomb? found)) found)
+      ((Eq 0 n) 0)
+      (else (go (Dec n)))))
+  (Ifz (Sz path) 0 (go (Dec (Sz path)))))
+
+;; bind-result :: Path -> Bind -> Res
+(define (bind-result path bind)
+  (If (bind-def? bind)
+    (res-known path (bind-from bind) (bind-body bind))
+    (res-null path (bind-from bind))))
+
+;; resolve :: Path -> Environment -> Res
+(define (resolve path env)
+  (define exact (environment-bind path env))
+  (If exact
+    (bind-result path exact)
+    (let ((cover (find-covering-tomb path (environment-tree env))))
+      (If cover (res-null path (bind-from cover)) (res-unknown path)))))
+
+;; resolve-record :: Span -> Path -> Environment -> [Environment Res]
+(define (resolve-record site path env)
+  (define res (resolve path env))
+  (If (res-unknown? res)
+    [env res]
+    [(make-environment-value (environment-tree env) (environment-warnings env)
+       (environment-sources env)
+       (snoc (make-resolution site path (res-from res) (res-tag res))
+         (environment-resolutions env)))
+     res]))
+
+;; source-relative-path :: Path -> Source -> Maybe Path
+(define (source-relative-path path source)
+  (define at (source-at source))
+  (If (path-prefix? at path) [(drop (Sz at) path)] 0))
+
+;; find-layer-cull :: Path -> Layer -> Maybe Note
+(define (find-layer-cull path layer)
+  (define (go n)
+    (define found (layer-get (take n path) layer))
+    (cond
+      ((And found (note-cull? found)) found)
+      ((Eq 0 n) 0)
+      (else (go (Dec n)))))
+  (Ifz (Sz path) 0 (go (Dec (Sz path)))))
+
+;; source-answer :: Path -> Source -> Res
+(define (source-answer path source)
+  (define relative (source-relative-path path source))
+  (Ifz relative
+    (res-unknown path)
+    (let* ((local (_0 relative))
+           (note (layer-get local (source-layer source)))
+           (found (If note note (find-layer-cull local (source-layer source)))))
+      (cond
+        ((Ifz found 1 0) (res-unknown path))
+        ((note-make? found) (res-known path (source-from source) (note-body found)))
+        (else (res-null path (source-from source)))))))
+
+;; replay :: Path -> Environment -> Row Res
+(define (replay path env)
+  (filter (cork Nil res-unknown?)
+    (map (source-answer path)
+      (filter
+        (lambda (source) (Nil (from-base? (source-from source))))
+        (rev (environment-sources env))))))
+
+;;; Deterministic identities ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; environment-semantic-entries :: Environment -> Row [Path Data]
+(define (environment-semantic-entries env)
+  (map
+    (lambda (pair) [(pair-path pair) (bind-semantic (pair-value pair))])
+    (canonical-entries (environment-tree env))))
+
+;; merged-identity :: Environment -> Pin
+(define (merged-identity env)
+  (Pin ["foil-env-merged/v1" (environment-semantic-entries env)]))
+
+;; source-semantic :: Source -> Data
+(define (source-semantic source)
+  [(from-kind (source-from source))
+   (If (from-own? (source-from source))
+     (layer-identity (source-layer source))
+     (layer-ref (source-layer source)))
+   (source-at source)
+   (source-order source)])
+
+;; environment-identity :: Environment -> Pin
+(define (environment-identity env)
+  ;; Spans, labels, warnings, and resolution sites are debug metadata.  The
+  ;; semantic identity is determined by the ordered source stack and merged
+  ;; bindings, both in canonical form.
+  (Pin ["foil-env-environment/v1"
+        (map source-semantic (environment-sources env))
+        (environment-semantic-entries env)]))
+
+;;; Retained compilation-unit envelope ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define UNIT-TAG "FOIL_ENV_UNIT")
+
+;; make-unit :: Data -> Row Mount -> Layer -> Layer -> Unit
+(define (make-unit label mounts own exports)
+  (unless (layer? own)
+    (error ["foil-env-malformed-unit" ["own-layer" own]])
+    (unless (layer? exports)
+      (error ["foil-env-malformed-unit" ["export-layer" exports]])
+      (let* ((ordered (validate-mounts mounts))
+             (environment (build-environment-validated ordered own)))
+        [UNIT-TAG label ordered own exports environment]))))
+
+;; make-unit-with-base :: Data -> Layer -> Row Mount -> Layer -> Layer -> Unit
+(define (make-unit-with-base label base mounts own exports)
+  (unless (layer? base)
+    (error ["foil-env-malformed-unit" ["base-layer" base]])
+    (unless (layer? own)
+      (error ["foil-env-malformed-unit" ["own-layer" own]])
+      (unless (layer? exports)
+        (error ["foil-env-malformed-unit" ["export-layer" exports]])
+        (let* ((ordered (validate-mounts mounts))
+               (environment (build-environment-with-base base ordered own)))
+          [UNIT-TAG label ordered own exports environment base])))))
+
+;; unit? :: Data -> Bool
+(define (unit? unit)
+  (And (IsApp unit) (Eq UNIT-TAG (_0 unit))))
+
+;; unit-label :: Unit -> Data
+(define unit-label (Ix 1))
+
+;; unit-mounts :: Unit -> Row Mount
+(define unit-mounts (Ix 2))
+
+;; unit-own-layer :: Unit -> Layer
+(define unit-own-layer (Ix 3))
+
+;; unit-export-layer :: Unit -> Layer
+(define unit-export-layer (Ix 4))
+
+;; unit-environment :: Unit -> Environment
+(define unit-environment (Ix 5))
+
+;; unit-base-layer :: Unit -> Layer | 0
+(define (unit-base-layer unit)
+  (If (Gt (Sz unit) 6) (Ix 6 unit) 0))
+
+;; unit-warnings :: Unit -> Row Warning
+(define (unit-warnings unit)
+  (environment-warnings (unit-environment unit)))
+
+;; unit-resolutions :: Unit -> Row Resolution
+(define (unit-resolutions unit)
+  (environment-resolutions (unit-environment unit)))
+
+;; unit-with-resolutions :: Row Resolution -> Unit -> Unit
+;;
+;; Resolutions are derived elaboration metadata.  They do not affect unit or
+;; environment identity, but retaining them in the completed unit makes the
+;; answer to "where did this reference come from?" a direct query.
+(define (unit-with-resolutions resolutions unit)
+  (Up 5
+    (environment-with-resolutions resolutions (unit-environment unit))
+    unit))
+
+;; unit-with-environment :: Environment -> Unit -> Unit
+;; Replace only derived/tooling metadata.  Unit identity is intentionally a
+;; function of base, mounts, and the semantic own layer, not this cached merge.
+(define (unit-with-environment environment unit)
+  (unless (environment? environment)
+    (error ["foil-env-malformed-unit-environment" environment])
+    (Up 5 environment unit)))
+
+;; unit-identity :: Unit -> Pin
+(define (unit-identity unit)
+  ;; Export pins are a derived lowering product.  The source unit is identified
+  ;; only by its normalized mount inputs and semantic own layer; labels and
+  ;; source spans are diagnostic metadata.
+  (Pin ["foil-env-unit/v2"
+        (Ifz (unit-base-layer unit) 0
+          (layer-ref (unit-base-layer unit)))
+        (map mount-identity (unit-mounts unit))
+        (layer-identity (unit-own-layer unit))]))
+
+;; unit-mount-layer :: Unit -> Layer
+(define (unit-mount-layer unit)
+  ;; The own layer remains symbolically `from-own` while elaborating this unit.
+  ;; Consumers mount an interface view stamped with the completed unit pin, so
+  ;; cross-unit provenance includes the imported unit's mount table as well as
+  ;; the layer contents.  Source notes win where present; generated public
+  ;; accessors/materializations come from the compiled export layer.  This
+  ;; keeps resolution/replay in agreement with the names the linker exposes.
+  (define own (unit-own-layer unit))
+  (define exports (unit-export-layer unit))
+  (define generated
+    (filter
+      (lambda (pair) (Nil (layer-get (pair-path pair) own)))
+      (layer-entries exports)))
+  (make-layer-ref (unit-label unit)
+    (Weld (layer-entries own) generated)
+    (unit-identity unit)))
+
+(#export
+ path-prefix? path-strict-prefix?
+ note-make note-cull note-poke note-tag note-body note-span
+ note-make? note-cull? note-poke?
+ make-layer make-layer-ref make-layer-tree make-layer-tree-ref layer?
+ layer-label layer-tree layer-ref-override layer-entries layer-get
+ layer-identity layer-ref layer-with-ref
+ no-mount-order explicit-mount-order make-mount mount? mount-layer mount-at
+ mount-order mount-span mount-root? mount-ordered? mount-order-value
+ mount-identity validate-mounts
+ from-import from-own from-base from-kind from-ref from-label
+ from-import? from-own? from-base?
+ bind-def bind-tomb bind-tag bind-body bind-span bind-from bind-def? bind-tomb?
+ warning-tag warning-path warning-occluded-from warning-winning-from warning-span
+ res-tag res-path res-from res-value res-known? res-null? res-unknown?
+ resolution-site resolution-path resolution-from resolution-kind
+ source-layer source-at source-order source-span source-from source-warns?
+ environment? environment-tree environment-warnings environment-sources
+ environment-resolutions environment-with-resolutions environment-bind
+ empty-environment
+ build-environment build-environment-with-base extend-environment
+ extend-own-derived
+ resolve resolve-record replay
+ merged-identity environment-identity
+ make-unit make-unit-with-base unit? unit-label unit-mounts unit-own-layer
+ unit-export-layer unit-base-layer
+ unit-environment unit-identity unit-mount-layer unit-warnings unit-resolutions
+ unit-with-resolutions unit-with-environment)
