@@ -1,0 +1,98 @@
+# Kill/resume integration test for the persistent lain serve.
+#
+# Boots a fresh serve (x/lain --fresh) on a test port, drives a few
+# journaled events through /chore/eval, hard-kills the server, then
+# re-runs x/lain and asserts the namespace RESUMED: the explorer
+# answers, the pre-kill /log entries survive, and /chore/eval still
+# works (the compiled world rode the snapshot).
+#
+#   x/lain-resume-test          # port 8127
+#   x/lain-resume-test 9001     # custom port
+
+set -ex
+
+PORT="${1:-8127}"
+ROOT="$(pwd)"
+LOG1="${TMPDIR:-/tmp}/lain-resume-fresh-$$.log"
+LOG2="${TMPDIR:-/tmp}/lain-resume-resume-$$.log"
+
+listener_pid () {
+  lsof -ti "tcp:${PORT}" || true
+}
+
+kill_listener () {
+  pid="$(listener_pid)"
+  [ -n "$pid" ] && kill -9 $pid 2>/dev/null || true
+}
+
+cleanup () {
+  kill_listener
+  rm -f "$LOG1" "$LOG2"
+}
+trap cleanup EXIT INT TERM
+
+wait_for_port () {
+  i=0
+  until curl -sf -o /dev/null "http://localhost:${PORT}/ns"; do
+    i=$((i+1))
+    if [ $i -gt 900 ]; then
+      echo "FAIL: server never answered on :${PORT}" >&2
+      tail -40 "$1" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+log_count () {
+  curl -s "http://localhost:${PORT}/ns/log" | grep -o 'log/' | wc -l | tr -d ' '
+}
+
+eval_check () {
+  out="$(curl -s --data 'expr=%28add+2+3%29' "http://localhost:${PORT}/chore/eval/sept")"
+  case "$out" in
+    *"value: 5"*) ;;
+    *) echo "FAIL: /chore/eval answered: $out" >&2; exit 1;;
+  esac
+}
+
+kill_listener
+
+# 1. fresh serve
+./x/lain --fresh "$PORT" >"$LOG1" 2>&1 &
+wait_for_port "$LOG1"
+
+# 2. journaled traffic
+N1="$(log_count)"
+eval_check
+eval_check
+N2="$(log_count)"
+[ "$N2" -gt "$N1" ] || { echo "FAIL: /log did not grow ($N1 -> $N2)" >&2; exit 1; }
+
+# 3. hard kill
+kill_listener
+sleep 1
+
+# 4. resume (no --fresh: rides run/lain/snap)
+./x/lain "$PORT" >"$LOG2" 2>&1 &
+wait_for_port "$LOG2"
+grep -q "resuming lain" "$LOG2" || { echo "FAIL: launcher did not take the resume path" >&2; exit 1; }
+
+# 5. the journal survived the kill
+N3="$(log_count)"
+[ "$N3" -ge "$N2" ] || { echo "FAIL: /log shrank across resume ($N2 -> $N3)" >&2; exit 1; }
+
+# 6. the compiled world survived too: eval still works and journals
+eval_check
+N4="$(log_count)"
+[ "$N4" -gt "$N3" ] || { echo "FAIL: /log did not grow post-resume ($N3 -> $N4)" >&2; exit 1; }
+
+# 7. no runtime errors on the resumed process
+if grep -q '"ERROR"' "$LOG2"; then
+  echo "FAIL: errors in resumed serve log" >&2
+  grep '"ERROR"' "$LOG2" | head >&2
+  exit 1
+fi
+
+kill_listener
+echo "lain resume test passed (log ${N1} -> ${N2} -> ${N3} -> ${N4})"

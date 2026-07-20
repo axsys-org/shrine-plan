@@ -1,0 +1,312 @@
+;;;; Textual rendering for compiler artifacts: types, PLAN values,
+;;;; decompiled laws, diagnostics, and doctest result lines.  Hoisted
+;;;; out of forge (the same move as foil-lore and doctest) so the
+;;;; namespace mirror, the chore families, and any CLI share one
+;;;; renderer; forge rebinds these names.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind ty (#module foil-types))
+
+(#bind foil-lore (#module foil-lore))
+
+
+;;; String helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Byte-by-byte on purpose: wisp's LoadVar returns wrong values on
+;; larger heaps (see doc/wisp-session-leak.md); Load8 is reliable.
+(define (str-contains? needle hay)
+  (define nl (Bytes needle))
+  (define hb (Bytes hay))
+  (define (match-at i j)
+    (Or (Ge j nl)
+      (And (Eq (Load8 j needle) (Load8 (Add i j) hay))
+        (match-at i (Inc j)))))
+  (define (go i)
+    (If (Gt (Add i nl) hb) 0
+      (If (match-at i 0) 1 (go (Inc i)))))
+  (Ifz nl 1 (go 0)))
+
+(define (printable-text? v)
+  (define (go i)
+    (Or (Ge i (Bytes v))
+      (And (let ((c (Load8 i v))) (And (Ge c 32) (Le c 126)))
+        (go (Inc i)))))
+  (And (IsNat v) (And (Gt (Bytes v) 0) (go 0))))
+
+(define (atom-str v)
+  (If (printable-text? v) v (showNat v)))
+
+(define (dotted path) (join-str "." path))
+
+;; Load8-based splitter: parse.rvr's byte splitter slices via LoadVar,
+;; which returns garbage on larger heaps (doc/wisp-session-leak.md).
+(define (split-ch ch s)
+  (define n (Bytes s))
+  (define (slice a b) (foil-lore:str-slice a (Sub b a) s))
+  (define (go start i acc)
+    (If (Ge i n)
+      (snoc (slice start i) acc)
+      (If (Eq ch (Load8 i s))
+        (go (Inc i) (Inc i) (snoc (slice start i) acc))
+        (go start (Inc i) acc))))
+  (go 0 0 []))
+
+
+;;; Type rendering as text ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; /ty-ap paths display as applications: bst[nat], bst[row[nat]],
+;; bst[@v]. (print-path on the raw encoding would try to print the
+;; length markers.)
+(define (path-text p)
+  (define parts (ty-ap-decode p))
+  (Ifz parts
+    (cond
+      ((ty-var-path? p) (strcat ["@" (Ix 1 p)]))
+      ((ty-val-path? p)
+        (If (printable-text? (Ix 1 p))
+          (strcat ["'$" (Ix 1 p)])
+          (showNat (Ix 1 p))))
+      (else (print-path p)))
+    (strcat
+      [(path-text (Ix 0 parts)) "["
+       (join-str " " (map path-text (drop 1 parts))) "]"])))
+
+(define (ty-text t)
+  (define tag (_1 t))
+  (define (many sep ts) (join-str sep (map ty-text ts)))
+  (cond
+    ((Eq tag "TNOM") (path-text (ty:tnom-ref t)))
+    ((Eq tag "TNAT")
+      (cond
+        ((Ifz (_2 t) 1 0) "nat")
+        ((printable-text? (_2 t)) (strcat ["'$" (_2 t)]))
+        (else (showNat (_2 t)))))
+    ((Eq tag "TFUN")
+      (strcat ["{" (many " " (ty:tfun-args t)) "; "
+               (ty-text (ty:tfun-ret t)) "}"]))
+    ((Eq tag "TROW")
+      (strcat [(If (ty:trow-cstr t) (atom-str (ty:trow-cstr t)) "")
+               "[" (many " " (ty:trow-vals t)) "]"]))
+    ((Eq tag "TSUM") (strcat ["(" (many " | " (ty:tsum-opts t)) ")"]))
+    ((Eq tag "TFAC")
+      (strcat [(atom-str (_2 t)) "=" (ty-text (ty:tfac-val t))]))
+    ((Eq tag "TQUA") (strcat ["@" (atom-str (_2 t)) " " (ty-text (_3 t))]))
+    ((Eq tag "TVAR") (strcat ["@" (atom-str (_2 t))]))
+    ((Eq tag "TPIN") (strcat ["pin[" (ty-text (ty:tpin-val t)) "]"]))
+    ((Eq tag "TSELF") (strcat ["self[" (ty-text (ty:tself-val t)) "]"]))
+    ((Eq tag "TARR") (strcat ["row[" (ty-text (_2 t)) "]"]))
+    ((Eq tag "TANY") "any")
+    ((Eq tag "TBOT") "bot")
+    ((Eq tag "TTYP") (strcat ["type " (ty-text (_2 t))]))
+    (else "?")))
+
+;;; PLAN value rendering — one renderer for every stage ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (law-of v) (If (IsPin v) (Unpin v) v))
+(define (law-like? v)
+  (Or (IsLaw v) (And (IsPin v) (IsLaw (Unpin v)))))
+
+;; Plain textual rendering with a depth budget.
+(define (render-plain-d d v)
+  (cond
+    ((IsNat v) (atom-str v))
+    ((law-like? v) (strcat ["#law:" (atom-str (Name (law-of v)))]))
+    ((IsPin v) (strcat ["#pin(" (render-plain-d (Dec d) (Unpin v)) ")"]))
+    ((Ifz d 1 0) "...")
+    (else
+      (strcat
+        ["(" (render-plain-d (Dec d) (Hd v)) " "
+         (join-str " "
+           (map (render-plain-d (Dec d)) (gen (Sz v) (lambda (i) (Ix i v)))))
+         ")"]))))
+
+(define (render-plain v) (render-plain-d 5 v))
+
+;;; Diagnostic rendering — pretty compiler errors for the terminal ;;;;;;;;;;;;;;
+
+(define diag-nl (strcat [10]))
+
+(define (ty-node? v)
+  (And (IsApp v) (And (Gt (Sz v) 1) (Eq "type" (Ix 0 v)))))
+
+;; The head tag of an error payload: apps carry it in Hd; rows have a
+;; zero head, their tag sits at Ix 0.
+(define (diag-tag v)
+  (And (IsApp v)
+    (If (And (IsNat (Hd v)) (Hd v))
+      (Hd v)
+      (And (Gt (Sz v) 0) (Ix 0 v)))))
+
+;; "at" blurbs from elab/sast errors: ["line" l "col" c] or a marker.
+(define (at-text blurb)
+  (If (IsApp blurb)
+    (strcat ["line " (showNat (Ix 1 blurb)) ", col " (showNat (Ix 3 blurb))])
+    "unknown location"))
+
+;; One payload value, prettily: types and tagged paths decode, rows
+;; recurse shallowly, atoms print as themselves.
+(define (diag-val v)
+  (cond
+    ((ty-node? v) (ty-text v))
+    ((And (IsApp v) (And (Eq 2 (Sz v)) (Eq "path" (Ix 0 v))))
+      (path-text (Ix 1 v)))
+    ((IsNat v) (atom-str v))
+    (else
+      (strcat
+        ["(" (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+         ")"]))))
+
+;; A message that may be a bare string or a row of message parts.
+(define (diag-flat v)
+  (If (And (IsApp v) (Nil (ty-node? v)))
+    (join-str " " (map diag-val (gen (Sz v) (lambda (i) (Ix i v)))))
+    (diag-val v)))
+
+;; Details shaped as label/value pairs get an aligned line each;
+;; anything else renders on a single line.  0 means "no detail".
+(define (detail-lines detail)
+  (define (labels? v)
+    (Ifz (Sz v) 1
+      (And (Gt (Sz v) 1)
+        (And (IsNat (_0 v)) (labels? (drop 2 v))))))
+  (define (pair-lines v)
+    (Ifz (Sz v) []
+      (cons (strcat ["  " (atom-str (_0 v)) ": " (diag-val (_1 v))])
+        (pair-lines (drop 2 v)))))
+  (cond
+    ((Ifz detail 1 0) [])
+    ((And (IsApp detail) (labels? detail)) (pair-lines detail))
+    (else [(strcat ["  " (diag-flat detail)])])))
+
+;; Module-pass diagnostics: ["in-decl" name msg blurb].  The msg may
+;; itself be a located error payload (per-decl parse recovery); then
+;; its own message and location win.
+(define (in-decl-line d)
+  (define msg (Ix 2 d))
+  (define tag (diag-tag msg))
+  (If (Or (Eq tag "foil-sast-error") (Eq tag "foil-elab-error"))
+    (strcat ["  in " (path-text (Ix 1 d)) " (" (at-text (Ix 1 (Ix 2 msg)))
+             "): " (diag-flat (Ix 1 msg))])
+    (strcat ["  in " (path-text (Ix 1 d)) " (" (at-text (Ix 3 d)) "): "
+             (diag-flat msg)])))
+
+;; Pretty lines for a compiler error payload; anything unrecognized
+;; falls back to the plain structural rendering.
+(define (diag-lines e)
+  (define tag (diag-tag e))
+  (cond
+    ((Eq tag "foil-elab-error")
+      (Weld
+        [(diag-flat (Ix 1 e))
+         (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])]
+        (detail-lines (Ix 3 e))))
+    ((Eq tag "foil-sast-error")
+      [(diag-flat (Ix 1 e))
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-import-cycle")
+      [(strcat ["import cycle: module " (diag-val (Ix 1 (Ix 1 e)))
+                " is already being imported"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-import-collision")
+      [(strcat ["import collision: " (path-text (Ix 1 (Ix 1 e)))
+                " is declared more than once"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-duplicate-decl")
+      [(strcat ["duplicate declaration: " (path-text (Ix 1 (Ix 1 e)))
+                " is declared more than once"])
+       (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])])
+    ((Eq tag "foil-type-wf")
+      (cons "types are not well-formed" (map in-decl-line (Ix 1 e))))
+    ((Eq tag "foil-unsupported")
+      (cons "unsupported syntax" (map in-decl-line (Ix 1 e))))
+    ;; Per-decl elaboration failures: [[name err] ...], every failed
+    ;; decl of the module at once.
+    ((Eq tag "foil-elab-errors")
+      (cons "the module does not elaborate"
+        (foldl
+          (lambda (acc d)
+            (Weld acc
+              (cons (strcat ["  in " (path-text (Ix 0 d)) ":"])
+                (map (strWeld "    ") (diag-lines (Ix 1 d))))))
+          []
+          (Ix 1 e))))
+    ((Eq tag "foil-in-module")
+      (cons (strcat ["in module " (atom-str (Ix 1 e)) ":"])
+        (map (strWeld "  ") (diag-lines (Ix 2 e)))))
+    (else [(render-plain e)])))
+
+(define (diag-text e) (join-str diag-nl (diag-lines e)))
+
+;;; Law decompilation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Decompile a law body back to readable form: 0=self, 1..a=args
+;; (a b c ...), a+i = let refs (x1 x2 ...), (0 x) quotes, (0 f x) apps.
+(define (render-law-body name arity nlets body)
+  (define maxref (Add arity nlets))
+  (define (ref-name r)
+    (cond
+      ((Eq r 0) (atom-str name))
+      ((Le r arity) (strcat [(Add 96 r)]))
+      (else (strcat ["x" (showNat (Sub r arity))]))))
+  (define (go b)
+    (cond
+      ((And (IsNat b) (Le b maxref)) (ref-name b))
+      ((IsNat b) (atom-str b))
+      ((And (IsApp b) (And (Eq (Hd b) 0) (Eq 1 (Sz b))))
+        (render-plain (_0 b)))
+      ((And (IsApp b) (Eq (Hd b) 0))
+        (strcat
+          ["(" (join-str " " (map go (gen (Sz b) (lambda (i) (Ix i b))))) ")"]))
+      (else (render-plain b))))
+  (go body))
+
+(define (law-lets body acc)
+  (If (And (IsApp body) (And (Eq (Hd body) 1) (Eq 2 (Sz body))))
+    (law-lets (_1 body) (snoc (_0 body) acc))
+    [acc body]))
+
+(define (render-law v)
+  (define l (law-of v))
+  (define a (Arity l))
+  (define parts (law-lets (Body l) []))
+  (define lets (_0 parts))
+  (define inner (_1 parts))
+  (define nlets (Sz lets))
+  (define args
+    (join-str " " (gen a (lambda (i) (strcat [(Add 97 i)])))))
+  (define let-strs
+    (gen nlets
+      (lambda (i)
+        (strcat ["  x" (showNat (Inc i)) " := "
+                 (render-law-body (Name l) a nlets (Ix i lets)) 10]))))
+  (strcat
+    [(If (IsPin v) "#pin " "") "law " (atom-str (Name l)) "(" args ")" 10
+     (strcat let-strs)
+     "  " (render-law-body (Name l) a nlets inner)]))
+
+;;; Doctest result lines ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Doctest values render numerically unless they are readable text —
+;; render-plain alone shows nat 99 as "c".
+(define (dt-val v)
+  (If (And (IsNat v) (Nil (And (printable-text? v) (Gt (Bytes v) 1))))
+    (showNat v)
+    (render-plain v)))
+
+(define (dt-res-line r[status line got want])
+  (strcat
+    ["  " status "  " line
+     (If (Eq "fail" status)
+       (strcat ["    got " (dt-val got) "  want " (dt-val want)])
+       "")]))

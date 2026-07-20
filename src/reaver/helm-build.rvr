@@ -1,0 +1,220 @@
+;;;; The build chore families: eval, compile (resync one module), and
+;;;; save — forge's workspace engine as namespace operations.  Each
+;;;; rides the generic chore driver (helm-chore.rvr): a build/*_req
+;;;; record made under the chore driver's /io name selects the family;
+;;;; results poke back onto the request node, and a recompile's
+;;;; remount rides the same cmd stream as mkp writes onto the /boot
+;;;; mirror nodes.
+;;;;
+;;;; Families:
+;;;;   'eval     ['mod] ['expr]        -> ['value] ['ty] ['law] | ['err]
+;;;;   'compile  ['mod]                -> ['report] ['changed/added/removed]
+;;;;                                      + mirror remount of the module
+;;;;   'save     ['mod] ['src]         -> write source, then 'compile
+;;;;
+;;;; v1 scope: 'compile requires ['mod] (whole-roster staleness sync
+;;;; needs persistent stamps the boot does not yet keep); evaluation
+;;;; uses the boot mirror cache's per-module subjects, so a resync's
+;;;; new compile is visible to later evals only through the mirror
+;;;; remount, not the eval subject — the buddy replacement (phase 3)
+;;;; carries live state.
+;;;;
+;;;; MAIN warming: the boot warm block calls each family's plan and a
+;;;; tiny eval/compile once — leaf actors only replay compiled paths.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+(#bind foil-lore (#module foil-lore))
+
+(#bind foil-render (#module foil-render))
+
+(#bind doctest (#module doctest))
+
+(#bind helm (#module helm))
+
+(define (ts s) ("ts" s))
+
+;; bs = [core mcache]: the compiled core (for entry constructors) and
+;; the boot mirror cache ([name subject decl-keys imported lore] rows).
+(define (b-core bs) (Ix 0 bs))
+(define (b-cache bs) (Ix 1 bs))
+(define (b-ent bs path) (helm:core-ent (b-core bs) path))
+
+(define (cache-mod bs mod)
+  (find (lambda (me) (Eq mod (_0 me))) (b-cache bs)))
+
+;;; Result records (constructed through compiled build.foil entries) ;;;;;;;;;;;;;;
+
+(define (val-myth bs val tyv)
+  ((b-ent bs ["build" "val_t"])
+    ;; dt-val, not render-plain: small printable nats (42, 97..) must
+    ;; render as decimals, not their bytes
+    (foil-render:dt-val val)
+    (foil-render:ty-text tyv)
+    (If (foil-render:law-like? val) (foil-render:render-law val) 0)))
+
+(define (err-myth bs e)
+  ((b-ent bs ["build" "err_t"]) (foil-render:diag-text e)))
+
+(define (poke-req bs reqnode t)
+  ((b-ent bs ["chore" "poke_t"]) reqnode t))
+
+;;; 'eval — one expression against a module's own compiled subject ;;;;;;;;;;;;;;;;
+
+(define (eval-plan bs rec reqnode)
+  (define txt-at (b-ent bs ["myth" "txt_at"]))
+  (define mod (txt-at [(ts "mod")] rec))
+  (define expr (txt-at [(ts "expr")] rec))
+  (If (Or (Nil mod) (Nil expr))
+    ["ERR" (ts "eval_args")]
+    ["JOBS" [[reqnode 0 [mod expr reqnode]]]]))
+
+(define (eval-run bs payload c)
+  (define mod (Ix 0 payload))
+  (define expr (Ix 1 payload))
+  (define reqnode (Ix 2 payload))
+  (define hit (cache-mod bs mod))
+  (If (Ifz hit 1 0)
+    [[(poke-req bs reqnode (err-myth bs ["unknown module" mod]))] 0 1]
+    (let ((r (doctest:eval-text (_1 (_0 hit)) expr)))
+      (If (Eq 1 (Hd r))
+        [[(poke-req bs reqnode (err-myth bs (_0 r)))] 0 1]
+        [[(poke-req bs reqnode
+            (val-myth bs (_0 (_0 r)) (_1 (_0 r))))]
+         1 0]))))
+
+;;; 'compile — recompile one module against the boot cache, report, ;;;;;;;;;;;;;;;
+;;; and remount its mirror nodes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The structural changeset between the old and new compiles of a
+;; module: own keys added/removed, shared keys whose compiled entries
+;; differ — forge's changeset-panel core, as mirror paths.
+(define (changeset-of mod old-me new-me)
+  (define old-keys (helm:entry-own-keys old-me))
+  (define new-keys (helm:entry-own-keys new-me))
+  (define (node k) (helm:boot-ent-node mod (drop 1 k)))
+  (define added
+    (map node
+      (filter (lambda (k) (Nil (includes (Equal k) old-keys))) new-keys)))
+  (define removed
+    (map node
+      (filter (lambda (k) (Nil (includes (Equal k) new-keys))) old-keys)))
+  (define changed
+    (map node
+      (filter
+        (lambda (k)
+          (And (includes (Equal k) old-keys)
+            (Nil (Equal (got-entry k (_1 old-me)) (got-entry k (_1 new-me))))))
+        new-keys)))
+  [changed added removed])
+
+;; Doctest tally over a fresh compile's lore: [passed failed].
+(define (lore-tally sut lore)
+  (foldl
+    (lambda (acc l)
+      (let* ((rs (doctest:run-lore sut l))
+             (np (foldl (lambda (a r) (If (Ix 1 r) (Inc a) a)) 0 rs)))
+        [(Add (Ix 0 acc) np) (Add (Ix 1 acc) (Sub (Sz rs) np))]))
+    [0 0] lore))
+
+(define nl (strcat [10]))
+
+;; Recompile mod against the mirror cache (the module itself evicted,
+;; imports served from cache), then: report text, changeset, remount
+;; cmds.  -> [cmds passed failed]
+(define (resync-run bs payload c)
+  (define mod (Ix 0 payload))
+  (define reqnode (Ix 1 payload))
+  (define old-hit (cache-mod bs mod))
+  (define cache1
+    (filter (lambda (me) (Ne mod (_0 me))) (b-cache bs)))
+  (define r
+    (Try
+      (lambda (z)
+        (let ((cr (foil:compile-mod-info-cached
+                    cache1 foil:default-subject mod)))
+          (DeepSeq cr cr)))
+      0))
+  (If (Eq 1 (Hd r))
+    ;; does not compile: the pretty diagnostic is the whole answer
+    [[(poke-req bs reqnode (err-myth bs (_0 r)))] 0 1]
+    (let* ((info (_1 (_0 r)))
+           (sut (Ix 0 info))
+           (lore (Ix 2 info))
+           (new-me
+             (let ((ce (_0 (find (lambda (e) (Eq mod (_0 e))) (_0 (_0 r))))))
+               [mod sut (Ix 2 ce) (Ix 3 ce) lore]))
+           (dt (lore-tally sut lore))
+           (cs (If (Ifz old-hit 1 0)
+                 [[] (map (lambda (k) (helm:boot-ent-node mod (drop 1 k)))
+                       (helm:entry-own-keys new-me)) []]
+                 (changeset-of mod (_0 old-hit) new-me)))
+           (report
+             (strcat
+               ["compiled " mod ": "
+                (showNat (Sz (Ix 0 cs))) " changed, "
+                (showNat (Sz (Ix 1 cs))) " added, "
+                (showNat (Sz (Ix 2 cs))) " removed" nl
+                "doctests: " (showNat (Ix 0 dt)) " passed, "
+                (showNat (Ix 1 dt)) " failed"]))
+           (rep-myth
+             ((b-ent bs ["build" "report_t"]) report))
+           (cs-myth
+             ((b-ent bs ["build" "changeset_t"])
+               (Ix 0 cs) (Ix 1 cs) (Ix 2 cs)))
+           ;; remount: the module's fresh mirror records, every write
+           ;; a make-retried-as-poke so live nodes update in place
+           (mkp (b-ent bs ["chore" "mkp_t"]))
+           (remount
+             (map (lambda (p) (mkp (Ix 0 p) (Ix 1 p)))
+               (helm:boot-mirror-pairs-with (b-core bs) [new-me])))
+           (cmds
+             (Weld remount
+               [(poke-req bs reqnode rep-myth)
+                (poke-req bs reqnode cs-myth)])))
+      [cmds (Ix 0 dt) (Ix 1 dt)])))
+
+(define (compile-plan bs rec reqnode)
+  (define mod ((b-ent bs ["myth" "txt_at"]) [(ts "mod")] rec))
+  (If (Nil mod)
+    ["ERR" (ts "mod_required")]
+    ["JOBS" [[reqnode 0 [mod reqnode]]]]))
+
+;;; 'save — write the source, then resync ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (save-plan bs rec reqnode)
+  (define txt-at (b-ent bs ["myth" "txt_at"]))
+  (define mod (txt-at [(ts "mod")] rec))
+  (define src (txt-at [(ts "src")] rec))
+  (If (Or (Nil mod) (Nil src))
+    ["ERR" (ts "save_args")]
+    ["JOBS" [[reqnode 0 [mod reqnode src]]]]))
+
+(define (save-run bs payload c)
+  (define mod (Ix 0 payload))
+  (define src (Ix 2 payload))
+  (Seq (write-text-file (strcat ["foil/" mod ".foil"]) src)
+    (resync-run bs [mod (Ix 1 payload)] c)))
+
+;;; The registry rows ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (eval-family bs)
+  [(ts "eval") (eval-plan bs) (eval-run bs)])
+
+(define (compile-family bs)
+  [(ts "compile") (compile-plan bs) (resync-run bs)])
+
+(define (save-family bs)
+  [(ts "save") (save-plan bs) (save-run bs)])
+
+(define (build-families bs)
+  [(eval-family bs) (compile-family bs) (save-family bs)])

@@ -1,0 +1,274 @@
+;;;; The chore driver: a generic helm worker running computations off
+;;;; the coordinator's event loop.  Requests ride the namespace like
+;;;; fetch's: a chore/req record MADE under /io/<name> selects a
+;;;; boot-registered family by its ['fam] quip (defaulting to the
+;;;; driver config's); the family plans jobs, each job runs in its own
+;;;; leaf actor, and the results come back as chore/cmd writes plus a
+;;;; pass/fail count.  When a request's jobs drain the worker pokes
+;;;; ['res_done]/['passed]/['failed] onto the request node and clears
+;;;; its fresh marker.
+;;;;
+;;;; A family is [fam-quip plan run]:
+;;;;   (plan req-myth reqnode) -> ["JOBS" [[node want-case payload] ..]]
+;;;;                             or ["ERR" quip]; runs in the worker
+;;;;                             under Try.  reqnode is the request
+;;;;                             record's own path — jobs that answer
+;;;;                             onto the request carry it in their
+;;;;                             payload.  want-case asks the node's
+;;;;                             current version first (the staleness
+;;;;                             anchor); its reply rides to run.
+;;;;   (run payload maybe-c)  -> [cmds passed failed]; runs in a leaf
+;;;;                             actor under Try — cmds is a row of
+;;;;                             foil chore/cmd values.
+;;;;
+;;;; Computations must be MAIN-warmed: spawned actors have no
+;;;; compiler, so a family's call graph is compiled once in MAIN at
+;;;; boot (the helm-http warm block) and the leaves only replay it.
+;;;; A family's run MAY use async:async-map-deep internally for fan
+;;;; out — a leaf's mailbox is quiet after the handshake — provided
+;;;; those paths are warmed too.
+;;;;
+;;;; Worker mailbox:
+;;;;   from the coordinator: ["go" res] ["change" pax res]
+;;;;     ["qres" pax res] ["cres" pax c] ["ack" rsvp] ["die"]
+;;;;   from leaf actors: ["jres" kid result]
+;;;;
+;;;; Correlation: worker->coordinator sends are FIFO and the
+;;;; coordinator replies within its turn, so "cres" replies return in
+;;;; job order and acks in cmd order — two FIFO queues.  "jres"
+;;;; results need no ordering: cmds are self-contained and the
+;;;; pass/fail account is commutative, so leaves run concurrently.
+;;;;
+;;;; cs = ["C" fetch/fresh chore/fam_of chore/done_t chore/fail_t
+;;;;       chore/clear_t chore/cmd_parts vine_poke vine_make] —
+;;;;       compiled foil entries, supplied by the spawner.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(define (c-fresh cs) (Ix 1 cs))
+(define (c-fam cs) (Ix 2 cs))
+(define (c-done cs) (Ix 3 cs))
+(define (c-fail cs) (Ix 4 cs))
+(define (c-clear cs) (Ix 5 cs))
+(define (c-parts cs) (Ix 6 cs))
+(define (c-poke cs) (Ix 7 cs))
+(define (c-make cs) (Ix 8 cs))
+
+(define (ts s) ("ts" s))
+
+(define (row-has k xs) (includes (Equal k) xs))
+(define (row-drop k xs) (filter (lambda (e) (Nil (Equal k e))) xs))
+(define (row-weld a b) (foldl (flip snoc) a b))
+
+;; One actor per job: handshake for the worker handle, run the
+;; computation, hand the result back.  The Try-then-DeepSeq INSIDE the
+;; leaf (async.rvr's future-run discipline) is what makes the work
+;; happen here, off the worker — and a job that kills its eval must
+;; not kill the driver.
+(define (chore-actor run payload c kid self)
+  (define mc (Recv 0))
+  (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
+  (define r (Try (lambda (z) (let ((v (run payload c))) (DeepSeq v v))) 0))
+  (define m ["jres" kid r])
+  (Seq (DeepSeq m m)
+    (Send wh m)))
+
+(define (mk-chore-worker cs fams name self)
+  (define mc (Recv 0))
+  (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
+  (define rec0 (_1 (Ix 0 mc)))
+  (define dpath [(ts "io") name])
+  (define (rpath kid) [(ts "io") name kid])
+  ;; the driver config's default family (0: requests must carry one)
+  (define cfgfam
+    (If (Eq "/boot/res/known" (Hd rec0))
+      ((c-fam cs) 0 (_0 rec0))
+      0))
+  (define (fresh-kids claimed m)
+    (filter (lambda (k) (Nil (row-has k claimed))) ((c-fresh cs) m)))
+  (define (read-kids kids)
+    (map (lambda (k) (SendCaps coord (DeepSeq k ["read" (rpath k)]) [0]))
+      kids))
+  (define (spawn-leaf run payload c kid)
+    (Seq (DeepSeq payload (DeepSeq c c))
+      (let ((la (Spawn (chore-actor run payload c kid))))
+        (SendCaps la ["go"] [0]))))
+  ;; state: claimed/reading as fetch; jobs = FIFO [kid payload run]
+  ;; awaiting "cres"; counts = [[kid pending passed failed] ..];
+  ;; queue = [[kid kind extra] ..] ack correlation
+  ;; the queue is forced before every Recv: send-cmd's Sends ride the
+  ;; queue value, and an unforced queue is a command never sent
+  (define (loop claimed reading jobs counts queue)
+    (define m (Seq (DeepSeq queue queue) (Recv 0)))
+    (define msg (Ix 0 m))
+    (define kind (_0 msg))
+    ;; queue2 is forced FIRST: chained send-cmds fire in row order, so
+    ;; result writes commit before the completion poke that announces
+    ;; them (and acks correlate with queue rows).  A lazily-forced
+    ;; chain would run the sends outermost-first — the http bridge saw
+    ;; ['res_done] land before the ['value] it announces.
+    (define (send-cmd kid ckind extra task queue2)
+      (let ((qf (DeepSeq queue2 queue2))
+            (cm ["cmd" name task]))
+        (Seq qf
+          (Seq (DeepSeq cm cm)
+            (Seq (Send coord cm)
+              (snoc [kid ckind extra] qf))))))
+    ;; a request finishes: completion poke + marker clear
+    (define (close kid resmyth queue2)
+      (send-cmd kid "clear" 0 ((c-poke cs) dpath ((c-clear cs) kid))
+        (send-cmd kid "res" 0 ((c-poke cs) (rpath kid) resmyth)
+          queue2)))
+    (define (finish kid passed failed queue2)
+      (close kid ((c-done cs) passed failed) queue2))
+    ;; interpret one chore/cmd value into a queued coordinator write
+    (define (send-parts kid parts queue2)
+      (let ((k (Ix 0 parts))
+            (pax (Ix 1 parts))
+            (t (Ix 2 parts)))
+        (cond
+          ((Eq k 0)
+            ;; make retried as poke when the node exists ("ack")
+            (send-cmd kid "mkp" [pax t] ((c-make cs) pax t) queue2))
+          ((Eq k 1)
+            (send-cmd kid "make" 0 ((c-make cs) pax t) queue2))
+          (else
+            (send-cmd kid "poke" 0 ((c-poke cs) pax t) queue2)))))
+    (cond
+      ((Eq kind "change")
+        (let ((res (_2 msg)))
+          (If (Or (Nil (Equal dpath (_1 msg)))
+                (Nil (Eq "/boot/res/known" (Hd res))))
+            (loop claimed reading jobs counts queue)
+            (let* ((kids (fresh-kids claimed (_0 res)))
+                   (sends (read-kids kids)))
+              (Seq (DeepSeq sends sends)
+                (loop (row-weld claimed kids) (row-weld reading kids)
+                  jobs counts queue))))))
+      ((Eq kind "qres")
+        (let ((kid (Ix 2 (_1 msg)))
+              (res (_2 msg)))
+          (If (Nil (row-has kid reading))
+            (loop claimed reading jobs counts queue)
+            (let ((reading2 (row-drop kid reading)))
+              (If (Nil (Eq "/boot/res/known" (Hd res)))
+                ;; culled before the read: just clear the marker
+                (loop claimed reading2 jobs counts
+                  (send-cmd kid "clear" 0
+                    ((c-poke cs) dpath ((c-clear cs) kid))
+                    queue))
+                (let* ((rec (_0 res))
+                       (fam ((c-fam cs) cfgfam rec))
+                       (hit (find (lambda (f) (Equal fam (Ix 0 f))) fams)))
+                  (Ifz hit
+                    ;; no such family: answer the failure in place
+                    (loop claimed reading2 jobs counts
+                      (close kid ((c-fail cs) (ts "fam_unknown")) queue))
+                    (let* ((plan (Ix 1 (_0 hit)))
+                           (run (Ix 2 (_0 hit)))
+                           (px (Try (lambda (z)
+                                      (let ((p (plan rec (rpath kid))))
+                                        (DeepSeq p p)))
+                                 0))
+                           (pr (If (Eq 1 (Hd px))
+                                 (Seq (Trace ["chore: plan failed" fam (_0 px)] 0)
+                                   ["ERR" (ts "plan_failed")])
+                                 (_0 px))))
+                      (If (Eq "ERR" (Ix 0 pr))
+                        (loop claimed reading2 jobs counts
+                          (close kid ((c-fail cs) (Ix 1 pr)) queue))
+                        (let ((js (Ix 1 pr)))
+                          (If (Eq 0 (Sz js))
+                            ;; nothing to do: answer done, all zero
+                            (loop claimed reading2 jobs counts
+                              (finish kid 0 0 queue))
+                            ;; want-case jobs queue behind a version
+                            ;; query; the rest go straight to a leaf
+                            (let* ((cased (filter (lambda (j) (Ix 1 j)) js))
+                                   (plain (filter (lambda (j) (Nil (Ix 1 j))) js))
+                                   (sends
+                                     (map
+                                       (lambda (j)
+                                         (SendCaps coord
+                                           (DeepSeq j ["case" (Ix 0 j)]) [0]))
+                                       cased))
+                                   (spawns
+                                     (map
+                                       (lambda (j)
+                                         (spawn-leaf run (Ix 2 j) 0 kid))
+                                       plain)))
+                              (Seq (DeepSeq sends (DeepSeq spawns spawns))
+                                (loop claimed reading2
+                                  (row-weld jobs
+                                    (map (lambda (j) [kid (Ix 2 j) run]) cased))
+                                  (snoc [kid (Sz js) 0 0] counts)
+                                  queue))))))))))))))
+      ((Eq kind "cres")
+        ;; FIFO: this reply answers the head job — its leaf runs with
+        ;; the node's version in hand
+        (let* ((job (Ix 0 jobs))
+               (jobs2 (drop 1 jobs))
+               (kid (Ix 0 job))
+               (payload (Ix 1 job))
+               (run (Ix 2 job))
+               (c (_2 msg)))
+          (Seq (spawn-leaf run payload c kid)
+            (loop claimed reading jobs2 counts queue))))
+      ((Eq kind "jres")
+        ;; a leaf finished: queue its writes, settle the account
+        (let* ((kid (_1 msg))
+               (rx (_2 msg))
+               (jr (If (Eq 1 (Hd rx))
+                     (Seq (Trace ["chore: run failed" (_0 rx)] 0)
+                       [[] 0 0])
+                     (_0 rx)))
+               (cmds (Ix 0 jr))
+               (np (Ix 1 jr))
+               (nf (Ix 2 jr))
+               (ct (find (lambda (e) (Equal kid (Ix 0 e))) counts))
+               (cte (_0 ct))
+               (passed (Add (Ix 2 cte) np))
+               (failed (Add (Ix 3 cte) nf))
+               (pending (Sub (Ix 1 cte) 1))
+               (counts2
+                 (filter (lambda (e) (Nil (Equal kid (Ix 0 e)))) counts))
+               (queue2
+                 (foldl
+                   (lambda (q cmd) (send-parts kid ((c-parts cs) cmd) q))
+                   queue cmds)))
+          (If (Eq 0 pending)
+            (loop claimed reading jobs counts2
+              (finish kid passed failed queue2))
+            (loop claimed reading jobs
+              (snoc [kid pending passed failed] counts2)
+              queue2))))
+      ((Eq kind "ack")
+        (let ((head (Ix 0 queue))
+              (rest (drop 1 queue))
+              (rsvp (_1 msg)))
+          (cond
+            ((And (Eq "/boot/rsvp/no" (Hd rsvp)) (Equal "mkp" (Ix 1 head)))
+              ;; the target already exists: re-send as a poke
+              (let ((extra (Ix 2 head)))
+                (loop claimed reading jobs counts
+                  (send-cmd (Ix 0 head) "mkp2" 0
+                    ((c-poke cs) (Ix 0 extra) (Ix 1 extra))
+                    rest))))
+            ((Eq "/boot/rsvp/no" (Hd rsvp))
+              (Seq (Trace ["chore: cmd failed" (Ix 0 head) (Ix 1 head)] 0)
+                (loop claimed reading jobs counts rest)))
+            ((Equal "clear" (Ix 1 head))
+              (loop (row-drop (Ix 0 head) claimed) reading jobs counts rest))
+            (else (loop claimed reading jobs counts rest)))))
+      ((Eq kind "die") ["dead"])
+      (else (loop claimed reading jobs counts queue))))
+  (define kids0
+    (If (Eq "/boot/res/known" (Hd rec0)) (fresh-kids [] (_0 rec0)) []))
+  (define sends0 (read-kids kids0))
+  (Seq coord
+    (Seq (DeepSeq kids0 (DeepSeq sends0 sends0))
+      (loop kids0 kids0 [] [] []))))

@@ -1,22 +1,19 @@
 # Launch the lain namespace over HTTP — the helm coordinator, the
-# HTTP driver at /io/http, and the weft namespace explorer — on port
-# 8090.  Builds the snapshot first if needed (same staging as x/test).
+# HTTP driver at /io/http, and the weft namespace explorer.
 #
-#   x/lain            # port 8090
-#   x/lain 9000       # custom port
-#   x/lain --fresh    # rebuild the precompiled image even if valid
+#   x/lain            # resume run/lain (or fresh-boot if none), port 8090
+#   x/lain 9000       # custom port (fresh boots only — a resumed
+#                     # serve keeps the port baked into its snapshot)
+#   x/lain --fresh    # discard run/lain and boot from source
 #
 # Then browse http://localhost:<port>/ns
 #
-# Startup is two sessions.  The warm session refreshes _lain_image_v1
-# (a precompiled helm core — helm.rvr "Persistent precompiled image")
-# and exits, which persists it through the ordinary top-of-loop
-# snapshot save; the serve session then boots from the image without
-# compiling anything.  The compile only reruns when a foil source in
-# helmapp's import closure, the compiler, or the loader changed.  The
-# serve session itself never persists: the repl saves before
-# evaluating run-lain-image and the serve form parks forever, so
-# killing and restarting the server replays the image, not the build.
+# Lifecycle: a fresh boot stages the repl snapshot if missing, clones
+# it into run/lain/snap, and compiles the world from source in the
+# serve session (helm-run.rvr run-lain-serve).  The serve Saves a
+# resume-continuation pin into run/lain/snap after every committed
+# event, so starting that snapshot resumes the namespace — the
+# snapshot is the only build cache there is.
 
 set -ex
 
@@ -27,6 +24,10 @@ if [ "${1:-}" = "--fresh" ]; then
 fi
 
 PORT="${1:-8090}"
+
+ROOT="$(pwd)"
+WISP="$(command -v wisp || echo "$ROOT/wisp")"
+SERVE_DIR="run/lain"
 
 reset () {
 	wisp --file-root ./src ./src/plan reaver main
@@ -51,51 +52,28 @@ load_quip () {
 EOF
 }
 
-if [ ! -e snap/root.plan ]
+# Resume: the serve snapshot's last pin is the namespace continuation.
+if [ -z "$FRESH" ] && [ -e "$SERVE_DIR/snap/data.mdb" ]; then
+  echo "resuming lain from $SERVE_DIR/snap (x/lain --fresh discards it)" >&2
+  cd "$SERVE_DIR"
+  exec "$WISP" --file-root "$ROOT/src" snap root _ </dev/null
+fi
+
+if [ ! -e snap/data.mdb ]
 then reset; load_stdlib; load_quip
 fi
 
-# One snapshot warmer at a time (shared with x/foil-cache: concurrent
-# resumed sessions would interleave their snapshot appends).
-lock=snap/.foil-artifact-cache.lock
-while ! mkdir "$lock" 2>/dev/null; do sleep 1; done
-log="${TMPDIR:-/tmp}/lain-warm-$$.log"
-cleanup() {
-  rmdir "$lock" 2>/dev/null || true
-  rm -f "$log"
-}
-trap cleanup EXIT INT TERM
-
-warm () {
-  repl >"$log" 2>&1 <<EOF
-(#bind helm (#module helm))
-(#bind _lain_image_v1 (helm:helm-image-refresh $1 "helmapp"))
-EOF
-}
-
-echo "warming lain image (a source change means a full rebuild)" >&2
-warm_status=0
-if [ -n "$FRESH" ]; then
-  warm 0 || warm_status=$?
-else
-  warm _lain_image_v1 || warm_status=$?
-  # First run against a snapshot that has never bound the image.
-  if grep -q '"ERROR"' "$log" && grep -q '"unbound"' "$log"; then
-    warm_status=0
-    warm 0 || warm_status=$?
-  fi
-fi
-if [ "$warm_status" -ne 0 ] || grep -q '"ERROR"' "$log"; then
-  tail -80 "$log" >&2
-  exit 1
-fi
-
-rmdir "$lock" 2>/dev/null || true
-trap 'rm -f "$log"' EXIT INT TERM
+# Fresh serve: COW-clone the staged repl snapshot into the serve dir
+# so the serve session's Saves land in run/lain/snap.
+rm -rf "$SERVE_DIR"
+mkdir -p "$SERVE_DIR/snap"
+cp -c snap/data.mdb "$SERVE_DIR/snap/" 2>/dev/null || cp snap/data.mdb "$SERVE_DIR/snap/"
+cp -c snap/pins.pack "$SERVE_DIR/snap/" 2>/dev/null || cp snap/pins.pack "$SERVE_DIR/snap/"
 
 echo "lain exploring on http://localhost:${PORT}/ns" >&2
 
-repl <<EOF
-(#bind helm-http (#module helm-http))
-(helm-http:run-lain-image ${PORT} _lain_image_v1)
+cd "$SERVE_DIR"
+"$WISP" --file-root "$ROOT/src" snap root _ <<EOF
+(#bind helm-run (#module helm-run))
+(helm-run:run-lain-serve ${PORT})
 EOF

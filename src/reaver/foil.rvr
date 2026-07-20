@@ -17,6 +17,8 @@
 (#bind foil-elab (#module foil-elab))
 (#bind foil-lower (#module foil-lower))
 (#bind foil-lore (#module foil-lore))
+(#bind ty (#module foil-types))
+(#bind parse (#module parse))
 
 ;;; Public parsing API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -444,6 +446,128 @@
 ;; fix (merged July 2026; doc/enki-actor-report.md).
 (define (compile-mods-par mods)
   (async:async-all-deep (lambda (m) (compile-mod default-subject m)) mods))
+
+
+;;; Reference index — who-calls as a query over the TCs ;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; (moved from forge with the renderers: the mirror writes these as
+;;; namespace slots, forge rebinds)
+
+(define (fold-kids f acc row)
+  (define (go i acc)
+    (If (Ge i (Sz row)) acc (go (Inc i) (f acc (Ix i row)))))
+  (go 0 acc))
+
+(define (snoc-new x xs)
+  (If (includes (Equal x) xs) xs (snoc x xs)))
+
+;; Collect ["call" path] (TC_GLOBAL) and ["type" path] (TNOM) refs.
+(define (collect-refs tcv)
+  (define (go acc v)
+    (Ifz (IsApp v) acc
+      (cond
+        ((Eq (Hd v) "TC_GLOBAL")
+          (snoc-new ["call" (foil-subject:tc-global-path v)] acc))
+        ((And (Eq (_0 v) "type") (Eq (_1 v) "TNOM"))
+          (fold-kids go (snoc-new ["type" (ty:tnom-ref v)] acc) v))
+        (else (fold-kids go acc v)))))
+  (go [] tcv))
+
+(define builtin-paths (foil-subject:subject-order default-subject))
+
+;; Compiled declarations live under the compilation root (/boot);
+;; source-facing names (URLs, lore keys, ns grouping) are relative.
+(define comp-root (foil-subject:sut-root default-subject))
+(define (unroot p)
+  (If (And (Ge (Sz p) (Sz comp-root))
+        (Equal comp-root (take (Sz comp-root) p)))
+    (drop (Sz comp-root) p)
+    p))
+
+(define (module-paths sut)
+  (filter (lambda (p) (Nil (includes (Equal p) builtin-paths)))
+    (foil-subject:subject-order sut)))
+
+;; Row of [src-path kind dst-path] over the module's entries.
+;; References to generic members ride /ty-ap-encoded selectors
+;; (bst/size[v]) — normalize dst to the base entry so who-calls
+;; matches the entry pages, and dedupe the instantiation spellings
+;; that collapse together.
+(define (ref-table sut)
+  (define (entry-refs acc path)
+    (define rows
+      (map (lambda (r) [path (_0 r) (foil-subject:resolve-path (_1 r))])
+        (collect-refs (foil-subject:got-entry-tc path sut))))
+    (foldl
+      (lambda (a r) (If (includes (Equal r) a) a (snoc r a)))
+      acc rows))
+  (foldl entry-refs [] (module-paths sut)))
+
+(define (refs-from table path)
+  (filter (lambda (r) (Equal path (_0 r))) table))
+(define (refs-to table path)
+  (filter (lambda (r) (Equal path (_2 r))) table))
+
+;;; Module discovery and staleness stamps ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; (moved from forge: the resync chore family stats these)
+
+(define (get-extension fnam) (Last (parse:split-str "." fnam)))
+
+;; "bst.foil" -> "bst" (only called on names known to end in .foil)
+(define (strip-foil fnam)
+  (foil-lore:str-slice 0 (Sub (Bytes fnam) 5) fnam))
+
+;; Module names under a file root: one per .foil file, named the way
+;; the compiler expects — relative to the root, no extension ("bst",
+;; "apps/life/main").
+(define (read-fs-tree root)
+  (define listing (ReadFolder root))
+  (foldl
+    (lambda (acc arg[folder? name])
+      (cond
+        (folder?
+          (Weld acc
+            (map (lambda (m) (strcat [name "/" m]))
+              (read-fs-tree (strcat [root "/" name])))))
+        ((Equal "foil" (get-extension name))
+          (snoc (strip-foil name) acc))
+        (else acc)))
+  [] listing))
+
+;; Transitive import closure of a module, by parsing import runes.
+(define (import-closure mod)
+  (define (go seen pend)
+    (Ifz (Sz pend)
+      seen
+      (let* ((name (_0 pend))
+             (rest (drop 1 pend)))
+        (If (includes (Eq name) seen)
+          (go seen rest)
+          (go (snoc name seen) (Weld rest (module-imports name)))))))
+  (go [] (module-imports mod)))
+
+(define (mod-stamp n)
+  (Stamp (strcat ["foil/" n ".foil"])))
+
+;; Stamp snapshot of everything a module's compile reads: the module
+;; itself plus its transitive import closure, one [name mtime] pair
+;; each, under the second the snapshot was taken.  Fresh means every
+;; stamp is unchanged AND predates that second — mtimes are whole
+;; seconds, so a file rewritten within the second it was stamped
+;; keeps its stamp and cannot be trusted (make's rule; the cost is
+;; one spurious recompile, converging the next second).  The tag
+;; also retires entries persisted in the old byte-snapshot shape.
+(define (import-snapshot mod)
+  ["STAMPS" (Now 0)
+   (map (lambda (n) [n (mod-stamp n)]) (snoc mod (import-closure mod)))])
+
+(define (snapshot-fresh? snap)
+  (And (IsApp snap)
+    (And (Eq "STAMPS" (_0 snap))
+      (let ((built (_1 snap)))
+        (Nil (includes
+               (lambda (p)
+                 (Or (Ge (_1 p) built) (Ne (_1 p) (mod-stamp (_0 p)))))
+               (_2 snap)))))))
 
 ;;; REPL helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

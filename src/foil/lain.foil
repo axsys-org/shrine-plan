@@ -100,6 +100,10 @@
     '  is the untyped carrier (the value may be a law, row, or pin) —
     '  read it back out, never do arithmetic on it.
     :  v=nat
+  +  ps
+    '  A row-of-paths payload — the /boot mirror's reference lists
+    '  riding as slot values.
+    :  ps=row[path]
 +  pd
   '  A data pail.
   \  x=nat
@@ -377,6 +381,27 @@
   ?  (eq 0 p.len)
      0
   (eq_iota p.at(0) 'h)
++  log_root
+  '  The event journal: one node per accepted post-boot epoch,
+  '  /log/<epoch>, holding the driving task, its ack, and its
+  '  outbound effects.  Commit-owned — kernel writes here fail the
+  '  event, and crew subscriptions to /log are skipped, so the
+  '  journal never feeds back into reactivity.  Signs for /log
+  '  paths still mint but are inert (no eyes ever match them).
+  ^  path
+  ['log]
++  is_log
+  '  Is this path under the event journal (/log)?
+  \  p=path
+  ^  nat
+  ?  (eq 0 p.len)
+     0
+  (eq_iota p.at(0) 'log)
++  log_card
+  '  One journal entry: the input event verbatim, the ack it earned,
+  '  and the outbound moves it produced.  Rides as the ['ev] slot of
+  '  the /log/<epoch> node, committed in the event's own step.
+  :  t=task ack=maybe[path] fx=row[move]
 +  dig_parse
   '  A cord of decimal digits as a nat; .none if empty or non-digit.
   \  s=nat
@@ -627,7 +652,7 @@
   ?  (eq i es.len)
      acc
   =  > h es.at(i)
-  ?  (hres c q)
+  ?  (hres c (unpin q.held))
    > (./known t=myth)  (_ i.inc acc.put(p t))
    > .null  (_ i.inc acc)
    > .unknown  (_ i.inc acc)
@@ -872,11 +897,14 @@
   (_ i.inc cs.weld(yc) y.out)
 +  dispatch
   '  Run one work unit against the transaction.  The /h overlay is
-  '  read-only: any write landing there fails the whole event.
+  '  read-only, and /log is commit-owned: any write landing on
+  '  either fails the whole event.
   \  f=flue wm=worm s=sov
   ^  wend
   ?  (is_h f.dst)
      (./bad 'h_reserved)
+  ?  (is_log f.dst)
+     (./bad 'log_reserved)
   =  > wm1 wm.set_now(wm.now.inc)
   =  > kk (read .y f.dst wm1 s)
   =  > cw (crew_of (read_x f.dst wm1 s) wm1 s)
@@ -1059,7 +1087,10 @@
   '  each named dep subscribes its node (as watcher) to the watched
   '  path.  Persistent and declarative — re-derived from the
   '  committed state each round, unlike the one-shot driver eyes.
-  '  /io nodes are skipped (see /is_io).
+  '  /io nodes are skipped (see /is_io), and so is /log on both
+  '  sides: journal nodes subscribe to nothing and nothing may
+  '  watch the journal (a /log eye would fire on every commit,
+  '  burning the cascade's fuel forever).
   \  s=sov
   ^  eyes
   =  > fat (peek [] s)
@@ -1069,7 +1100,7 @@
      acc
   =  > h es.at(i)
   =  > sub p
-  ?  (is_io sub)
+  ?  ((is_io sub) || (is_log sub))
      (_ i.inc acc)
   =  > t q
   =  > ks crew_slot
@@ -1086,6 +1117,8 @@
                 a2
              =  > e ds.at(j)
              =  > d e.val
+             ?  (is_log d.p)
+                (_ j.inc a2)
              =  > cur a2.gut(d.p [])
              (_ j.inc a2.put(d.p cur.snoc((dep d.c sub))))
         (_ i.inc acc2)
@@ -1132,7 +1165,10 @@
   '  (path, care) mints at most one independent local case.  Apollo
   '  time and PKI blockheight are zeroed in this port — the runtime
   '  supplies them a layer out.
-  \  f=fate s=sov
+  '  When journal is set, a /log/<epoch> node carrying the driving
+  '  task, its ack, and its effects rides the same diff set — the
+  '  event and its journal entry are one epoch, indivisible.
+  \  t=task a=maybe[path] journal=nat f=fate s=sov
   ^  verdict[[state=sov signs=axal[sign]]]
   =  > ws f.write
   =  > diffs
@@ -1144,21 +1180,39 @@
         > (./make t=myth)  (_ i.inc acc.put(p (note/make t)))
         > (./poke t=myth)  (_ i.inc acc.put(p (note/poke t)))
         > .cull  (_ i.inc acc.put(p (note/cull)))
-  s.step(diffs 0 0)
-+  run_event
+  =  > diffs2
+       ?  journal
+          =  > card  (log_card t a f.effects)
+          diffs.put(['log (dig_show s.top.inc)]
+                    (note/make (myth/sing ['ev] card)))
+       diffs
+  s.step(diffs2 0 0)
++  run_event_with
   '  The full cycle: run the kernel and, on success, commit — the new
   '  sovereign, the outbound moves, and the step's change signs.  On
-  '  failure the sovereign is untouched.
-  \  t=task eny=nat s=sov
+  '  failure the sovereign is untouched.  journal selects whether
+  '  the commit also writes the /log entry.
+  \  journal=nat t=task eny=nat s=sov
   ^  ovum
   ?  (kernel t eny s)
    > (./fail e=quip)  (./fail e)
    > (./done f=fate a=maybe[path])
-     ?  (commit f s)
+     ?  (commit t a journal f s)
       > (./rejected e=quip)  (./fail e)
       > (./accepted r=[state=sov signs=axal[sign]])
         =  > fx f.effects
         (./ripe state fx signs a)
++  run_event
+  '  A journal-free event: seeding and probes — no /log entry.
+  \  t=task eny=nat s=sov
+  ^  ovum
+  (run_event_with 0 t eny s)
++  run_event_log
+  '  A journaled event: the live loop — every accepted epoch leaves
+  '  its /log node.
+  \  t=task eny=nat s=sov
+  ^  ovum
+  (run_event_with 1 t eny s)
 +  gyre
   '  The reactive-cycle outcome: the final sovereign, all outbound
   '  moves, each round's signs (first = the driving event), and the
@@ -1177,9 +1231,10 @@
   '  news back as hear events until quiet — or until fuel runs out
   '  (apps may legally self-loop; the cap bounds them).  A failed
   '  hear round stops the cascade, keeping the rounds that committed.
+  '  Every accepted round journals: one /log node per epoch.
   \  t=task eny=nat fuel=nat s=sov
   ^  gyre
-  ?  (run_event t eny s)
+  ?  (run_event_log t eny s)
    > (./fail e=quip)  (./fail e)
    > (./ripe s1=sov fx1=row[move] sg1=axal[sign] a=maybe[path])
      |  > cur=sov s1  > moves=row[move] fx1  > rounds=row[axal[sign]] [sg1]  > sg=axal[sign] sg1  > gas=nat fuel
@@ -1190,7 +1245,7 @@
         (./spun cur moves rounds a)
      ?  (eq 0 gas)
         (./spun cur moves rounds a)
-     ?  (run_event (./hear nws) eny cur)
+     ?  (run_event_log (./hear nws) eny cur)
       > (./fail e2=quip)  (./spun cur moves rounds a)
       > (./ripe s2=sov fx2=row[move] sg2=axal[sign] a2=maybe[path])
         =  > m2 moves.weld(fx2)

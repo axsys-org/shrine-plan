@@ -15,6 +15,8 @@
 
 (#bind foil-lore (#module foil-lore))
 
+(#bind foil-render (#module foil-render))
+
 (#bind doctest (#module doctest))
 
 
@@ -50,24 +52,17 @@
 ;; their own app entries from the SAME compilation — one chain walk)
 ;; and the per-module compile cache (so the /boot mirror knows which
 ;; file declared which entry): ["HELM" boot exec x-query spy sut cache].
-(define (load-helm-mod mod)
-  (define r (foil:compile-mod-cached 0 foil:default-subject mod))
+;; Pack a compile result [cache sut] as the core row.  The query slot
+;; is /h-aware: the coordinator's query/read verbs serve the temporal
+;; overlay as well as live paths.
+(define (helm-pack r)
   (define sut (_1 r))
   (define (ent path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
-  ;; the query slot is /h-aware: the coordinator's query/read verbs
-  ;; serve the temporal overlay as well as live paths
   ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["x_query_h"])
    (ent ["helm" "spy"]) sut (_0 r)])
 
-;; Cross-process artifact-cache variant.  The core keeps the artifact cache so
-;; /boot attribution can use each artifact's declared/imported key metadata.
-(define (load-helm-mod-artifact-cached cache mod)
-  (define r
-    (foil:compile-mod-artifact-cached cache foil:default-subject 0 mod))
-  (define sut (_1 r))
-  (define (ent path) (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
-  ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["x_query_h"])
-   (ent ["helm" "spy"]) sut (_0 r)])
+(define (load-helm-mod mod)
+  (helm-pack (foil:compile-mod-cached 0 foil:default-subject mod)))
 
 ;; The bare driver chain.  The argument is ignored (a zero-argument
 ;; define does not reduce when applied).
@@ -84,57 +79,6 @@
 ;; An app entry from the core's own compilation.
 (define (core-ent core path)
   (foil:ir-entry-val (got-entry (Weld ["boot"] path) (core-sut core))))
-
-;;; Persistent precompiled image ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; A helm core wrapped with enough provenance to know when it is stale:
-;; the foil compiler token plus this loader chain, and the source bytes
-;; of the module's whole import closure.  The launcher binds the image
-;; to a snapshot top level (x/lain: _lain_image_v1); Reaver's snapshot
-;; continuation persists it, so a later process boots from the compiled
-;; core without compiling anything (the same free persistence ride
-;; foil-cache.rvr uses for per-module artifacts).
-
-(define image-schema 1)
-
-(define (image-token z)
-  ;; A compiler or loader change must invalidate the image; source
-  ;; changes are caught by image-sources below.
-  (Pin [image-schema (foil:artifact-compiler-token 0) load-helm-mod]))
-
-(define (image-sources mod)
-  (map (lambda (m) [m (foil:get-foil m)])
-    (foil:artifact-module-closure [mod])))
-
-(define (make-helm-image mod)
-  (define core (load-helm-mod mod))
-  (define img ["HELM_IMAGE" mod (image-token 0) (image-sources mod) core])
-  (DeepSeq core (Pin img)))
-
-(define (helm-image-body img)
-  (If (IsPin img) (Unpin img) 0))
-
-(define (helm-image-core img)
-  (Ix 4 (helm-image-body img)))
-
-(define (helm-image-valid? img mod)
-  (define b (helm-image-body img))
-  (And (IsApp b)
-    (And (Eq "HELM_IMAGE" (_0 b))
-      (And (Eq mod (Ix 1 b))
-        (And (Equal (image-token 0) (Ix 2 b))
-          (all (lambda (e) (Equal (_1 e) (foil:get-foil (_0 e))))
-            (Ix 3 b)))))))
-
-;; Reuse a valid image; rebuild otherwise.  Validation runs under Try
-;; so a malformed image (or a deleted source file) is a rebuild, not a
-;; wedge.  An import-graph change always shows up as changed bytes in
-;; some already-listed source, so the stored closure stays sound.
-(define (helm-image-refresh img mod)
-  (define v (Try (lambda (z) (helm-image-valid? img mod)) 0))
-  (If (And (Nil (Eq 1 (Hd v))) (_0 v))
-    img
-    (make-helm-image mod)))
 
 ;;; The /boot mirror ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -170,7 +114,11 @@
      "/boot/f/n/[...name] holds the entry declared at /[...name] "
      "(n path segments) - its kind in [kind], its own source in "
      "[src], and its compiled value in [code] when lowering "
-     "produced one. "
+     "produced one. entries also carry their rendered type in [ty] "
+     "and, when reference mirroring is on, [calls]/[called_by] rows "
+     "of mirror paths. /boot/ns/[root] groups every entry by source "
+     "namespace root. a module that failed to compile carries "
+     "[status] failed and its diagnostic in [err]. "
      "the namespace's fixed geography (each writable root also "
      "carries this as its own [lore]): /boot this mirror; /kook the "
      "kernel's behavior registry, by convention - kook refs are full "
@@ -184,8 +132,21 @@
 ;; cost without losing information.
 (define mirror-lore? 1)
 
-;; The 5th cache field when present; legacy 4-field and
-;; artifact-derived entries degrade to no lore.
+;; Reference mirroring writes ['calls]/['called_by] rows of mirror
+;; paths on each entry node (forge's who-calls, as namespace state).
+(define mirror-refs? 1)
+
+;; Law mirroring writes each lowered entry's decompiled law text at
+;; ['law].  Off by default: it walks every law at seed time.
+(define mirror-law? 0)
+
+;; Full-roster mirroring: compile every module on disk into the boot
+;; cache (not just the helmapp closure + apps) so the whole tree
+;; mirrors; modules that fail to compile get a fail card.
+(define mirror-all? 1)
+
+;; The 5th cache field when present; legacy 4-field entries degrade
+;; to no lore.
 (define (entry-lore me)
   (If (Lt 4 (Sz me)) (Ix 4 me) []))
 
@@ -212,32 +173,62 @@
 ;; One vine_make task per mirrored node: /boot first, then each
 ;; module's file node followed by its entries.  A module's own keys
 ;; are its cache entry's decl keys minus its imported keys — both
-;; stored on the entry ([name subject decl-keys imported-keys lore]).
-;; The cache in mirror shape ([name subject decl-keys imported lore]
-;; rows) regardless of flavor; artifacts carry no lore yet — empty
-;; 5th field.  The mirror builds from this, and the doctest driver
+;; stored on the entry ([name subject decl-keys imported-keys lore]
+;; rows).  The mirror builds from this, and the doctest driver
 ;; resolves target paths against it.
-(define (mirror-cache raw-cache core)
-  (If (And (IsApp raw-cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 raw-cache)))
-    (map
-      (lambda (ce)
-        (let ((body (foil:artifact-body (_1 ce))))
-          [(_0 ce) (core-sut core)
-           (foil:artifact-decl-keys body)
-           (foil:artifact-imported body)
-           []]))
-      (foil:artifact-cache-entries raw-cache))
-    raw-cache))
+
+;; A module entry's mirror node: /boot/<..modsegs>/<n>/<..name>.
+(define (boot-ent-node mod name)
+  (Weld (Weld [(ts "boot")] (map ts (mod-segs mod)))
+    (Weld [(ts (showNat (Sz name)))] (map ts name))))
+
+;; [[src-node dst-node] ..]: every reference between mirrored entries,
+;; deduped — forge's ref-table restated in mirror paths.  Refs to
+;; anything unmirrored (builtins) drop out.
+(define (boot-ref-table cache)
+  (define keymap
+    (foldl
+      (lambda (acc me)
+        (foldl
+          (lambda (a k) (snoc [k (boot-ent-node (_0 me) (drop 1 k))] a))
+          acc (entry-own-keys me)))
+      [] cache))
+  (define (node-for k)
+    (find (lambda (e) (Equal k (_0 e))) keymap))
+  (foldl
+    (lambda (acc me)
+      (foldl
+        (lambda (a k)
+          (let ((srcn (boot-ent-node (_0 me) (drop 1 k)))
+                (refs (foil:collect-refs (got-entry-tc k (_1 me)))))
+            (foldl
+              (lambda (aa r)
+                (let ((hit (node-for (resolve-path (_1 r)))))
+                  (Ifz hit
+                    aa
+                    (let ((row [srcn (_1 (_0 hit))]))
+                      (If (includes (Equal row) aa) aa (snoc row aa))))))
+              a refs)))
+        acc (entry-own-keys me)))
+    [] cache))
+
+;; A node's outgoing and incoming reference rows from the table.
+(define (refs-of reftab node)
+  [(map (Ix 1) (filter (lambda (r) (Equal node (Ix 0 r))) reftab))
+   (map (Ix 0) (filter (lambda (r) (Equal node (Ix 1 r))) reftab))])
 
 ;; The cache passed explicitly: the app pipeline compiles apps into
 ;; the core's cache first, then mirrors from the extended cache so
-;; app modules mirror (lore included) like kernel code.
-(define (boot-mirror-tasks-lore-with lore? raw-cache core)
-  (define cache (mirror-cache raw-cache core))
-  (define vine-make (core-ent core ["vine_make"]))
-  (define doc-t (core-ent core ["boot_doc_t"]))
+;; app modules mirror (lore included) like kernel code.  The pairs
+;; variant emits [node myth] rows (no /boot doc node) so a resync can
+;; remount one module's records through the chore cmd stream; the
+;; tasks variant wraps them as vine_makes for boot seeding.
+(define (boot-mirror-pairs-lore-with lore? raw-cache core)
+  (define cache raw-cache)
   (define src-t (core-ent core ["boot_src_t"]))
   (define ent-t (core-ent core ["boot_ent_t"]))
+  (define ent-x (core-ent core ["boot_ent_x"]))
+  (define reftab (If mirror-refs? (boot-ref-table cache) []))
   (define (mod-tasks me)
     (define mod (_0 me))
     (define sut (_1 me))
@@ -256,25 +247,108 @@
       ;; entry keys are rooted, capture-lore paths source-relative —
       ;; name (the rootless key) is the lookup key for both
       (define la (lore-args (foil-lore:lore-for lore name)))
-      (vine-make node
-        (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e)
-          (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la))))
+      ;; the extra panes forge used to render live: type text always,
+      ;; the decompiled law and reference rows behind their flags
+      (define tytext
+        (foil-render:ty-text (tc-ty (foil:ent-tc e))))
+      (define lawtext
+        (If (And mirror-law? (foil:ent-lowered e))
+          (If (foil-render:law-like? (foil:ent-val e))
+            (foil-render:render-law (foil:ent-val e))
+            0)
+          0))
+      (define rr (refs-of reftab node))
+      [node
+       (ent-x tytext lawtext (Ix 0 rr) (Ix 1 rr)
+         (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e)
+           (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la)))])
     ;; the module header's own slugs capture at path []
     (define mla (lore-args (foil-lore:lore-for lore [])))
-    (Weld [(vine-make mnode
-             (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)))]
+    (Weld [[mnode
+            (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla))]]
       (map ent-task own)))
+  (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache))
+
+(define (boot-mirror-pairs-with core raw-cache)
+  (boot-mirror-pairs-lore-with mirror-lore? raw-cache core))
+
+(define (boot-mirror-tasks-lore-with lore? raw-cache core)
+  (define vine-make (core-ent core ["vine_make"]))
+  (define doc-t (core-ent core ["boot_doc_t"]))
   (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
-    (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache)))
-
-(define (boot-mirror-tasks-lore lore? core)
-  (boot-mirror-tasks-lore-with lore? (core-cache core) core))
-
-(define (boot-mirror-tasks core)
-  (boot-mirror-tasks-lore mirror-lore? core))
+    (map (lambda (p) (vine-make (Ix 0 p) (Ix 1 p)))
+      (boot-mirror-pairs-lore-with lore? raw-cache core))))
 
 (define (boot-mirror-tasks-with raw-cache core)
   (boot-mirror-tasks-lore-with mirror-lore? raw-cache core))
+
+;; /boot/ns/<root> index nodes: every mirrored entry grouped by its
+;; source namespace root — forge's /ns aggregation as namespace state.
+(define (boot-ns-index-tasks core raw-cache)
+  (define cache raw-cache)
+  (define vine-make (core-ent core ["vine_make"]))
+  (define ns-t (core-ent core ["boot_ns_t"]))
+  (define pairs
+    (foldl
+      (lambda (acc me)
+        (foldl
+          (lambda (a k)
+            (let ((name (drop 1 k)))
+              (If (Sz name)
+                (snoc [(Ix 0 name) (boot-ent-node (_0 me) name)] a)
+                a)))
+          acc (entry-own-keys me)))
+      [] cache))
+  (define roots
+    (foldl
+      (lambda (a p) (If (includes (Equal (Ix 0 p)) a) a (snoc (Ix 0 p) a)))
+      [] pairs))
+  (map
+    (lambda (root)
+      (vine-make [(ts "boot") (ts "ns") (ts root)]
+        (ns-t (map (Ix 1)
+                (filter (lambda (p) (Equal root (Ix 0 p))) pairs)))))
+    roots))
+
+;; Compile one module into the shared cache under Try; a failure
+;; leaves the cache unchanged.  -> [cache' ok?]
+(define (cache-compile cache mod)
+  (define r
+    (Try
+      (lambda (z)
+        (let ((cr (foil:compile-mod-cached cache foil:default-subject mod)))
+          (DeepSeq (_0 cr) cr)))
+      0))
+  (If (Eq 1 (Hd r)) [cache 0] [(_0 (_0 r)) 1]))
+
+;; The whole disk roster compiled into the cache: [cache' failed-mods].
+(define (compile-roster cache mods)
+  (foldl
+    (lambda (st mod)
+      (let ((r (cache-compile (_0 st) mod)))
+        (If (_1 r)
+          [(_0 r) (_1 st)]
+          [(_0 st) (snoc mod (_1 st))])))
+    [cache []] mods))
+
+;; Fail cards for modules that did not compile: Try each again for
+;; the pretty diagnostic — a broken module is a visible mirror
+;; citizen, exactly like a broken app mount.
+(define (boot-fail-tasks core mods)
+  (define vine-make (core-ent core ["vine_make"]))
+  (define fail-t (core-ent core ["boot_fail_t"]))
+  (map
+    (lambda (mod)
+      (let* ((r (Try (lambda (z)
+                       (let ((c (foil:compile-mod foil:default-subject mod)))
+                         (Seq (DeepSeq c 0) 0)))
+                  0))
+             (text (If (Eq 1 (Hd r))
+                     (foil-render:diag-text (_0 r))
+                     "compiles alone; failed against the boot cache")))
+        (vine-make (Weld [(ts "boot")] (map ts (mod-segs mod)))
+          (fail-t text))))
+    mods))
 
 ;; Fold tasks into a sovereign through the compiled kernel: every node
 ;; arrives as an ordinary committed event.  A failed event dies loudly
@@ -290,7 +364,7 @@
     sov tasks))
 
 (define (seed-boot core sov)
-  (seed-tasks core sov (boot-mirror-tasks core)))
+  (seed-tasks core sov (boot-mirror-tasks-with (core-cache core) core)))
 
 ;;; Application mounting (doc/shrine-apps.md section 6) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -311,10 +385,7 @@
   (define r
     (Try
       (lambda (z)
-        (let* ((cr (If (And (IsApp cache) (Eq "FOIL_ARTIFACT_CACHE" (_0 cache)))
-                     (foil:compile-mod-artifact-cached
-                       cache foil:default-subject 0 mod)
-                     (foil:compile-mod-cached cache foil:default-subject mod)))
+        (let* ((cr (foil:compile-mod-cached cache foil:default-subject mod))
                (sut (_1 cr))
                (m (foil:ir-entry-val (got-entry ["boot" "app"] sut))))
           (Seq (If (Eq 1 (mani-ok m)) 0 (error ["app-entry-not-mani" mod]))
@@ -387,6 +458,10 @@
 ;; On: the image boots born-verified — every documented entry carries
 ;; its verdict from the start (the explorer renders the chips).  Flip
 ;; to 0 to shed the cost; /io/doctest re-runs anything on demand.
+;; This sweep stays synchronous in MAIN deliberately: running every
+;; doctest here is what compiles the eval pipeline's call graph, so
+;; the chore driver's leaf actors (helm-chore.rvr) only replay
+;; compiled paths — it IS the warming the off-MAIN runs rely on.
 (define doctest-sweep? 1)
 
 ;; Verdicts for every documented entry with tests, evaluated against
@@ -395,7 +470,7 @@
 ;; and poked onto the mirror nodes.  Tolerant: a failed poke traces
 ;; and moves on — verdicts are data, not gates.
 (define (seed-doctests raw-cache core sov)
-  (define cache (mirror-cache raw-cache core))
+  (define cache raw-cache)
   (define vine-poke (core-ent core ["vine_poke"]))
   (define vine-make (core-ent core ["vine_make"]))
   (define dt-card (core-ent core ["dt_card_t"]))
@@ -445,10 +520,18 @@
 (define (roster-drop roster n)
   (filter (lambda (e) (Nil (Equal n (_0 e)))) roster))
 
+;; Force-then-send: the receiver must not inherit our thunks.  The
+;; one send discipline every actor in this driver shares.
+(define (send! h m)
+  (Seq (DeepSeq m m) (Send h m)))
+
+;; Send to the named worker, if it is still on the roster.
+(define (send-named roster n m)
+  (let ((hit (roster-get roster n)))
+    (Ifz hit 0 (send! (_1 (_0 hit)) m))))
+
 ;; One duty against the roster, from inside the coordinator actor
-;; (handle 0 below is the coordinator's own inbox).  Payloads are
-;; deep-forced before every send — the receiver must not inherit our
-;; thunks.
+;; (handle 0 below is the coordinator's own inbox).
 (define (apply-duty mk-worker roster d)
   (define kind (Hd d))
   (cond
@@ -457,23 +540,14 @@
         (Seq (SendCaps w (DeepSeq d ["go" (_1 d)]) [0])
           (snoc [(_0 d) w] roster))))
     ((Eq kind "/boot/duty/fell")
-      (let ((hit (roster-get roster (_0 d))))
-        (Ifz hit
-          roster
-          (Seq (Send (_1 (_0 hit)) ["die"])
-            (roster-drop roster (_0 d))))))
+      (Seq (send-named roster (_0 d) ["die"])
+        (roster-drop roster (_0 d))))
     ((Eq kind "/boot/duty/tell")
-      (let ((hit (roster-get roster (_0 d))))
-        (Ifz hit
-          roster
-          (Seq (Send (_1 (_0 hit)) (DeepSeq d ["change" (_1 d) (_2 d)]))
-            roster))))
+      (Seq (send-named roster (_0 d) ["change" (_1 d) (_2 d)])
+        roster))
     ((Eq kind "/boot/duty/ack")
-      (let ((hit (roster-get roster (_0 d))))
-        (Ifz hit
-          roster
-          (Seq (Send (_1 (_0 hit)) (DeepSeq d ["ack" (_1 d)]))
-            roster))))
+      (Seq (send-named roster (_0 d) ["ack" (_1 d)])
+        roster))
     (else roster)))
 
 (define (apply-duties mk-worker roster ds)
@@ -481,7 +555,7 @@
 
 ;;; The coordinator ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (helm-loop core mk-worker st)
+(define (helm-loop core mk-worker persist st)
   (define hm (_0 st))
   (define roster (_1 st))
   (define mc (Recv 0))
@@ -492,40 +566,48 @@
   ;; new state is deep-forced BEFORE anything else happens, so all
   ;; effects land within the turn (a lazy fold would defer the Sends
   ;; to the next Recv — a deadlock).
+  ;;
+  ;; Write-ahead: the new helm state is forced and handed to persist
+  ;; (the snapshot hook) BEFORE the duty sends — acks included — fire
+  ;; in the apply-duties fold.  A crash between the two resumes with
+  ;; the event durable and the worker simply never acked; workers are
+  ;; ephemeral, so nothing is owed to them across a restart.
   (define (turn src task)
     (define r ((core-exec core) src task hm))
-    (define roster2 (apply-duties mk-worker roster (_1 r)))
-    (define st2 [(_0 r) roster2])
-    (DeepSeq st2 st2))
+    (define hm2 (DeepSeq (_0 r) (_0 r)))
+    (Seq (persist hm2)
+      (let ((roster2 (apply-duties mk-worker roster (_1 r))))
+        (let ((st2 [hm2 roster2]))
+          (DeepSeq st2 st2)))))
   (cond
     ((Eq kind "cmd")
       (let ((st2 (turn ("/boot/maybe/some" (_1 msg)) (_2 msg))))
         (Seq st2
-          (helm-loop core mk-worker st2))))
+          (helm-loop core mk-worker persist st2))))
     ((Eq kind "task")
       (let ((st2 (turn "/boot/maybe/none" (_1 msg))))
         (Seq st2
           (Seq (Send (Ix 0 caps) ["done"])
-            (helm-loop core mk-worker st2)))))
+            (helm-loop core mk-worker persist st2)))))
     ((Eq kind "query")
       (let ((s (_0 hm)))
         (Seq (Send (Ix 0 caps)
                (DeepSeq msg ((core-xq core) (Ix 2 s) (_1 msg) s)))
-          (helm-loop core mk-worker st))))
+          (helm-loop core mk-worker persist st))))
     ((Eq kind "spy")
       ;; ["spy" name path] — arm a one-shot watch for a worker.  No
       ;; reply: worker->coordinator sends are FIFO, so a spy followed
       ;; by a cmd from the same worker is armed before the cmd runs.
       (let ((hm2 ((core-spy core) (_1 msg) (_2 msg) hm)))
         (Seq (DeepSeq hm2 hm2)
-          (helm-loop core mk-worker [hm2 roster]))))
+          (helm-loop core mk-worker persist [hm2 roster]))))
     ((Eq kind "read")
       ;; ["read" path] — the committed record, tagged for multiplexed
       ;; worker mailboxes.
       (let ((s (_0 hm)))
         (let ((res ((core-xq core) (Ix 2 s) (_1 msg) s)))
           (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
-            (helm-loop core mk-worker st)))))
+            (helm-loop core mk-worker persist st)))))
     ((Eq kind "case")
       ;; ["case" path] — the node's current version (maybe[nat]),
       ;; tagged for multiplexed worker mailboxes.  The doctest
@@ -533,28 +615,33 @@
       (let ((s (_0 hm)))
         (let ((c ((core-ent core ["x_case_h"]) 0 (_1 msg) s)))
           (Seq (Send (Ix 0 caps) (DeepSeq c ["cres" (_1 msg) c]))
-            (helm-loop core mk-worker st)))))
+            (helm-loop core mk-worker persist st)))))
     ((Eq kind "crew")
       (Seq (Send (Ix 0 caps) (map (Ix 0) roster))
-        (helm-loop core mk-worker st)))
+        (helm-loop core mk-worker persist st)))
     ((Eq kind "handle")
       (let ((hit (roster-get roster (_1 msg))))
         (Seq (Ifz hit
                (Send (Ix 0 caps) ["nohandle"])
                (SendCaps (Ix 0 caps) ["handle"] [(_1 (_0 hit))]))
-          (helm-loop core mk-worker st))))
+          (helm-loop core mk-worker persist st))))
     ((Eq kind "stop")
       (let ((dies (map (lambda (e) (Send (_1 e) ["die"])) roster)))
         (Seq (DeepSeq dies dies)
           (Send (Ix 0 caps) ["bye"]))))
-    (else (helm-loop core mk-worker st))))
+    (else (helm-loop core mk-worker persist st))))
 
-;; The coordinator actor body: boot the helm, apply the initial
-;; births, loop.  Spawn as (Spawn (helm-actor core mk-worker s0)).
-;; The behavior registry is namespace state (/kook/<id>) — seed the
-;; sovereign before taking the helm.
-(define (helm-actor core mk-worker s0 self)
+;; The coordinator actor body: boot the helm, persist once (so a
+;; zero-event serve still leaves a resumable snapshot), apply the
+;; initial births, loop.  Spawn as
+;; (Spawn (helm-actor core mk-worker persist s0)).  The behavior
+;; registry is namespace state (/kook/<id>) — seed the sovereign
+;; before taking the helm.  persist receives the forced helm state;
+;; pass (lambda (hm) 0) for a non-persistent (test) coordinator.
+(define (helm-actor core mk-worker persist s0 self)
   (define b ((core-boot core) s0))
-  (define roster (apply-duties mk-worker [] (_1 b)))
-  (Seq (DeepSeq roster roster)
-    (helm-loop core mk-worker [(_0 b) roster])))
+  (define hm0 (DeepSeq (_0 b) (_0 b)))
+  (Seq (persist hm0)
+    (let ((roster (apply-duties mk-worker [] (_1 b))))
+      (Seq (DeepSeq roster roster)
+        (helm-loop core mk-worker persist [hm0 roster])))))

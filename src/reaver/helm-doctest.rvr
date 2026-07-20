@@ -1,32 +1,20 @@
-;;;; The doctest driver: a helm worker that evaluates documented
-;;;; entries' doctests against the live image's own compiled subject
-;;;; and pokes verdicts onto the documented nodes
+;;;; The doctest family: a chore-driver family (helm-chore.rvr) that
+;;;; evaluates documented entries' doctests against the live image's
+;;;; own compiled subject and writes verdicts onto the mirror nodes
 ;;;; (doc/doctest-runner-explorer.md part I).
 ;;;;
-;;;; Requests ride the namespace like fetch's: a dt/req record MADE
-;;;; under /io/doctest (via injected task or worker cmd) carries a
-;;;; ['target] mirror path — an exact documented node, or a /boot
-;;;; prefix to sweep.  The dtake kook marks it fresh on the driver
-;;;; record; helm x-watches each /io name's record, so that write is
-;;;; the notification.  For each job the worker asks the node's
-;;;; current version (["case"] — the verdict's staleness anchor),
-;;;; evaluates, and pokes ['dt] onto the node; when a request's jobs
-;;;; drain it pokes ['res_done]/['passed]/['failed] onto the request
-;;;; node and clears the marker.
+;;;; A dt/req record MADE under /io/doctest carries a ['target]
+;;;; mirror path — an exact documented node, or a /boot prefix to
+;;;; sweep.  The plan turns the target into one job per documented
+;;;; node; each job wants the node's current version (the verdict's
+;;;; staleness anchor) and evaluates in its own leaf actor.  The
+;;;; verdict rides a CHILD node (<node>/dt) through the mkp cmd — the
+;;;; documented node's version stays clean as the anchor, and an
+;;;; already-exists ack retries the make as a poke.
 ;;;;
-;;;; Worker mailbox:
-;;;;   from the coordinator: ["go" res] ["change" pax res]
-;;;;     ["qres" pax res] ["cres" pax c] ["ack" rsvp] ["die"]
-;;;;
-;;;; Correlation: worker->coordinator sends are FIFO and the
-;;;; coordinator replies within its turn, so "cres" replies return in
-;;;; job order and acks in cmd order — two FIFO queues.
-;;;;
-;;;; ds = ["D" sut mcache myth/pail_at fetch/fresh put-nat myth/new
-;;;;       vine_poke dt_card_t] — the core's subject, the mirror-shaped
-;;;;       cache, and compiled lainapp/pact entries (put-nat is the
-;;;;       spawner's myth/add glue; myth/new the empty-myth constant),
-;;;;       supplied by the spawner.
+;;;; ds = ["D" sut mcache myth/pail_at dt_card_t chore/cmd/mkp] — the
+;;;;       core's subject, the mirror-shaped cache, and compiled
+;;;;       lainapp/pact/chore entries, supplied by the spawner.
 ;;;;       Evaluation uses each cache entry's OWN subject (apps
 ;;;;       compile after the core chain, so the core's subject cannot
 ;;;;       resolve app-local names); the sut slot stays for shape
@@ -47,18 +35,10 @@
 (define (d-sut ds) (Ix 1 ds))
 (define (d-cache ds) (Ix 2 ds))
 (define (d-pslot ds) (Ix 3 ds))
-(define (d-fresh ds) (Ix 4 ds))
-(define (d-put ds) (Ix 5 ds))
-(define (d-t0 ds) (Ix 6 ds))
-(define (d-poke ds) (Ix 7 ds))
-(define (d-card ds) (Ix 8 ds))
-(define (d-make ds) (Ix 9 ds))
+(define (d-card ds) (Ix 4 ds))
+(define (d-mkp ds) (Ix 5 ds))
 
 (define (ts s) ("ts" s))
-
-(define (row-has k xs) (includes (Equal k) xs))
-(define (row-drop k xs) (filter (lambda (e) (Nil (Equal k e))) xs))
-(define (row-weld a b) (foldl (flip snoc) a b))
 
 ;; "12" -> [1 12]; anything non-decimal -> [0 0]
 (define (cord-nat s)
@@ -147,159 +127,30 @@
     (ej ej)
     (else (sweep 0))))
 
-(define (mk-doctest-worker ds name self)
-  (define mc (Recv 0))
-  (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
-  (define rec0 (_1 (Ix 0 mc)))
-  (define dpath [(ts "io") name])
-  (define (rpath kid) [(ts "io") name kid])
-  (define (fresh-kids claimed m)
-    (filter (lambda (k) (Nil (row-has k claimed))) ((d-fresh ds) m)))
-  (define (read-kids kids)
-    (map (lambda (k) (SendCaps coord (DeepSeq k ["read" (rpath k)]) [0]))
-      kids))
-  ;; the request node's completion record
-  (define (mk-done passed failed)
-    ((d-put ds)
-      ((d-put ds)
-        ((d-put ds) (d-t0 ds) [(ts "res_done")] 1)
-        [(ts "passed")] passed)
-      [(ts "failed")] failed))
-  (define (mk-clear kid)
-    ((d-put ds) (d-t0 ds) [(ts "fresh") kid] 0))
-  ;; state: claimed/reading as fetch; jobs = FIFO [kid node lore sut]
-  ;; awaiting "cres"; counts = [[kid pending passed failed] ..];
-  ;; queue = [[kid kind] ..] ack correlation
-  ;; the queue is forced before every Recv: send-cmd's Sends ride the
-  ;; queue value, and an unforced queue is a command never sent
-  (define (loop claimed reading jobs counts queue)
-    (define m (Seq (DeepSeq queue queue) (Recv 0)))
-    (define msg (Ix 0 m))
-    (define kind (_0 msg))
-    (define (send-cmd kid ckind extra task queue2)
-      (let ((cm ["cmd" name task]))
-        (Seq (DeepSeq cm cm)
-          (Seq (Send coord cm)
-            (snoc [kid ckind extra] queue2)))))
-    ;; a request finishes: done poke + marker clear
-    (define (finish kid passed failed queue2)
-      (send-cmd kid "clear" 0 ((d-poke ds) dpath (mk-clear kid))
-        (send-cmd kid "res" 0 ((d-poke ds) (rpath kid) (mk-done passed failed))
-          queue2)))
-    (cond
-      ((Eq kind "change")
-        (let ((res (_2 msg)))
-          (If (Or (Nil (Equal dpath (_1 msg)))
-                (Nil (Eq "/boot/res/known" (Hd res))))
-            (loop claimed reading jobs counts queue)
-            (let* ((kids (fresh-kids claimed (_0 res)))
-                   (sends (read-kids kids)))
-              (Seq (DeepSeq sends sends)
-                (loop (row-weld claimed kids) (row-weld reading kids)
-                  jobs counts queue))))))
-      ((Eq kind "qres")
-        (let ((kid (Ix 2 (_1 msg)))
-              (res (_2 msg)))
-          (If (Nil (row-has kid reading))
-            (loop claimed reading jobs counts queue)
-            (let ((reading2 (row-drop kid reading)))
-              (If (Nil (Eq "/boot/res/known" (Hd res)))
-                ;; culled before the read: just clear the marker
-                (loop claimed reading2 jobs counts
-                  (send-cmd kid "clear" 0 ((d-poke ds) dpath (mk-clear kid))
-                    queue))
-                (let* ((tgtp ((d-pslot ds) [(ts "target")] (_0 res)))
-                       (tgt (If (Eq "/boot/pails/p" (Hd tgtp)) (_0 tgtp) []))
-                       (js (Ifz (Sz tgt) [] (jobs-for ds tgt))))
-                  (If (Eq 0 (Sz js))
-                    ;; nothing documented there: answer done, all zero
-                    (loop claimed reading2 jobs counts
-                      (finish kid 0 0 queue))
-                    (let ((sends
-                            (map
-                              (lambda (j)
-                                (SendCaps coord
-                                  (DeepSeq j ["case" (Ix 0 j)]) [0]))
-                              js)))
-                      (Seq (DeepSeq sends sends)
-                        (loop claimed reading2
-                          (row-weld jobs
-                            (map (lambda (j) [kid (Ix 0 j) (Ix 1 j) (Ix 2 j)])
-                              js))
-                          (snoc [kid (Sz js) 0 0] counts)
-                          queue))))))))))
-      ((Eq kind "cres")
-        ;; FIFO: this reply answers the head job
-        (let* ((job (Ix 0 jobs))
-               (jobs2 (drop 1 jobs))
-               (kid (Ix 0 job))
-               (node (Ix 1 job))
-               (lore (Ix 2 job))
-               (msut (Ix 3 job))
-               (c (_2 msg))
-               (ct (find (lambda (e) (Equal kid (Ix 0 e))) counts))
-               (cte (_0 ct))
-               ;; evaluation under Try: a doctest that kills the eval
-               ;; must not kill the driver — it reports empty results
-               (rs (If (Eq "/boot/maybe/some" (Hd c))
-                     (let ((rx (Try (lambda (zz)
-                                      (let ((rr (cap-results
-                                                  (doctest:run-lore
-                                                    msut lore))))
-                                        (DeepSeq rr rr)))
-                                 0)))
-                       (If (Eq 1 (Hd rx))
-                         (Seq (Trace ["doctest: eval failed" (_0 rx)] 0) [])
-                         (_0 rx)))
-                     []))
-               (np (foldl (lambda (a r) (If (Ix 1 r) (Inc a) a)) 0 rs))
-               (nf (Sub (Sz rs) np))
-               (passed (Add (Ix 2 cte) np))
-               (failed (Add (Ix 3 cte) nf))
-               (pending (Sub (Ix 1 cte) 1))
-               (counts2
-                 (filter (lambda (e) (Nil (Equal kid (Ix 0 e)))) counts))
-               ;; the verdict rides a child node — the documented
-               ;; node's version stays clean as the staleness anchor.
-               ;; Try make first; an "already exists" ack retries as
-               ;; a poke (see the "ack" branch).
-               (queue2
-                 (If (Eq "/boot/maybe/some" (Hd c))
-                   (let* ((dtnode (snoc (ts "dt") node))
-                          (card ((d-card ds) (Now 0) (_0 c) rs)))
-                     (send-cmd kid "dtm" [dtnode card]
-                       ((d-make ds) dtnode card)
-                       queue))
-                   queue)))
-          (If (Eq 0 pending)
-            (loop claimed reading jobs2 counts2
-              (finish kid passed failed queue2))
-            (loop claimed reading jobs2
-              (snoc [kid pending passed failed] counts2)
-              queue2))))
-      ((Eq kind "ack")
-        (let ((head (Ix 0 queue))
-              (rest (drop 1 queue))
-              (rsvp (_1 msg)))
-          (cond
-            ((And (Eq "/boot/rsvp/no" (Hd rsvp)) (Equal "dtm" (Ix 1 head)))
-              ;; the dt child already exists: re-send as a poke
-              (let ((extra (Ix 2 head)))
-                (loop claimed reading jobs counts
-                  (send-cmd (Ix 0 head) "dtp" 0
-                    ((d-poke ds) (Ix 0 extra) (Ix 1 extra))
-                    rest))))
-            ((Eq "/boot/rsvp/no" (Hd rsvp))
-              (Seq (Trace ["doctest: cmd failed" (Ix 0 head) (Ix 1 head)] 0)
-                (loop claimed reading jobs counts rest)))
-            ((Equal "clear" (Ix 1 head))
-              (loop (row-drop (Ix 0 head) claimed) reading jobs counts rest))
-            (else (loop claimed reading jobs counts rest)))))
-      ((Eq kind "die") ["dead"])
-      (else (loop claimed reading jobs counts queue))))
-  (define kids0
-    (If (Eq "/boot/res/known" (Hd rec0)) (fresh-kids [] (_0 rec0)) []))
-  (define sends0 (read-kids kids0))
-  (Seq coord
-    (Seq (DeepSeq kids0 (DeepSeq sends0 sends0))
-      (loop kids0 kids0 [] [] []))))
+;; The family's plan: resolve the ['target] path into jobs.  Every
+;; job wants its node's version — the staleness anchor.  The request
+;; node itself is unused: verdicts land on the targets.
+(define (dt-plan ds rec reqnode)
+  (define tgtp ((d-pslot ds) [(ts "target")] rec))
+  (define tgt (If (Eq "/boot/pails/p" (Hd tgtp)) (_0 tgtp) []))
+  (define js (Ifz (Sz tgt) [] (jobs-for ds tgt)))
+  ["JOBS" (map (lambda (j) [(Ix 0 j) 1 j]) js)])
+
+;; The family's run (in a leaf actor): evaluate the node's doctests
+;; and hand back one mkp of the verdict child.  A node culled between
+;; plan and case reports nothing.
+(define (dt-run ds payload c)
+  (define node (Ix 0 payload))
+  (define lore (Ix 1 payload))
+  (define msut (Ix 2 payload))
+  (If (Nil (Eq "/boot/maybe/some" (Hd c)))
+    [[] 0 0]
+    (let* ((rs (cap-results (doctest:run-lore msut lore)))
+           (np (foldl (lambda (a r) (If (Ix 1 r) (Inc a) a)) 0 rs))
+           (nf (Sub (Sz rs) np))
+           (dtnode (snoc (ts "dt") node))
+           (card ((d-card ds) (Now 0) (_0 c) rs)))
+      [[((d-mkp ds) dtnode card)] np nf])))
+
+(define (dt-family ds)
+  [(ts "doctest") (dt-plan ds) (dt-run ds)])

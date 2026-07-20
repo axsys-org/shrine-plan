@@ -14,7 +14,9 @@
 (#bind foil (#module foil))
 (#bind helm (#module helm))
 (#bind helm-http (#module helm-http))
+(#bind helm-chore (#module helm-chore))
 (#bind helm-doctest (#module helm-doctest))
+(#bind helm-build (#module helm-build))
 
 
 ;;; The HTTP driver end-to-end, minus sockets (no outbound-connect
@@ -45,7 +47,10 @@
 (define txt-slot (app ["myth" "txt_at"]))
 
 (define helpers
-  ["H" (app ["http" "req"]) (app ["myth" "nat_at"]) (app ["vine_make"]) (app ["vine_cull"])])
+  ["H" (app ["http" "req"]) (app ["myth" "nat_at"]) (app ["vine_make"])
+   (app ["vine_cull"]) (app ["myth" "txt_at"])
+   (app ["build" "eval_req"]) (app ["build" "compile_req"])
+   (app ["build" "save_req"])])
 
 ;; the cache extended with the life app, like the real boot's — the
 ;; doctest fixtures cover an app-module target (compiled outside the
@@ -54,15 +59,27 @@
   (_0 (helm:compile-apps core (helm:core-cache core) ["life"])))
 
 (define dhelpers
-  ["D" (helm:core-sut core) (helm:mirror-cache (life-cache 0) core)
-   (app ["myth" "pail_at"]) (app ["fetch" "fresh"]) put-nat
-   myth-new (app ["vine_poke"]) (app ["dt_card_t"])
-   (app ["vine_make"])])
+  ["D" (helm:core-sut core) (life-cache 0)
+   (app ["myth" "pail_at"]) (app ["dt_card_t"])
+   (app ["chore" "mkp_t"])])
+
+(define chelpers
+  ["C" (app ["fetch" "fresh"]) (app ["chore" "fam_of"])
+   (app ["chore" "done_t"]) (app ["chore" "fail_t"])
+   (app ["chore" "clear_t"]) (app ["chore" "cmd_parts"])
+   (app ["vine_poke"]) (app ["vine_make"])])
+
+(define bs [core (life-cache 0)])
+
+(define fams
+  (Weld [(helm-doctest:dt-family dhelpers)]
+    (helm-build:build-families bs)))
 
 (define (mk-worker n)
-  (If (Equal n ("ts" "doctest"))
-    (helm-doctest:mk-doctest-worker dhelpers n)
-    (helm-http:mk-http-worker helpers n)))
+  (cond
+    ((Equal n ("ts" "doctest")) (helm-chore:mk-chore-worker chelpers fams n))
+    ((Equal n ("ts" "chore")) (helm-chore:mk-chore-worker chelpers fams n))
+    (else (helm-http:mk-http-worker helpers n))))
 
 ;; the registry plus the /boot mirror: the explorer fixtures browse
 ;; the system's own code.  Seeded and deep-forced HERE in main — a
@@ -71,11 +88,34 @@
 ;; define holds the giant sovereign (the repl journal would echo it).
 (define coord
   (let ((s (helm:seed-tasks core (app ["seeded"])
-             (helm:boot-mirror-tasks-with (life-cache 0) core))))
+             (Weld (helm:boot-mirror-tasks-with (life-cache 0) core)
+               (helm:boot-ns-index-tasks core (life-cache 0))))))
     ;; put-nat is local glue the workers call: one MAIN call compiles it
     (Seq (DeepSeq (put-nat myth-new [("ts" "warm")] 1) 0)
-      (Seq (DeepSeq s s)
-        (Spawn (helm:helm-actor core mk-worker s))))))
+      ;; chore glue: one MAIN call per compiled entry and rvr path the
+      ;; chore worker and its leaves replay off-MAIN
+      (Seq (DeepSeq
+             [((app ["chore" "done_t"]) 1 0)
+              ((app ["chore" "clear_t"]) ("ts" "k"))
+              ((app ["chore" "fail_t"]) ("ts" "x"))
+              ((app ["chore" "fam_of"]) ("ts" "d") myth-new)
+              ((app ["chore" "cmd_parts"])
+                ((app ["chore" "mkp_t"]) [("ts" "a")] myth-new))
+              (helm-doctest:dt-plan dhelpers
+                ((app ["dt" "req"]) [("ts" "boot")]) [("ts" "io")])
+              (helm-build:eval-plan bs
+                ((app ["build" "eval_req"]) "sept" "(add 1 1)")
+                [("ts" "io")])
+              (helm-build:eval-run bs ["sept" "(add 1 1)" [("ts" "io")]] 0)
+              (helm-build:compile-plan bs
+                ((app ["build" "compile_req"]) "weft") [("ts" "io")])
+              (helm-build:save-plan bs
+                ((app ["build" "save_req"]) "weft" "x") [("ts" "io")])
+              (helm-build:resync-run bs ["weft" [("ts" "io")]] 0)
+              (helm-http:form-field "expr" "expr=%28add+1+1%29")]
+             0)
+        (Seq (DeepSeq s s)
+          (Spawn (helm:helm-actor core mk-worker (lambda (hm) 0) s)))))))
 
 (define (ask m)
   (Seq (SendCaps coord (DeepSeq m m) [0])
@@ -208,6 +248,22 @@ assert(Eq 200 (_1 r9))
 assert(Eq 1 (contains? "row type" (_2 r9)))
 assert(Eq 1 (contains? "/kind" (_2 r9)))
 assert(Eq 1 (contains? "/src" (_2 r9)))
+;; the mirror's extra panes: rendered type text rides ['ty]
+assert(Eq 1 (contains? "/ty" (_2 r9)))
+
+;;; 5c. reference slots and the ns index ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; a function entry carries who-calls rows as mirror-path links
+(SendCaps wh3 ["req" "GET" "/ns/boot/sept/1/eq_pith" ""] [0])
+(define r9b (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 r9b))
+assert(Eq 1 (contains? "/called_by" (_2 r9b)))
+
+;; /boot/ns/<root> groups entries by source namespace root
+(SendCaps wh3 ["req" "GET" "/ns/boot/ns/chore" ""] [0])
+(define rns (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 rns))
+assert(Eq 1 (contains? "/ns/boot/chore" (_2 rns)))
 
 ;;; 5d. time travel through the explorer: /h browses history ;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -286,7 +342,9 @@ assert(Equal ["done"]
   (define tslot-f (app ["myth" "nat_at"]))
   (define has-slot-f (app ["myth" "has_at"]))
   ;; the worker answers asynchronously; each ask is a synchronous
-  ;; barrier, so a bounded poll converges — the chain is a few turns
+  ;; barrier, so a bounded poll converges.  Evaluation rides a leaf
+  ;; actor now (helm-chore.rvr), so completion is wall-clock async —
+  ;; the budget covers a cold app-subject eval, not a few turns
   (define (poll-done kid tries)
     (If (Eq 0 tries)
       0
@@ -295,11 +353,11 @@ assert(Equal ["done"]
               (Eq 1 (tslot-f [("ts" "res_done")] 0 (_0 r))))
           (_0 r)
           (poll-done kid (Sub tries 1))))))
-  (define done-rec (poll-done ("ts" "r1") 64))
+  (define done-rec (poll-done ("ts" "r1") 4096))
   (define vq (Ix 0 (ask ["query" (snoc ("ts" "dt") eqp-node)])))
   (define done2
     (Seq (inject (vine-make [tio tdt ("ts" "r2")] ((app ["dt" "req"]) eqp-node)))
-      (poll-done ("ts" "r2") 64)))
+      (poll-done ("ts" "r2") 4096)))
   [;; the request completed, both eq_pith doctests passed.  (IsApp,
    ;; not an Eq-0 check: shallow Eq against the deep record misreads
    ;; here — same corruption family as the top-level-assert notes.)
@@ -337,13 +395,45 @@ assert(Equal [1 1 1 1 1 1 1] (doctest-driver-checks 0))
   (define done3
     (Seq (inject (vine-make [tio tdt ("ts" "r3")]
                    ((app ["dt" "req"]) life-step-node)))
-      (poll-done ("ts" "r3") 64)))
+      (poll-done ("ts" "r3") 4096)))
   [(If (IsApp done3) 1 0)
    ;; all three step cases pass; none read "doctest error"
    (Eq 3 (tslot-f [("ts" "passed")] 99 done3))
    (Eq 0 (tslot-f [("ts" "failed")] 99 done3))])
 
 assert(Equal [1 1 1] (app-doctest-driver-checks 0))
+
+;;; 7c. the build families over the /chore bridge: eval and resync ;;;;;;;;;;;;;;;;
+
+(define tch ("ts" "chore"))
+assert(Equal ["done"]
+  (inject (vine-make [tio tch] ((app ["chore" "cfg"]) ("ts" "eval")))))
+
+;; evaluate against a module's own subject, through a plain form POST
+(SendCaps wh3 ["req" "POST" "/chore/eval/sept" "expr=%28add+2+3%29"] [0])
+(define rc1 (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 rc1))
+assert(Eq 1 (contains? "value: 5" (_2 rc1)))
+assert(Eq 1 (contains? "type:" (_2 rc1)))
+
+;; a broken expression answers the diagnostic, not a crash
+(SendCaps wh3 ["req" "POST" "/chore/eval/sept" "expr=%28frobnicate+1%29"] [0])
+(define rc2 (Ix 0 (Recv 0)))
+assert(Eq 500 (_1 rc2))
+
+;; recompiling an unchanged module reports an empty changeset and
+;; green doctests, and the mirror remount rides the same request
+(SendCaps wh3 ["req" "POST" "/chore/compile/sept" ""] [0])
+(define rc3 (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 rc3))
+assert(Eq 1 (contains? "0 changed" (_2 rc3)))
+assert(Eq 1 (contains? "0 added" (_2 rc3)))
+assert(Eq 1 (contains? "passed" (_2 rc3)))
+
+;; an unknown chore verb is a 404, answered without touching the driver
+(SendCaps wh3 ["req" "POST" "/chore/zap/sept" ""] [0])
+(define rc4 (Ix 0 (Recv 0)))
+assert(Eq 404 (_1 rc4))
 
 ;;; 8. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

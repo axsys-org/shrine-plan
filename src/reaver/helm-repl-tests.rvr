@@ -1,0 +1,108 @@
+;;;; helm-repl tests: the pure command layer, then the loop's actions
+;;;; driven against a real (portless, fetch-less) lain stack.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind helm (#module helm))
+(#bind helm-http (#module helm-http))
+(#bind helm-run (#module helm-run))
+(#bind helm-repl (#module helm-repl))
+
+
+;;; 1. the pure step ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define st0 ["sept" [] 0])
+
+;; bare expression -> eval against focus, no state change
+(define r1 (helm-repl:repl-step st0 "(add 1 2)"))
+assert(Equal st0 (Ix 0 r1))
+assert(Equal ["eval" "sept" "(add 1 2)"] (Ix 1 r1))
+
+;; empty line -> resync the focus
+assert(Equal ["resync" "sept"] (Ix 1 (helm-repl:repl-step st0 "")))
+
+;; focus switch
+(define r2 (helm-repl:repl-step st0 ":m weft"))
+assert(Equal "weft" (Ix 0 (Ix 0 r2)))
+
+;; commands map to their actions, defaulting to the focus
+assert(Equal ["resync" "weft"] (Ix 1 (helm-repl:repl-step st0 ":c weft")))
+assert(Equal ["doctest" "sept"] (Ix 1 (helm-repl:repl-step st0 ":t")))
+assert(Equal ["show" "sept" "eq_pith"] (Ix 1 (helm-repl:repl-step st0 ":s sept eq_pith")))
+assert(Equal ["nsroot" "chore"] (Ix 1 (helm-repl:repl-step st0 ":ns chore")))
+assert(Equal ["quit"] (Ix 1 (helm-repl:repl-step st0 ":q")))
+
+;; a bind stores the var and evaluates it; later evals ride the prelude
+(define r3 (helm-repl:repl-step st0 "a = (add 1 1)"))
+(define st3 (Ix 0 r3))
+assert(Equal [["a" "(add 1 1)"]] (Ix 1 st3))
+(define r4 (helm-repl:repl-step st3 "(add a a)"))
+assert(Equal ["eval" "sept" (strcat ["=  a  (add 1 1)" 10 "(add a a)"])]
+  (Ix 1 r4))
+;; rebinding replaces, does not stack
+(define st5 (Ix 0 (helm-repl:repl-step st3 "a = (add 2 2)")))
+assert(Equal [["a" "(add 2 2)"]] (Ix 1 st5))
+;; :vars lists them
+assert(Equal ["  a = (add 2 2)"]
+  (Ix 1 (Ix 1 (helm-repl:repl-step st5 ":vars"))))
+
+;; a non-identifier left side is an expression, not a bind
+assert(Eq "eval" (Ix 0 (Ix 1 (helm-repl:repl-step st0 "(eq 1 1) = x"))))
+
+;;; 2. actions against the live stack ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (contains-row? needle rows)
+  (define (has? hay)
+    (define nb (Bytes needle))
+    (define hb (Bytes hay))
+    (define (go i)
+      (cond
+        ((Gt (Add i nb) hb) 0)
+        ((Eq needle (Mod (Rsh hay (Mul 8 i)) (Lsh 1 (Mul 8 nb)))) 1)
+        (else (go (Inc i)))))
+    (go 0))
+  (includes has? rows))
+
+(define stack
+  (helm-run:boot-lain-stack 0 0 (helm:load-helm-mod "helmapp")))
+(define env (helm-repl:mk-repl-env (Ix 0 stack) (Ix 1 stack)))
+
+(define (repl-checks z)
+  (define ev
+    (helm-repl:run-action env 100 ["eval" "sept" "(add 2 3)"]))
+  (define evv
+    (helm-repl:run-action env 101
+      ["eval" "sept" (strcat ["=  a  (add 20 1)" 10 "(add a a)"])]))
+  (define bad
+    (helm-repl:run-action env 102 ["eval" "sept" "(frobnicate 1)"]))
+  (define sh
+    (helm-repl:run-action env 103 ["show" "sept" "eq_pith"]))
+  (define ns
+    (helm-repl:run-action env 104 ["nsroot" "chore"]))
+  (define rc
+    (helm-repl:run-action env 105 ["resync" "weft"]))
+  (define dt
+    (helm-repl:run-action env 106 ["doctest" "weft"]))
+  [(contains-row? "value: 5" ev)
+   (contains-row? "value: 42" evv)
+   (contains-row? "error:" bad)
+   (contains-row? "type:" sh)
+   (contains-row? "referenced by:" sh)
+   (contains-row? "/boot/chore" ns)
+   (contains-row? "0 changed" rc)
+   (contains-row? "passed" dt)])
+
+assert(Equal [1 1 1 1 1 1 1 1] (repl-checks 0))
+
+;;; 3. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (ask m)
+  (Seq (SendCaps (Ix 1 stack) (DeepSeq m m) [0])
+    (Recv 0)))
+assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
+
+(print "helm-repl tests passed")

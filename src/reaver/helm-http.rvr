@@ -17,7 +17,9 @@
 (#bind helm (#module helm))
 (#bind http-client (#module http-client))
 (#bind helm-fetch (#module helm-fetch))
+(#bind helm-chore (#module helm-chore))
 (#bind helm-doctest (#module helm-doctest))
+(#bind helm-build (#module helm-build))
 (#bind doctest (#module doctest))
 
 
@@ -148,14 +150,55 @@
       (Seq (Trace ["pump: listening" port] 0)
         (Seq wh (loop 0))))))
 
+;;; Form bodies (application/x-www-form-urlencoded) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (hex-val c)
+  (cond
+    ((And (Ge c 48) (Le c 57)) (Sub c 48))
+    ((And (Ge c 97) (Le c 102)) (Sub c 87))
+    ((And (Ge c 65) (Le c 70)) (Sub c 55))
+    (else 0)))
+
+(define (url-decode s)
+  (define n (Bytes s))
+  (define (go i)
+    (If (Ge i n)
+      0
+      (let ((c (Load8 i s)))
+        (cond
+          ((Eq c 43) (lcons 32 (go (Inc i))))
+          ((And (Eq c 37) (Lt (Add i 2) n))
+            (lcons
+              (Add (Mul 16 (hex-val (Load8 (Add i 1) s)))
+                (hex-val (Load8 (Add i 2) s)))
+              (go (Add i 3))))
+          (else (lcons c (go (Inc i))))))))
+  (lstrcat (go 0)))
+
+;; One urlencoded field's decoded value, or "".
+(define (form-field name body)
+  (define pre (strcat [name "="]))
+  (define hit
+    (find (lambda (p) (Eq pre (Mod p (Lsh 1 (Mul 8 (Bytes pre))))))
+      (split-ch 38 body)))
+  (Ifz hit "" (url-decode (Rsh (_0 hit) (Mul 8 (Bytes pre))))))
+
 ;;; The worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; helpers = ["H" http/req myth/nat_at vine_make vine_cull] — compiled
-;; lainapp entries, supplied by whoever spawns the coordinator.
+;; helpers = ["H" http/req myth/nat_at vine_make vine_cull myth/txt_at
+;;            build/eval_req build/compile_req build/save_req] —
+;; compiled lainapp/build entries, supplied by whoever spawns the
+;; coordinator.  The last four ride only where the /chore bridge is
+;; wired (the boot passes them; a short bundle disables the bridge).
 (define (h-req hs) (Ix 1 hs))
 (define (h-slot hs) (Ix 2 hs))
 (define (h-make hs) (Ix 3 hs))
 (define (h-cull hs) (Ix 4 hs))
+(define (h-txt hs) (Ix 5 hs))
+(define (h-evalreq hs) (Ix 6 hs))
+(define (h-compreq hs) (Ix 7 hs))
+(define (h-savereq hs) (Ix 8 hs))
+(define (h-bridge? hs) (Gt (Sz hs) 5))
 
 (define (pend-get pending pax)
   (find (lambda (e) (Equal pax (_0 e))) pending))
@@ -163,18 +206,50 @@
 (define (pend-drop pending pax)
   (filter (lambda (e) (Nil (Equal pax (_0 e)))) pending))
 
+;; A known record's myth, or 0 — the shared prologue of every
+;; response reader.
+(define (known-myth resrec)
+  (If (Eq "/boot/res/known" (Hd resrec)) (_0 resrec) 0))
+
 ;; The record's response, if the serving behavior wrote it yet:
 ;; [status body ctype].
 (define (res-of hs resrec)
-  (If (Eq "/boot/res/known" (Hd resrec))
-    (let ((m (_0 resrec)))
-      (let ((status ((h-slot hs) [("ts" "res_status")] 0 m)))
-        (Ifz status
-          0
-          [status
-           ((h-slot hs) [("ts" "res_body")] 0 m)
-           ((h-slot hs) [("ts" "res_ctype")] "text/plain; charset=utf-8" m)])))
-    0))
+  (define m (known-myth resrec))
+  (Ifz m
+    0
+    (let ((status ((h-slot hs) [("ts" "res_status")] 0 m)))
+      (Ifz status
+        0
+        [status
+         ((h-slot hs) [("ts" "res_body")] 0 m)
+         ((h-slot hs) [("ts" "res_ctype")] "text/plain; charset=utf-8" m)]))))
+
+(define chore-nl (strcat [10]))
+
+;; A chore request node's answer, once ['res_done] lands: the build
+;; families' result slots rendered as plain text.
+(define (chore-res-of hs resrec)
+  (define m (known-myth resrec))
+  (If (Or (Ifz m 1 0) (Nil (Eq 1 ((h-slot hs) [("ts" "res_done")] 0 m))))
+    0
+    (let* ((txt (h-txt hs))
+               (err (txt [("ts" "err")] m))
+               (report (txt [("ts" "report")] m))
+               (value (txt [("ts" "value")] m))
+               (tyt (txt [("ts" "ty")] m))
+               (law (txt [("ts" "law")] m))
+               (ct "text/plain; charset=utf-8"))
+          (cond
+            (err [500 err ct])
+            (report [200 report ct])
+            (value
+              [200
+               (strcat
+                 ["value: " value
+                  (Ifz tyt "" (strcat [chore-nl "type:  " tyt]))
+                  (Ifz law "" (strcat [chore-nl chore-nl law]))])
+               ct])
+            (else [500 "chore failed" ct])))))
 
 (define (mk-http-worker hs name self)
   ;; go handshake: the coordinator handle rides the caps; the config
@@ -197,39 +272,86 @@
     (define msg (Ix 0 m))
     (define caps (Ix 1 m))
     (define kind (_0 msg))
+    ;; a /chore/<verb>/<mod..> request builds a build/*_req record
+    ;; under the chore driver instead of an explorer request; the
+    ;; response reads the finished chore node's result slots
+    (define (chore-record parts body)
+      (define verb (Ix 1 parts))
+      (define mod (helm-doctest:join-slash (drop 2 parts)))
+      (cond
+        ((Eq verb "eval") ((h-evalreq hs) mod (form-field "expr" body)))
+        ((Eq verb "compile") ((h-compreq hs) mod))
+        ((Eq verb "save") ((h-savereq hs) mod (form-field "src" body)))
+        (else 0)))
+    ;; answer a waiting connection: cull the request node, send the
+    ;; response, retire the pending entry (the cull ack's own drop is
+    ;; then a no-op)
+    (define (answer hit pax r serial2 pending2 queue2)
+      (Seq (helm:send! coord ["cmd" name ((h-cull hs) pax)])
+        (Seq (helm:send! (_1 (_0 hit)) ["res" (_0 r) (_1 r) (_2 r)])
+          (loop serial2 (pend-drop pending2 pax) (snoc [pax "cull"] queue2)))))
+    ;; not ready: re-spy AND re-read — the next write may have
+    ;; committed before this re-arm; the read's qres catches exactly
+    ;; that window
+    (define (rearm pax)
+      (Seq (helm:send! coord ["spy" name pax])
+        (let ((rm ["read" pax]))
+          (Seq (DeepSeq rm rm) (SendCaps coord rm [0])))))
     (cond
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
-        (let* ((pax (rpath serial))
-               (record ((h-req hs) (_1 msg) (_2 msg) (_3 msg) (url-target (_2 msg))))
-               (task ((h-make hs) pax record))
-               (sm ["spy" name pax])
-               (cm ["cmd" name task]))
-          (Seq (DeepSeq cm (DeepSeq sm sm))
-            (Seq (Send coord sm)
-              (Seq (Send coord cm)
-                (loop (Inc serial)
-                  (snoc [pax (Ix 0 caps)] pending)
-                  (snoc [pax "make"] queue)))))))
+        (let* ((parts (filter Bytes (split-ch 47 (_2 msg))))
+               (chore? (And (h-bridge? hs)
+                         (And (Gt (Sz parts) 1)
+                           (Equal "chore" (Ix 0 parts)))))
+               (record
+                 (If chore?
+                   (chore-record parts (_3 msg))
+                   ((h-req hs) (_1 msg) (_2 msg) (_3 msg)
+                     (url-target (_2 msg)))))
+               (pax
+                 (If chore?
+                   [("ts" "io") ("ts" "chore")
+                    ("ts" (strcat ["b" (_0 name) (showNat serial)]))]
+                   (rpath serial))))
+          (If (And chore? (Ifz record 1 0))
+            (Seq (helm:send! (Ix 0 caps)
+                   ["res" 404 "unknown chore verb" "text/plain; charset=utf-8"])
+              (loop serial pending queue))
+            (let ((task ((h-make hs) pax record)))
+              ;; spy before cmd: worker->coordinator sends are FIFO,
+              ;; so the watch is armed before the request node exists
+              (Seq (helm:send! coord ["spy" name pax])
+                (Seq (helm:send! coord ["cmd" name task])
+                  (loop (Inc serial)
+                    (snoc [pax (Ix 0 caps)] pending)
+                    (snoc [pax "make"] queue))))))))
       ((Eq kind "change")
         ;; the watched request node moved: respond when the behavior
-        ;; has written the response slots, else re-spy and keep waiting
+        ;; has written the response slots, else re-arm and keep waiting
         (let ((pax (_1 msg))
               (hit (pend-get pending (_1 msg))))
           (Ifz hit
             (loop serial pending queue)
-            (let ((r (res-of hs (_2 msg))))
+            (let ((r (let ((r0 (res-of hs (_2 msg))))
+                       (If (Or r0 (Nil (h-bridge? hs)))
+                         r0
+                         (chore-res-of hs (_2 msg))))))
               (Ifz r
-                (let ((sm ["spy" name pax]))
-                  (Seq (DeepSeq sm sm)
-                    (Seq (Send coord sm)
-                      (loop serial pending queue))))
-                (let ((cm ["cmd" name ((h-cull hs) pax)])
-                      (rm ["res" (_0 r) (_1 r) (_2 r)]))
-                  (Seq (DeepSeq cm (DeepSeq rm rm))
-                    (Seq (Send coord cm)
-                      (Seq (Send (_1 (_0 hit)) rm)
-                        (loop serial pending (snoc [pax "cull"] queue)))))))))))
+                (Seq (rearm pax)
+                  (loop serial pending queue))
+                (answer hit pax r serial pending queue))))))
+      ((Eq kind "qres")
+        ;; a committed re-read of a pending chore node: answer if the
+        ;; result landed; otherwise the armed spy carries on
+        (let ((pax (_1 msg))
+              (hit (pend-get pending (_1 msg))))
+          (Ifz hit
+            (loop serial pending queue)
+            (let ((r (If (h-bridge? hs) (chore-res-of hs (_2 msg)) 0)))
+              (Ifz r
+                (loop serial pending queue)
+                (answer hit pax r serial pending queue))))))
       ((Eq kind "ack")
         ;; acks return in cmd order: pop the queue head
         (let ((head (Ix 0 queue))
@@ -242,10 +364,10 @@
               (let ((hit (pend-get pending (_0 head))))
                 (Ifz hit
                   (loop serial pending rest)
-                  (let ((rm ["res" 500 (_0 (_0 rsvp)) "text/plain; charset=utf-8"]))
-                    (Seq (DeepSeq rm rm)
-                      (Seq (Send (_1 (_0 hit)) rm)
-                        (loop serial (pend-drop pending (_0 head)) rest)))))))
+                  (Seq (helm:send!
+                         (_1 (_0 hit))
+                         ["res" 500 (_0 (_0 rsvp)) "text/plain; charset=utf-8"])
+                    (loop serial (pend-drop pending (_0 head)) rest)))))
             ((Equal "cull" (_1 head))
               ;; the request node is gone: this connection is done
               (loop serial (pend-drop pending (_0 head)) rest))
@@ -261,125 +383,5 @@
              (SendCaps pump ["go"] [0])))
       (loop 0 [] []))))
 
+
 ;;; Boot ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; The live stack, end to end: compile the helm chain, spawn the
-;; coordinator with this HTTP worker, seed a little namespace to
-;; explore, make /io/http with the explorer kook + a real port, then
-;; park.  Everything after boot is namespace-driven: the serving kook
-;; installs the responder, crews hydrate views, the cycle cascades.
-;; core0 is passed unevaluated (laziness defers any compile inside it
-;; until after the warm block runs in MAIN).
-(define (run-lain-boot port core0)
-  ;; Warm the socket path in MAIN: spawned actors have no compiler,
-  ;; so any lazily-expanded define first demanded inside one dies
-  ;; with "no compiler set".  DeepSeq stops at pins, so the warmup
-  ;; CALLS each path once — executing in main compiles the whole
-  ;; call graph the pump and connection actors will touch.
-  (define warm
-    (DeepSeq
-      [(DeepSeq [conn-actor listener-pump mk-http-worker res-of
-                 pend-get pend-drop
-                 helm-fetch:mk-fetch-worker helm-fetch:fetch-actor
-                 helm-doctest:mk-doctest-worker] 0)
-       ;; one real evaluation compiles the doctest eval pipeline in
-       ;; MAIN — the worker only replays compiled paths
-       (doctest:eval-text (helm:core-sut core0) "(add 1 1)")
-       (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
-       (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
-       (url-target "/ns/a/b")
-       (http-res 200 "text/plain" "hi")
-       (http-res 500 "text/plain" "no")
-       (request-body (strcat ["GET / HTTP/1.0" crlf crlf "body"]))
-       (helm-fetch:join-hdrs [["a" "b"]])
-       (helm-fetch:row-has 1 [1 2])
-       (helm-fetch:row-drop 1 [1 2])
-       (helm-fetch:row-weld [1] [2])
-       (http-client:fetch-warm 0)]
-      0))
-  (define core (Seq warm core0))
-  (define (app path) (helm:core-ent core path))
-  (define sov0 (app ["seeded_kern"]))
-  ;; apps compile before the mirror is built, against the core's own
-  ;; cache, so app modules mirror (lore included) like kernel code
-  (define ar (helm:compile-apps core (helm:core-cache core) (helm:discover-apps 0)))
-  ;; the boot image, introspectable at /boot
-  (define mirror (helm:boot-mirror-tasks-with (_0 ar) core))
-  (define sov1
-    (Seq (Trace ["mirroring /boot" (Sz mirror)] 0)
-      (helm:seed-tasks core sov0 mirror)))
-  ;; one event per app: the pact form expands the whole subtree
-  (define sov2
-    (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
-      (helm:mount-apps core sov1 (_1 ar))))
-  ;; optional: boot born-verified (helm:doctest-sweep?)
-  (define sov3
-    (If helm:doctest-sweep?
-      (Seq (Trace ["doctest sweep"] 0)
-        (helm:seed-doctests (_0 ar) core sov2))
-      sov2))
-  ;; t_data / put_nat left the app: rebuild them from the myth kit
-  ;; (myth/new is a constant now — the entry value IS the empty myth)
-  (define myth-new (app ["myth" "new"]))
-  (define myth-sing (app ["myth" "sing"]))
-  (define myth-add (app ["myth" "add"]))
-  (define limb-nat (app ["limb" "nat"]))
-  (define pd-f (app ["pd"]))
-  (define (t-data slot n) (myth-sing slot (pd-f n)))
-  (define (put-nat t slot n) (myth-add (limb-nat slot n) t))
-  (define vine-make (app ["vine_make"]))
-  (define cfg-port (app ["http" "cfg_port"]))
-  (define helpers
-    ["H" (app ["http" "req"]) (app ["myth" "nat_at"]) (app ["vine_make"]) (app ["vine_cull"])])
-  (define fhelpers
-    ["F" (app ["myth" "nat_at"]) (app ["fetch" "fresh"]) (app ["fetch" "hdrs"])
-     (app ["fetch" "res_ok"]) (app ["fetch" "res_err"]) put-nat
-     myth-new (app ["vine_poke"])])
-  (define dhelpers
-    ["D" (helm:core-sut core) (helm:mirror-cache (_0 ar) core)
-     (app ["myth" "pail_at"]) (app ["fetch" "fresh"]) put-nat
-     myth-new (app ["vine_poke"]) (app ["dt_card_t"])
-     (app ["vine_make"])])
-  (define (mk-worker n)
-    (cond
-      ((Equal n ("ts" "http-client"))
-        (helm-fetch:mk-fetch-worker fhelpers n))
-      ((Equal n ("ts" "doctest"))
-        (helm-doctest:mk-doctest-worker dhelpers n))
-      (else (mk-http-worker helpers n))))
-  ;; seed in MAIN (DeepSeq before Spawn): the reef seeding code cannot
-  ;; compile-on-demand inside the coordinator ("no compiler set")
-  (define coord
-    ;; put-nat is local glue the workers call: one MAIN call compiles it
-    (Seq (DeepSeq (put-nat myth-new [("ts" "warm")] 1) 0)
-      (Seq (DeepSeq sov3 sov3)
-        (Spawn (helm:helm-actor core mk-worker sov3)))))
-  (define (inject t)
-    (Seq (SendCaps coord (DeepSeq t ["task" t]) [0])
-      (Recv 0)))
-  ;; something to look at
-  (Seq (inject (vine-make [("ts" "data") ("ts" "hello")] (t-data [("ts" "num")] 41)))
-    (Seq (inject (vine-make [("ts" "data") ("ts" "hello") ("ts" "world")] (t-data [("ts" "num")] 42)))
-      ;; the drivers: explorer responder on a real listener, plus the
-      ;; outbound fetch driver at /io/http-client
-      (Seq (inject (vine-make [("ts" "io") ("ts" "http")] (cfg-port ("ts" "hex") port)))
-        (Seq (inject (vine-make [("ts" "io") ("ts" "http-client")] (app ["fetch" "cfg"])))
-        (Seq (inject (vine-make [("ts" "io") ("ts" "doctest")] (app ["dt" "cfg"])))
-        (Seq (Trace ["lain listening" port] 0)
-          ;; park: the coordinator and its actors do the work now
-          (let ((park (lambda (go z) (Seq (Recv 0) (go go z)))))
-            (park park 0)))))))))
-
-(define (run-lain port)
-  (run-lain-boot port (helm:load-helm-mod "helmapp")))
-
-(define (run-lain-artifact-cached port cache)
-  (run-lain-boot port (helm:load-helm-mod-artifact-cached cache "helmapp")))
-
-;; Boot from a persisted precompiled image (x/lain binds it to a
-;; snapshot top level and refreshes it in a prior session).  A stale
-;; or malformed image still boots — refresh falls back to a fresh
-;; source build — so this entry can never serve outdated code.
-(define (run-lain-image port img)
-  (run-lain-boot port
-    (helm:helm-image-core (helm:helm-image-refresh img "helmapp"))))

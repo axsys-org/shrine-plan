@@ -8,7 +8,9 @@
 '  /axal is a tree addressed by paths: each node holds an optional
 '  value (fil) and an ordered map of children (kid) — the kid map is
 '  /uon instantiated at the axal type itself.
-
++  strcat
+  \  l=nat r=nat
+  (add l (mul r 256))
 +  maybe
   '  An optional value: .some or .none.
   (@@ v)
@@ -57,6 +59,14 @@
     ?  (eq i xs.len)
        acc
     (_ i.inc (f acc xs.at(i)))
+  +  range
+    \  start=nat end=nat
+    ^  row[nat]
+    |  > i=nat start
+       > acc=row[nat] []
+    ?  (eq i end)
+       acc
+    (_ i.inc acc.snoc(i))
   +  any
     '  Does f hold somewhere?  Truthy, short-circuiting.
     '  ?=  ((row/any[nat] (lt 2) [1 3]) 1)
@@ -90,6 +100,12 @@
     ?  (eq 0 xs.len)
        .none
     (./some [xs.at(0) xs.drop(1)])
+  +  put_at
+    '  Replace the element at an index.
+    (@ v)
+    \  i=nat x=v xs=row[v]
+    ^  row[v]
+    xs.take(i).snoc(x).weld(xs.drop(i.inc))
 
 +  path
   '  A path: a row of iotas addressing a namespace node.  A type
@@ -698,25 +714,290 @@
   ?  (eq 2 m2.size)
      m2.gut(['a 'b] 0)
   0
++  bee
+  '  An ordered map from iota (quip) to v by /lte_iota — B-tree
+  '  internals, every child link behind a pin.  An insert rebuilds
+  '  (and re-pins) only its root-to-leaf path, so snapshotting a
+  '  tree that grew by one key re-serializes O(log fanout) small
+  '  nodes at any fanout.  In-order tap is naturally sorted; no
+  '  hashing, no boundary sorts.  Deletion is lazy: leaves may run
+  '  under half-full (structure deletes are rare — /axal/lop).
+  (@@ v)
+  &  bee/leaf[v]
+     bee/limb[v]
+
+  +  leaf
+    '  A run of sorted entries, at most /bee/max of them.  [] is
+    '  the empty map.
+    :  ents=row[uon/kv[v]]
+
+  +  limb
+    '  An interior node: kids.len = seps.len + 1; kid i covers keys
+    '  below seps.at(i) (at-or-above routes right).  sz caches the
+    '  total entry count.
+    :  sz=nat seps=row[quip] kids=row[bee/k[v]]
+
+  +  k
+    '  A pinned child link — the hitchhiker pin boundary.
+    :  held=pin[bee[v]]
+
+  +  max
+    ^  nat
+    16
+
+  +  ins
+    '  One level's insert outcome: the rebuilt node (grew tells
+    '  whether the key was new), or a split with its separator.
+    &  bee/ins/fit[v]
+       bee/ins/burst[v]
+
+    +  fit
+      :  t=bee[v] grew=nat
+
+    +  burst
+      :  l=bee/k[v] sep=quip r=bee/k[v]
+
+  +  arm
+    '  Count of separators at-or-below the probe: the child index a
+    '  key routes to in a limb.
+    \  key=quip ks=row[quip]
+    ^  nat
+    |  > i=nat 0
+    ?  (eq i ks.len)
+       i
+    ?  (lte_iota ks.at(i) key)
+       (_ i.inc)
+    i
+
+  +  size
+    \  t=bee[v]
+    ^  nat
+    ?  t
+     > lf=bee/leaf[v]  lf.ents.len
+     > lm=bee/limb[v]  lm.sz
+
+  +  get
+    \  key=quip t=bee[v]
+    ^  maybe[v]
+    ?  t
+     > lf=bee/leaf[v]
+       |  > i=nat 0
+       ^  maybe[v]
+       ?  (eq i lf.ents.len)
+          .none
+       =  e  lf.ents.at(i)
+       ?  (eq_iota e.key key)
+          (./some e.val)
+       ?  (lt_iota key e.key)
+          .none
+       (_ i.inc)
+     > lm=bee/limb[v]
+       (_ key (unpin lm.kids.at((bee/arm key lm.seps)).held))
+
+  +  gut
+    \  key=quip def=v t=bee[v]
+    ^  v
+    t.get(key).fall(def)
+
+  +  tally
+    '  Total entries across a kids row.
+    \  ks=row[bee/k[v]]
+    ^  nat
+    ks.fold(0 (\ acc w acc.add((bee/size[v] (unpin w.held)))))
+
+  +  put_in
+    '  Insert one level down; the caller absorbs a burst.
+    \  key=quip val=v t=bee[v]
+    ^  bee/ins[v]
+    ?  t
+     > lf=bee/leaf[v]
+       =  ents  lf.ents
+          i
+            |  > j=nat 0
+            ?  (eq j ents.len)
+               j
+            ?  (lt_iota ents.at(j).key key)
+               (_ j.inc)
+            j
+       =  hit
+            ?  (lt i ents.len)
+               (eq_iota ents.at(i).key key)
+            .false
+          e2
+            ?  hit
+               ents.put_at(i (uon/kv[v] key val))
+            ents.take(i).snoc((uon/kv[v] key val)).weld(ents.drop(i))
+          g
+            ?  hit
+               0
+            1
+       ?  (le e2.len bee/max)
+          (./fit (bee/leaf[v] e2) g)
+       =  m  (div e2.len 2)
+       (./burst
+         (bee/k[v] (pin (bee/leaf[v] e2.take(m))))
+         e2.at(m).key
+         (bee/k[v] (pin (bee/leaf[v] e2.drop(m)))))
+     > lm=bee/limb[v]
+       =  i    (bee/arm key lm.seps)
+          sub  (unpin lm.kids.at(i).held)
+       ?  (_ key val sub)
+        > (./fit t2 g)
+          (./fit
+            (bee/limb[v] lm.sz.add(g) lm.seps
+              lm.kids.put_at(i (bee/k[v] (pin t2))))
+            g)
+        > (./burst l2 sep r2)
+          =  s2  lm.seps.take(i).snoc(sep).weld(lm.seps.drop(i))
+             k2  lm.kids.take(i).snoc(l2).snoc(r2).weld(lm.kids.drop(i.inc))
+          ?  (le s2.len bee/max)
+             (./fit (bee/limb[v] lm.sz.inc s2 k2) 1)
+          =  m     (div s2.len 2)
+             msep  s2.at(m)
+             lk    k2.take(m.inc)
+             rk    k2.drop(m.inc)
+          (./burst
+            (bee/k[v] (pin (bee/limb[v] (bee/tally[v] lk) s2.take(m) lk)))
+            msep
+            (bee/k[v] (pin (bee/limb[v] (bee/tally[v] rk) s2.drop(m.inc) rk))))
+
+  +  put
+    \  key=quip val=v t=bee[v]
+    ^  bee[v]
+    ?  (bee/put_in key val t)
+     > (./fit t2 _)  t2
+     > (./burst l sep r)
+       (bee/limb[v]
+         (add (bee/size[v] (unpin l.held)) (bee/size[v] (unpin r.held)))
+         [sep] [l r])
+
+  +  has
+    \  key=quip t=bee[v]
+    ^  bool
+    ?=((./some _) t.get(key))
+
+  +  del2
+    '  Remove a key; lazy — no merge or borrow, leaves may run
+    '  under-full.  An absent key returns the tree untouched (no
+    '  fresh pins minted over identical content).
+    \  key=quip t=bee[v]
+    ^  bee[v]
+    ?  t
+     > lf=bee/leaf[v]
+       |  > i=nat 0
+       ^  bee[v]
+       ?  (eq i lf.ents.len)
+          t
+       ?  (eq_iota lf.ents.at(i).key key)
+          (bee/leaf[v] lf.ents.take(i).weld(lf.ents.drop(i.inc)))
+       (_ i.inc)
+     > lm=bee/limb[v]
+       =  i    (bee/arm key lm.seps)
+          sub  (unpin lm.kids.at(i).held)
+          d2   (_ key sub)
+       ?  (eq (bee/size[v] d2) (bee/size[v] sub))
+          t
+       (bee/limb[v] lm.sz.dec lm.seps
+         lm.kids.put_at(i (bee/k[v] (pin d2))))
+
+  +  tap
+    '  Every entry, ascending by key (in-order walk).
+    \  t=bee[v]
+    ^  row[uon/kv[v]]
+    ?  t
+     > lf=bee/leaf[v]  lf.ents
+     > lm=bee/limb[v]
+       =  me  (_)
+       lm.kids.fold([] (\ acc w acc.weld((me (unpin w.held)))))
+
+  +  keys
+    \  t=bee[v]
+    ^  row[quip]
+    t.tap.fold([] (\ acc e acc.snoc(e.key)))
+
+  +  uno
+    '  Merge b into a; meg resolves collisions (key, a's, b's).
+    \  meg={quip; v; v; v} b=bee[v] a=bee[v]
+    ^  bee[v]
+    b.tap.fold(a ;
+      \  acc e
+      ?  acc.get(e.key)
+       > (./some old)  acc.put(e.key (meg e.key old e.val))
+       > .none  acc.put(e.key e.val))
+
+  +  uni
+    '  Merge; a's values win collisions.
+    \  b=bee[v] a=bee[v]
+    ^  bee[v]
+    a.uno((\ k2 old new old) b)
+
+  +  run
+    '  Map a function over every value, structure-preserving.
+    (@ w)
+    \  fun={v; w} t=bee[v]
+    ^  bee[w]
+    ?  t
+     > lf=bee/leaf[v]
+       (bee/leaf[w]
+         lf.ents.fold([] (\ acc e acc.snoc((uon/kv[w] e.key (fun e.val))))))
+     > lm=bee/limb[v]
+       =  me  (_)
+       (bee/limb[w] lm.sz lm.seps
+         lm.kids.fold([]
+           (\ acc kw acc.snoc((bee/k[w] (pin ((me fun) (unpin kw.held))))))))
+
 +  axal
   '  A recursive path-tree: a value at this node (fil) plus an ordered
   '  map of children (kid), addressed by piths — path.  The kid
-  '  map instantiates /uon at the axal type itself.
+  '  map instantiates /bee at pinned links of the axal type itself:
+  '  child subtrees cross /axal/k pins, so bee nodes hold refs.
   (@@ v)
-  :  fil=maybe[v] kid=uon[axal[v]]
+  :  fil=maybe[v] kid=bee[axal/k[v]]
+  +  k
+    '  A pinned child subtree.
+    :  held=pin[axal[v]]
   +  new
     '  A leaf: the given fil and no kids.  (axal/new[v] .none) is the
     '  empty tree.
     \  m=maybe[v]
     ^  axal[v]
-    (axal[v] m (uon/empty))
+    (axal[v] m (bee/leaf[axal/k[v]] []))
+  +  kid_get
+    '  The child at a key, unpinned.
+    \  key=quip fat=axal[v]
+    ^  maybe[axal[v]]
+    ?>  (./some w) fat.kid.get(key)
+        .none
+    (./some (unpin w.held))
+  +  kid_gut
+    '  The child at a key, or the empty tree.
+    \  key=quip fat=axal[v]
+    ^  axal[v]
+    ?>  (./some sub) fat.kid_get(key)
+        (axal/new[v] .none)
+    sub
+  +  kid_put
+    '  The kid map with sub pinned in at key.
+    \  key=quip sub=axal[v] fat=axal[v]
+    ^  bee[axal/k[v]]
+    fat.kid.put(key (axal/k[v] (pin sub)))
+  +  kid_tap
+    '  Every (key, child) pair, ascending by key, unpinned.
+    \  fat=axal[v]
+    ^  row[uon/kv[axal[v]]]
+    fat.kid.tap.fold([]
+      (\ acc e acc.snoc((uon/kv[axal[v]] e.key (unpin e.val.held)))))
+  +  kid_keys
+    \  fat=axal[v]
+    ^  row[quip]
+    fat.kid.tap.fold([] (\ acc e acc.snoc(e.key)))
   +  dip
     '  Descend to the subtree at this path (empty if absent).
     \  pax=path fat=axal[v]
     ^  axal[v]
     ?  (eq 0 pax.len)
        fat
-    ?>  (./some sub) fat.kid.get(pax.at(0))
+    ?>  (./some sub) fat.kid_get(pax.at(0))
         (axal/new[v] .none)
     (_ pax.drop(1) sub)
   +  get
@@ -742,7 +1023,7 @@
     ^  [rem=path fil=maybe[v]]
     ?  (eq 0 pax.len)
        [pax fat.fil]
-    ?  fat.kid.get(pax.at(0))
+    ?  fat.kid_get(pax.at(0))
      >  .none  [pax fat.fil]
      >  (./some sub)
        =  [rem got]  (_ pax.drop(1) sub)
@@ -756,8 +1037,8 @@
     ?  (eq 0 pax.len)
        (axal[v] (./some dat) fat.kid)
     =  key  pax.at(0)
-       sub  fat.kid.gut(key (axal/new[v] .none))
-    (axal[v] fat.fil fat.kid.put(key (_ pax.drop(1) dat sub)))
+       sub  fat.kid_gut(key)
+    (axal[v] fat.fil fat.kid_put(key (_ pax.drop(1) dat sub)))
   +  gas
     '  Put a row of [pith value] entries.
     \  lit=row[[p=path q=v]] fat=axal[v]
@@ -770,8 +1051,8 @@
     ?  (eq 0 pax.len)
        fresh
     =  key  pax.at(0)
-       sub  fat.kid.gut(key (axal/new[v] .none))
-    (axal[v] fat.fil fat.kid.put(key (_ pax.drop(1) fresh sub)))
+       sub  fat.kid_gut(key)
+    (axal[v] fat.fil fat.kid_put(key (_ pax.drop(1) fresh sub)))
   +  del
     '  Clear the value at a path, keeping descendants.
     \  pax=path fat=axal[v]
@@ -779,9 +1060,9 @@
     ?  (eq 0 pax.len)
        (axal[v] .none fat.kid)
     =  key  pax.at(0)
-    ?  fat.kid.get(key)
+    ?  fat.kid_get(key)
      >  .none        fat
-     >  (./some sub)  (axal[v] fat.fil fat.kid.put(key (_ pax.drop(1) sub)))
+     >  (./some sub)  (axal[v] fat.fil fat.kid_put(key (_ pax.drop(1) sub)))
   +  lop
     '  Delete the whole subtree at a path.
     \  pax=path fat=axal[v]
@@ -791,10 +1072,10 @@
     ?  (eq 1 pax.len)
        (axal[v] fat.fil fat.kid.del2(pax.at(0)))
     =  key  pax.at(0)
-    ?  fat.kid.get(key)
+    ?  fat.kid_get(key)
      >  .none        fat
      >  (./some sub)
-      (axal[v] fat.fil fat.kid.put(key (_ pax.drop(1) sub)))
+      (axal[v] fat.fil fat.kid_put(key (_ pax.drop(1) sub)))
   +  tap
     '  Every [pith value] entry in the tree — anonymous rows — parent
     '  before kids, kids in ascending key order.  One accumulator
@@ -809,7 +1090,7 @@
          ?>  (./some x) cur.fil
              acc
          acc.snoc([here x])
-    cur.kid.tap.fold(out ;
+    cur.kid_tap.fold(out ;
       \  next [key sub]
       (me here.snoc(key) sub next))
   +  keys
@@ -827,7 +1108,7 @@
     \  fat=axal[v]
     ^  nat
     =  me  (_)
-       sub  fat.kid.tap.fold(0 (\ acc [_ kid] acc.add((me kid))))
+       sub  fat.kid_tap.fold(0 (\ acc [_ kid] acc.add((me kid))))
     ?  fat.fil
      > (./some _)  sub.inc
      > .none  sub
@@ -838,7 +1119,10 @@
     \  fun={v; w} fat=axal[v]
     ^  axal[w]
     =  me  (_)
-    (axal[w] fat.fil.run(fun) (uon/run[axal[v] axal[w]] (me fun) fat.kid))
+    (axal[w] fat.fil.run(fun)
+      (bee/run[axal/k[v] axal/k[w]]
+        (\ kw (axal/k[w] (pin ((me fun) (unpin kw.held)))))
+        fat.kid))
   +  snip_cut
     '  Worker for /axal/snip : a valued kid becomes its leaf; a
     '  hollow one is transparent and passes through to the nearest
@@ -851,7 +1135,10 @@
     ?  cur.fil
      > (./some _)  (axal/new[v] cur.fil)
      > .none
-       (axal[v] .none (uon/run[axal[v] axal[v]] me cur.kid))
+       (axal[v] .none
+         (bee/run[axal/k[v] axal/k[v]]
+           (\ kw (axal/k[v] (pin (me (unpin kw.held)))))
+           cur.kid))
   +  snip
     '  The care-y restriction of a tree: the root value plus its
     '  frontier — each nearest valued descendant at its full pith,
@@ -859,7 +1146,10 @@
     '  remain as empty structure, invisible to get/tap/keys.
     \  fat=axal[v]
     ^  axal[v]
-    (axal[v] fat.fil (uon/run[axal[v] axal[v]] axal/snip_cut[v] fat.kid))
+    (axal[v] fat.fil
+      (bee/run[axal/k[v] axal/k[v]]
+        (\ kw (axal/k[v] (pin (axal/snip_cut[v] (unpin kw.held)))))
+        fat.kid))
   +  uni
     '  Merge taf into fat; fat's values win at collisions.
     '  The loop is shaped to ride /uon/uno as its own meg gate (key,
@@ -872,11 +1162,15 @@
        > r=axal[v] taf
     ^  axal[v]
     =  me  (_)
-    (axal[v] l.fil.or(r.fil) l.kid.uno(me r.kid))
+    (axal[v] l.fil.or(r.fil)
+      l.kid.uno(
+        (\ k2 aw bw (axal/k[v] (pin (me k2 (unpin aw.held) (unpin bw.held)))))
+        r.kid))
   +  crumb
-    '  One level of zipper context: the parent's fil, its other kids,
-    '  and the key descended through.
-    :  fil=maybe[v] sibs=uon[axal[v]] key=quip
+    '  One level of zipper context: the parent's fil, its WHOLE kid
+    '  map (pins untouched — up overwrites at key), and the key
+    '  descended through.
+    :  fil=maybe[v] sibs=bee[axal/k[v]] key=quip
   +  zip
     '  An axal with a cursor: the subtree under focus plus the spine
     '  of crumbs back to the root, innermost last.  Edits happen on
@@ -888,9 +1182,8 @@
       '  edits at depth create their spine.
       \  k=quip z=axal/zip[v]
       ^  axal/zip[v]
-      =  kid   z.focus.kid.gut(k (axal/new[v] .none))
-         sibs  z.focus.kid.del2(k)
-         cr    (axal/crumb[v] z.focus.fil sibs k)
+      =  kid   z.focus.kid_gut(k)
+         cr    (axal/crumb[v] z.focus.fil z.focus.kid k)
       (axal/zip[v] kid z.spine.snoc(cr))
     +  up
       '  Reattach the focus one level up; at the root, a no-op.
@@ -899,7 +1192,7 @@
       ?  (eq 0 z.spine.len)
          z
       =  cr   z.spine.at(z.spine.len.dec)
-         par  (axal[v] cr.fil cr.sibs.put(cr.key z.focus))
+         par  (axal[v] cr.fil cr.sibs.put(cr.key (axal/k[v] (pin z.focus))))
       (axal/zip[v] par z.spine.take(z.spine.len.dec))
     +  top
       '  Unwind fully and return the tree.

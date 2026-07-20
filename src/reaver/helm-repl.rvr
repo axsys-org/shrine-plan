@@ -1,0 +1,351 @@
+;;;; The namespace REPL: buddy's terminal session rebuilt on the live
+;;;; lain stack.  MAIN boots the full namespace (mirror, apps, chore
+;;;; and doctest drivers, the explorer on a real port — browse in a
+;;;; browser while you type), then runs this loop instead of parking.
+;;;; Every command is namespace traffic: evals/resyncs ride build
+;;;; chore requests, doctests ride dt requests, browsing reads the
+;;;; /boot mirror — the REPL owns no compiler state of its own.
+;;;;
+;;;; Commands:
+;;;;   <expr>            evaluate against the focus module
+;;;;   name = expr       bind a REPL variable (re-evaluated as a
+;;;;                     textual prelude on later evals, so vars
+;;;;                     survive resyncs by construction)
+;;;;   :m <mod>          switch focus
+;;;;   :c [mod]          recompile (report + changeset + remount)
+;;;;   :t [mod]          run the module's doctests
+;;;;   :s <mod> <dotted> inspect one mirror entry (bst bst.size)
+;;;;   :ns <root>        entries under a source namespace root
+;;;;   :vars  :h  :q
+;;;;   <enter>           recompile the focus module
+;;;;
+;;;; The poke port (x/repl wires your editor's save hook to it)
+;;;; triggers the same resync as :c.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind foil (#module foil))
+(#bind foil-lore (#module foil-lore))
+(#bind helm (#module helm))
+(#bind helm-http (#module helm-http))
+(#bind helm-run (#module helm-run))
+
+(define (ts s) ("ts" s))
+(define NL (strcat [10]))
+
+(define (starts-with pre s)
+  (Eq pre (Mod s (Lsh 1 (Mul 8 (Bytes pre))))))
+
+(define (words s)
+  (filter Bytes (helm-http:split-ch 32 s)))
+
+;; "name = expr" -> [name expr] when name is a plain identifier; 0
+;; otherwise.  Splits on the FIRST " = " only.
+(define (bind-split line)
+  (define n (Bytes line))
+  (define (ident? w)
+    (define (go i)
+      (Or (Ge i (Bytes w))
+        (And (let ((c (Load8 i w)))
+               (Or (And (Ge c 97) (Le c 122))
+                 (Or (And (Ge c 48) (Le c 57)) (Eq c 95))))
+          (go (Inc i)))))
+    (And (Gt (Bytes w) 0) (go 0)))
+  (define (find-eq i)
+    (cond
+      ((Ge (Add i 2) n) 0)
+      ((And (Eq 32 (Load8 i line))
+         (And (Eq 61 (Load8 (Add i 1) line))
+           (Eq 32 (Load8 (Add i 2) line))))
+        [i])
+      (else (find-eq (Inc i)))))
+  (define hit (find-eq 0))
+  (Ifz hit
+    0
+    (let* ((i (Ix 0 hit))
+           (name (foil-lore:str-slice 0 i line))
+           (expr (Rsh line (Mul 8 (Add i 3)))))
+      (If (And (ident? name) (Gt (Bytes expr) 0))
+        [name expr]
+        0))))
+
+;;; The pure step: (state line) -> [state' action] ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; state = [focus vars serial]; vars = [[name expr] ..]
+;;; actions: ["quit"] ["rows" rows] ["eval" mod text] ["resync" mod]
+;;;          ["doctest" mod] ["show" mod dotted] ["nsroot" root]
+
+(define (st-focus st) (Ix 0 st))
+(define (st-vars st) (Ix 1 st))
+(define (st-serial st) (Ix 2 st))
+
+(define help-rows
+  ["the namespace repl — every command is namespace traffic"
+   ""
+   "  <expr>             evaluate against the focus module"
+   "  name = expr        bind a repl variable (:vars lists them)"
+   "  :m <mod>           switch focus"
+   "  :c [mod]           recompile: report, changeset, remount"
+   "  :t [mod]           run the module's doctests"
+   "  :s <mod> <dotted>  inspect one entry (:s bst bst.size)"
+   "  :ns <root>         entries under a namespace root"
+   "  <enter>            recompile the focus module"
+   "  :q                 quit (the explorer dies with the image)"])
+
+;; A var's prelude line; stacked = forms each take the rest as body.
+(define (var-prelude vars)
+  (strcat
+    (map (lambda (v) (strcat ["=  " (Ix 0 v) "  " (Ix 1 v) NL])) vars)))
+
+(define (repl-step st line)
+  (define focus (st-focus st))
+  (define vars (st-vars st))
+  (define ws (words line))
+  (define (arg i dflt) (If (Gt (Sz ws) i) (Ix i ws) dflt))
+  (define bind (bind-split line))
+  (cond
+    ((Eq 0 (Bytes line)) [st ["resync" focus]])
+    ((Equal line ":q") [st ["quit"]])
+    ((Equal line ":h") [st ["rows" help-rows]])
+    ((Equal line ":vars")
+      [st ["rows"
+           (Ifz (Sz vars)
+             ["no vars"]
+             (map (lambda (v) (strcat ["  " (Ix 0 v) " = " (Ix 1 v)]))
+               vars))]])
+    ((Equal (arg 0 "") ":m")
+      (let ((mod (arg 1 focus)))
+        [[mod vars (st-serial st)]
+         ["rows" [(strcat ["focus: " mod])]]]))
+    ((Equal (arg 0 "") ":c") [st ["resync" (arg 1 focus)]])
+    ((Equal (arg 0 "") ":t") [st ["doctest" (arg 1 focus)]])
+    ((Equal (arg 0 "") ":s") [st ["show" (arg 1 focus) (arg 2 "")]])
+    ((Equal (arg 0 "") ":ns") [st ["nsroot" (arg 1 "")]])
+    ((starts-with ":" line)
+      [st ["rows" [(strcat ["unknown command " line " — :h for help"])]]])
+    (bind
+      (let ((name (Ix 0 bind))
+            (expr (Ix 1 bind)))
+        [[focus
+          (snoc [name expr]
+            (filter (lambda (v) (Nil (Equal name (Ix 0 v)))) vars))
+          (st-serial st)]
+         ["eval" focus (strcat [(var-prelude vars) expr])]]))
+    (else
+      [st ["eval" focus (strcat [(var-prelude vars) line])]])))
+
+;;; Rendering chore answers as terminal rows ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; rs = ["R" txt-at nat-at pail-at] — compiled myth readers.
+(define (r-txt rs) (Ix 1 rs))
+(define (r-nat rs) (Ix 2 rs))
+(define (r-pail rs) (Ix 3 rs))
+
+(define (path-rows rs label m slot)
+  (define pl ((r-pail rs) [(ts slot)] m))
+  (If (Nil (Eq "/boot/pails/ps" (Hd pl)))
+    []
+    (let ((paths (_0 pl)))
+      (Ifz (Sz paths)
+        []
+        (cons label
+          (map (lambda (p)
+                 (strcat ["  /" (join-str "/" (map (Ix 0) p))]))
+            paths))))))
+
+(define (render-done rs m)
+  (define txt (r-txt rs))
+  (define err (txt [(ts "err")] m))
+  (define report (txt [(ts "report")] m))
+  (define value (txt [(ts "value")] m))
+  (cond
+    (err ["error:" err])
+    (report
+      (Weld [report]
+        (Weld (path-rows rs "changed:" m "changed")
+          (Weld (path-rows rs "added:" m "added")
+            (path-rows rs "removed:" m "removed")))))
+    (value
+      (let ((tyt (txt [(ts "ty")] m))
+            (law (txt [(ts "law")] m)))
+        (Weld [(strcat ["value: " value])]
+          (Weld (Ifz tyt [] [(strcat ["type:  " tyt])])
+            (Ifz law [] ["" law])))))
+    (else
+      [(strcat ["done: " (showNat ((r-nat rs) [(ts "passed")] 0 m))
+                " passed, " (showNat ((r-nat rs) [(ts "failed")] 0 m))
+                " failed"])])))
+
+;; An entry record's inspection rows: kind, type, lore head, refs, src.
+(define (render-entry rs m)
+  (define txt (r-txt rs))
+  (define kind (txt [(ts "kind")] m))
+  (define tyt (txt [(ts "ty")] m))
+  (define src (txt [(ts "src")] m))
+  (Weld (Ifz kind [] [(strcat ["[" kind "]"])])
+    (Weld (Ifz tyt [] [(strcat ["type: " tyt])])
+      (Weld (path-rows rs "calls:" m "calls")
+        (Weld (path-rows rs "referenced by:" m "called_by")
+          (Ifz src [] ["" src]))))))
+
+;;; The driver loop ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (put s)
+  (Write 1 (strWeld s 1)))
+
+(define (emit rows)
+  (put (join-str NL (Weld rows [""]))))
+
+(define (emit-prompt st)
+  (put (strcat [(st-focus st) "> "])))
+
+;; Pump stdin lines to the main loop; ["eof"] on ctrl-d.
+(define (stdin-pump self)
+  (define mc (Recv 0))
+  (define out (Ix 0 (Ix 1 mc)))
+  (define (loop z)
+    (define chunk (foil:read-stdin 384))
+    (Ifz chunk
+      (Send out ["eof"])
+      (Seq (Send out ["line" (foil:read-until 10 chunk)])
+        (loop z))))
+  (loop 0))
+
+;; Accept-and-close on the poke port; each connection means "something
+;; was saved" (wire your editor's write hook to it).
+(define (poke-pump port self)
+  (define mc (Recv 0))
+  (define out (Ix 0 (Ix 1 mc)))
+  (define listen (Try Listen port))
+  (If (Eq 1 (Hd listen))
+    (Send out ["nopoke"])
+    (let ((fd (_0 listen)))
+      (define (loop z)
+        (define conn (Accept fd))
+        (Seq (CloseFd conn)
+          (Seq (Send out ["poke"])
+            (loop z))))
+      (loop 0))))
+
+(define (mk-repl-env core coord)
+  (define (app path) (helm:core-ent core path))
+  (define (ask m)
+    (Seq (SendCaps coord (DeepSeq m m) [0])
+      (Recv 0)))
+  (define (inject t)
+    (Ix 0 (ask ["task" t])))
+  (define rs
+    ["R" (app ["myth" "txt_at"]) (app ["myth" "nat_at"])
+     (app ["myth" "pail_at"])])
+  ["E" core coord app ask inject rs])
+
+(define (e-core e) (Ix 1 e))
+(define (e-app e) (Ix 3 e))
+(define (e-ask e) (Ix 4 e))
+(define (e-inject e) (Ix 5 e))
+(define (e-rs e) (Ix 6 e))
+
+;; Wait for a request node's ['res_done]; each try is a coordinator
+;; barrier, and the budget covers a cold leaf-actor compile.
+(define (poll-done e pax tries)
+  (If (Eq 0 tries)
+    0
+    (let ((r (Ix 0 ((e-ask e) ["query" pax]))))
+      (If (And (Eq "/boot/res/known" (Hd r))
+            (Eq 1 ((Ix 2 (e-rs e)) [(ts "res_done")] 0 (_0 r))))
+        (_0 r)
+        (poll-done e pax (Sub tries 1))))))
+
+;; Make a request record under a driver, wait, hand back the myth.
+(define (drive e driver serial record)
+  (define kid (ts (strcat ["repl" (showNat serial)])))
+  (define pax [(ts "io") driver kid])
+  (Seq ((e-inject e) (((e-app e) ["vine_make"]) pax record))
+    (poll-done e pax 8192)))
+
+;; One action against the namespace -> rows.
+(define (run-action e serial action)
+  (define app (e-app e))
+  (define rs (e-rs e))
+  (define kind (Ix 0 action))
+  (cond
+    ((Eq kind "rows") (Ix 1 action))
+    ((Eq kind "eval")
+      (let ((m (drive e (ts "chore") serial
+                 ((app ["build" "eval_req"]) (Ix 1 action) (Ix 2 action)))))
+        (Ifz m ["(timed out)"] (render-done rs m))))
+    ((Eq kind "resync")
+      (let ((m (drive e (ts "chore") serial
+                 ((app ["build" "compile_req"]) (Ix 1 action)))))
+        (Ifz m ["(timed out)"] (render-done rs m))))
+    ((Eq kind "doctest")
+      (let* ((tgt (Weld [(ts "boot")]
+                    (map ts (helm:mod-segs (Ix 1 action)))))
+             (m (drive e (ts "doctest") serial ((app ["dt" "req"]) tgt))))
+        (Ifz m ["(timed out)"] (render-done rs m))))
+    ((Eq kind "show")
+      (let* ((mod (Ix 1 action))
+             (parts (filter Bytes (helm-http:split-ch 46 (Ix 2 action))))
+             (node
+               (Weld (Weld [(ts "boot")] (map ts (helm:mod-segs mod)))
+                 (If (Sz parts)
+                   (Weld [(ts (showNat (Sz parts)))] (map ts parts))
+                   [])))
+             (r (Ix 0 ((e-ask e) ["query" node]))))
+        (If (Eq "/boot/res/known" (Hd r))
+          (render-entry rs (_0 r))
+          [(strcat ["no entry at /" (join-str "/" (map (Ix 0) node))])])))
+    ((Eq kind "nsroot")
+      (let ((r (Ix 0 ((e-ask e) ["query" [(ts "boot") (ts "ns") (ts (Ix 1 action))]]))))
+        (If (Eq "/boot/res/known" (Hd r))
+          (path-rows rs (strcat ["/" (Ix 1 action) ":"]) (_0 r) "entries")
+          [(strcat ["no namespace root " (Ix 1 action)])])))
+    (else [])))
+
+(define (repl-loop e st)
+  (define mc (Recv 0))
+  (define msg (Ix 0 mc))
+  (define kind (_0 msg))
+  (define (step line)
+    (define r (repl-step st line))
+    (define st1 (Ix 0 r))
+    (define action (Ix 1 r))
+    (If (Equal ["quit"] action)
+      (emit ["bye"])
+      (let ((rows (run-action e (st-serial st1) action)))
+        (Seq (emit rows)
+          (let ((st2 [(st-focus st1) (st-vars st1) (Inc (st-serial st1))]))
+            (Seq (emit-prompt st2)
+              (repl-loop e st2)))))))
+  (cond
+    ((Eq kind "line") (step (_1 msg)))
+    ((Eq kind "poke") (step ""))
+    ((Eq kind "eof") (emit ["bye"]))
+    ((Eq kind "nopoke")
+      (Seq (emit ["(poke port busy — resync with <enter> only)"])
+        (repl-loop e st)))
+    (else (repl-loop e st))))
+
+;; Boot the full lain stack (explorer live on http-port), then take
+;; the terminal.  fetch?=0 skips the outbound-fetch driver — the local
+;; runtime lacks the Fetch primop.
+(define (run-repl http-port poke-port fetch?)
+  (define r
+    (helm-run:boot-lain-stack http-port fetch?
+      (helm:load-helm-mod "helmapp")))
+  (define e (mk-repl-env (Ix 0 r) (Ix 1 r)))
+  (define st ["sept" [] 0])
+  (Seq (emit ["the namespace repl — :h for help"
+              (strcat ["explorer: http://localhost:" (showNat http-port) "/ns"])])
+    (let* ((sin (Spawn stdin-pump))
+           (pok (Spawn (poke-pump poke-port))))
+      (Seq (SendCaps sin ["go"] [0])
+        (Seq (SendCaps pok ["go"] [0])
+          (Seq (emit-prompt st)
+            (repl-loop e st)))))))

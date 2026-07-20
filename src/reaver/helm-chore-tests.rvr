@@ -1,0 +1,183 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind helm (#module helm))
+(#bind helm-chore (#module helm-chore))
+
+
+;;; The chore driver end-to-end with a pure test family: a request
+;;; record made under /io/jobs selects the 'dbl family, whose plan
+;;; reads ['arg] and ['outp] off the record and whose run — in a leaf
+;;; actor — pokes ['out] = 2*arg onto the outp node.  Fetch-less boot
+;;; (no http-client worker: the local runtime lacks the Fetch primop)
+;;; and mirror-less (no doctest family here — helm-http-tests owns
+;;; that end of the driver).
+
+(define core (helm:load-helm-mod "helmapp"))
+
+(define (app path) (helm:core-ent core path))
+(define myth-new (app ["myth" "new"]))
+(define myth-sing (app ["myth" "sing"]))
+(define myth-add (app ["myth" "add"]))
+(define limb-nat (app ["limb" "nat"]))
+(define limb-pat (app ["limb" "pat"]))
+(define limb-quip (app ["limb" "quip"]))
+(define pd-f (app ["pd"]))
+(define (t-data slot n) (myth-sing slot (pd-f n)))
+(define (put-nat t slot n) (myth-add (limb-nat slot n) t))
+(define (put-path t slot p) (myth-add (limb-pat slot p) t))
+(define (put-quip t slot q) (myth-add (limb-quip slot q) t))
+(define vine-make (app ["vine_make"]))
+(define nat-at (app ["myth" "nat_at"]))
+(define pail-at (app ["myth" "pail_at"]))
+(define fresh-f (app ["fetch" "fresh"]))
+(define chore-cfg (app ["chore" "cfg"]))
+(define cmd-pk (app ["chore" "poke_t"]))
+
+(define tio ("ts" "io"))
+(define tjobs ("ts" "jobs"))
+(define tdbl ("ts" "dbl"))
+(define targ [("ts" "arg")])
+(define toutp [("ts" "outp")])
+(define tout [("ts" "out")])
+
+;;; The 'dbl family: one no-case job per request ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (dbl-plan rec reqnode)
+  (define n (nat-at targ 0 rec))
+  (define op (pail-at toutp rec))
+  (define outp (If (Eq "/boot/pails/p" (Hd op)) (_0 op) []))
+  (If (Eq 0 (Sz outp))
+    ["ERR" ("ts" "no_outp")]
+    ["JOBS" [[outp 0 [n outp]]]]))
+
+(define (dbl-run payload c)
+  (define n (Ix 0 payload))
+  (define outp (Ix 1 payload))
+  [[(cmd-pk outp (put-nat myth-new tout (Mul 2 n)))] 1 0])
+
+(define fams [[tdbl dbl-plan dbl-run]])
+
+(define chelpers
+  ["C" (app ["fetch" "fresh"]) (app ["chore" "fam_of"])
+   (app ["chore" "done_t"]) (app ["chore" "fail_t"])
+   (app ["chore" "clear_t"]) (app ["chore" "cmd_parts"])
+   (app ["vine_poke"]) (app ["vine_make"])])
+
+(define (mk-worker n)
+  (helm-chore:mk-chore-worker chelpers fams n))
+
+;; a request record: arg + out path, family left to the driver config
+(define (dbl-req n outp)
+  (put-path (put-nat myth-new targ n) toutp outp))
+
+;; seeded and warmed in MAIN: spawned actors have no compiler, so the
+;; family closures and every compiled chore entry get one call here
+(define coord
+  (let ((s (app ["seeded"])))
+    (Seq (DeepSeq (put-nat myth-new [("ts" "warm")] 1) 0)
+      (Seq (DeepSeq
+             [((app ["chore" "done_t"]) 1 0)
+              ((app ["chore" "clear_t"]) ("ts" "k"))
+              ((app ["chore" "fail_t"]) ("ts" "x"))
+              ((app ["chore" "fam_of"]) ("ts" "d") myth-new)
+              ((app ["chore" "cmd_parts"])
+                ((app ["chore" "mkp_t"]) [("ts" "a")] myth-new))
+              (dbl-plan (dbl-req 2 [("ts" "data") ("ts" "w")]) [("ts" "io")])
+              (dbl-run [2 [("ts" "data") ("ts" "w")]] 0)]
+             0)
+        (Seq (DeepSeq s s)
+          (Spawn (helm:helm-actor core mk-worker (lambda (hm) 0) s)))))))
+
+(define (ask m)
+  (Seq (SendCaps coord (DeepSeq m m) [0])
+    (Recv 0)))
+(define (inject t)
+  (Ix 0 (ask ["task" t])))
+
+;;; 1. the driver is born; output nodes exist ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["done"] (inject (vine-make [tio tjobs] (chore-cfg tdbl))))
+assert(Equal [tjobs] (Ix 0 (ask ["crew"])))
+(define tdata ("ts" "data"))
+(define to1 ("ts" "o1"))
+(define to2 ("ts" "o2"))
+assert(Equal ["done"] (inject (vine-make [tdata to1] (t-data [("ts" "num")] 1))))
+assert(Equal ["done"] (inject (vine-make [tdata to2] (t-data [("ts" "num")] 2))))
+
+;;; 2. two overlapping requests complete; results land; markers clear ;;;;;;;;;;;;;;;;
+
+(define (poll-done kid tries)
+  (If (Eq 0 tries)
+    0
+    (let ((r (Ix 0 (ask ["query" [tio tjobs kid]]))))
+      (If (And (Eq "/boot/res/known" (Hd r))
+            (Eq 1 (nat-at [("ts" "res_done")] 0 (_0 r))))
+        (_0 r)
+        (poll-done kid (Sub tries 1))))))
+
+(define (chore-driver-checks z)
+  (define done1
+    (Seq (inject (vine-make [tio tjobs ("ts" "r1")] (dbl-req 21 [tdata to1])))
+      (Seq (inject (vine-make [tio tjobs ("ts" "r2")]
+                     (put-quip (dbl-req 30 [tdata to2]) [("ts" "fam")] tdbl)))
+        (poll-done ("ts" "r1") 4096))))
+  (define done2 (poll-done ("ts" "r2") 4096))
+  (define out1 (Ix 0 (ask ["query" [tdata to1]])))
+  (define out2 (Ix 0 (ask ["query" [tdata to2]])))
+  (define drec (Ix 0 (ask ["query" [tio tjobs]])))
+  [;; both requests completed, one job each, no failures
+   (If (IsApp done1) 1 0)
+   (Eq 1 (nat-at [("ts" "passed")] 99 done1))
+   (Eq 0 (nat-at [("ts" "failed")] 99 done1))
+   (If (IsApp done2) 1 0)
+   (Eq 1 (nat-at [("ts" "passed")] 99 done2))
+   ;; the leaf's poke landed: out = 2*arg on each target node
+   (Eq 42 (nat-at [("ts" "out")] 0 (_0 out1)))
+   (Eq 60 (nat-at [("ts" "out")] 0 (_0 out2)))
+   ;; the driver record's fresh markers all cleared
+   (Eq 0 (Sz (fresh-f (_0 drec))))])
+
+assert(Equal [1 1 1 1 1 1 1 1] (chore-driver-checks 0))
+
+;;; 3. an unknown family answers a failure record ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (unknown-fam-checks z)
+  (define done3
+    (Seq (inject (vine-make [tio tjobs ("ts" "r3")]
+                   (put-quip (dbl-req 5 [tdata to1]) [("ts" "fam")] ("ts" "nope"))))
+      (poll-done ("ts" "r3") 4096)))
+  [(If (IsApp done3) 1 0)
+   (Eq 0 (nat-at [("ts" "res_ok")] 1 done3))])
+
+assert(Equal [1 1] (unknown-fam-checks 0))
+
+;;; 4. a plan error answers a failure record ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (plan-err-checks z)
+  ;; no ['outp]: the dbl plan answers ["ERR" no_outp]
+  (define done4
+    (Seq (inject (vine-make [tio tjobs ("ts" "r4")]
+                   (put-nat myth-new targ 7)))
+      (poll-done ("ts" "r4") 4096)))
+  [(If (IsApp done4) 1 0)
+   (Eq 0 (nat-at [("ts" "res_ok")] 1 done4))])
+
+assert(Equal [1 1] (plan-err-checks 0))
+
+;;; 5. clean shutdown ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal ["bye"] (Ix 0 (ask ["stop"])))
+
+(print "helm-chore tests passed")
