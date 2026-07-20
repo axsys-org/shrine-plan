@@ -1,0 +1,174 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind subject (#module foil-subject))
+(#import subject)
+
+(#bind cairn (#module cairn))
+
+(#bind ty (#module foil-types))
+
+(#bind relocate (#module foil-relocate))
+(#import relocate)
+
+;;; Canonical storage qualification ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define unit-a (Pin ["unit" "a"]))
+(define unit-b (Pin ["unit" "b"]))
+
+(define foo ["boot" "foo"])
+(define bar ["boot" "bar"])
+(define box ["boot" "box"])
+(define arg ["boot" "arg"])
+(define external ["boot" "external"])
+(define own-paths [foo bar box arg])
+
+(define qfoo-a (qualify-canonical-path own-paths unit-a foo))
+(define qfoo-b (qualify-canonical-path own-paths unit-b foo))
+
+assert(unit-qualified-path? qfoo-a)
+assert(Equal unit-a (unit-qualified-path-unit qfoo-a))
+assert(Equal foo (unit-qualified-path-local qfoo-a))
+assert(Nil (Equal qfoo-a qfoo-b))
+;; Axal path components are general PLAN values.  Distinct unit pins must
+;; occupy distinct branches instead of both coercing through primitive Cmp's
+;; non-nat zero fallback.
+(define qualified-ax
+  (cairn:putax qfoo-b "b"
+    (cairn:putax qfoo-a "a" cairn:empty-ax)))
+assert(Eq "a" (cairn:gotax qfoo-a qualified-ax))
+assert(Eq "b" (cairn:gotax qfoo-b qualified-ax))
+assert(Equal external
+  (qualify-canonical-path own-paths unit-a external))
+assert(Equal qfoo-a
+  (qualify-canonical-path own-paths unit-a qfoo-a))
+
+;;; /ty-ap remains encoded while owned paths inside it move ;;;;;;;;;;;;;;;;;;;
+
+(define applied
+  (ty-ap-encode [box arg external]))
+(define relocated-applied
+  (qualify-canonical-path own-paths unit-a applied))
+(define expected-applied
+  (ty-ap-encode
+    [(qualify-canonical-path own-paths unit-a box)
+     (qualify-canonical-path own-paths unit-a arg)
+     external]))
+
+assert(ty-ap-path? relocated-applied)
+assert(Equal expected-applied relocated-applied)
+
+;; A materialized selector may be the owned entry even when its generic base
+;; is not separately listed.  Its base still receives the unit qualifier.
+(define external-applied (ty-ap-encode [["boot" "generic"] arg]))
+(define materialized-own [external-applied arg])
+(define relocated-materialized
+  (qualify-canonical-path materialized-own unit-a external-applied))
+(define materialized-parts (ty-ap-decode relocated-materialized))
+assert(unit-qualified-path? (_0 materialized-parts))
+assert(Equal ["boot" "generic"]
+  (unit-qualified-path-local (_0 materialized-parts)))
+assert(unit-qualified-path? (_1 materialized-parts))
+
+;;; Type and typed-code relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define brand (print-path ["boot" "record"]))
+(define external-ty (ty:TNOM external 0))
+(define foo-ty (ty:TNOM foo 0))
+(define bar-ty (ty:TNOM bar 0))
+(define row-ty (ty:TROW brand [bar-ty external-ty]))
+(define fun-ty (ty:TFUN [foo-ty row-ty] external-ty))
+(define relocated-fun-ty (relocate-type own-paths unit-a fun-ty))
+
+assert(Equal qfoo-a (ty:tnom-ref (_0 (ty:tfun-args relocated-fun-ty))))
+(define relocated-row-ty (_1 (ty:tfun-args relocated-fun-ty)))
+assert(Equal brand (ty:trow-cstr relocated-row-ty))
+assert(Equal
+  (qualify-canonical-path own-paths unit-a bar)
+  (ty:tnom-ref (_0 (ty:trow-vals relocated-row-ty))))
+assert(Equal external
+  (ty:tnom-ref (_1 (ty:trow-vals relocated-row-ty))))
+assert(Equal external (ty:tnom-ref (ty:tfun-ret relocated-fun-ty)))
+
+;; Legacy separate TNOM argument rows relocate as well as the nominal head.
+(define legacy-nom (ty:TNOM foo [bar-ty external-ty]))
+(define relocated-legacy (relocate-type own-paths unit-a legacy-nom))
+assert(Equal qfoo-a (ty:tnom-ref relocated-legacy))
+assert(Equal
+  (qualify-canonical-path own-paths unit-a bar)
+  (ty:tnom-ref (_0 (_3 relocated-legacy))))
+assert(Equal external (ty:tnom-ref (_1 (_3 relocated-legacy))))
+
+(define code
+  (tc-app fun-ty
+    (tc-global fun-ty foo)
+    (tc-row row-ty brand
+      [(tc-global bar-ty bar)
+       (tc-lit external-ty 7)])))
+(define relocated-code-a (relocate-tc own-paths unit-a code))
+(define relocated-code-b (relocate-tc own-paths unit-b code))
+
+assert(Equal qfoo-a (tc-global-path (tc-app-f relocated-code-a)))
+assert(Nil (Equal
+  (tc-global-path (tc-app-f relocated-code-a))
+  (tc-global-path (tc-app-f relocated-code-b))))
+assert(Equal brand (tc-row-hd (tc-app-x relocated-code-a)))
+assert(Equal
+  (qualify-canonical-path own-paths unit-a bar)
+  (tc-global-path (_0 (tc-row-items (tc-app-x relocated-code-a)))))
+assert(Equal external
+  (ty:tnom-ref (tc-ty (_1 (tc-row-items (tc-app-x relocated-code-a))))))
+
+;;; Pinned TC and IR_ENTRY cloning ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define span [9 2 40 7])
+(define tc-pin (Pin (make-tc-entry foo span code)))
+(define cloned-tc-a (clone-qualified-entry-pin own-paths unit-a tc-pin))
+(define cloned-tc-b (clone-qualified-entry-pin own-paths unit-b tc-pin))
+(define tc-entry-a (Unpin cloned-tc-a))
+(define tc-entry-b (Unpin cloned-tc-b))
+
+assert(IsPin cloned-tc-a)
+assert(Equal qfoo-a (_0 tc-entry-a))
+assert(Nil (Equal (_0 tc-entry-a) (_0 tc-entry-b)))
+assert(Equal span (tc-entry-span tc-entry-a))
+assert(Equal relocated-code-a (tc-entry-contents tc-entry-a))
+
+(define runtime-value (Pin ["runtime-value" 42]))
+(define retained-ir ["IR" "unchanged" foo])
+(define ir-pin
+  (Pin ("IR_ENTRY" bar span runtime-value code retained-ir)))
+(define cloned-ir
+  (clone-qualified-entry-pin own-paths unit-a ir-pin))
+(define ir-entry (Unpin cloned-ir))
+
+assert(Equal
+  (qualify-canonical-path own-paths unit-a bar)
+  (_0 ir-entry))
+assert(Equal span (_1 ir-entry))
+assert(Equal runtime-value (_2 ir-entry))
+assert(Equal relocated-code-a (_3 ir-entry))
+assert(Equal retained-ir (_4 ir-entry))
+
+;;; Boundary validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define bad-unit
+  (Try (lambda (z) (qualify-canonical-path own-paths "not-a-pin" foo)) 0))
+assert(Eq 1 (Hd bad-unit))
+assert(Eq "foil-relocate-malformed-unit-id" (_0 (_0 bad-unit)))
+
+(define bad-entry
+  (Try (lambda (z)
+    (clone-qualified-entry-pin own-paths unit-a
+      (Pin ("OTHER_ENTRY" foo)))) 0))
+assert(Eq 1 (Hd bad-entry))
+assert(Eq "foil-relocate-unsupported-entry" (_0 (_0 bad-entry)))
+
+(print "foil-relocate tests passed")

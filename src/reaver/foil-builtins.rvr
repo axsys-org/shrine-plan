@@ -13,63 +13,13 @@
 
 (#bind ty (#module foil-types))
 
+(#bind core (#module foil-core-types))
+(#import core)
+
+(#bind typed-reaver (#module typed-reaver))
+(#import typed-reaver)
+
 ;;; Built-in Foil environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(define NONE 0)
-
-;; Compiled declarations live under the compilation root — the boot
-;; process is fiat /boot.  The primitives below are the substrate
-;; (Layer 0): their canonical names stay unrooted, so type-argument
-;; encodings minted without a subject in reach (ty-to-path's bare
-;; ["nat"]) agree with source-written ones.  canon-path's root retry
-;; makes both spellings resolve.
-(define boot-root ["boot"])
-
-(define nat-ty (ty:TNOM ["nat"] 0))
-(define uint-ty (ty:TNOM ["uint"] 0))
-(define unit-cstr (print-path ["unit"]))
-(define unit-ty (ty:TNOM ["unit"] 0))
-
-;; Applications are /ty-ap paths (see foil-subject.rvr) — the
-;; argument types must be path-shaped.
-(define (applied-of base items)
-  (ty:TNOM (ty-ap-encode (Weld [base] (map ty:ty-to-path items))) 0))
-;; row is structurally an array: building the FFI signatures on TARR
-;; (rather than a /ty-ap path) keeps substitution structural, so item
-;; types with no path form — anonymous rows — specialize fine.
-(define (row-of item)
-  (ty:TARR item))
-(define (list-of item)
-  (applied-of ["list"] [item]))
-(define (either-of left right)
-  (applied-of ["either"] [left right]))
-
-(define row-typ
-  (ty:TQUA "a" (ty:TARR (ty:TVAR "a"))))
-(define list-typ
-  (ty:TQUA "a"
-    (ty:TSUM
-      [(ty:TROW "nil" [])
-       (ty:TROW "cons" [(ty:TVAR "a") (list-of (ty:TVAR "a"))])])))
-(define either-typ
-  (ty:TQUA "a"
-    (ty:TQUA "b"
-      (ty:TSUM
-        [(ty:TROW "left" [(ty:TVAR "a")])
-         (ty:TROW "right" [(ty:TVAR "b")])]))))
-
-;; The quip aura type (quip.rvr): a '-prefixed literal parses to a
-;; tagged value, one option per aura.
-(define quip-typ
-  (ty:TSUM
-    [(ty:TROW "ds" [nat-ty])   ;; absolute time
-     (ty:TROW "u" [nat-ty])    ;; decimal number
-     (ty:TROW "w" [nat-ty])    ;; 0w base64 data
-     (ty:TROW "x" [nat-ty])    ;; 0x hex data
-     (ty:TROW "ta" [nat-ty])   ;; %ascii text
-     (ty:TROW "tu" [nat-ty])   ;; %!unicode text
-     (ty:TROW "ts" [nat-ty])   ;; symbol
-     (ty:TROW "r" [nat-ty])])) ;; #path-length
 
 (define if-ty
   (ty:TQUA "a" (ty:TFUN [(ty:TNAT 0) (ty:TVAR "a") (ty:TVAR "a")] (ty:TVAR "a"))))
@@ -159,7 +109,11 @@
   (ty:TQUA "a" (ty:TQUA "b"
     (ty:TFUN [(either-of (ty:TVAR "a") (ty:TVAR "b"))] (ty:TVAR "b")))))
 
-(define (uint-add-m y x) (Add x y))
+(define/typed typed-add (-> (Nat Nat) Nat) Add)
+(define/typed typed-pin (All (a) (-> (a) (Pin a))) Pin)
+(define/typed typed-unpin (All (a) (-> ((Pin a)) a)) Unpin)
+
+(define/typed (uint-add-m y x) (-> (UInt UInt) UInt) (Add x y))
 (define (uint-sub-m y x) (Sub x y))
 (define (uint-mul-m y x) (Mul x y))
 (define (uint-div-m y x) (Div x y))
@@ -177,7 +131,9 @@
 (define (row-snoc x xs) (snoc x xs))
 (define (row-take n xs) (take n xs))
 (define (row-drop n xs) (drop n xs))
-(define (row-map f xs) (map f xs))
+(define/typed (row-map f xs)
+  (All (a b) (-> ((-> (a) b) (Row a)) (Row b)))
+  (map f xs))
 (define (row-filter f xs) (filter f xs))
 (define (row-fold f z xs) (foldl f z xs))
 (define (row-find f def xs)
@@ -205,10 +161,17 @@
 (define (either-left-val x) (_0 x))
 (define (either-right-val x) (_0 x))
 
+(define typed-foil-api
+  (provide/foil
+    (typed-add (foil add))
+    (typed-pin (foil pin))
+    (typed-unpin (foil unpin))
+    (uint-add-m (foil uint add))
+    (row-map (foil row map))))
+
 
 (define (insert-uint-methods prefix sut)
   (pipe sut
-    (insert-ffi (Weld prefix ["add"]) uint-add-m binary-uint-ty)
     (insert-ffi (Weld prefix ["sub"]) uint-sub-m binary-uint-ty)
     (insert-ffi (Weld prefix ["mul"]) uint-mul-m binary-uint-ty)
     (insert-ffi (Weld prefix ["div"]) uint-div-m binary-uint-ty)
@@ -222,31 +185,17 @@
     (insert-ffi (Weld prefix ["ge"]) uint-ge-m cmp-uint-ty)
     (insert-ffi (Weld prefix ["gt"]) uint-gt-m cmp-uint-ty)))
 
-(define default-subject
+(define legacy-subject
   (pipe (set-sut-root boot-root empty-subject)
     ;; pipe applies bottom-up: these aliases run LAST, over the full
     ;; subject below.
-    (ty:insert-typ-ffi ["nat"] (ty:TNAT 0))
-    (ty:insert-typ-ffi ["uint"] (ty:TNAT 0))
-    ;; truth is a nat (0/1): primitives produce nats, so a distinct
-    ;; boolean member type would not compose with them.  .true/.false
-    ;; are the literals (foil-sast), ! and || the operators.
-    (ty:insert-typ-ffi ["bool"] (ty:TNAT 0))
-    (ty:insert-typ-ffi ["unit"] (ty:TROW unit-cstr []))
-    (ty:insert-typ-ffi ["quip"] quip-typ)
-    (ty:insert-typ-ffi ["pail"] ty:TPAIL)
-    (ty:insert-typ-ffi ["row"] row-typ)
-    (ty:insert-typ-ffi ["list"] list-typ)
-    (ty:insert-typ-ffi ["either"] either-typ)
+    (install-core-types)
     (insert-ffi ["if"] If if-ty)
-    (insert-ffi ["pin"] Pin pin-ty)
-    (insert-ffi ["unpin"] Unpin unpin-ty)
     (insert-ffi ["eq"] Eq eq-ty)
     ;; PLAN Eq is intentionally shallow on structured values.  Namespace
     ;; version deduplication needs extensional equality of whole myths, so
     ;; expose the runtime's forcing structural comparison separately.
     (insert-ffi ["equal"] Equal equal-ty)
-    (insert-ffi ["add"] Add binary-nat-ty)
     (insert-ffi ["sub"] Sub binary-nat-ty)
     (insert-ffi ["lt"] Lt binary-nat-ty)
     (insert-ffi ["le"] Le binary-nat-ty)
@@ -267,6 +216,7 @@
     (insert-ffi ["wid"] Bytes unary-nat-ty)
     (insert-ffi ["lsh"] Lsh binary-nat-ty)
     (insert-ffi ["rsh"] Rsh binary-nat-ty)
+    (insert-ffi ["nat" "add"] uint-add-m binary-uint-ty)
     (insert-uint-methods ["nat"])
     (insert-uint-methods ["uint"])
     (insert-ffi ["unit" "unit"] unit-cstr unit-ty)
@@ -280,7 +230,6 @@
     (insert-ffi ["row" "append"] row-weld row-weld-ty)
     (insert-ffi ["row" "cons"] row-cons row-cons-ty)
     (insert-ffi ["row" "snoc"] row-snoc row-cons-ty)
-    (insert-ffi ["row" "map"] row-map row-map-ty)
     (insert-ffi ["row" "filter"] row-filter row-filter-ty)
     (insert-ffi ["row" "fold"] row-fold row-fold-ty)
     (insert-ffi ["row" "find"] row-find row-find-ty)
@@ -304,3 +253,6 @@
     (insert-ffi ["either" "is_right"] either-is-right either-test-ty)
     (insert-ffi ["either" "left_val"] either-left-val either-left-val-ty)
     (insert-ffi ["either" "right_val"] either-right-val either-right-val-ty)))
+
+(define default-subject
+  (install-foil-provides typed-foil-api legacy-subject))

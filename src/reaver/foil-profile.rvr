@@ -11,95 +11,24 @@
 (#bind reef (#module reef))
 (#import reef)
 
-(#bind cairn (#module cairn))
-(#bind rex (#module rex))
-(#bind foil-sast (#module foil-sast))
 (#bind foil (#module foil))
-(#bind foil-subject (#module foil-subject))
-(#bind foil-elab (#module foil-elab))
-(#bind foil-lower (#module foil-lower))
-(#bind foil-lore (#module foil-lore))
 (#bind profile-zone (#module profile-zone))
 
 (define (phase-label phase mod)
   (strcat ["foil." phase "." mod]))
 
+;; profile-compile-mod-go :: [Cord] -> Cache -> Subject -> Cord -> CompileResult
+;;
+;; Profiling is a forcing policy around the one authoritative compiler, not a
+;; fork of import/environment semantics.  Fine-grained type/lowering zones
+;; remain inside their owning modules; this outer zone measures the complete
+;; content-addressed unit build.
 (define (profile-compile-mod-go stack cache0 sut0 mod)
   (define module-handle
     (profile-zone:zone-start (phase-label "module" mod)))
-  (define src
-    (profile-zone:force-zone (phase-label "source-read" mod)
-      (foil:get-foil mod)))
-  (define rex-tree
-    (profile-zone:force-zone (phase-label "rex-parse" mod)
-      (rex:ParseRexNormFile src)))
-  (define rows
-    (profile-zone:force-zone (phase-label "sast-parse" mod)
-      (foil-sast:parse-module-sast 0 rex-tree)))
-  (define lore
-    (profile-zone:force-zone (phase-label "lore-capture" mod)
-      (foil-lore:capture-lore rex-tree)))
-  (define split
-    (profile-zone:force-zone (phase-label "module-split" mod)
-      [(filter foil:mod-import? rows)
-       (filter (lambda (r) (Nil (foil:mod-import? r))) rows)]))
-  (define imps (_0 split))
-  (define decls (_1 split))
-  (define (apply-import st imp[_ mount span name])
-    (define cache (_0 st))
-    (define sut (_1 st))
-    (define seen (_2 st))
-    (define blurb (foil:import-blurb span))
-    (define hit (find (lambda (e) (Eq name (_0 e))) cache))
-    (define (compile-import z)
-      (profile-compile-mod-go (snoc name stack) cache foil:default-subject name))
-    (If (includes (Eq name) stack)
-      (error ["foil-import-cycle" ["module" name] ["at" blurb]])
-      (let* ((r (Ifz hit
-                  (let ((c (Try compile-import 0)))
-                    (If (Eq 1 (Hd c))
-                      (error ["foil-in-module" name (_0 c)])
-                      (let ((e (foil:cache-entry name (_1 (_0 c)) (_2 (_0 c))
-                                 (_3 (_0 c)))))
-                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e)])))
-                  (let ((e (_0 hit)))
-                    [cache (_1 e) (_2 e)])))
-             (imped (_1 r))
-             (keys (_2 r))
-             (sut2
-               (profile-zone:force-zone
-                 (strcat ["foil.import-merge." mod "." name])
-                 (let* ((sut1 (foil-subject:merge-subject blurb keys imped sut)))
-                   (Ifz (Sz mount)
-                     sut1
-                     (foil-subject:mount-subject blurb mount keys imped sut1))))))
-        [(_0 r) sut2 (Weld seen keys)])))
-  (define merged (foldl apply-import [cache0 sut0 0] imps))
-  (define root (foil-subject:sut-root sut0))
-  (define imp-ax
-    (foldl (lambda (a k) (cairn:putax k 1 a)) cairn:empty-ax (_2 merged)))
-  (define (check-collision seen d[_ name span body])
-    (cond
-      ((Ifz (cairn:getax (Weld root name) imp-ax) 0 1)
-        (error ["foil-import-collision"
-                ["path" name] ["at" (foil:import-blurb span)]]))
-      ((Ifz (cairn:getax name seen) 0 1)
-        (error ["foil-duplicate-decl"
-                ["path" name] ["at" (foil:import-blurb span)]]))
-      (else (cairn:putax name 1 seen))))
-  (define checked
-    (profile-zone:force-zone (phase-label "collision-check" mod)
-      (foldl check-collision cairn:empty-ax decls)))
-  (define elabbed
-    (profile-zone:force-zone (phase-label "elab-wf" mod)
-      (Seq checked (foil-elab:elab-mod-profiled (_1 merged) decls))))
-  (define final
-    (profile-zone:force-zone (phase-label "materialize" mod)
-      (foil-lower:materialize-consts-profiled elabbed)))
-  (define lowered
-    (profile-zone:force-zone (phase-label "lower" mod)
-      (foil-lower:lower-tc-mod-profiled final final)))
-  (define result [(_0 merged) lowered (_2 merged) lore])
+  (define result
+    (profile-zone:force-zone (phase-label "compile" mod)
+      (foil:compile-mod-go stack cache0 sut0 mod)))
   (Seq module-handle
     (DeepSeq result
       (Seq (profile-zone:zone-end module-handle) result))))
@@ -117,84 +46,17 @@
   (profile-zone:force-zone (phase-label "artifact" mod)
     (foil:compile-mod-artifact-cached cache sut flags mod)))
 
-;; Hit-only artifact replay with detailed zones.  A miss is an error so a
-;; benchmark can never silently turn into a source build.
-(define (profile-artifact-hit-go stack cache0 sut0 flags mod)
-  (define module-handle
-    (profile-zone:zone-start (phase-label "artifact-hit" mod)))
-  (define src
-    (profile-zone:force-zone (phase-label "artifact-source" mod)
-      (foil:get-foil mod)))
-  (define compiler
-    (profile-zone:force-zone (phase-label "artifact-compiler-token" mod)
-      (foil:artifact-compiler-token 0)))
-  (define init (Pin sut0))
-  (define found
-    (profile-zone:force-zone (phase-label "artifact-lookup" mod)
-      (foil:artifact-cache-find cache0 mod)))
-  (define art (Ifz found 0 (_1 (_0 found))))
-  (define candidate?
-    (profile-zone:force-zone (phase-label "artifact-base-validate" mod)
-      (foil:artifact-base-valid? art mod src compiler init flags)))
-  (define imps
-    (profile-zone:force-zone (phase-label "artifact-imports" mod)
-      (If candidate?
-        (map (Ix 0) (foil:artifact-direct (foil:artifact-body art)))
-        [])))
-  (define (apply-import st[cache sut seen direct legacy] imp[_ mount span name])
-    (define blurb (foil:import-blurb span))
-    (If (includes (Eq name) stack)
-      (error ["foil-import-cycle" ["module" name] ["at" blurb]])
-      (let* ((r (profile-artifact-hit-go (snoc name stack) cache
-                   foil:default-subject flags name))
-             (cache1 (_0 r))
-             (art1 (_1 r))
-             (imped (_2 r))
-             (keys (foil:artifact-decl-keys (foil:artifact-body art1)))
-             (legacy1 (foil:legacy-cache-merge legacy (Ix 4 r)))
-             (sut2
-               (profile-zone:force-zone
-                 (strcat ["foil.artifact-merge." mod "." name])
-                 (let ((sut1
-                         (foil-subject:merge-subject blurb keys imped sut)))
-                   (Ifz (Sz mount)
-                     sut1
-                     (foil-subject:mount-subject blurb mount keys imped sut1))))))
-        [cache1 sut2 (Weld seen keys) (snoc [imp art1] direct) legacy1])))
-  (define merged
-    (foldl apply-import [cache0 sut0 0 [] []] imps))
-  (define cache (_0 merged))
-  (define pre (_1 merged))
-  (define direct (_3 merged))
-  (define legacy (Ix 4 merged))
-  (define valid?
-    (profile-zone:force-zone (phase-label "artifact-validate" mod)
-      (foil:artifact-valid? art mod src compiler init flags direct)))
-  (define result
-    (Ifz valid?
-      (error ["foil-profile-artifact-miss" mod])
-      (let* ((body (foil:artifact-body art))
-             (compiled
-               (profile-zone:force-zone (phase-label "artifact-replay" mod)
-                 (foil-subject:apply-entry-delta
-                   ["cached module" mod] (foil:artifact-delta body) pre)))
-             (imported (foil:artifact-imported body))
-             (legacy1
-               (snoc (foil:cache-entry mod compiled imported [])
-                 (filter (lambda (e) (Ne mod (_0 e))) legacy))))
-        [cache art compiled imported legacy1])))
-  (Seq module-handle
-    (DeepSeq result
-      (Seq (profile-zone:zone-end module-handle) result))))
-
+;; compile-mod-artifact-hit :: Cache -> Subject -> Flags -> Cord -> [Cache Subject]
+;; Reuse the authoritative artifact compiler and verify that the normalized
+;; cache is unchanged.  A dependency miss changes the parent artifact pin and
+;; therefore the cache value, so a benchmark cannot silently become a rebuild.
 (define (compile-mod-artifact-hit cache sut flags mod)
   (define cache0
     (profile-zone:force-zone (phase-label "artifact-normalize" mod)
       (foil:artifact-cache-normalize cache flags)))
-  (define r
-    (Try (lambda (z)
-           (profile-artifact-hit-go [mod] cache0 sut flags mod))
-      0))
-  (If (Eq 1 (Hd r))
-    (error ["foil-in-module" mod (_0 r)])
-    [(_0 (_0 r)) (_2 (_0 r))]))
+  (define result
+    (profile-zone:force-zone (phase-label "artifact-hit" mod)
+      (foil:compile-mod-artifact-cached cache0 sut flags mod)))
+  (unless (Equal cache0 (_0 result))
+    (error ["foil-profile-artifact-miss" mod])
+    result))

@@ -11,7 +11,10 @@
 (#bind async (#module async))
 (#bind cairn (#module cairn))
 (#bind rex (#module rex))
+(#bind foil-surface (#module foil-surface))
 (#bind foil-subject (#module foil-subject))
+(#bind foil-env (#module foil-env))
+(#bind foil-relocate (#module foil-relocate))
 (#bind foil-sast (#module foil-sast))
 (#bind foil-builtins (#module foil-builtins))
 (#bind foil-elab (#module foil-elab))
@@ -33,6 +36,8 @@
 
 ;;; Public compatibility aliases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; default-subject :: Subject
+;; Shared typed/runtime substrate for every file-backed compilation.
 (define default-subject foil-builtins:default-subject)
 
 (define empty-env foil-elab:empty-env)
@@ -46,21 +51,39 @@
 (define burp-self foil-elab:burp-self)
 (define burp-face foil-elab:burp-face)
 (define elab-type foil-elab:elab-type)
+;; Completed Unit metadata remains the sealed source-resolution authority for
+;; live value elaboration.  Its visibility projection also normalizes rooted
+;; builtin row brands and nominal aliases without exposing unit-qualified
+;; linking storage.
 (define elab-val foil-elab:elab-val)
+;; elab-mod :: Subject -> Row SastRow -> Subject
+;; Seals declared and compiler-derived public names before checking bodies.
 (define elab-mod foil-elab:elab-mod)
 
 (define make-ir-entry foil-lower:make-ir-entry)
 (define ir-entry-val foil-lower:ir-entry-val)
 (define ir-entry-tc foil-lower:ir-entry-tc)
 (define ir-entry-ir foil-lower:ir-entry-ir)
+;; source-entry-val :: Path -> Subject -> Any
+;; Resolve a root-relative source spelling through the retained visibility
+;; projection before reading its lowered value.  Imported units deliberately do
+;; not occupy their historical raw storage paths.
+(define (source-entry-val path sut)
+  (ir-entry-val
+    (foil-subject:got-entry (foil-subject:canon-path path sut) sut)))
 (define lower-tc foil-lower:lower-tc)
 (define lower-tc-entry foil-lower:lower-tc-entry)
 (define lower-tc-mod foil-lower:lower-tc-mod)
+;; materialize-consts :: Subject -> Subject
 (define materialize-consts foil-lower:materialize-consts)
 
 ;;; Imports ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; mod-import? :: SastRow -> Bool
 (define (mod-import? row) (Eq "s_import" (_0 row)))
+
+;; mod-decl? :: SastRow -> Bool
+(define (mod-decl? row) (Eq "s_decl" (_0 row)))
 
 (define (import-blurb span)
   (Ifz span "unknown-location" ["line" (Ix 0 span) "col" (Ix 1 span)]))
@@ -69,16 +92,267 @@
 ;; missing or unparsable (the compile proper will say why).
 (define (module-imports mod)
   (define rowsx
-    (Try (lambda (z) (map (Ix 3) (filter mod-import? (parse-foil mod)))) 0))
+    (Try (lambda (z)
+           (map foil-surface:surf-import-modname
+             (filter mod-import? (parse-foil mod))))
+      0))
   (If (Eq 1 (Hd rowsx)) [] (_0 rowsx)))
 
-;; The keys a compiled module declared (directly or via its own
-;; imports): its order minus the builtin baseline.
+;; canonical-path-set :: Row Path -> Row Path
+(define (canonical-path-set paths)
+  (map (Ix 0)
+    (rowify (cairn:tapax
+      (foldl (lambda (ax path) (cairn:putax path 1 ax))
+        cairn:empty-ax paths)))))
+
+;; The keys a compiled module declared (directly or via its own imports).
+;; Subject-order subtraction recovers historical/imported entries, while the
+;; retained export layer is authoritative for own entries: an own declaration
+;; may replace a builtin and therefore already occur in the baseline order.
 (define (module-decl-keys imp)
   (define base (foil-subject:subject-order default-subject))
-  (filter
-    (lambda (k) (Nil (includes (Equal k) base)))
-    (foil-subject:subject-order imp)))
+  (define conventional
+    (filter
+      (lambda (k) (Nil (includes (Equal k) base)))
+      (foil-subject:subject-order imp)))
+  (define unit (foil-subject:sut-unit imp))
+  (define own
+    (If (foil-env:unit? unit)
+      (map
+        (lambda (pair)
+          (Weld (foil-subject:sut-root imp) (_0 pair)))
+        (foil-env:layer-entries (foil-env:unit-export-layer unit)))
+      []))
+  (canonical-path-set (Weld conventional own)))
+
+;;; Union-mount compiler projection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; foil-env is the source-of-truth namespace.  SUT remains the compatibility
+;;; projection consumed by the existing type elaborator and PLAN lowerer.  A
+;;; separate visibility index prevents the projection's hidden linking entries
+;;; from becoming ambient source bindings.
+
+;; strip-surface-spans :: Sast -> Sast
+;;
+;; Semantic layer identity excludes source locations.  The current parser puts
+;; a declaration-wide s_span around each body; recursively stripping these
+;; wrappers also future-proofs identity for exact per-reference spans.
+(define (strip-surface-spans x)
+  (Ifz (IsApp x)
+    x
+    (If (And (Sz x) (Eq "s_span" (_0 x)))
+      (strip-surface-spans (_2 x))
+      (gen (Sz x) (lambda (i) (strip-surface-spans (Ix i x)))))))
+
+;; make-own-layer :: Cord -> Row SastRow -> Layer
+(define (make-own-layer label rows)
+  (foil-env:make-layer label
+    (map
+      (lambda (decl)
+        [(Ix 1 decl)
+         (foil-env:note-make (strip-surface-spans (Ix 3 decl)) (Ix 2 decl))])
+      (filter mod-decl? rows))))
+
+;; own-keys-from-cache-fields :: [Path] -> [Path] -> [Path]
+(define (own-keys-from-cache-fields declared imported)
+  (filter (lambda (key) (Nil (includes (Equal key) imported))) declared))
+
+;; source-key? :: Subject -> Path -> Bool
+(define (source-key? sut key)
+  (define root (foil-subject:sut-root sut))
+  (And (Nil (foil-subject:ty-ap-path? key))
+    (Or (Ifz (Sz root) 1 0) (foil-env:path-prefix? root key))))
+
+;; make-export-layer :: Cord -> [Path] -> Subject -> Layer
+;;
+;; Export-layer bodies are the already-pinned entries.  They are a projection,
+;; not part of the unit's semantic identity; the unit envelope keeps both the
+;; span-free source layer and this compiled linking view.
+(define (make-export-layer label own-keys sut)
+  (define root (foil-subject:sut-root sut))
+  (foil-env:make-layer label
+    (map
+      (lambda (key)
+        [(drop (Sz root) key)
+         (foil-env:note-make (cairn:gotax key (_0 sut))
+           (foil-subject:get-span key sut))])
+      (filter (source-key? sut) own-keys))))
+
+(define RESOLVED-IMPORT "FOIL_RESOLVED_IMPORT")
+
+;; make-resolved-import :: SastImport -> Subject -> [Path] -> [Path]
+;;                      -> Layer -> Layer -> Mount -> Pin -> [Path]
+;;                      -> ResolvedImport
+(define (make-resolved-import imp sut keys own layer exports mount unit-id projected)
+  [RESOLVED-IMPORT imp sut keys own layer exports mount unit-id projected])
+(define resolved-import-sast (Ix 1))
+(define resolved-import-subject (Ix 2))
+(define resolved-import-keys (Ix 3))
+(define resolved-import-own-keys (Ix 4))
+(define resolved-import-layer (Ix 5))
+(define resolved-import-export-layer (Ix 6))
+(define resolved-import-mount (Ix 7))
+(define resolved-import-unit-id (Ix 8))
+(define resolved-import-projected-keys (Ix 9))
+
+;; import-mount :: Layer -> SastImport -> Mount
+(define (import-mount layer imp)
+  (foil-env:make-mount layer
+    (foil-surface:surf-import-at imp)
+    (foil-surface:surf-import-order imp)
+    (foil-surface:surf-import-span imp)))
+
+;; find-resolved-import :: Mount -> Row ResolvedImport -> ResolvedImport
+(define (find-resolved-import mount resolved)
+  (define ref (foil-env:layer-ref (foil-env:mount-layer mount)))
+  (need
+    (find (lambda (ri) (Equal ref (foil-env:layer-ref
+                              (resolved-import-layer ri))))
+      resolved)))
+
+;; project-export-entry :: Path -> [Path] -> Pin -> Note -> Subject -> Subject
+(define (project-export-entry written own unit-id note sut)
+  (Ifz (foil-env:note-make? note)
+    ;; A cull has no compiled entry, but it still occupies source visibility:
+    ;; type-only lookup must not fall through to a hidden import or builtin.
+    (foil-subject:mark-visible written ["/foil-env/unbound"] sut)
+    (let* ((pin
+             (foil-relocate:clone-qualified-entry-pin own unit-id
+               (foil-env:note-body note)))
+           (entry (foil-subject:unpin-soft pin))
+           (canonical (_0 entry))
+           (sut1 (foil-subject:put-entry-pin canonical pin sut)))
+      (foil-subject:mark-visible written canonical sut1))))
+
+;; project-import-storage :: ResolvedImport -> Subject -> Subject
+;;
+;; A consumer stores every entry owned by an imported unit below that unit's
+;; content pin.  Already-qualified dependency entries remain hidden linking
+;; storage.  This lets two prefix mounts expose the same local canonical names
+;; without either unit rewriting the other's type/global edges.
+(define (project-import-storage ri sut)
+  (define imported (resolved-import-subject ri))
+  (define keys (resolved-import-keys ri))
+  (define own (resolved-import-own-keys ri))
+  (define unit-id (resolved-import-unit-id ri))
+  (define dependencies
+    (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
+  (define with-dependencies
+    (foil-subject:overlay-subject dependencies imported sut))
+  (foldl
+    (lambda (acc key)
+      (let* ((pin
+               (foil-relocate:clone-qualified-entry-pin own unit-id
+                 (cairn:gotax key (_0 imported))))
+             (qualified
+               (foil-relocate:qualify-canonical-path own unit-id key)))
+        (foil-subject:put-entry-pin qualified pin acc)))
+    with-dependencies own))
+
+;; project-one-mount :: Row ResolvedImport -> Subject -> Mount -> Subject
+(define (project-one-mount resolved sut mount)
+  (define ri (find-resolved-import mount resolved))
+  (define own (resolved-import-own-keys ri))
+  (define unit-id (resolved-import-unit-id ri))
+  ;; Hidden cumulative entries make the imported unit's already-resolved type
+  ;; and global edges available.  Only the export-layer paths below enter the
+  ;; visibility index.
+  (define sut1 (project-import-storage ri sut))
+  (define prefix (Weld (foil-subject:sut-root sut1) (foil-env:mount-at mount)))
+  ;; Culls live in the symbolic mount layer; compiled makes live in the export
+  ;; layer.  Apply the former first so a later make/revival can replace it.
+  (define with-culls
+    (foldl
+      (lambda (acc pair)
+        (If (foil-env:note-cull? (_1 pair))
+          (project-export-entry (Weld prefix (_0 pair)) own unit-id (_1 pair) acc)
+          acc))
+      sut1 (foil-env:layer-entries (resolved-import-layer ri))))
+  (foldl
+    (lambda (acc pair)
+      (project-export-entry (Weld prefix (_0 pair)) own unit-id (_1 pair) acc))
+    with-culls (foil-env:layer-entries (resolved-import-export-layer ri))))
+
+;; mark-substrate-visible :: Subject -> Subject
+;;
+;; The subject supplied by the caller is the trusted compiler/runtime
+;; substrate.  Snapshot its source-visible entries before hidden import
+;; storage is overlaid, so an explicit visibility miss can never fall through
+;; to a transitive import that happens to use an unrooted canonical key.
+(define (mark-substrate-visible sut)
+  ;; A compiled subject is itself an immutable environment value suitable as
+  ;; the base of the next REPL turn.  Its explicit aliases are authoritative;
+  ;; rebuilding them from storage order would drop prefix mounts and expose
+  ;; hidden linking keys.  Only legacy/builtin subjects need reconstruction.
+  (If (foil-subject:sut-visible sut)
+    sut
+    (let ((root (foil-subject:sut-root sut)))
+      (foldl
+        (lambda (acc key)
+          (let* ((entry (foil-subject:got-entry key sut))
+                 (canonical (_0 entry))
+                 (written
+                   (If (foil-env:path-prefix? root key) key (Weld root key))))
+            (foil-subject:mark-visible written canonical acc)))
+        (foil-subject:set-sut-visible cairn:empty-ax sut)
+        (foil-subject:subject-order sut)))))
+
+;; make-substrate-layer :: Subject -> Layer
+;;
+;; Convert the caller-supplied compiler/runtime substrate into the explicit
+;; bottom namespace layer used for sealed source resolution, provenance, and
+;; unit identity.  The visibility projection already deduplicates aliases at
+;; their written paths; layer bodies retain the exact pinned entries.
+(define (make-substrate-layer sut)
+  (define rooted (mark-substrate-visible sut))
+  (define root (foil-subject:sut-root sut))
+  (foil-env:make-layer ["foil-core" (Pin sut)]
+    (map
+      (lambda (pair)
+        (let* ((written (_0 pair))
+               (canonical (_1 pair))
+               (relative
+                 (If (foil-env:path-prefix? root written)
+                   (drop (Sz root) written)
+                   written)))
+          [relative
+           (foil-env:note-make (foil-subject:got-const canonical sut)
+             (foil-subject:get-span canonical sut))]))
+      (rowify (cairn:tapax (foil-subject:sut-visible rooted))))))
+
+;; project-mounts :: Subject -> Row ResolvedImport -> Row Mount -> Row SastRow -> Subject
+(define (project-mounts sut0 resolved mounts decls)
+  (define mounted
+    (foldl (project-one-mount resolved)
+      (mark-substrate-visible sut0)
+      (foil-env:validate-mounts mounts)))
+  ;; The whole own layer is visible before any body elaborates: the sealed
+  ;; fixpoint world.  elab-mod's prototype pass supplies the storage entries.
+  (foldl
+    (lambda (sut decl)
+      (let ((path (foil-subject:root-path sut (Ix 1 decl))))
+        (foil-subject:mark-visible path path sut)))
+    mounted (filter mod-decl? decls)))
+
+;; retain-warnings :: Row Warning -> Any -> Any
+(define (retain-warnings warnings value)
+  (foldl
+    (lambda (out warning)
+      (Seq (Trace ["FOIL WARNING" warning] 0) out))
+    value warnings))
+
+;; subject-warnings :: Subject -> Row Warning
+(define (subject-warnings sut)
+  (define unit (foil-subject:sut-unit sut))
+  (If (foil-env:unit? unit) (foil-env:unit-warnings unit) []))
+
+;; emit-subject-warnings :: Subject -> Subject
+;;
+;; Cache hits must pass through the same retained diagnostic boundary as cold
+;; compiles.  Keeping unit extraction here avoids three subtly different cache
+;; paths learning the retained-unit representation independently.
+(define (emit-subject-warnings sut)
+  (retain-warnings (subject-warnings sut) sut))
 
 ;; Compile a module by name, resolving its imports first.  Imports are
 ;; order-independent: all of them merge (and mount, when nested under a
@@ -98,10 +372,15 @@
   (define lore (foil-lore:capture-lore rexn))
   (define imps (filter mod-import? rows))
   (define decls (filter (lambda (r) (Nil (mod-import? r))) rows))
-  (define (apply-import st imp[_ mount span name])
+  ;; Resolve imports to completed unit values first.  No namespace mutation
+  ;; occurs during this walk; the pure foil-env fold happens after every layer
+  ;; reference is known.
+  (define (resolve-import st imp)
     (define cache (_0 st))
-    (define sut (_1 st))
+    (define resolved (_1 st))
     (define seen (_2 st))
+    (define span (foil-surface:surf-import-span imp))
+    (define name (foil-surface:surf-import-modname imp))
     (define blurb (import-blurb span))
     (define hit (find (lambda (e) (Eq name (_0 e))) cache))
     ;; The imported module compiles under a Try so its failure carries
@@ -117,46 +396,87 @@
                       (error ["foil-in-module" name (_0 c)])
                       (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c))
                                  (_3 (_0 c)))))
-                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e)])))
+                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e) (_3 e)])))
                   (let ((e (_0 hit)))
-                    [cache (_1 e) (_2 e)])))
+                    [cache (_1 e) (_2 e) (_3 e)])))
              (imped (_1 r))
              (keys (_2 r))
-             (sut1 (foil-subject:merge-subject blurb keys imped sut))
-             (sut2 (Ifz (Sz mount)
-                     sut1
-                     (foil-subject:mount-subject blurb mount keys imped sut1))))
-        [(_0 r) sut2 (Weld seen keys)])))
-  (define merged (foldl apply-import [cache0 sut0 0] imps))
-  ;; A declaration whose path an import or earlier local declaration
-  ;; already occupies would silently shadow at insert time.  Imported
-  ;; keys are rooted; local decl paths are source-relative.  Both
-  ;; checks go through indexed sets — per-decl scans over the imported
-  ;; key row made this O(decls * imports).
-  (define root (foil-subject:sut-root sut0))
-  (define imp-ax
-    (foldl (lambda (a k) (cairn:putax k 1 a)) cairn:empty-ax (_2 merged)))
-  (define (check-collision seen d[_ name span body])
-    (cond
-      ;; s_bad rows are per-decl parse FAILURES, not declarations —
-      ;; their empty here-path made two of them "collide" as the
-      ;; infamous duplicate-decl (path 0).  Let elab-mod's scan pass
-      ;; report each with its own span and error instead.
-      ((Eq "s_bad" (_0 d)) seen)
-      ((Ifz (cairn:getax (Weld root name) imp-ax) 0 1)
-        (error ["foil-import-collision" ["path" name] ["at" (import-blurb span)]]))
-      ((Ifz (cairn:getax name seen) 0 1)
-        (error ["foil-duplicate-decl" ["path" name] ["at" (import-blurb span)]]))
-      (else (cairn:putax name 1 seen))))
-  (define checked (foldl check-collision cairn:empty-ax decls))
+             (imported (_3 r))
+             (own (own-keys-from-cache-fields keys imported))
+             (prior-unit (foil-subject:sut-unit imped))
+             (exports
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-export-layer prior-unit)
+                 (make-export-layer name own imped)))
+             (layer
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-mount-layer prior-unit)
+                 exports))
+             (mount (import-mount layer imp))
+             (unit-id
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-identity prior-unit)
+                 (foil-env:layer-ref layer)))
+             (qualified-own
+               (map (foil-relocate:qualify-canonical-path own unit-id) own))
+             (dependencies
+               (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
+             (projected (canonical-path-set (Weld dependencies qualified-own)))
+             (ri
+               (make-resolved-import imp imped keys own layer exports mount
+                 unit-id projected)))
+        [(_0 r) (snoc ri resolved) (Weld seen projected)])))
+  (define resolved-state (foldl resolve-import [cache0 [] []] imps))
+  (define resolved (_1 resolved-state))
+  (define mounts (map resolved-import-mount resolved))
+  ;; make-layer rejects duplicate own paths and normalizes same-layer culls
+  ;; before anything is projected or elaborated.
+  (define own-layer (make-own-layer mod decls))
+  (define substrate-layer (make-substrate-layer sut0))
+  (define environment
+    (foil-env:build-environment-with-base substrate-layer mounts own-layer))
+  (define pre
+    (foil-subject:set-sut-unit environment
+      (project-mounts sut0 resolved mounts decls)))
   ;; Force the lore here so the cache entry carries plain data — an
   ;; unforced capture would pin the module's whole rex tree in every
   ;; long-lived cache.
-  (define elabbed (Seq checked (DeepSeq lore (elab-mod (_1 merged) decls))))
+  (define elabbed
+    ;; Mount validation and the pure merge are part of compilation, not lazy
+    ;; metadata attached to its result.  Force the sealed environment while
+    ;; compile-mod's error boundary is active so malformed headers cannot
+    ;; escape later when tooling first inspects the retained Unit.
+    (DeepSeq lore (DeepSeq environment (elab-mod pre decls))))
   ;; Materialize every referenced ground instantiation of const-param
   ;; generics before lowering (their base members skip lowering).
   (define final (foil-lower:materialize-consts elabbed))
-  [(_0 merged) (lower-tc-mod final final) (_2 merged) lore])
+  (define declared
+    (map (lambda (d) (foil-subject:root-path final (Ix 1 d)))
+      (filter mod-decl? decls)))
+  (define own-keys
+    (canonical-path-set
+      (Weld declared
+        (map (Ix 0) (foil-subject:subject-entry-delta pre final)))))
+  ;; lower-tc-unit is the fixpoint-aware path; until a module actually has an
+  ;; internal cycle it is behaviorally identical to the historical fold.
+  (define lowered
+    (foil-lower:lower-tc-unit pre final own-keys))
+  (define exports (make-export-layer mod own-keys lowered))
+  (define unit0
+    (foil-env:make-unit-with-base mod substrate-layer mounts own-layer exports))
+  (define draft-environment (foil-subject:sut-unit lowered))
+  (define unit
+    (If (foil-env:environment? draft-environment)
+      ;; Retain the exact sealed environment, including compiler-derived own
+      ;; declarations.  Rebuilding from mounts alone would preserve reference
+      ;; rows but make resolve/replay forget those generated bindings.
+      (foil-env:unit-with-environment draft-environment unit0)
+      unit0))
+  (define compiled (foil-subject:set-sut-unit unit lowered))
+  [(_0 resolved-state)
+   (emit-subject-warnings compiled)
+   (_2 resolved-state)
+   lore])
 
 ;;; Public compile API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -182,7 +502,7 @@
         [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r)))
            (_0 (_0 r)))
          (_1 (_0 r))]))
-    [cache (_1 (_0 hit))]))
+    [cache (emit-subject-warnings (_1 (_0 hit)))]))
 
 (define (compile-mod-info sut mod)
   (define r (Try (lambda (z) (compile-mod-go [mod] 0 sut mod)) 0))
@@ -200,7 +520,8 @@
         [(snoc (cache-entry mod (_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r)))
            (_0 (_0 r)))
          [(_1 (_0 r)) (_2 (_0 r)) (_3 (_0 r))]]))
-    [cache [(_1 (_0 hit)) (_3 (_0 hit)) (Ix 4 (_0 hit))]]))
+    [cache [(emit-subject-warnings (_1 (_0 hit)))
+            (_3 (_0 hit)) (Ix 4 (_0 hit))]]))
 
 ;;; Content-addressed module artifacts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -209,14 +530,17 @@
 ;;; itself is ordinary PLAN data, so putting it in a Reaver top-level binding
 ;;; makes it survive in the existing content-addressed snapshot graph.
 
-(define artifact-schema 1)
+(define artifact-schema 3)
 
 (define (artifact-compiler-token z)
   ;; A source/compiler change alters one of these transitive pinned closures.
   ;; artifact-schema covers payload/replay changes in this section itself.
   (Pin [artifact-schema compile-mod-go foil-elab:elab-mod
-        foil-lower:materialize-consts foil-lower:lower-tc-mod
-        foil-subject:subject-entry-delta foil-subject:apply-entry-delta
+        foil-lower:materialize-consts foil-lower:lower-tc-unit
+        foil-env:unit-identity foil-relocate:clone-qualified-entry-pin
+        foil-subject:subject-entry-delta
+        foil-subject:subject-entry-replay-delta
+        foil-subject:apply-entry-delta
         default-subject]))
 
 (define (make-artifact-cache flags)
@@ -239,7 +563,8 @@
 
 ;; Artifact body:
 ;; [tag schema name source compiler-token initial-subject-pin flags
-;;  [[import-sast artifact-pin] ..] imported-keys decl-keys entry-delta]
+;;  [[import-sast artifact-pin] ..] imported-keys decl-keys entry-delta
+;;  unit visible]
 (define artifact-name (Ix 2))
 (define artifact-source (Ix 3))
 (define artifact-compiler (Ix 4))
@@ -249,6 +574,8 @@
 (define artifact-imported (Ix 8))
 (define artifact-decl-keys (Ix 9))
 (define artifact-delta (Ix 10))
+(define artifact-unit (Ix 11))
+(define artifact-visible (Ix 12))
 
 (define (artifact-body art)
   (If (IsPin art) (Unpin art) 0))
@@ -308,7 +635,9 @@
       (map (Ix 0) (artifact-direct (artifact-body art)))
       (filter mod-import?
         (foil-sast:parse-module-sast 0 (rex:ParseRexNormFile src)))))
-  (define (apply-import st[cache sut seen direct legacy] imp[_ mount span name])
+  (define (resolve-import st[cache resolved seen direct legacy] imp)
+    (define span (foil-surface:surf-import-span imp))
+    (define name (foil-surface:surf-import-modname imp))
     (define blurb (import-blurb span))
     (If (includes (Eq name) stack)
       (error ["foil-import-cycle" ["module" name] ["at" blurb]])
@@ -318,23 +647,49 @@
              (art (_1 r))
              (imped (_2 r))
              (keys (artifact-decl-keys (artifact-body art)))
+             (imported (artifact-imported (artifact-body art)))
+             (own (own-keys-from-cache-fields keys imported))
              (legacy1 (legacy-cache-merge legacy (Ix 4 r)))
-             (sut1 (foil-subject:merge-subject blurb keys imped sut))
-             (sut2 (Ifz (Sz mount)
-                     sut1
-                     (foil-subject:mount-subject blurb mount keys imped sut1))))
-        [cache1 sut2 (Weld seen keys) (snoc [imp art] direct) legacy1])))
+             (prior-unit (foil-subject:sut-unit imped))
+             (exports
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-export-layer prior-unit)
+                 (make-export-layer name own imped)))
+             (layer
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-mount-layer prior-unit)
+                 exports))
+             (mount (import-mount layer imp))
+             (unit-id
+               (If (foil-env:unit? prior-unit)
+                 (foil-env:unit-identity prior-unit)
+                 (foil-env:layer-ref layer)))
+             (qualified-own
+               (map (foil-relocate:qualify-canonical-path own unit-id) own))
+             (dependencies
+               (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
+             (projected (canonical-path-set (Weld dependencies qualified-own)))
+             (ri
+               (make-resolved-import imp imped keys own layer exports mount
+                 unit-id projected)))
+        [cache1 (snoc ri resolved) (Weld seen projected)
+         (snoc [imp art] direct) legacy1])))
   (define merged
-    (foldl apply-import [cache0 sut0 0 [] []] imps))
+    (foldl resolve-import [cache0 [] [] [] []] imps))
   (define cache (_0 merged))
-  (define pre (_1 merged))
+  (define resolved (_1 merged))
+  (define mounts (map resolved-import-mount resolved))
+  (define pre (project-mounts sut0 resolved mounts []))
   (define direct (_3 merged))
   (define legacy (Ix 4 merged))
   (If (artifact-valid? art mod src compiler init flags direct)
     (let* ((body (artifact-body art))
-           (compiled
-             (foil-subject:apply-entry-delta
-               ["cached module" mod] (artifact-delta body) pre))
+           (compiled0
+             (foil-subject:set-sut-unit (artifact-unit body)
+               (foil-subject:set-sut-visible (artifact-visible body)
+                 (foil-subject:apply-entry-delta
+                   ["cached module" mod] (artifact-delta body) pre))))
+           (compiled (emit-subject-warnings compiled0))
            (imported (artifact-imported body))
            ;; Pinned artifacts carry no lore field yet — a warm hit
            ;; degrades to no lore (bump artifact-schema to store it).
@@ -349,9 +704,11 @@
            (compiled (_1 cold))
            (imported (_2 cold))
            (decl-keys (module-decl-keys compiled))
-           (delta (foil-subject:subject-entry-delta pre compiled))
+           (delta (foil-subject:subject-entry-replay-delta pre compiled))
            (body ["FOIL_ARTIFACT" artifact-schema mod src compiler init flags
-                  direct imported decl-keys delta])
+                  direct imported decl-keys delta
+                  (foil-subject:sut-unit compiled)
+                  (foil-subject:sut-visible compiled)])
            (art1 (Pin body))
            (cache1 (artifact-cache-put cache mod art1))
            (legacy1

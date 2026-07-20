@@ -1,0 +1,275 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil (#module foil))
+(#bind env (#module foil-env))
+(#bind subject (#module foil-subject))
+
+;; lowered :: Path -> Subject -> Any
+(define (lowered path sut)
+  (foil:source-entry-val path sut))
+
+;; tree-has-tag? :: Cord -> Data -> Bool
+(define (tree-has-tag? wanted x)
+  (Ifz (IsApp x)
+    0
+    (Or (Eq wanted (_0 x))
+      (any (tree-has-tag? wanted)
+        (gen (Sz x) (lambda (i) (Ix i x)))))))
+
+;; resolution-at :: Path -> Unit -> Maybe Resolution
+(define (resolution-at path unit)
+  (find (lambda (resolution)
+          (Equal path (env:resolution-path resolution)))
+    (env:unit-resolutions unit)))
+
+;;; Ordered root unions are semantic, not lexical ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define union-a (foil:compile-mod foil:default-subject "env_union_a"))
+(define union-b (foil:compile-mod foil:default-subject "env_union_b"))
+(define union-unit-a (subject:sut-unit union-a))
+(define union-unit-b (subject:sut-unit union-b))
+
+assert(Eq 22 (lowered ["env_winner"] union-a))
+assert(Eq 22 (lowered ["env_winner"] union-b))
+assert(Equal (env:unit-identity union-unit-a)
+  (env:unit-identity union-unit-b))
+assert(Eq 1 (Sz (env:unit-warnings union-unit-a)))
+(define union-warning (_0 (env:unit-warnings union-unit-a)))
+assert(Eq "foil-env-import-occlusion" (env:warning-tag union-warning))
+assert(Equal ["equal"] (env:warning-path union-warning))
+assert(Eq "env_low"
+  (env:from-label (env:warning-occluded-from union-warning)))
+assert(Eq "env_high"
+  (env:from-label (env:warning-winning-from union-warning)))
+
+;; The winning edge is retained with its exact source site and imported unit.
+(define union-resolution (resolution-at ["equal"] union-unit-a))
+assert(Truth union-resolution)
+assert(Eq "env_high"
+  (env:from-label (env:resolution-from (_0 union-resolution))))
+assert(Truth (env:resolution-site (_0 union-resolution)))
+
+;; Replay is deliberately a mount-table query and still exposes the loser.
+(define union-history
+  (env:replay ["equal"] (env:unit-environment union-unit-a)))
+assert(Eq 2 (Sz union-history))
+assert(Eq "env_high" (env:from-label (env:res-from (_0 union-history))))
+assert(Eq "env_low" (env:from-label (env:res-from (_1 union-history))))
+
+;;; Own definitions form a sealed top layer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define shadow (foil:compile-mod foil:default-subject "env_shadow"))
+(define shadow-unit (subject:sut-unit shadow))
+assert(Eq 99 (lowered ["equal"] shadow))
+assert(Eq 99 (lowered ["env_shadow"] shadow))
+assert(Eq 0 (Sz (env:unit-warnings shadow-unit)))
+(define shadow-resolution (resolution-at ["equal"] shadow-unit))
+assert(Truth shadow-resolution)
+assert(env:from-own?
+  (env:resolution-from (_0 shadow-resolution)))
+(define shadow-history
+  (env:replay ["equal"] (env:unit-environment shadow-unit)))
+assert(Eq 2 (Sz shadow-history))
+assert(env:from-own? (env:res-from (_0 shadow-history)))
+assert(Eq "env_low" (env:from-label (env:res-from (_1 shadow-history))))
+
+;; Declaration order is absent from semantic unit identity.  This pair also
+;; exercises a forward value edge through the production module compiler.
+(define defs-a (foil:compile-mod foil:default-subject "env_defs_a"))
+(define defs-b (foil:compile-mod foil:default-subject "env_defs_b"))
+assert(Eq 7 (lowered ["alpha"] defs-a))
+assert(Eq 7 (lowered ["alpha"] defs-b))
+assert(Equal
+  (env:unit-identity (subject:sut-unit defs-a))
+  (env:unit-identity (subject:sut-unit defs-b)))
+
+;;; Prefix mounts graft names without ambient leakage ;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define prefixed (foil:compile-mod foil:default-subject "env_prefix"))
+(define prefixed-unit (subject:sut-unit prefixed))
+(define prefixed-env (env:unit-environment prefixed-unit))
+assert(Eq 7 ((lowered ["env_prefix"] prefixed) 7 9))
+assert(env:res-known? (env:resolve ["deps" "vec"] prefixed-env))
+assert(env:res-unknown? (env:resolve ["vec"] prefixed-env))
+(define prefix-resolution (resolution-at ["deps" "vec"] prefixed-unit))
+assert(Truth prefix-resolution)
+assert(Eq "vec"
+  (env:from-label (env:resolution-from (_0 prefix-resolution))))
+
+;; Completed subjects carry a Unit rather than the draft Environment directly.
+;; Live elaboration must still use that Unit's sealed visibility authority.
+(define completed-prefix-ref
+  (foil:elab-val prefixed foil:empty-env
+    (foil:parse-foil-val "deps/vec")))
+assert(Truth completed-prefix-ref)
+(define completed-prefix-leak
+  (Try (lambda (z)
+         (foil:elab-val prefixed foil:empty-env
+           (foil:parse-foil-val "vec")))
+    0))
+assert(Eq 1 (Hd completed-prefix-leak))
+assert(tree-has-tag? "foil-elab-error" (_0 completed-prefix-leak))
+
+;; Prefixes are storage isolation as well as surface aliases.  Both imported
+;; units declare the same canonical path, so this catches an implementation
+;; that grafts two names but lets the later import overwrite the first body.
+(define two-prefix
+  (foil:compile-mod foil:default-subject "env_two_prefix"))
+(define two-prefix-unit (subject:sut-unit two-prefix))
+(define two-prefix-env (env:unit-environment two-prefix-unit))
+assert(Eq 33 (lowered ["env_two_prefix"] two-prefix))
+assert(env:res-known? (env:resolve ["left" "equal"] two-prefix-env))
+assert(env:res-known? (env:resolve ["right" "equal"] two-prefix-env))
+
+(define prefix-leak-error
+  (Try (lambda (z)
+         (foil:compile-mod foil:default-subject "../foil-bad/env_prefix_leak"))
+    0))
+assert(Eq 1 (Hd prefix-leak-error))
+assert(tree-has-tag? "foil-elab-errors" (_0 prefix-leak-error))
+
+;;; Diagnostics and cache replay retain the environment value ;;;;;;;;;;;;;;;;
+
+(define unordered-error
+  (Try (lambda (z)
+         (foil:compile-mod foil:default-subject "../foil-bad/env_unordered"))
+    0))
+assert(Eq 1 (Hd unordered-error))
+assert(tree-has-tag? "foil-env-unordered-root-union" (_0 unordered-error))
+
+;; An ordinary cache hit returns the same retained unit and traverses the same
+;; warning-emission boundary as its cold compile.  The warning Trace itself is
+;; visible in this test's output; the assertions pin the data it is sourced
+;; from so a cache hit cannot silently fall back to an unannotated subject.
+(define ordinary-cold
+  (foil:compile-mod-cached 0 foil:default-subject "env_union_a"))
+(define ordinary-hit
+  (foil:compile-mod-cached
+    (_0 ordinary-cold) foil:default-subject "env_union_a"))
+(define ordinary-hit-unit
+  (subject:sut-unit (_1 ordinary-hit)))
+assert(Equal (_0 ordinary-cold) (_0 ordinary-hit))
+assert(Equal union-a (_1 ordinary-cold))
+assert(Equal union-a (_1 ordinary-hit))
+assert(Equal (env:unit-warnings union-unit-a)
+  (env:unit-warnings ordinary-hit-unit))
+
+(define artifact-cold
+  (foil:compile-mod-artifact-cached
+    (foil:make-artifact-cache 0) foil:default-subject 0 "env_union_a"))
+(define artifact-hit
+  (foil:compile-mod-artifact-cached
+    (_0 artifact-cold) foil:default-subject 0 "env_union_a"))
+(define artifact-unit
+  (subject:sut-unit (_1 artifact-hit)))
+assert(Equal (_0 artifact-cold) (_0 artifact-hit))
+assert(Equal (_1 artifact-cold) (_1 artifact-hit))
+assert(Equal (env:unit-identity union-unit-a)
+  (env:unit-identity artifact-unit))
+assert(Equal (env:unit-warnings union-unit-a)
+  (env:unit-warnings artifact-unit))
+assert(Equal (env:unit-resolutions union-unit-a)
+  (env:unit-resolutions artifact-unit))
+;; Schema 2 artifacts carried unchecked pair deltas and cannot be replayed by
+;; the replacement-aware schema.  Normalization discards the stale payload.
+assert(Eq 0
+  (Sz (foil:artifact-cache-entries
+    (foil:artifact-cache-normalize
+      ["FOIL_ARTIFACT_CACHE" 2 0 0 [["stale" 0]]] 0))))
+
+;; Replaying an own declaration that legally shadows an import is a checked
+;; replacement, not an artifact collision.  This is the production counterpart
+;; to foil-subject's low-level expected-old-pin test.
+(define shadow-artifact-cold
+  (foil:compile-mod-artifact-cached
+    (foil:make-artifact-cache 0) foil:default-subject 0 "env_shadow"))
+(define shadow-artifact-hit
+  (foil:compile-mod-artifact-cached
+    (_0 shadow-artifact-cold) foil:default-subject 0 "env_shadow"))
+assert(Equal shadow (_1 shadow-artifact-cold))
+assert(Equal shadow (_1 shadow-artifact-hit))
+assert(Equal (_0 shadow-artifact-cold) (_0 shadow-artifact-hit))
+assert(Eq 99 (lowered ["equal"] (_1 shadow-artifact-hit)))
+
+;;; Generated own names and immutable compiler turns ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define demo (foil:compile-mod foil:default-subject "demo"))
+(define demo-unit (subject:sut-unit demo))
+(define demo-environment (env:unit-environment demo-unit))
+(define generated-x (env:resolve ["point" "x"] demo-environment))
+assert(env:res-known? generated-x)
+assert(env:from-own? (env:res-from generated-x))
+assert(Truth (env:replay ["point" "x"] demo-environment))
+
+;; Artifact replay must retain the same generated-own environment, not rebuild
+;; a Unit from only source declarations and lose compiler-generated accessors.
+(define demo-artifact-cold
+  (foil:compile-mod-artifact-cached
+    (foil:make-artifact-cache 0) foil:default-subject 0 "demo"))
+(define demo-artifact-hit
+  (foil:compile-mod-artifact-cached
+    (_0 demo-artifact-cold) foil:default-subject 0 "demo"))
+(define hit-demo-env
+  (env:unit-environment (subject:sut-unit (_1 demo-artifact-hit))))
+assert(env:res-known? (env:resolve ["point" "x"] hit-demo-env))
+assert(env:from-own? (env:res-from (env:resolve ["point" "x"] hit-demo-env)))
+
+;; A compiled subject is an immutable base environment for the next REPL turn.
+;; `bar` captures turn one's `foo`; turn three shadows `foo` without repointing
+;; bar or mutating either predecessor.
+(define turn1
+  (foil:compile-mod foil:default-subject "../foil-bad/env_turn1"))
+(define turn2
+  (foil:compile-mod turn1 "../foil-bad/env_turn2"))
+(define turn3
+  (foil:compile-mod turn2 "../foil-bad/env_turn3"))
+assert(Eq 1 (lowered ["foo"] turn1))
+assert(Eq 1 (lowered ["foo"] turn2))
+assert(Eq 1 (lowered ["bar"] turn2))
+assert(Eq 2 (lowered ["foo"] turn3))
+assert(Eq 1 (lowered ["bar"] turn3))
+assert(Eq 1 (lowered ["foo"] turn1))
+assert(Eq 1 (lowered ["bar"] turn2))
+(define bar-edge
+  (resolution-at ["foo"] (subject:sut-unit turn2)))
+assert(Truth bar-edge)
+assert(env:from-base? (env:resolution-from (_0 bar-edge)))
+
+;;; Hidden linking storage is never ambient source scope ;;;;;;;;;;;;;;;;;;;;;;
+;; This is an existing hidden method (not merely an absent nominal method that
+;; should redispatch through an alias), so the sealed visibility fence applies.
+
+(define hidden-method-error
+  (Try (lambda (z)
+         (foil:compile-mod foil:default-subject "../foil-bad/env_method_leak"))
+    0))
+assert(Eq 1 (Hd hidden-method-error))
+assert(tree-has-tag? "no source-visible method" (_0 hidden-method-error))
+(define visible-method
+  (foil:compile-mod foil:default-subject "env_method_visible"))
+assert(Eq 2 (lowered ["env_method_visible"] visible-method))
+
+;; The same fence applies when live evaluation starts from a completed Unit;
+;; hidden transitive storage does not become ambient merely after compilation.
+(define method-client
+  (foil:compile-mod foil:default-subject "env_method_client"))
+(define method-leak-body
+  (Ix 3 (_0 (filter (lambda (row) (Eq "s_decl" (_0 row)))
+                (foil:parse-foil "../foil-bad/env_method_leak")))))
+(define completed-hidden-method
+  (Try (lambda (z)
+         (foil:elab-val method-client foil:empty-env
+           method-leak-body))
+    0))
+assert(Eq 1 (Hd completed-hidden-method))
+assert(tree-has-tag? "no source-visible method" (_0 completed-hidden-method))
+
+"foil-env integration tests passed"

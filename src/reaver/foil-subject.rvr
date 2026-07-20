@@ -87,7 +87,19 @@
 
 
 
-;; A subject is ("SUT" ax order tvars root).  The root is the
+;; A subject is ("SUT" ax order tvars root unit visible).  The axal accepts
+;; total-ordered PLAN path segments, including unit-identity pins.  The first four
+;; fields are the historical ABI.  `unit` is the optional union-mount unit
+;; record retained for tooling, and `visible` is either 0 (legacy lookup) or
+;; an AX mapping rooted source paths to canonical storage paths.  Keeping
+;; visibility separate from storage lets prefix-mounted code retain the
+;; canonical entries needed for linking and type expansion without leaking
+;; those entries as unqualified source names.
+;;
+;; Older four-field subjects are still readable through the tolerant
+;; accessors below; every subject constructed here uses the extended shape.
+;;
+;; The root is the
 ;; compilation's namespace prefix: entry keys are stored rooted, source
 ;; references resolve relative to it (canon-path), and row brands are
 ;; therefore real namespace paths.  The boot process (builtins and the
@@ -101,7 +113,38 @@
 (define set-sut-root (Up 3))
 (define (root-path sut p) (Weld (sut-root sut) p))
 
-(define (make-subject ax) ("SUT" ax 0 0 []))
+;; sut-unit :: Subject -> Unit | 0
+(define (sut-unit sut)
+  (If (Gt (Sz sut) 4) (Ix 4 sut) 0))
+
+;; sut-visible :: Subject -> Ax CanonPath | 0
+(define (sut-visible sut)
+  (If (Gt (Sz sut) 5) (Ix 5 sut) 0))
+
+;; upgrade-subject :: Subject -> Subject
+;;
+;; `Up` leaves an application unchanged when its index is out of range.  A
+;; direct write to slot 4 or 5 therefore cannot extend a retained historical
+;; four-field subject.  Rebuild old/intermediate values in the current shape
+;; before either extended-field setter runs; current and future wider subjects
+;; pass through unchanged.
+(define (upgrade-subject sut)
+  (If (And (IsApp sut)
+        (And (Eq "SUT" (Hd sut)) (Ge (Sz sut) 4)))
+    (If (Gt (Sz sut) 5)
+      sut
+      ("SUT" (_0 sut) (Ix 1 sut) (Ix 2 sut) (Ix 3 sut)
+        (If (Gt (Sz sut) 4) (Ix 4 sut) 0)
+        0))
+    (error ["foil-malformed-subject" sut])))
+
+;; set-sut-unit :: Unit | 0 -> Subject -> Subject
+(define (set-sut-unit unit sut) (Up 4 unit (upgrade-subject sut)))
+
+;; set-sut-visible :: Ax CanonPath | 0 -> Subject -> Subject
+(define (set-sut-visible visible sut) (Up 5 visible (upgrade-subject sut)))
+
+(define (make-subject ax) ("SUT" ax 0 0 [] 0 0))
 (define subject-order Ix1)
 (define set-subject-order (Up 1))
 (define (push-subject-order name sut)
@@ -124,6 +167,48 @@
     (fresh (push-subject-order key sut1))
     ((includes (Equal key) (subject-order sut1)) sut1)
     (else (push-subject-order key sut1))))
+
+;; put-entry-pin :: Path -> Pin Entry -> Subject -> Subject
+;;
+;; Overlay one already-pinned entry without re-pinning it.  Replacement keeps
+;; the existing deterministic order slot; a fresh canonical entry joins the
+;; order exactly once.
+(define (put-entry-pin key pin sut)
+  (define fresh (Ifz (getax key (_0 sut)) 1 0))
+  (define sut1 (snap 0 (putax key pin) sut))
+  (If fresh (push-subject-order key sut1) sut1))
+
+;; overlay-subject :: [Path] -> Subject -> Subject -> Subject
+;;
+;; Top-biased storage projection used by the union-mount compiler.  Name
+;; visibility and warning policy live in foil-env; this helper only makes the
+;; winning compiled entries available for linking and type expansion.
+(define (overlay-subject keys upper lower)
+  (foldl
+    (lambda (acc key) (put-entry-pin key (gotax key (_0 upper)) acc))
+    lower keys))
+
+;; graft-subject :: Path -> [Path] -> Subject -> Subject -> Subject
+;;
+;; Prefix-mount only: graft the layer's own entries below `prefix` without
+;; also unioning their canonical names at the root.  The stored entry keeps
+;; its canonical key, so canon-path can normalize the mounted spelling.
+(define (graft-subject prefix keys upper lower)
+  (define root (sut-root lower))
+  (define nroot (Sz root))
+  (foldl
+    (lambda (acc key)
+      (let ((mounted (Weld root (Weld prefix (drop nroot key)))))
+        (snap 0 (putax mounted (gotax key (_0 upper))) acc)))
+    lower keys))
+
+;; mark-visible :: Path -> Path -> Subject -> Subject
+(define (mark-visible written canonical sut)
+  ;; `sut-visible` is the AX itself, not a Maybe-wrapped AX.  Using `fall`
+  ;; here unwrapped the first AX field after the first insertion and silently
+  ;; discarded the accumulated visibility map.
+  (define vis (Ifz (sut-visible sut) empty-ax (sut-visible sut)))
+  (set-sut-visible (putax written canonical vis) sut))
 (define (make-tc-entry key span tc)
   ("TC" key tc span))
 (define tc-entry-contents (Ix 1))
@@ -145,6 +230,32 @@
 
 (define (unpin-soft x)
   (If (IsPin x) (Unpin x) x))
+
+;;; Unit-qualified canonical paths
+
+;; The hyphenated segment cannot be written as a Foil source word and the next
+;; segment is a content pin, so these hidden storage paths cannot collide with
+;; source paths.  Keep the shape beside the other canonical-path helpers;
+;; relocation and type expansion must agree on it.
+(define unit-storage-tag "foil-unit")
+
+;; unit-qualified-path? :: Path -> Bool
+(define (unit-qualified-path? path)
+  (And (IsApp path)
+    (And (Ge (Sz path) 2)
+      (And (Eq unit-storage-tag (Ix 0 path)) (IsPin (Ix 1 path))))))
+
+;; unit-qualified-path-unit :: QualifiedPath -> Pin
+(define (unit-qualified-path-unit path)
+  (unless (unit-qualified-path? path)
+    (error ["foil-relocate-malformed-qualified-path" path])
+    (Ix 1 path)))
+
+;; unit-qualified-path-local :: QualifiedPath -> Path
+(define (unit-qualified-path-local path)
+  (unless (unit-qualified-path? path)
+    (error ["foil-relocate-malformed-qualified-path" path])
+    (drop 2 path)))
 
 ;;; The /ty-ap namespace ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -266,6 +377,28 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; identity must not depend on which name the source used.  Entries
 ;; carry their canonical key at Ix 0 ("TC" and "IR_ENTRY" alike).
 (define (canon-path path sut)
+  ;; path-prefix? :: Path -> Path -> Bool
+  (define (path-prefix? prefix whole)
+    (And (Le (Sz prefix) (Sz whole))
+      (Equal prefix (take (Sz prefix) whole))))
+  ;; Legacy subjects infer visibility from storage.  A union-mount subject
+  ;; has an explicit visible-path index: relative source names must pass
+  ;; through it, while already-canonical rooted paths remain available to
+  ;; compiler internals (type expansion and symbolic global edges).
+  (define (visible-canon p)
+    (define vis (sut-visible sut))
+    (define root (sut-root sut))
+    (define absolute? (And (Sz root) (path-prefix? root p)))
+    (If (Or (Nil vis) absolute?)
+      0
+      (let ((hit (getax (Weld root p) vis)))
+        (Ifz hit
+          ;; The compiler snapshots its trusted substrate into this same
+          ;; visibility index before overlaying hidden import storage.  A miss
+          ;; must therefore stay a miss; consulting raw storage here would
+          ;; leak a transitive import when its canonical root is empty.
+          ["/foil-env/unbound"]
+          (_0 hit)))))
   (cond
     ((ty-var-path? path) path)
     ((ty-ap-path? path)
@@ -274,20 +407,23 @@ assert(ty-var-path? ["ty-var" "v"])
           path
           (ty-ap-encode (map (lambda (p) (canon-path p sut)) parts)))))
     (else
-      ;; Rooted-first: a compilation-local declaration shadows a
-      ;; substrate builtin of the same name (matching the pre-root
-      ;; replace-at-insert semantics).  A miss both ways is a forward
-      ;; reference to a declaration of this compilation, which will be
-      ;; inserted rooted — so the rooted guess IS its canonical name
-      ;; (the wf post-pass still catches genuinely unbound paths).
-      (let ((rooted (root-path sut path)))
-        (let ((rgot (If (Equal rooted path) 0 (get-const rooted sut))))
-          (Ifz rgot
-            (let ((got (get-const path sut)))
-              (Ifz got
-                (If (Equal rooted path) path rooted)
-                (_0 (unpin-soft (_0 got)))))
-            (_0 (unpin-soft (_0 rgot)))))))))
+      (let ((visible (visible-canon path)))
+        (If visible
+          visible
+          ;; Rooted-first: a compilation-local declaration shadows a
+          ;; substrate builtin of the same name (matching the pre-root
+          ;; replace-at-insert semantics).  A miss both ways is a forward
+          ;; reference to a declaration of this compilation, which will be
+          ;; inserted rooted — so the rooted guess IS its canonical name
+          ;; (the wf post-pass still catches genuinely unbound paths).
+          (let ((rooted (root-path sut path)))
+            (let ((rgot (If (Equal rooted path) 0 (get-const rooted sut))))
+              (Ifz rgot
+                (let ((got (get-const path sut)))
+                  (Ifz got
+                    (If (Equal rooted path) path rooted)
+                    (_0 (unpin-soft (_0 got)))))
+                (_0 (unpin-soft (_0 rgot)))))))))))
 
 ;; Merge a compiled module's declared entries into sut at their
 ;; canonical paths.  An identical entry at an occupied path is the
@@ -328,31 +464,70 @@ assert(ty-var-path? ["ty-var" "v"])
         (error ["foil-import-collision" ["path" mkey] ["at" blurb]]))))
   (foldl mount-one sut keys))
 
-;; The serialized form of a compiled module is an ordered row of
-;; [canonical-key entry-pin] additions.  Imported entries are already
-;; present in `base`; generated accessors and const materializations are
-;; included whenever their pinned entry differs from the base subject.
-(define (subject-entry-delta base final)
+;; subject-delta-keys :: Subject -> Subject -> Row Path
+;;
+;; Imported entries are already present in `base`; generated accessors, own
+;; shadows, and const materializations are included whenever their pinned
+;; entry differs from the base subject.
+(define (subject-delta-keys base final)
   (define (changed? key)
     (define old (getax key (_0 base)))
     (define new (gotax key (_0 final)))
     (Or (Nil old) (Nil (Equal (need old) new))))
+  (filter changed? (subject-order final)))
+
+;; subject-entry-delta :: Subject -> Subject -> Row [Path Pin]
+;;
+;; Preserve the historical public projection used by callers that only need
+;; the changed keys or replacement pins.
+(define (subject-entry-delta base final)
   (map (lambda (key) [key (gotax key (_0 final))])
-    (filter changed? (subject-order final))))
+    (subject-delta-keys base final)))
+
+;; subject-entry-replay-delta :: Subject -> Subject
+;;                            -> Row [Path (Maybe Pin) Pin]
+;;
+;; Artifact replay additionally records the exact old pin (Maybe-wrapped in
+;; Cairn's native get shape).  This distinguishes an authorized own-layer
+;; replacement from a cache assembled over the wrong import graph.
+(define (subject-entry-replay-delta base final)
+  (map
+    (lambda (key)
+      [key (getax key (_0 base)) (gotax key (_0 final))])
+    (subject-delta-keys base final)))
 
 ;; Replay a module delta without rebuilding or re-pinning its entries.
-;; Identical occupied entries are the diamond/import case; a different
-;; pin at the same canonical key is a cache/import collision and must be
-;; loud rather than silently changing the compiled image.
+;;
+;; Three-field checked entries authorize a replacement only when the current
+;; pin matches the recorded old Maybe Pin.  A current pin already equal to the
+;; new value is the idempotent/diamond case.  Historical two-field additions
+;; retain their strict insert-or-identical behavior for API compatibility.
 (define (apply-entry-delta blurb delta sut)
-  (define (apply-one acc pair[key pin])
+  (define (collision key expected actual)
+    (error ["foil-artifact-collision" ["path" key]
+            ["expected" expected] ["actual" actual] ["at" blurb]]))
+  (define (apply-legacy acc pair)
+    (define key (_0 pair))
+    (define pin (_1 pair))
     (define mine (getax key (_0 acc)))
     (cond
-      ((Nil mine)
-        (push-subject-order key (snap 0 (putax key pin) acc)))
+      ((Nil mine) (put-entry-pin key pin acc))
       ((Equal (need mine) pin) acc)
-      (else
-        (error ["foil-artifact-collision" ["path" key] ["at" blurb]]))))
+      (else (collision key 0 mine))))
+  (define (apply-checked acc pair)
+    (define key (_0 pair))
+    (define expected (_1 pair))
+    (define pin (_2 pair))
+    (define mine (getax key (_0 acc)))
+    (cond
+      ((Equal expected mine) (put-entry-pin key pin acc))
+      ((And mine (Equal (need mine) pin)) acc)
+      (else (collision key expected mine))))
+  (define (apply-one acc pair)
+    (cond
+      ((Eq 2 (Sz pair)) (apply-legacy acc pair))
+      ((Eq 3 (Sz pair)) (apply-checked acc pair))
+      (else (error ["foil-malformed-entry-delta" pair]))))
   (foldl apply-one sut delta))
 
 
@@ -405,6 +580,11 @@ assert(ty-var-path? ["ty-var" "v"])
  sut-root
  set-sut-root
  root-path
+ sut-unit
+ set-sut-unit
+ sut-visible
+ set-sut-visible
+ upgrade-subject
  make-subject
  subject-order
  set-subject-order
@@ -412,6 +592,10 @@ assert(ty-var-path? ["ty-var" "v"])
  pop-subject-order
  empty-subject
  insert-entry-sut
+ put-entry-pin
+ overlay-subject
+ graft-subject
+ mark-visible
  make-tc-entry
  tc-entry-contents
  tc-entry-span
@@ -427,11 +611,16 @@ assert(ty-var-path? ["ty-var" "v"])
  merge-subject
  mount-subject
  subject-entry-delta
+ subject-entry-replay-delta
  apply-entry-delta
  tc-cparam
  tc-cparam-name
  tc-has-cparam?
  tc-uses-cparam?
+ unit-storage-tag
+ unit-qualified-path?
+ unit-qualified-path-unit
+ unit-qualified-path-local
  ty-ap-tag
  ty-val-tag
  ty-val-path?

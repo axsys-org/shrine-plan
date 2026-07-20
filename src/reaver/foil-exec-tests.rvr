@@ -16,6 +16,7 @@
 (#import foil-subject)
 
 (#bind foil (#module foil))
+(#bind foil-lower (#module foil-lower))
 
 
 ;;; End-to-end execution tests: compile Foil and *run* the compiled PLAN.
@@ -27,10 +28,23 @@
   (define mod (foil-sast:parse-module-sast 0 (rex:ParseRexNorm txt)))
   (define elabbed (foil:elab-mod foil:default-subject mod))
   (define final (foil:materialize-consts elabbed))
-  (foil:lower-tc-mod final final))
+  (define declared
+    (map (lambda (r) (root-path final (_1 r)))
+      (filter (lambda (r) (Eq "s_decl" (_0 r))) mod)))
+  ;; Include ground const-generic materializations as members of the same
+  ;; sealed unit, exactly as the production module compiler does.
+  (define own
+    (uniq (sort cmp-total
+      (Weld declared
+        (map (Ix 0) (subject-entry-delta foil:default-subject final))))))
+  (foil-lower:lower-tc-unit foil:default-subject final own))
+
+;; Kept as an intention-revealing alias for tests specifically exercising
+;; sealing/fixpoints; all inline execution tests now share the production path.
+(define compile-inline-unit compile-inline)
 
 (define (lowered path sut)
-  (foil:ir-entry-val (got-entry (Weld ["boot"] path) sut)))
+  (foil:source-entry-val path sut))
 
 
 ;;; Argument order ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -72,6 +86,86 @@ assert(Eq 4 (apart 5 1))
 assert(Eq 0 (triangle 0))
 assert(Eq 6 (triangle 3))
 assert(Eq 15 (triangle 5))
+
+
+;;; Sealed top-level mutual recursion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define mutual-src-a "
++  even
+  \  n=nat
+  ^  nat
+  ?  n
+     =  > next (dec n)
+     (odd next)
+  1
++  odd
+  \  n=nat
+  ^  nat
+  ?  n
+     (even (dec n))
+  0
+")
+
+;; Same declarations in the opposite source order.  Prototype insertion and
+;; grouped slot assignment are path-canonical, so the compiled values agree.
+(define mutual-src-b "
++  odd
+  \  n=nat
+  ^  nat
+  ?  n
+     (even (dec n))
+  0
++  even
+  \  n=nat
+  ^  nat
+  ?  n
+     =  > next (dec n)
+     (odd next)
+  1
+")
+
+;; The two closures form an actual cyclic PLAN graph.  Pin the surrounding
+;; subjects so the test harness does not recursively pretty-print that graph;
+;; behavior, including source-order invariance, remains directly observable.
+(define mutual-a (Pin (compile-inline-unit mutual-src-a)))
+(define mutual-b (Pin (compile-inline-unit mutual-src-b)))
+assert(Eq 1 ((lowered ["even"] (Unpin mutual-a)) 0))
+assert(Eq 0 ((lowered ["odd"] (Unpin mutual-a)) 0))
+assert(Eq 1 ((lowered ["even"] (Unpin mutual-a)) 10))
+assert(Eq 1 ((lowered ["odd"] (Unpin mutual-a)) 11))
+assert(Eq 1 ((lowered ["even"] (Unpin mutual-b)) 10))
+assert(Eq 1 ((lowered ["odd"] (Unpin mutual-b)) 11))
+
+;; Values participate in the same sealed group: `before` can name a later
+;; explicitly cast declaration, and permuting the pair changes no behavior.
+(define forward-a (Pin (compile-inline-unit "
++  before
+  ^  nat
+  after
++  after
+  ^  nat
+  7
+")))
+(define forward-b (Pin (compile-inline-unit "
++  after
+  ^  nat
+  7
++  before
+  ^  nat
+  after
+")))
+assert(Eq 7 (lowered ["before"] (Unpin forward-a)))
+assert(Eq 7 (lowered ["before"] (Unpin forward-b)))
+
+;; Sealing makes every path visible, but does not invent a recursive signature:
+;; the first untyped edge in a cycle still observes the prototype and fails.
+(define untyped-forward-err
+  (Try (lambda (z) (compile-inline "+  left
+  right
++  right
+  left
+")) 0))
+assert(Eq 1 (Hd untyped-forward-err))
 
 
 ;;; Match arms and fallthrough ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -392,7 +486,7 @@ assert(Eq 1 (Hd over-spec-err))
 ")) 0))
 assert(Eq 1 (Hd over-spec-plain-err))
 
-;;; Imports (- rune): merge, mount, cycles, collisions ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Imports (- rune): merge, mount, cycles, and own shadows ;;;;;;;;;;;;;;;;;;;;;
 
 (define vecapp-sut (foil:compile-mod foil:default-subject "vecapp"))
 
@@ -417,27 +511,27 @@ assert(Eq 1 (Hd import-cycle-err))
 assert(Eq "foil-in-module" (Ix 0 (_0 import-cycle-err)))
 assert(Eq "cyca" (Ix 1 (_0 import-cycle-err)))
 
-;; declaring a path an import already occupies is a collision
-;; (deliberately-broken fixtures live in foil-bad/, outside the
-;; compile surface buddy warms)
-(define import-collide-err
-  (Try (lambda (x) (foil:compile-mod foil:default-subject "../foil-bad/collide")) 0))
-assert(Eq 1 (Hd import-collide-err))
-assert(Eq "foil-import-collision" (Ix 0 (Ix 2 (_0 import-collide-err))))
+;; Own declarations form the sealed top layer.  The historical collision
+;; fixtures live outside buddy's warmed compile surface, but are now positive
+;; regressions: a local type can replace an imported type at the same path.
+(define imported-root-shadow
+  (foil:compile-mod foil:default-subject "../foil-bad/collide"))
+(define own-vec-z (lowered ["own_vec_z"] imported-root-shadow))
+assert(Eq 37 (own-vec-z 37))
 
-;; Reopening is additive, but redefining an imported member still
-;; collides at the member path.
-(define imported-member-collide-err
-  (Try (lambda (x) (foil:compile-mod foil:default-subject "../foil-bad/mapcollide")) 0))
-assert(Eq 1 (Hd imported-member-collide-err))
-assert(Eq "foil-import-collision" (Ix 0 (Ix 2 (_0 imported-member-collide-err))))
+;; The same rule applies to a member of an additively reopened namespace.
+;; This local nullary value shadows the imported generic map/get function.
+(define imported-member-shadow
+  (foil:compile-mod foil:default-subject "../foil-bad/mapcollide"))
+assert(Eq 0 (lowered ["map" "get"] imported-member-shadow))
 
 ;; Duplicating a declaration path within one module is rejected before
 ;; insert-entry-sut can silently keep the later value.
 (define duplicate-decl-err
   (Try (lambda (x) (foil:compile-mod foil:default-subject "../foil-bad/dupdecl")) 0))
 assert(Eq 1 (Hd duplicate-decl-err))
-assert(Eq "foil-duplicate-decl" (Ix 0 (Ix 2 (_0 duplicate-decl-err))))
+assert(Eq "foil-env-duplicate-layer-path"
+  (Ix 0 (Ix 2 (_0 duplicate-decl-err))))
 
 ;; inline modules cannot import (no file resolution)
 (define inline-import-err
@@ -685,10 +779,11 @@ assert(Eq 4 (lowered ["mapuser_rev"] mapuser-rev-sut))
   (ty-ap-encode [["boot" "map" "insert"] ["nat"] ["lt"]]))
 assert(Eq "IR_ENTRY" (Hd (got-entry map-insert-lt-key map-sut)))
 assert(Eq "TC" (Hd (got-entry ["boot" "map" "insert"] map-sut)))
+(define map-has-base (canon-path ["map" "has"] mapuser-sut))
 (define map-has-lt-key
-  (ty-ap-encode [["boot" "map" "has"] ["nat"] ["lt"]]))
+  (ty-ap-encode [map-has-base ["nat"] ["lt"]]))
 assert(Eq "IR_ENTRY" (Hd (got-entry map-has-lt-key mapuser-sut)))
-assert(Eq "TC" (Hd (got-entry ["boot" "map" "has"] mapuser-sut)))
+assert(Eq "TC" (Hd (got-entry map-has-base mapuser-sut)))
 
 
 ;;; Constant symbols, literal precision, the autonamer ;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -763,7 +858,7 @@ assert(Eq 3 (lowered ["mk"] autoname-sut))
 (define diag-tags
   ["foil-sast-error" "foil-elab-error" "foil-elab-errors" "foil-type-wf"
    "foil-unsupported" "foil-import-cycle" "foil-import-collision"
-   "foil-duplicate-decl" "foil-in-module"])
+   "foil-duplicate-decl" "foil-env-duplicate-layer-path" "foil-in-module"])
 
 (define (recognized-diag? e)
   (Or (Eq e "bad rex parse")

@@ -1,0 +1,169 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind ty (#module foil-types))
+(#bind core (#module foil-core-types))
+
+(#bind typed-reaver (#module typed-reaver))
+(#import typed-reaver)
+
+(#bind fixture (#module typed-reaver-fixture))
+(#import fixture)
+
+;;; Static checking and retained metadata ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define/typed answer Nat 42)
+
+(define/typed (plus x y)
+  (-> (Nat Nat) Nat)
+  (Add x y))
+
+;; UInt expands nominally to Nat, so UInt arguments may flow to Add and its
+;; Nat result may flow back through the UInt alias.
+(define/typed (uint-plus y x)
+  (-> (UInt UInt) UInt)
+  (Add x y))
+
+(define/typed (countdown n)
+  (-> (Nat) Nat)
+  (If (Nil n) 0 (countdown (Dec n))))
+
+(define/typed (typed-id x)
+  (All (a) (-> (a) a))
+  x)
+
+(define/typed lambda-inc
+  (-> (Nat) Nat)
+  (lambda (x) (Inc x)))
+
+(define/typed pinned-inc
+  (-> (Nat) Nat)
+  (pinlambda (x) (Inc x)))
+
+(define/typed (typed-row-map f xs)
+  (All (a b) (-> ((-> (a) b) (Row a)) (Row b)))
+  (map f xs))
+
+(define/typed (row-id xs)
+  (-> ((Row Nat)) (Row Nat))
+  xs)
+
+assert(Eq 42 answer)
+assert(Eq 7 (plus 3 4))
+assert(Eq 7 (uint-plus 4 3))
+assert(Eq 0 (countdown 6))
+assert(Eq 9 (typed-id 9))
+assert(Eq 10 (lambda-inc 9))
+assert(Eq 10 (pinned-inc 9))
+assert(Equal [2 3 4] (typed-row-map Inc [1 2 3]))
+
+;;; Explicit manifests and shallow boundaries ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define foil-api
+  (provide/foil
+    (plus (foil typed plus))
+    (plus (foil typed plus-alias))
+    (imported-plus (foil typed imported-plus))
+    (uint-plus (foil typed uint-plus))
+    (typed-row-map (foil typed row-map))
+    (row-id (foil typed row-id))))
+
+(define typed-subject
+  (install-foil-provides foil-api core:core-subject))
+
+(define plus-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "plus"] typed-subject)))
+(define plus-alias-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "plus-alias"] typed-subject)))
+(define uint-plus-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "uint-plus"] typed-subject)))
+(define imported-plus-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "imported-plus"] typed-subject)))
+(define row-map-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "row-map"] typed-subject)))
+(define row-id-ffi
+  (tc-ffi-val (got-entry-tc ["typed" "row-id"] typed-subject)))
+
+assert(Eq 11 (plus-ffi 5 6))
+assert(Eq 11 (plus-alias-ffi 5 6))
+assert(Eq 11 (imported-plus-ffi 5 6))
+assert(Eq 11 (uint-plus-ffi 6 5))
+assert(Equal [2 3 4] (row-map-ffi Inc [1 2 3]))
+
+;; Shallow Row enforcement intentionally does not visit elements.
+(define malformed-elements [(Pin 1) (Pin 2)])
+assert(Equal malformed-elements (row-id-ffi malformed-elements))
+
+;; Bad input is blamed before Reaver is called.  A direct result check covers
+;; the output direction without needing an intentionally unsound definition.
+(define bad-input
+  (Try (lambda (ignored) (plus-ffi (Pin 1) 2)) 0))
+(define bad-output
+  (Try (boundary-result core:core-subject ["typed" "bad-output"]
+         (ty:TNAT 0))
+    (Pin 1)))
+assert(Eq 1 (Hd bad-input))
+assert(Eq 1 (Hd bad-output))
+assert(Eq "input" (_1 (_2 (_0 bad-input))))
+assert(Eq 0 (_1 (_3 (_0 bad-input))))
+assert(Eq "output" (_1 (_2 (_0 bad-output))))
+
+;; Reinstalling onto an occupied subject is a collision.
+(define collision
+  (Try (install-foil-provides foil-api) typed-subject))
+assert(Eq 1 (Hd collision))
+
+;; Public type parsing covers all v1 constructors, including rank-1 All.
+assert(Equal (ty:TPIN (ty:TNAT 0))
+  (parse-type "test" '(Pin Nat)))
+assert(Eq "TQUA" (_1
+  (parse-type "test" '(All (a) (-> ((Row a)) (Either a Unit))))))
+
+;; Malformed annotations are rejected by the parser with a located error.
+(define malformed-type (Try (parse-type "malformed") '(Row Nat Nat)))
+assert(Eq 1 (Hd malformed-type))
+
+;;; Negative checker cases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The runtime checker functions accept the same raw syntax that the macro
+;; sees, which lets this suite assert compile-time failures without making the
+;; test module itself fail expansion.
+(define add-global (Pin ["Add" Add "value" 0 0]))
+(define raw-global (Pin ["raw-global" 0 "value" 0 0]))
+(define macro-global (Pin ["mystery" 0 "macro" 0 0]))
+
+(define wrong-return
+  (Try (check-expr "wrong-return" 0 [] '1)
+    (ty:TPIN (ty:TNAT 0))))
+(define wrong-call-argument
+  (Try (check-expr "wrong-call" add-global [] '(Add [1] 2))
+    (ty:TNAT 0)))
+(define wrong-call-arity
+  (Try (check-expr "wrong-arity" add-global [] '(Add 1))
+    (ty:TNAT 0)))
+(define untyped-global-use
+  (Try (synth-expr "untyped-global" raw-global []) "raw-global"))
+(define unknown-macro-use
+  (Try (synth-expr "unknown-macro" macro-global []) '(mystery 1)))
+(define unsupported-local-recursion
+  (Try (synth-expr "local-recursion" 0 [])
+    '(letrec ((loop (lambda (x) x))) (loop 1))))
+
+assert(Eq 1 (Hd wrong-return))
+assert(Eq 1 (Hd wrong-call-argument))
+assert(Eq 1 (Hd wrong-call-arity))
+assert(Eq 1 (Hd untyped-global-use))
+assert(Eq 1 (Hd unknown-macro-use))
+assert(Eq 1 (Hd unsupported-local-recursion))
+
+(print "all typed Reaver tests passed")
