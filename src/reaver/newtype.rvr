@@ -144,8 +144,24 @@
   (define rhs [(1 trow) cstr-expr items-expr])
   [uniq glo ["#bind" nm rhs]])
 
+(define (row-decl-transformer ctx uniq glo locals depth form)
+  (And depth (typed-error ctx "declare-row is top-level only" form))
+  (unless (Ge (Sz form) 3)
+    (typed-error ctx "bad declare-row" form) 1)
+  (define nm (_1 form))
+  (unless (IsNat nm)
+    (typed-error ctx "bad declare-row name" form) 1)
+  ;; An unbranded PLAN row is an application headed by 0.  Giving its type
+  ;; metadata the same constructor lets the existing $ and . transformers
+  ;; synthesize representation-preserving constructors and projections.
+  (define item-exprs (map (handle-decl-item ctx) (drop 2 form)))
+  (define items-expr (cons (1 0) item-exprs))
+  (define rhs [(1 trow) (1 0) items-expr])
+  [uniq glo ["#bind" nm rhs]])
+
 (define ROOT "/boot/types/")
 (#macro declare-cstr type-decl-transformer)
+(#macro declare-row row-decl-transformer)
 
 
 
@@ -192,9 +208,9 @@
   [args (tarr tany)]
   [return tany])
 
-(define (row-face-transformer ctx uniq glo locals depth form)
+(define (row-face-index ctx glo form)
   (unless (Eq 3 (Sz form))
-    (typed-error ctx "bad row-face accessor" form)
+    (typed-error ctx "bad row-face operation" form)
     1)
   (define type-name (_1 form))
   (define face (_2 form))
@@ -220,11 +236,21 @@
   (unless hit
     (typed-error ctx "unknown row face" [type-name face])
     1)
-  (define index (_0 hit))
+  (_0 hit))
+
+(define (row-face-transformer ctx uniq glo locals depth form)
+  (define index (row-face-index ctx glo form))
 
   ;; Emit (Ix index), capturing Ix at the macro's definition site and
   ;; embedding the numeric index as literal data.
   [uniq glo [(1 Ix) (1 index)]])
+
+(define (row-face-updater-transformer ctx uniq glo locals depth form)
+  (define index (row-face-index ctx glo form))
+
+  ;; Up index takes the replacement first and the old row second, so the
+  ;; expanded updater composes directly as (Type.=face replacement row).
+  [uniq glo [(1 Up) (1 index)]])
 
 
 (define (constructor-check-expr cstr item arg)
@@ -233,6 +259,18 @@
    (1 (_0 item))
    (1 (_1 item))
    arg])
+
+;; The compiler's unique counter is itself a natural, so at 95 its raw value
+;; is also the source identifier `_`.  `_` is an ignored binding name and
+;; cannot be referenced.  Keep the counter for uniqueness, but put generated
+;; binders in a private byte-string namespace so no counter value can turn
+;; into source punctuation with binding semantics.
+(define (newtype-gensym uniq offset)
+  (strWeld "#newtype-gensym/" (Add uniq offset)))
+
+;; 95 is the atom/string `_`, the counter value which originally exposed the
+;; constructor hygiene bug while compiling rex.rvr.
+assert(Ne "_" (newtype-gensym 95 0))
 
 (define (type-constructor-transformer ctx uniq glo locals depth form)
   (unless (Eq 2 (Sz form))
@@ -259,7 +297,7 @@
   ;; The generated names are not observable, but they must not capture any
   ;; call-site locals.  Draw the self name and every argument from uniq.
   (define names
-    (gen (Inc arity) (lambda (i) (Add uniq i))))
+    (gen (Inc arity) (newtype-gensym uniq)))
   (define self (_0 names))
   (define args (drop 1 names))
   (define signature (cons self args))
@@ -289,6 +327,7 @@
 
 
 (#macro . row-face-transformer)
+(#macro .= row-face-updater-transformer)
 (#macro $ type-constructor-transformer)
 
 ;; Preserve the stage-0 implementations as bootstrap witnesses.  All public
@@ -466,14 +505,45 @@ assert(Equal
   [uniq glo ["#bind" name (1 union-type)]])
 
 
+(define (bracket-syntax? form)
+  (And (IsApp form)
+    (And (Eq 0 (Hd form)) (Eq "#brak" (_0 form)))))
+
+(define (parse-union-arm-bindings ctx typ form)
+  (unless (bracket-syntax? form)
+    (typed-error ctx "union match field bindings must use brackets" form)
+    1)
+  (define faces (drop 1 form))
+  (unless (all (lambda (face)
+            (And (IsNat face) (And face (Ne "_" face))))
+          faces)
+    (typed-error ctx "union match field names must be bindable symbols" faces)
+    1)
+  (unless (Nil (duplicate-row-values? faces))
+    (typed-error ctx "duplicate union match field binding" faces)
+    1)
+  (define items (_1 typ))
+  (map (lambda (face)
+    (define hit
+      (find-idx (lambda (item) (Eq face (_0 item))) items))
+    (unless hit
+      (typed-error ctx "unknown union match field" [face typ])
+      1)
+    [face (_0 hit)])
+    faces))
+
 (define (parse-union-arm ctx glo options arm)
-  (unless (And (IsApp arm) (Eq 2 (Sz arm)))
+  (unless (And (IsApp arm)
+            (Or (Eq 2 (Sz arm)) (Eq 3 (Sz arm))))
     (typed-error ctx "bad union match arm" arm)
     1)
   (define key (_0 arm))
-  (define branch (_1 arm))
+  (define has-bindings (Eq 3 (Sz arm)))
+  (define branch (If has-bindings (_2 arm) (_1 arm)))
   (If (Eq "_" key)
-    ["fallthrough" branch]
+    (If has-bindings
+      (typed-error ctx "union fallthrough cannot bind fields" arm)
+      ["fallthrough" branch])
     (let1 typ (global-type ctx glo "bad union match arm" key)
       (unless (row-type? typ)
         (typed-error ctx "union match arm is not a constructor type"
@@ -483,13 +553,18 @@ assert(Equal
         (typed-error ctx "union match arm is not in the asserted union"
           [key typ])
         1)
-      ["typed" typ (_0 typ) branch])))
+      (define bindings
+        (If has-bindings
+          (parse-union-arm-bindings ctx typ (_1 arm))
+          []))
+      ["typed" typ (_0 typ) bindings branch])))
 
 (define (typed-union-arm? arm) (Eq "typed" (_0 arm)))
 (define (fallthrough-union-arm? arm) (Eq "fallthrough" (_0 arm)))
 (define (union-arm-type arm) (_1 arm))
 (define (union-arm-cstr arm) (_2 arm))
-(define (union-arm-branch arm) (_3 arm))
+(define (union-arm-bindings arm) (_3 arm))
+(define (union-arm-branch arm) (_4 arm))
 
 (define (assert-union-value name typ val)
   (If (shallow-type-fits? typ val)
@@ -499,10 +574,21 @@ assert(Equal
             ["expected" typ]
             ["actual" val]])))
 
+(define (bind-union-arm-fields scrutinee arm)
+  (define bindings (union-arm-bindings arm))
+  (Ifz (Sz bindings)
+    (union-arm-branch arm)
+    ["#let"
+     (map (lambda (binding)
+       [(_0 binding)
+        [(1 Ix) (1 (_1 binding)) scrutinee]])
+       bindings)
+     (union-arm-branch arm)]))
+
 (define (union-dispatch-arm scrutinee arm rest)
   [(1 If)
    [(1 Eq) (1 (union-arm-cstr arm)) [(1 Hd) scrutinee]]
-   (union-arm-branch arm)
+   (bind-union-arm-fields scrutinee arm)
    rest])
 
 (define (union-match-transformer ctx uniq glo locals depth form)
@@ -544,7 +630,7 @@ assert(Equal
     (typed-error ctx "non-total union match" [type-name missing])
     1)
 
-  (define scrutinee uniq)
+  (define scrutinee (newtype-gensym uniq 0))
   (define impossible
     [(1 error)
      (1 ["newtype" "impossible total union match" ["union" type-name]])])
@@ -564,6 +650,10 @@ assert(Equal
 (declare-cstr Pair ROOT
   [fst (tnat 0)]
   [snd (tnat 0)])
+
+(declare-row Point
+  [x (tnat 0)]
+  [y (tnat 0)])
 
 (declare-cstr Answer ROOT
   [value (tconst 42)])
@@ -641,6 +731,19 @@ assert(Eq "/boot/types/pair" (Hd example-pair))
 assert(Eq 1 (Pair.fst example-pair))
 assert(Eq 2 (Pair.snd example-pair))
 
+(define example-point ($Point 3 4))
+assert(Eq 0 (Hd example-point))
+assert(Eq 2 (Sz example-point))
+assert(Eq 3 (Point.x example-point))
+assert(Eq 4 (Point.y example-point))
+
+(define updated-point (Point.=x 30 example-point))
+assert(Eq 0 (Hd updated-point))
+assert(Eq 2 (Sz updated-point))
+assert(Eq 30 (Point.x updated-point))
+assert(Eq 4 (Point.y updated-point))
+assert(Eq 3 (Point.x example-point))
+
 (define bad-pair
   (Try (lambda (z) ($Pair 1 [2])) 0))
 assert(Eq 1 (Hd bad-pair))
@@ -663,8 +766,8 @@ assert(Eq 2 (Sz (Sum.options PairOrRow)))
 
 (define (describe-pair-or-row val)
   (? PairOrRow val
-    (Pair (Pair.snd val))
-    (Row (Sz (Row.items val)))))
+    (Pair [snd] snd)
+    (Row [items] (Sz items))))
 
 assert(Eq 2 (describe-pair-or-row example-pair))
 assert(Eq 3 (describe-pair-or-row example-row))
