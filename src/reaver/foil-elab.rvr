@@ -27,14 +27,16 @@
 
 ;;; Elaboration environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (burp-self type[_ tag f val])
+(define (burp-self type)
+  (define tag (ty:type-tag type))
   (define (tag-is x) (Eq tag x))
   (define ret
     (cond
       ((tag-is "TSELF") (burp-self (ty:tself-val type)))
       (else type)))
   ret)
-(define (burp-face ty[_ tag f val])
+(define (burp-face ty)
+  (define tag (ty:type-tag ty))
   (define (tag-is x) (Eq tag x))
   (define ret
     (cond
@@ -120,7 +122,7 @@
 
 ;; Normalize a type-valued elaboration to a TTYP wrapper (idempotent).
 (define (as-ttyp typ)
-  (If (Eq "TTYP" (_1 typ)) typ (ty:TTYP typ)))
+  (If (Eq "TTYP" (ty:type-tag typ)) typ (ty:TTYP typ)))
 
 ;; A sealed path whose declaration has no usable public signature.  TC_CONST
 ;; is reserved for the predeclaration phase, and the payload distinguishes this
@@ -185,7 +187,7 @@
                          (map ty:path-to-ty
                            (take (min nt (Sz (drop 1 parts)))
                              (drop 1 parts))))))
-              (If (Eq "TBAD" (_1 typ))
+              (If (Eq "TBAD" (ty:type-tag typ))
                 (error ("cannot specialize entry" path typ))
                 (set-tc-ty (ground typ) tc)))))))
     tc))
@@ -209,7 +211,7 @@
         (ty:TROW (_1 f) fields))
       ((And (Eq "s_ref" (_0 f)) (Equal ["pin"] (surf-ref-path f)))
         (unless (Eq 1 (Sz fields))
-          (ty:TBAD ["bad-pin-arity" fields])
+          (ty:type-error ["bad-pin-arity" fields])
           (ty:TPIN (_0 fields))))
       ;; ('$foo) — a parenthesized constant symbol (the face position
       ;; x=('$foo); rex can't take a bare quip as a rune operand).
@@ -225,7 +227,7 @@
               fields)
             (ty:TNOM enc 0))))
       (else
-        (ty:TBAD "uimpl tapp"))))
+        (ty:type-error "uimpl tapp"))))
 
   (cond
     ;; An anonymous structural row: bare TROW with cstr 0, never
@@ -522,10 +524,10 @@
      (ty:TSELF inner)
      (ty:TSELF (ty:TFAC name inner))))
 
-(define (match-face wan ty[_ tag hav])
-  (and (Eq tag "TFAC") (Eq hav wan)))
+(define (match-face wan typ)
+  (and (Eq (ty:type-tag typ) "TFAC") (Eq (ty:tfac-face typ) wan)))
 
-(define (match-self ty[_ tag]) (Eq tag "TSELF"))
+(define (match-self typ) (Eq (ty:type-tag typ) "TSELF"))
 
 (define (tc-fold-app f xs)
   (Ifz xs f
@@ -536,7 +538,9 @@
 
 (define (score-meth obj meth sut)
   (define outer-ty (tc-ty obj))
-  (define ty[_ tag nom] (burp-face (tc-ty obj)))
+  (define ty (burp-face (tc-ty obj)))
+  (define tag (ty:type-tag ty))
+  (define nom (If (Eq tag "TNOM") (ty:tnom-ref ty) 0))
   ;; member-path :: CanonPath -> CanonPath
   ;;
   ;; A namespace may be reopened by an upper unit: the receiver's nominal
@@ -608,7 +612,7 @@
       (Ifz (ty:count-tqua (tc-ty tc))
         scored
         (let ((typ (ty:type-specialize sut (tc-ty tc) args)))
-          (If (Eq "TBAD" (_1 typ))
+          (If (Eq "TBAD" (ty:type-tag typ))
             (error ("cannot specialize method" meth typ))
             [(set-tc-ty typ tc) (_1 scored)])))))
   (define (row-item-type row)
@@ -644,7 +648,7 @@
   ;; methods win, then lookup re-dispatches on the unfolded type.
   (define (score-ty t)
     (define (score-nom t)
-      (define nom (_2 t))
+      (define nom (ty:tnom-ref t))
       (define sel (sel-for nom))
       (If (get-const sel sut)
         (by-name sel (applied-entry-tc sut sel))
@@ -658,21 +662,22 @@
                       (applied-type sut nom)
                       ty:TBAD)))
           (cond
-            ((Eq "TROW" (_1 decl)) (row-meth decl))
-            ((And (Eq "TNOM" (_1 decl)) (Nil (Equal decl t)))
+            ((Eq "TROW" (ty:type-tag decl)) (row-meth decl))
+            ((And (Eq "TNOM" (ty:type-tag decl)) (Nil (Equal decl t)))
               (score-ty decl))
             (else
               (let ((span (ty:mold-to-span sut t)))
-                (If (Eq "TROW" (_1 span))
+                (If (Eq "TROW" (ty:type-tag span))
                   (row-meth span)
-                  (If (Or (Eq "TBAD" (_1 decl)) (Equal decl t))
+                  (If (Or (Eq "TBAD" (ty:type-tag decl)) (Equal decl t))
                     (error ("bad dot call" obj meth))
                     (score-ty decl)))))))))
     (cond
-      ((Eq (_1 t) "TNOM") (score-nom t))
-      ((Eq (_1 t) "TROW") (row-meth t))
-      ((Eq (_1 t) "TARR") (specialize-method (builtin-meth ["row"]) [(_2 t)]))
-      ((Eq (_1 t) "TNAT") (builtin-meth ["uint"]))
+      ((Eq (ty:type-tag t) "TNOM") (score-nom t))
+      ((Eq (ty:type-tag t) "TROW") (row-meth t))
+      ((Eq (ty:type-tag t) "TARR")
+        (specialize-method (builtin-meth ["row"]) [(ty:tarr-item t)]))
+      ((Eq (ty:type-tag t) "TNAT") (builtin-meth ["uint"]))
       (else (error ("bad dot call" obj meth)))))
   (score-ty ty))
 
@@ -711,16 +716,17 @@
   ;; through type-apply's ordinary inference; the instantiated
   ;; signature comes back in one piece.  -> instantiated TFUN or 0.
   (define (empty-row-ty? t)
-    (And (Eq "TROW" (_1 t))
+    (And (Eq "TROW" (ty:type-tag t))
       (And (Ifz (ty:trow-cstr t) 1 0) (Ifz (Sz (ty:trow-vals t)) 1 0))))
   (define (resolve-generic fty known goal)
     ;; known = [[idx ty] ...] over the declared parameter positions
-    (define use-goal (If goal (Ifz (Eq "TBAD" (_1 goal)) 1 0) 0))
+    (define use-goal (If goal (Ifz (Eq "TBAD" (ty:type-tag goal)) 1 0) 0))
     (define (rewrap t)
-      (define tag (_1 t))
+      (define tag (ty:type-tag t))
       (cond
         ((Eq tag "TQUA")
-          (let ((r (rewrap (_3 t)))) (Ifz r 0 (ty:TQUA (_2 t) r))))
+          (let ((r (rewrap (ty:tqua-body-value t))))
+            (Ifz r 0 (ty:TQUA (ty:tqua-name t) r))))
         ((Eq tag "TFAC") (rewrap (ty:tfac-val t)))
         ((Eq tag "TSELF") (rewrap (ty:tself-val t)))
         ((ty:is-tfun? t)
@@ -735,7 +741,7 @@
       0
       (let ((r (ty:type-apply sut probe
                  (Weld (map (Ix 1) known) (If use-goal [goal] [])))))
-        (If (Eq "TBAD" (_1 r))
+        (If (Eq "TBAD" (ty:type-tag r))
           0
           (let ((vals (ty:trow-vals r)))
             (ty:TFUN (Init vals) (Last vals)))))))
@@ -777,7 +783,7 @@
         (gen n (lambda (i) i))))
     [(_0 lams) exs spec])
   (define (has-quas? fty)
-    (Eq "TQUA" (_1 (burp-face fty))))
+    (Eq "TQUA" (ty:type-tag (burp-face fty))))
   (define (any-lam? surfs)
     (Truth (find (lambda (s) (Eq "s_fun" (_0 s))) surfs)))
   (define (nests-pairs ctx0 pairs)
@@ -812,15 +818,15 @@
       ((Eq "s_trow" (_0 argp))
         (let ((frow
                 (cond
-                  ((Eq "TROW" (_1 fm)) fm)
-                  ((Eq "TNOM" (_1 fm))
-                    (let ((d (burp-face (applied-type sut (_2 fm)))))
-                      (If (Eq "TROW" (_1 d))
+                  ((Eq "TROW" (ty:type-tag fm)) fm)
+                  ((Eq "TNOM" (ty:type-tag fm))
+                    (let ((d (burp-face (applied-type sut (ty:tnom-ref fm)))))
+                      (If (Eq "TROW" (ty:type-tag d))
                         d
                         (burp-face (ty:mold-to-span sut fm)))))
                   (else (burp-face (ty:mold-to-span sut fm)))))
               (kids (_1 argp)))
-          (If (And (Eq "TROW" (_1 frow))
+          (If (And (Eq "TROW" (ty:type-tag frow))
                 (Eq (Sz kids) (Sz (ty:trow-vals frow))))
             (ty:TROW (ty:trow-cstr frow)
               (map (lambda (pr) (relvar-pat-field (_0 pr) (_1 pr)))
@@ -894,7 +900,7 @@
     (define goals
       (Ifz (env-goal env) 0
         (let ((gspan (burp-face (env-goal env))))
-          (If (And (Eq "TROW" (_1 gspan))
+          (If (And (Eq "TROW" (ty:type-tag gspan))
                 (Eq (Sz items) (Sz (ty:trow-vals gspan))))
             (ty:trow-vals gspan)
             0))))
@@ -933,8 +939,8 @@
   (define (relvar-opt-tag o)
     (define b (burp-face o))
     (cond
-      ((Eq "TROW" (_1 b)) (cstr-tag (ty:trow-cstr b)))
-      ((Eq "TNOM" (_1 b)) (path-last-seg (_2 b)))
+      ((Eq "TROW" (ty:type-tag b)) (cstr-tag (ty:trow-cstr b)))
+      ((Eq "TNOM" (ty:type-tag b)) (path-last-seg (ty:tnom-ref b)))
       (else 0)))
   ;; The declared option molds of an expected union type, instantiated
   ;; (applied-type substitutes /ty-ap arguments); alias links chase.
@@ -942,10 +948,10 @@
     (define (chase m fuel)
       (cond
         ((Eq 0 fuel) 0)
-        ((Eq "TSUM" (_1 m)) (ty:tsum-opts m))
-        ((Eq "TROW" (_1 m)) [m])
-        ((Eq "TNOM" (_1 m))
-          (chase (burp-face (applied-type sut (_2 m))) (Dec fuel)))
+        ((Eq "TSUM" (ty:type-tag m)) (ty:tsum-opts m))
+        ((Eq "TROW" (ty:type-tag m)) [m])
+        ((Eq "TNOM" (ty:type-tag m))
+          (chase (burp-face (applied-type sut (ty:tnom-ref m))) (Dec fuel)))
         (else 0)))
     (chase (burp-face expect) 8))
   ;; -> [ctx fields cstr arity]: the member's positional field molds
@@ -965,25 +971,25 @@
              ;; entries, so retain the same provenance edge as an explicit
              ;; constructor reference would; structural options have no path.
              (ctx1
-               (If (Eq "TNOM" (_1 o))
-                 (record-canonical-reference ctx0 env (_2 o))
+               (If (Eq "TNOM" (ty:type-tag o))
+                 (record-canonical-reference ctx0 env (ty:tnom-ref o))
                  ctx0))
              (fields
-               (If (Eq "TNOM" (_1 o))
+               (If (Eq "TNOM" (ty:type-tag o))
                  ;; a legacy TNOM (structural arguments that cannot
                  ;; ride a /ty-ap path) carries them in the args row
-                 (let* ((base (applied-type sut (_2 o)))
-                        (m0 (If (Sz (_3 o))
-                              (ty:type-specialize sut base (_3 o))
+                 (let* ((base (applied-type sut (ty:tnom-ref o)))
+                        (m0 (If (Sz (ty:tnom-args o))
+                              (ty:type-specialize sut base (ty:tnom-args o))
                               base))
                         (m (burp-face m0)))
-                   (If (Eq "TROW" (_1 m))
+                   (If (Eq "TROW" (ty:type-tag m))
                      (ty:trow-vals m)
                      (elab-error env ["member is not a row type" tag] m)))
                  (ty:trow-vals o)))
              (sr (ty:mold-to-span-context ctx1 o))
              (span (burp-face (_1 sr))))
-        (unless (Eq "TROW" (_1 span))
+        (unless (Eq "TROW" (ty:type-tag span))
           (elab-error env ["member has no runtime constructor" tag] span)
           [(_0 sr) fields (ty:trow-cstr span) (Sz (ty:trow-vals span))]))))
   ;; Expression position: arguments fill the member's fields
@@ -1017,14 +1023,14 @@
   (define (tc-type-row tc)
     (If (Eq "TC_TYP" (Hd tc))
       (let ((typ (tc-typ-inner tc)))
-        (If (Nil (Eq (_1 typ) "TTYP"))
+        (If (Nil (Eq (ty:type-tag typ) "TTYP"))
           0
-          (let ((inner (_2 typ)))
+          (let ((inner (ty:ttyp-type typ)))
             (cond
-              ((Eq (_1 inner) "TROW") [inner 0])
-              ((Eq (_1 inner) "TNOM")
-                (let ((decl (applied-type sut (_2 inner))))
-                  (If (Eq (_1 decl) "TROW") [decl inner] 0)))
+              ((Eq (ty:type-tag inner) "TROW") [inner 0])
+              ((Eq (ty:type-tag inner) "TNOM")
+                (let ((decl (applied-type sut (ty:tnom-ref inner))))
+                  (If (Eq (ty:type-tag decl) "TROW") [decl inner] 0)))
               (else 0)))))
       0))
   ;; A constructor call's result type is the NOMINAL type when the
@@ -1060,12 +1066,12 @@
       [(_0 nr) (tc-row (Ifz nom row nom) (ty:trow-cstr row) xs)]))
   (define (on-call ctx0 f xs)
     (define xs-ty (map (cork burp-face tc-ty) xs))
-    (define ty[_ tag] (ty:type-apply sut (tc-ty f) xs-ty))
+    (define typ (ty:type-apply sut (tc-ty f) xs-ty))
     (define app (tc-fold-app f xs))
-    (If (Eq tag "TBAD")
+    (If (Eq (ty:type-tag typ) "TBAD")
       (elab-error env "cannot apply function to these arguments"
-        ["fun" (tc-ty f) "args" xs-ty "because" ty])
-      [ctx0 (set-tc-ty ty app)]))
+        ["fun" (tc-ty f) "args" xs-ty "because" typ])
+      [ctx0 (set-tc-ty typ app)]))
   ;; A loop (|) is an immediately-applied anonymous lambda: params come
   ;; from the arm patterns, inits elaborate in the OUTER env (parallel
   ;; binding — it's one call), and (_ ...) re-enters through the self
@@ -1096,7 +1102,9 @@
     (define br (elab-val-context ctx (clear-env-goal env) val))
     (define base (_1 br))
     (define bty0
-      (If (Eq "TC_TYP" (Hd base)) (_2 (tc-typ-inner base)) (tc-ty base)))
+      (If (Eq "TC_TYP" (Hd base))
+        (ty:ttyp-type (tc-typ-inner base))
+        (tc-ty base)))
     (define cpairs (ty:cqua-pairs bty0))
     (define nt0 (ty:count-tqua bty0))
     (define typed-targs
@@ -1121,7 +1129,7 @@
     (define spec-ctx
       (foldl record-const-arg (_0 typed-targs) (drop nt0 args)))
     (define (bad-type? typ)
-      (Eq (_1 typ) "TBAD"))
+      (Eq (ty:type-tag typ) "TBAD"))
     (define (specialize typ)
       (ty:type-specialize sut typ targs))
     ;; A specialized named type IS its /ty-ap path.  Bare names arrive
@@ -1215,14 +1223,14 @@
        ;; so check the argument count against the generic's arity here.
        ;; Against args, not targs: targs is take-truncated to the arity,
        ;; so its size can never expose surplus arguments.
-       (let ((quas (ty:count-tqua (_2 (tc-typ-inner base)))))
+       (let ((quas (ty:count-tqua (ty:ttyp-type (tc-typ-inner base)))))
          (If (Ne quas (Sz args))
            (elab-error env "wrong number of type arguments"
              ["want" quas "got" (Sz targs)])
            (let ((enc (nom-spec)))
              (If enc
                (tc-typ (ty:TTYP (ty:TNOM enc 0)))
-               (let ((typ (specialize (_2 (tc-typ-inner base)))))
+               (let ((typ (specialize (ty:ttyp-type (tc-typ-inner base)))))
                  (If (bad-type? typ)
                    (elab-error env "bad specialization" ["got" typ "args" args])
                    (tc-typ (ty:TTYP typ))))))))
@@ -1308,7 +1316,7 @@
     (If (Eq 1 (Sz path)) (_0 path) path))
   (define (find-local-face face)
     (define (scan-ty ty path)
-      (define tag (_1 ty))
+      (define tag (ty:type-tag ty))
       (define (scan-row vals)
         (define (go idx rest)
           (Ifz rest
@@ -1318,12 +1326,12 @@
         (go 0 vals))
       (define (scan-tnom)
         (define span (ty:mold-to-span sut ty))
-        (If (Eq "TROW" (_1 span))
+        (If (Eq "TROW" (ty:type-tag span))
           (scan-ty span path)
           0))
       (cond
         ((Eq tag "TFAC")
-          (If (Eq face (_2 ty))
+          (If (Eq face (ty:tfac-face ty))
             [[ty path]]
             ;; Anonymous rows are transparent aggregates: bare faces
             ;; resolve through a faced local holding one.  Named molds
@@ -1331,7 +1339,8 @@
             ;; recursing into them would silently rebind bare words
             ;; like key/val inside match arms.
             (let ((inner (ty:tfac-val ty)))
-              (If (And (Eq "TROW" (_1 inner)) (Eq 0 (ty:trow-cstr inner)))
+              (If (And (Eq "TROW" (ty:type-tag inner))
+                    (Eq 0 (ty:trow-cstr inner)))
                 (scan-ty inner path)
                 0))))
         ((Eq tag "TROW")
@@ -1459,7 +1468,7 @@
   ;; ["key" cstr arity kids] — kids all 0 for a flat pattern (no
   ;; nested constraints); pat-deep fills them for nested variants.
   (define (arm-span-key span)
-    (If (Eq "TROW" (_1 span))
+    (If (Eq "TROW" (ty:type-tag span))
       (let ((n (Sz (ty:trow-vals span))))
         ["key" (ty:trow-cstr span) n (gen n (lambda (i) 0))])
       0))
@@ -1508,15 +1517,15 @@
       ((Eq "s_trow" (_0 argp))
         (let ((frow
                 (cond
-                  ((Eq "TROW" (_1 fm)) fm)
-                  ((Eq "TNOM" (_1 fm))
-                    (let ((d (burp-face (applied-type sut (_2 fm)))))
-                      (If (Eq "TROW" (_1 d))
+                  ((Eq "TROW" (ty:type-tag fm)) fm)
+                  ((Eq "TNOM" (ty:type-tag fm))
+                    (let ((d (burp-face (applied-type sut (ty:tnom-ref fm)))))
+                      (If (Eq "TROW" (ty:type-tag d))
                         d
                         (burp-face (ty:mold-to-span sut fm)))))
                   (else (burp-face (ty:mold-to-span sut fm)))))
               (kids (_1 argp)))
-          (If (And (Eq "TROW" (_1 frow))
+          (If (And (Eq "TROW" (ty:type-tag frow))
                 (Eq (Sz kids) (Sz (ty:trow-vals frow))))
             (let* ((kr (deep-kids ctx0 kids (ty:trow-vals frow)))
                    (keys (Ix 2 kr))
@@ -1547,18 +1556,18 @@
     (define (impose-faces met)
       (ty:TROW (ty:trow-cstr met)
         (map (lambda (pr)
-               (If (Eq "TFAC" (_1 (_0 pr)))
-                 (ty:TFAC (_2 (_0 pr)) (burp-face (_1 pr)))
+               (If (Eq "TFAC" (ty:type-tag (_0 pr)))
+                 (ty:TFAC (ty:tfac-face (_0 pr)) (burp-face (_1 pr)))
                  (_1 pr)))
           (zip (ty:trow-vals pat-ty) (ty:trow-vals met)))))
     (define local-ty
-      (If (And (Eq "TROW" (_1 pat-ty))
+      (If (And (Eq "TROW" (ty:type-tag pat-ty))
             (And (Eq 0 (ty:trow-cstr pat-ty))
-              (And (Eq "TROW" (_1 ty))
+              (And (Eq "TROW" (ty:type-tag ty))
                 (Eq (Sz (ty:trow-vals pat-ty)) (Sz (ty:trow-vals ty))))))
         (impose-faces ty)
         ty))
-    (unless (Eq "TROW" (_1 span))
+    (unless (Eq "TROW" (ty:type-tag span))
       (elab-error env "match arm pattern is not a row (constructor) type"
         ["pattern" pat-ty "narrowed" ty])
       (let* ((rr (elab-val-context ctx1 (push-local-env env local-ty) val))
@@ -1616,7 +1625,7 @@
     (define keys (map arm-info-key infos))
     (define (opt-key o)
       (define s (burp-face o))
-      (If (Eq "TROW" (_1 s))
+      (If (Eq "TROW" (ty:type-tag s))
         (arm-span-key s)
         0))
     (define (uncovered? o)
@@ -1626,8 +1635,8 @@
                keys))))
     (define opts
       (cond
-        ((Eq "TSUM" (_1 span)) (ty:tsum-opts span))
-        ((Eq "TROW" (_1 span)) [span])
+        ((Eq "TSUM" (ty:type-tag span)) (ty:tsum-opts span))
+        ((Eq "TROW" (ty:type-tag span)) [span])
         (else 0)))
     (Ifz opts
       (elab-error env "match without fallthrough on a non-sum scrutinee"
@@ -1709,7 +1718,7 @@
       (filter (lambda (v) (ty:type-mentions-var? v typ)) vars))
     [(_0 r)
      (If (Eq "TC_TYP" (Hd tc))
-       (let ((inner (_2 (tc-typ-inner tc))))
+       (let ((inner (ty:ttyp-type (tc-typ-inner tc))))
          (tc-typ (ty:TTYP (wrap-tquas (kept inner) inner))))
        (let ((typ (tc-ty tc)))
          (set-tc-ty (wrap-tquas (kept typ) typ) tc)))])
@@ -1728,7 +1737,9 @@
     (define r (elab-val-context (_0 typed-consts) env1 body))
     (define tc (_1 r))
     (define typ0
-      (If (Eq "TC_TYP" (Hd tc)) (_2 (tc-typ-inner tc)) (tc-ty tc)))
+      (If (Eq "TC_TYP" (Hd tc))
+        (ty:ttyp-type (tc-typ-inner tc))
+        (tc-ty tc)))
     (define (kept-const? p)
       (Or (tc-uses-cparam? (_0 p) tc)
         (ty:type-mentions-var? (_0 p) typ0)))
@@ -1786,14 +1797,17 @@
 (define (can-gen-accessors? tc[ty])
   (define (unwrap vars cps typ)
     (cond
-      ((Eq (_1 typ) "TQUA") (unwrap (snoc (_2 typ) vars) cps (_3 typ)))
-      ((Eq (_1 typ) "TCQUA")
-        (unwrap vars (snoc [(_2 typ) (_3 typ)] cps) (_4 typ)))
-      ((Eq (_1 typ) "TROW")
+      ((Eq (ty:type-tag typ) "TQUA")
+        (unwrap (snoc (ty:tqua-name typ) vars) cps (ty:tqua-body-value typ)))
+      ((Eq (ty:type-tag typ) "TCQUA")
+        (unwrap vars
+          (snoc [(ty:tcqua-name typ) (ty:tcqua-type typ)] cps)
+          (ty:tcqua-body typ)))
+      ((Eq (ty:type-tag typ) "TROW")
         [(Ifz (Sz vars) 0 vars) cps (ty:trow-vals typ)])
       (else 0)))
-  (If (and (Eq (Hd tc) "TC_TYP") (Eq (_1 ty) "TTYP"))
-    (unwrap [] [] (_2 ty))
+  (If (and (Eq (Hd tc) "TC_TYP") (Eq (ty:type-tag ty) "TTYP"))
+    (unwrap [] [] (ty:ttyp-type ty))
     0))
 
 ;;; Unsupported-syntax scan ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1836,7 +1850,7 @@
 (define (elab-mod-go sut mod profiled?)
   (define (insert-elab-tc name span tc sut)
     (If (Eq (Hd tc) "TC_TYP")
-      (ty:insert-typ name span (_2 (tc-typ-inner tc)) sut)
+      (ty:insert-typ name span (ty:ttyp-type (tc-typ-inner tc)) sut)
       (insert-tc name span tc sut)))
 
   ;; prototype-tc : Subject -> Env -> SAST -> TC
@@ -1850,12 +1864,12 @@
     (define (recur env1 body1) (prototype-tc psut env1 body1))
     (define (wrap-vars vars tc)
       (If (Eq "TC_TYP" (Hd tc))
-        (let ((inner (_2 (tc-typ-inner tc))))
+        (let ((inner (ty:ttyp-type (tc-typ-inner tc))))
           (tc-typ (ty:TTYP (wrap-tquas vars inner))))
         (set-tc-ty (wrap-tquas vars (tc-ty tc)) tc)))
     (define (wrap-consts pairs tc)
       (If (Eq "TC_TYP" (Hd tc))
-        (let ((inner (_2 (tc-typ-inner tc))))
+        (let ((inner (ty:ttyp-type (tc-typ-inner tc))))
           (tc-typ (ty:TTYP (ty:wrap-tcquas pairs inner))))
         (set-tc-ty (ty:wrap-tcquas pairs (tc-ty tc)) tc)))
     (cond
