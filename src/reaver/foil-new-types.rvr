@@ -1,0 +1,1147 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; A small stage-1 type kernel.  The central invariant is that every ground
+;; generic application is a normal nominal reference: its canonical /ty-ap
+;; path resolves to a TypeEntry in TypeWorld.overlays.  Encoding and decoding
+;; application paths are confined to the environment boundary below.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind cairn (#module cairn))
+
+(#bind newtype (#module newtype))
+(#import newtype)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+
+;;; Stage-1 data declarations ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define FOIL_NEW_TYPE_ROOT "/foil/new-types/")
+
+;; Var and App are template-only nodes.  A resolved monotype contains neither.
+(declare-cstr TyVar FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)])
+
+(declare-cstr ConstVar FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)])
+
+(declare-cstr TyArg FOIL_NEW_TYPE_ROOT
+  [value tany])
+
+(declare-cstr ConstArg FOIL_NEW_TYPE_ROOT
+  [value tany])
+
+(decl-union GenericArgument TyArg ConstArg)
+
+(declare-cstr TyApp FOIL_NEW_TYPE_ROOT
+  [base (tarr (tnat 0))]
+  [arguments (tarr GenericArgument)])
+
+;; Quantification belongs to schemes, rather than the monotype spine.
+(declare-cstr TyParam FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)])
+
+(declare-cstr ConstParam FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)]
+  [declared-type tany])
+
+(decl-union SchemeParameter TyParam ConstParam)
+
+(declare-cstr Scheme FOIL_NEW_TYPE_ROOT
+  [parameters (tarr SchemeParameter)]
+  [body tany])
+
+;; One entry shape serves both declarations and materialized applications.
+;; `scheme` is the declaration template.  Applied entries additionally carry
+;; a saturated `body`; their scheme has no remaining parameters.
+(declare-cstr TypeEntry FOIL_NEW_TYPE_ROOT
+  [path (tarr (tnat 0))]
+  [origin (tarr (tnat 0))]
+  [arguments (tarr GenericArgument)]
+  [scheme Scheme]
+  [body tany]
+  [runtime-brand (tnat 0)]
+  [runtime-arity (tnat 0)]
+  [source tany])
+
+(declare-cstr TypeWorld FOIL_NEW_TYPE_ROOT
+  [namespace tany]
+  [overlays tany]
+  [namespace-revision (tnat 0)]
+  [unfold-cache tany]
+  [subtype-cache tany])
+
+;; A binding is deliberately explicit.  This keeps template substitution
+;; local and prevents variables from leaking into namespace paths.
+(declare-cstr TypeBinding FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)]
+  [argument GenericArgument])
+
+
+;;; Public constructor vocabulary ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define type-var $TyVar)
+(define const-var $ConstVar)
+(define type-arg $TyArg)
+(define const-arg $ConstArg)
+(define type-app $TyApp)
+(define type-param $TyParam)
+(define const-param $ConstParam)
+(define scheme $Scheme)
+(define type-ref $Path)
+
+(define (mono body) ($Scheme [] body))
+
+;; Generated dotted accessors are macros and therefore do not compose with a
+;; module qualifier at call sites.  Export ordinary functional projections at
+;; the module seam while continuing to use the generated declarations here.
+(define ty-var-name TyVar.name)
+(define const-var-name ConstVar.name)
+(define ty-app-base TyApp.base)
+(define ty-app-arguments TyApp.arguments)
+(define scheme-parameters Scheme.parameters)
+(define scheme-body Scheme.body)
+(define type-entry-path TypeEntry.path)
+(define type-entry-origin TypeEntry.origin)
+(define type-entry-arguments TypeEntry.arguments)
+(define type-entry-scheme TypeEntry.scheme)
+(define type-entry-body TypeEntry.body)
+(define type-entry-runtime-brand TypeEntry.runtime-brand)
+(define type-entry-runtime-arity TypeEntry.runtime-arity)
+(define type-entry-source TypeEntry.source)
+(define world-namespace TypeWorld.namespace)
+(define world-overlays TypeWorld.overlays)
+(define world-revision TypeWorld.namespace-revision)
+(define row-items Row.items)
+(define row-cstr Row.cstr)
+(define row-item-face RowItem.face)
+(define row-item-value RowItem.value)
+
+(define (type-error what detail)
+  (error ["foil-new-types" what detail]))
+
+(define (valid-path? path)
+  (And (IsApp path)
+    (And (Sz path) (all IsNat path))))
+
+(define (need-path what path)
+  (unless (valid-path? path)
+    (type-error what ["expected nonempty path" path])
+    path))
+
+(define (type-node-tag typ) (And (IsApp typ) (Hd typ)))
+(define (type-is-tag? tag typ) (Eq tag (type-node-tag typ)))
+(define (type-ref? typ) (type-is-tag? tpath-pax typ))
+(define (type-var? typ) (type-is-tag? "/foil/new-types/tyvar" typ))
+(define (const-var? typ) (type-is-tag? "/foil/new-types/constvar" typ))
+(define (type-app? typ) (type-is-tag? "/foil/new-types/tyapp" typ))
+(define (scheme? value) (type-is-tag? "/foil/new-types/scheme" value))
+
+(define (argument-kind arg)
+  (cond
+    ((type-is-tag? "/foil/new-types/tyarg" arg) "type")
+    ((type-is-tag? "/foil/new-types/constarg" arg) "const")
+    (else (type-error "bad generic argument" arg))))
+
+(define (parameter-kind param)
+  (? SchemeParameter param
+    (TyParam "type")
+    (ConstParam "const")))
+
+(define (parameter-name param)
+  (? SchemeParameter param
+    (TyParam [name] name)
+    (ConstParam [name] name)))
+
+
+;;; TypeWorld and declaration insertion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define empty-type-world
+  ($TypeWorld cairn:empty-ax cairn:empty-ax 0
+    cairn:empty-ax cairn:empty-ax))
+
+(define (make-type-world namespace)
+  ($TypeWorld namespace cairn:empty-ax 0
+    cairn:empty-ax cairn:empty-ax))
+
+(define (world-with-overlays world overlays)
+  (TypeWorld.=overlays overlays world))
+
+(define (world-with-unfold-cache world cache)
+  (TypeWorld.=unfold-cache cache world))
+
+(define (world-with-subtype-cache world cache)
+  (TypeWorld.=subtype-cache cache world))
+
+(define (world-clear-caches world)
+  (world-with-subtype-cache
+    (world-with-unfold-cache world cairn:empty-ax)
+    cairn:empty-ax))
+
+(define (world-find-direct world path)
+  (define over (cairn:getax path (TypeWorld.overlays world)))
+  (If over over
+    (cairn:getax path (TypeWorld.namespace world))))
+
+(define (make-type-entry path scm runtime-brand runtime-arity source)
+  (need-path "bad type-entry path" path)
+  (unless (scheme? scm)
+    (type-error "bad type-entry scheme" scm)
+    1)
+  ($TypeEntry path path [] scm
+    (Ifz (Sz (Scheme.parameters scm)) (Scheme.body scm) 0)
+    runtime-brand runtime-arity source))
+
+(define (insert-type-entry world entry)
+  (define path (TypeEntry.path entry))
+  (need-path "bad inserted path" path)
+  (unless (Nil (world-find-direct world path))
+    (type-error "duplicate type entry" path)
+    1)
+  (let* ((world1
+           (TypeWorld.=namespace
+             (cairn:putax path entry (TypeWorld.namespace world))
+             world))
+         (world2
+           (TypeWorld.=namespace-revision
+             (Inc (TypeWorld.namespace-revision world1)) world1)))
+    (world-clear-caches world2)))
+
+(define (declare-type world path scm runtime-brand runtime-arity source)
+  (insert-type-entry world
+    (make-type-entry path scm runtime-brand runtime-arity source)))
+
+(define (type-world-entries world)
+  ;; Overlays are intentionally absent: they are lookupable but second-class
+  ;; for enumeration, so declaration order never becomes a cache dump.
+  (rowify (cairn:tapax (TypeWorld.namespace world))))
+
+
+;;; Generic arguments and canonical application paths ;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (binding-find name bindings)
+  (define hit
+    (find (lambda (binding) (Eq name (TypeBinding.name binding))) bindings))
+  (And hit (_0 hit)))
+
+(define (binding-argument name bindings)
+  (define hit (binding-find name bindings))
+  (unless hit
+    (type-error "unbound template variable" name)
+    (TypeBinding.argument hit)))
+
+(define (argument-path arg)
+  (cond
+    ((type-is-tag? "/foil/new-types/tyarg" arg)
+      (let ((value (TyArg.value arg)))
+        (unless (type-ref? value)
+          (type-error "type application argument must be a resolved Path" value)
+          (Path.p value))))
+    ((type-is-tag? "/foil/new-types/constarg" arg)
+      [ty-val-tag (ConstArg.value arg)])
+    (else (type-error "bad application argument" arg))))
+
+(define (application-path base arguments)
+  ;; This is one of the two intentionally small /ty-ap encoding boundaries.
+  (need-path "bad type application base" base)
+  (ty-ap-encode (Weld [base] (map argument-path arguments))))
+
+(define (ground-application-path? path)
+  (define (ground-part? part)
+    (cond
+      ((ty-var-path? part) 0)
+      ((ty-ap-path? part)
+        (let ((nested (ty-ap-decode part)))
+          (And nested (all ground-part? nested))))
+      (else (valid-path? part))))
+  (define parts (ty-ap-decode path))
+  (And parts
+    (And (Equal path (ty-ap-encode parts))
+      (And (Gt (Sz parts) 1) (all ground-part? parts)))))
+
+(define (arguments-match-parameters? params arguments)
+  (And (Eq (Sz params) (Sz arguments))
+    (all (lambda (pair)
+      (Eq (parameter-kind (_0 pair)) (argument-kind (_1 pair))))
+      (zip params arguments))))
+
+
+;;; One central type walk ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; map-type rebuilds every type-bearing node.  Const payloads and Path values
+;; are opaque.  Closure, free-variable checks, validation, and template
+;; substitution below all share this vocabulary, so adding a new node cannot
+;; silently leave a variable or ZeroRec under an unvisited child.
+(define (map-type f typ)
+  (define recur (map-type f))
+  (define rebuilt
+    (cond
+      ((type-is-tag? trow-item-pax typ)
+        (trow-item (RowItem.face typ) (recur (RowItem.value typ))))
+      ((type-is-tag? trow-pax typ)
+        (trow (Row.cstr typ)
+          (map (lambda (item)
+            (trow-item (RowItem.face item) (recur (RowItem.value item))))
+            (Row.items typ))))
+      ((type-is-tag? tsum-pax typ)
+        (tsum (map recur (Sum.options typ))))
+      ((type-is-tag? tfun-pax typ)
+        (tfun (map recur (Fun.args typ)) (recur (Fun.return typ))))
+      ((type-is-tag? tarr-pax typ)
+        (tarr (recur (Arr.item typ))))
+      ((type-app? typ)
+        (type-app (TyApp.base typ)
+          (map (lambda (arg)
+            (? GenericArgument arg
+              (TyArg [value] (type-arg (recur value)))
+              (ConstArg arg)))
+            (TyApp.arguments typ))))
+      ;; Bot, Any, Nat, Const, Path, ZeroRec, TyVar, and ConstVar are leaves.
+      (else typ)))
+  (f rebuilt))
+
+(define (type-any? pred typ)
+  (define recur (type-any? pred))
+  (Or (pred typ)
+    (cond
+      ((type-is-tag? trow-item-pax typ) (recur (RowItem.value typ)))
+      ((type-is-tag? trow-pax typ)
+        (any (lambda (item) (recur (RowItem.value item))) (Row.items typ)))
+      ((type-is-tag? tsum-pax typ) (any recur (Sum.options typ)))
+      ((type-is-tag? tfun-pax typ)
+        (Or (any recur (Fun.args typ)) (recur (Fun.return typ))))
+      ((type-is-tag? tarr-pax typ) (recur (Arr.item typ)))
+      ((type-app? typ)
+        (any (lambda (arg)
+          (? GenericArgument arg
+            (TyArg [value] (recur value))
+            (ConstArg 0)))
+          (TyApp.arguments typ)))
+      (else 0))))
+
+(define (resolved-type? typ)
+  (Nil (type-any?
+    (lambda (node)
+      (Or (type-var? node)
+        (Or (const-var? node)
+          (Or (type-app? node)
+            (type-is-tag? tzero-rec-pax node)))))
+    typ)))
+
+
+;;; Specialization and overlay materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (bind-parameters params arguments)
+  (unless (arguments-match-parameters? params arguments)
+    (type-error "generic argument mismatch"
+      ["parameters" params "arguments" arguments])
+    1)
+  (map (lambda (pair)
+    ($TypeBinding (parameter-name (_0 pair)) (_1 pair)))
+    (zip params arguments)))
+
+(define (specialize-template-resolving resolve world bindings self-path typ)
+  (define (recur w t)
+    (specialize-template-resolving resolve w bindings self-path t))
+  (define (specialize-args w arguments)
+    (foldl
+      (lambda (state arg)
+        (? GenericArgument arg
+          (TyArg [value]
+            (let ((r (recur (_0 state) value)))
+              [(_0 r) (snoc (type-arg (_1 r)) (_1 state))]))
+          (ConstArg [value]
+            (If (const-var? value)
+              (let ((bound (binding-argument (ConstVar.name value) bindings)))
+                (? GenericArgument bound
+                  (ConstArg [value]
+                    [(_0 state) (snoc (const-arg value) (_1 state))])
+                  (TyArg
+                    (type-error "type argument in const position" value))))
+              [(_0 state) (snoc arg (_1 state))]))))
+      [w []] arguments))
+  (cond
+    ((type-var? typ)
+      (let ((arg (binding-argument (TyVar.name typ) bindings)))
+        (? GenericArgument arg
+          (TyArg [value] [world value])
+          (ConstArg
+            (type-error "const argument used as a type variable" typ)))))
+    ((const-var? typ)
+      (let ((arg (binding-argument (ConstVar.name typ) bindings)))
+        (? GenericArgument arg
+          (ConstArg [value] [world (tconst value)])
+          (TyArg
+            (type-error "type argument used as a const variable" typ)))))
+    ((type-app? typ)
+      (let* ((r (specialize-args world (TyApp.arguments typ)))
+             (args (_1 r))
+             (path (application-path (TyApp.base typ) args)))
+        (If (And self-path (Equal path self-path))
+          [(_0 r) (type-ref self-path)]
+          (let ((resolved (resolve (_0 r) path)))
+            [(_0 resolved) (type-ref path)]))))
+    ((type-is-tag? trow-item-pax typ)
+      (let ((r (recur world (RowItem.value typ))))
+        [(_0 r) (trow-item (RowItem.face typ) (_1 r))]))
+    ((type-is-tag? trow-pax typ)
+      (let ((r
+              (foldl
+                (lambda (state item)
+                  (let ((ir (recur (_0 state) (RowItem.value item))))
+                    [(_0 ir)
+                     (snoc (trow-item (RowItem.face item) (_1 ir))
+                       (_1 state))]))
+                [world []] (Row.items typ))))
+        [(_0 r) (trow (Row.cstr typ) (_1 r))]))
+    ((type-is-tag? tsum-pax typ)
+      (let ((r
+              (foldl
+                (lambda (state option)
+                  (let ((ir (recur (_0 state) option)))
+                    [(_0 ir) (snoc (_1 ir) (_1 state))]))
+                [world []] (Sum.options typ))))
+        [(_0 r) (tsum (_1 r))]))
+    ((type-is-tag? tfun-pax typ)
+      (let* ((ra
+               (foldl
+                 (lambda (state arg)
+                   (let ((ir (recur (_0 state) arg)))
+                     [(_0 ir) (snoc (_1 ir) (_1 state))]))
+                 [world []] (Fun.args typ)))
+             (rr (recur (_0 ra) (Fun.return typ))))
+        [(_0 rr) (tfun (_1 ra) (_1 rr))]))
+    ((type-is-tag? tarr-pax typ)
+      (let ((r (recur world (Arr.item typ))))
+        [(_0 r) (tarr (_1 r))]))
+    ((type-is-tag? tzero-rec-pax typ)
+      (If self-path
+        [world (type-ref self-path)]
+        (type-error "ZeroRec outside a materialized entry" typ)))
+    (else [world typ])))
+
+(define (specialize-const-parameter-types resolve world params arguments)
+  ;; Parameters are ordered.  A const parameter's declared type may mention
+  ;; earlier type parameters, but never later ones.
+  (define (walk w done-params done-args rest-params rest-args)
+    (Ifz (Sz rest-params)
+      w
+      (let ((param (_0 rest-params))
+            (arg (_0 rest-args)))
+        (? SchemeParameter param
+          (TyParam
+            (walk w (snoc param done-params) (snoc arg done-args)
+              (drop 1 rest-params) (drop 1 rest-args)))
+          (ConstParam [declared-type]
+            (let* ((prior-bindings (bind-parameters done-params done-args))
+                   (r (specialize-template-resolving resolve w
+                        prior-bindings 0 declared-type))
+                   (want (_1 r))
+                   (value (ConstArg.value arg)))
+              (unless (shallow-type-fits? want value)
+                (type-error "const generic argument type mismatch"
+                  ["parameter" (ConstParam.name param)
+                   "expected" want "actual" value])
+                1)
+              (walk (_0 r) (snoc param done-params) (snoc arg done-args)
+                (drop 1 rest-params) (drop 1 rest-args))))))))
+  (walk world [] [] params arguments))
+
+(define (specialize-scheme-at-resolving resolve world scm arguments self-path)
+  (define params (Scheme.parameters scm))
+  (unless (arguments-match-parameters? params arguments)
+    (type-error "scheme specialization mismatch"
+      ["parameters" params "arguments" arguments])
+    1)
+  (let ((checked-world
+          (specialize-const-parameter-types resolve world params arguments)))
+    (specialize-template-resolving resolve checked-world
+      (bind-parameters params arguments) self-path (Scheme.body scm))))
+
+(define (decode-application-arguments resolve world params parts)
+  ;; This is the other /ty-ap decoding boundary.  Nothing downstream sees
+  ;; path syntax; it receives ordinary GenericArgument values.
+  (unless (Eq (Sz params) (Sz parts))
+    (type-error "type application arity mismatch"
+      ["expected" (Sz params) "actual" (Sz parts)])
+    1)
+  (foldl
+    (lambda (state pair)
+      (define param (_0 pair))
+      (define part (_1 pair))
+      (? SchemeParameter param
+        (TyParam
+          (let ((bad-const-path (ty-val-path? part)))
+            (unless (Nil bad-const-path)
+              (type-error "const path supplied for type parameter" part)
+              1)
+            ;; Resolve nested applications now.  Plain paths are validated by
+            ;; ordinary lookup as well, making bad arguments fail at the seam.
+            (let ((lr (resolve (_0 state) part)))
+              [(_0 lr) (snoc (type-arg (type-ref part)) (_1 state))])))
+        (ConstParam
+          (let ((is-const-path (ty-val-path? part)))
+            (unless is-const-path
+              (type-error "type path supplied for const parameter" part)
+              1)
+            [(_0 state) (snoc (const-arg (Ix 1 part)) (_1 state))]))))
+    [world []] (zip params parts)))
+
+(define (materialize-type-application-resolving resolve world path)
+  (unless (ground-application-path? path)
+    (type-error "application path must be canonical and ground" path)
+    1)
+  (let* ((parts (ty-ap-decode path))
+         (base (_0 parts))
+         (base-result (resolve world base))
+         (world1 (_0 base-result))
+         (generic (_1 base-result))
+         (params (Scheme.parameters (TypeEntry.scheme generic)))
+         (decoded
+           (decode-application-arguments resolve world1 params (drop 1 parts)))
+         (args (_1 decoded))
+         (body-result
+           (specialize-scheme-at-resolving resolve (_0 decoded)
+             (TypeEntry.scheme generic) args path))
+         (body (_1 body-result)))
+    (unless (resolved-type? body)
+      (type-error "materialized application is not ground" [path body])
+      1)
+    (let* ((entry
+             ($TypeEntry path base args (mono body) body
+               (TypeEntry.runtime-brand generic)
+               (TypeEntry.runtime-arity generic)
+               (TypeEntry.source generic)))
+           (world2
+             (world-with-overlays (_0 body-result)
+               (cairn:putax path entry
+                 (TypeWorld.overlays (_0 body-result))))))
+      [world2 entry])))
+
+(define (lookup-type-entry world path)
+  (need-path "bad lookup path" path)
+  (let ((direct (world-find-direct world path)))
+    (cond
+      (direct [world (_0 direct)])
+      ((ty-ap-path? path)
+        (materialize-type-application-resolving lookup-type-entry world path))
+      (else (type-error "unbound type" path)))))
+
+(define (intern-type-application world base arguments)
+  (define path (application-path base arguments))
+  (define resolved (lookup-type-entry world path))
+  [(_0 resolved) path])
+
+(define (specialize-scheme world scm arguments)
+  (specialize-scheme-at-resolving lookup-type-entry world scm arguments 0))
+
+
+;;; Weak-head views and validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (unfold-type world ref)
+  (unless (type-ref? ref)
+    (type-error "unfold-type expected Path" ref)
+    1)
+  (let* ((path (Path.p ref))
+         (cached (cairn:getax path (TypeWorld.unfold-cache world))))
+    (If cached
+      [world (_0 cached)]
+      (let* ((looked (lookup-type-entry world path))
+             (world1 (_0 looked))
+             (body (TypeEntry.body (_1 looked))))
+        (unless body
+          (type-error "cannot unfold unspecialized generic" path)
+          1)
+        [(world-with-unfold-cache world1
+           (cairn:putax path body (TypeWorld.unfold-cache world1)))
+         body]))))
+
+(define (view world typ)
+  (If (type-ref? typ) (unfold-type world typ) [world typ]))
+
+(define (runtime-key world typ)
+  (cond
+    ((type-ref? typ)
+      (let ((r (lookup-type-entry world (Path.p typ))))
+        [(_0 r)
+         [(TypeEntry.runtime-brand (_1 r))
+          (TypeEntry.runtime-arity (_1 r))]]))
+    ((type-is-tag? trow-pax typ)
+      [world [(Row.cstr typ) (Sz (Row.items typ))]])
+    (else [world 0])))
+
+(define (check-sum-runtime-keys world options)
+  (define (walk w seen rest)
+    (Ifz (Sz rest)
+      w
+      (let ((kr (runtime-key w (_0 rest))))
+        (define key (_1 kr))
+        (unless (Nil (And key (includes (Equal key) seen)))
+          (type-error "sum alternatives collide at runtime" key)
+          1)
+        (walk (_0 kr) (If key (snoc key seen) seen) (drop 1 rest)))))
+  (walk world [] options))
+
+(define (check-type-wf world typ)
+  (define (walk w t)
+    (cond
+      ((Or (type-var? t) (Or (const-var? t) (type-app? t)))
+        (type-error "template node in resolved type" t))
+      ((type-is-tag? tzero-rec-pax t)
+        (type-error "open recursion in resolved type" t))
+      ((type-ref? t)
+        (_0 (lookup-type-entry w (Path.p t))))
+      ((type-is-tag? trow-item-pax t)
+        (walk w (RowItem.value t)))
+      ((type-is-tag? trow-pax t)
+        (foldl (lambda (acc item) (walk acc (RowItem.value item)))
+          w (Row.items t)))
+      ((type-is-tag? tsum-pax t)
+        (let ((w1 (foldl walk w (Sum.options t))))
+          (check-sum-runtime-keys w1 (Sum.options t))))
+      ((type-is-tag? tfun-pax t)
+        (walk (foldl walk w (Fun.args t)) (Fun.return t)))
+      ((type-is-tag? tarr-pax t) (walk w (Arr.item t)))
+      (else w)))
+  (walk world typ))
+
+
+;;; Static subtyping and gradual consistency ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (seen-pair? actual expected seen)
+  (includes (lambda (pair)
+    (And (Equal actual (_0 pair)) (Equal expected (_1 pair)))) seen))
+
+(define (subtype-seen world seen actual expected)
+  (If (seen-pair? actual expected seen)
+    [world 1]
+    (let ((seen1 (snoc [actual expected] seen)))
+      (define (recur w a b) (subtype-seen w seen1 a b))
+      (define (all-pairs w pairs contra?)
+        (foldl
+          (lambda (state pair)
+            (Ifz (_1 state)
+              state
+              (let ((r
+                      (If contra?
+                        (recur (_0 state) (_1 pair) (_0 pair))
+                        (recur (_0 state) (_0 pair) (_1 pair)))))
+                [(_0 r) (_1 r)])))
+          [w 1] pairs))
+      (define (all-options w options target options-actual?)
+        (foldl
+          (lambda (state option)
+            (Ifz (_1 state)
+              state
+              (let ((r
+                      (If options-actual?
+                        (recur (_0 state) option target)
+                        (recur (_0 state) target option))))
+                [(_0 r) (_1 r)])))
+          [w 1] options))
+      (define (any-options w options target options-expected?)
+        (foldl
+          (lambda (state option)
+            (If (_1 state)
+              state
+              (let ((r
+                      (If options-expected?
+                        (recur (_0 state) target option)
+                        (recur (_0 state) option target))))
+                [(_0 r) (_1 r)])))
+          [w 0] options))
+      (cond
+        ((Equal actual expected) [world 1])
+        ;; Any is not static top or bottom.  It participates only in the
+        ;; separately named consistency relation below.
+        ((Or (type-is-tag? tany-pax actual)
+             (type-is-tag? tany-pax expected))
+          [world 0])
+        ((type-is-tag? tbot-pax actual) [world 1])
+        ((type-is-tag? tbot-pax expected) [world 0])
+        ;; Preserve nominal identity when equal; otherwise inspect one weak
+        ;; head layer and let the coinductive pair memo tie recursive knots.
+        ((Or (type-ref? actual) (type-ref? expected))
+          (let* ((ar (view world actual))
+                 (er (view (_0 ar) expected)))
+            (recur (_0 er) (_1 ar) (_1 er))))
+        ((type-is-tag? tsum-pax actual)
+          (all-options world (Sum.options actual) expected 1))
+        ((type-is-tag? tsum-pax expected)
+          (any-options world (Sum.options expected) actual 1))
+        ((And (type-is-tag? tconst-pax actual)
+              (type-is-tag? tnat-pax expected))
+          [world (IsNat (Const.value actual))])
+        ((And (type-is-tag? tnat-pax actual)
+              (type-is-tag? tnat-pax expected))
+          [world
+           (Or (Eq (Nat.aura actual) (Nat.aura expected))
+             (Eq 0 (Nat.aura expected)))])
+        ((And (type-is-tag? tconst-pax actual)
+              (type-is-tag? tconst-pax expected))
+          [world (Equal (Const.value actual) (Const.value expected))])
+        ((And (type-is-tag? tarr-pax actual)
+              (type-is-tag? tarr-pax expected))
+          (recur world (Arr.item actual) (Arr.item expected)))
+        ((And (type-is-tag? tfun-pax actual)
+              (type-is-tag? tfun-pax expected))
+          (Ifz (Eq (Sz (Fun.args actual)) (Sz (Fun.args expected)))
+            [world 0]
+            (let ((args-result
+                    (all-pairs world
+                      (zip (Fun.args actual) (Fun.args expected)) 1)))
+              (Ifz (_1 args-result)
+                args-result
+                (recur (_0 args-result)
+                  (Fun.return actual) (Fun.return expected))))))
+        ((And (type-is-tag? trow-pax actual)
+              (type-is-tag? trow-pax expected))
+          (Ifz (And (Eq (Row.cstr actual) (Row.cstr expected))
+                  (Eq (Sz (Row.items actual)) (Sz (Row.items expected))))
+            [world 0]
+            (all-pairs world
+              (zip (map RowItem.value (Row.items actual))
+                   (map RowItem.value (Row.items expected)))
+              0)))
+        (else [world 0])))))
+
+(define (subtype world actual expected)
+  (define key [actual expected])
+  (define cached (cairn:getax key (TypeWorld.subtype-cache world)))
+  (If cached
+    [world (_0 cached)]
+    (let ((r (subtype-seen world [] actual expected)))
+      [(world-with-subtype-cache (_0 r)
+         (cairn:putax key (_1 r) (TypeWorld.subtype-cache (_0 r))))
+       (_1 r)])))
+
+(define (subtype? world actual expected)
+  (_1 (subtype world actual expected)))
+
+(define (consistent-seen world seen a b)
+  (If (seen-pair? a b seen)
+    [world 1]
+    (let ((seen1 (snoc [a b] seen)))
+      (define (recur w x y) (consistent-seen w seen1 x y))
+      (define (all-pairs w pairs)
+        (foldl
+          (lambda (state pair)
+            (Ifz (_1 state)
+              state
+              (let ((r (recur (_0 state) (_0 pair) (_1 pair))))
+                [(_0 r) (_1 r)])))
+          [w 1] pairs))
+      (define (any-option w options target)
+        (foldl
+          (lambda (state option)
+            (If (_1 state)
+              state
+              (let ((r (recur (_0 state) option target)))
+                [(_0 r) (_1 r)])))
+          [w 0] options))
+      (cond
+        ((Equal a b) [world 1])
+        ((Or (type-is-tag? tany-pax a) (type-is-tag? tany-pax b)) [world 1])
+        ((Or (type-ref? a) (type-ref? b))
+          (let* ((av (view world a))
+                 (bv (view (_0 av) b)))
+            (recur (_0 bv) (_1 av) (_1 bv))))
+        ((type-is-tag? tsum-pax a)
+          (any-option world (Sum.options a) b))
+        ((type-is-tag? tsum-pax b)
+          (any-option world (Sum.options b) a))
+        ((And (type-is-tag? tconst-pax a) (type-is-tag? tnat-pax b))
+          [world (IsNat (Const.value a))])
+        ((And (type-is-tag? tnat-pax a) (type-is-tag? tconst-pax b))
+          [world (IsNat (Const.value b))])
+        ((And (type-is-tag? tnat-pax a) (type-is-tag? tnat-pax b))
+          [world
+           (Or (Eq 0 (Nat.aura a))
+             (Or (Eq 0 (Nat.aura b))
+               (Eq (Nat.aura a) (Nat.aura b))))])
+        ((And (type-is-tag? tconst-pax a) (type-is-tag? tconst-pax b))
+          [world (Equal (Const.value a) (Const.value b))])
+        ((And (type-is-tag? tarr-pax a) (type-is-tag? tarr-pax b))
+          (recur world (Arr.item a) (Arr.item b)))
+        ((And (type-is-tag? tfun-pax a) (type-is-tag? tfun-pax b))
+          (Ifz (Eq (Sz (Fun.args a)) (Sz (Fun.args b)))
+            [world 0]
+            (let ((args-result
+                    (all-pairs world (zip (Fun.args a) (Fun.args b)))))
+              (Ifz (_1 args-result)
+                args-result
+                (recur (_0 args-result) (Fun.return a) (Fun.return b))))))
+        ((And (type-is-tag? trow-pax a) (type-is-tag? trow-pax b))
+          (Ifz (And (Eq (Row.cstr a) (Row.cstr b))
+                  (Eq (Sz (Row.items a)) (Sz (Row.items b))))
+            [world 0]
+            (all-pairs world
+              (zip (map RowItem.value (Row.items a))
+                   (map RowItem.value (Row.items b))))))
+        (else [world 0])))))
+
+(define (consistent world a b)
+  (consistent-seen world [] a b))
+
+(define (consistent? world a b)
+  (_1 (consistent world a b)))
+
+
+;;; Weak joins and narrowing meets ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (flat-sum-options typ)
+  (If (type-is-tag? tsum-pax typ) (Sum.options typ) [typ]))
+
+(define (check-join-runtime-keys world options)
+  (define (walk w seen rest)
+    (Ifz (Sz rest)
+      w
+      (let ((kr (runtime-key w (_0 rest))))
+        (define key (_1 kr))
+        (unless key
+          (type-error "join requires an annotation (no runtime dispatch key)"
+            (_0 rest))
+          1)
+        (unless (Nil (includes (Equal key) seen))
+          (type-error "join requires an annotation (runtime key collision)" key)
+          1)
+        (walk (_0 kr) (snoc key seen) (drop 1 rest)))))
+  (walk world [] options))
+
+(define (join world a b)
+  (cond
+    ((Equal a b) [world a])
+    (else
+      (let ((ab (subtype world a b)))
+        (If (_1 ab)
+          [(_0 ab) b]
+          (let ((ba (subtype (_0 ab) b a)))
+            (If (_1 ba)
+              [(_0 ba) a]
+              (let* ((opts (Weld (flat-sum-options a) (flat-sum-options b)))
+                     (checked (check-join-runtime-keys (_0 ba) opts)))
+                [checked (tsum opts)]))))))))
+
+(define (join-type world a b) (_1 (join world a b)))
+
+(define (meet world a b)
+  (cond
+    ((Equal a b) [world a])
+    (else
+      (let ((ab (subtype world a b)))
+        (If (_1 ab)
+          [(_0 ab) a]
+          (let ((ba (subtype (_0 ab) b a)))
+            (If (_1 ba)
+              [(_0 ba) b]
+              [(_0 ba) tbot])))))))
+
+(define (meet-type world a b) (_1 (meet world a b)))
+
+
+;;; A small explicit-polymorphism bidirectional checker ;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; This is the checker kernel, deliberately independent of Foil's current SAST
+;; and legacy TC nodes.  A later elaboration adapter can translate surface
+;; syntax into these declarations without importing the old type algebra.
+
+(declare-cstr TermParam FOIL_NEW_TYPE_ROOT
+  [name (tnat 0)]
+  [annotation tany])
+
+(declare-cstr ExprField FOIL_NEW_TYPE_ROOT
+  [face (tnat 0)]
+  [value tany])
+
+(declare-cstr NameExpr FOIL_NEW_TYPE_ROOT
+  [path (tarr (tnat 0))])
+
+(declare-cstr LitExpr FOIL_NEW_TYPE_ROOT
+  [value tany])
+
+(declare-cstr AnnExpr FOIL_NEW_TYPE_ROOT
+  [expected tany]
+  [value tany])
+
+(declare-cstr CallExpr FOIL_NEW_TYPE_ROOT
+  [callee tany]
+  [arguments (tarr tany)])
+
+(declare-cstr LambdaExpr FOIL_NEW_TYPE_ROOT
+  [parameters (tarr TermParam)]
+  [body tany])
+
+(declare-cstr RowExpr FOIL_NEW_TYPE_ROOT
+  [cstr (tnat 0)]
+  [fields (tarr ExprField)])
+
+(declare-cstr IfExpr FOIL_NEW_TYPE_ROOT
+  [condition tany]
+  [yes tany]
+  [no tany])
+
+(declare-cstr SpecializeExpr FOIL_NEW_TYPE_ROOT
+  [callee tany]
+  [arguments (tarr GenericArgument)])
+
+(declare-cstr ConstructExpr FOIL_NEW_TYPE_ROOT
+  [path (tarr (tnat 0))]
+  [arguments (tarr tany)])
+
+(decl-union TypeExpr NameExpr LitExpr AnnExpr CallExpr LambdaExpr RowExpr
+  IfExpr SpecializeExpr ConstructExpr)
+
+(declare-cstr ValueBinding FOIL_NEW_TYPE_ROOT
+  [scheme Scheme]
+  [source tany])
+
+(declare-cstr CheckContext FOIL_NEW_TYPE_ROOT
+  [world TypeWorld]
+  [globals tany]
+  [locals tany]
+  [source tany])
+
+(declare-cstr Checked FOIL_NEW_TYPE_ROOT
+  [type tany]
+  [expression TypeExpr])
+
+(define name-expr $NameExpr)
+(define literal-expr $LitExpr)
+(define annotation-expr $AnnExpr)
+(define call-expr $CallExpr)
+(define lambda-expr $LambdaExpr)
+(define row-expr $RowExpr)
+(define if-expr $IfExpr)
+(define specialize-expr $SpecializeExpr)
+(define construct-expr $ConstructExpr)
+(define term-param $TermParam)
+(define expr-field $ExprField)
+(define checked-type Checked.type)
+(define checked-expression Checked.expression)
+
+(define (make-check-context world)
+  ($CheckContext world cairn:empty-ax cairn:empty-ax 0))
+
+(define (context-with-world ctx world)
+  (CheckContext.=world world ctx))
+
+(define (context-with-source ctx source)
+  (CheckContext.=source source ctx))
+
+(define (bind-global ctx path scm source)
+  (need-path "bad global value path" path)
+  (CheckContext.=globals
+    (cairn:putax path ($ValueBinding scm source) (CheckContext.globals ctx))
+    ctx))
+
+(define (bind-local ctx name scm source)
+  (CheckContext.=locals
+    (cairn:putax [name] ($ValueBinding scm source) (CheckContext.locals ctx))
+    ctx))
+
+(define (lookup-value ctx path)
+  (define local
+    (And (Eq 1 (Sz path))
+      (cairn:getax path (CheckContext.locals ctx))))
+  (define hit
+    (If local local (cairn:getax path (CheckContext.globals ctx))))
+  (unless hit
+    (type-error "unbound value" [path "at" (CheckContext.source ctx)])
+    (_0 hit)))
+
+(define (binding-check-type binding)
+  (define scm (ValueBinding.scheme binding))
+  (Ifz (Sz (Scheme.parameters scm)) (Scheme.body scm) scm))
+
+(define (expose-function world typ)
+  (cond
+    ((type-is-tag? tfun-pax typ) [world typ])
+    ((type-ref? typ)
+      (let ((v (view world typ)))
+        (expose-function (_0 v) (_1 v))))
+    (else
+      (type-error "application expected a function" typ))))
+
+(define (type-expression mode ctx expr expected)
+  (define (synth c e) (type-expression "synth" c e 0))
+  (define (check c e want) (type-expression "check" c e want))
+  (define (check-many c exprs wants)
+    (unless (Eq (Sz exprs) (Sz wants))
+      (type-error "expression arity mismatch"
+        ["expected" (Sz wants) "actual" (Sz exprs)
+         "at" (CheckContext.source c)])
+      1)
+    (foldl
+      (lambda (state pair)
+        (let ((r (check (_0 state) (_0 pair) (_1 pair))))
+          [(_0 r) (snoc (_1 r) (_1 state))]))
+      [c []] (zip exprs wants)))
+  (define (synth-many c exprs)
+    (foldl
+      (lambda (state e)
+        (let ((r (synth (_0 state) e)))
+          [(_0 r) (snoc (_1 r) (_1 state))]))
+      [c []] exprs))
+  (define (check-lambda c lam want)
+    (define viewed (view (CheckContext.world c) want))
+    (define c1 (context-with-world c (_0 viewed)))
+    (define fun (_1 viewed))
+    (define params (LambdaExpr.parameters lam))
+    (define arg-types (Fun.args fun))
+    (define extended
+      (foldl
+        (lambda (acc pair)
+          (define param (_0 pair))
+          (define arg-type (_1 pair))
+          (define ann (TermParam.annotation param))
+          (unless (Or (Nil ann)
+                    (And (subtype? (CheckContext.world acc) ann arg-type)
+                      (subtype? (CheckContext.world acc) arg-type ann)))
+            (type-error "lambda parameter annotation disagrees with goal"
+              ["parameter" (TermParam.name param)
+               "annotation" ann "expected" arg-type])
+            1)
+          (bind-local acc (TermParam.name param) (mono arg-type)
+            (CheckContext.source acc)))
+        c1 (zip params arg-types)))
+    (define body-result (check extended (LambdaExpr.body lam) (Fun.return fun)))
+    (unless (type-is-tag? tfun-pax fun)
+      (type-error "lambda requires an expected function type"
+        [want "at" (CheckContext.source c)])
+      1)
+    (unless (Eq (Sz params) (Sz arg-types))
+      (type-error "lambda arity mismatch"
+        ["expected" (Sz arg-types) "actual" (Sz params)])
+      1)
+    [(context-with-world c1 (CheckContext.world (_0 body-result)))
+     ($Checked want lam)])
+  (define (check-row c row want)
+    (define viewed (view (CheckContext.world c) want))
+    (define c1 (context-with-world c (_0 viewed)))
+    (define row-type (_1 viewed))
+    (define checked
+      (check-many c1 (map ExprField.value (RowExpr.fields row))
+        (map RowItem.value (Row.items row-type))))
+    (unless (And (type-is-tag? trow-pax row-type)
+              (Eq (RowExpr.cstr row) (Row.cstr row-type)))
+      (type-error "row literal disagrees with expected type"
+        [row want "at" (CheckContext.source c)])
+      1)
+    [(_0 checked) ($Checked want row)])
+  (If (Eq "check" mode)
+    (cond
+      ((Eq "/foil/new-types/lambdaexpr" (Hd expr))
+        (check-lambda ctx expr expected))
+      ((Eq "/foil/new-types/rowexpr" (Hd expr))
+        (check-row ctx expr expected))
+      ((Eq "/foil/new-types/ifexpr" (Hd expr))
+        (let* ((condition (check ctx (IfExpr.condition expr) (tnat 0)))
+               (yes (check (_0 condition) (IfExpr.yes expr) expected))
+               (no (check (_0 yes) (IfExpr.no expr) expected)))
+          [(_0 no) ($Checked expected expr)]))
+      (else
+        (let* ((got (synth ctx expr))
+               (rel (subtype (CheckContext.world (_0 got))
+                      (Checked.type (_1 got)) expected)))
+          (unless (_1 rel)
+            (type-error "type mismatch"
+              ["expected" expected "actual" (Checked.type (_1 got))
+               "at" (CheckContext.source ctx)])
+            1)
+          [(context-with-world (_0 got) (_0 rel))
+           ($Checked expected expr)])))
+    (? TypeExpr expr
+      (NameExpr [path]
+        (let ((binding (lookup-value ctx path)))
+          [ctx ($Checked (binding-check-type binding) expr)]))
+      (LitExpr [value]
+        [ctx ($Checked (tconst value) expr)])
+      (AnnExpr [expected value]
+        (let ((r (check ctx value expected)))
+          [(_0 r) ($Checked expected expr)]))
+      (SpecializeExpr [callee arguments]
+        (let ((callee-result (synth ctx callee)))
+          (define callee-type (Checked.type (_1 callee-result)))
+          (unless (scheme? callee-type)
+            (type-error "explicit specialization requires a scheme" callee-type)
+            1)
+          (let ((r (specialize-scheme
+                     (CheckContext.world (_0 callee-result))
+                     callee-type arguments)))
+            [(context-with-world (_0 callee-result) (_0 r))
+             ($Checked (_1 r) expr)])))
+      (CallExpr [callee arguments]
+        (let* ((callee-result (synth ctx callee))
+               (callee-type (Checked.type (_1 callee-result))))
+          (unless (Nil (scheme? callee-type))
+            (type-error "generic call requires explicit specialization"
+              callee-type)
+            1)
+          (let* ((fun-result
+                   (expose-function (CheckContext.world (_0 callee-result))
+                     callee-type))
+                 (fun (Ix 1 fun-result))
+                 (c1 (context-with-world (_0 callee-result) (_0 fun-result)))
+                 (args-result (check-many c1 arguments (Fun.args fun))))
+            [(_0 args-result) ($Checked (Fun.return fun) expr)])))
+      (LambdaExpr
+        (type-error "lambda needs an expected type or annotation" expr))
+      (RowExpr [cstr fields]
+        (let ((r (synth-many ctx (map ExprField.value fields))))
+          (define items
+            (map (lambda (pair)
+              (trow-item (ExprField.face (_0 pair)) (Checked.type (_1 pair))))
+              (zip fields (_1 r))))
+          [(_0 r) ($Checked (trow cstr items) expr)]))
+      (IfExpr [condition yes no]
+        (let* ((condition-result (check ctx condition (tnat 0)))
+               (yes-result (synth (_0 condition-result) yes))
+               (no-result (synth (_0 yes-result) no))
+               (joined
+                 (join (CheckContext.world (_0 no-result))
+                   (Checked.type (_1 yes-result))
+                   (Checked.type (_1 no-result)))))
+          [(context-with-world (_0 no-result) (_0 joined))
+           ($Checked (_1 joined) expr)]))
+      (ConstructExpr [path arguments]
+        (let* ((looked (lookup-type-entry (CheckContext.world ctx) path))
+               (entry (_1 looked))
+               (body (TypeEntry.body entry)))
+          (unless body
+            (type-error "generic constructor requires specialization" path)
+            1)
+          (unless (type-is-tag? trow-pax body)
+            (type-error "constructor entry is not a row" [path body])
+            1)
+          (let* ((c1 (context-with-world ctx (_0 looked)))
+                 (args-result
+                   (check-many c1 arguments
+                     (map RowItem.value (Row.items body)))))
+            [(_0 args-result) ($Checked (type-ref path) expr)]))))))
+
+(define (synthesize ctx expr)
+  (type-expression "synth" ctx expr 0))
+
+(define (check ctx expr expected)
+  (type-expression "check" ctx expr expected))
+
+;; Dynamic boundaries opt into consistency explicitly; ordinary checking never
+;; silently treats Any as static subtyping.
+(define (check-consistent ctx expr expected)
+  (define got (synthesize ctx expr))
+  (define rel
+    (consistent (CheckContext.world (_0 got))
+      (Checked.type (_1 got)) expected))
+  (unless (_1 rel)
+    (type-error "inconsistent dynamic boundary"
+      ["expected" expected "actual" (Checked.type (_1 got))])
+    1)
+  [(context-with-world (_0 got) (_0 rel)) ($Checked expected expr)])
