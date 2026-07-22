@@ -1,0 +1,569 @@
+
+
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind prnt (#module print))
+(#bind wisp (#module wisp))
+
+(define (ty-pax p) (strWeld "/boot/types/" p))
+
+(define (some x) ((ty-pax "maybe/some") x))
+(define none ((ty-pax "maybe/some") 0))
+
+(define (left x) ((ty-pax "either/left") x))
+(define (right x) ((ty-pax "either/right") x))
+
+(define tbot-pax (ty-pax "bot"))
+(define tbot (tbot-pax 0))
+(define (ty-not-bottom? a) (Ne (Hd a) tbot-pax))
+
+(define tany-pax (ty-pax "any"))
+(define tany (tany-pax 0))
+
+(define tnat-pax (ty-pax "nat"))
+(define (tnat aura) (tnat-pax aura))
+(define tstr (tnat "t"))
+(define tsum-pax (ty-pax "sum"))
+(define (tsum opts)
+  (define canon (uniq (sort cmp-total (filter ty-not-bottom? opts))))
+  (define sz (Sz canon))
+  (Case3 (Sz canon)
+    tbot ;; 0
+    (_0 canon)
+    (tsum-pax opts)))
+
+(define tfun-pax (ty-pax "fun"))
+(define (tfun args ret)
+  (Ifz (Sz args) ret
+    (tfun-pax args ret)))
+
+(define tconst-pax (ty-pax "const"))
+(define (tconst val) (tconst-pax val))
+
+(define trow-item-pax (ty-pax "row-item"))
+(define (trow-item face typ)
+  assert(IsNat face)
+  (trow-item-pax face typ))
+
+
+(define trow-pax (ty-pax "row"))
+(define (trow cstr vals)
+  assert(IsNat cstr)
+  (trow-pax cstr vals))
+
+
+(define tarr-pax (ty-pax "arr"))
+(define (tarr item) (tarr-pax item))
+
+(define (typed-error ctx what detail)
+  (error ["newtype" what ["at" ctx] detail]))
+
+
+;;; Shallow runtime validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (law-like? val)
+  (Or (IsLaw val)
+    (And (IsPin val) (IsLaw (Unpin val)))))
+
+;; Check only the outer representation promised by a type.  Array elements,
+;; row fields, and function arguments/results deliberately remain unchecked.
+(define (shallow-type-fits? typ val)
+  (define pax (Hd typ))
+  (cond
+    ((Eq tany-pax pax) 1)
+    ((Eq tbot-pax pax) 0)
+    ((Eq tnat-pax pax) (IsNat val))
+    ((Eq tconst-pax pax) (Equal (_0 typ) val))
+    ((Eq tfun-pax pax) (law-like? val))
+    ;; PLAN erases an empty array to the atom 0; non-empty arrays are rows.
+    ((Eq tarr-pax pax) (Or (Nil val) (is-row? val)))
+    ((Eq tsum-pax pax)
+      (any (lambda (opt) (shallow-type-fits? opt val)) (_0 typ)))
+    ((Eq trow-pax pax)
+      (define cstr (_0 typ))
+      (define fields (_1 typ))
+      (Ifz (Sz fields)
+        (Eq cstr val)
+        (And (IsApp val)
+          (And (Eq cstr (Hd val)) (Eq (Sz fields) (Sz val))))))
+    (else 0)))
+
+(define (check-constructor-field cstr face typ val)
+  (If (shallow-type-fits? typ val)
+    val
+    (error ["newtype" "constructor field type mismatch"
+            ["constructor" cstr]
+            ["face" face]
+            ["expected" typ]
+            ["actual" val]])))
+
+
+(define (handle-decl-item ctx item)
+  ;; A transformer sees the unexpanded input, so a source-level [face ty]
+  ;; still has the shape ["#brak" face ty].
+  (unless (And (IsApp item)
+            (And (Eq 0 (Hd item))
+              (And (Eq "#brak" (_0 item)) (Eq 3 (Sz item)))))
+    (typed-error ctx "bad row item" item)
+    1)
+  (define face (_1 item))
+  (define ty (_2 item))
+  (unless (IsNat face)
+    (typed-error ctx "bad row-item face" face)
+    1)
+  ;; This is syntax for a row value, not the row value itself.  The first
+  ;; atom embeds the row constructor; the face is literal data; and the type
+  ;; expression remains call-site syntax to be compiled after expansion.
+  [(1 0) (1 face) ty])
+
+
+
+(define (type-decl-transformer ctx uniq glo locals depth form)
+  (And depth (typed-error ctx "type-decl is top-level only" form))
+  (unless (Ge (Sz form) 4)
+    (typed-error ctx "bad type-decl" form) 1)
+  (define nm (_1 form))
+  (unless (IsNat nm)
+    (typed-error ctx "bad type-decl" form) 1)
+  ;; ROOT and each field type belong to the call site.  Keep them as syntax
+  ;; and build the value in the generated #bind RHS.  Only names owned by
+  ;; this macro (strWeld, trow, the row constructor, and literal data) are
+  ;; embedded as definition-site constants.
+  (define cstr-expr [(1 strWeld) (_2 form) (1 (prnt:to-lower nm))])
+  (define item-exprs (map (handle-decl-item ctx) (drop 3 form)))
+  (define items-expr (cons (1 0) item-exprs))
+  (define rhs [(1 trow) cstr-expr items-expr])
+  [uniq glo ["#bind" nm rhs]])
+
+(define ROOT "/boot/types/")
+(#macro declare-cstr type-decl-transformer)
+
+
+;; Stage 0: describe the type constructors with the small hand-written kernel
+;; above.  These declarations are ordinary row types; after $ is installed we
+;; replace the public constructor functions with implementations derived from
+;; this metadata.
+(declare-cstr Const ROOT
+  [value tany])
+
+(declare-cstr Bot ROOT
+  [value (tconst 0)])
+
+(declare-cstr Any ROOT
+  [value (tconst 0)])
+
+(declare-cstr Nat ROOT
+  [aura tany])
+
+(declare-cstr Arr ROOT
+  [item tany])
+
+;; Lower-case spelling preserves the historical /boot/types/row-item tag;
+;; expose the conventional type name as an alias for lookup by $RowItem.
+(declare-cstr row-item ROOT
+  [face tstr]
+  [value tany])
+(define RowItem row-item)
+
+(declare-cstr Row ROOT
+  [cstr (tnat 0)]
+  [items (tarr RowItem)])
+
+(declare-cstr Sum ROOT
+  [options (tarr tany)])
+
+(declare-cstr Fun ROOT
+  [args (tarr tany)]
+  [return tany])
+
+(define (row-face-transformer ctx uniq glo locals depth form)
+  (unless (Eq 3 (Sz form))
+    (typed-error ctx "bad row-face accessor" form)
+    1)
+  (define type-name (_1 form))
+  (define face (_2 form))
+  (unless (And (IsNat type-name) (IsNat face))
+    (typed-error ctx "row and face names must be symbols" form)
+    1)
+
+  ;; Resolve the declared type explicitly in the expansion-site global
+  ;; environment: Row is type syntax here, rather than an expression to be
+  ;; evaluated.
+  (define entry (wisp:glookup type-name glo))
+  (unless entry
+    (typed-error ctx "unknown row type" type-name)
+    1)
+  (define row-type (_1 (wisp:Unpin entry)))
+  (unless (And (IsApp row-type) (Eq trow-pax (Hd row-type)))
+    (typed-error ctx "not a row type" type-name)
+    1)
+
+  (define items (_1 row-type))
+  (define hit
+    (find-idx (lambda (item) (Eq face (_0 item))) items))
+  (unless hit
+    (typed-error ctx "unknown row face" [type-name face])
+    1)
+  (define index (_0 hit))
+
+  ;; Emit (Ix index), capturing Ix at the macro's definition site and
+  ;; embedding the numeric index as literal data.
+  [uniq glo [(1 Ix) (1 index)]])
+
+
+(define (constructor-check-expr cstr item arg)
+  [(1 check-constructor-field)
+   (1 cstr)
+   (1 (_0 item))
+   (1 (_1 item))
+   arg])
+
+(define (type-constructor-transformer ctx uniq glo locals depth form)
+  (unless (Eq 2 (Sz form))
+    (typed-error ctx "bad type constructor" form)
+    1)
+  (define type-name (_1 form))
+  (unless (IsNat type-name)
+    (typed-error ctx "type name must be a symbol" type-name)
+    1)
+
+  (define entry (wisp:glookup type-name glo))
+  (unless entry
+    (typed-error ctx "unknown constructor type" type-name)
+    1)
+  (define row-type (_1 (wisp:Unpin entry)))
+  (unless (And (IsApp row-type) (Eq trow-pax (Hd row-type)))
+    (typed-error ctx "constructor type is not a row" type-name)
+    1)
+
+  (define cstr (_0 row-type))
+  (define items (_1 row-type))
+  (define arity (Sz items))
+
+  ;; The generated names are not observable, but they must not capture any
+  ;; call-site locals.  Draw the self name and every argument from uniq.
+  (define names
+    (gen (Inc arity) (lambda (i) (Add uniq i))))
+  (define self (_0 names))
+  (define args (drop 1 names))
+  (define signature (cons self args))
+
+  ;; Validate every argument before constructing the branded row.  Seq makes
+  ;; the checks eager even though PLAN application arguments are lazy.
+  (define checks
+    (map (lambda (pair)
+      (constructor-check-expr cstr (_0 pair) (_1 pair)))
+      (zip items args)))
+  (define result (cons (1 cstr) args))
+  (define body
+    (foldr (lambda (check rest) [(1 Seq) check rest]) result checks))
+
+  ;; A one-field constructor constrained by Const has exactly one possible
+  ;; value.  In that case $Type is the inhabitant itself, not a unary function
+  ;; which asks the caller to redundantly supply the known constant.
+  (define singleton-const?
+    (And (Eq 1 arity)
+      (let1 field-type (_1 (_0 items))
+        (And (IsApp field-type) (Eq tconst-pax (Hd field-type))))))
+  (If singleton-const?
+    [uniq glo [(1 cstr) (1 (_0 (_1 (_0 items))))]]
+    [(Add uniq (Inc arity)) glo
+     ["#fun" "nopin" "inline" (1 type-name) signature body]]))
+
+
+
+(#macro . row-face-transformer)
+(#macro $ type-constructor-transformer)
+
+;; Preserve the stage-0 implementations as bootstrap witnesses.  All public
+;; names below this point are generated from the declarations above.
+(define bootstrap-tbot tbot)
+(define bootstrap-tany tany)
+(define bootstrap-tnat tnat)
+(define bootstrap-tsum tsum)
+(define bootstrap-tfun tfun)
+(define bootstrap-tconst tconst)
+(define bootstrap-trow-item trow-item)
+(define bootstrap-trow trow)
+(define bootstrap-tarr tarr)
+
+(define tbot $Bot)
+(define tany $Any)
+(define tnat $Nat)
+(define tstr (tnat "t"))
+(define tconst $Const)
+(define trow-item $RowItem)
+(define trow $Row)
+(define tarr $Arr)
+
+;; Sum and function types retain their canonical erasures around generated
+;; raw constructors: empty/singleton sums and zero-argument functions do not
+;; allocate a wrapper node.
+(define make-sum $Sum)
+(define make-fun $Fun)
+
+(define (tsum opts)
+  (define canon (uniq (sort cmp-total (filter ty-not-bottom? opts))))
+  (Case3 (Sz canon)
+    tbot
+    (_0 canon)
+    (make-sum canon)))
+
+(define (tfun args ret)
+  (Ifz (Sz args) ret
+    (make-fun args ret)))
+
+;; The generated layer is representation-compatible with the bootstrap seed.
+assert(Equal bootstrap-tbot tbot)
+assert(Equal bootstrap-tany tany)
+assert(Equal (bootstrap-tnat 7) (tnat 7))
+assert(Equal (bootstrap-tconst 7) (tconst 7))
+assert(Equal (bootstrap-tarr tstr) (tarr tstr))
+assert(Equal
+  (bootstrap-trow-item "face" tstr)
+  (trow-item "face" tstr))
+assert(Equal
+  (bootstrap-trow "/example" [["face" tstr]])
+  (trow "/example" [["face" tstr]]))
+assert(Eq trow-item-pax (Row.cstr RowItem))
+
+(define canonical-sum-example
+  (uniq (sort cmp-total [tany tstr])))
+assert(Equal
+  (bootstrap-tsum canonical-sum-example)
+  (tsum canonical-sum-example))
+assert(Equal
+  (bootstrap-tfun [tstr] tany)
+  (tfun [tstr] tany))
+
+
+;;; Declared unions and total matching ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (global-type ctx glo purpose name)
+  (unless (IsNat name)
+    (typed-error ctx purpose ["expected a type name" name])
+    1)
+  (define entry (wisp:glookup name glo))
+  (unless entry
+    (typed-error ctx purpose ["unknown type" name])
+    1)
+  (_1 (wisp:Unpin entry)))
+
+(define (row-type? typ)
+  (And (IsApp typ) (Eq trow-pax (Hd typ))))
+
+(define (row-contains-equal? needle row)
+  (any (lambda (x) (Equal needle x)) row))
+
+(define (duplicate-row-values? row)
+  (Ifz (Sz row) 0
+    (Or (row-contains-equal? (_0 row) (drop 1 row))
+      (duplicate-row-values? (drop 1 row)))))
+
+(define (decl-union-transformer ctx uniq glo locals depth form)
+  (And depth (typed-error ctx "decl-union is top-level only" form))
+  (unless (Ge (Sz form) 4)
+    (typed-error ctx "bad decl-union" form)
+    1)
+  (define name (_1 form))
+  (unless (IsNat name)
+    (typed-error ctx "bad union name" name)
+    1)
+
+  (define names (drop 2 form))
+  (define members
+    (map (lambda (member-name)
+      (define member
+        (global-type ctx glo "bad union member" member-name))
+      (unless (row-type? member)
+        (typed-error ctx "union member is not a constructor type"
+          [member-name member])
+        1)
+      member)
+      names))
+  (define cstrs (map (lambda (member) (_0 member)) members))
+  (unless (Nil (duplicate-row-values? cstrs))
+    (typed-error ctx "union has duplicate constructors" names)
+    1)
+
+  ;; The binding contains the already-resolved type value.  This both avoids
+  ;; a second evaluation stage and makes the declaration independent of later
+  ;; shadowing of the member names.
+  (define union-type (tsum members))
+  [uniq glo ["#bind" name (1 union-type)]])
+
+
+(define (parse-union-arm ctx glo options arm)
+  (unless (And (IsApp arm) (Eq 2 (Sz arm)))
+    (typed-error ctx "bad union match arm" arm)
+    1)
+  (define key (_0 arm))
+  (define branch (_1 arm))
+  (If (Eq "_" key)
+    ["fallthrough" branch]
+    (let1 typ (global-type ctx glo "bad union match arm" key)
+      (unless (row-type? typ)
+        (typed-error ctx "union match arm is not a constructor type"
+          [key typ])
+        1)
+      (unless (row-contains-equal? typ options)
+        (typed-error ctx "union match arm is not in the asserted union"
+          [key typ])
+        1)
+      ["typed" typ (_0 typ) branch])))
+
+(define (typed-union-arm? arm) (Eq "typed" (_0 arm)))
+(define (fallthrough-union-arm? arm) (Eq "fallthrough" (_0 arm)))
+(define (union-arm-type arm) (_1 arm))
+(define (union-arm-cstr arm) (_2 arm))
+(define (union-arm-branch arm) (_3 arm))
+
+(define (assert-union-value name typ val)
+  (If (shallow-type-fits? typ val)
+    val
+    (error ["newtype" "union match asserted type mismatch"
+            ["union" name]
+            ["expected" typ]
+            ["actual" val]])))
+
+(define (union-dispatch-arm scrutinee arm rest)
+  [(1 If)
+   [(1 Eq) (1 (union-arm-cstr arm)) [(1 Hd) scrutinee]]
+   (union-arm-branch arm)
+   rest])
+
+(define (union-match-transformer ctx uniq glo locals depth form)
+  (unless (Ge (Sz form) 4)
+    (typed-error ctx "bad union match" form)
+    1)
+  (define type-name (_1 form))
+  (define scrutinee-expr (_2 form))
+
+  (define union-type
+    (global-type ctx glo "bad asserted union" type-name))
+  (unless (And (IsApp union-type) (Eq tsum-pax (Hd union-type)))
+    (typed-error ctx "asserted type is not a union" [type-name union-type])
+    1)
+  (define options (_0 union-type))
+  (define arms
+    (map (lambda (arm) (parse-union-arm ctx glo options arm))
+      (drop 3 form)))
+  (define typed-arms (filter typed-union-arm? arms))
+  (define fallthroughs (filter fallthrough-union-arm? arms))
+
+  (unless (Nil (duplicate-row-values? (map union-arm-type typed-arms)))
+    (typed-error ctx "duplicate union match arm" form)
+    1)
+  (unless (Nil (Gt (Sz fallthroughs) 1))
+    (typed-error ctx "multiple union match fallthroughs" form)
+    1)
+  (unless (Nil (And (Sz fallthroughs)
+          (Ne "fallthrough" (_0 (Ix (Dec (Sz arms)) arms)))))
+    (typed-error ctx "union match fallthrough must be last" form)
+    1)
+
+  (define covered-types (map union-arm-type typed-arms))
+  (define missing
+    (filter (lambda (option)
+      (Nil (row-contains-equal? option covered-types)))
+      options))
+  (unless (Nil (And (Sz missing) (Nil (Sz fallthroughs))))
+    (typed-error ctx "non-total union match" [type-name missing])
+    1)
+
+  (define scrutinee uniq)
+  (define impossible
+    [(1 error)
+     (1 ["newtype" "impossible total union match" ["union" type-name]])])
+  (define fallback
+    (Ifz (Sz fallthroughs) impossible (_1 (_0 fallthroughs))))
+  (define dispatch
+    (foldr (union-dispatch-arm scrutinee) fallback typed-arms))
+  (define checked
+    [(1 assert-union-value) (1 type-name) (1 union-type) scrutinee])
+  [(Inc uniq) glo
+   ["#let" [[scrutinee scrutinee-expr]]
+    [(1 Seq) checked dispatch]]])
+
+(#macro decl-union decl-union-transformer)
+(#macro ? union-match-transformer)
+
+(declare-cstr Pair ROOT
+  [fst (tnat 0)]
+  [snd (tnat 0)])
+
+(declare-cstr Answer ROOT
+  [value (tconst 42)])
+
+(declare-cstr some ROOT
+  [p any])
+
+(declare-cstr none ROOT [p (tconst 0)])
+
+(declare-cstr left ROOT
+  [p any])
+
+(declare-cstr right ROOT
+  [p any])
+
+(decl-union maybe none some)
+(decl-union either left right)
+
+
+
+(define the-answer $Answer)
+assert(Eq "/boot/types/answer" (Hd the-answer))
+assert(Eq 42 (Answer.value the-answer))
+
+;; ($Pair 1 2) -> synthesize a constructor for Pair, check arity, and shallowly
+;; check that the arguments have the correct type
+
+(define example-pair ($Pair 1 2))
+assert(Eq 2 (Arity $Pair))
+assert(Eq "/boot/types/pair" (Hd example-pair))
+assert(Eq 1 (Pair.fst example-pair))
+assert(Eq 2 (Pair.snd example-pair))
+
+(define bad-pair
+  (Try (lambda (z) ($Pair 1 [2])) 0))
+assert(Eq 1 (Hd bad-pair))
+
+(define get-row-cstr (. Row cstr))
+(define get-row-items (. Row items))
+
+(define example-row ($Row "example/cstr" [3 4 5]))
+assert(Eq 2 (Arity $Row))
+
+(define ex-cstr (Row.cstr example-row))
+assert(Eq "example/cstr" ex-cstr)
+assert(Eq "example/cstr" (get-row-cstr example-row))
+assert(Equal [3 4 5] (get-row-items example-row))
+
+
+(decl-union PairOrRow Pair Row)
+assert(Eq tsum-pax (Hd PairOrRow))
+assert(Eq 2 (Sz (Sum.options PairOrRow)))
+
+(define (describe-pair-or-row val)
+  (? PairOrRow val
+    (Pair (Pair.snd val))
+    (Row (Sz (Row.items val)))))
+
+assert(Eq 2 (describe-pair-or-row example-pair))
+assert(Eq 3 (describe-pair-or-row example-row))
+
+(define (pair-or-fallback val)
+  (? PairOrRow val
+    (Pair "pair")
+    (_ "other")))
+
+assert(Eq "pair" (pair-or-fallback example-pair))
+assert(Eq "other" (pair-or-fallback example-row))
+
+;; The explicit assertion is still enforced when a syntactic fallthrough is
+;; present: _ covers unlisted union members, not values outside the union.
+(define bad-union-scrutinee
+  (Try (lambda (z) (pair-or-fallback tany)) 0))
+assert(Eq 1 (Hd bad-union-scrutinee))

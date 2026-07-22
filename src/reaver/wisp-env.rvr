@@ -1,0 +1,179 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;;;; Traversal and rendering for Reaver's reflected global environments.
+;;;;
+;;;; `#env` exposes the Global value at its call site.  The special `wisp`
+;;;; module supplies the matching walker from plan/global.plan, so callers do
+;;;; not need to know whether a particular namespace is represented by an
+;;;; entry, a BST, or one of the trie layers.
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind wisp (#module wisp))
+
+
+;;; Entries and traversal ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (environment-entry-fields entry)
+  (wisp:Unpin entry))
+
+(define (environment-entry-name entry)
+  (Ix 0 (environment-entry-fields entry)))
+
+(define (environment-entry-value entry)
+  (Ix 1 (environment-entry-fields entry)))
+
+(define (environment-entry-kind entry)
+  (Ix 2 (environment-entry-fields entry)))
+
+(define (environment-entry-expr entry)
+  (Ix 3 (environment-entry-fields entry)))
+
+(define (environment-entry-type entry)
+  (Ix 4 (environment-entry-fields entry)))
+
+;; Compare packed identifier text byte-by-byte.  Numeric comparison of the
+;; packed naturals is deterministic but not the alphabetical order a human
+;; expects (for example, every one-byte name sorts before every two-byte name).
+(define (environment-name-compare left right)
+  (define left-size (Bytes left))
+  (define right-size (Bytes right))
+  (define (go i)
+    (cond
+      ((And (Ge i left-size) (Ge i right-size)) 1)
+      ((Ge i left-size) 0)
+      ((Ge i right-size) 2)
+      (else
+        (define order (Cmp (Load8 i left) (Load8 i right)))
+        (If (Eq 1 order) (go (Inc i)) order))))
+  (go 0))
+
+(define (environment-entry-compare left right)
+  (environment-name-compare
+    (environment-entry-name left)
+    (environment-entry-name right)))
+
+;; Return pinned entries in stable, human-readable name order.  `gwalk` is the
+;; representation-independent boundary: it handles all Global node shapes.
+(define (environment-entries environment)
+  (define entries (wisp:gwalk environment))
+  (sort environment-entry-compare
+    (Row 0 (llen entries) entries)))
+
+;; step :: accumulator -> PinnedEntry -> accumulator
+(define (environment-fold step initial environment)
+  (foldl step initial (environment-entries environment)))
+
+;; visit :: PinnedEntry -> value
+(define (environment-map visit environment)
+  (map visit (environment-entries environment)))
+
+
+;;; Compact value rendering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (environment-printable-text? value)
+  (define (go i)
+    (Or (Ge i (Bytes value))
+      (And (Ge (Load8 i value) 32)
+        (And (Le (Load8 i value) 126)
+          (go (Inc i))))))
+  (And (IsNat value)
+    (And (Gt (Bytes value) 1) (go 0))))
+
+(define (environment-name-text name)
+  (If (And (IsNat name) (Gt (Bytes name) 0))
+    name
+    (showNat name)))
+
+(define (environment-law-text law)
+  (strcat
+    ["<law " (environment-name-text (Name law))
+     "/" (showNat (Arity law)) ">"]))
+
+;; Environment values can be very large graphs.  Summarize their outer shape
+;; instead of recursively opening every pin while printing a namespace.
+(define (environment-value-text value)
+  (cond
+    ((IsPin value)
+      (define inner (wisp:Unpin value))
+      (If (IsLaw inner)
+        (environment-law-text inner)
+        (strcat ["<pin " (environment-value-text inner) ">"])))
+    ((IsLaw value) (environment-law-text value))
+    ((IsApp value) (strcat ["<app:" (showNat (Sz value)) ">"]))
+    ((environment-printable-text? value) (strcat [34 value 34]))
+    (else (showNat value))))
+
+(define (environment-entry-flags entry)
+  (define typed? (environment-entry-type entry))
+  (If typed? " [typed]" ""))
+
+(define (environment-entry-text entry)
+  (strcat
+    ["  " (environment-entry-kind entry) " "
+     (environment-name-text (environment-entry-name entry))
+     (environment-entry-flags entry) " = "
+     (environment-value-text (environment-entry-value entry))]))
+
+(define environment-newline (strcat [10]))
+
+(define (environment-lines-text lines)
+  (define (go remaining[line rest])
+    (Ifz remaining ""
+      (Ifz rest line
+        (strcat [line environment-newline (go rest)]))))
+  (go (stream lines)))
+
+(define (environment-text environment)
+  (define entries (environment-entries environment))
+  (define body (environment-lines-text (map environment-entry-text entries)))
+  (strcat
+    ["global environment (" (showNat (Sz entries)) " bindings)"
+     (Ifz (Sz entries) "" (strcat [environment-newline body]))]))
+
+(define (print-environment-value environment)
+  (define text (environment-text environment))
+  (Seq (wisp:putStrLn text) 0))
+
+
+;;; Call-site reflection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; `#env` is compile-time reflection.  Wrapping it in a macro preserves the
+;; important call-site behavior instead of capturing this module's namespace.
+(define-syntax (current-global-environment form)
+  (If (Eq 1 (Sz form))
+    ["#env"]
+    (error ["current-global-environment" "expected-no-arguments" form])))
+
+;; With no argument, print the namespace at the macro call site.  The one-
+;; argument form is useful for nested module environments and test fixtures.
+(define-syntax (print-global-environment form)
+  (cond
+    ((Eq 1 (Sz form))
+      [(1 print-environment-value) ["#env"]])
+    ((Eq 2 (Sz form))
+      [(1 print-environment-value) (_1 form)])
+    (else
+      (error ["print-global-environment" "expected-zero-or-one-argument" form]))))
+
+
+(#export
+  environment-entry-fields
+  environment-entry-name
+  environment-entry-value
+  environment-entry-kind
+  environment-entry-expr
+  environment-entry-type
+  environment-name-compare
+  environment-entries
+  environment-fold
+  environment-map
+  environment-value-text
+  environment-entry-text
+  environment-text
+  print-environment-value
+  current-global-environment
+  print-global-environment)
