@@ -8,18 +8,132 @@
 (#bind reef (#module reef))
 (#import reef)
 
-;;; Rex implemented in Reaver.  The public representation matches the
-;;; Haskell bridge that used to live in Plan.hs:
+(#bind newtype (#module newtype))
+(#import newtype)
+
+;;; Runtime schemas ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Rex's historical wire format is already a family of branded rows.  An
+;; empty constructor root preserves those exact public tags while giving the
+;; implementation checked constructors, named projections, and closed unions.
+(define REX_TYPE_ROOT "")
+(define rex-span-type (tarr (tnat 0)))
+;; Arrays include PLAN's atom-0 empty representation.
+(define rex-row-type (tarr tany))
+
+(declare-cstr Leaf REX_TYPE_ROOT
+  [span rex-span-type]
+  [shape tany]
+  [text tstr])
+
+(declare-cstr Nest REX_TYPE_ROOT
+  [span rex-span-type]
+  [color tstr]
+  [rune tstr]
+  [kids rex-row-type])
+
+(declare-cstr Expr REX_TYPE_ROOT
+  [span rex-span-type]
+  [color tstr]
+  [kids rex-row-type])
+
+(declare-cstr Pref REX_TYPE_ROOT
+  [span rex-span-type]
+  [rune tstr]
+  [kid tany])
+
+(declare-cstr Tyte REX_TYPE_ROOT
+  [span rex-span-type]
+  [rune tstr]
+  [kids rex-row-type])
+
+(declare-cstr Bloc REX_TYPE_ROOT
+  [span rex-span-type]
+  [color tstr]
+  [rune tstr]
+  [head tany]
+  [items rex-row-type])
+
+(declare-cstr Open REX_TYPE_ROOT
+  [span rex-span-type]
+  [rune tstr]
+  [kids rex-row-type])
+
+(declare-cstr Juxt REX_TYPE_ROOT
+  [span rex-span-type]
+  [kids rex-row-type])
+
+(declare-cstr Heir REX_TYPE_ROOT
+  [span rex-span-type]
+  [kids rex-row-type])
+
+(decl-union Rex Leaf Nest Expr Pref Tyte Bloc Open Juxt Heir)
+
+;; Tagged intermediate models used by the tree parser and clump converter.
+(declare-cstr Rune REX_TYPE_ROOT
+  [span rex-span-type]
+  [rune tstr])
+
+(declare-cstr leaf-node REX_TYPE_ROOT
+  [span rex-span-type]
+  [leaf rex-row-type])
+(define LeafNode leaf-node)
+
+(declare-cstr Tree REX_TYPE_ROOT
+  [shape tstr]
+  [color tstr]
+  [span rex-span-type]
+  [nodes rex-row-type])
+
+(declare-cstr Child REX_TYPE_ROOT
+  [tree Tree])
+
+(decl-union RexNode Rune LeafNode Child)
+
+(declare-cstr Ctx REX_TYPE_ROOT
+  [value tany])
+
+(declare-cstr Quip REX_TYPE_ROOT
+  [line (tnat 0)]
+  [column (tnat 0)]
+  [offset (tnat 0)])
+
+(decl-union RexStackEntry Ctx Quip)
+
+(declare-cstr rune-elem REX_TYPE_ROOT
+  [rune tstr])
+(define RuneElem rune-elem)
+
+(declare-cstr rex-elem REX_TYPE_ROOT
+  [rex Rex])
+(define RexElem rex-elem)
+
+(declare-cstr block-elem REX_TYPE_ROOT
+  [items tany])
+(define BlockElem block-elem)
+
+(decl-union RexElement RuneElem RexElem BlockElem)
+
+(declare-cstr Ok REX_TYPE_ROOT
+  [value tany])
+
+(declare-cstr Bad REX_TYPE_ROOT
+  [reason tany])
+
+(decl-union RexResult Ok Bad)
+
+;;; Rex implemented in Reaver.  Public values are constructor-headed
+;;; applications: the tag is at Hd and the declared fields begin at Ix 0.
 ;;;
-;;;   ["leaf" span shape text]
-;;;   ["nest" span color rune kids]
-;;;   ["expr" span color kids]
-;;;   ["pref" span rune kid]
-;;;   ["tyte" span rune kids]
-;;;   ["bloc" span color rune head items]
-;;;   ["open" span rune kids]
-;;;   ["juxt" span kids]
-;;;   ["heir" span kids]
+;;;   ("leaf" span shape text)
+;;;   ("nest" span color rune kids)
+;;;   ("expr" span color kids)
+;;;   ("pref" span rune kid)
+;;;   ("tyte" span rune kids)
+;;;   ("bloc" span color rune head items)
+;;;   ("open" span rune kids)
+;;;   ("juxt" span kids)
+;;;   ("heir" span kids)
 
 ;;; Basic helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -418,27 +532,26 @@
 
 ;;; Tree model and parser ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define (rex-node-rune sp r) ["rune" sp r])
-(define (rex-node-leaf sp lf) ["leaf-node" sp lf])
-(define (rex-node-child tr) ["child" tr])
+(define rex-node-rune $Rune)
+(define rex-node-leaf $LeafNode)
+(define rex-node-child $Child)
 
-(define (rex-tree shape color span nodes)
-  ["tree" shape color span nodes])
+(define rex-tree $Tree)
 
-(define rex-tree-shape _1)
-(define rex-tree-color _2)
-(define rex-tree-span _3)
-(define rex-tree-nodes _4)
+(define rex-tree-shape Tree.shape)
+(define rex-tree-color Tree.color)
+(define rex-tree-span Tree.span)
+(define rex-tree-nodes Tree.nodes)
 (define (rex-tree-pos t) (rex-span-col (rex-tree-span t)))
 (define (rex-tree-off t) (rex-span-off (rex-tree-span t)))
 (define (rex-tree-len t) (rex-span-len (rex-tree-span t)))
 
-(define (rex-node-tag n) (_0 n))
+(define (rex-node-tag n) (Hd n))
 (define (rex-node-span n)
-  (cond
-    ((Eq (_0 n) "rune") (_1 n))
-    ((Eq (_0 n) "leaf-node") (_1 n))
-    (else (rex-tree-span (_1 n)))))
+  (? RexNode n
+    (Rune (Rune.span n))
+    (LeafNode (LeafNode.span n))
+    (Child (Tree.span (Child.tree n)))))
 
 (define (rex-node-col n)
   (rex-span-col (rex-node-span n)))
@@ -497,10 +610,10 @@
                         (max 0 (Sub (rex-ctx-end c) off)))
               (rex-ctx-nodes c))))
 
-(define (rex-stack-ctx c) ["ctx" c])
-(define (rex-stack-quip lin col off) ["quip" lin col off])
-(define (rex-stack-tag x) (_0 x))
-(define (rex-stack-val x) (_1 x))
+(define rex-stack-ctx $Ctx)
+(define rex-stack-quip $Quip)
+(define (rex-stack-tag x) (Hd x))
+(define rex-stack-val Ctx.value)
 
 (define (rex-leaf-token? ty)
   (Or (Eq ty "WORD")
@@ -564,9 +677,9 @@
             (let* ((q (_0 rest))
                    (qrest (_1 rest))
                    (tree (rex-finalize k))
-                   (qlin (_1 q))
-                   (qcol (_2 q))
-                   (qoff (_3 q))
+                   (qlin (Quip.line q))
+                   (qcol (Quip.column q))
+                   (qoff (Quip.offset q))
                    (quip (rex-tree "quip" "clear"
                                     (rex-span qlin qcol qoff (Sub (rex-ctx-end k) qoff))
                                     [(rex-node-child tree)])))
@@ -799,16 +912,19 @@
 (define (rex-dispatch tok st)
   (let* ((top (_0 st))
          (rest (_1 st)))
-    (If (Eq (rex-stack-tag top) "ctx")
-        (let* ((ctx (rex-stack-val top))
+    (? RexStackEntry top
+      (Ctx
+        (let* ((ctx (Ctx.value top))
                (ty (rex-ctx-ty ctx)))
           (cond
             ((Eq ty "clump") (rex-step-clump rex-dispatch tok ctx rest))
             ((Eq ty "poem")  (rex-step-poem rex-dispatch tok ctx rest))
             ((Eq ty "block") (rex-step-block rex-dispatch tok ctx rest))
             ((Eq ty "item")  (rex-step-item rex-dispatch tok ctx rest))
-            (else            (rex-step-spaced rex-dispatch tok ctx rest))))
-        (rex-step-quip rex-dispatch tok (_1 top) (_2 top) (_3 top) rest))))
+            (else            (rex-step-spaced rex-dispatch tok ctx rest)))))
+      (Quip
+        (rex-step-quip rex-dispatch tok
+          (Quip.line top) (Quip.column top) (Quip.offset top) rest)))))
 
 (define (rex-emit-root reset p)
   (let* ((st (rex-pop-all (_0 p)))
@@ -830,16 +946,21 @@
 ;;; Rex normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (rex-leaf-shape-bad reason)
-  ["bad" reason])
+  ($Bad reason))
+
+(define (rex-result-leaf sp shape source result)
+  (? RexResult result
+    (Ok ($Leaf sp shape (Ok.value result)))
+    (Bad ($Leaf sp (rex-leaf-shape-bad (Bad.reason result)) source))))
 
 (define (rex-classify-bad-leaf sp s)
-  ["leaf" sp
+  ($Leaf sp
    (rex-leaf-shape-bad
      (cond
        ((And (rex-str-prefix? REX_DQUOTE s) (Nil (rex-str-suffix? REX_DQUOTE s))) "unclosed-trad")
        ((And (rex-str-prefix? "''" s) (Nil (rex-str-suffix? "''" s))) "unclosed-ugly")
        (else "invalid-char")))
-   s])
+   s))
 
 (define (rex-unescape-quotes s)
   (define (go i)
@@ -874,45 +995,41 @@
   (define content-col (rex-span-col sp))
   (define ls (rex-lines body))
   (cond
-    ((Eq 0 (Sz ls)) ["ok" ""])
-    ((Eq 1 (Sz ls)) ["ok" (rex-unescape-quotes (_0 ls))])
+    ((Eq 0 (Sz ls)) ($Ok ""))
+    ((Eq 1 (Sz ls)) ($Ok (rex-unescape-quotes (_0 ls))))
     ((all (lambda (line) (rex-valid-span-line? content-col line)) (drop 1 ls))
-      ["ok" (rex-unlines
+      ($Ok (rex-unlines
               (cons (rex-unescape-quotes (_0 ls))
                     (map (lambda (line) (rex-unescape-quotes (rex-strip-n content-col line)))
-                         (drop 1 ls))))])
-    (else ["bad" "invalid-span"])))
+                         (drop 1 ls))))))
+    (else ($Bad "invalid-span"))))
 
 (define (rex-strip-tape s col rest)
   (define ls (rex-lines rest))
   (If (Eq 0 (Sz ls))
-      ["ok" ""]
+      ($Ok "")
       (let* ((last-line (Last ls))
              (body (snip ls))
              (strip-depth (rex-leading-spaces last-line))
              (after (rex-strip-n strip-depth last-line)))
         (If (And (Eq after REX_DQUOTE)
                  (all (lambda (line) (rex-valid-page-line? strip-depth line)) body))
-            ["ok" (rex-unlines
+            ($Ok (rex-unlines
                     (map (lambda (line)
                            (rex-unescape-quotes
                              (rex-strip-line-for-page strip-depth line)))
-                         body))]
-            ["bad" "invalid-page"]))))
+                         body)))
+            ($Bad "invalid-page")))))
 
 (define (rex-trad-to-rex sp s)
   (If (rex-str-prefix? REX_DQUOTE s)
       (let* ((after-open (rex-str-drop 1 s)))
         (If (rex-str-prefix? "\n" after-open)
             (let* ((r (rex-strip-tape s (rex-span-col sp) (rex-str-drop 1 after-open))))
-              (If (Eq (_0 r) "ok")
-                  ["leaf" sp "tape" (_1 r)]
-                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))
+              (rex-result-leaf sp "tape" s r))
             (let* ((r (rex-strip-cord sp s after-open)))
-              (If (Eq (_0 r) "ok")
-                  ["leaf" sp "cord" (_1 r)]
-                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))))
-      ["leaf" sp "cord" s]))
+              (rex-result-leaf sp "cord" s r))))
+      ($Leaf sp "cord" s)))
 
 (define (rex-remove-closing ticks s)
   (If (rex-str-suffix? ticks s)
@@ -925,28 +1042,28 @@
   (define content-col (Sub (Add (rex-span-col sp) n) 1))
   (define ls (rex-lines body))
   (cond
-    ((Eq 0 (Sz ls)) ["ok" ""])
-    ((Eq 1 (Sz ls)) ["ok" (rex-unescape-quotes (_0 ls))])
+    ((Eq 0 (Sz ls)) ($Ok ""))
+    ((Eq 1 (Sz ls)) ($Ok (rex-unescape-quotes (_0 ls))))
     ((all (lambda (line) (rex-valid-span-line? content-col line)) (drop 1 ls))
-      ["ok" (rex-unlines
+      ($Ok (rex-unlines
               (cons (rex-unescape-quotes (_0 ls))
                     (map (lambda (line) (rex-unescape-quotes (rex-strip-n content-col line)))
-                         (drop 1 ls))))])
-    (else ["bad" "invalid-span"])))
+                         (drop 1 ls))))))
+    (else ($Bad "invalid-span"))))
 
 (define (rex-strip-page n content)
   (define ls (rex-lines content))
   (define close-ticks (reap "'" n))
   (If (Eq 0 (Sz ls))
-      ["ok" ""]
+      ($Ok "")
       (let* ((last-line (Last ls))
              (body (snip ls))
              (strip-depth (rex-leading-spaces last-line))
              (after (rex-strip-n strip-depth last-line)))
         (If (And (Eq after close-ticks)
                  (all (lambda (line) (rex-valid-page-line? strip-depth line)) body))
-            ["ok" (rex-unlines (map (lambda (line) (rex-strip-line-for-page strip-depth line)) body))]
-            ["bad" "invalid-page"]))))
+            ($Ok (rex-unlines (map (lambda (line) (rex-strip-line-for-page strip-depth line)) body)))
+            ($Bad "invalid-page")))))
 
 (define (rex-ugly-to-rex sp s)
   (define n (rex-count-quotes s 0))
@@ -954,14 +1071,10 @@
       (let* ((after-open (rex-str-drop n s)))
         (If (rex-str-prefix? "\n" after-open)
             (let* ((r (rex-strip-page n (rex-str-drop 1 after-open))))
-              (If (Eq (_0 r) "ok")
-                  ["leaf" sp "page" (_1 r)]
-                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))
+              (rex-result-leaf sp "page" s r))
             (let* ((r (rex-strip-span sp n after-open)))
-              (If (Eq (_0 r) "ok")
-                  ["leaf" sp "span" (_1 r)]
-                  ["leaf" sp (rex-leaf-shape-bad (_1 r)) s]))))
-      ["leaf" sp "span" s]))
+              (rex-result-leaf sp "span" s r))))
+      ($Leaf sp "span" s)))
 
 (define (rex-strip-slug-line s)
   (cond
@@ -976,10 +1089,10 @@
   (define tag (rex-leaf-tag lf))
   (define s (rex-leaf-text lf))
   (cond
-    ((Eq tag "word") ["leaf" sp "word" s])
+    ((Eq tag "word") ($Leaf sp "word" s))
     ((Eq tag "trad") (rex-trad-to-rex sp s))
     ((Eq tag "ugly") (rex-ugly-to-rex sp s))
-    ((Eq tag "slug") ["leaf" sp "slug" (rex-strip-slug s)])
+    ((Eq tag "slug") ($Leaf sp "slug" (rex-strip-slug s)))
     (else (rex-classify-bad-leaf sp s))))
 
 (define rex-rune-seq ";,:#$`~@?\\|^&=!<>+-*/%!.")
@@ -1016,77 +1129,91 @@
   (Ifz elems 0
     (let* ((e (_0 elems))
            (tail (rex-sorted-runes (_1 elems))))
-      (If (Eq (_0 e) "rune-elem")
-          (rex-insert-rune (_1 e) tail)
-          tail))))
+      (? RexElement e
+        (RuneElem (rex-insert-rune (RuneElem.rune e) tail))
+        (_ tail)))))
 
-(define (rex-elem-rune r) ["rune-elem" r])
-(define (rex-elem-rex r)  ["rex-elem" r])
-(define (rex-elem-block items) ["block-elem" items])
+(define rex-elem-rune $RuneElem)
+(define rex-elem-rex $RexElem)
+(define rex-elem-block $BlockElem)
+(define (rex-element-tag e) (Hd e))
 
 (define (rex-split-on-rune rune elems)
   (define (go acc xs)
     (Ifz xs [(lrev acc) 0]
       (let* ((e (_0 xs)))
-        (If (And (Eq (_0 e) "rune-elem") (Eq (_1 e) rune))
-            [(lrev acc) (go 0 (_1 xs))]
-            (go (lcons e acc) (_1 xs))))))
+        (? RexElement e
+          (RuneElem
+            (If (Eq (RuneElem.rune e) rune)
+                [(lrev acc) (go 0 (_1 xs))]
+                (go (lcons e acc) (_1 xs))))
+          (_ (go (lcons e acc) (_1 xs)))))))
   (go 0 elems))
 
 (define (rex-apply-color sp color rex)
   (If (Eq color "clear") rex
-      (cond
-        ((And (Eq (_0 rex) "nest") (Eq (_2 rex) "clear"))
-          ["nest" sp color (_3 rex) (_4 rex)])
-        ((And (Eq (_0 rex) "expr") (Eq (_2 rex) "clear"))
-          ["expr" sp color (_3 rex)])
-        ((And (Eq (_0 rex) "bloc") (Eq (_2 rex) "clear"))
-          ["bloc" sp color (_3 rex) (_4 rex) (_5 rex)])
-        (else ["expr" sp color [rex]]))))
+      (? Rex rex
+        (Nest
+          (If (Eq (Nest.color rex) "clear")
+              ($Nest sp color (Nest.rune rex) (Nest.kids rex))
+              ($Expr sp color [rex])))
+        (Expr
+          (If (Eq (Expr.color rex) "clear")
+              ($Expr sp color (Expr.kids rex))
+              ($Expr sp color [rex])))
+        (Bloc
+          (If (Eq (Bloc.color rex) "clear")
+              ($Bloc sp color (Bloc.rune rex) (Bloc.head rex) (Bloc.items rex))
+              ($Expr sp color [rex])))
+        (_ ($Expr sp color [rex])))))
 
 (define (rex-node-to-elem convert src block-off node)
-  (cond
-    ((Eq (_0 node) "rune")
-      (rex-elem-rune (_2 node)))
-    ((Eq (_0 node) "leaf-node")
-      (rex-elem-rex (rex-leaf-to-rex (_1 node) (_2 node))))
-    (else
-      (let* ((tree (_1 node)))
+  (? RexNode node
+    (Rune
+      (rex-elem-rune (Rune.rune node)))
+    (LeafNode
+      (rex-elem-rex
+        (rex-leaf-to-rex (LeafNode.span node) (LeafNode.leaf node))))
+    (Child
+      (let* ((tree (Child.tree node)))
         (If (Eq (rex-tree-shape tree) "block")
-            (rex-elem-block (map _1 (filter (lambda (n) (Eq (_0 n) "child"))
-                                            (rex-tree-nodes tree))))
+            (rex-elem-block
+              (map Child.tree
+                (filter (lambda (n) (Eq (Hd n) "child"))
+                  (rex-tree-nodes tree))))
             (rex-elem-rex (convert src block-off tree)))))))
 
 (define (rex-convert-node convert src block-off node)
-  (cond
-    ((Eq (_0 node) "leaf-node") (rex-leaf-to-rex (_1 node) (_2 node)))
-    ((Eq (_0 node) "child") (convert src block-off (_1 node)))
-    (else (rex-error ["bare-rune" node]))))
+  (? RexNode node
+    (LeafNode
+      (rex-leaf-to-rex (LeafNode.span node) (LeafNode.leaf node)))
+    (Child (convert src block-off (Child.tree node)))
+    (Rune (rex-error ["bare-rune" node]))))
 
 (define (rex-merge-blocks-go convert src block-off acc xs)
   (cond
     ((Nil xs) (lrev acc))
-    ((And (Eq (_0 (_0 xs)) "rex-elem")
+    ((And (Eq (rex-element-tag (_0 xs)) "rex-elem")
           (And (_1 xs)
-               (And (Eq (_0 (_0 (_1 xs))) "rune-elem")
+               (And (Eq (rex-element-tag (_0 (_1 xs))) "rune-elem")
                     (And (_1 (_1 xs))
-                         (Eq (_0 (_0 (_1 (_1 xs)))) "block-elem")))))
-      (let* ((hd (_1 (_0 xs)))
-             (r (_1 (_0 (_1 xs))))
-             (items (_1 (_0 (_1 (_1 xs)))))
-             (bloc ["bloc" rex-no-span "clear" r hd
-                    (Row 0 (llen items)
-                         (lmap (lambda (t) (convert src block-off t)) items))]))
+                         (Eq (rex-element-tag (_0 (_1 (_1 xs)))) "block-elem")))))
+      (let* ((hd (RexElem.rex (_0 xs)))
+             (r (RuneElem.rune (_0 (_1 xs))))
+             (items (BlockElem.items (_0 (_1 (_1 xs)))))
+             (bloc ($Bloc rex-no-span "clear" r hd
+                    (rowify
+                      (lmap (lambda (t) (convert src block-off t)) items)))))
         (rex-merge-blocks-go convert src block-off
                              (lcons (rex-elem-rex bloc) acc)
                              (_1 (_1 (_1 xs))))))
-    ((And (Eq (_0 (_0 xs)) "rune-elem")
-          (And (_1 xs) (Eq (_0 (_0 (_1 xs))) "block-elem")))
-      (let* ((r (_1 (_0 xs)))
-             (items (_1 (_0 (_1 xs))))
-             (bloc ["bloc" rex-no-span "clear" r ["expr" rex-no-span "clear" []]
-                    (Row 0 (llen items)
-                         (lmap (lambda (t) (convert src block-off t)) items))]))
+    ((And (Eq (rex-element-tag (_0 xs)) "rune-elem")
+          (And (_1 xs) (Eq (rex-element-tag (_0 (_1 xs))) "block-elem")))
+      (let* ((r (RuneElem.rune (_0 xs)))
+             (items (BlockElem.items (_0 (_1 xs))))
+             (bloc ($Bloc rex-no-span "clear" r ($Expr rex-no-span "clear" [])
+                    (rowify
+                      (lmap (lambda (t) (convert src block-off t)) items)))))
         (rex-merge-blocks-go convert src block-off
                              (lcons (rex-elem-rex bloc) acc)
                              (_1 (_1 xs)))))
@@ -1098,22 +1225,23 @@
 
 (define (rex-infix-recur sp runes elems)
   (cond
-    ((And (Eq 1 (llen elems)) (Eq (_0 (_0 elems)) "rex-elem"))
-      (_1 (_0 elems)))
+    ((And (Eq 1 (llen elems)) (Eq (rex-element-tag (_0 elems)) "rex-elem"))
+      (RexElem.rex (_0 elems)))
     ((Nil runes)
-      (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+      (let* ((rs (lmap RexElem.rex
+                   (lfilter (lambda (e) (Eq (rex-element-tag e) "rex-elem")) elems))))
         (If (Eq 1 (llen rs)) (_0 rs)
-            ["expr" sp "clear" (rowify rs)])))
+            ($Expr sp "clear" (rowify rs)))))
     (else
       (let* ((rune (_0 runes))
              (groups (rex-split-on-rune rune elems)))
         (If (Nil (_1 groups))
             (rex-infix-recur sp (_1 runes) (_0 groups))
             (let* ((parts (lfilter (lambda (g) (Nil (Nil g))) groups)))
-              ["nest" sp "clear" rune
-               (Row 0 (llen parts)
-                    (lmap (lambda (g) (rex-infix-recur sp (_1 runes) g))
-                          parts))]))))))
+              ($Nest sp "clear" rune
+               (rowify
+                 (lmap (lambda (g) (rex-infix-recur sp (_1 runes) g))
+                   parts)))))))))
 
 (define (rex-spaced-group convert src block-off sp color nodes)
   (let* ((elems (rex-merge-blocks convert src block-off
@@ -1121,29 +1249,31 @@
                         (stream nodes))))
          (runes (rex-sorted-runes elems)))
     (If (Nil runes)
-        (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
+        (let* ((rs (lmap RexElem.rex
+                     (lfilter (lambda (e) (Eq (rex-element-tag e) "rex-elem")) elems))))
           (cond
-            ((Nil rs) ["expr" sp color []])
+            ((Nil rs) ($Expr sp color []))
             ((Nil (_1 rs)) (rex-apply-color sp color (_0 rs)))
-            (else ["expr" sp color (rowify rs)])))
+            (else ($Expr sp color (rowify rs)))))
         (rex-apply-color sp color (rex-infix-recur sp runes elems)))))
 
 (define (rex-extract-block nodes)
   (If (Lt (Sz nodes) 2) 0
       (let* ((last-node (Last nodes))
              (prev (Ix (Sub (Sz nodes) 2) nodes)))
-        (If (And (Eq (_0 last-node) "child")
-                 (And (Eq (rex-tree-shape (_1 last-node)) "block")
-                      (Eq (_0 prev) "rune")))
+        (If (And (Eq (rex-node-tag last-node) "child")
+                 (And (Eq (rex-tree-shape (Child.tree last-node)) "block")
+                      (Eq (rex-node-tag prev) "rune")))
             [(take (Sub (Sz nodes) 2) nodes)
-             (_2 prev)
-             (map _1 (filter (lambda (n) (Eq (_0 n) "child"))
-                             (rex-tree-nodes (_1 last-node))))]
+             (Rune.rune prev)
+             (map Child.tree
+               (filter (lambda (n) (Eq (rex-node-tag n) "child"))
+                 (rex-tree-nodes (Child.tree last-node))))]
             0))))
 
 (define (rex-spaced-head convert src block-off nodes)
   (cond
-    ((Eq 0 (Sz nodes)) ["expr" rex-no-span "clear" []])
+    ((Eq 0 (Sz nodes)) ($Expr rex-no-span "clear" []))
     ((Eq 1 (Sz nodes)) (rex-convert-node convert src block-off (_0 nodes)))
     (else (rex-spaced-group convert src block-off rex-no-span "clear" nodes))))
 
@@ -1153,14 +1283,14 @@
         (let* ((head-nodes (_0 blk))
                (rune (_1 blk))
                (block-children (_2 blk)))
-          ["bloc" sp color rune
+          ($Bloc sp color rune
            (rex-spaced-head convert src block-off head-nodes)
-           (map (lambda (t) (convert src block-off t)) block-children)])
+           (map (lambda (t) (convert src block-off t)) block-children)))
         (rex-spaced-group convert src block-off sp color nodes))))
 
 (define (rex-convert-nest convert src block-off sp color nodes)
   (cond
-    ((Eq 0 (Sz nodes)) ["expr" sp color []])
+    ((Eq 0 (Sz nodes)) ($Expr sp color []))
     ((Eq 1 (Sz nodes)) (rex-apply-color sp color (rex-convert-node convert src block-off (_0 nodes))))
     (else (rex-convert-spaced convert src block-off sp color nodes))))
 
@@ -1168,53 +1298,60 @@
   (cond
     ((Nil acc) rest)
     ((Nil (_1 acc)) (lcons (rex-elem-rex (_0 acc)) rest))
-    (else (lcons (rex-elem-rex ["juxt" sp (rowify (lrev acc))]) rest))))
+    (else (lcons (rex-elem-rex ($Juxt sp (rowify (lrev acc)))) rest))))
 
 (define (rex-clump-juxt sp acc elems)
   (Ifz elems
       (rex-juxt-collapse sp acc 0)
       (let* ((e (_0 elems)))
         (cond
-          ((Eq (_0 e) "rune-elem")
+          ((Eq (rex-element-tag e) "rune-elem")
             (rex-juxt-collapse sp acc (lcons e (rex-clump-juxt sp 0 (_1 elems)))))
-          ((Eq (_0 e) "rex-elem")
-            (rex-clump-juxt sp (lcons (_1 e) acc) (_1 elems)))
+          ((Eq (rex-element-tag e) "rex-elem")
+            (rex-clump-juxt sp (lcons (RexElem.rex e) acc) (_1 elems)))
           (else
             (rex-clump-juxt sp acc (_1 elems)))))))
 
 (define (rex-clump-tight-go sp runes elems)
   (cond
-    ((And (Eq 1 (llen elems)) (Eq (_0 (_0 elems)) "rex-elem")) (_1 (_0 elems)))
+    ((And (Eq 1 (llen elems)) (Eq (rex-element-tag (_0 elems)) "rex-elem"))
+      (RexElem.rex (_0 elems)))
     ((Nil runes)
-      (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
-        (If (Nil (_1 rs)) (_0 rs) ["expr" sp "clear" (rowify rs)])))
+      (let* ((rs (lmap RexElem.rex
+                   (lfilter (lambda (e) (Eq (rex-element-tag e) "rex-elem")) elems))))
+        (If (Nil (_1 rs)) (_0 rs) ($Expr sp "clear" (rowify rs)))))
     (else
       (let* ((kids (lmap (lambda (g) (rex-clump-tight-go sp (_1 runes) g))
                          (rex-split-on-rune (_0 runes) elems))))
-        (If (Nil (_1 kids)) (_0 kids) ["tyte" sp (_0 runes) (rowify kids)])))))
+        (If (Nil (_1 kids)) (_0 kids) ($Tyte sp (_0 runes) (rowify kids)))))))
 
 (define (rex-clump-tight sp elems)
   (let* ((runes (rex-sorted-runes elems)))
     (If (Nil runes)
-        (let* ((rs (lmap _1 (lfilter (lambda (e) (Eq (_0 e) "rex-elem")) elems))))
-          (If (Nil (_1 rs)) (_0 rs) ["expr" sp "clear" (rowify rs)]))
+        (let* ((rs (lmap RexElem.rex
+                     (lfilter (lambda (e) (Eq (rex-element-tag e) "rex-elem")) elems))))
+          (If (Nil (_1 rs)) (_0 rs) ($Expr sp "clear" (rowify rs))))
         (rex-clump-tight-go sp runes elems))))
 
 (define (rex-convert-clump-top sp es)
   (cond
-    ((And (Eq 1 (llen es)) (Eq (_0 (_0 es)) "rex-elem"))
-      (_1 (_0 es)))
-    ((And (Eq (_0 (_0 es)) "rune-elem")
-          (And (_1 es) (Eq (_0 (_0 (_1 es))) "rex-elem")))
+    ((And (Eq 1 (llen es)) (Eq (rex-element-tag (_0 es)) "rex-elem"))
+      (RexElem.rex (_0 es)))
+    ((And (Eq (rex-element-tag (_0 es)) "rune-elem")
+          (And (_1 es) (Eq (rex-element-tag (_0 (_1 es))) "rex-elem")))
       (rex-convert-clump-top sp
-        (lcons (rex-elem-rex ["pref" sp (_1 (_0 es)) (_1 (_0 (_1 es)))])
+        (lcons (rex-elem-rex
+                 ($Pref sp
+                   (RuneElem.rune (_0 es))
+                   (RexElem.rex (_0 (_1 es)))))
                (_1 (_1 es)))))
-    ((Eq (_0 (_0 es)) "rune-elem")
-      ["pref" sp (_1 (_0 es)) (rex-convert-clump-top sp (_1 es))])
+    ((Eq (rex-element-tag (_0 es)) "rune-elem")
+      ($Pref sp (RuneElem.rune (_0 es)) (rex-convert-clump-top sp (_1 es))))
     (else
       (let* ((collapsed (rex-clump-juxt sp 0 es)))
-        (If (And (Eq 1 (llen collapsed)) (Eq (_0 (_0 collapsed)) "rex-elem"))
-            (_1 (_0 collapsed))
+        (If (And (Eq 1 (llen collapsed))
+                 (Eq (rex-element-tag (_0 collapsed)) "rex-elem"))
+            (RexElem.rex (_0 collapsed))
             (rex-clump-tight sp collapsed))))))
 
 (define (rex-convert-clump convert src block-off sp nodes)
@@ -1231,25 +1368,27 @@
   (rex-split-heir-go pos 0 (stream nodes)))
 
 (define (rex-flatten-heir r)
-  (If (Eq (_0 r) "heir") (stream (_2 r)) [r 0]))
+  (? Rex r
+    (Heir (stream (Heir.kids r)))
+    (_ [r 0])))
 
 (define (rex-concat-flattened rs)
   (lcat (lmap rex-flatten-heir rs)))
 
 (define (rex-mk-heir sp rs)
-  (If (Nil (_1 rs)) (_0 rs) ["heir" sp (rowify rs)]))
+  (If (Nil (_1 rs)) (_0 rs) ($Heir sp (rowify rs))))
 
 (define (rex-convert-poem convert src block-off sp pos nodes)
   (If (Eq 0 (Sz nodes))
       (rex-error "empty-poem")
       (let* ((first (_0 nodes)))
-        (cond
-          ((Eq (_0 first) "rune")
+        (? RexNode first
+          (Rune
             (let* ((split (rex-split-heir pos (drop 1 nodes)))
                    (children (_0 split))
                    (heir-nodes (_1 split))
-                   (open ["open" sp (_2 first)
-                          (map (lambda (n) (rex-convert-node convert src block-off n)) children)]))
+                   (open ($Open sp (Rune.rune first)
+                          (map (lambda (n) (rex-convert-node convert src block-off n)) children))))
               (If (Eq 0 (Sz heir-nodes))
                   open
                   (rex-mk-heir sp
@@ -1257,19 +1396,20 @@
                       (rex-concat-flattened
                         (lmap (lambda (n) (rex-convert-node convert src block-off n))
                               (stream heir-nodes))))))))
-          ((Eq (_0 first) "leaf-node")
-            (let* ((slug (rex-leaf-to-rex (_1 first) (_2 first)))
+          (LeafNode
+            (let* ((slug (rex-leaf-to-rex
+                           (LeafNode.span first) (LeafNode.leaf first)))
                    (flattened (rex-concat-flattened
                                 (lmap (lambda (n) (rex-convert-node convert src block-off n))
                                       (stream (drop 1 nodes))))))
               (rex-mk-heir sp (lcons slug flattened))))
-          (else (rex-error "poem-start"))))))
+          (Child (rex-error "poem-start"))))))
 
 (define (rex-quip-to-rex src block-off tree)
   (let* ((qoff (rex-tree-off tree))
          (qlen (rex-tree-len tree))
          (s (rex-str-slice (Sub qoff block-off) qlen src)))
-    ["leaf" (rex-tree-span tree) "quip" (rex-normalize-quip-indent s)]))
+    ($Leaf (rex-tree-span tree) "quip" (rex-normalize-quip-indent s))))
 
 (define (rex-convert-with src block-off tree)
   (let* ((sh (rex-tree-shape tree))
@@ -1325,28 +1465,34 @@
 ;;; Final three-case normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (rex-normal-empty-clear-nest? r)
-  (And (Eq (_0 r) "nest")
-       (And (Eq (_2 r) "clear")
-            (And (Eq (_3 r) "")
-                 (Eq 0 (Sz (_4 r)))))))
+  (? Rex r
+    (Nest
+      (And (Eq (Nest.color r) "clear")
+        (And (Eq (Nest.rune r) "")
+          (Eq 0 (Sz (Nest.kids r))))))
+    (_ 0)))
 
 (define (rex-normal-clear-nest? r)
-  (And (Eq (_0 r) "nest") (Eq (_2 r) "clear")))
+  (? Rex r
+    (Nest (Eq (Nest.color r) "clear"))
+    (_ 0)))
 
 (define (rex-normalize-juxt-kid norm r)
   (let* ((n (norm r)))
-    (If (Eq (_0 n) "juxt") (stream (_2 n)) (lcons n 0))))
+    (? Rex n
+      (Juxt (stream (Juxt.kids n)))
+      (_ (lcons n 0)))))
 
 (define (rex-normalize-juxt norm sp kids)
-  ["juxt" sp (rowify (lcat (lmap (rex-normalize-juxt-kid norm) (stream kids))))])
+  ($Juxt sp (rowify (lcat (lmap (rex-normalize-juxt-kid norm) (stream kids))))))
 
 (define (rex-normalize-expr norm sp color kids)
   (let* ((norm-kids (map norm kids)))
     (If (And (Eq 1 (Sz norm-kids))
              (rex-normal-clear-nest? (_0 norm-kids)))
         (let* ((kid (_0 norm-kids)))
-          ["nest" sp color (_3 kid) (_4 kid)])
-        ["nest" sp color "" norm-kids])))
+          ($Nest sp color (Nest.rune kid) (Nest.kids kid)))
+        ($Nest sp color "" norm-kids))))
 
 (define (rex-normalize-bloc norm sp color rune head items)
   (let* ((norm-head (norm head))
@@ -1354,29 +1500,34 @@
          (kids (If (rex-normal-empty-clear-nest? norm-head)
                    norm-items
                    (rowify (lcons norm-head (stream norm-items))))))
-    ["nest" sp color rune kids]))
+    ($Nest sp color rune kids)))
 
 (define (NormalizeRex r)
-  (define tag (_0 r))
-  (cond
-    ((Eq tag "leaf") r)
-    ((Eq tag "nest")
-      ["nest" (_1 r) (_2 r) (_3 r) (map NormalizeRex (_4 r))])
-    ((Eq tag "expr")
-      (rex-normalize-expr NormalizeRex (_1 r) (_2 r) (_3 r)))
-    ((Eq tag "pref")
-      ["nest" (_1 r) "clear" (_2 r) [(NormalizeRex (_3 r))]])
-    ((Eq tag "tyte")
-      ["nest" (_1 r) "clear" (_2 r) (map NormalizeRex (_3 r))])
-    ((Eq tag "bloc")
-      (rex-normalize-bloc NormalizeRex (_1 r) (_2 r) (_3 r) (_4 r) (_5 r)))
-    ((Eq tag "open")
-      ["nest" (_1 r) "clear" (_2 r) (map NormalizeRex (_3 r))])
-    ((Eq tag "juxt")
-      (rex-normalize-juxt NormalizeRex (_1 r) (_2 r)))
-    ((Eq tag "heir")
-      (rex-normalize-juxt NormalizeRex (_1 r) (_2 r)))
-    (else (rex-error ["bad-rex-normalize" r]))))
+  (? Rex r
+    (Leaf r)
+    (Nest
+      ($Nest (Nest.span r) (Nest.color r) (Nest.rune r)
+        (map NormalizeRex (Nest.kids r))))
+    (Expr
+      (rex-normalize-expr NormalizeRex
+        (Expr.span r) (Expr.color r) (Expr.kids r)))
+    (Pref
+      ($Nest (Pref.span r) "clear" (Pref.rune r)
+        [(NormalizeRex (Pref.kid r))]))
+    (Tyte
+      ($Nest (Tyte.span r) "clear" (Tyte.rune r)
+        (map NormalizeRex (Tyte.kids r))))
+    (Bloc
+      (rex-normalize-bloc NormalizeRex
+        (Bloc.span r) (Bloc.color r) (Bloc.rune r)
+        (Bloc.head r) (Bloc.items r)))
+    (Open
+      ($Nest (Open.span r) "clear" (Open.rune r)
+        (map NormalizeRex (Open.kids r))))
+    (Juxt
+      (rex-normalize-juxt NormalizeRex (Juxt.span r) (Juxt.kids r)))
+    (Heir
+      (rex-normalize-juxt NormalizeRex (Heir.span r) (Heir.kids r)))))
 
 (define (ParseRexNorm src)
   (NormalizeRex (ParseRex src)))
@@ -1412,20 +1563,25 @@
       (Add (sum (map width kids)) (Dec (Sz kids)))))
 
 (define (rex-min-width r)
-  (define tag (_0 r))
-  (cond
-    ((Eq tag "leaf") (rex-leaf-width (_2 r) (_3 r)))
-    ((Eq tag "nest") (Add (Add 3 (Bytes (_3 r))) (rex-children-width rex-min-width (_4 r))))
-    ((Eq tag "expr") (Add 2 (rex-children-width rex-min-width (_3 r))))
-    ((Eq tag "pref") (Add (Bytes (_2 r)) (rex-min-width (_3 r))))
-    ((Eq tag "tyte") (Add (sum (map rex-min-width (_3 r)))
-                          (Mul (Bytes (_2 r)) (Dec (Sz (_3 r))))))
-    ((Eq tag "bloc") (Add (Add (Bytes (_3 r)) 1)
-                          (Add (rex-min-width (_4 r)) (rex-children-width rex-min-width (_5 r)))))
-    ((Eq tag "open") (Add (Add (Bytes (_2 r)) 1) (rex-children-width rex-min-width (_3 r))))
-    ((Eq tag "juxt") (sum (map rex-min-width (_2 r))))
-    ((Eq tag "heir") (rex-children-width rex-min-width (_2 r)))
-    (else 0)))
+  (? Rex r
+    (Leaf (rex-leaf-width (Leaf.shape r) (Leaf.text r)))
+    (Nest
+      (Add (Add 3 (Bytes (Nest.rune r)))
+        (rex-children-width rex-min-width (Nest.kids r))))
+    (Expr (Add 2 (rex-children-width rex-min-width (Expr.kids r))))
+    (Pref (Add (Bytes (Pref.rune r)) (rex-min-width (Pref.kid r))))
+    (Tyte
+      (Add (sum (map rex-min-width (Tyte.kids r)))
+        (Mul (Bytes (Tyte.rune r)) (Dec (Sz (Tyte.kids r))))))
+    (Bloc
+      (Add (Add (Bytes (Bloc.rune r)) 1)
+        (Add (rex-min-width (Bloc.head r))
+          (rex-children-width rex-min-width (Bloc.items r)))))
+    (Open
+      (Add (Add (Bytes (Open.rune r)) 1)
+        (rex-children-width rex-min-width (Open.kids r))))
+    (Juxt (sum (map rex-min-width (Juxt.kids r))))
+    (Heir (rex-children-width rex-min-width (Heir.kids r)))))
 
 (define (rex-bracket-open color)
   (cond
@@ -1487,17 +1643,22 @@
     (else s)))
 
 (define (rex-closed? r)
-  (define tag (_0 r))
-  (Or (Eq tag "leaf")
-      (Or (Eq tag "nest")
-          (Or (Eq tag "expr")
-              (Or (Eq tag "pref")
-                  (Or (Eq tag "tyte") (Eq tag "juxt")))))))
+  (? Rex r
+    (Leaf 1)
+    (Nest 1)
+    (Expr 1)
+    (Pref 1)
+    (Tyte 1)
+    (Juxt 1)
+    (_ 0)))
 
 (define (rex-force-vertical? r)
-  (Or (And (Eq (_0 r) "leaf") (Eq (_2 r) "slug"))
-      (Or (Eq (_0 r) "open")
-          (Or (Eq (_0 r) "bloc") (Eq (_0 r) "heir")))))
+  (? Rex r
+    (Leaf (Eq (Leaf.shape r) "slug"))
+    (Open 1)
+    (Bloc 1)
+    (Heir 1)
+    (_ 0)))
 
 (define (rex-any-open-then-more kids)
   (If (Le (Sz kids) 1) 0
@@ -1560,22 +1721,62 @@
         (strcat [(rex-bracket-open color) body (rex-bracket-close color)]))))
 
 (define (rex-print r)
-  (define tag (_0 r))
-  (cond
-    ((Eq tag "leaf") (rex-print-leaf (_2 r) (_3 r)))
-    ((Eq tag "nest") (rex-print-nest rex-print (_2 r) (_3 r) (_4 r)))
-    ((Eq tag "expr") (rex-print-expr rex-print (_2 r) (_3 r)))
-    ((Eq tag "pref") (strcat [(_2 r) (rex-print-tight rex-print (_3 r))]))
-    ((Eq tag "tyte") (rex-join-printed rex-print (_2 r) (_3 r) 1))
-    ((Eq tag "juxt") (rex-join-printed rex-print "" (_2 r) 1))
-    ((Eq tag "open") (rex-print-open rex-print (_2 r) (_3 r)))
-    ((Eq tag "heir") (rex-print-heir rex-print (_2 r)))
-    ((Eq tag "bloc") (rex-print-bloc rex-print (_2 r) (_3 r) (_4 r) (_5 r)))
-    (else (rex-error ["bad-rex-print" r]))))
+  (? Rex r
+    (Leaf (rex-print-leaf (Leaf.shape r) (Leaf.text r)))
+    (Nest
+      (rex-print-nest rex-print
+        (Nest.color r) (Nest.rune r) (Nest.kids r)))
+    (Expr
+      (rex-print-expr rex-print (Expr.color r) (Expr.kids r)))
+    (Pref
+      (strcat [(Pref.rune r) (rex-print-tight rex-print (Pref.kid r))]))
+    (Tyte
+      (rex-join-printed rex-print (Tyte.rune r) (Tyte.kids r) 1))
+    (Juxt
+      (rex-join-printed rex-print "" (Juxt.kids r) 1))
+    (Open
+      (rex-print-open rex-print (Open.rune r) (Open.kids r)))
+    (Heir
+      (rex-print-heir rex-print (Heir.kids r)))
+    (Bloc
+      (rex-print-bloc rex-print
+        (Bloc.color r) (Bloc.rune r) (Bloc.head r) (Bloc.items r)))))
 
 (define PrintRex rex-print)
 
+;; Public constructor values complement the exported type metadata.  Keeping
+;; these aliases after the implementation also keeps their generated locals
+;; out of the unique-number stream used while compiling Rex itself.
+(define MakeLeaf $Leaf)
+(define MakeNest $Nest)
+(define MakeExpr $Expr)
+(define MakePref $Pref)
+(define MakeTyte $Tyte)
+(define MakeBloc $Bloc)
+(define MakeOpen $Open)
+(define MakeJuxt $Juxt)
+(define MakeHeir $Heir)
+
 (#export
+  Rex
+  Leaf
+  Nest
+  Expr
+  Pref
+  Tyte
+  Bloc
+  Open
+  Juxt
+  Heir
+  MakeLeaf
+  MakeNest
+  MakeExpr
+  MakePref
+  MakeTyte
+  MakeBloc
+  MakeOpen
+  MakeJuxt
+  MakeHeir
   ParseRex
   ParseRexFile
   ParseRexNorm
