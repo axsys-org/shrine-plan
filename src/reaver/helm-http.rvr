@@ -82,8 +82,9 @@
       "Content-Type: " ctype crlf
       crlf body]))
 
-;; "/ns/a/b" -> [("ts" "a") ("ts" "b")]; "/", "/ns" -> [].  A leading
-;; "ns" segment is the explorer's own prefix and is dropped.
+;; "/ns/a/b", "/api/ns/a/b", and "/api/file/a/b" all resolve to the
+;; namespace path [("ts" "a") ("ts" "b")].  Prefixes select a Foil-owned
+;; projection only; the host just transports the authoritative target.
 (define (str-slice off len src)
   (Mod (Rsh src (Mul 8 off)) (Lsh 1 (Mul 8 len))))
 
@@ -100,10 +101,24 @@
 (define (url-target u)
   (define parts (filter (lambda (x) (Nil (Eq 0 (Bytes x)))) (split-ch 47 u)))
   (define parts2
-    (If (And (Sz parts) (Equal "ns" (Ix 0 parts)))
-      (drop 1 parts)
-      parts))
+    (cond
+      ((And (Sz parts) (Equal "ns" (Ix 0 parts)))
+        (drop 1 parts))
+      ((And (Ge (Sz parts) 2)
+         (And (Equal "api" (Ix 0 parts)) (Equal "ns" (Ix 1 parts))))
+        (drop 2 parts))
+      ((And (Ge (Sz parts) 2)
+         (And (Equal "api" (Ix 0 parts)) (Equal "file" (Ix 1 parts))))
+        (drop 2 parts))
+      (else parts)))
   (map (lambda (t) ("ts" t)) parts2))
+
+(define (locus-route u)
+  (define parts (filter (lambda (x) (Nil (Eq 0 (Bytes x)))) (split-ch 47 u)))
+  (If (And (Ge (Sz parts) 3)
+        (And (Equal "api" (Ix 0 parts)) (Equal "locus" (Ix 1 parts))))
+    [("ts" (Ix 2 parts)) (map (lambda (t) ("ts" t)) (drop 3 parts))]
+    0))
 
 ;;; Socket layer (thin; blocking IO lives in its own actors) ;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -127,7 +142,10 @@
   (Seq (DeepSeq m m)
     (Seq (SendCaps wh m [0])
       (let ((r (Ix 0 (Recv 0))))
-        (Seq (Write fd (strWeld (http-res (_1 r) (_3 r) (_2 r)) 1))
+        ;; The patched host Write releases failed handles; successful writes
+        ;; retain the normal explicit close in this connection actor.
+        (Seq (Try (lambda (response) (Write fd response))
+               (strWeld (http-res (_1 r) (_3 r) (_2 r)) 1))
           (CloseFd fd))))))
 
 ;; Accept loop: handshake for the worker handle, then one actor per
@@ -150,12 +168,17 @@
 
 ;;; The worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; helpers = ["H" http-req tslot vine-make vine-cull] — compiled
+;; helpers = ["H" http-req tslot vine-make vine-cull vine-poke
+;;            space-state-t intent-t]
+;; — compiled
 ;; lainapp entries, supplied by whoever spawns the coordinator.
 (define (h-req hs) (Ix 1 hs))
 (define (h-slot hs) (Ix 2 hs))
 (define (h-make hs) (Ix 3 hs))
 (define (h-cull hs) (Ix 4 hs))
+(define (h-poke hs) (Ix 5 hs))
+(define (h-space hs) (Ix 6 hs))
+(define (h-intent hs) (Ix 7 hs))
 
 (define (pend-get pending pax)
   (find (lambda (e) (Equal pax (_0 e))) pending))
@@ -198,6 +221,35 @@
     (define caps (Ix 1 m))
     (define kind (_0 msg))
     (cond
+      ((And (Eq kind "req")
+         (And (Equal "POST" (_1 msg)) (Equal "/api/space" (_2 msg))))
+        ;; One deliberately narrow mutation bridge: replace the live Space
+        ;; composition record. The serial request path is only a correlation
+        ;; key; the authoritative occurrence is fixed in the namespace.
+        (let* ((key (rpath serial))
+               (pax [("ts" "app") ("ts" "jshrine") ("ts" "space")])
+               (task ((h-poke hs) pax ((h-space hs) (_3 msg))))
+               (cm ["cmd" name task]))
+          (Seq (DeepSeq cm cm)
+            (Seq (Send coord cm)
+              (loop (Inc serial)
+                (snoc [key (Ix 0 caps)] pending)
+                (snoc [key "space"] queue))))))
+      ((And (Eq kind "req")
+         (And (Equal "POST" (_1 msg)) (locus-route (_2 msg))))
+        ;; A narrow mechanical bridge.  The route carries only a generic
+        ;; intent id and optional namespace target; /app/jshrine/locus owns
+        ;; the meaning and transition in its Lain behavior.
+        (let* ((key (rpath serial))
+               (route (locus-route (_2 msg)))
+               (pax [("ts" "app") ("ts" "jshrine") ("ts" "locus")])
+               (task ((h-poke hs) pax ((h-intent hs) (_0 route) (_1 route))))
+               (cm ["cmd" name task]))
+          (Seq (DeepSeq cm cm)
+            (Seq (Send coord cm)
+              (loop (Inc serial)
+                (snoc [key (Ix 0 caps)] pending)
+                (snoc [key "locus"] queue))))))
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
         (let* ((pax (rpath serial))
@@ -243,6 +295,15 @@
                 (Ifz hit
                   (loop serial pending rest)
                   (let ((rm ["res" 500 (_0 (_0 rsvp)) "text/plain; charset=utf-8"]))
+                    (Seq (DeepSeq rm rm)
+                      (Seq (Send (_1 (_0 hit)) rm)
+                        (loop serial (pend-drop pending (_0 head)) rest)))))))
+            ((Or (Equal "space" (_1 head)) (Equal "locus" (_1 head)))
+              (let ((hit (pend-get pending (_0 head))))
+                (Ifz hit
+                  (loop serial pending rest)
+                  (let ((rm ["res" 200 (strcat ["{" 34 "ok" 34 ":true}"])
+                                   "application/json; charset=utf-8"]))
                     (Seq (DeepSeq rm rm)
                       (Seq (Send (_1 (_0 hit)) rm)
                         (loop serial (pend-drop pending (_0 head)) rest)))))))
@@ -322,7 +383,8 @@
   (define vine-make (app ["vine_make"]))
   (define cfg-port (app ["http_cfg_port"]))
   (define helpers
-    ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])])
+    ["H" (app ["http_req"]) (app ["tslot"]) (app ["vine_make"]) (app ["vine_cull"])
+     (app ["vine_poke"]) (app ["space_state_t"]) (app ["intent_t"])])
   (define fhelpers
     ["F" (app ["tslot"]) (app ["fetch_fresh"]) (app ["fetch_hdrs"])
      (app ["fetch_res_ok"]) (app ["fetch_res_err"]) (app ["put_nat"])
