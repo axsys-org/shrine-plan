@@ -6,6 +6,7 @@
 (#import reef)
 (#bind prnt (#module print))
 (#bind wisp (#module wisp))
+(#bind cairn (#module cairn))
 
 (define (ty-pax p) (strWeld "/boot/types/" p))
 
@@ -57,6 +58,9 @@
 (define tarr-pax (ty-pax "arr"))
 (define (tarr item) (tarr-pax item))
 
+(define tpath-pax (ty-pax "path"))
+(define tzero-rec-pax (ty-pax "zerorec"))
+
 (define (typed-error ctx what detail)
   (error ["newtype" what ["at" ctx] detail]))
 
@@ -79,6 +83,9 @@
     ((Eq tfun-pax pax) (law-like? val))
     ;; PLAN erases an empty array to the atom 0; non-empty arrays are rows.
     ((Eq tarr-pax pax) (Or (Nil val) (is-row? val)))
+    ;; An open-recursion hole has no closed type to check against yet.  The
+    ;; enclosing type becomes checkable after close-type substitutes it.
+    ((Eq tzero-rec-pax pax) 1)
     ((Eq tsum-pax pax)
       (any (lambda (opt) (shallow-type-fits? opt val)) (_0 typ)))
     ((Eq trow-pax pax)
@@ -141,6 +148,7 @@
 (#macro declare-cstr type-decl-transformer)
 
 
+
 ;; Stage 0: describe the type constructors with the small hand-written kernel
 ;; above.  These declarations are ordinary row types; after $ is installed we
 ;; replace the public constructor functions with implementations derived from
@@ -155,10 +163,16 @@
   [value (tconst 0)])
 
 (declare-cstr Nat ROOT
-  [aura tany])
+  [aura (tnat 0)])
 
 (declare-cstr Arr ROOT
   [item tany])
+
+(declare-cstr Path ROOT
+  [p (tarr (tnat 0))])
+
+(declare-cstr ZeroRec ROOT
+  [p tstr])
 
 ;; Lower-case spelling preserves the historical /boot/types/row-item tag;
 ;; expose the conventional type name as an alias for lookup by $RowItem.
@@ -297,6 +311,8 @@
 (define trow-item $RowItem)
 (define trow $Row)
 (define tarr $Arr)
+(define tpath $Path)
+(define tzero-rec $ZeroRec)
 
 ;; Sum and function types retain their canonical erasures around generated
 ;; raw constructors: empty/singleton sums and zero-argument functions do not
@@ -361,6 +377,61 @@ assert(Equal
   (Ifz (Sz row) 0
     (Or (row-contains-equal? (_0 row) (drop 1 row))
       (duplicate-row-values? (drop 1 row)))))
+
+
+;;; Closing open-recursive types ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (close-type-replacement root type-ax name)
+  (define path (Weld root [name]))
+  (define hit (cairn:getax path type-ax))
+  (unless hit
+    (error ["newtype" "unbound ZeroRec path" path])
+    1)
+  (_0 hit))
+
+;; Rebuild just the type-bearing parts of a type value.  Const payloads and
+;; Path nodes are deliberately opaque: either may contain data which happens
+;; to resemble a type.
+(define (close-type-value root type-ax typ)
+  (unless (IsApp typ)
+    (error ["newtype" "close-type expected a type value" typ])
+    1)
+  (define pax (Hd typ))
+  (define recur (close-type-value root type-ax))
+  (cond
+    ((Eq tzero-rec-pax pax)
+      (close-type-replacement root type-ax (_0 typ)))
+    ((Eq trow-item-pax pax)
+      (trow-item-pax (_0 typ) (recur (_1 typ))))
+    ((Eq trow-pax pax)
+      (trow-pax (_0 typ)
+        ;; declare-cstr deliberately stores compact [face type] pairs here,
+        ;; rather than allocating branded RowItem values.
+        (map (lambda (item)
+          [(_0 item) (recur (_1 item))])
+          (_1 typ))))
+    ((Eq tsum-pax pax)
+      (tsum (map (lambda (option) (recur option)) (_0 typ))))
+    ((Eq tfun-pax pax)
+      (tfun-pax
+        (map (lambda (arg) (recur arg)) (_0 typ))
+        (recur (_1 typ))))
+    ((Eq tarr-pax pax)
+      (tarr-pax (recur (_0 typ))))
+    ((Eq tpath-pax pax) typ)
+    ;; These are leaves.  Unknown tags are leaves too, so adding a new opaque
+    ;; type constructor does not make close-type reject existing programs.
+    (else typ)))
+
+(define (close-type root bases type-ax)
+  (unless (Sz bases)
+    (error ["newtype" "close-type needs at least one base type"])
+    1)
+  (define closed
+    (map (lambda (typ) (close-type-value root type-ax typ)) bases))
+  ;; Preserve the usual sum invariants after substitution: bottom disappears,
+  ;; singleton sums erase, and real unions are sorted and deduplicated.
+  (tsum closed))
 
 (define (decl-union-transformer ctx uniq glo locals depth form)
   (And depth (typed-error ctx "decl-union is top-level only" form))
@@ -507,6 +578,50 @@ assert(Equal
 
 (declare-cstr right ROOT
   [p any])
+
+;; Closing is relative to a namespace in an Axal.  Path is an opaque, finite
+;; nominal reference; it ties the recursive knot without constructing an
+;; infinite PLAN value.
+(declare-cstr OpenCell ROOT
+  [head (tnat 0)]
+  [tail ($ZeroRec "self")]
+  [children (tarr ($ZeroRec "self"))])
+
+(define close-type-ax
+  (pipe cairn:empty-ax
+    (cairn:putax ["NatCell" "self"] ($Path ["NatCell"]))
+    (cairn:putax ["PairOrCell" "self"] ($Path ["PairOrCell"]))))
+
+(define NatCell
+  (close-type ["NatCell"] [OpenCell] close-type-ax))
+
+(define open-cell-tail-type
+  (RowItem.value (_1 (Row.items OpenCell))))
+(define nat-cell-tail-type
+  (RowItem.value (_1 (Row.items NatCell))))
+(define nat-cell-children-type
+  (RowItem.value (_2 (Row.items NatCell))))
+assert(Eq tzero-rec-pax (Hd open-cell-tail-type))
+assert(Equal ($Path ["NatCell"]) nat-cell-tail-type)
+assert(Equal
+  (tarr ($Path ["NatCell"]))
+  nat-cell-children-type)
+
+;; A sibling Axal namespace can close the same base differently.  More than
+;; one base closes to a canonical union.
+(define PairOrCell
+  (close-type ["PairOrCell"] [Pair OpenCell] close-type-ax))
+
+assert(Eq tsum-pax (Hd PairOrCell))
+assert(Eq 2 (Sz (Sum.options PairOrCell)))
+(define pair-or-cell-cell-type
+  (_0 (find
+    (lambda (typ) (Eq "/boot/types/opencell" (Row.cstr typ)))
+    (Sum.options PairOrCell))))
+(define pair-or-cell-tail-type
+  (RowItem.value
+    (_1 (Row.items pair-or-cell-cell-type))))
+assert(Equal ($Path ["PairOrCell"]) pair-or-cell-tail-type)
 
 (decl-union maybe none some)
 (decl-union either left right)
