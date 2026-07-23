@@ -1,0 +1,1017 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; Surface Foil -> the production TC_* IR, checked by foil-new-types.
+;;
+;; The old FoilType algebra appears only in `legacy-scheme`, the compatibility
+;; seam used when a source program refers to a production builtin.  Every type
+;; produced, stored in a new declaration, compared, or attached to TC below is
+;; a stage-1 newtype value.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind newtype (#module newtype))
+(#import newtype)
+
+(#bind foil-surface (#module foil-surface))
+(#import foil-surface)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind nt (#module foil-new-types))
+(#bind legacy (#module foil-types))
+(#bind quip (#module quip))
+
+
+;;; Compiler and environment declarations ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define FOIL_NEW_ELAB_ROOT "/foil/new-elab/")
+
+(declare-cstr NewCompiler FOIL_NEW_ELAB_ROOT
+  [subject tany]
+  [world tany])
+
+(declare-cstr LocalBinding FOIL_NEW_ELAB_ROOT
+  [name (tnat 0)]
+  [type tany])
+
+(declare-cstr ElabEnv FOIL_NEW_ELAB_ROOT
+  [locals (tarr tany)]
+  [type-vars (tarr (tnat 0))]
+  [const-vars (tarr tany)]
+  [goal tany]
+  [span tany]
+  [name (tarr (tnat 0))])
+
+(define make-compiler $NewCompiler)
+(define compiler-subject NewCompiler.subject)
+(define compiler-world NewCompiler.world)
+(define compiler-with-subject NewCompiler.=subject)
+(define compiler-with-world NewCompiler.=world)
+
+(define local-name LocalBinding.name)
+(define local-type LocalBinding.type)
+
+(define env-locals ElabEnv.locals)
+(define env-type-vars ElabEnv.type-vars)
+(define env-const-vars ElabEnv.const-vars)
+(define env-goal ElabEnv.goal)
+(define env-span ElabEnv.span)
+(define env-name ElabEnv.name)
+(define env-with-locals ElabEnv.=locals)
+(define env-with-type-vars ElabEnv.=type-vars)
+(define env-with-const-vars ElabEnv.=const-vars)
+(define env-with-goal ElabEnv.=goal)
+(define env-with-span ElabEnv.=span)
+(define env-with-name ElabEnv.=name)
+
+(define empty-env ($ElabEnv [] [] [] 0 0 []))
+
+(define (clear-goal env) (env-with-goal 0 env))
+(define (push-locals bindings env)
+  (env-with-locals (Weld bindings (env-locals env)) env))
+(define (push-local name typ env)
+  (push-locals [($LocalBinding name typ)] env))
+
+(define (new-elab-error env what detail)
+  (error ["foil-new-elab" what ["at" (env-span env)] detail]))
+
+(define prototype-mark "FOIL_NEW_UNTYPED_PROTOTYPE")
+(define (prototype-tc) (tc-const nt:tany prototype-mark))
+(define (prototype-tc? tc)
+  (And (Eq "TC_CONST" (Hd tc))
+    (Eq prototype-mark (tc-const-val tc))))
+
+
+;;; New builtin type world ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define nat-ref (nt:type-ref ["nat"]))
+
+(define (install-core-world world)
+  (let* ((w1
+           (nt:declare-type world ["nat"] (nt:mono (nt:tnat 0))
+             "nat" 0 "builtin"))
+         (w2
+           (nt:declare-type w1 ["uint"] (nt:mono (nt:tnat 0))
+             "uint" 0 "builtin"))
+         (w3
+           (nt:declare-type w2 ["bool"] (nt:mono (nt:tnat 0))
+             "bool" 0 "builtin"))
+         (w4
+           (nt:declare-type w3 ["unit"]
+             (nt:mono (nt:trow (print-path ["unit"]) []))
+             (print-path ["unit"]) 0 "builtin"))
+         (w5
+           (nt:declare-type w4 ["pail"] (nt:mono nt:tany)
+             0 0 "builtin"))
+         (w6
+           (nt:declare-type w5 ["row"]
+             (nt:scheme [(nt:type-param "a")]
+               (nt:tarr (nt:type-var "a")))
+             0 0 "builtin"))
+         (w7
+           (nt:declare-type w6 ["list"]
+             (nt:scheme [(nt:type-param "a")]
+               (nt:tsum
+                 [(nt:trow "nil" [])
+                  (nt:trow "cons"
+                    [(nt:trow-item 0 (nt:type-var "a"))
+                     (nt:trow-item 1
+                       (nt:type-app ["list"]
+                         [(nt:type-arg (nt:type-var "a"))]))])]))
+             0 0 "builtin"))
+         (w8
+           (nt:declare-type w7 ["either"]
+             (nt:scheme [(nt:type-param "a") (nt:type-param "b")]
+               (nt:tsum
+                 [(nt:trow "left"
+                    [(nt:trow-item 0 (nt:type-var "a"))])
+                  (nt:trow "right"
+                    [(nt:trow-item 0 (nt:type-var "b"))])]))
+             0 0 "builtin"))
+         (w9
+           (nt:declare-type w8 ["quip"]
+             (nt:mono
+               (nt:tsum
+                 (map (lambda (tag)
+                   (nt:trow tag [(nt:trow-item 0 nat-ref)]))
+                   ["ds" "u" "w" "x" "ta" "tu" "ts" "r"])))
+             0 0 "builtin")))
+    w9))
+
+(define default-type-world (install-core-world nt:empty-type-world))
+
+(define (compiler-for subject)
+  ($NewCompiler subject default-type-world))
+
+
+;;; Legacy builtin signature adapter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (legacy-monotype compiler typ)
+  (define tag (legacy:type-tag typ))
+  (define (recur c t) (legacy-monotype c t))
+  (define (many c xs)
+    (foldl
+      (lambda (state x)
+        (let ((r (recur (_0 state) x)))
+          [(_0 r) (snoc (_1 r) (_1 state))]))
+      [c []] xs))
+  (cond
+    ((Eq tag "TBOT") [compiler nt:tbot])
+    ((Or (Eq tag "TANY") (Eq tag "TPAIL")) [compiler nt:tany])
+    ((Eq tag "TNAT")
+      [compiler
+       (Ifz (legacy:tnat-cube typ)
+         (nt:tnat 0)
+         (nt:tconst (legacy:tnat-cube typ)))])
+    ((Eq tag "TNOM")
+      [compiler (nt:type-ref (legacy:tnom-ref typ))])
+    ((Eq tag "TVAR") [compiler (nt:type-var (legacy:tvar-index typ))])
+    ((Eq tag "TFAC") (recur compiler (legacy:tfac-val typ)))
+    ((Eq tag "TSELF") (recur compiler (legacy:tself-val typ)))
+    ((Eq tag "TPIN") [compiler nt:tany])
+    ((Eq tag "TARR")
+      (let ((r (recur compiler (legacy:tarr-item typ))))
+        [(_0 r) (nt:tarr (_1 r))]))
+    ((Eq tag "TFUN")
+      (let* ((ar (many compiler (legacy:tfun-args typ)))
+             (rr (recur (_0 ar) (legacy:tfun-ret typ))))
+        [(_0 rr) (nt:tfun (_1 ar) (_1 rr))]))
+    ((Eq tag "TROW")
+      (let ((r
+              (foldl
+                (lambda (state item)
+                  (let* ((face
+                           (If (Eq "TFAC" (legacy:type-tag item))
+                             (legacy:tfac-face item)
+                             (Sz (_1 state))))
+                         (raw
+                           (If (Eq "TFAC" (legacy:type-tag item))
+                             (legacy:tfac-val item)
+                             item))
+                         (ir (recur (_0 state) raw)))
+                    [(_0 ir)
+                     (snoc (nt:trow-item face (_1 ir)) (_1 state))]))
+                [compiler []] (legacy:trow-vals typ))))
+        [(_0 r) (nt:trow (legacy:trow-cstr typ) (_1 r))]))
+    ((Eq tag "TSUM")
+      (let ((r (many compiler (legacy:tsum-opts typ))))
+        [(_0 r) (nt:tsum (_1 r))]))
+    ((Eq tag "TTYP") (recur compiler (legacy:ttyp-type typ)))
+    (else
+      (error ["foil-new-elab" "unsupported legacy builtin type" typ]))))
+
+(define (legacy-scheme compiler typ)
+  (define (go c params t)
+    (define tag (legacy:type-tag t))
+    (cond
+      ((Eq tag "TQUA")
+        (go c (snoc (nt:type-param (legacy:tqua-name t)) params)
+          (legacy:tqua-body-value t)))
+      ((Eq tag "TCQUA")
+        (let ((tr (legacy-monotype c (legacy:tcqua-type t))))
+          (go (_0 tr)
+            (snoc (nt:const-param (legacy:tcqua-name t) (_1 tr)) params)
+            (legacy:tcqua-body t))))
+      (else
+        (let ((r (legacy-monotype c t)))
+          [(_0 r) (nt:scheme params (_1 r))]))))
+  (go compiler [] typ))
+
+(define (normalize-tc compiler tc)
+  (define typ (tc-ty tc))
+  (If (nt:type-value? typ)
+    [compiler tc]
+    (let ((r (legacy-scheme compiler typ)))
+      [(_0 r)
+       (set-tc-ty
+         (Ifz (Sz (nt:scheme-parameters (_1 r)))
+           (nt:scheme-body (_1 r))
+           (_1 r))
+         tc)])))
+
+
+;;; Surface type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (bound-type-var? env name)
+  (includes (Eq name) (env-type-vars env)))
+
+(define (const-binding env name)
+  (define hit
+    (find (lambda (pair) (Eq name (_0 pair))) (env-const-vars env)))
+  (And hit (_0 hit)))
+
+(define (type-path compiler path)
+  (canon-path path (compiler-subject compiler)))
+
+(define (const-surface-argument env arg)
+  (define tag (_0 arg))
+  (cond
+    ((Eq tag "s_tsym") (nt:const-arg (_1 arg)))
+    ((Eq tag "s_lit") (nt:const-arg (_1 arg)))
+    ((And (Or (Eq tag "s_ref") (Eq tag "s_var"))
+       (let ((name
+               (If (Eq tag "s_var") (_1 arg)
+                 (If (Eq 1 (Sz (surf-ref-path arg)))
+                   (_0 (surf-ref-path arg)) 0))))
+         (And name (const-binding env name))))
+      (let ((name
+              (If (Eq tag "s_var") (_1 arg)
+                (_0 (surf-ref-path arg)))))
+        (nt:const-arg (nt:const-var name))))
+    ((And (Eq tag "s_ref")
+       (And (Eq 1 (Sz (surf-ref-path arg)))
+         (str-numeric? (_0 (surf-ref-path arg)))))
+      (nt:const-arg (parse-nat (_0 (surf-ref-path arg)))))
+    (else
+      (new-elab-error env "const argument must be a literal or const parameter"
+        arg))))
+
+(define (template-argument? arg)
+  (cond
+    ((Eq "type" (nt:argument-kind arg))
+      (Or (nt:type-var? (nt:argument-value arg))
+        (nt:type-app? (nt:argument-value arg))))
+    (else (nt:const-var? (nt:argument-value arg)))))
+
+;; elab-type :: Compiler -> Env -> TypeSAST -> top-row-brand-or-0
+;;           -> [Compiler MonotypeTemplate]
+(define (elab-type compiler env surf top-brand)
+  (define (type-row-items compiler env kids)
+    (foldl
+      (lambda (state pair)
+        (define i (_0 pair))
+        (define kid (_1 pair))
+        (define faced (Eq "s_face" (_0 kid)))
+        (define face (If faced (surf-face-name kid) i))
+        (define raw (If faced (surf-face-kid kid) kid))
+        (define r (elab-type (_0 state) env raw 0))
+        [(_0 r) (snoc (nt:trow-item face (_1 r)) (_1 state))])
+      [compiler []]
+      (zip (gen (Sz kids) (lambda (i) i)) kids)))
+  (define (type-application-arguments compiler env params args)
+    (unless (Eq (Sz params) (Sz args))
+      (new-elab-error env "wrong number of type arguments"
+        ["want" (Sz params) "got" (Sz args)])
+      1)
+    (foldl
+      (lambda (state pair)
+        (define param (_0 pair))
+        (define arg (_1 pair))
+        (If (Eq "type" (nt:parameter-kind param))
+          (let ((r (elab-type (_0 state) env arg 0)))
+            [(_0 r) (snoc (nt:type-arg (_1 r)) (_1 state))])
+          [(_0 state) (snoc (const-surface-argument env arg) (_1 state))]))
+      [compiler []] (zip params args)))
+  (define tag (_0 surf))
+  (define (recur c x) (elab-type c env x 0))
+  (define (many c xs)
+    (foldl
+      (lambda (state x)
+        (let ((r (recur (_0 state) x)))
+          [(_0 r) (snoc (_1 r) (_1 state))]))
+      [c []] xs))
+  (cond
+    ((Eq tag "s_span")
+      (elab-type compiler (env-with-span (_1 surf) env) (_2 surf) top-brand))
+    ((Eq tag "s_face") (recur compiler (surf-face-kid surf)))
+    ((Or (Eq tag "s_trow") (Eq tag "s_row"))
+      (let ((r (type-row-items compiler env (surf-row-kids surf))))
+        [(_0 r) (nt:trow top-brand (_1 r))]))
+    ((Eq tag "s_tfun")
+      (let* ((ar (many compiler (surf-fun-args surf)))
+             (rr (recur (_0 ar) (surf-fun-ret surf))))
+        [(_0 rr) (nt:tfun (_1 ar) (_1 rr))]))
+    ((Eq tag "s_union")
+      (let ((r (many compiler (surf-union-opts surf))))
+        [(_0 r) (nt:tsum (_1 r))]))
+    ((Eq tag "s_tsym") [compiler (nt:tconst (_1 surf))])
+    ((Eq tag "s_variant") [compiler (nt:trow (_1 surf) [])])
+    ((Eq tag "s_ref")
+      (let* ((path (surf-ref-path surf))
+             (name (If (Eq 1 (Sz path)) (_0 path) 0))
+             (cb (And name (const-binding env name))))
+        (cond
+          ((And name (bound-type-var? env name))
+            [compiler (nt:type-var name)])
+          (cb [compiler (nt:const-var name)])
+          ((And name (str-numeric? name))
+            [compiler (nt:tconst (parse-nat name))])
+          (else [compiler (nt:type-ref (type-path compiler path))]))))
+    ((Eq tag "s_tapp")
+      (let* ((kids (surf-tapp-kids surf))
+             (head (_0 kids))
+             (args (drop 1 kids)))
+        (cond
+          ((Eq "s_variant" (_0 head))
+            (let ((r (many compiler args)))
+              [(_0 r)
+               (nt:trow (_1 head)
+                 (map (lambda (pair)
+                   (nt:trow-item (_0 pair) (_1 pair)))
+                   (zip (gen (Sz (_1 r)) (lambda (i) i)) (_1 r))))]))
+          ((Eq "s_ref" (_0 head))
+            (let* ((base (type-path compiler (surf-ref-path head)))
+                   (lr (nt:lookup-type-entry (compiler-world compiler) base))
+                   (compiler1 (compiler-with-world (_0 lr) compiler))
+                   (params
+                     (nt:scheme-parameters (nt:type-entry-scheme (_1 lr))))
+                   (ar
+                     (type-application-arguments compiler1 env params args))
+                   (gargs (_1 ar)))
+              (If (any template-argument? gargs)
+                [(_0 ar) (nt:type-app base gargs)]
+                (let ((ir
+                        (nt:intern-type-application
+                          (compiler-world (_0 ar)) base gargs)))
+                  [(compiler-with-world (_0 ir) (_0 ar))
+                   (nt:type-ref (_1 ir))]))))
+          (else (new-elab-error env "type application needs a named head" surf)))))
+    ((Eq tag "s_hole")
+      (new-elab-error env "wildcard is not a type" surf))
+    (else (new-elab-error env "unsupported type syntax" surf))))
+
+;; Generic value specialization shares the surface argument conversion, but
+;; lives after elab-type so Reaver's top-level binding order stays acyclic.
+(define (type-application-arguments compiler env params args)
+  (unless (Eq (Sz params) (Sz args))
+    (new-elab-error env "wrong number of type arguments"
+      ["want" (Sz params) "got" (Sz args)])
+    1)
+  (foldl
+    (lambda (state pair)
+      (define param (_0 pair))
+      (define arg (_1 pair))
+      (If (Eq "type" (nt:parameter-kind param))
+        (let ((r (elab-type (_0 state) env arg 0)))
+          [(_0 r) (snoc (nt:type-arg (_1 r)) (_1 state))])
+        [(_0 state) (snoc (const-surface-argument env arg) (_1 state))]))
+    [compiler []] (zip params args)))
+
+;; A value or type declaration's explicit @/@@ prefix becomes a Scheme.
+(define (elab-scheme compiler env surf top-brand)
+  (define (go c e params node)
+    (define tag (_0 node))
+    (cond
+      ((Eq tag "s_span")
+        (go c (env-with-span (_1 node) e) params (_2 node)))
+      ((Eq tag "s_tvars")
+        (let* ((vars (_1 node))
+               (e1 (env-with-type-vars (Weld vars (env-type-vars e)) e))
+               (ps (Weld params (map nt:type-param vars))))
+          (go c e1 ps (_2 node))))
+      ((Eq tag "s_cvars")
+        (let ((cr
+                (foldl
+                  (lambda (state ent)
+                    (let ((r (elab-type (_0 state) e (_1 ent) 0)))
+                      [(_0 r)
+                       (snoc [(_0 ent) (_1 r)] (_1 state))
+                       (snoc (nt:const-param (_0 ent) (_1 r)) (_2 state))]))
+                  [c [] params] (_1 node))))
+          (go (_0 cr)
+            (env-with-const-vars (Weld (_1 cr) (env-const-vars e)) e)
+            (_2 cr) (_2 node))))
+      (else
+        (let ((r (elab-type c e node top-brand)))
+          [(_0 r) (nt:scheme params (_1 r))]))))
+  (go compiler env [] surf))
+
+
+;;; Value lookup and checking ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (find-local env name)
+  (define hit
+    (find-idx (lambda (binding) (Eq name (local-name binding)))
+      (env-locals env)))
+  (And hit [(_0 hit) (Ix (_0 hit) (env-locals env))]))
+
+(define (global-reference compiler env path0)
+  (define path (canon-path path0 (compiler-subject compiler)))
+  (define world (compiler-world compiler))
+  (cond
+    ((nt:type-bound? world path)
+      (let* ((lr (nt:lookup-type-entry world path))
+             (entry (_1 lr))
+             (scm (nt:type-entry-scheme entry))
+             (inner
+               (Ifz (Sz (nt:scheme-parameters scm))
+                 (nt:type-ref path)
+                 scm)))
+        [(compiler-with-world (_0 lr) compiler) (tc-typ inner)]))
+    ((get-const path (compiler-subject compiler))
+      (let* ((raw (got-entry-tc path (compiler-subject compiler)))
+             (nr (normalize-tc compiler raw))
+             (tc (_1 nr)))
+        (If (prototype-tc? tc)
+          (new-elab-error env
+            "forward reference requires an explicit type annotation" path)
+          [(_0 nr)
+           (If (Or (Eq "TC_FFI" (Hd tc)) (Eq "TC_LIT" (Hd tc)))
+             tc
+             (tc-global (tc-ty tc) path))])))
+    (else (new-elab-error env "unbound reference" path0))))
+
+(define (view-type compiler env typ what)
+  (unless (Nil (nt:scheme? typ))
+    (new-elab-error env what "generic value requires explicit specialization")
+    1)
+  (let ((r (nt:view (compiler-world compiler) typ)))
+    [(compiler-with-world (_0 r) compiler) (_1 r)]))
+
+(define (ensure-subtype compiler env actual expected what)
+  (unless (And (Nil (nt:scheme? actual)) (Nil (nt:scheme? expected)))
+    (new-elab-error env what ["actual" actual "expected" expected])
+    1)
+  (let ((r (nt:subtype (compiler-world compiler) actual expected)))
+    (unless (_1 r)
+      (new-elab-error env what ["want" expected "got" actual])
+      1)
+    (compiler-with-world (_0 r) compiler)))
+
+(define (fold-tc-app f xs result-type)
+  (define app
+    (foldl (lambda (acc x) (tc-app result-type acc x)) f xs))
+  (set-tc-ty result-type app))
+
+(define (peek-return-type compiler env body)
+  (define tag (_0 body))
+  (cond
+    ((Eq tag "s_span")
+      (peek-return-type compiler (env-with-span (_1 body) env) (_2 body)))
+    ((Eq tag "s_cast") (elab-type compiler env (surf-cast-ty body) 0))
+    (else [compiler 0])))
+
+(define (function-goal compiler env arity)
+  (Ifz (env-goal env)
+    [compiler 0]
+    (let ((vr (view-type compiler env (env-goal env)
+                "lambda goal is not a function")))
+      (unless (And (nt:fun-type? (_1 vr))
+                (Eq arity (Sz (nt:fun-args (_1 vr)))))
+        (new-elab-error env "lambda goal has the wrong arity"
+          (env-goal env))
+        1)
+      vr)))
+
+(define (lambda-parameters compiler env args goal-fun)
+  (foldl
+    (lambda (state pair)
+      (define i (_0 pair))
+      (define arg (_1 pair))
+      (define tag (_0 arg))
+      (define inferred
+        (If goal-fun (Ix i (nt:fun-args goal-fun)) 0))
+      (cond
+        ((Eq tag "s_face")
+          (let ((r (elab-type (_0 state) env (surf-face-kid arg) 0)))
+            [(_0 r)
+             (snoc [($LocalBinding (surf-face-name arg) (_1 r)) (_1 r)]
+               (_1 state))]))
+        ((And (Eq tag "s_ref") (Eq 1 (Sz (surf-ref-path arg))))
+          (unless inferred
+            (new-elab-error env
+              "lambda parameter needs a type annotation" arg)
+            1)
+          [(_0 state)
+           (snoc [($LocalBinding (_0 (surf-ref-path arg)) inferred) inferred]
+             (_1 state))])
+        ((Eq tag "s_hole")
+          (unless inferred
+            (new-elab-error env
+              "lambda wildcard needs an expected function type" arg)
+            1)
+          [(_0 state) (snoc [($LocalBinding 0 inferred) inferred] (_1 state))])
+        (else (new-elab-error env "unsupported lambda parameter" arg))))
+    [compiler []]
+    (zip (gen (Sz args) (lambda (i) i)) args)))
+
+(define (constructor-path compiler surf tc)
+  (define (go node)
+    (cond
+      ((Eq "s_span" (_0 node)) (go (_2 node)))
+      ((Eq "s_ref" (_0 node))
+        (canon-path (surf-ref-path node) (compiler-subject compiler)))
+      ((Eq "s_var" (_0 node))
+        (canon-path [(_1 node)] (compiler-subject compiler)))
+      ((Eq "s_spec" (_0 node))
+        (let ((inner (tc-typ-inner tc)))
+          (And (nt:type-ref? inner) (nt:type-ref-path inner))))
+      (else 0)))
+  (If (And (Eq "TC_TYP" (Hd tc)) (nt:type-ref? (tc-typ-inner tc)))
+    (nt:type-ref-path (tc-typ-inner tc))
+    (go surf)))
+
+(define (specialization-base-path compiler surf)
+  (cond
+    ((Eq "s_ref" (_0 surf))
+      (canon-path (surf-ref-path surf) (compiler-subject compiler)))
+    ((Eq "s_var" (_0 surf))
+      (canon-path [(_1 surf)] (compiler-subject compiler)))
+    ((Eq "s_span" (_0 surf)) (specialization-base-path compiler (_2 surf)))
+    (else 0)))
+
+;;; Core expression elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (elab-value-go compiler env surf)
+  (define (check-value compiler env surf expected)
+    (define r (elab-value-go compiler (env-with-goal expected env) surf))
+    (define tc (_1 r))
+    (define c1
+      (ensure-subtype (_0 r) env (tc-ty tc) expected "type mismatch"))
+    [c1 (set-tc-ty expected tc)])
+  (define (elab-values compiler env surfs goals)
+    (unless (Or (Nil goals) (Eq (Sz surfs) (Sz goals)))
+      (new-elab-error env "argument arity mismatch"
+        ["want" (Sz goals) "got" (Sz surfs)])
+      1)
+    (foldl
+      (lambda (state pair)
+        (define r
+          (If goals
+            (check-value (_0 state) env (_0 pair) (_1 pair))
+            (elab-value-go (_0 state) (clear-goal env) (_0 pair))))
+        [(_0 r) (snoc (_1 r) (_1 state))])
+      [compiler []]
+      (zip surfs (If goals goals (gen (Sz surfs) (lambda (i) 0))))))
+  (define (elab-call compiler env fsurf args)
+    (define fr (elab-value-go compiler (clear-goal env) fsurf))
+    (define f (_1 fr))
+    (If (Eq "TC_TYP" (Hd f))
+      (let ((path (constructor-path (_0 fr) fsurf f)))
+        (If path
+          (let* ((lr (nt:lookup-type-entry (compiler-world (_0 fr)) path))
+                 (entry (_1 lr))
+                 (body (nt:type-entry-body entry)))
+            (unless body
+              (new-elab-error env
+                "generic constructor requires explicit specialization" path)
+              1)
+            (unless (nt:row-type? body)
+              (new-elab-error env "called type is not a row constructor"
+                [path body])
+              1)
+            (let* ((c1 (compiler-with-world (_0 lr) (_0 fr)))
+                   (ar
+                     (elab-values c1 env args
+                       (map nt:row-item-value (nt:row-items body)))))
+              [(_0 ar)
+               (tc-row (nt:type-ref path) (nt:row-cstr body) (_1 ar))]))
+          (let* ((inner (tc-typ-inner f))
+                 (scm (If (nt:scheme? inner) inner (nt:mono inner)))
+                 (body (nt:scheme-body scm)))
+            (unless (And (Ifz (Sz (nt:scheme-parameters scm)) 1 0)
+                      (nt:row-type? body))
+              (new-elab-error env "anonymous called type is not a row" inner)
+              1)
+            (let ((ar
+                    (elab-values (_0 fr) env args
+                      (map nt:row-item-value (nt:row-items body)))))
+              [(_0 ar) (tc-row body (nt:row-cstr body) (_1 ar))]))))
+      (let* ((vr (view-type (_0 fr) env (tc-ty f)
+                   "application expected a function"))
+             (fun (_1 vr)))
+        (unless (nt:fun-type? fun)
+          (new-elab-error env "application expected a function" (tc-ty f))
+          1)
+        (unless (Eq (Sz args) (Sz (nt:fun-args fun)))
+          (new-elab-error env "function arity mismatch"
+            ["want" (Sz (nt:fun-args fun)) "got" (Sz args)])
+          1)
+        (let ((ar
+                (elab-values (_0 vr) env args (nt:fun-args fun))))
+          [(_0 ar) (fold-tc-app f (_1 ar) (nt:fun-return fun))]))))
+  (define (elab-specialization compiler env val args)
+    (define br (elab-value-go compiler (clear-goal env) val))
+    (define base (_1 br))
+    (define scm (tc-ty base))
+    (unless (nt:scheme? scm)
+      (new-elab-error env "explicit specialization requires a generic value"
+        scm)
+      1)
+    (define ar
+      (type-application-arguments (_0 br) env
+        (nt:scheme-parameters scm) args))
+    (define gargs (_1 ar))
+    (If (Eq "TC_TYP" (Hd base))
+      (let ((path (specialization-base-path (_0 ar) val)))
+        (unless path
+          (new-elab-error env "type specialization needs a named base" val)
+          1)
+        (let ((ir
+                (nt:intern-type-application
+                  (compiler-world (_0 ar)) path gargs)))
+          [(compiler-with-world (_0 ir) (_0 ar))
+           (tc-typ (nt:type-ref (_1 ir)))]))
+      (let ((sr
+              (nt:specialize-scheme (compiler-world (_0 ar)) scm gargs)))
+        (unless (Nil
+                  (find (lambda (p) (Eq "const" (nt:parameter-kind p)))
+                    (nt:scheme-parameters scm)))
+          (new-elab-error env
+            "const-generic values are not materialized by the new elaborator yet"
+            val)
+          1)
+        [(compiler-with-world (_0 sr) (_0 ar))
+         (set-tc-ty (_1 sr) base)])))
+  (define tag (_0 surf))
+  (cond
+    ((Eq tag "s_span")
+      (elab-value-go compiler (env-with-span (_1 surf) env) (_2 surf)))
+    ((Eq tag "s_lit")
+      [compiler (tc-lit (nt:tconst (surf-lit-val surf)) (surf-lit-val surf))])
+    ((Eq tag "s_literal")
+      (cond
+        ((Eq "cord" (_1 surf))
+          [compiler (tc-lit (nt:tconst (_2 surf)) (_2 surf))])
+        ((Eq "quip" (_1 surf))
+          [compiler
+           (tc-lit (nt:type-ref ["quip"]) (quip:parse-quip (_2 surf)))])
+        (else (new-elab-error env "unsupported literal shape" (_1 surf)))))
+    ((Eq tag "s_ref")
+      (global-reference compiler env (surf-ref-path surf)))
+    ((Eq tag "s_var")
+      (let ((local (find-local env (_1 surf))))
+        (If local
+          (let ((binding (_1 local)))
+            [compiler
+             (tc-local (local-type binding) (_0 local) (local-name binding))])
+          (let ((cb (const-binding env (_1 surf))))
+            (If cb
+              [compiler (tc-cparam (_1 cb) (_1 surf))]
+              (global-reference compiler env [(_1 surf)]))))))
+    ((Eq tag "s_cast")
+      (let* ((tr (elab-type compiler env (surf-cast-ty surf) 0))
+             (vr (check-value (_0 tr) env (_2 surf) (_1 tr))))
+        [(_0 vr) (set-tc-ty (_1 tr) (_1 vr))]))
+    ((Eq tag "s_fun")
+      (let* ((gr (function-goal compiler env (Sz (surf-fun-args surf))))
+             (goal-fun (_1 gr))
+             (pr
+               (lambda-parameters (_0 gr) env (surf-fun-args surf) goal-fun))
+             (pairs (_1 pr))
+             (bindings (map (Ix 0) pairs))
+             (arg-types (map (Ix 1) pairs))
+             (rr (peek-return-type (_0 pr) env (surf-fun-ret surf)))
+             (declared-ret
+               (If (_1 rr) (_1 rr)
+                 (If goal-fun (nt:fun-return goal-fun) 0)))
+             (self-ret (If declared-ret declared-ret nt:tbot))
+             (self-type (nt:tfun arg-types self-ret))
+             (frame-bindings
+               (Weld [($LocalBinding 0 self-type)] bindings))
+             (inner
+               (push-locals frame-bindings
+                 (clear-goal env)))
+             (br
+               (If declared-ret
+                 (check-value (_0 rr) inner (surf-fun-ret surf) declared-ret)
+                 (elab-value-go (_0 rr) inner (surf-fun-ret surf))))
+             (typ (nt:tfun arg-types (tc-ty (_1 br))))
+             (c1
+               (If goal-fun
+                 (ensure-subtype (_0 br) env typ (env-goal env)
+                   "lambda does not match its expected function type")
+                 (_0 br)))
+             (out-type (If goal-fun (env-goal env) typ)))
+        [c1
+         (tc-lam out-type 0 (Weld [self-type] arg-types) (_1 br))]))
+    ((Eq tag "s_self")
+      (let ((self (find-local env 0)))
+        (unless self
+          (new-elab-error env "recursive call outside a function" surf)
+          1)
+        (let ((binding (_1 self)))
+          (unless (nt:fun-type? (local-type binding))
+            (new-elab-error env "recursive function has no declared return type"
+              (local-type binding))
+            1)
+          (unless (Nil (nt:bottom-type? (nt:fun-return (local-type binding))))
+            (new-elab-error env
+              "recursive call requires an explicit return type" surf)
+            1)
+          (let ((ar
+                  (elab-values compiler env (_1 surf)
+                    (nt:fun-args (local-type binding)))))
+            [(_0 ar)
+             (fold-tc-app
+               (tc-local (local-type binding) (_0 self) 0)
+               (_1 ar) (nt:fun-return (local-type binding)))]))))
+    ((Eq tag "s_app")
+      (elab-call compiler env (_1 surf) (_2 surf)))
+    ((Eq tag "s_spec")
+      (elab-specialization compiler env
+        (surf-spec-val surf) (surf-spec-args surf)))
+    ((Eq tag "s_row")
+      (let* ((goal-view
+               (Ifz (env-goal env)
+                 [compiler 0]
+                 (view-type compiler env (env-goal env)
+                   "row goal is not a row")))
+             (row-goal
+               (If (And (_1 goal-view) (nt:row-type? (_1 goal-view)))
+                 (_1 goal-view) 0))
+             (goals
+               (If (And row-goal
+                     (Eq (Sz (surf-row-kids surf))
+                       (Sz (nt:row-items row-goal))))
+                 (map nt:row-item-value (nt:row-items row-goal))
+                 0))
+             (er
+               (elab-values (_0 goal-view) env (surf-row-kids surf) goals))
+             (body
+               (If row-goal row-goal
+                 (nt:trow 0
+                   (map (lambda (pair)
+                     (nt:trow-item (_0 pair) (tc-ty (_1 pair))))
+                     (zip (gen (Sz (_1 er)) (lambda (i) i)) (_1 er))))))
+             (typ (If row-goal (env-goal env) body)))
+        [(_0 er) (tc-row typ (nt:row-cstr body) (_1 er))]))
+    ((Eq tag "s_variant")
+      (let ((typ (nt:trow (_1 surf) [])))
+        [compiler (tc-row typ (_1 surf) [])]))
+    ((Eq tag "s_if")
+      (let* ((cr (check-value compiler (clear-goal env) (_1 surf) (nt:tnat 0)))
+             (yr
+               (If (env-goal env)
+                 (check-value (_0 cr) env (_2 surf) (env-goal env))
+                 (elab-value-go (_0 cr) (clear-goal env) (_2 surf))))
+             (nr
+               (If (env-goal env)
+                 (check-value (_0 yr) env (_3 surf) (env-goal env))
+                 (elab-value-go (_0 yr) (clear-goal env) (_3 surf))))
+             (jr
+               (If (env-goal env)
+                 [(_0 nr) (env-goal env)]
+                 (let ((j
+                         (nt:join (compiler-world (_0 nr))
+                           (tc-ty (_1 yr)) (tc-ty (_1 nr)))))
+                   [(compiler-with-world (_0 j) (_0 nr)) (_1 j)])))
+             (out (_1 jr))
+             (if-ty (nt:tfun [(nt:tnat 0) out out] out))
+             (if-tc (tc-ffi if-ty If)))
+        [(_0 jr) (fold-tc-app if-tc [(_1 cr) (_1 yr) (_1 nr)] out)]))
+    ((Eq tag "s_letrec")
+      (let* ((outer-goal (env-goal env))
+             (lr
+               (foldl
+                 (lambda (state arm)
+                   (define c (_0 state))
+                   (define e (_1 state))
+                   (define binds (_2 state))
+                   (define pat (_1 arm))
+                   (define value (_2 arm))
+                   (define faced (Eq "s_face" (_0 pat)))
+                   (define name
+                     (cond
+                       (faced (surf-face-name pat))
+                       ((And (Eq "s_ref" (_0 pat))
+                          (Eq 1 (Sz (surf-ref-path pat))))
+                         (_0 (surf-ref-path pat)))
+                       (else
+                         (new-elab-error e
+                           "unsupported local binding pattern" pat))))
+                   (define tr
+                     (If faced
+                       (elab-type c e (surf-face-kid pat) 0)
+                       [c 0]))
+                   (define vr
+                     (If (_1 tr)
+                       (check-value (_0 tr) e value (_1 tr))
+                       (elab-value-go (_0 tr) (clear-goal e) value)))
+                   (define typ (If (_1 tr) (_1 tr) (tc-ty (_1 vr))))
+                   [(_0 vr) (push-local name typ e) (snoc (_1 vr) binds)])
+                 [compiler (clear-goal env) []] (_1 surf)))
+             (br
+               (If outer-goal
+                 (check-value (_0 lr) (env-with-goal outer-goal (_1 lr))
+                   (_2 surf) outer-goal)
+                 (elab-value-go (_0 lr) (_1 lr) (_2 surf)))))
+        [(_0 br) (tc-letrec (tc-ty (_1 br)) (_2 lr) (_1 br))]))
+    ((Eq tag "s_tvars")
+      (let* ((vars (_1 surf))
+             (e1 (env-with-type-vars (Weld vars (env-type-vars env)) env))
+             (r (elab-value-go compiler e1 (_2 surf)))
+             (typ (tc-ty (_1 r)))
+             (body (If (nt:scheme? typ) (nt:scheme-body typ) typ))
+             (old (If (nt:scheme? typ) (nt:scheme-parameters typ) []))
+             (scm (nt:scheme (Weld (map nt:type-param vars) old) body)))
+        [(_0 r) (set-tc-ty scm (_1 r))]))
+    ((Eq tag "s_cvars")
+      (let* ((cr
+               (foldl
+                 (lambda (state ent)
+                   (let ((r (elab-type (_0 state) env (_1 ent) 0)))
+                     [(_0 r)
+                      (snoc [(_0 ent) (_1 r)] (_1 state))
+                      (snoc (nt:const-param (_0 ent) (_1 r)) (_2 state))]))
+                 [compiler [] []] (_1 surf)))
+             (e1
+               (env-with-const-vars (Weld (_1 cr) (env-const-vars env)) env))
+             (r (elab-value-go (_0 cr) e1 (_2 surf)))
+             (typ (tc-ty (_1 r)))
+             (body (If (nt:scheme? typ) (nt:scheme-body typ) typ))
+             (old (If (nt:scheme? typ) (nt:scheme-parameters typ) []))
+             (scm (nt:scheme (Weld (_2 cr) old) body)))
+        [(_0 r) (set-tc-ty scm (_1 r))]))
+    ((Or (Eq tag "s_trow")
+       (Or (Eq tag "s_tfun") (Eq tag "s_union")))
+      (let ((r (elab-scheme compiler env surf 0)))
+        [(_0 r) (tc-typ (_1 r))]))
+    (else (new-elab-error env "unsupported surface form" surf))))
+
+(define (elab-value compiler surf)
+  (elab-value-go compiler empty-env surf))
+
+
+;;; Module sealing and elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (type-form? surf)
+  (define tag (_0 surf))
+  (cond
+    ((Eq tag "s_span") (type-form? (_2 surf)))
+    ((Or (Eq tag "s_tvars") (Eq tag "s_cvars"))
+      (type-form? (_2 surf)))
+    (else (Or (Eq tag "s_trow")
+            (Or (Eq tag "s_tfun") (Eq tag "s_union"))))))
+
+(define (placeholder-parameters surf)
+  (define tag (_0 surf))
+  (cond
+    ((Eq tag "s_span") (placeholder-parameters (_2 surf)))
+    ((Eq tag "s_tvars")
+      (Weld (map nt:type-param (_1 surf))
+        (placeholder-parameters (_2 surf))))
+    ((Eq tag "s_cvars")
+      (Weld (map (lambda (ent) (nt:const-param (_0 ent) nt:tany))
+              (_1 surf))
+        (placeholder-parameters (_2 surf))))
+    (else [])))
+
+(define (seed-type-declaration compiler row)
+  (define path (root-path (compiler-subject compiler) (_1 row)))
+  (define body (_3 row))
+  (Ifz (type-form? body)
+    compiler
+    (let* ((scm (nt:scheme (placeholder-parameters body) nt:tany))
+           (world (compiler-world compiler))
+           (world1
+             (If (nt:type-bound? world path)
+               (nt:replace-type world path scm 0 0 body)
+               (nt:declare-type world path scm 0 0 body)))
+           (subject1
+             (insert-tc path (_2 row) (tc-typ scm)
+               (compiler-subject compiler))))
+      ($NewCompiler subject1 world1))))
+
+(define (refine-type-declaration compiler row)
+  (define path (root-path (compiler-subject compiler) (_1 row)))
+  (define body (_3 row))
+  (Ifz (type-form? body)
+    compiler
+    (let* ((env (env-with-name path empty-env))
+           (sr (elab-scheme compiler env body (print-path path)))
+           (scm (_1 sr))
+           (mono (nt:scheme-body scm))
+           (brand (If (nt:row-type? mono) (nt:row-cstr mono) 0))
+           (arity (If (nt:row-type? mono) (Sz (nt:row-items mono)) 0))
+           (world1
+             (nt:replace-type (compiler-world (_0 sr)) path scm
+               brand arity body))
+           (subject1
+             (insert-tc path (_2 row) (tc-typ scm)
+               (compiler-subject (_0 sr)))))
+      ($NewCompiler subject1 world1))))
+
+(define (prototype-value compiler env surf)
+  (define tag (_0 surf))
+  (cond
+    ((Eq tag "s_span")
+      (prototype-value compiler (env-with-span (_1 surf) env) (_2 surf)))
+    ((Eq tag "s_tvars")
+      (let* ((vars (_1 surf))
+             (r
+               (prototype-value compiler
+                 (env-with-type-vars (Weld vars (env-type-vars env)) env)
+                 (_2 surf)))
+             (typ (tc-ty (_1 r)))
+             (body (If (nt:scheme? typ) (nt:scheme-body typ) typ))
+             (old (If (nt:scheme? typ) (nt:scheme-parameters typ) [])))
+        [(_0 r)
+         (set-tc-ty
+           (nt:scheme (Weld (map nt:type-param vars) old) body)
+           (_1 r))]))
+    ((Eq tag "s_cvars")
+      (let* ((cr
+               (foldl
+                 (lambda (state ent)
+                   (let ((r (elab-type (_0 state) env (_1 ent) 0)))
+                     [(_0 r)
+                      (snoc [(_0 ent) (_1 r)] (_1 state))
+                      (snoc (nt:const-param (_0 ent) (_1 r)) (_2 state))]))
+                 [compiler [] []] (_1 surf)))
+             (e1
+               (env-with-const-vars (Weld (_1 cr) (env-const-vars env)) env))
+             (r (prototype-value (_0 cr) e1 (_2 surf)))
+             (typ (tc-ty (_1 r)))
+             (body (If (nt:scheme? typ) (nt:scheme-body typ) typ))
+             (old (If (nt:scheme? typ) (nt:scheme-parameters typ) [])))
+        [(_0 r) (set-tc-ty (nt:scheme (Weld (_2 cr) old) body) (_1 r))]))
+    ((Eq tag "s_cast")
+      (let ((r (elab-type compiler env (surf-cast-ty surf) 0)))
+        [(_0 r) (tc-const (_1 r) 0)]))
+    ((Eq tag "s_fun")
+      (let* ((pr (lambda-parameters compiler env (surf-fun-args surf) 0))
+             (rr (peek-return-type (_0 pr) env (surf-fun-ret surf))))
+        (Ifz (_1 rr)
+          [(_0 rr) (prototype-tc)]
+          [(_0 rr)
+           (tc-const (nt:tfun (map (Ix 1) (_1 pr)) (_1 rr)) 0)])))
+    (else [compiler (prototype-tc)])))
+
+(define (seed-value-declaration compiler row)
+  (define body (_3 row))
+  (If (type-form? body)
+    compiler
+    (let* ((path (root-path (compiler-subject compiler) (_1 row)))
+           (env (env-with-name path empty-env))
+           (pr (prototype-value compiler env body))
+           (subject1
+             (insert-tc path (_2 row) (_1 pr)
+               (compiler-subject (_0 pr)))))
+      (compiler-with-subject subject1 (_0 pr)))))
+
+(define (elab-declaration compiler row)
+  (define path (root-path (compiler-subject compiler) (_1 row)))
+  (define body (_3 row))
+  (If (type-form? body)
+    compiler
+    (let* ((env (env-with-name path empty-env))
+           (r (elab-value-go compiler env body))
+           (subject1
+             (insert-tc path (_2 row) (_1 r)
+               (compiler-subject (_0 r)))))
+      (compiler-with-subject subject1 (_0 r)))))
+
+(define (module-declarations mod)
+  (filter (lambda (row) (And (IsApp row) (Eq "s_decl" (_0 row)))) mod))
+
+;; elab-mod :: NewCompiler -> ModuleSAST -> NewCompiler
+;; Names and signatures are sealed before bodies, so annotated forward and
+;; mutually recursive references have the same TC_GLOBAL behavior as the
+;; production elaborator.
+(define (elab-mod compiler mod)
+  (define decls (module-declarations mod))
+  (define seeded-types (foldl seed-type-declaration compiler decls))
+  (define refined-types (foldl refine-type-declaration seeded-types decls))
+  (define seeded-values (foldl seed-value-declaration refined-types decls))
+  (foldl elab-declaration seeded-values decls))
+
+(define (elab-mod-from subject world mod)
+  (elab-mod ($NewCompiler subject world) mod))

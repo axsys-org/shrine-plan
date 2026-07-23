@@ -1,0 +1,123 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind surface (#module foil-surface))
+(#import surface)
+
+(#bind subject (#module foil-subject))
+(#import subject)
+
+(#bind builtins (#module foil-builtins))
+(#bind nt (#module foil-new-types))
+(#bind elab (#module foil-new-elab))
+(#bind lower (#module foil-lower))
+
+(define span wack-span)
+(define nat-sast (surf-ref ["nat"]))
+
+(define id-decl
+  ["s_decl" ["id"] span
+   (surf-tvars ["a"]
+     (surf-fun
+       [(surf-face "x" (surf-ref ["a"]))]
+       (surf-cast (surf-ref ["a"]) (surf-var "x"))))])
+
+(define pair-decl
+  ["s_decl" ["pair"] span
+   (surf-trow
+     [(surf-face "left" nat-sast)
+      (surf-face "right" nat-sast)])])
+
+(define box-decl
+  ["s_decl" ["box"] span
+   (surf-tvars ["a"]
+     (surf-trow [(surf-face "value" (surf-ref ["a"]))]))])
+
+(define four-decl
+  ["s_decl" ["four"] span
+   (surf-cast nat-sast
+     (surf-app
+       (surf-spec (surf-var "id") [nat-sast])
+       [(surf-lit 4)]))])
+
+(define pair-value-decl
+  ["s_decl" ["a_pair"] span
+   (surf-app (surf-var "pair") [(surf-lit 3) (surf-lit 4)])])
+
+(define box-value-decl
+  ["s_decl" ["a_box"] span
+   (surf-app
+     (surf-spec (surf-var "box") [nat-sast])
+     [(surf-lit 7)])])
+
+(define choose-decl
+  ["s_decl" ["choose"] span
+   (surf-fun
+     [(surf-face "flag" nat-sast)
+      (surf-face "yes" nat-sast)
+      (surf-face "no" nat-sast)]
+     (surf-cast nat-sast
+       (surf-if (surf-var "flag") (surf-var "yes") (surf-var "no"))))])
+
+(define forward-decl
+  ["s_decl" ["forward"] span
+   (surf-fun [(surf-face "x" nat-sast)]
+     (surf-cast nat-sast
+       (surf-app (surf-var "later") [(surf-var "x")])))])
+
+(define later-decl
+  ["s_decl" ["later"] span
+   (surf-fun [(surf-face "x" nat-sast)]
+     (surf-cast nat-sast
+       (surf-app (surf-var "add") [(surf-var "x") (surf-lit 1)])))])
+
+(define mod
+  [id-decl pair-decl box-decl four-decl pair-value-decl box-value-decl
+   choose-decl forward-decl later-decl])
+
+(define base builtins:default-subject)
+(define compiled (elab:elab-mod (elab:compiler-for base) mod))
+(define final (elab:compiler-subject compiled))
+(define world (elab:compiler-world compiled))
+
+;; All public TC annotations belong to the new algebra.
+(define id-tc (got-entry-tc ["boot" "id"] final))
+assert(Eq "TC_LAM" (Hd id-tc))
+assert(nt:scheme? (tc-ty id-tc))
+assert(nt:type-value? (tc-ty (got-entry-tc ["boot" "four"] final)))
+
+;; Named rows are branded at declaration and generic applications are interned
+;; in the TypeWorld overlay while preserving that runtime constructor.
+(define pair-entry (_1 (nt:lookup-type-entry world ["boot" "pair"])))
+assert(Eq (print-path ["boot" "pair"])
+  (nt:row-cstr (nt:type-entry-body pair-entry)))
+
+(define box-nat-path
+  (_1 (nt:intern-type-application world ["boot" "box"]
+        [(nt:type-arg (nt:type-ref ["nat"]))])))
+(define box-entry (_1 (nt:lookup-type-entry world box-nat-path)))
+assert(Eq (print-path ["boot" "box"])
+  (nt:row-cstr (nt:type-entry-body box-entry)))
+
+;; The unchanged production lowerer accepts the same TC_* nodes and runs them.
+(define own
+  (map (lambda (decl) (root-path final (_1 decl))) mod))
+(define lowered (lower:lower-tc-unit base final own))
+(define (value name)
+  (lower:ir-entry-val (got-entry ["boot" name] lowered)))
+
+assert(Eq 4 (value "four"))
+assert(Equal ((print-path ["boot" "pair"]) 3 4) (value "a_pair"))
+assert(Equal ((print-path ["boot" "box"]) 7) (value "a_box"))
+assert(Eq 8 ((value "choose") 1 8 9))
+assert(Eq 9 ((value "choose") 0 8 9))
+assert(Eq 6 ((value "forward") 5))
+
+(print "foil-new-elab tests passed")
