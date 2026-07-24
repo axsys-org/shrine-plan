@@ -94,9 +94,11 @@ assert(nt:resolved-type? (nt:type-entry-body node-nat-entry))
 assert(Equal (nt:tconst 3)
   (nt:row-item-value (_0 (nt:row-items (nt:type-entry-body sized-3-entry)))))
 
+;; A nat row like [3] is path-shaped and rides as a path part (the
+;; ambiguity is inherent to the encoding); a nested row cannot.
 (define bad-const
   (Try (lambda (z)
-    (nt:intern-type-application world9 ["sized"] [(nt:const-arg [3])])) 0))
+    (nt:intern-type-application world9 ["sized"] [(nt:const-arg [[3]])])) 0))
 assert(Eq 1 (Hd bad-const))
 
 
@@ -105,6 +107,45 @@ assert(Eq 1 (Hd bad-const))
 assert(nt:subtype? world9 (nt:tconst 3) (nt:tnat 0))
 assert(Nil (nt:subtype? world9 nt:tany (nt:tnat 0)))
 assert(Nil (nt:subtype? world9 (nt:tnat 0) nt:tany))
+
+;; Template applications view symbolically through their base scheme and
+;; compare coinductively.
+(define node-w (nt:type-app ["node"] [(nt:type-arg (nt:type-var "w"))]))
+(define node-w-view (nt:view world9 node-w))
+assert(nt:row-type? (_1 node-w-view))
+assert(Equal (nt:type-var "w")
+  (nt:row-item-value (_0 (nt:row-items (_1 node-w-view)))))
+assert(Equal node-w
+  (nt:row-item-value (_1 (nt:row-items (_1 node-w-view)))))
+assert(nt:subtype? (_0 node-w-view) node-w node-w)
+assert(nt:subtype? (_0 node-w-view) (_1 node-w-view) node-w)
+assert(Nil (nt:subtype? (_0 node-w-view)
+  (nt:type-app ["node"] [(nt:type-arg (nt:type-var "u"))]) node-w))
+
+;; Template matching (inference): first binding wins, constants widen to
+;; nat at binding sites, /ty-ap actuals decode, conflicts reject.
+assert(Equal [["a" (nt:tnat 0)]]
+  (_1 (nt:match-template world9 [] (nt:type-var "a") (nt:tnat 0))))
+assert(Equal [["a" (nt:tnat 0)]]
+  (_1 (nt:match-template world9 [] (nt:type-var "a") (nt:tconst 5))))
+assert(Equal [["a" (nt:type-ref ["nat"])]]
+  (_1 (nt:match-template world9 []
+        (nt:type-app ["node"] [(nt:type-arg (nt:type-var "a"))])
+        (nt:type-ref (ty-ap-encode [["node"] ["nat"]])))))
+assert(Nil (nt:match-template world9 []
+  (nt:tfun [(nt:type-var "a") (nt:type-var "a")] (nt:type-var "a"))
+  (nt:tfun [(nt:tnat 0) (nt:trow "x" [])] (nt:tnat 0))))
+
+;; Consistent subtyping: Any is compatible at any depth; every other rule
+;; keeps static strictness.
+assert(nt:consistent-subtype? world9 nt:tany (nt:tnat 0))
+assert(nt:consistent-subtype? world9 (nt:tnat 0) nt:tany)
+assert(nt:consistent-subtype? world9
+  (nt:trow "p" [(nt:trow-item 0 nt:tany)])
+  (nt:trow "p" [(nt:trow-item 0 (nt:tnat 0))]))
+assert(Nil (nt:consistent-subtype? world9 (nt:tnat 0) (nt:tnat "t")))
+assert(Nil (nt:consistent-subtype? world9
+  (nt:trow "a" []) (nt:trow "b" [])))
 assert(nt:consistent? world9 nt:tany (nt:tfun [(nt:tnat 0)] (nt:tnat 0)))
 assert(nt:consistent? world9
   (nt:tfun [nt:tany] (nt:tnat 0))
@@ -164,5 +205,41 @@ assert(Equal (nt:tfun [nat] nat) (nt:checked-type (_1 checked-lambda)))
 (define bare-lambda
   (Try (lambda (z) (nt:synthesize ctx0 id-lambda)) 0))
 assert(Eq 1 (Hd bare-lambda))
+
+;;; Relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (into-libx path)
+  (If (Eq "boot" (Ix 0 path)) (Weld ["libx"] (drop 1 path)) path))
+
+(define reloc-scheme
+  (nt:scheme [(nt:type-param "v")]
+    (nt:trow "cell"
+      [(nt:trow-item "head" (nt:type-ref ["boot" "elem"]))
+       (nt:trow-item "tail"
+         (nt:type-app ["boot" "cell"]
+           [(nt:type-arg (nt:type-var "v"))]))])))
+(define relocated-scheme (nt:relocate-scheme into-libx reloc-scheme))
+(define relocated-items (nt:row-items (nt:scheme-body relocated-scheme)))
+assert(Equal (nt:type-ref ["libx" "elem"])
+  (nt:row-item-value (_0 relocated-items)))
+assert(Equal ["libx" "cell"]
+  (nt:ty-app-base (nt:row-item-value (_1 relocated-items))))
+;; The runtime constructor is identity, not location: never rewritten.
+assert(Eq "cell" (nt:row-cstr (nt:scheme-body relocated-scheme)))
+
+;; The rewriter receives full /ty-ap selectors; relocate-path lifts a plain
+;; per-declaration rewriter, decomposing part-wise with /ty-val opaque.
+(define ap-ref
+  (nt:type-ref
+    (ty-ap-encode [["boot" "box"] ["boot" "elem"] [ty-val-tag 3]])))
+(define relocated-ap
+  (nt:relocate-type (nt:relocate-path into-libx) ap-ref))
+assert(Equal
+  (ty-ap-encode [["libx" "box"] ["libx" "elem"] [ty-val-tag 3]])
+  (nt:type-ref-path relocated-ap))
+
+;; Unowned paths pass through untouched.
+assert(Equal (nt:type-ref ["nat"])
+  (nt:relocate-type into-libx (nt:type-ref ["nat"])))
 
 (print "foil-new-types tests passed")

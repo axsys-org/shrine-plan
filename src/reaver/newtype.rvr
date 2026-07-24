@@ -23,6 +23,12 @@
 (define tany-pax (ty-pax "any"))
 (define tany (tany-pax 0))
 
+;; The pail universe: the open union of branded nominal row types.  A
+;; single canonical value — it is compared with Equal — and never
+;; rebound by the $-derived constructor section below.
+(define tpail-pax (ty-pax "pail"))
+(define tpail (tpail-pax 0))
+
 (define tnat-pax (ty-pax "nat"))
 (define (tnat aura) (tnat-pax aura))
 (define tstr (tnat "t"))
@@ -63,6 +69,45 @@
 
 (define (typed-error ctx what detail)
   (error ["newtype" what ["at" ctx] detail]))
+
+
+;;; Type syntax ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Infix arrow syntax for function types: (a b -> r) rewrites to the
+;; expression (tfun [a b] r).  The arrow is right-associative, so
+;; (a -> b -> c) is (tfun [a] (tfun [b] c)), and (-> r) is a zero-argument
+;; type (which tfun canonically erases to r).
+;;
+;; arrow-rewrite expects its elements to be individually rewritten already;
+;; only chained arrows recurse here.
+(define (arrow-rewrite ctx elems)
+  (define hit (find-idx (Eq "->") elems))
+  (define i (_0 hit))
+  (define args (take i elems))
+  (define rest (drop (Inc i) elems))
+  (define ret
+    (Case3 (Sz rest)
+      (typed-error ctx "missing result type after ->" elems)
+      (_0 rest)
+      (If (find-idx (Eq "->") rest)
+        (arrow-rewrite ctx rest)
+        (typed-error ctx "multiple result types after ->" elems))))
+  [(1 tfun) (cons (1 0) args) ret])
+
+;; Rewriting is purely syntactic: it recurses through ordinary forms and
+;; brackets, and a form without a top-level arrow passes through unchanged
+;; as an ordinary expression.  Quoted literals stay opaque.
+(define (type-syntax ctx form)
+  (cond
+    ((Nil (IsApp form)) form)
+    ((Ne 0 (Hd form)) form)
+    ((Eq "#brak" (_0 form))
+      (cons "#brak" (map (type-syntax ctx) (drop 1 form))))
+    (else
+      (let1 elems (map (type-syntax ctx) form)
+        (If (find-idx (Eq "->") elems)
+          (arrow-rewrite ctx elems)
+          elems)))))
 
 
 ;;; Shallow runtime validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -106,6 +151,38 @@
             ["expected" typ]
             ["actual" val]])))
 
+(define (check-fun-arg name index typ val)
+  (If (shallow-type-fits? typ val)
+    val
+    (error ["newtype" "function argument type mismatch"
+            ["function" name]
+            ["index" index]
+            ["expected" typ]
+            ["actual" val]])))
+
+(define (check-fun-result name typ val)
+  (If (shallow-type-fits? typ val)
+    val
+    (error ["newtype" "function result type mismatch"
+            ["function" name]
+            ["expected" typ]
+            ["actual" val]])))
+
+(define (check-fun-impl name arity impl)
+  (unless (law-like? impl)
+    (error ["newtype" "function implementation is not law-like"
+            ["function" name]
+            ["actual" impl]])
+    1)
+  (define impl-arity (Arity (If (IsPin impl) (Unpin impl) impl)))
+  (unless (Eq arity impl-arity)
+    (error ["newtype" "function implementation arity mismatch"
+            ["function" name]
+            ["expected" arity]
+            ["actual" impl-arity]])
+    1)
+  impl)
+
 
 (define (handle-decl-item ctx item)
   ;; A transformer sees the unexpanded input, so a source-level [face ty]
@@ -116,7 +193,7 @@
     (typed-error ctx "bad row item" item)
     1)
   (define face (_1 item))
-  (define ty (_2 item))
+  (define ty (type-syntax ctx (_2 item)))
   (unless (IsNat face)
     (typed-error ctx "bad row-item face" face)
     1)
@@ -238,19 +315,46 @@
     1)
   (_0 hit))
 
-(define (row-face-transformer ctx uniq glo locals depth form)
-  (define index (row-face-index ctx glo form))
+;; Runtime face resolution, for type expressions which are not plain symbols
+;; in the expansion-site global environment (for example module-qualified
+;; references like nt:Row).  The face index lives in the row-type value
+;; itself, so nothing about the static path is lost except expansion-time
+;; error reporting.
+(define (row-face-index-of typ face)
+  (unless (And (IsApp typ) (Eq trow-pax (Hd typ)))
+    (error ["newtype" "not a row type" ["face" face "type" typ]])
+    1)
+  (define hit
+    (find-idx (lambda (item) (Eq face (_0 item))) (_1 typ)))
+  (unless hit
+    (error ["newtype" "unknown row face" [face typ]])
+    (_0 hit)))
 
-  ;; Emit (Ix index), capturing Ix at the macro's definition site and
-  ;; embedding the numeric index as literal data.
-  [uniq glo [(1 Ix) (1 index)]])
+(define (runtime-face-accessor typ face)
+  (Ix (row-face-index-of typ face)))
+(define (runtime-face-updater typ face)
+  (Up (row-face-index-of typ face)))
+
+;; A symbolic type name resolves to a literal index at expansion time.  Any
+;; other type expression stays call-site syntax and resolves its face at
+;; runtime.  Emitted operators capture Ix/Up at the definition site; the
+;; updater takes the replacement first, so (Type.=face new row) composes.
+(define (row-face-form ctx glo form static-op runtime-op)
+  (unless (Eq 3 (Sz form))
+    (typed-error ctx "bad row-face operation" form)
+    1)
+  (unless (IsNat (_2 form))
+    (typed-error ctx "face name must be a symbol" form)
+    1)
+  (If (IsNat (_1 form))
+    [(1 static-op) (1 (row-face-index ctx glo form))]
+    [(1 runtime-op) (_1 form) (1 (_2 form))]))
+
+(define (row-face-transformer ctx uniq glo locals depth form)
+  [uniq glo (row-face-form ctx glo form Ix runtime-face-accessor)])
 
 (define (row-face-updater-transformer ctx uniq glo locals depth form)
-  (define index (row-face-index ctx glo form))
-
-  ;; Up index takes the replacement first and the old row second, so the
-  ;; expanded updater composes directly as (Type.=face replacement row).
-  [uniq glo [(1 Up) (1 index)]])
+  [uniq glo (row-face-form ctx glo form Up runtime-face-updater)])
 
 
 (define (constructor-check-expr cstr item arg)
@@ -272,24 +376,44 @@
 ;; constructor hygiene bug while compiling rex.rvr.
 assert(Ne "_" (newtype-gensym 95 0))
 
-(define (type-constructor-transformer ctx uniq glo locals depth form)
-  (unless (Eq 2 (Sz form))
-    (typed-error ctx "bad type constructor" form)
-    1)
-  (define type-name (_1 form))
-  (unless (IsNat type-name)
-    (typed-error ctx "type name must be a symbol" type-name)
-    1)
+;; ($FunType impl) synthesizes a wrapper for impl which shallowly checks
+;; every argument and the result against the declared function type.  Like
+;; constructor field checks, only the outer representation is validated.
+(define (fun-wrapper-expansion uniq glo type-name typ)
+  (define argtys (_0 typ))
+  (define ret (_1 typ))
+  (define arity (Sz argtys))
 
-  (define entry (wisp:glookup type-name glo))
-  (unless entry
-    (typed-error ctx "unknown constructor type" type-name)
-    1)
-  (define row-type (_1 (wisp:Unpin entry)))
-  (unless (And (IsApp row-type) (Eq trow-pax (Hd row-type)))
-    (typed-error ctx "constructor type is not a row" type-name)
-    1)
+  ;; Same hygiene discipline as the constructor path: the outer self, the
+  ;; implementation binder, the inner self, and every argument are drawn
+  ;; from uniq in the private gensym namespace.
+  (define names (gen (Add 3 arity) (newtype-gensym uniq)))
+  (define outer-self (_0 names))
+  (define impl (_1 names))
+  (define inner-self (_2 names))
+  (define args (drop 3 names))
 
+  (define checks
+    (gen arity
+      (lambda (i)
+        [(1 check-fun-arg) (1 type-name) (1 i) (1 (Ix i argtys)) (Ix i args)])))
+  (define raw-call (cons impl args))
+  (define result
+    [(1 check-fun-result) (1 type-name) (1 ret) raw-call])
+  (define body
+    (foldr (lambda (check rest) [(1 Seq) check rest]) result checks))
+  (define inner
+    ["#fun" "nopin" "noinline" (1 type-name) (cons inner-self args) body])
+
+  ;; The implementation itself is validated once, when the wrapper is built,
+  ;; not on every call.
+  (define checked-impl
+    [(1 check-fun-impl) (1 type-name) (1 arity) impl])
+  [(Add uniq (Add 3 arity)) glo
+   ["#fun" "nopin" "inline" (1 type-name) [outer-self impl]
+    [(1 Seq) checked-impl inner]]])
+
+(define (row-constructor-expansion ctx uniq glo type-name row-type)
   (define cstr (_0 row-type))
   (define items (_1 row-type))
   (define arity (Sz items))
@@ -323,6 +447,31 @@ assert(Ne "_" (newtype-gensym 95 0))
     [uniq glo [(1 cstr) (1 (_0 (_1 (_0 items))))]]
     [(Add uniq (Inc arity)) glo
      ["#fun" "nopin" "inline" (1 type-name) signature body]]))
+
+(define (type-constructor-transformer ctx uniq glo locals depth form)
+  (unless (Eq 2 (Sz form))
+    (typed-error ctx "bad type constructor" form)
+    1)
+  (define type-name (_1 form))
+  (unless (IsNat type-name)
+    (typed-error ctx "type name must be a symbol" type-name)
+    1)
+
+  (define entry (wisp:glookup type-name glo))
+  (unless entry
+    (typed-error ctx "unknown constructor type" type-name)
+    1)
+  (define typ (_1 (wisp:Unpin entry)))
+  (unless (IsApp typ)
+    (typed-error ctx "constructor type is not a row or fun" type-name)
+    1)
+  (cond
+    ((Eq tfun-pax (Hd typ))
+      (fun-wrapper-expansion uniq glo type-name typ))
+    ((Eq trow-pax (Hd typ))
+      (row-constructor-expansion ctx uniq glo type-name typ))
+    (else
+      (typed-error ctx "constructor type is not a row or fun" type-name))))
 
 
 
@@ -644,7 +793,27 @@ assert(Equal
    ["#let" [[scrutinee scrutinee-expr]]
     [(1 Seq) checked dispatch]]])
 
+;; (decl-fun Name argty ... -> retty) binds Name to a function type value.
+;; Types use the infix arrow syntax; each type stays call-site syntax,
+;; evaluated in the generated #bind RHS like declare-cstr field types.
+;; tfun's canonical erasure applies: (decl-fun T -> r) binds the result type.
+(define (fun-decl-transformer ctx uniq glo locals depth form)
+  (And depth (typed-error ctx "decl-fun is top-level only" form))
+  (unless (Ge (Sz form) 4)
+    (typed-error ctx "bad decl-fun" form)
+    1)
+  (define nm (_1 form))
+  (unless (IsNat nm)
+    (typed-error ctx "bad decl-fun name" form)
+    1)
+  (define spec (map (type-syntax ctx) (drop 2 form)))
+  (unless (find-idx (Eq "->") spec)
+    (typed-error ctx "decl-fun needs an -> between arguments and result" form)
+    1)
+  [uniq glo ["#bind" nm (arrow-rewrite ctx spec)]])
+
 (#macro decl-union decl-union-transformer)
+(#macro decl-fun fun-decl-transformer)
 (#macro ? union-match-transformer)
 
 (declare-cstr Pair ROOT
@@ -785,3 +954,77 @@ assert(Eq "other" (pair-or-fallback example-row))
 (define bad-union-scrutinee
   (Try (lambda (z) (pair-or-fallback tany)) 0))
 assert(Eq 1 (Hd bad-union-scrutinee))
+
+
+;; (decl-fun NatBinop ...) -> bind NatBinop to a function type; ($NatBinop f)
+;; wraps f so every call shallowly checks arguments and result.
+
+(decl-fun NatBinop (tnat 0) (tnat 0) -> (tnat 0))
+assert(Eq tfun-pax (Hd NatBinop))
+assert(Equal (tfun [(tnat 0) (tnat 0)] (tnat 0)) NatBinop)
+
+(define (raw-add a b) (Add a b))
+(define checked-add ($NatBinop raw-add))
+assert(Eq 5 (checked-add 2 3))
+
+(define bad-add-argument
+  (Try (lambda (z) (checked-add [1] 3)) 0))
+assert(Eq 1 (Hd bad-add-argument))
+
+(decl-fun NatToNat (tnat 0) -> (tnat 0))
+(define bad-result-fn ($NatToNat (lambda (a) [a])))
+(define bad-fun-result
+  (Try (lambda (z) (bad-result-fn 7)) 0))
+assert(Eq 1 (Hd bad-fun-result))
+
+;; The implementation is validated once, when the wrapper is built.
+(define bad-fun-impl
+  (Try (lambda (z) ($NatBinop 5)) 0))
+assert(Eq 1 (Hd bad-fun-impl))
+
+(define bad-fun-arity
+  (Try (lambda (z) ($NatBinop (lambda (a) a))) 0))
+assert(Eq 1 (Hd bad-fun-arity))
+
+;; A non-symbolic type expression defers face resolution to runtime, so
+;; accessors work through aliases the expander cannot see (module-qualified
+;; references, locals, computed types).
+assert(Eq trow-item-pax ((. (_0 [Row]) cstr) RowItem))
+assert(Eq 4 ((. (_0 [Point]) y) example-point))
+
+(define runtime-moved-point ((.= (_0 [Point]) x) 30 example-point))
+assert(Eq 30 (Point.x runtime-moved-point))
+assert(Eq 4 (Point.y runtime-moved-point))
+
+(define bad-runtime-face
+  (Try (lambda (z) ((. (_0 [Row]) nosuch) example-row)) 0))
+assert(Eq 1 (Hd bad-runtime-face))
+
+;; Zero-argument declarations share tfun's canonical erasure.
+(decl-fun ThunkNat -> (tnat 0))
+assert(Equal (tnat 0) ThunkNat)
+
+;; Parenthesized arrow groups nest as argument or result types.
+(decl-fun NatIter ((tnat 0) -> (tnat 0)) (tnat 0) -> (tnat 0))
+assert(Equal
+  (tfun [(tfun [(tnat 0)] (tnat 0)) (tnat 0)] (tnat 0))
+  NatIter)
+
+(define iter-twice ($NatIter (lambda (f x) (f (f x)))))
+assert(Eq 7 (iter-twice (lambda (n) (Inc n)) 5))
+(define bad-iter-fun-arg
+  (Try (lambda (z) (iter-twice 9 5)) 0))
+assert(Eq 1 (Hd bad-iter-fun-arg))
+
+;; The arrow is right-associative.
+(decl-fun CurriedAdd (tnat 0) -> (tnat 0) -> (tnat 0))
+assert(Equal
+  (tfun [(tnat 0)] (tfun [(tnat 0)] (tnat 0)))
+  CurriedAdd)
+
+;; Field types in declarations understand the same arrow syntax.
+(declare-cstr Handler ROOT
+  [run (tstr -> tany)])
+assert(Equal
+  (tfun [tstr] tany)
+  (_1 (_0 (Row.items Handler))))

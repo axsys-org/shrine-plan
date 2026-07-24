@@ -135,9 +135,24 @@
 (define (type-error what detail)
   (error ["foil-new-types" what detail]))
 
+;; Thread a state value through a per-item step which returns [state item].
+;; This is the calling convention used throughout this kernel and the
+;; surface elaborator; thread-map replaces the hand-written fold plumbing
+;; that convention otherwise forces at every call site.
+(define (thread-map f state xs)
+  (foldl
+    (lambda (acc x)
+      (let ((r (f (_0 acc) x)))
+        [(_0 r) (snoc (_1 r) (_1 acc))]))
+    [state []] xs))
+
+;; Unit-qualified storage keys carry a content pin as a segment, so path
+;; segments are naturals or pins.
+(define (path-segment? seg) (Or (IsNat seg) (IsPin seg)))
+
 (define (valid-path? path)
   (And (IsApp path)
-    (And (Sz path) (all IsNat path))))
+    (And (Sz path) (all path-segment? path))))
 
 (define (need-path what path)
   (unless (valid-path? path)
@@ -168,6 +183,13 @@
     (TyParam [name] name)
     (ConstParam [name] name)))
 
+;; The declared type of a const parameter (errors on a type parameter,
+;; which carries none).
+(define (const-param-type param)
+  (? SchemeParameter param
+    (TyParam (type-error "type parameter has no declared type" param))
+    (ConstParam [declared-type] declared-type)))
+
 (define (argument-value arg)
   (? GenericArgument arg
     (TyArg [value] value)
@@ -178,6 +200,7 @@
 ;; happen to implement the public type vocabulary.
 (define (bottom-type? typ) (type-is-tag? tbot-pax typ))
 (define (any-type? typ) (type-is-tag? tany-pax typ))
+(define (pail-type? typ) (type-is-tag? tpail-pax typ))
 (define (nat-type? typ) (type-is-tag? tnat-pax typ))
 (define (const-type? typ) (type-is-tag? tconst-pax typ))
 (define (row-item-type? typ) (type-is-tag? trow-item-pax typ))
@@ -188,7 +211,7 @@
 
 (define (monotype? typ)
   (any (lambda (pred) (pred typ))
-    [bottom-type? any-type? nat-type? const-type?
+    [bottom-type? any-type? pail-type? nat-type? const-type?
      row-item-type? row-type? sum-type? fun-type? array-type?
      type-ref? type-var? const-var? type-app?]))
 
@@ -219,9 +242,13 @@
   (TypeWorld.=subtype-cache cache world))
 
 (define (world-clear-caches world)
-  (world-with-subtype-cache
-    (world-with-unfold-cache world cairn:empty-ax)
-    cairn:empty-ax))
+  (pipe world
+    (TypeWorld.=unfold-cache cairn:empty-ax)
+    (TypeWorld.=subtype-cache cairn:empty-ax)))
+
+(define (world-bump-revision world)
+  (TypeWorld.=namespace-revision
+    (Inc (TypeWorld.namespace-revision world)) world))
 
 (define (world-find-direct world path)
   (define over (cairn:getax path (TypeWorld.overlays world)))
@@ -243,14 +270,10 @@
   (unless (Nil (world-find-direct world path))
     (type-error "duplicate type entry" path)
     1)
-  (let* ((world1
-           (TypeWorld.=namespace
-             (cairn:putax path entry (TypeWorld.namespace world))
-             world))
-         (world2
-           (TypeWorld.=namespace-revision
-             (Inc (TypeWorld.namespace-revision world1)) world1)))
-    (world-clear-caches world2)))
+  (pipe world
+    (TypeWorld.=namespace (cairn:putax path entry (TypeWorld.namespace world)))
+    world-bump-revision
+    world-clear-caches))
 
 (define (declare-type world path scm runtime-brand runtime-arity source)
   (insert-type-entry world
@@ -264,15 +287,18 @@
   (unless (world-find-direct world path)
     (type-error "cannot replace missing type entry" path)
     1)
-  (let* ((entry
-           (make-type-entry path scm runtime-brand runtime-arity source))
-         (world1
-           (TypeWorld.=namespace
-             (cairn:putax path entry (TypeWorld.namespace world)) world))
-         (world2
-           (TypeWorld.=namespace-revision
-             (Inc (TypeWorld.namespace-revision world1)) world1)))
-    (world-clear-caches world2)))
+  (define entry
+    (make-type-entry path scm runtime-brand runtime-arity source))
+  ;; Materialized applications are specializations of namespace entries, so
+  ;; replacement invalidates them wholesale: an overlay interned against
+  ;; this entry's placeholder (during the seal -> refine module pass) must
+  ;; not survive the refinement.  They are a cache and re-materialize
+  ;; lazily on lookup.
+  (pipe world
+    (TypeWorld.=namespace (cairn:putax path entry (TypeWorld.namespace world)))
+    (TypeWorld.=overlays cairn:empty-ax)
+    world-bump-revision
+    world-clear-caches))
 
 (define (type-world-entries world)
   ;; Overlays are intentionally absent: they are lookupable but second-class
@@ -301,7 +327,15 @@
           (type-error "type application argument must be a resolved Path" value)
           (Path.p value))))
     ((type-is-tag? "/foil/new-types/constarg" arg)
-      [ty-val-tag (ConstArg.value arg)])
+      ;; Literal consts ride as /ty-val segments; a path-valued const (a
+      ;; comparator function) rides as a plain path part — the parameter
+      ;; kind disambiguates on decode.
+      (let ((value (ConstArg.value arg)))
+        (cond
+          ((IsNat value) [ty-val-tag value])
+          ((valid-path? value) value)
+          (else
+            (type-error "const argument cannot ride a path" value)))))
     (else (type-error "bad application argument" arg))))
 
 (define (application-path base arguments)
@@ -382,7 +416,9 @@
         (any (lambda (arg)
           (? GenericArgument arg
             (TyArg [value] (recur value))
-            (ConstArg 0)))
+            ;; A symbolic const argument is a ConstVar leaf; ground consts
+            ;; (nats, paths) never satisfy a type predicate.
+            (ConstArg [value] (pred value))))
           (TyApp.arguments typ)))
       (else 0))))
 
@@ -396,7 +432,82 @@
     typ)))
 
 
+;;; Relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Rewrite every nominal path in a type value.  The rewriter receives full
+;; canonical paths — including /ty-ap selectors — because relocation policy
+;; (foil-relocate's qualify-canonical-path) needs the whole selector to
+;; decide ownership.  Row runtime constructors are never rewritten: they are
+;; runtime identity, not location.  A simple per-declaration rewriter lifts
+;; to the full contract with (relocate-path plain-rewrite), which decomposes
+;; /ty-ap selectors and passes /ty-val and /ty-var segments through opaquely.
+(define (relocate-path rewrite path)
+  (cond
+    ((ty-ap-path? path)
+      (let ((parts (ty-ap-decode path)))
+        (unless parts
+          (type-error "malformed /ty-ap path" path)
+          1)
+        (ty-ap-encode (map (relocate-path rewrite) parts))))
+    ((ty-val-path? path) path)
+    ((ty-var-path? path) path)
+    (else (rewrite path))))
+
+(define (relocate-type rewrite typ)
+  (map-type
+    (lambda (node)
+      (cond
+        ((type-ref? node)
+          (type-ref (rewrite (Path.p node))))
+        ((type-app? node)
+          (type-app (rewrite (TyApp.base node))
+            (TyApp.arguments node)))
+        (else node)))
+    typ))
+
+(define (relocate-scheme rewrite scm)
+  (unless (scheme? scm)
+    (type-error "relocate-scheme expected a Scheme" scm)
+    1)
+  (scheme
+    (map (lambda (param)
+      (? SchemeParameter param
+        (TyParam param)
+        (ConstParam [name declared-type]
+          (const-param name (relocate-type rewrite declared-type)))))
+      (Scheme.parameters scm))
+    (relocate-type rewrite (Scheme.body scm))))
+
+(define (relocate-type-value rewrite value)
+  (If (scheme? value)
+    (relocate-scheme rewrite value)
+    (relocate-type rewrite value)))
+
+
 ;;; Specialization and overlay materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; An argument is template while it still mentions variables (or an
+;; unresolved application) and therefore cannot ride a canonical path.
+(define (template-argument? arg)
+  (? GenericArgument arg
+    (TyArg [value] (Nil (resolved-type? value)))
+    (ConstArg [value] (const-var? value))))
+
+;; An argument rides a canonical /ty-ap path only as a resolved nominal
+;; reference or a ground constant; anything else (template nodes, ground
+;; structural types) keeps its application symbolic.
+(define (path-ridable-argument? arg)
+  (? GenericArgument arg
+    (TyArg [value] (type-ref? value))
+    (ConstArg [value] (Nil (const-var? value)))))
+
+;; A parameter as its own symbolic argument, for eta-expanding a bare
+;; reference to a parameterized entry: `empty` viewed inside a @v body
+;; means empty[@v].
+(define (parameter-template-argument param)
+  (? SchemeParameter param
+    (TyParam [name] (type-arg (type-var name)))
+    (ConstParam [name] (const-arg (const-var name)))))
 
 (define (bind-parameters params arguments)
   (unless (arguments-match-parameters? params arguments)
@@ -411,22 +522,21 @@
   (define (recur w t)
     (specialize-template-resolving resolve w bindings self-path t))
   (define (specialize-args w arguments)
-    (foldl
-      (lambda (state arg)
+    (thread-map
+      (lambda (w1 arg)
         (? GenericArgument arg
           (TyArg [value]
-            (let ((r (recur (_0 state) value)))
-              [(_0 r) (snoc (type-arg (_1 r)) (_1 state))]))
+            (let ((r (recur w1 value)))
+              [(_0 r) (type-arg (_1 r))]))
           (ConstArg [value]
             (If (const-var? value)
               (let ((bound (binding-argument (ConstVar.name value) bindings)))
                 (? GenericArgument bound
-                  (ConstArg [value]
-                    [(_0 state) (snoc (const-arg value) (_1 state))])
+                  (ConstArg [value] [w1 (const-arg value)])
                   (TyArg
                     (type-error "type argument in const position" value))))
-              [(_0 state) (snoc arg (_1 state))]))))
-      [w []] arguments))
+              [w1 arg]))))
+      w arguments))
   (cond
     ((type-var? typ)
       (let ((arg (binding-argument (TyVar.name typ) bindings)))
@@ -437,45 +547,43 @@
     ((const-var? typ)
       (let ((arg (binding-argument (ConstVar.name typ) bindings)))
         (? GenericArgument arg
-          (ConstArg [value] [world (tconst value)])
+          (ConstArg [value]
+            ;; A template const argument substitutes symbolically; a
+            ;; ground one becomes its singleton type.
+            (If (const-var? value) [world value] [world (tconst value)]))
           (TyArg
             (type-error "type argument used as a const variable" typ)))))
     ((type-app? typ)
       (let* ((r (specialize-args world (TyApp.arguments typ)))
-             (args (_1 r))
-             (path (application-path (TyApp.base typ) args)))
-        (If (And self-path (Equal path self-path))
-          [(_0 r) (type-ref self-path)]
-          (let ((resolved (resolve (_0 r) path)))
-            [(_0 resolved) (type-ref path)]))))
+             (args (_1 r)))
+        (If (all path-ridable-argument? args)
+          (let ((path (application-path (TyApp.base typ) args)))
+            (If (And self-path (Equal path self-path))
+              [(_0 r) (type-ref self-path)]
+              (let ((resolved (resolve (_0 r) path)))
+                [(_0 resolved) (type-ref path)])))
+          ;; Substitution did not produce path-ridable arguments (still
+          ;; template, or ground but structural): keep the application
+          ;; symbolic.  Views, runtime keys, and subtyping all work on
+          ;; the symbolic form; it interns if a later specialization
+          ;; grounds it nominally.
+          [(_0 r) (type-app (TyApp.base typ) args)])))
     ((type-is-tag? trow-item-pax typ)
       (let ((r (recur world (RowItem.value typ))))
         [(_0 r) (trow-item (RowItem.face typ) (_1 r))]))
     ((type-is-tag? trow-pax typ)
       (let ((r
-              (foldl
-                (lambda (state item)
-                  (let ((ir (recur (_0 state) (RowItem.value item))))
-                    [(_0 ir)
-                     (snoc (trow-item (RowItem.face item) (_1 ir))
-                       (_1 state))]))
-                [world []] (Row.items typ))))
+              (thread-map
+                (lambda (w1 item)
+                  (let ((ir (recur w1 (RowItem.value item))))
+                    [(_0 ir) (trow-item (RowItem.face item) (_1 ir))]))
+                world (Row.items typ))))
         [(_0 r) (trow (Row.cstr typ) (_1 r))]))
     ((type-is-tag? tsum-pax typ)
-      (let ((r
-              (foldl
-                (lambda (state option)
-                  (let ((ir (recur (_0 state) option)))
-                    [(_0 ir) (snoc (_1 ir) (_1 state))]))
-                [world []] (Sum.options typ))))
+      (let ((r (thread-map recur world (Sum.options typ))))
         [(_0 r) (tsum (_1 r))]))
     ((type-is-tag? tfun-pax typ)
-      (let* ((ra
-               (foldl
-                 (lambda (state arg)
-                   (let ((ir (recur (_0 state) arg)))
-                     [(_0 ir) (snoc (_1 ir) (_1 state))]))
-                 [world []] (Fun.args typ)))
+      (let* ((ra (thread-map recur world (Fun.args typ)))
              (rr (recur (_0 ra) (Fun.return typ))))
         [(_0 rr) (tfun (_1 ra) (_1 rr))]))
     ((type-is-tag? tarr-pax typ)
@@ -488,6 +596,17 @@
     (else [world typ])))
 
 (define (specialize-const-parameter-types resolve world params arguments)
+  ;; A declared const-parameter type may be a nominal reference (the surface
+  ;; elaborator emits e.g. Path ["nat"]).  The shallow fit below needs the
+  ;; underlying representation, so chase references through their entries.
+  (define (deref w t)
+    (If (type-ref? t)
+      (let ((lr (resolve w (Path.p t))))
+        (unless (TypeEntry.body (_1 lr))
+          (type-error "const parameter type is an unspecialized generic" t)
+          1)
+        (deref (_0 lr) (TypeEntry.body (_1 lr))))
+      [w t]))
   ;; Parameters are ordered.  A const parameter's declared type may mention
   ;; earlier type parameters, but never later ones.
   (define (walk w done-params done-args rest-params rest-args)
@@ -500,18 +619,26 @@
             (walk w (snoc param done-params) (snoc arg done-args)
               (drop 1 rest-params) (drop 1 rest-args)))
           (ConstParam [declared-type]
-            (let* ((prior-bindings (bind-parameters done-params done-args))
-                   (r (specialize-template-resolving resolve w
-                        prior-bindings 0 declared-type))
-                   (want (_1 r))
-                   (value (ConstArg.value arg)))
-              (unless (shallow-type-fits? want value)
-                (type-error "const generic argument type mismatch"
-                  ["parameter" (ConstParam.name param)
-                   "expected" want "actual" value])
-                1)
-              (walk (_0 r) (snoc param done-params) (snoc arg done-args)
-                (drop 1 rest-params) (drop 1 rest-args))))))))
+            (If (Nil (IsNat (ConstArg.value arg)))
+              ;; Template const arguments defer their fit to the
+              ;; grounding specialization; path-valued consts defer to
+              ;; materialization, which resolves the referee.  Only
+              ;; ground naturals shallow-check here.
+              (walk w (snoc param done-params) (snoc arg done-args)
+                (drop 1 rest-params) (drop 1 rest-args))
+              (let* ((prior-bindings (bind-parameters done-params done-args))
+                     (r (specialize-template-resolving resolve w
+                          prior-bindings 0 declared-type))
+                     (wr (deref (_0 r) (_1 r)))
+                     (want (_1 wr))
+                     (value (ConstArg.value arg)))
+                (unless (shallow-type-fits? want value)
+                  (type-error "const generic argument type mismatch"
+                    ["parameter" (ConstParam.name param)
+                     "expected" want "actual" value])
+                  1)
+                (walk (_0 wr) (snoc param done-params) (snoc arg done-args)
+                  (drop 1 rest-params) (drop 1 rest-args)))))))))
   (walk world [] [] params arguments))
 
 (define (specialize-scheme-at-resolving resolve world scm arguments self-path)
@@ -532,8 +659,8 @@
     (type-error "type application arity mismatch"
       ["expected" (Sz params) "actual" (Sz parts)])
     1)
-  (foldl
-    (lambda (state pair)
+  (thread-map
+    (lambda (w pair)
       (define param (_0 pair))
       (define part (_1 pair))
       (? SchemeParameter param
@@ -544,15 +671,15 @@
               1)
             ;; Resolve nested applications now.  Plain paths are validated by
             ;; ordinary lookup as well, making bad arguments fail at the seam.
-            (let ((lr (resolve (_0 state) part)))
-              [(_0 lr) (snoc (type-arg (type-ref part)) (_1 state))])))
+            (let ((lr (resolve w part)))
+              [(_0 lr) (type-arg (type-ref part))])))
         (ConstParam
-          (let ((is-const-path (ty-val-path? part)))
-            (unless is-const-path
-              (type-error "type path supplied for const parameter" part)
-              1)
-            [(_0 state) (snoc (const-arg (Ix 1 part)) (_1 state))]))))
-    [world []] (zip params parts)))
+          (If (ty-val-path? part)
+            [w (const-arg (Ix 1 part))]
+            ;; A plain path part under a const parameter is a
+            ;; path-valued const argument (a comparator function).
+            [w (const-arg part)]))))
+    world (zip params parts)))
 
 (define (materialize-type-application-resolving resolve world path)
   (unless (ground-application-path? path)
@@ -567,8 +694,25 @@
          (decoded
            (decode-application-arguments resolve world1 params (drop 1 parts)))
          (args (_1 decoded))
+         ;; Tie the knot for recursive generics.  The body being specialized
+         ;; can reach this same application through a member (map[nat] names
+         ;; map/node[nat] whose fields name map[nat] again), which the
+         ;; self-path short-circuit below cannot see.  Lookups made while the
+         ;; body specializes must find a placeholder instead of re-entering
+         ;; this materialization; the real entry overwrites it on completion.
+         ;; The placeholder body is a self-reference: mid-specialization only
+         ;; `resolve` touches this entry, never a view of its body.
+         (placeholder
+           ($TypeEntry path base args (mono (type-ref path)) (type-ref path)
+             (TypeEntry.runtime-brand generic)
+             (TypeEntry.runtime-arity generic)
+             (TypeEntry.source generic)))
+         (world-tied
+           (world-with-overlays (_0 decoded)
+             (cairn:putax path placeholder
+               (TypeWorld.overlays (_0 decoded)))))
          (body-result
-           (specialize-scheme-at-resolving resolve (_0 decoded)
+           (specialize-scheme-at-resolving resolve world-tied
              (TypeEntry.scheme generic) args path))
          (body (_1 body-result)))
     (unless (resolved-type? body)
@@ -615,21 +759,69 @@
       [world (_0 cached)]
       (let* ((looked (lookup-type-entry world path))
              (world1 (_0 looked))
-             (body (TypeEntry.body (_1 looked))))
-        (unless body
-          (type-error "cannot unfold unspecialized generic" path)
-          1)
-        [(world-with-unfold-cache world1
-           (cairn:putax path body (TypeWorld.unfold-cache world1)))
+             (entry (_1 looked))
+             (direct (TypeEntry.body entry))
+             (br
+               (If direct
+                 [world1 direct]
+                 ;; A bare reference to a parameterized entry views as
+                 ;; the symbolic application of the entry to its own
+                 ;; parameters (auto-eta).
+                 (specialize-scheme-at-resolving lookup-type-entry world1
+                   (TypeEntry.scheme entry)
+                   (map parameter-template-argument
+                     (Scheme.parameters (TypeEntry.scheme entry)))
+                   0)))
+             (body (_1 br)))
+        [(world-with-unfold-cache (_0 br)
+           (cairn:putax path body (TypeWorld.unfold-cache (_0 br))))
          body]))))
 
 (define (view world typ)
-  (If (type-ref? typ) (unfold-type world typ) [world typ]))
+  (cond
+    ((type-ref? typ) (unfold-type world typ))
+    ;; A template application views through its base scheme by symbolic
+    ;; substitution: bst[@v] becomes bst's body with @v in place of the
+    ;; parameter, nested applications staying symbolic while any of
+    ;; their arguments remains template.  Substitution is purely syntactic
+    ;; over the base entry, so the result is memoizable on the application
+    ;; value alone; recursive generics (map[k lt]) re-view the same app at
+    ;; every subtype/match step and blow up without this.
+    ((type-app? typ)
+      (let* ((key ["#app-view" typ])
+             (cached (cairn:getax key (TypeWorld.unfold-cache world))))
+        (If cached
+          [world (_0 cached)]
+          (let* ((lr (lookup-type-entry world (TyApp.base typ)))
+                 (br
+                   (specialize-scheme-at-resolving lookup-type-entry (_0 lr)
+                     (TypeEntry.scheme (_1 lr)) (TyApp.arguments typ) 0))
+                 (body (_1 br)))
+            [(world-with-unfold-cache (_0 br)
+               (cairn:putax key body (TypeWorld.unfold-cache (_0 br))))
+             body]))))
+    (else [world typ])))
 
 (define (runtime-key world typ)
   (cond
     ((type-ref? typ)
-      (let ((r (lookup-type-entry world (Path.p typ))))
+      (let* ((r (lookup-type-entry world (Path.p typ)))
+             (entry (_1 r))
+             (brand (TypeEntry.runtime-brand entry))
+             (arity (TypeEntry.runtime-arity entry))
+             (body (TypeEntry.body entry)))
+        ;; An alias entry (body itself a reference or application) with
+        ;; no key of its own forwards its target's runtime key, so
+        ;; matching through the alias dispatches on the real brand.
+        (If (And (Ifz brand 1 0)
+              (And (Ifz arity 1 0)
+                (Or (type-ref? body) (type-app? body))))
+          (runtime-key (_0 r) body)
+          [(_0 r) [brand arity]])))
+    ;; Type arguments erase at runtime, so a template application keys
+    ;; exactly as its base.
+    ((type-app? typ)
+      (let ((r (lookup-type-entry world (TyApp.base typ))))
         [(_0 r)
          [(TypeEntry.runtime-brand (_1 r))
           (TypeEntry.runtime-arity (_1 r))]]))
@@ -672,6 +864,49 @@
       (else w)))
   (walk world typ))
 
+;; Like check-type-wf, but template nodes are acceptable: a declaration
+;; template is well-formed when every nominal reference in it resolves.
+;; This is the module post-pass check — types may reference declarations
+;; that follow them, so it runs against the final world.
+(define (check-template-wf world typ)
+  (define (walk w t)
+    (cond
+      ((type-var? t) w)
+      ((const-var? t) w)
+      ((type-app? t)
+        (let ((w1 (_0 (lookup-type-entry w (TyApp.base t)))))
+          (foldl
+            (lambda (acc arg)
+              (? GenericArgument arg
+                (TyArg [value] (walk acc value))
+                (ConstArg acc)))
+            w1 (TyApp.arguments t))))
+      ((type-is-tag? tzero-rec-pax t)
+        (type-error "open recursion in resolved type" t))
+      ((type-ref? t) (_0 (lookup-type-entry w (Path.p t))))
+      ((type-is-tag? trow-item-pax t) (walk w (RowItem.value t)))
+      ((type-is-tag? trow-pax t)
+        (foldl (lambda (acc item) (walk acc (RowItem.value item)))
+          w (Row.items t)))
+      ((type-is-tag? tsum-pax t)
+        (let ((w1 (foldl walk w (Sum.options t))))
+          (check-sum-runtime-keys w1 (Sum.options t))))
+      ((type-is-tag? tfun-pax t)
+        (walk (foldl walk w (Fun.args t)) (Fun.return t)))
+      ((type-is-tag? tarr-pax t) (walk w (Arr.item t)))
+      (else w)))
+  (walk world typ))
+
+(define (check-scheme-wf world scm)
+  (define w1
+    (foldl
+      (lambda (w param)
+        (? SchemeParameter param
+          (TyParam w)
+          (ConstParam [declared-type] (check-template-wf w declared-type))))
+      world (Scheme.parameters scm)))
+  (check-template-wf w1 (Scheme.body scm)))
+
 
 ;;; Static subtyping and gradual consistency ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -679,11 +914,16 @@
   (includes (lambda (pair)
     (And (Equal actual (_0 pair)) (Equal expected (_1 pair)))) seen))
 
-(define (subtype-seen world seen actual expected)
+;; One walk serves both the strict and the gradual boundary relation:
+;; any-ok? is the single point where they differ.  Consistent subtyping
+;; (any-ok? = 1) keeps every other rule of static subtyping — auras,
+;; constants, contravariant function arguments, nominal identity — and
+;; only lets Any stand for any type, at any depth.
+(define (subtype-go any-ok? world seen actual expected)
   (If (seen-pair? actual expected seen)
     [world 1]
     (let ((seen1 (snoc [actual expected] seen)))
-      (define (recur w a b) (subtype-seen w seen1 a b))
+      (define (recur w a b) (subtype-go any-ok? w seen1 a b))
       (define (all-pairs w pairs contra?)
         (foldl
           (lambda (state pair)
@@ -719,19 +959,33 @@
           [w 0] options))
       (cond
         ((Equal actual expected) [world 1])
-        ;; Any is not static top or bottom.  It participates only in the
-        ;; separately named consistency relation below.
+        ;; Under strict subtyping Any is not top or bottom; a dynamic
+        ;; boundary opts in via consistent-subtype.
         ((Or (type-is-tag? tany-pax actual)
              (type-is-tag? tany-pax expected))
-          [world 0])
+          [world any-ok?])
         ((type-is-tag? tbot-pax actual) [world 1])
         ((type-is-tag? tbot-pax expected) [world 0])
         ;; Preserve nominal identity when equal; otherwise inspect one weak
         ;; head layer and let the coinductive pair memo tie recursive knots.
+        ;; Template applications view symbolically the same way.
         ((Or (type-ref? actual) (type-ref? expected))
           (let* ((ar (view world actual))
                  (er (view (_0 ar) expected)))
             (recur (_0 er) (_1 ar) (_1 er))))
+        ((Or (type-app? actual) (type-app? expected))
+          (let* ((ar (view world actual))
+                 (er (view (_0 ar) expected)))
+            (recur (_0 er) (_1 ar) (_1 er))))
+        ;; The pail universe admits exactly the branded nominal rows:
+        ;; anonymous (cstr-0) rows and sums stay outside it.  After the
+        ;; view clauses (both sides are weak-head structural here) and
+        ;; before the sum clauses, so a sum never slips in option-wise.
+        ((type-is-tag? tpail-pax expected)
+          (If (type-is-tag? trow-pax actual)
+            [world (Ifz (Row.cstr actual) 0 1)]
+            [world (type-is-tag? tpail-pax actual)]))
+        ((type-is-tag? tpail-pax actual) [world 0])
         ((type-is-tag? tsum-pax actual)
           (all-options world (Sum.options actual) expected 1))
         ((type-is-tag? tsum-pax expected)
@@ -761,6 +1015,14 @@
                 args-result
                 (recur (_0 args-result)
                   (Fun.return actual) (Fun.return expected))))))
+        ;; A cstr-0 structural row is a PLAN row at runtime, so it nests
+        ;; as an array whenever every item fits the element type.
+        ((And (type-is-tag? trow-pax actual)
+              (And (Ifz (Row.cstr actual) 1 0)
+                (type-is-tag? tarr-pax expected)))
+          (all-options world
+            (map RowItem.value (Row.items actual))
+            (Arr.item expected) 1))
         ((And (type-is-tag? trow-pax actual)
               (type-is-tag? trow-pax expected))
           (Ifz (And (Eq (Row.cstr actual) (Row.cstr expected))
@@ -772,18 +1034,150 @@
               0)))
         (else [world 0])))))
 
-(define (subtype world actual expected)
-  (define key [actual expected])
+(define (subtype-with-cache any-ok? world actual expected)
+  (define key
+    (If any-ok? ["cs" actual expected] [actual expected]))
   (define cached (cairn:getax key (TypeWorld.subtype-cache world)))
   (If cached
     [world (_0 cached)]
-    (let ((r (subtype-seen world [] actual expected)))
+    (let ((r (subtype-go any-ok? world [] actual expected)))
       [(world-with-subtype-cache (_0 r)
          (cairn:putax key (_1 r) (TypeWorld.subtype-cache (_0 r))))
        (_1 r)])))
 
+(define (subtype world actual expected)
+  (subtype-with-cache 0 world actual expected))
+
 (define (subtype? world actual expected)
   (_1 (subtype world actual expected)))
+
+(define (consistent-subtype world actual expected)
+  (subtype-with-cache 1 world actual expected))
+
+(define (consistent-subtype? world actual expected)
+  (_1 (consistent-subtype world actual expected)))
+
+
+;;; Template matching (inference) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Match a template monotype against an actual type, accumulating type
+;; variable bindings ([name type] rows).  First binding wins; a later
+;; occurrence must relate by subtyping in one direction, the binding
+;; widening when the new actual is wider.  Constants widen to plain nat
+;; at binding sites: tconst is the const-parameter vocabulary, not an
+;; inference target.  A fully resolved template defers to consistent
+;; subtyping.  Returns [world bindings] or 0 (no match).
+(define (match-template world bindings template actual0)
+  (define (widen-constant t)
+    (If (const-type? t) (tnat 0) t))
+  (define actual (widen-constant actual0))
+  (define (match-many w bs pairs)
+    (foldl
+      (lambda (state pair)
+        (Ifz state
+          0
+          (match-template (_0 state) (_1 state) (_0 pair) (_1 pair))))
+      [w bs] pairs))
+  (define (match-arguments w bs targs aargs)
+    (And (Eq (Sz targs) (Sz aargs))
+      (foldl
+        (lambda (state pair)
+          (Ifz state
+            0
+            (? GenericArgument (_0 pair)
+              (TyArg [value]
+                (If (Eq "type" (argument-kind (_1 pair)))
+                  (match-template (_0 state) (_1 state) value
+                    (argument-value (_1 pair)))
+                  0))
+              (ConstArg
+                (If (Equal (_0 pair) (_1 pair)) state 0)))))
+        [w bs] (zip targs aargs))))
+  (define (match-argument-parts w bs targs parts)
+    (And (Eq (Sz targs) (Sz parts))
+      (foldl
+        (lambda (state pair)
+          (Ifz state
+            0
+            (? GenericArgument (_0 pair)
+              (TyArg [value]
+                (If (ty-val-path? (_1 pair))
+                  0
+                  (match-template (_0 state) (_1 state) value
+                    (type-ref (_1 pair)))))
+              (ConstArg [value]
+                (If (ty-val-path? (_1 pair))
+                  (If (Equal value (Ix 1 (_1 pair))) state 0)
+                  (If (Equal value (_1 pair)) state 0))))))
+        [w bs] (zip targs parts))))
+  (cond
+    ((type-var? template)
+      (let* ((name (ty-var-name template))
+             (hit (find (lambda (b) (Eq name (_0 b))) bindings)))
+        (Ifz hit
+          [world (snoc [name actual] bindings)]
+          (let ((bound (_1 (_0 hit))))
+            (cond
+              ((Equal bound actual) [world bindings])
+              ((consistent-subtype? world actual bound) [world bindings])
+              ((consistent-subtype? world bound actual)
+                [world
+                 (map (lambda (b) (If (Eq name (_0 b)) [name actual] b))
+                   bindings)])
+              (else 0))))))
+    ((Equal template actual) [world bindings])
+    ((resolved-type? template)
+      (If (consistent-subtype? world actual template) [world bindings] 0))
+    ((type-app? template)
+      (cond
+        ((And (type-app? actual)
+           (Equal (TyApp.base template) (TyApp.base actual)))
+          (match-arguments world bindings
+            (TyApp.arguments template) (TyApp.arguments actual)))
+        ((And (type-ref? actual) (ty-ap-path? (Path.p actual)))
+          (let ((parts (ty-ap-decode (Path.p actual))))
+            (And (Equal (TyApp.base template) (_0 parts))
+              (match-argument-parts world bindings
+                (TyApp.arguments template) (drop 1 parts)))))
+        (else 0)))
+    ;; A nominal actual against a structural template views one weak
+    ;; head layer and retries — BEFORE the structural clauses, which
+    ;; would otherwise reject the shape mismatch outright.
+    ((Or (type-ref? actual) (type-app? actual))
+      (let ((vr (view world actual)))
+        (match-template (_0 vr) bindings template (_1 vr))))
+    ((type-is-tag? tfun-pax template)
+      (And (type-is-tag? tfun-pax actual)
+        (And (Eq (Sz (Fun.args template)) (Sz (Fun.args actual)))
+          (match-many world bindings
+            (snoc [(Fun.return template) (Fun.return actual)]
+              (zip (Fun.args template) (Fun.args actual)))))))
+    ((type-is-tag? tarr-pax template)
+      (cond
+        ((type-is-tag? tarr-pax actual)
+          (match-template world bindings
+            (Arr.item template) (Arr.item actual)))
+        ;; A cstr-0 structural row nests as an array (see subtype-go):
+        ;; every item matches the element template in turn, first
+        ;; binding wins.  An empty literal binds nothing — the item
+        ;; variable falls to the caller's fallback.
+        ((And (type-is-tag? trow-pax actual) (Ifz (Row.cstr actual) 1 0))
+          (match-many world bindings
+            (map (lambda (item) [(Arr.item template) (RowItem.value item)])
+              (Row.items actual))))
+        (else 0)))
+    ((type-is-tag? trow-item-pax template)
+      (And (type-is-tag? trow-item-pax actual)
+        (match-template world bindings
+          (RowItem.value template) (RowItem.value actual))))
+    ((type-is-tag? trow-pax template)
+      (And (type-is-tag? trow-pax actual)
+        (And (Eq (Row.cstr template) (Row.cstr actual))
+          (And (Eq (Sz (Row.items template)) (Sz (Row.items actual)))
+            (match-many world bindings
+              (zip (map RowItem.value (Row.items template))
+                (map RowItem.value (Row.items actual))))))))
+    (else 0)))
 
 (define (consistent-seen world seen a b)
   (If (seen-pair? a b seen)
@@ -813,6 +1207,17 @@
           (let* ((av (view world a))
                  (bv (view (_0 av) b)))
             (recur (_0 bv) (_1 av) (_1 bv))))
+        ((Or (type-app? a) (type-app? b))
+          (let* ((av (view world a))
+                 (bv (view (_0 av) b)))
+            (recur (_0 bv) (_1 av) (_1 bv))))
+        ;; The pail universe admits exactly the branded nominal rows,
+        ;; under consistency as under strict subtyping — before the sum
+        ;; clauses, so a sum never slips in option-by-option.
+        ((type-is-tag? tpail-pax a)
+          [world (And (type-is-tag? trow-pax b) (Ifz (Row.cstr b) 0 1))])
+        ((type-is-tag? tpail-pax b)
+          [world (And (type-is-tag? trow-pax a) (Ifz (Row.cstr a) 0 1))])
         ((type-is-tag? tsum-pax a)
           (any-option world (Sum.options a) b))
         ((type-is-tag? tsum-pax b)
@@ -1038,23 +1443,25 @@
         ["expected" (Sz wants) "actual" (Sz exprs)
          "at" (CheckContext.source c)])
       1)
-    (foldl
-      (lambda (state pair)
-        (let ((r (check (_0 state) (_0 pair) (_1 pair))))
-          [(_0 r) (snoc (_1 r) (_1 state))]))
-      [c []] (zip exprs wants)))
+    (thread-map
+      (lambda (c1 pair) (check c1 (_0 pair) (_1 pair)))
+      c (zip exprs wants)))
   (define (synth-many c exprs)
-    (foldl
-      (lambda (state e)
-        (let ((r (synth (_0 state) e)))
-          [(_0 r) (snoc (_1 r) (_1 state))]))
-      [c []] exprs))
+    (thread-map synth c exprs))
   (define (check-lambda c lam want)
     (define viewed (view (CheckContext.world c) want))
     (define c1 (context-with-world c (_0 viewed)))
     (define fun (_1 viewed))
     (define params (LambdaExpr.parameters lam))
+    (unless (type-is-tag? tfun-pax fun)
+      (type-error "lambda requires an expected function type"
+        [want "at" (CheckContext.source c)])
+      1)
     (define arg-types (Fun.args fun))
+    (unless (Eq (Sz params) (Sz arg-types))
+      (type-error "lambda arity mismatch"
+        ["expected" (Sz arg-types) "actual" (Sz params)])
+      1)
     (define extended
       (foldl
         (lambda (acc pair)
@@ -1072,28 +1479,20 @@
             (CheckContext.source acc)))
         c1 (zip params arg-types)))
     (define body-result (check extended (LambdaExpr.body lam) (Fun.return fun)))
-    (unless (type-is-tag? tfun-pax fun)
-      (type-error "lambda requires an expected function type"
-        [want "at" (CheckContext.source c)])
-      1)
-    (unless (Eq (Sz params) (Sz arg-types))
-      (type-error "lambda arity mismatch"
-        ["expected" (Sz arg-types) "actual" (Sz params)])
-      1)
     [(context-with-world c1 (CheckContext.world (_0 body-result)))
      ($Checked want lam)])
   (define (check-row c row want)
     (define viewed (view (CheckContext.world c) want))
     (define c1 (context-with-world c (_0 viewed)))
     (define row-type (_1 viewed))
-    (define checked
-      (check-many c1 (map ExprField.value (RowExpr.fields row))
-        (map RowItem.value (Row.items row-type))))
     (unless (And (type-is-tag? trow-pax row-type)
               (Eq (RowExpr.cstr row) (Row.cstr row-type)))
       (type-error "row literal disagrees with expected type"
         [row want "at" (CheckContext.source c)])
       1)
+    (define checked
+      (check-many c1 (map ExprField.value (RowExpr.fields row))
+        (map RowItem.value (Row.items row-type))))
     [(_0 checked) ($Checked want row)])
   (If (Eq "check" mode)
     (cond

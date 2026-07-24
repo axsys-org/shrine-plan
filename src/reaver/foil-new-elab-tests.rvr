@@ -18,6 +18,9 @@
 (#bind nt (#module foil-new-types))
 (#bind elab (#module foil-new-elab))
 (#bind lower (#module foil-lower))
+(#bind reloc (#module foil-relocate))
+(#bind cairn (#module cairn))
+(#bind render (#module foil-render))
 
 (define span wack-span)
 (define nat-sast (surf-ref ["nat"]))
@@ -119,5 +122,714 @@ assert(Equal ((print-path ["boot" "box"]) 7) (value "a_box"))
 assert(Eq 8 ((value "choose") 1 8 9))
 assert(Eq 9 ((value "choose") 0 8 9))
 assert(Eq 6 ((value "forward") 5))
+
+;;; Regressions ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A row literal checked against a row goal must match the goal's arity;
+;; it must not fall back to synthesis and then claim the goal type.
+(define bad-row-arity
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [pair-decl
+       ["s_decl" ["bad_row"] span
+        (surf-cast (surf-ref ["pair"]) (surf-row [(surf-lit 1)]))]])) 0))
+assert(Eq 1 (Hd bad-row-arity))
+
+(define good-row-compiled
+  (elab:elab-mod (elab:compiler-for base)
+    [pair-decl
+     ["s_decl" ["good_row"] span
+      (surf-cast (surf-ref ["pair"])
+        (surf-row [(surf-lit 1) (surf-lit 2)]))]]))
+(define good-row-tc
+  (got-entry-tc ["boot" "good_row"]
+    (elab:compiler-subject good-row-compiled)))
+assert(nt:type-ref? (tc-ty good-row-tc))
+
+;; Refining a declaration must invalidate overlays materialized from its
+;; sealed placeholder: here `holder` interns (box nat) before box's real
+;; scheme exists.
+(define holder-decl
+  ["s_decl" ["holder"] span
+   (surf-trow
+     [(surf-face "inner" (surf-tapp [(surf-ref ["box"]) nat-sast]))])])
+(define holder-compiled
+  (elab:elab-mod (elab:compiler-for base) [holder-decl box-decl]))
+(define holder-world (elab:compiler-world holder-compiled))
+(define holder-box-entry
+  (_1 (nt:lookup-type-entry holder-world
+        (_1 (nt:intern-type-application holder-world ["boot" "box"]
+              [(nt:type-arg (nt:type-ref ["nat"]))])))))
+assert(nt:row-type? (nt:type-entry-body holder-box-entry))
+
+;; Const arguments are naturals; anything else fails at the surface seam.
+(define sized-decl
+  ["s_decl" ["sized"] span
+   (surf-cvars [["n" nat-sast]]
+     (surf-trow [(surf-face "value" nat-sast)]))])
+(define use-sized-compiled
+  (elab:elab-mod (elab:compiler-for base)
+    [sized-decl
+     ["s_decl" ["use_sized"] span
+      (surf-trow
+        [(surf-face "inner"
+           (surf-tapp [(surf-ref ["sized"]) (surf-lit 3)]))])]]))
+(define sized-3-entry
+  (_1 (nt:lookup-type-entry (elab:compiler-world use-sized-compiled)
+        (_1 (nt:intern-type-application
+              (elab:compiler-world use-sized-compiled)
+              ["boot" "sized"] [(nt:const-arg 3)])))))
+assert(nt:row-type? (nt:type-entry-body sized-3-entry))
+
+(define bad-const-arg
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [sized-decl
+       ["s_decl" ["bad_sized"] span
+        (surf-trow
+          [(surf-face "inner"
+             (surf-tapp [(surf-ref ["sized"]) (surf-lit [1 2])]))])]])) 0))
+assert(Eq 1 (Hd bad-const-arg))
+
+;;; Diagnostics ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Independent failures report together; a referee of a failed declaration
+;; gets its own cascade diagnostic; healthy neighbors still elaborate.
+(define bad-a-decl
+  ["s_decl" ["bad_a"] span
+   (surf-cast nat-sast (surf-var "nosuch_a"))])
+(define bad-b-decl
+  ["s_decl" ["bad_b"] span
+   (surf-cast nat-sast (surf-var "nosuch_b"))])
+(define uses-bad-decl
+  ["s_decl" ["uses_bad"] span
+   (surf-cast nat-sast (surf-var "bad_a"))])
+
+(define diag-result
+  (elab:elab-mod-diags (elab:compiler-for base)
+    [bad-a-decl bad-b-decl uses-bad-decl later-decl]))
+(define diag-rows (_1 diag-result))
+(define diag-subject (elab:compiler-subject (_0 diag-result)))
+
+assert(Eq 3 (Sz diag-rows))
+assert(all (lambda (d) (Eq "in-decl" (_0 d))) diag-rows)
+assert(Equal ["boot" "bad_a"] (_1 (_0 diag-rows)))
+assert(Eq "TC_MEAN" (Hd (got-entry-tc ["boot" "bad_a"] diag-subject)))
+assert(Eq "TC_LAM" (Hd (got-entry-tc ["boot" "later"] diag-subject)))
+
+;; The throwing entry point batches the same diagnostics into one error.
+(define batched
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base) [bad-a-decl bad-b-decl])) 0))
+assert(Eq 1 (Hd batched))
+
+;; A type declaration failing its refine pass is diagnosed without hiding
+;; later declarations.
+(define bad-type-diags
+  (elab:elab-mod-diags (elab:compiler-for base)
+    [["s_decl" ["badty"] span
+      (surf-trow
+        [(surf-face "x"
+           (surf-tapp [(surf-ref ["nosuch_generic"]) nat-sast]))])]
+     later-decl]))
+assert(Eq 1 (Sz (_1 bad-type-diags)))
+assert(Eq "TC_LAM"
+  (Hd (got-entry-tc ["boot" "later"]
+        (elab:compiler-subject (_0 bad-type-diags)))))
+
+;; s_bad parse rows surface as diagnostics instead of vanishing.
+(define bad-parse-diags
+  (_1 (elab:elab-mod-diags (elab:compiler-for base)
+        [["s_bad" ["oops"] span "could not parse declaration"]
+         later-decl])))
+assert(Eq 1 (Sz bad-parse-diags))
+assert(Eq "in-decl" (_0 (_0 bad-parse-diags)))
+
+;; A clean module reports no diagnostics through the same path.
+assert(Eq 0
+  (Sz (_1 (elab:elab-mod-diags (elab:compiler-for base) [later-decl]))))
+
+
+;;; World persistence and relocation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The TypeWorld derives from the subject: unit B starts from unit A's
+;; subject alone and still sees A's type declarations, monomorphic and
+;; generic alike.
+(define unit-a
+  (elab:elab-mod (elab:compiler-for base) [pair-decl box-decl]))
+(define unit-b
+  (elab:elab-mod (elab:compiler-for (elab:compiler-subject unit-a))
+    [["s_decl" ["b_pair"] span
+      (surf-app (surf-var "pair") [(surf-lit 5) (surf-lit 6)])]
+     ["s_decl" ["b_box"] span
+      (surf-app (surf-spec (surf-var "box") [nat-sast]) [(surf-lit 9)])]]))
+(define unit-b-subject (elab:compiler-subject unit-b))
+assert(Equal (nt:type-ref ["boot" "pair"])
+  (tc-ty (got-entry-tc ["boot" "b_pair"] unit-b-subject)))
+assert(Equal (nt:type-ref (ty-ap-encode [["boot" "box"] ["nat"]]))
+  (tc-ty (got-entry-tc ["boot" "b_box"] unit-b-subject)))
+
+;; A relocated mount: rewrite unit A's stored type declarations under a new
+;; prefix; the derived world serves lookups, constructor calls, and generic
+;; interning at the new paths.
+(define (into-libx path)
+  (If (Eq "boot" (Ix 0 path)) (Weld ["libx"] (drop 1 path)) path))
+(define unit-a-subject (elab:compiler-subject unit-a))
+(define relocated-subject
+  (foldl
+    (lambda (sut name)
+      (insert-tc ["libx" name] wack-span
+        (tc-typ
+          (nt:relocate-type-value into-libx
+            (tc-typ-inner (got-entry-tc ["boot" name] unit-a-subject))))
+        sut))
+    base ["pair" "box"]))
+(define unit-c
+  (elab:elab-mod (elab:compiler-for relocated-subject)
+    [["s_decl" ["c_pair"] span
+      (surf-app (surf-ref ["libx" "pair"]) [(surf-lit 7) (surf-lit 8)])]
+     ["s_decl" ["c_box"] span
+      (surf-app (surf-spec (surf-ref ["libx" "box"]) [nat-sast])
+        [(surf-lit 2)])]]))
+(define unit-c-subject (elab:compiler-subject unit-c))
+assert(Equal (nt:type-ref ["libx" "pair"])
+  (tc-ty (got-entry-tc ["boot" "c_pair"] unit-c-subject)))
+assert(Equal (nt:type-ref (ty-ap-encode [["libx" "box"] ["nat"]]))
+  (tc-ty (got-entry-tc ["boot" "c_box"] unit-c-subject)))
+
+;; The production sealing path itself: clone-qualified-entry-pin relocates
+;; stage-1 entries at unit-qualified keys, mark-visible provides the source
+;; names, and the derived world serves the qualified paths — constructor
+;; calls and generic interning included.
+(define unit-id (Pin ["unit-a" "test-identity"]))
+(define own-a [["boot" "pair"] ["boot" "box"]])
+(define (mount-one sut name)
+  (define key ["boot" name])
+  (define pin
+    (reloc:clone-qualified-entry-pin own-a unit-id
+      (cairn:gotax key (_0 unit-a-subject))))
+  (define qualified (reloc:qualify-canonical-path own-a unit-id key))
+  ;; Visibility keys are rooted source names (canon-path consults the
+  ;; index at (Weld root path)); production callers pass them pre-rooted.
+  (mark-visible (root-path sut ["liba" name]) qualified
+    (put-entry-pin qualified pin sut)))
+;; Once a visibility index exists every relative source name resolves
+;; through it, so snapshot the substrate names the module uses — the same
+;; move the production compiler makes before overlaying import storage.
+(define mounted-base
+  (mark-visible (root-path base ["nat"]) ["nat"] base))
+(define mounted-subject (foldl mount-one mounted-base ["pair" "box"]))
+(define unit-d
+  (elab:elab-mod (elab:compiler-for mounted-subject)
+    [["s_decl" ["d_pair"] span
+      (surf-app (surf-ref ["liba" "pair"]) [(surf-lit 1) (surf-lit 2)])]
+     ["s_decl" ["d_box"] span
+      (surf-app (surf-spec (surf-ref ["liba" "box"]) [nat-sast])
+        [(surf-lit 4)])]]))
+(define unit-d-subject (elab:compiler-subject unit-d))
+(define qualified-pair
+  (reloc:qualify-canonical-path own-a unit-id ["boot" "pair"]))
+(define qualified-box
+  (reloc:qualify-canonical-path own-a unit-id ["boot" "box"]))
+assert(Equal (nt:type-ref qualified-pair)
+  (tc-ty (got-entry-tc ["boot" "d_pair"] unit-d-subject)))
+assert(Equal (nt:type-ref (ty-ap-encode [qualified-box ["nat"]]))
+  (tc-ty (got-entry-tc ["boot" "d_box"] unit-d-subject)))
+
+
+;;; Surface coverage: case, relative variants, loops ;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define circle-decl
+  ["s_decl" ["circle"] span
+   (surf-trow [(surf-face "radius" nat-sast)])])
+(define rect-decl
+  ["s_decl" ["rect"] span
+   (surf-trow [(surf-face "w" nat-sast) (surf-face "h" nat-sast)])])
+(define shape-decl
+  ["s_decl" ["shape"] span
+   (surf-union [(surf-ref ["circle"]) (surf-ref ["rect"])])])
+
+;; Exhaustive match with relative-variant binder patterns (and a hole).
+(define area-decl
+  ["s_decl" ["area"] span
+   (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+     (surf-cast nat-sast
+       (surf-case (surf-var "s")
+         [(surf-arm (surf-tapp [(surf-relvar "circle") (surf-ref ["r"])])
+            (surf-app (surf-var "mul") [(surf-var "r") (surf-var "r")]))
+          (surf-arm (surf-tapp [(surf-relvar "rect")
+                                (surf-ref ["w"]) surf-hole])
+            (surf-var "w"))]
+         foil-no-heir)))])
+
+;; Named-type arm plus an explicit fallthrough.
+(define is-circle-decl
+  ["s_decl" ["is_circle"] span
+   (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+     (surf-cast nat-sast
+       (surf-case (surf-var "s")
+         [(surf-arm (surf-ref ["circle"]) (surf-lit 1))]
+         (surf-lit 0))))])
+
+;; Relative-variant construction against a cast goal.
+(define shape-values
+  [["s_decl" ["a_circle"] span
+    (surf-cast (surf-ref ["shape"])
+      (surf-app (surf-relvar "circle") [(surf-lit 5)]))]
+   ["s_decl" ["a_rect"] span
+    (surf-cast (surf-ref ["shape"])
+      (surf-app (surf-relvar "rect") [(surf-lit 3) (surf-lit 4)]))]])
+
+;; A loop: sum 1..5 through the self slot.
+(define sum-to-decl
+  ["s_decl" ["sum_to"] span
+   (surf-loop
+     [(surf-arm (surf-face "i" nat-sast) (surf-lit 5))
+      (surf-arm (surf-face "acc" nat-sast) (surf-lit 0))]
+     (surf-cast nat-sast
+       (surf-if (surf-var "i")
+         (surf-self
+           [(surf-app (surf-var "sub") [(surf-var "i") (surf-lit 1)])
+            (surf-app (surf-var "add") [(surf-var "acc") (surf-var "i")])])
+         (surf-var "acc"))))])
+
+;; Method chains: a member entry under the receiver's nominal path, the
+;; bare-global UFCS fallback, and chaining with written arguments.
+(define meth-decls
+  [["s_decl" ["shape" "describe"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-app (surf-var "area") [(surf-var "s")])))]
+   ["s_decl" ["meth_area"] span
+    (surf-cast nat-sast (surf-meth ["a_circle" "describe"]))]
+   ["s_decl" ["meth_fallback"] span
+    (surf-cast nat-sast (surf-meth ["a_rect" "area"]))]
+   ["s_decl" ["meth_chain"] span
+    (surf-cast nat-sast
+      (surf-meth
+        ["sum_to"
+         (surf-mseg "add" [(surf-lit 4)])
+         (surf-mseg "add" [(surf-lit 1)])]))]])
+
+;; Arm pattern forms beyond flat relvars: absolute-variant heads with
+;; faced binders, and the classic (name : Type) whole-member binder.
+(define arm-decls
+  [["s_decl" ["opt"] span
+    (surf-union
+      [(surf-tapp [(surf-variant "some") nat-sast])
+       (surf-variant "none")])]
+   ["s_decl" ["pick"] span
+    (surf-fun [(surf-face "o" (surf-ref ["opt"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-var "o")
+          [(surf-arm (surf-tapp [(surf-variant "some")
+                                 (surf-face "v" nat-sast)])
+             (surf-var "v"))
+           (surf-arm (surf-variant "none") (surf-lit 0))]
+          foil-no-heir)))]
+   ["s_decl" ["a_some"] span
+    (surf-cast (surf-ref ["opt"])
+      (surf-app (surf-relvar "some") [(surf-lit 9)]))]
+   ["s_decl" ["a_none"] span
+    (surf-cast (surf-ref ["opt"]) (surf-variant "none"))]
+   ["s_decl" ["classic"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-var "s")
+          [(surf-arm (surf-face "c" (surf-ref ["circle"]))
+             (surf-app (surf-var "is_circle") [(surf-var "c")]))
+           (surf-arm (surf-ref ["rect"]) (surf-lit 2))]
+          foil-no-heir)))]])
+
+;; Generic bodies at template types: declare lst[@a], match and recurse
+;; on a lst[@a] scrutinee inside the generic body, ground by explicit
+;; specialization, and run.
+(define template-decls
+  [["s_decl" ["lst"] span
+    (surf-tvars ["a"]
+      (surf-union
+        [(surf-variant "mt")
+         (surf-tapp [(surf-variant "cons")
+                     (surf-ref ["a"])
+                     (surf-tapp [(surf-ref ["lst"]) (surf-ref ["a"])])])]))]
+   ["s_decl" ["len"] span
+    (surf-tvars ["a"]
+      (surf-fun
+        [(surf-face "l" (surf-tapp [(surf-ref ["lst"]) (surf-ref ["a"])]))]
+        (surf-cast nat-sast
+          (surf-case (surf-var "l")
+            [(surf-arm (surf-variant "mt") (surf-lit 0))
+             (surf-arm (surf-tapp [(surf-variant "cons")
+                                   surf-hole (surf-ref ["t"])])
+               (surf-app (surf-var "add")
+                 [(surf-lit 1) (surf-self [(surf-var "t")])]))]
+            foil-no-heir))))]
+   ["s_decl" ["l2"] span
+    (surf-cast (surf-tapp [(surf-ref ["lst"]) nat-sast])
+      (surf-app (surf-relvar "cons")
+        [(surf-lit 7)
+         (surf-cast (surf-tapp [(surf-ref ["lst"]) nat-sast])
+           (surf-app (surf-relvar "cons")
+             [(surf-lit 8)
+              (surf-cast (surf-tapp [(surf-ref ["lst"]) nat-sast])
+                (surf-variant "mt"))]))]))]
+   ["s_decl" ["len2"] span
+    (surf-cast nat-sast
+      (surf-app (surf-spec (surf-var "len") [nat-sast])
+        [(surf-var "l2")]))]])
+
+;; Field access: face-spread bare names, generated accessors (get,
+;; set_, over_ via methods and direct paths), and receiver-driven
+;; specialization of a generic type's accessors.
+(define field-decls
+  [["s_decl" ["r34"] span
+    (surf-app (surf-var "rect") [(surf-lit 3) (surf-lit 4)])]
+   ["s_decl" ["rect_w"] span
+    (surf-fun [(surf-face "r" (surf-ref ["rect"]))]
+      (surf-cast nat-sast (surf-var "w")))]
+   ["s_decl" ["rect_w2"] span
+    (surf-fun [(surf-face "r" (surf-ref ["rect"]))]
+      (surf-cast nat-sast (surf-meth ["r" "w"])))]
+   ["s_decl" ["rect_grow"] span
+    (surf-fun [(surf-face "r" (surf-ref ["rect"]))]
+      (surf-cast (surf-ref ["rect"])
+        (surf-meth ["r" (surf-mseg "set_w" [(surf-lit 10)])])))]
+   ["s_decl" ["direct_w"] span
+    (surf-cast nat-sast
+      (surf-app (surf-ref ["rect" "w"]) [(surf-var "r34")]))]
+   ["s_decl" ["area_spread"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-var "s")
+          [(surf-arm (surf-relvar "circle") (surf-var "radius"))
+           (surf-arm (surf-relvar "rect") (surf-var "h"))]
+          foil-no-heir)))]
+   ["s_decl" ["pairof"] span
+    (surf-tvars ["a"]
+      (surf-trow [(surf-face "fst" (surf-ref ["a"]))
+                  (surf-face "snd" (surf-ref ["a"]))]))]
+   ["s_decl" ["swap"] span
+    (surf-tvars ["a"]
+      (surf-fun
+        [(surf-face "p" (surf-tapp [(surf-ref ["pairof"]) (surf-ref ["a"])]))]
+        (surf-cast (surf-tapp [(surf-ref ["pairof"]) (surf-ref ["a"])])
+          (surf-app
+            (surf-spec (surf-var "pairof") [(surf-ref ["a"])])
+            [(surf-meth ["p" "snd"]) (surf-meth ["p" "fst"])]))))]
+   ["s_decl" ["swapped"] span
+    (surf-cast nat-sast
+      (surf-meth
+        [(surf-app (surf-spec (surf-var "swap") [nat-sast])
+           [(surf-app (surf-spec (surf-var "pairof") [nat-sast])
+              [(surf-lit 1) (surf-lit 2)])])
+         "fst"]))]])
+
+;; B+D: partial application, inferred generic calls, receiver-joining
+;; method inference, and two-phase lambda arguments.
+(define infer-decls
+  [["s_decl" ["add5"] span
+    (surf-app (surf-var "add") [(surf-lit 5)])]
+   ["s_decl" ["use_add5"] span
+    (surf-cast nat-sast
+      (surf-app (surf-var "add5") [(surf-lit 7)]))]
+   ["s_decl" ["len3"] span
+    (surf-cast nat-sast
+      (surf-app (surf-var "len") [(surf-var "l2")]))]
+   ["s_decl" ["pairup"] span
+    (surf-tvars ["t"]
+      (surf-fun [(surf-face "x" (surf-ref ["t"]))
+                 (surf-face "y" (surf-ref ["t"]))]
+        (surf-cast (surf-tapp [(surf-ref ["pairof"]) (surf-ref ["t"])])
+          (surf-app (surf-spec (surf-var "pairof") [(surf-ref ["t"])])
+            [(surf-var "x") (surf-var "y")]))))]
+   ["s_decl" ["paired"] span
+    (surf-cast nat-sast
+      (surf-meth [(surf-lit 4)
+                  (surf-mseg "pairup" [(surf-lit 9)])
+                  "fst"]))]
+   ["s_decl" ["apply2"] span
+    (surf-tvars ["t"]
+      (surf-fun
+        [(surf-face "f" (surf-tfun [(surf-ref ["t"])] (surf-ref ["t"])))
+         (surf-face "x" (surf-ref ["t"]))]
+        (surf-cast (surf-ref ["t"])
+          (surf-app (surf-var "f") [(surf-var "x")]))))]
+   ["s_decl" ["applied"] span
+    (surf-cast nat-sast
+      (surf-app (surf-var "apply2")
+        [(surf-fun [(surf-ref ["q"])]
+           (surf-app (surf-var "add") [(surf-var "q") (surf-lit 1)]))
+         (surf-lit 41)]))]
+   ["s_decl" ["arr_lit"] span
+    (surf-cast (surf-tapp [(surf-ref ["row"]) nat-sast])
+      (surf-row [(surf-lit 1) (surf-lit 2) (surf-lit 3)]))]
+   ["s_decl" ["arr_mt"] span
+    (surf-cast (surf-tapp [(surf-ref ["row"]) nat-sast])
+      (surf-row []))]
+   ["s_decl" ["mapped"] span
+    (surf-cast (surf-tapp [(surf-ref ["row"]) nat-sast])
+      (surf-meth
+        ["arr_lit"
+         (surf-mseg "map"
+           [(surf-fun [(surf-ref ["q"])]
+              (surf-app (surf-var "add") [(surf-var "q") (surf-lit 1)]))])]))]])
+
+(define shapes-mod
+  (Weld [circle-decl rect-decl shape-decl area-decl is-circle-decl]
+    (Weld shape-values
+      (Weld [sum-to-decl]
+        (Weld meth-decls
+          (Weld arm-decls
+            (Weld template-decls (Weld field-decls infer-decls))))))))
+(define shapes-compiled (elab:elab-mod (elab:compiler-for base) shapes-mod))
+(define shapes-final (elab:compiler-subject shapes-compiled))
+(define shapes-own
+  (map (lambda (decl) (root-path shapes-final (_1 decl))) shapes-mod))
+(define shapes-lowered (lower:lower-tc-unit base shapes-final shapes-own))
+(define (shape-value name)
+  (lower:ir-entry-val (got-entry ["boot" name] shapes-lowered)))
+
+assert(Eq 25 ((shape-value "area") (shape-value "a_circle")))
+assert(Eq 3 ((shape-value "area") (shape-value "a_rect")))
+assert(Eq 1 ((shape-value "is_circle") (shape-value "a_circle")))
+assert(Eq 0 ((shape-value "is_circle") (shape-value "a_rect")))
+assert(Eq 15 (shape-value "sum_to"))
+assert(Eq 25 (shape-value "meth_area"))
+assert(Eq 3 (shape-value "meth_fallback"))
+assert(Eq 20 (shape-value "meth_chain"))
+assert(Eq 9 ((shape-value "pick") (shape-value "a_some")))
+assert(Eq 0 ((shape-value "pick") (shape-value "a_none")))
+assert(Eq 1 ((shape-value "classic") (shape-value "a_circle")))
+assert(Eq 2 ((shape-value "classic") (shape-value "a_rect")))
+assert(Eq 2 (shape-value "len2"))
+assert(Eq 3 ((shape-value "rect_w") (shape-value "r34")))
+assert(Eq 3 ((shape-value "rect_w2") (shape-value "r34")))
+assert(Eq 10
+  ((shape-value "rect_w") ((shape-value "rect_grow") (shape-value "r34"))))
+assert(Eq 3 (shape-value "direct_w"))
+assert(Eq 5 ((shape-value "area_spread") (shape-value "a_circle")))
+assert(Eq 4 ((shape-value "area_spread") (shape-value "a_rect")))
+assert(Eq 2 (shape-value "swapped"))
+assert(Eq 12 (shape-value "use_add5"))
+assert(Eq 12 ((shape-value "add5") 7))
+assert(Eq 2 (shape-value "len3"))
+assert(Eq 9 (shape-value "paired"))
+assert(Eq 42 (shape-value "applied"))
+assert(Equal [1 2 3] (shape-value "arr_lit"))
+assert(Eq 0 (shape-value "arr_mt"))
+assert(Equal [2 3 4] (shape-value "mapped"))
+
+;; An array-goal element that does not fit the item type is rejected.
+(define bad-arr
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [["s_decl" ["bad_arr"] span
+        (surf-cast (surf-tapp [(surf-ref ["row"]) nat-sast])
+          (surf-row [(surf-lit 1) (surf-row [])]))]])) 0))
+assert(Eq 1 (Hd bad-arr))
+
+;; A faced binder whose annotation the field cannot fit is rejected.
+(define bad-binder-ann
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [circle-decl rect-decl shape-decl (_0 arm-decls)
+       ["s_decl" ["badb"] span
+        (surf-fun [(surf-face "o" (surf-ref ["opt"]))]
+          (surf-cast nat-sast
+            (surf-case (surf-var "o")
+              [(surf-arm (surf-tapp [(surf-variant "some")
+                                     (surf-face "v" (surf-ref ["circle"]))])
+                 (surf-lit 1))]
+              (surf-lit 0))))]])) 0))
+assert(Eq 1 (Hd bad-binder-ann))
+
+;; A match missing a member and lacking a fallthrough is rejected.
+(define non-exhaustive
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [circle-decl rect-decl shape-decl
+       ["s_decl" ["partial"] span
+        (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+          (surf-cast nat-sast
+            (surf-case (surf-var "s")
+              [(surf-arm (surf-relvar "circle") (surf-lit 1))]
+              foil-no-heir)))]])) 0))
+assert(Eq 1 (Hd non-exhaustive))
+
+;; A duplicate arm is unreachable.
+(define duplicate-arm
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [circle-decl rect-decl shape-decl
+       ["s_decl" ["dup"] span
+        (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+          (surf-cast nat-sast
+            (surf-case (surf-var "s")
+              [(surf-arm (surf-relvar "circle") (surf-lit 1))
+               (surf-arm (surf-ref ["circle"]) (surf-lit 2))]
+              (surf-lit 0))))]])) 0))
+assert(Eq 1 (Hd duplicate-arm))
+
+;; A relative variant needs an expected type.
+(define bare-relvar
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [circle-decl
+       ["s_decl" ["bare"] span
+        (surf-app (surf-relvar "circle") [(surf-lit 1)])]])) 0))
+assert(Eq 1 (Hd bare-relvar))
+
+;; Unported sugar surfaces as a diagnostic, not silence.
+(define ufcs-diags
+  (_1 (elab:elab-mod-diags (elab:compiler-for base)
+        [["s_decl" ["u"] span (surf-ufcs-put "x" 0)]])))
+assert(Eq 1 (Sz ufcs-diags))
+
+;; The wf post-pass resolves every stored nominal reference against the
+;; final world, catching dangling names in never-unfolded positions (a
+;; row field and a lambda annotation the body never touches).
+(define wf-diags
+  (_1 (elab:elab-mod-diags (elab:compiler-for base)
+        [["s_decl" ["bad_row_ty"] span
+          (surf-trow [(surf-face "x" (surf-ref ["nosuch_type"]))])]
+         ["s_decl" ["bad_val_ann"] span
+          (surf-fun [(surf-face "x" (surf-ref ["nosuch_type"]))]
+            (surf-cast nat-sast (surf-lit 1)))]])))
+assert(Eq 2 (Sz wf-diags))
+
+;; Any-consistent check boundaries: pail (Any) accepts and supplies any
+;; type at elaboration boundaries, in both directions; every other
+;; mismatch stays a static error.
+(define any-mod
+  [["s_decl" ["takes_any"] span
+    (surf-fun [(surf-face "x" (surf-ref ["any"]))]
+      (surf-cast nat-sast (surf-lit 1)))]
+   ["s_decl" ["give_any"] span
+    (surf-cast nat-sast
+      (surf-app (surf-var "takes_any") [(surf-lit 7)]))]
+   ["s_decl" ["any_val"] span
+    (surf-cast (surf-ref ["any"]) (surf-lit 3))]
+   ["s_decl" ["from_any"] span
+    (surf-cast nat-sast (surf-var "any_val"))]])
+(define any-compiled (elab:elab-mod (elab:compiler-for base) any-mod))
+assert(IsApp
+  (got-entry-tc ["boot" "from_any"] (elab:compiler-subject any-compiled)))
+
+(define still-strict
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [["s_decl" ["bad_sym"] span
+        (surf-cast (surf-tsym "a") (surf-lit 5))]])) 0))
+assert(Eq 1 (Hd still-strict))
+
+
+;;; Type rendering on the reflection API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Eq "nat" (render:ty-text (nt:tnat 0)))
+assert(Eq "str" (render:ty-text (nt:tnat "t")))
+assert(Eq "any" (render:ty-text nt:tany))
+assert(Eq "'$hello" (render:ty-text (nt:tconst "hello")))
+assert(Eq "{nat nat; nat}"
+  (render:ty-text (nt:tfun [(nt:tnat 0) (nt:tnat 0)] (nt:tnat 0))))
+assert(Eq "row[any]" (render:ty-text (nt:tarr nt:tany)))
+assert(Eq "/boot/shape" (render:ty-text (nt:type-ref ["boot" "shape"])))
+assert(Eq "/boot/box[/nat]"
+  (render:ty-text (nt:type-ref (ty-ap-encode [["boot" "box"] ["nat"]]))))
+
+;; Real elaborated artifacts render through the same seam.  Annotations
+;; elaborate to nominal references, so builtin names keep path spelling.
+assert(Eq "{/boot/shape; /nat}"
+  (render:ty-text (tc-ty (got-entry-tc ["boot" "area"] shapes-final))))
+
+(define shape-render
+  (render:ty-text
+    (nt:scheme-body (tc-typ-inner (got-entry-tc ["boot" "shape"] shapes-final)))))
+assert(Or (Eq "(/boot/circle | /boot/rect)" shape-render)
+  (Eq "(/boot/rect | /boot/circle)" shape-render))
+
+;; Generic schemes: parameters, row faces, and template variables.
+assert(Eq "@a /boot/box[value=@a]"
+  (render:ty-text
+    (tc-typ-inner (got-entry-tc ["boot" "box"] unit-a-subject))))
+
+;; Const parameters carry their declared type.
+assert(Eq "@[n /nat] /boot/sized[value=/nat]"
+  (render:ty-text
+    (tc-typ-inner
+      (got-entry-tc ["boot" "sized"]
+        (elab:compiler-subject use-sized-compiled)))))
+
+;; Unit-qualified storage keys display as ~/local/path.
+assert(Eq "~/boot/pair" (render:ty-text (nt:type-ref qualified-pair)))
+
+
+;;; Const-generic value materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define add-n-decl
+  ["s_decl" ["add_n"] span
+   (surf-cvars [["n" nat-sast]]
+     (surf-fun [(surf-face "x" nat-sast)]
+       (surf-cast nat-sast
+         (surf-app (surf-var "add") [(surf-var "x") (surf-var "n")]))))])
+(define const-mod
+  [add-n-decl
+   ["s_decl" ["use_five"] span
+    (surf-cast nat-sast
+      (surf-app (surf-spec (surf-var "add_n") [(surf-lit 5)])
+        [(surf-lit 3)]))]
+   ["s_decl" ["use_two"] span
+    (surf-cast nat-sast
+      (surf-app (surf-spec (surf-var "add_n") [(surf-lit 2)])
+        [(surf-lit 3)]))]
+   ["s_decl" ["as_seven"] span
+    (surf-spec (surf-var "add_n") [(surf-lit 7)])]
+   ["s_decl" ["inc_ref"] span
+    (surf-fun [(surf-face "x" nat-sast)]
+      (surf-cast nat-sast
+        (surf-app (surf-var "add") [(surf-var "x") (surf-lit 1)])))]
+   ["s_decl" ["apply_c"] span
+    (surf-cvars [["f" (surf-tfun [nat-sast] nat-sast)]]
+      (surf-fun [(surf-face "x" nat-sast)]
+        (surf-cast nat-sast
+          (surf-app (surf-var "f") [(surf-var "x")]))))]
+   ["s_decl" ["use_apply_c"] span
+    (surf-cast nat-sast
+      (surf-app (surf-spec (surf-var "apply_c") [(surf-ref ["inc_ref"])])
+        [(surf-lit 6)]))]])
+(define const-compiled (elab:elab-mod (elab:compiler-for base) const-mod))
+
+;; The specialized value references the canonical /ty-ap member path.
+(define as-seven-tc
+  (got-entry-tc ["boot" "as_seven"]
+    (elab:compiler-subject const-compiled)))
+assert(Eq "TC_GLOBAL" (Hd as-seven-tc))
+assert(Equal (ty-ap-encode [["boot" "add_n"] [ty-val-tag 7]])
+  (tc-global-path as-seven-tc))
+
+;; Materialize instantiations, lower behind the unit dispatcher, and run.
+(define const-final
+  (lower:materialize-consts (elab:compiler-subject const-compiled)))
+(define const-own (map (Ix 0) (subject-entry-delta base const-final)))
+(define const-lowered (lower:lower-tc-unit base const-final const-own))
+(define (const-value name)
+  (lower:ir-entry-val (got-entry ["boot" name] const-lowered)))
+assert(Eq 8 (const-value "use_five"))
+assert(Eq 5 (const-value "use_two"))
+assert(Eq 17 ((const-value "as_seven") 10))
+;; Path-valued const arguments: a function reference rides the /ty-ap
+;; path as a plain part and materializes to its referee.
+assert(Eq 7 (const-value "use_apply_c"))
+
+;; Template arguments cannot ground a /ty-ap member path.
+(define template-spec
+  (Try (lambda (z)
+    (elab:elab-mod (elab:compiler-for base)
+      [add-n-decl
+       ["s_decl" ["outer"] span
+        (surf-cvars [["m" nat-sast]]
+          (surf-cast nat-sast
+            (surf-app (surf-spec (surf-var "add_n") [(surf-ref ["m"])])
+              [(surf-lit 1)])))]])) 0))
+assert(Eq 1 (Hd template-spec))
 
 (print "foil-new-elab tests passed")

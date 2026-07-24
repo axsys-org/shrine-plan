@@ -17,6 +17,7 @@
 (#import foil-subject)
 
 (#bind ty (#module foil-types))
+(#bind nt (#module foil-new-types))
 
 (#bind foil-lore (#module foil-lore))
 
@@ -82,9 +83,9 @@
       [(path-text (Ix 0 parts)) "["
        (join-str " " (map path-text (drop 1 parts))) "]"])))
 
-(define (ty-text t)
+(define (legacy-ty-text t)
   (define tag (ty:type-tag t))
-  (define (many sep ts) (join-str sep (map ty-text ts)))
+  (define (many sep ts) (join-str sep (map legacy-ty-text ts)))
   (cond
     ((Eq tag "TNOM") (path-text (ty:tnom-ref t)))
     ((Eq tag "TNAT")
@@ -95,24 +96,110 @@
         (else (showNat (ty:tnat-cube t)))))
     ((Eq tag "TFUN")
       (strcat ["{" (many " " (ty:tfun-args t)) "; "
-               (ty-text (ty:tfun-ret t)) "}"]))
+               (legacy-ty-text (ty:tfun-ret t)) "}"]))
     ((Eq tag "TROW")
       (strcat [(If (ty:trow-cstr t) (atom-str (ty:trow-cstr t)) "")
                "[" (many " " (ty:trow-vals t)) "]"]))
     ((Eq tag "TSUM") (strcat ["(" (many " | " (ty:tsum-opts t)) ")"]))
     ((Eq tag "TFAC")
-      (strcat [(atom-str (ty:tfac-face t)) "=" (ty-text (ty:tfac-val t))]))
+      (strcat [(atom-str (ty:tfac-face t)) "="
+               (legacy-ty-text (ty:tfac-val t))]))
     ((Eq tag "TQUA")
       (strcat ["@" (atom-str (ty:tqua-name t)) " "
-        (ty-text (ty:tqua-body-value t))]))
+        (legacy-ty-text (ty:tqua-body-value t))]))
     ((Eq tag "TVAR") (strcat ["@" (atom-str (ty:tvar-index t))]))
-    ((Eq tag "TPIN") (strcat ["pin[" (ty-text (ty:tpin-val t)) "]"]))
-    ((Eq tag "TSELF") (strcat ["self[" (ty-text (ty:tself-val t)) "]"]))
-    ((Eq tag "TARR") (strcat ["row[" (ty-text (ty:tarr-item t)) "]"]))
+    ((Eq tag "TPIN") (strcat ["pin[" (legacy-ty-text (ty:tpin-val t)) "]"]))
+    ((Eq tag "TSELF")
+      (strcat ["self[" (legacy-ty-text (ty:tself-val t)) "]"]))
+    ((Eq tag "TARR") (strcat ["row[" (legacy-ty-text (ty:tarr-item t)) "]"]))
     ((Eq tag "TANY") "any")
     ((Eq tag "TBOT") "bot")
-    ((Eq tag "TTYP") (strcat ["type " (ty-text (ty:ttyp-type t))]))
+    ((Eq tag "TTYP") (strcat ["type " (legacy-ty-text (ty:ttyp-type t))]))
     (else "?")))
+
+;;; Stage-1 type rendering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; foil-new-types values render through the kernel's public reflection
+;; vocabulary only — predicates, projections, and path codecs — in the
+;; same surface conventions as the legacy renderer.  Unit-qualified
+;; storage keys display as ~/local/path (the pin itself is unprintable).
+(define (new-path-text p)
+  (define parts (ty-ap-decode p))
+  (Ifz parts
+    (cond
+      ((ty-var-path? p) (strcat ["@" (Ix 1 p)]))
+      ((ty-val-path? p)
+        (If (printable-text? (Ix 1 p))
+          (strcat ["'$" (Ix 1 p)])
+          (showNat (Ix 1 p))))
+      ((unit-qualified-path? p)
+        (strcat ["~" (print-path (unit-qualified-path-local p))]))
+      (else (print-path p)))
+    (strcat
+      [(new-path-text (Ix 0 parts)) "["
+       (join-str " " (map new-path-text (drop 1 parts))) "]"])))
+
+(define (new-ty-text t)
+  (define (many sep ts) (join-str sep (map new-ty-text ts)))
+  (define (const-text v)
+    (cond
+      ((Nil (IsNat v)) "'...")
+      ((printable-text? v) (strcat ["'$" v]))
+      (else (showNat v))))
+  (define (item-text pair)
+    (define face (nt:row-item-face (_1 pair)))
+    (define vt (new-ty-text (nt:row-item-value (_1 pair))))
+    (If (Eq face (_0 pair)) vt (strcat [(atom-str face) "=" vt])))
+  (define (items-text items)
+    (join-str " "
+      (map item-text (zip (gen (Sz items) (lambda (i) i)) items))))
+  (define (param-text param)
+    (If (Eq "type" (nt:parameter-kind param))
+      (strcat ["@" (atom-str (nt:parameter-name param)) " "])
+      (strcat ["@[" (atom-str (nt:parameter-name param)) " "
+               (new-ty-text (nt:const-param-type param)) "] "])))
+  (define (argument-text arg)
+    (If (Eq "type" (nt:argument-kind arg))
+      (new-ty-text (nt:argument-value arg))
+      (const-text (nt:argument-value arg))))
+  (cond
+    ((nt:scheme? t)
+      (strcat
+        [(strcat (map param-text (nt:scheme-parameters t)))
+         (new-ty-text (nt:scheme-body t))]))
+    ((nt:type-ref? t) (new-path-text (nt:type-ref-path t)))
+    ((nt:any-type? t) "any")
+    ((nt:pail-type? t) "pail")
+    ((nt:bottom-type? t) "bot")
+    ((nt:nat-type? t)
+      (cond
+        ((Ifz (nt:nat-aura t) 1 0) "nat")
+        ((Eq "t" (nt:nat-aura t)) "str")
+        (else (strcat ["nat/" (atom-str (nt:nat-aura t))]))))
+    ((nt:const-type? t) (const-text (nt:const-value t)))
+    ((nt:fun-type? t)
+      (strcat ["{" (many " " (nt:fun-args t)) "; "
+               (new-ty-text (nt:fun-return t)) "}"]))
+    ((nt:row-type? t)
+      (strcat [(If (nt:row-cstr t) (atom-str (nt:row-cstr t)) "")
+               "[" (items-text (nt:row-items t)) "]"]))
+    ((nt:sum-type? t) (strcat ["(" (many " | " (nt:sum-options t)) ")"]))
+    ((nt:array-type? t)
+      (strcat ["row[" (new-ty-text (nt:array-item t)) "]"]))
+    ((nt:row-item-type? t)
+      (strcat [(atom-str (nt:row-item-face t)) "="
+               (new-ty-text (nt:row-item-value t))]))
+    ((nt:type-var? t) (strcat ["@" (atom-str (nt:ty-var-name t))]))
+    ((nt:const-var? t) (strcat ["@" (atom-str (nt:const-var-name t))]))
+    ((nt:type-app? t)
+      (strcat
+        [(new-path-text (nt:ty-app-base t)) "["
+         (join-str " " (map argument-text (nt:ty-app-arguments t))) "]"]))
+    (else "?")))
+
+;; One renderer for both algebras during the migration.
+(define (ty-text t)
+  (If (nt:type-value? t) (new-ty-text t) (legacy-ty-text t)))
 
 ;;; PLAN value rendering — one renderer for every stage ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
