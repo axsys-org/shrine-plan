@@ -208,12 +208,14 @@
 (define (sum-type? typ) (type-is-tag? tsum-pax typ))
 (define (fun-type? typ) (type-is-tag? tfun-pax typ))
 (define (array-type? typ) (type-is-tag? tarr-pax typ))
+(define (pin-type? typ) (type-is-tag? tpin-pax typ))
+(define pin-item TyPin.item)
 
 (define (monotype? typ)
   (any (lambda (pred) (pred typ))
     [bottom-type? any-type? pail-type? nat-type? const-type?
      row-item-type? row-type? sum-type? fun-type? array-type?
-     type-ref? type-var? const-var? type-app?]))
+     pin-type? type-ref? type-var? const-var? type-app?]))
 
 (define (type-value? typ) (Or (scheme? typ) (monotype? typ)))
 
@@ -390,6 +392,8 @@
         (tfun (map recur (Fun.args typ)) (recur (Fun.return typ))))
       ((type-is-tag? tarr-pax typ)
         (tarr (recur (Arr.item typ))))
+      ((type-is-tag? tpin-pax typ)
+        (tpin (recur (TyPin.item typ))))
       ((type-app? typ)
         (type-app (TyApp.base typ)
           (map (lambda (arg)
@@ -412,6 +416,7 @@
       ((type-is-tag? tfun-pax typ)
         (Or (any recur (Fun.args typ)) (recur (Fun.return typ))))
       ((type-is-tag? tarr-pax typ) (recur (Arr.item typ)))
+      ((type-is-tag? tpin-pax typ) (recur (TyPin.item typ)))
       ((type-app? typ)
         (any (lambda (arg)
           (? GenericArgument arg
@@ -589,6 +594,9 @@
     ((type-is-tag? tarr-pax typ)
       (let ((r (recur world (Arr.item typ))))
         [(_0 r) (tarr (_1 r))]))
+    ((type-is-tag? tpin-pax typ)
+      (let ((r (recur world (TyPin.item typ))))
+        [(_0 r) (tpin (_1 r))]))
     ((type-is-tag? tzero-rec-pax typ)
       (If self-path
         [world (type-ref self-path)]
@@ -1004,6 +1012,9 @@
         ((And (type-is-tag? tarr-pax actual)
               (type-is-tag? tarr-pax expected))
           (recur world (Arr.item actual) (Arr.item expected)))
+        ((And (type-is-tag? tpin-pax actual)
+              (type-is-tag? tpin-pax expected))
+          (recur world (TyPin.item actual) (TyPin.item expected)))
         ((And (type-is-tag? tfun-pax actual)
               (type-is-tag? tfun-pax expected))
           (Ifz (Eq (Sz (Fun.args actual)) (Sz (Fun.args expected)))
@@ -1125,7 +1136,13 @@
                  (map (lambda (b) (If (Eq name (_0 b)) [name actual] b))
                    bindings)])
               (else 0))))))
-    ((Equal template actual) [world bindings])
+    ;; The identity shortcut is only sound for resolved templates: an
+    ;; identical SYMBOLIC pair ({@v; @w} against itself, calling a
+    ;; sibling generic from a generic body) must still walk the
+    ;; structure so each template variable binds (symbolically) to the
+    ;; caller's variable of the same name.
+    ((And (Equal template actual) (resolved-type? template))
+      [world bindings])
     ((resolved-type? template)
       (If (consistent-subtype? world actual template) [world bindings] 0))
     ((type-app? template)
@@ -1166,6 +1183,10 @@
             (map (lambda (item) [(Arr.item template) (RowItem.value item)])
               (Row.items actual))))
         (else 0)))
+    ((type-is-tag? tpin-pax template)
+      (And (type-is-tag? tpin-pax actual)
+        (match-template world bindings
+          (TyPin.item template) (TyPin.item actual))))
     ((type-is-tag? trow-item-pax template)
       (And (type-is-tag? trow-item-pax actual)
         (match-template world bindings
@@ -1235,6 +1256,8 @@
           [world (Equal (Const.value a) (Const.value b))])
         ((And (type-is-tag? tarr-pax a) (type-is-tag? tarr-pax b))
           (recur world (Arr.item a) (Arr.item b)))
+        ((And (type-is-tag? tpin-pax a) (type-is-tag? tpin-pax b))
+          (recur world (TyPin.item a) (TyPin.item b)))
         ((And (type-is-tag? tfun-pax a) (type-is-tag? tfun-pax b))
           (Ifz (Eq (Sz (Fun.args a)) (Sz (Fun.args b)))
             [world 0]
@@ -1290,9 +1313,15 @@
           (let ((ba (subtype (_0 ab) b a)))
             (If (_1 ba)
               [(_0 ba) a]
-              (let* ((opts (Weld (flat-sum-options a) (flat-sum-options b)))
-                     (checked (check-join-runtime-keys (_0 ba) opts)))
-                [checked (tsum opts)]))))))))
+              ;; Distinct constants share no runtime dispatch key;
+              ;; their join is the shared representation type, not a
+              ;; sum (.true joins .false as nat).
+              (If (And (const-type? a) (const-type? b))
+                [(_0 ba) (tnat 0)]
+                (let* ((opts
+                         (Weld (flat-sum-options a) (flat-sum-options b)))
+                       (checked (check-join-runtime-keys (_0 ba) opts)))
+                  [checked (tsum opts)])))))))))
 
 (define (join-type world a b) (_1 (join world a b)))
 
