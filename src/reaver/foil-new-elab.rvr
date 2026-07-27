@@ -96,6 +96,31 @@
 (define (new-elab-error env what detail)
   (error ["foil-new-elab" what ["at" (span-blurb (env-span env))] detail]))
 
+;; Guard: raise a located diagnostic unless ok.  Laziness makes the
+;; error side free on the success path; the value is the historical
+;; sentinel 1 so a guard can stand anywhere an expression can.
+(define (need env ok what detail)
+  (unless ok (new-elab-error env what detail) 1))
+
+;; (flow st ((name expr) ...) body...) — the [state value] threading
+;; convention as a binding form.  Each expr sees the freshest state
+;; under the SAME name; its result pair splits into the bound name and
+;; a rebound state, so the body never touches (_0 r)/(_1 r) plumbing.
+(define-syntax (flow form)
+  (foldr
+    (lambda (binding acc)
+      ["#let" [[(_1 form) (_1 binding)]]
+       ["#let" [[(_0 binding) [(1 _1) (_1 form)]]
+                [(_1 form) [(1 _0) (_1 form)]]]
+        acc]])
+    (unblock (drop 3 form))
+    (_2 form)))
+
+;; Lift a kernel [world value] pair into the compiler convention, so
+;; kernel calls participate in a compiler-stated flow.
+(define (lift-world compiler wr)
+  [(compiler-with-world (_0 wr) compiler) (_1 wr)])
+
 ;; A declaration which failed to elaborate is poisoned with a TC_MEAN entry
 ;; (see run-decl-pass below).  References must fail with a readable cascade
 ;; diagnostic instead of consuming the poison as a type.
@@ -359,10 +384,9 @@
 ;; spelling, so invert the subject's visibility projection — preferring
 ;; an alias whose own or parent path was already recorded (the alias the
 ;; receiver's type resolved through), otherwise the first written alias.
-(define (record-member-resolution compiler env member)
+(define (record-member-resolution compiler env member vis-pairs)
   (define subject (compiler-subject compiler))
-  (define vis (sut-visible subject))
-  (Ifz vis
+  (Ifz (Sz vis-pairs)
     compiler
     (let* ((root (sut-root subject))
            (sources
@@ -373,7 +397,7 @@
                      (drop (Sz root) written)
                      written)))
                (filter (lambda (pair) (Equal member (_1 pair)))
-                 (rowify (cairn:tapax vis)))))
+                 vis-pairs)))
            (prior (compiler-resolutions compiler))
            (preferred
              (find
@@ -454,10 +478,8 @@
 ;; type elaboration and value specialization; `elab` is elab-type, passed
 ;; explicitly so this single definition can precede it.
 (define (type-application-arguments-using elab compiler env params args)
-  (unless (Eq (Sz params) (Sz args))
-    (new-elab-error env "wrong number of type arguments"
-      ["want" (Sz params) "got" (Sz args)])
-    1)
+  (need env (Eq (Sz params) (Sz args))
+    "wrong number of type arguments" ["want" (Sz params) "got" (Sz args)])
   (nt:thread-map
     (lambda (c pair)
       (define param (_0 pair))
@@ -558,10 +580,8 @@
           ;; bare name stays the FFI value.
           ((And (Eq "s_ref" (_0 head))
              (Equal ["pin"] (surf-ref-path head)))
-            (unless (Eq 1 (Sz args))
-              (new-elab-error env "pin takes exactly one type argument"
-                surf)
-              1)
+            (need env (Eq 1 (Sz args))
+              "pin takes exactly one type argument" surf)
             (let ((r (recur compiler (_0 args))))
               [(_0 r) (nt:tpin (_1 r))]))
           ((Eq "s_ref" (_0 head))
@@ -571,28 +591,29 @@
                        (new-elab-error env
                          "reference to a declaration that failed to elaborate"
                          base)
-                       base))
-                   (lr (nt:lookup-type-entry (compiler-world compiler) checked))
-                   (compiler1
-                     (record-resolution
-                       (compiler-with-world (_0 lr) compiler)
-                       env (surf-ref-path head)))
-                   (params
-                     (nt:scheme-parameters (nt:type-entry-scheme (_1 lr))))
-                   (ar
-                     (type-application-arguments-using elab-type
-                       compiler1 env params args))
-                   (gargs (_1 ar)))
-              ;; Intern only nominally-ground applications.  Template args
-              ;; ground later; structural ground args (function types) have
-              ;; no path form and stay symbolic permanently.
+                       base)))
+            (flow compiler
+              ((entry
+                 (lift-world compiler
+                   (nt:lookup-type-entry
+                     (compiler-world compiler) checked)))
+               (gargs
+                 (type-application-arguments-using elab-type
+                   (record-resolution compiler env (surf-ref-path head))
+                   env
+                   (nt:scheme-parameters (nt:type-entry-scheme entry))
+                   args)))
+              ;; Intern only nominally-ground applications.  Template
+              ;; args ground later; structural ground args (function
+              ;; types) have no path form and stay symbolic permanently.
               (If (all nt:path-ridable-argument? gargs)
-                (let ((ir
-                        (nt:intern-type-application
-                          (compiler-world (_0 ar)) base gargs)))
-                  [(compiler-with-world (_0 ir) (_0 ar))
-                   (nt:type-ref (_1 ir))])
-                [(_0 ar) (nt:type-app base gargs)])))
+                (flow compiler
+                  ((path
+                     (lift-world compiler
+                       (nt:intern-type-application
+                         (compiler-world compiler) base gargs))))
+                  [compiler (nt:type-ref path)])
+                [compiler (nt:type-app base gargs)]))))
           (else (new-elab-error env "type application needs a named head" surf)))))
     ((Eq tag "s_hole")
       (new-elab-error env "wildcard is not a type" surf))
@@ -714,15 +735,14 @@
     (else (new-elab-error env "unbound reference" path))))
 
 (define (global-reference compiler env path0)
-  (define r
-    (global-reference-canonical compiler env
-      (canon-path path0 (compiler-subject compiler))))
-  [(record-resolution (_0 r) env path0) (_1 r)])
+  (flow compiler
+    ((tc (global-reference-canonical compiler env
+           (canon-path path0 (compiler-subject compiler)))))
+    [(record-resolution compiler env path0) tc]))
 
 (define (view-type compiler env typ what)
-  (unless (Nil (nt:scheme? typ))
-    (new-elab-error env what "generic value requires explicit specialization")
-    1)
+  (need env (Nil (nt:scheme? typ))
+    what "generic value requires explicit specialization")
   (let ((r (nt:view (compiler-world compiler) typ)))
     [(compiler-with-world (_0 r) compiler) (_1 r)]))
 
@@ -731,13 +751,10 @@
 ;; while every other rule keeps its static strictness.  The runtime
 ;; boundary remains responsible for values that abuse the permission.
 (define (ensure-subtype compiler env actual expected what)
-  (unless (And (Nil (nt:scheme? actual)) (Nil (nt:scheme? expected)))
-    (new-elab-error env what ["actual" actual "expected" expected])
-    1)
+  (need env (And (Nil (nt:scheme? actual)) (Nil (nt:scheme? expected)))
+    what ["actual" actual "expected" expected])
   (let ((r (nt:consistent-subtype (compiler-world compiler) actual expected)))
-    (unless (_1 r)
-      (new-elab-error env what ["want" expected "got" actual])
-      1)
+    (need env (_1 r) what ["want" expected "got" actual])
     (compiler-with-world (_0 r) compiler)))
 
 (define (fold-tc-app f xs result-type)
@@ -758,11 +775,8 @@
     [compiler 0]
     (let ((vr (view-type compiler env (env-goal env)
                 "lambda goal is not a function")))
-      (unless (And (nt:fun-type? (_1 vr))
-                (Eq arity (Sz (nt:fun-args (_1 vr)))))
-        (new-elab-error env "lambda goal has the wrong arity"
-          (env-goal env))
-        1)
+      (need env (And (nt:fun-type? (_1 vr)) (Eq arity (Sz (nt:fun-args (_1 vr)))))
+        "lambda goal has the wrong arity" (env-goal env))
       vr)))
 
 (define (lambda-parameters compiler env args goal-fun)
@@ -780,18 +794,13 @@
              (snoc [($LocalBinding (surf-face-name arg) (_1 r)) (_1 r)]
                (_1 state))]))
         ((And (Eq tag "s_ref") (Eq 1 (Sz (surf-ref-path arg))))
-          (unless inferred
-            (new-elab-error env
-              "lambda parameter needs a type annotation" arg)
-            1)
+          (need env inferred "lambda parameter needs a type annotation" arg)
           [(_0 state)
            (snoc [($LocalBinding (_0 (surf-ref-path arg)) inferred) inferred]
              (_1 state))])
         ((Eq tag "s_hole")
-          (unless inferred
-            (new-elab-error env
-              "lambda wildcard needs an expected function type" arg)
-            1)
+          (need env inferred
+            "lambda wildcard needs an expected function type" arg)
           [(_0 state) (snoc [($LocalBinding 0 inferred) inferred] (_1 state))])
         (else (new-elab-error env "unsupported lambda parameter" arg))))
     [compiler []]
@@ -882,16 +891,13 @@
   (define or0 (union-options compiler env expect what))
   (define hit
     (find (lambda (o) (Eq tag (option-member-tag o))) (_1 or0)))
-  (unless hit
-    (new-elab-error env ["no member named" tag "in the expected type"]
-      ["expected" expect "resolving" what])
-    1)
+  (need env hit
+    ["no member named" tag "in the expected type"]
+    ["expected" expect "resolving" what])
   (define member (_0 hit))
   (define vr (view-type (_0 or0) env member "member is not a row type"))
   (define row (_1 vr))
-  (unless (nt:row-type? row)
-    (new-elab-error env ["member is not a row type" tag] member)
-    1)
+  (need env (nt:row-type? row) ["member is not a row type" tag] member)
   (define kr (nt:runtime-key (compiler-world (_0 vr)) row))
   [(compiler-with-world (_0 kr) (_0 vr)) row member (flat-arm-key (_1 kr))])
 
@@ -1008,10 +1014,8 @@
       (ensure-subtype (_0 r) env (tc-ty tc) expected "type mismatch"))
     [c1 (set-tc-ty expected tc)])
   (define (elab-values compiler env surfs goals)
-    (unless (Or (Nil goals) (Eq (Sz surfs) (Sz goals)))
-      (new-elab-error env "argument arity mismatch"
-        ["want" (Sz goals) "got" (Sz surfs)])
-      1)
+    (need env (Or (Nil goals) (Eq (Sz surfs) (Sz goals)))
+      "argument arity mismatch" ["want" (Sz goals) "got" (Sz surfs)])
     (nt:thread-map
       (lambda (c pair)
         (If goals
@@ -1024,14 +1028,11 @@
   ;; value is already right and only the type keeps the remaining
   ;; parameters.
   (define (elab-checked-apply-go compiler env f args fun)
-    (unless (nt:fun-type? fun)
-      (new-elab-error env "application expected a function" (tc-ty f))
-      1)
+    (need env (nt:fun-type? fun)
+      "application expected a function" (tc-ty f))
     (define params (nt:fun-args fun))
-    (unless (Le (Sz args) (Sz params))
-      (new-elab-error env "function arity mismatch"
-        ["want" (Sz params) "got" (Sz args)])
-      1)
+    (need env (Le (Sz args) (Sz params))
+      "function arity mismatch" ["want" (Sz params) "got" (Sz args)])
     (define ar (elab-values compiler env args (take (Sz args) params)))
     (define ret
       (If (Eq (Sz args) (Sz params))
@@ -1068,19 +1069,13 @@
   ;; argument against the instantiated type, giving lambdas their goals.
   ;; Returns [compiler specialized-monotype].
   (define (infer-generic compiler env scm args extra-known what)
-    (unless (Ifz (nt:scheme-const-parameter-count scm) 1 0)
-      (new-elab-error env
-        "const-generic call requires explicit specialization" what)
-      1)
+    (need env (Ifz (nt:scheme-const-parameter-count scm) 1 0)
+      "const-generic call requires explicit specialization" what)
     (define body (nt:scheme-body scm))
-    (unless (nt:fun-type? body)
-      (new-elab-error env "application expected a function" scm)
-      1)
+    (need env (nt:fun-type? body) "application expected a function" scm)
     (define params (nt:fun-args body))
-    (unless (Le (Sz args) (Sz params))
-      (new-elab-error env "function arity mismatch"
-        ["want" (Sz params) "got" (Sz args)])
-      1)
+    (need env (Le (Sz args) (Sz params))
+      "function arity mismatch" ["want" (Sz params) "got" (Sz args)])
     (define sr
       (foldl
         (lambda (state pair)
@@ -1111,11 +1106,9 @@
                     (nt:fun-return body) goal)))
             (If gm gm arg-mr))
           arg-mr)))
-    (unless mr
-      (new-elab-error env
-        "cannot infer type arguments from this call - specialize explicitly"
-        what)
-      1)
+    (need env mr
+      "cannot infer type arguments from this call - specialize explicitly"
+      what)
     (define lambda-args? (Ifz (find lambda-surf? args) 0 1))
     (define gargs
       (map
@@ -1151,84 +1144,84 @@
       (let* ((mr (relvar-member compiler env tag goal "a value"))
              (row (_1 mr))
              (fields (map nt:row-item-value (nt:row-items row))))
-        (unless (Eq (Sz args) (Sz fields))
-          (new-elab-error env ["member arity mismatch" tag]
-            ["want" (Sz fields) "got" (Sz args)])
-          1)
+        (need env (Eq (Sz args) (Sz fields))
+          ["member arity mismatch" tag] ["want" (Sz fields) "got" (Sz args)])
         (let ((er (elab-values (_0 mr) env args fields)))
           [(_0 er) (tc-row goal (nt:row-cstr row) (_1 er))]))))
   (define (elab-ordinary-call compiler env fsurf args)
-    (define fr (elab-value-go compiler (clear-goal env) fsurf))
-    (define f (_1 fr))
-    (If (Eq "TC_TYP" (Hd f))
-      (let ((path (constructor-path (_0 fr) fsurf f)))
-        (If path
-          (let* ((lr (nt:lookup-type-entry (compiler-world (_0 fr)) path))
-                 (entry (_1 lr))
-                 (body (nt:type-entry-body entry))
-                 (c1 (compiler-with-world (_0 lr) (_0 fr))))
-            (cond
-              ((Nil body)
-                ;; A generic constructor instantiates from the expected
-                ;; type, exactly like a relative variant: the goal names
-                ;; the union (or member), the entry names which member.
-                (cond
-                  ((env-goal env)
-                    (relvar-construct c1 env (path-last-segment path) args))
-                  ;; Goal-less and nullary (map/empty in a plain let):
-                  ;; the runtime value is just the brand, so instantiate
-                  ;; at Any and let consistency carry later uses.
-                  ((Ifz (Sz args) 1 0)
-                    (let ((kr
-                            (nt:runtime-key (compiler-world c1)
-                              (nt:type-ref path))))
-                      (unless (Ifz (_1 (_1 kr)) 1 0)
-                        (new-elab-error env
+    (flow compiler
+      ((f (elab-value-go compiler (clear-goal env) fsurf)))
+      (If (Eq "TC_TYP" (Hd f))
+        (let ((path (constructor-path compiler fsurf f)))
+          (If path
+            (flow compiler
+              ((entry
+                 (lift-world compiler
+                   (nt:lookup-type-entry (compiler-world compiler) path))))
+              (define body (nt:type-entry-body entry))
+              (cond
+                ((Nil body)
+                  ;; A generic constructor instantiates from the
+                  ;; expected type, exactly like a relative variant: the
+                  ;; goal names the union (or member), the entry names
+                  ;; which member.
+                  (cond
+                    ((env-goal env)
+                      (relvar-construct compiler env
+                        (path-last-segment path) args))
+                    ;; Goal-less and nullary (map/empty in a plain
+                    ;; let): the runtime value is just the brand, so
+                    ;; instantiate at Any and let consistency carry
+                    ;; later uses.
+                    ((Ifz (Sz args) 1 0)
+                      (flow compiler
+                        ((key
+                           (lift-world compiler
+                             (nt:runtime-key (compiler-world compiler)
+                               (nt:type-ref path)))))
+                        (need env (Ifz (_1 key) 1 0)
                           "generic constructor requires explicit specialization"
                           path)
-                        1)
-                      [(compiler-with-world (_0 kr) c1)
-                       (tc-row nt:tany (_0 (_1 kr)) [])]))
-                  (else
-                    (new-elab-error env
-                      "generic constructor requires explicit specialization"
-                      path))))
-              ((Nil (nt:row-type? body))
-                (new-elab-error env "called type is not a row constructor"
-                  [path body]))
-              (else
-                (let ((ar
-                        (elab-values c1 env args
-                          (map nt:row-item-value (nt:row-items body)))))
-                  [(_0 ar)
-                   (tc-row (nt:type-ref path) (nt:row-cstr body)
-                     (_1 ar))]))))
-          (let ((inner (tc-typ-inner f)))
-            (unless (Nil (nt:scheme? inner))
-              (new-elab-error env
+                        [compiler (tc-row nt:tany (_0 key) [])]))
+                    (else
+                      (new-elab-error env
+                        "generic constructor requires explicit specialization"
+                        path))))
+                ((Nil (nt:row-type? body))
+                  (new-elab-error env "called type is not a row constructor"
+                    [path body]))
+                (else
+                  (flow compiler
+                    ((fields
+                       (elab-values compiler env args
+                         (map nt:row-item-value (nt:row-items body)))))
+                    [compiler
+                     (tc-row (nt:type-ref path) (nt:row-cstr body)
+                       fields)]))))
+            (let ((inner (tc-typ-inner f)))
+              (need env (Nil (nt:scheme? inner))
                 "generic constructor requires explicit specialization" inner)
-              1)
-            ;; A template application (bst[@v] inside a @v body) or plain
-            ;; monotype views to its row; the construction is typed as
-            ;; the callee type itself.
-            (let* ((vr (view-type (_0 fr) env inner
-                         "anonymous called type is not a row"))
-                   (body (_1 vr)))
-              (unless (nt:row-type? body)
-                (new-elab-error env "anonymous called type is not a row"
-                  inner)
-                1)
-              (let ((ar
-                      (elab-values (_0 vr) env args
-                        (map nt:row-item-value (nt:row-items body)))))
-                [(_0 ar) (tc-row inner (nt:row-cstr body) (_1 ar))])))))
-      (If (nt:scheme? (tc-ty f))
-        ;; Explicit-specialization-free generic call: infer, then apply
-        ;; at the instantiated type.
-        (let* ((gr (infer-generic (_0 fr) env (tc-ty f) args [] (tc-ty f)))
-               (f1 (set-tc-ty (_1 gr) f)))
-          (elab-checked-apply (_0 gr) env f1 args))
-        (elab-checked-apply (_0 fr) env f args))))
+              ;; A template application (bst[@v] inside a @v body) or
+              ;; plain monotype views to its row; the construction is
+              ;; typed as the callee type itself.
+              (flow compiler
+                ((body
+                   (view-type compiler env inner
+                     "anonymous called type is not a row"))
+                 (fields
+                   (Seq
+                     (need env (nt:row-type? body)
+                       "anonymous called type is not a row" inner)
+                     (elab-values compiler env args
+                       (map nt:row-item-value (nt:row-items body))))))
+                [compiler (tc-row inner (nt:row-cstr body) fields)]))))
+        (If (nt:scheme? (tc-ty f))
+          ;; Explicit-specialization-free generic call: infer, then
+          ;; apply at the instantiated type.
+          (flow compiler
+            ((inst (infer-generic compiler env (tc-ty f) args [] (tc-ty f))))
+            (elab-checked-apply compiler env (set-tc-ty inst f) args))
+          (elab-checked-apply compiler env f args)))))
   ;; An absolute variant call constructs by tag: against a goal it is a
   ;; relative variant (typed as the expected union); without one it
   ;; synthesizes a structural row.
@@ -1253,56 +1246,54 @@
         (variant-construct compiler env (_1 fhead) args))
       (else (elab-ordinary-call compiler env fsurf args))))
   (define (elab-specialization compiler env val args)
-    (define br (elab-value-go compiler (clear-goal env) val))
-    (define base (_1 br))
-    (define scm (tc-ty base))
-    (unless (nt:scheme? scm)
-      (new-elab-error env "explicit specialization requires a generic value"
-        scm)
-      1)
-    (define ar
-      (type-application-arguments (_0 br) env
-        (nt:scheme-parameters scm) args))
-    (define gargs (_1 ar))
-    (If (Eq "TC_TYP" (Hd base))
-      (let ((path (specialization-base-path (_0 ar) val)))
-        (unless path
-          (new-elab-error env "type specialization needs a named base" val)
-          1)
-        ;; Inside a generic body the specialization stays symbolic; it
-        ;; grounds (and interns) at an enclosing ground specialization.
-        ;; Structural ground args (function types) have no path form and
-        ;; stay symbolic permanently.
-        (If (all nt:path-ridable-argument? gargs)
-          (let ((ir
-                  (nt:intern-type-application
-                    (compiler-world (_0 ar)) path gargs)))
-            [(compiler-with-world (_0 ir) (_0 ar))
-             (tc-typ (nt:type-ref (_1 ir)))])
-          [(_0 ar) (tc-typ (nt:type-app path gargs))]))
-      (let ((sr
-              (nt:specialize-scheme (compiler-world (_0 ar)) scm gargs)))
-        (Ifz (nt:scheme-const-parameter-count scm)
-          ;; Type-only specialization erases at runtime: the value is the
-          ;; base itself at its specialized type.
-          [(compiler-with-world (_0 sr) (_0 ar))
-           (set-tc-ty (_1 sr) base)]
-          ;; A const-bearing instantiation is its own runtime entity.  It
-          ;; references the canonical /ty-ap member path; the base entry
-          ;; skips lowering, and materialize-consts substitutes the
-          ;; constants into a fresh entry at this path before lowering.
-          (unless (Eq "TC_GLOBAL" (Hd base))
-            (new-elab-error env
-              "const-generic specialization requires a named value" val)
-            ;; Ground arguments make a canonical /ty-ap reference;
+    (flow compiler
+      ((base (elab-value-go compiler (clear-goal env) val))
+       (gargs
+         (let ((scm (tc-ty base)))
+           (need env (nt:scheme? scm)
+             "explicit specialization requires a generic value" scm)
+           (type-application-arguments compiler env
+             (nt:scheme-parameters scm) args))))
+      (define scm (tc-ty base))
+      (If (Eq "TC_TYP" (Hd base))
+        (let ((path (specialization-base-path compiler val)))
+          (need env path "type specialization needs a named base" val)
+          ;; Inside a generic body the specialization stays symbolic;
+          ;; it grounds (and interns) at an enclosing ground
+          ;; specialization.  Structural ground args (function types)
+          ;; have no path form and stay symbolic permanently.
+          (If (all nt:path-ridable-argument? gargs)
+            (flow compiler
+              ((path1
+                 (lift-world compiler
+                   (nt:intern-type-application
+                     (compiler-world compiler) path gargs))))
+              [compiler (tc-typ (nt:type-ref path1))])
+            [compiler (tc-typ (nt:type-app path gargs))]))
+        (flow compiler
+          ((spec
+             (lift-world compiler
+               (nt:specialize-scheme (compiler-world compiler)
+                 scm gargs))))
+          (Ifz (nt:scheme-const-parameter-count scm)
+            ;; Type-only specialization erases at runtime: the value
+            ;; is the base itself at its specialized type.
+            [compiler (set-tc-ty spec base)]
+            ;; A const-bearing instantiation is its own runtime entity.
+            ;; It references the canonical /ty-ap member path; the base
+            ;; entry skips lowering, and materialize-consts substitutes
+            ;; the constants into a fresh entry at this path before
+            ;; lowering.  Ground arguments make a canonical reference;
             ;; symbolic ones (inside a generic body) ride as /ty-var
-            ;; segments that materialization rewrites per instantiation.
-            (let ((path
-                    (ty-ap-encode
-                      (Weld [(tc-global-path base)]
-                        (map specialization-argument-part gargs)))))
-              [(compiler-with-world (_0 sr) (_0 ar))
-               (tc-global (_1 sr) path)]))))))
+            ;; segments rewritten per instantiation.
+            (Seq
+              (need env (Eq "TC_GLOBAL" (Hd base))
+                "const-generic specialization requires a named value" val)
+              [compiler
+               (tc-global spec
+                 (ty-ap-encode
+                   (Weld [(tc-global-path base)]
+                     (map specialization-argument-part gargs))))]))))))
   ;; One match arm -> [compiler [arm-tc key]].  env already carries the
   ;; scrutinee local (slot 0), matching lower-match's one-let framing; a
   ;; binder pattern adds TC_LET projections over that slot.
@@ -1320,10 +1311,9 @@
       (define narrowed (_2 mr))
       (define key (_3 mr))
       (define items (nt:row-items row))
-      (unless (Or (Nil (Sz binders)) (Eq (Sz binders) (Sz items)))
-        (new-elab-error env ["member arity mismatch in pattern" tag]
-          ["want" (Sz items) "got" (Sz binders)])
-        1)
+      (need env (Or (Nil (Sz binders)) (Eq (Sz binders) (Sz items)))
+        ["member arity mismatch in pattern" tag]
+        ["want" (Sz items) "got" (Sz binders)])
       (define bound
         (foldl
           (lambda (state pair)
@@ -1373,18 +1363,14 @@
              (vr (view-type (_0 tr) env typ
                    "match arm pattern is not a row (constructor) type"))
              (row (_1 vr)))
-        (unless (nt:row-type? row)
-          (new-elab-error env
-            "match arm pattern is not a row (constructor) type" typ)
-          1)
+        (need env (nt:row-type? row)
+          "match arm pattern is not a row (constructor) type" typ)
         (let* ((kr (nt:runtime-key (compiler-world (_0 vr)) row))
                (key (flat-arm-key (_1 kr)))
                (c1 (compiler-with-world (_0 kr) (_0 vr))))
           ;; Open mode (opt-keys 0): every branded row arm is admissible.
-          (unless (Or (Ifz opt-keys 1 0) (includes (Equal key) opt-keys))
-            (new-elab-error env
-              "match arm is not a member of the scrutinee union" typ)
-            1)
+          (need env (Or (Ifz opt-keys 1 0) (includes (Equal key) opt-keys))
+            "match arm is not a member of the scrutinee union" typ)
           (let* ((e0 (narrow-scrutinee env typ))
                  (e1 (Ifz binder-name e0 (push-local binder-name typ e0)))
                  (br (arm-body c1 e1))
@@ -1458,11 +1444,9 @@
       (Ifz (Sz keys) 0
         (Or (includes (Equal (_0 keys)) (drop 1 keys))
           (dup? (drop 1 keys)))))
-    (unless (Nil (dup? arm-keys))
-      (new-elab-error env
-        "match arm unreachable (an earlier arm already matches everything it matches)"
-        arm-keys)
-      1)
+    (need env (Nil (dup? arm-keys))
+      "match arm unreachable (an earlier arm already matches everything it matches)"
+      arm-keys)
     (define fall (_3 surf))
     (define no-heir? (Eq foil-no-heir fall))
     (define uncovered
@@ -1471,9 +1455,8 @@
         (filter
           (lambda (k) (Or (Nil k) (Nil (includes (Equal k) arm-keys))))
           opt-keys)))
-    (unless (Nil (And no-heir? (Sz uncovered)))
-      (new-elab-error env "non-exhaustive match" ["missing" uncovered])
-      1)
+    (need env (Nil (And no-heir? (Sz uncovered)))
+      "non-exhaustive match" ["missing" uncovered])
     ;; The fallthrough elaborates with the scrutinee local in scope: it is
     ;; lowered inside the match's let, so its slots must account for it.
     (define fallr
@@ -1505,9 +1488,8 @@
       (foldl
         (lambda (state arm)
           (define pat (surf-strip-spans (_1 arm)))
-          (unless (Eq "s_face" (_0 pat))
-            (new-elab-error env "loop parameter must be a faced type" pat)
-            1)
+          (need env (Eq "s_face" (_0 pat))
+            "loop parameter must be a faced type" pat)
           (let ((r (elab-type (_0 state) env (surf-face-kid pat) 0)))
             [(_0 r)
              (snoc (surf-face-name pat) (_1 state))
@@ -1565,24 +1547,25 @@
     ;; canonical prefix.  Only the written namespace unifies the prefix:
     ;; reverse-map the canonical base to its written aliases and resolve
     ;; the member through the visibility index.
+    ;; One shared inversion of the visibility index: written->canonical
+    ;; pairs, computed lazily (forced only by mounted-receiver probes)
+    ;; and scanned by the alias/extension/recording steps below instead
+    ;; of each re-walking the index.
+    (define vis (sut-visible subject))
+    (define vis-pairs (Ifz vis [] (rowify (cairn:tapax vis))))
     (define (extension-member nominal)
-      (define vis (sut-visible subject))
       (define (member-at pair)
         (And (Equal nominal (_1 pair))
           (let ((m (cairn:getax (Weld (_0 pair) [name]) vis)))
             (And m (And (get-const (_0 m) subject) (_0 m))))))
-      (Ifz vis
-        0
-        (let ((hit (find member-at (rowify (cairn:tapax vis)))))
-          (If hit (member-at (_0 hit)) 0))))
-    (define (visible-canonical? vis key)
+      (let ((hit (find member-at vis-pairs)))
+        (If hit (member-at (_0 hit)) 0)))
+    (define (visible-canonical? key)
       (Truth
-        (find (lambda (pair) (Equal key (_1 pair)))
-          (rowify (cairn:tapax vis)))))
+        (find (lambda (pair) (Equal key (_1 pair))) vis-pairs)))
     (define (member-for nominal)
       (And nominal
         (let* ((raw (snoc name nominal))
-               (vis (sut-visible subject))
                (stored (get-const raw subject)))
           (cond
             ;; Legacy subjects infer visibility from storage: probe the
@@ -1595,13 +1578,14 @@
             ;; A stored canonical key is admissible only through a
             ;; written alias: hidden transitive linking storage must
             ;; not leak methods into scope.
-            ((And stored (visible-canonical? vis raw)) raw)
+            ((And stored (visible-canonical? raw)) raw)
             (else
               (let* ((mp (canon-path raw subject))
-                     (hit (And (get-const mp subject) mp)))
+                     (hit (And (get-const mp subject) mp))
+                     (ext (Ifz hit (extension-member nominal) 0)))
                 (cond
                   (hit hit)
-                  ((extension-member nominal) (extension-member nominal))
+                  (ext ext)
                   (stored
                     ;; The detail row leads with the legacy tag so
                     ;; tooling that scans error trees by head keeps
@@ -1622,7 +1606,8 @@
       (cond
         (member
           (let ((gr (global-reference-canonical c env member)))
-            [(record-member-resolution (_0 gr) env member) (_1 gr) t]))
+            [(record-member-resolution (_0 gr) env member vis-pairs)
+             (_1 gr) t]))
         ((And (Lt depth 8)
            (Or (nt:type-ref? t) (nt:type-app? t)))
           (let* ((vr (nt:view (compiler-world c) t))
@@ -1678,43 +1663,38 @@
           (specialized-reference compiler sr (_1 dr))))
       (else
         (let ((body (nt:scheme-body scm)))
-          (unless (And (nt:fun-type? body)
-                    (Eq (Inc (Sz margs)) (Sz (nt:fun-args body))))
-            (new-elab-error env ["method arity mismatch" name] scm)
-            1)
+          (need env (And (nt:fun-type? body) (Eq (Inc (Sz margs)) (Sz (nt:fun-args body))))
+            ["method arity mismatch" name] scm)
           (let ((gr
                   (infer-generic compiler env scm margs
                     [[(Ix (Sz margs) (nt:fun-args body)) rcvr-ty]]
                     name)))
             [(_0 gr) (set-tc-ty (_1 gr) f)])))))
   (define (elab-meth-step env state seg)
-    (define compiler (_0 state))
     (define rcvr (_1 state))
     (define name (surf-mseg-name seg))
     (define margs (surf-mseg-args seg))
-    (define fr0 (meth-function compiler env (tc-ty rcvr) name))
-    (define fr
-      (If (nt:scheme? (tc-ty (_1 fr0)))
-        (meth-specialize (_0 fr0) env (_1 fr0) (_2 fr0) name margs)
-        fr0))
-    (define f (_1 fr))
-    (define vr
-      (view-type (_0 fr) env (tc-ty f) "method is not a function"))
-    (define fun (_1 vr))
-    (unless (nt:fun-type? fun)
-      (new-elab-error env "method is not a function" [name (tc-ty f)])
-      1)
-    (unless (Eq (Inc (Sz margs)) (Sz (nt:fun-args fun)))
-      (new-elab-error env ["method arity mismatch" name]
-        ["want" (Sz (nt:fun-args fun)) "got" (Inc (Sz margs))])
-      1)
-    (define ar
-      (elab-values (_0 vr) env margs (take (Sz margs) (nt:fun-args fun))))
-    (define c1
-      (ensure-subtype (_0 ar) env (tc-ty rcvr)
-        (Ix (Sz margs) (nt:fun-args fun))
-        "receiver does not fit the method's trailing parameter"))
-    [c1 (fold-tc-app f (snoc rcvr (_1 ar)) (nt:fun-return fun))])
+    (define fr0 (meth-function (_0 state) env (tc-ty rcvr) name))
+    (flow compiler
+      ((f
+         (If (nt:scheme? (tc-ty (_1 fr0)))
+           (meth-specialize (_0 fr0) env (_1 fr0) (_2 fr0) name margs)
+           [(_0 fr0) (_1 fr0)]))
+       (fun (view-type compiler env (tc-ty f) "method is not a function"))
+       (margs-tc
+         (Seq
+           (need env (nt:fun-type? fun)
+             "method is not a function" [name (tc-ty f)])
+           (Seq
+             (need env (Eq (Inc (Sz margs)) (Sz (nt:fun-args fun)))
+               ["method arity mismatch" name]
+               ["want" (Sz (nt:fun-args fun)) "got" (Inc (Sz margs))])
+             (elab-values compiler env margs
+               (take (Sz margs) (nt:fun-args fun)))))))
+      [(ensure-subtype compiler env (tc-ty rcvr)
+         (Ix (Sz margs) (nt:fun-args fun))
+         "receiver does not fit the method's trailing parameter")
+       (fold-tc-app f (snoc rcvr margs-tc) (nt:fun-return fun))]))
   (define (elab-meth compiler env surf)
     (define els (_1 surf))
     (define head (_0 els))
@@ -1829,14 +1809,11 @@
          (tc-lam out-type 0 (Weld [self-type] arg-types) (_1 br))]))
     ((Eq tag "s_self")
       (let ((self (find-local env 0)))
-        (unless self
-          (new-elab-error env "recursive call outside a function" surf)
-          1)
+        (need env self "recursive call outside a function" surf)
         (let ((binding (_1 self)))
-          (unless (nt:fun-type? (local-type binding))
-            (new-elab-error env "recursive function has no declared return type"
-              (local-type binding))
-            1)
+          (need env (nt:fun-type? (local-type binding))
+            "recursive function has no declared return type"
+            (local-type binding))
           ;; An undeclared self-return is Bot: the recursive call
           ;; contributes nothing to a join, so an uncast loop types as
           ;; the join of its non-recursive exits.  Under-application is
@@ -1845,10 +1822,9 @@
           (let* ((fun (local-type binding))
                  (params (nt:fun-args fun))
                  (args (_1 surf)))
-            (unless (Le (Sz args) (Sz params))
-              (new-elab-error env "recursive call arity mismatch"
-                ["want" (Sz params) "got" (Sz args)])
-              1)
+            (need env (Le (Sz args) (Sz params))
+              "recursive call arity mismatch"
+              ["want" (Sz params) "got" (Sz args)])
             (let ((ar
                     (elab-values compiler env args
                       (take (Sz args) params))))
@@ -1923,26 +1899,25 @@
       (let ((typ (nt:trow (_1 surf) [])))
         [compiler (tc-row typ (_1 surf) [])]))
     ((Eq tag "s_if")
-      (let* ((cr (check-value compiler (clear-goal env) (_1 surf) (nt:tnat 0)))
-             (yr
-               (If (env-goal env)
-                 (check-value (_0 cr) env (_2 surf) (env-goal env))
-                 (elab-value-go (_0 cr) (clear-goal env) (_2 surf))))
-             (nr
-               (If (env-goal env)
-                 (check-value (_0 yr) env (_3 surf) (env-goal env))
-                 (elab-value-go (_0 yr) (clear-goal env) (_3 surf))))
-             (jr
-               (If (env-goal env)
-                 [(_0 nr) (env-goal env)]
-                 (let ((j
-                         (nt:join (compiler-world (_0 nr))
-                           (tc-ty (_1 yr)) (tc-ty (_1 nr)))))
-                   [(compiler-with-world (_0 j) (_0 nr)) (_1 j)])))
-             (out (_1 jr))
-             (if-ty (nt:tfun [(nt:tnat 0) out out] out))
-             (if-tc (tc-ffi if-ty If)))
-        [(_0 jr) (fold-tc-app if-tc [(_1 cr) (_1 yr) (_1 nr)] out)]))
+      (flow compiler
+        ((cnd (check-value compiler (clear-goal env) (_1 surf) (nt:tnat 0)))
+         (yes
+           (If (env-goal env)
+             (check-value compiler env (_2 surf) (env-goal env))
+             (elab-value-go compiler (clear-goal env) (_2 surf))))
+         (no
+           (If (env-goal env)
+             (check-value compiler env (_3 surf) (env-goal env))
+             (elab-value-go compiler (clear-goal env) (_3 surf))))
+         (out
+           (If (env-goal env)
+             [compiler (env-goal env)]
+             (lift-world compiler
+               (nt:join (compiler-world compiler)
+                 (tc-ty yes) (tc-ty no))))))
+        [compiler
+         (fold-tc-app (tc-ffi (nt:tfun [(nt:tnat 0) out out] out) If)
+           [cnd yes no] out)]))
     ((Eq tag "s_letrec")
       (let* ((outer-goal (env-goal env))
              (lr
@@ -1981,11 +1956,9 @@
                               (view-type (_0 vr) e typ
                                 "destructuring needs a row value"))
                             (row (_1 wr)))
-                       (unless (And (nt:row-type? row)
-                                 (Eq (Sz names) (Sz (nt:row-items row))))
-                         (new-elab-error e "destructuring arity mismatch"
-                           ["pattern" names "value" typ])
-                         1)
+                       (need e (And (nt:row-type? row) (Eq (Sz names) (Sz (nt:row-items row))))
+                         "destructuring arity mismatch"
+                         ["pattern" names "value" typ])
                        (let* ((items
                                 (map nt:row-item-value (nt:row-items row)))
                               (out

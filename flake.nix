@@ -81,6 +81,7 @@
           foil-async-tests = runReaverTest "foil-async-tests";
           typed-reaver-tests = runReaverTest "typed-reaver-tests";
           helm-ref-tests = runReaverTest "helm-ref-tests";
+          wisp-env-tests = runReaverTest "wisp-env-tests";
         });
     };
 }

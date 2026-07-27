@@ -1,0 +1,89 @@
+;; Reflection demo: compile a module with the stage-1 pipeline and use
+;; the reflection API to render every declaration's type, inspect a
+;; generic's scheme, and type a live expression.
+(#bind std (#module std))
+(#import std)
+(#bind rex (#module rex))
+(#bind foil-sast (#module foil-sast))
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+(#bind foil (#module foil))
+(#bind elab (#module foil-new-elab))
+(#bind nt (#module foil-new-types))
+(#bind render (#module foil-render))
+
+(define src "
++  temp
+  '  A labelled temperature reading.
+  :  site=quip celsius=nat
++  reading
+  &  ($ok temp)
+     $missing
++  stash
+  (@@ v)
+  +  empty
+    :
+  +  node
+    :  val=v rest=stash[v]
+  &  stash/empty
+     stash/node[v]
+  +  put
+    \  x=v s=stash[v]
+    ^  stash[v]
+    (stash/node[v] x s)
++  mean_c
+  \  rs=row[temp]
+  ^  nat
+  =  > total rs.fold((\ acc t acc.add(t.celsius)) 0)
+  (div total rs.len)
+")
+(define rows (foil-sast:parse-module-sast 0 (rex:ParseRexNorm src)))
+(define compiler
+  (elab:elab-mod (elab:compiler-for foil:default-subject) rows))
+(define sut (elab:compiler-subject compiler))
+
+;; 1. Every declaration's rendered type, straight off the subject.
+(define (sig name)
+  [(print-path name)
+   (render:ty-text (tc-ty (got-entry-tc (Weld ["boot"] name) sut)))])
+(define signatures
+  (map sig
+    [["temp"] ["reading"] ["stash"] ["stash" "node"] ["stash" "put"]
+     ["temp" "celsius"] ["temp" "set_celsius"] ["mean_c"]]))
+
+;; 2. The world: look a generic up and take its scheme apart.
+(define world (elab:compiler-world compiler))
+(define stash-entry (_1 (nt:lookup-type-entry world ["boot" "stash"])))
+(define stash-facts
+  ["params"
+   (map nt:parameter-name
+     (nt:scheme-parameters (nt:type-entry-scheme stash-entry)))
+   "brand" (nt:type-entry-runtime-brand stash-entry)
+   "body" (render:ty-text (nt:scheme-body (nt:type-entry-scheme stash-entry)))])
+
+;; 3. A ground instantiation materializes on demand; render its body.
+(define ground
+  (nt:intern-type-application world ["boot" "stash"]
+    [(nt:type-arg (nt:type-ref ["nat"]))]))
+(define ground-body
+  (render:ty-text
+    (nt:type-entry-body (_1 (nt:lookup-type-entry (_0 ground) (_1 ground))))))
+
+;; 4. Live value elaboration: the type of an expression against the
+;; compiled subject, as a tool/REPL would ask for it.
+(define (type-of txt)
+  (render:ty-text
+    (tc-ty
+      (_1 (elab:elab-value (elab:compiler-for sut)
+            (foil-sast:parse-val-sast (rex:ParseRexNorm txt)))))))
+(define live
+  [["(temp '%kit 21)"   (type-of "(temp '%kit 21)")]
+   ["($ok (temp '%kit 21))" (type-of "($ok (temp '%kit 21))")]
+   ["(stash/put[nat] 3 (stash/empty))"
+    (type-of "(stash/put[nat] 3 (stash/empty))")]
+   ["mean_c" (type-of "mean_c")]])
+
+["SIGNATURES" signatures
+ "STASH" stash-facts
+ "GROUND stash[nat]" ground-body
+ "LIVE" live]

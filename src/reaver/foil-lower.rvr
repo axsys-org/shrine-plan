@@ -23,9 +23,25 @@
 
 (define (make-ir-entry key span val tc ir)
   ("IR_ENTRY" key span val tc ir))
-(define ir-entry-val (Ix 2))
+
+;; Unit-grouped entries do not embed their compiled value directly: the
+;; whole group's runtime row (and IR) is serialized behind ONE pin, and
+;; each entry stores only ["#group" group-pin index].  Without this
+;; boundary every entry pin re-serializes a private copy of the shared
+;; dispatcher closure — content-addressed sharing dedupes only at pin
+;; boundaries — and a ~30KB module writes tens of MB of store (the
+;; global.plan cost model: bound pin churn per update).  The accessors
+;; re-derive the projection at each read, so the boundary survives
+;; forcing.
+(define (group-slot? v)
+  (And (IsApp v) (And (Eq 3 (Sz v)) (Eq "#group" (_0 v)))))
+
+(define (entry-slot v)
+  (If (group-slot? v) (Ix (_2 v) (Unpin (_1 v))) v))
+
+(define (ir-entry-val ent) (entry-slot (Ix 2 ent)))
 (define ir-entry-tc (Ix 3))
-(define ir-entry-ir (Ix 4))
+(define (ir-entry-ir ent) (entry-slot (Ix 4 ent)))
 
 ;;; TC lowering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -262,15 +278,18 @@
                (profile-zone:force-zone "foil.lower.unit.codegen"
                  (cgen:compile-expr group-ir))
                (cgen:compile-expr group-ir)))
-           (project-ir
-             (lambda (i)
-               (cgen:A (cgen:A (cgen:K Ix) (cgen:K i)) group-ir)))
+           (values-pin (Pin values))
            (insert-one
              (lambda (out pair[i key])
                (let* ((old (got-entry key final))
                       (tc (tc-entry-contents old))
+                      ;; The retained IR is debug metadata with no
+                      ;; production consumer, and measured ~20x the
+                      ;; size of the compiled code itself: persisting
+                      ;; it dominated snapshot mass.  Tooling that
+                      ;; wants IR re-lowers the entry's TC on demand.
                       (ent (make-ir-entry key (tc-entry-span old)
-                             (Ix i values) tc (project-ir i))))
+                             ["#group" values-pin i] tc 0)))
                  (insert-entry-sut key ent out)))))
       ;; The shared dispatcher is compiled once; every entry stores an indexed
       ;; value and a projection IR suitable for downstream caches/debugging.
