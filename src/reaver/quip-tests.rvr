@@ -1,0 +1,153 @@
+
+; Aura codec tests: parse-quip / print-quip round-trips per aura, and
+; strictness rejections via parse-quip-soft (0 = syntax error).
+
+(#bind reef (#module reef))
+(#import reef)
+(#bind quip (#module quip))
+(#import quip)
+
+(define (rejects str) (Eq 0 (parse-quip-soft str)))
+(define (round-trips str) (Equal str (print-quip (parse-quip str))))
+
+;; --- symbols (ts) ------------------------------------------------------
+assert(Equal ("ts" "foo") (parse-quip "foo"))
+assert(Equal ("ts" "foo_Bar2") (parse-quip "foo_Bar2"))
+assert(Equal ("ts" "Foo") (parse-quip "Foo"))
+assert(Equal ("ts" "r1") (parse-quip "r1"))
+assert(round-trips "foo")
+assert(round-trips "foo_Bar2")
+assert(rejects "foo-bar")
+assert(rejects "_foo")
+assert(rejects "1foo")
+
+;; --- nats (u) ----------------------------------------------------------
+assert(Equal ("u" 0) (parse-quip "0"))
+assert(Equal ("u" 31) (parse-quip "31"))
+assert(round-trips "0")
+assert(round-trips "31")
+assert(rejects "007")
+assert(rejects "01")
+
+;; --- booleans (f) ------------------------------------------------------
+assert(Equal ("f" 0) (parse-quip "0.y"))
+assert(Equal ("f" 1) (parse-quip "0.n"))
+assert(round-trips "0.y")
+assert(round-trips "0.n")
+assert(rejects "0.x")
+assert(rejects "0.")
+assert(rejects "0.yy")
+
+;; --- signed integers (s) -----------------------------------------------
+assert(Equal ("s" 0) (parse-quip "0s0"))
+assert(Equal ("s" 2) (parse-quip "0s1"))
+assert(Equal ("s" 1) (parse-quip "0s-1"))
+assert(Equal ("s" 10) (parse-quip "0s5"))
+assert(Equal ("s" 9) (parse-quip "0s-5"))
+assert(round-trips "0s0")
+assert(round-trips "0s5")
+assert(round-trips "0s-5")
+assert(rejects "0s-0")
+assert(rejects "0s05")
+assert(rejects "0s")
+assert(rejects "0s-")
+
+;; --- hex binary (x) ----------------------------------------------------
+assert(Equal ("x" 255) (parse-quip "0xff"))
+assert(Equal ("x" 31) (parse-quip "0x1f"))
+assert(round-trips "0xff")
+assert(round-trips "0x0102")
+assert(rejects "0x1F")
+assert(rejects "0x")
+assert(rejects "0xf")
+assert(rejects "0xff00")
+
+;; --- base64url binary (w) ----------------------------------------------
+assert(round-trips "0wQQ")
+assert(Equal ("w" 65) (parse-quip "0wQQ"))
+assert(rejects "0wQQ==")
+assert(rejects "0w")
+assert(rejects "0wQ")
+
+;; --- strings (ta / tu) -------------------------------------------------
+assert(Equal ("ta" "hello") (parse-quip "$hello"))
+assert(round-trips "$hello")
+;; deprecated % alias: parses to the same nat, never prints
+assert(Equal ("ta" "hello") (parse-quip "%hello"))
+assert(Equal "$hello" (print-quip (parse-quip "%hello")))
+assert(Equal (parse-quip "$!aGk") (parse-quip "%!aGk"))
+;; tu round-trips through base64url
+assert(Equal "$!aGk" (print-quip ("tu" (Ix 0 (parse-quip "$!aGk")))))
+assert(rejects "$")
+assert(rejects "$!")
+assert(rejects "%")
+;; ta printer refuses non-ascii payloads
+assert(Equal ("tu" "hi") (cord-to-text-quip "hi"))
+
+;; --- path arity (r) ----------------------------------------------------
+assert(Equal ("r" 3) (parse-quip "#3"))
+assert(Equal ("r" 0) (parse-quip "#0"))
+assert(round-trips "#3")
+assert(rejects "#03")
+assert(rejects "#")
+
+;; --- durations (dr) ----------------------------------------------------
+assert(Equal ("dr" 250) (parse-quip "@ms250"))
+assert(Equal ("dr" 5400000) (parse-quip "@h1.m30"))
+assert(Equal ("dr" 5400000) (parse-quip "@m90"))
+assert(Equal "@h1.m30" (print-quip ("dr" 5400000)))
+assert(Equal ("dr" 183600000) (parse-quip "@d2.h3"))
+assert(Equal ("dr" 0) (parse-quip "@ms0"))
+assert(Equal "@ms0" (print-quip ("dr" 0)))
+assert(round-trips "@ms250")
+assert(round-trips "@h1.m30")
+assert(round-trips "@d2.h3.m4.s5.ms6")
+assert(rejects "@m30.h1")
+assert(rejects "@h1.h1")
+assert(rejects "@h01")
+assert(rejects "@h")
+assert(rejects "@q5")
+assert(rejects "@")
+
+;; --- absolute times (dm / ds) ------------------------------------------
+assert(round-trips "@2026.7.27..12.0.0")
+assert(round-trips "@@2026.7.27..12.0.0")
+assert(round-trips "@2026.7.27..12.0.0..ff")
+assert(round-trips "@@1969.7.21..2.56.15")
+;; dm and ds share the Apollo zero: same wall time, scales 2^10 vs 2^50
+assert(Equal
+  (Mul (Bex 40) (Ix 0 (parse-quip "@2026.7.27..12.0.0")))
+  (Ix 0 (parse-quip "@@2026.7.27..12.0.0")))
+;; later times are bigger
+assert(Lt (Ix 0 (parse-quip "@2026.7.27..12.0.0"))
+          (Ix 0 (parse-quip "@2026.7.27..12.0.1")))
+;; fraction bounds: dm frac is sub-second in 2^10 units
+assert(rejects "@2026.7.27..0.0.0..0004")
+assert(rejects "@2026.13.1..0.0.0")
+assert(rejects "@2026.0.1..0.0.0")
+assert(rejects "@2026.1.32..0.0.0")
+assert(rejects "@2026.1.1..24.0.0")
+assert(rejects "@2026.1.1..0.60.0")
+assert(rejects "@2026.7.27")
+assert(rejects "@@")
+
+;; --- floats: reserved, codec TODO --------------------------------------
+assert(rejects "0fd1.5")
+assert(rejects "0fs1.5")
+assert(rejects "0fdnan")
+
+;; --- degraded printing of bare nats --------------------------------------
+;; sym > $-string > decimal, injective.
+assert(Equal "foo" (print-nat-canonical "foo"))
+assert(Equal "$1abc" (print-nat-canonical "1abc"))
+assert(Equal "$1" (print-nat-canonical 49))       ; bytes "1", not nat 1
+assert(Equal "1" (print-nat-canonical 1))
+assert(Equal "d" (print-nat-canonical 100))       ; 0x64 = 'd', a symbol
+assert(Equal "0" (print-nat-canonical 0))
+assert(Eq 1 (str-numeric? (print-nat-canonical "a b")))   ; space -> decimal
+
+;; --- reserved 0-prefix space -------------------------------------------
+assert(rejects "0z5")
+assert(rejects "0q")
+
+(print "quip aura tests passed")

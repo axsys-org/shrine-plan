@@ -2,6 +2,7 @@
 ;;;; SPDX-License-Identifier: MIT
 ;;;; See LICENSE for full terms.
 
+(#bind quip (#module quip))
 (#bind std (#module std))
 (#import std)
 
@@ -84,8 +85,6 @@
       "Content-Type: " ctype crlf
       crlf body]))
 
-;; "/ns/a/b" -> [("ts" "a") ("ts" "b")]; "/", "/ns" -> [].  A leading
-;; "ns" segment is the explorer's own prefix and is dropped.
 (define (str-slice off len src)
   (Mod (Rsh src (Mul 8 off)) (Lsh 1 (Mul 8 len))))
 
@@ -99,13 +98,22 @@
         (go (Inc i) start acc))))
   (go 0 0 []))
 
+;; "/ns/a/3/$s" -> [[("ts" "a") ("u" 3) ("ta" "s")]]; "/", "/ns" -> [[]].
+;; Each segment parses through the aura codec, so numeric segments
+;; arrive as u quips and $-segments as strings; an unparseable segment
+;; yields 0 and the caller 404s.  A leading "ns" segment is the
+;; explorer's own prefix and is dropped.
 (define (url-target u)
   (define parts (filter (lambda (x) (Nil (Eq 0 (Bytes x)))) (split-ch 47 u)))
   (define parts2
     (If (And (Sz parts) (Equal "ns" (Ix 0 parts)))
       (drop 1 parts)
       parts))
-  (map (lambda (t) ("ts" t)) parts2))
+  (define (go i acc)
+    (If (Eq i (Sz parts2)) [acc]
+      (let ((r (quip:parse-quip-soft (Ix i parts2))))
+        (Ifz r 0 (go (Inc i) (snoc (_0 r) acc))))))
+  (go 0 []))
 
 ;;; Socket layer (thin; blocking IO lives in its own actors) ;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -304,16 +312,21 @@
                (chore? (And (h-bridge? hs)
                          (And (Gt (Sz parts) 1)
                            (Equal "chore" (Ix 0 parts)))))
+               (target (url-target (_2 msg)))
                (record
                  (If chore?
                    (chore-record parts (_3 msg))
-                   ((h-req hs) (_1 msg) (_2 msg) (_3 msg)
-                     (url-target (_2 msg)))))
+                   (Ifz target 0
+                     ((h-req hs) (_1 msg) (_2 msg) (_3 msg) (_0 target)))))
                (pax
                  (If chore?
                    [("ts" "io") ("ts" "chore")
                     ("ts" (strcat ["b" (_0 name) (showNat serial)]))]
                    (rpath serial))))
+          (If (And (Nil chore?) (Ifz target 1 0))
+            (Seq (helm:send! (Ix 0 caps)
+                   ["res" 404 "unparseable path segment" "text/plain; charset=utf-8"])
+              (loop serial pending queue))
           (If (And chore? (Ifz record 1 0))
             (Seq (helm:send! (Ix 0 caps)
                    ["res" 404 "unknown chore verb" "text/plain; charset=utf-8"])
@@ -325,7 +338,7 @@
                 (Seq (helm:send! coord ["cmd" name task])
                   (loop (Inc serial)
                     (snoc [pax (Ix 0 caps)] pending)
-                    (snoc [pax "make"] queue))))))))
+                    (snoc [pax "make"] queue)))))))))
       ((Eq kind "change")
         ;; the watched request node moved: respond when the behavior
         ;; has written the response slots, else re-arm and keep waiting

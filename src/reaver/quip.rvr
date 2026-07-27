@@ -1,15 +1,24 @@
 
-; @yyyy.mm.dd..hh.MM.ss..hex-fractional - single precision time (64bit, milli)
-; @@yyyy.mm.dd..hh.MM.ss..hex-fractional` double precision time (128bit, femto)
-; foo - any alphabetic char begins a symbol (alphanumerics + _ )
-; 31 - any numeric char (except 0) begins a number
-; 0 - just 0
-; %!<base64> - arbitrary run of unicode, encoded as base64
-; %<chars> - arbitrary run of ascii (no spaces, control codes)
-; #3 - path length indicator
-; 0w<base-64> binary data in base64
-; 0x<base-16> hex data
-
+; The kernel aura codec (see doc/aura-spec.md).  A quip is (tag payload);
+; parse-quip maps a lexical segment to exactly one quip, print-quip maps a
+; quip back to exactly one canonical spelling.  Dispatch is total over
+; leading characters, first match wins:
+;
+; @@y.m.d..h.M.s..hexfrac - "ds" absolute time, double precision (femto)
+; @y.m.d..h.M.s..hexfrac  - "dm" absolute time, single precision (binary ms)
+; @h1.m30, @ms250         - "dr" duration (unit-letter-first, largest first)
+; 0.y / 0.n               - "f"  boolean (true=0, false=1)
+; 0s5 / 0s-5              - "s"  signed integer, zigzag (0s-0 is an error)
+; 0fs... / 0fd...         - "rs"/"rd" floats (codec TODO, parse errors)
+; 0w<base64url>           - "w"  binary, base64url (no padding)
+; 0x<lowercase hex>       - "x"  binary, hex (uppercase is an error)
+; 0 alone                 - "u"  zero (any other 0-prefix is reserved)
+; 31                      - "u"  decimal nat (no leading zeros)
+; $!<base64url>           - "tu" unicode string (UTF-8 bytes)
+; $<chars>                - "ta" ascii string (printable, no space/control)
+; %!<b64> / %<chars>      - deprecated aliases for tu/ta (parse-only)
+; #3                      - "r"  path arity marker (path grammar, not an aura)
+; foo_Bar2                - "ts" symbol (alpha start, alnum+_ continue)
 
 (#bind reef (#module reef))
 (#import reef)
@@ -24,6 +33,28 @@
 (#import parse)
 (#bind apollo (#module apollo))
 (#import apollo)
+
+;; --- character classes -------------------------------------------------
+
+(define (aura-print-char? c) (And (Gt c 32) (Lt c 127)))
+(define (aura-alpha? c) (Or (isLower c) (isUpper c)))
+(define (aura-sym-char? c)
+  (Or (aura-alpha? c) (Or (isNatChr c) (Eq "_" c))))
+(define (aura-sym? str)
+  (And (Ne 0 str)
+    (And (aura-alpha? (Load8 0 str))
+      (str-all aura-sym-char? str))))
+
+;; Strict minimal decimal: nonempty, digits only, no leading zero.
+;; Soft parsers return 0 on malformed input and [value] on success.
+(define (dec-strict-soft str)
+  (cond
+    ((Eq 0 str) 0)
+    ((Nil (str-all isNatChr str)) 0)
+    ((And (Gt (Bytes str) 1) (Eq "0" (Load8 0 str))) 0)
+    (else [(parse-nat str)])))
+
+;; --- base64url (no padding) --------------------------------------------
 
 (define (base64-decode-char ch)
   (define hi (size-nat 4 (Rsh ch 4)))
@@ -46,22 +77,16 @@
     ((Eq a 63) "_")
     (else (error "bad sextet"))))
 
-
 (define sexs (Row 0 64 (lrange 0)))
 (define (does-invert x)
   (Eq x (base64-decode-char (base64-encode-char x))))
 assert(all does-invert sexs)
 
-(define (base64-dec str)
-  (define r[strip str1]
-    (cond
-      ((Eq "==" (slice-r 0 2 str)) [2 (byte-trunc-by 2 str)])
-      ((Eq "=" (slice-r 0 1 str))  [1 (byte-trunc-by 1 str)])
-      (else [0 str])))
-  (define output (lfoldl1 (bloq-weld 6)
-                   ;(lambda (acc arg) (Add acc (Mul 64 arg)))
-    (lrev (lmap base64-decode-char (lexplode str1)))))
-  (bytes-swp (Rsh output (Mul 2 strip))))
+(define (base64-char? ch)
+  (Or (isLower ch)
+    (Or (isUpper ch)
+      (Or (isNatChr ch)
+        (Or (Eq "-" ch) (Eq "_" ch))))))
 
 (define (load-bytes-to-sex bytes[one two tri])
   (define fst (Rsh one 2))
@@ -72,8 +97,6 @@ assert(all does-invert sexs)
 
 (define (base64-enc byts)
   (define len (berm-met 8 byts))
-  assert(Ne 0 len)
-  (define pad (reap "=" (Mod len 4)))
   (define (go buf idx iter iter-count)
     (define iter1 (Up iter-count (berm-load8 idx buf) iter))
     (define last (Eq (Inc idx) len))
@@ -85,13 +108,36 @@ assert(all does-invert sexs)
               (map base64-encode-char
                 (drop-r (Sub 2 iter-count) (load-bytes-to-sex iter1)))
             (go buf (Inc idx) iter1 (Inc iter-count)))))
-  (define res (crip (go byts 0 [0 0 0] 0)))
-  (strWeld res (reap "=" (Sub 4 (Mod (Bytes res) 4)))))
+  (If (Eq 0 len)
+    (error ["quip-print-error" "empty-binary" byts])
+    (crip (go byts 0 [0 0 0] 0))))
 
 (define (base64-enc-str str)
   (base64-enc (make-berm8 str)))
 
-(define hex-chars (Row 0 16 (lexplode "0123456789ABCDEF")))
+;; Strict decode: valid alphabet only (no '='), possible char count, and
+;; canonical (re-encodes to the same text -- rejects nonzero dropped bits
+;; and non-minimal trailing zero bytes).
+(define (base64-dec-soft str)
+  (define extra (Mod (Mul 6 (Bytes str)) 8))
+  (define output (lfoldl1 (bloq-weld 6)
+    (lrev (lmap base64-decode-char (lexplode str)))))
+  (define v (bytes-swp (Rsh output extra)))
+  (cond
+    ((Eq 0 str) 0)
+    ((Nil (str-all base64-char? str)) 0)
+    ((gte extra 6) 0)
+    ((Equal str (base64-enc v)) [v])
+    (else 0)))
+
+(define (base64-dec str)
+  (define r (base64-dec-soft str))
+  (Ifz r (error ["quip-parse-error" "bad-base64url" str]) (_0 r)))
+
+;; --- hex (lowercase) ---------------------------------------------------
+
+(define hex-chars (Row 0 16 (lexplode "0123456789abcdef")))
+
 (define (hex-enc byts)
   (define len (berm-met 8 byts))
   (define (go buf idx)
@@ -102,80 +148,294 @@ assert(all does-invert sexs)
       [(Ix hi hex-chars) [(Ix lo hex-chars) (go buf (Inc idx))]]))
   (lcrip (go byts 0)))
 
-(define (hex-dec-nibble nib)
-  (define ret (cond
-    ((gte nib "a") (Add 10 (Sub nib "a")))
-    ((gte nib "A") (Add 10 (Sub nib "A")))
-    (else (Sub nib "0"))))
-  assert(Lt ret 16)
-  ret)
+(define (hex-char? ch)
+  (Or (isNatChr ch) (And (gte ch "a") (lte ch "f"))))
 
-(define (hex-dec str)
+(define (hex-dec-nibble nib)
+  (If (gte nib "a") (Add 10 (Sub nib "a")) (Sub nib "0")))
+
+(define (hex-dec-raw str)
   (define nibs (lmap hex-dec-nibble (lexplode str)))
   (define byts (chunks 2 nibs))
   (define (hex-dec-byt byt[hi lo])
     (Add (Lsh hi 4) lo))
     (lfoldr strWeld 0 (lmap hex-dec-byt byts)))
 
-(define (parse-time str)
-  (define t[date time frac] (split-str ".." str))
-  (define d[y m d] (split-str "." date))
-  (define ti[h mm s] (split-str "." time))
-  (define hex (hex-dec frac))
-  (define unix (cal-to-unix [y m d h mm s hex]))
-  (define apollo (unix-to-apollo unix))
-  (i128-add hex apollo))
-
-
-(define (parse-rec str)
-  ("r" (parse-nat str)))
-
-(define (parse-num str)
-  (define tag (Load8 0 str))
-  (define tag-is (Eq tag))
-  (define rest (Rsh str 8))
+;; Strict decode: lowercase-only, whole bytes, canonical (re-encode check
+;; rejects trailing zero bytes).
+(define (hex-dec-soft str)
+  (define v (hex-dec-raw str))
   (cond
-    ((Eq rest 0) ("u" 0))
-    ((tag-is "w") ("w" (base64-dec rest)))
-    ((tag-is "x") ("x" (hex-dec rest)))
-    (else (error ("Bad tag parse-num" tag)))))
+    ((Eq 0 str) 0)
+    ((Nil (str-all hex-char? str)) 0)
+    ((Ne 0 (Mod (Bytes str) 2)) 0)
+    ((Equal str (hex-enc v)) [v])
+    (else 0)))
 
-(define (parse-str str)
-  (define tag (Load8 0 str))
-  (define tag-is (Eq tag))
-  (define rest (Rsh str 8))
+(define (hex-dec str)
+  (define r (hex-dec-soft str))
+  (Ifz r (error ["quip-parse-error" "bad-hex" str]) (_0 r)))
+
+;; --- signed integers (zigzag) ------------------------------------------
+
+(define (parse-zigzag-soft str)
+  (define neg (Eq "-" (Load8 0 str)))
+  (define d (dec-strict-soft (If neg (Rsh str 8) str)))
+  (Ifz d 0
+    (If neg
+      (If (Eq 0 (_0 d)) 0             ; 0s-0 is unspellable
+        [(Dec (Mul 2 (_0 d)))])
+      [(Mul 2 (_0 d))])))
+
+(define (print-zigzag k)
+  (If (Eq 0 (Mod k 2))
+    (strWeld "0s" (showNat (Div k 2)))
+    (strWeld "0s-" (showNat (Div (Inc k) 2)))))
+
+;; --- durations ---------------------------------------------------------
+;; Payload: total milliseconds.  Spelling: unit-letter-first components,
+;; largest unit first, each unit at most once, joined with ".":
+;; @h1.m30, @ms250, @d2.h3.  Non-canonical magnitudes (@m90) parse but
+;; never print; out-of-order or repeated units are errors.
+
+(define dur-unit-names ["d" "h" "m" "s" "ms"])
+(define dur-unit-mults [86400000 3600000 60000 1000 1])
+
+(define (dur-unit-idx u)
+  (define (go i)
+    (If (Eq i 5) 5
+      (If (Equal u (Ix i dur-unit-names)) i (go (Inc i)))))
+  (go 0))
+
+(define (dur-split ls)                 ; [letter-chars digit-rest]
+  (define r (dur-split (_1 ls)))
+  (Ifz ls [0 0]
+    (If (aura-alpha? (_0 ls))
+      [[(_0 ls) (_0 r)] (_1 r)]
+      [0 ls])))
+
+(define (dur-comp-soft comp)           ; 0 | [unit-idx ms]
+  (define sp[lets digs] (dur-split (lexplode comp)))
+  (define idx (dur-unit-idx (lcrip lets)))
+  (define d (dec-strict-soft (lcrip digs)))
+  (If (Eq idx 5) 0
+    (Ifz d 0
+      [idx (Mul (Ix idx dur-unit-mults) (_0 d))])))
+
+(define (parse-duration-soft str)
+  (define comps (split-str "." str))
+  (define (go i first prev acc)
+    (define c (dur-comp-soft (Ix i comps)))
+    (If (Eq i (Sz comps)) [acc]
+      (Ifz c 0
+        (If (And (Nil first) (lte (_0 c) prev)) 0
+          (go (Inc i) 0 (_0 c) (Add acc (_1 c)))))))
+  (go 0 1 0 0))
+
+(define (print-duration n)
+  (define (go i rem acc)
+    (define mult (Ix i dur-unit-mults))
+    (define q (Div rem mult))
+    (If (Eq i 5) acc
+      (go (Inc i) (Mod rem mult)
+        (If (Eq 0 q) acc
+          (Weld acc [(strWeld (Ix i dur-unit-names) (showNat q))])))))
+  (define comps (go 0 n []))
+  (strWeld "@"
+    (If (Eq 0 (Sz comps)) "ms0" (join-str "." comps))))
+
+;; --- absolute times ----------------------------------------------------
+;; ds: femtosecond-grade Apollo scale (fs-s = 2^50 units per second).
+;; dm: the same scale coarsened to fs-ms units (2^10 per second), i.e.
+;; dm = ds div (fs-s / fs-ms) when the fraction lines up.  Both count from
+;; Apollo zero; times before it are unrepresentable (payloads are nats).
+
+(define apollo-epoch-s (Div unix-epoch fs-s))
+(define ms-per-s (Div fs-s fs-ms))
+
+(define (parse-cal-soft body frac-limit)   ; 0 | [unix-seconds-i128 frac]
+  (define parts (split-str ".." body))
+  (define np (Sz parts))
+  (define (fields-soft str n)
+    (define fs (split-str "." str))
+    (define (go i acc)
+      (define d (dec-strict-soft (Ix i fs)))
+      (If (Eq i n) [acc]
+        (Ifz d 0 (go (Inc i) (Weld acc [(_0 d)])))))
+    (If (Ne n (Sz fs)) 0 (go 0 [])))
+  (define df (fields-soft (Ix 0 parts) 3))
+  (define tf (fields-soft (Ix 1 parts) 3))
+  (define fh (hex-dec-soft (Ix 2 parts)))
+  (define frac
+    (If (Eq np 2) [0]
+      (Ifz fh 0 (If (Lt (_0 fh) frac-limit) fh 0))))
+  (define y (Ix 0 (_0 df)))
+  (define m (Ix 1 (_0 df)))
+  (define dd (Ix 2 (_0 df)))
+  (define h (Ix 0 (_0 tf)))
+  (define mi (Ix 1 (_0 tf)))
+  (define s (Ix 2 (_0 tf)))
   (cond
-    ((tag-is "!") ("tu" (base64-dec rest)))
-    (else ("ta" str))))
+    ((Or (Lt np 2) (Gt np 3)) 0)
+    ((Ifz df 1 0) 0)
+    ((Ifz tf 1 0) 0)
+    ((Ifz frac 1 0) 0)
+    ((Or (Lt m 1) (Gt m 12)) 0)
+    ((Or (Lt dd 1) (Gt dd 31)) 0)
+    ((gte h 24) 0)
+    ((gte mi 60) 0)
+    ((gte s 60) 0)
+    (else [(cal-to-unix [y m dd h mi s 0]) (_0 frac)])))
+
+(define (parse-time-ds-soft body)
+  (define r (parse-cal-soft body fs-s))
+  (define asec (i128-add apollo-epoch-s (_0 r)))
+  (cond
+    ((Ifz r 1 0) 0)
+    ((i128-is-negative? asec) 0)
+    (else [(Add (Mul fs-s asec) (_1 r))])))
+
+(define (parse-time-dm-soft body)
+  (define r (parse-cal-soft body ms-per-s))
+  (define asec (i128-add apollo-epoch-s (_0 r)))
+  (cond
+    ((Ifz r 1 0) 0)
+    ((i128-is-negative? asec) 0)
+    (else [(Add (Mul ms-per-s asec) (_1 r))])))
+
+(define (print-cal-fields asec frac)
+  (define cal (cal-from-unix (i128-sub asec apollo-epoch-s)))
+  (foldr strWeld ""
+    [(showNat (cal-y cal)) "." (showNat (cal-m cal)) "." (showNat (cal-d cal))
+     ".." (showNat (cal-h cal)) "." (showNat (cal-mi cal)) "." (showNat (cal-s cal))
+     (Ifz frac "" (strWeld ".." (hex-enc frac)))]))
+
+(define (print-time-ds a)
+  (strWeld "@@" (print-cal-fields (Div a fs-s) (Mod a fs-s))))
+
+(define (print-time-dm ms)
+  (strWeld "@" (print-cal-fields (Div ms ms-per-s) (Mod ms ms-per-s))))
+
+;; --- floats (TODO) -----------------------------------------------------
+;; TODO(aura-floats): rs (binary32) and rd (binary64) hold IEEE bit
+;; patterns as nats; the lexical codec is unimplemented.  Planned shape:
+;; exact-nat correctly-rounded parse (decimal mantissa scaled by 2^k/5^k,
+;; round-to-nearest-even at 24/53 bits; overflow-to-inf REJECTS; underflow
+;; to signed zero accepted), specials inf/-inf/-0/nan (quiet, zero payload
+;; only -- printer must reject every other NaN pattern), and shortest
+;; round-trip printing by trying 1..9/1..17 significant digits with a
+;; parse-back check.  Until then 0fs/0fd literals error, as does printing
+;; an rs/rd quip.
+
+(define (float-prefix? str)
+  (Or (Eq "0fs" (Mod str (Bex 24))) (Eq "0fd" (Mod str (Bex 24)))))
+
+;; --- the aura dispatcher -----------------------------------------------
+
+(define (parse-str-soft rest)          ; after '$' or '%'
+  (define v (base64-dec-soft (Rsh rest 8)))
+  (If (Eq "!" (Load8 0 rest))
+    (Ifz v 0 [("tu" (_0 v))])
+    (If (And (Ne 0 rest) (str-all aura-print-char? rest))
+      [("ta" rest)]
+      0)))
+
+(define (parse-zero-soft rest)
+  (define c (Load8 0 rest))
+  (define r2 (Rsh rest 8))
+  (define z (parse-zigzag-soft r2))
+  (define bw (base64-dec-soft r2))
+  (define hx (hex-dec-soft r2))
+  (cond
+    ((Eq 0 rest) [("u" 0)])
+    ((Eq c ".")
+      (cond
+        ((Equal r2 "y") [("f" 0)])
+        ((Equal r2 "n") [("f" 1)])
+        (else 0)))
+    ((Eq c "s") (Ifz z 0 [("s" (_0 z))]))
+    ((Eq c "w") (Ifz bw 0 [("w" (_0 bw))]))
+    ((Eq c "x") (Ifz hx 0 [("x" (_0 hx))]))
+    (else 0)))                         ; incl. 0f... (floats TODO) and the
+                                       ; reserved 0-prefix space
+
+(define (parse-at-soft rest)
+  (define c (Load8 0 rest))
+  (define td (parse-time-ds-soft (Rsh rest 8)))
+  (define tm (parse-time-dm-soft rest))
+  (define du (parse-duration-soft rest))
+  (cond
+    ((Eq 0 rest) 0)
+    ((Eq c "@") (Ifz td 0 [("ds" (_0 td))]))
+    ((isNatChr c) (Ifz tm 0 [("dm" (_0 tm))]))
+    ((aura-alpha? c) (Ifz du 0 [("dr" (_0 du))]))
+    (else 0)))
+
+(define (parse-quip-soft str)
+  (define c0 (Load8 0 str))
+  (define rest (Rsh str 8))
+  (define rec (dec-strict-soft rest))
+  (define dec (dec-strict-soft str))
+  (cond
+    ((Eq 0 str) 0)
+    ((Eq c0 "@") (parse-at-soft rest))
+    ((Eq c0 "0") (parse-zero-soft rest))
+    ((Eq c0 "$") (parse-str-soft rest))
+    ((Eq c0 "%") (parse-str-soft rest))  ; deprecated alias, parse-only
+    ((Eq c0 "#") (Ifz rec 0 [("r" (_0 rec))]))
+    ((aura-sym? str) [("ts" str)])
+    ((isNatChr c0) (Ifz dec 0 [("u" (_0 dec))]))
+    (else 0)))
 
 (define (parse-quip str)
-  (define tag (Load8 0 str))
-  (define tag-is (Eq tag))
+  (define r (parse-quip-soft str))
+  (Ifz r
+    (If (float-prefix? str)
+      (error ["quip-parse-error" "float-todo" str])
+      (error ["quip-parse-error" "bad-aura-literal" str]))
+    (_0 r)))
+
+;; The elaborator's trad-literal hook: a double-quoted string at an
+;; iota goal is a unicode-string iota.
+(define (cord-to-text-quip c) ("tu" c))
+
+;; The canonical degraded spelling of a bare nat with no aura in sight
+;; (doc/aura-spec.md): symbol if the bytes qualify, $-string if
+;; printable ascii, decimal otherwise.  Injective — a nat prints
+;; exactly one way (100 prints "d", not "100": its byte qualifies as a
+;; symbol; nat 49 prints "$1", never colliding with nat 1's "1").
+(define (print-nat-canonical n)
   (cond
-    ((tag-is "@")  ("ds" (parse-time (Rsh str 8))))
-    ((tag-is "0")  (parse-num (Rsh str 8)))
-    ((tag-is "%")  (parse-str (Rsh str 8)))
-    ((tag-is "#")  (parse-rec (Rsh str 8)))
-    ((is-sym str) ("ts" str))
-    (else
-      (begin
-        assert(is-numeric str)
-        ;; print-quip shows "u" auras with showNat: store the number,
-        ;; not its decimal text.
-        ("u" (parse-nat str))))))
+    ((aura-sym? n) n)
+    ((And (Ne 0 n) (str-all aura-print-char? n)) (strWeld "$" n))
+    (else (showNat n))))
 
 (define (print-quip qp[val])
   (define hd (Hd qp))
   (define hd-is (Eq hd))
   (cond
-    ((hd-is "ds") (print-time val))
-    ((hd-is "x") (strWeld "0x" (hex-enc val)))
-    ((hd-is "w") (strWeld "0w" (base64-enc val)))
-    ((hd-is "u") (showNat val))
-    ((hd-is "ta") (strWeld "%" val))
-    ((hd-is "tu") (strWeld "%!" (base64-enc-str val)))
-    ((hd-is "ts") val)
+    ((hd-is "dm") (print-time-dm val))
+    ((hd-is "dr") (print-duration val))
+    ((hd-is "ds") (print-time-ds val))
+    ((hd-is "f")
+      (cond ((Eq val 0) "0.y")
+            ((Eq val 1) "0.n")
+            (else (error ["quip-print-error" "bad-boolean" val]))))
     ((hd-is "r") (strWeld "#" (showNat val)))
-    (else (error ("unknown aura" hd)))))
-
-
+    ((hd-is "rd") (error ["quip-print-error" "float-todo" val]))
+    ((hd-is "rs") (error ["quip-print-error" "float-todo" val]))
+    ((hd-is "s") (print-zigzag val))
+    ((hd-is "ta")
+      (If (And (Ne 0 val) (str-all aura-print-char? val))
+        (strWeld "$" val)
+        (error ["quip-print-error" "ta-not-bare-ascii" val])))
+    ((hd-is "ts")
+      (If (aura-sym? val) val
+        (error ["quip-print-error" "ts-not-symbol" val])))
+    ((hd-is "tu")
+      (If (Eq 0 val) (error ["quip-print-error" "empty-string" val])
+        (strWeld "$!" (base64-enc-str val))))
+    ((hd-is "u") (showNat val))
+    ((hd-is "w") (strWeld "0w" (base64-enc val)))
+    ((hd-is "x") (strWeld "0x" (hex-enc val)))
+    (else (error ["quip-print-error" "unknown-aura" hd]))))

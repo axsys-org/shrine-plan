@@ -139,6 +139,19 @@
 
 (define nat-ref (nt:type-ref ["nat"]))
 
+;; The fourteen kernel auras (doc/aura-spec.md).  aura-tag? gates the
+;; nat/<aura> surface spelling; iota-body is the tagged-pair sum the
+;; goal-directed literal rules recognize.
+(define aura-tags
+  ["dm" "dr" "ds" "f" "r" "rd" "rs" "s" "ta" "ts" "tu" "u" "w" "x"])
+(define (aura-tag? a)
+  (includes (Eq a) aura-tags))
+(define iota-body
+  (nt:tsum
+    (map (lambda (tag)
+      (nt:trow tag [(nt:trow-item 0 nat-ref)]))
+      aura-tags)))
+
 (define (install-core-world world)
   ;; Every core entry has runtime arity 0 and the "builtin" source; each
   ;; `builtin` call yields one pipe stage awaiting the world.
@@ -175,15 +188,29 @@
            (nt:trow "right"
              [(nt:trow-item 0 (nt:type-var "b"))])]))
       0)
-    (builtin ["quip"]
-      (nt:mono
-        (nt:tsum
-          (map (lambda (tag)
-            (nt:trow tag [(nt:trow-item 0 nat-ref)]))
-            ["ds" "u" "w" "x" "ta" "tu" "ts" "r"])))
-      0)))
+    (builtin ["iota"] (nt:mono iota-body) 0)
+    ;; Aura'd nat aliases: a sym/str value is a bare nat whose aura
+    ;; rides the type and widens away to plain nat.
+    (builtin ["sym"] (nt:mono (nt:tnat "ts")) 0)
+    (builtin ["str"] (nt:mono (nt:tnat "tu")) 0)))
 
 (define default-type-world (install-core-world nt:empty-type-world))
+
+;; The structural view of the current goal: unfold nominal/application
+;; layers (bounded, like meth-function's resolve) so alias goals
+;; (id = iota, sym = nat/ts) direct literals exactly like their
+;; spelled-out forms.  Returns [compiler viewed], viewed = 0 when no
+;; goal is set.
+(define (goal-view compiler env)
+  (define (go c t depth)
+    (If (And (Lt depth 8)
+          (Or (nt:type-ref? t) (nt:type-app? t)))
+      (let ((vr (nt:view (compiler-world c) t)))
+        (If (Equal (_1 vr) t)
+          [c t]
+          (go (compiler-with-world (_0 vr) c) (_1 vr) (Inc depth))))
+      [c t]))
+  (Ifz (env-goal env) [compiler 0] (go compiler (env-goal env) 0)))
 
 
 ;;; Deriving the TypeWorld from a subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -534,6 +561,11 @@
           (cb [compiler (nt:const-var name)])
           ((And name (str-numeric? name))
             [compiler (nt:tconst (parse-nat name))])
+          ;; nat/<aura> — the aura-refined nat spelling (the renderer's
+          ;; own output).  Type-level only: the value is a bare nat.
+          ((And (Eq 2 (Sz path))
+             (And (Eq "nat" (_0 path)) (aura-tag? (_1 path))))
+            [compiler (nt:tnat (_1 path))])
           (else
             (let ((rooted (type-path compiler path)))
               (If (failed-declaration? compiler rooted)
@@ -541,10 +573,6 @@
                   "reference to a declaration that failed to elaborate" rooted)
                 [(record-resolution compiler env path)
                  (nt:type-ref rooted)]))))))
-    ;; '$foo — a constant symbol names its singleton type (cords are
-    ;; naturals, so it rides the same const machinery as literals).
-    ((Eq tag "s_tsym")
-      [compiler (nt:tconst (_1 surf))])
     ;; Alias declaration bodies parse in value position: a bare word is
     ;; s_var and a specialization is s_spec.  Normalize both onto the
     ;; type spellings.
@@ -1710,14 +1738,42 @@
       (elab-value-go compiler (env-with-span (_1 surf) env) (_2 surf)))
     ((Eq tag "s_lit")
       [compiler (tc-lit (nt:tconst (surf-lit-val surf)) (surf-lit-val surf))])
+    ;; Aura literals are goal-directed (doc/aura-spec.md Part III): at
+    ;; an iota goal they build the tagged pair; at an aura'd-nat goal
+    ;; (or none) the value is the bare payload nat and the aura rides
+    ;; the type alone.
     ((Eq tag "s_literal")
-      (cond
-        ((Eq "cord" (_1 surf))
-          [compiler (tc-lit (nt:tconst (_2 surf)) (_2 surf))])
-        ((Eq "quip" (_1 surf))
-          [compiler
-           (tc-lit (nt:type-ref ["quip"]) (quip:parse-quip (_2 surf)))])
-        (else (new-elab-error env "unsupported literal shape" (_1 surf)))))
+      (let* ((gv (goal-view compiler env))
+             (gc (_0 gv))
+             (goal (_1 gv))
+             (iota-goal? (And goal (Equal iota-body goal)))
+             (aura-goal
+               (If (And goal
+                     (And (nt:nat-type? goal)
+                       (Ifz (nt:nat-aura goal) 0 1)))
+                 (nt:nat-aura goal)
+                 0)))
+        (cond
+          ((Eq "cord" (_1 surf))
+            (cond
+              (iota-goal?
+                [gc (tc-lit (env-goal env)
+                      (quip:cord-to-text-quip (_2 surf)))])
+              ((Eq "tu" aura-goal)
+                [gc (tc-lit (nt:tnat "tu") (_2 surf))])
+              (else [gc (tc-lit (nt:tconst (_2 surf)) (_2 surf))])))
+          ((Eq "quip" (_1 surf))
+            (let* ((p (quip:parse-quip (_2 surf)))
+                   (ptag (Hd p)))
+              (cond
+                (iota-goal? [gc (tc-lit (env-goal env) p)])
+                (aura-goal
+                  (If (Eq ptag aura-goal)
+                    [gc (tc-lit (nt:tnat ptag) (Ix 0 p))]
+                    (new-elab-error env "aura mismatch"
+                      ["literal" ptag "goal" aura-goal])))
+                (else [gc (tc-lit (nt:tnat ptag) (Ix 0 p))]))))
+          (else (new-elab-error env "unsupported literal shape" (_1 surf))))))
     ((Eq tag "s_ref")
       (global-reference compiler env (surf-ref-path surf)))
     ((Eq tag "s_var")
@@ -1853,17 +1909,17 @@
       (elab-specialization compiler env
         (surf-spec-val surf) (surf-spec-args surf)))
     ((Eq tag "s_row")
-      (let* ((goal-view
-               (Ifz (env-goal env)
-                 [compiler 0]
-                 (view-type compiler env (env-goal env)
-                   "row goal is not a row")))
+      ;; goal-view (not the single-layer view-type): a row goal can sit
+      ;; behind an alias chain (path -> row[iota] -> tarr), and the
+      ;; element goals must reach the kids or aura literals in paths
+      ;; would synthesize bare instead of building iota pairs.
+      (let* ((gvr (goal-view compiler env))
              (array-goal
-               (If (And (_1 goal-view) (nt:array-type? (_1 goal-view)))
-                 (_1 goal-view) 0))
+               (If (And (_1 gvr) (nt:array-type? (_1 gvr)))
+                 (_1 gvr) 0))
              (row-goal
-               (If (And (_1 goal-view) (nt:row-type? (_1 goal-view)))
-                 (_1 goal-view) 0))
+               (If (And (_1 gvr) (nt:row-type? (_1 gvr)))
+                 (_1 gvr) 0))
              ;; A row goal of the wrong arity must fail here.  Falling back
              ;; to synthesis and then stamping the literal with the goal
              ;; type would let any row check against any row goal.  An
@@ -1882,7 +1938,7 @@
                         "got" (Sz (surf-row-kids surf))])))
                  (else 0)))
              (er
-               (elab-values (_0 goal-view) env (surf-row-kids surf) goals))
+               (elab-values (_0 gvr) env (surf-row-kids surf) goals))
              (body
                (If row-goal row-goal
                  (nt:trow 0
@@ -2066,8 +2122,12 @@
   (Or (type-form? body)
     (let ((target (alias-target-path body)))
       (And target
-        (nt:type-bound? (compiler-world compiler)
-          (type-path compiler target))))))
+        (Or
+          ;; nat/<aura> is type grammar, not a namespace entry.
+          (And (Eq 2 (Sz target))
+            (And (Eq "nat" (_0 target)) (aura-tag? (_1 target))))
+          (nt:type-bound? (compiler-world compiler)
+            (type-path compiler target)))))))
 
 (define (placeholder-parameters surf)
   (define tag (_0 surf))
