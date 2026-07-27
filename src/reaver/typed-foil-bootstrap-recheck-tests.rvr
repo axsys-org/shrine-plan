@@ -1,0 +1,369 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; Stage-1 recheck machinery tests (B0).  Module-local define/bootstrap
+;; fixtures exercise recheck/bootstrap-bindings end-to-end: runtime-value
+;; identity across the rebind, canonical define/typed-style metadata,
+;; per-batch alias-map resolution of qualified references, and fail-closed
+;; rejection of ill-typed sources, wrapper-only facades, and untyped
+;; globals.  A simulated producer module then exercises the manifest
+;; surface (foil-data's bootstrap/manifest into recheck/bootstrap-manifest)
+;; through the same shared per-binding core.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind data (#module foil-data))
+(#import data)
+
+;; Runtime alias for the fixture sources: `core` means foil-data-core here,
+;; exactly as it does in the six handwritten bootstrap files.
+(#bind core (#module foil-data-core))
+
+;; Canonical stage-1 facade: the same helpers with canonical metadata and
+;; identical runtime values.  Checking authority for core:* references.
+(#bind canon (#module foil-canonical-data-attachment))
+
+(#bind typed-reaver (#module typed-reaver))
+(#import typed-reaver)
+
+(#bind recheck (#module foil-bootstrap-recheck))
+(#import recheck)
+
+;;; Test-local probes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Entry.typeInfo readback at expansion time (foil-data-tests idiom).
+(define (recheck-type-info-probe ctx uniq glo locals depth form)
+  [uniq glo (1 (data-global-type-info glo (_1 form)))])
+(#macro type-info-of recheck-type-info-probe)
+
+;; Expansion-time rejection probe: run the real transformer over the real
+;; globals table inside Try and embed the outcome head as a constant.
+;; 1 = the batch was rejected before any rebind form was produced;
+;; 0 = the whole batch validated and checked.
+(define (recheck-outcome-probe ctx uniq glo locals depth form)
+  (define target (cons "recheck/bootstrap-bindings" (drop 1 form)))
+  (define attempt
+    (Try
+      (lambda (ignored)
+        (Force
+          (recheck-bootstrap-bindings-transformer ctx uniq glo 0 0 target)))
+      0))
+  [uniq glo (1 (Hd attempt))])
+(#macro recheck-outcome recheck-outcome-probe)
+
+;; Wrapper-substitution fixture: bind a value under a #typed-reaver-binding
+;; marker whose envelope is malformed (right tag, wrong shape).  The recheck
+;; must reject it -- a facade that merely wraps a value in bootstrap-looking
+;; metadata never reaches the checker.
+(define (forge-bootstrap-envelope-transformer ctx uniq glo locals depth form)
+  [uniq glo
+   ["#bind" (_1 form)
+    ["#typed-reaver-binding"
+     (1 [HANDWRITTEN-BOOTSTRAP-TAG "Nat"])
+     (_2 form)]]])
+(#macro forge-bootstrap-envelope forge-bootstrap-envelope-transformer)
+
+;;; Fixtures ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; 1. Plain value binding.
+(define/bootstrap Nat
+  (define recheck-fixture-answer (Add 20 22)))
+
+;; 2. Function binding.
+(define/bootstrap (-> (Nat Nat) Nat)
+  (define (recheck-fixture-plus a b) (Add a b)))
+
+;; 3. Function using an internal define.
+(define/bootstrap (-> (Nat) Nat)
+  (define (recheck-fixture-doubler n)
+    (define doubled (Add n n))
+    doubled))
+
+;; 4. (Maybe Nat) signature consuming core:maybe-some through the qualified
+;; alias `core` (resolved by the batch alias map at check time).
+(define/bootstrap (Maybe Nat)
+  (define recheck-fixture-some (core:maybe-some (Add 21 21))))
+
+;; 5. (Opaque x) signature.
+(define/bootstrap (Opaque recheck-opaque-face)
+  (define recheck-fixture-opaque [1 2 3]))
+
+;; Negative fixtures.  Stage 0 records them without judgment; only the
+;; recheck rejects them, so they are exercised through the Try probe rather
+;; than the real macro invocation.
+;; (c) source does not satisfy its signature (Nat signature, lambda body).
+(define/bootstrap Nat
+  (define recheck-fixture-badsig (lambda (x) x)))
+;; (e) source consuming an untyped global.
+(define recheck-fixture-untyped-helper 7)
+(define/bootstrap Nat
+  (define recheck-fixture-untyped-use
+    (Add recheck-fixture-untyped-helper 1)))
+;; (d) wrapper substitution: no envelope at all, and a malformed envelope.
+(define recheck-fixture-unwrapped 42)
+(forge-bootstrap-envelope recheck-fixture-forged 42)
+
+;; Pre-recheck captures: values and stage-0 envelopes.
+(define pre-answer recheck-fixture-answer)
+(define pre-plus recheck-fixture-plus)
+(define pre-doubler recheck-fixture-doubler)
+(define pre-some recheck-fixture-some)
+(define pre-opaque recheck-fixture-opaque)
+
+assert(handwritten-bootstrap-info? (type-info-of recheck-fixture-answer))
+assert(handwritten-bootstrap-info? (type-info-of recheck-fixture-plus))
+assert(handwritten-bootstrap-info? (type-info-of recheck-fixture-doubler))
+assert(handwritten-bootstrap-info? (type-info-of recheck-fixture-some))
+assert(handwritten-bootstrap-info? (type-info-of recheck-fixture-opaque))
+
+;;; Alias-map plumbing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(recheck-valid-alias-map? [])
+assert(recheck-valid-alias-map? [["core" "canon"]])
+assert(Nil (recheck-valid-alias-map? "core"))
+assert(Nil (recheck-valid-alias-map? [["core"]]))
+assert(recheck-qualified-form? 'core:maybe-some)
+assert(Nil (recheck-qualified-form? '(Add 1 2)))
+assert(Equal '(canon:maybe-some (Add 21 21))
+  (recheck-map-qualified-aliases [["core" "canon"]]
+    '(core:maybe-some (Add 21 21))))
+;; An alias outside the batch map fails closed instead of resolving against
+;; whatever the recheck module binds under that name.
+assert(Eq 1 (Hd (Try
+  (lambda (ignored)
+    (Force
+      (recheck-map-qualified-aliases [] '(core:maybe-some (Add 21 21)))))
+  0)))
+
+;;; Fail-closed rejections (before any rebinding) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; (c) signature/source mismatch.
+assert(Eq 1 (recheck-outcome [] recheck-fixture-badsig))
+;; (d) wrapper-substitution attempts: missing and malformed envelopes.
+assert(Eq 1 (recheck-outcome [] recheck-fixture-unwrapped))
+assert(Eq 1 (recheck-outcome [] recheck-fixture-forged))
+;; A name with no binding at all.
+assert(Eq 1 (recheck-outcome [] recheck-fixture-never-bound))
+;; (e) untyped global in the source.
+assert(Eq 1 (recheck-outcome [] recheck-fixture-untyped-use))
+;; Qualified alias without a batch mapping.
+assert(Eq 1 (recheck-outcome [] recheck-fixture-some))
+;; Alias mapped at the neutral producer: maybe-some's foil-data-core entry
+;; still carries the neutral envelope, which the checker rejects.  Only the
+;; canonical facade may type the member (alias-trap regression test).
+assert(Eq 1 (recheck-outcome [[core core]] recheck-fixture-some))
+;; A batch fails atomically: one bad member poisons the whole batch even
+;; when every other member is good.
+assert(Eq 1 (recheck-outcome [[core canon]]
+  recheck-fixture-answer recheck-fixture-badsig))
+;; Malformed batch syntax.
+assert(Eq 1 (recheck-outcome "not-a-map" recheck-fixture-answer))
+
+;; Positive control through the same probe.
+assert(Eq 0 (recheck-outcome [[core canon]]
+  recheck-fixture-answer
+  recheck-fixture-plus
+  recheck-fixture-doubler
+  recheck-fixture-some
+  recheck-fixture-opaque))
+
+;;; The real recheck ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(recheck/bootstrap-bindings [[core canon]]
+  recheck-fixture-answer
+  recheck-fixture-plus
+  recheck-fixture-doubler
+  recheck-fixture-some
+  recheck-fixture-opaque)
+
+;; (a) The rebind preserved each runtime value exactly (deep PLAN equality).
+assert(Equal pre-answer recheck-fixture-answer)
+assert(Equal pre-plus recheck-fixture-plus)
+assert(Equal pre-doubler recheck-fixture-doubler)
+assert(Equal pre-some recheck-fixture-some)
+assert(Equal pre-opaque recheck-fixture-opaque)
+assert(Eq 42 recheck-fixture-answer)
+assert(Eq 3 (recheck-fixture-plus 1 2))
+assert(Eq 10 (recheck-fixture-doubler 5))
+assert(core:maybe-some? recheck-fixture-some)
+assert(Eq 42 (core:maybe-some-value recheck-fixture-some))
+assert(Equal [1 2 3] recheck-fixture-opaque)
+
+;; (b) The attached metadata is canonical define/typed-style typed-info.
+(define post-answer-info (type-info-of recheck-fixture-answer))
+(define post-plus-info (type-info-of recheck-fixture-plus))
+(define post-doubler-info (type-info-of recheck-fixture-doubler))
+(define post-some-info (type-info-of recheck-fixture-some))
+(define post-opaque-info (type-info-of recheck-fixture-opaque))
+assert(typed-info? post-answer-info)
+assert(typed-info? post-plus-info)
+assert(typed-info? post-doubler-info)
+assert(typed-info? post-some-info)
+assert(typed-info? post-opaque-info)
+
+;; Identical to what define/typed attaches for the same signatures.
+(define/typed recheck-typed-answer Nat 42)
+(define/typed (recheck-typed-plus a b) (-> (Nat Nat) Nat) (Add a b))
+assert(Equal (type-info-of recheck-typed-answer) post-answer-info)
+assert(Equal (type-info-of recheck-typed-plus) post-plus-info)
+assert(Equal (typed-info (parse-type "recheck-tests" '(Maybe Nat)))
+  post-some-info)
+assert(Equal
+  (typed-info (parse-type "recheck-tests" '(Opaque recheck-opaque-face)))
+  post-opaque-info)
+
+;; Rechecked bindings are ordinary typed globals: define/typed can consume
+;; them directly, including through application.
+(define/typed recheck-typed-consumer Nat
+  (recheck-fixture-plus recheck-fixture-answer (recheck-fixture-doubler 4)))
+assert(Eq 50 recheck-typed-consumer)
+
+;;; Producer-manifest surface ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; (bootstrap/manifest at the producer, recheck/bootstrap-manifest here)
+
+;; Simulated producer module, in-module: recorded bindings captured into one
+;; manifest binding while the module's own globals still see them.  The
+;; -private fixture stands in for a name a real producer keeps out of its
+;; #export list; the manifest binding is the only name a consumer needs.
+(define/bootstrap Nat
+  (define manifest-fixture-private (Add 30 3)))
+
+(define/bootstrap (-> (Nat) Nat)
+  (define (manifest-fixture-inc n) (Add n 1)))
+
+;; Qualified reference through the producer's `core` alias, resolved by the
+;; batch alias map at recheck time exactly as in the name-addressed surface.
+(define/bootstrap (Maybe Nat)
+  (define manifest-fixture-some (core:maybe-some (Add 3 4))))
+
+(bootstrap/manifest recheck-tests-manifest
+  manifest-fixture-private
+  manifest-fixture-inc
+  manifest-fixture-some)
+
+;; The manifest binding is a plain value bind: tagged shape, module-label =
+;; the manifest binding name, three rows, and no envelope of its own.
+assert(handwritten-bootstrap-manifest? recheck-tests-manifest)
+assert(Eq "recheck-tests-manifest"
+  (handwritten-bootstrap-manifest-label recheck-tests-manifest))
+assert(Eq 3 (Sz (handwritten-bootstrap-manifest-rows recheck-tests-manifest)))
+assert(Eq "manifest-fixture-private"
+  (_0 (_0 (handwritten-bootstrap-manifest-rows recheck-tests-manifest))))
+assert(Nil (type-info-of recheck-tests-manifest))
+
+;; Manifest expansion fails closed over the real globals: an unrecorded
+;; member (no envelope), a forged (malformed) envelope, and an unbound
+;; member are all rejected before any bind form is produced, and one bad
+;; member poisons the whole manifest.
+(define (manifest-outcome-probe ctx uniq glo locals depth form)
+  (define attempt
+    (Try
+      (lambda (ignored)
+        (Force
+          (Ix 2 (bootstrap-manifest-transformer ctx uniq glo 0 0
+                  (cons "bootstrap/manifest" (drop 1 form))))))
+      0))
+  [uniq glo (1 (Hd attempt))])
+(#macro manifest-outcome manifest-outcome-probe)
+
+assert(Eq 1 (manifest-outcome bad-manifest recheck-fixture-untyped-helper))
+assert(Eq 1 (manifest-outcome bad-manifest recheck-fixture-forged))
+assert(Eq 1 (manifest-outcome bad-manifest recheck-fixture-never-bound))
+assert(Eq 1 (manifest-outcome bad-manifest
+  manifest-fixture-private recheck-fixture-untyped-helper))
+assert(Eq 0 (manifest-outcome good-manifest manifest-fixture-private))
+
+;; Recheck-side rejection probe: the real manifest transformer over the real
+;; globals inside Try.  1 = rejected before any rebind form was produced;
+;; 0 = the whole manifest validated and checked.
+(define (recheck-manifest-outcome-probe ctx uniq glo locals depth form)
+  (define target (cons "recheck/bootstrap-manifest" (drop 1 form)))
+  (define attempt
+    (Try
+      (lambda (ignored)
+        (Force
+          (recheck-bootstrap-manifest-transformer ctx uniq glo 0 0 target)))
+      0))
+  [uniq glo (1 (Hd attempt))])
+(#macro recheck-manifest-outcome recheck-manifest-outcome-probe)
+
+;; Malformed manifest values are rejected at recheck expansion: a
+;; non-manifest binding, a wrong rows shape, a malformed row, a malformed
+;; per-row envelope, and an unbound manifest binding.
+(define forged-not-manifest 42)
+(define forged-manifest-bad-rows
+  [HANDWRITTEN-BOOTSTRAP-MANIFEST-TAG "forged-manifest-bad-rows" "rows"])
+(define forged-manifest-bad-row-shape
+  [HANDWRITTEN-BOOTSTRAP-MANIFEST-TAG "forged-manifest-bad-row-shape"
+   [["only-name"]]])
+(define forged-manifest-bad-envelope
+  [HANDWRITTEN-BOOTSTRAP-MANIFEST-TAG "forged-manifest-bad-envelope"
+   [["x" [HANDWRITTEN-BOOTSTRAP-TAG "Nat"] 7]]])
+
+assert(Eq 1 (recheck-manifest-outcome [[core canon]] forged-not-manifest))
+assert(Eq 1 (recheck-manifest-outcome [[core canon]] forged-manifest-bad-rows))
+assert(Eq 1
+  (recheck-manifest-outcome [[core canon]] forged-manifest-bad-row-shape))
+assert(Eq 1
+  (recheck-manifest-outcome [[core canon]] forged-manifest-bad-envelope))
+assert(Eq 1 (recheck-manifest-outcome [[core canon]] never-bound-manifest))
+;; Qualified alias without a batch mapping fails closed.
+assert(Eq 1 (recheck-manifest-outcome [] recheck-tests-manifest))
+;; Malformed batch syntax.
+assert(Eq 1 (recheck-manifest-outcome "not-a-map" recheck-tests-manifest))
+
+;; Atomicity: a manifest whose rows include a recorded-but-ill-typed member
+;; is rejected as a whole even when every other row is good.
+(bootstrap/manifest recheck-tests-poisoned-manifest
+  manifest-fixture-private
+  recheck-fixture-badsig)
+assert(Eq 1
+  (recheck-manifest-outcome [[core canon]] recheck-tests-poisoned-manifest))
+
+;; Positive control through the same probe.
+assert(Eq 0 (recheck-manifest-outcome [[core canon]] recheck-tests-manifest))
+
+;; Pre-recheck captures: values and stage-0 envelopes.
+(define pre-manifest-private manifest-fixture-private)
+(define pre-manifest-inc manifest-fixture-inc)
+(define pre-manifest-some manifest-fixture-some)
+assert(handwritten-bootstrap-info? (type-info-of manifest-fixture-private))
+assert(handwritten-bootstrap-info? (type-info-of manifest-fixture-inc))
+assert(handwritten-bootstrap-info? (type-info-of manifest-fixture-some))
+
+;; The real manifest-driven recheck.
+(recheck/bootstrap-manifest [[core canon]] recheck-tests-manifest)
+
+;; Values preserved exactly (deep PLAN equality) and still executable.
+assert(Equal pre-manifest-private manifest-fixture-private)
+assert(Equal pre-manifest-inc manifest-fixture-inc)
+assert(Equal pre-manifest-some manifest-fixture-some)
+assert(Eq 33 manifest-fixture-private)
+assert(Eq 34 (manifest-fixture-inc manifest-fixture-private))
+assert(core:maybe-some? manifest-fixture-some)
+assert(Eq 7 (core:maybe-some-value manifest-fixture-some))
+
+;; Canonical define/typed-style metadata attached, identical to what the
+;; name-addressed surface and define/typed attach for the same signatures.
+(define post-manifest-private-info (type-info-of manifest-fixture-private))
+(define post-manifest-inc-info (type-info-of manifest-fixture-inc))
+(define post-manifest-some-info (type-info-of manifest-fixture-some))
+assert(typed-info? post-manifest-private-info)
+assert(typed-info? post-manifest-inc-info)
+assert(typed-info? post-manifest-some-info)
+assert(Equal (type-info-of recheck-typed-answer) post-manifest-private-info)
+assert(Equal (typed-info (parse-type "recheck-tests" '(-> (Nat) Nat)))
+  post-manifest-inc-info)
+assert(Equal post-some-info post-manifest-some-info)
+
+;; Manifest-rechecked bindings are ordinary typed globals.
+(define/typed manifest-typed-consumer Nat
+  (manifest-fixture-inc manifest-fixture-private))
+assert(Eq 34 manifest-typed-consumer)
+
+(print "all typed Foil bootstrap recheck tests passed")

@@ -466,7 +466,13 @@
   [name compiled keys imported lore
    (unit-import-pack name compiled keys imported)])
 
-(define (compile-mod-go stack cache0 sut0 mod)
+;; compile-mod-go-sub :: [Cord] -> Cache -> [MarkedSubject Layer]
+;;                    -> [MarkedSubject Layer] -> Cord -> Result
+;; pair0 is this module's substrate (marked subject + layer); dpair is
+;; the default-subject substrate every import compile starts from.
+;; See compile-mod-go below for the threading rationale.
+(define (compile-mod-go-sub stack cache0 pair0 dpair mod)
+  (define sut0 (_0 pair0))
   ;; parse-foil's two steps inlined so the raw rex is in scope for lore
   ;; capture (doc/shrine-apps.md section 4.1) without a second parse.
   (define rexn (rex:ParseRexNormFile (get-foil mod)))
@@ -489,7 +495,7 @@
     ;; its name: ["foil-in-module" name err].  Chains nest — a failure
     ;; three imports deep reads in-module a > in-module b > the error.
     (define (compile-import z)
-      (compile-mod-go (snoc name stack) cache default-subject name))
+      (compile-mod-go-sub (snoc name stack) cache dpair dpair name))
     (If (includes (Eq name) stack)
       (error ["foil-import-cycle" ["module" name] ["at" blurb]])
       (let* ((r (Ifz hit
@@ -522,7 +528,7 @@
   ;; make-layer rejects duplicate own paths and normalizes same-layer culls
   ;; before anything is projected or elaborated.
   (define own-layer (make-own-layer mod decls))
-  (define substrate-layer (make-substrate-layer sut0))
+  (define substrate-layer (_1 pair0))
   (define environment
     (foil-env:build-environment-with-base substrate-layer mounts own-layer))
   (define pre
@@ -567,6 +573,26 @@
    (emit-subject-warnings compiled)
    (_2 resolved-state)
    lore])
+
+;; The compile entry point: mark the caller's substrate and derive its
+;; layer ONCE, then thread both through the whole import chain.  Import
+;; compiles always start from default-subject, so the chain shares one
+;; lazily-computed default pair instead of re-marking the substrate and
+;; re-deriving (and re-pinning) its layer once per module — a measured
+;; ~0.5s per chain module.  Threading is by argument, deliberately: a
+;; process-global marked default-subject broke the bare elab-mod path,
+;; and identity guards are unavailable (PLAN Eq is shallow, Equal has
+;; no pointer fast path).
+(define (compile-mod-go stack cache0 sut0 mod)
+  (define marked0 (mark-substrate-visible sut0))
+  (define pair0 [marked0 (make-substrate-layer marked0)])
+  ;; Lazy: forced only when a cold import actually compiles.  When sut0
+  ;; is default-subject (every production caller) this recomputes the
+  ;; same pair once per top-level compile — the price of not having an
+  ;; identity test — and every deeper chain module then shares it.
+  (define dmarked (mark-substrate-visible default-subject))
+  (define dpair [dmarked (make-substrate-layer dmarked)])
+  (compile-mod-go-sub stack cache0 pair0 dpair mod))
 
 ;;; Public compile API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

@@ -23,8 +23,11 @@
       (go (lcons x acc) xs))))
   (go 0 (stream x)))
 
-(define (parse-road els)
-  (surf-ref (map rx-word-str! els)))
+;; %/name — a current-namespace reference.  Rex delivers %/add as a
+;; "%/"-runed nest holding one word, and %/a/b as a "/"-path nest whose
+;; HEAD is that "%/" nest (the remaining segments are ordinary words).
+(define (cref-nest? k)
+  (And (rx-nest? k) (Eq "%/" (rx-nest-rune k))))
 
 ;; A specialization bracket.  Rex normalization absorbs the rune of a
 ;; bracket wrapping a single rune expression ([uon/kv[v]] arrives as a
@@ -60,6 +63,28 @@
 (define (sast-error what val)
   (sast-error-at val what val))
 
+;;; Reference roads ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (cref-head-word k)
+  (define kids (rx-nest-kids k))
+  (unless (And (Eq 1 (Sz kids)) (rx-word? (_0 kids)))
+    (sast-error "bad current-namespace reference (%/)" k)
+    (rx-word-str! (_0 kids))))
+
+;; Path elements admissible to parse-road: ordinary words, optionally
+;; led by a %/ anchor nest.
+(define (road-kids? els)
+  (And (Gt (Sz els) 0)
+    (And (Or (rx-word? (_0 els)) (cref-nest? (_0 els)))
+      (all rx-word? (drop 1 els)))))
+
+(define (parse-road els)
+  (If (And (Sz els) (cref-nest? (_0 els)))
+    (surf-cref
+      (Weld [(cref-head-word (_0 els))]
+        (map rx-word-str! (drop 1 els))))
+    (surf-ref (map rx-word-str! els))))
+
 ;;; Type parsing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; '$foo — a constant symbol type literal.  The leaf text includes the
 ;; quote; the symbol is the text after the '$ prefix.
@@ -94,7 +119,7 @@
     (And (Eq 2 (Sz jkids))
       (And (rx-word? (_0 jkids))
         (And (spec-brack? (_1 jkids))
-          (all rx-word? (Init kids))))))
+          (road-kids? (Init kids))))))
   (cond
     ;; =foo/bar — the autonamer wraps the whole path in a face named
     ;; after the first segment.
@@ -102,7 +127,7 @@
       (surf-face (autoname-word (_0 kids))
         (parse-type-path cont
           (Weld [(autoname-inner (_0 kids))] (drop 1 kids)))))
-    ((And (Gt (Sz kids) 0) (all rx-word? kids)) (parse-road kids))
+    ((road-kids? kids) (parse-road kids))
     ((And (Gt (Sz kids) 1) (And (rx-juxt? last) (spec-tail (rx-juxt-kids last))))
       (let ((jkids (rx-juxt-kids last)))
         (surf-tapp
@@ -142,6 +167,49 @@
       ((Eq 2 (Sz kids))
         (surf-face (rx-word-str! (_0 kids)) (parse-type-sast (_1 kids))))
       (else (sast-error "bad face" (_0 kids)))))
+  ;; foo=%/bar / =%/bar — a faced current-namespace reference, arriving
+  ;; as the glued "=%/" rune.  The tail keeps the shapes a bare %/
+  ;; produces minus the absorbed anchor: a word, a /-path of words
+  ;; (spec-tailed or not), or a word-headed spec juxt.  Re-head the
+  ;; first segment as a synthetic %/ nest and reuse the road machinery.
+  (define (on-cref-face exp kids)
+    (define named? (Eq 2 (Sz kids)))
+    (define tail
+      (unless (Or named? (Eq 1 (Sz kids)))
+        (sast-error "bad face" exp)
+        (If named? (_1 kids) (_0 kids))))
+    (define (cref-head w)
+      (rx-nest (rx-span exp) "clear" "%/" [w]))
+    (define (tail-first t)
+      (cond
+        ((rx-word? t) t)
+        ((rx-rune? "/" t) (_0 (hr-stem (rx-rune-kids t))))
+        ((rx-juxt? t) (_0 (rx-juxt-kids t)))
+        (else (sast-error "bad current-namespace reference (%/)" exp))))
+    (define parsed
+      (cond
+        ((rx-word? tail) (parse-road [(cref-head tail)]))
+        ((rx-rune? "/" tail)
+          (let ((ks (hr-stem (rx-rune-kids tail))))
+            (parse-type-path parse-type-sast
+              (Weld [(cref-head (tail-first tail))] (drop 1 ks)))))
+        ((rx-juxt? tail)
+          (let ((jk (rx-juxt-kids tail)))
+            (unless (And (Eq 2 (Sz jk))
+                      (And (rx-word? (_0 jk)) (spec-brack? (_1 jk))))
+              (sast-error "bad current-namespace reference (%/)" exp)
+              (surf-tapp
+                (Weld [(parse-road [(cref-head (_0 jk))])]
+                  (brack-args parse-type-sast (_1 jk)))))))
+        (else (sast-error "bad current-namespace reference (%/)" exp))))
+    (define fname
+      (If named?
+        (unless (rx-word? (_0 kids))
+          (sast-error "bad face" exp)
+          (rx-word-str! (_0 kids)))
+        ;; the autonamer: the face takes the FIRST segment's name.
+        (rx-word-str! (tail-first tail))))
+    (surf-face fname parsed))
   (define (on-clear exp)
     (define rune (rx-nest-rune exp))
     (define kids (rx-nest-kids exp))
@@ -151,6 +219,14 @@
           (sast-error "bad type sequence" exp)
           (parse-type-sast (_0 kids))))
       ((Eq "/" rune) (parse-type-path parse-type-sast kids))
+      ;; %/name — a current-namespace type reference; the whole nest is
+      ;; the head segment of a one-element road.
+      ((Eq "%/" rune) (parse-road [exp]))
+      ;; foo=%/bar — adjacent rune chars glue, so a faced cref type
+      ;; arrives as one "=%/" rune: the face name (absent for the
+      ;; autonamer =%/bar), then the reference tail in the same shapes
+      ;; a bare %/ produces (word, /-path, or spec juxt).
+      ((Eq "=%/" rune) (on-cref-face exp kids))
       ((Eq "=" rune) (on-face kids))
       ((Eq "$" rune)
         (unless (Eq 1 (Sz kids))
@@ -179,6 +255,13 @@
       ((And (Eq "paren" (rx-nest-color nes))
          (Eq "" (rx-nest-rune nes)))
         (surf-tapp kids))
+      ;; (%/pt) — a parenthesized current-namespace reference: the
+      ;; paren absorbs the %/ rune during rex normalization.  Needed
+      ;; because = and %/ glue into one rune token when adjacent, so a
+      ;; faced cref type is spelled p=(%/pt).
+      ((And (Eq "paren" (rx-nest-color nes))
+         (Eq "%/" (rx-nest-rune nes)))
+        (parse-road [nes]))
       ;; Plain-curly rows are retired: curly is function types only;
       ;; anonymous structural rows are spelled with brackets.
       ((And (Eq "curly" (rx-nest-color nes))
@@ -207,6 +290,13 @@
            (spec-brack? (_1 kids))))
         (surf-tapp
           (Weld [(surf-ref [(rx-word-str! (_0 kids))])]
+            (brack-args parse-type-sast (_1 kids)))))
+      ;; %/vec[nat] — a specialized current-namespace reference.
+      ((And (Eq 2 (Sz kids))
+         (And (cref-nest? (_0 kids))
+           (spec-brack? (_1 kids))))
+        (surf-tapp
+          (Weld [(parse-road [(_0 kids)])]
             (brack-args parse-type-sast (_1 kids)))))
       (else (sast-error "bad type juxt" jux))))
   (cond
@@ -318,14 +408,15 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
   (define (spec-juxt? kids)
     (And (Eq 2 (Sz kids))
       (And (spec-brack? (_1 kids))
-        (Nil (And (rx-nest? (_0 kids))
-          (Eq "clear" (rx-nest-color (_0 kids))))))))
+        (Or (cref-nest? (_0 kids))
+          (Nil (And (rx-nest? (_0 kids))
+            (Eq "clear" (rx-nest-color (_0 kids)))))))))
   (define (parse-path-val kids)
     (define last (Last kids))
     (If (rx-juxt? last)
       (let ((jkids (rx-juxt-kids last)))
         (If (And (spec-juxt? jkids)
-              (all rx-word? (Weld (Init kids) [(_0 jkids)])))
+              (road-kids? (Weld (Init kids) [(_0 jkids)])))
           (surf-spec
             (parse-road (Weld (Init kids) [(_0 jkids)]))
             (brack-args parse-type-sast (_1 jkids)))
@@ -504,6 +595,25 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           (surf-case (parse-val-sast (_1 kids))
             [(surf-arm (parse-type-sast (_0 kids)) heir)]
             (parse-val-sast (_2 kids)))))
+      ;; >  PAT SOURCE   standalone introduction through a pattern.
+      ;; REST...         Two kids: the pattern must be statically
+      ;;                 irrefutable — a one-binding letrec.  Three kids
+      ;; >  PAT SOURCE   (an indented failure value): a guarded
+      ;;    FAILURE      introduction — on a match the heir runs with
+      ;; REST...         the pattern's binders, otherwise FAILURE (the
+      ;;                 same desugar as ?>).
+      ((Eq ">" rune)
+        (unless (And (Or (Eq 2 (Sz kids)) (Eq 3 (Sz kids)))
+                  (Ne foil-no-heir heir))
+          (sast-error "bad standalone binding (>) - needs a pattern, a source value, an optional indented failure value, and a following body" val)
+          (If (Eq 2 (Sz kids))
+            (surf-letrec
+              [(surf-arm (parse-type-sast (_0 kids))
+                 (parse-val-sast (_1 kids)))]
+              heir)
+            (surf-case (parse-val-sast (_1 kids))
+              [(surf-arm (parse-type-sast (_0 kids)) heir)]
+              (parse-val-sast (_2 kids))))))
       ((Eq "|>" rune)
         (unless (And (Gt (Sz kids) 1) (Eq foil-no-heir heir))
           (sast-error "pipeline (|>) requires a seed and at least one stage" val)
@@ -531,8 +641,8 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
       ((Eq "%" rune)
         (uncurry-call (parse-val-sast (_0 kids)) heir))
       ((Eq "^" rune)
-        (unless (Eq 1 (Sz kids))
-          (sast-error "bad cast" val)
+        (unless (And (Eq 1 (Sz kids)) (Ne foil-no-heir heir))
+          (sast-error "cast (^) needs a value to cast - for type reflection write (^ expr)" val)
           (surf-cast (parse-type-sast (_0 kids)) heir)))
       ((Eq "&" rune)
         (surf-union (map parse-type-sast kids)))
@@ -651,6 +761,18 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                   (handle-rune "?" (_0 ts)
                     (parse-body-go (body-flat (_1 ts)) hair)))))
             ((rx-rune? "?>" body) (handle-rune "?>" (rx-rune-kids body) hair))
+            ;; A wide free rune (?>, |>) opening a standalone >'s heir
+            ;; cannot heir-chain (rune widths differ) and is swallowed
+            ;; into the > poem as trailing kids — split it back out.
+            ((rx-rune? ">" body)
+              (let* ((bk (rx-rune-kids body))
+                     (wide? (lambda (k)
+                              (Or (rx-rune? "?>" k) (rx-rune? "|>" k))))
+                     (cut (find-idx wide? bk)))
+                (If cut
+                  (handle-rune ">" (take (_0 cut) bk)
+                    (parse-body-go (body-flat (drop (_0 cut) bk)) hair))
+                  (handle-rune ">" bk hair))))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
             ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
             ((And (rx-nest-is? "paren" "@" body) (Ne foil-no-heir hair))
@@ -692,6 +814,17 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         ;; a zero-arg call of a path — possibly spec-tailed:
         ;; (labeled/tagof['$foo])
         (surf-app (parse-path-val (rx-nest-kids nes)) []))
+      ;; (%/add) — a zero-arg call of a current-namespace reference
+      ;; (the paren absorbs the %/ rune during rex normalization).
+      ((Eq "%/" (rx-nest-rune nes))
+        (surf-app (parse-road [nes]) []))
+      ;; (^ expr) — unary type reflection.  Only the PAREN form
+      ;; reflects: a clear-form ^ with no heir is a dangling cast and
+      ;; stays a parse error (handle-rune below).
+      ((Eq "^" (rx-nest-rune nes))
+        (unless (Eq 1 (Sz kids))
+          (sast-error "type reflection (^ expr) takes exactly one expression" nes)
+          (surf-reflect (_0 kids))))
       ((Eq "." (rx-nest-rune nes))
         (If (Eq 1 (Sz (rx-nest-kids nes)))
           (parse-rel-variant-val (_0 (rx-nest-kids nes)))
@@ -703,6 +836,8 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (cond
       ((Eq "" rune) (parse-body kids))
       ((Eq "/" rune) (parse-path-val kids))
+      ;; %/name — a current-namespace reference in value position.
+      ((Eq "%/" rune) (parse-road [nes]))
       ((Eq "." rune)
         (If (Eq 1 (Sz kids))
           (parse-rel-variant-val (_0 kids))
