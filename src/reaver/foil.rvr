@@ -211,8 +211,8 @@
 ;; make-resolved-import :: SastImport -> Subject -> [Path] -> [Path]
 ;;                      -> Layer -> Layer -> Mount -> Pin -> [Path]
 ;;                      -> ResolvedImport
-(define (make-resolved-import imp sut keys own layer exports mount unit-id projected)
-  [RESOLVED-IMPORT imp sut keys own layer exports mount unit-id projected])
+(define (make-resolved-import imp sut keys own layer exports mount unit-id projected pack)
+  [RESOLVED-IMPORT imp sut keys own layer exports mount unit-id projected pack])
 (define resolved-import-sast (Ix 1))
 (define resolved-import-subject (Ix 2))
 (define resolved-import-keys (Ix 3))
@@ -222,6 +222,77 @@
 (define resolved-import-mount (Ix 7))
 (define resolved-import-unit-id (Ix 8))
 (define resolved-import-projected-keys (Ix 9))
+(define resolved-import-pack (Ix 10))
+
+;;; Per-unit import pack ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Everything a consumer derives from an imported unit that does NOT depend
+;;; on the consumer: ownership partition, unit identity, qualified storage
+;;; keys, and — the expensive part — the relocated entry clones
+;;; (clone-qualified-entry-pin walks every entry's whole TC tree).  Computed
+;;; lazily once per cache row and shared by every importer; previously each
+;;; consumer redid the clone walk, which dominated the per-module import
+;;; envelope (a 19-line app importing the world paid ~9s).
+
+(define (unit-import-pack name imped keys imported)
+  (define own (own-keys-from-cache-fields keys imported))
+  (define prior-unit (foil-subject:sut-unit imped))
+  (define exports
+    (If (foil-env:unit? prior-unit)
+      (foil-env:unit-export-layer prior-unit)
+      (make-export-layer name own imped)))
+  (define layer
+    (If (foil-env:unit? prior-unit)
+      (foil-env:unit-mount-layer prior-unit)
+      exports))
+  (define unit-id
+    (If (foil-env:unit? prior-unit)
+      (foil-env:unit-identity prior-unit)
+      (foil-env:layer-ref layer)))
+  (define qualified-own
+    (map (foil-relocate:qualify-canonical-path own unit-id) own))
+  (define dependencies
+    (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
+  (define projected (canonical-path-set (Weld dependencies qualified-own)))
+  ;; [[qualified-key cloned-pin] ..] for the unit's own storage entries.
+  (define own-pairs
+    (map
+      (lambda (k)
+        [(foil-relocate:qualify-canonical-path own unit-id k)
+         (foil-relocate:clone-qualified-entry-pin own unit-id
+           (cairn:gotax k (Ix 0 imped)))])
+      own))
+  ;; [[relpath make? pin-or-note canonical] ..] for the export layer.
+  (define export-rows
+    (map
+      (lambda (pair)
+        (let ((note (_1 pair)))
+          (If (foil-env:note-make? note)
+            (let* ((pin
+                     (foil-relocate:clone-qualified-entry-pin own unit-id
+                       (foil-env:note-body note)))
+                   (entry (foil-subject:unpin-soft pin)))
+              [(_0 pair) 1 pin (_0 entry)])
+            [(_0 pair) 0 note 0])))
+      (foil-env:layer-entries exports)))
+  [own exports layer unit-id qualified-own dependencies projected
+   own-pairs export-rows])
+(define pack-own (Ix 0))
+(define pack-exports (Ix 1))
+(define pack-layer (Ix 2))
+(define pack-unit-id (Ix 3))
+(define pack-qualified-own (Ix 4))
+(define pack-dependencies (Ix 5))
+(define pack-projected (Ix 6))
+(define pack-own-pairs (Ix 7))
+(define pack-export-rows (Ix 8))
+
+;; Cache rows created before the pack field existed (or mirror-shaped rows
+;; built by tooling) fall back to computing the pack in place.
+(define (entry-pack e)
+  (If (Lt 5 (Sz e))
+    (Ix 5 e)
+    (unit-import-pack (_0 e) (_1 e) (_2 e) (_3 e))))
 
 ;; import-mount :: Layer -> SastImport -> Mount
 (define (import-mount layer imp)
@@ -259,23 +330,15 @@
 ;; storage.  This lets two prefix mounts expose the same local canonical names
 ;; without either unit rewriting the other's type/global edges.
 (define (project-import-storage ri sut)
-  (define imported (resolved-import-subject ri))
-  (define keys (resolved-import-keys ri))
-  (define own (resolved-import-own-keys ri))
-  (define unit-id (resolved-import-unit-id ri))
-  (define dependencies
-    (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
+  (define pack (resolved-import-pack ri))
   (define with-dependencies
-    (foil-subject:overlay-subject dependencies imported sut))
+    (foil-subject:overlay-subject (pack-dependencies pack)
+      (resolved-import-subject ri) sut))
+  ;; The relocated clones come precomputed from the unit's import pack.
   (foldl
-    (lambda (acc key)
-      (let* ((pin
-               (foil-relocate:clone-qualified-entry-pin own unit-id
-                 (cairn:gotax key (_0 imported))))
-             (qualified
-               (foil-relocate:qualify-canonical-path own unit-id key)))
-        (foil-subject:put-entry-pin qualified pin acc)))
-    with-dependencies own))
+    (lambda (acc pair)
+      (foil-subject:put-entry-pin (_0 pair) (_1 pair) acc))
+    with-dependencies (pack-own-pairs pack)))
 
 ;; project-one-mount :: Row ResolvedImport -> Subject -> Mount -> Subject
 (define (project-one-mount resolved sut mount)
@@ -296,10 +359,17 @@
           (project-export-entry (Weld prefix (_0 pair)) own unit-id (_1 pair) acc)
           acc))
       sut1 (foil-env:layer-entries (resolved-import-layer ri))))
+  ;; Export makes install from the pack's precomputed clones; only the
+  ;; consumer-side visibility marks happen here.
   (foldl
-    (lambda (acc pair)
-      (project-export-entry (Weld prefix (_0 pair)) own unit-id (_1 pair) acc))
-    with-culls (foil-env:layer-entries (resolved-import-export-layer ri))))
+    (lambda (acc row)
+      (let ((written (Weld prefix (_0 row))))
+        (Ifz (_1 row)
+          ;; A cull occupies source visibility without a compiled entry.
+          (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
+          (foil-subject:mark-visible written (Ix 3 row)
+            (foil-subject:put-entry-pin (Ix 3 row) (Ix 2 row) acc)))))
+    with-culls (pack-export-rows (resolved-import-pack ri))))
 
 ;; mark-substrate-visible :: Subject -> Subject
 ;;
@@ -390,7 +460,11 @@
 ;; derivation; stack is the import chain, for cycle detection.
 ;; Returns [cache' compiled imported-keys lore].
 (define (cache-entry name compiled imported lore)
-  [name compiled (module-decl-keys compiled) imported lore])
+  (define keys (module-decl-keys compiled))
+  ;; The pack rides the row lazily: it computes on first import and is
+  ;; shared by every later consumer threading this cache.
+  [name compiled keys imported lore
+   (unit-import-pack name compiled keys imported)])
 
 (define (compile-mod-go stack cache0 sut0 mod)
   ;; parse-foil's two steps inlined so the raw rex is in scope for lore
@@ -424,35 +498,23 @@
                       (error ["foil-in-module" name (_0 c)])
                       (let ((e (cache-entry name (_1 (_0 c)) (_2 (_0 c))
                                  (_3 (_0 c)))))
-                        [(snoc e (_0 (_0 c))) (_1 e) (_2 e) (_3 e)])))
-                  (let ((e (_0 hit)))
-                    [cache (_1 e) (_2 e) (_3 e)])))
-             (imped (_1 r))
-             (keys (_2 r))
-             (imported (_3 r))
-             (own (own-keys-from-cache-fields keys imported))
-             (prior-unit (foil-subject:sut-unit imped))
-             (exports
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-export-layer prior-unit)
-                 (make-export-layer name own imped)))
-             (layer
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-mount-layer prior-unit)
-                 exports))
+                        [(snoc e (_0 (_0 c))) e])))
+                  [cache (_0 hit)]))
+             (e (_1 r))
+             (imped (_1 e))
+             (keys (_2 e))
+             ;; Unit-fixed derivations come from the row's shared pack —
+             ;; computed once per unit, not once per consumer.
+             (pack (entry-pack e))
+             (own (pack-own pack))
+             (exports (pack-exports pack))
+             (layer (pack-layer pack))
              (mount (import-mount layer imp))
-             (unit-id
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-identity prior-unit)
-                 (foil-env:layer-ref layer)))
-             (qualified-own
-               (map (foil-relocate:qualify-canonical-path own unit-id) own))
-             (dependencies
-               (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
-             (projected (canonical-path-set (Weld dependencies qualified-own)))
+             (unit-id (pack-unit-id pack))
+             (projected (pack-projected pack))
              (ri
                (make-resolved-import imp imped keys own layer exports mount
-                 unit-id projected)))
+                 unit-id projected pack)))
         [(_0 r) (snoc ri resolved) (Weld seen projected)])))
   (define resolved-state (foldl resolve-import [cache0 [] []] imps))
   (define resolved (_1 resolved-state))
@@ -676,30 +738,24 @@
              (imped (_2 r))
              (keys (artifact-decl-keys (artifact-body art)))
              (imported (artifact-imported (artifact-body art)))
-             (own (own-keys-from-cache-fields keys imported))
              (legacy1 (legacy-cache-merge legacy (Ix 4 r)))
-             (prior-unit (foil-subject:sut-unit imped))
-             (exports
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-export-layer prior-unit)
-                 (make-export-layer name own imped)))
-             (layer
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-mount-layer prior-unit)
-                 exports))
+             ;; Share the legacy row's import pack when present (the cold
+             ;; compile below is seeded with the same rows, so the clone
+             ;; work is paid once either way).
+             (pack
+               (let ((le (find (lambda (x) (Eq name (_0 x))) legacy1)))
+                 (Ifz le
+                   (unit-import-pack name imped keys imported)
+                   (entry-pack (_0 le)))))
+             (own (pack-own pack))
+             (exports (pack-exports pack))
+             (layer (pack-layer pack))
              (mount (import-mount layer imp))
-             (unit-id
-               (If (foil-env:unit? prior-unit)
-                 (foil-env:unit-identity prior-unit)
-                 (foil-env:layer-ref layer)))
-             (qualified-own
-               (map (foil-relocate:qualify-canonical-path own unit-id) own))
-             (dependencies
-               (filter (lambda (key) (Nil (includes (Equal key) own))) keys))
-             (projected (canonical-path-set (Weld dependencies qualified-own)))
+             (unit-id (pack-unit-id pack))
+             (projected (pack-projected pack))
              (ri
                (make-resolved-import imp imped keys own layer exports mount
-                 unit-id projected)))
+                 unit-id projected pack)))
         [cache1 (snoc ri resolved) (Weld seen projected)
          (snoc [imp art] direct) legacy1])))
   (define merged
