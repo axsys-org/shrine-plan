@@ -237,13 +237,13 @@
 ;; variant emits [node myth] rows (no /boot doc node) so a resync can
 ;; remount one module's records through the chore cmd stream; the
 ;; tasks variant wraps them as vine_makes for boot seeding.
-(define (boot-mirror-pairs-lore-with lore? raw-cache core)
+(define (boot-mirror-mods-lore-with lore? raw-cache core)
   (define cache raw-cache)
   (define src-t (core-ent core ["boot_src_t"]))
   (define ent-t (core-ent core ["boot_ent_t"]))
   (define ent-x (core-ent core ["boot_ent_x"]))
   (define reftab (If mirror-refs? (boot-ref-table cache) []))
-  (define (mod-tasks me)
+  (define (mod-parts me)
     (define mod (_0 me))
     (define sut (_1 me))
     (define imported (_3 me))
@@ -272,16 +272,27 @@
             0)
           0))
       (define rr (refs-of reftab node))
-      [node
+      ;; entry paths are module-relative; consumers re-root them
+      [(drop (Sz mnode) node)
        (ent-x tytext lawtext (Ix 0 rr) (Ix 1 rr)
          (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e)
            (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la)))])
     ;; the module header's own slugs capture at path []
     (define mla (lore-args (foil-lore:lore-for lore [])))
-    (Weld [[mnode
-            (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla))]]
-      (map ent-task own)))
-  (foldl (lambda (acc me) (Weld acc (mod-tasks me))) [] cache))
+    [mnode mla
+     (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla))
+     (map ent-task own)])
+  (map mod-parts cache))
+
+(define (boot-mirror-pairs-lore-with lore? raw-cache core)
+  (foldl
+    (lambda (acc mp)
+      (let ((mnode (Ix 0 mp)))
+        (Weld acc
+          (Weld [[mnode (Ix 2 mp)]]
+            (map (lambda (e) [(Weld mnode (Ix 0 e)) (Ix 1 e)])
+              (Ix 3 mp))))))
+    [] (boot-mirror-mods-lore-with lore? raw-cache core)))
 
 (define (boot-mirror-pairs-with core raw-cache)
   (boot-mirror-pairs-lore-with mirror-lore? raw-cache core))
@@ -296,12 +307,30 @@
 (define (boot-mirror-tasks-with raw-cache core)
   (boot-mirror-tasks-lore-with mirror-lore? raw-cache core))
 
-;; /boot/ns/<root> index nodes: every mirrored entry grouped by its
-;; source namespace root — forge's /ns aggregation as namespace state.
-(define (boot-ns-index-tasks core raw-cache)
-  (define cache raw-cache)
+;; The batched mirror: one pact event per module — the root card
+;; carries the module's entry records as a manifest, and the in-kernel
+;; pact expansion commits the whole subtree in one epoch.  ~40 events
+;; instead of ~1,500; the commit machinery (prepare, zipper walk,
+;; ledger pin) is paid per subtree, and shared spine nodes mint once.
+(define (boot-mirror-pact-tasks-lore-with lore? raw-cache core)
+  (define vine-pact (core-ent core ["vine_pact"]))
   (define vine-make (core-ent core ["vine_make"]))
-  (define ns-t (core-ent core ["boot_ns_t"]))
+  (define doc-t (core-ent core ["boot_doc_t"]))
+  (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
+    (map
+      (lambda (mp)
+        (let ((mla (Ix 1 mp)))
+          (vine-pact (Ix 0 mp)
+            (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)
+            (Ix 2 mp) (Ix 3 mp))))
+      (boot-mirror-mods-lore-with lore? raw-cache core))))
+
+(define (boot-mirror-pact-tasks-with raw-cache core)
+  (boot-mirror-pact-tasks-lore-with mirror-lore? raw-cache core))
+
+;; Every mirrored entry grouped by its source namespace root:
+;; [[root entry-nodes] ..] — forge's /ns aggregation.
+(define (ns-groups cache)
   (define pairs
     (foldl
       (lambda (acc me)
@@ -319,10 +348,28 @@
       [] pairs))
   (map
     (lambda (root)
-      (vine-make [(ts "boot") (ts "ns") (ts root)]
-        (ns-t (map (Ix 1)
-                (filter (lambda (p) (Equal root (Ix 0 p))) pairs)))))
+      [root (map (Ix 1) (filter (lambda (p) (Equal root (Ix 0 p))) pairs))])
     roots))
+
+;; The whole /boot/ns index as one pact event at /boot/ns.
+(define (boot-ns-pact-task core raw-cache)
+  (define vine-pact (core-ent core ["vine_pact"]))
+  (define doc-t (core-ent core ["boot_doc_t"]))
+  (define ns-t (core-ent core ["boot_ns_t"]))
+  (vine-pact [(ts "boot") (ts "ns")] 0 0 [] []
+    (doc-t "every mirrored entry grouped by its source namespace root.")
+    (map (lambda (g) [[(ts (Ix 0 g))] (ns-t (Ix 1 g))])
+      (ns-groups raw-cache))))
+
+;; /boot/ns/<root> index nodes, one event per root — the unbatched
+;; variant, kept for resyncs and tests.
+(define (boot-ns-index-tasks core raw-cache)
+  (define vine-make (core-ent core ["vine_make"]))
+  (define ns-t (core-ent core ["boot_ns_t"]))
+  (map
+    (lambda (g)
+      (vine-make [(ts "boot") (ts "ns") (ts (Ix 0 g))] (ns-t (Ix 1 g))))
+    (ns-groups raw-cache)))
 
 ;; Compile one module into the shared cache under Try; a failure
 ;; leaves the cache unchanged.  -> [cache' ok?]
