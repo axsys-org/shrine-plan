@@ -181,9 +181,122 @@
           (map (lambda (tag)
             (nt:trow tag [(nt:trow-item 0 nat-ref)]))
             ["ds" "u" "w" "x" "ta" "tu" "ts" "r"])))
+      0)
+    ;; The reflection descriptor sum: (^ expr) values.  Closed and
+    ;; non-generic; recursion is by nominal self-reference (a type-app
+    ;; here would be a template node, which wf rejects in resolved
+    ;; types).  Member shapes must stay in sync with the legacy mirror
+    ;; in foil-core-types.rvr (type-typ) and with reflect-encode below.
+    (builtin ["type"]
+      (let ((self (nt:type-ref ["type"])))
+        (nt:mono
+          (nt:tsum
+            [(nt:trow "any" [])
+             (nt:trow "pail" [])
+             (nt:trow "bot" [])
+             ;; An opaque constant: a non-nat const value (a baked
+             ;; comparator, say) that reflection cannot decompose.
+             (nt:trow "opq" [])
+             (nt:trow "nat" [(nt:trow-item "aura" nat-ref)])
+             (nt:trow "cst" [(nt:trow-item "val" nat-ref)])
+             (nt:trow "var" [(nt:trow-item "name" nat-ref)])
+             (nt:trow "arr" [(nt:trow-item "item" self)])
+             (nt:trow "pin" [(nt:trow-item "item" self)])
+             (nt:trow "fun"
+               [(nt:trow-item "args" (nt:tarr self))
+                (nt:trow-item "ret" self)])
+             (nt:trow "sum" [(nt:trow-item "opts" (nt:tarr self))])
+             (nt:trow "rec"
+               [(nt:trow-item "cstr" nat-ref)
+                (nt:trow-item "items"
+                  (nt:tarr
+                    (nt:trow 0
+                      [(nt:trow-item "face" nat-ref)
+                       (nt:trow-item "item" self)])))])
+             (nt:trow "nom"
+               [(nt:trow-item "path" (nt:tarr nat-ref))
+                (nt:trow-item "args" (nt:tarr self))])
+             (nt:trow "gen"
+               [(nt:trow-item "params"
+                  (nt:tarr
+                    (nt:trow 0
+                      [(nt:trow-item "cnst" nat-ref)
+                       (nt:trow-item "name" nat-ref)
+                       (nt:trow-item "cty" self)])))
+                (nt:trow-item "body" self)])])))
       0)))
 
 (define default-type-world (install-core-world nt:empty-type-world))
+
+;; reflect-encode :: Env -> Monotype|Scheme -> descriptor value
+;;
+;; The (^ expr) encoder: one descriptor case per new-ty-text branch
+;; (foil-render.rvr), so the Foil-side printer can reproduce the rvr
+;; renderer byte for byte.  Nominal depth: refs and applications stay
+;; paths + argument descriptors — nothing unfolds.  Non-nat constants
+;; (baked comparator values) are opaque: "opq".
+(define (reflect-encode env typ)
+  (define (enc-const v) (If (IsNat v) ("cst" v) "opq"))
+  ;; One reference path -> descriptor.  /ty-ap-encoded applications
+  ;; decode to a nom with argument descriptors; @var and '$val parts
+  ;; ride as var/cst; unit-qualified keys carry an unprintable pin, so
+  ;; they reflect as a "~"-headed local path ("~" is not a source word).
+  (define (enc-ref p)
+    (define parts (ty-ap-decode p))
+    (Ifz parts
+      (cond
+        ((ty-var-path? p) ("var" (Ix 1 p)))
+        ((ty-val-path? p) (enc-const (Ix 1 p)))
+        ((unit-qualified-path? p)
+          ("nom" (Weld ["~"] (unit-qualified-path-local p)) []))
+        (else ("nom" p [])))
+      (let ((base (enc-ref (Ix 0 parts))))
+        (If (And (IsApp base) (Eq "nom" (Hd base)))
+          ("nom" (Ix 0 base) (map enc-ref (drop 1 parts)))
+          (new-elab-error env "unreflectable type application base" p)))))
+  (define (enc t)
+    (cond
+      ((nt:scheme? t)
+        ("gen"
+         (map
+           (lambda (param)
+             (If (Eq "type" (nt:parameter-kind param))
+               [0 (nt:parameter-name param) "bot"]
+               [1 (nt:parameter-name param)
+                  (enc (nt:const-param-type param))]))
+           (nt:scheme-parameters t))
+         (enc (nt:scheme-body t))))
+      ((nt:type-ref? t) (enc-ref (nt:type-ref-path t)))
+      ((nt:any-type? t) "any")
+      ((nt:pail-type? t) "pail")
+      ((nt:bottom-type? t) "bot")
+      ((nt:pin-type? t) ("pin" (enc (nt:pin-item t))))
+      ((nt:nat-type? t) ("nat" (nt:nat-aura t)))
+      ((nt:const-type? t) (enc-const (nt:const-value t)))
+      ((nt:fun-type? t)
+        ("fun" (map enc (nt:fun-args t)) (enc (nt:fun-return t))))
+      ((nt:row-type? t)
+        ("rec" (nt:row-cstr t)
+          (map
+            (lambda (item)
+              [(nt:row-item-face item) (enc (nt:row-item-value item))])
+            (nt:row-items t))))
+      ((nt:sum-type? t) ("sum" (map enc (nt:sum-options t))))
+      ((nt:array-type? t) ("arr" (enc (nt:array-item t))))
+      ((nt:type-var? t) ("var" (nt:ty-var-name t)))
+      ((nt:const-var? t) ("var" (nt:const-var-name t)))
+      ((nt:type-app? t)
+        ("nom" (nt:ty-app-base t)
+          (map
+            (lambda (garg)
+              (If (Eq "type" (nt:argument-kind garg))
+                (enc (nt:argument-value garg))
+                (enc-const (nt:argument-value garg))))
+            (nt:ty-app-arguments t))))
+      ;; A bare row-item (or anything else) is never a value's resolved
+      ;; type — refuse loudly rather than encode junk.
+      (else (new-elab-error env "unreflectable type" t))))
+  (enc typ))
 
 
 ;;; Deriving the TypeWorld from a subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -349,6 +462,27 @@
 
 (define (surf-strip-spans surf)
   (If (Eq "s_span" (_0 surf)) (surf-strip-spans (_2 surf)) surf))
+
+;; Expand every current-namespace reference (%/x, s_cref) into an
+;; ordinary s_ref of anchor+suffix.  The anchor is the enclosing
+;; declaration's source path, determined structurally BEFORE any
+;; declaration elaborates: %/ performs no parent search and no
+;; rooted-first fallback of its own — it forms one exact written path,
+;; which then resolves through the ordinary environment machinery
+;; (canon-path: visibility, mounts, aliases).
+(define (cref-expand anchor x)
+  (Ifz (IsApp x)
+    x
+    (If (And (Sz x) (Eq "s_cref" (_0 x)))
+      ["s_ref" (Weld anchor (_1 x))]
+      (gen (Sz x) (lambda (i) (cref-expand anchor (Ix i x)))))))
+
+;; A declaration row with its body's %/ references expanded at the
+;; declaration's own namespace position.
+(define (expand-decl-crefs row)
+  (If (And (IsApp row) (Eq "s_decl" (_0 row)))
+    (Up 3 (cref-expand (_1 row) (_3 row)) row)
+    row))
 
 ;; The sealed environment riding the subject (an Environment during
 ;; module elaboration, a Unit envelope on completed subjects), or 0 for
@@ -1753,6 +1887,16 @@
       (let* ((tr (elab-type compiler env (surf-cast-ty surf) 0))
              (vr (check-value (_0 tr) env (_2 surf) (_1 tr))))
         [(_0 vr) (set-tc-ty (_1 tr) (_1 vr))]))
+    ;; (^ expr) — unary type reflection: elaborate the operand, take
+    ;; the type elaboration assigned to it (a named type reflects its
+    ;; inner type), and splice the descriptor as a literal.  The
+    ;; operand's TC is discarded — never lowered, never evaluated.
+    ((Eq tag "s_reflect")
+      (let* ((vr (elab-value-go compiler (clear-goal env) (_1 surf)))
+             (tc (_1 vr))
+             (typ (If (Eq "TC_TYP" (Hd tc)) (tc-typ-inner tc) (tc-ty tc))))
+        [(_0 vr)
+         (tc-lit (nt:type-ref ["type"]) (reflect-encode env typ))]))
     ((Eq tag "s_fun")
       ;; A positional-row parameter ((\ acc [key val] ...)) desugars to
       ;; a fresh parameter destructured by the letrec machinery.  Fresh
@@ -1934,17 +2078,23 @@
                      ;; value binds under a hidden slot, then each name
                      ;; as a field projection of it (distance i: i locals
                      ;; are pushed between the parent and projection i).
-                     (let* ((names
+                     ;; A faced kid ([x=nat y=nat]) annotates its
+                     ;; binding; the row's field must fit the annotation.
+                     ;; specs: [name-or-0 [ann-surf]-or-0] per position.
+                     (let* ((specs
                               (map
                                 (lambda (k)
                                   (let ((ks (surf-strip-spans k)))
                                     (cond
                                       ((And (Eq "s_ref" (_0 ks))
                                          (Eq 1 (Sz (surf-ref-path ks))))
-                                        (_0 (surf-ref-path ks)))
+                                        [(_0 (surf-ref-path ks)) 0])
                                       ;; A hole occupies its position
                                       ;; without binding.
-                                      ((Eq "s_hole" (_0 ks)) 0)
+                                      ((Eq "s_hole" (_0 ks)) [0 0])
+                                      ((Eq "s_face" (_0 ks))
+                                        [(surf-face-name ks)
+                                         [(surf-face-kid ks)]])
                                       (else
                                         (new-elab-error e
                                           "unsupported local binding pattern"
@@ -1956,30 +2106,46 @@
                               (view-type (_0 vr) e typ
                                 "destructuring needs a row value"))
                             (row (_1 wr)))
-                       (need e (And (nt:row-type? row) (Eq (Sz names) (Sz (nt:row-items row))))
+                       (need e (And (nt:row-type? row) (Eq (Sz specs) (Sz (nt:row-items row))))
                          "destructuring arity mismatch"
-                         ["pattern" names "value" typ])
+                         ["pattern" (map (Ix 0) specs) "value" typ])
                        (let* ((items
                                 (map nt:row-item-value (nt:row-items row)))
                               (out
                                 (foldl
                                   (lambda (st i)
-                                    (If (Nil (Ix i names))
+                                    (If (Nil (_0 (Ix i specs)))
                                       st
-                                      [(_0 st)
-                                       (push-local (Ix i names)
-                                         (Ix i items) (_1 st))
-                                       (snoc
-                                         (field-projection-tc typ
-                                           (Ix i items) i (_3 st))
-                                         (_2 st))
-                                       (Inc (_3 st))]))
+                                      (let* ((ann-surf (_1 (Ix i specs)))
+                                             (tr
+                                               (If ann-surf
+                                                 (elab-type (_0 st) e
+                                                   (_0 ann-surf) 0)
+                                                 [(_0 st) 0]))
+                                             (c2
+                                               (If ann-surf
+                                                 (ensure-subtype (_0 tr) e
+                                                   (Ix i items) (_1 tr)
+                                                   "destructuring annotation does not fit the row field")
+                                                 (_0 tr)))
+                                             (ty
+                                               (If ann-surf
+                                                 (_1 tr)
+                                                 (Ix i items))))
+                                        [c2
+                                         (push-local (_0 (Ix i specs))
+                                           ty (_1 st))
+                                         (snoc
+                                           (field-projection-tc typ
+                                             ty i (_3 st))
+                                           (_2 st))
+                                         (Inc (_3 st))])))
                                   [(_0 wr)
                                    (push-local "#foil-new-elab/destructure"
                                      typ e)
                                    (snoc (_1 vr) binds)
                                    0]
-                                  (gen (Sz names) (lambda (i) i)))))
+                                  (gen (Sz specs) (lambda (i) i)))))
                          [(_0 out) (_1 out) (_2 out)]))
                      (let* ((faced (Eq "s_face" (_0 pat)))
                             (name
@@ -2027,7 +2193,9 @@
     (else (new-elab-error env "unsupported surface form" surf))))
 
 (define (elab-value compiler surf)
-  (elab-value-go compiler empty-env surf))
+  ;; A live value elaborates at module level: %/ anchors at the
+  ;; compilation root.
+  (elab-value-go compiler empty-env (cref-expand [] surf)))
 
 
 ;;; Module sealing and elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2156,6 +2324,10 @@
     ((Eq tag "s_cast")
       (let ((r (elab-type compiler env (surf-cast-ty surf) 0)))
         [(_0 r) (tc-const (_1 r) 0)]))
+    ;; A reflection's type is always the descriptor sum: forward
+    ;; references to reflect-bodied declarations need no annotation.
+    ((Eq tag "s_reflect")
+      [compiler (tc-const (nt:type-ref ["type"]) 0)])
     ((Eq tag "s_fun")
       (let* ((pr (lambda-parameters compiler env (surf-fun-args surf) 0))
              (rr (peek-return-type (_0 pr) env (surf-fun-ret surf))))
@@ -2353,7 +2525,9 @@
 ;; neighbors fail; the compiler carries poison entries for the failures.
 (define (elab-mod-diags compiler mod)
   (define base-subject (compiler-subject compiler))
-  (define decls (module-declarations mod))
+  ;; %/ references expand structurally at each declaration's own
+  ;; namespace position before any pass consumes the bodies.
+  (define decls (map expand-decl-crefs (module-declarations mod)))
   (define state0 [compiler (module-scan-diags mod) []])
   (define seeded-types (run-pass seed-type-declaration state0 decls))
   (define refined-types (run-pass refine-type-declaration seeded-types decls))

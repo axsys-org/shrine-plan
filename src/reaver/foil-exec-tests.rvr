@@ -272,6 +272,45 @@ assert(Equal (mk 1 3) (bumpy p12))
 assert(Equal (mk 1 2) p12)
 
 
+;;; Tall (variadic) UFCS ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; A `.` poem takes the receiver and any number of wing segments as
+;;; children — the receiver-last analog of a |> pipeline — and means
+;;; exactly the inline chain.
+
+(define tall-meth-sut (compile-inline "
++  pt2
+  :  x=nat y=nat
++  mk2
+  \  x=nat y=nat
+  ^  pt2
+  (pt2 x y)
++  tall
+  \  p=pt2
+  ^  pt2
+  .  p
+     set_x(5)
+     over_y(inc)
++  flat
+  \  p=pt2
+  ^  pt2
+  p.set_x(5).over_y(inc)
++  tallexp
+  \  n=nat
+  ^  nat
+  .  (mk2 n n)
+     over_x(inc)
+     x
+"))
+
+(define tp12 ((lowered ["mk2"] tall-meth-sut) 1 2))
+assert(Equal ((lowered ["flat"] tall-meth-sut) tp12)
+  ((lowered ["tall"] tall-meth-sut) tp12))
+assert(Equal ((lowered ["mk2"] tall-meth-sut) 5 3)
+  ((lowered ["tall"] tall-meth-sut) tp12))
+;; a parenthesized expression works as the tall receiver
+assert(Eq 8 ((lowered ["tallexp"] tall-meth-sut) 7))
+
+
 ;;; Quip literals ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define quip-sut (compile-inline "
@@ -1533,6 +1572,227 @@ assert(Eq 7 ((lowered ["tru"] bind-else-sut) 0))
 assert(Eq 9 ((lowered ["chain2"] bind-else-sut) 4))
 assert(Eq 1000 ((lowered ["chain2"] bind-else-sut) 0))
 assert(Eq 10 ((lowered ["down"] bind-else-sut) 4))
+
+
+;;; Standalone > introduction ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; >  PAT SOURCE / REST: an irrefutable introduction (a one-binding
+;;; letrec — faced binds, bare and annotated destructures).
+;;; >  PAT SOURCE / FAILURE / REST: a guarded introduction (the ?>
+;;; desugar, spelled with the introduction rune itself).
+
+(define standalone-bind-sut (compile-inline "
++  opt
+  (@@ v)
+  &  ($just v)
+     $nix
++  idm
+  \  x=nat
+  ^  opt[nat]
+  ?  (eq x 0)
+     .nix
+  (./just x)
++  two
+  \  p=[x=nat y=nat]
+  ^  nat
+  >  [a=nat b=nat] p
+  (add a b)
++  bare
+  \  p=[x=nat y=nat]
+  ^  nat
+  >  [a b] p
+  (add a b)
++  scalar
+  \  x=nat
+  ^  nat
+  >  n=nat (add x 1)
+  (add n 10)
++  guarded
+  \  x=nat
+  ^  nat
+  >  (./just v) (idm x)
+     0
+  (inc v)
++  gchain
+  \  x=nat
+  ^  nat
+  >  (./just a) (idm x)
+     1000
+  >  (./just b) (idm (add a 1))
+     2000
+  (add a b)
+"))
+
+assert(Eq 7 ((lowered ["two"] standalone-bind-sut) [3 4]))
+assert(Eq 7 ((lowered ["bare"] standalone-bind-sut) [3 4]))
+assert(Eq 16 ((lowered ["scalar"] standalone-bind-sut) 5))
+assert(Eq 5 ((lowered ["guarded"] standalone-bind-sut) 4))
+assert(Eq 0 ((lowered ["guarded"] standalone-bind-sut) 0))
+assert(Eq 9 ((lowered ["gchain"] standalone-bind-sut) 4))
+assert(Eq 1000 ((lowered ["gchain"] standalone-bind-sut) 0))
+
+;; a refutable pattern in the two-child form is an elaboration error
+(define standalone-refutable-err
+  (Try (lambda (z) (compile-inline "
++  opt
+  (@@ v)
+  &  ($just v)
+     $nix
++  bad
+  \  m=opt[nat]
+  ^  nat
+  >  (./just v) m
+  (inc v)
+")) 0))
+assert(Eq 1 (Hd standalone-refutable-err))
+
+;; a destructuring annotation the field cannot satisfy is an error
+(define standalone-ann-err
+  (Try (lambda (z) (compile-inline "
++  bad
+  \  p=[x=nat y=[a=nat]]
+  ^  nat
+  >  [a=nat b=nat] p
+  (add a b)
+")) 0))
+assert(Eq 1 (Hd standalone-ann-err))
+
+
+;;; Current-namespace references (%/) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; %/x anchors at the namespace position containing the form: the
+;;; enclosing declaration's path, one exact path, resolved through the
+;;; ordinary environment (aliases included).  A nested declaration
+;;; changes the position for its own body and descendants.
+
+(define cref-sut (compile-inline "
++  pointy
+  :  x=nat y=nat
++  vec
+  +  pt
+    pointy
+  +  double
+    \  a=nat
+    ^  nat
+    (add a a)
+  \  n=nat
+  ^  %/pt
+  (pointy (%/double n) n)
++  span2
+  +  pt
+    pointy
+  \  p=%/pt
+  ^  nat
+  (add p.x p.y)
++  deep
+  +  inner
+    +  triple
+      \  a=nat
+      ^  nat
+      (add a (add a a))
+    \  n=nat
+    ^  nat
+    (%/triple n)
+  \  n=nat
+  ^  nat
+  ((%/inner n))
+"))
+
+;; sibling member through %/, alias in the result-cast type position
+;; (a branded row carries its brand as the constructor head; fields
+;; index from 0)
+assert(Eq 6 (Ix 0 ((lowered ["vec"] cref-sut) 3)))
+assert(Eq 3 (Ix 1 ((lowered ["vec"] cref-sut) 3)))
+;; nested anchoring: %/inner -> deep/inner, %/triple -> deep/inner/triple
+assert(Eq 6 ((lowered ["deep"] cref-sut) 2))
+;; a glued faced cref parameter (p=%/pt): span2/pt and vec/pt both
+;; alias pointy, so the value flows across
+assert(Eq 9 ((lowered ["span2"] cref-sut) ((lowered ["vec"] cref-sut) 3)))
+
+;; %/ forms one exact path - no parent search: %/absent under a nested
+;; declaration must not fall back to a sibling of the parent
+(define cref-exact-err
+  (Try (lambda (z) (compile-inline "
++  outer
+  +  helper
+    \  a=nat
+    ^  nat
+    a
+  +  user
+    \  n=nat
+    ^  nat
+    (%/helper n)
+  \  n=nat
+  ^  nat
+  n
+")) 0))
+assert(Eq 1 (Hd cref-exact-err))
+
+
+;;; Unary type reflection (^ expr) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; (^ expr) reifies the type elaboration assigned to expr as a value
+;;; of the builtin closed sum `type`; a named type (^ nat) reflects
+;;; directly.  The operand is never evaluated.
+
+(define reflect-sut (compile-inline "
++  pointy
+  :  x=nat y=nat
++  refl_lit
+  ^  type
+  (^ 1)
++  refl_nat
+  ^  type
+  (^ nat)
++  refl_param
+  \  x=nat
+  ^  type
+  (^ x)
++  refl_row
+  \  p=pointy
+  ^  type
+  (^ p)
++  refl_fun
+  ^  type
+  (^ refl_param)
++  refl_open
+  \  held=pail
+  ^  type
+  (^ held)
++  tagof
+  \  t=type
+  ^  nat
+  ?  t
+   > .any                 1
+   > .pail                2
+   > .bot                 3
+   > .opq                 4
+   > (./nat aura)         5
+   > (./cst val)          6
+   > (./var name)         7
+   > (./arr item)         8
+   > (./pin item)         9
+   > (./fun args ret)    10
+   > (./sum opts)        11
+   > (./rec cstr items)  12
+   > (./nom path args)   13
+   > (./gen params body) 14
+"))
+
+assert(Equal ("cst" 1) (lowered ["refl_lit"] reflect-sut))
+assert(Equal ("nom" ["nat"] []) (lowered ["refl_nat"] reflect-sut))
+;; an annotated parameter reflects its annotation (the nominal ref)
+assert(Equal ("nom" ["nat"] []) ((lowered ["refl_param"] reflect-sut) 3))
+;; the operand is never evaluated: 0 is not a pointy, yet reflection
+;; still answers with the static type
+assert(Equal ("nom" ["boot" "pointy"] [])
+  ((lowered ["refl_row"] reflect-sut) 0))
+;; a pail-typed value reflects as its STATIC type — the pail reference
+;; the annotation elaborated to — never its current inhabitant
+assert(Equal ("nom" ["pail"] []) ((lowered ["refl_open"] reflect-sut) 0))
+;; runtime dispatch over the closed descriptor sum
+(define reflect-tagof (lowered ["tagof"] reflect-sut))
+assert(Eq 6 (reflect-tagof (lowered ["refl_lit"] reflect-sut)))
+assert(Eq 13 (reflect-tagof ((lowered ["refl_row"] reflect-sut) 0)))
+assert(Eq 10 (reflect-tagof (lowered ["refl_fun"] reflect-sut)))
+assert(Eq 13 (reflect-tagof ((lowered ["refl_open"] reflect-sut) 0)))
 
 
 ;;; Pattern tests and booleans ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

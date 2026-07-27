@@ -1,0 +1,256 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; Stage-1 recheck of handwritten bootstrap bindings (B0).
+;;
+;; define/bootstrap (foil-data, stage 0) binds the plain define's exact
+;; runtime value and stashes a neutral
+;; ["foil/handwritten-bootstrap-neutral/v1" SIGNATURE SOURCE] envelope in
+;; Entry.typeInfo.  This module runs after canonical Type and Typed Reaver
+;; have loaded: for each recorded binding it parses the signature once,
+;; type-checks the preserved original source with typed-reaver's check-expr
+;; under the loaded global environment, and rebinds the name with canonical
+;; define/typed-style metadata attached to the identical runtime value.
+;;
+;; Qualified references: preserved sources contain mod:member forms, which
+;; parse as (#juxt ":" mod member).  synth-expr types those by resolving the
+;; member entry through mod's module table in the checking globals (mirroring
+;; the runtime #in resolution the std ':' macro expands to).  Because alias
+;; names are per home module ("core" means foil-data-core in the bootstrap
+;; files but foil-core-types in typed-reaver.rvr), each batch supplies an
+;; explicit alias map: the transformer rewrites every qualified form's alias
+;; through that map before checking, and any alias the map does not cover
+;; fails closed.  The recheck module invokes the macro once per source module
+;; with that module's alias map.
+;;
+;; Two entry surfaces share one per-binding code path:
+;; recheck/bootstrap-bindings resolves names through the recheck module's
+;; own globals (exported producer names only), while
+;; recheck/bootstrap-manifest consumes a producer-exported
+;; bootstrap/manifest binding (foil-data) whose embedded [name envelope
+;; value] rows were captured inside the producer's globals, where private
+;; recorded names are visible.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind data (#module foil-data))
+(#import data)
+
+;; Typed Reaver is intentionally imported last, mirroring
+;; foil-canonical-data-attachment: every neutral producer stays below the
+;; checker, and this module is the one-way recheck edge.
+(#bind typed-reaver (#module typed-reaver))
+(#import typed-reaver)
+
+;; Global entry layout is (Pin [nm v macro x typeInfo]); these accessors
+;; read an already-Unpinned entry row.
+(define recheck-entry-val (Ix 1))
+(define recheck-entry-type-info (Ix 4))
+
+(define (recheck-error what detail)
+  (error ["foil-bootstrap-recheck" what detail]))
+
+(define (recheck-ordinary-form? x)
+  (And (IsApp x) (Eq 0 (Hd x))))
+
+;; mod:member in raw preserved source: (#juxt ":" mod member).
+(define (recheck-qualified-form? x)
+  (And (recheck-ordinary-form? x)
+    (And (Eq 4 (Sz x))
+      (And (Eq "#juxt" (_0 x))
+        (And (Eq ":" (_1 x))
+          (And (IsNat (_2 x)) (IsNat (_3 x))))))))
+
+;; Literal reader for the alias-map argument: embedded constants unwrap and
+;; #brak forms become rows, recursively.  (A private mirror of typed-reaver's
+;; syntax-literal-value, which is not exported.)
+(define (recheck-brak-literal form)
+  (cond
+    ((And (IsApp form) (And (Eq 1 (Hd form)) (Eq 1 (Sz form))))
+      (_0 form))
+    ((And (recheck-ordinary-form? form) (Eq "#brak" (_0 form)))
+      (map recheck-brak-literal (drop 1 form)))
+    (else form)))
+
+;; The per-batch alias map is a row of [source-alias target-binding] pairs.
+;; source-alias is the module alias as spelled inside the batch's home
+;; module; target-binding is the name of a module binding in the recheck
+;; module's own globals whose table carries the typed/canonical metadata the
+;; member must check against.
+(define (recheck-valid-alias-map? alias-map)
+  ;; The empty row is 0 (NIL), so an empty alias map is the Nil case.
+  (Or (Nil alias-map)
+    (And (is-row? alias-map)
+      (all
+        (lambda (pair)
+          (And (is-row? pair)
+            (And (Eq 2 (Sz pair))
+              (And (IsNat (_0 pair)) (IsNat (_1 pair))))))
+        alias-map))))
+
+(define (recheck-alias-target alias-map alias)
+  (find (lambda (pair) (Eq alias (_0 pair))) alias-map))
+
+;; Rewrite every qualified form's alias through the batch alias map.  This is
+;; a pure syntactic alias rename confined to the (#juxt ":" alias member)
+;; alias slot: member names, application structure, and every other symbol
+;; are untouched, so the checker judges exactly the preserved source, only
+;; resolved under the home module's alias meaning.  An alias the map does not
+;; cover fails closed rather than silently resolving against whatever the
+;; recheck module happens to bind under that name.  Quote forms are opaque
+;; data and are never rewritten.
+(define (recheck-map-qualified-aliases alias-map form)
+  (cond
+    ((recheck-qualified-form? form)
+      (begin
+        (define hit (recheck-alias-target alias-map (_2 form)))
+        (unless hit
+          (recheck-error "unmapped module alias in preserved source"
+            [(_2 form) (_3 form)])
+          1)
+        (Up 2 (_1 (_0 hit)) form)))
+    ((Nil (recheck-ordinary-form? form)) form)
+    ((Eq "quote" (_0 form)) form)
+    ((And (Eq "#juxt" (_0 form)) (Eq "'" (_1 form))) form)
+    (else (map (recheck-map-qualified-aliases alias-map) form))))
+
+;; Shared per-binding core; both entry surfaces (the name-addressed batch
+;; and the producer manifest) funnel every binding through here.  Read the
+;; stage-0 envelope (fail closed on anything else -- a wrapper-only facade
+;; with missing or malformed metadata must not slip through), parse the
+;; signature once, check the alias-resolved preserved source against it,
+;; and emit the rebind carrying canonical typed metadata and the identical
+;; existing runtime value as embedded constants.
+;;
+;; The whole batch shares one checker context shape: the plain [name ctx]
+;; label defaults every Subject consultation inside the checker to the
+;; constant core Subject (checker-context-subject), so no per-binding
+;; Subject is ever built.  Signature parsing is the only per-binding type
+;; construction, and it happens exactly once here.
+(define (recheck-envelope-binding ctx glo alias-map name envelope value)
+  (unless (IsNat name)
+    (recheck-error "bootstrap binding name must be a symbol" name)
+    1)
+  (unless (handwritten-bootstrap-info? envelope)
+    (recheck-error "binding lacks a handwritten bootstrap envelope"
+      [name envelope])
+    1)
+  (define label ["recheck/bootstrap-bindings" name ctx])
+  (define typ (parse-type label (handwritten-bootstrap-signature envelope)))
+  (define source
+    (recheck-map-qualified-aliases alias-map
+      (handwritten-bootstrap-source envelope)))
+  (Force (check-expr label glo [] source typ))
+  ["#bind" name
+   ["#typed-reaver-binding"
+    (1 (typed-info typ))
+    (1 value)]])
+
+;; One name-addressed binding: resolve the recorded entry in the checking
+;; globals (only exported producer names are visible here) and recheck its
+;; envelope and value through the shared core.
+(define (recheck-bootstrap-binding ctx glo alias-map name)
+  (unless (IsNat name)
+    (recheck-error "bootstrap binding name must be a symbol" name)
+    1)
+  (define ent (tr-glookup name glo))
+  (unless ent
+    (recheck-error "unbound bootstrap binding" name)
+    1)
+  (define inner (Unpin ent))
+  (recheck-envelope-binding ctx glo alias-map name
+    (recheck-entry-type-info inner)
+    (recheck-entry-val inner)))
+
+;; (recheck/bootstrap-bindings ALIAS-MAP NAME ...)
+;;
+;; ALIAS-MAP is a literal row of [source-alias target-binding] pairs; NAME...
+;; are recorded define/bootstrap bindings already present in the global
+;; table.  Every binding is validated and checked before any rebind form is
+;; returned, so the batch succeeds or fails atomically at expansion time.
+(define (recheck-bootstrap-bindings-transformer ctx uniq glo locals depth form)
+  (And depth
+    (recheck-error "recheck/bootstrap-bindings is top-level only" form))
+  (unless (Ge (Sz form) 3)
+    (recheck-error
+      "recheck/bootstrap-bindings needs an alias map and at least one name"
+      form)
+    1)
+  (define alias-map (recheck-brak-literal (_1 form)))
+  (unless (recheck-valid-alias-map? alias-map)
+    (recheck-error "malformed alias map" (_1 form))
+    1)
+  (define binds
+    (Force
+      (map (recheck-bootstrap-binding ctx glo alias-map) (drop 2 form))))
+  [uniq glo (cons 0 binds)])
+
+(#macro recheck-bootstrap-bindings recheck-bootstrap-bindings-transformer)
+(#macro recheck/bootstrap-bindings recheck-bootstrap-bindings-transformer)
+
+;; (recheck/bootstrap-manifest ALIAS-MAP MANIFEST-BINDING)
+;;
+;; MANIFEST-BINDING names an exported producer manifest binding: a plain
+;; value bind whose value is
+;;   ["foil/handwritten-bootstrap-manifest/v1" module-label rows]
+;; emitted by foil-data's bootstrap/manifest inside the producer module,
+;; where the producer's private recorded names are still visible.  The tag,
+;; label, and per-row [name envelope value] shapes are validated first
+;; (anything else fails closed), and each row is then rechecked through
+;; exactly the same per-binding core as the name-addressed surface.  As with
+;; that surface, every row is validated and checked before any rebind form
+;; is returned, so the batch succeeds or fails atomically at expansion time,
+;; and per-row work stays one signature parse plus one check under the
+;; shared context.
+(define (recheck-bootstrap-manifest-transformer ctx uniq glo locals depth form)
+  (And depth
+    (recheck-error "recheck/bootstrap-manifest is top-level only" form))
+  (unless (Eq 3 (Sz form))
+    (recheck-error
+      "recheck/bootstrap-manifest needs an alias map and a manifest binding"
+      form)
+    1)
+  (define alias-map (recheck-brak-literal (_1 form)))
+  (unless (recheck-valid-alias-map? alias-map)
+    (recheck-error "malformed alias map" (_1 form))
+    1)
+  (define manifest-name (_2 form))
+  (unless (IsNat manifest-name)
+    (recheck-error "manifest binding must be a symbol" manifest-name)
+    1)
+  (define ent (tr-glookup manifest-name glo))
+  (unless ent
+    (recheck-error "unbound manifest binding" manifest-name)
+    1)
+  (define manifest (recheck-entry-val (Unpin ent)))
+  (unless (handwritten-bootstrap-manifest? manifest)
+    (recheck-error "malformed handwritten bootstrap manifest"
+      [manifest-name manifest])
+    1)
+  (define binds
+    (Force
+      (map
+        (lambda (row)
+          (recheck-envelope-binding ctx glo alias-map
+            (_0 row) (_1 row) (_2 row)))
+        (handwritten-bootstrap-manifest-rows manifest))))
+  [uniq glo (cons 0 binds)])
+
+(#macro recheck-bootstrap-manifest recheck-bootstrap-manifest-transformer)
+(#macro recheck/bootstrap-manifest recheck-bootstrap-manifest-transformer)
+
+(#export
+ recheck-qualified-form?
+ recheck-valid-alias-map?
+ recheck-map-qualified-aliases
+ recheck-envelope-binding
+ recheck-bootstrap-binding
+ recheck-bootstrap-bindings-transformer
+ recheck-bootstrap-bindings recheck/bootstrap-bindings
+ recheck-bootstrap-manifest-transformer
+ recheck-bootstrap-manifest recheck/bootstrap-manifest)
