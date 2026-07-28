@@ -586,14 +586,20 @@
 
 ;; A rune node's span col is its FREE-POS (col + len - 1,
 ;; rex-free-node); its start column is where the rune itself begins.
-;; Sibling-vs-child attachment keys on start columns so that equal
-;; indentation means sibling regardless of rune width — the old
-;; free-pos comparison swallowed wider runes as children, and every
-;; column repair in foil-sast existed to undo that.
+;; Peer-vs-child attachment compares a node's START column against the
+;; poem's ANCHOR (the head rune's last char) — reference §8.4: lines
+;; starting at or left of the anchor are peers.
 (define (rex-node-start-col n)
   (? RexNode n
     (Rune [span]
       (Inc (Sub (rex-span-col span) (rex-span-len span))))
+    ;; A poem tree's span col is its ANCHOR (the ctx pos) — its start
+    ;; column is its head rune's.
+    (Child [tree]
+      (let ((ns (rex-tree-nodes tree)))
+        (If (And (Eq "poem" (rex-tree-shape tree)) (Sz ns))
+          (rex-node-start-col (_0 ns))
+          (rex-tree-pos tree))))
     (_ (rex-node-col n))))
 
 (define (rex-node-line n)
@@ -825,7 +831,7 @@
                           (lcons (rex-stack-quip qlin qcol qoff) rest))))
       ((Eq ty "FREE")
         (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
                  (lcons (rex-stack-quip qlin qcol qoff) rest))))
       ((Eq ty "BEGIN")
         (lcons (rex-stack-ctx
@@ -846,16 +852,17 @@
 
 (define (rex-step-poem dispatch tok ctx rest)
   (let* ((ty (rex-tok-ty tok))
-         (is-real (rex-real-token? ty))
-         ;; A poem ctx's pos is its head rune's START column.  A real
-         ;; token strictly before it ends the poem; anything at or past
-         ;; it stays in the node list — equal-column siblings (of any
-         ;; token kind) are split back out by start column at
-         ;; conversion.  (The old free-pos comparison swallowed wider
-         ;; runes as nested poems — the origin of every column repair
-         ;; in foil-sast.)
-         (heir-rune (And (Eq ty "FREE") (Eq (rex-tok-col tok) (rex-ctx-pos ctx)))))
-    (If (And is-real (And (Lt (rex-tok-col tok) (rex-ctx-pos ctx)) (Nil heir-rune)))
+         (is-real (rex-real-token? ty)))
+    ;; A poem ctx's pos is its ANCHOR: the head rune's last character
+    ;; (rex reference §8.3-8.4).  Tokens at the anchor or right of it
+    ;; stay in the node list; conversion splits peers (start <= anchor)
+    ;; from children (start > anchor).  A peer starting inside a
+    ;; multi-char rune's width pops here and regroups by column in the
+    ;; parent — same placement, no special case.  (The old code
+    ;; demanded free-pos EQUALITY for peers, which swallowed wider
+    ;; runes as nested poems — the origin of every column repair that
+    ;; used to live in foil-sast.)
+    (If (And is-real (Lt (rex-tok-col tok) (rex-ctx-pos ctx)))
         (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest)))
         (cond
           ((rex-leaf-token? ty)
@@ -867,7 +874,7 @@
                               (lcons (rex-stack-ctx ctx) rest))))
           ((Eq ty "FREE")
             (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
                      (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
           ((Eq ty "BEGIN")
             (lcons (rex-stack-ctx
@@ -900,9 +907,14 @@
           (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
                           (lcons (rex-stack-ctx ctx) rest))))
       ((Eq ty "FREE")
+        ;; NOTE: the rex reference (§8.1) says explicit nesting
+        ;; suppresses layout inside it, yet this opens a poem inside a
+        ;; nest and the corpus leans on it (multi-line lambdas in
+        ;; plain parens, e.g. shrine's .any( \ pre ...)).  Spec and
+        ;; behavior disagree here; today the behavior is load-bearing.
         (If (Or (rex-ctx-empty? ctx) (rex-ctx-last-rune ctx))
             (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
                      (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
             (lcons (rex-stack-ctx
                      (rex-append-node (rex-free-node tok) (rex-tok-lin tok)
@@ -1412,8 +1424,8 @@
         [(rowify (lrev acc)) (rowify rest)]
         (rex-split-heir-go pos (lcons (_0 rest) acc) (_1 rest)))))
 
-;; Nodes indented past pos (a START column) are the poem's own
-;; content; nodes at or before it are heir siblings.
+;; Nodes STARTING past pos (the poem's ANCHOR) are the poem's own
+;; content; nodes starting at or before it are peers (§8.4).
 (define (rex-split-heir pos nodes)
   (rex-split-heir-go pos 0 (stream nodes)))
 
@@ -1489,15 +1501,17 @@
       (let* ((first (_0 nodes)))
         (? RexNode first
           (Rune [rune]
-            ;; Split by START column: equal indentation is a sibling
-            ;; regardless of rune width.  Head-line nodes are operands
-            ;; (flat); later lines are body items grouped relative to
-            ;; the FIRST OPERAND's column — deeper runs continue an
-            ;; item's value as one sub-block kid, equal-column lines
-            ;; are the poem's own items.
-            (let* ((head-start (rex-node-start-col first))
+            ;; Split against the ANCHOR — the head rune's last char,
+            ;; which is exactly the rune node's span col (rex-free-node
+            ;; stores free-pos).  Peers START at or left of the anchor
+            ;; (rex reference §8.4) regardless of their own rune width;
+            ;; children start strictly right of it.  Head-line nodes
+            ;; are operands (flat); later lines are body items grouped
+            ;; relative to the FIRST OPERAND's column — deeper runs
+            ;; continue an item's value as one sub-block kid.
+            (let* ((anchor (rex-node-col first))
                    (head-line (rex-node-line first))
-                   (split (rex-split-heir head-start (drop 1 nodes)))
+                   (split (rex-split-heir anchor (drop 1 nodes)))
                    (children (_0 split))
                    (heir-nodes (_1 split))
                    (on-line?
@@ -1507,7 +1521,7 @@
                      (filter (lambda (n) (Nil (on-line? n))) children))
                    (base0
                      (Ifz (Sz operands)
-                       head-start
+                       anchor
                        (rex-node-start-col (_0 operands))))
                    (conv (lambda (n) (rex-convert-node convert src block-off n)))
                    (kids

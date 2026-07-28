@@ -8,9 +8,14 @@ deleted.  What shipped differs from the plan below in one spelling:
 the vertical group normalizes to the EMPTY-RUNE CLEAR NEST (the block
 form sast always consumed), not to Juxt — a group and a same-line
 juxtaposition (`f(x)` method segment) can occupy the same position,
-so they need distinct constructors.  Everything else is as planned:
-poem contexts key on start columns (pop on Lt, FREE-at-equal-col =
-heir sibling), body items group relative to the FIRST OPERAND's
+so they need distinct constructors.  Everything else is as planned,
+with one correction after checking the rex reference: the poem
+ANCHOR is the head rune's LAST character (§8.3-8.4), peers are lines
+STARTING at or left of it, children strictly right — the original
+bug was demanding free-pos EQUALITY for peers, not the anchor choice
+itself.  Poem ctxs carry the anchor; a peer starting inside a
+multi-char rune's width pops and regroups by column in the parent.
+Body items group relative to the FIRST OPERAND's
 column (deeper runs = one sub-block kid, equal-column lines = the
 poem's own items, same-line followers join as a juxt), `=` pairs
 positionally (group in value position = block value; in head
