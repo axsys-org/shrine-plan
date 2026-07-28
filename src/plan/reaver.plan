@@ -388,12 +388,86 @@
 
 
 
+(define (module-file module)
+  (strWeld "reaver/" (strWeld module ".rvr")))
+
+; The module names a form loads: literal (#module m) plus the ::/::*
+; loader macros (std.rvr), found by a deep walk over the read tree.
+; Over-collection is harmless (an extra stamp check on hits); a miss
+; re-opens the stale-dependent hole this exists to close.
+
+(define (form-module-deps acc x)
+  (cond
+    ((IsNat x) acc)
+    ((Nil x)   acc)
+    ((Hd x)    acc)  ; (1 _) literals / (2 _) resolved macro forms
+    (else
+      (begin
+        (define hd (Ix 0 x))
+        (define acc1
+          (If (And (Eq 2 (Sz x))
+                (And (Or (Eq "#module" hd) (Or (Eq "::" hd) (Eq "::*" hd)))
+                  (valid-module-name? (Ix 1 x))))
+            (cons (Ix 1 x) acc)
+            acc))
+        (lfoldl form-module-deps acc1 (stream x))))))
+
+(tests
+  (["quip"] (form-module-deps [] ["#bind" "q" ["#module" "quip"]]))
+  (["b" "a"] (form-module-deps [] [["#module" "a"] [["#module" "b"]]]))
+  ([] (form-module-deps [] ["#import" "quip"])))
+
+(define (dedupe-names names)
+  (define (loop i acc)
+    (If (Le (Sz names) i) acc
+      (begin
+        (define nm (Ix i names))
+        (loop (Inc i) (If (Eq i (lsearch nm names)) (cons nm acc) acc)))))
+  (loop 0 []))
+
+; Transitive dep stamps for a freshly compiled module: each direct
+; load's [name stamp] plus the flattened rows its own cache entry
+; already carries — so a later hit revalidates the whole closure with
+; one stamp sweep, no recursion into entries that may since have been
+; replaced.  Deduped by name (first occurrence wins).
+
+(define (dep-stamp-rows cache deps)
+  (define (entry-deps nm)
+    (define e (bst-idx nm cache))
+    (define own [[nm (Stamp (module-file nm))]])
+    (define ebox (Ix 2 e))
+    (If (And e ebox) (Weld own (Ix 0 ebox)) own))
+  (define all (cat (map entry-deps deps)))
+  (define (seen-before j i nm)
+    (If (Le i j) 0
+      (Or (Eq nm (Ix 0 (Ix j all))) (seen-before (Inc j) i nm))))
+  (define (loop i acc)
+    (If (Le (Sz all) i) acc
+      (begin
+        (define pr (Ix i all))
+        (loop (Inc i)
+          (If (seen-before 0 i (Ix 0 pr)) acc (cons pr acc))))))
+  (loop 0 []))
+
 (define (reaver-module-load go cache ctx uniq glo locals depth x module)
   (assert-size 2 x)
-  (define filenm             (strWeld "reaver/" (strWeld module ".rvr")))
+  (define filenm             (module-file module))
   (define stamp              (Stamp filenm))
   (define ent[eStamp eValue] (bst-idx module cache))
-  (If (And ent (Eq eStamp stamp))
+  ; Entry dep stamps ride BOXED ([deps-row]) so a legacy two-slot
+  ; entry reads 0 here — unknown deps, treated as stale — instead of
+  ; masquerading as dep-free.
+  (define edeps (Ix 2 ent))
+  (define deps-ok
+    (And edeps
+      (begin
+        (define deps (Ix 0 edeps))
+        (define (fresh i)
+          (If (Le (Sz deps) i) 1
+            (And (Eq (Ix 1 (Ix i deps)) (Stamp (module-file (Ix 0 (Ix i deps)))))
+              (fresh (Inc i)))))
+        (fresh 0))))
+  (If (And ent (And (Eq eStamp stamp) deps-ok))
     (begin
       (print ("CACHED" module ent eStamp stamp))
       [cache uniq glo (K eValue)])
@@ -401,10 +475,17 @@
       (print ("LOADING" module))
       (define bytes (ReadFile filenm))
       (And (Nil bytes) Error("#module" "file-not-found" filenm))
+      (define forms (readAll 0 (explode-bytes bytes)))
       (define @[cache value]
-        (file-loop go module cache ctx INITIAL-UNIQUE EMPTY-ENVIRONMENT
-          (readAll 0 (explode-bytes bytes))))
-      (define cache (bst-insert module [stamp value] cache))
+        (file-loop go module cache ctx INITIAL-UNIQUE EMPTY-ENVIRONMENT forms))
+      ; A dependent must recompile when ANYTHING it loaded (directly
+      ; or transitively) changed on disk; the own-stamp-only cache
+      ; silently served stale dependents (sabotage-verified).
+      (define dnames
+        (dedupe-names
+          (lfoldl {acc lcx -> (form-module-deps acc (Ix 2 lcx))} [] forms)))
+      (define cache
+        (bst-insert module [stamp value [(dep-stamp-rows cache dnames)]] cache))
       [cache uniq glo (K value)])))
 
 (define (reaver-module go cache ctx uniq glo locals depth x[_ moduleS])
