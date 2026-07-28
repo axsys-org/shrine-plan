@@ -22,6 +22,7 @@
 (#bind helm-doctest (#module helm-doctest))
 (#bind helm-build (#module helm-build))
 (#bind doctest (#module doctest))
+(#bind foil-render (#module foil-render))
 
 
 ;;; The HTTP driver: a helm worker whose requests ride the namespace.
@@ -207,6 +208,18 @@
 (define (h-compreq hs) (Ix 7 hs))
 (define (h-savereq hs) (Ix 8 hs))
 (define (h-bridge? hs) (Gt (Sz hs) 5))
+;; vine_poke + the compiled boot subject: the explorer's write box
+;; (POST /vine/<path>) evaluates its expression against the subject
+;; and emits the writ as a driver cmd.  Only the full boot bundle
+;; carries them.
+(define (h-poke hs) (Ix 9 hs))
+(define (h-sut hs) (Ix 10 hs))
+(define (h-vine? hs) (Gt (Sz hs) 9))
+
+;; "/vine" or "/vine/..." — the write box's endpoint.
+(define (vine-url? u)
+  (And (Eq "/vine" (Mod u (Lsh 1 40)))
+    (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
 
 (define (pend-get pending pax)
   (find (lambda (e) (Equal pax (_0 e))) pending))
@@ -305,7 +318,45 @@
       (Seq (helm:send! coord ["spy" name pax])
         (let ((rm ["read" pax]))
           (Seq (DeepSeq rm rm) (SendCaps coord rm [0])))))
+    ;; The explorer's write box: POST /vine/<path> with verb=make|
+    ;; poke|cull and (for make/poke) expr, a foil expression that
+    ;; evaluates against the boot subject to the writ's myth.  The
+    ;; task goes out as an ordinary driver cmd — the same effect
+    ;; channel every request-node make uses — and the reply bounces
+    ;; the browser back to the node.
+    (define (vine! z)
+      (define url (_2 msg))
+      (define body (_3 msg))
+      (define verb (form-field "verb" body))
+      (define target (url-target (Rsh url 40)))
+      (define expr (form-field "expr" body))
+      (define (reply status body2)
+        (Seq (helm:send! (Ix 0 caps) ["res" status body2 "text/html; charset=utf-8"])
+          (loop serial pending queue)))
+      (define (back-page pax)
+        (define loc (strWeld "/ns" (quip:print-path pax)))
+        (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
+                 " content=" 34 "1;url=" loc 34 "></head><body>emitted; <a href="
+                 34 loc 34 ">back to the node</a></body></html>"]))
+      (define (emit task pax)
+        (Seq (helm:send! coord ["cmd" name task])
+          (reply 200 (back-page pax))))
+      (cond
+        ((Ifz target 1 0) (reply 404 "unparseable path segment"))
+        ((Eq verb "cull") (emit ((h-cull hs) (_0 target)) (_0 target)))
+        ((Or (Eq verb "make") (Eq verb "poke"))
+          (let ((r (doctest:eval-text (h-sut hs) expr)))
+            (If (Eq 1 (Hd r))
+              (reply 400 (foil-render:diag-text (_0 r)))
+              (emit
+                ((If (Eq verb "make") (h-make hs) (h-poke hs))
+                 (_0 target) (_0 (_0 r)))
+                (_0 target)))))
+        (else (reply 400 "verb must be make, poke, or cull"))))
     (cond
+      ((And (Eq kind "req")
+         (And (h-vine? hs) (vine-url? (_2 msg))))
+        (vine! 0))
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
         (let* ((parts (filter Bytes (split-ch 47 (_2 msg))))
