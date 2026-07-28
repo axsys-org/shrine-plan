@@ -1,0 +1,147 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+(#bind schemagen (#module schemagen))
+
+
+;;; schemagen: JSON schema -> generated foil types + serde, compiled
+;;; through the tree-fed seam (foil:compile-rex).  Schema and payload
+;;; text is host-built (quote bytes can't ride foil literals, and the
+;;; fixtures are JSON).
+
+(define q 34)
+(define (js s) (strcat [q s q]))
+(define (kv k v) (strcat [(js k) ":" v]))
+
+;;; compile-rex identity: a parsed tree compiles like the file did.
+
+(define jsrc (foil:get-foil "json"))
+(define jsut (foil:compile-rex foil:default-subject "json"
+               (rex:ParseRexNormFile jsrc)))
+(define jrt (foil:source-entry-val ["rt"] jsut))
+assert(Equal "[1,2,3]" (jrt "[ 1 , 2 , 3 ]"))
+
+;;; The fixture: a record with required/optional prims, an array, a
+;;; record ref, and an enum ref.
+
+(define schema-txt
+  (strcat
+    ["{" (kv "title" (js "task")) "," (kv "type" (js "object")) ","
+     (kv "required" (strcat ["[" (js "name") "," (js "done") "]"])) ","
+     (kv "properties"
+       (strcat
+         ["{" (kv "name" (strcat ["{" (kv "type" (js "string")) "}"])) ","
+          (kv "done" (strcat ["{" (kv "type" (js "boolean")) "}"])) ","
+          (kv "count" (strcat ["{" (kv "type" (js "integer")) "}"])) ","
+          (kv "tags" (strcat ["{" (kv "type" (js "array")) ","
+                              (kv "items" (strcat ["{" (kv "type" (js "string")) "}"]))
+                              "}"])) ","
+          (kv "peer" (strcat ["{" (kv "$ref" (js "#/$defs/peer")) "}"])) ","
+          (kv "hue" (strcat ["{" (kv "$ref" (js "#/$defs/hue")) "}"]))
+          "}"])) ","
+     (kv "$defs"
+       (strcat
+         ["{" (kv "peer"
+                (strcat ["{" (kv "type" (js "object")) ","
+                         (kv "required" (strcat ["[" (js "host") "," (js "port") "]"])) ","
+                         (kv "properties"
+                           (strcat ["{" (kv "host" (strcat ["{" (kv "type" (js "string")) "}"])) ","
+                                    (kv "port" (strcat ["{" (kv "type" (js "integer")) "}"]))
+                                    "}"]))
+                         "}"])) ","
+          (kv "hue" (strcat ["{" (kv "enum" (strcat ["[" (js "red") "," (js "green") "]"])) "}"]))
+          "}"])) ","
+     (kv "examples"
+       (strcat ["[{" (kv "name" (js "a")) "," (kv "done" "true") "}]"]))
+     "}"]))
+
+(define g (schemagen:compile-schema foil:default-subject jsut schema-txt))
+assert(Equal "task" (_0 g))
+(define gsut (Ix 2 g))
+(define rt (foil:source-entry-val ["rt"] gsut))
+
+;;; Round-trips: canonical spelling back, optional keys ride only when
+;;; present, order preserved.
+
+(define t-min (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") "}"]))
+assert(Equal t-min (rt t-min))
+
+(define t-full
+  (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+           (kv "count" "3") ","
+           (kv "tags" (strcat ["[" (js "x") "," (js "y") "]"])) ","
+           (kv "peer" (strcat ["{" (kv "host" (js "h")) "," (kv "port" "80") "}"])) ","
+           (kv "hue" (js "red")) "}"]))
+assert(Equal t-full (rt t-full))
+
+;; whitespace and key order normalize to the declaration order
+(define t-sloppy
+  (strcat ["{ " (kv "done" "true") " , " (kv "name" (js "a")) " }"]))
+assert(Equal t-min (rt t-sloppy))
+
+;;; Decode failures carry field-path breadcrumbs.
+
+assert(Equal "name:missing" (rt (strcat ["{" (kv "done" "true") "}"])))
+assert(Equal "peer.port:missing"
+  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+               (kv "peer" (strcat ["{" (kv "host" (js "h")) "}"])) "}"])))
+assert(Equal "name:expected-string"
+  (rt (strcat ["{" (kv "name" "1") "," (kv "done" "true") "}"])))
+assert(Equal "count:negative"
+  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+               (kv "count" "-1") "}"])))
+assert(Equal "tags[1]:expected-string"
+  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+               (kv "tags" (strcat ["[" (js "x") ",2]"])) "}"])))
+assert(Equal "hue:bad-enum"
+  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+               (kv "hue" (js "blue")) "}"])))
+assert(Equal "expected-key" (rt "{,}"))
+
+;;; Typed access on the generated record.
+
+(define parse-task (foil:source-entry-val ["parse_task"] gsut))
+(define pr (parse-task t-full))
+assert(Equal "/boot/task_r/ok" (Hd pr))
+
+;;; The generated text carries ?= doctests minted from examples.
+
+(define gtxt (_1 g))
+assert(Lt 0 (Sz (rex:ParseRexNormFile gtxt)))
+
+;;; Unsupported schema shapes are rejected loudly.
+
+(define (gen-fails schema)
+  (define r (Try (lambda (z) (schemagen:gen-text jsut schema)) 0))
+  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+
+assert(Equal "float-unsupported (no honest representation yet)"
+  (gen-fails
+    (strcat ["{" (kv "title" (js "t")) "," (kv "type" (js "object")) ","
+             (kv "properties"
+               (strcat ["{" (kv "x" (strcat ["{" (kv "type" (js "number")) "}"])) "}"]))
+             "}"])))
+assert(Equal "missing-title"
+  (gen-fails (strcat ["{" (kv "type" (js "object")) "}"])))
+assert(Equal "reserved-name"
+  (gen-fails
+    (strcat ["{" (kv "title" (js "parse")) "," (kv "type" (js "object")) ","
+             (kv "properties"
+               (strcat ["{" (kv "x" (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+             "}"])))
+
+(print "foil-schemagen tests passed")
