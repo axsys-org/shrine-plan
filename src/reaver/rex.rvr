@@ -584,6 +584,21 @@
 (define (rex-node-col n)
   (rex-span-col (rex-node-span n)))
 
+;; A rune node's span col is its FREE-POS (col + len - 1,
+;; rex-free-node); its start column is where the rune itself begins.
+;; Sibling-vs-child attachment keys on start columns so that equal
+;; indentation means sibling regardless of rune width — the old
+;; free-pos comparison swallowed wider runes as children, and every
+;; column repair in foil-sast existed to undo that.
+(define (rex-node-start-col n)
+  (? RexNode n
+    (Rune [span]
+      (Inc (Sub (rex-span-col span) (rex-span-len span))))
+    (_ (rex-node-col n))))
+
+(define (rex-node-line n)
+  (rex-span-line (rex-node-span n)))
+
 (define (rex-leaf ltag s) [ltag s])
 (define (rex-leaf-tag lf) (_0 lf))
 (define (rex-leaf-text lf) (_1 lf))
@@ -810,7 +825,7 @@
                           (lcons (rex-stack-quip qlin qcol qoff) rest))))
       ((Eq ty "FREE")
         (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+          (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
                  (lcons (rex-stack-quip qlin qcol qoff) rest))))
       ((Eq ty "BEGIN")
         (lcons (rex-stack-ctx
@@ -832,7 +847,14 @@
 (define (rex-step-poem dispatch tok ctx rest)
   (let* ((ty (rex-tok-ty tok))
          (is-real (rex-real-token? ty))
-         (heir-rune (And (Eq ty "FREE") (Eq (rex-free-pos tok) (rex-ctx-pos ctx)))))
+         ;; A poem ctx's pos is its head rune's START column.  A real
+         ;; token strictly before it ends the poem; anything at or past
+         ;; it stays in the node list — equal-column siblings (of any
+         ;; token kind) are split back out by start column at
+         ;; conversion.  (The old free-pos comparison swallowed wider
+         ;; runes as nested poems — the origin of every column repair
+         ;; in foil-sast.)
+         (heir-rune (And (Eq ty "FREE") (Eq (rex-tok-col tok) (rex-ctx-pos ctx)))))
     (If (And is-real (And (Lt (rex-tok-col tok) (rex-ctx-pos ctx)) (Nil heir-rune)))
         (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest)))
         (cond
@@ -845,7 +867,7 @@
                               (lcons (rex-stack-ctx ctx) rest))))
           ((Eq ty "FREE")
             (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
                      (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
           ((Eq ty "BEGIN")
             (lcons (rex-stack-ctx
@@ -880,7 +902,7 @@
       ((Eq ty "FREE")
         (If (Or (rex-ctx-empty? ctx) (rex-ctx-last-rune ctx))
             (rex-push-into (rex-free-node tok) (rex-tok-lin tok) (rex-tok-off tok) (rex-tok-end tok)
-              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-free-pos tok) (rex-tok-off tok)))
+              (lcons (rex-stack-ctx (rex-mk-ctx "poem" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
                      (rex-close-clump (lcons (rex-stack-ctx ctx) rest))))
             (lcons (rex-stack-ctx
                      (rex-append-node (rex-free-node tok) (rex-tok-lin tok)
@@ -1386,10 +1408,12 @@
 
 (define (rex-split-heir-go pos acc rest)
   (Ifz rest [(rowify (lrev acc)) []]
-    (If (Le (rex-node-col (_0 rest)) pos)
+    (If (Le (rex-node-start-col (_0 rest)) pos)
         [(rowify (lrev acc)) (rowify rest)]
         (rex-split-heir-go pos (lcons (_0 rest) acc) (_1 rest)))))
 
+;; Nodes indented past pos (a START column) are the poem's own
+;; content; nodes at or before it are heir siblings.
 (define (rex-split-heir pos nodes)
   (rex-split-heir-go pos 0 (stream nodes)))
 
@@ -1404,24 +1428,99 @@
 (define (rex-mk-heir sp rs)
   (If (Nil (_1 rs)) (_0 rs) ($Heir sp (rowify rs))))
 
+;; Flat body nodes at mixed depths -> item list.  A node at its run's
+;; base column starts an item; same-line followers join it as a juxt
+;; (`rt  (_ n.r)` is one binding line); a deeper later-line run is that
+;; item's sub-block, grouped as ONE following Heir item (recursively) —
+;; leaf-headed lines don't open poem contexts, so their blocks must be
+;; reconstructed here, the one layer allowed to think in columns.
+(define (rex-body-items conv base0 nodes)
+  (define (split-run f rest)
+    (Ifz rest [0 0]
+      (If (f (_0 rest))
+        (let ((r (split-run f (_1 rest))))
+          [(lcons (_0 rest) (_0 r)) (_1 r)])
+        [0 rest])))
+  ;; go returns finished statements: a converted node that is itself a
+  ;; Heir (a rune child with its heir chain) splices inline; a
+  ;; sub-block stays ONE Heir item, deliberately NOT flattened.
+  (define (go rest)
+    (Ifz rest 0
+      (let* ((n0 (_0 rest))
+             (base (rex-node-start-col n0))
+             (line (rex-node-line n0))
+             (sl (split-run (lambda (n) (Eq line (rex-node-line n)))
+                   (_1 rest)))
+             (same (_0 sl))
+             (dp (split-run
+                   (lambda (n) (Gt (rex-node-start-col n) base))
+                   (_1 sl)))
+             (deep (_0 dp))
+             (item0
+               (Ifz same
+                 (conv n0)
+                 ($Juxt (rex-node-span n0)
+                   (rowify (lcons (conv n0) (lmap conv same))))))
+             (tail (go (_1 dp))))
+        (lweld (rex-flatten-heir item0)
+          (Ifz deep
+            tail
+            (lcons
+              (rex-mk-heir (rex-node-span (_0 deep)) (go deep))
+              tail))))))
+  ;; Body lines deeper than the first OPERAND's column continue that
+  ;; operand's value — they lead as one sub-block item.  Lines at or
+  ;; before it are the poem's own items.
+  (define (start rest)
+    (Ifz rest 0
+      (let ((lead (split-run
+                    (lambda (n) (Gt (rex-node-start-col n) base0))
+                    rest)))
+        (Ifz (_0 lead)
+          (go rest)
+          (lcons
+            (rex-mk-heir (rex-node-span (_0 (_0 lead))) (go (_0 lead)))
+            (go (_1 lead)))))))
+  (start (stream nodes)))
+
 (define (rex-convert-poem convert src block-off sp pos nodes)
   (If (Eq 0 (Sz nodes))
       (rex-error "empty-poem")
       (let* ((first (_0 nodes)))
         (? RexNode first
           (Rune [rune]
-            (let* ((split (rex-split-heir pos (drop 1 nodes)))
+            ;; Split by START column: equal indentation is a sibling
+            ;; regardless of rune width.  Head-line nodes are operands
+            ;; (flat); later lines are body items grouped relative to
+            ;; the FIRST OPERAND's column — deeper runs continue an
+            ;; item's value as one sub-block kid, equal-column lines
+            ;; are the poem's own items.
+            (let* ((head-start (rex-node-start-col first))
+                   (head-line (rex-node-line first))
+                   (split (rex-split-heir head-start (drop 1 nodes)))
                    (children (_0 split))
                    (heir-nodes (_1 split))
-                   (open ($Open sp rune
-                          (map (lambda (n) (rex-convert-node convert src block-off n)) children))))
+                   (on-line?
+                     (lambda (n) (Eq head-line (rex-node-line n))))
+                   (operands (filter on-line? children))
+                   (body-nodes
+                     (filter (lambda (n) (Nil (on-line? n))) children))
+                   (base0
+                     (Ifz (Sz operands)
+                       head-start
+                       (rex-node-start-col (_0 operands))))
+                   (conv (lambda (n) (rex-convert-node convert src block-off n)))
+                   (kids
+                     (rowify
+                       (lweld (lmap conv (stream operands))
+                         (rex-body-items conv base0 body-nodes))))
+                   (open ($Open sp rune kids)))
               (If (Eq 0 (Sz heir-nodes))
                   open
                   (rex-mk-heir sp
                     (lcons open
                       (rex-concat-flattened
-                        (lmap (lambda (n) (rex-convert-node convert src block-off n))
-                              (stream heir-nodes))))))))
+                        (lmap conv (stream heir-nodes))))))))
           (LeafNode [span leaf]
             (let* ((slug (rex-leaf-to-rex
                            span leaf))
@@ -1503,6 +1602,11 @@
     (Nest [color] (Eq color "clear"))
     (_ 0)))
 
+(define (rex-normal-empty-clear-nest-rune? r)
+  (? Rex r
+    (Nest [color rune] (And (Eq color "clear") (Eq rune "")))
+    (_ 0)))
+
 (define (rex-normalize-juxt-kid norm r)
   (let* ((n (norm r)))
     (? Rex n
@@ -1514,18 +1618,31 @@
 
 (define (rex-normalize-expr norm sp color kids)
   (let* ((norm-kids (map norm kids)))
+    ;; A single RUNED clear kid absorbs into the bracket ((? ...) is a
+    ;; ?-paren).  An empty-rune kid is a vertical GROUP — absorbing it
+    ;; would turn its statements into call arguments.
     (If (And (Eq 1 (Sz norm-kids))
-             (rex-normal-clear-nest? (_0 norm-kids)))
+             (And (rex-normal-clear-nest? (_0 norm-kids))
+                  (Nil (rex-normal-empty-clear-nest-rune? (_0 norm-kids)))))
         (let* ((kid (_0 norm-kids)))
           ($Nest sp color (Nest.rune kid) (Nest.kids kid)))
         ($Nest sp color "" norm-kids))))
 
+;; Bloc items are a vertical group: they normalize to ONE trailing
+;; Juxt kid (singletons unwrap) instead of splicing beside the head —
+;; a statement's operands never mix with its block.
 (define (rex-normalize-bloc norm sp color rune head items)
   (let* ((norm-head (norm head))
          (norm-items (map norm items))
-         (kids (If (rex-normal-empty-clear-nest? norm-head)
-                   norm-items
-                   (rowify (lcons norm-head (stream norm-items))))))
+         (group
+           (If (Eq 1 (Sz norm-items)) (_0 norm-items)
+             ($Nest sp "clear" "" norm-items)))
+         (headless (rex-normal-empty-clear-nest? norm-head))
+         (kids
+           (cond
+             ((Eq 0 (Sz norm-items)) (If headless [] [norm-head]))
+             (headless [group])
+             (else [norm-head group]))))
     ($Nest sp color rune kids)))
 
 (define (NormalizeRex r)
@@ -1551,8 +1668,13 @@
         (map NormalizeRex kids)))
     (Juxt [span kids]
       (rex-normalize-juxt NormalizeRex span kids))
+    ;; A Heir is a VERTICAL group — statements, not juxtaposition — and
+    ;; normalizes to the empty-rune clear nest (the block form sast
+    ;; already consumes).  Keeping it distinct from Juxt matters: a
+    ;; method segment `f(x)` is a horizontal juxt, and a trailing
+    ;; group must not be mistaken for one.
     (Heir [span kids]
-      (rex-normalize-juxt NormalizeRex span kids))))
+      ($Nest span "clear" "" (map NormalizeRex kids)))))
 
 (define (ParseRexNorm src)
   (NormalizeRex (ParseRex src)))
