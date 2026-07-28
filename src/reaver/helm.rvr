@@ -237,12 +237,12 @@
 ;; variant emits [node myth] rows (no /boot doc node) so a resync can
 ;; remount one module's records through the chore cmd stream; the
 ;; tasks variant wraps them as vine_makes for boot seeding.
-(define (boot-mirror-mods-lore-with lore? raw-cache core)
+(define (boot-mirror-mods-refs-lore-with refs? lore? raw-cache core)
   (define cache raw-cache)
   (define src-t (core-ent core ["mirror" "src"]))
   (define ent-t (core-ent core ["mirror" "entry"]))
   (define ent-x (core-ent core ["mirror" "extras"]))
-  (define reftab (If mirror-refs? (boot-ref-table cache) []))
+  (define reftab (If refs? (boot-ref-table cache) []))
   (define (mod-parts me)
     (define mod (_0 me))
     (define sut (_1 me))
@@ -283,6 +283,13 @@
      (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla))
      (map ent-task own)])
   (map mod-parts cache))
+
+;; The boot-path builder: reference rows deferred (the who-calls table
+;; costs ~33s; ref-upgrade-task below re-mirrors WITH refs as one
+;; post-listen pact poke).  A chore resync re-minted card is likewise
+;; ref-less until the next upgrade.
+(define (boot-mirror-mods-lore-with lore? raw-cache core)
+  (boot-mirror-mods-refs-lore-with 0 lore? raw-cache core))
 
 (define (boot-mirror-pairs-lore-with lore? raw-cache core)
   (foldl
@@ -327,6 +334,32 @@
 
 (define (boot-mirror-pact-tasks-with raw-cache core)
   (boot-mirror-pact-tasks-lore-with mirror-lore? raw-cache core))
+
+;; The deferred who-calls upgrade: ONE pact poke at /boot whose
+;; manifest seeds every entry card rebuilt WITH its reference rows.
+;; pact/talk expands it poke-if-present, so the whole tree melds in a
+;; single committed epoch — per-node injection was measured at ~400s
+;; of per-event commit+persist churn; this is one event.  Computing
+;; the ref table (the ~33s the boot no longer pays) happens lazily
+;; when this injects after the listener is up.
+(define (ref-upgrade-task raw-cache core)
+  (define vine-poke (core-ent core ["vine_poke"]))
+  (define msing (core-ent core ["myth" "sing"]))
+  (define mani-c (core-ent core ["mani"]))
+  (define lore-c (core-ent core ["lore"]))
+  (define pact-slot (core-ent core ["pact" "slot"]))
+  (define seeds
+    (foldl
+      (lambda (acc mp)
+        (let ((mnode (Ix 0 mp)))
+          (Weld acc
+            (map
+              (lambda (e) [(drop 1 (Weld mnode (Ix 0 e))) (Ix 1 e)])
+              (Ix 3 mp)))))
+      [] (boot-mirror-mods-refs-lore-with 1 mirror-lore? raw-cache core)))
+  (vine-poke [(ts "boot")]
+    (msing pact-slot
+      (mani-c ("ts" "refs") (lore-c 0 [] []) [] seeds))))
 
 ;; Every mirrored entry grouped by its source namespace root:
 ;; [[root entry-nodes] ..] — forge's /ns aggregation.
@@ -381,6 +414,23 @@
           (DeepSeq (_0 cr) cr)))
       0))
   (If (Eq 1 (Hd r)) [cache 0] [(_0 (_0 r)) 1]))
+
+;; Test fixtures excluded from the boot mirror: compiling ~23 fixture
+;; modules cost more than half the mirror-all roster compile, and the
+;; suites that exercise them compile them themselves.  env_* is the
+;; fixture prefix; the named ones are suite props.  A module absent
+;; here still mirrors on demand through the build chores.
+(define fixture-modules
+  ["helm_ref_caller" "helm_ref_target" "mapuser" "mapuser_rev" "mapx"
+   "vecapp" "perfbench"])
+
+(define (fixture-module? mod)
+  (Or (Eq "env_" (Trunc32 mod))
+    (includes (Eq mod) fixture-modules)))
+
+;; The boot-mirror roster policy over a disk scan.
+(define (mirror-roster mods)
+  (filter (lambda (m) (Nil (fixture-module? m))) mods))
 
 ;; The whole disk roster compiled into the cache: [cache' failed-mods].
 (define (compile-roster cache mods)
@@ -525,53 +575,66 @@
 ;; compiled paths — it IS the warming the off-MAIN runs rely on.
 (define doctest-sweep? 1)
 
-;; Verdicts for every documented entry with tests, evaluated against
-;; the owning module's cache-entry subject (apps compile after the
-;; core chain, so the core's subject cannot resolve app-local names)
-;; and poked onto the mirror nodes.  Tolerant: a failed poke traces
-;; and moves on — verdicts are data, not gates.
-(define (seed-doctests raw-cache core sov)
+;; Verdict tasks for every documented entry with tests, evaluated
+;; against the owning module's cache-entry subject (apps compile after
+;; the core chain, so the core's subject cannot resolve app-local
+;; names).  The staleness anchor and the make/poke choice read against
+;; the supplied sovereign; verdicts ride /dt CHILD nodes, so one
+;; verdict never moves another node's anchor and the whole batch is
+;; sound against one snapshot.  Lazy: forcing task i runs entry i's
+;; doctests, nothing else — the serve injects these AFTER listening.
+(define (doctest-tasks raw-cache core sov)
   (define cache raw-cache)
   (define vine-poke (core-ent core ["vine_poke"]))
   (define vine-make (core-ent core ["vine_make"]))
   (define dt-card (core-ent core ["doctest" "card"]))
-  (define run-event (core-ent core ["run_event"]))
   (define xcase (core-ent core ["x_case_h"]))
   (define (tested l) (Gt (Sz (foil-lore:lore-tests l)) 0))
   ;; the verdict rides a child node — the documented node's version
   ;; stays clean as the staleness anchor (doctest-runner-explorer I.3)
-  (define (poke1 msut s node l)
-    (define c (xcase 0 node s))
+  (define (task1 msut node l)
+    (define c (xcase 0 node sov))
     (If (Nil (Eq "/boot/maybe/some" (Hd c)))
-      s
+      []
       (let* ((rs (doctest:run-lore msut l))
              (dtnode (snoc (ts "dt") node))
-             (card (dt-card (Now 0) (_0 c) rs))
-             (task (If (Eq "/boot/maybe/some" (Hd (xcase 0 dtnode s)))
-                     (vine-poke dtnode card)
-                     (vine-make dtnode card)))
-             (o (Try (lambda (z) (run-event task 0 s)) 0)))
-        (If (And (Eq 0 (Hd o)) (Eq "/boot/ovum/ripe" (Hd (_0 o))))
-          (Ix 0 (_0 o))
-          (Seq (Trace ["doctest-sweep: poke failed" node] 0) s)))))
-  (define (mod-sweep s me)
+             (card (dt-card (Now 0) (_0 c) rs)))
+        [(If (Eq "/boot/maybe/some" (Hd (xcase 0 dtnode sov)))
+           (vine-poke dtnode card)
+           (vine-make dtnode card))])))
+  (define (mod-tasks acc me)
     (define bsegs (Weld [(ts "boot")] (map ts (mod-segs (_0 me)))))
     (define lore (entry-lore me))
-    (define s1
+    (define acc1
       (let ((mh (foil-lore:lore-for lore [])))
-        (If (And mh (tested (_0 mh))) (poke1 (_1 me) s bsegs (_0 mh)) s)))
+        (If (And mh (tested (_0 mh)))
+          (Weld acc (task1 (_1 me) bsegs (_0 mh)))
+          acc)))
     (foldl
-      (lambda (s2 k)
+      (lambda (acc2 k)
         (let* ((name (drop 1 k))
                (hit (foil-lore:lore-for lore name)))
           (If (And hit (tested (_0 hit)))
-            (poke1 (_1 me)
-              s2
-              (Weld bsegs (Weld [(ts (showNat (Sz name)))] (map ts name)))
-              (_0 hit))
-            s2)))
-      s1 (entry-own-keys me)))
-  (foldl mod-sweep sov cache))
+            (Weld acc2
+              (task1 (_1 me)
+                (Weld bsegs (Weld [(ts (showNat (Sz name)))] (map ts name)))
+                (_0 hit)))
+            acc2)))
+      acc1 (entry-own-keys me)))
+  (foldl mod-tasks [] cache))
+
+;; Apply the sweep directly to a sovereign (pre-spawn seeding; tests
+;; and tools).  Tolerant: a failed poke traces and moves on —
+;; verdicts are data, not gates.
+(define (seed-doctests raw-cache core sov)
+  (define run-event (core-ent core ["run_event"]))
+  (foldl
+    (lambda (s task)
+      (let ((o (Try (lambda (z) (run-event task 0 s)) 0)))
+        (If (And (Eq 0 (Hd o)) (Eq "/boot/ovum/ripe" (Hd (_0 o))))
+          (Ix 0 (_0 o))
+          (Seq (Trace ["doctest-sweep: poke failed"] 0) s))))
+    sov (doctest-tasks raw-cache core sov)))
 
 ;;; Duty application ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
