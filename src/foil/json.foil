@@ -1,0 +1,403 @@
+-  sept
+'  json: encode and decode JSON text (RFC 8259-ish).  Values are the
+'  /json sum.  Numbers are exact integers - floats are rejected, like
+'  the aura codec, until an honest representation exists.  Strings
+'  are UTF-8 cords passed through verbatim; uXXXX escapes decode
+'  (surrogate pairs included), but u0000 is rejected (a cord cannot
+'  hold NUL).  Decode by /parse , encode by /show ; the
+'  round-trip /rt is the doctest surface.
++  jres
+  '  A decode outcome: the value with the unconsumed tail, or a
+  '  failure naming why, at the tail where it stopped.
+  &  jres/ok
+     jres/err
+  +  ok
+    :  v=json rest=nat
+  +  err
+    :  why=nat rest=nat
++  json
+  '  A JSON value.
+  &  json/nul
+     json/boo
+     json/num
+     json/str
+     json/arr
+     json/obj
+  +  nul
+    '  Null.  The field is inert (a nullary member cannot be
+    '  constructed by relvar from its own module — give it a body).
+    :  z=nat
+  +  boo
+    :  b=bool
+  +  num
+    '  An exact integer: sign and magnitude.
+    :  neg=bool n=nat
+  +  str
+    :  s=nat
+  +  arr
+    :  xs=row[json]
+  +  obj
+    '  Ordered key/value pairs; keys are cords.  Duplicates ride as
+    '  written.
+    :  kvs=row[jkv]
++  jkv
+  '  One object member: key and value.
+  :  k=nat v=json
++  jnull
+  '  The null value.
+  ^  json
+  (json/nul 0)
++  cat2
+  \  a=nat b=nat
+  ^  nat
+  (add a (lsh b (mul 8 (wid a))))
++  snoc8
+  '  Append one byte.
+  \  s=nat b=nat
+  ^  nat
+  (add s (lsh b (mul 8 (wid s))))
++  show_nat
+  \  n=nat
+  ^  nat
+  ?  (eq n 0)
+     "0"
+  |  > rest=nat n  > out=nat 0
+  ?  (eq rest 0)
+     out
+  (_ (div rest 10) (cat2 (add "0" (mod rest 10)) out))
++  ws
+  '  The tail past any leading JSON whitespace.
+  \  s=nat
+  ^  nat
+  |  > r=nat s
+  =  c  (mod r 256)
+  ?  (eq c " ")
+     (_ (div r 256))
+  ?  (eq c 10)
+     (_ (div r 256))
+  ?  (eq c 13)
+     (_ (div r 256))
+  ?  (eq c 9)
+     (_ (div r 256))
+  r
++  lit
+  '  Expect an exact prefix: the tail after it, or .none.
+  \  pre=nat s=nat
+  ^  maybe[nat]
+  =  w  (lsh 1 (mul 8 (wid pre)))
+  ?  (eq pre (mod s w))
+     (./some (div s w))
+  .none
++  digit
+  \  c=nat
+  ^  bool
+  ?  (lt c "0")
+     .false
+  ?  (gt c "9")
+     .false
+  .true
++  hexv
+  '  A hex digit's value, or 16 for a non-digit.
+  \  c=nat
+  ^  nat
+  ?  (digit c)
+     (sub c "0")
+  ?  (lt c "A")
+     16
+  ?  (gt c "f")
+     16
+  ?  (gt c "F")
+     ?  (lt c "a")
+        16
+     (sub c 87)
+  (sub c 55)
++  hexd
+  \  v=nat
+  ^  nat
+  ?  (lt v 10)
+     (add "0" v)
+  (add 87 v)
++  hex2
+  '  A byte as two lowercase hex digits.
+  \  b=nat
+  ^  nat
+  (cat2 (hexd (div b 16)) (hexd (mod b 16)))
++  utf8
+  '  Append one codepoint, UTF-8 encoded.
+  \  out=nat cp=nat
+  ^  nat
+  ?  (lt cp 128)
+     (snoc8 out cp)
+  ?  (lt cp 2048)
+     (snoc8 (snoc8 out (add 192 (div cp 64))) (add 128 (mod cp 64)))
+  ?  (lt cp 65536)
+     (snoc8 (snoc8 (snoc8 out (add 224 (div cp 4096)))
+       (add 128 (mod (div cp 64) 64))) (add 128 (mod cp 64)))
+  (snoc8 (snoc8 (snoc8 (snoc8 out (add 240 (div cp 262144)))
+    (add 128 (mod (div cp 4096) 64))) (add 128 (mod (div cp 64) 64)))
+    (add 128 (mod cp 64)))
++  hex4
+  '  Four hex digits from the front: the codepoint and tail, or .none.
+  \  s=nat
+  ^  maybe[[cp=nat rest=nat]]
+  |  > i=nat 0  > r=nat s  > acc=nat 0
+  ^  maybe[[cp=nat rest=nat]]
+  ?  (eq i 4)
+     (./some [acc r])
+  =  v  (hexv (mod r 256))
+  ?  (eq v 16)
+     .none
+  (_ i.inc (div r 256) (add (mul acc 16) v))
++  esc2
+  '  Append a two-byte escape: backslash then b.
+  \  out=nat b=nat
+  ^  nat
+  (snoc8 (snoc8 out 92) b)
++  p_str
+  '  A string, from its opening quote.
+  \  s=nat
+  ^  jres
+  =  s0  (div s 256)
+  |  > r=nat s0  > out=nat 0
+  ^  jres
+  =  c  (mod r 256)
+  ?  (eq c 0)
+     (jres/err "unterminated-string" r)
+  ?  (eq c 34)
+     (jres/ok (json/str out) (div r 256))
+  ?  (lt c 32)
+     (jres/err "control-in-string" r)
+  ?  (eq c 92)
+     =  e   (mod (div r 256) 256)
+     =  r2  (div r 65536)
+     ?  (eq e 34)
+        (_ r2 (snoc8 out 34))
+     ?  (eq e 92)
+        (_ r2 (snoc8 out 92))
+     ?  (eq e "/")
+        (_ r2 (snoc8 out "/"))
+     ?  (eq e "b")
+        (_ r2 (snoc8 out 8))
+     ?  (eq e "f")
+        (_ r2 (snoc8 out 12))
+     ?  (eq e "n")
+        (_ r2 (snoc8 out 10))
+     ?  (eq e "r")
+        (_ r2 (snoc8 out 13))
+     ?  (eq e "t")
+        (_ r2 (snoc8 out 9))
+     ?  (eq e "u")
+        ?  (hex4 r2)
+         > .none  (jres/err "bad-unicode-escape" r2)
+         > (./some h1)
+           =  [cp=nat r3=nat]  h1
+           ?  (eq cp 0)
+              (jres/err "nul-in-string" r2)
+           ?  (lt cp 55296)
+              (_ r3 (utf8 out cp))
+           ?  (gt cp 57343)
+              (_ r3 (utf8 out cp))
+           ?  (gt cp 56319)
+              (jres/err "lone-low-surrogate" r2)
+           ?  (eq 92 (mod r3 256))
+              ?  (eq "u" (mod (div r3 256) 256))
+                 ?  (hex4 (div r3 65536))
+                  > .none  (jres/err "bad-unicode-escape" r3)
+                  > (./some h2)
+                    =  [lo=nat r5=nat]  h2
+                    ?  (lt lo 56320)
+                       (jres/err "bad-surrogate-pair" r3)
+                    ?  (gt lo 57343)
+                       (jres/err "bad-surrogate-pair" r3)
+                    (_ r5 (utf8 out
+                      (add 65536 (add (mul (sub cp 55296) 1024) (sub lo 56320)))))
+              (jres/err "lone-high-surrogate" r3)
+           (jres/err "lone-high-surrogate" r3)
+     (jres/err "bad-escape" r)
+  (_ (div r 256) (snoc8 out c))
++  p_num
+  \  s=nat
+  ^  jres
+  =  neg
+       ?  (eq "-" (mod s 256))
+          .true
+       .false
+  =  s1
+       ?  neg
+          (div s 256)
+       s
+  ?  (digit (mod s1 256))
+     |  > r=nat s1  > n=nat 0
+     ^  jres
+     =  c  (mod r 256)
+     ?  (digit c)
+        (_ (div r 256) (add (mul n 10) (sub c "0")))
+     ?  (eq c ".")
+        (jres/err "float-todo" r)
+     ?  (eq c "e")
+        (jres/err "float-todo" r)
+     ?  (eq c "E")
+        (jres/err "float-todo" r)
+     (jres/ok (json/num neg n) r)
+  (jres/err "bad-number" s)
++  p_arr
+  '  Array elements, from just past the opening bracket.
+  \  s=nat
+  ^  jres
+  =  s0  (ws s)
+  ?  (eq "]" (mod s0 256))
+     (jres/ok (json/arr []) (div s0 256))
+  |  > r=nat s0  > xs=row[json] []
+  ^  jres
+  ?  (p_val r)
+   > (./err why=nat rest=nat)  (jres/err why rest)
+   > (./ok v=json rest=nat)
+     =  s1  (ws rest)
+     =  c   (mod s1 256)
+     ?  (eq c ",")
+        (_ (ws (div s1 256)) xs.snoc(v))
+     ?  (eq c "]")
+        (jres/ok (json/arr xs.snoc(v)) (div s1 256))
+     (jres/err "expected-comma-or-bracket" s1)
++  p_obj
+  '  Object members, from just past the opening brace.
+  \  s=nat
+  ^  jres
+  =  s0  (ws s)
+  ?  (eq "}" (mod s0 256))
+     (jres/ok (json/obj []) (div s0 256))
+  |  > r=nat s0  > kvs=row[jkv] []
+  ^  jres
+  ?  (eq 34 (mod r 256))
+     ?  (p_str r)
+      > (./err why=nat rest=nat)  (jres/err why rest)
+      > (./ok kv=json rest=nat)
+        =  key
+             ?  kv
+              > kt=json/str  kt.s
+             0
+        =  s1  (ws rest)
+        ?  (eq ":" (mod s1 256))
+           ?  (p_val (ws (div s1 256)))
+            > (./err why2=nat rest2=nat)  (jres/err why2 rest2)
+            > (./ok v=json rest2=nat)
+              =  s2  (ws rest2)
+              =  c   (mod s2 256)
+              ?  (eq c ",")
+                 (_ (ws (div s2 256)) kvs.snoc((jkv key v)))
+              ?  (eq c "}")
+                 (jres/ok (json/obj kvs.snoc((jkv key v))) (div s2 256))
+              (jres/err "expected-comma-or-brace" s2)
+        (jres/err "expected-colon" s1)
+  (jres/err "expected-key" r)
++  p_val
+  \  s=nat
+  ^  jres
+  =  c  (mod s 256)
+  ?  (eq c "{")
+     (p_obj (div s 256))
+  ?  (eq c "[")
+     (p_arr (div s 256))
+  ?  (eq c 34)
+     (p_str s)
+  ?  (eq c "t")
+     ?  (lit "true" s)
+      > (./some r1)  (jres/ok (json/boo .true) r1)
+      > .none  (jres/err "bad-literal" s)
+  ?  (eq c "f")
+     ?  (lit "false" s)
+      > (./some r2)  (jres/ok (json/boo .false) r2)
+      > .none  (jres/err "bad-literal" s)
+  ?  (eq c "n")
+     ?  (lit "null" s)
+      > (./some r3)  (jres/ok jnull r3)
+      > .none  (jres/err "bad-literal" s)
+  ?  (eq c "-")
+     (p_num s)
+  ?  (digit c)
+     (p_num s)
+  (jres/err "unexpected-byte" s)
++  parse
+  '  Decode one complete document: surrounding whitespace allowed,
+  '  trailing garbage is an error.
+  \  s=nat
+  ^  jres
+  ?  (p_val (ws s))
+   > (./err why=nat rest=nat)  (jres/err why rest)
+   > (./ok v=json rest=nat)
+     ?  (eq 0 (ws rest))
+        (jres/ok v 0)
+     (jres/err "trailing-garbage" rest)
++  show_str
+  \  s=nat
+  ^  nat
+  =  body
+       |  > r=nat s  > out=nat 0
+       ?  (eq r 0)
+          out
+       =  c  (mod r 256)
+       ?  (eq c 34)
+          (_ (div r 256) (esc2 out 34))
+       ?  (eq c 92)
+          (_ (div r 256) (esc2 out 92))
+       ?  (lt c 32)
+          ?  (eq c 10)
+             (_ (div r 256) (esc2 out "n"))
+          ?  (eq c 9)
+             (_ (div r 256) (esc2 out "t"))
+          ?  (eq c 13)
+             (_ (div r 256) (esc2 out "r"))
+          (_ (div r 256)
+             (cat2 (cat2 (esc2 out "u") "00") (hex2 c)))
+       (_ (div r 256) (snoc8 out c))
+  (snoc8 (cat2 34 body) 34)
++  show
+  '  Encode compactly.
+  \  v=json
+  ^  nat
+  ?  v
+   > b=json/boo
+     ?  b.b
+        "true"
+     "false"
+   > x=json/num
+     ?  x.neg
+        (cat2 "-" (show_nat x.n))
+     (show_nat x.n)
+   > t=json/str  (show_str t.s)
+   > a=json/arr
+     =  parts
+          |  > i=nat 0  > out=nat "["
+          ?  (eq i a.xs.len)
+             out
+          =  piece  (show a.xs.at(i))
+          ?  (eq i 0)
+             (_ i.inc (cat2 out piece))
+          (_ i.inc (cat2 (cat2 out ",") piece))
+     (cat2 parts "]")
+   > o=json/obj
+     =  parts
+          |  > i=nat 0  > out=nat "{"
+          ?  (eq i o.kvs.len)
+             out
+          =  e  o.kvs.at(i)
+          =  piece  (cat2 (cat2 (show_str e.k) ":") (show e.v))
+          ?  (eq i 0)
+             (_ i.inc (cat2 out piece))
+          (_ i.inc (cat2 (cat2 out ",") piece))
+     (cat2 parts "}")
+   "null"
++  rt
+  '  Decode then re-encode: the canonical spelling, or the failure's
+  '  why.  The doctest surface.
+  '  ?=  ((rt "[1, 2, 3]") "[1,2,3]")
+  '  ?=  ((rt " null ") "null")
+  '  ?=  ((rt "[true, false, [-5], []]") "[true,false,[-5],[]]")
+  '  ?=  ((rt "12") "12")
+  '  ?=  ((rt "1.5") "float-todo")
+  '  ?=  ((rt "[1") "expected-comma-or-bracket")
+  \  s=nat
+  ^  nat
+  ?  (parse s)
+   > (./ok v=json rest=nat)  (show v)
+   > (./err why=nat rest=nat)  why
