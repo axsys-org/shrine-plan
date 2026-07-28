@@ -1,0 +1,104 @@
+# The parallel test gate over ONE shared build cache.
+#
+#   x/check          # full gate (includes helm-tests, the long pole)
+#   x/check --fast   # skip helm-tests
+#   x/check --fresh  # discard the cached template first
+#
+# The template snapshot stages boot + stdlib + the WHOLE compiled test
+# corpus (foil-corpus-helm forces the sept..helmapp chain), keyed by a
+# hash of src/ — so the corpus compiles once per source state and every
+# suite group (and every later x/check on unchanged sources) starts
+# with the world already built.  Suites read their subjects from the
+# foil-corpus-* tiers, so a warm template makes their compiles hits.
+#
+# Groups then run as parallel PROCESSES on snapshot copies: each gets
+# its own canon arena and Save (one group aborting cannot corrupt
+# another), and a fresh template per source state sidesteps the module
+# cache's dep-blindness.  Verdicts grep each log for ERROR — exit
+# codes lie (memory: pristine-snapshot-capture).
+
+set -e
+
+FAST=""; FRESH=""
+for a in "$@"; do
+  case "$a" in
+    --fast) FAST=1 ;;
+    --fresh) FRESH=1 ;;
+  esac
+done
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WISP="$(command -v wisp || echo "$ROOT/wisp")"
+if [ ! -x "$WISP" ]; then
+  echo "x/check: no wisp on PATH and no $ROOT/wisp" >&2
+  exit 2
+fi
+DIR="$ROOT/.check"
+mkdir -p "$DIR"
+
+HASH="$(find "$ROOT/src" -type f \( -name '*.rvr' -o -name '*.foil' -o -name '*.plan' \) -print0 \
+  | xargs -0 shasum | sort | shasum | cut -c1-16)"
+TPL="$DIR/template-$HASH"
+
+if [ -n "$FRESH" ]; then rm -rf "$TPL"; fi
+
+if [ ! -e "$TPL/data.mdb" ]; then
+  echo "x/check: staging template $HASH (boot + stdlib + corpus)" >&2
+  rm -rf "$DIR"/template-* "$DIR/stage"
+  mkdir -p "$DIR/stage"
+  cd "$DIR/stage"
+  "$WISP" --file-root "$ROOT/src" "$ROOT/src/plan" reaver main > boot.log 2>&1
+  "$WISP" --file-root "$ROOT/src" snap root _ > stage1.log 2>&1 <<'EOF'
+(#bind std (#module std))
+(#import std)
+::*rex
+EOF
+  "$WISP" --file-root "$ROOT/src" snap root _ > stage2.log 2>&1 <<'EOF'
+(#bind quip (#module quip))
+EOF
+  "$WISP" --file-root "$ROOT/src" snap root _ > stage3.log 2>&1 <<'EOF'
+(#bind corpus (#module foil-corpus-helm))
+EOF
+  if grep -aq 'ERROR' stage3.log; then
+    echo "x/check: corpus staging FAILED (see $DIR/stage/stage3.log)" >&2
+    exit 1
+  fi
+  mkdir -p "$TPL"
+  cp snap/data.mdb snap/pins.pack "$TPL/"
+fi
+
+# group <name> <suite> [<suite>...]
+group () {
+  name="$1"; shift
+  gdir="$DIR/g-$name"
+  rm -rf "$gdir"
+  mkdir -p "$gdir/snap"
+  cp "$TPL/data.mdb" "$TPL/pins.pack" "$gdir/snap/"
+  {
+    for s in "$@"; do echo "(#bind $s (#module $s))"; done
+  } > "$gdir/input"
+  ( cd "$gdir" && "$WISP" --file-root "$ROOT/src" snap root _ < input > out.log 2>&1
+    if grep -aq 'ERROR' out.log; then echo "FAIL" > verdict; else echo "ok" > verdict; fi ) &
+}
+
+group core foil-sast-tests foil-new-types-tests foil-new-elab-tests \
+  foil-types-tests foil-subject-tests typed-reaver-tests \
+  foil-env-tests foil-relocate-tests foil-provenance-tests \
+  foil-env-integration-tests foil-integration-tests
+group exec foil-exec-tests foil-bst-tests
+group corpus foil-sept-tests foil-shrine-tests foil-weft-tests foil-tyshow-tests
+group lain foil-lain-tests foil-life-tests
+group helmapp foil-helm-tests
+if [ -z "$FAST" ]; then
+  group helmrt helm-tests
+fi
+
+wait
+
+fail=0
+for g in "$DIR"/g-*; do
+  v="$(cat "$g/verdict" 2>/dev/null || echo FAIL)"
+  printf '%-10s %s\n' "$(basename "$g" | sed 's/^g-//')" "$v"
+  [ "$v" = "ok" ] || fail=1
+done
+exit $fail
