@@ -2,13 +2,12 @@
 ;;;; SPDX-License-Identifier: MIT
 ;;;; See LICENSE for full terms.
 
-;;;; schemagen: JSON schema -> foil types + serde, compiled without a
-;;;; source file.  The schema (parsed by json.foil) maps to a typedef
-;;;; IR, the IR emits foil source TEXT as an in-memory cord, and the
-;;;; text feeds rex:ParseRexNormFile -> foil:compile-rex.  Text, not a
-;;;; hand-built rex tree, because foil layout IS structure: member
-;;;; nesting and block splitting live in span columns/offsets, and the
-;;;; only correct span synthesizer in the tree is the parser itself.
+;;;; schemagen: JSON schema -> foil types + serde, compiled with no
+;;;; source text at all.  The schema (parsed by json.foil) maps to a
+;;;; typedef IR, the IR emits NORMALIZED REX directly (Leaf/Nest/Juxt
+;;;; with inert zero spans — the structure refactor made spans pure
+;;;; diagnostics), and the tree feeds foil:compile-rex.  A human view
+;;;; is a printer concern, not a compilation artifact.
 ;;;;
 ;;;; v1 subset: records (object + required/optional -> maybe), string/
 ;;;; integer/boolean fields, arrays of prims/refs, #/$defs/<n> refs
@@ -78,10 +77,6 @@
 
 (define (dedupe-eq xs)
   (foldl (lambda (acc x) (If (includes (Eq x) acc) acc (snoc x acc))) [] xs))
-
-(define (join-sp xs)
-  (Ifz (Sz xs) ""
-    (foldl (lambda (acc x) (strcat [acc " " x])) (_0 xs) (drop 1 xs))))
 
 (define (nat-str n)
   (If (Lt n 10) (Add "0" n)
@@ -204,32 +199,13 @@
     (sg-error "duplicate-type-name" names)
     [root-name (sg-topo tds)]))
 
-;;; Emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;; Lines are [col text]; sg-render joins them with real newlines.
-;;; Indent discipline lifted from json.foil: member bodies at +2 per
-;;; nest, bool-? then at +3 / else at ? col, match-? arms at +1 with
-;;; arm blocks at +2, `=` value blocks at +5.
+;;; Shared naming ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define sg-nl 10)
 (define sg-q 34)
 
-(define (sg-sp n) (strcat (gen n (lambda (i) " "))))
-
-(define (sg-render lines)
-  (strcat (map (lambda (l) (strcat [(sg-sp (Ix 0 l)) (Ix 1 l) sg-nl]))
-            lines)))
-
+;; Quote for embedding inside doctest lore text (the doctest runner
+;; re-parses the ?= expression, so its cords need real quote bytes).
 (define (qq s) (strcat [sg-q s sg-q]))
-
-;; foil type text of an ftype (req wraps happen at use sites).
-(define (sg-ft-ty ft)
-  (cond
-    ((Eq "str" (_0 ft)) "nat")
-    ((Eq "int" (_0 ft)) "nat")
-    ((Eq "bool" (_0 ft)) "bool")
-    ((Eq "ref" (_0 ft)) (Ix 1 ft))
-    ((Eq "row" (_0 ft)) (strcat ["row[" (sg-ft-ty (Ix 1 ft)) "]"]))))
 
 ;; helper-name suffix of an ftype.
 (define (sg-ft-key ft)
@@ -253,297 +229,6 @@
     (strcat [(Ix 1 ft) "_from"])
     (strcat ["d_val_" (sg-ft-key ft)])))
 
-;; A tiny result-sum decl: ok holds v=<vty>.
-(define (sg-sum-lines name vty)
-  [[0 (strcat ["+  " name])]
-   [2 (strcat ["&  " name "/ok"])]
-   [5 (strcat [name "/err"])]
-   [2 "+  ok"]
-   [4 (strcat [":  v=" vty])]
-   [2 "+  err"]
-   [4 ":  path=nat why=nat"]])
-
-;; d_val_<key> for a non-ref ftype: json value -> r_<key>.
-(define (sg-dval-lines ft)
-  (define key (sg-ft-key ft))
-  (define rs (strcat ["r_" key]))
-  (define head
-    [[0 (strcat ["+  d_val_" key])]
-     [2 "\  j=json p=nat"]
-     [2 (strcat ["^  " rs])]])
-  (cond
-    ((Eq "str" (_0 ft))
-      (Weld head
-        [[2 "?  j"]
-         [3 (strcat ["> t=json/str  (" rs "/ok t.s)"])]
-         [3 (strcat ["(" rs "/err p " (qq "expected-string") ")"])]]))
-    ((Eq "int" (_0 ft))
-      (Weld head
-        [[2 "?  j"]
-         [3 "> t=json/num"]
-         [5 "?  t.neg"]
-         [8 (strcat ["(" rs "/err p " (qq "negative") ")"])]
-         [5 (strcat ["(" rs "/ok t.n)"])]
-         [3 (strcat ["(" rs "/err p " (qq "expected-integer") ")"])]]))
-    ((Eq "bool" (_0 ft))
-      (Weld head
-        [[2 "?  j"]
-         [3 (strcat ["> t=json/boo  (" rs "/ok t.b)"])]
-         [3 (strcat ["(" rs "/err p " (qq "expected-boolean") ")"])]]))
-    ((Eq "row" (_0 ft))
-      (let* ((et (Ix 1 ft))
-             (ety (sg-ft-ty et))
-             (edv (sg-ft-dval et)))
-        (Weld head
-          [[2 "?  j"]
-           [3 "> t=json/arr"]
-           [5 (strcat ["|  > i=nat 0  > out=row[" ety "] []"])]
-           [5 (strcat ["^  " rs])]
-           [5 "?  (eq i t.xs.len)"]
-           [8 (strcat ["(" rs "/ok out)"])]
-           [5 (strcat ["?  (" edv " t.xs.at(i) (jidx p i))"])]
-           [6 (strcat ["> (./err path=nat why=nat)  (" rs "/err path why)"])]
-           [6 (strcat ["> (./ok v=" ety ")  (_ i.inc out.snoc(v))"])]
-           [3 (strcat ["(" rs "/err p " (qq "expected-array") ")"])]])))
-    (else (sg-error "dval-of-ref" ft))))
-
-;; d_req_<key>: maybe[json] -> the bare result sum.
-(define (sg-dreq-lines ft)
-  (define key (sg-ft-key ft))
-  (define rs (sg-ft-rsum ft))
-  (define dv (sg-ft-dval ft))
-  [[0 (strcat ["+  d_req_" key])]
-   [2 "\  m=maybe[json] p=nat"]
-   [2 (strcat ["^  " rs])]
-   [2 "?  m"]
-   [3 (strcat ["> .none  (" rs "/err p " (qq "missing") ")"])]
-   [3 (strcat ["> (./some j)  (" dv " j p)"])]])
-
-;; r_o_<key> + d_opt_<key>: maybe[json] -> ok v=maybe[<ty>].
-(define (sg-dopt-lines ft)
-  (define key (sg-ft-key ft))
-  (define ty (sg-ft-ty ft))
-  (define ors (strcat ["r_o_" key]))
-  (define dv (sg-ft-dval ft))
-  (Weld (sg-sum-lines ors (strcat ["maybe[" ty "]"]))
-    [[0 (strcat ["+  d_opt_" key])]
-     [2 "\  m=maybe[json] p=nat"]
-     [2 (strcat ["^  " ors])]
-     [2 "?  m"]
-     [3 (strcat ["> .none  (" ors "/ok .none)"])]
-     [3 "> (./some j)"]
-     [5 (strcat ["?  (" dv " j p)"])]
-     [6 (strcat ["> (./err path=nat why=nat)  (" ors "/err path why)"])]
-     [6 (strcat ["> (./ok v=" ty ")  (" ors "/ok (./some v))"])]]))
-
-;; Helper members for one field use, emitted once per (part, key):
-;; "v:" = r_<key> sum + d_val (non-ref only), "q:" = d_req, "o:" =
-;; r_o_<key> + d_opt.  seen carries the emitted part tags across the
-;; whole module — peer needing d_req_int must not rob task of d_opt_int.
-(define (sg-part-lines seen ft req opt)
-  (define key (sg-ft-key ft))
-  (define is-ref (Eq "ref" (_0 ft)))
-  (define (add tag emit st)
-    (let ((tagk (strcat [tag key])))
-      (If (includes (Eq tagk) (_0 st)) st
-        [(snoc tagk (_0 st)) (Weld (_1 st) (emit 0))])))
-  (define st0 [seen []])
-  (define st1
-    (Ifz is-ref
-      (add "v:"
-        (lambda (z)
-          (Weld (sg-sum-lines (strcat ["r_" key]) (sg-ft-ty ft))
-            (sg-dval-lines ft)))
-        st0)
-      st0))
-  (define st2 (Ifz req st1 (add "q:" (lambda (z) (sg-dreq-lines ft)) st1)))
-  (Ifz opt st2 (add "o:" (lambda (z) (sg-dopt-lines ft)) st2)))
-
-;;; Per-typedef emission ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(define (sg-rec-decl-lines name fields)
-  (define fts
-    (map (lambda (f)
-           (let ((ty (sg-ft-ty (Ix 1 f))))
-             (strcat [(Ix 0 f) "="
-                      (If (Ix 2 f) ty (strcat ["maybe[" ty "]"]))])))
-      fields))
-  [[0 (strcat ["+  " name])]
-   [2 (strcat [":  " (join-sp fts)])]])
-
-;; The decode chain: one d_req/d_opt match per field, each continuation
-;; three columns deeper (arm col +2, body +1 relative to the ? col).
-(define (sg-rec-from-lines name fields)
-  (define rsum (strcat [name "_r"]))
-  (define n (Sz fields))
-  (define (chain i col)
-    (If (Eq i n)
-      [[col (strcat ["(" rsum "/ok (" name " "
-                     (join-sp (map (lambda (k) (strcat ["v" (nat-str k)]))
-                                (gen n (lambda (k) k))))
-                     "))"])]]
-      (let* ((f (Ix i fields))
-             (fname (Ix 0 f))
-             (ft (Ix 1 f))
-             (req (Ix 2 f))
-             (dfn (strcat [(If req "d_req_" "d_opt_") (sg-ft-key ft)]))
-             (vty (If req (sg-ft-ty ft)
-                      (strcat ["maybe[" (sg-ft-ty ft) "]"])))
-             (ix (nat-str i)))
-        (Weld
-          [[col (strcat ["?  (" dfn " (jget " (qq fname) " o.kvs)"
-                         " (jpath p " (qq fname) "))"])]
-           [(Inc col) (strcat ["> (./err path" ix "=nat why" ix "=nat)  ("
-                               rsum "/err path" ix " why" ix ")"])]
-           [(Inc col) (strcat ["> (./ok v" ix "=" vty ")"])]]
-          (chain (Inc i) (Add col 3))))))
-  (Weld
-    [[0 (strcat ["+  " name "_from"])]
-     [2 (strcat ["'  Decode a " name " from a json value; p is the"])]
-     [2 "'  breadcrumb prefix."]
-     [2 "\  v=json p=nat"]
-     [2 (strcat ["^  " rsum])]
-     [2 "?  v"]
-     [3 "> o=json/obj"]]
-    (Weld (chain 0 5)
-      [[3 (strcat ["(" rsum "/err p " (qq "expected-object") ")"])]])))
-
-;; Encode one field value expression (access exp is already typed bare).
-;; -> [pre-lines expr]: rows/optionals need a bound intermediate.
-(define (sg-enc-of ft exp)
-  (cond
-    ((Eq "str" (_0 ft)) (strcat ["(json/str " exp ")"]))
-    ((Eq "int" (_0 ft)) (strcat ["(json/num .false " exp ")"]))
-    ((Eq "bool" (_0 ft)) (strcat ["(json/boo " exp ")"]))
-    ((Eq "ref" (_0 ft)) (strcat ["(" (Ix 1 ft) "_to " exp ")"]))
-    (else (sg-error "enc-of-row-inline" ft))))
-
-(define (sg-rec-to-lines name fields)
-  (define n (Sz fields))
-  (define (field-lines i)
-    (define f (Ix i fields))
-    (define fname (Ix 0 f))
-    (define ft (Ix 1 f))
-    (define req (Ix 2 f))
-    (define ix (nat-str i))
-    (define acc0 (strcat ["k" (nat-str i)]))
-    (define acc1 (strcat ["k" (nat-str (Inc i))]))
-    (define is-row (Eq "row" (_0 ft)))
-    (define (row-loop-lines col outv src et)
-      ;; a row[json] from src's elements
-      [[col (strcat ["|  > i" ix "=nat 0  > " outv "=row[json] []"])]
-       [col (strcat ["?  (eq i" ix " " src ".len)"])]
-       [(Add col 3) outv]
-       [col (strcat ["(_ i" ix ".inc " outv ".snoc("
-                     (sg-enc-of et (strcat [src ".at(i" ix ")"])) "))"])]])
-    (If req
-      (If is-row
-        (Weld
-          (Weld [[2 (strcat ["=  a" ix])]]
-            (row-loop-lines 7 (strcat ["b" ix])
-              (strcat ["x." fname]) (Ix 1 ft)))
-          [[2 (strcat ["=  " acc1 "  " acc0 ".snoc((jkv " (qq fname)
-                       " (json/arr a" ix ")))"])]])
-        [[2 (strcat ["=  " acc1 "  " acc0 ".snoc((jkv " (qq fname) " "
-                     (sg-enc-of ft (strcat ["x." fname])) "))"])]])
-      ;; optional: match the maybe; absent key stays absent
-      (If is-row
-        (Weld
-          [[2 (strcat ["=  " acc1])]
-           [7 (strcat ["?  x." fname])]
-           [8 (strcat ["> .none  " acc0])]
-           [8 (strcat ["> (./some w" ix ")"])]]
-          (Weld
-            (Weld [[10 (strcat ["=  a" ix])]]
-              (row-loop-lines 15 (strcat ["b" ix]) (strcat ["w" ix]) (Ix 1 ft)))
-            [[10 (strcat [acc0 ".snoc((jkv " (qq fname) " (json/arr a" ix ")))"])]]))
-        [[2 (strcat ["=  " acc1])]
-         [7 (strcat ["?  x." fname])]
-         [8 (strcat ["> .none  " acc0])]
-         [8 (strcat ["> (./some w" ix ")  " acc0 ".snoc((jkv " (qq fname) " "
-                     (sg-enc-of ft (strcat ["w" ix])) "))"])]])))
-  (Weld
-    (Weld
-      [[0 (strcat ["+  " name "_to"])]
-       [2 (strcat ["\  x=" name])]
-       [2 "^  json"]
-       [2 "=  k0  []"]]
-      (foldl (lambda (acc i) (Weld acc (field-lines i))) []
-        (gen n (lambda (i) i))))
-    [[2 (strcat ["(json/obj k" (nat-str n) ")"])]]))
-
-(define (sg-enum-decl-lines name vals)
-  (Weld
-    (Weld
-      [[0 (strcat ["+  " name])]
-       [2 (strcat ["&  " name "/" (_0 vals)])]]
-      (map (lambda (v) [5 (strcat [name "/" v])]) (drop 1 vals)))
-    (foldl (lambda (acc v)
-             (Weld acc
-               [[2 (strcat ["+  " v])]
-                [4 ":  z=nat"]]))
-      [] vals)))
-
-(define (sg-enum-from-lines name vals)
-  (define rsum (strcat [name "_r"]))
-  (Weld
-    (Weld
-      [[0 (strcat ["+  " name "_from"])]
-       [2 "\  v=json p=nat"]
-       [2 (strcat ["^  " rsum])]
-       [2 "?  v"]
-       [3 "> t=json/str"]]
-      (foldl (lambda (acc v)
-               (Weld acc
-                 [[5 (strcat ["?  (eq t.s " (qq v) ")"])]
-                  [8 (strcat ["(" rsum "/ok (" name "/" v " 0))"])]]))
-        [] vals))
-    [[5 (strcat ["(" rsum "/err p " (qq "bad-enum") ")"])]
-     [3 (strcat ["(" rsum "/err p " (qq "expected-string") ")"])]]))
-
-(define (sg-enum-to-lines name vals)
-  (Weld
-    [[0 (strcat ["+  " name "_to"])]
-     [2 (strcat ["\  x=" name])]
-     [2 "^  json"]
-     [2 "?  x"]]
-    (Weld
-      (map (lambda (v)
-             [3 (strcat ["> e_" v "=" name "/" v "  (json/str " (qq v) ")"])])
-        vals)
-      [[3 (strcat ["(json/str " (qq (_0 vals)) ")"])]])))
-
-;;; Module assembly ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(define sg-prelude-lines
-  [[0 "-  sept [order=10]"]
-   [0 "-  json [order=20]"]
-   [0 "'  Generated by schemagen.  The schema is the source of truth;"]
-   [0 "'  there is no source file to edit."]
-   [0 "+  jget"]
-   [2 "'  The value at key k, if present."]
-   [2 "\  k=nat kvs=row[jkv]"]
-   [2 "^  maybe[json]"]
-   [2 "|  > i=nat 0"]
-   [2 "^  maybe[json]"]
-   [2 "?  (eq i kvs.len)"]
-   [5 ".none"]
-   [2 "=  e  kvs.at(i)"]
-   [2 "?  (eq e.k k)"]
-   [5 "(./some e.v)"]
-   [2 "(_ i.inc)"]
-   [0 "+  jpath"]
-   [2 "'  Breadcrumb: p.f, or f at the root."]
-   [2 "\  p=nat f=nat"]
-   [2 "^  nat"]
-   [2 "?  (eq p 0)"]
-   [5 "f"]
-   [2 (strcat ["(cat2 (cat2 p " (qq ".") ") f)"])]
-   [0 "+  jidx"]
-   [2 "'  Breadcrumb: p[i]."]
-   [2 "\  p=nat i=nat"]
-   [2 "^  nat"]
-   [2 (strcat ["(cat2 (cat2 (cat2 p " (qq "[") ") (show_nat i)) " (qq "]") ")"])]])
 
 ;; Merge a [ft req opt] use into the per-rec key list, OR-ing modes.
 (define (sg-merge-entry acc ent)
@@ -563,18 +248,394 @@
     [[(Ix 1 ft) 0 0]]
     []))
 
-(define (sg-td-lines seen td)
+;;; Tree emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Emits normalized rex DIRECTLY — Leaf/Nest/Juxt with inert zero
+;;; spans, straight into foil:compile-rex.  Shapes mirror what
+;;; ParseRexNormFile produces for the same source (probe-transcribed);
+;;; the dev oracle was Equal against the span-zapped parse of the text
+;;; emitter's output.
+
+(define nzsp [0 0 0 0])
+(define (nw s) (rex:MakeLeaf nzsp "word" s))
+(define (nc s) (rex:MakeLeaf nzsp "cord" s))
+(define (nrn rune kids) (rex:MakeNest nzsp "clear" rune kids))
+(define (npar kids) (rex:MakeNest nzsp "paren" "" kids))
+(define (nbrk kids) (rex:MakeNest nzsp "brack" "" kids))
+(define (nbrko rune kids) (rex:MakeNest nzsp "brack" rune kids))
+(define (njx kids) (rex:MakeJuxt nzsp kids))
+(define (ngrp kids) (If (Eq 1 (Sz kids)) (_0 kids) (nrn "" kids)))
+
+;; BUG-COMPATIBLE, twice over: the parser's lore-line join writes a
+;; LITERAL backslash-n (rex-unlines-go, rex.rvr:301 — string literals
+;; process no escapes), and DECL-level continuation lines keep a "' "
+;; prefix while top-level ones are stripped.  Match both so generated
+;; lore is indistinguishable from parsed lore; flip in lockstep when
+;; the newline bug is fixed.
+(define (nslug-join sep lines)
+  (rex:MakeLeaf nzsp "slug"
+    (foldl (lambda (acc l)
+             (Ifz acc (strcat [" " l]) (strcat [acc sep l])))
+      0 lines)))
+(define (nslug-top lines) (nslug-join (strcat ["\n" " "]) lines))
+(define (nslug lines) (nslug-join (strcat ["\n" "  '  "]) lines))
+
+(define (npth segs) (nrn "/" (map nw segs)))
+(define (nfc name ty) (nrn "=" [(nw name) ty]))
+(define (ndot a b) (nrn "." [a b]))
+(define (ndotw a b) (ndot (nw a) (nw b)))
+(define (nmeth recv seg args)
+  (nrn "." [recv (njx [(nw seg) (npar args)])]))
+(define (nrelv name) (nrn "." [(nw name)]))
+(define (nrelap name args)
+  (npar (cons (nrn "./" [(nw name)]) args)))
+(define (nspec name args) (njx [(nw name) (nbrk args)]))
+
+;; foil type tree of an ftype.
+(define (sg-ft-ty-t ft)
+  (cond
+    ((Eq "str" (_0 ft)) (nw "nat"))
+    ((Eq "int" (_0 ft)) (nw "nat"))
+    ((Eq "bool" (_0 ft)) (nw "bool"))
+    ((Eq "ref" (_0 ft)) (nw (Ix 1 ft)))
+    ((Eq "row" (_0 ft)) (nspec "row" [(sg-ft-ty-t (Ix 1 ft))]))))
+
+(define (sg-maybe-t ty) (nspec "maybe" [ty]))
+
+;; (name/variant args...) application.
+(define (nvap sum variant args)
+  (npar (cons (npth [sum variant]) args)))
+
+(define (sg-sum-tree name vty)
+  (nrn "+"
+    [(nw name)
+     (nrn "&" [(npth [name "ok"]) (npth [name "err"])])
+     (nrn "+" [(nw "ok") (nrn ":" [(nfc "v" vty)])])
+     (nrn "+" [(nw "err")
+               (nrn ":" [(nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])])]))
+
+(define (sg-dval-tree ft)
+  (define key (sg-ft-key ft))
+  (define rs (strcat ["r_" key]))
+  (define (err why) (nvap rs "err" [(nw "p") (nc why)]))
+  (define (ok v) (nvap rs "ok" [v]))
+  (define body
+    (cond
+      ((Eq "str" (_0 ft))
+        (nrn "?" [(nw "j")
+                  (nrn ">" [(nfc "t" (npth ["json" "str"])) (ok (ndotw "t" "s"))])
+                  (err "expected-string")]))
+      ((Eq "int" (_0 ft))
+        (nrn "?" [(nw "j")
+                  (nrn ">" [(nfc "t" (npth ["json" "num"]))
+                            (nrn "?" [(ndotw "t" "neg") (err "negative")])
+                            (ok (ndotw "t" "n"))])
+                  (err "expected-integer")]))
+      ((Eq "bool" (_0 ft))
+        (nrn "?" [(nw "j")
+                  (nrn ">" [(nfc "t" (npth ["json" "boo"])) (ok (ndotw "t" "b"))])
+                  (err "expected-boolean")]))
+      ((Eq "row" (_0 ft))
+        (let* ((et (Ix 1 ft))
+               (ety (sg-ft-ty-t et))
+               (edv (sg-ft-dval et)))
+          (nrn "?"
+            [(nw "j")
+             (nrn ">"
+               [(nfc "t" (npth ["json" "arr"]))
+                ;; one-line arm chains: the second > rides as a kid
+                ;; of the first (loop-arm-chain unchains them)
+                (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
+                                    (nrn ">" [(nfc "out" (nspec "row" [ety]))
+                                              (nbrk [])])])])
+                (nrn "^" [(nw rs)])
+                (nrn "?" [(npar [(nw "eq") (nw "i")
+                                 (nrn "." [(nw "t") (nw "xs") (nw "len")])])
+                          (ok (nw "out"))])
+                (nrn "?"
+                  [(npar [(nw edv)
+                          (nrn "." [(nw "t") (nw "xs")
+                                    (njx [(nw "at") (npar [(nw "i")])])])
+                          (npar [(nw "jidx") (nw "p") (nw "i")])])
+                   (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                                    (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                             (nvap rs "err" [(nw "path") (nw "why")])])
+                   (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ety)])
+                             (npar [(nw "_") (ndotw "i" "inc")
+                                    (nmeth (nw "out") "snoc" [(nw "v")])])])])])
+             (err "expected-array")])))
+      (else (sg-error "dval-of-ref" ft))))
+  (nrn "+"
+    [(nw (strcat ["d_val_" key]))
+     (nrn "\" [(nfc "j" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rs)])
+     body]))
+
+(define (sg-dreq-tree ft)
+  (define key (sg-ft-key ft))
+  (define rs (sg-ft-rsum ft))
+  (define dv (sg-ft-dval ft))
+  (nrn "+"
+    [(nw (strcat ["d_req_" key]))
+     (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rs)])
+     (nrn "?"
+       [(nw "m")
+        (nrn ">" [(nrelv "none") (nvap rs "err" [(nw "p") (nc "missing")])])
+        (nrn ">" [(npar [(nrn "./" [(nw "some")]) (nw "j")])
+                  (npar [(nw dv) (nw "j") (nw "p")])])])]))
+
+(define (sg-dopt-tree ft)
+  (define key (sg-ft-key ft))
+  (define ty (sg-ft-ty-t ft))
+  (define ors (strcat ["r_o_" key]))
+  (define dv (sg-ft-dval ft))
+  [(sg-sum-tree ors (sg-maybe-t ty))
+   (nrn "+"
+     [(nw (strcat ["d_opt_" key]))
+      (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "nat"))])
+      (nrn "^" [(nw ors)])
+      (nrn "?"
+        [(nw "m")
+         (nrn ">" [(nrelv "none") (nvap ors "ok" [(nrelv "none")])])
+         (nrn ">"
+           [(npar [(nrn "./" [(nw "some")]) (nw "j")])
+            (nrn "?"
+              [(npar [(nw dv) (nw "j") (nw "p")])
+               (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                                (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                         (nvap ors "err" [(nw "path") (nw "why")])])
+               (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ty)])
+                         (nvap ors "ok" [(nrelap "some" [(nw "v")])])])])])])])])
+
+;; Helper members for one field use, emitted once per (part, key).
+(define (sg-part-trees seen ft req opt)
+  (define key (sg-ft-key ft))
+  (define is-ref (Eq "ref" (_0 ft)))
+  (define (add tag emit st)
+    (let ((tagk (strcat [tag key])))
+      (If (includes (Eq tagk) (_0 st)) st
+        [(snoc tagk (_0 st)) (Weld (_1 st) (emit 0))])))
+  (define st0 [seen []])
+  (define st1
+    (Ifz is-ref
+      (add "v:"
+        (lambda (z)
+          [(sg-sum-tree (strcat ["r_" key]) (sg-ft-ty-t ft))
+           (sg-dval-tree ft)])
+        st0)
+      st0))
+  (define st2 (Ifz req st1 (add "q:" (lambda (z) [(sg-dreq-tree ft)]) st1)))
+  (Ifz opt st2 (add "o:" (lambda (z) (sg-dopt-tree ft)) st2)))
+
+(define (sg-rec-decl-tree name fields)
+  (nrn "+"
+    [(nw name)
+     (nrn ":"
+       (map (lambda (f)
+              (let ((ty (sg-ft-ty-t (Ix 1 f))))
+                (nfc (Ix 0 f) (If (Ix 2 f) ty (sg-maybe-t ty)))))
+         fields))]))
+
+(define (sg-rec-from-tree name fields)
+  (define rsum (strcat [name "_r"]))
+  (define n (Sz fields))
+  (define (chain i)
+    (If (Eq i n)
+      (nvap rsum "ok"
+        [(npar (cons (nw name)
+                 (map (lambda (k) (nw (strcat ["v" (nat-str k)])))
+                   (gen n (lambda (k) k)))))])
+      (let* ((f (Ix i fields))
+             (fname (Ix 0 f))
+             (ft (Ix 1 f))
+             (req (Ix 2 f))
+             (dfn (strcat [(If req "d_req_" "d_opt_") (sg-ft-key ft)]))
+             (vty (If req (sg-ft-ty-t ft) (sg-maybe-t (sg-ft-ty-t ft))))
+             (ix (nat-str i)))
+        (nrn "?"
+          [(npar [(nw dfn)
+                  (npar [(nw "jget") (nc fname) (ndotw "o" "kvs")])
+                  (npar [(nw "jpath") (nw "p") (nc fname)])])
+           (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                            (nfc (strcat ["path" ix]) (nw "nat"))
+                            (nfc (strcat ["why" ix]) (nw "nat"))])
+                     (nvap rsum "err"
+                       [(nw (strcat ["path" ix])) (nw (strcat ["why" ix]))])])
+           (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                            (nfc (strcat ["v" ix]) vty)])
+                     (chain (Inc i))])]))))
+  (nrn "+"
+    [(nw (strcat [name "_from"]))
+     (nslug [(strcat ["Decode a " name " from a json value; p is the"])
+             "breadcrumb prefix."])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(nw "v")
+        (nrn ">" [(nfc "o" (npth ["json" "obj"])) (chain 0)])
+        (nvap rsum "err" [(nw "p") (nc "expected-object")])])]))
+
+;; Encode one field value expression.
+(define (sg-enc-t ft exp)
+  (cond
+    ((Eq "str" (_0 ft)) (npar [(npth ["json" "str"]) exp]))
+    ((Eq "int" (_0 ft)) (npar [(npth ["json" "num"]) (nrelv "false") exp]))
+    ((Eq "bool" (_0 ft)) (npar [(npth ["json" "boo"]) exp]))
+    ((Eq "ref" (_0 ft)) (npar [(nw (strcat [(Ix 1 ft) "_to"])) exp]))
+    (else (sg-error "enc-of-row-inline" ft))))
+
+(define (sg-rec-to-tree name fields)
+  (define n (Sz fields))
+  (define (row-loop ix outv src et)
+    ;; a row[json] loop from src's elements
+    [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
+                         (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
+                                   (nbrk [])])])])
+     (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
+                      (nrn "." (snoc (nw "len") src))])
+               (nw outv)])
+     (npar [(nw "_") (ndotw (strcat ["i" ix]) "inc")
+            (nmeth (nw outv) "snoc"
+              [(sg-enc-t et
+                 (nrn "." (snoc (njx [(nw "at") (npar [(nw (strcat ["i" ix]))])])
+                            src)))])])])
+  (define (field-trees i)
+    (define f (Ix i fields))
+    (define fname (Ix 0 f))
+    (define ft (Ix 1 f))
+    (define req (Ix 2 f))
+    (define ix (nat-str i))
+    (define acc0 (strcat ["k" (nat-str i)]))
+    (define acc1 (strcat ["k" (nat-str (Inc i))]))
+    (define is-row (Eq "row" (_0 ft)))
+    (define (snoc-kv enc)
+      (nmeth (nw acc0) "snoc" [(npar [(nw "jkv") (nc fname) enc])]))
+    (If req
+      (If is-row
+        [(nrn "=" [(nw (strcat ["a" ix]))
+                   (ngrp (row-loop ix (strcat ["b" ix])
+                           [(nw "x") (nw fname)] (Ix 1 ft)))])
+         (nrn "=" [(nw acc1)
+                   (snoc-kv (npar [(npth ["json" "arr"]) (nw (strcat ["a" ix]))]))])]
+        [(nrn "=" [(nw acc1) (snoc-kv (sg-enc-t ft (ndotw "x" fname)))])])
+      (If is-row
+        [(nrn "="
+           [(nw acc1)
+            (nrn "?"
+              [(ndotw "x" fname)
+               (nrn ">" [(nrelv "none") (nw acc0)])
+               (nrn ">"
+                 [(npar [(nrn "./" [(nw "some")]) (nw (strcat ["w" ix]))])
+                  (nrn "=" [(nw (strcat ["a" ix]))
+                            (ngrp (row-loop ix (strcat ["b" ix])
+                                    [(nw (strcat ["w" ix]))] (Ix 1 ft)))])
+                  (snoc-kv (npar [(npth ["json" "arr"]) (nw (strcat ["a" ix]))]))])])])]
+        [(nrn "="
+           [(nw acc1)
+            (nrn "?"
+              [(ndotw "x" fname)
+               (nrn ">" [(nrelv "none") (nw acc0)])
+               (nrn ">" [(npar [(nrn "./" [(nw "some")]) (nw (strcat ["w" ix]))])
+                         (snoc-kv (sg-enc-t ft (nw (strcat ["w" ix]))))])])])])))
+  (nrn "+"
+    (Weld
+      [(nw (strcat [name "_to"]))
+       (nrn "\" [(nfc "x" (nw name))])
+       (nrn "^" [(nw "json")])
+       (nrn "=" [(nw "k0") (nbrk [])])]
+      (snoc
+        (npar [(npth ["json" "obj"]) (nw (strcat ["k" (nat-str n)]))])
+        (foldl (lambda (acc i) (Weld acc (field-trees i))) []
+          (gen n (lambda (i) i)))))))
+
+(define (sg-enum-decl-tree name vals)
+  (nrn "+"
+    (Weld
+      [(nw name)
+       (nrn "&" (map (lambda (v) (npth [name v])) vals))]
+      (map (lambda (v)
+             (nrn "+" [(nw v) (nrn ":" [(nfc "z" (nw "nat"))])]))
+        vals))))
+
+(define (sg-enum-from-tree name vals)
+  (define rsum (strcat [name "_r"]))
+  (nrn "+"
+    [(nw (strcat [name "_from"]))
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(nw "v")
+        (nrn ">"
+          (Weld [(nfc "t" (npth ["json" "str"]))]
+            (snoc (nvap rsum "err" [(nw "p") (nc "bad-enum")])
+              (map (lambda (v)
+                     (nrn "?" [(npar [(nw "eq") (ndotw "t" "s") (nc v)])
+                               (nvap rsum "ok" [(nvap name v [(nw "0")])])]))
+                vals))))
+        (nvap rsum "err" [(nw "p") (nc "expected-string")])])]))
+
+(define (sg-enum-to-tree name vals)
+  (nrn "+"
+    [(nw (strcat [name "_to"]))
+     (nrn "\" [(nfc "x" (nw name))])
+     (nrn "^" [(nw "json")])
+     (nrn "?"
+       (Weld
+         (Weld [(nw "x")]
+           (map (lambda (v)
+                  (nrn ">" [(nfc (strcat ["e_" v]) (npth [name v]))
+                            (npar [(npth ["json" "str"]) (nc v)])]))
+             vals))
+         [(npar [(npth ["json" "str"]) (nc (_0 vals))])]))]))
+
+(define sg-prelude-trees
+  [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
+   (nrn "-" [(nw "json") (nbrko "=" [(nw "order") (nw "20")])])
+   (nslug-top ["Generated by schemagen.  The schema is the source of truth;"
+               "there is no source file to edit."])
+   (nrn "+"
+     [(nw "jget")
+      (nslug ["The value at key k, if present."])
+      (nrn "\" [(nfc "k" (nw "nat")) (nfc "kvs" (nspec "row" [(nw "jkv")]))])
+      (nrn "^" [(sg-maybe-t (nw "json"))])
+      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")])])
+      (nrn "^" [(sg-maybe-t (nw "json"))])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "kvs" "len")])
+                (nrelv "none")])
+      (nrn "=" [(nw "e") (nmeth (nw "kvs") "at" [(nw "i")])])
+      (nrn "?" [(npar [(nw "eq") (ndotw "e" "k") (nw "k")])
+                (nrelap "some" [(ndotw "e" "v")])])
+      (npar [(nw "_") (ndotw "i" "inc")])])
+   (nrn "+"
+     [(nw "jpath")
+      (nslug ["Breadcrumb: p.f, or f at the root."])
+      (nrn "\" [(nfc "p" (nw "nat")) (nfc "f" (nw "nat"))])
+      (nrn "^" [(nw "nat")])
+      (nrn "?" [(npar [(nw "eq") (nw "p") (nw "0")]) (nw "f")])
+      (npar [(nw "cat2") (npar [(nw "cat2") (nw "p") (nc ".")]) (nw "f")])])
+   (nrn "+"
+     [(nw "jidx")
+      (nslug ["Breadcrumb: p[i]."])
+      (nrn "\" [(nfc "p" (nw "nat")) (nfc "i" (nw "nat"))])
+      (nrn "^" [(nw "nat")])
+      (npar [(nw "cat2")
+             (npar [(nw "cat2")
+                    (npar [(nw "cat2") (nw "p") (nc "[")])
+                    (npar [(nw "show_nat") (nw "i")])])
+             (nc "]")])])])
+
+(define (sg-td-trees seen td)
   (define kind (_0 td))
   (define name (Ix 1 td))
   (If (Eq "enum" kind)
     (let ((vals (Ix 2 td)))
       [seen
-       (Weld (sg-enum-decl-lines name vals)
-         (Weld (sg-sum-lines (strcat [name "_r"]) name)
-           (Weld (sg-enum-from-lines name vals)
-             (sg-enum-to-lines name vals))))])
+       [(sg-enum-decl-tree name vals)
+        (sg-sum-tree (strcat [name "_r"]) (nw name))
+        (sg-enum-from-tree name vals)
+        (sg-enum-to-tree name vals)]])
     (let* ((fields (Ix 2 td))
-           ;; every key use this rec makes, element d_vals included
            (wanted
              (foldl (lambda (acc f)
                       (foldl sg-merge-entry
@@ -582,75 +643,86 @@
                           [(Ix 1 f) (Ix 2 f) (Nil (Ix 2 f))])
                         (sg-elem-keys (Ix 1 f))))
                [] fields))
-           ;; row keys sort after their element keys (d_val deps)
            (wanted-sorted
              (Weld (filter (lambda (e) (Nil (Eq "row" (_0 (Ix 0 e))))) wanted)
                (filter (lambda (e) (Eq "row" (_0 (Ix 0 e)))) wanted)))
            (hst
              (foldl (lambda (st e)
-                      (let ((r (sg-part-lines (_0 st) (Ix 0 e)
+                      (let ((r (sg-part-trees (_0 st) (Ix 0 e)
                                  (Ix 1 e) (Ix 2 e))))
                         [(_0 r) (Weld (_1 st) (_1 r))]))
                [seen []] wanted-sorted))
            (seen1 (_0 hst))
-           (helper-lines (_1 hst)))
+           (helpers (_1 hst)))
       [seen1
-       (Weld (sg-rec-decl-lines name fields)
-         (Weld (sg-sum-lines (strcat [name "_r"]) name)
-           (Weld helper-lines
-             (Weld (sg-rec-from-lines name fields)
-               (sg-rec-to-lines name fields)))))])))
+       (Weld [(sg-rec-decl-tree name fields)
+              (sg-sum-tree (strcat [name "_r"]) (nw name))]
+         (Weld helpers
+           [(sg-rec-from-tree name fields)
+            (sg-rec-to-tree name fields)]))])))
 
-(define (sg-root-lines root-name examples)
+(define (sg-root-trees root-name examples)
   (define rsum (strcat [root-name "_r"]))
-  (define doctest-lines
-    (map (lambda (ex)
-           [2 (strcat ["'  ?=  ((rt " (qq (dq-escape ex)) ") "
-                       (qq (dq-escape ex)) ")"])])
-      examples))
-  (Weld
-    [[0 (strcat ["+  parse_" root-name])]
-     [2 (strcat ["'  Decode a " root-name " from JSON text."])]
-     [2 "\  s=nat"]
-     [2 (strcat ["^  " rsum])]
-     [2 "?  (parse s)"]
-     [3 (strcat ["> (./err why=nat rest=nat)  (" rsum "/err 0 why)"])]
-     [3 (strcat ["> (./ok v=json rest=nat)  (" root-name "_from v 0)"])]
-     [0 (strcat ["+  show_" root-name])]
-     [2 (strcat ["'  Encode a " root-name " compactly."])]
-     [2 (strcat ["\  x=" root-name])]
-     [2 "^  nat"]
-     [2 (strcat ["(show (" root-name "_to x))"])]
-     [0 "+  rt"]
-     [2 "'  Decode then re-encode: the canonical spelling, or"]
-     [2 "'  path:why on failure.  The doctest surface."]]
-    (Weld doctest-lines
-      [[2 "\  s=nat"]
-       [2 "^  nat"]
-       [2 (strcat ["?  (parse_" root-name " s)"])]
-       [3 "> (./err path=nat why=nat)"]
-       [5 "?  (eq path 0)"]
-       [8 "why"]
-       [5 (strcat ["(cat2 (cat2 path " (qq ":") ") why)"])]
-       [3 (strcat ["> (./ok v=" root-name ")  (show_" root-name " v)"])]])))
+  (define rt-lore
+    (Weld
+      ["Decode then re-encode: the canonical spelling, or"
+       "path:why on failure.  The doctest surface."]
+      (map (lambda (ex)
+             (strcat ["?=  ((rt " (qq (dq-escape ex)) ") "
+                      (qq (dq-escape ex)) ")"]))
+        examples)))
+  [(nrn "+"
+     [(nw (strcat ["parse_" root-name]))
+      (nslug [(strcat ["Decode a " root-name " from JSON text."])])
+      (nrn "\" [(nfc "s" (nw "nat"))])
+      (nrn "^" [(nw rsum)])
+      (nrn "?"
+        [(npar [(nw "parse") (nw "s")])
+         (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                          (nfc "why" (nw "nat")) (nfc "rest" (nw "nat"))])
+                   (nvap rsum "err" [(nw "0") (nw "why")])])
+         (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                          (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
+                   (npar [(nw (strcat [root-name "_from"])) (nw "v") (nw "0")])])])])
+   (nrn "+"
+     [(nw (strcat ["show_" root-name]))
+      (nslug [(strcat ["Encode a " root-name " compactly."])])
+      (nrn "\" [(nfc "x" (nw root-name))])
+      (nrn "^" [(nw "nat")])
+      (npar [(nw "show") (npar [(nw (strcat [root-name "_to"])) (nw "x")])])])
+   (nrn "+"
+     [(nw "rt")
+      (nslug rt-lore)
+      (nrn "\" [(nfc "s" (nw "nat"))])
+      (nrn "^" [(nw "nat")])
+      (nrn "?"
+        [(npar [(nw (strcat ["parse_" root-name])) (nw "s")])
+         (nrn ">"
+           [(npar [(nrn "./" [(nw "err")])
+                   (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+            (nrn "?" [(npar [(nw "eq") (nw "path") (nw "0")]) (nw "why")])
+            (npar [(nw "cat2") (npar [(nw "cat2") (nw "path") (nc ":")])
+                   (nw "why")])])
+         (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" (nw root-name))])
+                   (npar [(nw (strcat ["show_" root-name])) (nw "v")])])])])])
 
-;; -> [root-name text]
-(define (sg-gen-text show-fn sv)
+;; -> [root-name tree]
+(define (sg-gen-tree show-fn sv)
   (define nt (sg-schema-typedefs sv))
   (define root-name (_0 nt))
   (define tds (_1 nt))
   (define exs-r (jv-get "examples" sv))
   (define examples
     (Ifz exs-r [] (map show-fn (jv-xs! (_0 exs-r)))))
-  (define td-lines
+  (define td-trees
     (_1 (foldl (lambda (st td)
-                 (let ((r (sg-td-lines (_0 st) td)))
+                 (let ((r (sg-td-trees (_0 st) td)))
                    [(_0 r) (Weld (_1 st) (_1 r))]))
           [[] []] tds)))
   [root-name
-   (sg-render
-     (Weld sg-prelude-lines
-       (Weld td-lines (sg-root-lines root-name examples))))])
+   (ngrp
+     (Weld sg-prelude-trees
+       (Weld td-trees (sg-root-trees root-name examples))))])
 
 ;;; Public API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -662,15 +734,13 @@
     (Ix 0 r)
     (sg-error "schema-json" (Ix 0 r))))
 
-;; Generate the module text for a schema document.  -> [name text]
-(define (gen-text jsut schema-txt)
-  (sg-gen-text (foil:source-entry-val ["show"] jsut)
+;; Generate the module tree for a schema document.  -> [name tree]
+(define (gen-tree jsut schema-txt)
+  (sg-gen-tree (foil:source-entry-val ["show"] jsut)
     (sg-schema-value jsut schema-txt)))
 
-;; Generate AND compile.  -> [name text subject]
+;; Generate AND compile.  -> [name tree subject]
 (define (compile-schema sut jsut schema-txt)
-  (define g (gen-text jsut schema-txt))
-  (define name (_0 g))
-  (define txt (_1 g))
-  [name txt
-   (foil:compile-rex sut name (rex:ParseRexNormFile txt))])
+  (define g (gen-tree jsut schema-txt))
+  [(_0 g) (_1 g)
+   (foil:compile-rex sut (_0 g) (_1 g))])
