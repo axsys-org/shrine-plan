@@ -46,7 +46,11 @@
 ;;; Ack correlation: worker->coordinator sends are FIFO and the
 ;;; coordinator acks each cmd within its turn, so acks return in cmd
 ;;; order — a queue of [pax kind] entries pairs each ack with its
-;;; command (failed acks carry no path).
+;;; command (failed acks carry no path).  Write-box entries are
+;;; [pax "vine" conn-cap]: the connection waits on the ack, so the
+;;; reply reports the kernel's actual verdict and never races the
+;;; commit.  EVERY cmd this worker sends must push a queue entry, or
+;;; later acks pop the wrong one.
 
 ;;; HTTP plumbing (local — forge's helpers, without dragging forge in)
 
@@ -76,6 +80,7 @@
 (define (status-line status)
   (cond
     ((Eq status 200) "HTTP/1.0 200 OK")
+    ((Eq status 400) "HTTP/1.0 400 Bad Request")
     ((Eq status 404) "HTTP/1.0 404 Not Found")
     ((Eq status 500) "HTTP/1.0 500 Internal Server Error")
     (else (strcat ["HTTP/1.0 " (showNat status) " Status"]))))
@@ -115,6 +120,32 @@
       (let ((r (quip:parse-quip-soft (Ix i parts2))))
         (Ifz r 0 (go (Inc i) (snoc (_0 r) acc))))))
   (go 0 []))
+
+;; Rendered text for a kernel rejection's err iota: the canonical quip
+;; spelling when it has one, else the flat diagnostic walk.
+(define (err-text e)
+  (define r (Try (lambda (z) (quip:print-quip e)) 0))
+  (If (Eq 1 (Hd r)) (foil-render:diag-flat e) (_0 r)))
+
+;; The write box's replies, both minted only when the ack lands.
+(define (vine-back-page pax)
+  (define loc (strWeld "/ns" (quip:print-path pax)))
+  (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
+           " content=" 34 "0;url=" loc 34 "></head><body>committed; <a href="
+           34 loc 34 ">back to the node</a></body></html>"]))
+
+(define (vine-fail-page pax err)
+  (define loc (strWeld "/ns" (quip:print-path pax)))
+  (strcat ["<!doctype html><html><body><p>write rejected: <code>"
+           (err-text err) "</code></p><p><a href=" 34 loc 34
+           ">back to the node</a></p></body></html>"]))
+
+;; A myth is a mop at runtime; anything else poked into the kernel
+;; dies INSIDE the coordinator's exec (a non-exhaustive mop match), so
+;; the write box refuses non-myth expression values up front.
+(define (myth-rep? v)
+  (Or (Eq "/boot/mop/empty" v)
+    (And (IsApp v) (Eq "/boot/mop/node" (Hd v)))))
 
 ;;; Socket layer (thin; blocking IO lives in its own actors) ;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -322,8 +353,11 @@
     ;; poke|cull and (for make/poke) expr, a foil expression that
     ;; evaluates against the boot subject to the writ's myth.  The
     ;; task goes out as an ordinary driver cmd — the same effect
-    ;; channel every request-node make uses — and the reply bounces
-    ;; the browser back to the node.
+    ;; channel every request-node make uses — and the connection then
+    ;; WAITS on the cmd's ack (the [pax "vine" cap] queue entry): the
+    ;; reply is the kernel's verdict, a bounce back to the node on
+    ;; commit or the rendered rejection.  Only eval and parse failures
+    ;; answer immediately (nothing was emitted).
     (define (vine! z)
       (define url (_2 msg))
       (define body (_3 msg))
@@ -333,14 +367,9 @@
       (define (reply status body2)
         (Seq (helm:send! (Ix 0 caps) ["res" status body2 "text/html; charset=utf-8"])
           (loop serial pending queue)))
-      (define (back-page pax)
-        (define loc (strWeld "/ns" (quip:print-path pax)))
-        (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
-                 " content=" 34 "1;url=" loc 34 "></head><body>emitted; <a href="
-                 34 loc 34 ">back to the node</a></body></html>"]))
       (define (emit task pax)
         (Seq (helm:send! coord ["cmd" name task])
-          (reply 200 (back-page pax))))
+          (loop serial pending (snoc [pax "vine" (Ix 0 caps)] queue))))
       (cond
         ((Ifz target 1 0) (reply 404 "unparseable path segment"))
         ((Eq verb "cull") (emit ((h-cull hs) (_0 target)) (_0 target)))
@@ -348,10 +377,22 @@
           (let ((r (doctest:eval-text (h-sut hs) expr)))
             (If (Eq 1 (Hd r))
               (reply 400 (foil-render:diag-text (_0 r)))
-              (emit
-                ((If (Eq verb "make") (h-make hs) (h-poke hs))
-                 (_0 target) (_0 (_0 r)))
-                (_0 target)))))
+              ;; force the value HERE, under Try — a lazily-crashing
+              ;; or non-myth value must answer 400, not die in the
+              ;; coordinator's exec
+              (let ((fv (Try (lambda (z)
+                               (let ((v (_0 (_0 r))))
+                                 (Seq (DeepSeq v v) v)))
+                          0)))
+                (cond
+                  ((Eq 1 (Hd fv)) (reply 400 (err-text (_0 fv))))
+                  ((Nil (myth-rep? (_0 fv)))
+                    (reply 400 "expression must evaluate to a myth (e.g. (myth/sing ['n] (pd 41)))"))
+                  (else
+                    (emit
+                      ((If (Eq verb "make") (h-make hs) (h-poke hs))
+                       (_0 target) (_0 fv))
+                      (_0 target))))))))
         (else (reply 400 "verb must be make, poke, or cull"))))
     (cond
       ((And (Eq kind "req")
@@ -422,6 +463,17 @@
               (rest (drop 1 queue))
               (rsvp (_1 msg)))
           (cond
+            ((Equal "vine" (_1 head))
+              ;; the write box answers here, with the kernel's verdict:
+              ;; committed (bounce back to the node) or rejected (500,
+              ;; the rendered err)
+              (Seq (helm:send! (_2 head)
+                     (If (Eq "/boot/rsvp/no" (Hd rsvp))
+                       ["res" 500 (vine-fail-page (_0 head) (_0 rsvp))
+                        "text/html; charset=utf-8"]
+                       ["res" 200 (vine-back-page (_0 head))
+                        "text/html; charset=utf-8"]))
+                (loop serial pending rest)))
             ((Eq "/boot/rsvp/no" (Hd rsvp))
               ;; the command failed — if its connection still waits,
               ;; answer 500 with the failure
@@ -430,7 +482,7 @@
                   (loop serial pending rest)
                   (Seq (helm:send!
                          (_1 (_0 hit))
-                         ["res" 500 (_0 (_0 rsvp)) "text/plain; charset=utf-8"])
+                         ["res" 500 (err-text (_0 rsvp)) "text/plain; charset=utf-8"])
                     (loop serial (pend-drop pending (_0 head)) rest)))))
             ((Equal "cull" (_1 head))
               ;; the request node is gone: this connection is done
