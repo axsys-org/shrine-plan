@@ -426,18 +426,20 @@
   (loop 0 []))
 
 ; Transitive dep stamps for a freshly compiled module: each direct
-; load's [name stamp] plus the flattened rows its own cache entry
+; load's [path stamp] plus the flattened rows its own cache entry
 ; already carries — so a later hit revalidates the whole closure with
 ; one stamp sweep, no recursion into entries that may since have been
-; replaced.  Deduped by name (first occurrence wins).
+; replaced.  Deduped by path (first occurrence wins).  Rows are keyed
+; by FILE PATH, not module name, so a module's declared extra file
+; stamps (module-file-stamps below) ride the same sweep.
 
-(define (dep-stamp-rows cache deps)
+(define (dep-stamp-rows cache deps extra)
   (define (entry-deps nm)
     (define e (bst-idx nm cache))
-    (define own [[nm (Stamp (module-file nm))]])
+    (define own [[(module-file nm) (Stamp (module-file nm))]])
     (define ebox (Ix 2 e))
     (If (And e ebox) (Weld own (Ix 0 ebox)) own))
-  (define all (cat (map entry-deps deps)))
+  (define all (Weld extra (cat (map entry-deps deps))))
   (define (seen-before j i nm)
     (If (Le i j) 0
       (Or (Eq nm (Ix 0 (Ix j all))) (seen-before (Inc j) i nm))))
@@ -448,6 +450,18 @@
         (loop (Inc i)
           (If (seen-before 0 i (Ix 0 pr)) acc (cons pr acc))))))
   (loop 0 []))
+
+; A module may declare stamps for files OUTSIDE the module graph: a
+; top-level binding named module-file-stamps holding a row of file
+; paths (e.g. the .foil sources a corpus tier compiles).  Their
+; stamps join the entry's dep rows, so the cached module value
+; invalidates when any listed file changes — without this, a tier's
+; compiled world froze in the snapshot while its sources moved on.
+
+(define (declared-file-stamps value)
+  (define hit (glookup "module-file-stamps" value))
+  (Ifz hit []
+    (map {f -> [f (Stamp f)]} (Ix 1 (Unpin hit)))))
 
 (define (reaver-module-load go cache ctx uniq glo locals depth x module)
   (assert-size 2 x)
@@ -464,7 +478,7 @@
         (define deps (Ix 0 edeps))
         (define (fresh i)
           (If (Le (Sz deps) i) 1
-            (And (Eq (Ix 1 (Ix i deps)) (Stamp (module-file (Ix 0 (Ix i deps)))))
+            (And (Eq (Ix 1 (Ix i deps)) (Stamp (Ix 0 (Ix i deps))))
               (fresh (Inc i)))))
         (fresh 0))))
   (If (And ent (And (Eq eStamp stamp) deps-ok))
@@ -484,8 +498,9 @@
       (define dnames
         (dedupe-names
           (lfoldl {acc lcx -> (form-module-deps acc (Ix 2 lcx))} [] forms)))
+      (define drows (dep-stamp-rows cache dnames (declared-file-stamps value)))
       (define cache
-        (bst-insert module [stamp value [(dep-stamp-rows cache dnames)]] cache))
+        (bst-insert module [stamp value [drows]] cache))
       [cache uniq glo (K value)])))
 
 (define (reaver-module go cache ctx uniq glo locals depth x[_ moduleS])

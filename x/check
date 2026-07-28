@@ -40,31 +40,52 @@ HASH="$(find "$ROOT/src" -type f \( -name '*.rvr' -o -name '*.foil' -o -name '*.
   | xargs -0 shasum | sort | shasum | cut -c1-16)"
 TPL="$DIR/template-$HASH"
 
-if [ -n "$FRESH" ]; then rm -rf "$TPL"; fi
+if [ -n "$FRESH" ]; then rm -rf "$DIR"/template-*; fi
 
 if [ ! -e "$TPL/data.mdb" ]; then
-  echo "x/check: staging template $HASH (boot + stdlib + corpus)" >&2
-  rm -rf "$DIR"/template-* "$DIR/stage"
+  # Incremental restage: seed from the newest existing template — the
+  # module cache is dep-stamped (transitive .rvr stamps + the corpus
+  # tiers' declared .foil stamps), so the stage session recompiles
+  # only what actually changed.  The seed is only valid if src/plan is
+  # unchanged: the boot bakes the plan-layer (loader included) into
+  # the snapshot's repl continuation, and no amount of module-cache
+  # hygiene refreshes THAT.  No valid seed (or --fresh): full boot.
+  PLANHASH="$(find "$ROOT/src/plan" -type f -print0 | xargs -0 shasum | sort | shasum | cut -c1-16)"
+  SEED="$(ls -td "$DIR"/template-* 2>/dev/null | head -1)"
+  if [ -n "$SEED" ] && [ "$(cat "$SEED/planhash" 2>/dev/null)" != "$PLANHASH" ]; then
+    SEED=""
+  fi
+  rm -rf "$DIR/stage"
   mkdir -p "$DIR/stage"
   cd "$DIR/stage"
-  "$WISP" --file-root "$ROOT/src" "$ROOT/src/plan" reaver main > boot.log 2>&1
-  "$WISP" --file-root "$ROOT/src" snap root _ > stage1.log 2>&1 <<'EOF'
+  if [ -n "$SEED" ] && [ -e "$SEED/data.mdb" ]; then
+    echo "x/check: staging template $HASH (incremental, from $(basename "$SEED"))" >&2
+    mkdir -p snap
+    cp "$SEED/data.mdb" "$SEED/pins.pack" snap/
+  else
+    echo "x/check: staging template $HASH (boot + stdlib + corpus)" >&2
+    "$WISP" --file-root "$ROOT/src" "$ROOT/src/plan" reaver main > boot.log 2>&1
+    "$WISP" --file-root "$ROOT/src" snap root _ > stage1.log 2>&1 <<'EOF'
 (#bind std (#module std))
 (#import std)
 ::*rex
 EOF
-  "$WISP" --file-root "$ROOT/src" snap root _ > stage2.log 2>&1 <<'EOF'
+    "$WISP" --file-root "$ROOT/src" snap root _ > stage2.log 2>&1 <<'EOF'
 (#bind quip (#module quip))
 EOF
+  fi
   "$WISP" --file-root "$ROOT/src" snap root _ > stage3.log 2>&1 <<'EOF'
 (#bind corpus (#module foil-corpus-helm))
 EOF
-  if grep -aq 'ERROR' stage3.log; then
+  if grep -aq 'ERROR' stage3.log \
+     || grep -aq 'Assertion .* failed\|arena exhausted\|deadlock' stage3.log; then
     echo "x/check: corpus staging FAILED (see $DIR/stage/stage3.log)" >&2
     exit 1
   fi
   mkdir -p "$TPL"
   cp snap/data.mdb snap/pins.pack "$TPL/"
+  echo "$PLANHASH" > "$TPL/planhash"
+  ls -td "$DIR"/template-* | tail -n +3 | xargs rm -rf 2>/dev/null || true
 fi
 
 # group <name> <suite> [<suite>...]
