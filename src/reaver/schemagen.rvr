@@ -78,6 +78,65 @@
 (define (dedupe-eq xs)
   (foldl (lambda (acc x) (If (includes (Eq x) acc) acc (snoc x acc))) [] xs))
 
+;;; Name normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Real-world specs name types in PascalCase and operations in
+;;; camelCase; foil wants [a-z][a-z0-9_]*.  Normalization is a
+;;; MAPPING, not a check: the same function must run on schema keys
+;;; and on $ref targets so the two agree, and the caller must assert
+;;; the mapping stays injective (sg-name-map).
+
+(define (sg-upper? c) (And (Ge c 65) (Le c 90)))
+(define (sg-lower? c) (And (Ge c 97) (Le c 122)))
+(define (sg-digit? c) (And (Ge c 48) (Le c 57)))
+(define (sg-alnum? c) (Or (sg-lower? c) (Or (sg-upper? c) (sg-digit? c))))
+(define (sg-to-lower c) (If (sg-upper? c) (Add c 32) c))
+
+;; "AABenchmarkEntry" -> "aabenchmark_entry"; "jobId" -> "job_id";
+;; "text/event-stream" -> "text_event_stream".  A leading digit is
+;; left in place for sg-check-name to reject.
+(define (sg-norm-name s)
+  (define cs (trip s))
+  (define n (Sz cs))
+  ;; lowercase, break at lower|digit -> upper boundaries, non-alnum -> _
+  (define (emit i acc)
+    (If (Ge i n) acc
+      (let* ((c (Ix i cs))
+             (prev (If (Eq i 0) 0 (Ix (Dec i) cs))))
+        (cond
+          ((Ifz (sg-alnum? c) 1 0) (emit (Inc i) (Weld acc [95])))
+          ((And (sg-upper? c) (Or (sg-lower? prev) (sg-digit? prev)))
+            (emit (Inc i) (Weld acc [95 (sg-to-lower c)])))
+          (else (emit (Inc i) (Weld acc [(sg-to-lower c)])))))))
+  (define raw (emit 0 []))
+  ;; collapse runs of _ and drop leading ones
+  (define (clean i acc)
+    (If (Ge i (Sz raw)) acc
+      (let ((c (Ix i raw)))
+        (If (Eq c 95)
+          (If (Ifz (Sz acc) 1 0) (clean (Inc i) acc)
+            (If (Eq 95 (Ix (Dec (Sz acc)) acc)) (clean (Inc i) acc)
+              (clean (Inc i) (Weld acc [c]))))
+          (clean (Inc i) (Weld acc [c]))))))
+  (define body (clean 0 []))
+  ;; drop a trailing _
+  (define trimmed
+    (Ifz (Sz body) body
+      (If (Eq 95 (Ix (Dec (Sz body)) body)) (take (Dec (Sz body)) body) body)))
+  (strcat trimmed))
+
+;; Normalize AND validate: the name a generated module will use.
+(define (sg-name s) (sg-check-name (sg-norm-name s)))
+
+;; [[orig norm] ..] for a row of source names, asserting injectivity —
+;; two schemas that normalize alike would silently merge.
+(define (sg-name-map names)
+  (define pairs (map (lambda (s) [s (sg-norm-name s)]) names))
+  (define norms (map (lambda (p) (Ix 1 p)) pairs))
+  (define dups
+    (filter (lambda (nm) (Gt (Sz (filter (Eq nm) norms)) 1)) (dedupe-eq norms)))
+  (Ifz (Sz dups) pairs (sg-error "name-collision after normalization" dups)))
+
 (define (nat-str n)
   (If (Lt n 10) (Add "0" n)
     (strcat [(nat-str (Div n 10)) (Add "0" (Mod n 10))])))
@@ -94,30 +153,42 @@
 ;;; field:   [name ftype req]
 ;;; typedef: ["rec" name fields] | ["enum" name [vname ..]]
 
-(define sg-ref-prefix "#/$defs/")
-
 (define (sg-strip-prefix pre s)
   ;; 0 when s lacks the prefix, [tail] otherwise
   (define w (Lsh 1 (Mul 8 (Bytes pre))))
   (If (Eq pre (Mod s w)) [(Div s w)] 0))
 
+;; The three spellings of "a named schema in this document": JSON
+;; Schema $defs, Swagger 2.0 definitions, OpenAPI 3.x components.
+(define sg-ref-prefixes
+  ["#/$defs/" "#/definitions/" "#/components/schemas/"])
+
+;; -> the bare target name (errors on an unrecognized $ref shape)
+(define (sg-ref-target s)
+  (define hit
+    (foldl (lambda (acc pre) (Ifz acc (sg-strip-prefix pre s) acc))
+      0 sg-ref-prefixes))
+  (Ifz hit (sg-error "bad-ref (want #/$defs/, #/definitions/ or #/components/schemas/)" s)
+    (_0 hit)))
+
+;; -> 0 when v is not a $ref, else [target] (the wrapped shape callers expect)
 (define (sg-ref-name v)
   (define r (jv-get "$ref" v))
-  (Ifz r 0
-    (let* ((s (jv-str! (_0 r)))
-           (a (sg-strip-prefix sg-ref-prefix s))
-           (b (Ifz a (sg-strip-prefix "#/definitions/" s) a)))
-      (Ifz b
-        (sg-error "bad-ref (want #/$defs/ or #/definitions/)" s)
-        b))))
+  (Ifz r 0 [(sg-ref-target (jv-str! (_0 r)))]))
 
+;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"].  It is a
+;; distinct feature, not a malformed type, and saying so keeps the
+;; coverage histogram honest.
 (define (sg-type-str v)
   (define t (jv-get "type" v))
-  (Ifz t 0 [(jv-str! (_0 t))]))
+  (Ifz t 0
+    (If (jv-arr? (_0 t))
+      (sg-error "nullable-type-union (type: [T,null])" (_0 t))
+      [(jv-str! (_0 t))])))
 
 (define (sg-ftype-of v)
   (define r (sg-ref-name v))
-  (Ifz (Nil r) ["ref" (sg-check-name (_0 r))]
+  (Ifz (Nil r) ["ref" (sg-name (_0 r))]
     (Ifz (Nil (jv-get "enum" v))
       (sg-error "inline-enum (hoist to $defs)" v)
       (let ((t (sg-type-str v)))
@@ -141,7 +212,7 @@
 (define (sg-typedef-of name v)
   (define en (jv-get "enum" v))
   (Ifz (Nil en)
-    (let ((vals (map (lambda (x) (sg-check-name (jv-str! x)))
+    (let ((vals (map (lambda (x) (sg-name (jv-str! x)))
                   (jv-xs! (_0 en)))))
       (Ifz (Sz vals) (sg-error "empty-enum" name)
         ["enum" name vals]))
@@ -154,7 +225,7 @@
                (reqs (Ifz reqs-r [] (map jv-str! (jv-xs! (_0 reqs-r)))))
                (fields
                  (map (lambda (e)
-                        (let ((fname (sg-check-name (Ix 0 e))))
+                        (let ((fname (sg-name (Ix 0 e))))
                           [fname (sg-ftype-of (Ix 1 e))
                            (If (includes (Eq (Ix 0 e)) reqs) 1 0)]))
                    props)))
@@ -193,11 +264,11 @@
   (define title-r (jv-get "title" sv))
   (define root-name
     (Ifz title-r (sg-error "missing-title" 0)
-      (sg-check-name (jv-str! (_0 title-r)))))
+      (sg-name (jv-str! (_0 title-r)))))
   (define defs-r (jv-get "$defs" sv))
   (define def-tds
     (Ifz defs-r []
-      (map (lambda (e) (sg-typedef-of (sg-check-name (Ix 0 e)) (Ix 1 e)))
+      (map (lambda (e) (sg-typedef-of (sg-name (Ix 0 e)) (Ix 1 e)))
         (jv-kvs (_0 defs-r)))))
   (define tds (snoc (sg-typedef-of root-name sv) def-tds))
   (define names (map (Ix 1) tds))
@@ -749,11 +820,169 @@
 ;;;   body:    0 | [defname]
 ;;;   resp:    defname (the 200 response $ref)
 
-(define sg-defs-prefix "#/definitions/")
-
 (define (sg-need k v why)
   (define r (jv-get k v))
   (Ifz r (sg-error why v) (_0 r)))
+
+;;; Spec dialect ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Swagger 2.0 and OpenAPI 3.x say the same things in different
+;;; places.  These accessors are the ONLY code that knows which:
+;;; everything downstream sees one shape.
+;;;
+;;;   2.0                          3.x
+;;;   definitions                  components.schemas
+;;;   basePath ("/v1")             servers[0].url ("https://h/v1")
+;;;   parameters[in=body].schema   requestBody.content[mt].schema
+;;;   responses.200.schema         responses.200.content[mt].schema
+
+;; 3 when the document is OpenAPI 3.x, 0 when Swagger 2.0.
+(define (sg-v3? sv) (Ifz (jv-get "openapi" sv) 0 1))
+
+;; The named-schema map as kvs: [[source-name val] ..].
+(define (sg-spec-schemas sv)
+  (define r
+    (If (sg-v3? sv)
+      (let ((c (jv-get "components" sv)))
+        (Ifz c 0 (jv-get "schemas" (_0 c))))
+      (jv-get "definitions" sv)))
+  (Ifz r [] (jv-kvs (_0 r))))
+
+;; The document title, normalized — the generated module's name.
+(define (sg-spec-title sv)
+  (sg-name (jv-str! (sg-need "title" (sg-need "info" sv "spec: missing info")
+                      "spec: info needs title"))))
+
+;; The base url the hand prepends to every path.  2.0 gives a path
+;; fragment; 3.x gives a whole origin+prefix, which is the same string
+;; in the place the url builders splice it.
+(define (sg-spec-base sv)
+  (If (sg-v3? sv)
+    (let ((ss (jv-get "servers" sv)))
+      (Ifz ss ""
+        (let ((xs (jv-xs! (_0 ss))))
+          (Ifz (Sz xs) ""
+            (jv-str! (sg-need "url" (_0 xs) "spec: server needs url"))))))
+    (Ifz (jv-get "basePath" sv) "" (jv-str! (_0 (jv-get "basePath" sv))))))
+
+(define sg-json-mt "application/json")
+
+;; The application/json schema out of a 3.x content map.  Other media
+;; types (text/event-stream, multipart, audio/*) are a driver-protocol
+;; question, not a codegen one: rejected here, deliberately.
+(define (sg-content-schema cv why)
+  (define kvs (jv-kvs cv))
+  (define hit (find (lambda (e) (Eq sg-json-mt (Ix 0 e))) kvs))
+  (Ifz hit
+    (sg-error (strcat [why " (no " sg-json-mt "; have)"])
+      (map (lambda (e) (Ix 0 e)) kvs))
+    (sg-need "schema" (Ix 1 (_0 hit)) why)))
+
+;; The request-body schema of an operation: 0 or [schema].
+(define (sg-op-body-schema v3 opv)
+  (If v3
+    (let ((rb (jv-get "requestBody" opv)))
+      (Ifz rb 0
+        [(sg-content-schema
+           (sg-need "content" (_0 rb) "spec: requestBody needs content")
+           "spec: requestBody schema")]))
+    (let* ((ps (jv-get "parameters" opv))
+           (xs (Ifz ps [] (jv-xs! (_0 ps))))
+           (hit (find (lambda (p) (Eq "body"
+                                   (Ifz (jv-get "in" p) ""
+                                     (jv-str! (_0 (jv-get "in" p)))))) xs)))
+      (Ifz hit 0
+        [(sg-need "schema" (_0 hit) "spec: body param needs schema")]))))
+
+;; The 200-response schema of an operation: 0 or [schema].
+(define (sg-op-resp-schema v3 opv)
+  (define rs (jv-get "responses" opv))
+  (Ifz rs 0
+    (let ((r (jv-get "200" (_0 rs))))
+      (Ifz r 0
+        (If v3
+          (let ((c (jv-get "content" (_0 r))))
+            (Ifz c 0 [(sg-content-schema (_0 c) "spec: 200 response schema")]))
+          (let ((s (jv-get "schema" (_0 r))))
+            (Ifz s 0 [(_0 s)])))))))
+
+;;; Ref walking and slicing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; A real spec is far larger than any one client needs (713 schemas
+;;; for OpenRouter, ~2100 generated top-levels).  Module load forces
+;;; every top-level, so generating whole documents is not viable:
+;;; callers name the operations they want and get their transitive
+;;; schema closure.
+
+;; Every $ref target named anywhere inside a schema value, source
+;; spelling, duplicates included.
+(define (sg-refs-of v)
+  (define (go v acc)
+    (Ifz (IsApp v) acc
+      (Ifz (jv-obj? v)
+        (Ifz (jv-arr? v) acc (foldl (lambda (a x) (go x a)) acc (Ix 0 v)))
+        (foldl
+          (lambda (a e)
+            (If (Eq "$ref" (Ix 0 e))
+              (snoc (sg-ref-target (jv-str! (Ix 1 e))) a)
+              (go (Ix 1 e) a)))
+          acc (jv-kvs v)))))
+  (go v []))
+
+;; Transitive closure of seed names over the schema map (source
+;; spellings throughout).  Dangling refs are an error, not a silent
+;; drop — the generated module would not compile.
+(define (sg-closure schemas seeds)
+  (define (lookup nm)
+    (define hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas))
+    (Ifz hit (sg-error "dangling-ref (no such schema)" nm) (Ix 1 (_0 hit))))
+  (define (go pending seen)
+    (Ifz (Sz pending) seen
+      (let ((nm (_0 pending)) (rest (drop 1 pending)))
+        (If (includes (Eq nm) seen)
+          (go rest seen)
+          (go (Weld rest (sg-refs-of (lookup nm))) (snoc nm seen))))))
+  (go (dedupe-eq seeds) []))
+
+;; The operations of a spec as [[path method opv] ..].
+(define sg-http-methods ["get" "put" "post" "delete" "patch" "head" "options"])
+(define (sg-spec-op-entries sv)
+  (foldl
+    (lambda (acc pe)
+      (foldl
+        (lambda (a me)
+          (If (includes (Eq (Ix 0 me)) sg-http-methods)
+            (snoc [(Ix 0 pe) (Ix 0 me) (Ix 1 me)] a)
+            a))
+        acc (jv-kvs (Ix 1 pe))))
+    [] (jv-kvs (sg-need "paths" sv "spec: missing paths"))))
+
+;; Source-spelled schema names an operation entry directly names.
+(define (sg-op-seed-names v3 ent)
+  (define opv (Ix 2 ent))
+  (define b (sg-op-body-schema v3 opv))
+  (define r (sg-op-resp-schema v3 opv))
+  (Weld (Ifz (Nil b) (sg-refs-of (_0 b)) [])
+    (Ifz (Nil r) (sg-refs-of (_0 r)) [])))
+
+;; Select operations by NORMALIZED operationId.  -> [[path method opv] ..]
+(define (sg-select-ops sv opids)
+  (define ents (sg-spec-op-entries sv))
+  (define (opid-of ent)
+    (define r (jv-get "operationId" (Ix 2 ent)))
+    (Ifz r "" (sg-norm-name (jv-str! (_0 r)))))
+  (define hits (filter (lambda (e) (includes (Eq (opid-of e)) opids)) ents))
+  (define got (dedupe-eq (map opid-of hits)))
+  (define missing (filter (lambda (o) (Ifz (includes (Eq o) got) 1 0)) opids))
+  (Ifz (Sz missing) hits (sg-error "no such operationId" missing)))
+
+;; The schema-name closure needed by a set of operations.
+(define (sg-slice sv opids)
+  (define v3 (sg-v3? sv))
+  (define schemas (sg-spec-schemas sv))
+  (define ents (sg-select-ops sv opids))
+  (sg-closure schemas
+    (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents)))
 
 ;; "/pets/{pet_id}" -> [["lit" "pets"] ["par" "pet_id"]]
 (define (sg-path-segs s)
@@ -764,7 +993,7 @@
     (If (And (Gt m 2)
           (And (Eq 123 (Mod cur 256))
             (Eq 125 (Div cur (Lsh 1 (Mul 8 (Dec m)))))))
-      ["par" (sg-check-name
+      ["par" (sg-name
                (Div (Mod cur (Lsh 1 (Mul 8 (Dec m)))) 256))]
       ["lit" cur]))
   (define (go i cur acc)
@@ -781,60 +1010,89 @@
   (define r (sg-ref-name v))
   (Ifz (Nil r) (_0 r) (sg-error "swagger: expected a $ref schema" v)))
 
-(define (sg-op-of pathstr method opv)
+;; Resolve a parameter that may itself be a $ref into components.parameters.
+(define (sg-param-deref sv p)
+  (define r (jv-get "$ref" p))
+  (Ifz r p
+    (let* ((s (jv-str! (_0 r)))
+           (tail (sg-strip-prefix "#/components/parameters/" s)))
+      (Ifz tail (sg-error "spec: unsupported parameter $ref" s)
+        (let ((c (jv-get "components" sv)))
+          (Ifz c (sg-error "spec: parameter $ref with no components" s)
+            (sg-need (_0 tail) (sg-need "parameters" (_0 c) "spec: no components.parameters")
+              "spec: no such component parameter")))))))
+
+(define (sg-op-of sv v3 pathstr method opv)
   (define opid
-    (sg-check-name (jv-str! (sg-need "operationId" opv "swagger: op needs operationId"))))
+    (sg-name (jv-str! (sg-need "operationId" opv "spec: op needs operationId"))))
   (define params
-    (Ifz (jv-get "parameters" opv) []
-      (jv-xs! (_0 (jv-get "parameters" opv)))))
+    (map (lambda (p) (sg-param-deref sv p))
+      (Ifz (jv-get "parameters" opv) []
+        (jv-xs! (_0 (jv-get "parameters" opv))))))
+  (define (req-of p)
+    (If (Nil (jv-get "required" p)) 0
+      (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
+        (Ix 0 (_0 (jv-get "required" p))) 0)))
+  ;; 3.x puts a parameter's type under `schema`; 2.0 inlines it.
+  (define (ptype p)
+    (define s (jv-get "schema" p))
+    (Ifz s (sg-ftype-of p) (sg-ftype-of (_0 s))))
   (define (fold-param acc p)
-    (define where (jv-str! (sg-need "in" p "swagger: param needs in")))
-    (define pname (sg-check-name (jv-str! (sg-need "name" p "swagger: param needs name"))))
+    (define where (jv-str! (sg-need "in" p "spec: param needs in")))
+    (define pname (sg-name (jv-str! (sg-need "name" p "spec: param needs name"))))
     (cond
       ((Eq where "path")
-        [(snoc [pname (sg-ftype-of p)] (_0 acc)) (_1 acc) (_2 acc)])
+        [(snoc [pname (ptype p)] (_0 acc)) (_1 acc)])
       ((Eq where "query")
-        (let ((req (If (Nil (jv-get "required" p)) 0
-                     (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
-                       (Ix 0 (_0 (jv-get "required" p))) 0))))
-          [(_0 acc) (snoc [pname (sg-ftype-of p) req] (_1 acc)) (_2 acc)]))
-      ((Eq where "body")
-        [(_0 acc) (_1 acc)
-         [(sg-ref-defname (sg-need "schema" p "swagger: body param needs schema"))]])
-      (else (sg-error "swagger: unsupported param location" where))))
-  (define pqb (foldl fold-param [[] [] 0] params))
+        [(_0 acc) (snoc [pname (ptype p) (req-of p)] (_1 acc))])
+      ;; An OPTIONAL header is omissible without loss (the server
+      ;; applies its default); a required one would silently change
+      ;; the request, so it stops the build.
+      ((Eq where "header")
+        (Ifz (req-of p) acc
+          (sg-error "spec: required header param unsupported" pname)))
+      ;; 2.0's body param is read by sg-op-body-schema, not here.
+      ((Eq where "body") acc)
+      (else (sg-error "spec: unsupported param location" where))))
+  (define pq (foldl fold-param [[] []] params))
+  (define body-r (sg-op-body-schema v3 opv))
+  (define body
+    (Ifz (Nil body-r) [(sg-name (sg-ref-defname (_0 body-r)))] 0))
+  (define resp-r (sg-op-resp-schema v3 opv))
   (define resp
-    (sg-ref-defname
-      (sg-need "schema"
-        (sg-need "200"
-          (sg-need "responses" opv "swagger: op needs responses")
-          "swagger: op needs a 200 response")
-        "swagger: 200 response needs a schema")))
-  [opid method (sg-path-segs pathstr) (_0 pqb) (_1 pqb) (_2 pqb) resp])
+    (Ifz (Nil resp-r) (sg-name (sg-ref-defname (_0 resp-r)))
+      (sg-error "spec: op needs a 200 response schema" opid)))
+  [opid method (sg-path-segs pathstr) (_0 pq) (_1 pq) body resp])
 
 ;; -> [name basepath [typedef ..] [op ..]]
-(define (sg-swagger-parts sv)
-  (define info (sg-need "info" sv "swagger: missing info"))
-  (define name
-    (sg-check-name (jv-str! (sg-need "title" info "swagger: info needs title"))))
-  (define base
-    (Ifz (jv-get "basePath" sv) "" (jv-str! (_0 (jv-get "basePath" sv)))))
-  (define defs-r (jv-get "definitions" sv))
+;; opids = [] means every operation; otherwise the named ones only,
+;; and the typedefs are cut down to their transitive closure.
+(define (sg-spec-parts sv opids)
+  (define v3 (sg-v3? sv))
+  (define name (sg-spec-title sv))
+  (define base (sg-spec-base sv))
+  (define schemas (sg-spec-schemas sv))
+  (define ents
+    (Ifz (Sz opids) (sg-spec-op-entries sv) (sg-select-ops sv opids)))
+  (define wanted
+    (Ifz (Sz opids) (map (lambda (e) (Ix 0 e)) schemas)
+      (sg-closure schemas
+        (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents))))
+  ;; injectivity is asserted over the names we actually emit
+  (define nm-ok (sg-name-map wanted))
   (define tds
     (sg-topo
-      (Ifz defs-r []
-        (map (lambda (e) (sg-typedef-of (sg-check-name (Ix 0 e)) (Ix 1 e)))
-          (jv-kvs (_0 defs-r))))))
+      (map (lambda (nm)
+             (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
+               (Ifz hit (sg-error "dangling-ref (no such schema)" nm)
+                 (sg-typedef-of (sg-name nm) (Ix 1 (_0 hit))))))
+        (Seq nm-ok wanted))))
   (define ops
-    (foldl
-      (lambda (acc pe)
-        (foldl
-          (lambda (a me)
-            (snoc (sg-op-of (Ix 0 pe) (Ix 0 me) (Ix 1 me)) a))
-          acc (jv-kvs (Ix 1 pe))))
-      []
-      (jv-kvs (sg-need "paths" sv "swagger: missing paths"))))
+    (map (lambda (e) (sg-op-of sv v3 (Ix 0 e) (Ix 1 e) (Ix 2 e))) ents))
   [name base tds ops])
+
+;; Back-compat: the whole document, every operation.
+(define (sg-swagger-parts sv) (sg-spec-parts sv []))
 
 ;; parse_<t> for every distinct response type: JSON text -> <t>_r.
 (define (sg-resp-parser-tree tname)
@@ -1392,6 +1650,56 @@
 (define (gen-tree jsut schema-txt)
   (sg-gen-tree (foil:source-entry-val ["show"] jsut)
     (sg-schema-value jsut schema-txt)))
+
+;;; Spec inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Read-only queries over a spec document: what it declares, and how
+;;; much of it today's type subset can express.  The coverage number
+;;; is a RATCHET (see foil-schemagen-tests): it may only go up.
+
+;; [v3? title base #schemas #ops]
+(define (spec-summary sv)
+  [(sg-v3? sv) (sg-spec-title sv) (sg-spec-base sv)
+   (Sz (sg-spec-schemas sv)) (Sz (sg-spec-op-entries sv))])
+
+;; Normalized operationIds, in document order.
+(define (spec-opids sv)
+  (map (lambda (e)
+         (let ((r (jv-get "operationId" (Ix 2 e))))
+           (Ifz r "" (sg-norm-name (jv-str! (_0 r))))))
+    (sg-spec-op-entries sv)))
+
+;; The transitive schema closure of named operations (source spellings).
+(define (spec-slice sv opids) (sg-slice sv opids))
+
+;; How many named schemas the typedef IR can express today.
+;; -> [clean total [[name why] ..]]  (why = the first rejection reason)
+(define (spec-coverage sv)
+  (define schemas (sg-spec-schemas sv))
+  (define rs
+    (map (lambda (e)
+           (let ((r (Try (lambda (z)
+                           (let ((td (sg-typedef-of (sg-name (Ix 0 e)) (Ix 1 e))))
+                             (DeepSeq td td))) 0)))
+             (If (Eq 1 (Hd r)) [(Ix 0 e) (Ix 1 (_0 r))] 0)))
+      schemas))
+  (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
+  [(Sub (Sz schemas) (Sz bad)) (Sz schemas) bad])
+
+;; Coverage restricted to one operation's closure. -> [clean total bad]
+(define (spec-coverage-of sv opids)
+  (define schemas (sg-spec-schemas sv))
+  (define names (sg-slice sv opids))
+  (define rs
+    (map (lambda (nm)
+           (let* ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas))
+                  (r (Try (lambda (z)
+                            (let ((td (sg-typedef-of (sg-name nm) (Ix 1 (_0 hit)))))
+                              (DeepSeq td td))) 0)))
+             (If (Eq 1 (Hd r)) [nm (Ix 1 (_0 r))] 0)))
+      names))
+  (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
+  [(Sub (Sz names) (Sz bad)) (Sz names) bad])
 
 ;; Generate AND compile.  -> [name tree subject]
 (define (compile-schema sut jsut schema-txt)

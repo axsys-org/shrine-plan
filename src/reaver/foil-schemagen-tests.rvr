@@ -412,3 +412,68 @@ assert(Equal "rex" (Ix 1 (Ix 0 (Ix 0 sw-hok))))
 assert(Equal "/boot/maybe/some" (Hd sw-herr))
 assert(Equal "/boot/pet_r/err" (Hd (Ix 0 sw-herr)))
 assert(Equal "fetch-err-2" (Ix 1 (Ix 0 sw-herr)))
+
+;;; OpenAPI 3.1: dialect, name normalization, slicing, coverage ratchet.
+;;;
+;;; The fixture is a SLICE of the OpenRouter spec (x/trim-spec, the
+;;; /models closure).  The full 1.7MB document cannot be a fixture:
+;;; json.foil consumes a cord by dividing the whole string once per
+;;; byte, so parsing is quadratic (32KB ~ 2.5s, 128KB ~ 54s).
+
+;;; A. name normalization is a mapping, and must be injective.
+
+assert(Equal "aabenchmark_entry" (schemagen:sg-norm-name "AABenchmarkEntry"))
+assert(Equal "job_id" (schemagen:sg-norm-name "jobId"))
+assert(Equal "chat_request" (schemagen:sg-norm-name "ChatRequest"))
+assert(Equal "base64_image" (schemagen:sg-norm-name "Base64Image"))
+assert(Equal "text_event_stream" (schemagen:sg-norm-name "text/event-stream"))
+assert(Equal "gpt_4" (schemagen:sg-norm-name "gpt-4"))
+assert(Equal "already_snake" (schemagen:sg-norm-name "already_snake"))
+;; idempotent: normalizing an already-normal name changes nothing
+assert(Equal "job_id" (schemagen:sg-norm-name (schemagen:sg-norm-name "jobId")))
+;; a collision is an error, never a silent merge
+(define (names-fail xs)
+  (define r (Try (lambda (z) (schemagen:sg-name-map xs)) 0))
+  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+assert(Equal 0 (names-fail ["Foo" "Bar"]))
+assert(Equal "name-collision after normalization" (names-fail ["fooBar" "FooBar"]))
+
+;;; B. the Swagger 2.0 dialect still reads (the petstore path above).
+
+(define sw-v (schemagen:sg-schema-value jsut swagger-txt))
+assert(Equal [0 "petstore" "/v1" 4 3] (schemagen:spec-summary sw-v))
+assert(Equal ["get_pet" "list_pets" "make_pet"]
+  (schemagen:dedupe-eq (schemagen:spec-opids sw-v)))
+assert(Equal ["pet" "kind"] (schemagen:spec-slice sw-v ["get_pet"]))
+;; naming an operation that does not exist is an error, not an empty slice
+(define (slice-fail ids)
+  (define r (Try (lambda (z) (schemagen:spec-slice sw-v ids)) 0))
+  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+assert(Equal "no such operationId" (slice-fail ["nope"]))
+
+;;; C. the OpenAPI 3.1 dialect reads: components.schemas, servers[0].url,
+;;;    responses.200.content["application/json"].schema.
+
+(define oa-v (schemagen:sg-schema-value jsut
+               (read-text-file "spec/openrouter-models.json")))
+assert(Equal [1 "open_router_api" "https://openrouter.ai/api/v1" 20 1]
+  (schemagen:spec-summary oa-v))
+assert(Equal ["get_models"] (schemagen:spec-opids oa-v))
+;; every named schema is reachable from the one operation we sliced for
+assert(Equal 20 (Sz (schemagen:spec-slice oa-v ["get_models"])))
+
+;;; D. THE RATCHET.  How many named schemas the typedef IR can express.
+;;; This number may only go UP.  Raise it when a phase lands; never
+;;; lower it to make a change pass.
+
+(define oa-cov (schemagen:spec-coverage oa-v))
+assert(Equal 20 (Ix 1 oa-cov))
+assert(Eq 1 (Ge (_0 oa-cov) 6))
+
+;;; The rejections are the Phase 1 worklist, and each must name its
+;;; own feature — a nullable type union is not a malformed string.
+(define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
+(define (why? w) (includes (Eq w) oa-whys))
+assert(Eq 1 (why? "nullable-type-union (type: [T,null])"))
+assert(Eq 1 (why? "float-unsupported (no honest representation yet)"))
+assert(Eq 1 (why? "inline-object (hoist to $defs)"))
