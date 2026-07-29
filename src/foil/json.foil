@@ -12,8 +12,10 @@
 '  hold NUL).  Decode by /parse , encode by /show ; the
 '  round-trip /rt is the doctest surface.
 +  jres
-  '  A decode outcome: the value with the unconsumed tail, or a
-  '  failure naming why, at the tail where it stopped.
+  '  A decode outcome: the value with the INDEX just past it, or a
+  '  failure naming why, at the index where it stopped.  Both carry
+  '  an offset into the original text, never a copy of the tail —
+  '  copying the tail per step is what made scanning quadratic.
   &  jres/ok
      jres/err
   +  ok
@@ -79,28 +81,40 @@
      out
   (_ (div rest 10) (cat2 (add "0" (mod rest 10)) out))
 +  ws
-  '  The tail past any leading JSON whitespace.
-  \  s=nat
+  '  The first index at or after i that is not JSON whitespace.
+  \  s=nat i=nat
   ^  nat
-  |  > r=nat s
-  =  c  (mod r 256)
+  |  > j=nat i
+  ?  (cord/eof s j)
+     j
+  =  c  (cord/at s j)
   ?  (eq c " ")
-     (_ (div r 256))
+     (_ j.inc)
   ?  (eq c 10)
-     (_ (div r 256))
+     (_ j.inc)
   ?  (eq c 13)
-     (_ (div r 256))
+     (_ j.inc)
   ?  (eq c 9)
-     (_ (div r 256))
-  r
+     (_ j.inc)
+  j
 +  lit
-  '  Expect an exact prefix: the tail after it, or .none.
-  \  pre=nat s=nat
+  '  Expect an exact prefix at i: the index just after it, or .none.
+  \  pre=nat s=nat i=nat
   ^  maybe[nat]
-  =  w  (lsh 1 (mul 8 (wid pre)))
-  ?  (eq pre (mod s w))
-     (./some (div s w))
+  =  w  (wid pre)
+  ?  (eq pre (cord/slice s i w))
+     (./some (add i w))
   .none
++  run_cat
+  '  Append the pending verbatim run [run,j) of s to out.  String
+  '  bodies are copied a RUN at a time, not a byte at a time: an
+  '  append rebuilds the accumulator, so per-byte appends make a
+  '  string quadratic in its own length.
+  \  s=nat out=nat run=nat j=nat
+  ^  nat
+  ?  (ge run j)
+     out
+  (cord/cat out (cord/slice s run (sub j run)))
 +  digit
   \  c=nat
   ^  bool
@@ -150,84 +164,91 @@
     (add 128 (mod (div cp 4096) 64))) (add 128 (mod (div cp 64) 64)))
     (add 128 (mod cp 64)))
 +  hex4
-  '  Four hex digits from the front: the codepoint and tail, or .none.
-  \  s=nat
+  '  Four hex digits from i: the codepoint and the index after, or
+  '  .none.
+  \  s=nat i=nat
   ^  maybe[[cp=nat rest=nat]]
-  |  > i=nat 0  > r=nat s  > acc=nat 0
+  |  > k=nat 0  > j=nat i  > acc=nat 0
   ^  maybe[[cp=nat rest=nat]]
-  ?  (eq i 4)
-     (./some [acc r])
-  =  v  (hexv (mod r 256))
+  ?  (eq k 4)
+     (./some [acc j])
+  ?  (cord/eof s j)
+     .none
+  =  v  (hexv (cord/at s j))
   ?  (eq v 16)
      .none
-  (_ i.inc (div r 256) (add (mul acc 16) v))
+  (_ k.inc j.inc (add (mul acc 16) v))
 +  esc2
   '  Append a two-byte escape: backslash then b.
   \  out=nat b=nat
   ^  nat
   (snoc8 (snoc8 out 92) b)
 +  p_str
-  '  A string, from its opening quote.
-  \  s=nat
+  '  A string, from its opening quote at i.  Plain bytes are not
+  '  copied as they are scanned: run holds the start of the current
+  '  unescaped stretch, which is spliced into out only when an escape
+  '  or the closing quote ends it.
+  \  s=nat i=nat
   ^  jres
-  =  s0  (div s 256)
-  |  > r=nat s0  > out=nat 0
+  =  i0  i.inc
+  |  > j=nat i0  > run=nat i0  > out=nat 0
   ^  jres
-  =  c  (mod r 256)
-  ?  (eq c 0)
-     (jres/err "unterminated-string" r)
+  ?  (cord/eof s j)
+     (jres/err "unterminated-string" j)
+  =  c  (cord/at s j)
   ?  (eq c 34)
-     (jres/ok (json/str out) (div r 256))
+     (jres/ok (json/str (run_cat s out run j)) j.inc)
   ?  (lt c 32)
-     (jres/err "control-in-string" r)
+     (jres/err "control-in-string" j)
   ?  (eq c 92)
-     =  e   (mod (div r 256) 256)
-     =  r2  (div r 65536)
+     =  e    (cord/at s j.inc)
+     =  j2   (add j 2)
+     =  out0 (run_cat s out run j)
      ?  (eq e 34)
-        (_ r2 (snoc8 out 34))
+        (_ j2 j2 (snoc8 out0 34))
      ?  (eq e 92)
-        (_ r2 (snoc8 out 92))
+        (_ j2 j2 (snoc8 out0 92))
      ?  (eq e "/")
-        (_ r2 (snoc8 out "/"))
+        (_ j2 j2 (snoc8 out0 "/"))
      ?  (eq e "b")
-        (_ r2 (snoc8 out 8))
+        (_ j2 j2 (snoc8 out0 8))
      ?  (eq e "f")
-        (_ r2 (snoc8 out 12))
+        (_ j2 j2 (snoc8 out0 12))
      ?  (eq e "n")
-        (_ r2 (snoc8 out 10))
+        (_ j2 j2 (snoc8 out0 10))
      ?  (eq e "r")
-        (_ r2 (snoc8 out 13))
+        (_ j2 j2 (snoc8 out0 13))
      ?  (eq e "t")
-        (_ r2 (snoc8 out 9))
+        (_ j2 j2 (snoc8 out0 9))
      ?  (eq e "u")
-        ?  (hex4 r2)
-         > .none  (jres/err "bad-unicode-escape" r2)
+        ?  (hex4 s j2)
+         > .none  (jres/err "bad-unicode-escape" j2)
          > (./some h1)
-           =  [cp=nat r3=nat]  h1
+           =  [cp=nat j3=nat]  h1
            ?  (eq cp 0)
-              (jres/err "nul-in-string" r2)
+              (jres/err "nul-in-string" j2)
            ?  (lt cp 55296)
-              (_ r3 (utf8 out cp))
+              (_ j3 j3 (utf8 out0 cp))
            ?  (gt cp 57343)
-              (_ r3 (utf8 out cp))
+              (_ j3 j3 (utf8 out0 cp))
            ?  (gt cp 56319)
-              (jres/err "lone-low-surrogate" r2)
-           ?  (eq 92 (mod r3 256))
-              ?  (eq "u" (mod (div r3 256) 256))
-                 ?  (hex4 (div r3 65536))
-                  > .none  (jres/err "bad-unicode-escape" r3)
+              (jres/err "lone-low-surrogate" j2)
+           ?  (eq 92 (cord/at s j3))
+              ?  (eq "u" (cord/at s j3.inc))
+                 ?  (hex4 s (add j3 2))
+                  > .none  (jres/err "bad-unicode-escape" j3)
                   > (./some h2)
-                    =  [lo=nat r5=nat]  h2
+                    =  [lo=nat j5=nat]  h2
                     ?  (lt lo 56320)
-                       (jres/err "bad-surrogate-pair" r3)
+                       (jres/err "bad-surrogate-pair" j3)
                     ?  (gt lo 57343)
-                       (jres/err "bad-surrogate-pair" r3)
-                    (_ r5 (utf8 out
+                       (jres/err "bad-surrogate-pair" j3)
+                    (_ j5 j5 (utf8 out0
                       (add 65536 (add (mul (sub cp 55296) 1024) (sub lo 56320)))))
-              (jres/err "lone-high-surrogate" r3)
-           (jres/err "lone-high-surrogate" r3)
-     (jres/err "bad-escape" r)
-  (_ (div r 256) (snoc8 out c))
+              (jres/err "lone-high-surrogate" j3)
+           (jres/err "lone-high-surrogate" j3)
+     (jres/err "bad-escape" j)
+  (_ j.inc run out)
 +  exp_sign
   '  A + or - is part of the number only directly after e or E; a
   '  sign anywhere else ends the literal.
@@ -247,148 +268,152 @@
      .false
   .false
 +  p_num
-  \  s=nat
+  '  A number from i.  The real lexeme is a verbatim source slice
+  '  taken once at the end, so nothing is accumulated per byte.
+  \  s=nat i=nat
   ^  jres
   =  neg
-       ?  (eq "-" (mod s 256))
+       ?  (eq "-" (cord/at s i))
           .true
        .false
-  =  s1
+  =  i1
        ?  neg
-          (div s 256)
-       s
-  =  lex0
-       ?  neg
-          "-"
-       ""
-  ?  (digit (mod s1 256))
-     |  > r=nat s1  > n=nat 0  > lex=nat lex0  > real=bool .false  > prev=nat 0
+          i.inc
+       i
+  ?  (digit (cord/at s i1))
+     |  > j=nat i1  > n=nat 0  > real=bool .false  > prev=nat 0
      ^  jres
-     =  c  (mod r 256)
+     =  c  (cord/at s j)
      ?  (digit c)
-        (_ (div r 256) (add (mul n 10) (sub c "0")) (snoc8 lex c) real c)
+        (_ j.inc (add (mul n 10) (sub c "0")) real c)
      ?  (eq c ".")
-        (_ (div r 256) n (snoc8 lex c) .true c)
+        (_ j.inc n .true c)
      ?  (eq c "e")
-        (_ (div r 256) n (snoc8 lex c) .true c)
+        (_ j.inc n .true c)
      ?  (eq c "E")
-        (_ (div r 256) n (snoc8 lex c) .true c)
+        (_ j.inc n .true c)
      ?  (exp_sign prev c)
-        (_ (div r 256) n (snoc8 lex c) real c)
+        (_ j.inc n real c)
      ?  real
-        (jres/ok (json/real lex) r)
-     (jres/ok (json/num neg n) r)
-  (jres/err "bad-number" s)
+        (jres/ok (json/real (cord/slice s i (sub j i))) j)
+     (jres/ok (json/num neg n) j)
+  (jres/err "bad-number" i)
 +  p_arr
-  '  Array elements, from just past the opening bracket.
-  \  s=nat
+  '  Array elements, from just past the opening bracket at i.
+  \  s=nat i=nat
   ^  jres
-  =  s0  (ws s)
-  ?  (eq "]" (mod s0 256))
-     (jres/ok (json/arr []) (div s0 256))
-  |  > r=nat s0  > xs=row[json] []
+  =  i0  (ws s i)
+  ?  (eq "]" (cord/at s i0))
+     (jres/ok (json/arr []) i0.inc)
+  |  > j=nat i0  > xs=list[json] nil[json]
   ^  jres
-  ?  (p_val r)
+  ?  (p_val s j)
    > (./err why=nat rest=nat)  (jres/err why rest)
    > (./ok v=json rest=nat)
-     =  s1  (ws rest)
-     =  c   (mod s1 256)
+     =  j1  (ws s rest)
+     =  c   (cord/at s j1)
      ?  (eq c ",")
-        (_ (ws (div s1 256)) xs.snoc(v))
+        (_ (ws s j1.inc) (cons v xs))
      ?  (eq c "]")
-        (jres/ok (json/arr xs.snoc(v)) (div s1 256))
-     (jres/err "expected-comma-or-bracket" s1)
+        (jres/ok (json/arr (list_row (cons v xs)).rev) j1.inc)
+     (jres/err "expected-comma-or-bracket" j1)
 +  p_obj
-  '  Object members, from just past the opening brace.
-  \  s=nat
+  '  Object members, from just past the opening brace at i.
+  \  s=nat i=nat
   ^  jres
-  =  s0  (ws s)
-  ?  (eq "}" (mod s0 256))
-     (jres/ok (json/obj []) (div s0 256))
-  |  > r=nat s0  > kvs=row[jkv] []
+  =  i0  (ws s i)
+  ?  (eq "}" (cord/at s i0))
+     (jres/ok (json/obj []) i0.inc)
+  |  > j=nat i0  > kvs=list[jkv] nil[jkv]
   ^  jres
-  ?  (eq 34 (mod r 256))
-     ?  (p_str r)
+  ?  (eq 34 (cord/at s j))
+     ?  (p_str s j)
       > (./err why=nat rest=nat)  (jres/err why rest)
       > (./ok kv=json rest=nat)
         =  key
              ?  kv
               > kt=json/str  kt.s
              0
-        =  s1  (ws rest)
-        ?  (eq ":" (mod s1 256))
-           ?  (p_val (ws (div s1 256)))
+        =  j1  (ws s rest)
+        ?  (eq ":" (cord/at s j1))
+           ?  (p_val s (ws s j1.inc))
             > (./err why2=nat rest2=nat)  (jres/err why2 rest2)
             > (./ok v=json rest2=nat)
-              =  s2  (ws rest2)
-              =  c   (mod s2 256)
+              =  j2  (ws s rest2)
+              =  c   (cord/at s j2)
               ?  (eq c ",")
-                 (_ (ws (div s2 256)) kvs.snoc((jkv key v)))
+                 (_ (ws s j2.inc) (cons (jkv key v) kvs))
               ?  (eq c "}")
-                 (jres/ok (json/obj kvs.snoc((jkv key v))) (div s2 256))
-              (jres/err "expected-comma-or-brace" s2)
-        (jres/err "expected-colon" s1)
-  (jres/err "expected-key" r)
+                 (jres/ok
+                   (json/obj (list_row (cons (jkv key v) kvs)).rev) j2.inc)
+              (jres/err "expected-comma-or-brace" j2)
+        (jres/err "expected-colon" j1)
+  (jres/err "expected-key" j)
 +  p_val
-  \  s=nat
+  '  One value at i.  Leading whitespace is the CALLER's job.
+  \  s=nat i=nat
   ^  jres
-  =  c  (mod s 256)
+  =  c  (cord/at s i)
   ?  (eq c "{")
-     (p_obj (div s 256))
+     (p_obj s i.inc)
   ?  (eq c "[")
-     (p_arr (div s 256))
+     (p_arr s i.inc)
   ?  (eq c 34)
-     (p_str s)
+     (p_str s i)
   ?  (eq c "t")
-     ?  (lit "true" s)
+     ?  (lit "true" s i)
       > (./some r1)  (jres/ok (json/boo .true) r1)
-      > .none  (jres/err "bad-literal" s)
+      > .none  (jres/err "bad-literal" i)
   ?  (eq c "f")
-     ?  (lit "false" s)
+     ?  (lit "false" s i)
       > (./some r2)  (jres/ok (json/boo .false) r2)
-      > .none  (jres/err "bad-literal" s)
+      > .none  (jres/err "bad-literal" i)
   ?  (eq c "n")
-     ?  (lit "null" s)
+     ?  (lit "null" s i)
       > (./some r3)  (jres/ok jnull r3)
-      > .none  (jres/err "bad-literal" s)
+      > .none  (jres/err "bad-literal" i)
   ?  (eq c "-")
-     (p_num s)
+     (p_num s i)
   ?  (digit c)
-     (p_num s)
-  (jres/err "unexpected-byte" s)
+     (p_num s i)
+  (jres/err "unexpected-byte" i)
 +  parse
   '  Decode one complete document: surrounding whitespace allowed,
-  '  trailing garbage is an error.
+  '  trailing garbage is an error.  A jres carries the INDEX it
+  '  stopped at, not the unconsumed tail.
   \  s=nat
   ^  jres
-  ?  (p_val (ws s))
+  ?  (p_val s (ws s 0))
    > (./err why=nat rest=nat)  (jres/err why rest)
    > (./ok v=json rest=nat)
-     ?  (eq 0 (ws rest))
+     ?  (cord/eof s (ws s rest))
         (jres/ok v 0)
      (jres/err "trailing-garbage" rest)
 +  show_str
+  '  A quoted, escaped string.  Scans by index and copies unescaped
+  '  stretches a RUN at a time, the mirror of /p_str .
   \  s=nat
   ^  nat
   =  body
-       |  > r=nat s  > out=nat 0
-       ?  (eq r 0)
-          out
-       =  c  (mod r 256)
+       |  > j=nat 0  > run=nat 0  > out=nat 0
+       ?  (cord/eof s j)
+          (run_cat s out run j)
+       =  c     (cord/at s j)
+       =  out0  (run_cat s out run j)
        ?  (eq c 34)
-          (_ (div r 256) (esc2 out 34))
+          (_ j.inc j.inc (esc2 out0 34))
        ?  (eq c 92)
-          (_ (div r 256) (esc2 out 92))
+          (_ j.inc j.inc (esc2 out0 92))
        ?  (lt c 32)
           ?  (eq c 10)
-             (_ (div r 256) (esc2 out "n"))
+             (_ j.inc j.inc (esc2 out0 "n"))
           ?  (eq c 9)
-             (_ (div r 256) (esc2 out "t"))
+             (_ j.inc j.inc (esc2 out0 "t"))
           ?  (eq c 13)
-             (_ (div r 256) (esc2 out "r"))
-          (_ (div r 256)
-             (cat2 (cat2 (esc2 out "u") "00") (hex2 c)))
-       (_ (div r 256) (snoc8 out c))
+             (_ j.inc j.inc (esc2 out0 "r"))
+          (_ j.inc j.inc
+             (cord/cat (cord/cat (esc2 out0 "u") "00") (hex2 c)))
+       (_ j.inc run out)
   (snoc8 (cat2 34 body) 34)
 +  show
   '  Encode compactly.
@@ -406,26 +431,30 @@
    > y=json/real  y.lex
    > t=json/str  (show_str t.s)
    > a=json/arr
+     '  Pieces are gathered on a list and merged once.  Appending each
+     '  to a growing cord rebuilds it every step, and so does snoc-ing
+     '  onto a growing row: either way a container costs the square of
+     '  its own length.  cons is O(1) and the merge is one pass.
      =  parts
-          |  > i=nat 0  > out=nat "["
+          |  > i=nat 0  > out=list[nat] (cons "[" nil[nat])
           ?  (eq i a.xs.len)
              out
           =  piece  (show a.xs.at(i))
           ?  (eq i 0)
-             (_ i.inc (cat2 out piece))
-          (_ i.inc (cat2 (cat2 out ",") piece))
-     (cat2 parts "]")
+             (_ i.inc (cons piece out))
+          (_ i.inc (cons piece (cons "," out)))
+     (cord/cat_all (list_row (cons "]" parts)).rev)
    > o=json/obj
      =  parts
-          |  > i=nat 0  > out=nat "{"
+          |  > i=nat 0  > out=list[nat] (cons "{" nil[nat])
           ?  (eq i o.kvs.len)
              out
-          =  e  o.kvs.at(i)
-          =  piece  (cat2 (cat2 (show_str e.k) ":") (show e.v))
+          =  e      o.kvs.at(i)
+          =  piece  (cord/cat_all [(show_str e.k) ":" (show e.v)])
           ?  (eq i 0)
-             (_ i.inc (cat2 out piece))
-          (_ i.inc (cat2 (cat2 out ",") piece))
-     (cat2 parts "}")
+             (_ i.inc (cons piece out))
+          (_ i.inc (cons piece (cons "," out)))
+     (cord/cat_all (list_row (cons "}" parts)).rev)
    "null"
 +  rt
   '  Decode then re-encode: the canonical spelling, or the failure's
