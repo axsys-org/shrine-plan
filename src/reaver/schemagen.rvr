@@ -155,7 +155,7 @@
 ;;;
 ;;; ftype:   ["str"] ["int"] ["bool"] ["ref" name] ["row" ftype]
 ;;; field:   [name ftype req]
-;;; typedef: ["rec" name fields] | ["enum" name [vname ..]]
+;;; typedef: ["rec" name fields] | ["enum" name [[vname wire] ..]]
 
 (define (sg-strip-prefix pre s)
   ;; 0 when s lacks the prefix, [tail] otherwise
@@ -320,13 +320,23 @@
       (sg-null-union v)
       [(jv-str! (_0 t))])))
 
-;; Does this property schema admit null in its own right?  Such a field
-;; is optional however the record's `required` list reads.
-(define (sg-nullable? v)
-  (Ifz (Nil (sg-null-union v)) 1
-    (let ((en (jv-get "enum" v)))
-      (Ifz en 0
-        (If (any (lambda (x) (jv? "/boot/json/nul" x)) (jv-xs! (_0 en))) 1 0)))))
+;; Does this schema admit null?  Such a field is optional however the
+;; record's `required` list reads.  A $ref is followed, because the
+;; nullability can be declared on the NAMED type — this document's
+;; InstructType is an enum with a null among its values, and the API
+;; really does send it.
+(define (sg-nullable-go env v depth)
+  (Ifz (Lt depth 16) 0
+    (let ((r (sg-ref-name v)))
+      (Ifz (Nil r)
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (Ifz hit 0 (sg-nullable-go env (Ix 1 (_0 hit)) (Inc depth))))
+        (Ifz (Nil (sg-null-union v)) 1
+          (let ((en (jv-get "enum" v)))
+            (Ifz en 0
+              (If (any (lambda (x) (jv? "/boot/json/nul" x)) (jv-xs! (_0 en)))
+                1 0))))))))
+(define (sg-nullable? env v) (sg-nullable-go env v 0))
 
 (define (sg-ftype-go env v depth)
   (Ifz (Lt depth 24) (sg-error "alias chain too deep" depth)
@@ -396,7 +406,13 @@
     ;; A null among the values is 3.1's nullable-enum spelling, not a
     ;; variant: it is dropped here and shows up as the field being
     ;; optional (see sg-nullable?).
-    (let ((vals (map (lambda (x) (sg-name (jv-str! x)))
+    ;; Each variant keeps BOTH spellings: the normalized foil name and
+    ;; the wire string.  They differ often ("Qwen" is a legal value of
+    ;; this document's ModelGroup, and the variant is qwen), and
+    ;; matching the normalized one against the wire would reject every
+    ;; value that is not already lowercase.
+    (let ((vals (map (lambda (x)
+                       (let ((s (jv-str! x))) [(sg-name s) s]))
                   (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0))
                     (jv-xs! (_0 en))))))
       (Ifz (Sz vals) (sg-error "empty-enum" name)
@@ -416,7 +432,7 @@
                             ;; nullable beats required: a field the
                             ;; server may send as null cannot be bare T
                             (req (If (And (includes (Eq (Ix 0 e)) reqs)
-                                       (Nil (sg-nullable? pv)))
+                                       (Nil (sg-nullable? env pv)))
                                    1 0))
                             (items (jv-get "items" pv))
                             (arr-lift
@@ -707,6 +723,26 @@
         (nrn ">" [(npar [(nrn "./" [(nw "some")]) (nw "j")])
                   (npar [(nw dv) (nw "j") (nw "p")])])])]))
 
+(define (sg-dopt-body ors ty dv)
+  (define decode
+    (nrn "?"
+      [(npar [(nw dv) (nw "j") (nw "p")])
+       (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                        (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                 (nvap ors "err" [(nw "path") (nw "why")])])
+       (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ty)])
+                 (nvap ors "ok" [(nrelap "some" [(nw "v")])])])]))
+  (define present
+    (nrn "?"
+      [(nw "j")
+       (nrn ">" [(nfc "z" (npth ["json" "nul"]))
+                 (nvap ors "ok" [(nrelv "none")])])
+       decode]))
+  (nrn "?"
+    [(nw "m")
+     (nrn ">" [(nrelv "none") (nvap ors "ok" [(nrelv "none")])])
+     (nrn ">" [(npar [(nrn "./" [(nw "some")]) (nw "j")]) present])]))
+
 (define (sg-dopt-tree ft)
   (define key (sg-ft-key ft))
   (define ty (sg-ft-ty-t ft))
@@ -717,18 +753,12 @@
      [(nw (strcat ["d_opt_" key]))
       (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "nat"))])
       (nrn "^" [(nw ors)])
-      (nrn "?"
-        [(nw "m")
-         (nrn ">" [(nrelv "none") (nvap ors "ok" [(nrelv "none")])])
-         (nrn ">"
-           [(npar [(nrn "./" [(nw "some")]) (nw "j")])
-            (nrn "?"
-              [(npar [(nw dv) (nw "j") (nw "p")])
-               (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                                (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
-                         (nvap ors "err" [(nw "path") (nw "why")])])
-               (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ty)])
-                         (nvap ors "ok" [(nrelap "some" [(nw "v")])])])])])])])])
+      ;; An explicit null reads as absent.  A key the server sends as
+      ;; null is not a value this field can hold, and EVERY nullable
+      ;; spelling lands here — type: [T,null], a null among enum
+      ;; values, or either of those behind a $ref — rather than each
+      ;; needing to be recognised at the use site.
+      (sg-dopt-body ors ty dv)])])
 
 ;; Helper members for one field use, emitted once per (part, key).
 (define (sg-part-trees seen ft req opt)
@@ -873,13 +903,18 @@
         (foldl (lambda (acc i) (Weld acc (field-trees i))) []
           (gen n (lambda (i) i)))))))
 
+;; vals are [variant-name wire-string] pairs: the foil variant is the
+;; normalized name, but decode and encode both speak the wire string.
+(define (sg-vname p) (_0 p))
+(define (sg-vwire p) (Ix 1 p))
+
 (define (sg-enum-decl-tree name vals)
   (nrn "+"
     (Weld
       [(nw name)
-       (nrn "&" (map (lambda (v) (npth [name v])) vals))]
-      (map (lambda (v)
-             (nrn "+" [(nw v) (nrn ":" [(nfc "z" (nw "nat"))])]))
+       (nrn "&" (map (lambda (p) (npth [name (sg-vname p)])) vals))]
+      (map (lambda (p)
+             (nrn "+" [(nw (sg-vname p)) (nrn ":" [(nfc "z" (nw "nat"))])]))
         vals))))
 
 (define (sg-enum-from-tree name vals)
@@ -893,9 +928,11 @@
         (nrn ">"
           (Weld [(nfc "t" (npth ["json" "str"]))]
             (snoc (nvap rsum "err" [(nw "p") (nc "bad-enum")])
-              (map (lambda (v)
-                     (nrn "?" [(npar [(nw "eq") (ndotw "t" "s") (nc v)])
-                               (nvap rsum "ok" [(nvap name v [(nw "0")])])]))
+              (map (lambda (p)
+                     (nrn "?" [(npar [(nw "eq") (ndotw "t" "s")
+                                      (nc (sg-vwire p))])
+                               (nvap rsum "ok"
+                                 [(nvap name (sg-vname p) [(nw "0")])])]))
                 vals))))
         (nvap rsum "err" [(nw "p") (nc "expected-string")])])]))
 
@@ -907,11 +944,13 @@
      (nrn "?"
        (Weld
          (Weld [(nw "x")]
-           (map (lambda (v)
-                  (nrn ">" [(nfc (strcat ["e_" v]) (npth [name v]))
-                            (npar [(npth ["json" "str"]) (nc v)])]))
+           (map (lambda (p)
+                  (nrn ">" [(nfc (strcat ["e_" (sg-vname p)])
+                              (npth [name (sg-vname p)]))
+                            (npar [(npth ["json" "str"])
+                                   (nc (sg-vwire p))])]))
              vals))
-         [(npar [(npth ["json" "str"]) (nc (_0 vals))])]))]))
+         [(npar [(npth ["json" "str"]) (nc (sg-vwire (_0 vals)))])]))]))
 
 (define sg-prelude-trees
   [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
@@ -1105,7 +1144,41 @@
             (jv-str! (sg-need "url" (_0 xs) "spec: server needs url"))))))
     (Ifz (jv-get "basePath" sv) "" (jv-str! (_0 (jv-get "basePath" sv))))))
 
+;; What the url builders BAKE IN, as distinct from what the caller
+;; injects at the root record's ['base].  Swagger 2.0's basePath is a
+;; path fragment, so it belongs in the url and the caller supplies only
+;; an origin.  OpenAPI 3.x's servers[0].url is already the whole
+;; origin-plus-prefix and IS the injected base, so nothing is baked —
+;; baking it too would spell the host twice.
+(define (sg-spec-url-prefix sv)
+  (If (sg-v3? sv) "" (sg-spec-base sv)))
+
 (define sg-json-mt "application/json")
+
+;; How the document says a client authenticates, in the only shape the
+;; hand can act on: a request header.  -> 0, or [header-name prefix]
+;; where the header value is prefix ++ the credential.  A query-key or
+;; OAuth flow is a different shape and is not guessed at.  The header
+;; name is lowercased: HTTP field names are case-insensitive, and a
+;; lowercase quip needs no escaping in the emitted path literal.
+(define (sg-spec-auth sv)
+  (define c (jv-get "components" sv))
+  (define (str-at k s d)
+    (define r (jv-get k s))
+    (Ifz r d (jv-str! (_0 r))))
+  (Ifz c 0
+    (let ((ss (jv-get "securitySchemes" (_0 c))))
+      (Ifz ss 0
+        (let ((es (jv-kvs (_0 ss))))
+          (Ifz (Sz es) 0
+            (let* ((s (Ix 1 (_0 es)))
+                   (ty (str-at "type" s ""))
+                   (sc (str-at "scheme" s "")))
+              (cond
+                ((And (Eq ty "http") (Eq sc "bearer")) ["authorization" "Bearer "])
+                ((And (Eq ty "apiKey") (Eq "header" (str-at "in" s "")))
+                  [(sg-norm-name (str-at "name" s "authorization")) ""])
+                (else 0)))))))))
 
 ;; The application/json schema out of a 3.x content map.  Other media
 ;; types (text/event-stream, multipart, audio/*) are a driver-protocol
@@ -1345,7 +1418,7 @@
         [] (Seq nm-ok wanted))))
   (define ops
     (map (lambda (e) (sg-op-of env sv v3 (Ix 0 e) (Ix 1 e) (Ix 2 e))) ents))
-  [name base tds ops])
+  [name base tds ops (sg-spec-auth sv) (sg-spec-url-prefix sv)])
 
 ;; Back-compat: the whole document, every operation.
 (define (sg-swagger-parts sv) (sg-spec-parts sv []))
@@ -1443,6 +1516,47 @@
       (nrn "^" [(nw "nat")])
       (nrn "?"
         [(nmget (nw "cur") (npl ["base"]))
+         (nsome-arm "held" (nw "pail")
+           [(nrn "?" [(nw "held")
+                      (nrn ">" [(nfc "t" (npth ["pails" "t"]))
+                                (ndotw "t" "t")])
+                      (nw "0")])])
+         (nw "0")])])
+   (nrn "+"
+     [(nw "qjoin")
+      (nslug ["The query string from k=v fragments, skipping the absent"
+              "ones (0): ? before the first that is set, & between the"
+              "rest.  Empty when nothing is set.  Values are spliced"
+              "verbatim — percent-encoding is not done yet."])
+      (nrn "\" [(nfc "ps" (nspec "row" [(nw "nat")]))])
+      (nrn "^" [(nw "nat")])
+      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
+                          (nrn ">" [(nfc "out" (nw "nat")) (nw "0")
+                                    (nrn ">" [(nfc "some" (nw "bool"))
+                                              (nrelv "false")])])])])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "ps" "len")])
+                (nw "out")])
+      (nrn "=" [(nw "p") (nmeth (nw "ps") "at" [(nw "i")])])
+      (nrn "?" [(npar [(nw "eq") (nw "p") (nw "0")])
+                (nself [(ndotw "i" "inc") (nw "out") (nw "some")])])
+      (nrn "?" [(nw "some")
+                (nself [(ndotw "i" "inc")
+                        (npar [(nw "cat2")
+                               (npar [(nw "cat2") (nw "out") (nc "&")])
+                               (nw "p")])
+                        (nrelv "true")])])
+      (nself [(ndotw "i" "inc")
+              (npar [(nw "cat2") (nc "?") (nw "p")])
+              (nrelv "true")])])
+   (nrn "+"
+     [(nw "auth_of")
+      (nslug ["The credential from the root record's ['auth], or 0 when"
+              "none was injected — an unauthenticated call is a real"
+              "case, so a missing credential is not an error here."])
+      (nrn "\" [(nfc "cur" (nw "myth"))])
+      (nrn "^" [(nw "nat")])
+      (nrn "?"
+        [(nmget (nw "cur") (npl ["auth"]))
          (nsome-arm "held" (nw "pail")
            [(nrn "?" [(nw "held")
                       (nrn ">" [(nfc "t" (npth ["pails" "t"]))
@@ -1560,7 +1674,7 @@
                         (nw "pail")
                         [(nrn "="
                             [(nw "fr")
-                              (npar [(nw "fetch_for") (npar [(nw "base_of") (nw "cur")]) (nw "held")])])
+                              (npar [(nw "fetch_for") (npar [(nw "base_of") (nw "cur")]) (npar [(nw "auth_of") (nw "cur")]) (nw "held")])])
                           (nrn "?" [(npar [(nw "eq") (nw "0") (ndotw "fr" "len")]) nskip])
                           (nrn "?"
                             [(npar [(nw "http_of") (nw "out")])
@@ -1705,6 +1819,8 @@
     (cond
       ((Eq "int" (_0 ft)) (npar [(nw "show_nat") x]))
       ((Eq "str" (_0 ft)) x)
+      ;; a number is already carried as its decimal text
+      ((Eq "num" (_0 ft)) x)
       (else (sg-error "swagger: unsupported url param type" ft))))
   (define (pft name)
     (define hit (find (lambda (pp) (Eq name (Ix 0 pp))) pparams))
@@ -1746,25 +1862,29 @@
                (If (Ix 2 qp) (sg-ft-ty-t (Ix 1 qp))
                  (sg-maybe-t (sg-ft-ty-t (Ix 1 qp))))))
         qparams)))
+  ;; Each query param becomes a "k=v" fragment, or 0 when an optional
+  ;; one is absent.  Which fragment gets the "?" and which get "&"
+  ;; cannot be decided here — it depends on what is set at the call —
+  ;; so qjoin settles it at runtime.
+  (define (qfrag qp)
+    (define qn (Ix 0 qp))
+    (define pref (nc (strcat [qn "="])))
+    (define (kv x) (npar [(nw "cat2") pref (conv (Ix 1 qp) x)]))
+    (nrn "="
+      [(nw (strcat ["q_" qn]))
+       (If (Ix 2 qp)
+         (kv (nw qn))
+         (nrn "?" [(nw qn)
+                   (nnone-arm (nw "0"))
+                   (nsome-arm "qv" 0 [(kv (nw "qv"))])]))]))
   (define qtail
-    ;; at most ONE query param (v1); optional -> maybe match
-    (cond
-      ((Eq 0 (Sz qparams)) [(nw "u1")])
-      ((Eq 1 (Sz qparams))
-        (let* ((qp (_0 qparams))
-               (qn (Ix 0 qp))
-               (qc (lambda (x) (conv (Ix 1 qp) x)))
-               (pref (nc (strcat ["?" qn "="]))))
-          (If (Ix 2 qp)
-            [(npar [(nw "cat2") (npar [(nw "cat2") (nw "u1") pref])
-                    (qc (nw qn))])]
-            [(nrn "?"
-               [(nw qn)
-                (nnone-arm (nw "u1"))
-                (nsome-arm "qv" 0
-                  [(npar [(nw "cat2") (npar [(nw "cat2") (nw "u1") pref])
-                          (qc (nw "qv"))])])])])))
-      (else (sg-error "swagger: at most one query param per op (v1)" opid))))
+    (Ifz (Sz qparams) [(nw "u1")]
+      (Weld (map qfrag qparams)
+        [(npar [(nw "cat2") (nw "u1")
+                (npar [(nw "qjoin")
+                       (nbrk (map (lambda (qp)
+                                    (nw (strcat ["q_" (Ix 0 qp)])))
+                               qparams))])])])))
   (nrn "+"
     (Weld
       [(nw (strcat ["url_" opid]))
@@ -1796,7 +1916,16 @@
         ops))))
 
 ;; fetch_for: the driver request myth per req variant.
-(define (sg-fetch-for-tree ops)
+(define (sg-fetch-for-tree ops auth)
+  ;; The driver honors one ['hdr <name>] slot per request header, so the
+  ;; credential rides as a slot put onto the request record rather than
+  ;; anything the fetch/req builder knows about.
+  (define (with-auth req)
+    (Ifz auth req
+      (nmeth req "put"
+        [(npl ["hdr" (_0 auth)])
+         (npar [(nw "pd")
+                (npar [(nw "cat2") (nc (Ix 1 auth)) (nw "auth")])])])))
   (define (arm i op)
     (define opid (Ix 0 op))
     (define b (nw (strcat ["g" (nat-str i)])))
@@ -1818,17 +1947,19 @@
         (else (sg-error "swagger: unsupported method" (Ix 1 op)))))
     (nrn ">"
       [(nfc (strcat ["g" (nat-str i)]) (npth ["req" opid]))
-       (nbrk [(npar (Weld [(npth ["fetch" "req"]) (nc mth)
-                           (npar (Weld [(nw (strcat ["url_" opid]))
-                                        (nw "base")]
-                                   url-args))]
-                      [body-expr (nw "30000")]))])]))
+       (nbrk [(with-auth
+                (npar (Weld [(npth ["fetch" "req"]) (nc mth)
+                             (npar (Weld [(nw (strcat ["url_" opid]))
+                                          (nw "base")]
+                                     url-args))]
+                        [body-expr (nw "30000")])))])]))
   (nrn "+"
     (Weld
       [(nw "fetch_for")
        (nslug ["The driver request myth for one req variant, or empty"
                "row when the pail is not a request."])
-       (nrn "\" [(nfc "base" (nw "nat")) (nfc "held" (nw "pail"))])
+       (nrn "\" [(nfc "base" (nw "nat")) (nfc "auth" (nw "nat"))
+                 (nfc "held" (nw "pail"))])
        (nrn "^" [(nspec "row" [(nw "myth")])])]
       (Weld [(nrn "?" (Weld [(nw "held")]
                         (Weld (map (lambda (i) (arm i (Ix i ops)))
@@ -1873,7 +2004,8 @@
 ;; arrangement the hand-written reference validated.
 (define (sg-swagger-hand-tree parts)
   (define name (_0 parts))
-  (define base (Ix 1 parts))
+  ;; the prefix to bake, NOT the injected base — see sg-spec-url-prefix
+  (define base (Ix 5 parts))
   (define ops (Ix 3 parts))
   [(strcat [name "_hand"])
    (ngrp
@@ -1887,7 +2019,7 @@
          (Weld [(sg-req-sum-tree ops)]
            (Weld (map (lambda (o) (sg-url-tree base o)) ops)
              (Weld sg-hand-fixed-trees-a
-               (Weld [(sg-fetch-for-tree ops)]
+               (Weld [(sg-fetch-for-tree ops (Ix 4 parts))]
                  (Weld sg-hand-fixed-trees-b
                    (Weld [(sg-resp-for-tree ops)]
                      (sg-hand-fixed-trees-c name))))))))))])
