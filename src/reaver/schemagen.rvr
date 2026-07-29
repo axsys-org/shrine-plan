@@ -180,19 +180,169 @@
   (define r (jv-get "$ref" v))
   (Ifz r 0 [(sg-ref-target (jv-str! (_0 r)))]))
 
-;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"].  It is a
-;; distinct feature, not a malformed type, and saying so keeps the
-;; coverage histogram honest.
+;;; allOf, and schemas that are only aliases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Many named schemas are not types in their own right: a bare $ref, a
+;;; $ref wrapped in allOf so prose can hang off it (59 of this
+;;; document's 95 allOf sites are exactly that), an array of something
+;;; else, a bare string.  Minting a nominal foil type for each would
+;;; produce hundreds of one-field wrappers that callers then have to
+;;; convert between, all of them structurally identical.  They are
+;;; ALIASES: nothing is emitted, and every reference resolves through.
+;;;
+;;; The allOf sites that DO add something are single inheritance —
+;;; base plus extra fields — and get merged.  `required` merges
+;;; separately from `properties`, because a branch may add no field at
+;;; all and only promote one it inherited.
+
+(define (sg-allof v)
+  (define r (jv-get "allOf" v))
+  (Ifz r [] (jv-xs! (_0 r))))
+
+(define (sg-props-of v)
+  (define r (jv-get "properties" v))
+  (Ifz r [] (jv-kvs (_0 r))))
+
+(define (sg-reqs-of v)
+  (define r (jv-get "required" v))
+  (Ifz r [] (map jv-str! (jv-xs! (_0 r)))))
+
+;; Does a branch contribute anything beyond prose?
+(define (sg-branch-adds? b)
+  (Or (If (Sz (sg-props-of b)) 1 0)
+    (Or (If (Sz (sg-reqs-of b)) 1 0)
+      (Or (Ifz (jv-get "enum" b) 0 1)
+        (Ifz (jv-get "items" b) 0 1)))))
+
+(define (sg-ref-branches ao)
+  (filter (lambda (b) (Ifz (Nil (sg-ref-name b)) 1 0)) ao))
+
+(define sg-prim-types ["string" "integer" "boolean" "number" "array"])
+
+;; The declared type, ignoring a null beside it (the nullable reading
+;; proper is sg-null-union, below).  -> 0 or [string]
+(define (sg-type-str-raw v)
+  (define t (jv-get "type" v))
+  (Ifz t 0
+    (If (jv-arr? (_0 t))
+      (let ((real (filter (lambda (x) (Ifz (Eq "null" x) 1 0))
+                    (map jv-str! (jv-xs! (_0 t))))))
+        (Ifz (Sz real) 0 [(_0 real)]))
+      [(jv-str! (_0 t))])))
+
+;; Is this named schema merely a pointer at another type?
+;; -> 0, or [the schema to take the ftype from instead]
+(define (sg-alias-subst v)
+  (define ao (sg-allof v))
+  (define refs (sg-ref-branches ao))
+  (cond
+    ;; a bare $ref
+    ((Ifz (Nil (sg-ref-name v)) 1 0) [v])
+    ;; exactly one $ref branch, and nothing else adds a field
+    ((And (Sz ao)
+       (And (Eq 1 (Sz refs)) (Ifz (any sg-branch-adds? ao) 1 0)))
+      [(_0 refs)])
+    ;; any other allOf is a real merge
+    ((Sz ao) 0)
+    ;; an enum is a type of its own, whatever its base type says
+    ((Ifz (jv-get "enum" v) 0 1) 0)
+    (else
+      (let ((t (sg-type-str-raw v)))
+        (Ifz t 0
+          (If (includes (Eq (_0 t)) sg-prim-types) [v] 0))))))
+
+;; name -> substitute schema, for every alias in the document.
+(define (sg-alias-map defs)
+  (foldl
+    (lambda (acc e)
+      (let ((al (sg-alias-subst (Ix 1 e))))
+        (Ifz (Nil al) (snoc [(Ix 0 e) (_0 al)] acc) acc)))
+    [] defs))
+
+(define (sg-alias-look aliases nm)
+  (define hit (find (lambda (e) (Eq nm (Ix 0 e))) aliases))
+  (Ifz hit 0 [(Ix 1 (_0 hit))]))
+
+;; An env threads the document's schemas and its alias map through
+;; ftype resolution.
+(define (sg-env defs) [defs (sg-alias-map defs)])
+(define (sg-env-defs env) (_0 env))
+(define (sg-env-aliases env) (_1 env))
+(define sg-env-none [[] []])
+
+;; A record view of a schema with allOf resolved: [props reqs].
+(define (sg-flat-record env v depth)
+  (Ifz (Lt depth 24) (sg-error "allOf nested too deep" depth)
+    (let ((ao (sg-allof v)))
+      (Ifz (Sz ao) [(sg-props-of v) (sg-reqs-of v)]
+        (foldl
+          (lambda (acc b)
+            (let* ((r (sg-ref-name b))
+                   (bs (Ifz (Nil r)
+                         (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e)))
+                                     (sg-env-defs env))))
+                           (Ifz hit
+                             (sg-error "dangling-ref (no such schema)" (_0 r))
+                             (Ix 1 (_0 hit))))
+                         b))
+                   (sub (sg-flat-record env bs (Inc depth))))
+              ;; a later branch's field wins; required is a union
+              [(Weld
+                 (filter (lambda (x)
+                           (Ifz (find (lambda (y) (Eq (Ix 0 y) (Ix 0 x))) (_0 sub))
+                             1 0))
+                   (_0 acc))
+                 (_0 sub))
+               (Weld (_1 acc) (_1 sub))]))
+          [(sg-props-of v) (sg-reqs-of v)] ao)))))
+
+;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"] — one real
+;; type beside the null.  It becomes T, and the field carrying it
+;; becomes OPTIONAL: absent and explicitly null both read as .none,
+;; which is a deliberate flattening of a distinction foil's maybe
+;; cannot make.  A union of two real types is a different feature
+;; (oneOf's business) and is still rejected.
+;; -> 0, or [type-string]
+(define (sg-null-union v)
+  (define t (jv-get "type" v))
+  (Ifz t 0
+    (Ifz (jv-arr? (_0 t)) 0
+      (let* ((xs (map jv-str! (jv-xs! (_0 t))))
+             (real (filter (lambda (x) (Ifz (Eq "null" x) 1 0)) xs)))
+        (If (And (includes (Eq "null") xs) (Eq 1 (Sz real)))
+          [(_0 real)]
+          (sg-error "type-union of two real types (needs oneOf)" xs))))))
+
 (define (sg-type-str v)
   (define t (jv-get "type" v))
   (Ifz t 0
     (If (jv-arr? (_0 t))
-      (sg-error "nullable-type-union (type: [T,null])" (_0 t))
+      (sg-null-union v)
       [(jv-str! (_0 t))])))
 
-(define (sg-ftype-of v)
-  (define r (sg-ref-name v))
-  (Ifz (Nil r) ["ref" (sg-name (_0 r))]
+;; Does this property schema admit null in its own right?  Such a field
+;; is optional however the record's `required` list reads.
+(define (sg-nullable? v)
+  (Ifz (Nil (sg-null-union v)) 1
+    (let ((en (jv-get "enum" v)))
+      (Ifz en 0
+        (If (any (lambda (x) (jv? "/boot/json/nul" x)) (jv-xs! (_0 en))) 1 0)))))
+
+(define (sg-ftype-go env v depth)
+  (Ifz (Lt depth 24) (sg-error "alias chain too deep" depth)
+  (let ((r (sg-ref-name v)))
+  (Ifz (Nil r)
+    ;; a reference to an alias resolves through to what it names
+    (let ((al (sg-alias-look (sg-env-aliases env) (_0 r))))
+      (Ifz (Nil al)
+        (sg-ftype-go env (_0 al) (Inc depth))
+        ["ref" (sg-name (_0 r))]))
+    ;; an allOf here is either an alias to a $ref or an inline object
+    (If (Sz (sg-allof v))
+      (let ((al (sg-alias-subst v)))
+        (Ifz (Nil al)
+          (sg-ftype-go env (_0 al) (Inc depth))
+          (sg-error "inline-object (hoist to $defs)" v)))
     (Ifz (Nil (jv-get "enum" v))
       (sg-error "inline-enum (hoist to $defs)" v)
       (let ((t (sg-type-str v)))
@@ -202,39 +352,103 @@
               ((Eq ty "string") ["str"])
               ((Eq ty "integer") ["int"])
               ((Eq ty "boolean") ["bool"])
-              ((Eq ty "number") (sg-error "float-unsupported (no honest representation yet)" v))
+              ;; A JSON number arrives as its DECIMAL TEXT, because
+              ;; there is no honest float here and a client does not
+              ;; need one — it must show what it received and send
+              ;; back what it was given, and the lexeme does both
+              ;; exactly.  Integral numbers render canonically.
+              ((Eq ty "number") ["num"])
               ((Eq ty "object") (sg-error "inline-object (hoist to $defs)" v))
               ((Eq ty "array")
                 (let ((it (jv-get "items" v)))
                   (Ifz it (sg-error "array-without-items" v)
-                    (let ((et (sg-ftype-of (_0 it))))
+                    (let ((et (sg-ftype-go env (_0 it) (Inc depth))))
                       (If (Eq "row" (_0 et))
                         (sg-error "nested-array-unsupported" v)
                         ["row" et])))))
-              (else (sg-error "unsupported-type" ty)))))))))
+              (else (sg-error "unsupported-type" ty))))))))))))
 
-(define (sg-typedef-of name v)
+(define (sg-ftype-of env v) (sg-ftype-go env v 0))
+
+;; A property carrying a whole record inline needs a name of its own.
+;; It is LIFTED and referenced, never flattened into the parent: the
+;; nesting has to survive the encode direction.
+(define (sg-liftable? env v)
+  (And (Nil (sg-ref-name v))
+    (And (Nil (sg-alias-subst v))
+      (And (Ifz (jv-get "enum" v) 1 0)
+        (If (Sz (_0 (sg-flat-record env v 0))) 1 0)))))
+
+;; The minted name must not collide with one the document already uses.
+(define (sg-mint env owner fname)
+  (define nm (strcat [owner "_" fname]))
+  (define taken
+    (any (lambda (e) (Eq nm (sg-norm-name (Ix 0 e)))) (sg-env-defs env)))
+  (If taken
+    (sg-error "lifted-name collides with a declared schema" nm)
+    nm))
+
+;; -> [typedef [extra-typedef ..]]   extras are lifted inline objects
+(define (sg-typedef-go env name v depth)
   (define en (jv-get "enum" v))
+  (Ifz (Lt depth 12) (sg-error "inline objects nested too deep" name)
   (Ifz (Nil en)
+    ;; A null among the values is 3.1's nullable-enum spelling, not a
+    ;; variant: it is dropped here and shows up as the field being
+    ;; optional (see sg-nullable?).
     (let ((vals (map (lambda (x) (sg-name (jv-str! x)))
-                  (jv-xs! (_0 en)))))
+                  (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0))
+                    (jv-xs! (_0 en))))))
       (Ifz (Sz vals) (sg-error "empty-enum" name)
-        ["enum" name vals]))
-    (let ((t (sg-type-str v)))
-      (Ifz (And t (Eq "object" (_0 t)))
+        [["enum" name vals] []]))
+    ;; a record: its own properties, plus any inherited through allOf
+    (let* ((flat (sg-flat-record env v 0))
+           (props (_0 flat))
+           (reqs (_1 flat))
+           (t (sg-type-str v)))
+      (Ifz (Or (Sz (sg-allof v)) (And t (Eq "object" (_0 t))))
         (sg-error "unsupported-def (want object or enum)" name)
-        (let* ((props-r (jv-get "properties" v))
-               (props (Ifz props-r [] (jv-kvs (_0 props-r))))
-               (reqs-r (jv-get "required" v))
-               (reqs (Ifz reqs-r [] (map jv-str! (jv-xs! (_0 reqs-r)))))
-               (fields
-                 (map (lambda (e)
-                        (let ((fname (sg-name (Ix 0 e))))
-                          [fname (sg-ftype-of (Ix 1 e))
-                           (If (includes (Eq (Ix 0 e)) reqs) 1 0)]))
-                   props)))
+        (let* ((step
+                 (foldl
+                   (lambda (acc e)
+                     (let* ((fname (sg-name (Ix 0 e)))
+                            (pv (Ix 1 e))
+                            ;; nullable beats required: a field the
+                            ;; server may send as null cannot be bare T
+                            (req (If (And (includes (Eq (Ix 0 e)) reqs)
+                                       (Nil (sg-nullable? pv)))
+                                   1 0))
+                            (items (jv-get "items" pv))
+                            (arr-lift
+                              (And (Ifz items 0 1)
+                                (If items (sg-liftable? env (_0 items)) 0))))
+                       (cond
+                         ((sg-liftable? env pv)
+                           (let* ((nm (sg-mint env name fname))
+                                  (sub (sg-typedef-go env nm pv (Inc depth))))
+                             [(snoc [fname ["ref" nm] req] (_0 acc))
+                              (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
+                         (arr-lift
+                           (let* ((nm (sg-mint env name fname))
+                                  (sub (sg-typedef-go env nm (_0 items)
+                                         (Inc depth))))
+                             [(snoc [fname ["row" ["ref" nm]] req] (_0 acc))
+                              (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
+                         (else
+                           [(snoc [fname (sg-ftype-of env pv) req] (_0 acc))
+                            (_1 acc)]))))
+                   [[] []] props))
+               (fields (_0 step)))
           (Ifz (Sz fields) (sg-error "empty-object" name)
-            ["rec" name fields]))))))
+            [["rec" name fields] (_1 step)])))))))
+
+;; The typedef alone, for callers that only need to know it elaborates.
+(define (sg-typedef-of env name v) (_0 (sg-typedef-go env name v 0)))
+
+;; The typedef plus everything lifted out of it, in emission order.
+(define (sg-typedefs-of env name v)
+  (define r (sg-typedef-go env name v 0))
+  (snoc (_0 r) (_1 r)))
 
 ;; ref names reachable from a typedef's fields.
 (define (sg-ft-refs ft)
@@ -270,11 +484,15 @@
     (Ifz title-r (sg-error "missing-title" 0)
       (sg-name (jv-str! (_0 title-r)))))
   (define defs-r (jv-get "$defs" sv))
+  (define defs (Ifz defs-r [] (jv-kvs (_0 defs-r))))
+  (define env (sg-env defs))
+  ;; aliases emit nothing: references to them resolved through already
   (define def-tds
-    (Ifz defs-r []
-      (map (lambda (e) (sg-typedef-of (sg-name (Ix 0 e)) (Ix 1 e)))
-        (jv-kvs (_0 defs-r)))))
-  (define tds (snoc (sg-typedef-of root-name sv) def-tds))
+    (foldl (lambda (acc e)
+            (Weld acc (sg-typedefs-of env (sg-name (Ix 0 e)) (Ix 1 e))))
+      []
+      (filter (lambda (e) (Nil (sg-alias-subst (Ix 1 e)))) defs)))
+  (define tds (Weld (sg-typedefs-of env root-name sv) def-tds))
   (define names (map (Ix 1) tds))
   (Ifz (Eq (Sz names) (Sz (dedupe-eq names)))
     (sg-error "duplicate-type-name" names)
@@ -294,6 +512,7 @@
     ((Eq "str" (_0 ft)) "str")
     ((Eq "int" (_0 ft)) "int")
     ((Eq "bool" (_0 ft)) "boo")
+    ((Eq "num" (_0 ft)) "num")
     ((Eq "ref" (_0 ft)) (Ix 1 ft))
     ((Eq "row" (_0 ft)) (strcat ["row_" (sg-ft-key (Ix 1 ft))]))))
 
@@ -385,6 +604,8 @@
     ((Eq "str" (_0 ft)) (nw "nat"))
     ((Eq "int" (_0 ft)) (nw "nat"))
     ((Eq "bool" (_0 ft)) (nw "bool"))
+    ;; decimal text, not an arithmetic value
+    ((Eq "num" (_0 ft)) (nw "nat"))
     ((Eq "ref" (_0 ft)) (nw (Ix 1 ft)))
     ((Eq "row" (_0 ft)) (nspec "row" [(sg-ft-ty-t (Ix 1 ft))]))))
 
@@ -423,6 +644,19 @@
         (nrn "?" [(nw "j")
                   (nrn ">" [(nfc "t" (npth ["json" "boo"])) (ok (ndotw "t" "b"))])
                   (err "expected-boolean")]))
+      ;; A number keeps its decimal text: json/real already holds the
+      ;; source lexeme, and an integral json/num is rendered back to
+      ;; the same spelling it arrived with.
+      ((Eq "num" (_0 ft))
+        (nrn "?" [(nw "j")
+                  (nrn ">" [(nfc "t" (npth ["json" "real"])) (ok (ndotw "t" "lex"))])
+                  (nrn ">" [(nfc "t" (npth ["json" "num"]))
+                            (nrn "?" [(ndotw "t" "neg")
+                                      (ok (npar [(nw "cat2") (nc "-")
+                                                 (npar [(nw "show_nat")
+                                                        (ndotw "t" "n")])]))])
+                            (ok (npar [(nw "show_nat") (ndotw "t" "n")]))])
+                  (err "expected-number")]))
       ((Eq "row" (_0 ft))
         (let* ((et (Ix 1 ft))
                (ety (sg-ft-ty-t et))
@@ -570,6 +804,8 @@
     ((Eq "str" (_0 ft)) (npar [(npth ["json" "str"]) exp]))
     ((Eq "int" (_0 ft)) (npar [(npth ["json" "num"]) (nrelv "false") exp]))
     ((Eq "bool" (_0 ft)) (npar [(npth ["json" "boo"]) exp]))
+    ;; the stored decimal text goes back out verbatim, unquoted
+    ((Eq "num" (_0 ft)) (npar [(npth ["json" "real"]) exp]))
     ((Eq "ref" (_0 ft)) (npar [(nw (strcat [(Ix 1 ft) "_to"])) exp]))
     (else (sg-error "enc-of-row-inline" ft))))
 
@@ -1026,7 +1262,7 @@
             (sg-need (_0 tail) (sg-need "parameters" (_0 c) "spec: no components.parameters")
               "spec: no such component parameter")))))))
 
-(define (sg-op-of sv v3 pathstr method opv)
+(define (sg-op-of env sv v3 pathstr method opv)
   (define opid
     (sg-name (jv-str! (sg-need "operationId" opv "spec: op needs operationId"))))
   (define params
@@ -1038,9 +1274,16 @@
       (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
         (Ix 0 (_0 (jv-get "required" p))) 0)))
   ;; 3.x puts a parameter's type under `schema`; 2.0 inlines it.
+  ;; An enum in a path or query parameter stays a STRING: on the wire
+  ;; it is one, the constraint is the server's to enforce, and minting
+  ;; a sum per query filter would bury the caller in variants.  Enums
+  ;; in bodies and responses are types and are not treated this way.
   (define (ptype p)
     (define s (jv-get "schema" p))
-    (Ifz s (sg-ftype-of p) (sg-ftype-of (_0 s))))
+    (define pv (Ifz s p (_0 s)))
+    (Ifz (jv-get "enum" pv)
+      (sg-ftype-of env pv)
+      ["str"]))
   (define (fold-param acc p)
     (define where (jv-str! (sg-need "in" p "spec: param needs in")))
     (define pname (sg-name (jv-str! (sg-need "name" p "spec: param needs name"))))
@@ -1076,23 +1319,32 @@
   (define name (sg-spec-title sv))
   (define base (sg-spec-base sv))
   (define schemas (sg-spec-schemas sv))
+  (define env (sg-env schemas))
   (define ents
     (Ifz (Sz opids) (sg-spec-op-entries sv) (sg-select-ops sv opids)))
-  (define wanted
+  (define reachable
     (Ifz (Sz opids) (map (lambda (e) (Ix 0 e)) schemas)
       (sg-closure schemas
         (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents))))
+  ;; an alias is not a type: nothing is emitted for it, and references
+  ;; to it were already resolved through by sg-ftype-of
+  (define wanted
+    (filter (lambda (nm)
+              (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
+                (Ifz hit 1 (Nil (sg-alias-subst (Ix 1 (_0 hit)))))))
+      reachable))
   ;; injectivity is asserted over the names we actually emit
   (define nm-ok (sg-name-map wanted))
   (define tds
     (sg-topo
-      (map (lambda (nm)
-             (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
-               (Ifz hit (sg-error "dangling-ref (no such schema)" nm)
-                 (sg-typedef-of (sg-name nm) (Ix 1 (_0 hit))))))
-        (Seq nm-ok wanted))))
+      (foldl
+        (lambda (acc nm)
+          (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
+            (Ifz hit (sg-error "dangling-ref (no such schema)" nm)
+              (Weld acc (sg-typedefs-of env (sg-name nm) (Ix 1 (_0 hit)))))))
+        [] (Seq nm-ok wanted))))
   (define ops
-    (map (lambda (e) (sg-op-of sv v3 (Ix 0 e) (Ix 1 e) (Ix 2 e))) ents))
+    (map (lambda (e) (sg-op-of env sv v3 (Ix 0 e) (Ix 1 e) (Ix 2 e))) ents))
   [name base tds ops])
 
 ;; Back-compat: the whole document, every operation.
@@ -1676,32 +1928,35 @@
 ;; The transitive schema closure of named operations (source spellings).
 (define (spec-slice sv opids) (sg-slice sv opids))
 
+;; Can this named schema be expressed?  An ALIAS counts as expressible:
+;; it emits no type of its own, and every reference to it resolves
+;; through to what it names.  -> 0, or [name why]
+(define (sg-cov-check env schemas nm)
+  (define hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas))
+  (Ifz hit [nm "dangling-ref (no such schema)"]
+    (let* ((v (Ix 1 (_0 hit)))
+           (r (Try (lambda (z)
+                     (Ifz (Nil (sg-alias-subst v))
+                       (let ((ft (sg-ftype-of env v))) (DeepSeq ft ft))
+                       (let ((td (sg-typedef-of env (sg-name nm) v)))
+                         (DeepSeq td td)))) 0)))
+      (If (Eq 1 (Hd r)) [nm (Ix 1 (_0 r))] 0))))
+
 ;; How many named schemas the typedef IR can express today.
 ;; -> [clean total [[name why] ..]]  (why = the first rejection reason)
 (define (spec-coverage sv)
   (define schemas (sg-spec-schemas sv))
-  (define rs
-    (map (lambda (e)
-           (let ((r (Try (lambda (z)
-                           (let ((td (sg-typedef-of (sg-name (Ix 0 e)) (Ix 1 e))))
-                             (DeepSeq td td))) 0)))
-             (If (Eq 1 (Hd r)) [(Ix 0 e) (Ix 1 (_0 r))] 0)))
-      schemas))
+  (define env (sg-env schemas))
+  (define rs (map (lambda (e) (sg-cov-check env schemas (Ix 0 e))) schemas))
   (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
   [(Sub (Sz schemas) (Sz bad)) (Sz schemas) bad])
 
 ;; Coverage restricted to one operation's closure. -> [clean total bad]
 (define (spec-coverage-of sv opids)
   (define schemas (sg-spec-schemas sv))
+  (define env (sg-env schemas))
   (define names (sg-slice sv opids))
-  (define rs
-    (map (lambda (nm)
-           (let* ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas))
-                  (r (Try (lambda (z)
-                            (let ((td (sg-typedef-of (sg-name nm) (Ix 1 (_0 hit)))))
-                              (DeepSeq td td))) 0)))
-             (If (Eq 1 (Hd r)) [nm (Ix 1 (_0 r))] 0)))
-      names))
+  (define rs (map (lambda (nm) (sg-cov-check env schemas nm)) names))
   (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
   [(Sub (Sz names) (Sz bad)) (Sz names) bad])
 
@@ -1712,23 +1967,26 @@
    (foil:compile-rex sut (_0 g) (_1 g))])
 
 ;; Swagger: generate the TYPES module tree.  -> [name basepath ops tree]
-(define (gen-swagger-types jsut swagger-txt)
-  (define parts (sg-swagger-parts (sg-schema-value jsut swagger-txt)))
+;; opids = [] for the whole document, or the operations wanted — a real
+;; spec is far larger than any one client needs, and module load forces
+;; every top-level, so naming the operations is the normal case.
+(define (gen-swagger-types jsut swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
   (define nt (sg-swagger-types-tree parts))
   [(_0 nt) (Ix 1 parts) (Ix 3 parts) (_1 nt)])
 
 ;; Swagger: generate the HAND module tree (imports the types module by
 ;; name).  -> [hand-name tree]
-(define (gen-swagger-hand jsut swagger-txt)
+(define (gen-swagger-hand jsut swagger-txt opids)
   (sg-swagger-hand-tree
-    (sg-swagger-parts (sg-schema-value jsut swagger-txt))))
+    (sg-spec-parts (sg-schema-value jsut swagger-txt) opids)))
 
 ;; Generate AND compile both modules: the types module first, then the
 ;; hand against a cache holding it (a tree-fed module has no file, so
 ;; the hand's by-name import must resolve from the cache).
 ;; -> [types-name hand-name subject]
-(define (compile-swagger-hand sut jsut swagger-txt)
-  (define parts (sg-swagger-parts (sg-schema-value jsut swagger-txt)))
+(define (compile-swagger-hand sut jsut swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
   (define tname (_0 parts))
   (define tnt (sg-swagger-types-tree parts))
   (define c1 (foil:compile-rex-cached 0 sut tname (_1 tnt)))

@@ -152,14 +152,43 @@ assert(IsApp gtree)
 ;;; Unsupported schema shapes are rejected loudly.
 
 (define (gen-fails schema)
-  (define r (Try (lambda (z) (schemagen:gen-tree jsut schema)) 0))
+  (define r (Try (lambda (z)
+                   (let ((g (schemagen:gen-tree jsut schema))) (DeepSeq g g))) 0))
   (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
 
-assert(Equal "float-unsupported (no honest representation yet)"
+(define jstr-s (strcat ["{" (kv "type" (js "string")) "}"]))
+
+;;; A JSON number is carried as its DECIMAL TEXT: there is no honest
+;;; float, and a client needs to show what it received and send back
+;;; what it was given, which the lexeme does exactly.
+
+(define num-schema
+  (strcat ["{" (kv "title" (js "reading")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "v") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "v" (strcat ["{" (kv "type" (js "number")) "}"])) "}"]))
+           "}"]))
+(define nsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut num-schema)))
+(define nrt (foil:source-entry-val ["rt"] nsut))
+assert(Equal (strcat ["{" (kv "v" "0.0015") "}"])
+  (nrt (strcat ["{" (kv "v" "0.0015") "}"])))
+assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
+  (nrt (strcat ["{" (kv "v" "6.02e23") "}"])))
+;; an integral number keeps its integral spelling
+assert(Equal (strcat ["{" (kv "v" "5") "}"])
+  (nrt (strcat ["{" (kv "v" "5") "}"])))
+assert(Equal "v:expected-number" (nrt (strcat ["{" (kv "v" (js "x")) "}"])))
+
+;; a nested array has no ftype
+assert(Equal "nested-array-unsupported"
   (gen-fails
     (strcat ["{" (kv "title" (js "t")) "," (kv "type" (js "object")) ","
              (kv "properties"
-               (strcat ["{" (kv "x" (strcat ["{" (kv "type" (js "number")) "}"])) "}"]))
+               (strcat ["{" (kv "x"
+                 (strcat ["{" (kv "type" (js "array")) ","
+                          (kv "items" (strcat ["{" (kv "type" (js "array")) ","
+                                               (kv "items" jstr-s) "}"])) "}"]))
+                 "}"]))
              "}"])))
 assert(Equal "missing-title"
   (gen-fails (strcat ["{" (kv "type" (js "object")) "}"])))
@@ -243,9 +272,9 @@ assert(Equal "reserved-name"
                               (jobj [(kv "type" (js "array"))
                                      (kv "items" (jref "pet"))]))]))]))]))]))
 
-(define sw-tnt (schemagen:gen-swagger-types jsut swagger-txt))
+(define sw-tnt (schemagen:gen-swagger-types jsut swagger-txt []))
 assert(Equal "petstore" (_0 sw-tnt))
-(define sw-hnt (schemagen:gen-swagger-hand jsut swagger-txt))
+(define sw-hnt (schemagen:gen-swagger-hand jsut swagger-txt []))
 assert(Equal "petstore_hand" (_0 sw-hnt))
 assert(IsApp (_1 sw-hnt))
 
@@ -479,15 +508,51 @@ assert(Eq 1 (Lt 152 713))
 ;;; D. THE RATCHET.  How many named schemas the typedef IR can express.
 ;;; This number may only go UP.  Raise it when a phase lands; never
 ;;; lower it to make a change pass.
+;;;   116  phase 0 (dialect only)
+;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 116))
+assert(Eq 1 (Ge (_0 oa-cov) 257))
 
-;;; The rejections are the Phase 1 worklist, and each must name its
-;;; own feature — a nullable type union is not a malformed string.
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
-assert(Eq 1 (why? "nullable-type-union (type: [T,null])"))
-assert(Eq 1 (why? "float-unsupported (no honest representation yet)"))
-assert(Eq 1 (why? "inline-object (hoist to $defs)"))
+
+;;; What phase 1 retired.  These must stay absent: each was a whole
+;;; class of schema the IR could not say, and a regression would show
+;;; up here long before the count moved much.
+assert(Eq 0 (why? "nullable-type-union (type: [T,null])"))
+assert(Eq 0 (why? "float-unsupported (no honest representation yet)"))
+
+;;; What is left is the phase 2 worklist, dominated by inline enums —
+;;; and most of THOSE are single-value discriminator tags rather than
+;;; enumerations, so that work belongs with oneOf/anyOf, not here.
+;;; `unsupported-def` is now exactly the top-level oneOf/anyOf case:
+;;; a schema that is a union rather than a record.
+assert(Eq 1 (why? "inline-enum (hoist to $defs)"))
+assert(Eq 1 (why? "untyped-field (want type or $ref)"))
+assert(Eq 1 (why? "unsupported-def (want object or enum)"))
+
+;;; E. /models expresses COMPLETELY — every schema in its closure —
+;;; which is what makes it the first operation a real client can use.
+(define oa-models (schemagen:spec-coverage-of oa-v ["get_models"]))
+assert(Equal [20 20 []] oa-models)
+
+;;; ...and its whole module generates: 29 query parameters, all
+;;; optional, typed str/int/num.
+(define oa-parts (schemagen:sg-spec-parts oa-v ["get_models"]))
+assert(Equal "open_router_api" (_0 oa-parts))
+assert(Equal "https://openrouter.ai/api/v1" (Ix 1 oa-parts))
+assert(Equal 1 (Sz (Ix 3 oa-parts)))
+(define oa-op (_0 (Ix 3 oa-parts)))
+assert(Equal "get_models" (_0 oa-op))
+assert(Equal "get" (Ix 1 oa-op))
+assert(Equal [["lit" "models"]] (Ix 2 oa-op))
+assert(Equal [] (Ix 3 oa-op))
+assert(Equal 29 (Sz (Ix 4 oa-op)))
+;; a nullable integer, a plain integer, an enum-as-string, a number
+(define (qp nm) (_0 (find (lambda (p) (Eq nm (_0 p))) (Ix 4 oa-op))))
+assert(Equal ["offset" ["int"] 0] (qp "offset"))
+assert(Equal ["limit" ["int"] 0] (qp "limit"))
+assert(Equal ["category" ["str"] 0] (qp "category"))
+assert(Equal ["min_price" ["num"] 0] (qp "min_price"))
