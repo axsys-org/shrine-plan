@@ -96,14 +96,20 @@
 
 (define sg-ref-prefix "#/$defs/")
 
+(define (sg-strip-prefix pre s)
+  ;; 0 when s lacks the prefix, [tail] otherwise
+  (define w (Lsh 1 (Mul 8 (Bytes pre))))
+  (If (Eq pre (Mod s w)) [(Div s w)] 0))
+
 (define (sg-ref-name v)
   (define r (jv-get "$ref" v))
   (Ifz r 0
     (let* ((s (jv-str! (_0 r)))
-           (w (Lsh 1 (Mul 8 (Bytes sg-ref-prefix)))))
-      (Ifz (Eq sg-ref-prefix (Mod s w))
-        (sg-error "bad-ref (want #/$defs/<name>)" s)
-        [(Div s w)]))))
+           (a (sg-strip-prefix sg-ref-prefix s))
+           (b (Ifz a (sg-strip-prefix "#/definitions/" s) a)))
+      (Ifz b
+        (sg-error "bad-ref (want #/$defs/ or #/definitions/)" s)
+        b))))
 
 (define (sg-type-str v)
   (define t (jv-get "type" v))
@@ -282,10 +288,17 @@
 
 (define (npth segs) (nrn "/" (map nw segs)))
 (define (nfc name ty) (nrn "=" [(nw name) ty]))
-(define (ndot a b) (nrn "." [a b]))
+;; "." chains are FLAT in normalized rex (a.b.c(x) is ONE "." nest with
+;; kids [a b c-juxt]; parse-meth rejects a nested "." receiver), so a
+;; "."-nest receiver splices its kids.
+(define (ndot a b)
+  (If (And (Eq "nest" (Hd a))
+        (And (Eq "clear" (Ix 1 a)) (Eq "." (Ix 2 a))))
+    (nrn "." (snoc b (Ix 3 a)))
+    (nrn "." [a b])))
 (define (ndotw a b) (ndot (nw a) (nw b)))
 (define (nmeth recv seg args)
-  (nrn "." [recv (njx [(nw seg) (npar args)])]))
+  (ndot recv (njx [(nw seg) (npar args)])))
 (define (nrelv name) (nrn "." [(nw name)]))
 (define (nrelap name args)
   (npar (cons (nrn "./" [(nw name)]) args)))
@@ -724,6 +737,647 @@
      (Weld sg-prelude-trees
        (Weld td-trees (sg-root-trees root-name examples))))])
 
+;;; Swagger ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Swagger 2.0 subset: definitions ride through the schema typedef
+;;; machinery ($ref spelled #/definitions/<n>); paths/operations map
+;;; to an op IR the hand emitter consumes.
+;;; op: [opid method segs pparams qparams body resp]
+;;;   segs:    [["lit" cord] | ["par" name]] from the path template
+;;;   pparams: [[name ftype] ..]   (path params, always required)
+;;;   qparams: [[name ftype req] ..]
+;;;   body:    0 | [defname]
+;;;   resp:    defname (the 200 response $ref)
+
+(define sg-defs-prefix "#/definitions/")
+
+(define (sg-need k v why)
+  (define r (jv-get k v))
+  (Ifz r (sg-error why v) (_0 r)))
+
+;; "/pets/{pet_id}" -> [["lit" "pets"] ["par" "pet_id"]]
+(define (sg-path-segs s)
+  (define cs (trip s))
+  (define n (Sz cs))
+  (define (seg-of cur)
+    (define m (Bytes cur))
+    (If (And (Gt m 2)
+          (And (Eq 123 (Mod cur 256))
+            (Eq 125 (Div cur (Lsh 1 (Mul 8 (Dec m)))))))
+      ["par" (sg-check-name
+               (Div (Mod cur (Lsh 1 (Mul 8 (Dec m)))) 256))]
+      ["lit" cur]))
+  (define (go i cur acc)
+    (If (Ge i n)
+      (If (Bytes cur) (snoc (seg-of cur) acc) acc)
+      (let ((c (Ix i cs)))
+        (If (Eq c 47)
+          (go (Inc i) "" (If (Bytes cur) (snoc (seg-of cur) acc) acc))
+          (go (Inc i) (strcat [cur c]) acc)))))
+  (go 0 "" []))
+
+(define (sg-ref-defname v)
+  ;; a {"$ref": "#/$defs/x"} object (post-swaggerize) -> "x"
+  (define r (sg-ref-name v))
+  (Ifz (Nil r) (_0 r) (sg-error "swagger: expected a $ref schema" v)))
+
+(define (sg-op-of pathstr method opv)
+  (define opid
+    (sg-check-name (jv-str! (sg-need "operationId" opv "swagger: op needs operationId"))))
+  (define params
+    (Ifz (jv-get "parameters" opv) []
+      (jv-xs! (_0 (jv-get "parameters" opv)))))
+  (define (fold-param acc p)
+    (define where (jv-str! (sg-need "in" p "swagger: param needs in")))
+    (define pname (sg-check-name (jv-str! (sg-need "name" p "swagger: param needs name"))))
+    (cond
+      ((Eq where "path")
+        [(snoc [pname (sg-ftype-of p)] (_0 acc)) (_1 acc) (_2 acc)])
+      ((Eq where "query")
+        (let ((req (If (Nil (jv-get "required" p)) 0
+                     (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
+                       (Ix 0 (_0 (jv-get "required" p))) 0))))
+          [(_0 acc) (snoc [pname (sg-ftype-of p) req] (_1 acc)) (_2 acc)]))
+      ((Eq where "body")
+        [(_0 acc) (_1 acc)
+         [(sg-ref-defname (sg-need "schema" p "swagger: body param needs schema"))]])
+      (else (sg-error "swagger: unsupported param location" where))))
+  (define pqb (foldl fold-param [[] [] 0] params))
+  (define resp
+    (sg-ref-defname
+      (sg-need "schema"
+        (sg-need "200"
+          (sg-need "responses" opv "swagger: op needs responses")
+          "swagger: op needs a 200 response")
+        "swagger: 200 response needs a schema")))
+  [opid method (sg-path-segs pathstr) (_0 pqb) (_1 pqb) (_2 pqb) resp])
+
+;; -> [name basepath [typedef ..] [op ..]]
+(define (sg-swagger-parts sv)
+  (define info (sg-need "info" sv "swagger: missing info"))
+  (define name
+    (sg-check-name (jv-str! (sg-need "title" info "swagger: info needs title"))))
+  (define base
+    (Ifz (jv-get "basePath" sv) "" (jv-str! (_0 (jv-get "basePath" sv)))))
+  (define defs-r (jv-get "definitions" sv))
+  (define tds
+    (sg-topo
+      (Ifz defs-r []
+        (map (lambda (e) (sg-typedef-of (sg-check-name (Ix 0 e)) (Ix 1 e)))
+          (jv-kvs (_0 defs-r))))))
+  (define ops
+    (foldl
+      (lambda (acc pe)
+        (foldl
+          (lambda (a me)
+            (snoc (sg-op-of (Ix 0 pe) (Ix 0 me) (Ix 1 me)) a))
+          acc (jv-kvs (Ix 1 pe))))
+      []
+      (jv-kvs (sg-need "paths" sv "swagger: missing paths"))))
+  [name base tds ops])
+
+;; parse_<t> for every distinct response type: JSON text -> <t>_r.
+(define (sg-resp-parser-tree tname)
+  (define rsum (strcat [tname "_r"]))
+  (nrn "+"
+    [(nw (strcat ["parse_" tname]))
+     (nslug [(strcat ["Decode a " tname " from JSON text."])])
+     (nrn "\" [(nfc "s" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(npar [(nw "parse") (nw "s")])
+        (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                         (nfc "why" (nw "nat")) (nfc "rest" (nw "nat"))])
+                  (nvap rsum "err" [(nw "0") (nw "why")])])
+        (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                         (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
+                  (npar [(nw (strcat [tname "_from"])) (nw "v") (nw "0")])])])]))
+
+;; The swagger TYPES module: definitions + serde + per-response
+;; parsers.  (The hand emit joins this tree; reference phase first.)
+(define (sg-swagger-types-tree parts)
+  (define name (_0 parts))
+  (define tds (Ix 2 parts))
+  (define ops (Ix 3 parts))
+  (define resps (dedupe-eq (map (lambda (o) (Ix 6 o)) ops)))
+  (define td-trees
+    (_1 (foldl (lambda (st td)
+                 (let ((r (sg-td-trees (_0 st) td)))
+                   [(_0 r) (Weld (_1 st) (_1 r))]))
+          [[] []] tds)))
+  [name
+   (ngrp
+     (Weld sg-prelude-trees
+       (Weld td-trees (map sg-resp-parser-tree resps))))])
+
+;;; Hand emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; The kook hand: requests are kids /<root>/[req-id] carrying bond/req
+;;; (a sum with one variant per operation); take issues the fetch via
+;;; the crew-injected http-client (['http]) and subscribes the req-id
+;;; crew slot; hear parses res_body per the originating operation and
+;;; answers bond/res with the response type's RESULT VARIANT record.
+;;; Shapes mirror the hand-written zz_swagger_ref.foil (the dev
+;;; oracle).  Base URL from the root record's ['base].
+
+(define sg-hand-prelude-trees
+  [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
+   (nrn "-" [(nw "json") (nbrko "=" [(nw "order") (nw "20")])])
+   (nrn "-" [(nw "shrine_types") (nbrko "=" [(nw "order") (nw "30")])])
+   (nrn "-" [(nw "lain") (nbrko "=" [(nw "order") (nw "40")])])
+   (nrn "-" [(nw "web") (nbrko "=" [(nw "order") (nw "50")])])
+   (nrn "-" [(nw "bond") (nbrko "=" [(nw "order") (nw "60")])])
+   (nrn "-" [(nw "pact") (nbrko "=" [(nw "order") (nw "70")])])])
+
+;; the generated TYPES module, imported by name at order 80
+(define (sg-types-import name)
+  (nrn "-" [(nw name) (nbrko "=" [(nw "order") (nw "80")])]))
+
+;; a match arm (./some x) / .none pair helpers
+(define (nsome-arm binder ty body-kids)
+  (nrn ">" (Weld [(npar [(nrn "./" [(nw "some")])
+                         (If ty (nfc binder ty) (nw binder))])]
+             body-kids)))
+(define (nnone-arm body) (nrn ">" [(nrelv "none") body]))
+
+(define (nquip s) (rex:MakeLeaf nzsp "quip" s))
+;; ['base] / ['io 'http] — bracketed quip path literals
+(define (npl segs)
+  (nbrk (map (lambda (t) (nquip (strcat ["'" t]))) segs)))
+(define (nmget recv slot) (nmeth recv "get" [slot]))
+;; (a/b) — parse normalization absorbs a paren's single rune kid into
+;; the paren itself, so emit the absorbed form directly.
+(define (nparp segs) (rex:MakeNest nzsp "paren" "/" (map nw segs)))
+(define (nself args) (npar (Weld [(nw "_")] args)))
+(define nyell (npar [(nw "yell") (nw "cards") (nw "out")]))
+(define nskip (nself [(nw "next") (nw "cards") (nw "out")]))
+;; row[[p=path q=writ]]
+(define ncards-ty
+  (nspec "row" [(nbrk [(nfc "p" (nw "path")) (nfc "q" (nw "writ"))])]))
+;; the i/cards/out loop head (one-line > chain nests successively)
+(define nloop-head
+  (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
+                      (nrn ">" [(nfc "cards" ncards-ty) (nbrk [])
+                                (nrn ">" [(nfc "out" (nw "myth"))
+                                          (nw "cur")])])])]))
+
+(define sg-hand-fixed-trees-a
+  [(nrn "+"
+     [(nw "base_of")
+      (nslug ["The server base url from the root record's ['base]."])
+      (nrn "\" [(nfc "cur" (nw "myth"))])
+      (nrn "^" [(nw "nat")])
+      (nrn "?"
+        [(nmget (nw "cur") (npl ["base"]))
+         (nsome-arm "held" (nw "pail")
+           [(nrn "?" [(nw "held")
+                      (nrn ">" [(nfc "t" (npth ["pails" "t"]))
+                                (ndotw "t" "t")])
+                      (nw "0")])])
+         (nw "0")])])
+   (nrn "+"
+     [(nw "crew_of_rec")
+      (nslug ["The crew mop in a record's /sys/crew, or empty."])
+      (nrn "\" [(nfc "cur" (nw "myth"))])
+      (nrn "^" [(nw "crew")])
+      (nrn "?"
+        [(nmget (nw "cur") (npth ["bond" "crew"]))
+         (nsome-arm "held" (nw "pail")
+           [(nrn "?" [(nw "held")
+                      (nrn ">" [(nfc "c" (nw "cpail")) (ndotw "c" "crew")])
+                      (npar [(npth ["mop" "empty"])])])])
+         (npar [(npth ["mop" "empty"])])])])
+   (nrn "+"
+     [(nw "http_of")
+      (nslug ["The injected http-client root from the crew slot ['http]."])
+      (nrn "\" [(nfc "cur" (nw "myth"))])
+      (nrn "^" [(nspec "maybe" [(nw "path")])])
+      (nrn "?"
+        [(nmget (npar [(nw "crew_of_rec") (nw "cur")]) (npl ["http"]))
+         (nnone-arm (nrelv "none"))
+         (nsome-arm "d" (nw "dep")
+           [(nrelap "some" [(ndotw "d" "p")])])])])
+   (nrn "+"
+     [(nw "crew_put")
+      (nrn "\" [(nfc "cur" (nw "myth")) (nfc "slot" (nw "path"))
+                (nfc "d" (nw "dep"))])
+      (nrn "^" [(nw "myth")])
+      (nmeth (nw "cur") "put"
+        [(npth ["bond" "crew"])
+         (npar [(nw "cpail")
+                (nmeth (npar [(nw "crew_of_rec") (nw "cur")]) "put"
+                  [(nw "slot") (nw "d")])])])])
+   (nrn "+"
+     [(nw "crew_del")
+      (nrn "\" [(nfc "cur" (nw "myth")) (nfc "slot" (nw "path"))])
+      (nrn "^" [(nw "myth")])
+      (nrn "=" [(nw "es")
+                (ndot (npar [(nw "crew_of_rec") (nw "cur")]) (nw "tap"))])
+      (nrn "="
+        [(nw "c2")
+         (ngrp
+           [(nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
+                                (nrn ">" [(nfc "acc" (nw "crew"))
+                                          (npar [(npth ["mop" "empty"])])])])])
+            (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "es" "len")])
+                      (nw "acc")])
+            (nrn "=" [(nw "h") (nmeth (nw "es") "at" [(nw "i")])])
+            (nrn "?" [(npar [(nw "eq_pith") (ndotw "h" "key") (nw "slot")])
+                      (nself [(ndotw "i" "inc") (nw "acc")])])
+            (nself [(ndotw "i" "inc")
+                    (nmeth (nw "acc") "put"
+                      [(ndotw "h" "key") (ndotw "h" "val")])])])])
+      (nmeth (nw "cur") "put"
+        [(npth ["bond" "crew"]) (npar [(nw "cpail") (nw "c2")])])])
+   (nrn "+"
+     [(nw "crew_slot_for")
+      (nslug ["The crew slot whose dep watches path p."])
+      (nrn "\" [(nfc "cur" (nw "myth")) (nfc "p" (nw "path"))])
+      (nrn "^" [(nspec "maybe" [(nw "path")])])
+      (nrn "=" [(nw "es")
+                (ndot (npar [(nw "crew_of_rec") (nw "cur")]) (nw "tap"))])
+      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")])])
+      (nrn "^" [(nspec "maybe" [(nw "path")])])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "es" "len")])
+                (nrelv "none")])
+      (nrn "=" [(nw "h") (nmeth (nw "es") "at" [(nw "i")])])
+      (nrn "?" [(npar [(nw "eq_pith")
+                       (nrn "." [(nw "h") (nw "val") (nw "p")])
+                       (nw "p")])
+                (nrelap "some" [(ndotw "h" "key")])])
+      (nself [(ndotw "i" "inc")])])])
+
+(define sg-hand-fixed-trees-b
+  [(nrn "+"
+     [(nw "take")
+      (nslug ["Handle request kids: for each non-deleted gift with a bond/req"
+              "and no bond/res, emit the fetch make-card and subscribe the"
+              "req-id crew slot to the fetch node."])
+      (nrn "\" [(nfc "b" (nw "bowl")) (nfc "cur" (nw "myth"))
+                (nfc "gift" (nspec "axal" [(nw "mode")]))])
+      (nrn "^" [(nw "yell")])
+      (nrn "=" [(nw "entries") (ndotw "gift" "tap")])
+      nloop-head
+      (nrn "^" [(nw "yell")])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "entries" "len")])
+                nyell])
+      (nrn "=" [(nw "ent") (nmeth (nw "entries") "at" [(nw "i")])
+                (njx [(nw "next") (ndotw "i" "inc")])])
+      (nrn "=" [(nbrk [(nfc "gp" (nw "path")) (nfc "gm" (nw "mode"))])
+                (nw "ent")])
+      (nrn "?"
+  [(nw "gm")
+    (nrn ">" [(nfc "d0" (npth ["mode" "del"])) nskip])
+    (nrn "?"
+      [(nmget (ndotw "b" "kids") (nw "gp"))
+        (nnone-arm nskip)
+        (nsome-arm
+          "t"
+          (nw "myth")
+          [(nrn "?"
+              [(nmget (nw "t") (npth ["bond" "res"]))
+                (nsome-arm "done" (nw "pail") [nskip])
+                (nnone-arm
+                  (nrn "?"
+                    [(nmget (nw "t") (npth ["bond" "req"]))
+                      (nnone-arm nskip)
+                      (nsome-arm
+                        "held"
+                        (nw "pail")
+                        [(nrn "="
+                            [(nw "fr")
+                              (npar [(nw "fetch_for") (npar [(nw "base_of") (nw "cur")]) (nw "held")])])
+                          (nrn "?" [(npar [(nw "eq") (nw "0") (ndotw "fr" "len")]) nskip])
+                          (nrn "?"
+                            [(npar [(nw "http_of") (nw "out")])
+                              (nnone-arm nskip)
+                              (nsome-arm
+                                "hp"
+                                (nw "path")
+                                [(nrn "=" [(nw "dst") (nmeth (nw "hp") "weld" [(nw "gp")])])
+                                  (nself
+                                    [(nw "next")
+                                      (nmeth
+                                        (nw "cards")
+                                        "snoc"
+                                        [(nbrk
+                                            [(nw "dst") (npar [(npth ["writ" "make"]) (nmeth (nw "fr") "at" [(nw "0")])])])])
+                                      (npar
+                                        [(nw "crew_put")
+                                          (nw "out")
+                                          (nw "gp")
+                                          (npar [(nw "dep") (nparp ["care" "x"]) (nw "dst")])])])])])])]))])])])])])
+   (nrn "+"
+     [(nw "pd_of")
+      (nslug ["Any nominal record as a pail, unchanged (records inhabit pails)."])
+      (nrn "\" [(nfc "v" (nw "pail"))])
+      (nrn "^" [(nw "pail")])
+      (nw "v")])
+   (nrn "+"
+     [(nw "res_body_nat")
+      (nrn "\" [(nfc "fm" (nw "myth")) (nfc "slot" (nw "path"))])
+      (nrn "^" [(nw "nat")])
+      (nrn "?"
+        [(nmget (nw "fm") (nw "slot"))
+         (nsome-arm "bp" (nw "pail")
+           [(nrn "?" [(nw "bp")
+                      (nrn ">" [(nfc "n" (npth ["pails" "n"]))
+                                (ndotw "n" "n")])
+                      (nw "0")])])
+         (nw "0")])])])
+
+(define (sg-hand-fixed-trees-c name)
+  [(nrn "+"
+     [(nw "hear")
+      (nslug ["Handle fetch completions: parse res_body per the originating"
+              "request's operation, answer bond/res, unsubscribe."])
+      (nrn "\" [(nfc "b" (nw "bowl")) (nfc "cur" (nw "myth"))
+                (nfc "changed" (nspec "row" [(nw "dep")]))])
+      (nrn "^" [(nw "yell")])
+      nloop-head
+      (nrn "^" [(nw "yell")])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "changed" "len")])
+                nyell])
+      (nrn "=" [(nw "d") (nmeth (nw "changed") "at" [(nw "i")])
+                (njx [(nw "next") (ndotw "i" "inc")])])
+      (nrn "?"
+  [(npar [(nw "crew_slot_for") (nw "out") (ndotw "d" "p")])
+    (nnone-arm nskip)
+    (nsome-arm
+      "k"
+      (nw "path")
+      [(nrn "?"
+          [(nmget (ndotw "b" "crew") (nw "k"))
+            (nnone-arm nskip)
+            (nsome-arm
+              "ax"
+              0
+              [(nrn "?"
+                  [(ndotw "ax" "fil")
+                    (nnone-arm nskip)
+                    (nsome-arm
+                      "fm"
+                      (nw "myth")
+                      [(nrn "?"
+                          [(nmget (nw "fm") (npl ["res_done"]))
+                            (nnone-arm nskip)
+                            (nsome-arm
+                              "dn"
+                              (nw "pail")
+                              [(nrn "="
+                                  [(nw "okf")
+                                    (npar [(nw "res_body_nat") (nw "fm") (npl ["res_ok"])])
+                                    (njx
+                                      [(nw "body") (npar [(nw "res_body_nat") (nw "fm") (npl ["res_body"])])])])
+                                (nrn "?"
+                                  [(nmget (ndotw "b" "kids") (nw "k"))
+                                    (nnone-arm nskip)
+                                    (nsome-arm
+                                      "t"
+                                      (nw "myth")
+                                      [(nrn "?"
+                                          [(nmget (nw "t") (npth ["bond" "req"]))
+                                            (nnone-arm nskip)
+                                            (nsome-arm
+                                              "held"
+                                              (nw "pail")
+                                              [(nrn "="
+                                                  [(nw "ecode")
+                                                    (npar
+                                                      [(nw "cat2")
+                                                        (nc "fetch-err-")
+                                                        (npar
+                                                          [(nw "show_nat") (npar [(nw "res_body_nat") (nw "fm") (npl ["res_err"])])])])])
+                                                (nrn "="
+                                                  [(nw "resp")
+                                                    (npar [(nw "resp_for") (nw "held") (nw "okf") (nw "body") (nw "ecode")])])
+                                                (nrn "?" [(npar [(nw "eq") (nw "0") (ndotw "resp" "len")]) nskip])
+                                                (nself
+                                                  [(nw "next")
+                                                    (nmeth
+                                                      (nw "cards")
+                                                      "snoc"
+                                                      [(nbrk
+                                                          [(nw "k")
+                                                            (npar
+                                                              [(npth ["writ" "poke"])
+                                                                (npar
+                                                                  [(npth ["myth" "sing"])
+                                                                    (npth ["bond" "res"])
+                                                                    (nmeth (nw "resp") "at" [(nw "0")])])])])])
+                                                    (npar [(nw "crew_del") (nw "out") (nw "k")])])])])])])])])])])])])])])])
+   (nrn "+"
+     [(nw "serve")
+      (nslug ["The generated behavior: requests in take, responses in hear."])
+      (nrn "^" [(nw "form")])
+      (nrn "." [(nw "def_form")
+                (njx [(nw "set_take") (npar [(nw "take")])])
+                (njx [(nw "set_hear") (npar [(nw "hear")])])])])
+   (nrn "+"
+     [(nw "decl")
+      (nrn "^" [(npth ["kook" "decl"])])
+      (npar [(npth ["kook" "decl"]) (nquip (strcat ["'" name])) (nw "serve")
+             (npar [(npth ["lore" "line"])
+                    (nc (strcat ["Generated " name " API hand."]))])])])])
+
+;; url piece plan for one op: merge literal runs, params by ftype.
+;; -> the url builder member tree.
+(define (sg-url-tree base op)
+  (define opid (Ix 0 op))
+  (define segs (Ix 2 op))
+  (define pparams (Ix 3 op))
+  (define qparams (Ix 4 op))
+  (define (conv ft x)
+    (cond
+      ((Eq "int" (_0 ft)) (npar [(nw "show_nat") x]))
+      ((Eq "str" (_0 ft)) x)
+      (else (sg-error "swagger: unsupported url param type" ft))))
+  (define (pft name)
+    (define hit (find (lambda (pp) (Eq name (Ix 0 pp))) pparams))
+    (Ifz hit (sg-error "swagger: path param not declared" name)
+      (Ix 1 (_0 hit))))
+  ;; fold segs into [lit-run-cord | ["p" name]] pieces
+  (define pieces
+    (foldl
+      (lambda (acc sg)
+        (If (Eq "lit" (_0 sg))
+          (let ((lastlit (And (Sz acc)
+                           (Nil (IsApp (Ix (Dec (Sz acc)) acc))))))
+            (If lastlit
+              (Up (Dec (Sz acc))
+                (strcat [(Ix (Dec (Sz acc)) acc) "/" (Ix 1 sg)]) acc)
+              (snoc (strcat ["/" (Ix 1 sg)]) acc)))
+          (let ((lastlit (And (Sz acc)
+                           (Nil (IsApp (Ix (Dec (Sz acc)) acc))))))
+            (If lastlit
+              (snoc ["p" (Ix 1 sg)]
+                (Up (Dec (Sz acc)) (strcat [(Ix (Dec (Sz acc)) acc) "/"]) acc))
+              (snoc ["p" (Ix 1 sg)] (snoc "/" acc))))))
+      (If (Bytes base) [base] [])
+      segs))
+  ;; base expr: cat2-chain over pieces onto the base param
+  (define url-expr
+    (foldl
+      (lambda (acc pc)
+        (If (IsApp pc)
+          (npar [(nw "cat2") acc (conv (pft (Ix 1 pc)) (nw (Ix 1 pc)))])
+          (npar [(nw "cat2") acc (nc pc)])))
+      (nw "u0")
+      pieces))
+  (define params
+    (Weld
+      (map (lambda (pp) (nfc (Ix 0 pp) (sg-ft-ty-t (Ix 1 pp)))) pparams)
+      (map (lambda (qp)
+             (nfc (Ix 0 qp)
+               (If (Ix 2 qp) (sg-ft-ty-t (Ix 1 qp))
+                 (sg-maybe-t (sg-ft-ty-t (Ix 1 qp))))))
+        qparams)))
+  (define qtail
+    ;; at most ONE query param (v1); optional -> maybe match
+    (cond
+      ((Eq 0 (Sz qparams)) [(nw "u1")])
+      ((Eq 1 (Sz qparams))
+        (let* ((qp (_0 qparams))
+               (qn (Ix 0 qp))
+               (qc (lambda (x) (conv (Ix 1 qp) x)))
+               (pref (nc (strcat ["?" qn "="]))))
+          (If (Ix 2 qp)
+            [(npar [(nw "cat2") (npar [(nw "cat2") (nw "u1") pref])
+                    (qc (nw qn))])]
+            [(nrn "?"
+               [(nw qn)
+                (nnone-arm (nw "u1"))
+                (nsome-arm "qv" 0
+                  [(npar [(nw "cat2") (npar [(nw "cat2") (nw "u1") pref])
+                          (qc (nw "qv"))])])])])))
+      (else (sg-error "swagger: at most one query param per op (v1)" opid))))
+  (nrn "+"
+    (Weld
+      [(nw (strcat ["url_" opid]))
+       (nrn "\" (Weld [(nfc "u0" (nw "nat"))] params))
+       (nrn "^" [(nw "nat")])
+       (nrn "=" [(nw "u1") url-expr])]
+      qtail)))
+
+;; The req sum: a variant per operation.
+(define (sg-req-sum-tree ops)
+  (define (vfields op)
+    (Weld
+      (map (lambda (pp) (nfc (Ix 0 pp) (sg-ft-ty-t (Ix 1 pp)))) (Ix 3 op))
+      (Weld
+        (map (lambda (qp)
+               (nfc (Ix 0 qp)
+                 (If (Ix 2 qp) (sg-ft-ty-t (Ix 1 qp))
+                   (sg-maybe-t (sg-ft-ty-t (Ix 1 qp))))))
+          (Ix 4 op))
+        (Ifz (Ix 5 op) []
+          [(nrn "=" [(nw (_0 (Ix 5 op)))])]))))
+  (nrn "+"
+    (Weld
+      [(nw "req")
+       (nslug ["One request: a variant per swagger operation."])
+       (nrn "&" (map (lambda (o) (npth ["req" (Ix 0 o)])) ops))]
+      (map (lambda (o)
+             (nrn "+" [(nw (Ix 0 o)) (nrn ":" (vfields o))]))
+        ops))))
+
+;; fetch_for: the driver request myth per req variant.
+(define (sg-fetch-for-tree ops)
+  (define (arm i op)
+    (define opid (Ix 0 op))
+    (define b (nw (strcat ["g" (nat-str i)])))
+    (define url-args
+      (Weld
+        (map (lambda (pp) (ndot b (nw (Ix 0 pp)))) (Ix 3 op))
+        (map (lambda (qp) (ndot b (nw (Ix 0 qp)))) (Ix 4 op))))
+    (define body-expr
+      (Ifz (Ix 5 op) (nw "0")
+        (npar [(nw "show")
+               (npar [(nw (strcat [(_0 (Ix 5 op)) "_to"]))
+                      (ndot b (nw (_0 (Ix 5 op))))])])))
+    (define mth
+      (cond
+        ((Eq "get" (Ix 1 op)) "GET")
+        ((Eq "post" (Ix 1 op)) "POST")
+        ((Eq "put" (Ix 1 op)) "PUT")
+        ((Eq "delete" (Ix 1 op)) "DELETE")
+        (else (sg-error "swagger: unsupported method" (Ix 1 op)))))
+    (nrn ">"
+      [(nfc (strcat ["g" (nat-str i)]) (npth ["req" opid]))
+       (nbrk [(npar (Weld [(npth ["fetch" "req"]) (nc mth)
+                           (npar (Weld [(nw (strcat ["url_" opid]))
+                                        (nw "base")]
+                                   url-args))]
+                      [body-expr (nw "30000")]))])]))
+  (nrn "+"
+    (Weld
+      [(nw "fetch_for")
+       (nslug ["The driver request myth for one req variant, or empty"
+               "row when the pail is not a request."])
+       (nrn "\" [(nfc "base" (nw "nat")) (nfc "held" (nw "pail"))])
+       (nrn "^" [(nspec "row" [(nw "myth")])])]
+      (Weld [(nrn "?" (Weld [(nw "held")]
+                        (Weld (map (lambda (i) (arm i (Ix i ops)))
+                                (gen (Sz ops) (lambda (i) i)))
+                          [(nbrk [])])))]
+        []))))
+
+;; resp_for: parse per originating op; result VARIANT records as pails.
+(define (sg-resp-for-tree ops)
+  (define (arm i op)
+    (define opid (Ix 0 op))
+    (define resp (Ix 6 op))
+    (define rs (strcat [resp "_r"]))
+    (define ix (nat-str i))
+    (nrn ">"
+      [(nfc (strcat ["g" ix]) (npth ["req" opid]))
+       (nrn "?"
+         [(nw "okf")
+          (nrn "?"
+            [(npar [(nw (strcat ["parse_" resp])) (nw "body")])
+             (nrn ">" [(nfc (strcat ["o" ix]) (npth [rs "ok"]))
+                       (nbrk [(npar [(nw "pd_of") (nw (strcat ["o" ix]))])])])
+             (nrn ">" [(nfc (strcat ["e" ix]) (npth [rs "err"]))
+                       (nbrk [(npar [(nw "pd_of") (nw (strcat ["e" ix]))])])])])])
+       (nbrk [(npar [(nw "pd_of")
+                     (nvap rs "err" [(nc "") (nw "ecode")])])])]))
+  (nrn "+"
+    (Weld
+      [(nw "resp_for")
+       (nslug ["The bond/res pail for one completed fetch: parse per the"
+               "originating operation, or the op's error record."])
+       (nrn "\" [(nfc "held" (nw "pail")) (nfc "okf" (nw "nat"))
+                 (nfc "body" (nw "nat")) (nfc "ecode" (nw "nat"))])
+       (nrn "^" [(nspec "row" [(nw "pail")])])]
+      [(nrn "?" (Weld [(nw "held")]
+                  (Weld (map (lambda (i) (arm i (Ix i ops)))
+                          (gen (Sz ops) (lambda (i) i)))
+                    [(nbrk [])])))])))
+
+;; -> [name tree]: the HAND module.  Types + serde live in the
+;; separate types module (gen-swagger-types), imported by name — the
+;; arrangement the hand-written reference validated.
+(define (sg-swagger-hand-tree parts)
+  (define name (_0 parts))
+  (define base (Ix 1 parts))
+  (define ops (Ix 3 parts))
+  [(strcat [name "_hand"])
+   (ngrp
+     (Weld (snoc (sg-types-import name) sg-hand-prelude-trees)
+       (Weld
+         [(nslug-top
+            [(strcat ["Generated by schemagen from the " name " swagger."])
+             "The schema is the source of truth; there is no source file"
+             "to edit.  Requests are kids /<root>/[req-id] carrying"
+             "bond/req; answers arrive in bond/res."])]
+         (Weld [(sg-req-sum-tree ops)]
+           (Weld (map (lambda (o) (sg-url-tree base o)) ops)
+             (Weld sg-hand-fixed-trees-a
+               (Weld [(sg-fetch-for-tree ops)]
+                 (Weld sg-hand-fixed-trees-b
+                   (Weld [(sg-resp-for-tree ops)]
+                     (sg-hand-fixed-trees-c name))))))))))])
+
 ;;; Public API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Parse a schema document with json.foil's parse (jsut: a compiled
@@ -744,3 +1398,28 @@
   (define g (gen-tree jsut schema-txt))
   [(_0 g) (_1 g)
    (foil:compile-rex sut (_0 g) (_1 g))])
+
+;; Swagger: generate the TYPES module tree.  -> [name basepath ops tree]
+(define (gen-swagger-types jsut swagger-txt)
+  (define parts (sg-swagger-parts (sg-schema-value jsut swagger-txt)))
+  (define nt (sg-swagger-types-tree parts))
+  [(_0 nt) (Ix 1 parts) (Ix 3 parts) (_1 nt)])
+
+;; Swagger: generate the HAND module tree (imports the types module by
+;; name).  -> [hand-name tree]
+(define (gen-swagger-hand jsut swagger-txt)
+  (sg-swagger-hand-tree
+    (sg-swagger-parts (sg-schema-value jsut swagger-txt))))
+
+;; Generate AND compile both modules: the types module first, then the
+;; hand against a cache holding it (a tree-fed module has no file, so
+;; the hand's by-name import must resolve from the cache).
+;; -> [types-name hand-name subject]
+(define (compile-swagger-hand sut jsut swagger-txt)
+  (define parts (sg-swagger-parts (sg-schema-value jsut swagger-txt)))
+  (define tname (_0 parts))
+  (define tnt (sg-swagger-types-tree parts))
+  (define c1 (foil:compile-rex-cached 0 sut tname (_1 tnt)))
+  (define hnt (sg-swagger-hand-tree parts))
+  (define c2 (foil:compile-rex-cached (_0 c1) sut (_0 hnt) (_1 hnt)))
+  [tname (_0 hnt) (_1 c2)])
