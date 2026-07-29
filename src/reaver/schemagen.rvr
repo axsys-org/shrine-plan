@@ -208,6 +208,41 @@
   (Ifz r [] (map jv-str! (jv-xs! (_0 r)))))
 
 ;; Does a branch contribute anything beyond prose?
+;; The enum's values with any null dropped (the null is the nullable
+;; spelling, handled by sg-nullable?).  -> [] when there is no enum.
+(define (sg-enum-vals v)
+  (define r (jv-get "enum" v))
+  (Ifz r []
+    (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
+
+;; A single-value enum is a CONSTANT, not an enumeration: the wire
+;; always carries that one string.  In a discriminated union it is the
+;; tag; on its own it is a field nothing branches on.  Either way a sum
+;; with one variant would be noise, so it stays a string — 435 of this
+;; document's 522 inline enums are of this shape.
+(define (sg-const-enum? v) (Eq 1 (Sz (sg-enum-vals v))))
+(define (sg-real-enum? v) (Gt (Sz (sg-enum-vals v)) 1))
+
+;; The arms of a oneOf/anyOf, with a bare `null` arm dropped — that arm
+;; is the nullable spelling again, not a member of the union.
+(define (sg-union-arms v)
+  (define (real xs)
+    (filter (lambda (b)
+              (let ((t (jv-get "type" b)))
+                (Ifz t 1 (Ifz (Eq "null" (jv-str! (_0 t))) 1 0))))
+      xs))
+  (define one (jv-get "oneOf" v))
+  (define any-r (jv-get "anyOf" v))
+  (Weld (Ifz one [] (real (jv-xs! (_0 one))))
+    (Ifz any-r [] (real (jv-xs! (_0 any-r))))))
+
+;; A union every one of whose arms is a bare constant is an ENUM spelled
+;; the long way — this document does that 12 times.
+(define (sg-union-is-enum? v)
+  (define arms (sg-union-arms v))
+  (And (Gt (Sz arms) 1)
+    (If (all sg-const-enum? arms) 1 0)))
+
 (define (sg-branch-adds? b)
   (Or (If (Sz (sg-props-of b)) 1 0)
     (Or (If (Sz (sg-reqs-of b)) 1 0)
@@ -353,10 +388,20 @@
         (Ifz (Nil al)
           (sg-ftype-go env (_0 al) (Inc depth))
           (sg-error "inline-object (hoist to $defs)" v)))
-    (Ifz (Nil (jv-get "enum" v))
+    ;; A constant is a string on the wire.  A real enumeration needs a
+    ;; name, which only sg-typedef-go can mint, so reaching here with
+    ;; one means it was used somewhere lifting does not run.
+    (If (sg-real-enum? v)
       (sg-error "inline-enum (hoist to $defs)" v)
+    (If (sg-const-enum? v) ["str"]
+    (If (Sz (sg-union-arms v))
+      (sg-error "union of real types (needs oneOf support)" v)
       (let ((t (sg-type-str v)))
-        (Ifz t (sg-error "untyped-field (want type or $ref)" v)
+        ;; No type and no $ref means "any JSON value" — the document is
+        ;; declining to say more, so the field carries the value as it
+        ;; arrived.  An object with only additionalProperties is the
+        ;; same statement about a whole object.
+        (Ifz t ["any"]
           (let ((ty (_0 t)))
             (cond
               ((Eq ty "string") ["str"])
@@ -368,7 +413,12 @@
               ;; back what it was given, and the lexeme does both
               ;; exactly.  Integral numbers render canonically.
               ((Eq ty "number") ["num"])
-              ((Eq ty "object") (sg-error "inline-object (hoist to $defs)" v))
+              ;; an object with no declared properties says nothing
+              ;; about its keys, so it is any JSON object
+              ((Eq ty "object")
+                (Ifz (Sz (_0 (sg-flat-record env v 0)))
+                  ["any"]
+                  (sg-error "inline-object (hoist to $defs)" v)))
               ((Eq ty "array")
                 (let ((it (jv-get "items" v)))
                   (Ifz it (sg-error "array-without-items" v)
@@ -376,18 +426,21 @@
                       (If (Eq "row" (_0 et))
                         (sg-error "nested-array-unsupported" v)
                         ["row" et])))))
-              (else (sg-error "unsupported-type" ty))))))))))))
+              (else (sg-error "unsupported-type" ty))))))))))))))
 
 (define (sg-ftype-of env v) (sg-ftype-go env v 0))
 
-;; A property carrying a whole record inline needs a name of its own.
-;; It is LIFTED and referenced, never flattened into the parent: the
-;; nesting has to survive the encode direction.
+;; A property carrying a whole type inline needs a name of its own: a
+;; record, a real enumeration, or a union spelled as constants.  It is
+;; LIFTED and referenced, never flattened into the parent — the nesting
+;; has to survive the encode direction, and a sum needs a declaration.
 (define (sg-liftable? env v)
   (And (Nil (sg-ref-name v))
-    (And (Nil (sg-alias-subst v))
-      (And (Ifz (jv-get "enum" v) 1 0)
-        (If (Sz (_0 (sg-flat-record env v 0))) 1 0)))))
+    (Or (sg-real-enum? v)
+      (Or (sg-union-is-enum? v)
+        (And (Nil (sg-alias-subst v))
+          (And (Ifz (jv-get "enum" v) 1 0)
+            (If (Sz (_0 (sg-flat-record env v 0))) 1 0)))))))
 
 ;; The minted name must not collide with one the document already uses.
 (define (sg-mint env owner fname)
@@ -398,25 +451,33 @@
     (sg-error "lifted-name collides with a declared schema" nm)
     nm))
 
-;; -> [typedef [extra-typedef ..]]   extras are lifted inline objects
+;; Each variant keeps BOTH spellings: the normalized foil name and the
+;; wire string.  They differ often ("Qwen" is a legal value of this
+;; document's ModelGroup, and the variant is qwen), and matching the
+;; normalized one against the wire would reject every value that is not
+;; already lowercase.
+(define (sg-enum-pairs vals)
+  (map (lambda (x) (let ((s (jv-str! x))) [(sg-name s) s])) vals))
+
+;; Dedupe on the WIRE string.  dedupe-eq cannot do this: Eq is shallow,
+;; so on [vname wire] rows it does not compare the contents.
+(define (sg-dedupe-pairs ps)
+  (foldl (lambda (acc p)
+           (If (any (lambda (q) (Eq (Ix 1 q) (Ix 1 p))) acc) acc (snoc p acc)))
+    [] ps))
+
+;; -> [typedef [extra-typedef ..]]   extras are lifted inline types
 (define (sg-typedef-go env name v depth)
-  (define en (jv-get "enum" v))
-  (Ifz (Lt depth 12) (sg-error "inline objects nested too deep" name)
-  (Ifz (Nil en)
-    ;; A null among the values is 3.1's nullable-enum spelling, not a
-    ;; variant: it is dropped here and shows up as the field being
-    ;; optional (see sg-nullable?).
-    ;; Each variant keeps BOTH spellings: the normalized foil name and
-    ;; the wire string.  They differ often ("Qwen" is a legal value of
-    ;; this document's ModelGroup, and the variant is qwen), and
-    ;; matching the normalized one against the wire would reject every
-    ;; value that is not already lowercase.
-    (let ((vals (map (lambda (x)
-                       (let ((s (jv-str! x))) [(sg-name s) s]))
-                  (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0))
-                    (jv-xs! (_0 en))))))
-      (Ifz (Sz vals) (sg-error "empty-enum" name)
-        [["enum" name vals] []]))
+  ;; A union whose every arm is a bare constant is an enum written the
+  ;; long way; take its arms' values as the variants.
+  (define vals
+    (If (sg-union-is-enum? v)
+      (foldl (lambda (acc b) (Weld acc (sg-enum-vals b))) [] (sg-union-arms v))
+      (sg-enum-vals v)))
+  (Ifz (Lt depth 12) (sg-error "inline types nested too deep" name)
+  (If (Sz vals)
+    (let ((pairs (sg-dedupe-pairs (sg-enum-pairs vals))))
+      [["enum" name pairs] []])
     ;; a record: its own properties, plus any inherited through allOf
     (let* ((flat (sg-flat-record env v 0))
            (props (_0 flat))
@@ -529,6 +590,7 @@
     ((Eq "int" (_0 ft)) "int")
     ((Eq "bool" (_0 ft)) "boo")
     ((Eq "num" (_0 ft)) "num")
+    ((Eq "any" (_0 ft)) "any")
     ((Eq "ref" (_0 ft)) (Ix 1 ft))
     ((Eq "row" (_0 ft)) (strcat ["row_" (sg-ft-key (Ix 1 ft))]))))
 
@@ -622,6 +684,8 @@
     ((Eq "bool" (_0 ft)) (nw "bool"))
     ;; decimal text, not an arithmetic value
     ((Eq "num" (_0 ft)) (nw "nat"))
+    ;; the value exactly as it arrived, undecoded
+    ((Eq "any" (_0 ft)) (nw "json"))
     ((Eq "ref" (_0 ft)) (nw (Ix 1 ft)))
     ((Eq "row" (_0 ft)) (nspec "row" [(sg-ft-ty-t (Ix 1 ft))]))))
 
@@ -660,6 +724,9 @@
         (nrn "?" [(nw "j")
                   (nrn ">" [(nfc "t" (npth ["json" "boo"])) (ok (ndotw "t" "b"))])
                   (err "expected-boolean")]))
+      ;; Any JSON value passes through undecoded, so there is nothing
+      ;; that can fail.
+      ((Eq "any" (_0 ft)) (ok (nw "j")))
       ;; A number keeps its decimal text: json/real already holds the
       ;; source lexeme, and an integral json/num is rendered back to
       ;; the same spelling it arrived with.
@@ -836,6 +903,8 @@
     ((Eq "bool" (_0 ft)) (npar [(npth ["json" "boo"]) exp]))
     ;; the stored decimal text goes back out verbatim, unquoted
     ((Eq "num" (_0 ft)) (npar [(npth ["json" "real"]) exp]))
+    ;; an undecoded value is already json
+    ((Eq "any" (_0 ft)) exp)
     ((Eq "ref" (_0 ft)) (npar [(nw (strcat [(Ix 1 ft) "_to"])) exp]))
     (else (sg-error "enc-of-row-inline" ft))))
 

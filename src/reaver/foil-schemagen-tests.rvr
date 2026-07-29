@@ -214,6 +214,44 @@ assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
 ;; a value outside the enum is still rejected
 assert(Equal "tag:bad-enum" (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
 
+;;; A SINGLE-value enum is a constant, not an enumeration.  A sum with
+;;; one variant would be noise — and in a discriminated union that same
+;;; shape is the tag — so it stays a string.  An inline enum with
+;;; several values does get lifted, to <owner>_<field>.  A union whose
+;;; every arm is a bare constant is an enum written the long way.
+;;; A schema that declines to say anything is any JSON value, carried
+;;; through undecoded.
+
+(define mixed-schema
+  (strcat ["{" (kv "title" (js "mix")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{"
+               (kv "kind" (strcat ["{" (kv "enum" (strcat ["[" (js "fixed") "]"])) "}"])) ","
+               (kv "hue" (strcat ["{" (kv "enum"
+                 (strcat ["[" (js "Red") "," (js "Green") "]"])) "}"])) ","
+               (kv "side" (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "enum" (strcat ["[" (js "L") "]"])) "},{"
+                          (kv "enum" (strcat ["[" (js "R") "]"])) "}]"])) "}"])) ","
+               (kv "blob" "{}")
+               "}"]))
+           "}"]))
+(define msut (Ix 2 (schemagen:compile-schema foil:default-subject jsut mixed-schema)))
+(define mrt (foil:source-entry-val ["rt"] msut))
+;; the constant rides as a string, the lifted enums by wire value, and
+;; the untyped field keeps whatever shape it arrived with
+(define m-full
+  (strcat ["{" (kv "kind" (js "fixed")) "," (kv "hue" (js "Green")) ","
+           (kv "side" (js "R")) ","
+           (kv "blob" (strcat ["{" (kv "any" (strcat ["[1," (js "two") ",3.5]"])) "}"]))
+           "}"]))
+assert(Equal m-full (mrt m-full))
+;; each field is independently optional here, so an empty object holds
+assert(Equal "{}" (mrt "{}"))
+;; the lifted enum still rejects an unlisted value
+assert(Equal "hue:bad-enum" (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
+;; ...and so does the constants-union
+assert(Equal "side:bad-enum" (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
+
 ;; a nested array has no ftype
 assert(Equal "nested-array-unsupported"
   (gen-fails
@@ -545,27 +583,27 @@ assert(Eq 1 (Lt 152 713))
 ;;; lower it to make a change pass.
 ;;;   116  phase 0 (dialect only)
 ;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
+;;;   613  phase 2a (enums by wire value, constants, any-JSON)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 257))
+assert(Eq 1 (Ge (_0 oa-cov) 613))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
 
-;;; What phase 1 retired.  These must stay absent: each was a whole
-;;; class of schema the IR could not say, and a regression would show
-;;; up here long before the count moved much.
+;;; What earlier phases retired.  These must stay absent: each was a
+;;; whole class of schema the IR could not say, and a regression would
+;;; show up here long before the count moved much.
 assert(Eq 0 (why? "nullable-type-union (type: [T,null])"))
 assert(Eq 0 (why? "float-unsupported (no honest representation yet)"))
+assert(Eq 0 (why? "untyped-field (want type or $ref)"))
 
-;;; What is left is the phase 2 worklist, dominated by inline enums —
-;;; and most of THOSE are single-value discriminator tags rather than
-;;; enumerations, so that work belongs with oneOf/anyOf, not here.
-;;; `unsupported-def` is now exactly the top-level oneOf/anyOf case:
-;;; a schema that is a union rather than a record.
-assert(Eq 1 (why? "inline-enum (hoist to $defs)"))
-assert(Eq 1 (why? "untyped-field (want type or $ref)"))
+;;; What is left is almost entirely UNIONS: a schema that is a oneOf or
+;;; anyOf of real types rather than a record.  `unsupported-def` is that
+;;; case at the top level of a named schema; the other is the same thing
+;;; in a field.  Nothing else accounts for more than a handful.
+assert(Eq 1 (why? "union of real types (needs oneOf support)"))
 assert(Eq 1 (why? "unsupported-def (want object or enum)"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
