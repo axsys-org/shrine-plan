@@ -133,10 +133,22 @@ assert(Equal "count:negative"
 assert(Equal "tags[1]:expected-string"
   (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
                (kv "tags" (strcat ["[" (js "x") ",2]"])) "}"])))
-assert(Equal "hue:bad-enum"
-  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-               (kv "hue" (js "blue")) "}"])))
 assert(Equal "expected-key" (rt "{,}"))
+
+;;; An enum is OPEN: a value outside the declared set is not a decode
+;;; failure, it rides in the catch-all variant and re-encodes verbatim.
+;;; Every multi-value enum in the OpenRouter document reserves the right
+;;; to send one (x-speakeasy-unknown-values), so rejecting it would break
+;;; a working client the first time the server adds a value.
+
+(define t-odd-hue
+  (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+           (kv "hue" (js "blue")) "}"]))
+assert(Equal t-odd-hue (rt t-odd-hue))
+;; a NON-string is still a decode failure — the schema does say string
+assert(Equal "hue:expected-string"
+  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+               (kv "hue" "7") "}"])))
 
 ;;; Typed access on the generated record.
 
@@ -211,8 +223,9 @@ assert(Equal "{}" (ert (strcat ["{" (kv "tag" "null") "}"])))
 ;; nullability is on the named type the $ref points at
 assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
   (ert (strcat ["{" (kv "tag" (js "Qwen")) "," (kv "opt" "null") "}"])))
-;; a value outside the enum is still rejected
-assert(Equal "tag:bad-enum" (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
+;; a value outside the enum rides undecoded, keeping its exact spelling
+assert(Equal (strcat ["{" (kv "tag" (js "Nope")) "}"])
+  (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
 
 ;;; A SINGLE-value enum is a constant, not an enumeration.  A sum with
 ;;; one variant would be noise — and in a discriminated union that same
@@ -247,10 +260,35 @@ assert(Equal "tag:bad-enum" (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
 assert(Equal m-full (mrt m-full))
 ;; each field is independently optional here, so an empty object holds
 assert(Equal "{}" (mrt "{}"))
-;; the lifted enum still rejects an unlisted value
-assert(Equal "hue:bad-enum" (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
+;; the lifted enum carries an unlisted value through
+assert(Equal (strcat ["{" (kv "hue" (js "Blue")) "}"])
+  (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
 ;; ...and so does the constants-union
-assert(Equal "side:bad-enum" (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
+assert(Equal (strcat ["{" (kv "side" (js "X")) "}"])
+  (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
+
+;;; The catch-all needs a name no declared value can take, and three of
+;;; this document's enums (Quantization among them) spell their own
+;;; escape hatch "unknown".  The generated variant steps aside to
+;;; unknown_, which sg-norm-name can never produce because it trims a
+;;; trailing underscore.  The declared value keeps its own variant: it
+;;; encodes as a CONSTANT, so if the two had merged, an undeclared value
+;;; would come back spelled "unknown" instead of itself.
+
+(define clash-schema
+  (strcat ["{" (kv "title" (js "clash")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "k" (strcat ["{" (kv "enum"
+               (strcat ["[" (js "unknown") "," (js "hot") "]"])) "}"])) "}"]))
+           "}"]))
+(define csut (Ix 2 (schemagen:compile-schema foil:default-subject jsut clash-schema)))
+(define crt (foil:source-entry-val ["rt"] csut))
+assert(Equal (strcat ["{" (kv "k" (js "hot")) "}"])
+  (crt (strcat ["{" (kv "k" (js "hot")) "}"])))
+assert(Equal (strcat ["{" (kv "k" (js "unknown")) "}"])
+  (crt (strcat ["{" (kv "k" (js "unknown")) "}"])))
+assert(Equal (strcat ["{" (kv "k" (js "zzz")) "}"])
+  (crt (strcat ["{" (kv "k" (js "zzz")) "}"])))
 
 ;;; A oneOf/anyOf of real types becomes a nominal sum, discriminated by
 ;;; the field that pins a distinct value in every arm.  That field is
