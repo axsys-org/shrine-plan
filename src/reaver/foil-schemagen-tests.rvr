@@ -252,6 +252,73 @@ assert(Equal "hue:bad-enum" (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
 ;; ...and so does the constants-union
 assert(Equal "side:bad-enum" (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
 
+;;; A oneOf/anyOf of real types becomes a nominal sum, discriminated by
+;;; the field that pins a distinct value in every arm.  That field is
+;;; DERIVED, not read from the `discriminator` keyword — the derivation
+;;; agrees with all 40 of OpenRouter's declared ones and finds 31 more.
+;;;
+;;; A variant wraps its arm's type rather than flattening it in, so the
+;;; arm stays usable on its own; and because the arm's own schema
+;;; declares the tag, the tag needs no special handling in either
+;;; direction and cannot drift out of step with the variant.
+;;;
+;;; Every union carries a trailing catch-all holding the value
+;;; undecoded: 145 enum sites in that document reserve the right to send
+;;; a value nobody has seen, and an unmatched tag must keep parsing and
+;;; re-encode verbatim rather than break the client.
+
+(define (jdef n body) (kv n body))
+(define union-schema
+  (strcat ["{" (kv "title" (js "evt")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "body") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "oneOf"
+                 (strcat ["[{" (kv "$ref" (js "#/$defs/a")) "},{"
+                          (kv "$ref" (js "#/$defs/b")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "a" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "," (js "n") "]"])) ","
+                 (kv "properties" (strcat ["{"
+                   (kv "kind" (strcat ["{" (kv "enum" (strcat ["[" (js "alpha") "]"])) "}"])) ","
+                   (kv "n" (strcat ["{" (kv "type" (js "integer")) "}"])) "}"])) "}"])) ","
+               (jdef "b" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "," (js "s") "]"])) ","
+                 (kv "properties" (strcat ["{"
+                   (kv "kind" (strcat ["{" (kv "enum" (strcat ["[" (js "beta") "]"])) "}"])) ","
+                   (kv "s" (strcat ["{" (kv "type" (js "string")) "}"])) "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define usut (Ix 2 (schemagen:compile-schema foil:default-subject jsut union-schema)))
+(define urt (foil:source-entry-val ["rt"] usut))
+
+;; each arm decodes and re-encodes as itself, tag included
+(define u-alpha
+  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "," (kv "n" "3") "}"])) "}"]))
+assert(Equal u-alpha (urt u-alpha))
+(define u-beta
+  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "beta")) "," (kv "s" (js "x")) "}"])) "}"]))
+assert(Equal u-beta (urt u-beta))
+
+;; A TAG NOBODY DECLARED still parses, and comes back byte for byte.
+;; This is the forward-compatibility property: the server adding a
+;; variant must not break a client that has not been regenerated.
+(define u-new
+  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "gamma")) "," (kv "z" "1") "}"])) "}"]))
+assert(Equal u-new (urt u-new))
+
+;; a known tag with a malformed payload is still an error, with the
+;; breadcrumb pointing through the union
+assert(Equal "body.n:missing"
+  (urt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "}"])) "}"])))
+;; and something that is not an object at all
+assert(Equal "body:expected-object"
+  (urt (strcat ["{" (kv "body" "5") "}"])))
+;; ...or that carries no tag
+assert(Equal "body:missing-tag"
+  (urt (strcat ["{" (kv "body" (strcat ["{" (kv "n" "1") "}"])) "}"])))
+
 ;; a nested array has no ftype
 assert(Equal "nested-array-unsupported"
   (gen-fails
@@ -584,10 +651,11 @@ assert(Eq 1 (Lt 152 713))
 ;;;   116  phase 0 (dialect only)
 ;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
 ;;;   613  phase 2a (enums by wire value, constants, any-JSON)
+;;;   690  phase 2b (tag-discriminated unions)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 613))
+assert(Eq 1 (Ge (_0 oa-cov) 690))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
@@ -599,12 +667,16 @@ assert(Eq 0 (why? "nullable-type-union (type: [T,null])"))
 assert(Eq 0 (why? "float-unsupported (no honest representation yet)"))
 assert(Eq 0 (why? "untyped-field (want type or $ref)"))
 
-;;; What is left is almost entirely UNIONS: a schema that is a oneOf or
-;;; anyOf of real types rather than a record.  `unsupported-def` is that
-;;; case at the top level of a named schema; the other is the same thing
-;;; in a field.  Nothing else accounts for more than a handful.
-assert(Eq 1 (why? "union of real types (needs oneOf support)"))
-assert(Eq 1 (why? "unsupported-def (want object or enum)"))
+assert(Eq 0 (why? "union of real types (needs oneOf support)"))
+assert(Eq 0 (why? "unsupported-def (want object or enum)"))
+
+;;; What is left is 23 schemas, and no longer one dominant class.  The
+;;; only group is the unions no FIELD can settle: 34 of the document's
+;;; 141 discriminate on the JSON constructor instead (mostly
+;;; `string | array`), and 5 are genuinely ambiguous — one has 49 arms
+;;; with `type: "message"` on three of them.  Guessing between those two
+;;; cases would be worse than saying so.
+assert(Eq 1 (why? "union has no discriminating field"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
 ;;; which is what makes it the first operation a real client can use.

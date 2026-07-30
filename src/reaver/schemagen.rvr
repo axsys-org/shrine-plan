@@ -331,6 +331,48 @@
                (Weld (_1 acc) (_1 sub))]))
           [(sg-props-of v) (sg-reqs-of v)] ao)))))
 
+;;; Discriminating a union ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; "Discriminator" is not a property of a field but of a field
+;;; RELATIVE TO A UNION.  A field discriminates when matching on it is
+;;; enough to pick an arm, which means: present in every arm, pinned to
+;;; one value in every arm, and those values pairwise distinct.  Derived
+;;; that way it agrees with all 40 of this document's declared
+;;; `discriminator` keys and finds 31 more, so the keyword is never read.
+
+;; The one value a property schema pins, as a wire string, or 0.
+(define (sg-pin-val ps)
+  (define c (jv-get "const" ps))
+  (Ifz c
+    (let ((vs (sg-enum-vals ps)))
+      (If (And (Eq 1 (Sz vs)) (jv-str? (_0 vs))) [(jv-str! (_0 vs))] 0))
+    (If (jv-str? (_0 c)) [(jv-str! (_0 c))] 0)))
+
+;; An arm's properties, following a $ref and flattening allOf.
+(define (sg-arm-props env b depth)
+  (Ifz (Lt depth 16) []
+    (let ((r (sg-ref-name b)))
+      (Ifz (Nil r)
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (Ifz hit [] (sg-arm-props env (Ix 1 (_0 hit)) (Inc depth))))
+        (_0 (sg-flat-record env b 0))))))
+
+;; The field that discriminates these arms, or 0.
+(define (sg-union-tag env arms)
+  (define views (map (lambda (b) (sg-arm-props env b 0)) arms))
+  (define (pin f view)
+    (define hit (find (lambda (e) (Eq f (Ix 0 e))) view))
+    (Ifz hit 0 (sg-pin-val (Ix 1 (_0 hit)))))
+  (define (tags? f)
+    (define vs (map (lambda (vw) (pin f vw)) views))
+    (And (all (lambda (x) (Ifz (Nil x) 1 0)) vs)
+      (let ((ss (map (lambda (x) (_0 x)) vs)))
+        (If (Eq (Sz ss) (Sz (dedupe-eq ss))) 1 0))))
+  (define cands
+    (Ifz (Sz views) []
+      (filter tags? (map (lambda (e) (Ix 0 e)) (_0 views)))))
+  (Ifz (Sz cands) 0 [(_0 cands)]))
+
 ;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"] — one real
 ;; type beside the null.  It becomes T, and the field carrying it
 ;; becomes OPTIONAL: absent and explicitly null both read as .none,
@@ -438,9 +480,10 @@
   (And (Nil (sg-ref-name v))
     (Or (sg-real-enum? v)
       (Or (sg-union-is-enum? v)
-        (And (Nil (sg-alias-subst v))
-          (And (Ifz (jv-get "enum" v) 1 0)
-            (If (Sz (_0 (sg-flat-record env v 0))) 1 0)))))))
+        (Or (If (Sz (sg-union-arms v)) 1 0)
+          (And (Nil (sg-alias-subst v))
+            (And (Ifz (jv-get "enum" v) 1 0)
+              (If (Sz (_0 (sg-flat-record env v 0))) 1 0))))))))
 
 ;; The minted name must not collide with one the document already uses.
 (define (sg-mint env owner fname)
@@ -466,6 +509,34 @@
            (If (any (lambda (q) (Eq (Ix 1 q) (Ix 1 p))) acc) acc (snoc p acc)))
     [] ps))
 
+;; Every union gets a trailing catch-all holding the value undecoded.
+;; 145 enum sites in this document carry x-speakeasy-unknown-values, so
+;; the server reserves the right to send a tag nobody has seen: an
+;; unmatched arm keeps parsing and re-encodes verbatim instead of
+;; turning every API addition into a client outage.
+(define sg-union-else "unknown")
+
+;; -> ["union" name tagfield arms], arm = [vname ftype wire]
+(define (sg-union-td env name v)
+  (define arms (sg-union-arms v))
+  (define tag (sg-union-tag env arms))
+  (Ifz (Nil tag)
+    (let* ((tf (_0 tag))
+           (built
+             (map (lambda (b)
+                    (let* ((props (sg-arm-props env b 0))
+                           (hit (find (lambda (e) (Eq tf (Ix 0 e))) props))
+                           (wire (_0 (sg-pin-val (Ix 1 (_0 hit))))))
+                      [(sg-name wire) (sg-ftype-of env b) wire]))
+               arms)))
+      (If (any (lambda (a) (Eq sg-union-else (_0 a))) built)
+        (sg-error "union arm collides with the catch-all name" name)
+        ["union" name tf built]))
+    ;; No field settles it.  Shape discrimination (disjoint JSON types)
+    ;; and the handful of genuinely ambiguous unions are both still
+    ;; unsupported, and saying which is which would be a guess.
+    (sg-error "union has no discriminating field" name)))
+
 ;; -> [typedef [extra-typedef ..]]   extras are lifted inline types
 (define (sg-typedef-go env name v depth)
   ;; A union whose every arm is a bare constant is an enum written the
@@ -478,6 +549,8 @@
   (If (Sz vals)
     (let ((pairs (sg-dedupe-pairs (sg-enum-pairs vals))))
       [["enum" name pairs] []])
+  (If (Sz (sg-union-arms v))
+    [(sg-union-td env name v) []]
     ;; a record: its own properties, plus any inherited through allOf
     (let* ((flat (sg-flat-record env v 0))
            (props (_0 flat))
@@ -517,7 +590,7 @@
                    [[] []] props))
                (fields (_0 step)))
           (Ifz (Sz fields) (sg-error "empty-object" name)
-            [["rec" name fields] (_1 step)])))))))
+            [["rec" name fields] (_1 step)]))))))))
 
 ;; The typedef alone, for callers that only need to know it elaborates.
 (define (sg-typedef-of env name v) (_0 (sg-typedef-go env name v 0)))
@@ -535,9 +608,13 @@
     (else [])))
 
 (define (sg-td-deps td)
-  (If (Eq "rec" (_0 td))
-    (foldl (lambda (acc f) (Weld acc (sg-ft-refs (Ix 1 f)))) [] (Ix 2 td))
-    []))
+  (cond
+    ((Eq "rec" (_0 td))
+      (foldl (lambda (acc f) (Weld acc (sg-ft-refs (Ix 1 f)))) [] (Ix 2 td)))
+    ;; a union names its arms' types, so they must be emitted first
+    ((Eq "union" (_0 td))
+      (foldl (lambda (acc a) (Weld acc (sg-ft-refs (Ix 1 a)))) [] (Ix 3 td)))
+    (else [])))
 
 ;; Emission order: a def before its dependents; cycles rejected.
 (define (sg-topo tds)
@@ -1021,6 +1098,91 @@
              vals))
          [(npar [(npth ["json" "str"]) (nc (sg-vwire (_0 vals)))])]))]))
 
+;;; Union emitters ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; A variant WRAPS its arm's type in a single field rather than
+;;; flattening the arm's fields in: flattening would duplicate them into
+;;; the union decl and break outright when two arms share a field name
+;;; at different types.
+;;;
+;;; The tag needs no special handling in either direction, because every
+;;; arm's own schema declares it and a single-value enum is already a
+;;; plain string field.  Decode reads it to choose the arm and then lets
+;;; the arm decode it as an ordinary field; encode writes it back the
+;;; same way.  So the tag cannot drift out of step with the variant.
+
+;; arm = [vname ftype wire]
+(define (sg-union-decl-tree name arms)
+  (define all-arms
+    (snoc [sg-union-else ["any"] 0] arms))
+  (nrn "+"
+    (Weld
+      [(nw name)
+       (nrn "&" (map (lambda (a) (npth [name (_0 a)])) all-arms))]
+      (map (lambda (a)
+             (nrn "+" [(nw (_0 a))
+                       (nrn ":" [(nfc "v" (sg-ft-ty-t (Ix 1 a)))])]))
+        all-arms))))
+
+;; Decode one arm: run its own decoder, wrap the ok in this variant.
+(define (sg-union-arm-decode name rsum a)
+  (nrn "?"
+    [(npar [(nw (sg-ft-dval (Ix 1 a))) (nw "v") (nw "p")])
+     (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                      (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+               (nvap rsum "err" [(nw "path") (nw "why")])])
+     (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                      (nfc "av" (sg-ft-ty-t (Ix 1 a)))])
+               (nvap rsum "ok" [(nvap name (_0 a) [(nw "av")])])])]))
+
+(define (sg-union-from-tree name tagf arms)
+  (define rsum (strcat [name "_r"]))
+  (define catch-all
+    (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])]))
+  (define dispatch
+    (nrn "?"
+      (Weld [(nw "tj")]
+        [(nrn ">"
+           (Weld [(nfc "ts" (npth ["json" "str"]))]
+             (snoc catch-all
+               (map (lambda (a)
+                      (nrn "?" [(npar [(nw "eq") (ndotw "ts" "s")
+                                       (nc (Ix 2 a))])
+                                (sg-union-arm-decode name rsum a)]))
+                 arms))))
+         (nvap rsum "err" [(nw "p") (nc "tag-not-a-string")])])))
+  (nrn "+"
+    [(nw (strcat [name "_from"]))
+     (nslug [(strcat ["Decode a " name " by its " tagf " tag; an"])
+             "unrecognised tag rides undecoded."])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(nw "v")
+        (nrn ">"
+          [(nfc "o" (npth ["json" "obj"]))
+           (nrn "?"
+             [(npar [(nw "jget") (nc tagf) (ndotw "o" "kvs")])
+              (nrn ">" [(nrelv "none")
+                        (nvap rsum "err" [(nw "p") (nc "missing-tag")])])
+              (nrn ">" [(npar [(nrn "./" [(nw "some")])
+                               (nfc "tj" (nw "json"))])
+                        dispatch])])])
+        (nvap rsum "err" [(nw "p") (nc "expected-object")])])]))
+
+(define (sg-union-to-tree name arms)
+  (define all-arms (snoc [sg-union-else ["any"] 0] arms))
+  (nrn "+"
+    [(nw (strcat [name "_to"]))
+     (nrn "\" [(nfc "x" (nw name))])
+     (nrn "^" [(nw "json")])
+     (nrn "?"
+       (Weld [(nw "x")]
+         (map (lambda (a)
+                (nrn ">" [(nfc (strcat ["u_" (_0 a)]) (npth [name (_0 a)]))
+                          (sg-enc-t (Ix 1 a) (ndotw (strcat ["u_" (_0 a)]) "v"))]))
+           all-arms)))]))
+
 (define sg-prelude-trees
   [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
    (nrn "-" [(nw "json") (nbrko "=" [(nw "order") (nw "20")])])
@@ -1060,6 +1222,25 @@
 (define (sg-td-trees seen td)
   (define kind (_0 td))
   (define name (Ix 1 td))
+  (If (Eq "union" kind)
+    ;; each arm needs its own value decoder, exactly as a row's element
+    ;; type does: request it with req=0 opt=0
+    (let* ((tagf (Ix 2 td))
+           (arms (Ix 3 td))
+           (wanted
+             (foldl (lambda (acc a) (sg-merge-entry acc [(Ix 1 a) 0 0]))
+               [] arms))
+           (hst
+             (foldl (lambda (st e)
+                      (let ((r (sg-part-trees (_0 st) (Ix 0 e) 0 0)))
+                        [(_0 r) (Weld (_1 st) (_1 r))]))
+               [seen []] wanted)))
+      [(_0 hst)
+       (Weld (_1 hst)
+         [(sg-union-decl-tree name arms)
+          (sg-sum-tree (strcat [name "_r"]) (nw name))
+          (sg-union-from-tree name tagf arms)
+          (sg-union-to-tree name arms)])])
   (If (Eq "enum" kind)
     (let ((vals (Ix 2 td)))
       [seen
@@ -1091,7 +1272,7 @@
               (sg-sum-tree (strcat [name "_r"]) (nw name))]
          (Weld helpers
            [(sg-rec-from-tree name fields)
-            (sg-rec-to-tree name fields)]))])))
+            (sg-rec-to-tree name fields)]))]))))
 
 (define (sg-root-trees root-name examples)
   (define rsum (strcat [root-name "_r"]))
