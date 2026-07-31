@@ -1,10 +1,13 @@
 '  weft: an HTML templating library — node trees rendered to cords.
 '  .
-'  Cords are LE byte-packed nats and the compiler exposes no byte
-'  primitives, so everything here is arithmetic: welding shifts by
-'  256^len, escaping and decimal rendering walk bytes with mod/div
-'  256 (the /lte_str scheme).  Text nodes escape at render time; raw
-'  nodes (style bodies) do not.
+'  Cords are LE byte-packed nats.  The small cord utilities (cat2,
+'  join, show_nat) are arithmetic: welding shifts by 256^len.  But
+'  rendering never welds as it goes — that pays bignum work per
+'  append, quadratic in the page.  Instead render assembles a
+'  CordTree (str_text / str_slice / str_cat nodes, O(1) each) and
+'  str_run flattens it in one native pass; esc slices whole runs of
+'  safe bytes found by scan8 rather than dividing per byte.  Text
+'  nodes escape at render time; raw nodes (style bodies) do not.
 +  weft
   +  blen
     '  Byte length of a cord (the native width).
@@ -48,26 +51,57 @@
     ?  (eq i 0)
        (_ 1 xs.at(0))
     (_ i.inc (weft/cat2 acc (weft/cat2 sep xs.at(i))))
+  +  esc_class
+    '  The scan8 byte-set of the four dangerous bytes (& < > quote).
+    \  _z=nat
+    ^  nat
+    (add (bex 34) (add (bex 38) (add (bex 60) (bex 62))))
+  +  ent
+    '  The entity for a dangerous byte.
+    '  ?=  ((weft/ent 38) "&amp;")
+    '  ?=  ((weft/ent 60) "&lt;")
+    \  b=nat
+    ^  nat
+    ?  (eq b 38)
+       "&amp;"
+    ?  (eq b 60)
+       "&lt;"
+    ?  (eq b 62)
+       "&gt;"
+    "&quot;"
+  +  tcat
+    '  Weld a row of CordTrees.
+    \  xs=row[any]
+    ^  any
+    |  > i=nat 0  > acc=any (str_text 0)
+    ^  any
+    ?  (eq i xs.len)
+       acc
+    (_ i.inc (str_cat acc xs.at(i)))
+  +  esc_tree
+    '  HTML-escape s as a CordTree: each run of safe bytes rides as
+    '  one slice of s (scan8 finds the run natively), so cost scales
+    '  with the escape count, not the byte count.
+    \  s=nat
+    ^  any
+    =  > n (wid s)
+    =  > cls (weft/esc_class 0)
+    |  > i=nat 0  > acc=any (str_text 0)
+    ^  any
+    ?  (ge i n)
+       acc
+    =  > e (scan8_end s i cls 0)
+    =  > acc2 (str_cat acc (str_slice s i (sub e i)))
+    ?  (ge e n)
+       acc2
+    (_ e.inc (str_cat acc2 (str_text (weft/ent (load8 e s)))))
   +  esc
     '  HTML-escape: the four dangerous bytes become entities.
     '  ?=  ((weft/esc "a<b") "a&lt;b")
     '  ?=  ((weft/esc "x&y") "x&amp;y")
     \  s=nat
     ^  nat
-    |  > x=nat s  > acc=nat 0
-    ?  (eq 0 x)
-       acc
-    =  > b (mod x 256)
-    =  > r (div x 256)
-    ?  (eq b 38)
-       (_ r (weft/cat2 acc "&amp;"))
-    ?  (eq b 60)
-       (_ r (weft/cat2 acc "&lt;"))
-    ?  (eq b 62)
-       (_ r (weft/cat2 acc "&gt;"))
-    ?  (eq b 34)
-       (_ r (weft/cat2 acc "&quot;"))
-    (_ r (weft/cat2 acc b))
+    (str_run (weft/esc_tree s))
   +  show_nat
     '  Decimal rendering of a nat.
     '  ?=  ((weft/show_nat 0) "0")
@@ -123,32 +157,41 @@
     \  tag=nat as=row[weft/att] s=nat
     ^  weft/node
     (weft/node/el tag as [(weft/node/tx s)])
-  +  render
-    '  A node tree as an HTML cord.  Attribute values are quoted with
+  +  render_tree
+    '  A node tree as a CordTree: O(1) per piece, welded exactly once
+    '  by the str_run in render.  Attribute values are quoted with
     '  byte 34 (cord literals cannot hold a double quote).
+    \  nd0=weft/node
+    ^  any
+    |  > nd=weft/node nd0
+    ^  any
+    =  > me (_)
+    ?  nd
+     > (./tx s=nat)  (weft/esc_tree s)
+     > (./raw s=nat)  (str_text s)
+     > (./el tag=nat as=row[weft/att] kids=row[weft/node])
+       =  > astr
+            |  > i=nat 0  > acc=any (str_text 0)
+            ^  any
+            ?  (eq i as.len)
+               acc
+            =  > a as.at(i)
+            (_ i.inc (weft/tcat [acc (str_text " ") (str_text a.k) (str_text "=") (str_text 34) (weft/esc_tree a.v) (str_text 34)]))
+       =  > kstr
+            |  > j=nat 0  > acc2=any (str_text 0)
+            ^  any
+            ?  (eq j kids.len)
+               acc2
+            (_ j.inc (str_cat acc2 (me kids.at(j))))
+       (weft/tcat [(str_text "<") (str_text tag) astr (str_text ">") kstr (str_text "</") (str_text tag) (str_text ">")])
+  +  render
+    '  A node tree as an HTML cord — one native flatten of the
+    '  CordTree built by render_tree.
     '  ?=  ((weft/render (weft/leaf "b" [] "hi")) "<b>hi</b>")
     '  ?=  ((weft/render (weft/tx "a<b")) "a&lt;b")
     \  nd0=weft/node
     ^  nat
-    |  > nd=weft/node nd0
-    ^  nat
-    =  > me (_)
-    ?  nd
-     > (./tx s=nat)  (weft/esc s)
-     > (./raw s=nat)  s
-     > (./el tag=nat as=row[weft/att] kids=row[weft/node])
-       =  > astr
-            |  > i=nat 0  > acc=nat 0
-            ?  (eq i as.len)
-               acc
-            =  > a as.at(i)
-            (_ i.inc (weft/cat [acc " " a.k "=" 34 (weft/esc a.v) 34]))
-       =  > kstr
-            |  > j=nat 0  > acc2=nat 0
-            ?  (eq j kids.len)
-               acc2
-            (_ j.inc (weft/cat2 acc2 (me kids.at(j))))
-       (weft/cat ["<" tag astr ">" kstr "</" tag ">"])
+    (str_run (weft/render_tree nd0))
   +  page
     '  A full document: title, a raw css block, body nodes.
     \  title=nat css=nat body=row[weft/node]
@@ -156,4 +199,4 @@
     =  > hd (weft/el "head" [] [(weft/leaf "title" [] title) (weft/el "style" [] [(weft/raw css)])])
     =  > bd (weft/el "body" [] body)
     =  > doc (weft/el "html" [] [hd bd])
-    (weft/cat2 "<!doctype html>" (weft/render doc))
+    (str_run (str_cat (str_text "<!doctype html>") (weft/render_tree doc)))

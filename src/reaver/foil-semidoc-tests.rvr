@@ -1,0 +1,272 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind corpus (#module foil-corpus-lain))
+
+
+;;; semidoc.foil: the minimal semantic documentation format (spec
+;;; draft 0).  semidoc imports the spine through lain (myths) and
+;;; weft (rendering), so it compiles against the lain corpus tier's
+;;; cache.  Node values are nominal rows: the brand rides the head,
+;;; fields index from 0 in constructor order.
+
+(define r (foil:compile-mod-cached corpus:cache foil:default-subject "semidoc"))
+(define sd-sut (_1 r))
+(define (sf path) (foil:source-entry-val path sd-sut))
+
+(define parse (sf ["parse"]))
+
+(define nl 10)
+(define (unlines xs) (foldl (lambda (a x) (strcat [a x nl])) "" xs))
+
+(define (head? brand x) (Eq brand (Hd x)))
+
+;;; 1. the spec's own example (section 15) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define spec-src
+  (unlines
+    [";@ /doc/alias d /doc"
+     ";@ /doc/alias p /project"
+     ""
+     ";. /shrine/roadmap"
+     ""
+     "  ;= Unix Driver"
+     ""
+     "    ;@ p/status /status/in-progress"
+     "    ;@ p/owner ;/people/liam"
+     ""
+     "    Provide deterministic access to Unix programs."
+     ""
+     "    ;= Acceptance"
+     ""
+     "      ;- Batch execution works."
+     ""
+     "      ;- Output streams correctly."
+     ""
+     "      ;- Capabilities remain deterministic."
+     ""
+     "    ;= Example"
+     ""
+     "      ;@ d/interpret-as /formats/test"
+     ""
+     "      ;$ foil"
+     ""
+     "        +result = resolve(path)"]))
+
+(define spec-tree (parse spec-src))
+assert(Eq 1 (DeepSeq spec-tree (Sz spec-tree)))
+
+;; the document: aliases were consumed, the identity is canonical
+(define doc (Ix 0 spec-tree))
+assert(head? "/boot/snode/doc" doc)
+assert(Equal ["shrine" "roadmap"] (Ix 0 doc))
+assert(Eq 1 (Sz (Ix 2 doc)))
+
+;; the driver section: one prose kid, two subsections
+(define drv (Ix 0 (Ix 2 doc)))
+assert(head? "/boot/snode/sect" drv)
+assert(Equal "Unix Driver" (Ix 0 drv))
+(define drv-kids (Ix 2 drv))
+assert(Eq 3 (Sz drv-kids))
+
+;; the attributes decorate the FOLLOWING node — the prose paragraph —
+;; with canonical predicate paths; the ;/value parsed as a reference
+(define prose (Ix 0 drv-kids))
+assert(head? "/boot/snode/prose" prose)
+assert(Equal "Provide deterministic access to Unix programs." (Ix 0 prose))
+(define pas (Ix 1 prose))
+assert(Eq 2 (Sz pas))
+assert(Equal ["project" "status"] (Ix 0 (Ix 0 pas)))
+(define status-val (Ix 0 (Ix 1 (Ix 0 pas))))
+assert(head? "/boot/sval/word" status-val)
+assert(Equal "/status/in-progress" (Ix 0 status-val))
+assert(Equal ["project" "owner"] (Ix 0 (Ix 1 pas)))
+(define owner-val (Ix 0 (Ix 1 (Ix 1 pas))))
+assert(head? "/boot/sval/ref" owner-val)
+assert(Equal ["people" "liam"] (Ix 0 owner-val))
+
+;; acceptance: three items, ordering preserved
+(define acc (Ix 1 drv-kids))
+assert(Equal "Acceptance" (Ix 0 acc))
+(define acc-kids (Ix 2 acc))
+assert(Eq 3 (Sz acc-kids))
+assert(head? "/boot/snode/item" (Ix 0 acc-kids))
+assert(Equal "Batch execution works." (Ix 0 (Ix 0 acc-kids)))
+assert(Equal "Capabilities remain deterministic." (Ix 0 (Ix 2 acc-kids)))
+
+;; the literal: interpret-as decorates it, the payload is opaque and
+;; dedented, the language tag rides along
+(define ex (Ix 2 drv-kids))
+assert(Equal "Example" (Ix 0 ex))
+(define lit (Ix 0 (Ix 2 ex)))
+assert(head? "/boot/snode/lit" lit)
+assert(Equal "foil" (Ix 0 lit))
+(define las (Ix 1 lit))
+assert(Eq 1 (Sz las))
+assert(Equal ["doc" "interpret-as"] (Ix 0 (Ix 0 las)))
+assert(Equal "+result = resolve(path)" (Ix 2 lit))
+
+;;; 2. blocks the example does not cover ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; a reference block and a quotation with children
+(define t2
+  (parse (unlines
+    [";> attributed to nobody"
+     ""
+     "  the quoted passage itself"
+     ""
+     ";/shrine/moment"])))
+assert(Eq 2 (DeepSeq t2 (Sz t2)))
+(define qt (Ix 0 t2))
+assert(head? "/boot/snode/quote" qt)
+assert(Equal "attributed to nobody" (Ix 0 qt))
+assert(head? "/boot/snode/prose" (Ix 0 (Ix 2 qt)))
+(define rf (Ix 1 t2))
+assert(head? "/boot/snode/ref" rf)
+assert(Equal ["shrine" "moment"] (Ix 0 rf))
+
+;; paragraphs split on blank lines; consecutive lines join
+(define t3 (parse (unlines ["one two" "three" "" "four"])))
+assert(Eq 2 (DeepSeq t3 (Sz t3)))
+assert(Equal "one two three" (Ix 0 (Ix 0 t3)))
+assert(Equal "four" (Ix 0 (Ix 1 t3)))
+
+;; a literal keeps blank lines and INNER indentation, dedented to its
+;; own base — and never parses its payload (runes inside stay text)
+(define t4
+  (parse (unlines
+    [";$ text"
+     ""
+     "  unknown -> known"
+     ""
+     "    deeper survives"
+     "  ;= not a section"])))
+assert(Eq 1 (DeepSeq t4 (Sz t4)))
+(define lit4 (Ix 0 t4))
+assert(head? "/boot/snode/lit" lit4)
+assert(Equal
+  (strcat ["unknown -> known" nl nl "  deeper survives" nl ";= not a section"])
+  (Ix 2 lit4))
+
+;; trailing attributes with no following node attach to the container
+(define t5
+  (parse (unlines
+    [";= Widget"
+     ""
+     "  some prose"
+     ""
+     "  ;@ /doc/status draft"])))
+(define w5 (Ix 0 t5))
+assert(Eq 1 (DeepSeq t5 (Sz (Ix 1 w5))))
+assert(Equal ["doc" "status"] (Ix 0 (Ix 0 (Ix 1 w5))))
+
+;; an unknown alias head stays as written (canonicalization is
+;; lexical, not a registry); an aliased predicate expands
+(define t6
+  (parse (unlines
+    [";@ /doc/alias q /questions"
+     ";@ q/open why"
+     ";@ zz/other val"
+     "prose anchor"])))
+(define p6 (Ix 0 t6))
+(define as6 (Ix 1 p6))
+assert(Eq 2 (DeepSeq t6 (Sz as6)))
+assert(Equal ["questions" "open"] (Ix 0 (Ix 0 as6)))
+assert(Equal ["zz" "other"] (Ix 0 (Ix 1 as6)))
+
+;; a document without an identity: ;. alone
+(define t7 (parse (unlines [";." "" "  body prose"])))
+assert(Equal [] (DeepSeq t7 (Ix 0 (Ix 0 t7))))
+
+;;; 3. the weft renderer ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define sd-page (sf ["page"]))
+
+(define (starts-with pre s)
+  (Eq pre (Mod s (Lsh 1 (Mul 8 (Bytes pre))))))
+(define (contains? needle hay)
+  (define nb (Bytes needle))
+  (define hb (Bytes hay))
+  (define (go i)
+    (cond
+      ((Gt (Add i nb) hb) 0)
+      ((Eq needle (Mod (Rsh hay (Mul 8 i)) (Lsh 1 (Mul 8 nb)))) 1)
+      (else (go (Inc i)))))
+  (go 0))
+
+(define html (sd-page spec-tree))
+assert(Eq 1 (DeepSeq html (starts-with "<!doctype html>" html)))
+;; sections nest with their titles; the doc id renders
+assert(Eq 1 (contains? "<section><h2>Unix Driver</h2>" html))
+assert(Eq 1 (contains? "/shrine/roadmap" html))
+;; attribute chips: canonical predicate text, reference values link
+;; into the explorer
+assert(Eq 1 (contains? "/project/status" html))
+assert(Eq 1 (contains? "/ns/people/liam" html))
+;; the literal payload survives verbatim inside its pre block
+assert(Eq 1 (contains? "+result = resolve(path)" html))
+;; the interpret-as /formats/test vocabulary: the literal renders
+;; with a run form posting to the eval bridge (default module sept)
+assert(Eq 1 (contains? "/chore/eval/sept" html))
+assert(Eq 1 (contains? "run against sept" html))
+;; and literal text ESCAPES at render: t4's arrow becomes entities
+assert(Eq 1 (contains? "unknown -&gt; known" (sd-page t4)))
+
+;;; 4. the tree as namespace myths ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define sd-myths (sf ["myths"]))
+(define txt-slot (sf ["myth" "txt_at"]))
+(define pail-slot (sf ["myth" "pail_at"]))
+
+(define root [("ts" "d")])
+(define ms (sd-myths root spec-tree))
+;; one write per node: doc + sect + (prose + 2 sects) + 3 items + lit
+assert(Eq 9 (DeepSeq ms (Sz ms)))
+
+;; every mount is branded, parents precede kids, kids number in order
+(define m0 (Ix 0 ms))
+assert(Eq "/boot/smount" (Hd m0))
+assert(Equal [("ts" "d") ("u" 0)] (Ix 0 m0))
+assert(Equal "doc" (txt-slot [("ts" "kind")] (Ix 1 m0)))
+
+;; the prose node: kind, text, and the attributes at their canonical
+;; predicate paths — an attributed relation is a slot
+(define (mount-at p)
+  (define hit (find (lambda (m) (Equal p (Ix 0 m))) ms))
+  (Ifz hit 0 (_1 (_0 hit))))
+(define prose-m (mount-at [("ts" "d") ("u" 0) ("u" 0) ("u" 0)]))
+assert(Equal "prose" (txt-slot [("ts" "kind")] prose-m))
+assert(Equal "Provide deterministic access to Unix programs."
+  (txt-slot [("ts" "text")] prose-m))
+assert(Equal "/status/in-progress"
+  (txt-slot [("ts" "project") ("ts" "status")] prose-m))
+;; the ;/ owner value rides as a PATH pail: brand head, path payload
+(define owner-pail (pail-slot [("ts" "project") ("ts" "owner")] prose-m))
+assert(Eq "/boot/pails/p" (Hd owner-pail))
+assert(Equal [("ts" "people") ("ts" "liam")] (_0 owner-pail))
+
+;; the literal: body opaque, interpret-as at its predicate path
+(define lit-m (mount-at [("ts" "d") ("u" 0) ("u" 0) ("u" 2) ("u" 0)]))
+assert(Equal "lit" (txt-slot [("ts" "kind")] lit-m))
+assert(Equal "foil" (txt-slot [("ts" "lang")] lit-m))
+assert(Equal "+result = resolve(path)" (txt-slot [("ts" "body")] lit-m))
+assert(Equal "/formats/test"
+  (txt-slot [("ts" "doc") ("ts" "interpret-as")] lit-m))
+
+;; items keep their document order as numbered siblings
+(define item2 (mount-at [("ts" "d") ("u" 0) ("u" 0) ("u" 1) ("u" 2)]))
+assert(Equal "Capabilities remain deterministic."
+  (txt-slot [("ts" "lead")] item2))
+
+(print "semidoc tests passed")

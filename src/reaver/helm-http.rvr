@@ -223,6 +223,25 @@
       (split-ch 38 body)))
   (Ifz hit "" (url-decode (Rsh (_0 hit) (Mul 8 (Bytes pre))))))
 
+;; Every form field as decoded [name value] pairs, in body order.
+;; Fields without an = are skipped.
+(define (field-eq-idx p)
+  (define n (Bytes p))
+  (define (go i)
+    (cond
+      ((Ge i n) 0)
+      ((Eq 61 (Load8 i p)) [i])
+      (else (go (Inc i)))))
+  (go 0))
+(define (form-fields body)
+  (define (pair p)
+    (define hit (field-eq-idx p))
+    (Ifz hit 0
+      (let ((i (_0 hit)))
+        [[(str-slice 0 i p)
+          (url-decode (Rsh p (Mul 8 (Inc i))))]])))
+  (foldl (lambda (acc p) (Weld acc (pair p))) [] (split-ch 38 body)))
+
 ;;; The worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; helpers = ["H" http/req myth/nat_at vine_make vine_cull myth/txt_at
@@ -246,11 +265,45 @@
 (define (h-poke hs) (Ix 9 hs))
 (define (h-sut hs) (Ix 10 hs))
 (define (h-vine? hs) (Gt (Sz hs) 9))
+;; myth/new + myth/add + twig/txt: the form-post endpoint builds its
+;; poke myth from the fields directly — no expression evaluation.
+(define (h-myth0 hs) (Ix 11 hs))
+(define (h-madd hs) (Ix 12 hs))
+(define (h-twigt hs) (Ix 13 hs))
+(define (h-post? hs) (Gt (Sz hs) 11))
 
 ;; "/vine" or "/vine/..." — the write box's endpoint.
 (define (vine-url? u)
   (And (Eq "/vine" (Mod u (Lsh 1 40)))
     (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
+
+;; "/post/..." — the form-post endpoint: POST /post/<path> pokes the
+;; target with a myth of ['post <field>] text slots, one per form
+;; field (the "back" field is control data: the bounce destination).
+;; The target's own talk arm decides what the post means — the same
+;; authority split as the write box, minus the expression language.
+(define (post-url? u)
+  (And (Eq "/post" (Mod u (Lsh 1 40)))
+    (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
+
+;; The poke myth for a form body: each field k=v except "back"
+;; becomes a text pail at slot ['post <k>].
+(define (post-myth hs body)
+  (foldl
+    (lambda (m kv)
+      (If (Equal "back" (_0 kv))
+        m
+        ((h-madd hs)
+         ((h-twigt hs) [("ts" "post") ("ts" (_0 kv))] (_1 kv))
+         m)))
+    (h-myth0 hs)
+    (form-fields body)))
+
+;; The form post's bounce: straight back to the page the form named.
+(define (post-back-page loc)
+  (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
+           " content=" 34 "0;url=" loc 34 "></head><body>posted; <a href="
+           34 loc 34 ">back</a></body></html>"]))
 
 (define (pend-get pending pax)
   (find (lambda (e) (Equal pax (_0 e))) pending))
@@ -394,7 +447,29 @@
                        (_0 target) (_0 fv))
                       (_0 target))))))))
         (else (reply 400 "verb must be make, poke, or cull"))))
+    ;; The form-post endpoint: POST /post/<path> pokes the target with
+    ;; the fields as ['post <k>] text slots and waits on the kernel's
+    ;; ack, bouncing back to the form's own page on commit.  The
+    ;; target's talk arm gives the post its meaning.
+    (define (post! z)
+      (define url (_2 msg))
+      (define body (_3 msg))
+      (define target (url-target (Rsh url 40)))
+      (define back0 (form-field "back" body))
+      (If (Ifz target 1 0)
+        (Seq (helm:send! (Ix 0 caps)
+               ["res" 404 "unparseable path segment" "text/plain; charset=utf-8"])
+          (loop serial pending queue))
+        (let ((back (If (Eq 0 (Bytes back0))
+                      (strWeld "/ns" (quip:print-path (_0 target)))
+                      back0))
+              (task ((h-poke hs) (_0 target) (post-myth hs body))))
+          (Seq (helm:send! coord ["cmd" name task])
+            (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
     (cond
+      ((And (Eq kind "req")
+         (And (h-post? hs) (post-url? (_2 msg))))
+        (post! 0))
       ((And (Eq kind "req")
          (And (h-vine? hs) (vine-url? (_2 msg))))
         (vine! 0))
@@ -463,6 +538,16 @@
               (rest (drop 1 queue))
               (rsvp (_1 msg)))
           (cond
+            ((Equal "post" (_1 head))
+              ;; the form post answers with the kernel's verdict:
+              ;; committed (bounce to the form's page) or rejected
+              (Seq (helm:send! (_2 head)
+                     (If (Eq "/boot/rsvp/no" (Hd rsvp))
+                       ["res" 500 (vine-fail-page (_0 head) (_0 rsvp))
+                        "text/html; charset=utf-8"]
+                       ["res" 200 (post-back-page (_3 head))
+                        "text/html; charset=utf-8"]))
+                (loop serial pending rest)))
             ((Equal "vine" (_1 head))
               ;; the write box answers here, with the kernel's verdict:
               ;; committed (bounce back to the node) or rejected (500,
