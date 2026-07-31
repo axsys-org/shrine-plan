@@ -643,11 +643,70 @@ assert(Equal (strcat ["{" (kv "status" "0") "}"])
 assert(Equal (strcat ["{" (kv "engine" (js "b")) "}"])
   (trt (strcat ["{" (kv "engine" (js "b")) "}"])))
 
+;;; When nothing settles the arms as ONE set, they are GROUPED by json
+;;; constructor and each group settled on its own.  ChatToolChoice is
+;;; three bare string constants beside two object refs: no field is
+;;; common to all five and the shapes are not disjoint, but "the
+;;; strings" and "the objects" are each perfectly ordinary — an enum and
+;;; a tag union.  Each group of more than one arm becomes a type of its
+;;; own, and the outer union is the shape dispatch already in hand.
+
+(define grouped-schema
+  (strcat ["{" (kv "title" (js "pick")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "choice") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "choice"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) ","
+                            (kv "enum" (strcat ["[" (js "none") "]"])) "},{"
+                          (kv "type" (js "string")) ","
+                            (kv "enum" (strcat ["[" (js "auto") "]"])) "},{"
+                          (kv "$ref" (js "#/$defs/named")) "},{"
+                          (kv "$ref" (js "#/$defs/served")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "named" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "type") "," (js "name") "]"])) ","
+                 (kv "properties" (strcat ["{"
+                   (kv "type" (strcat ["{" (kv "enum"
+                     (strcat ["[" (js "function") "]"])) "}"])) ","
+                   (kv "name" (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+                 "}"])) ","
+               (jdef "served" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "type") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "type"
+                   (strcat ["{" (kv "enum"
+                     (strcat ["[" (js "server") "]"])) "}"])) "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define gpsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut grouped-schema)))
+(define gprt (foil:source-entry-val ["rt"] gpsut))
+;; a string constant lands in the minted enum group
+assert(Equal (strcat ["{" (kv "choice" (js "auto")) "}"])
+  (gprt (strcat ["{" (kv "choice" (js "auto")) "}"])))
+;; an object lands in the minted tag-union group, by its own tag
+(define gp-obj
+  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "function")) ","
+                                     (kv "name" (js "f")) "}"])) "}"]))
+assert(Equal gp-obj (gprt gp-obj))
+assert(Equal (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])
+  (gprt (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])))
+;; each group keeps its OWN catch-all: an unlisted string and an
+;; unrecognised tag both still round-trip
+assert(Equal (strcat ["{" (kv "choice" (js "zzz")) "}"])
+  (gprt (strcat ["{" (kv "choice" (js "zzz")) "}"])))
+(define gp-new
+  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "later")) "}"])) "}"]))
+assert(Equal gp-new (gprt gp-new))
+;; and a shape no group claims rides in the outer catch-all
+assert(Equal (strcat ["{" (kv "choice" "true") "}"])
+  (gprt (strcat ["{" (kv "choice" "true") "}"])))
+
 ;;; Shapes that are NOT disjoint are rejected rather than settled by arm
 ;;; order: json/num answers to both `integer` and `number`, so a union of
 ;;; the two has no constructor that tells them apart.  This document
 ;;; never writes one, but arm order would be a silent wrong answer.
-assert(Equal "union has no discriminating field or shape"
+assert(Equal "union groups overlap on a json constructor"
   (gen-fails
     (strcat ["{" (kv "title" (js "amb")) "," (kv "type" (js "object")) ","
              (kv "properties"
@@ -996,10 +1055,17 @@ assert(Eq 1 (Lt 152 713))
 ;;;   705  phase 2f (a named array mints its element)
 ;;;   709  phase 2g (digit-leading names, numeric enums, enum unions)
 ;;;   711  phase 2h (set-valued tags, and a union's own fallback arm)
+;;;   713  phase 2i (arms grouped by shape, each group settled on its own)
+;;;
+;;; 713 of 713.  Every NAMED schema in the document expresses.  That is
+;;; not the same as every operation generating — see the second ratchet
+;;; below, which is still 53 of 89, because a lifted field-position type
+;;; can fail where no named schema does.
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 711))
+assert(Eq 1 (Ge (_0 oa-cov) 713))
+assert(Equal [] (Ix 2 oa-cov))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
@@ -1040,12 +1106,10 @@ assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 ;;; the element type.
 assert(Eq 0 (why? "inline-union (hoist to $defs)"))
 
-;;; What is left is 2: ChatToolChoice and OpenAIResponsesToolChoice, each
-;;; a handful of bare string constants sitting beside object arms.  No
-;;; single field settles those and their shapes are not disjoint (several
-;;; arms are strings), so they need the arms GROUPED by shape and settled
-;;; within each group.
-assert(Eq 1 (why? "union has no discriminating field or shape"))
+;;; Nothing is left.  Each of these was a whole CLASS of schema the IR
+;;; could not say, and every one is now retired — a regression would show
+;;; up here long before the count moved much.
+assert(Eq 0 (why? "union has no discriminating field or shape"))
 ;; a name that cannot start a foil identifier is mangled, not rejected
 assert(Eq 0 (why? "bad-name (want [a-z][a-z0-9_]*)"))
 ;; a numeric enum is carried by value rather than named

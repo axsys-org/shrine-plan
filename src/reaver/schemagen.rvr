@@ -720,8 +720,7 @@
 ;; inline type needing a name of its own, and minting one is
 ;; sg-typedef-go's job — which is defined after this, so it cannot be
 ;; called from here.
-(define (sg-union-plan env name v)
-  (define arms (sg-union-arms v))
+(define (sg-union-plan-arms env name arms)
   (define tag (sg-union-tag env arms))
   (Ifz (Nil tag)
     (let* ((tf (_0 tag))
@@ -747,10 +746,10 @@
         [["shape"]
          (gen (Sz arms)
            (lambda (i) [(Ix i shapes) (Ix i arms) [(Ix i shapes)]]))]
-        ;; Neither a field nor a shape: the genuinely ambiguous ones
-        ;; (this document has 5, one with 49 arms carrying type:"message"
-        ;; on three).  Guessing between them would be worse than saying so.
-        (sg-error "union has no discriminating field or shape" name)))))
+        ;; Neither settles these arms as they stand.  0 rather than an
+        ;; error: the caller may still group them by shape and settle
+        ;; each group on its own.
+        0))))
 
 ;; -> [typedef [extra-typedef ..]]   extras are lifted inline types
 (define (sg-typedef-go env name v depth)
@@ -777,33 +776,88 @@
     ;; is referenced.  Without this an arm could only ever be a $ref or a
     ;; primitive, which is what made `string | array-of-<union>` (this
     ;; document's BaseInputs and Inputs) unreachable.
-    (let* ((plan (sg-union-plan env name v))
-           (step
-             (foldl
-               (lambda (acc s)
-                 (let* ((vname (_0 s))
-                        (b (Ix 1 s))
-                        (key (Ix 2 s))
-                        (items (jv-get "items" b))
-                        (arr-lift
-                          (And (Ifz items 0 1)
-                            (If items (sg-liftable? env (_0 items)) 0))))
-                   (cond
-                     ((sg-liftable? env b)
-                       (let* ((nm (sg-mint env name vname))
-                              (sub (sg-typedef-go env nm b (Inc depth))))
-                         [(snoc [vname ["ref" nm] key] (_0 acc))
-                          (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
-                     (arr-lift
-                       (let* ((nm (sg-mint env name vname))
-                              (sub (sg-typedef-go env nm (_0 items) (Inc depth))))
-                         [(snoc [vname ["row" ["ref" nm]] key] (_0 acc))
-                          (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
-                     (else
-                       [(snoc [vname (sg-ftype-of env b) key] (_0 acc))
-                        (_1 acc)]))))
-               [[] []] (Ix 1 plan))))
-      [["union" name (_0 plan) (_0 step)] (_1 step)])
+    (let* ((arms (sg-union-arms v))
+           ;; one arm's ftype, minting a type for it if it is inline
+           ;; -> [ftype extras]
+           (arm-ft
+             (lambda (owner vname b)
+               (let* ((items (jv-get "items" b))
+                      (arr-lift
+                        (And (Ifz items 0 1)
+                          (If items (sg-liftable? env (_0 items)) 0))))
+                 (cond
+                   ((sg-liftable? env b)
+                     (let* ((nm (sg-mint env owner vname))
+                            (sub (sg-typedef-go env nm b (Inc depth))))
+                       [["ref" nm] (snoc (_0 sub) (_1 sub))]))
+                   (arr-lift
+                     (let* ((nm (sg-mint env owner vname))
+                            (sub (sg-typedef-go env nm (_0 items) (Inc depth))))
+                       [["row" ["ref" nm]] (snoc (_0 sub) (_1 sub))]))
+                   (else [(sg-ftype-of env b) []])))))
+           (from-specs
+             (lambda (nm disc specs)
+               (let ((step
+                       (foldl
+                         (lambda (acc s)
+                           (let ((r (arm-ft nm (_0 s) (Ix 1 s))))
+                             [(snoc [(_0 s) (_0 r) (Ix 2 s)] (_0 acc))
+                              (Weld (_1 acc) (_1 r))]))
+                         [[] []] specs)))
+                 [["union" nm disc (_0 step)] (_1 step)])))
+           (plan (sg-union-plan-arms env name arms)))
+      (Ifz (Nil plan)
+        (from-specs name (_0 plan) (Ix 1 plan))
+        ;; Nothing settles the arms as one set — GROUP them by json
+        ;; constructor and settle each group on its own.  ChatToolChoice
+        ;; is three bare string constants beside two object refs: no
+        ;; field is common to all five and the shapes are not disjoint,
+        ;; but "the strings" and "the objects" are each perfectly
+        ;; ordinary, an enum and a tag union.  Each group with more than
+        ;; one arm becomes a type of its own, and the outer union is the
+        ;; plain shape dispatch it already knows how to emit.
+        (let ((shapes (map (lambda (b) (sg-arm-shape env b 0)) arms)))
+          (Ifz (all (lambda (s) (Ifz (Nil s) 1 0)) shapes)
+            (sg-error "union has no discriminating field or shape" name)
+            (let* ((keys (dedupe-eq (map (lambda (s) (_0 s)) shapes)))
+                   (ctors
+                     (foldl (lambda (a k) (Weld a (sg-shape-ctors k))) [] keys)))
+              (Ifz (Eq (Sz ctors) (Sz (dedupe-eq ctors)))
+                (sg-error "union groups overlap on a json constructor" name)
+                (let ((step
+                        (foldl
+                          (lambda (acc k)
+                            (let* ((idxs
+                                     (filter
+                                       (lambda (i) (Eq k (_0 (Ix i shapes))))
+                                       (gen (Sz arms) (lambda (i) i))))
+                                   (mem (map (lambda (i) (Ix i arms)) idxs)))
+                              (If (Eq 1 (Sz mem))
+                                (let ((r (arm-ft name k (_0 mem))))
+                                  [(snoc [k (_0 r) [k]] (_0 acc))
+                                   (Weld (_1 acc) (_1 r))])
+                                (let* ((nm (sg-mint env name k))
+                                       (sub
+                                         (If (all sg-enumerates? mem)
+                                           ;; all constants: one enum
+                                           [["enum" nm
+                                             (sg-dedupe-pairs
+                                               (sg-enum-pairs
+                                                 (foldl
+                                                   (lambda (a b)
+                                                     (Weld a (sg-str-enum-vals b)))
+                                                   [] mem)))]
+                                            []]
+                                           (let ((p (sg-union-plan-arms env nm mem)))
+                                             (Ifz (Nil p)
+                                               (from-specs nm (_0 p) (Ix 1 p))
+                                               (sg-error
+                                                 "union group has no discriminating field or shape"
+                                                 nm))))))
+                                  [(snoc [k ["ref" nm] [k]] (_0 acc))
+                                   (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))))
+                          [[] []] keys)))
+                  [["union" name ["shape"] (_0 step)] (_1 step)])))))))
     ;; a record: its own properties, plus any inherited through allOf
     (let* ((flat (sg-flat-record env v 0))
            (props (_0 flat))
