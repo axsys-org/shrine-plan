@@ -587,9 +587,14 @@
            (ctors (foldl (lambda (acc k) (Weld acc (sg-shape-ctors k))) [] keys)))
       (If (Eq (Sz ctors) (Sz (dedupe-eq ctors))) keys 0))))
 
-;; -> ["union" name disc arms], disc = ["tag" field] | ["shape"],
-;;    arm = [vname ftype key]  (key = the tag's wire value, or the shape)
-(define (sg-union-td env name v)
+;; -> [disc specs], disc = ["tag" field] | ["shape"],
+;;    spec = [vname arm-schema key]  (key = the tag's wire value, or the shape)
+;;
+;; Deliberately stops short of the arms' FTYPES.  An arm can itself be an
+;; inline type needing a name of its own, and minting one is
+;; sg-typedef-go's job — which is defined after this, so it cannot be
+;; called from here.
+(define (sg-union-plan env name v)
   (define arms (sg-union-arms v))
   (define tag (sg-union-tag env arms))
   (Ifz (Nil tag)
@@ -599,20 +604,19 @@
                     (let* ((props (sg-arm-props env b 0))
                            (hit (find (lambda (e) (Eq tf (Ix 0 e))) props))
                            (wire (_0 (sg-pin-val (Ix 1 (_0 hit))))))
-                      [(sg-name wire) (sg-ftype-of env b) wire]))
+                      [(sg-name wire) b wire]))
                arms)))
       (If (any (lambda (a) (Eq sg-union-else (_0 a))) built)
         (sg-error "union arm collides with the catch-all name" name)
-        ["union" name ["tag" tf] built]))
+        [["tag" tf] built]))
     ;; No field settles it — try the arms' json constructors.  The
     ;; shape keys are str/arr/obj/num/boo, so they cannot collide with
     ;; the catch-all the way a tag's wire value can.
     (let ((shapes (sg-union-shape env arms)))
       (Ifz (Nil shapes)
-        ["union" name ["shape"]
+        [["shape"]
          (gen (Sz arms)
-           (lambda (i)
-             [(Ix i shapes) (sg-ftype-of env (Ix i arms)) (Ix i shapes)]))]
+           (lambda (i) [(Ix i shapes) (Ix i arms) (Ix i shapes)]))]
         ;; Neither a field nor a shape: the genuinely ambiguous ones
         ;; (this document has 5, one with 49 arms carrying type:"message"
         ;; on three).  Guessing between them would be worse than saying so.
@@ -631,7 +635,38 @@
     (let ((pairs (sg-dedupe-pairs (sg-enum-pairs vals))))
       [["enum" name pairs] []])
   (If (Sz (sg-union-arms v))
-    [(sg-union-td env name v) []]
+    ;; A union's ARMS lift exactly as a record's properties do: an arm
+    ;; that is an inline object, enum or union gets a name of its own and
+    ;; is referenced.  Without this an arm could only ever be a $ref or a
+    ;; primitive, which is what made `string | array-of-<union>` (this
+    ;; document's BaseInputs and Inputs) unreachable.
+    (let* ((plan (sg-union-plan env name v))
+           (step
+             (foldl
+               (lambda (acc s)
+                 (let* ((vname (_0 s))
+                        (b (Ix 1 s))
+                        (key (Ix 2 s))
+                        (items (jv-get "items" b))
+                        (arr-lift
+                          (And (Ifz items 0 1)
+                            (If items (sg-liftable? env (_0 items)) 0))))
+                   (cond
+                     ((sg-liftable? env b)
+                       (let* ((nm (sg-mint env name vname))
+                              (sub (sg-typedef-go env nm b (Inc depth))))
+                         [(snoc [vname ["ref" nm] key] (_0 acc))
+                          (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
+                     (arr-lift
+                       (let* ((nm (sg-mint env name vname))
+                              (sub (sg-typedef-go env nm (_0 items) (Inc depth))))
+                         [(snoc [vname ["row" ["ref" nm]] key] (_0 acc))
+                          (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))
+                     (else
+                       [(snoc [vname (sg-ftype-of env b) key] (_0 acc))
+                        (_1 acc)]))))
+               [[] []] (Ix 1 plan))))
+      [["union" name (_0 plan) (_0 step)] (_1 step)])
     ;; a record: its own properties, plus any inherited through allOf
     (let* ((flat (sg-flat-record env v 0))
            (props (_0 flat))

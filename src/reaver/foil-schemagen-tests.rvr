@@ -420,6 +420,73 @@ assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
 assert(Equal (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])
   (nsrt (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])))
 
+;;; A union's ARMS lift exactly as a record's properties do.  Without it
+;;; an arm could only be a $ref or a primitive, which is what put this
+;;; document's BaseInputs and Inputs out of reach: both are
+;;; `string | array-of-<union>`, so the shape settles the outer union and
+;;; the element type has to be minted.  Generating is not the claim —
+;;; these round-trip through the lifted types.
+
+(define armlift-schema
+  (strcat ["{" (kv "title" (js "inp")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "items"
+                            (strcat ["{" (kv "oneOf"
+                              (strcat ["[{" (kv "$ref" (js "#/$defs/a")) "},{"
+                                       (kv "$ref" (js "#/$defs/b")) "}]"])) "}"]))
+                          "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "a" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "enum" (strcat ["[" (js "alpha") "]"])) "}"]))
+                   "}"])) "}"])) ","
+               (jdef "b" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "enum" (strcat ["[" (js "beta") "]"])) "}"]))
+                   "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define alsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut armlift-schema)))
+(define alrt (foil:source-entry-val ["rt"] alsut))
+;; the string arm, and the array arm whose ELEMENT is a lifted tag union
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (alrt (strcat ["{" (kv "body" (js "x")) "}"])))
+(define al-arr
+  (strcat ["{" (kv "body"
+    (strcat ["[{" (kv "kind" (js "alpha")) "},{" (kv "kind" (js "beta")) "}]"]))
+    "}"]))
+assert(Equal al-arr (alrt al-arr))
+;; the lifted element union keeps its own catch-all
+(define al-new
+  (strcat ["{" (kv "body" (strcat ["[{" (kv "kind" (js "gamma")) "}]"])) "}"]))
+assert(Equal al-new (alrt al-new))
+
+;;; ...and an arm that is an inline OBJECT lifts the same way.
+(define objarm-schema
+  (strcat ["{" (kv "title" (js "oarm")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "type" (js "object")) ","
+                          (kv "required" (strcat ["[" (js "n") "]"])) ","
+                          (kv "properties" (strcat ["{" (kv "n"
+                            (strcat ["{" (kv "type" (js "integer")) "}"])) "}"]))
+                          "}]"])) "}"])) "}"]))
+           "}"]))
+(define oasut (Ix 2 (schemagen:compile-schema foil:default-subject jsut objarm-schema)))
+(define oart (foil:source-entry-val ["rt"] oasut))
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (oart (strcat ["{" (kv "body" (js "x")) "}"])))
+assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])
+  (oart (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])))
+
 ;;; Shapes that are NOT disjoint are rejected rather than settled by arm
 ;;; order: json/num answers to both `integer` and `number`, so a union of
 ;;; the two has no constructor that tells them apart.  This document
@@ -768,10 +835,11 @@ assert(Eq 1 (Lt 152 713))
 ;;;   613  phase 2a (enums by wire value, constants, any-JSON)
 ;;;   690  phase 2b (tag-discriminated unions)
 ;;;   692  phase 2c (shape-discriminated unions)
+;;;   696  phase 2d (union arms lift)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 692))
+assert(Eq 1 (Ge (_0 oa-cov) 696))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
@@ -802,18 +870,18 @@ assert(Eq 0 (why? "untyped-field (want type or $ref)"))
 assert(Eq 0 (why? "union of real types (needs oneOf support)"))
 assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 
-;;; A union in plain field position is minted and referenced, so oneOf
-;;; itself is no longer the gap.  What is left is hoisting a union
-;;; nested where lifting does not reach — inside an array's items, or
-;;; inside another union's arm.  BaseInputs and Inputs are both
-;;; `string | array`, which the shape dispatch settles, and then run
-;;; into this on the array's element type.
-assert(Eq 1 (why? "inline-union (hoist to $defs)"))
+;;; A union's ARMS now lift the way a record's properties do, so an arm
+;;; that is an inline object, enum or union gets a name of its own.
+;;; That retired the last structural gap: BaseInputs and Inputs are
+;;; `string | array-of-<union>`, settled by shape and then by lifting
+;;; the element type.
+assert(Eq 0 (why? "inline-union (hoist to $defs)"))
 
-;;; What is left are the unions neither a field nor a shape can settle:
-;;; 5 are genuinely ambiguous (one has 49 arms with `type: "message"` on
-;;; three of them), and two more reach a shape union whose ARM type is
-;;; one of those.  Guessing among them would be worse than saying so.
+;;; What is left is 17, and the largest group is the 5 unions neither a
+;;; field nor a shape can settle — one has 49 arms with `type: "message"`
+;;; on three of them.  Guessing among those would be worse than saying
+;;; so.  The rest: empty-object 4, inline-enum 3, inline-object 2,
+;;; bad-name 2, expected-string 1.
 assert(Eq 1 (why? "union has no discriminating field or shape"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
