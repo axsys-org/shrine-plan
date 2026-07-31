@@ -25,6 +25,8 @@
 
 (#bind doctest (#module doctest))
 
+(#bind cairn (#module cairn))
+
 
 ;;; The IO driver shell: real enki actors around the pure helm core
 ;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
@@ -160,11 +162,18 @@
 ;; materialized const-generic instantiations (/ty-ap-encoded keys are
 ;; not namespace paths) — the mirror's and the doctest driver's
 ;; shared notion of "documented entries".
+;; The imported keys as a cairn AX index: a helm-scale module imports
+;; the whole world (~1,500 keys), so the includes-scan variant was
+;; O(decls x imports) with deep path equality — one own-keys pass over
+;; the boot cache cost ~17s, and the mirror, /ns index, ref table, and
+;; doctest sweep each paid it.
 (define (entry-own-keys me)
+  (define imp-ax
+    (foldl (lambda (ax k) (cairn:putax k 1 ax)) cairn:empty-ax (_3 me)))
   (filter
     (lambda (k)
       (And (Nil (ty-ap-path? k))
-        (Nil (includes (Equal k) (_3 me)))))
+        (Nil (cairn:getax k imp-ax))))
     (_2 me)))
 
 ;; A lore-for hit (0 or singleton) -> the four constructor arguments
@@ -239,6 +248,12 @@
 ;; variant emits [node myth] rows (no /boot doc node) so a resync can
 ;; remount one module's records through the chore cmd stream; the
 ;; tasks variant wraps them as vine_makes for boot seeding.
+;; Profiling sub-zones: label + deep-force the payload so the span
+;; covers the work, not the thunk (see foil.rvr zspan).
+(define (zspan lbl v)
+  (define h (ZoneStart lbl))
+  (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))
+
 (define (boot-mirror-mods-refs-lore-with refs? lore? raw-cache core)
   (define cache raw-cache)
   (define src-t (core-ent core ["mirror" "src"]))
@@ -249,32 +264,34 @@
     (define mod (_0 me))
     (define sut (_1 me))
     (define imported (_3 me))
-    (define src (foil:get-foil mod))
+    (define src (zspan "m-src" (foil:get-foil mod)))
     (define lore (If lore? (entry-lore me) []))
     (define own (entry-own-keys me))
     (define mnode (Weld [(ts "boot")] (map ts (mod-segs mod))))
     (define (ent-task k)
-      (define e (foil:entry-parts sut k))
-      (define kind (foil:entry-kind sut k (foil:ent-tc e)))
-      (define slice (foil:source-slice src (foil:ent-span e)))
+      (define e (zspan "m-parts" (foil:entry-parts sut k)))
+      (define kind (zspan "m-kind" (foil:entry-kind sut k (foil:ent-tc e))))
+      (define slice (zspan "m-slice" (foil:source-slice src (foil:ent-span e))))
       (define name (drop 1 k))
       (define node
         (Weld mnode (Weld [("u" (Sz name))] (map ts name))))
       ;; entry keys are rooted, capture-lore paths source-relative —
       ;; name (the rootless key) is the lookup key for both
-      (define la (lore-args (foil-lore:lore-for lore name)))
+      (define la (zspan "m-lore" (lore-args (foil-lore:lore-for lore name))))
       ;; the extra panes forge used to render live: the reflected
       ;; type descriptor always (the explorer renders it via tyshow),
       ;; the decompiled law and reference rows behind their flags
       (define tydesc
-        ("/boot/maybe/some"
-         (foil-new-elab:reflect-encode 0 (tc-ty (foil:ent-tc e)))))
+        (zspan "m-ty"
+          ("/boot/maybe/some"
+           (foil-new-elab:reflect-encode 0 (tc-ty (foil:ent-tc e))))))
       (define lawtext
-        (If (And mirror-law? (foil:ent-lowered e))
-          (If (foil-render:law-like? (foil:ent-val e))
-            (foil-render:render-law (foil:ent-val e))
-            0)
-          0))
+        (zspan "m-law"
+          (If (And mirror-law? (foil:ent-lowered e))
+            (If (foil-render:law-like? (foil:ent-val e))
+              (foil-render:render-law (foil:ent-val e))
+              0)
+            0)))
       (define rr (refs-of reftab node))
       ;; entry paths are module-relative; consumers re-root them
       [(drop (Sz mnode) node)
