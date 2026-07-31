@@ -436,8 +436,13 @@
     (If (sg-real-enum? v)
       (sg-error "inline-enum (hoist to $defs)" v)
     (If (sg-const-enum? v) ["str"]
+    ;; A union reached HERE is one lifting never got to: inside an
+    ;; array's items, or inside another union's arm.  A union in plain
+    ;; field position is minted by sg-typedef-go and arrives as a $ref,
+    ;; so oneOf itself is supported — what is missing is hoisting the
+    ;; nested ones, exactly as with inline objects and enums above.
     (If (Sz (sg-union-arms v))
-      (sg-error "union of real types (needs oneOf support)" v)
+      (sg-error "inline-union (hoist to $defs)" v)
       (let ((t (sg-type-str v)))
         ;; No type and no $ref means "any JSON value" — the document is
         ;; declining to say more, so the field carries the value as it
@@ -516,7 +521,74 @@
 ;; turning every API addition into a client outage.
 (define sg-union-else "unknown")
 
-;; -> ["union" name tagfield arms], arm = [vname ftype wire]
+;;; Shape discrimination ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; When no FIELD settles a union, the arms' JSON constructors often do:
+;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
+;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
+;;; the constructor of the value itself rather than a key inside it.
+
+;; The json constructors a shape can arrive as.  `num` claims BOTH,
+;; because json splits numbers by spelling, not by type: an integral
+;; literal is json/num and any other is json/real (it keeps the source
+;; lexeme).  So one `number` arm needs two match arms.  That also means
+;; an `integer` arm and a `number` arm are NOT disjoint — json/num
+;; answers to both — and such a union is rejected rather than decided by
+;; arm order.  This document never writes one.
+(define (sg-shape-ctors s)
+  (cond
+    ((Eq "str" s) ["str"])
+    ((Eq "int" s) ["num"])
+    ((Eq "num" s) ["num" "real"])
+    ((Eq "boo" s) ["boo"])
+    ((Eq "arr" s) ["arr"])
+    ((Eq "obj" s) ["obj"])
+    (else [])))
+
+(define (sg-shape-of-type t)
+  (cond
+    ((Eq "string" t) ["str"])
+    ((Eq "integer" t) ["int"])
+    ((Eq "number" t) ["num"])
+    ((Eq "boolean" t) ["boo"])
+    ((Eq "array" t) ["arr"])
+    ((Eq "object" t) ["obj"])
+    (else 0)))
+
+;; The json shape an arm arrives as, following $refs and allOf.
+;; -> 0 (undecidable) or [shape-key]
+(define (sg-arm-shape env b depth)
+  (Ifz (Lt depth 16) 0
+    (let ((r (sg-ref-name b)))
+      (Ifz (Nil r)
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (Ifz hit 0 (sg-arm-shape env (Ix 1 (_0 hit)) (Inc depth))))
+        ;; a nested union has no single constructor of its own
+        (Ifz (Sz (sg-union-arms b))
+          (let ((t (sg-type-str b)))
+            (Ifz (Nil t)
+              (sg-shape-of-type (_0 t))
+              ;; no declared type: read it off the structure
+              (cond
+                ;; a substantive allOf is a record merge
+                ((Sz (sg-allof b)) ["obj"])
+                ((Ifz (jv-get "enum" b) 0 1) ["str"])
+                ((Sz (sg-props-of b)) ["obj"])
+                ((Ifz (jv-get "items" b) 0 1) ["arr"])
+                (else 0))))
+          0)))))
+
+;; The arms' shapes, if every arm has one and no two can arrive as the
+;; same json constructor.  -> 0, or [shape-key ..] parallel to arms
+(define (sg-union-shape env arms)
+  (define shapes (map (lambda (b) (sg-arm-shape env b 0)) arms))
+  (Ifz (all (lambda (s) (Ifz (Nil s) 1 0)) shapes) 0
+    (let* ((keys (map (lambda (s) (_0 s)) shapes))
+           (ctors (foldl (lambda (acc k) (Weld acc (sg-shape-ctors k))) [] keys)))
+      (If (Eq (Sz ctors) (Sz (dedupe-eq ctors))) keys 0))))
+
+;; -> ["union" name disc arms], disc = ["tag" field] | ["shape"],
+;;    arm = [vname ftype key]  (key = the tag's wire value, or the shape)
 (define (sg-union-td env name v)
   (define arms (sg-union-arms v))
   (define tag (sg-union-tag env arms))
@@ -531,11 +603,20 @@
                arms)))
       (If (any (lambda (a) (Eq sg-union-else (_0 a))) built)
         (sg-error "union arm collides with the catch-all name" name)
-        ["union" name tf built]))
-    ;; No field settles it.  Shape discrimination (disjoint JSON types)
-    ;; and the handful of genuinely ambiguous unions are both still
-    ;; unsupported, and saying which is which would be a guess.
-    (sg-error "union has no discriminating field" name)))
+        ["union" name ["tag" tf] built]))
+    ;; No field settles it — try the arms' json constructors.  The
+    ;; shape keys are str/arr/obj/num/boo, so they cannot collide with
+    ;; the catch-all the way a tag's wire value can.
+    (let ((shapes (sg-union-shape env arms)))
+      (Ifz (Nil shapes)
+        ["union" name ["shape"]
+         (gen (Sz arms)
+           (lambda (i)
+             [(Ix i shapes) (sg-ftype-of env (Ix i arms)) (Ix i shapes)]))]
+        ;; Neither a field nor a shape: the genuinely ambiguous ones
+        ;; (this document has 5, one with 49 arms carrying type:"message"
+        ;; on three).  Guessing between them would be worse than saying so.
+        (sg-error "union has no discriminating field or shape" name)))))
 
 ;; -> [typedef [extra-typedef ..]]   extras are lifted inline types
 (define (sg-typedef-go env name v depth)
@@ -985,21 +1066,32 @@
     ((Eq "ref" (_0 ft)) (npar [(nw (strcat [(Ix 1 ft) "_to"])) exp]))
     (else (sg-error "enc-of-row-inline" ft))))
 
+;; A row[json] built from src's elements, each encoded with et.  src is
+;; the receiver as a list of path components (`[x tags]` -> x.tags), and
+;; every loop variable is suffixed with ix so that several of these can
+;; sit in one function without colliding.  Rows cannot go through
+;; sg-enc-t: they need a loop, and the loop needs that fresh index.
+(define (sg-enc-row-loop ix outv src et)
+  [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
+                       (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
+                                 (nbrk [])])])])
+   (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
+                    (nrn "." (snoc (nw "len") src))])
+             (nw outv)])
+   (npar [(nw "_") (ndotw (strcat ["i" ix]) "inc")
+          (nmeth (nw outv) "snoc"
+            [(sg-enc-t et
+               (nrn "." (snoc (njx [(nw "at") (npar [(nw (strcat ["i" ix]))])])
+                          src)))])])])
+
+;; The whole json/arr for a row-typed value.
+(define (sg-enc-row ix src et)
+  (npar [(npth ["json" "arr"])
+         (ngrp (sg-enc-row-loop ix (strcat ["b" ix]) src et))]))
+
 (define (sg-rec-to-tree name fields)
   (define n (Sz fields))
-  (define (row-loop ix outv src et)
-    ;; a row[json] loop from src's elements
-    [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
-                         (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
-                                   (nbrk [])])])])
-     (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
-                      (nrn "." (snoc (nw "len") src))])
-               (nw outv)])
-     (npar [(nw "_") (ndotw (strcat ["i" ix]) "inc")
-            (nmeth (nw outv) "snoc"
-              [(sg-enc-t et
-                 (nrn "." (snoc (njx [(nw "at") (npar [(nw (strcat ["i" ix]))])])
-                            src)))])])])
+  (define (row-loop ix outv src et) (sg-enc-row-loop ix outv src et))
   (define (field-trees i)
     (define f (Ix i fields))
     (define fname (Ix 0 f))
@@ -1168,6 +1260,32 @@
                       (nfc "av" (sg-ft-ty-t (Ix 1 a)))])
                (nvap rsum "ok" [(nvap name (_0 a) [(nw "av")])])])]))
 
+;; Dispatch on the constructor the value actually arrived as.  Each arm
+;; contributes one match arm per constructor it can answer to (two for a
+;; number), and the arm's own decoder still receives the whole value, so
+;; nothing here has to unwrap it.
+(define (sg-union-shape-from-tree name arms)
+  (define rsum (strcat [name "_r"]))
+  (define catch-all
+    (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])]))
+  (nrn "+"
+    [(nw (strcat [name "_from"]))
+     (nslug [(strcat ["Decode a " name " by the json constructor it"])
+             "arrived as; any other shape rides undecoded."])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       (Weld [(nw "v")]
+         (snoc catch-all
+           (foldl
+             (lambda (acc a)
+               (Weld acc
+                 (map (lambda (c)
+                        (nrn ">" [(nfc (strcat ["j_" c]) (npth ["json" c]))
+                                  (sg-union-arm-decode name rsum a)]))
+                   (sg-shape-ctors (_0 a)))))
+             [] arms))))]))
+
 (define (sg-union-from-tree name tagf arms)
   (define rsum (strcat [name "_r"]))
   (define catch-all
@@ -1211,10 +1329,18 @@
      (nrn "^" [(nw "json")])
      (nrn "?"
        (Weld [(nw "x")]
-         (map (lambda (a)
-                (nrn ">" [(nfc (strcat ["u_" (_0 a)]) (npth [name (_0 a)]))
-                          (sg-enc-t (Ix 1 a) (ndotw (strcat ["u_" (_0 a)]) "v"))]))
-           all-arms)))]))
+         (gen (Sz all-arms)
+           (lambda (i)
+             (let* ((a (Ix i all-arms))
+                    (ft (Ix 1 a))
+                    (bnd (strcat ["u_" (_0 a)])))
+               (nrn ">"
+                 [(nfc bnd (npth [name (_0 a)]))
+                  ;; an array arm needs the same loop a record field
+                  ;; does; the arm index keeps its variables distinct
+                  (If (Eq "row" (_0 ft))
+                    (sg-enc-row (nat-str i) [(nw bnd) (nw "v")] (Ix 1 ft))
+                    (sg-enc-t ft (ndotw bnd "v")))]))))))]))
 
 (define sg-prelude-trees
   [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
@@ -1258,7 +1384,7 @@
   (If (Eq "union" kind)
     ;; each arm needs its own value decoder, exactly as a row's element
     ;; type does: request it with req=0 opt=0
-    (let* ((tagf (Ix 2 td))
+    (let* ((disc (Ix 2 td))
            (arms (Ix 3 td))
            (wanted
              (foldl (lambda (acc a) (sg-merge-entry acc [(Ix 1 a) 0 0]))
@@ -1272,7 +1398,9 @@
        (Weld (_1 hst)
          [(sg-union-decl-tree name arms)
           (sg-sum-tree (strcat [name "_r"]) (nw name))
-          (sg-union-from-tree name tagf arms)
+          (If (Eq "shape" (_0 disc))
+            (sg-union-shape-from-tree name arms)
+            (sg-union-from-tree name (Ix 1 disc) arms))
           (sg-union-to-tree name arms)])])
   (If (Eq "enum" kind)
     (let ((vals (Ix 2 td)))

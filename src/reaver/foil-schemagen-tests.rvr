@@ -357,6 +357,83 @@ assert(Equal "body:expected-object"
 assert(Equal "body:missing-tag"
   (urt (strcat ["{" (kv "body" (strcat ["{" (kv "n" "1") "}"])) "}"])))
 
+;;; When no FIELD settles a union, the arms' JSON CONSTRUCTORS often do:
+;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
+;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
+;;; the constructor of the value itself instead of a key inside it, and
+;;; the variants are named for the shape (str/arr/obj/num/boo) rather
+;;; than for a type name the arm may not have.
+
+(define shape-schema
+  (strcat ["{" (kv "title" (js "shp")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "type" (js "array")) ","
+                          (kv "items" (strcat ["{" (kv "type" (js "string")) "}"]))
+                          "}]"])) "}"])) "}"]))
+           "}"]))
+(define ssut (Ix 2 (schemagen:compile-schema foil:default-subject jsut shape-schema)))
+(define srt (foil:source-entry-val ["rt"] ssut))
+
+;; each shape decodes as its own arm and re-encodes as itself
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (srt (strcat ["{" (kv "body" (js "x")) "}"])))
+assert(Equal (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])
+  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])))
+;; a shape no arm claims rides in the catch-all, exactly as an
+;; unrecognised tag does
+assert(Equal (strcat ["{" (kv "body" "true") "}"])
+  (srt (strcat ["{" (kv "body" "true") "}"])))
+;; the chosen arm still decodes properly, breadcrumb and all
+assert(Equal "body[1]:expected-string"
+  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") ",2]"])) "}"])))
+
+;;; A `number` arm needs TWO match arms, because json splits numbers by
+;;; spelling rather than by type: an integral literal is json/num and
+;;; anything else is json/real.  Both must reach the same variant.
+
+(define numsh-schema
+  (strcat ["{" (kv "title" (js "lat")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "v"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "number")) "},{"
+                          (kv "$ref" (js "#/$defs/cut")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{" (kv "cut"
+               (strcat ["{" (kv "type" (js "object")) ","
+                        (kv "properties" (strcat ["{" (kv "p50"
+                          (strcat ["{" (kv "type" (js "number")) "}"])) "}"]))
+                        "}"])) "}"]))
+           "}"]))
+(define nssut (Ix 2 (schemagen:compile-schema foil:default-subject jsut numsh-schema)))
+(define nsrt (foil:source-entry-val ["rt"] nssut))
+;; an integral literal (json/num) and a fractional one (json/real) both
+;; land on the number variant
+assert(Equal (strcat ["{" (kv "v" "5") "}"]) (nsrt (strcat ["{" (kv "v" "5") "}"])))
+assert(Equal (strcat ["{" (kv "v" "1.5") "}"]) (nsrt (strcat ["{" (kv "v" "1.5") "}"])))
+assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
+  (nsrt (strcat ["{" (kv "v" "6.02e23") "}"])))
+;; and the object arm is still reached
+assert(Equal (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])
+  (nsrt (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])))
+
+;;; Shapes that are NOT disjoint are rejected rather than settled by arm
+;;; order: json/num answers to both `integer` and `number`, so a union of
+;;; the two has no constructor that tells them apart.  This document
+;;; never writes one, but arm order would be a silent wrong answer.
+assert(Equal "union has no discriminating field or shape"
+  (gen-fails
+    (strcat ["{" (kv "title" (js "amb")) "," (kv "type" (js "object")) ","
+             (kv "properties"
+               (strcat ["{" (kv "v"
+                 (strcat ["{" (kv "anyOf"
+                   (strcat ["[{" (kv "type" (js "integer")) "},{"
+                            (kv "type" (js "number")) "}]"])) "}"])) "}"]))
+             "}"])))
+
 ;; a nested array has no ftype
 assert(Equal "nested-array-unsupported"
   (gen-fails
@@ -690,13 +767,30 @@ assert(Eq 1 (Lt 152 713))
 ;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
 ;;;   613  phase 2a (enums by wire value, constants, any-JSON)
 ;;;   690  phase 2b (tag-discriminated unions)
+;;;   692  phase 2c (shape-discriminated unions)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 690))
+assert(Eq 1 (Ge (_0 oa-cov) 692))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
+
+;;; A SECOND ratchet, because the first one understates the work.
+;;; spec-coverage counts NAMED schemas only, so a failure inside a
+;;; lifted field-position type never reaches it — and field position is
+;;; where the shape unions overwhelmingly live (39 of this document's
+;;; 43, against 4 named).  This counts operations whose whole module
+;;; builds, which is the number a caller actually cares about.
+;;;    46  phase 2b (tag-discriminated unions)
+;;;    49  phase 2c (shape-discriminated unions)
+(define (op-builds? id)
+  (define r (Try (lambda (z)
+                   (let ((p (schemagen:sg-spec-parts oa-v [id])))
+                     (DeepSeq p 1)))
+              0))
+  (If (Eq 1 (Hd r)) 0 1))
+assert(Eq 1 (Ge (Sz (filter op-builds? oa-ids)) 49))
 
 ;;; What earlier phases retired.  These must stay absent: each was a
 ;;; whole class of schema the IR could not say, and a regression would
@@ -708,13 +802,19 @@ assert(Eq 0 (why? "untyped-field (want type or $ref)"))
 assert(Eq 0 (why? "union of real types (needs oneOf support)"))
 assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 
-;;; What is left is 23 schemas, and no longer one dominant class.  The
-;;; only group is the unions no FIELD can settle: 34 of the document's
-;;; 141 discriminate on the JSON constructor instead (mostly
-;;; `string | array`), and 5 are genuinely ambiguous — one has 49 arms
-;;; with `type: "message"` on three of them.  Guessing between those two
-;;; cases would be worse than saying so.
-assert(Eq 1 (why? "union has no discriminating field"))
+;;; A union in plain field position is minted and referenced, so oneOf
+;;; itself is no longer the gap.  What is left is hoisting a union
+;;; nested where lifting does not reach — inside an array's items, or
+;;; inside another union's arm.  BaseInputs and Inputs are both
+;;; `string | array`, which the shape dispatch settles, and then run
+;;; into this on the array's element type.
+assert(Eq 1 (why? "inline-union (hoist to $defs)"))
+
+;;; What is left are the unions neither a field nor a shape can settle:
+;;; 5 are genuinely ambiguous (one has 49 arms with `type: "message"` on
+;;; three of them), and two more reach a shape union whose ARM type is
+;;; one of those.  Guessing among them would be worse than saying so.
+assert(Eq 1 (why? "union has no discriminating field or shape"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
 ;;; which is what makes it the first operation a real client can use.
