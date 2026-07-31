@@ -5,7 +5,7 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/lf/liquid";
+    url = "github:axsys-org/enki/main";
   };
 
   outputs = { self, nixpkgs, rex, enki }:
