@@ -29,6 +29,12 @@
 (define (get-foil fnam)
   (read-text-file (strcat ["foil/" fnam ".foil"])))
 
+;; Profiling spans (wisp --profile-json): force the stage INSIDE the
+;; zone so laziness cannot smear attribution.  DeepSeq stops at pins.
+(define (zspan lbl v)
+  (define h (ZoneStart lbl))
+  (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))
+
 (define (parse-foil fnam)
   (foil-sast:parse-module-sast 0 (rex:ParseRexNormFile (get-foil fnam))))
 
@@ -479,8 +485,8 @@
 ;; See compile-mod-go below for the threading rationale.
 (define (compile-rex-go-sub compile-sub stack cache0 pair0 dpair mod rexn)
   (define sut0 (_0 pair0))
-  (define rows (foil-sast:parse-module-sast 0 rexn))
-  (define lore (foil-lore:capture-lore rexn))
+  (define rows (zspan "c-sast" (foil-sast:parse-module-sast 0 rexn)))
+  (define lore (zspan "c-lore" (foil-lore:capture-lore rexn)))
   (define imps (filter mod-import? rows))
   (define decls (filter (lambda (r) (Nil (mod-import? r))) rows))
   ;; Resolve imports to completed unit values first.  No namespace mutation
@@ -533,7 +539,8 @@
   (define own-layer (make-own-layer mod decls))
   (define substrate-layer (_1 pair0))
   (define environment
-    (foil-env:build-environment-with-base substrate-layer mounts own-layer))
+    (zspan "c-env"
+      (foil-env:build-environment-with-base substrate-layer mounts own-layer)))
   (define pre
     (foil-subject:set-sut-unit environment
       (project-mounts sut0 resolved mounts decls)))
@@ -545,10 +552,10 @@
     ;; metadata attached to its result.  Force the sealed environment while
     ;; compile-mod's error boundary is active so malformed headers cannot
     ;; escape later when tooling first inspects the retained Unit.
-    (DeepSeq lore (DeepSeq environment (elab-mod pre decls))))
+    (DeepSeq lore (DeepSeq environment (zspan "c-elab" (elab-mod pre decls)))))
   ;; Materialize every referenced ground instantiation of const-param
   ;; generics before lowering (their base members skip lowering).
-  (define final (foil-lower:materialize-consts elabbed))
+  (define final (zspan "c-consts" (foil-lower:materialize-consts elabbed)))
   (define declared
     (map (lambda (d) (foil-subject:root-path final (Ix 1 d)))
       (filter mod-decl? decls)))
@@ -559,7 +566,7 @@
   ;; lower-tc-unit is the fixpoint-aware path; until a module actually has an
   ;; internal cycle it is behaviorally identical to the historical fold.
   (define lowered
-    (foil-lower:lower-tc-unit pre final own-keys))
+    (zspan "c-lower" (foil-lower:lower-tc-unit pre final own-keys)))
   (define exports (make-export-layer mod own-keys lowered))
   (define unit0
     (foil-env:make-unit-with-base mod substrate-layer mounts own-layer exports))

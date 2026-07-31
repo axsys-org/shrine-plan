@@ -52,6 +52,13 @@
 (define (lain-park z)
   (Seq (Recv 0) (lain-park z)))
 
+;; Boot phase stamps: force the phase INSIDE the stamp (laziness
+;; would otherwise attribute its work to whoever demands it first)
+;; and mark the wall clock.  DeepSeq stops at pins, so re-forcing is
+;; cheap.  Now is 1s resolution — phases are tens of seconds.
+(define (phase-stamp name v)
+  (Seq (DeepSeq v 0) (Seq (Trace ["PHASE" name (Now 0)] 0) v)))
+
 ;; The compiled world a serve closes over, pinned once: every saved
 ;; snapshot references it by hash, so the core costs one pin file
 ;; ever, not one per event.
@@ -88,6 +95,7 @@
   ;; call graph the pump and connection actors will touch.  A resume
   ;; re-runs this same block, so both processes force identically.
   (define warm
+    (phase-stamp "main-warm"
     (DeepSeq
       [(DeepSeq [helm-http:conn-actor helm-http:listener-pump helm-http:mk-http-worker helm-http:res-of
                  helm-http:pend-get helm-http:pend-drop
@@ -111,7 +119,7 @@
        ;; the local runtime may lack the Fetch primop (op-83): the
        ;; fetch-less boot skips its warm and its driver below
        (If fetch? (http-client:fetch-warm 0) 0)]
-      0))
+      0)))
   (define (app path) (helm:core-ent core path))
   ;; t_data / put_nat left the app: rebuild them from the myth kit
   ;; (myth/new is a constant now — the entry value IS the empty myth)
@@ -213,38 +221,44 @@
 ;; The seeding half: compile the whole world and grow the first
 ;; sovereign — /boot mirror, /boot/ns indices, fail cards, mounted
 ;; apps, the doctest sweep.  -> [mcache sov]
+
+
 (define (build-lain-sov core)
   (define (app path) (helm:core-ent core path))
-  (define sov0 (app ["seeded_kern"]))
+  (define sov0 (phase-stamp "seed-kern" (app ["seeded_kern"])))
   ;; apps compile before the mirror is built, against the core's own
   ;; cache, so app modules mirror (lore included) like kernel code
-  (define ar (helm:compile-apps core (helm:core-cache core) (helm:discover-apps 0)))
+  (define ar (phase-stamp "compile-apps" (helm:compile-apps core (helm:core-cache core) (helm:discover-apps 0))))
   ;; full-roster mirroring: every module on disk compiles into the
   ;; boot cache so the whole tree mirrors; failures get fail cards
   (define rr
+    (phase-stamp "compile-roster"
     (If helm:mirror-all?
       (helm:compile-roster (_0 ar)
         (helm:mirror-roster (foil:read-fs-tree "foil")))
-      [(_0 ar) []]))
+      [(_0 ar) []])))
   (define full-cache (_0 rr))
   ;; the boot image, introspectable at /boot: entries, /boot/ns
   ;; indices, and fail cards for the broken modules
   ;; batched: one pact event per module subtree + one for /boot/ns,
   ;; instead of one event per mirrored node (~40 commits vs ~1,500)
   (define mirror
-    (Weld (helm:boot-mirror-pact-tasks-with full-cache core)
-      (Weld [(helm:boot-ns-pact-task core full-cache)]
-        (helm:boot-fail-tasks core (_1 rr)))))
+    (phase-stamp "mirror-tasks"
+      (Weld (helm:boot-mirror-pact-tasks-with full-cache core)
+        (Weld [(helm:boot-ns-pact-task core full-cache)]
+          (helm:boot-fail-tasks core (_1 rr))))))
   (define sov1
-    (Seq (Trace ["mirroring /boot" (Sz mirror) "failed" (Sz (_1 rr))] 0)
-      (helm:seed-tasks core sov0 mirror)))
+    (phase-stamp "seed-mirror"
+      (Seq (Trace ["mirroring /boot" (Sz mirror) "failed" (Sz (_1 rr))] 0)
+        (helm:seed-tasks core sov0 mirror))))
   ;; one event per app: the pact form expands the whole subtree.
   ;; Apps in the roots table own a top-level root instead of the
   ;; default /app/<name> — the chat app serves at /chat.
   (define app-roots [["chat" [("ts" "chat")]] ["nenex" [("ts" "nenex")]]])
   (define sov2
-    (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
-      (helm:mount-apps core sov1 (_1 ar) app-roots)))
+    (phase-stamp "mount-apps"
+      (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
+        (helm:mount-apps core sov1 (_1 ar) app-roots))))
   ;; the doctest sweep no longer blocks the boot: boot-lain-with
   ;; injects its verdict tasks through the coordinator AFTER the
   ;; listener is up (helm:doctest-sweep? still gates it there)
@@ -256,7 +270,7 @@
 ;; core0 is passed unevaluated (laziness defers any compile inside it
 ;; until this runs in MAIN).
 (define (boot-lain-with live? port fetch? core0)
-  (define core core0)
+  (define core (phase-stamp "compile-core" core0))
   (define (app path) (helm:core-ent core path))
   (define bl (build-lain-sov core))
   (define pk (serve-pin core (_0 bl)))
@@ -282,7 +296,7 @@
         (Seq (inject (vine-make [("ts" "io") ("ts" "doctest")] (app ["dt" "cfg"])))
         (Seq (inject (vine-make [("ts" "io") ("ts" "chore")]
                ((app ["chore" "cfg"]) ("ts" "eval"))))
-        (Seq (Trace ["lain listening" port] 0)
+        (Seq (Trace ["PHASE" "listening" (Now 0) port] 0)
           ;; The expensive mirror garnishes run AFTER the listener is
           ;; up, streaming through the coordinator while the explorer
           ;; serves: first the who-calls rows (mirror-refs?), then the
@@ -296,8 +310,10 @@
                  0)
           (Seq (If helm:doctest-sweep?
                  (Seq (Trace ["doctest sweep (post-listen)"] 0)
-                   (foldl (lambda (z t) (Seq (inject t) 0)) 0
-                     (helm:doctest-tasks (_0 bl) core (_1 bl))))
+                   (Seq
+                     (foldl (lambda (z t) (Seq (inject t) 0)) 0
+                       (helm:doctest-tasks (_0 bl) core (_1 bl)))
+                     (Trace ["PHASE" "sweep-done" (Now 0)] 0)))
                  0)
             [core coord]))))))))))
 
