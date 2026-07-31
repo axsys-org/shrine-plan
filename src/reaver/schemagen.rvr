@@ -127,7 +127,16 @@
   (define trimmed
     (Ifz (Sz body) body
       (If (Eq 95 (Ix (Dec (Sz body)) body)) (take (Dec (Sz body)) body) body)))
-  (strcat trimmed))
+  ;; A leading digit is legal JSON and illegal foil, and the values that
+  ;; hit it are ordinary ("5m" and "1h" are this document's cache TTLs).
+  ;; Prefix rather than reject.  n_ is safe against colliding with a
+  ;; value that spells the mangling itself, because a source name can
+  ;; only produce a leading n_ from text that already starts with a
+  ;; letter, and this branch is only taken when it starts with a digit.
+  (define fixed
+    (Ifz (Sz trimmed) trimmed
+      (If (sg-digit? (_0 trimmed)) (Weld [110 95] trimmed) trimmed)))
+  (strcat fixed))
 
 ;; Normalize AND validate: the name a generated module will use.
 (define (sg-name s) (sg-check-name (sg-norm-name s)))
@@ -215,13 +224,23 @@
   (Ifz r []
     (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
 
+;; Enum values this IR can name.  A foil variant's name comes from the
+;; wire STRING, so a numeric enum has nothing to make variants out of —
+;; this document's EndpointStatus is [0,-1,-2,-3,-5,-10].  Such a schema
+;; is not an enumeration here; sg-ftype-go carries it by value instead.
+(define (sg-jv-num? x)
+  (Or (jv? "/boot/json/num" x) (jv? "/boot/json/real" x)))
+(define (sg-str-enum-vals v)
+  (define xs (sg-enum-vals v))
+  (If (all jv-str? xs) xs []))
+
 ;; A single-value enum is a CONSTANT, not an enumeration: the wire
 ;; always carries that one string.  In a discriminated union it is the
 ;; tag; on its own it is a field nothing branches on.  Either way a sum
 ;; with one variant would be noise, so it stays a string — 435 of this
 ;; document's 522 inline enums are of this shape.
-(define (sg-const-enum? v) (Eq 1 (Sz (sg-enum-vals v))))
-(define (sg-real-enum? v) (Gt (Sz (sg-enum-vals v)) 1))
+(define (sg-const-enum? v) (Eq 1 (Sz (sg-str-enum-vals v))))
+(define (sg-real-enum? v) (Gt (Sz (sg-str-enum-vals v)) 1))
 
 ;; The arms of a oneOf/anyOf, with a bare `null` arm dropped — that arm
 ;; is the nullable spelling again, not a member of the union.
@@ -236,12 +255,16 @@
   (Weld (Ifz one [] (real (jv-xs! (_0 one))))
     (Ifz any-r [] (real (jv-xs! (_0 any-r))))))
 
-;; A union every one of whose arms is a bare constant is an ENUM spelled
-;; the long way — this document does that 12 times.
+;; A union every one of whose arms ENUMERATES is an enum spelled the long
+;; way — its variants are all the arms' values taken together.  Arity is
+;; not the point: this document writes it as 12 unions of bare constants,
+;; but PDFParserEngine is a 3-value enum beside a 1-value one, which
+;; means exactly the same thing.
+(define (sg-enumerates? v) (Gt (Sz (sg-str-enum-vals v)) 0))
 (define (sg-union-is-enum? v)
   (define arms (sg-union-arms v))
   (And (Gt (Sz arms) 1)
-    (If (all sg-const-enum? arms) 1 0)))
+    (If (all sg-enumerates? arms) 1 0)))
 
 (define (sg-branch-adds? b)
   (Or (If (Sz (sg-props-of b)) 1 0)
@@ -310,8 +333,10 @@
       [(_0 refs)])
     ;; any other allOf is a real merge
     ((Sz ao) 0)
-    ;; an enum is a type of its own, whatever its base type says
-    ((Ifz (jv-get "enum" v) 0 1) 0)
+    ;; a STRING enum is a type of its own, whatever its base type says;
+    ;; a numeric one is not an enumeration here, so it falls through and
+    ;; rides as its value
+    ((If (Sz (sg-str-enum-vals v)) 1 0) 0)
     ;; an array whose element must be minted is not an alias
     ((sg-named-row? v) 0)
     (else
@@ -382,18 +407,15 @@
 ;;;
 ;;; "Discriminator" is not a property of a field but of a field
 ;;; RELATIVE TO A UNION.  A field discriminates when matching on it is
-;;; enough to pick an arm, which means: present in every arm, pinned to
-;;; one value in every arm, and those values pairwise distinct.  Derived
-;;; that way it agrees with all 40 of this document's declared
-;;; `discriminator` keys and finds 31 more, so the keyword is never read.
-
-;; The one value a property schema pins, as a wire string, or 0.
-(define (sg-pin-val ps)
-  (define c (jv-get "const" ps))
-  (Ifz c
-    (let ((vs (sg-enum-vals ps)))
-      (If (And (Eq 1 (Sz vs)) (jv-str? (_0 vs))) [(jv-str! (_0 vs))] 0))
-    (If (jv-str? (_0 c)) [(jv-str! (_0 c))] 0)))
+;;; enough to pick an arm, which means: present in every arm, pinned in
+;;; every arm, and no two arms claiming a value in common.  Derived that
+;;; way it agrees with all 40 of this document's declared `discriminator`
+;;; keys and finds 31 more, so the keyword is never read.
+;;;
+;;; "Pinned to ONE value" is the common case but not the rule: an arm may
+;;; claim a set, and one arm may decline to pin at all and take whatever
+;;; is left.  See sg-union-tag, which tries the strict reading first so
+;;; that a union which already had a tag keeps the same one.
 
 ;; An arm's properties, following a $ref and flattening allOf.
 (define (sg-arm-props env b depth)
@@ -404,21 +426,65 @@
           (Ifz hit [] (sg-arm-props env (Ix 1 (_0 hit)) (Inc depth))))
         (_0 (sg-flat-record env b 0))))))
 
+;; The wire values a property schema pins, as a row of strings, or 0.
+;; An arm may claim SEVERAL — ChatFunctionTool has an arm whose `type` is
+;; an anyOf of two constants — and that still discriminates, so long as
+;; no two arms claim a value in common.
+(define (sg-pin-vals ps)
+  (define c (jv-get "const" ps))
+  (Ifz c
+    (let ((vs (sg-str-enum-vals ps)))
+      (Ifz (Sz vs)
+        (let* ((bs (sg-union-arms ps))
+               (acc (foldl (lambda (a b) (Weld a (sg-str-enum-vals b))) [] bs)))
+          (Ifz (Sz acc) 0 [(map jv-str! acc)]))
+        [(map jv-str! vs)]))
+    (If (jv-str? (_0 c)) [[(jv-str! (_0 c))]] 0)))
+
+;; The per-arm value sets for field f: 0 where an arm declares f without
+;; pinning it.  Only meaningful when f is present in every arm.
+(define (sg-tag-sets env arms f)
+  (map (lambda (b)
+         (let* ((view (sg-arm-props env b 0))
+                (hit (find (lambda (e) (Eq f (Ix 0 e))) view)))
+           (Ifz hit 0 (sg-pin-vals (Ix 1 (_0 hit))))))
+    arms))
+
 ;; The field that discriminates these arms, or 0.
+;;
+;; Tried in order of strictness, so that a union which already had a tag
+;; keeps the SAME one: every arm pinning exactly one value; then arms
+;; pinning disjoint SETS; then those plus a single arm that declares the
+;; field without pinning it, which is that union's own catch-all
+;; (AnthropicUnknownUsageIteration declares `type` as a plain string
+;; beside three arms that pin it).
 (define (sg-union-tag env arms)
   (define views (map (lambda (b) (sg-arm-props env b 0)) arms))
-  (define (pin f view)
-    (define hit (find (lambda (e) (Eq f (Ix 0 e))) view))
-    (Ifz hit 0 (sg-pin-val (Ix 1 (_0 hit)))))
-  (define (tags? f)
-    (define vs (map (lambda (vw) (pin f vw)) views))
-    (And (all (lambda (x) (Ifz (Nil x) 1 0)) vs)
-      (let ((ss (map (lambda (x) (_0 x)) vs)))
-        (If (Eq (Sz ss) (Sz (dedupe-eq ss))) 1 0))))
-  (define cands
-    (Ifz (Sz views) []
-      (filter tags? (map (lambda (e) (Ix 0 e)) (_0 views)))))
-  (Ifz (Sz cands) 0 [(_0 cands)]))
+  (define (present? f)
+    (all (lambda (vw) (Ifz (find (lambda (e) (Eq f (Ix 0 e))) vw) 0 1)) views))
+  (define (ok? f max-open one-each)
+    (And (present? f)
+      (let* ((vs (sg-tag-sets env arms f))
+             (pinned (filter (lambda (x) (Ifz (Nil x) 1 0)) vs))
+             (open (Sub (Sz vs) (Sz pinned)))
+             (flat (foldl (lambda (a x) (Weld a (_0 x))) [] pinned)))
+        ;; at least two arms, and at least one of them pinning: with a
+        ;; fallback arm the pinned count can legitimately be 1
+        (And (If (Le open max-open) 1 0)
+          (And (And (If (Gt (Sz vs) 1) 1 0) (If (Gt (Sz pinned) 0) 1 0))
+            (And (If one-each
+                   (If (all (lambda (x) (Eq 1 (Sz (_0 x)))) pinned) 1 0)
+                   1)
+              (If (Eq (Sz flat) (Sz (dedupe-eq flat))) 1 0)))))))
+  (define fields
+    (Ifz (Sz views) [] (map (lambda (e) (Ix 0 e)) (_0 views))))
+  (define (first-ok max-open one-each)
+    (let ((c (filter (lambda (f) (ok? f max-open one-each)) fields)))
+      (Ifz (Sz c) 0 [(_0 c)])))
+  (define strict (first-ok 0 1))
+  (Ifz (Nil strict) strict
+    (let ((setty (first-ok 0 0)))
+      (Ifz (Nil setty) setty (first-ok 1 0)))))
 
 ;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"] — one real
 ;; type beside the null.  It becomes T, and the field carrying it
@@ -488,6 +554,11 @@
     (If (sg-real-enum? v)
       (sg-error "inline-enum (hoist to $defs)" v)
     (If (sg-const-enum? v) ["str"]
+    ;; Enum values that are not strings.  A JSON number can be negative
+    ;; and foil's int is a nat, so the decimal lexeme is the only honest
+    ;; carrier — EndpointStatus is [0,-1,-2,-3,-5,-10].
+    (If (Sz (sg-enum-vals v))
+      (If (all sg-jv-num? (sg-enum-vals v)) ["num"] ["any"])
     ;; A union reached HERE is one lifting never got to: inside an
     ;; array's items, or inside another union's arm.  A union in plain
     ;; field position is minted by sg-typedef-go and arrives as a $ref,
@@ -525,7 +596,7 @@
                       (If (Eq "row" (_0 et))
                         (sg-error "nested-array-unsupported" v)
                         ["row" et])))))
-              (else (sg-error "unsupported-type" ty))))))))))))))
+              (else (sg-error "unsupported-type" ty)))))))))))))))
 
 (define (sg-ftype-of env v) (sg-ftype-go env v 0))
 
@@ -640,7 +711,10 @@
       (If (Eq (Sz ctors) (Sz (dedupe-eq ctors))) keys 0))))
 
 ;; -> [disc specs], disc = ["tag" field] | ["shape"],
-;;    spec = [vname arm-schema key]  (key = the tag's wire value, or the shape)
+;;    spec = [vname arm-schema keys]
+;;      keys = the tag's wire values (a row, since an arm may claim
+;;      several), or [the shape].  An EMPTY keys row marks the union's
+;;      own catch-all arm: it takes whatever the tag values do not.
 ;;
 ;; Deliberately stops short of the arms' FTYPES.  An arm can itself be an
 ;; inline type needing a name of its own, and minting one is
@@ -651,14 +725,18 @@
   (define tag (sg-union-tag env arms))
   (Ifz (Nil tag)
     (let* ((tf (_0 tag))
+           (sets (sg-tag-sets env arms tf))
            (built
-             (map (lambda (b)
-                    (let* ((props (sg-arm-props env b 0))
-                           (hit (find (lambda (e) (Eq tf (Ix 0 e))) props))
-                           (wire (_0 (sg-pin-val (Ix 1 (_0 hit))))))
-                      [(sg-name wire) b wire]))
-               arms)))
-      (If (any (lambda (a) (Eq sg-union-else (_0 a))) built)
+             (gen (Sz arms)
+               (lambda (i)
+                 (let ((s (Ix i sets)))
+                   (Ifz (Nil s)
+                     [(sg-name (_0 (_0 s))) (Ix i arms) (_0 s)]
+                     ;; the arm that declares the tag without pinning it
+                     [sg-union-else (Ix i arms) []]))))))
+      (If (any (lambda (a)
+                 (And (Eq sg-union-else (_0 a)) (If (Sz (Ix 2 a)) 1 0)))
+            built)
         (sg-error "union arm collides with the catch-all name" name)
         [["tag" tf] built]))
     ;; No field settles it — try the arms' json constructors.  The
@@ -668,7 +746,7 @@
       (Ifz (Nil shapes)
         [["shape"]
          (gen (Sz arms)
-           (lambda (i) [(Ix i shapes) (Ix i arms) (Ix i shapes)]))]
+           (lambda (i) [(Ix i shapes) (Ix i arms) [(Ix i shapes)]]))]
         ;; Neither a field nor a shape: the genuinely ambiguous ones
         ;; (this document has 5, one with 49 arms carrying type:"message"
         ;; on three).  Guessing between them would be worse than saying so.
@@ -680,8 +758,9 @@
   ;; long way; take its arms' values as the variants.
   (define vals
     (If (sg-union-is-enum? v)
-      (foldl (lambda (acc b) (Weld acc (sg-enum-vals b))) [] (sg-union-arms v))
-      (sg-enum-vals v)))
+      (foldl (lambda (acc b) (Weld acc (sg-str-enum-vals b))) []
+        (sg-union-arms v))
+      (sg-str-enum-vals v)))
   (Ifz (Lt depth 12) (sg-error "inline types nested too deep" name)
   ;; A named ARRAY declares nothing of its own — the element is the type.
   ;; It is minted under this schema's name, and every reference to the
@@ -1329,10 +1408,18 @@
 ;;; the arm decode it as an ordinary field; encode writes it back the
 ;;; same way.  So the tag cannot drift out of step with the variant.
 
-;; arm = [vname ftype wire]
+;; Every union carries a catch-all.  Usually it is synthesized and holds
+;; the value undecoded, but a union whose own schema declares a fallback
+;; arm brings its own, already named sg-union-else — that one has a real
+;; type, so it must not be shadowed by the synthesized one.
+(define (sg-union-all-arms arms)
+  (If (any (lambda (a) (Eq sg-union-else (_0 a))) arms)
+    arms
+    (snoc [sg-union-else ["any"] 0] arms)))
+
+;; arm = [vname ftype keys]
 (define (sg-union-decl-tree name arms)
-  (define all-arms
-    (snoc [sg-union-else ["any"] 0] arms))
+  (define all-arms (sg-union-all-arms arms))
   (nrn "+"
     (Weld
       [(nw name)
@@ -1381,19 +1468,31 @@
 
 (define (sg-union-from-tree name tagf arms)
   (define rsum (strcat [name "_r"]))
+  ;; The union's own fallback arm if it declares one (empty keys), else
+  ;; the synthesized catch-all holding the value undecoded.
+  (define own-else
+    (find (lambda (a) (Ifz (Sz (Ix 2 a)) 1 0)) arms))
   (define catch-all
-    (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])]))
+    (Ifz own-else
+      (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])])
+      (sg-union-arm-decode name rsum (_0 own-else))))
+  ;; One guard per (arm, value): an arm may claim several tag values, and
+  ;; a chain of eq needs no `or`.
+  (define guards
+    (foldl
+      (lambda (acc a)
+        (Weld acc
+          (map (lambda (wire)
+                 (nrn "?" [(npar [(nw "eq") (ndotw "ts" "s") (nc wire)])
+                           (sg-union-arm-decode name rsum a)]))
+            (Ix 2 a))))
+      [] arms))
   (define dispatch
     (nrn "?"
       (Weld [(nw "tj")]
         [(nrn ">"
            (Weld [(nfc "ts" (npth ["json" "str"]))]
-             (snoc catch-all
-               (map (lambda (a)
-                      (nrn "?" [(npar [(nw "eq") (ndotw "ts" "s")
-                                       (nc (Ix 2 a))])
-                                (sg-union-arm-decode name rsum a)]))
-                 arms))))
+             (snoc catch-all guards)))
          (nvap rsum "err" [(nw "p") (nc "tag-not-a-string")])])))
   (nrn "+"
     [(nw (strcat [name "_from"]))
@@ -1415,7 +1514,7 @@
         (nvap rsum "err" [(nw "p") (nc "expected-object")])])]))
 
 (define (sg-union-to-tree name arms)
-  (define all-arms (snoc [sg-union-else ["any"] 0] arms))
+  (define all-arms (sg-union-all-arms arms))
   (nrn "+"
     [(nw (strcat [name "_to"]))
      (nrn "\" [(nfc "x" (nw name))])
