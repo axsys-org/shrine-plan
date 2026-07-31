@@ -487,6 +487,39 @@ assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
 assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])
   (oart (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])))
 
+;;; A NAMED object that declares no properties says nothing about its
+;;; keys, so it is any JSON object rather than a record with no fields.
+;;; Both spellings mean it: a literal `properties: {}`, and
+;;; additionalProperties, which is a map whose value type the IR cannot
+;;; say yet.  It becomes an ALIAS — nothing is declared for it and
+;;; references resolve through — which is what the same schema already
+;;; did in field position.
+
+(define bag-schema
+  (strcat ["{" (kv "title" (js "cfg")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "opts" (strcat ["{" (kv "$ref" (js "#/$defs/bag")) "}"])) ","
+                      (kv "blank" (strcat ["{" (kv "$ref" (js "#/$defs/nada")) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "bag" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "additionalProperties"
+                   (strcat ["{" (kv "type" (js "string")) "}"])) "}"])) ","
+               (jdef "nada" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "properties" "{}") "}"]))
+               "}"]))
+           "}"]))
+(define bsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut bag-schema)))
+(define brt (foil:source-entry-val ["rt"] bsut))
+;; the map rides undecoded, keys and all
+(define b-full
+  (strcat ["{" (kv "opts" (strcat ["{" (kv "a" (js "1")) "," (kv "b" (js "2")) "}"])) ","
+           (kv "blank" (strcat ["{" (kv "z" "3") "}"])) "}"]))
+assert(Equal b-full (brt b-full))
+;; ...including an empty one, which is the shape that used to fail
+assert(Equal (strcat ["{" (kv "opts" "{}") "}"])
+  (brt (strcat ["{" (kv "opts" "{}") "}"])))
+
 ;;; Shapes that are NOT disjoint are rejected rather than settled by arm
 ;;; order: json/num answers to both `integer` and `number`, so a union of
 ;;; the two has no constructor that tells them apart.  This document
@@ -836,10 +869,11 @@ assert(Eq 1 (Lt 152 713))
 ;;;   690  phase 2b (tag-discriminated unions)
 ;;;   692  phase 2c (shape-discriminated unions)
 ;;;   696  phase 2d (union arms lift)
+;;;   700  phase 2e (a property-less object is any JSON object)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 696))
+assert(Eq 1 (Ge (_0 oa-cov) 700))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
@@ -852,13 +886,15 @@ assert(Eq 1 (Ge (_0 oa-cov) 696))
 ;;; builds, which is the number a caller actually cares about.
 ;;;    46  phase 2b (tag-discriminated unions)
 ;;;    49  phase 2c (shape-discriminated unions)
+;;;    49  phase 2d (union arms lift — named schemas only)
+;;;    51  phase 2e (property-less objects; ImageConfig is in chat's closure)
 (define (op-builds? id)
   (define r (Try (lambda (z)
                    (let ((p (schemagen:sg-spec-parts oa-v [id])))
                      (DeepSeq p 1)))
               0))
   (If (Eq 1 (Hd r)) 0 1))
-assert(Eq 1 (Ge (Sz (filter op-builds? oa-ids)) 49))
+assert(Eq 1 (Ge (Sz (filter op-builds? oa-ids)) 51))
 
 ;;; What earlier phases retired.  These must stay absent: each was a
 ;;; whole class of schema the IR could not say, and a regression would
@@ -877,12 +913,14 @@ assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 ;;; the element type.
 assert(Eq 0 (why? "inline-union (hoist to $defs)"))
 
-;;; What is left is 17, and the largest group is the 5 unions neither a
+;;; What is left is 13, and the largest group is the 5 unions neither a
 ;;; field nor a shape can settle — one has 49 arms with `type: "message"`
 ;;; on three of them.  Guessing among those would be worse than saying
-;;; so.  The rest: empty-object 4, inline-enum 3, inline-object 2,
-;;; bad-name 2, expected-string 1.
+;;; so.  The rest: inline-enum 3, inline-object 2, bad-name 2,
+;;; expected-string 1.
 assert(Eq 1 (why? "union has no discriminating field or shape"))
+;; a property-less object is now any JSON object, not a failure
+assert(Eq 0 (why? "empty-object"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
 ;;; which is what makes it the first operation a real client can use.
