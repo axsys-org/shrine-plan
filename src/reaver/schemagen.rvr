@@ -265,6 +265,37 @@
         (Ifz (Sz real) 0 [(_0 real)]))
       [(jv-str! (_0 t))])))
 
+;; An inline type needing a name of its own, judged WITHOUT an env —
+;; sg-alias-subst has none.  This is sg-liftable? minus the allOf
+;; flattening, which an array's element never needs.
+(define (sg-inline-type? v)
+  (And (Nil (sg-ref-name v))
+    (Or (sg-real-enum? v)
+      (Or (sg-union-is-enum? v)
+        (Or (If (Sz (sg-union-arms v)) 1 0)
+          (And (Ifz (jv-get "enum" v) 1 0)
+            (If (Sz (sg-props-of v)) 1 0)))))))
+
+;; A named schema that is an array whose ELEMENT has to be minted.
+;;
+;; Such a schema is NOT an alias.  An array of a $ref or a primitive is
+;; one — it resolves through to `row[that]` and declares nothing — but
+;; an inline element has no name, and alias resolution is name-blind, so
+;; there is nowhere to put one.  Instead the ELEMENT takes the schema's
+;; name (suffixed) and a reference to the array becomes a row of it.
+;; This document spells three enums and two objects that way, including
+;; AnthropicAllowedCallers, which two more schemas then reference.
+(define (sg-named-row? v)
+  (define t (sg-type-str-raw v))
+  (And (Ifz (Nil t) 1 0)
+    (And (Eq "array" (_0 t))
+      (let ((it (jv-get "items" v)))
+        (Ifz it 0 (sg-inline-type? (_0 it)))))))
+
+;; The minted element name.  sg-mint applies the collision check at the
+;; typedef site; sg-ftype-go only needs the same string.
+(define (sg-row-item-name nm) (strcat [nm "_item"]))
+
 ;; Is this named schema merely a pointer at another type?
 ;; -> 0, or [the schema to take the ftype from instead]
 (define (sg-alias-subst v)
@@ -281,6 +312,8 @@
     ((Sz ao) 0)
     ;; an enum is a type of its own, whatever its base type says
     ((Ifz (jv-get "enum" v) 0 1) 0)
+    ;; an array whose element must be minted is not an alias
+    ((sg-named-row? v) 0)
     (else
       (let ((t (sg-type-str-raw v)))
         (Ifz t 0
@@ -437,7 +470,12 @@
     (let ((al (sg-alias-look (sg-env-aliases env) (_0 r))))
       (Ifz (Nil al)
         (sg-ftype-go env (_0 al) (Inc depth))
-        ["ref" (sg-name (_0 r))]))
+        ;; a named array whose element was minted: the element carries
+        ;; the name, so the reference is a ROW of it
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (If (Ifz hit 0 (sg-named-row? (Ix 1 (_0 hit))))
+            ["row" ["ref" (sg-row-item-name (sg-name (_0 r)))]]
+            ["ref" (sg-name (_0 r))]))))
     ;; an allOf here is either an alias to a $ref or an inline object
     (If (Sz (sg-allof v))
       (let ((al (sg-alias-subst v)))
@@ -645,6 +683,12 @@
       (foldl (lambda (acc b) (Weld acc (sg-enum-vals b))) [] (sg-union-arms v))
       (sg-enum-vals v)))
   (Ifz (Lt depth 12) (sg-error "inline types nested too deep" name)
+  ;; A named ARRAY declares nothing of its own — the element is the type.
+  ;; It is minted under this schema's name, and every reference to the
+  ;; array resolved to a row of it (sg-ftype-go).
+  (If (sg-named-row? v)
+    (sg-typedef-go env (sg-mint env name "item")
+      (_0 (jv-get "items" v)) (Inc depth))
   (If (Sz vals)
     (let ((pairs (sg-dedupe-pairs (sg-enum-pairs vals))))
       [["enum" name pairs] []])
@@ -720,7 +764,7 @@
                    [[] []] props))
                (fields (_0 step)))
           (Ifz (Sz fields) (sg-error "empty-object" name)
-            [["rec" name fields] (_1 step)]))))))))
+            [["rec" name fields] (_1 step)])))))))))
 
 ;; The typedef alone, for callers that only need to know it elaborates.
 (define (sg-typedef-of env name v) (_0 (sg-typedef-go env name v 0)))

@@ -520,6 +520,50 @@ assert(Equal b-full (brt b-full))
 assert(Equal (strcat ["{" (kv "opts" "{}") "}"])
   (brt (strcat ["{" (kv "opts" "{}") "}"])))
 
+;;; A NAMED array declares nothing of its own — the element is the type.
+;;; An array of a $ref or a primitive is an alias and resolves through to
+;;; row[that], but an inline element has no name, and alias resolution is
+;;; name-blind, so there is nowhere to put one.  The element is minted
+;;; under the schema's name instead, and references become a row of it.
+;;; This document spells three enums and two objects that way.
+
+(define namedrow-schema
+  (strcat ["{" (kv "title" (js "doc")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "callers" (strcat ["{" (kv "$ref" (js "#/$defs/callers")) "}"])) ","
+                      (kv "shots" (strcat ["{" (kv "$ref" (js "#/$defs/shots")) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               ;; array of an inline ENUM
+               (jdef "callers" (strcat ["{" (kv "type" (js "array")) ","
+                 (kv "items" (strcat ["{" (kv "type" (js "string")) ","
+                   (kv "enum" (strcat ["[" (js "direct") "," (js "relayed") "]"])) "}"]))
+                 "}"])) ","
+               ;; array of an inline OBJECT
+               (jdef "shots" (strcat ["{" (kv "type" (js "array")) ","
+                 (kv "items" (strcat ["{" (kv "type" (js "object")) ","
+                   (kv "required" (strcat ["[" (js "url") "]"])) ","
+                   (kv "properties" (strcat ["{" (kv "url"
+                     (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+                   "}"]))
+                 "}"]))
+               "}"]))
+           "}"]))
+(define nrsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut namedrow-schema)))
+(define nrrt (foil:source-entry-val ["rt"] nrsut))
+(define nr-full
+  (strcat ["{" (kv "callers" (strcat ["[" (js "direct") "," (js "relayed") "]"])) ","
+           (kv "shots" (strcat ["[{" (kv "url" (js "a")) "},{" (kv "url" (js "b")) "}]"]))
+           "}"]))
+assert(Equal nr-full (nrrt nr-full))
+;; the minted element enum is open, like every other enum
+(define nr-new
+  (strcat ["{" (kv "callers" (strcat ["[" (js "sideways") "]"])) "}"]))
+assert(Equal nr-new (nrrt nr-new))
+;; and an element failure still breadcrumbs through the row
+assert(Equal "shots[0].url:missing"
+  (nrrt (strcat ["{" (kv "shots" "[{}]") "}"])))
+
 ;;; Shapes that are NOT disjoint are rejected rather than settled by arm
 ;;; order: json/num answers to both `integer` and `number`, so a union of
 ;;; the two has no constructor that tells them apart.  This document
@@ -870,10 +914,11 @@ assert(Eq 1 (Lt 152 713))
 ;;;   692  phase 2c (shape-discriminated unions)
 ;;;   696  phase 2d (union arms lift)
 ;;;   700  phase 2e (a property-less object is any JSON object)
+;;;   705  phase 2f (a named array mints its element)
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 700))
+assert(Eq 1 (Ge (_0 oa-cov) 705))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
@@ -913,14 +958,20 @@ assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 ;;; the element type.
 assert(Eq 0 (why? "inline-union (hoist to $defs)"))
 
-;;; What is left is 13, and the largest group is the 5 unions neither a
-;;; field nor a shape can settle — one has 49 arms with `type: "message"`
-;;; on three of them.  Guessing among those would be worse than saying
-;;; so.  The rest: inline-enum 3, inline-object 2, bad-name 2,
-;;; expected-string 1.
+;;; What is left is 8, and every structural gap is closed: the 5 unions
+;;; neither a field nor a shape can settle (one has 49 arms with
+;;; `type: "message"` on three of them, and guessing among those would be
+;;; worse than saying so), 2 names that cannot normalize, and 1 schema
+;;; whose own type is wrong.  Nothing left is a CLASS of schema the IR
+;;; cannot say.
 assert(Eq 1 (why? "union has no discriminating field or shape"))
-;; a property-less object is now any JSON object, not a failure
+assert(Eq 1 (why? "bad-name (want [a-z][a-z0-9_]*)"))
+assert(Eq 1 (why? "expected-string"))
+;; a property-less object is any JSON object, not a failure
 assert(Eq 0 (why? "empty-object"))
+;; and an inline type anywhere lifting reaches now gets a name
+assert(Eq 0 (why? "inline-enum (hoist to $defs)"))
+assert(Eq 0 (why? "inline-object (hoist to $defs)"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
 ;;; which is what makes it the first operation a real client can use.
