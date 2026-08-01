@@ -75,9 +75,17 @@
    ;; builtins json now leans on
    "list" "list_row" "nil" "cons" "load8" "loadvar"])
 
+;; A name the generated module already uses for something else is
+;; MANGLED, not rejected.  This document really does contain schemas
+;; called `json` and `ws` and an operationId `list` — and `list` is
+;; reserved only because json.foil came to need it.  Underscores are
+;; appended until the name is free, which the first step always achieves
+;; since sg-norm-name trims a trailing _ and so can never produce one.
 (define (sg-check-name s)
+  (define (free nm)
+    (If (includes (Eq nm) sg-reserved) (free (strcat [nm "_"])) nm))
   (Ifz (sg-sane-name? s) (sg-error "bad-name (want [a-z][a-z0-9_]*)" s)
-    (If (includes (Eq s) sg-reserved) (sg-error "reserved-name" s) s)))
+    (free s)))
 
 (define (dedupe-eq xs)
   (foldl (lambda (acc x) (If (includes (Eq x) acc) acc (snoc x acc))) [] xs))
@@ -1864,17 +1872,34 @@
       (Ifz hit 0
         [(sg-need "schema" (_0 hit) "spec: body param needs schema")]))))
 
-;; The 200-response schema of an operation: 0 or [schema].
+;; A three-digit 2xx status.  "2XX" is a legal OpenAPI key and is not
+;; one: a wildcard says nothing about the body's shape.
+(define (sg-ok-status? k)
+  (define cs (trip k))
+  (And (Eq 3 (Sz cs))
+    (And (Eq 50 (_0 cs)) (If (all sg-digit? cs) 1 0))))
+
+;; The success-response schema of an operation: 0 or [schema].
+;;
+;; 200 when it is there, else the first other 2xx.  A created or accepted
+;; body is the same thing to a client as an OK one, and six of this
+;; document's operations only ever answer 201 or 202.
 (define (sg-op-resp-schema v3 opv)
   (define rs (jv-get "responses" opv))
   (Ifz rs 0
-    (let ((r (jv-get "200" (_0 rs))))
-      (Ifz r 0
-        (If v3
-          (let ((c (jv-get "content" (_0 r))))
-            (Ifz c 0 [(sg-content-schema (_0 c) "spec: 200 response schema")]))
-          (let ((s (jv-get "schema" (_0 r))))
-            (Ifz s 0 [(_0 s)])))))))
+    (let* ((kvs (jv-kvs (_0 rs)))
+           (exact (find (lambda (e) (Eq "200" (Ix 0 e))) kvs))
+           (hit (Ifz exact
+                  (find (lambda (e) (sg-ok-status? (Ix 0 e))) kvs)
+                  exact)))
+      (Ifz hit 0
+        (let ((r (Ix 1 (_0 hit))))
+          (If v3
+            (let ((c (jv-get "content" r)))
+              (Ifz c 0
+                [(sg-content-schema (_0 c) "spec: 2xx response schema")]))
+            (let ((s (jv-get "schema" r)))
+              (Ifz s 0 [(_0 s)]))))))))
 
 ;;; Ref walking and slicing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1935,6 +1960,47 @@
   (Weld (Ifz (Nil b) (sg-refs-of (_0 b)) [])
     (Ifz (Nil r) (sg-refs-of (_0 r)) [])))
 
+;;; Operations whose schema is written INLINE ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Everything downstream addresses types by NAME: the op record carries
+;;; the name of its request and response type, the closure is computed
+;;; over names, and the emitter looks types up by name.  So an operation
+;;; whose requestBody or 2xx schema is written inline rather than as a
+;;; $ref had nowhere to be addressed from, and could not generate at all
+;;; — 14 of this document's operations are written that way.
+;;;
+;;; They get a name minted from the operation, and the schema is added to
+;;; the document's own map under it.  From there nothing else changes:
+;;; the type is built, closed over and emitted like any other.
+
+(define (sg-op-opid ent)
+  (define r (jv-get "operationId" (Ix 2 ent)))
+  (Ifz r "" (sg-norm-name (jv-str! (_0 r)))))
+
+(define (sg-op-inline-name opid suffix) (strcat [opid "_" suffix]))
+
+;; The named type for one of an operation's schemas: the $ref's target
+;; when it is one, else the minted name.
+(define (sg-op-schema-name opid suffix v)
+  (define r (sg-ref-name v))
+  (Ifz (Nil r) (_0 r) (sg-op-inline-name opid suffix)))
+
+;; -> [[name schema] ..] for every inline operation schema in ents.
+(define (sg-op-inline-defs v3 ents)
+  (define (one acc opid sch suffix)
+    (Ifz (Nil sch)
+      (Ifz (Nil (sg-ref-name (_0 sch)))
+        acc
+        (snoc [(sg-op-inline-name opid suffix) (_0 sch)] acc))
+      acc))
+  (foldl
+    (lambda (acc ent)
+      (let* ((opv (Ix 2 ent))
+             (opid (sg-op-opid ent)))
+        (one (one acc opid (sg-op-body-schema v3 opv) "req")
+          opid (sg-op-resp-schema v3 opv) "res")))
+    [] ents))
+
 ;; Select operations by NORMALIZED operationId.  -> [[path method opv] ..]
 (define (sg-select-ops sv opids)
   (define ents (sg-spec-op-entries sv))
@@ -1974,11 +2040,6 @@
           (go (Inc i) "" (If (Bytes cur) (snoc (seg-of cur) acc) acc))
           (go (Inc i) (strcat [cur c]) acc)))))
   (go 0 "" []))
-
-(define (sg-ref-defname v)
-  ;; a {"$ref": "#/$defs/x"} object (post-swaggerize) -> "x"
-  (define r (sg-ref-name v))
-  (Ifz (Nil r) (_0 r) (sg-error "swagger: expected a $ref schema" v)))
 
 ;; Resolve a parameter that may itself be a $ref into components.parameters.
 (define (sg-param-deref sv p)
@@ -2034,11 +2095,12 @@
   (define pq (foldl fold-param [[] []] params))
   (define body-r (sg-op-body-schema v3 opv))
   (define body
-    (Ifz (Nil body-r) [(sg-name (sg-ref-defname (_0 body-r)))] 0))
+    (Ifz (Nil body-r)
+      [(sg-name (sg-op-schema-name opid "req" (_0 body-r)))] 0))
   (define resp-r (sg-op-resp-schema v3 opv))
   (define resp
-    (Ifz (Nil resp-r) (sg-name (sg-ref-defname (_0 resp-r)))
-      (sg-error "spec: op needs a 200 response schema" opid)))
+    (Ifz (Nil resp-r) (sg-name (sg-op-schema-name opid "res" (_0 resp-r)))
+      (sg-error "spec: op needs a 2xx response schema" opid)))
   [opid method (sg-path-segs pathstr) (_0 pq) (_1 pq) body resp])
 
 ;; -> [name basepath [typedef ..] [op ..]]
@@ -2048,14 +2110,19 @@
   (define v3 (sg-v3? sv))
   (define name (sg-spec-title sv))
   (define base (sg-spec-base sv))
-  (define schemas (sg-spec-schemas sv))
-  (define env (sg-env schemas))
   (define ents
     (Ifz (Sz opids) (sg-spec-op-entries sv) (sg-select-ops sv opids)))
+  ;; an operation may write its schema inline; that gets a name of its
+  ;; own and joins the document's map, so everything after this is blind
+  ;; to which of the two it was
+  (define inline-defs (sg-op-inline-defs v3 ents))
+  (define schemas (Weld inline-defs (sg-spec-schemas sv)))
+  (define env (sg-env schemas))
   (define reachable
     (Ifz (Sz opids) (map (lambda (e) (Ix 0 e)) schemas)
       (sg-closure schemas
-        (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents))))
+        (Weld (map (lambda (e) (Ix 0 e)) inline-defs)
+          (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents)))))
   ;; an alias is not a type: nothing is emitted for it, and references
   ;; to it were already resolved through by sg-ftype-of
   (define wanted
