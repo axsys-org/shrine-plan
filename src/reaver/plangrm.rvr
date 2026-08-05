@@ -1,0 +1,2846 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#import bst)
+;; newtype rebinds `Row` (the row TYPE); capture the builtin jet first.
+(define RowJet Row)
+(#bind newtype (#module newtype))
+(#import newtype)
+
+;;; PlanGrm Optimizer (port of plangrm.hs)
+;;; -------------------------------------
+;;;
+;;; PlanGrm is a basic STG-like optimization system for a compiler for
+;;; PLAN.  The front-end produces code which is correct, but maximally
+;;; indirect: every expression is a thunk and all allocations happen
+;;; unconditionally.  This optimizer progressively collapses explicit
+;;; graph reduction into direct execution by eliminating unnecessary
+;;; laziness, shortening the lifetime of pure bindings, and rewriting
+;;; forced thunks into eager control flow.
+;;;
+;;; This module is a direct, function-by-function port of the Haskell
+;;; prototype plangrm.hs, which stays frozen as the reference for pass
+;;; semantics.  Haskell names are kept verbatim; State monads become
+;;; explicitly threaded accumulators; UniqueM becomes a threaded
+;;; max-key counter `uq` (fresh key = (Inc uq), pass the new key on);
+;;; Data.Map becomes bst; Data.Set values STORED in the IR (procFree)
+;;; are canonical sorted rows, because `optimize` detects its fixed
+;;; point with structural Equal and bst shapes depend on insertion
+;;; order.
+;;;
+;;; Core IR invariants (from the prototype):
+;;;   - All bindings use globally unique keys.  No shadowing.
+;;;   - No forward references.
+;;;   - All evaluation is explicit via FORCE; all laziness via DELAY.
+;;;   - FORCE always produces a value in WHNF.
+;;;   - Partial applications (CLOSE) are always in WHNF.
+;;;   - PROC represents eager control flow; procs do not escape.
+;;;   - Thunks are entered only via FORCE.
+;;;   - Blocks end in exactly one terminator (RET or BR).
+;;;   - Known calls use fast paths with already-forced strict args.
+;;;   - SLOW must only be used with already-forced functions.
+;;;   - Join points are represented using procs.
+;;;   - Tailness is inferred, not represented explicitly.
+;;;   - The IR is trusted (not user-facing).
+
+
+;;; IR types ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define ROOT "/plangrm/")
+
+;; data Atom = REF Key | CNS Val
+(declare-cstr REF ROOT [key (tnat 0)])
+(declare-cstr CNS ROOT [val tany])
+(decl-union Atom REF CNS)
+
+;; data Op = FAST Val | SLOW Atom | RECUR | ADD | LOCAL Key
+(declare-cstr FAST  ROOT [val tany])
+(declare-cstr SLOW  ROOT [fn Atom])
+(declare-cstr RECUR ROOT [tag (tconst 0)])
+(declare-cstr ADD   ROOT [tag (tconst 0)])
+(declare-cstr LOCAL ROOT [key (tnat 0)])
+(decl-union Op FAST SLOW RECUR ADD LOCAL)
+
+;; data Strictness = STRICT | LAZY
+(declare-cstr STRICT ROOT [tag (tconst 0)])
+(declare-cstr LAZY   ROOT [tag (tconst 0)])
+(decl-union Strictness STRICT LAZY)
+
+;; data Arg = ARG { argKey :: Key, argStrict :: Strictness }
+(declare-cstr ARG ROOT [key (tnat 0)] [strict Strictness])
+
+;; data Proc = MK_PROC { procArgs :: [Arg], procFree :: FreeVars,
+;;                       procCode :: Block }
+;; procFree is a canonical sorted row of keys (see header).
+(declare-cstr MK-PROC ROOT
+  [args (tarr ARG)]
+  [free (tarr (tnat 0))]
+  [code (tarr tany)])
+(define Proc MK-PROC)
+
+;; data Alloc = CLOSE Atom [Atom] | DELAY Proc
+(declare-cstr CLOSE ROOT [fn Atom] [args (tarr Atom)])
+(declare-cstr DELAY ROOT [body Proc])
+(decl-union Alloc CLOSE DELAY)
+
+;; data Stmt
+;;     = RET Atom               --  return x
+;;     | CALL Key Op [Atom]     --  let k = (op args..)
+;;     | FORCE Key Atom         --  k = force x
+;;     | PROC Key Proc          --  local proc
+;;     | LET Key Alloc          --  let k = alloc
+;;     | REC [(Key, Alloc)]     --  letrec (binds: row of [key alloc])
+;;     | BR Atom [(Key, Proc)]  --  switch (arms: row of [key proc])
+(declare-cstr RET   ROOT [x Atom])
+(declare-cstr CALL  ROOT [key (tnat 0)] [op Op] [args (tarr Atom)])
+(declare-cstr FORCE ROOT [key (tnat 0)] [x Atom])
+(declare-cstr PROC  ROOT [key (tnat 0)] [body Proc])
+(declare-cstr LET   ROOT [key (tnat 0)] [rhs Alloc])
+(declare-cstr REC   ROOT [binds (tarr tany)])
+(declare-cstr BR    ROOT [x Atom] [arms (tarr tany)])
+(decl-union Stmt RET CALL FORCE PROC LET REC BR)
+
+(define procArgs (. MK-PROC args))
+(define procFree (. MK-PROC free))
+(define procCode (. MK-PROC code))
+(define argKey (. ARG key))
+(define argStrict (. ARG strict))
+
+
+;;; Small helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; list -> row
+(define (lrow ls)
+  (RowJet 0 (llen ls) ls))
+
+;; mapMaybe over a row: f returns [] (nothing) or a row of results.
+(define (map-maybe f row)
+  (cat (map f row)))
+
+(define (lrepeat v) [v (lrepeat v)])
+
+;; Canonical key sets: sorted, deduplicated rows of nats.
+(define (nat-set row)      (uniq (sort Cmp row)))
+(define (set-member k s)   (any (Eq k) s))
+(define (set-null s)       (Nil (Sz s)))
+(define (set-intersect a b)
+  (filter (lambda (k) (set-member k b)) a))
+
+;; Largest key present in a bst (0 when empty).
+(define (bstMaxKey t)
+  (Ifz t 0
+    (Ifz (bst-dex t) (bst-key t)
+      (bstMaxKey (bst-dex t)))))
+
+;; M.unionWith max
+(define (bstUnionMax a b)
+  (lfoldl
+    (lambda (acc kv[k v]) (bst-ups k 0 (max v) acc))
+    a
+    (bst-ltap b)))
+
+
+;;; Reference counting (refcounts) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; State Refs () becomes an explicitly threaded bst (key -> count).
+
+;; Makes sure that bound keys are represented, even if not referenced.
+(define (boundCounts k counts)
+  (If (bst-has k counts) counts (bst-insert k 0 counts)))
+
+(define (refrCounts k counts)
+  (bst-ups k 0 Inc counts))
+
+(define (atomCounts a counts)
+  (? Atom a
+    (REF [key] (refrCounts key counts))
+    (CNS counts)))
+
+(define (operCounts o counts)
+  (? Op o
+    (FAST counts)
+    (SLOW [fn] (atomCounts fn counts))
+    (RECUR counts)
+    (ADD counts)
+    (LOCAL [key] (refrCounts key counts))))
+
+(define (stmtCounts s counts)
+  (define (goProc p c)
+    (foldl (lambda (c2 s2) (stmtCounts s2 c2)) c (procCode p)))
+  (define (goAlloc k a c)
+    (define c1 (boundCounts k c))
+    (? Alloc a
+      (CLOSE [fn args]
+        (foldl (lambda (c2 v) (atomCounts v c2)) (atomCounts fn c1) args))
+      (DELAY [body] (goProc body c1))))
+  (? Stmt s
+    (RET [x] (atomCounts x counts))
+    (CALL [key op args]
+      (foldl (lambda (c v) (atomCounts v c))
+        (operCounts op (boundCounts key counts))
+        args))
+    (FORCE [key x] (atomCounts x (boundCounts key counts)))
+    (PROC [key body] (goProc body (boundCounts key counts)))
+    (LET [key rhs] (goAlloc key rhs counts))
+    (REC [binds]
+      (foldl (lambda (c kv) (goAlloc (_0 kv) (_1 kv) c)) counts binds))
+    (BR [x arms]
+      (foldl (lambda (c br) (goProc (_1 br) c))
+        (atomCounts x counts)
+        arms))))
+
+(define (procCounts p counts)
+  (foldl (lambda (c s) (stmtCounts s c)) counts (procCode p)))
+
+;; Counts the number of times a key (a bound value, or a local proc) is
+;; referred to.  Since the only valid operation on a Proc is to call it,
+;; the result also tells you the number of times a local proc is called.
+(define (refcounts p)
+  (procCounts p E))
+
+
+;;; Free variables and proc construction ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; The Haskell walker threads a bound-key set through State and unions
+;;; the returned free sets.  Here the accumulator is [bound free], both
+;;; plain lists, threaded left to right; the result is canonicalized.
+;;; Sub-procs contribute their STORED free sets (minus bound keys).
+
+(define (freeVars argKeys b)
+  (define (fvRef k st[bound free])
+    (If (lhas k bound) st [bound [k free]]))
+  (define (fvBound k st[bound free])
+    [[k bound] free])
+  (define (fvProc p st)
+    (foldl (lambda (st2 k) (fvRef k st2)) st (procFree p)))
+  (define (fvAtom a st)
+    (? Atom a
+      (REF [key] (fvRef key st))
+      (CNS st)))
+  (define (fvOper o st)
+    (? Op o
+      (SLOW [fn] (fvAtom fn st))
+      (LOCAL [key] (fvRef key st))
+      (_ st)))
+  (define (fvAlloc a st)
+    (? Alloc a
+      (CLOSE [fn args]
+        (foldl (lambda (st2 v) (fvAtom v st2)) (fvAtom fn st) args))
+      (DELAY [body] (fvProc body st))))
+  (define (fvStmt s st)
+    (? Stmt s
+      (RET [x] (fvAtom x st))
+      (FORCE [key x] (fvAtom x (fvBound key st)))
+      (PROC [key body] (fvProc body (fvBound key st)))
+      (LET [key rhs] (fvAlloc rhs (fvBound key st)))
+      (REC [binds]
+        (foldl (lambda (st2 kv) (fvAlloc (_1 kv) st2))
+          (foldl (lambda (st2 kv) (fvBound (_0 kv) st2)) st binds)
+          binds))
+      (BR [x arms]
+        (foldl (lambda (st2 br) (fvProc (_1 br) st2))
+          (fvAtom x st)
+          arms))
+      (CALL [key op args]
+        (foldl (lambda (st2 v) (fvAtom v st2))
+          (fvOper op (fvBound key st))
+          args))))
+  (define done
+    (foldl (lambda (st s) (fvStmt s st)) [(stream argKeys) NIL] b))
+  (nat-set (lrow (_1 done))))
+
+(define (mkProc as b)
+  ($MK-PROC as (freeVars (map argKey as) b) b))
+
+(define (blockProc b) (mkProc [] b))
+
+;; overCode :: (Block -> Block) -> (Proc -> Proc)
+(define (overCode f p)
+  (mkProc (procArgs p) (f (procCode p))))
+
+
+;;; Dead code elimination ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (deadCodeElim top)
+  (define counts (refcounts top))
+  (define (keep k) (Gt (bst-gut k 0 counts) 0))
+  (define (goProc p)
+    (define (goAlloc a)
+      (? Alloc a
+        (DELAY [body] ($DELAY (goProc body)))
+        (CLOSE a)))
+    (overCode
+      (map-maybe
+        (lambda (s)
+          (? Stmt s
+            (LET [key rhs]
+              (Ifz (keep key) []
+                [($LET key (goAlloc rhs))]))
+            (PROC [key body]
+              (Ifz (keep key) []
+                [($PROC key (goProc body))]))
+            ;; TODO(prototype): generalize to all pure calls
+            (CALL [key op args]
+              (? Op op
+                (ADD (Ifz (keep key) [] [s]))
+                (_ [s])))
+            (REC [binds]
+              (begin
+                (define kept (filter (lambda (kv) (keep (_0 kv))) binds))
+                (Ifz (Sz kept) []
+                  [($REC (map (lambda (kv) [(_0 kv) (goAlloc (_1 kv))]) kept))])))
+            (BR [x arms]
+              [($BR x (map (lambda (br) [(_0 br) (goProc (_1 br))]) arms))])
+            (_ [s]))))
+      p))
+  (goProc top))
+
+
+;;; Substitution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; An inlining utility which replaces references to arguments with the
+;;; actual arguments passed in.  table :: bst Key Atom
+
+(define (subst table block)
+  (define (sAtom a)
+    (? Atom a
+      (REF [key]
+        (begin
+          (define hit (bst-search key table))
+          (Ifz hit a (_0 hit))))
+      (CNS a)))
+  (define (sOper o)
+    (? Op o
+      (SLOW [fn] ($SLOW (sAtom fn)))
+      (_ o)))
+  (define (sStmt s)
+    (define (sProc p) (overCode (map sStmt) p))
+    (define (sAlloc a)
+      (? Alloc a
+        (CLOSE [fn args] ($CLOSE (sAtom fn) (map sAtom args)))
+        (DELAY [body] ($DELAY (sProc body)))))
+    (? Stmt s
+      (RET [x] ($RET (sAtom x)))
+      (CALL [key op args] ($CALL key (sOper op) (map sAtom args)))
+      (FORCE [key x] ($FORCE key (sAtom x)))
+      (PROC [key body] ($PROC key (sProc body)))
+      (LET [key rhs] ($LET key (sAlloc rhs)))
+      (REC [binds]
+        ($REC (map (lambda (kv) [(_0 kv) (sAlloc (_1 kv))]) binds)))
+      (BR [x arms]
+        ($BR (sAtom x)
+          (map (lambda (br) [(_0 br) (sProc (_1 br))]) arms)))))
+  (map sStmt block))
+
+
+;;; Inlining ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; openBasicBlock :: Proc -> Maybe (Block, Atom)
+;; Returns 0 or [[stmts ret-atom]].
+(define (openBasicBlock p)
+  (define (go acc b)
+    (Ifz (Sz b) (error "block never returns")
+      (let1 s (_0 b)
+        (? Stmt s
+          (RET [x] [[(rev (lrow acc)) x]])
+          (BR 0)
+          (_ (go [s acc] (drop 1 b)))))))
+  (go NIL (procCode p)))
+
+;; rewriteReturns :: (Atom -> UniqueM [Stmt]) -> Proc -> UniqueM Proc
+;; f uq atom -> [uq' stmts-row]; returns [uq' proc'].
+(define (rewriteReturns f target uq)
+  (define (goBlock b uq2)
+    (define (goProc p uqp)
+      (define r[uqx code] (goBlock (procCode p) uqp))
+      [uqx (mkProc (procArgs p) code)])
+    (Ifz (Sz b) [uq2 []]
+      (begin
+        (define s (_0 b))
+        (define r
+          (? Stmt s
+            (BR [x arms]
+              (begin
+                (define rb
+                  (foldl
+                    (lambda (acc br)
+                      (begin
+                        (define uqa (_0 acc))
+                        (define done (_1 acc))
+                        (define rp[uqb p2] (goProc (_1 br) uqa))
+                        [uqb (snoc [(_0 br) p2] done)]))
+                    [uq2 []]
+                    arms))
+                [(_0 rb) [($BR x (_1 rb))]]))
+            (RET [x] (f uq2 x))
+            (_ [uq2 [s]])))
+        (define uq3 (_0 r))
+        (define here (_1 r))
+        (define r2[uq4 rest] (goBlock (drop 1 b) uq3))
+        [uq4 (weld here rest)])))
+  (define r[uq2 code] (goBlock (procCode target) uq))
+  [uq2 (mkProc (procArgs target) code)])
+
+;; inline :: (Key, Proc, [Atom]) -> Block -> UniqueM Block
+;;
+;; To inline a tail call, inline the body of the called proc and drop
+;; the continuation.  To inline a basic block, inline the statements
+;; except the return, substituting the returned atom for the call
+;; result.  Otherwise, turn the continuation into a join point and
+;; rewrite every return of the callee into a call of the join point.
+(define (inline rk target params cont uq)
+  (define table
+    (bst-from-pairs-list
+      (lzip (lmap argKey (stream (procArgs target))) (stream params))))
+  (define retarget (overCode (subst table) target))
+  (define (isTailCall c)
+    (And (Eq 1 (Sz c))
+      (? Stmt (_0 c)
+        (RET [x]
+          (? Atom x
+            (REF [key] (Eq key rk))
+            (CNS 0)))
+        (_ 0))))
+  (If (isTailCall cont)
+    [uq (subst table (procCode target))]
+    (let1 opened (openBasicBlock retarget)
+      (If opened
+        (begin
+          (define pair (_0 opened))
+          (define stmts (_0 pair))
+          (define targetRet (_1 pair))
+          [uq (weld stmts (subst (bst-sing rk targetRet) cont))])
+        (begin
+          (define jp (Inc uq))
+          (define (retf uq2 a)
+            (let1 t (Inc uq2)
+              [t [($CALL t ($LOCAL jp) [a]) ($RET ($REF t))]]))
+          (define joinProc (mkProc [($ARG rk $STRICT)] cont))
+          (define r[uq3 retarget2] (rewriteReturns retf retarget jp))
+          [uq3 (cons ($PROC jp joinProc) (procCode retarget2))])))))
+
+;; inlineCallsToProc :: (Key, Proc) -> Proc -> UniqueM Proc
+(define (inlineCallsToProc targetKey targetProc p uq)
+  (define (goBlock b uq2)
+    (define (goProc p2 uqp)
+      (define r[uqx code] (goBlock (procCode p2) uqp))
+      [uqx (mkProc (procArgs p2) code)])
+    (define (goAlloc a uqa)
+      (? Alloc a
+        (CLOSE [uqa a])
+        (DELAY [body]
+          (begin
+            (define r[uqx p2] (goProc body uqa))
+            [uqx ($DELAY p2)]))))
+    (define (goTail s cont uqt)
+      (define r[uqx rest] (goBlock cont uqt))
+      [uqx (cons s rest)])
+    (Ifz (Sz b) [uq2 []]
+      (begin
+        (define s (_0 b))
+        (define cont (drop 1 b))
+        (? Stmt s
+          (CALL [key op args]
+            (begin
+              (define isTargetCall
+                (? Op op
+                  (LOCAL [key] (Eq key targetKey))
+                  (_ 0)))
+              (Ifz isTargetCall
+                (goTail s cont uq2)
+                (begin
+                  (define r[uq3 inlined] (inline key targetProc args cont uq2))
+                  (goBlock inlined uq3)))))
+          (PROC [key body]
+            (If (Eq key targetKey)
+              (goBlock cont uq2)
+              (begin
+                (define r[uq3 p2] (goProc body uq2))
+                (goTail ($PROC key p2) cont uq3))))
+          (BR [x arms]
+            (begin
+              (define rb
+                (foldl
+                  (lambda (acc br)
+                    (begin
+                      (define uqa (_0 acc))
+                      (define done (_1 acc))
+                      (define rp[uqb p2] (goProc (_1 br) uqa))
+                      [uqb (snoc [(_0 br) p2] done)]))
+                  [uq2 []]
+                  arms))
+              (goTail ($BR x (_1 rb)) cont (_0 rb))))
+          (LET [key rhs]
+            (begin
+              (define r[uq3 a2] (goAlloc rhs uq2))
+              (goTail ($LET key a2) cont uq3)))
+          (REC [binds]
+            (begin
+              (define rb
+                (foldl
+                  (lambda (acc kv)
+                    (begin
+                      (define uqa (_0 acc))
+                      (define done (_1 acc))
+                      (define ra[uqb a2] (goAlloc (_1 kv) uqa))
+                      [uqb (snoc [(_0 kv) a2] done)]))
+                  [uq2 []]
+                  binds))
+              (goTail ($REC (_1 rb)) cont (_0 rb))))
+          (_ (goTail s cont uq2))))))
+  (define r[uq2 code] (goBlock (procCode p) uq))
+  [uq2 (mkProc (procArgs p) code)])
+
+;; listOfProcs :: Proc -> [(Key, Proc)]  (a list of [key proc] pairs)
+(define (listOfProcs top)
+  (define (goAlloc a)
+    (? Alloc a
+      (DELAY [body] (listOfProcs body))
+      (CLOSE NIL)))
+  (lcatmap
+    (lambda (s)
+      (? Stmt s
+        (PROC [key body] (lcons [key body] (listOfProcs body)))
+        (LET [key rhs] (goAlloc rhs))
+        (REC [binds] (lcatmap (lambda (kv) (goAlloc (_1 kv))) (stream binds)))
+        (BR [x arms]
+          (lcatmap (lambda (br) (listOfProcs (_1 br))) (stream arms)))
+        (_ NIL)))
+    (stream (procCode top))))
+
+(define (singleUseProcs top)
+  (define counts (refcounts top))
+  (lfilter
+    (lambda (kp) (Eq 1 (bst-gut (_0 kp) 0 counts)))
+    (listOfProcs top)))
+
+;; inlineSingleUseProcs :: Proc -> UniqueM Proc
+(define (inlineSingleUseProcs p uq)
+  (define singles (singleUseProcs p))
+  (Ifz singles [uq p]
+    (begin
+      (define kp (_0 singles))
+      (define r[uq2 p2] (inlineCallsToProc (_0 kp) (_1 kp) p uq))
+      (inlineSingleUseProcs p2 uq2))))
+
+
+;;; Dethunk ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; usedLazily: a binding is used lazily iff it is used for anything
+;;; besides forcing — as an operand, stored in a closure, or referenced
+;;; from another thunk.
+
+(define (usedLazily k b)
+  (define (goAtom a)
+    (? Atom a
+      (REF [key] ~[key])
+      (CNS NIL)))
+  (define (goOper o)
+    (? Op o
+      (SLOW [fn] (goAtom fn))
+      (_ NIL)))
+  (define (goStmt s)
+    (define (bloc b2) (lcatmap goStmt (stream b2)))
+    (define (goAlloc a)
+      (? Alloc a
+        (CLOSE [fn args] (lcatmap goAtom (stream (cons fn args))))
+        (DELAY [body] (stream (procFree body)))))
+    (? Stmt s
+      (RET [x] (goAtom x))
+      (CALL [key op args] (lweld (goOper op) (lcatmap goAtom (stream args))))
+      (FORCE NIL) ;; not used lazily!
+      (PROC [key body] (bloc (procCode body))) ;; could be strict
+      (LET [key rhs] (goAlloc rhs))
+      (REC [binds] (lcatmap (lambda (kv) (goAlloc (_1 kv))) (stream binds)))
+      (BR [x arms]
+        (lweld (goAtom x)
+          (lcatmap (lambda (br) (bloc (procCode (_1 br)))) (stream arms))))))
+  (lhas k (lcatmap goStmt (stream b))))
+
+;; procThunks :: Proc -> [(Key, Proc)]  (immediate LET/REC thunks only)
+(define (procThunks p)
+  (define (goAlloc kv)
+    (? Alloc (_1 kv)
+      (DELAY [body] ~[[(_0 kv) body]])
+      (CLOSE NIL)))
+  (lcatmap
+    (lambda (s)
+      (? Stmt s
+        (LET [key rhs] (goAlloc [key rhs]))
+        (REC [binds] (lcatmap goAlloc (stream binds)))
+        (_ NIL)))
+    (stream (procCode p))))
+
+;; Dethunk converts thunks which are never used lazily into procs.
+(define (dethunkStep top)
+  (define ts (procThunks top))
+  (define procable
+    (lfilter (lambda (kp) (Nil (usedLazily (_0 kp) (procCode top)))) ts))
+  (define toProc (bst-from-pairs-list procable))
+  (define (goStmt s)
+    (define (goProc p) (overCode (map goStmt) p))
+    (? Stmt s
+      (LET [key rhs] ;; rewrite DELAY to PROC when procable
+        (? Alloc rhs
+          (DELAY
+            (begin
+              (define hit (bst-search key toProc))
+              (Ifz hit s ($PROC key (_0 hit)))))
+          (CLOSE s)))
+      (FORCE [key x] ;; rewrite FORCE to CALL
+        (? Atom x
+          (REF
+            (begin
+              (define label (REF.key x))
+              (Ifz (bst-has label toProc) s
+                ($CALL key ($LOCAL label) []))))
+          (CNS s)))
+      (PROC [key body] ($PROC key (goProc body)))
+      (BR [x arms]
+        ($BR x (map (lambda (br) [(_0 br) (goProc (_1 br))]) arms)))
+      (REC (error "TODO: dethunk letrec"))
+      (_ s)))
+  (Ifz toProc top (overCode (map goStmt) top)))
+
+(define (dethunk top)
+  (define (goAlloc a)
+    (? Alloc a
+      (DELAY [body] ($DELAY (dethunk body)))
+      (CLOSE a)))
+  (overCode
+    (map
+      (lambda (s)
+        (? Stmt s
+          (LET [key rhs] ($LET key (goAlloc rhs)))
+          (PROC [key body] ($PROC key (dethunk body)))
+          (BR [x arms]
+            ($BR x (map (lambda (br) [(_0 br) (dethunk (_1 br))]) arms)))
+          (REC [binds]
+            ($REC (map (lambda (kv) [(_0 kv) (goAlloc (_1 kv))]) binds)))
+          (_ s))))
+    (dethunkStep top)))
+
+
+;;; Reforce ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Rewrites blocks to avoid forcing something twice or referencing a
+;;; thunk which has already been forced.  Forced = [forced-keys
+;;; alias-pairs], both lists; new entries are prepended and lookup takes
+;;; the first match, exactly like the Haskell lists.
+
+;; Forced-set membership: constants are always in WHNF.
+(define (isForced f a)
+  (? Atom a
+    (REF [key] (lhas key (_0 f)))
+    (CNS 1)))
+
+(define (forcedKnown k f) [[k (_0 f)] (_1 f)])
+
+(define (forcedExplicit k a f)
+  (? Atom a
+    (REF [key] [[k (_0 f)] [[key ($REF k)] (_1 f)]])
+    (CNS (error "impossible"))))
+
+;; invariant: `old` is always a canonical (already rewritten) atom.
+(define (forcedAlias new old f) [(_0 f) [[new old] (_1 f)]])
+
+(define (forcedAtom f a)
+  (? Atom a
+    (REF [key]
+      (begin
+        (define (look m)
+          (Ifz m a
+            (If (Eq key (_0 (_0 m))) (_1 (_0 m)) (look (_1 m)))))
+        (look (_1 f))))
+    (CNS a)))
+
+;; Partial applications are always in WHNF by definition, so it is
+;; pointless to force them, even if they are part of a letrec binding.
+;; Delayed blocks are thunks, however.
+(define (forcedKnowclz binds f)
+  (foldl
+    (lambda (f2 kv)
+      (? Alloc (_1 kv)
+        (DELAY f2)
+        (CLOSE (forcedKnown (_0 kv) f2))))
+    f
+    binds))
+
+(define (forcedArgs as f)
+  (foldl
+    (lambda (f2 a)
+      (? Strictness (argStrict a)
+        (STRICT (forcedKnown (argKey a) f2))
+        (LAZY f2)))
+    f
+    as))
+
+(define (reforce top)
+  (define (go f block)
+    (define (goProc f2 p)
+      (overCode (go (forcedArgs (procArgs p) f2)) p))
+    (define (goAlloc f2 a)
+      (? Alloc a
+        (DELAY [body] ($DELAY (goProc f2 body)))
+        (CLOSE [fn args] ($CLOSE (forcedAtom f2 fn) (map (forcedAtom f2) args)))))
+    (define (goOper f2 o)
+      (? Op o
+        (SLOW [fn] ($SLOW (forcedAtom f2 fn)))
+        (_ o)))
+    (define (whnf f2 k a b)
+      (If (isForced f2 a)
+        (go (forcedAlias k a f2) b)
+        (cons ($FORCE k a) (go (forcedExplicit k a f2) b))))
+    (Ifz (Sz block) []
+      (begin
+        (define s (_0 block))
+        (define b (drop 1 block))
+        (? Stmt s
+          (RET [x] [($RET (forcedAtom f x))])
+          (PROC [key body] (cons ($PROC key (goProc f body)) (go f b)))
+          (LET [key rhs]
+            (cons ($LET key (goAlloc f rhs))
+              (go (forcedKnowclz [[key rhs]] f) b)))
+          (REC [binds]
+            (cons ($REC (map (lambda (kv) [(_0 kv) (goAlloc f (_1 kv))]) binds))
+              (go (forcedKnowclz binds f) b)))
+          (BR [x arms]
+            [($BR (forcedAtom f x)
+               (map (lambda (br) [(_0 br) (goProc f (_1 br))]) arms))])
+          (CALL [key op args]
+            (cons ($CALL key (goOper f op) (map (forcedAtom f) args))
+              (go (forcedKnown key f) b)))
+          (FORCE [key x] (whnf f key (forcedAtom f x) b))))))
+  (overCode (go (forcedArgs (procArgs top) [NIL NIL])) top))
+
+
+;;; optimizeEachBlock ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Transforms an optimization which runs on a single shallow block into
+;;; one that runs on all sub-blocks recursively, outer blocks first.
+
+(define (optimizeEachBlock opt p)
+  (define (go p2)
+    (overCode
+      (map
+        (lambda (s)
+          (? Stmt s
+            (PROC [key body] ($PROC key (go body)))
+            (LET [key rhs]
+              (? Alloc rhs
+                (DELAY [body] ($LET key ($DELAY (go body))))
+                (CLOSE s)))
+            (REC [binds]
+              ($REC
+                (map
+                  (lambda (kv)
+                    (? Alloc (_1 kv)
+                      (DELAY [body] [(_0 kv) ($DELAY (go body))])
+                      (CLOSE kv)))
+                  binds)))
+            (BR [x arms]
+              ($BR x (map (lambda (br) [(_0 br) (go (_1 br))]) arms)))
+            (_ s))))
+      (opt p2)))
+  (go p))
+
+
+;;; Reschedule ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Bubbles forces upward and sinks allocations downward, unless that
+;;; would change observable effects or violate data dependencies.
+;;;
+;;; - A FORCE may move earlier past a statement with no effects which
+;;;   binds nothing the FORCE depends on.
+;;; - An allocation (LET / REC) may move later past a statement which
+;;;   does not reference any of the keys it binds.
+
+(define (stmtKeys s)
+  (? Stmt s
+    (CALL [key op args] [key])
+    (FORCE [key x] [key])
+    (PROC [key body] [key])
+    (LET [key rhs] [key])
+    (REC [binds] (map (lambda (kv) (_0 kv)) binds))
+    (RET [])
+    (BR [])))
+
+(define (reschedule p)
+  (define (isTerm s)
+    (? Stmt s (RET 1) (BR 1) (_ 0)))
+  (define (hasfx s)
+    (? Stmt s
+      (LET 0)
+      (REC 0)
+      (PROC 0)
+      (CALL [key op args]
+        (? Op op (ADD 0) (_ 1)))
+      (_ 1)))
+  (define (priority s)
+    (? Stmt s
+      (FORCE 2)
+      (LET 0)
+      (REC 0)
+      (_ 1)))
+  (define (reorder a b)
+    (define counts (stmtCounts b E))
+    (define refDep (any (lambda (k) (bst-has k counts)) (stmtKeys a)))
+    (define fxDep (And (hasfx a) (hasfx b)))
+    (define noGain (Ge (priority a) (priority b)))
+    (Nil (or (isTerm b) fxDep refDep noGain)))
+  (define (ins s xs)
+    (Ifz xs ~[s]
+      (If (reorder s (_0 xs))
+        [(_0 xs) (ins s (_1 xs))]
+        [s xs])))
+  (optimizeEachBlock
+    (lambda (p2)
+      (overCode
+        (lambda (b) (lrow (lfoldr ins NIL (stream b))))
+        p2))
+    p))
+
+
+;;; Lower pure binds ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Are any of these keys used directly during the execution of this
+;; basic block (ignoring branches and sub-blocks)?
+(define (usedDirectly target b)
+  (define (goRef a)
+    (? Atom a
+      (REF [key] (target key))
+      (CNS 0)))
+  (define (goCall o)
+    (? Op o
+      (LOCAL [key] (target key))
+      (SLOW [fn] (goRef fn))
+      (_ 0)))
+  (define (goAlloc a)
+    (? Alloc a
+      (CLOSE [fn args] (or (goRef fn) (any goRef args)))
+      (DELAY 0)))
+  (any
+    (lambda (s)
+      (? Stmt s
+        (CALL [key op args] (or (goCall op) (any goRef args)))
+        (FORCE [key x] (goRef x))
+        (RET [x] (goRef x))
+        (BR [x arms] (goRef x))
+        (LET [key rhs] (goAlloc rhs))
+        (PROC 0)
+        (REC [binds]
+          ;; REC ignores self-references within the same binding group.
+          (And (Nil (any (lambda (kv) (target (_0 kv))) binds))
+            (any (lambda (kv) (goAlloc (_1 kv))) binds)))))
+    b))
+
+;; Immediate child regions of a block (each has a binding key).
+(define (blockChildren b)
+  (map-maybe
+    (lambda (s)
+      (? Stmt s
+        (PROC [key body] [[key body]])
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY [body] [[key body]])
+            (CLOSE [])))
+        (BR [x arms] arms)
+        (_ [])))
+    b))
+
+;; A list of bindings without effects and their keys.  The key is a
+;; "statement identifier" (first binding key of a letrec) usable for
+;; deletion.
+(define (pureBinds b)
+  (map-maybe
+    (lambda (s)
+      (? Stmt s
+        (PROC [key body] [[key s]])
+        (LET [key rhs] [[key s]])
+        (CALL [key op args]
+          (? Op op (ADD [[key s]]) (_ [])))
+        (REC [binds]
+          (Ifz (Sz binds) []
+            [[(_0 (_0 binds)) s]]))
+        (_ [])))
+    b))
+
+;; moveStmt (stmtKey, stmt, destKey): delete the statement and prepend
+;; it to the sub-block identified by destKey.
+(define (moveStmt stmtKey stmt destKey p)
+  (define (place p2) (overCode (cons stmt) p2))
+  (define (isTargetStmt s)
+    (? Stmt s
+      (PROC [key body] (Eq key destKey))
+      (BR [x arms] (any (lambda (br) (Eq destKey (_0 br))) arms))
+      (REC [binds] (any (lambda (kv) (Eq destKey (_0 kv))) binds))
+      (LET [key rhs] (Eq key destKey))
+      (_ 0)))
+  (define (prependToSubBlock s)
+    (? Stmt s
+      (LET [key rhs]
+        (? Alloc rhs
+          (DELAY [body] ($LET key ($DELAY (place body))))
+          (CLOSE (error "bad move target"))))
+      (PROC [key body] ($PROC key (place body)))
+      (BR [x arms]
+        ($BR x
+          (map
+            (lambda (br)
+              (If (Eq destKey (_0 br))
+                [(_0 br) (place (_1 br))]
+                br))
+            arms)))
+      (REC [binds]
+        ($REC
+          (map
+            (lambda (kv)
+              (? Alloc (_1 kv)
+                (DELAY [body]
+                  (If (Eq destKey (_0 kv))
+                    [(_0 kv) ($DELAY (place body))]
+                    kv))
+                (CLOSE kv)))
+            binds)))
+      (_ (error "bad move target"))))
+  (overCode
+    (map-maybe
+      (lambda (s)
+        (begin
+          (define ks (stmtKeys s))
+          (If (And (Sz ks) (Eq (_0 ks) stmtKey))
+            []
+            [(If (isTargetStmt s) (prependToSubBlock s) s)]))))
+    p))
+
+;; computePureMoves: pure bindings which can be moved down into exactly
+;; one sub-block.  Returns a list of [stmtId stmt destKey].
+(define (computePureMoves p)
+  (define b (procCode p))
+  (lcatmap
+    (lambda (idStmt)
+      (define stmtId (_0 idStmt))
+      (define stmt (_1 idStmt))
+      (define keyset (nat-set (stmtKeys stmt)))
+      (define subBlocksWhichUse
+        (map-maybe
+          (lambda (kp)
+            (Ifz (set-null (set-intersect keyset (procFree (_1 kp))))
+              [(_0 kp)]
+              []))
+          (blockChildren b)))
+      (If (usedDirectly (lambda (k) (set-member k keyset)) b)
+        NIL
+        (Ifz (Eq 1 (Sz subBlocksWhichUse))
+          NIL
+          ~[[stmtId stmt (_0 subBlocksWhichUse)]])))
+    (stream (pureBinds b))))
+
+(define (tryPureMoves p)
+  (lrow (lmap (lambda (m) [(_0 m) (_2 m)]) (computePureMoves p))))
+
+;; lowerPureBinds moves non-effectful bindings (thunks, procs, partial
+;; applications, some primops like add) into more specific sub-blocks
+;; if that is the only place where they are used.
+(define (lowerPureBinds p)
+  (define (go p2)
+    (define mvs (computePureMoves p2))
+    (Ifz mvs p2
+      (let1 mv (_0 mvs)
+        (go (moveStmt (_0 mv) (_1 mv) (_2 mv) p2)))))
+  (optimizeEachBlock go p))
+
+;; brSink: lowerPureBinds restricted to BR-arm destinations.  After
+;; brLower, the lazy chain feeding a branch body sits in the parent
+;; block where strictify must not touch it (forcing before the branch
+;; would evaluate the untaken side — for a self-recursive law, forever).
+;; Sinking each pure bind whose only use is a single arm INTO that arm
+;; puts producer and strict consumer in the same block, so the next
+;; round's strictify/dethunk cascade can eagerize it.  Full
+;; lowerPureBinds is NOT safe here: it also sinks into DELAY bodies,
+;; and residual DELAYs must keep the single-call shape codegen emits.
+(define (brSink p)
+  (define (armKeys b)
+    (map-maybe
+      (lambda (s)
+        (? Stmt s
+          (BR [x arms] (map (lambda (br) (_0 br)) arms))
+          (_ [])))
+      b))
+  (define (go p2)
+    (define aks (armKeys (procCode p2)))
+    ;; never move a REC: emission anchors knots at the block prelude
+    ;; (index 0), and a later move prepending into the same arm would
+    ;; displace it — "REC not in prelude" → dumb fallback
+    (define mvs
+      (lfilter
+        (lambda (m)
+          (And (set-member (_2 m) aks)
+            (? Stmt (_1 m) (REC 0) (_ 1))))
+        (computePureMoves p2)))
+    (Ifz mvs p2
+      (let1 mv (_0 mvs)
+        (go (moveStmt (_0 mv) (_1 mv) (_2 mv) p2)))))
+  (optimizeEachBlock go p))
+
+;; placeStmt: insert a statement at the start of the sub-block bound to
+;; `target` (a prototype test helper; kept for parity).
+(define (placeStmt item target p)
+  (define (place p2) (overCode (cons item) p2))
+  (overCode
+    (map
+      (lambda (s)
+        (? Stmt s
+          (PROC [key body]
+            (If (Eq key target) ($PROC key (place body)) s))
+          (BR [x arms]
+            ($BR x
+              (map
+                (lambda (br)
+                  (If (Eq target (_0 br)) [(_0 br) (place (_1 br))] br))
+                arms)))
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body]
+                (If (Eq key target) ($LET key ($DELAY (place body))) s))
+              (CLOSE s)))
+          (REC [binds]
+            ($REC
+              (map
+                (lambda (kv)
+                  (? Alloc (_1 kv)
+                    (DELAY [body]
+                      (If (Eq target (_0 kv))
+                        [(_0 kv) ($DELAY (place body))]
+                        kv))
+                    (CLOSE kv)))
+                binds)))
+          (_ s))))
+    p))
+
+
+;;; Occurrence analysis (for thunk update flags) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Computes *entry attempt counts* for thunks and local procs, to
+;;; decide whether a thunk must be Updatable (Many) or can be NoUpdate
+;;; (Zero / Once).  Occurrences live in a monotone lattice
+;;; Zero < Once < Many; sequencing adds, branching joins with max.
+;;; Thunk/proc bodies are charged lazily on first possible entry, which
+;;; PLAN's own laziness memoizes — mirroring runtime thunk semantics.
+
+(define ZERO 0)
+(define ONCE 1)
+(define MANY 2)
+
+(define (usesPlus a b)
+  (Ifz a b (Ifz b a MANY)))
+
+;; OccState is [occ pend]: occ :: bst Key Uses (accumulated entry
+;; attempts), pend :: bst Key ProcOcc (registered but not yet entered;
+;; a 0 value marks an already-activated entry).  ProcOcc is
+;; [free-occ arg-uses-row].
+
+(define (occAnalysis recurArgUses top)
+  (define (argUses o)
+    (? Op o
+      (RECUR (stream recurArgUses))
+      (ADD ~[ONCE ONCE])
+      (FAST (lrepeat MANY)) ;; TODO(prototype): lookup from metadata
+      (SLOW (lrepeat MANY)) ;; unknown call, must be pessimistic
+      (LOCAL (error "this should not be reachable"))))
+  (define (analyzeProc p st0)
+    (letrec
+        ((useThunk
+           (lambda (u a st)
+             (Ifz u st
+               (? Atom a
+                 (CNS st)
+                 (REF [key]
+                   (begin
+                     (define st1 (activate key [] st))
+                     [(bst-ups key ZERO (usesPlus u) (_0 st1)) (_1 st1)]))))))
+         (activate
+           (lambda (k params st)
+             (begin
+               (define hit (bst-search k (_1 st)))
+               (Ifz hit st
+                 (begin
+                   (define po (_0 hit))
+                   (Ifz po st ;; 0 = already activated
+                     (begin
+                       (define st1 [(_0 st) (bst-insert k 0 (_1 st))])
+                       (define st2
+                         (lfoldl
+                           (lambda (st3 kv[k v]) (useThunk v ($REF k) st3))
+                           st1
+                           (bst-ltap (_0 po))))
+                       (lfoldl
+                         (lambda (st3 ua) (useThunk (_0 ua) (_1 ua) st3))
+                         st2
+                         (lzip (stream (_1 po)) (stream params))))))))))
+         (procOcc
+           (lambda (p2)
+             (begin
+               (define done (analyzeProc p2 [E E]))
+               (define occ (_0 done))
+               (define free
+                 (bst-from-pairs-list
+                   (lfilter
+                     (lambda (kv) (set-member (_0 kv) (procFree p2)))
+                     (bst-ltap occ))))
+               (define args
+                 (map (lambda (a) (bst-gut (argKey a) ZERO occ)) (procArgs p2)))
+               [free args])))
+         (registerPending
+           (lambda (k p2 st)
+             [(_0 st) (bst-insert k (procOcc p2) (_1 st))]))
+         (escapeAlloc
+           (lambda (fn xs st)
+             (foldl
+               (lambda (st2 v) (useThunk MANY v st2))
+               (useThunk MANY fn st)
+               xs)))
+         (branches
+           (lambda (ps st)
+             [(lfoldl
+                (lambda (acc p2) (bstUnionMax acc (_0 (analyzeProc p2 st))))
+                E
+                ps)
+              (_1 st)]))
+         (analyzeStmt
+           (lambda (s st)
+             (? Stmt s
+               (LET [key rhs]
+                 (? Alloc rhs
+                   (DELAY [body] (registerPending key body st))
+                   (CLOSE [fn args] (escapeAlloc fn args st))))
+               (PROC [key body] (registerPending key body st))
+               (FORCE [key x] (useThunk ONCE x st))
+               (CALL [key op args]
+                 (? Op op
+                   (LOCAL [key] (activate key args st))
+                   (_
+                     (lfoldl
+                       (lambda (st2 ua) (useThunk (_0 ua) (_1 ua) st2))
+                       st
+                       (lzip (argUses op) (stream args))))))
+               (BR [x arms]
+                 (branches (lmap (lambda (br) (_1 br)) (stream arms)) st))
+               (RET st)
+               (REC [binds]
+                 (begin
+                   (define st1
+                     (foldl
+                       (lambda (st2 kv)
+                         (? Alloc (_1 kv)
+                           (DELAY [body] (registerPending (_0 kv) body st2))
+                           (CLOSE st2)))
+                       st
+                       binds))
+                   (foldl
+                     (lambda (st2 kv)
+                       (? Alloc (_1 kv)
+                         (CLOSE [fn args] (escapeAlloc fn args st2))
+                         (DELAY st2)))
+                     st1
+                     binds)))))))
+      (foldl (lambda (st s) (analyzeStmt s st)) st0 (procCode p))))
+  (analyzeProc top [E E]))
+
+;; occurs :: Proc -> Occ (bst Key Uses)
+;;
+;; Local procs are non-recursive; the only source of repetition is
+;; RECUR.  Occurrence analysis is therefore a fixed point over the
+;; top-level argument uses fed back through RECUR.  The lattice is
+;; finite, so termination is guaranteed.
+(define (occurs top)
+  (define topArgs (map argKey (procArgs top)))
+  (define (recurArgUsesFrom argOcc)
+    (map (lambda (k) (bst-gut k ZERO argOcc)) topArgs))
+  (define (restrictArgs occ)
+    (bst-from-pairs-list
+      (lmap (lambda (k) [k (bst-gut k ZERO occ)]) (stream topArgs))))
+  (define (go argOcc)
+    (define st (occAnalysis (recurArgUsesFrom argOcc) top))
+    (define occ (_0 st))
+    (define argOcc2 (restrictArgs occ))
+    (If (Equal argOcc2 argOcc) occ (go argOcc2)))
+  (go (bst-from-pairs-list (lmap (lambda (k) [k ZERO]) (stream topArgs)))))
+
+(define (occOf k occ)
+  (bst-gut k ZERO occ))
+
+
+;;; Driver ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; optimizeOnce :: Proc -> UniqueM Proc
+(define (optimizeOnce p uq)
+  (define q (dethunk (reforce (reschedule (lowerPureBinds p)))))
+  (define r[uq2 q2] (inlineSingleUseProcs q uq))
+  [uq2 (deadCodeElim q2)])
+
+;; optimize runs all optimizations repeatedly, until a pass produces no
+;; changes.  This converges because no pass introduces new sharing or
+;; new thunks.
+(define (optimize top)
+  (define (go uq p)
+    (define r[uq2 p2] (optimizeOnce p uq))
+    (If (Equal p2 p) p (go uq2 p2)))
+  (go (bstMaxKey (refcounts top)) top))
+
+
+;;; S3: front-end (kal law body -> dumb IR) and codegen ;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; ingestLaw turns a law into the "maximally indirect" dumb IR: every
+;;; call becomes a LET of a DELAY'd CALL (thunk-per-call), operand
+;;; thunks are allocated eagerly in the top block (mirroring the
+;;; runtime, where the whole build sequence runs at law entry), and the
+;;; let prelude becomes one REC of DELAY procs keyed by env slot.
+;;;
+;;; codegenLaw emits bytecode for the UNOPTIMIZED IR that is
+;;; byte-identical to the shipped compiler's output (the S3 parity
+;;; gate); the REC prelude is not emitted (the runtime's JUDGE scan
+;;; builds the env before entering bytecode, exactly as today).
+;;;
+;;; Deviations from the prototype's stated dumb shape, for parity:
+;;; SLOW calls carry the unforced head atom (no explicit FORCE) since
+;;; the runtime's slow path forces at entry; explicit strict-arg FORCEs
+;;; arrive with strictness metadata in a later stage.
+
+;; Bytecode opcode/bane numbers, mirroring the shipped compiler
+;; (reaver/src/plan/reaver.plan) and pl_op in the C runtime.
+(define OP_PUSH_VAR 0)
+(define OP_PUSH_LIT 1)
+(define OP_MK_THK 2)
+(define OP_FORCE 3)
+(define OP_CALL 4)
+(define OP_RET 7)
+(define OP_MK_APP 8)
+(define OP_PUSH_SLOT 9)
+(define OP_BR 10)
+(define OP_JMP 11)
+(define OP_ENTRY 12)
+(define OP_CALL_KNOWN 13)
+(define OP_CALL_FAST 14)
+(define OP_CALL_SLOW 15)
+(define BANE_FAST 1)
+(define BANE_SLOW 2)
+(define BANE_PRIM 3)
+(define BANE_PRIM_KNOWN 4)
+(define BAD_ARITY 10000)
+
+(define (pinArity x)
+  (let1 i (Unpin x)
+    (If (IsLaw i) (Arity i) 1)))
+
+(define (planArity x)
+  (cond
+    ((IsNat x) 0)
+    ((IsPin x) (pinArity x))
+    ((IsLaw x) (Arity x))
+    (else (Dec (planArity (Init x))))))
+
+;; kal shape predicates, mirroring the shipped compiler exactly: a law
+;; body is variable references (nats <= depth), calls (0 f x), quotes
+;; (0 x), and literals (everything else, INCLUDING apps whose elements
+;; happen to look like variables or calls -- never recurse into them).
+(define (law-var? depth e) (And (IsNat e) (Le e depth)))
+(define (law-quote? e)
+  (If (IsApp e)
+    (If (And (Sz e) (Nil (Dec (Sz e)))) (Nil (Hd e)) 0)
+    0))
+(define (law-const e) (If (law-quote? e) (_0 e) e))
+(define (law-call? e)
+  (And (IsApp e) (And (Nil (Hd e)) (Eq 2 (Sz e)))))
+(define (law-const? depth e)
+  (Nil (Or (law-var? depth e) (law-call? e))))
+(define (unwind e args)
+  (Ifz (law-call? e) [e args]
+    (unwind (_0 e) (cons (_1 e) args))))
+(define (get-arity depth e)
+  (If (law-var? depth e) BAD_ARITY (planArity (law-const e))))
+(define (partial-app? depth hd)
+  (Ifz (law-const? depth hd) 0 (IsApp (law-const hd))))
+(define (primop-val? v) (And (IsPin v) (IsNat (Unpin v))))
+(define (primop? depth hd)
+  (And (law-const? depth hd) (primop-val? (law-const hd))))
+(define (row-expr? depth e)
+  (Ifz (law-call? e) 0
+    (begin
+      (define hu (unwind e []))
+      (Ifz (law-var? depth (_0 hu))
+        (Nil (planArity (law-const (_0 hu))))
+        0))))
+
+;; The let prelude: (1 v k) chains.  -> [depth let-exprs-list body]
+;; (let exprs in env-slot order; first let binds slot arity+1).
+(define (collect-lets arity body)
+  (Ifz (And (Eq 2 (Sz body)) (Eq 1 (Hd body)))
+    [arity NIL body]
+    (begin
+      (define r[depth exprs rest] (collect-lets (Inc arity) (_1 body)))
+      [depth [(_0 body) exprs] rest])))
+
+;; ingestExpr depth uq e -> [uq' prefix-row atom].  prefix is a row of
+;; LET statements (eager thunk/row allocations) the atom depends on.
+(define (ingestExpr depth uq e)
+  ;; wrap a call in its thunk binding: allocate the binding key and the
+  ;; call-result key, append the LET, hand back the REF.
+  (define (bindCall uq0 prefix op atoms)
+    (define k (Inc uq0))
+    (define k2 (Inc k))
+    (define thunkProc (mkProc [] [($CALL k2 op atoms) ($RET ($REF k2))]))
+    [k2 (snoc ($LET k ($DELAY thunkProc)) prefix) ($REF k)])
+  ;; ingest a list/row of subexpressions -> [uq' prefix atoms-row]
+  (define (ingestRow uq0 exprs)
+    (foldl
+      (lambda (acc e2)
+        (begin
+          (define st[uqa prefix atoms] acc)
+          (define r[uqb p2 a2] (ingestExpr depth uqa e2))
+          [uqb (weld prefix p2) (snoc a2 atoms)]))
+      [uq0 [] []]
+      exprs))
+  (define (ingestCall uq0 e2)
+    (define hu (unwind e2 []))
+    (define head (_0 hu))
+    (define args (_1 hu))
+    (define argc (Sz args))
+    (define hd-arity (get-arity depth head))
+    (define is-prim (And (primop? depth head) (Eq 1 argc)))
+    ;; A "known" primop call is the simple wrapper shape
+    ;; (0 <oppin> (0 "Name" args..)): [name relems] on match, else 0.
+    (define known-row
+      (Ifz is-prim 0
+        (Ifz (law-call? (_0 args)) 0
+          (begin
+            (define ru (unwind (_0 args) []))
+            (Ifz (law-var? depth (_0 ru))
+              (If (IsNat (law-const (_0 ru)))
+                [(law-const (_0 ru)) (_1 ru)]
+                0)
+              0)))))
+    (define is-fast
+      (And (Nil (primop? depth head))
+        (And (Nil (partial-app? depth head)) (Eq hd-arity argc))))
+    (define head-atom
+      (If (law-var? depth head) ($REF head) ($CNS (law-const head))))
+    (If known-row
+      (begin
+        (define r[uq1 prefix atoms] (ingestRow uq0 (_1 known-row)))
+        (define rk (Inc uq1))
+        (define prefix2
+          (snoc ($LET rk ($CLOSE ($CNS (_0 known-row)) atoms)) prefix))
+        (bindCall rk prefix2 ($FAST (law-const head)) [($REF rk)]))
+      (If is-prim
+        (If (row-expr? depth (_0 args))
+          (begin
+            (define ru (unwind (_0 args) []))
+            (define r[uq1 prefix atoms] (ingestRow uq0 (_1 ru)))
+            (define rk (Inc uq1))
+            (define prefix2
+              (snoc ($LET rk ($CLOSE ($CNS (law-const (_0 ru))) atoms)) prefix))
+            (bindCall rk prefix2 ($FAST (law-const head)) [($REF rk)]))
+          (begin
+            (define r[uq1 prefix a0] (ingestExpr depth uq0 (_0 args)))
+            (bindCall uq1 prefix ($FAST (law-const head)) [a0])))
+        (begin
+          (define r[uq1 prefix atoms] (ingestRow uq0 args))
+          (define op (If is-fast ($FAST (law-const head)) ($SLOW head-atom)))
+          (bindCall uq1 prefix op atoms)))))
+  (cond
+    ((law-var? depth e) [uq [] ($REF e)])
+    ((law-call? e) (ingestCall uq e))
+    (else [uq [] ($CNS (law-const e))])))
+
+;; ingestLaw :: Law|Pin-of-Law -> [depth Proc]
+(define (ingestLaw l)
+  (define la (If (IsPin l) (Unpin l) l))
+  (define arity (Arity la))
+  (define r[depth letExprs calls] (collect-lets arity (Body la)))
+  (define lr
+    (lfoldl
+      (lambda (acc ve)
+        (begin
+          (define st[uqa slot binds] acc)
+          (define r2[uqb prefix atom] (ingestExpr depth uqa ve))
+          (define letProc (mkProc [] (snoc ($RET atom) prefix)))
+          [uqb (Inc slot) (snoc [slot ($DELAY letProc)] binds)]))
+      [depth (Inc arity) []]
+      letExprs))
+  (define r3[uq2 prefix atom] (ingestExpr depth (_0 lr) calls))
+  (define bodyBlock (snoc ($RET atom) prefix))
+  (define block
+    (Ifz (Sz (_2 lr)) bodyBlock (cons ($REC (_2 lr)) bodyBlock)))
+  (define pargs (gen (Inc arity) (lambda (i) ($ARG i $LAZY))))
+  [depth (mkProc pargs block)])
+
+;; codegenProc: emit bytecode for an UNOPTIMIZED dumb-IR proc,
+;; byte-identical to the shipped compiler.  Emission is driven from the
+;; RET atom, inlining each single-use LET definition at its use site,
+;; which reproduces the shipped compiler's depth-first push order.
+(define (codegenProc depth p)
+  (define defs
+    (foldl
+      (lambda (d s)
+        (? Stmt s
+          (LET [key rhs] (bst-insert key rhs d))
+          (_ d)))
+      E
+      (procCode p)))
+  (define root
+    (? Stmt (Last (procCode p))
+      (RET [x] x)
+      (_ (error "codegen: block must end in RET"))))
+  (define (emitAtom a)
+    (define (emitClose h elems)
+      (weld [OP_PUSH_LIT h]
+        (weld (cat (map emitAtom elems)) [OP_MK_APP (Sz elems)])))
+    (define (emitPrim oppin a0)
+      (define closeHit
+        (? Atom a0
+          (REF [key]
+            (If (Le key depth) 0
+              (? Alloc (bst-idx key defs)
+                (CLOSE [fn args] [[(CNS.val fn) args]])
+                (DELAY 0))))
+          (CNS 0)))
+      (Ifz closeHit
+        (weld [OP_PUSH_LIT oppin]
+          (weld (emitAtom a0) [OP_MK_THK 2 BANE_PRIM]))
+        (begin
+          (define h (_0 (_0 closeHit)))
+          (define elems (_1 (_0 closeHit)))
+          (If (IsNat h)
+            (weld (cat (map emitAtom elems))
+              [OP_MK_THK (Sz elems) BANE_PRIM_KNOWN oppin h])
+            (weld [OP_PUSH_LIT oppin]
+              (weld (emitClose h elems) [OP_MK_THK 2 BANE_PRIM]))))))
+    (define (emitAlloc al)
+      (? Alloc al
+        (CLOSE [fn args] (emitClose (CNS.val fn) args))
+        (DELAY [body]
+          (? Stmt (_0 (procCode body))
+            (CALL [key op args]
+              (? Op op
+                (FAST [val]
+                  (If (And (primop-val? val) (Eq 1 (Sz args)))
+                    (emitPrim val (_0 args))
+                    (weld [OP_PUSH_LIT val]
+                      (weld (cat (map emitAtom args))
+                        [OP_MK_THK (Inc (Sz args)) BANE_FAST]))))
+                (SLOW [fn]
+                  (weld (emitAtom fn)
+                    (weld (cat (map emitAtom args))
+                      [OP_MK_THK (Inc (Sz args)) BANE_SLOW])))
+                (_ (error "codegen: unsupported call op"))))
+            (_ (error "codegen: expected CALL in thunk"))))))
+    (? Atom a
+      (REF [key]
+        (If (Le key depth)
+          [OP_PUSH_VAR key]
+          (emitAlloc (bst-idx key defs))))
+      (CNS [val] [OP_PUSH_LIT val])))
+  (weld (emitAtom root) [OP_RET]))
+
+;; codegenLaw: the whole unoptimized pipeline, comparable byte-for-byte
+;; against the shipped compiler's output for the same law.
+(define (codegenLaw l)
+  (define r[depth p] (ingestLaw l))
+  (codegenProc depth p))
+
+
+;;; S4: optimizing pipeline ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; ingestLawOpt is ingestLaw with one change: the law body's result
+;;; call is EAGER (a block-level CALL + RET) instead of a returned
+;;; thunk.  This is semantically exact: a law is only entered under
+;;; demand, so its result is always forced immediately — the runtime's
+;;; MK_THK+RET -> OP_TAILCALL fusion already exploits precisely this.
+;;;
+;;; strictify then inserts FORCE statements for the strict arguments of
+;;; known primop calls in EAGER contexts only (main block and PROC
+;;; bodies, never DELAY bodies).  Strictness comes from a conservative
+;;; mirror of the C pl_ops strict masks: emitting a FORCE for an
+;;; argument the runtime's F_OPARG driver forces anyway is
+;;; semantics-neutral by construction; omitting one merely misses an
+;;; optimization.  With forces in place, reforce dedups them, dethunk
+;;; converts force-only thunks into procs, and inline+DCE collapse the
+;;; residue — cascading across the fixed-point iterations.
+
+;; [name argc strict-mask] mirror of fully-safe op66 entries (op.c).
+;; Bit i (low to high) = argument i is forced to WHNF before the body.
+(define strict-ops
+  [["Inc" 1 1] ["Dec" 1 1] ["Add" 2 3] ["Sub" 2 3] ["Mul" 2 3]
+   ["Div" 2 3] ["Mod" 2 3] ["Rsh" 2 3] ["Lsh" 2 3]
+   ["Eq" 2 3] ["Ne" 2 3] ["Lt" 2 3] ["Le" 2 3] ["Gt" 2 3] ["Ge" 2 3]
+   ["Cmp" 2 3] ["Hd" 1 1] ["Sz" 1 1] ["Nil" 1 1] ["Truth" 1 1]
+   ["Nat" 1 1] ["IsPin" 1 1] ["IsLaw" 1 1] ["IsApp" 1 1] ["IsNat" 1 1]
+   ["Ix" 2 3] ["Ix0" 1 1] ["Ix1" 1 1] ["Ix2" 1 1] ["Ix3" 1 1]
+   ["Ix4" 1 1] ["Ix5" 1 1] ["Ix6" 1 1] ["Ix7" 1 1]
+   ["Weld" 2 3] ["Test" 2 3] ["If" 3 1] ["Ifz" 3 1]
+   ["Seq" 2 1] ["Seq2" 3 3] ["And" 2 1] ["Or" 2 1] ["Row" 3 6]
+   ["Case2" 3 1] ["Case3" 4 1] ["Case4" 5 1]])
+
+(define strict-op-table
+  (bst-from-pairs-list
+    (lmap (lambda (e) [(_0 e) [(_1 e) (_2 e)]]) (stream strict-ops))))
+
+;; strict mask for (name, argc), or 0
+(define (strictMaskOf name argc)
+  (define hit (bst-search name strict-op-table))
+  (Ifz hit 0
+    (If (Eq argc (_0 (_0 hit))) (_1 (_0 hit)) 0)))
+
+;; prims whose result is provably 0 or 1 ([name argc]): a branch on
+;; one needs no Truth/Nil normalization (Cmp is 0/1/2 — excluded)
+(define bool-prims
+  (bst-from-pairs-list
+    ~[["Lt" 2] ["Le" 2] ["Gt" 2] ["Ge" 2] ["Eq" 2] ["Ne" 2]
+      ["Nil" 1] ["Truth" 1] ["IsPin" 1] ["IsLaw" 1] ["IsApp" 1]
+      ["IsNat" 1]]))
+
+;; bit i-1 of a strictness mask = argument i
+(define (pow2n i) (Ifz i 1 (Mul 2 (pow2n (Dec i)))))
+(define (argBit i) (pow2n (Dec i)))
+(define (bitSet? mask i) (Mod (Div mask (argBit i)) 2))
+
+;; ingestLawOpt: like ingestLaw, but the body's result position is
+;; eager.  A body call becomes CALL k2 op atoms; RET (REF k2); other
+;; bodies are unchanged.
+(define (ingestLawOpt l)
+  (define la (If (IsPin l) (Unpin l) l))
+  (define arity (Arity la))
+  (define r[depth letExprs calls] (collect-lets arity (Body la)))
+  (define lr
+    (lfoldl
+      (lambda (acc ve)
+        (begin
+          (define st[uqa slot binds] acc)
+          (define r2[uqb prefix atom] (ingestExpr depth uqa ve))
+          (define letProc (mkProc [] (snoc ($RET atom) prefix)))
+          [uqb (Inc slot) (snoc [slot ($DELAY letProc)] binds)]))
+      [depth (Inc arity) []]
+      letExprs))
+  (define r3[uq2 prefix atom] (ingestExpr depth (_0 lr) calls))
+  ;; Un-thunk the tail position: when the body atom is the sole use of
+  ;; the final LET (DELAY [CALL.. RET..]), replace it with the eager
+  ;; call.  (ingestExpr binds the outermost call last.)
+  (define bodyBlock
+    (begin
+      (define n (Sz prefix))
+      (define tailHit
+        (Ifz n 0
+          (? Atom atom
+            (REF
+              (begin
+                (define lastS (Ix (Dec n) prefix))
+                (? Stmt lastS
+                  (LET [key rhs]
+                    (Ifz (Eq key (REF.key atom)) 0
+                      (? Alloc rhs
+                        (DELAY [body]
+                          (? Stmt (_0 (procCode body))
+                            (CALL [key op args] [[key op args]])
+                            (_ 0)))
+                        (CLOSE 0))))
+                  (_ 0))))
+            (CNS 0))))
+      (Ifz tailHit
+        (snoc ($RET atom) prefix)
+        (begin
+          (define c (_0 tailHit))
+          (weld (take (Dec n) prefix)
+            [($CALL (_0 c) (_1 c) (_2 c)) ($RET ($REF (_0 c)))])))))
+  ;; The let-prelude stays one REC knot: judge builds it as a bulk
+  ;; allocation (one reserve, 3-cell kal thunks sharing the env), which
+  ;; beats per-bind MK_THK code for residual-lazy binds — lowering the
+  ;; prelude to LETs at ingest regressed ~16-20% twice.  Instead,
+  ;; dethunkOpt eats INDIVIDUAL knot binds (single-use, force-only);
+  ;; a fully-eaten knot leaves no chain-slot references, max_var drops
+  ;; to the arity, and the law enters chain-free at runtime.
+  (define block
+    (Ifz (Sz (_2 lr)) bodyBlock (cons ($REC (_2 lr)) bodyBlock)))
+  (define pargs (gen (Inc arity) (lambda (i) ($ARG i $LAZY))))
+  [depth (mkProc pargs block)])
+
+;; recurLower: a saturated call through the self reference (var 0) IS
+;; recursion — represent it as RECUR (prototype parity: RECUR is the
+;; only source of repetition) so strictify and codegen treat it
+;; uniformly.  RECUR is context-free (no var-0 atom survives in the
+;; call), codegen re-materializes the self value from env slot 0 and
+;; emits a verified exact-arity FAST at every level.  Runs once right
+;; after ingest; the dumb pipeline never sees RECUR.
+(define (recurLower top)
+  (define selfArity (Dec (Sz (procArgs top))))
+  (define (goStmt s)
+    (define (goProc p2) (overCode (map goStmt) p2))
+    (define (goAlloc a)
+      (? Alloc a
+        (CLOSE a)
+        (DELAY [body] ($DELAY (goProc body)))))
+    (? Stmt s
+      (CALL [key op args]
+        (? Op op
+          (SLOW [fn]
+            (? Atom fn
+              (REF
+                (If (And (Nil (REF.key fn)) (Eq (Sz args) selfArity))
+                  ($CALL key $RECUR args)
+                  s))
+              (CNS s)))
+          (_ s)))
+      (PROC [key body] ($PROC key (goProc body)))
+      (LET [key rhs] ($LET key (goAlloc rhs)))
+      (REC [binds]
+        ($REC (map (lambda (kv) [(_0 kv) (goAlloc (_1 kv))]) binds)))
+      (BR [x arms]
+        ($BR x (map (lambda (kp) [(_0 kp) (goProc (_1 kp))]) arms)))
+      (_ s)))
+  (overCode (map goStmt) top))
+
+;; strictify: in eager contexts (main block, PROC bodies), insert
+;; FORCE statements for strict REF arguments of known primop calls.
+;; DELAY bodies are lazy contexts and stay untouched.  Threads uq.
+(define (strictify lawSig selfMask selfArity depth p uq)
+  (define (goBlock b uq0)
+    ;; already-WHNF keys: both FORCE sources and FORCE results (a
+    ;; FORCE's bound key is WHNF by definition — missing the results
+    ;; made the final law pass re-force the prologue's slots)
+    (define forced
+      (foldl
+        (lambda (s2 s)
+          (? Stmt s
+            (FORCE [key x]
+              (begin
+                (define s3 (bst-insert key 1 s2))
+                (? Atom x (REF [key] (bst-insert key 1 s3)) (CNS s3))))
+            (_ s2)))
+        E b))
+    ;; CLOSE lets keyed for KNOWN-call elem lookup
+    (define closes
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs (CLOSE [fn args] (bst-insert key [fn args] m)) (DELAY m)))
+            (_ m)))
+        E b))
+    (define (pow2 i) (Ifz i 1 (Mul 2 (pow2 (Dec i)))))
+    (define (forceArgs uqa atoms mask)
+      ;; -> [uq forces atoms']: FORCE stmts for masked REF args not
+      ;; already forced in this block
+      (foldl
+        (lambda (acc a)
+          (begin
+            (define st[uqx forces done] acc)
+            (define bit (Mod (Div mask (pow2 (Sz done))) 2))
+            (Ifz bit [uqx forces (snoc a done)]
+              (? Atom a
+                (REF [key]
+                  (If (bst-has key forced)
+                    [uqx forces (snoc a done)]
+                    (begin
+                      (define f (Inc uqx))
+                      [f (snoc ($FORCE f a) forces) (snoc ($REF f) done)])))
+                (CNS [uqx forces (snoc a done)])))))
+        [uqa [] []]
+        atoms))
+    (define done
+      (foldl
+        (lambda (acc s)
+          (begin
+            (define st[uqa out] acc)
+            (? Stmt s
+              (CALL [key op args]
+                (? Op op
+                  (FAST [val]
+                    (Ifz (primop-val? val)
+                      ;; saturated call to a known law: pre-force the
+                      ;; args its own checked prologue would force, so
+                      ;; codegen can target the fast entry
+                      (begin
+                        (define lm (Ifz lawSig 0 (lawSig val)))
+                        (Ifz lm [uqa (snoc s out)]
+                          (begin
+                            (define rf[uqb forces args2]
+                              (forceArgs uqa args lm))
+                            (Ifz (Sz forces) [uqa (snoc s out)]
+                              [uqb (weld out
+                                     (snoc ($CALL key op args2) forces))]))))
+                      (begin
+                        ;; KNOWN shape: single arg referencing a CLOSE
+                        ;; row with a nat name head
+                        (define kn
+                          (Ifz (Eq 1 (Sz args)) 0
+                            (? Atom (_0 args)
+                              (REF [key]
+                                (begin
+                                  (define hit (bst-search key closes))
+                                  (Ifz hit 0
+                                    (? Atom (_0 (_0 hit))
+                                      (CNS [val] (If (IsNat val) [[key (_0 hit)]] 0))
+                                      (_ 0)))))
+                              (CNS 0))))
+                        (Ifz kn [uqa (snoc s out)]
+                          (begin
+                            (define rk (_0 (_0 kn)))
+                            (define fn (_0 (_1 (_0 kn))))
+                            (define elems (_1 (_1 (_0 kn))))
+                            (define mask (strictMaskOf (CNS.val fn) (Sz elems)))
+                            (Ifz mask [uqa (snoc s out)]
+                              ;; splice the forces immediately before
+                              ;; the CLOSE row wherever it sits: its
+                              ;; elems' sources are bound above it, so
+                              ;; no forward references are created
+                              (begin
+                                (define closeAt
+                                  (find-idx
+                                    (lambda (s2)
+                                      (? Stmt s2
+                                        (LET [key rhs] (Eq key rk))
+                                        (_ 0)))
+                                    out))
+                                (Ifz closeAt [uqa (snoc s out)]
+                                  (begin
+                                    (define ci (_0 closeAt))
+                                    (define rf[uqb forces elems2]
+                                      (forceArgs uqa elems mask))
+                                    [uqb
+                                     (snoc s
+                                       (weld (take ci out)
+                                         (weld forces
+                                           (cons
+                                             ($LET rk ($CLOSE fn elems2))
+                                             (drop (Inc ci) out)))))])))))))))
+                  (RECUR
+                    ;; self-call (saturated by recurLower): pre-force
+                    ;; this law's own strict args so the emitted
+                    ;; self-hint always lands on the fast entry
+                    (Ifz selfMask [uqa (snoc s out)]
+                      (begin
+                        (define rf[uqb forces args2]
+                          (forceArgs uqa args selfMask))
+                        (Ifz (Sz forces) [uqa (snoc s out)]
+                          [uqb (weld out
+                                 (snoc ($CALL key op args2) forces))]))))
+                  (_ [uqa (snoc s out)])))
+              (PROC [key body]
+                (begin
+                  (define rp[uqb code2] (goBlock (procCode body) uqa))
+                  [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+              (BR [x arms]
+                (begin
+                  (define rr
+                    (foldl
+                      (lambda (a2 kp)
+                        (begin
+                          (define st2[uqx done2] a2)
+                          (define r2[uqy code2]
+                            (goBlock (procCode (_1 kp)) uqx))
+                          [uqy (snoc [(_0 kp)
+                                      (mkProc (procArgs (_1 kp)) code2)]
+                                 done2)]))
+                      [uqa []]
+                      arms))
+                  [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
+              (_ [uqa (snoc s out)]))))
+        [uq0 []]
+        b))
+    done)
+  (define r[uq2 code2] (goBlock (procCode p) uq))
+  [uq2 (mkProc (procArgs p) code2)])
+
+;; dethunkOpt: dethunkStep over LET-bound thunks AND individual REC
+;; (knot) binds.  Converting a knot bind removes it from the REC and
+;; places its body as a PROC at the knot's position; a fully-eaten
+;; knot disappears, and with no chain-slot references left the law's
+;; code drops to max_var <= arity and enters chain-free at runtime.
+;; A partially-eaten knot keeps env-mode entry — the judge still
+;; builds every chain thunk (the kal body is unchanged), so partial
+;; conversion is perf-neutral, never a regression.
+(define (dethunkOpt top)
+  (define (candidates b)
+    (lcatmap
+      (lambda (s)
+        (? Stmt s
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body] ~[[key body]])
+              (CLOSE NIL)))
+          (REC [binds]
+            (lcatmap
+              (lambda (kv)
+                (? Alloc (_1 kv)
+                  (DELAY [body] ~[[(_0 kv) body]])
+                  (CLOSE NIL)))
+              (stream binds)))
+          (_ NIL)))
+      (stream b)))
+  (define (step p procable)
+    (define toProc (bst-from-pairs-list procable))
+    (define (goStmt s)
+      ;; -> row of replacement stmts (REC conversion splits one stmt
+      ;; into the surviving knot plus PROCs for the eaten binds)
+      (define (goProc p2)
+        (overCode (lambda (b2) (cat (map goStmt b2))) p2))
+      (? Stmt s
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY
+              (begin
+                (define hit (bst-search key toProc))
+                (Ifz hit [s] [($PROC key (_0 hit))])))
+            (CLOSE [s])))
+        (FORCE [key x]
+          (? Atom x
+            (REF
+              (begin
+                (define label (REF.key x))
+                (Ifz (bst-has label toProc) [s]
+                  [($CALL key ($LOCAL label) [])])))
+            (CNS [s])))
+        (PROC [key body] [($PROC key (goProc body))])
+        (REC [binds]
+          (begin
+            (define kept
+              (filter (lambda (kv) (Nil (bst-has (_0 kv) toProc))) binds))
+            (define procs
+              (map-maybe
+                (lambda (kv)
+                  (begin
+                    (define hit (bst-search (_0 kv) toProc))
+                    (Ifz hit [] [($PROC (_0 kv) (_0 hit))])))
+                binds))
+            (Ifz (Sz kept) procs (cons ($REC kept) procs))))
+        (BR [x arms]
+          [($BR x (map (lambda (kp) [(_0 kp) (goProc (_1 kp))]) arms))])
+        (_ [s])))
+    (Ifz toProc p (overCode (lambda (b2) (cat (map goStmt b2))) p)))
+  ;; recurse outer-first over PROC bodies (DELAY bodies stay lazy);
+  ;; returns [changed proc] so the fixed-point driver can stop without
+  ;; a deep Equal — dethunk is the only cascade driver, and each
+  ;; continuing round strictly decreases the thunk count.
+  ;; single-use only: converting a multi-FORCE thunk makes a
+  ;; multi-call PROC, which inline can't collapse — the law then
+  ;; falls to the dumb pipeline (and each call re-evaluates).  A
+  ;; shared thunk stays a memoized DELAY, which is what it means.
+  ;; Keys are globally unique, so one whole-proc count serves every
+  ;; nested block (recomputing per level doubled compile time).
+  (define topCounts (refcounts top))
+  (define (go p)
+    (define candidatesLeft
+      (lfilter
+        (lambda (kp)
+          (And (Eq 1 (bst-gut (_0 kp) 0 topCounts))
+            (Nil (usedLazily (_0 kp) (procCode p)))))
+        (candidates (procCode p))))
+    (define stepped (Ifz candidatesLeft p (step p candidatesLeft)))
+    (define sub
+      (foldl
+        (lambda (acc s)
+          (? Stmt s
+            (PROC [key body]
+              (begin
+                (define r (go body))
+                [(Or (_0 acc) (_0 r))
+                 (snoc ($PROC key (_1 r)) (_1 acc))]))
+            (BR [x arms]
+              (begin
+                (define rr
+                  (foldl
+                    (lambda (a2 kp)
+                      (begin
+                        (define r2 (go (_1 kp)))
+                        [(Or (_0 a2) (_0 r2))
+                         (snoc [(_0 kp) (_1 r2)] (_1 a2))]))
+                    [0 []]
+                    arms))
+                [(Or (_0 acc) (_0 rr))
+                 (snoc ($BR x (_1 rr)) (_1 acc))]))
+            (_ [(_0 acc) (snoc s (_1 acc))])))
+        [(Truth candidatesLeft) []]
+        (procCode stepped)))
+    [(_0 sub) (mkProc (procArgs stepped) (_1 sub))])
+  (go top))
+
+;; codegenOpt: slot-model block compiler for optimized IR.
+;;
+;; Every emitted binding statement leaves its value on the operand
+;; stack (slot = running index); atoms compile to PUSH_VAR (env),
+;; PUSH_SLOT (locals), or PUSH_LIT.  Residual DELAYs must have the
+;; dumb single-call body shape and become thkes exactly as before.
+;; Block-level CALLs are eager: thke build + OP_FORCE (with
+;; PL_BAN_NOUPD when noupd is on), or MK_THK+RET at tail position
+;; (which the C ingest fuses to OP_TAILCALL).  CLOSE lets consumed by
+;; a single KNOWN call are fused into the MK_THK operands (no row is
+;; built), as in the dumb pipeline.  The pipeline runs dethunk only
+;; together with inline+DCE, so local procs are gone by codegen time;
+;; any survivor (a multi-force thunk) errors the law over to the dumb
+;; fallback.  BR never appears (nothing produces it yet).
+
+;; brLower: a tail If/Ifz KNOWN call whose result is returned becomes a
+;; BR.  The condition is normalized with an eager Truth (If) or Nil
+;; (Ifz) call, whose 0/1 maps both forms onto arms [else, then].  A
+;; branch argument that is a single-use DELAY in this block becomes an
+;; eager arm proc (the whole point); any other atom becomes a trivial
+;; RET arm.  Only tail position is lowered (arms end in RET, returning
+;; from the frame); non-tail Ifs would need join points.
+(define (brLower p uq)
+  (define (goBlock b uq0)
+    (define n (Sz b))
+    (define counts (foldl (lambda (c s) (stmtCounts s c)) E b))
+    (define closes
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs (CLOSE [fn args] (bst-insert key [fn args] m)) (DELAY m)))
+            (_ m)))
+        E b))
+    (define delays
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs (DELAY [body] (bst-insert key body m)) (CLOSE m)))
+            (_ m)))
+        E b))
+    ;; first recurse into sub-procs (PROC bodies, existing BR arms)
+    (define sub
+      (foldl
+        (lambda (acc s)
+          (begin
+            (define st[uqa out] acc)
+            (? Stmt s
+              (PROC [key body]
+                (begin
+                  (define r[uqb code2] (goBlock (procCode body) uqa))
+                  [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+              (BR [x arms]
+                (begin
+                  (define rr
+                    (foldl
+                      (lambda (a2 kp)
+                        (begin
+                          (define st2[uqx done] a2)
+                          (define r2[uqy code2] (goBlock (procCode (_1 kp)) uqx))
+                          [uqy (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) code2)] done)]))
+                      [uqa []]
+                      arms))
+                  [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
+              (LET [key rhs]
+                (? Alloc rhs
+                  (DELAY [body]
+                    (begin
+                      (define r[uqb code2] (goBlock (procCode body) uqa))
+                      [uqb (snoc ($LET key ($DELAY (mkProc (procArgs body) code2))) out)]))
+                  (CLOSE [uqa (snoc s out)])))
+              (_ [uqa (snoc s out)]))))
+        [uq0 []]
+        b))
+    (define uq1 (_0 sub))
+    (define b2 (_1 sub))
+    ;; tail pattern: [.., CALL k (FAST oppin) [REF rowk], RET (REF k)]
+    (define hit
+      (Ifz (Ge n 2) 0
+        (? Stmt (Ix (Sub n 2) b2)
+          (CALL [key op args]
+            (? Op op
+              (FAST [val]
+                (Ifz (And (primop-val? val) (Eq 1 (Sz args))) 0
+                  (? Atom (_0 args)
+                    (REF
+                      (begin
+                        (define rowk (REF.key (_0 args)))
+                        (define ch (bst-search rowk closes))
+                        (Ifz (And (Truth ch) (Eq 1 (bst-gut rowk 0 counts))) 0
+                          (begin
+                            (define fn (_0 (_0 ch)))
+                            (define elems (_1 (_0 ch)))
+                            (? Atom fn
+                              (CNS [val]
+                                (Ifz (And (Eq 3 (Sz elems))
+                                       (Or (Eq val "If") (Eq val "Ifz"))) 0
+                                  (? Stmt (Ix (Dec n) b2)
+                                    (RET [x]
+                                      (? Atom x
+                                        (REF (If (Eq (REF.key x) key)
+                                               [[key rowk val elems]] 0))
+                                        (CNS 0)))
+                                    (_ 0))))
+                              (_ 0))))))
+                    (CNS 0))))
+              (_ 0)))
+          (_ 0))))
+    (Ifz hit [uq1 b2]
+      (begin
+        (define callk (_0 (_0 hit)))
+        (define rowk (_1 (_0 hit)))
+        (define ifname (_2 (_0 hit)))
+        (define elems (_3 (_0 hit)))
+        (define cond (_0 elems))
+        (define thenA (_1 elems))
+        (define elseA (_2 elems))
+        (define oppin (Pin "B"))
+        ;; single-use DELAY -> its body proc; otherwise RET the atom
+        (define (armOf a uqx)
+          (? Atom a
+            (REF
+              (begin
+                (define k2 (REF.key a))
+                (define dh (bst-search k2 delays))
+                (If (And (Truth dh) (Eq 1 (bst-gut k2 0 counts)))
+                  [uqx (_0 dh) [k2]]
+                  [(Inc uqx) (blockProc [($RET a)]) []])))
+            (CNS [(Inc uqx) (blockProc [($RET a)]) []])))
+        (define ra[uq2 thenP thenUsed] (armOf thenA uq1))
+        (define rb[uq3 elseP elseUsed] (armOf elseA uq2))
+        (define consumed (weld (weld [rowk] thenUsed) elseUsed))
+        (define kept
+          (map-maybe
+            (lambda (s)
+              (begin
+                (define ks (stmtKeys s))
+                (If (And (Sz ks) (set-member (_0 ks) consumed)) [] [s])))
+            (take (Sub n 2) b2)))
+        (define tk (Inc uq3))
+        (define nk (Inc tk))
+        (define ka (Inc nk))
+        (define kb (Inc ka))
+        ;; when the condition provably comes from a 0/1-producing prim
+        ;; in this block, branch on it directly: If keeps arm order
+        ;; [else, then] (Truth is identity on 0/1), Ifz swaps to
+        ;; [then, else] instead of inverting through Nil
+        (define condBool
+          (? Atom cond
+            (REF
+              (begin
+                (define ck (REF.key cond))
+                (define pidx
+                  (find-idx
+                    (lambda (s)
+                      (? Stmt s
+                        (CALL [key op args] (Eq key ck))
+                        (_ 0)))
+                    b2))
+                (Ifz pidx 0
+                  (? Stmt (Ix (_0 pidx) b2)
+                    (CALL [key op args]
+                      (? Op op
+                        (FAST [val]
+                          (Ifz (And (primop-val? val) (Eq 1 (Sz args))) 0
+                            (? Atom (_0 args)
+                              (REF
+                                (begin
+                                  (define ch2
+                                    (bst-search (REF.key (_0 args)) closes))
+                                  (Ifz ch2 0
+                                    (? Atom (_0 (_0 ch2))
+                                      (CNS [val]
+                                        (begin
+                                          (define bh
+                                            (bst-search val bool-prims))
+                                          (Ifz bh 0
+                                            (Eq (_0 bh)
+                                              (Sz (_1 (_0 ch2)))))))
+                                      (_ 0)))))
+                              (CNS 0))))
+                        (_ 0)))
+                    (_ 0)))))
+            (CNS 0)))
+        (Ifz condBool
+          [kb
+           (weld kept
+             [($LET tk ($CLOSE ($CNS (If (Eq ifname "If") "Truth" "Nil")) [cond]))
+              ($CALL nk ($FAST oppin) [($REF tk)])
+              ($BR ($REF nk) [[kb elseP] [ka thenP]])])]
+          [kb
+           (weld kept
+             [($BR cond
+                (If (Eq ifname "If")
+                  [[kb elseP] [ka thenP]]
+                  [[ka thenP] [kb elseP]]))])]))))
+  (define r[uq2 code2] (goBlock (procCode p) uq))
+  [uq2 (mkProc (procArgs p) code2)])
+
+;; brCondClean: strip a BR's Truth/Nil normalization once the branch
+;; chain has eagerized.  brLower must normalize pessimistically (at
+;; lowering time the condition is usually still a thunk ref), but
+;; after later rounds strictify/dethunk the chain, the pattern
+;;   LET tk (CLOSE Truth|Nil [x]); CALL nk (FAST B) [tk]; BR nk arms
+;; with x the single-use result of a provably-0/1 prim call in the
+;; same block can branch on x directly (Truth is identity on 0/1;
+;; Nil inverts, so its arms swap).  The dead CLOSE is left for DCE.
+(define (brCondClean p)
+  (define (goBlock b)
+    (define counts (foldl (lambda (c s) (stmtCounts s c)) E b))
+    (define closes
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs
+                (CLOSE [fn args] (bst-insert key [fn args] m))
+                (DELAY m)))
+            (_ m)))
+        E b))
+    (define calls
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (CALL [key op args] (bst-insert key [op args] m))
+            (_ m)))
+        E b))
+    ;; is k the result of a single-arg KNOWN call whose row head is a
+    ;; 0/1-producing prim?
+    (define (boolKey k)
+      (begin
+        (define ph (bst-search k calls))
+        (Ifz ph 0
+          (? Op (_0 (_0 ph))
+            (FAST [val]
+              (Ifz (And (primop-val? val) (Eq 1 (Sz (_1 (_0 ph))))) 0
+                (? Atom (_0 (_1 (_0 ph)))
+                  (REF
+                    (begin
+                      (define ch (bst-search (REF.key (_0 (_1 (_0 ph)))) closes))
+                      (Ifz ch 0
+                        (? Atom (_0 (_0 ch))
+                          (CNS [val]
+                            (begin
+                              (define bh (bst-search val bool-prims))
+                              (Ifz bh 0
+                                (Eq (_0 bh) (Sz (_1 (_0 ch)))))))
+                          (_ 0)))))
+                  (CNS 0))))
+            (_ 0)))))
+    ;; BR scrutinee k -> [x swap] when it is a single-use Truth/Nil of
+    ;; a provably-0/1 x, else 0
+    (define (normOf k)
+      (Ifz (Eq 1 (bst-gut k 0 counts)) 0
+        (begin
+          (define ph (bst-search k calls))
+          (Ifz ph 0
+            (? Op (_0 (_0 ph))
+              (FAST [val]
+                (Ifz (And (primop-val? val) (Eq 1 (Sz (_1 (_0 ph))))) 0
+                  (? Atom (_0 (_1 (_0 ph)))
+                    (REF
+                      (begin
+                        (define tk (REF.key (_0 (_1 (_0 ph)))))
+                        (define ch (bst-search tk closes))
+                        (Ifz (And (Truth ch) (Eq 1 (bst-gut tk 0 counts))) 0
+                          (? Atom (_0 (_0 ch))
+                            (CNS [val]
+                              (Ifz (Or (Eq val "Truth") (Eq val "Nil")) 0
+                                (begin
+                                  (define elems (_1 (_0 ch)))
+                                  (Ifz (Eq 1 (Sz elems)) 0
+                                    (? Atom (_0 elems)
+                                      (REF
+                                        (Ifz (boolKey (REF.key (_0 elems))) 0
+                                          [[(_0 elems) (Eq val "Nil") k]]))
+                                      (CNS 0))))))
+                            (_ 0)))))
+                    (CNS 0))))
+              (_ 0))))))
+    (define hits
+      (map-maybe
+        (lambda (s)
+          (? Stmt s
+            (BR [x arms]
+              (? Atom x
+                (REF (Ifz (normOf (REF.key x)) 0 (normOf (REF.key x))))
+                (CNS [])))
+            (_ [])))
+        b))
+    (define dropKeys (map (lambda (h) (_2 h)) hits))
+    (define byKey (bst-from-pairs-list
+      (lfoldr (lambda (h l) [[(_2 h) h] l]) NIL (stream hits))))
+    (map-maybe
+      (lambda (s)
+        (? Stmt s
+          (CALL [key op args]
+            (If (set-member key dropKeys) [] [s]))
+          (BR [x arms]
+            (? Atom x
+              (REF
+                (begin
+                  (define h (bst-search (REF.key x) byKey))
+                  (Ifz h [s]
+                    [($BR (_0 (_0 h))
+                       (If (_1 (_0 h))
+                         [(_1 arms) (_0 arms)]
+                         arms))])))
+              (CNS [s])))
+          (_ [s])))
+      b))
+  (optimizeEachBlock (lambda (p2) (overCode goBlock p2)) p))
+
+;; strictPrologue: the leading run of argument FORCEs — FORCE stmts of
+;; args (1..arity) occurring before the first CALL, non-arg FORCE, or
+;; RET.  Returns [mask idx-row]; deterministic, shared by the callee's
+;; prologue emission and the caller's signature computation.
+(define (strictPrologue arity block)
+  (define (scan i mask idxs)
+    (If (Ge i (Sz block)) [mask idxs]
+      (? Stmt (Ix i block)
+        (FORCE [key x]
+          (? Atom x
+            (REF
+              (begin
+                (define src (REF.key x))
+                (If (And (Ge src 1)
+                      (And (Le src arity) (Nil (bitSet? mask src))))
+                  (scan (Inc i) (Add mask (argBit src)) (snoc i idxs))
+                  [mask idxs])))
+            (CNS [mask idxs])))
+        (LET (scan (Inc i) mask idxs))
+        (REC (scan (Inc i) mask idxs))
+        (PROC (scan (Inc i) mask idxs))
+        (_ [mask idxs]))))
+  (scan 0 0 []))
+
+;; delayCallShape: [CALL k2 op cargs, RET (REF k2)] -> [[op cargs]]
+(define (delayCallShape b)
+  (Ifz (Eq 2 (Sz b)) 0
+    (? Stmt (_0 b)
+      (CALL [key op args]
+        (? Stmt (_1 b)
+          (RET [x]
+            (? Atom x
+              (REF (If (Eq (REF.key x) key) [[op args]] 0))
+              (CNS 0)))
+          (_ 0)))
+      (_ 0))))
+
+(define BANE_NOUPD 8)
+
+(define (maskAnd a b)
+  (define (go i acc)
+    (If (Gt i 16) acc
+      (go (Inc i)
+        (If (And (bitSet? a i) (bitSet? b i)) (Add acc (argBit i)) acc))))
+  (go 1 0))
+
+(define (codegenOpt lawSig selfSig noupd depth top)
+  (define selfArity (Dec (Sz (procArgs top))))
+  (define topBlock (procCode top))
+  ;; strict-entry prologue (self-call sites hint with exactly proMask)
+  (define proScan
+    (Ifz selfSig [0 []] (strictPrologue selfArity topBlock)))
+  (define proMask (maskAnd (_0 proScan) selfSig))
+  (define proIdxs
+    (Ifz proMask []
+      (filter
+        (lambda (i)
+          (? Stmt (Ix i topBlock)
+            (FORCE [key x]
+              (? Atom x (REF [key] (bitSet? proMask key)) (CNS 0)))
+            (_ 0)))
+        (_1 proScan))))
+  ;; recursive block emitter; BR arms are emitted as ["ARM" items]
+  ;; markers sitting in the BR's target slots, resolved by flatten.
+  (define (emitBlock block st0 emitOrder)
+    (define n (Sz block))
+    (define counts (foldl (lambda (c s) (stmtCounts s c)) E block))
+    (define closes
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs
+                (CLOSE [fn args] (bst-insert key [fn args] m))
+                (DELAY m)))
+            (_ m)))
+        E block))
+    (define (knownRowOf op args)
+      (? Op op
+        (FAST [val]
+          (Ifz (And (primop-val? val) (Eq 1 (Sz args))) 0
+            (? Atom (_0 args)
+              (REF [key]
+                (begin
+                  (define hit (bst-search key closes))
+                  (Ifz hit 0
+                    (Ifz (Eq 1 (bst-gut key 0 counts)) 0
+                      (? Atom (_0 (_0 hit))
+                        (CNS [val] (If (IsNat val) [[key val (_1 (_0 hit))]] 0))
+                        (_ 0))))))
+              (CNS 0))))
+        (_ 0)))
+    (define fusedCloses
+      (foldl
+        (lambda (m s)
+          (? Stmt s
+            (CALL [key op args]
+              (begin
+                (define kr (knownRowOf op args))
+                (Ifz kr m (bst-insert (_0 (_0 kr)) 1 m))))
+            (LET [key rhs]
+              (? Alloc rhs
+                (DELAY [body]
+                  (begin
+                    (define shape (delayCallShape (procCode body)))
+                    (Ifz shape m
+                      (begin
+                        (define kr (knownRowOf (_0 (_0 shape)) (_1 (_0 shape))))
+                        (Ifz kr m (bst-insert (_0 (_0 kr)) 1 m))))))
+                (CLOSE m)))
+            (_ m)))
+        E block))
+    (define (emitAtom st a)
+      (? Atom a
+        (REF [key]
+          (If (Le key depth) [OP_PUSH_VAR key]
+            (begin
+              (define hit (bst-search key (_1 st)))
+              (Ifz hit (error ["codegenOpt: unbound local" key])
+                [OP_PUSH_SLOT (_0 hit)]))))
+        (CNS [val] [OP_PUSH_LIT val])))
+    (define (emitThkBuild st op args flag hintOk)
+      (define kr (knownRowOf op args))
+      (Ifz kr
+        (? Op op
+          (FAST [val]
+            (If (And (primop-val? val) (Eq 1 (Sz args)))
+              (weld [OP_PUSH_LIT val]
+                (weld (emitAtom st (_0 args))
+                  [OP_MK_THK 2 (Add BANE_PRIM flag)]))
+              (begin
+                (define hint
+                  (Ifz lawSig 0 (Ifz hintOk 0 (Mul 256 (lawSig val)))))
+                (weld [OP_PUSH_LIT val]
+                  (weld (cat (map (emitAtom st) args))
+                    [OP_MK_THK (Inc (Sz args))
+                     (Add BANE_FAST (Add flag hint))])))))
+          (RECUR
+            ;; self-call: re-materialize self from env slot 0 and emit
+            ;; a verified exact-arity FAST at every level; the strict
+            ;; hint only when signatures are on and the context is
+            ;; eager (a lazy thunk's args are unforced)
+            (weld [OP_PUSH_VAR 0]
+              (weld (cat (map (emitAtom st) args))
+                [OP_MK_THK (Inc (Sz args))
+                 (Add BANE_FAST
+                   (Add flag
+                     (Ifz lawSig 0
+                       (Ifz hintOk 0 (Mul 256 proMask)))))])))
+          (SLOW [fn]
+            (weld (emitAtom st fn)
+              (weld (cat (map (emitAtom st) args))
+                [OP_MK_THK (Inc (Sz args)) (Add BANE_SLOW flag)])))
+          (_ (error "codegenOpt: local call survived to codegen")))
+        (begin
+          (define oppin (? Op op (FAST [val] val) (_ 0)))
+          (define name (_1 (_0 kr)))
+          (define elems (_2 (_0 kr)))
+          (weld (cat (map (emitAtom st) elems))
+            [OP_MK_THK (Sz elems) (Add BANE_PRIM_KNOWN flag) oppin name]))))
+    ;; direct eager call: same classification as emitThkBuild, but the
+    ;; call enters the callee straight from the stack — no thunk cell,
+    ;; no FORCE, no update.  Returns [code], or 0 to fall back to
+    ;; MK_THK+FORCE (the unresolved-PRIM wrapper shape, local calls).
+    ;; OP_CALL_FAST's hint operand is the raw strict mask (not shifted
+    ;; into bane bits — there is no bane word here).
+    (define (emitCallDirect st op args)
+      (define kr (knownRowOf op args))
+      (Ifz kr
+        (? Op op
+          (FAST [val]
+            (If (And (primop-val? val) (Eq 1 (Sz args)))
+              0
+              [(weld [OP_PUSH_LIT val]
+                 (weld (cat (map (emitAtom st) args))
+                   [OP_CALL_FAST (Sz args)
+                    (Ifz lawSig 0 (lawSig val))]))]))
+          (RECUR
+            [(weld [OP_PUSH_VAR 0]
+               (weld (cat (map (emitAtom st) args))
+                 [OP_CALL_FAST (Sz args) (Ifz lawSig 0 proMask)]))])
+          (SLOW [fn]
+            [(weld (emitAtom st fn)
+               (weld (cat (map (emitAtom st) args))
+                 [OP_CALL_SLOW (Sz args)]))])
+          (_ 0))
+        (begin
+          (define oppin (? Op op (FAST [val] val) (_ 0)))
+          (define name (_1 (_0 kr)))
+          (define elems (_2 (_0 kr)))
+          [(weld (cat (map (emitAtom st) elems))
+             [OP_CALL_KNOWN (Sz elems) oppin name])])))
+    (define (bindSlot st key code)
+      [(Inc (_0 st)) (bst-insert key (_0 st) (_1 st)) (weld (_2 st) code)])
+    (define (tailCallOf i s)
+      (Ifz (Eq i (Sub n 2)) 0
+        (? Stmt s
+          (CALL [key op args]
+            (? Op op
+              (LOCAL 0)
+              (_
+                (Ifz (Eq 1 (bst-gut key 0 counts)) 0
+                  (? Stmt (Ix (Inc i) block)
+                    (RET [x]
+                      (? Atom x
+                        (REF (If (Eq (REF.key x) key) [[op args]] 0))
+                        (CNS 0)))
+                    (_ 0))))))
+          (_ 0))))
+    ;; the atom a prologue FORCE statement forces (an env arg ref)
+    (define (proAtomOf j)
+      (? Stmt (Ix j block)
+        (FORCE [key x] x)
+        (_ (error "codegenOpt: prologue index is not a force"))))
+    (define done
+      (foldl
+        (lambda (st i)
+          (If (IsApp i)
+            ;; dual entry: the checked prologue above just forced the
+            ;; strict args into slots 0..k-1; jump it over the fast
+            ;; prologue, which materializes the SAME slots by re-pushing
+            ;; the (caller-forced) args without forcing.  strict_entry
+            ;; points at the first fast push (decoder: after the mask).
+            (begin
+              (define proPushes
+                (map (lambda (j) (emitAtom st (proAtomOf j))) proIdxs))
+              (define fastW (Sz (cat proPushes)))
+              ;; the prologue sits at the start of the top block, which
+              ;; flattens from position 0, so this offset is absolute
+              (define bodyTarget (Add (Sz (_2 st)) (Add 4 fastW)))
+              [(_0 st) (_1 st)
+               (weld (_2 st)
+                 (weld [OP_JMP bodyTarget OP_ENTRY proMask]
+                   (cat proPushes)))])
+            (begin
+              (define s (Ix i block))
+              (define tc (tailCallOf i s))
+              (Ifz tc
+                (? Stmt s
+                  (REC (Ifz i st (error "codegenOpt: REC not in prelude")))
+                  (LET [key rhs]
+                    (? Alloc rhs
+                      (CLOSE [fn args]
+                        (If (bst-has key fusedCloses) st
+                          (bindSlot st key
+                            (weld [OP_PUSH_LIT (CNS.val fn)]
+                              (weld (cat (map (emitAtom st) args))
+                                [OP_MK_APP (Sz args)])))))
+                      (DELAY [body]
+                        (begin
+                          (define shape (delayCallShape (procCode body)))
+                          (Ifz shape (error "codegenOpt: general code thunk")
+                            (bindSlot st key
+                              (emitThkBuild st (_0 (_0 shape))
+                                (_1 (_0 shape)) 0 0)))))))
+                  (FORCE [key x]
+                    (bindSlot st key (weld (emitAtom st x) [OP_FORCE])))
+                  (CALL [key op args]
+                    (begin
+                      (define dc (emitCallDirect st op args))
+                      (bindSlot st key
+                        (Ifz dc
+                          (weld (emitThkBuild st op args
+                                  (If noupd BANE_NOUPD 0) 1)
+                            [OP_FORCE])
+                          (_0 dc)))))
+                  (RET [x]
+                    (begin
+                      (define prevTc
+                        (Ifz i 0 (tailCallOf (Dec i) (Ix (Dec i) block))))
+                      (Ifz prevTc
+                        [(_0 st) (_1 st)
+                         (weld (_2 st) (weld (emitAtom st x) [OP_RET]))]
+                        st)))
+                  (BR [x arms]
+                    [(_0 st) (_1 st)
+                     (weld (_2 st)
+                       (weld (emitAtom st x)
+                         (weld [OP_BR (Sz arms)]
+                           (map
+                             (lambda (kp)
+                               ["ARM"
+                                (emitBlock (procCode (_1 kp))
+                                  [(_0 st) (_1 st) []]
+                                  (gen (Sz (procCode (_1 kp)))
+                                    (lambda (j) j)))])
+                             arms))))])
+                  (_ (error "codegenOpt: unsupported statement")))
+                [(_0 st) (_1 st)
+                 (weld (_2 st)
+                   (weld (emitThkBuild st (_0 (_0 tc)) (_1 (_0 tc)) 0 1)
+                     [OP_RET]))]))))
+        st0
+        emitOrder))
+    (_2 done))
+  (define mainOrder
+    (Ifz proMask (gen (Sz topBlock) (lambda (i) i))
+      (weld proIdxs
+        (cons ["entry"]
+          (filter (lambda (i) (Nil (set-member i proIdxs)))
+            (gen (Sz topBlock) (lambda (i) i)))))))
+  (define items (emitBlock topBlock [0 E []] mainOrder))
+  ;; opcode-aware flatten: ["ARM" ...] markers occupy exactly the BR
+  ;; target slots; arms are appended after the targets, depth-first.
+  (define (flatten its pos)
+    (define m (Sz its))
+    (define (walk i out)
+      (If (Ge i m) out
+        (begin
+          (define op (Ix i its))
+          (cond
+            ((Eq op OP_BR)
+              (begin
+                (define nb (Ix (Inc i) its))
+                (define base (Add pos (Add i (Add 2 nb))))
+                (define armsdone
+                  (foldl
+                    (lambda (acc j)
+                      (begin
+                        (define st2[targets flats at] acc)
+                        (define armits (_1 (Ix (Add i (Add 2 j)) its)))
+                        (define flat (flatten armits at))
+                        [(snoc at targets) (snoc flat flats)
+                         (Add at (Sz flat))]))
+                    [[] [] base]
+                    (gen nb (lambda (j) j))))
+                (weld out
+                  (weld [OP_BR nb]
+                    (weld (_0 armsdone) (cat (_1 armsdone)))))))
+            ((Eq op OP_MK_THK)
+              (walk (Add i (If (Eq 4 (Mod (Ix (Add i 2) its) 8)) 5 3))
+                (weld out
+                  (take (If (Eq 4 (Mod (Ix (Add i 2) its) 8)) 5 3)
+                    (drop i its)))))
+            ((Or (Eq op OP_RET) (Eq op OP_FORCE))
+              (walk (Inc i) (snoc op out)))
+            ((Or (Eq op OP_CALL) (Eq op OP_CALL_FAST))
+              (walk (Add i 3) (weld out (take 3 (drop i its)))))
+            ((Eq op OP_CALL_KNOWN)
+              (walk (Add i 4) (weld out (take 4 (drop i its)))))
+            (else
+              (walk (Add i 2) (weld out (take 2 (drop i its)))))))))
+    (walk 0 []))
+  (flatten items 0))
+
+;; inlinePrimWrappers: a FAST call to a bplan-style wrapper law — one
+;; whose whole body is (0 <oppin> (0 "Name" 1..n)) at matching arity —
+;; IS that primop call.  Rewrite it to the KNOWN shape (an eager CLOSE
+;; row + FAST oppin) so strictify/dethunk can see through the wrapper.
+;; Exact substitution: the wrapper applies the op to its args verbatim.
+(define (wrapperOf v argc)
+  ;; -> [[oppin name]] when v is a primop wrapper law of arity argc
+  (define la (If (IsPin v) (Unpin v) v))
+  (Ifz (IsLaw la) 0
+    (Ifz (Eq argc (Arity la)) 0
+      (begin
+        (define body (Body la))
+        (Ifz (law-call? body) 0
+          (begin
+            (define oppin (law-const (_0 body)))
+            (Ifz (primop-val? oppin) 0
+              (Ifz (law-call? (_1 body)) 0
+                (begin
+                  (define ru (unwind (_1 body) []))
+                  (define nm (law-const (_0 ru)))
+                  (Ifz (And (law-const? (Arity la) (_0 ru)) (IsNat nm)) 0
+                    (If (Equal (_1 ru) (gen argc (lambda (i) (Inc i))))
+                      [[oppin nm]]
+                      0)))))))))))
+
+(define (inlinePrimWrappers p uq)
+  (define (goBlock b uq0)
+    (foldl
+      (lambda (acc s)
+        (begin
+          (define st[uqa out] acc)
+          (define (rewriteCall key op args wrap)
+            ;; -> [uq stmts]: CLOSE row + rewritten call
+            (begin
+              (define rk (Inc uqa))
+              [rk [($LET rk ($CLOSE ($CNS (_1 (_0 wrap))) args))
+                   ($CALL key ($FAST (_0 (_0 wrap))) [($REF rk)])]]))
+          ;; a saturating SLOW call with a constant partial-app head
+          ;; IS the saturated call: ((Add 1) x) == Add 1 x.  Captured
+          ;; args become CNS atoms; FAST arity-verifies at runtime.
+          (define (uncurry op args)
+            (? Op op
+              (SLOW [fn]
+                (? Atom fn
+                  (CNS [val]
+                    (Ifz (IsApp val) [op args]
+                      (If (Eq (planArity val) (Sz args))
+                        [($FAST (Hd val))
+                         (weld (gen (Sz val) (lambda (i) ($CNS (Ix i val))))
+                           args)]
+                        [op args])))
+                  (_ [op args])))
+              (_ [op args])))
+          (define (callWrap op args)
+            (? Op op
+              (FAST [val]
+                (If (primop-val? val) 0 (wrapperOf val (Sz args))))
+              (_ 0)))
+          (? Stmt s
+            (CALL [key op args]
+              (begin
+                (define ua (uncurry op args))
+                (define op2 (_0 ua))
+                (define args2 (_1 ua))
+                (define w (callWrap op2 args2))
+                (Ifz w
+                  (If (Equal ua [op args])
+                    [uqa (snoc s out)]
+                    [uqa (snoc ($CALL key op2 args2) out)])
+                  (begin
+                    (define r[uqb stmts] (rewriteCall key op2 args2 w))
+                    [uqb (weld out stmts)]))))
+            (LET [key rhs]
+              (? Alloc rhs
+                (DELAY [body]
+                  (begin
+                    (define shape (delayCallShape (procCode body)))
+                    (Ifz shape [uqa (snoc s out)]
+                      (begin
+                        (define ua2 (uncurry (_0 (_0 shape)) (_1 (_0 shape))))
+                        (define cop (_0 ua2))
+                        (define cargs (_1 ua2))
+                        (define w (callWrap cop cargs))
+                        (Ifz w
+                          (If (Equal ua2 [(_0 (_0 shape)) (_1 (_0 shape))])
+                            [uqa (snoc s out)]
+                            (begin
+                              (define k3 (Inc uqa))
+                              [k3 (snoc
+                                    ($LET key ($DELAY
+                                      (mkProc []
+                                        [($CALL k3 cop cargs)
+                                         ($RET ($REF k3))])))
+                                    out)]))
+                          (begin
+                            ;; hoist the CLOSE into this block; the
+                            ;; delay body becomes the KNOWN call
+                            (define rk (Inc uqa))
+                            (define k2 (Inc rk))
+                            (define body2
+                              (mkProc []
+                                [($CALL k2 ($FAST (_0 (_0 w))) [($REF rk)])
+                                 ($RET ($REF k2))]))
+                            [k2 (weld out
+                                  [($LET rk ($CLOSE ($CNS (_1 (_0 w))) cargs))
+                                   ($LET key ($DELAY body2))])]))))))
+                (CLOSE [uqa (snoc s out)])))
+            (PROC [key body]
+              (begin
+                (define r[uqb code2] (goBlock (procCode body) uqa))
+                [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+            (_ [uqa (snoc s out)]))))
+      [uq0 []]
+      b))
+  (define r[uq2 code2] (goBlock (procCode p) uq))
+  [uq2 (mkProc (procArgs p) code2)])
+
+;; Signature memoization: every distinct non-primop FAST head in a
+;; proc is a callee whose signature the pipeline will ask for — at
+;; every call site, in every round.  Collect them once, sig each once,
+;; and serve lookups from the table.  Values are identical to calling
+;; sigOfLaw directly (pure refactor of evaluation strategy), so
+;; emitted code — and the persistent code cache keyed on it — is
+;; byte-for-byte unchanged.
+
+;; distinct non-primop FAST head values anywhere in the proc
+(define (fastHeads p)
+  (define (goBlock acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args]
+            (? Op op
+              (FAST [val]
+                (If (primop-val? val) a
+                  (If (any (lambda (h) (Equal h val)) a) a
+                    (snoc val a))))
+              (_ a)))
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body] (goBlock a (procCode body)))
+              (CLOSE a)))
+          (PROC [key body] (goBlock a (procCode body)))
+          (REC [binds]
+            (foldl
+              (lambda (a2 kv)
+                (? Alloc (_1 kv)
+                  (DELAY [body] (goBlock a2 (procCode body)))
+                  (CLOSE a2)))
+              a binds))
+          (BR [x arms]
+            (foldl (lambda (a2 kp) (goBlock a2 (procCode (_1 kp)))) a arms))
+          (_ a)))
+      acc b))
+  (goBlock [] (procCode p)))
+
+;; table = row of [head sig]; heads compare by Equal (pins by hash)
+(define (sigTableAdd sigf table heads)
+  (foldl
+    (lambda (tb h)
+      (If (any (lambda (e) (Equal (_0 e) h)) tb) tb
+        (snoc [h (sigf h)] tb)))
+    table heads))
+
+(define (sigLookup table)
+  (lambda (v)
+    (foldl (lambda (acc e) (If (Equal (_0 e) v) (_1 e) acc)) 0 table)))
+
+;; sigOfLaw: the strictness signature a law's own compilation will
+;; expose (mask over args 1..arity), computed from the callee's body
+;; with the prim-level pipeline only (no law-sig recursion, so cycles
+;; and self-calls terminate).  Both caller and callee compute this
+;; independently; the runtime entry gate compares the two, so drift
+;; only costs the fast entry, never correctness.
+(define (sigOfLawB budget v)
+  (define attempt
+    (Try
+      (lambda (z)
+        (begin
+          (define la (If (IsPin v) (Unpin v) v))
+          (Ifz (And (IsLaw la) (Le (Arity la) 16)) 0
+            (begin
+              (define ri[depth p0i] (ingestLawOpt v))
+              (define p (recurLower p0i))
+              ;; transitive law-to-law strictness: known law calls in
+              ;; the pipeline see their callees' signatures, computed
+              ;; with one budget tick less — budget 0 is the prim-only
+              ;; base case, so mutual recursion terminates and every
+              ;; top-level sigOfLaw call is the same deterministic
+              ;; function of the law alone (callers and callees agree).
+              (define lawSigB (Ifz budget 0 (sigOfLawB (Dec budget))))
+              ;; the sig table threads through the rounds: each
+              ;; distinct callee head is sig'd once per sigOfLawB
+              ;; call, not once per site per round
+              (define (round5 tb0 p0 uq0)
+                (define r0[uqw pw] (inlinePrimWrappers p0 uq0))
+                (define tb
+                  (Ifz budget 0
+                    (sigTableAdd lawSigB tb0 (fastHeads pw))))
+                (define r1[uq1 p1]
+                  (strictify (Ifz budget 0 (sigLookup tb))
+                    0 0 depth pw uqw))
+                (define p2 (reforce p1))
+                (define rd[dethunked p3] (dethunkOpt p2))
+                (define r2[uq2 p4] (inlineSingleUseProcs p3 uq1))
+                [uq2 dethunked (deadCodeElim p4) tb])
+              (define (go i tb p0 uq0)
+                (Ifz i p0
+                  (begin
+                    (define rr[uq1 dethunked p1 tb1] (round5 tb p0 uq0))
+                    (Ifz dethunked p1 (go (Dec i) tb1 p1 uq1)))))
+              (define ps (go 8 [] p (bstMaxKey (refcounts p))))
+              (_0 (strictPrologue (Arity la) (procCode ps)))))))
+      0))
+  (If (Hd attempt) 0 (_0 attempt)))
+
+;; the signature every caller and callee computes: one transitive tick
+;; (callees are seen at their prim-only signatures)
+(define (sigOfLaw v) (sigOfLawB 1 v))
+
+;; The pipeline levels.  Each returns a full compiler (law -> code
+;; row); any error in the optimizing path falls the law back to the
+;; byte-identical dumb pipeline.
+(define (optPasses level selfSig depth p uq)
+  ;; -> proc' ; level: 1 = tail-eager only, 2 = +strictify+reforce,
+  ;; 3/4 = +dethunk+inline+DCE, 5 = fixed point.
+  (define (round p0 uq0)
+    (define r0[uqw pw] (inlinePrimWrappers p0 uq0))
+    (define r1[uq1 p1] (strictify 0 0 0 depth pw uqw))
+    ;; the BR trio is cheap structural rewriting and needs no
+    ;; signatures — it activates at level 5, giving a realtime tier
+    ;; (P5) with branch-eager code but no sig cascade and no checked
+    ;; prologues; level 6 adds the signature machinery on top
+    (define rbl[uqb p1b]
+      (Ifz (Ge level 5) [uq1 p1] (brLower p1 uq1)))
+    (define p1s (Ifz (Ge level 5) p1b (brSink p1b)))
+    (define p1r (reforce p1s))
+    ;; after reforce: strictify's transient FORCE aliases are gone, so
+    ;; the Truth/Nil chain's producers are visible again
+    (define p2 (Ifz (Ge level 5) p1r (brCondClean p1r)))
+    (define rd[dethunked p3] (dethunkOpt p2))
+    (define r2[uq2 p4] (inlineSingleUseProcs p3 uqb))
+    [uq2 dethunked (deadCodeElim p4)])
+  (cond
+    ((Eq level 1) p)
+    ((Eq level 2)
+      (begin
+        (define r0[uqw pw] (inlinePrimWrappers p uq))
+        (define r[uq1 p1] (strictify 0 depth pw uqw))
+        (reforce p1)))
+    ((Le level 4) (_2 (round p uq)))
+    (else
+      ;; iterate while dethunk keeps converting (each continuing round
+      ;; strictly decreases the thunk count, so this terminates); no
+      ;; deep Equal needed for convergence.  Level 6 then runs ONE
+      ;; final strictify with law signatures: keeping it out of the
+      ;; fixed point keeps sigOfLaw (the prim-only pipeline) the single
+      ;; source of truth both sides compute.
+      (begin
+        (define (go i p0 uq0)
+          (Ifz i p0
+            (begin
+              (define r[uq1 dethunked p1] (round p0 uq0))
+              ;; BR-era rewrites (uncurry, wrapper-inline, BR) can
+              ;; enable next-round work without dethunking anything
+              ;; this round: fall back to deep-Equal convergence there
+              ;; level 5 (the realtime tier) converges on the dethunk
+              ;; dirty flag alone: BR-only rounds don't retrigger, so
+              ;; compile cost stays near P4; level 6 keeps deep-Equal
+              ;; convergence for maximal cascades
+              (define continue
+                (Or dethunked
+                  (And (Ge level 6) (Nil (Equal p1 p0)))))
+              (Ifz continue p1 (go (Dec i) p1 uq1)))))
+        (define pf (go 8 p uq))
+        (Ifz (Ge level 6) pf
+          ;; the law pass inserts forces the fixed point never saw
+          ;; (self-call args in particular), so run one round-tail
+          ;; behind it: reforce cleans redundant forces, dethunk
+          ;; converts the newly-forced thunks, inline+DCE clean up
+          (begin
+            (define finalSig
+              (sigLookup (sigTableAdd sigOfLaw [] (fastHeads pf))))
+            (define rf[uqf pf1]
+              (strictify finalSig selfSig
+                (Dec (Sz (procArgs pf))) depth pf
+                (bstMaxKey (refcounts pf))))
+            (define pr (brCondClean (reforce pf1)))
+            (define rd[dethunked pd] (dethunkOpt pr))
+            (define ri[uqi pi] (inlineSingleUseProcs pd uqf))
+            (deadCodeElim pi)))))))
+
+(define (compileOptLevel level noupd l)
+  (define attempt
+    (Try
+      (lambda (z)
+        (begin
+          (define r[depth p0] (ingestLawOpt l))
+          (define p (recurLower p0))
+          (define maxk (bstMaxKey (refcounts p)))
+          (define selfSig (If (Ge level 6) (sigOfLaw l) 0))
+          (define p2 (optPasses level selfSig depth p maxk))
+          (codegenOpt
+            (If (Ge level 6)
+              (sigLookup (sigTableAdd sigOfLaw [] (fastHeads p2)))
+              0)
+            selfSig noupd depth p2)))
+      0))
+  (If (Hd attempt)
+    (codegenLaw l) ;; anything unlowerable: byte-identical dumb output
+    (_0 attempt)))
+
+;; The per-level compilers for benchmarking.
+(define (compileP1 l) (compileOptLevel 1 0 l))
+(define (compileP2 l) (compileOptLevel 2 0 l))
+(define (compileP3 l) (compileOptLevel 3 0 l))
+(define (compileP4 l) (compileOptLevel 4 1 l))
+(define (compileP5 l) (compileOptLevel 5 1 l))
+(define (compileP6 l) (compileOptLevel 6 1 l))

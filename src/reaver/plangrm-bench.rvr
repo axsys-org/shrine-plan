@@ -1,0 +1,107 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#import bst)
+(#bind plangrm (#module plangrm))
+(#import plangrm)
+
+;;; S4 benchmark harness.  bench-main [level workload iters] installs
+;;; the selected pipeline level's compiler (which recompiles every
+;;; interned law via the Install sweep), runs the workload, and checks
+;;; its checksum — a built-in correctness gate for every measurement.
+
+(define (nfib n)
+  (If (Lt n 2) 1
+    (Add 1 (Add (nfib (Sub n 1)) (nfib (Sub n 2))))))
+
+(define (lbuild n acc) (Ifz n acc (lbuild (Dec n) [n acc])))
+(define (bsuml l acc) (Ifz l acc (bsuml (_1 l) (Add acc (_0 l)))))
+(define (listwork n) (bsuml (lbuild n 0) 0))
+
+(define (rowwork n) (sum (map (Add 1) (gen n (lambda (i) i)))))
+
+;;; "Complicated" workloads: higher-order stdlib code and the compiler
+;;; itself, exercising deep first-order call chains, bst/list churn,
+;;; and Try/closures — much closer to real module code than the loops
+;;; above.
+
+;; sort a pseudo-random row and checksum it
+(define (scramble i) (Mod (Mul (Inc i) 2654435761) 65521))
+(define (sortwork n)
+  (sum (sort Cmp (gen n scramble))))
+
+;; build a bst under key collisions, then probe every key
+(define (bstwork n)
+  (define t
+    (foldl (lambda (t2 i) (bst-insert (Mod (Mul (Inc i) 40503) 9973) i t2))
+      0 (gen n (lambda (i) i))))
+  (foldl
+    (lambda (acc i) (Add acc (bst-gut (Mod (Mul (Inc i) 40503) 9973) 0 t)))
+    0 (gen n (lambda (i) i))))
+
+;; the compiler compiling: full P4 pipeline over the nfib law
+(define (compwork z) (Add z (Sz (compileP4 nfib))))
+
+;; name -> [fn arg expected]
+(define workloads
+  (bst-from-pairs-list
+    ~[["nfib" [nfib 24 150049]]
+      ["listwork" [listwork 300000 45000150000]]
+      ["rowwork" [rowwork 150000 11250075000]]
+      ["sortwork" [sortwork 20000 655980053]]
+      ["bstwork" [bstwork 20000 300527813]]
+      ["compwork" [compwork 0 70]]]))
+
+(define compilers
+  (bst-from-pairs-list
+    ~[["p1" compileP1] ["p2" compileP2] ["p3" compileP3]
+      ["p4" compileP4] ["p5" compileP5] ["p6" compileP6]]))
+
+;; decimal string of a nat — big nats otherwise print as byte-strings
+;; ("H/3#" for 590753608), a recurring parse trap in bench pipelines
+(define (dec-nat n)
+  (define (go n acc)
+    (Ifz n acc (go (Div n 10) (Add (Add 48 (Mod n 10)) (Lsh acc 8)))))
+  (Ifz n "0" (go n 0)))
+
+(define (bench-main args)
+  (define level (_0 args))
+  (define which (_1 args))
+  (define iters (parse-nat (_2 args)))
+  (define chit (bst-search level compilers))
+  (define installed
+    (Ifz chit "ship"
+      (begin
+        ;; compileP* are already pins (define pins functions)
+        (define p (_0 chit))
+        (Seq (Save p)
+          (Seq (Install p) level)))))
+  ;; intern the workload laws AFTER install: put_code compiles each
+  ;; law at intern time with the compiler now in force.  Without this
+  ;; the workload fns are never canonicalized (only laws reachable
+  ;; from the installed compiler get swept) and run INTERPRETED.
+  (define saved
+    (Seq installed
+      (Seq (Save nfib)
+        (Seq (Save listwork)
+          (Seq (Save rowwork)
+            (Seq (Save sortwork)
+              (Seq (Save bstwork) (Save compwork))))))))
+  (Seq saved
+    (begin
+      (define whit (bst-search which workloads))
+      (Ifz whit (print ["BENCH-SETUP-ONLY" installed])
+        (begin
+          (define w (_0 whit))
+          (define (loop i acc)
+            (Ifz i acc (loop (Dec i) (Add acc ((_0 w) (_1 w))))))
+          (define t0 (Now 0))
+          (define got (Seq t0 (loop iters 0)))
+          (define t1 (Seq got (Now 0)))
+          (define want (Mul iters (_2 w)))
+          (If (Eq got want)
+            (Seq (print ["BENCH-NS" installed which (dec-nat (Sub t1 t0))])
+              (print ["BENCH-OK" installed which got]))
+            (error ["BENCH-MISMATCH" installed which got want])))))))

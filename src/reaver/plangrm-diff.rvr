@@ -1,0 +1,118 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#import bst)
+(#bind plangrm (#module plangrm))
+(#import plangrm)
+
+;;; S3 corpus differential for the PlanGrm pipeline.
+;;;
+;;; runDiff takes the SHIPPED compiler (the boot world's `compile`,
+;;; passed in from a .plan bridge -- see reaver/src/plan/plangrm-diff.plan)
+;;; and compares its bytecode output against plangrm's
+;;; ingest+codegen pipeline for every law reachable from a seed set of
+;;; real module functions.  The gate is byte-for-byte row equality.
+
+;; Walk values reachable from the seeds, collecting law pins and raw
+;; laws.  Dedup via a cmp-total bst keyed by the value itself.
+(define (corpus seeds)
+  (define (walk v st)
+    (define seen (_0 st))
+    (define laws (_1 st))
+    (cond
+      ((IsNat v) st)
+      ((bst-has v seen) st)
+      ((IsPin v)
+        (begin
+          (define st1 [(bst-insert v 1 seen) laws])
+          (define inner (Unpin v))
+          (If (IsLaw inner)
+            (walk (Body inner) [(_0 st1) [v (_1 st1)]])
+            (walk inner st1))))
+      ((IsLaw v)
+        (walk (Body v) [(bst-insert v 1 seen) [v laws]]))
+      ((IsApp v)
+        (begin
+          (define st1 [(bst-insert v 1 seen) laws])
+          (foldl (lambda (st2 i) (walk (Ix i v) st2))
+            (walk (Hd v) st1)
+            (gen (Sz v) (lambda (i) i)))))
+      (else st)))
+  (_1 (foldl (lambda (st s) (walk s st)) [E NIL] seeds)))
+
+;; A default seed set: real functions from every imported module plus
+;; the plangrm passes themselves (rich in shapes: primop wrappers,
+;; higher-order calls, partial applications, letrec preludes).
+(define default-seeds
+  [map foldr foldl filter sort uniq cat weld cons stream lzip
+   bst-insert bst-search bst-ltap cmp-total find-idx gen
+   optimize reforce reschedule dethunk lowerPureBinds deadCodeElim
+   inlineSingleUseProcs occurs mkProc freeVars refcounts subst
+   ingestLaw codegenLaw planArity])
+
+;; Decode a flat code row and histogram the MK_THK banes plus MK_APP
+;; uses, so the summary proves the corpus exercises every emission path.
+;; Layout mirrors the shipped compiler: PUSH_VAR/PUSH_LIT/MK_APP take
+;; one operand, MK_THK takes argc+bane (+op+name when bane is KNOWN),
+;; RET takes none.
+(define (bane-histogram code acc)
+  (define (go i acc2)
+    (If (Ge i (Sz code)) acc2
+      (begin
+        (define op (Ix i code))
+        (cond
+          ((Eq op OP_MK_THK)
+            (begin
+              (define bane (Ix (Add i 2) code))
+              (go (Add i (If (Eq bane BANE_PRIM_KNOWN) 5 3))
+                (bst-ups bane 0 Inc acc2))))
+          ((Eq op OP_RET) (go (Inc i) acc2))
+          ((Eq op OP_MK_APP) (go (Add i 2) (bst-ups "mkapp" 0 Inc acc2)))
+          (else (go (Add i 2) acc2))))))
+  (go 0 acc))
+
+;; The real corpus exercises FAST/SLOW/KNOWN heavily but the shipped
+;; compiler's plain-PRIM and row-expr (MK_APP) paths are nearly dead in
+;; real code; force them with synthetic laws so the gate covers every
+;; emission path.  (0 <oppin> var) hits generic PRIM; a call whose row
+;; head is a non-nat arity-0 constant hits the MK_APP row build.
+(define synthetic-laws
+  (begin
+    (define oppin (Pin "B"))
+    ~[(Law 1 "syn-prim-var" [oppin 1])
+      (Law 1 "syn-prim-row" [oppin [[[5 6]] 1]])
+      (Law 2 "syn-slow-var" [[1 2] 2])
+      (Law 1 "syn-quote" [[77]])]))
+
+;; runDiff :: (Law -> CodeRow) -> [total mismatches-list]
+;; Prints a summary; returns the mismatch list (law values).
+(define (runDiff compileFn)
+  (define laws (lweld synthetic-laws (corpus default-seeds)))
+  (define total (llen laws))
+  (define histogram
+    (lfoldl (lambda (acc l) (bane-histogram (compileFn l) acc)) E laws))
+  (print ["bane-histogram (fast/slow/prim/known/mkapp)"
+          (bst-gut BANE_FAST 0 histogram)
+          (bst-gut BANE_SLOW 0 histogram)
+          (bst-gut BANE_PRIM 0 histogram)
+          (bst-gut BANE_PRIM_KNOWN 0 histogram)
+          (bst-gut "mkapp" 0 histogram)])
+  (define mismatches
+    (lfilter
+      (lambda (l)
+        (Nil (Equal (compileFn l) (codegenLaw l))))
+      laws))
+  (define bad (llen mismatches))
+  (print ["plangrm-diff" "laws" total "mismatches" bad])
+  (foreach
+    (lambda (l)
+      (print ["MISMATCH" (Name (If (IsPin l) (Unpin l) l))
+              "theirs" (compileFn l)
+              "mine" (codegenLaw l)]))
+    (ltake 3 mismatches))
+  (If (Nil bad)
+    (print "plangrm-diff: all laws byte-identical")
+    (print ["plangrm-diff: MISMATCHES" bad]))
+  [total mismatches])

@@ -1,0 +1,674 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind plangrm (#module plangrm))
+(#import plangrm)
+
+;;; Tests for the PlanGrm optimizer, ported from plangrm.hs.  Each
+;;; test_* mirrors the prototype test of the same name.
+
+;; testcase nm f inp expected — 1 on match; traces details on failure.
+(define (testcase nm f inp expected)
+  (define result (f inp))
+  (If (Equal result expected) 1
+    (Trace ["FAIL" nm "input" inp "expected" expected "output" result] 0)))
+
+;; fors k x = FORCE k (REF x)
+(define (fors k v) ($FORCE k ($REF v)))
+
+;; thunk k b = LET k (DELAY (mkProc [] b))
+(define (thunk k b) ($LET k ($DELAY (mkProc [] b))))
+
+;; mkbr a bs = BR a [(k, blockProc b) | (k, b) <- bs]
+(define (mkbr a bs)
+  ($BR a (map (lambda (kb) [(_0 kb) (blockProc (_1 kb))]) bs)))
+
+
+;;; reforce ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define test_no_alias_chains
+  (testcase "test_no_alias_chains" reforce
+    (blockProc [(fors 1 0) (fors 2 1) (fors 3 2) ($RET ($REF 3))])
+    (blockProc [(fors 1 0) ($RET ($REF 1))])))
+assert(test_no_alias_chains)
+
+
+;;; dethunk ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define dethunk-thunk-proc (blockProc [($RET ($CNS 42))]))
+
+(define test_dethunk_simple
+  (testcase "test_dethunk_simple" dethunk
+    (blockProc
+      [($LET 1 ($DELAY dethunk-thunk-proc))
+       (fors 2 1)
+       ($RET ($REF 2))])
+    (blockProc
+      [($PROC 1 dethunk-thunk-proc)
+       ($CALL 2 ($LOCAL 1) [])
+       ($RET ($REF 2))])))
+assert(test_dethunk_simple)
+
+
+;;; computePureMoves / tryPureMoves ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define test_move_into_thunk
+  (Equal [[1 2]]
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (thunk 2 [($RET ($REF 1))])
+         ($RET ($CNS 42))]))))
+assert(test_move_into_thunk)
+
+(define test_not_moved_if_used_directly
+  (Nil
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (fors 2 1)
+         (thunk 3 [($RET ($REF 1))])
+         ($RET ($REF 2))]))))
+assert(test_not_moved_if_used_directly)
+
+(define test_not_moved_if_multiple_children
+  (Nil
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (mkbr ($CNS 0)
+           [[2 [($RET ($REF 1))]]
+            [3 [($RET ($REF 1))]]])]))))
+assert(test_not_moved_if_multiple_children)
+
+(define test_letrec_moves_as_group
+  (Equal [[1 3]]
+    (tryPureMoves
+      (blockProc
+        [($REC [[1 ($CLOSE ($REF 2) [])] [2 ($CLOSE ($REF 1) [])]])
+         (thunk 3 [($RET ($REF 2))])
+         ($RET ($CNS 0))]))))
+assert(test_letrec_moves_as_group)
+
+(define test_letrec_blocked_by_secondary_direct_use
+  (Nil
+    (tryPureMoves
+      (blockProc
+        [($REC [[1 ($CLOSE ($REF 2) [])] [2 ($CLOSE ($REF 1) [])]])
+         (fors 3 2)
+         (thunk 4 [($RET ($REF 1))])
+         ($RET ($REF 3))]))))
+assert(test_letrec_blocked_by_secondary_direct_use)
+
+(define test_move_multiple_pure_into_thunk
+  (Equal [[1 3] [2 3]]
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 10) []))
+         ($LET 2 ($CLOSE ($CNS 20) []))
+         (thunk 3
+           [($CALL 4 $ADD [($REF 1) ($REF 2)])
+            ($RET ($REF 4))])
+         ($RET ($CNS 0))]))))
+assert(test_move_multiple_pure_into_thunk)
+
+(define test_move_thunk_into_branch
+  (Equal [[1 2]]
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (mkbr ($CNS 1)
+           [[2 [($RET ($REF 1))]]
+            [3 [($RET ($CNS 0))]]])]))))
+assert(test_move_thunk_into_branch)
+
+(define test_not_moved_if_used_in_branch_cond
+  (Nil
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (mkbr ($REF 1)
+           [[2 [($RET ($CNS 1))]]
+            [3 [($RET ($CNS 0))]]])]))))
+assert(test_not_moved_if_used_in_branch_cond)
+
+(define test_move_proc_into_thunk
+  (Equal [[1 2]]
+    (tryPureMoves
+      (mkProc []
+        [($PROC 1 (mkProc [] [($RET ($CNS 99))]))
+         (thunk 2 [($CALL 3 ($LOCAL 1) []) ($RET ($REF 3))])
+         ($RET ($CNS 0))]))))
+assert(test_move_proc_into_thunk)
+
+(define test_move_proc_into_branch
+  (Equal [[1 2]]
+    (tryPureMoves
+      (mkProc []
+        [($PROC 1 (mkProc [] [($RET ($CNS 7))]))
+         (mkbr ($CNS 0)
+           [[2 [($CALL 3 ($LOCAL 1) []) ($RET ($REF 3))]]
+            [3 [($RET ($CNS 0))]]])]))))
+assert(test_move_proc_into_branch)
+
+(define test_proc_not_moved_if_called_directly
+  (Nil
+    (tryPureMoves
+      (mkProc []
+        [($PROC 1 (mkProc [] [($RET ($CNS 7))]))
+         ($CALL 2 ($LOCAL 1) [])
+         (thunk 3 [($CALL 4 ($LOCAL 1) []) ($RET ($REF 4))])
+         ($RET ($REF 2))]))))
+assert(test_proc_not_moved_if_called_directly)
+
+(define test_not_moved_if_thunk_and_branch_both_reference
+  (Nil
+    (tryPureMoves
+      (mkProc []
+        [($LET 1 ($CLOSE ($CNS 0) []))
+         (thunk 2 [($RET ($REF 1))])
+         (mkbr ($CNS 0)
+           [[3 [($RET ($REF 1))]]])]))))
+assert(test_not_moved_if_thunk_and_branch_both_reference)
+
+
+;;; lowerPureBinds ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define test_letrec_group_sinks_once
+  (testcase "test_letrec_group_sinks_once" lowerPureBinds
+    (mkProc []
+      [($REC [[1 ($CLOSE ($REF 2) [])] [2 ($CLOSE ($REF 1) [])]])
+       (thunk 3 [($RET ($REF 2))])
+       ($RET ($CNS 0))])
+    (mkProc []
+      [(thunk 3
+         [($REC [[1 ($CLOSE ($REF 2) [])] [2 ($CLOSE ($REF 1) [])]])
+          ($RET ($REF 2))])
+       ($RET ($CNS 0))])))
+assert(test_letrec_group_sinks_once)
+
+(define test_move_into_branch_only_once
+  (testcase "test_move_into_branch_only_once" lowerPureBinds
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 7) []))
+       (mkbr ($CNS 0)
+         [[2 [($RET ($REF 1))]]
+          [3 [($RET ($CNS 0))]]])])
+    (mkProc []
+      [(mkbr ($CNS 0)
+         [[2 [($LET 1 ($CLOSE ($CNS 7) [])) ($RET ($REF 1))]]
+          [3 [($RET ($CNS 0))]]])])))
+assert(test_move_into_branch_only_once)
+
+(define fixed-point-proc
+  (mkProc []
+    [($LET 1 ($CLOSE ($CNS 0) []))
+     (thunk 2 [($RET ($REF 1))])
+     ($CALL 3 $ADD [($REF 1) ($CNS 1)])
+     ($RET ($REF 3))]))
+
+(define test_fixed_point_blocks_on_direct_use
+  (testcase "test_fixed_point_blocks_on_direct_use" lowerPureBinds
+    fixed-point-proc
+    fixed-point-proc))
+assert(test_fixed_point_blocks_on_direct_use)
+
+(define test_cascading_moves
+  (testcase "test_cascading_moves" lowerPureBinds
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 0) []))
+       (thunk 2 [($RET ($REF 1))])
+       (thunk 3 [($RET ($REF 2))])
+       ($RET ($CNS 99))])
+    (mkProc []
+      [(thunk 3
+         [(thunk 2
+            [($LET 1 ($CLOSE ($CNS 0) []))
+             ($RET ($REF 1))])
+          ($RET ($REF 2))])
+       ($RET ($CNS 99))])))
+assert(test_cascading_moves)
+
+(define test_recursive_move_inside_thunk
+  (testcase "test_recursive_move_inside_thunk" lowerPureBinds
+    (mkProc []
+      [(thunk 1
+         [($LET 2 ($CLOSE ($CNS 0) []))
+          (thunk 3 [($RET ($REF 2))])
+          ($RET ($CNS 99))])
+       ($RET ($CNS 0))])
+    (mkProc []
+      [(thunk 1
+         [(thunk 3
+            [($LET 2 ($CLOSE ($CNS 0) []))
+             ($RET ($REF 2))])
+          ($RET ($CNS 99))])
+       ($RET ($CNS 0))])))
+assert(test_recursive_move_inside_thunk)
+
+(define test_recursive_move_inside_branch
+  (testcase "test_recursive_move_inside_branch" lowerPureBinds
+    (mkProc []
+      [(mkbr ($CNS 0)
+         [[1 [($LET 2 ($CLOSE ($CNS 7) []))
+              (thunk 3 [($RET ($REF 2))])
+              ($RET ($CNS 1))]]
+          [4 [($RET ($CNS 2))]]])])
+    (mkProc []
+      [(mkbr ($CNS 0)
+         [[1 [(thunk 3
+                [($LET 2 ($CLOSE ($CNS 7) []))
+                 ($RET ($REF 2))])
+              ($RET ($CNS 1))]]
+          [4 [($RET ($CNS 2))]]])])))
+assert(test_recursive_move_inside_branch)
+
+(define test_recursive_cascade
+  (testcase "test_recursive_cascade" lowerPureBinds
+    (mkProc []
+      [(thunk 1
+         [($LET 2 ($CLOSE ($CNS 0) []))
+          (thunk 3
+            [(thunk 4 [($RET ($REF 2))])
+             ($RET ($CNS 10))])
+          ($RET ($CNS 20))])])
+    (mkProc []
+      [(thunk 1
+         [(thunk 3
+            [(thunk 4
+               [($LET 2 ($CLOSE ($CNS 0) []))
+                ($RET ($REF 2))])
+             ($RET ($CNS 10))])
+          ($RET ($CNS 20))])])))
+assert(test_recursive_cascade)
+
+(define recursive-blocked-proc
+  (mkProc []
+    [(thunk 1
+       [($LET 2 ($CLOSE ($CNS 0) []))
+        (fors 3 2)
+        (thunk 4 [($RET ($REF 2))])
+        ($RET ($REF 3))])]))
+
+(define test_recursive_blocked_by_direct_use
+  (testcase "test_recursive_blocked_by_direct_use" lowerPureBinds
+    recursive-blocked-proc
+    recursive-blocked-proc))
+assert(test_recursive_blocked_by_direct_use)
+
+(define test_recursive_letrec_inside_thunk
+  (testcase "test_recursive_letrec_inside_thunk" lowerPureBinds
+    (mkProc []
+      [(thunk 1
+         [($REC [[2 ($CLOSE ($REF 3) [])] [3 ($CLOSE ($REF 2) [])]])
+          (thunk 4 [($RET ($REF 2))])
+          ($RET ($CNS 0))])])
+    (mkProc []
+      [(thunk 1
+         [(thunk 4
+            [($REC [[2 ($CLOSE ($REF 3) [])] [3 ($CLOSE ($REF 2) [])]])
+             ($RET ($REF 2))])
+          ($RET ($CNS 0))])])))
+assert(test_recursive_letrec_inside_thunk)
+
+
+;;; optimize pipelines ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define test_slide_dethunk_inline_chain
+  (testcase "test_slide_dethunk_inline_chain" optimize
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 10) []))
+       (thunk 2
+         [($CALL 3 $ADD [($REF 1) ($CNS 1)])
+          ($RET ($REF 3))])
+       (thunk 4
+         [(fors 5 2)
+          ($CALL 6 $ADD [($REF 5) ($CNS 2)])
+          ($RET ($REF 6))])
+       ($FORCE 7 ($REF 4))
+       ($RET ($REF 7))])
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 10) []))
+       ($CALL 3 $ADD [($REF 1) ($CNS 1)])
+       ($CALL 6 $ADD [($REF 3) ($CNS 2)])
+       ($RET ($REF 6))])))
+assert(test_slide_dethunk_inline_chain)
+
+(define test_branch_slide_dethunk_inline
+  (testcase "test_branch_slide_dethunk_inline" optimize
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 7) []))
+       (thunk 2
+         [($CALL 3 $ADD [($REF 1) ($CNS 1)])
+          ($RET ($REF 3))])
+       (mkbr ($CNS 0)
+         [[4 [(fors 5 2) ($RET ($REF 5))]]
+          [6 [($RET ($CNS 99))]]])])
+    (mkProc []
+      [(mkbr ($CNS 0)
+         [[4 [($LET 1 ($CLOSE ($CNS 7) []))
+              ($CALL 3 $ADD [($REF 1) ($CNS 1)])
+              ($RET ($REF 3))]]
+          [6 [($RET ($CNS 99))]]])])))
+assert(test_branch_slide_dethunk_inline)
+
+(define test_multi_stage_cascade
+  (testcase "test_multi_stage_cascade" optimize
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 1) []))
+       ($LET 2 ($DELAY
+          (mkProc []
+            [($CALL 3 $ADD [($REF 1) ($CNS 2)])
+             ($RET ($REF 3))])))
+       ($LET 4 ($DELAY
+          (mkProc []
+            [($FORCE 5 ($REF 2))
+             ($CALL 6 $ADD [($REF 5) ($CNS 3)])
+             ($RET ($REF 6))])))
+       ($LET 7 ($DELAY
+          (mkProc []
+            [($FORCE 8 ($REF 4))
+             ($CALL 9 $ADD [($REF 8) ($CNS 4)])
+             ($RET ($REF 9))])))
+       ($FORCE 10 ($REF 7))
+       ($RET ($REF 10))])
+    (mkProc []
+      [($LET 1 ($CLOSE ($CNS 1) []))
+       ($CALL 3 $ADD [($REF 1) ($CNS 2)])
+       ($CALL 6 $ADD [($REF 3) ($CNS 3)])
+       ($CALL 9 $ADD [($REF 6) ($CNS 4)])
+       ($RET ($REF 9))])))
+assert(test_multi_stage_cascade)
+
+(define shared-thunk-proc
+  (mkProc []
+    [(thunk 1
+       [($CALL 2 $ADD [($CNS 1) ($CNS 2)])
+        ($RET ($REF 2))])
+     (fors 3 1)
+     (fors 4 1)
+     ($CALL 5 $ADD [($REF 3) ($REF 4)])
+     ($RET ($REF 5))]))
+
+;; test_no_inline_when_shared is defined in the prototype but NOT
+;; included in its test_results list: reforce legitimately collapses
+;; the second force of the shared thunk through the alias map (the
+;; sharing is preserved via the first force's WHNF binding).  Kept as a
+;; definition for parity; forced but not compared.
+(define test_no_inline_when_shared
+  (optimize shared-thunk-proc))
+assert(Truth (Sz (procCode test_no_inline_when_shared)))
+
+
+;;; reschedule ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (reschedule-case nm inp out)
+  (testcase nm reschedule (mkProc [] inp) (mkProc [] out)))
+
+(define tests_reschedule_allocations
+  (And
+    (reschedule-case "1. Simple allocation sinking"
+      [($LET 1 ($CLOSE ($CNS 10) []))
+       ($CALL 2 $ADD [($CNS 1) ($CNS 2)])
+       ($RET ($CNS 0))]
+      [($CALL 2 $ADD [($CNS 1) ($CNS 2)])
+       ($LET 1 ($CLOSE ($CNS 10) []))
+       ($RET ($CNS 0))])
+  (And
+    (reschedule-case "2. Allocation stops at first use"
+      [($LET 1 ($CLOSE ($CNS 10) []))
+       ($CALL 3 $ADD [($CNS 2) ($CNS 3)])
+       ($CALL 2 $ADD [($REF 1) ($CNS 1)])
+       ($RET ($REF 3))]
+      [($CALL 3 $ADD [($CNS 2) ($CNS 3)])
+       ($LET 1 ($CLOSE ($CNS 10) []))
+       ($CALL 2 $ADD [($REF 1) ($CNS 1)])
+       ($RET ($REF 3))])
+  (And
+    (reschedule-case "3. Multiple allocations sink independently"
+      [($LET 1 ($CLOSE ($CNS 1) []))
+       ($LET 2 ($CLOSE ($CNS 2) []))
+       ($CALL 3 $ADD [($REF 1) ($CNS 10)])
+       ($CALL 4 $ADD [($REF 2) ($CNS 20)])
+       ($RET ($REF 4))]
+      [($LET 1 ($CLOSE ($CNS 1) []))
+       ($CALL 3 $ADD [($REF 1) ($CNS 10)])
+       ($LET 2 ($CLOSE ($CNS 2) []))
+       ($CALL 4 $ADD [($REF 2) ($CNS 20)])
+       ($RET ($REF 4))])
+  (And
+    (reschedule-case "4. Allocation does not cross force"
+      [($LET 1 ($CLOSE ($CNS 7) []))
+       (fors 2 1)
+       ($CALL 3 $ADD [($REF 2) ($CNS 1)])
+       ($RET ($REF 3))]
+      [($LET 1 ($CLOSE ($CNS 7) []))
+       (fors 2 1)
+       ($CALL 3 $ADD [($REF 2) ($CNS 1)])
+       ($RET ($REF 3))])
+  (And
+    (reschedule-case "5. Allocation crosses effectful call"
+      [($LET 1 ($CLOSE ($CNS 5) []))
+       ($CALL 2 ($SLOW ($REF 99)) [])
+       ($RET ($CNS 0))]
+      [($CALL 2 ($SLOW ($REF 99)) [])
+       ($LET 1 ($CLOSE ($CNS 5) []))
+       ($RET ($CNS 0))])
+  (And
+    (reschedule-case "6. Effects may not be rescheduled"
+      [($CALL 3 ($SLOW ($REF 99)) [($REF 1)])
+       (fors 2 1)
+       ($RET ($CNS 0))]
+      [($CALL 3 ($SLOW ($REF 99)) [($REF 1)])
+       (fors 2 1)
+       ($RET ($CNS 0))])
+    (reschedule-case "7. Pure calls can be rescheduled"
+      [($CALL 3 $ADD [($REF 1) ($REF 1)])
+       (fors 2 1)
+       ($RET ($CNS 0))]
+      [(fors 2 1)
+       ($CALL 3 $ADD [($REF 1) ($REF 1)])
+       ($RET ($CNS 0))]))))))))
+assert(tests_reschedule_allocations)
+
+
+;;; Occurrence analysis ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (delay0 v)
+  ($DELAY (mkProc [] [($RET ($CNS v))])))
+
+(define test_occ_unused_thunk
+  (Eq ZERO
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($RET ($CNS 1))])))))
+assert(test_occ_unused_thunk)
+
+(define test_occ_single_force
+  (Eq ONCE
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($FORCE 2 ($REF 1))
+       ($RET ($REF 2))])))))
+assert(test_occ_single_force)
+
+(define test_occ_double_force
+  (Eq MANY
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($FORCE 2 ($REF 1))
+       ($FORCE 3 ($REF 1))
+       ($RET ($REF 3))])))))
+assert(test_occ_double_force)
+
+(define test_occ_force_in_one_branch
+  (Eq ONCE
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($BR ($CNS 0)
+         [[2 (mkProc [] [($FORCE 3 ($REF 1)) ($RET ($REF 3))])]
+          [4 (mkProc [] [($RET ($CNS 1))])]])])))))
+assert(test_occ_force_in_one_branch)
+
+(define test_occ_force_in_both_branches
+  (Eq ONCE
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($BR ($CNS 0)
+         [[2 (mkProc [] [($FORCE 3 ($REF 1)) ($RET ($REF 3))])]
+          [4 (mkProc [] [($FORCE 5 ($REF 1)) ($RET ($REF 5))])]])])))))
+assert(test_occ_force_in_both_branches)
+
+(define test_occ_escape_via_close
+  (Eq MANY
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($LET 2 ($CLOSE ($REF 1) []))
+       ($RET ($CNS 0))])))))
+assert(test_occ_escape_via_close)
+
+(define test_occ_proc_free_var
+  (Eq ONCE
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($PROC 2 (mkProc [] [($FORCE 3 ($REF 1)) ($RET ($REF 3))]))
+       ($CALL 4 ($LOCAL 2) [])
+       ($RET ($REF 4))])))))
+assert(test_occ_proc_free_var)
+
+(define test_occ_proc_not_called
+  (Eq ZERO
+    (occOf 1 (occurs (mkProc []
+      [($LET 1 (delay0 0))
+       ($PROC 2 (mkProc [] [($FORCE 3 ($REF 1)) ($RET ($REF 3))]))
+       ($RET ($CNS 0))])))))
+assert(test_occ_proc_not_called)
+
+(define test_occ_self_recur_zero
+  (Eq ZERO
+    (occOf 0 (occurs (mkProc [($ARG 0 $STRICT)]
+      [($CALL 1 $RECUR [($REF 0)])
+       ($RET ($CNS 0))])))))
+assert(test_occ_self_recur_zero)
+
+(define test_occ_recur_amplifies
+  (Eq MANY
+    (occOf 0 (occurs (mkProc [($ARG 0 $STRICT)]
+      [($FORCE 1 ($REF 0))
+       ($CALL 2 $RECUR [($REF 0)])
+       ($RET ($REF 1))])))))
+assert(test_occ_recur_amplifies)
+
+(define test_occ_nested_thunks
+  (begin
+    (define pa (mkProc [] [($RET ($CNS 0))]))
+    (define pb (mkProc [] [($FORCE 10 ($REF 1)) ($RET ($REF 10))]))
+    (define pc (mkProc [] [($FORCE 11 ($REF 2)) ($RET ($REF 11))]))
+    (define occ
+      (occurs (mkProc []
+        [($LET 1 ($DELAY pa))
+         ($LET 2 ($DELAY pb))
+         ($LET 3 ($DELAY pc))
+         ($FORCE 12 ($REF 3))
+         ($RET ($REF 12))])))
+    (And (Eq ONCE (occOf 1 occ))
+      (And (Eq ONCE (occOf 2 occ))
+           (Eq ONCE (occOf 3 occ))))))
+assert(test_occ_nested_thunks)
+
+
+;;; Example programs (smoke + idempotence) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define ex1 (optimize (blockProc [($RET ($CNS 0))])))
+assert(Equal ex1 (blockProc [($RET ($CNS 0))]))
+
+(define ex2 (optimize (blockProc [(fors 1 0) ($RET ($REF 1))])))
+assert(Equal ex2 (blockProc [(fors 1 0) ($RET ($REF 1))]))
+
+(define ex4
+  (optimize (blockProc
+    [(fors 1 0) (fors 2 1) (fors 3 2) ($RET ($REF 3))])))
+assert(Equal ex4 (blockProc [(fors 1 0) ($RET ($REF 1))]))
+
+(define ex5
+  (optimize (blockProc
+    [(fors 1 0) (fors 2 0)
+     ($CALL 3 $ADD [($REF 1) ($REF 2)])
+     ($RET ($REF 3))])))
+assert(Equal ex5
+  (blockProc
+    [(fors 1 0)
+     ($CALL 3 $ADD [($REF 1) ($REF 1)])
+     ($RET ($REF 3))]))
+
+(define ex6
+  (optimize (mkProc [($ARG 0 $STRICT)]
+    [($CALL 1 $ADD [($REF 0) ($REF 0)])
+     (fors 2 1)
+     ($RET ($REF 2))])))
+assert(Equal ex6
+  (mkProc [($ARG 0 $STRICT)]
+    [($CALL 1 $ADD [($REF 0) ($REF 0)])
+     ($RET ($REF 1))]))
+
+;; ex7: the force is reordered before the thunk allocation, and then
+;; reforce notices the argument is already forced and removes the
+;; redundant force.  We check full-pipeline idempotence.
+(define ex7
+  (optimize (blockProc
+    [($LET 2 ($DELAY (blockProc
+        [(fors 2 1)
+         ($CALL 3 $ADD [($REF 2) ($REF 2)])
+         ($RET ($REF 3))])))
+     (fors 3 1)
+     ($LET 4 ($CLOSE ($CNS 0) [($REF 2) ($REF 3)]))
+     ($RET ($REF 4))])))
+assert(Equal ex7 (optimize ex7))
+
+;;; S3 front-end + codegen: exact-emission smoke tests.  The real gate
+;;; is the corpus differential (plangrm-diff via the .plan bridge);
+;;; these lock the flat row format locally.
+
+;; ((0 (0 1 2)) 2): slow call of var head -> operands pushed, MK_THK 3
+;; BANE_SLOW.
+(define syn-slow (Law 2 "syn-slow" [[1 2] 2]))
+assert(Equal
+  [OP_PUSH_VAR 1 OP_PUSH_VAR 2 OP_PUSH_VAR 2 OP_MK_THK 3 BANE_SLOW OP_RET]
+  (codegenLaw syn-slow))
+
+;; (0 <oppin> (0 "Nm" 1)): known primop wrapper -> element pushes only,
+;; MK_THK carries the (oppin, name) operands inline.
+(define syn-known (Law 1 "syn-known" [(Pin "B") [["Nm"] 1]]))
+assert(Equal
+  [OP_PUSH_VAR 1 OP_MK_THK 1 BANE_PRIM_KNOWN (Pin "B") "Nm" OP_RET]
+  (codegenLaw syn-known))
+
+;; recurLower rewrites saturated var-0 calls (anywhere in the block
+;; tree) to RECUR
+(define (t-cnt n) (Ifz n 0 (Add 1 (t-cnt (Dec n)))))
+(define (hasRecur b)
+  (any
+    (lambda (s)
+      (? Stmt s
+        (CALL [key op args] (? Op op (RECUR 1) (_ 0)))
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY [body] (hasRecur (procCode body)))
+            (CLOSE 0)))
+        (PROC [key body] (hasRecur (procCode body)))
+        (BR [x arms]
+          (any (lambda (kp) (hasRecur (procCode (_1 kp)))) arms))
+        (_ 0)))
+    b))
+assert(hasRecur (procCode (recurLower (_1 (ingestLawOpt t-cnt)))))
+
+;; transitive law-to-law strictness: t-ff is strict in x only through
+;; t-gg (whose own sig is prim-derived)
+(define (t-gg x) (Add x 1))
+(define (t-ff x) (t-gg x))
+assert(Eq 1 (sigOfLaw t-gg))
+assert(Eq 1 (sigOfLaw t-ff))
+assert(Eq 0 (sigOfLawB 0 t-ff)) ;; prim-only base case sees nothing
+
+(print "plangrm tests passed")
