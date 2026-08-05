@@ -75,9 +75,17 @@
    ;; builtins json now leans on
    "list" "list_row" "nil" "cons" "load8" "loadvar"])
 
+;; A name the generated module already uses for something else is
+;; MANGLED, not rejected.  This document really does contain schemas
+;; called `json` and `ws` and an operationId `list` — and `list` is
+;; reserved only because json.foil came to need it.  Underscores are
+;; appended until the name is free, which the first step always achieves
+;; since sg-norm-name trims a trailing _ and so can never produce one.
 (define (sg-check-name s)
+  (define (free nm)
+    (If (includes (Eq nm) sg-reserved) (free (strcat [nm "_"])) nm))
   (Ifz (sg-sane-name? s) (sg-error "bad-name (want [a-z][a-z0-9_]*)" s)
-    (If (includes (Eq s) sg-reserved) (sg-error "reserved-name" s) s)))
+    (free s)))
 
 (define (dedupe-eq xs)
   (foldl (lambda (acc x) (If (includes (Eq x) acc) acc (snoc x acc))) [] xs))
@@ -127,7 +135,16 @@
   (define trimmed
     (Ifz (Sz body) body
       (If (Eq 95 (Ix (Dec (Sz body)) body)) (take (Dec (Sz body)) body) body)))
-  (strcat trimmed))
+  ;; A leading digit is legal JSON and illegal foil, and the values that
+  ;; hit it are ordinary ("5m" and "1h" are this document's cache TTLs).
+  ;; Prefix rather than reject.  n_ is safe against colliding with a
+  ;; value that spells the mangling itself, because a source name can
+  ;; only produce a leading n_ from text that already starts with a
+  ;; letter, and this branch is only taken when it starts with a digit.
+  (define fixed
+    (Ifz (Sz trimmed) trimmed
+      (If (sg-digit? (_0 trimmed)) (Weld [110 95] trimmed) trimmed)))
+  (strcat fixed))
 
 ;; Normalize AND validate: the name a generated module will use.
 (define (sg-name s) (sg-check-name (sg-norm-name s)))
@@ -215,13 +232,23 @@
   (Ifz r []
     (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
 
+;; Enum values this IR can name.  A foil variant's name comes from the
+;; wire STRING, so a numeric enum has nothing to make variants out of —
+;; this document's EndpointStatus is [0,-1,-2,-3,-5,-10].  Such a schema
+;; is not an enumeration here; sg-ftype-go carries it by value instead.
+(define (sg-jv-num? x)
+  (Or (jv? "/boot/json/num" x) (jv? "/boot/json/real" x)))
+(define (sg-str-enum-vals v)
+  (define xs (sg-enum-vals v))
+  (If (all jv-str? xs) xs []))
+
 ;; A single-value enum is a CONSTANT, not an enumeration: the wire
 ;; always carries that one string.  In a discriminated union it is the
 ;; tag; on its own it is a field nothing branches on.  Either way a sum
 ;; with one variant would be noise, so it stays a string — 435 of this
 ;; document's 522 inline enums are of this shape.
-(define (sg-const-enum? v) (Eq 1 (Sz (sg-enum-vals v))))
-(define (sg-real-enum? v) (Gt (Sz (sg-enum-vals v)) 1))
+(define (sg-const-enum? v) (Eq 1 (Sz (sg-str-enum-vals v))))
+(define (sg-real-enum? v) (Gt (Sz (sg-str-enum-vals v)) 1))
 
 ;; The arms of a oneOf/anyOf, with a bare `null` arm dropped — that arm
 ;; is the nullable spelling again, not a member of the union.
@@ -236,12 +263,16 @@
   (Weld (Ifz one [] (real (jv-xs! (_0 one))))
     (Ifz any-r [] (real (jv-xs! (_0 any-r))))))
 
-;; A union every one of whose arms is a bare constant is an ENUM spelled
-;; the long way — this document does that 12 times.
+;; A union every one of whose arms ENUMERATES is an enum spelled the long
+;; way — its variants are all the arms' values taken together.  Arity is
+;; not the point: this document writes it as 12 unions of bare constants,
+;; but PDFParserEngine is a 3-value enum beside a 1-value one, which
+;; means exactly the same thing.
+(define (sg-enumerates? v) (Gt (Sz (sg-str-enum-vals v)) 0))
 (define (sg-union-is-enum? v)
   (define arms (sg-union-arms v))
   (And (Gt (Sz arms) 1)
-    (If (all sg-const-enum? arms) 1 0)))
+    (If (all sg-enumerates? arms) 1 0)))
 
 (define (sg-branch-adds? b)
   (Or (If (Sz (sg-props-of b)) 1 0)
@@ -265,6 +296,37 @@
         (Ifz (Sz real) 0 [(_0 real)]))
       [(jv-str! (_0 t))])))
 
+;; An inline type needing a name of its own, judged WITHOUT an env —
+;; sg-alias-subst has none.  This is sg-liftable? minus the allOf
+;; flattening, which an array's element never needs.
+(define (sg-inline-type? v)
+  (And (Nil (sg-ref-name v))
+    (Or (sg-real-enum? v)
+      (Or (sg-union-is-enum? v)
+        (Or (If (Sz (sg-union-arms v)) 1 0)
+          (And (Ifz (jv-get "enum" v) 1 0)
+            (If (Sz (sg-props-of v)) 1 0)))))))
+
+;; A named schema that is an array whose ELEMENT has to be minted.
+;;
+;; Such a schema is NOT an alias.  An array of a $ref or a primitive is
+;; one — it resolves through to `row[that]` and declares nothing — but
+;; an inline element has no name, and alias resolution is name-blind, so
+;; there is nowhere to put one.  Instead the ELEMENT takes the schema's
+;; name (suffixed) and a reference to the array becomes a row of it.
+;; This document spells three enums and two objects that way, including
+;; AnthropicAllowedCallers, which two more schemas then reference.
+(define (sg-named-row? v)
+  (define t (sg-type-str-raw v))
+  (And (Ifz (Nil t) 1 0)
+    (And (Eq "array" (_0 t))
+      (let ((it (jv-get "items" v)))
+        (Ifz it 0 (sg-inline-type? (_0 it)))))))
+
+;; The minted element name.  sg-mint applies the collision check at the
+;; typedef site; sg-ftype-go only needs the same string.
+(define (sg-row-item-name nm) (strcat [nm "_item"]))
+
 ;; Is this named schema merely a pointer at another type?
 ;; -> 0, or [the schema to take the ftype from instead]
 (define (sg-alias-subst v)
@@ -279,12 +341,30 @@
       [(_0 refs)])
     ;; any other allOf is a real merge
     ((Sz ao) 0)
-    ;; an enum is a type of its own, whatever its base type says
-    ((Ifz (jv-get "enum" v) 0 1) 0)
+    ;; a STRING enum is a type of its own, whatever its base type says;
+    ;; a numeric one is not an enumeration here, so it falls through and
+    ;; rides as its value
+    ((If (Sz (sg-str-enum-vals v)) 1 0) 0)
+    ;; an array whose element must be minted is not an alias
+    ((sg-named-row? v) 0)
     (else
       (let ((t (sg-type-str-raw v)))
         (Ifz t 0
-          (If (includes (Eq (_0 t)) sg-prim-types) [v] 0))))))
+          (cond
+            ((includes (Eq (_0 t)) sg-prim-types) [v])
+            ;; An object that declares no properties says nothing about
+            ;; its KEYS — it is any JSON object, not a record with none.
+            ;; That covers both spellings this document uses: a literal
+            ;; `properties: {}`, and additionalProperties, which is a map
+            ;; whose value type the IR has no way to say yet.  Carrying
+            ;; it undecoded is what sg-ftype-go already does for the same
+            ;; schema in field position; this makes the NAMED case agree
+            ;; instead of failing the whole schema.
+            ((And (Eq "object" (_0 t))
+               (And (Ifz (Sz (sg-props-of v)) 1 0)
+                 (Ifz (Sz (sg-union-arms v)) 1 0)))
+              [v])
+            (else 0)))))))
 
 ;; name -> substitute schema, for every alias in the document.
 (define (sg-alias-map defs)
@@ -335,18 +415,15 @@
 ;;;
 ;;; "Discriminator" is not a property of a field but of a field
 ;;; RELATIVE TO A UNION.  A field discriminates when matching on it is
-;;; enough to pick an arm, which means: present in every arm, pinned to
-;;; one value in every arm, and those values pairwise distinct.  Derived
-;;; that way it agrees with all 40 of this document's declared
-;;; `discriminator` keys and finds 31 more, so the keyword is never read.
-
-;; The one value a property schema pins, as a wire string, or 0.
-(define (sg-pin-val ps)
-  (define c (jv-get "const" ps))
-  (Ifz c
-    (let ((vs (sg-enum-vals ps)))
-      (If (And (Eq 1 (Sz vs)) (jv-str? (_0 vs))) [(jv-str! (_0 vs))] 0))
-    (If (jv-str? (_0 c)) [(jv-str! (_0 c))] 0)))
+;;; enough to pick an arm, which means: present in every arm, pinned in
+;;; every arm, and no two arms claiming a value in common.  Derived that
+;;; way it agrees with all 40 of this document's declared `discriminator`
+;;; keys and finds 31 more, so the keyword is never read.
+;;;
+;;; "Pinned to ONE value" is the common case but not the rule: an arm may
+;;; claim a set, and one arm may decline to pin at all and take whatever
+;;; is left.  See sg-union-tag, which tries the strict reading first so
+;;; that a union which already had a tag keeps the same one.
 
 ;; An arm's properties, following a $ref and flattening allOf.
 (define (sg-arm-props env b depth)
@@ -357,21 +434,65 @@
           (Ifz hit [] (sg-arm-props env (Ix 1 (_0 hit)) (Inc depth))))
         (_0 (sg-flat-record env b 0))))))
 
+;; The wire values a property schema pins, as a row of strings, or 0.
+;; An arm may claim SEVERAL — ChatFunctionTool has an arm whose `type` is
+;; an anyOf of two constants — and that still discriminates, so long as
+;; no two arms claim a value in common.
+(define (sg-pin-vals ps)
+  (define c (jv-get "const" ps))
+  (Ifz c
+    (let ((vs (sg-str-enum-vals ps)))
+      (Ifz (Sz vs)
+        (let* ((bs (sg-union-arms ps))
+               (acc (foldl (lambda (a b) (Weld a (sg-str-enum-vals b))) [] bs)))
+          (Ifz (Sz acc) 0 [(map jv-str! acc)]))
+        [(map jv-str! vs)]))
+    (If (jv-str? (_0 c)) [[(jv-str! (_0 c))]] 0)))
+
+;; The per-arm value sets for field f: 0 where an arm declares f without
+;; pinning it.  Only meaningful when f is present in every arm.
+(define (sg-tag-sets env arms f)
+  (map (lambda (b)
+         (let* ((view (sg-arm-props env b 0))
+                (hit (find (lambda (e) (Eq f (Ix 0 e))) view)))
+           (Ifz hit 0 (sg-pin-vals (Ix 1 (_0 hit))))))
+    arms))
+
 ;; The field that discriminates these arms, or 0.
+;;
+;; Tried in order of strictness, so that a union which already had a tag
+;; keeps the SAME one: every arm pinning exactly one value; then arms
+;; pinning disjoint SETS; then those plus a single arm that declares the
+;; field without pinning it, which is that union's own catch-all
+;; (AnthropicUnknownUsageIteration declares `type` as a plain string
+;; beside three arms that pin it).
 (define (sg-union-tag env arms)
   (define views (map (lambda (b) (sg-arm-props env b 0)) arms))
-  (define (pin f view)
-    (define hit (find (lambda (e) (Eq f (Ix 0 e))) view))
-    (Ifz hit 0 (sg-pin-val (Ix 1 (_0 hit)))))
-  (define (tags? f)
-    (define vs (map (lambda (vw) (pin f vw)) views))
-    (And (all (lambda (x) (Ifz (Nil x) 1 0)) vs)
-      (let ((ss (map (lambda (x) (_0 x)) vs)))
-        (If (Eq (Sz ss) (Sz (dedupe-eq ss))) 1 0))))
-  (define cands
-    (Ifz (Sz views) []
-      (filter tags? (map (lambda (e) (Ix 0 e)) (_0 views)))))
-  (Ifz (Sz cands) 0 [(_0 cands)]))
+  (define (present? f)
+    (all (lambda (vw) (Ifz (find (lambda (e) (Eq f (Ix 0 e))) vw) 0 1)) views))
+  (define (ok? f max-open one-each)
+    (And (present? f)
+      (let* ((vs (sg-tag-sets env arms f))
+             (pinned (filter (lambda (x) (Ifz (Nil x) 1 0)) vs))
+             (open (Sub (Sz vs) (Sz pinned)))
+             (flat (foldl (lambda (a x) (Weld a (_0 x))) [] pinned)))
+        ;; at least two arms, and at least one of them pinning: with a
+        ;; fallback arm the pinned count can legitimately be 1
+        (And (If (Le open max-open) 1 0)
+          (And (And (If (Gt (Sz vs) 1) 1 0) (If (Gt (Sz pinned) 0) 1 0))
+            (And (If one-each
+                   (If (all (lambda (x) (Eq 1 (Sz (_0 x)))) pinned) 1 0)
+                   1)
+              (If (Eq (Sz flat) (Sz (dedupe-eq flat))) 1 0)))))))
+  (define fields
+    (Ifz (Sz views) [] (map (lambda (e) (Ix 0 e)) (_0 views))))
+  (define (first-ok max-open one-each)
+    (let ((c (filter (lambda (f) (ok? f max-open one-each)) fields)))
+      (Ifz (Sz c) 0 [(_0 c)])))
+  (define strict (first-ok 0 1))
+  (Ifz (Nil strict) strict
+    (let ((setty (first-ok 0 0)))
+      (Ifz (Nil setty) setty (first-ok 1 0)))))
 
 ;; OpenAPI 3.1 spells "nullable T" as type: ["T","null"] — one real
 ;; type beside the null.  It becomes T, and the field carrying it
@@ -423,7 +544,12 @@
     (let ((al (sg-alias-look (sg-env-aliases env) (_0 r))))
       (Ifz (Nil al)
         (sg-ftype-go env (_0 al) (Inc depth))
-        ["ref" (sg-name (_0 r))]))
+        ;; a named array whose element was minted: the element carries
+        ;; the name, so the reference is a ROW of it
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (If (Ifz hit 0 (sg-named-row? (Ix 1 (_0 hit))))
+            ["row" ["ref" (sg-row-item-name (sg-name (_0 r)))]]
+            ["ref" (sg-name (_0 r))]))))
     ;; an allOf here is either an alias to a $ref or an inline object
     (If (Sz (sg-allof v))
       (let ((al (sg-alias-subst v)))
@@ -436,8 +562,18 @@
     (If (sg-real-enum? v)
       (sg-error "inline-enum (hoist to $defs)" v)
     (If (sg-const-enum? v) ["str"]
+    ;; Enum values that are not strings.  A JSON number can be negative
+    ;; and foil's int is a nat, so the decimal lexeme is the only honest
+    ;; carrier — EndpointStatus is [0,-1,-2,-3,-5,-10].
+    (If (Sz (sg-enum-vals v))
+      (If (all sg-jv-num? (sg-enum-vals v)) ["num"] ["any"])
+    ;; A union reached HERE is one lifting never got to: inside an
+    ;; array's items, or inside another union's arm.  A union in plain
+    ;; field position is minted by sg-typedef-go and arrives as a $ref,
+    ;; so oneOf itself is supported — what is missing is hoisting the
+    ;; nested ones, exactly as with inline objects and enums above.
     (If (Sz (sg-union-arms v))
-      (sg-error "union of real types (needs oneOf support)" v)
+      (sg-error "inline-union (hoist to $defs)" v)
       (let ((t (sg-type-str v)))
         ;; No type and no $ref means "any JSON value" — the document is
         ;; declining to say more, so the field carries the value as it
@@ -468,7 +604,7 @@
                       (If (Eq "row" (_0 et))
                         (sg-error "nested-array-unsupported" v)
                         ["row" et])))))
-              (else (sg-error "unsupported-type" ty))))))))))))))
+              (else (sg-error "unsupported-type" ty)))))))))))))))
 
 (define (sg-ftype-of env v) (sg-ftype-go env v 0))
 
@@ -516,26 +652,146 @@
 ;; turning every API addition into a client outage.
 (define sg-union-else "unknown")
 
-;; -> ["union" name tagfield arms], arm = [vname ftype wire]
-(define (sg-union-td env name v)
-  (define arms (sg-union-arms v))
+;;; Shape discrimination ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; When no FIELD settles a union, the arms' JSON constructors often do:
+;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
+;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
+;;; the constructor of the value itself rather than a key inside it.
+
+;; The json constructors a shape can arrive as.  `num` claims BOTH,
+;; because json splits numbers by spelling, not by type: an integral
+;; literal is json/num and any other is json/real (it keeps the source
+;; lexeme).  So one `number` arm needs two match arms.  That also means
+;; an `integer` arm and a `number` arm are NOT disjoint — json/num
+;; answers to both — and such a union is rejected rather than decided by
+;; arm order.  This document never writes one.
+(define (sg-shape-ctors s)
+  (cond
+    ((Eq "str" s) ["str"])
+    ((Eq "int" s) ["num"])
+    ((Eq "num" s) ["num" "real"])
+    ((Eq "boo" s) ["boo"])
+    ((Eq "arr" s) ["arr"])
+    ((Eq "obj" s) ["obj"])
+    (else [])))
+
+(define (sg-shape-of-type t)
+  (cond
+    ((Eq "string" t) ["str"])
+    ((Eq "integer" t) ["int"])
+    ((Eq "number" t) ["num"])
+    ((Eq "boolean" t) ["boo"])
+    ((Eq "array" t) ["arr"])
+    ((Eq "object" t) ["obj"])
+    (else 0)))
+
+;; The json shape an arm arrives as, following $refs and allOf.
+;; -> 0 (undecidable) or [shape-key]
+(define (sg-arm-shape env b depth)
+  (Ifz (Lt depth 16) 0
+    (let ((r (sg-ref-name b)))
+      (Ifz (Nil r)
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (Ifz hit 0 (sg-arm-shape env (Ix 1 (_0 hit)) (Inc depth))))
+        ;; a nested union has no single constructor of its own
+        (Ifz (Sz (sg-union-arms b))
+          (let ((t (sg-type-str b)))
+            (Ifz (Nil t)
+              (sg-shape-of-type (_0 t))
+              ;; no declared type: read it off the structure
+              (cond
+                ;; a substantive allOf is a record merge
+                ((Sz (sg-allof b)) ["obj"])
+                ((Ifz (jv-get "enum" b) 0 1) ["str"])
+                ((Sz (sg-props-of b)) ["obj"])
+                ((Ifz (jv-get "items" b) 0 1) ["arr"])
+                (else 0))))
+          0)))))
+
+;; The arms' shapes, if every arm has one and no two can arrive as the
+;; same json constructor.  -> 0, or [shape-key ..] parallel to arms
+(define (sg-union-shape env arms)
+  (define shapes (map (lambda (b) (sg-arm-shape env b 0)) arms))
+  (Ifz (all (lambda (s) (Ifz (Nil s) 1 0)) shapes) 0
+    (let* ((keys (map (lambda (s) (_0 s)) shapes))
+           (ctors (foldl (lambda (acc k) (Weld acc (sg-shape-ctors k))) [] keys)))
+      (If (Eq (Sz ctors) (Sz (dedupe-eq ctors))) keys 0))))
+
+;; A bare `type: string` arm — no enum, no ref, no union of its own.
+(define (sg-plain-str? v)
+  (define t (sg-type-str-raw v))
+  (And (Nil (sg-ref-name v))
+    (And (Ifz (Nil t) 1 0)
+      (And (Eq "string" (_0 t))
+        (And (Ifz (Sz (sg-str-enum-vals v)) 1 0)
+          (Ifz (Sz (sg-union-arms v)) 1 0))))))
+
+;; Does this arm enumerate, following $refs?  An arm may BE a named enum
+;; rather than spell one inline.
+(define (sg-arm-enumerates? env b depth)
+  (Ifz (Lt depth 16) 0
+    (let ((r (sg-ref-name b)))
+      (Ifz (Nil r)
+        (let ((hit (find (lambda (e) (Eq (_0 r) (Ix 0 e))) (sg-env-defs env))))
+          (Ifz hit 0 (sg-arm-enumerates? env (Ix 1 (_0 hit)) (Inc depth))))
+        (If (Sz (sg-str-enum-vals b)) 1 0)))))
+
+;; A bare string arm beside an enum adds NOTHING, because the enum is
+;; already open: its catch-all holds every value the bare arm would have
+;; taken.  `ProviderName | string` says "a known provider, or any other
+;; string", which the enum alone already says — and written as a union it
+;; is undecidable, since the two arms overlap by construction.  Dropping
+;; the bare arm is what makes it decidable, and loses nothing.
+;;
+;; This is the shape of seven of this document's operations, all through
+;; ProviderPreferences.ignore.
+(define (sg-drop-redundant-str env mem)
+  (If (And (any (lambda (b) (sg-arm-enumerates? env b 0)) mem)
+        (any sg-plain-str? mem))
+    (filter (lambda (b) (Nil (sg-plain-str? b))) mem)
+    mem))
+
+;; -> [disc specs], disc = ["tag" field] | ["shape"],
+;;    spec = [vname arm-schema keys]
+;;      keys = the tag's wire values (a row, since an arm may claim
+;;      several), or [the shape].  An EMPTY keys row marks the union's
+;;      own catch-all arm: it takes whatever the tag values do not.
+;;
+;; Deliberately stops short of the arms' FTYPES.  An arm can itself be an
+;; inline type needing a name of its own, and minting one is
+;; sg-typedef-go's job — which is defined after this, so it cannot be
+;; called from here.
+(define (sg-union-plan-arms env name arms)
   (define tag (sg-union-tag env arms))
   (Ifz (Nil tag)
     (let* ((tf (_0 tag))
+           (sets (sg-tag-sets env arms tf))
            (built
-             (map (lambda (b)
-                    (let* ((props (sg-arm-props env b 0))
-                           (hit (find (lambda (e) (Eq tf (Ix 0 e))) props))
-                           (wire (_0 (sg-pin-val (Ix 1 (_0 hit))))))
-                      [(sg-name wire) (sg-ftype-of env b) wire]))
-               arms)))
-      (If (any (lambda (a) (Eq sg-union-else (_0 a))) built)
+             (gen (Sz arms)
+               (lambda (i)
+                 (let ((s (Ix i sets)))
+                   (Ifz (Nil s)
+                     [(sg-name (_0 (_0 s))) (Ix i arms) (_0 s)]
+                     ;; the arm that declares the tag without pinning it
+                     [sg-union-else (Ix i arms) []]))))))
+      (If (any (lambda (a)
+                 (And (Eq sg-union-else (_0 a)) (If (Sz (Ix 2 a)) 1 0)))
+            built)
         (sg-error "union arm collides with the catch-all name" name)
-        ["union" name tf built]))
-    ;; No field settles it.  Shape discrimination (disjoint JSON types)
-    ;; and the handful of genuinely ambiguous unions are both still
-    ;; unsupported, and saying which is which would be a guess.
-    (sg-error "union has no discriminating field" name)))
+        [["tag" tf] built]))
+    ;; No field settles it — try the arms' json constructors.  The
+    ;; shape keys are str/arr/obj/num/boo, so they cannot collide with
+    ;; the catch-all the way a tag's wire value can.
+    (let ((shapes (sg-union-shape env arms)))
+      (Ifz (Nil shapes)
+        [["shape"]
+         (gen (Sz arms)
+           (lambda (i) [(Ix i shapes) (Ix i arms) [(Ix i shapes)]]))]
+        ;; Neither settles these arms as they stand.  0 rather than an
+        ;; error: the caller may still group them by shape and settle
+        ;; each group on its own.
+        0))))
 
 ;; -> [typedef [extra-typedef ..]]   extras are lifted inline types
 (define (sg-typedef-go env name v depth)
@@ -543,14 +799,109 @@
   ;; long way; take its arms' values as the variants.
   (define vals
     (If (sg-union-is-enum? v)
-      (foldl (lambda (acc b) (Weld acc (sg-enum-vals b))) [] (sg-union-arms v))
-      (sg-enum-vals v)))
+      (foldl (lambda (acc b) (Weld acc (sg-str-enum-vals b))) []
+        (sg-union-arms v))
+      (sg-str-enum-vals v)))
   (Ifz (Lt depth 12) (sg-error "inline types nested too deep" name)
+  ;; A named ARRAY declares nothing of its own — the element is the type.
+  ;; It is minted under this schema's name, and every reference to the
+  ;; array resolved to a row of it (sg-ftype-go).
+  (If (sg-named-row? v)
+    (sg-typedef-go env (sg-mint env name "item")
+      (_0 (jv-get "items" v)) (Inc depth))
   (If (Sz vals)
     (let ((pairs (sg-dedupe-pairs (sg-enum-pairs vals))))
       [["enum" name pairs] []])
   (If (Sz (sg-union-arms v))
-    [(sg-union-td env name v) []]
+    ;; A union's ARMS lift exactly as a record's properties do: an arm
+    ;; that is an inline object, enum or union gets a name of its own and
+    ;; is referenced.  Without this an arm could only ever be a $ref or a
+    ;; primitive, which is what made `string | array-of-<union>` (this
+    ;; document's BaseInputs and Inputs) unreachable.
+    (let* ((arms (sg-union-arms v))
+           ;; one arm's ftype, minting a type for it if it is inline
+           ;; -> [ftype extras]
+           (arm-ft
+             (lambda (owner vname b)
+               (let* ((items (jv-get "items" b))
+                      (arr-lift
+                        (And (Ifz items 0 1)
+                          (If items (sg-liftable? env (_0 items)) 0))))
+                 (cond
+                   ((sg-liftable? env b)
+                     (let* ((nm (sg-mint env owner vname))
+                            (sub (sg-typedef-go env nm b (Inc depth))))
+                       [["ref" nm] (snoc (_0 sub) (_1 sub))]))
+                   (arr-lift
+                     (let* ((nm (sg-mint env owner vname))
+                            (sub (sg-typedef-go env nm (_0 items) (Inc depth))))
+                       [["row" ["ref" nm]] (snoc (_0 sub) (_1 sub))]))
+                   (else [(sg-ftype-of env b) []])))))
+           (from-specs
+             (lambda (nm disc specs)
+               (let ((step
+                       (foldl
+                         (lambda (acc s)
+                           (let ((r (arm-ft nm (_0 s) (Ix 1 s))))
+                             [(snoc [(_0 s) (_0 r) (Ix 2 s)] (_0 acc))
+                              (Weld (_1 acc) (_1 r))]))
+                         [[] []] specs)))
+                 [["union" nm disc (_0 step)] (_1 step)])))
+           (plan (sg-union-plan-arms env name arms)))
+      (Ifz (Nil plan)
+        (from-specs name (_0 plan) (Ix 1 plan))
+        ;; Nothing settles the arms as one set — GROUP them by json
+        ;; constructor and settle each group on its own.  ChatToolChoice
+        ;; is three bare string constants beside two object refs: no
+        ;; field is common to all five and the shapes are not disjoint,
+        ;; but "the strings" and "the objects" are each perfectly
+        ;; ordinary, an enum and a tag union.  Each group with more than
+        ;; one arm becomes a type of its own, and the outer union is the
+        ;; plain shape dispatch it already knows how to emit.
+        (let ((shapes (map (lambda (b) (sg-arm-shape env b 0)) arms)))
+          (Ifz (all (lambda (s) (Ifz (Nil s) 1 0)) shapes)
+            (sg-error "union has no discriminating field or shape" name)
+            (let* ((keys (dedupe-eq (map (lambda (s) (_0 s)) shapes)))
+                   (ctors
+                     (foldl (lambda (a k) (Weld a (sg-shape-ctors k))) [] keys)))
+              (Ifz (Eq (Sz ctors) (Sz (dedupe-eq ctors)))
+                (sg-error "union groups overlap on a json constructor" name)
+                (let ((step
+                        (foldl
+                          (lambda (acc k)
+                            (let* ((idxs
+                                     (filter
+                                       (lambda (i) (Eq k (_0 (Ix i shapes))))
+                                       (gen (Sz arms) (lambda (i) i))))
+                                   (mem
+                                     (sg-drop-redundant-str env
+                                       (map (lambda (i) (Ix i arms)) idxs))))
+                              (If (Eq 1 (Sz mem))
+                                (let ((r (arm-ft name k (_0 mem))))
+                                  [(snoc [k (_0 r) [k]] (_0 acc))
+                                   (Weld (_1 acc) (_1 r))])
+                                (let* ((nm (sg-mint env name k))
+                                       (sub
+                                         (If (all sg-enumerates? mem)
+                                           ;; all constants: one enum
+                                           [["enum" nm
+                                             (sg-dedupe-pairs
+                                               (sg-enum-pairs
+                                                 (foldl
+                                                   (lambda (a b)
+                                                     (Weld a (sg-str-enum-vals b)))
+                                                   [] mem)))]
+                                            []]
+                                           (let ((p (sg-union-plan-arms env nm mem)))
+                                             (Ifz (Nil p)
+                                               (from-specs nm (_0 p) (Ix 1 p))
+                                               (sg-error
+                                                 "union group has no discriminating field or shape"
+                                                 nm))))))
+                                  [(snoc [k ["ref" nm] [k]] (_0 acc))
+                                   (Weld (_1 acc) (snoc (_0 sub) (_1 sub)))]))))
+                          [[] []] keys)))
+                  [["union" name ["shape"] (_0 step)] (_1 step)])))))))
     ;; a record: its own properties, plus any inherited through allOf
     (let* ((flat (sg-flat-record env v 0))
            (props (_0 flat))
@@ -590,7 +941,7 @@
                    [[] []] props))
                (fields (_0 step)))
           (Ifz (Sz fields) (sg-error "empty-object" name)
-            [["rec" name fields] (_1 step)]))))))))
+            [["rec" name fields] (_1 step)])))))))))
 
 ;; The typedef alone, for callers that only need to know it elaborates.
 (define (sg-typedef-of env name v) (_0 (sg-typedef-go env name v 0)))
@@ -985,21 +1336,32 @@
     ((Eq "ref" (_0 ft)) (npar [(nw (strcat [(Ix 1 ft) "_to"])) exp]))
     (else (sg-error "enc-of-row-inline" ft))))
 
+;; A row[json] built from src's elements, each encoded with et.  src is
+;; the receiver as a list of path components (`[x tags]` -> x.tags), and
+;; every loop variable is suffixed with ix so that several of these can
+;; sit in one function without colliding.  Rows cannot go through
+;; sg-enc-t: they need a loop, and the loop needs that fresh index.
+(define (sg-enc-row-loop ix outv src et)
+  [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
+                       (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
+                                 (nbrk [])])])])
+   (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
+                    (nrn "." (snoc (nw "len") src))])
+             (nw outv)])
+   (npar [(nw "_") (ndotw (strcat ["i" ix]) "inc")
+          (nmeth (nw outv) "snoc"
+            [(sg-enc-t et
+               (nrn "." (snoc (njx [(nw "at") (npar [(nw (strcat ["i" ix]))])])
+                          src)))])])])
+
+;; The whole json/arr for a row-typed value.
+(define (sg-enc-row ix src et)
+  (npar [(npth ["json" "arr"])
+         (ngrp (sg-enc-row-loop ix (strcat ["b" ix]) src et))]))
+
 (define (sg-rec-to-tree name fields)
   (define n (Sz fields))
-  (define (row-loop ix outv src et)
-    ;; a row[json] loop from src's elements
-    [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
-                         (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
-                                   (nbrk [])])])])
-     (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
-                      (nrn "." (snoc (nw "len") src))])
-               (nw outv)])
-     (npar [(nw "_") (ndotw (strcat ["i" ix]) "inc")
-            (nmeth (nw outv) "snoc"
-              [(sg-enc-t et
-                 (nrn "." (snoc (njx [(nw "at") (npar [(nw (strcat ["i" ix]))])])
-                            src)))])])])
+  (define (row-loop ix outv src et) (sg-enc-row-loop ix outv src et))
   (define (field-trees i)
     (define f (Ix i fields))
     (define fname (Ix 0 f))
@@ -1144,10 +1506,18 @@
 ;;; the arm decode it as an ordinary field; encode writes it back the
 ;;; same way.  So the tag cannot drift out of step with the variant.
 
-;; arm = [vname ftype wire]
+;; Every union carries a catch-all.  Usually it is synthesized and holds
+;; the value undecoded, but a union whose own schema declares a fallback
+;; arm brings its own, already named sg-union-else — that one has a real
+;; type, so it must not be shadowed by the synthesized one.
+(define (sg-union-all-arms arms)
+  (If (any (lambda (a) (Eq sg-union-else (_0 a))) arms)
+    arms
+    (snoc [sg-union-else ["any"] 0] arms)))
+
+;; arm = [vname ftype keys]
 (define (sg-union-decl-tree name arms)
-  (define all-arms
-    (snoc [sg-union-else ["any"] 0] arms))
+  (define all-arms (sg-union-all-arms arms))
   (nrn "+"
     (Weld
       [(nw name)
@@ -1168,21 +1538,59 @@
                       (nfc "av" (sg-ft-ty-t (Ix 1 a)))])
                (nvap rsum "ok" [(nvap name (_0 a) [(nw "av")])])])]))
 
-(define (sg-union-from-tree name tagf arms)
+;; Dispatch on the constructor the value actually arrived as.  Each arm
+;; contributes one match arm per constructor it can answer to (two for a
+;; number), and the arm's own decoder still receives the whole value, so
+;; nothing here has to unwrap it.
+(define (sg-union-shape-from-tree name arms)
   (define rsum (strcat [name "_r"]))
   (define catch-all
     (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])]))
+  (nrn "+"
+    [(nw (strcat [name "_from"]))
+     (nslug [(strcat ["Decode a " name " by the json constructor it"])
+             "arrived as; any other shape rides undecoded."])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       (Weld [(nw "v")]
+         (snoc catch-all
+           (foldl
+             (lambda (acc a)
+               (Weld acc
+                 (map (lambda (c)
+                        (nrn ">" [(nfc (strcat ["j_" c]) (npth ["json" c]))
+                                  (sg-union-arm-decode name rsum a)]))
+                   (sg-shape-ctors (_0 a)))))
+             [] arms))))]))
+
+(define (sg-union-from-tree name tagf arms)
+  (define rsum (strcat [name "_r"]))
+  ;; The union's own fallback arm if it declares one (empty keys), else
+  ;; the synthesized catch-all holding the value undecoded.
+  (define own-else
+    (find (lambda (a) (Ifz (Sz (Ix 2 a)) 1 0)) arms))
+  (define catch-all
+    (Ifz own-else
+      (nvap rsum "ok" [(nvap name sg-union-else [(nw "v")])])
+      (sg-union-arm-decode name rsum (_0 own-else))))
+  ;; One guard per (arm, value): an arm may claim several tag values, and
+  ;; a chain of eq needs no `or`.
+  (define guards
+    (foldl
+      (lambda (acc a)
+        (Weld acc
+          (map (lambda (wire)
+                 (nrn "?" [(npar [(nw "eq") (ndotw "ts" "s") (nc wire)])
+                           (sg-union-arm-decode name rsum a)]))
+            (Ix 2 a))))
+      [] arms))
   (define dispatch
     (nrn "?"
       (Weld [(nw "tj")]
         [(nrn ">"
            (Weld [(nfc "ts" (npth ["json" "str"]))]
-             (snoc catch-all
-               (map (lambda (a)
-                      (nrn "?" [(npar [(nw "eq") (ndotw "ts" "s")
-                                       (nc (Ix 2 a))])
-                                (sg-union-arm-decode name rsum a)]))
-                 arms))))
+             (snoc catch-all guards)))
          (nvap rsum "err" [(nw "p") (nc "tag-not-a-string")])])))
   (nrn "+"
     [(nw (strcat [name "_from"]))
@@ -1204,17 +1612,25 @@
         (nvap rsum "err" [(nw "p") (nc "expected-object")])])]))
 
 (define (sg-union-to-tree name arms)
-  (define all-arms (snoc [sg-union-else ["any"] 0] arms))
+  (define all-arms (sg-union-all-arms arms))
   (nrn "+"
     [(nw (strcat [name "_to"]))
      (nrn "\" [(nfc "x" (nw name))])
      (nrn "^" [(nw "json")])
      (nrn "?"
        (Weld [(nw "x")]
-         (map (lambda (a)
-                (nrn ">" [(nfc (strcat ["u_" (_0 a)]) (npth [name (_0 a)]))
-                          (sg-enc-t (Ix 1 a) (ndotw (strcat ["u_" (_0 a)]) "v"))]))
-           all-arms)))]))
+         (gen (Sz all-arms)
+           (lambda (i)
+             (let* ((a (Ix i all-arms))
+                    (ft (Ix 1 a))
+                    (bnd (strcat ["u_" (_0 a)])))
+               (nrn ">"
+                 [(nfc bnd (npth [name (_0 a)]))
+                  ;; an array arm needs the same loop a record field
+                  ;; does; the arm index keeps its variables distinct
+                  (If (Eq "row" (_0 ft))
+                    (sg-enc-row (nat-str i) [(nw bnd) (nw "v")] (Ix 1 ft))
+                    (sg-enc-t ft (ndotw bnd "v")))]))))))]))
 
 (define sg-prelude-trees
   [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
@@ -1258,7 +1674,7 @@
   (If (Eq "union" kind)
     ;; each arm needs its own value decoder, exactly as a row's element
     ;; type does: request it with req=0 opt=0
-    (let* ((tagf (Ix 2 td))
+    (let* ((disc (Ix 2 td))
            (arms (Ix 3 td))
            (wanted
              (foldl (lambda (acc a) (sg-merge-entry acc [(Ix 1 a) 0 0]))
@@ -1272,7 +1688,9 @@
        (Weld (_1 hst)
          [(sg-union-decl-tree name arms)
           (sg-sum-tree (strcat [name "_r"]) (nw name))
-          (sg-union-from-tree name tagf arms)
+          (If (Eq "shape" (_0 disc))
+            (sg-union-shape-from-tree name arms)
+            (sg-union-from-tree name (Ix 1 disc) arms))
           (sg-union-to-tree name arms)])])
   (If (Eq "enum" kind)
     (let ((vals (Ix 2 td)))
@@ -1490,17 +1908,34 @@
       (Ifz hit 0
         [(sg-need "schema" (_0 hit) "spec: body param needs schema")]))))
 
-;; The 200-response schema of an operation: 0 or [schema].
+;; A three-digit 2xx status.  "2XX" is a legal OpenAPI key and is not
+;; one: a wildcard says nothing about the body's shape.
+(define (sg-ok-status? k)
+  (define cs (trip k))
+  (And (Eq 3 (Sz cs))
+    (And (Eq 50 (_0 cs)) (If (all sg-digit? cs) 1 0))))
+
+;; The success-response schema of an operation: 0 or [schema].
+;;
+;; 200 when it is there, else the first other 2xx.  A created or accepted
+;; body is the same thing to a client as an OK one, and six of this
+;; document's operations only ever answer 201 or 202.
 (define (sg-op-resp-schema v3 opv)
   (define rs (jv-get "responses" opv))
   (Ifz rs 0
-    (let ((r (jv-get "200" (_0 rs))))
-      (Ifz r 0
-        (If v3
-          (let ((c (jv-get "content" (_0 r))))
-            (Ifz c 0 [(sg-content-schema (_0 c) "spec: 200 response schema")]))
-          (let ((s (jv-get "schema" (_0 r))))
-            (Ifz s 0 [(_0 s)])))))))
+    (let* ((kvs (jv-kvs (_0 rs)))
+           (exact (find (lambda (e) (Eq "200" (Ix 0 e))) kvs))
+           (hit (Ifz exact
+                  (find (lambda (e) (sg-ok-status? (Ix 0 e))) kvs)
+                  exact)))
+      (Ifz hit 0
+        (let ((r (Ix 1 (_0 hit))))
+          (If v3
+            (let ((c (jv-get "content" r)))
+              (Ifz c 0
+                [(sg-content-schema (_0 c) "spec: 2xx response schema")]))
+            (let ((s (jv-get "schema" r)))
+              (Ifz s 0 [(_0 s)]))))))))
 
 ;;; Ref walking and slicing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -1561,6 +1996,47 @@
   (Weld (Ifz (Nil b) (sg-refs-of (_0 b)) [])
     (Ifz (Nil r) (sg-refs-of (_0 r)) [])))
 
+;;; Operations whose schema is written INLINE ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Everything downstream addresses types by NAME: the op record carries
+;;; the name of its request and response type, the closure is computed
+;;; over names, and the emitter looks types up by name.  So an operation
+;;; whose requestBody or 2xx schema is written inline rather than as a
+;;; $ref had nowhere to be addressed from, and could not generate at all
+;;; — 14 of this document's operations are written that way.
+;;;
+;;; They get a name minted from the operation, and the schema is added to
+;;; the document's own map under it.  From there nothing else changes:
+;;; the type is built, closed over and emitted like any other.
+
+(define (sg-op-opid ent)
+  (define r (jv-get "operationId" (Ix 2 ent)))
+  (Ifz r "" (sg-norm-name (jv-str! (_0 r)))))
+
+(define (sg-op-inline-name opid suffix) (strcat [opid "_" suffix]))
+
+;; The named type for one of an operation's schemas: the $ref's target
+;; when it is one, else the minted name.
+(define (sg-op-schema-name opid suffix v)
+  (define r (sg-ref-name v))
+  (Ifz (Nil r) (_0 r) (sg-op-inline-name opid suffix)))
+
+;; -> [[name schema] ..] for every inline operation schema in ents.
+(define (sg-op-inline-defs v3 ents)
+  (define (one acc opid sch suffix)
+    (Ifz (Nil sch)
+      (Ifz (Nil (sg-ref-name (_0 sch)))
+        acc
+        (snoc [(sg-op-inline-name opid suffix) (_0 sch)] acc))
+      acc))
+  (foldl
+    (lambda (acc ent)
+      (let* ((opv (Ix 2 ent))
+             (opid (sg-op-opid ent)))
+        (one (one acc opid (sg-op-body-schema v3 opv) "req")
+          opid (sg-op-resp-schema v3 opv) "res")))
+    [] ents))
+
 ;; Select operations by NORMALIZED operationId.  -> [[path method opv] ..]
 (define (sg-select-ops sv opids)
   (define ents (sg-spec-op-entries sv))
@@ -1600,11 +2076,6 @@
           (go (Inc i) "" (If (Bytes cur) (snoc (seg-of cur) acc) acc))
           (go (Inc i) (strcat [cur c]) acc)))))
   (go 0 "" []))
-
-(define (sg-ref-defname v)
-  ;; a {"$ref": "#/$defs/x"} object (post-swaggerize) -> "x"
-  (define r (sg-ref-name v))
-  (Ifz (Nil r) (_0 r) (sg-error "swagger: expected a $ref schema" v)))
 
 ;; Resolve a parameter that may itself be a $ref into components.parameters.
 (define (sg-param-deref sv p)
@@ -1660,11 +2131,12 @@
   (define pq (foldl fold-param [[] []] params))
   (define body-r (sg-op-body-schema v3 opv))
   (define body
-    (Ifz (Nil body-r) [(sg-name (sg-ref-defname (_0 body-r)))] 0))
+    (Ifz (Nil body-r)
+      [(sg-name (sg-op-schema-name opid "req" (_0 body-r)))] 0))
   (define resp-r (sg-op-resp-schema v3 opv))
   (define resp
-    (Ifz (Nil resp-r) (sg-name (sg-ref-defname (_0 resp-r)))
-      (sg-error "spec: op needs a 200 response schema" opid)))
+    (Ifz (Nil resp-r) (sg-name (sg-op-schema-name opid "res" (_0 resp-r)))
+      (sg-error "spec: op needs a 2xx response schema" opid)))
   [opid method (sg-path-segs pathstr) (_0 pq) (_1 pq) body resp])
 
 ;; -> [name basepath [typedef ..] [op ..]]
@@ -1674,14 +2146,19 @@
   (define v3 (sg-v3? sv))
   (define name (sg-spec-title sv))
   (define base (sg-spec-base sv))
-  (define schemas (sg-spec-schemas sv))
-  (define env (sg-env schemas))
   (define ents
     (Ifz (Sz opids) (sg-spec-op-entries sv) (sg-select-ops sv opids)))
+  ;; an operation may write its schema inline; that gets a name of its
+  ;; own and joins the document's map, so everything after this is blind
+  ;; to which of the two it was
+  (define inline-defs (sg-op-inline-defs v3 ents))
+  (define schemas (Weld inline-defs (sg-spec-schemas sv)))
+  (define env (sg-env schemas))
   (define reachable
     (Ifz (Sz opids) (map (lambda (e) (Ix 0 e)) schemas)
       (sg-closure schemas
-        (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents))))
+        (Weld (map (lambda (e) (Ix 0 e)) inline-defs)
+          (foldl (lambda (acc e) (Weld acc (sg-op-seed-names v3 e))) [] ents)))))
   ;; an alias is not a type: nothing is emitted for it, and references
   ;; to it were already resolved through by sg-ftype-of
   (define wanted

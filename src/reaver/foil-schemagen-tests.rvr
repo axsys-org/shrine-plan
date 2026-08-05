@@ -357,6 +357,396 @@ assert(Equal "body:expected-object"
 assert(Equal "body:missing-tag"
   (urt (strcat ["{" (kv "body" (strcat ["{" (kv "n" "1") "}"])) "}"])))
 
+;;; When no FIELD settles a union, the arms' JSON CONSTRUCTORS often do:
+;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
+;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
+;;; the constructor of the value itself instead of a key inside it, and
+;;; the variants are named for the shape (str/arr/obj/num/boo) rather
+;;; than for a type name the arm may not have.
+
+(define shape-schema
+  (strcat ["{" (kv "title" (js "shp")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "type" (js "array")) ","
+                          (kv "items" (strcat ["{" (kv "type" (js "string")) "}"]))
+                          "}]"])) "}"])) "}"]))
+           "}"]))
+(define ssut (Ix 2 (schemagen:compile-schema foil:default-subject jsut shape-schema)))
+(define srt (foil:source-entry-val ["rt"] ssut))
+
+;; each shape decodes as its own arm and re-encodes as itself
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (srt (strcat ["{" (kv "body" (js "x")) "}"])))
+assert(Equal (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])
+  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])))
+;; a shape no arm claims rides in the catch-all, exactly as an
+;; unrecognised tag does
+assert(Equal (strcat ["{" (kv "body" "true") "}"])
+  (srt (strcat ["{" (kv "body" "true") "}"])))
+;; the chosen arm still decodes properly, breadcrumb and all
+assert(Equal "body[1]:expected-string"
+  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") ",2]"])) "}"])))
+
+;;; A `number` arm needs TWO match arms, because json splits numbers by
+;;; spelling rather than by type: an integral literal is json/num and
+;;; anything else is json/real.  Both must reach the same variant.
+
+(define numsh-schema
+  (strcat ["{" (kv "title" (js "lat")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "v"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "number")) "},{"
+                          (kv "$ref" (js "#/$defs/cut")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{" (kv "cut"
+               (strcat ["{" (kv "type" (js "object")) ","
+                        (kv "properties" (strcat ["{" (kv "p50"
+                          (strcat ["{" (kv "type" (js "number")) "}"])) "}"]))
+                        "}"])) "}"]))
+           "}"]))
+(define nssut (Ix 2 (schemagen:compile-schema foil:default-subject jsut numsh-schema)))
+(define nsrt (foil:source-entry-val ["rt"] nssut))
+;; an integral literal (json/num) and a fractional one (json/real) both
+;; land on the number variant
+assert(Equal (strcat ["{" (kv "v" "5") "}"]) (nsrt (strcat ["{" (kv "v" "5") "}"])))
+assert(Equal (strcat ["{" (kv "v" "1.5") "}"]) (nsrt (strcat ["{" (kv "v" "1.5") "}"])))
+assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
+  (nsrt (strcat ["{" (kv "v" "6.02e23") "}"])))
+;; and the object arm is still reached
+assert(Equal (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])
+  (nsrt (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])))
+
+;;; A tag arm may claim a SET of wire values rather than one, and ONE arm
+;;; may decline to pin the tag at all — that arm is the union's own
+;;; catch-all and takes whatever the others do not, replacing the
+;;; synthesized one.  Both readings are tried only after the strict one
+;;; fails, so a union that already had a tag keeps the same tag.
+
+(define setfall-schema
+  (strcat ["{" (kv "title" (js "ev")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "body") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "oneOf"
+                 (strcat ["[{" (kv "$ref" (js "#/$defs/multi")) "},{"
+                          (kv "$ref" (js "#/$defs/other")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               ;; claims TWO tag values
+               (jdef "multi" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "enum"
+                     (strcat ["[" (js "a") "," (js "b") "]"])) "}"])) "}"])) "}"])) ","
+               ;; declares the tag without pinning it: the fallback
+               (jdef "other" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "type" (js "string")) "}"])) "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define sfsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut setfall-schema)))
+(define sfrt (foil:source-entry-val ["rt"] sfsut))
+;; either of the claimed values reaches the same arm
+assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])
+  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])))
+assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])
+  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])))
+;; and anything else lands in the DECLARED fallback arm, decoded by it
+;; rather than riding undecoded
+assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])
+  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])))
+
+;;; A union's ARMS lift exactly as a record's properties do.  Without it
+;;; an arm could only be a $ref or a primitive, which is what put this
+;;; document's BaseInputs and Inputs out of reach: both are
+;;; `string | array-of-<union>`, so the shape settles the outer union and
+;;; the element type has to be minted.  Generating is not the claim —
+;;; these round-trip through the lifted types.
+
+(define armlift-schema
+  (strcat ["{" (kv "title" (js "inp")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "items"
+                            (strcat ["{" (kv "oneOf"
+                              (strcat ["[{" (kv "$ref" (js "#/$defs/a")) "},{"
+                                       (kv "$ref" (js "#/$defs/b")) "}]"])) "}"]))
+                          "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "a" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "enum" (strcat ["[" (js "alpha") "]"])) "}"]))
+                   "}"])) "}"])) ","
+               (jdef "b" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "kind") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "kind"
+                   (strcat ["{" (kv "enum" (strcat ["[" (js "beta") "]"])) "}"]))
+                   "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define alsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut armlift-schema)))
+(define alrt (foil:source-entry-val ["rt"] alsut))
+;; the string arm, and the array arm whose ELEMENT is a lifted tag union
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (alrt (strcat ["{" (kv "body" (js "x")) "}"])))
+(define al-arr
+  (strcat ["{" (kv "body"
+    (strcat ["[{" (kv "kind" (js "alpha")) "},{" (kv "kind" (js "beta")) "}]"]))
+    "}"]))
+assert(Equal al-arr (alrt al-arr))
+;; the lifted element union keeps its own catch-all
+(define al-new
+  (strcat ["{" (kv "body" (strcat ["[{" (kv "kind" (js "gamma")) "}]"])) "}"]))
+assert(Equal al-new (alrt al-new))
+
+;;; ...and an arm that is an inline OBJECT lifts the same way.
+(define objarm-schema
+  (strcat ["{" (kv "title" (js "oarm")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "body"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) "},{"
+                          (kv "type" (js "object")) ","
+                          (kv "required" (strcat ["[" (js "n") "]"])) ","
+                          (kv "properties" (strcat ["{" (kv "n"
+                            (strcat ["{" (kv "type" (js "integer")) "}"])) "}"]))
+                          "}]"])) "}"])) "}"]))
+           "}"]))
+(define oasut (Ix 2 (schemagen:compile-schema foil:default-subject jsut objarm-schema)))
+(define oart (foil:source-entry-val ["rt"] oasut))
+assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+  (oart (strcat ["{" (kv "body" (js "x")) "}"])))
+assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])
+  (oart (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])))
+
+;;; A NAMED object that declares no properties says nothing about its
+;;; keys, so it is any JSON object rather than a record with no fields.
+;;; Both spellings mean it: a literal `properties: {}`, and
+;;; additionalProperties, which is a map whose value type the IR cannot
+;;; say yet.  It becomes an ALIAS — nothing is declared for it and
+;;; references resolve through — which is what the same schema already
+;;; did in field position.
+
+(define bag-schema
+  (strcat ["{" (kv "title" (js "cfg")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "opts" (strcat ["{" (kv "$ref" (js "#/$defs/bag")) "}"])) ","
+                      (kv "blank" (strcat ["{" (kv "$ref" (js "#/$defs/nada")) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "bag" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "additionalProperties"
+                   (strcat ["{" (kv "type" (js "string")) "}"])) "}"])) ","
+               (jdef "nada" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "properties" "{}") "}"]))
+               "}"]))
+           "}"]))
+(define bsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut bag-schema)))
+(define brt (foil:source-entry-val ["rt"] bsut))
+;; the map rides undecoded, keys and all
+(define b-full
+  (strcat ["{" (kv "opts" (strcat ["{" (kv "a" (js "1")) "," (kv "b" (js "2")) "}"])) ","
+           (kv "blank" (strcat ["{" (kv "z" "3") "}"])) "}"]))
+assert(Equal b-full (brt b-full))
+;; ...including an empty one, which is the shape that used to fail
+assert(Equal (strcat ["{" (kv "opts" "{}") "}"])
+  (brt (strcat ["{" (kv "opts" "{}") "}"])))
+
+;;; A NAMED array declares nothing of its own — the element is the type.
+;;; An array of a $ref or a primitive is an alias and resolves through to
+;;; row[that], but an inline element has no name, and alias resolution is
+;;; name-blind, so there is nowhere to put one.  The element is minted
+;;; under the schema's name instead, and references become a row of it.
+;;; This document spells three enums and two objects that way.
+
+(define namedrow-schema
+  (strcat ["{" (kv "title" (js "doc")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "callers" (strcat ["{" (kv "$ref" (js "#/$defs/callers")) "}"])) ","
+                      (kv "shots" (strcat ["{" (kv "$ref" (js "#/$defs/shots")) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               ;; array of an inline ENUM
+               (jdef "callers" (strcat ["{" (kv "type" (js "array")) ","
+                 (kv "items" (strcat ["{" (kv "type" (js "string")) ","
+                   (kv "enum" (strcat ["[" (js "direct") "," (js "relayed") "]"])) "}"]))
+                 "}"])) ","
+               ;; array of an inline OBJECT
+               (jdef "shots" (strcat ["{" (kv "type" (js "array")) ","
+                 (kv "items" (strcat ["{" (kv "type" (js "object")) ","
+                   (kv "required" (strcat ["[" (js "url") "]"])) ","
+                   (kv "properties" (strcat ["{" (kv "url"
+                     (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+                   "}"]))
+                 "}"]))
+               "}"]))
+           "}"]))
+(define nrsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut namedrow-schema)))
+(define nrrt (foil:source-entry-val ["rt"] nrsut))
+(define nr-full
+  (strcat ["{" (kv "callers" (strcat ["[" (js "direct") "," (js "relayed") "]"])) ","
+           (kv "shots" (strcat ["[{" (kv "url" (js "a")) "},{" (kv "url" (js "b")) "}]"]))
+           "}"]))
+assert(Equal nr-full (nrrt nr-full))
+;; the minted element enum is open, like every other enum
+(define nr-new
+  (strcat ["{" (kv "callers" (strcat ["[" (js "sideways") "]"])) "}"]))
+assert(Equal nr-new (nrrt nr-new))
+;; and an element failure still breadcrumbs through the row
+assert(Equal "shots[0].url:missing"
+  (nrrt (strcat ["{" (kv "shots" "[{}]") "}"])))
+
+;;; Three ways a schema can name something foil cannot say directly.
+;;; A value that cannot START a foil identifier is MANGLED rather than
+;;; rejected ("5m" and "1h" are this document's cache TTLs).  A numeric
+;;; enum has nothing to make variant names out of, so it is carried by
+;;; value -- and by its LEXEME, because JSON numbers can be negative and
+;;; foil's int is a nat.  And a union of enums is one enum whatever the
+;;; arms' arities: 3 values beside 1 says exactly what 1 beside 1 does.
+
+(define tail-schema
+  (strcat ["{" (kv "title" (js "tail")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{"
+               (kv "ttl" (strcat ["{" (kv "enum"
+                 (strcat ["[" (js "5m") "," (js "1h") "]"])) "}"])) ","
+               (kv "status" (strcat ["{" (kv "type" (js "integer")) ","
+                 (kv "enum" "[0,-1,-2]") "}"])) ","
+               (kv "engine" (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "enum"
+                            (strcat ["[" (js "a") "," (js "b") "," (js "c") "]"])) "},{"
+                          (kv "enum" (strcat ["[" (js "d") "]"])) "}]"])) "}"]))
+               "}"]))
+           "}"]))
+(define tsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut tail-schema)))
+(define trt (foil:source-entry-val ["rt"] tsut))
+(define t-all
+  (strcat ["{" (kv "ttl" (js "5m")) "," (kv "status" "-2") ","
+           (kv "engine" (js "d")) "}"]))
+assert(Equal t-all (trt t-all))
+;; the mangled variant still speaks the WIRE value, not its foil name
+assert(Equal (strcat ["{" (kv "ttl" (js "1h")) "}"])
+  (trt (strcat ["{" (kv "ttl" (js "1h")) "}"])))
+;; a negative rides exactly, which ["int"] could not do
+assert(Equal (strcat ["{" (kv "status" "0") "}"])
+  (trt (strcat ["{" (kv "status" "0") "}"])))
+;; and the merged enum accepts values from either arm
+assert(Equal (strcat ["{" (kv "engine" (js "b")) "}"])
+  (trt (strcat ["{" (kv "engine" (js "b")) "}"])))
+
+;;; A bare string arm beside an enum adds NOTHING, because the enum is
+;;; already open: its catch-all holds every value the bare arm would have
+;;; taken.  `ProviderName | string` says "a known provider, or any other
+;;; string" — which the enum alone already says, and which as a union is
+;;; undecidable, the two arms overlapping by construction.  Dropping the
+;;; bare arm is what makes it decidable and loses nothing.
+
+(define openenum-schema
+  (strcat ["{" (kv "title" (js "pref")) "," (kv "type" (js "object")) ","
+           (kv "properties"
+             (strcat ["{" (kv "ignore"
+               (strcat ["{" (kv "type" (js "array")) ","
+                        (kv "items"
+                          (strcat ["{" (kv "anyOf"
+                            (strcat ["[{" (kv "$ref" (js "#/$defs/prov")) "},{"
+                                     (kv "type" (js "string")) "}]"])) "}"]))
+                        "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{" (kv "prov"
+               (strcat ["{" (kv "enum"
+                 (strcat ["[" (js "openai") "," (js "anthropic") "]"])) "}"])) "}"]))
+           "}"]))
+(define oesut (Ix 2 (schemagen:compile-schema foil:default-subject jsut openenum-schema)))
+(define oert (foil:source-entry-val ["rt"] oesut))
+;; a declared provider and an undeclared one both ride, the second in the
+;; enum's own catch-all — which is exactly what the dropped arm meant
+(define oe-full
+  (strcat ["{" (kv "ignore"
+    (strcat ["[" (js "openai") "," (js "other-co") "]"])) "}"]))
+assert(Equal oe-full (oert oe-full))
+
+;;; When nothing settles the arms as ONE set, they are GROUPED by json
+;;; constructor and each group settled on its own.  ChatToolChoice is
+;;; three bare string constants beside two object refs: no field is
+;;; common to all five and the shapes are not disjoint, but "the
+;;; strings" and "the objects" are each perfectly ordinary — an enum and
+;;; a tag union.  Each group of more than one arm becomes a type of its
+;;; own, and the outer union is the shape dispatch already in hand.
+
+(define grouped-schema
+  (strcat ["{" (kv "title" (js "pick")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "choice") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "choice"
+               (strcat ["{" (kv "anyOf"
+                 (strcat ["[{" (kv "type" (js "string")) ","
+                            (kv "enum" (strcat ["[" (js "none") "]"])) "},{"
+                          (kv "type" (js "string")) ","
+                            (kv "enum" (strcat ["[" (js "auto") "]"])) "},{"
+                          (kv "$ref" (js "#/$defs/named")) "},{"
+                          (kv "$ref" (js "#/$defs/served")) "}]"])) "}"])) "}"])) ","
+           (kv "$defs"
+             (strcat ["{"
+               (jdef "named" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "type") "," (js "name") "]"])) ","
+                 (kv "properties" (strcat ["{"
+                   (kv "type" (strcat ["{" (kv "enum"
+                     (strcat ["[" (js "function") "]"])) "}"])) ","
+                   (kv "name" (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+                 "}"])) ","
+               (jdef "served" (strcat ["{" (kv "type" (js "object")) ","
+                 (kv "required" (strcat ["[" (js "type") "]"])) ","
+                 (kv "properties" (strcat ["{" (kv "type"
+                   (strcat ["{" (kv "enum"
+                     (strcat ["[" (js "server") "]"])) "}"])) "}"])) "}"]))
+               "}"]))
+           "}"]))
+(define gpsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut grouped-schema)))
+(define gprt (foil:source-entry-val ["rt"] gpsut))
+;; a string constant lands in the minted enum group
+assert(Equal (strcat ["{" (kv "choice" (js "auto")) "}"])
+  (gprt (strcat ["{" (kv "choice" (js "auto")) "}"])))
+;; an object lands in the minted tag-union group, by its own tag
+(define gp-obj
+  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "function")) ","
+                                     (kv "name" (js "f")) "}"])) "}"]))
+assert(Equal gp-obj (gprt gp-obj))
+assert(Equal (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])
+  (gprt (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])))
+;; each group keeps its OWN catch-all: an unlisted string and an
+;; unrecognised tag both still round-trip
+assert(Equal (strcat ["{" (kv "choice" (js "zzz")) "}"])
+  (gprt (strcat ["{" (kv "choice" (js "zzz")) "}"])))
+(define gp-new
+  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "later")) "}"])) "}"]))
+assert(Equal gp-new (gprt gp-new))
+;; and a shape no group claims rides in the outer catch-all
+assert(Equal (strcat ["{" (kv "choice" "true") "}"])
+  (gprt (strcat ["{" (kv "choice" "true") "}"])))
+
+;;; Shapes that are NOT disjoint are rejected rather than settled by arm
+;;; order: json/num answers to both `integer` and `number`, so a union of
+;;; the two has no constructor that tells them apart.  This document
+;;; never writes one, but arm order would be a silent wrong answer.
+assert(Equal "union groups overlap on a json constructor"
+  (gen-fails
+    (strcat ["{" (kv "title" (js "amb")) "," (kv "type" (js "object")) ","
+             (kv "properties"
+               (strcat ["{" (kv "v"
+                 (strcat ["{" (kv "anyOf"
+                   (strcat ["[{" (kv "type" (js "integer")) "},{"
+                            (kv "type" (js "number")) "}]"])) "}"])) "}"]))
+             "}"])))
+
 ;; a nested array has no ftype
 assert(Equal "nested-array-unsupported"
   (gen-fails
@@ -370,12 +760,21 @@ assert(Equal "nested-array-unsupported"
              "}"])))
 assert(Equal "missing-title"
   (gen-fails (strcat ["{" (kv "type" (js "object")) "}"])))
-assert(Equal "reserved-name"
-  (gen-fails
-    (strcat ["{" (kv "title" (js "parse")) "," (kv "type" (js "object")) ","
-             (kv "properties"
-               (strcat ["{" (kv "x" (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
-             "}"])))
+;; A name the generated module already uses for something else is
+;; MANGLED, not rejected.  `parse` is json.foil's; the document is
+;; entitled to a schema by that name and gets parse_ instead.
+(define resv-schema
+  (strcat ["{" (kv "title" (js "parse")) "," (kv "type" (js "object")) ","
+           (kv "required" (strcat ["[" (js "x") "]"])) ","
+           (kv "properties"
+             (strcat ["{" (kv "x" (strcat ["{" (kv "type" (js "string")) "}"])) "}"]))
+           "}"]))
+assert(Equal "parse_" (_0 (schemagen:gen-tree jsut resv-schema)))
+;; and the mangled module is a working one
+(define rvsut (Ix 2 (schemagen:compile-schema foil:default-subject jsut resv-schema)))
+(define rvrt (foil:source-entry-val ["rt"] rvsut))
+assert(Equal (strcat ["{" (kv "x" (js "hi")) "}"])
+  (rvrt (strcat ["{" (kv "x" (js "hi")) "}"])))
 
 (print "foil-schemagen tests passed")
 
@@ -690,13 +1089,56 @@ assert(Eq 1 (Lt 152 713))
 ;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
 ;;;   613  phase 2a (enums by wire value, constants, any-JSON)
 ;;;   690  phase 2b (tag-discriminated unions)
+;;;   692  phase 2c (shape-discriminated unions)
+;;;   696  phase 2d (union arms lift)
+;;;   700  phase 2e (a property-less object is any JSON object)
+;;;   705  phase 2f (a named array mints its element)
+;;;   709  phase 2g (digit-leading names, numeric enums, enum unions)
+;;;   711  phase 2h (set-valued tags, and a union's own fallback arm)
+;;;   713  phase 2i (arms grouped by shape, each group settled on its own)
+;;;
+;;; 713 of 713.  Every NAMED schema in the document expresses.  That is
+;;; not the same as every operation generating — see the second ratchet
+;;; below, which is still 53 of 89, because a lifted field-position type
+;;; can fail where no named schema does.
 
 (define oa-cov (schemagen:spec-coverage oa-v))
 assert(Equal 713 (Ix 1 oa-cov))
-assert(Eq 1 (Ge (_0 oa-cov) 690))
+assert(Eq 1 (Ge (_0 oa-cov) 713))
+assert(Equal [] (Ix 2 oa-cov))
 
 (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
 (define (why? w) (includes (Eq w) oa-whys))
+
+;;; A SECOND ratchet, because the first one understates the work.
+;;; spec-coverage counts NAMED schemas only, so a failure inside a
+;;; lifted field-position type never reaches it — and field position is
+;;; where the shape unions overwhelmingly live (39 of this document's
+;;; 43, against 4 named).  This counts operations whose whole module
+;;; builds, which is the number a caller actually cares about.
+;;;    46  phase 2b (tag-discriminated unions)
+;;;    49  phase 2c (shape-discriminated unions)
+;;;    49  phase 2d (union arms lift — named schemas only)
+;;;    51  phase 2e (property-less objects; ImageConfig is in chat's closure)
+;;;    53  phase 2g (digit-leading names, numeric enums, enum unions)
+;;;    74  phase 3a (any 2xx, inline op schemas minted, reserved names
+;;;                  mangled) — the biggest single jump, and none of it
+;;;                  was about what the type IR can say
+;;;    80  phase 3b (a bare string arm beside an enum is dropped)
+;;;
+;;; The 9 that remain are not gaps in the IR.  Four are binary payloads
+;;; (audio/*, video/mp4, octet-stream, multipart) with no schema to
+;;; generate at all; one operation declares no 2xx body; and four are
+;;; unions that are genuinely undecidable — an empty array matches all
+;;; four of createEmbeddings' array arms, and the 49-arm Inputs union
+;;; carries `type: "message"` on three of them.
+(define (op-builds? id)
+  (define r (Try (lambda (z)
+                   (let ((p (schemagen:sg-spec-parts oa-v [id])))
+                     (DeepSeq p 1)))
+              0))
+  (If (Eq 1 (Hd r)) 0 1))
+assert(Eq 1 (Ge (Sz (filter op-builds? oa-ids)) 80))
 
 ;;; What earlier phases retired.  These must stay absent: each was a
 ;;; whole class of schema the IR could not say, and a regression would
@@ -708,13 +1150,26 @@ assert(Eq 0 (why? "untyped-field (want type or $ref)"))
 assert(Eq 0 (why? "union of real types (needs oneOf support)"))
 assert(Eq 0 (why? "unsupported-def (want object or enum)"))
 
-;;; What is left is 23 schemas, and no longer one dominant class.  The
-;;; only group is the unions no FIELD can settle: 34 of the document's
-;;; 141 discriminate on the JSON constructor instead (mostly
-;;; `string | array`), and 5 are genuinely ambiguous — one has 49 arms
-;;; with `type: "message"` on three of them.  Guessing between those two
-;;; cases would be worse than saying so.
-assert(Eq 1 (why? "union has no discriminating field"))
+;;; A union's ARMS now lift the way a record's properties do, so an arm
+;;; that is an inline object, enum or union gets a name of its own.
+;;; That retired the last structural gap: BaseInputs and Inputs are
+;;; `string | array-of-<union>`, settled by shape and then by lifting
+;;; the element type.
+assert(Eq 0 (why? "inline-union (hoist to $defs)"))
+
+;;; Nothing is left.  Each of these was a whole CLASS of schema the IR
+;;; could not say, and every one is now retired — a regression would show
+;;; up here long before the count moved much.
+assert(Eq 0 (why? "union has no discriminating field or shape"))
+;; a name that cannot start a foil identifier is mangled, not rejected
+assert(Eq 0 (why? "bad-name (want [a-z][a-z0-9_]*)"))
+;; a numeric enum is carried by value rather than named
+assert(Eq 0 (why? "expected-string"))
+;; a property-less object is any JSON object, not a failure
+assert(Eq 0 (why? "empty-object"))
+;; and an inline type anywhere lifting reaches now gets a name
+assert(Eq 0 (why? "inline-enum (hoist to $defs)"))
+assert(Eq 0 (why? "inline-object (hoist to $defs)"))
 
 ;;; E. /models expresses COMPLETELY — every schema in its closure —
 ;;; which is what makes it the first operation a real client can use.
@@ -739,3 +1194,28 @@ assert(Equal ["offset" ["int"] 0] (qp "offset"))
 assert(Equal ["limit" ["int"] 0] (qp "limit"))
 assert(Equal ["category" ["str"] 0] (qp "category"))
 assert(Equal ["min_price" ["num"] 0] (qp "min_price"))
+
+;;; F. What an operation needs beyond its schemas expressing.
+
+;;; A created or accepted body is the same thing to a client as an OK
+;;; one.  Six of this document's operations only ever answer 201 or 202,
+;;; and read as having no response at all until 2xx was accepted.
+(define oa-created (schemagen:sg-spec-parts oa-v ["create_workspace"]))
+assert(Equal 1 (Sz (Ix 3 oa-created)))
+assert(Equal "create_workspace" (_0 (_0 (Ix 3 oa-created))))
+
+;;; An operation may write its schema INLINE rather than as a $ref.
+;;; Everything downstream addresses types by name, so those had nowhere
+;;; to be addressed from; the type is now minted from the operation id.
+(define oa-inline (schemagen:sg-spec-parts oa-v ["get_analytics_meta"]))
+(define oa-iop (_0 (Ix 3 oa-inline)))
+assert(Equal "get_analytics_meta_res" (Ix 6 oa-iop))
+;; and the minted type is really emitted, not just named
+assert(Eq 1 (includes (Eq "get_analytics_meta_res")
+              (map (lambda (td) (Ix 1 td)) (Ix 2 oa-inline))))
+
+;;; A name the generated module already uses is mangled, not rejected.
+;;; This document has schemas called `json` and `ws`, and an operationId
+;;; `list` — which is reserved only because json.foil came to need it.
+(define oa-resv (schemagen:sg-spec-parts oa-v ["list"]))
+assert(Equal "list_" (_0 (_0 (Ix 3 oa-resv))))
