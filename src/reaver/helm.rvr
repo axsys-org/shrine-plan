@@ -201,6 +201,32 @@
 ;; deduped — forge's ref-table restated in mirror paths.  Refs to
 ;; anything unmirrored (builtins) drop out.
 (define (boot-ref-table cache)
+  ;; key -> mirror node as a cairn AX — the linear find here was
+  ;; O(refs x entries) across the whole cache.  Unit-id PINS as bst
+  ;; key segments are poison: cmp-total opens UNEQUAL pins and
+  ;; compares their whole contents, so one descent past a unit-id
+  ;; walks two entire unit subjects.  Intern pins to small indexes
+  ;; first (Eq on pins is store identity); keys become pin-free.
+  (define units
+    (foldl
+      (lambda (a me)
+        (let ((unit (sut-unit (_1 me))))
+          (let ((uid (If (foil-env:unit? unit)
+                       (foil-env:unit-identity unit) 0)))
+            (If (Or (Ifz uid 1 0) (includes (Eq uid) a))
+              a (snoc uid a)))))
+      [] cache))
+  (define (pin-idx p)
+    (define n (Sz units))
+    (define (go i)
+      (If (Ge i n) 0 (If (Eq p (Ix i units)) [i] (go (Inc i)))))
+    (go 0))
+  (define (intern-seg s)
+    (If (IsPin s)
+      (let ((hit (pin-idx s)))
+        (Ifz hit ["#pin-miss"] ["#pin" (_0 hit)]))
+      s))
+  (define (intern-key k) (map intern-seg k))
   (define keymap
     (foldl
       (lambda (acc me)
@@ -208,39 +234,57 @@
         (define unit (sut-unit (_1 me)))
         (define unit-id
           (If (foil-env:unit? unit) (foil-env:unit-identity unit) 0))
+        (define own-ax (foil-relocate:own-index own))
         (foldl
           (lambda (a k)
             (define node (boot-ent-node (_0 me) (drop 1 k)))
-            (define raw (snoc [k node] a))
+            (define raw (cairn:putax (intern-key k) node a))
             (Ifz unit-id
               raw
-              (snoc [(foil-relocate:qualify-canonical-path own unit-id k) node]
-                raw)))
+              (cairn:putax
+                (intern-key
+                  (foil-relocate:qualify-canonical-path own-ax unit-id k))
+                node raw)))
           acc own))
-      [] cache))
+      cairn:empty-ax cache))
   (define (node-for k)
-    (find (lambda (e) (Equal k (_0 e))) keymap))
-  (foldl
-    (lambda (acc me)
-      (foldl
-        (lambda (a k)
-          (let ((srcn (boot-ent-node (_0 me) (drop 1 k)))
-                (refs (foil:collect-refs (got-entry-tc k (_1 me)))))
-            (foldl
-              (lambda (aa r)
-                (let ((hit (node-for (resolve-path (_1 r)))))
-                  (Ifz hit
-                    aa
-                    (let ((row [srcn (_1 (_0 hit))]))
-                      (If (includes (Equal row) aa) aa (snoc row aa))))))
-              a refs)))
-        acc (entry-own-keys me)))
-    [] cache))
+    (cairn:getax (intern-key k) keymap))
+  ;; dedup via a seen-AX keyed by the [src dst] row itself
+  (_1
+    (foldl
+      (lambda (st me)
+        (foldl
+          (lambda (st1 k)
+            (let ((srcn (boot-ent-node (_0 me) (drop 1 k)))
+                  (refs (foil:collect-refs (got-entry-tc k (_1 me)))))
+              (foldl
+                (lambda (st2 r)
+                  (let ((hit (node-for (resolve-path (_1 r)))))
+                    (Ifz hit
+                      st2
+                      (let ((row [srcn (_0 hit)]))
+                        (Ifz (cairn:getax row (_0 st2))
+                          [(cairn:putax row 1 (_0 st2)) (snoc row (_1 st2))]
+                          st2)))))
+                st1 refs)))
+          st (entry-own-keys me)))
+      [cairn:empty-ax []] cache)))
 
-;; A node's outgoing and incoming reference rows from the table.
-(define (refs-of reftab node)
-  [(map (Ix 1) (filter (lambda (r) (Equal node (Ix 0 r))) reftab))
-   (map (Ix 0) (filter (lambda (r) (Equal node (Ix 1 r))) reftab))])
+;; The ref table grouped by endpoint: [out-ax in-ax], node -> row of
+;; peers.  Built once — the per-entry filter pair over the whole
+;; table was O(entries x refs).
+(define (ref-axes reftab)
+  (foldl
+    (lambda (axs r)
+      (let ((s (Ix 0 r)) (d (Ix 1 r)))
+        [(cairn:putax s (snoc d (cairn:gutax s [] (_0 axs))) (_0 axs))
+         (cairn:putax d (snoc s (cairn:gutax d [] (_1 axs))) (_1 axs))]))
+    [cairn:empty-ax cairn:empty-ax] reftab))
+
+;; A node's outgoing and incoming reference rows from the grouped axes.
+(define (refs-of raxes node)
+  [(cairn:gutax node [] (_0 raxes))
+   (cairn:gutax node [] (_1 raxes))])
 
 ;; The cache passed explicitly: the app pipeline compiles apps into
 ;; the core's cache first, then mirrors from the extended cache so
@@ -261,7 +305,7 @@
   (define ent-x (core-ent core ["mirror" "extras"]))
   (define msing (core-ent core ["myth" "sing"]))
   (define mmeld (core-ent core ["myth" "meld"]))
-  (define reftab (If refs? (boot-ref-table cache) []))
+  (define raxes (ref-axes (If refs? (boot-ref-table cache) [])))
   (define (mod-parts me)
     (define mod (_0 me))
     (define sut (_1 me))
@@ -294,7 +338,7 @@
               (foil-render:render-law (foil:ent-val e))
               0)
             0)))
-      (define rr (refs-of reftab node))
+      (define rr (refs-of raxes node))
       ;; entry paths are module-relative; consumers re-root them
       [(drop (Sz mnode) node)
        (ent-x tydesc lawtext (Ix 0 rr) (Ix 1 rr)

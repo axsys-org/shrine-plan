@@ -199,8 +199,14 @@
     ((And (Ge c 65) (Le c 70)) (Sub c 55))
     (else 0)))
 
+;; CR bytes are dropped: browsers normalize every form value to CRLF
+;; on submit, and nothing downstream (semidoc reparse, foil eval)
+;; speaks \r — an editor POST arrived as \r\n-lines and wrecked the
+;; reparse, and even a one-line run expr picked up a trailing \r.
 (define (url-decode s)
   (define n (Bytes s))
+  (define (emit c rest)
+    (If (Eq c 13) rest (lcons c rest)))
   (define (go i)
     (If (Ge i n)
       0
@@ -208,12 +214,22 @@
         (cond
           ((Eq c 43) (lcons 32 (go (Inc i))))
           ((And (Eq c 37) (Lt (Add i 2) n))
-            (lcons
+            (emit
               (Add (Mul 16 (hex-val (Load8 (Add i 1) s)))
                 (hex-val (Load8 (Add i 2) s)))
               (go (Add i 3))))
-          (else (lcons c (go (Inc i))))))))
+          (else (emit c (go (Inc i))))))))
   (lstrcat (go 0)))
+
+;; Strip leading/trailing whitespace bytes (space, tab, LF, CR).
+(define (trim-ws s)
+  (define n (Bytes s))
+  (define (ws? b) (Or (Eq b 32) (Or (Eq b 9) (Or (Eq b 10) (Eq b 13)))))
+  (define (start i) (If (And (Lt i n) (ws? (Load8 i s))) (start (Inc i)) i))
+  (define (end i) (If (And (Gt i 0) (ws? (Load8 (Dec i) s))) (end (Dec i)) i))
+  (define a (start 0))
+  (define b (end n))
+  (If (Ge a b) "" (Trunc (Mul 8 (Sub b a)) (Rsh s (Mul 8 a)))))
 
 ;; One urlencoded field's decoded value, or "".
 (define (form-field name body)
@@ -384,7 +400,10 @@
       (define verb (Ix 1 parts))
       (define mod (helm-doctest:join-slash (drop 2 parts)))
       (cond
-        ((Eq verb "eval") ((h-evalreq hs) mod (form-field "expr" body)))
+        ;; an expr is one expression: trim the whitespace a browser
+        ;; form ships around it (the run form's literal body ends
+        ;; with the newline it was written with)
+        ((Eq verb "eval") ((h-evalreq hs) mod (trim-ws (form-field "expr" body))))
         ((Eq verb "compile") ((h-compreq hs) mod))
         ((Eq verb "save") ((h-savereq hs) mod (form-field "src" body)))
         (else 0)))
