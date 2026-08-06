@@ -1062,6 +1062,27 @@
   (define b (procCode p))
   (define children (blockChildren b))
   (define usedSet (directUseSet b))
+  ;; Uses inside REC thunk bodies are invisible to blockChildren (REC
+  ;; bodies are not move destinations: prepending above a nested knot
+  ;; would displace it from the block prelude) and are not "direct",
+  ;; so they must BLOCK a move outright — otherwise the moved bind's
+  ;; reference in the knot body dangles ("codegenOpt: unbound local").
+  ;; Each entry is [ownerStmtId freeSet]; a candidate REC group skips
+  ;; its own bodies so knots with DELAY binds still move as a group.
+  (define recBodyFrees
+    (map-maybe
+      (lambda (s)
+        (? Stmt s
+          (REC [binds]
+            (Ifz (Sz binds) []
+              (map-maybe
+                (lambda (kv)
+                  (? Alloc (_1 kv)
+                    (DELAY [body] [[(_0 (_0 binds)) (procFree body)]])
+                    (CLOSE [])))
+                binds)))
+          (_ [])))
+      b))
   (lcatmap
     (lambda (idStmt)
       (define stmtId (_0 idStmt))
@@ -1074,7 +1095,14 @@
               [(_0 kp)]
               []))
           children))
-      (If (any (lambda (k) (bst-has k usedSet)) keyset)
+      (define usedFromRecBody
+        (any
+          (lambda (e)
+            (And (Nil (Eq (_0 e) stmtId))
+              (Nil (set-null (set-intersect keyset (_1 e))))))
+          recBodyFrees))
+      (If (Or usedFromRecBody
+            (any (lambda (k) (bst-has k usedSet)) keyset))
         NIL
         (Ifz (Eq 1 (Sz subBlocksWhichUse))
           NIL
