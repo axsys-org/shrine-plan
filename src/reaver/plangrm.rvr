@@ -2878,7 +2878,12 @@
 ;; and self-calls terminate).  Both caller and callee compute this
 ;; independently; the runtime entry gate compares the two, so drift
 ;; only costs the fast entry, never correctness.
-(define (sigOfLawB budget v)
+(define (sigOfLawG lawSigB v)
+  ;; parametrized over the callee-sig function (0 = prim-only base
+  ;; case).  Budget recursion is expressed by the concrete lawSigB
+  ;; passed in, so each budget tier below is a distinct top-level pin
+  ;; — which is exactly what the Memo op needs as a cache key
+  ;; (partial applications are not pins).
   (define attempt
     (Try
       (lambda (z)
@@ -2888,23 +2893,16 @@
             (begin
               (define ri[depth p0i] (ingestLawOpt v))
               (define p (recurLower p0i))
-              ;; transitive law-to-law strictness: known law calls in
-              ;; the pipeline see their callees' signatures, computed
-              ;; with one budget tick less — budget 0 is the prim-only
-              ;; base case, so mutual recursion terminates and every
-              ;; top-level sigOfLaw call is the same deterministic
-              ;; function of the law alone (callers and callees agree).
-              (define lawSigB (Ifz budget 0 (sigOfLawB (Dec budget))))
               ;; the sig table threads through the rounds: each
-              ;; distinct callee head is sig'd once per sigOfLawB
-              ;; call, not once per site per round
+              ;; distinct callee head is sig'd once per call, not
+              ;; once per site per round
               (define (round5 tb0 p0 uq0)
                 (define r0[uqw pw] (inlinePrimWrappers p0 uq0))
                 (define tb
-                  (Ifz budget 0
+                  (Ifz lawSigB 0
                     (sigTableAdd lawSigB tb0 (fastHeads pw))))
                 (define r1[uq1 p1]
-                  (strictify (Ifz budget 0 (sigLookup tb))
+                  (strictify (Ifz lawSigB 0 (sigLookup tb))
                     0 0 depth pw uqw))
                 (define p2 (reforce p1))
                 (define rd[dethunked p3] (dethunkOpt p2))
@@ -2920,9 +2918,26 @@
       0))
   (If (Hd attempt) 0 (_0 attempt)))
 
+;; The pinned budget tiers.  Transitive law-to-law strictness:
+;; budget 1 sees its callees at their budget-0 (prim-only)
+;; signatures, so mutual recursion terminates and every top-level
+;; sigOfLaw call is the same deterministic function of the law alone
+;; (callers and callees agree).  Callee queries go through the Memo
+;; op — (Memo f x) ≡ (f x), with the runtime permitted to serve the
+;; pinned pair from its machine-global nat cache — so a law's
+;; signature is computed once per (compiler, law) per machine instead
+;; of once per caller per compile (doc/sigoflaw-memo-spec.md).
+(define (sigOfLawB0 v) (sigOfLawG 0 v))
+(define (sigOfLawB1 v) (sigOfLawG (lambda (h) (Memo sigOfLawB0 h)) v))
+
+;; budget-B entry (tests, general use): 0 = prim-only, else one
+;; transitive tick
+(define (sigOfLawB budget v)
+  (Ifz budget (sigOfLawB0 v) (sigOfLawB1 v)))
+
 ;; the signature every caller and callee computes: one transitive tick
 ;; (callees are seen at their prim-only signatures)
-(define (sigOfLaw v) (sigOfLawB 1 v))
+(define (sigOfLaw v) (Memo sigOfLawB1 v))
 
 ;; The pipeline levels.  Each returns a full compiler (law -> code
 ;; row); any error in the optimizing path falls the law back to the
