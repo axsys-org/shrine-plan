@@ -1,0 +1,264 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bst (#module bst))
+(#import bst)
+(#bind plangrm (#module plangrm))
+(#import plangrm)
+(#bind plangrm-diff (#module plangrm-diff))
+(#import plangrm-diff)
+
+;;; Compile-TIME profiler for the plangrm optimizing pipeline.
+;;;
+;;; Modes (profile-main [mode ...]):
+;;;   levels <iters>       — wall time per pipeline level over the corpus
+;;;   top <level>          — slowest individual laws at a level
+;;;   passes <level> <n>   — per-pass time breakdown (mirrors optPasses)
+;;;
+;;; All timings via Now (ns) with DeepSeq forcing between stamps, per
+;;; the bench conventions in plangrm-bench.rvr.
+
+;; decimal string of a nat (big nats otherwise print as byte-strings)
+(define (dec-nat n)
+  (define (go n acc)
+    (Ifz n acc (go (Div n 10) (Add (Add 48 (Mod n 10)) (Lsh acc 8)))))
+  (Ifz n "0" (go n 0)))
+
+(define (to-ms n) (Div n 1000000))
+(define (to-us n) (Div n 1000))
+
+(define (law-name l) (Name (If (IsPin l) (Unpin l) l)))
+
+;; reef's foreach drops f in its recursion (prints only the first
+;; element); local strict list-print loop instead.
+(define (print-each f ls)
+  (Ifz ls 0
+    (Seq (f (_0 ls)) (print-each f (_1 ls)))))
+
+;; timed: deep-force dep (the pass inputs — charges upstream work to
+;; its own producer), stamp, run (f 0), deep-force the result, stamp.
+;; The returned result is gated on the end stamp so any downstream
+;; consumer forces this pass's window closed before starting its own.
+;; -> [acc' result]
+(define (timed name dep f acc)
+  (define dd (DeepSeq dep 0))
+  (define t0 (Seq dd (Now 0)))
+  (define r (Seq t0 (f 0)))
+  (define d (DeepSeq r 0))
+  (define t1 (Seq d (Now 0)))
+  [(bst-ups name [0 0]
+     (lambda (e) [(Add (_0 e) (Sub t1 t0)) (Inc (_1 e))])
+     acc)
+   (Seq t1 r)])
+
+;; wall-time one compile, deep-forced.  -> ns
+(define (time-one compileFn l)
+  (define t0 (Now 0))
+  (define c (Seq t0 (compileFn l)))
+  (define d (DeepSeq c 0))
+  (define t1 (Seq d (Now 0)))
+  (Sub t1 t0))
+
+
+;;; mode: levels ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Rolling checksum of a code row: position-sensitive over nat
+;; elements, constant marker for non-nat literals (pins/laws).  Strong
+;; enough to catch any op/operand/order drift across a change.
+(define CKP 2305843009213693951)
+(define (code-sum c)
+  (foldl
+    (lambda (a v)
+      (Mod (Add (Mul a 1000003)
+             (If (IsNat v) (Mod v 4294967291) 4000000007))
+        CKP))
+    7 c))
+
+(define (time-level name compileFn laws)
+  (define t0 (Now 0))
+  (define st
+    (Seq t0
+      (lfoldl
+        (lambda (a l)
+          (begin
+            (define c (compileFn l))
+            (Seq (DeepSeq c 0)
+              [(Add (_0 a) (Sz c))
+               (Mod (Add (Mul (_1 a) 31) (code-sum c)) CKP)])))
+        [0 7] laws)))
+  (define t1 (Seq (DeepSeq st 0) (Now 0)))
+  (print ["LEVEL" name "ms" (dec-nat (to-ms (Sub t1 t0)))
+          "opsum" (dec-nat (_0 st))
+          "cksum" (dec-nat (_1 st))]))
+
+(define (run-levels laws)
+  (Seq (print ["corpus laws" (dec-nat (llen laws))])
+    (Seq (time-level "dumb" codegenLaw laws)
+      (Seq (time-level "p1" compileP1 laws)
+        (Seq (time-level "p2" compileP2 laws)
+          (Seq (time-level "p3" compileP3 laws)
+            (Seq (time-level "p4" compileP4 laws)
+              (Seq (time-level "p5" compileP5 laws)
+                (time-level "p6" compileP6 laws)))))))))
+
+
+;;; mode: top ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (run-top compileFn laws)
+  (define pairs
+    (lmap (lambda (l) [(time-one compileFn l) (law-name l)]) laws))
+  (define sorted (sort Cmp (lrow pairs)))
+  (define n (Sz sorted))
+  (define k (If (Lt n 15) n 15))
+  (define top (rev (drop (Sub n k) sorted)))
+  (Seq
+    (print-each
+      (lambda (e) (print ["LAW" (_1 e) "us" (dec-nat (to-us (_0 e)))]))
+      (stream top))
+    (print ["total-ms"
+            (dec-nat (to-ms (foldl (lambda (a e) (Add a (_0 e))) 0 sorted)))])))
+
+
+;;; mode: passes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Mirrors compileOptLevel/optPasses for levels 5 and 6, timing each
+;;; pass separately.  Laws that error (the dumb-fallback path) are
+;;; counted and skipped.
+
+(define (profile-law level l acc0)
+  ;; -> [acc rounds]
+  (define attempt
+    (Try
+      (lambda (z)
+        (begin
+          (define r0[acc1 ri] (timed "01-ingest" l (lambda (z2) (ingestLawOpt l)) acc0))
+          (define depth (_0 ri))
+          (define r1[acc2 p] (timed "02-recurLower" ri (lambda (z2) (recurLower (_1 ri))) acc1))
+          (define r2[acc3 maxk] (timed "03-refcounts-maxk" p (lambda (z2) (bstMaxKey (refcounts p))) acc2))
+          (define r3[acc4 selfSig]
+            (If (Ge level 6)
+              (timed "04-sigOfLaw-self" [maxk l] (lambda (z2) (sigOfLaw l)) acc3)
+              [acc3 0]))
+          (define (round acc p0 uq0)
+            ;; -> [acc uq dethunked pOut]
+            (begin
+              (define ra[acca rw] (timed "05-inlinePrimWrap" [p0 uq0] (lambda (z2) (inlinePrimWrappers p0 uq0)) acc))
+              (define rb[accb rs] (timed "06-strictify" rw (lambda (z2) (strictify 0 0 0 depth (_1 rw) (_0 rw))) acca))
+              (define p1 (_1 rs))
+              (define rc[accc rbl] (timed "07-brLower" rs (lambda (z2) (brLower p1 (_0 rs))) accb))
+              (define rd[accd p1s] (timed "08-brSink" rbl (lambda (z2) (brSink (_1 rbl))) accc))
+              (define re[acce p1r] (timed "09-reforce" p1s (lambda (z2) (reforce p1s)) accd))
+              (define rf[accf p2] (timed "10-brCondClean" p1r (lambda (z2) (brCondClean p1r)) acce))
+              (define rg[accg rdt] (timed "11-dethunkOpt" p2 (lambda (z2) (dethunkOpt p2)) accf))
+              (define rh[acch risp] (timed "12-inlineSingleUse" rdt (lambda (z2) (inlineSingleUseProcs (_1 rdt) (_0 rbl))) accg))
+              (define ri2[acci p4] (timed "13-deadCodeElim" risp (lambda (z2) (deadCodeElim (_1 risp))) acch))
+              [acci (_0 risp) (_0 rdt) p4]))
+          (define (go i acc p0 uq0 rounds)
+            (Ifz i [acc p0 rounds]
+              (begin
+                (define rr[accq uq1 dethunked p1] (round acc p0 uq0))
+                (define rq
+                  (If (Ge level 6)
+                    (timed "14-equal-check" [p1 p0] (lambda (z2) (Nil (Equal p1 p0))) accq)
+                    [accq 0]))
+                (define continue
+                  (Or dethunked (And (Ge level 6) (_1 rq))))
+                (Ifz continue [(_0 rq) p1 (Inc rounds)]
+                  (go (Dec i) (_0 rq) p1 uq1 (Inc rounds))))))
+          (define rg2[accA pf rounds] (go 8 acc4 p maxk 0))
+          (define rfin
+            (Ifz (Ge level 6) [accA pf 0]
+              (begin
+                (define rh2[accB heads] (timed "15-fastHeads" pf (lambda (z2) (fastHeads pf)) accA))
+                (define ri3[accC tb] (timed "16-sigOfLaw-callees" heads (lambda (z2) (sigTableAdd sigOfLaw [] heads)) accB))
+                (define rj[accD rsf]
+                  (timed "17-final-strictify" [tb pf]
+                    (lambda (z2)
+                      (strictify (sigLookup tb) selfSig
+                        (Dec (Sz (procArgs pf))) depth pf
+                        (bstMaxKey (refcounts pf))))
+                    accC))
+                (define rk[accE pr] (timed "18-final-refc-brcc" rsf (lambda (z2) (brCondClean (reforce (_1 rsf)))) accD))
+                (define rl[accF rdt2] (timed "19-final-dethunk" pr (lambda (z2) (dethunkOpt pr)) accE))
+                (define rm[accG risp2] (timed "20-final-inline" rdt2 (lambda (z2) (inlineSingleUseProcs (_1 rdt2) (_0 rsf))) accF))
+                (define rn[accH pd] (timed "21-final-dce" risp2 (lambda (z2) (deadCodeElim (_1 risp2))) accG))
+                [accH pd (sigLookup tb)])))
+          (define ro[accI code]
+            (timed "22-codegenOpt" rfin
+              (lambda (z2)
+                (codegenOpt (_2 rfin) selfSig 1 depth (_1 rfin)))
+              (_0 rfin)))
+          [accI rounds]))
+      0))
+  (If (Hd attempt)
+    [(bst-ups "99-fallback" [0 0]
+       (lambda (e) [(_0 e) (Inc (_1 e))])
+       acc0)
+     0]
+    (_0 attempt)))
+
+(define (run-passes level laws)
+  (define done
+    (lfoldl
+      (lambda (st l)
+        (begin
+          (define r[acc rounds] (profile-law level l (_0 st)))
+          [acc (bst-ups rounds [0 0]
+                 (lambda (e) [(Inc (_0 e)) 0])
+                 (_1 st))]))
+      [E E]
+      laws))
+  (Seq
+    (print-each
+      (lambda (kv)
+        (print ["PASS" (_0 kv)
+                "ms" (dec-nat (to-ms (_0 (_1 kv))))
+                "calls" (dec-nat (_1 (_1 kv)))]))
+      (stream (sort Cmp (lrow (bst-ltap (_0 done))))))
+    (print-each
+      (lambda (kv)
+        (print ["ROUNDS" (dec-nat (_0 kv)) "laws" (dec-nat (_0 (_1 kv)))]))
+      (bst-ltap (_1 done)))))
+
+
+;;; entry ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Stable seed set: stdlib/bst functions only, NO plangrm functions —
+;; the diff corpus includes the compiler's own passes, so editing the
+;; compiler changes that corpus and invalidates before/after checksum
+;; comparison.  This one is fixed across compiler edits.
+(define stable-seeds
+  [map foldr foldl filter sort uniq cat weld cons stream lzip
+   bst-insert bst-search bst-ltap cmp-total find-idx gen rev
+   take drop snoc any all sum lfoldl lfilter lcatmap lweld ltake
+   parse-nat])
+
+(define (profile-main args)
+  (define mode (_0 args))
+  ;; "full" as the last arg switches to the diff corpus (includes the
+  ;; compiler's own passes — bigger laws, but self-referential: NOT
+  ;; usable for before/after checksum comparison across compiler edits)
+  (define laws
+    (If (Eq "full" (Ix (Dec (Sz args)) args))
+      (corpus default-seeds)
+      (corpus stable-seeds)))
+  (cond
+    ((Eq mode "levels") (run-levels laws))
+    ((Eq mode "top")
+      (begin
+        (define level (parse-nat (_1 args)))
+        (define chit
+          (cond
+            ((Eq level 4) compileP4)
+            ((Eq level 5) compileP5)
+            ((Eq level 6) compileP6)
+            (else codegenLaw)))
+        (run-top chit laws)))
+    ((Eq mode "passes")
+      (begin
+        (define level (parse-nat (_1 args)))
+        (define limit (parse-nat (_2 args)))
+        (define lws (Ifz limit laws (ltake limit laws)))
+        (run-passes level lws)))
+    (else (print ["unknown mode" mode]))))
