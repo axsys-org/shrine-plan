@@ -493,6 +493,83 @@
   (define r[uq2 code] (goBlock (procCode p) uq))
   [uq2 (mkProc (procArgs p) code)])
 
+;; inlineProcsMap: inlineCallsToProc generalized to a bst of targets
+;; (key -> proc), inlining every call to any of them and dropping
+;; their definitions in ONE walk.  The inlined block is re-walked, so
+;; call sites of other targets inside spliced code are still found.
+;; Used by inlineSingleUseProcs to avoid a full refcount + rescan per
+;; individual target.
+(define (inlineProcsMap targets p uq)
+  (define (goBlock b uq2)
+    (define (goProc p2 uqp)
+      (define r[uqx code] (goBlock (procCode p2) uqp))
+      [uqx (mkProc (procArgs p2) code)])
+    (define (goAlloc a uqa)
+      (? Alloc a
+        (CLOSE [uqa a])
+        (DELAY [body]
+          (begin
+            (define r[uqx p2] (goProc body uqa))
+            [uqx ($DELAY p2)]))))
+    (define (goTail s cont uqt)
+      (define r[uqx rest] (goBlock cont uqt))
+      [uqx (cons s rest)])
+    (Ifz (Sz b) [uq2 []]
+      (begin
+        (define s (_0 b))
+        (define cont (drop 1 b))
+        (? Stmt s
+          (CALL [key op args]
+            (begin
+              (define hit
+                (? Op op
+                  (LOCAL [key] (bst-search key targets))
+                  (_ 0)))
+              (Ifz hit
+                (goTail s cont uq2)
+                (begin
+                  (define r[uq3 inlined] (inline key (_0 hit) args cont uq2))
+                  (goBlock inlined uq3)))))
+          (PROC [key body]
+            (If (bst-has key targets)
+              (goBlock cont uq2)
+              (begin
+                (define r[uq3 p2] (goProc body uq2))
+                (goTail ($PROC key p2) cont uq3))))
+          (BR [x arms]
+            (begin
+              (define rb
+                (foldl
+                  (lambda (acc br)
+                    (begin
+                      (define uqa (_0 acc))
+                      (define done (_1 acc))
+                      (define rp[uqb p2] (goProc (_1 br) uqa))
+                      [uqb (snoc [(_0 br) p2] done)]))
+                  [uq2 []]
+                  arms))
+              (goTail ($BR x (_1 rb)) cont (_0 rb))))
+          (LET [key rhs]
+            (begin
+              (define r[uq3 a2] (goAlloc rhs uq2))
+              (goTail ($LET key a2) cont uq3)))
+          (REC [binds]
+            (begin
+              (define rb
+                (foldl
+                  (lambda (acc kv)
+                    (begin
+                      (define uqa (_0 acc))
+                      (define done (_1 acc))
+                      (define ra[uqb a2] (goAlloc (_1 kv) uqa))
+                      [uqb (snoc [(_0 kv) a2] done)]))
+                  [uq2 []]
+                  binds))
+              (goTail ($REC (_1 rb)) cont (_0 rb))))
+          (_ (goTail s cont uq2))))))
+  (define r[uq2 code] (goBlock (procCode p) uq))
+  [uq2 (mkProc (procArgs p) code)])
+
 ;; listOfProcs :: Proc -> [(Key, Proc)]  (a list of [key proc] pairs)
 (define (listOfProcs top)
   (define (goAlloc a)
@@ -517,12 +594,18 @@
     (listOfProcs top)))
 
 ;; inlineSingleUseProcs :: Proc -> UniqueM Proc
+;;
+;; Inline all current singles in one walk per iteration (inlining a
+;; single-use proc never changes any other proc's refcount — bodies
+;; move, they are not duplicated — so one refcount pass covers the
+;; whole batch); iterate for procs that newly become single-use
+;; (join points introduced by non-tail inlines).
 (define (inlineSingleUseProcs p uq)
   (define singles (singleUseProcs p))
   (Ifz singles [uq p]
     (begin
-      (define kp (_0 singles))
-      (define r[uq2 p2] (inlineCallsToProc (_0 kp) (_1 kp) p uq))
+      (define r[uq2 p2]
+        (inlineProcsMap (bst-from-pairs-list singles) p uq))
       (inlineSingleUseProcs p2 uq2))))
 
 
@@ -532,7 +615,7 @@
 ;;; besides forcing — as an operand, stored in a closure, or referenced
 ;;; from another thunk.
 
-(define (usedLazily k b)
+(define (lazilyUsedKeys b)
   (define (goAtom a)
     (? Atom a
       (REF [key] ~[key])
@@ -557,7 +640,15 @@
       (BR [x arms]
         (lweld (goAtom x)
           (lcatmap (lambda (br) (bloc (procCode (_1 br)))) (stream arms))))))
-  (lhas k (lcatmap goStmt (stream b))))
+  (lcatmap goStmt (stream b)))
+
+(define (usedLazily k b)
+  (lhas k (lazilyUsedKeys b)))
+
+;; lazilyUsedKeys as a bst, for testing many candidates against one
+;; block without rescanning it per candidate.
+(define (lazilyUsedSet b)
+  (lfoldl (lambda (t k) (bst-insert k 1 t)) E (lazilyUsedKeys b)))
 
 ;; procThunks :: Proc -> [(Key, Proc)]  (immediate LET/REC thunks only)
 (define (procThunks p)
@@ -915,10 +1006,62 @@
             [(If (isTargetStmt s) (prependToSubBlock s) s)]))))
     p))
 
+;; directUseSet: every key used directly during the execution of this
+;; basic block (ignoring branches and sub-blocks), as one bst.  A
+;; REC's references to its own binding group are excluded, mirroring
+;; usedDirectly — equivalent for any target set because keys are
+;; globally unique, so only a statement's own keys can be its
+;; self-references.  Lets computePureMoves test each bind by
+;; membership instead of rescanning the block per bind.
+(define (directUseSet b)
+  (define (goRef a t)
+    (? Atom a
+      (REF [key] (bst-insert key 1 t))
+      (CNS t)))
+  (define (goCall o t)
+    (? Op o
+      (LOCAL [key] (bst-insert key 1 t))
+      (SLOW [fn] (goRef fn t))
+      (_ t)))
+  (define (goAlloc a t)
+    (? Alloc a
+      (CLOSE [fn args]
+        (foldl (lambda (t2 v) (goRef v t2)) (goRef fn t) args))
+      (DELAY t)))
+  (foldl
+    (lambda (t s)
+      (? Stmt s
+        (CALL [key op args]
+          (foldl (lambda (t2 v) (goRef v t2)) (goCall op t) args))
+        (FORCE [key x] (goRef x t))
+        (RET [x] (goRef x t))
+        (BR [x arms] (goRef x t))
+        (LET [key rhs] (goAlloc rhs t))
+        (PROC t)
+        (REC [binds]
+          (begin
+            (define own
+              (foldl (lambda (t2 kv) (bst-insert (_0 kv) 1 t2)) E binds))
+            (define (goRefX a t2)
+              (? Atom a
+                (REF [key]
+                  (If (bst-has key own) t2 (bst-insert key 1 t2)))
+                (CNS t2)))
+            (foldl
+              (lambda (t2 kv)
+                (? Alloc (_1 kv)
+                  (CLOSE [fn args]
+                    (foldl (lambda (t3 v) (goRefX v t3)) (goRefX fn t2) args))
+                  (DELAY t2)))
+              t binds)))))
+    E b))
+
 ;; computePureMoves: pure bindings which can be moved down into exactly
 ;; one sub-block.  Returns a list of [stmtId stmt destKey].
 (define (computePureMoves p)
   (define b (procCode p))
+  (define children (blockChildren b))
+  (define usedSet (directUseSet b))
   (lcatmap
     (lambda (idStmt)
       (define stmtId (_0 idStmt))
@@ -930,8 +1073,8 @@
             (Ifz (set-null (set-intersect keyset (procFree (_1 kp))))
               [(_0 kp)]
               []))
-          (blockChildren b)))
-      (If (usedDirectly (lambda (k) (set-member k keyset)) b)
+          children))
+      (If (any (lambda (k) (bst-has k usedSet)) keyset)
         NIL
         (Ifz (Eq 1 (Sz subBlocksWhichUse))
           NIL
@@ -952,6 +1095,31 @@
         (go (moveStmt (_0 mv) (_1 mv) (_2 mv) p2)))))
   (optimizeEachBlock go p))
 
+;; hasBR: any BR anywhere in the proc?  Cheap read-only scan (no
+;; rebuild) used to skip the BR-era passes entirely for branch-free
+;; laws — most of the corpus, and most rounds of the rest.
+(define (hasBR p)
+  (define (goB b)
+    (any
+      (lambda (s)
+        (? Stmt s
+          (BR 1)
+          (PROC [key body] (goB (procCode body)))
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body] (goB (procCode body)))
+              (CLOSE 0)))
+          (REC [binds]
+            (any
+              (lambda (kv)
+                (? Alloc (_1 kv)
+                  (DELAY [body] (goB (procCode body)))
+                  (CLOSE 0)))
+              binds))
+          (_ 0)))
+      b))
+  (goB (procCode p)))
+
 ;; brSink: lowerPureBinds restricted to BR-arm destinations.  After
 ;; brLower, the lazy chain feeding a branch body sits in the parent
 ;; block where strictify must not touch it (forcing before the branch
@@ -971,19 +1139,25 @@
       b))
   (define (go p2)
     (define aks (armKeys (procCode p2)))
-    ;; never move a REC: emission anchors knots at the block prelude
-    ;; (index 0), and a later move prepending into the same arm would
-    ;; displace it — "REC not in prelude" → dumb fallback
-    (define mvs
-      (lfilter
-        (lambda (m)
-          (And (set-member (_2 m) aks)
-            (? Stmt (_1 m) (REC 0) (_ 1))))
-        (computePureMoves p2)))
-    (Ifz mvs p2
-      (let1 mv (_0 mvs)
-        (go (moveStmt (_0 mv) (_1 mv) (_2 mv) p2)))))
-  (optimizeEachBlock go p))
+    ;; no arms in this block: nothing to sink into — skip the
+    ;; pure-move scan (the arm filter below rejects every move anyway)
+    (Ifz (Sz aks) p2
+      (begin
+        ;; never move a REC: emission anchors knots at the block
+        ;; prelude (index 0), and a later move prepending into the
+        ;; same arm would displace it — "REC not in prelude" → dumb
+        ;; fallback
+        (define mvs
+          (lfilter
+            (lambda (m)
+              (And (set-member (_2 m) aks)
+                (? Stmt (_1 m) (REC 0) (_ 1))))
+            (computePureMoves p2)))
+        (Ifz mvs p2
+          (let1 mv (_0 mvs)
+            (go (moveStmt (_0 mv) (_1 mv) (_2 mv) p2)))))))
+  (Ifz (hasBR p) p
+    (optimizeEachBlock go p)))
 
 ;; placeStmt: insert a statement at the start of the sub-block bound to
 ;; `target` (a prototype test helper; kept for parity).
@@ -1831,11 +2005,15 @@
   ;; nested block (recomputing per level doubled compile time).
   (define topCounts (refcounts top))
   (define (go p)
+    ;; one lazily-used set per block instead of a usedLazily rescan
+    ;; per candidate (lazy define: never built when the count filter
+    ;; already rejects everything)
+    (define lazySet (lazilyUsedSet (procCode p)))
     (define candidatesLeft
       (lfilter
         (lambda (kp)
           (And (Eq 1 (bst-gut (_0 kp) 0 topCounts))
-            (Nil (usedLazily (_0 kp) (procCode p)))))
+            (Nil (bst-has (_0 kp) lazySet))))
         (candidates (procCode p))))
     (define stepped (Ifz candidatesLeft p (step p candidatesLeft)))
     (define sub
@@ -2178,7 +2356,8 @@
               (CNS [s])))
           (_ [s])))
       b))
-  (optimizeEachBlock (lambda (p2) (overCode goBlock p2)) p))
+  (Ifz (hasBR p) p
+    (optimizeEachBlock (lambda (p2) (overCode goBlock p2)) p)))
 
 ;; strictPrologue: the leading run of argument FORCEs — FORCE stmts of
 ;; args (1..arity) occurring before the first CALL, non-arg FORCE, or
@@ -2749,8 +2928,13 @@
 ;; row); any error in the optimizing path falls the law back to the
 ;; byte-identical dumb pipeline.
 (define (optPasses level selfSig depth p uq)
-  ;; -> proc' ; level: 1 = tail-eager only, 2 = +strictify+reforce,
-  ;; 3/4 = +dethunk+inline+DCE, 5 = fixed point.
+  ;; -> [proc' lawSig] ; level: 1 = tail-eager only, 2 =
+  ;; +strictify+reforce, 3/4 = +dethunk+inline+DCE, 5 = fixed point.
+  ;; lawSig is the level-6 callee-signature lookup (0 below level 6),
+  ;; built ONCE here and reused by codegenOpt: the final pass only
+  ;; removes fast heads (dethunk/inline/DCE introduce none), so the
+  ;; table built from the fixed point's heads covers codegen's heads
+  ;; and sigOfLaw is pure — the emitted hints are byte-identical.
   (define (round p0 uq0)
     (define r0[uqw pw] (inlinePrimWrappers p0 uq0))
     (define r1[uq1 p1] (strictify 0 0 0 depth pw uqw))
@@ -2769,13 +2953,13 @@
     (define r2[uq2 p4] (inlineSingleUseProcs p3 uqb))
     [uq2 dethunked (deadCodeElim p4)])
   (cond
-    ((Eq level 1) p)
+    ((Eq level 1) [p 0])
     ((Eq level 2)
       (begin
         (define r0[uqw pw] (inlinePrimWrappers p uq))
-        (define r[uq1 p1] (strictify 0 depth pw uqw))
-        (reforce p1)))
-    ((Le level 4) (_2 (round p uq)))
+        (define r[uq1 p1] (strictify 0 0 0 depth pw uqw))
+        [(reforce p1) 0]))
+    ((Le level 4) [(_2 (round p uq)) 0])
     (else
       ;; iterate while dethunk keeps converting (each continuing round
       ;; strictly decreases the thunk count, so this terminates); no
@@ -2800,7 +2984,7 @@
                   (And (Ge level 6) (Nil (Equal p1 p0)))))
               (Ifz continue p1 (go (Dec i) p1 uq1)))))
         (define pf (go 8 p uq))
-        (Ifz (Ge level 6) pf
+        (Ifz (Ge level 6) [pf 0]
           ;; the law pass inserts forces the fixed point never saw
           ;; (self-call args in particular), so run one round-tail
           ;; behind it: reforce cleans redundant forces, dethunk
@@ -2815,7 +2999,7 @@
             (define pr (brCondClean (reforce pf1)))
             (define rd[dethunked pd] (dethunkOpt pr))
             (define ri[uqi pi] (inlineSingleUseProcs pd uqf))
-            (deadCodeElim pi)))))))
+            [(deadCodeElim pi) finalSig]))))))
 
 (define (compileOptLevel level noupd l)
   (define attempt
@@ -2826,12 +3010,8 @@
           (define p (recurLower p0))
           (define maxk (bstMaxKey (refcounts p)))
           (define selfSig (If (Ge level 6) (sigOfLaw l) 0))
-          (define p2 (optPasses level selfSig depth p maxk))
-          (codegenOpt
-            (If (Ge level 6)
-              (sigLookup (sigTableAdd sigOfLaw [] (fastHeads p2)))
-              0)
-            selfSig noupd depth p2)))
+          (define rp[p2 lawSig] (optPasses level selfSig depth p maxk))
+          (codegenOpt lawSig selfSig noupd depth p2)))
       0))
   (If (Hd attempt)
     (codegenLaw l) ;; anything unlowerable: byte-identical dumb output
