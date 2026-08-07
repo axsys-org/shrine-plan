@@ -587,6 +587,10 @@ op 66 ["Up", i, v, r]  = planUp i v r
 op 66 ["UpUniq",i,v,r] = planUp i v r -- TODO: inplace
 op 66 ["Coup", h, x]   = planCoup h x
 op 66 ["Try", f, x]    = planTry f x
+-- (Memo f x) ≡ (f x): semantically the identity on application; the C
+-- runtime MAY serve it from a nat cache (doc/sigoflaw-memo-spec.md in
+-- enki), the reference never does.
+op 66 ["Memo", f, x]   = f % x
 op 66 ["Throw", r]     = throw $! PLAN_EXN $! force r
 op 66 ["Hd", r]        = case r of A f _ -> f; x -> x
 op 66 ["Ix", i, r]     = planIx i r

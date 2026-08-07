@@ -27,6 +27,7 @@
 (#bind helm-build (#module helm-build))
 (#bind doctest (#module doctest))
 (#bind helm-http (#module helm-http))
+(#bind helm-llm (#module helm-llm))
 
 ;; The reaver bytecode compiler, by store name.  The installed
 ;; compiler is process state, not snapshot state: every Saved
@@ -168,7 +169,17 @@
   (define (persist hm)
     (Seq
       (Seq (print "persisting")
-        (Seq (Install opt:compileP5)
+        (Seq (Install opt:compileP2)
+          ;; P5 at intern time (it is in the latency path of every pin),
+          ;; P6 behind it on the staging thread — each law is upgraded in
+          ;; place once the optimizer gets to it, and the result is cached
+          ;; machine-wide, so later boots intern straight into P6 code.
+          ;; DISABLED 2026-08-07 (claude): (Upgrade opt:compileP6) here
+          ;; deadlocks the boot at the first committed event — "persisting"
+          ;; prints, "installed bytecode compiler" never does, and the
+          ;; runtime dies on "every actor is blocked on Recv".  Install
+          ;; alone boots fine.  Restore once Upgrade's staging thread
+          ;; stops blocking MAIN.
           (Seq (print "installed bytecode compiler") 0)))
       (If live?
       (let ((sv (_0 hm)))
@@ -183,10 +194,11 @@
           ;; injecting).  An unforced coord is a namespace that
           ;; never spawns: MAIN parks alone and the runtime exits
           ;; on deadlock.
-          (Seq (Install opt:compileP5)
+          (Seq (Install opt:compileP2)
+           (Seq (Upgrade opt:compileP6)
             (Seq (Ix 1 (serve-lain 1 port fetch? pk (sweep-orphans core sv)))
               (Seq (Trace ["lain resumed" port] 0)
-                (lain-park 0))))))))
+                (lain-park 0)))))))))
         0)))
   ;; seed in MAIN (DeepSeq before Spawn): the reef seeding code cannot
   ;; compile-on-demand inside the coordinator ("no compiler set")
@@ -234,12 +246,22 @@
 ;; apps, the doctest sweep.  -> [mcache sov]
 
 
+;; The dev grant policy: x/lain grants every app whatever its manifest
+;; asks for.  A production boot passes a [name allow-fetch allow-serve]
+;; row instead, and anything not named is denied (helm:grants-for).
+(define dev-grants-policy "all")
+
 (define (build-lain-sov core)
   (define (app path) (helm:core-ent core path))
   (define sov0 (phase-stamp "seed-kern" (app ["seeded_kern"])))
+  ;; the generated OpenRouter client goes in FIRST: it has no file on
+  ;; disk, so the chat app's by-name import of it resolves only off
+  ;; this shared cache (helm-llm.rvr)
+  (define lc (phase-stamp "compile-llm-client"
+               (helm-llm:llm-client-cache (helm:core-cache core))))
   ;; apps compile before the mirror is built, against the core's own
   ;; cache, so app modules mirror (lore included) like kernel code
-  (define ar (phase-stamp "compile-apps" (helm:compile-apps core (helm:core-cache core) (helm:discover-apps 0))))
+  (define ar (phase-stamp "compile-apps" (helm:compile-apps core (_0 lc) (helm:discover-apps 0))))
   ;; full-roster mirroring: every module on disk compiles into the
   ;; boot cache so the whole tree mirrors; failures get fail cards
   (define rr
@@ -269,18 +291,20 @@
   (define sov2
     (phase-stamp "mount-apps"
       (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
-        (helm:mount-apps core sov1 (_1 ar) app-roots))))
+        (helm:mount-apps core sov1 (_1 ar) app-roots dev-grants-policy))))
   ;; the doctest sweep no longer blocks the boot: boot-lain-with
   ;; injects its verdict tasks through the coordinator AFTER the
   ;; listener is up (helm:doctest-sweep? still gates it there)
-  [full-cache sov2])
+  ;; lc rides along: boot-lain-with registers the generated hand's
+  ;; form from it, which the app deliberately does not carry
+  [full-cache sov2 lc])
 
 ;; Fresh boot end to end: seed, serve, inject the driver configs.  A
 ;; resume skips all of this — the sovereign already carries the /io
 ;; nodes, and (core-boot)'s /io scan re-births their workers.
 ;; core0 is passed unevaluated (laziness defers any compile inside it
 ;; until this runs in MAIN).
-(define (boot-lain-with live? port fetch? core0)
+(define (boot-lain-with live? port fetch? key core0)
   (define core (phase-stamp "compile-core" core0))
   (define (app path) (helm:core-ent core path))
   (define bl (build-lain-sov core))
@@ -291,7 +315,37 @@
   (define pd-f (app ["pd"]))
   (define (t-data slot n) (myth-sing slot (pd-f n)))
   (define vine-make (app ["vine_make"]))
+  (define vine-poke (app ["vine_poke"]))
+  ;; lain's `pt`, NOT ["pails" "t"]: pails/t is a nominal record, so
+  ;; the subject entry at that path is its type and applying it yields
+  ;; a slot no reader can unwrap — the credential arrived as an empty
+  ;; "Bearer " header and OpenRouter answered 401.
+  (define pails-t (app ["pt"]))
   (define cfg-port (app ["http" "cfg_port"]))
+  ;; The chat app's credential, poked onto its hand node after the
+  ;; mount.  It arrives as a boot ARGUMENT rather than a file: this
+  ;; runtime has no environment primop, and writing it under src/
+  ;; would put a secret in the source tree (and change the build
+  ;; hash).  An empty key is a real case — the hand simply sends no
+  ;; authorization header — so it is not an error here.
+  (define auth-task
+    (vine-poke [("ts" "chat") ("ts" "conv") ("ts" "api")]
+      (myth-sing [("ts" "auth")] (pails-t key))))
+  ;; The generated hand, registered ONCE in the kernel's own behavior
+  ;; registry and referred to by path — never carried in the app's
+  ;; manifest, whose every copy would drag the whole compiled client
+  ;; (see helm-llm:llm-serve-form).  Registration must land BEFORE the
+  ;; app's node points at it: kook resolution fails on a ref with no
+  ;; form behind it.
+  (define llm-kook-path [("ts" "kook") ("ts" "llm")])
+  (define llm-kook-task
+    (vine-make llm-kook-path
+      ((app ["form" "card"]) (helm-llm:llm-serve-form (Ix 2 bl))
+        ((app ["lore" "line"])
+          "The generated OpenRouter hand: take fetches each request kid, hear parses the answer into bond/res."))))
+  (define api-limb-task
+    (vine-poke [("ts" "chat") ("ts" "conv") ("ts" "api")]
+      ((app ["kooked"]) [llm-kook-path])))
   (define (inject t)
     (Seq (SendCaps coord (DeepSeq t ["task" t]) [0])
       (Recv 0)))
@@ -307,6 +361,14 @@
         (Seq (inject (vine-make [("ts" "io") ("ts" "doctest")] (app ["dt" "cfg"])))
         (Seq (inject (vine-make [("ts" "io") ("ts" "chore")]
                ((app ["chore" "cfg"]) ("ts" "eval"))))
+        ;; provision the chat app's granted capability: register the
+        ;; generated behavior, point the app's node at it, then the key
+        (Seq (inject llm-kook-task)
+        (Seq (inject api-limb-task)
+        (Seq (If (Bytes key)
+               (Seq (Trace ["chat: api key installed" (Bytes key)] 0)
+                 (inject auth-task))
+               (Trace ["chat: no OPENROUTER_API_KEY — calls will be unauthenticated"] 0))
         (Seq (Trace ["PHASE" "listening" (Now 0) port] 0)
           ;; The expensive mirror garnishes run AFTER the listener is
           ;; up, streaming through the coordinator while the explorer
@@ -326,10 +388,10 @@
                        (helm:doctest-tasks (_0 bl) core (_1 bl)))
                      (Trace ["PHASE" "sweep-done" (Now 0)] 0)))
                  0)
-            [core coord]))))))))))
+            [core coord])))))))))))))
 
 (define (boot-lain-stack port fetch? core0)
-  (boot-lain-with 0 port fetch? core0))
+  (boot-lain-with 0 port fetch? "" core0))
 
 (define (run-lain-boot port core0)
   (Seq (boot-lain-stack port 1 core0)
@@ -343,8 +405,26 @@
 ;; persist every committed event, park.  After a kill, starting the
 ;; snapshot (wisp snap root _) resumes the namespace from the last
 ;; saved pin — the snapshot is the only build cache there is.
-(define (run-lain-serve port)
+;; A live serve that does NOT persist: same stack, same drivers, same
+;; apps — but no Save per committed event.
+;;
+;; Persisting pins the whole compiled world, and the generated
+;; OpenRouter client makes that graph expensive enough that the first
+;; Save after boot has run for tens of minutes without finishing.  This
+;; path exists to run and verify the namespace while that cost is a
+;; separate problem: kill it and the namespace is gone, which is the
+;; trade being made.
+(define (run-lain-live port key)
+  (Seq (Trace ["lain" "serving (no persistence)" port] 0)
+    (Seq (boot-lain-with 0 port 1 key (helm:load-helm-mod "helmapp"))
+      (lain-park 0))))
+
+;; key is the OpenRouter credential, passed through from x/lain's
+;; environment (see the auth-task note in boot-lain-with).  "" is a
+;; boot with no credential, which still serves — the calls just go out
+;; unauthenticated and come back 401.
+(define (run-lain-serve port key)
   (Seq (Trace ["lain" "serving" port] 0)
-    (Seq (boot-lain-with 1 port 1 (helm:load-helm-mod "helmapp"))
+    (Seq (boot-lain-with 1 port 1 key (helm:load-helm-mod "helmapp"))
       (lain-park 0))))
 

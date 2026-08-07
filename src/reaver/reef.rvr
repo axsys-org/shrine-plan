@@ -94,18 +94,35 @@
     (Or (Eq e x)
       (lhas e xs))))
 
+;; Indexed for the same reason as `find` and `find-idx`: recursing on
+;; (drop 1 row) copies the tail every step, so membership over an n-row
+;; costs O(n^2).  With 71 call sites this one is load-bearing.
+;;
+;; Answers a strict 1/0 where the old fold answered (Or ..) over the
+;; predicate's results.  Every predicate in the tree is Eq/Equal-shaped
+;; (already 1/0) and every call site tests it as a boolean, so the two
+;; agree — but the contract is now the boolean it was always used as,
+;; and it also stops at the first hit instead of scanning the rest.
 (define (includes f row)
-  (Ifz row 0
-    (Or (f (_0 row)) (includes f (drop 1 row)))))
+  (define n (Sz row))
+  (define (go i)
+    (If (Ge i n)
+      0
+      (If (f (Ix i row)) 1 (go (Inc i)))))
+  (go 0))
 
+;; Indexed rather than re-sliced.  The Weld-onto-the-tail construction
+;; is kept exactly (it terminates at 0, which is what callers see for an
+;; empty result), so only the per-step copy goes away.
 (define (intersect f x y)
-  (define has-fst (f (_0 x)))
-  (define next (intersect f (drop 1 x) y))
-  (Ifz x 0
-    (Ifz y 0
-      (If (includes has-fst y)
-        (Weld [(_0 x)] next)
-        next))))
+  (define n (Sz x))
+  (define (go i)
+    (If (Ge i n)
+      0
+      (let ((e (Ix i x))
+            (rest (go (Inc i))))
+        (If (includes (f e) y) (Weld [e] rest) rest))))
+  (Ifz x 0 (Ifz y 0 (go 0))))
 
 (define (countdown n)
   (define m (Dec n))
@@ -125,11 +142,11 @@
   (And ls
     (Ifz xs x (lrear xs))))
 
+;; The last element, by index.  This used to walk to the end with
+;; (drop 1 r) per step — O(n^2) to read one element that Ix answers
+;; outright.
 (define (rear r)
-  (And r
-    (If (Eq (Sz r) 1)
-        (_0 r)
-        (rear (drop 1 r)))))
+  (And r (Ix (Dec (Sz r)) r)))
 
 (define (lsnip ls[x xs])
   (And ls
@@ -210,20 +227,31 @@ assert(Equal ["debug" "foo" "bar"] (snip (0 "debug" "foo" "bar" "baz")))
 (define (cmp-total a b)
   (cmp-total-in a b))
 
+
 (define (filter f row)
   (define ls (lfilter f (stream row)))
   (Row 0 (llen ls) ls))
 
+;; Quicksort on a MIDDLE pivot.  Pivoting on (_0 row) splits sorted
+;; input into 0 and n-1 at every level -- O(n^2) -- and nearly every row
+;; sorted in the compiler is already ordered: cairn's tapax yields trie
+;; order, so layer-entries/canonical-entries re-sort an ordered row, and
+;; canonical-path-set hands sorted keys to the next sort.  Measured on
+;; ordered input: 3.86x per doubling head-pivot vs 2.1-2.3x mid-pivot,
+;; 2286ms vs 27ms at n=2000.
+;; Partitioning the whole row rather than row-minus-head keeps the pivot
+;; inside `same`, so `less` and `more` are both strictly smaller and the
+;; recursion still terminates (a row of equal elements ends up entirely
+;; in `same` with both halves empty).
 (define (sort f row)
-  (define pivot (_0 row))
-  (define rest (drop 1 row))
+  (define pivot (Ix (Div (Sz row) 2) row))
   (define cmp (f pivot))
-  (define less (filter (lambda (x) (Eq sym-gt (cmp x))) rest))
-  (define same (filter (lambda (x) (Eq sym-eq (cmp x))) rest))
-  (define more (filter (lambda (x) (Eq sym-lt (cmp x))) rest))
+  (define less (filter (lambda (x) (Eq sym-gt (cmp x))) row))
+  (define same (filter (lambda (x) (Eq sym-eq (cmp x))) row))
+  (define more (filter (lambda (x) (Eq sym-lt (cmp x))) row))
   (define ret
     (Ifz row row
-    (Weld (sort f less) (Weld (Weld [pivot] same) (sort f more)))))
+    (Weld (sort f less) (Weld same (sort f more)))))
   ret)
 
 (define sort-nat (sort Cmp))
@@ -252,14 +280,22 @@ assert(Equal [7 7] (sort-nat [7 7]))
 
 
 
-(define (find-idx-go f xs idx)
-  (If (Eq 0 (Sz xs))
-       0
-      (If (Eq 0 (f (_0 xs)))
-        (find-idx-go f (drop 1 xs) (Inc idx))
-        [idx])))
+;; Index, never re-slice.  `drop` is (Slice n (Sz row) row), which
+;; COPIES, so walking a row by dropping its head makes a scan quadratic
+;; in the row's length rather than linear.  Measured over rows of paths
+;; with a full-row miss, holding total element-visits fixed: 0.85ms per
+;; scan at 500 elements, 30.07ms at 4,000 — 3-4x per doubling, when a
+;; linear scan would have been flat.  That is what made lower-tc-unit's
+;; slot-of (one scan per global reference, over every own key) the
+;; largest phase of a big module's compile.  Same shape as `find`.
+(define (find-idx-go f xs n idx)
+  (If (Ge idx n)
+    0
+    (If (Eq 0 (f (Ix idx xs)))
+      (find-idx-go f xs n (Inc idx))
+      [idx])))
 
-(define (find-idx f xs) (find-idx-go f xs 0))
+(define (find-idx f xs) (find-idx-go f xs (Sz xs) 0))
 
 (define (snoc x xs) (xs x))
 

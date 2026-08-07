@@ -257,6 +257,11 @@
     (If (foil-env:unit? prior-unit)
       (foil-env:unit-export-layer prior-unit)
       (make-export-layer name own imped)))
+  ;; Profiled 2026-08-07: this line, not the clone walks, was the pack's
+  ;; dominant cost (1.8s of a 2.6s pack for a 2000-key module).
+  ;; unit-mount-layer re-sorts both layers' entries and then make-layer
+  ;; sorts the merge — three sorts of an already-ordered row, which was
+  ;; quadratic until reef's sort stopped pivoting on the head element.
   (define layer
     (If (foil-env:unit? prior-unit)
       (foil-env:unit-mount-layer prior-unit)
@@ -476,7 +481,7 @@
 ;; derivation; stack is the import chain, for cycle detection.
 ;; Returns [cache' compiled imported-keys lore].
 (define (cache-entry name compiled imported lore)
-  (define keys (module-decl-keys compiled))
+  (define keys (zspan "c-declkeys" (module-decl-keys compiled)))
   ;; The pack rides the row lazily: it computes on first import and is
   ;; shared by every later consumer threading this cache.
   ;; The PIN rides last: the entry's six durable fields (pack
@@ -486,10 +491,10 @@
   ;; persist by pin: the namespace write-through path.  Lazy: an
   ;; interactive compile that never pins never forces the pack here.
   ;; Additive: nothing indexes past the pack.
-  (define row6
-    [name compiled keys imported lore
-     (unit-import-pack name compiled keys imported)])
-  (Weld row6 [(Seq (DeepSeq row6 0) (Pin row6))]))
+  (define pack
+    (zspan "c-pack" (unit-import-pack name compiled keys imported)))
+  (define row6 [name compiled keys imported lore pack])
+  (Weld row6 [(zspan "c-pin" (Seq (DeepSeq row6 0) (Pin row6)))]))
 
 ;; The entry's durable fields as a pin; rows from older tooling pin
 ;; in place.  (Unpin (entry-pin e)) round-trips to a pack-bearing
@@ -569,8 +574,9 @@
     (zspan "c-env"
       (foil-env:build-environment-with-base substrate-layer mounts own-layer)))
   (define pre
-    (foil-subject:set-sut-unit environment
-      (project-mounts sut0 resolved mounts decls)))
+    (zspan "c-project"
+      (foil-subject:set-sut-unit environment
+        (project-mounts sut0 resolved mounts decls))))
   ;; Force the lore here so the cache entry carries plain data — an
   ;; unforced capture would pin the module's whole rex tree in every
   ;; long-lived cache.
@@ -586,15 +592,16 @@
   (define declared
     (map (lambda (d) (foil-subject:root-path final (Ix 1 d)))
       (filter mod-decl? decls)))
+  (define delta
+    (zspan "c-delta" (foil-subject:subject-entry-delta pre final)))
   (define own-keys
-    (canonical-path-set
-      (Weld declared
-        (map (Ix 0) (foil-subject:subject-entry-delta pre final)))))
+    (zspan "c-ownkeys"
+      (canonical-path-set (Weld declared (map (Ix 0) delta)))))
   ;; lower-tc-unit is the fixpoint-aware path; until a module actually has an
   ;; internal cycle it is behaviorally identical to the historical fold.
   (define lowered
     (zspan "c-lower" (foil-lower:lower-tc-unit pre final own-keys)))
-  (define exports (make-export-layer mod own-keys lowered))
+  (define exports (zspan "c-exports" (make-export-layer mod own-keys lowered)))
   (define unit0
     (foil-env:make-unit-with-base mod substrate-layer mounts own-layer exports))
   (define draft-environment (foil-subject:sut-unit lowered))
@@ -607,7 +614,7 @@
       unit0))
   (define compiled (foil-subject:set-sut-unit unit lowered))
   [(_0 resolved-state)
-   (emit-subject-warnings compiled)
+   (zspan "c-warn" (emit-subject-warnings compiled))
    (_2 resolved-state)
    lore])
 

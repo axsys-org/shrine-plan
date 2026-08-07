@@ -298,8 +298,28 @@
   (define h (ZoneStart lbl))
   (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))
 
+;; Whether a cached module has source on disk to mirror.
+;;
+;; A GENERATED module (schemagen's tree-fed client — helm-llm.rvr) has
+;; no file, so get-foil answers empty.  Mirroring one anyway puts its
+;; entire entry table into the namespace with no source to show for it,
+;; and that table is not small: the two OpenRouter modules carry 8,172
+;; entries against 1,560 for every hand-written module in the system
+;; combined.  Measured, seeding the mirror went 4.8s -> 61.2s with them
+;; in — and every one of those nodes then rides in the sovereign that
+;; each Save has to serialize.
+;;
+;; The cost of leaving them out: their ['sub] cache rows are not in the
+;; namespace either, so hydrate-cache cannot rebuild them in a fresh
+;; session — it regenerates from the spec instead.  That is the right
+;; trade while a generated module costs 5 minutes to compile and its
+;; source of truth is the schema, not the namespace.
+(define (mirror-has-source? mod)
+  (define r (Try (lambda (z) (Bytes (foil:get-foil mod))) 0))
+  (If (Eq 1 (Hd r)) 0 (If (_0 r) 1 0)))
+
 (define (boot-mirror-mods-refs-lore-with refs? lore? raw-cache core)
-  (define cache raw-cache)
+  (define cache (filter (lambda (me) (mirror-has-source? (_0 me))) raw-cache))
   (define src-t (core-ent core ["mirror" "src"]))
   (define ent-t (core-ent core ["mirror" "entry"]))
   (define ent-x (core-ent core ["mirror" "extras"]))
@@ -442,7 +462,7 @@
   ;; an unbranded row that pact/talk's mani match silently rejects.
   (vine-poke [(ts "boot")]
     (msing pact-slot
-      ("/boot/mani" ("ts" "refs") ("/boot/lore" 0 [] []) [] seeds))))
+      ("/boot/mani" ("ts" "refs") ("/boot/lore" 0 [] []) [] seeds []))))
 
 ;; Every mirrored entry grouped by its source namespace root:
 ;; [[root entry-nodes] ..] — forge's /ns aggregation.
@@ -642,6 +662,21 @@
   (define r (Try (lambda (z) (foil-render:diag-flat e)) 0))
   (If (Eq 1 (Hd r)) "unrenderable error" (_0 r)))
 
+;; The host's grant decision for one app, capped by what the app
+;; asked for: a grant never exceeds the ask, so ['grants] is always a
+;; subset of ['wants] and the gap between them reads as denial.  The
+;; policy is "all" (allow whatever is asked — x/lain's dev default) or
+;; a row of [name allow-fetch allow-serve] flags; anything not named
+;; is DENIED, so the default ([]) is deny-all.
+;; -> [gfetch gport]
+(define (grants-for policy name want-fetch want-port)
+  (define all? (Equal "all" policy))
+  (define hit
+    (Ifz all? (find (lambda (e) (Equal name (_0 e))) policy) 0))
+  (define af (If all? 1 (Ifz hit 0 (Ix 1 (_0 hit)))))
+  (define ap (If all? 1 (Ifz hit 0 (Ix 2 (_0 hit)))))
+  [(And want-fetch af) (If ap want-port 0)])
+
 ;; Mount one compiled app at ['app <name>]: a single make whose card
 ;; carries the manifest — the in-kernel pact/form expansion commits
 ;; the whole app subtree in that one epoch, and a failed worm commits
@@ -649,7 +684,12 @@
 ;; (compile, brand gate, mount outcome, root collision — a make on a
 ;; live root fails the event) leaves an pact/fail tombstone at the
 ;; root instead: a broken app is a visible namespace citizen.
-(define (mount-app-at core sov root name res)
+;;
+;; The card also carries the grant ledger: what the manifest asked for
+;; and what this host allowed.  The helm's move gate reads the
+;; ['grants 'fetch] slot back off this very card, so the mount is the
+;; only place authority is decided.
+(define (mount-app-at core sov root name res policy)
   (define vine-make (core-ent core ["vine_make"]))
   (define run-event (core-ent core ["run_event"]))
   (define (fail err)
@@ -665,31 +705,46 @@
   (If (Eq "ERR" (_0 res))
     (fail (_1 res))
     (let* ((app-card (core-ent core ["pact" "card"]))
+           (has-fetch (core-ent core ["grant" "has_fetch"]))
+           (serve-port (core-ent core ["grant" "serve_port"]))
            (mod (strcat ["apps/" name "/main"]))
+           ;; mani's fields read positionally off the nominal rep
+           ;; (brand at Hd, fields from Ix 0): wants is the fifth
+           (wants (Ix 4 (_1 res)))
+           (want-fetch (has-fetch wants))
+           (want-port (serve-port wants))
+           (g (grants-for policy name want-fetch want-port))
            (o (Try (lambda (z)
-                     (run-event (vine-make root (app-card (_1 res) mod)) 0 sov))
+                     (run-event
+                       (vine-make root
+                         (app-card (_1 res) mod (_0 g) (Ix 1 g)))
+                       0 sov))
                 0)))
-      (If (Eq 1 (Hd o))
-        (fail (_0 o))
-        (If (Eq "/boot/ovum/ripe" (Hd (_0 o)))
-          (Ix 0 (_0 o))
-          (fail ["mount-not-ripe" (_0 o)]))))))
+      (Seq
+        ;; a denied want is visible, not silent
+        (If (And want-fetch (Nil (_0 g)))
+          (Trace ["app-grant-denied" name "fetch"] 0) 0)
+        (If (Eq 1 (Hd o))
+          (fail (_0 o))
+          (If (Eq "/boot/ovum/ripe" (Hd (_0 o)))
+            (Ix 0 (_0 o))
+            (fail ["mount-not-ripe" (_0 o)])))))))
 
 ;; The default root: ['app <name>].  The root is the MOUNTER's
 ;; parameter (shrine-apps.md section 5.1) — roots is a [[name root]..]
 ;; override table for apps that own a top-level root of their own
 ;; (the chat app lives at /chat).
 (define (mount-app core sov name res)
-  (mount-app-at core sov [(ts "app") (ts name)] name res))
+  (mount-app-at core sov [(ts "app") (ts name)] name res []))
 
 (define (mount-root roots name)
   (define hit (find (lambda (e) (Equal name (_0 e))) roots))
   (Ifz hit [(ts "app") (ts name)] (_1 (_0 hit))))
 
-(define (mount-apps core sov apps roots)
+(define (mount-apps core sov apps roots policy)
   (foldl
     (lambda (s e)
-      (mount-app-at core s (mount-root roots (_0 e)) (_0 e) (_1 e)))
+      (mount-app-at core s (mount-root roots (_0 e)) (_0 e) (_1 e) policy))
     sov apps))
 
 ;;; Boot-time doctest sweep (doc/doctest-runner-explorer.md part I) ;;;;;;;;;;;;;;;;;
