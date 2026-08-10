@@ -31,11 +31,13 @@
 (#bind parse (#module parse))
 (#import parse)
 
+(#bind quip (#module quip))
 (#bind foil (#module foil))
 (#bind foil-lore (#module foil-lore))
 (#bind helm (#module helm))
 (#bind helm-http (#module helm-http))
 (#bind helm-run (#module helm-run))
+(#bind wire-json (#module wire-json))
 
 (define (ts s) ("ts" s))
 (define NL (strcat [10]))
@@ -317,6 +319,249 @@
           [(strcat ["no namespace root " (Ix 1 action)])])))
     (else [])))
 
+;;; The wire port: the poke port grown into a data port ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; One JSON request per connection, one JSON reply, close — the
+;;; editor protocol (doc/buddy-wire.md).  Requests ride the main loop's
+;;; mailbox, so wire traffic and terminal commands serialize against
+;;; the same image and share the serial counter.
+
+;; json.foil imports nothing, so it compiles standalone against the
+;; default subject (the foil-json-tests precedent) — its parse is the
+;; wire's request decoder; responses are built as text (wire-json).
+(define json-mod (foil:compile-mod-cached 0 foil:default-subject "json"))
+(define jparse (foil:source-entry-val ["parse"] (Ix 1 json-mod)))
+
+(define (wire-ok pairs)
+  (wire-json:jobj (cons ["ok" "true"] pairs)))
+
+(define (wire-fail msg pairs)
+  (wire-json:jobj
+    (Weld [["ok" "false"] ["error" (wire-json:jq msg)]] pairs)))
+
+;; A chore answer's failure payload: the pretty text plus the located
+;; rows the leaf wrote at ['diag] (raw JSON, embedded verbatim).
+(define (wire-chore-fail rs m)
+  (define err ((r-txt rs) [(ts "err")] m))
+  (define dg ((r-txt rs) [(ts "diag")] m))
+  (wire-fail err [["diags" (Ifz dg "[]" dg)]]))
+
+(define (wire-timeout z)
+  (wire-fail "timed out" []))
+
+;; Mirror node paths as JSON string rows.
+(define (wire-paths ps)
+  (wire-json:jarr (map (lambda (p) (wire-json:jq (quip:print-path p))) ps)))
+
+(define (wire-path-slot rs m slot)
+  (define pl ((r-pail rs) [(ts slot)] m))
+  (If (Eq "/boot/pails/ps" (Hd pl))
+    (wire-paths (_0 pl))
+    "[]"))
+
+;; The entry node for mod + dotted name ("" names the module node).
+(define (wire-node mod dotted)
+  (define parts (filter Bytes (helm-http:split-ch 46 dotted)))
+  (Weld (Weld [(ts "boot")] (map ts (helm:mod-segs mod)))
+    (If (Sz parts)
+      (Weld [("u" (Sz parts))] (map ts parts))
+      [])))
+
+(define (wire-eval e serial mod expr)
+  (define rs (e-rs e))
+  (define m (drive e (ts "chore") serial
+              (((e-app e) ["build" "eval_req"]) mod expr)))
+  (Ifz m
+    (wire-timeout 0)
+    (let ((err ((r-txt rs) [(ts "err")] m))
+          (value ((r-txt rs) [(ts "value")] m)))
+      (cond
+        (err (wire-chore-fail rs m))
+        (value
+          (let ((tyt (ty-text rs m))
+                (law ((r-txt rs) [(ts "law")] m)))
+            (wire-ok
+              [["value" (wire-json:jq value)]
+               ["type" (Ifz tyt "null" (wire-json:jq tyt))]
+               ["law" (Ifz law "null" (wire-json:jq law))]])))
+        (else (wire-fail "no result" []))))))
+
+(define (wire-compile e serial mod)
+  (define rs (e-rs e))
+  (define m (drive e (ts "chore") serial
+              (((e-app e) ["build" "compile_req"]) mod)))
+  (Ifz m
+    (wire-timeout 0)
+    (let ((err ((r-txt rs) [(ts "err")] m))
+          (report ((r-txt rs) [(ts "report")] m)))
+      (cond
+        (err (wire-chore-fail rs m))
+        (report
+          (wire-ok
+            [["report" (wire-json:jq report)]
+             ["changed" (wire-path-slot rs m "changed")]
+             ["added" (wire-path-slot rs m "added")]
+             ["removed" (wire-path-slot rs m "removed")]]))
+        (else (wire-fail "no result" []))))))
+
+(define (wire-doctest e serial mod)
+  (define rs (e-rs e))
+  (define tgt (Weld [(ts "boot")] (map ts (helm:mod-segs mod))))
+  (define m (drive e (ts "doctest") serial (((e-app e) ["dt" "req"]) tgt)))
+  (Ifz m
+    (wire-timeout 0)
+    (let ((err ((r-txt rs) [(ts "err")] m)))
+      (If err
+        (wire-chore-fail rs m)
+        (wire-ok
+          [["passed" (showNat ((r-nat rs) [(ts "passed")] 0 m))]
+           ["failed" (showNat ((r-nat rs) [(ts "failed")] 0 m))]])))))
+
+(define (wire-describe e mod dotted)
+  (define rs (e-rs e))
+  (define node (wire-node mod dotted))
+  (define r (Ix 0 ((e-ask e) ["query" node])))
+  (If (Nil (Eq "/boot/res/known" (Hd r)))
+    (wire-fail (strcat ["no entry at " (quip:print-path node)]) [])
+    (let* ((m (_0 r))
+           (txt (r-txt rs))
+           (kind (txt [(ts "kind")] m))
+           (tyt (ty-text rs m))
+           (lede (txt [(ts "sys") (ts "lede")] m))
+           (src (txt [(ts "sys") (ts "src")] m))
+           (defline ((r-nat rs) [(ts "defline")] 0 m)))
+      (wire-ok
+        [["kind" (Ifz kind "null" (wire-json:jq kind))]
+         ["type" (Ifz tyt "null" (wire-json:jq tyt))]
+         ["lede" (Ifz lede "null" (wire-json:jq lede))]
+         ["line" (Ifz defline "null" (showNat defline))]
+         ["src" (Ifz src "null" (wire-json:jq src))]
+         ["calls" (wire-path-slot rs m "calls")]
+         ["called_by" (wire-path-slot rs m "called_by")]]))))
+
+;; A module's own entry names: the module node's ['entries] rows with
+;; the module prefix and the segment-count marker stripped, "/"-joined
+;; (the spelling foil source uses).
+(define (wire-complete e mod prefix)
+  (define rs (e-rs e))
+  (define mnode (Weld [(ts "boot")] (map ts (helm:mod-segs mod))))
+  (define r (Ix 0 ((e-ask e) ["query" mnode])))
+  (If (Nil (Eq "/boot/res/known" (Hd r)))
+    (wire-fail (strcat ["no module " mod]) [])
+    (let ((pl ((r-pail rs) [(ts "entries")] (_0 r))))
+      (If (Nil (Eq "/boot/pails/ps" (Hd pl)))
+        (wire-ok [["names" "[]"]])
+        (let* ((names
+                 (map
+                   (lambda (p)
+                     (join-str "/"
+                       (map (Ix 0) (drop (Inc (Sz mnode)) p))))
+                   (_0 pl)))
+               (hits
+                 (If (Bytes prefix)
+                   (filter (starts-with prefix) names)
+                   names)))
+          (wire-ok [["names" (wire-json:jarr-str hits)]]))))))
+
+(define (wire-nsls e root)
+  (define rs (e-rs e))
+  (define r (Ix 0 ((e-ask e) ["query" [(ts "boot") (ts "ns") (ts root)]])))
+  (If (Nil (Eq "/boot/res/known" (Hd r)))
+    (wire-fail (strcat ["no namespace root " root]) [])
+    (wire-ok [["entries" (wire-path-slot rs (_0 r) "entries")]])))
+
+;; One request line -> one response line (no trailing newline; the
+;; connection actor adds it).
+(define (wire-handle e serial line)
+  (define pr (jparse line))
+  (If (Nil (wire-json:jok? pr))
+    (wire-fail "bad json" [])
+    (let* ((v (wire-json:jval pr))
+           (op (wire-json:jget-str "op" v))
+           (mod (wire-json:jget-str "module" v)))
+      (cond
+        ((Eq op "ping")
+          (wire-ok [["server" (wire-json:jq "buddy-wire")] ["v" "1"]]))
+        ((Eq op "eval")
+          (let ((text (wire-json:jget-str "text" v)))
+            (If (Or (Nil mod) (Nil text))
+              (wire-fail "eval needs module and text" [])
+              (wire-eval e serial mod text))))
+        ((Eq op "compile")
+          (If (Nil mod)
+            (wire-fail "compile needs module" [])
+            (wire-compile e serial mod)))
+        ((Eq op "doctest")
+          (If (Nil mod)
+            (wire-fail "doctest needs module" [])
+            (wire-doctest e serial mod)))
+        ((Eq op "describe")
+          (If (Nil mod)
+            (wire-fail "describe needs module" [])
+            (wire-describe e mod (wire-json:jget-str "name" v))))
+        ((Eq op "complete")
+          (If (Nil mod)
+            (wire-fail "complete needs module" [])
+            (wire-complete e mod (wire-json:jget-str "prefix" v))))
+        ((Eq op "nsls")
+          (let ((root (wire-json:jget-str "root" v)))
+            (If (Nil root)
+              (wire-fail "nsls needs root" [])
+              (wire-nsls e root))))
+        (else (wire-fail (strcat ["unknown op " op]) []))))))
+
+;;; Wire sockets ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Read fd until the accumulated request holds a LF (or EOF); Read
+;; returns a bar (data then a 0x01 top byte) — strip the terminator.
+(define (wire-read fd)
+  (define (has-lf? s)
+    (define n (Bytes s))
+    (define (go i)
+      (And (Lt i n) (Or (Eq 10 (Load8 i s)) (go (Inc i)))))
+    (go 0))
+  (define (go acc)
+    (define raw (Read fd 65536))
+    (If (Le raw 1)
+      acc
+      (let* ((chunk (foil-lore:str-slice 0 (Dec (Bytes raw)) raw))
+             (acc2 (strWeld acc chunk)))
+        (If (has-lf? acc2) acc2 (go acc2)))))
+  (go ""))
+
+(define (first-line s)
+  (define n (Bytes s))
+  (define (go i)
+    (If (Ge i n) n (If (Eq 10 (Load8 i s)) i (go (Inc i)))))
+  (foil-lore:str-slice 0 (go 0) s))
+
+;; One actor per connection: handshake for the main-loop cap, read the
+;; request, ask the loop, write the reply, close (the helm-http
+;; conn-actor pattern).
+(define (wire-conn fd self)
+  (define mc (Recv 0))
+  (define out (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
+  (define line (first-line (wire-read fd)))
+  (define m ["wire" line])
+  (Seq (DeepSeq m m)
+    (Seq (SendCaps out m [0])
+      (let ((r (Ix 0 (Recv 0))))
+        (Seq (Write fd (strWeld (strcat [(Ix 1 r) NL]) 1))
+          (CloseFd fd))))))
+
+(define (wire-pump port self)
+  (define mc (Recv 0))
+  (define out (Ix 0 (Ix 1 mc)))
+  (define listen (Try Listen port))
+  (If (Eq 1 (Hd listen))
+    (Trace ["wire: listen failed" port] 0)
+    (let ((fd (_0 listen)))
+      (define (loop z)
+        (define conn (Accept fd))
+        (Seq (let ((c (Spawn (wire-conn conn))))
+               (SendCaps c ["go"] [out]))
+          (loop z)))
+      (Seq out (loop 0)))))
+
 (define (repl-loop e st)
   (define mc (Recv 0))
   (define msg (Ix 0 mc))
@@ -335,6 +580,12 @@
   (cond
     ((Eq kind "line") (step (_1 msg)))
     ((Eq kind "poke") (step ""))
+    ((Eq kind "wire")
+      ;; a wire request: answer the connection actor, burn a serial,
+      ;; leave the terminal state (focus, vars, prompt) alone
+      (let ((r ["wres" (wire-handle e (st-serial st) (_1 msg))]))
+        (Seq (helm:send! (Ix 0 (Ix 1 mc)) r)
+          (repl-loop e [(st-focus st) (st-vars st) (Inc (st-serial st))]))))
     ((Eq kind "eof") (emit ["bye"]))
     ((Eq kind "nopoke")
       (Seq (emit ["(poke port busy — resync with <enter> only)"])
@@ -343,8 +594,8 @@
 
 ;; Boot the full lain stack (explorer live on http-port), then take
 ;; the terminal.  fetch?=0 skips the outbound-fetch driver — the local
-;; runtime lacks the Fetch primop.
-(define (run-repl http-port poke-port fetch?)
+;; runtime lacks the Fetch primop.  wire-port 0 skips the editor wire.
+(define (run-repl http-port poke-port wire-port fetch?)
   (define r
     (helm-run:boot-lain-stack http-port fetch?
       (helm:load-helm-mod "helmapp")))
@@ -356,5 +607,9 @@
            (pok (Spawn (poke-pump poke-port))))
       (Seq (SendCaps sin ["go"] [0])
         (Seq (SendCaps pok ["go"] [0])
-          (Seq (emit-prompt st)
-            (repl-loop e st)))))))
+          (Seq (Ifz wire-port
+                 0
+                 (let ((wir (Spawn (wire-pump wire-port))))
+                   (SendCaps wir ["go"] [0])))
+            (Seq (emit-prompt st)
+              (repl-loop e st))))))))
