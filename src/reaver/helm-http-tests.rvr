@@ -18,6 +18,7 @@
 (#bind helm-chore (#module helm-chore))
 (#bind helm-doctest (#module helm-doctest))
 (#bind helm-build (#module helm-build))
+(#bind helm-llm (#module helm-llm))
 
 
 ;;; The HTTP driver end-to-end, minus sockets (no outbound-connect
@@ -369,12 +370,23 @@ assert(Eq 1 (contains? "/ns/kook/count" (_2 rh6)))
 ;; cache, then one card make expanded in-kernel by pact/init.  Built
 ;; inside a function — the compile result holds the whole cache, and
 ;; a top-level define would echo it into the canon arena.
+;; The chat app imports the generated OpenRouter client, which has no
+;; file on disk — its cache rows are the ONLY way that import resolves
+;; (helm-llm.rvr).  A function, not a top-level define, for the reason
+;; life-cache is: a cache at top level is echoed whole by the module
+;; loader.  Only the chat mount forces it, and it is the reason this
+;; group is slow — generating and compiling the client is minutes.
+(define (llm-cache z)
+  (_0 (helm-llm:llm-client-cache (helm:core-cache core))))
+
 (define (mount-app-via-card name root)
-  (define r (helm:compile-apps core (helm:core-cache core) [name]))
+  (define base
+    (If (Equal "chat" name) (llm-cache 0) (helm:core-cache core)))
+  (define r (helm:compile-apps core base [name]))
   (define res (_1 (_0 (_1 r))))
   (define mani (_1 res))
   (inject (vine-make root
-            ((app ["pact" "card"]) mani (strcat ["apps/" name "/main"])))))
+            ((app ["pact" "card"]) mani (strcat ["apps/" name "/main"]) 0 0))))
 
 assert(Equal ["done"] (mount-app-via-card "life" [("ts" "app") ("ts" "life")]))
 assert(Equal ["done"] (mount-app-via-card "demo" [("ts" "app") ("ts" "demo")]))
@@ -421,27 +433,34 @@ assert(Eq 0 (contains? "location.reload" (_2 rf5)))
 
 (define z-app-faces-e (ZoneEnd z-app-faces))
 (define z-chat (ZoneStart "chat"))
-;;; 5f. the chat app: a fresh interface at its own /chat root, with ;;;;;;;;;;;;;;;;
-;;; form posts through the /post endpoint.  The face renders the
-;;; conversation; the log's talk arm appends each message in-kernel.
+;;; 5f. the chat app: a conversation with a language model at its own ;;;;;;;;;;;;;
+;;; /chat root.  A post appends the user's turn AND mints a request kid
+;;; under ['api] in the same transaction; the generated hand would
+;;; fetch it.  There is no fetch driver in this boot and the hand's
+;;; form is host-provisioned (helm-run registers it at /kook/llm), so
+;;; the request kid simply stays open here — which is exactly what the
+;;; page reports as the model thinking.  The turn-taking, the request
+;;; minting, and the rendering are what this section pins down; the
+;;; live round trip is not a unit-test concern.
 
 assert(Equal ["done"] (mount-app-via-card "chat" [("ts" "chat")]))
 
-;; the empty conversation: the fresh page carries the form wired at
-;; the log, the side picker, and the in-place refresh — and none of
-;; the explorer chrome
+;; the empty conversation: the fresh page carries the form wired at the
+;; conv node and the in-place refresh — and none of the explorer chrome
 (SendCaps wh3 ["req" "GET" "/chat" ""] [0])
 (define rc5 (Ix 0 (Recv 0)))
 assert(Eq 200 (_1 rc5))
 assert(Eq 1 (starts-with "text/html" (_3 rc5)))
-assert(Eq 1 (contains? "/post/chat/log" (_2 rc5)))
+assert(Eq 1 (contains? "/post/chat/conv" (_2 rc5)))
 assert(Eq 1 (contains? "getElementById" (_2 rc5)))
 assert(Eq 0 (contains? "breadcrumb" (_2 rc5)))
+;; nothing asked yet, so nothing is pending
+assert(Eq 0 (contains? "thinking" (_2 rc5)))
 
-;; post from side a: the worker pokes the log, the talk appends kid 0,
-;; and the reply bounces back to the form's page
-(SendCaps wh3 ["req" "POST" "/post/chat/log"
-               "who=a&text=hello+there&back=%2Fchat"] [0])
+;; a turn: the worker pokes conv, whose talk appends the user's message
+;; and mints the request kid, and the reply bounces back to the page
+(SendCaps wh3 ["req" "POST" "/post/chat/conv"
+               "text=hello+there&back=%2Fchat"] [0])
 (define rp1 (Ix 0 (Recv 0)))
 assert(Eq 200 (_1 rp1))
 assert(Eq 1 (contains? "url=/chat" (_2 rp1)))
@@ -449,22 +468,32 @@ assert(Eq 1 (contains? "url=/chat" (_2 rp1)))
 (SendCaps wh3 ["req" "GET" "/chat" ""] [0])
 (define rc6 (Ix 0 (Recv 0)))
 assert(Eq 1 (contains? "hello there" (_2 rc6)))
-assert(Eq 1 (contains? "msg a" (_2 rc6)))
+assert(Eq 1 (contains? "msg user" (_2 rc6)))
+;; the request kid is open and unanswered: the page says so
+assert(Eq 1 (contains? "thinking" (_2 rc6)))
 
-;; the other side answers; both bubbles ride the next render
-(SendCaps wh3 ["req" "POST" "/post/chat/log"
-               "who=b&text=hi+yourself&back=%2Fchat"] [0])
+;; a second turn rides alongside the first — history accumulates
+(SendCaps wh3 ["req" "POST" "/post/chat/conv"
+               "text=and+again&back=%2Fchat"] [0])
 (define rp2 (Ix 0 (Recv 0)))
 assert(Eq 200 (_1 rp2))
 (SendCaps wh3 ["req" "GET" "/chat" ""] [0])
 (define rc7 (Ix 0 (Recv 0)))
 assert(Eq 1 (contains? "hello there" (_2 rc7)))
-assert(Eq 1 (contains? "hi yourself" (_2 rc7)))
-assert(Eq 1 (contains? "msg b" (_2 rc7)))
+assert(Eq 1 (contains? "and again" (_2 rc7)))
+
+;; the model is a slot on the conversation, set by its own form
+(SendCaps wh3 ["req" "POST" "/post/chat/conv"
+               "model=openai%2Fgpt-4o-mini&back=%2Fchat"] [0])
+(define rpm (Ix 0 (Recv 0)))
+assert(Eq 200 (_1 rpm))
+(SendCaps wh3 ["req" "GET" "/chat" ""] [0])
+(define rcm (Ix 0 (Recv 0)))
+assert(Eq 1 (contains? "openai/gpt-4o-mini" (_2 rcm)))
 
 ;; message text is escaped at render: markup in, entities out
-(SendCaps wh3 ["req" "POST" "/post/chat/log"
-               "who=a&text=%3Cscript%3Eboo&back=%2Fchat"] [0])
+(SendCaps wh3 ["req" "POST" "/post/chat/conv"
+               "text=%3Cscript%3Eboo&back=%2Fchat"] [0])
 (define rp3 (Ix 0 (Recv 0)))
 assert(Eq 200 (_1 rp3))
 (SendCaps wh3 ["req" "GET" "/chat" ""] [0])
@@ -477,12 +506,22 @@ assert(Eq 1 (contains? "&lt;script&gt;boo" (_2 rc8)))
 assert(Eq 500 (_1 rp4))
 assert(Eq 1 (contains? "poke_missing" (_2 rp4)))
 
-;; the deep chat paths still serve the chat face (single-segment
-;; root dispatch), and the log node's own page renders the log too
-(SendCaps wh3 ["req" "GET" "/chat/log" ""] [0])
+;; the deep chat paths still serve the chat face (single-segment root
+;; dispatch), and the conv node's own page renders the conversation too
+(SendCaps wh3 ["req" "GET" "/chat/conv" ""] [0])
 (define rc9 (Ix 0 (Recv 0)))
 assert(Eq 200 (_1 rc9))
 assert(Eq 1 (contains? "hello there" (_2 rc9)))
+
+;; the grant ledger on the app card: this app ASKS for outbound HTTP,
+;; and this mount (mount-app-via-card, which passes the deny-all
+;; decision) does not grant it.  The gap between the two slots is the
+;; readable denial, and ['grants 'fetch] is exactly what the helm's
+;; move gate reads back before applying an app's /io move.
+(define chat-card (Ix 0 (ask ["query" [("ts" "chat")]])))
+assert(Eq "/boot/res/known" (Hd chat-card))
+assert(Eq 1 (nat-slot [("ts" "wants") ("ts" "fetch")] 0 (_0 chat-card)))
+assert(Eq 0 (nat-slot [("ts" "grants") ("ts" "fetch")] 1 (_0 chat-card)))
 
 (define z-chat-e (ZoneEnd z-chat))
 (define z-nenex (ZoneStart "nenex"))

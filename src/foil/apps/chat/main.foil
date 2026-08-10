@@ -1,62 +1,239 @@
 -  sept [order=10]
 -  shrine_types [order=20]
+-  bond [order=25]
 -  shrine [order=30]
 -  lain [order=40]
 -  weft [order=50]
 -  pact [order=60]
 -  web [order=70]
 -  lainapp [order=80]
-'  chat: a two-sided conversation as a shrine app with its own HTML
-'  face.  Messages are numbered kids of the log node; the face's form
-'  posts through the worker's /post endpoint, which pokes the log —
-'  the log's talk arm appends the message kid in-kernel, so the
-'  namespace write never leaves the kernel's authority.  The page
-'  refreshes its log in place each second.  Mounted at the top-level
-'  /chat root (helm-run's roots table), not under /app.
-+  side_of
-  '  The posting side, defaulting to a: only a and b exist.
-  '  ?=  ((side_of "b") "b")
-  '  ?=  ((side_of "x") "a")
-  '  ?=  ((side_of 0) "a")
-  \  s=nat
+-  open_router_api [order=90]
+-  open_router_api_hand [order=100]
+'  chat: a conversation with a language model, as a shrine app.
+'  .
+'  The whole round trip is namespace state.  A post pokes the conv
+'  node; its talk appends the turn under ['msgs] AND makes a request
+'  kid under ['api], whose behavior is the OpenRouter hand schemagen
+'  generated from src/spec/openrouter.json.  The hand's take emits the
+'  fetch card at /io/http_client — a card outside the app's own
+'  subtree, which leaves the transaction as a MOVE and is applied only
+'  because the app's card grants ['grants 'fetch] (helm/moves, and
+'  doc/multifile-apps-io-grants.md part II).  When the answer lands the
+'  hand pokes bond/res onto the request kid; the conv node hears that
+'  through its own z-care crew and appends the assistant's turn.
+'  .
+'  So every message, every request, and every reply is an addressable
+'  node with history: /h scrubs the whole conversation, and nothing
+'  about the exchange lives in host memory.
++  conv_slot
+  '  Where the conversation's turns live, under the conv node.
+  ^  path
+  ['msgs]
++  api_slot
+  '  Where the request kids live: the hand node's own subtree.
+  ^  path
+  ['api]
++  dflt_model
   ^  nat
-  ?  (eq s "b")
-     "b"
-  "a"
-+  log_talk
-  '  A post poke appends one message: ['post 'who] and ['post 'text]
-  '  become a numbered kid's ['who] and ['text], and the count
-  '  advances.  The post slots themselves are never retained.  Pokes
-  '  without a post payload meld as usual.
+  "anthropic/claude-sonnet-4.5"
++  msg_rec
+  '  One turn as a record: who said it and what they said.
+  \  who=nat body=nat
+  ^  myth
+  .  (myth/new)
+     put(['who] (pails/t who))
+     put(['text] (pails/t body))
++  model_of
+  '  The conversation's chosen model, or the default.
+  \  cur=myth
+  ^  nat
+  =  m  (myth/txt_at ['model] cur)
+  ?  (eq 0 m)
+     dflt_model
+  m
++  turn_msg
+  '  One stored turn as a chat message.  A turn the model produced
+  '  goes back as an assistant message so the exchange stays a
+  '  conversation and not a series of unrelated questions.
+  \  who=nat body=nat
+  ^  chat_messages
+  ?  (eq who "assistant")
+     (./assistant
+       (chat_assistant_message .none (./some (./str body)) .none .none
+         .none .none .none .none "assistant" .none))
+  (./user (chat_user_message (./str body) .none "user"))
++  history
+  '  Every stored turn, oldest first, as chat messages.
+  \  msgs=axal[myth]
+  ^  row[chat_messages]
+  =  kids  msgs.kid_tap
+  |  > i=nat 0  > out=row[chat_messages] []
+  ?  (eq i kids.len)
+     out
+  =  e  kids.at(i)
+  ?  e.val.fil
+   > .none  (_ i.inc out)
+   > (./some t=myth)
+     =  who  (myth/txt_at ['who] t)
+        body  (myth/txt_at ['text] t)
+     (_ i.inc out.snoc((turn_msg who body)))
++  chat_body
+  '  The request body: the conversation so far, at the chosen model.
+  '  chat_request is 42 fields wide and positional — everything we do
+  '  not set is explicitly absent, in the schema's own field order.
+  \  msgs=row[chat_messages] model=nat
+  ^  chat_request
+  (chat_request .none .none .none .none .none .none .none .none
+    msgs .none .none .none (./some model) .none .none .none .none
+    .none .none .none .none .none .none .none .none .none .none
+    .none .none .none .none .none .none .none .none .none .none
+    .none .none .none .none .none)
++  req_rec
+  '  A request kid: the bond/req the hand's take is waiting for.
+  \  msgs=row[chat_messages] model=nat
+  ^  myth
+  (myth/new).put(bond/req (req/send_chat_completion_request
+                            (chat_body msgs model)))
++  reply_text
+  '  The assistant's words from a parsed result.  A result with no
+  '  choices, or content that came back as parts rather than a plain
+  '  string, reads as empty — the caller decides what to do about it.
+  \  r=chat_result
+  ^  nat
+  ?  (eq 0 r.choices.len)
+     ""
+  =  m  r.choices.at(0).message
+  ?  m.content
+   > .none  ""
+   > (./some c)
+     ?  c
+      > (./str s)  s
+      > (./arr xs)  ""
+      > (./unknown u)  ""
++  res_reply
+  '  The reply carried by a finished request kid, or 0 when it has
+  '  not finished.  The hand parks the parse result in bond/res as
+  '  the generated chat_result_r — ok holds the value, err holds the
+  '  path it failed at and why, and a decode failure is worth showing
+  '  rather than swallowing.
+  \  t=myth
+  ^  nat
+  ?  t.get(bond/res)
+   > .none  0
+   > (./some held=pail)
+     ?  held
+      > o=chat_result_r/ok   (reply_text o.v)
+      > e=chat_result_r/err  (weft/cat2 "error: " e.why)
+      0
++  conv_init
+  '  The conversation container: a z-care crew on its own subtree, so
+  '  a reply poked onto a request kid comes back as a hear here, and
+  '  the counters both turns and requests are numbered by.
+  \  b=bowl t=myth
+  ^  yell
+  =  t2  t.put(crew_slot (cpail (crew/sing ['self] (dep .z b.here))))
+  =  t3  t2.put(['count] (pd 0)).put(['reqs] (pd 0))
+  (yell [] t3)
++  conv_talk
+  '  A post: ['post 'model] switches models, ['post 'text] takes a
+  '  turn — the turn is appended AND a request kid is made in the same
+  '  transaction, so the question and the asking of it commit together.
   \  b=bowl cur=myth nu=myth
   ^  yell
-  =  text  (myth/txt_at ['post 'text] nu)
-  ?  (eq 0 text)
+  =  mdl  (myth/txt_at ['post 'model] nu)
+  ?  !(eq 0 mdl)
+     (yell [] cur.put(['model] (pails/t mdl)))
+  =  body  (myth/txt_at ['post 'text] nu)
+  ?  (eq 0 body)
      (def_talk b cur nu)
-  =  who  (side_of (myth/txt_at ['post 'who] nu))
-     n    cur.nat_at(['count] 0)
-     msg
-       .  (myth/new)
-          put(['who] (pails/t who))
-          put(['text] (pails/t text))
-     card  [b.here.snoc(($u n)) (writ/make msg)]
-  (yell [card] cur.put(['count] (pd n.inc)))
-+  log_form
-  '  The log behavior: talk appends.
+  =  n  cur.nat_at(['count] 0)
+     k  cur.nat_at(['reqs] 0)
+  =  fat   b.crew.gut(['self] (axal/new[myth] .none))
+     past  (history fat.dip(conv_slot))
+  =  msgs  past.snoc((turn_msg "user" body))
+  =  cards
+       [[b.here.weld(conv_slot.snoc(($u n)))
+         (writ/make (msg_rec "user" body))]
+        [b.here.weld(api_slot.snoc(($u k)))
+         (writ/make (req_rec msgs (model_of cur)))]]
+  =  out
+       .  cur
+          put(['count] (pd n.inc))
+          put(['reqs] (pd k.inc))
+  (yell cards out)
++  conv_hear
+  '  A request kid changed.  If it now carries a reply, append it as
+  '  the assistant's turn and mark the kid answered, so the same reply
+  '  is never appended twice (the crew fires on every write under the
+  '  subtree, including our own).
+  \  b=bowl cur=myth changed=row[dep]
+  ^  yell
+  =  fat  b.crew.gut(['self] (axal/new[myth] .none))
+  =  kids  fat.dip(api_slot).kid_tap
+  |  > i=nat 0  > cards=row[[p=path q=writ]] []  > out=myth cur
+  ^  yell
+  ?  (eq i kids.len)
+     (yell cards out)
+  =  e  kids.at(i)
+  ?  e.val.fil
+   > .none  (_ i.inc cards out)
+   > (./some t=myth)
+     ?  t.nat_at(['taken] 0)
+        (_ i.inc cards out)
+     =  txt  (res_reply t)
+     ?  (eq 0 txt)
+        (_ i.inc cards out)
+     =  n  out.nat_at(['count] 0)
+        c2
+          .  cards
+             snoc([b.here.weld(conv_slot.snoc(($u n)))
+                   (writ/make (msg_rec "assistant" txt))])
+             snoc([b.here.weld(api_slot.snoc(e.key))
+                   (writ/poke (myth/new).put(['taken] (pd 1)))])
+     (_ i.inc c2 out.put(['count] (pd n.inc)))
++  conv_form
+  '  The conversation behavior: init watches, talk asks, hear answers.
   ^  form
-  def_form.set_talk(log_talk)
-+  log_seed
-  '  The seeded log: empty, carrying the log kook (app-relative —
-  '  the mount absolutizes it).
+  def_form.set_init(conv_init).set_talk(conv_talk).set_hear(conv_hear)
++  conv_seed
+  '  The seeded conversation: empty, carrying the conv kook.
   ^  myth
-  (kooked [['kook 'log]]).put(['count] (pd 0))
-+  log_of
-  '  The log subtree in a hydrated target view: the target may be
-  '  the app root (the log rides as the ['log] kid) or the log node
-  '  itself (its record carries the count).
+  (kooked [['kook 'conv]])
++  api_seed
+  '  The generated hand's node — seeded WITHOUT a behavior.
+  '  .
+  '  The hand's form closes over the whole compiled client (190 types
+  '  and their serde), and a manifest is stored entire on the app card
+  '  and re-expanded on every remount, so carrying it here would put
+  '  that closure in the namespace twice and drag it through every
+  '  mount.  The host registers the form once in the kernel registry
+  '  and pokes this node's limb to point at it, exactly as it
+  '  provisions any other driver-backed capability the app asked for.
+  '  Until that lands the node is inert, which is the honest state of
+  '  an app whose grant has not been provisioned.
+  '  .
+  '  ['base] is the server the schema named; ['auth] is poked in at
+  '  boot (an unauthenticated client is a real case, so an absent key
+  '  is not a mount failure); the ['http] crew slot is how the hand
+  '  finds the fetch driver.
+  ^  myth
+  .  (myth/new)
+     put(['base] (pails/t "https://openrouter.ai/api/v1"))
+     put(crew_slot (cpail (crew/sing ['http] (dep .x ['io 'http_client]))))
++  chat_css
+  ^  nat
+  "body{font-family:sans-serif;max-width:44em;margin:2em auto;padding:0 1em} h1{font-size:1.2em;color:#345} #log{display:flex;flex-direction:column;gap:.6em;margin:1em 0} .msg{padding:.5em .8em;border-radius:1em;max-width:80%;white-space:pre-wrap} .user{background:#dde8ff;align-self:flex-end} .assistant{background:#eee;align-self:flex-start} .who{font-size:.7em;color:#667;margin-bottom:.2em} .pending{color:#999;font-style:italic} form{display:flex;gap:.5em;align-items:center;margin-top:1em} input[type=text]{flex:1;padding:.5em} .bar{display:flex;gap:.5em;align-items:center;font-size:.8em;color:#667}"
++  refresh_js
+  '  Replace the log in place from a fresh render: a reload would wipe
+  '  what the user is typing, and a reply can land at any time.
+  ^  nat
+  "setInterval(function(){fetch(location.href).then(function(r){return r.text()}).then(function(t){var d=new DOMParser().parseFromString(t,'text/html');var n=d.getElementById('log');var o=document.getElementById('log');if(n&&o&&document.activeElement.name!=='text'){o.innerHTML=n.innerHTML}})},1000)"
++  conv_of
+  '  The conv subtree in a hydrated target view: the target may be the
+  '  app root (conv rides as the ['conv] kid) or the conv node itself.
   \  view=axal[myth]
   ^  axal[myth]
-  =  sub  view.dip(['log])
+  =  sub  view.dip(['conv])
   ?  sub.fil
    > (./some t=myth)  sub
    > .none
@@ -76,20 +253,27 @@
   ?  (eq_iota tgt.at(0) 'app)
      tgt.take(2)
   tgt.take(1)
-+  chat_css
++  pending
+  '  Whether any request kid is still waiting on an answer — what the
+  '  page shows as the model thinking.
+  \  conv=axal[myth]
   ^  nat
-  "body{font-family:sans-serif;max-width:40em;margin:2em auto;padding:0 1em} h1{font-size:1.2em;color:#345} #log{display:flex;flex-direction:column;gap:.4em;margin:1em 0} .msg{padding:.5em .8em;border-radius:1em;max-width:70%} .a{background:#dde8ff;align-self:flex-start} .b{background:#d8f5d8;align-self:flex-end} .who{font-size:.7em;color:#667} form{display:flex;gap:.5em;align-items:center} input[type=text]{flex:1;padding:.4em}"
-+  refresh_js
-  '  Replace the log in place from a fresh render: a reload would
-  '  wipe the form, so only the log node's markup is swapped.
-  ^  nat
-  "setInterval(function(){fetch(location.href).then(function(r){return r.text()}).then(function(t){var d=new DOMParser().parseFromString(t,'text/html');var n=d.getElementById('log');var o=document.getElementById('log');if(n&&o){o.innerHTML=n.innerHTML}})},1000)"
+  =  kids  conv.dip(api_slot).kid_tap
+  |  > i=nat 0
+  ?  (eq i kids.len)
+     0
+  =  e  kids.at(i)
+  ?  e.val.fil
+   > .none  (_ i.inc)
+   > (./some t=myth)
+     ?  t.nat_at(['taken] 0)
+        (_ i.inc)
+     1
 +  msg_nodes
-  '  The conversation, oldest first: the log's numbered kids in
-  '  their natural order, each a bubble on its side.
-  \  log=axal[myth]
+  '  The conversation, oldest first, each turn on its own side.
+  \  conv=axal[myth]
   ^  row[weft/node]
-  =  kids  log.kid_tap
+  =  kids  conv.dip(conv_slot).kid_tap
   |  > i=nat 0  > out=row[weft/node] []
   ?  (eq i kids.len)
      out
@@ -97,50 +281,60 @@
   ?  e.val.fil
    > .none  (_ i.inc out)
    > (./some t=myth)
-     =  who  (side_of (myth/txt_at ['who] t))
+     =  who  (myth/txt_at ['who] t)
      =  nd
           (weft/el "div" [(weft/cls (weft/cat2 "msg " who))]
             [(weft/el "div" [(weft/cls "who")] [(weft/tx who)])
              (weft/tx t.txt_at(['text]))])
      (_ i.inc out.snoc(nd))
-+  side_input
-  '  One side of the picker: a labeled radio button.
-  \  v=nat checked=nat
-  ^  weft/node
-  =  as
-       ?  checked
-          [(weft/att "type" "radio") (weft/att "name" "who")
-           (weft/att "value" v) (weft/att "checked" "checked")]
-       [(weft/att "type" "radio") (weft/att "name" "who")
-        (weft/att "value" v)]
-  (weft/el "label" [] [(weft/el "input" as []) (weft/tx v)])
++  log_nodes
+  '  The rendered log, with a thinking line while a request is open.
+  \  conv=axal[myth]
+  ^  row[weft/node]
+  =  ms  (msg_nodes conv)
+  ?  (pending conv)
+     ms.snoc((weft/el "div" [(weft/cls "msg assistant pending")]
+               [(weft/tx "thinking...")]))
+  ms
 +  chat_page
-  '  The whole page: the conversation, the posting form (side picker,
-  '  text, send), and the in-place refresh timer.
-  \  root=path log=axal[myth]
+  '  The whole page: the conversation, the model in use, and the box.
+  \  root=path conv=axal[myth]
   ^  nat
-  =  logp=path  root.weld(['log])
-  =  post_url  (weft/cat2 "/post" (show/path logp))
+  =  convp=path  root.weld(['conv])
+  =  post_url  (weft/cat2 "/post" (show/path convp))
      back_url  (show/path root)
+     model
+       ?  conv.fil
+        > (./some t=myth)  (model_of t)
+        > .none  dflt_model
      body
        [(weft/leaf "h1" [] "chat")
-        (weft/el "div" [(weft/att "id" "log")] (msg_nodes log))
+        (weft/el "div" [(weft/att "id" "log")] (log_nodes conv))
         (weft/el "form"
           [(weft/att "method" "post") (weft/att "action" post_url)]
           [(weft/el "input"
              [(weft/att "type" "hidden") (weft/att "name" "back")
               (weft/att "value" back_url)] [])
-           (side_input "a" 1)
-           (side_input "b" 0)
            (weft/el "input"
              [(weft/att "type" "text") (weft/att "name" "text")
               (weft/att "autocomplete" "off")] [])
            (weft/leaf "button" [] "send")])
+        (weft/el "form"
+          [(weft/att "method" "post") (weft/att "action" post_url)
+           (weft/cls "bar")]
+          [(weft/el "input"
+             [(weft/att "type" "hidden") (weft/att "name" "back")
+              (weft/att "value" back_url)] [])
+           (weft/leaf "span" [] "model")
+           (weft/el "input"
+             [(weft/att "type" "text") (weft/att "name" "model")
+              (weft/att "value" model)] [])
+           (weft/leaf "button" [] "set")])
         (weft/el "script" [] [(weft/raw refresh_js)])]
   (weft/page "chat" chat_css body)
 +  face_talk
   '  The app's HTTP face: render the conversation from the hydrated
-  '  request target.  Same responder contract as the explorer.
+  '  request target.
   \  b=bowl cur=myth nu=myth
   ^  yell
   =  out  cur.meld(nu)
@@ -155,7 +349,7 @@
      done
        .  out
           put(['res_status] (pd 200))
-          put(['res_body] (pd (chat_page (root_of tgt) (log_of view))))
+          put(['res_body] (pd (chat_page (root_of tgt) (conv_of view))))
           put(['res_ctype] (pd "text/html; charset=utf-8"))
   (yell [] done)
 +  face_form
@@ -163,14 +357,20 @@
   ^  form
   def_form.set_talk(face_talk)
 +  app
-  '  The chat app: the log and its face.
+  '  The chat app: the conversation, the generated API hand, and the
+  '  face.  The wants row is the ask that makes the whole thing
+  '  possible — without a granted ['gfetch] the hand's fetch card is
+  '  dropped as an ungoverned move and no request ever leaves.
   ^  mani
   (mani 'chat
-        (lore "A two-sided chat, served as its own page."
-              ["A two-sided chat, served as its own page."
-               "Messages are numbered kids of the log node; the face's form posts through the /post endpoint, and the log's talk arm appends each message in-kernel."
-               "Pick a side (a or b), type, send.  The page refreshes its log in place, so a conversation held in two windows converges by itself."]
+        (lore "A conversation with a language model, held in the namespace."
+              ["A conversation with a language model, held in the namespace."
+               "A post appends the turn and makes a request kid under ['api]; the generated OpenRouter hand fetches, and its reply is heard back and appended as the assistant's turn."
+               "Every message and every request is an addressable node, so /h scrubs the whole exchange."
+               "Set the model with the second box; it is remembered as a slot on the conversation."]
               [])
-        [(kook/decl 'log log_form (lore/line "The log: a post poke appends a numbered message kid and advances the count."))
-         (kook/decl 'face face_form (lore/line "The HTML face: renders the conversation and the posting form; the log refreshes in place."))]
-        [[['log] log_seed]])
+        [(kook/decl 'conv conv_form (lore/line "The conversation: talk takes a turn and asks, hear appends the answer."))
+         (kook/decl 'face face_form (lore/line "The HTML face: renders the conversation and the box; the log refreshes in place."))]
+        [[['conv] conv_seed]
+         [['conv 'api] api_seed]]
+        [.gfetch])
