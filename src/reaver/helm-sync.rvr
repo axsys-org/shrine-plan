@@ -1,0 +1,445 @@
+;;;; The serve terminal: one keystroke syncs unix into the namespace.
+;;;;
+;;;; x/lain used to park after booting — the only way to get changed
+;;;; source into a live namespace was to kill it and pay a fresh boot.
+;;;; This module gives the serve process a stdin CLI instead:
+;;;;
+;;;;   s          sync foil/ into the namespace and rebuild what changed
+;;;;   s <mod>    force a rebuild of <mod> and everything importing it
+;;;;   l          list what a plain s would rebuild, without doing it
+;;;;   h  q       help, quit
+;;;;
+;;;; What "sync" means here is literal: a module is out of date when
+;;;; the bytes on disk differ from the source the namespace holds at
+;;;; /boot/<mod> [/sys/src].  The namespace is the baseline, not a
+;;;; table of mtimes we keep on the side, so a RESUMED serve notices
+;;;; edits made while the process was dead.
+;;;;
+;;;; A rebuild is a real rebuild, not a per-module recompile: the
+;;;; changed set is closed under "imports something changed" (a
+;;;; dependent's compiled entries embed the code it imported), ordered
+;;;; so dependencies compile first, and threaded through ONE cache
+;;;; that starts as the boot mirror cache and carries every fresh
+;;;; subject forward.  Editing sept.foil therefore rebuilds the world
+;;;; below it, and everything downstream sees the new sept — which is
+;;;; the part the /chore/compile family cannot do (its cache is the
+;;;; boot cache, fixed at the closure it was built with).
+;;;;
+;;;; Each rebuilt module lands as ONE pact poke at /boot/<mod>: the
+;;;; module node's own slots meld in place and pact/talk expands the
+;;;; entry seeds inside the same epoch — the same shape the boot's
+;;;; pact makes use, for a node that already exists.  An app module
+;;;; additionally gets a fresh pact card poked at its mount root, so
+;;;; the running app upgrades with its code (shrine-apps.md 5.2).
+;;;;
+;;;; Everything runs in MAIN, which is where the compiler lives; the
+;;;; coordinator keeps serving HTTP while a rebuild compiles.
+;;;;
+;;;; What a sync does NOT touch: the mcache the serve's chore families
+;;;; closed over at boot, so /chore/eval keeps evaluating against boot
+;;;; subjects until the process restarts.  The namespace's own ['sub]
+;;;; pins ARE rewritten, so the next resume (or any hydrate-cache
+;;;; reader) picks the rebuild up.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+(#bind foil (#module foil))
+(#bind foil-render (#module foil-render))
+(#bind helm (#module helm))
+
+(define (ts s) ("ts" s))
+(define NL (strcat [10]))
+
+;;; Terminal ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (put s) (Write 1 (strWeld s 1)))
+
+(define (emit rows) (put (join-str NL (Weld rows [""]))))
+
+(define (prompt z) (put "lain> "))
+
+(define (words s) (filter Bytes (split-str " " s)))
+
+;; Now is nanoseconds (at 1s resolution) — the raw difference is what
+;; the PHASE stamps print, and it is not a number anyone reads.
+(define (since t0) (showNat (Div (Sub (Now 0) t0) 1000000000)))
+
+(define help-rows
+  ["the lain serve terminal — the namespace keeps serving while you type"
+   ""
+   "  s          sync foil/ into the namespace and rebuild what changed"
+   "  s <mod>    force a rebuild of <mod> (and everything importing it)"
+   "  l          list what s would rebuild, without rebuilding"
+   "  h          this help"
+   "  q          quit (the namespace is durable — x/lain resumes it)"
+   ""
+   "a module counts as changed when its file differs from the source"
+   "the namespace holds at /boot/<mod>.  ctrl-d parks the serve."])
+
+;;; The environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; ["S" core coord cache pump].  cache is the live compile cache: it
+;; starts as the boot mirror cache and every successful rebuild
+;; replaces one row, so the next compile sees its dependencies fresh.
+(define (env-core e) (Ix 1 e))
+(define (env-coord e) (Ix 2 e))
+(define (env-cache e) (Ix 3 e))
+(define (env-pump e) (Ix 4 e))
+(define (env-cache-set e c) ["S" (env-core e) (env-coord e) c (env-pump e)])
+
+(define (e-ent e path) (helm:core-ent (env-core e) path))
+
+;; Coordinator traffic, exactly as the repl does it: send, wait for
+;; the reply on MAIN's mailbox.
+(define (ask e msg)
+  (Seq (SendCaps (env-coord e) (DeepSeq msg msg) [0])
+    (Recv 0)))
+
+(define (query e pax) (Ix 0 (ask e ["query" pax])))
+
+;; -> ["done"] on commit, ["fail" err] on rejection.
+(define (inject e t) (Ix 0 (ask e ["task" t])))
+
+(define (committed? reply) (Eq "done" (_0 reply)))
+
+;;; What is out of date ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Every .foil under foil/, minus the fixture modules the boot mirror
+;; also skips (they are not in the namespace, so they cannot be out
+;; of sync with it).
+(define (disk-roster z)
+  (helm:mirror-roster (foil:read-fs-tree "foil")))
+
+(define (mod-node mod)
+  (Weld [(ts "boot")] (map ts (helm:mod-segs mod))))
+
+;; The source the namespace currently holds for a module.  0 when the
+;; module has no mirror node, or carries a fail card instead of a
+;; source record — both mean "not in sync", which is what we want.
+(define (mirror-src e mod)
+  (define txt-at (e-ent e ["myth" "txt_at"]))
+  (define r (query e (mod-node mod)))
+  (If (Eq "/boot/res/known" (Hd r))
+    (txt-at [(ts "sys") (ts "src")] (_0 r))
+    0))
+
+;; The unix -> namespace delta.  Read fresh on every sync: no mtime
+;; table on the side means a resumed serve sees edits made while the
+;; process was dead, and an unreadable file is simply not a change.
+(define (changed-mods e roster)
+  (filter
+    (lambda (mod)
+      (let ((disk (Try (lambda (z) (foil:get-foil mod)) 0)))
+        (If (Eq 1 (Hd disk))
+          0
+          (Nil (Equal (_0 disk) (mirror-src e mod))))))
+    roster))
+
+;;; Ordering the rebuild ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; [[mod [direct-imports..]] ..] over the roster — one parse per file,
+;; and only paid once something actually changed.  Imports outside the
+;; roster (fixtures, missing files) drop out: they cannot be dirty.
+(define (import-table roster)
+  (map
+    (lambda (m)
+      [m (filter (lambda (i) (includes (Eq i) roster))
+           (foil:module-imports m))])
+    roster))
+
+(define (imports-of tab mod)
+  (define hit (find (lambda (r) (Eq mod (_0 r))) tab))
+  (Ifz hit [] (_1 (_0 hit))))
+
+;; The changed set closed under "imports something in it".  A
+;; dependent's compiled entries embed the code it imported, so its
+;; mirror is stale the moment an import changes, even though its own
+;; file did not move.
+(define (dirty-closure tab seed)
+  (define (grow cur)
+    (define next
+      (foldl
+        (lambda (a r)
+          (If (includes (Eq (_0 r)) a)
+            a
+            (If (includes (lambda (i) (includes (Eq i) a)) (_1 r))
+              (snoc (_0 r) a)
+              a)))
+        cur tab))
+    (If (Eq (Sz next) (Sz cur)) cur (grow next)))
+  (grow seed))
+
+;; Dirty modules ordered so a module's dirty imports rebuild first —
+;; each compile then sees its dependencies' fresh subjects.  The set
+;; is import-closed downstream, so ordering on DIRECT imports is
+;; enough.  An import cycle cannot be ordered: take the head and let
+;; the compiler be the one to complain.
+(define (build-order tab dirty)
+  (define (go pend done)
+    (Ifz (Sz pend)
+      done
+      (let* ((blocked?
+               (lambda (m)
+                 (includes
+                   (lambda (i) (And (Ne i m) (includes (Eq i) pend)))
+                   (imports-of tab m))))
+             (ready (filter (lambda (m) (Nil (blocked? m))) pend))
+             (pick (Ifz (Sz ready) (_0 pend) (_0 ready))))
+        (go (filter (lambda (m) (Ne m pick)) pend) (snoc pick done)))))
+  (go dirty []))
+
+;;; Landing a rebuilt module in the namespace ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The module's whole mirror subtree as ONE pact poke at /boot/<mod>:
+;; the module node's own slots (source, header lore, the ['sub] cache
+;; pin) meld in place, and pact/talk expands the entry seeds —
+;; make-if-absent, poke-if-present — inside the same committed epoch.
+;; /boot/<mod> already carries the pact kook (the boot mirrors through
+;; pact/vine), so the poke dispatches with no extra wiring.
+;;
+;; Entries DELETED by the edit are not culled: pact/talk expands the
+;; manifest it is given and leaves kids it was not told about, exactly
+;; as the chore resync's remount does.  The stale node keeps its last
+;; good value until the next fresh boot.
+(define (remount-task core me)
+  (define vine-poke (helm:core-ent core ["vine_poke"]))
+  (define msing (helm:core-ent core ["myth" "sing"]))
+  (define mmeld (helm:core-ent core ["myth" "meld"]))
+  (define pact-slot (helm:core-ent core ["pact" "slot"]))
+  (define mp
+    (_0 (helm:boot-mirror-mods-lore-with helm:mirror-lore? [me] core)))
+  (define mla (Ix 1 mp))
+  ;; rvr-side nominal construction is by rep — the pact/lore and
+  ;; pact/mani entries are TYPES, not value constructors (the
+  ;; ref-upgrade-task precedent in helm.rvr).
+  (define doc
+    (If (Ix 0 mla)
+      ("/boot/lore" (Ix 1 mla) (Ix 2 mla) (Ix 3 mla))
+      ("/boot/lore" 0 [] [])))
+  (vine-poke (Ix 0 mp)
+    (mmeld (msing pact-slot ("/boot/mani" (ts "sub") doc [] (Ix 3 mp)))
+      (Ix 2 mp))))
+
+;; "apps/<name>/main" -> [<name>]; 0 for an ordinary module.
+(define (app-of mod)
+  (define segs (helm:mod-segs mod))
+  (If (And (Eq 3 (Sz segs))
+        (And (Equal "apps" (Ix 0 segs)) (Equal "main" (Ix 2 segs))))
+    [(Ix 1 segs)]
+    0))
+
+;; A rebuilt app upgrades in place: a fresh pact card poked at its
+;; mount root, whose manifest pact/talk diffs against the live subtree
+;; and expands as the delta (shrine-apps.md 5.2).  An app entry that
+;; stopped being a manifest is left alone — the mount that is running
+;; is better than no mount.
+(define (remount-app-tasks core mod sut)
+  (define hit (app-of mod))
+  (Ifz hit
+    []
+    (let* ((name (_0 hit))
+           (mani-ok (helm:core-ent core ["mani" "ok"]))
+           (card (helm:core-ent core ["pact" "card"]))
+           (vine-poke (helm:core-ent core ["vine_poke"]))
+           (r (Try (lambda (z)
+                     (let ((m (foil:source-entry-val ["app"] sut)))
+                       (Seq (DeepSeq m 0) m)))
+                0)))
+      (If (Or (Eq 1 (Hd r)) (Nil (Eq 1 (mani-ok (_0 r)))))
+        []
+        [(vine-poke (helm:mount-root helm:app-roots name)
+           (card (_0 r) mod))]))))
+
+;;; One module ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Recompile one module against the live cache and land it.  A module
+;; that does not compile is reported on the terminal and NOT written:
+;; the namespace keeps its last good build rather than growing a
+;; tombstone that nothing would ever clear.  -> [env' rows]
+(define (rebuild-mod e mod)
+  (define core (env-core e))
+  (define cache (env-cache e))
+  (define cache1 (filter (lambda (me) (Ne mod (_0 me))) cache))
+  ;; the clock reading has to be FORCED before the work it measures,
+  ;; or laziness attributes it to whoever first demands secs — which
+  ;; is after the compile (helm-run.rvr phase-stamp, same trap)
+  (define t0 (Now 0))
+  (define r
+    (Seq t0
+      (Try
+        (lambda (z)
+          (let ((cr (foil:compile-mod-cached cache1 foil:default-subject mod)))
+            (Seq (DeepSeq cr cr) cr)))
+        0)))
+  (If (Eq 1 (Hd r))
+    [e [(strcat ["  " mod ": FAILED — not written"])
+        (foil-render:diag-text (_0 r))]]
+    (let* ((cache2 (_0 (_0 r)))
+           (sut (_1 (_0 r)))
+           (me (_0 (find (lambda (x) (Eq mod (_0 x))) cache2)))
+           (tasks (cons (remount-task core me)
+                    (remount-app-tasks core mod sut)))
+           ;; map is lazy and inject is an effect: force the whole row
+           ;; of verdicts here rather than wherever it gets read
+           (reps0 (map (lambda (t) (inject e t)) tasks))
+           (reps (DeepSeq reps0 reps0))
+           (bad (filter (lambda (x) (Nil (committed? x))) reps)))
+      (If (Sz bad)
+        ;; the compile stands but the namespace refused the write —
+        ;; keep the fresh cache row anyway (it is what the next
+        ;; module in the order must compile against), and put the
+        ;; rejection where a serve log will keep it
+        (Seq (Trace ["sync: write rejected" mod (_0 bad)] 0)
+          [(env-cache-set e cache2)
+           [(strcat ["  " mod ": compiled, but the namespace refused the "
+                     "write — see the serve log"])]])
+        [(env-cache-set e cache2)
+         [(strcat ["  " mod " (" (since t0) "s)"])]]))))
+
+;;; The sync ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; seed = [] to take whatever differs from the namespace, or an
+;; explicit row of module names to force.  -> env'
+(define (sync e seed)
+  (define roster (disk-roster 0))
+  (define changed (Ifz (Sz seed) (changed-mods e roster) seed))
+  (Ifz (Sz changed)
+    (Seq (emit ["nothing to sync — the namespace matches foil/"]) e)
+    (let* ((tab (import-table roster))
+           (order (build-order tab (dirty-closure tab changed)))
+           (t0 (Now 0)))
+      (Seq t0
+      (Seq
+        (emit
+          [(strcat [(showNat (Sz changed)) " changed on disk, "
+                    (showNat (Sz order)) " to rebuild:"])
+           (strcat ["  " (join-str " " order)])])
+        (let ((e2 (foldl
+                    (lambda (acc mod)
+                      (let ((r (rebuild-mod acc mod)))
+                        (Seq (emit (_1 r)) (_0 r))))
+                    e order)))
+          ;; force the fold before the closing line: it IS the work,
+          ;; and a lazy e2 would print "synced in 0s" first and only
+          ;; then run (and report) the modules underneath it
+          (Seq e2
+            (Seq (emit [(strcat ["synced in " (since t0) "s"])])
+              e2))))))))
+
+;; What a plain s would do, without doing it.
+(define (plan-rows e)
+  (define roster (disk-roster 0))
+  (define changed (changed-mods e roster))
+  (Ifz (Sz changed)
+    ["nothing to sync — the namespace matches foil/"]
+    (let* ((tab (import-table roster))
+           (order (build-order tab (dirty-closure tab changed))))
+      [(strcat ["changed:  " (join-str " " changed)])
+       (strcat ["rebuild:  " (join-str " " order)])])))
+
+;;; The loop ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; One stdin line per request: MAIN asks, the pump answers.  A
+;; free-running pump would race the coordinator replies MAIN waits for
+;; inside a rebuild — both land in the same mailbox, and a stray line
+;; read as a commit verdict would wedge the sync.
+(define (stdin-pump self)
+  (define mc (Recv 0))
+  (define out (Ix 0 (Ix 1 mc)))
+  (define (loop z)
+    (Seq (Recv 0)
+      (let ((chunk (foil:read-stdin 384)))
+        (Ifz chunk
+          (Send out ["eof"])
+          (Seq (Send out ["line" (foil:read-until 10 chunk)])
+            (loop z))))))
+  ;; force the greeting BEFORE the loop's Recv, or laziness inverts
+  ;; them: mc is only demanded by the first Send, so the loop's Recv
+  ;; eats the ["go"] message and mc then takes the caps off the
+  ;; ["next"] request — which carries none, and every line is
+  ;; delivered to nobody.
+  (Seq out (loop 0)))
+
+;; A spawned actor has no compiler, so force the pump's call graph in
+;; MAIN before spawning it (helm-run.rvr's warm block, same reason).
+(define (warm-pump z)
+  (DeepSeq
+    [stdin-pump foil:read-stdin foil:read-until
+     (foil:read-until 10 [104 [105 [10 0]]])]
+    0))
+
+;; After EOF the serve is still a serve: park like it always did.
+(define (park z) (Seq (Recv 0) (park z)))
+
+;; MAIN's mailbox also carries coordinator replies; only pump traffic
+;; ends a wait for input.
+(define (await-line z)
+  (define msg (Ix 0 (Recv 0)))
+  (If (Or (Equal "line" (_0 msg)) (Equal "eof" (_0 msg)))
+    msg
+    (await-line z)))
+
+;; -> [env'] to keep going, 0 to quit.
+(define (run-line e line)
+  (define ws (words line))
+  (define cmd (Ifz (Sz ws) "" (Ix 0 ws)))
+  (define roster (disk-roster 0))
+  (cond
+    ((Equal "" cmd) [e])
+    ((Equal "q" cmd) 0)
+    ((Equal "h" cmd) (Seq (emit help-rows) [e]))
+    ((Equal "l" cmd) (Seq (emit (plan-rows e)) [e]))
+    ((Equal "s" cmd)
+      (Ifz (Sub (Sz ws) 1)
+        [(sync e [])]
+        (let ((mod (Ix 1 ws)))
+          (If (includes (Eq mod) roster)
+            [(sync e [mod])]
+            (Seq (emit [(strcat ["no module " mod " under foil/"])]) [e])))))
+    (else
+      (Seq (emit [(strcat ["unknown command " line " — h for help"])]) [e]))))
+
+(define (cli-loop e)
+  (Seq (Send (env-pump e) ["next"])
+    (let* ((msg (await-line 0))
+           (kind (_0 msg)))
+      (If (Equal "eof" kind)
+        (Seq (emit ["" "stdin closed — parking; the namespace keeps serving"])
+          (park 0))
+        (let ((r (run-line e (_1 msg))))
+          (Ifz r
+            (emit ["bye"])
+            ;; force the command through before the next prompt: an s
+            ;; returns [(sync ..)], which Ifz only takes to WHNF, so a
+            ;; bare (Seq (prompt 0) ..) prints the prompt in front of
+            ;; the output of the command it is prompting after
+            (let ((e1 (_0 r)))
+              (Seq e1
+                (Seq (prompt 0) (cli-loop e1))))))))))
+
+;; Take the terminal after the serve is up.  Called instead of the
+;; park at the end of a fresh boot AND at the end of a resume, so a
+;; resumed namespace has the same CLI as the one that booted it.
+(define (run-cli core coord cache port)
+  ;; Force the serve before printing a prompt about it: these arrive
+  ;; as thunks, and a terminal in front of an unbuilt namespace is
+  ;; worse than no terminal (helm-run.rvr run-lain-serve says the
+  ;; same thing at the other end of the call).
+  (Seq (Seq coord (Seq core 0))
+    (Seq (warm-pump 0)
+    (let* ((pump (Spawn stdin-pump))
+           (e ["S" core coord cache pump]))
+      (Seq (SendCaps pump ["go"] [0])
+        (Seq (emit
+               [""
+                (strcat ["lain serving on http://localhost:"
+                         (showNat port) "/ns"])
+                "s + enter syncs foil/ into the namespace and rebuilds; h for help"])
+          (Seq (prompt 0) (cli-loop e))))))))

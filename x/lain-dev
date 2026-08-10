@@ -1,0 +1,212 @@
+# A live lain serve as an agent-friendly incremental build loop.
+#
+# Same lifecycle as x/lain, but fully isolated under run/lain-dev/
+# (its own repl staging and serve snapshot — it never touches the
+# root snap/ that x/foil resumes from, nor run/lain), and driven
+# through a fifo instead of a terminal, so an editing session can do:
+#
+#   x/lain-dev start [--fresh] [PORT]   # launch (resumes serve snap if present)
+#   x/lain-dev wait [SECS]              # block until HTTP is up (fresh boot: minutes)
+#   x/lain-dev sync                     # "s": rebuild whatever changed under src/foil
+#   x/lain-dev sync <mod>               # "s <mod>": force apps/nenex/main etc.
+#   x/lain-dev plan                     # "l": what a sync would rebuild, dry
+#   x/lain-dev log [N]                  # last N serve log lines
+#   x/lain-dev status | stop
+#
+# sync/plan exit nonzero when a module FAILED or a write was refused,
+# and print the serve's own report — so "edit, x/lain-dev sync" is the
+# whole compile loop, with the compile error on stdout.  The serve
+# keeps serving HTTP while it rebuilds; curl the port to check
+# behavior (x/lain: browse /ns).
+#
+# stop closes the fifo's write end first: the serve sees stdin EOF and
+# parks itself (Save + exit), so the next start resumes it.
+
+set -eu
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEV="$ROOT/run/lain-dev"
+CTL="$DEV/ctl"
+LOG="$DEV/serve.log"
+PIDF="$DEV/pid"
+HPIDF="$DEV/holder-pid"
+PORTF="$DEV/port"
+
+die () { echo "x/lain-dev: $*" >&2; exit 1; }
+
+wisp_bin () {
+  if command -v wisp >/dev/null 2>&1; then command -v wisp; return; fi
+  if [ -s "$DEV/wispbin" ] && [ -x "$(cat "$DEV/wispbin")" ]; then cat "$DEV/wispbin"; return; fi
+  w="$(nix develop "$ROOT" -c which wisp 2>/dev/null | tail -1 || true)"
+  [ -n "$w" ] && [ -x "$w" ] || die "no wisp on PATH, and nix develop lookup failed"
+  mkdir -p "$DEV"; printf '%s\n' "$w" > "$DEV/wispbin"
+  printf '%s\n' "$w"
+}
+
+running () { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+log_len () { if [ -f "$LOG" ]; then wc -l < "$LOG"; else echo 0; fi }
+
+delta () { tail -n +"$(( $1 + 1 ))" "$LOG"; }
+
+# Stage the pristine repl snapshot in run/lain-dev/root (the x/lain
+# recipe, verbatim), once per missing/markerless snap.
+stage () {
+  mkdir -p "$DEV/root"
+  if [ -e "$DEV/root/snap/data.mdb" ] && [ -e "$DEV/root/snap/.repl-staged" ]; then return 0; fi
+  echo "x/lain-dev: staging repl snapshot (one-time boot, minutes)" >&2
+  cd "$DEV/root"
+  rm -rf snap
+  "$WISP" --file-root "$ROOT/src" "$ROOT/src/plan" reaver main
+  "$WISP" --file-root "$ROOT/src" snap root _ <<'EOF'
+(#bind std (#module std))
+(#import std)
+::*app-todo
+::*rex
+(#bind opt (#module plangrm))
+(Install opt:compileP5)
+EOF
+  "$WISP" --file-root "$ROOT/src" snap root _ <<'EOF'
+(#bind quip (#module quip))
+EOF
+  touch snap/.repl-staged
+  cd "$ROOT"
+}
+
+start () {
+  fresh=""; port=""
+  for a in "$@"; do
+    case "$a" in
+      --fresh) fresh=1 ;;
+      *) port="$a" ;;
+    esac
+  done
+  running && die "already running (pid $(cat "$PIDF"), port $(cat "$PORTF" 2>/dev/null || echo '?')) — x/lain-dev stop first"
+  WISP="$(wisp_bin)"
+  mkdir -p "$DEV"
+  stage
+  if [ -n "$fresh" ] || [ ! -e "$DEV/serve/snap/data.mdb" ]; then
+    fresh=1
+    port="${port:-8100}"
+    rm -rf "$DEV/serve"
+    mkdir -p "$DEV/serve/snap"
+    cp -c "$DEV/root/snap/data.mdb" "$DEV/serve/snap/" 2>/dev/null || cp "$DEV/root/snap/data.mdb" "$DEV/serve/snap/"
+    cp -c "$DEV/root/snap/pins.pack" "$DEV/serve/snap/" 2>/dev/null || cp "$DEV/root/snap/pins.pack" "$DEV/serve/snap/"
+    echo "$port" > "$PORTF"
+  else
+    # a resumed serve keeps the port baked into its snapshot
+    baked="$(cat "$PORTF" 2>/dev/null || echo '')"
+    [ -z "$port" ] || [ "$port" = "$baked" ] || die "resume keeps baked port $baked; use --fresh to change it"
+    port="$baked"
+    [ -n "$port" ] || die "no recorded port for the serve snapshot; use --fresh"
+  fi
+  rm -f "$CTL"; mkfifo "$CTL"
+  : > "$LOG"
+  ( cd "$DEV/serve" && exec "$WISP" --file-root "$ROOT/src" snap root _ ) < "$CTL" >> "$LOG" 2>&1 &
+  echo $! > "$PIDF"
+  # hold the fifo's write end open: EOF on stdin makes the serve park
+  tail -f /dev/null > "$CTL" 2>/dev/null &
+  echo $! > "$HPIDF"
+  if [ -n "$fresh" ]; then
+    # boot forms first (the x/lain fresh recipe); the fifo stays open
+    # for CLI lines afterwards
+    printf '(#bind std (#module std))\n(#import std)\n(#bind helm-run (#module helm-run))\n(helm-run:run-lain-serve %s)\n' "$port" > "$CTL"
+    echo "x/lain-dev: fresh serve booting on port $port (compiles the world — minutes); x/lain-dev wait" >&2
+  else
+    echo "x/lain-dev: resuming serve on port $port; x/lain-dev wait" >&2
+  fi
+}
+
+wait_up () {
+  secs="${1:-900}"
+  port="$(cat "$PORTF" 2>/dev/null || echo '')"
+  [ -n "$port" ] || die "no serve recorded; x/lain-dev start"
+  i=0
+  while [ "$i" -lt "$secs" ]; do
+    if curl -fsS -o /dev/null --max-time 2 "http://localhost:$port/ns" 2>/dev/null; then
+      echo "up: http://localhost:$port/ns (log: run/lain-dev/serve.log)"
+      return 0
+    fi
+    if ! running; then
+      echo "x/lain-dev: serve died during boot; last log lines:" >&2
+      tail -30 "$LOG" >&2
+      exit 1
+    fi
+    sleep 1; i=$((i+1))
+  done
+  die "not up after ${secs}s; see run/lain-dev/serve.log"
+}
+
+# Send one CLI line and print the log delta once the finish marker
+# shows.  sync exits 1 on a failed module or refused write.
+sync () {
+  running || die "not running; x/lain-dev start"
+  mark="$(log_len)"
+  if [ "$#" -gt 0 ]; then printf 's %s\n' "$*" > "$CTL"; else printf 's\n' > "$CTL"; fi
+  i=0
+  while [ "$i" -lt 1200 ]; do
+    if delta "$mark" | grep -aqE 'synced in |nothing to sync'; then
+      delta "$mark"
+      if delta "$mark" | grep -aqE 'FAILED|refused the write'; then exit 1; fi
+      return 0
+    fi
+    running || { echo "x/lain-dev: serve died mid-sync:" >&2; delta "$mark" >&2; exit 1; }
+    sleep 1; i=$((i+1))
+  done
+  echo "x/lain-dev: sync still running after 20min; log delta so far:" >&2
+  delta "$mark" >&2
+  exit 1
+}
+
+plan () {
+  running || die "not running; x/lain-dev start"
+  mark="$(log_len)"
+  printf 'l\n' > "$CTL"
+  i=0
+  while [ "$i" -lt 60 ]; do
+    if delta "$mark" | grep -aqE 'rebuild:|nothing to sync'; then delta "$mark"; return 0; fi
+    running || die "serve died"
+    sleep 1; i=$((i+1))
+  done
+  die "no plan reply after 60s"
+}
+
+status () {
+  if running; then
+    echo "running: pid $(cat "$PIDF"), port $(cat "$PORTF" 2>/dev/null || echo '?'), log run/lain-dev/serve.log"
+  else
+    echo "not running"
+    if [ -e "$DEV/serve/snap/data.mdb" ]; then echo "serve snapshot present — plain start resumes it"; fi
+  fi
+}
+
+stop () {
+  # close the write end first: stdin EOF parks the serve (Save + exit)
+  if [ -f "$HPIDF" ]; then kill "$(cat "$HPIDF")" 2>/dev/null || true; rm -f "$HPIDF"; fi
+  if [ -f "$PIDF" ]; then
+    p="$(cat "$PIDF")"
+    i=0
+    while [ "$i" -lt 15 ] && kill -0 "$p" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    if kill -0 "$p" 2>/dev/null; then
+      echo "x/lain-dev: serve did not park in 15s; killing" >&2
+      kill -TERM "$p" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+    rm -f "$PIDF"
+  fi
+  rm -f "$CTL"
+  echo "stopped"
+}
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+case "$cmd" in
+  start)  start "$@" ;;
+  wait)   wait_up "$@" ;;
+  sync)   sync "$@" ;;
+  plan)   plan "$@" ;;
+  log)    tail -n "${1:-40}" "$LOG" ;;
+  status) status ;;
+  stop)   stop ;;
+  *) die "unknown command: $cmd (start|wait|sync|plan|log|status|stop)" ;;
+esac

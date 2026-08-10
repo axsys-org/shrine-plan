@@ -338,6 +338,38 @@ No commas or named argument syntax are used. A parenthesized call with fewer
 arguments may be a partial application when its expected function type makes
 that valid, as in `(add 3)`.
 
+### The call rune `%`
+
+`%` is a call written as a rune instead of parentheses: its children and
+its heir become one application.
+
+```foil
+%  f
+   x
+   y
+z
+```
+
+means `(f x y z)`. The first child is the function; every later child,
+then the heir, is an argument. Children may also sit on the rune's own
+line, so `%  f x y` with heir `z` is the same call.
+
+This is what a call spread over lines looks like when an argument is
+long enough that a parenthesized call would wrap badly, and — because
+the heir is the rest of the body — it is also how a call takes
+everything that follows as its final argument:
+
+```foil
+%  (if (eq a 0) b)
+(_ (dec a) (inc b))
+```
+
+means `(if (eq a 0) b (_ (dec a) (inc b)))`. A head that is already a
+call flattens into one application rather than nesting.
+
+In a position with no heir, the children alone make the call: `(% f x y)`
+is `(f x y)`. `%` with a single child and nothing to apply is that child.
+
 ### UFCS methods
 
 Method calls are receiver-last. If `tree/insert` has parameters
@@ -739,6 +771,7 @@ When asked to create or change Foil:
 \  x=type y=type BODY             function/lambda
 ^  type BODY                      type/result ascription
 (f a b)                           prefix call
+%  f / a / b                      call rune: children + heir = (f a b ..)
 f[type const]                     explicit specialization
 [a b c]                           row value
 [x=type y=type]                   anonymous row type/pattern
