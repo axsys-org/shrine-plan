@@ -38,8 +38,23 @@ Or manually: add both directories to `runtimepath` and call
 
 ## run
 
+Two servers speak the wire; pick one:
+
 ```sh
-x/repl                 # http 8090, poke 8678, wire 8679
+x/repl                 # the buddy: http 8090, poke 8678, wire 8679
+```
+
+```sh
+x/lain-dev start && x/lain-dev wait   # the dev serve: wire on HTTP port + 1 (default 8101)
+```
+
+Against the dev serve, save/`:FoilCompile` runs helm-sync's LIVE
+incremental rebuild (dependents included, one live cache) instead of
+the chore family's boot-frozen compile — this is the better daily
+loop.  `x/lain-dev wire` prints the port:
+
+```lua
+require("foil").setup({ port = 8101 })
 ```
 
 then `:FoilConnect` to check the wire.  `setup` options:

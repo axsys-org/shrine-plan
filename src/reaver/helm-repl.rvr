@@ -31,12 +31,16 @@
 (#bind parse (#module parse))
 (#import parse)
 
+;; NO helm-run bind here: helm-sync (bound by helm-run) binds this
+;; module for the wire handlers, so a helm-run bind would close an
+;; import cycle — and the loader does not detect cycles, it re-loads
+;; the ring forever (measured: 5,470 laps before the kill).  The boot
+;; entrypoint (run-repl) lives in helm-run.rvr for exactly this reason.
 (#bind quip (#module quip))
 (#bind foil (#module foil))
 (#bind foil-lore (#module foil-lore))
 (#bind helm (#module helm))
 (#bind helm-http (#module helm-http))
-(#bind helm-run (#module helm-run))
 (#bind wire-json (#module wire-json))
 
 (define (ts s) ("ts" s))
@@ -416,51 +420,113 @@
           [["passed" (showNat ((r-nat rs) [(ts "passed")] 0 m))]
            ["failed" (showNat ((r-nat rs) [(ts "failed")] 0 m))]])))))
 
-(define (wire-describe e mod dotted)
+;; A mirror entry node "/boot/<mod..>/<n>/<name..>" split at its
+;; count marker -> [mod-text name-segs] (0 when not entry-shaped).
+(define (node-mod-name node)
+  (define n (Sz node))
+  (define (go i)
+    (cond
+      ((Ge i n) 0)
+      ((Eq "u" (Hd (Ix i node)))
+        [(join-str "/" (map (Ix 0) (take (Dec i) (drop 1 node))))
+         (map (Ix 0) (drop (Inc i) node))])
+      (else (go (Inc i)))))
+  (go 0))
+
+(define (wire-entry-json e modname node m)
   (define rs (e-rs e))
+  (define txt (r-txt rs))
+  (define kind (txt [(ts "kind")] m))
+  (define tyt (ty-text rs m))
+  (define lede (txt [(ts "sys") (ts "lede")] m))
+  (define src (txt [(ts "sys") (ts "src")] m))
+  (define defline ((r-nat rs) [(ts "defline")] 0 m))
+  (wire-ok
+    [["module" (wire-json:jq modname)]
+     ["path" (wire-json:jq (quip:print-path node))]
+     ["kind" (Ifz kind "null" (wire-json:jq kind))]
+     ["type" (Ifz tyt "null" (wire-json:jq tyt))]
+     ["lede" (Ifz lede "null" (wire-json:jq lede))]
+     ["line" (Ifz defline "null" (showNat defline))]
+     ["src" (Ifz src "null" (wire-json:jq src))]
+     ["calls" (wire-path-slot rs m "calls")]
+     ["called_by" (wire-path-slot rs m "called_by")]]))
+
+;; Describe resolves like the language does: the module's own node
+;; first, then the union mount — imports land bare, so a name that is
+;; not the module's own is looked up in the /boot/ns index (grouped by
+;; first name segment) and answered from its OWNING module's entry,
+;; ["module"] naming it (that is where gd must jump).
+(define (wire-describe e mod dotted)
+  (define parts (filter Bytes (helm-http:split-ch 46 dotted)))
   (define node (wire-node mod dotted))
   (define r (Ix 0 ((e-ask e) ["query" node])))
-  (If (Nil (Eq "/boot/res/known" (Hd r)))
-    (wire-fail (strcat ["no entry at " (quip:print-path node)]) [])
-    (let* ((m (_0 r))
-           (txt (r-txt rs))
-           (kind (txt [(ts "kind")] m))
-           (tyt (ty-text rs m))
-           (lede (txt [(ts "sys") (ts "lede")] m))
-           (src (txt [(ts "sys") (ts "src")] m))
-           (defline ((r-nat rs) [(ts "defline")] 0 m)))
-      (wire-ok
-        [["kind" (Ifz kind "null" (wire-json:jq kind))]
-         ["type" (Ifz tyt "null" (wire-json:jq tyt))]
-         ["lede" (Ifz lede "null" (wire-json:jq lede))]
-         ["line" (Ifz defline "null" (showNat defline))]
-         ["src" (Ifz src "null" (wire-json:jq src))]
-         ["calls" (wire-path-slot rs m "calls")]
-         ["called_by" (wire-path-slot rs m "called_by")]]))))
+  (If (Eq "/boot/res/known" (Hd r))
+    (wire-entry-json e mod node (_0 r))
+    (Ifz (Sz parts)
+      (wire-fail (strcat ["no entry at " (quip:print-path node)]) [])
+      (let ((rn (Ix 0 ((e-ask e)
+                        ["query" [(ts "boot") (ts "ns") (ts (Ix 0 parts))]]))))
+        (If (Nil (Eq "/boot/res/known" (Hd rn)))
+          (wire-fail (strcat ["no entry " dotted]) [])
+          (let* ((pl ((r-pail (e-rs e)) [(ts "entries")] (_0 rn)))
+                 (nodes (If (Eq "/boot/pails/ps" (Hd pl)) (_0 pl) []))
+                 (hits
+                   (filter
+                     (lambda (nd)
+                       (let ((mn (node-mod-name nd)))
+                         (And mn (Equal parts (Ix 1 mn)))))
+                     nodes)))
+            (Ifz (Sz hits)
+              (wire-fail (strcat ["no entry " dotted]) [])
+              (let* ((nd (Ix 0 hits))
+                     (r2 (Ix 0 ((e-ask e) ["query" nd]))))
+                (If (Nil (Eq "/boot/res/known" (Hd r2)))
+                  (wire-fail (strcat ["no entry at " (quip:print-path nd)]) [])
+                  (wire-entry-json e (Ix 0 (node-mod-name nd)) nd
+                    (_0 r2)))))))))))
 
-;; A module's own entry names: the module node's ['entries] rows with
-;; the module prefix and the segment-count marker stripped, "/"-joined
-;; (the spelling foil source uses).
+;; Names completable inside a module's source: the ['visible] slot —
+;; the whole declared key set, union-mounted imports included, exactly
+;; what lands bare in the module's scope.  Mirrors seeded before the
+;; slot existed degrade to the module's own ['entries].
 (define (wire-complete e mod prefix)
   (define rs (e-rs e))
   (define mnode (Weld [(ts "boot")] (map ts (helm:mod-segs mod))))
   (define r (Ix 0 ((e-ask e) ["query" mnode])))
   (If (Nil (Eq "/boot/res/known" (Hd r)))
     (wire-fail (strcat ["no module " mod]) [])
-    (let ((pl ((r-pail rs) [(ts "entries")] (_0 r))))
-      (If (Nil (Eq "/boot/pails/ps" (Hd pl)))
-        (wire-ok [["names" "[]"]])
-        (let* ((names
+    (let* ((vis ((r-pail rs) [(ts "visible")] (_0 r)))
+           (ent ((r-pail rs) [(ts "entries")] (_0 r)))
+           ;; imported keys ride as canonical "/boot/<name>" cords
+           ;; (the qualified form) while own keys are plain segments —
+           ;; the SOURCE spells both bare, so strip the canonical root
+           (strip-boot
+             (lambda (n)
+               (If (starts-with "/boot/" n) (Rsh n 48) n)))
+           (names
+             (cond
+               ((Eq "/boot/pails/ps" (Hd vis))
                  (map
                    (lambda (p)
-                     (join-str "/"
-                       (map (Ix 0) (drop (Inc (Sz mnode)) p))))
-                   (_0 pl)))
-               (hits
-                 (If (Bytes prefix)
-                   (filter (starts-with prefix) names)
-                   names)))
-          (wire-ok [["names" (wire-json:jarr-str hits)]]))))))
+                     (strip-boot (join-str "/" (map (Ix 0) p))))
+                   (_0 vis)))
+               ((Eq "/boot/pails/ps" (Hd ent))
+                 (map
+                   (lambda (p)
+                     (join-str "/" (map (Ix 0) (drop (Inc (Sz mnode)) p))))
+                   (_0 ent)))
+               (else [])))
+           (hits
+             (If (Bytes prefix)
+               (filter (starts-with prefix) names)
+               names))
+           ;; imports of imports repeat across packs — dedup the offer
+           (uniq
+             (foldl
+               (lambda (a n) (If (includes (Equal n) a) a (snoc n a)))
+               [] hits)))
+      (wire-ok [["names" (wire-json:jarr-str uniq)]]))))
 
 (define (wire-nsls e root)
   (define rs (e-rs e))
@@ -592,14 +658,10 @@
         (repl-loop e st)))
     (else (repl-loop e st))))
 
-;; Boot the full lain stack (explorer live on http-port), then take
-;; the terminal.  fetch?=0 skips the outbound-fetch driver — the local
-;; runtime lacks the Fetch primop.  wire-port 0 skips the editor wire.
-(define (run-repl http-port poke-port wire-port fetch?)
-  (define r
-    (helm-run:boot-lain-stack http-port fetch?
-      (helm:load-helm-mod "helmapp")))
-  (define e (mk-repl-env (Ix 0 r) (Ix 1 r)))
+;; Take the terminal against an already-booted stack (helm-run's
+;; run-repl boots one and calls this).  wire-port 0 skips the wire.
+(define (take-terminal core coord http-port poke-port wire-port)
+  (define e (mk-repl-env core coord))
   (define st ["sept" [] 0])
   (Seq (emit ["the namespace repl — :h for help"
               (strcat ["explorer: http://localhost:" (showNat http-port) "/ns"])])

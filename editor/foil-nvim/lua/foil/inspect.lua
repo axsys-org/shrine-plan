@@ -30,7 +30,8 @@ function M.describe(name, cb)
   end)
 end
 
---- K: kind, type, first lore line.
+--- K: kind, type, first lore line.  Imported (union-mounted) names
+--- resolve to their owning module — shown when it isn't this buffer's.
 function M.hover()
   M.describe(nil, function(name, res)
     if not res.ok then
@@ -38,7 +39,10 @@ function M.hover()
     end
     local lines = {}
     local kind = wire.field(res, "kind")
+    local owner = wire.field(res, "module")
+    local here = module.of(0)
     lines[1] = name .. (kind and ("  [" .. kind .. "]") or "")
+      .. ((owner and owner ~= here) and ("  ← " .. owner) or "")
     local ty = wire.field(res, "type")
     if ty then lines[#lines + 1] = "type: " .. ty end
     local lede = wire.field(res, "lede")
@@ -57,6 +61,8 @@ function M.inspect(name)
       return ui.notify(wire.field(res, "error") or "unknown entry", vim.log.levels.WARN)
     end
     local lines = { nm .. (wire.field(res, "kind") and ("  [" .. res.kind .. "]") or "") }
+    local owner = wire.field(res, "module")
+    if owner and owner ~= module.of(0) then lines[#lines + 1] = "module: " .. owner end
     if wire.field(res, "type") then lines[#lines + 1] = "type: " .. res.type end
     if wire.field(res, "line") then lines[#lines + 1] = "line: " .. res.line end
     if wire.field(res, "lede") then
@@ -84,17 +90,30 @@ function M.inspect(name)
   end)
 end
 
---- gd: the ['defline] mirror slot.
+--- gd: the ['defline] mirror slot.  A union-mounted name's describe
+--- names its OWNING module — jump opens that module's file.
 function M.goto_definition()
   local name = M.name_at_cursor()
   if not name then return ui.notify("no name under cursor", vim.log.levels.WARN) end
-  local ok, res = wire.request_sync({ op = "describe", module = module.of(0), name = name }, 8000)
+  local here = module.of(0)
+  local ok, res = wire.request_sync({ op = "describe", module = here, name = name }, 8000)
   if not ok then return ui.notify(res, vim.log.levels.WARN) end
   local line = res.ok and wire.field(res, "line")
   if type(line) ~= "number" or line < 1 then
     return ui.notify("no definition line for " .. name, vim.log.levels.WARN)
   end
-  vim.cmd("normal! m'") -- jumplist
+  local owner = wire.field(res, "module")
+  if owner and owner ~= here then
+    local file = module.file_of(owner, 0)
+    if not file then
+      return ui.notify(("defined in %s:%d (no foil/ root to resolve the file)")
+        :format(owner, line), vim.log.levels.WARN)
+    end
+    vim.cmd("normal! m'")
+    vim.cmd.edit(vim.fn.fnameescape(file))
+  else
+    vim.cmd("normal! m'")
+  end
   vim.api.nvim_win_set_cursor(0, { line, 0 })
 end
 

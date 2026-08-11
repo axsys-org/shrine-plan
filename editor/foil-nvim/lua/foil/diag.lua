@@ -11,10 +11,16 @@ local M = {}
 
 M.ns = vim.api.nvim_create_namespace("foil-wire")
 
-local function to_diagnostics(res)
-  local out = {}
+-- A lain-dev serve's sync diags carry a "module" field (a dependent
+-- can break when its import changes); rows for other modules land as
+-- one summary line rather than mis-anchored in this buffer.
+local function to_diagnostics(res, mod)
+  local out, foreign = {}, {}
   for _, d in ipairs(res.diags or {}) do
-    if type(d.line) == "number" and d.line > 0 then
+    local dmod = d.module
+    if dmod ~= nil and dmod ~= vim.NIL and dmod ~= mod then
+      foreign[#foreign + 1] = ("%s:%s  %s"):format(dmod, d.line or "?", d.msg or "")
+    elseif type(d.line) == "number" and d.line > 0 then
       out[#out + 1] = {
         lnum = d.line - 1,
         col = math.max(0, (tonumber(d.col) or 1) - 1),
@@ -23,6 +29,14 @@ local function to_diagnostics(res)
         source = "foil",
       }
     end
+  end
+  if #foreign > 0 then
+    out[#out + 1] = {
+      lnum = 0, col = 0,
+      message = "dependents broke:\n" .. table.concat(foreign, "\n"),
+      severity = vim.diagnostic.severity.WARN,
+      source = "foil",
+    }
   end
   if #out == 0 then
     out[1] = {
@@ -45,7 +59,7 @@ function M.compile(bufnr)
       vim.diagnostic.set(M.ns, bufnr, {})
       ui.notify((wire.field(res, "report") or "compiled"):gsub("\n", " · "))
     else
-      vim.diagnostic.set(M.ns, bufnr, to_diagnostics(res))
+      vim.diagnostic.set(M.ns, bufnr, to_diagnostics(res, mod))
       local first = (res.diags or {})[1]
       ui.notify(first and first.msg or wire.field(res, "error") or "compile failed",
         vim.log.levels.ERROR)
