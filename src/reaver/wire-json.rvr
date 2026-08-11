@@ -1,0 +1,103 @@
+;;;; JSON text plumbing for the buddy's wire port: encoders that build
+;;;; response text directly (no value tree), and rep-walkers over
+;;;; json.foil's decoded values (nominal member rows — see
+;;;; doc/buddy-wire.md).  The PARSER itself stays in json.foil; a
+;;;; caller compiles it (compile-mod-cached "json" — it imports
+;;;; nothing) and hands the jres to these walkers.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind parse (#module parse))
+(#import parse)
+
+;;; Encoding: response text built by hand ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (hexd n)
+  (If (Lt n 10) (Add "0" n) (Add "a" (Sub n 10))))
+
+;; Escaped body bytes of s (no surrounding quotes).
+(define (jesc s)
+  (define n (Bytes s))
+  (define bs 92)
+  (define (go i)
+    (If (Ge i n)
+      0
+      (let ((c (Load8 i s)))
+        (cond
+          ((Eq c 34) (lcons bs (lcons 34 (go (Inc i)))))
+          ((Eq c 92) (lcons bs (lcons 92 (go (Inc i)))))
+          ((Eq c 10) (lcons bs (lcons "n" (go (Inc i)))))
+          ((Eq c 9) (lcons bs (lcons "t" (go (Inc i)))))
+          ((Eq c 13) (lcons bs (lcons "r" (go (Inc i)))))
+          ((Lt c 32)
+            (lcons bs (lcons "u" (lcons "0" (lcons "0"
+              (lcons (hexd (Div c 16)) (lcons (hexd (Mod c 16))
+                (go (Inc i)))))))))
+          (else (lcons c (go (Inc i))))))))
+  (lstrcat (go 0)))
+
+;; A quoted, escaped JSON string.
+(define (jq s)
+  (strcat [34 (jesc s) 34]))
+
+;; An array of already-encoded element texts.
+(define (jarr xs)
+  (strcat ["[" (join-str "," xs) "]"]))
+
+;; An object from [key encoded-value-text] pairs.
+(define (jobj pairs)
+  (strcat
+    ["{"
+     (join-str ","
+       (map (lambda (p) (strcat [(jq (Ix 0 p)) ":" (Ix 1 p)])) pairs))
+     "}"]))
+
+(define (jarr-str xs) (jarr (map jq xs)))
+
+;;; Decoding: walkers over json.foil's runtime reps ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; parse -> ("/boot/jres/ok" v rest) | ("/boot/jres/err" why rest)
+;;; v -> ("/boot/json/obj" kvs) kvs=[("/boot/jkv" k v)..]
+;;;      ("/boot/json/str" s) ("/boot/json/num" neg n)
+;;;      ("/boot/json/arr" xs) ("/boot/json/boo" b) ("/boot/json/nul" z)
+
+(define (jok? r) (And (IsApp r) (Eq "/boot/jres/ok" (Hd r))))
+(define (jval r) (_0 r))
+
+;; The value at key k of an object, or 0.
+(define (jget k v)
+  (If (And (IsApp v) (Eq "/boot/json/obj" (Hd v)))
+    (let ((hit (find (lambda (kv) (Eq k (_0 kv))) (_0 v))))
+      (Ifz hit 0 (_1 (_0 hit))))
+    0))
+
+;; A json string's text (0 for anything else — "" and absent collapse,
+;; which every wire op treats the same).
+(define (jstr v)
+  (If (And (IsApp v) (Eq "/boot/json/str" (Hd v))) (_0 v) 0))
+
+;; A non-negative json integer, dflt otherwise.
+(define (jnat dflt v)
+  (If (And (IsApp v) (Eq "/boot/json/num" (Hd v)))
+    (If (_0 v) dflt (_1 v))
+    dflt))
+
+(define (jget-str k v) (jstr (jget k v)))
+(define (jget-nat k dflt v) (jnat dflt (jget k v)))
+
+;;; Diagnostic rows as a JSON array ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; rows = [[line col msg] ..] (line 0 = unlocated) — the shape
+;; foil-render:diag-rows extracts from a compiler error payload.
+(define (jdiags rows)
+  (jarr
+    (map
+      (lambda (r)
+        (jobj
+          [["line" (showNat (Ix 0 r))]
+           ["col" (showNat (Ix 1 r))]
+           ["msg" (jq (Ix 2 r))]]))
+      rows)))

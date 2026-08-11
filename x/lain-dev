@@ -7,20 +7,27 @@
 #
 #   x/lain-dev start [--fresh] [PORT]   # launch (resumes serve snap if present)
 #   x/lain-dev wait [SECS]              # block until HTTP is up (fresh boot: minutes)
-#   x/lain-dev sync                     # "s": rebuild whatever changed under src/foil
-#   x/lain-dev sync <mod>               # "s <mod>": force apps/nenex/main etc.
-#   x/lain-dev plan                     # "l": what a sync would rebuild, dry
+#   x/lain-dev sync                     # rebuild whatever changed under src/foil
+#   x/lain-dev sync <mod>               # force apps/nenex/main etc.
+#   x/lain-dev plan                     # what a sync would rebuild, dry
+#   x/lain-dev req '<json>'             # raw wire request (doc/buddy-wire.md)
+#   x/lain-dev wire                     # print the wire port (for foil-nvim)
 #   x/lain-dev log [N]                  # last N serve log lines
 #   x/lain-dev status | stop
 #
-# sync/plan exit nonzero when a module FAILED or a write was refused,
-# and print the serve's own report — so "edit, x/lain-dev sync" is the
-# whole compile loop, with the compile error on stdout.  The serve
-# keeps serving HTTP while it rebuilds; curl the port to check
-# behavior (x/lain: browse /ns).
+# sync/plan ride the serve's WIRE PORT (HTTP port + 1, the buddy-wire
+# protocol): one JSON request per connection, a structured JSON reply
+# — no log scraping, no polling.  Exit nonzero when a module FAILED
+# or a write was refused, with the report and located diagnostics on
+# stdout.  The serve keeps serving HTTP while it rebuilds; curl the
+# port to check behavior (x/lain: browse /ns).  The same wire port
+# serves describe/complete/eval/doctest — point foil-nvim at it
+# (editor/foil-nvim: setup{ port = <wire> }) and `req` at anything
+# else.
 #
-# stop closes the fifo's write end first: the serve sees stdin EOF and
-# parks itself (Save + exit), so the next start resumes it.
+# stop closes the fifo's write end first: the serve sees stdin EOF;
+# the terminal stops but the wire and HTTP keep serving until the
+# process is killed (stop does that too), and the next start resumes.
 
 set -eu
 
@@ -137,43 +144,63 @@ wait_up () {
   die "not up after ${secs}s; see run/lain-dev/serve.log"
 }
 
-# Send one CLI line and print the log delta once the finish marker
-# shows.  sync exits 1 on a failed module or refused write.
-sync () {
+wire_port () {
+  port="$(cat "$PORTF" 2>/dev/null || echo '')"
+  [ -n "$port" ] || die "no serve recorded; x/lain-dev start"
+  echo $((port + 1))
+}
+
+# One wire request, one JSON reply (the serve closes the connection).
+# Long timeout: a sync after a sept edit rebuilds the world below it.
+wire_req () {
   running || die "not running; x/lain-dev start"
-  mark="$(log_len)"
-  if [ "$#" -gt 0 ]; then printf 's %s\n' "$*" > "$CTL"; else printf 's\n' > "$CTL"; fi
-  i=0
-  while [ "$i" -lt 1200 ]; do
-    if delta "$mark" | grep -aqE 'synced in |nothing to sync'; then
-      delta "$mark"
-      if delta "$mark" | grep -aqE 'FAILED|refused the write'; then exit 1; fi
-      return 0
-    fi
-    running || { echo "x/lain-dev: serve died mid-sync:" >&2; delta "$mark" >&2; exit 1; }
-    sleep 1; i=$((i+1))
-  done
-  echo "x/lain-dev: sync still running after 20min; log delta so far:" >&2
-  delta "$mark" >&2
-  exit 1
+  wp="$(wire_port)"
+  resp="$(printf '%s\n' "$1" | nc -w 1800 localhost "$wp" || true)"
+  [ -n "$resp" ] || die "no reply on wire port $wp — mid-boot? (x/lain-dev wait, then retry)"
+  printf '%s\n' "$resp"
+}
+
+# sync/plan over the wire: structured reply, report on stdout, exit 1
+# on a failed module or refused write.
+sync () {
+  if [ "$#" -gt 0 ]; then
+    mods=""
+    for m in "$@"; do mods="$mods${mods:+,}\"$m\""; done
+    req="{\"op\":\"sync\",\"modules\":[$mods]}"
+  else
+    req='{"op":"sync"}'
+  fi
+  wire_req "$req" | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+if "report" in r: print(r["report"])
+for d in r.get("diags") or []:
+    print("  %s:%s:%s  %s" % (d.get("module","?"), d.get("line",0), d.get("col",0), d.get("msg","")))
+if not r.get("ok"):
+    if r.get("error"): print(r["error"], file=sys.stderr)
+    sys.exit(1)
+'
 }
 
 plan () {
-  running || die "not running; x/lain-dev start"
-  mark="$(log_len)"
-  printf 'l\n' > "$CTL"
-  i=0
-  while [ "$i" -lt 60 ]; do
-    if delta "$mark" | grep -aqE 'rebuild:|nothing to sync'; then delta "$mark"; return 0; fi
-    running || die "serve died"
-    sleep 1; i=$((i+1))
-  done
-  die "no plan reply after 60s"
+  wire_req '{"op":"plan"}' | python3 -c '
+import json,sys
+r=json.load(sys.stdin)
+if not r.get("ok"):
+    print(r.get("error","plan failed"), file=sys.stderr); sys.exit(1)
+ch=r.get("changed") or []; rb=r.get("rebuild") or []
+if not ch: print("nothing to sync — the namespace matches foil/")
+else:
+    print("changed:  " + " ".join(ch))
+    print("rebuild:  " + " ".join(rb))
+'
 }
 
 status () {
   if running; then
-    echo "running: pid $(cat "$PIDF"), port $(cat "$PORTF" 2>/dev/null || echo '?'), log run/lain-dev/serve.log"
+    p="$(cat "$PORTF" 2>/dev/null || echo '?')"
+    w="?"; [ "$p" != "?" ] && w=$((p + 1))
+    echo "running: pid $(cat "$PIDF"), port $p (wire $w), log run/lain-dev/serve.log"
   else
     echo "not running"
     if [ -e "$DEV/serve/snap/data.mdb" ]; then echo "serve snapshot present — plain start resumes it"; fi
@@ -205,8 +232,10 @@ case "$cmd" in
   wait)   wait_up "$@" ;;
   sync)   sync "$@" ;;
   plan)   plan "$@" ;;
+  req)    [ "$#" -ge 1 ] || die "usage: x/lain-dev req '<json>'"; wire_req "$1" ;;
+  wire)   wire_port ;;
   log)    tail -n "${1:-40}" "$LOG" ;;
   status) status ;;
   stop)   stop ;;
-  *) die "unknown command: $cmd (start|wait|sync|plan|log|status|stop)" ;;
+  *) die "unknown command: $cmd (start|wait|sync|plan|req|wire|log|status|stop)" ;;
 esac

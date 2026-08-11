@@ -53,6 +53,8 @@
 (#bind foil (#module foil))
 (#bind foil-render (#module foil-render))
 (#bind helm (#module helm))
+(#bind helm-repl (#module helm-repl))
+(#bind wire-json (#module wire-json))
 
 (define (ts s) ("ts" s))
 (define NL (strcat [10]))
@@ -85,14 +87,22 @@
 
 ;;; The environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; ["S" core coord cache pump].  cache is the live compile cache: it
-;; starts as the boot mirror cache and every successful rebuild
-;; replaces one row, so the next compile sees its dependencies fresh.
+;; ["S" core coord cache funnel renv serial].  cache is the live
+;; compile cache: it starts as the boot mirror cache and every
+;; successful rebuild replaces one row, so the next compile sees its
+;; dependencies fresh.  renv/serial drive the delegated wire ops
+;; (helm-repl:wire-handle — describe, complete, eval, ...).
 (define (env-core e) (Ix 1 e))
 (define (env-coord e) (Ix 2 e))
 (define (env-cache e) (Ix 3 e))
-(define (env-pump e) (Ix 4 e))
-(define (env-cache-set e c) ["S" (env-core e) (env-coord e) c (env-pump e)])
+(define (env-funnel e) (Ix 4 e))
+(define (env-renv e) (Ix 5 e))
+(define (env-serial e) (Ix 6 e))
+(define (env-cache-set e c)
+  ["S" (env-core e) (env-coord e) c (env-funnel e) (env-renv e) (env-serial e)])
+(define (env-serial-inc e)
+  ["S" (env-core e) (env-coord e) (env-cache e) (env-funnel e) (env-renv e)
+   (Inc (env-serial e))])
 
 (define (e-ent e path) (helm:core-ent (env-core e) path))
 
@@ -262,7 +272,9 @@
 ;; Recompile one module against the live cache and land it.  A module
 ;; that does not compile is reported on the terminal and NOT written:
 ;; the namespace keeps its last good build rather than growing a
-;; tombstone that nothing would ever clear.  -> [env' rows]
+;; tombstone that nothing would ever clear.
+;; -> [env' rows ok? diag-rows] (diag-rows = foil-render:diag-rows of
+;; the compile failure, [] otherwise — the wire's located payload)
 (define (rebuild-mod e mod)
   (define core (env-core e))
   (define cache (env-cache e))
@@ -280,7 +292,8 @@
         0)))
   (If (Eq 1 (Hd r))
     [e [(strcat ["  " mod ": FAILED — not written"])
-        (foil-render:diag-text (_0 r))]]
+        (foil-render:diag-text (_0 r))]
+     0 (foil-render:diag-rows (_0 r))]
     (let* ((cache2 (_0 (_0 r)))
            (sut (_1 (_0 r)))
            (me (_0 (find (lambda (x) (Eq mod (_0 x))) cache2)))
@@ -299,92 +312,206 @@
         (Seq (Trace ["sync: write rejected" mod (_0 bad)] 0)
           [(env-cache-set e cache2)
            [(strcat ["  " mod ": compiled, but the namespace refused the "
-                     "write — see the serve log"])]])
+                     "write — see the serve log"])]
+           0 []])
         [(env-cache-set e cache2)
-         [(strcat ["  " mod " (" (since t0) "s)"])]]))))
+         [(strcat ["  " mod " (" (since t0) "s)"])]
+         1 []]))))
 
 ;;; The sync ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; seed = [] to take whatever differs from the namespace, or an
-;; explicit row of module names to force.  -> env'
-(define (sync e seed)
+;; The sync, structurally: seed = [] to take whatever differs from the
+;; namespace, or an explicit row of module names to force.
+;; -> [env' rows nfailed diag-pairs]; diag-pairs = [[mod [line col
+;; msg]] ..] — the wire's located payload, empty on success.  Rows are
+;; emitted incrementally as each module lands (the terminal and the
+;; serve log both narrate), and returned whole for the wire.
+(define (sync-run e seed)
   (define roster (disk-roster 0))
   (define changed (Ifz (Sz seed) (changed-mods e roster) seed))
   (Ifz (Sz changed)
-    (Seq (emit ["nothing to sync — the namespace matches foil/"]) e)
+    (let ((rows ["nothing to sync — the namespace matches foil/"]))
+      (Seq (emit rows) [e rows 0 []]))
     (let* ((tab (import-table roster))
            (order (build-order tab (dirty-closure tab changed)))
            (t0 (Now 0)))
       (Seq t0
-      (Seq
-        (emit
-          [(strcat [(showNat (Sz changed)) " changed on disk, "
-                    (showNat (Sz order)) " to rebuild:"])
-           (strcat ["  " (join-str " " order)])])
-        (let ((e2 (foldl
-                    (lambda (acc mod)
-                      (let ((r (rebuild-mod acc mod)))
-                        (Seq (emit (_1 r)) (_0 r))))
-                    e order)))
+      (let ((head
+              [(strcat [(showNat (Sz changed)) " changed on disk, "
+                        (showNat (Sz order)) " to rebuild:"])
+               (strcat ["  " (join-str " " order)])]))
+      (Seq (emit head)
+        (let ((acc2 (foldl
+                      (lambda (acc mod)
+                        (let ((r (rebuild-mod (Ix 0 acc) mod)))
+                          (Seq (emit (Ix 1 r))
+                            [(Ix 0 r)
+                             (Weld (Ix 1 acc) (Ix 1 r))
+                             (Add (Ix 2 acc) (If (Ix 2 r) 0 1))
+                             (Weld (Ix 3 acc)
+                               (map (lambda (d) [mod d]) (Ix 3 r)))])))
+                      [e head 0 []] order)))
           ;; force the fold before the closing line: it IS the work,
-          ;; and a lazy e2 would print "synced in 0s" first and only
+          ;; and a lazy fold would print "synced in 0s" first and only
           ;; then run (and report) the modules underneath it
-          (Seq e2
-            (Seq (emit [(strcat ["synced in " (since t0) "s"])])
-              e2))))))))
+          (Seq (DeepSeq (Ix 2 acc2) acc2)
+            (let ((tail-row (strcat ["synced in " (since t0) "s"])))
+              (Seq (emit [tail-row])
+                [(Ix 0 acc2)
+                 (snoc tail-row (Ix 1 acc2))
+                 (Ix 2 acc2)
+                 (Ix 3 acc2)]))))))))))
 
-;; What a plain s would do, without doing it.
-(define (plan-rows e)
+;; The terminal's sync: narrate (sync-run already emits) -> env'.
+(define (sync e seed)
+  (Ix 0 (sync-run e seed)))
+
+;; What a plain s would rebuild, structurally: [changed order].
+(define (plan-info e)
   (define roster (disk-roster 0))
   (define changed (changed-mods e roster))
   (Ifz (Sz changed)
+    [[] []]
+    (let ((tab (import-table roster)))
+      [changed (build-order tab (dirty-closure tab changed))])))
+
+;; What a plain s would do, without doing it.
+(define (plan-rows e)
+  (define pi (plan-info e))
+  (Ifz (Sz (Ix 0 pi))
     ["nothing to sync — the namespace matches foil/"]
-    (let* ((tab (import-table roster))
-           (order (build-order tab (dirty-closure tab changed))))
-      [(strcat ["changed:  " (join-str " " changed)])
-       (strcat ["rebuild:  " (join-str " " order)])])))
+    [(strcat ["changed:  " (join-str " " (Ix 0 pi))])
+     (strcat ["rebuild:  " (join-str " " (Ix 1 pi))])]))
 
 ;;; The loop ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; One stdin line per request: MAIN asks, the pump answers.  A
-;; free-running pump would race the coordinator replies MAIN waits for
-;; inside a rebuild — both land in the same mailbox, and a stray line
-;; read as a commit verdict would wedge the sync.
+;; Every input source lands in the FUNNEL, and MAIN pulls ONE item per
+;; ["next"] token.  MAIN therefore never holds a pending input while
+;; it waits on coordinator replies inside a rebuild — both land in the
+;; same mailbox, and a stray input read as a commit verdict would
+;; wedge the sync.  (The old design paced the stdin pump directly; a
+;; second source — the wire — needs the token to cover them jointly.)
 (define (stdin-pump self)
   (define mc (Recv 0))
   (define out (Ix 0 (Ix 1 mc)))
   (define (loop z)
-    (Seq (Recv 0)
-      (let ((chunk (foil:read-stdin 384)))
-        (Ifz chunk
-          (Send out ["eof"])
-          (Seq (Send out ["line" (foil:read-until 10 chunk)])
-            (loop z))))))
-  ;; force the greeting BEFORE the loop's Recv, or laziness inverts
-  ;; them: mc is only demanded by the first Send, so the loop's Recv
-  ;; eats the ["go"] message and mc then takes the caps off the
-  ;; ["next"] request — which carries none, and every line is
-  ;; delivered to nobody.
+    (define chunk (foil:read-stdin 384))
+    (Ifz chunk
+      (Send out ["eof"])
+      (Seq (Send out ["line" (foil:read-until 10 chunk)])
+        (loop z))))
+  ;; force the handshake BEFORE the loop, or laziness inverts them
   (Seq out (loop 0)))
 
-;; A spawned actor has no compiler, so force the pump's call graph in
-;; MAIN before spawning it (helm-run.rvr's warm block, same reason).
+;; The funnel: queue stdin lines and wire requests; deliver at most
+;; one item per ["next"] from MAIN, re-delegating a wire item's
+;; connection cap.
+(define (funnel self)
+  (define mc (Recv 0))
+  (define out (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
+  (define (deliver item)
+    (If (Sz (Ix 1 item))
+      (SendCaps out (Ix 0 item) (Ix 1 item))
+      (Send out (Ix 0 item))))
+  (define (loop q wanted)
+    (define m (Recv 0))
+    (define msg (Ix 0 m))
+    (define caps (Ix 1 m))
+    (define kind (_0 msg))
+    (cond
+      ((Equal "next" kind)
+        (Ifz (Sz q)
+          (loop q 1)
+          (Seq (deliver (Ix 0 q))
+            (loop (drop 1 q) 0))))
+      ((Or (Equal "line" kind) (Or (Equal "eof" kind) (Equal "wire" kind)))
+        (let ((item [msg (If (And (Equal "wire" kind) (Sz caps))
+                           [(Ix 0 caps)]
+                           [])]))
+          (If wanted
+            (Seq (deliver item) (loop q 0))
+            (loop (snoc item q) wanted))))
+      (else (loop q wanted))))
+  (Seq out (loop [] 0)))
+
+;; A spawned actor has no compiler, so force the pumps' call graphs in
+;; MAIN before spawning them (helm-run.rvr's warm block, same reason).
 (define (warm-pump z)
   (DeepSeq
-    [stdin-pump foil:read-stdin foil:read-until
+    [stdin-pump funnel foil:read-stdin foil:read-until
      (foil:read-until 10 [104 [105 [10 0]]])]
     0))
 
-;; After EOF the serve is still a serve: park like it always did.
-(define (park z) (Seq (Recv 0) (park z)))
+;;; The wire (doc/buddy-wire.md, served on port+1) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; sync/plan are this serve's own ops; "compile" maps to a forced
+;;; live-cache sync of that one module (strictly better than the chore
+;;; family's compile_req, whose cache froze at boot); everything else
+;;; (describe, complete, eval, doctest, nsls, ping) delegates to the
+;;; buddy's handler against the same core+coord.
 
-;; MAIN's mailbox also carries coordinator replies; only pump traffic
-;; ends a wait for input.
-(define (await-line z)
-  (define msg (Ix 0 (Recv 0)))
-  (If (Or (Equal "line" (_0 msg)) (Equal "eof" (_0 msg)))
-    msg
-    (await-line z)))
+(define (wire-sync-diags pairs)
+  (wire-json:jarr
+    (map
+      (lambda (p)
+        (wire-json:jobj
+          [["module" (wire-json:jq (Ix 0 p))]
+           ["line" (showNat (Ix 0 (Ix 1 p)))]
+           ["col" (showNat (Ix 1 (Ix 1 p)))]
+           ["msg" (wire-json:jq (Ix 2 (Ix 1 p)))]]))
+      pairs)))
+
+;; The "modules" field: a json array of strings -> row of names.
+(define (wire-mods v)
+  (define a (wire-json:jget "modules" v))
+  (If (And (IsApp a) (Eq "/boot/json/arr" (Hd a)))
+    (filter Bytes (map wire-json:jstr (_0 a)))
+    []))
+
+(define (wire-sync-reply r)
+  (wire-json:jobj
+    [["ok" (Ifz (Ix 2 r) "true" "false")]
+     ["report" (wire-json:jq (join-str NL (Ix 1 r)))]
+     ["failed" (showNat (Ix 2 r))]
+     ["diags" (wire-sync-diags (Ix 3 r))]]))
+
+;; One wire request -> [env' response-json].
+(define (wire-line e line)
+  (define pr (helm-repl:jparse line))
+  (If (Nil (wire-json:jok? pr))
+    [e (wire-json:jobj [["ok" "false"] ["error" (wire-json:jq "bad json")]])]
+    (let* ((v (wire-json:jval pr))
+           (op (wire-json:jget-str "op" v))
+           (mod (wire-json:jget-str "module" v)))
+      (cond
+        ((Eq op "plan")
+          (let ((pi (plan-info e)))
+            [e (wire-json:jobj
+                 [["ok" "true"]
+                  ["changed" (wire-json:jarr-str (Ix 0 pi))]
+                  ["rebuild" (wire-json:jarr-str (Ix 1 pi))]])]))
+        ((Or (Eq op "sync") (Eq op "compile"))
+          (let* ((seed (If (Eq op "compile")
+                         (Ifz mod [] [mod])
+                         (wire-mods v)))
+                 (roster (disk-roster 0))
+                 (bad (find (lambda (m) (Nil (includes (Eq m) roster)))
+                        seed)))
+            (cond
+              ((And (Eq op "compile") (Nil mod))
+                [e (wire-json:jobj
+                     [["ok" "false"]
+                      ["error" (wire-json:jq "compile needs module")]])])
+              (bad
+                [e (wire-json:jobj
+                     [["ok" "false"]
+                      ["error" (wire-json:jq
+                                 (strcat ["no module " (_0 bad)
+                                          " under foil/"]))]])])
+              (else
+                (let ((r (sync-run e seed)))
+                  [(Ix 0 r) (wire-sync-reply r)])))))
+        (else
+          [e (helm-repl:wire-handle (env-renv e) (env-serial e) line)])))))
 
 ;; -> [env'] to keep going, 0 to quit.
 (define (run-line e line)
@@ -406,27 +533,42 @@
     (else
       (Seq (emit [(strcat ["unknown command " line " — h for help"])]) [e]))))
 
-(define (cli-loop e)
-  (Seq (Send (env-pump e) ["next"])
-    (let* ((msg (await-line 0))
+;; One funnel item at a time: grant the token, take the item, process
+;; it COMPLETELY (rebuild asks included — no other input can land
+;; mid-ask), then loop.  stdin EOF stops the terminal but not the
+;; serve: the wire stays up, which is what a headless x/lain-dev is.
+(define (serve-loop e)
+  (Seq (Send (env-funnel e) ["next"])
+    (let* ((mc (Recv 0))
+           (msg (Ix 0 mc))
            (kind (_0 msg)))
-      (If (Equal "eof" kind)
-        (Seq (emit ["" "stdin closed — parking; the namespace keeps serving"])
-          (park 0))
-        (let ((r (run-line e (_1 msg))))
-          (Ifz r
-            (emit ["bye"])
-            ;; force the command through before the next prompt: an s
-            ;; returns [(sync ..)], which Ifz only takes to WHNF, so a
-            ;; bare (Seq (prompt 0) ..) prints the prompt in front of
-            ;; the output of the command it is prompting after
-            (let ((e1 (_0 r)))
-              (Seq e1
-                (Seq (prompt 0) (cli-loop e1))))))))))
+      (cond
+        ((Equal "line" kind)
+          (let ((r (run-line e (_1 msg))))
+            (Ifz r
+              (emit ["bye"])
+              ;; force the command through before the next prompt: an s
+              ;; returns [(sync ..)], which Ifz only takes to WHNF, so a
+              ;; bare (Seq (prompt 0) ..) prints the prompt in front of
+              ;; the output of the command it is prompting after
+              (let ((e1 (_0 r)))
+                (Seq e1
+                  (Seq (prompt 0) (serve-loop e1)))))))
+        ((Equal "wire" kind)
+          (let* ((r (wire-line e (_1 msg)))
+                 (e1 (Ix 0 r)))
+            (Seq e1
+              (Seq (helm:send! (Ix 0 (Ix 1 mc)) ["wres" (Ix 1 r)])
+                (serve-loop (env-serial-inc e1))))))
+        ((Equal "eof" kind)
+          (Seq (emit ["" "stdin closed — the wire keeps serving (and so does HTTP)"])
+            (serve-loop e)))
+        (else (serve-loop e))))))
 
 ;; Take the terminal after the serve is up.  Called instead of the
 ;; park at the end of a fresh boot AND at the end of a resume, so a
-;; resumed namespace has the same CLI as the one that booted it.
+;; resumed namespace has the same CLI as the one that booted it.  The
+;; editor wire (doc/buddy-wire.md) listens on port+1.
 (define (run-cli core coord cache port)
   ;; Force the serve before printing a prompt about it: these arrive
   ;; as thunks, and a terminal in front of an unbuilt namespace is
@@ -434,12 +576,19 @@
   ;; same thing at the other end of the call).
   (Seq (Seq coord (Seq core 0))
     (Seq (warm-pump 0)
-    (let* ((pump (Spawn stdin-pump))
-           (e ["S" core coord cache pump]))
-      (Seq (SendCaps pump ["go"] [0])
-        (Seq (emit
-               [""
-                (strcat ["lain serving on http://localhost:"
-                         (showNat port) "/ns"])
-                "s + enter syncs foil/ into the namespace and rebuilds; h for help"])
-          (Seq (prompt 0) (cli-loop e))))))))
+    (let ((fun (Spawn funnel))
+          (renv (helm-repl:mk-repl-env core coord)))
+      (Seq (SendCaps fun ["go"] [0])
+        (let ((pump (Spawn stdin-pump))
+              (wir (Spawn (helm-repl:wire-pump (Inc port)))))
+          (Seq (SendCaps pump ["go"] [fun])
+            (Seq (SendCaps wir ["go"] [fun])
+              (let ((e ["S" core coord cache fun renv 0]))
+                (Seq (emit
+                       [""
+                        (strcat ["lain serving on http://localhost:"
+                                 (showNat port) "/ns"])
+                        (strcat ["editor wire on port " (showNat (Inc port))
+                                 " (doc/buddy-wire.md)"])
+                        "s + enter syncs foil/ into the namespace and rebuilds; h for help"])
+                  (Seq (prompt 0) (serve-loop e))))))))))))
