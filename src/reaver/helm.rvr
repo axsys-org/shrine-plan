@@ -39,8 +39,11 @@
 ;;;   ["task" task]       external injection; replies ["done"] to the
 ;;;                       cap — the synchronous barrier drivers use
 ;;;   ["query" path]      replies the committed record (res shape)
+;;;   ["project" path]    replies ["qres" path res] at latest case
 ;;;   ["case" path]       replies ["cres" path maybe[nat]] — the
 ;;;                       node's current version
+;;;   ["observe" name dep report after] atomically compares report's
+;;;                       case, or arms one cared observation
 ;;;   ["crew" ]           replies the roster's names
 ;;;   ["handle" name]     replies ["handle"] with the worker handle as
 ;;;                       a capability (or ["nohandle"])
@@ -49,6 +52,7 @@
 ;;; Worker protocol (coordinator -> worker):
 ;;;   ["go" res]     first message; caps = [coordinator-handle]
 ;;;   ["change" res] the name's new committed record
+;;;   ["observed" path maybe[nat]] a one-shot projection wake
 ;;;   ["ack" rsvp]   the outcome of a command this worker sent
 ;;;   ["die"]        the name was removed
 ;;; Workers send ["cmd" name task] to the coordinator handle.
@@ -863,6 +867,9 @@
     ((Eq kind "/boot/duty/tell")
       (Seq (send-named roster (_0 d) ["change" (_1 d) (_2 d)])
         roster))
+    ((Eq kind "/boot/duty/wake")
+      (Seq (send-named roster (_0 d) ["observed" (_1 d) (_2 d)])
+        roster))
     ((Eq kind "/boot/duty/ack")
       (Seq (send-named roster (_0 d) ["ack" (_1 d)])
         roster))
@@ -951,11 +958,34 @@
       (let ((hm2 ((core-spy core) (_1 msg) (_2 msg) hm)))
         (Seq (DeepSeq hm2 hm2)
           (helm-loop core mk-worker persist [hm2 roster]))))
+    ((Eq kind "observe")
+      ;; ["observe" name dep report after] — compare and arm in one
+      ;; coordinator turn, closing the read-then-subscribe race.  The
+      ;; observation mutates only the helm's ephemeral eyes: no event,
+      ;; snapshot, or namespace occurrence is created.
+      (let* ((s (_0 hm))
+             (cur ((core-ent core ["x_case_h"]) 0 (Ix 3 msg) s))
+             (now (If (Eq "/boot/maybe/some" (Hd cur)) (_0 cur) 0)))
+        (If (Ne now (Ix 4 msg))
+          (Seq (send-named roster (_1 msg) ["observed" (Ix 3 msg) cur])
+            (helm-loop core mk-worker persist st))
+          (let ((hm2 ((core-ent core ["helm" "observe"])
+                       (_1 msg) (_2 msg) (Ix 3 msg) hm)))
+            (Seq (DeepSeq hm2 hm2)
+              (helm-loop core mk-worker persist [hm2 roster]))))))
     ((Eq kind "read")
       ;; ["read" path] — the committed record, tagged for multiplexed
       ;; worker mailboxes.
       (let ((s (_0 hm)))
         (let ((res ((core-xq core) (Ix 2 s) (_1 msg) s)))
+          (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
+            (helm-loop core mk-worker persist st)))))
+    ((Eq kind "project")
+      ;; ["project" path] — a latest-case derived read.  Ordinary
+      ;; request-node re-reads use the sovereign's top case; /o
+      ;; projection data is locally versioned and therefore asks at 0.
+      (let ((s (_0 hm)))
+        (let ((res ((core-xq core) 0 (_1 msg) s)))
           (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
             (helm-loop core mk-worker persist st)))))
     ((Eq kind "case")

@@ -198,28 +198,37 @@
     '  .
     '  w-get="/frag/..."      the element is a fragment mount; fetch
     '                         the URL and swap the markup in
-    '  w-trigger="every Ns"   re-fetch on an interval (fetch-on-load
-    '                         always happens)
+    '  w-watch="x|y|z"       hold one cared observation after each
+    '                         successful fragment fetch
     '  w-swap="inner|outer"   how the swap lands (default inner)
     '  w-post (on a form)     intercept submit, POST the fields,
     '                         then refresh the fragments named in
     '                         w-refresh and clear the text inputs
     '  w-refresh="id id.."    fragment element ids a w-post refreshes
     '  .
+    '  Each fragment mount owns a monotonically increasing load
+    '  generation, so a late response cannot overwrite a newer one.
     '  Swaps are skipped when the fetched text is byte-identical to
-    '  the last applied text (client-side staleness compare — the
-    '  poll is cheap, the DOM stays quiet, form state survives).
+    '  that mount's last applied text.  A successful observation is
+    '  one-shot: fetch once, apply, then re-arm at the returned case.
+    '  Network failures retry, but unchanged state emits no traffic.
+    '  Each form also serializes its POSTs in submit order before
+    '  refreshing named fragments.
     '  Cord literals cannot hold a double-quote byte, so the script
     '  is single-quote-only.
     ^  nat
-    =  jopen  "(function(){var last={};"
-       jswap  "function swap(el,t){var k=el.getAttribute('w-get');if(last[k]===t){return}last[k]=t;if(el.getAttribute('w-swap')==='outer'){el.outerHTML=t}else{el.innerHTML=t}}"
-       jload  "function load(el){fetch(el.getAttribute('w-get')).then(function(r){return r.ok?r.text():null}).then(function(t){if(t!==null&&t!==undefined){swap(el,t)}})}"
-       jarm   "function arm(el){load(el);var tr=el.getAttribute('w-trigger')||'';if(tr.indexOf('every ')===0){var n=parseFloat(tr.slice(6));if(n>0){setInterval(function(){load(el)},n*1000)}}}"
-       jwire  "function wire(f){f.addEventListener('submit',function(e){e.preventDefault();fetch(f.getAttribute('action'),{method:'POST',body:new URLSearchParams(new FormData(f))}).then(function(){var ids=(f.getAttribute('w-refresh')||'').split(' ');var i;for(i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el&&el.getAttribute('w-get')){load(el)}}});var ins=f.querySelectorAll('input[type=text],textarea');var j;for(j=0;j<ins.length;j++){ins[j].value=''}})}"
+    =  jopen  "(function(){"
+       jswap  "function swap(el,t){if(el._wLast===t){return}el._wLast=t;if(el.getAttribute('w-swap')==='outer'){el.outerHTML=t}else{el.innerHTML=t}}"
+       jload  "function load(el){var n=(el._wLoad||0)+1;el._wLoad=n;return fetch(el.getAttribute('w-get')).then(function(r){return r.ok?r.text():null}).then(function(t){if(el._wLoad===n&&t!==null&&t!==undefined){swap(el,t);return 1}return 0})}"
+       jretry "function retry(f){setTimeout(f,1000)}"
+       jwurl  "function watchUrl(el,c){var u=el.getAttribute('w-get')||'';return '/watch/'+el.getAttribute('w-watch')+'/'+c+u.slice(5)}"
+       jwait  "function wait(el,c){if(!el.isConnected){return}fetch(watchUrl(el,c)).then(function(r){return r.ok?r.text():null}).then(function(t){if(t===null){retry(function(){wait(el,c)});return}var n=parseInt(t,10);if(!isFinite(n)){retry(function(){wait(el,c)});return}refresh(el,n)}).catch(function(){retry(function(){wait(el,c)})})}"
+       jfresh "function refresh(el,c){load(el).then(function(ok){if(ok){wait(el,c)}else{retry(function(){refresh(el,c)})}}).catch(function(){retry(function(){refresh(el,c)})})}"
+       jarm   "function arm(el){var u=el.getAttribute('w-get')||'';var c=el.getAttribute('w-watch')||'';if(u.indexOf('/frag/')===0&&(c==='x'||c==='y'||c==='z')){wait(el,0)}else{load(el)}}"
+       jwire  "function wire(f){var queue=Promise.resolve();f.addEventListener('submit',function(e){e.preventDefault();var body=new URLSearchParams(new FormData(f));var ins=f.querySelectorAll('input[type=text],textarea');var j;for(j=0;j<ins.length;j++){ins[j].value=''}queue=queue.catch(function(){}).then(function(){return fetch(f.getAttribute('action'),{method:'POST',body:body})}).then(function(r){if(!r.ok){return}var ids=(f.getAttribute('w-refresh')||'').split(' ');var loads=[];var i;for(i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el&&el.getAttribute('w-get')){loads.push(load(el))}}return Promise.all(loads)})})}"
        jboot  "function boot(){var els=document.querySelectorAll('[w-get]');var i;for(i=0;i<els.length;i++){arm(els[i])}var fs=document.querySelectorAll('form[w-post]');var j;for(j=0;j<fs.length;j++){wire(fs[j])}}"
        jgo    "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',boot)}else{boot()}})();"
-    (weft/cat [jopen jswap jload jarm jwire jboot jgo])
+    (weft/cat [jopen jswap jload jretry jwurl jwait jfresh jarm jwire jboot jgo])
   +  page
     '  A full document: title, a raw css block, body nodes.
     \  title=nat css=nat body=row[weft/node]
