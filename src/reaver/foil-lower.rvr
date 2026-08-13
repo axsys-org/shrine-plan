@@ -236,8 +236,21 @@
 ;; reverted: it knots genuinely cyclic heap values, which the content-addressed
 ;; store cannot pin — the acyclicity here is a load-bearing invariant.)
 ;; Imported references remain pinned G edges through `base`.
+;; Sub-zone helper, same discipline as foil.rvr's zspan: open, FORCE
+;; INSIDE, close.  Closing before the value is demanded attributes none
+;; of the work to the zone — laziness smears it onto whoever forces it.
+;; c-lower and c-consts had no internal zones at all, which is why the
+;; remaining superlinearity could not be attributed.
+(define (lspan lbl v)
+  (define h (ZoneStart lbl))
+  (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))
+
 (define (lower-tc-unit-go base final own-keys profiled?)
-  (define paths (unit-own-lowerable-keys final own-keys))
+  ;; NB: this zone is the first thing to force `final`'s entries (canon
+  ;; and the lowerable filter touch each one), so it absorbs work that
+  ;; logically belongs to the phases after it.  Read it as "keys plus
+  ;; whatever forcing the subject costs", not as sorting alone.
+  (define paths (lspan "l-keys" (unit-own-lowerable-keys final own-keys)))
   (define (slot-of path)
     ;; Runtime erases ordinary type arguments.  Prefer an exact materialized
     ;; const-generic entry, then let a virtual /ty-ap reference share the slot
@@ -265,12 +278,13 @@
   (define binds
     (If profiled?
       (profile-zone:force-zone "foil.lower.unit.ir" (lower-all 0))
-      (lower-all 0)))
+      (lspan "l-ir" (lower-all 0))))
   (Ifz (Sz paths)
     final
     (let* ((row-body
-             (fold-app (cgen:K 0)
-               binds))
+             (lspan "l-foldapp"
+               (fold-app (cgen:K 0)
+                 binds)))
            ;; At row-body depth zero, V 0 is UNIT's self and V 1 is its
            ;; deliberately unused forcing argument.  Entry-local lambdas add
            ;; their complete frames to the resolver depth above.
@@ -280,8 +294,8 @@
              (If profiled?
                (profile-zone:force-zone "foil.lower.unit.codegen"
                  (cgen:compile-expr group-ir))
-               (cgen:compile-expr group-ir)))
-           (values-pin (Pin values))
+               (lspan "l-codegen" (cgen:compile-expr group-ir))))
+           (values-pin (lspan "l-pin" (Pin values)))
            (insert-one
              (lambda (out pair[i key])
                (let* ((old (got-entry key final))
@@ -296,8 +310,9 @@
                  (insert-entry-sut key ent out)))))
       ;; The shared dispatcher is compiled once; every entry stores an indexed
       ;; value and a projection IR suitable for downstream caches/debugging.
-      (foldl insert-one final
-        (zip (gen (Sz paths) (lambda (i) i)) paths)))))
+      (lspan "l-insert"
+        (foldl insert-one final
+          (zip (gen (Sz paths) (lambda (i) i)) paths))))))
 
 ;; lower-tc-unit : Subject -> Subject -> [Path] -> Subject
 ;; `base` contains mounted/imported lowered entries; `final` is the sealed,
@@ -462,8 +477,15 @@
         st))
     [(_0 st1) (_1 st1) (snoc key (_2 st1))])
   ;; done is a pure membership set (never read as a list) — an AX
+  ;; One zone, on the fold that walks the whole subject-order.  Do NOT
+  ;; add a second zone around the seal below: it forces `final`, so it
+  ;; absorbs this fold's work and reports it twice (measured — mc-seal
+  ;; and mc-walk came back with segment counts two apart).  Per-entry
+  ;; zones inside walk are worse still: ~30% overhead and, because the
+  ;; order accumulator is lazy, each one re-forces its predecessors.
   (define final
-    (foldl walk [(_0 sut) empty-ax []] (subject-order sut)))
+    (lspan "mc-walk"
+      (foldl walk [(_0 sut) empty-ax []] (subject-order sut))))
   (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
 
 (define (materialize-consts sut)
