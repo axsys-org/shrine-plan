@@ -325,6 +325,26 @@
   (And (Eq "/edit" (Mod u (Lsh 1 40)))
     (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
 
+;; "/fork/..." — the counterfactual endpoint: POST /fork/<dst> with
+;; at=<path>, from=<epoch>, expr=<foil myth> forks the world at
+;; `from`, pokes the evaluated myth at `at`, replays the journal
+;; against the branch, and commits the verdict record at <dst>.
+;; The branch is transient; only the verdict lands in the trunk.
+(define (fork-url? u)
+  (And (Eq "/fork" (Mod u (Lsh 1 40)))
+    (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
+
+;; Leading decimal run of a form field, 0 when none.
+(define (parse-nat s)
+  (define n (Bytes s))
+  (define (go i acc)
+    (If (Ge i n) acc
+      (let ((c (Load8 i s)))
+        (If (And (Ge c 48) (Le c 57))
+          (go (Inc i) (Add (Mul 10 acc) (Sub c 48)))
+          acc))))
+  (go 0 0))
+
 ;; The poke myth for a form body: each field k=v except "back"
 ;; becomes a text pail at slot ['post <k>].
 (define (post-myth hs body)
@@ -534,6 +554,42 @@
               (task ((h-poke hs) (_0 target) (edit-myth hs body))))
           (Seq (helm:send! coord ["cmd" name task])
             (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
+    ;; The counterfactual endpoint: evaluate the intervention myth
+    ;; (the same expression discipline as the write box), hand the
+    ;; whole job to the coordinator as a ["branch" ..] message, and
+    ;; wait on the verdict commit's ack — the "vine" queue kind, so
+    ;; the reply bounces to the verdict node on success.
+    (define (fork! z)
+      (define url (_2 msg))
+      (define body (_3 msg))
+      (define dst (url-target (Rsh url 40)))
+      (define at (url-target (form-field "at" body)))
+      (define from (parse-nat (form-field "from" body)))
+      (define expr (form-field "expr" body))
+      (define (reply status body2)
+        (Seq (helm:send! (Ix 0 caps) ["res" status body2 "text/html; charset=utf-8"])
+          (loop serial pending queue)))
+      (cond
+        ((Ifz dst 1 0) (reply 404 "unparseable destination path"))
+        ((Or (Ifz at 1 0) (Nil (Sz (_0 at)))) (reply 400 "at= must be a namespace path"))
+        ((Ifz from 1 0) (reply 400 "from= must be a positive epoch"))
+        (else
+          (let ((r (doctest:eval-text (h-sut hs) expr)))
+            (If (Eq 1 (Hd r))
+              (reply 400 (foil-render:diag-text (_0 r)))
+              (let ((fv (Try (lambda (z2)
+                               (let ((v (_0 (_0 r))))
+                                 (Seq (DeepSeq v v) v)))
+                          0)))
+                (cond
+                  ((Eq 1 (Hd fv)) (reply 400 (err-text (_0 fv))))
+                  ((Nil (myth-rep? (_0 fv)))
+                    (reply 400 "expr must evaluate to a myth (the intervention to poke)"))
+                  (else
+                    (Seq (helm:send! coord
+                           ["branch" name (_0 dst) (_0 at) from (_0 fv)])
+                      (loop serial pending
+                        (snoc [(_0 dst) "vine" (Ix 0 caps)] queue)))))))))))
     ;; The fragment endpoint: rebuild the /o target from the /frag
     ;; URL, make a request record stamped with the ['frag] marker,
     ;; and wait on the response slots like any request — the
@@ -573,6 +629,9 @@
       ((And (Eq kind "req")
          (And (h-vine? hs) (vine-url? (_2 msg))))
         (vine! 0))
+      ((And (Eq kind "req")
+         (And (h-vine? hs) (fork-url? (_2 msg))))
+        (fork! 0))
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
         (let* ((parts (filter Bytes (split-ch 47 (_2 msg))))
