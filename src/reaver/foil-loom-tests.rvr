@@ -1,0 +1,351 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+(#bind stage (#module foil-stage))
+
+
+;;; apps/loom/main.foil: the metacircular HTML editor.  The pure
+;;; address/grammar core is asserted directly; the app is then
+;;; mounted through the real pact expansion and driven with source
+;;; commits, record pokes (the /edit shape), and structure ops
+;;; through the cycle, so both directions of the sync law run
+;;; against real facts.  Runtime shapes as in foil-life-tests.
+
+(define sut (stage:sut-of "apps/loom/main"))
+(define (app path) (foil:source-entry-val path sut))
+
+;;; 1. addresses and text ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define split-slash (app ["split_slash"]))
+(define parse-rel (app ["parse_rel"]))
+(define parse-abs (app ["parse_abs"]))
+(define rel-text (app ["rel_text"]))
+(define tag-ok (app ["tag_ok"]))
+(define safe-href (app ["safe_href"]))
+(define decode-ent (app ["decode_ent"]))
+(define clean-run (app ["clean_run"]))
+(define nl 10)
+
+assert(Equal ["a" "bb"] (split-slash "a/bb"))
+assert(Equal ["a" "b"] (split-slash "/a/b/"))
+assert(Eq "/boot/maybe/some" (Hd (parse-rel ".")))
+assert(Equal [] (_0 (parse-rel ".")))
+assert(Equal [("u" 0) ("u" 2)] (_0 (parse-rel "0/2")))
+assert(Eq "/boot/maybe/none" (parse-rel "x"))
+assert(Eq "/boot/maybe/none" (parse-rel ""))
+assert(Equal [("ts" "app") ("ts" "loom") ("ts" "p") ("ts" "home")]
+  (parse-abs "/app/loom/p/home"))
+assert(Equal [("ts" "app") ("u" 3)] (parse-abs "app/3"))
+assert(Equal [("ts" "3")] (parse-abs "$3"))
+assert(Eq "." (rel-text []))
+assert(Eq "0/2" (rel-text [("u" 0) ("u" 2)]))
+assert(Eq 1 (tag-ok "p"))
+assert(Eq 0 (tag-ok "script"))
+assert(Eq "/app/loom" (safe-href "/app/loom"))
+assert(Eq "#" (safe-href "javascript:alert(1)"))
+assert(Eq "#" (safe-href "JavaScript:x"))
+assert(Eq "a&b" (decode-ent "a&amp;b"))
+assert(Eq "x&y" (decode-ent "x&y"))
+assert(Eq "a<b>" (decode-ent "a&lt;b&gt;"))
+assert(Eq "a b" (clean-run (strcat ["  a" nl "  b  "])))
+assert(Eq 0 (clean-run (strcat ["  " nl " "])))
+
+;;; 2. the grammar: hand-typed input, refusals, entities ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define parse-src (app ["parse_src"]))
+(define lmounts (app ["lmounts"]))
+(define txt-slot (app ["myth" "txt_at"]))
+(define has-slot (app ["myth" "has_at"]))
+(define tok "/boot/pres/ok")
+(define tbad "/boot/pres/bad")
+(define ttag [("ts" "tag")])
+(define ttext [("ts" "text")])
+(define tcls [("ts" "cls")])
+(define tpart [("ts" "part")])
+(define tdata [("ts" "data")])
+(define tsrc [("ts" "src")])
+(define terr [("ts" "err")])
+
+;; a plain element, and a bare leading run
+(define p1 (parse-src "<p>hi</p>"))
+assert(Eq tok (Hd p1))
+assert(Eq 0 (_0 p1))
+(define p1m (lmounts [] (_1 p1)))
+assert(Eq 1 (Sz p1m))
+assert(Equal [("u" 0)] (_0 (Ix 0 p1m)))
+assert(Eq "p" (txt-slot ttag (_1 (Ix 0 p1m))))
+assert(Eq "hi" (txt-slot ttext (_1 (Ix 0 p1m))))
+assert(Eq "hello" (_0 (parse-src "hello")))
+;; sloppy whitespace, a self-close, entities, class -> ['cls]
+(define p2 (parse-src (strcat
+  ["  <p   class=" 34 "x" 34 "  >a &amp; b</p>" nl "  <br/>" nl])))
+assert(Eq tok (Hd p2))
+(define p2m (lmounts [] (_1 p2)))
+assert(Eq 2 (Sz p2m))
+assert(Eq "x" (txt-slot tcls (_1 (Ix 0 p2m))))
+assert(Eq "a & b" (txt-slot ttext (_1 (Ix 0 p2m))))
+assert(Eq "br" (txt-slot ttag (_1 (Ix 1 p2m))))
+;; nesting numbers kids under their parent, preorder
+(define p3 (parse-src "<div><h2>t</h2><p>b</p></div>"))
+(define p3m (lmounts [] (_1 p3)))
+assert(Eq 3 (Sz p3m))
+assert(Equal [("u" 0)] (_0 (Ix 0 p3m)))
+assert(Equal [("u" 0) ("u" 0)] (_0 (Ix 1 p3m)))
+assert(Equal [("u" 0) ("u" 1)] (_0 (Ix 2 p3m)))
+;; the part spelling round-trips through the path codec
+(define psrc (strcat
+  ["<part part=" 34 "/app/life/weft/board" 34 " data=" 34 "/app/life/board" 34 ">"]))
+(define p4 (parse-src psrc))
+assert(Eq tok (Hd p4))
+(define p4rec (_1 (Ix 0 (lmounts [] (_1 p4)))))
+assert(Eq 1 (has-slot tpart p4rec))
+assert(Eq 1 (has-slot tdata p4rec))
+;; a parsed script tag is a legal RECORD (the renderer is the guard)
+(define p5 (parse-src "<script>hi</script>"))
+assert(Eq tok (Hd p5))
+assert(Eq "script" (txt-slot ttag (_1 (Ix 0 (lmounts [] (_1 p5))))))
+;; refusals, each with its own why
+assert(Eq tbad (Hd (parse-src "<p>oops")))
+assert(Eq "unclosed element p" (_0 (parse-src "<p>oops")))
+assert(Eq "mismatched close q" (_0 (parse-src "<p>a</q>")))
+assert(Eq "text after a child element" (_0 (parse-src "<p>a<em>b</em>c</p>")))
+assert(Eq "unknown attribute foo" (_0 (parse-src (strcat ["<p foo=" 34 "x" 34 ">a</p>"]))))
+assert(Eq "malformed attribute" (_0 (parse-src "<p class=x>a</p>")))
+assert(Eq "a tag opens with a lowercase name" (_0 (parse-src "<P>x</P>")))
+
+;;; 3. the mount: one make expands the whole app subtree ;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define run-event (app ["run_event"]))
+(define vine-make (app ["vine_make"]))
+(define vine-poke (app ["vine_poke"]))
+(define cycle (app ["cycle"]))
+(define x-latest (app ["sov" "x_latest"]))
+(define z-latest (app ["sov" "z_latest"]))
+(define msing (app ["myth" "sing"]))
+(define madd (app ["myth" "add"]))
+(define mnew (app ["myth" "new"]))
+(define ttxt (app ["twig" "txt"]))
+(define pt (app ["pt"]))
+(define (tmyth pairs)
+  (foldl (lambda (m kv) (madd (ttxt (Ix 0 kv) (Ix 1 kv)) m)) mnew pairs))
+
+(define loom-mani (app ["app"]))
+(define card ((app ["pact" "card"]) loom-mani "apps/loom/main" 0 0))
+(define sov0 (app ["seeded_kern"]))
+
+(define tapp ("ts" "app"))
+(define tloom ("ts" "loom"))
+(define hub [tapp tloom ("ts" "p")])
+(define home [tapp tloom ("ts" "p") ("ts" "home")])
+(define about [tapp tloom ("ts" "p") ("ts" "about")])
+(define (kid base n) (snoc ("u" n) base))
+
+(define m1 (run-event (vine-make [tapp tloom] card) 0 sov0))
+assert(Eq "/boot/ovum/ripe" (Hd m1))
+(define s1 (_0 m1))
+;; the home page, its first kid, and the part rows exist
+(define hm1 (x-latest home s1))
+assert(Eq "/boot/res/known" (Hd hm1))
+assert(Eq "h1" (txt-slot ttag (_0 (x-latest (kid home 0) s1))))
+(define part1 (_0 (x-latest (kid home 5) s1)))
+assert(Eq 1 (has-slot tpart part1))
+;; the page-in-page part's rebased data path is absolute
+(define part2 (_0 (x-latest (kid home 7) s1)))
+assert(Eq 1 (has-slot tdata part2))
+;; the component card and the three kooks mounted
+assert(Eq "/boot/res/known" (Hd (x-latest [tapp tloom ("ts" "weft") ("ts" "page")] s1)))
+assert(Eq "/boot/res/known" (Hd (x-latest [tapp tloom ("ts" "kook") ("ts" "page")] s1)))
+assert(Eq "/boot/res/known" (Hd (x-latest [tapp tloom ("ts" "kook") ("ts" "hub")] s1)))
+assert(Eq "/boot/res/known" (Hd (x-latest [tapp tloom ("ts" "kook") ("ts" "face")] s1)))
+;; the mount-epoch hear rounds regenerated ['src] from the records
+(define src0 (txt-slot tsrc (_0 hm1)))
+assert(Eq 1 (Ifz src0 0 1))
+(define cord-has (app ["cord" "has"]))
+assert(Eq 1 (cord-has "<h1>loom</h1>" src0))
+assert(Eq 1 (cord-has "<part part=" src0))
+
+;;; 4. the seeded source is its own fixpoint ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define rec-image (app ["rec_image"]))
+(define unparse-page (app ["unparse_page"]))
+(define tapped (app ["tapped"]))
+(define zfat (_0 (z-latest home s1)))
+(define im (rec-image zfat))
+(define rp (parse-src src0))
+assert(Eq tok (Hd rp))
+assert(Equal (_0 im) (_0 rp))
+assert(Equal (_1 im) (tapped (lmounts [] (_1 rp))))
+;; unparse of reparse is the fixpoint from the first regeneration on
+assert(Equal src0 (unparse-page zfat))
+
+;;; 5. a source commit re-expands the records ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define tpsrc [("ts" "post") ("ts" "src")])
+(define src1 (strcat ["<h2 class=" 34 "big" 34 ">edited</h2>" nl "<p>hello &amp; goodbye</p>"]))
+(define g1 (cycle (vine-poke home (msing tpsrc (pt src1))) 0 8 s1))
+assert(Eq "/boot/gyre/spun" (Hd g1))
+(define s2 (_0 g1))
+(define hm2 (_0 (x-latest home s2)))
+;; the source landed as written, the error swept
+assert(Equal src1 (txt-slot tsrc hm2))
+assert(Eq 0 (txt-slot terr hm2))
+;; records match the new source
+assert(Eq "h2" (txt-slot ttag (_0 (x-latest (kid home 0) s2))))
+assert(Eq "big" (txt-slot tcls (_0 (x-latest (kid home 0) s2))))
+assert(Eq "edited" (txt-slot ttext (_0 (x-latest (kid home 0) s2))))
+assert(Eq "hello & goodbye" (txt-slot ttext (_0 (x-latest (kid home 1) s2))))
+;; the records the source no longer mounts are culled
+assert(Eq "/boot/res/null" (Hd (x-latest (kid home 5) s2)))
+assert(Eq "/boot/res/null" (Hd (x-latest (kid home 8) s2)))
+
+;;; 6. a withdrawn attribute sweeps, and stays swept ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define src2 (strcat ["<h2>edited</h2>" nl "<p>hello &amp; goodbye</p>"]))
+(define g2 (cycle (vine-poke home (msing tpsrc (pt src2))) 0 8 s2))
+assert(Eq "/boot/gyre/spun" (Hd g2))
+(define s3 (_0 g2))
+;; the class slot swept to the empty text pail on the record
+(define k0 (_0 (x-latest (kid home 0) s3)))
+assert(Eq 1 (has-slot tcls k0))
+assert(Eq 0 (txt-slot tcls k0))
+;; and absent from the record image, so the law is quiescent
+(define zf3 (_0 (z-latest home s3)))
+(define im3 (rec-image zf3))
+(define rp3 (parse-src (txt-slot tsrc (_0 (x-latest home s3)))))
+assert(Equal (_0 im3) (_0 rp3))
+assert(Equal (_1 im3) (tapped (lmounts [] (_1 rp3))))
+;; the author's layout survived: ['src] is src2 verbatim
+assert(Equal src2 (txt-slot tsrc (_0 (x-latest home s3))))
+
+;;; 7. a bad commit refuses visibly and touches nothing ;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define g3 (cycle (vine-poke home (msing tpsrc (pt "<p>oops"))) 0 8 s3))
+assert(Eq "/boot/gyre/spun" (Hd g3))
+(define s4 (_0 g3))
+(define hm4 (_0 (x-latest home s4)))
+assert(Eq "unclosed element p" (txt-slot terr hm4))
+assert(Equal src2 (txt-slot tsrc hm4))
+assert(Eq "h2" (txt-slot ttag (_0 (x-latest (kid home 0) s4))))
+;; the next good commit sweeps the error
+(define g4 (cycle (vine-poke home (msing tpsrc (pt "<p>fresh</p>"))) 0 8 s4))
+(define s5 (_0 g4))
+assert(Eq 0 (txt-slot terr (_0 (x-latest home s5))))
+assert(Eq "fresh" (txt-slot ttext (_0 (x-latest (kid home 0) s5))))
+assert(Eq "/boot/res/null" (Hd (x-latest (kid home 1) s5)))
+
+;;; 8. a record poke (the /edit shape) regenerates the source ;;;;;;;;;;;;;;;;;;;;;;
+
+(define g5 (cycle (vine-poke (kid home 0) (msing ttext (pt "retitled"))) 0 8 s5))
+assert(Eq "/boot/gyre/spun" (Hd g5))
+(define s6 (_0 g5))
+assert(Eq "retitled" (txt-slot ttext (_0 (x-latest (kid home 0) s6))))
+assert(Equal "<p>retitled</p>" (txt-slot tsrc (_0 (x-latest home s6))))
+
+;;; 9. structure ops through the cycle ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define tpop [("ts" "post") ("ts" "op")])
+(define tpat [("ts" "post") ("ts" "at")])
+(define tptag [("ts" "post") ("ts" "tag")])
+(define tptext [("ts" "post") ("ts" "text")])
+(define tpwith [("ts" "post") ("ts" "with")])
+;; add: a new element at the next index, and the source follows
+(define g6 (cycle (vine-poke home (tmyth
+  [[tpop "add"] [tpat "."] [tptag "p"] [tptext "added"]])) 0 8 s6))
+(define s7 (_0 g6))
+assert(Eq "added" (txt-slot ttext (_0 (x-latest (kid home 1) s7))))
+assert(Equal (strcat ["<p>retitled</p>" nl "<p>added</p>"])
+  (txt-slot tsrc (_0 (x-latest home s7))))
+;; an unknown tag is refused: no new record
+(define g6b (cycle (vine-poke home (tmyth
+  [[tpop "add"] [tpat "."] [tptag "script"] [tptext "boom"]])) 0 8 s7))
+(define s7b (_0 g6b))
+assert(Eq "/boot/res/null" (Hd (x-latest (kid home 2) s7b)))
+;; retag
+(define g7 (cycle (vine-poke home (tmyth
+  [[tpop "tag"] [tpat "0"] [tptag "h3"]])) 0 8 s7b))
+(define s8 (_0 g7))
+assert(Eq "h3" (txt-slot ttag (_0 (x-latest (kid home 0) s8))))
+;; delete leaves a numbering gap; the ordinal image stays quiescent
+(define g8 (cycle (vine-poke home (tmyth [[tpop "del"] [tpat "0"]])) 0 8 s8))
+(define s9 (_0 g8))
+assert(Eq "/boot/res/null" (Hd (x-latest (kid home 0) s9)))
+assert(Equal "<p>added</p>" (txt-slot tsrc (_0 (x-latest home s9))))
+(define zf9 (_0 (z-latest home s9)))
+(define im9 (rec-image zf9))
+(define rp9 (parse-src (txt-slot tsrc (_0 (x-latest home s9)))))
+assert(Equal (_0 im9) (_0 rp9))
+assert(Equal (_1 im9) (tapped (lmounts [] (_1 rp9))))
+
+;;; 10. swap exchanges two sibling subtrees, deeply ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; rebuild a two-branch page on about: a section with a kid, and a p
+(define asrc (strcat
+  ["<section><p>inner</p></section>" nl "<p>flat</p>"]))
+(define ga (cycle (vine-poke about (msing tpsrc (pt asrc))) 0 8 s9))
+(define sa (_0 ga))
+assert(Eq "section" (txt-slot ttag (_0 (x-latest (kid about 0) sa))))
+assert(Eq "inner" (txt-slot ttext (_0 (x-latest (kid (kid about 0) 0) sa))))
+assert(Eq "flat" (txt-slot ttext (_0 (x-latest (kid about 1) sa))))
+(define gb (cycle (vine-poke about (tmyth
+  [[tpop "swap"] [tpat "0"] [tpwith "1"]])) 0 8 sa))
+(define sb (_0 gb))
+;; the flat p now sits at 0; the section and its kid at 1
+assert(Eq "p" (txt-slot ttag (_0 (x-latest (kid about 0) sb))))
+assert(Eq "flat" (txt-slot ttext (_0 (x-latest (kid about 0) sb))))
+assert(Eq "section" (txt-slot ttag (_0 (x-latest (kid about 1) sb))))
+assert(Eq "inner" (txt-slot ttext (_0 (x-latest (kid (kid about 1) 0) sb))))
+;; no stale leftovers: the old deep path under 0 is gone
+assert(Eq "/boot/res/null" (Hd (x-latest (kid (kid about 0) 0) sb)))
+;; and the source followed the swap
+assert(Equal (strcat ["<p>flat</p>" nl "<section>" nl "  <p>inner</p>" nl "</section>"])
+  (txt-slot tsrc (_0 (x-latest about sb))))
+
+;;; 11. the hub stamps a new page ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define tpnew [("ts" "post") ("ts" "new")])
+(define gc (cycle (vine-poke hub (msing tpnew (pt "scratch"))) 0 8 sb))
+(define sc (_0 gc))
+(define scratch [tapp tloom ("ts" "p") ("ts" "scratch")])
+assert(Eq "/boot/res/known" (Hd (x-latest scratch sc)))
+;; the blank stamp seeded a first kid in the same epoch
+assert(Eq "p" (txt-slot ttag (_0 (x-latest (kid scratch 0) sc))))
+;; and the sync law seeded its source
+assert(Eq 1 (cord-has "click this text" (txt-slot tsrc (_0 (x-latest scratch sc)))))
+
+;;; 12. the renderer: w-edit affordances, live parts, the tag guard ;;;;;;;;;;;;;;;;;
+
+(define page-html (app ["page_html"]))
+(define as-node (app ["frag" "as_node"]))
+(define render (app ["weft" "render"]))
+(define pail-at (app ["myth" "pail_at"]))
+(define thtml [("ts" "html")])
+(define (rendered s pgpath)
+  (render (_0 (as-node (pail-at thtml (page-html (_0 (z-latest pgpath s))))))))
+;; the mounted home page: editable runs and both live mounts
+(define h0 (rendered s1 home))
+assert(Eq 1 (cord-has "w-edit=" h0))
+;; the root's app slots never leak into markup attributes (the
+;; ['src] slot is the page source, not an img src — caught live)
+assert(Eq 0 (cord-has "article src=" h0))
+assert(Eq 1 (cord-has "/frag/1/4/app/life/weft/board/3/app/life/board" h0))
+assert(Eq 1 (cord-has "/frag/1/4/app/loom/weft/page/4/app/loom/p/about" h0))
+assert(Eq 1 (cord-has (strcat ["id=" 34 "pt-5" 34]) h0))
+;; a script-tag record renders as an inert chip, its text escaped
+(define script-rec (tmyth [[ttag "script"] [ttext "<script>boom</script>"]]))
+(define gd (cycle (vine-make (kid scratch 1) script-rec) 0 8 sc))
+(define sd (_0 gd))
+(define h1r (rendered sd scratch))
+assert(Eq 1 (cord-has "badtag" h1r))
+assert(Eq 1 (cord-has "&lt;script&gt;boom&lt;/script&gt;" h1r))
+assert(Eq 0 (cord-has "<script>boom" h1r))

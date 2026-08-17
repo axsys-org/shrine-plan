@@ -87,6 +87,17 @@
 (define elab-val
   (If use-new-elab new-elab-val foil-elab:elab-val))
 
+;; world-from-subject :: Subject -> TypeWorld — public alias so eval
+;; drivers can share one world across an expression storm.
+(define world-from-subject foil-new-elab:world-from-subject)
+
+;; elab-val-in :: TypeWorld -> Subject -> Env -> Sast -> TC
+;;
+;; elab-val with a caller-supplied world (see world-from-subject).
+(define (elab-val-in world sut env surf)
+  (_1 (foil-new-elab:elab-value
+        (foil-new-elab:compiler-for-with world sut) surf)))
+
 (define make-ir-entry foil-lower:make-ir-entry)
 (define ir-entry-val foil-lower:ir-entry-val)
 (define ir-entry-tc foil-lower:ir-entry-tc)
@@ -224,8 +235,8 @@
 ;; make-resolved-import :: SastImport -> Subject -> [Path] -> [Path]
 ;;                      -> Layer -> Layer -> Mount -> Pin -> [Path]
 ;;                      -> ResolvedImport
-(define (make-resolved-import imp sut keys own layer exports mount unit-id projected pack)
-  [RESOLVED-IMPORT imp sut keys own layer exports mount unit-id projected pack])
+(define (make-resolved-import imp sut keys own layer exports mount unit-id projected pack row-pin)
+  [RESOLVED-IMPORT imp sut keys own layer exports mount unit-id projected pack row-pin])
 (define resolved-import-sast (Ix 1))
 (define resolved-import-subject (Ix 2))
 (define resolved-import-keys (Ix 3))
@@ -236,6 +247,9 @@
 (define resolved-import-unit-id (Ix 8))
 (define resolved-import-projected-keys (Ix 9))
 (define resolved-import-pack (Ix 10))
+;; the imported row's durable pin: the lazy mount record carries THIS
+;; so DeepSeq of a projected subject stops at the mount boundary
+(define resolved-import-row-pin (Ix 11))
 
 ;;; Per-unit import pack ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -296,8 +310,76 @@
               [(_0 pair) 1 pin (_0 entry)])
             [(_0 pair) 0 note 0])))
       (foil-env:layer-entries exports)))
+  ;; Hybrid-lazy lookup indexes (lazily forced with the pack, shared
+  ;; per unit): the consumer's dispatch index is built from
+  ;; `reachable`, and a dispatch hit fetches through `own-lookup` /
+  ;; `export-lookup` or descends into the imported subject.
+  (define own-lookup
+    (foldl (lambda (ax pair) (cairn:putax (_0 pair) (_1 pair) ax))
+      cairn:empty-ax own-pairs))
+  (define export-make-pairs
+    (map (lambda (row) [(Ix 3 row) (Ix 2 row)])
+      (filter (Ix 1) export-rows)))
+  (define export-lookup
+    (foldl (lambda (ax pair) (cairn:putax (_0 pair) (_1 pair) ax))
+      cairn:empty-ax export-make-pairs))
+  (define (tc-typ-pair? pair)
+    (define ent (foil-subject:unpin-soft (_1 pair)))
+    (And (IsApp ent)
+      (let ((tc
+              (cond
+                ((Eq "TC" (Hd ent)) (foil-subject:tc-entry-contents ent))
+                ((Eq "IR_ENTRY" (Hd ent)) (Ix 3 ent))
+                (else 0))))
+        (And (IsApp tc) (Eq "TC_TYP" (Hd tc))))))
+  ;; TypeWorld rows, TRANSITIVE (verified equivalent to the eager
+  ;; trie's TC_TYP key set): a lazily-projected imped contributes its
+  ;; mounts' rows; an eager-era imped enumerates its trie once, minus
+  ;; the substrate.
+  (define imped-lz (foil-subject:sut-lazy imped))
+  (define imped-world-rows
+    (If imped-lz
+      (foldl
+        (lambda (acc m) (Weld acc (foil-subject:lzm-world-rows m)))
+        [] (foil-subject:lz-mounts imped-lz))
+      (filter
+        (lambda (pair)
+          (And (tc-typ-pair? pair)
+            (Ifz (cairn:getax (_0 pair) default-subject-order-index) 1 0)))
+        (rowify (cairn:tapax (Ix 0 imped))))))
+  (define world-rows
+    (_1
+      (foldl
+        (lambda (st pair)
+          (Ifz (cairn:getax (_0 pair) (_0 st))
+            [(cairn:putax (_0 pair) 1 (_0 st)) (snoc pair (_1 st))]
+            st))
+        [cairn:empty-ax []]
+        (Weld (filter tc-typ-pair? (Weld own-pairs export-make-pairs))
+          imped-world-rows))))
+  ;; export keys colliding with the substrate stay eagerly inserted
+  ;; (trie-first lookup would let a builtin win over its replacement)
+  (define substrate-shadows
+    (filter
+      (lambda (pair) (If (cairn:getax (_0 pair) default-subject-order-index) 1 0))
+      export-make-pairs))
+  ;; every key answerable through this mount: decl-keys (transitive
+  ;; for eager-era rows), the qualified and export spellings, and —
+  ;; for a lazy imped — everything ITS dispatch answers
+  (define reachable
+    (foldl (lambda (ax k) (cairn:putax k 1 ax))
+      cairn:empty-ax
+      (Weld keys
+        (Weld qualified-own
+          (Weld (map (Ix 0) export-make-pairs)
+            (If imped-lz
+              (map (Ix 0)
+                (rowify (cairn:tapax
+                  (foil-subject:lz-dispatch imped-lz))))
+              []))))))
   [own exports layer unit-id qualified-own dependencies projected
-   own-pairs export-rows])
+   own-pairs export-rows own-lookup export-lookup world-rows
+   substrate-shadows reachable])
 (define pack-own (Ix 0))
 (define pack-exports (Ix 1))
 (define pack-layer (Ix 2))
@@ -307,12 +389,19 @@
 (define pack-projected (Ix 6))
 (define pack-own-pairs (Ix 7))
 (define pack-export-rows (Ix 8))
+(define pack-own-lookup (Ix 9))
+(define pack-export-lookup (Ix 10))
+(define pack-world-rows (Ix 11))
+(define pack-substrate-shadows (Ix 12))
+(define pack-reachable (Ix 13))
 
 ;; Cache rows created before the pack field existed (or mirror-shaped rows
 ;; built by tooling) fall back to computing the pack in place.
 (define (entry-pack e)
-  (If (Lt 5 (Sz e))
-    (Ix 5 e)
+  ;; a pre-hybrid pack (narrower shape) recomputes in place
+  (define held (If (Lt 5 (Sz e)) (Ix 5 e) 0))
+  (If (And (IsApp held) (Gt (Sz held) 13))
+    held
     (unit-import-pack (_0 e) (_1 e) (_2 e) (_3 e))))
 
 ;; import-mount :: Layer -> SastImport -> Mount
@@ -344,32 +433,24 @@
            (sut1 (foil-subject:put-entry-pin canonical pin sut)))
       (foil-subject:mark-visible written canonical sut1))))
 
-;; project-import-storage :: ResolvedImport -> Subject -> Subject
-;;
-;; A consumer stores every entry owned by an imported unit below that unit's
-;; content pin.  Already-qualified dependency entries remain hidden linking
-;; storage.  This lets two prefix mounts expose the same local canonical names
-;; without either unit rewriting the other's type/global edges.
-(define (project-import-storage ri sut)
-  (define pack (resolved-import-pack ri))
-  (define with-dependencies
-    (foil-subject:overlay-subject (pack-dependencies pack)
-      (resolved-import-subject ri) sut))
-  ;; The relocated clones come precomputed from the unit's import pack.
-  (foldl
-    (lambda (acc pair)
-      (foil-subject:put-entry-pin (_0 pair) (_1 pair) acc))
-    with-dependencies (pack-own-pairs pack)))
+;; Hybrid-lazy projection: a mount's entries stay in its pack; the
+;; consumer materializes only the substrate-shadow keys and the
+;; visibility marks (resolution semantics untouched), appends one
+;; lazy mount record, and extends the combined dispatch index with
+;; the mount's reachable keys — later mounts overwrite, preserving
+;; later-import-wins.  Dependencies resolve transitively through the
+;; imported subject; the eager dependency overlay and per-entry
+;; storage/export inserts are gone.
 
 ;; project-one-mount :: Row ResolvedImport -> Subject -> Mount -> Subject
 (define (project-one-mount resolved sut mount)
   (define ri (find-resolved-import mount resolved))
   (define own (resolved-import-own-keys ri))
   (define unit-id (resolved-import-unit-id ri))
-  ;; Hidden cumulative entries make the imported unit's already-resolved type
-  ;; and global edges available.  Only the export-layer paths below enter the
-  ;; visibility index.
-  (define sut1 (project-import-storage ri sut))
+  (define pack (resolved-import-pack ri))
+  ;; eager residue 1: import exports that replace a substrate key
+  (define sut1
+    (foil-subject:put-entry-pins (pack-substrate-shadows pack) sut))
   (define prefix (Weld (foil-subject:sut-root sut1) (foil-env:mount-at mount)))
   ;; Culls live in the symbolic mount layer; compiled makes live in the export
   ;; layer.  Apply the former first so a later make/revival can replace it.
@@ -380,17 +461,33 @@
           (project-export-entry (Weld prefix (_0 pair)) own unit-id (_1 pair) acc)
           acc))
       sut1 (foil-env:layer-entries (resolved-import-layer ri))))
-  ;; Export makes install from the pack's precomputed clones; only the
-  ;; consumer-side visibility marks happen here.
-  (foldl
-    (lambda (acc row)
-      (let ((written (Weld prefix (_0 row))))
-        (Ifz (_1 row)
-          ;; A cull occupies source visibility without a compiled entry.
-          (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
-          (foil-subject:mark-visible written (Ix 3 row)
-            (foil-subject:put-entry-pin (Ix 3 row) (Ix 2 row) acc)))))
-    with-culls (pack-export-rows (resolved-import-pack ri))))
+  ;; visibility marks stay fully materialized (canon-path and the
+  ;; method-resolution inverse are untouched by laziness)
+  (define export-rows (pack-export-rows pack))
+  (define with-marks
+    (foldl
+      (lambda (acc row)
+        (let ((written (Weld prefix (_0 row))))
+          (Ifz (_1 row)
+            ;; A cull occupies source visibility without a compiled entry.
+            (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
+            (foil-subject:mark-visible written (Ix 3 row) acc))))
+      with-culls export-rows))
+  ;; append the lazy mount record (reachable rides field 4); the
+  ;; combined dispatch is built once by project-mounts after every
+  ;; mount has landed — newest-first with skip-if-present, which
+  ;; preserves later-import-wins AND touches each key once instead of
+  ;; re-inserting the heavily overlapping transitive sets per mount
+  (define lz0 (foil-subject:sut-lazy with-marks))
+  (define lz (Ifz lz0 [cairn:empty-ax []] lz0))
+  (define mounts0 (foil-subject:lz-mounts lz))
+  (define mrec
+    [(pack-own-lookup pack) (pack-export-lookup pack)
+     (resolved-import-row-pin ri) (pack-world-rows pack)
+     (pack-reachable pack)])
+  (foil-subject:set-sut-lazy
+    [(foil-subject:lz-dispatch lz) (snoc mrec mounts0)]
+    with-marks))
 
 ;; mark-substrate-visible :: Subject -> Subject
 ;;
@@ -441,10 +538,32 @@
 
 ;; project-mounts :: Subject -> Row ResolvedImport -> Row Mount -> Row SastRow -> Subject
 (define (project-mounts sut0 resolved mounts decls)
-  (define mounted
+  (define mounted0
     (foldl (project-one-mount resolved)
       (mark-substrate-visible sut0)
       (foil-env:validate-mounts mounts)))
+  ;; seal the dispatch: mounts newest-first, first claim wins (= the
+  ;; newest importer of the key, matching eager overwrite order)
+  (define mounted
+    (let ((lz (foil-subject:sut-lazy mounted0)))
+      (Ifz lz
+        mounted0
+        (let* ((ms (foil-subject:lz-mounts lz))
+               (n (Sz ms))
+               (dispatch
+                 (foldl
+                   (lambda (ax i)
+                     (let ((midx (Sub (Sub n 1) i)))
+                       (foldl
+                         (lambda (a pair)
+                           (Ifz (cairn:getax (_0 pair) a)
+                             (cairn:putax (_0 pair) midx a)
+                             a))
+                         ax
+                         (rowify (cairn:tapax
+                           (foil-subject:lzm-reachable (Ix midx ms)))))))
+                   cairn:empty-ax (gen n (lambda (i) i)))))
+          (foil-subject:set-sut-lazy [dispatch ms] mounted0)))))
   ;; The whole own layer is visible before any body elaborates: the sealed
   ;; fixpoint world.  elab-mod's prototype pass supplies the storage entries.
   (foldl
@@ -494,7 +613,18 @@
   (define pack
     (zspan "c-pack" (unit-import-pack name compiled keys imported)))
   (define row6 [name compiled keys imported lore pack])
-  (Weld row6 [(zspan "c-pin" (Seq (DeepSeq row6 0) (Pin row6)))]))
+  ;; index 7: the module's TypeWorld, lazily shared like the pack —
+  ;; OUTSIDE the pin and never DeepSeq'd at construction, so it costs
+  ;; nothing until an eval driver reads it (and then only once per
+  ;; row).
+  (Weld row6
+    [(zspan "c-pin" (Seq (DeepSeq row6 0) (Pin row6)))
+     (foil-new-elab:world-from-subject compiled)
+     ;; index 8: the SUBJECT's own pin, lazily shared — the lazy mount
+     ;; records carry this (content-addressed on the subject alone, so
+     ;; every compile path that produces the same subject produces the
+     ;; same mount record)
+     (Pin compiled)]))
 
 ;; The entry's durable fields as a pin; rows from older tooling pin
 ;; in place.  (Unpin (entry-pin e)) round-trips to a pack-bearing
@@ -503,6 +633,18 @@
   (If (Lt 6 (Sz e))
     (Ix 6 e)
     (Pin e)))
+
+;; The row's lazily shared TypeWorld; pre-world rows derive unfshared.
+(define (entry-world e)
+  (If (Gt (Sz e) 7)
+    (Ix 7 e)
+    (foil-new-elab:world-from-subject (_1 e))))
+
+;; The row's lazily shared subject pin; older rows pin in place.
+(define (entry-sut-pin e)
+  (If (Gt (Sz e) 8)
+    (Ix 8 e)
+    (Pin (_1 e))))
 
 ;; compile-rex-go-sub :: ByNameCompiler -> [Cord] -> Cache
 ;;                    -> [MarkedSubject Layer] -> [MarkedSubject Layer]
@@ -561,7 +703,7 @@
              (projected (pack-projected pack))
              (ri
                (make-resolved-import imp imped keys own layer exports mount
-                 unit-id projected pack)))
+                 unit-id projected pack (entry-sut-pin e))))
         [(_0 r) (snoc ri resolved) (Weld seen projected)])))
   (define resolved-state (foldl resolve-import [cache0 [] []] imps))
   (define resolved (_1 resolved-state))
@@ -574,9 +716,11 @@
     (zspan "c-env"
       (foil-env:build-environment-with-base substrate-layer mounts own-layer)))
   (define pre
-    (zspan "c-project"
-      (foil-subject:set-sut-unit environment
-        (project-mounts sut0 resolved mounts decls))))
+    ;; the write-log baseline: both module deltas measure from here
+    (foil-subject:reset-write-log
+      (zspan "c-project"
+        (foil-subject:set-sut-unit environment
+          (project-mounts sut0 resolved mounts decls)))))
   ;; Force the lore here so the cache entry carries plain data — an
   ;; unforced capture would pin the module's whole rex tree in every
   ;; long-lived cache.
@@ -612,7 +756,22 @@
       ;; rows but make resolve/replay forget those generated bindings.
       (foil-env:unit-with-environment draft-environment unit0)
       unit0))
-  (define compiled (foil-subject:set-sut-unit unit lowered))
+  ;; Normalize the visibility inverse at the durable boundary: the
+  ;; incremental index can carry history (a remapped alias leaves an
+  ;; empty row) that a wholesale rebuild never creates, and the pinned
+  ;; subject must be identical whether it came from a cold compile or
+  ;; an artifact restore.
+  (define compiled
+    ;; durable boundary: derived state stripped — the vis inverse and
+    ;; write log are rebuilt where they are consumed (doctest bundles
+    ;; rebuild the inverse once per eval storm; imports never read
+    ;; it), and the pinned form must not depend on construction
+    ;; history (an incremental ax's bst shape varies with insertion
+    ;; order, so stripping is also what keeps cold and artifact pins
+    ;; identical for free)
+    (foil-subject:reset-write-log
+      (foil-subject:set-sut-vis-inverse 0
+        (foil-subject:set-sut-unit unit lowered))))
   [(_0 resolved-state)
    (zspan "c-warn" (emit-subject-warnings compiled))
    (_2 resolved-state)
@@ -857,11 +1016,15 @@
              ;; Share the legacy row's import pack when present (the cold
              ;; compile below is seeded with the same rows, so the clone
              ;; work is paid once either way).
+             (rowhit (find (lambda (x) (Eq name (_0 x))) legacy1))
              (pack
-               (let ((le (find (lambda (x) (Eq name (_0 x))) legacy1)))
-                 (Ifz le
-                   (unit-import-pack name imped keys imported)
-                   (entry-pack (_0 le)))))
+               (Ifz rowhit
+                 (unit-import-pack name imped keys imported)
+                 (entry-pack (_0 rowhit))))
+             (row-pin
+               (Ifz rowhit
+                 (Pin imped)
+                 (entry-sut-pin (_0 rowhit))))
              (own (pack-own pack))
              (exports (pack-exports pack))
              (layer (pack-layer pack))
@@ -870,7 +1033,7 @@
              (projected (pack-projected pack))
              (ri
                (make-resolved-import imp imped keys own layer exports mount
-                 unit-id projected pack)))
+                 unit-id projected pack row-pin)))
         [cache1 (snoc ri resolved) (Weld seen projected)
          (snoc [imp art] direct) legacy1])))
   (define merged
@@ -885,9 +1048,14 @@
     (let* ((body (artifact-body art))
            (compiled0
              (foil-subject:set-sut-unit (artifact-unit body)
-               (foil-subject:set-sut-visible (artifact-visible body)
-                 (foil-subject:apply-entry-delta
-                   ["cached module" mod] (artifact-delta body) pre))))
+               ;; artifacts store only the vis ax; inverse and write
+               ;; log are derived state — stripped, same as the cold
+               ;; compile's durable boundary
+               (foil-subject:reset-write-log
+                 (foil-subject:set-sut-vis-inverse 0
+                   (foil-subject:set-sut-visible (artifact-visible body)
+                     (foil-subject:apply-entry-delta
+                       ["cached module" mod] (artifact-delta body) pre))))))
            (compiled (emit-subject-warnings compiled0))
            (imported (artifact-imported body))
            ;; Pinned artifacts carry no lore field yet — a warm hit

@@ -367,12 +367,34 @@
             (nt:declare-type world path scm brand arity 0)))))))
 
 (define (world-from-subject subject)
-  ;; Slot 0 of a subject is its entry ax (the same access get-const uses).
-  (foldl subject-type-declaration default-type-world
-    (rowify (cairn:tapax (Ix 0 subject)))))
+  ;; Slot 0 of a subject is its entry ax — under hybrid-lazy
+  ;; projection that is substrate + own + shadow entries only; each
+  ;; mount's TC_TYP rows ride its lazy mount record (shared per unit,
+  ;; verified key-equivalent to the eager trie walk).  Declaration
+  ;; order is precedence: the trie, then mounts newest-first
+  ;; (first declaration wins in subject-type-declaration).
+  (define base
+    (foldl subject-type-declaration default-type-world
+      (rowify (cairn:tapax (Ix 0 subject)))))
+  (define lz (foil-subject:sut-lazy subject))
+  (Ifz lz
+    base
+    (foldl
+      (lambda (w m)
+        (foldl subject-type-declaration w (foil-subject:lzm-world-rows m)))
+      base (rev (foil-subject:lz-mounts lz)))))
 
 (define (compiler-for subject)
   ($NewCompiler subject (world-from-subject subject) []))
+
+;; compiler-for-with :: TypeWorld -> Subject -> NewCompiler
+;;
+;; The world is a pure function of the subject; a caller evaluating
+;; many expressions against ONE subject builds it once (or reads the
+;; cache row's lazily shared copy) instead of re-deriving it per
+;; expression.
+(define (compiler-for-with world subject)
+  ($NewCompiler subject world []))
 
 
 ;;; Legacy builtin signature adapter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -548,20 +570,20 @@
 ;; spelling, so invert the subject's visibility projection — preferring
 ;; an alias whose own or parent path was already recorded (the alias the
 ;; receiver's type resolved through), otherwise the first written alias.
-(define (record-member-resolution compiler env member vis-pairs)
+;; writtens: the member's written aliases (the visibility inverse row
+;; for its canonical key) — already filtered, no index scan here.
+(define (record-member-resolution compiler env member writtens)
   (define subject (compiler-subject compiler))
-  (Ifz (Sz vis-pairs)
+  (Ifz (Sz writtens)
     compiler
     (let* ((root (sut-root subject))
            (sources
              (map
-               (lambda (pair)
-                 (let ((written (_0 pair)))
-                   (If (foil-env:path-prefix? root written)
-                     (drop (Sz root) written)
-                     written)))
-               (filter (lambda (pair) (Equal member (_1 pair)))
-                 vis-pairs)))
+               (lambda (written)
+                 (If (foil-env:path-prefix? root written)
+                   (drop (Sz root) written)
+                   written))
+               writtens))
            (prior (compiler-resolutions compiler))
            (preferred
              (find
@@ -1145,7 +1167,10 @@
   ;; call resolves; bare/legacy subjects keep inferring from storage.
   (define (mark-derived key sut)
     (If (sut-visible sut) (mark-visible key key sut) sut))
-  (define (go sut pair)
+  ;; one batched insert for the whole record's accessor set (three
+  ;; entries per field — the per-entry path paid an order snoc each),
+  ;; then the visibility marks, which are already incremental
+  (define (field-rows pair)
     (define idx (_0 pair))
     (define item (_1 pair))
     (define face (nt:row-item-face item))
@@ -1154,20 +1179,20 @@
     (define set-key (Weld path [(strWeld "set_" face)]))
     (define over-key (Weld path [(strWeld "over_" face)]))
     (If (Eq face idx)
-      sut
-      (pipe sut
-        (insert-tc get-key wack-span
-          (tc-ffi (qua (nt:tfun [self-ty] fty)) (Ix idx)))
-        (mark-derived get-key)
-        (insert-tc set-key wack-span
-          (tc-ffi (qua (nt:tfun [fty self-ty] self-ty)) (row-set-at idx)))
-        (mark-derived set-key)
-        (insert-tc over-key wack-span
-          (tc-ffi (qua (nt:tfun [(nt:tfun [fty] fty) self-ty] self-ty))
-            (row-over-at idx)))
-        (mark-derived over-key))))
-  (foldl go subject
-    (zip (gen (Sz (nt:row-items row)) (lambda (i) i)) (nt:row-items row))))
+      []
+      [[get-key wack-span (tc-ffi (qua (nt:tfun [self-ty] fty)) (Ix idx))]
+       [set-key wack-span
+        (tc-ffi (qua (nt:tfun [fty self-ty] self-ty)) (row-set-at idx))]
+       [over-key wack-span
+        (tc-ffi (qua (nt:tfun [(nt:tfun [fty] fty) self-ty] self-ty))
+          (row-over-at idx))]]))
+  (define rows
+    (foldl (lambda (acc pair) (Weld acc (field-rows pair)))
+      []
+      (zip (gen (Sz (nt:row-items row)) (lambda (i) i)) (nt:row-items row))))
+  (foldl (lambda (s r) (mark-derived (_0 r) s))
+    (insert-tcs rows subject)
+    rows))
 
 ;;; Core expression elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1712,22 +1737,37 @@
     ;; canonical prefix.  Only the written namespace unifies the prefix:
     ;; reverse-map the canonical base to its written aliases and resolve
     ;; the member through the visibility index.
-    ;; One shared inversion of the visibility index: written->canonical
-    ;; pairs, computed lazily (forced only by mounted-receiver probes)
-    ;; and scanned by the alias/extension/recording steps below instead
-    ;; of each re-walking the index.
+    ;; The visibility inverse (canonical -> written aliases) is
+    ;; maintained incrementally on the subject by mark-visible.  The
+    ;; per-call-site inversion this replaces enumerated the WHOLE
+    ;; visibility index per method segment — O(marks) each, the
+    ;; dominant cost of compiling code against a large import surface
+    ;; (a chat-sized module re-walked ~19k marks per `.method(...)`).
+    ;; A pre-inverse subject (hydrated old cache row) rebuilds once
+    ;; per resolution, which is exactly the old cost.
     (define vis (sut-visible subject))
-    (define vis-pairs (Ifz vis [] (rowify (cairn:tapax vis))))
+    (define inv0 (sut-vis-inverse subject))
+    (define inv
+      (If inv0
+        inv0
+        (Ifz vis
+          0
+          (foldl
+            (lambda (a pair)
+              (cairn:putax (_1 pair)
+                (snoc (_0 pair) (fall [] (cairn:getax (_1 pair) a)))
+                a))
+            cairn:empty-ax (rowify (cairn:tapax vis))))))
+    (define (aliases-of canonical)
+      (Ifz inv [] (fall [] (cairn:getax canonical inv))))
     (define (extension-member nominal)
-      (define (member-at pair)
-        (And (Equal nominal (_1 pair))
-          (let ((m (cairn:getax (Weld (_0 pair) [name]) vis)))
-            (And m (And (get-const (_0 m) subject) (_0 m))))))
-      (let ((hit (find member-at vis-pairs)))
-        (If hit (member-at (_0 hit)) 0)))
+      (define (try-written written)
+        (let ((m (cairn:getax (Weld written [name]) vis)))
+          (And m (And (get-const (_0 m) subject) (_0 m)))))
+      (let ((hit (find (lambda (w) (Truth (try-written w))) (aliases-of nominal))))
+        (If hit (try-written (_0 hit)) 0)))
     (define (visible-canonical? key)
-      (Truth
-        (find (lambda (pair) (Equal key (_1 pair))) vis-pairs)))
+      (Truth (Sz (aliases-of key))))
     (define (member-for nominal)
       (And nominal
         (let* ((raw (snoc name nominal))
@@ -1771,7 +1811,7 @@
       (cond
         (member
           (let ((gr (global-reference-canonical c env member)))
-            [(record-member-resolution (_0 gr) env member vis-pairs)
+            [(record-member-resolution (_0 gr) env member (aliases-of member))
              (_1 gr) t]))
         ((And (Lt depth 8)
            (Or (nt:type-ref? t) (nt:type-app? t)))
@@ -2549,11 +2589,21 @@
                (If (foil-env:path-prefix? root key)
                  (drop (Sz root) key)
                  key)))
+           ;; classify by an exact-bind probe first: a declared key has
+           ;; a bind and is never derived.  The covering-tomb prefix
+           ;; walk (the expensive half of resolve) only matters when
+           ;; the environment holds tombs at all — checked once, not
+           ;; once per written key (a generated module writes 8k).
+           (tombless (foil-env:environment-tombless? unit))
            (derived
              (filter
                (lambda (pair)
-                 (foil-env:res-unknown?
-                   (foil-env:resolve (local-path (_0 pair)) unit)))
+                 (let ((lp (local-path (_0 pair))))
+                   (Ifz (foil-env:environment-bind lp unit)
+                     (If tombless
+                       1
+                       (foil-env:res-unknown? (foil-env:resolve lp unit)))
+                     0)))
                (subject-entry-delta base-subject subject))))
       (Ifz (Sz derived)
         compiler

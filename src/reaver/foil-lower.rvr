@@ -426,7 +426,11 @@
   ;; Keep cache/linking projection bugs inside the compiler's structured
   ;; diagnostic vocabulary instead of leaking an unlocated `need-fail`.
   (define (materialize-entry phase key ax)
-    (define hit (getax key ax))
+    ;; the walk's accumulator first (own + fresh materializations),
+    ;; then the subject's lazy mounts — an imported generic base or
+    ;; instantiation is no longer materialized into the trie
+    (define hit0 (getax key ax))
+    (define hit (If hit0 hit0 (foil-subject:sut-find key sut)))
     (Ifz hit
       (error ["foil-materialize-missing-entry" ["phase" phase] ["path" key]])
       (unpin-soft (_0 hit))))
@@ -452,7 +456,10 @@
       ;; fresh TC would lower it a second time and duplicate its key
       ;; in the order.
       ((Ifz (getax key ax) 0 1)
-        [ax (putax key 1 done) order])
+        [ax (putax key 1 done) order (Ix 3 st)])
+      ;; an import already materialized it — behind the mount stack now
+      ((Ifz (foil-subject:sut-find key sut) 0 1)
+        [ax (putax key 1 done) order (Ix 3 st)])
       (else
         (let* ((base (ty-ap-base key))
                (bent (materialize-entry "generic-base" base ax))
@@ -463,19 +470,22 @@
                         (strcat ["foil.materialize.const." (print-path key)])
                         mtc0)
                       mtc0))
-               (st1 (foldl materialize [ax (putax key 1 done) order]
+               (st1 (foldl materialize [ax (putax key 1 done) order (Ix 3 st)]
                       (const-deps sut mtc))))
           [(putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
              (_0 st1))
            (_1 st1)
-           (snoc key (_2 st1))]))))
+           (snoc key (_2 st1))
+           ;; created keys bypass the logged writers; collect them so
+           ;; the seal below can join them to the subject's write log
+           (lcons key (Ix 3 st1))]))))
   (define (walk st key)
     (define ent (materialize-entry "subject-order" key (_0 st)))
     (define st1
       (If (Eq (Hd ent) "TC")
         (foldl materialize st (const-deps sut (tc-entry-contents ent)))
         st))
-    [(_0 st1) (_1 st1) (snoc key (_2 st1))])
+    [(_0 st1) (_1 st1) (snoc key (_2 st1)) (Ix 3 st1)])
   ;; done is a pure membership set (never read as a list) — an AX
   ;; One zone, on the fold that walks the whole subject-order.  Do NOT
   ;; add a second zone around the seal below: it forces `final`, so it
@@ -485,8 +495,12 @@
   ;; order accumulator is lazy, each one re-forces its predecessors.
   (define final
     (lspan "mc-walk"
-      (foldl walk [(_0 sut) empty-ax []] (subject-order sut))))
-  (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
+      (foldl walk [(_0 sut) empty-ax [] 0] (subject-order sut))))
+  (define sealed
+    (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
+  ;; join the created keys to the write log so the module delta (which
+  ;; filters the log instead of walking the order) still sees them
+  (lfoldl (lambda (s k) (foil-subject:log-write k s)) sealed (Ix 3 final)))
 
 (define (materialize-consts sut)
   (materialize-consts-go sut 0))
