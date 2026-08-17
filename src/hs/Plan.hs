@@ -599,6 +599,8 @@ op 66 ["Ix5", r]       = op 66 ["Ix", N 5, r]
 op 66 ["Ix6", r]       = op 66 ["Ix", N 6, r]
 op 66 ["Ix7", r]       = op 66 ["Ix", N 7, r]
 op 66 ["Save", x]      = unsafePerformIO (savePin x)
+op 66 ["PinHash", x]   = pinHashBytes x
+op 66 ["PinSave", x]   = unsafePerformIO (pinSaveArtifact x)
 op 66 ["Load", N 0]    = unsafePerformIO loadSnapshot
 op 66 ["Trace", x, y]  = trace (showVal x) y
 op 66 ["Nil", x]       = planNil x
@@ -803,3 +805,15 @@ savePinOnly (P hash subPins inner) = do
         mapM_ savePinOnly subPins
         writeFile pinPath (canonize subPins inner)
 savePinOnly _ = pure ()
+
+-- Canonical terminal bytes of a finalized content pin.  Provisional or
+-- foreign values refuse instead of silently degrading to route identity.
+pinHashBytes :: Val -> Val
+pinHashBytes (P hash _ _)
+    | BS.length hash == 32 = array (map (N . fromIntegral) (BS.unpack hash))
+    | otherwise = error "PinHash: provisional pin"
+pinHashBytes _ = error "PinHash: expected a pin"
+
+pinSaveArtifact :: Val -> IO Val
+pinSaveArtifact pin@(P _ _ _) = savePinOnly pin >> pure pin
+pinSaveArtifact x = error ("PinSave: expected a pin, got: " <> showVal x)

@@ -13,4 +13,6 @@ Foil is documented in
 [doc/foil-semantics.md](doc/foil-semantics.md), and the current implementation
 sharp edges are documented in [PAPERCUTS.md](PAPERCUTS.md).
 
+The proposed single-corpus projection and design-system direction is documented
+in the [Nenex-Authored Foundry Roadmap](doc/nenex-foundry-roadmap.md).
 

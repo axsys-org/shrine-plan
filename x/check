@@ -1,8 +1,9 @@
-# The parallel test gate over ONE shared build cache.
+# The bounded test gate over ONE shared build cache.
 #
 #   x/check          # full gate (includes helm-tests, the long pole)
 #   x/check --fast   # skip helm-tests
 #   x/check --fresh  # discard the cached template first
+#   x/check --parallel # opt into the old all-groups-at-once behavior
 #
 # The template snapshot stages boot + stdlib + the WHOLE compiled test
 # corpus (foil-stage compiles everything on disk and lands it in a
@@ -21,15 +22,18 @@
 
 set -e
 
-FAST=""; FRESH=""
+FAST=""; FRESH=""; PARALLEL=""
 for a in "$@"; do
   case "$a" in
     --fast) FAST=1 ;;
     --fresh) FRESH=1 ;;
+    --parallel) PARALLEL=1 ;;
   esac
 done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$ROOT/.check/tmp"
+export TMPDIR="$ROOT/.check/tmp"
 WISP="$(command -v wisp || echo "$ROOT/wisp")"
 if [ ! -x "$WISP" ]; then
   echo "x/check: no wisp on PATH and no $ROOT/wisp" >&2
@@ -38,7 +42,7 @@ fi
 DIR="$ROOT/.check"
 mkdir -p "$DIR"
 
-HASH="$(find "$ROOT/src" -type f \( -name '*.rvr' -o -name '*.foil' -o -name '*.plan' \) -print0 \
+HASH="$(find "$ROOT/src" -type f \( -name '*.rvr' -o -name '*.foil' -o -name '*.plan' -o -name '*.sd' \) -print0 \
   | xargs -0 shasum | sort | shasum | cut -c1-16)"
 TPL="$DIR/template-$HASH"
 
@@ -107,7 +111,18 @@ group () {
     if grep -aq 'ERROR' out.log \
        || grep -aq 'Assertion .* failed\|arena exhausted' out.log; then
       echo "FAIL" > verdict
-    else echo "ok" > verdict; fi ) &
+    else
+      echo "ok" > verdict
+      # Successful suites do not need to retain another multi-gigabyte
+      # snapshot or a giant compiler trace.  Keep a short diagnostic tail.
+      tail -n 40 out.log > passed.log
+      : > out.log
+      rm -rf snap
+    fi ) &
+  # Each Wisp process memory-maps its own shrine snapshot.  Serial is the
+  # safe default for developer machines; explicit --parallel retains the
+  # high-throughput, high-memory CI behavior.
+  if [ -z "$PARALLEL" ]; then wait; fi
 }
 
 group core foil-sast-tests foil-new-types-tests foil-new-elab-tests \
@@ -117,7 +132,17 @@ group core foil-sast-tests foil-new-types-tests foil-new-elab-tests \
 group exec foil-exec-tests foil-bst-tests
 group corpus foil-sept-tests foil-shrine-tests foil-weft-tests foil-tyshow-tests foil-json-tests foil-schemagen-tests foil-semidoc-tests
 group lain foil-lain-tests foil-life-tests foil-tmpl-tests
-group helmapp foil-helm-tests helm-http-tests
+group foundry foil-surface-tree-tests foil-foundry-tests \
+  foil-foundry-resolver-tests foil-foundry-zoo-tests \
+  foil-foundry-doc-tests foil-foundry-corpus-tests foil-foundry-delivery-tests \
+  foil-foundry-action-tests foil-foundry-interaction-tests \
+  foil-foundry-view-tests foil-foundry-pronounce-tests \
+  foil-foundry-terminal-tests foil-foundry-web-terminal-tests \
+  foil-foundry-text-terminal-tests \
+  foil-foundry-codegen-tests \
+  foil-foundry-lens-tests foil-foundry-wire-tests \
+  foil-foundry-chat-tests foil-life-foundry-tests
+group helmapp foil-helm-tests helm-http-tests helm-projection-frame-tests
 if [ -z "$FAST" ]; then
   group helmrt helm-tests
 fi

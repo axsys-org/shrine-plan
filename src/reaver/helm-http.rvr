@@ -83,6 +83,8 @@
     ((Eq status 200) "HTTP/1.0 200 OK")
     ((Eq status 400) "HTTP/1.0 400 Bad Request")
     ((Eq status 404) "HTTP/1.0 404 Not Found")
+    ((Eq status 501) "HTTP/1.0 501 Not Implemented")
+    ((Eq status 503) "HTTP/1.0 503 Service Unavailable")
     ((Eq status 500) "HTTP/1.0 500 Internal Server Error")
     (else (strcat ["HTTP/1.0 " (showNat status) " Status"]))))
 
@@ -155,6 +157,13 @@
 ;; never through closures), then read, parse, ask the worker, write
 ;; the response (with the sentinel byte — Write drops the top byte),
 ;; close.
+;;
+;; There is no sound disconnect cancellation at this layer today:
+;; Read is complete before the request is delegated, Recv has no
+;; timeout/select primitive, and the worker receives no monitor event
+;; if the remote peer disappears.  The projection admission bound
+;; below therefore caps abandoned capabilities; a one-shot wake still
+;; performs the only cleanup the runtime can currently prove.
 (define (conn-actor fd self)
   (define mc (Recv 0))
   (define wh (Seq (Ix 0 mc) (Ix 0 (Ix 1 mc))))
@@ -324,6 +333,50 @@
   (And (Eq "/watch" (Mod u (Lsh 1 48)))
     (Or (Eq 6 (Bytes u)) (Eq "/" (Load8 6 u)))))
 
+;; Generic projection routes carry one exact report path rather than
+;; reconstructing a single overlay application.  This admits nested
+;; /o chains for independently live SurfaceTree holes while retaining
+;; /frag and /watch as compatibility spellings.
+;;   /project/<len>/<report...>
+;;   /observe/<care>/<after>/<len>/<report...>
+(define (project-url? u)
+  (And (Eq "/project" (Mod u (Lsh 1 64)))
+    (Or (Eq 8 (Bytes u)) (Eq "/" (Load8 8 u)))))
+
+(define (observe-url? u)
+  (And (Eq "/observe" (Mod u (Lsh 1 64)))
+    (Or (Eq 8 (Bytes u)) (Eq "/" (Load8 8 u)))))
+
+;; A renderer-neutral frame batch produced by one exact derived report:
+;;   /projection-frame/<len>/<report...>
+;;
+;; The report must supply ['projection_frames] as JSON encoded by
+;; foundry_wire.  The HTTP worker never constructs a graph, derives identity,
+;; or falls back to rendering the report as HTML.
+(define (projection-frame-url? u)
+  (And (Eq "/projection-frame" (Mod u (Lsh 1 136)))
+    (Or (Eq 17 (Bytes u)) (Eq "/" (Load8 17 u)))))
+
+;; [u-length report...] -> report.  Empty reports are refused: a live
+;; projection mount names a result, never the namespace root.
+(define (report-spec parts)
+  (If (Lt (Sz parts) 2)
+    0
+    (let ((lq (Ix 0 parts)))
+      (If (Or (Nil (Eq "u" (Hd lq))) (Eq 0 (_0 lq)))
+        0
+        (If (Nil (Eq (Sz parts) (Inc (_0 lq))))
+          0
+          (drop 1 parts))))))
+
+(define (project-report-spec u)
+  (define parsed (url-target (Rsh u 64)))
+  (Ifz parsed 0 (report-spec (_0 parsed))))
+
+(define (projection-frame-report-spec u)
+  (define parsed (url-target (Rsh u 136)))
+  (Ifz parsed 0 (report-spec (_0 parsed))))
+
 ;; A validated fragment payload -> [derived-/o-path data-path].
 ;; payload = case, op-length, op..., data-length, data...
 (define (frag-spec parts)
@@ -370,6 +423,30 @@
                 0
                 [("/boot/dep" care (_0 fs)) (_0 afterq) (_0 fs)]))))))))
 
+;; A generic observe URL -> [dep after report].  The exact report is
+;; preserved; in particular, nested /o payload lengths are not parsed
+;; or flattened by the HTTP adapter.
+(define (observe-report-spec u)
+  (define parsed (url-target (Rsh u 64)))
+  (Ifz parsed
+    0
+    (let ((parts (_0 parsed)))
+      (If (Lt (Sz parts) 4)
+        0
+        (let ((careq (Ix 0 parts)) (afterq (Ix 1 parts)))
+          (If (Or (Nil (Eq "ts" (Hd careq))) (Nil (Eq "u" (Hd afterq))))
+            0
+            (let ((care
+                    (cond
+                      ((Eq "x" (_0 careq)) "/boot/care/x")
+                      ((Eq "y" (_0 careq)) "/boot/care/y")
+                      ((Eq "z" (_0 careq)) "/boot/care/z")
+                      (else 0)))
+                  (report (report-spec (drop 2 parts))))
+              (If (Or (Ifz care 1 0) (Ifz report 1 0))
+                0
+                [("/boot/dep" care report) (_0 afterq) report]))))))))
+
 ;; The poke myth for a form body: each field k=v except "back"
 ;; becomes a text pail at slot ['post <k>].
 (define (post-myth hs body)
@@ -409,6 +486,68 @@
         (And (Equal tag (_2 e)) (Equal pax (_0 e))))))
     pending))
 
+;; A delayed wake for one report must not consume a later observation
+;; that has already armed at the case being delivered.  Watch entries
+;; carry their `after` token in slot 3; only older tokens are answered
+;; and retired by this wake.
+(define (pend-watch-hit? e report now)
+  (And (Gt (Sz e) 3)
+    (And (Equal "watch" (_2 e))
+      (And (Equal report (_0 e)) (Ne now (_3 e))))))
+
+(define (pend-watch-hits pending report now)
+  (filter (lambda (e) (pend-watch-hit? e report now)) pending))
+
+(define (pend-drop-watch-hits pending report now)
+  (filter (lambda (e) (Nil (pend-watch-hit? e report now))) pending))
+
+;; Projection traffic is deliberately ephemeral, but its connection
+;; capabilities still occupy this worker's heap while a coordinator
+;; read or cared observation is outstanding.  Bound short project reads
+;; and long observe waits independently: abandoned long polls must never
+;; starve the read that paints a newly opened surface.  Ordinary namespace
+;; request nodes retain their existing causal lifecycle.
+;;
+;; This is a worker-local admission limit, not source authority and
+;; not a namespace projection object.  A request is refused BEFORE a
+;; coordinator project/observe message is sent, so overflow cannot
+;; leave an orphan Helm eye behind.
+(define projection-pending-limit 32)
+(define projection-project-pending-limit 32)
+
+(define (projection-pending? e)
+  (And (Gt (Sz e) 2)
+    (Or (Equal "frag" (_2 e))
+      (Or (Equal "frame" (_2 e)) (Equal "watch" (_2 e))))))
+
+(define (projection-pending-count pending)
+  (Sz (filter projection-pending? pending)))
+
+(define (projection-tag-count pending tag)
+  (Sz (filter (lambda (e)
+                (And (Gt (Sz e) 2) (Equal tag (_2 e))))
+        pending)))
+
+(define (projection-watch-room? pending)
+  (Lt (projection-tag-count pending "watch") projection-pending-limit))
+
+(define (projection-project-room? pending)
+  (Lt (Add (projection-tag-count pending "frag")
+        (projection-tag-count pending "frame"))
+    projection-project-pending-limit))
+
+;; A stable machine-readable refusal for the renderer-specific HTTP
+;; adapter.  The coordinator protocol remains the generic
+;; project/observe pair; /frag and /watch are compatibility routes.
+(define (projection-refusal status code operation retryable)
+  ["res" status
+   (strcat
+     ["{" 34 "error" 34 ":" 34 code 34 ","
+      34 "operation" 34 ":" 34 operation 34 ","
+      34 "retryable" 34 ":" (If retryable "true" "false") ","
+      34 "limit" 34 ":" (showNat projection-pending-limit) "}"])
+   "application/problem+json; charset=utf-8"])
+
 ;; A known record's myth, or 0 — the shared prologue of every
 ;; response reader.
 (define (known-myth resrec)
@@ -421,6 +560,19 @@
     [404 "no fragment at this path" "text/html; charset=utf-8"]
     (let ((r ((h-frag hs) m)))
       [(_0 r) (_1 r) "text/html; charset=utf-8"])))
+
+;; A direct report's already-encoded semantic frame batch.  Missing producer
+;; output is an explicit refusal rather than a fake one-node packet or a
+;; terminal-fragment fallback.
+(define (projection-frame-res-of hs resrec)
+  (define m (known-myth resrec))
+  (Ifz m
+    (projection-refusal 404 "projection_report_missing" "frame" 0)
+    (let ((frames ((h-txt hs) [("ts" "projection_frames")] m)))
+      (Ifz frames
+        (projection-refusal 501 "projection_producer_unavailable" "frame" 0)
+        [200 frames
+         "application/vnd.shrine.projection-frames+json; charset=utf-8"]))))
 
 ;; The record's response, if the serving behavior wrote it yet:
 ;; [status body ctype].
@@ -479,7 +631,8 @@
     [("ts" "io") name ("ts" (strcat ["r" (showNat i)]))])
   ;; state: serial; pending contains request-node [pax conn-cap], pure
   ;; fragment [report conn-cap "frag"], and observation
-  ;; [report conn-cap "watch"] entries; queue correlates command acks.
+  ;; [report conn-cap "watch" after] entries; queue correlates command
+  ;; acks.
   (define (loop serial pending queue)
     (define m (Recv 0))
     (define msg (Ix 0 m))
@@ -503,7 +656,7 @@
     ;; response, retire the pending entry (the cull ack's own drop is
     ;; then a no-op)
     (define (answer hit pax r serial2 pending2 queue2)
-      (Seq (helm:send! coord ["cmd" name ((h-cull hs) pax)])
+      (Seq (helm:send! coord ["cmd-ephemeral" name ((h-cull hs) pax)])
         (Seq (helm:send! (_1 (_0 hit)) ["res" (_0 r) (_1 r) (_2 r)])
           (loop serial2 (pend-drop pending2 pax) (snoc [pax "cull"] queue2)))))
     ;; not ready: re-spy AND re-read — the next write may have
@@ -577,39 +730,82 @@
               (task ((h-poke hs) (_0 target) (post-myth hs body))))
           (Seq (helm:send! coord ["cmd" name task])
             (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
-    ;; The fragment endpoint: query the hydrated /o record directly
-    ;; and render it through web's pure frag/render boundary.  GET is
-    ;; consequently read-only even for stale clients that still fetch
-    ;; on an interval.
-    (define (frag! z)
+    ;; Generic project, pronounced by the compatibility /frag route:
+    ;; query the hydrated /o record directly and render it through
+    ;; web's pure frag/render boundary.  GET is consequently read-only
+    ;; even for stale clients that still fetch on an interval.
+    (define (project! z)
       (define url (_2 msg))
-      (define parsed (url-target (Rsh url 40)))
-      (define spec (Ifz parsed 0 (frag-spec (_0 parsed))))
+      (define spec
+        (If (Equal "GET" (_1 msg))
+          (If (project-url? url)
+            (let ((report (project-report-spec url)))
+              (Ifz report 0 [report []]))
+            (let ((parsed (url-target (Rsh url 40))))
+              (Ifz parsed 0 (frag-spec (_0 parsed)))))
+          0))
       (If (Ifz spec 1 0)
         (Seq (helm:send! (Ix 0 caps)
-               ["res" 404 "unparseable fragment path" "text/plain; charset=utf-8"])
+               (projection-refusal 400 "malformed_projection_request" "project" 0))
           (loop serial pending queue))
-        (let ((target (_0 spec)))
-          (let ((rm ["project" target]))
+        (If (Nil (projection-project-room? pending))
+          (Seq (helm:send! (Ix 0 caps)
+                 (projection-refusal 503 "projection_capacity" "project" 1))
+            (loop serial pending queue))
+          (let ((target (_0 spec)))
+            (let ((rm ["project" target]))
+              (Seq (DeepSeq rm rm)
+                (Seq (SendCaps coord rm [0])
+                  (loop serial
+                    (snoc [target (Ix 0 caps) "frag"] pending)
+                    queue))))))))
+    ;; Renderer-neutral frame delivery.  This follows the same direct-query
+    ;; path as project!, but it accepts only an exact producer report and
+    ;; answers only that report's foundry_wire JSON slot.
+    (define (projection-frame! z)
+      (define report
+        (If (Equal "GET" (_1 msg))
+          (projection-frame-report-spec (_2 msg))
+          0))
+      (If (Ifz report 1 0)
+        (Seq (helm:send! (Ix 0 caps)
+               (projection-refusal
+                 400 "malformed_projection_request" "frame" 0))
+          (loop serial pending queue))
+        (If (Nil (projection-project-room? pending))
+          (Seq (helm:send! (Ix 0 caps)
+                 (projection-refusal 503 "projection_capacity" "frame" 1))
+            (loop serial pending queue))
+          (let ((rm ["project" report]))
             (Seq (DeepSeq rm rm)
               (Seq (SendCaps coord rm [0])
                 (loop serial
-                  (snoc [target (Ix 0 caps) "frag"] pending)
+                  (snoc [report (Ix 0 caps) "frame"] pending)
                   queue)))))))
-    ;; A projection watch never enters the namespace.  The coordinator
-    ;; atomically compares the caller's case and arms a cared one-shot
-    ;; observation only when the projection is still unchanged.
-    (define (watch! z)
-      (define spec (watch-spec (_2 msg)))
+    ;; Generic observe, pronounced by the compatibility /watch route.
+    ;; It never enters the namespace.  The coordinator atomically
+    ;; compares the caller's case and arms a cared one-shot observation
+    ;; only when the projection is still unchanged.
+    (define (observe! z)
+      (define spec
+        (If (Equal "GET" (_1 msg))
+          (If (observe-url? (_2 msg))
+            (observe-report-spec (_2 msg))
+            (watch-spec (_2 msg)))
+          0))
       (If (Ifz spec 1 0)
         (Seq (helm:send! (Ix 0 caps)
-               ["res" 404 "unparseable watch path" "text/plain; charset=utf-8"])
+               (projection-refusal 400 "malformed_projection_request" "observe" 0))
           (loop serial pending queue))
-        (let ((dep (_0 spec)) (after (_1 spec)) (report (_2 spec)))
-          (Seq (helm:send! coord ["observe" name dep report after])
-            (loop serial
-              (snoc [report (Ix 0 caps) "watch"] pending)
-              queue)))))
+        (If (Nil (projection-watch-room? pending))
+          (Seq (helm:send! (Ix 0 caps)
+                 (projection-refusal 503 "projection_capacity" "observe" 1))
+            (loop serial pending queue))
+          (let ((dep (_0 spec)) (after (_1 spec)) (report (_2 spec)))
+            (Seq (helm:send! coord ["observe" name dep report after])
+              (loop serial
+                (snoc [report (Ix 0 caps) "watch" after] pending)
+                queue))))))
     (cond
       ((And (Eq kind "req")
          (And (h-wjs? hs) (Eq "/w.js" (_2 msg))))
@@ -618,11 +814,15 @@
                ["res" 200 (h-wjs hs) "application/javascript"])
           (loop serial pending queue)))
       ((And (Eq kind "req")
-         (And (h-frag? hs) (frag-url? (_2 msg))))
-        (frag! 0))
+         (And (h-frag? hs)
+           (Or (frag-url? (_2 msg)) (project-url? (_2 msg)))))
+        (project! 0))
       ((And (Eq kind "req")
-         (And (h-frag? hs) (watch-url? (_2 msg))))
-        (watch! 0))
+         (And (h-frag? hs)
+           (Or (watch-url? (_2 msg)) (observe-url? (_2 msg)))))
+        (observe! 0))
+      ((And (Eq kind "req") (projection-frame-url? (_2 msg)))
+        (projection-frame! 0))
       ((And (Eq kind "req")
          (And (h-post? hs) (post-url? (_2 msg))))
         (post! 0))
@@ -654,11 +854,20 @@
             (Seq (helm:send! (Ix 0 caps)
                    ["res" 404 "unknown chore verb" "text/plain; charset=utf-8"])
               (loop serial pending queue))
-            (let ((task ((h-make hs) pax record)))
+            (let ((task ((h-make hs) pax record))
+                  ;; A GET request occurrence is replaceable host
+                  ;; scaffolding.  It still runs the normal behavior
+                  ;; and reactive cycle, but need not enter /log or
+                  ;; the resume snapshot.  Chores and non-GET
+                  ;; requests stay durable.
+                  (cmd-kind
+                    (If (And (Nil chore?) (Equal "GET" (_1 msg)))
+                      "cmd-ephemeral"
+                      "cmd")))
               ;; spy before cmd: worker->coordinator sends are FIFO,
               ;; so the watch is armed before the request node exists
               (Seq (helm:send! coord ["spy" name pax])
-                (Seq (helm:send! coord ["cmd" name task])
+                (Seq (helm:send! coord [cmd-kind name task])
                   (loop (Inc serial)
                     (snoc [pax (Ix 0 caps)] pending)
                     (snoc [pax "make"] queue)))))))))
@@ -679,41 +888,53 @@
                 (answer hit pax r serial pending queue))))))
       ((Eq kind "qres")
         ;; A read-only fragment query broadcasts one render to every
-        ;; matching connection.  Otherwise this is the committed
-        ;; re-read of a pending chore node.
+        ;; matching connection.  A frame query broadcasts only the producer's
+        ;; renderer-neutral JSON slot.  Otherwise this is the committed re-read
+        ;; of a pending chore node.
         (let ((pax (_1 msg))
-              (frags (pend-hits pending (_1 msg) "frag")))
-          (If (Gt (Sz frags) 0)
-            (let ((r (frag-res-of hs (_2 msg))))
-              (Seq (DeepSeq
-                     (map (lambda (e)
-                            (helm:send! (_1 e)
-                              ["res" (_0 r) (_1 r) (_2 r)]))
-                       frags)
-                     0)
-                (loop serial (pend-drop-tag pending pax "frag") queue)))
-            (let ((hit (pend-get pending pax)))
-              (Ifz hit
-                (loop serial pending queue)
-                (let ((r (If (h-bridge? hs) (chore-res-of hs (_2 msg)) 0)))
-                  (Ifz r
-                    (loop serial pending queue)
-                    (answer hit pax r serial pending queue))))))))
+              (frags (pend-hits pending (_1 msg) "frag"))
+              (frames (pend-hits pending (_1 msg) "frame")))
+          (cond
+            ((Or (Gt (Sz frags) 0) (Gt (Sz frames) 0))
+              (let ((fr (frag-res-of hs (_2 msg)))
+                    (wr (projection-frame-res-of hs (_2 msg))))
+                (Seq (DeepSeq
+                       [(map (lambda (e)
+                               (helm:send! (_1 e)
+                                 ["res" (_0 fr) (_1 fr) (_2 fr)]))
+                          frags)
+                        (map (lambda (e)
+                               (helm:send! (_1 e)
+                                 ["res" (_0 wr) (_1 wr) (_2 wr)]))
+                          frames)]
+                       0)
+                  (loop serial
+                    (pend-drop-tag
+                      (pend-drop-tag pending pax "frag") pax "frame")
+                    queue))))
+            (else
+              (let ((hit (pend-get pending pax)))
+                (Ifz hit
+                  (loop serial pending queue)
+                  (let ((r (If (h-bridge? hs) (chore-res-of hs (_2 msg)) 0)))
+                    (Ifz r
+                      (loop serial pending queue)
+                      (answer hit pax r serial pending queue)))))))))
       ((Eq kind "observed")
         ;; One Helm wake fans out to every tab waiting on the same
         ;; projection.  All entries retire together; each reply's case
         ;; is the token the browser uses when it re-arms.
         (let* ((report (_1 msg))
-               (hits (pend-hits pending report "watch"))
                (c (_2 msg))
-               (now (If (Eq "/boot/maybe/some" (Hd c)) (_0 c) 0)))
+               (now (If (Eq "/boot/maybe/some" (Hd c)) (_0 c) 0))
+               (hits (pend-watch-hits pending report now)))
           (Seq (DeepSeq
                  (map (lambda (e)
                         (helm:send! (_1 e)
                           ["res" 200 (showNat now) "text/plain; charset=utf-8"]))
                    hits)
                  0)
-            (loop serial (pend-drop-tag pending report "watch") queue))))
+            (loop serial (pend-drop-watch-hits pending report now) queue))))
       ((Eq kind "ack")
         ;; acks return in cmd order: pop the queue head
         (let ((head (Ix 0 queue))

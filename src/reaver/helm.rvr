@@ -43,7 +43,9 @@
 ;;;   ["case" path]       replies ["cres" path maybe[nat]] — the
 ;;;                       node's current version
 ;;;   ["observe" name dep report after] atomically compares report's
-;;;                       case, or arms one cared observation
+;;;                       case, or arms one cared observation.  Host
+;;;                       workers admit/bound waiter capabilities
+;;;                       before sending this message.
 ;;;   ["crew" ]           replies the roster's names
 ;;;   ["handle" name]     replies ["handle"] with the worker handle as
 ;;;                       a capability (or ["nohandle"])
@@ -63,7 +65,8 @@
 ;; the shell needs plus the compiled subject (so callers can pull
 ;; their own app entries from the SAME compilation — one chain walk)
 ;; and the per-module compile cache (so the /boot mirror knows which
-;; file declared which entry): ["HELM" boot exec x-query spy sut cache].
+;; file declared which entry):
+;; ["HELM" boot exec x-query spy sut cache exec-ephemeral].
 ;; Pack a compile result [cache sut] as the core row.  The query slot
 ;; is /h-aware: the coordinator's query/read verbs serve the temporal
 ;; overlay as well as live paths.
@@ -71,7 +74,7 @@
   (define sut (_1 r))
   (define (ent path) (foil:source-entry-val path sut))
   ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["x_query_h"])
-   (ent ["helm" "spy"]) sut (_0 r)])
+   (ent ["helm" "spy"]) sut (_0 r) (ent ["helm" "exec_ephemeral"])])
 
 (define (load-helm-mod mod)
   (helm-pack (foil:compile-mod-cached 0 foil:default-subject mod)))
@@ -87,6 +90,7 @@
 (define (core-spy c) (Ix 4 c))
 (define (core-sut c) (Ix 5 c))
 (define (core-cache c) (Ix 6 c))
+(define (core-exec-ephemeral c) (Ix 7 c))
 
 ;; An app entry from the core's own compilation.
 (define (core-ent core path)
@@ -651,6 +655,41 @@
   (define r (ReadFolder "foil/apps"))
   (Ifz r [] (map (Ix 1) (filter (lambda (e) (Eq 1 (Ix 0 e))) r))))
 
+;; Foundry authoring is ordinary Semidoc on disk, compiled by typed Foil and
+;; mounted as inert records below each document's declared /foundry/name.
+;; Recursive discovery is mechanical: the host never interprets recipe,
+;; surface, layer, or catalog fields.
+(define (foundry-doc-files root)
+  (define listing (ReadFolder root))
+  (Ifz listing []
+    (foldl
+      (lambda (acc e)
+        (let ((folder? (Ix 0 e)) (name (Ix 1 e)))
+          (If folder?
+            (Weld acc (foundry-doc-files (strcat [root "/" name])))
+            (If (Equal "sd" (foil:get-extension name))
+              (snoc (strcat [root "/" name]) acc)
+              acc))))
+      [] listing)))
+
+(define (foundry-doc-tasks core)
+  (define compile-records (core-ent core ["foundry_doc" "compile_mount_records"]))
+  (define vine-make (core-ent core ["vine_make"]))
+  (foldl
+    (lambda (acc file)
+      (let ((r (Try (lambda (z) (compile-records (read-text-file file))) 0)))
+        (If (Eq 1 (Hd r))
+          (Seq (Trace ["foundry-doc-failed" file (_0 r)] 0) acc)
+          (let ((got (_0 r)))
+            (If (Eq "/boot/maybe/some" (Hd got))
+              (Weld acc
+                (map (lambda (e) (vine-make (Ix 0 e) (Ix 1 e))) (_0 got)))
+              (Seq (Trace ["foundry-doc-refused" file] 0) acc))))))
+    [] (foundry-doc-files "foil/foundry")))
+
+(define (seed-foundry-docs core sov)
+  (seed-tasks core sov (foundry-doc-tasks core)))
+
 ;; Compile one app module against the shared core cache and pull its
 ;; manifest.  The whole step runs under Try — one bad app never costs
 ;; the boot.  mani-ok is the core's own brand gate (brands are shared
@@ -897,14 +936,15 @@
   ;; in the apply-duties fold.  A crash between the two resumes with
   ;; the event durable and the worker simply never acked; workers are
   ;; ephemeral, so nothing is owed to them across a restart.
-  (define (turn src task)
+  (define (turn src task durable?)
     ;; the exec rides a Try: a poisoned task (ill-typed writ payload,
     ;; malformed task row) must not kill the coordinator — the state
     ;; stands, and a named sender gets the failure as its ack instead
     ;; of a system-wide deadlock
     (define rr
       (Try (lambda (z)
-             (let ((r ((core-exec core) src task hm)))
+             (let ((r ((If durable? (core-exec core) (core-exec-ephemeral core))
+                        src task hm)))
                (Seq (DeepSeq r r) r)))
         0))
     (If (Eq 1 (Hd rr))
@@ -925,20 +965,27 @@
         (Seq (If (Eq "/boot/maybe/some" (Hd spill))
                (Trace ["helm: cascade round failed" (_0 spill)] 0)
                0)
-          (Seq (persist hm2)
+          (Seq (If durable? (persist hm2) 0)
             (let ((roster2 (apply-duties mk-worker roster (_1 r))))
               (let ((st2 [hm2 roster2]))
                 (Seq (DeepSeq st2 st2) [st2 (Ix 2 r)]))))))))
   (cond
     ((Eq kind "cmd")
-      (let ((tr (turn ("/boot/maybe/some" (_1 msg)) (_2 msg))))
+      (let ((tr (turn ("/boot/maybe/some" (_1 msg)) (_2 msg) 1)))
+        (Seq tr
+          (helm-loop core mk-worker persist (_0 tr)))))
+    ((Eq kind "cmd-ephemeral")
+      ;; Named host-only scaffolding: execute and ack like cmd, but
+      ;; neither journal nor snapshot it.  The HTTP worker uses this
+      ;; only for GET request occurrences and request-node cleanup.
+      (let ((tr (turn ("/boot/maybe/some" (_1 msg)) (_2 msg) 0)))
         (Seq tr
           (helm-loop core mk-worker persist (_0 tr)))))
     ((Eq kind "task")
       ;; the reply carries the event's verdict: ["done"] on commit,
       ;; ["fail" err] on rejection — an anonymous task's failure used
       ;; to vanish (the ack duty only exists for named senders)
-      (let* ((tr (turn "/boot/maybe/none" (_1 msg)))
+      (let* ((tr (turn "/boot/maybe/none" (_1 msg) 1))
              (rsvp (_1 tr))
              (reply (If (Eq "/boot/rsvp/no" (Hd rsvp))
                       ["fail" (_0 rsvp)]
@@ -962,7 +1009,9 @@
       ;; ["observe" name dep report after] — compare and arm in one
       ;; coordinator turn, closing the read-then-subscribe race.  The
       ;; observation mutates only the helm's ephemeral eyes: no event,
-      ;; snapshot, or namespace occurrence is created.
+      ;; snapshot, or namespace occurrence is created.  Repeated
+      ;; observations may represent N host waiters but deduplicate to
+      ;; one physical Helm eye; waiter admission remains host-local.
       (let* ((s (_0 hm))
              (cur ((core-ent core ["x_case_h"]) 0 (Ix 3 msg) s))
              (now (If (Eq "/boot/maybe/some" (Hd cur)) (_0 cur) 0)))

@@ -21,7 +21,9 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = enki.packages.${system}.default.overrideAttrs (old: {
+            patches = (old.patches or []) ++ [ ./nix/enki-pinhash.patch ];
+          });
 
 
           hsPkgs = pkgs.haskellPackages.override {
@@ -53,7 +55,9 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = enki.packages.${system}.default.overrideAttrs (old: {
+            patches = (old.patches or []) ++ [ ./nix/enki-pinhash.patch ];
+          });
           runReaverTest = module: pkgs.runCommand "reaver-${module}" {
             nativeBuildInputs = [ enkiPkg ];
           } ''
