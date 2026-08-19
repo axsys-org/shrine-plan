@@ -1,0 +1,744 @@
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;;;; grove: the namespace-spec DSL -> shrine_types soma/lash values,
+;;;; compiled with no source text at all (the schemagen seam).  Grove
+;;;; source is ordinary rex; the reader walks the parsed tree, resolves
+;;;; roles host-side, and emits a NORMALIZED foil module tree
+;;;; (Leaf/Nest/Juxt, inert zero spans) declaring one lash constant per
+;;;; role and a `spec` soma constant, straight into foil:compile-rex.
+;;;;
+;;;; Surface (see doc/grove.md):
+;;;;   =  name role..        role definition (a named lash)
+;;;;   +  seg role.. "lede"  literal arm (word or quip segment)
+;;;;   *  aura role.. "lede" variable arm (one per node)
+;;;;   !  slot ty.. | ..     one CNF need group; each clause is a slot
+;;;;                         plus write-curb types (union)
+;;;;   ?  slot ty.. | ..     curbs only, no presence demand
+;;;;   @  path..             kook refs on this node (behavior; ./-
+;;;;                         relative paths rebase at mount)
+;;;;   &  path care [req]    top level only: one yoke dep (a fief);
+;;;;                         care x/y/z (default x), `req` marks it
+;;;;                         required
+;;;;   &  fetch | serve N    top level only: one driver grant the
+;;;;                         mani ASKS for (the host decides);
+;;;;                         `fetch`/`serve` are reserved & heads
+;;;;   :  slot value         one seed slot on this node's record:
+;;;;                         "cord" -> pails/t, digits -> pails/n,
+;;;;                         path (./-relative ok) -> pails/p.
+;;;;                         Concrete-path nodes only (never under a
+;;;;                         var arm).
+;;;;   '  text               help prose; a cord child is the lede
+;;;;
+;;;; Slots are words ([slot]) or /-paths; bare type words default to
+;;;; boot/pails/<w>.  Roles meld in order of appearance (curbs union
+;;;; per slot, need groups conjoin, later lede/help win).
+;;;;
+;;;; The compiled `spec` is a YOKE (self lash, kid arms, deps).  A
+;;;; source with no @/& lines emits a light module (sept +
+;;;; shrine_types only); any kook or dep adds the app layer: `tpl` (a
+;;;; semidoc template source with the kook refs and docs, the
+;;;; tmpl/render shape) and `app` (tmpl/mani of tpl), on the full
+;;;; pact/semidoc/tmpl import stack.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind rex (#module rex))
+
+(#bind quip (#module quip))
+
+(#bind foil-rex (#module foil-rex))
+(#import foil-rex)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil (#module foil))
+
+(define (gv-error why what) (error ["grove" why what]))
+
+;;; Row utilities ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (gv-take-go n xs i acc)
+  (If (Ge i n) acc (gv-take-go n xs (Add i 1) (snoc (Ix i xs) acc))))
+(define (gv-take n xs) (gv-take-go n xs 0 []))
+
+(define (gv-has? x xs)
+  (Truth (find (lambda (y) (Equal x y)) xs)))
+
+;;; Reader: rex tree -> IR ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; lash IR: [curbs need lede help]
+;;;   curbs: row of [slot-path type-paths]  (write side; insertion order)
+;;;   need:  row of groups; group = row of slot-paths
+;;;   lede/help: 0 or cord
+;;; node IR: [lash-ir-or-0 arms kooks vals]
+;;;   arm:  ["lit" quip-str sub-node] | ["var" aura-tag sub-node]
+;;;   kook: [rel segs]  (rel=1 for ./-headed refs)
+;;;   val:  [slot-path ["t" cord] | ["n" natword] | ["p" [rel segs]]]
+;;; dep IR: [[rel segs] care req]  (care "x"/"y"/"z")
+
+(define gv-lash-empty [[] [] 0 0])
+
+(define (gv-lash-empty? l)
+  (And (Eq 0 (Sz (Ix 0 l)))
+    (And (Eq 0 (Sz (Ix 1 l)))
+      (And (Eq 0 (Ix 2 l)) (Eq 0 (Ix 3 l))))))
+
+(define gv-auras
+  ["dm" "dr" "ds" "f" "r" "rd" "rs" "s" "ta" "ts" "tu" "u" "w" "x"])
+
+(define (gv-word? t)
+  (And (rx-leaf? t) (Eq "word" (rx-leaf-shape t))))
+(define (gv-quip? t)
+  (And (rx-leaf? t) (Eq "quip" (rx-leaf-shape t))))
+(define (gv-cord? t)
+  (And (rx-leaf? t) (Eq "cord" (rx-leaf-shape t))))
+(define (gv-slug? t)
+  (And (rx-leaf? t) (Eq "slug" (rx-leaf-shape t))))
+(define (gv-rune? r t)
+  (And (rx-nest? t) (Eq r (rx-nest-rune t))))
+
+(define (gv-word! ctx t)
+  (Ifz (gv-word? t) (gv-error "expected-word" ctx) (rx-leaf-str t)))
+
+;; A slot spelling: bare word -> one-segment path, a/b/c -> segments.
+(define (gv-slot-path t)
+  (cond
+    ((gv-word? t) [(rx-leaf-str t)])
+    ((gv-rune? "/" t) (map (lambda (k) (gv-word! "slot-segment" k))
+                        (rx-nest-kids t)))
+    (else (gv-error "bad-slot" t))))
+
+;; A type spelling: bare word -> boot/pails/<w>, a/b/c -> as written.
+(define (gv-type-path t)
+  (cond
+    ((gv-word? t) ["boot" "pails" (rx-leaf-str t)])
+    ((gv-rune? "/" t) (map (lambda (k) (gv-word! "type-segment" k))
+                        (rx-nest-kids t)))
+    (else (gv-error "bad-type" t))))
+
+;; A reference spelling for kooks/deps: a word or /-path, absolute,
+;; or ./-headed for mount-relative.  ./a/b parses as a "/" nest whose
+;; first kid is the "./" nest.  -> [rel segs]
+(define (gv-ref-path t)
+  (cond
+    ((gv-word? t) [0 [(rx-leaf-str t)]])
+    ((gv-rune? "./" t)
+      [1 (map (lambda (k) (gv-word! "ref-segment" k)) (rx-nest-kids t))])
+    ((gv-rune? "/" t)
+      (let ((ks (rx-nest-kids t)))
+        (If (gv-rune? "./" (Ix 0 ks))
+          [1 (Weld (map (lambda (k) (gv-word! "ref-segment" k))
+                     (rx-nest-kids (Ix 0 ks)))
+               (map (lambda (k) (gv-word! "ref-segment" k))
+                 (gv-take-go (Sz ks) ks 1 [])))]
+          [0 (map (lambda (k) (gv-word! "ref-segment" k)) ks)])))
+    (else (gv-error "bad-ref" t))))
+
+(define (gv-digit? b) (And (Ge b 48) (Le b 57)))
+(define (gv-digits? w)
+  (define bs (trip w))
+  (And (Sz bs) (all gv-digit? bs)))
+
+;; A : line's value token.
+(define (gv-val t)
+  (cond
+    ((gv-cord? t) ["t" (rx-leaf-str t)])
+    ((And (gv-word? t) (gv-digits? (rx-leaf-str t))) ["n" (rx-leaf-str t)])
+    (else ["p" (gv-ref-path t)])))
+
+;; A lit-arm segment as its foil quip-literal spelling.  Words and
+;; codec-shaped quip contents (symbols, numerics, $/%/@-sigiled) pass
+;; through verbatim; anything else (e.g. 'todo-list) gets the ta
+;; sugar: '$<content>.
+(define (gv-codec-head? b)
+  (Or (Eq b 36)                          ;; $  ta/tu
+    (Or (Eq b 37)                        ;; %  deprecated ta/tu
+      (Or (Eq b 64)                      ;; @  times
+        (And (Ge b 48) (Le b 57))))))    ;; 0-9 u/x/w/f/s...
+
+(define (gv-seg-content content)
+  (If (quip:aura-sym? content)
+    (strcat ["'" content])
+    (If (gv-codec-head? (Mod content 256))
+      (strcat ["'" content])
+      (strcat ["'$" content]))))
+
+(define (gv-seg-quip t)
+  (cond
+    ((gv-word? t) (gv-seg-content (rx-leaf-str t)))
+    ((gv-quip? t) (gv-seg-content (Div (rx-leaf-str t) 256)))
+    (else (gv-error "bad-segment" t))))
+
+;; The clauses of a ! or ? line: kids run left to right, a trailing
+;; "|" nest carries the next clause (pipes chain rightward in layout).
+;; -> row of token-rows.
+(define (gv-clauses ctx kids)
+  (define n (Sz kids))
+  (define lastk (If n (Ix (Sub n 1) kids) 0))
+  (define piped (And n (gv-rune? "|" lastk)))
+  (define own (If piped (gv-take (Sub n 1) kids) kids))
+  (Ifz (Sz own)
+    (gv-error "empty-clause" ctx)
+    (If piped
+      (cons own (gv-clauses ctx (rx-nest-kids lastk)))
+      [own])))
+
+;; clause tokens -> [slot-path type-paths]
+(define (gv-clause-ir toks)
+  [(gv-slot-path (_0 toks))
+   (map gv-type-path (gv-take-go (Sz toks) toks 1 []))])
+
+;;; lash IR construction ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Union one slot's types into the curbs row (order-preserving).
+(define (gv-curb-add curbs slot types)
+  (define hit (find (lambda (e) (Equal slot (Ix 0 e))) curbs))
+  (Ifz hit
+    (If (Sz types) (snoc [slot types] curbs) curbs)
+    (map (lambda (e)
+           (Ifz (Equal slot (Ix 0 e)) e
+             [slot (foldl (lambda (acc ty)
+                            (If (gv-has? ty acc) acc (snoc ty acc)))
+                     (Ix 1 e) types)]))
+      curbs)))
+
+(define (gv-curbs-meld base add)
+  (foldl (lambda (acc e) (gv-curb-add acc (Ix 0 e) (Ix 1 e))) base add))
+
+;; Meld `add` onto `base`: curbs union, need groups conjoin, add's
+;; docs win when present.
+(define (gv-lash-meld base add)
+  [(gv-curbs-meld (Ix 0 base) (Ix 0 add))
+   (Weld (Ix 1 base) (Ix 1 add))
+   (If (Ix 2 add) (Ix 2 add) (Ix 2 base))
+   (If (Ix 3 add) (Ix 3 add) (Ix 3 base))])
+
+;; Apply one ! line: each clause types its slot; the clauses' slots
+;; are ONE disjunctive need group.
+(define (gv-lash-need l clauses)
+  (define curbs
+    (foldl (lambda (acc c) (gv-curb-add acc (Ix 0 c) (Ix 1 c)))
+      (Ix 0 l) clauses))
+  [curbs
+   (snoc (map (lambda (c) (Ix 0 c)) clauses) (Ix 1 l))
+   (Ix 2 l) (Ix 3 l)])
+
+;; Apply one ? line: curbs only.
+(define (gv-lash-curb l clauses)
+  (define curbs
+    (foldl (lambda (acc c)
+             (Ifz (Sz (Ix 1 c))
+               (gv-error "curb-line-needs-types" (Ix 0 c))
+               (gv-curb-add acc (Ix 0 c) (Ix 1 c))))
+      (Ix 0 l) clauses))
+  [curbs (Ix 1 l) (Ix 2 l) (Ix 3 l)])
+
+(define (gv-lash-lede l s)
+  (If (Ix 2 l) (gv-error "duplicate-lede" s) [(Ix 0 l) (Ix 1 l) s (Ix 3 l)]))
+
+;; Normalize one slug token into help text.  The rex parser joins
+;; consecutive slug lines with a LITERAL backslash-n plus the "'  "
+;; continuation marker (the bug-compatible lore-line join schemagen
+;; documents), so split on that two-byte sequence and strip each
+;; line's leading spaces / tick / spaces, rejoining with a real
+;; newline.
+(define (gv-slug-clean s)
+  (define bs (trip s))
+  (define n (Sz bs))
+  (define (strip line)
+    (define m (Sz line))
+    (define (sp j) (If (And (Lt j m) (Eq 32 (Ix j line))) (sp (Add j 1)) j))
+    (define j0 (sp 0))
+    (define j1 (If (And (Lt j0 m) (Eq 39 (Ix j0 line))) (sp (Add j0 1)) j0))
+    (strcat (gv-take-go m line j1 [])))
+  (define (split i cur out)
+    (If (Ge i n)
+      (snoc (strip cur) out)
+      (If (And (Eq 92 (Ix i bs))
+            (And (Lt (Add i 1) n) (Eq 110 (Ix (Add i 1) bs))))
+        (split (Add i 2) [] (snoc (strip cur) out))
+        (split (Add i 1) (snoc (Ix i bs) cur) out))))
+  (define lines (split 0 [] []))
+  (foldl (lambda (acc l) (Ifz acc l (strcat [acc 10 l]))) 0 lines))
+
+(define (gv-lash-help l s)
+  (define line (gv-slug-clean s))
+  (define cur (Ix 3 l))
+  [(Ix 0 l) (Ix 1 l) (Ix 2 l)
+   (Ifz cur line (strcat [cur 10 line]))])
+
+;;; Node walking ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (gv-role-of roles name)
+  (define hit (find (lambda (e) (Eq name (Ix 0 e))) roles))
+  (Ifz hit (gv-error "unknown-role (roles define before use)" name)
+    (Ix 1 (_0 hit))))
+
+;; Fold one body kid into [lash arms kooks] under the role registry.
+;; The arm recursion is threaded as arm-fn (top-level defines only
+;; allow SELF-forward references, and node/arm are mutually
+;; recursive).
+(define (gv-node-kid arm-fn roles allow-arms st k)
+  (define l (Ix 0 st))
+  (define arms (Ix 1 st))
+  (define kooks (Ix 2 st))
+  (define vals (Ix 3 st))
+  (cond
+    ((gv-word? k) [(gv-lash-meld l (gv-role-of roles (rx-leaf-str k))) arms kooks vals])
+    ((gv-cord? k) [(gv-lash-lede l (rx-leaf-str k)) arms kooks vals])
+    ((gv-slug? k) [(gv-lash-help l (rx-leaf-str k)) arms kooks vals])
+    ((gv-rune? "!" k) [(gv-lash-need l (map gv-clause-ir
+                                         (gv-clauses "!" (rx-nest-kids k)))) arms kooks vals])
+    ((gv-rune? "?" k) [(gv-lash-curb l (map gv-clause-ir
+                                         (gv-clauses "?" (rx-nest-kids k)))) arms kooks vals])
+    ((gv-rune? "@" k)
+      [l arms (Weld kooks (map gv-ref-path (rx-nest-kids k))) vals])
+    ((gv-rune? ":" k)
+      (let ((ks (rx-nest-kids k)))
+        (If (Eq 2 (Sz ks))
+          [l arms kooks
+           (snoc [(gv-slot-path (Ix 0 ks)) (gv-val (Ix 1 ks))] vals)]
+          (gv-error "slot-line-wants-slot-and-value" k))))
+    ((gv-rune? "&" k) (gv-error "dep-must-be-top-level" k))
+    ((gv-rune? "+" k)
+      (Ifz allow-arms (gv-error "arm-inside-role" k)
+        [l (snoc (arm-fn roles k) arms) kooks vals]))
+    ((gv-rune? "*" k)
+      (Ifz allow-arms (gv-error "arm-inside-role" k)
+        [l (snoc (arm-fn roles k) arms) kooks vals]))
+    (else (gv-error "unknown-form" k))))
+
+;; Sibling discipline: lit segments unique, at most one var arm.
+;; DeepSeq: the check must ride the dataflow or laziness skips it.
+(define (gv-check-arms arms)
+  (DeepSeq
+    (foldl (lambda (seen a)
+             (If (Eq "lit" (Ix 0 a))
+               (If (gv-has? (Ix 1 a) (Ix 0 seen))
+                 (gv-error "duplicate-lit-arm" (Ix 1 a))
+                 [(snoc (Ix 1 a) (Ix 0 seen)) (Ix 1 seen)])
+               (If (Ix 1 seen)
+                 (gv-error "two-var-arms" (Ix 1 a))
+                 [(Ix 0 seen) 1])))
+      [[] 0] arms)
+    arms))
+
+;; Any : slot value anywhere in a node tree?
+(define (gv-any-vals? node)
+  (Or (Sz (Ix 3 node))
+    (Truth (find (lambda (a) (gv-any-vals? (Ix 2 a))) (Ix 1 node)))))
+
+;; One + or * nest -> arm IR, recursing into nodes through node-fn.
+;; A var arm's subtree has no concrete mount path, so : lines are
+;; rejected anywhere below one.
+(define (gv-arm-go node-fn roles nest)
+  (define kids (rx-nest-kids nest))
+  (Ifz (Sz kids)
+    (gv-error "empty-arm" nest)
+    (let ((sub (node-fn roles 1 (gv-take-go (Sz kids) kids 1 []))))
+      (If (Eq "+" (rx-nest-rune nest))
+        ["lit" (gv-seg-quip (_0 kids)) sub]
+        (let ((tag (gv-word! "aura" (_0 kids))))
+          (Ifz (gv-has? tag gv-auras)
+            (gv-error "unknown-aura" tag)
+            (If (gv-any-vals? sub)
+              (gv-error "slot-value-under-var-arm" nest)
+              ["var" tag sub])))))))
+
+;; Body kids (header token already stripped) -> node IR
+;; [lash-or-0 arms kooks vals].
+(define (gv-node roles allow-arms kids)
+  (define (arm-fn rs nest) (gv-arm-go gv-node rs nest))
+  (define st (foldl (lambda (acc k) (gv-node-kid arm-fn roles allow-arms acc k))
+               [gv-lash-empty [] [] []] kids))
+  [(If (gv-lash-empty? (Ix 0 st)) 0 (Ix 0 st))
+   (gv-check-arms (Ix 1 st))
+   (Ix 2 st)
+   (Ix 3 st)])
+
+;; The standalone arm entry (gv-read's top-level lit/var forms).
+(define (gv-arm roles nest) (gv-arm-go gv-node roles nest))
+
+;;; Top level ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (gv-top-forms root)
+  (If (And (rx-nest? root) (Eq 0 (rx-nest-rune root)))
+    (rx-nest-kids root)
+    [root]))
+
+;; A = form: name, cited parents, then lash items.  -> [name lash]
+(define (gv-role roles nest)
+  (define kids (rx-nest-kids nest))
+  (Ifz (Sz kids)
+    (gv-error "empty-role" nest)
+    (let* ((name0 (gv-word! "role-name" (_0 kids)))
+           (name (Ifz (Nil (find (lambda (e) (Eq name0 (Ix 0 e))) roles))
+                   (gv-error "duplicate-role" name0)
+                   name0))
+           (st (gv-node roles 0 (gv-take-go (Sz kids) kids 1 []))))
+      (If (Sz (Ix 2 st))
+        (gv-error "kook-inside-role" name)
+        (If (Sz (Ix 3 st))
+          (gv-error "slot-value-inside-role" name)
+          [name (Ifz (Ix 0 st) gv-lash-empty (Ix 0 st))])))))
+
+;; One top-level & form -> ["dep" [[rel segs] care req]] or
+;; ["grant" ["fetch"] | ["serve" port]].  fetch/serve are reserved
+;; heads: a namespace dep cannot use them as a bare first segment.
+(define (gv-ask nest)
+  (define kids (rx-nest-kids nest))
+  (define (dep-of ref)
+    (foldl (lambda (acc k)
+             (let ((w (gv-word! "dep-word" k)))
+               (cond
+                 ((Eq "req" w) [(Ix 0 acc) (Ix 1 acc) 1])
+                 ((Or (Eq "x" w) (Or (Eq "y" w) (Eq "z" w)))
+                   [(Ix 0 acc) w (Ix 2 acc)])
+                 (else (gv-error "unknown-dep-word (want x/y/z or req)" w)))))
+      [ref "x" 0]
+      (gv-take-go (Sz kids) kids 1 [])))
+  (Ifz (Sz kids)
+    (gv-error "empty-ask" nest)
+    (let ((hd (Ix 0 kids)))
+      (cond
+        ((And (gv-word? hd) (Eq "fetch" (rx-leaf-str hd)))
+          (If (Eq 1 (Sz kids))
+            ["grant" ["fetch"]]
+            (gv-error "fetch-takes-nothing" nest)))
+        ((And (gv-word? hd) (Eq "serve" (rx-leaf-str hd)))
+          (If (Eq 2 (Sz kids))
+            ["grant" ["serve" (gv-word! "serve-port" (Ix 1 kids))]]
+            (gv-error "serve-takes-one-port" nest)))
+        (else ["dep" (dep-of (gv-ref-path hd))])))))
+
+;; Whole file -> [roles root-node-ir deps grants]
+;;   roles: row of [name lash], definition order.
+(define (gv-read src)
+  (define forms (gv-top-forms (rex:ParseRexNormFile src)))
+  (define st
+    (foldl (lambda (acc f)
+             ;; acc: [roles lash arms kooks vals deps grants]
+             (cond
+               ((gv-rune? "=" f)
+                 [(snoc (gv-role (Ix 0 acc) f) (Ix 0 acc))
+                  (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
+                  (Ix 5 acc) (Ix 6 acc)])
+               ((gv-rune? "&" f)
+                 (let ((a (gv-ask f)))
+                   (If (Eq "dep" (Ix 0 a))
+                     [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
+                      (snoc (Ix 1 a) (Ix 5 acc)) (Ix 6 acc)]
+                     [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
+                      (Ix 5 acc) (snoc (Ix 1 a) (Ix 6 acc))])))
+               (else
+                 (let ((n (gv-node-kid gv-arm (Ix 0 acc) 1
+                            [(Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)] f)))
+                   [(Ix 0 acc) (Ix 0 n) (Ix 1 n) (Ix 2 n) (Ix 3 n)
+                    (Ix 5 acc) (Ix 6 acc)]))))
+      [[] gv-lash-empty [] [] [] [] []] forms))
+  [(Ix 0 st)
+   [(If (gv-lash-empty? (Ix 1 st)) 0 (Ix 1 st))
+    (gv-check-arms (Ix 2 st))
+    (Ix 3 st)
+    (Ix 4 st)]
+   (Ix 5 st)
+   (Ix 6 st)])
+
+;;; Tree emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Emits normalized rex directly (the schemagen discipline): shapes
+;;; probe-transcribed from ParseRexNormFile over the handwritten
+;;; target module, verified compiling against shrine_types.
+
+(define nzsp [0 0 0 0])
+(define (nw s) (rex:MakeLeaf nzsp "word" s))
+(define (nc s) (rex:MakeLeaf nzsp "cord" s))
+(define (nq s) (rex:MakeLeaf nzsp "quip" s))
+(define (nrn rune kids) (rex:MakeNest nzsp "clear" rune kids))
+(define (npar kids) (rex:MakeNest nzsp "paren" "" kids))
+(define (nparo rune kids) (rex:MakeNest nzsp "paren" rune kids))
+(define (nbrk kids) (rex:MakeNest nzsp "brack" "" kids))
+(define (nbrko rune kids) (rex:MakeNest nzsp "brack" rune kids))
+(define (njx kids) (rex:MakeJuxt nzsp kids))
+(define (ngrp kids) (If (Eq 1 (Sz kids)) (_0 kids) (nrn "" kids)))
+(define (npth segs) (nrn "/" (map nw segs)))
+
+;; "." chains are FLAT in normalized rex (schemagen's ndot lesson).
+(define (ndot a b)
+  (If (And (Eq "nest" (Hd a))
+        (And (Eq "clear" (Ix 1 a)) (Eq "." (Ix 2 a))))
+    (nrn "." (snoc b (Ix 3 a)))
+    (nrn "." [a b])))
+
+(define gv-prelude
+  [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
+   (nrn "-" [(nw "shrine_types") (nbrko "=" [(nw "order") (nw "20")])])])
+
+;; The app layer's import stack: lain (pails), pact (rel/lore/mani),
+;; semidoc (snode/sattr/unparse), tmpl (mani/kook_pred).
+(define gv-prelude-app
+  (Weld gv-prelude
+    [(nrn "-" [(nw "lain") (nbrko "=" [(nw "order") (nw "25")])])
+     (nrn "-" [(nw "pact") (nbrko "=" [(nw "order") (nw "30")])])
+     (nrn "-" [(nw "semidoc") (nbrko "=" [(nw "order") (nw "40")])])
+     (nrn "-" [(nw "tmpl") (nbrko "=" [(nw "order") (nw "50")])])]))
+
+;; ['a 'b 'c] - a path literal from cord segments.
+(define (gv-path-t segs)
+  (nbrk (map (lambda (s) (nq (strcat ["'" s]))) segs)))
+
+;; (mop/empty)
+(define gv-mop-empty (nparo "/" [(nw "mop") (nw "empty")]))
+
+;; (mop/put[path curb lt_pith] KEY VAL REST), chained; first curb ends
+;; up outermost so insertion order is the row order.
+(define gv-mop-put-head
+  (nrn "/" [(nw "mop")
+            (njx [(nw "put")
+                  (nbrk [(nw "path") (nw "curb") (nw "lt_pith")])])]))
+
+(define (gv-curbs-t curbs)
+  (foldr (lambda (e rest)
+           (npar [gv-mop-put-head
+                  (gv-path-t (Ix 0 e))
+                  (nbrk (map gv-path-t (Ix 1 e)))
+                  rest]))
+    gv-mop-empty curbs))
+
+;; [[['a] ['b]] ..] - the need literal.
+(define (gv-need-t need)
+  (nbrk (map (lambda (grp) (nbrk (map gv-path-t grp))) need)))
+
+(define (gv-doc-t s) (Ifz s (nw "0") (nc s)))
+
+;; (lash (mop/empty) WRITE NEED LEDE HELP)
+(define (gv-lash-t l)
+  (npar [(nw "lash")
+         gv-mop-empty
+         (gv-curbs-t (Ix 0 l))
+         (gv-need-t (Ix 1 l))
+         (gv-doc-t (Ix 2 l))
+         (gv-doc-t (Ix 3 l))]))
+
+;; (soma/arm (zeta/lit 'seg) SUB) / (soma/arm (zeta/var "tag") SUB),
+;; sub-soma recursion threaded (self-forward-reference discipline).
+(define (gv-arm-t-go soma-fn a)
+  (npar [(npth ["soma" "arm"])
+         (If (Eq "lit" (Ix 0 a))
+           (npar [(npth ["zeta" "lit"]) (nq (Ix 1 a))])
+           (npar [(npth ["zeta" "var"]) (nc (Ix 1 a))]))
+         (soma-fn (Ix 2 a))]))
+
+;; (soma FIL [ARMS]) with .none / (./some LASH) fil.
+(define (gv-soma-t s)
+  (npar [(nw "soma")
+         (Ifz (Ix 0 s)
+           (nrn "." [(nw "none")])
+           (npar [(nrn "./" [(nw "some")]) (gv-lash-t (Ix 0 s))]))
+         (nbrk (map (lambda (a) (gv-arm-t-go gv-soma-t a)) (Ix 1 s)))]))
+
+;; +  NAME / ^  TYPE / EXPR
+(define (gv-decl-t name ty expr)
+  (nrn "+" [(nw name) (nrn "^" [(nw ty)]) expr]))
+
+;;; Yoke emission ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; (fief (deed .true) .x soma/new)
+(define (gv-fief-t d)
+  (npar [(nw "fief")
+         (npar [(nw "deed") (nrn "." [(nw (If (Ix 2 d) "true" "false"))])])
+         (nrn "." [(nw (Ix 1 d))])
+         (npth ["soma" "new"])]))
+
+;; A dep's mount path: (pact/rel [segs]) when ./-relative.
+(define (gv-dep-path-t r)
+  (If (Ix 0 r)
+    (npar [(npth ["pact" "rel"]) (gv-path-t (Ix 1 r))])
+    (gv-path-t (Ix 1 r))))
+
+;; (axal/new[fief] .none)
+(define gv-axal-new
+  (npar [(nrn "/" [(nw "axal") (njx [(nw "new") (nbrk [(nw "fief")])])])
+         (nrn "." [(nw "none")])]))
+
+;; (axal/new[fief] .none).put(P F).put(P F)..
+(define (gv-deps-t deps)
+  (foldl (lambda (acc d)
+           (ndot acc
+             (njx [(nw "put")
+                   (npar [(gv-dep-path-t (Ix 0 d)) (gv-fief-t d)])])))
+    gv-axal-new deps))
+
+;; (yoke SELF [ARMS] DEPS); root kooks have no yoke slot -- they live
+;; on the template side only.
+(define (gv-yoke-t node deps)
+  (npar [(nw "yoke")
+         (Ifz (Ix 0 node) (npth ["lash" "new"]) (gv-lash-t (Ix 0 node)))
+         (nbrk (map (lambda (a) (gv-arm-t-go gv-soma-t a)) (Ix 1 node)))
+         (gv-deps-t deps)]))
+
+;;; Template emission (the app layer) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; Mirrors tmpl/render's shapes -- doc nodes only, docs as
+;;; prose/quote kids, one exemplar per var arm -- plus per-node
+;;; /doc/kook attributes, which a yoke cannot say.
+
+;; The quip content (tick dropped); named text of a lit segment, or 0
+;; for non-text auras (u/x/w/..): '$c -> c, symbol -> itself.
+(define (gv-qcontent qstr) (Div qstr 256))
+(define (gv-named-text qstr)
+  (define c (gv-qcontent qstr))
+  (If (Eq 36 (Mod c 256))
+    (Div c 256)
+    (If (quip:aura-sym? c) c 0)))
+
+(define (gv-texts-t texts) (nbrk (map nc texts)))
+
+;; (sattr tmpl/kook_pred [(sval/ref ["." "w" "form"])])
+(define (gv-kook-attr-t r)
+  (npar [(nw "sattr")
+         (npth ["tmpl" "kook_pred"])
+         (nbrk [(npar [(npth ["sval" "ref"])
+                       (gv-texts-t (If (Ix 0 r)
+                                     (cons "." (Ix 1 r))
+                                     (Ix 1 r)))])])]))
+
+;; A node's documentation kids: lede as prose, help as quote lead.
+(define (gv-tpl-docs-t l)
+  (Ifz l []
+    (Weld
+      (Ifz (Ix 2 l) []
+        [(npar [(npth ["snode" "prose"]) (nc (Ix 2 l)) (nbrk [])])])
+      (Ifz (Ix 3 l) []
+        [(npar [(npth ["snode" "quote"]) (nc (Ix 3 l)) (nbrk []) (nbrk [])])]))))
+
+;; One arm as a template doc node (kids recursion threaded).  A text
+;; lit mounts NAMED at its root-relative path; other lits and vars
+;; render un-named (a var is one exemplar; its kids keep the base --
+;; the yoke stays authoritative, as in tmpl/arm_node).
+(define (gv-tpl-arm-t kids-fn base a)
+  (define sub (Ix 2 a))
+  (define attrs (nbrk (map gv-kook-attr-t (Ix 2 sub))))
+  (If (Eq "var" (Ix 0 a))
+    (npar [(npth ["snode" "doc"]) (nbrk []) attrs
+           (nbrk (kids-fn base sub))])
+    (let* ((nt (gv-named-text (Ix 1 a)))
+           (at (snoc (If nt nt (gv-qcontent (Ix 1 a))) base)))
+      (npar [(npth ["snode" "doc"])
+             (If nt (gv-texts-t at) (nbrk []))
+             attrs
+             (nbrk (kids-fn at sub))]))))
+
+;; A node's template kids: docs first, then arms.
+(define (gv-tpl-kids-go self base node)
+  (Weld (gv-tpl-docs-t (Ix 0 node))
+    (map (lambda (a) (gv-tpl-arm-t (lambda (b n) (self self b n)) base a))
+      (Ix 1 node))))
+(define (gv-tpl-kids base node) (gv-tpl-kids-go gv-tpl-kids-go base node))
+
+;; The instance root: un-named, deps as documentation kook lines
+;; (parts drops root refs at instantiation) plus the root's own
+;; kooks.
+(define (gv-tpl-root-t node deps)
+  (npar [(npth ["snode" "doc"])
+         (nbrk [])
+         (nbrk (Weld (map (lambda (d) (gv-kook-attr-t (Ix 0 d))) deps)
+                 (map gv-kook-attr-t (Ix 2 node))))
+         (nbrk (gv-tpl-kids [] node))]))
+
+;; Any kook anywhere in the trie?
+(define (gv-any-kooks? node)
+  (Or (Sz (Ix 2 node))
+    (Truth (find (lambda (a) (gv-any-kooks? (Ix 2 a))) (Ix 1 node)))))
+
+;;; Seed slot values (the : lines) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Collect [seg-quips vals] rows for every concrete node that carries
+;; : lines (var subtrees were rejected by the reader).
+(define (gv-extras-go self base node acc)
+  (define acc1
+    (Ifz (Sz (Ix 3 node)) acc (snoc [base (Ix 3 node)] acc)))
+  (foldl (lambda (a arm)
+           (If (Eq "var" (Ix 0 arm))
+             a
+             (self self (snoc (Ix 1 arm) base) (Ix 2 arm) a)))
+    acc1 (Ix 1 node)))
+(define (gv-extras node) (gv-extras-go gv-extras-go [] node []))
+
+;; (pails/t "..") / (pails/n 41) / (pails/p ['a]) value trees.
+(define (gv-val-t v)
+  (cond
+    ((Eq "t" (Ix 0 v)) (npar [(npth ["pails" "t"]) (nc (Ix 1 v))]))
+    ((Eq "n" (Ix 0 v)) (npar [(npth ["pails" "n"]) (nw (Ix 1 v))]))
+    (else (npar [(npth ["pails" "p"]) (gv-dep-path-t (Ix 1 v))]))))
+
+;; (myth/new).put(SLOT VAL).put(..) for one extras row entry.
+(define (gv-extra-t e)
+  (define myt
+    (foldl (lambda (recv v)
+             (ndot recv
+               (njx [(nw "put")
+                     (npar [(gv-path-t (Ix 0 v)) (gv-val-t (Ix 1 v))])])))
+      (npar [(npth ["myth" "new"])])
+      (Ix 1 e)))
+  (nbrk [(nbrk (map nq (Ix 0 e))) myt]))
+
+(define (gv-extras-t node)
+  (nbrk (map gv-extra-t (gv-extras node))))
+
+;;; Entry points ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Grove source -> normalized foil module tree: one lash constant per
+;; role (definition order) plus `spec ^ yoke`.  Any @/& line adds the
+;; app layer: `tpl ^ nat` (the semidoc template source, tmpl/render
+;; shaped, carrying the kook refs) and `app ^ mani` (tmpl/mani named
+;; by the module).
+;; [.gfetch (grant/gserve N)] — the wants row (the nullary member
+;; rides the relative spelling; a bare grant/gfetch path is the TYPE).
+(define (gv-wants-t grants)
+  (nbrk (map (lambda (g)
+               (If (Eq "fetch" (Ix 0 g))
+                 (nrn "." [(nw "gfetch")])
+                 (npar [(npth ["grant" "gserve"]) (nw (Ix 1 g))])))
+          grants)))
+
+(define (grove-tree name src)
+  (define ir (gv-read src))
+  (define node (Ix 1 ir))
+  (define deps (Ix 2 ir))
+  (define grants (Ix 3 ir))
+  (define appy
+    (Or (Sz deps)
+      (Or (Sz grants)
+        (Or (gv-any-kooks? node) (gv-any-vals? node)))))
+  (define role-decls
+    (map (lambda (e) (gv-decl-t (Ix 0 e) "lash" (gv-lash-t (Ix 1 e))))
+      (Ix 0 ir)))
+  (define spec-decl (gv-decl-t "spec" "yoke" (gv-yoke-t node deps)))
+  (define app-decls
+    (Ifz appy []
+      [(gv-decl-t "tpl" "nat"
+         (npar [(nw "unparse") (nbrk [(gv-tpl-root-t node deps)])]))
+       (gv-decl-t "app" "mani"
+         (npar [(npth ["tmpl" "mani_spec"])
+                (nq (strcat ["'" name]))
+                (npar [(npth ["lore" "line"])
+                       (gv-doc-t (Ifz (Ix 0 node) 0 (Ix 2 (Ix 0 node))))])
+                (nw "tpl")
+                (nw "spec")
+                (gv-wants-t grants)
+                (gv-extras-t node)]))]))
+  (ngrp
+    (Weld (Ifz appy gv-prelude gv-prelude-app)
+      (Weld role-decls (cons spec-decl app-decls)))))
+
+;; Generate AND compile.  -> subject
+(define (grove-compile sut name src)
+  (foil:compile-rex sut name (grove-tree name src)))

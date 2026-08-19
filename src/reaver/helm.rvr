@@ -27,6 +27,8 @@
 
 (#bind cairn (#module cairn))
 
+(#bind grove (#module grove))
+
 
 ;;; The IO driver shell: real enki actors around the pure helm core
 ;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
@@ -667,21 +669,59 @@
   (define r (ReadFolder "foil/apps"))
   (Ifz r [] (map (Ix 1) (filter (lambda (e) (Eq 1 (Ix 0 e))) r))))
 
-;; Compile one app module against the shared core cache and pull its
-;; manifest.  The whole step runs under Try — one bad app never costs
-;; the boot.  mani-ok is the core's own brand gate (brands are shared
-;; through the cache, so the core's pact/form applies to the app's
-;; mani directly).  -> [cache' ["OK" mani] | ["ERR" err]]
-(define (compile-app core cache mod)
+;; A file's text, or 0 when absent/empty (ReadFile throws on missing;
+;; the probe is how an app declares which layers it has).
+(define (probe-file path)
+  (define r (Try (lambda (z) (let ((s (read-text-file path))) (DeepSeq s s))) 0))
+  (If (Eq 1 (Hd r)) 0 (_0 r)))
+
+;; Compile one app against the shared core cache and pull its
+;; manifest.  An app is main.foil (code: forms, views, its own mani),
+;; main.grove (spec: typing, structural seeds, kook refs — compiled
+;; through grove's tree seam), or both — welded through the core's
+;; own pact functions (mani/weld_spec, mani/adopt_spec), so every
+;; seed adopts the contract the yoke assigns it.  The whole step runs
+;; under Try — one bad app never costs the boot.  mani-ok is the
+;; core's brand gate (brands are shared through the cache, so the
+;; core's pact/form applies to the app's mani directly).
+;; -> [cache' ["OK" mani] | ["ERR" err]]
+(define (compile-app core cache name)
+  (define mod (strcat ["apps/" name "/main"]))
   (define mani-ok (core-ent core ["mani" "ok"]))
   (define r
     (Try
       (lambda (z)
-        (let* ((cr (foil:compile-mod-cached cache foil:default-subject mod))
-               (sut (_1 cr))
-               (m (foil:source-entry-val ["app"] sut)))
-          (Seq (If (Eq 1 (mani-ok m)) 0 (error ["app-entry-not-mani" mod]))
-            [(_0 cr) m])))
+        (let* ((gsrc (probe-file (strcat ["foil/apps/" name "/main.grove"])))
+               (fsrc (probe-file (strcat ["foil/apps/" name "/main.foil"])))
+               (base (Ifz fsrc
+                       [cache 0]
+                       (let* ((cr (foil:compile-mod-cached cache foil:default-subject mod))
+                              (m (foil:source-entry-val ["app"] (_1 cr))))
+                         [(_0 cr) m])))
+               (spec (Ifz gsrc
+                       [(_0 base) 0 0]
+                       (let* ((gt (grove:grove-tree name gsrc))
+                              (gc (foil:compile-rex-cached (_0 base)
+                                    foil:default-subject
+                                    (strcat [mod "_spec"]) gt))
+                              (gsut (_1 gc))
+                              (y (foil:source-entry-val ["spec"] gsut))
+                              (gm (Try (lambda (zz)
+                                         (let ((v (foil:source-entry-val ["app"] gsut)))
+                                           (DeepSeq (Hd v) v)))
+                                    0)))
+                         [(_0 gc) y (If (Eq 1 (Hd gm)) 0 (_0 gm))])))
+               (m (_1 base))
+               (y (Ix 1 spec))
+               (gm (Ix 2 spec))
+               (mm (cond
+                     ((And (Nil m) (Nil gm)) (error ["no-app-mani" name]))
+                     ((Nil m) gm)
+                     ((Nil gm)
+                       (Ifz y m ((core-ent core ["mani" "adopt_spec"]) y m)))
+                     (else ((core-ent core ["mani" "weld_spec"]) y gm m)))))
+          (Seq (If (Eq 1 (mani-ok mm)) 0 (error ["app-entry-not-mani" mod]))
+            [(Ix 0 spec) mm])))
       0))
   (If (Eq 1 (Hd r))
     [cache ["ERR" (_0 r)]]
@@ -692,7 +732,7 @@
 (define (compile-apps core cache names)
   (foldl
     (lambda (st name)
-      (let ((r (compile-app core (_0 st) (strcat ["apps/" name "/main"]))))
+      (let ((r (compile-app core (_0 st) name)))
         [(_0 r) (snoc [name (_1 r)] (_1 st))]))
     [cache []] names))
 
