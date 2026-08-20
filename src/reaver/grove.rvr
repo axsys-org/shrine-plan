@@ -79,9 +79,13 @@
 ;;;   lede/help: 0 or cord
 ;;; node IR: [lash-ir-or-0 arms kooks vals]
 ;;;   arm:  ["lit" quip-str sub-node] | ["var" aura-tag sub-node]
-;;;   kook: [rel segs]  (rel=1 for ./-headed refs)
-;;;   val:  [slot-path ["t" cord] | ["n" natword] | ["p" [rel segs]]]
+;;;   kook: ["path" [rel segs]] | ["code" alias entry]
+;;;         (path = namespace ref, rel=1 for ./-headed; code = a
+;;;          companion-module entry grove mints a kook/decl for)
+;;;   val:  [slot-path ["t" cord] | ["n" natword] | ["p" [rel segs]]
+;;;          | ["ps" row-of-[rel segs]] | ["f" alias entry]]
 ;;; dep IR: [[rel segs] care req]  (care "x"/"y"/"z")
+;;; import IR: [alias mod]  (the %/ companion imports)
 
 (define gv-lash-empty [[] [] 0 0])
 
@@ -141,16 +145,66 @@
           [0 (map (lambda (k) (gv-word! "ref-segment" k)) ks)])))
     (else (gv-error "bad-ref" t))))
 
+;; A brack's element row.  A bracket that swallowed a SINGLE infix
+;; expression hoists the rune onto the bracket itself ([a#b] is a
+;; "#"-runed brack with kids [a b]); re-wrap that as one clear nest
+;; so element parsers see the same shape as the multi-element case.
+(define (gv-brack-elems t)
+  (If (Eq 0 (rx-nest-rune t))
+    (rx-nest-kids t)
+    [(rx-nest (rx-span t) "clear" (rx-nest-rune t) (rx-nest-kids t))]))
+
+;; alias#entry — a reference into a %/-imported companion module.
+(define (gv-code-ref? t) (gv-rune? "#" t))
+(define (gv-code-ref t)
+  (define ks (rx-nest-kids t))
+  (If (Eq 2 (Sz ks))
+    [(gv-word! "code-alias" (Ix 0 ks)) (gv-word! "code-entry" (Ix 1 ks))]
+    (gv-error "code-ref-wants-alias#entry" t)))
+
+;; A kook ref: alias#entry or a namespace path.
+(define (gv-kook-ref t)
+  (If (gv-code-ref? t)
+    (cons "code" (gv-code-ref t))
+    ["path" (gv-ref-path t)]))
+
 (define (gv-digit? b) (And (Ge b 48) (Le b 57)))
 (define (gv-digits? w)
   (define bs (trip w))
   (And (Sz bs) (all gv-digit? bs)))
+
+;; The tack quip: '?/<care>;<path> — bind the CURRENT case at care
+;; of <path> ("%/"-headed = app-relative, rebased at mount).  v1
+;; accepts care y only: the care the /x spun reads at.
+(define (gv-tack-val t)
+  (define c (Div (rx-leaf-str t) 256))
+  (define bs (trip c))
+  (define n (Sz bs))
+  (define (seg-split i cur acc)
+    (If (Ge i n)
+      (snoc (strcat cur) acc)
+      (If (Eq 47 (Ix i bs))
+        (seg-split (Add i 1) [] (snoc (strcat cur) acc))
+        (seg-split (Add i 1) (snoc (Ix i bs) cur) acc))))
+  (If (And (Ge n 5)
+        (And (Eq 63 (Ix 0 bs))
+          (And (Eq 47 (Ix 1 bs)) (Eq 59 (Ix 3 bs)))))
+    (If (Eq 121 (Ix 2 bs))
+      (If (And (Gt n 6) (And (Eq 37 (Ix 4 bs)) (Eq 47 (Ix 5 bs))))
+        ["tack" "y" [1 (seg-split 6 [] [])]]
+        ["tack" "y" [0 (seg-split 4 [] [])]])
+      (gv-error "tack-care-must-be-y (the spun reads at y)" t))
+    (gv-error "tack-wants-'?/care;path" t)))
 
 ;; A : line's value token.
 (define (gv-val t)
   (cond
     ((gv-cord? t) ["t" (rx-leaf-str t)])
     ((And (gv-word? t) (gv-digits? (rx-leaf-str t))) ["n" (rx-leaf-str t)])
+    ((gv-code-ref? t) (cons "f" (gv-code-ref t)))
+    ((gv-quip? t) (gv-tack-val t))
+    ((And (rx-nest? t) (Eq "brack" (rx-nest-color t)))
+      ["ps" (map gv-ref-path (gv-brack-elems t))])
     (else ["p" (gv-ref-path t)])))
 
 ;; A lit-arm segment as its foil quip-literal spelling.  Words and
@@ -299,12 +353,19 @@
     ((gv-rune? "?" k) [(gv-lash-curb l (map gv-clause-ir
                                          (gv-clauses "?" (rx-nest-kids k)))) arms kooks vals])
     ((gv-rune? "@" k)
-      [l arms (Weld kooks (map gv-ref-path (rx-nest-kids k))) vals])
+      [l arms (Weld kooks (map (lambda (r) ["path" (gv-ref-path r)])
+                            (rx-nest-kids k))) vals])
     ((gv-rune? ":" k)
       (let ((ks (rx-nest-kids k)))
         (If (Eq 2 (Sz ks))
-          [l arms kooks
-           (snoc [(gv-slot-path (Ix 0 ks)) (gv-val (Ix 1 ks))] vals)]
+          ;; : kook [refs..] is limb sugar, not a data slot
+          (If (And (Equal ["kook"] (gv-slot-path (Ix 0 ks)))
+                (And (rx-nest? (Ix 1 ks))
+                  (Eq "brack" (rx-nest-color (Ix 1 ks)))))
+            [l arms (Weld kooks (map gv-kook-ref (gv-brack-elems (Ix 1 ks))))
+             vals]
+            [l arms kooks
+             (snoc [(gv-slot-path (Ix 0 ks)) (gv-val (Ix 1 ks))] vals)])
           (gv-error "slot-line-wants-slot-and-value" k))))
     ((gv-rune? "&" k) (gv-error "dep-must-be-top-level" k))
     ((gv-rune? "+" k)
@@ -418,38 +479,127 @@
             (gv-error "serve-takes-one-port" nest)))
         (else ["dep" (dep-of (gv-ref-path hd))])))))
 
-;; Whole file -> [roles root-node-ir deps grants]
+;; A token's printable spelling, for op documentation.
+(define (gv-tok-text t)
+  (cond
+    ((gv-word? t) (rx-leaf-str t))
+    ((gv-rune? "/" t)
+      (foldl (lambda (acc k)
+               (Ifz acc (gv-word! "tok" k)
+                 (strcat [acc "/" (gv-word! "tok" k)])))
+        0 (rx-nest-kids t)))
+    ((gv-code-ref? t)
+      (let ((r (gv-code-ref t)))
+        (strcat [(Ix 0 r) "#" (Ix 1 r)])))
+    (else (gv-error "bad-op-token" t))))
+
+;; A > block's element row: block mode wraps the indented lines in
+;; one rune-0 nest.
+(define (gv-block-elems t)
+  (define ks (rx-nest-kids t))
+  (If (And (Eq 1 (Sz ks))
+        (And (rx-nest? (Ix 0 ks)) (Eq 0 (rx-nest-rune (Ix 0 ks)))))
+    (rx-nest-kids (Ix 0 ks))
+    ks))
+
+;; One top-level # form -> op IR [name receiver inputs output lede]
+;;   inputs: row of [slot-path type-spelling]; receiver/output are
+;;   role names (validated), types are documentation spellings.
+(define (gv-op roles nest)
+  (define kids (rx-nest-kids nest))
+  (define (role! w)
+    (Ifz (Nil (find (lambda (e) (Eq w (Ix 0 e))) roles))
+      w
+      (gv-error "op-wants-a-defined-role" w)))
+  (define (input-of k)
+    (Ifz (gv-rune? ":" k)
+      (gv-error "op-input-wants-slot-lines" k)
+      (let ((ks (rx-nest-kids k)))
+        (If (Eq 2 (Sz ks))
+          [(gv-slot-path (Ix 0 ks)) (gv-tok-text (Ix 1 ks))]
+          (gv-error "op-input-wants-slot-and-type" k)))))
+  (Ifz (Sz kids)
+    (gv-error "empty-op" nest)
+    (foldl
+      (lambda (acc k)
+        (cond
+          ((gv-slug? k)
+            (let ((line (gv-slug-clean (rx-leaf-str k))))
+              [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc)
+               (Ifz (Ix 4 acc) line (strcat [(Ix 4 acc) 10 line]))]))
+          ((gv-rune? ":" k)
+            (let ((ks (rx-nest-kids k)))
+              (If (Eq 1 (Sz ks))
+                [(Ix 0 acc) (role! (gv-word! "op-receiver" (Ix 0 ks)))
+                 (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)]
+                (gv-error "op-receiver-wants-one-role" k))))
+          ((gv-rune? ">" k)
+            [(Ix 0 acc) (Ix 1 acc)
+             (map input-of (gv-block-elems k))
+             (Ix 3 acc) (Ix 4 acc)])
+          ((gv-rune? "<" k)
+            (let ((ks (gv-block-elems k)))
+              (If (Eq 1 (Sz ks))
+                [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc)
+                 (role! (gv-word! "op-output" (Ix 0 ks)))
+                 (Ix 4 acc)]
+                (gv-error "op-output-wants-one-role" k))))
+          (else (gv-error "unknown-op-form" k))))
+      [(gv-word! "op-name" (Ix 0 kids)) 0 [] 0 0]
+      (gv-take-go (Sz kids) kids 1 []))))
+
+;; A top-level - form: `- alias %/mod` (only %/ companion imports).
+(define (gv-import nest)
+  (define kids (rx-nest-kids nest))
+  (If (And (Eq 2 (Sz kids)) (gv-rune? "%/" (Ix 1 kids)))
+    [(gv-word! "import-alias" (Ix 0 kids))
+     (gv-word! "import-mod" (Ix 0 (rx-nest-kids (Ix 1 kids))))]
+    (gv-error "import-wants-alias-and-%/mod" nest)))
+
+;; Whole file -> [roles root-node-ir deps grants imports ops]
 ;;   roles: row of [name lash], definition order.
 (define (gv-read src)
   (define forms (gv-top-forms (rex:ParseRexNormFile src)))
   (define st
     (foldl (lambda (acc f)
-             ;; acc: [roles lash arms kooks vals deps grants]
+             ;; acc: [roles lash arms kooks vals deps grants imports ops]
              (cond
                ((gv-rune? "=" f)
                  [(snoc (gv-role (Ix 0 acc) f) (Ix 0 acc))
                   (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
-                  (Ix 5 acc) (Ix 6 acc)])
+                  (Ix 5 acc) (Ix 6 acc) (Ix 7 acc) (Ix 8 acc)])
+               ((gv-rune? "-" f)
+                 [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
+                  (Ix 5 acc) (Ix 6 acc) (snoc (gv-import f) (Ix 7 acc))
+                  (Ix 8 acc)])
+               ((gv-rune? "#" f)
+                 [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
+                  (Ix 5 acc) (Ix 6 acc) (Ix 7 acc)
+                  (snoc (gv-op (Ix 0 acc) f) (Ix 8 acc))])
                ((gv-rune? "&" f)
                  (let ((a (gv-ask f)))
                    (If (Eq "dep" (Ix 0 a))
                      [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
-                      (snoc (Ix 1 a) (Ix 5 acc)) (Ix 6 acc)]
+                      (snoc (Ix 1 a) (Ix 5 acc)) (Ix 6 acc) (Ix 7 acc)
+                      (Ix 8 acc)]
                      [(Ix 0 acc) (Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)
-                      (Ix 5 acc) (snoc (Ix 1 a) (Ix 6 acc))])))
+                      (Ix 5 acc) (snoc (Ix 1 a) (Ix 6 acc)) (Ix 7 acc)
+                      (Ix 8 acc)])))
                (else
                  (let ((n (gv-node-kid gv-arm (Ix 0 acc) 1
                             [(Ix 1 acc) (Ix 2 acc) (Ix 3 acc) (Ix 4 acc)] f)))
                    [(Ix 0 acc) (Ix 0 n) (Ix 1 n) (Ix 2 n) (Ix 3 n)
-                    (Ix 5 acc) (Ix 6 acc)]))))
-      [[] gv-lash-empty [] [] [] [] []] forms))
+                    (Ix 5 acc) (Ix 6 acc) (Ix 7 acc) (Ix 8 acc)]))))
+      [[] gv-lash-empty [] [] [] [] [] [] []] forms))
   [(Ix 0 st)
    [(If (gv-lash-empty? (Ix 1 st)) 0 (Ix 1 st))
     (gv-check-arms (Ix 2 st))
     (Ix 3 st)
     (Ix 4 st)]
    (Ix 5 st)
-   (Ix 6 st)])
+   (Ix 6 st)
+   (Ix 7 st)
+   (Ix 8 st)])
 
 ;;; Tree emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -547,6 +697,9 @@
 ;; +  NAME / ^  TYPE / EXPR
 (define (gv-decl-t name ty expr)
   (nrn "+" [(nw name) (nrn "^" [(nw ty)]) expr]))
+;; the tree-typed variant, for spec types like row[op]
+(define (gv-decl-tt name tyt expr)
+  (nrn "+" [(nw name) (nrn "^" [tyt]) expr]))
 
 ;;; Yoke emission ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -601,14 +754,20 @@
 
 (define (gv-texts-t texts) (nbrk (map nc texts)))
 
-;; (sattr tmpl/kook_pred [(sval/ref ["." "w" "form"])])
-(define (gv-kook-attr-t r)
+;; (sattr tmpl/kook_pred [(sval/ref ["." "w" "form"])]).  A "code"
+;; kook rides "."-relative under kook/<entry> — where pact/kooks
+;; mounts the decl grove mints for it.
+(define (gv-kook-texts k)
+  (If (Eq "code" (Ix 0 k))
+    ["." "kook" (Ix 2 k)]
+    (let ((r (Ix 1 k)))
+      (If (Ix 0 r) (cons "." (Ix 1 r)) (Ix 1 r)))))
+
+(define (gv-kook-attr-t k)
   (npar [(nw "sattr")
          (npth ["tmpl" "kook_pred"])
          (nbrk [(npar [(npth ["sval" "ref"])
-                       (gv-texts-t (If (Ix 0 r)
-                                     (cons "." (Ix 1 r))
-                                     (Ix 1 r)))])])]))
+                       (gv-texts-t (gv-kook-texts k))])])]))
 
 ;; A node's documentation kids: lede as prose, help as quote lead.
 (define (gv-tpl-docs-t l)
@@ -643,20 +802,140 @@
       (Ix 1 node))))
 (define (gv-tpl-kids base node) (gv-tpl-kids-go gv-tpl-kids-go base node))
 
+;;; Op declarations ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; "op finish_card: recall > grade code#recall_feedback, when n < recall"
+(define (gv-op-text o)
+  (define ins
+    (foldl (lambda (acc i)
+             (let ((st (foldl (lambda (a w)
+                                (Ifz a w (strcat [a "/" w])))
+                         0 (Ix 0 i))))
+               (Ifz acc (strcat [st " " (Ix 1 i)])
+                 (strcat [acc ", " st " " (Ix 1 i)]))))
+      0 (Ix 2 o)))
+  (strcat ["op " (Ix 0 o) ": " (Ix 1 o)
+           (Ifz ins "" (strcat [" > " ins]))
+           " < " (Ix 3 o)]))
+
+;; (op 'name 'receiver [[SLOT "ty"] ..] 'output LEDE fn) — fn is the
+;; companion entry of the op's own name (in scope via the %-import).
+(define (gv-op-t o)
+  (Ifz (Ix 1 o)
+    (gv-error "op-missing-receiver" (Ix 0 o))
+    (Ifz (Ix 3 o)
+      (gv-error "op-missing-output" (Ix 0 o))
+      (npar [(nw "op")
+             (nq (strcat ["'" (Ix 0 o)]))
+             (nq (strcat ["'" (Ix 1 o)]))
+             (nbrk (map (lambda (i)
+                          (nbrk [(gv-path-t (Ix 0 i)) (nc (Ix 1 i))]))
+                     (Ix 2 o)))
+             (nq (strcat ["'" (Ix 3 o)]))
+             (gv-doc-t (Ix 4 o))
+             (nw (Ix 0 o))]))))
+
+;; One op as an OP CARD seed at ['op <name>]: ['sys 'op] carries the
+;; op record (fn inside — warp resolves it there), the lede shows
+;; the protocol line in the explorer.
+(define (gv-op-extra-t o)
+  (nbrk [(nbrk [(nq "'op") (nq (strcat ["'" (Ix 0 o)]))])
+         (ndot (ndot (npar [(npth ["myth" "new"])])
+                 (njx [(nw "put")
+                       (npar [(gv-path-t ["sys" "op"]) (gv-op-t o)])]))
+           (njx [(nw "put")
+                 (npar [(gv-path-t ["lede"])
+                        (npar [(npth ["pails" "t"]) (nc (gv-op-text o))])])]))]))
+
 ;; The instance root: un-named, deps as documentation kook lines
 ;; (parts drops root refs at instantiation) plus the root's own
-;; kooks.
-(define (gv-tpl-root-t node deps)
+;; kooks; op declarations render as prose kids ahead of the arms.
+(define (gv-tpl-root-t node deps ops)
   (npar [(npth ["snode" "doc"])
          (nbrk [])
-         (nbrk (Weld (map (lambda (d) (gv-kook-attr-t (Ix 0 d))) deps)
+         (nbrk (Weld (map (lambda (d) (gv-kook-attr-t ["path" (Ix 0 d)])) deps)
                  (map gv-kook-attr-t (Ix 2 node))))
-         (nbrk (gv-tpl-kids [] node))]))
+         (nbrk (Weld (map (lambda (o)
+                            (npar [(npth ["snode" "prose"])
+                                   (nc (gv-op-text o))
+                                   (nbrk [])]))
+                       ops)
+                 (gv-tpl-kids [] node)))]))
+
+;;; Companion imports and minted kook/decls ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Every "code" kook ref in the trie, deduped by [alias entry].
+(define (gv-code-kooks-go self node acc)
+  (define acc1
+    (foldl (lambda (a k)
+             (If (Eq "code" (Ix 0 k))
+               (let ((e [(Ix 1 k) (Ix 2 k)]))
+                 (If (gv-has? e a) a (snoc e a)))
+               a))
+      acc (Ix 2 node)))
+  (foldl (lambda (a arm) (self self (Ix 2 arm) a)) acc1 (Ix 1 node)))
+(define (gv-code-kooks node) (gv-code-kooks-go gv-code-kooks-go node []))
+
+;; Aliases named by code refs must be imported.
+(define (gv-check-aliases imports refs)
+  (DeepSeq
+    (map (lambda (e)
+           (Ifz (Nil (find (lambda (i) (Eq (Ix 0 e) (Ix 0 i))) imports))
+             0
+             (gv-error "unknown-import-alias" (Ix 0 e))))
+      refs)
+    refs))
+
+;; -  apps/<name>/<mod> [order=9N]
+(define (gv-import-t name i imp)
+  (nrn "-" [(nw (strcat ["apps/" name "/" (Ix 1 imp)]))
+            (nbrko "=" [(nw "order") (nw (strcat ["9" i]))])]))
+
+;; (kook/decl 'entry entry (lore/line "..")) — the minted decl; the
+;; form value is the companion entry, in scope through the import.
+(define (gv-decl-kook-t e)
+  (npar [(npth ["kook" "decl"])
+         (nq (strcat ["'" (Ix 1 e)]))
+         (nw (Ix 1 e))
+         (npar [(npth ["lore" "line"])
+                (nc (strcat ["grove-minted behavior: " (Ix 1 e)]))])]))
+
+;; Every tack val in the trie as a yoke dep [[rel segs] "y" 0]: a
+;; view's data dependency is a fief like any other.
+(define (gv-tacks-go self node acc)
+  (define acc1
+    (foldl (lambda (a v)
+             (If (Eq "tack" (Ix 0 (Ix 1 v)))
+               (snoc [(Ix 2 (Ix 1 v)) "y" 0] a)
+               a))
+      acc (Ix 3 node)))
+  (foldl (lambda (a arm) (self self (Ix 2 arm) a)) acc1 (Ix 1 node)))
+(define (gv-tacks node) (gv-tacks-go gv-tacks-go node []))
 
 ;; Any kook anywhere in the trie?
 (define (gv-any-kooks? node)
   (Or (Sz (Ix 2 node))
     (Truth (find (lambda (a) (gv-any-kooks? (Ix 2 a))) (Ix 1 node)))))
+
+;; The armor pass (app layer only): every var-arm parent gets the
+;; kernel warden in its kooks and its own sub-spec at ['sys 'spec],
+;; so kids arriving after mount adopt their contracts in the same
+;; event that creates them (pact/ward, the take cascade).
+(define gv-ward-ref ["path" [0 ["kook" "ward"]]])
+
+(define (gv-armor-go self node)
+  (define arms2
+    (map (lambda (a) [(Ix 0 a) (Ix 1 a) (self self (Ix 2 a))])
+      (Ix 1 node)))
+  (If (Truth (find (lambda (a) (Eq "var" (Ix 0 a))) (Ix 1 node)))
+    [(Ix 0 node)
+     arms2
+     (If (gv-has? gv-ward-ref (Ix 2 node))
+       (Ix 2 node)
+       (snoc gv-ward-ref (Ix 2 node)))
+     (snoc [["sys" "spec"] ["spec" node]] (Ix 3 node))]
+    [(Ix 0 node) arms2 (Ix 2 node) (Ix 3 node)]))
+(define (gv-armor node) (gv-armor-go gv-armor-go node))
 
 ;;; Seed slot values (the : lines) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -672,26 +951,100 @@
     acc1 (Ix 1 node)))
 (define (gv-extras node) (gv-extras-go gv-extras-go [] node []))
 
-;; (pails/t "..") / (pails/n 41) / (pails/p ['a]) value trees.
+;; (pails/t "..") / (pails/n 41) / (pails/p ['a]) / (pails/ps [..])
+;; value trees.  "f" (a code ref) has no pail lowering yet — it is
+;; the weft slot's business (the /x pass).
 (define (gv-val-t v)
   (cond
     ((Eq "t" (Ix 0 v)) (npar [(npth ["pails" "t"]) (nc (Ix 1 v))]))
     ((Eq "n" (Ix 0 v)) (npar [(npth ["pails" "n"]) (nw (Ix 1 v))]))
+    ((Eq "ps" (Ix 0 v))
+      (npar [(npth ["pails" "ps"]) (nbrk (map gv-dep-path-t (Ix 1 v)))]))
+    ((Eq "f" (Ix 0 v))
+      (gv-error "code-ref-value-only-valid-for-weft (pending /x)" (Ix 1 v)))
+    ((Eq "spec" (Ix 0 v)) (gv-yoke-t (Ix 1 v) []))
     (else (npar [(npth ["pails" "p"]) (gv-dep-path-t (Ix 1 v))]))))
+
+;; One : val as its [SLOT VALEXPR] lowering.  weft code-refs land at
+;; ['sys 'weft] as a spun over the companion entry; tack quips land
+;; at ['sys 'tack] as the (possibly app-relative) path pail — the /x
+;; lens reads both.
+(define (gv-slotval-t v)
+  (define slot (Ix 0 v))
+  (define val (Ix 1 v))
+  (cond
+    ((And (Equal ["weft"] slot) (Eq "f" (Ix 0 val)))
+      [(gv-path-t ["sys" "weft"])
+       (npar [(nw "spun") (nw (Ix 2 val)) (nrn "." [(nw "none")])])])
+    ((Eq "tack" (Ix 0 val))
+      [(gv-path-t ["sys" "tack"])
+       (npar [(npth ["pails" "p"]) (gv-dep-path-t (Ix 2 val))])])
+    (else [(gv-path-t slot) (gv-val-t val)])))
 
 ;; (myth/new).put(SLOT VAL).put(..) for one extras row entry.
 (define (gv-extra-t e)
   (define myt
     (foldl (lambda (recv v)
              (ndot recv
-               (njx [(nw "put")
-                     (npar [(gv-path-t (Ix 0 v)) (gv-val-t (Ix 1 v))])])))
+               (njx [(nw "put") (npar (gv-slotval-t v))])))
       (npar [(npth ["myth" "new"])])
       (Ix 1 e)))
   (nbrk [(nbrk (map nq (Ix 0 e))) myt]))
 
 (define (gv-extras-t node)
   (nbrk (map gv-extra-t (gv-extras node))))
+
+;;; Seed linting ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; fit_check at build time: a seed that will mount carrying a
+;;; contract is judged HERE, where the error can name the file, not
+;;; after mount where a mistyped slot quietly demands every later
+;;; poke supply the missing one.  Curb violations always reject; a
+;;; need violation rejects only when the node sets any : vals (a
+;;; docs-only scaffold legitimately mounts unfilled — the gate's
+;;; adoption exemption covers it).
+
+(define (gv-val-type-path v)
+  (cond
+    ((Eq "t" (Ix 0 v)) ["boot" "pails" "t"])
+    ((Eq "n" (Ix 0 v)) ["boot" "pails" "n"])
+    (else ["boot" "pails" "p"])))
+
+;; The implicit template slots every seed record carries.
+(define gv-implicit-slots [["kind"] ["id"]])
+
+(define (gv-lint-node lash vals)
+  (define curbs (Ix 0 lash))
+  (define need (Ix 1 lash))
+  (define slots (Weld gv-implicit-slots (map (lambda (v) (Ix 0 v)) vals)))
+  (define curb-ok
+    (foldl (lambda (acc v)
+             (let ((hit (find (lambda (e) (Equal (Ix 0 v) (Ix 0 e))) curbs)))
+               (Ifz hit acc
+                 (If (gv-has? (gv-val-type-path (Ix 1 v)) (Ix 1 (_0 hit)))
+                   acc
+                   (gv-error "seed-breaks-curb" (Ix 0 v))))))
+      1 vals))
+  (define need-ok
+    (Ifz (Sz vals) 1
+      (foldl (lambda (acc grp)
+               (If (Truth (find (lambda (s) (gv-has? s slots)) grp))
+                 acc
+                 (gv-error "seed-misses-need-group (first slot named)"
+                   (Ix 0 grp))))
+        1 need)))
+  (And curb-ok need-ok))
+
+;; Walk the lit trie linting every node against its own melded lash
+;; (for a lit path that IS the lash yoke/adopt assigns).  Var
+;; subtrees carry no vals (reader-enforced) and are skipped.
+(define (gv-lint-go self node)
+  (define own
+    (Ifz (Ix 0 node) 1 (gv-lint-node (Ix 0 node) (Ix 3 node))))
+  (foldl (lambda (acc a)
+           (If (Eq "var" (Ix 0 a)) acc (And acc (self self (Ix 2 a)))))
+    own (Ix 1 node)))
+(define (gv-lint node) (gv-lint-go gv-lint-go node))
 
 ;;; Entry points ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -711,21 +1064,39 @@
 
 (define (grove-tree name src)
   (define ir (gv-read src))
-  (define node (Ix 1 ir))
-  (define deps (Ix 2 ir))
+  (define node (DeepSeq (gv-lint (Ix 1 ir)) (Ix 1 ir)))
+  (define deps (Weld (Ix 2 ir) (gv-tacks node)))
   (define grants (Ix 3 ir))
+  (define imports (Ix 4 ir))
+  (define ops (Ix 5 ir))
+  (define code-kooks (gv-check-aliases imports (gv-code-kooks node)))
   (define appy
     (Or (Sz deps)
       (Or (Sz grants)
-        (Or (gv-any-kooks? node) (gv-any-vals? node)))))
+        (Or (Sz ops)
+          (Or (gv-any-kooks? node) (gv-any-vals? node))))))
+  ;; op fns bind companion entries by name: no companion, no ops
+  (define ops-ok
+    (Ifz (Sz ops) ops
+      (Ifz (Sz imports)
+        (gv-error "ops-need-a-companion-import" (Ix 0 (Ix 0 ops)))
+        ops)))
+  ;; armor only apps: a typing-only grove stays light even with var
+  ;; arms (nothing mounts, so there is nothing to ward)
+  (define anode (Ifz appy node (gv-armor node)))
   (define role-decls
     (map (lambda (e) (gv-decl-t (Ix 0 e) "lash" (gv-lash-t (Ix 1 e))))
       (Ix 0 ir)))
   (define spec-decl (gv-decl-t "spec" "yoke" (gv-yoke-t node deps)))
+  (define import-decls
+    (_1 (foldl (lambda (st imp)
+                 [(Add 1 (Ix 0 st))
+                  (snoc (gv-import-t name (Ix 0 st) imp) (Ix 1 st))])
+          [0 []] imports)))
   (define app-decls
     (Ifz appy []
       [(gv-decl-t "tpl" "nat"
-         (npar [(nw "unparse") (nbrk [(gv-tpl-root-t node deps)])]))
+         (npar [(nw "unparse") (nbrk [(gv-tpl-root-t anode deps ops)])]))
        (gv-decl-t "app" "mani"
          (npar [(npth ["tmpl" "mani_spec"])
                 (nq (strcat ["'" name]))
@@ -734,11 +1105,19 @@
                 (nw "tpl")
                 (nw "spec")
                 (gv-wants-t grants)
-                (gv-extras-t node)]))]))
+                (nbrk (Weld (map gv-op-extra-t ops-ok)
+                        (map gv-extra-t (gv-extras anode))))
+                (nbrk (map gv-decl-kook-t code-kooks))]))]))
   (ngrp
     (Weld (Ifz appy gv-prelude gv-prelude-app)
-      (Weld role-decls (cons spec-decl app-decls)))))
+      (Weld import-decls
+        (Weld role-decls (cons spec-decl app-decls))))))
 
 ;; Generate AND compile.  -> subject
 (define (grove-compile sut name src)
   (foil:compile-rex sut name (grove-tree name src)))
+
+;; Cache-threaded variant: how helm (and any test with a companion
+;; module already in the cache) compiles a grove.  -> [cache' sut]
+(define (grove-compile-cached cache sut name src)
+  (foil:compile-rex-cached cache sut name (grove-tree name src)))
