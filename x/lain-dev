@@ -52,6 +52,16 @@ wisp_bin () {
 
 running () { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 
+# Anyone listening on the port (or its wire twin)?  An orphaned serve
+# — one whose pid file was lost, e.g. an rm -rf run/lain-dev while it
+# ran — keeps both ports, the new serve's bind fails NON-fatally
+# ("bind/listen failed" in the log, boot completes deaf), and every
+# request silently reaches the old world: stale evals/doctests/faces
+# with no error anywhere.  Refuse to start into that.
+port_holders () {
+  lsof -nP -iTCP:"$1" -iTCP:"$(( $1 + 1 ))" -sTCP:LISTEN 2>/dev/null | tail -n +2
+}
+
 log_len () { if [ -f "$LOG" ]; then wc -l < "$LOG"; else echo 0; fi }
 
 delta () { tail -n +"$(( $1 + 1 ))" "$LOG"; }
@@ -97,6 +107,12 @@ start () {
     port="$baked"
     [ -n "$port" ] || die "no recorded port for the serve snapshot; use --fresh"
   fi
+  holders="$(port_holders "$port")"
+  if [ -n "$holders" ]; then
+    echo "x/lain-dev: port $port (or wire $((port + 1))) is already taken:" >&2
+    echo "$holders" >&2
+    die "kill the listener first (an orphaned serve?) — a boot into a taken port completes silently deaf"
+  fi
   rm -f "$CTL"; mkfifo "$CTL"
   : > "$LOG"
   ( cd "$DEV/serve" && exec "$WISP" --file-root "$ROOT/src" snap root _ ) < "$CTL" >> "$LOG" 2>&1 &
@@ -123,6 +139,12 @@ wait_up () {
   [ -n "$port" ] || die "no serve recorded; x/lain-dev start"
   i=0
   while [ "$i" -lt "$secs" ]; do
+    if grep -aq 'bind/listen failed' "$LOG" 2>/dev/null; then
+      echo "x/lain-dev: the serve could NOT bind port $port or $((port + 1)) — another" >&2
+      echo "process holds it, and anything answering HTTP there is the OLD world:" >&2
+      port_holders "$port" >&2
+      exit 1
+    fi
     if curl -fsS -o /dev/null --max-time 2 "http://localhost:$port/ns" 2>/dev/null; then
       echo "up: http://localhost:$port/ns (log: run/lain-dev/serve.log)"
       return 0
@@ -216,6 +238,12 @@ stop () {
     rm -f "$PIDF"
   fi
   rm -f "$CTL"
+  p="$(cat "$PORTF" 2>/dev/null || echo '')"
+  if [ -n "$p" ] && [ -n "$(port_holders "$p")" ]; then
+    echo "x/lain-dev: WARNING — port $p (or wire) is still held after stop:" >&2
+    port_holders "$p" >&2
+    echo "x/lain-dev: an orphaned serve; kill it before the next start" >&2
+  fi
   echo "stopped"
 }
 
