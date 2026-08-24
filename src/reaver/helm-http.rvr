@@ -290,6 +290,11 @@
 ;; the /w.js runtime cord: served statically, no namespace event.
 (define (h-wjs hs) (Ix 14 hs))
 (define (h-wjs? hs) (Gt (Sz hs) 14))
+;; vine_warp + twig/nat: the op endpoint (POST /op/<dst>) builds a
+;; warp task from the form fields.
+(define (h-warp hs) (Ix 15 hs))
+(define (h-twign hs) (Ix 16 hs))
+(define (h-op? hs) (Gt (Sz hs) 16))
 
 ;; "/vine" or "/vine/..." — the write box's endpoint.
 (define (vine-url? u)
@@ -334,6 +339,17 @@
   (And (Eq "/fork" (Mod u (Lsh 1 40)))
     (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
 
+;; "/op/..." — the op endpoint: POST /op/<dst> with op=<op node
+;; path>, optional back=<bounce url>; every other field k=v becomes
+;; an input slot at the "/"-split key (all-digit values as pd nats,
+;; else text), plus ['when] stamped with the host clock.  The task is
+;; a warp: the op card's fn applied to (input, dst's record) — ops
+;; are how apps expose write protocols (grove # forms) and how apps
+;; install (/kook/install).
+(define (op-url? u)
+  (And (Eq "/op" (Mod u (Lsh 1 24)))
+    (Or (Eq 3 (Bytes u)) (Eq "/" (Load8 3 u)))))
+
 ;; Leading decimal run of a form field, 0 when none.
 (define (parse-nat s)
   (define n (Bytes s))
@@ -367,6 +383,38 @@
         m
         ((h-madd hs) ((h-twigt hs) [("ts" (_0 kv))] (_1 kv)) m)))
     (h-myth0 hs)
+    (form-fields body)))
+
+;; Every byte a decimal digit (and at least one): parse-nat would
+;; happily coerce "12abc", so op fields gate on this first.
+(define (all-digits? s)
+  (define n (Bytes s))
+  (define (go i)
+    (If (Ge i n) 1
+      (let ((c (Load8 i s)))
+        (If (And (Ge c 48) (Le c 57)) (go (Inc i)) 0))))
+  (And n (go 0)))
+
+;; The op input myth: fields as slots at their "/"-split keys (the
+;; same quip codec as url-target, so "srs/grade" lands at ['srs
+;; 'grade]), digits as data pails, text otherwise; "op" and "back"
+;; are control fields; ['when] carries the host clock for ops that
+;; need a timestamp.  An unparseable key drops its field.
+(define (op-myth hs now body)
+  (foldl
+    (lambda (m kv)
+      (cond
+        ((Equal "op" (_0 kv)) m)
+        ((Equal "back" (_0 kv)) m)
+        (else
+          (let ((sk (url-target (_0 kv))))
+            (Ifz sk m
+              ((h-madd hs)
+               (If (all-digits? (_1 kv))
+                 ((h-twign hs) (_0 sk) (parse-nat (_1 kv)))
+                 ((h-twigt hs) (_0 sk) (_1 kv)))
+               m))))))
+    ((h-madd hs) ((h-twign hs) [("ts" "when")] now) (h-myth0 hs))
     (form-fields body)))
 
 ;; The form post's bounce: straight back to the page the form named.
@@ -554,6 +602,35 @@
               (task ((h-poke hs) (_0 target) (edit-myth hs body))))
           (Seq (helm:send! coord ["cmd" name task])
             (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
+    ;; The op endpoint: POST /op/<dst> emits a warp of the op the
+    ;; form named, input built from the remaining fields, and waits
+    ;; on the kernel's verdict — the same ack/bounce discipline as
+    ;; /post ("post" queue kind).
+    (define (op! z)
+      (define url (_2 msg))
+      (define body (_3 msg))
+      (define dst (url-target (Rsh url 24)))
+      (define opp (url-target (form-field "op" body)))
+      (define back0 (form-field "back" body))
+      (define (reply status body2)
+        (Seq (helm:send! (Ix 0 caps)
+               ["res" status body2 "text/plain; charset=utf-8"])
+          (loop serial pending queue)))
+      (cond
+        ((Ifz dst 1 0) (reply 404 "unparseable path segment"))
+        ((Or (Ifz opp 1 0) (Nil (Sz (_0 opp))))
+          (reply 400 "op= must be a namespace path"))
+        (else
+          (let ((back (If (Eq 0 (Bytes back0))
+                        (strWeld "/ns" (quip:print-path (_0 dst)))
+                        back0))
+                (task ((h-warp hs) (_0 dst) (_0 opp)
+                        ;; seconds, not the primop's nanoseconds —
+                        ;; ops do day arithmetic on ['when]
+                        (op-myth hs (Div (Now 0) 1000000000) body))))
+            (Seq (helm:send! coord ["cmd" name task])
+              (loop serial pending
+                (snoc [(_0 dst) "post" (Ix 0 caps) back] queue)))))))
     ;; The counterfactual endpoint: evaluate the intervention myth
     ;; (the same expression discipline as the write box), hand the
     ;; whole job to the coordinator as a ["branch" ..] message, and
@@ -642,6 +719,9 @@
       ((And (Eq kind "req")
          (And (h-vine? hs) (fork-url? (_2 msg))))
         (fork! 0))
+      ((And (Eq kind "req")
+         (And (h-op? hs) (op-url? (_2 msg))))
+        (op! 0))
       ((Eq kind "req")
         ;; a new part of the namespace for this connection
         (let* ((parts (filter Bytes (split-ch 47 (_2 msg))))

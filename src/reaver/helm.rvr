@@ -419,7 +419,9 @@
          (mmeld (ns-t (map (lambda (en) (Weld mnode (Ix 0 en))) ents))
            (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)))))
      ents])
-  (map mod-parts cache))
+  ;; module rows only: the compile cache also carries foil's 3-field
+  ;; "#world" memo rows (real module rows are 6+ fields)
+  (map mod-parts (filter (lambda (e) (Lt 5 (Sz e))) cache)))
 
 ;; The boot-path builder: reference rows deferred (the who-calls table
 ;; costs ~33s; ref-upgrade-task below re-mirrors WITH refs as one
@@ -763,100 +765,55 @@
   (define ap (If all? 1 (Ifz hit 0 (Ix 2 (_0 hit)))))
   [(And want-fetch af) (If ap want-port 0)])
 
-;; Mount one compiled app at ['app <name>]: a single make whose card
-;; carries the manifest — the in-kernel pact/form expansion commits
-;; the whole app subtree in that one epoch, and a failed worm commits
-;; nothing, so there is never a partial subtree.  Any failure
-;; (compile, brand gate, mount outcome, root collision — a make on a
-;; live root fails the event) leaves an pact/fail tombstone at the
-;; root instead: a broken app is a visible namespace citizen.
-;;
-;; The card also carries the grant ledger: what the manifest asked for
-;; and what this host allowed.  The helm's move gate reads the
-;; ['grants 'fetch] slot back off this very card, so the mount is the
-;; only place authority is decided.
-(define (mount-app-at core sov root name res policy)
-  (define vine-make (core-ent core ["vine_make"]))
-  (define run-event (core-ent core ["run_event"]))
-  (define (fail err)
-    (define fail-t (core-ent core ["pact" "fail"]))
-    (define o
-      (Try (lambda (z)
-             (run-event (vine-make root (fail-t (err-cord err))) 0 sov))
-        0))
-    (Seq (Trace ["app-mount-failed" name err] 0)
-      (If (And (Eq 0 (Hd o)) (Eq "/boot/ovum/ripe" (Hd (_0 o))))
-        (Ix 0 (_0 o))
-        sov)))
-  ;; component registration: one make under /weft per weft seed
-  ;; (zoo/tasks) after a successful mount.  Never fatal — a failed
-  ;; registration is a Trace, and the app stays mounted.
-  (define (register s2)
-    (define ts (Try (lambda (z)
-                      (let* ((zoo-tasks (core-ent core ["zoo" "tasks"]))
-                             (mod (strcat ["apps/" name "/main"]))
-                             (r (zoo-tasks root mod (_1 res))))
-                        (Seq (DeepSeq r r) r)))
-                 0))
-    (If (Eq 1 (Hd ts))
-      (Seq (Trace ["zoo-register-failed" name] 0) s2)
-      (foldl
-        (lambda (s t)
-          (let ((o (Try (lambda (z) (run-event t 0 s)) 0)))
-            (If (And (Eq 0 (Hd o)) (Eq "/boot/ovum/ripe" (Hd (_0 o))))
-              (Ix 0 (_0 o))
-              (Seq (Trace ["zoo-register-failed" name] 0) s))))
-        s2 (_0 ts))))
-  (If (Eq "ERR" (_0 res))
-    (fail (_1 res))
-    (let* ((app-card (core-ent core ["pact" "card"]))
-           (has-fetch (core-ent core ["grant" "has_fetch"]))
-           (serve-port (core-ent core ["grant" "serve_port"]))
-           (mod (strcat ["apps/" name "/main"]))
-           ;; mani's fields read positionally off the nominal rep
-           ;; (brand at Hd, fields from Ix 0): wants is the fifth
-           (wants (Ix 4 (_1 res)))
-           (want-fetch (has-fetch wants))
-           (want-port (serve-port wants))
-           (g (grants-for policy name want-fetch want-port))
-           (o (Try (lambda (z)
-                     (run-event
-                       (vine-make root
-                         (app-card (_1 res) mod (_0 g) (Ix 1 g)))
-                       0 sov))
-                0)))
-      (Seq
-        ;; a denied want is visible, not silent
-        (If (And want-fetch (Nil (_0 g)))
-          (Trace ["app-grant-denied" name "fetch"] 0) 0)
-        (If (Eq 1 (Hd o))
-          (fail (_0 o))
-          (If (Eq "/boot/ovum/ripe" (Hd (_0 o)))
-            (register (Ix 0 (_0 o)))
-            (fail ["mount-not-ripe" (_0 o)])))))))
+;; The kernel install op's fn: (input, cur) -> the pact/card for the
+;; app named by the input's ['app] text slot, or a pact/fail record.
+;; Closes over the boot-compiled [[name res]..] roster and the grant
+;; policy, so the warp is where authority is decided — the card
+;; carries the grant ledger the helm's move gate reads back.  Every
+;; record is minted by compiled subject ctors (op/pact rows are
+;; nominal and cannot be hand-built across the FFI).
+(define (install-fn core ar policy)
+  (define txt-at (core-ent core ["myth" "txt_at"]))
+  (define app-card (core-ent core ["pact" "card"]))
+  (define fail-t (core-ent core ["pact" "fail"]))
+  (define has-fetch (core-ent core ["grant" "has_fetch"]))
+  (define serve-port (core-ent core ["grant" "serve_port"]))
+  (lambda (input cur)
+    (let* ((name (txt-at [(ts "app")] input))
+           (hit (find (lambda (e) (Equal name (_0 e))) ar)))
+      (cond
+        ((Nil (Bytes name)) (fail-t "install: missing ['app] name"))
+        ((Ifz hit 1 0)
+          (fail-t (strcat ["install: unknown app " name
+                           " (apps are discovered at boot)"])))
+        ((Eq "ERR" (_0 (_1 (_0 hit))))
+          (fail-t (err-cord (_1 (_1 (_0 hit))))))
+        (else
+          (let* ((mani (_1 (_1 (_0 hit))))
+                 ;; mani's fields read positionally off the nominal
+                 ;; rep (brand at Hd, fields from Ix 0): wants fifth
+                 (wants (Ix 4 mani))
+                 (want-fetch (has-fetch wants))
+                 (g (grants-for policy name want-fetch (serve-port wants))))
+            (Seq
+              (If (And want-fetch (Nil (_0 g)))
+                (Trace ["app-grant-denied" name "fetch"] 0) 0)
+              (app-card mani (strcat ["apps/" name "/main"])
+                (_0 g) (Ix 1 g)))))))))
 
-;; The default root: ['app <name>].  The root is the MOUNTER's
-;; parameter (shrine-apps.md section 5.1) — roots is a [[name root]..]
+;; The default install root: ['app <name>] — roots is a [[name root]..]
 ;; override table for apps that own a top-level root of their own
-;; (the chat app lives at /chat).
-(define (mount-app core sov name res)
-  (mount-app-at core sov [(ts "app") (ts name)] name res []))
-
+;; (the chat app lives at /chat).  Shared, because a remount has to
+;; reach the same root the install landed at (helm-sync.rvr).  Apps
+;; are NOT mounted at boot: /boot mirrors every compiled module (the
+;; catalog), and a warp of /kook/install at the chosen root is the
+;; explicit install.
 (define (mount-root roots name)
   (define hit (find (lambda (e) (Equal name (_0 e))) roots))
   (Ifz hit [(ts "app") (ts name)] (_1 (_0 hit))))
 
-;; The override table itself: apps that own a top-level root instead
-;; of the default /app/<name>.  Shared, because a remount has to reach
-;; the same root the boot mounted at (helm-sync.rvr).
 (define app-roots
   [["chat" [(ts "chat")]] ["nenex" [(ts "nenex")]]])
-
-(define (mount-apps core sov apps roots policy)
-  (foldl
-    (lambda (s e)
-      (mount-app-at core s (mount-root roots (_0 e)) (_0 e) (_1 e) policy))
-    sov apps))
 
 ;;; Boot-time doctest sweep (doc/doctest-runner-explorer.md part I) ;;;;;;;;;;;;;;;;;
 
@@ -918,7 +875,8 @@
                 (_0 hit)))
             acc2)))
       acc1 (entry-own-keys me)))
-  (foldl mod-tasks [] cache))
+  ;; module rows only (skip foil's 3-field "#world" memo rows)
+  (foldl mod-tasks [] (filter (lambda (e) (Lt 5 (Sz e))) cache)))
 
 ;; Apply the sweep directly to a sovereign (pre-spawn seeding; tests
 ;; and tools).  Tolerant: a failed poke traces and moves on —

@@ -54,6 +54,8 @@
 (#bind foil-render (#module foil-render))
 (#bind helm (#module helm))
 (#bind helm-repl (#module helm-repl))
+(#bind helm-http (#module helm-http))
+(#bind quip (#module quip))
 (#bind wire-json (#module wire-json))
 
 (define (ts s) ("ts" s))
@@ -87,22 +89,29 @@
 
 ;;; The environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; ["S" core coord cache funnel renv serial].  cache is the live
+;; ["S" core coord cache funnel renv serial itab].  cache is the live
 ;; compile cache: it starts as the boot mirror cache and every
 ;; successful rebuild replaces one row, so the next compile sees its
 ;; dependencies fresh.  renv/serial drive the delegated wire ops
-;; (helm-repl:wire-handle — describe, complete, eval, ...).
+;; (helm-repl:wire-handle — describe, complete, eval, ...).  itab is
+;; the import-table cache ([[mod src imports] ..]): a module's import
+;; row re-parses only when its bytes changed (see import-row).
 (define (env-core e) (Ix 1 e))
 (define (env-coord e) (Ix 2 e))
 (define (env-cache e) (Ix 3 e))
 (define (env-funnel e) (Ix 4 e))
 (define (env-renv e) (Ix 5 e))
 (define (env-serial e) (Ix 6 e))
+(define (env-itab e) (Ix 7 e))
 (define (env-cache-set e c)
-  ["S" (env-core e) (env-coord e) c (env-funnel e) (env-renv e) (env-serial e)])
+  ["S" (env-core e) (env-coord e) c (env-funnel e) (env-renv e)
+   (env-serial e) (env-itab e)])
 (define (env-serial-inc e)
   ["S" (env-core e) (env-coord e) (env-cache e) (env-funnel e) (env-renv e)
-   (Inc (env-serial e))])
+   (Inc (env-serial e)) (env-itab e)])
+(define (env-itab-set e it)
+  ["S" (env-core e) (env-coord e) (env-cache e) (env-funnel e) (env-renv e)
+   (env-serial e) it])
 
 (define (e-ent e path) (helm:core-ent (env-core e) path))
 
@@ -154,15 +163,35 @@
 
 ;;; Ordering the rebuild ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; [[mod [direct-imports..]] ..] over the roster — one parse per file,
-;; and only paid once something actually changed.  Imports outside the
-;; roster (fixtures, missing files) drop out: they cannot be dirty.
-(define (import-table roster)
-  (map
-    (lambda (m)
-      [m (filter (lambda (i) (includes (Eq i) roster))
-           (foil:module-imports m))])
-    roster))
+;; One import-table row, against the cache: [mod src imports].  A
+;; cached row whose source bytes still match reuses its parsed
+;; imports; anything else pays foil:module-imports — a full-file
+;; parse, which is why the cache exists (the whole-roster parse was a
+;; measured ~8s fixed tax on EVERY sync and plan, dwarfing a leaf
+;; module's 1s compile).  Imports outside the roster (fixtures,
+;; missing files) drop out: they cannot be dirty.
+(define (import-row itab roster m)
+  (define disk (Try (lambda (z) (foil:get-foil m)) 0))
+  (define src (If (Eq 1 (Hd disk)) 0 (_0 disk)))
+  (define hit (find (lambda (r) (Eq m (Ix 0 r))) itab))
+  (define cached
+    (Ifz hit
+      0
+      (If (Equal src (Ix 1 (_0 hit)))
+        [(Ix 2 (_0 hit))]
+        0)))
+  (Ifz cached
+    [m src (filter (lambda (i) (includes (Eq i) roster))
+             (foil:module-imports m))]
+    [m src (_0 cached)]))
+
+;; The cached import table: -> [itab' [[mod [direct-imports..]] ..]].
+;; Forced whole so retained rows never pin a parse tree, and so the
+;; first sync's timing honestly attributes the one full parse it pays.
+(define (import-table-cached itab roster)
+  (define rows0 (map (lambda (m) (import-row itab roster m)) roster))
+  (define rows (DeepSeq rows0 rows0))
+  [rows (map (lambda (r) [(Ix 0 r) (Ix 2 r)]) rows)])
 
 (define (imports-of tab mod)
   (define hit (find (lambda (r) (Eq mod (_0 r))) tab))
@@ -245,14 +274,20 @@
     [(Ix 1 segs)]
     0))
 
-;; A rebuilt app upgrades in place: the fresh MANIFEST poked at its
-;; mount root's pact slot, which pact/talk diffs against the live
-;; subtree and expands as the delta (shrine-apps.md 5.2).  Only the
-;; manifest slot rides the poke — a full pact/card would clobber the
-;; grant ledger back to denied.  An app entry that stopped being a
-;; manifest is left alone — the mount that is running is better than
-;; no mount.
-(define (remount-app-tasks core mod sut)
+;; A rebuilt app upgrades every INSTALLED copy in place: the fresh
+;; MANIFEST poked at each live root's pact slot, which pact/talk
+;; diffs against the live subtree and expands as the delta
+;; (shrine-apps.md 5.2).  Only the manifest slot rides the poke — a
+;; full pact/card would clobber the grant ledger back to denied.
+;; Apps are not mounted at boot, so each candidate root (the
+;; app-roots override and the /app/<name> default) is PROBED first
+;; and pokes only when it holds this very app (matching ['module]) —
+;; an uninstalled app is simply not remounted, and an unrelated
+;; record at the root is left alone.  An app entry that stopped
+;; being a manifest is left alone too — the mount that is running is
+;; better than no mount.
+(define (remount-app-tasks e mod sut)
+  (define core (env-core e))
   (define hit (app-of mod))
   (Ifz hit
     []
@@ -261,14 +296,23 @@
            (msing (helm:core-ent core ["myth" "sing"]))
            (psl (helm:core-ent core ["pact" "slot"]))
            (vine-poke (helm:core-ent core ["vine_poke"]))
+           (txt-at (helm:core-ent core ["myth" "txt_at"]))
            (r (Try (lambda (z)
                      (let ((m (foil:source-entry-val ["app"] sut)))
                        (Seq (DeepSeq m 0) m)))
                 0)))
       (If (Or (Eq 1 (Hd r)) (Nil (Eq 1 (mani-ok (_0 r)))))
         []
-        [(vine-poke (helm:mount-root helm:app-roots name)
-           (msing psl (_0 r)))]))))
+        (let* ((rover (helm:mount-root helm:app-roots name))
+               (rdefault [(ts "app") (ts name)])
+               (roots (If (Equal rover rdefault) [rover] [rover rdefault]))
+               (installed?
+                 (lambda (rt)
+                   (let ((q (query e rt)))
+                     (And (Eq "/boot/res/known" (Hd q))
+                       (Equal mod (txt-at [(ts "module")] (_0 q))))))))
+          (map (lambda (rt) (vine-poke rt (msing psl (_0 r))))
+            (filter installed? roots)))))))
 
 ;;; One module ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -301,7 +345,7 @@
            (sut (_1 (_0 r)))
            (me (_0 (find (lambda (x) (Eq mod (_0 x))) cache2)))
            (tasks (cons (remount-task core me)
-                    (remount-app-tasks core mod sut)))
+                    (remount-app-tasks e mod sut)))
            ;; map is lazy and inject is an effect: force the whole row
            ;; of verdicts here rather than wherever it gets read
            (reps0 (map (lambda (t) (inject e t)) tasks))
@@ -335,7 +379,9 @@
   (Ifz (Sz changed)
     (let ((rows ["nothing to sync — the namespace matches foil/"]))
       (Seq (emit rows) [e rows 0 []]))
-    (let* ((tab (import-table roster))
+    (let* ((it (import-table-cached (env-itab e) roster))
+           (e1 (env-itab-set e (Ix 0 it)))
+           (tab (Ix 1 it))
            (order (build-order tab (dirty-closure tab changed)))
            (t0 (Now 0)))
       (Seq t0
@@ -353,7 +399,7 @@
                              (Add (Ix 2 acc) (If (Ix 2 r) 0 1))
                              (Weld (Ix 3 acc)
                                (map (lambda (d) [mod d]) (Ix 3 r)))])))
-                      [e head 0 []] order)))
+                      [e1 head 0 []] order)))
           ;; force the fold before the closing line: it IS the work,
           ;; and a lazy fold would print "synced in 0s" first and only
           ;; then run (and report) the modules underneath it
@@ -369,22 +415,27 @@
 (define (sync e seed)
   (Ix 0 (sync-run e seed)))
 
-;; What a plain s would rebuild, structurally: [changed order].
+;; What a plain s would rebuild, structurally: [env' changed order] —
+;; env' carries the refreshed import-table cache forward, so the sync
+;; that follows a plan pays no second parse.
 (define (plan-info e)
   (define roster (disk-roster 0))
   (define changed (changed-mods e roster))
   (Ifz (Sz changed)
-    [[] []]
-    (let ((tab (import-table roster)))
-      [changed (build-order tab (dirty-closure tab changed))])))
+    [e [] []]
+    (let* ((it (import-table-cached (env-itab e) roster))
+           (e1 (env-itab-set e (Ix 0 it)))
+           (tab (Ix 1 it)))
+      [e1 changed (build-order tab (dirty-closure tab changed))])))
 
-;; What a plain s would do, without doing it.
+;; What a plain s would do, without doing it: -> [env' rows].
 (define (plan-rows e)
   (define pi (plan-info e))
-  (Ifz (Sz (Ix 0 pi))
-    ["nothing to sync — the namespace matches foil/"]
-    [(strcat ["changed:  " (join-str " " (Ix 0 pi))])
-     (strcat ["rebuild:  " (join-str " " (Ix 1 pi))])]))
+  (define e1 (Ix 0 pi))
+  (Ifz (Sz (Ix 1 pi))
+    [e1 ["nothing to sync — the namespace matches foil/"]]
+    [e1 [(strcat ["changed:  " (join-str " " (Ix 1 pi))])
+         (strcat ["rebuild:  " (join-str " " (Ix 2 pi))])]]))
 
 ;;; The loop ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -478,6 +529,84 @@
      ["diags" (wire-sync-diags (Ix 3 r))]]))
 
 ;; One wire request -> [env' response-json].
+;; The wire install: warp /kook/install at the chosen root (the
+;; app-roots override or /app/<name>), then the host-side follow-ups
+;; the kernel deliberately cannot do — component registration in the
+;; /weft zoo (a mount expansion is jailed to its own subtree), and
+;; for chat the hand-node provisioning (the /kook/llm limb + the
+;; credential staged on that card at boot).  The mani for zoo/tasks
+;; is read back off the freshly installed card's ['pact] slot, so it
+;; is exactly the installed version.  -> [e reply-json]
+(define (install-run e name root0)
+  (define core (env-core e))
+  (define (ent p) (helm:core-ent core p))
+  (define root
+    (If (Bytes root0)
+      (let ((r (helm-http:url-target root0)))
+        (Ifz r 0 (_0 r)))
+      (helm:mount-root helm:app-roots name)))
+  (define (reply ok rows)
+    [e (wire-json:jobj
+         [["ok" (If ok "true" "false")]
+          ["report" (wire-json:jarr-str rows)]])])
+  (If (Ifz root 1 0)
+    (reply 0 ["install: unparseable root"])
+    (let* ((wtask ((ent ["vine_warp"]) root
+                    [(ts "kook") (ts "install")]
+                    ((ent ["myth" "sing"]) [(ts "app")] ((ent ["pt"]) name))))
+           (w (inject e wtask)))
+      (If (Nil (committed? w))
+        (reply 0 [(strcat ["install: the namespace refused the warp — "
+                           (helm-http:err-text (Ix 1 w))])])
+        (let* ((q (query e root))
+               (rec (If (Eq "/boot/res/known" (Hd q)) (_0 q) 0))
+               (txt-at (ent ["myth" "txt_at"]))
+               (status (Ifz rec 0 (txt-at [(ts "status")] rec))))
+          (cond
+            ((Ifz rec 1 0) (reply 0 ["install: no record at the root after commit"]))
+            ((Equal "failed" status)
+              (reply 0 [(strcat ["install failed: " (txt-at [(ts "err")] rec)])]))
+            (else
+              (let* ((mod (strcat ["apps/" name "/main"]))
+                     (mani ((ent ["myth" "pail_at"]) [(ts "pact")] rec))
+                     (zr (Try (lambda (z)
+                                (let ((t ((ent ["zoo" "tasks"]) root mod mani)))
+                                  (Seq (DeepSeq t t) t)))
+                           0))
+                     (zrows
+                       (If (Eq 1 (Hd zr))
+                         ["zoo: registration tasks failed to build (non-fatal)"]
+                         (map (lambda (t)
+                                (If (committed? (inject e t))
+                                  "zoo: component registered"
+                                  "zoo: a registration was refused (non-fatal)"))
+                           (_0 zr))))
+                     (chatrows
+                       (If (Equal "chat" name)
+                         (let* ((lq (query e [(ts "kook") (ts "llm")]))
+                                (auth (If (Eq "/boot/res/known" (Hd lq))
+                                        (txt-at [(ts "auth")] (_0 lq))
+                                        0))
+                                (limb ((ent ["kooked"]) [[(ts "kook") (ts "llm")]]))
+                                (card (If (Bytes auth)
+                                        ((ent ["myth" "add"])
+                                         ((ent ["twig" "txt"]) [(ts "auth")] auth)
+                                         limb)
+                                        limb))
+                                (pr (inject e ((ent ["vine_poke"])
+                                                (Weld root [(ts "conv") (ts "api")])
+                                                card))))
+                           (If (committed? pr)
+                             [(If (Bytes auth)
+                                "chat: hand node provisioned (limb + key)"
+                                "chat: hand node provisioned (limb, no key)")]
+                             ["chat: hand provisioning was refused"]))
+                         [])))
+                (reply 1
+                  (cons (strcat ["installed " name " at "
+                                 (quip:print-path root)])
+                    (Weld (DeepSeq zrows zrows) chatrows)))))))))))
+
 (define (wire-line e line)
   (define pr (helm-repl:jparse line))
   (If (Nil (wire-json:jok? pr))
@@ -486,12 +615,20 @@
            (op (wire-json:jget-str "op" v))
            (mod (wire-json:jget-str "module" v)))
       (cond
+        ((Eq op "install")
+          (let ((nm (wire-json:jget-str "name" v)))
+            (If (Nil (Bytes nm))
+              [e (wire-json:jobj
+                   [["ok" "false"]
+                    ["error" (wire-json:jq "install needs name")]])]
+              (install-run e nm (wire-json:jget-str "root" v)))))
         ((Eq op "plan")
-          (let ((pi (plan-info e)))
-            [e (wire-json:jobj
-                 [["ok" "true"]
-                  ["changed" (wire-json:jarr-str (Ix 0 pi))]
-                  ["rebuild" (wire-json:jarr-str (Ix 1 pi))]])]))
+          (let* ((pi (plan-info e))
+                 (e1 (Ix 0 pi)))
+            [e1 (wire-json:jobj
+                  [["ok" "true"]
+                   ["changed" (wire-json:jarr-str (Ix 1 pi))]
+                   ["rebuild" (wire-json:jarr-str (Ix 2 pi))]])]))
         ((Or (Eq op "sync") (Eq op "compile"))
           (let* ((seed (If (Eq op "compile")
                          (Ifz mod [] [mod])
@@ -525,7 +662,9 @@
     ((Equal "" cmd) [e])
     ((Equal "q" cmd) 0)
     ((Equal "h" cmd) (Seq (emit help-rows) [e]))
-    ((Equal "l" cmd) (Seq (emit (plan-rows e)) [e]))
+    ((Equal "l" cmd)
+      (let ((pr (plan-rows e)))
+        (Seq (emit (Ix 1 pr)) [(Ix 0 pr)])))
     ((Equal "s" cmd)
       (Ifz (Sub (Sz ws) 1)
         [(sync e [])]
@@ -586,7 +725,7 @@
               (wir (Spawn (helm-repl:wire-pump (Inc port)))))
           (Seq (SendCaps pump ["go"] [fun])
             (Seq (SendCaps wir ["go"] [fun])
-              (let ((e ["S" core coord cache fun renv 0]))
+              (let ((e ["S" core coord cache fun renv 0 []]))
                 (Seq (emit
                        [""
                         (strcat ["lain serving on http://localhost:"

@@ -425,7 +425,8 @@
   (define pack (resolved-import-pack ri))
   ;; eager residue 1: import exports that replace a substrate key
   (define sut1
-    (foil-subject:put-entry-pins (pack-substrate-shadows pack) sut))
+    (zspan "p-shadows"
+      (foil-subject:put-entry-pins (pack-substrate-shadows pack) sut)))
   (define prefix (Weld (foil-subject:sut-root sut1) (foil-env:mount-at mount)))
   ;; Culls live in the symbolic mount layer; compiled makes live in the export
   ;; layer.  Apply the former first so a later make/revival can replace it.
@@ -440,14 +441,16 @@
   ;; method-resolution inverse are untouched by laziness)
   (define export-rows (pack-export-rows pack))
   (define with-marks
-    (foldl
-      (lambda (acc row)
-        (let ((written (Weld prefix (_0 row))))
-          (Ifz (_1 row)
-            ;; A cull occupies source visibility without a compiled entry.
-            (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
-            (foil-subject:mark-visible written (Ix 3 row) acc))))
-      with-culls export-rows))
+    (Seq (Trace ["p-mount" (foil-env:mount-at mount) "exports" (Sz export-rows)] 0)
+      (zspan "p-marks"
+        (foldl
+          (lambda (acc row)
+            (let ((written (Weld prefix (_0 row))))
+              (Ifz (_1 row)
+                ;; A cull occupies source visibility without a compiled entry.
+                (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
+                (foil-subject:mark-visible written (Ix 3 row) acc))))
+          with-culls export-rows))))
   ;; append the lazy mount record (reachable rides field 4); the
   ;; combined dispatch is built once by project-mounts after every
   ;; mount has landed — newest-first with skip-if-present, which
@@ -511,8 +514,17 @@
              (foil-subject:get-span canonical sut))]))
       (rowify (cairn:tapax (foil-subject:sut-visible rooted))))))
 
-;; project-mounts :: Subject -> Row ResolvedImport -> Row Mount -> Row SastRow -> Subject
-(define (project-mounts sut0 resolved mounts decls)
+;; project-mounts-base :: Subject -> Row ResolvedImport -> Row Mount -> Subject
+;;
+;; The import-derived part of the compile world: every mount landed
+;; (storage shadows, visibility marks, the inverse) plus the sealed
+;; dispatch.  A pure function of (substrate, the mounts' unit
+;; contents, the mount prefixes, order) and NOTHING of the consuming
+;; module's own declarations — which is what makes it memoizable per
+;; consumer (the #world rows compile-rex-go-sub threads through the
+;; cache): recompiling a module whose imports did not change skips
+;; the whole ~50k-key reassembly (measured 5.5s for chat).
+(define (project-mounts-base sut0 resolved mounts)
   (define mounted0
     (foldl (project-one-mount resolved)
       (mark-substrate-visible sut0)
@@ -526,26 +538,50 @@
         (let* ((ms (foil-subject:lz-mounts lz))
                (n (Sz ms))
                (dispatch
-                 (foldl
-                   (lambda (ax i)
-                     (let ((midx (Sub (Sub n 1) i)))
-                       (foldl
-                         (lambda (a pair)
-                           (Ifz (cairn:getax (_0 pair) a)
-                             (cairn:putax (_0 pair) midx a)
-                             a))
-                         ax
-                         (rowify (cairn:tapax
-                           (foil-subject:lzm-reachable (Ix midx ms)))))))
-                   cairn:empty-ax (gen n (lambda (i) i)))))
+                 (zspan "p-dispatch"
+                   (foldl
+                     (lambda (ax i)
+                       (let* ((midx (Sub (Sub n 1) i))
+                              (pairs (rowify (cairn:tapax
+                                (foil-subject:lzm-reachable (Ix midx ms))))))
+                         (Seq (Trace ["p-reach" midx (Sz pairs)] 0)
+                           (foldl
+                             (lambda (a pair)
+                               (Ifz (cairn:getax (_0 pair) a)
+                                 (cairn:putax (_0 pair) midx a)
+                                 a))
+                             ax pairs))))
+                     cairn:empty-ax (gen n (lambda (i) i))))))
           (foil-subject:set-sut-lazy [dispatch ms] mounted0)))))
-  ;; The whole own layer is visible before any body elaborates: the sealed
-  ;; fixpoint world.  elab-mod's prototype pass supplies the storage entries.
-  (foldl
-    (lambda (sut decl)
-      (let ((path (foil-subject:root-path sut (Ix 1 decl))))
-        (foil-subject:mark-visible path path sut)))
-    mounted (filter mod-decl? decls)))
+  mounted)
+
+;; project-own :: Subject -> Row SastRow -> Subject
+;;
+;; The whole own layer is visible before any body elaborates: the sealed
+;; fixpoint world.  elab-mod's prototype pass supplies the storage entries.
+(define (project-own mounted decls)
+  (zspan "p-own"
+    (foldl
+      (lambda (sut decl)
+        (let ((path (foil-subject:root-path sut (Ix 1 decl))))
+          (foil-subject:mark-visible path path sut)))
+      mounted (filter mod-decl? decls))))
+
+;; project-mounts :: Subject -> Row ResolvedImport -> Row Mount -> Row SastRow -> Subject
+(define (project-mounts sut0 resolved mounts decls)
+  (project-own (project-mounts-base sut0 resolved mounts) decls))
+
+;; NOTE (2026-08-21): a per-consumer memo of project-mounts-base (the
+;; "#world" cache rows) was built and REVERTED here.  The hit path
+;; worked (chat recompile 18s -> 11s), but on kernel rebuilds the
+;; memoized-world plumbing sent commits into multi-minute pl_eq_deep
+;; walks (value-identical, pointer-fresh worlds defeat Equal's ptr
+;; fast path) and 10GB RSS.  The memo needs runtime-level cheap value
+;; identity first: a working RefEq primop (the name resolves to an
+;; UNIMPLEMENTED primop and a call kills the actor — that was the
+;; "deadlocked serve"), pin-hash-at-alloc, or interning.  See the
+;; sync-time notes in doc/ and the project-mounts-base split, which
+;; remains (it is the memoizable boundary when this returns).
 
 ;; retain-warnings :: Row Warning -> Any -> Any
 (define (retain-warnings warnings value)

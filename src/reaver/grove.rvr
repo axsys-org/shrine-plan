@@ -196,13 +196,46 @@
       (gv-error "tack-care-must-be-y (the spun reads at y)" t))
     (gv-error "tack-wants-'?/care;path" t)))
 
+;; The hunt quip: 'h;<care>;<path> — a face binding/claim value
+;; (bond/face datum bindings, kook-face ['hunt] claims): care one of
+;; x/y/z, path "%/"-headed = app-relative (rebased at mount), absent
+;; or empty = the empty path.
+(define (gv-hunt-val t)
+  (define c (Div (rx-leaf-str t) 256))
+  (define bs (trip c))
+  (define n (Sz bs))
+  (define (seg-split i cur acc)
+    (If (Ge i n)
+      (snoc (strcat cur) acc)
+      (If (Eq 47 (Ix i bs))
+        (seg-split (Add i 1) [] (snoc (strcat cur) acc))
+        (seg-split (Add i 1) (snoc (Ix i bs) cur) acc))))
+  (define (care-ok b) (Or (Eq b 120) (Or (Eq b 121) (Eq b 122))))
+  (If (And (Ge n 3)
+        (And (Eq 104 (Ix 0 bs)) (Eq 59 (Ix 1 bs))))
+    (If (care-ok (Ix 2 bs))
+      (let ((care (strcat [(Ix 2 bs)])))
+        (cond
+          ((Eq n 3) ["h" care [0 []]])
+          ((Ifz (Eq 59 (Ix 3 bs)) 1 0) (gv-error "hunt-wants-'h;care;path" t))
+          ((Eq n 4) ["h" care [0 []]])
+          ((And (Gt n 5) (And (Eq 37 (Ix 4 bs)) (Eq 47 (Ix 5 bs))))
+            ["h" care [1 (If (Eq n 6) [] (seg-split 6 [] []))]])
+          (else ["h" care [0 (seg-split 4 [] [])]])))
+      (gv-error "hunt-care-must-be-x-y-z" t))
+    (gv-error "hunt-wants-'h;care;path" t)))
+
 ;; A : line's value token.
 (define (gv-val t)
   (cond
     ((gv-cord? t) ["t" (rx-leaf-str t)])
     ((And (gv-word? t) (gv-digits? (rx-leaf-str t))) ["n" (rx-leaf-str t)])
     ((gv-code-ref? t) (cons "f" (gv-code-ref t)))
-    ((gv-quip? t) (gv-tack-val t))
+    ((gv-quip? t)
+      (let ((c (Div (rx-leaf-str t) 256)))
+        (If (And (Eq 104 (Mod c 256)) (Eq 59 (Mod (Div c 256) 256)))
+          (gv-hunt-val t)
+          (gv-tack-val t))))
     ((And (rx-nest? t) (Eq "brack" (rx-nest-color t)))
       ["ps" (map gv-ref-path (gv-brack-elems t))])
     (else ["p" (gv-ref-path t)])))
@@ -960,6 +993,8 @@
     ((Eq "n" (Ix 0 v)) (npar [(npth ["pails" "n"]) (nw (Ix 1 v))]))
     ((Eq "ps" (Ix 0 v))
       (npar [(npth ["pails" "ps"]) (nbrk (map gv-dep-path-t (Ix 1 v)))]))
+    ((Eq "h" (Ix 0 v))
+      (npar [(nw "hunt") (nrn "." [(nw (Ix 1 v))]) (gv-dep-path-t (Ix 2 v))]))
     ((Eq "f" (Ix 0 v))
       (gv-error "code-ref-value-only-valid-for-weft (pending /x)" (Ix 1 v)))
     ((Eq "spec" (Ix 0 v)) (gv-yoke-t (Ix 1 v) []))
@@ -969,13 +1004,22 @@
 ;; ['sys 'weft] as a spun over the companion entry; tack quips land
 ;; at ['sys 'tack] as the (possibly app-relative) path pail — the /x
 ;; lens reads both.
+(define gv-weft-families ["dyed" "felt" "knit" "sewn"])
+
 (define (gv-slotval-t v)
   (define slot (Ix 0 v))
   (define val (Ix 1 v))
   (cond
     ((And (Equal ["weft"] slot) (Eq "f" (Ix 0 val)))
+      ;; the code ref's alias position doubles as the ctor family:
+      ;; dyed/felt/knit/sewn name the overlay ctor, anything else
+      ;; (the companion import alias, e.g. code#entry) stays the
+      ;; spun /x view — back-compat.
       [(gv-path-t ["sys" "weft"])
-       (npar [(nw "spun") (nw (Ix 2 val)) (nrn "." [(nw "none")])])])
+       (npar [(nw (If (gv-has? (Ix 1 val) gv-weft-families)
+                    (Ix 1 val)
+                    "spun"))
+              (nw (Ix 2 val)) (nrn "." [(nw "none")])])])
     ((Eq "tack" (Ix 0 val))
       [(gv-path-t ["sys" "tack"])
        (npar [(npth ["pails" "p"]) (gv-dep-path-t (Ix 2 val))])])
@@ -1008,6 +1052,7 @@
   (cond
     ((Eq "t" (Ix 0 v)) ["boot" "pails" "t"])
     ((Eq "n" (Ix 0 v)) ["boot" "pails" "n"])
+    ((Eq "h" (Ix 0 v)) ["boot" "hunt"])
     (else ["boot" "pails" "p"])))
 
 ;; The implicit template slots every seed record carries.
@@ -1069,7 +1114,19 @@
   (define grants (Ix 3 ir))
   (define imports (Ix 4 ir))
   (define ops (Ix 5 ir))
-  (define code-kooks (gv-check-aliases imports (gv-code-kooks node)))
+  ;; the weft val's alias position doubles as a ctor family word
+  ;; (gv-slotval-t): an import alias named dyed/felt/knit/sewn would
+  ;; silently flip meaning — reject it
+  (define alias-ok
+    (DeepSeq
+      (map (lambda (i)
+             (If (gv-has? (Ix 0 i) gv-weft-families)
+               (gv-error "import-alias-shadows-a-weft-family" (Ix 0 i))
+               0))
+        imports)
+      1))
+  (define code-kooks
+    (Seq alias-ok (gv-check-aliases imports (gv-code-kooks node))))
   (define appy
     (Or (Sz deps)
       (Or (Sz grants)

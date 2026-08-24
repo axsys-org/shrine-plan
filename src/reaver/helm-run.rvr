@@ -117,6 +117,8 @@
        (Try (lambda (z) (milton:parse-http-request "get /x http/1.1")) 0)
        (Try (lambda (z) (milton:parse-http-request "GET /x HTTP/1.1")) 0)
        (helm-http:url-target "/ns/a/b")
+       (helm-http:op-url? "/op/x")
+       (helm-http:all-digits? "12")
        (helm-http:http-res 200 "text/plain" "hi")
        (helm-http:http-res 500 "text/plain" "no")
        (helm-http:request-body (strcat ["GET / HTTP/1.0" helm-http:crlf helm-http:crlf "body"]))
@@ -144,7 +146,8 @@
      ;; TypeWorld is built once per serve, not once per request
      (doctest:bundle (helm:core-sut core))
      myth-new (app ["myth" "add"]) (app ["twig" "txt"])
-     (app ["weft" "runtime"])])
+     (app ["weft" "runtime"])
+     (app ["vine_warp"]) (app ["twig" "nat"])])
   (define fhelpers
     ["F" (app ["myth" "nat_at"]) (app ["fetch" "fresh"]) (app ["fetch" "hdrs"])
      (app ["fetch" "res_ok"]) (app ["fetch" "res_err"]) put-nat
@@ -303,20 +306,17 @@
     (phase-stamp "seed-mirror"
       (Seq (Trace ["mirroring /boot" (Sz mirror) "failed" (Sz (_1 rr))] 0)
         (helm:seed-tasks core sov0 mirror))))
-  ;; one event per app: the pact form expands the whole subtree.
-  ;; Apps in the roots table own a top-level root instead of the
-  ;; default /app/<name> — the chat app serves at /chat.  The table
-  ;; lives in helm.rvr: a CLI remount must reach the same root.
-  (define sov2
-    (phase-stamp "mount-apps"
-      (Seq (Trace ["mounting apps" (Sz (_1 ar))] 0)
-        (helm:mount-apps core sov1 (_1 ar) helm:app-roots dev-grants-policy))))
+  ;; NO app mounts at boot: /boot mirrors every compiled app module
+  ;; (the catalog), /app stays an empty reserved root, and a warp of
+  ;; /kook/install at the chosen root is the explicit install —
+  ;; boot-lain-with registers that op with the compiled roster (ar)
+  ;; closed over, after the listener is up.
   ;; the doctest sweep no longer blocks the boot: boot-lain-with
   ;; injects its verdict tasks through the coordinator AFTER the
   ;; listener is up (helm:doctest-sweep? still gates it there)
   ;; lc rides along: boot-lain-with registers the generated hand's
   ;; form from it, which the app deliberately does not carry
-  [full-cache sov2 lc])
+  [full-cache sov1 lc (_1 ar)])
 
 ;; Fresh boot end to end: seed, serve, inject the driver configs.  A
 ;; resume skips all of this — the sovereign already carries the /io
@@ -341,30 +341,34 @@
   ;; "Bearer " header and OpenRouter answered 401.
   (define pails-t (app ["pt"]))
   (define cfg-port (app ["http" "cfg_port"]))
-  ;; The chat app's credential, poked onto its hand node after the
-  ;; mount.  It arrives as a boot ARGUMENT rather than a file: this
-  ;; runtime has no environment primop, and writing it under src/
-  ;; would put a secret in the source tree (and change the build
-  ;; hash).  An empty key is a real case — the hand simply sends no
-  ;; authorization header — so it is not an error here.
-  (define auth-task
-    (vine-poke [("ts" "chat") ("ts" "conv") ("ts" "api")]
-      (myth-sing [("ts" "auth")] (pails-t key))))
   ;; The generated hand, registered ONCE in the kernel's own behavior
   ;; registry and referred to by path — never carried in the app's
   ;; manifest, whose every copy would drag the whole compiled client
-  ;; (see helm-llm:llm-serve-form).  Registration must land BEFORE the
-  ;; app's node points at it: kook resolution fails on a ref with no
-  ;; form behind it.
+  ;; (see helm-llm:llm-serve-form).  The chat app's credential rides
+  ;; the SAME card at ['auth]: chat is not mounted at boot, so the
+  ;; install (helm-sync) reads it back from here and pokes it onto
+  ;; the app's hand node.  It arrives as a boot ARGUMENT rather than
+  ;; a file: this runtime has no environment primop, and writing it
+  ;; under src/ would put a secret in the source tree.  An empty key
+  ;; is a real case (unauthenticated calls), not an error.
   (define llm-kook-path [("ts" "kook") ("ts" "llm")])
-  (define llm-kook-task
-    (vine-make llm-kook-path
-      ((app ["form" "card"]) (helm-llm:llm-serve-form (Ix 2 bl))
-        ((app ["lore" "line"])
-          "The generated OpenRouter hand: take fetches each request kid, hear parses the answer into bond/res."))))
-  (define api-limb-task
-    (vine-poke [("ts" "chat") ("ts" "conv") ("ts" "api")]
-      ((app ["kooked"]) [llm-kook-path])))
+  (define llm-card0
+    ((app ["form" "card"]) (helm-llm:llm-serve-form (Ix 2 bl))
+      ((app ["lore" "line"])
+        "The generated OpenRouter hand: take fetches each request kid, hear parses the answer into bond/res.")))
+  (define llm-card
+    (If (Bytes key)
+      ((app ["myth" "add"]) ((app ["twig" "txt"]) [("ts" "auth")] key) llm-card0)
+      llm-card0))
+  (define llm-kook-task (vine-make llm-kook-path llm-card))
+  ;; The install op: warp /kook/install at any root to mount the app
+  ;; named by the input's ['app] slot there.  The fn closes over the
+  ;; boot-compiled roster and the grant policy — authority stays
+  ;; host-side (helm:install-fn).
+  (define install-task
+    (vine-make [("ts" "kook") ("ts" "install")]
+      ((app ["install_card"])
+        (helm:install-fn core (Ix 3 bl) dev-grants-policy))))
   (define (inject t)
     (Seq (SendCaps coord (DeepSeq t ["task" t]) [0])
       (Recv 0)))
@@ -380,13 +384,13 @@
         (Seq (inject (vine-make [("ts" "io") ("ts" "doctest")] (app ["dt" "cfg"])))
         (Seq (inject (vine-make [("ts" "io") ("ts" "chore")]
                ((app ["chore" "cfg"]) ("ts" "eval"))))
-        ;; provision the chat app's granted capability: register the
-        ;; generated behavior, point the app's node at it, then the key
+        ;; register the kernel capabilities apps resolve by path: the
+        ;; generated LLM hand (credential riding its card) and the
+        ;; install op — installs happen AFTER boot, through warps
         (Seq (inject llm-kook-task)
-        (Seq (inject api-limb-task)
+        (Seq (inject install-task)
         (Seq (If (Bytes key)
-               (Seq (Trace ["chat: api key installed" (Bytes key)] 0)
-                 (inject auth-task))
+               (Trace ["chat: api key staged on /kook/llm" (Bytes key)] 0)
                (Trace ["chat: no OPENROUTER_API_KEY — calls will be unauthenticated"] 0))
         (Seq (Trace ["PHASE" "listening" (Now 0) port] 0)
           ;; The expensive mirror garnishes run AFTER the listener is
