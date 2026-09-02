@@ -177,11 +177,10 @@
 
 ;; sut-vis-inverse :: Subject -> Ax (Row WrittenPath) | 0
 ;;
-;; The visibility index inverted: canonical -> every written alias,
-;; maintained INCREMENTALLY by mark-visible.  Method resolution used
-;; to re-derive this per call site by enumerating the whole visibility
-;; index (O(marks) per method segment — the dominant cost of compiling
-;; against a large import surface); now it is two O(log) probes.
+;; RETIRED slot (2026-09-01): the inverse is derived per NewCompiler
+;; (derive-vis-inverse) instead of riding the subject.  The tolerant
+;; reader remains for hydrated historical rows; upgrade-subject zeroes
+;; the slot so current-shape subjects never carry one.
 (define (sut-vis-inverse sut)
   (If (Gt (Sz sut) 6) (Subject.vis-inverse sut) 0))
 
@@ -199,9 +198,9 @@
       ($Subject (sut-ax sut) (Ix 1 sut) (Ix 2 sut) (Ix 3 sut)
         (If (Gt (Sz sut) 4) (Ix 4 sut) 0)
         (If (Gt (Sz sut) 5) (Ix 5 sut) 0)
-        (If (Gt (Sz sut) 6) (Ix 6 sut) 0)
-        (If (Gt (Sz sut) 7) (Ix 7 sut) 0)
-        (If (Gt (Sz sut) 8) (Ix 8 sut) 0)
+        0 ;; vis-inverse: retired — derived per compiler now
+        0 ;; write-log: retired — the own layer's order is the write set
+        0 ;; lazy: retired — imports ride the prev chain
         0))
     (error ["foil-malformed-subject" sut])))
 
@@ -212,130 +211,90 @@
 (define (set-sut-visible visible sut)
   (Subject.=visible visible (upgrade-subject sut)))
 
-;; set-sut-vis-inverse :: Ax (Row WrittenPath) | 0 -> Subject -> Subject
-(define (set-sut-vis-inverse inv sut)
-  (Subject.=vis-inverse inv (upgrade-subject sut)))
 
-;; Hybrid lazy projection (slot 8): entries stay in their import
-;; packs; the subject carries [dispatch mounts] where dispatch is ONE
-;; combined ax mapping every reachable imported key to its mount
-;; index, and mounts is a row of [own-lookup export-lookup imped-pin
-;; world-rows] records (newest first — the dispatch is built in
-;; precedence order so its winner already reflects later-import-wins).
-;; A keyed miss costs one dispatch probe; a hit costs the probe plus
-;; one indexed fetch (or a transitive descent through the imported
-;; subject for a dependency key).  Visibility and its inverse stay
-;; materialized — resolution semantics are untouched.
+;; RETIRED slot 8 (hybrid lazy projection, 2026-09-01): imports ride
+;; the prev chain now — project-mounts-base splices each compiled
+;; import as a layer, and sut-find/vis-find/world derivation walk the
+;; chain.  The dispatch/mount records this slot carried are gone.
+;; The tolerant reader remains for hydrated historical rows; note a
+;; hydrated slot-8 subject's mounts are UNREACHABLE under this code —
+;; restage rather than mixing eras.  upgrade-subject zeroes the slot.
 (define (sut-lazy sut)
   (If (Gt (Sz sut) 8) (Subject.lazy sut) 0))
-(define (set-sut-lazy lz sut) (Subject.=lazy lz (upgrade-subject sut)))
-
-;; The lazy-projection records are plain (headless) rows — declare-row
-;; keeps that representation while naming the faces.
-(declare-row Lazy
-  [dispatch tany]
-  [mounts tany])
-(declare-row LazyMount
-  [own tany]
-  [export tany]
-  [imped tany]
-  [world-rows tany]
-  [reachable tany])
-(define lz-dispatch Lazy.dispatch)
-(define lz-mounts Lazy.mounts)
-(define lzm-own LazyMount.own)
-(define lzm-export LazyMount.export)
-(define lzm-imped LazyMount.imped)
-(define lzm-world-rows LazyMount.world-rows)
-(define lzm-reachable LazyMount.reachable)
 
 ;; sut-find :: Path -> Subject -> Maybe (Pin Entry)
 ;;
-;; Trie first (substrate + own + substrate-shadows win), then the
-;; dispatch index; a dispatch hit names the mount whose indexes (or
-;; transitively, whose imported subject) hold the entry.
-; (define (sut-find key sut)
-;   (define hit (getax key (sut-ax sut)))
-;   (If hit
-;     hit
-;     (let ((prev (sut-prev sut)))
-;       (Ifz prev 0
-;         (sut-find key (Unpin (sut-prev sut)))))))
+;; The prev slot holds a ROW of import-subject PINS (newest-first), or
+;; 0.  Storing the imports' own cache pins — rather than re-parenting a
+;; single chain — is what shares structure: a diamond-imported module
+;; is ONE pin referenced from many prev rows, no spine is rebuilt, and
+;; two compiles of the same graph produce Equal prev rows (the artifact
+;; warm-hit contract).  Each pinned import is itself a full subject with
+;; its own prevs, so the chain is a shared DAG walked depth-first,
+;; newest import first (later-import-wins).  Own layer first, then the
+;; prevs — nearest layer wins.
+(define (sut-prevs sut)
+  (define p (sut-prev sut))
+  (Ifz p [] p))
 
 (define (sut-find key sut)
   (define hit (getax key (sut-ax sut)))
-  (define (try-prev z)
-    (let ((prev (sut-prev sut)))
-      (Ifz prev 0 (sut-find key (Unpin prev)))))
+  ;; local (top-level mutual recursion does not resolve in a module):
+  ;; first prev whose DAG holds the key
+  (define (fp prevs)
+    (Ifz (Sz prevs) 0
+      (let ((h (sut-find key (Unpin (_0 prevs)))))
+        (If h h (fp (drop 1 prevs))))))
   (If hit
     hit
-    (let ((lz (sut-lazy sut)))
-      (Ifz lz
-        (try-prev 0)
-        (let ((mi (getax key (lz-dispatch lz))))
-          (Ifz mi
-            (try-prev 0)
-            (let* ((m (Ix (_0 mi) (lz-mounts lz)))
-                   (q (getax key (lzm-own m)))
-                   (c (If q q (getax key (lzm-export m)))))
-              (If c c (sut-find key (Unpin (lzm-imped m)))))))))))
+    (fp (sut-prevs sut))))
 
+;; Every layer subject reachable through the chain (head, then each
+;; import DAG), for the order-flattening consumers.
 (define (sut-layers sut)
-  (define p (sut-prev sut))
-  [sut
-    (Ifz p 0
-      (sut-layers (Unpin p)))])
+  (lcons sut
+    (foldl (lambda (acc p) (lweld (sut-layers (Unpin p)) acc))
+      0 (sut-prevs sut))))
 
-;; sut-write-log :: Subject -> ConsList Path | 0
-;;
-;; Every entry key written since the last reset, newest first.  The
-;; module deltas (extend-derived-environment and c-delta) used to
-;; recover "what did elaboration write" by walking the WHOLE order —
-;; a deep-Equal per key over every projected import, twice per
-;; compile.  The log makes both O(writes).  Derived state: reset at
-;; the projection boundary, cleared again at the durable boundary so
-;; pinned subjects stay canonical.
-(define (sut-write-log sut)
-  (If (Gt (Sz sut) 7) (Subject.write-log sut) 0))
-(define (set-sut-write-log log sut)
-  (Subject.=write-log log (upgrade-subject sut)))
-(define (log-write key sut)
-  (define up (upgrade-subject sut))
-  (Subject.=write-log (lcons key (Subject.write-log up)) up))
-(define (reset-write-log sut)
-  (Subject.=write-log 0 (upgrade-subject sut)))
+;; RETIRED slot 7 (write-log, 2026-09-01): the log existed so the two
+;; per-compile deltas could avoid deep-Equal-walking a projection-fat
+;; order.  Under layered subjects a compile's own layer IS the write
+;; set — its order is small and authoritative — so the delta walks the
+;; order again and the log has nothing left to accelerate.
+;; upgrade-subject zeroes the slot; hydrated historical rows may still
+;; carry one, ignored.
 
-;; insert-written :: WrittenPath -> Row WrittenPath -> Row WrittenPath
+;; derive-vis-inverse :: Subject -> Ax (Row WrittenPath)
 ;;
-;; Sorted, deduped insertion.  Alias rows stay in one canonical order
-;; no matter how they were built, so an incrementally-maintained
-;; inverse deep-Equals one rebuilt wholesale (the artifact warm-hit
-;; equality depends on exactly this).
-(define (insert-written written row)
-  (Ifz (Sz row)
-    [written]
-    (Case3 (cmp-total written (_0 row))
-      (Weld [written] row)
-      row
-      (Weld [(_0 row)] (insert-written written (drop 1 row))))))
-
-;; rebuild-vis-inverse :: Subject -> Subject
-;;
-;; Recompute the inverse from the visibility index wholesale — for the
-;; two paths that install a vis ax without going through mark-visible
-;; (artifact restore, tooling-shaped subjects).
-(define (rebuild-vis-inverse sut)
+;; The visibility index inverted (canonical -> every written alias),
+;; derived on demand from the chain's per-layer indexes — head first,
+;; so a nearer layer's claim on a written path shadows a tail's, the
+;; same nearest-wins rule vis-find applies forward.  This retired the
+;; subject's slot-6 inverse cache (2026-09-01): the inverse is now
+;; derived once per NewCompiler and cached there, so it is no longer
+;; subject state, mark-visible no longer maintains it, and the durable
+;; boundary has nothing to strip.
+(define (derive-vis-inverse sut)
+  ;; sorted, deduped alias insertion — one canonical row order no
+  ;; matter which layer order contributed the aliases
+  (define (insert-written written row)
+    (Ifz (Sz row)
+      [written]
+      (Case3 (cmp-total written (_0 row))
+        (Weld [written] row)
+        row
+        (Weld [(_0 row)] (insert-written written (drop 1 row))))))
+  ;; HEAD vis only — the inverse mirrors the compile's own naming
+  ;; authority, same rule as visible-canon.
   (define vis (sut-visible sut))
   (Ifz vis
-    (set-sut-vis-inverse 0 sut)
-    (set-sut-vis-inverse
-      (foldl
-        (lambda (inv pair)
-          (putax (_1 pair)
-            (insert-written (_0 pair) (fall [] (getax (_1 pair) inv)))
-            inv))
-        empty-ax (rowify (tapax vis)))
-      sut)))
+    empty-ax
+    (foldl
+      (lambda (inv pair)
+        (putax (_1 pair)
+          (insert-written (_0 pair) (fall [] (getax (_1 pair) inv)))
+          inv))
+      empty-ax (rowify (tapax vis)))))
 
 ;; Born in the full nine-slot shape (narrower historical subjects
 ;; still hydrate; upgrade-subject widens them on first extended write).
@@ -349,17 +308,20 @@
   [(_0 ord) (set-subject-order (drop 1 ord) sut)])
 (define empty-subject (make-subject empty-ax))
 
+;; head-onto-pins :: [Pin Subject] -> Subject -> Subject
+;; A fresh head over the given import pins (stored verbatim — they are
+;; the shared cache pins).  Inherits the base subject's root.
+(define (head-onto-pins prevs base)
+  ($Subject empty-ax 0 0 (sut-root base) 0 0 0 0 0 prevs))
+
+;; push-layer :: Subject -> Subject — a fresh head over one subject,
+;; pinned here (the test/single-import convenience).
 (define (push-layer sut)
-  (pipe empty-subject
-    (Subject.=prev (Pin sut))
-    (Subject.=root (sut-root sut))))
+  (head-onto-pins [(Pin sut)] sut))
 
 (define (subject-order-all sut)
-  (define first (subject-order sut))
-  (define next (sut-prev sut))
-  (Ifz next
-    first
-    (Weld first (subject-order-all (Unpin next)))))
+  (foldl (lambda (acc p) (Weld acc (subject-order-all (Unpin p))))
+    (subject-order sut) (sut-prevs sut)))
 
 ;; Replacing an existing entry must not duplicate its key in the order:
 ;; the order is a set, and passes that walk it (e.g. lowering) rely on
@@ -370,7 +332,7 @@
 ;; over aliases) pay it.
 (define (insert-entry-sut key val sut)
   (define fresh (Ifz (getax key (sut-ax sut)) 1 0))
-  (define sut1 (log-write key (snap 0 (putax key (Pin val)) sut)))
+  (define sut1 (snap 0 (putax key (Pin val)) sut))
   (cond
     (fresh (push-subject-order key sut1))
     ((includes (Equal key) (subject-order sut1)) sut1)
@@ -383,7 +345,7 @@
 ;; order exactly once.
 (define (put-entry-pin key pin sut)
   (define fresh (Ifz (getax key (sut-ax sut)) 1 0))
-  (define sut1 (log-write key (snap 0 (putax key pin) sut)))
+  (define sut1 (snap 0 (putax key pin) sut))
   (If fresh (push-subject-order key sut1) sut1))
 
 ;; put-entry-pins :: [[Path (Pin Entry)]] -> Subject -> Subject
@@ -419,10 +381,7 @@
                   st
                   [(putax k 1 (_0 st)) (lcons k (_1 st))]))))
           [empty-ax 0] pairs)))))
-  ;; every batch key joins the write log (replacements included — the
-  ;; delta wants changed keys, not just fresh ones)
-  (define sut2
-    (foldl (lambda (s pair) (log-write (_0 pair) s)) sut1 pairs))
+  (define sut2 sut1)
   (If (Sz fresh)
     (set-subject-order (Weld (subject-order sut2) fresh) sut2)
     sut2))
@@ -456,28 +415,10 @@
   ;; `sut-visible` is the AX itself, not a Maybe-wrapped AX.  Using `fall`
   ;; here unwrapped the first AX field after the first insertion and silently
   ;; discarded the accumulated visibility map.
+  ;; (The slot-6 inverse is no longer maintained here — it derives on
+  ;; demand per compiler; see derive-vis-inverse.)
   (define vis (Ifz (sut-visible sut) empty-ax (sut-visible sut)))
-  ;; maintain the inverse in the same write: a remark that MOVES a
-  ;; written alias (cull/revive) drops it from the old canonical's row
-  ;; first, so the inverse always mirrors the index exactly
-  (define inv (Ifz (sut-vis-inverse sut) empty-ax (sut-vis-inverse sut)))
-  (define prior (getax written vis))
-  (define same (And prior (Equal (_0 prior) canonical)))
-  (define inv1
-    (If (And prior (Nil same))
-      (putax (_0 prior)
-        (filter (lambda (w) (Nil (Equal w written)))
-          (fall [] (getax (_0 prior) inv)))
-        inv)
-      inv))
-  (define inv2
-    (If same
-      inv1
-      (putax canonical
-        (insert-written written (fall [] (getax canonical inv1)))
-        inv1)))
-  (set-sut-vis-inverse inv2
-    (set-sut-visible (putax written canonical vis) sut)))
+  (set-sut-visible (putax written canonical vis) sut))
 ;; The "TC" brand rides the historical entry shape ("TC" key tc span).
 (define TcEntry
   (trow "TC" [["key" tany] ["contents" tany] ["span" tany]]))
@@ -506,8 +447,7 @@
       (lambda (ax)
         (foldl (lambda (a p) (putax (_0 p) (_1 p) a)) ax pairs))
       sut))
-  (define sut2
-    (foldl (lambda (s p) (log-write (_0 p) s)) sut1 pairs))
+  (define sut2 sut1)
   (define joins
     (rev (rowify
       (_1
@@ -689,6 +629,11 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; mounted import resolves to the same pinned entry, and nominal type
 ;; identity must not depend on which name the source used.  Entries
 ;; carry their canonical key at Ix 0 ("TC" and "IR_ENTRY" alike).
+;; Visibility on a chained subject is per-layer, like the entries: each
+;; Visibility is HEAD-only naming authority (per-compile): the chain
+;; carries entries, never names, so canon-path reads the head index
+;; directly.
+
 (define (canon-path path sut)
   ;; path-prefix? :: Path -> Path -> Bool
   (define (path-prefix? prefix whole)
@@ -698,6 +643,12 @@ assert(ty-var-path? ["ty-var" "v"])
   ;; has an explicit visible-path index: relative source names must pass
   ;; through it, while already-canonical rooted paths remain available to
   ;; compiler internals (type expansion and symbolic global edges).
+  ;; HEAD vis only, deliberately: visibility is per-compile naming
+  ;; authority (substrate + own decls + direct mounts' export marks,
+  ;; all made by THIS compile into its head).  Probing tail layers'
+  ;; indexes would let every import's own-name marks leak into scope —
+  ;; a prefix-mounted vec answering bare `vec` (the completed-prefix-
+  ;; leak test).  The chain carries entries; it does not carry names.
   (define (visible-canon p)
     (define vis (sut-visible sut))
     (define root (sut-root sut))
@@ -787,25 +738,10 @@ assert(ty-var-path? ["ty-var" "v"])
     (define old (getax key (sut-ax base)))
     (define new (gotax key (sut-ax final)))
     (Or (Nil old) (Nil (Equal (need old) new))))
-  ;; final's write log carries every key touched since base (the
-  ;; projection boundary resets it), so the delta filters the log
-  ;; instead of deep-Equal-walking the whole order — the two
-  ;; per-compile deltas were O(order) each.  A final without a log
-  ;; (hydrated old row, tooling subject) falls back to the walk.
-  ;; Dedup keeps FIRST-write order, matching the order-row sequence
-  ;; the walk produced for fresh keys.
-  (define log (sut-write-log final))
-  (If log
-    (filter changed?
-      (rev (rowify
-        (_1
-          (lfoldl
-            (lambda (st k)
-              (Ifz (getax k (_0 st))
-                [(putax k 1 (_0 st)) (lcons k (_1 st))]
-                st))
-            [empty-ax 0] (lrev log))))))
-    (filter changed? (subject-order final))))
+  ;; Walk final's order: under layered subjects the compile's own
+  ;; layer holds exactly the writes, so the order IS the write set
+  ;; (the slot-7 log this once filtered is retired).
+  (filter changed? (subject-order final)))
 
 ;; subject-entry-delta :: Subject -> Subject -> Row [Path Pin]
 ;;
@@ -815,51 +751,6 @@ assert(ty-var-path? ["ty-var" "v"])
   (map (lambda (key) [key (gotax key (sut-ax final))])
     (subject-delta-keys base final)))
 
-;; subject-entry-replay-delta :: Subject -> Subject
-;;                            -> Row [Path (Maybe Pin) Pin]
-;;
-;; Artifact replay additionally records the exact old pin (Maybe-wrapped in
-;; Cairn's native get shape).  This distinguishes an authorized own-layer
-;; replacement from a cache assembled over the wrong import graph.
-(define (subject-entry-replay-delta base final)
-  (map
-    (lambda (key)
-      [key (getax key (sut-ax base)) (gotax key (sut-ax final))])
-    (subject-delta-keys base final)))
-
-;; Replay a module delta without rebuilding or re-pinning its entries.
-;;
-;; Three-field checked entries authorize a replacement only when the current
-;; pin matches the recorded old Maybe Pin.  A current pin already equal to the
-;; new value is the idempotent/diamond case.  Historical two-field additions
-;; retain their strict insert-or-identical behavior for API compatibility.
-(define (apply-entry-delta blurb delta sut)
-  (define (collision key expected actual)
-    (error ["foil-artifact-collision" ["path" key]
-            ["expected" expected] ["actual" actual] ["at" blurb]]))
-  (define (apply-legacy acc pair)
-    (define key (_0 pair))
-    (define pin (_1 pair))
-    (define mine (getax key (sut-ax acc)))
-    (cond
-      ((Nil mine) (put-entry-pin key pin acc))
-      ((Equal (need mine) pin) acc)
-      (else (collision key 0 mine))))
-  (define (apply-checked acc pair)
-    (define key (_0 pair))
-    (define expected (_1 pair))
-    (define pin (_2 pair))
-    (define mine (getax key (sut-ax acc)))
-    (cond
-      ((Equal expected mine) (put-entry-pin key pin acc))
-      ((And mine (Equal (need mine) pin)) acc)
-      (else (collision key expected mine))))
-  (define (apply-one acc pair)
-    (cond
-      ((Eq 2 (Sz pair)) (apply-legacy acc pair))
-      ((Eq 3 (Sz pair)) (apply-checked acc pair))
-      (else (error ["foil-malformed-entry-delta" pair]))))
-  (foldl apply-one sut delta))
 
 
 
@@ -885,8 +776,6 @@ assert(ty-var-path? ["ty-var" "v"])
  TcArm
  TcEntry
  Subject
- Lazy
- LazyMount
  tc
  tc-ty
  set-tc-ty
@@ -937,22 +826,9 @@ assert(ty-var-path? ["ty-var" "v"])
  sut-visible
  set-sut-visible
  sut-vis-inverse
- set-sut-vis-inverse
- rebuild-vis-inverse
+ derive-vis-inverse
  sut-lazy
- set-sut-lazy
- lz-dispatch
- lz-mounts
- lzm-own
- lzm-export
- lzm-imped
- lzm-world-rows
- lzm-reachable
  sut-find
- sut-write-log
- set-sut-write-log
- log-write
- reset-write-log
  upgrade-subject
  make-subject
  subject-order
@@ -980,8 +856,6 @@ assert(ty-var-path? ["ty-var" "v"])
  unpin-soft
  canon-path
  subject-entry-delta
- subject-entry-replay-delta
- apply-entry-delta
  tc-cparam
  tc-cparam-name
  tc-has-cparam?
@@ -1008,5 +882,7 @@ assert(ty-var-path? ["ty-var" "v"])
  subject?
  subject-order-all
  push-layer
+ head-onto-pins
+ sut-prevs
  sut-layers
  )

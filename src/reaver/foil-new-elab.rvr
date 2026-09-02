@@ -43,7 +43,14 @@
 (declare-cstr NewCompiler FOIL_NEW_ELAB_ROOT
   [subject tany]
   [world tany]
-  [resolutions (tarr tany)])
+  [resolutions (tarr tany)]
+  ;; The visibility inverse (canonical -> written aliases), derived
+  ;; once per compiler from the subject chain and carried row-wrapped
+  ;; ([inv]) so the constructor's WHNF force does not compute it.
+  ;; Same-module marks made after construction (generated accessors)
+  ;; are absent by design: mounted-extension members always come from
+  ;; import layers, whose marks predate the compiler.
+  [member-inverse tany])
 
 (declare-cstr LocalBinding FOIL_NEW_ELAB_ROOT
   [name (tnat 0)]
@@ -64,6 +71,7 @@
 (define compiler-with-world NewCompiler.=world)
 (define compiler-resolutions NewCompiler.resolutions)
 (define compiler-with-resolutions NewCompiler.=resolutions)
+(define compiler-member-inverse NewCompiler.member-inverse)
 
 (define local-name LocalBinding.name)
 (define local-type LocalBinding.type)
@@ -367,30 +375,22 @@
             (nt:declare-type world path scm brand arity 0)))))))
 
 (define (world-from-layer world subject)
-  ;; Slot 0 of a subject is its entry ax — under hybrid-lazy
-  ;; projection that is substrate + own + shadow entries only; each
-  ;; mount's TC_TYP rows ride its lazy mount record (shared per unit,
-  ;; verified key-equivalent to the eager trie walk).  Declaration
-  ;; order is precedence: the trie, then mounts newest-first
-  ;; (first declaration wins in subject-type-declaration).
-  (define base
-    (foldl subject-type-declaration world
-      (rowify (cairn:tapax (sut-ax subject)))))
-  (define lz (foil-subject:sut-lazy subject))
-  (Ifz lz
-    base
-    (foldl
-      (lambda (w m)
-        (foldl subject-type-declaration w (foil-subject:lzm-world-rows m)))
-      base (rev (foil-subject:lz-mounts lz)))))
+  ;; One layer's own entry ax; transitive declarations ride the tail
+  ;; layers, folded by world-from-subject head-first (first declaration
+  ;; wins in subject-type-declaration = nearest layer wins).  The
+  ;; slot-8 mount arm this once carried is retired with the hybrid
+  ;; projection.
+  (foldl subject-type-declaration world
+    (rowify (cairn:tapax (sut-ax subject)))))
 
 (define (world-from-subject sut)
   (lfoldl
     world-from-layer default-type-world
-    (foil-subject:subject-layers sut)))
+    (foil-subject:sut-layers sut)))
 
 (define (compiler-for subject)
-  ($NewCompiler subject (world-from-subject subject) []))
+  ($NewCompiler subject (world-from-subject subject) []
+    [(foil-subject:derive-vis-inverse subject)]))
 
 ;; compiler-for-with :: TypeWorld -> Subject -> NewCompiler
 ;;
@@ -399,7 +399,8 @@
 ;; cache row's lazily shared copy) instead of re-deriving it per
 ;; expression.
 (define (compiler-for-with world subject)
-  ($NewCompiler subject world []))
+  ($NewCompiler subject world []
+    [(foil-subject:derive-vis-inverse subject)]))
 
 
 ;;; Legacy builtin signature adapter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1750,21 +1751,17 @@
     ;; (a chat-sized module re-walked ~19k marks per `.method(...)`).
     ;; A pre-inverse subject (hydrated old cache row) rebuilds once
     ;; per resolution, which is exactly the old cost.
+    ;; HEAD vis only — per-compile naming authority, the same rule as
+    ;; canon-path's visible branch (tail layers' marks must not leak
+    ;; extension members into scope).
     (define vis (sut-visible subject))
-    (define inv0 (sut-vis-inverse subject))
-    (define inv
-      (If inv0
-        inv0
-        (Ifz vis
-          0
-          (foldl
-            (lambda (a pair)
-              (cairn:putax (_1 pair)
-                (snoc (_0 pair) (fall [] (cairn:getax (_1 pair) a)))
-                a))
-            cairn:empty-ax (rowify (cairn:tapax vis))))))
+    ;; The inverse rides the compiler, row-wrapped and lazily derived
+    ;; from the head index (derive-vis-inverse); forcing it here on
+    ;; first use keeps the O(log) per-segment probes without subject
+    ;; state.
+    (define inv (_0 (compiler-member-inverse compiler)))
     (define (aliases-of canonical)
-      (Ifz inv [] (fall [] (cairn:getax canonical inv))))
+      (fall [] (cairn:getax canonical inv)))
     (define (extension-member nominal)
       (define (try-written written)
         (let ((m (cairn:getax (Weld written [name]) vis)))
@@ -2396,7 +2393,8 @@
       ;; declaration's Try (see run-decl-pass); an unforced error would
       ;; otherwise fire in whichever neighbor demands it first.
       (Seq (DeepSeq scm 1)
-        ($NewCompiler subject1 world1 (compiler-resolutions compiler))))))
+        ($NewCompiler subject1 world1 (compiler-resolutions compiler)
+          (compiler-member-inverse compiler))))))
 
 (define (refine-type-declaration compiler row)
   (define path (root-path (compiler-subject compiler) (_1 row)))
@@ -2429,7 +2427,8 @@
                (gen-accessors path scm subject1)
                subject1)))
       (Seq (DeepSeq scm 1)
-        ($NewCompiler subject2 world1 (compiler-resolutions compiler))))))
+        ($NewCompiler subject2 world1 (compiler-resolutions compiler)
+          (compiler-member-inverse compiler))))))
 
 (define (prototype-value compiler env surf)
   (define tag (_0 surf))

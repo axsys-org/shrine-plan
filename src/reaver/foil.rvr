@@ -320,21 +320,17 @@
                 ((Eq "IR_ENTRY" (Hd ent)) (Ix 3 ent))
                 (else 0))))
         (And (IsApp tc) (Eq "TC_TYP" (Hd tc))))))
-  ;; TypeWorld rows, TRANSITIVE (verified equivalent to the eager
-  ;; trie's TC_TYP key set): a lazily-projected imped contributes its
-  ;; mounts' rows; an eager-era imped enumerates its trie once, minus
-  ;; the substrate.
-  (define imped-lz (foil-subject:sut-lazy imped))
+  ;; TypeWorld rows from the imped's OWN layer (its head ax): under
+  ;; chained subjects transitive types ride the tail layers, which the
+  ;; world derivation folds directly — pack world-rows only need the
+  ;; module's own declarations (vestigial once the world fold is fully
+  ;; chain-native; kept for cache-row shape compatibility).
   (define imped-world-rows
-    (If imped-lz
-      (foldl
-        (lambda (acc m) (Weld acc (foil-subject:lzm-world-rows m)))
-        [] (foil-subject:lz-mounts imped-lz))
-      (filter
-        (lambda (pair)
-          (And (tc-typ-pair? pair)
-            (Ifz (cairn:getax (_0 pair) default-subject-order-index) 1 0)))
-        (rowify (cairn:tapax (Ix 0 imped))))))
+    (filter
+      (lambda (pair)
+        (And (tc-typ-pair? pair)
+          (Ifz (cairn:getax (_0 pair) default-subject-order-index) 1 0)))
+      (rowify (cairn:tapax (foil-subject:sut-ax imped)))))
   (define world-rows
     (_1
       (foldl
@@ -351,20 +347,14 @@
     (filter
       (lambda (pair) (If (cairn:getax (_0 pair) default-subject-order-index) 1 0))
       export-make-pairs))
-  ;; every key answerable through this mount: decl-keys (transitive
-  ;; for eager-era rows), the qualified and export spellings, and —
-  ;; for a lazy imped — everything ITS dispatch answers
+  ;; every key answerable through this mount: decl-keys, the qualified
+  ;; and export spellings (the slot-8 dispatch this once seeded is
+  ;; retired; kept for cache-row shape compatibility)
   (define reachable
     (foldl (lambda (ax k) (cairn:putax k 1 ax))
       cairn:empty-ax
       (Weld keys
-        (Weld qualified-own
-          (Weld (map (Ix 0) export-make-pairs)
-            (If imped-lz
-              (map (Ix 0)
-                (rowify (cairn:tapax
-                  (foil-subject:lz-dispatch imped-lz))))
-              []))))))
+        (Weld qualified-own (map (Ix 0) export-make-pairs)))))
   [own exports layer unit-id qualified-own dependencies projected
    own-pairs export-rows own-lookup export-lookup world-rows
    substrate-shadows reachable])
@@ -501,20 +491,16 @@
                 (foil-subject:mark-visible written ["/foil-env/unbound"] acc)
                 (foil-subject:mark-visible written (Ix 3 row) acc))))
           with-culls export-rows))))
-  ;; append the lazy mount record (reachable rides field 4); the
-  ;; combined dispatch is built once by project-mounts after every
-  ;; mount has landed — newest-first with skip-if-present, which
-  ;; preserves later-import-wins AND touches each key once instead of
-  ;; re-inserting the heavily overlapping transitive sets per mount
-  (define lz0 (foil-subject:sut-lazy with-marks))
-  (define lz (Ifz lz0 [cairn:empty-ax []] lz0))
-  (define mounts0 (foil-subject:lz-mounts lz))
-  (define mrec
-    [(pack-own-lookup pack) (pack-export-lookup pack)
-     (resolved-import-row-pin ri) (pack-world-rows pack)
-     (pack-reachable pack)])
-  (foil-subject:set-sut-lazy
-    [(foil-subject:lz-dispatch lz) (snoc mrec mounts0)]
+  ;; entries themselves ride the chain layer spliced by
+  ;; project-mounts-base; what the chain cannot answer are the
+  ;; unit-qualified and export SPELLINGS the slot-8 own/export lookups
+  ;; used to serve — alias their pinned entries into the head ax
+  ;; (navigation only, no order join, the graft-subject pattern)
+  (snap 0
+    (lambda (ax)
+      (foldl (lambda (a pair) (cairn:putax (_0 pair) (_1 pair) a)) ax
+        (Weld (rowify (cairn:tapax (pack-own-lookup pack)))
+          (rowify (cairn:tapax (pack-export-lookup pack))))))
     with-marks))
 
 ;; mark-substrate-visible :: Subject -> Subject
@@ -540,6 +526,29 @@
             (foil-subject:mark-visible written canonical acc)))
         (foil-subject:set-sut-visible cairn:empty-ax sut)
         (foil-subject:subject-order sut)))))
+
+;; mark-substrate-into :: Subject -> Subject -> Subject
+;;
+;; Copy the base subject's naming authority into a fresh chain head:
+;; a compiled base's explicit vis pairs verbatim, a bare builtin
+;; base's identity marks rebuilt from its storage order — the
+;; head-relocated twin of mark-substrate-visible.
+(define (mark-substrate-into base head)
+  (define bvis (foil-subject:sut-visible base))
+  (If bvis
+    (foldl
+      (lambda (acc pair)
+        (foil-subject:mark-visible (_0 pair) (_1 pair) acc))
+      head (rowify (cairn:tapax bvis)))
+    (let ((root (foil-subject:sut-root base)))
+      (foldl
+        (lambda (acc key)
+          (let* ((entry (foil-subject:got-entry key base))
+                 (canonical (_0 entry))
+                 (written
+                   (If (foil-env:path-prefix? root key) key (Weld root key))))
+            (foil-subject:mark-visible written canonical acc)))
+        head (foil-subject:subject-order base)))))
 
 ;; make-substrate-layer :: Subject -> Layer
 ;;
@@ -575,35 +584,32 @@
 ;; cache): recompiling a module whose imports did not change skips
 ;; the whole ~50k-key reassembly (measured 5.5s for chat).
 (define (project-mounts-base sut0 resolved mounts)
-  (define mounted0
-    (foldl (project-one-mount resolved)
-      (mark-substrate-visible sut0)
-      (foil-env:validate-mounts mounts)))
-  ;; seal the dispatch: mounts newest-first, first claim wins (= the
-  ;; newest importer of the key, matching eager overwrite order)
-  (define mounted
-    (let ((lz (foil-subject:sut-lazy mounted0)))
-      (Ifz lz
-        mounted0
-        (let* ((ms (foil-subject:lz-mounts lz))
-               (n (Sz ms))
-               (dispatch
-                 (zspan "p-dispatch"
-                   (foldl
-                     (lambda (ax i)
-                       (let* ((midx (Sub (Sub n 1) i))
-                              (pairs (rowify (cairn:tapax
-                                (foil-subject:lzm-reachable (Ix midx ms))))))
-                         (Seq (Trace ["p-reach" midx (Sz pairs)] 0)
-                           (foldl
-                             (lambda (a pair)
-                               (Ifz (cairn:getax (_0 pair) a)
-                                 (cairn:putax (_0 pair) midx a)
-                                 a))
-                             ax pairs))))
-                     cairn:empty-ax (gen n (lambda (i) i))))))
-          (foil-subject:set-sut-lazy [dispatch ms] mounted0)))))
-  mounted)
+  ;; Layered imports (slot 8's dispatch/mount records are retired):
+  ;; each resolved import's compiled subject becomes one chain layer
+  ;; under a fresh head; later mounts splice nearer the head, which is
+  ;; the dispatch's old newest-first / later-import-wins rule.  Entry
+  ;; lookup, visibility, and the TypeWorld all walk the chain.
+  ;; Substrate visibility rides the base layer's own index (vis-find
+  ;; probes it through the chain).
+  (define vmounts (foil-env:validate-mounts mounts))
+  ;; prev = each import's SHARED cache pin (row-pin = entry-sut-pin),
+  ;; later-import-first, with the substrate pinned last so a zero-import
+  ;; module still reaches it.  No spine rebuild — diamonds share.
+  (define prev-pins
+    (Weld
+      (rev (map
+             (lambda (mount)
+               (resolved-import-row-pin (find-resolved-import mount resolved)))
+             vmounts))
+      [(Pin sut0)]))
+  ;; visibility is HEAD state: copy the substrate's naming authority
+  ;; into the fresh head (a compiled base's own vis is authoritative;
+  ;; a bare builtin base rebuilds from its storage order)
+  (define head
+    (mark-substrate-into sut0 (foil-subject:head-onto-pins prev-pins sut0)))
+  ;; per-mount eager residue (substrate shadows, culls) and the
+  ;; written->canonical visibility marks land in the fresh head
+  (foldl (project-one-mount resolved) head vmounts))
 
 ;; project-own :: Subject -> Row SastRow -> Subject
 ;;
@@ -777,11 +783,9 @@
     (zspan "c-env"
       (foil-env:build-environment-with-base substrate-layer mounts own-layer)))
   (define pre
-    ;; the write-log baseline: both module deltas measure from here
-    (foil-subject:reset-write-log
-      (zspan "c-project"
-        (foil-subject:set-sut-unit environment
-          (project-mounts sut0 resolved mounts decls)))))
+    (zspan "c-project"
+      (foil-subject:set-sut-unit environment
+        (project-mounts sut0 resolved mounts decls))))
   ;; Force the lore here so the cache entry carries plain data — an
   ;; unforced capture would pin the module's whole rex tree in every
   ;; long-lived cache.
@@ -817,22 +821,11 @@
       ;; rows but make resolve/replay forget those generated bindings.
       (foil-env:unit-with-environment draft-environment unit0)
       unit0))
-  ;; Normalize the visibility inverse at the durable boundary: the
-  ;; incremental index can carry history (a remapped alias leaves an
-  ;; empty row) that a wholesale rebuild never creates, and the pinned
-  ;; subject must be identical whether it came from a cold compile or
-  ;; an artifact restore.
   (define compiled
-    ;; durable boundary: derived state stripped — the vis inverse and
-    ;; write log are rebuilt where they are consumed (doctest bundles
-    ;; rebuild the inverse once per eval storm; imports never read
-    ;; it), and the pinned form must not depend on construction
-    ;; history (an incremental ax's bst shape varies with insertion
-    ;; order, so stripping is also what keeps cold and artifact pins
-    ;; identical for free)
-    (foil-subject:reset-write-log
-      (foil-subject:set-sut-vis-inverse 0
-        (foil-subject:set-sut-unit unit lowered))))
+    ;; durable boundary: derived state (vis inverse, write log) is
+    ;; retired/per-compiler now, so the pinned form is just the lowered
+    ;; subject with its sealed unit
+    (foil-subject:set-sut-unit unit lowered))
   [(_0 resolved-state)
    (zspan "c-warn" (emit-subject-warnings compiled))
    (_2 resolved-state)
@@ -942,235 +935,7 @@
     [cache [(emit-subject-warnings (CacheEntry.subject (_0 hit)))
             (CacheEntry.imported-keys (_0 hit)) (CacheEntry.lore (_0 hit))]]))
 
-;;; Content-addressed module artifacts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;; Unlike compile-mod-cached's process-local cumulative subjects, these
-;;; entries contain only a module's pinned subject additions.  The cache value
-;;; itself is ordinary PLAN data, so putting it in a Reaver top-level binding
-;;; makes it survive in the existing content-addressed snapshot graph.
-
-;; 4: artifact/cache rows became constructor-headed newtype rows
-;; (previously headless rows carrying the tag in slot 0).
-(define artifact-schema 4)
-
-(define (artifact-compiler-token z)
-  ;; ONE compile-side closure: compile-mod-go transitively pins the
-  ;; live elaborator, lowerer, env, relocation, and pack machinery, so
-  ;; any real compiler change alters it — no hand-maintained function
-  ;; list to forget.  The replay-side foil-subject functions ride
-  ;; separately (a HIT runs them without touching the compile
-  ;; closure), as does the substrate; artifact-schema covers payload
-  ;; and replay-logic changes within this section itself.  (The token
-  ;; cannot pin compile-artifact-go — that would be a forward
-  ;; reference and a pin cycle.)
-  (Pin [artifact-schema compile-mod-go
-        foil-subject:subject-entry-replay-delta
-        foil-subject:apply-entry-delta
-        default-subject]))
-
-(define ArtifactCache
-  (trow "FOIL_ARTIFACT_CACHE"
-    [["schema" (tconst artifact-schema)] ["compiler" tany]
-     ["flags" tany] ["entries" tany]]))
-
-(define (make-artifact-cache flags)
-  ($ArtifactCache artifact-schema (artifact-compiler-token 0) flags []))
-
-(define artifact-cache-flags ArtifactCache.flags)
-(define artifact-cache-entries ArtifactCache.entries)
-
-;; Constructor-headed since schema 4, so the brand check reads Hd.
-;; (The historical headless rows carried the tag in slot 0, where a
-;; Hd check was silently always-false; they fail typed-value? here
-;; and normalize to a fresh cache.)
-(define (artifact-cache-normalize cache flags)
-  (If (And (typed-value? ArtifactCache cache)
-        (And (Eq artifact-schema (ArtifactCache.schema cache))
-          (And (Equal (artifact-compiler-token 0) (ArtifactCache.compiler cache))
-            (Equal flags (artifact-cache-flags cache)))))
-    cache
-    (make-artifact-cache flags)))
-
-;; Artifact body: the pinned per-module compile record.  `direct` is
-;; [[import-sast artifact-pin] ..]; `initial` is the initial subject
-;; pin; `delta` is the checked entry-replay delta.
-(define Artifact
-  (trow "FOIL_ARTIFACT"
-    [["schema" (tconst artifact-schema)] ["name" tany] ["source" tany]
-     ["compiler" tany] ["initial" tany] ["flags" tany]
-     ["direct" tany] ["imported" tany] ["decl-keys" tany]
-     ["delta" tany] ["unit" tany] ["visible" tany]]))
-(define artifact-name Artifact.name)
-(define artifact-source Artifact.source)
-(define artifact-compiler Artifact.compiler)
-(define artifact-initial Artifact.initial)
-(define artifact-flags Artifact.flags)
-(define artifact-direct Artifact.direct)
-(define artifact-imported Artifact.imported)
-(define artifact-decl-keys Artifact.decl-keys)
-(define artifact-delta Artifact.delta)
-(define artifact-unit Artifact.unit)
-(define artifact-visible Artifact.visible)
-
-(define (artifact-body art)
-  (If (IsPin art) (Unpin art) 0))
-
-(define (artifact-shaped? art)
-  (define b (artifact-body art))
-  (And (typed-value? Artifact b)
-    (Eq artifact-schema (Artifact.schema b))))
-
-(define (artifact-cache-find cache mod)
-  (find (lambda (e) (Eq mod (_0 e))) (artifact-cache-entries cache)))
-
-(define (artifact-cache-put cache mod art)
-  (ArtifactCache.=entries
-    (snoc [mod art]
-      (filter (lambda (e) (Ne mod (_0 e)))
-        (artifact-cache-entries cache)))
-    cache))
-
-(define (legacy-cache-merge base more)
-  (foldl
-    (lambda (acc e)
-      (If (includes (lambda (x) (Eq (CacheEntry.name e) (CacheEntry.name x)))
-            acc)
-        acc
-        (snoc e acc)))
-    base more))
-
-(define (artifact-base-valid? art mod src compiler init flags)
-  (Ifz (artifact-shaped? art)
-    0
-    (let ((b (artifact-body art)))
-      (And (Eq mod (artifact-name b))
-        (And (Equal src (artifact-source b))
-          (And (Equal compiler (artifact-compiler b))
-            (And (Equal init (artifact-initial b))
-              (Equal flags (artifact-flags b)))))))))
-
-(define (artifact-valid? art mod src compiler init flags direct)
-  (And (artifact-base-valid? art mod src compiler init flags)
-    (Equal (map (Ix 1) direct)
-      (map (Ix 1) (artifact-direct (artifact-body art))))))
-
-;; -> [cache artifact compiled imported-keys legacy-cache]
-(define (compile-artifact-go stack cache0 sut0 flags mod)
-  (define src (get-foil mod))
-  (define compiler (artifact-compiler-token 0))
-  (define init (Pin sut0))
-  (define found (artifact-cache-find cache0 mod))
-  (define art (Ifz found 0 (_1 (_0 found))))
-  ;; An exact source/compiler/subject hit can trust the import SAST stored in
-  ;; the pinned artifact.  That is what lets a warm module skip lexing and
-  ;; parsing altogether; dependency pins are checked after resolving imports.
-  (define candidate? (artifact-base-valid? art mod src compiler init flags))
-  (define imps
-    (If candidate?
-      (map (Ix 0) (artifact-direct (artifact-body art)))
-      (filter mod-import?
-        (foil-sast:parse-module-sast 0 (rex:ParseRexNormFile src)))))
-  (define (resolve-import st[cache resolved seen direct legacy] imp)
-    (define span (foil-surface:surf-import-span imp))
-    (define name (foil-surface:surf-import-modname imp))
-    (define blurb (import-blurb span))
-    (If (includes (Eq name) stack)
-      (error ["foil-import-cycle" ["module" name] ["at" blurb]])
-      (let* ((r (compile-artifact-go (snoc name stack) cache
-                   default-subject flags name))
-             (cache1 (_0 r))
-             (art (_1 r))
-             (imped (_2 r))
-             (keys (artifact-decl-keys (artifact-body art)))
-             (imported (artifact-imported (artifact-body art)))
-             (legacy1 (legacy-cache-merge legacy (Ix 4 r)))
-             ;; Share the legacy row's import pack when present (the cold
-             ;; compile below is seeded with the same rows, so the clone
-             ;; work is paid once either way).
-             (rowhit (find (lambda (x) (Eq name (CacheEntry.name x))) legacy1))
-             (pack
-               (Ifz rowhit
-                 (unit-import-pack name imped keys imported)
-                 (entry-pack (_0 rowhit))))
-             (row-pin
-               (Ifz rowhit
-                 (Pin imped)
-                 (entry-sut-pin (_0 rowhit))))
-             (own (pack-own pack))
-             (exports (pack-exports pack))
-             (layer (pack-layer pack))
-             (mount (import-mount layer imp))
-             (unit-id (pack-unit-id pack))
-             (projected (pack-projected pack))
-             (ri
-               (make-resolved-import imp imped keys own layer exports mount
-                 unit-id projected pack row-pin)))
-        [cache1 (snoc ri resolved) (Weld seen projected)
-         (snoc [imp art] direct) legacy1])))
-  (define merged
-    (foldl resolve-import [cache0 [] [] [] []] imps))
-  (define cache (_0 merged))
-  (define resolved (_1 merged))
-  (define mounts (map resolved-import-mount resolved))
-  (define pre (project-mounts sut0 resolved mounts []))
-  (define direct (_3 merged))
-  (define legacy (Ix 4 merged))
-  (If (artifact-valid? art mod src compiler init flags direct)
-    (let* ((body (artifact-body art))
-           (compiled0
-             (foil-subject:set-sut-unit (artifact-unit body)
-               ;; artifacts store only the vis ax; inverse and write
-               ;; log are derived state — stripped, same as the cold
-               ;; compile's durable boundary
-               (foil-subject:reset-write-log
-                 (foil-subject:set-sut-vis-inverse 0
-                   (foil-subject:set-sut-visible (artifact-visible body)
-                     (foil-subject:apply-entry-delta
-                       ["cached module" mod] (artifact-delta body) pre))))))
-           (compiled (emit-subject-warnings compiled0))
-           (imported (artifact-imported body))
-           ;; Pinned artifacts carry no lore field yet — a warm hit
-           ;; degrades to no lore (bump artifact-schema to store it).
-           (legacy1
-             (snoc (cache-entry mod compiled imported [])
-               (filter (lambda (e) (Ne mod (CacheEntry.name e))) legacy))))
-      [cache art compiled imported legacy1])
-    ;; Imports have already been resolved to cumulative subjects above.
-    ;; Seed the old in-process cache with them so the cold module compile
-    ;; does not elaborate the import graph a second time.
-    (let* ((cold (compile-mod-go stack legacy sut0 mod))
-           (compiled (_1 cold))
-           (imported (_2 cold))
-           (decl-keys (module-decl-keys compiled))
-           (delta (foil-subject:subject-entry-replay-delta pre compiled))
-           (body ($Artifact artifact-schema mod src compiler init flags
-                   direct imported decl-keys delta
-                   (foil-subject:sut-unit compiled)
-                   (foil-subject:sut-visible compiled)))
-           (art1 (Pin body))
-           (cache1 (artifact-cache-put cache mod art1))
-           (legacy1
-             (snoc (cache-entry mod compiled imported (_3 cold))
-               (filter (lambda (e) (Ne mod (CacheEntry.name e))) (_0 cold)))))
-      [cache1 art1 compiled imported legacy1])))
-
-(define (compile-mod-artifact-cached cache sut flags mod)
-  (define cache0 (artifact-cache-normalize cache flags))
-  (define r
-    (Try (lambda (z) (compile-artifact-go [mod] cache0 sut flags mod)) 0))
-  (If (Eq 1 (Hd r))
-    (error ["foil-in-module" mod (_0 r)])
-    [(_0 (_0 r)) (_2 (_0 r))]))
-
-(define (compile-mod-info-artifact-cached cache sut flags mod)
-  (define cache0 (artifact-cache-normalize cache flags))
-  (define r
-    (Try (lambda (z) (compile-artifact-go [mod] cache0 sut flags mod)) 0))
-  (If (Eq 1 (Hd r))
-    (error ["foil-in-module" mod (_0 r)])
-    [(_0 (_0 r)) [(_2 (_0 r)) (_3 (_0 r))]]))
-
-(define (artifact-module-closure mods)
+(define (module-closure mods)
   (define (go seen pending)
     (Ifz (Sz pending)
       seen
@@ -1181,12 +946,6 @@
           (go (snoc mod seen) (Weld rest (module-imports mod)))))))
   (go [] mods))
 
-(define (artifact-cache-drop cache names)
-  (ArtifactCache.=entries
-    (filter (lambda (e) (Nil (includes (Eq (_0 e)) names)))
-      (artifact-cache-entries cache))
-    cache))
-
 ;; The .foil file paths of some modules' transitive import closure.
 ;; The corpus tiers hand these to the module loader as their
 ;; module-file-stamps declaration: the tier's cached value then
@@ -1195,18 +954,7 @@
 ;; cache).
 (define (foil-closure-files mods)
   (map (lambda (m) (strcat ["foil/" m ".foil"]))
-    (artifact-module-closure mods)))
-
-(define (warm-mod-artifacts cache sut flags mods fresh?)
-  (define cache0 (artifact-cache-normalize cache flags))
-  (define cache1
-    (If fresh?
-      (artifact-cache-drop cache0 (artifact-module-closure mods))
-      cache0))
-  (foldl
-    (lambda (acc mod)
-      (_0 (compile-mod-artifact-cached acc sut flags mod)))
-    cache1 mods))
+    (module-closure mods)))
 
 ;;; Entry inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1268,6 +1016,17 @@
 ;; produces Equal rows and first-occurrence merge is sound.  Each
 ;; module runs under its own Try — a failure costs that module only.
 ;; -> [cache' failed-mods], the compile-roster shape.
+;; Merge legacy cache rows by module name, keeping the base's row on a
+;; collision (the rows describe the same compile; first seen wins).
+(define (legacy-cache-merge base more)
+  (foldl
+    (lambda (acc e)
+      (If (includes (lambda (x) (Eq (CacheEntry.name e) (CacheEntry.name x)))
+            acc)
+        acc
+        (snoc e acc)))
+    base more))
+
 (define (compile-mods-par-cached cache mods)
   (define rs
     (async:async-all-deep

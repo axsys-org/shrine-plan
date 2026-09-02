@@ -30,6 +30,138 @@
 (#bind grove (#module grove))
 
 
+;;; Namespace path macros ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; The runtime spells namespace paths three ways: entry-key rows
+;; (["myth" "new"]), ts-quip segments (("ts" "io")), and node paths
+;; ([("ts" "kook") ("ts" "llm")]).  Adjacent word+string parses as an
+;; application (p"myth/new" is (p "myth/new")), so these macros read
+;; like reader macros:
+;;
+;;   p"myth/new"    -> ["myth" "new"]              entry-key row
+;;   t"io"          -> ("ts" "io")                 one ts segment
+;;   n"kook/llm"    -> [("ts" "kook") ("ts" "llm")] node path
+;;   a"myth/new"    -> (app ["myth" "new"])        entry lookup
+;;
+;; They ride (#import helm) into the other helm-* modules.
+;;
+;; CAUTION: `a` is deliberately unhygienic — it expands to a call of
+;; whatever `app` is bound at the use site (the (app path) helpers in
+;; helm-run's build-lain-sov and serve-lain).  Where no `app` is in
+;; scope it is silently junk (#export gating rules); use (app p"...")
+;; anywhere hygiene is in doubt.
+
+;; Expansion-time cord split on "/".  Offset walk with Load8 — never
+;; advance a cord by division (that is the quadratic §4 trap even at
+;; expansion time).
+(define (path-seg-slice off len s)
+  (Trunc (Mul 8 len) (Rsh s (Mul 8 off))))
+;; A string literal reaches a transformer as the quote node (1 cord);
+;; a bare word arrives as the cord itself.  Accept both, refuse the rest.
+(define (path-macro-str ctx x)
+  (cond
+    ((IsNat x) x)
+    ((And (IsApp x) (Eq 1 (Hd x))) (_0 x))
+    (else
+      (error ["helm-path-macro" "path must be a string literal"
+              ["at" ctx]]))))
+(define (path-macro-segs ctx s0)
+  (define s (path-macro-str ctx s0))
+  (define nb (Bytes s))
+  (define (emit start i acc)
+    (define seg (path-seg-slice start (Sub i start) s))
+    (unless (Gt (Bytes seg) 0)
+      (error ["helm-path-macro" "empty path segment" ["in" s] ["at" ctx]])
+      (lcons seg acc)))
+  (define (go start i acc)
+    (cond
+      ((Ge i nb) (rowify (lrev (emit start i acc))))
+      ((Eq "/" (Load8 i s)) (go (Inc i) (Inc i) (emit start i acc)))
+      (else (go start (Inc i) acc))))
+  (unless (Gt nb 0)
+    (error ["helm-path-macro" "empty path" ["at" ctx]])
+    (go 0 0 0)))
+
+;; Each expansion is built from quoted constants, so the emitted form
+;; is pure syntax: a "#brak" row of quoted cords (p), an application
+;; of the quoted "ts" tag (t), or both (n).
+;;
+;; A juxt in call position folds its arguments into the same form —
+;; (a"build/eval_req" "demo") arrives as (a "build/eval_req" "demo") —
+;; so every macro re-applies the expansion to the trailing elements.
+(define (path-macro-call base form)
+  (If (Gt (Sz form) 2)
+    (Weld [base] (drop 2 form))
+    base))
+
+(define-syntax (p form)
+  (path-macro-call
+    (cons "#brak"
+      (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))
+    form))
+
+(define-syntax (t form)
+  (path-macro-call
+    [(1 "ts") (1 (path-macro-str form (_1 form)))]
+    form))
+
+(define-syntax (n form)
+  (path-macro-call
+    (cons "#brak"
+      (map (lambda (seg) [(1 "ts") (1 seg)])
+        (path-macro-segs form (_1 form))))
+    form))
+
+(define-syntax (a form)
+  (path-macro-call
+    ["app" (cons "#brak"
+             (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))]
+    form))
+
+;; ent"myth/new" is (core-ent core ["myth" "new"]) — the core-entry
+;; lookup.  Unhygienic over `core`, the way `a` is over `app`.
+(define-syntax (ent form)
+  (path-macro-call
+    ["core-ent" "core"
+     (cons "#brak"
+       (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))]
+    form))
+
+;;; Boot value helpers (plain functions — nothing syntactic here) ;;;;;;;;;;;;;;;
+;;
+;; Maybe probes for the "/boot/maybe/some"-branded rows the mirror and
+;; doctest plumbing pass around, and by-rep pail constructors for the
+;; mirror's seed writes.  The rep- prefix is deliberate: mirror seeding
+;; constructs pails by representation (the mani precedent) — pokes from
+;; rvr hosts still go through lain's pd/pt, never these.
+(define (boot-some? x) (Eq "/boot/maybe/some" (Hd x)))
+(define (boot-some v) ("/boot/maybe/some" v))
+(define (rep-pail-n v) ("/boot/pails/n" v))
+(define (rep-pail-ps v) ("/boot/pails/ps" v))
+(define (rep-pail-code v) ("/boot/pails/code" v))
+(define (rep-pail-code? x) (Eq "/boot/pails/code" (Hd x)))
+
+assert(Equal ["myth" "new"] p"myth/new")
+assert(Equal ["peek"] p"peek")
+assert(Equal ("ts" "io") t"io")
+assert(Equal [("ts" "kook") ("ts" "llm")] n"kook/llm")
+(define (path-macro-a-check app)
+  a"myth/new")
+assert(Equal ["got" ["myth" "new"]]
+  (path-macro-a-check (lambda (x) ["got" x])))
+(define (path-macro-ent-check core-ent core)
+  ent"myth/new")
+assert(Equal ["ce" "c" ["myth" "new"]]
+  (path-macro-ent-check (lambda (c x) ["ce" c x]) "c"))
+assert(Eq 1 (boot-some? (boot-some 5)))
+assert(Equal ("/boot/pails/n" 7) (rep-pail-n 7))
+;; call position folds trailing args into the juxt's form
+(define (path-macro-a-check-args app)
+  (a"myth/new" 7))
+assert(Equal ["got" ["myth" "new"] 7]
+  (path-macro-a-check-args (lambda (x y) ["got" x y])))
+
+
 ;;; The IO driver shell: real enki actors around the pure helm core
 ;;; (src/foil/helm.foil).  The coordinator actor owns the helm state
 ;;; and a roster of one worker actor per /io name; it executes the
@@ -67,9 +199,11 @@
 ;; overlay as well as live paths.
 (define (helm-pack r)
   (define sut (_1 r))
-  (define (ent path) (foil:source-entry-val path sut))
-  ["HELM" (ent ["helm" "boot"]) (ent ["helm" "exec"]) (ent ["x_query_h"])
-   (ent ["helm" "spy"]) sut (_0 r)])
+  ;; sv, not ent: `ent` is the core-entry macro above, and this local
+  ;; reads source entries off a fresh compile instead.
+  (define (sv path) (foil:source-entry-val path sut))
+  ["HELM" (sv ["helm" "boot"]) (sv ["helm" "exec"]) (sv ["x_query_h"])
+   (sv ["helm" "spy"]) sut (_0 r)])
 
 (define (load-helm-mod mod)
   (helm-pack (foil:compile-mod-cached 0 foil:default-subject mod)))
@@ -196,7 +330,7 @@
 
 ;; A module entry's mirror node: /boot/<..modsegs>/<n>/<..name>.
 (define (boot-ent-node mod name)
-  (Weld (Weld [(ts "boot")] (map ts (mod-segs mod)))
+  (Weld (Weld n"boot" (map ts (mod-segs mod)))
     (Weld [("u" (Sz name))] (map ts name))))
 
 ;; [[src-node dst-node] ..]: every reference between mirrored entries,
@@ -322,12 +456,12 @@
 
 (define (boot-mirror-mods-refs-lore-with refs? lore? raw-cache core)
   (define cache (filter (lambda (me) (mirror-has-source? (_0 me))) raw-cache))
-  (define src-t (core-ent core ["mirror" "src"]))
-  (define ent-t (core-ent core ["mirror" "entry"]))
-  (define ent-x (core-ent core ["mirror" "extras"]))
-  (define ns-t (core-ent core ["mirror" "index"]))
-  (define msing (core-ent core ["myth" "sing"]))
-  (define mmeld (core-ent core ["myth" "meld"]))
+  (define src-t ent"mirror/src")
+  (define ent-t ent"mirror/entry")
+  (define ent-x ent"mirror/extras")
+  (define ns-t ent"mirror/index")
+  (define msing ent"myth/sing")
+  (define mmeld ent"myth/meld")
   (define raxes (ref-axes (If refs? (boot-ref-table cache) [])))
   (define (mod-parts me)
     (define mod (_0 me))
@@ -336,7 +470,7 @@
     (define src (zspan "m-src" (foil:get-foil mod)))
     (define lore (If lore? (entry-lore me) []))
     (define own (entry-own-keys me))
-    (define mnode (Weld [(ts "boot")] (map ts (mod-segs mod))))
+    (define mnode (Weld n"boot" (map ts (mod-segs mod))))
     (define (ent-task k)
       (define e (zspan "m-parts" (foil:entry-parts sut k)))
       (define kind (zspan "m-kind" (foil:entry-kind sut k (foil:ent-tc e))))
@@ -367,8 +501,8 @@
       ;; wire port's jump-to-definition (pail by rep, the ['sub] idiom).
       [(drop (Sz mnode) node)
        (mmeld
-         (msing [(ts "defline")]
-           ("/boot/pails/n" (Ix 0 (foil:ent-span e))))
+         (msing n"defline"
+           (rep-pail-n (Ix 0 (foil:ent-span e))))
          (ent-x tydesc lawtext (Ix 0 rr) (Ix 1 rr)
            (ent-t (foil:ent-val e) kind slice (foil:ent-lowered e)
              (Ix 0 la) (Ix 1 la) (Ix 2 la) (Ix 3 la))))])
@@ -414,8 +548,8 @@
         (filter Sz
           (Weld (map (lambda (k) (drop 1 k)) own) imp-own))))
     [mnode mla
-     (mmeld (msing [(ts "sub")] ("/boot/pails/code" (foil:entry-pin me)))
-       (mmeld (msing [(ts "visible")] ("/boot/pails/ps" visible))
+     (mmeld (msing n"sub" (rep-pail-code (foil:entry-pin me)))
+       (mmeld (msing n"visible" (rep-pail-ps visible))
          (mmeld (ns-t (map (lambda (en) (Weld mnode (Ix 0 en))) ents))
            (src-t src (Ix 0 mla) (Ix 1 mla) (Ix 2 mla) (Ix 3 mla)))))
      ents])
@@ -444,9 +578,9 @@
   (boot-mirror-pairs-lore-with mirror-lore? raw-cache core))
 
 (define (boot-mirror-tasks-lore-with lore? raw-cache core)
-  (define vine-make (core-ent core ["vine_make"]))
-  (define doc-t (core-ent core ["mirror" "doc"]))
-  (Weld [(vine-make [(ts "boot")] (doc-t boot-doc-text))]
+  (define vine-make ent"vine_make")
+  (define doc-t ent"mirror/doc")
+  (Weld [(vine-make n"boot" (doc-t boot-doc-text))]
     (map (lambda (p) (vine-make (Ix 0 p) (Ix 1 p)))
       (boot-mirror-pairs-lore-with lore? raw-cache core))))
 
@@ -459,17 +593,17 @@
 ;; instead of ~1,500; the commit machinery (gate/prepare, zipper walk,
 ;; ledger pin) is paid per subtree, and shared spine nodes mint once.
 (define (boot-mirror-pact-tasks-lore-with lore? raw-cache core)
-  (define vine-pact (core-ent core ["pact" "vine"]))
-  (define vine-make (core-ent core ["vine_make"]))
-  (define doc-t (core-ent core ["mirror" "doc"]))
-  (define kooked (core-ent core ["kooked"]))
-  (define mmeld (core-ent core ["myth" "meld"]))
+  (define vine-pact ent"pact/vine")
+  (define vine-make ent"vine_make")
+  (define doc-t ent"mirror/doc")
+  (define kooked ent"kooked")
+  (define mmeld ent"myth/meld")
   ;; /boot itself carries the pact kook: the deferred who-calls
   ;; upgrade (ref-upgrade-task) pokes a ['pact] manifest at the root,
   ;; and without a kook the poke would meld the slot and expand
   ;; nothing.
-  (Weld [(vine-make [(ts "boot")]
-           (mmeld (kooked [[(ts "kook") (ts "pact")]])
+  (Weld [(vine-make n"boot"
+           (mmeld (kooked [[t"kook" t"pact"]])
              (doc-t boot-doc-text)))]
     (map
       (lambda (mp)
@@ -490,9 +624,9 @@
 ;; the ref table (the ~33s the boot no longer pays) happens lazily
 ;; when this injects after the listener is up.
 (define (ref-upgrade-task raw-cache core)
-  (define vine-poke (core-ent core ["vine_poke"]))
-  (define msing (core-ent core ["myth" "sing"]))
-  (define pact-slot (core-ent core ["pact" "slot"]))
+  (define vine-poke ent"vine_poke")
+  (define msing ent"myth/sing")
+  (define pact-slot ent"pact/slot")
   (define seeds
     (foldl
       (lambda (acc mp)
@@ -505,9 +639,9 @@
   ;; rvr-side nominal construction is by rep: the ["mani"]/["lore"]
   ;; entries are TYPES, not value constructors — applying them yields
   ;; an unbranded row that pact/talk's mani match silently rejects.
-  (vine-poke [(ts "boot")]
+  (vine-poke n"boot"
     (msing pact-slot
-      ("/boot/mani" ("ts" "refs") ("/boot/lore" 0 [] []) [] seeds []))))
+      ("/boot/mani" t"refs" ("/boot/lore" 0 [] []) [] seeds []))))
 
 ;; Every mirrored entry grouped by its source namespace root:
 ;; [[root entry-nodes] ..] — forge's /ns aggregation.
@@ -534,10 +668,10 @@
 
 ;; The whole /boot/ns index as one pact event at /boot/ns.
 (define (boot-ns-pact-task core raw-cache)
-  (define vine-pact (core-ent core ["pact" "vine"]))
-  (define doc-t (core-ent core ["mirror" "doc"]))
-  (define ns-t (core-ent core ["mirror" "index"]))
-  (vine-pact [(ts "boot") (ts "ns")] 0 0 [] []
+  (define vine-pact ent"pact/vine")
+  (define doc-t ent"mirror/doc")
+  (define ns-t ent"mirror/index")
+  (vine-pact [t"boot" t"ns"] 0 0 [] []
     (doc-t "every mirrored entry grouped by its source namespace root.")
     (map (lambda (g) [[(ts (Ix 0 g))] (ns-t (Ix 1 g))])
       (ns-groups raw-cache))))
@@ -545,11 +679,11 @@
 ;; /boot/ns/<root> index nodes, one event per root — the unbatched
 ;; variant, kept for resyncs and tests.
 (define (boot-ns-index-tasks core raw-cache)
-  (define vine-make (core-ent core ["vine_make"]))
-  (define ns-t (core-ent core ["mirror" "index"]))
+  (define vine-make ent"vine_make")
+  (define ns-t ent"mirror/index")
   (map
     (lambda (g)
-      (vine-make [(ts "boot") (ts "ns") (ts (Ix 0 g))] (ns-t (Ix 1 g))))
+      (vine-make [t"boot" t"ns" (ts (Ix 0 g))] (ns-t (Ix 1 g))))
     (ns-groups raw-cache)))
 
 ;; Compile one module into the shared cache under Try; a failure
@@ -592,8 +726,8 @@
 ;; the pretty diagnostic — a broken module is a visible mirror
 ;; citizen, exactly like a broken app mount.
 (define (boot-fail-tasks core mods)
-  (define vine-make (core-ent core ["vine_make"]))
-  (define fail-t (core-ent core ["mirror" "fail"]))
+  (define vine-make ent"vine_make")
+  (define fail-t ent"mirror/fail")
   (map
     (lambda (mod)
       (let* ((r (Try (lambda (z)
@@ -603,7 +737,7 @@
              (text (If (Eq 1 (Hd r))
                      (foil-render:diag-text (_0 r))
                      "compiles alone; failed against the boot cache")))
-        (vine-make (Weld [(ts "boot")] (map ts (mod-segs mod)))
+        (vine-make (Weld n"boot" (map ts (mod-segs mod)))
           (fail-t text))))
     mods))
 
@@ -611,7 +745,7 @@
 ;; arrives as an ordinary committed event.  A failed event dies loudly
 ;; — threading its ovum/fail on as the sovereign would corrupt the fold.
 (define (seed-tasks core sov tasks)
-  (define run-event (core-ent core ["run_event"]))
+  (define run-event ent"run_event")
   (foldl
     (lambda (s t)
       (let ((o (run-event t 0 s)))
@@ -632,12 +766,12 @@
 ;; re-lands the SAME pin.  0 when the node or slot is absent.
 (define (hydrate-mod core sov mod)
   (define xq (core-xq core))
-  (define pail-at (core-ent core ["myth" "pail_at"]))
-  (define node (Weld [(ts "boot")] (map ts (mod-segs mod))))
+  (define pail-at ent"myth/pail_at")
+  (define node (Weld n"boot" (map ts (mod-segs mod))))
   (define r (xq (Ix 2 sov) node sov))
   (If (Eq "/boot/res/known" (Hd r))
-    (let ((pl (pail-at [(ts "sub")] (_0 r))))
-      (If (Eq "/boot/pails/code" (Hd pl))
+    (let ((pl (pail-at n"sub" (_0 r))))
+      (If (rep-pail-code? pl)
         (let ((p (Ix 0 pl)))
           (Weld (Unpin p) [p]))
         0))
@@ -689,7 +823,7 @@
 ;; -> [cache' ["OK" mani] | ["ERR" err]]
 (define (compile-app core cache name)
   (define mod (strcat ["apps/" name "/main"]))
-  (define mani-ok (core-ent core ["mani" "ok"]))
+  (define mani-ok ent"mani/ok")
   (define r
     (Try
       (lambda (z)
@@ -725,8 +859,8 @@
                      ((And (Nil m) (Nil gm)) (error ["no-app-mani" name]))
                      ((Nil m) gm)
                      ((Nil gm)
-                       (Ifz y m ((core-ent core ["mani" "adopt_spec"]) y m)))
-                     (else ((core-ent core ["mani" "weld_spec"]) y gm m)))))
+                       (Ifz y m (ent"mani/adopt_spec" y m)))
+                     (else (ent"mani/weld_spec" y gm m)))))
           (Seq (If (Eq 1 (mani-ok mm)) 0 (error ["app-entry-not-mani" mod]))
             [(Ix 0 spec) mm])))
       0))
@@ -773,13 +907,13 @@
 ;; record is minted by compiled subject ctors (op/pact rows are
 ;; nominal and cannot be hand-built across the FFI).
 (define (install-fn core ar policy)
-  (define txt-at (core-ent core ["myth" "txt_at"]))
-  (define app-card (core-ent core ["pact" "card"]))
-  (define fail-t (core-ent core ["pact" "fail"]))
-  (define has-fetch (core-ent core ["grant" "has_fetch"]))
-  (define serve-port (core-ent core ["grant" "serve_port"]))
+  (define txt-at ent"myth/txt_at")
+  (define app-card ent"pact/card")
+  (define fail-t ent"pact/fail")
+  (define has-fetch ent"grant/has_fetch")
+  (define serve-port ent"grant/serve_port")
   (lambda (input cur)
-    (let* ((name (txt-at [(ts "app")] input))
+    (let* ((name (txt-at n"app" input))
            (hit (find (lambda (e) (Equal name (_0 e))) ar)))
       (cond
         ((Nil (Bytes name)) (fail-t "install: missing ['app] name"))
@@ -810,10 +944,10 @@
 ;; explicit install.
 (define (mount-root roots name)
   (define hit (find (lambda (e) (Equal name (_0 e))) roots))
-  (Ifz hit [(ts "app") (ts name)] (_1 (_0 hit))))
+  (Ifz hit [t"app" (ts name)] (_1 (_0 hit))))
 
 (define app-roots
-  [["chat" [(ts "chat")]] ["nenex" [(ts "nenex")]]])
+  [["chat" n"chat"] ["nenex" n"nenex"]])
 
 ;;; Boot-time doctest sweep (doc/doctest-runner-explorer.md part I) ;;;;;;;;;;;;;;;;;
 
@@ -836,25 +970,25 @@
 ;; doctests, nothing else — the serve injects these AFTER listening.
 (define (doctest-tasks raw-cache core sov)
   (define cache raw-cache)
-  (define vine-poke (core-ent core ["vine_poke"]))
-  (define vine-make (core-ent core ["vine_make"]))
-  (define dt-card (core-ent core ["doctest" "card"]))
-  (define xcase (core-ent core ["x_case_h"]))
+  (define vine-poke ent"vine_poke")
+  (define vine-make ent"vine_make")
+  (define dt-card ent"doctest/card")
+  (define xcase ent"x_case_h")
   (define (tested l) (Gt (Sz (foil-lore:lore-tests l)) 0))
   ;; the verdict rides a child node — the documented node's version
   ;; stays clean as the staleness anchor (doctest-runner-explorer I.3)
   (define (task1 msut node l)
     (define c (xcase 0 node sov))
-    (If (Nil (Eq "/boot/maybe/some" (Hd c)))
+    (If (Nil (boot-some? c))
       []
       (let* ((rs (doctest:run-lore msut l))
-             (dtnode (snoc (ts "dt") node))
+             (dtnode (snoc t"dt" node))
              (card (dt-card (Now 0) (_0 c) rs)))
         [(If (Eq "/boot/maybe/some" (Hd (xcase 0 dtnode sov)))
            (vine-poke dtnode card)
            (vine-make dtnode card))])))
   (define (mod-tasks acc me)
-    (define bsegs (Weld [(ts "boot")] (map ts (mod-segs (_0 me)))))
+    (define bsegs (Weld n"boot" (map ts (mod-segs (_0 me)))))
     (define lore (entry-lore me))
     ;; one bundled TypeWorld per module for the whole sweep — the
     ;; per-entry evals used to rebuild it per documented entry
@@ -882,7 +1016,7 @@
 ;; and tools).  Tolerant: a failed poke traces and moves on —
 ;; verdicts are data, not gates.
 (define (seed-doctests raw-cache core sov)
-  (define run-event (core-ent core ["run_event"]))
+  (define run-event ent"run_event")
   (foldl
     (lambda (s task)
       (let ((o (Try (lambda (z) (run-event task 0 s)) 0)))
@@ -964,7 +1098,7 @@
     (If (Eq 1 (Hd rr))
       (let ((rsvp ("/boot/rsvp/no" (_0 rr))))
         (let ((duties
-                (If (Eq "/boot/maybe/some" (Hd src))
+                (If (boot-some? src)
                   [("/boot/duty/ack" (_0 src) rsvp)]
                   [])))
           (Seq (Trace ["helm: task crashed" (_0 rr)] 0)
@@ -976,7 +1110,7 @@
              (spill (Ix 3 r)))
         ;; a cascaded hear round's failure rides the gyre's spill —
         ;; the committed rounds stand, but the error is reported
-        (Seq (If (Eq "/boot/maybe/some" (Hd spill))
+        (Seq (If (boot-some? spill)
                (Trace ["helm: cascade round failed" (_0 spill)] 0)
                0)
           (Seq (persist hm2)
@@ -985,7 +1119,7 @@
                 (Seq (DeepSeq st2 st2) [st2 (Ix 2 r)]))))))))
   (cond
     ((Eq kind "cmd")
-      (let ((tr (turn ("/boot/maybe/some" (_1 msg)) (_2 msg))))
+      (let ((tr (turn (boot-some (_1 msg)) (_2 msg))))
         (Seq tr
           (helm-loop core mk-worker persist (_0 tr)))))
     ((Eq kind "task")
@@ -1017,23 +1151,23 @@
       ;; acceptable at v1 scale, and honest: a counterfactual is an
       ;; event like any other.
       (let* ((sv (_0 hm))
-             (bt (core-ent core ["fork" "backtest"]))
+             (bt ent"fork/backtest")
              (vr (Try (lambda (z)
                         (let ((v (bt (Ix 4 msg) (Ix 3 msg) (Ix 5 msg) sv)))
                           (Seq (DeepSeq v v) v)))
                    0))
              (verdict
                (If (Eq 1 (Hd vr))
-                 ((core-ent core ["myth" "sing"]) [("ts" "err")]
-                   ((core-ent core ["pt"]) "backtest crashed — see the serve log"))
+                 (ent"myth/sing" n"err"
+                   (ent"pt" "backtest crashed — see the serve log"))
                  (_0 vr)))
              (dst (Ix 2 msg))
              (known? (Eq "/boot/res/known"
                        (Hd ((core-xq core) (Ix 2 sv) dst sv))))
              (task (If known?
-                     ((core-ent core ["vine_poke"]) dst verdict)
-                     ((core-ent core ["vine_make"]) dst verdict)))
-             (tr (turn ("/boot/maybe/some" (_1 msg)) task)))
+                     (ent"vine_poke" dst verdict)
+                     (ent"vine_make" dst verdict)))
+             (tr (turn (boot-some (_1 msg)) task)))
         (Seq (If (Eq 1 (Hd vr))
                (Trace ["branch: backtest crashed" (_0 vr)] 0) 0)
           (helm-loop core mk-worker persist (_0 tr)))))
@@ -1056,7 +1190,7 @@
       ;; tagged for multiplexed worker mailboxes.  The doctest
       ;; driver's staleness anchor.
       (let ((s (_0 hm)))
-        (let ((c ((core-ent core ["x_case_h"]) 0 (_1 msg) s)))
+        (let ((c (ent"x_case_h" 0 (_1 msg) s)))
           (Seq (Send (Ix 0 caps) (DeepSeq c ["cres" (_1 msg) c]))
             (helm-loop core mk-worker persist st)))))
     ((Eq kind "crew")
