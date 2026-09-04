@@ -115,8 +115,6 @@
 ;; is
 (define TSELF $SELF)
 (define tself-val SELF.value)
-;;
-(define (is-tfun? x) (type-is? "TFUN" x))
 (define (tfun-ari x) (Sz (FUN.arguments x)))
 (define tfun-args FUN.arguments)
 (define tfun-ret FUN.return)
@@ -441,8 +439,6 @@
 
 (define (make-type-context sut)
   ($TypeContext sut 0 cairn:empty-ax [] 0 []))
-(define (make-profile-type-context sut)
-  ($TypeContext sut 0 cairn:empty-ax [] 1 []))
 (define type-context-sut TypeContext.sut)
 (define type-context-generation TypeContext.generation)
 (define type-context-expansions TypeContext.expansions)
@@ -450,13 +446,6 @@
 (define type-context-profiled? TypeContext.profiled)
 ;; type-context-resolutions :: TypeContext -> Row Resolution
 (define type-context-resolutions TypeContext.resolutions)
-;; type-context-record-resolution :: Resolution -> TypeContext -> TypeContext
-(define (type-context-record-resolution resolution ctx)
-  (define prior (type-context-resolutions ctx))
-  (If (includes (Equal resolution) prior)
-    ctx
-    (TypeContext.=resolutions (snoc resolution prior) ctx)))
-
 (define (profile-type-context-result ctx label result)
   (If (type-context-profiled? ctx)
     (profile-zone:force-pair-value-zone label result)
@@ -576,10 +565,17 @@
       (or (Eq 0 (tnat-cube sup)) (Eq (tnat-cube sup) (tnat-cube sub))))
     (else 0)))
 
-(define (check-type-wf sut x)
-  (define recur (check-type-wf sut))
+;; check-type-wf-in :: Subject -> [Cord] -> Type -> Either
+;;
+;; Quantifier scope is walk-local: `tvars` is the row of binder names in
+;; scope (QUA/CQUA push, VAR and /ty-var refs query).  It rides the
+;; recursion as an explicit argument — it once lived in the subject's
+;; slot 2, which made a walk-local scope look like compile state.
+(define (check-type-wf-in sut tvars x)
+  (define recur (check-type-wf-in sut tvars))
+  (define (bound? name) (find-idx (Eq name) tvars))
   (define (check-tfun-args args)
-    (define res (filter is-left? (map (check-type-wf sut) args)))
+    (define res (filter is-left? (map recur args)))
     (Ifz (Sz res) (right 0) (_0 res)))
   (define (type-and x y) (If (is-left? x) x y))
   ;; A nominal ref may be a /ty-var path, a /ty-ap application (whose
@@ -588,7 +584,7 @@
   (define (check-const-arg p)
     (cond
       ((ty-var-path? p)
-        (Ifz (sut-get-tvar? (Ix 1 p) sut)
+        (Ifz (bound? (Ix 1 p))
           (left ["unbound const parameter" (Ix 1 p)])
           (right 0)))
       ((ty-val-path? p) (right 0))
@@ -598,7 +594,7 @@
   (define (check-nom-ref ref)
     (cond
       ((ty-var-path? ref)
-        (Ifz (sut-get-tvar? (Ix 1 ref) sut)
+        (Ifz (bound? (Ix 1 ref))
           (left ["unbound ty var" (Ix 1 ref)])
           (right 0)))
       ((ty-ap-path? ref)
@@ -660,7 +656,7 @@
              "cstr" (Ix 1 dup) "arity" (Ix 2 dup)])))
   (? FoilType x
     (VAR [index]
-     (Ifz (sut-get-tvar? index sut)
+     (Ifz (bound? index)
        (left ["unbound ty var" index])
        (right 0)))
      (FUN [arguments return]
@@ -670,10 +666,10 @@
      (PIN [value] (recur value))
      (ARR [item] (recur item))
      (NAT (right 0))
-     (QUA [name body] (check-type-wf (sut-put-tvar name sut) body))
+     (QUA [name body] (check-type-wf-in sut (snoc name tvars) body))
      (CQUA [name const-type body]
        (type-and (recur const-type)
-         (check-type-wf (sut-put-tvar name sut) body)))
+         (check-type-wf-in sut (snoc name tvars) body)))
      (SUM [options]
        (type-and (check-tfun-args options) (check-sum-opts options)))
      (ROW [cstr vals]
@@ -686,6 +682,9 @@
      (TYP [type] (recur type))
      ;; Remaining tags (TANY, TBOT, TBAD) are leaves.
      (_ (right 0))))
+
+;; check-type-wf :: Subject -> Type -> Either
+(define (check-type-wf sut x) (check-type-wf-in sut [] x))
 
 ;; Binder names of a generic's TQUA chain, outermost first (skipping
 ;; faces/self, mirroring count-tqua's traversal).
@@ -923,12 +922,6 @@
       (ARR [item] (TARR (recur item)))
       (_ ty))
     (TNOM (_0 nom) 0)))
-
-(define (span-to-mold-context ctx span)
-  (If (type-context-profiled? ctx)
-    (profile-zone:force-zone "foil.type.reverse-recovery"
-      (span-to-mold (type-context-sut ctx) span))
-    (span-to-mold (type-context-sut ctx) span)))
 
 (define (type-nests? sut sup sub)
   (cond
@@ -1226,24 +1219,6 @@
              (joined (type-join-span sut xs ys)))
         (recover-joined-mold (span-to-mold sut) x xs y ys joined)))))
 
-(define (type-join-context ctx x y)
-  (define result
-    (cond
-      ((Equal x y) [ctx x])
-      ((type-is? "TBOT" x) [ctx y])
-      ((type-is? "TBOT" y) [ctx x])
-      (else
-        (let* ((xr (mold-to-span-context ctx x))
-               (yr (mold-to-span-context (_0 xr) y))
-               (ctx1 (_0 yr))
-               (xs (_1 xr))
-               (ys (_1 yr))
-               (joined (type-join-span (type-context-sut ctx1) xs ys)))
-          [ctx1
-           (recover-joined-mold (span-to-mold-context ctx1)
-             x xs y ys joined)]))))
-  (profile-type-context-result ctx "foil.type.join" result))
-
 ;; type intersection
 (define (type-meet-span sut x y)
   (define xtag (type-tag x))
@@ -1343,18 +1318,6 @@
     (else
       (_0 (type-meet-expanded sut x (mold-to-span sut x) y
             (mold-to-span-seen sut (mold-rec-seed x) y))))))
-
-(define (type-meet-context ctx x y)
-  (define result
-    (let* ((xr (mold-to-span-context ctx x))
-           (ctx1 (_0 xr))
-           ;; As in type-nests-context, this expansion's recursive cut depends on
-           ;; the opposite operand and therefore stays local to the comparison.
-           (ys (mold-to-span-seen (type-context-sut ctx1) (mold-rec-seed x) y))
-           (res (type-meet-expanded-go (type-context-sut ctx1)
-                  (type-context-profiled? ctx1) x (_1 xr) y ys)))
-      [ctx1 res]))
-  (profile-type-context-result ctx "foil.type.meet" result))
 
 (define (fits-err err)
   (1 [err]))
@@ -1468,8 +1431,6 @@
 
 ;;; Subject insertion and type AST conversion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define tc-poison
-  (tc "POISON" TBAD))
 (define (tc-ttyp typ)
   (tc-typ (TTYP typ)))
 ;; Quantifiers are transparent to naming: a generic row declaration
@@ -1489,13 +1450,6 @@
   (insert-typ key wack-span typ sut))
 
 ;;; Row face helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(define (collect-faces items)
-  (define (go acc[idx ls] arg)
-    (? FoilType arg
-      (FAC [face value] [(Inc idx) (snoc [idx face value] ls)])
-      (_ [(Inc idx) ls])))
-  (_1 (foldl go [0 0] items)))
 
 ;;; Public exports ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1520,29 +1474,23 @@
  type-entry?
  mold-to-span
  make-type-context
- make-profile-type-context
  type-context-sut
  type-context-generation
  type-context-resolutions
- type-context-record-resolution
  type-context-with-subject
  mold-to-span-context
  span-to-mold
  type-apply
  type-specialize
  type-join
- type-join-context
  type-meet
  type-meet-expanded
- type-meet-context
  type-fits
  type-shape-fits
  type-nests?
  type-nests-context
  insert-typ
  insert-typ-ffi
- collect-faces
-
 TBOT
 ;; natural, optionally constant
  TNAT
@@ -1559,11 +1507,8 @@ tsum-opts
  TVAR
  tvar-index
 TFUN
-
 TSELF
 tself-val
-
-is-tfun?
 tfun-ari
 tfun-args
 tfun-ret

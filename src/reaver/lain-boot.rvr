@@ -7,6 +7,120 @@
 (#bind nfoil (#module foil-new-env))
 (#bind foil-subject (#module foil-subject))
 
+;;; Namespace path macros ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; The runtime spells namespace paths three ways: entry-key rows
+;; (["myth" "new"]), ts-quip segments (("ts" "io")), and node paths
+;; ([("ts" "kook") ("ts" "llm")]).  Adjacent word+string parses as an
+;; application (p"myth/new" is (p "myth/new")), so these macros read
+;; like reader macros:
+;;
+;;   p"myth/new"    -> ["myth" "new"]              entry-key row
+;;   t"io"          -> ("ts" "io")                 one ts segment
+;;   n"kook/llm"    -> [("ts" "kook") ("ts" "llm")] node path
+;;   a"myth/new"    -> (app ["myth" "new"])        entry lookup
+;;
+;; They ride (#import helm) into the other helm-* modules.
+;;
+;; CAUTION: `a` is deliberately unhygienic — it expands to a call of
+;; whatever `app` is bound at the use site (the (app path) helpers in
+;; helm-run's build-lain-sov and serve-lain).  Where no `app` is in
+;; scope it is silently junk (#export gating rules); use (app p"...")
+;; anywhere hygiene is in doubt.
+
+;; Expansion-time cord split on "/".  Offset walk with Load8 — never
+;; advance a cord by division (that is the quadratic §4 trap even at
+;; expansion time).
+(define (path-seg-slice off len s)
+  (Trunc (Mul 8 len) (Rsh s (Mul 8 off))))
+;; A string literal reaches a transformer as the quote node (1 cord);
+;; a bare word arrives as the cord itself.  Accept both, refuse the rest.
+(define (path-macro-str ctx x)
+  (cond
+    ((IsNat x) x)
+    ((And (IsApp x) (Eq 1 (Hd x))) (_0 x))
+    (else
+      (error ["helm-path-macro" "path must be a string literal"
+              ["at" ctx]]))))
+(define (path-macro-segs ctx s0)
+  (define s (path-macro-str ctx s0))
+  (define nb (Bytes s))
+  (define (emit start i acc)
+    (define seg (path-seg-slice start (Sub i start) s))
+    (unless (Gt (Bytes seg) 0)
+      (error ["helm-path-macro" "empty path segment" ["in" s] ["at" ctx]])
+      (lcons seg acc)))
+  (define (go start i acc)
+    (cond
+      ((Ge i nb) (rowify (lrev (emit start i acc))))
+      ((Eq "/" (Load8 i s)) (go (Inc i) (Inc i) (emit start i acc)))
+      (else (go start (Inc i) acc))))
+  (unless (Gt nb 0)
+    (error ["helm-path-macro" "empty path" ["at" ctx]])
+    (go 0 0 0)))
+
+(define (path-segs s)
+  (define nb (Bytes s))
+  (define (emit start i acc)
+    (define seg (path-seg-slice start (Sub i start) s))
+    (unless (Gt (Bytes seg) 0)
+      (error ["helm-path-macro" "empty path segment" ["in" s]])
+      (lcons seg acc)))
+  (define (go start i acc)
+    (cond
+      ((Ge i nb) (rowify (lrev (emit start i acc))))
+      ((Eq "/" (Load8 i s)) (go (Inc i) (Inc i) (emit start i acc)))
+      (else (go start (Inc i) acc))))
+  (unless (Gt nb 0)
+    (error ["helm-path-macro" "empty path"])
+    (go 0 0 0)))
+
+;; Each expansion is built from quoted constants, so the emitted form
+;; is pure syntax: a "#brak" row of quoted cords (p), an application
+;; of the quoted "ts" tag (t), or both (n).
+;;
+;; A juxt in call position folds its arguments into the same form —
+;; (a"build/eval_req" "demo") arrives as (a "build/eval_req" "demo") —
+;; so every macro re-applies the expansion to the trailing elements.
+(define (path-macro-call base form)
+  (If (Gt (Sz form) 2)
+    (Weld [base] (drop 2 form))
+    base))
+
+(define-syntax (p form)
+  (path-macro-call
+    (cons "#brak"
+      (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))
+    form))
+
+(define-syntax (t form)
+  (path-macro-call
+    [(1 "ts") (1 (path-macro-str form (_1 form)))]
+    form))
+
+(define-syntax (n form)
+  (path-macro-call
+    (cons "#brak"
+      (map (lambda (seg) [(1 "ts") (1 seg)])
+        (path-macro-segs form (_1 form))))
+    form))
+
+; (define-syntax (a form)
+;   (path-macro-call
+;     ["app" (cons "#brak"
+;              (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))]
+;     form))
+
+;; ent"myth/new" is (core-ent core ["myth" "new"]) — the core-entry
+;; lookup.  Unhygienic over `core`, the way `a` is over `app`.
+(define-syntax (ent form)
+  (path-macro-call
+    ["core-ent" "core"
+     (cons "#brak"
+       (map (lambda (seg) (1 seg)) (path-macro-segs form (_1 form))))]
+    form))
+
+
 ;; compile lain
 ;; install lain at /
 ;; install pact at /pact
@@ -15,11 +129,39 @@
 ;; take /io result and bootstrap drivers
 
 
-(define lain-core (nfoil:compile nfoil:empty-foil-cache "lain"))
+(define helm-core (nfoil:compile nfoil:empty-foil-cache "eden"))
 
+;; compile returns [cache perc]; Perc = [rex sast layer]
+(define helm-perc (_1 helm-core))
+(define helm-sut (Ix 2 helm-perc))
+
+;; a SPELLING, resolved through eden's head marks (per-module roots:
+;; sov/new canonicalizes to /boot/shrine/sov/new)
+(define (parse-name name) (path-segs name))
+;; the LOWERED value of a declaration (a callable law for functions)
+(define (v name) (nfoil:get-perc (parse-name name) helm-perc))
+
+;; the TC node (signature, type) of a declaration
+(define (helm-tc name) (foil-subject:got-entry-tc (parse-name name) helm-sut))
+
+
+;; soil is the impermanent state
+
+;; sov is the permanent namespace state
+
+(define sov v"sov/new")
+(define apply v"sov/apply")
+(define cycle v"cycle")
+(define lain ("/boot/lain/vine" cycle))
+(print ("lain" cycle))
+
+(define first (v"eden/first" lain (v"pact/kook/decl" 0)))
+; (define first (
+
+(define one v)
 
 ; (define (compile-lain x)
-;   foil()
+  ;   foil())
 ;
 ; (define (start port key)
 ;   ;;

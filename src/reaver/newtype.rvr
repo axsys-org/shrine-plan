@@ -115,6 +115,20 @@
 
 ;;; Shallow runtime validation ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; The runtime check switch.  1 (debug): every $-constructor field, typed
+;; function argument and result, and union-match scrutinee is validated
+;; against its declared type by shallow-type-fits? — the check calls are
+;; emitted into every expansion.  0 (release): the expansions emit the bare
+;; values and no check law runs at all.  Constructors still WHNF-force each
+;; field (the Seq chain stays), so evaluation order is unchanged; only the
+;; representation walk is gone.  check-fun-impl (law-like + arity, once per
+;; wrapper build) is not gated: it is not per-call.
+;;
+;; Read at EXPANSION time: flipping it recompiles every importer (the module
+;; cache keys on this file anyway), and any test asserting a "type mismatch"
+;; error is expected to fail at 0.
+(define newtype-runtime-checks? 0)
+
 (define (law-like? val)
   (Or (IsLaw val)
     (And (IsPin val) (IsLaw (Unpin val)))))
@@ -405,12 +419,16 @@ assert(Ne "_" (newtype-gensym 95 0))
   (define args (drop 3 names))
 
   (define checks
-    (gen arity
-      (lambda (i)
-        [(1 check-fun-arg) (1 type-name) (1 i) (1 (Ix i argtys)) (Ix i args)])))
+    (If newtype-runtime-checks?
+      (gen arity
+        (lambda (i)
+          [(1 check-fun-arg) (1 type-name) (1 i) (1 (Ix i argtys)) (Ix i args)]))
+      []))
   (define raw-call (cons impl args))
   (define result
-    [(1 check-fun-result) (1 type-name) (1 ret) raw-call])
+    (If newtype-runtime-checks?
+      [(1 check-fun-result) (1 type-name) (1 ret) raw-call]
+      raw-call))
   (define body
     (foldr (lambda (check rest) [(1 Seq) check rest]) result checks))
   (define inner
@@ -438,11 +456,15 @@ assert(Ne "_" (newtype-gensym 95 0))
   (define signature (cons self args))
 
   ;; Validate every argument before constructing the branded row.  Seq makes
-  ;; the checks eager even though PLAN application arguments are lazy.
+  ;; the checks eager even though PLAN application arguments are lazy.  With
+  ;; checks off the Seq chain forces the bare arguments instead, keeping the
+  ;; constructor's strictness identical.
   (define checks
-    (map (lambda (pair)
-      (constructor-check-expr cstr (_0 pair) (_1 pair)))
-      (zip items args)))
+    (If newtype-runtime-checks?
+      (map (lambda (pair)
+        (constructor-check-expr cstr (_0 pair) (_1 pair)))
+        (zip items args))
+      args))
   (define result (cons (1 cstr) args))
   (define body
     (foldr (lambda (check rest) [(1 Seq) check rest]) result checks))
@@ -803,7 +825,7 @@ assert(Equal
     [(1 assert-union-value) (1 type-name) (1 union-type) scrutinee])
   [(Inc uniq) glo
    ["#let" [[scrutinee scrutinee-expr]]
-    [(1 Seq) checked dispatch]]])
+    (If newtype-runtime-checks? [(1 Seq) checked dispatch] dispatch)]])
 
 ;; (decl-fun Name argty ... -> retty) binds Name to a function type value.
 ;; Types use the infix arrow syntax; each type stays call-site syntax,
@@ -925,9 +947,12 @@ assert(Eq 30 (Point.x updated-point))
 assert(Eq 4 (Point.y updated-point))
 assert(Eq 3 (Point.x example-point))
 
+;; The mismatch self-tests below assert against the switch: with checks on
+;; the Try reports an error (1), with checks off the bad value is simply
+;; built (0).  check-fun-impl and unknown-face failures are not gated.
 (define bad-pair
   (Try (lambda (z) ($Pair 1 [2])) 0))
-assert(Eq 1 (Hd bad-pair))
+assert(Eq newtype-runtime-checks? (Hd bad-pair))
 
 (define get-row-cstr (. Row cstr))
 (define get-row-items (. Row items))
@@ -965,7 +990,7 @@ assert(Eq "other" (pair-or-fallback example-row))
 ;; present: _ covers unlisted union members, not values outside the union.
 (define bad-union-scrutinee
   (Try (lambda (z) (pair-or-fallback tany)) 0))
-assert(Eq 1 (Hd bad-union-scrutinee))
+assert(Eq newtype-runtime-checks? (Hd bad-union-scrutinee))
 
 
 ;; (decl-fun NatBinop ...) -> bind NatBinop to a function type; ($NatBinop f)
@@ -981,13 +1006,13 @@ assert(Eq 5 (checked-add 2 3))
 
 (define bad-add-argument
   (Try (lambda (z) (checked-add [1] 3)) 0))
-assert(Eq 1 (Hd bad-add-argument))
+assert(Eq newtype-runtime-checks? (Hd bad-add-argument))
 
 (decl-fun NatToNat (tnat 0) -> (tnat 0))
 (define bad-result-fn ($NatToNat (lambda (a) [a])))
 (define bad-fun-result
   (Try (lambda (z) (bad-result-fn 7)) 0))
-assert(Eq 1 (Hd bad-fun-result))
+assert(Eq newtype-runtime-checks? (Hd bad-fun-result))
 
 ;; The implementation is validated once, when the wrapper is built.
 (define bad-fun-impl
@@ -1026,7 +1051,7 @@ assert(Equal
 assert(Eq 7 (iter-twice (lambda (n) (Inc n)) 5))
 (define bad-iter-fun-arg
   (Try (lambda (z) (iter-twice 9 5)) 0))
-assert(Eq 1 (Hd bad-iter-fun-arg))
+assert(Eq newtype-runtime-checks? (Hd bad-iter-fun-arg))
 
 ;; The arrow is right-associative.
 (decl-fun CurriedAdd (tnat 0) -> (tnat 0) -> (tnat 0))

@@ -59,6 +59,8 @@
 ;; Nat -> Perc -> FoilCache
 (define (put-foil-cache nam perc cache)
   (bst:bst-insert nam perc cache))
+(define (get-foil-cache nam cache)
+  (bst:bst-search nam cache))
 
 ;; Path -> Layer -> Unit[Bind]
 (define (lookup-bind path lay)
@@ -92,10 +94,11 @@
   (force lowered))
 
 ;; -> [cache prev-pins direct-layers]: the row of import-subject PINS
-;; (later-import-first, substrate last), plus the DIRECT import layer
-;; subjects, kept so the caller can mark their names visible —
-;; visibility is head state (a name resolves because THIS compile
-;; marked it, never because a tail layer marked its own).
+;; (later-import-first, substrate last), plus the DIRECT imports as
+;; [layer at] pairs (at = the import's mount prefix, [] when bare), kept
+;; so the caller can spell their names into the head — visibility is
+;; head state (a name resolves because THIS compile marked it, never
+;; because a tail layer marked its own).
 (define (construct-subject compile cache base imps[imp rest])
   (define (go cache1 pins layers imps1[imp rest])
     (Ifz imps1
@@ -104,10 +107,15 @@
       [cache1 (snoc (Pin base) pins) layers]
       (letrec
         ((name (foil-surface:surf-import-modname imp))
+         (at0 (foil-surface:surf-import-at imp))
+         (at (Ifz at0 [] at0))
          (compiled (compile cache1 name))
          (cache2 (put-foil-cache name (_1 compiled) (_0 compiled)))
          (lay (Perc.layer (_1 compiled))))
-        (go cache2 (Weld [(Pin lay)] pins) (snoc lay layers) rest))))
+        ;; each import compiles in program order (see the DeepSeq in
+        ;; `compile`: the head must be forced before elaboration)
+        (Seq lay
+          (go cache2 (Weld [(Pin lay)] pins) (snoc [lay at] layers) rest)))))
   (go cache [] [] imps))
 
 (define (mark-own-visible decls sut)
@@ -117,18 +125,67 @@
         (foil-subject:mark-visible path path s)))
     sut (filter mod-decl? decls)))
 
-;; Each direct import's own head-order keys, marked identity-visible —
-;; the prototype's p-marks (no export filtering: everything a direct
-;; import declares is importable here).
-(define (mark-imports-visible layers sut)
+;; PER-MODULE ROOTS (Liam, 2026-09-03): every module compiles beneath
+;; /boot/<mod>, so a declaration's canonical key — its storage key, its
+;; nominal identity, the brand on its values — is module-qualified and
+;; two modules can never collide.  The import line only decides the
+;; SPELLING: a layer's key is marked under the importer's root (plus the
+;; import's at= prefix for a direct mount) with the layer's own root
+;; stripped.  The substrate's keys are bare (["either" "left"]) and its
+;; root is /boot, so builtins spell as bare names in every module.
+;; Materialized /ty-ap keys have no spelling (canon-path treats them
+;; as canonical already) and are skipped.
+(define (mark-layer-under spell lay s)
+  (define lroot (foil-subject:sut-root lay))
+  (define n (Sz lroot))
   (foldl
-    (lambda (s lay)
-      (foldl (lambda (s2 k) (foil-subject:mark-visible k k s2))
-        s (foil-subject:subject-order lay)))
-    sut layers))
+    (lambda (s2 k)
+      (cond
+        ((foil-subject:ty-ap-path? k) s2)
+        ((And (Ge (Sz k) n) (Equal lroot (take n k)))
+          (foil-subject:mark-visible (Weld spell (drop n k)) k s2))
+        (else (foil-subject:mark-visible (Weld spell k) k s2))))
+    s (foil-subject:subject-order lay)))
+
+;; TRANSITIVE visibility (Liam, 2026-09-03): every declaration anywhere
+;; in the import closure is importable here — no export filtering and
+;; no direct-only rule.  Far layers are marked before near ones and
+;; siblings in source order, so on a name collision the nearest (and
+;; then the later) layer wins; own decls are marked after this and win
+;; over everything.  Transitive layers (and the substrate, which ends
+;; every chain) spell under the bare root; a direct import spells under
+;; root ++ at.  A layer already marked under a spelling is not marked
+;; again (diamonds), so precedence follows the first, nearest reach.
+(define (mark-imports-visible root layers sut)
+  (define (mark-chain st lay spell)
+    (define key (Weld spell (foil-subject:sut-root lay)))
+    (If (ca:getax key (_1 st))
+      st
+      (let* ((prevs (foil-subject:sut-prevs lay))
+             (st1 (foldl (lambda (acc p) (mark-chain acc (Unpin p) root)) st (rev prevs)))
+             (s2 (mark-layer-under spell lay (_0 st1))))
+        [s2 (ca:putax key 1 (_1 st1))])))
+  (_0 (foldl
+        (lambda (st pair) (mark-chain st (_0 pair) (Weld root (_1 pair))))
+        [sut ca:empty-ax] layers)))
+
+;; make-head : Cord -> Subject -> [Pin] -> [[Subject Path]] -> [Decl] -> Subject
+;; The fresh head of a compile: rooted at /boot/<mod> over the shared
+;; import pins, with the whole closure's names (substrate included) and
+;; the module's own decls marked into it.
+(define (make-head mod base prev-pins layers decls)
+  (define root (Weld (foil-subject:sut-root base) [mod]))
+  (define head
+    (foil-subject:set-sut-root root
+      (foil-subject:head-onto-pins prev-pins base)))
+  ;; the substrate goes FIRST (lowest precedence: imports and own decls
+  ;; shadow builtins) and explicitly — a module with no imports has no
+  ;; chain through which the substrate would otherwise be reached
+  (mark-own-visible decls
+    (mark-imports-visible root (Weld [[base []]] layers) head)))
 
 ;; cache -> module name -> [cache' perc]
-(define (compile cache mod)
+(define (compile-inner compile cache mod)
   (define rex (rex:ParseRexNormFile (foil:get-foil mod)))
   (define base foil-builtins:default-subject)
   (define sast (foil-sast:parse-module-sast 0 rex))
@@ -136,33 +193,48 @@
   (print ("imps" imps))
   (define decls (filter (lambda (r) (Nil (mod-import? r))) sast))
   (define res[cach prev-pins layers] (construct-subject compile cache base imps))
-  ;; fresh head over the shared import pins; all naming authority
-  ;; (substrate, direct imports, own decls) is marked into it — the
-  ;; pinned tail layers carry entries only
-  (define sut
-    (mark-own-visible decls
-      (mark-imports-visible layers
-        (foil:mark-substrate-into base
-          (foil-subject:head-onto-pins prev-pins base)))))
+  ;; fresh head rooted at /boot/<mod> over the shared import pins; all
+  ;; naming authority (substrate, the whole import closure, own decls)
+  ;; is marked into it — the pinned tail layers carry entries only
+  (define sut (make-head mod base prev-pins layers decls))
+  ;; Force the head — and through its visibility marks every import's
+  ;; compile — HERE, at driver level.  Left lazy, a failing import first
+  ;; fails inside the importer's per-declaration Try in foil-new-elab
+  ;; (run-decl-pass records it as that declaration's diagnostic), and the
+  ;; next declaration re-forces the same blackholed thunk: wisp reports
+  ;; that as a fatal <<loop>> instead of the import's error.  (The prev
+  ;; pins stop DeepSeq; the unpinned direct layers in the marks do not.)
+  (DeepSeq sut 0)
   (define mod (elab-mod compile sut decls))
   [cach ($Perc rex sast mod)])
+
+(define (compile cache mod)
+  (define hit (get-foil-cache mod cache))
+  (Ifz hit (compile-inner compile cache mod)
+    [cache (_0 hit)]))
 
 (define (time f x)
   (define start (Now 0))
   (define res (f x))
   (define done (Now 0))
   (define timing (print ("took" (Sub done start))))
-  (seqN
+  (Seq
     start
-    res
-    done
-    timing
-    res))
+    (Seq res
+        (Seq timing res))))
+
+    ; res
+    ; done
+    ; timing
+    ; res))
 
 (define evo-perc (_1 (time (compile empty-foil-cache) "evo")))
 
 ; (print ("test" (Perc.layer evo-perc)))
-(define perc-add (get-perc ["boot" "add_two"] evo-perc))
-(define mk-point (get-perc ["boot" "make_point"] evo-perc))
+(define perc-add (get-perc ["add_two"] evo-perc))
+(define mk-point (get-perc ["make_point"] evo-perc))
 (mk-point 3)
 (perc-add 3)
+
+(define (timed-compile mod)
+  (time (compile empty-foil-cache) mod))
