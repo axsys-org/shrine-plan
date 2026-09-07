@@ -110,6 +110,55 @@
 (define (autoname-inner k)
   (_0 (hr-stem (rx-rune-kids k))))
 
+;; {\ a b} — the argument half of a function type.
+(define (fun-curly? k) (rx-nest-is? "curly" "\" k))
+
+;; A surface node without its s_span wrappers (the elaborator's
+;; surf-strip-spans is not visible here).
+(define (sast-strip-span x)
+  (If (And (IsApp x) (Eq "s_span" (_0 x))) (sast-strip-span (_2 x)) x))
+
+;; Re-form the operands a flattened line delivers.  On a head line rex
+;; glues `row[path]` and `{\ v}w` into juxts, but a continuation line
+;; arrives as ONE juxt of everything on it, so a spec bracket after a
+;; word/cref, and a \-curly's result (the next operand, plus a spec
+;; bracket after a word), are re-attached to their heads.
+(define (regroup ks)
+  (define (spec-head? k) (Or (rx-word? k) (cref-nest? k)))
+  (define (go rest acc)
+    (Ifz (Sz rest)
+      acc
+      (let ((k (_0 rest))
+            (more (drop 1 rest)))
+        (cond
+          ((fun-curly? k)
+            (let ((n (cond
+                       ((Eq 0 (Sz more)) 0)
+                       ((And (Gt (Sz more) 1)
+                          (And (spec-head? (_0 more)) (spec-brack? (_1 more))))
+                         2)
+                       (else 1))))
+              (go (drop n more)
+                (snoc (rx-juxt (rx-span k) (Weld [k] (take n more))) acc))))
+          ((And (Gt (Sz more) 0)
+             (And (spec-head? k) (spec-brack? (_0 more))))
+            (go (drop 1 more)
+              (snoc (rx-juxt (rx-span k) [k (_0 more)]) acc)))
+          (else (go more (snoc k acc)))))))
+  (go ks []))
+
+;; The items of a tall row declaration (:).  Kids are the head line's
+;; operands plus one juxt per continuation line (or a group of them);
+;; a continuation juxt holds several items, so regroup it.
+(define (flat-items kids)
+  (foldl
+    (lambda (acc k)
+      (cond
+        ((rx-plain? "clear" k) (Weld acc (flat-items (rx-nest-kids k))))
+        ((rx-juxt? k) (Weld acc (regroup (hr-stem (rx-juxt-kids k)))))
+        (else (snoc k acc))))
+    [] (hr-stem kids)))
+
 
 ;; Type paths, with specialization on the last segment: bst/node[v]
 ;; arrives as (/ bst (juxt node [v])) — juxtaposition binds tighter
@@ -124,6 +173,16 @@
         (And (spec-brack? (_1 jkids))
           (road-kids? (Init kids))))))
   (cond
+    ;; {\ v}weft/node — a function type whose result is a path: rex
+    ;; delivers (/ (juxt curly weft) node); peel the curly off the
+    ;; first segment and the road that remains is the result.
+    ((And (Gt (Sz kids) 0)
+       (And (rx-juxt? (_0 kids))
+         (fun-curly? (_0 (rx-juxt-kids (_0 kids))))))
+      (let ((jk (rx-juxt-kids (_0 kids))))
+        (surf-tfun
+          (map cont (hr-stem (rx-nest-kids (_0 jk))))
+          (parse-type-path cont (Weld (drop 1 jk) (drop 1 kids))))))
     ;; =foo/bar — the autonamer wraps the whole path in a face named
     ;; after the first segment.
     ((And (Gt (Sz kids) 0) (autoname-head? (_0 kids)))
@@ -265,18 +324,15 @@
       ((And (Eq "paren" (rx-nest-color nes))
          (Eq "%/" (rx-nest-rune nes)))
         (parse-road [nes]))
-      ;; Plain-curly rows are retired: curly is function types only;
-      ;; anonymous structural rows are spelled with brackets.
+      ;; Function types are spelled {\ a b}c: the arguments inside the
+      ;; braces, the result glued after them (on-juxt below).  Curly is
+      ;; function types only (anonymous rows are bracketed); the old
+      ;; result-last spellings are located diagnostics.
       ((And (Eq "curly" (rx-nest-color nes))
-         (Eq ";" (rx-nest-rune nes)))
-        (unless (Gt (Sz kids) 1)
-          (sast-error "bad function type" nes)
-          (surf-tfun (Init kids) (Last kids))))
-      ((And (Eq "curly" (rx-nest-color nes))
-         (Eq "%" (rx-nest-rune nes)))
-        (unless (Gt (Sz kids) 1)
-          (sast-error "bad function type" nes)
-          (surf-tfun (Init kids) (Last kids))))
+         (Or (Eq ";" (rx-nest-rune nes)) (Eq "%" (rx-nest-rune nes))))
+        (sast-error "function types are spelled {\ a b}c now - arguments inside the braces, the result glued after the closing brace" nes))
+      ((fun-curly? nes)
+        (sast-error "a function type needs its result type right after the brace: {\ a b}c" nes))
       (else (sast-error "bad type nest" nes))))
   (define (on-leaf lef)
     (cond
@@ -288,6 +344,19 @@
   (define (on-juxt jux)
     (define kids (rx-juxt-kids jux))
     (cond
+      ;; {\ a b}c — a function type: the curly holds the arguments, the
+      ;; rest of the juxt is the result ({\ a}{\ b}c nests rightward,
+      ;; {\ v}maybe[w] keeps its spec juxt).
+      ((fun-curly? (_0 kids))
+        (let ((rest (drop 1 kids)))
+          (unless (Gt (Sz rest) 0)
+            (sast-error "a function type needs its result type right after the brace: {\ a b}c" jux)
+            (surf-tfun
+              (map parse-type-sast (hr-stem (rx-nest-kids (_0 kids))))
+              (parse-type-sast
+                (If (Eq 1 (Sz rest))
+                  (_0 rest)
+                  (rx-juxt (rx-span (_0 rest)) rest)))))))
       ((And (Eq 2 (Sz kids))
          (And (rx-word? (_0 kids))
            (spec-brack? (_1 kids))))
@@ -309,7 +378,7 @@
     (else (sast-error "bad type rex" ty))))
 
 ;; Kids of an @ / @@ variable list: bare words declare type vars;
-;; faced kids (name={k k; nat}) declare compile-time-constant
+;; faced kids (name={\ k k}nat) declare compile-time-constant
 ;; parameters with their types.  -> [vars consts].
 (define (parse-tvar-kids ctx kids)
   (define (faced? k) (rx-rune? "=" k))
@@ -393,6 +462,8 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (cond
       ((rx-word? r) (rx-word-str! r))
       ((And (rx-nest? r) (Eq "paren" (rx-nest-color r))) (cont r))
+      ((rx-rune? "#" r)
+        (sast-error-at r "flip (#) applies to a call head, not a method receiver" els))
       (else (sast-error-at r "bad method receiver" els))))
   ;; Tall chains deliver the continuation segments as one vertical
   ;; group kid — splice it (a segment that is a horizontal juxt stays
@@ -420,6 +491,11 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             (Eq "clear" (rx-nest-color (_0 kids)))))))))
   (define (parse-path-val kids)
     (define last (Last kids))
+    ;; #str/cat arrives as (/ (# str) cat): the flip wraps the whole path
+    (If (And (Or (rx-rune? "#" (_0 kids)) (rx-rune? "##" (_0 kids)))
+          (Eq 1 (Sz (rx-rune-kids (_0 kids)))))
+      (let ((one (surf-flip (parse-path-val (Weld (rx-rune-kids (_0 kids)) (drop 1 kids))))))
+        (If (rx-rune? "##" (_0 kids)) (surf-flip one) one))
     (If (rx-juxt? last)
       (let ((jkids (rx-juxt-kids last)))
         (If (And (spec-juxt? jkids)
@@ -428,61 +504,68 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
             (parse-road (Weld (Init kids) [(_0 jkids)]))
             (brack-args parse-type-sast (_1 jkids)))
           (parse-road kids)))
-      (parse-road kids)))
+      (parse-road kids))))
   (define (synth-body items)
     (If (Eq 1 (Sz items))
       (_0 items)
       (rx-nest (rx-span (_0 items)) "clear" "" items)))
-  ;; Bindings come as > arms (typed, or match-bodied local functions)
-  ;; or as bare name/value pairs, consumed PAIRWISE.  Positional
-  ;; disambiguation of the group kid: in VALUE position it is the
-  ;; binding's block value; in HEAD position (operands fully paired so
+  ;; The operands of a | call.  Sibling kids are separate operands,
+  ;; except that a \ kid with kids after it takes them as its body
+  ;; chain - the body walker's own rule for a lambda line - and ends
+  ;; the list (the call's heir is still the call's last argument).
+  ;; Only \ chains: a | or ? kid followed by a sibling must stay two
+  ;; operands, or `| add ..` + `[sep]` would fold [sep] into add.
+  ;; The chain parses as a plain group (on-clear reads it as a body).
+  (define (call-operands ks)
+    (cond
+      ((Eq 0 (Sz ks)) [])
+      ((And (rx-rune? "\" (_0 ks)) (Gt (Sz ks) 1))
+        [(surf-fun
+           (map parse-type-sast (hr-stem (rx-juxt-flat (rx-rune-kids (_0 ks)))))
+           (parse-val-sast (rx-nest (rx-span (_0 ks)) "clear" "" (drop 1 ks))))])
+      (else (Weld [(parse-val-sast (_0 ks))] (call-operands (drop 1 ks))))))
+  ;; Bindings and loop parameters are `pattern init` PAIRS, consumed
+  ;; pairwise: a =-block's equations and a %-loop's parameters alike.
+  ;; Positional disambiguation of a group kid: in VALUE position it is
+  ;; the pair's block value; in HEAD position (operands fully paired so
   ;; far) it carries continuation pairs — splice it and keep pairing.
-  (define (parse-letrec kids heir)
+  ;; A continuation line (`rt  (_ n.r)`) arrives as one juxt: regroup
+  ;; its operands and splice them.  A > head is the retired arm
+  ;; spelling (> is match/guard only) — a located diagnostic.
+  (define (parse-pairs arm-msg unpaired-msg kids)
     (define (go rest acc)
-      (Ifz (Sz rest)
-        acc
-        (let ((head (_0 rest)))
-          (cond
-            ((rx-rune? ">" head)
-              (go (drop 1 rest)
-                (snoc ((parse-arm parse-val-sast) head) acc)))
-            ((rx-plain? "clear" head)
-              (go (Weld (hr-stem (rx-nest-kids head)) (drop 1 rest)) acc))
-            ;; a binding line (`rt  (_ n.r)`) arrives as one juxt —
-            ;; splice it into the pair stream
-            ((rx-juxt? head)
-              (go (Weld (rx-juxt-kids head) (drop 1 rest)) acc))
-            ((Gt (Sz rest) 1)
-              (go (drop 2 rest)
-                (snoc
-                  (surf-arm (parse-type-sast head)
-                    (parse-val-sast (_1 rest)))
-                  acc)))
-            (else (sast-error "unpaired local binding (=)" head))))))
-    (surf-letrec (go (hr-stem kids) []) heir))
-  ;; Loop (|) parameter arms.  One arm is `> face=type init`; arms on
-  ;; one line chain (rex packs the next > nest as a kid of the
-  ;; previous), stacked > lines arrive as flat sibling kids.
-  (define (loop-arm-of ks)
-    (unless (Eq 2 (Sz ks))
-      (sast-error "bad loop parameter arm" val)
-      (surf-arm (parse-type-sast (_0 ks)) (parse-val-sast (_1 ks)))))
-  (define (loop-arm-chain nest acc)
-    (define (go own rest)
-      (Ifz rest
-        (snoc (loop-arm-of own) acc)
-        (If (rx-rune? ">" (_0 rest))
-          (loop-arm-chain (_0 rest) (snoc (loop-arm-of own) acc))
-          (go (snoc (_0 rest) own) (drop 1 rest)))))
-    (go [] (rx-rune-kids nest)))
-  (define (parse-loop-arms kids)
-    (foldl
-      (lambda (acc k)
-        (If (rx-rune? ">" k)
-          (loop-arm-chain k acc)
-          (sast-error "loop (|) parameters must be > arms" val)))
-      [] (rx-juxt-flat kids)))
+      (cond
+        ((Eq 0 (Sz rest)) acc)
+        ((rx-rune? ">" (_0 rest))
+          (sast-error-at (_0 rest) arm-msg (_0 rest)))
+        ((rx-plain? "clear" (_0 rest))
+          (go (Weld (hr-stem (rx-nest-kids (_0 rest))) (drop 1 rest)) acc))
+        ((rx-juxt? (_0 rest))
+          (go (Weld (regroup (hr-stem (rx-juxt-kids (_0 rest)))) (drop 1 rest))
+            acc))
+        ((Gt (Sz rest) 1)
+          (go (drop 2 rest)
+            (snoc
+              (surf-arm (parse-type-sast (_0 rest))
+                (parse-val-sast (_1 rest)))
+              acc)))
+        (else (sast-error-at (_0 rest) unpaired-msg (_0 rest)))))
+    (go (hr-stem kids) []))
+  (define (parse-letrec kids heir)
+    (surf-letrec
+      (parse-pairs
+        "local binding (=) takes `pattern init` pairs - drop the > (> is match/guard only)"
+        "unpaired local binding (=) - each pattern needs a value"
+        kids)
+      heir))
+  ;; | foo.bar baz — a dotted call head folds the trailing operands
+  ;; (and the heir) into its LAST method segment: foo.bar(baz).
+  (define (meth-fold-args m extra)
+    (define els (SMeth.args m))
+    (define last (Last els))
+    (SMeth.=args
+      (Weld (Init els) [(SMseg.=args (Weld (SMseg.args last) extra) last)])
+      m))
   (define (body-flat items)
     (define (flat-one acc item)
       (Weld acc
@@ -551,6 +634,15 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         (unless (And (Eq 1 (Sz kids)) (Eq foil-no-heir heir))
           (sast-error "bad relative variant" val)
           (parse-rel-variant-val (_0 kids))))
+      ;; #f — a call head with its arguments reversed (clamped prefix
+      ;; only: (#f a b), (#(expr) a b); a path head is handled where
+      ;; paths parse, since rex binds # tighter than /).
+      ;; ## lexes as one rune (maximal munch): two flips.
+      ((Or (Eq "#" rune) (Eq "##" rune))
+        (unless (And (Eq 1 (Sz kids)) (Eq foil-no-heir heir))
+          (sast-error "flip (#) prefixes one call head: (#f a b) - it has no tall form" val)
+          (let ((one (surf-flip (parse-val-sast (_0 kids)))))
+            (If (Eq "##" rune) (surf-flip one) one))))
       ;; ?=(PAT VAL) — pattern test: 1 when VAL matches PAT, else 0.
       ;; !?= is its negation (adjacent rune chars lex as one token, so
       ;; the negated test is its own rune).
@@ -627,27 +719,46 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
               (sast-error "inline lambda needs parameters and a body" val)
               (surf-fun (map parse-type-sast (Init fk))
                 (parse-val-sast (Last fk)))))))
-      ;; %  f     the call rune: the children and the heir are one
+      ;; |  f     the call rune: the children and the heir are one
       ;;    x     application.  The first child is the function; every
       ;;    y     later child, then the heir, is an argument — so the
       ;; z        form above is (f x y z).
       ;;
       ;; In body position the heir is the rest of the body, which is
-      ;; what makes % a continuation rune: `%  (if c b)` followed by
+      ;; what makes | a continuation rune: `|  (if c b)` followed by
       ;; the body applies the call to everything after it.  In paren
       ;; or arm position there is no heir and the children alone make
       ;; the call.  A lone child with nothing to apply is that child.
       ;;
       ;; Arguments are appended through uncurry-call, so a head that
-      ;; is already a call flattens: `%  (g a)` + b is (g a b), not
-      ;; ((g a) b) — the same value, one s_app.
-      ((Eq "%" rune)
-        (let ((items (hr-stem kids)))
-          (unless (Gt (Sz items) 0)
-            (sast-error "call rune (%) needs a function to call" val)
-            (foldl uncurry-call (parse-val-sast (_0 items))
-              (Weld (map parse-val-sast (drop 1 items))
-                (If (Eq foil-no-heir heir) [] [heir]))))))
+      ;; is already a call flattens: `|  (g a)` + b is (g a b), not
+      ;; ((g a) b) — the same value, one s_app.  A dotted head folds
+      ;; the operands into its last method segment: `|  foo.bar baz`
+      ;; is foo.bar(baz).
+      ((Eq "|" rune)
+        ;; operands continue on deeper lines, several per line (a
+        ;; continuation line is one juxt): flat-items regroups them
+        (let ((items (flat-items kids)))
+          (cond
+            ((Eq 0 (Sz items))
+              (sast-error "call rune (|) needs a function to call" val))
+            ((find (lambda (k) (rx-rune? ">" k)) items)
+              (sast-error "loops are spelled % now: `%  name=type init ...` with no > arms (| is the multi-line call rune)" val))
+            (else
+              (let ((extra
+                      (Weld (call-operands (drop 1 items))
+                        (If (Eq foil-no-heir heir) [] [heir]))))
+                (If (And (rx-rune? "." (_0 items))
+                      (Gt (Sz (rx-rune-kids (_0 items))) 1))
+                  (meth-fold-args
+                    (parse-meth parse-val-sast (rx-rune-kids (_0 items)))
+                    extra)
+                  ;; `|  _ a b` recurses like (_ a b): _ is a word, so
+                  ;; the self-call is the application whose head is _
+                  (let ((head (parse-val-sast (_0 items))))
+                    (If (Equal (surf-var "_") head)
+                      (surf-self extra)
+                      (foldl uncurry-call head extra)))))))))
       ((Eq "^" rune)
         (unless (And (Eq 1 (Sz kids)) (Ne foil-no-heir heir))
           (sast-error "cast (^) needs a value to cast - for type reflection write (^ expr)" val)
@@ -657,12 +768,20 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         ;; variant stays one operand).
         (surf-union (map parse-type-sast (hr-stem (rx-juxt-flat kids)))))
       ((Eq "?" rune)
-        (If (And (Gt (Sz kids) 1)
-              (And (Ne foil-no-heir heir) (Nil (arm-ish? (_1 kids)))))
-          (surf-if
-            (parse-val-sast (_0 kids))
-            (parse-val-sast (synth-body (hr-stem (drop 1 kids))))
-            heir)
+        (cond
+          ;; ?  c yes no — the one-line truthy if with no body
+          ((And (Eq 3 (Sz kids))
+             (And (Eq foil-no-heir heir) (Nil (arm-ish? (_1 kids)))))
+            (surf-if (parse-val-sast (_0 kids))
+              (parse-val-sast (_1 kids))
+              (parse-val-sast (_2 kids))))
+          ((And (Gt (Sz kids) 1)
+             (And (Ne foil-no-heir heir) (Nil (arm-ish? (_1 kids)))))
+            (surf-if
+              (parse-val-sast (_0 kids))
+              (parse-val-sast (synth-body (hr-stem (drop 1 kids))))
+              heir))
+          (else
           ;; Trailing non-> items among the arms are the fallthrough
           ;; chain (a fallthrough written at the arms' column rides
           ;; inside the poem instead of chaining as the heir).
@@ -677,27 +796,51 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
               (surf-case
                 (parse-val-sast (_0 kids))
                 (map (parse-arm parse-val-sast) arms)
-                (Ifz (Sz trail) heir (parse-val-sast (synth-body trail))))))))
+                (Ifz (Sz trail) heir (parse-val-sast (synth-body trail)))))))))
       ((Eq "=" rune)
         (parse-letrec kids heir))
-      ;; Loop: `|  > foo=nat 3` declares loop params with initial
-      ;; values; the heir is the body, re-entered via (_ ...).  Arms
-      ;; written on one line chain (the next > nest rides as a kid of
-      ;; the previous), so unchain; stacked > lines arrive flat.
-      ((Eq "|" rune)
-        (unless (Nil (Eq foil-no-heir heir))
-          (sast-error "loop (|) requires a body" val)
-          (let ((arms (parse-loop-arms kids)))
-            (unless (Gt (Sz arms) 0)
-              (sast-error "loop (|) requires at least one > parameter arm" val)
-              (surf-loop arms heir)))))
+      ;; %  a=nat 1     the loop rune: `name=type init` pairs declare
+      ;;    b=nat 2     the parameters with their initial values (one
+      ;; BODY           parallel call in the outer scope); the heir is
+      ;;                the body, re-entered via (_ ...).
+      ((Eq "%" rune)
+        (unless (Ne foil-no-heir heir)
+          (sast-error "loop (%) requires a body - if this was a call, multi-line calls are spelled | now" val)
+          (let ((arms
+                  (parse-pairs
+                    "loop (%) takes `name=type init` pairs - drop the > (> is match/guard only)"
+                    "unpaired loop (%) parameter - each name=type needs an init value; if this was a call, multi-line calls are spelled | now"
+                    kids)))
+            (cond
+              ((Eq 0 (Sz arms))
+                (sast-error "loop (%) requires at least one parameter (name=type init)" val))
+              ((find
+                 (lambda (arm)
+                   (Ne "s_face" (_0 (sast-strip-span (surf-arm-pat arm)))))
+                 arms)
+                (sast-error "loop (%) parameter must be faced (name=type init) - if this was a call, multi-line calls are spelled | now" val))
+              (else (surf-loop arms heir))))))
+      ;; <  PAT SOURCE   bind-or-propagate: on SOURCE's success case
+      ;;    MAPPER       (ok/some) PAT binds the payload and the heir
+      ;; REST...         runs; on its failure case (err/none) the
+      ;;                 failure re-wraps into the declared result, an
+      ;;                 either's error through the optional MAPPER.
+      ((Eq "<" rune)
+        (unless (And (Or (Eq 2 (Sz kids)) (Eq 3 (Sz kids)))
+                  (Ne foil-no-heir heir))
+          (sast-error "bad bind-or-propagate (<) - needs a pattern, a source value, an optional indented error mapper, and a following body (spell it `<  pat src`: a glued <( is not a rune)" val)
+          (surf-prop (parse-type-sast (_0 kids)) (parse-val-sast (_1 kids))
+            (If (Eq 3 (Sz kids)) (parse-val-sast (_2 kids)) 0)
+            heir)))
       ;; Tall row type declaration: `:  foo=bar baz=qux`.  Kids are the
-      ;; faced field types; a lone `:` is the empty row (and `:  []` is
+      ;; field types — faced, or a single faceless type for a brand
+      ;; (`:  row[nat]` is ONE item: flat-items regroups spec juxts and
+      ;; function types); a lone `:` is the empty row (and `:  []` is
       ;; accepted as its bracketed spelling).
       ((Eq ":" rune)
         (unless (Eq foil-no-heir heir)
           (sast-error "row type declaration (:) does not take a body" val)
-          (let ((fk (hr-stem (rx-juxt-flat kids))))
+          (let ((fk (flat-items kids)))
             (surf-trow
               (map parse-type-sast
                 (If (And (Eq 1 (Sz fk))
@@ -761,6 +904,7 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                   (handle-rune ">" (take (_0 cut) bk)
                     (parse-body-go (body-flat (drop (_0 cut) bk)) hair))
                   (handle-rune ">" bk hair))))
+            ((rx-rune? "<" body) (handle-rune "<" (rx-rune-kids body) hair))
             ((rx-rune? "=" body) (handle-rune "=" (rx-rune-kids body) hair))
             ((rx-rune? "|" body) (handle-rune "|" (rx-rune-kids body) hair))
             ((And (rx-nest-is? "paren" "@" body) (Ne foil-no-heir hair))

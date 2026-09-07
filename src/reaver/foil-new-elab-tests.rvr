@@ -577,13 +577,83 @@ assert(Equal (nt:type-ref (ty-ap-encode [qualified-box ["nat"]]))
            [(surf-fun [(surf-ref ["q"])]
               (surf-app (surf-var "add") [(surf-var "q") (surf-lit 1)]))])]))]])
 
+;; Derived union members: shape/is_c and shape/try_c (payload = the one
+;; field of a one-field case, else the case row); and a named-row binder
+;; pattern (> rect[w _]).
+(define either-nat (surf-tapp [(surf-ref ["either"]) nat-sast nat-sast]))
+(define maybe-nat (surf-tapp [(surf-ref ["maybe"]) nat-sast]))
+(define add1-fun
+  (surf-fun [(surf-face "n" nat-sast)]
+    (surf-cast nat-sast (surf-app (surf-var "add") [(surf-var "n") (surf-lit 1)]))))
+;; < x src body: the success payload binds, the failure re-wraps (through
+;; the mapper on an either).
+(define prop-decls
+  [["s_decl" ["prop_add"] span
+    (surf-fun [(surf-face "e" either-nat)]
+      (surf-cast either-nat
+        (surf-prop (surf-ref ["x"]) (surf-var "e") 0
+          (surf-app (surf-relvar "ok")
+            [(surf-app (surf-var "add") [(surf-var "x") (surf-lit 1)])]))))]
+   ["s_decl" ["prop_mapped"] span
+    (surf-fun [(surf-face "e" either-nat)]
+      (surf-cast either-nat
+        (surf-prop (surf-ref ["x"]) (surf-var "e") add1-fun
+          (surf-app (surf-relvar "ok") [(surf-var "x")]))))]
+   ["s_decl" ["prop_maybe"] span
+    (surf-fun [(surf-face "m" maybe-nat)]
+      (surf-cast maybe-nat
+        (surf-prop (surf-ref ["x"]) (surf-var "m") 0
+          (surf-app (surf-relvar "some")
+            [(surf-app (surf-var "add") [(surf-var "x") (surf-lit 1)])]))))]])
+
+;; (#f a b) reverses a saturated call's arguments; ## is the identity.
+(define flip-decls
+  [["s_decl" ["flip_sub"] span
+    (surf-cast nat-sast
+      (surf-app (surf-flip (surf-var "sub")) [(surf-lit 1) (surf-lit 5)]))]
+   ["s_decl" ["flip_flip_sub"] span
+    (surf-cast nat-sast
+      (surf-app (surf-flip (surf-flip (surf-var "sub"))) [(surf-lit 5) (surf-lit 1)]))]])
+
+(define derived-decls
+  [["s_decl" ["rect_w_pat"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-var "s")
+          [(surf-arm (surf-tapp [(surf-ref ["rect"]) (surf-ref ["w"]) surf-hole])
+             (surf-var "w"))
+           (surf-arm (surf-ref ["circle"]) (surf-lit 0))]
+          foil-no-heir)))]
+   ["s_decl" ["circ_is"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast (surf-ref ["bool"]) (surf-meth ["s" "is_circle"])))]
+   ["s_decl" ["circ_try"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-meth ["s" "try_circle"])
+          [(surf-arm (surf-tapp [(surf-relvar "some") (surf-ref ["r"])])
+             (surf-var "r"))
+           (surf-arm (surf-relvar "none") (surf-lit 0))]
+          foil-no-heir)))]
+   ["s_decl" ["rect_try"] span
+    (surf-fun [(surf-face "s" (surf-ref ["shape"]))]
+      (surf-cast nat-sast
+        (surf-case (surf-meth ["s" "try_rect"])
+          [(surf-arm (surf-tapp [(surf-relvar "some") (surf-ref ["q"])])
+             (surf-cast nat-sast (surf-meth ["q" "h"])))
+           (surf-arm (surf-relvar "none") (surf-lit 0))]
+          foil-no-heir)))]])
+
 (define shapes-mod
   (Weld [circle-decl rect-decl shape-decl area-decl is-circle-decl]
     (Weld shape-values
       (Weld [sum-to-decl]
         (Weld meth-decls
           (Weld arm-decls
-            (Weld template-decls (Weld field-decls infer-decls))))))))
+            (Weld template-decls
+              (Weld field-decls
+                (Weld infer-decls
+                  (Weld derived-decls (Weld prop-decls flip-decls)))))))))))
 (define shapes-compiled (elab:elab-mod (elab:compiler-for base) shapes-mod))
 (define shapes-final (elab:compiler-subject shapes-compiled))
 (define shapes-own
@@ -621,6 +691,79 @@ assert(Eq 42 (shape-value "applied"))
 assert(Equal [1 2 3] (shape-value "arr_lit"))
 assert(Eq 0 (shape-value "arr_mt"))
 assert(Equal [2 3 4] (shape-value "mapped"))
+
+;; Derived union members are baked FFI constants under the union's path.
+assert(Eq "TC_FFI" (Hd (got-entry-tc ["boot" "shape" "is_circle"] shapes-final)))
+assert(Eq "TC_FFI" (Hd (got-entry-tc ["boot" "shape" "try_rect"] shapes-final)))
+assert(Eq 1 ((shape-value "circ_is") (shape-value "a_circle")))
+assert(Eq 0 ((shape-value "circ_is") (shape-value "a_rect")))
+assert(Eq 5 ((shape-value "circ_try") (shape-value "a_circle")))
+assert(Eq 0 ((shape-value "circ_try") (shape-value "a_rect")))
+assert(Eq 4 ((shape-value "rect_try") (shape-value "a_rect")))
+assert(Eq 0 ((shape-value "rect_try") (shape-value "a_circle")))
+
+;; A declaration spelled like a derived member is a diagnostic on the union.
+(define collide-diags
+  (_1 (elab:elab-mod-diags (elab:compiler-for base)
+        [circle-decl rect-decl shape-decl
+         ["s_decl" ["shape" "is_rect"] span (surf-lit 1)]])))
+assert(Eq 1 (Sz collide-diags))
+assert(Equal ["boot" "shape"] (_1 (_0 collide-diags)))
+
+;; Named-row binder patterns bind positionally; a generic head is rejected.
+assert(Eq 3 ((shape-value "rect_w_pat") (shape-value "a_rect")))
+assert(Eq 0 ((shape-value "rect_w_pat") (shape-value "a_circle")))
+(define generic-binder-diags
+  (_1 (elab:elab-mod-diags (elab:compiler-for base)
+        [box-decl
+         ["s_decl" ["bad_pat"] span
+          (surf-fun [(surf-face "b" (surf-tapp [(surf-ref ["box"]) nat-sast]))]
+            (surf-cast nat-sast
+              (surf-case (surf-var "b")
+                [(surf-arm (surf-tapp [(surf-ref ["box"]) (surf-ref ["v"])])
+                   (surf-var "v"))]
+                foil-no-heir)))]])))
+assert(Eq 1 (Sz generic-binder-diags))
+
+;; < bind-or-propagate on either and maybe sources.
+assert(Equal ("ok" 4) ((shape-value "prop_add") ("ok" 3)))
+assert(Equal ("err" 3) ((shape-value "prop_add") ("err" 3)))
+assert(Equal ("ok" 3) ((shape-value "prop_mapped") ("ok" 3)))
+assert(Equal ("err" 4) ((shape-value "prop_mapped") ("err" 3)))
+assert(Equal ("/boot/maybe/some" 4) ((shape-value "prop_maybe") ("/boot/maybe/some" 3)))
+assert(Equal "/boot/maybe/none" ((shape-value "prop_maybe") "/boot/maybe/none"))
+assert(Eq 4 (shape-value "flip_sub"))
+assert(Eq 4 (shape-value "flip_flip_sub"))
+;; a partial flipped call and a bare #f are diagnostics
+(define (flip-diag-count decl)
+  (Sz (_1 (elab:elab-mod-diags (elab:compiler-for base) [decl]))))
+assert(Eq 1 (flip-diag-count
+  ["s_decl" ["flip_partial"] span
+   (surf-app (surf-flip (surf-var "sub")) [(surf-lit 1)])]))
+assert(Eq 1 (flip-diag-count
+  ["s_decl" ["flip_bare"] span
+   (surf-flip (surf-var "sub"))]))
+
+;; diagnostics: no goal; a maybe source under an either result; a
+;; mapper on a maybe source.
+(define (prop-diag-count decl)
+  (Sz (_1 (elab:elab-mod-diags (elab:compiler-for base) [decl]))))
+assert(Eq 1 (prop-diag-count
+  ["s_decl" ["prop_nogoal"] span
+   (surf-fun [(surf-face "e" either-nat)]
+     (surf-prop (surf-ref ["x"]) (surf-var "e") 0 (surf-var "x")))]))
+assert(Eq 1 (prop-diag-count
+  ["s_decl" ["prop_mixed"] span
+   (surf-fun [(surf-face "m" maybe-nat)]
+     (surf-cast either-nat
+       (surf-prop (surf-ref ["x"]) (surf-var "m") 0
+         (surf-app (surf-relvar "ok") [(surf-var "x")]))))]))
+assert(Eq 1 (prop-diag-count
+  ["s_decl" ["prop_maybe_mapper"] span
+   (surf-fun [(surf-face "m" maybe-nat)]
+     (surf-cast maybe-nat
+       (surf-prop (surf-ref ["x"]) (surf-var "m") add1-fun
+         (surf-app (surf-relvar "some") [(surf-var "x")]))))]))
 
 ;; An array-goal element that does not fit the item type is rejected.
 (define bad-arr
@@ -734,7 +877,7 @@ assert(Eq "nat" (render:ty-text (nt:tnat 0)))
 assert(Eq "nat/t" (render:ty-text (nt:tnat "t")))
 assert(Eq "any" (render:ty-text nt:tany))
 assert(Eq "'$hello" (render:ty-text (nt:tconst "hello")))
-assert(Eq "{nat nat; nat}"
+assert(Eq "{\ nat nat}nat"
   (render:ty-text (nt:tfun [(nt:tnat 0) (nt:tnat 0)] (nt:tnat 0))))
 assert(Eq "row[any]" (render:ty-text (nt:tarr nt:tany)))
 assert(Eq "/boot/shape" (render:ty-text (nt:type-ref ["boot" "shape"])))
@@ -743,7 +886,7 @@ assert(Eq "/boot/box[/nat]"
 
 ;; Real elaborated artifacts render through the same seam.  Annotations
 ;; elaborate to nominal references, so builtin names keep path spelling.
-assert(Eq "{/boot/shape; /nat}"
+assert(Eq "{\ /boot/shape}/nat"
   (render:ty-text (tc-ty (got-entry-tc ["boot" "area"] shapes-final))))
 
 (define shape-render

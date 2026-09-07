@@ -64,11 +64,38 @@ assert(Equal
 
 assert(Equal
   (surf-tfun [(surf-ref ["nat"])] (surf-ref ["nat"]))
-  (parse-type "{nat; nat}"))
+  (parse-type "{\ nat}nat"))
 
 assert(Equal
   (surf-tfun [(surf-ref ["nat"]) (surf-ref ["nat"])] (surf-ref ["nat"]))
-  (parse-type "{nat; nat; nat}"))
+  (parse-type "{\ nat nat}nat"))
+
+;; a nullary callable, a specialized result, a callable result, a path
+;; result, faced arguments
+assert(Equal (surf-tfun [] (surf-ref ["unit"])) (parse-type "{\}unit"))
+assert(Equal
+  (surf-tfun [(surf-ref ["v"])]
+    (surf-tapp [(surf-ref ["maybe"]) (surf-ref ["w"])]))
+  (parse-type "{\ v}maybe[w]"))
+assert(Equal
+  (surf-tfun [(surf-ref ["a"])]
+    (surf-tfun [(surf-ref ["b"])] (surf-ref ["c"])))
+  (parse-type "{\ a}{\ b}c"))
+assert(Equal
+  (surf-tfun [(surf-ref ["v"])] (surf-ref ["weft" "node"]))
+  (parse-type "{\ v}weft/node"))
+assert(Equal
+  (surf-tfun [(surf-face "a" (surf-ref ["nat"])) (surf-face "b" (surf-ref ["nat"]))]
+    (surf-ref ["nat"]))
+  (parse-type "{\ a=nat b=nat}nat"))
+
+;; the retired result-last spellings and a resultless curly are diagnostics
+(define old-fun-err (Try (lambda (x) (parse-type "{nat; nat}")) 0))
+assert(Eq 1 (Hd old-fun-err))
+(define pct-fun-err (Try (lambda (x) (parse-type "{% nat nat}")) 0))
+assert(Eq 1 (Hd pct-fun-err))
+(define bare-fun-err (Try (lambda (x) (parse-type "{\ nat}")) 0))
+assert(Eq 1 (Hd bare-fun-err))
 
 ;; plain-curly rows are retired: curly is function types only
 (define curly-row-err
@@ -138,6 +165,14 @@ assert(Equal
   (parse-val "? x 1
 0"))
 
+;; the one-line truthy if, tall and in parens
+assert(Equal
+  (surf-if (surf-var "x") (surf-lit 1) (surf-lit 0))
+  (parse-val "?  x 1 0"))
+assert(Equal
+  (surf-if (surf-var "x") (surf-lit 1) (surf-lit 0))
+  (parse-val "(? x 1 0)"))
+
 assert(Equal
   (surf-case (surf-var "x")
     [(surf-arm (surf-ref ["nat"]) (surf-lit 1))]
@@ -203,8 +238,7 @@ assert(Equal
   (surf-letrec [(surf-arm (surf-ref ["nat"]) (surf-lit 1))] (surf-var "x"))
   (parse-val-sast
     (rx-juxt test-span
-      [(rx-nest test-span "paren" "="
-         [(rx-nest test-span "clear" ">" [test-word-nat test-lit-1])])
+      [(rx-nest test-span "paren" "=" [test-word-nat test-lit-1])
        test-word-x])))
 
 assert(Equal
@@ -442,7 +476,7 @@ assert(Eq 1 (Hd atat-body-err))
 (define atat-const-rows
   (parse-module-sast 0 (rex:ParseRexNorm "
 +  g
-  (@@ k lt={k; k; nat})
+  (@@ k lt={\ k k}nat)
   1
 ")))
 assert(Equal 1 (Sz atat-const-rows))
@@ -490,6 +524,21 @@ assert(Equal
 ;; `:  []` is the bracketed spelling of the empty row
 assert(Equal (surf-trow []) (parse-val ":  []"))
 
+;; a single faceless item is a brand: a spec juxt is ONE item, as is a
+;; function type; continuation lines carry several items
+assert(Equal
+  (surf-trow [(surf-tapp [(surf-ref ["row"]) (surf-ref ["path"])])])
+  (parse-val ":  row[path]"))
+assert(Equal
+  (surf-trow [(surf-tfun [(surf-ref ["v"])] (surf-ref ["w"]))])
+  (parse-val ":  {\ v}w"))
+assert(Equal
+  (surf-trow [(surf-face "x" (surf-ref ["nat"]))
+              (surf-tapp [(surf-ref ["row"]) (surf-ref ["path"])])
+              (surf-face "y" (surf-ref ["nat"]))])
+  (parse-val ":  x=nat
+   row[path] y=nat"))
+
 ;; a lone `:` decl body is the empty row; module-level round trip
 (define colon-module
   (parse-module-sast 0 (rex:ParseRexNorm "
@@ -509,35 +558,153 @@ assert(Equal ["emptyrow"] (_1 (_1 colon-module)))
 assert(Eq 1 (Hd colon-heir-err))
 
 
-;;; Loops (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Loops (%) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; single param arm, body as heir
+;; single parameter pair, body as heir
 assert(Equal
   (surf-loop
     [(surf-arm (surf-face "foo" (surf-ref ["nat"])) (surf-lit 3))]
     (surf-var "foo"))
-  (parse-val "|  > foo=nat 3
+  (parse-val "%  foo=nat 3
 foo"))
 
-;; two param arms on one line
+;; two parameter pairs on one line
 assert(Equal
   (surf-loop
     [(surf-arm (surf-face "a" (surf-ref ["nat"])) (surf-lit 1))
      (surf-arm (surf-face "b" (surf-ref ["nat"])) (surf-lit 2))]
     (surf-var "a"))
-  (parse-val "|  > a=nat 1  > b=nat 2
+  (parse-val "%  a=nat 1  b=nat 2
+a"))
+
+;; parameters stack on continuation lines
+assert(Equal
+  (surf-loop
+    [(surf-arm (surf-face "a" (surf-ref ["nat"])) (surf-lit 1))
+     (surf-arm (surf-face "b" (surf-ref ["nat"])) (surf-lit 2))]
+    (surf-var "a"))
+  (parse-val "%  a=nat 1
+   b=nat 2
 a"))
 
 ;; a loop without a body is an error
 (define loop-nobody-err
-  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|  > foo=nat 3"))) 0))
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "%  foo=nat 3"))) 0))
 assert(Eq 1 (Hd loop-nobody-err))
 
-;; a loop without parameter arms is an error
+;; a loop without parameter pairs is an error
 (define loop-noarm-err
-  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "%
 5"))) 0))
 assert(Eq 1 (Hd loop-noarm-err))
+
+;; the retired > arm spellings, and an unfaced pair (the old call rune's
+;; operands), are located diagnostics
+(define loop-old-arm-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|  > foo=nat 3
+foo"))) 0))
+assert(Eq 1 (Hd loop-old-arm-err))
+(define loop-pct-arm-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "%  > foo=nat 3
+foo"))) 0))
+assert(Eq 1 (Hd loop-pct-arm-err))
+(define loop-call-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "%  f x
+y"))) 0))
+assert(Eq 1 (Hd loop-call-err))
+
+
+;;; Equations (=) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; `pattern init` pairs: on one line, or stacked on continuation lines
+assert(Equal
+  (surf-letrec
+    [(surf-arm (surf-ref ["a"]) (surf-lit 1))
+     (surf-arm (surf-ref ["b"]) (surf-lit 2))]
+    (surf-var "a"))
+  (parse-val "=  a 1  b 2
+a"))
+assert(Equal
+  (surf-letrec
+    [(surf-arm (surf-ref ["a"]) (surf-lit 1))
+     (surf-arm (surf-ref ["b"]) (surf-lit 2))]
+    (surf-var "a"))
+  (parse-val "=  a 1
+   b 2
+a"))
+
+;; a specialization juxt on a continuation line stays one value
+assert(Equal
+  (surf-letrec
+    [(surf-arm (surf-ref ["a"]) (surf-lit 1))
+     (surf-arm (surf-ref ["v"]) (surf-spec (surf-var "vec") [(surf-ref ["nat"])]))]
+    (surf-var "a"))
+  (parse-val "=  a 1
+   v vec[nat]
+a"))
+
+;; the retired > arm spelling is a located diagnostic
+(define eq-old-arm-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "=  > a 1
+a"))) 0))
+assert(Eq 1 (Hd eq-old-arm-err))
+
+
+;;; Flip (#) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal
+  (surf-app (surf-flip (surf-var "f")) [(surf-var "a") (surf-var "b")])
+  (parse-val "(#f a b)"))
+;; a path head: rex binds # tighter than /, the flip wraps the path
+assert(Equal
+  (surf-app (surf-flip (surf-ref ["str" "cat"])) [(surf-var "a") (surf-var "b")])
+  (parse-val "(#str/cat a b)"))
+assert(Equal
+  (surf-app (surf-flip (surf-flip (surf-var "f"))) [(surf-var "a")])
+  (parse-val "(##f a)"))
+assert(Equal
+  (surf-app (surf-flip (surf-app (surf-var "f") [(surf-lit 1)])) [(surf-var "a")])
+  (parse-val "(#(f 1) a)"))
+;; as a | head
+assert(Equal
+  (surf-app (surf-flip (surf-ref ["str" "cat"])) [(surf-var "a") (surf-var "b")])
+  (parse-val "|  #str/cat a
+b"))
+;; no tall form, and not on a method receiver
+(define flip-tall-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "#  f a
+b"))) 0))
+assert(Eq 1 (Hd flip-tall-err))
+(define flip-recv-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "(#x.m a)"))) 0))
+assert(Eq 1 (Hd flip-recv-err))
+
+
+;;; Bind-or-propagate (<) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+assert(Equal
+  (surf-prop (surf-ref ["x"]) (surf-var "src") 0 (surf-var "body"))
+  (parse-val "<  x src
+body"))
+
+;; an indented third kid is the error mapper
+assert(Equal
+  (surf-prop (surf-ref ["x"]) (surf-var "src") (surf-var "f") (surf-var "body"))
+  (parse-val "<  x src
+   f
+body"))
+
+;; a structural-row pattern binds the payload's faces
+assert(Equal
+  (surf-prop (surf-trow [(surf-face "a" (surf-ref ["nat"]))])
+    (surf-app (surf-var "g") [(surf-lit 1)]) 0 (surf-var "a"))
+  (parse-val "<  [a=nat] (g 1)
+a"))
+
+;; < needs a body
+(define prop-nobody-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "<  x src"))) 0))
+assert(Eq 1 (Hd prop-nobody-err))
 
 
 ;;; Current-namespace references (%/) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -642,36 +809,36 @@ assert(Equal (surf-cast (surf-ref ["nat"]) (surf-lit 1))
 assert(Eq 1 (Hd dangling-cast-err))
 
 
-;;; The call rune (%) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; The call rune (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; children then heir, all one application
 assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "y") (surf-var "z")])
-  (parse-val "%  f
+  (parse-val "|  f
    x
    y
 z"))
 
 ;; children on the rune's own line read the same
 assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "y") (surf-var "z")])
-  (parse-val "%  f x y
+  (parse-val "|  f x y
 z"))
 
 ;; and so does the narrow spelling — kids only have to sit past the rune
 assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "y") (surf-var "z")])
-  (parse-val "% f
+  (parse-val "| f
   x
   y
 z"))
 
 ;; no heir: the children alone make the call
 assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "y")])
-  (parse-val "(% f x y)"))
+  (parse-val "(| f x y)"))
 
-;; the continuation form that % already had — a call head flattens
+;; the continuation form that | already had — a call head flattens
 ;; rather than nesting, so the heir lands in the SAME application
 assert(Equal (surf-app (surf-var "if")
                [(surf-var "c") (surf-var "b") (surf-var "rest")])
-  (parse-val "%  (if c b)
+  (parse-val "|  (if c b)
 rest"))
 
 ;; arguments keep their own structure: a specialization juxt is one
@@ -679,25 +846,87 @@ rest"))
 assert(Equal (surf-app (surf-var "f")
                [(surf-spec (surf-var "vec") [(surf-ref ["nat"])])
                 (surf-var "z")])
-  (parse-val "%  f
+  (parse-val "|  f
    vec[nat]
 z"))
 
 ;; a lone child has nothing to apply and is itself
-assert(Equal (surf-var "f") (parse-val "(% f)"))
+assert(Equal (surf-var "f") (parse-val "(| f)"))
 
 ;; a comment slug among the children is not an argument
 assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "z")])
-  (parse-val "%  f
+  (parse-val "|  f
    '  a note
    x
 z"))
 
-;; an empty % has no function to call — a located parse error, not a
+;; an empty | has no function to call — a located parse error, not a
 ;; silently malformed application
 (define empty-call-err
-  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "(%)"))) 0))
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "(|)"))) 0))
 assert(Eq 1 (Hd empty-call-err))
+
+;; a dotted head folds the operands (and the heir) into its last
+;; method segment
+assert(Equal
+  (surf-meth ["foo" (surf-mseg "bar" [(surf-var "baz") (surf-var "z")])])
+  (parse-val "|  foo.bar baz
+z"))
+assert(Equal
+  (surf-meth ["foo" (surf-mseg "bar" [(surf-lit 1) (surf-var "baz")])])
+  (parse-val "(| foo.bar(1) baz)"))
+assert(Equal
+  (surf-meth ["s"
+    (surf-mseg "ever_at" [(surf-var "pax")])
+    (surf-mseg "x" [(surf-var "z")])])
+  (parse-val "(| s.ever_at(pax).x z)"))
+
+;; operands continue on deeper lines, several per line
+assert(Equal (surf-app (surf-var "f") [(surf-var "x") (surf-var "y") (surf-var "z") (surf-var "w")])
+  (parse-val "|  f x
+   y z
+w"))
+;; `|  _ a b` is the self-call, like (_ a b)
+assert(Equal (surf-self [(surf-var "a") (surf-var "b")])
+  (parse-val "|  _ a
+b"))
+;; a \ operand with sibling kids after it takes them as its body chain
+;; (the body walker's rule); the call's heir stays the last argument
+assert(Equal
+  (surf-meth ["l"
+    (surf-mseg "uno"
+      [(surf-fun [(surf-ref ["a"]) (surf-ref ["b"])]
+         (surf-app (surf-var "g") [(surf-var "a") (surf-var "b")]))
+       (surf-var "r")])])
+  (parse-val "| l.uno
+ \ a b
+ | g a b
+r"))
+assert(Equal
+  (surf-app (surf-var "f")
+    [(surf-fun [(surf-ref ["x"])] (surf-app (surf-var "g") [(surf-var "x")]))
+     (surf-var "y")])
+  (parse-val "| f
+ \ x
+ | g x
+y"))
+;; a one-line \ kid with nothing after it keeps the one-line rule
+assert(Equal
+  (surf-app (surf-var "f")
+    [(surf-fun [(surf-ref ["x"])] (surf-var "x")) (surf-var "y")])
+  (parse-val "| f
+ \ x x
+y"))
+;; a nested one-line | is one operand
+assert(Equal (surf-app (surf-var "f") [(surf-var "a") (surf-app (surf-var "g") [(surf-var "b")]) (surf-var "c")])
+  (parse-val "|  f a | g b
+c"))
+
+;; the retired loop spelling under | is a located diagnostic
+(define call-old-loop-err
+  (Try (lambda (x) (parse-val-sast (rex:ParseRexNorm "|  > i=nat 0
+i"))) 0))
+assert(Eq 1 (Hd call-old-loop-err))
 
 
 (print "foil-sast tests passed")
