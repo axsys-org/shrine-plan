@@ -11,46 +11,18 @@
 
 (#bind milton (#module milton))
 
-(#bind foil-subject (#module foil-subject))
-(#import foil-subject)
 
-(#bind foil (#module foil))
 (#bind helm (#module helm))
-(#bind http-client (#module http-client))
-(#bind helm-fetch (#module helm-fetch))
-(#bind helm-chore (#module helm-chore))
 (#bind helm-doctest (#module helm-doctest))
-(#bind helm-build (#module helm-build))
 (#bind doctest (#module doctest))
 (#bind foil-render (#module foil-render))
 
 
-;;; The HTTP driver: a helm worker whose requests ride the namespace.
-;;; An incoming request is WRITTEN as a record at a fresh path under
-;;; the driver's own name (/io/<name>/r<serial>), carrying the kook
-;;; named by the driver's config record; the serving behavior writes
-;;; ['res_status] / ['res_body] slots onto it — same event (init) or
-;;; later — and the driver, watching the node through a helm spy,
-;;; feeds those slots back as the HTTP response and culls the node.
-;;;
-;;; Config record at /io/<name>: ['serve] = the behavior id to stamp
-;;; on request nodes; ['port] = the TCP port (absent: no listener —
-;;; the mode tests use, driving requests as messages).
-;;;
-;;; Worker mailbox:
-;;;   from the coordinator: ["go" res] ["change" pax res]
-;;;                         ["ack" rsvp] ["die"]
-;;;   from connection actors (or tests): ["req" method url body],
-;;;     caps = [reply-handle]; answered with ["res" status body].
-;;;
-;;; Ack correlation: worker->coordinator sends are FIFO and the
-;;; coordinator acks each cmd within its turn, so acks return in cmd
-;;; order — a queue of [pax kind] entries pairs each ack with its
-;;; command (failed acks carry no path).  Write-box entries are
-;;; [pax "vine" conn-cap]: the connection waits on the ack, so the
-;;; reply reports the kernel's actual verdict and never races the
-;;; commit.  EVERY cmd this worker sends must push a queue entry, or
-;;; later acks pop the wrong one.
+;;; The HTTP host adapter. Foil's http_driver/step owns pending requests,
+;;; persistent watches, the command ack queue, and response completion.
+;;; The host owns sockets, connection capabilities, and browser route parsing.
+;;; Routes produce http_action; the driver emits http_effect and driver_out.
+;;; Every typed command, including crew publication, has a FIFO ack entry.
 
 ;;; HTTP plumbing (local — forge's helpers, without dragging forge in)
 
@@ -126,19 +98,6 @@
 (define (err-text e)
   (define r (Try (lambda (z) (quip:print-quip e)) 0))
   (If (Eq 1 (Hd r)) (foil-render:diag-flat e) (_0 r)))
-
-;; The write box's replies, both minted only when the ack lands.
-(define (vine-back-page pax)
-  (define loc (strWeld "/ns" (quip:print-path pax)))
-  (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
-           " content=" 34 "0;url=" loc 34 "></head><body>committed; <a href="
-           34 loc 34 ">back to the node</a></body></html>"]))
-
-(define (vine-fail-page pax err)
-  (define loc (strWeld "/ns" (quip:print-path pax)))
-  (strcat ["<!doctype html><html><body><p>write rejected: <code>"
-           (err-text err) "</code></p><p><a href=" 34 loc 34
-           ">back to the node</a></p></body></html>"]))
 
 ;; A myth is a mop at runtime; anything else poked into the kernel
 ;; dies INSIDE the coordinator's exec (a non-exhaustive mop match), so
@@ -258,8 +217,9 @@
           (url-decode (Rsh p (Mul 8 (Inc i))))]])))
   (foldl (lambda (acc p) (Weld acc (pair p))) [] (split-ch 38 body)))
 
-;;; The worker ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Browser application route context ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; Legacy browser application entries, private to prepare (not the driver ABI).
 ;; helpers = ["H" http/req myth/nat_at vine_make vine_cull myth/txt_at
 ;;            build/eval_req build/compile_req build/save_req] —
 ;; compiled lainapp/build entries, supplied by whoever spawns the
@@ -328,15 +288,6 @@
 ;; the write means.
 (define (edit-url? u)
   (And (Eq "/edit" (Mod u (Lsh 1 40)))
-    (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
-
-;; "/fork/..." — the counterfactual endpoint: POST /fork/<dst> with
-;; at=<path>, from=<epoch>, expr=<foil myth> forks the world at
-;; `from`, pokes the evaluated myth at `at`, replays the journal
-;; against the branch, and commits the verdict record at <dst>.
-;; The branch is transient; only the verdict lands in the trunk.
-(define (fork-url? u)
-  (And (Eq "/fork" (Mod u (Lsh 1 40)))
     (Or (Eq 5 (Bytes u)) (Eq "/" (Load8 5 u)))))
 
 ;; "/op/..." — the op endpoint: POST /op/<dst> with op=<op node
@@ -417,421 +368,123 @@
     ((h-madd hs) ((h-twign hs) [("ts" "when")] now) (h-myth0 hs))
     (form-fields body)))
 
-;; The form post's bounce: straight back to the page the form named.
-(define (post-back-page loc)
-  (strcat ["<!doctype html><html><head><meta http-equiv=" 34 "refresh" 34
-           " content=" 34 "0;url=" loc 34 "></head><body>posted; <a href="
-           34 loc 34 ">back</a></body></html>"]))
+;; Browser application adapter. It translates routes into typed actions;
+;; request lifetimes, dependency publication, and ack handling are Foil.
+(define (prepare hs name serial msg)
+  (define method (_1 msg))
+  (define url (_2 msg))
+  (define body (_3 msg))
+  (define (reply status text ctype)
+    ("/boot/http_action/reply" ("/boot/http_response" status text ctype)))
+  (define (bad status text) (reply status text "text/plain; charset=utf-8"))
+  (define (back p) (strWeld "/ns" (quip:print-path p)))
+  (define (write task p loc) ("/boot/http_action/write" task p loc))
+  (define (wait p record) ("/boot/http_action/wait" p record))
+  (define rpath [("ts" "io") name ("ts" (strcat ["r" (showNat serial)]))])
+  (define (form-write edit?)
+    (define target (url-target (Rsh url 40)))
+    (Ifz target (bad 404 "unparseable path segment")
+      (let* ((p (_0 target))
+             (loc (form-field "back" body))
+             (record (If edit? (edit-myth hs body) (post-myth hs body))))
+        (write ((h-poke hs) p record) p
+          (If (Or edit? (Eq loc 0)) (back p) loc)))))
+  (define (vine z)
+    (define target (url-target (Rsh url 40)))
+    (define verb (form-field "verb" body))
+    (cond
+      ((Nil target) (bad 404 "unparseable path segment"))
+      ((Eq verb "cull") (write ((h-cull hs) (_0 target)) (_0 target) (back (_0 target))))
+      ((Or (Eq verb "make") (Eq verb "poke"))
+        (let ((r (doctest:eval-text (h-sut hs) (form-field "expr" body))))
+          (If (Eq 1 (Hd r)) (bad 400 (foil-render:diag-text (_0 r)))
+            (let ((fv (Try (lambda (z) (let ((v (_0 (_0 r)))) (Seq (DeepSeq v v) v))) 0)))
+              (cond
+                ((Eq 1 (Hd fv)) (bad 400 (err-text (_0 fv))))
+                ((Nil (myth-rep? (_0 fv))) (bad 400 "expression must evaluate to a myth"))
+                (else (write ((If (Eq verb "make") (h-make hs) (h-poke hs)) (_0 target) (_0 fv))
+                        (_0 target) (back (_0 target)))))))))
+      (else (bad 400 "verb must be make, poke, or cull"))))
+  (define (op z)
+    (define dst (url-target (Rsh url 24)))
+    (define opp (url-target (form-field "op" body)))
+    (define loc (form-field "back" body))
+    (cond
+      ((Nil dst) (bad 404 "unparseable path segment"))
+      ((Or (Nil opp) (Nil (Sz (_0 opp)))) (bad 400 "op= must be a namespace path"))
+      (else (write ((h-warp hs) (_0 dst) (_0 opp)
+                     (op-myth hs (Div (Now 0) 1000000000) body))
+              (_0 dst) (If loc loc (back (_0 dst)))))))
+  (define (regular z)
+    (define parts (filter Bytes (split-ch 47 url)))
+    (define chore? (And (h-bridge? hs) (And (Gt (Sz parts) 1) (Eq "chore" (Ix 0 parts)))))
+    (define target (url-target url))
+    (If chore?
+      (let* ((verb (Ix 1 parts))
+             (mod (helm-doctest:join-slash (drop 2 parts)))
+             (record (cond
+                       ((Eq verb "eval") ((h-evalreq hs) mod (trim-ws (form-field "expr" body))))
+                       ((Eq verb "compile") ((h-compreq hs) mod))
+                       ((Eq verb "save") ((h-savereq hs) mod (form-field "src" body)))
+                       (else 0))))
+        (If record
+          (wait [("ts" "io") ("ts" "chore") ("ts" (strcat ["b" (_0 name) (showNat serial)]))] record)
+          (bad 404 "unknown chore verb")))
+      (Ifz target (bad 404 "unparseable path segment")
+        (wait rpath ((h-req hs) method url body (_0 target))))))
+  (cond
+    ((And (h-wjs? hs) (Eq url "/w.js")) (reply 200 (h-wjs hs) "application/javascript"))
+    ((Eq url "/style.css") (reply 200 (ReadFile "foil/style.css") "text/css"))
+    ((And (h-wjs? hs) (frag-url? url))
+      (let ((rest (url-target (Rsh url 40))))
+        (Ifz rest (bad 404 "unparseable fragment path")
+          (wait rpath ((h-madd hs) ((h-twigt hs) [("ts" "frag")] "1")
+                        ((h-req hs) method url body (weld [("ts" "o")] (_0 rest))))))))
+    ((And (h-post? hs) (post-url? url)) (form-write 0))
+    ((And (h-post? hs) (edit-url? url)) (form-write 1))
+    ((And (h-vine? hs) (vine-url? url)) (vine 0))
+    ((And (h-op? hs) (op-url? url)) (op 0))
+    (else (regular 0))))
 
-(define (pend-get pending pax)
-  (find (lambda (e) (Equal pax (_0 e))) pending))
-
-(define (pend-drop pending pax)
-  (filter (lambda (e) (Nil (Equal pax (_0 e)))) pending))
-
-;; A known record's myth, or 0 — the shared prologue of every
-;; response reader.
-(define (known-myth resrec)
-  (If (Eq "/boot/res/known" (Hd resrec)) (_0 resrec) 0))
-
-;; The record's response, if the serving behavior wrote it yet:
-;; [status body ctype].
-(define (res-of hs resrec)
-  (define m (known-myth resrec))
-  (Ifz m
-    0
-    (let ((status ((h-slot hs) [("ts" "res_status")] 0 m)))
-      (Ifz status
-        0
-        [status
-         ((h-slot hs) [("ts" "res_body")] 0 m)
-         ((h-slot hs) [("ts" "res_ctype")] "text/plain; charset=utf-8" m)]))))
-
-(define chore-nl (strcat [10]))
-
-;; A chore request node's answer, once ['res_done] lands: the build
-;; families' result slots rendered as plain text.
-(define (chore-res-of hs resrec)
-  (define m (known-myth resrec))
-  (If (Or (Ifz m 1 0) (Nil (Eq 1 ((h-slot hs) [("ts" "res_done")] 0 m))))
-    0
-    (let* ((txt (h-txt hs))
-               (err (txt [("ts" "err")] m))
-               (report (txt [("ts" "report")] m))
-               (value (txt [("ts" "value")] m))
-               (tyt (txt [("ts" "ty")] m))
-               (law (txt [("ts" "law")] m))
-               (ct "text/plain; charset=utf-8"))
-          (cond
-            (err [500 err ct])
-            (report [200 report ct])
-            (value
-              [200
-               (strcat
-                 ["value: " value
-                  (Ifz tyt "" (strcat [chore-nl "type:  " tyt]))
-                  (Ifz law "" (strcat [chore-nl chore-nl law]))])
-               ct])
-            (else [500 "chore failed" ct])))))
-
-(define (mk-http-worker hs name self)
-  ;; go handshake: the coordinator handle rides the caps; the config
-  ;; record rides the message.  Forced before the loop (lazy defines
-  ;; would let the loop steal it).  The config's serving kook — not
-  ;; this driver — is what answers requests: request records are made
-  ;; bare, the /io/<name> take installs the responder on them.
+;; The host interprets the Foil effect list in order. Connection capabilities
+;; never enter a Foil value: only monotonically allocated request tickets do.
+(define (mk-http-worker planner step name self)
   (define mc (Recv 0))
   (define coord (Seq (DeepSeq mc mc) (Ix 0 (Ix 1 mc))))
-  (define rec0 (_1 (Ix 0 mc)))
-  (define port
-    (If (Eq "/boot/res/known" (Hd rec0))
-      ((h-slot hs) [("ts" "port")] 0 (_0 rec0))
-      0))
-  (define (rpath i)
-    [("ts" "io") name ("ts" (strcat ["r" (showNat i)]))])
-  ;; state: serial, pending = [[pax conn-cap] ..], queue = [[pax kind] ..]
-  (define (loop serial pending queue)
-    (define m (Recv 0))
-    (define msg (Ix 0 m))
-    (define caps (Ix 1 m))
-    (define kind (_0 msg))
-    ;; a /chore/<verb>/<mod..> request builds a build/*_req record
-    ;; under the chore driver instead of an explorer request; the
-    ;; response reads the finished chore node's result slots
-    (define (chore-record parts body)
-      (define verb (Ix 1 parts))
-      (define mod (helm-doctest:join-slash (drop 2 parts)))
-      (cond
-        ;; an expr is one expression: trim the whitespace a browser
-        ;; form ships around it (the run form's literal body ends
-        ;; with the newline it was written with)
-        ((Eq verb "eval") ((h-evalreq hs) mod (trim-ws (form-field "expr" body))))
-        ((Eq verb "compile") ((h-compreq hs) mod))
-        ((Eq verb "save") ((h-savereq hs) mod (form-field "src" body)))
-        (else 0)))
-    ;; answer a waiting connection: cull the request node, send the
-    ;; response, retire the pending entry (the cull ack's own drop is
-    ;; then a no-op)
-    (define (answer hit pax r serial2 pending2 queue2)
-      (Seq (helm:send! coord ["cmd" name ((h-cull hs) pax)])
-        (Seq (helm:send! (_1 (_0 hit)) ["res" (_0 r) (_1 r) (_2 r)])
-          (loop serial2 (pend-drop pending2 pax) (snoc [pax "cull"] queue2)))))
-    ;; not ready: re-spy AND re-read — the next write may have
-    ;; committed before this re-arm; the read's qres catches exactly
-    ;; that window
-    (define (rearm pax)
-      (Seq (helm:send! coord ["spy" name pax])
-        (let ((rm ["read" pax]))
-          (Seq (DeepSeq rm rm) (SendCaps coord rm [0])))))
-    ;; The explorer's write box: POST /vine/<path> with verb=make|
-    ;; poke|cull and (for make/poke) expr, a foil expression that
-    ;; evaluates against the boot subject to the writ's myth.  The
-    ;; task goes out as an ordinary driver cmd — the same effect
-    ;; channel every request-node make uses — and the connection then
-    ;; WAITS on the cmd's ack (the [pax "vine" cap] queue entry): the
-    ;; reply is the kernel's verdict, a bounce back to the node on
-    ;; commit or the rendered rejection.  Only eval and parse failures
-    ;; answer immediately (nothing was emitted).
-    (define (vine! z)
-      (define url (_2 msg))
-      (define body (_3 msg))
-      (define verb (form-field "verb" body))
-      (define target (url-target (Rsh url 40)))
-      (define expr (form-field "expr" body))
-      (define (reply status body2)
-        (Seq (helm:send! (Ix 0 caps) ["res" status body2 "text/html; charset=utf-8"])
-          (loop serial pending queue)))
-      (define (emit task pax)
-        (Seq (helm:send! coord ["cmd" name task])
-          (loop serial pending (snoc [pax "vine" (Ix 0 caps)] queue))))
-      (cond
-        ((Ifz target 1 0) (reply 404 "unparseable path segment"))
-        ((Eq verb "cull") (emit ((h-cull hs) (_0 target)) (_0 target)))
-        ((Or (Eq verb "make") (Eq verb "poke"))
-          (let ((r (doctest:eval-text (h-sut hs) expr)))
-            (If (Eq 1 (Hd r))
-              (reply 400 (foil-render:diag-text (_0 r)))
-              ;; force the value HERE, under Try — a lazily-crashing
-              ;; or non-myth value must answer 400, not die in the
-              ;; coordinator's exec
-              (let ((fv (Try (lambda (z)
-                               (let ((v (_0 (_0 r))))
-                                 (Seq (DeepSeq v v) v)))
-                          0)))
-                (cond
-                  ((Eq 1 (Hd fv)) (reply 400 (err-text (_0 fv))))
-                  ((Nil (myth-rep? (_0 fv)))
-                    (reply 400 "expression must evaluate to a myth (e.g. (myth/sing ['n] (pd 41)))"))
-                  (else
-                    (emit
-                      ((If (Eq verb "make") (h-make hs) (h-poke hs))
-                       (_0 target) (_0 fv))
-                      (_0 target))))))))
-        (else (reply 400 "verb must be make, poke, or cull"))))
-    ;; The form-post endpoint: POST /post/<path> pokes the target with
-    ;; the fields as ['post <k>] text slots and waits on the kernel's
-    ;; ack, bouncing back to the form's own page on commit.  The
-    ;; target's talk arm gives the post its meaning.
-    (define (post! z)
-      (define url (_2 msg))
-      (define body (_3 msg))
-      (define target (url-target (Rsh url 40)))
-      (define back0 (form-field "back" body))
-      (If (Ifz target 1 0)
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" 404 "unparseable path segment" "text/plain; charset=utf-8"])
-          (loop serial pending queue))
-        (let ((back (If (Eq 0 (Bytes back0))
-                      (strWeld "/ns" (quip:print-path (_0 target)))
-                      back0))
-              (task ((h-poke hs) (_0 target) (post-myth hs body))))
-          (Seq (helm:send! coord ["cmd" name task])
-            (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
-    ;; The edit endpoint: POST /edit/<path> pokes the target with the
-    ;; fields as direct text slots and waits on the kernel's ack —
-    ;; the same verdict discipline as /post, minus the post prefix.
-    (define (edit! z)
-      (define url (_2 msg))
-      (define body (_3 msg))
-      (define target (url-target (Rsh url 40)))
-      (If (Ifz target 1 0)
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" 404 "unparseable path segment" "text/plain; charset=utf-8"])
-          (loop serial pending queue))
-        (let ((back (strWeld "/ns" (quip:print-path (_0 target))))
-              (task ((h-poke hs) (_0 target) (edit-myth hs body))))
-          (Seq (helm:send! coord ["cmd" name task])
-            (loop serial pending (snoc [(_0 target) "post" (Ix 0 caps) back] queue))))))
-    ;; The op endpoint: POST /op/<dst> emits a warp of the op the
-    ;; form named, input built from the remaining fields, and waits
-    ;; on the kernel's verdict — the same ack/bounce discipline as
-    ;; /post ("post" queue kind).
-    (define (op! z)
-      (define url (_2 msg))
-      (define body (_3 msg))
-      (define dst (url-target (Rsh url 24)))
-      (define opp (url-target (form-field "op" body)))
-      (define back0 (form-field "back" body))
-      (define (reply status body2)
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" status body2 "text/plain; charset=utf-8"])
-          (loop serial pending queue)))
-      (cond
-        ((Ifz dst 1 0) (reply 404 "unparseable path segment"))
-        ((Or (Ifz opp 1 0) (Nil (Sz (_0 opp))))
-          (reply 400 "op= must be a namespace path"))
-        (else
-          (let ((back (If (Eq 0 (Bytes back0))
-                        (strWeld "/ns" (quip:print-path (_0 dst)))
-                        back0))
-                (task ((h-warp hs) (_0 dst) (_0 opp)
-                        ;; seconds, not the primop's nanoseconds —
-                        ;; ops do day arithmetic on ['when]
-                        (op-myth hs (Div (Now 0) 1000000000) body))))
-            (Seq (helm:send! coord ["cmd" name task])
-              (loop serial pending
-                (snoc [(_0 dst) "post" (Ix 0 caps) back] queue)))))))
-    ;; The counterfactual endpoint: evaluate the intervention myth
-    ;; (the same expression discipline as the write box), hand the
-    ;; whole job to the coordinator as a ["branch" ..] message, and
-    ;; wait on the verdict commit's ack — the "vine" queue kind, so
-    ;; the reply bounces to the verdict node on success.
-    (define (fork! z)
-      (define url (_2 msg))
-      (define body (_3 msg))
-      (define dst (url-target (Rsh url 40)))
-      (define at (url-target (form-field "at" body)))
-      (define from (parse-nat (form-field "from" body)))
-      (define expr (form-field "expr" body))
-      (define (reply status body2)
-        (Seq (helm:send! (Ix 0 caps) ["res" status body2 "text/html; charset=utf-8"])
-          (loop serial pending queue)))
-      (cond
-        ((Ifz dst 1 0) (reply 404 "unparseable destination path"))
-        ((Or (Ifz at 1 0) (Nil (Sz (_0 at)))) (reply 400 "at= must be a namespace path"))
-        ((Ifz from 1 0) (reply 400 "from= must be a positive epoch"))
-        (else
-          (let ((r (doctest:eval-text (h-sut hs) expr)))
-            (If (Eq 1 (Hd r))
-              (reply 400 (foil-render:diag-text (_0 r)))
-              (let ((fv (Try (lambda (z2)
-                               (let ((v (_0 (_0 r))))
-                                 (Seq (DeepSeq v v) v)))
-                          0)))
-                (cond
-                  ((Eq 1 (Hd fv)) (reply 400 (err-text (_0 fv))))
-                  ((Nil (myth-rep? (_0 fv)))
-                    (reply 400 "expr must evaluate to a myth (the intervention to poke)"))
-                  (else
-                    (Seq (helm:send! coord
-                           ["branch" name (_0 dst) (_0 at) from (_0 fv)])
-                      (loop serial pending
-                        (snoc [(_0 dst) "vine" (Ix 0 caps)] queue)))))))))))
-    ;; The fragment endpoint: rebuild the /o target from the /frag
-    ;; URL, make a request record stamped with the ['frag] marker,
-    ;; and wait on the response slots like any request — the
-    ;; responder's frag arm answers the bare component markup.
-    (define (frag! z)
-      (define url (_2 msg))
-      (define rest (url-target (Rsh url 40)))
-      (If (Ifz rest 1 0)
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" 404 "unparseable fragment path" "text/plain; charset=utf-8"])
-          (loop serial pending queue))
-        (let* ((target (weld [("ts" "o")] (_0 rest)))
-               (record ((h-madd hs) ((h-twigt hs) [("ts" "frag")] "1")
-                        ((h-req hs) (_1 msg) url (_3 msg) target)))
-               (pax (rpath serial)))
-          (Seq (helm:send! coord ["spy" name pax])
-            (Seq (helm:send! coord ["cmd" name ((h-make hs) pax record)])
-              (loop (Inc serial)
-                (snoc [pax (Ix 0 caps)] pending)
-                (snoc [pax "make"] queue)))))))
+  (define initial ("/boot/http_event/helm" (helm:driver-message (Ix 0 mc))))
+  (define (perform routes effect)
+    (define kind (Hd effect))
     (cond
-      ((And (Eq kind "req")
-         (And (h-wjs? hs) (Eq "/w.js" (_2 msg))))
-        ;; the shared client runtime: a static answer, no event
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" 200 (h-wjs hs) "application/javascript"])
-          (loop serial pending queue)))
-      ((And (Eq kind "req") (Eq "/style.css" (_2 msg)))
-        ;; the dev stylesheet: foil/style.css read from disk PER
-        ;; REQUEST — unlike the /w.js cord (captured at spawn), this
-        ;; is never frozen: edit the file, refresh the page.  Every
-        ;; weft/page links it after its inline <style>, so file rules
-        ;; win ties.  The route->file mapping is fixed (no filename
-        ;; from the URL).  No namespace event.
-        (Seq (helm:send! (Ix 0 caps)
-               ["res" 200 (ReadFile "foil/style.css") "text/css"])
-          (loop serial pending queue)))
-      ((And (Eq kind "req")
-         (And (h-wjs? hs) (frag-url? (_2 msg))))
-        (frag! 0))
-      ((And (Eq kind "req")
-         (And (h-post? hs) (post-url? (_2 msg))))
-        (post! 0))
-      ((And (Eq kind "req")
-         (And (h-post? hs) (edit-url? (_2 msg))))
-        (edit! 0))
-      ((And (Eq kind "req")
-         (And (h-vine? hs) (vine-url? (_2 msg))))
-        (vine! 0))
-      ((And (Eq kind "req")
-         (And (h-vine? hs) (fork-url? (_2 msg))))
-        (fork! 0))
-      ((And (Eq kind "req")
-         (And (h-op? hs) (op-url? (_2 msg))))
-        (op! 0))
-      ((Eq kind "req")
-        ;; a new part of the namespace for this connection
-        (let* ((parts (filter Bytes (split-ch 47 (_2 msg))))
-               (chore? (And (h-bridge? hs)
-                         (And (Gt (Sz parts) 1)
-                           (Equal "chore" (Ix 0 parts)))))
-               (target (url-target (_2 msg)))
-               (record
-                 (If chore?
-                   (chore-record parts (_3 msg))
-                   (Ifz target 0
-                     ((h-req hs) (_1 msg) (_2 msg) (_3 msg) (_0 target)))))
-               (pax
-                 (If chore?
-                   [("ts" "io") ("ts" "chore")
-                    ("ts" (strcat ["b" (_0 name) (showNat serial)]))]
-                   (rpath serial))))
-          (If (And (Nil chore?) (Ifz target 1 0))
-            (Seq (helm:send! (Ix 0 caps)
-                   ["res" 404 "unparseable path segment" "text/plain; charset=utf-8"])
-              (loop serial pending queue))
-          (If (And chore? (Ifz record 1 0))
-            (Seq (helm:send! (Ix 0 caps)
-                   ["res" 404 "unknown chore verb" "text/plain; charset=utf-8"])
-              (loop serial pending queue))
-            (let ((task ((h-make hs) pax record)))
-              ;; spy before cmd: worker->coordinator sends are FIFO,
-              ;; so the watch is armed before the request node exists
-              (Seq (helm:send! coord ["spy" name pax])
-                (Seq (helm:send! coord ["cmd" name task])
-                  (loop (Inc serial)
-                    (snoc [pax (Ix 0 caps)] pending)
-                    (snoc [pax "make"] queue)))))))))
-      ((Eq kind "change")
-        ;; the watched request node moved: respond when the behavior
-        ;; has written the response slots, else re-arm and keep waiting
-        (let ((pax (_1 msg))
-              (hit (pend-get pending (_1 msg))))
-          (Ifz hit
-            (loop serial pending queue)
-            (let ((r (let ((r0 (res-of hs (_2 msg))))
-                       (If (Or r0 (Nil (h-bridge? hs)))
-                         r0
-                         (chore-res-of hs (_2 msg))))))
-              (Ifz r
-                (Seq (rearm pax)
-                  (loop serial pending queue))
-                (answer hit pax r serial pending queue))))))
-      ((Eq kind "qres")
-        ;; a committed re-read of a pending chore node: answer if the
-        ;; result landed; otherwise the armed spy carries on
-        (let ((pax (_1 msg))
-              (hit (pend-get pending (_1 msg))))
-          (Ifz hit
-            (loop serial pending queue)
-            (let ((r (If (h-bridge? hs) (chore-res-of hs (_2 msg)) 0)))
-              (Ifz r
-                (loop serial pending queue)
-                (answer hit pax r serial pending queue))))))
-      ((Eq kind "ack")
-        ;; acks return in cmd order: pop the queue head
-        (let ((head (Ix 0 queue))
-              (rest (drop 1 queue))
-              (rsvp (_1 msg)))
-          (cond
-            ((Equal "post" (_1 head))
-              ;; the form post answers with the kernel's verdict:
-              ;; committed (bounce to the form's page) or rejected
-              (Seq (helm:send! (_2 head)
-                     (If (Eq "/boot/rsvp/no" (Hd rsvp))
-                       ["res" 500 (vine-fail-page (_0 head) (_0 rsvp))
-                        "text/html; charset=utf-8"]
-                       ["res" 200 (post-back-page (_3 head))
-                        "text/html; charset=utf-8"]))
-                (loop serial pending rest)))
-            ((Equal "vine" (_1 head))
-              ;; the write box answers here, with the kernel's verdict:
-              ;; committed (bounce back to the node) or rejected (500,
-              ;; the rendered err)
-              (Seq (helm:send! (_2 head)
-                     (If (Eq "/boot/rsvp/no" (Hd rsvp))
-                       ["res" 500 (vine-fail-page (_0 head) (_0 rsvp))
-                        "text/html; charset=utf-8"]
-                       ["res" 200 (vine-back-page (_0 head))
-                        "text/html; charset=utf-8"]))
-                (loop serial pending rest)))
-            ((Eq "/boot/rsvp/no" (Hd rsvp))
-              ;; the command failed — if its connection still waits,
-              ;; answer 500 with the failure
-              (let ((hit (pend-get pending (_0 head))))
-                (Ifz hit
-                  (loop serial pending rest)
-                  (Seq (helm:send!
-                         (_1 (_0 hit))
-                         ["res" 500 (err-text (_0 rsvp)) "text/plain; charset=utf-8"])
-                    (loop serial (pend-drop pending (_0 head)) rest)))))
-            ((Equal "cull" (_1 head))
-              ;; the request node is gone: this connection is done
-              (loop serial (pend-drop pending (_0 head)) rest))
-            (else (loop serial pending rest)))))
-      ((Eq kind "noport")
-        (loop serial pending queue))
-      ((Eq kind "die") ["dead"])
-      (else (loop serial pending queue))))
-  (Seq coord
-    (Seq (Ifz port
-           0
-           (let ((pump (Spawn (listener-pump port))))
-             (SendCaps pump ["go"] [0])))
-      (loop 0 [] []))))
-
-
-;;; Boot ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+      ((Eq kind "/boot/http_effect/send")
+        (Seq (helm:send! coord (_0 effect)) routes))
+      ((Eq kind "/boot/http_effect/listen")
+        (Seq (let ((pump (Spawn (listener-pump (_0 effect)))))
+               (SendCaps pump ["go"] [0])) routes))
+      ((Eq kind "/boot/http_effect/reply")
+        (let ((hit (find (lambda (r) (Eq (_0 r) (_0 effect))) routes)))
+          (Ifz hit routes
+            (let ((response (_1 effect)))
+              (Seq (helm:send! (_1 (_0 hit)) ["res" (_0 response) (_1 response) (_2 response)])
+                (filter (lambda (r) (Nil (Eq (_0 r) (_0 effect)))) routes))))))
+      (else (error ["unknown HTTP effect" effect]))))
+  (define (loop state routes serial event)
+    (define turn (step name state event))
+    (define routes2 (Seq (DeepSeq turn turn) (foldl perform routes (_1 turn))))
+    (Seq (DeepSeq routes2 routes2)
+      (If (_2 turn) ["dead"]
+        (let* ((mail (Recv 0))
+               (msg (Ix 0 mail))
+               (caps (Ix 1 mail)))
+          (If (Eq (_0 msg) "req")
+            (let ((action (Try (lambda (z) (let ((a (planner name serial msg))) (Seq (DeepSeq a a) a))) 0)))
+              (loop (_0 turn) (snoc [serial (Ix 0 caps)] routes2) (Inc serial)
+                ("/boot/http_event/request" serial
+                  (If (Eq 1 (Hd action))
+                    ("/boot/http_action/reply" ("/boot/http_response" 400 (err-text (_0 action)) "text/plain; charset=utf-8"))
+                    (_0 action)))))
+            (let ((message (helm:driver-message msg)))
+              (If message
+                (loop (_0 turn) routes2 serial ("/boot/http_event/helm" message))
+                ;; Unknown transport notifications leave driver state alone.
+                (loop (_0 turn) routes2 serial "/boot/http_event/idle"))))))))
+  (Seq coord (loop ("/boot/http_state" [] []) [] 0 initial)))

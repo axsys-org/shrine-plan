@@ -953,6 +953,16 @@
            (canon-path path0 (compiler-subject compiler)))))
     [(record-resolution compiler env path0) tc]))
 
+;; An aura'd nat type (str, sym, nat/<aura>): the refinement an
+;; explicit ^ cast may claim for any nat.
+(define (aura-nat-type? t)
+  (And (nt:nat-type? t) (Ifz (nt:nat-aura t) 0 1)))
+;; A viewed type whose values are bare nats: a nat of any aura, or a
+;; nat constant.
+(define (nat-ish-type? t)
+  (Or (nt:nat-type? t)
+    (And (nt:const-type? t) (IsNat (nt:const-value t)))))
+
 (define (view-type compiler env typ what)
   (need env (Nil (nt:scheme? typ))
     what "generic value requires explicit specialization")
@@ -992,11 +1002,15 @@
         "lambda goal has the wrong arity" (env-goal env))
       vr)))
 
+(define (unmark surf)
+  (define node (surf-strip-spans surf))
+  (If (Eq "s_strict" (_0 node)) (unmark (_1 node)) node))
+
 (define (lambda-parameters compiler env args goal-fun)
   (foldl
     (lambda (state pair)
       (define i (_0 pair))
-      (define arg (_1 pair))
+      (define arg (unmark (_1 pair)))
       (define tag (_0 arg))
       (define inferred
         (If goal-fun (Ix i (nt:fun-args goal-fun)) 0))
@@ -1354,6 +1368,11 @@
 ;;; Core expression elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (elab-value-go compiler env surf)
+  ;; A branch result annotation is inside the selected branch, not a
+  ;; caller-side annotation on If's lazy operand.
+  (define (region tc)
+    (If (Eq "TC_DEMAND" (Hd tc))
+      (tc-letrec (tc-ty tc) [tc] (tc-local (tc-ty tc) 0 "#strict-result")) tc))
   (define (check-value compiler env surf expected)
     (define r (elab-value-go compiler (env-with-goal expected env) surf))
     (define tc (_1 r))
@@ -2311,10 +2330,34 @@
                       fr
                       (global-reference compiler env
                         [(_1 surf)]))))))))))
+    ;; ^ T v: v elaborates at goal T and must fit it.  One coercion
+    ;; lives here and nowhere else: when T views to an aura'd nat
+    ;; (str, sym, nat/<aura>) any nat fits.  The aura is a refinement
+    ;; the bare value cannot witness, so implicit flow is one-way
+    ;; (aura'd -> nat, subtype-go in foil-new-types) and the explicit
+    ;; cast is the programmer's claim of it.  The value is untouched:
+    ;; (^ str 3) is the nat 3 at type str.
     ((Eq tag "s_cast")
       (let* ((tr (elab-type compiler env (surf-cast-ty surf) 0))
-             (vr (check-value (_0 tr) env (_2 surf) (_1 tr))))
-        [(_0 vr) (set-tc-ty (_1 tr) (_1 vr))]))
+             (target (_1 tr))
+             (tv (If (nt:scheme? target)
+                   [(_0 tr) 0]
+                   (view-type (_0 tr) env target "cast")))
+             (aura? (And (_1 tv) (aura-nat-type? (_1 tv)))))
+        (If aura?
+          (let* ((vr (elab-value-go (_0 tv) (env-with-goal target env)
+                       (_2 surf)))
+                 (actual (tc-ty (_1 vr)))
+                 (av (If (nt:scheme? actual)
+                       [(_0 vr) 0]
+                       (view-type (_0 vr) env actual "type mismatch")))
+                 (c1 (If (And (_1 av) (nat-ish-type? (_1 av)))
+                       (_0 av)
+                       (ensure-subtype (_0 av) env actual target
+                         "type mismatch"))))
+            [c1 (set-tc-ty target (_1 vr))])
+          (let ((vr (check-value (_0 tv) env (_2 surf) target)))
+            [(_0 vr) (set-tc-ty target (_1 vr))]))))
     ;; (^ expr) — unary type reflection: elaborate the operand, take
     ;; the type elaboration assigned to it (a named type reflects its
     ;; inner type), and splice the descriptor as a literal.  The
@@ -2338,6 +2381,14 @@
                     typ0)))
         [(_0 dv)
          (tc-lit (nt:type-ref ["type"]) (reflect-encode env typ))]))
+    ((Eq tag "s_strict")
+      (let ((r (elab-value-go compiler env (_1 surf))))
+        [(_0 r) (If (Eq "TC_DEMAND" (Hd (_1 r))) (_1 r)
+                   (tc-demand (tc-ty (_1 r)) (_1 r)))]))
+    ((Eq tag "s_before")
+      (let* ((v (elab-value-go compiler (clear-goal env) (_1 surf)))
+             (b (elab-value-go (_0 v) env (_2 surf))))
+        [(_0 b) (tc-before (tc-ty (_1 b)) (_1 v) (_1 b))]))
     ((Eq tag "s_fun")
       ;; A positional-row parameter ((\ acc [key val] ...)) desugars to
       ;; a fresh parameter destructured by the letrec machinery.  Fresh
@@ -2349,11 +2400,12 @@
                  (lambda (st pair)
                    (define i (_0 pair))
                    (define a (_1 pair))
-                   (define stripped (surf-strip-spans a))
+                   (define clean (unmark a))
+                   (define stripped (surf-strip-spans clean))
                    (If (Eq "s_trow" (_0 stripped))
                      [(snoc ["s_ref" [(Inc i)]] (_0 st))
                       (snoc [0 stripped ["s_var" (Inc i)]] (_1 st))]
-                     [(snoc a (_0 st)) (_1 st)]))
+                     [(snoc clean (_0 st)) (_1 st)]))
                  [[] []]
                  (zip (gen (Sz raw-args) (lambda (i) i)) raw-args)))
              (fun-args (_0 dr))
@@ -2391,7 +2443,12 @@
                  (_0 br)))
              (out-type (If goal-fun (env-goal env) typ)))
         [c1
-         (tc-lam out-type 0 (Weld [self-type] arg-types) (_1 br))]))
+         (tc-lam out-type 0 (Weld [self-type] arg-types)
+           (foldr (lambda (i body)
+             (If (Eq "s_strict" (_0 (surf-strip-spans (Ix i raw-args))))
+               (tc-before (tc-ty body) (tc-local (Ix i arg-types) (Inc i) "#strict-parameter") body)
+               body))
+             (_1 br) (gen (Sz raw-args) (lambda (i) i))))]))
     ((Eq tag "s_self")
       (let ((self (find-local env 0)))
         (need env self "recursive call outside a function" surf)
@@ -2507,7 +2564,7 @@
                  (tc-ty yes) (tc-ty no))))))
         [compiler
          (fold-tc-app (tc-ffi (nt:tfun [(nt:tnat 0) out out] out) If)
-           [cnd yes no] out)]))
+           [cnd (region yes) (region no)] out)]))
     ((Eq tag "s_letrec")
       (let* ((outer-goal (env-goal env))
              (lr
@@ -2516,8 +2573,10 @@
                    (define c (_0 state))
                    (define e (_1 state))
                    (define binds (_2 state))
-                   (define pat (_1 arm))
-                   (define value (_2 arm))
+                   (define outer (surf-strip-spans (_1 arm)))
+                   (define marked (Eq "s_strict" (_0 outer)))
+                   (define pat (unmark (_1 arm)))
+                   (define value (If marked (surf-strict (_2 arm)) (_2 arm)))
                    (define stripped (surf-strip-spans pat))
                    (If (Eq "s_trow" (_0 stripped))
                      ;; = [a b] value — positional destructure: the whole

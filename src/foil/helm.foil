@@ -1,20 +1,12 @@
 -  sept [order=10]
 -  shrine_types [order=20]
 -  shrine [order=30]
--  lain [order=40]
-'  helm: the IO driver core — a pure state machine between the lain
-'  kernel and the host's actors.  The shell executes duties and
-'  shuttles messages; it decides nothing.
-'  .
-'  The helm tracks the /io subnamespace, one actor per name under it:
-'  a name's birth spawns an actor (carrying its record), a change
-'  tells the actor its new record, a removal fells it.  Actors send
-'  tasks back through the shell into the full namespace, and every
-'  task is acked to its sender — the command's path tag, or the
-'  failure.  Watching rides /react: one-shot eyes on /io (membership,
-'  y care) and on each /io name (content, x care), re-armed every
-'  pulse.  Outbound kernel moves are dropped in this port (xeno
-'  delivery is a later round).
+-  lain_types [order=38]
+-  lain_peek [order=39]
+-  lain_poke [order=40]
+'  Helm executes tasks and granted moves through one transition path, then
+'  reconciles actors once against the final namespace. Actor dependencies
+'  live in their ordinary /sys/crew slots and persist until changed.
 +  rsvp
   '  The ack an actor receives for its command.
   &  rsvp/ok
@@ -25,6 +17,34 @@
 
   +  no
     :  err=iota
++  driver_in
+  '  Helm-to-driver protocol. Actor capabilities stay in the host adapter.
+  &  driver_in/go
+     driver_in/change
+     driver_in/view
+     driver_in/qres
+     driver_in/ack
+     driver_in/die
+  +  go
+    :  rec=res[myth]
+  +  change
+    :  p=path rec=res[myth]
+  +  view
+    :  d=dep rec=res[axal[myth]]
+  +  qres
+    :  p=path rec=res[myth]
+  +  ack
+    :  =rsvp
+  +  die
+    :
++  driver_out
+  '  Driver-to-Helm requests. Reads return driver_in/qres; commands ack.
+  &  driver_out/cmd
+     driver_out/read
+  +  cmd
+    :  n=iota =task
+  +  read
+    :  p=path
 +  duty
   '  One command to the shell: spawn an actor for a name (with its
   '  record), kill one, deliver a change (which watched path fired,
@@ -33,6 +53,7 @@
      duty/fell
      duty/tell
      duty/ack
+     duty/view
 
   +  birth
     :  n=iota rec=res[myth]
@@ -42,6 +63,10 @@
 
   +  tell
     :  n=iota wat=path rec=res[myth]
+
+  +  view
+    '  A y/z dependency answer; x dependencies use tell for host compatibility.
+    :  n=iota d=dep rec=res[axal[myth]]
 
   +  ack
     :  n=iota =rsvp
@@ -55,226 +80,223 @@
   ^  path
   ['io n]
 +  has_name
-  \  n=iota names=path
-  ^  nat
-  |  > i=nat 0
-  ?  (eq i names.len)
-     0
-  ?  (eq_iota names.at(i) n)
-     1
-  (_ i.inc)
+  '  Compatibility name for deep row membership, including the name's aura.
+  row/has[iota]
 +  io_bound
-  '  Whether a move is addressed into the driver subtree.  Only these
-  '  are the gate's business; every other move keeps the old
-  '  behavior, which is to be dropped.
+  '  Only moves into the driver subtree pass through the outbound gate.
   \  dst=path
-  ^  nat
-  ?  (eq 0 dst.len)
-     0
-  ?  (eq_iota dst.at(0) 'io)
-     1
-  0
+  ^  bool
+  dst.starts('io)
 +  granted_fetch
-  '  Whether outbound HTTP is granted to whoever emitted a move: the
-  '  nearest ancestor of src (src itself included) whose record
-  '  carries ['grants 'fetch].  The mount pipeline writes that slot on
-  '  the app card, so this attributes every move to the app whose
-  '  subtree emitted it, wherever that app happens to be rooted — /app
-  '  kids and top-level roots alike.
-  '  .
-  '  A move with no app card above it at all — anything the kernel
-  '  itself emitted — is governed by nothing and reads 0, so it stays
-  '  dropped.  The gate fails CLOSED by construction rather than by a
-  '  check that could be forgotten.
+  '  Walk from src to the root, accepting the first nonzero fetch grant.
+  '  Mounts put ['grants 'fetch] on their app card, so grants follow
+  '  the emitting subtree wherever it is rooted.  Missing or zero slots
+  '  continue the search; they do not revoke an ancestor's grant.
+  '  With no grant anywhere above the source, the move stays dropped.
   \  src=path s=sov
-  ^  nat
-  |  > i=nat src.len.inc
+  ^  bool
+  %  i=nat src.len.inc
   ?  (eq i 0)
-     0
-  =  > hit
+     .false
+  =  hit
        ?  s.x_latest(src.take(i.dec))
         > (./known t=myth)  t.nat_at(['grants 'fetch] 0)
         > .null  0
         > .unknown  0
   ?  hit
-     1
+     .true
   (_ i.dec)
++  delivery_issue
+  '  A failed outbound event or its reactive cascade; earlier commits stand.
+  :  dst=path err=iota
 +  helm
-  '  Driver state: the sovereign, the armed
-  '  watches, the live-name set (a uon keyed by name; the value
-  '  is unused), and the kernel's crew index — derived once when the
-  '  helm is taken and bumped by every event thereafter, so a
-  '  reactive round never re-walks the namespace.  The sovereign
-  '  stays FIRST: the shell reads it positionally.
-  :  =sov =eyes crew=uon[nat] =hive
+  '  The sovereign, actor dependencies, actor incarnation counters, and the
+  '  kernel dependency index. The sovereign stays first for the host ABI.
+  :  =sov watches=hive crew=uon[nat] =hive
   +  scan
-    '  The live names under /io — peek already drops tombstones.
-    \  s=sov
-    ^  path
-    =  > sub (peek io_root s)
-    sub.kid_keys
+    '  Only live immediate /io records are actors; structural spines are not.
+    \ s=sov
+    ^ path
+    = sub | s.idx.dip io_root
+    | sub.kid_keys.keep
+    \ n
+    ?=((./known _) s.x_latest((io_path n)))
   +  crew_of
-    \  names=path
-    ^  uon[nat]
-    |  > i=nat 0  > acc=uon[nat] (uon/empty)
-    ?  (eq i names.len)
-       acc
-    (_ i.inc acc.put(names.at(i) 0))
-  +  arm
-    '  Watches for the crew: membership on /io (y: kids moving),
-    '  content on each name (x: its own data).  Puts are idempotent
-    '  over surviving entries.
-    \  names=path ey=eyes
-    ^  eyes
-    =  > root io_root
-    =  > e1 ey.put(root [(dep .y root)])
-    |  > i=nat 0  > acc=eyes e1
-    ?  (eq i names.len)
-       acc
-    =  > pn (io_path names.at(i))
-    (_ i.inc acc.put(pn [(dep .x pn)]))
+    '  x shape counts distinguish removal/recreation from ordinary updates.
+    \ names=path s=sov
+    ^ uon[nat]
+    | names.fold (uon/empty)
+    \ acc n
+    | acc.put n s.ever_at((io_path n)).x.lock.shape
+  +  watches_of
+    '  Own-record updates plus the actor's declared cared dependencies.
+    \ names=path s=sov
+    ^ hive
+    | names.fold (axal/new[row[dep]] .none)
+    \ acc n
+    = pax | io_path n
+      declared=row[dep]
+        ? s.x_latest(pax)
+         > (./known t) (node_deps t)
+        []
+    = own=row[dep] [(dep .x pax)]
+    | acc.put pax (row/uniq[dep] own.weld(declared))
+  +  request_crew
+    '  HTTP workers publish their complete pending-request dependency set
+    '  as an ordinary namespace task. No separate watch-registration protocol.
+    \ n=iota paths=row[path]
+    ^ task
+    = deps=crew
+        | paths.fold (mop/empty)
+        \ acc p
+        | acc.put p (dep .x p)
+    | task/vine (io_path n)
+    | writ/poke
+    | myth/sing crew_slot (cpail deps)
   +  births_for
-    '  Birth duties for names, each carrying its latest record.
-    \  names=row[iota] s=sov
-    ^  row[duty]
-    =  > nod=row[duty] []
-    names.fold(nod ;
-      \  acc=row[duty] n=iota
-      =  > r s.x_latest((io_path n))
-      acc.snoc((duty/birth n r)))
+    \ names=path s=sov
+    ^ row[duty]
+    | names.map
+    \ n
+    | duty/birth n s.x_latest((io_path n))
+  +  notification
+    \ n=iota d=dep s=sov
+    ^ duty
+    ? d.c
+     > .x
+       = answer=res[myth]
+           ? (view .x 0 d.p s)
+            > (./known tree)
+              ? tree.fil
+               > (./some t) (./known t)
+              .unknown
+            > .null .null
+            > .unknown .unknown
+       | duty/tell n d.p answer
+    | duty/view n d (view d.c 0 d.p s)
+  +  changed
+    '  Translate derived dependencies against both ends of the batch.
+    \ d=dep signs=axal[sign] before=sov after=sov
+    ^ bool
+    = triggers=row[dep]
+        ? (is_o d.p)
+          (o_trigger d.p before).weld((o_trigger d.p after))
+        ? (is_xv d.p)
+          (xv_trigger d.p before).weld((xv_trigger d.p after))
+        ? (is_h d.p) []
+        [d]
+    | triggers.any
+    \ t
+    ? signs.get(t.p)
+     > (./some g) (fires t.c g)
+    .false
+  +  notifications
+    '  New dependencies hydrate immediately. Existing dependencies invalidate
+    '  at most once per batch. Birth already carries the actor's own record.
+    \ names=path born=path watches=hive signs=axal[sign] before=helm after=helm
+    ^ row[duty]
+    | names.bind
+    \ n
+    = pax | io_path n
+      fresh | born.has n
+      old=row[dep]
+        ? fresh []
+        before.watches.gut(pax [])
+    | watches.gut(pax []).sift
+    \ d
+    ^ maybe[duty]
+    ? fresh
+      ? (equal d (dep .x pax)) .none
+      | ./some (helm/notification n d after.sov)
+    ? (old.has(d))
+      ? !(helm/changed d signs before.sov after.sov) .none
+      | ./some (helm/notification n d after.sov)
+    | ./some (helm/notification n d after.sov)
   +  boot
-    '  Take the helm: birth an actor for every existing name, arm
-    '  the watches, and derive the kernel's crew index once — a
-    '  seeded or resumed sovereign arrives with crews already in it,
-    '  and this is the only full walk the driver ever pays.
-    \  s=sov
-    ^  [hm=helm out=row[duty]]
-    =  > names (helm/scan s)
-    =  > outs (helm/births_for names s)
-    =  > ey (helm/arm names (axal/new[row[dep]] .none))
-    [(helm s ey (helm/crew_of names) (hive_of s)) outs]
-  +  pulse
-    '  Digest one event's signs: membership first (fells, then
-    '  births), tells for surviving fired names, and re-arm every
-    '  fired watch.
-    \  signs=axal[sign] h=helm
-    ^  [hm=helm out=row[duty]]
-    =  > rr (react signs h.eyes)
-    =  > s h.sov
-    =  > root io_root
-    =  > olds h.crew.keys
-    =  > memb
-         ?  news.get(root)
-          > (./some ds=row[dep])  1
-          > .none  0
-    =  > names2
-         ?  memb
-            (helm/scan s)
-         olds
-    =  > nod=row[duty] []
-    =  > fells
-         olds.fold(nod ;
-           \  acc=row[duty] n=iota
-           ?  (has_name n names2)
-              acc
-           acc.snoc((duty/fell n)))
-    =  > births
-         names2.fold(nod ;
-           \  acc=row[duty] n=iota
-           ?  h.crew.has(n)
-              acc
-           =  > r s.x_latest((io_path n))
-           acc.snoc((duty/birth n r)))
-    =  > tells
-         news.tap.fold(nod ;
-           \  acc=row[duty] [wat ds]
-           ds.fold(acc ;
-             \  a2=row[duty] e=dep
-             =  > w e.p
-             ?  !(eq 2 w.len)
-                a2
-             ?  !(eq_iota w.at(0) 'io)
-                a2
-             =  > n w.at(1)
-             ?  !(has_name n names2)
-                a2
-             =  > r s.x_latest(wat)
-             a2.snoc((duty/tell n wat r))))
-    =  > ey2 (helm/arm names2 rest)
-    =  > d1 fells.weld(births)
-    =  > d2 d1.weld(tells)
-    [(helm s ey2 (helm/crew_of names2) h.hive) d2]
-  +  spy
-    '  Arm a one-shot watch for a named actor on any path: the next
-    '  change there tells n once, then the watch is consumed —
-    '  workers re-spy for more (lazy reactivity).
-    \  n=iota pax=path h=helm
-    ^  helm
-    h.set_eyes(h.eyes.put(pax [(dep .x (io_path n))]))
+    \ s=sov
+    ^ [hm=helm out=row[duty]]
+    = names | helm/scan s
+      watches | helm/watches_of names s
+      h | helm s watches (helm/crew_of names s) (hive_of s)
+      empty | helm s (axal/new[row[dep]] .none) (uon/empty) h.hive
+      initial | helm/notifications names names watches (axal/new[sign] .none) empty h
+    [h (helm/births_for names s).weld(initial)]
+  +  signs
+    '  Preserve every care that changed, including changes later reverted.
+    \ rounds=row[axal[sign]]
+    ^ axal[sign]
+    | rounds.fold (axal/new[sign] .none)
+    \ acc round
+    | round.tap.fold acc
+    \ out [p g]
+    = old | out.gut p (sign 0 0 0)
+    | out.put p (sign (nmax old.x g.x) (nmax old.y g.y) (nmax old.z g.z))
+  +  reconcile
+    '  Final membership with incarnation-aware restarts, then final answers.
+    \ before=helm signs=axal[sign] after=helm
+    ^ [hm=helm out=row[duty]]
+    = names | helm/scan after.sov
+      crew | helm/crew_of names after.sov
+      restarted=path
+        | names.keep
+        \ n
+        ? !(before.crew.has(n)) .false
+        | gt crew.gut(n 0) before.crew.gut(n 0)
+      dead | before.crew.keys.keep (\ n (!(names.has(n)) || restarted.has(n)))
+      born | names.keep (\ n (!(before.crew.has(n)) || restarted.has(n)))
+      watches | helm/watches_of names after.sov
+      tells | helm/notifications names born watches signs before after
+      fells=row[duty] | dead.map (\ n (duty/fell n))
+      births | helm/births_for born after.sov
+    [(helm after.sov watches crew after.hive) fells.weld(births).weld(tells)]
+  +  run
+    '  The sole execution path: sovereign and kernel index advance together.
+    \ t=task h=helm
+    ^ [hm=helm result=gyre]
+    = [result index] | cycle_with h.hive t 0 8 h.sov
+    ? result
+     > (./fail _) [h result]
+     > (./spun state _ _ _ _)
+       [h.set_sov(state).set_hive(index) result]
   +  moves
-    '  Apply the granted outbound moves (doc/multifile-apps-io-
-    '  grants.md part II).  A move whose dst is under /io and whose
-    '  src sits beneath an app card granting fetch is fed back in as
-    '  its own event, so the driver node really gets made; every other
-    '  move is dropped exactly as before.
-    '  .
-    '  The rounds those events produce come back for pulsing — that is
-    '  what turns the make into the driver's notification, and without
-    '  it the request would sit in the namespace unseen.
-    '  .
-    '  Moves emitted BY an applied move are NOT themselves applied:
-    '  one hop only.  That bounds the gate to the app's own request
-    '  and keeps a self-feeding app from looping the shell.
-    \  h=helm fx=row[move]
-    ^  [mh=helm mrs=row[axal[sign]]]
-    |  > i=nat 0  > hh=helm h  > rs=row[axal[sign]] []
-    ^  [mh=helm mrs=row[axal[sign]]]
-    ?  (eq i fx.len)
-       [hh rs]
-    =  > m fx.at(i)
-    ?  !(io_bound m.dst)
-       (_ i.inc hh rs)
-    ?  !(granted_fetch m.src hh.sov)
-       (_ i.inc hh rs)
-    ?  (cycle (./vine m.dst m.w) 0 8 hh.sov)
-     > (./fail e=iota)  (_ i.inc hh rs)
-     > (./spun s3=sov fx3=row[move] r3=row[axal[sign]] a3=maybe[path] sp3=maybe[iota])
-       (_ i.inc hh.set_sov(s3) rs.weld(r3))
+    '  Each allowed move is an independent event. Secondary effects remain
+    '  undelivered (one hop); failures are retained with their destinations.
+    \ h=helm fx=row[move]
+    ^ [mh=helm rounds=row[axal[sign]] issues=row[delivery_issue]]
+    | fx.fold [h [] []]
+    \ [current rounds issues] m
+    ^ [mh=helm rounds=row[axal[sign]] issues=row[delivery_issue]]
+    ? !(io_bound m.dst) [current rounds issues]
+    ? !(granted_fetch m.src current.sov) [current rounds issues]
+    = [next result] | helm/run (task/vine m.dst m.w) current
+    ? result
+     > (./fail err)
+       [next rounds issues.snoc((delivery_issue m.dst err))]
+     > (./spun _ _ more _ spill)
+       = problems
+           ? spill
+            > (./some err) issues.snoc((delivery_issue m.dst err))
+           issues
+       [next rounds.weld(more) problems]
+  +  answer
+    \ src=maybe[iota] reply=rsvp spill=maybe[iota] issues=row[delivery_issue] duties=row[duty] h=helm
+    ^ [hm=helm out=row[duty] =rsvp spill=maybe[iota] issues=row[delivery_issue]]
+    = out
+        ? src
+         > (./some n) duties.snoc((duty/ack n reply))
+        duties
+    [h out reply spill issues]
   +  exec
-    '  Run one task through the reactive cycle (crew-derived hears
-    '  cascade until quiet, fuel 8): the sovereign advances, every
-    '  round's signs pulse the driver's own eyes, and the source
-    '  actor (when named) is acked last.  The outcome ALSO returns
-    '  directly (rsvp: anonymous tasks have no ack duty, but their
-    '  senders still deserve the verdict), along with any cascade
-    '  spill the gyre surfaced — the driver reports it.
-    \  src=maybe[iota] t=task h=helm
-    ^  [hm=helm out=row[duty] =rsvp spill=maybe[iota]]
-    =  [g=gyre hv2=hive]  (cycle_with h.hive t 0 8 h.sov)
-    ?  g
-     > (./fail e=iota)
-       =  > rn (rsvp/no e)
-       ?  src
-        > (./some n=iota)
-          =  > d0 [(duty/ack n rn)]
-          [h d0 rn .none]
-        > .none  [h [] rn .none]
-     > (./spun s2=sov fx=row[move] rounds=row[axal[sign]] a=maybe[path] spill=maybe[iota])
-       =  > h1 h.set_sov(s2).set_hive(hv2)
-       '  the granted /io moves land as their own events first, so
-       '  their rounds pulse alongside the originating event's
-       =  > mv (helm/moves h1 fx)
-       =  > rounds2 rounds.weld(mrs)
-       =  > pr
-            |  > i=nat 0  > hh=helm mh  > ds=row[duty] []
-            ^  [h2=helm ds2=row[duty]]
-            ?  (eq i rounds2.len)
-               [hh ds]
-            =  > r2 (helm/pulse rounds2.at(i) hh)
-            (_ i.inc hm ds.weld(out))
-       =  > rk (rsvp/ok a)
-       ?  src
-        > (./some n=iota)
-          =  > d3 ds2.snoc((duty/ack n rk))
-          [h2 d3 rk spill]
-        > .none  [h2 ds2 rk spill]
+    '  Run the driving task and its granted moves, reconcile once, ack last.
+    '  Move failures never turn an already committed driving task into a nack.
+    \ src=maybe[iota] t=task h=helm
+    ^ [hm=helm out=row[duty] =rsvp spill=maybe[iota] issues=row[delivery_issue]]
+    = [updated result] | helm/run t h
+    ? result
+     > (./fail err)
+       | helm/answer src (rsvp/no err) .none [] [] h
+     > (./spun _ effects rounds ack spill)
+       = [moved more issues] | helm/moves updated effects
+         signs | helm/signs rounds.weld(more)
+         [settled duties] | helm/reconcile h signs moved
+       | helm/answer src (rsvp/ok ack) spill issues duties settled

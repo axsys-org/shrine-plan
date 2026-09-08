@@ -21,7 +21,7 @@
 ;;; Lowered module entries ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (make-ir-entry key span val tc ir)
-  ("IR_ENTRY" key span val tc ir))
+  ("IR_ENTRY" key span val tc ir cgen:ir-version))
 
 ;; Unit-grouped entries do not embed their compiled value directly: the
 ;; whole group's runtime row (and IR) is serialized behind ONE pin, and
@@ -110,7 +110,7 @@
   (define (lower-match val)
     ;; Match lowers to one let holding the scrutinee.  Arm bodies and the
     ;; fallthrough therefore see one more lexical slot than the scrutinee.
-    (cgen:L (recur (tc-match-scrut val))
+    (cgen:L 0 (recur (tc-match-scrut val))
       (lower-arms (Inc depth) (tc-match-fall val) (tc-match-arms val))))
   ;; Local bindings lower to nested lets: binding i's value sits inside
   ;; i enclosing lets, matching the one-local-per-binding elaboration.
@@ -118,12 +118,20 @@
     (define (go d bs)
       (Ifz bs
         (at d (tc-letrec-body val))
-        (cgen:L (at d (_0 bs)) (go (Inc d) (drop 1 bs)))))
+        (let ((v (_0 bs)))
+          (cgen:L (Eq "TC_DEMAND" (Hd v))
+            (at d (If (Eq "TC_DEMAND" (Hd v)) (tc-demand-val v) v))
+            (go (Inc d) (drop 1 bs))))))
     (go depth (tc-letrec-binds val)))
+  (define (lower-call f x)
+    (If (Eq "TC_DEMAND" (Hd x))
+      ;; A saturated intermediate operator finishes before this argument.
+      (cgen:L 1 f
+        (cgen:L 1 (cgen:shift 1 0 (recur (tc-demand-val x)))
+          (cgen:A (cgen:V 1) (cgen:V 0))))
+      (cgen:A f (recur x))))
   (define (lower-row row)
-    (fold-app
-      (cgen:K (tc-row-hd row))
-      (map recur (tc-row-items row))))
+    (foldl lower-call (cgen:K (tc-row-hd row)) (tc-row-items row)))
   (define (lower-local-path path)
     (define (go acc idx)
       (cgen:A (cgen:A (cgen:K Ix) (cgen:K idx)) acc))
@@ -140,8 +148,10 @@
       (resolve-global depth (tc-global-path val)))
     ((tag-is "TC_LIT")    (cgen:K (tc-lit-val val)))
     ((tag-is "TC_FFI")    (cgen:K (tc-ffi-val val)))
-    ((tag-is "TC_APP")    (cgen:A (recur (tc-app-f val))
-                             (recur (tc-app-x val))))
+    ((tag-is "TC_APP") (lower-call (recur (tc-app-f val)) (tc-app-x val)))
+    ((tag-is "TC_DEMAND") (cgen:L 1 (recur (tc-demand-val val)) (cgen:V 0)))
+    ((tag-is "TC_BEFORE") (cgen:before (recur (tc-before-val val))
+                             (recur (tc-before-body val))))
     ((tag-is "TC_LAM")    (lower-lam val))
     ((tag-is "TC_ROW")    (lower-row val))
     ((tag-is "TC_TYP")    (cgen:K val))
@@ -213,7 +223,7 @@
 ;; Compile all lowerable entries owned by one sealed unit behind one recursive
 ;; dispatcher law.  Calling the dispatcher produces the canonical member row;
 ;; a same-unit reference projects from a recursive call through the dispatcher's
-;; lexical self.  Unlike PLAN's strict sequential lets, this representation can
+;; lexical self. This representation can
 ;; construct mutually recursive closures without first constructing a cyclic
 ;; runtime value.  (A letrec (cgen:R) variant was prototyped 2026-07-27 and
 ;; reverted: it knots genuinely cyclic heap values, which the content-addressed
@@ -356,6 +366,10 @@
                   referee)))))))
     ((tag-is "TC_GLOBAL")
       (tc-global (tc-ty tc) (subst-path-args mapping (tc-global-path tc))))
+    ((tag-is "TC_DEMAND")
+      (tc-demand (tc-ty tc) (recur (tc-demand-val tc))))
+    ((tag-is "TC_BEFORE")
+      (tc-before (tc-ty tc) (recur (tc-before-val tc)) (recur (tc-before-body tc))))
     ((tag-is "TC_APP")
       (tc-app (tc-ty tc) (recur (tc-app-f tc)) (recur (tc-app-x tc))))
     ((tag-is "TC_LAM")

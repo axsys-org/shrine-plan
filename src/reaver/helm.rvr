@@ -193,7 +193,7 @@ assert(Equal ["got" ["myth" "new"] 7]
 ;; the shell needs plus the compiled subject (so callers can pull
 ;; their own app entries from the SAME compilation — one chain walk)
 ;; and the per-module compile cache (so the /boot mirror knows which
-;; file declared which entry): ["HELM" boot exec x-query spy sut cache].
+;; file declared which entry): ["HELM" boot exec x-query sut cache].
 ;; Pack a compile result [cache sut] as the core row.  The query slot
 ;; is /h-aware: the coordinator's query/read verbs serve the temporal
 ;; overlay as well as live paths.
@@ -203,7 +203,7 @@ assert(Equal ["got" ["myth" "new"] 7]
   ;; reads source entries off a fresh compile instead.
   (define (sv path) (foil:source-entry-val path sut))
   ["HELM" (sv ["helm" "boot"]) (sv ["helm" "exec"]) (sv ["x_query_h"])
-   (sv ["helm" "spy"]) sut (_0 r)])
+   sut (_0 r)])
 
 (define (load-helm-mod mod)
   (helm-pack (foil:compile-mod-cached 0 foil:default-subject mod)))
@@ -216,9 +216,8 @@ assert(Equal ["got" ["myth" "new"] 7]
 (define (core-boot c) (Ix 1 c))
 (define (core-exec c) (Ix 2 c))
 (define (core-xq c) (Ix 3 c))
-(define (core-spy c) (Ix 4 c))
-(define (core-sut c) (Ix 5 c))
-(define (core-cache c) (Ix 6 c))
+(define (core-sut c) (Ix 4 c))
+(define (core-cache c) (Ix 5 c))
 
 ;; An app entry from the core's own compilation.
 (define (core-ent core path)
@@ -1038,6 +1037,34 @@ assert(Equal ["got" ["myth" "new"] 7]
 (define (send! h m)
   (Seq (DeepSeq m m) (Send h m)))
 
+;; Compatibility codec at the actor boundary. Foil drivers receive the
+;; driver_in union; older Reaver workers retain their existing wire format.
+(define (driver-message msg)
+  (define kind (_0 msg))
+  (cond
+    ((Eq kind "go") ("/boot/driver_in/go" (_1 msg)))
+    ((Eq kind "change") ("/boot/driver_in/change" (_1 msg) (_2 msg)))
+    ((Eq kind "view") ("/boot/driver_in/view" (_1 msg) (_2 msg)))
+    ((Eq kind "qres") ("/boot/driver_in/qres" (_1 msg) (_2 msg)))
+    ((Eq kind "ack") ("/boot/driver_in/ack" (_1 msg)))
+    ((Eq kind "die") "/boot/driver_in/die")
+    ((includes (Eq (Hd msg))
+       ["/boot/driver_in/go" "/boot/driver_in/change" "/boot/driver_in/view"
+        "/boot/driver_in/qres" "/boot/driver_in/ack"]) msg)
+    ((Eq msg "/boot/driver_in/die") msg)
+    (else 0)))
+
+;; Host exceptions are arbitrary values, whereas rsvp/no promises an iota.
+;; Keep the detailed exception in the coordinator trace, not in that field.
+(define driver-crash-rsvp ("/boot/rsvp/no" ("ts" "task_crashed")))
+
+;; Typed driver requests enter the same coordinator transition path.
+(define (driver-command msg)
+  (cond
+    ((Eq (Hd msg) "/boot/driver_out/cmd") ["cmd" (_0 msg) (_1 msg)])
+    ((Eq (Hd msg) "/boot/driver_out/read") ["read" (_0 msg)])
+    (else msg)))
+
 ;; Send to the named worker, if it is still on the roster.
 (define (send-named roster n m)
   (let ((hit (roster-get roster n)))
@@ -1058,13 +1085,23 @@ assert(Equal ["got" ["myth" "new"] 7]
     ((Eq kind "/boot/duty/tell")
       (Seq (send-named roster (_0 d) ["change" (_1 d) (_2 d)])
         roster))
+    ((Eq kind "/boot/duty/view")
+      (Seq (send-named roster (_0 d) ["view" (_1 d) (_2 d)])
+        roster))
     ((Eq kind "/boot/duty/ack")
       (Seq (send-named roster (_0 d) ["ack" (_1 d)])
         roster))
     (else roster)))
 
 (define (apply-duties mk-worker roster ds)
-  (foldl (apply-duty mk-worker) roster ds))
+  ;; An ack belongs to the pre-turn actor. A remove/recreate must not deliver
+  ;; the old actor's command reply into its replacement's empty request queue.
+  (foldl
+    (lambda (current d)
+      (If (Eq "/boot/duty/ack" (Hd d))
+        (Seq (send-named roster (_0 d) ["ack" (_1 d)]) current)
+        (apply-duty mk-worker current d)))
+    roster ds))
 
 ;;; The coordinator ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1072,7 +1109,8 @@ assert(Equal ["got" ["myth" "new"] 7]
   (define hm (_0 st))
   (define roster (_1 st))
   (define mc (Recv 0))
-  (define msg (Ix 0 mc))
+  (define wire (Ix 0 mc))
+  (define msg (driver-command wire))
   (define caps (Ix 1 mc))
   (define kind (_0 msg))
   ;; The duty Sends live inside the apply-duties fold: every turn's
@@ -1096,7 +1134,7 @@ assert(Equal ["got" ["myth" "new"] 7]
                (Seq (DeepSeq r r) r)))
         0))
     (If (Eq 1 (Hd rr))
-      (let ((rsvp ("/boot/rsvp/no" (_0 rr))))
+      (let ((rsvp driver-crash-rsvp))
         (let ((duties
                 (If (boot-some? src)
                   [("/boot/duty/ack" (_0 src) rsvp)]
@@ -1107,13 +1145,15 @@ assert(Equal ["got" ["myth" "new"] 7]
                 (Seq (DeepSeq st2 st2) [st2 rsvp]))))))
       (let* ((r (_0 rr))
              (hm2 (_0 r))
-             (spill (Ix 3 r)))
-        ;; a cascaded hear round's failure rides the gyre's spill —
+             (spill (Ix 3 r))
+             (issues (Ix 4 r)))
+        ;; Cascade exhaustion or a hear failure rides the gyre's spill —
         ;; the committed rounds stand, but the error is reported
         (Seq (If (boot-some? spill)
-               (Trace ["helm: cascade round failed" (_0 spill)] 0)
+               (Trace ["helm: cascade stopped" (_0 spill)] 0)
                0)
-          (Seq (persist hm2)
+          (Seq (Seq (If (Sz issues) (Trace ["helm: outbound delivery issues" issues] 0) 0)
+                 (persist hm2))
             (let ((roster2 (apply-duties mk-worker roster (_1 r))))
               (let ((st2 [hm2 roster2]))
                 (Seq (DeepSeq st2 st2) [st2 (Ix 2 r)]))))))))
@@ -1139,51 +1179,15 @@ assert(Equal ["got" ["myth" "new"] 7]
         (Seq (Send (Ix 0 caps)
                (DeepSeq msg ((core-xq core) (Ix 2 s) (_1 msg) s)))
           (helm-loop core mk-worker persist st))))
-    ((Eq kind "branch")
-      ;; ["branch" name dst at from patch] — the executable
-      ;; counterfactual: fork the sovereign at `from`, poke `patch`
-      ;; at `at`, replay the journal from+1..top against the branch,
-      ;; and commit the VERDICT at `dst` as an ordinary named task —
-      ;; the sender's ack rides the normal duty, and the trunk only
-      ;; ever gains the verdict card (the branch lives and dies as a
-      ;; value inside fork/backtest).  Runs in the coordinator's
-      ;; turn, so a long replay serializes behind live traffic —
-      ;; acceptable at v1 scale, and honest: a counterfactual is an
-      ;; event like any other.
-      (let* ((sv (_0 hm))
-             (bt ent"fork/backtest")
-             (vr (Try (lambda (z)
-                        (let ((v (bt (Ix 4 msg) (Ix 3 msg) (Ix 5 msg) sv)))
-                          (Seq (DeepSeq v v) v)))
-                   0))
-             (verdict
-               (If (Eq 1 (Hd vr))
-                 (ent"myth/sing" n"err"
-                   (ent"pt" "backtest crashed — see the serve log"))
-                 (_0 vr)))
-             (dst (Ix 2 msg))
-             (known? (Eq "/boot/res/known"
-                       (Hd ((core-xq core) (Ix 2 sv) dst sv))))
-             (task (If known?
-                     (ent"vine_poke" dst verdict)
-                     (ent"vine_make" dst verdict)))
-             (tr (turn (boot-some (_1 msg)) task)))
-        (Seq (If (Eq 1 (Hd vr))
-               (Trace ["branch: backtest crashed" (_0 vr)] 0) 0)
-          (helm-loop core mk-worker persist (_0 tr)))))
-    ((Eq kind "spy")
-      ;; ["spy" name path] — arm a one-shot watch for a worker.  No
-      ;; reply: worker->coordinator sends are FIFO, so a spy followed
-      ;; by a cmd from the same worker is armed before the cmd runs.
-      (let ((hm2 ((core-spy core) (_1 msg) (_2 msg) hm)))
-        (Seq (DeepSeq hm2 hm2)
-          (helm-loop core mk-worker persist [hm2 roster]))))
     ((Eq kind "read")
       ;; ["read" path] — the committed record, tagged for multiplexed
       ;; worker mailboxes.
       (let ((s (_0 hm)))
         (let ((res ((core-xq core) (Ix 2 s) (_1 msg) s)))
-          (Seq (Send (Ix 0 caps) (DeepSeq res ["qres" (_1 msg) res]))
+          (Seq (Send (Ix 0 caps) (DeepSeq res
+                 (If (Eq (Hd wire) "/boot/driver_out/read")
+                   ("/boot/driver_in/qres" (_1 msg) res)
+                   ["qres" (_1 msg) res])))
             (helm-loop core mk-worker persist st)))))
     ((Eq kind "case")
       ;; ["case" path] — the node's current version (maybe[nat]),

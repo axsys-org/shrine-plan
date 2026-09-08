@@ -1,18 +1,132 @@
-'  sept: the namespace data structures — an ordered map (/uon) and a
-'  recursive path-tree (/axal).
+'  sept: packed text, collection helpers, ordered maps and path trees.
 '  .
 '  An iota is one path segment: the builtin iota aura-sum.  A path
 '  (pith) is a row of iotas: the /path alias.  /uon maps iotas to
-'  values, ordered by /lte_iota (size-balanced binary search tree
+'  values, ordered by /lt_iota (size-balanced binary search tree
 '  internals, the bst.foil scheme); entries come back in key order.
 '  /axal is a tree addressed by paths: each node holds an optional
 '  value (fil) and an ordered map of children (kid) — the kid map is
-'  /uon instantiated at the axal type itself.
+'  /bee specialized to axal child entries.
++  str
+  '  UTF-8 text stored as a little-endian packed atom.  Offsets and
+  '  slices count bytes; callers choose codepoint boundaries.
+  +  from_atom
+    '  Interpret packed bytes as text without changing their representation.
+    \ bytes=nat
+    ^ str
+    | add bytes 0
+  +  to_atom
+    '  The packed bytes, for APIs that still take a nat cord.
+    \ text=str
+    ^ nat
+    | add text 0
+  +  cat
+    \ r=str l=str
+    ^ str
+    | add l | lsh r | mul 8 (wid l)
+  +  slice
+    \ start=nat len=nat s=str
+    ^ str
+    | loadvar start len s
+  +  len
+    \ s=str
+    | wid s
+  +  at
+    \ idx=nat s=str
+    | load8 idx s
+  +  eof
+    '  Is the byte offset at or beyond the end?
+    \ i=nat s=str
+    ^ bool
+    | ge i s.len
+  +  snoc_byte
+    '  Append a nonzero byte (1..255).  Zero cannot extend a packed atom.
+    \ b=nat s=str
+    ^ str
+    | add s | lsh b | mul 8 s.len
+  +  cat_slice
+    '  Append the source's byte range [start,end), or nothing if empty.
+    \ source=str start=nat end=nat out=str
+    ^ str
+    ? (ge start end)
+      out
+    out.cat(source.slice(start (sub end start)))
+  +  prefix_at
+    '  Match a prefix at an offset; return the offset just after it.
+    \ pre=str i=nat s=str
+    ^ maybe[nat]
+    ? (eq pre s.slice(i pre.len))
+      | ./some i.add(pre.len)
+    .none
+  +  cat_all
+    '  Merge pieces in a balanced tree, avoiding a growing accumulator.
+    \ xs=row[str]
+    ^ str
+    ? (eq xs.len 0) ""
+    ? (eq xs.len 1) xs.at(0)
+    = half | div xs.len 2
+      left | _ xs.take(half)
+    | left.cat | _ xs.drop(half)
+  +  join
+    '  Join pieces with a separator.  Collect in constant-time conses,
+    '  then use the balanced merge rather than repeatedly appending.
+    \ sep=str xs=row[str]
+    ^ str
+    = parts
+        % i=nat 0
+          out=list[str] .nil
+        ^ list[str]
+        ? (eq i xs.len) out
+        = tail
+            ? (eq i 0) out
+            | list/cons[str] sep out
+        | _ i.inc (list/cons[str] xs.at(i) tail)
+    | str/cat_all parts.row.rev
+  +  snoc_utf8
+    '  Append a nonzero Unicode scalar as UTF-8.  The caller excludes
+    '  surrogates and values above U+10FFFF; byte appends do no validation.
+    \ cp=nat out=str
+    ^ str
+    ? (lt cp 128)
+      out.snoc_byte(cp)
+    ? (lt cp 2048)
+      out.snoc_byte((add 192 (div cp 64))).snoc_byte((add 128 (mod cp 64)))
+    ? (lt cp 65536)
+      | str/snoc_byte (add 128 (mod cp 64))
+      | str/snoc_byte (add 128 (mod (div cp 64) 64))
+      out.snoc_byte((add 224 (div cp 4096)))
+    | str/snoc_byte (add 128 (mod cp 64))
+    | str/snoc_byte (add 128 (mod (div cp 64) 64))
+    | str/snoc_byte (add 128 (mod (div cp 4096) 64))
+    out.snoc_byte((add 240 (div cp 262144)))
 +  nat
-  +  str
-    \  l=nat r=nat
-    | add l (mul r 256)
-+  strcat  nat/str
+  +  show
+    '  Decimal text, including zero.  Digits are prepended least first.
+    \ n=nat
+    ^ str
+    ? (eq n 0) "0"
+    % rest=nat n
+      out=str ""
+    ? (eq rest 0) out
+    = digit
+        ^ str
+        | add 48 | mod rest 10
+    | _ (div rest 10) digit.cat(out)
+  +  parse
+    '  Decimal text to a natural number; reject empty text and non-digits.
+    '  Scan by offset so a long input is not copied once per digit.
+    \ s=str
+    ^ maybe[nat]
+    ? (eq s.len 0) .none
+    % i=nat 0
+      acc=nat 0
+    ^ maybe[nat]
+    ? (eq i s.len)
+      | ./some acc
+    = byte s.at(i)
+    ? ((lt byte 48) || (gt byte 57)) .none
+    | _ i.inc (add (mul acc 10) (sub byte 48))
++  strcat  str/cat
 +  maybe
   '  An optional value: .some or .none (a substrate type; this reopens it).
   (@@ v)
@@ -169,7 +283,7 @@
        seen=row[v] []
     ^  list[v]
     ?  xs.is_nil  .nil
-    ?  seen.any((equal xs.head))
+    ?  seen.has(xs.head)
        | _ xs.tail seen
     | list/cons xs.head
     | _ xs.tail seen.snoc(xs.head)
@@ -198,6 +312,12 @@
     ?  (f xs.at(i))
        .true
     |  _ i.inc
+  +  has
+    '  Membership by deep equality: structured values include every field.
+    (@ v)
+    \  item=v xs=row[v]
+    ^  bool
+    xs.any((equal item))
   +  all
     '  Does f hold everywhere?  Truthy, short-circuiting.
     '  ?=  ((row/all[nat] (lt 0) [1 2]) 1)
@@ -336,6 +456,44 @@
   ?  (gt c "9")
      .false
   .true
++  hex
+  '  Hexadecimal digits are bytes; parsed values are ordinary numbers.
+  +  value
+    '  Decode either case.  Sixteen is the sentinel for a non-digit.
+    \ c=nat
+    ^ nat
+    ? (digit_byte c) (sub c 48)
+    ? (lt c 65) 16
+    ? (le c 70) (sub c 55)
+    ? (lt c 97) 16
+    ? (le c 102) (sub c 87)
+    16
+  +  digit
+    '  A nibble (0..15) as a lowercase ASCII byte.
+    \ n=nat
+    ^ nat
+    ? (lt n 10) (add 48 n)
+    | add 87 n
+  +  byte
+    '  A byte (0..255) as two lowercase hex digits, including leading zero.
+    \ b=nat
+    ^ str
+    | str/snoc_byte (hex/digit (mod b 16))
+    | str/snoc_byte (hex/digit (div b 16))
+    ""
+  +  read
+    '  Read exactly width hex digits at a byte offset; reject short input.
+    \ width=nat start=nat s=str
+    ^ maybe[nat]
+    ? (gt start.add(width) s.len) .none
+    % i=nat 0
+      acc=nat 0
+    ^ maybe[nat]
+    ? (eq i width)
+      | ./some acc
+    = digit | hex/value s.at(start.add(i))
+    ? (eq digit 16) .none
+    | _ i.inc (add (mul acc 16) digit)
 +  word_char
   '  A word byte: alphanumeric or underscore.
   '  ?=  ((word_char "a") 1)
@@ -379,7 +537,9 @@
     1
   | _ i.inc
 +  cord
-  '  Indexed byte access to a cord.  A cord is one big LE-packed nat,
+  '  Compatibility API for nat-packed bytes. Shared operations delegate
+  '  to str; argument order and nat results retain the legacy API.
+  '  A cord is one big LE-packed nat,
   '  so the historic walk — peek (mod s 256), advance (div s 256) —
   '  reallocates the whole remainder once per byte, and every scan is
   '  quadratic.  Read by index instead: hold the cord still and
@@ -390,27 +550,25 @@
     '  ?=  ((cord/len "abc") 3)
     \  s=nat
     ^  nat
-    |  wid s
+    | str/len (str/from_atom s)
   +  at
     '  The byte at index i; 0 at or past the end.
     '  ?=  ((cord/at "abc" 1) 98)
     \  s=nat i=nat
     ^  nat
-    |  load8 i s
+    | str/at i (str/from_atom s)
   +  eof
     '  Is i at or past the end?
     '  ?=  ((cord/eof "abc" 3) 1)
     \  s=nat i=nat
     ^  bool
-    ?  | ge i (wid s)
-      .true
-    .false
+    | str/eof i (str/from_atom s)
   +  slice
     '  The len bytes from off.  A native window: no rebuild.
-    '  ?=  ((cord/slice "hello" 1 3) "ell")
-    \  s=nat off=nat len=nat
-    ^  nat
-    |  loadvar off len s
+    '  ?=  ((cord/slice 1 3 "hello") "ell")
+    \ off=nat len=nat s=nat
+    ^ nat
+    | str/to_atom (str/slice off len (str/from_atom s))
   +  span_while
     '  The first index at or after i whose byte fails f, stopping at
     '  the end.
@@ -418,9 +576,9 @@
     \  f={\ bool}nat s=nat i=nat
     ^  nat
     %  j=nat i
-    ?  | ge j (wid s)
+    ?  | ge j (cord/len s)
       j
-    ?  (f (load8 j s))
+    ?  (f (cord/at s j))
       | _ j.inc
     j
   +  has
@@ -430,15 +588,15 @@
     '  ?=  ((cord/has 0 "hello") 1)
     \  needle=nat hay=nat
     ^  nat
-    =  nb  (wid needle)
-    =  hb  (wid hay)
+    =  nb  (cord/len needle)
+    =  hb  (cord/len hay)
     ?  | eq 0 nb
       1
     %  i=nat 0
     ^  nat
     ?  | gt (add i nb) hb
       0
-    ?  | eq needle (loadvar i nb hay)
+    ?  | eq needle (cord/slice i nb hay)
       1
     |  _ i.inc
   +  count
@@ -447,16 +605,16 @@
     '  ?=  ((cord/count "zz" "hello") 0)
     \ needle=nat hay=nat
     ^ nat
-    = nb | wid needle
+    = nb | cord/len needle
     ? | eq 0 nb
      0
-    = hb | wid hay
+    = hb | cord/len hay
     % i=nat 0
       n=nat 0
     ^ nat
     ? | gt (add i nb) hb
      n
-    ? | eq needle | loadvar i nb hay
+    ? | eq needle | cord/slice i nb hay
      | _ i.inc n.inc
     | _ i.inc n
   +  cat
@@ -464,9 +622,7 @@
     '  ?=  ((cord/cat "ab" "cd") "abcd")
     \ a=nat b=nat
     ^ nat
-    | add  a
-    | lsh b
-    | mul 8 (wid a)
+    | str/to_atom (str/cat (str/from_atom b) (str/from_atom a))
   +  cat_all
     '  Concatenate a row of cords.  Folding cat over the row rebuilds
     '  the accumulator at every step, so the total is quadratic in
@@ -474,13 +630,9 @@
     '  ?=  ((cord/cat_all ["ab" "cd" "ef"]) "abcdef")
     \ xs=row[nat]
     ^ nat
-    ? | eq xs.len 0
-     0
-    ? | eq xs.len 1
-     xs.at(0)
-    = h | div xs.len 2
-    | cord/cat | cord/cat_all xs.take(h)
-    | cord/cat_all xs.drop(h)
+    | str/to_atom
+    | str/cat_all
+    | xs.map str/from_atom
 +  lte_str
   '  Byte-lexicographic compare of two LE-packed strings.  Numeric
   '  compare is wrong here ("b" < "aa" as nats).
@@ -519,9 +671,16 @@
   \ a=iota b=iota
   ^ bool
   | iota_eq a b
++  path
+  +  starts
+    '  Does a nonempty path begin with this segment?  Compare the aura
+    '  and payload together, just as ordered path maps do.
+    \ root=iota p=path
+    ^ bool
+    ? (eq p.len 0) .false
+    | eq_iota root p.at(0)
 +  lte_iota
-  '  The key order of /uon : /lte_dime , which is 1 for a iota
-  '  against itself.
+  '  Non-strict iota ordering; unlike /lt_iota, equal keys pass.
   '  ?=  ((lte_iota '1 '2) 1)
   '  ?=  ((lte_iota 'bar 'foo) 1)
   '  ?=  ((lte_iota 'foo '1) 1)
@@ -610,7 +769,7 @@
    .false
   | lte_pith a b
 +  uon
-  '  An ordered map from iota (iota) to v, ordered by /lte_iota .
+  '  An ordered map from iota to v, using the strict /lt_iota order.
   '  Size-balanced binary-search-tree internals (the bst.foil scheme).
   (@@ v)
   & uon/empty
@@ -636,6 +795,13 @@
     ^ uon[v]
     | uon/node[v] l.size.inc.add(r.size)
       key val l r
+  +  from_keys
+    '  Build an index with one shared value; repeated keys collapse.
+    \  value=v keys=row[iota]
+    ^  uon[v]
+    |  keys.fold (uon/empty)
+    \  acc key
+    acc.put(key value)
   +  sing
     '  ?=  ((uon/size[nat] (uon/sing[nat] '1 10)) 1)
     \ key=iota val=v
@@ -857,7 +1023,9 @@
   '  compile-time constant comparison: mop[k v lt] (the map.foil
   '  scheme).  The ordering is declared once and never passed at
   '  runtime.  Size-balanced binary-search-tree internals, exactly
-  '  /uon with the key type and order generalized.
+  '  /uon with the key type and order generalized. These nominal
+  '  representations stay distinct: uon also supports deletion and
+  '  floor queries, and both brands appear in persisted values.
   (@@ k v lt={\ k k}bool)
   &  mop/empty
      mop/node[k v lt]
@@ -959,6 +1127,12 @@
      | mop/balance[k v lt] n.key n.val
        n.l | _ key val n.r
     | mop/n[k v lt] key val n.l n.r
+  +  gas
+    '  Insert entries in order; later values replace earlier equal keys.
+    \ entries=row[[key=k value=v]] m=mop[k v lt]
+    ^ mop[k v lt]
+    | entries.fold m
+    \ acc [key value] acc.put(key value)
   +  get
     '  The value at a key, or .none.
     \ key=k a=mop[k v lt]
