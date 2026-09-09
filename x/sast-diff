@@ -1,0 +1,108 @@
+#!/bin/sh
+# x/sast-diff [FILE.foil ...]
+#
+# The migration oracle for a syntax change: parses every src/foil/**/*.foil
+# (or the given files, paths relative to src/) with the WORKING TREE's
+# parser over the working tree's sources, AND with the parser at git HEAD
+# over the sources at HEAD, zeroes every span, and diffs the two SAST
+# dumps.  An empty diff means the rewrite preserved every parse; an
+# `s_bad` row on the new side is a located diagnostic to fix; a shape
+# difference is a real change of meaning (or a parser bug).
+#
+# Warms from the newest x/check template (run x/check once first): the
+# .rvr module cache is dep-stamped, so only rex/foil-sast recompile.
+#
+# SAST_BASE=<rev> picks the base commit (default HEAD).  Once the syntax
+# commit is in HEAD, the equivalence oracle for a migration is the LAST
+# PRE-SYNTAX commit: its parser over its sources against the working
+# tree's parser over the ported file.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BASE="${SAST_BASE:-HEAD}"
+WISP="$(command -v wisp || echo "$ROOT/wisp")"
+if [ ! -x "$WISP" ]; then
+  echo "x/sast-diff: no wisp on PATH and no $ROOT/wisp" >&2; exit 2
+fi
+TPL="$(ls -td "$ROOT/.check"/template-* 2>/dev/null | head -1)"
+if [ -z "$TPL" ] || [ ! -e "$TPL/data.mdb" ]; then
+  echo "x/sast-diff: no x/check template to warm from - run x/check first" >&2; exit 2
+fi
+DIR="$ROOT/.check/sast-diff"
+rm -rf "$DIR"; mkdir -p "$DIR/head" "$DIR/old" "$DIR/new"
+git -C "$ROOT" archive "$BASE" src | tar -x -C "$DIR/head"
+
+if [ $# -gt 0 ]; then
+  FILES="$*"
+else
+  FILES="$(cd "$ROOT/src" && find foil -name '*.foil' | sort | tr '\n' ' ')"
+fi
+
+# One session: bind the parser, parse each file under Try, zero the spans
+# (every 4-nat row is a span: line/col/line/col), print one SAST per file.
+# The prints are APPS of a cord ("SAST" ...), which the printer renders
+# with the cord first; a row would print as (0 "SAST" ...).
+gen_input () {
+  cat <<'EOF'
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind foil-sast (#module foil-sast))
+(define (span? x)
+  (And (IsApp x)
+    (And (Eq 4 (Sz x))
+      (And (IsNat (_0 x)) (And (IsNat (_1 x)) (And (IsNat (_2 x)) (IsNat (_3 x))))))))
+(define (zap x)
+  (cond
+    ((span? x) 0)
+    ((IsApp x) (map zap x))
+    (else x)))
+(define (one f)
+  (let ((r (Try (lambda (z)
+                  (let ((s (foil-sast:parse-module-sast 0
+                             (rex:ParseRexNormFile (read-text-file f)))))
+                    (Seq (DeepSeq s 1) (zap s))))
+             0)))
+    ;; a whole-file failure (rex parse error, a module-level sast-error)
+    ;; is not an s_bad row - surface it as one so the diff names it
+    (If (Eq 1 (Hd r))
+      ["PARSE-FAILED" (_0 r)]
+      (_0 r))))
+EOF
+  for f in $FILES; do
+    echo "(print (\"SAST\" \"$f\" (one \"$f\")))"
+  done
+  echo '(print ("SAST-DONE" 0))'
+}
+
+run_side () {  # $1 = side dir, $2 = file root
+  mkdir -p "$1/snap"
+  cp "$TPL/data.mdb" "$TPL/pins.pack" "$1/snap/"
+  gen_input > "$1/input"
+  ( cd "$1" && "$WISP" --file-root "$2" snap root _ < input > out.log 2>&1 ) || true
+  # keep only the SAST prints (each spans lines up to the next print)
+  awk '/^\("SAST"/{p=1} /^\("SAST-DONE"/{p=0} p' "$1/out.log" > "$1/sast.txt"
+  if ! grep -aq '^("SAST-DONE"' "$1/out.log"; then
+    echo "x/sast-diff: the $(basename "$1") session did not finish (see $1/out.log)" >&2
+  fi
+}
+
+run_side "$DIR/old" "$DIR/head/src" &
+run_side "$DIR/new" "$ROOT/src" &
+wait
+
+BAD="$(grep -a -c '"s_bad"' "$DIR/new/sast.txt" || true)"
+FAILED="$(grep -a -c 'PARSE-FAILED' "$DIR/new/sast.txt" || true)"
+if [ "$FAILED" != "0" ]; then
+  echo "x/sast-diff: $FAILED file(s) FAILED TO PARSE on the new side (see $DIR/new/sast.txt):" >&2
+  grep -a -A6 'PARSE-FAILED' "$DIR/new/sast.txt" | cut -c1-200 >&2
+fi
+if diff -u "$DIR/old/sast.txt" "$DIR/new/sast.txt" > "$DIR/sast.diff"; then
+  echo "x/sast-diff: identical SASTs for $(echo $FILES | wc -w | tr -d ' ') files (s_bad rows: $BAD)"
+  exit 0
+else
+  echo "x/sast-diff: SASTs differ (s_bad rows on the new side: $BAD) - see $DIR/sast.diff" >&2
+  grep -a '^[-+]("SAST"' "$DIR/sast.diff" | sed 's/ (.*//' | sort | uniq -c | head -60 >&2
+  exit 1
+fi

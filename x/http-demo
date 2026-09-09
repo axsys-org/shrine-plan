@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Run the current Foil/Helm HTTP counter; --check exercises the real socket."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+root = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--port', type=int, default=8080)
+parser.add_argument('--check', action='store_true')
+args = parser.parse_args()
+runtime = os.environ.get('WISP') or shutil.which('wisp') or str(root / 'wisp')
+if not os.access(runtime, os.X_OK):
+    parser.error('Set WISP to a working runtime executable (see doc/actor-abort-investigation.md).')
+templates = list((root / '.check').glob('template-*'))
+if not templates:
+    parser.error('Run x/check once to create a bootstrap template.')
+template = max(templates, key=lambda p: p.stat().st_mtime)
+work = Path(tempfile.mkdtemp(prefix='foil-http-'))
+(work / 'snap').mkdir()
+for name in ('data.mdb', 'pins.pack'):
+    shutil.copyfile(template / name, work / 'snap' / name)
+url = f'http://127.0.0.1:{args.port}'
+log_path = work / 'out.log'
+print(f'Compiling HTTP demo. Log: {log_path}', flush=True)
+with log_path.open('w') as log:
+    process = subprocess.Popen(
+        [runtime, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
+        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+    try:
+        process.stdin.write(f'(#bind demo (#module http-demo-run))\n(demo:start {args.port})\n')
+        process.stdin.flush()
+        deadline = time.monotonic() + 240
+        while True:
+            output = log_path.read_text(errors='replace')
+            if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output:
+                raise RuntimeError(output[-5000:])
+            if 'pump: listening' in output:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(f'Server startup timed out; inspect {log_path}')
+            time.sleep(0.25)
+        print(f'Foil HTTP interface: {url}/', flush=True)
+        if args.check:
+            def get(path='/'):
+                with urllib.request.urlopen(url + path, timeout=20) as response:
+                    return response.read().decode()
+            assert '<output>0</output>' in get()
+            request = urllib.request.Request(url + '/increment', data=b'', method='POST')
+            with urllib.request.urlopen(request, timeout=20) as response:
+                assert 'committed' in response.read().decode()
+            assert '<output>1</output>' in get()
+            try:
+                get('/missing')
+                raise AssertionError('Expected 404')
+            except urllib.error.HTTPError as error:
+                assert error.code == 404
+            print('HTTP e2e passed: GET, POST commit, GET readback, and 404.', flush=True)
+        else:
+            print('State lasts for this run. Ctrl-C stops the server.', flush=True)
+            process.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()

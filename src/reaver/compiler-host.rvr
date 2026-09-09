@@ -1,0 +1,568 @@
+;;;; Host compiler representation adapters for the Foil boot tools.
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+
+(#bind reef (#module reef))
+(#import reef)
+
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+
+(#bind foil-env (#module foil-env))
+
+(#bind foil-relocate (#module foil-relocate))
+
+(#bind foil (#module foil))
+
+(#bind foil-lore (#module foil-lore))
+
+(#bind foil-render (#module foil-render))
+
+(#bind foil-new-elab (#module foil-new-elab))
+
+(#bind doctest (#module doctest))
+
+(#bind cairn (#module cairn))
+
+(#bind grove (#module grove))
+
+
+(#bind runtime (#module helm-host))
+(#bind wire (#module helm-wire))
+(define helm-pack runtime:helm-pack)
+(define load-helm-mod runtime:load-helm-mod)
+(define load-helm runtime:load-helm)
+(define core-boot runtime:core-boot)
+(define core-exec runtime:core-exec)
+(define core-xq runtime:core-xq)
+(define core-sut runtime:core-sut)
+(define core-cache runtime:core-cache)
+(define core-run runtime:core-run)
+(define core-ent runtime:core-ent)
+(define helm-actor runtime:helm-actor)
+(define send! wire:send!)
+(define driver-message wire:driver-message)
+(define driver-command wire:driver-command)
+(define driver-crash-rsvp wire:driver-crash-rsvp)
+
+(Seq (define tools-compiled
+       (foil:compile-mod-cached 0 foil:default-subject "boot_tools"))
+  (DeepSeq tools-compiled 0))
+(define (tool path) (foil:source-entry-val path (_1 tools-compiled)))
+
+(define (ts s) ("ts" s))
+
+;; Module names split into namespace segments: apps mirror at
+;; /boot/apps/<name>/main, kernel modules keep their single segment.
+(define (mod-segs mod) ((tool ["boot_mirror" "segments"]) mod))
+
+(define boot-doc-text (tool ["boot_mirror" "description"]))
+
+;; Lore mirroring is a pure function of the already-mirrored [src]
+;; (doc/shrine-apps.md section 4.3) — flip to 0 to shed the seeding
+;; cost without losing information.
+(define mirror-lore? 1)
+
+;; Reference mirroring writes ['calls]/['called_by] rows of mirror
+;; paths on each entry node (forge's who-calls, as namespace state).
+(define mirror-refs? 0)  ;; TEMP: off for the boot check
+
+;; Law mirroring writes each lowered entry's decompiled law text at
+;; ['law].  Off by default: it walks every law at seed time.
+(define mirror-law? 0)
+
+;; Full-roster mirroring: compile every module on disk into the boot
+;; cache (not just the helmapp closure + apps) so the whole tree
+;; mirrors; modules that fail to compile get a fail card.
+(define mirror-all? 1)
+
+;; The 5th cache field when present; legacy 4-field entries degrade
+;; to no lore.
+(define (entry-lore me)
+  (If (Lt 4 (Sz me)) (Ix 4 me) []))
+
+;; A mirror-shaped entry's own keys: declared, minus imports, minus
+;; materialized const-generic instantiations (/ty-ap-encoded keys are
+;; not namespace paths) — the mirror's and the doctest driver's
+;; shared notion of "documented entries".
+;; The imported keys as a cairn AX index: a helm-scale module imports
+;; the whole world (~1,500 keys), so the includes-scan variant was
+;; O(decls x imports) with deep path equality — one own-keys pass over
+;; the boot cache cost ~17s, and the mirror, /ns index, ref table, and
+;; doctest sweep each paid it.
+(define (entry-own-keys me)
+  (define imp-ax
+    (foldl (lambda (ax k) (cairn:putax k 1 ax)) cairn:empty-ax (_3 me)))
+  (filter
+    (lambda (k)
+      (And (Nil (ty-ap-path? k))
+        (Nil (cairn:getax k imp-ax))))
+    (_2 me)))
+
+;; A lore-for hit (0 or singleton) -> the four constructor arguments
+;; [lo lh lb lt] the boot_*_t records take.
+(define (lore-args hit)
+  (Ifz hit
+    [0 0 [] []]
+    (let ((l (_0 hit)))
+      [1 (foil-lore:lore-head l) (foil-lore:lore-body l)
+       (foil-lore:lore-test-pairs l)])))
+
+;; One vine_make task per mirrored node: /boot first, then each
+;; module's file node followed by its entries.  A module's own keys
+;; are its cache entry's decl keys minus its imported keys — both
+;; stored on the entry ([name subject decl-keys imported-keys lore]
+;; rows).  The mirror builds from this, and the doctest driver
+;; resolves target paths against it.
+
+;; A module entry's mirror node: /boot/<..modsegs>/<n>/<..name>.
+(define (boot-ent-node mod name)
+  ((tool ["boot_mirror" "node"]) (map ts (mod-segs mod)) (map ts name)))
+
+;; [[src-node dst-node] ..]: every reference between mirrored entries,
+;; deduped — forge's ref-table restated in mirror paths.  Refs to
+;; anything unmirrored (builtins) drop out.
+(define (boot-ref-table cache)
+  ;; key -> mirror node as a cairn AX — the linear find here was
+  ;; O(refs x entries) across the whole cache.  Unit-id PINS as bst
+  ;; key segments are poison: cmp-total opens UNEQUAL pins and
+  ;; compares their whole contents, so one descent past a unit-id
+  ;; walks two entire unit subjects.  Intern pins to small indexes
+  ;; first (Eq on pins is store identity); keys become pin-free.
+  (define units
+    (foldl
+      (lambda (a me)
+        (let ((unit (sut-unit (_1 me))))
+          (let ((uid (If (foil-env:unit? unit)
+                       (foil-env:unit-identity unit) 0)))
+            (If (Or (Ifz uid 1 0) (includes (Eq uid) a))
+              a (snoc uid a)))))
+      [] cache))
+  (define (pin-idx p)
+    (define n (Sz units))
+    (define (go i)
+      (If (Ge i n) 0 (If (Eq p (Ix i units)) [i] (go (Inc i)))))
+    (go 0))
+  (define (intern-seg s)
+    (If (IsPin s)
+      (let ((hit (pin-idx s)))
+        (Ifz hit ["#pin-miss"] ["#pin" (_0 hit)]))
+      s))
+  (define (intern-key k) (map intern-seg k))
+  (define keymap
+    (foldl
+      (lambda (acc me)
+        (define own (entry-own-keys me))
+        (define unit (sut-unit (_1 me)))
+        (define unit-id
+          (If (foil-env:unit? unit) (foil-env:unit-identity unit) 0))
+        (define own-ax (foil-relocate:own-index own))
+        (foldl
+          (lambda (a k)
+            (define node (boot-ent-node (_0 me) (drop 1 k)))
+            (define raw (cairn:putax (intern-key k) node a))
+            (Ifz unit-id
+              raw
+              (cairn:putax
+                (intern-key
+                  (foil-relocate:qualify-canonical-path own-ax unit-id k))
+                node raw)))
+          acc own))
+      cairn:empty-ax cache))
+  (define (node-for k)
+    (cairn:getax (intern-key k) keymap))
+  ;; dedup via a seen-AX keyed by the [src dst] row itself
+  (_1
+    (foldl
+      (lambda (st me)
+        (foldl
+          (lambda (st1 k)
+            (let ((srcn (boot-ent-node (_0 me) (drop 1 k)))
+                  (refs (foil:collect-refs (got-entry-tc k (_1 me)))))
+              (foldl
+                (lambda (st2 r)
+                  (let ((hit (node-for (resolve-path (_1 r)))))
+                    (Ifz hit
+                      st2
+                      (let ((row [srcn (_0 hit)]))
+                        (Ifz (cairn:getax row (_0 st2))
+                          [(cairn:putax row 1 (_0 st2)) (snoc row (_1 st2))]
+                          st2)))))
+                st1 refs)))
+          st (entry-own-keys me)))
+      [cairn:empty-ax []] cache)))
+
+;; The ref table grouped by endpoint: [out-ax in-ax], node -> row of
+;; peers.  Built once — the per-entry filter pair over the whole
+;; table was O(entries x refs).
+(define (ref-axes edges) ((tool ["boot_mirror" "ref_axes"]) edges))
+(define (refs-of axes node) ((tool ["boot_mirror" "refs_of"]) axes node))
+
+;; Whether a cached module has source on disk to mirror.
+;;
+;; A GENERATED module (schemagen's tree-fed client — helm-llm.rvr) has
+;; no file, so get-foil answers empty.  Mirroring one anyway puts its
+;; entire entry table into the namespace with no source to show for it,
+;; and that table is not small: the two OpenRouter modules carry 8,172
+;; entries against 1,560 for every hand-written module in the system
+;; combined.  Measured, seeding the mirror went 4.8s -> 61.2s with them
+;; in — and every one of those nodes then rides in the sovereign that
+;; each Save has to serialize.
+;;
+;; The cost of leaving them out: their ['sub] cache rows are not in the
+;; namespace either, so hydrate-cache cannot rebuild them in a fresh
+;; session — it regenerates from the spec instead.  That is the right
+;; trade while a generated module costs 5 minutes to compile and its
+;; source of truth is the schema, not the namespace.
+(define (mirror-has-source? mod)
+  (define r (Try (lambda (z) (Bytes (foil:get-foil mod))) 0))
+  (If (Eq 1 (Hd r)) 0 (If (_0 r) 1 0)))
+
+;; Compiler representation bridge. Foil receives typed descriptions and
+;; opaque cache pins; it owns all mirror paths, cards and installation.
+(define (typed-lore args)
+  ("/boot/compiler_lore" (_0 args) (_1 args) (_2 args) (Ix 3 args)))
+(define (describe-cache refs? lore? raw-cache)
+  (define cache (filter (lambda (e) (And (Lt 5 (Sz e))
+    (mirror-has-source? (_0 e)))) raw-cache))
+  (define raxes (ref-axes (If refs? (boot-ref-table cache) [])))
+  (define (describe me)
+    (define mod (_0 me))
+    (define sut (_1 me))
+    (define src (foil:get-foil mod))
+    (define lore (If lore? (entry-lore me) []))
+    (define own (entry-own-keys me))
+    (define (describe-entry k)
+      (define e (foil:entry-parts sut k))
+      (define name (drop 1 k))
+      (define rr (refs-of raxes (boot-ent-node mod name)))
+      ("/boot/compiler_entry" (map ts name) (foil:ent-val e)
+        (foil:entry-kind sut k (foil:ent-tc e))
+        (foil:source-slice src (foil:ent-span e)) (foil:ent-lowered e)
+        (typed-lore (lore-args (foil-lore:lore-for lore name)))
+        ("/boot/maybe/some" (foil-new-elab:reflect-encode 0 (tc-ty (foil:ent-tc e))))
+        (If (And mirror-law? (foil:ent-lowered e))
+          (If (foil-render:law-like? (foil:ent-val e))
+            (foil-render:render-law (foil:ent-val e)) 0) 0)
+        (Ix 0 (foil:ent-span e)) (_0 rr) (_1 rr)))
+    (define imported
+      (foldl (lambda (acc name)
+        (let ((hit (find (lambda (entry) (Eq name (_0 entry))) cache)))
+          (Ifz hit acc (Weld acc (map (lambda (k) (drop 1 k))
+            (entry-own-keys (_0 hit))))))) [] (foil:module-imports mod)))
+    ("/boot/compiler_module" (map ts (mod-segs mod)) src
+      (typed-lore (lore-args (foil-lore:lore-for lore [])))
+      (map describe-entry own)
+      (map (lambda (name) (map ts name))
+        (filter Sz (Weld (map (lambda (k) (drop 1 k)) own) imported)))
+      (foil:entry-pin me)))
+  (map describe cache))
+
+(define (boot-mirror-mods-refs-lore-with refs? lore? raw-cache core)
+  (map (lambda (desc)
+    (let* ((parts ((tool ["boot_mirror" "parts"]) desc)) (doc (_1 parts)))
+      [(_0 parts) [(_0 doc) (_1 doc) (_2 doc) (Ix 3 doc)]
+        (_2 parts) (Ix 3 parts)]))
+    (describe-cache refs? lore? raw-cache)))
+
+;; The boot-path builder: reference rows deferred (the who-calls table
+;; costs ~33s; ref-upgrade-task below re-mirrors WITH refs as one
+;; post-listen pact poke).  A chore resync re-minted card is likewise
+;; ref-less until the next upgrade.
+(define (boot-mirror-mods-lore-with lore? raw-cache core)
+  (boot-mirror-mods-refs-lore-with 0 lore? raw-cache core))
+
+(define (boot-mirror-pairs-lore-with lore? raw-cache core)
+  ((tool ["boot_mirror" "pairs"]) (describe-cache 0 lore? raw-cache)))
+
+(define (boot-mirror-pairs-with core raw-cache)
+  (boot-mirror-pairs-lore-with mirror-lore? raw-cache core))
+
+(define (boot-mirror-tasks-lore-with lore? raw-cache core)
+  ((tool ["boot_mirror" "tasks"]) boot-doc-text
+    (describe-cache 0 lore? raw-cache)))
+
+(define (boot-mirror-tasks-with raw-cache core)
+  (boot-mirror-tasks-lore-with mirror-lore? raw-cache core))
+
+;; The batched mirror: one pact event per module — the root card
+;; carries the module's entry records as a manifest, and the in-kernel
+;; pact expansion commits the whole subtree in one epoch.  ~40 events
+;; instead of ~1,500; the commit machinery (gate/prepare, zipper walk,
+;; ledger pin) is paid per subtree, and shared spine nodes mint once.
+(define (boot-mirror-pact-tasks-lore-with lore? raw-cache core)
+  ((tool ["boot_mirror" "batches"]) boot-doc-text
+    (describe-cache 0 lore? raw-cache)))
+
+(define (boot-mirror-pact-tasks-with raw-cache core)
+  (boot-mirror-pact-tasks-lore-with mirror-lore? raw-cache core))
+
+;; The deferred who-calls upgrade: ONE pact poke at /boot whose
+;; manifest seeds every entry card rebuilt WITH its reference rows.
+;; pact/talk expands it poke-if-present, so the whole tree melds in a
+;; single committed epoch — per-node injection was measured at ~400s
+;; of per-event commit+persist churn; this is one event.  Computing
+;; the ref table (the ~33s the boot no longer pays) happens lazily
+;; when this injects after the listener is up.
+(define (ref-upgrade-task raw-cache core)
+  ((tool ["boot_mirror" "references"])
+    (describe-cache 1 mirror-lore? raw-cache)))
+
+;; Every mirrored entry grouped by its source namespace root:
+;; [[root entry-nodes] ..] — forge's /ns aggregation.
+(define (ns-groups cache)
+  (define names (map (lambda (me)
+    [(map ts (mod-segs (_0 me)))
+     (map (lambda (k) (map ts (drop 1 k))) (entry-own-keys me))]) cache))
+  (map (lambda (g) [(_0 (_0 g)) (_1 g)])
+    ((tool ["boot_mirror" "names"]) names)))
+
+(define (typed-groups cache)
+  (map (lambda (g) [(ts (_0 g)) (_1 g)]) (ns-groups cache)))
+(define (boot-ns-pact-task core raw-cache)
+  ((tool ["boot_mirror" "index_batch"]) (typed-groups raw-cache)))
+(define (boot-ns-index-tasks core raw-cache)
+  ((tool ["boot_mirror" "index_tasks"]) (typed-groups raw-cache)))
+
+;; Compile one module into the shared cache under Try; a failure
+;; leaves the cache unchanged.  -> [cache' ok?]
+(define (cache-compile cache mod)
+  (define r
+    (Try
+      (lambda (z)
+        (let ((cr (foil:compile-mod-cached cache foil:default-subject mod)))
+          (DeepSeq (_0 cr) cr)))
+      0))
+  (If (Eq 1 (Hd r)) [cache 0] [(_0 (_0 r)) 1]))
+
+;; Test fixtures excluded from the boot mirror: compiling ~23 fixture
+;; modules cost more than half the mirror-all roster compile, and the
+;; suites that exercise them compile them themselves.  env_* is the
+;; fixture prefix; the named ones are suite props.  A module absent
+;; here still mirrors on demand through the build chores.
+(define (fixture-module? mod) ((tool ["boot_mirror" "fixture"]) mod))
+(define (mirror-roster mods) ((tool ["boot_mirror" "roster"]) mods))
+
+;; The whole disk roster compiled into the cache: [cache' failed-mods].
+;; Parallel: the roster's leaves share the already-compiled cone
+;; through the base cache and rarely import each other, so they
+;; compile in independent actors (compile-mods-par-cached merges
+;; deterministically, one Try per module).
+(define (compile-roster cache mods)
+  (foil:compile-mods-par-cached cache mods))
+
+;; Fail cards for modules that did not compile: Try each again for
+;; the pretty diagnostic — a broken module is a visible mirror
+;; citizen, exactly like a broken app mount.
+(define (boot-fail-tasks core mods)
+  (define failures (map (lambda (mod)
+    (define r (Try (lambda (z)
+      (DeepSeq (foil:compile-mod foil:default-subject mod) 0)) 0))
+    [(map ts (mod-segs mod))
+      (If (Eq 1 (Hd r)) (foil-render:diag-text (_0 r))
+        "compiles alone; failed against the boot cache")]) mods))
+  ((tool ["boot_mirror" "fail_tasks"]) failures))
+
+;; Fold tasks into a sovereign through the compiled kernel: every node
+;; arrives as an ordinary committed event.  A failed event dies loudly
+;; — threading its ovum/fail on as the sovereign would corrupt the fold.
+(define (seed-tasks core sov tasks)
+  (define result ((tool ["boot_mirror" "seed"]) tasks sov))
+  (If (Eq (Hd result) "/boot/compiler_seed/ready") (_0 result)
+    (error ["seed-task-failed" (_0 result) (_1 result)])))
+
+(define (seed-boot core sov)
+  (seed-tasks core sov (boot-mirror-tasks-with (core-cache core) core)))
+
+;;; The namespace as compile cache ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Read one module's cache row back out of a sovereign's /boot
+;; mirror: the ['sub] slot on the module's file node carries the
+;; row's six durable fields as a pin (foil.rvr cache-entry).  The
+;; pin rides back onto the row, so re-mirroring a hydrated cache
+;; re-lands the SAME pin.  0 when the node or slot is absent.
+(define (hydrate-cache core sov mods)
+  (define pins ((tool ["boot_mirror" "hydrate"])
+    (map (lambda (mod) (map ts (mod-segs mod))) mods) sov))
+  (map (lambda (p)
+    (If (IsPin p)
+      (let ((row (Unpin p)))
+        (If (Ge (Sz row) 6) (Weld row [p])
+          (error "invalid compiler cache image")))
+      (error "compiler cache image is not a pin"))) pins))
+
+(define (hydrate-mod core sov mod)
+  (define rows (hydrate-cache core sov [mod]))
+  (Ifz rows 0 (_0 rows)))
+
+;; A hydrated module's subject, for suites that pin one module's
+;; world: (sut-of cache "sept") replaces the corpus tiers' sept-sut.
+(define (cache-sut-of cache mod)
+  (define hit (find (lambda (e) (Eq mod (_0 e))) cache))
+  (Ifz hit
+    (error ["cache-sut-of: module not in cache" mod])
+    (_1 (_0 hit))))
+
+;;; Application mounting (doc/shrine-apps.md section 6) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; App names discovered on disk: one folder per app under foil/apps
+;; (module apps/<name>/main).  ReadFolder rides the event log, so a
+;; recorded boot replays the same scan; 0 means no apps.
+(define (discover-apps z)
+  (define r (ReadFolder "foil/apps"))
+  (Ifz r [] (map (Ix 1) (filter (lambda (e) (Eq 1 (Ix 0 e))) r))))
+
+;; A file's text, or 0 when absent/empty (ReadFile throws on missing;
+;; the probe is how an app declares which layers it has).
+(define (probe-file path)
+  (define r (Try (lambda (z) (let ((s (read-text-file path))) (DeepSeq s s))) 0))
+  (If (Eq 1 (Hd r)) 0 (_0 r)))
+
+;; Compile one app against the shared core cache and pull its
+;; manifest.  An app is main.foil (code: forms, views, its own mani),
+;; main.grove (spec: typing, structural seeds, kook refs — compiled
+;; through grove's tree seam), or both — welded through the core's
+;; own pact functions (mani/weld_spec, mani/adopt_spec), so every
+;; seed adopts the contract the yoke assigns it.  The whole step runs
+;; under Try — one bad app never costs the boot.  mani-ok is the
+;; core's brand gate (brands are shared through the cache, so the
+;; core's pact/form applies to the app's mani directly).
+;; -> [cache' ["OK" mani] | ["ERR" err]]
+(define (err-cord e)
+  (define r (Try (lambda (z) (foil-render:diag-flat e)) 0))
+  (If (Eq 1 (Hd r)) "unrenderable error" (_0 r)))
+
+
+;; Compiler operations expose typed results; Foil owns discovery order,
+;; manifest composition, catalog folding, and cache rollback on failure.
+(define (optional-manifest sut)
+  (define hit (Try (lambda (z) (foil:source-entry-val ["app"] sut)) 0))
+  (If (Eq 1 (Hd hit)) "/boot/maybe/none"
+    (let ((value (_0 hit)))
+      (If ((foil:source-entry-val ["mani" "ok"] sut) value)
+        ("/boot/maybe/some" value)
+        (error "app-entry-not-mani")))))
+(define (compile-code cache mod)
+  (define result (foil:compile-mod-cached cache foil:default-subject mod))
+  ("/boot/app_compiled" (_0 result) (optional-manifest (_1 result))
+    "/boot/maybe/none"))
+(define (compile-grove cache name source)
+  (define result (foil:compile-rex-cached cache foil:default-subject
+    (strcat ["apps/" name "/main_spec"]) (grove:grove-tree name source)))
+  ("/boot/app_compiled" (_0 result) (optional-manifest (_1 result))
+    ("/boot/maybe/some" (foil:source-entry-val ["spec"] (_1 result)))))
+(define (app-attempt thunk)
+  (define result (Try (lambda (z) (let ((r (thunk 0))) (DeepSeq r r))) 0))
+  (If (Eq 1 (Hd result))
+    ("/boot/app_attempt/failed" (err-cord (_0 result)))
+    ("/boot/app_attempt/ready" (_0 result))))
+(define app-ports
+  ("/boot/app_compile_ports" probe-file compile-code compile-grove app-attempt))
+(define (legacy-app-result result)
+  (If (Eq (Hd result) "/boot/app_manifest/ready") ["OK" (_0 result)]
+    ["ERR" (_0 result)]))
+(define (compile-app core cache name)
+  (define built ((tool ["app_compile" "one"]) app-ports cache name))
+  [(_0 built) (legacy-app-result (_1 built))])
+(define (compile-apps core cache names)
+  (define built ((tool ["app_compile" "many"]) app-ports cache names))
+  [(_0 built) (map (lambda (entry)
+    [(_0 entry) (legacy-app-result (_1 entry))]) (_1 built))])
+
+;; Error text for the fail card: the diagnostic renderer's flat walk
+;; (atoms, located blurbs, nested rows — no more "opaque"); the Trace
+;; carries the full value.
+;; The host's grant decision for one app, capped by what the app
+;; asked for: a grant never exceeds the ask, so ['grants] is always a
+;; subset of ['wants] and the gap between them reads as denial.  The
+;; policy is "all" (allow whatever is asked — x/lain's dev default) or
+;; a row of [name allow-fetch allow-serve] flags; anything not named
+;; is DENIED, so the default ([]) is deny-all.
+;; -> [gfetch gport]
+(define (typed-policy policy)
+  (If (Equal policy "all") "/boot/app_policy/all"
+    ("/boot/app_policy/only"
+      (map (lambda (g) ("/boot/app_grant" (_0 g) (_1 g) (_2 g))) policy))))
+
+(define (grants-for policy name want-fetch want-port)
+  ((tool ["app_install" "grants"]) (typed-policy policy) name want-fetch want-port))
+
+(define (install-fn core ar policy)
+  (define catalog (map (lambda (entry)
+    (define result (_1 entry))
+    ("/boot/app_catalog_entry" (_0 entry)
+      (If (Eq "ERR" (_0 result))
+        ("/boot/app_manifest/failed" (err-cord (_1 result)))
+        ("/boot/app_manifest/ready" (_1 result))))) ar))
+  (define install (tool ["app_install" "card"]))
+  (define grants (typed-policy policy))
+  (lambda (input cur) (install catalog grants input)))
+
+;; The default install root: ['app <name>] — roots is a [[name root]..]
+;; override table for apps that own a top-level root of their own
+;; (the chat app lives at /chat).  Shared, because a remount has to
+;; reach the same root the install landed at (helm-sync.rvr).  Apps
+;; are NOT mounted at boot: /boot mirrors every compiled module (the
+;; catalog), and a warp of /kook/install at the chosen root is the
+;; explicit install.
+(define (mount-root roots name)
+  ((tool ["app_install" "root"]) roots name))
+
+(define app-roots
+  [["chat" [("ts" "chat")]] ["nenex" [("ts" "nenex")]]])
+
+;;; Boot-time doctest sweep (doc/doctest-runner-explorer.md part I) ;;;;;;;;;;;;;;;;;
+
+;; On: the image boots born-verified — every documented entry carries
+;; its verdict from the start (the explorer renders the chips).  Flip
+;; to 0 to shed the cost; /io/doctest re-runs anything on demand.
+;; This sweep stays synchronous in MAIN deliberately: running every
+;; doctest here is what compiles the eval pipeline's call graph, so
+;; the chore driver's leaf actors (helm-chore.rvr) only replay
+;; compiled paths — it IS the warming the off-MAIN runs rely on.
+(define doctest-sweep? 0)  ;; TEMP: off for the boot check
+
+;; Verdict tasks for every documented entry with tests, evaluated
+;; against the owning module's cache-entry subject (apps compile after
+;; the core chain, so the core's subject cannot resolve app-local
+;; names).  The staleness anchor and the make/poke choice read against
+;; the supplied sovereign; verdicts ride /dt CHILD nodes, so one
+;; verdict never moves another node's anchor and the whole batch is
+;; sound against one snapshot.  Lazy: forcing task i runs entry i's
+;; doctests, nothing else — the serve injects these AFTER listening.
+(define (doctest-attempt thunk)
+  (define result (Try (lambda (z) (let ((r (thunk 0))) (DeepSeq r r))) 0))
+  (If (Eq 1 (Hd result)) "/boot/maybe/none"
+    ("/boot/maybe/some" (_0 result))))
+(define doctest-ports
+  ("/boot/doctest_ports" Now doctest-attempt
+    (lambda (task) (Trace ["doctest-sweep: poke failed"] 0))))
+
+;; Extract compiler-owned lore and one evaluation context per module.
+;; Foil decides which work to execute and where/how to publish it.
+(define (doctest-work raw-cache)
+  (foldl (lambda (acc me)
+    (define lore (entry-lore me))
+    (define subject (doctest:bundle-with (foil:entry-world me) (_1 me)))
+    (define (work name)
+      (define hit (foil-lore:lore-for lore name))
+      (Ifz hit []
+        (let ((item (_0 hit)))
+          [("/boot/doctest_work"
+            (Ifz name (Weld [("ts" "boot")] (map ts (mod-segs (_0 me))))
+              (boot-ent-node (_0 me) name))
+            (Sz (foil-lore:lore-tests item))
+            (lambda (z) (doctest:run-lore subject item)))])))
+    (Weld acc (Weld (work [])
+      (foldl (lambda (out k) (Weld out (work (drop 1 k))))
+        [] (entry-own-keys me)))))
+    [] (filter (lambda (e) (Lt 5 (Sz e))) raw-cache)))
+(define (doctest-tasks raw-cache core sov)
+  ((tool ["boot_doctest" "tasks"]) doctest-ports (doctest-work raw-cache) sov))
+(define (seed-doctests raw-cache core sov)
+  ((tool ["boot_doctest" "seed"]) doctest-ports
+    (doctest-tasks raw-cache core sov) sov))

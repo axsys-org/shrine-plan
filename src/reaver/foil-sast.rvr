@@ -16,6 +16,8 @@
 (#bind foil-surface (#module foil-surface))
 (#import foil-surface)
 
+(#bind foil-builder (#module foil-builder))
+
 ;;; Parser helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (split-once f x)
@@ -465,11 +467,14 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
               (foldl Weld [] (map call-args (drop 1 kids)))))))
       (else (sast-error "bad method segment" seg))))
   ;; A receiver is a bare name (stored as its string, resolved by
-  ;; elab-var) or an explicitly parenthesized expression (stored as its
+  ;; elab-var), a literal, or a parenthesized expression (stored as its
   ;; parsed SAST — elab-meth tells them apart by IsApp).
   (define (parse-recv r)
     (cond
       ((rx-word? r) (rx-word-str! r))
+      ((rx-shape? "cord" r)
+        (surf-cast (surf-ref ["str"]) (cont r)))
+      ((rx-literal? r) (cont r))
       ((And (rx-nest? r) (Eq "paren" (rx-nest-color r))) (cont r))
       ((rx-rune? "#" r)
         (sast-error-at r "flip (#) applies to a call head, not a method receiver" els))
@@ -865,9 +870,23 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
                   []
                   fk))))))
       (else (sast-error "wack rune" val))))
+  (define (builder-parse-heir x heir)
+    (handle-rune (rx-nest-rune x) (rx-nest-kids x) heir))
+  (define (builder-start kids rest)
+    (unless (Sz kids)
+      (sast-error "builder activation (~) requires a namespace" val)
+      (let ((ns (parse-type-sast (_0 kids))))
+        (unless (Eq "s_ref" (_0 ns))
+          (sast-error "builder namespace must be a path" (_0 kids))
+          (surf-cast (surf-tapp [(surf-ref ["row"])
+              (surf-ref (Weld (surf-ref-path ns) ["child"]))])
+            (foil-builder:builder-expand parse-val-sast parse-type-sast builder-parse-heir sast-error
+              (surf-ref-path ns) (Weld (drop 1 kids) rest)))))))
   (define (parse-body-go kids tail)
     (cond
       ((Eq 0 (Sz kids)) tail)
+      ((rx-rune? "~" (_0 kids))
+        (builder-start (rx-rune-kids (_0 kids)) (drop 1 kids)))
       ((And (Eq foil-no-heir tail) (spec-juxt? kids)) (parse-spec kids))
       ((And (Eq foil-no-heir tail) (Eq 1 (Sz kids)))
         (parse-val-sast (_0 kids)))
@@ -984,6 +1003,9 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
     (define kids (rx-nest-kids nes))
     (cond
       ((Eq "" rune) (parse-body kids))
+      ((Eq "~" rune) (builder-start kids []))
+      ((foil-builder:builder-form? nes)
+        (sast-error "builder form requires an enclosing ~ namespace" nes))
       ((Eq "/" rune) (parse-path-val kids))
       ;; %/name — a current-namespace reference in value position.
       ((Eq "%/" rune) (parse-road [nes]))

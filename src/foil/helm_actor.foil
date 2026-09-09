@@ -1,0 +1,181 @@
+-  sept [order=10]
+-  shrine_types [order=20]
+-  shrine [order=30]
+-  lain_types [order=38]
+-  lain_peek [order=39]
+-  lain_poke [order=40]
+-  helm [order=80]
+'  Coordinator policy and ordered actor lifecycle. Capability numbers
+'  are private to the transport adapter and never namespace data.
++  actor_request
+  & actor_request/cmd actor_request/task actor_request/query
+    actor_request/read actor_request/case actor_request/crew
+    actor_request/handle actor_request/stop actor_request/idle
+  +  cmd
+    : name=iota command=task
+  +  task
+    : command=task
+  +  query
+    : target=path
+  +  read
+    : target=path
+  +  case
+    : target=path
+  +  crew
+    :
+  +  handle
+    : name=iota
+  +  stop
+    :
+  +  idle
+    :
++  actor_envelope
+  : request=actor_request reply=nat typed=bool
++  actor_reply
+  & actor_reply/done actor_reply/query actor_reply/read
+    actor_reply/case actor_reply/crew actor_reply/handle
+    actor_reply/bye
+  +  done
+    : result=rsvp
+  +  query
+    : record=res[myth]
+  +  read
+    : target=path record=res[myth] typed=bool
+  +  case
+    : target=path version=maybe[nat]
+  +  crew
+    : names=path
+  +  handle
+    : actor=maybe[nat]
+  +  bye
+    :
++  actor_member
+  : name=iota handle=nat
++  actor_turn
+  : state=helm duties=row[duty] result=rsvp
+    spill=maybe[iota] issues=row[delivery_issue]
++  actor_ports
+  : recv={\ nat}actor_envelope
+    birth={\ iota res[myth]}nat
+    send={\ nat driver_in}nat
+    reply={\ nat actor_reply}nat
+    persist={\ helm}nat
+    attempt={\ {\ nat}actor_turn}maybe[actor_turn]
+    report={\ maybe[iota] row[delivery_issue]}nat
++  helm_actor
+  +  lookup
+    \ name=iota crew=row[actor_member]
+    ^ maybe[nat]
+    | crew.fold (maybe/none[nat])
+    \ found item
+    ? (eq_iota name item.name) (./some item.handle)
+    found
+  +  send
+    \ ports=actor_ports crew=row[actor_member]
+      name=iota message=driver_in
+    ^ nat
+    ?> (./some handle) (helm_actor/lookup name crew) 0
+    (ports.send handle message)
+  +  duties
+    '  Acks use the pre-turn roster, including replaced actors.
+    \ ports=actor_ports before=row[actor_member] ds=row[duty]
+    ^ row[actor_member]
+    | ds.fold before
+    \ ;current=row[actor_member] d=duty
+    ^ row[actor_member]
+    ? d
+     > (./birth name rec)
+       = ;handle (ports.birth name rec)
+       current.snoc((actor_member name handle))
+     > (./fell name)
+       ; | helm_actor/send ports current name .die
+       | current.keep (\ item !(eq_iota name item.name))
+     > (./tell name target rec)
+       ; | helm_actor/send ports current name
+         (driver_in/change target rec)
+       current
+     > (./view name dep rec)
+       ; | helm_actor/send ports current name (driver_in/view dep rec)
+       current
+     > (./ack name result)
+       ; | helm_actor/send ports before name (driver_in/ack result)
+       current
+  +  execute
+    \ src=maybe[iota] command=task state=helm
+    ^ actor_turn
+    = [next duties result spill issues]
+        | helm/exec src command state
+    | actor_turn next duties result spill issues
+  +  turn
+    \ ports=actor_ports src=maybe[iota] command=task
+      state=helm crew=row[actor_member]
+    ^ [state=helm crew=row[actor_member] result=rsvp]
+    = invoke ports.attempt
+    = ;attempt
+        | invoke
+        \ _=nat
+        | helm_actor/execute src command state
+    ? attempt
+     > .none
+       = failure | rsvp/no 'task_crashed
+         duties=row[duty]
+           ? src
+            > (./some name) [(duty/ack name failure)]
+           []
+       = ;actors | helm_actor/duties ports crew duties
+       [state actors failure]
+     > (./some next)
+       ; (ports.report next.spill next.issues)
+       ; (ports.persist next.state)
+       = ;actors | helm_actor/duties ports crew next.duties
+       [next.state actors next.result]
+  +  loop
+    \ ports=actor_ports state=helm crew=row[actor_member]
+    ^ nat
+    = reply ports.reply
+    = ;event (ports.recv 0)
+    ? event.request
+     > (./cmd name command)
+       = ;[next actors result]
+           | helm_actor/turn ports (./some name) command state crew
+       | _ ports next actors
+     > (./task command)
+       = ;[next actors result]
+           | helm_actor/turn ports .none command state crew
+       ; | reply event.reply (actor_reply/done result)
+       | _ ports next actors
+     > (./query target)
+       ; | reply event.reply
+         (actor_reply/query (x_query_h state.sov.top target state.sov))
+       | _ ports state crew
+     > (./read target)
+       ; | reply event.reply
+         (actor_reply/read target
+           (x_query_h state.sov.top target state.sov) event.typed)
+       | _ ports state crew
+     > (./case target)
+       ; | reply event.reply
+         (actor_reply/case target (x_case_h 0 target state.sov))
+       | _ ports state crew
+     > .crew
+       ; | reply event.reply
+         (actor_reply/crew crew.map((\ item item.name)))
+       | _ ports state crew
+     > (./handle name)
+       ; | reply event.reply
+         (actor_reply/handle (helm_actor/lookup name crew))
+       | _ ports state crew
+     > .stop
+       ; | crew.fold 0
+         (\ ;prev=nat item=actor_member
+           (ports.send item.handle .die))
+       | reply event.reply .bye
+     > .idle
+       | _ ports state crew
+  +  run
+    \ ports=actor_ports seed=sov
+    ^ nat
+    = [state duties] | helm/boot seed
+    ; (ports.persist state)
+    = ;actors | helm_actor/duties ports [] duties
+    | helm_actor/loop ports state actors

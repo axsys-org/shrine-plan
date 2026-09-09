@@ -10,42 +10,18 @@
 
 (#bind rex (#module rex))
 
-(#bind foil-sast (#module foil-sast))
-
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
 (#bind foil (#module foil))
-(#bind foil-lower (#module foil-lower))
-
 
 ;;; End-to-end execution tests: compile Foil and *run* the compiled PLAN.
-;;; Everything else in the suite asserts on IR shape; these asserts pin
-;;; the calling convention (self=0, args in application order) by
-;;; observing results.
+;;; Runtime results pin the calling convention. Selected assertions also
+;;; inspect representation and diagnostics at the host boundary.
 
-(define (compile-inline txt)
-  (define mod (foil-sast:parse-module-sast 0 (rex:ParseRexNorm txt)))
-  (define elabbed (foil:elab-mod foil:default-subject mod))
-  (define final (foil:materialize-consts elabbed))
-  (define declared
-    (map (lambda (r) (root-path final (_1 r)))
-      (filter (lambda (r) (Eq "s_decl" (_0 r))) mod)))
-  ;; Include ground const-generic materializations as members of the same
-  ;; sealed unit, exactly as the production module compiler does.
-  (define own
-    (uniq (sort cmp-total
-      (Weld declared
-        (map (Ix 0) (subject-entry-delta foil:default-subject final))))))
-  (foil-lower:lower-tc-unit foil:default-subject final own))
-
-;; Kept as an intention-revealing alias for tests specifically exercising
-;; sealing/fixpoints; all inline execution tests now share the production path.
-(define compile-inline-unit compile-inline)
-
-(define (lowered path sut)
-  (foil:source-entry-val path sut))
-
+(#bind cases (#module foil-test-cases))
+(define compile-inline cases:compile)
+(define lowered foil:source-entry-val)
 
 ;;; Argument order ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -70,7 +46,6 @@ assert(Eq 2 (sub2 3 1))
 assert(Eq 4 (apart 1 5))
 assert(Eq 4 (apart 5 1))
 
-
 ;;; Recursion through ~ ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define rec-sut (compile-inline "
@@ -86,7 +61,6 @@ assert(Eq 4 (apart 5 1))
 assert(Eq 0 (triangle 0))
 assert(Eq 6 (triangle 3))
 assert(Eq 15 (triangle 5))
-
 
 ;;; Sealed top-level mutual recursion ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -127,8 +101,8 @@ assert(Eq 15 (triangle 5))
 ;; The two closures form an actual cyclic PLAN graph.  Pin the surrounding
 ;; subjects so the test harness does not recursively pretty-print that graph;
 ;; behavior, including source-order invariance, remains directly observable.
-(define mutual-a (Pin (compile-inline-unit mutual-src-a)))
-(define mutual-b (Pin (compile-inline-unit mutual-src-b)))
+(define mutual-a (Pin (compile-inline mutual-src-a)))
+(define mutual-b (Pin (compile-inline mutual-src-b)))
 assert(Eq 1 ((lowered ["even"] (Unpin mutual-a)) 0))
 assert(Eq 0 ((lowered ["odd"] (Unpin mutual-a)) 0))
 assert(Eq 1 ((lowered ["even"] (Unpin mutual-a)) 10))
@@ -138,7 +112,7 @@ assert(Eq 1 ((lowered ["odd"] (Unpin mutual-b)) 11))
 
 ;; Values participate in the same sealed group: `before` can name a later
 ;; explicitly cast declaration, and permuting the pair changes no behavior.
-(define forward-a (Pin (compile-inline-unit "
+(define forward-a (Pin (compile-inline "
 +  before
   ^  nat
   after
@@ -146,7 +120,7 @@ assert(Eq 1 ((lowered ["odd"] (Unpin mutual-b)) 11))
   ^  nat
   7
 ")))
-(define forward-b (Pin (compile-inline-unit "
+(define forward-b (Pin (compile-inline "
 +  after
   ^  nat
   7
@@ -159,14 +133,11 @@ assert(Eq 7 (lowered ["before"] (Unpin forward-b)))
 
 ;; Sealing makes every path visible, but does not invent a recursive signature:
 ;; the first untyped edge in a cycle still observes the prototype and fails.
-(define untyped-forward-err
-  (Try (lambda (z) (compile-inline "+  left
+(cases:reject "untyped-forward-err" "+  left
   right
 +  right
   left
-")) 0))
-assert(Eq 1 (Hd untyped-forward-err))
-
+")
 
 ;;; Match arms and fallthrough ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -186,7 +157,6 @@ assert(Eq 1 (Hd untyped-forward-err))
 assert(Eq 7 (pick ("some" 7) 3))
 ;; The fallthrough leg must still see the function's own arguments.
 assert(Eq 3 (pick "none" 3))
-
 
 ;;; The bst.foil canary, executed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -220,6 +190,15 @@ assert(Eq 70 (bst-got 7 0 tree10))
 assert(Eq 100 (bst-got 10 0 tree10))
 assert(Eq 0 (bst-has 42 tree10))
 
+(define bst-get (lowered ["bst" "get"] bst-sut))
+(define bst-map (lowered ["bst" "map"] bst-sut))
+assert(Equal ("/boot/bst_maybe/some" 20) (bst-get 2 tree2))
+assert(Equal "/boot/bst_maybe/none" (bst-get 9 tree2))
+(define mapped-tree (bst-map (Add 1) tree2))
+assert(Eq 3 (bst-size mapped-tree))
+assert(Eq 11 (bst-got 1 0 mapped-tree))
+assert(Eq 21 (bst-got 2 0 mapped-tree))
+assert(Eq 31 (bst-got 3 0 mapped-tree))
 
 ;;; Local bindings (=) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -235,7 +214,6 @@ assert(Eq 0 (bst-has 42 tree10))
 (define lets (lowered ["lets"] let-sut))
 assert(Eq 12 (lets 3))
 assert(Eq 3 (lets 0))
-
 
 ;;; Record update via generated set_/over_ methods ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -270,7 +248,6 @@ assert(Equal (mk 9 2) (setx p12 9))
 assert(Equal (mk 1 3) (bumpy p12))
 ;; update is functional: the original is untouched
 assert(Equal (mk 1 2) p12)
-
 
 ;;; Tall (variadic) UFCS ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; A `.` poem takes the receiver and any number of wing segments as
@@ -309,7 +286,6 @@ assert(Equal ((lowered ["mk2"] tall-meth-sut) 5 3)
   ((lowered ["tall"] tall-meth-sut) tp12))
 ;; a parenthesized expression works as the tall receiver
 assert(Eq 8 ((lowered ["tallexp"] tall-meth-sut) 7))
-
 
 ;;; Quip literals ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -400,9 +376,10 @@ assert(Eq "hi" (lowered ["trad_nat"] trad-sut))
 assert(Eq "foo" (lowered ["symish"] aura-sut))
 assert(Eq "foo" (lowered ["natts"] aura-sut))
 assert(Equal ("ts" "foo") (lowered ["pairish"] aura-sut))
-assert(Eq "foo" ((lowered ["widen"] aura-sut) "foo"))
-assert(Eq (Add "foo" 1) ((lowered ["bump"] aura-sut) "foo"))
-assert(Eq "foo" ((lowered ["branchy"] aura-sut) 1))
+(cases:run aura-sut
+ [["widen" ["foo"] "foo"]
+  ["bump" ["foo"] (Add "foo" 1)]
+  ["branchy" [1] "foo"]])
 ;; Path literals: '/foo/bar is a row of iotas; '/ is the empty path.
 (define path-sut (compile-inline "
 +  pathy
@@ -420,12 +397,10 @@ assert(Equal [] (lowered ["rooty"] path-sut))
 assert(Equal [("ts" "a") ("u" 3) ("ta" "b")] (lowered ["mixy"] path-sut))
 
 ;; An aura mismatch is a compile error ('foo is ts, the goal wants tu).
-(define aura-mismatch-err
-  (Try (lambda (z) (compile-inline "+  bad
+(cases:reject "aura-mismatch-err" "+  bad
   ^  nat/tu
   'foo
-")) 0))
-assert(Eq 1 (Hd aura-mismatch-err))
+")
 ;; A trad at a str (nat/tu) goal is the bare cord.
 (define strish-sut (compile-inline (strcat ["
 +  strish
@@ -434,11 +409,10 @@ assert(Eq 1 (Hd aura-mismatch-err))
 "])))
 assert(Eq "foo bar" (lowered ["strish"] strish-sut))
 
-(define quip-tag (lowered ["quip_tag"] quip-sut))
-assert(Eq 1 (quip-tag ("ta" "hello")))
-assert(Eq 2 (quip-tag ("ts" "foo")))
-assert(Eq 0 (quip-tag ("u" 5)))
-
+(cases:run quip-sut
+ [["quip_tag" [("ta" "hello")] 1]
+  ["quip_tag" [("ts" "foo")] 2]
+  ["quip_tag" [("u" 5)] 0]])
 
 ;;; Function-argument variance + by-name linking ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -466,9 +440,8 @@ assert(Eq 0 (quip-tag ("u" 5)))
 "))
 
 assert(Eq 5 (lowered ["varcall"] var-sut))
-(define use-some-fn (lowered ["use_some"] var-sut))
 (define sum-len-fn (lowered ["sum_len"] var-sut))
-assert(Eq 7 (use-some-fn sum-len-fn 7))
+assert(Eq 7 ((lowered ["use_some"] var-sut) sum-len-fn 7))
 assert(Eq 0 (sum-len-fn "vnone"))
 
 ;;; Row builtins, executed ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -485,10 +458,9 @@ assert(Eq 0 (sum-len-fn "vnone"))
   ^  row[nat]
   xs.take(2)
 "))
-(define rowops-cut (lowered ["cut"] rowops-sut))
-(define rowops-front (lowered ["front"] rowops-sut))
-assert(Equal [8 9] (rowops-cut [7 8 9]))
-assert(Equal [7 8] (rowops-front [7 8 9]))
+(cases:run rowops-sut
+ [["cut" [[7 8 9]] [8 9]]
+  ["front" [[7 8 9]] [7 8]]])
 
 ;; A parenthesized expression is a method receiver: an application, and
 ;; a chained method call (whose paren absorbs the "." rune during rex
@@ -507,31 +479,26 @@ assert(Equal [7 8] (rowops-front [7 8 9]))
   ^  row[nat]
   (xs.take(2)).cons(5)
 "))
-(define paren-recv (lowered ["paren_recv"] paren-recv-sut))
-(define paren-recv-chain (lowered ["paren_recv_chain"] paren-recv-sut))
-assert(Eq 2 (paren-recv [7 8 9]))
-assert(Equal [5 7 8] (paren-recv-chain [7 8 9]))
-
+(cases:run paren-recv-sut
+ [["paren_recv" [[7 8 9]] 2]
+  ["paren_recv_chain" [[7 8 9]] [5 7 8]]])
 
 ;;; Elaboration rejections (review round) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; A match arm whose pattern is not a row type has no constructor+arity
 ;; key; it used to miscompile to an `== 0` scrutinee test.
-(define non-row-arm-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "non-row-arm-err" "
 +  bad_arm
   \  x=nat
   ^  nat
   ?  x
    > n=nat (add n 1)
   0
-")) 0))
-assert(Eq 1 (Hd non-row-arm-err))
+")
 
 ;; Duplicate detection and exhaustiveness use the same stored runtime
 ;; constructor/arity keys as lowering.
-(define duplicate-arm-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "duplicate-arm-err" "
 +  dmaybe
   &  ($some nat)
      $none
@@ -542,11 +509,9 @@ assert(Eq 1 (Hd non-row-arm-err))
    > ($some a=nat) a
    > ($some b=nat) b
   0
-")) 0))
-assert(Eq 1 (Hd duplicate-arm-err))
+")
 
-(define non-exhaustive-arm-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "non-exhaustive-arm-err" "
 +  emaybe
   &  ($some nat)
      $none
@@ -555,44 +520,36 @@ assert(Eq 1 (Hd duplicate-arm-err))
   ^  nat
   ?  x
    > ($some a=nat) a
-")) 0))
-assert(Eq 1 (Hd non-exhaustive-arm-err))
+")
 
 ;; Sum options that collide on constructor+arity are unmatchable.
-(define sum-collide-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "sum-collide-err" "
 +  cpt
   :  x=nat y=nat
 +  clash
   &  ($a nat)
      ($a cpt)
-")) 0))
-assert(Eq 1 (Hd sum-collide-err))
+")
 
 ;; Undefined types inside /ty-ap arguments on a *value* entry are
 ;; caught by the module wf pass (which now visits every entry).
-(define lam-wf-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "lam-wf-err" "
 +  bad_lam
   \  xs=list[bogus]
   ^  nat
   0
-")) 0))
-assert(Eq 1 (Hd lam-wf-err))
+")
 
 ;; Wrong number of type arguments: under-application (either wants 2)
 ;; and over-application at an explicit spec site.
-(define under-spec-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "under-spec-err" "
 +  bad_under
   \  x=either[nat]
   ^  nat
   0
-")) 0))
-assert(Eq 1 (Hd under-spec-err))
+")
 
-(define over-spec-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "over-spec-err" "
 +  box
   (@ v)
   +  cell
@@ -602,14 +559,12 @@ assert(Eq 1 (Hd under-spec-err))
 +  bad_over
   ^  nat
   ((box/cell[nat nat] 5).val)
-")) 0))
-assert(Eq 1 (Hd over-spec-err))
+")
 
 ;; The same surplus argument in plain call position (no method chain):
 ;; type-specialize ignores extra args, so only the elab arity check
 ;; rejects this.
-(define over-spec-plain-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "over-spec-plain-err" "
 +  box
   (@ v)
   +  cell
@@ -620,25 +575,21 @@ assert(Eq 1 (Hd over-spec-err))
   ^  nat
   =  c (box/cell[nat nat] 5)
   c.val
-")) 0))
-assert(Eq 1 (Hd over-spec-plain-err))
+")
 
 ;;; Imports (- rune): merge, mount, cycles, and own shadows ;;;;;;;;;;;;;;;;;;;;;
 
 (define vecapp-sut (foil:compile-mod foil:default-subject "vecapp"))
 
 ;; canonical use of an imported type + method
-(define vmain (lowered ["main"] vecapp-sut))
-assert(Eq 11 (vmain 1 2 10 20))
+assert(Eq 11 ((lowered ["main"] vecapp-sut) 1 2 10 20))
 
 ;; a canonical vec satisfies a parameter typed through the mount
 ;; (nominal identity normalizes through canon-path)
-(define vcross (lowered ["cross"] vecapp-sut))
-assert(Eq 4 (vcross 3 4))
+assert(Eq 4 ((lowered ["cross"] vecapp-sut) 3 4))
 
 ;; constructing through the mounted path yields the canonical row
-(define vmounted (lowered ["mounted_make"] vecapp-sut))
-assert(Eq 7 (vmounted 7 9))
+assert(Eq 7 ((lowered ["mounted_make"] vecapp-sut) 7 9))
 
 ;; import cycles are a diagnostic, not a hang — and compile failures
 ;; carry the module name
@@ -653,8 +604,7 @@ assert(Eq "cyca" (Ix 1 (_0 import-cycle-err)))
 ;; regressions: a local type can replace an imported type at the same path.
 (define imported-root-shadow
   (foil:compile-mod foil:default-subject "../foil-bad/collide"))
-(define own-vec-z (lowered ["own_vec_z"] imported-root-shadow))
-assert(Eq 37 (own-vec-z 37))
+assert(Eq 37 ((lowered ["own_vec_z"] imported-root-shadow) 37))
 
 ;; The same rule applies to a member of an additively reopened namespace.
 ;; This local nullary value shadows the imported generic map/get function.
@@ -670,15 +620,13 @@ assert(Eq 1 (Hd duplicate-decl-err))
 assert(Eq "foil-env-duplicate-layer-path"
   (Ix 0 (Ix 2 (_0 duplicate-decl-err))))
 
-;; inline modules cannot import (no file resolution)
-(define inline-import-err
-  (Try (lambda (x) (compile-inline "
+;; The production tree-fed path resolves imports by name.
+(cases:run (compile-inline "
 -  vec
 +  f
   ^  nat
   0
-")) 0))
-assert(Eq 1 (Hd inline-import-err))
+") [["f" [] 0]])
 
 ;; Type arguments with no path form (function types) specialize
 ;; structurally instead of erroring — they can't ride a /ty-ap name.
@@ -715,8 +663,8 @@ assert(Eq "SUT" (Hd fnarg-rec-sut))
   (alsonosuch 2)
 ")) 0))
 assert(Eq 1 (Hd multi-elab-err))
-assert(Eq "foil-new-elab-errors" (Ix 0 (_0 multi-elab-err)))
-assert(Eq 2 (Sz (Ix 1 (_0 multi-elab-err))))
+assert(Eq "foil-new-elab-errors" (Ix 0 (Ix 2 (_0 multi-elab-err))))
+assert(Eq 2 (Sz (Ix 1 (Ix 2 (_0 multi-elab-err)))))
 
 ;;; Every builtin, executed by value ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; The row.drop lesson: a builtin whose only test is its type can be
@@ -808,8 +756,9 @@ assert(Equal [1 0 5 1 7] (lowered ["eitherops"] builtin-sut))
 ;; maybe is a substrate sum whose constructors are the rooted brand cords.
 assert(Equal ("/boot/maybe/some" 4) ((lowered ["mk_some"] builtin-sut) 4))
 assert(Equal "/boot/maybe/none" (lowered ["mk_none"] builtin-sut))
-assert(Eq 4 ((lowered ["unwrap"] builtin-sut) 9 ("/boot/maybe/some" 4)))
-assert(Eq 9 ((lowered ["unwrap"] builtin-sut) 9 "/boot/maybe/none"))
+(cases:run builtin-sut
+ [["unwrap" [9 ("/boot/maybe/some" 4)] 4]
+  ["unwrap" [9 "/boot/maybe/none"] 9]])
 assert(Equal [4 9 1 0 0 1] (lowered ["maybeops"] builtin-sut))
 assert(Equal [1 2 1 5] ((lowered ["rootops"] builtin-sut) 5))
 
@@ -918,62 +867,59 @@ assert(Equal [1 2 1 5] ((lowered ["rootops"] builtin-sut) 5))
 ;; ^ str re-auras a nat: the explicit cast is the one place a bare nat
 ;; (a literal, a nat-typed value) claims an aura; the value is untouched
 assert(Eq 3 (lowered ["three"] text-sut))
-assert(Eq 9 ((lowered ["restr"] text-sut) 9))
-assert(Equal "aA" ((lowered ["cat65"] text-sut) "a"))
+(cases:run text-sut
+ [["restr" [9] 9]
+  ["cat65" ["a"] "aA"]])
 ;; # reverses a saturated call's arguments: the receiver-last builtins
 ;; read left to right, and ## is the identity
-assert(Equal "ab" ((lowered ["fcat"] text-sut) "a" "b"))
-assert(Equal "ab" ((lowered ["tall_flip"] text-sut) "a" "b"))
-assert(Equal [1 2 3 4] ((lowered ["fweld"] text-sut) [1 2] [3 4]))
-assert(Eq 6 ((lowered ["rsub3"] text-sut) 1 2 9))
-assert(Eq 4 ((lowered ["same"] text-sut) 6 2))
-(define flip-partial-err
-  (Try (lambda (x) (compile-inline "
+(cases:run text-sut
+ [["fcat" ["a" "b"] "ab"]
+  ["tall_flip" ["a" "b"] "ab"]
+  ["fweld" [[1 2] [3 4]] [1 2 3 4]]
+  ["rsub3" [1 2 9] 6]
+  ["same" [6 2] 4]])
+(cases:reject "flip-partial-err" "
 +  bad
   \  a=nat
   ^  nat
   (#sub a)
-")) 0))
-assert(Eq 1 (Hd flip-partial-err))
-assert(Equal "hi_bob" ((lowered ["greet"] text-sut) "bob"))
-assert(Equal "pre_x" ((lowered ["pre"] text-sut) "x"))
-assert(Equal "yobang" ((lowered ["bang"] text-sut) "yo"))
-assert(Eq 5 ((lowered ["size"] text-sut) "hello"))
-assert(Equal "el" ((lowered ["mid"] text-sut) "hello"))
-assert(Equal "42" ((lowered ["shown"] text-sut) 42))
-assert(Equal "0" ((lowered ["shown"] text-sut) 0))
-assert(Eq 42 ((lowered ["parsed"] text-sut) "42"))
-assert(Eq 0 ((lowered ["parsed"] text-sut) "4x"))
-assert(Eq 0 ((lowered ["parsed"] text-sut) 0))
-assert(Equal "abc" ((lowered ["symtext"] text-sut) "abc"))
-assert(Eq 3 ((lowered ["symof"] text-sut) "abc"))
-assert(Eq 0 ((lowered ["symof"] text-sut) "a-b"))
-assert(Eq 3 ((lowered ["segtext"] text-sut) ("ts" "foo")))
-assert(Eq 0 ((lowered ["segtext"] text-sut) ("u" 5)))
-assert(Equal "/a/b" ((lowered ["pshow"] text-sut) [("ts" "a") ("ts" "b")]))
-assert(Eq 2 ((lowered ["pparse"] text-sut) "/a/b"))
-assert(Eq 99 ((lowered ["pparse"] text-sut) "bad"))
+")
+(cases:run text-sut
+ [["greet" ["bob"] "hi_bob"]
+  ["pre" ["x"] "pre_x"]
+  ["bang" ["yo"] "yobang"]
+  ["size" ["hello"] 5]
+  ["mid" ["hello"] "el"]
+  ["shown" [42] "42"]
+  ["shown" [0] "0"]
+  ["parsed" ["42"] 42]
+  ["parsed" ["4x"] 0]
+  ["parsed" [0] 0]
+  ["symtext" ["abc"] "abc"]
+  ["symof" ["abc"] 3]
+  ["symof" ["a-b"] 0]
+  ["segtext" [("ts" "foo")] 3]
+  ["segtext" [("u" 5)] 0]
+  ["pshow" [[("ts" "a") ("ts" "b")]] "/a/b"]
+  ["pparse" ["/a/b"] 2]
+  ["pparse" ["bad"] 99]])
 ;; a bare nat never satisfies a str goal on its own (only the ^ cast
 ;; re-auras: see three/restr/cat65 above)
-(define nat-into-str-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "nat-into-str-err" "
 +  bad
   \  n=nat
   ^  nat
   (str/len n)
-")) 0))
-assert(Eq 1 (Hd nat-into-str-err))
+")
 ;; nor does a symbol literal, even under the cast: its spelled aura
 ;; contradicts the claim (nat/ts is not nat/tu - "aura mismatch")
-(define sym-into-str-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "sym-into-str-err" "
 +  bad
   ^  str
   'foo
-")) 0))
-assert(Eq 1 (Hd sym-into-str-err))
+")
 
-;; Inline modules cannot import, but they can reopen builtin
+;; Inline modules can reopen builtin
 ;; namespaces because builtins are already in the default subject.
 (define builtin-ext-sut (compile-inline "
 +  list
@@ -1032,13 +978,11 @@ assert(Eq 1 (Hd reserved-decl-err))
 assert(Eq 5 (lowered ["use_snd"] atat-sut))
 assert(Eq 7 (lowered ["use_plain"] atat-sut))
 
-
 ;;; Const generic parameters: map.foil end to end ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define map-sut (foil:compile-mod foil:default-subject "map"))
 (define mapuser-sut (foil:compile-mod foil:default-subject "mapuser"))
 (define mapuser-rev-sut (foil:compile-mod foil:default-subject "mapuser_rev"))
-
 
 ;; explicit-spec use, two DISTINCT instantiations of the same generic
 assert(Eq 20 (lowered ["mapuse"] map-sut))
@@ -1061,7 +1005,6 @@ assert(Eq "TC" (Hd (got-entry ["boot" "map" "insert"] map-sut)))
   (ty-ap-encode [map-has-base ["nat"] ["lt"]]))
 assert(Eq "IR_ENTRY" (Hd (got-entry map-has-lt-key mapuser-sut)))
 assert(Eq "TC" (Hd (got-entry map-has-base mapuser-sut)))
-
 
 ;;; Constant symbols, literal precision, the autonamer ;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1097,8 +1040,7 @@ assert(Eq 3 (lowered ["give3"] symconst-sut))
 assert(Eq 1 (lowered ["givesym"] symconst-sut))
 
 ;; ... and reject the wrong constant
-(define wrong-const-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "wrong-const-err" "
 +  want3
   \  x=3
   ^  nat
@@ -1106,8 +1048,7 @@ assert(Eq 1 (lowered ["givesym"] symconst-sut))
 +  give4
   ^  nat
   (want3 4)
-")) 0))
-assert(Eq 1 (Hd wrong-const-err))
+")
 
 ;; the autonamer names row fields and accessors after the type
 (define autoname-sut (compile-inline "
@@ -1125,7 +1066,6 @@ assert(Eq 1 (Hd wrong-const-err))
 "))
 assert(Eq 3 (lowered ["mk"] autoname-sut))
 
-
 ;;; Crash-vs-diagnostic sweep ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Anything a .foil source can trigger must land in a recognized
 ;; diagnostic shape — a raw internal tuple is a compiler bug.  "bad rex
@@ -1139,8 +1079,10 @@ assert(Eq 3 (lowered ["mk"] autoname-sut))
    "foil-duplicate-decl" "foil-env-duplicate-layer-path" "foil-in-module"])
 
 (define (recognized-diag? e)
+  (If (And (IsApp e) (Eq "foil-in-module" (Ix 0 e)))
+    (recognized-diag? (Ix 2 e))
   (Or (Eq e "bad rex parse")
-    (And (IsApp e) (includes (Eq (Ix 0 e)) diag-tags))))
+    (And (IsApp e) (includes (Eq (Ix 0 e)) diag-tags)))))
 
 (define crash-corpus
   ["
@@ -1234,7 +1176,6 @@ assert(Eq 3 (lowered ["mk"] autoname-sut))
 (define crash-leaks (filter (lambda (x) x) (map crash-one crash-corpus)))
 assert(Eq 0 (Sz crash-leaks))
 
-
 ;;; Anonymous structural rows ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; [..] in type position is a bare cstr-0 row: runtime head literally
 ;; 0 (PLAN row rep), outside UFCS; consumed by binding + bare faces,
@@ -1290,81 +1231,66 @@ assert(Eq 0 (Sz crash-leaks))
 "))
 
 ;; runtime head is literally 0: the value IS a PLAN row
-(define anon-mk (lowered ["mk"] anon-sut))
-assert(Equal [("some" 5) 6] (anon-mk 5))
-assert(Eq 0 (Hd (anon-mk 5)))
-assert(Equal ("some" 5) (_0 (anon-mk 5)))
-assert(Eq 6 (_1 (anon-mk 5)))
+assert(Equal [("some" 5) 6] ((lowered ["mk"] anon-sut) 5))
+assert(Eq 0 (Hd ((lowered ["mk"] anon-sut) 5)))
+assert(Equal ("some" 5) (_0 ((lowered ["mk"] anon-sut) 5)))
+assert(Eq 6 (_1 ((lowered ["mk"] anon-sut) 5)))
 
 ;; bare faces resolve through a letrec-bound anonymous row
-(define anon-use (lowered ["use"] anon-sut))
-assert(Eq 11 (anon-use 5))
+assert(Eq 11 ((lowered ["use"] anon-sut) 5))
 
 ;; ... and through a TFAC-wrapped anonymous-row parameter
-(define anon-fst2 (lowered ["fst2"] anon-sut))
-assert(Eq 7 (anon-fst2 [7 9]))
+assert(Eq 7 ((lowered ["fst2"] anon-sut) [7 9]))
 
 ;; self-recursion under an anonymous return cast
-(define anon-splitn (lowered ["splitn"] anon-sut))
-assert(Equal [3 0] (anon-splitn 3))
-assert(Equal [3 2] (anon-splitn 23))
+(cases:run anon-sut
+ [["splitn" [3] [3 0]]
+  ["splitn" [23] [3 2]]])
 
 ;; match arm on an anonymous row: key (0, arity)
-(define anon-arm (lowered ["arm_use"] anon-sut))
-assert(Eq 12 (anon-arm [5 7]))
+assert(Eq 12 ((lowered ["arm_use"] anon-sut) [5 7]))
 
 ;; binderless arm patterns bind through the pattern's own faces
-(define anon-arm-free (lowered ["arm_free"] anon-sut))
-assert(Eq 17 (anon-arm-free [5 7]))
+assert(Eq 17 ((lowered ["arm_free"] anon-sut) [5 7]))
 
 ;; anonymous rows as spec arguments: row[[a=nat b=nat]]
-(define anon-addpairs (lowered ["addpairs"] anon-sut))
-assert(Eq 10 (anon-addpairs [[1 2] [3 4]]))
+assert(Eq 10 ((lowered ["addpairs"] anon-sut) [[1 2] [3 4]]))
 
 ;; row builtins still reach cstr-0 receivers that nest as arrays
 (define anon-litlen (lowered ["litlen"] anon-sut))
 assert(Eq 3 anon-litlen)
 
 ;; UFCS face access on an anonymous row is rejected
-(define anon-ufcs-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "anon-ufcs-err" "
 +  bad
   \  p=[a=nat b=nat]
   ^  nat
   p.a
-")) 0))
-assert(Eq 1 (Hd anon-ufcs-err))
+")
 
 ;; named and anonymous rows do not cross-flow, either direction
-(define named-into-anon-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "named-into-anon-err" "
 +  pt
   :  x=nat y=nat
 +  bad2
   \  q=pt
   ^  [x=nat y=nat]
   q
-")) 0))
-assert(Eq 1 (Hd named-into-anon-err))
-(define anon-into-named-err
-  (Try (lambda (x) (compile-inline "
+")
+(cases:reject "anon-into-named-err" "
 +  pt
   :  x=nat y=nat
 +  bad3
   \  q=[x=nat y=nat]
   ^  pt
   q
-")) 0))
-assert(Eq 1 (Hd anon-into-named-err))
+")
 
 ;; stale $ [..] row declarations get the migration diagnostic
-(define dollar-row-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "dollar-row-err" "
 +  pt2
   $  [x=nat y=nat]
-")) 0))
-assert(Eq 1 (Hd dollar-row-err))
-
+")
 
 ;;; Loops (|) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; An immediately-applied lambda: > arms declare typed loop params with
@@ -1416,41 +1342,38 @@ assert(Eq 1 (Hd dollar-row-err))
 "))
 
 ;; the motivating example: counts down to 0
-(define loop-countdown (lowered ["countdown"] loop-sut))
-assert(Eq 0 (loop-countdown 3))
-assert(Eq 0 (loop-countdown 0))
+(cases:run loop-sut
+ [["countdown" [3] 0]
+  ["countdown" [0] 0]])
 
 ;; two loop params, accumulator shape
-(define loop-triangle (lowered ["triangle"] loop-sut))
-assert(Eq 0 (loop-triangle 0))
-assert(Eq 6 (loop-triangle 3))
-assert(Eq 15 (loop-triangle 5))
+(cases:run loop-sut
+ [["triangle" [0] 0]
+  ["triangle" [3] 6]
+  ["triangle" [5] 15]])
 
 ;; the loop body captures an enclosing fn param (k): lambda-lift path
-(define loop-scaled (lowered ["scaled_triangle"] loop-sut))
-assert(Eq 30 (loop-scaled 5 2))
-assert(Eq 45 (loop-scaled 5 3))
+(cases:run loop-sut
+ [["scaled_triangle" [5 2] 30]
+  ["scaled_triangle" [5 3] 45]])
 
 ;; an explicit ^ cast as the loop body's first form still works —
 ;; needed when the recursive result is consumed (not in tail position)
-(define loop-cast (lowered ["cast_loop"] loop-sut))
-assert(Eq 120 (loop-cast 5))
+assert(Eq 120 ((lowered ["cast_loop"] loop-sut) 5))
 
 ;; nested loops: (_ ...) binds the innermost loop
-(define loop-nested (lowered ["nested_loops"] loop-sut))
-assert(Eq 0 (loop-nested 0))
-assert(Eq 10 (loop-nested 3))
+(cases:run loop-sut
+ [["nested_loops" [0] 0]
+  ["nested_loops" [3] 10]])
 
 ;; a self-call arity mismatch inside a loop is rejected
-(define loop-arity-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "loop-arity-err" "
 +  bad_loop
   \  n=nat
   ^  nat
   %  i=nat n
   (_ i i)
-")) 0))
-assert(Eq 1 (Hd loop-arity-err))
+")
 
 ;;; The pail universe ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; `pail` is the open union of nominal row types: any declared row
@@ -1504,40 +1427,35 @@ assert(Eq 1 (Hd loop-arity-err))
    > (./some x)  x.n
    > .none  0
 "))
-(define mk-n (lowered ["mk_n"] pail-sut))
-(define mk-k (lowered ["mk_k"] pail-sut))
-(define p-disc (lowered ["disc"] pail-sut))
-(define p-many (lowered ["many"] pail-sut))
-(define p-reslot (lowered ["reslot"] pail-sut))
 
 ;; runtime heads are the declaration brands
-(define np7 (mk-n 7))
+(define np7 ((lowered ["mk_n"] pail-sut) 7))
 assert(Eq "/boot/npail" (Hd np7))
 assert(Eq 7 (_0 np7))
 ;; dispatch by branded head, fallthrough for the open remainder
-assert(Eq 7 (p-disc np7))
-assert(Eq 2 (p-disc (mk-k [("ts" "a") ("ts" "b")])))
+(cases:run pail-sut
+ [["disc" [np7] 7]
+  ["disc" [((lowered ["mk_k"] pail-sut) [("ts" "a") ("ts" "b")])] 2]])
 ;; heterogeneous pail rows
-assert(Eq 3 (p-many [(mk-n 2) (mk-k [("ts" "a")])]))
+assert(Eq 3 ((lowered ["many"] pail-sut) [((lowered ["mk_n"] pail-sut) 2) ((lowered ["mk_k"] pail-sut) [("ts" "a")])]))
 ;; pail-typed fields in rows (boxed values built host-side by brand)
-assert(Eq 5 (p-reslot ("/boot/boxed" (mk-n 5))))
-assert(Eq 0 (p-reslot ("/boot/boxed" (mk-k []))))
+(cases:run pail-sut
+ [["reslot" [("/boot/boxed" ((lowered ["mk_n"] pail-sut) 5))] 5]
+  ["reslot" [("/boot/boxed" ((lowered ["mk_k"] pail-sut) []))] 0]])
 ;; pail/as[t]: some when the pail carries t's brand, none otherwise
-assert(Equal ("/boot/maybe/some" np7) ((lowered ["as_n"] pail-sut) np7))
-assert(Equal "/boot/maybe/none" ((lowered ["as_n"] pail-sut) (mk-k [])))
-assert(Eq 7 ((lowered ["as_n_val"] pail-sut) np7))
-assert(Eq 0 ((lowered ["as_n_val"] pail-sut) (mk-k [("ts" "a")])))
+(cases:run pail-sut
+ [["as_n" [np7] ("/boot/maybe/some" np7)]
+  ["as_n" [((lowered ["mk_k"] pail-sut) [])] "/boot/maybe/none"]
+  ["as_n_val" [np7] 7]
+  ["as_n_val" [((lowered ["mk_k"] pail-sut) [("ts" "a")])] 0]])
 ;; only declared records inhabit pail: nat and a sum are rejected as t
-(define pail-as-nat-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "pail-as-nat-err" "
 +  bad
   \  p=pail
   ^  maybe[nat]
   (pail/as[nat] p)
-")) 0))
-assert(Eq 1 (Hd pail-as-nat-err))
-(define pail-as-sum-err
-  (Try (lambda (x) (compile-inline "
+")
+(cases:reject "pail-as-sum-err" "
 +  pm
   &  ($some nat)
      $none
@@ -1545,22 +1463,18 @@ assert(Eq 1 (Hd pail-as-nat-err))
   \  p=pail
   ^  maybe[pm]
   (pail/as[pm] p)
-")) 0))
-assert(Eq 1 (Hd pail-as-sum-err))
+")
 
 ;; anonymous rows do not inhabit pail
-(define anon-pail-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "anon-pail-err" "
 +  bad
   \  x=nat
   ^  pail
   [x]
-")) 0))
-assert(Eq 1 (Hd anon-pail-err))
+")
 
 ;; sums do not inhabit pail
-(define sum-pail-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "sum-pail-err" "
 +  pm
   &  ($some nat)
      $none
@@ -1568,12 +1482,10 @@ assert(Eq 1 (Hd anon-pail-err))
   \  x=pm
   ^  pail
   x
-")) 0))
-assert(Eq 1 (Hd sum-pail-err))
+")
 
 ;; a match on a pail without fallthrough is rejected (open universe)
-(define pail-exhaust-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "pail-exhaust-err" "
 +  npail2
   :  n=nat
 +  bad3
@@ -1581,8 +1493,7 @@ assert(Eq 1 (Hd sum-pail-err))
   ^  nat
   ?  p
    > x=npail2  x.n
-")) 0))
-assert(Eq 1 (Hd pail-exhaust-err))
+")
 
 ;;; Type aliases ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; A + declaration whose body is a type expression is a transparent
@@ -1641,11 +1552,9 @@ assert(Eq 1 (Hd pail-exhaust-err))
 "))
 
 ;; runtime rep is the bare row: no wrapper, no brand
-(define al-plen (lowered ["plen"] alias-sut))
-(define al-mk3 (lowered ["mk3"] alias-sut))
-(define al-back (lowered ["back"] alias-sut))
-assert(Eq 2 (al-plen [("ts" "a") ("ts" "b")]))
-assert(Equal [("ts" "q") ("ts" "q") ("ts" "q")] (al-back (al-mk3 ("ts" "q"))))
+(cases:run alias-sut
+ [["plen" [[("ts" "a") ("ts" "b")]] 2]
+  ["back" [((lowered ["mk3"] alias-sut) ("ts" "q"))] [("ts" "q") ("ts" "q") ("ts" "q")]]])
 ;; the alias's own methods win; the target's are still reachable
 assert(Eq 4 ((lowered ["both"] alias-sut) [("ts" "a") ("ts" "b")]))
 ;; inferred raw-variable results preserve the argument's alias identity
@@ -1673,7 +1582,6 @@ assert(Eq 8 ((lowered ["bump"] alias-sut) 7))
   (take (mk p))
 "))
 assert(Eq 1 ((lowered ["use"] alias-gen-sut) [("ts" "a")]))
-
 
 ;;; Relative variants (dot dialect) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; .tag / (./tag args) resolve against the expected type: the goal in
@@ -1795,8 +1703,9 @@ assert(Eq 1 ((lowered ["use"] alias-gen-sut) [("ts" "a")]))
 "))
 
 ;; nominal members: construction, bare nullary, positional binder
-assert(Eq 5 ((lowered ["rdass"] relvar-sut) ((lowered ["mkker"] relvar-sut) 5)))
-assert(Eq 0 ((lowered ["rdass"] relvar-sut) ((lowered ["mknul"] relvar-sut) 0)))
+(cases:run relvar-sut
+ [["rdass" [((lowered ["mkker"] relvar-sut) 5)] 5]
+  ["rdass" [((lowered ["mknul"] relvar-sut) 0)] 0]])
 ;; generic nominal members: instantiated through the expected type
 assert(Eq 3 ((lowered ["rdres"] relvar-sut) ((lowered ["mkres"] relvar-sut) 3)))
 ;; relvar as a call argument (goal from the callee's parameter)
@@ -1812,17 +1721,17 @@ assert(Eq 9 ((lowered ["chain"] relvar-sut) 5))
 ;; derived union members: is_c on every case, try_c on payload cases
 ;; (one field unwraps, a wider case yields the case row); nullary
 ;; cases derive no try_.
-assert(Equal [1 0 3] ((lowered ["isk"] relvar-sut) ((lowered ["mkres"] relvar-sut) 3)))
-assert(Equal [0 1 0] ((lowered ["isk"] relvar-sut) "/boot/res2/nun"))
-assert(Equal [1 0 5] ((lowered ["isker"] relvar-sut) ((lowered ["mkker"] relvar-sut) 5)))
-assert(Equal [0 1 0] ((lowered ["isker"] relvar-sut) ((lowered ["mknul"] relvar-sut) 0)))
-assert(Eq 3 ((lowered ["tryjust"] relvar-sut) ("just" 3)))
-assert(Eq 0 ((lowered ["tryjust"] relvar-sut) "nix"))
-assert(Equal ("/boot/maybe/some" ("pt" 1 2)) ((lowered ["trypt"] relvar-sut) ("pt" 1 2)))
-assert(Equal "/boot/maybe/none" ((lowered ["trypt"] relvar-sut) "no"))
+(cases:run relvar-sut
+ [["isk" [((lowered ["mkres"] relvar-sut) 3)] [1 0 3]]
+  ["isk" ["/boot/res2/nun"] [0 1 0]]
+  ["isker" [((lowered ["mkker"] relvar-sut) 5)] [1 0 5]]
+  ["isker" [((lowered ["mknul"] relvar-sut) 0)] [0 1 0]]
+  ["tryjust" [("just" 3)] 3]
+  ["tryjust" ["nix"] 0]
+  ["trypt" [("pt" 1 2)] ("/boot/maybe/some" ("pt" 1 2))]
+  ["trypt" ["no"] "/boot/maybe/none"]])
 assert(Eq "TC_FFI" (Hd (got-entry-tc ["boot" "res2" "is_nun"] relvar-sut)))
 assert(Eq 1 (Hd (Try (lambda (z) (got-entry-tc ["boot" "res2" "try_nun"] relvar-sut)) 0)))
-
 
 ;;; Brands and binder patterns ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; A `:  T` record is a brand: (T x) constructs, > T[x] binds the
@@ -1896,20 +1805,22 @@ assert(Eq 1 (Hd (Try (lambda (z) (got-entry-tc ["boot" "res2" "try_nun"] relvar-
    > .miss  0
 "))
 
-assert(Eq 5 ((lowered ["unwrap"] brand-sut) ("/boot/wrap" 5)))
-assert(Equal ("/boot/pt" 4 3) ((lowered ["swap"] brand-sut) ("/boot/pt" 3 4)))
-assert(Eq 3 ((lowered ["first"] brand-sut) ("/boot/pt" 3 4)))
-assert(Eq 6 ((lowered ["prsum"] brand-sut) ("/boot/pr" [1 2] 3)))
+(cases:run brand-sut
+ [["unwrap" [("/boot/wrap" 5)] 5]
+  ["swap" [("/boot/pt" 3 4)] ("/boot/pt" 4 3)]
+  ["first" [("/boot/pt" 3 4)] 3]
+  ["prsum" [("/boot/pr" [1 2] 3)] 6]])
 ;; forwarding: b.size reaches row/size through the payload, b.count is bag's own
-assert(Eq 3 ((lowered ["bsize"] brand-sut) ("/boot/bag" [1 2 3])))
-assert(Eq 42 ((lowered ["bcount"] brand-sut) ("/boot/bag" [1 2 3])))
+(cases:run brand-sut
+ [["bsize" [("/boot/bag" [1 2 3])] 3]
+  ["bcount" [("/boot/bag" [1 2 3])] 42]])
 ;; a one-field union case: bound by > res/hit[h] or narrowed by h=res/hit
-assert(Eq 2 ((lowered ["hsize"] brand-sut) ("/boot/res/hit" [1 2])))
-assert(Eq 0 ((lowered ["hsize"] brand-sut) "/boot/res/miss"))
-assert(Eq 2 ((lowered ["hsize2"] brand-sut) ("/boot/res/hit" [1 2])))
+(cases:run brand-sut
+ [["hsize" [("/boot/res/hit" [1 2])] 2]
+  ["hsize" ["/boot/res/miss"] 0]
+  ["hsize2" [("/boot/res/hit" [1 2])] 2]])
 ;; binder arity is checked
-(define brand-arity-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "brand-arity-err" "
 +  wrap
   :  nat
 +  bad
@@ -1917,9 +1828,7 @@ assert(Eq 2 ((lowered ["hsize2"] brand-sut) ("/boot/res/hit" [1 2])))
   ^  nat
   ?  w
    > wrap[x y]  x
-")) 0))
-assert(Eq 1 (Hd brand-arity-err))
-
+")
 
 ;;; ?> bind-or-else ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; ?>  PAT SCRUT / ELSE / REST: on a match REST runs with PAT's
@@ -1977,17 +1886,17 @@ assert(Eq 1 (Hd brand-arity-err))
   (_ (dec v) (add acc v))
 "))
 
-assert(Equal ("just" 5) ((lowered ["guard"] bind-else-sut) 4))
-assert(Eq "nix" ((lowered ["guard"] bind-else-sut) 0))
-assert(Eq 15 ((lowered ["spine"] bind-else-sut) 4))
-assert(Eq 0 ((lowered ["spine"] bind-else-sut) 0))
-assert(Eq 100 ((lowered ["tru"] bind-else-sut) 1))
-assert(Eq 204 ((lowered ["tru"] bind-else-sut) 4))
-assert(Eq 7 ((lowered ["tru"] bind-else-sut) 0))
-assert(Eq 9 ((lowered ["chain2"] bind-else-sut) 4))
-assert(Eq 1000 ((lowered ["chain2"] bind-else-sut) 0))
-assert(Eq 10 ((lowered ["down"] bind-else-sut) 4))
-
+(cases:run bind-else-sut
+ [["guard" [4] ("just" 5)]
+  ["guard" [0] "nix"]
+  ["spine" [4] 15]
+  ["spine" [0] 0]
+  ["tru" [1] 100]
+  ["tru" [4] 204]
+  ["tru" [0] 7]
+  ["chain2" [4] 9]
+  ["chain2" [0] 1000]
+  ["down" [4] 10]])
 
 ;;; Standalone > introduction ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; >  PAT SOURCE / REST: an irrefutable introduction (a one-binding
@@ -2037,17 +1946,17 @@ assert(Eq 10 ((lowered ["down"] bind-else-sut) 4))
   (add a b)
 "))
 
-assert(Eq 7 ((lowered ["two"] standalone-bind-sut) [3 4]))
-assert(Eq 7 ((lowered ["bare"] standalone-bind-sut) [3 4]))
-assert(Eq 16 ((lowered ["scalar"] standalone-bind-sut) 5))
-assert(Eq 5 ((lowered ["guarded"] standalone-bind-sut) 4))
-assert(Eq 0 ((lowered ["guarded"] standalone-bind-sut) 0))
-assert(Eq 9 ((lowered ["gchain"] standalone-bind-sut) 4))
-assert(Eq 1000 ((lowered ["gchain"] standalone-bind-sut) 0))
+(cases:run standalone-bind-sut
+ [["two" [[3 4]] 7]
+  ["bare" [[3 4]] 7]
+  ["scalar" [5] 16]
+  ["guarded" [4] 5]
+  ["guarded" [0] 0]
+  ["gchain" [4] 9]
+  ["gchain" [0] 1000]])
 
 ;; a refutable pattern in the two-child form is an elaboration error
-(define standalone-refutable-err
-  (Try (lambda (z) (compile-inline "
+(cases:reject "standalone-refutable-err" "
 +  opt
   (@@ v)
   &  ($just v)
@@ -2057,20 +1966,16 @@ assert(Eq 1000 ((lowered ["gchain"] standalone-bind-sut) 0))
   ^  nat
   >  (./just v) m
   (inc v)
-")) 0))
-assert(Eq 1 (Hd standalone-refutable-err))
+")
 
 ;; a destructuring annotation the field cannot satisfy is an error
-(define standalone-ann-err
-  (Try (lambda (z) (compile-inline "
+(cases:reject "standalone-ann-err" "
 +  bad
   \  p=[x=nat y=[a=nat]]
   ^  nat
   >  [a=nat b=nat] p
   (add a b)
-")) 0))
-assert(Eq 1 (Hd standalone-ann-err))
-
+")
 
 ;;; Current-namespace references (%/) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; %/x anchors at the namespace position containing the form: the
@@ -2116,16 +2021,15 @@ assert(Eq 1 (Hd standalone-ann-err))
 ;; index from 0)
 assert(Eq 6 (Ix 0 ((lowered ["vec"] cref-sut) 3)))
 assert(Eq 3 (Ix 1 ((lowered ["vec"] cref-sut) 3)))
-;; nested anchoring: %/inner -> deep/inner, %/triple -> deep/inner/triple
+;; Nested anchoring stays within deep/inner.
 assert(Eq 6 ((lowered ["deep"] cref-sut) 2))
-;; a glued faced cref parameter (p=%/pt): span2/pt and vec/pt both
-;; alias pointy, so the value flows across
-assert(Eq 9 ((lowered ["span2"] cref-sut) ((lowered ["vec"] cref-sut) 3)))
+;; The two faced aliases still name the same branded row.
+assert(Eq 9 ((lowered ["span2"] cref-sut)
+             ((lowered ["vec"] cref-sut) 3)))
 
 ;; %/ forms one exact path - no parent search: %/absent under a nested
 ;; declaration must not fall back to a sibling of the parent
-(define cref-exact-err
-  (Try (lambda (z) (compile-inline "
+(cases:reject "cref-exact-err" "
 +  outer
   +  helper
     \  a=nat
@@ -2138,9 +2042,7 @@ assert(Eq 9 ((lowered ["span2"] cref-sut) ((lowered ["vec"] cref-sut) 3)))
   \  n=nat
   ^  nat
   n
-")) 0))
-assert(Eq 1 (Hd cref-exact-err))
-
+")
 
 ;;; Unary type reflection (^ expr) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; (^ expr) reifies the type elaboration assigned to expr as a value
@@ -2203,12 +2105,11 @@ assert(Equal ("nom" ["boot" "pointy"] [])
 ;; the annotation elaborated to — never its current inhabitant
 assert(Equal ("nom" ["pail"] []) ((lowered ["refl_open"] reflect-sut) 0))
 ;; runtime dispatch over the closed descriptor sum
-(define reflect-tagof (lowered ["tagof"] reflect-sut))
-assert(Eq 6 (reflect-tagof (lowered ["refl_lit"] reflect-sut)))
-assert(Eq 13 (reflect-tagof ((lowered ["refl_row"] reflect-sut) 0)))
-assert(Eq 10 (reflect-tagof (lowered ["refl_fun"] reflect-sut)))
-assert(Eq 13 (reflect-tagof ((lowered ["refl_open"] reflect-sut) 0)))
-
+(cases:run reflect-sut
+ [["tagof" [(lowered ["refl_lit"] reflect-sut)] 6]
+  ["tagof" [((lowered ["refl_row"] reflect-sut) 0)] 13]
+  ["tagof" [(lowered ["refl_fun"] reflect-sut)] 10]
+  ["tagof" [((lowered ["refl_open"] reflect-sut) 0)] 13]])
 
 ;;; Pattern tests and booleans ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; ?=(PAT VAL) is 1 when VAL matches PAT (!?= negates); ! and ||
@@ -2244,15 +2145,15 @@ assert(Eq 13 (reflect-tagof ((lowered ["refl_open"] reflect-sut) 0)))
   (gt a b)
 "))
 
-assert(Eq 1 ((lowered ["tst"] booly-sut) ((lowered ["idm"] booly-sut) 4)))
-assert(Eq 0 ((lowered ["tst"] booly-sut) ((lowered ["idm"] booly-sut) 0)))
-assert(Eq 1 ((lowered ["ntst"] booly-sut) ((lowered ["idm"] booly-sut) 4)))
-assert(Eq 0 ((lowered ["ntst"] booly-sut) ((lowered ["idm"] booly-sut) 0)))
-assert(Eq 1 ((lowered ["mix"] booly-sut) "nix" 0))
-assert(Eq 0 ((lowered ["mix"] booly-sut) ("just" 4) 0))
-assert(Eq 1 ((lowered ["mix"] booly-sut) ("just" 4) 9))
-assert(Eq 1 ((lowered ["graded"] booly-sut) 5 3))
-
+(cases:run booly-sut
+ [["tst" [((lowered ["idm"] booly-sut) 4)] 1]
+  ["tst" [((lowered ["idm"] booly-sut) 0)] 0]
+  ["ntst" [((lowered ["idm"] booly-sut) 4)] 1]
+  ["ntst" [((lowered ["idm"] booly-sut) 0)] 0]
+  ["mix" ["nix" 0] 1]
+  ["mix" [("just" 4) 0] 0]
+  ["mix" [("just" 4) 9] 1]
+  ["graded" [5 3] 1]])
 
 ;;; Inline lambdas, bare bindings, and nullary constants ;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Lambdas check against the callee's parameter types (the generic
@@ -2288,11 +2189,11 @@ assert(Eq 1 ((lowered ["graded"] booly-sut) 5 3))
   (applyn (\ v (add v v)) x)
 "))
 
-assert(Eq 15 ((lowered ["useten"] lam-sut) 5))
-assert(Eq 7 ((lowered ["pairs"] lam-sut) 2))
-assert(Eq 4 ((lowered ["pairs"] lam-sut) 1))
-assert(Eq 12 ((lowered ["twice"] lam-sut) 3))
-
+(cases:run lam-sut
+ [["useten" [5] 15]
+  ["pairs" [2] 7]
+  ["pairs" [1] 4]
+  ["twice" [3] 12]])
 
 ;;; Nested variant patterns (key trees) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; A variant pattern inside another pattern contributes a node to the
@@ -2368,27 +2269,30 @@ assert(Eq 12 ((lowered ["twice"] lam-sut) 3))
 
 ;; nested variant in a ?> guard: match binds through the chain, both
 ;; failure shapes (wrong inner member, wrong outer member) take else
-assert(Eq 5 ((lowered ["guard"] deep-sut) ((lowered ["mkk"] deep-sut) 5)))
-assert(Eq 0 ((lowered ["guard"] deep-sut) ((lowered ["mkn"] deep-sut) 0)))
-assert(Eq 0 ((lowered ["guard"] deep-sut) ((lowered ["mko"] deep-sut) 0)))
+(cases:run deep-sut
+ [["guard" [((lowered ["mkk"] deep-sut) 5)] 5]
+  ["guard" [((lowered ["mkn"] deep-sut) 0)] 0]
+  ["guard" [((lowered ["mko"] deep-sut) 0)] 0]])
 ;; tuple-of-variants arms: an anonymous-row pattern needs no test of
 ;; its own but keys a node for the variants inside it
-assert(Eq 1 ((lowered ["tup"] deep-sut) ("just" 3) ("just" 3)))
-assert(Eq 0 ((lowered ["tup"] deep-sut) ("just" 3) ("just" 4)))
-assert(Eq 1 ((lowered ["tup"] deep-sut) "nix" "nix"))
-assert(Eq 0 ((lowered ["tup"] deep-sut) ("just" 3) "nix"))
+(cases:run deep-sut
+ [["tup" [("just" 3) ("just" 3)] 1]
+  ["tup" [("just" 3) ("just" 4)] 0]
+  ["tup" ["nix" "nix"] 1]
+  ["tup" [("just" 3) "nix"] 0]])
 ;; nested nullary member in a ?= test (bare-tag rep at an Ix probe)
-assert(Eq 1 ((lowered ["tstn"] deep-sut) ((lowered ["mkn"] deep-sut) 0)))
-assert(Eq 0 ((lowered ["tstn"] deep-sut) ((lowered ["mkk"] deep-sut) 1)))
-assert(Eq 0 ((lowered ["tstn"] deep-sut) ((lowered ["mko"] deep-sut) 0)))
+(cases:run deep-sut
+ [["tstn" [((lowered ["mkn"] deep-sut) 0)] 1]
+  ["tstn" [((lowered ["mkk"] deep-sut) 1)] 0]
+  ["tstn" [((lowered ["mko"] deep-sut) 0)] 0]])
 ;; nested and flat arms over the same option, explicit fallthrough
-assert(Eq 9 ((lowered ["mix"] deep-sut) ((lowered ["mkk"] deep-sut) 9)))
-assert(Eq 7 ((lowered ["mix"] deep-sut) ((lowered ["mkn"] deep-sut) 0)))
-assert(Eq 2 ((lowered ["mix"] deep-sut) ((lowered ["mko"] deep-sut) 0)))
+(cases:run deep-sut
+ [["mix" [((lowered ["mkk"] deep-sut) 9)] 9]
+  ["mix" [((lowered ["mkn"] deep-sut) 0)] 7]
+  ["mix" [((lowered ["mko"] deep-sut) 0)] 2]])
 ;; a bare arm ahead of a nested one is dead code, rejected at elab
 ;; (its key subsumes the nested arm's key)
-(define shadowed-arm-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "shadowed-arm-err" "
 +  opt
   (@@ v)
   &  ($just v)
@@ -2401,11 +2305,9 @@ assert(Eq 2 ((lowered ["mix"] deep-sut) ((lowered ["mko"] deep-sut) 0)))
    > (./just (./just g)) g
    > .nix                2
   3
-")) 0))
-assert(Eq 1 (Hd shadowed-arm-err))
+")
 ;; nested arms alone do not cover their option: fallthrough required
-(define nested-no-fall-err
-  (Try (lambda (x) (compile-inline "
+(cases:reject "nested-no-fall-err" "
 +  opt
   (@@ v)
   &  ($just v)
@@ -2417,8 +2319,7 @@ assert(Eq 1 (Hd shadowed-arm-err))
    > (./just (./just g)) g
    > (./just .nix)       7
    > .nix                2
-")) 0))
-assert(Eq 1 (Hd nested-no-fall-err))
+")
 
 ;;; The call rune (%) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -2454,18 +2355,13 @@ assert(Eq 1 (Hd nested-no-fall-err))
 "))
 
 ;; 1 + 10*(2 + 10*3) = 321 — a wrong argument order cannot match
-(define kids-and-heir (lowered ["kids_and_heir"] pct-sut))
-assert(Eq 321 (kids-and-heir 3))
+assert(Eq 321 ((lowered ["kids_and_heir"] pct-sut) 3))
 
-(define one-line (lowered ["one_line"] pct-sut))
-assert(Eq 321 (one-line 3))
+assert(Eq 321 ((lowered ["one_line"] pct-sut) 3))
 
-(define paren-form (lowered ["paren_form"] pct-sut))
-assert(Eq 321 (paren-form 3))
+assert(Eq 321 ((lowered ["paren_form"] pct-sut) 3))
 
 ;; a head that is already a call takes the rest as further arguments
-(define call-head (lowered ["call_head"] pct-sut))
-assert(Eq 321 (call-head 3))
-
+assert(Eq 321 ((lowered ["call_head"] pct-sut) 3))
 
 (print "foil-exec tests passed")

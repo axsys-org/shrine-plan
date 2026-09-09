@@ -1,0 +1,79 @@
+;;;; Native ports for foil/helm_actor. No coordinator policy lives here.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind wire (#module helm-wire))
+
+(define (request msg)
+  (define m (wire:driver-command msg))
+  (cond
+    ((Eq (_0 m) "cmd") ("/boot/actor_request/cmd" (_1 m) (_2 m)))
+    ((Eq (_0 m) "task") ("/boot/actor_request/task" (_1 m)))
+    ((Eq (_0 m) "query") ("/boot/actor_request/query" (_1 m)))
+    ((Eq (_0 m) "read") ("/boot/actor_request/read" (_1 m)))
+    ((Eq (_0 m) "case") ("/boot/actor_request/case" (_1 m)))
+    ((Eq (_0 m) "crew") "/boot/actor_request/crew")
+    ((Eq (_0 m) "handle") ("/boot/actor_request/handle" (_1 m)))
+    ((Eq (_0 m) "stop") "/boot/actor_request/stop")
+    (else "/boot/actor_request/idle")))
+
+(define (receive z)
+  (define mc (Recv 0))
+  (define msg (_0 mc))
+  (define caps (_1 mc))
+  ("/boot/actor_envelope" (request msg) (If (Sz caps) (_0 caps) 0)
+    (Eq (Hd msg) "/boot/driver_out/read")))
+
+;; Existing Reaver workers receive their original protocol. Typed workers
+;; accept these notifications through the same boundary codec.
+(define (notification msg)
+  (cond
+    ((Eq (Hd msg) "/boot/driver_in/go") ["go" (_0 msg)])
+    ((Eq (Hd msg) "/boot/driver_in/change") ["change" (_0 msg) (_1 msg)])
+    ((Eq (Hd msg) "/boot/driver_in/view") ["view" (_0 msg) (_1 msg)])
+    ((Eq (Hd msg) "/boot/driver_in/ack") ["ack" (_0 msg)])
+    ((Eq msg "/boot/driver_in/die") ["die"])
+    (else msg)))
+
+(define (send h msg) (wire:send! h (notification msg)))
+
+(define (reply h msg)
+  (define kind (Hd msg))
+  (cond
+    ((Eq kind "/boot/actor_reply/handle")
+      (If (Eq (Hd (_0 msg)) "/boot/maybe/some")
+        (SendCaps h ["handle"] [(_0 (_0 msg))])
+        (Send h ["nohandle"])))
+    (else
+      (wire:send! h
+        (cond
+          ((Eq kind "/boot/actor_reply/done")
+            (If (Eq (Hd (_0 msg)) "/boot/rsvp/no")
+              ["fail" (_0 (_0 msg))] ["done"]))
+          ((Eq kind "/boot/actor_reply/query") (_0 msg))
+          ((Eq kind "/boot/actor_reply/read")
+            (If (_2 msg) ("/boot/driver_in/qres" (_0 msg) (_1 msg))
+              ["qres" (_0 msg) (_1 msg)]))
+          ((Eq kind "/boot/actor_reply/case") ["cres" (_0 msg) (_1 msg)])
+          ((Eq kind "/boot/actor_reply/crew") (_0 msg))
+          (else ["bye"]))))))
+
+(define (attempt thunk)
+  (define result (Try (lambda (z)
+    (let ((value (thunk 0))) (DeepSeq value value))) 0))
+  (If (Eq 1 (Hd result))
+    (Seq (Trace ["helm: task crashed" (_0 result)] 0) "/boot/maybe/none")
+    ("/boot/maybe/some" (_0 result))))
+
+(define (report spill issues)
+  (Seq (If (Eq (Hd spill) "/boot/maybe/some")
+         (Trace ["helm: cascade stopped" (_0 spill)] 0) 0)
+    (If (Sz issues) (Trace ["helm: outbound delivery issues" issues] 0) 0)))
+
+(define (actor run mk-worker persist seed self)
+  (define (birth name record)
+    (define h (Spawn (mk-worker name)))
+    (Seq h (Seq (SendCaps h (DeepSeq record ["go" record]) [0]) h)))
+  (define (save state) (DeepSeq state (persist state)))
+  (run ("/boot/actor_ports" receive birth send reply save attempt report) seed))
