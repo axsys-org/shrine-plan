@@ -1,58 +1,32 @@
-;;;; Validated persistent inputs for native tests and doctests.
+;;;; In-memory new-compiler inputs for native tests and doctests.
 (#bind std (#module std))
 (#import std)
 (#bind reef (#module reef))
 (#import reef)
-(#bind foil (#module foil))
-(#bind subject (#module foil-subject))
-(#bind env (#module foil-env))
+(#bind foil (#module foil-new-env))
+(#bind source (#module foil-source))
 (#bind deps (#module foil-test-deps))
 
-(define (imports entry)
-  (define unit (subject:sut-unit (_1 entry)))
-  (If (env:unit? unit)
-    (cons (env:unit-label unit)
-      (map (lambda (m) (env:layer-label (env:mount-layer m)))
-        (env:unit-mounts unit))) []))
-
 ;; Read the graph that actually produced the cached code, including
-;; generated modules and the original unit labels behind aliases.
+;; generated modules and the defining modules behind test aliases.
 (define (closure cache mod)
   (define (go seen pending)
     (Ifz (Sz pending) seen
       (let* ((name (_0 pending)) (rest (drop 1 pending)))
         (If (includes (Equal name) seen) (go seen rest)
-          (let ((hit (find (lambda (e) (Equal name (_0 e))) cache)))
+          (let ((hit (foil:get-foil-cache name cache)))
             (go (snoc name seen)
-              (Weld rest (If hit (imports (_0 hit)) []))))))))
+              (Weld rest (If hit (foil:perc-dependencies (_0 hit)) []))))))))
   (go [] [mod]))
 
-;; The host invalidates the entire artifact on compiler/generator/spec
-;; changes. For source edits, drop just the affected dependency cones.
 (define (refresh cache changed)
-  (Ifz (Sz changed) cache
-    (filter
-      (lambda (entry)
-        (If (any (lambda (n) (includes (Equal n) changed))
-              (closure cache (_0 entry))) 0 1))
-      cache)))
-
-(define (durable cache)
-  (define used
-    (cat (map (lambda (e)
-                (filter (lambda (n) (If (Equal n (_0 e)) 0 1))
-                  (imports e))) cache)))
-  ;; Import packs relocate every exported TC tree. Keep shared packs for
-  ;; dependencies, but do not construct unused packs for test-only leaves.
-  ;; Both row5 and row6 are supported by the production cache accessors.
-  (map (lambda (e) (take (If (includes (Equal (_0 e)) used) 6 5) e)) cache))
+  (foldl (lambda (kept perc)
+    (If (any (lambda (name) (includes (Equal name) changed))
+          (closure cache (foil:perc-name perc)))
+      kept
+      (foil:put-foil-cache (foil:perc-name perc) perc kept)))
+    foil:empty-foil-cache (foil:cache-results cache)))
 
 (define (prepare cache changed mods)
-  (define current (refresh cache changed))
-  (Seq (print ("TEST-CACHE" "retained" (Sz current)
-                "invalidated" (Sub (Sz cache) (Sz current))))
-    (durable
-      (foldl
-        (lambda (cache mod)
-          (_0 (foil:compile-mod-cached cache foil:default-subject mod)))
-        (deps:prepare current mods) mods))))
+  (foldl (lambda (cache mod) (_0 (source:compile cache mod)))
+    (deps:prepare (refresh cache changed) mods) mods))

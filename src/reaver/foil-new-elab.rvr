@@ -4,10 +4,8 @@
 
 ;; Surface Foil -> the production TC_* IR, checked by foil-new-types.
 ;;
-;; The old FoilType algebra appears only in `legacy-scheme`, the compatibility
-;; seam used when a source program refers to a production builtin.  Every type
-;; produced, stored in a new declaration, compared, or attached to TC below is
-;; a stage-1 newtype value.
+;; Every builtin signature, declaration, and TC annotation uses the shared
+;; type kernel. Old or malformed type payloads fail at the entry boundary.
 
 (#bind std (#module std))
 (#import std)
@@ -26,7 +24,7 @@
 
 (#bind foil-env (#module foil-env))
 (#bind nt (#module foil-new-types))
-(#bind legacy (#module foil-types))
+(#bind core (#module foil-type-core))
 (#bind quip (#module quip))
 (#bind cairn (#module cairn))
 ;; NOTE on profiling: do NOT wrap the lazily-threaded pass state in
@@ -143,129 +141,14 @@
 
 ;;; New builtin type world ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define nat-ref (nt:type-ref ["nat"]))
-
-;; The fourteen kernel auras (doc/aura-spec.md).  aura-tag? gates the
-;; nat/<aura> surface spelling; iota-body is the tagged-pair sum the
-;; goal-directed literal rules recognize.
-(define aura-tags
-  ["dm" "dr" "ds" "f" "r" "rd" "rs" "s" "ta" "ts" "tu" "u" "w" "x"])
-(define (aura-tag? a)
-  (includes (Eq a) aura-tags))
-(define iota-body
-  (nt:tsum
-    (map (lambda (tag)
-      (nt:trow tag [(nt:trow-item 0 nat-ref)]))
-      aura-tags)))
-
-;; The substrate option's brand cords: maybe's constructors ARE these
-;; rooted cords (see the maybe declaration below), and the derived
-;; union members (sum-try-case) build maybe values from them.
-(define maybe-some-brand "/boot/maybe/some")
-(define maybe-none-brand "/boot/maybe/none")
-
-(define (install-core-world world)
-  ;; Every core entry has runtime arity 0 and the "builtin" source; each
-  ;; `builtin` call yields one pipe stage awaiting the world.
-  (define (builtin path scm brand)
-    (lambda (w) (nt:declare-type w path scm brand 0 "builtin")))
-  (pipe world
-    (builtin ["nat"] (nt:mono (nt:tnat 0)) "nat")
-    (builtin ["uint"] (nt:mono (nt:tnat 0)) "uint")
-    (builtin ["bool"] (nt:mono (nt:tnat 0)) "bool")
-    (builtin ["unit"]
-      (nt:mono (nt:trow (print-path ["unit"]) []))
-      (print-path ["unit"]))
-    (builtin ["pail"] (nt:mono nt:tpail) 0)
-    (builtin ["any"] (nt:mono nt:tany) 0)
-    (builtin ["row"]
-      (nt:scheme [(nt:type-param "a")]
-        (nt:tarr (nt:type-var "a")))
-      0)
-    (builtin ["list"]
-      (nt:scheme [(nt:type-param "a")]
-        (nt:tsum
-          [(nt:trow "nil" [])
-           (nt:trow "cons"
-             [(nt:trow-item 0 (nt:type-var "a"))
-              (nt:trow-item 1
-                (nt:type-app ["list"]
-                  [(nt:type-arg (nt:type-var "a"))]))])]))
-      0)
-    ;; either[e a]: the hardcoded result type — error type FIRST, cases
-    ;; err/ok (the < rune propagates err; see elab-prop).  Structural
-    ;; rows with bare tags, like list.
-    (builtin ["either"]
-      (nt:scheme [(nt:type-param "e") (nt:type-param "a")]
-        (nt:tsum
-          [(nt:trow "err"
-             [(nt:trow-item 0 (nt:type-var "e"))])
-           (nt:trow "ok"
-             [(nt:trow-item 0 (nt:type-var "a"))])]))
-      0)
-    ;; maybe[v]: the substrate option type, cases some/none.  Its
-    ;; constructors are the ROOTED cords /boot/maybe/some and
-    ;; /boot/maybe/none - the brand sept.foil's nominal maybe used to
-    ;; carry - so hosts and tests keep the runtime shape
-    ;; ("/boot/maybe/some" x) / "/boot/maybe/none"; option-member-tag
-    ;; reads the last /-segment, so .some/.none still name the cases.
-    ;; Mirror: foil-core-types.rvr maybe-typ; FFI ctors in foil-builtins.
-    (builtin ["maybe"]
-      (nt:scheme [(nt:type-param "v")]
-        (nt:tsum
-          [(nt:trow maybe-some-brand [(nt:trow-item 0 (nt:type-var "v"))])
-           (nt:trow maybe-none-brand [])]))
-      0)
-    (builtin ["iota"] (nt:mono iota-body) 0)
-    ;; Aura'd nat aliases: a sym/str value is a bare nat whose aura
-    ;; rides the type and widens away to plain nat.
-    (builtin ["sym"] (nt:mono (nt:tnat "ts")) 0)
-    (builtin ["str"] (nt:mono (nt:tnat "tu")) 0)
-    ;; The reflection descriptor sum: (^ expr) values.  Closed and
-    ;; non-generic; recursion is by nominal self-reference (a type-app
-    ;; here would be a template node, which wf rejects in resolved
-    ;; types).  Member shapes must stay in sync with the legacy mirror
-    ;; in foil-core-types.rvr (type-typ) and with reflect-encode below.
-    (builtin ["type"]
-      (let ((self (nt:type-ref ["type"])))
-        (nt:mono
-          (nt:tsum
-            [(nt:trow "any" [])
-             (nt:trow "pail" [])
-             (nt:trow "bot" [])
-             ;; An opaque constant: a non-nat const value (a baked
-             ;; comparator, say) that reflection cannot decompose.
-             (nt:trow "opq" [])
-             (nt:trow "nat" [(nt:trow-item "aura" nat-ref)])
-             (nt:trow "cst" [(nt:trow-item "val" nat-ref)])
-             (nt:trow "var" [(nt:trow-item "name" nat-ref)])
-             (nt:trow "arr" [(nt:trow-item "item" self)])
-             (nt:trow "pin" [(nt:trow-item "item" self)])
-             (nt:trow "fun"
-               [(nt:trow-item "args" (nt:tarr self))
-                (nt:trow-item "ret" self)])
-             (nt:trow "sum" [(nt:trow-item "opts" (nt:tarr self))])
-             (nt:trow "rec"
-               [(nt:trow-item "cstr" nat-ref)
-                (nt:trow-item "items"
-                  (nt:tarr
-                    (nt:trow 0
-                      [(nt:trow-item "face" nat-ref)
-                       (nt:trow-item "item" self)])))])
-             (nt:trow "nom"
-               [(nt:trow-item "path" (nt:tarr nat-ref))
-                (nt:trow-item "args" (nt:tarr self))])
-             (nt:trow "gen"
-               [(nt:trow-item "params"
-                  (nt:tarr
-                    (nt:trow 0
-                      [(nt:trow-item "cnst" nat-ref)
-                       (nt:trow-item "name" nat-ref)
-                       (nt:trow-item "cty" self)])))
-                (nt:trow-item "body" self)])])))
-      0)))
-
-(define default-type-world (install-core-world nt:empty-type-world))
+(define nat-ref core:nat-ref)
+(define aura-tags core:aura-tags)
+(define aura-tag? core:aura-tag?)
+(define iota-body core:iota-body)
+(define maybe-some-brand core:maybe-some-brand)
+(define maybe-none-brand core:maybe-none-brand)
+(define install-core-world core:install-core-world)
+(define default-type-world core:default-type-world)
 
 ;; The structural view of the current goal: unfold nominal/application
 ;; layers (bounded, like meth-function's resolve) so alias goals
@@ -364,49 +247,10 @@
 ;; path, and a unit compile derives its TypeWorld by replaying those entries
 ;; over the builtin core.  Materialized /ty-ap overlays are a cache and are
 ;; deliberately not persisted; they re-materialize lazily on lookup.
-(define (subject-entry-tc ent0)
-  (define ent (If (IsPin ent0) (Unpin ent0) ent0))
-  (cond
-    ((Nil (IsApp ent)) 0)
-    ((Eq "TC" (Hd ent)) (_1 ent))
-    ((Eq "IR_ENTRY" (Hd ent)) (_3 ent))
-    (else 0)))
-
-(define (subject-type-declaration world pair)
-  (define tc (subject-entry-tc (_1 pair)))
-  (Ifz (And tc (Eq "TC_TYP" (Hd tc)))
-    world
-    (let* ((path (_0 pair))
-           (inner (tc-typ-inner tc))
-           (scm
-             (cond
-               ((nt:scheme? inner) inner)
-               ((nt:monotype? inner) (nt:mono inner))
-               ;; A TC_TYP whose type is not a stage-1 value is a legacy
-               ;; declaration; the legacy pipeline owns it.
-               (else 0))))
-      (cond
-        ((Nil scm) world)
-        ((nt:type-bound? world path) world)
-        (else
-          (let* ((mono (nt:scheme-body scm))
-                 (brand (If (nt:row-type? mono) (nt:row-cstr mono) 0))
-                 (arity (If (nt:row-type? mono) (Sz (nt:row-items mono)) 0)))
-            (nt:declare-type world path scm brand arity 0)))))))
-
-(define (world-from-layer world subject)
-  ;; One layer's own entry ax; transitive declarations ride the tail
-  ;; layers, folded by world-from-subject head-first (first declaration
-  ;; wins in subject-type-declaration = nearest layer wins).  The
-  ;; slot-8 mount arm this once carried is retired with the hybrid
-  ;; projection.
-  (foldl subject-type-declaration world
-    (rowify (cairn:tapax (sut-ax subject)))))
-
-(define (world-from-subject sut)
-  (lfoldl
-    world-from-layer default-type-world
-    (foil-subject:sut-layers sut)))
+(define subject-entry-tc core:subject-entry-tc)
+(define subject-type-declaration core:subject-type-declaration)
+(define world-from-layer core:world-from-layer)
+(define world-from-subject core:world-from-subject)
 
 (define (compiler-for subject)
   ($NewCompiler subject (world-from-subject subject) []
@@ -423,106 +267,9 @@
     [(foil-subject:derive-vis-inverse subject)]))
 
 
-;;; Legacy builtin signature adapter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; A legacy nominal reference may be a /ty-ap selector whose parts include
-;; template (/ty-var) segments — builtin signatures encode `List a` that
-;; way.  Those become symbolic stage-1 applications; ground selectors and
-;; plain paths stay nominal references.
-(define (legacy-nominal-reference path)
-  (If (Nil (ty-ap-path? path))
-    (nt:type-ref path)
-    (let ((parts (ty-ap-decode path)))
-      (If (Nil (any ty-var-path? parts))
-        (nt:type-ref path)
-        (nt:type-app (_0 parts)
-          (map
-            (lambda (part)
-              (cond
-                ((ty-var-path? part)
-                  (nt:type-arg (nt:type-var (Ix 1 part))))
-                ((ty-val-path? part) (nt:const-arg (Ix 1 part)))
-                (else (nt:type-arg (legacy-nominal-reference part)))))
-            (drop 1 parts)))))))
-
-(define (legacy-monotype compiler typ)
-  (define tag (legacy:type-tag typ))
-  (define (recur c t) (legacy-monotype c t))
-  (define (many c xs) (nt:thread-map recur c xs))
-  (cond
-    ((Eq tag "TBOT") [compiler nt:tbot])
-    ((Eq tag "TANY") [compiler nt:tany])
-    ((Eq tag "TPAIL") [compiler nt:tpail])
-    ((Eq tag "TNAT")
-      [compiler
-       (Ifz (legacy:tnat-cube typ)
-         (nt:tnat 0)
-         (nt:tconst (legacy:tnat-cube typ)))])
-    ((Eq tag "TNOM")
-      [compiler (legacy-nominal-reference (legacy:tnom-ref typ))])
-    ((Eq tag "TVAR") [compiler (nt:type-var (legacy:tvar-index typ))])
-    ((Eq tag "TFAC") (recur compiler (legacy:tfac-val typ)))
-    ((Eq tag "TSELF") (recur compiler (legacy:tself-val typ)))
-    ((Eq tag "TPIN")
-      (let ((r (recur compiler (legacy:tpin-val typ))))
-        [(_0 r) (nt:tpin (_1 r))]))
-    ((Eq tag "TARR")
-      (let ((r (recur compiler (legacy:tarr-item typ))))
-        [(_0 r) (nt:tarr (_1 r))]))
-    ((Eq tag "TFUN")
-      (let* ((ar (many compiler (legacy:tfun-args typ)))
-             (rr (recur (_0 ar) (legacy:tfun-ret typ))))
-        [(_0 rr) (nt:tfun (_1 ar) (_1 rr))]))
-    ((Eq tag "TROW")
-      (let ((r
-              (nt:thread-map
-                (lambda (c pair)
-                  (define i (_0 pair))
-                  (define item (_1 pair))
-                  (define faced (Eq "TFAC" (legacy:type-tag item)))
-                  (define face (If faced (legacy:tfac-face item) i))
-                  (define raw (If faced (legacy:tfac-val item) item))
-                  (let ((ir (recur c raw)))
-                    [(_0 ir) (nt:trow-item face (_1 ir))]))
-                compiler
-                (zip (gen (Sz (legacy:trow-vals typ)) (lambda (i) i))
-                  (legacy:trow-vals typ)))))
-        [(_0 r) (nt:trow (legacy:trow-cstr typ) (_1 r))]))
-    ((Eq tag "TSUM")
-      (let ((r (many compiler (legacy:tsum-opts typ))))
-        [(_0 r) (nt:tsum (_1 r))]))
-    ((Eq tag "TTYP") (recur compiler (legacy:ttyp-type typ)))
-    (else
-      (error ["foil-new-elab" "unsupported legacy builtin type" typ]))))
-
-(define (legacy-scheme compiler typ)
-  (define (go c params t)
-    (define tag (legacy:type-tag t))
-    (cond
-      ((Eq tag "TQUA")
-        (go c (snoc (nt:type-param (legacy:tqua-name t)) params)
-          (legacy:tqua-body-value t)))
-      ((Eq tag "TCQUA")
-        (let ((tr (legacy-monotype c (legacy:tcqua-type t))))
-          (go (_0 tr)
-            (snoc (nt:const-param (legacy:tcqua-name t) (_1 tr)) params)
-            (legacy:tcqua-body t))))
-      (else
-        (let ((r (legacy-monotype c t)))
-          [(_0 r) (nt:scheme params (_1 r))]))))
-  (go compiler [] typ))
-
 (define (normalize-tc compiler tc)
-  (define typ (tc-ty tc))
-  (If (nt:type-value? typ)
-    [compiler tc]
-    (let ((r (legacy-scheme compiler typ)))
-      [(_0 r)
-       (set-tc-ty
-         (Ifz (Sz (nt:scheme-parameters (_1 r)))
-           (nt:scheme-body (_1 r))
-           (_1 r))
-         tc)])))
+  (nt:require-type-value "TC annotation" (tc-ty tc))
+  [compiler tc])
 
 
 ;;; Surface type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

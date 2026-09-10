@@ -1,0 +1,137 @@
+;;;; Metadata follows source ownership, not visible import spellings.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind driver (#module foil-new-env))
+(#bind lore (#module foil-lore))
+(#bind doctest (#module doctest))
+(#bind subject (#module foil-subject))
+
+(define (tree text) (rex:ParseRexNormFile text))
+(define (compile cache name text)
+  (driver:compile-rex cache name (tree text)))
+(define (has key keys) (includes (Equal key) keys))
+(define (must-not-read name) (error ["unexpected read" name]))
+
+(define leaf
+  (compile driver:empty-foil-cache "meta_leaf"
+    "+ answer
+  ' Leaf documentation.
+  ^ nat
+  11
+"))
+(define dep
+  (compile (_0 leaf) "meta_dep"
+    "- meta_leaf
++ token
+  ' A token from the dependency.
+  : value=nat
++ answer
+  ^ nat
+  12
+"))
+(define source
+  "' Metadata module.
+- meta_dep [at=left]
+- meta_leaf
+- meta_dep [at=right]
++ token
+  ' A local token.
+  : value=nat
++ answer
+  ' The local answer.
+  ' ?= (answer 42)
+  ^ nat
+  42
++ copied | left/token right/answer
+")
+(define built (compile (_0 dep) "meta_root" source))
+(define perc (_1 built))
+assert(Equal "meta_root" (driver:perc-name perc))
+assert(Equal ["boot" "meta_root"] (driver:perc-root perc))
+assert(Equal (tree source) (driver:perc-rex perc))
+assert(Equal ["meta_dep" "meta_leaf"]
+  (driver:perc-dependencies perc))
+(define imps (driver:perc-imports perc))
+assert(Equal ["meta_dep" "meta_leaf" "meta_dep"]
+  (map driver:import-module imps))
+assert(Equal [["left"] [] ["right"]]
+  (map driver:import-prefix imps))
+assert(Gt (Ix 3 (driver:import-span (_0 imps))) 0)
+assert(Lt (Ix 2 (driver:import-span (_0 imps)))
+  (Ix 2 (driver:import-span (_2 imps))))
+assert(Equal ["meta_leaf"] (driver:perc-dependencies (_1 dep)))
+assert(Equal [] (driver:perc-dependencies (_1 leaf)))
+
+(define declared (driver:perc-declared-keys perc))
+(define own (driver:perc-own-keys perc))
+assert(Eq 3 (Sz declared))
+assert(has ["boot" "meta_root" "token"] declared)
+assert(has ["boot" "meta_root" "answer"] declared)
+assert(has ["boot" "meta_root" "token" "value"] own)
+assert(has ["boot" "meta_root" "token" "set_value"] own)
+assert(Nil (has ["boot" "meta_root" "token" "value"] declared))
+assert(Nil (has ["boot" "meta_dep" "token"] own))
+assert(Nil (has ["boot" "meta_leaf" "answer"] own))
+assert(Nil (has ["boot" "meta_root" "left" "token"] own))
+assert(Equal own (map (Ix 0) (driver:perc-own-entries perc)))
+assert(Equal (map (lambda (key)
+  (subject:got-entry key (driver:perc-subject perc))) own)
+  (map (Ix 1) (driver:perc-own-entries perc)))
+
+(define docs (driver:perc-lore perc))
+assert(Equal "Metadata module."
+  (lore:lore-head (_0 (lore:lore-for docs []))))
+assert(Equal "A local token."
+  (lore:lore-head (_0 (lore:lore-for docs ["token"]))))
+assert(Nil (lore:lore-for docs ["left" "token"]))
+(define answer-doc (_0 (lore:lore-for docs ["answer"])))
+assert(Eq 1 (Sz (lore:lore-tests answer-doc)))
+(define context (doctest:bundle-with (driver:perc-world perc)
+  (driver:perc-subject perc)))
+assert(Equal [[0 1 0]] (doctest:run-lore context answer-doc))
+(define expression (doctest:eval-text context "(left/token 9)"))
+assert(Eq 0 (Hd expression))
+assert(Equal ("/boot/meta_dep/token" 9) (_0 (_0 expression)))
+(define span (driver:perc-entry-span
+  ["boot" "meta_root" "answer"] perc))
+assert(Gt (Ix 3 span) 0)
+assert(Equal "+ answer" (lore:str-slice (Ix 2 span) 8 source))
+
+;; Cache hits retain complete metadata without consulting the loader.
+assert(Equal built
+  (driver:compile-with must-not-read (_0 built) "meta_root"))
+assert(Equal perc (_0 (driver:get-foil-cache "meta_root" (_0 built))))
+
+;; Specializing an imported const template writes /ty-ap entries in this
+;; compile. Retain them even though they are outside the module root.
+;; Keep this result local: full-cache serialization is a separate task.
+(define (check-const z)
+  (define base (compile driver:empty-foil-cache "meta_const"
+    "+ labeled
+  (@@ n=nat)
+  + number
+    \ ignored=nat
+    ^ nat
+    n
+"))
+  (define use (compile (_0 base) "meta_const_use"
+    "- meta_const [at=c]
++ result | c/labeled/number[7] 0
+"))
+  (define p (_1 use))
+  assert(Eq 7 (driver:get-perc ["result"] p))
+  assert(Gt (Sz (filter subject:ty-ap-path?
+    (driver:perc-own-keys p))) 0)
+  assert(Equal [["boot" "meta_const_use" "result"]]
+    (driver:perc-declared-keys p))
+  1)
+assert(Eq 1 (check-const 0))
+;; File compilation uses the same result API as generated source.
+(define disk (_1 (driver:compile driver:empty-foil-cache "test_fixtures/env_low")))
+assert(Equal "test_fixtures/env_low" (driver:perc-name disk))
+assert(Equal (driver:read-module "test_fixtures/env_low") (driver:perc-rex disk))
+assert(has ["boot" "test_fixtures/env_low" "equal"] (driver:perc-declared-keys disk))
+(print "New-driver metadata tests passed")

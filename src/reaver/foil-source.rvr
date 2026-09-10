@@ -1,0 +1,88 @@
+;;;; Source loading for the sole compiler.
+;;;; Historical order annotations are stripped; imports follow source precedence.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rx (#module foil-rex))
+(#bind driver (#module foil-new-env))
+(#bind sast (#module foil-sast))
+(#bind parse (#module parse))
+(#bind foil-lore (#module foil-lore))
+
+(define (order-option? node)
+  (And (rx:rx-nest? node)
+    (And (Equal "brack" (rx:rx-nest-color node))
+      (And (Equal "=" (rx:rx-nest-rune node))
+        (let ((kids (rx:rx-nest-kids node)))
+          (And (Eq 2 (Sz kids))
+            (And (rx:rx-word? (_0 kids))
+              (Equal "order" (rx:rx-leaf-str (_0 kids))))))))))
+(define (new-imports node)
+  (cond
+    ((rx:rx-nest? node)
+      (let ((kids (rx:rx-nest-kids node)))
+        (rx:rx-nest (rx:rx-span node) (rx:rx-nest-color node)
+          (rx:rx-nest-rune node)
+          (map new-imports
+            (If (Equal "-" (rx:rx-nest-rune node))
+              (filter (lambda (kid) (Nil (order-option? kid))) kids)
+              kids)))))
+    ((rx:rx-juxt? node)
+      (rx:rx-juxt (rx:rx-span node)
+        (map new-imports (rx:rx-juxt-kids node))))
+    (else node)))
+(define (read-module name) (new-imports (driver:read-module name)))
+(define (compile cache name) (driver:compile-with read-module cache name))
+
+(define (compile-rex cache name tree)
+  (driver:compile-with
+    (lambda (mod) (If (Equal mod name) (new-imports tree)
+      (read-module mod))) cache name))
+
+;; Source graph discovery is best-effort; compilation reports malformed files.
+(define (module-imports name)
+  (define found (Try (lambda (z)
+    (force (map driver:import-module
+      (filter driver:mod-import? (sast:parse-module-sast 0 (read-module name)))))) 0))
+  (If (Eq 1 (Hd found)) [] (_0 found)))
+(define (module-closure mods)
+  (define (go seen pending)
+    (Ifz (Sz pending) seen
+      (let ((name (_0 pending)) (rest (drop 1 pending)))
+        (If (includes (Equal name) seen) (go seen rest)
+          (go (snoc name seen) (Weld rest (module-imports name)))))))
+  (go [] mods))
+(define (foil-closure-files mods)
+  (map (lambda (name) (strcat ["foil/" name ".foil"])) (module-closure mods)))
+
+;; Generated import words can name app files directly, retaining their identity.
+(define (import-tree name)
+  (rx:rx-nest 0 "clear" "-" [(rx:rx-leaf 0 "word" name)]))
+
+(define (get-extension fnam) (Last (parse:split-str "." fnam)))
+
+;; "bst.foil" -> "bst" (only called on names known to end in .foil)
+(define (strip-foil fnam)
+  (foil-lore:str-slice 0 (Sub (Bytes fnam) 5) fnam))
+
+;; Module names under a file root: one per .foil file, named the way
+;; the compiler expects — relative to the root, no extension ("bst",
+;; "apps/life/main").
+(define (read-fs-tree root)
+  (define listing (ReadFolder root))
+  (foldl
+    (lambda (acc arg[folder? name])
+      (cond
+        (folder?
+          (Weld acc
+            (map (lambda (m) (strcat [name "/" m]))
+              (read-fs-tree (strcat [root "/" name])))))
+        ((Equal "foil" (get-extension name))
+          (snoc (strip-foil name) acc))
+        (else acc)))
+  [] listing))
+
+
+(define (read-source name)
+  (read-text-file (strcat ["foil/" name ".foil"])))

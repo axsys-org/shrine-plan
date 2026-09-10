@@ -421,84 +421,7 @@
           (define r[uq3 retarget2] (rewriteReturns retf retarget jp))
           [uq3 (cons ($PROC jp joinProc) (procCode retarget2))])))))
 
-;; inlineCallsToProc :: (Key, Proc) -> Proc -> UniqueM Proc
-(define (inlineCallsToProc targetKey targetProc p uq)
-  (define (goBlock b uq2)
-    (define (goProc p2 uqp)
-      (define r[uqx code] (goBlock (procCode p2) uqp))
-      [uqx (mkProc (procArgs p2) code)])
-    (define (goAlloc a uqa)
-      (? Alloc a
-        (CLOSE [uqa a])
-        (DELAY [body]
-          (begin
-            (define r[uqx p2] (goProc body uqa))
-            [uqx ($DELAY p2)]))))
-    (define (goTail s cont uqt)
-      (define r[uqx rest] (goBlock cont uqt))
-      [uqx (cons s rest)])
-    (Ifz (Sz b) [uq2 []]
-      (begin
-        (define s (_0 b))
-        (define cont (drop 1 b))
-        (? Stmt s
-          (CALL [key op args]
-            (begin
-              (define isTargetCall
-                (? Op op
-                  (LOCAL [key] (Eq key targetKey))
-                  (_ 0)))
-              (Ifz isTargetCall
-                (goTail s cont uq2)
-                (begin
-                  (define r[uq3 inlined] (inline key targetProc args cont uq2))
-                  (goBlock inlined uq3)))))
-          (PROC [key body]
-            (If (Eq key targetKey)
-              (goBlock cont uq2)
-              (begin
-                (define r[uq3 p2] (goProc body uq2))
-                (goTail ($PROC key p2) cont uq3))))
-          (BR [x arms]
-            (begin
-              (define rb
-                (foldl
-                  (lambda (acc br)
-                    (begin
-                      (define uqa (_0 acc))
-                      (define done (_1 acc))
-                      (define rp[uqb p2] (goProc (_1 br) uqa))
-                      [uqb (snoc [(_0 br) p2] done)]))
-                  [uq2 []]
-                  arms))
-              (goTail ($BR x (_1 rb)) cont (_0 rb))))
-          (LET [key rhs]
-            (begin
-              (define r[uq3 a2] (goAlloc rhs uq2))
-              (goTail ($LET key a2) cont uq3)))
-          (REC [binds]
-            (begin
-              (define rb
-                (foldl
-                  (lambda (acc kv)
-                    (begin
-                      (define uqa (_0 acc))
-                      (define done (_1 acc))
-                      (define ra[uqb a2] (goAlloc (_1 kv) uqa))
-                      [uqb (snoc [(_0 kv) a2] done)]))
-                  [uq2 []]
-                  binds))
-              (goTail ($REC (_1 rb)) cont (_0 rb))))
-          (_ (goTail s cont uq2))))))
-  (define r[uq2 code] (goBlock (procCode p) uq))
-  [uq2 (mkProc (procArgs p) code)])
-
-;; inlineProcsMap: inlineCallsToProc generalized to a bst of targets
-;; (key -> proc), inlining every call to any of them and dropping
-;; their definitions in ONE walk.  The inlined block is re-walked, so
-;; call sites of other targets inside spliced code are still found.
-;; Used by inlineSingleUseProcs to avoid a full refcount + rescan per
-;; individual target.
+;; Inline every target in one walk, rewalking spliced code for nested calls.
 (define (inlineProcsMap targets p uq)
   (define (goBlock b uq2)
     (define (goProc p2 uqp)
@@ -1558,7 +1481,7 @@
     (else [uq [] ($CNS (law-const e))])))
 
 ;; ingestLaw :: Law|Pin-of-Law -> [depth Proc]
-(define (ingestLaw l)
+(define (ingestLawWith finish l)
   (define la (If (IsPin l) (Unpin l) l))
   (define arity (Arity la))
   (define r[depth letExprs calls] (collect-lets arity (Body la)))
@@ -1573,11 +1496,15 @@
       [depth (Inc arity) []]
       letExprs))
   (define r3[uq2 prefix atom] (ingestExpr depth (_0 lr) calls))
-  (define bodyBlock (snoc ($RET atom) prefix))
+  (define bodyBlock (finish prefix atom))
+  ;; Preserve one REC knot for the delayed let prelude.
   (define block
     (Ifz (Sz (_2 lr)) bodyBlock (cons ($REC (_2 lr)) bodyBlock)))
   (define pargs (gen (Inc arity) (lambda (i) ($ARG i $LAZY))))
   [depth (mkProc pargs block)])
+
+(define (ingestLaw l)
+  (ingestLawWith (lambda (prefix atom) (snoc ($RET atom) prefix)) l))
 
 ;; codegenProc: emit bytecode for an UNOPTIMIZED dumb-IR proc,
 ;; byte-identical to the shipped compiler.  Emission is driven from the
@@ -1712,61 +1639,37 @@
 ;; ingestLawOpt: like ingestLaw, but the body's result position is
 ;; eager.  A body call becomes CALL k2 op atoms; RET (REF k2); other
 ;; bodies are unchanged.
-(define (ingestLawOpt l)
-  (define la (If (IsPin l) (Unpin l) l))
-  (define arity (Arity la))
-  (define r[depth letExprs calls] (collect-lets arity (Body la)))
-  (define lr
-    (lfoldl
-      (lambda (acc ve)
-        (begin
-          (define st[uqa slot binds] acc)
-          (define r2[uqb prefix atom] (ingestExpr depth uqa ve))
-          (define letProc (mkProc [] (snoc ($RET atom) prefix)))
-          [uqb (Inc slot) (snoc [slot ($DELAY letProc)] binds)]))
-      [depth (Inc arity) []]
-      letExprs))
-  (define r3[uq2 prefix atom] (ingestExpr depth (_0 lr) calls))
+(define (eagerTail prefix atom)
   ;; Un-thunk the tail position: when the body atom is the sole use of
   ;; the final LET (DELAY [CALL.. RET..]), replace it with the eager
   ;; call.  (ingestExpr binds the outermost call last.)
-  (define bodyBlock
-    (begin
-      (define n (Sz prefix))
-      (define tailHit
-        (Ifz n 0
-          (? Atom atom
-            (REF
-              (begin
-                (define lastS (Ix (Dec n) prefix))
-                (? Stmt lastS
-                  (LET [key rhs]
-                    (Ifz (Eq key (REF.key atom)) 0
-                      (? Alloc rhs
-                        (DELAY [body]
-                          (? Stmt (_0 (procCode body))
-                            (CALL [key op args] [[key op args]])
-                            (_ 0)))
-                        (CLOSE 0))))
-                  (_ 0))))
-            (CNS 0))))
-      (Ifz tailHit
-        (snoc ($RET atom) prefix)
-        (begin
-          (define c (_0 tailHit))
-          (weld (take (Dec n) prefix)
-            [($CALL (_0 c) (_1 c) (_2 c)) ($RET ($REF (_0 c)))])))))
-  ;; The let-prelude stays one REC knot: judge builds it as a bulk
-  ;; allocation (one reserve, 3-cell kal thunks sharing the env), which
-  ;; beats per-bind MK_THK code for residual-lazy binds — lowering the
-  ;; prelude to LETs at ingest regressed ~16-20% twice.  Instead,
-  ;; dethunkOpt eats INDIVIDUAL knot binds (single-use, force-only);
-  ;; a fully-eaten knot leaves no chain-slot references, max_var drops
-  ;; to the arity, and the law enters chain-free at runtime.
-  (define block
-    (Ifz (Sz (_2 lr)) bodyBlock (cons ($REC (_2 lr)) bodyBlock)))
-  (define pargs (gen (Inc arity) (lambda (i) ($ARG i $LAZY))))
-  [depth (mkProc pargs block)])
+  (begin
+    (define n (Sz prefix))
+    (define tailHit
+      (Ifz n 0
+        (? Atom atom
+          (REF
+            (begin
+              (define lastS (Ix (Dec n) prefix))
+              (? Stmt lastS
+                (LET [key rhs]
+                  (Ifz (Eq key (REF.key atom)) 0
+                    (? Alloc rhs
+                      (DELAY [body]
+                        (? Stmt (_0 (procCode body))
+                          (CALL [key op args] [[key op args]])
+                          (_ 0)))
+                      (CLOSE 0))))
+                (_ 0))))
+          (CNS 0))))
+    (Ifz tailHit
+      (snoc ($RET atom) prefix)
+      (begin
+        (define c (_0 tailHit))
+        (weld (take (Dec n) prefix)
+          [($CALL (_0 c) (_1 c) (_2 c)) ($RET ($REF (_0 c)))])))))
+
+(define (ingestLawOpt l) (ingestLawWith eagerTail l))
 
 ;; recurLower: a saturated call through the self reference (var 0) IS
 ;; recursion — represent it as RECUR (prototype parity: RECUR is the

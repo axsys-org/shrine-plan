@@ -4,21 +4,15 @@
 
 (#bind std (#module std))
 (#import std)
-
 (#bind reef (#module reef))
 (#import reef)
-
 (#bind rex (#module rex))
-
 (#bind foil-rex (#module foil-rex))
-
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
-
-(#bind foil (#module foil))
-
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
 (#bind schemagen (#module schemagen))
-
 (define module-file-stamps
   ["spec/openrouter.json" "spec/openapi-test.json"
    "spec/test-fixtures/schema-txt.json"
@@ -39,960 +33,967 @@
    "spec/test-fixtures/grouped.json"
    "spec/test-fixtures/resv.json"])
 
+(define (check z)
+  ;;; schemagen: JSON schema -> generated foil types + serde, compiled
+  ;;; through the tree-fed seam (source:compile-rex).  Schema and payload
+  ;;; text is host-built (quote bytes can't ride foil literals, and the
+  ;;; fixtures are JSON).
 
-;;; schemagen: JSON schema -> generated foil types + serde, compiled
-;;; through the tree-fed seam (foil:compile-rex).  Schema and payload
-;;; text is host-built (quote bytes can't ride foil literals, and the
-;;; fixtures are JSON).
+  (define q 34)
+  (define (js s) (strcat [q s q]))
+  (define (kv k v) (strcat [(js k) ":" v]))
 
-(define q 34)
-(define (js s) (strcat [q s q]))
-(define (kv k v) (strcat [(js k) ":" v]))
+  ;;; compile-rex identity: a parsed tree compiles like the file did.
 
-;;; compile-rex identity: a parsed tree compiles like the file did.
+  (define jsrc (read-text-file "foil/json.foil"))
+  (define jsut (_1 (source:compile-rex 0 "json"
+                   (rex:ParseRexNormFile jsrc))))
+  (DeepSeq jsut 0)
+  (define jrt (driver:get-perc ["rt"] jsut))
+  assert(Equal "[1,2,3]" (jrt "[ 1 , 2 , 3 ]"))
 
-(define jsrc (foil:get-foil "json"))
-(Seq
-  (define jsut (foil:compile-rex foil:default-subject "json"
-                 (rex:ParseRexNormFile jsrc)))
-  (DeepSeq jsut 0))
-(define jrt (foil:source-entry-val ["rt"] jsut))
-assert(Equal "[1,2,3]" (jrt "[ 1 , 2 , 3 ]"))
+  ;;; The zero-span property: past the tokenizer, spans are diagnostics
+  ;;; only.  A normalized tree with every span zeroed must compile and
+  ;;; behave identically — structure lives in containment, never in
+  ;;; columns or offsets.
 
-;;; The zero-span property: past the tokenizer, spans are diagnostics
-;;; only.  A normalized tree with every span zeroed must compile and
-;;; behave identically — structure lives in containment, never in
-;;; columns or offsets.
+  (define zspan [0 0 0 0])
+  (define (zap r)
+    (cond
+      ((foil-rex:rx-leaf? r)
+        (foil-rex:rx-leaf zspan (foil-rex:rx-leaf-shape r)
+          (foil-rex:rx-leaf-str r)))
+      ((foil-rex:rx-nest? r)
+        (foil-rex:rx-nest zspan (foil-rex:rx-nest-color r)
+          (foil-rex:rx-nest-rune r) (map zap (foil-rex:rx-nest-kids r))))
+      ((foil-rex:rx-juxt? r)
+        (foil-rex:rx-juxt zspan (map zap (foil-rex:rx-juxt-kids r))))
+      (else r)))
 
-(define zspan [0 0 0 0])
-(define (zap r)
-  (cond
-    ((foil-rex:rx-leaf? r)
-      (foil-rex:rx-leaf zspan (foil-rex:rx-leaf-shape r)
-        (foil-rex:rx-leaf-str r)))
-    ((foil-rex:rx-nest? r)
-      (foil-rex:rx-nest zspan (foil-rex:rx-nest-color r)
-        (foil-rex:rx-nest-rune r) (map zap (foil-rex:rx-nest-kids r))))
-    ((foil-rex:rx-juxt? r)
-      (foil-rex:rx-juxt zspan (map zap (foil-rex:rx-juxt-kids r))))
-    (else r)))
+  (define zsut (_1 (source:compile-rex 0 "json"
+                   (zap (rex:ParseRexNormFile jsrc)))))
+  (DeepSeq zsut 0)
+  (define zrt (driver:get-perc ["rt"] zsut))
+  assert(Equal "[1,2,3]" (zrt "[ 1 , 2 , 3 ]"))
+  assert(Equal "expected-comma-or-bracket" (zrt "[1"))
 
-(Seq
-  (define zsut (foil:compile-rex foil:default-subject "json"
-                 (zap (rex:ParseRexNormFile jsrc))))
-  (DeepSeq zsut 0))
-(define zrt (foil:source-entry-val ["rt"] zsut))
-assert(Equal "[1,2,3]" (zrt "[ 1 , 2 , 3 ]"))
-assert(Equal "expected-comma-or-bracket" (zrt "[1"))
-
-;;; Share only production imports.  Every generated fixture starts
-;;; from this same cache; none sees another fixture's declarations.
-(Seq
+  ;;; Share only production imports.  Every generated fixture starts
+  ;;; from this same cache; none sees another fixture's declarations.
   (define imports
-    (_0 (foil:compile-mod-cached
-      (_0 (foil:compile-mod-cached 0 foil:default-subject "json"))
-      foil:default-subject "sept")))
-  (DeepSeq imports 0))
-(define (compile-fixture txt)
-  (_1 (schemagen:compile-schema-cached
-    imports foil:default-subject jsut txt)))
+      (_0 (source:compile
+        (_0 (source:compile 0 "json"))
+        "sept")))
+  (DeepSeq imports 0)
+  (define (compile-fixture txt)
+    (_1 (schemagen:compile-schema-cached
+      imports jsut txt)))
 
-(define (roundtrip schema)
-  (define sut (Ix 2 (compile-fixture schema)))
-  (DeepSeq sut (foil:source-entry-val ["rt"] sut)))
+  (define (roundtrip schema)
+    (define sut (Ix 2 (compile-fixture schema)))
+  (DeepSeq sut (driver:get-perc ["rt"] sut)))
 
-;;; The fixture: a record with required/optional prims, an array, a
-;;; record ref, and an enum ref.
+  ;;; The fixture: a record with required/optional prims, an array, a
+  ;;; record ref, and an enum ref.
 
-(define schema-txt
-  (read-text-file "spec/test-fixtures/schema-txt.json"))
+  (define schema-txt
+    (read-text-file "spec/test-fixtures/schema-txt.json"))
 
-(Seq
   (define g
-    (schemagen:compile-schema foil:default-subject jsut schema-txt))
-  (DeepSeq g 0))
-assert(Equal "task" (_0 g))
-(Seq
+      (schemagen:compile-schema jsut schema-txt))
+  (DeepSeq g 0)
+  assert(Equal "task" (_0 g))
   (define gsut (Ix 2 g))
-  (DeepSeq gsut 0))
-(define rt (foil:source-entry-val ["rt"] gsut))
+  (DeepSeq gsut 0)
+  (define rt (driver:get-perc ["rt"] gsut))
 
-;;; Reusing a generated name must still compile a fresh fixture.
-;;; Keep the cold result as the oracle for the cached entry point.
-(Seq
+  ;;; Reusing a generated name must still compile a fresh fixture.
+  ;;; Keep the cold result as the oracle for the cached entry point.
   (define warm-g (compile-fixture schema-txt))
-  (DeepSeq warm-g 0))
-assert(Equal (_0 g) (_0 warm-g))
-assert(Equal (_1 g) (_1 warm-g))
-(define warm-rt (foil:source-entry-val ["rt"] (Ix 2 warm-g)))
-(Seq
+  (DeepSeq warm-g 0)
+  assert(Equal (_0 g) (_0 warm-g))
+  assert(Equal (_1 g) (_1 warm-g))
+  (define warm-rt (driver:get-perc ["rt"] (Ix 2 warm-g)))
   (define other-g
-    (compile-fixture
-      (strcat ["{" (kv "title" (js "task")) ","
-        (kv "type" (js "object")) ","
-        (kv "required" (strcat ["[" (js "other") "]"])) ","
-        (kv "properties"
-          (strcat ["{" (kv "other"
-            (strcat ["{" (kv "type" (js "integer")) "}"])) "}"]))
-        "}"])))
-  (DeepSeq other-g 0))
-(define other-rt (foil:source-entry-val ["rt"] (Ix 2 other-g)))
-(define other-json (strcat ["{" (kv "other" "7") "}"]))
-assert(Equal other-json (other-rt other-json))
+      (compile-fixture
+        (strcat ["{" (kv "title" (js "task")) ","
+          (kv "type" (js "object")) ","
+          (kv "required" (strcat ["[" (js "other") "]"])) ","
+          (kv "properties"
+            (strcat ["{" (kv "other"
+              (strcat ["{" (kv "type" (js "integer")) "}"])) "}"]))
+          "}"])))
+  (DeepSeq other-g 0)
+  (define other-rt (driver:get-perc ["rt"] (Ix 2 other-g)))
+  (define other-json (strcat ["{" (kv "other" "7") "}"]))
+  assert(Equal other-json (other-rt other-json))
 
-;;; Round-trips: canonical spelling back, optional keys ride only when
-;;; present, order preserved.
+  ;;; Round-trips: canonical spelling back, optional keys ride only when
+  ;;; present, order preserved.
 
-(define t-min (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") "}"]))
-assert(Equal t-min (rt t-min))
-assert(Equal (rt t-min) (warm-rt t-min))
+  (define t-min (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") "}"]))
+  assert(Equal t-min (rt t-min))
+  assert(Equal (rt t-min) (warm-rt t-min))
 
-(define t-full
-  (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-           (kv "count" "3") ","
-           (kv "tags" (strcat ["[" (js "x") "," (js "y") "]"])) ","
-           (kv "peer" (strcat ["{" (kv "host" (js "h")) "," (kv "port" "80") "}"])) ","
-           (kv "hue" (js "red")) "}"]))
-assert(Equal t-full (rt t-full))
+  (define t-full
+    (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+             (kv "count" "3") ","
+             (kv "tags" (strcat ["[" (js "x") "," (js "y") "]"])) ","
+             (kv "peer" (strcat ["{" (kv "host" (js "h")) "," (kv "port" "80") "}"])) ","
+             (kv "hue" (js "red")) "}"]))
+  assert(Equal t-full (rt t-full))
 
-;; whitespace and key order normalize to the declaration order
-(define t-sloppy
-  (strcat ["{ " (kv "done" "true") " , " (kv "name" (js "a")) " }"]))
-assert(Equal t-min (rt t-sloppy))
+  ;; whitespace and key order normalize to the declaration order
+  (define t-sloppy
+    (strcat ["{ " (kv "done" "true") " , " (kv "name" (js "a")) " }"]))
+  assert(Equal t-min (rt t-sloppy))
 
-;;; Decode failures carry field-path breadcrumbs.
+  ;;; Decode failures carry field-path breadcrumbs.
 
-assert(Equal "name:missing" (rt (strcat ["{" (kv "done" "true") "}"])))
-assert(Equal "peer.port:missing"
-  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-               (kv "peer" (strcat ["{" (kv "host" (js "h")) "}"])) "}"])))
-assert(Equal "name:expected-string"
-  (rt (strcat ["{" (kv "name" "1") "," (kv "done" "true") "}"])))
-assert(Equal "count:negative"
-  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-               (kv "count" "-1") "}"])))
-assert(Equal "tags[1]:expected-string"
-  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-               (kv "tags" (strcat ["[" (js "x") ",2]"])) "}"])))
-assert(Equal "expected-key" (rt "{,}"))
+  assert(Equal "name:missing" (rt (strcat ["{" (kv "done" "true") "}"])))
+  assert(Equal "peer.port:missing"
+    (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+                 (kv "peer" (strcat ["{" (kv "host" (js "h")) "}"])) "}"])))
+  assert(Equal "name:expected-string"
+    (rt (strcat ["{" (kv "name" "1") "," (kv "done" "true") "}"])))
+  assert(Equal "count:negative"
+    (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+                 (kv "count" "-1") "}"])))
+  assert(Equal "tags[1]:expected-string"
+    (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+                 (kv "tags" (strcat ["[" (js "x") ",2]"])) "}"])))
+  assert(Equal "expected-key" (rt "{,}"))
 
-;;; An enum is OPEN: a value outside the declared set is not a decode
-;;; failure, it rides in the catch-all variant and re-encodes verbatim.
-;;; Every multi-value enum in the OpenRouter document reserves the right
-;;; to send one (x-speakeasy-unknown-values), so rejecting it would break
-;;; a working client the first time the server adds a value.
+  ;;; An enum is OPEN: a value outside the declared set is not a decode
+  ;;; failure, it rides in the catch-all variant and re-encodes verbatim.
+  ;;; Every multi-value enum in the OpenRouter document reserves the right
+  ;;; to send one (x-speakeasy-unknown-values), so rejecting it would break
+  ;;; a working client the first time the server adds a value.
 
-(define t-odd-hue
-  (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-           (kv "hue" (js "blue")) "}"]))
-assert(Equal t-odd-hue (rt t-odd-hue))
-;; a NON-string is still a decode failure — the schema does say string
-assert(Equal "hue:expected-string"
-  (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
-               (kv "hue" "7") "}"])))
+  (define t-odd-hue
+    (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+             (kv "hue" (js "blue")) "}"]))
+  assert(Equal t-odd-hue (rt t-odd-hue))
+  ;; a NON-string is still a decode failure — the schema does say string
+  assert(Equal "hue:expected-string"
+    (rt (strcat ["{" (kv "name" (js "a")) "," (kv "done" "true") ","
+                 (kv "hue" "7") "}"])))
 
-;;; Typed access on the generated record.
+  ;;; Typed access on the generated record.
 
-(define parse-task (foil:source-entry-val ["parse_task"] gsut))
-(define pr (parse-task t-full))
-assert(Equal "/boot/task_r/ok" (Hd pr))
+  (define parse-task (driver:get-perc ["parse_task"] gsut))
+  (define pr (parse-task t-full))
+  assert(Equal "/boot/task/task_r/ok" (Hd pr))
 
-;;; The generated tree is normalized rex, never text.
+  ;;; The generated tree is normalized rex, never text.
 
-(define gtree (_1 g))
-assert(IsApp gtree)
+  (define gtree (_1 g))
+  assert(IsApp gtree)
 
-;;; Unsupported schema shapes are rejected loudly.
+  ;;; Unsupported schema shapes are rejected loudly.
 
-(define (gen-fails schema)
-  (define r (Try (lambda (z)
-                   (let ((g (schemagen:gen-tree jsut schema))) (DeepSeq g g))) 0))
-  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+  (define (gen-fails schema)
+    (define r (Try (lambda (z)
+                     (let ((g (schemagen:gen-tree jsut schema))) (DeepSeq g g))) 0))
+    (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
 
-(define jstr-s (strcat ["{" (kv "type" (js "string")) "}"]))
+  (define jstr-s (strcat ["{" (kv "type" (js "string")) "}"]))
 
-;;; A JSON number is carried as its DECIMAL TEXT: there is no honest
-;;; float, and a client needs to show what it received and send back
-;;; what it was given, which the lexeme does exactly.
+  ;;; A JSON number is carried as its DECIMAL TEXT: there is no honest
+  ;;; float, and a client needs to show what it received and send back
+  ;;; what it was given, which the lexeme does exactly.
 
-(define num-schema
-  (read-text-file "spec/test-fixtures/num.json"))
-(define nrt (roundtrip num-schema))
-assert(Equal (strcat ["{" (kv "v" "0.0015") "}"])
-  (nrt (strcat ["{" (kv "v" "0.0015") "}"])))
-assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
-  (nrt (strcat ["{" (kv "v" "6.02e23") "}"])))
-;; an integral number keeps its integral spelling
-assert(Equal (strcat ["{" (kv "v" "5") "}"])
-  (nrt (strcat ["{" (kv "v" "5") "}"])))
-assert(Equal "v:expected-number" (nrt (strcat ["{" (kv "v" (js "x")) "}"])))
+  (define num-schema
+    (read-text-file "spec/test-fixtures/num.json"))
+  (define nrt (roundtrip num-schema))
+  assert(Equal (strcat ["{" (kv "v" "0.0015") "}"])
+    (nrt (strcat ["{" (kv "v" "0.0015") "}"])))
+  assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
+    (nrt (strcat ["{" (kv "v" "6.02e23") "}"])))
+  ;; an integral number keeps its integral spelling
+  assert(Equal (strcat ["{" (kv "v" "5") "}"])
+    (nrt (strcat ["{" (kv "v" "5") "}"])))
+  assert(Equal "v:expected-number" (nrt (strcat ["{" (kv "v" (js "x")) "}"])))
 
-;;; Enum variants keep BOTH spellings: the foil variant is normalized,
-;;; but decode and encode speak the WIRE string.  These differ in
-;;; practice — OpenRouter's ModelGroup really does contain "Qwen", and
-;;; matching the variant name against the wire rejected every value
-;;; that was not already lowercase.  A null among the values is the
-;;; nullable spelling, so it makes the field optional rather than
-;;; becoming a variant, and it does so THROUGH the $ref.
+  ;;; Enum variants keep BOTH spellings: the foil variant is normalized,
+  ;;; but decode and encode speak the WIRE string.  These differ in
+  ;;; practice — OpenRouter's ModelGroup really does contain "Qwen", and
+  ;;; matching the variant name against the wire rejected every value
+  ;;; that was not already lowercase.  A null among the values is the
+  ;;; nullable spelling, so it makes the field optional rather than
+  ;;; becoming a variant, and it does so THROUGH the $ref.
 
-(define enum-schema
-  (read-text-file "spec/test-fixtures/enum.json"))
-(define ert (roundtrip enum-schema))
-;; a capitalized wire value survives the round trip
-assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
-  (ert (strcat ["{" (kv "tag" (js "Qwen")) "}"])))
-assert(Equal (strcat ["{" (kv "tag" (js "Claude")) "}"])
-  (ert (strcat ["{" (kv "tag" (js "Claude")) "}"])))
-;; an explicit null reads as absent, so no key comes back
-assert(Equal "{}" (ert (strcat ["{" (kv "tag" "null") "}"])))
-;; ...and it does so for a field declared REQUIRED, because the
-;; nullability is on the named type the $ref points at
-assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
-  (ert (strcat ["{" (kv "tag" (js "Qwen")) "," (kv "opt" "null") "}"])))
-;; a value outside the enum rides undecoded, keeping its exact spelling
-assert(Equal (strcat ["{" (kv "tag" (js "Nope")) "}"])
-  (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
+  (define enum-schema
+    (read-text-file "spec/test-fixtures/enum.json"))
+  (define ert (roundtrip enum-schema))
+  ;; a capitalized wire value survives the round trip
+  assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
+    (ert (strcat ["{" (kv "tag" (js "Qwen")) "}"])))
+  assert(Equal (strcat ["{" (kv "tag" (js "Claude")) "}"])
+    (ert (strcat ["{" (kv "tag" (js "Claude")) "}"])))
+  ;; an explicit null reads as absent, so no key comes back
+  assert(Equal "{}" (ert (strcat ["{" (kv "tag" "null") "}"])))
+  ;; ...and it does so for a field declared REQUIRED, because the
+  ;; nullability is on the named type the $ref points at
+  assert(Equal (strcat ["{" (kv "tag" (js "Qwen")) "}"])
+    (ert (strcat ["{" (kv "tag" (js "Qwen")) "," (kv "opt" "null") "}"])))
+  ;; a value outside the enum rides undecoded, keeping its exact spelling
+  assert(Equal (strcat ["{" (kv "tag" (js "Nope")) "}"])
+    (ert (strcat ["{" (kv "tag" (js "Nope")) "}"])))
 
-;;; A SINGLE-value enum is a constant, not an enumeration.  A sum with
-;;; one variant would be noise — and in a discriminated union that same
-;;; shape is the tag — so it stays a string.  An inline enum with
-;;; several values does get lifted, to <owner>_<field>.  A union whose
-;;; every arm is a bare constant is an enum written the long way.
-;;; A schema that declines to say anything is any JSON value, carried
-;;; through undecoded.
+  ;;; A SINGLE-value enum is a constant, not an enumeration.  A sum with
+  ;;; one variant would be noise — and in a discriminated union that same
+  ;;; shape is the tag — so it stays a string.  An inline enum with
+  ;;; several values does get lifted, to <owner>_<field>.  A union whose
+  ;;; every arm is a bare constant is an enum written the long way.
+  ;;; A schema that declines to say anything is any JSON value, carried
+  ;;; through undecoded.
 
-(define mixed-schema
-  (read-text-file "spec/test-fixtures/mixed.json"))
-(define mrt (roundtrip mixed-schema))
-;; the constant rides as a string, the lifted enums by wire value, and
-;; the untyped field keeps whatever shape it arrived with
-(define m-full
-  (strcat ["{" (kv "kind" (js "fixed")) "," (kv "hue" (js "Green")) ","
-           (kv "side" (js "R")) ","
-           (kv "blob" (strcat ["{" (kv "any" (strcat ["[1," (js "two") ",3.5]"])) "}"]))
-           "}"]))
-assert(Equal m-full (mrt m-full))
-;; each field is independently optional here, so an empty object holds
-assert(Equal "{}" (mrt "{}"))
-;; the lifted enum carries an unlisted value through
-assert(Equal (strcat ["{" (kv "hue" (js "Blue")) "}"])
-  (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
-;; ...and so does the constants-union
-assert(Equal (strcat ["{" (kv "side" (js "X")) "}"])
-  (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
+  (define mixed-schema
+    (read-text-file "spec/test-fixtures/mixed.json"))
+  (define mrt (roundtrip mixed-schema))
+  ;; the constant rides as a string, the lifted enums by wire value, and
+  ;; the untyped field keeps whatever shape it arrived with
+  (define m-full
+    (strcat ["{" (kv "kind" (js "fixed")) "," (kv "hue" (js "Green")) ","
+             (kv "side" (js "R")) ","
+             (kv "blob" (strcat ["{" (kv "any" (strcat ["[1," (js "two") ",3.5]"])) "}"]))
+             "}"]))
+  assert(Equal m-full (mrt m-full))
+  ;; each field is independently optional here, so an empty object holds
+  assert(Equal "{}" (mrt "{}"))
+  ;; the lifted enum carries an unlisted value through
+  assert(Equal (strcat ["{" (kv "hue" (js "Blue")) "}"])
+    (mrt (strcat ["{" (kv "hue" (js "Blue")) "}"])))
+  ;; ...and so does the constants-union
+  assert(Equal (strcat ["{" (kv "side" (js "X")) "}"])
+    (mrt (strcat ["{" (kv "side" (js "X")) "}"])))
 
-;;; The catch-all needs a name no declared value can take, and three of
-;;; this document's enums (Quantization among them) spell their own
-;;; escape hatch "unknown".  The generated variant steps aside to
-;;; unknown_, which sg-norm-name can never produce because it trims a
-;;; trailing underscore.  The declared value keeps its own variant: it
-;;; encodes as a CONSTANT, so if the two had merged, an undeclared value
-;;; would come back spelled "unknown" instead of itself.
+  ;;; The catch-all needs a name no declared value can take, and three of
+  ;;; this document's enums (Quantization among them) spell their own
+  ;;; escape hatch "unknown".  The generated variant steps aside to
+  ;;; unknown_, which sg-norm-name can never produce because it trims a
+  ;;; trailing underscore.  The declared value keeps its own variant: it
+  ;;; encodes as a CONSTANT, so if the two had merged, an undeclared value
+  ;;; would come back spelled "unknown" instead of itself.
 
-(define clash-schema
-  (read-text-file "spec/test-fixtures/clash.json"))
-(define crt (roundtrip clash-schema))
-assert(Equal (strcat ["{" (kv "k" (js "hot")) "}"])
-  (crt (strcat ["{" (kv "k" (js "hot")) "}"])))
-assert(Equal (strcat ["{" (kv "k" (js "unknown")) "}"])
-  (crt (strcat ["{" (kv "k" (js "unknown")) "}"])))
-assert(Equal (strcat ["{" (kv "k" (js "zzz")) "}"])
-  (crt (strcat ["{" (kv "k" (js "zzz")) "}"])))
+  (define clash-schema
+    (read-text-file "spec/test-fixtures/clash.json"))
+  (define crt (roundtrip clash-schema))
+  assert(Equal (strcat ["{" (kv "k" (js "hot")) "}"])
+    (crt (strcat ["{" (kv "k" (js "hot")) "}"])))
+  assert(Equal (strcat ["{" (kv "k" (js "unknown")) "}"])
+    (crt (strcat ["{" (kv "k" (js "unknown")) "}"])))
+  assert(Equal (strcat ["{" (kv "k" (js "zzz")) "}"])
+    (crt (strcat ["{" (kv "k" (js "zzz")) "}"])))
 
-;;; A oneOf/anyOf of real types becomes a nominal sum, discriminated by
-;;; the field that pins a distinct value in every arm.  That field is
-;;; DERIVED, not read from the `discriminator` keyword — the derivation
-;;; agrees with all 40 of OpenRouter's declared ones and finds 31 more.
-;;;
-;;; A variant wraps its arm's type rather than flattening it in, so the
-;;; arm stays usable on its own; and because the arm's own schema
-;;; declares the tag, the tag needs no special handling in either
-;;; direction and cannot drift out of step with the variant.
-;;;
-;;; Every union carries a trailing catch-all holding the value
-;;; undecoded: 145 enum sites in that document reserve the right to send
-;;; a value nobody has seen, and an unmatched tag must keep parsing and
-;;; re-encode verbatim rather than break the client.
+  ;;; A oneOf/anyOf of real types becomes a nominal sum, discriminated by
+  ;;; the field that pins a distinct value in every arm.  That field is
+  ;;; DERIVED, not read from the `discriminator` keyword — the derivation
+  ;;; agrees with all 40 of OpenRouter's declared ones and finds 31 more.
+  ;;;
+  ;;; A variant wraps its arm's type rather than flattening it in, so the
+  ;;; arm stays usable on its own; and because the arm's own schema
+  ;;; declares the tag, the tag needs no special handling in either
+  ;;; direction and cannot drift out of step with the variant.
+  ;;;
+  ;;; Every union carries a trailing catch-all holding the value
+  ;;; undecoded: 145 enum sites in that document reserve the right to send
+  ;;; a value nobody has seen, and an unmatched tag must keep parsing and
+  ;;; re-encode verbatim rather than break the client.
 
-(define union-schema
-  (read-text-file "spec/test-fixtures/union.json"))
-(define urt (roundtrip union-schema))
+  (define union-schema
+    (read-text-file "spec/test-fixtures/union.json"))
+  (define urt (roundtrip union-schema))
 
-;; each arm decodes and re-encodes as itself, tag included
-(define u-alpha
-  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "," (kv "n" "3") "}"])) "}"]))
-assert(Equal u-alpha (urt u-alpha))
-(define u-beta
-  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "beta")) "," (kv "s" (js "x")) "}"])) "}"]))
-assert(Equal u-beta (urt u-beta))
+  ;; each arm decodes and re-encodes as itself, tag included
+  (define u-alpha
+    (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "," (kv "n" "3") "}"])) "}"]))
+  assert(Equal u-alpha (urt u-alpha))
+  (define u-beta
+    (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "beta")) "," (kv "s" (js "x")) "}"])) "}"]))
+  assert(Equal u-beta (urt u-beta))
 
-;; A TAG NOBODY DECLARED still parses, and comes back byte for byte.
-;; This is the forward-compatibility property: the server adding a
-;; variant must not break a client that has not been regenerated.
-(define u-new
-  (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "gamma")) "," (kv "z" "1") "}"])) "}"]))
-assert(Equal u-new (urt u-new))
+  ;; A TAG NOBODY DECLARED still parses, and comes back byte for byte.
+  ;; This is the forward-compatibility property: the server adding a
+  ;; variant must not break a client that has not been regenerated.
+  (define u-new
+    (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "gamma")) "," (kv "z" "1") "}"])) "}"]))
+  assert(Equal u-new (urt u-new))
 
-;; a known tag with a malformed payload is still an error, with the
-;; breadcrumb pointing through the union
-assert(Equal "body.n:missing"
-  (urt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "}"])) "}"])))
-;; and something that is not an object at all
-assert(Equal "body:expected-object"
-  (urt (strcat ["{" (kv "body" "5") "}"])))
-;; ...or that carries no tag
-assert(Equal "body:missing-tag"
-  (urt (strcat ["{" (kv "body" (strcat ["{" (kv "n" "1") "}"])) "}"])))
+  ;; a known tag with a malformed payload is still an error, with the
+  ;; breadcrumb pointing through the union
+  assert(Equal "body.n:missing"
+    (urt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "alpha")) "}"])) "}"])))
+  ;; and something that is not an object at all
+  assert(Equal "body:expected-object"
+    (urt (strcat ["{" (kv "body" "5") "}"])))
+  ;; ...or that carries no tag
+  assert(Equal "body:missing-tag"
+    (urt (strcat ["{" (kv "body" (strcat ["{" (kv "n" "1") "}"])) "}"])))
 
-;;; When no FIELD settles a union, the arms' JSON CONSTRUCTORS often do:
-;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
-;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
-;;; the constructor of the value itself instead of a key inside it, and
-;;; the variants are named for the shape (str/arr/obj/num/boo) rather
-;;; than for a type name the arm may not have.
+  ;;; When no FIELD settles a union, the arms' JSON CONSTRUCTORS often do:
+  ;;; 43 of this document's 77 fieldless unions have pairwise-disjoint
+  ;;; shapes, 21 of them the plain `string | array`.  Dispatch then reads
+  ;;; the constructor of the value itself instead of a key inside it, and
+  ;;; the variants are named for the shape (str/arr/obj/num/boo) rather
+  ;;; than for a type name the arm may not have.
 
-(define shape-schema
-  (read-text-file "spec/test-fixtures/shape.json"))
-(define srt (roundtrip shape-schema))
+  (define shape-schema
+    (read-text-file "spec/test-fixtures/shape.json"))
+  (define srt (roundtrip shape-schema))
 
-;; each shape decodes as its own arm and re-encodes as itself
-assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
-  (srt (strcat ["{" (kv "body" (js "x")) "}"])))
-assert(Equal (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])
-  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])))
-;; a shape no arm claims rides in the catch-all, exactly as an
-;; unrecognised tag does
-assert(Equal (strcat ["{" (kv "body" "true") "}"])
-  (srt (strcat ["{" (kv "body" "true") "}"])))
-;; the chosen arm still decodes properly, breadcrumb and all
-assert(Equal "body[1]:expected-string"
-  (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") ",2]"])) "}"])))
+  ;; each shape decodes as its own arm and re-encodes as itself
+  assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+    (srt (strcat ["{" (kv "body" (js "x")) "}"])))
+  assert(Equal (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])
+    (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") "," (js "b") "]"])) "}"])))
+  ;; a shape no arm claims rides in the catch-all, exactly as an
+  ;; unrecognised tag does
+  assert(Equal (strcat ["{" (kv "body" "true") "}"])
+    (srt (strcat ["{" (kv "body" "true") "}"])))
+  ;; the chosen arm still decodes properly, breadcrumb and all
+  assert(Equal "body[1]:expected-string"
+    (srt (strcat ["{" (kv "body" (strcat ["[" (js "a") ",2]"])) "}"])))
 
-;;; A `number` arm needs TWO match arms, because json splits numbers by
-;;; spelling rather than by type: an integral literal is json/num and
-;;; anything else is json/real.  Both must reach the same variant.
+  ;;; A `number` arm needs TWO match arms, because json splits numbers by
+  ;;; spelling rather than by type: an integral literal is json/num and
+  ;;; anything else is json/real.  Both must reach the same variant.
 
-(define numsh-schema
-  (read-text-file "spec/test-fixtures/numsh.json"))
-(define nsrt (roundtrip numsh-schema))
-;; an integral literal (json/num) and a fractional one (json/real) both
-;; land on the number variant
-assert(Equal (strcat ["{" (kv "v" "5") "}"]) (nsrt (strcat ["{" (kv "v" "5") "}"])))
-assert(Equal (strcat ["{" (kv "v" "1.5") "}"]) (nsrt (strcat ["{" (kv "v" "1.5") "}"])))
-assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
-  (nsrt (strcat ["{" (kv "v" "6.02e23") "}"])))
-;; and the object arm is still reached
-assert(Equal (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])
-  (nsrt (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])))
+  (define numsh-schema
+    (read-text-file "spec/test-fixtures/numsh.json"))
+  (define nsrt (roundtrip numsh-schema))
+  ;; an integral literal (json/num) and a fractional one (json/real) both
+  ;; land on the number variant
+  assert(Equal (strcat ["{" (kv "v" "5") "}"]) (nsrt (strcat ["{" (kv "v" "5") "}"])))
+  assert(Equal (strcat ["{" (kv "v" "1.5") "}"]) (nsrt (strcat ["{" (kv "v" "1.5") "}"])))
+  assert(Equal (strcat ["{" (kv "v" "6.02e23") "}"])
+    (nsrt (strcat ["{" (kv "v" "6.02e23") "}"])))
+  ;; and the object arm is still reached
+  assert(Equal (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])
+    (nsrt (strcat ["{" (kv "v" (strcat ["{" (kv "p50" "2.5") "}"])) "}"])))
 
-;;; A tag arm may claim a SET of wire values rather than one, and ONE arm
-;;; may decline to pin the tag at all — that arm is the union's own
-;;; catch-all and takes whatever the others do not, replacing the
-;;; synthesized one.  Both readings are tried only after the strict one
-;;; fails, so a union that already had a tag keeps the same tag.
+  ;;; A tag arm may claim a SET of wire values rather than one, and ONE arm
+  ;;; may decline to pin the tag at all — that arm is the union's own
+  ;;; catch-all and takes whatever the others do not, replacing the
+  ;;; synthesized one.  Both readings are tried only after the strict one
+  ;;; fails, so a union that already had a tag keeps the same tag.
 
-(define setfall-schema
-  (read-text-file "spec/test-fixtures/setfall.json"))
-(define sfrt (roundtrip setfall-schema))
-;; either of the claimed values reaches the same arm
-assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])
-  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])))
-assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])
-  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])))
-;; and anything else lands in the DECLARED fallback arm, decoded by it
-;; rather than riding undecoded
-assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])
-  (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])))
+  (define setfall-schema
+    (read-text-file "spec/test-fixtures/setfall.json"))
+  (define sfrt (roundtrip setfall-schema))
+  ;; either of the claimed values reaches the same arm
+  assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])
+    (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "a")) "}"])) "}"])))
+  assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])
+    (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "b")) "}"])) "}"])))
+  ;; and anything else lands in the DECLARED fallback arm, decoded by it
+  ;; rather than riding undecoded
+  assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])
+    (sfrt (strcat ["{" (kv "body" (strcat ["{" (kv "kind" (js "zzz")) "}"])) "}"])))
 
-;;; A union's ARMS lift exactly as a record's properties do.  Without it
-;;; an arm could only be a $ref or a primitive, which is what put this
-;;; document's BaseInputs and Inputs out of reach: both are
-;;; `string | array-of-<union>`, so the shape settles the outer union and
-;;; the element type has to be minted.  Generating is not the claim —
-;;; these round-trip through the lifted types.
+  ;;; A union's ARMS lift exactly as a record's properties do.  Without it
+  ;;; an arm could only be a $ref or a primitive, which is what put this
+  ;;; document's BaseInputs and Inputs out of reach: both are
+  ;;; `string | array-of-<union>`, so the shape settles the outer union and
+  ;;; the element type has to be minted.  Generating is not the claim —
+  ;;; these round-trip through the lifted types.
 
-(define armlift-schema
-  (read-text-file "spec/test-fixtures/armlift.json"))
-(define alrt (roundtrip armlift-schema))
-;; the string arm, and the array arm whose ELEMENT is a lifted tag union
-assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
-  (alrt (strcat ["{" (kv "body" (js "x")) "}"])))
-(define al-arr
-  (strcat ["{" (kv "body"
-    (strcat ["[{" (kv "kind" (js "alpha")) "},{" (kv "kind" (js "beta")) "}]"]))
-    "}"]))
-assert(Equal al-arr (alrt al-arr))
-;; the lifted element union keeps its own catch-all
-(define al-new
-  (strcat ["{" (kv "body" (strcat ["[{" (kv "kind" (js "gamma")) "}]"])) "}"]))
-assert(Equal al-new (alrt al-new))
+  (define armlift-schema
+    (read-text-file "spec/test-fixtures/armlift.json"))
+  (define alrt (roundtrip armlift-schema))
+  ;; the string arm, and the array arm whose ELEMENT is a lifted tag union
+  assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+    (alrt (strcat ["{" (kv "body" (js "x")) "}"])))
+  (define al-arr
+    (strcat ["{" (kv "body"
+      (strcat ["[{" (kv "kind" (js "alpha")) "},{" (kv "kind" (js "beta")) "}]"]))
+      "}"]))
+  assert(Equal al-arr (alrt al-arr))
+  ;; the lifted element union keeps its own catch-all
+  (define al-new
+    (strcat ["{" (kv "body" (strcat ["[{" (kv "kind" (js "gamma")) "}]"])) "}"]))
+  assert(Equal al-new (alrt al-new))
 
-;;; ...and an arm that is an inline OBJECT lifts the same way.
-(define objarm-schema
-  (read-text-file "spec/test-fixtures/objarm.json"))
-(define oart (roundtrip objarm-schema))
-assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
-  (oart (strcat ["{" (kv "body" (js "x")) "}"])))
-assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])
-  (oart (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])))
+  ;;; ...and an arm that is an inline OBJECT lifts the same way.
+  (define objarm-schema
+    (read-text-file "spec/test-fixtures/objarm.json"))
+  (define oart (roundtrip objarm-schema))
+  assert(Equal (strcat ["{" (kv "body" (js "x")) "}"])
+    (oart (strcat ["{" (kv "body" (js "x")) "}"])))
+  assert(Equal (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])
+    (oart (strcat ["{" (kv "body" (strcat ["{" (kv "n" "3") "}"])) "}"])))
 
-;;; A NAMED object that declares no properties says nothing about its
-;;; keys, so it is any JSON object rather than a record with no fields.
-;;; Both spellings mean it: a literal `properties: {}`, and
-;;; additionalProperties, which is a map whose value type the IR cannot
-;;; say yet.  It becomes an ALIAS — nothing is declared for it and
-;;; references resolve through — which is what the same schema already
-;;; did in field position.
+  ;;; A NAMED object that declares no properties says nothing about its
+  ;;; keys, so it is any JSON object rather than a record with no fields.
+  ;;; Both spellings mean it: a literal `properties: {}`, and
+  ;;; additionalProperties, which is a map whose value type the IR cannot
+  ;;; say yet.  It becomes an ALIAS — nothing is declared for it and
+  ;;; references resolve through — which is what the same schema already
+  ;;; did in field position.
 
-(define bag-schema
-  (read-text-file "spec/test-fixtures/bag.json"))
-(define brt (roundtrip bag-schema))
-;; the map rides undecoded, keys and all
-(define b-full
-  (strcat ["{" (kv "opts" (strcat ["{" (kv "a" (js "1")) "," (kv "b" (js "2")) "}"])) ","
-           (kv "blank" (strcat ["{" (kv "z" "3") "}"])) "}"]))
-assert(Equal b-full (brt b-full))
-;; ...including an empty one, which is the shape that used to fail
-assert(Equal (strcat ["{" (kv "opts" "{}") "}"])
-  (brt (strcat ["{" (kv "opts" "{}") "}"])))
+  (define bag-schema
+    (read-text-file "spec/test-fixtures/bag.json"))
+  (define brt (roundtrip bag-schema))
+  ;; the map rides undecoded, keys and all
+  (define b-full
+    (strcat ["{" (kv "opts" (strcat ["{" (kv "a" (js "1")) "," (kv "b" (js "2")) "}"])) ","
+             (kv "blank" (strcat ["{" (kv "z" "3") "}"])) "}"]))
+  assert(Equal b-full (brt b-full))
+  ;; ...including an empty one, which is the shape that used to fail
+  assert(Equal (strcat ["{" (kv "opts" "{}") "}"])
+    (brt (strcat ["{" (kv "opts" "{}") "}"])))
 
-;;; A NAMED array declares nothing of its own — the element is the type.
-;;; An array of a $ref or a primitive is an alias and resolves through to
-;;; row[that], but an inline element has no name, and alias resolution is
-;;; name-blind, so there is nowhere to put one.  The element is minted
-;;; under the schema's name instead, and references become a row of it.
-;;; This document spells three enums and two objects that way.
+  ;;; A NAMED array declares nothing of its own — the element is the type.
+  ;;; An array of a $ref or a primitive is an alias and resolves through to
+  ;;; row[that], but an inline element has no name, and alias resolution is
+  ;;; name-blind, so there is nowhere to put one.  The element is minted
+  ;;; under the schema's name instead, and references become a row of it.
+  ;;; This document spells three enums and two objects that way.
 
-(define namedrow-schema
-  (read-text-file "spec/test-fixtures/namedrow.json"))
-(define nrrt (roundtrip namedrow-schema))
-(define nr-full
-  (strcat ["{" (kv "callers" (strcat ["[" (js "direct") "," (js "relayed") "]"])) ","
-           (kv "shots" (strcat ["[{" (kv "url" (js "a")) "},{" (kv "url" (js "b")) "}]"]))
-           "}"]))
-assert(Equal nr-full (nrrt nr-full))
-;; the minted element enum is open, like every other enum
-(define nr-new
-  (strcat ["{" (kv "callers" (strcat ["[" (js "sideways") "]"])) "}"]))
-assert(Equal nr-new (nrrt nr-new))
-;; and an element failure still breadcrumbs through the row
-assert(Equal "shots[0].url:missing"
-  (nrrt (strcat ["{" (kv "shots" "[{}]") "}"])))
+  (define namedrow-schema
+    (read-text-file "spec/test-fixtures/namedrow.json"))
+  (define nrrt (roundtrip namedrow-schema))
+  (define nr-full
+    (strcat ["{" (kv "callers" (strcat ["[" (js "direct") "," (js "relayed") "]"])) ","
+             (kv "shots" (strcat ["[{" (kv "url" (js "a")) "},{" (kv "url" (js "b")) "}]"]))
+             "}"]))
+  assert(Equal nr-full (nrrt nr-full))
+  ;; the minted element enum is open, like every other enum
+  (define nr-new
+    (strcat ["{" (kv "callers" (strcat ["[" (js "sideways") "]"])) "}"]))
+  assert(Equal nr-new (nrrt nr-new))
+  ;; and an element failure still breadcrumbs through the row
+  assert(Equal "shots[0].url:missing"
+    (nrrt (strcat ["{" (kv "shots" "[{}]") "}"])))
 
-;;; Three ways a schema can name something foil cannot say directly.
-;;; A value that cannot START a foil identifier is MANGLED rather than
-;;; rejected ("5m" and "1h" are this document's cache TTLs).  A numeric
-;;; enum has nothing to make variant names out of, so it is carried by
-;;; value -- and by its LEXEME, because JSON numbers can be negative and
-;;; foil's int is a nat.  And a union of enums is one enum whatever the
-;;; arms' arities: 3 values beside 1 says exactly what 1 beside 1 does.
+  ;;; Three ways a schema can name something foil cannot say directly.
+  ;;; A value that cannot START a foil identifier is MANGLED rather than
+  ;;; rejected ("5m" and "1h" are this document's cache TTLs).  A numeric
+  ;;; enum has nothing to make variant names out of, so it is carried by
+  ;;; value -- and by its LEXEME, because JSON numbers can be negative and
+  ;;; foil's int is a nat.  And a union of enums is one enum whatever the
+  ;;; arms' arities: 3 values beside 1 says exactly what 1 beside 1 does.
 
-(define tail-schema
-  (read-text-file "spec/test-fixtures/tail.json"))
-(define trt (roundtrip tail-schema))
-(define t-all
-  (strcat ["{" (kv "ttl" (js "5m")) "," (kv "status" "-2") ","
-           (kv "engine" (js "d")) "}"]))
-assert(Equal t-all (trt t-all))
-;; the mangled variant still speaks the WIRE value, not its foil name
-assert(Equal (strcat ["{" (kv "ttl" (js "1h")) "}"])
-  (trt (strcat ["{" (kv "ttl" (js "1h")) "}"])))
-;; a negative rides exactly, which ["int"] could not do
-assert(Equal (strcat ["{" (kv "status" "0") "}"])
-  (trt (strcat ["{" (kv "status" "0") "}"])))
-;; and the merged enum accepts values from either arm
-assert(Equal (strcat ["{" (kv "engine" (js "b")) "}"])
-  (trt (strcat ["{" (kv "engine" (js "b")) "}"])))
+  (define tail-schema
+    (read-text-file "spec/test-fixtures/tail.json"))
+  (define trt (roundtrip tail-schema))
+  (define t-all
+    (strcat ["{" (kv "ttl" (js "5m")) "," (kv "status" "-2") ","
+             (kv "engine" (js "d")) "}"]))
+  assert(Equal t-all (trt t-all))
+  ;; the mangled variant still speaks the WIRE value, not its foil name
+  assert(Equal (strcat ["{" (kv "ttl" (js "1h")) "}"])
+    (trt (strcat ["{" (kv "ttl" (js "1h")) "}"])))
+  ;; a negative rides exactly, which ["int"] could not do
+  assert(Equal (strcat ["{" (kv "status" "0") "}"])
+    (trt (strcat ["{" (kv "status" "0") "}"])))
+  ;; and the merged enum accepts values from either arm
+  assert(Equal (strcat ["{" (kv "engine" (js "b")) "}"])
+    (trt (strcat ["{" (kv "engine" (js "b")) "}"])))
 
-;;; A bare string arm beside an enum adds NOTHING, because the enum is
-;;; already open: its catch-all holds every value the bare arm would have
-;;; taken.  `ProviderName | string` says "a known provider, or any other
-;;; string" — which the enum alone already says, and which as a union is
-;;; undecidable, the two arms overlapping by construction.  Dropping the
-;;; bare arm is what makes it decidable and loses nothing.
+  ;;; A bare string arm beside an enum adds NOTHING, because the enum is
+  ;;; already open: its catch-all holds every value the bare arm would have
+  ;;; taken.  `ProviderName | string` says "a known provider, or any other
+  ;;; string" — which the enum alone already says, and which as a union is
+  ;;; undecidable, the two arms overlapping by construction.  Dropping the
+  ;;; bare arm is what makes it decidable and loses nothing.
 
-(define openenum-schema
-  (read-text-file "spec/test-fixtures/openenum.json"))
-(define oert (roundtrip openenum-schema))
-;; a declared provider and an undeclared one both ride, the second in the
-;; enum's own catch-all — which is exactly what the dropped arm meant
-(define oe-full
-  (strcat ["{" (kv "ignore"
-    (strcat ["[" (js "openai") "," (js "other-co") "]"])) "}"]))
-assert(Equal oe-full (oert oe-full))
+  (define openenum-schema
+    (read-text-file "spec/test-fixtures/openenum.json"))
+  (define oert (roundtrip openenum-schema))
+  ;; a declared provider and an undeclared one both ride, the second in the
+  ;; enum's own catch-all — which is exactly what the dropped arm meant
+  (define oe-full
+    (strcat ["{" (kv "ignore"
+      (strcat ["[" (js "openai") "," (js "other-co") "]"])) "}"]))
+  assert(Equal oe-full (oert oe-full))
 
-;;; When nothing settles the arms as ONE set, they are GROUPED by json
-;;; constructor and each group settled on its own.  ChatToolChoice is
-;;; three bare string constants beside two object refs: no field is
-;;; common to all five and the shapes are not disjoint, but "the
-;;; strings" and "the objects" are each perfectly ordinary — an enum and
-;;; a tag union.  Each group of more than one arm becomes a type of its
-;;; own, and the outer union is the shape dispatch already in hand.
+  ;;; When nothing settles the arms as ONE set, they are GROUPED by json
+  ;;; constructor and each group settled on its own.  ChatToolChoice is
+  ;;; three bare string constants beside two object refs: no field is
+  ;;; common to all five and the shapes are not disjoint, but "the
+  ;;; strings" and "the objects" are each perfectly ordinary — an enum and
+  ;;; a tag union.  Each group of more than one arm becomes a type of its
+  ;;; own, and the outer union is the shape dispatch already in hand.
 
-(define grouped-schema
-  (read-text-file "spec/test-fixtures/grouped.json"))
-(define gprt (roundtrip grouped-schema))
-;; a string constant lands in the minted enum group
-assert(Equal (strcat ["{" (kv "choice" (js "auto")) "}"])
-  (gprt (strcat ["{" (kv "choice" (js "auto")) "}"])))
-;; an object lands in the minted tag-union group, by its own tag
-(define gp-obj
-  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "function")) ","
-                                     (kv "name" (js "f")) "}"])) "}"]))
-assert(Equal gp-obj (gprt gp-obj))
-assert(Equal (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])
-  (gprt (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])))
-;; each group keeps its OWN catch-all: an unlisted string and an
-;; unrecognised tag both still round-trip
-assert(Equal (strcat ["{" (kv "choice" (js "zzz")) "}"])
-  (gprt (strcat ["{" (kv "choice" (js "zzz")) "}"])))
-(define gp-new
-  (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "later")) "}"])) "}"]))
-assert(Equal gp-new (gprt gp-new))
-;; and a shape no group claims rides in the outer catch-all
-assert(Equal (strcat ["{" (kv "choice" "true") "}"])
-  (gprt (strcat ["{" (kv "choice" "true") "}"])))
+  (define grouped-schema
+    (read-text-file "spec/test-fixtures/grouped.json"))
+  (define gprt (roundtrip grouped-schema))
+  ;; a string constant lands in the minted enum group
+  assert(Equal (strcat ["{" (kv "choice" (js "auto")) "}"])
+    (gprt (strcat ["{" (kv "choice" (js "auto")) "}"])))
+  ;; an object lands in the minted tag-union group, by its own tag
+  (define gp-obj
+    (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "function")) ","
+                                       (kv "name" (js "f")) "}"])) "}"]))
+  assert(Equal gp-obj (gprt gp-obj))
+  assert(Equal (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])
+    (gprt (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "server")) "}"])) "}"])))
+  ;; each group keeps its OWN catch-all: an unlisted string and an
+  ;; unrecognised tag both still round-trip
+  assert(Equal (strcat ["{" (kv "choice" (js "zzz")) "}"])
+    (gprt (strcat ["{" (kv "choice" (js "zzz")) "}"])))
+  (define gp-new
+    (strcat ["{" (kv "choice" (strcat ["{" (kv "type" (js "later")) "}"])) "}"]))
+  assert(Equal gp-new (gprt gp-new))
+  ;; and a shape no group claims rides in the outer catch-all
+  assert(Equal (strcat ["{" (kv "choice" "true") "}"])
+    (gprt (strcat ["{" (kv "choice" "true") "}"])))
 
-;;; Shapes that are NOT disjoint are rejected rather than settled by arm
-;;; order: json/num answers to both `integer` and `number`, so a union of
-;;; the two has no constructor that tells them apart.  This document
-;;; never writes one, but arm order would be a silent wrong answer.
-assert(Equal "union groups overlap on a json constructor"
-  (gen-fails
-    (strcat ["{" (kv "title" (js "amb")) "," (kv "type" (js "object")) ","
-             (kv "properties"
-               (strcat ["{" (kv "v"
-                 (strcat ["{" (kv "anyOf"
-                   (strcat ["[{" (kv "type" (js "integer")) "},{"
-                            (kv "type" (js "number")) "}]"])) "}"])) "}"]))
-             "}"])))
+  ;;; Shapes that are NOT disjoint are rejected rather than settled by arm
+  ;;; order: json/num answers to both `integer` and `number`, so a union of
+  ;;; the two has no constructor that tells them apart.  This document
+  ;;; never writes one, but arm order would be a silent wrong answer.
+  assert(Equal "union groups overlap on a json constructor"
+    (gen-fails
+      (strcat ["{" (kv "title" (js "amb")) "," (kv "type" (js "object")) ","
+               (kv "properties"
+                 (strcat ["{" (kv "v"
+                   (strcat ["{" (kv "anyOf"
+                     (strcat ["[{" (kv "type" (js "integer")) "},{"
+                              (kv "type" (js "number")) "}]"])) "}"])) "}"]))
+               "}"])))
 
-;; a nested array has no ftype
-assert(Equal "nested-array-unsupported"
-  (gen-fails
-    (strcat ["{" (kv "title" (js "t")) "," (kv "type" (js "object")) ","
-             (kv "properties"
-               (strcat ["{" (kv "x"
-                 (strcat ["{" (kv "type" (js "array")) ","
-                          (kv "items" (strcat ["{" (kv "type" (js "array")) ","
-                                               (kv "items" jstr-s) "}"])) "}"]))
-                 "}"]))
-             "}"])))
-assert(Equal "missing-title"
-  (gen-fails (strcat ["{" (kv "type" (js "object")) "}"])))
-;; A name the generated module already uses for something else is
-;; MANGLED, not rejected.  `parse` is json.foil's; the document is
-;; entitled to a schema by that name and gets parse_ instead.
-(define resv-schema
-  (read-text-file "spec/test-fixtures/resv.json"))
-assert(Equal "parse_" (_0 (schemagen:gen-tree jsut resv-schema)))
-;; and the mangled module is a working one
-(define rvrt (roundtrip resv-schema))
-assert(Equal (strcat ["{" (kv "x" (js "hi")) "}"])
-  (rvrt (strcat ["{" (kv "x" (js "hi")) "}"])))
+  ;; a nested array has no ftype
+  assert(Equal "nested-array-unsupported"
+    (gen-fails
+      (strcat ["{" (kv "title" (js "t")) "," (kv "type" (js "object")) ","
+               (kv "properties"
+                 (strcat ["{" (kv "x"
+                   (strcat ["{" (kv "type" (js "array")) ","
+                            (kv "items" (strcat ["{" (kv "type" (js "array")) ","
+                                                 (kv "items" jstr-s) "}"])) "}"]))
+                   "}"]))
+               "}"])))
+  assert(Equal "missing-title"
+    (gen-fails (strcat ["{" (kv "type" (js "object")) "}"])))
+  ;; A name the generated module already uses for something else is
+  ;; MANGLED, not rejected.  `parse` is json.foil's; the document is
+  ;; entitled to a schema by that name and gets parse_ instead.
+  (define resv-schema
+    (read-text-file "spec/test-fixtures/resv.json"))
+  assert(Equal "parse_" (_0 (schemagen:gen-tree jsut resv-schema)))
+  ;; and the mangled module is a working one
+  (define rvrt (roundtrip resv-schema))
+  assert(Equal (strcat ["{" (kv "x" (js "hi")) "}"])
+    (rvrt (strcat ["{" (kv "x" (js "hi")) "}"])))
 
-(print "foil-schemagen tests passed")
+  (print "foil-schemagen tests passed")
 
-;;; Swagger: the petstore fixture -> generated types + hand modules,
-;;; the hand's take/hear driven by pure laws.  The law driver is a
-;;; foil module (request values MUST be constructed in foil: rvr-built
-;;; variant applications do not match foil pail-matches), compiled
-;;; from embedded text against a cache holding the two generated
-;;; modules (the cached chain is compile-swagger-hand's shape, kept
-;;; open here so the driver can join the same cache).
+  ;;; Swagger: the petstore fixture -> generated types + hand modules,
+  ;;; the hand's take/hear driven by pure laws.  The law driver is a
+  ;;; foil module (request values MUST be constructed in foil: rvr-built
+  ;;; variant applications do not match foil pail-matches), compiled
+  ;;; from embedded text against a cache holding the two generated
+  ;;; modules (the cached chain is compile-swagger-hand's shape, kept
+  ;;; open here so the driver can join the same cache).
 
-(define (sw-commas xs)
-  (Ifz (Sz xs) ""
-    (foldl (lambda (acc x) (strcat [acc "," x])) (_0 xs) (drop 1 xs))))
-(define (jobj pairs) (strcat ["{" (sw-commas pairs) "}"]))
-(define (jarr xs) (strcat ["[" (sw-commas xs) "]"]))
-(define (jref d) (jobj [(kv "$ref" (js (strcat ["#/definitions/" d])))]))
-(define jint (jobj [(kv "type" (js "integer"))]))
-(define jstr (jobj [(kv "type" (js "string"))]))
+  (define (sw-commas xs)
+    (Ifz (Sz xs) ""
+      (foldl (lambda (acc x) (strcat [acc "," x])) (_0 xs) (drop 1 xs))))
+  (define (jobj pairs) (strcat ["{" (sw-commas pairs) "}"]))
+  (define (jarr xs) (strcat ["[" (sw-commas xs) "]"]))
+  (define (jref d) (jobj [(kv "$ref" (js (strcat ["#/definitions/" d])))]))
+  (define jint (jobj [(kv "type" (js "integer"))]))
+  (define jstr (jobj [(kv "type" (js "string"))]))
 
-(define (sw-op opid params resp)
-  (jobj [(kv "operationId" (js opid))
-         (kv "parameters" (jarr params))
-         (kv "responses"
-           (jobj [(kv "200" (jobj [(kv "schema" (jref resp))]))]))]))
+  (define (sw-op opid params resp)
+    (jobj [(kv "operationId" (js opid))
+           (kv "parameters" (jarr params))
+           (kv "responses"
+             (jobj [(kv "200" (jobj [(kv "schema" (jref resp))]))]))]))
 
-(define swagger-txt
-  (jobj
-    [(kv "swagger" (js "2.0"))
-     (kv "info" (jobj [(kv "title" (js "petstore"))
-                       (kv "version" (js "1.0.0"))]))
-     (kv "basePath" (js "/v1"))
-     (kv "paths"
-       (jobj
-         [(kv "/pets/{pet_id}"
-            (jobj [(kv "get"
-                     (sw-op "get_pet"
-                       [(jobj [(kv "name" (js "pet_id")) (kv "in" (js "path"))
-                               (kv "required" "true") (kv "type" (js "integer"))])]
-                       "pet"))]))
-          (kv "/pets"
-            (jobj [(kv "get"
-                     (sw-op "list_pets"
-                       [(jobj [(kv "name" (js "limit")) (kv "in" (js "query"))
-                               (kv "required" "false") (kv "type" (js "integer"))])]
-                       "pets"))
-                   (kv "post"
-                     (sw-op "make_pet"
-                       [(jobj [(kv "name" (js "new_pet")) (kv "in" (js "body"))
-                               (kv "required" "true")
-                               (kv "schema" (jref "new_pet"))])]
-                       "pet"))]))]))
-     (kv "definitions"
-       (jobj
-         [(kv "pet"
-            (jobj [(kv "type" (js "object"))
-                   (kv "required" (jarr [(js "id") (js "name")]))
-                   (kv "properties"
-                     (jobj [(kv "id" jint) (kv "name" jstr) (kv "tag" jstr)
-                            (kv "kind" (jref "kind"))]))]))
-          (kv "new_pet"
-            (jobj [(kv "type" (js "object"))
-                   (kv "required" (jarr [(js "name")]))
-                   (kv "properties" (jobj [(kv "name" jstr) (kv "tag" jstr)]))]))
-          (kv "kind"
-            (jobj [(kv "enum" (jarr [(js "cat") (js "dog") (js "bird")]))]))
-          (kv "pets"
-            (jobj [(kv "type" (js "object"))
-                   (kv "required" (jarr [(js "items")]))
-                   (kv "properties"
-                     (jobj [(kv "items"
-                              (jobj [(kv "type" (js "array"))
-                                     (kv "items" (jref "pet"))]))]))]))]))]))
+  (define swagger-txt
+    (jobj
+      [(kv "swagger" (js "2.0"))
+       (kv "info" (jobj [(kv "title" (js "petstore"))
+                         (kv "version" (js "1.0.0"))]))
+       (kv "basePath" (js "/v1"))
+       (kv "paths"
+         (jobj
+           [(kv "/pets/{pet_id}"
+              (jobj [(kv "get"
+                       (sw-op "get_pet"
+                         [(jobj [(kv "name" (js "pet_id")) (kv "in" (js "path"))
+                                 (kv "required" "true") (kv "type" (js "integer"))])]
+                         "pet"))]))
+            (kv "/pets"
+              (jobj [(kv "get"
+                       (sw-op "list_pets"
+                         [(jobj [(kv "name" (js "limit")) (kv "in" (js "query"))
+                                 (kv "required" "false") (kv "type" (js "integer"))])]
+                         "pets"))
+                     (kv "post"
+                       (sw-op "make_pet"
+                         [(jobj [(kv "name" (js "new_pet")) (kv "in" (js "body"))
+                                 (kv "required" "true")
+                                 (kv "schema" (jref "new_pet"))])]
+                         "pet"))]))]))
+       (kv "definitions"
+         (jobj
+           [(kv "pet"
+              (jobj [(kv "type" (js "object"))
+                     (kv "required" (jarr [(js "id") (js "name")]))
+                     (kv "properties"
+                       (jobj [(kv "id" jint) (kv "name" jstr) (kv "tag" jstr)
+                              (kv "kind" (jref "kind"))]))]))
+            (kv "new_pet"
+              (jobj [(kv "type" (js "object"))
+                     (kv "required" (jarr [(js "name")]))
+                     (kv "properties" (jobj [(kv "name" jstr) (kv "tag" jstr)]))]))
+            (kv "kind"
+              (jobj [(kv "enum" (jarr [(js "cat") (js "dog") (js "bird")]))]))
+            (kv "pets"
+              (jobj [(kv "type" (js "object"))
+                     (kv "required" (jarr [(js "items")]))
+                     (kv "properties"
+                       (jobj [(kv "items"
+                                (jobj [(kv "type" (js "array"))
+                                       (kv "items" (jref "pet"))]))]))]))]))]))
 
-(define sw-tnt (schemagen:gen-swagger-types jsut swagger-txt []))
-assert(Equal "petstore" (_0 sw-tnt))
-(define sw-hnt (schemagen:gen-swagger-hand jsut swagger-txt []))
-assert(Equal "petstore_hand" (_0 sw-hnt))
-assert(IsApp (_1 sw-hnt))
+  ;; The public cached wrapper retains both generated modules for imports.
+  (define sw-public (schemagen:compile-swagger-hand-cached
+    imports jsut swagger-txt []))
+  (define sw-public-mods (_1 sw-public))
+  assert(Equal "petstore" (_0 sw-public-mods))
+  assert(Equal "petstore_hand" (_1 sw-public-mods))
+  assert(Equal ["boot" "petstore_hand"]
+    (driver:perc-root (Ix 2 sw-public-mods)))
+  assert(Equal 1 (Nil (Nil (driver:get-foil-cache "petstore" (_0 sw-public)))))
+  assert(Equal 0 (driver:get-foil-cache "petstore" imports))
 
-(define nl 10)
-(define (sw-unlines ls)
-  (strcat (foldl (lambda (acc l) (Weld acc [l nl])) [] ls)))
+  (define sw-tnt (schemagen:gen-swagger-types jsut swagger-txt []))
+  assert(Equal "petstore" (_0 sw-tnt))
+  (define sw-hnt (schemagen:gen-swagger-hand jsut swagger-txt []))
+  assert(Equal "petstore_hand" (_0 sw-hnt))
+  assert(IsApp (_1 sw-hnt))
 
-(define sw-driver-txt
-  (sw-unlines
-    ["-  sept [order=10]"
-     "-  shrine_types [order=20]"
-     "-  lain_types [order=28]"
-     "-  lain_peek [order=29]"
-     "-  lain_poke [order=30]"
-     "-  bond [order=40]"
-     "-  petstore [order=50]"
-     "-  petstore_hand [order=60]"
-     "'  Pure-law driver for the generated petstore hand: build bowls"
-     "'  and gifts by hand, drive take and hear directly, and surface"
-     "'  simple values for the rvr suite to assert on."
-     "+  t_root"
-     "  '  Test root record: base url + injected http crew."
-     "  ^  myth"
-     "  .  (myth/new)"
-     (strcat ["     put(['base] (pails/t " (js "http://m") "))"])
-     "     put(bond/crew (cpail (crew/sing ['http] (dep (care/x) ['io 'http]))))"
-     "+  t_bowl"
-     "  '  Test bowl: one pending request kid at [r1]."
-     "  \  rq=pail"
-     "  ^  bowl"
-     "  (bowl ['u] ['api] 0 0"
-     "    (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
-     "    (mop/empty))"
-     "+  t_lim"
-     "  '  0 = no limit (the maybe is constructed in foil)."
-     "  \  lim=nat"
-     "  ^  maybe[nat]"
-     "  ?  (eq lim 0)"
-     "     .none"
-     "  (./some lim)"
-     "+  t_take_url"
-     "  '  Drive take with one get_pet request; the fetch card's ['url]."
-     "  \  pet_id=nat"
-     "  ^  nat"
-     "  =  rq    (req/get_pet pet_id)"
-     "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y     (take (t_bowl rq) t_root gift)"
-     "  ?  (eq 1 y.cards.len)"
-     "     =  [cp=path cq=writ]  y.cards.at(0)"
-     "     ?  cq"
-     "      > w=writ/make"
-     "        ?  w.myth.get(['url])"
-     "         > (./some up=pail)"
-     "           ?  up"
-     "            > n=pails/n  n.n"
-     "           0"
-     "         0"
-     "      0"
-     "  0"
-     "+  t_take_list_url"
-     "  '  list_pets with and without the optional limit (0 = none)."
-     "  \  lim=nat"
-     "  ^  nat"
-     "  =  rq    (req/list_pets (t_lim lim))"
-     "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y     (take (t_bowl rq) t_root gift)"
-     "  ?  (eq 1 y.cards.len)"
-     "     =  [cp=path cq=writ]  y.cards.at(0)"
-     "     ?  cq"
-     "      > w=writ/make"
-     "        ?  w.myth.get(['url])"
-     "         > (./some up=pail)"
-     "           ?  up"
-     "            > n=pails/n  n.n"
-     "           0"
-     "         0"
-     "      0"
-     "  0"
-     "+  t_take_post"
-     "  '  make_pet: the fetch card's ['method] and ['body]."
-     "  \  nm=str"
-     "  ^  row[nat]"
-     "  =  rq    (req/make_pet (new_pet nm .none))"
-     "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y     (take (t_bowl rq) t_root gift)"
-     "  ?  (eq 1 y.cards.len)"
-     "     =  [cp=path cq=writ]  y.cards.at(0)"
-     "     ?  cq"
-     "      > w=writ/make"
-     "        =  gv"
-     "             \  s=path"
-     "             ^  nat"
-     "             ?  w.myth.get(s)"
-     "              > (./some vp=pail)"
-     "                ?  vp"
-     "                 > n=pails/n  n.n"
-     "                0"
-     "              0"
-     "        [(gv ['method]) (gv ['body])]"
-     "      []"
-     "  []"
-     "+  t_take_card_ok"
-     "  '  1 when the make-card lands at the http client's fetch path,"
-     "  '  its kid the flattened here+kid (unique per hand instance)."
-     "  \  pet_id=nat"
-     "  ^  nat"
-     "  =  rq    (req/get_pet pet_id)"
-     "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y     (take (t_bowl rq) t_root gift)"
-     "  ?  (eq 1 y.cards.len)"
-     "     =  [cp2=path cq2=writ]  y.cards.at(0)"
-     (strcat ["     (eq_pith cp2 ['io 'http ($ts " (js "api_r1") ")])"])
-     "  0"
-     "+  t_bowl2"
-     "  '  A second hand instance: same kid key, deeper here."
-     "  \  rq=pail"
-     "  ^  bowl"
-     "  (bowl ['u] ['chat 'conv 'fork ($u 0) 'api] 0 0"
-     "    (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
-     "    (mop/empty))"
-     "+  t_take_card_uniq"
-     "  '  Two hand instances, same kid key: distinct fetch nodes -"
-     "  '  the collision two convs used to have at /io."
-     "  \  pet_id=nat"
-     "  ^  nat"
-     "  =  rq    (req/get_pet pet_id)"
-     "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y1    (take (t_bowl rq) t_root gift)"
-     "  =  y2    (take (t_bowl2 rq) t_root gift)"
-     "  ?  !(eq 1 y1.cards.len)"
-     "     0"
-     "  ?  !(eq 1 y2.cards.len)"
-     "     0"
-     "  =  [ca=path qa=writ]  y1.cards.at(0)"
-     "  =  [cb=path qb=writ]  y2.cards.at(0)"
-     (strcat ["  ?  !(eq_pith cb ['io 'http ($ts "
-              (js "chat_conv_fork_0_api_r1") ")])"])
-     "     0"
-     "  !(eq_pith ca cb)"
-     "+  t_hear_res"
-     "  '  Drive hear after a completed fetch; the bond/res pail poked back."
-     "  \  pet_id=nat okf=nat body=nat"
-     "  ^  maybe[pail]"
-     "  =  rq     (req/get_pet pet_id)"
-     "  =  root0  t_root"
-     "  =  gift   (axal/new[mode] .none).put(['r1] (mode/add))"
-     "  =  y1     (take (t_bowl rq) root0 gift)"
-     "  =  fnode"
-     "       .  (myth/new)"
-     "          put(['res_done] (pd 1))"
-     "          put(['res_ok] (pd okf))"
-     "          put(['res_body] (pd body))"
-     "          put(['res_err] (pd 2))"
-     "  =  b2"
-     "       (bowl ['u] ['api] 1 0"
-     "         (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
-     "         (mop/sing[path axal[myth] lt_pith] ['r1] (axal/new[myth] (./some fnode))))"
-     (strcat ["  =  y2  (hear b2 y1.out [(dep (care/x) ['io 'http ($ts "
-              (js "api_r1") ")])])"])
-     "  ?  (eq 1 y2.cards.len)"
-     "     =  [cp3=path cq3=writ]  y2.cards.at(0)"
-     "     ?  cq3"
-     "      > w=writ/poke"
-     "        w.myth.get(bond/res)"
-     "      .none"
-     "  .none"]))
+  (define nl 10)
+  (define (sw-unlines ls)
+    (strcat (foldl (lambda (acc l) (Weld acc [l nl])) [] ls)))
 
-(Seq
+  (define sw-driver-txt
+    (sw-unlines
+      ["-  sept [order=10]"
+       "-  shrine_types [order=20]"
+       "-  lain_types [order=28]"
+       "-  lain_peek [order=29]"
+       "-  lain_poke [order=30]"
+       "-  bond [order=40]"
+       "-  petstore [order=50]"
+       "-  petstore_hand [order=60]"
+       "'  Pure-law driver for the generated petstore hand: build bowls"
+       "'  and gifts by hand, drive take and hear directly, and surface"
+       "'  simple values for the rvr suite to assert on."
+       "+  t_root"
+       "  '  Test root record: base url + injected http crew."
+       "  ^  myth"
+       "  .  (myth/new)"
+       (strcat ["     put(['base] (pails/t " (js "http://m") "))"])
+       "     put(bond/crew (cpail (crew/sing ['http] (dep (care/x) ['io 'http]))))"
+       "+  t_bowl"
+       "  '  Test bowl: one pending request kid at [r1]."
+       "  \  rq=pail"
+       "  ^  bowl"
+       "  (bowl ['u] ['api] 0 0"
+       "    (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
+       "    (mop/empty))"
+       "+  t_lim"
+       "  '  0 = no limit (the maybe is constructed in foil)."
+       "  \  lim=nat"
+       "  ^  maybe[nat]"
+       "  ?  (eq lim 0)"
+       "     .none"
+       "  (./some lim)"
+       "+  t_take_url"
+       "  '  Drive take with one get_pet request; the fetch card's ['url]."
+       "  \  pet_id=nat"
+       "  ^  nat"
+       "  =  rq    (req/get_pet pet_id)"
+       "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y     (take (t_bowl rq) t_root gift)"
+       "  ?  (eq 1 y.cards.len)"
+       "     =  [cp=path cq=writ]  y.cards.at(0)"
+       "     ?  cq"
+       "      > w=writ/make"
+       "        ?  w.myth.get(['url])"
+       "         > (./some up=pail)"
+       "           ?  up"
+       "            > n=pails/n  n.n"
+       "           0"
+       "         0"
+       "      0"
+       "  0"
+       "+  t_take_list_url"
+       "  '  list_pets with and without the optional limit (0 = none)."
+       "  \  lim=nat"
+       "  ^  nat"
+       "  =  rq    (req/list_pets (t_lim lim))"
+       "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y     (take (t_bowl rq) t_root gift)"
+       "  ?  (eq 1 y.cards.len)"
+       "     =  [cp=path cq=writ]  y.cards.at(0)"
+       "     ?  cq"
+       "      > w=writ/make"
+       "        ?  w.myth.get(['url])"
+       "         > (./some up=pail)"
+       "           ?  up"
+       "            > n=pails/n  n.n"
+       "           0"
+       "         0"
+       "      0"
+       "  0"
+       "+  t_take_post"
+       "  '  make_pet: the fetch card's ['method] and ['body]."
+       "  \  nm=str"
+       "  ^  row[nat]"
+       "  =  rq    (req/make_pet (new_pet nm .none))"
+       "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y     (take (t_bowl rq) t_root gift)"
+       "  ?  (eq 1 y.cards.len)"
+       "     =  [cp=path cq=writ]  y.cards.at(0)"
+       "     ?  cq"
+       "      > w=writ/make"
+       "        =  gv"
+       "             \  s=path"
+       "             ^  nat"
+       "             ?  w.myth.get(s)"
+       "              > (./some vp=pail)"
+       "                ?  vp"
+       "                 > n=pails/n  n.n"
+       "                0"
+       "              0"
+       "        [(gv ['method]) (gv ['body])]"
+       "      []"
+       "  []"
+       "+  t_take_card_ok"
+       "  '  1 when the make-card lands at the http client's fetch path,"
+       "  '  its kid the flattened here+kid (unique per hand instance)."
+       "  \  pet_id=nat"
+       "  ^  nat"
+       "  =  rq    (req/get_pet pet_id)"
+       "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y     (take (t_bowl rq) t_root gift)"
+       "  ?  (eq 1 y.cards.len)"
+       "     =  [cp2=path cq2=writ]  y.cards.at(0)"
+       (strcat ["     (eq_pith cp2 ['io 'http ($ts " (js "api_r1") ")])"])
+       "  0"
+       "+  t_bowl2"
+       "  '  A second hand instance: same kid key, deeper here."
+       "  \  rq=pail"
+       "  ^  bowl"
+       "  (bowl ['u] ['chat 'conv 'fork ($u 0) 'api] 0 0"
+       "    (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
+       "    (mop/empty))"
+       "+  t_take_card_uniq"
+       "  '  Two hand instances, same kid key: distinct fetch nodes -"
+       "  '  the collision two convs used to have at /io."
+       "  \  pet_id=nat"
+       "  ^  nat"
+       "  =  rq    (req/get_pet pet_id)"
+       "  =  gift  (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y1    (take (t_bowl rq) t_root gift)"
+       "  =  y2    (take (t_bowl2 rq) t_root gift)"
+       "  ?  !(eq 1 y1.cards.len)"
+       "     0"
+       "  ?  !(eq 1 y2.cards.len)"
+       "     0"
+       "  =  [ca=path qa=writ]  y1.cards.at(0)"
+       "  =  [cb=path qb=writ]  y2.cards.at(0)"
+       (strcat ["  ?  !(eq_pith cb ['io 'http ($ts "
+                (js "chat_conv_fork_0_api_r1") ")])"])
+       "     0"
+       "  !(eq_pith ca cb)"
+       "+  t_hear_res"
+       "  '  Drive hear after a completed fetch; the bond/res pail poked back."
+       "  \  pet_id=nat okf=nat body=nat"
+       "  ^  maybe[pail]"
+       "  =  rq     (req/get_pet pet_id)"
+       "  =  root0  t_root"
+       "  =  gift   (axal/new[mode] .none).put(['r1] (mode/add))"
+       "  =  y1     (take (t_bowl rq) root0 gift)"
+       "  =  fnode"
+       "       .  (myth/new)"
+       "          put(['res_done] (pd 1))"
+       "          put(['res_ok] (pd okf))"
+       "          put(['res_body] (pd body))"
+       "          put(['res_err] (pd 2))"
+       "  =  b2"
+       "       (bowl ['u] ['api] 1 0"
+       "         (axal/new[myth] .none).put(['r1] (myth/sing bond/req rq))"
+       "         (mop/sing[path axal[myth] lt_pith] ['r1] (axal/new[myth] (./some fnode))))"
+       (strcat ["  =  y2  (hear b2 y1.out [(dep (care/x) ['io 'http ($ts "
+                (js "api_r1") ")])])"])
+       "  ?  (eq 1 y2.cards.len)"
+       "     =  [cp3=path cq3=writ]  y2.cards.at(0)"
+       "     ?  cq3"
+       "      > w=writ/poke"
+       "        w.myth.get(bond/res)"
+       "      .none"
+       "  .none"]))
+
   (define sw-c1
-    (foil:compile-rex-cached 0 foil:default-subject "petstore" (Ix 3 sw-tnt)))
-  (DeepSeq sw-c1 0))
-(Seq
+      (source:compile-rex 0 "petstore" (Ix 3 sw-tnt)))
+  (DeepSeq sw-c1 0)
   (define sw-c2
-    (foil:compile-rex-cached (_0 sw-c1) foil:default-subject "petstore_hand"
-      (_1 sw-hnt)))
-  (DeepSeq sw-c2 0))
-(Seq
+      (source:compile-rex (_0 sw-c1) "petstore_hand"
+        (_1 sw-hnt)))
+  (DeepSeq sw-c2 0)
   (define sw-c3
-    (foil:compile-rex-cached (_0 sw-c2) foil:default-subject "petstore_laws"
-      (rex:ParseRexNormFile sw-driver-txt)))
-  (DeepSeq sw-c3 0))
-(Seq
+      (source:compile-rex (_0 sw-c2) "petstore_laws"
+        (rex:ParseRexNormFile sw-driver-txt)))
+  (DeepSeq sw-c3 0)
   (define sw-sut (_1 sw-c3))
-  (DeepSeq sw-sut 0))
-(define (sw-law nm) (foil:source-entry-val [nm] sw-sut))
+  (DeepSeq sw-sut 0)
+  (define (sw-law nm) (driver:get-perc [nm] sw-sut))
+  (define public-laws (source:compile-rex (_0 sw-public) "public_petstore_laws"
+    (rex:ParseRexNormFile sw-driver-txt)))
+  assert(Equal "http://m/v1/pets/7"
+    ((driver:get-perc ["t_take_url"] (_1 public-laws)) 7))
 
-assert(Equal "http://m/v1/pets/7" ((sw-law "t_take_url") 7))
-assert(Equal "http://m/v1/pets" ((sw-law "t_take_list_url") 0))
-assert(Equal "http://m/v1/pets?limit=5" ((sw-law "t_take_list_url") 5))
-assert(Equal ["POST" (jobj [(kv "name" (js "x"))])]
-  ((sw-law "t_take_post") 120))
-assert(Equal 1 ((sw-law "t_take_card_ok") 7))
-assert(Equal 1 ((sw-law "t_take_card_uniq") 7))
 
-(define sw-petjson (jobj [(kv "id" "7") (kv "name" (js "rex"))]))
-(define sw-hok ((sw-law "t_hear_res") 7 1 sw-petjson))
-assert(Equal "/boot/maybe/some" (Hd sw-hok))
-assert(Equal "/boot/pet_r/ok" (Hd (Ix 0 sw-hok)))
-assert(Equal "/boot/pet" (Hd (Ix 0 (Ix 0 sw-hok))))
-assert(Equal 7 (Ix 0 (Ix 0 (Ix 0 sw-hok))))
-assert(Equal "rex" (Ix 1 (Ix 0 (Ix 0 sw-hok))))
-(define sw-herr ((sw-law "t_hear_res") 7 0 sw-petjson))
-assert(Equal "/boot/maybe/some" (Hd sw-herr))
-assert(Equal "/boot/pet_r/err" (Hd (Ix 0 sw-herr)))
-assert(Equal "fetch-err-2" (Ix 1 (Ix 0 sw-herr)))
+  assert(Equal "http://m/v1/pets/7" ((sw-law "t_take_url") 7))
+  assert(Equal "http://m/v1/pets" ((sw-law "t_take_list_url") 0))
+  assert(Equal "http://m/v1/pets?limit=5" ((sw-law "t_take_list_url") 5))
+  assert(Equal ["POST" (jobj [(kv "name" (js "x"))])]
+    ((sw-law "t_take_post") 120))
+  assert(Equal 1 ((sw-law "t_take_card_ok") 7))
+  assert(Equal 1 ((sw-law "t_take_card_uniq") 7))
 
-;;; OpenAPI 3.1: dialect, name normalization, slicing, coverage ratchet.
-;;;
-;;; Vendor-wide counts and ratchets live in the explicit exhaustive suite.
+  (define sw-petjson (jobj [(kv "id" "7") (kv "name" (js "rex"))]))
+  (define sw-hok ((sw-law "t_hear_res") 7 1 sw-petjson))
+  assert(Equal "/boot/maybe/some" (Hd sw-hok))
+  assert(Equal "/boot/petstore/pet_r/ok" (Hd (Ix 0 sw-hok)))
+  assert(Equal "/boot/petstore/pet" (Hd (Ix 0 (Ix 0 sw-hok))))
+  assert(Equal 7 (Ix 0 (Ix 0 (Ix 0 sw-hok))))
+  assert(Equal "rex" (Ix 1 (Ix 0 (Ix 0 sw-hok))))
+  (define sw-herr ((sw-law "t_hear_res") 7 0 sw-petjson))
+  assert(Equal "/boot/maybe/some" (Hd sw-herr))
+  assert(Equal "/boot/petstore/pet_r/err" (Hd (Ix 0 sw-herr)))
+  assert(Equal "fetch-err-2" (Ix 1 (Ix 0 sw-herr)))
 
-;;; A. name normalization is a mapping, and must be injective.
+  ;;; OpenAPI 3.1: dialect, name normalization, slicing, coverage ratchet.
+  ;;;
+  ;;; Vendor-wide counts and ratchets live in the explicit exhaustive suite.
 
-assert(Equal "aabenchmark_entry" (schemagen:sg-norm-name "AABenchmarkEntry"))
-assert(Equal "job_id" (schemagen:sg-norm-name "jobId"))
-assert(Equal "chat_request" (schemagen:sg-norm-name "ChatRequest"))
-assert(Equal "base64_image" (schemagen:sg-norm-name "Base64Image"))
-assert(Equal "text_event_stream" (schemagen:sg-norm-name "text/event-stream"))
-assert(Equal "gpt_4" (schemagen:sg-norm-name "gpt-4"))
-assert(Equal "already_snake" (schemagen:sg-norm-name "already_snake"))
-;; idempotent: normalizing an already-normal name changes nothing
-assert(Equal "job_id" (schemagen:sg-norm-name (schemagen:sg-norm-name "jobId")))
-;; a collision is an error, never a silent merge
-(define (names-fail xs)
-  (define r (Try (lambda (z) (schemagen:sg-name-map xs)) 0))
-  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
-assert(Equal 0 (names-fail ["Foo" "Bar"]))
-assert(Equal "name-collision after normalization" (names-fail ["fooBar" "FooBar"]))
+  ;;; A. name normalization is a mapping, and must be injective.
 
-;;; B. the Swagger 2.0 dialect still reads (the petstore path above).
+  assert(Equal "aabenchmark_entry" (schemagen:sg-norm-name "AABenchmarkEntry"))
+  assert(Equal "job_id" (schemagen:sg-norm-name "jobId"))
+  assert(Equal "chat_request" (schemagen:sg-norm-name "ChatRequest"))
+  assert(Equal "base64_image" (schemagen:sg-norm-name "Base64Image"))
+  assert(Equal "text_event_stream" (schemagen:sg-norm-name "text/event-stream"))
+  assert(Equal "gpt_4" (schemagen:sg-norm-name "gpt-4"))
+  assert(Equal "already_snake" (schemagen:sg-norm-name "already_snake"))
+  ;; idempotent: normalizing an already-normal name changes nothing
+  assert(Equal "job_id" (schemagen:sg-norm-name (schemagen:sg-norm-name "jobId")))
+  ;; a collision is an error, never a silent merge
+  (define (names-fail xs)
+    (define r (Try (lambda (z) (schemagen:sg-name-map xs)) 0))
+    (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+  assert(Equal 0 (names-fail ["Foo" "Bar"]))
+  assert(Equal "name-collision after normalization" (names-fail ["fooBar" "FooBar"]))
 
-(define sw-v (schemagen:sg-schema-value jsut swagger-txt))
-assert(Equal [0 "petstore" "/v1" 4 3] (schemagen:spec-summary sw-v))
-assert(Equal ["get_pet" "list_pets" "make_pet"]
-  (schemagen:dedupe-eq (schemagen:spec-opids sw-v)))
-assert(Equal ["pet" "kind"] (schemagen:spec-slice sw-v ["get_pet"]))
-;; naming an operation that does not exist is an error, not an empty slice
-(define (slice-fail ids)
-  (define r (Try (lambda (z) (schemagen:spec-slice sw-v ids)) 0))
-  (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
-assert(Equal "no such operationId" (slice-fail ["nope"]))
+  ;;; B. the Swagger 2.0 dialect still reads (the petstore path above).
 
-;;; OpenAPI 3.1 production slice: the real boot/client input.
-(Seq
+  (define sw-v (schemagen:sg-schema-value jsut swagger-txt))
+  assert(Equal [0 "petstore" "/v1" 4 3] (schemagen:spec-summary sw-v))
+  assert(Equal ["get_pet" "list_pets" "make_pet"]
+    (schemagen:dedupe-eq (schemagen:spec-opids sw-v)))
+  assert(Equal ["pet" "kind"] (schemagen:spec-slice sw-v ["get_pet"]))
+  ;; naming an operation that does not exist is an error, not an empty slice
+  (define (slice-fail ids)
+    (define r (Try (lambda (z) (schemagen:spec-slice sw-v ids)) 0))
+    (If (Eq 1 (Hd r)) (Ix 1 (_0 r)) 0))
+  assert(Equal "no such operationId" (slice-fail ["nope"]))
+
+  ;;; OpenAPI 3.1 production slice: the real boot/client input.
   (define oa-v (schemagen:sg-schema-value jsut
-                 (read-text-file "spec/openrouter.json")))
-  (DeepSeq oa-v 0))
-assert(Equal [1 "open_router_api" "https://openrouter.ai/api/v1" 188 2]
-  (schemagen:spec-summary oa-v))
-assert(Equal ["get_models" "send_chat_completion_request"]
-  (schemagen:spec-opids oa-v))
-assert(Equal 20 (Sz (schemagen:spec-slice oa-v ["get_models"])))
-assert(Equal 132 (Sz (schemagen:spec-slice oa-v ["send_chat_completion_request"])))
-assert(Equal 152 (Sz (schemagen:spec-slice oa-v
-                       ["get_models" "send_chat_completion_request"])))
+                   (read-text-file "spec/openrouter.json")))
+  (DeepSeq oa-v 0)
+  assert(Equal [1 "open_router_api" "https://openrouter.ai/api/v1" 188 2]
+    (schemagen:spec-summary oa-v))
+  assert(Equal ["get_models" "send_chat_completion_request"]
+    (schemagen:spec-opids oa-v))
+  assert(Equal 20 (Sz (schemagen:spec-slice oa-v ["get_models"])))
+  assert(Equal 132 (Sz (schemagen:spec-slice oa-v ["send_chat_completion_request"])))
+  assert(Equal 152 (Sz (schemagen:spec-slice oa-v
+                         ["get_models" "send_chat_completion_request"])))
 
-;;; The production slice must COMPILE, not merely derive typedef IR.
-;;; The exhaustive operation census stops before compilation, so a duplicate
-;;; DECLARATION sails straight past it and dies at module load
-;;; instead.  That is not hypothetical: chat_request lifts
-;;; chat_request_reasoning_effort from two field positions, minting the
-;;; same name twice, and "builds" said yes while the module would not
-;;; load (sg-dedupe-tds).  DeepSeq is what forces the compile — reading
-;;; the names alone leaves it a thunk and proves nothing.
-(Seq
+  ;;; The production slice must COMPILE, not merely derive typedef IR.
+  ;;; The exhaustive operation census stops before compilation, so a duplicate
+  ;;; DECLARATION sails straight past it and dies at module load
+  ;;; instead.  That is not hypothetical: chat_request lifts
+  ;;; chat_request_reasoning_effort from two field positions, minting the
+  ;;; same name twice, and "builds" said yes while the module would not
+  ;;; load (sg-dedupe-tds).  DeepSeq is what forces the compile — reading
+  ;;; the names alone leaves it a thunk and proves nothing.
   (define oa-chat-mods
-    (schemagen:compile-swagger-hand foil:default-subject jsut
-      (read-text-file "spec/openrouter.json")
-      ["get_models" "send_chat_completion_request"]))
-  (DeepSeq oa-chat-mods 0))
-assert(Equal "open_router_api" (_0 oa-chat-mods))
-assert(Equal "open_router_api_hand" (Ix 1 oa-chat-mods))
-assert(Eq 1 (DeepSeq (Ix 2 oa-chat-mods) 1))
+      (schemagen:compile-swagger-hand jsut
+        (read-text-file "spec/openrouter.json")
+        ["get_models" "send_chat_completion_request"]))
+  (DeepSeq oa-chat-mods 0)
+  assert(Equal "open_router_api" (_0 oa-chat-mods))
+  assert(Equal "open_router_api_hand" (Ix 1 oa-chat-mods))
+  assert(Eq 1 (DeepSeq (Ix 2 oa-chat-mods) 1))
 
-;;; E. /models expresses COMPLETELY — every schema in its closure —
-;;; which is what makes it the first operation a real client can use.
-(define oa-models (schemagen:spec-coverage-of oa-v ["get_models"]))
-assert(Equal [20 20 []] oa-models)
+  ;;; E. /models expresses COMPLETELY — every schema in its closure —
+  ;;; which is what makes it the first operation a real client can use.
+  (define oa-models (schemagen:spec-coverage-of oa-v ["get_models"]))
+  assert(Equal [20 20 []] oa-models)
 
-;;; ...and its whole module generates: 29 query parameters, all
-;;; optional, typed str/int/num.
-(define oa-parts (schemagen:sg-spec-parts oa-v ["get_models"]))
-assert(Equal "open_router_api" (_0 oa-parts))
-assert(Equal "https://openrouter.ai/api/v1" (Ix 1 oa-parts))
-assert(Equal 1 (Sz (Ix 3 oa-parts)))
-(define oa-op (_0 (Ix 3 oa-parts)))
-assert(Equal "get_models" (_0 oa-op))
-assert(Equal "get" (Ix 1 oa-op))
-assert(Equal [["lit" "models"]] (Ix 2 oa-op))
-assert(Equal [] (Ix 3 oa-op))
-assert(Equal 29 (Sz (Ix 4 oa-op)))
-;; a nullable integer, a plain integer, an enum-as-string, a number
-(define (qp nm) (_0 (find (lambda (p) (Eq nm (_0 p))) (Ix 4 oa-op))))
-assert(Equal ["offset" ["int"] 0] (qp "offset"))
-assert(Equal ["limit" ["int"] 0] (qp "limit"))
-assert(Equal ["category" ["str"] 0] (qp "category"))
-assert(Equal ["min_price" ["num"] 0] (qp "min_price"))
+  ;;; ...and its whole module generates: 29 query parameters, all
+  ;;; optional, typed str/int/num.
+  (define oa-parts (schemagen:sg-spec-parts oa-v ["get_models"]))
+  assert(Equal "open_router_api" (_0 oa-parts))
+  assert(Equal "https://openrouter.ai/api/v1" (Ix 1 oa-parts))
+  assert(Equal 1 (Sz (Ix 3 oa-parts)))
+  (define oa-op (_0 (Ix 3 oa-parts)))
+  assert(Equal "get_models" (_0 oa-op))
+  assert(Equal "get" (Ix 1 oa-op))
+  assert(Equal [["lit" "models"]] (Ix 2 oa-op))
+  assert(Equal [] (Ix 3 oa-op))
+  assert(Equal 29 (Sz (Ix 4 oa-op)))
+  ;; a nullable integer, a plain integer, an enum-as-string, a number
+  (define (qp nm) (_0 (find (lambda (p) (Eq nm (_0 p))) (Ix 4 oa-op))))
+  assert(Equal ["offset" ["int"] 0] (qp "offset"))
+  assert(Equal ["limit" ["int"] 0] (qp "limit"))
+  assert(Equal ["category" ["str"] 0] (qp "category"))
+  assert(Equal ["min_price" ["num"] 0] (qp "min_price"))
 
-;;; Small OpenAPI fixtures own response/status and naming semantics.
-(define edge-v (schemagen:sg-schema-value jsut
-                 (read-text-file "spec/openapi-test.json")))
+  ;;; Small OpenAPI fixtures own response/status and naming semantics.
+  (define edge-v (schemagen:sg-schema-value jsut
+                   (read-text-file "spec/openapi-test.json")))
 
-;;; A created or accepted body is the same thing to a client as an OK
-;;; one. Exercise 201 and 202 independently of the vendor document.
-(define oa-created (schemagen:sg-spec-parts edge-v ["create_workspace"]))
-assert(Equal 1 (Sz (Ix 3 oa-created)))
-assert(Equal "create_workspace" (_0 (_0 (Ix 3 oa-created))))
+  ;;; A created or accepted body is the same thing to a client as an OK
+  ;;; one. Exercise 201 and 202 independently of the vendor document.
+  (define oa-created (schemagen:sg-spec-parts edge-v ["create_workspace"]))
+  assert(Equal 1 (Sz (Ix 3 oa-created)))
+  assert(Equal "create_workspace" (_0 (_0 (Ix 3 oa-created))))
 
-;;; An operation may write its schema INLINE rather than as a $ref.
-;;; Everything downstream addresses types by name, so those had nowhere
-;;; to be addressed from; the type is now minted from the operation id.
-(define oa-inline (schemagen:sg-spec-parts edge-v ["get_analytics_meta"]))
-(define oa-iop (_0 (Ix 3 oa-inline)))
-assert(Equal "get_analytics_meta_res" (Ix 6 oa-iop))
-;; and the minted type is really emitted, not just named
-assert(Eq 1 (includes (Eq "get_analytics_meta_res")
-              (map (lambda (td) (Ix 1 td)) (Ix 2 oa-inline))))
+  ;;; An operation may write its schema INLINE rather than as a $ref.
+  ;;; Everything downstream addresses types by name, so those had nowhere
+  ;;; to be addressed from; the type is now minted from the operation id.
+  (define oa-inline (schemagen:sg-spec-parts edge-v ["get_analytics_meta"]))
+  (define oa-iop (_0 (Ix 3 oa-inline)))
+  assert(Equal "get_analytics_meta_res" (Ix 6 oa-iop))
+  ;; and the minted type is really emitted, not just named
+  assert(Eq 1 (includes (Eq "get_analytics_meta_res")
+                (map (lambda (td) (Ix 1 td)) (Ix 2 oa-inline))))
 
-;;; A name the generated module already uses is mangled, not rejected.
-;;; This document has schemas called `json` and `ws`, and an operationId
-;;; `list` — which is reserved only because json.foil came to need it.
-(define oa-resv (schemagen:sg-spec-parts edge-v ["list"]))
-assert(Equal "list_" (_0 (_0 (Ix 3 oa-resv))))
+  ;;; A name the generated module already uses is mangled, not rejected.
+  ;;; This document has schemas called `json` and `ws`, and an operationId
+  ;;; `list` — which is reserved only because json.foil came to need it.
+  (define oa-resv (schemagen:sg-spec-parts edge-v ["list"]))
+  assert(Equal "list_" (_0 (_0 (Ix 3 oa-resv))))
 
-(define oa-accepted (schemagen:sg-spec-parts edge-v ["accept_job"]))
-assert(Equal "accept_job" (_0 (_0 (Ix 3 oa-accepted))))
-assert(Equal "ws_" (Ix 6 (_0 (Ix 3 oa-accepted))))
-assert(Eq 1 (includes (Eq "json_")
-  (map (lambda (td) (Ix 1 td)) (Ix 2 oa-resv))))
-(print "foil-schemagen tests passed")
+  (define oa-accepted (schemagen:sg-spec-parts edge-v ["accept_job"]))
+  assert(Equal "accept_job" (_0 (_0 (Ix 3 oa-accepted))))
+  assert(Equal "ws_" (Ix 6 (_0 (Ix 3 oa-accepted))))
+  assert(Eq 1 (includes (Eq "json_")
+    (map (lambda (td) (Ix 1 td)) (Ix 2 oa-resv))))
+  (print "foil-schemagen tests passed")
+
+  1)
+
+assert(Equal 1 (check 0))

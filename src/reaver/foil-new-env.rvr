@@ -12,49 +12,86 @@
 
 (#bind rex (#module rex))
 
-(#bind foil (#module foil))
-(#bind foil-sast (#module foil-sast))
 (#bind foil-sast (#module foil-sast))
 (#bind foil-builtins (#module foil-builtins))
 (#bind foil-new-elab (#module foil-new-elab))
 (#bind foil-lower (#module foil-lower))
-(#bind foil-lore (#module foil-lore))
 (#bind foil-subject (#module foil-subject))
 (#bind foil-surface (#module foil-surface))
+(#bind foil-lore (#module foil-lore))
 
 (#bind ca (#module cairn))
 
 (define TY_ROOT "/foil/ty")
-
-(declare-cstr Layer TY_ROOT
-  [binds tany] ;; ax[bind]
-  [prev tany] ;; Unit[Layer]
-)
 
 (define (mod-decl? row) (Eq "s_decl" (_0 row)))
 (define (mod-import? row) (Eq "s_import" (_0 row)))
 
 (define (canonical-path-set paths)
   (map (Ix 0)
-    (rowify (cairn:tapax
-      (foldl (lambda (ax path) (cairn:putax path 1 ax))
-        cairn:empty-ax paths)))))
+    (rowify (ca:tapax
+      (foldl (lambda (ax path) (ca:putax path 1 ax))
+        ca:empty-ax paths)))))
 (define (source-entry-val path sut)
   (foil-lower:ir-entry-val
     (foil-subject:got-entry (foil-subject:canon-path path sut) sut)))
-
-(define empty-env ($Layer ca:empty-ax 0))
-
 
 (declare-cstr Perc TY_ROOT
   [rex tany] ;; parsed rex tree
   [sast tany] ;; parsed sast tree
   [layer tany] ;; compiled layer
+  [name tany] ;; loader/cache identity, including generated modules
+  [own-keys tany] ;; exact lowering set, including generated entries
+  [lore tany] ;; this source's documentation, with relative paths
 )
+
+(define perc-name Perc.name)
+(define perc-rex Perc.rex)
+(define perc-sast Perc.sast)
+(define (perc-subject perc) (Perc.layer perc))
+(define (perc-root perc) (foil-subject:sut-root (Perc.layer perc)))
+(define perc-own-keys Perc.own-keys)
+(define perc-lore Perc.lore)
+
+;; Import occurrences retain source order, duplicates, prefixes and spans.
+;; Dependencies are distinct direct module names, in first-occurrence order.
+(define (perc-imports perc) (filter mod-import? (Perc.sast perc)))
+(define import-module foil-surface:surf-import-modname)
+(define import-prefix foil-surface:surf-import-at)
+(define import-span foil-surface:surf-import-span)
+(define (perc-dependencies perc)
+  (foldl (lambda (seen imp)
+    (define name (import-module imp))
+    (If (includes (Equal name) seen) seen (snoc name seen)))
+    [] (perc-imports perc)))
+
+;; Source declarations exclude compiler-generated entries. All key sets
+;; use canonical storage paths, never an importer's visible spelling.
+(define (perc-declarations perc) (filter mod-decl? (Perc.sast perc)))
+(define (perc-declared-keys perc)
+  (canonical-path-set
+    (map (lambda (decl) (foil-subject:root-path
+      (Perc.layer perc) (Ix 1 decl))) (perc-declarations perc))))
+(define (perc-own-entries perc)
+  (map (lambda (key)
+    [key (foil-subject:got-entry key (Perc.layer perc))])
+    (Perc.own-keys perc)))
+
+;; The subject is authoritative; derive a world on demand. Consumers
+;; evaluating several expressions should retain/share the returned world.
+(define (perc-world perc)
+  (foil-new-elab:world-from-subject (Perc.layer perc)))
+
+;; Entry spans refer to the loader's source tree. Generated entries can
+;; share their originating declaration's span or have an empty span.
+(define (perc-entry-span key perc)
+  (define ent (foil-subject:got-entry key (Perc.layer perc)))
+  (If (Eq (Hd ent) "IR_ENTRY") (Ix 1 ent)
+    (foil-subject:tc-entry-span ent)))
 
 (define (get-perc name perc)
   (source-entry-val name (Perc.layer perc)))
-(define empty-foil-cache bst:E) ;;
+(define empty-foil-cache bst:E)
 
 ;; Nat -> Perc -> FoilCache
 (define (put-foil-cache nam perc cache)
@@ -62,36 +99,28 @@
 (define (get-foil-cache nam cache)
   (bst:bst-search nam cache))
 
-;; Path -> Layer -> Unit[Bind]
-(define (lookup-bind path lay)
-  (define bind (ca:getax path (Layer.binds lay)))
-  (define prev (Layer.prev lay))
-  (cond
-    ((And (Nil bind) prev) (lookup-bind path (_0 prev)))
-    ((Nil bind) 0)
-    (else bind)))
+;; Deterministic module-name order for tooling; hide the BST layout.
+(define (cache-results cache)
+  (map (Ix 1)
+    (sort (lambda (a b) (Cmp (_0 a) (_0 b)))
+      (rowify (bst:bst-ltap cache)))))
 
-(define (elab-mod compile sut decls)
-  (print "a")
+;; Returns [lowered subject, exact own key set].
+(define (elab-mod-info sut decls)
   (define mod
     (foil-new-elab:compiler-subject
       (foil-new-elab:elab-mod
         (foil-new-elab:compiler-for sut) decls)))
-  (print "b")
   (define final (foil-lower:materialize-consts mod))
-  (print "c")
   (define declared
     (map (lambda (d) (foil-subject:root-path final (Ix 1 d)))
       (filter mod-decl? decls)))
-  (print "d")
   (define delta
     (foil-subject:subject-entry-delta sut final))
   (define own-keys
       (canonical-path-set (Weld declared (map (Ix 0) delta))))
-  (print ("own-keys" own-keys))
   (define lowered (foil-lower:lower-tc-unit sut final own-keys))
-  (print "e")
-  (force lowered))
+  [(force lowered) own-keys])
 
 ;; -> [cache prev-pins direct-layers]: the row of import-subject PINS
 ;; (later-import-first, substrate last), plus the DIRECT imports as
@@ -109,8 +138,14 @@
         ((name (foil-surface:surf-import-modname imp))
          (at0 (foil-surface:surf-import-at imp))
          (at (Ifz at0 [] at0))
-         (compiled (compile cache1 name))
-         (cache2 (put-foil-cache name (_1 compiled) (_0 compiled)))
+         (compiled
+           (If (foil-surface:surf-import-order imp)
+             (error ["foil-import-order-unsupported"
+               ["module" name]
+               ["at" (foil-surface:surf-import-span imp)]
+               "remove order=; nearer imports and later siblings win"])
+             (compile cache1 name)))
+         (cache2 (_0 compiled))
          (lay (Perc.layer (_1 compiled))))
         ;; each import compiles in program order (see the DeepSeq in
         ;; `compile`: the head must be forced before elaboration)
@@ -147,27 +182,38 @@
         (else (foil-subject:mark-visible (Weld spell k) k s2))))
     s (foil-subject:subject-order lay)))
 
-;; TRANSITIVE visibility (Liam, 2026-09-03): every declaration anywhere
-;; in the import closure is importable here — no export filtering and
-;; no direct-only rule.  Far layers are marked before near ones and
-;; siblings in source order, so on a name collision the nearest (and
-;; then the later) layer wins; own decls are marked after this and win
-;; over everything.  Transitive layers (and the substrate, which ends
-;; every chain) spell under the bare root; a direct import spells under
-;; root ++ at.  A layer already marked under a spelling is not marked
-;; again (diamonds), so precedence follows the first, nearest reach.
-(define (mark-imports-visible root layers sut)
-  (define (mark-chain st lay spell)
-    (define key (Weld spell (foil-subject:sut-root lay)))
-    (If (ca:getax key (_1 st))
-      st
-      (let* ((prevs (foil-subject:sut-prevs lay))
-             (st1 (foldl (lambda (acc p) (mark-chain acc (Unpin p) root)) st (rev prevs)))
-             (s2 (mark-layer-under spell lay (_0 st1))))
-        [s2 (ca:putax key 1 (_1 st1))])))
-  (_0 (foldl
-        (lambda (st pair) (mark-chain st (_0 pair) (Weld root (_1 pair))))
-        [sut ca:empty-ax] layers)))
+;; Walk breadth-first, strongest first: shortest import distance wins;
+;; at equal distance later source siblings (and their paths) win. Mark
+;; the collected layers in reverse so the strongest spelling lands last.
+;; A direct prefix changes only that layer's spelling. Its dependencies
+;; enter the transitive, unprefixed scope. Dedup by spelling AND identity
+;; after ranking, so an earlier deep visit cannot hide a nearer import.
+(define (mark-imports-visible root base layers sut)
+  (define (level todo seen ranked)
+    (Ifz (Sz todo)
+      ranked
+      (let ((step
+              (foldl
+                (lambda (st pair)
+                  (define lay (_0 pair))
+                  (define spell (_1 pair))
+                  (define key [spell (foil-subject:sut-root lay)])
+                  (If (ca:getax key (_0 st)) st
+                    [(ca:putax key 1 (_0 st))
+                     (Weld (_1 st)
+                       (map (lambda (p) [(Unpin p) root])
+                         (foil-subject:sut-prevs lay)))
+                     (Weld [pair] (_2 st))]))
+                [seen [] ranked] todo)))
+        (level (_1 step) (_0 step) (_2 step)))))
+  (define ranked
+    (level
+      (map (lambda (pair) [(_0 pair) (Weld root (_1 pair))])
+        (rev layers))
+      (ca:putax [root (foil-subject:sut-root base)] 1 ca:empty-ax)
+      []))
+  (foldl (lambda (s pair) (mark-layer-under (_1 pair) (_0 pair) s))
+    (mark-layer-under root base sut) ranked))
 
 ;; make-head : Cord -> Subject -> [Pin] -> [[Subject Path]] -> [Decl] -> Subject
 ;; The fresh head of a compile: rooted at /boot/<mod> over the shared
@@ -182,16 +228,29 @@
   ;; shadow builtins) and explicitly — a module with no imports has no
   ;; chain through which the substrate would otherwise be reached
   (mark-own-visible decls
-    (mark-imports-visible root (Weld [[base []]] layers) head)))
+    (mark-imports-visible root base layers head)))
+
+;; Reject duplicate source declarations before constructing or lowering a head.
+;; Reopening a namespace remains valid when its declared member paths differ.
+(define (check-declarations decls)
+  (define (location span)
+    (If span ["line" (_0 span) "col" (_1 span)] "unknown-location"))
+  (define (step seen decl)
+    (define path (_1 decl))
+    (define first (ca:getax path seen))
+    (If first
+      (error ["foil-duplicate-decl" ["path" path]
+        ["at" (location (_2 decl))] ["first" (location (_0 first))]])
+      (ca:putax path (_2 decl) seen)))
+  (Seq (foldl step ca:empty-ax (filter mod-decl? decls)) 0))
 
 ;; cache -> module name -> [cache' perc]
-(define (compile-inner compile cache mod)
-  (define rex (rex:ParseRexNormFile (foil:get-foil mod)))
+(define (compile-inner compile cache mod rexn)
   (define base foil-builtins:default-subject)
-  (define sast (foil-sast:parse-module-sast 0 rex))
+  (define sast (foil-sast:parse-module-sast 0 rexn))
   (define imps (stream (filter mod-import? sast)))
-  (print ("imps" imps))
   (define decls (filter (lambda (r) (Nil (mod-import? r))) sast))
+  (check-declarations decls)
   (define res[cach prev-pins layers] (construct-subject compile cache base imps))
   ;; fresh head rooted at /boot/<mod> over the shared import pins; all
   ;; naming authority (substrate, the whole import closure, own decls)
@@ -205,36 +264,52 @@
   ;; that as a fatal <<loop>> instead of the import's error.  (The prev
   ;; pins stop DeepSeq; the unpinned direct layers in the marks do not.)
   (DeepSeq sut 0)
-  (define mod (elab-mod compile sut decls))
-  [cach ($Perc rex sast mod)])
+  (define out (elab-mod-info sut decls))
+  (define perc ($Perc rexn sast (_0 out) mod (_1 out)
+    (foil-lore:capture-lore rexn)))
+  ;; Publish only a completed result, including the requested root module.
+  (DeepSeq perc [(put-foil-cache mod perc cach) perc]))
+
+;; A loader returns normalized Rex. File and generated inputs share this
+;; engine; cache hits never call the loader. A cache belongs to one source
+;; revision: callers must invalidate changed modules and their dependents.
+(define (compile-go read-rex stack cache mod)
+  (If (includes (Equal mod) stack)
+    (error ["foil-import-cycle" ["modules" (snoc mod stack)]])
+    (let ((hit (get-foil-cache mod cache)))
+      (If hit [cache (_0 hit)]
+        (let ((result
+                (Try
+                  (lambda (z)
+                    (force
+                      (compile-inner
+                        (compile-go read-rex (snoc mod stack))
+                        cache mod (read-rex mod))))
+                  0)))
+          (If (Eq 1 (Hd result))
+            (error ["foil-in-module" mod (_0 result)])
+            (_0 result)))))))
+
+(define (read-module mod)
+  (rex:ParseRexNormFile
+    (read-text-file (strcat ["foil/" mod ".foil"]))))
+
+;; read-rex -> cache -> module name -> [cache' Perc]
+(define (compile-with read-rex cache mod)
+  (compile-go read-rex [] cache mod))
 
 (define (compile cache mod)
-  (define hit (get-foil-cache mod cache))
-  (Ifz hit (compile-inner compile cache mod)
-    [cache (_0 hit)]))
+  (compile-with read-module cache mod))
 
-(define (time f x)
-  (define start (Now 0))
-  (define res (f x))
-  (define done (Now 0))
-  (define timing (print ("took" (Sub done start))))
-  (Seq
-    start
-    (Seq res
-        (Seq timing res))))
+;; Generated modules are cached under their supplied name and can then be
+;; imported by later modules even when no source file exists.
+(define (compile-rex cache mod rexn)
+  (define (read-rex name)
+    (If (Equal name mod) rexn (read-module name)))
+  (compile-with read-rex cache mod))
 
-    ; res
-    ; done
-    ; timing
-    ; res))
-
-(define evo-perc (_1 (time (compile empty-foil-cache) "evo")))
-
-; (print ("test" (Perc.layer evo-perc)))
-(define perc-add (get-perc ["add_two"] evo-perc))
-(define mk-point (get-perc ["make_point"] evo-perc))
-(mk-point 3)
-(perc-add 3)
-
-(define (timed-compile mod)
-  (time (compile empty-foil-cache) mod))
+;; Evict one module before rebuilding; callers order dependent rebuilds.
+(define (remove-foil-cache name cache)
+  (foldl (lambda (out perc)
+    (If (Eq name (perc-name perc)) out (put-foil-cache (perc-name perc) perc out)))
+    empty-foil-cache (cache-results cache)))

@@ -6,7 +6,7 @@
 ;;;; source text at all.  The schema (parsed by json.foil) maps to a
 ;;;; typedef IR, the IR emits NORMALIZED REX directly (Leaf/Nest/Juxt
 ;;;; with inert zero spans — the structure refactor made spans pure
-;;;; diagnostics), and the tree feeds foil:compile-rex.  A human view
+;;;; diagnostics), and the tree feeds source:compile-rex.  A human view
 ;;;; is a printer concern, not a compilation artifact.
 ;;;;
 ;;;; v1 subset: records (object + required/optional -> maybe), string/
@@ -22,18 +22,21 @@
 (#import reef)
 
 (#bind rex (#module rex))
+(#bind rex-build (#module rex-build))
+(#import rex-build)
 
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
-(#bind foil (#module foil))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
 
 ;;; json value access (reps probed 2026-07-28: cstr-headed apps,
 ;;; brands "/boot/json/<v>", fields from Ix 0) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (sg-error why what) (error ["schemagen" why what]))
 
-(define (jv? tag v) (And (IsApp v) (Eq tag (Hd v))))
+(define (jv? tag v) (And (IsApp v) (Or (Eq tag (Hd v)) (Eq (strcat ["/boot/json/" (Rsh tag 48)]) (Hd v)))))
 (define (jv-obj? v) (jv? "/boot/json/obj" v))
 (define (jv-str? v) (jv? "/boot/json/str" v))
 (define (jv-arr? v) (jv? "/boot/json/arr" v))
@@ -1057,20 +1060,10 @@
 ;;; Tree emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; Emits normalized rex DIRECTLY — Leaf/Nest/Juxt with inert zero
-;;; spans, straight into foil:compile-rex.  Shapes mirror what
+;;; spans, straight into source:compile-rex.  Shapes mirror what
 ;;; ParseRexNormFile produces for the same source (probe-transcribed);
 ;;; the dev oracle was Equal against the span-zapped parse of the text
 ;;; emitter's output.
-
-(define nzsp [0 0 0 0])
-(define (nw s) (rex:MakeLeaf nzsp "word" s))
-(define (nc s) (rex:MakeLeaf nzsp "cord" s))
-(define (nrn rune kids) (rex:MakeNest nzsp "clear" rune kids))
-(define (npar kids) (rex:MakeNest nzsp "paren" "" kids))
-(define (nbrk kids) (rex:MakeNest nzsp "brack" "" kids))
-(define (nbrko rune kids) (rex:MakeNest nzsp "brack" rune kids))
-(define (njx kids) (rex:MakeJuxt nzsp kids))
-(define (ngrp kids) (If (Eq 1 (Sz kids)) (_0 kids) (nrn "" kids)))
 
 ;; BUG-COMPATIBLE, twice over: the parser's lore-line join writes a
 ;; LITERAL backslash-n (rex-unlines-go, rex.rvr:301 — string literals
@@ -1086,19 +1079,10 @@
 (define (nslug-top lines) (nslug-join (strcat ["\n" " "]) lines))
 (define (nslug lines) (nslug-join (strcat ["\n" "  '  "]) lines))
 
-(define (npth segs) (nrn "/" (map nw segs)))
 (define (nfc name ty) (nrn "=" [(nw name) ty]))
 ;; %  i=nat 0  out=row[t] []  — a loop head: `name=type init` pairs as
 ;; flat operands (the parser pairs them positionally; no > arms).
 (define (nloop pairs) (nrn "%" (foldl Weld [] pairs)))
-;; "." chains are FLAT in normalized rex (a.b.c(x) is ONE "." nest with
-;; kids [a b c-juxt]; parse-meth rejects a nested "." receiver), so a
-;; "."-nest receiver splices its kids.
-(define (ndot a b)
-  (If (And (Eq "nest" (Hd a))
-        (And (Eq "clear" (Ix 1 a)) (Eq "." (Ix 2 a))))
-    (nrn "." (snoc b (Ix 3 a)))
-    (nrn "." [a b])))
 (define (ndotw a b) (ndot (nw a) (nw b)))
 (define (nmeth recv seg args)
   (ndot recv (njx [(nw seg) (npar args)])))
@@ -1724,6 +1708,23 @@
            [(sg-rec-from-tree name fields)
             (sg-rec-to-tree name fields)]))]))))
 
+;; parse_<t> for every distinct response type: JSON text -> <t>_r.
+(define (sg-resp-parser-tree tname)
+  (define rsum (strcat [tname "_r"]))
+  (nrn "+"
+    [(nw (strcat ["parse_" tname]))
+     (nslug [(strcat ["Decode a " tname " from JSON text."])])
+     (nrn "\" [(nfc "s" (nw "str"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(npar [(nw "parse") (nw "s")])
+        (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                         (nfc "why" (nw "str")) (nfc "rest" (nw "nat"))])
+                  (nvap rsum "err" [(nc "") (nw "why")])])
+        (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                         (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
+                  (npar [(nw (strcat [tname "_from"])) (nw "v") (nc "")])])])]))
+
 (define (sg-root-trees root-name examples)
   (define rsum (strcat [root-name "_r"]))
   (define rt-lore
@@ -1734,19 +1735,7 @@
              (strcat ["?=  ((rt " (qq (dq-escape ex)) ") "
                       (qq (dq-escape ex)) ")"]))
         examples)))
-  [(nrn "+"
-     [(nw (strcat ["parse_" root-name]))
-      (nslug [(strcat ["Decode a " root-name " from JSON text."])])
-      (nrn "\" [(nfc "s" (nw "str"))])
-      (nrn "^" [(nw rsum)])
-      (nrn "?"
-        [(npar [(nw "parse") (nw "s")])
-         (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                          (nfc "why" (nw "str")) (nfc "rest" (nw "nat"))])
-                   (nvap rsum "err" [(nc "") (nw "why")])])
-         (nrn ">" [(npar [(nrn "./" [(nw "ok")])
-                          (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
-                   (npar [(nw (strcat [root-name "_from"])) (nw "v") (nc "")])])])])
+  [(sg-resp-parser-tree root-name)
    (nrn "+"
      [(nw (strcat ["show_" root-name]))
       (nslug [(strcat ["Encode a " root-name " compactly."])])
@@ -1768,6 +1757,12 @@
          (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" (nw root-name))])
                    (npar [(nw (strcat ["show_" root-name])) (nw "v")])])])])])
 
+(define (sg-typedef-trees tds)
+  (_1 (foldl (lambda (st td)
+                 (let ((r (sg-td-trees (_0 st) td)))
+                   [(_0 r) (Weld (_1 st) (_1 r))]))
+          [[] []] tds)))
+
 ;; -> [root-name tree]
 (define (sg-gen-tree show-fn sv)
   (define nt (sg-schema-typedefs sv))
@@ -1777,10 +1772,7 @@
   (define examples
     (Ifz exs-r [] (map show-fn (jv-xs! (_0 exs-r)))))
   (define td-trees
-    (_1 (foldl (lambda (st td)
-                 (let ((r (sg-td-trees (_0 st) td)))
-                   [(_0 r) (Weld (_1 st) (_1 r))]))
-          [[] []] tds)))
+    (sg-typedef-trees tds))
   [root-name
    (ngrp
      (Weld sg-prelude-trees
@@ -2199,23 +2191,6 @@
 ;; Back-compat: the whole document, every operation.
 (define (sg-swagger-parts sv) (sg-spec-parts sv []))
 
-;; parse_<t> for every distinct response type: JSON text -> <t>_r.
-(define (sg-resp-parser-tree tname)
-  (define rsum (strcat [tname "_r"]))
-  (nrn "+"
-    [(nw (strcat ["parse_" tname]))
-     (nslug [(strcat ["Decode a " tname " from JSON text."])])
-     (nrn "\" [(nfc "s" (nw "str"))])
-     (nrn "^" [(nw rsum)])
-     (nrn "?"
-       [(npar [(nw "parse") (nw "s")])
-        (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                         (nfc "why" (nw "str")) (nfc "rest" (nw "nat"))])
-                  (nvap rsum "err" [(nc "") (nw "why")])])
-        (nrn ">" [(npar [(nrn "./" [(nw "ok")])
-                         (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
-                  (npar [(nw (strcat [tname "_from"])) (nw "v") (nc "")])])])]))
-
 ;; The swagger TYPES module: definitions + serde + per-response
 ;; parsers.  (The hand emit joins this tree; reference phase first.)
 (define (sg-swagger-types-tree parts)
@@ -2224,10 +2199,7 @@
   (define ops (Ix 3 parts))
   (define resps (dedupe-eq (map (lambda (o) (Ix 6 o)) ops)))
   (define td-trees
-    (_1 (foldl (lambda (st td)
-                 (let ((r (sg-td-trees (_0 st) td)))
-                   [(_0 r) (Weld (_1 st) (_1 r))]))
-          [[] []] tds)))
+    (sg-typedef-trees tds))
   [name
    (ngrp
      (Weld sg-prelude-trees
@@ -2845,18 +2817,18 @@
 
 ;;; Public API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; Parse a schema document with json.foil's parse (jsut: a compiled
-;; json subject).
-(define (sg-schema-value jsut txt)
-  (define r ((foil:source-entry-val ["parse"] jsut) txt))
-  (If (Eq "/boot/jres/ok" (Hd r))
+;; Parse a schema document with json.foil's parse (jperc: a compiled
+;; json Perc).
+(define (sg-schema-value jperc txt)
+  (define r ((driver:get-perc ["parse"] jperc) txt))
+  (If (Eq "/boot/json/jres/ok" (Hd r))
     (Ix 0 r)
     (sg-error "schema-json" (Ix 0 r))))
 
 ;; Generate the module tree for a schema document.  -> [name tree]
-(define (gen-tree jsut schema-txt)
-  (sg-gen-tree (foil:source-entry-val ["show"] jsut)
-    (sg-schema-value jsut schema-txt)))
+(define (gen-tree jperc schema-txt)
+  (sg-gen-tree (driver:get-perc ["show"] jperc)
+    (sg-schema-value jperc schema-txt)))
 
 ;;; Spec inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -2911,42 +2883,45 @@
   (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
   [(Sub (Sz names) (Sz bad)) (Sz names) bad])
 
-;; Generate AND compile.  -> [cache' [name tree subject]].
-;; As with foil's cached API, only share caches compiled against
-;; default-subject.  Independent schemas
-;; must start from an imports-only cache: generated names can collide.
-(define (compile-schema-cached cache sut jsut schema-txt)
-  (define g (gen-tree jsut schema-txt))
-  (define c (foil:compile-rex-cached cache sut (_0 g) (_1 g)))
+;; Generate AND compile.  -> [cache' [name tree Perc]].
+;; Independent schemas start from an imports-only cache: generated names
+;; can collide.
+(define (compile-schema-cached cache jperc schema-txt)
+  (define g (gen-tree jperc schema-txt))
+  (define c (source:compile-rex cache (_0 g) (_1 g)))
   [(_0 c) [(_0 g) (_1 g) (_1 c)]])
 
-(define (compile-schema sut jsut schema-txt)
-  (_1 (compile-schema-cached 0 sut jsut schema-txt)))
+(define (compile-schema jperc schema-txt)
+  (_1 (compile-schema-cached driver:empty-foil-cache jperc schema-txt)))
 
 ;; Swagger: generate the TYPES module tree.  -> [name basepath ops tree]
 ;; opids = [] for the whole document, or the operations wanted — a real
 ;; spec is far larger than any one client needs, and module load forces
 ;; every top-level, so naming the operations is the normal case.
-(define (gen-swagger-types jsut swagger-txt opids)
-  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
+(define (gen-swagger-types jperc swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jperc swagger-txt) opids))
   (define nt (sg-swagger-types-tree parts))
   [(_0 nt) (Ix 1 parts) (Ix 3 parts) (_1 nt)])
 
 ;; Swagger: generate the HAND module tree (imports the types module by
 ;; name).  -> [hand-name tree]
-(define (gen-swagger-hand jsut swagger-txt opids)
+(define (gen-swagger-hand jperc swagger-txt opids)
   (sg-swagger-hand-tree
-    (sg-spec-parts (sg-schema-value jsut swagger-txt) opids)))
+    (sg-spec-parts (sg-schema-value jperc swagger-txt) opids)))
 
 ;; Generate AND compile both modules: the types module first, then the
 ;; hand against a cache holding it (a tree-fed module has no file, so
 ;; the hand's by-name import must resolve from the cache).
-;; -> [types-name hand-name subject]
-(define (compile-swagger-hand sut jsut swagger-txt opids)
-  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
+;; -> [cache' [types-name hand-name Perc]]
+(define (compile-swagger-hand-cached cache jperc swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jperc swagger-txt) opids))
   (define tname (_0 parts))
   (define tnt (sg-swagger-types-tree parts))
-  (define c1 (foil:compile-rex-cached 0 sut tname (_1 tnt)))
+  (define c1 (source:compile-rex cache tname (_1 tnt)))
   (define hnt (sg-swagger-hand-tree parts))
-  (define c2 (foil:compile-rex-cached (_0 c1) sut (_0 hnt) (_1 hnt)))
-  [tname (_0 hnt) (_1 c2)])
+  (define c2 (source:compile-rex (_0 c1) (_0 hnt) (_1 hnt)))
+  [(_0 c2) [tname (_0 hnt) (_1 c2)]])
+
+(define (compile-swagger-hand jperc swagger-txt opids)
+  (_1 (compile-swagger-hand-cached driver:empty-foil-cache
+    jperc swagger-txt opids)))

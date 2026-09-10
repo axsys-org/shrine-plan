@@ -1,0 +1,203 @@
+;;;; File and generated inputs exercise the same new module driver.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind driver (#module foil-new-env))
+(#bind bst (#module bst))
+
+(define empty driver:empty-foil-cache)
+(define (tree text) (rex:ParseRexNormFile text))
+(define (value path result) (driver:get-perc path (_1 result)))
+(define (must-not-read name) (error ["unexpected-source-read" name]))
+
+;; The requested root is cached, not just its imports. A hit can succeed
+;; with an unavailable loader and returns the original result and cache.
+(define disk (driver:compile empty "test_fixtures/env_low"))
+assert(Eq 11 (value ["equal"] disk))
+assert(Eq 1 (bst:bst-sz (_0 disk)))
+assert(Truth (driver:get-foil-cache "test_fixtures/env_low" (_0 disk)))
+(define warm
+  (driver:compile-with must-not-read (_0 disk) "test_fixtures/env_low"))
+assert(Equal disk warm)
+
+;; File and tree inputs share module compilation.
+(define from-tree
+  (driver:compile-rex empty "test_fixtures/env_low"
+    (driver:read-module "test_fixtures/env_low")))
+assert(Eq (value ["equal"] disk) (value ["equal"] from-tree))
+
+;; No file exists for these generated modules. An importer finds the
+;; completed dependency in the cache and can use its nominal constructor.
+(define generated
+  (driver:compile-rex empty "new_driver_generated"
+    (tree "+ token (: value=nat)
++ answer
+  ^ nat
+  40
++ boxed (token 9)
+")))
+(define consumer
+  (driver:compile-rex (_0 generated) "new_driver_consumer"
+    (tree "- new_driver_generated
++ result
+  ^ nat
+  (add answer 2)
++ boxed (token 9)
+")))
+assert(Eq 42 (value ["result"] consumer))
+assert(Equal (value ["boxed"] generated)
+  (value ["boxed"] consumer))
+assert(Equal "/boot/new_driver_generated/token"
+  (Hd (value ["boxed"] consumer)))
+assert(Eq 2 (bst:bst-sz (_0 consumer)))
+assert(Equal consumer
+  (driver:compile-with must-not-read (_0 consumer)
+    "new_driver_consumer"))
+assert(Equal consumer
+  (driver:compile-rex (_0 consumer) "new_driver_consumer"
+    (error "cached tree must not be demanded")))
+
+;; A tree-fed root can also import an ordinary file.
+(define mixed
+  (driver:compile-rex empty "new_driver_mixed"
+    (tree "- test_fixtures/env_type_provider
++ boxed (token 4)
+")))
+assert(Equal ("/boot/test_fixtures/env_type_provider/token" 4)
+  (value ["boxed"] mixed))
+assert(Eq 2 (bst:bst-sz (_0 mixed)))
+
+;; A diamond retains each completed module once in the returned cache.
+(define (diamond-source name)
+  (tree
+    (cond
+      ((Equal name "nd_root")
+        "- nd_left
+- nd_right
++ result
+  ^ nat
+  (add left right)
+")
+      ((Equal name "nd_left")
+        "- nd_leaf
++ left
+  ^ nat
+  (add leaf 1)
+")
+      ((Equal name "nd_right")
+        "- nd_leaf
++ right
+  ^ nat
+  (add leaf 2)
+")
+      ((Equal name "nd_leaf") "+ leaf
+  ^ nat
+  10
+")
+      (else (must-not-read name)))))
+(define diamond (driver:compile-with diamond-source empty "nd_root"))
+assert(Eq 23 (value ["result"] diamond))
+assert(Eq 4 (bst:bst-sz (_0 diamond)))
+
+;; Errors are forced inside the module boundary, including recursive
+;; imports and deferred failures in a generated declaration.
+(define (has-value wanted x)
+  (Or (Equal wanted x)
+    (And (IsApp x)
+      (any (has-value wanted)
+        (gen (Sz x) (lambda (i) (Ix i x)))))))
+(define (cycle-source name)
+  (tree (If (Equal name "nd_cycle_a")
+    "- nd_cycle_b
++ a
+  ^ nat
+  1
+"
+    "- nd_cycle_a
++ b
+  ^ nat
+  2
+")))
+(define cycle-error
+  (Try (lambda (z)
+    (driver:compile-with cycle-source empty "nd_cycle_a")) 0))
+assert(Eq 1 (Hd cycle-error))
+assert(has-value "foil-import-cycle" (_0 cycle-error))
+assert(has-value ["nd_cycle_a" "nd_cycle_b" "nd_cycle_a"]
+  (_0 cycle-error))
+assert(has-value "foil-in-module" (_0 cycle-error))
+(define self-error
+  (Try (lambda (z)
+    (driver:compile-rex empty "nd_self" (tree "- nd_self
+"))) 0))
+assert(Eq 1 (Hd self-error))
+assert(has-value ["nd_self" "nd_self"] (_0 self-error))
+(define missing-error
+  (Try (lambda (z)
+    (driver:compile-rex empty "nd_missing_root"
+      (tree "- new_driver_missing_file
+"))) 0))
+assert(Eq 1 (Hd missing-error))
+assert(has-value "nd_missing_root" (_0 missing-error))
+assert(has-value "new_driver_missing_file" (_0 missing-error))
+(define bad-error
+  (Try (lambda (z)
+    (driver:compile-rex (_0 generated) "nd_bad"
+      (tree "- new_driver_generated
++ bad
+  ^ nat
+  unknown_value
+"))) 0))
+assert(Eq 1 (Hd bad-error))
+assert(has-value "nd_bad" (_0 bad-error))
+assert(Nil (driver:get-foil-cache "nd_bad" (_0 generated)))
+assert(Eq 40 (value ["answer"] generated))
+
+(define (broken-source name)
+  (tree (If (Equal name "nd_parent")
+    "- nd_broken
++ result
+  ^ nat
+  1
+"
+    "+ bad
+  ^ nat
+  unknown_value
+")))
+(define imported-error
+  (Try (lambda (z)
+    (driver:compile-with broken-source empty "nd_parent")) 0))
+assert(Eq 1 (Hd imported-error))
+assert(Equal "foil-in-module" (_0 (_0 imported-error)))
+assert(Equal "nd_parent" (_1 (_0 imported-error)))
+assert(Equal "foil-in-module" (_0 (_2 (_0 imported-error))))
+assert(Equal "nd_broken" (_1 (_2 (_0 imported-error))))
+
+;; Duplicates are rejected in their source module before publishing a cache.
+(define duplicate-error
+  (Try (lambda (z)
+    (driver:compile-rex (_0 generated) "nd_duplicate"
+      (tree "+ ns
+  + value 1
++ ns
+  + value 2
+"))) 0))
+assert(Eq 1 (Hd duplicate-error))
+assert(has-value "foil-duplicate-decl" (_0 duplicate-error))
+assert(has-value ["path" ["ns" "value"]] (_0 duplicate-error))
+assert(has-value ["first" ["line" 2 "col" 3]] (_0 duplicate-error))
+assert(has-value ["at" ["line" 4 "col" 3]] (_0 duplicate-error))
+assert(Nil (driver:get-foil-cache "nd_duplicate" (_0 generated)))
+(define reopened
+  (driver:compile-rex empty "nd_reopened"
+    (tree "+ ns
+  + first 1
++ ns
+  + second 2
+")))
+assert(Eq 1 (value ["ns" "first"] reopened))
+assert(Eq 2 (value ["ns" "second"] reopened))
+
+(print "foil-new-env tests passed")

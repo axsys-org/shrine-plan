@@ -13,7 +13,6 @@
 (#bind cairn (#module cairn))
 
 
-(#bind ty (#module foil-types))
 (#bind new-ty (#module foil-new-types))
 (#bind cgen (#module codegen))
 (#bind profile-zone (#module profile-zone))
@@ -161,36 +160,22 @@
     (else (error ("lowering" val)))))
 
 ;; lower-tc : Subject -> TC -> IR
-;; Legacy entry-at-a-time lowering: every global is resolved immediately to
-;; the pinned entry already present in the progressively lowered subject.
+;; Expression lowering for doctests: globals resolve to compiled subject values.
 (define (lower-tc sut val)
-  (define (legacy-global depth path)
+  (define (resolve-global depth path)
     (cgen:G (got-const path sut)))
-  (lower-tc-go legacy-global sut 0 val))
-
-;; Lowering resolves TC_GLOBAL references from =out= — the subject that
-;; accumulates IR entries — so a referee's compiled value is available
-;; by the time its referrers lower (declaration order is
-;; define-before-use, enforced by elaboration).
-(define (lower-tc-entry out key ent)
-  (define tc (tc-entry-contents ent))
-  (define ir (lower-tc out tc))
-  (define span (tc-entry-span ent))
-  (define val (cgen:compile-expr ir))
-  (define ent1 (make-ir-entry key span val tc ir))
-  (insert-entry-sut key ent1 out))
+  (lower-tc-go resolve-global sut 0 val))
 
 ;; FFI entries are already runtime values, type entries have no runtime
 ;; representation, IR entries were lowered previously, and members that
 ;; reference const generic parameters cannot lower at the base — their
 ;; instantiations materialize (materialize-consts) and lower instead.
 (define (type-const-param-count typ)
+  (new-ty:require-type-value "lowering" typ)
   (cond
     ((new-ty:scheme? typ) (new-ty:scheme-const-parameter-count typ))
-    ;; New monotypes never carry quantifiers.  Keep the legacy walk wholly on
-    ;; legacy values so a stage-0 Path/Fun is not fed to FoilType matching.
     ((new-ty:monotype? typ) 0)
-    (else (ty:count-cqua typ))))
+    (else (error ["invalid lowering type" typ]))))
 
 (define (const-param-base-tc? tc)
   (Or (tc-has-cparam? tc) (Lt 0 (type-const-param-count (tc-ty tc)))))
@@ -229,7 +214,7 @@
 ;; reverted: it knots genuinely cyclic heap values, which the content-addressed
 ;; store cannot pin — the acyclicity here is a load-bearing invariant.)
 ;; Imported references remain pinned G edges through `base`.
-;; Sub-zone helper, same discipline as foil.rvr's zspan: open, FORCE
+;; Sub-zone helper: open, FORCE
 ;; INSIDE, close.  Closing before the value is demanded attributes none
 ;; of the work to the zone — laziness smears it onto whoever forces it.
 ;; c-lower and c-consts had no internal zones at all, which is why the
@@ -353,12 +338,10 @@
           (error ["unsubstituted const parameter" (tc-cparam-name tc)])
           (let ((arg (_1 (_0 hit))))
             (If (ty-val-path? arg)
-              ;; The literal's singleton type follows the parameter's algebra.
+              ;; Const values retain their singleton type after substitution.
               (let ((v (Ix 1 arg)))
                 (tc-lit
-                  (If (new-ty:type-value? (tc-ty tc))
-                    (new-ty:tconst v)
-                    (ty:TNAT v))
+                  (new-ty:tconst v)
                   v))
               (let ((referee (got-entry-tc arg sut)))
                 (If (Eq "TC_LAM" (Hd referee))
@@ -431,12 +414,11 @@
     (define base (ty-ap-base key))
     (define bentry (materialize-entry "member-mapping" base (sut-ax sut)))
     (define bty (tc-ty (tc-entry-contents bentry)))
-    ;; Parameter names in declaration order, from whichever algebra the
-    ;; base's type belongs to.
+    ;; Parameter names in declaration order from the base scheme.
     (define names
       (If (new-ty:scheme? bty)
         (map new-ty:parameter-name (new-ty:scheme-parameters bty))
-        (Weld (ty:tqua-names bty) (map (Ix 0) (ty:cqua-pairs bty)))))
+        (error ["generic base requires a Scheme" base bty])))
     (zip names (drop 1 (ty-ap-decode key))))
   (define (materialize st key)
     (define ax (_0 st))
@@ -495,16 +477,3 @@
 
 (define (materialize-consts sut)
   (materialize-consts-go sut 0))
-
-(define (lower-tc-mod-go sut out)
-  (define n[next sut1] (pop-subject-order sut))
-  (define entry (got-entry next sut))
-  (Ifz (subject-order sut) out
-    (let ((out1 (If (lowerable-entry? entry)
-                  (lower-tc-entry out next entry)
-                  out)))
-      (lower-tc-mod-go sut1 out1))))
-
-(define (lower-tc-mod sut out)
-  (lower-tc-mod-go sut out))
-
