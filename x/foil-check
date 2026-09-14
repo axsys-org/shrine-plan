@@ -1,8 +1,7 @@
 #!/bin/sh
 # x/foil-check MODULE...      (foil/sept.foil, src/foil/sept.foil, sept, apps/srs)
 #
-# Compiles each module through the production driver (foil:compile-mod
-# on the default subject - the same path x/lain-dev and helm take),
+# Compiles each module through foil-source and the sole foil-new-env driver,
 # forces every lowered entry the compile produced, and prints the
 # diagnostics as located lines.  Exit 1 when any module fails.
 #
@@ -18,11 +17,11 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${FOIL_SRC:-$ROOT/src}"
-WISP="$(command -v wisp || echo "$ROOT/wisp")"
+WISP="${WISP:-$(command -v wisp || echo "$ROOT/wisp")}"
 if [ ! -x "$WISP" ]; then
   echo "x/foil-check: no wisp on PATH and no $ROOT/wisp" >&2; exit 2
 fi
-TPL="$(ls -td "$ROOT/.check"/template-* 2>/dev/null | head -1)"
+TPL="$(ls -td "$ROOT/.check"/template-compiler-new-env-v1-* 2>/dev/null | head -1)"
 if [ -z "$TPL" ] || [ ! -e "$TPL/data.mdb" ]; then
   echo "x/foil-check: no x/check template to warm from - run x/check first" >&2; exit 2
 fi
@@ -47,13 +46,15 @@ cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
 (#import reef)
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
-(#bind foil (#module foil))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind lower (#module foil-lower))
 (#bind foil-render (#module foil-render))
 ;; Delta entries are canonical storage keys, including imported generic
 ;; instantiations.  Do not resolve them again as root-relative source names.
 ;; Force one lowered entry; 0 = fine, else the error
 (define (force-entry sut p)
-  (let ((r (Try (lambda (z) (Seq (DeepSeq (foil:ir-entry-val (got-entry p sut)) 1) 0)) 0)))
+  (let ((r (Try (lambda (z) (Seq (DeepSeq (lower:ir-entry-val (got-entry p sut)) 1) 0)) 0)))
     (If (Eq 1 (Hd r)) (_0 r) 0)))
 ;; Render a diagnostic tree defensively: the nested shapes are walked
 ;; here (foil-in-module, foil-new-elab-errors, in-decl) and every leaf
@@ -90,26 +91,20 @@ cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
       (DeepSeq (map emit-decl (_1 e)) 1))
     (else (DeepSeq (map (lambda (l) (say prefix l)) (leaf-lines e)) 1))))
 (define (check mod)
-  (let ((r (Try (lambda (z)
-                  (let ((sut (foil:compile-mod foil:default-subject mod)))
-                    (Seq (DeepSeq (subject-entry-delta foil:default-subject sut) 1) sut)))
-             0)))
-    (If (Eq 1 (Hd r))
-      (Seq (print ("FC" mod "FAIL")) (emit "" (_0 r)))
-      (let* ((sut (_0 r))
-             (own (map (Ix 0) (subject-entry-delta foil:default-subject sut)))
-             (vals (filter (lambda (p) (Eq "IR_ENTRY" (Hd (got-entry p sut)))) own))
-             (bad (filter (lambda (pe) (Truth (_1 pe)))
-                    (map (lambda (p) [p (force-entry sut p)]) vals))))
-        (If (Sz bad)
-          (Seq (print ("FC" mod "FAIL"))
-            (DeepSeq
-              (map (lambda (pe)
-                     (Seq (say "" (strcat ["lowering " (foil-render:render-plain (_0 pe)) " failed:"]))
-                       (emit "  " (_1 pe))))
-                bad)
-              1))
-          (print ("FC" mod "OK" (Sz own) (Sz vals))))))))
+  (define result (Try (lambda (z)
+    (force (_1 (source:compile driver:empty-foil-cache mod)))) 0))
+  (If (Eq 1 (Hd result))
+    (Seq (print ("FC" mod "FAIL")) (emit "" (_0 result)))
+    (let* ((perc (_0 result))
+           (sut (driver:perc-subject perc))
+           (own (driver:perc-own-keys perc))
+           (bad (filter (lambda (pe) (Truth (_1 pe)))
+             (map (lambda (p) [p (force-entry sut p)]) own))))
+      (If (Sz bad)
+        (Seq (print ("FC" mod "FAIL"))
+          (DeepSeq (map (lambda (pe) (emit "  " (_1 pe))) bad) 1))
+        (print ("FC" mod "OK" (Sz own) (Sz own)))))))
+
 EOF
   for m in $MODS; do echo "(check \"$m\")"; done
   echo '(print ("FC-DONE" 0))'

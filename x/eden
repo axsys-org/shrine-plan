@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Run the Eden namespace explorer; --check exercises the real socket."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
+import re
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -15,6 +18,8 @@ root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port', type=int, default=8130)
 parser.add_argument('--check', action='store_true')
+parser.add_argument('--srs', action='store_true',
+                    help='Publish Grove SRS definitions and offer instance installation in the UI')
 args = parser.parse_args()
 if not 1 <= args.port <= 65535:
     parser.error('--port must be between 1 and 65535')
@@ -37,15 +42,20 @@ with log_path.open('w') as log:
         [runtime, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
         cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
     try:
-        process.stdin.write(f'(#bind eden (#module eden-boot))\n(eden:start {args.port})\n')
+        entry = f'(eden:start-srs {args.port})' if args.srs else f'(eden:start {args.port} 0)'
+        process.stdin.write(f'(#bind eden (#module eden))\n{entry}\n')
         process.stdin.flush()
         deadline = time.monotonic() + 300
         while True:
             output = log_path.read_text(errors='replace')
             if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output or 'bind/listen failed' in output:
                 raise RuntimeError(output[-5000:])
-            if 'pump: listening' in output:
-                break
+            if re.search(r'^"?HTTP foot listening"?$', output, re.MULTILINE):
+                try:
+                    with socket.create_connection(('127.0.0.1', args.port), timeout=0.2):
+                        break
+                except (ConnectionRefusedError, TimeoutError):
+                    pass
             if time.monotonic() > deadline:
                 raise RuntimeError(f'Server startup timed out; inspect {log_path}')
             time.sleep(0.25)
@@ -54,23 +64,84 @@ with log_path.open('w') as log:
             def get(path='/'):
                 with urllib.request.urlopen(url + path, timeout=20) as response:
                     return response.read().decode()
+            if args.srs:
+                preview = get('/ns/gov/srs')
+                assert 'Install instance' in preview
+                assert 'name="root"' in preview
+                assert 'no record at this node' in get('/ns/gov/srs/cards/demo')
+                grade = get('/ns/gov/srs/grade')
+                assert 'compiled Grove module' in grade
+                version = re.search(r'name="version" value="(\d+)"', preview)
+                assert version, preview
+                def install_instance(target, case=version.group(1)):
+                    data = urllib.parse.urlencode({
+                        'source': '/gov/srs', 'version': case, 'root': target
+                    }).encode()
+                    with urllib.request.urlopen(urllib.request.Request(
+                            url + '/grove/install', data=data), timeout=30) as response:
+                        return response.read().decode()
+                assert 'committed' in install_instance('/app/srs')
+                assert 'committed' in install_instance('/app/second')
+                for target, case in [('/app/srs', version.group(1)), ('/app/stale', '0')]:
+                    try:
+                        install_instance(target, case)
+                        raise AssertionError('Conflicting/stale installation must fail')
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 409
+                assert 'Install instance' in get('/ns/gov/srs')
+                assert 'What does a Shrine name identify?' in get('/ns/app/srs/cards/demo')
+                assert 'What does a Shrine name identify?' in get('/ns/app/second/cards/demo')
+                assert 'path="/x/app/srs/next/0"' in get('/ns/x/app/srs/next')
+                assert 'no record at this node' in get('/ns/app/srs/grade')
             assert 'sh-triptych' in get('/ns')
             assert 'Hello from Eden.' in get('/ns/hello')
+            with ThreadPoolExecutor(max_workers=4) as clients:
+                assert all('Hello from Eden.' in page
+                           for page in clients.map(get, ['/ns/hello'] * 8))
+                paths = ['/w.js', '/ns/hello', '/style.css'] * 4
+                for path, page in zip(paths, clients.map(get, paths)):
+                    if path == '/ns/hello':
+                        assert 'Hello from Eden.' in page
+                    elif path == '/w.js':
+                        assert 'w-get' in page
+                    else:
+                        assert len(page) > 100
+            def raw_request(parts):
+                with socket.create_connection(('127.0.0.1', args.port), timeout=20) as connection:
+                    for part in parts:
+                        connection.sendall(part)
+                        time.sleep(0.02)
+                    received = []
+                    while chunk := connection.recv(65536):
+                        received.append(chunk)
+                    return b''.join(received)
+            assert b'400' in raw_request([b'garbage\r\n\r\n']).split(b'\r\n', 1)[0]
+            assert b'400' in raw_request([
+                b'GET /ns/%zz HTTP/1.1\r\nHost: localhost\r\n\r\n'
+            ]).split(b'\r\n', 1)[0]
+            body = b'message=Split+request+verified.'
+            header = (b'POST /edit/hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: '
+                      + str(len(body)).encode() + b'\r\n\r\n')
+            assert b'committed' in raw_request([header[:17], header[17:], body[:8], body[8:]])
+            assert 'Split request verified.' in get('/ns/hello')
             def post(path, fields):
                 data = urllib.parse.urlencode(fields).encode()
                 with urllib.request.urlopen(urllib.request.Request(url + path, data=data), timeout=30) as response:
                     return response.read().decode()
-            assert 'committed' in post('/vine/hello', {'verb': 'poke', 'expr': "(myth/sing ['message] (pails/t \"Eden write verified.\"))"})
+            assert 'committed' in post('/edit/hello', {'message': 'Eden write verified.'})
             assert 'Eden write verified.' in get('/ns/hello')
             assert 'Hello from Eden.' in get('/ns/h/x/1/1/hello')
-            assert 'committed' in post('/vine/created', {'verb': 'make', 'expr': "(myth/sing ['message] (pails/t \"Created through HTTP.\"))"})
-            assert 'Created through HTTP.' in get('/ns/created')
-            assert 'committed' in post('/vine/created', {'verb': 'cull'})
-            assert 'no record at this node' in get('/ns/created')
+            assert 'committed' in post('/vine/hello', {'verb': 'cull'})
+            assert 'no record at this node' in get('/ns/hello')
             assert 'component zoo' in get('/weft')
             assert 'w-get' in get('/w.js')
             assert len(get('/style.css')) > 100
-            print('Eden e2e passed: explorer, make/poke/cull, readback, history, zoo, and assets.', flush=True)
+            try:
+                post('/vine/created', {'verb': 'make', 'expr': '(myth/new)'})
+                raise AssertionError('Expression route should require the compiler service')
+            except urllib.error.HTTPError as error:
+                assert error.code == 501
+            print('Eden e2e passed: Foil foot, explorer, edit/cull, readback, history, zoo, and assets.', flush=True)
         else:
             print('State lasts for this run. Ctrl-C stops the server.', flush=True)
             process.wait()

@@ -6,7 +6,7 @@
 #   x/profile-parse                      # whole compilation of lain through the foil-new-env pipeline
 #   x/profile-parse --parse-only         # only read + rex parse + surface parse of lain's closure files
 #   x/profile-parse --mods "lain web"    # root modules to compile (or, with --parse-only, files to parse)
-#   x/profile-parse --uncached       # compile with NO import cache: every import edge recompiles
+#   x/profile-parse --uncached       # compile each root with a fresh import cache
 #                                        # (default = each module once)
 #   x/profile-parse --samply | --tracy   # profiler (default: samply when on PATH, else the Tracy build)
 #   x/profile-parse --fresh              # rebuild the staged snapshot first
@@ -24,17 +24,13 @@
 #
 # Stage 1 (plain wisp, cached in .profile/parse/snap, keyed by a hash of every
 # src/reaver/*.rvr + src/plan): boot + stdlib (+P2), bind the whole compiler
-# chain (rex, foil, foil-new-elab, foil-lower, foil-new-env ...), define the
+# chain (rex, foil-source, foil-new-elab, foil-lower, foil-new-env ...), define the
 # loads, and RUN the compile load ONCE so law bytecode compilation and every
 # other first-use cost lands in the snapshot.
-# Stage 2 (profiler, one session on a COPY of that snapshot): only the load
-# runs.  Every stage is a zone forced inside the zone (ZoneStart/ZoneEnd —
-# visible in Tracy; samply sees the wisp frames underneath):
-#   compile.load > compile.mod.<mod> > parse.read/rex/sast.<mod>,
-#   compile.imports.<mod> (nested compiles), compile.head/elab/consts/delta/lower.<mod>
-# and the session prints a per-module, per-stage millisecond table as well.
-# Subject-valued stages force their entries THROUGH pins (DeepSeq stops at
-# pins), so elaboration work is charged to elab, not to lowering.
+# Stage 2 runs on a copy of the bootstrap. Compile mode measures each root
+# and the total load through the sole driver. Parse-only mode measures read,
+# Rex, and SAST stages. Results contain counts, never saved compiler caches.
+# Fine-grained compilation is not reimplemented by this profiling harness.
 #
 # The Tracy build needs a CONNECTED client: --wait-for-tracy blocks until one
 # connects (=N gives up waiting after N seconds and runs anyway), and with no
@@ -93,7 +89,7 @@ cat <<'EOF'
 (#bind reef (#module reef))
 (#import reef)
 (#bind rex (#module rex))
-(#bind foil (#module foil))
+(#bind source (#module foil-source))
 (#bind foil-sast (#module foil-sast))
 (#bind foil-builtins (#module foil-builtins))
 (#bind foil-new-elab (#module foil-new-elab))
@@ -112,12 +108,6 @@ cat <<'EOF'
   (define t1 (Seq e (Now 0)))
   (define msg (print ("STAGE" lbl (Div (Sub t1 t0) 1000000))))
   (seqN t0 h r d e t1 msg r))
-;; DeepSeq stops at pins: force a subject's own entries through them.
-(define (fsut sut)
-  (foldl (lambda (acc k) (Seq (DeepSeq (foil-subject:got-entry k sut) 0) acc))
-    0 (foil-subject:subject-order sut)))
-(define (tzs lbl thunk)
-  (tz lbl (lambda (_) (let ((s (thunk 0))) (Seq (fsut s) s)))))
 (define (parse-one mod)
   (define src (tz (strcat ["parse.read." mod]) (lambda (_) (read-text-file (strcat ["foil/" mod ".foil"])))))
   (define rexn (Seq src (tz (strcat ["parse.rex." mod]) (lambda (_) (rex:ParseRexNormFile src)))))
@@ -125,53 +115,16 @@ cat <<'EOF'
   (seqN src rexn sast sast))
 (define (parse-load mods)
   (tz "parse.load" (lambda (_) (map (lambda (m) (Sz (parse-one m))) mods))))
-;; compile-one : Bool -> Ax[name -> lowered subject] -> Cord -> [cache lowered]
-;; The foil-new-env pipeline with the same stage cuts as the driver: parse,
-;; imports (recursive; cached per name unless use-cache? is 0), fresh head
-;; over the shared import pins + visibility marks, elab, const
-;; materialization, delta/own-keys, lowering.
-(define (compile-one use-cache? cache0 mod)
-  (define tstart (Now 0))
-  (define base foil-builtins:default-subject)
-  (define (stage lbl) (strcat ["compile." lbl "." mod]))
-  (define (walk cache pins layers imps)
-    (Ifz (Sz imps)
-      [cache (snoc (Pin base) pins) layers]
-      (let* ((name (foil-surface:surf-import-modname (_0 imps)))
-             (hit (If use-cache? (ca:getax [name] cache) 0))
-             (cr (If hit [cache (ca:gotax [name] cache)] (compile-one use-cache? cache name)))
-             (lay (_1 cr))
-             (cache2 (cond (hit cache) (use-cache? (ca:putax [name] lay (_0 cr))) (else cache)))
-             (at0 (foil-surface:surf-import-at (_0 imps)))
-             (at (Ifz at0 [] at0)))
-        ;; force the nested compile HERE, in program order, before the next
-        ;; import — otherwise DeepSeq's traversal of the result decides when
-        ;; each nested compile runs and the stage prints interleave
-        (Seq lay (walk cache2 (Weld [(Pin lay)] pins) (snoc [lay at] layers) (drop 1 imps))))))
-  (define sast (parse-one mod))
-  (define imps (filter nfoil:mod-import? sast))
-  (define decls (filter (lambda (r) (Nil (nfoil:mod-import? r))) sast))
-  (define res (Seq sast (tz (stage "imports") (lambda (_) (walk cache0 [] [] imps)))))
-  (define head (Seq res (tzs (stage "head") (lambda (_)
-     (nfoil:make-head mod base (_1 res) (_2 res) decls)))))
-  (define elabbed (Seq head (tzs (stage "elab") (lambda (_)
-     (foil-new-elab:compiler-subject
-       (foil-new-elab:elab-mod (foil-new-elab:compiler-for head) decls))))))
-  (define final (Seq elabbed (tzs (stage "consts") (lambda (_) (foil-lower:materialize-consts elabbed)))))
-  (define declared (map (lambda (d) (foil-subject:root-path final (Ix 1 d))) (filter nfoil:mod-decl? decls)))
-  (define own (Seq final (tz (stage "delta") (lambda (_)
-     (nfoil:canonical-path-set (Weld declared (map (Ix 0) (foil-subject:subject-entry-delta head final))))))))
-  (define lowered (Seq own (tz (stage "lower") (lambda (_) (foil-lower:lower-tc-unit head final own)))))
-  (define tend (Seq lowered (Now 0)))
-  (define msg (print ("STAGE" (stage "mod") (Div (Sub tend tstart) 1000000))))
-  (seqN tstart sast res head elabbed final own lowered tend msg [(_0 res) lowered]))
+(define (compile-one use-cache? cache mod)
+  (tz (strcat ["compile.mod." mod]) (lambda (_)
+    (source:compile (If use-cache? cache nfoil:empty-foil-cache) mod))))
 (define (compile-load use-cache? mods)
   (tz "compile.load" (lambda (_)
-    (_1 (foldl
-          (lambda (st m)
-            (let ((r (compile-one use-cache? (_0 st) m)))
-              [(_0 r) (snoc (Sz (foil-subject:subject-order (_1 r))) (_1 st))]))
-          [ca:empty-ax []] mods)))))
+    (_1 (foldl (lambda (st mod)
+      (define result (compile-one use-cache? (_0 st) mod))
+      [(_0 result) (snoc (Sz (nfoil:perc-own-keys (_1 result))) (_1 st))])
+      [nfoil:empty-foil-cache []] mods)))))
+
 EOF
 }
 
@@ -210,7 +163,7 @@ cd "$RUN"
 # wrapper: extra environment is exported here and inherited by the session
 # shellcheck disable=SC2086
 [ -z "$WISP_ENV" ] || export $WISP_ENV
-if [ "$MODE" = "parse" ]; then WHAT="parse of [$MODS]"; else WHAT="compile of [$MODS]$( [ "$USE_CACHE" = 1 ] || printf ' (no import cache)')"; fi
+if [ "$MODE" = "parse" ]; then WHAT="parse of [$MODS]"; else WHAT="compile of [$MODS]$( [ "$USE_CACHE" = 1 ] || printf ' (fresh cache per root)')"; fi
 # shellcheck disable=SC2086
 if [ "$PROFILER" = "samply" ]; then
   echo "x/profile-parse: $WHAT: samply $SAMPLY_FLAGS on $WISP_RUN -> $RUN/profile.json.gz" >&2
@@ -251,8 +204,8 @@ grep -a '^("STAGE" ' run.log | perl -e '
     if ($st eq "mod") { $row{$key}{total} = $ms; $occ{$mod}++; next }
     $row{$key}{$st} = $ms;
   }
-  my $compile = grep { exists $row{$_}{elab} } keys %row;
-  my @cols = $compile ? @stages : qw(read rex sast);
+  my $compile = grep { exists $row{$_}{total} } keys %row;
+  my @cols = $compile ? () : qw(read rex sast);
   printf "%-14s" . ("%8s" x @cols) . ($compile ? "%8s%8s" : "") . "\n", "module", @cols, ($compile ? ("total", "excl") : ());
   my %sum;
   for my $k (@order) {

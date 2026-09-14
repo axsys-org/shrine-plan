@@ -1,0 +1,466 @@
+- grove
+- grove_role_runtime
+'  Role analysis and Rex generation. Native compiler state stays opaque.
++ grove_roles
+  + field
+    : span=rex/source_span name=str slot=path
+      type=rex codec=rex optional=bool
+  + shape
+    : fields=row[grove_roles/field] need=row[row[path]]
+  + fail
+    (@ a)
+    \ span=rex/source_span message=str
+    ^ either[grove/error a]
+    | ./err (grove/error/syntax span message)
+  + is_role
+    \ body=row[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) (equal kind (grove/tag_kind/role))
+    .false
+  + parts
+    \ tree=rex
+    ^ either[grove/error path]
+    ? tree
+     > (./leaf span shape text)
+      ? (equal tree.leaf_kind (maybe/some[str] "word"))
+        | ./ok [($ts text)]
+      ? (equal tree.leaf_kind (maybe/some[str] "cord"))
+        = parts (str/split_byte 47 text)
+        ? !(eq parts.at(0) "")
+          | grove_roles/fail[path] span "Expected absolute slot path."
+        | ./ok parts.drop(1).map((\ x ($ts x)))
+      | grove_roles/fail[path] span "Expected slot or type reference."
+     > (./nest span color rune kids)
+      ? !((eq rune "/") || (eq rune "%/"))
+        | grove_roles/fail[path] span "Expected slot or type reference."
+      % rest=row[rex] kids out=path []
+      ^ either[grove/error path]
+      ? (eq rest.len 0) (./ok out)
+      < next (grove_roles/parts rest.at(0))
+      | _ rest.drop(1) out.weld(next)
+    | grove_roles/fail[path] tree.span
+      "Expected slot or type reference."
+  + imports
+    \ doc=grove/document
+    ^ row[grove/import_decl]
+    | doc.items.bind
+    \ item
+    ? item
+     > imp=grove/import_decl [imp]
+    []
+  + local_slot
+    \ tree=rex
+    ^ bool
+    ? tree
+     > (./nest span color rune kids)
+      ? (eq rune "%/") .true
+      | row/any[rex] grove_roles/local_slot kids
+    .false
+  + slot
+    \ root=path doc=grove/document tree=rex
+    ^ either[grove/error path]
+    = norm (rex/normalize tree)
+    < parts (grove_roles/parts norm)
+    ? (eq parts.len 0)
+      | grove_roles/fail[path] tree.span "Empty slot path."
+    ? (grove_roles/local_slot norm) (./ok root.weld(parts))
+    ? (equal tree.leaf_kind (maybe/some[str] "cord")) (./ok parts)
+    % rest=row[grove/import_decl] (grove_roles/imports doc)
+    ^ either[grove/error path]
+    ? (eq rest.len 0) (./ok parts)
+    = imp rest.at(0)
+    ? (equal parts.at(0) ($ts imp.alias))
+      < base (grove_roles/parts (rex/normalize imp.target))
+      | ./ok base.weld(parts.drop(1))
+    | _ rest.drop(1)
+  + add_field
+    \ field=grove_roles/field shape=grove_roles/shape
+    ^ either[grove/error grove_roles/shape]
+    ? (row/any[grove_roles/field]
+        (\ old (equal old.slot field.slot)) shape.fields)
+      | grove_roles/fail[grove_roles/shape] field.span
+        "Duplicate or inherited role slot."
+    ? (row/any[grove_roles/field]
+        (\ old (eq old.name field.name)) shape.fields)
+      | grove_roles/fail[grove_roles/shape] field.span
+        "Role field names collide; use distinct slot names."
+    = reserved=row[str]
+        ["extra" "fields" "schema" "spec" "from_myth" "to_myth"
+         "read" "write" "contract"]
+    ? reserved.has(field.name)
+      | grove_roles/fail[grove_roles/shape] field.span
+        "Role field name conflicts with a generated member."
+    | ./ok shape.set_fields(shape.fields.snoc(field))
+  + member
+    \ names=row[str] base=rex
+    ^ rex
+    | rex/rune "/" (row/weld[rex] names.map(rex/word) [base])
+  + inherited
+    \ base=rex schema=grove_role_schema span=rex/source_span
+    ^ grove_roles/shape
+    = fields
+        | schema.fields.map
+        \ field
+        = codec (grove_roles/member ["fields" field.name] base)
+          type (grove_roles/member ["value_type"] codec)
+        | grove_roles/field span field.name field.slot
+          type codec field.optional
+    | grove_roles/shape fields schema.need
+  + merge
+    \ next=grove_roles/shape shape=grove_roles/shape
+    ^ either[grove/error grove_roles/shape]
+    % rest=row[grove_roles/field] next.fields
+      out=grove_roles/shape shape
+    ^ either[grove/error grove_roles/shape]
+    ? (eq rest.len 0)
+      | ./ok out.set_need(out.need.weld(next.need))
+    < out (grove_roles/add_field rest.at(0) out)
+    | _ rest.drop(1) out
+  + parent
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      stack=row[str] tree=rex
+    ^ either[grove/error grove_roles/shape]
+    < parts (grove_roles/parts (rex/normalize tree))
+    ? !(eq parts.len 1)
+      | grove_roles/fail[grove_roles/shape] tree.span
+        "#with requires a local role or imported role alias."
+    = name (str/from_atom (quip_val parts.at(0)))
+    % rest=row[grove/item] doc.items
+    ^ either[grove/error grove_roles/shape]
+    ? (eq rest.len 0)
+      | grove_roles/fail[grove_roles/shape] tree.span "Unknown role."
+    ? rest.at(0)
+     > (grove/declaration span nam body)
+      ? nam
+       > (grove/name/identifier text)
+        ? (eq text name)
+          ? !(grove_roles/is_role body)
+            | grove_roles/fail[grove_roles/shape] tree.span
+              "#with target is not a role."
+          ? stack.has(text)
+            | grove_roles/fail[grove_roles/shape] tree.span
+              "Cyclic role inheritance."
+          < shape (grove_roles/analyze root doc lookup stack text body)
+          = schema (grove_roles/schema shape)
+          | ./ok
+            (grove_roles/inherited (rex/word name) schema tree.span)
+        | _ rest.drop(1)
+      | _ rest.drop(1)
+     > (grove/import_decl span alias target)
+      ? !(eq name alias) (_ rest.drop(1))
+      < path (grove_roles/parts (rex/normalize target))
+      > (./some card) (lookup path)
+        | grove_roles/fail[grove_roles/shape] span
+          "Missing role import."
+      > (./some value) card.get(['sys 'grove 'role])
+        | grove_roles/fail[grove_roles/shape] span
+          "Imported declaration has no role schema."
+      > schema=grove_role_schema value
+        | grove_roles/fail[grove_roles/shape] span
+          "Invalid role schema."
+      | ./ok (grove_roles/inherited (rex/word alias) schema tree.span)
+    | _ rest.drop(1)
+  + properties
+    \ root=path doc=grove/document optional=bool
+      span=rex/source_span body=row[grove/statement]
+      shape=grove_roles/shape
+    ^ either[grove/error grove_roles/shape]
+    ? (eq body.len 0) (./ok shape)
+    ? body.at(0)
+     > (grove/comment span text)
+      | grove_roles/properties root doc optional span body.drop(1) shape
+     > (grove/property span slot type)
+      < path (grove_roles/slot root doc slot)
+      = name (str/from_atom (quip_val path.at((dec path.len))))
+        norm (rex/normalize type)
+      < checked (grove_roles/parts norm)
+      = field (grove_roles/field span name path norm norm optional)
+      < next (grove_roles/add_field field shape)
+      | grove_roles/properties root doc optional span body.drop(1) next
+    | grove_roles/fail[grove_roles/shape] span
+      "Role groups contain only properties and comments."
+  + analyze
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      stack=row[str] name=str body=row[grove/statement]
+    ^ either[grove/error grove_roles/shape]
+    ? stack.has(name)
+      | grove_roles/fail[grove_roles/shape] rex/zero_span
+        "Cyclic role inheritance."
+    % rest=row[grove/statement] body
+      shape=grove_roles/shape (grove_roles/shape [] [])
+    ^ either[grove/error grove_roles/shape]
+    ? (eq rest.len 0) (./ok shape)
+    ? rest.at(0)
+     > (grove/tag span kind)
+      ? ((equal kind (grove/tag_kind/role)) ||
+         (equal kind (grove/tag_kind/slot)))
+        | _ rest.drop(1) shape
+      | grove_roles/fail[grove_roles/shape] span
+        "Incompatible role tag."
+     > (grove/comment span text) (_ rest.drop(1) shape)
+     > (grove/property span slot type)
+      < next (grove_roles/properties root doc .false span
+          [rest.at(0)] shape)
+      = field next.fields.at((dec next.fields.len))
+      | _ rest.drop(1) next.set_need(next.need.snoc([field.slot]))
+     > (grove/directive span kind target)
+      ? !(equal kind (grove/directive_kind/with))
+        | grove_roles/fail[grove_roles/shape] span
+          "Only #with is supported on roles."
+      < parent (grove_roles/parent root doc lookup
+          stack.snoc(name) target)
+      < next (grove_roles/merge parent shape)
+      | _ rest.drop(1) next
+     > (grove/block span kind kids)
+      ? (equal kind (grove/block_kind/meta)) (_ rest.drop(1) shape)
+      ? !((equal kind (grove/block_kind/or)) ||
+          (equal kind (grove/block_kind/opt)))
+        | grove_roles/fail[grove_roles/shape] span
+          "Unsupported role block."
+      < next (grove_roles/properties root doc .true span kids shape)
+      = added next.fields.drop(shape.fields.len)
+      ? (eq added.len 0)
+        | grove_roles/fail[grove_roles/shape] span "Empty role group."
+      = need
+          ? (equal kind (grove/block_kind/or))
+            next.need.snoc(added.map((\ field field.slot)))
+          next.need
+      | _ rest.drop(1) next.set_need(need)
+     > (grove/implementation span code)
+      | grove_roles/fail[grove_roles/shape] span
+        "Explicit implementations on roles are unsupported."
+  + schema
+    \ shape=grove_roles/shape
+    ^ grove_role_schema
+    = fields
+        | shape.fields.map
+        \ field
+        | grove_role_field field.name field.slot field.optional
+    | grove_role_schema fields shape.need
+  + template
+    \ span=rex/source_span text=str pairs=row[[str rex]]
+    ^ rex
+    > (./ok tree) (rex/parse_normalized text)
+      | rex/word "invalid_role_template"
+    | tree.walk
+    \ node
+    = node node.with_span(span)
+    > (./leaf at shape name) node
+      node
+    ? !(equal node.leaf_kind (maybe/some[str] "word")) node
+    | pairs.fold node
+    \ out [key value]
+    ? (eq key name) value
+    out
+  + path_value
+    \ path=path
+    ^ rex
+    | rex/brack
+    | path.map
+    \ part
+    | rex/paren
+      [(rex/rune "$" [(rex/word (str/from_atom (aura_tag part)))])
+       (rex/word (nat/show (quip_val part)))]
+  + need_value
+    \ need=row[row[path]]
+    ^ rex
+    = rows
+        | need.map
+        \ group
+        | rex/brack group.map(grove_roles/path_value)
+    | rex/brack rows
+  + decl
+    \ name=str value=rex
+    ^ rex
+    | rex/rune "+" [(rex/word name) value]
+  + field_code
+    \ field=grove_roles/field
+    ^ rex
+    = type field.type
+      read (grove_roles/member ["read"] field.codec)
+      write (grove_roles/member ["write"] field.codec)
+      contract (grove_roles/member ["contract"] field.codec)
+      slot (grove_roles/path_value field.slot)
+      pairs=row[[str rex]] [["TYPE" type] ["READ" read]
+        ["WRITE" write] ["SLOT" slot]]
+      extract
+        ? field.optional
+          | grove_roles/template field.span
+            (str/join (str/from_atom 10)
+              [(str/join "" [(str/from_atom 92) " card=myth"])
+               "^ maybe[maybe[TYPE]]"
+               "? card.get(SLOT)"
+               " > .none (./some .none)"
+               " > (./some held)"
+               "  < value (READ held)"
+               "  | ./some (./some value)"]) pairs
+        | grove_roles/template field.span
+          (str/join (str/from_atom 10)
+              [(str/join "" [(str/from_atom 92) " card=myth"])
+               "^ maybe[TYPE]"
+               "< held card.get(SLOT)"
+               "| READ held"]) pairs
+      put
+        ? field.optional
+          | grove_roles/template field.span
+            (str/join (str/from_atom 10)
+              [(str/join ""
+                  [(str/from_atom 92) " value=maybe[TYPE] card=myth"])
+               "^ myth"
+               "? value"
+               " > .none card.del(SLOT)"
+               " > (./some val) card.put(SLOT (WRITE val))"]) pairs
+        | grove_roles/template field.span
+          (str/join (str/from_atom 10)
+              [(str/join ""
+                  [(str/from_atom 92) " value=TYPE card=myth"])
+               "^ myth"
+               "| card.put SLOT (WRITE value)"]) pairs
+    | grove_roles/decl field.name
+    | rex/group
+      [(grove_roles/decl "value_type" type)
+       (grove_roles/decl "read" read)
+       (grove_roles/decl "write" write)
+       (grove_roles/decl "contract" contract)
+       (grove_roles/decl "extract" extract)
+       (grove_roles/decl "put" put)]
+  + schema_code
+    \ shape=grove_roles/shape
+    ^ rex
+    = fields
+        | shape.fields.map
+        \ field
+        | rex/rune "|" [(rex/word "grove_role_field")
+          (rex/cord field.name) (grove_roles/path_value field.slot)
+          (rex/word (? field.optional "1" "0"))]
+    | rex/rune "|" [(rex/word "grove_role_schema")
+      (rex/brack fields) (grove_roles/need_value shape.need)]
+  + read_step
+    \ role=rex next=rex field=grove_roles/field
+    ^ rex
+    = extract
+        | grove_roles/member ["fields" field.name "extract"] role
+      value (rex/rune "|" [extract (rex/word "card")])
+    = guard (rex/rune "<" [(rex/word field.name) value])
+    | rex/group [guard.with_span(field.span) next]
+  + patch_step
+    \ role=rex card=rex field=grove_roles/field
+    ^ rex
+    = put (grove_roles/member ["fields" field.name "put"] role)
+      val (rex/dot (rex/word field.name) (rex/word "value"))
+    | rex/rune "|" [put val card]
+  + code
+    \ span=rex/source_span name=str shape=grove_roles/shape
+    ^ row[rex]
+    | grove_roles/code_at span (rex/path [name]) shape
+  + code_at
+    \ span=rex/source_span role=rex shape=grove_roles/shape
+    ^ row[rex]
+    = fields
+        | shape.fields.map
+        \ field
+        = type
+            ? field.optional
+              | grove_roles/template span "maybe[TYPE]"
+                [["TYPE" field.type]]
+            field.type
+        | rex/rune "=" [(rex/word field.name) type]
+      extra (rex/rune "=" [(rex/word "extra") (rex/word "myth")])
+      record (rex/rune ":" fields.snoc(extra))
+      names shape.fields.map((\ field (rex/word field.name)))
+      construct (rex/rune "|" names.cons(role).snoc((rex/word "card")))
+      finish
+        | grove_roles/template span "| ./some VALUE"
+          [["VALUE" construct]]
+      reversed (row/rev[grove_roles/field] shape.fields)
+      chain=rex
+        | row/fold[grove_roles/field rex] finish
+          (grove_roles/read_step role) reversed
+      need (grove_roles/need_value shape.need)
+      from
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+              [(str/join "" [(str/from_atom 92) " card=myth"])
+               "^ maybe[ROLE]"
+               "? !(grove_role_runtime/present NEED card) .none"
+               "BODY"]) [["ROLE" role] ["NEED" need] ["BODY" chain]]
+      patch=rex
+        | row/fold[grove_roles/field rex]
+          (rex/dot (rex/word "extra") (rex/word "value"))
+          (grove_roles/patch_step role) shape.fields
+      to
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+              [(str/join "" [(str/from_atom 92) " value=ROLE"])
+               "^ maybe[myth]"
+               "= card PATCH"
+               "? !(grove_role_runtime/present NEED card) .none"
+               "| ./some card"])
+          [["ROLE" role] ["PATCH" patch] ["NEED" need]]
+      read
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " raw=pail"])
+             "^ maybe[ROLE]"
+             "> value=ROLE raw"
+             "  .none"
+             "| ./some value"]) [["ROLE" role]]
+      write
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " raw=ROLE"])
+             "^ pail" "raw"]) [["ROLE" role]]
+      contract
+        | grove_roles/template span "| curb/of_type (^ ROLE)"
+          [["ROLE" role]]
+      contracts
+        | shape.fields.map
+        \ field
+        | rex/brack [(grove_roles/path_value field.slot)
+          (grove_roles/member ["contract"] field.codec)]
+      spec
+        | rex/rune "|" [(rex/path ["grove_role_runtime" "spec"])
+          (rex/brack contracts) need]
+    [record (grove_roles/decl "fields"
+        (rex/group shape.fields.map(grove_roles/field_code)))
+      (grove_roles/decl "schema" (grove_roles/schema_code shape))
+      (grove_roles/decl "spec" spec)
+      (grove_roles/decl "from_myth" from)
+      (grove_roles/decl "to_myth" to)
+      (grove_roles/decl "read" read)
+      (grove_roles/decl "write" write)
+      (grove_roles/decl "contract" contract)]
+  + prepare
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    % rest=row[grove/item] doc.items out=row[grove/item] []
+    ^ either[grove/error grove/document]
+    ? (eq rest.len 0) (./ok (grove/document out))
+    > (grove/declaration span name body) rest.at(0)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    ? !(grove_roles/is_role body)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    > (grove/name/identifier text) name
+      | grove_roles/fail[grove/document] span "Roles need a name."
+    < shape (grove_roles/analyze root doc lookup [] text body)
+    = kept
+        | body.keep
+        \ stmt
+        ? stmt
+         > (grove/comment at text) .true
+         > (grove/block at kind kids)
+          | equal kind (grove/block_kind/meta)
+        .false
+      schema (grove_roles/member ["schema"] (rex/word text))
+      prop=grove/statement
+        | grove/property span (rex/cord "/sys/grove/role") schema
+      meta=grove/statement
+        | grove/block span (grove/block_kind/meta) [prop]
+      code=grove/statement
+        | grove/implementation span (grove_roles/code span text shape)
+      decl=grove/item
+        | grove/declaration span name kept.snoc(meta).snoc(code)
+    | _ rest.drop(1) out.snoc(decl)

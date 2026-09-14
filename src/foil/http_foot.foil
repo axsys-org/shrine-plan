@@ -8,10 +8,13 @@
     : method=str target=str body=str
   + action
     & http_foot/action/reply
+      http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
     + reply
       : response=http_response
+    + install
+      : source=path version=nat target=path
     + write
       : pax=path wit=writ back=str
     + wait
@@ -22,6 +25,7 @@
       feet/task/fact
       feet/task/page
       feet/task/ack
+      http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
   + pending
@@ -29,10 +33,13 @@
   + ack
     & http_foot/ack/request
       http_foot/ack/write
+      http_foot/ack/install
       http_foot/ack/cleanup
     + request
       : key=iota
     + write
+      : conn=nat back=str
+    + install
       : conn=nat back=str
     + cleanup
       :
@@ -153,6 +160,20 @@
     ? (equal[str] url "/style.css")
       | ./reply (http_response 200
           (http_foot/unbar (ReadFile "foil/style.css")) "text/css")
+    ? (http_foot/route_is "/grove/install" url)
+      ? !(equal[str] request.method "POST")
+        | ./reply (http_driver/response 405 "POST required")
+      ?> (./some version)
+          (nat/parse (http_foot/field "version" fields))
+        | ./reply (http_driver/response 400 "Template version required")
+      = source (http_foot/field "source" fields)
+      ? (eq source.len 0)
+        | ./reply (http_driver/response 400 "Published Grove path required")
+      = target (http_foot/field "root" fields)
+      ? ((eq target.len 0) || !(eq target.at(0) 47))
+        | ./reply (http_driver/response 400 "Instance root required")
+      | ./install (http_foot/target source) version
+          (http_foot/target target)
     ? (http_foot/route_is "/chore" url)
       | ./reply (http_driver/response 501 "Compiler service is not installed.")
     = post (http_foot/route_is "/post" url)
@@ -333,6 +354,14 @@
     % serial=nat 0 pending=row[http_foot/pending] [] queue=row[http_foot/ack] []
     = ;[message caps] (Recv[http_foot/task] 0)
     ? message
+     > (http_foot/action/install source version target)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+        back (str/cat_all ["/ns" (path_show target)])
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/install source version target))
+      | _ serial.inc pending
+          queue.snoc((http_foot/ack/install conn back))
      > (http_foot/action/write pax wit back)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
@@ -355,6 +384,21 @@
       = head queue.at(0)
         tail queue.drop(1)
       ? head
+       > (./install conn back)
+        = response
+            ? err
+             > .none (http_driver/back back)
+             > (./some cause)
+              = reason=str
+                  ? cause
+                   > fault=helm/supervisor/rejection
+                    | str/from_atom (iota_show fault.reason)
+                  "installation_failed"
+              | http_driver/response 409
+                  (str/cat_all ["Installation rejected: " reason
+                    ". Refresh the Grove template before retrying."])
+        ; (http_foot/reply conn response)
+        | _ serial pending tail
        > (./write conn back)
         = response
             ? err

@@ -1,0 +1,200 @@
+- grove_roles
+
+' Actions decode arguments separately from the receiver record.
++ grove_actions
+  + shape
+    : receiver=rex fields=grove_roles/shape code=row[rex]
+  + is_action
+    \ body=row[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind)
+      | equal kind (grove/tag_kind/action)
+    .false
+  + finish
+    \ span=rex/source_span receiver=maybe[rex]
+      fields=grove_roles/shape code=maybe[row[rex]]
+    ^ either[grove/error grove_actions/shape]
+    > (./some target) receiver
+      | grove_roles/fail[grove_actions/shape] span
+        "Action requires one #on role."
+    > (./some trees) code
+      | grove_roles/fail[grove_actions/shape] span
+        "Action requires an explicit Foil implementation."
+    ? (eq trees.len 0)
+      | grove_roles/fail[grove_actions/shape] span
+        "Empty action implementation."
+    | ./ok (grove_actions/shape target fields trees)
+  + analyze
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      span=rex/source_span body=row[grove/statement]
+    ^ either[grove/error grove_actions/shape]
+    % rest=row[grove/statement] body receiver=maybe[rex] .none
+      fields=grove_roles/shape (grove_roles/shape [] [])
+      code=maybe[row[rex]] .none
+    ^ either[grove/error grove_actions/shape]
+    ? (eq rest.len 0)
+      | grove_actions/finish span receiver fields code
+    ? rest.at(0)
+     > (grove/tag at kind)
+      ? ((equal kind (grove/tag_kind/action)) ||
+         (equal kind (grove/tag_kind/slot)))
+        | _ rest.drop(1) receiver fields code
+      | grove_roles/fail[grove_actions/shape] at
+        "Incompatible action tag."
+     > (grove/comment at text)
+      | _ rest.drop(1) receiver fields code
+     > (grove/block at kind kids)
+      ? (equal kind (grove/block_kind/meta))
+        | _ rest.drop(1) receiver fields code
+      | grove_roles/fail[grove_actions/shape] at
+        "Unsupported action block."
+     > (grove/property at slot type)
+      < next (grove_roles/properties root doc .false at
+          [rest.at(0)] fields)
+      = field next.fields.at((dec next.fields.len))
+      = reserved=row[str] ["card" "current" "receiver"]
+      ? reserved.has(field.name)
+        | grove_roles/fail[grove_actions/shape] at
+          "Action argument name conflicts with a generated binding."
+      = next next.set_need(next.need.snoc([field.slot]))
+      | _ rest.drop(1) receiver next code
+     > (grove/directive at kind target)
+      ? !(equal kind (grove/directive_kind/on))
+        | grove_roles/fail[grove_actions/shape] at
+          "Only #on is supported on actions."
+      ? receiver
+       > (./some old)
+        | grove_roles/fail[grove_actions/shape] at
+          "Duplicate action receiver."
+       > .none
+        < checked (grove_roles/parent root doc lookup [] target)
+        | _ rest.drop(1) (./some (rex/normalize target)) fields code
+     > (grove/implementation at trees)
+      ? code
+       > (./some old)
+        | grove_roles/fail[grove_actions/shape] at
+          "Duplicate action implementation."
+       > .none
+        | _ rest.drop(1) receiver fields (./some trees)
+  + code
+    \ root=path doc=grove/document span=rex/source_span
+      name=str shape=grove_actions/shape
+    ^ either[grove/error row[rex]]
+    = self (rex/path [name])
+      role shape.receiver
+      types shape.fields.fields.map((\ field field.type))
+      labels
+        | (row/range 0 types.len).map
+        \ i
+        | str/join "" ["ARG" (nat/show i)]
+      pairs
+        | (row/range 0 types.len).map
+        \ i
+        [labels.at(i) types.at(i)]
+      params
+        | (row/range 0 types.len).map
+        \ i
+        | str/join "" ["arg" (nat/show i) "=" labels.at(i)]
+      args
+        | (row/range 0 types.len).map
+        \ i
+        | rex/word (str/join "" ["arg" (nat/show i)])
+      implementation (grove_roles/member ["implementation"] self)
+      invoke_body
+        | rex/rune "|"
+          args.cons(implementation).snoc((rex/word "receiver"))
+      run
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " "
+                (str/join " " params.snoc("receiver=ROLE"))])
+             "^ ROLE" "BODY"])
+          pairs.snoc(["ROLE" role]).snoc(["BODY" invoke_body])
+      names shape.fields.fields.map((\ field (rex/word field.name)))
+      invoke (grove_roles/member ["run"] self)
+      call
+        | rex/rune "|" names.cons(invoke).snoc((rex/word "receiver"))
+      finish
+        | rex/rune "|" [(grove_roles/member ["to_myth"] role) call]
+      chain
+        | row/fold[grove_roles/field rex] finish
+          (grove_roles/read_step self)
+          (row/rev[grove_roles/field] shape.fields.fields)
+      apply
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92)
+                " card=myth current=myth"])
+             "^ maybe[myth]"
+             "< receiver (FROM current)"
+             "BODY"])
+          [["FROM" (grove_roles/member ["from_myth"] role)]
+           ["BODY" chain]]
+    < parts (grove_roles/parts role)
+    = imported
+        | (grove_roles/imports doc).any
+        \ imp
+        | equal parts.at(0) ($ts imp.alias)
+    = reference
+        | rex/path parts.map((\ part (str/from_atom (quip_val part))))
+    < receiver (grove_roles/slot root doc reference)
+    = receiver (? imported receiver root.weld(parts))
+    = args (grove_roles/schema_code shape.fields)
+      schema
+        | rex/rune "|" [(rex/word "grove_action_schema")
+          (grove_roles/path_value receiver) args]
+    | ./ok
+      [(grove_roles/decl "implementation" (rex/group shape.code))
+      (grove_roles/decl "run" run)
+      (grove_roles/decl "fields"
+        (rex/group shape.fields.fields.map(grove_roles/field_code)))
+      (grove_roles/decl "apply" apply)
+      (grove_roles/decl "schema" schema)]
+  + located
+    \ span=rex/source_span tree=rex
+    ^ rex
+    | tree.walk
+    \ node
+    ? (equal node.span rex/zero_span) node.with_span(span)
+    node
+  + prepare
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    % rest=row[grove/item] doc.items out=row[grove/item] []
+    ^ either[grove/error grove/document]
+    ? (eq rest.len 0) (./ok (grove/document out))
+    > (grove/declaration span name body) rest.at(0)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    ? !(grove_actions/is_action body)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    > (grove/name/identifier text) name
+      | grove_roles/fail[grove/document] span "Actions need a name."
+    < shape (grove_actions/analyze root doc lookup span body)
+    < trees (grove_actions/code root doc span text shape)
+    = kept
+        | body.keep
+        \ stmt
+        ? stmt
+         > (grove/comment at text) .true
+         > (grove/block at kind kids)
+          | equal kind (grove/block_kind/meta)
+        .false
+      schema (grove_roles/member ["schema"] (rex/path [text]))
+      prop=grove/statement
+        | grove/property span (rex/cord "/sys/grove/action") schema
+      meta=grove/statement
+        | grove/block span (grove/block_kind/meta) [prop]
+      code=grove/statement
+        | grove/implementation span
+          trees.map((grove_actions/located span))
+      decl=grove/item
+        | grove/declaration span name kept.snoc(meta).snoc(code)
+    | _ rest.drop(1) out.snoc(decl)
+  + prepare_all
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    < doc (grove_actions/prepare root doc lookup)
+    | grove_roles/prepare root doc lookup

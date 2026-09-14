@@ -96,8 +96,7 @@ def needs_corpus(mod):
 
 def compiler_files():
     # Test sources are loaded in disposable workers, never into this key.
-    mods = reaver_closure(['foil', 'foil-test-cache', 'foil-test-shrine',
-                           'foil-test-lain', 'foil-test-helm', 'std', 'quip'])
+    mods = reaver_closure(['foil-new-env', 'std', 'quip'])
     return [ROOT / 'src/reaver' / (m + '.rvr') for m in mods
             if (ROOT / 'src/reaver' / (m + '.rvr')).exists()]
 
@@ -175,8 +174,8 @@ def copy_snapshot(source, dest):
 
 def compiler_key(wisp):
     inputs = [*compiler_files(), *(ROOT / 'src/plan').glob('*.plan'),
-              ROOT / 'src/spec/openrouter.json', Path(wisp), ROOT / 'x/stage-lib']
-    return 'compiler-' + digest(inputs)
+              Path(wisp), ROOT / 'x/stage-lib']
+    return 'compiler-new-env-v1-' + digest(inputs)
 
 
 def stage(wisp, fresh, timeout):
@@ -210,7 +209,7 @@ def stage(wisp, fresh, timeout):
             if boot.exists():
                 shutil.rmtree(boot)
             copy_snapshot(directory / 'snap', boot)
-        module = 'foil'
+        module = 'foil-new-env'
         source = f'(#bind stage (#module {module}))\n(print "TEST-RUN-DONE")\n'
         code, complete, _ = run_process([wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
                                         directory, source, timeout)
@@ -234,110 +233,8 @@ def rvr_string(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '""') + '"'
 
 
-def foil_stamps():
-    return {p.relative_to(ROOT / 'src/foil').with_suffix('').as_posix():
-            hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in (ROOT / 'src/foil').rglob('*.foil')}
-
-
-def input_fixtures(suites):
-    deps = reaver_closure(s['target'] for s in suites if s['kind'] == 'reaver')
-    return sorted(deps & {'foil-test-shrine', 'foil-test-lain', 'foil-test-helm'})
-
-
-def prepare_inputs(wisp, template, suites, root, fresh, timeout):
-    """Publish compilation only; suite assertions always run in fresh workers."""
-    mods = [s['target'] for s in suites if s['kind'] in ('native', 'docs')]
-    fixtures = input_fixtures(suites)
-    if not mods and not fixtures:
-        return template
-    store = ROOT / '.check' / ('inputs-' + template.name)
-    with store.with_suffix('.lock').open('w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        previous = store.exists() and not fresh
-        directory = root / 'prepare'
-        copy_inputs(store if previous else template, directory / 'snap')
-        compiler_before = compiler_key(wisp)
-        if template.name.startswith('template-') and template.name != 'template-' + compiler_before:
-            raise RuntimeError('Compiler inputs changed after staging; rerun tests')
-        stamps = foil_stamps()
-        old = json.loads((store / 'sources.json').read_text()) if previous else {}
-        changed = sorted(n for n in stamps.keys() | old.keys() if stamps.get(n) != old.get(n))
-        old_fixtures = json.loads((store / 'fixtures.json').read_text()) if previous else []
-        # The legacy module loader validates timestamps. If fixture content
-        # changed, rebuild its module environment even for preserved mtimes.
-        if set(changed) & set(old_fixtures):
-            shutil.rmtree(directory / 'snap')
-            copy_inputs(template, directory / 'snap')
-            previous = False
-            old_fixtures = []
-        lines = ['(#bind input-cache (#module foil-test-cache))']
-        if not previous:
-            lines.append('(define test-cache 0)')
-        row = lambda xs: '[' + ' '.join(map(rvr_string, xs)) + ']'
-        lines.append(f'(Seq (define test-cache (input-cache:refresh test-cache {row(changed)})) (DeepSeq test-cache 0))')
-        # Loading only fixture modules lets the production loader validate
-        # their transitive source stamps without ever caching test results.
-        for fixture in fixtures:
-            lines.append(f'(#bind {fixture} (#module {fixture}))')
-            lines.append(f'(DeepSeq (map (lambda (p) (print ["TEST-FIXTURE" p])) {fixture}:module-file-stamps) 0)')
-        if fixtures:
-            last = next(f for f in ('foil-test-helm', 'foil-test-lain', 'foil-test-shrine') if f in fixtures)
-            lines += ['(#bind foil (#module foil))',
-                      f'(Seq (define test-cache (foil:legacy-cache-merge test-cache (_0 {last}:compiled))) (DeepSeq test-cache 0))']
-        prepared = directory / 'snap'
-        available = set()
-        fixture_paths = set(old_fixtures)
-        started = time.monotonic()
-        deadline = started + timeout
-        # Commit one fully forced module at a time. Hits need no subprocess;
-        # workers still validate/execute every selected suite independently.
-        for index, mod in enumerate([None, *dict.fromkeys(mods)]):
-            if mod is not None and mod in available:
-                continue
-            label = mod or 'shared fixtures'
-            requested = [] if mod is None else [mod]
-            forms = lines if mod is None else []
-            forms = forms + [
-                f'(Seq (define test-cache (input-cache:prepare test-cache [] {row(requested)})) (DeepSeq test-cache 0))',
-                '(DeepSeq (map (lambda (e) (print ("TEST-INPUT" (_0 e)))) test-cache) 0)',
-                '(print "TEST-RUN-DONE")']
-            step = directory if mod is None else directory / 'steps' / str(index)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f'input compilation timed out before {label}; completed inputs are cached')
-            print(f'Preparing {label}: {step}', flush=True)
-            code, complete, seconds = run_process(
-                [wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
-                step, '\n'.join(forms) + '\n', remaining, cwd=directory)
-            log = (step / 'out.log').read_text(errors='replace')
-            if mod is not None:
-                with (directory / 'out.log').open('a') as aggregate:
-                    aggregate.write(log)
-            if not verdict(log, code, complete)[0]:
-                raise RuntimeError(f'input compilation failed for {label} '
-                                   f'(exit={code}, completed={complete}): {step}/out.log')
-            if stamps != foil_stamps() or compiler_before != compiler_key(wisp):
-                raise RuntimeError('Sources changed during input compilation; rerun tests')
-            available = {decode_atom(m[1]) for m in re.finditer(
-                r'^\("TEST-INPUT"\s+' + ATOM + r'\s*\)', log, re.M)}
-            fixture_paths.update(decode_atom(m[1]).removeprefix('foil/').removesuffix('.foil')
-                                 for m in re.finditer(r'^\((?:0\s+)?"TEST-FIXTURE"\s+' + ATOM + r'\s*\)', log, re.M))
-            (prepared / 'sources.json').write_text(json.dumps(stamps))
-            (prepared / 'fixtures.json').write_text(json.dumps(sorted(fixture_paths)))
-            publishing = directory / 'publish'
-            shutil.copytree(prepared, publishing)
-            if store.exists():
-                shutil.rmtree(store)
-            publishing.rename(store)
-            print(f'Compiled {label} ({seconds:.1f}s)', flush=True)
-        print(f'Inputs ({time.monotonic() - started:.1f}s): {directory}/out.log', flush=True)
-        return prepared
-
-
-def copy_inputs(source, dest):
-    # Per-run snapshots are immutable. Only compiler-template replacement
-    # needs the global lock; long input compilation has its own store lock.
+def copy_template(source, dest):
+    # Workers copy the immutable compiler template under its publication lock.
     if source.name.startswith('template-'):
         with (ROOT / '.check/stage.lock').open('r') as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
@@ -348,7 +245,7 @@ def copy_inputs(source, dest):
 
 def run_group(suites, wisp, template, root, timeout):
     directory = root / suites[0]['group']
-    copy_inputs(template, directory / 'snap')
+    copy_template(template, directory / 'snap')
     command_suite = suites[0]['kind'] == 'command'
     if command_suite:
         env = dict(os.environ, WISP=wisp, TEST_TEMPLATE=str(template),
@@ -364,7 +261,7 @@ def run_group(suites, wisp, template, root, timeout):
         if any(s['kind'] != 'reaver' for s in suites):
             lines.append('(#bind runner (#module foil-test-runner))')
             mods = '[' + ' '.join(rvr_string(s['target']) for s in suites) + ']'
-            lines.append(f'(runner:run test-cache {rvr_string(suites[0]["kind"])} {mods})')
+            lines.append(f'(runner:run 0 {rvr_string(suites[0]["kind"])} {mods})')
         for suite in suites:
             mod = rvr_string(suite['target'])
             if suite['kind'] == 'reaver':
@@ -393,9 +290,6 @@ def run_group(suites, wisp, template, root, timeout):
                     if error:
                         records[i] = ('error', record[1], record[2], 'passing module',
                                       log[error.start():error.start()+800])
-        if any(s['target'] == 'foil-helm-fetch-tests' for s in suites):
-            good &= [l for l in log.splitlines() if l.startswith('"FETCH-ORDER-')] == [
-                '"FETCH-ORDER-read"', '"FETCH-ORDER-recv"']
         # A completely missing adapter output must never look green.
         good &= all(any(r[1] == s['target'] and r[0] != 'start' for r in records) for s in suites)
     # The REPL echoes a top-level print's result; nested prints do not.
@@ -473,12 +367,6 @@ def main():
     started = time.monotonic()
     compiler = stage(wisp, args.fresh, args.timeout or 900)
     phases = {'compiler_seconds': round(time.monotonic() - started, 3)}
-    started = time.monotonic()
-    input_budget = max(900, sum(max((s['timeout'] for s in selected if s['kind'] == kind), default=0)
-                                for kind in ('native', 'docs')))
-    template = prepare_inputs(wisp, compiler, selected, root, args.fresh,
-                              args.timeout or input_budget)
-    phases['inputs_seconds'] = round(time.monotonic() - started, 3)
     (root / 'phases.json').write_text(json.dumps(phases, indent=2) + '\n')
     print('Setup: ' + json.dumps(phases), flush=True)
     print('Results: ' + str(root), flush=True)
@@ -487,8 +375,7 @@ def main():
         groups.setdefault(s['group'], []).append(s)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = [pool.submit(run_group, ss, wisp,
-                               template if input_fixtures(ss) or any(s['kind'] in ('native', 'docs') for s in ss)
-                               else compiler, root,
+                               compiler, root,
                                args.timeout or max(s['timeout'] for s in ss)) for ss in groups.values()]
         results = [f.result() for f in futures]
     (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')

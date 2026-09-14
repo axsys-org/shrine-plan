@@ -3,8 +3,6 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import patch
-import json
 from pathlib import Path
 import sys
 
@@ -12,6 +10,44 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_deprecated_compiler_cannot_reenter_module_graph(self):
+        retired = {'foil', 'compiler-host', 'helm-host'}
+        modules = {p.stem for p in (runner.ROOT / 'src/reaver').glob('*.rvr')}
+        self.assertFalse(retired & modules)
+        self.assertFalse(retired & runner.reaver_closure(modules))
+
+    def test_retired_type_system_cannot_return(self):
+        retired = {'foil-types', 'foil-core-types', 'foil-types-tests'}
+        sources = list((runner.ROOT / 'src/reaver').glob('*.rvr'))
+        modules = {p.stem for p in sources}
+        self.assertFalse(retired & modules)
+        self.assertFalse(retired & runner.reaver_closure(modules))
+        for name in retired:
+            self.assertNotIn(name, (runner.ROOT / 'test-inventory.json').read_text())
+        # Old tags are allowed only as deliberately invalid test inputs.
+        rejection_tests = {'typed-reaver-tests', 'foil-relocate-tests',
+                           'compiler-inspect-tests'}
+        for path in sources:
+            if path.stem not in rejection_tests:
+                self.assertNotIn('/foil/types/', path.read_text(), str(path))
+
+    def test_type_core_has_no_compiler_or_ffi_dependency(self):
+        closure = runner.reaver_closure(['foil-type-core'])
+        self.assertFalse({'foil-types', 'foil-core-types', 'foil-builtins',
+                          'typed-reaver', 'foil-new-elab', 'foil-new-env'} & closure)
+
+    def test_ffi_producers_do_not_depend_on_retired_types(self):
+        closure = runner.reaver_closure(['foil-builtins', 'typed-reaver'])
+        self.assertFalse({'foil-types', 'foil-core-types',
+                          'foil-new-elab', 'foil-new-env'} & closure)
+
+    def test_compiler_consumers_do_not_import_retired_types(self):
+        closure = runner.reaver_closure([
+            'foil-new-env', 'foil-lower', 'foil-render', 'foil-relocate',
+            'foil-entry', 'compiler-inspect', 'compiler-build',
+        ])
+        self.assertFalse({'foil-types', 'foil-core-types'} & closure)
+
     def test_wrapped_fields_and_escaping(self):
         log = '("TEST" "fail" "tests/json"\n "quoted ""case"""\n "a\\\\b" "actual")\n'
         self.assertEqual(runner.events(log), [('fail', 'tests/json', 'quoted "case"', 'a\\b', 'actual')])
@@ -78,10 +114,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('foil:apps/loom/tests', names)
         self.assertIn('foil:apps/nenex/tests', names)
         self.assertIn('doc:sept', names)
-        step = next(s for s in suites if s['name'] == 'helm-repl-step-tests')
-        self.assertTrue(step['enabled'])
-        self.assertFalse(runner.needs_corpus('helm-repl-step-tests'))
-        self.assertFalse(runner.needs_corpus('helm-repl-tests'))
+        self.assertIn('foil:tests/supervisor', names)
+        self.assertIn('foil:tests/http_foot', names)
+        self.assertFalse(any(name.startswith('helm-') for name in names))
 
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}
@@ -92,8 +127,8 @@ class ProtocolTests(unittest.TestCase):
         for name in ('semidoc', 'weft'):
             self.assertTrue(suites['foil-' + name + '-layout-tests']['enabled'])
         self.assertEqual(suites['foil-shrine-tests']['group'], 'shrine')
-        self.assertFalse(runner.input_fixtures(
-            [s for s in suites.values() if s['group'] == 'corpus']))
+        self.assertTrue(all(not runner.needs_corpus(s['target'])
+                            for s in suites.values() if s['group'] == 'corpus'))
 
     def test_app_migrations_and_semidoc_closure(self):
         suites = {s['name']: s for s in runner.inventory()}
@@ -107,7 +142,11 @@ class ProtocolTests(unittest.TestCase):
     def test_compiler_inputs_exclude_suites(self):
         files = {p.stem for p in runner.compiler_files()}
         self.assertIn('foil-new-elab', files)
-        self.assertIn('schemagen', files)
+        self.assertIn('foil-new-env', files)
+        self.assertNotIn('foil', files)
+        self.assertNotIn('schemagen', files)
+        self.assertNotIn('foil-test-shrine', files)
+        self.assertNotIn('foil-test-cache', files)
         self.assertNotIn('foil-new-elab-tests', files)
         self.assertNotIn('foil-schemagen-tests', files)
         suites = runner.inventory()
@@ -133,175 +172,97 @@ class ProtocolTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('WISP') and os.environ.get('TEST_TEMPLATE'),
                      'set WISP and TEST_TEMPLATE for real-runtime probes')
 class RuntimeTests(unittest.TestCase):
-    def test_preparation_keeps_completed_inputs_after_failure(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            shutil.copytree(runner.ROOT / 'src', root / 'src')
-            (root / 'x').mkdir()
-            shutil.copy2(runner.ROOT / 'x/stage-lib', root / 'x/stage-lib')
-            (root / '.check').mkdir()
-            seed = root / 'seed'
-            runner.copy_snapshot(Path(os.environ['TEST_TEMPLATE']), seed)
-            first = root / 'src/foil/cache_checkpoint_first.foil'
-            second = root / 'src/foil/cache_checkpoint_second.foil'
-            first.write_text('+ answer 1\n')
-            second.write_text('+ answer missing_checkpoint_value\n')
-            suites = [dict(kind='native', target=p.stem) for p in (first, second)]
-            with patch.object(runner, 'ROOT', root):
-                with self.assertRaisesRegex(RuntimeError, 'cache_checkpoint_second'):
-                    runner.prepare_inputs(os.environ['WISP'], seed, suites,
-                                          root / 'failed', False, 180)
-                second.write_text('+ answer 2\n')
-                prepared = runner.prepare_inputs(os.environ['WISP'], seed, suites,
-                                                 root / 'retry', False, 180)
-                self.assertFalse((root / 'retry/prepare/steps/1').exists())
-                self.assertTrue((root / 'retry/prepare/steps/2/out.log').exists())
-                work = root / 'check'
-                runner.copy_snapshot(prepared, work / 'snap')
-                source = '''(#bind foil (#module foil))
-(#bind reef (#module reef))
-(#import reef)
-(define (answer name)
-  (foil:source-entry-val ["answer"]
-    (_1 (_0 (find (lambda (e) (Equal name (_0 e))) test-cache)))))
-assert(Eq 1 (answer "cache_checkpoint_first"))
-assert(Eq 2 (answer "cache_checkpoint_second"))
-(print "TEST-RUN-DONE")
-'''
-                code, complete, _ = runner.run_process(
-                    [os.environ['WISP'], '--file-root', str(root / 'src'),
-                     'snap', 'root', '_'], work, source, 180)
-                log = (work / 'out.log').read_text(errors='replace')
-                self.assertTrue(runner.verdict(log, code, complete)[0], log[-4000:])
+    def probe(self, root, source):
+        code, complete, _ = runner.run_process(
+            [os.environ['WISP'], '--file-root', str(root / 'src'),
+             'snap', 'root', '_'], root, source + '\n(print "TEST-RUN-DONE")\n', 180)
+        log = (root / 'out.log').read_text(errors='replace')
+        self.assertTrue(runner.verdict(log, code, complete)[0], log[-6000:])
 
-    def test_fixture_snapshot_detects_preserved_timestamp_edits(self):
+    def test_workers_read_preserved_timestamp_edits(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             shutil.copytree(runner.ROOT / 'src', root / 'src')
-            (root / 'x').mkdir()
-            shutil.copy2(runner.ROOT / 'x/stage-lib', root / 'x/stage-lib')
-            (root / '.check').mkdir()
-            (root / '.check/stage.lock').touch()
             dep = root / 'src/foil/cache_probe_dep.foil'
             dep.write_text('+ answer 1\n')
-            (root / 'src/reaver/foil-test-shrine.rvr').write_text('''(#bind std (#module std))
-(#import std)
-(#bind foil (#module foil))
-(Seq (define compiled (foil:compile-mod-cached 0
-  foil:default-subject "cache_probe_dep")) (DeepSeq compiled 0))
-(define module-file-stamps ["foil/cache_probe_dep.foil"])
-''')
-            seed = root / 'seed'
-            runner.copy_snapshot(Path(os.environ['TEST_TEMPLATE']), seed)
-            suites = [dict(kind='reaver', target='foil-shrine-tests')]
-            with patch.object(runner, 'ROOT', root):
-                for value in (1, 2):
-                    stamp = dep.stat()
-                    dep.write_text(f'+ answer {value}\n')
-                    os.utime(dep, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-                    prepared = runner.prepare_inputs(
-                        os.environ['WISP'], seed,
-                        suites, root / str(value), False, 180)
-                    self.assertEqual(json.loads((prepared / 'fixtures.json').read_text()),
-                                     ['cache_probe_dep'])
-                    work = root / ('check-' + str(value))
-                    runner.copy_snapshot(prepared, work / 'snap')
-                    source = ('assert(Eq ' + str(value) +
-                              ' (foil:source-entry-val ["answer"] '
-                              '(_1 foil-test-shrine:compiled)))\n'
-                              '(print "TEST-RUN-DONE")\n')
-                    code, complete, _ = runner.run_process(
-                        [os.environ['WISP'], '--file-root', str(root / 'src'),
-                         'snap', 'root', '_'], work, source, 180)
-                    log = (work / 'out.log').read_text(errors='replace')
-                    self.assertTrue(runner.verdict(log, code, complete)[0], log[-4000:])
+            seed = Path(os.environ['TEST_TEMPLATE'])
+            for value in (1, 2):
+                stamp = dep.stat()
+                dep.write_text(f'+ answer {value}\n')
+                os.utime(dep, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                work = root / str(value)
+                work.mkdir()
+                (work / 'src').symlink_to(root / 'src')
+                runner.copy_template(seed, work / 'snap')
+                self.probe(work, '\n'.join([
+                    '(#bind source (#module foil-source))',
+                    '(#bind driver (#module foil-new-env))',
+                    '(define (check z)',
+                    '  (define result (source:compile 0 "cache_probe_dep"))',
+                    f'  assert(Eq {value} (driver:get-perc ["answer"] (_1 result)))',
+                    '  1)', 'assert(check 0)']))
+                self.assertFalse((work / 'prepare').exists())
 
     def test_content_changes_invalidate_only_dependent_cache_entries(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             shutil.copytree(runner.ROOT / 'src', root / 'src')
-            foil = root / 'src/foil'
-            dep = foil / 'cache_probe_dep.foil'
-            dep.write_text('+ answer 1\n')
-            (foil / 'cache_probe_app.foil').write_text(
-                '- cache_probe_dep\n+ observed answer\n')
-            (foil / 'cache_probe_other.foil').write_text('+ other 9\n')
             runner.copy_snapshot(Path(os.environ['TEST_TEMPLATE']), root / 'snap')
-
-            def run(source):
-                code, complete, _ = runner.run_process(
-                    [os.environ['WISP'], '--file-root', str(root / 'src'),
-                     'snap', 'root', '_'], root,
-                    source + '\n(print "TEST-RUN-DONE")\n', 180)
-                log = (root / 'out.log').read_text(errors='replace')
-                self.assertTrue(runner.verdict(log, code, complete)[0], log[-4000:])
-
-            run('''(#bind reef (#module reef))
+            self.probe(root, '''(#bind reef (#module reef))
 (#import reef)
 (#bind cc (#module foil-test-cache))
-(#bind foil (#module foil))
-(Seq (define saved (cc:prepare 0 []
-  ["cache_probe_app" "cache_probe_other"])) (DeepSeq saved 0))
-(define (entry cache name)
-  (_0 (find (lambda (e) (Equal name (_0 e))) cache)))
-(define other (entry saved "cache_probe_other"))
-assert(Eq 6 (Sz (entry saved "cache_probe_dep")))
-assert(Eq 5 (Sz other))
-(define (without-unused-pack marker)
-  (cc:durable [(Weld other [(error marker)])]))
-assert(Equal [other] (without-unused-pack "unused import pack forced"))
-assert(Eq 1 (foil:source-entry-val ["observed"]
-  (_1 (entry saved "cache_probe_app"))))
-''')
-            stamp = dep.stat()
-            dep.write_text('+ answer 2\n')
-            os.utime(dep, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-            run('''(Seq (define kept (cc:refresh saved ["cache_probe_dep"]))
-  (DeepSeq kept 0))
-assert(Equal [other] kept)
-(Seq (define saved (cc:prepare kept [] ["cache_probe_app"]))
-  (DeepSeq saved 0))
-assert(Eq 2 (foil:source-entry-val ["observed"]
-  (_1 (entry saved "cache_probe_app"))))
-assert(Equal other (entry saved "cache_probe_other"))
-''')
-            # Editing only the importer preserves its compiled dependency.
-            app = foil / 'cache_probe_app.foil'
-            app.write_text('- cache_probe_dep\n+ observed (add answer 3)\n')
-            run('''(define dependency (entry saved "cache_probe_dep"))
-(Seq (define kept (cc:refresh saved ["cache_probe_app"]))
-  (DeepSeq kept 0))
-assert(Eq 2 (Sz kept))
-(Seq (define saved (cc:prepare kept [] ["cache_probe_app"]))
-  (DeepSeq saved 0))
-assert(Eq 5 (foil:source-entry-val ["observed"]
-  (_1 (entry saved "cache_probe_app"))))
-assert(Equal dependency (entry saved "cache_probe_dep"))
-''')
-            # A tree-fed module and an alias still carry their real imports.
-            run('''(#bind rex (#module rex))
-(define tree (rex:ParseRexNormFile
-  "- cache_probe_other\n+ generated_value other\n"))
-(Seq (define generated (foil:compile-rex-cached saved
-  foil:default-subject "generated_probe" tree)) (DeepSeq generated 0))
-(define app-entry (entry saved "cache_probe_app"))
-(define alias (foil:cache-entry "alias_probe" (_1 app-entry)
-  (Ix 3 app-entry) (Ix 4 app-entry)))
-(define all-cache (snoc alias (_0 generated)))
-assert(Equal ["alias_probe" "cache_probe_app" "cache_probe_dep"]
-  (cc:closure all-cache "alias_probe"))
-(define kept (cc:refresh all-cache ["cache_probe_other"]))
-assert(Eq 3 (Sz kept))
-assert(Equal alias (entry kept "alias_probe"))
-assert(Equal [] (filter (lambda (e) (Equal "generated_probe" (_0 e))) kept))
-assert(Eq 3 (Sz (cc:refresh all-cache ["cache_probe_app"])))
-''')
-            dep.unlink()
-            run('''(define kept (cc:refresh saved ["cache_probe_dep"]))
-assert(Equal [other] kept)
-(define failure (Try (lambda (z)
-  (DeepSeq (cc:prepare kept [] ["cache_probe_app"]) 0)) 0))
-assert(Eq 1 (Hd failure))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind rex (#module rex))
+(define (check z)
+  (define (read version name)
+    (rex:ParseRexNormFile
+      (cond
+        ((Equal name "dep") (strcat ["+ answer " (showNat version)]))
+        ((Equal name "app") "- dep
++ observed answer")
+        ((Equal name "other") "+ other 9")
+        ((Equal name "generated") "- other
++ generated_value other")
+        ((Equal name "alias") "- app")
+        (else (error ["missing" name])))))
+  (define (compile version cache mod) (driver:compile-with (read version) cache mod))
+  (define first (compile 1 0 "alias"))
+  (define all-cache (_0 (compile 1 (_0 first) "generated")))
+  (define (entry cache name) (_0 (driver:get-foil-cache name cache)))
+  (define other (entry all-cache "other"))
+  assert(Equal ["alias" "app" "dep"] (cc:closure all-cache "alias"))
+  assert(Equal ["generated" "other"] (cc:closure all-cache "generated"))
+  (define kept (cc:refresh all-cache ["dep"]))
+  assert(Eq 2 (Sz (driver:cache-results kept)))
+  assert(Equal other (entry kept "other"))
+  assert(Equal 0 (driver:get-foil-cache "alias" kept))
+  (define rebuilt (compile 2 kept "alias"))
+  assert(Eq 2 (driver:get-perc ["observed"] (_1 rebuilt)))
+  assert(Equal other (entry (_0 rebuilt) "other"))
+  (define importer-edit (cc:refresh (_0 rebuilt) ["app"]))
+  assert(Equal (entry (_0 rebuilt) "dep") (entry importer-edit "dep"))
+  assert(Equal 0 (driver:get-foil-cache "alias" importer-edit))
+  (define generated-edit (cc:refresh all-cache ["other"]))
+  assert(Eq 3 (Sz (driver:cache-results generated-edit)))
+  assert(Equal 0 (driver:get-foil-cache "generated" generated-edit))
+  ;; A failed recompile cannot mutate the retained unrelated modules.
+  (define failure (Try (lambda (z)
+    (force (driver:compile-with (lambda (name) (error name)) kept "app"))) 0))
+  assert(Eq 1 (Hd failure))
+  assert(Equal other (entry kept "other"))
+  ;; App paths are generated word leaves; their nominal identity survives aliases.
+  (define app-result (driver:compile-with
+    (lambda (name) (If (Equal name "app_alias")
+      (source:import-tree "apps/probe/main")
+      (rex:ParseRexNormFile "+ token\n  : value=nat\n+ value | token 7"))) 0 "app_alias"))
+  assert(Equal ["apps/probe/main"] (driver:perc-dependencies (_1 app-result)))
+  assert(Equal "/boot/apps/probe/main/token"
+    (Hd (driver:get-perc ["value"] (_1 app-result))))
+  assert(Equal (driver:get-perc ["value"] (entry (_0 app-result) "apps/probe/main"))
+    (driver:get-perc ["value"] (_1 app-result)))
+  1)
+assert(check 0)
 ''')
 
     def test_native_and_doctest_failures_reach_host(self):
@@ -331,8 +292,9 @@ assert(Eq 1 (Hd failure))
    (testing/case "empty" empty_case)]
 ''')
             runner.copy_snapshot(Path(os.environ['TEST_TEMPLATE']), root / 'snap')
+            (root / 'src/foil/test_bad.foil').write_text('+ tests missing_test_value\n')
             source = ('(#bind runner (#module foil-test-runner))\n'
-                      '(runner:run 0 "native" ["test_probe"])\n'
+                      '(runner:run 0 "native" ["test_bad" "test_probe"])\n'
                       '(runner:run 0 "docs" ["test_probe"])\n'
                       '(print "TEST-RUN-DONE")\n')
             code, complete, _ = runner.run_process(
@@ -345,9 +307,9 @@ assert(Eq 1 (Hd failure))
             self.assertFalse(good)
             results = [r for r in records if r[0] != 'start']
             self.assertEqual([r[0] for r in results],
-                             ['fail', 'pass', 'fail', 'pass', 'fail', 'broken'], log[-4000:])
-            self.assertEqual(results[0][3:], ('want', 'got'))
-            self.assertEqual(results[4][3:], ('2', '1'))
+                             ['error', 'fail', 'pass', 'fail', 'pass', 'fail', 'broken'], log[-4000:])
+            self.assertEqual(results[1][3:], ('want', 'got'))
+            self.assertEqual(results[5][3:], ('2', '1'))
 
 
 if __name__ == '__main__':
