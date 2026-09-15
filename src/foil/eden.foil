@@ -13,27 +13,20 @@
 -  helm [order=80]
 - http_response
 -  http_foot
+- fs_sync_foot
 '  Eden's first boot milestone: Pact, a browsable namespace, and HTTP.
 '  Base installation runs through Lain before Eden starts actors.
 '  Grove instances install later through the supervisor.
 +  eden
-  +  result
-    & eden/ready eden/failed
-  +  ready
-    : state=sov
   +  failed
     : stage=iota reason=iota
-
-  +  first
-    '  Install the mount implementation before any manifest can use it.
-    ^ task
-    | task/vine ['pact]
-      (writ/make (form/card pact/form (lore/line "Pact: application mounting.")))
 
   +  manifest
     ^ mani
     | mani 'eden (lore/line "Eden: the live namespace.")
       [(kook/decl 'hserve http/serve_form (lore/line "HTTP request serving."))
+       (kook/decl 'fs fs/form
+         (lore/line "Filesystem scan requests."))
        (kook/decl 'hex explorer/form (lore/line "The namespace explorer."))
        (kook/decl 'ward ward/form (lore/line "Contract adoption."))
        (kook/decl 'fresh fresh/form (lore/line "Live references."))]
@@ -46,38 +39,46 @@
        [['hello] (myth/sing ['message] (pails/t "Hello from Eden."))]]
       []
 
-  +  second
-    '  Mount at the root through /pact, preserving that bootstrap child.
-    ^ task
-    = card (pact/card eden/manifest "eden" 0 0)
-      card card.put(limb_slot (kook [['pact]]))
-    | task/vine [] (writ/make card)
-
-  +  third
-    '  The listener is installed last, after its forms and namespace exist.
-    \ port=nat
-    ^ task
-    | task/vine ['io 'http] (writ/make (http/cfg_port 'hex port))
-
-  +  install
-    '  Required boot stages fail closed. No partial state reaches the host.
-    \ stages=row[[name=iota command=task]]
-    ^ eden/result
-    % idx=nat 0 state=sov sov/new
-    ^ eden/result
-    ? (eq idx stages.len) (./ready state)
+  + boot
+    ' The caller supplies a node identity and a trusted system pin.
+    ' Boot returns a namespace only after every local stage succeeds.
+    \ self=iota system=pin[system_publication] local=sov port=nat
+    ^ either[eden/failed namespace]
+    ? ((eq port 0) || (gt port 65535))
+      | ./err (eden/failed 'http 'invalid_port)
+    ?> (./ok initial) (namespace/create self local system)
+      | ./err (eden/failed 'namespace 'invalid_namespace)
+    = root=path [self]
+      registry=path [self 'kook 'pact]
+      first
+        | task/vine registry
+          (writ/make (form/card pact/form
+            (lore/line "Pact: application mounting.")))
+      mounted
+        | (pact/card eden/manifest "eden" 0 0).put
+          limb_slot (kook [registry])
+      second | task/vine root (writ/make mounted)
+      listener
+        | http/cfg_port [self 'kook 'hserve]
+          [self 'kook 'hex] port
+      third
+        | task/vine [self 'io 'http] (writ/make listener)
+      filesystem | root/card "Filesystem sync instances."
+      fourth
+        | task/vine [self 'io 'fs] (writ/make filesystem)
+      stages=row[[iota task]]
+        [['pact first] ['namespace second]
+         ['http third] ['fs fourth]]
+    % idx=nat 0 state=namespace initial
+    ^ either[eden/failed namespace]
+    ? (eq idx stages.len) (./ok state)
     = [name command] stages.at(idx)
-    ? (run_event command 0 state)
-     > (./fail reason) (./failed name reason)
+    ? (sovereign_run_event command 0 0 0 state)
+     > (./fail why) (./err (eden/failed name why))
      > (./ripe next effects signs ack)
-       ? effects.len (./failed name 'unexpected_boot_effect)
+       ? effects.len
+         | ./err (eden/failed name 'unexpected_boot_effect)
        | _ idx.inc next
-
-  +  boot
-    \ port=nat
-    ^ eden/result
-    ? ((eq port 0) || (gt port 65535)) (./failed 'http 'invalid_port)
-    | eden/install [['pact eden/first] ['namespace eden/second] ['http (eden/third port)]]
 
   +  make
     '  Typed constructors for the browser route adapter.
@@ -100,27 +101,36 @@
     : msg=str
   +  throw
     \ txt=str
+    ^ nat
     | error | eden/err | txt
-  +  main
-    '  Boot the namespace, register its HTTP foot, and return the supervisor.
-    '  ports is currently the HTTP port; config is reserved.
-    \ ports=nat config=nat
+  + serve
+    \ state=namespace
     ^ nat
-    ? (eden/boot ports)
-     > (./failed stage reason)
-      | error (eden/failed stage reason)
-     > (./ready state) (eden/serve state)
-
-  +  serve
-    \ state=sov
+    = start
+        \ self=nat
+        ^ nat
+        | helm/supervisor/run state self
+    = ;server (Spawn start)
+      registrations=row[helm/supervisor/register]
+        [(helm/supervisor/register [state.self 'io 'fs] fs_foot/run)
+         (helm/supervisor/register [state.self 'io 'http]
+           http_foot/run)]
+    % idx=nat 0
     ^ nat
-    = ;server (Spawn (helm/supervisor/run state))
-    ; (SendCaps server
-        (helm/supervisor/register ['io 'http] http_foot/run) [0])
+    ? (eq idx registrations.len) server
+    ; (SendCaps server registrations.at(idx) [0])
     = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
     ? reply
      > (./ack err)
-      ? err
-       > .none server
-       > (./some reason) (error reason)
-    | eden/throw "HTTP foot registration failed"
+       ? err
+        > .none (_ idx.inc)
+        > (./some why) (error why)
+    | eden/throw "Foot registration failed"
+
+  + main
+    \ self=iota system=pin[system_publication] local=sov port=nat
+    ^ nat
+    ? (eden/boot self system local port)
+     > (./err why) (error why)
+     > (./ok state) (eden/serve state)

@@ -1,0 +1,294 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind pub (#module foil-publication))
+(#bind driver (#module foil-new-env))
+(#bind brand (#module shrine-brand))
+(#bind source (#module foil-source))
+(#bind elab (#module foil-new-elab))
+(#bind subject (#module foil-subject))
+(#bind nt (#module foil-new-types))
+(#bind contexts (#module foil-context))
+(#bind core (#module foil-type-core))
+(define native-selection
+  (Pin (map (lambda (name)
+    [(Weld [("ts" "sys") ("ts" "types")]
+       (map (lambda (part) ("ts" part)) name)) 1]) core:system-names)))
+(define root [["x" 7] ["ts" "library"]])
+(define app [["x" 7] ["ts" "app"]])
+(define sources
+  [["library" "+ tree (@@ t)
+  & tree/leaf[t] tree/empty
+  + leaf (: value=t)
+  + empty (:)
++ value (tree/leaf[nat] 12)
+"]
+   ["app" "- library [at=renamed]
++ value renamed/value
+"]])
+(define (read name)
+  (rex:ParseRexNormFile (_1 (need (find (lambda (pair) (Equal name (_0 pair))) sources)))))
+(define (prepare version)
+  (pub:prepare native-selection (Pin "compiler") read
+    [["library" root] ["app" app]] [] (lambda (path) version)))
+(define plan (prepare 0))
+(define compiled (pub:compile plan driver:empty-foil-cache))
+(define artifacts (_2 compiled))
+(define library (Unpin (_1 (_0 artifacts))))
+(define application (Unpin (_1 (_1 artifacts))))
+(define value (driver:get-perc ["value"] library))
+assert(Equal [[(Weld root [["ts" "tree"] ["ts" "leaf"]]) 1]]
+  (brand:decode (Hd value)))
+assert(Equal value (driver:get-perc ["value"] application))
+assert(Equal compiled (pub:verify-predecessors compiled (lambda (path) 0)))
+assert(Eq 1 (Hd (Try (lambda (z)
+  (pub:verify-predecessors compiled (lambda (path) 1))) 0)))
+(define revised (pub:compile (prepare 1) (_1 compiled)))
+assert(Nil (Eq (Hd value)
+  (Hd (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 revised))))))))
+;; An unrelated bad declaration rejects the whole prepared batch.
+(define bad (pub:prepare native-selection (Pin "compiler")
+  (lambda (name) (rex:ParseRexNormFile "+ broken (unknown 1)
+"))
+  [["bad" app]] [] (lambda (path) 0)))
+assert(Eq 1 (Hd (Try (lambda (z) (pub:compile bad (_1 compiled))) 0)))
+;; Resolver aliases select pinned existing moments, not new revisions.
+(define imported (pub:prepare native-selection (Pin "compiler")
+  (lambda (name) (rex:ParseRexNormFile "- mounted
++ result value
+"))
+  [["mounted" root] ["consumer" app]] [["mounted" (Pin library)]]
+  (lambda (path) 0)))
+(define consumed (pub:compile imported driver:empty-foil-cache))
+assert(Equal value (driver:get-perc ["result"]
+  (Unpin (_1 (_0 (_2 consumed))))))
+
+;; Artifact dependency resolver names need not exist at their new mount.
+(define mounted (source:prepare-publication native-selection (Pin "compiler")
+  (lambda (name) (If (Equal name "moved") app
+    (error ["unexpected-resolver-call" name])))
+  [["moved" (Pin application)]] (lambda (path) 0) ["moved"]))
+(define loaded (driver:compile-context (pub:compilation-context mounted)
+  (lambda (name) (error ["unexpected-source-read" name]))
+  driver:empty-foil-cache "moved"))
+assert(Equal value (driver:get-perc ["value"] (_1 loaded)))
+
+;; File and generated sources use the same frozen graph and resolver.
+(define discovered (source:prepare-publication-with read
+  native-selection (Pin "compiler")
+  (lambda (name) (If (Equal name "library") root app))
+  [] (lambda (path) 0) ["app"]))
+(define discovered-compiled (pub:compile discovered driver:empty-foil-cache))
+assert(Equal value (driver:get-perc ["value"]
+  (Unpin (_1 (_0 (_2 discovered-compiled))))))
+
+(define sut (driver:perc-subject library))
+(define key (subject:resolve-source-path ["tree" "leaf"] sut))
+(define reflected (elab:reflect-in-subject sut 0 (nt:type-ref key)))
+assert(Equal ("ref" (Hd value) []) reflected)
+assert(Equal [[(Weld root [["ts" "tree"] ["ts" "leaf"]]) 1]]
+  (subject:definition-moment key sut))
+
+;; Publish compiler products through the actual sovereign history machinery.
+(define initial-policy-plan
+  (source:prepare-publication native-selection (Pin "compiler")
+    (lambda (name) [["x" 7] ["ts" "lib"] ["ts" name]]) []
+    (lambda (path) 0) ["compiler_publication" "tests/namespace" "show"]))
+(define initial-policy-code (pub:compile initial-policy-plan driver:empty-foil-cache))
+(define policy
+  (Unpin (_1 (need (find (lambda (pair) (Equal "compiler_publication" (_0 pair)))
+    (_2 initial-policy-code))))))
+(define empty (driver:get-perc ["sov" "new"] policy))
+(define slot [("x" 7) ("ts" "compiler") ("ts" "artifact")])
+(define first (pub:publish policy slot ("x" 7) compiled 0 0 empty))
+assert(Equal "ok" (Hd first))
+(define again (pub:publish policy slot ("x" 7) compiled 0 0 (_0 first)))
+assert(Equal "err" (Hd again))
+assert(Equal ("ts" "stale_publication") (_0 again))
+(define second (pub:publish policy slot ("x" 7) revised 0 0 (_0 first)))
+assert(Equal "ok" (Hd second))
+(define cases (driver:get-perc ["sov" "x_case"] policy))
+(define target [("x" 7) ("ts" "library") ("ts" "tree") ("ts" "leaf")])
+assert(Eq 1 (_0 (cases target (_0 first))))
+assert(Eq 2 (_0 (cases target (_0 second))))
+
+;; Private keys are not source spellings. Exact lookups are separate.
+assert(Equal ["/foil-env/unbound"] (subject:resolve-source-path key sut))
+assert(Equal ["/foil-env/unbound"] (subject:canon-path key sut))
+(define generic-ref (elab:reflect-in-subject sut 0
+  (nt:type-app key [(nt:type-arg (nt:tnat 0))])))
+assert(Equal ("ref" (Hd value) [("nat" 0)]) generic-ref)
+
+;; System artifacts retain a preassigned manifest, avoiding a pin fixed point.
+(define system-root [["ts" "sys"] ["ts" "types"]])
+(define system-path [("ts" "sys") ("ts" "types") ("ts" "node")])
+(define assignment
+  ((driver:get-perc ["compiler_publication" "assign_system"] policy)
+    (Weld [system-path] (map (lambda (name)
+      (Weld [("ts" "sys") ("ts" "types")]
+        (map (lambda (part) ("ts" part)) name))) core:system-names))))
+(define system-plan (pub:prepare-system (Pin "compiler")
+  (lambda (name) (rex:ParseRexNormFile "+ node
+  : next=maybe[node]
+")) [["system-types" system-root]]))
+assert(Equal assignment (contexts:publication-key
+  (pub:compilation-context system-plan)))
+(define system-code (pub:compile system-plan driver:empty-foil-cache))
+(define published-system (pub:publish-system policy slot system-code 0 0))
+assert(Equal "ok" (Hd published-system))
+(define trusted (_0 published-system))
+assert(Equal assignment (_2 (Unpin trusted)))
+assert(Equal "ok" (Hd
+  ((driver:get-perc ["namespace" "create"] policy) ("x" 7) empty trusted)))
+(define wrong-selection
+  (Pin (map (lambda (pair)
+    (If (Equal system-path (_0 pair)) [system-path 2] pair))
+    (Unpin assignment))))
+(define wrong-plan (pub:prepare wrong-selection (Pin "compiler")
+  (lambda (name) (rex:ParseRexNormFile "+ node
+  : next=maybe[node]
+")) [["system-types" system-root]] [] (lambda (path) 0)))
+assert(Equal "err" (Hd (pub:publish-system policy slot
+  (pub:compile wrong-plan driver:empty-foil-cache) 0 0)))
+
+
+;; Compile against the preassigned manifest; journal the complete system pin.
+(define fixture (_1 (source:compile (pub:compilation-context initial-policy-plan) (_1 initial-policy-code) "tests/namespace")))
+(define initial (driver:get-perc ["namespace_tests" "initial"] fixture))
+(define system trusted)
+(define namespace-key (_1 (nt:runtime-key (driver:perc-world policy)
+  (nt:type-ref (subject:resolve-source-path ["namespace"]
+    (driver:perc-subject policy))))))
+(define state ((_0 namespace-key) ("x" 7) empty system))
+(define selection (_2 (Unpin system)))
+(define live-plan (pub:prepare selection (Pin "compiler") read
+  [["library" root] ["app" app]] [] (lambda (path) 0)))
+(define live (pub:compile live-plan driver:empty-foil-cache))
+assert(Equal system (_2 state))
+assert(Equal selection (contexts:publication-key (pub:compilation-context live-plan)))
+(define accepted (pub:publish-local policy slot live 123 4 state))
+(If (Equal "err" (Hd accepted)) (error ["publication-rejected" (_0 accepted)]) 0)
+assert(Equal "ok" (Hd accepted))
+(define committed (_0 (_0 accepted)))
+assert(Equal system (_2 committed))
+assert(Equal system
+  (_0 ((driver:get-perc ["namespace_tests" "journal_system"] fixture) committed)))
+assert(Equal "err" (Hd (pub:publish-local policy slot compiled 0 0 state)))
+
+;; Presentation decodes framed brands, including bare nullary values.
+(define display (_1 (source:compile (pub:compilation-context initial-policy-plan) (_1 initial-policy-code) "show")))
+(define show-value (driver:get-perc ["show" "value"] display))
+(define show-name (driver:get-perc ["tyshow" "definition_name"] display))
+assert(Equal (strcat [(show-name (Hd value)) "(12)"])
+  (show-value value 0))
+(define empty-brand (brand:encode
+  (Weld root [["ts" "tree"] ["ts" "empty"]]) 1))
+assert(Equal (strcat [(show-name empty-brand) "()"])
+  (show-value empty-brand 0))
+assert(Equal "12" (show-value 12 0))
+
+(define mixed (Try (lambda (ignored)
+  (pub:prepare native-selection (Pin "compiler") read
+    [["library" root] ["app" [["x" 8] ["ts" "app"]]]]
+    [] (lambda (path) 0))) 0))
+assert(Eq 1 (Hd mixed))
+
+(#bind abi (#module foil-abi))
+assert(Equal (Hd value) (abi:member library ["tree"] "leaf" [(nt:tnat 0)]))
+assert(Equal empty-brand (abi:member library ["tree"] "empty" [(nt:tnat 0)]))
+
+;; The real defining modules bootstrap through the same preparation path.
+(define system-modules ["types" "shrine" "schema" "hand" "view"])
+(define real-system-plan
+  (pub:prepare-system (Pin "compiler") source:read-module
+    (map (lambda (name)
+      [(strWeld "sys/" name) [["ts" "sys"] ["ts" name]]]) system-modules)))
+(define real-system-code (pub:compile real-system-plan driver:empty-foil-cache))
+(define real-publication (pub:publish-system policy slot real-system-code 0 0))
+(If (Equal "err" (Hd real-publication))
+  (error ["real-system-publication-rejected" (_0 real-publication)]) 0)
+assert(Equal "ok" (Hd real-publication))
+
+;; The publisher's store policy consumes the pinned system artifacts. Its
+;; records and containers therefore use the same brands as future readers.
+(define system-images (_2 real-system-code))
+(define (publisher-root name)
+  (define system-image (find (lambda (pair) (Equal name (_0 pair))) system-images))
+  (If system-image
+    (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 system-image))))))
+    [["x" 7] ["ts" "lib"] ["ts" name]]))
+(define policy-plan
+  (source:prepare-publication
+    (contexts:publication-key (pub:compilation-context real-system-plan))
+    (Pin "compiler") publisher-root system-images (lambda (path) 0)
+    ["compiler_publication"]))
+(define policy-code (pub:compile policy-plan driver:empty-foil-cache))
+(define published-policy
+  (Unpin (_1 (need (find (lambda (pair) (Equal "compiler_publication" (_0 pair)))
+    (_2 policy-code))))))
+(define grounded-publication
+  (pub:publish-system published-policy slot real-system-code 0 0))
+(If (Equal "err" (Hd grounded-publication))
+  (error ["grounded-system-publication-rejected" (_0 grounded-publication)]) 0)
+assert(Equal "ok" (Hd grounded-publication))
+(define grounded-empty (driver:get-perc ["sov" "new"] published-policy))
+assert(Equal "ok" (Hd
+  ((driver:get-perc ["namespace" "create"] published-policy)
+    ("x" 7) grounded-empty (_0 grounded-publication))))
+
+;; Public containers retain their system identities through the publisher's
+;; imports. Private history storage remains under that publisher's root.
+(define exposed-containers
+  [["mop" "empty"] ["mop" "node"] ["mop" "kv"]
+   ["bee" "leaf"] ["bee" "limb"] ["bee" "kv"] ["bee" "k"]
+   ["axal"] ["axal" "k"]])
+(define policy-subject (driver:perc-subject published-policy))
+(define (definition-location name)
+  (subject:definition-moment
+    (subject:resolve-source-path name policy-subject) policy-subject))
+assert(all (lambda (name)
+  (Equal [[(Weld [["ts" "sys"] ["ts" "types"]]
+             (map (lambda (part) ["ts" part]) name)) 1]]
+    (definition-location name))) exposed-containers)
+assert(Equal [[[["x" 7] ["ts" "lib"] ["ts" "sept"]
+               ["ts" "uon"] ["ts" "node"]] 1]]
+  (definition-location ["uon" "node"]))
+assert(Equal [[[["ts" "sys"] ["ts" "types"]
+               ["ts" "mop"] ["ts" "empty"]] 1]]
+  (brand:decode (abi:constructor published-policy ["mop" "empty"])))
+
+;; Time carriers retain their existing erased payload and namespace codec.
+(define some (abi:option published-policy "some"))
+(define none (abi:option published-policy "none"))
+(define time-write (driver:get-perc ["time" "write"] published-policy))
+(define time-read (driver:get-perc ["time" "read"] published-policy))
+(define duration-write (driver:get-perc ["duration" "write"] published-policy))
+(define duration-read (driver:get-perc ["duration" "read"] published-policy))
+assert(Equal (some 12345) (time-read (time-write 12345)))
+assert(Equal (some 250) (duration-read (duration-write 250)))
+assert(Equal (abi:constructor published-policy ["pails" "n"])
+  (Hd (time-write 12345)))
+assert(Equal none (time-read ((abi:constructor published-policy ["pails" "t"]) "text")))
+
+;; Contracts contain exact moments, never printed paths or a latest case.
+(define contract-of (driver:get-perc ["curb" "of_type"] published-policy))
+(define matches (driver:get-perc ["definition_reference" "matches"] published-policy))
+(define contract (contract-of reflected))
+assert(Eq 1 (Sz contract))
+assert(matches value (_0 contract))
+assert(Nil (matches
+  (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 revised)))))
+  (_0 contract)))
+(define nullary-contract (contract-of ("rec" empty-brand [])))
+assert(matches empty-brand (_0 nullary-contract))
+assert(Nil (matches value (_0 nullary-contract)))
+assert(Equal [] (contract-of ("rec" "/boot/library/tree/leaf" [])))
+;; Sum contracts admit their defining constructor moments individually.
+(define sum-contract (contract-of ("sum" [("rec" empty-brand []) reflected])))
+assert(Eq 2 (Sz sum-contract))
+assert(Eq 1 (any (matches empty-brand) sum-contract))
+assert(Eq 1 (any (matches value) sum-contract))
+assert(Eq 0 (any (matches
+  (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 revised)))))) sum-contract))

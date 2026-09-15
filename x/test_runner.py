@@ -111,6 +111,8 @@ def inventory():
                 raise ValueError('duplicate suite: ' + mod)
             registered.add(mod)
             suites.append(dict(name=mod, kind='reaver', target=mod,
+                               entrypoint=data.get('entrypoints', {}).get(mod),
+                               fixture=data.get('entrypoint_fixtures', {}).get(mod),
                                group=group['name'], fast=group['fast'],
                                timeout=group['timeout'], category=group['category'],
                                enabled=group.get('enabled', True),
@@ -125,14 +127,20 @@ def inventory():
              if p.stem.endswith('-tests') or p.stem.startswith('test-')}
     if found != known:
         raise ValueError(f'inventory drift: unclassified={sorted(found-known)}, missing={sorted(known-found)}')
+    helpers = data.get('native_helpers', {})
+    found_helpers = set()
     for path in sorted((ROOT / 'src/foil').rglob('*.foil')):
         mod = path.relative_to(ROOT / 'src/foil').with_suffix('').as_posix()
-        if mod.startswith('tests/') or (mod.startswith('apps/') and path.stem == 'tests'):
+        if mod in helpers:
+            found_helpers.add(mod)
+        elif mod.startswith('tests/') or (mod.startswith('apps/') and path.stem == 'tests'):
             suites.append(dict(name='foil:' + mod, kind='native', target=mod,
                                group='native', fast=True, timeout=900, category='foil', enabled=True))
         if re.search(r"^\s*'\s*\?=", path.read_text(), re.M):
             suites.append(dict(name='doc:' + mod, kind='docs', target=mod,
                                group='doctests', fast=True, timeout=900, category='docs', enabled=True))
+    if found_helpers != helpers.keys():
+        raise ValueError(f'missing native helpers: {sorted(helpers.keys() - found_helpers)}')
     for command in data['commands']:
         suites.append(dict(command, kind='command', group=command['name'], enabled=True))
     return suites
@@ -175,7 +183,7 @@ def copy_snapshot(source, dest):
 def compiler_key(wisp):
     inputs = [*compiler_files(), *(ROOT / 'src/plan').glob('*.plan'),
               Path(wisp), ROOT / 'x/stage-lib']
-    return 'compiler-new-env-v1-' + digest(inputs)
+    return 'compiler-sovereign-v3-' + digest(inputs)
 
 
 def stage(wisp, fresh, timeout):
@@ -249,6 +257,7 @@ def run_group(suites, wisp, template, root, timeout):
     command_suite = suites[0]['kind'] == 'command'
     if command_suite:
         env = dict(os.environ, WISP=wisp, TEST_TEMPLATE=str(template),
+                   TEST_SOURCE_ROOT=str(root / 'src'),
                    TEST_RUN_DIR=str(directory), PATH=str(Path(wisp).parent) + os.pathsep + os.environ.get('PATH', ''))
         code, complete, seconds = run_process([sys.executable, str(ROOT / suites[0]['target'])],
                                                directory, '', timeout, env)
@@ -258,18 +267,49 @@ def run_group(suites, wisp, template, root, timeout):
         records = []
     else:
         lines = []
+        if any(s.get('entrypoint') for s in suites):
+            lines.extend(['(#bind test_std (#module std))', '(#import test_std)'])
         if any(s['kind'] != 'reaver' for s in suites):
             lines.append('(#bind runner (#module foil-test-runner))')
             mods = '[' + ' '.join(rvr_string(s['target']) for s in suites) + ']'
             lines.append(f'(runner:run 0 {rvr_string(suites[0]["kind"])} {mods})')
+        fixtures = {}
+        fixture_calls = []
         for suite in suites:
             mod = rvr_string(suite['target'])
             if suite['kind'] == 'reaver':
                 lines += [f'(print ("TEST" "start" {mod} "~:module" "~:" "~:"))',
-                          f'(#bind {suite["target"]} (#module {suite["target"]}))',
-                          f'(print ("TEST" "pass" {mod} "~:module" "~:" "~:"))']
+                          f'(#bind {suite["target"]} (#module {suite["target"]}))']
+                if suite.get('entrypoint'):
+                    argument = '0'
+                    if suite.get('fixture'):
+                        fixture = tuple(suite['fixture'])
+                        if fixture not in fixtures:
+                            binding = f'test_fixture_{len(fixtures)}'
+                            module, entry = fixture
+                            lines.append(f'(#bind {binding}_module (#module {module}))')
+                            fixture_calls.append(f'(define {binding} ({binding}_module:{entry} 0))')
+                            fixtures[fixture] = binding
+                        argument = fixtures[fixture]
+                    call = (f'(test_std:assert-impl "{suite["target"]}" '
+                            f'({suite["target"]}:{suite["entrypoint"]} {argument}))')
+                    if suite.get('fixture'):
+                        fixture_calls.extend([
+                            f'(print ("TEST" "start" {mod} "~:module" "~:" "~:"))',
+                            f'(define outcome (Try (lambda (ignored) {call}) 0))',
+                            f'(If (Eq 1 (Hd outcome)) '
+                            f'(Seq (print outcome) (print ("TEST" "error" {mod} "~:module" "~:passing entrypoint" "~:caught failure"))) '
+                            f'(print ("TEST" "pass" {mod} "~:module" "~:" "~:")))'])
+                        continue
+                    lines.append(call)
+                lines.append(f'(print ("TEST" "pass" {mod} "~:module" "~:" "~:"))')
+        if fixture_calls:
+            # Compiler products stay local to this call, outside snapshot state.
+            lines.append('(define (test_fixture_run ignored)')
+            lines.extend('  ' + call for call in fixture_calls)
+            lines.extend(['  1)', '(test_fixture_run 0)'])
         lines.append('(print "TEST-RUN-DONE")')
-        code, complete, seconds = run_process([wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
+        code, complete, seconds = run_process([wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
                                                directory, '\n'.join(lines) + '\n', timeout)
         log = report_log(directory / 'out.log')
         good, records = verdict(log, code, complete)
@@ -296,7 +336,7 @@ def run_group(suites, wisp, template, root, timeout):
     records = [r for i, r in enumerate(records) if i == 0 or r != records[i-1]]
     for suite in suites:
         if suite['kind'] == 'docs':
-            path = ROOT / 'src/foil' / (suite['target'] + '.foil')
+            path = root / 'src/foil' / (suite['target'] + '.foil')
             expected = len(re.findall(r"^\s*'\s*\?=", path.read_text(), re.M))
             actual = sum(r[1] == suite['target'] and r[0] != 'start' for r in records)
             if expected != actual:
@@ -308,7 +348,7 @@ def run_group(suites, wisp, template, root, timeout):
         print('  ' + detail, flush=True)
     locations = {}
     for suite in suites:
-        path = ROOT / 'src/foil' / (suite['target'] + '.foil')
+        path = root / 'src/foil' / (suite['target'] + '.foil')
         if suite['kind'] != 'docs':
             continue
         by_text = {}
@@ -366,6 +406,9 @@ def main():
     root = Path(tempfile.mkdtemp(prefix='run-', dir=ROOT / '.check'))
     started = time.monotonic()
     compiler = stage(wisp, args.fresh, args.timeout or 900)
+    # Modules load lazily, sometimes minutes into a group. Preserve one source
+    # revision for all runtime groups while work continues in the checkout.
+    shutil.copytree(ROOT / 'src', root / 'src')
     phases = {'compiler_seconds': round(time.monotonic() - started, 3)}
     (root / 'phases.json').write_text(json.dumps(phases, indent=2) + '\n')
     print('Setup: ' + json.dumps(phases), flush=True)

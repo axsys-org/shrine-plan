@@ -1,5 +1,5 @@
 #!/bin/sh
-# x/foil-check MODULE...      (foil/sept.foil, src/foil/sept.foil, sept, apps/srs)
+# x/foil-check --node 0xPUBKEY MODULE...      (foil/sept.foil, src/foil/sept.foil, sept, apps/srs)
 #
 # Compiles each module through foil-source and the sole foil-new-env driver,
 # forces every lowered entry the compile produced, and prints the
@@ -10,7 +10,7 @@
 # way, so a module whose imports are still unmigrated reports THEIR
 # diagnostics (under "in module <name>:").
 #
-# Warms from the newest x/check template (run x/check once first).
+# Warms from the matching x/check template (run x/check once first).
 # FOIL_SRC=<dir> compiles from another source root (default src): a
 # scratch copy of src with a patched import, say, so one module can be
 # checked while an import it needs is mid-edit.
@@ -21,13 +21,36 @@ WISP="${WISP:-$(command -v wisp || echo "$ROOT/wisp")}"
 if [ ! -x "$WISP" ]; then
   echo "x/foil-check: no wisp on PATH and no $ROOT/wisp" >&2; exit 2
 fi
-TPL="$(ls -td "$ROOT/.check"/template-compiler-new-env-v1-* 2>/dev/null | head -1)"
+TPL="$(python3 - "$ROOT" "$WISP" <<'PYCODE'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / 'x'))
+from test_runner import compiler_key
+print(root / '.check' / ('template-' + compiler_key(sys.argv[2])))
+PYCODE
+)"
 if [ -z "$TPL" ] || [ ! -e "$TPL/data.mdb" ]; then
-  echo "x/foil-check: no x/check template to warm from - run x/check first" >&2; exit 2
+  echo "x/foil-check: no matching compiler/runtime template - run x/check first" >&2; exit 2
 fi
 if [ $# -eq 0 ]; then
   echo "usage: x/foil-check MODULE..." >&2; exit 2
 fi
+if [ "$1" != "--node" ] || [ $# -lt 3 ]; then
+  echo "usage: x/foil-check --node 0xPUBKEY MODULE..." >&2; exit 2
+fi
+NODE_NUMBER="$(python3 - "$ROOT/x" "$2" <<'PYCODE'
+import sys
+sys.path.insert(0, sys.argv[1])
+from namespace_identity import parse_node_identity
+try:
+    value, spelling = parse_node_identity(sys.argv[2])
+except ValueError as error:
+    raise SystemExit(str(error))
+print(value)
+PYCODE
+)"
+shift 2
 MODS=""
 for a in "$@"; do
   m="$a"
@@ -39,6 +62,7 @@ DIR="$ROOT/.check/foil-check"
 rm -rf "$DIR"; mkdir -p "$DIR/snap"
 cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
 {
+  printf '(define publisher-authority ("x" %s))\n' "$NODE_NUMBER"
   cat <<'EOF'
 (#bind std (#module std))
 (#import std)
@@ -48,6 +72,18 @@ cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
 (#import foil-subject)
 (#bind driver (#module foil-new-env))
 (#bind source (#module foil-source))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind publication (#module foil-publication))
+(#bind contexts (#module foil-context))
+(Seq (define system-plan (publication:prepare-system
+  (Pin driver:compile) source:read-module bootstrap:system-roots))
+  (DeepSeq system-plan 0))
+(Seq (define system-code (publication:compile system-plan driver:empty-foil-cache))
+  (DeepSeq system-code 0))
+(define (module-root name)
+  (define found (find (lambda (pair) (Equal name (_0 pair))) bootstrap:system-roots))
+  (If found (_1 (_0 found))
+    [["x" (_0 publisher-authority)] ["ts" "lib"] ["ts" name]]))
 (#bind lower (#module foil-lower))
 (#bind foil-render (#module foil-render))
 ;; Delta entries are canonical storage keys, including imported generic
@@ -92,7 +128,11 @@ cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
     (else (DeepSeq (map (lambda (l) (say prefix l)) (leaf-lines e)) 1))))
 (define (check mod)
   (define result (Try (lambda (z)
-    (force (_1 (source:compile driver:empty-foil-cache mod)))) 0))
+    (define plan (source:prepare-publication
+      (contexts:publication-key (publication:compilation-context system-plan))
+      (Pin driver:compile) module-root (_2 system-code) (lambda (path) 0) [mod]))
+    (force (_1 (source:compile (publication:compilation-context plan)
+      (_1 system-code) mod)))) 0))
   (If (Eq 1 (Hd result))
     (Seq (print ("FC" mod "FAIL")) (emit "" (_0 result)))
     (let* ((perc (_0 result))

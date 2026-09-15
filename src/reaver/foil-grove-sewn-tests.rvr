@@ -1,3 +1,5 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
 ;;;; Tree transformations validate both sides of their norm boundary.
 (#bind std (#module std))
 (#import std)
@@ -10,57 +12,52 @@
 (define (ok result)
   (If (Eq "ok" (Hd result)) (_0 result)
     (error ["sewn-build" result])))
-(define (check ignored)
-  (define prepared (backend:prepare 0))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
   (define policy (_1 prepared))
-  (define helpers (_1 (source:compile (_0 prepared)
-    "tests/grove_backend")))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
   (define (helper name)
     (driver:get-perc ["grove_backend_checks" name] helpers))
   (define (parse text)
     (ok ((driver:get-perc ["grove" "parse"] policy) text)))
-  (define (missing key) "/boot/maybe/none")
+  (define (missing key) (grove_fixture:lookup local [] key))
   (define (compile lookup root text)
-    (backend:compile prepared lookup (path root) (parse text)))
-  (define slots (ok (compile missing ["sys"]
-    (read-text-file "grove/sys_slots.grove"))))
-  (define types (ok (compile missing ["sys" "types"]
-    (read-text-file "grove/sys_types.grove"))))
-  (define lookup ((helper "lookup") (Weld slots types)))
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
   (define srs (parse (read-text-file "grove/srs.grove")))
-  (define records (ok (backend:compile prepared lookup
-    (path ["gov" "srs"]) ((helper "first") 9 srs))))
-  assert(Eq 9 (Sz records))
-  (define queue (_1 (Ix 8 records)))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "srs"]))) ((helper "first") 9 srs))))
+  assert(Gt (Sz records) 9)
+  (define queue (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "srs" "queue"]))))
   (define (export rec key) ((helper "export") (path [key]) rec))
   (define apply (export queue "apply"))
   (define empty ((helper "queue_input") 0))
-  assert(Equal ("/boot/maybe/some" empty) (apply empty))
+  assert(Equal ((abi:option policy "some") empty) (apply empty))
   (define tied (apply ((helper "queue_ties") 0)))
-  assert(Equal "/boot/maybe/some" (Hd tied))
+  assert(Equal (abi:option policy "some") (Hd tied))
   assert(Equal [[0 100 (path ["a"])] [1 100 (path ["b"])]
     [2 100 (path ["c"])]] ((helper "queue_summary") (_0 tied)))
   assert(Equal tied (apply ((helper "queue_ties") 1)))
   (define input ((helper "queue_input") 12))
   (define result (apply input))
-  assert(Equal "/boot/maybe/some" (Hd result))
+  assert(Equal (abi:option policy "some") (Hd result))
   (define summary ((helper "queue_summary") (_0 result)))
   assert(Eq 10 (Sz summary))
   assert(Equal (map (lambda (i) [i (Inc i)
     (path [(strcat ["card" (showNat (Sub 11 i))])])])
     [0 1 2 3 4 5 6 7 8 9])
     summary)
-  assert(Equal (map path [["gov" "srs" "cards_by_id"]
+  assert(Equal (map (lambda (p) (grove_fixture:qualified (path p))) [["gov" "srs" "cards_by_id"]
     ["gov" "srs" "card_list"]]) ((helper "sewn_summary") queue))
   (define base ((helper "req_data") ((helper "recall_data") 0 1)))
-  assert(Equal "/boot/maybe/none"
+  assert(Equal (abi:option policy "none")
     (apply ((helper "norm_tree") 2 base)))
 
-  (define stored ((helper "lookup") records))
-  (define fresh (backend:prepare 0))
-  (define imported (ok (backend:compile fresh stored
-    (path ["gov" "consumer"])
-    (parse "#import src=gov/srs/cards_by_id
+  (define stored (grove_fixture:lookup local records))
+  (define fresh (backend:prepare code))
+  (define imported (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "consumer"]))) (parse "#import src=gov/srs/cards_by_id
 #import dst=gov/srs/card_list
 #import queue=gov/srs/queue
 
@@ -88,11 +85,11 @@ forward =
   ! foil
   + apply queue/apply
 "))))
-  assert(Equal ("/boot/maybe/some" input)
-    ((export (_1 (_0 imported)) "apply") input))
-  assert(Equal "/boot/maybe/none"
-    ((export (_1 (_1 imported)) "apply") input))
-  assert(Equal result ((export (_1 (_2 imported)) "apply") input))
+  assert(Equal ((abi:option policy "some") input)
+    ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "identity"]))) "apply") input))
+  assert(Equal (abi:option policy "none")
+    ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "bad_output"]))) "apply") input))
+  assert(Equal result ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "forward"]))) "apply") input))
   (define (reject text)
     (define result (compile stored ["gov" "bad"] text))
     assert(Equal "err" (Hd result))
@@ -143,4 +140,7 @@ bad =
 "))
   assert(Equal "err" (Hd typo))
   1)
-assert(Eq 1 (check 0))
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

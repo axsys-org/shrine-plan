@@ -7,6 +7,7 @@
 ;; Every builtin signature, declaration, and TC annotation uses the shared
 ;; type kernel. Old or malformed type payloads fail at the entry boundary.
 
+(#bind brands (#module shrine-brand))
 (#bind std (#module std))
 (#import std)
 
@@ -48,7 +49,12 @@
   ;; Same-module marks made after construction (generated accessors)
   ;; are absent by design: mounted-extension members always come from
   ;; import layers, whose marks predate the compiler.
-  [member-inverse tany])
+  [member-inverse tany]
+  ;; The selected system substrate is fixed for this compiler. Discover its
+  ;; storage root once, not by walking the import DAG for every literal or
+  ;; generic specialization. Row-wrapping keeps discovery lazy, like the
+  ;; member inverse; declaration passes preserve this same cached root.
+  [system-root tany])
 
 (declare-cstr LocalBinding FOIL_NEW_ELAB_ROOT
   [name (tnat 0)]
@@ -129,8 +135,9 @@
 ;; (see run-decl-pass below).  References must fail with a readable cascade
 ;; diagnostic instead of consuming the poison as a type.
 (define (failed-declaration? compiler path)
-  (And (get-const path (compiler-subject compiler))
-    (Eq "TC_MEAN" (Hd (got-entry-tc path (compiler-subject compiler))))))
+  (define hit (get-const path (compiler-subject compiler)))
+  (And hit
+    (Eq "TC_MEAN" (Hd (entry-tc path (unpin-soft (_0 hit)))))))
 
 (define prototype-mark "FOIL_NEW_UNTYPED_PROTOTYPE")
 (define (prototype-tc) (tc-const nt:tany prototype-mark))
@@ -176,7 +183,11 @@
 ;; renderer byte for byte.  Nominal depth: refs and applications stay
 ;; paths + argument descriptors — nothing unfolds.  Non-nat constants
 ;; (baked comparator values) are opaque: "opq".
-(define (reflect-encode env typ)
+(define (reflect-with identity env typ)
+  (define (nominal path args)
+    (define exact (identity path))
+    (If (Eq exact "opq") "opq"
+      (If exact ("ref" (_0 exact) args) ("nom" path args))))
   (define (enc-const v) (If (IsNat v) ("cst" v) "opq"))
   ;; One reference path -> descriptor.  /ty-ap-encoded applications
   ;; decode to a nom with argument descriptors; @var and '$val parts
@@ -190,10 +201,10 @@
         ((ty-val-path? p) (enc-const (Ix 1 p)))
         ((unit-qualified-path? p)
           ("nom" (Weld ["~"] (unit-qualified-path-local p)) []))
-        (else ("nom" p [])))
+        (else (nominal p [])))
       (let ((base (enc-ref (Ix 0 parts))))
-        (If (And (IsApp base) (Eq "nom" (Hd base)))
-          ("nom" (Ix 0 base) (map enc-ref (drop 1 parts)))
+        (If (And (IsApp base) (includes (Eq (Hd base)) ["nom" "ref"]))
+          ((Hd base) (Ix 0 base) (map enc-ref (drop 1 parts)))
           (new-elab-error env "unreflectable type application base" p)))))
   (define (enc t)
     (cond
@@ -227,7 +238,7 @@
       ((nt:type-var? t) ("var" (nt:ty-var-name t)))
       ((nt:const-var? t) ("var" (nt:const-var-name t)))
       ((nt:type-app? t)
-        ("nom" (nt:ty-app-base t)
+        (nominal (nt:ty-app-base t)
           (map
             (lambda (garg)
               (If (Eq "type" (nt:argument-kind garg))
@@ -238,6 +249,18 @@
       ;; type — refuse loudly rather than encode junk.
       (else (new-elab-error env "unreflectable type" t))))
   (enc typ))
+
+(define (reflect-encode env typ)
+  (reflect-with (lambda (path) 0) env typ))
+(define (reflect-in-subject sut env typ)
+  (reflect-with (lambda (path)
+    (define found (definition-moment path sut))
+    (If found
+      [(brands:encode (_0 (_0 found)) (_1 (_0 found)))]
+      (If (And (sut-context sut) (get-const path sut))
+        (If (Eq "TC_FFI" (Hd (got-entry-tc path sut))) "opq" 0)
+        0))) env typ))
+
 
 
 ;;; Deriving the TypeWorld from a subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -252,9 +275,16 @@
 (define world-from-layer core:world-from-layer)
 (define world-from-subject core:world-from-subject)
 
+(define (resolve-system-root subject)
+  (define root (core:system-path subject 0))
+  ;; Scratch subjects have an empty storage root. Canonicalize the empty
+  ;; Weld result to nat zero before retaining it in a saveable compiler.
+  (If (Sz root) root 0))
+
 (define (compiler-for subject)
   ($NewCompiler subject (world-from-subject subject) []
-    [(foil-subject:derive-vis-inverse subject)]))
+    [(foil-subject:derive-vis-inverse subject)]
+    [(resolve-system-root subject)]))
 
 ;; compiler-for-with :: TypeWorld -> Subject -> NewCompiler
 ;;
@@ -264,7 +294,8 @@
 ;; expression.
 (define (compiler-for-with world subject)
   ($NewCompiler subject world []
-    [(foil-subject:derive-vis-inverse subject)]))
+    [(foil-subject:derive-vis-inverse subject)]
+    [(resolve-system-root subject)]))
 
 
 (define (normalize-tc compiler tc)
@@ -283,14 +314,16 @@
   (And hit (_0 hit)))
 
 (define (type-path compiler path)
-  (canon-path path (compiler-subject compiler)))
+  (define sut (compiler-subject compiler))
+  (If (sut-context sut) (resolve-source-path path sut)
+    (canon-path path sut)))
 
 (define (surf-strip-spans surf)
   (If (Eq "s_span" (_0 surf)) (surf-strip-spans (_2 surf)) surf))
 
 ;; Expand every current-namespace reference (%/x, s_cref) into an
 ;; ordinary s_ref of anchor+suffix.  The anchor is the enclosing
-;; declaration's source path, determined structurally BEFORE any
+;; declaration's parent source path, determined structurally BEFORE any
 ;; declaration elaborates: %/ performs no parent search and no
 ;; rooted-first fallback of its own — it forms one exact written path,
 ;; which then resolves through the ordinary environment machinery
@@ -303,10 +336,10 @@
       (gen (Sz x) (lambda (i) (cref-expand anchor (Ix i x)))))))
 
 ;; A declaration row with its body's %/ references expanded at the
-;; declaration's own namespace position.
+;; enclosing namespace (siblings of the declaration itself).
 (define (expand-decl-crefs row)
   (If (And (IsApp row) (Eq "s_decl" (_0 row)))
-    (Up 3 (cref-expand (_1 row) (_3 row)) row)
+    (Up 3 (cref-expand (Init (_1 row)) (_3 row)) row)
     row))
 
 ;; The sealed environment riding the subject (an Environment during
@@ -409,7 +442,7 @@
     ((Or (Eq tag "s_ref") (Eq tag "s_var"))
       (let* ((path0
                (If (Eq tag "s_var") [(_1 arg)] (surf-ref-path arg)))
-             (path (canon-path path0 (compiler-subject compiler))))
+             (path (type-path compiler path0)))
         (If (get-const path (compiler-subject compiler))
           (nt:const-arg path)
           (new-elab-error env "unbound const argument reference" arg))))
@@ -668,6 +701,10 @@
 ;; would bounce them off the visibility index.
 (define (global-reference-canonical compiler env path)
   (define world (compiler-world compiler))
+  ;; One lookup serves poison checking, presence checking and decoding.
+  ;; Imported entries are immutable; no cross-compilation state is retained.
+  (define hit (get-const path (compiler-subject compiler)))
+  (define raw (And hit (entry-tc path (unpin-soft (_0 hit)))))
   (cond
     ((nt:type-bound? world path)
       (let* ((lr (nt:lookup-type-entry world path))
@@ -678,12 +715,11 @@
                  (nt:type-ref path)
                  scm)))
         [(compiler-with-world (_0 lr) compiler) (tc-typ inner)]))
-    ((failed-declaration? compiler path)
+    ((And hit (Eq "TC_MEAN" (Hd raw)))
       (new-elab-error env
         "reference to a declaration that failed to elaborate" path))
-    ((get-const path (compiler-subject compiler))
-      (let* ((raw (got-entry-tc path (compiler-subject compiler)))
-             (nr (normalize-tc compiler raw))
+    (hit
+      (let* ((nr (normalize-tc compiler raw))
              (tc (_1 nr)))
         (If (prototype-tc? tc)
           (new-elab-error env
@@ -695,7 +731,7 @@
     (else (new-elab-error env "unbound reference" path))))
 
 (define (global-reference compiler env path0)
-  (define canonical (canon-path path0 (compiler-subject compiler)))
+  (define canonical (type-path compiler path0))
   ;; Visibility tombstones are internal. Diagnose the spelling the author
   ;; actually used, not the sentinel installed for a hidden/cut reference.
   (If (Equal canonical ["/foil-env/unbound"])
@@ -789,9 +825,9 @@
     (cond
       ((Eq "s_span" (_0 node)) (go (_2 node)))
       ((Eq "s_ref" (_0 node))
-        (canon-path (surf-ref-path node) (compiler-subject compiler)))
+        (type-path compiler (surf-ref-path node)))
       ((Eq "s_var" (_0 node))
-        (canon-path [(_1 node)] (compiler-subject compiler)))
+        (type-path compiler [(_1 node)]))
       ((Eq "s_spec" (_0 node))
         (let ((inner (tc-typ-inner tc)))
           (And (nt:type-ref? inner) (nt:type-ref-path inner))))
@@ -803,9 +839,9 @@
 (define (specialization-base-path compiler surf)
   (cond
     ((Eq "s_ref" (_0 surf))
-      (canon-path (surf-ref-path surf) (compiler-subject compiler)))
+      (type-path compiler (surf-ref-path surf)))
     ((Eq "s_var" (_0 surf))
-      (canon-path [(_1 surf)] (compiler-subject compiler)))
+      (type-path compiler [(_1 surf)]))
     ((Eq "s_span" (_0 surf)) (specialization-base-path compiler (_2 surf)))
     (else 0)))
 
@@ -820,7 +856,7 @@
 
 ;; The member tag of a structural row constructor: its last /-separated
 ;; segment (a rootless constructor is its own tag).
-(define (cstr-tag cstr)
+(define (legacy-cstr-tag cstr)
   (define n (Bytes cstr))
   (define (go i last)
     (If (Ge i n)
@@ -828,6 +864,10 @@
       (go (Inc i)
         (If (Eq 47 (Mod (Rsh cstr (Mul 8 i)) 256)) (Inc i) last))))
   (go 0 0))
+
+(define (cstr-tag cstr)
+  (If (brands:brand? cstr) (brands:member-name cstr)
+    (legacy-cstr-tag cstr)))
 
 (define (option-member-tag option)
   (cond
@@ -1014,13 +1054,23 @@
   (Ifz arity
     (Eq brand v)
     (And (IsApp v) (And (Eq brand (Hd v)) (Eq arity (Sz v))))))
-(define (sum-try-case brand arity unwrap? v)
+(define (sum-try-case some none brand arity unwrap? v)
   (If (sum-is-case brand arity v)
-    (maybe-some-brand (If unwrap? (Ix 0 v) v))
-    maybe-none-brand))
+    (some (If unwrap? (Ix 0 v) v))
+    none))
 ;; pail/as[t]: some when the pail value carries t's brand at t's arity.
-(define (pail-as-key brand arity p)
-  (If (sum-is-case brand arity p) (maybe-some-brand p) maybe-none-brand))
+(define (pail-as-key some none brand arity p)
+  (If (sum-is-case brand arity p) (some p) none))
+
+(define (system-path compiler name)
+  (Weld (_0 (NewCompiler.system-root compiler)) name))
+(define (option-brands compiler)
+  (Ifz (sut-context (compiler-subject compiler))
+    [maybe-some-brand maybe-none-brand]
+    (map (lambda (name)
+      (_0 (_1 (nt:runtime-key (compiler-world compiler)
+        (nt:type-ref (system-path compiler ["maybe" name]))))))
+      ["some" "none"])))
 
 ;; pail/as[t] is the one specialization whose runtime value depends on
 ;; its type argument: t must be a declared record (the pail universe is
@@ -1039,8 +1089,9 @@
     t)
   (define kr (nt:runtime-key (compiler-world (_0 vr)) row))
   (define key (_1 kr))
+  (define options (option-brands compiler))
   [(compiler-with-world (_0 kr) (_0 vr))
-   (tc-ffi spec-ty (pail-as-key (_0 key) (_1 key)))])
+   (tc-ffi spec-ty (pail-as-key (_0 options) (_1 options) (_0 key) (_1 key)))])
 
 ;; The row an option denotes, WITHOUT interning: a structural row is
 ;; itself; a nominal member's row is its entry's scheme body; a generic
@@ -1062,6 +1113,37 @@
         [(_0 sr) (If (nt:row-type? (_1 sr)) (_1 sr) 0)]))
     (else [world 0])))
 
+;; Named records expose the same checked pail projection as pail/as[T].
+;; Type parameters remain type information; nominal runtime identity is
+;; the defining record's exact moment, independent of specialization.
+(define (gen-pail-member compiler path scm declared)
+  (define params (nt:scheme-parameters scm))
+  (define row (nt:scheme-body scm))
+  (define key (Weld path ["try_from_pail"]))
+  (define env (env-with-name path empty-env))
+  (need env
+    (And (Nil (includes (Equal key) declared))
+      (Nil (includes
+        (lambda (item) (Equal "try_from_pail" (nt:row-item-face item)))
+        (nt:row-items row))))
+    ["derived pail member collides with a declaration or field"
+     (print-path key)]
+    ["record" (print-path path)])
+  (define self-ty
+    (Ifz (Sz params)
+      (nt:type-ref path)
+      (nt:type-app path (map nt:parameter-template-argument params))))
+  (define typ
+    (nt:tfun [nt:tpail]
+      (nt:type-app (system-path compiler ["maybe"])
+        [(nt:type-arg self-ty)])))
+  (define options (option-brands compiler))
+  [compiler
+   [[key wack-span
+     (tc-ffi (Ifz (Sz params) typ (nt:scheme params typ))
+       (pail-as-key (_0 options) (_1 options)
+         (nt:row-cstr row) (Sz (nt:row-items row))))]]])
+
 ;; gen-sum-members :: compiler -> path -> scheme -> [path] -> [compiler rows]
 ;; Per option with a runtime key: S/is_c : {\ S}bool and, for a payload
 ;; case, S/try_c : {\ S}maybe[payload] - payload = the single field's
@@ -1077,8 +1159,10 @@
       (nt:type-ref path)
       (nt:type-app path (map nt:parameter-template-argument params))))
   (define (qua typ) (Ifz (Sz params) typ (nt:scheme params typ)))
-  (define bool-ty (nt:type-ref ["bool"]))
-  (define (maybe-of typ) (nt:type-app ["maybe"] [(nt:type-arg typ)]))
+  (define bool-ty (nt:type-ref (system-path compiler ["bool"])))
+  (define (maybe-of typ)
+    (nt:type-app (system-path compiler ["maybe"]) [(nt:type-arg typ)]))
+  (define options (option-brands compiler))
   (define (derived-key stem tag)
     (define key (Weld path [(strWeld stem tag)]))
     (need env (Nil (includes (Equal key) declared))
@@ -1112,7 +1196,8 @@
                           (If unwrap? (nt:row-item-value (_0 items)) option)))
                    [[(derived-key "try_" tag) wack-span
                      (tc-ffi (qua (nt:tfun [self-ty] (maybe-of payload)))
-                       (sum-try-case brand arity unwrap?))]]))))
+                       (sum-try-case (_0 options) (_1 options)
+                         brand arity unwrap?))]]))))
         [c2 (Weld (_1 state) (Weld [is-row] try-rows))])))
   (foldl option-rows [compiler []] (nt:sum-options (nt:scheme-body scm))))
 
@@ -1276,8 +1361,13 @@
             (flow compiler
               ((entry
                  (lift-world compiler
-                   (nt:lookup-type-entry (compiler-world compiler) path))))
-              (define body (nt:type-entry-body entry))
+                   (nt:lookup-type-entry (compiler-world compiler) path)))
+               (body
+                 (If (Or (Nil (nt:type-entry-body entry))
+                         (nt:row-type? (nt:type-entry-body entry)))
+                   [compiler (nt:type-entry-body entry)]
+                   (view-type compiler env (nt:type-entry-body entry)
+                     "called type is not a row constructor"))))
               (cond
                 ((Nil body)
                   ;; A generic constructor instantiates from the
@@ -1427,7 +1517,8 @@
              (lift-world compiler
                (nt:specialize-scheme (compiler-world compiler)
                  scm gargs))))
-          (If (Equal ["pail" "as"] (specialization-base-path compiler val))
+          (If (Equal (system-path compiler ["pail" "as"])
+                     (specialization-base-path compiler val))
             (elab-pail-as compiler env spec gargs)
           (Ifz (nt:scheme-const-parameter-count scm)
             ;; Type-only specialization erases at runtime: the value
@@ -1852,7 +1943,9 @@
             ;; not leak methods into scope.
             ((And stored (visible-canonical? raw)) raw)
             (else
-              (let* ((mp (canon-path raw subject))
+              (let* ((mp (If (sut-context subject)
+                           (resolve-source-path raw subject)
+                           (canon-path raw subject)))
                      (hit (And (get-const mp subject) mp))
                      (ext (Ifz hit (extension-member nominal) 0)))
                 (cond
@@ -2015,7 +2108,8 @@
       (let* ((gv (goal-view compiler env))
              (gc (_0 gv))
              (goal (_1 gv))
-             (iota-goal? (And goal (Equal iota-body goal)))
+             (iota-goal? (And goal
+               (Equal (nt:relocate-type (system-path compiler) iota-body) goal)))
              (aura-goal
                (If (And goal
                      (And (nt:nat-type? goal)
@@ -2036,7 +2130,7 @@
           ;; row[iota]; check-value's subtype pass admits it at path
           ;; (and other alias) goals.
           ((And (Eq "quip" (_1 surf)) (Eq "/" (Load8 0 (_2 surf))))
-            [gc (tc-lit (nt:tarr (nt:type-ref ["iota"]))
+            [gc (tc-lit (nt:tarr (nt:type-ref (system-path compiler ["iota"])))
                   (quip:parse-path (_2 surf)))])
           ((Eq "quip" (_1 surf))
             (let* ((p (quip:parse-quip (_2 surf)))
@@ -2066,8 +2160,7 @@
               ;; a bare face only captures names the namespace cannot
               ;; see.
               (let* ((gpath
-                       (canon-path [(_1 surf)]
-                         (compiler-subject compiler)))
+                       (type-path compiler [(_1 surf)]))
                      (bound
                        (Or
                          (nt:type-bound?
@@ -2131,7 +2224,7 @@
                     (_1 dv)
                     typ0)))
         [(_0 dv)
-         (tc-lit (nt:type-ref ["type"]) (reflect-encode env typ))]))
+         (tc-lit (nt:type-ref (system-path compiler ["type"])) (reflect-in-subject (compiler-subject (_0 dv)) env typ))]))
     ((Eq tag "s_strict")
       (let ((r (elab-value-go compiler env (_1 surf))))
         [(_0 r) (If (Eq "TC_DEMAND" (Hd (_1 r))) (_1 r)
@@ -2529,7 +2622,8 @@
       ;; otherwise fire in whichever neighbor demands it first.
       (Seq (DeepSeq scm 1)
         ($NewCompiler subject1 world1 (compiler-resolutions compiler)
-          (compiler-member-inverse compiler))))))
+          (compiler-member-inverse compiler)
+          (NewCompiler.system-root compiler))))))
 
 (define (refine-type-declaration compiler row)
   (define path (root-path (compiler-subject compiler) (_1 row)))
@@ -2537,7 +2631,8 @@
   (Ifz (type-declaration? compiler body)
     compiler
     (let* ((env (env-with-name path empty-env))
-           (sr (elab-scheme compiler env body (print-path path)))
+           (sr (elab-scheme compiler env body
+                 (definition-brand (compiler-subject compiler) (_1 row))))
            (scm (_1 sr))
            (mono (nt:scheme-body scm))
            ;; A row body brands itself; an alias body (type-ref/app to
@@ -2563,16 +2658,17 @@
                subject1)))
       (Seq (DeepSeq scm 1)
         ($NewCompiler subject2 world1 (compiler-resolutions compiler)
-          (compiler-member-inverse compiler))))))
+          (compiler-member-inverse compiler)
+          (NewCompiler.system-root compiler))))))
 
-;; Between refine and seed-value: every union declaration gets its
-;; derived S/is_c and S/try_c members (gen-sum-members).  It must follow
+;; Between refine and seed-value: records get T/try_from_pail and
+;; unions get S/is_c and S/try_c members. This must follow
 ;; EVERY refine - a nominal member's brand is final only once its own
 ;; refine ran, and on-decl emits the union before its member kids - and
 ;; precede seed-value, so extend-derived-environment classifies the
 ;; inserted entries as derived.  The rows are forced here so a collision
 ;; lands in this pass's Try as a diagnostic on the union.
-(define (derive-sum-members-pass declared)
+(define (derive-type-members-pass declared)
   (lambda (compiler row)
     (define path (root-path (compiler-subject compiler) (_1 row)))
     (If (Nil (type-declaration? compiler (_3 row)))
@@ -2580,9 +2676,13 @@
       (let* ((r (nt:lookup-type-entry (compiler-world compiler) path))
              (scm (nt:type-entry-scheme (_1 r)))
              (c0 (compiler-with-world (_0 r) compiler)))
-        (If (Nil (nt:sum-type? (nt:scheme-body scm)))
+        (define mono (nt:scheme-body scm))
+        (If (Nil (Or (nt:sum-type? mono) (nt:row-type? mono)))
           c0
-          (let* ((gr (gen-sum-members c0 path scm declared))
+          (let* ((gr
+                   (If (nt:row-type? mono)
+                     (gen-pail-member c0 path scm declared)
+                     (gen-sum-members c0 path scm declared)))
                  (rows (_1 gr))
                  (subject
                    (foldl (lambda (s r) (mark-derived (_0 r) s))
@@ -2615,7 +2715,7 @@
     ;; A reflection's type is always the descriptor sum: forward
     ;; references to reflect-bodied declarations need no annotation.
     ((Eq tag "s_reflect")
-      [compiler (tc-const (nt:type-ref ["type"]) 0)])
+      [compiler (tc-const (nt:type-ref (system-path compiler ["type"])) 0)])
     ((Eq tag "s_fun")
       (let* ((pr (lambda-parameters compiler env (surf-fun-args surf) 0))
              (rr (peek-return-type (_0 pr) env (surf-fun-ret surf))))
@@ -2827,6 +2927,8 @@
 
 (define (elab-mod-diags compiler mod)
   (define base-subject (compiler-subject compiler))
+  (If (sut-context base-subject) 0
+    (error "module-elaboration-requires-compilation-context"))
   ;; %/ references expand structurally at each declaration's own
   ;; namespace position before any pass consumes the bodies.
   ;; The five passes were zoned; the cref expansion before them and the
@@ -2840,7 +2942,7 @@
   (define declared (map (lambda (r) (root-path base-subject (_1 r))) decls))
   (define derived-sums
     (ez "e-derive-sums"
-      (run-pass (derive-sum-members-pass declared) refined-types decls)))
+      (run-pass (derive-type-members-pass declared) refined-types decls)))
   (define seeded-values (ez "e-seed-values" (run-pass seed-value-declaration derived-sums decls)))
   (define elabbed (ez "e-elab-decls" (run-pass elab-declaration seeded-values decls)))
   (define result (ez "e-wf" (run-pass wf-declaration elabbed decls)))
@@ -2857,4 +2959,3 @@
   (Ifz (Sz (_1 r))
     (_0 r)
     (error ["foil-new-elab-errors" (_1 r)])))
-

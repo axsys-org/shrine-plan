@@ -9,6 +9,8 @@
 (#bind newtype (#module newtype))
 (#import newtype)
 
+(#bind contexts (#module foil-context))
+
 (#bind print (#module print))
 (#import print)
 
@@ -125,106 +127,47 @@
 
 
 
-;; A subject is ("SUT" ax order tvar root unit visible ...).  The axal accepts
-;; total-ordered PLAN path segments, including unit-identity pins.  The first four
-;; fields are the historical ABI.  `unit` is the optional union-mount unit
-;; record retained for tooling, and `visible` is either 0 (legacy lookup) or
-;; an AX mapping rooted source paths to canonical storage paths.  Keeping
-;; visibility separate from storage lets prefix-mounted code retain the
-;; canonical entries needed for linking and type expansion without leaking
-;; those entries as unqualified source names.
-;;
-;; Older four-field subjects are still readable through the tolerant
-;; accessors below; every subject constructed here uses the extended shape.
-;; Slot 2 (`tvar`) is retired and always 0. It remains only to preserve
-;; subject field positions; generic scope belongs to the type kernel.
-;;
-;; The root is the
-;; compilation's namespace prefix: entry keys are stored rooted, source
-;; references resolve relative to it (canon-path), and row brands are
-;; therefore real namespace paths.  The boot process (builtins and the
-;; modules compiled against them) lives at /boot; an empty root is the
-;; unrooted (test/legacy) subject.
-;;
-;; The "SUT" brand is historical ABI (snapshots, tooling); like the TC
-;; nodes above, the newtype declaration rides the existing tag.  The
-;; tolerant accessors below keep their own Sz guards — a generated
-;; accessor indexes unconditionally, and hydrated narrower subjects
-;; must still read as 0 in the extended slots.
+;; Compiler storage is private. Public definition locations and moments
+;; belong to the explicit compilation context. The visibility index maps
+;; source spellings to storage keys; import pins carry defining layers.
+;; Version two requires the context slot even during entrypoint migration.
+;; Retired slots remain zero, but old or wider payloads are never upgraded.
 (define Subject
-  (trow "SUT"
+  (trow "foil/subject/v2"
     [["ax" tany] ["order" tany] ["tvar" tany] ["root" tany]
      ["unit" tany] ["visible" tany] ["vis-inverse" tany]
-     ["write-log" tany] ["lazy" tany] ["prev" tany]]))
-
-(define sut-ax Subject.ax)
-(define sut-root Subject.root)
-(define set-sut-root Subject.=root)
-(define (root-path sut p) (Weld (sut-root sut) p))
-(define sut-prev Subject.prev)
+     ["write-log" tany] ["lazy" tany] ["prev" tany]
+     ["context" tany]]))
 
 (define (subject? x)
-  (and
-    (Eq (Hd x) "SUT")
-    (IsApp x)
-    (Ge (Sz x) 4)))
+  (And (IsApp x)
+    (And (Eq (Hd x) "foil/subject/v2") (Eq (Sz x) 11))))
+(define (require-subject sut)
+  (If (subject? sut) sut
+    (error "stale-compiler-subject: rebuild compiler artifacts and snapshots")))
 
-;; sut-unit :: Subject -> Unit | 0
-(define (sut-unit sut)
-  (If (Gt (Sz sut) 4) (Subject.unit sut) 0))
-
-;; sut-visible :: Subject -> Ax CanonPath | 0
-(define (sut-visible sut)
-  (If (Gt (Sz sut) 5) (Subject.visible sut) 0))
-
-;; sut-vis-inverse :: Subject -> Ax (Row WrittenPath) | 0
-;;
-;; RETIRED slot (2026-09-01): the inverse is derived per NewCompiler
-;; (derive-vis-inverse) instead of riding the subject.  The tolerant
-;; reader remains for hydrated historical rows; upgrade-subject zeroes
-;; the slot so current-shape subjects never carry one.
-(define (sut-vis-inverse sut)
-  (If (Gt (Sz sut) 6) (Subject.vis-inverse sut) 0))
-
-;; upgrade-subject :: Subject -> Subject
-;;
-;; `Up` leaves an application unchanged when its index is out of range.  A
-;; direct write to slot 4/5/6 therefore cannot extend a retained historical
-;; narrower subject.  Rebuild old/intermediate values in the current shape
-;; before any extended-field setter runs; current and future wider subjects
-;; pass through unchanged.
-(define (upgrade-subject sut)
-  (If (And (typed-value? Subject sut) (Ge (Sz sut) 4))
-    (If (Gt (Sz sut) 9)
-      sut
-      ($Subject (sut-ax sut) (Ix 1 sut)
-        0 ;; tvar: retired — check-type-wf threads quantifier scope
-        (Ix 3 sut)
-        (If (Gt (Sz sut) 4) (Ix 4 sut) 0)
-        (If (Gt (Sz sut) 5) (Ix 5 sut) 0)
-        0 ;; vis-inverse: retired — derived per compiler now
-        0 ;; write-log: retired — the own layer's order is the write set
-        0 ;; lazy: retired — imports ride the prev chain
-        0))
-    (error ["foil-malformed-subject" sut])))
+(define (sut-ax sut) (Subject.ax (require-subject sut)))
+(define (sut-root sut) (Subject.root (require-subject sut)))
+(define (set-sut-root root sut) (Subject.=root root (require-subject sut)))
+(define (root-path sut p) (Weld (sut-root sut) p))
+(define (sut-context sut) (Subject.context (require-subject sut)))
+(define (sut-prev sut) (Subject.prev (require-subject sut)))
+(define (sut-unit sut) (Subject.unit (require-subject sut)))
+(define (sut-visible sut) (Subject.visible (require-subject sut)))
+(define (sut-vis-inverse sut) (Subject.vis-inverse (require-subject sut)))
 
 ;; set-sut-unit :: Unit | 0 -> Subject -> Subject
-(define (set-sut-unit unit sut) (Subject.=unit unit (upgrade-subject sut)))
+(define (set-sut-context context sut)
+  (Subject.=context context (require-subject sut)))
+(define (set-sut-unit unit sut) (Subject.=unit unit (require-subject sut)))
 
 ;; set-sut-visible :: Ax CanonPath | 0 -> Subject -> Subject
 (define (set-sut-visible visible sut)
-  (Subject.=visible visible (upgrade-subject sut)))
+  (Subject.=visible visible (require-subject sut)))
 
 
-;; RETIRED slot 8 (hybrid lazy projection, 2026-09-01): imports ride
-;; the prev chain now — project-mounts-base splices each compiled
-;; import as a layer, and sut-find/vis-find/world derivation walk the
-;; chain.  The dispatch/mount records this slot carried are gone.
-;; The tolerant reader remains for hydrated historical rows; note a
-;; hydrated slot-8 subject's mounts are UNREACHABLE under this code —
-;; restage rather than mixing eras.  upgrade-subject zeroes the slot.
-(define (sut-lazy sut)
-  (If (Gt (Sz sut) 8) (Subject.lazy sut) 0))
+;; Retired slot 8 is always zero; import layers live in prev.
+(define (sut-lazy sut) (Subject.lazy (require-subject sut)))
 
 ;; sut-find :: Path -> Subject -> Maybe (Pin Entry)
 ;;
@@ -241,32 +184,44 @@
   (define p (sut-prev sut))
   (Ifz p [] p))
 
-(define (sut-find key sut)
-  (define hit (getax key (sut-ax sut)))
-  ;; local (top-level mutual recursion does not resolve in a module):
-  ;; first prev whose DAG holds the key
-  (define (fp prevs)
+(define (search-layers visit sut)
+  (define hit (visit sut))
+  ;; Revisited pins cannot produce a new result. Shared system imports make
+  ;; diamonds common; walking their tails again made misses exponential.
+  (define (fp seen prevs)
     (Ifz (Sz prevs) 0
-      (let ((h (sut-find key (Unpin (_0 prevs)))))
-        (If h h (fp (drop 1 prevs))))))
+      (let ((pin (_0 prevs)) (rest (drop 1 prevs)))
+        (If (includes (Equal pin) seen) (fp seen rest)
+          (let* ((layer (Unpin pin)) (h (visit layer)))
+            (If h h
+              (fp (snoc pin seen) (Weld (sut-prevs layer) rest))))))))
   (If hit
     hit
-    (fp (sut-prevs sut))))
+    (fp [] (sut-prevs sut))))
+
+(define (sut-find key sut)
+  (search-layers (lambda (layer) (getax key (sut-ax layer))) sut))
 
 ;; Every layer subject reachable through the chain (head, then each
 ;; import DAG), for the order-flattening consumers.
 (define (sut-layers sut)
-  (lcons sut
-    (foldl (lambda (acc p) (lweld (sut-layers (Unpin p)) acc))
-      0 (sut-prevs sut))))
+  ;; Preserve the existing right-to-left layer fold, retaining only each
+  ;; pin's first occurrence. This does not change source-name precedence.
+  (define (walk seen pending)
+    (Ifz (Sz pending) 0
+      (let ((pin (_0 pending)) (rest (drop 1 pending)))
+        (If (includes (Equal pin) seen) (walk seen rest)
+          (let ((layer (Unpin pin)))
+            (lcons layer (walk (snoc pin seen)
+              (Weld (rev (sut-prevs layer)) rest))))))))
+  (lcons sut (walk [] (rev (sut-prevs sut)))))
 
 ;; RETIRED slot 7 (write-log, 2026-09-01): the log existed so the two
 ;; per-compile deltas could avoid deep-Equal-walking a projection-fat
 ;; order.  Under layered subjects a compile's own layer IS the write
 ;; set — its order is small and authoritative — so the delta walks the
 ;; order again and the log has nothing left to accelerate.
-;; upgrade-subject zeroes the slot; hydrated historical rows may still
-;; carry one, ignored.
+;; Constructors leave the retired slot zero.
 
 ;; derive-vis-inverse :: Subject -> Ax (Row WrittenPath)
 ;;
@@ -300,9 +255,8 @@
           inv))
       empty-ax (rowify (tapax vis)))))
 
-;; Born in the full nine-slot shape (narrower historical subjects
-;; still hydrate; upgrade-subject widens them on first extended write).
-(define (make-subject ax) ($Subject ax 0 0 [] 0 0 0 0 0 0))
+;; Construct only the current format.
+(define (make-subject ax) ($Subject ax 0 0 [] 0 0 0 0 0 0 0))
 (define subject-order Subject.order)
 (define set-subject-order Subject.=order)
 (define (push-subject-order name sut)
@@ -313,7 +267,8 @@
 ;; A fresh head over the given import pins (stored verbatim — they are
 ;; the shared cache pins).  Inherits the base subject's root.
 (define (head-onto-pins prevs base)
-  ($Subject empty-ax 0 0 (sut-root base) 0 0 0 0 0 prevs))
+  ($Subject empty-ax 0 0 (sut-root base) 0 0 0 0 0 prevs
+    (sut-context base)))
 
 ;; push-layer :: Subject -> Subject — a fresh head over one subject,
 ;; pinned here (the test/single-import convenience).
@@ -559,8 +514,30 @@ assert(ty-var-path? ["ty-var" "v"])
   (unpin-soft (need (get-const path sut))))
 (define (got-const name sut) (need (get-const name sut)))
 
-(define (got-entry-tc path sut)
-  (define ent (got-entry path sut))
+;; Resolve a public definition moment through the defining layers, never
+;; through the importing source's visibility table. Return the private key
+;; separately so namespace addresses cannot be mistaken for storage keys.
+(define (definition-key identity sut)
+  (search-layers (lambda (layer)
+    (define context (sut-context layer))
+    (define local (If context (contexts:local-definition context identity) 0))
+    (define own (If local (root-path layer (_0 local)) 0))
+    (If (And own (getax own (sut-ax layer))) [own] 0)) sut))
+
+(define (definition-moment key sut)
+  (search-layers (lambda (layer)
+    (define unit (sut-context layer))
+    (define root (sut-root layer))
+    (define own (And unit
+      (And (Equal root (take (Sz root) key)) (getax key (sut-ax layer)))))
+    (If own (contexts:find-moment unit (drop (Sz root) key)) 0)) sut))
+
+(define (get-definition identity sut)
+  (define key (definition-key identity sut))
+  (If key (get-const (_0 key) sut) 0))
+
+;; Decode an already-found entry without walking the import graph again.
+(define (entry-tc path ent)
   (cond
     ((typed-value? TcEntry ent) (tc-entry-contents ent))
     ;; IR_ENTRY belongs to foil-lower (which imports this module);
@@ -568,6 +545,9 @@ assert(ty-var-path? ["ty-var" "v"])
     ((Eq (Hd ent) "IR_ENTRY") (_3 ent))
     (else
       (error ("bad entry" path)))))
+
+(define (got-entry-tc path sut)
+  (entry-tc path (got-entry path sut)))
 
 (define (print-path x)
   (foldl strWeld "" (map (cork print-nat (strWeld "/")) x)))
@@ -597,31 +577,27 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; carries entries, never names, so canon-path reads the head index
 ;; directly.
 
+(define (definition-brand sut local)
+  (If (sut-context sut)
+    (contexts:runtime-brand (sut-context sut) local)
+    (error "definition-brand-requires-compilation-context")))
+
+;; Source spelling has its own lookup operation. In particular, a source
+;; name beginning with a compiler-storage discriminator gains no privilege.
+(define (resolve-source-path path sut)
+  (define visible (sut-visible sut))
+  (Ifz visible (error "source-resolution-requires-visibility")
+    (let ((hit (getax (Weld (sut-root sut) path) visible)))
+      (If hit (_0 hit) ["/foil-env/unbound"]))))
+
 (define (canon-path path sut)
-  ;; path-prefix? :: Path -> Path -> Bool
-  (define (path-prefix? prefix whole)
-    (And (Le (Sz prefix) (Sz whole))
-      (Equal prefix (take (Sz prefix) whole))))
-  ;; Legacy subjects infer visibility from storage.  A union-mount subject
-  ;; has an explicit visible-path index: relative source names must pass
-  ;; through it, while already-canonical rooted paths remain available to
-  ;; compiler internals (type expansion and symbolic global edges).
-  ;; HEAD vis only, deliberately: visibility is per-compile naming
-  ;; authority (substrate + own decls + direct mounts' export marks,
-  ;; all made by THIS compile into its head).  Probing tail layers'
-  ;; indexes would let every import's own-name marks leak into scope —
-  ;; a prefix-mounted vec answering bare `vec` (the completed-prefix-
-  ;; leak test).  The chain carries entries; it does not carry names.
+  ;; Compiled subjects resolve source spellings only through their explicit
+  ;; visibility index. Canonical identity lookup uses definition-key instead.
+  ;; Unindexed scratch subjects are used for internal type construction.
   (define (visible-canon p)
     (define vis (sut-visible sut))
     (define root (sut-root sut))
-    ;; Absolute = already canonical.  Under per-module roots (foil-new-env
-    ;; compiles each module beneath /boot/<mod>) an import's canonical key
-    ;; starts with the NAMESPACE root, not this compile's, so the test is
-    ;; against root's first segment; with the production root /boot the
-    ;; two coincide.
-    (define absolute? (And (Sz root) (path-prefix? (take 1 root) p)))
-    (If (Or (Nil vis) absolute?)
+    (If (Nil vis)
       0
       (let ((hit (getax (Weld root p) vis)))
         (Ifz hit
@@ -750,6 +726,10 @@ assert(ty-var-path? ["ty-var" "v"])
  tc-arm-val
  tc-arm-key
  sut-ax
+ sut-context
+ set-sut-context
+ definition-brand
+ resolve-source-path
  sut-root
  set-sut-root
  root-path
@@ -761,7 +741,7 @@ assert(ty-var-path? ["ty-var" "v"])
  derive-vis-inverse
  sut-lazy
  sut-find
- upgrade-subject
+ require-subject
  make-subject
  subject-order
  set-subject-order
@@ -780,6 +760,9 @@ assert(ty-var-path? ["ty-var" "v"])
  insert-ffi
  got-entry
  get-const
+ definition-key
+ definition-moment
+ get-definition
  got-const
  unpin-soft
  canon-path
@@ -802,6 +785,7 @@ assert(ty-var-path? ["ty-var" "v"])
  ty-ap-decode
  ty-ap-base
  resolve-path
+ entry-tc
  got-entry-tc
  print-path
  got-span

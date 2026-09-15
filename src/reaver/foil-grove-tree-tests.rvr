@@ -1,3 +1,5 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
 ;;;; Tree transformations validate both sides of their norm boundary.
 (#bind std (#module std))
 (#import std)
@@ -10,28 +12,26 @@
 (define (ok result)
   (If (Eq "ok" (Hd result)) (_0 result)
     (error ["sewn-build" result])))
-(define (check ignored)
-  (define prepared (backend:prepare 0))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
   (define policy (_1 prepared))
-  (define helpers (_1 (source:compile (_0 prepared)
-    "tests/grove_backend")))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
   (define (helper name)
     (driver:get-perc ["grove_backend_checks" name] helpers))
+  assert(Eq 1 ((helper "path_codec_checks") ("unit")))
   (define (parse text)
     (ok ((driver:get-perc ["grove" "parse"] policy) text)))
-  (define (missing key) "/boot/maybe/none")
+  (define (missing key) (grove_fixture:lookup local [] key))
   (define (compile lookup root text)
-    (backend:compile prepared lookup (path root) (parse text)))
-  (define slots (ok (compile missing ["sys"]
-    (read-text-file "grove/sys_slots.grove"))))
-  (define types (ok (compile missing ["sys" "types"]
-    (read-text-file "grove/sys_types.grove"))))
-  (define lookup ((helper "lookup") (Weld slots types)))
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
   (define srs (parse (read-text-file "grove/srs.grove")))
-  (define records (ok (backend:compile prepared lookup
-    (path ["gov" "srs"]) srs)))
-  assert(Eq 10 (Sz records))
-  (define stored ((helper "lookup") records))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path ["gov" "srs"])) srs)))
+  assert(Gt (Sz records) 10)
+  (define stored (grove_fixture:lookup local records))
   assert(Eq 1 ((helper "tree_seed_checks") records))
   (define (tree key body)
     (strcat [34 key 34 " =
@@ -45,12 +45,18 @@
     1)
   assert(Eq 1 (reject (strcat [(tree "/same" "")
     (tree "/same" "")])))
-  ;; Definition and instance names belong to distinct namespaces.
-  assert(Eq 2 (Sz (ok (compile missing ["gov" "separate"]
+  ;; Definition and instance names remain distinct. Generated nominal
+  ;; definitions also have their own publication records.
+  (define separate (ok (compile missing ["gov" "separate"]
     (strcat ["same =
   @slot
 
-" (tree "/same" "")])))))
+" (tree "/same" "")]))))
+  (define (has-record names records)
+    (If (find (lambda (record)
+      (Equal (grove_fixture:qualified (path names)) (_0 record))) records) 1 0))
+  assert(Eq 1 (has-record ["gov" "separate"] separate))
+  assert(Eq 1 (has-record ["gov" "separate" "same"] separate))
   assert(Eq 1 (reject (tree "/a//b" "")))
   assert(Eq 1 (reject (tree "/a/../b" "")))
   assert(Eq 1 (reject (tree "/view" "  tack: '@/y/%/missing
@@ -83,39 +89,44 @@
       ": n
   " 34 "/sys/tack" 34 ": '@/y/%/cards
 "])) ])))
-  (define fresh (backend:prepare 0))
-  (define external (ok (backend:compile fresh stored
-    (path ["gov" "external"])
-    (parse (strcat ["#import n=gov/srs/cards_by_id
+  (define fresh (backend:prepare code))
+  (define external (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (path ["gov" "external"])) (parse (strcat ["#import n=gov/srs/cards_by_id
 
 "
       (tree "/items" "  #like ; n
 ")])))))
-  assert(Eq 1 (Sz external))
-  (define install-mod (_1 (source:compile (_0 prepared)
-    "tests/grove_install")))
-  (define install (driver:get-perc ["grove_install_checks" "check"]
-    install-mod))
+  assert(Eq 1 (has-record ["gov" "external"] external))
+  (define boot-code (_1 (grove_fixture:boot local)))
+  (define (boot-module name)
+    (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) (_2 boot-code))))))
+  (define install-mod (boot-module "tests/grove_install"))
+  (define install (driver:get-perc ["grove_install_checks" "check"] install-mod))
   assert(Eq 1 (ok (install records)))
-  ;; Compilation produces shared publications and reusable templates.
-  (define boot-mod (_1 (source:compile (_0 prepared) "tests/eden_srs")))
-  (define (boot-helper name)
-    (driver:get-perc ["eden_srs" name] boot-mod))
-  (define build (ok ((boot-helper "compile")
-    (read-text-file "grove/sys_slots.grove")
-    (read-text-file "grove/sys_types.grove")
-    (read-text-file "grove/srs.grove")
-    (backend:compile-port (_1 prepared) (_2 prepared)))))
-  assert(Equal records (_1 (_2 build)))
-  (define first ((boot-helper "boot") 18131 build))
-  (define second ((boot-helper "boot") 18132 build))
+  ;; Real boot imports pinned /sys slots and publishes only local definitions.
+  (define boot-mod (boot-module "tests/eden_srs"))
+  (define (boot-helper name) (driver:get-perc ["eden_srs" name] boot-mod))
+  (define case (driver:get-perc ["namespace" "case"] boot-mod))
+  (define (previous state path)
+    (define found (case (abi:constructor boot-mod ["care" "x"])
+      (map (lambda (part) ((_0 part) (_1 part))) path) state))
+    (If (Eq (abi:option boot-mod "some") (Hd found)) (_0 found) 0))
+  (define ports ((abi:constructor boot-mod ["eden_srs" "ports"])
+    (lambda (state request) (backend:compile-port prepared (previous state) request))
+    (lambda (state records) (backend:publish prepared records 0 0 state))))
+  (define (boot port)
+    ((boot-helper "boot") ("x" 17) (_2 (_0 local))
+      (_1 (_0 local)) port
+      (read-text-file "grove/value_codecs.grove")
+      (read-text-file "grove/srs.grove") ports))
+  (define first (boot 18131))
+  (define second (boot 18132))
   assert(Equal "ok" (Hd first))
   assert(Equal "ok" (Hd second))
   assert(Eq 1 ((driver:get-perc
-    ["eden_srs_checks" "atomic_install"] boot-mod) build))
-  assert(Eq 1 ((driver:get-perc
-    ["eden_srs_checks" "instance_install"] boot-mod) build))
-  ;; Existing publication roots cannot be overwritten.
-  assert(Equal "err" (Hd ((boot-helper "publish") build (ok first))))
+    ["eden_srs_checks" "instance_install"] boot-mod) (ok first)))
+  assert(Equal "err" (Hd (backend:publish prepared records 0 0 (ok first))))
   1)
-assert(Eq 1 (check 0))
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

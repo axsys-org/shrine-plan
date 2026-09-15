@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -10,6 +11,60 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_shared_fixture_is_built_once_and_passed_to_each_entrypoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            suites = [dict(name=name, kind='reaver', target=name, group='exec',
+                           entrypoint='check', fixture=['fixture', 'create'])
+                      for name in ['first', 'second']]
+            captured = []
+            def copy(_source, target):
+                target.mkdir(parents=True)
+            def execute(_command, directory, source, _timeout):
+                captured.append(source)
+                (directory / 'out.log').write_text(
+                    ''.join(f'("TEST" "pass" "{suite["name"]}" "~:module" "~:" "~:")\n'
+                            for suite in suites) + runner.DONE + '\n')
+                return 0, True, 0.0
+            with patch.object(runner, 'copy_template', copy), \
+                 patch.object(runner, 'run_process', execute):
+                runner.run_group(suites, 'wisp', root, root, 1)
+            source = captured[0]
+            self.assertEqual(source.count('(test_fixture_0_module:create 0)'), 1)
+            self.assertIn('(#module fixture)', source)
+            self.assertIn('(first:check test_fixture_0)', source)
+            self.assertIn('(second:check test_fixture_0)', source)
+            self.assertLess(source.index('(define (test_fixture_run ignored)'),
+                            source.index('(define test_fixture_0'))
+            self.assertLess(source.index('(#bind first'),
+                            source.index('(define test_fixture_0'))
+
+    def test_doctests_count_and_locate_the_frozen_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            frozen = root / 'src/foil/example.foil'
+            frozen.parent.mkdir(parents=True)
+            frozen.write_text("' ?= ((add 1 1) 2)\n")
+            live = root / 'checkout/src/foil/example.foil'
+            live.parent.mkdir(parents=True)
+            live.write_text("+ changed 0\n")
+            suite = dict(name='doc:example', kind='docs', target='example',
+                         group='doctests')
+            def copy(_source, target):
+                target.mkdir(parents=True)
+            def execute(_command, directory, _input, _timeout):
+                (directory / 'out.log').write_text(
+                    '("TEST" "pass" "example" "~:1: ?= ((add 1 1) 2)" '
+                    '"~:2" "~:2")\n' + runner.DONE + '\n')
+                return 0, True, 0.0
+            with patch.object(runner, 'ROOT', root / 'checkout'), \
+                 patch.object(runner, 'copy_template', copy), \
+                 patch.object(runner, 'run_process', execute):
+                result = runner.run_group([suite], 'wisp', root, root, 1)
+            self.assertTrue(result['passed'])
+            self.assertEqual(list(result['locations'].values()),
+                             [str(frozen) + ':1'])
+
     def test_deprecated_compiler_cannot_reenter_module_graph(self):
         retired = {'foil', 'compiler-host', 'helm-host'}
         modules = {p.stem for p in (runner.ROOT / 'src/reaver').glob('*.rvr')}
@@ -118,6 +173,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('foil:tests/http_foot', names)
         self.assertFalse(any(name.startswith('helm-') for name in names))
 
+    def test_generated_helpers_are_covered_without_running_as_suites(self):
+        suites = {s['name']: s for s in runner.inventory()}
+        for helper in ('grove_backend', 'grove_install', 'eden_srs'):
+            self.assertNotIn('foil:tests/' + helper, suites)
+            self.assertIn('"tests/' + helper + '"',
+                          '\n'.join((runner.ROOT / 'src/reaver' / (name + '.rvr')).read_text()
+                                    for name in runner.reaver_closure(['foil-grove-tree-tests'])
+                                    if (runner.ROOT / 'src/reaver' / (name + '.rvr')).exists()))
+        self.assertTrue(suites['foil-grove-tree-tests']['enabled'])
+
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}
         for name in ('web', 'pact', 'sept', 'semidoc', 'weft'):
@@ -179,6 +244,39 @@ class RuntimeTests(unittest.TestCase):
         log = (root / 'out.log').read_text(errors='replace')
         self.assertTrue(runner.verdict(log, code, complete)[0], log[-6000:])
 
+    def test_shared_fixture_runtime_calls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(runner.ROOT / 'src', root / 'src')
+            modules = root / 'src/reaver'
+            (modules / 'shared_probe.rvr').write_text(
+                '(#bind std (#module std))\n(#import std)\n'
+                '(define (create ignored) [17 99])\n(#export create)\n')
+            suites = []
+            for name, index, expected in [('probe_one', 0, 17), ('probe_two', 1, 99)]:
+                (modules / (name + '.rvr')).write_text(
+                    '(#bind std (#module std))\n(#import std)\n'
+                    f'(define (check fixture) (std:Eq {expected} (std:Ix {index} fixture)))\n'
+                    '(#export check)\n')
+                suites.append(dict(name=name, target=name, kind='reaver', group='exec',
+                                   entrypoint='check', fixture=['shared_probe', 'create']))
+            result = runner.run_group(suites, os.environ['WISP'],
+                                      Path(os.environ['TEST_TEMPLATE']), root, 180)
+            self.assertTrue(result['passed'], (root / 'exec/out.log').read_text()[-6000:])
+            # A failed entrypoint must not prevent later shared-fixture suites.
+            (modules / 'probe_one.rvr').write_text(
+                '(#bind std (#module std))\n(#import std)\n'
+                '(define (check fixture) (std:error "fixture probe failure"))\n'
+                '(#export check)\n')
+            failed_root = root / 'failed'
+            failed_root.mkdir()
+            (failed_root / 'src').symlink_to(root / 'src')
+            result = runner.run_group(suites, os.environ['WISP'],
+                                      Path(os.environ['TEST_TEMPLATE']), failed_root, 180)
+            self.assertFalse(result['passed'])
+            self.assertTrue(any(r[:2] == ('error', 'probe_one') for r in result['records']))
+            self.assertTrue(any(r[:2] == ('pass', 'probe_two') for r in result['records']))
+
     def test_workers_read_preserved_timestamp_edits(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -196,9 +294,10 @@ class RuntimeTests(unittest.TestCase):
                 runner.copy_template(seed, work / 'snap')
                 self.probe(work, '\n'.join([
                     '(#bind source (#module foil-source))',
+                    '(#bind fixture (#module foil-test-context))',
                     '(#bind driver (#module foil-new-env))',
                     '(define (check z)',
-                    '  (define result (source:compile 0 "cache_probe_dep"))',
+                    '  (define result (source:compile (fixture:files 0 ["cache_probe_dep"]) 0 "cache_probe_dep"))',
                     f'  assert(Eq {value} (driver:get-perc ["answer"] (_1 result)))',
                     '  1)', 'assert(check 0)']))
                 self.assertFalse((work / 'prepare').exists())
@@ -211,6 +310,8 @@ class RuntimeTests(unittest.TestCase):
             self.probe(root, '''(#bind reef (#module reef))
 (#import reef)
 (#bind cc (#module foil-test-cache))
+(#bind fixture (#module foil-test-context))
+(#bind brand (#module shrine-brand))
 (#bind driver (#module foil-new-env))
 (#bind source (#module foil-source))
 (#bind rex (#module rex))
@@ -226,38 +327,42 @@ class RuntimeTests(unittest.TestCase):
 + generated_value other")
         ((Equal name "alias") "- app")
         (else (error ["missing" name])))))
-  (define (compile version cache mod) (driver:compile-with (read version) cache mod))
+  (define (compile version cache mod)
+    (driver:compile-with (fixture:graph (read version) cache [mod]) (read version) cache mod))
   (define first (compile 1 0 "alias"))
   (define all-cache (_0 (compile 1 (_0 first) "generated")))
-  (define (entry cache name) (_0 (driver:get-foil-cache name cache)))
+  (define (find-entry cache name)
+    (find (lambda (perc) (Equal name (driver:perc-name perc))) (driver:cache-results cache)))
+  (define (entry cache name) (_0 (find-entry cache name)))
   (define other (entry all-cache "other"))
   assert(Equal ["alias" "app" "dep"] (cc:closure all-cache "alias"))
   assert(Equal ["generated" "other"] (cc:closure all-cache "generated"))
   (define kept (cc:refresh all-cache ["dep"]))
   assert(Eq 2 (Sz (driver:cache-results kept)))
   assert(Equal other (entry kept "other"))
-  assert(Equal 0 (driver:get-foil-cache "alias" kept))
+  assert(Equal 0 (find-entry kept "alias"))
   (define rebuilt (compile 2 kept "alias"))
   assert(Eq 2 (driver:get-perc ["observed"] (_1 rebuilt)))
   assert(Equal other (entry (_0 rebuilt) "other"))
   (define importer-edit (cc:refresh (_0 rebuilt) ["app"]))
   assert(Equal (entry (_0 rebuilt) "dep") (entry importer-edit "dep"))
-  assert(Equal 0 (driver:get-foil-cache "alias" importer-edit))
+  assert(Equal 0 (find-entry importer-edit "alias"))
   (define generated-edit (cc:refresh all-cache ["other"]))
   assert(Eq 3 (Sz (driver:cache-results generated-edit)))
-  assert(Equal 0 (driver:get-foil-cache "generated" generated-edit))
+  assert(Equal 0 (find-entry generated-edit "generated"))
   ;; A failed recompile cannot mutate the retained unrelated modules.
   (define failure (Try (lambda (z)
-    (force (driver:compile-with (lambda (name) (error name)) kept "app"))) 0))
+    (force (driver:compile-with (fixture:graph (read 1) kept ["app"])
+      (lambda (name) (error name)) kept "app"))) 0))
   assert(Eq 1 (Hd failure))
   assert(Equal other (entry kept "other"))
   ;; App paths are generated word leaves; their nominal identity survives aliases.
-  (define app-result (driver:compile-with
-    (lambda (name) (If (Equal name "app_alias")
+  (define (app-read name) (If (Equal name "app_alias")
       (source:import-tree "apps/probe/main")
-      (rex:ParseRexNormFile "+ token\n  : value=nat\n+ value | token 7"))) 0 "app_alias"))
+      (rex:ParseRexNormFile "+ token\n  : value=nat\n+ value | token 7")))
+  (define app-result (driver:compile-with (fixture:graph app-read 0 ["app_alias"]) app-read 0 "app_alias"))
   assert(Equal ["apps/probe/main"] (driver:perc-dependencies (_1 app-result)))
-  assert(Equal "/boot/apps/probe/main/token"
+  assert(Equal (brand:encode (Weld (fixture:root "apps/probe/main") [["ts" "token"]]) 1)
     (Hd (driver:get-perc ["value"] (_1 app-result))))
   assert(Equal (driver:get-perc ["value"] (entry (_0 app-result) "apps/probe/main"))
     (driver:get-perc ["value"] (_1 app-result)))
@@ -310,6 +415,19 @@ assert(check 0)
                              ['error', 'fail', 'pass', 'fail', 'pass', 'fail', 'broken'], log[-4000:])
             self.assertEqual(results[1][3:], ('want', 'got'))
             self.assertEqual(results[5][3:], ('2', '1'))
+
+
+class NamespaceIdentityTests(unittest.TestCase):
+    def test_identity_uses_shrine_byte_order(self):
+        from namespace_identity import parse_node_identity
+        for spelling, number in [("0x01", 1), ("0x11", 17), ("0x0102", 513), ("0x0001", 256)]:
+            self.assertEqual((number, spelling), parse_node_identity(spelling))
+
+    def test_identity_rejects_noncanonical_and_zero_spellings(self):
+        from namespace_identity import parse_node_identity
+        for spelling in ["0x", "0x1", "11", "0xFF", "0x1100", "0x00", "-0x01"]:
+            with self.subTest(spelling=spelling), self.assertRaises(ValueError):
+                parse_node_identity(spelling)
 
 
 if __name__ == '__main__':

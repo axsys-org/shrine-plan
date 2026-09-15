@@ -1,3 +1,4 @@
+(#bind fixture (#module foil-test-context))
 ;;;; New cache operations, app composition and generated contracts.
 (#bind std (#module std))
 (#import std)
@@ -7,6 +8,10 @@
 (#bind driver (#module foil-new-env))
 (#bind source (#module foil-source))
 (#bind rex (#module rex))
+(#bind contexts (#module foil-context))
+(#bind grove (#module grove))
+(#bind abi (#module foil-abi))
+(#bind brand (#module shrine-brand))
 (define (tree text) (rex:ParseRexNormFile text))
 (define (read name)
   (cond
@@ -16,26 +21,34 @@
 + broken | missing 1
 "))
     (else (error ["unexpected module" name]))))
-(define roster (build:compile-roster-with read driver:empty-foil-cache
+(define context (fixture:graph read driver:empty-foil-cache ["cb_bad" "cb_good"]))
+(define roster (build:compile-roster-with context read driver:empty-foil-cache
   ["cb_bad" "cb_good"]))
 assert(Equal ["cb_bad"] (_1 roster))
-assert(Nil (driver:get-foil-cache "cb_dep" (_0 roster)))
+assert(Nil (find (lambda (perc) (Equal "cb_dep" (driver:perc-name perc))) (driver:cache-results (_0 roster))))
 assert(Eq 42 (driver:get-perc ["answer"]
-  (_0 (driver:get-foil-cache "cb_good" (_0 roster)))))
+  (_0 (find (lambda (perc) (Equal "cb_good" (driver:perc-name perc))) (driver:cache-results (_0 roster))))))
 assert(Equal [(_0 roster) 1]
-  (build:cache-compile-with (lambda (name) (error "unexpected read"))
+  (build:cache-compile-with context (lambda (name) (error "unexpected read"))
     (_0 roster) "cb_good"))
 assert(Equal [(_0 roster) 0]
-  (build:cache-compile-with read (_0 roster) "cb_bad"))
+  (build:cache-compile-with context read (_0 roster) "cb_bad"))
 
 assert(Equal [driver:empty-foil-cache []]
-  (build:compile-apps-with (lambda (path) (error "unexpected read"))
+  (build:compile-apps-with context (lambda (path) (error "unexpected read"))
     driver:empty-foil-cache []))
 
 (define (check-apps z)
-  (define policy (source:compile driver:empty-foil-cache "app_install"))
+  (define policy (source:compile (fixture:files driver:empty-foil-cache ["app_install"]) driver:empty-foil-cache "app_install"))
   (define cache (_0 policy))
-  (define good (source:compile-rex cache "apps/cb_code/main"
+  (define good (source:compile-rex (fixture:tree cache "apps/cb_code/main" (tree "- pact
++ doc
+  ^ str
+  0
++ app
+  ^ mani
+  | mani 'code (lore/line doc) [] [] []
+")) cache "apps/cb_code/main"
     (tree "- pact
 + doc
   ^ str
@@ -44,9 +57,16 @@ assert(Equal [driver:empty-foil-cache []]
   ^ mani
   | mani 'code (lore/line doc) [] [] []
 ")))
-  (define only (source:compile-rex (_0 good) "apps/cb_only/main"
+  (define only (source:compile-rex (fixture:tree (_0 good) "apps/cb_only/main" (driver:perc-rex (_1 good))) (_0 good) "apps/cb_only/main"
     (driver:perc-rex (_1 good))))
-  (define wrong (source:compile-rex (_0 only) "apps/cb_wrong/main"
+  (define wrong (source:compile-rex (fixture:tree (_0 only) "apps/cb_wrong/main" (tree "- pact
++ mani
+  + ok
+    \ value=pail
+    ^ bool
+    .true
++ app 7
+")) (_0 only) "apps/cb_wrong/main"
     (tree "- pact
 + mani
   + ok
@@ -73,30 +93,40 @@ assert(Equal [driver:empty-foil-cache []]
   ! title t
 ")
       (else 0)))
-  (define bad (build:compile-apps-with files (_0 wrong) ["cb_wrong" "cb_missing" "cb_nomani"]))
+  (define app-context
+    (fixture:trees (_0 wrong)
+      (map (lambda (name)
+        [(strcat ["apps/" name "/main_spec"])
+         (grove:grove-tree name (files (strcat ["foil/apps/" name "/main.grove"])))])
+        ["cb_code" "cb_grove" "cb_nomani"])))
+  (define bad (build:compile-apps-with app-context files (_0 wrong) ["cb_wrong" "cb_missing" "cb_nomani"]))
   assert(Equal (_0 wrong) (_0 bad))
   assert(Equal ["ERR" "ERR" "ERR"] (map (lambda (e) (_0 (_1 e))) (_1 bad)))
-  assert(Nil (driver:get-foil-cache "apps/cb_nomani/main_spec" (_0 bad)))
-  (define result (build:compile-apps-with files (_0 wrong)
+  assert(Nil (find (lambda (perc) (Equal "apps/cb_nomani/main_spec" (driver:perc-name perc))) (driver:cache-results (_0 bad))))
+  (define result (build:compile-apps-with app-context files (_0 wrong)
     ["cb_code" "cb_grove" "cb_only" "cb_missing"]))
   assert(Equal ["OK" "OK" "OK" "ERR"]
     (map (lambda (e) (_0 (_1 e))) (_1 result)))
-  assert(Equal "/boot/pact/mani" (Hd (_1 (_1 (_0 (_1 result))))))
-  assert(Truth (driver:get-foil-cache "apps/cb_code/main_spec" (_0 result)))
-  assert(Truth (driver:get-foil-cache "apps/cb_grove/main_spec" (_0 result)))
-  (define spec (_0 (driver:get-foil-cache "apps/cb_grove/main_spec" (_0 result))))
+  assert(Equal (abi:constructor (_1 policy) ["mani"]) (Hd (_1 (_1 (_0 (_1 result))))))
+  assert(Truth (find (lambda (perc) (Equal "apps/cb_code/main_spec" (driver:perc-name perc))) (driver:cache-results (_0 result))))
+  assert(Truth (find (lambda (perc) (Equal "apps/cb_grove/main_spec" (driver:perc-name perc))) (driver:cache-results (_0 result))))
+  (define spec (_0 (find (lambda (perc) (Equal "apps/cb_grove/main_spec" (driver:perc-name perc))) (driver:cache-results (_0 result)))))
   (define yoke (driver:get-perc ["spec"] spec))
   (define at (driver:get-perc ["yoke" "at"] spec))
   (define lash (_0 (at [("ts" "item")] yoke)))
   ;; Inspect the concrete map node: the contract type is module-qualified.
-  assert(Equal [[("ts" "boot") ("ts" "lain_types") ("ts" "pails") ("ts" "n")]]
-    (_2 (_1 lash)))
-  (define real (build:compile-app 0 (_0 result) "board"))
+  assert(Equal [[[["ts" "sys"] ["ts" "types"] ["ts" "pails"] ["ts" "n"]] 1]]
+    (map (lambda (reference) [(map (lambda (segment) [(Hd segment) (_0 segment)]) (_0 reference)) (_1 reference)])
+      (_2 (_1 lash))))
+  (define board-context (fixture:trees (_0 result)
+    [["apps/board/main_spec" (grove:grove-tree "board"
+      (read-text-file "foil/apps/board/main.grove"))]]))
+  (define real (build:compile-app board-context (_0 result) "board"))
   assert(Equal "OK" (_0 (_1 real)))
-  assert(Equal "/boot/pact/mani" (Hd (_1 (_1 real))))
+  assert(Equal (abi:constructor (_1 policy) ["mani"]) (Hd (_1 (_1 real))))
   1)
 assert(Eq 1 (check-apps 0))
-(define disk (build:cache-compile driver:empty-foil-cache "test_fixtures/env_low"))
+(define disk (build:cache-compile (fixture:files driver:empty-foil-cache ["test_fixtures/env_low"]) driver:empty-foil-cache "test_fixtures/env_low"))
 assert(Eq 1 (_1 disk))
-assert(Truth (driver:get-foil-cache "test_fixtures/env_low" (_0 disk)))
+assert(Truth (find (lambda (perc) (Equal "test_fixtures/env_low" (driver:perc-name perc))) (driver:cache-results (_0 disk))))
 (print "Compiler build tests passed")

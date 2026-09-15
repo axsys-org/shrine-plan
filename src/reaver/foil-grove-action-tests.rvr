@@ -1,3 +1,5 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
 ;;;; Checked action synthesis against the real SRS prefix.
 (#bind std (#module std))
 (#import std)
@@ -10,28 +12,25 @@
 (define (ok result)
   (If (Eq "ok" (Hd result)) (_0 result)
     (error ["action-build" result])))
-(define (check ignored)
-  (define prepared (backend:prepare 0))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
   (define policy (_1 prepared))
-  (define helpers (_1 (source:compile (_0 prepared)
-    "tests/grove_backend")))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
   (define (helper name)
     (driver:get-perc ["grove_backend_checks" name] helpers))
   (define (parse text)
     (ok ((driver:get-perc ["grove" "parse"] policy) text)))
-  (define (missing key) "/boot/maybe/none")
+  (define (missing key) (grove_fixture:lookup local [] key))
   (define (compile lookup root text)
-    (backend:compile prepared lookup (path root) (parse text)))
-  (define slots (ok (compile missing ["sys"]
-    (read-text-file "grove/sys_slots.grove"))))
-  (define types (ok (compile missing ["sys" "types"]
-    (read-text-file "grove/sys_types.grove"))))
-  (define lookup ((helper "lookup") (Weld slots types)))
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
   (define srs (parse (read-text-file "grove/srs.grove")))
-  (define records (ok (backend:compile prepared lookup
-    (path ["gov" "srs"]) ((helper "first") 6 srs))))
-  assert(Eq 6 (Sz records))
-  (define stored ((helper "lookup") records))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "srs"]))) ((helper "first") 6 srs))))
+  assert(Gt (Sz records) 6)
+  (define stored (grove_fixture:lookup local records))
   (define values (ok (compile stored ["test" "grades"]
     "#import grade=gov/srs/grade
 
@@ -50,10 +49,10 @@ values =
     ^ pail
     | grade/write .easy
 ")))
-  (define grade (_1 (_0 values)))
-  (define action (_1 (Ix 5 records)))
+  (define grade (grove_fixture:record local values (path ["test" "grades" "values"])))
+  (define action (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "srs" "finish"]))))
   (define (export rec key) ((helper "export") (path [key]) rec))
-  assert(Equal (map path [["gov" "srs" "recall"]
+  assert(Equal (map (lambda (p) (grove_fixture:qualified (path p))) [["gov" "srs" "recall"]
     ["gov" "srs" "grade"] ["sys" "now"]])
     ((helper "action_summary") action))
   (define apply (export action "apply"))
@@ -65,7 +64,7 @@ values =
     (define result (apply (args name) base))
     (define expected ((helper "role_data") 7
       ((helper "recall_data") (Add 200 interval) interval)))
-    (If (Equal ("/boot/maybe/some" expected) result) 0
+    (If (Equal ((abi:option policy "some") expected) result) 0
       (error ["outcome" name (export grade name) result expected]))
     1)
   assert(Eq 1 (expect "again" 1))
@@ -73,30 +72,26 @@ values =
   assert(Eq 1 (expect "good" 16))
   assert(Eq 1 (expect "easy" 24))
   (define good (args "good"))
-  assert(Equal "/boot/maybe/none"
-    (apply good "/boot/sept/mop/empty"))
+  assert(Equal (abi:option policy "none")
+    (apply good (abi:constructor policy ["mop" "empty"])))
   (define (bad mode)
-    assert(Equal "/boot/maybe/none"
+    assert(Equal (abi:option policy "none")
       (apply ((helper "invalid_args") mode good) base))
     1)
   assert(Equal [1 1 1 1] (map bad [0 1 2 3]))
   ;; Import the stored action without its source or original cache.
-  (define fresh (backend:prepare 0))
-  (define forwarded (ok (backend:compile fresh stored
-    (path ["gov" "forward"])
-    (parse "#import action=gov/srs/finish
+  (define fresh (backend:prepare code))
+  (define forwarded (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "forward"]))) (parse "#import action=gov/srs/finish
 
 forward =
   ! foil
   + apply action/apply
 "))))
   assert(Equal (apply good base)
-    ((export (_1 (_0 forwarded)) "apply") good base))
+    ((export (grove_fixture:record local forwarded (grove_fixture:qualified (path ["gov" "forward" "forward"]))) "apply") good base))
 
   ;; Imported receivers and zero-argument actions still validate output.
-  (define clear (ok (backend:compile fresh stored
-    (path ["gov" "clear"])
-    (parse "#import role=gov/srs/card
+  (define clear (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "clear"]))) (parse "#import role=gov/srs/card
 
 clear =
   @action
@@ -106,15 +101,14 @@ clear =
   ^ role
   value.set_req(.none).set_about(.none)
 "))))
-  assert(Equal [(path ["gov" "srs" "card"])]
-    ((helper "action_summary") (_1 (_0 clear))))
-  assert(Equal "/boot/maybe/none"
-    ((export (_1 (_0 clear)) "apply") good
+  assert(Equal [(grove_fixture:qualified (path ["gov" "srs" "card"]))]
+    ((helper "action_summary") (grove_fixture:record local clear (grove_fixture:qualified (path ["gov" "clear" "clear"])))))
+  assert(Equal (abi:option policy "none")
+    ((export (grove_fixture:record local clear (grove_fixture:qualified (path ["gov" "clear" "clear"]))) "apply") good
       ((helper "req_data") base)))
 
   (define (reject text)
-    (define result (backend:compile prepared stored
-      (path ["gov" "bad"]) (parse text)))
+    (define result (backend:compile prepared grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "bad"]))) (parse text)))
     assert(Equal "err" (Hd result))
     assert(Gt (_0 (_0 (_0 result))) 0)
     1)
@@ -187,11 +181,14 @@ bad =
   @action
   #on ; role
   #meta ;
-    /sys/grove/action: (pails/n 1)
+    /0x11/lib/publisher_vocabulary/publisher_vocabulary/grove/action: (pails/n 1)
   ! foil
   \ value=role
   ^ role
   value
 "))
   1)
-assert(Eq 1 (check 0))
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

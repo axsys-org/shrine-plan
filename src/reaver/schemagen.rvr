@@ -30,16 +30,16 @@
 
 (#bind driver (#module foil-new-env))
 (#bind source (#module foil-source))
+(#bind wire (#module wire-json))
 
-;;; json value access (reps probed 2026-07-28: cstr-headed apps,
-;;; brands "/boot/json/<v>", fields from Ix 0) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Access to the private host JSON tree decoded at the module boundary.
 
 (define (sg-error why what) (error ["schemagen" why what]))
 
-(define (jv? tag v) (And (IsApp v) (Or (Eq tag (Hd v)) (Eq (strcat ["/boot/json/" (Rsh tag 48)]) (Hd v)))))
-(define (jv-obj? v) (jv? "/boot/json/obj" v))
-(define (jv-str? v) (jv? "/boot/json/str" v))
-(define (jv-arr? v) (jv? "/boot/json/arr" v))
+(define (jv? tag v) (And (IsApp v) (Eq tag (Hd v))))
+(define (jv-obj? v) (jv? "wire/json/obj" v))
+(define (jv-str? v) (jv? "wire/json/str" v))
+(define (jv-arr? v) (jv? "wire/json/arr" v))
 
 (define (jv-str! v)
   (Ifz (jv-str? v) (sg-error "expected-string" v) (Ix 0 v)))
@@ -233,14 +233,14 @@
 (define (sg-enum-vals v)
   (define r (jv-get "enum" v))
   (Ifz r []
-    (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
+    (filter (lambda (x) (Ifz (jv? "wire/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
 
 ;; Enum values this IR can name.  A foil variant's name comes from the
 ;; wire STRING, so a numeric enum has nothing to make variants out of —
 ;; this document's EndpointStatus is [0,-1,-2,-3,-5,-10].  Such a schema
 ;; is not an enumeration here; sg-ftype-go carries it by value instead.
 (define (sg-jv-num? x)
-  (Or (jv? "/boot/json/num" x) (jv? "/boot/json/real" x)))
+  (Or (jv? "wire/json/num" x) (jv? "wire/json/real" x)))
 (define (sg-str-enum-vals v)
   (define xs (sg-enum-vals v))
   (If (all jv-str? xs) xs []))
@@ -535,7 +535,7 @@
         (Ifz (Nil (sg-null-union v)) 1
           (let ((en (jv-get "enum" v)))
             (Ifz en 0
-              (If (any (lambda (x) (jv? "/boot/json/nul" x)) (jv-xs! (_0 en)))
+              (If (any (lambda (x) (jv? "wire/json/nul" x)) (jv-xs! (_0 en)))
                 1 0))))))))
 (define (sg-nullable? env v) (sg-nullable-go env v 0))
 
@@ -2083,7 +2083,7 @@
         (jv-xs! (_0 (jv-get "parameters" opv))))))
   (define (req-of p)
     (If (Nil (jv-get "required" p)) 0
-      (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
+      (If (jv? "wire/json/boo" (_0 (jv-get "required" p)))
         (Ix 0 (_0 (jv-get "required" p))) 0)))
   ;; 3.x puts a parameter's type under `schema`; 2.0 inlines it.
   ;; An enum in a path or query parameter stays a STRING: on the wire
@@ -2815,14 +2815,12 @@
 ;; Parse a schema document with json.foil's parse (jperc: a compiled
 ;; json Perc).
 (define (sg-schema-value jperc txt)
-  (define r ((driver:get-perc ["parse"] jperc) txt))
-  (If (Eq "/boot/json/jres/ok" (Hd r))
-    (Ix 0 r)
-    (sg-error "schema-json" (Ix 0 r))))
+  (wire:schema-value (wire:codec jperc)
+    ((driver:get-perc ["parse"] jperc) txt)))
 
 ;; Generate the module tree for a schema document.  -> [name tree]
 (define (gen-tree jperc schema-txt)
-  (sg-gen-tree (driver:get-perc ["show"] jperc)
+  (sg-gen-tree wire:jshow
     (sg-schema-value jperc schema-txt)))
 
 ;;; Spec inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2881,13 +2879,13 @@
 ;; Generate AND compile.  -> [cache' [name tree Perc]].
 ;; Independent schemas start from an imports-only cache: generated names
 ;; can collide.
-(define (compile-schema-cached cache jperc schema-txt)
+(define (compile-schema-cached context cache jperc schema-txt)
   (define g (gen-tree jperc schema-txt))
-  (define c (source:compile-rex cache (_0 g) (_1 g)))
+  (define c (source:compile-rex context cache (_0 g) (_1 g)))
   [(_0 c) [(_0 g) (_1 g) (_1 c)]])
 
-(define (compile-schema jperc schema-txt)
-  (_1 (compile-schema-cached driver:empty-foil-cache jperc schema-txt)))
+(define (compile-schema context jperc schema-txt)
+  (_1 (compile-schema-cached context driver:empty-foil-cache jperc schema-txt)))
 
 ;; Swagger: generate the TYPES module tree.  -> [name basepath ops tree]
 ;; opids = [] for the whole document, or the operations wanted — a real
@@ -2908,15 +2906,15 @@
 ;; hand against a cache holding it (a tree-fed module has no file, so
 ;; the hand's by-name import must resolve from the cache).
 ;; -> [cache' [types-name hand-name Perc]]
-(define (compile-swagger-hand-cached cache jperc swagger-txt opids)
+(define (compile-swagger-hand-cached context cache jperc swagger-txt opids)
   (define parts (sg-spec-parts (sg-schema-value jperc swagger-txt) opids))
   (define tname (_0 parts))
   (define tnt (sg-swagger-types-tree parts))
-  (define c1 (source:compile-rex cache tname (_1 tnt)))
+  (define c1 (source:compile-rex context cache tname (_1 tnt)))
   (define hnt (sg-swagger-hand-tree parts))
-  (define c2 (source:compile-rex (_0 c1) (_0 hnt) (_1 hnt)))
+  (define c2 (source:compile-rex context (_0 c1) (_0 hnt) (_1 hnt)))
   [(_0 c2) [tname (_0 hnt) (_1 c2)]])
 
-(define (compile-swagger-hand jperc swagger-txt opids)
-  (_1 (compile-swagger-hand-cached driver:empty-foil-cache
+(define (compile-swagger-hand context jperc swagger-txt opids)
+  (_1 (compile-swagger-hand-cached context driver:empty-foil-cache
     jperc swagger-txt opids)))

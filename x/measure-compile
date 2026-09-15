@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Measure publication preparation, compilation, reuse and descriptors on frozen sources."""
+import argparse
+import ast
+import re
+import sys, shutil, tempfile, os, json
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import test_runner as tr
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('modules', nargs='*', default=['namespace','namespace','web','namespace'])
+parser.add_argument('--detail', action='store_true', help='Instrument module head construction and elaboration/lowering in the frozen copy.')
+parser.add_argument('--declarations', action='store_true', help='Time web value bodies at their existing forced-TC boundary; implies --passes.')
+parser.add_argument('--single-reference-lookup', action='store_true', help='Diagnostic frozen-copy experiment: reuse one entry lookup inside global-reference-canonical.')
+parser.add_argument('--fast-key-equality', action='store_true', help='Diagnostic frozen-copy experiment: short-circuit equal compiler map keys before recursive ordering.')
+parser.add_argument('--no-subtype-cache', action='store_true', help='Diagnostic frozen-copy experiment: run subtype checks without the outer memo table.')
+parser.add_argument('--uncached-system-root', action='store_true', help='Diagnostic frozen-copy control: rediscover the system substrate root on every use.')
+parser.add_argument('--passes', action='store_true', help='Time existing elaborator pass boundaries; implies --detail.')
+parser.add_argument('--timeout',type=float,default=1800)
+args=parser.parse_args()
+args.passes = args.passes or args.declarations
+if args.timeout <= 0:
+    parser.error('--timeout must be positive')
+wisp=os.environ.get('WISP') or shutil.which('wisp') or str(tr.ROOT/'wisp')
+wisp=str(Path(wisp).resolve())
+if not os.access(wisp,os.X_OK):
+    parser.error('Set WISP to a working runtime executable.')
+(tr.ROOT/'.check').mkdir(exist_ok=True)
+root=Path(tempfile.mkdtemp(prefix='measure-',dir=tr.ROOT/'.check'))
+shutil.copytree(tr.ROOT/'src',root/'src')
+tr.copy_snapshot(tr.stage(wisp,False,900),root/'snap')
+measure='''(#bind std (#module std))
+(#import std)
+(define (timed label f)
+  (define start (Now 0))
+  (define result (Seq start (f 0)))
+  (define end (DeepSeq result (Now 0)))
+  (Seq (print ("MEASURE" label (Div (Sub end start) 1000000))) result))
+(#export timed)
+'''
+(root/'src/reaver/compile-measure.rvr').write_text(measure)
+p=root/'src/reaver/foil-test-context.rvr'
+s=p.read_text().replace('(#bind std (#module std))','(#bind measure (#module compile-measure))\n(#bind std (#module std))')
+s=s.replace('(publication:prepare-system compiler source:read-module bootstrap:system-roots)', '(measure:timed "system.prepare" (lambda (_) (publication:prepare-system compiler source:read-module bootstrap:system-roots)))')
+s=s.replace('(publication:compile system-plan driver:empty-foil-cache)', '(measure:timed "system.compile" (lambda (_) (publication:compile system-plan driver:empty-foil-cache)))')
+p.write_text(s)
+if args.detail or args.passes:
+    p=root/'src/reaver/foil-new-env.rvr'
+    s=p.read_text().replace('(#bind std (#module std))','(#bind measure (#module compile-measure))\n(#bind std (#module std))')
+    s=s.replace('(define sut (make-head context mod base prev-pins layers decls))', '(define sut (measure:timed (strWeld "head-inclusive." mod) (lambda (_) (make-head context mod base prev-pins layers decls))))')
+    s=s.replace('(define out (elab-mod-info sut decls))', '(define out (measure:timed (strWeld "elaborate-lower." mod) (lambda (_) (elab-mod-info sut decls))))')
+    s=s.replace('(foil-new-elab:compiler-subject\n      (foil-new-elab:elab-mod\n        (foil-new-elab:compiler-for sut) decls))', '(measure:timed "phase.elaborate" (lambda (_) (foil-new-elab:compiler-subject (foil-new-elab:elab-mod (foil-new-elab:compiler-for sut) decls))))')
+    s=s.replace('(define final (foil-lower:materialize-consts mod))', '(define final (DeepSeq mod (measure:timed "phase.materialize" (lambda (_) (foil-lower:materialize-consts mod)))))')
+    s=s.replace('(define lowered (foil-lower:lower-tc-unit sut final own-keys))', '(define lowered (DeepSeq [final own-keys] (measure:timed "phase.lower" (lambda (_) (foil-lower:lower-tc-unit sut final own-keys)))))')
+    p.write_text(s)
+if args.passes:
+    p=root/'src/reaver/foil-new-elab.rvr'
+    s=p.read_text().replace('(#bind std (#module std))','(#bind measure (#module compile-measure))\n(#bind std (#module std))')
+    old='(define (ez lbl v)\n  (define h (ZoneStart lbl))\n  (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))'
+    new='(define (ez lbl v)\n  (define start (Now 0))\n  (define h (Seq start (ZoneStart lbl)))\n  (define end (Seq h (DeepSeq v (Seq (ZoneEnd h) (Now 0)))))\n  (Seq (print ("MEASURE" lbl (Div (Sub end start) 1000000))) v))'
+    if old not in s:
+        sys.exit('Elaborator pass boundary changed; update instrumentation.')
+    s=s.replace(old,new)
+    # Existing pass zones nest through lazy dependencies. Force each prior
+    # result before starting the next timer, without timing the cache twice.
+    for label,dependency in [
+        ('e-seed-types','[decls state0]'),
+        ('e-refine-types','seeded-types'),
+        ('e-derive-sums','refined-types'),
+        ('e-seed-values','derived-sums'),
+        ('e-elab-decls','seeded-values'),
+        ('e-wf','elabbed'),
+        ('e-extend','result'),
+        ('e-retain','extended')]:
+        start=s.index('(ez "'+label+'"')
+        depth=0
+        for end in range(start,len(s)):
+            depth += (s[end]=='(')-(s[end]==')')
+            if depth==0:
+                break
+        expression=s[start:end+1]
+        s=s[:start]+'(DeepSeq '+dependency+' '+expression+')'+s[end+1:]
+    p.write_text(s)
+if args.declarations:
+    p=root/'src/reaver/foil-new-elab.rvr'
+    s=p.read_text()
+    start=s.index('(define (elab-declaration compiler row)')
+    end=s.index('(define (module-declarations mod)',start)
+    block=s[start:end]
+    block=block.replace('(r (elab-value-go compiler env body))', '(profile (Equal "web" (_3 (sut-context (compiler-subject compiler)))))\n           (start (If profile (Now 0) 0))\n           (r (Seq start (elab-value-go compiler env body)))')
+    block=block.replace('(compiler-with-subject subject1 (_0 r))', '(Seq (If profile (print ("MEASURE" (foldl (lambda (out part) (strcat [out "/" part])) "decl" (_1 row)) (Div (Sub (Now 0) start) 1000000))) 0) (compiler-with-subject subject1 (_0 r)))')
+    p.write_text(s[:start]+block+s[end:])
+if args.single_reference_lookup:
+    p=root/'src/reaver/foil-new-elab.rvr'
+    s=p.read_text()
+    start=s.index('(define (global-reference-canonical compiler env path)')
+    end=s.index('(define (global-reference compiler env path0)',start)
+    block=s[start:end]
+    block=block.replace('(define world (compiler-world compiler))', '''(define world (compiler-world compiler))
+  (define hit (get-const path (compiler-subject compiler)))
+  (define cached-tc
+    (If hit
+      (let ((entry (unpin-soft (_0 hit))))
+        (cond
+          ((And (IsApp entry) (Eq "TC" (Hd entry))) (tc-entry-contents entry))
+          ((Eq (Hd entry) "IR_ENTRY") (_3 entry))
+          (else (error ("bad entry" path))))) 0))''')
+    block=block.replace('(failed-declaration? compiler path)', '(And hit (Eq "TC_MEAN" (Hd cached-tc)))')
+    block=block.replace('((get-const path (compiler-subject compiler))', '(hit')
+    block=block.replace('(raw (got-entry-tc path (compiler-subject compiler)))', '(raw cached-tc)')
+    p.write_text(s[:start]+block+s[end:])
+if args.uncached_system_root:
+    p=root/'src/reaver/foil-new-elab.rvr'
+    s=p.read_text()
+    old='(Weld (_0 (NewCompiler.system-root compiler)) name)'
+    if old not in s:
+        sys.exit('System-root cache changed; update the control instrumentation.')
+    s=s.replace(old, '(core:system-path (compiler-subject compiler) name)', 1)
+    p.write_text(s)
+if args.no_subtype_cache:
+    p=root/'src/reaver/foil-new-types.rvr'
+    s=p.read_text()
+    start=s.index('(define (subtype-with-cache any-ok? world actual expected)')
+    end=s.index('(define (subtype world actual expected)', start)
+    s=s[:start]+'(define (subtype-with-cache any-ok? world actual expected)\n  (subtype-go any-ok? world [] actual expected))\n\n'+s[end:]
+    p.write_text(s)
+if args.fast_key_equality:
+    p=root/'src/reaver/reef.rvr'
+    s=p.read_text()
+    old='(define ret (If (Ne atype btype) (Cmp atype btype)'
+    new='(define ret (If (Equal a b) sym-eq (If (Ne atype btype) (Cmp atype btype)'
+    if old not in s:
+        sys.exit('Comparator changed; update instrumentation.')
+    s=s.replace(old,new,1)
+    old='(else (error ("no fallthrough"))))))'
+    if old not in s:
+        sys.exit('Comparator tail changed; update instrumentation.')
+    s=s.replace(old,'(else (error ("no fallthrough")))))))',1)
+    p.write_text(s)
+source='''(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind measure (#module compile-measure))
+(#bind driver (#module foil-new-env))
+(#bind pub (#module foil-publication))
+(#bind deps (#module foil-test-deps))
+(define (one cache mod)
+  (define plan (measure:timed (strWeld mod ".prepare") (lambda (_) (deps:prepare cache [mod]))))
+  (define built (Seq plan (measure:timed (strWeld mod ".compile") (lambda (_) (pub:compile plan cache)))))
+  (define warm (Seq built (measure:timed (strWeld mod ".same-context") (lambda (_) (pub:compile plan (_1 built))))))
+  (define records (Seq warm (measure:timed (strWeld mod ".descriptors") (lambda (_) (pub:definition-records built)))))
+  (define counts (Seq records (measure:timed (strWeld mod ".cache-enumeration") (lambda (_) (driver:cache-results (_1 built))))))
+  (Seq (print ("COUNTS" mod (Sz (_2 plan)) (Sz counts) (Sz records))) (_1 built)))
+(define (run ignored)
+  (foldl one driver:empty-foil-cache MODULES)
+  1)
+(run 0)
+(print "MEASURE-DONE")
+'''
+source=source.replace('MODULES','['+' '.join(tr.rvr_string(m) for m in args.modules)+']')
+(root/'input.rvr').write_text(source)
+print(root,flush=True)
+code,complete,seconds=tr.run_process([wisp,'--file-root',str(root/'src'),'snap','root','_'],root,source,args.timeout)
+(root/'result.json').write_text(json.dumps(dict(code=code,complete=complete,seconds=seconds,modules=args.modules,detail=args.detail or args.passes,passes=args.passes,declarations=args.declarations,single_reference_lookup=args.single_reference_lookup,fast_key_equality=args.fast_key_equality,no_subtype_cache=args.no_subtype_cache,uncached_system_root=args.uncached_system_root,runtime=wisp)))
+print(dict(code=code,complete=complete,seconds=seconds),flush=True)
+
+log=(root/'out.log').read_text()
+def number(atom):
+    if atom.startswith('"'):
+        quoted='"'+atom[1:-1].replace('""', '\\"')+'"'
+        return int.from_bytes(ast.literal_eval(quoted).encode('latin1'),'little')
+    return int(atom)
+rows=[]
+for match in re.finditer(r'^\("MEASURE"\s+'+tr.ATOM+r'\s+'+tr.ATOM+r'\)',log,re.M):
+    rows.append(dict(stage=tr.decode_atom(match[1]),milliseconds=number(match[2])))
+(root/'measurements.json').write_text(json.dumps(rows,indent=2)+'\n')
+for row in rows:
+    print(f"{row['milliseconds']/1000:10.3f}s  {row['stage']}")
+if code or not complete or not re.search(r'^"MEASURE-DONE"$',log,re.M) or re.search(r'^\("(?:error|ERROR)"',log,re.M):
+    sys.exit('Measurement failed; inspect '+str(root/'out.log'))

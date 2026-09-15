@@ -1,0 +1,238 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind driver (#module foil-new-env))
+(#bind context (#module foil-context))
+(#bind brand (#module shrine-brand))
+(#bind subject (#module foil-subject))
+(#bind core (#module foil-type-core))
+(define native-selection
+  (Pin (map (lambda (name)
+    [(Weld [("ts" "sys") ("ts" "types")]
+       (map (lambda (part) ("ts" part)) name)) 1]) core:system-names)))
+
+;; A system revision changes native constructors independently of the
+;; publishing module's own definitions and cached source.
+(define native-source "+ parsed
+  \ s=str
+  (nat/parse s)
++ absent
+  ^ maybe[nat]
+  .none
++ present
+  ^ maybe[nat]
+  (./some 7)
++ descriptor (^ maybe[nat])
+")
+(define (native-context revision)
+  (define selected (Pin (map (lambda (pair) [(_0 pair) revision])
+    (Unpin native-selection))))
+  (context:create selected (Pin "compiler") (Pin native-source)
+    [["native-use" [["x" 1] ["ts" "native-use"]]]]
+    [["native-use" []]] []))
+(define native-first (driver:compile-context (native-context 1)
+  (lambda (name) (rex:ParseRexNormFile native-source))
+  driver:empty-foil-cache "native-use"))
+(define native-second (driver:compile-context (native-context 2)
+  (lambda (name) (rex:ParseRexNormFile native-source))
+  (_0 native-first) "native-use"))
+;; Eviction preserves the context keys of every retained revision.
+(define retained (driver:remove-foil-cache "unrelated" (_0 native-second)))
+assert(Equal (_0 native-second) retained)
+assert(Truth (driver:get-foil-cache (context:cache-key (native-context 1) "native-use") retained))
+assert(Truth (driver:get-foil-cache (context:cache-key (native-context 2) "native-use") retained))
+assert(Equal driver:empty-foil-cache
+  (driver:remove-foil-cache "native-use" retained))
+(define first-option ((driver:get-perc ["parsed"] (_1 native-first)) "42"))
+(define second-option ((driver:get-perc ["parsed"] (_1 native-second)) "42"))
+assert(Nil (Equal (Hd first-option) (Hd second-option)))
+assert(Equal 42 (_0 second-option))
+assert(Equal (Hd second-option)
+  (Hd (driver:get-perc ["present"] (_1 native-second))))
+assert(Equal [[[["ts" "sys"] ["ts" "types"] ["ts" "maybe"] ["ts" "none"]] 2]]
+  (brand:decode (driver:get-perc ["absent"] (_1 native-second))))
+(define native-description (driver:get-perc ["descriptor"] (_1 native-second)))
+assert(Equal
+  ("sum" (map (lambda (name)
+    ("ref" (brand:encode
+      [["ts" "sys"] ["ts" "types"] ["ts" "maybe"] ["ts" name]] 2)
+      [("ref" (brand:encode [["ts" "sys"] ["ts" "types"] ["ts" "nat"]] 2) [])]))
+    ["some" "none"]))
+  native-description)
+(define code "+ token (: value=nat)
++ boxed (token 9)
++ empty (:)
++ choice
+  & empty token
++ bare
+  ^ choice
+  .empty
++ decoded (brand_decode (nominal_brand boxed))
++ decoded_empty (brand_decode (nominal_brand bare))
++ encoded (brand_encode [($x 1) 'lib 'token] 1)
+")
+(define root [["x" 1] ["ts" "lib"]])
+(define (ctx revision)
+  (context:create native-selection (Pin "compiler") (Pin ["compiler" code])
+    [["test" root]]
+    [["test" [[(snoc ["ts" "token"] root) revision]
+               [(snoc ["ts" "empty"] root) revision]]]] []))
+(define (read name) (rex:ParseRexNormFile code))
+(define a (driver:compile-context (ctx 1) read driver:empty-foil-cache "test"))
+(define b (driver:compile-context (ctx 2) read (_0 a) "test"))
+(define av (driver:get-perc ["boxed"] (_1 a)))
+(define bv (driver:get-perc ["boxed"] (_1 b)))
+assert(Equal [[(snoc ["ts" "token"] root) 1]] (brand:decode (Hd av)))
+assert(Equal [[(snoc ["ts" "token"] root) 2]] (brand:decode (Hd bv)))
+assert(Eq 9 (_0 av))
+assert(Eq (Hd av) (driver:get-perc ["encoded"] (_1 a)))
+assert(Equal (_0 (brand:decode-path (Hd av)))
+  (_0 (driver:get-perc ["decoded"] (_1 a))))
+assert(Equal (_0 (brand:decode-path (driver:get-perc ["bare"] (_1 a))))
+  (_0 (driver:get-perc ["decoded_empty"] (_1 a))))
+
+assert(Nil (Eq (Hd av) (Hd bv)))
+assert(IsNat (driver:get-perc ["bare"] (_1 a)))
+assert(Equal [[(snoc ["ts" "empty"] root) 1]]
+  (brand:decode (driver:get-perc ["bare"] (_1 a))))
+(define warm (driver:compile-context (ctx 1)
+  (lambda (name) (error "unexpected-source-read")) (_0 b) "test"))
+assert(Equal (_1 a) (_1 warm))
+
+;; Relocated source-free imports preserve the defining constructor moment.
+(define consumer-root [["x" 1] ["ts" "consumer"]])
+(define imported-context
+  (context:create native-selection (Pin "compiler") (Pin ["compiler" "consumer-source"])
+    [["installed" root] ["consumer" consumer-root]]
+    [["installed" [[(snoc ["ts" "token"] root) 1]
+                    [(snoc ["ts" "empty"] root) 1]]]
+     ["consumer" []]]
+    [["installed" (Pin (_1 a))]]))
+(define (consumer-source name)
+  (If (Equal name "consumer")
+    (rex:ParseRexNormFile "- installed
++ alias token
++ boxed (alias 17)
+") (error "source-free import attempted a source read")))
+(define consumer (driver:compile-context imported-context consumer-source
+  driver:empty-foil-cache "consumer"))
+(define relocated (driver:get-perc ["boxed"] (_1 consumer)))
+assert(Eq (Hd av) (Hd relocated))
+assert(Eq 17 (_0 relocated))
+
+;; An artifact from another data case must not satisfy the resolver.
+(define stale-context
+  (context:create native-selection (Pin "compiler") (Pin ["compiler" "stale-source"])
+    [["installed" root]]
+    [["installed" [[(snoc ["ts" "token"] root) 2]
+                    [(snoc ["ts" "empty"] root) 2]]]]
+    [["installed" (Pin (_1 a))]]))
+assert(Eq 1 (Hd (Try (lambda (z) (force
+  (driver:compile-context stale-context consumer-source
+    driver:empty-foil-cache "installed"))) 0)))
+
+(define (both-context text)
+  (context:create native-selection (Pin "compiler") (Pin text)
+    [["old" root] ["new" root] ["use" consumer-root]]
+    [["old" [[(snoc ["ts" "token"] root) 1]
+              [(snoc ["ts" "empty"] root) 1]]]
+     ["new" [[(snoc ["ts" "token"] root) 2]
+              [(snoc ["ts" "empty"] root) 2]]]
+     ["use" []]]
+    [["old" (Pin (_1 a))] ["new" (Pin (_1 b))]]))
+(define both-source "- old [at=left]
+- new [at=right]
++ one (left/token 1)
++ two (right/token 2)
++ convert
+  \ value=left/token
+  ^ right/token
+  (right/token value.value)
++ converted (convert one)
+")
+(define both (driver:compile-context (both-context both-source)
+  (lambda (name) (rex:ParseRexNormFile both-source))
+  driver:empty-foil-cache "use"))
+assert(Eq (Hd av) (Hd (driver:get-perc ["one"] (_1 both))))
+assert(Eq (Hd bv) (Hd (driver:get-perc ["two"] (_1 both))))
+assert(Eq (Hd bv) (Hd (driver:get-perc ["converted"] (_1 both))))
+assert(Eq 1 (_0 (driver:get-perc ["converted"] (_1 both))))
+;; Public identity lookup finds both revisions without knowing either mount.
+(define both-subject (driver:perc-subject (_1 both)))
+(define token-path (snoc ["ts" "token"] root))
+(define old-key (subject:definition-key [token-path 1] both-subject))
+(define new-key (subject:definition-key [token-path 2] both-subject))
+assert(Nil (Equal old-key new-key))
+assert(Equal (subject:get-const (_0 old-key) both-subject)
+  (subject:get-definition [token-path 1] both-subject))
+assert(Equal (subject:get-const (_0 new-key) both-subject)
+  (subject:get-definition [token-path 2] both-subject))
+assert(Equal 0 (subject:get-definition [token-path 3] both-subject))
+(define relocated-subject (driver:perc-subject (_1 consumer)))
+assert(Equal (subject:get-definition [token-path 1] both-subject)
+  (subject:get-definition [token-path 1] relocated-subject))
+(define invalid-source "- old [at=left]
+- new [at=right]
++ take
+  \ value=left/token
+  ^ nat
+  value.value
++ rejected (take (right/token 2))
+")
+assert(Eq 1 (Hd (Try (lambda (z) (force
+  (driver:compile-context (both-context invalid-source)
+    (lambda (name) (rex:ParseRexNormFile invalid-source))
+    driver:empty-foil-cache "use"))) 0)))
+
+;; Pre-cutover artifacts must fail at both publication and cache boundaries.
+(define old-perc
+  ("/foil/tyPerc" (_0 (_1 a)) (_1 (_1 a)) (_2 (_1 a))
+    (_3 (_1 a)) (_4 (_1 a)) (_5 (_1 a))))
+(define old-context
+  (context:create native-selection (Pin "compiler") (Pin "old-artifact")
+    [["test" root]]
+    [["test" [[(snoc ["ts" "token"] root) 1]
+               [(snoc ["ts" "empty"] root) 1]]]]
+    [["test" (Pin old-perc)]]))
+assert(Eq 1 (Hd (Try (lambda (z) (force
+  (driver:compile-context old-context read driver:empty-foil-cache "test"))) 0)))
+(define poisoned-cache
+  (driver:put-foil-cache (context:cache-key (ctx 1) "test") old-perc
+    driver:empty-foil-cache))
+assert(Eq 1 (Hd (Try (lambda (z) (force
+  (driver:compile-context (ctx 1) read poisoned-cache "test"))) 0)))
+
+;; Specializations share the defining constructor's moment, while their
+;; arguments remain independently checked type information.
+(define generic-source "+ box
+  (@ t)
+  : value=t
++ number (box[nat] 7)
++ symbol (box[sym] 'seven)
+")
+(define (generic-context source)
+  (context:create native-selection (Pin "compiler") (Pin source)
+    [["generic" root]]
+    [["generic" [[(snoc ["ts" "box"] root) 3]]]] []))
+(define generic
+  (driver:compile-context (generic-context generic-source)
+    (lambda (name) (rex:ParseRexNormFile generic-source))
+    driver:empty-foil-cache "generic"))
+(define number-box (driver:get-perc ["number"] (_1 generic)))
+(define symbol-box (driver:get-perc ["symbol"] (_1 generic)))
+assert(Eq (Hd number-box) (Hd symbol-box))
+assert(Equal [[(snoc ["ts" "box"] root) 3]]
+  (brand:decode (Hd number-box)))
+(define generic-mismatch
+  (strWeld generic-source "+ take
+  \ value=box[sym]
+  ^ sym
+  value.value
++ rejected (take number)
+"))
+assert(Eq 1 (Hd (Try (lambda (z) (force
+  (driver:compile-context (generic-context generic-mismatch)
+    (lambda (name) (rex:ParseRexNormFile generic-mismatch))
+    driver:empty-foil-cache "generic"))) 0)))

@@ -1,30 +1,63 @@
-;;;; Minimal Eden launcher. System startup policy belongs to Foil.
+;;;; The host selects identity, trusted publication and publication roots.
 (#bind std (#module std))
 (#import std)
 (#bind reef (#module reef))
 (#import reef)
 (#bind compiler (#module foil-new-env))
-(#bind source (#module foil-source))
 (#bind backend (#module foil-grove-backend))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind abi (#module foil-abi))
 
-(define (load-main port config)
-  (define compiled (source:compile compiler:empty-foil-cache "eden"))
-  ((compiler:get-perc ["eden" "main"] (_1 compiled)) port config))
+(define (module name code)
+  (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) (_2 code))))))
+(define (attach-codex code self server bridge-port token)
+  (define compiled (module "codex_driver" code))
+  (define installed
+    ((compiler:get-perc ["codex_driver" "install"] compiled)
+      server [self ("ts" "io") ("ts" "codex")] bridge-port token))
+  (Seq installed (Seq (print "Codex foot registered") installed)))
 
-;; config is reserved. Foil owns installation and actor startup.
-(define (start port config)
-  (load-main port config))
+(define (start-with self system resolve slot port addons bridge-port token)
+  (define local (bootstrap:build-local self system resolve slot
+    (Weld ["eden"] addons)))
+  (define compiled (module "eden" (_1 local)))
+  (define server ((compiler:get-perc ["eden" "main"] compiled)
+    self (bootstrap:trusted system) (_1 (_0 local)) port))
+  (If (Eq 0 (Sz addons)) server
+    (attach-codex (_1 local) self server bridge-port token)))
 
-;; The host supplies source strings and the existing compiler adapter.
-;; Eden's Foil entry owns compilation order, imports, publication, and serving.
-(define (start-srs port)
-  (define prepared (backend:prepare compiler:empty-foil-cache))
-  (define compiled (source:compile (_0 prepared) "eden_srs"))
-  (define entry (compiler:get-perc ["eden_srs" "main"] (_1 compiled)))
-  (entry port
-    (read-text-file "grove/sys_slots.grove")
-    (read-text-file "grove/sys_types.grove")
-    (read-text-file "grove/srs.grove")
-    (backend:compile-port (_1 prepared) (_2 prepared))))
+(define (start self system resolve slot port)
+  (start-with self system resolve slot port [] 0 ""))
+(define (start-codex self system resolve slot port bridge-port token)
+  (start-with self system resolve slot port ["codex_driver"] bridge-port token))
 
-(#export load-main start start-srs)
+(define (start-srs-with self system resolve slot port addons bridge-port token)
+  (define local (bootstrap:build-local self system resolve slot
+    (Weld ["eden_srs" "grove_backend"] addons)))
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define compiled (module "eden_srs" code))
+  (define x (abi:constructor compiled ["care" "x"]))
+  (define version (compiler:get-perc ["namespace" "case"] compiled))
+  (define (previous state path)
+    (define found (version x
+      (map (lambda (part) ((_0 part) (_1 part))) path) state))
+    (If (And (IsApp found) (Eq 1 (Sz found))) (_0 found) 0))
+  (define (compile state request)
+    (backend:compile-port prepared (previous state) request))
+  (define (publish state records)
+    (backend:publish prepared records 0 0 state))
+  (define ports ((abi:constructor compiled ["eden_srs" "ports"]) compile publish))
+  (define server ((compiler:get-perc ["eden_srs" "main"] compiled)
+    self (bootstrap:trusted system) (_1 (_0 local)) port
+    (read-text-file "grove/value_codecs.grove")
+    (read-text-file "grove/srs.grove") ports))
+  (If (Eq 0 (Sz addons)) server
+    (attach-codex code self server bridge-port token)))
+
+(define (start-srs self system resolve slot port)
+  (start-srs-with self system resolve slot port [] 0 ""))
+(define (start-srs-codex self system resolve slot port bridge-port token)
+  (start-srs-with self system resolve slot port ["codex_driver"] bridge-port token))
+
+(#export start start-srs start-codex start-srs-codex)

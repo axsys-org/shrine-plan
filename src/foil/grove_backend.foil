@@ -1,3 +1,6 @@
+- grove_bundle
+- publication
+- publisher_vocabulary
 - grove
 - grove_template
 - lain_types
@@ -7,19 +10,15 @@
 + grove_backend
   + diagnostic
     : span=rex/source_span message=str cause=maybe[any]
-  + entry
-    : key=path value=any signature=type kind=str
-  + bundle
-    : version=nat identity=str prefix=path
-      exports=mop[path grove_backend/entry lt_pith] artifact=any
   + dependency
     : span=rex/source_span alias=str module=grove_backend/bundle
   + request
-    : identity=str tree=rex imports=row[grove_backend/dependency]
-      metadata=row[path]
+    : identity=path tree=rex imports=row[grove_backend/dependency]
+      metadata=row[path] records=row[path]
   + compiled
     : entries=mop[path grove_backend/entry lt_pith]
       metadata=row[pail] artifact=any
+      definitions=row[[path nat type]]
   + ports
     : lookup={\ path}maybe[myth]
       compile={\ grove_backend/request}either[
@@ -30,12 +29,6 @@
   + index
     : definitions=row[grove_backend/definition]
       imports=row[grove/import_decl]
-  + module_slot
-    ^ path
-    ['sys 'grove 'module]
-  + version
-    ^ nat
-    1
   + fail
     (@ a)
     \ span=rex/source_span message=str
@@ -145,14 +138,10 @@
       ? !(equal tree.leaf_kind (maybe/some[str] "cord"))
         | grove_backend/fail[path] span
           "Expected an absolute namespace path cord."
-      = parts (str/split_byte 47 text)
-      ? (lt parts.len 2)
-        | grove_backend/fail[path] span "Expected an absolute path."
-      ? !(eq parts.at(0) "")
-        | grove_backend/fail[path] span "Expected an absolute path."
-      ? (row/any[str] (\ x (eq x "")) parts.drop(1))
-        | grove_backend/fail[path] span "Empty namespace segment."
-      | ./ok parts.drop(1).map((\ x ($ts x)))
+      ?> (./some parts) (path_parse text)
+        | grove_backend/fail[path] span
+          "Invalid absolute namespace path."
+      | ./ok parts
     | grove_backend/fail[path] tree.span
       "Expected an absolute namespace path cord."
   + path_parts
@@ -161,8 +150,10 @@
     ? tree
      > (./leaf span shape text)
       ? (equal tree.leaf_kind (maybe/some[str] "word"))
-        ? !(eq text "") (./ok [($ts text)])
-        | grove_backend/fail[path] span "Empty namespace segment."
+        ?> (./some parts) (path_parse (str/join "" ["/" text]))
+          | grove_backend/fail[path] span "Invalid namespace segment."
+        ? (eq parts.len 1) (./ok parts)
+        | grove_backend/fail[path] span "Expected one namespace segment."
       | grove_backend/fail[path] span "Expected a namespace path."
      > (./nest span color rune kids)
       ? !(eq rune "/")
@@ -176,7 +167,7 @@
       | _ rest.drop(1) parts.weld(next)
     | grove_backend/fail[path] tree.span "Expected a namespace path."
   + resolve_slot
-    \ imports=row[grove/import_decl] tree=rex
+    \ lookup={\ path}maybe[myth] imports=row[grove/import_decl] tree=rex
     ^ either[grove_backend/diagnostic path]
     < path (grove_backend/namespace_path tree)
     ? (equal tree.leaf_kind (maybe/some[str] "cord")) (./ok path)
@@ -186,8 +177,27 @@
     = imp rest.at(0)
     ? (equal path.at(0) ($ts imp.alias))
       < target (grove_backend/namespace_path imp.target)
-      | ./ok target.weld(path.drop(1))
+      | ./ok (grove_roles/import_location target lookup).weld(path.drop(1))
     | _ rest.drop(1)
+  + imported_module
+    \ span=rex/source_span target=path card=myth
+    ^ either[grove_backend/diagnostic grove_backend/bundle]
+    ' A namespace alias needs no compiler artifact. It exports no code.
+    ?> (./some slot) card.get(grove_backend/module_slot)
+      | ./ok (grove_backend/bundle grove_backend/version
+          target [] (mop/empty) 0)
+    ?> module=grove_backend/bundle slot
+      | grove_backend/fail[grove_backend/bundle] span
+        "Invalid Grove module bundle."
+    ? !(eq module.version grove_backend/version)
+      | grove_backend/fail[grove_backend/bundle] span
+        "Incompatible Grove bundle; rebuild definitions."
+    ? (equal[any] module.artifact 0)
+      ? module.exports.size
+        | grove_backend/fail[grove_backend/bundle] span
+          "Code imports require a published compiler artifact; rebuild definitions."
+      | ./ok module
+    | ./ok module
   + resolve
     \ ports=grove_backend/ports imports=row[grove/import_decl]
     ^ either[grove_backend/diagnostic row[grove_backend/dependency]]
@@ -197,28 +207,10 @@
     > (./some card) (ports.lookup target)
       | grove_backend/fail[row[grove_backend/dependency]] imp.span
         "Missing imported declaration."
-    > (./some slot) card.get(grove_backend/module_slot)
-      | grove_backend/fail[row[grove_backend/dependency]] imp.span
-        "Imported declaration has no /sys/grove/module slot."
-    > module=grove_backend/bundle slot
-      | grove_backend/fail[row[grove_backend/dependency]] imp.span
-        "Invalid Grove module bundle."
-    ? !(eq module.version grove_backend/version)
-      | grove_backend/fail[row[grove_backend/dependency]] imp.span
-        "Incompatible Grove module bundle version."
+    < module (grove_backend/imported_module imp.span target card)
     < tail (grove_backend/resolve ports imports.drop(1))
     | ./ok tail.cons(
         (grove_backend/dependency imp.span imp.alias module))
-  + identity
-    \ root=path
-    ^ str
-    = parts
-        | root.map
-        \ part
-        | str/join ":"
-          [(str/from_atom (aura_tag part))
-           (nat/show (quip_val part))]
-    | str/join "/" parts.cons("grove-v1")
   + meta_key
     \ name=str index=nat
     ^ path
@@ -337,21 +329,21 @@
     < checked_meta (grove_backend/check_code (rex/group metas))
     | _ rest.drop(1) forms.weld(added).weld(metas)
   + slots
-    \ imports=row[grove/import_decl]
+    \ lookup={\ path}maybe[myth] imports=row[grove/import_decl]
       defs=row[grove_backend/definition]
     ^ either[grove_backend/diagnostic row[row[path]]]
     ? (eq defs.len 0) (./ok [])
     = def defs.at(0)
-    < head (grove_backend/property_slots imports def.metadata [])
-    < tail (grove_backend/slots imports defs.drop(1))
+    < head (grove_backend/property_slots lookup imports def.metadata [])
+    < tail (grove_backend/slots lookup imports defs.drop(1))
     | ./ok tail.cons(head)
   + property_slots
-    \ imports=row[grove/import_decl]
+    \ lookup={\ path}maybe[myth] imports=row[grove/import_decl]
       props=row[grove/property] seen=row[path]
     ^ either[grove_backend/diagnostic row[path]]
     ? (eq props.len 0) (./ok seen)
     = prop props.at(0)
-    < slot (grove_backend/resolve_slot imports prop.slot)
+    < slot (grove_backend/resolve_slot lookup imports prop.slot)
     = reserved=row[path]
         [grove_backend/module_slot grove_templates/slot
          grove_templates/source_slot]
@@ -361,9 +353,9 @@
     ? (seen.has(slot))
       | grove_backend/fail[row[path]] prop.span
         "Conflicting metadata assignments."
-    | grove_backend/property_slots imports props.drop(1) seen.snoc(slot)
+    | grove_backend/property_slots lookup imports props.drop(1) seen.snoc(slot)
   + publish
-    \ root=path identity=str defs=row[grove_backend/definition]
+    \ root=path identity=path defs=row[grove_backend/definition]
       slots=row[row[path]] result=grove_backend/compiled
     ^ row[[path myth]]
     % rest=row[grove_backend/definition] defs position=nat 0
@@ -410,33 +402,66 @@
     ^ either[grove_backend/diagnostic row[[path myth]]]
     < doc (grove_backend/prepare root doc ports.lookup)
     < index (grove_backend/index_document doc)
-    < slots (grove_backend/slots index.imports index.definitions)
+    < slots (grove_backend/slots ports.lookup index.imports index.definitions)
     < imports (grove_backend/resolve ports index.imports)
     < tree (grove_backend/generate index)
-    = identity (grove_backend/identity root)
+    = identity root
       metas
         | index.definitions.bind
         \ def
         | (row/range 0 def.metadata.len).map
         \ i
         | grove_backend/meta_key def.name i
-    = request (grove_backend/request identity tree imports metas)
+    = names=row[path]
+        | index.definitions.map (\ def [($ts def.name)])
+      request
+        | grove_backend/request identity tree imports metas names.cons([])
     < result (ports.compile request)
     ? !(eq result.metadata.len metas.len)
       | grove_backend/fail[row[[path myth]]] rex/zero_span
         "Compiler returned an invalid metadata count."
     = records (grove_backend/publish root identity
         index.definitions slots result)
-    | grove_backend/publication_records root index.definitions records
+    < records (grove_backend/publication_records root index.definitions records)
+    | ./ok (grove_backend/definition_records root result records)
   + compiled_from
     \ entries=row[[path grove_backend/entry]] metadata=row[pail]
-      artifact=any
+      artifact=any definitions=row[[path nat type]]
     ^ grove_backend/compiled
     = table=mop[path grove_backend/entry lt_pith]
         | entries.fold (mop/empty)
         \ out [key value]
         | out.put key value
-    | grove_backend/compiled table metadata artifact
+    | grove_backend/compiled table metadata artifact definitions
+  + definition_records
+    ' Every assigned definition, including nested nominal members, is
+    ' navigable and carries its canonical descriptor and compiler artifact.
+    \ root=path result=grove_backend/compiled records=row[[path myth]]
+    ^ row[[path myth]]
+    = table=axal[myth]
+        | records.fold (axal/new[myth] .none)
+          \ out [name card]
+          | out.put name card
+    = published
+        | result.definitions.fold table
+          \ out [relative prior description]
+          = name | root.weld relative
+            card
+              ? out.dip(name).fil
+               > (./some card) card
+              myth/new
+            exports=mop[path grove_backend/entry lt_pith]
+              | result.entries.tap.fold (mop/empty)
+                \ entries [key value]
+                ? (pith_prefix relative key)
+                  | entries.put key.drop(relative.len) value
+                entries
+            module
+              | grove_backend/bundle grove_backend/version root
+                  relative exports result.artifact
+            card | card.put ['sys 'mold] (pails/ty description)
+          | out.put name card.put(grove_backend/module_slot module)
+    | published.tap
   + bindings
     \ dep=grove_backend/dependency
     ^ row[[path path]]
@@ -455,7 +480,8 @@
     ? (eq i records.len)
       < checked (grove_backend/check_seeds seeds rules)
       ? (eq seeds.len 0) (./ok out)
-      = template (grove_template 1 (grove_backend/armor seeds rules))
+      = template (grove_template grove_templates/version
+          (grove_backend/armor root.at(0) seeds rules))
         card (myth/sing grove_templates/slot template)
       | ./ok out.snoc([root card])
     = [path card] records.at(i)
@@ -511,8 +537,17 @@
         (str/join "" ["Tree seed violates #like at "
           (path_show base.weld(bad))])
      > .none (grove_backend/check_seeds seeds rules.drop(1))
+  + with_behavior
+    \ reference=path card=myth
+    ^ myth
+    = refs=row[path]
+        ?> (./some held) card.get(limb_slot) []
+        ?> existing=kook held []
+        existing.refs
+    ? refs.has(reference) card
+    | card.put limb_slot (kook refs.snoc(reference))
   + armor
-    \ records=row[[path myth]]
+    \ publisher=iota records=row[[path myth]]
       rules=row[[rex/source_span path grove_tree_rule]]
     ^ row[[path myth]]
     | records.map
@@ -530,15 +565,42 @@
         ? !(equal path base) card
         = spec (yoke lash/new rule.spec.kids
             (axal/new[fief] .none))
-        = card card.put(['sys 'spec] spec)
-        = card card.put(['sys 'grove 'like] (pails/p rule.source))
-        | card.put limb_slot (kook [['kook 'ward]])
+        = card card.put(publisher_vocabulary/spec spec)
+        = card card.put(publisher_vocabulary/grove/like (pails/p rule.source))
+        | grove_backend/with_behavior [publisher 'kook 'ward] card
     = card
         ? card.get(['sys 'tack])
          > (./some held)
           ? held
            > link=grove_instance_ref
-            | card.put limb_slot (kook [['kook 'fresh]])
+            | grove_backend/with_behavior [publisher 'kook 'fresh] card
           card
         card
     [path card]
+
+  + artifact_of
+    \ card=myth
+    ^ maybe[any]
+    ?> (./some value) card.get(grove_backend/module_slot) .none
+    ?> bundle=grove_backend/bundle value .none
+    | ./some bundle.artifact
+
+  + commit
+    \ system=pin[row[[path nat]]] expected=row[[path nat]]
+      records=row[[path myth]] now=nat block=nat state=namespace
+    ^ either[iota namespace/committed]
+    = names | expected.map (\ [name prior] name)
+    < batch
+      | publication_batch/prepare state.self names state.local
+    = valid
+        | expected.all
+          \ [name prior]
+          ?> (./some actual) batch.expected.dip(name).fil .false
+          | eq actual prior
+    ? !valid (./err 'stale_publication)
+    = table
+        | records.fold (axal/new[myth] .none)
+          \ out [name card]
+          | out.put name card
+    ? !(eq table.tap.len records.len) (./err 'duplicate_definition)
+    | batch.publish_namespace system table now block state

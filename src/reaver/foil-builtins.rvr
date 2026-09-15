@@ -22,6 +22,8 @@
 (#bind quip (#module quip))
 (#bind native-http (#module http-client))
 (#bind rex (#module rex))
+(#bind shrine-brand (#module shrine-brand))
+(#bind cairn (#module cairn))
 
 
 ;;; Built-in Foil environment ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -383,6 +385,17 @@
 (define (maybe-some x) (maybe-some-brand x))
 (define maybe-none maybe-none-brand)
 
+(define (decode-brand value)
+  (define result (shrine-brand:decode-path value))
+  (Ifz (Sz result) maybe-none (maybe-some (_0 result))))
+(define brand-encode-ty
+  (nt:tfun [(row-of (nt:type-ref ["iota"])) (nt:tnat 0)] (nt:tnat 0)))
+(define brand-decode-ty
+  (nt:tfun [(nt:tnat 0)]
+    (maybe-of (nt:trow 0
+      [(nt:trow-item "path" (row-of (nt:type-ref ["iota"])))
+       (nt:trow-item "case" (nt:tnat 0))]))))
+
 ;;; Aura-preserving text primitives ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; str = nat/tu, sym = nat/ts.  An aura'd nat widens to nat but nothing
 ;; widens back (a bare nat cannot claim an aura), so every operation that
@@ -500,6 +513,7 @@
     (insert-ffi ["rex" "shape_error"] foil-rex-leaf-error
       (nt:tfun [nt:tany] (maybe-nt str-ref)))
     (insert-ffi ["if"] If if-ty)
+    (insert-ffi ["and"] And (nt:tfun [bool-ty bool-ty] bool-ty))
     ;; Raises its pail argument; nat is the declared result until the
     ;; language represents non-returning functions explicitly.
     (insert-ffi ["error"] error (nt:tfun [nt:tpail] (nt:tnat 0)))
@@ -581,6 +595,9 @@
     (insert-ffi ["iota_eq"] iota-eq iota-cmp-ty)
     (insert-ffi ["iota_show"] quip:print-quip iota-show-nt-ty)
     (insert-ffi ["nat_show"] quip:print-nat-canonical unary-nat-ty)
+    (insert-ffi ["brand_encode"] shrine-brand:encode-path brand-encode-ty)
+    (insert-ffi ["brand_decode"] decode-brand brand-decode-ty)
+    (insert-ffi ["nominal_brand"] shrine-brand:value-brand rep-nat-ty)
     (insert-ffi ["rep_hd"] Hd rep-nat-ty)
     (insert-ffi ["rep_sz"] Sz rep-nat-ty)
     (insert-ffi ["rep_ix"] Ix rep-ix-ty)
@@ -656,3 +673,56 @@
 ;; debugging aid, re-enable by swapping back to install-foil-provides.
 (define default-subject
   (install-foil-provides-raw typed-foil-api ffi-subject))
+
+;; Host primitives share the selected native type definitions. Adapt only
+;; the option returned by the host boundary: its payload may itself be an
+;; opaque value with an unrelated nominal identity.
+(define (for-context context)
+  (define base (core:system-subject context))
+  (define root (sut-root base))
+  (define (key path)
+    (If (Equal "rex" (_0 path)) path (Weld root path)))
+  (define world (core:world-from-subject base))
+  (define (brand name)
+    (_0 (_1 (nt:runtime-key world
+      (nt:type-ref (key name))))))
+  (define some (brand ["maybe" "some"]))
+  (define none (brand ["maybe" "none"]))
+  (define (option f value)
+    (define result (f value))
+    (If (maybe-is-none result) none
+      (If (maybe-is-some result) (some (_0 result))
+        (error ["invalid-host-option" result]))))
+  (define option-functions
+    [["brand_decode"] ["nat" "parse"] ["iota" "text"]
+     ["str" "sym"] ["path_parse"]
+     ["rex" "shape_kind"] ["rex" "shape_error"]])
+  (define (install sut pair)
+    (define name (_0 pair))
+    (define tc (core:subject-entry-tc (_1 pair)))
+    (cond
+      ((Eq "TC_FFI" (Hd tc))
+        (If (includes (Equal name)
+              [["maybe" "some"] ["maybe" "none"]]) sut
+          (let* ((original (tc-ffi-val tc))
+                 (value
+                   (cond
+                     ((includes (Equal name) option-functions)
+                       (option original))
+                     ((Equal name ["maybe" "is_some"])
+                       (lambda (v) (And (IsApp v)
+                         (And (Eq some (Hd v)) (Eq 1 (Sz v))))))
+                     ((Equal name ["maybe" "is_none"])
+                       (lambda (v) (Eq none v)))
+                     ((Equal name ["unit" "unit"]) (brand ["unit"]))
+                     (else original))))
+            (mark-visible (key name) (key name)
+              (insert-ffi (key name) value
+                (nt:relocate-type-value key (tc-ty tc)) sut)))))
+      ;; Rex is the native compiler codec, not a system nominal type.
+      ((And (Eq "TC_TYP" (Hd tc)) (Equal "rex" (_0 name)))
+        (mark-visible name name
+          (insert-tc name wack-span
+            (tc-typ (nt:relocate-type-value key (tc-typ-inner tc))) sut)))
+      (else sut)))
+  (foldl install base (rowify (cairn:tapax (sut-ax default-subject)))))

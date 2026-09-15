@@ -1,0 +1,150 @@
+- codex
+- testing
+
++ codex_tests
+  + response
+    \ id=nat result=json
+    ^ json
+    | codex/object [(jkv "id" (codex/number id)) (jkv "result" result)]
+  + ready
+    ^ codex/batch
+    | codex/incoming (codex_tests/response 1 codex/obj) (codex/begin (codex/boot).state)
+  + thread
+    \ id=str
+    ^ json
+    | codex/object [(jkv "thread" (codex/object [(jkv "id" (json/str id))]))]
+  + turn
+    \ id=str
+    ^ json
+    | codex/object [(jkv "turn" (codex/object [(jkv "id" (json/str id))]))]
+  + started
+    ^ codex/batch
+    = b (codex/consume 'c1 (codex/start (json/arr []) codex/obj .none) (codex/begin (codex_tests/ready).state))
+      b (codex/incoming (codex_tests/response 2 (codex_tests/thread "t1")) b)
+    | codex/incoming (codex_tests/response 3 (codex_tests/turn "u1")) b
+  + method
+    \ message=json
+    ^ str
+    | codex/text (codex/get "method" message)
+  + handshake
+    \ ignored=unit
+    ^ row[testing/check]
+    = waiting (codex/consume 'early (codex/start (json/arr []) codex/obj .none) codex/boot)
+    [(testing/text "initialize first" "initialize" (codex_tests/method (codex/boot).wire.at(0)))
+     (testing/nat "not ready before response" 0 (codex/boot).state.ready)
+     (testing/nat "early commands stay unconsumed" 0 waiting.state.seen.len)
+     (testing/nat "ready after response" 1 (codex_tests/ready).state.ready)
+     (testing/text "initialized notification" "initialized" (codex_tests/method (codex_tests/ready).wire.at(0)))]
+  + lifecycle
+    \ ignored=unit
+    ^ row[testing/check]
+    = b codex_tests/started
+      session (codex/session_at "t1" b.state)
+      duplicate (codex/consume 'c1 (codex/start (json/arr []) codex/obj .none) (codex/begin b.state))
+      good (codex/consume 'c2 (codex/steer "t1" "u1" (json/arr [])) (codex/begin b.state))
+      stale (codex/consume 'c3 (codex/steer "t1" "old" (json/arr [])) (codex/begin b.state))
+      stop (codex/consume 'c4 (codex/interrupt "t1" "u1") (codex/begin b.state))
+    [(testing/text "thread then turn" "turn/start" (codex_tests/method b.wire.at(1)))
+     (testing/text "active turn" "u1" session.turn)
+     (testing/nat "duplicate command never resent" 0 duplicate.wire.len)
+     (testing/text "steer maps to RPC" "turn/steer" (codex_tests/method good.wire.at(0)))
+     (testing/nat "stale steer never sent" 0 stale.wire.len)
+     (testing/nat "stale steer completes with error" 0 stale.writes.at(0).record.nat_at(codex_slots/ok 9))
+     (testing/text "interrupt RPC" "turn/interrupt" (codex_tests/method stop.wire.at(0)))
+     (testing/nat "interrupt acknowledgement does not finish turn" 1 (codex/session_at "t1" stop.state).busy)]
+  + resume
+    \ ignored=unit
+    ^ row[testing/check]
+    = b (codex/consume 'resume (codex/start (json/arr []) codex/obj (./some "existing")) (codex/begin (codex_tests/ready).state))
+      duplicate (codex/consume 'other (codex/start (json/arr []) codex/obj (./some "existing")) (codex/begin b.state))
+      resumed (codex/incoming (codex_tests/response 2 (codex_tests/thread "existing")) b)
+      done (codex/notification "turn/completed" (codex/put "threadId" (json/str "t1") (codex_tests/turn "u1")) (codex/begin (codex_tests/started).state))
+      next (codex/consume 'next (codex/start (json/arr []) codex/obj (./some "t1")) done)
+    [(testing/text "resume unloaded thread" "thread/resume" (codex_tests/method b.wire.at(0)))
+     (testing/nat "pending resume excludes a second start" 0 duplicate.wire.len)
+     (testing/text "resume then start" "turn/start" (codex_tests/method resumed.wire.at(1)))
+     (testing/text "loaded thread starts directly" "turn/start" (codex_tests/method next.wire.at(0)))]
+  + request
+    \ id=json
+    ^ json
+    | codex/object [(jkv "id" id) (jkv "method" (json/str "item/tool/requestUserInput"))
+        (jkv "params" (codex/object [(jkv "threadId" (json/str "t1"))]))]
+  + effects
+    \ ignored=unit
+    ^ row[testing/check]
+    = b (codex/incoming (codex_tests/request (json/str "7")) (codex/begin (codex_tests/started).state))
+      c (codex/incoming (codex_tests/request (codex/number 7)) b)
+      effect c.state.effects.at(0)
+      record (codex/request_effect effect.id "question" codex/obj).put(codex_slots/reply_result (pails/t "{}"))
+      answered (codex/consume effect.key record (codex/begin c.state))
+      repeated (codex/consume effect.key record (codex/begin answered.state))
+      resolved (codex/notification "serverRequest/resolved" (codex/object [(jkv "requestId" (codex/number 7))]) (codex/begin answered.state))
+    [(testing/nat "numeric and string IDs distinct" 2 c.state.effects.len)
+     (testing/nat "one effect response" 1 answered.wire.len)
+     (testing/text "string ID retained" "7" (codex/text (codex/get "id" answered.wire.at(0))))
+     (testing/nat "reply not replayed" 0 repeated.wire.len)
+     (testing/nat "server resolution removes pending request" 0 resolved.state.effects.len)]
+  + failure
+    \ ignored=unit
+    ^ row[testing/check]
+    = started (codex/consume 'c (codex/start (json/arr []) codex/obj .none) (codex/begin (codex_tests/ready).state))
+      b (codex/incoming (codex_tests/request (codex/number 9)) started)
+      failed (codex/fail "EOF" b)
+      again (codex/fail "EOF again" failed)
+      invalid (codex/incoming (json/arr []) (codex/begin (codex_tests/ready).state))
+    [(testing/nat "failure terminal" 1 failed.state.dead)
+     (testing/nat "outstanding RPCs cleared" 0 failed.state.rpcs.len)
+     (testing/nat "effects invalidated" 0 failed.state.effects.len)
+     (testing/nat "failure idempotent" failed.writes.len again.writes.len)
+     (testing/nat "invalid envelope terminal" 1 invalid.state.dead)]
+
+  + races
+    \ ignored=unit
+    ^ row[testing/check]
+    = command (codex/start (json/arr []) codex/obj .none)
+      b (codex/consume 'race command (codex/begin (codex_tests/ready).state))
+      b (codex/incoming (codex_tests/response 2 (codex_tests/thread "t1")) b)
+      b (codex/notification "turn/completed" (codex/put "threadId" (json/str "t1") (codex_tests/turn "u1")) b)
+      b (codex/incoming (codex_tests/response 3 (codex_tests/turn "u1")) b)
+      effect (codex/put "params" (codex/object [(jkv "threadId" (json/str "t1")) (jkv "turnId" (json/str "u1"))]) (codex_tests/request (codex/number 7)))
+      requested (codex/incoming effect (codex/begin (codex_tests/started).state))
+      cleared (codex/notification "turn/completed" (codex/put "threadId" (json/str "t1") (codex_tests/turn "u1")) requested)
+      late_record (codex/request_effect (codex/number 7) "question" codex/obj).put(codex_slots/reply_result (pails/t "{}"))
+      late (codex/consume requested.state.effects.at(0).key late_record (codex/begin cleared.state))
+    [(testing/nat "late start response cannot resurrect completed turn" 0 (codex/session_at "t1" b.state).busy)
+     (testing/nat "completion clears effect" 0 cleared.state.effects.len)
+     (testing/nat "late effect reply ignored" 0 late.wire.len)]
+  + rpc_errors
+    \ ignored=unit
+    ^ row[testing/check]
+    = b (codex/consume 'bad (codex/start (json/arr []) codex/obj .none) (codex/begin (codex_tests/ready).state))
+      payload (codex/object [(jkv "code" (codex/number 123)) (jkv "message" (json/str "bad input"))])
+      b (codex/incoming (codex/object [(jkv "id" (codex/number 2)) (jkv "error" payload)]) b)
+      unknown (codex/incoming (codex_tests/response 999 codex/obj) (codex/begin (codex_tests/ready).state))
+    [(testing/nat "RPC failure does not kill connection" 0 b.state.dead)
+     (testing/nat "RPC removed after error" 0 b.state.rpcs.len)
+     (testing/text "error payload preserved" (show payload) b.writes.at(0).record.txt_at(codex_slots/result))
+     (testing/nat "unknown response fails closed" 1 unknown.state.dead)]
+
+  + malformed
+    \ ignored=unit
+    ^ row[testing/check]
+    = b (codex/consume 'bad (codex/start (json/arr []) codex/obj .none) (codex/begin (codex_tests/ready).state))
+      b (codex/incoming (codex_tests/response 2 codex/obj) b)
+    [(testing/nat "malformed response closes connection" 1 b.state.dead)
+     (testing/nat "malformed response resolves original command as error" 0 b.writes.at(1).record.nat_at(codex_slots/ok 9))
+     (testing/nat "invalid exponent rejected" 1 ?=((./err _ _) (codex_json/decode "1e")))
+     (testing/nat "leading zero rejected" 1 ?=((./err _ _) (codex_json/decode "01")))
+     (testing/nat "repeated decimal rejected" 1 ?=((./err _ _) (codex_json/decode "1.2.3")))
+     (testing/nat "valid exponent accepted" 1 ?=((./ok _ _) (codex_json/decode "[-1.2e+3,0,0.01]")))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "handshake" codex_tests/handshake)
+   (testing/case "lifecycle" codex_tests/lifecycle)
+   (testing/case "resume and continuation" codex_tests/resume)
+   (testing/case "server effects" codex_tests/effects)
+   (testing/case "failure" codex_tests/failure)
+   (testing/case "completion races" codex_tests/races)
+   (testing/case "RPC errors" codex_tests/rpc_errors)
+   (testing/case "malformed protocol" codex_tests/malformed)]

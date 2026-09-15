@@ -2,10 +2,13 @@
 """Run the Eden namespace explorer; --check exercises the real socket."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+import sys
 import os
 import re
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -14,43 +17,114 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from test_runner import stage, rvr_string
+from namespace_identity import parse_node_identity
+
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port', type=int, default=8130)
+parser.add_argument('--node', help='Explicit node public-key hash in canonical Shrine hex, e.g. 0x0102 (no keypair is generated)')
 parser.add_argument('--check', action='store_true')
+parser.add_argument('--startup-timeout', type=int, default=1200,
+                    help='Seconds allowed for compilation and listener startup (default: 1200)')
+parser.add_argument('--request-timeout', type=int, default=30,
+                    help='Seconds allowed per socket check request (default: 30)')
 parser.add_argument('--srs', action='store_true',
                     help='Publish Grove SRS definitions and offer instance installation in the UI')
+parser.add_argument('--codex', action='store_true',
+                    help='Start the Codex desk driver; --check uses a fake app server')
+parser.add_argument('--codex-bin', default='codex',
+                    help='Codex executable for --codex (default: codex)')
+parser.add_argument('--profile-boot', action='store_true',
+                    help='Report startup phases from the disposable source copy')
 args = parser.parse_args()
+boot_started = time.monotonic()
+if args.codex and not args.check and not shutil.which(args.codex_bin):
+    parser.error('--codex requires a Codex executable; set --codex-bin')
+if args.node is None and not args.check:
+    parser.error('--node is required; --check uses deterministic fixture identity 0x11')
+try:
+    node_number, node = parse_node_identity(args.node or '0x11')
+except ValueError as error:
+    parser.error(str(error))
+if args.startup_timeout <= 0:
+    parser.error('--startup-timeout must be positive')
+if args.request_timeout <= 0:
+    parser.error('--request-timeout must be positive')
 if not 1 <= args.port <= 65535:
     parser.error('--port must be between 1 and 65535')
 runtime = os.environ.get('WISP') or shutil.which('wisp') or str(root / 'wisp')
 if not os.access(runtime, os.X_OK):
     parser.error('Set WISP to a working runtime executable (see doc/actor-abort-investigation.md).')
-templates = list((root / '.check').glob('template-*'))
-if not templates:
-    parser.error('Run x/check once to create a bootstrap template.')
-template = max(templates, key=lambda p: p.stat().st_mtime)
+# A template is tied to both compiler inputs and the runtime binary. Picking
+# the newest directory can mix runtimes or silently reuse stale compiler code.
+try:
+    template = stage(runtime, False, args.startup_timeout)
+except (RuntimeError, OSError) as error:
+    parser.error(str(error))
+staged_at = time.monotonic()
 work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
+shutil.copytree(root / 'src', work / 'src')
+if args.codex:
+    for name in ('codex_slots', 'codex_json', 'codex', 'codex_foot', 'codex_ui', 'codex_driver'):
+        shutil.copy2(work / 'src' / 'desks' / 'codex' / (name + '.foil'),
+                     work / 'src' / 'foil' / (name + '.foil'))
+if args.profile_boot:
+    from eden_boot_profile import instrument, report
+    instrument(work / 'src')
 (work / 'snap').mkdir()
 for name in ('data.mdb', 'pins.pack'):
     shutil.copyfile(template / name, work / 'snap' / name)
 url = f'http://127.0.0.1:{args.port}'
 log_path = work / 'out.log'
 print(f'Compiling Eden. Log: {log_path}', flush=True)
-with log_path.open('w') as log:
+prepared_at = time.monotonic()
+with ExitStack() as cleanup, log_path.open('w') as log:
+    bridge = None
+    if args.codex:
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt
+        previous = signal.signal(signal.SIGTERM, interrupt)
+        cleanup.callback(signal.signal, signal.SIGTERM, previous)
+        sys.path.insert(0, str(work / 'src' / 'desks' / 'codex'))
+        from codex_bridge import Bridge
+        command = ([sys.executable, str(work / 'src' / 'desks' / 'codex' / 'codex_fake_server.py'), 'normal']
+                   if args.check else [shutil.which(args.codex_bin), 'app-server', '--listen', 'stdio://'])
+        stderr = cleanup.enter_context((work / 'codex.log').open('w'))
+        bridge = Bridge(command, stderr=stderr, auth_timeout=args.startup_timeout).start()
+        cleanup.callback(bridge.close)
     process = subprocess.Popen(
-        [runtime, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
+        [runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_'],
         cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
     try:
-        entry = f'(eden:start-srs {args.port})' if args.srs else f'(eden:start {args.port} 0)'
-        process.stdin.write(f'(#bind eden (#module eden))\n{entry}\n')
+        entry = 'start-srs' if args.srs else 'start'
+        if args.codex:
+            entry += '-codex'
+        extra = f' {bridge.port} {rvr_string(bridge.token)}' if bridge else ''
+        launch_source = f"""(#bind eden (#module eden))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind std (#module std))
+(#import std)
+(define (launch ignored)
+  (define (resolve name) [["x" {node_number}] ["ts" "lib"] ["ts" name]])
+  (define slot [("x" {node_number}) ("ts" "compiler") ("ts" "artifact")])
+  (define system (bootstrap:build-system (Pin eden:{entry}) resolve slot))
+  (eden:{entry} ("x" {node_number}) system resolve slot {args.port}{extra}))
+(launch 0)
+"""
+        process.stdin.write(launch_source)
         process.stdin.flush()
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + args.startup_timeout
         while True:
             output = log_path.read_text(errors='replace')
             if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output or 'bind/listen failed' in output:
                 raise RuntimeError(output[-5000:])
-            if re.search(r'^"?HTTP foot listening"?$', output, re.MULTILINE):
+            if bridge and bridge.error:
+                raise RuntimeError(f'Codex bridge failed: {bridge.error}; inspect {work / "codex.log"}')
+            codex_ready = not args.codex or re.search(r'^"?Codex foot registered"?$', output, re.MULTILINE)
+            if args.codex and args.check:
+                codex_ready = codex_ready and 'Codex fake initialized' in (work / 'codex.log').read_text()
+            if codex_ready and re.search(r'^"?HTTP foot listening"?$', output, re.MULTILINE):
                 try:
                     with socket.create_connection(('127.0.0.1', args.port), timeout=0.2):
                         break
@@ -59,27 +133,66 @@ with log_path.open('w') as log:
             if time.monotonic() > deadline:
                 raise RuntimeError(f'Server startup timed out; inspect {log_path}')
             time.sleep(0.25)
+        ready_at = time.monotonic()
+        if args.profile_boot:
+            print(f'Boot host staging: {staged_at-boot_started:.3f}s; copy: {prepared_at-staged_at:.3f}s; runtime: {ready_at-prepared_at:.3f}s; total: {ready_at-boot_started:.3f}s', flush=True)
+            report(output, work / 'boot-timings.json')
         print(f'Foil HTTP interface: {url}/ns', flush=True)
+        if args.codex:
+            print(f'Codex driver: {url}/ns/{node}/io/codex', flush=True)
         if args.check:
             def get(path='/'):
-                with urllib.request.urlopen(url + path, timeout=20) as response:
+                with urllib.request.urlopen(url + path, timeout=args.request_timeout) as response:
                     return response.read().decode()
+            if args.codex:
+                console = f'/ns/{node}/io/codex'
+                assert 'What should Codex do?' in get(console)
+                def codex_post(**fields):
+                    request = urllib.request.Request(
+                        url + f'/post/{node}/io/codex',
+                        data=urllib.parse.urlencode(fields).encode())
+                    with urllib.request.urlopen(request, timeout=args.request_timeout) as response:
+                        assert 'committed' in response.read().decode()
+                def codex_wait(fragment):
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        page = get(console)
+                        if fragment in page:
+                            return page
+                        time.sleep(0.2)
+                    raise AssertionError(f'Codex console missing {fragment}: {page}')
+                codex_post(action='start', prompt='Hello from Shrine')
+                codex_wait('hello')
+                codex_post(action='steer', thread='t1', turn='u1', prompt='Question please')
+                page = codex_wait('data-effect=')
+                effect = re.search(r'data-effect="([^"]+)"', page).group(1)
+                codex_post(action='reply', effect=effect,
+                           reply_kind='result', reply='{"answers":{}}')
+                codex_wait('serverRequest/resolved')
+                codex_post(action='interrupt', thread='t1', turn='u1')
+                codex_wait('interrupted')
+                assert bridge.process is not None and bridge.process.poll() is None
+                print('Codex e2e passed: prompt, streamed reply, request response, and interrupt through HTTP.', flush=True)
             if args.srs:
-                preview = get('/ns/gov/srs')
+                preview = get(f'/ns/{node}/gov/srs')
                 assert 'Install instance' in preview
                 assert 'name="root"' in preview
-                assert 'no record at this node' in get('/ns/gov/srs/cards/demo')
-                grade = get('/ns/gov/srs/grade')
+                assert 'no record at this node' in get(f'/ns/{node}/gov/srs/cards/demo')
+                grade = get(f'/ns/{node}/gov/srs/grade')
                 assert 'compiled Grove module' in grade
                 version = re.search(r'name="version" value="(\d+)"', preview)
                 assert version, preview
                 def install_instance(target, case=version.group(1)):
                     data = urllib.parse.urlencode({
-                        'source': '/gov/srs', 'version': case, 'root': target
+                        'source': f'/{node}/gov/srs', 'version': case, 'root': f'/{node}{target}'
                     }).encode()
-                    with urllib.request.urlopen(urllib.request.Request(
-                            url + '/grove/install', data=data), timeout=30) as response:
-                        return response.read().decode()
+                    try:
+                        with urllib.request.urlopen(urllib.request.Request(
+                                url + '/grove/install', data=data), timeout=args.request_timeout) as response:
+                            return response.read().decode()
+                    except urllib.error.HTTPError as error:
+                        print(f'Install {target}: {error.code} {error.read().decode()}', flush=True)
+                        raise
                 assert 'committed' in install_instance('/app/srs')
                 assert 'committed' in install_instance('/app/second')
                 for target, case in [('/app/srs', version.group(1)), ('/app/stale', '0')]:
@@ -88,26 +201,26 @@ with log_path.open('w') as log:
                         raise AssertionError('Conflicting/stale installation must fail')
                     except urllib.error.HTTPError as error:
                         assert error.code == 409
-                assert 'Install instance' in get('/ns/gov/srs')
-                assert 'What does a Shrine name identify?' in get('/ns/app/srs/cards/demo')
-                assert 'What does a Shrine name identify?' in get('/ns/app/second/cards/demo')
-                assert 'path="/x/app/srs/next/0"' in get('/ns/x/app/srs/next')
-                assert 'no record at this node' in get('/ns/app/srs/grade')
+                assert 'Install instance' in get(f'/ns/{node}/gov/srs')
+                assert 'What does a Shrine name identify?' in get(f'/ns/{node}/app/srs/cards/demo')
+                assert 'What does a Shrine name identify?' in get(f'/ns/{node}/app/second/cards/demo')
+                assert f'path="/x/{node}/app/srs/next/0"' in get(f'/ns/x/{node}/app/srs/next')
+                assert 'no record at this node' in get(f'/ns/{node}/app/srs/grade')
             assert 'sh-triptych' in get('/ns')
-            assert 'Hello from Eden.' in get('/ns/hello')
+            assert 'Hello from Eden.' in get(f'/ns/{node}/hello')
             with ThreadPoolExecutor(max_workers=4) as clients:
                 assert all('Hello from Eden.' in page
-                           for page in clients.map(get, ['/ns/hello'] * 8))
-                paths = ['/w.js', '/ns/hello', '/style.css'] * 4
+                           for page in clients.map(get, [f'/ns/{node}/hello'] * 8))
+                paths = ['/w.js', f'/ns/{node}/hello', '/style.css'] * 4
                 for path, page in zip(paths, clients.map(get, paths)):
-                    if path == '/ns/hello':
+                    if path == f'/ns/{node}/hello':
                         assert 'Hello from Eden.' in page
                     elif path == '/w.js':
                         assert 'w-get' in page
                     else:
                         assert len(page) > 100
             def raw_request(parts):
-                with socket.create_connection(('127.0.0.1', args.port), timeout=20) as connection:
+                with socket.create_connection(('127.0.0.1', args.port), timeout=args.request_timeout) as connection:
                     for part in parts:
                         connection.sendall(part)
                         time.sleep(0.02)
@@ -120,24 +233,24 @@ with log_path.open('w') as log:
                 b'GET /ns/%zz HTTP/1.1\r\nHost: localhost\r\n\r\n'
             ]).split(b'\r\n', 1)[0]
             body = b'message=Split+request+verified.'
-            header = (b'POST /edit/hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: '
+            header = (f'POST /edit/{node}/hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: '.encode()
                       + str(len(body)).encode() + b'\r\n\r\n')
             assert b'committed' in raw_request([header[:17], header[17:], body[:8], body[8:]])
-            assert 'Split request verified.' in get('/ns/hello')
+            assert 'Split request verified.' in get(f'/ns/{node}/hello')
             def post(path, fields):
                 data = urllib.parse.urlencode(fields).encode()
-                with urllib.request.urlopen(urllib.request.Request(url + path, data=data), timeout=30) as response:
+                with urllib.request.urlopen(urllib.request.Request(url + path, data=data), timeout=args.request_timeout) as response:
                     return response.read().decode()
-            assert 'committed' in post('/edit/hello', {'message': 'Eden write verified.'})
-            assert 'Eden write verified.' in get('/ns/hello')
-            assert 'Hello from Eden.' in get('/ns/h/x/1/1/hello')
-            assert 'committed' in post('/vine/hello', {'verb': 'cull'})
-            assert 'no record at this node' in get('/ns/hello')
+            assert 'committed' in post(f'/edit/{node}/hello', {'message': 'Eden write verified.'})
+            assert 'Eden write verified.' in get(f'/ns/{node}/hello')
+            assert 'Hello from Eden.' in get(f'/ns/h/x/1/2/{node}/hello')
+            assert 'committed' in post(f'/vine/{node}/hello', {'verb': 'cull'})
+            assert 'no record at this node' in get(f'/ns/{node}/hello')
             assert 'component zoo' in get('/weft')
             assert 'w-get' in get('/w.js')
             assert len(get('/style.css')) > 100
             try:
-                post('/vine/created', {'verb': 'make', 'expr': '(myth/new)'})
+                post(f'/vine/{node}/created', {'verb': 'make', 'expr': '(myth/new)'})
                 raise AssertionError('Expression route should require the compiler service')
             except urllib.error.HTTPError as error:
                 assert error.code == 501

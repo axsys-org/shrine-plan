@@ -9,6 +9,7 @@
 (#bind sast (#module foil-sast))
 (#bind parse (#module parse))
 (#bind foil-lore (#module foil-lore))
+(#bind publication (#module foil-publication))
 
 (define (order-option? node)
   (And (rx:rx-nest? node)
@@ -33,10 +34,11 @@
         (map new-imports (rx:rx-juxt-kids node))))
     (else node)))
 (define (read-module name) (new-imports (driver:read-module name)))
-(define (compile cache name) (driver:compile-with read-module cache name))
+(define (compile context cache name)
+  (driver:compile-with context read-module cache name))
 
-(define (compile-rex cache name tree)
-  (driver:compile-with
+(define (compile-rex context cache name tree)
+  (driver:compile-with context
     (lambda (mod) (If (Equal mod name) (new-imports tree)
       (read-module mod))) cache name))
 
@@ -86,3 +88,40 @@
 
 (define (read-source name)
   (read-text-file (strcat ["foil/" name ".foil"])))
+
+;; Resolve the complete file/artifact graph before assigning any moments.
+;; A resolver supplies canonical roots; filenames are never public roots.
+(define (prepare-publication-with read-rex system compiler resolver artifacts previous mods)
+  (define (artifact name)
+    (find (lambda (pair) (Equal name (_0 pair))) artifacts))
+  (define (read-checked name)
+    (define result (Try (lambda (ignored) (force (new-imports (read-rex name)))) 0))
+    (If (Eq 1 (Hd result)) (error ["foil-in-module" name (_0 result)]) (_0 result)))
+  (define (walk seen trees pending)
+    (Ifz (Sz pending) [seen trees]
+      (let ((name (_0 pending)) (rest (drop 1 pending)))
+        (If (includes (Equal name) seen) (walk seen trees rest)
+          (If (artifact name)
+            ;; Pinned artifacts contain their defining dependency graph.
+            (walk (snoc name seen) trees rest)
+            (let* ((tree (read-checked name))
+                   (imports (map driver:import-module
+                     (filter driver:mod-import? (sast:parse-module-sast 0 tree)))))
+              (walk (snoc name seen) (snoc [name tree] trees)
+                (Weld rest imports))))))))
+  (define discovered (Try (lambda (ignored) (force (walk [] [] mods))) 0))
+  (define graph
+    (If (Eq 1 (Hd discovered))
+      (error ["foil-publication-inputs"
+        (filter (lambda (name) (Nil (artifact name))) mods) (_0 discovered)])
+      (_0 discovered)))
+  (define names (_0 graph))
+  (define roots (map (lambda (name) [name (resolver name)]) names))
+  (define imported
+    (filter (lambda (pair) (includes (Equal (_0 pair)) names)) artifacts))
+  (define (frozen name)
+    (_1 (need (find (lambda (pair) (Equal name (_0 pair))) (_1 graph)))))
+  (publication:prepare system compiler frozen roots imported previous))
+
+(define (prepare-publication system compiler resolver artifacts previous mods)
+  (prepare-publication-with read-module system compiler resolver artifacts previous mods))
