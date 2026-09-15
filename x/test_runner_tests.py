@@ -118,6 +118,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('foil:tests/http_foot', names)
         self.assertFalse(any(name.startswith('helm-') for name in names))
 
+    def test_native_helpers_are_not_mistaken_for_suites(self):
+        suites = {s['name']: s for s in runner.inventory()}
+        for name in ('eden_srs', 'grove_backend', 'grove_debugger', 'grove_install', 'value_http'):
+            self.assertFalse(suites['foil:tests/' + name]['enabled'])
+            self.assertTrue(suites['foil:tests/' + name]['reason'])
+
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}
         for name in ('web', 'pact', 'sept', 'semidoc', 'weft'):

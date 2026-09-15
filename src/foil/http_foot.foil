@@ -2,6 +2,7 @@
 - http_response
 - http
 - weft
+- web
 
 + http_foot
   + request
@@ -11,6 +12,10 @@
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
+      http_foot/action/journal
+      http_foot/action/value
+      http_foot/action/physical
+      http_foot/action/debug
     + reply
       : response=http_response
     + install
@@ -19,16 +24,34 @@
       : pax=path wit=writ back=str
     + wait
       : record=myth
+    + journal
+      : before=maybe[nat] limit=nat
+    + value
+      : query=value_read/request
+    + physical
+      : query=physical_read/request
+    + debug
+      : query=debug_read/request
   + task
     '  Supervisor messages and namespace actions from connections.
     & feet/task/init
       feet/task/fact
       feet/task/page
+      feet/task/journal
+      feet/task/value
+      feet/task/physical
+      feet/task/debug
       feet/task/ack
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
+      http_foot/action/journal
+      http_foot/action/value
+      http_foot/action/physical
+      http_foot/action/debug
   + pending
+    ' Text r<serial> keys belong to ordinary HTTP namespace records.
+    ' Numeric serial keys correlate read-only supervisor requests.
     : key=iota conn=nat
   + ack
     & http_foot/ack/request
@@ -150,16 +173,250 @@
         ? (equal[str] kind "post") ['post ($ts key)]
         [($ts key)]
     | record.put pax (pails/t value)
+  + journal_query
+    ' Strict paging grammar. Decode before checking duplicates, retain
+    ' arbitrary-size decimal epochs as naturals, and never accept an
+    ' unknown parameter as an accidentally ignored cursor.
+    \ target=str
+    ^ http_foot/action
+    = parts (http_foot/split 63 target)
+    ? (gt parts.len 2)
+      | ./reply (http_driver/response 400 "Invalid journal query")
+    = query=str (? (eq parts.len 2) parts.at(1) "")
+    ? (eq query.len 0) (./journal .none 40)
+    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/fields query)
+      | ./reply (http_driver/response 400 "Invalid journal query encoding")
+    % i=nat 0 before=maybe[nat] .none limit=maybe[nat] .none viewed=bool .false
+    ^ http_foot/action
+    ? (eq i fields.len) (./journal before limit.fall(40))
+    = [key value] fields.at(i)
+    ? (equal[str] key "before")
+      ? (maybe/is_some before)
+        | ./reply (http_driver/response 400 "Duplicate before cursor")
+      ?> (./some n) (nat/parse value)
+        | ./reply (http_driver/response 400 "before must be a decimal epoch")
+      ? !(equal[str] value (nat/show n))
+        | ./reply (http_driver/response 400 "before must be a canonical decimal epoch")
+      | _ i.inc (./some n) limit viewed
+    ? (equal[str] key "limit")
+      ? (maybe/is_some limit)
+        | ./reply (http_driver/response 400 "Duplicate page limit")
+      ?> (./some n) (nat/parse value)
+        | ./reply (http_driver/response 400 "limit must be an integer from 1 to 40")
+      ? ((eq n 0) || (gt n 40) || !(equal[str] value (nat/show n)))
+        | ./reply (http_driver/response 400 "limit must be an integer from 1 to 40")
+      | _ i.inc before (./some n) viewed
+    ? (equal[str] key "view")
+      ? (viewed || !(equal[str] value "rendered"))
+        | ./reply (http_driver/response 400 "Invalid or duplicate view mode")
+      | _ i.inc before limit .true
+    | ./reply (http_driver/response 400 "Unknown journal query parameter")
+
+  + value_path
+    ' Query values are already percent-decoded. Require the canonical
+    ' namespace spelling, without aliases, dot paths, or a second decode.
+    \ text=str
+    ^ maybe[path]
+    ? ((eq text.len 0) || (gt text.len 4096) || !(eq text.at(0) 47)) .none
+    ? !(value_read/identifier text) .none
+    ? (text.split_byte(47).any((\ part=str ((equal[str] part ".") || (equal[str] part ".."))))) .none
+    ?> (./some pax) (path_parse text) .none
+    ? !(equal[str] text (path_show pax)) .none
+    | ./some pax
+  + value_number
+    \ text=str
+    ^ maybe[nat]
+    ?> (./some n) (nat/parse text) .none
+    ? !(equal[str] text (nat/show n)) .none
+    | ./some n
+  + value_query
+    \ target=str
+    ^ http_foot/action
+    = bad (http_foot/action/reply (http_foot/value_error 'invalid_query 400))
+      parts (http_foot/split 63 target)
+    ? ((gt target.len 32768) || !(eq parts.len 2)) bad
+    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/fields parts.at(1)) bad
+    % i=nat 0 pax=maybe[path] .none slot=maybe[path] .none
+      epoch=maybe[nat] .none offset=maybe[nat] .none limit=maybe[nat] .none
+    ^ http_foot/action
+    ? (eq i fields.len)
+      ?> (./some p) pax bad
+      ?> (./some k) slot bad
+      ?> (./some e) epoch bad
+      ?> (./some o) offset bad
+      ?> (./some n) limit bad
+      | ./value (value_read/request p k e o n)
+    = [key value] fields.at(i)
+    ? (equal[str] key "path")
+      ? (maybe/is_some pax) bad
+      ?> (./some p) (http_foot/value_path value) bad
+      | _ i.inc (./some p) slot epoch offset limit
+    ? (equal[str] key "slot")
+      ? (maybe/is_some slot) bad
+      ?> (./some k) (http_foot/value_path value) bad
+      | _ i.inc pax (./some k) epoch offset limit
+    ? (equal[str] key "epoch")
+      ? (maybe/is_some epoch) bad
+      ?> (./some e) (http_foot/value_number value) bad
+      | _ i.inc pax slot (./some e) offset limit
+    ? (equal[str] key "offset")
+      ? (maybe/is_some offset) bad
+      ?> (./some o) (http_foot/value_number value) bad
+      | _ i.inc pax slot epoch (./some o) limit
+    ? (equal[str] key "limit")
+      ? (maybe/is_some limit) bad
+      ?> (./some n) (http_foot/value_number value) bad
+      ? ((eq n 0) || (gt n 65536)) bad
+      | _ i.inc pax slot epoch offset (./some n)
+    bad
+
+  + physical_ascii
+    ' The structural wire codec and parameter names are printable ASCII.
+    ' Check raw fields before split can drop a trailing packed NUL.
+    \ text=str
+    ^ bool
+    % i=nat 0
+    ? (eq i text.len) .true
+    = byte text.at(i)
+    ? ((lt byte 33) || (gt byte 126)) .false
+    | _ i.inc
+  + physical_query
+    \ target=str
+    ^ http_foot/action
+    = bad (http_foot/action/reply (http_foot/value_error 'invalid_query 400))
+    ? (gt target.len 32800) bad
+    ? !(http_foot/physical_ascii target) bad
+    = parts (http_foot/split 63 target)
+    ? !(eq parts.len 2) bad
+    = raw parts.at(1)
+    ? ((eq raw.len 0) || (gt raw.len 32768)) bad
+    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/physical_fields raw) bad
+    % i=nat 0 pax=maybe[path] .none collection=maybe[iota] .none
+      epoch=maybe[nat] .none after=maybe[path] .none limit=maybe[nat] .none
+    ^ http_foot/action
+    ? (eq i fields.len)
+      ?> (./some p) pax bad
+      ?> (./some c) collection bad
+      ? (? (maybe/is_some after) (maybe/is_none epoch) .false) bad
+      ? (? (eq_iota c 'children) (after.run((\ key=path !(eq key.len 1))).fall(.false)) .false) bad
+      | ./physical (physical_read/request p epoch c after limit.fall(40))
+    = [key value] fields.at(i)
+    ? ((eq value.len 0) || !(http_foot/physical_ascii key) || !(http_foot/physical_ascii value)) bad
+    ? (equal[str] key "pathKey")
+      ? (maybe/is_some pax) bad
+      ?> (./some p) (physical_key/decode value) bad
+      | _ i.inc (./some p) collection epoch after limit
+    ? (equal[str] key "collection")
+      ? (maybe/is_some collection) bad
+      ? (equal[str] value "children") (_ i.inc pax (./some 'children) epoch after limit)
+      ? (equal[str] value "slots") (_ i.inc pax (./some 'slots) epoch after limit)
+      bad
+    ? (equal[str] key "epoch")
+      ? ((maybe/is_some epoch) || (gt value.len 128)) bad
+      ?> (./some e) (http_foot/value_number value) bad
+      | _ i.inc pax collection (./some e) after limit
+    ? (equal[str] key "after")
+      ? (maybe/is_some after) bad
+      ?> (./some a) (physical_key/decode value) bad
+      | _ i.inc pax collection epoch (./some a) limit
+    ? (equal[str] key "limit")
+      ? ((maybe/is_some limit) || (gt value.len 2)) bad
+      ?> (./some n) (http_foot/value_number value) bad
+      ? ((eq n 0) || (gt n 40)) bad
+      | _ i.inc pax collection epoch after (./some n)
+    bad
+
+  + physical_decode
+    ' Called only after the raw physical query passed printable ASCII.
+    ' Canonical codec strings need no allocation or byte-by-byte rebuild.
+    ' Encoded input keeps the existing strict percent/NUL/plus behavior.
+    \ text=str
+    ^ str
+    % i=nat 0
+    ? (eq i text.len) text
+    = byte text.at(i)
+    ? ((eq byte 37) || (eq byte 43)) (http_foot/decode .true text)
+    | _ i.inc
+  + physical_fields
+    \ raw=str
+    ^ row[[key=str value=str]]
+    | (http_foot/split 38 raw).map
+    \ field=str
+    ? (http_foot/find "=" field)
+     > (./some at)
+       [(http_foot/physical_decode field.slice(0 at))
+        (http_foot/physical_decode field.slice(at.inc field.len))]
+     > .none [(http_foot/physical_decode field) ""]
+
+  + debug_query
+    \ target=str
+    ^ http_foot/action
+    = parts (http_foot/split 63 target)
+      pax (http_foot/target parts.at(0).slice(6 parts.at(0).len))
+      invalid (http_foot/action/reply (http_driver/response 400 "Invalid debugger query"))
+    ? (gt parts.len 2) invalid
+    = fields (? (eq parts.len 2) (http_foot/fields parts.at(1)) [])
+    % i=nat 0 seen=row[str] [] epoch=maybe[nat] .none
+      children=maybe[path] .none slots=maybe[path] .none scope=iota 'document
+    ^ http_foot/action
+    ? (eq i fields.len)
+      = continuation ((maybe/is_some children) || (maybe/is_some slots))
+      ? (? continuation (maybe/is_none epoch) .false) invalid
+      | ./debug (debug_read/request pax epoch children slots scope)
+    = [key value] fields.at(i)
+    ? (seen.any((\ known=str (equal[str] key known)))) invalid
+    = next seen.snoc(key)
+    ? (equal[str] key "scope")
+      ? !((equal[str] value "workspace") || (equal[str] value "outline") || (equal[str] value "preview")) invalid
+      | _ i.inc next epoch children slots ($ts value)
+    ? (equal[str] key "view")
+      ? !(equal[str] value "rendered") invalid
+      | _ i.inc next epoch children slots scope
+    ? (equal[str] key "epoch")
+      ?> (./some number) (nat/parse value) invalid
+      ? !(equal[str] value (nat/show number)) invalid
+      | _ i.inc next (./some number) children slots scope
+    ? ((equal[str] key "children") || (equal[str] key "slots"))
+      ?> (./some cursor) (physical_key/decode value) invalid
+      ? (equal[str] key "children")
+        ? !(eq cursor.len 1) invalid
+        | _ i.inc next epoch (./some cursor) slots scope
+      | _ i.inc next epoch children (./some cursor) scope
+    invalid
+
   + plan
     \ request=http_foot/request now=nat
     ^ http_foot/action
     = url (http_foot/split 63 request.target).at(0)
       fields (http_foot/fields request.body)
+    ? (http_foot/route_is "/debug-read" url)
+      ? !((equal[str] url "/debug-read/value") || (equal[str] url "/debug-read/physical"))
+        | ./reply (http_foot/value_error 'route_missing 404)
+      ? !(equal[str] request.method "GET")
+        | ./reply (http_foot/value_error 'method_not_allowed 405)
+      = parse={\ str}http_foot/action
+          ? (equal[str] url "/debug-read/physical") http_foot/physical_query
+          http_foot/value_query
+      ? (Try parse request.target)
+       > (./ok action) action
+       > (./err _) (./reply (http_foot/value_error 'invalid_query 400))
     ? (equal[str] url "/w.js")
       | ./reply (http_response 200 weft/runtime "application/javascript")
     ? (equal[str] url "/style.css")
       | ./reply (http_response 200
           (http_foot/unbar (ReadFile "foil/style.css")) "text/css")
+    ? (equal[str] url "/debug.js")
+      | ./reply (http_response 200
+          (http_foot/unbar (ReadFile "foil/debug.js")) "application/javascript")
+    ? (equal[str] url "/debug.css")
+      | ./reply (http_response 200
+          (http_foot/unbar (ReadFile "foil/debug.css")) "text/css")
+    ? (equal[str] url "/debug-mash.js")
+      | ./reply (http_response 200
+          (http_foot/unbar (ReadFile "foil/.debug-assets/mash.js")) "application/javascript")
+    ? (equal[str] url "/debug-components.css")
+      | ./reply (http_response 200
+          (http_foot/unbar (ReadFile "foil/.debug-assets/components.css")) "text/css")
     ? (http_foot/route_is "/grove/install" url)
       ? !(equal[str] request.method "POST")
         | ./reply (http_driver/response 405 "POST required")
@@ -200,6 +457,10 @@
       | ./write pax (writ/poke (http_foot/form_record (? post "post" "edit") fields now)) back
     ? !(equal[str] request.method "GET")
       | ./reply (http_driver/response 405 "GET required")
+    ? (http_foot/route_is "/debug" url)
+      = pax (http_foot/target url.slice(6 url.len))
+      ? (eq_pith pax log_root) (http_foot/journal_query request.target)
+      | http_foot/debug_query request.target
     ? (http_foot/route_is "/frag" url)
       = prefix=path ['o]
         pax prefix.weld((http_foot/target url.slice(5 url.len)))
@@ -207,11 +468,18 @@
     | ./wait (http/req request.method url request.body (http_foot/target url))
 
   + header_end
+    ' The framing delimiter is fixed: compare its bytes without slicing
+    ' the remaining large request atom at every candidate offset.
     \ text=str
     ^ maybe[nat]
-    ? (http_foot/find (http_foot/crlf).cat(http_foot/crlf) text)
-     > (./some at) (./some (add at 4))
-     > .none .none
+    % i=nat 0
+    ^ maybe[nat]
+    ? (gt (add i 4) text.len) .none
+    ? !(eq text.at(i) 13) (_ i.inc)
+    ? !(eq text.at(i.inc) 10) (_ i.inc)
+    ? !(eq text.at((add i 2)) 13) (_ i.inc)
+    ? !(eq text.at((add i 3)) 10) (_ i.inc)
+    | ./some (add i 4)
   + content_length
     \ headers=str
     ^ nat
@@ -243,6 +511,29 @@
     ^ http_foot/request
     ; (error (http_foot/fault reason))
     | http_foot/request "" "" ""
+  + request_line_valid
+    ' Validate before splitting/packing a target ending in NUL, which
+    ' would otherwise lose that byte and alias a different request.
+    \ line=str
+    ^ bool
+    % i=nat 0
+    ? (eq i line.len) .true
+    = byte line.at(i)
+    ? ((lt byte 32) || (eq byte 127))
+      ? (? (eq byte 13) (eq i.inc line.len) .false) .true
+      .false
+    | _ i.inc
+  + request_chunk
+    ' Read returns a length-preserving high sentinel. Removing it into a
+    ' packed str would erase a terminal NUL before line validation. Reject
+    ' that already-unrepresentable input at each socket chunk boundary.
+    \ bytes=nat
+    ^ str
+    = length (wid bytes)
+    ? (? (gt length 1) (eq (load8 (sub length 2) bytes) 0) .false)
+      ; (error (http_foot/fault "NUL at request chunk boundary"))
+      ""
+    | http_foot/unbar bytes
   + read_request
     \ fd=nat
     ^ http_foot/request
@@ -255,7 +546,8 @@
       = length (http_foot/content_length input.slice(0 at))
       ? (ge input.len (add at length))
         = line (http_foot/split 10 input).at(0)
-          words (http_foot/split 32 (http_foot/trim line))
+        ? !(http_foot/request_line_valid line) (http_foot/bad_request "Invalid request target bytes")
+        = words (http_foot/split 32 (http_foot/trim line))
         ? !(eq words.len 3) (http_foot/bad_request "Malformed request line")
         ? !(equal[str] words.at(2) "HTTP/1.0")
           ? !(equal[str] words.at(2) "HTTP/1.1")
@@ -264,12 +556,12 @@
         | http_foot/request words.at(0) words.at(1) input.slice(at length)
       = ;bytes (Read fd 16384)
       ? (eq bytes 0) (http_foot/bad_request "Incomplete request body")
-      | _ input.cat((http_foot/unbar bytes))
+      | _ input.cat((http_foot/request_chunk bytes))
      > .none
       ? (gt input.len 65536) (http_foot/bad_request "Headers too large")
       = ;bytes (Read fd 16384)
       ? (eq bytes 0) (http_foot/bad_request "Incomplete request headers")
-      | _ input.cat((http_foot/unbar bytes))
+      | _ input.cat((http_foot/request_chunk bytes))
   + encode
     \ response=http_response
     ^ nat
@@ -285,9 +577,8 @@
     ^ nat
     = ;[hello caps] (Recv[nat] 0)
       foot caps.at(0)
-      ;request (Try http_foot/read_request fd)
-      response=http_response
-        ? request
+    = response=http_response
+        ? (Try http_foot/read_request fd)
          > (./err _) (http_driver/response 400 "Malformed HTTP request")
          > (./ok parsed)
           =   ;planned
@@ -323,12 +614,79 @@
     ^ nat
     ; (Send conn response)
     | CloseHandle conn
+  + journal_response
+    \ result=either[iota helm/journal_page]
+    ^ http_response
+    | http_foot/journal_response_with .none result
+  + journal_response_with
+    \ components=maybe[axal[myth]] result=either[iota helm/journal_page]
+    ^ http_response
+    ? result
+     > (./err reason)
+       | http_driver/response 500 (weft/cat2 "Journal read rejected: " (iota_show reason))
+     > (./ok page)
+       > (./some registry) components
+         | http_driver/response 503 "Grove debugger unavailable: publish /weft/debug/v1/page."
+       = body
+             | debugger/declared_page registry log_root
+               (page.view.run((\ version=saga (unpin version.myth))))
+               (axal/new[myth] .none) [] (./some page)
+       | http_response 200 body "text/html; charset=utf-8"
+  + debug_response
+    \ components=maybe[axal[myth]] result=either[iota debug_read/result]
+    ^ http_response
+    ? result
+     > (./err reason)
+      | http_foot/value_error reason (? (eq_iota reason 'epoch_conflict) 409 400)
+     > (./ok read)
+      > (./some registry) components
+        | http_driver/response 503 "Grove debugger unavailable: publish /weft/debug/v1/page."
+      = data (grove_debug_data read.target read.view read.versions read.operations .none
+          (? (is_log read.target) .false (explorer/writable read.target)) read.scope (./some read.paging))
+        body (debugger/render_declared registry data)
+      | http_response 200 body "text/html; charset=utf-8"
+  + debug_renderer
+    ' One renderer retains the immutable Grove registry, not a fresh actor
+    ' and transferred renderer closure per request. The foot/coordinator
+    ' remains free to acknowledge writes and deliver bounded reads.
+    \ components=maybe[axal[myth]] self=nat
+    ^ nat
+    % ignored=nat 0
+    = ;[result caps] (Recv[either[iota debug_read/result]] 0)
+      response
+        ? (Try (http_foot/debug_response components) result)
+         > (./ok ready) ready
+         > (./err _) (http_driver/response 500 "Debugger rendering failed")
+    ; (http_foot/reply caps.at(0) response)
+    | _ 0
+  + value_error
+    \ reason=iota status=nat
+    ^ http_response
+    | http_response status (str/to_atom (value_read/error_json reason)) "application/json; charset=utf-8"
+  + value_response
+    \ result=either[iota value_read/chunk]
+    ^ http_response
+    ? result
+     > (./err reason) (http_foot/value_error reason (value_read/status reason))
+     > (./ok chunk)
+       = ;body (str/to_atom (value_read/json chunk))
+       | http_response 200 body "application/json; charset=utf-8"
+  + physical_response
+    \ result=either[iota str]
+    ^ http_response
+    ? result
+     > (./err reason) (http_foot/value_error reason (physical_projection/status reason))
+     > (./ok body)
+       | http_response 200 (str/to_atom body) "application/json; charset=utf-8"
   + finish
     \ parent=nat binding=axal[saga] pending=row[http_foot/pending] queue=row[http_foot/ack]
     ^ [pending=row[http_foot/pending] queue=row[http_foot/ack]]
     % i=nat 0 left=row[http_foot/pending] [] acks=row[http_foot/ack] queue
     ? (eq i pending.len) [left acks]
     = item pending.at(i)
+    ? (maybe/is_some (dig_of item.key))
+      | _ i.inc left.snoc(item) acks
+    =
       response=maybe[http_response]
         ? binding.get([item.key])
          > (./some version) (http_driver/result (./known (unpin version.myth)))
@@ -342,12 +700,17 @@
   + run
     \ initial=feet/task/init self=nat
     ^ nat
+    | http_foot/run_with .none initial self
+  + run_with
+    \ components=maybe[axal[myth]] initial=feet/task/init self=nat
+    ^ nat
     = port=nat
         ? initial.ax.fil
          > (./some version) (unpin version.myth).nat_at(['port] 0)
         0
       ;fd (Listen port)
       ;pump (Spawn (http_foot/listener fd))
+      ;renderer (Spawn (http_foot/debug_renderer components))
     ; (SendCaps pump 0 [0])
     ; (CloseHandle pump)
     ; (Trace "HTTP foot listening" 0)
@@ -376,6 +739,87 @@
       ; (Send initial.parent (feet/gift/pass [key] (writ/make record)))
       | _ serial.inc pending.snoc((http_foot/pending key conn))
         queue.snoc((http_foot/ack/request key))
+     > (http_foot/action/journal before limit)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/journal serial before limit))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/value query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/value serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/physical query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/physical serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/debug query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/debug serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/debug request result)
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (SendCaps renderer result [item.conn])
+          ; (CloseHandle item.conn)
+          out
+      | _ serial left queue
+     > (feet/task/physical request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try http_foot/physical_response result)
+           > (./ok ready) ready
+           > (./err _) (http_foot/value_error 'read_failed 500)
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
+     > (feet/task/value request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try http_foot/value_response result)
+           > (./ok ready) ready
+           > (./err _) (http_foot/value_error 'read_failed 500)
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
+     > (feet/task/journal request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try (http_foot/journal_response_with components) result)
+           > (./ok ready) ready
+           > (./err _) (http_driver/response 500 "Journal rendering failed")
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
      > (./fact binding)
       = ;[left acks] (http_foot/finish initial.parent binding pending queue)
       | _ serial left acks

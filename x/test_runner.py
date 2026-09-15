@@ -103,6 +103,10 @@ def compiler_files():
 
 def inventory():
     data = json.loads((ROOT / 'test-inventory.json').read_text())
+    native_excluded = data.get('native_excluded', {})
+    for mod in native_excluded:
+        if not (ROOT / 'src/foil' / (mod + '.foil')).is_file():
+            raise ValueError('missing native fixture: ' + mod)
     suites = []
     registered = set()
     for group in data['groups']:
@@ -129,7 +133,8 @@ def inventory():
         mod = path.relative_to(ROOT / 'src/foil').with_suffix('').as_posix()
         if mod.startswith('tests/') or (mod.startswith('apps/') and path.stem == 'tests'):
             suites.append(dict(name='foil:' + mod, kind='native', target=mod,
-                               group='native', fast=True, timeout=900, category='foil', enabled=True))
+                               group='native', fast=mod not in native_excluded, timeout=900, category='foil',
+                               enabled=mod not in native_excluded, reason=native_excluded.get(mod, '')))
         if re.search(r"^\s*'\s*\?=", path.read_text(), re.M):
             suites.append(dict(name='doc:' + mod, kind='docs', target=mod,
                                group='doctests', fast=True, timeout=900, category='docs', enabled=True))
@@ -363,6 +368,7 @@ def main():
     wisp = str(Path(wisp).resolve())
     if not os.access(wisp, os.X_OK):
         parser.error('wisp unavailable; enter the dev shell or set WISP=/path/to/wisp')
+    (ROOT / '.check').mkdir(exist_ok=True)
     root = Path(tempfile.mkdtemp(prefix='run-', dir=ROOT / '.check'))
     started = time.monotonic()
     compiler = stage(wisp, args.fresh, args.timeout or 900)
