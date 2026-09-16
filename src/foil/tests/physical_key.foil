@@ -1,0 +1,142 @@
+- physical_key
+- testing
+
++ key_tests
+  + encoded
+    \ key=path
+    ^ str
+    ? (physical_key/encode key)
+     > (./ok text) text
+     > (./err _) "encoding-failed"
+  + roundtrip
+    \ key=path
+    ^ bool
+    ?> (./ok text) (physical_key/encode key) .false
+    ?> (./some decoded) (physical_key/decode text) .false
+    | eq_pith key decoded
+  + canonical
+    \ text=str
+    ^ bool
+    ?> (./some decoded) (physical_key/decode text) .false
+    ?> (./ok encoded) (physical_key/encode decoded) .false
+    | equal[str] text encoded
+  + too_large
+    \ key=path
+    ^ bool
+    ? (physical_key/encode key)
+     > (./err reason) (eq_iota reason 'key_too_large)
+    .false
+  + numbers
+    \ count=nat
+    ^ path
+    | (row/range 0 count).map (\ n=nat ($u n))
+  + auras
+    ' Raw payloads, not merely values admitted by the lexical codec.
+    ^ path
+    [($dm 0) ($dr 90001) ($ds (bex 80)) ($f 2) ($r 0)
+     ($rd 9221120237041090561) ($rs 2143289345) ($s 9)
+     ($ta 10) ($ts "a-b") ($tu 4259905) ($u (bex 256))
+     ($w 0) ($x 0)]
+  + all_zero
+    ^ path
+    [($dm 0) ($dr 0) ($ds 0) ($f 0) ($r 0) ($rd 0) ($rs 0)
+     ($s 0) ($ta 0) ($ts 0) ($tu 0) ($u 0) ($w 0) ($x 0)]
+  + identities
+    \ ignored=unit
+    ^ row[testing/check]
+    = auras key_tests/auras
+    [(testing/text "empty path is version only" "v1" (key_tests/encoded []))
+     (testing/text "frozen example" "v1/ts:617070/u:01"
+       (key_tests/encoded ['app ($u 1)]))
+     (testing/text "zero payload is empty hex" "v1/u:"
+       (key_tests/encoded [($u 0)]))
+     (testing/text "LE byte ordering preserves low zero byte" "v1/u:0001"
+       (key_tests/encoded [($u 256)]))
+     (testing/text "embedded NUL bytes are exact" "v1/tu:410041"
+       (key_tests/encoded [($tu 4259905)]))
+     (testing/nat "all14 aura payloads roundtrip" 1 (key_tests/roundtrip key_tests/auras))
+     (testing/nat "zero payload in every aura roundtrips" 1 (key_tests/roundtrip key_tests/all_zero))
+     (testing/nat "each aura alone roundtrips" 1
+       (auras.all((\ key=iota (key_tests/roundtrip [key])))))
+     (testing/nat "slashes and delimiters are payload bytes" 1
+       (key_tests/roundtrip [($ta "a/b") ($ts "/:v1") ($tu "%?&#")]))
+     (testing/nat "nonUTF8 bytes roundtrip" 1
+       (key_tests/roundtrip [($ta 255) ($ts 255) ($tu 255)]))
+     (testing/nat "80 segments preserve full identity" 1
+       (key_tests/roundtrip (key_tests/numbers 80)))
+     (testing/nat "empty path differs from a zero-valued segment" 0
+       (equal[str] (key_tests/encoded []) (key_tests/encoded [($u 0)])))
+     (testing/nat "aura identity does not collapse equal payloads" 0
+       (equal[str] (key_tests/encoded [($u 1)]) (key_tests/encoded [($f 1)])))]
+
+  + malformed
+    \ ignored=unit
+    ^ row[testing/check]
+    = rejected=row[str]
+        ["" "v0" "V1" "v1/" "/v1" "v1//u:01" "v1/u:01/"
+         "v1/u" "v1/u::01" "v1/:01" "v1/U:01" "v1/ud:01"
+         "v1/unknown:01" "v1/u:0" "v1/u:0A" "v1/u:gg"
+         "v1/u:+1" "v1/u: 1" "v1/u:00" "v1/u:0100"
+         "v1/u:0000" "v1/u:01?x" "v1/u:%30%31" "v1/tu:00"]
+      accepted=row[str] ["v1" "v1/u:" "v1/u:01" "v1/u:0001"
+        "v1/ta:" "v1/tu:ff" "v1/tu:410041" "v1/rd:010000000000f87f"]
+    [(testing/nat "noncanonical encodings are rejected" 1
+       (rejected.all((\ text=str !(maybe/is_some (physical_key/decode text))))))
+     (testing/nat "accepted encodings reencode identically" 1
+       (accepted.all(key_tests/canonical)))]
+
+  + budgets
+    \ ignored=unit
+    ^ row[testing/check]
+    = exact=path [($tu (bex 32736))]
+      too_wide=path [($tu (bex 32744))]
+      exact_text (key_tests/encoded exact)
+      too_long exact_text.cat("0")
+      indexes (row/range 0 2730)
+      min_segments=path indexes.map((\ n=nat ($u 0)))
+      min_text (key_tests/encoded min_segments)
+    [(testing/nat "exact8192 encoded bytes accepted" 8192 exact_text.len)
+     (testing/nat "maximum key roundtrips" 1 (key_tests/roundtrip exact))
+     (testing/nat "payload exceeding aggregate cap rejects honestly" 1
+       (key_tests/too_large too_wide))
+     (testing/nat "aggregate path cap not persegment only" 1
+       (key_tests/too_large exact.snoc(($u 0))))
+     (testing/nat "decoder rejects8193 bytes" 0
+       (maybe/is_some (physical_key/decode too_long)))
+     (testing/nat "2730 zero-valued segments meet exact8192 cap" 8192
+       min_text.len)
+     (testing/nat "too many segments reject even when all payloads zero" 1
+       (key_tests/too_large min_segments.snoc(($u 0))))]
+
+  + displays
+    \ ignored=unit
+    ^ row[testing/check]
+    = unsupported=row[path]
+        [[($rd 0)] [($rs 0)] [($ta "a/b")] [($ts "a-b")]
+         [($ta 10)] [($tu 4259905)] [($f 2)] [($tu 0)]
+         [($w 0)] [($x 0)]]
+      raw128=path [($tu (str/to_atom (str/repeat 128 "a")))]
+      raw129=path [($tu (str/to_atom (str/repeat 129 "a")))]
+    [(testing/text "root display" "/" (physical_key/display []).fall("absent"))
+     (testing/text "safe authored path display" "/app/1"
+       (physical_key/display ['app ($u 1)]).fall("absent"))
+     (testing/nat "partial lexical encodings never become display identities" 1
+       (unsupported.all((\ key=path !(maybe/is_some (physical_key/display key))))))
+     (testing/nat "32segment display allowed" 1
+       (maybe/is_some (physical_key/display (key_tests/numbers 32))))
+     (testing/nat "33segment display omitted, identity still works" 1
+       (? (maybe/is_some (physical_key/display (key_tests/numbers 33))) .false
+        (key_tests/roundtrip (key_tests/numbers 33))))
+     (testing/nat "128raw bytes display allowed" 1
+       (maybe/is_some (physical_key/display raw128)))
+     (testing/nat "129raw bytes display omitted, identity still works" 1
+       (? (maybe/is_some (physical_key/display raw129)) .false (key_tests/roundtrip raw129)))
+     (testing/nat "aggregate rawbyte display cap" 0
+       (maybe/is_some (physical_key/display raw128.snoc(($u 1)))))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "lossless structural identities" key_tests/identities)
+   (testing/case "strict canonical wire grammar" key_tests/malformed)
+   (testing/case "preflight wire budgets" key_tests/budgets)
+   (testing/case "optional safe display" key_tests/displays)]

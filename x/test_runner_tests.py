@@ -93,6 +93,17 @@ class ProtocolTests(unittest.TestCase):
             path.write_text('"FETCH-ORDER-read"\n"FETCH-ORDER-recv"\n')
             self.assertEqual(runner.report_log(path), path.read_text())
 
+    def test_external_template_uses_its_own_publication_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template = root / 'template-external'
+            template.mkdir()
+            (root / 'stage.lock').touch()
+            for name in ('data.mdb', 'pins.pack'):
+                (template / name).write_bytes(b'compiler-only-fixture')
+            runner.copy_template(template, root / 'copy')
+            self.assertEqual((root / 'copy/data.mdb').read_bytes(), b'compiler-only-fixture')
+
     def test_timeout_and_crash(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
@@ -117,6 +128,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('foil:tests/supervisor', names)
         self.assertIn('foil:tests/http_foot', names)
         self.assertFalse(any(name.startswith('helm-') for name in names))
+
+    def test_native_helpers_are_not_mistaken_for_suites(self):
+        suites = {s['name']: s for s in runner.inventory()}
+        for name in ('eden_srs', 'grove_backend', 'grove_debugger', 'grove_install', 'value_http'):
+            self.assertFalse(suites['foil:tests/' + name]['enabled'])
+            self.assertTrue(suites['foil:tests/' + name]['reason'])
 
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}

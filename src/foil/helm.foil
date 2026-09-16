@@ -5,11 +5,24 @@
 -  lain_types
 -  lain_peek
 -  lain_poke
+- value_read
+- physical_projection
+- debug_read
 
 +  helm
+  +  journal_page
+    '  One bounded physical /log snapshot at a captured sovereign epoch.
+    '  view contains only the displayed child keys, including keys whose
+    '  own record is absent or malformed. next is an exclusive epoch key.
+    : epoch=nat before=maybe[nat] limit=nat total=nat next=maybe[nat] view=axal[saga]
+
   +  card
     &  helm/card/install
        helm/card/peek
+       helm/card/journal
+       helm/card/value
+       helm/card/physical
+       helm/card/debug
        helm/card/step
     + install
       : source=path version=nat target=path
@@ -17,6 +30,14 @@
       : pax=path wit=writ
     +  peek
       : car=care cas=maybe[nat] pax=path
+    +  journal
+      : request=nat before=maybe[nat] limit=nat
+    + value
+      : request=nat query=value_read/request
+    + physical
+      : request=nat query=physical_read/request
+    + debug
+      : request=nat query=debug_read/request
 
   +  supervisor
     '  Trusted bootstrap requests carry a transferred reply capability.
@@ -27,6 +48,10 @@
       & helm/card/install
         helm/card/step
         helm/card/peek
+        helm/card/journal
+        helm/card/value
+        helm/card/physical
+        helm/card/debug
         helm/supervisor/register
     +  register
       '  Explicit bootstrap registration; duplicate or absent paths fail.
@@ -79,6 +104,40 @@
            out
         | out.put rel version
 
+    +  journal_key
+      \ entry=uon/kv[axal/k[tome]]
+      ^ bool
+      | maybe/is_some (dig_of entry.key)
+
+    +  journal
+      '  Read the index itself, not peek/.z or a reactive HTTP record.
+      '  Only limit+1 physical child links are selected; only displayed
+      '  children have their own history resolved. Descendants are never
+      '  hydrated. This function cannot mint a commit or journal entry.
+      \ before=maybe[nat] limit=nat s=sov
+      ^ either[iota helm/journal_page]
+      ? ((eq limit 0) || (gt limit 40)) (./err 'invalid_journal_limit)
+      = epoch s.top
+        source s.idx.dip(log_root)
+        bound=maybe[iota] before.run(dig_show)
+        selected source.kid.range_rev(bound limit.inc)
+        valid (selected.all(helm/supervisor/journal_key))
+      ? !valid (./err 'invalid_journal_key)
+      = count (? (lt selected.len limit) selected.len limit)
+        next=maybe[nat]
+          ? (gt selected.len limit) (dig_of selected.at(count.dec).key)
+          .none
+        root_version (ass/saga epoch (tome/hist source.fil))
+        view
+          % i=nat 0 out=axal[saga] (axal/new[saga] root_version)
+          ? (eq i count) out
+          = entry selected.at(i)
+            child (unpin entry.val.held)
+            version (ass/saga epoch (tome/hist child.fil))
+            node (axal/new[saga] version)
+          | _ i.inc out.set_kid(out.kid_put(entry.key node))
+      | ./ok (helm/journal_page epoch before limit source.kid.size next view)
+
     +  handle
       '  Namespace work stays pure; the loop below owns communication.
       \ cad=helm/card s=sov index=hive
@@ -93,6 +152,17 @@
        > (./peek car cas pax)
         [s index (feet/task/page pax
           (helm/supervisor/page car cas pax s))]
+       > (./journal request before limit)
+        [s index (feet/task/journal request
+          (helm/supervisor/journal before limit s))]
+       > (./value request query)
+        [s index (feet/task/value request (value_read/safe_read query s))]
+       > (./physical request query)
+        ' Only the fully forced bounded wire scalar crosses the mailbox.
+        [s index (feet/task/physical request
+          (physical_projection/safe_json query s))]
+       > (./debug request query)
+        [s index (feet/task/debug request (debug_read/safe_read query s))]
        > (./step pax wit)
         = [result next_index]
             | cycle_with index (task/vine pax wit) 0 8 s
@@ -208,6 +278,14 @@
             | helm/supervisor/advance card state index members
            > card=helm/card/peek
             | helm/supervisor/advance card state index members
+           > card=helm/card/journal
+            | helm/supervisor/advance card state index members
+           > card=helm/card/value
+            | helm/supervisor/advance card state index members
+           > card=helm/card/physical
+            | helm/supervisor/advance card state index members
+           > card=helm/card/debug
+            | helm/supervisor/advance card state index members
       ; (Send caps.at(0) answer)
       ; (helm/supervisor/close_caps caps)
       | _ next next_index joined
@@ -220,6 +298,10 @@
     & feet/task/init
       feet/task/fact
       feet/task/page
+      feet/task/journal
+      feet/task/value
+      feet/task/physical
+      feet/task/debug
       feet/task/ack
       t
     +  init
@@ -232,6 +314,17 @@
     +  page
       '  Answer to gift/peek, including absent or unknown paths.
       : pax=path axe=res[axal[saga]]
+    +  journal
+      '  Correlated, read-only bounded journal response.
+      : request=nat result=either[iota helm/journal_page]
+    + value
+      ' Correlated immutable physical slot bytes; no namespace work.
+      : request=nat result=either[iota value_read/chunk]
+    + physical
+      ' Already projected JSON, never the raw physical page or its pins.
+      : request=nat result=either[iota str]
+    + debug
+      : request=nat result=either[iota debug_read/result]
     +  ack
       '  Write result: none on success, some error on rejection.
       : err=maybe[pail]
@@ -242,6 +335,10 @@
       feet/gift/poke
       feet/gift/pass
       feet/gift/peek
+      feet/gift/journal
+      feet/gift/value
+      feet/gift/physical
+      feet/gift/debug
       t
     +  normalize
       '  The endpoint supplies the registered location, never the foot.
@@ -253,6 +350,14 @@
        > (./poke pax wit) (./some (helm/card/step pax wit))
        > (./pass pax wit) (./some (helm/card/step home.weld(pax) wit))
        > (./peek pax) (./some (helm/card/peek .y .none pax))
+       > (./journal request before limit)
+        | ./some (helm/card/journal request before limit)
+       > (./value request query)
+        | ./some (helm/card/value request query)
+       > (./physical request query)
+        | ./some (helm/card/physical request query)
+       > (./debug request query)
+        | ./some (helm/card/debug request query)
       .none
     + install
       : source=path version=nat target=path
@@ -265,3 +370,12 @@
     +  peek
       '  Read an absolute namespace path; answered by task/page.
       : pax=path
+    +  journal
+      '  Read physical /log keys without creating namespace work.
+      : request=nat before=maybe[nat] limit=nat
+    + value
+      : request=nat query=value_read/request
+    + physical
+      : request=nat query=physical_read/request
+    + debug
+      : request=nat query=debug_read/request

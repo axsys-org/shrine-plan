@@ -113,12 +113,12 @@
     '  Shared scanner; a nonempty run of NUL bytes still occupies a row entry.
     \ keep=bool sep=nat text=str
     ^ row[str]
-    % i=nat 0 start=nat 0 out=row[str] []
+    % i=nat 0 start=nat 0 out=list[str] .nil
     ? ((eq i text.len) || (eq text.at(i) sep))
       = next
-          ? (keep || (gt i start)) out.snoc(text.slice(start (sub i start)))
+          ? (keep || (gt i start)) (list/cons[str] text.slice(start (sub i start)) out)
           out
-      ? (eq i text.len) next
+      ? (eq i text.len) next.row.rev
       | _ i.inc i.inc next
     | _ i.inc start out
   +  ascii_lower
@@ -1241,6 +1241,30 @@
       hi  | _ n.r
       kv  | mop/kv[k v] n.key n.val
     lo.weld(hi.cons(kv))
+  +  range_after
+    '  At most limit entries, ascending by this map's comparator.
+    '  No cursor starts at the least key; some key admits only keys
+    '  strictly after it, including when that key is absent. A zero
+    '  limit never inspects the tree. Seek past excluded subtrees,
+    '  then stop as soon as the page fills: no tap or offset scan.
+    '  Ask for page-size + 1 for lookahead; continue from the last
+    '  displayed key, not the undisplayed lookahead key.
+    \ after=maybe[k] limit=nat tree=mop[k v lt]
+    ^ row[mop/kv[k v]]
+    ? (eq limit 0) []
+    > node=mop/node[k v lt] tree
+      []
+    = excluded
+        ? after
+         > .none .false
+         > (./some key) !(lt key node.key)
+    ? excluded (_ after limit node.r)
+    = me (_)
+      left (me after limit node.l)
+    ? (eq left.len limit) left
+    = out left.snoc((mop/kv[k v] node.key node.val))
+    ? (eq out.len limit) out
+    | out.weld (me .none (sub limit out.len) node.r)
   +  uno
     '  Merge b into a; meg arbitrates key collisions as
     '  (meg key old-from-a new-from-b).
@@ -1487,6 +1511,78 @@
        = me (_)
        | lm.kids.fold []
        \ acc w acc.weld((me (unpin w.held)))
+  +  range_rev
+    '  At most limit entries, descending by /lt_iota.  No cursor
+    '  starts at the greatest key; some key admits only keys strictly
+    '  below it, whether or not that key exists.  A zero limit does
+    '  not inspect the tree.  Ask for page-size + 1 for lookahead;
+    '  the last displayed key is the next page's exclusive cursor.
+    '  Route directly to the cursor's child, then visit earlier
+    '  siblings only until the limit is filled.  Never tap the tree
+    '  or discard an offset-sized prefix.  Cached zero-size limbs
+    '  skip subtrees emptied by lazy deletion.
+    \ before=maybe[iota] limit=nat t=bee[v]
+    ^ row[uon/kv[v]]
+    ? (eq limit 0) []
+    ? t
+     > lf=bee/leaf[v]
+       % n=nat lf.ents.len out=row[uon/kv[v]] []
+       ? ((eq n 0) || (eq out.len limit)) out
+       = e lf.ents.at(n.dec)
+       ? !(gt_bound before e.key)
+         | _ n.dec out
+       | _ n.dec out.snoc(e)
+     > lm=bee/limb[v]
+       ? (eq lm.sz 0) []
+       = me (_)
+         count
+           ? before
+            > .none lm.kids.len
+            > (./some key)
+              '  Equal separators start on their left: the right
+              '  child contains no key below this exclusive bound.
+              % i=nat 0
+              ? (eq i lm.seps.len) i.inc
+              ? !(lt_iota lm.seps.at(i) key) i.inc
+              | _ i.inc
+       % n=nat count out=row[uon/kv[v]] []
+       ? ((eq n 0) || (eq out.len limit)) out
+       = page | me before (sub limit out.len)
+                | unpin lm.kids.at(n.dec).held
+       | _ n.dec out.weld(page)
+  +  range_after
+    '  At most limit entries, ascending by /lt_iota.  No cursor
+    '  starts at the least key; some key admits only keys strictly
+    '  above it, including when the cursor is absent or deleted.
+    '  A zero limit does not inspect the tree.  Request page-size
+    '  + 1 for lookahead and continue after the last displayed key.
+    '  Seek directly to the cursor's child, then visit later siblings
+    '  only until the page is full.  No tap or offset-prefix discard.
+    '  Cached zero-size limbs skip lazily emptied subtrees; sparse
+    '  trees can still require visiting empty child links along the way.
+    \ after=maybe[iota] limit=nat t=bee[v]
+    ^ row[uon/kv[v]]
+    ? (eq limit 0) []
+    ? t
+     > lf=bee/leaf[v]
+       % i=nat 0 out=row[uon/kv[v]] []
+       ? ((eq i lf.ents.len) || (eq out.len limit)) out
+       = e lf.ents.at(i)
+       ? !(lt_bound after e.key)
+         | _ i.inc out
+       | _ i.inc out.snoc(e)
+     > lm=bee/limb[v]
+       ? (eq lm.sz 0) []
+       = me (_)
+         first
+           ? after
+            > .none 0
+            > (./some key) (bee/arm key lm.seps)
+       % i=nat first out=row[uon/kv[v]] []
+       ? ((eq i lm.kids.len) || (eq out.len limit)) out
+       = page | me after (sub limit out.len)
+                | unpin lm.kids.at(i).held
+       | _ i.inc out.weld(page)
   +  keys
     \ t=bee[v]
     ^ row[iota]

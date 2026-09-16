@@ -6,49 +6,94 @@ import os
 import re
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import test_runner
+from debug_runtime_helpers import startup_failed, verify_asset_build
+
+
+def runtime_exit_status(returncode, log_path):
+    """Keep a native child failure visible to people and calling tools."""
+    if returncode < 0:
+        number = -returncode
+        try:
+            name = signal.Signals(number).name
+        except ValueError:
+            name = 'unknown signal'
+        print(f'Wisp exited due to {name} (signal {number}). Log: {log_path}',
+              file=sys.stderr, flush=True)
+        return 128 + number
+    print(f'Wisp exited with status {returncode}. Log: {log_path}',
+          file=sys.stderr, flush=True)
+    return returncode
+
 
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port', type=int, default=8130)
 parser.add_argument('--check', action='store_true')
 parser.add_argument('--srs', action='store_true',
-                    help='Publish Grove SRS definitions and offer instance installation in the UI')
+                    help='Also publish the optional Grove SRS example')
+parser.add_argument('--debug', action='store_true',
+                    help='Start the Grove-declared debugger; SRS is opt-in with --srs')
 args = parser.parse_args()
 if not 1 <= args.port <= 65535:
     parser.error('--port must be between 1 and 65535')
 runtime = os.environ.get('WISP') or shutil.which('wisp') or str(root / 'wisp')
 if not os.access(runtime, os.X_OK):
     parser.error('Set WISP to a working runtime executable (see doc/actor-abort-investigation.md).')
-templates = list((root / '.check').glob('template-*'))
-if not templates:
-    parser.error('Run x/check once to create a bootstrap template.')
-template = max(templates, key=lambda p: p.stat().st_mtime)
+template = test_runner.stage(runtime, False, 900)
 work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
 (work / 'snap').mkdir()
 for name in ('data.mdb', 'pins.pack'):
     shutil.copyfile(template / name, work / 'snap' / name)
+source = root / 'src'
+if args.debug:
+    assets = Path(os.environ.get('DEBUG_OUTPUT_ROOT', root / '.check/debug-assets/foil'))
+    try:
+        build = verify_asset_build(assets)
+    except (RuntimeError, OSError) as error:
+        parser.error(str(error))
+    source = work / 'src'
+    shutil.copytree(root / 'src', source)
+    for relative in build['assets']:
+        target = source / 'foil' / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(assets / relative, target)
 url = f'http://127.0.0.1:{args.port}'
 log_path = work / 'out.log'
 print(f'Compiling Eden. Log: {log_path}', flush=True)
 with log_path.open('w') as log:
     process = subprocess.Popen(
-        [runtime, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
-        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+        [runtime, '--file-root', str(source), 'snap', 'root', '_'],
+        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True,
+        # Python ignores SIGPIPE. Preserve that disposition: this Wisp's
+        # native socket Write uses write(2), so a closed browser connection
+        # must become an EPIPE/PLAN error caught by http_foot's Try, not kill
+        # the whole namespace. This changes only this child, not the runtime
+        # installation or other running servers.
+        restore_signals=False)
     try:
-        entry = f'(eden:start-srs {args.port})' if args.srs else f'(eden:start {args.port} 0)'
-        process.stdin.write(f'(#bind eden (#module eden))\n{entry}\n')
+        name = 'start-debug-srs' if args.debug and args.srs else 'start-debug' if args.debug else 'start-srs'
+        entry = f'(eden:{name} {args.port})' if args.srs or args.debug else f'(eden:start {args.port} 0)'
+        process.stdin.write(f'(#bind eden (#module eden))\n(print ("EDEN-LAUNCH-RETURNED" (Try (lambda (ignored) {entry}) 0)))\n')
         process.stdin.flush()
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + (900 if args.srs or args.debug else 300)
         while True:
             output = log_path.read_text(errors='replace')
-            if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output or 'bind/listen failed' in output:
+            returncode = process.poll()
+            if returncode is not None:
+                print('Wisp stopped before the HTTP listener was ready.',
+                      file=sys.stderr, flush=True)
+                raise SystemExit(runtime_exit_status(returncode, log_path) or 1)
+            if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
                 raise RuntimeError(output[-5000:])
             if re.search(r'^"?HTTP foot listening"?$', output, re.MULTILINE):
                 try:
@@ -144,7 +189,7 @@ with log_path.open('w') as log:
             print('Eden e2e passed: Foil foot, explorer, edit/cull, readback, history, zoo, and assets.', flush=True)
         else:
             print('State lasts for this run. Ctrl-C stops the server.', flush=True)
-            process.wait()
+            raise SystemExit(runtime_exit_status(process.wait(), log_path))
     except KeyboardInterrupt:
         pass
     finally:
