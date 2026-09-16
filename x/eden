@@ -11,11 +11,31 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import test_runner
+from debug_runtime_helpers import startup_failed, verify_asset_build
+
+
+def runtime_exit_status(returncode, log_path):
+    """Keep a native child failure visible to people and calling tools."""
+    if returncode < 0:
+        number = -returncode
+        try:
+            name = signal.Signals(number).name
+        except ValueError:
+            name = 'unknown signal'
+        print(f'Wisp exited due to {name} (signal {number}). Log: {log_path}',
+              file=sys.stderr, flush=True)
+        return 128 + number
+    print(f'Wisp exited with status {returncode}. Log: {log_path}',
+          file=sys.stderr, flush=True)
+    return returncode
+
 
 from test_runner import stage, rvr_string
 from namespace_identity import parse_node_identity
@@ -75,6 +95,19 @@ if args.profile_boot:
 (work / 'snap').mkdir()
 for name in ('data.mdb', 'pins.pack'):
     shutil.copyfile(template / name, work / 'snap' / name)
+source = root / 'src'
+if args.debug:
+    assets = Path(os.environ.get('DEBUG_OUTPUT_ROOT', root / '.check/debug-assets/foil'))
+    try:
+        build = verify_asset_build(assets)
+    except (RuntimeError, OSError) as error:
+        parser.error(str(error))
+    source = work / 'src'
+    shutil.copytree(root / 'src', source)
+    for relative in build['assets']:
+        target = source / 'foil' / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(assets / relative, target)
 url = f'http://127.0.0.1:{args.port}'
 log_path = work / 'out.log'
 print(f'Compiling Eden. Log: {log_path}', flush=True)
@@ -117,7 +150,12 @@ with ExitStack() as cleanup, log_path.open('w') as log:
         deadline = time.monotonic() + args.startup_timeout
         while True:
             output = log_path.read_text(errors='replace')
-            if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output or 'bind/listen failed' in output:
+            returncode = process.poll()
+            if returncode is not None:
+                print('Wisp stopped before the HTTP listener was ready.',
+                      file=sys.stderr, flush=True)
+                raise SystemExit(runtime_exit_status(returncode, log_path) or 1)
+            if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
                 raise RuntimeError(output[-5000:])
             if bridge and bridge.error:
                 raise RuntimeError(f'Codex bridge failed: {bridge.error}; inspect {work / "codex.log"}')
@@ -257,7 +295,7 @@ with ExitStack() as cleanup, log_path.open('w') as log:
             print('Eden e2e passed: Foil foot, explorer, edit/cull, readback, history, zoo, and assets.', flush=True)
         else:
             print('State lasts for this run. Ctrl-C stops the server.', flush=True)
-            process.wait()
+            raise SystemExit(runtime_exit_status(process.wait(), log_path))
     except KeyboardInterrupt:
         pass
     finally:

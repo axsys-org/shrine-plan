@@ -1,0 +1,124 @@
+- shrine
+- value_read
+
+' Bounded physical selection, not a serialized debugger response. In
+' particular a slot pail can be arbitrarily large, and an assertion holds
+' a whole pinned record. Consumers must project bounded previews rather
+' than show/serialize this internal page. Cold pin loading is not bounded
+' by the number of selected entries. No x/y/z reinterpretation occurs.
++ physical_read
+  + request
+    : pax=path epoch=maybe[nat] collection=iota after=maybe[path] limit=nat
+  + node
+    ' Preserve unknown versus tombstone, and the actual assertion epoch.
+    ' The count is physical keys, including transparent/history-only nodes.
+    : assertion=maybe[ass] epoch=maybe[nat] children=nat
+  + entry
+    & physical_read/entry/child
+      physical_read/entry/slot
+    + child
+      : key=iota node=physical_read/node
+    + slot
+      ' A path-shaped opaque slot key, never a relative namespace path.
+      : key=path value=pail
+  + page
+    : pax=path epoch=nat collection=iota after=maybe[path] limit=nat total=nat
+      next=maybe[path] own=physical_read/node entries=row[physical_read/entry]
+
+  + lookup
+    ' Unlike dip, retain the distinction between an absent physical key
+    ' and an existing empty/transparent physical node. Never visit siblings.
+    \ pax=path index=axal[tome]
+    ^ maybe[axal[tome]]
+    ? (eq pax.len 0) (./some index)
+    ?> (./some child) index.kid_get(pax.at(0)) .none
+    | _ pax.drop(1) child
+
+  + describe
+    ' One history floor lookup. Do not unpin the record, read its slots,
+    ' enumerate care cases, evaluate metadata, or descend into children.
+    \ epoch=nat source=axal[tome]
+    ^ physical_read/node
+    = history (tome/hist source.fil)
+    ?> (./some entry) history.floor(($u epoch))
+      | physical_read/node .none .none source.kid.size
+    = [key assertion] entry
+    | physical_read/node (./some assertion) (dig_of key) source.kid.size
+
+  + record
+    \ node=physical_read/node
+    ^ res[pin[myth]]
+    ?> (./some assertion) node.assertion .unknown
+    ? assertion
+     > (ass/ker version) (./known version.myth)
+     > (ass/nul _) .null
+
+  + children
+    \ query=physical_read/request epoch=nat own=physical_read/node source=axal[tome]
+    ^ physical_read/page
+    = bound=maybe[iota] query.after.run((\ key=path key.at(0)))
+      selected source.kid.range_after(bound query.limit.inc)
+      count (? (lt selected.len query.limit) selected.len query.limit)
+      next=maybe[path]
+        ? (gt selected.len query.limit) (./some [selected.at(count.dec).key])
+        .none
+      entries
+        % i=nat 0 out=row[physical_read/entry] []
+        ? (eq i count) out
+        = entry selected.at(i)
+          node (physical_read/describe epoch (unpin entry.val.held))
+        | _ i.inc out.snoc((physical_read/entry/child entry.key node))
+    | physical_read/page query.pax epoch query.collection query.after query.limit
+        source.kid.size next own entries
+
+  + slots
+    \ query=physical_read/request epoch=nat own=physical_read/node record=myth
+    ^ physical_read/page
+    = selected record.range_after(query.after query.limit.inc)
+      count (? (lt selected.len query.limit) selected.len query.limit)
+      next=maybe[path]
+        ? (gt selected.len query.limit) (./some selected.at(count.dec).key)
+        .none
+      entries
+        % i=nat 0 out=row[physical_read/entry] []
+        ? (eq i count) out
+        = entry selected.at(i)
+        | _ i.inc out.snoc((physical_read/entry/slot entry.key entry.val))
+    | physical_read/page query.pax epoch query.collection query.after query.limit
+        record.size next own entries
+
+  + read
+    ' This first internal slice bounds traversal/selection only. HTTP
+    ' transport, preview/key byte budgets, and operation registry paging
+    ' are separate gates before the ordinary debugger can use this read.
+    ' Continuations use the current index only at the exact captured epoch.
+    ' Resolving old assertions from a newer index cannot recover old keys.
+    \ query=physical_read/request state=sov
+    ^ either[iota physical_read/page]
+    ? ((eq query.limit 0) || (gt query.limit 40)) (./err 'invalid_limit)
+    ? !((eq_iota query.collection 'children) || (eq_iota query.collection 'slots))
+      | ./err 'invalid_collection
+    ? !(value_read/physical query.pax) (./err 'derived_path)
+    = after_valid=bool
+        ? query.after
+         > .none .true
+         > (./some after)
+           ? (eq_iota query.collection 'children) (eq after.len 1)
+           .true
+    ? !after_valid (./err 'invalid_cursor)
+    = epoch_missing=bool
+        ? (maybe/is_some query.after) (maybe/is_none query.epoch)
+        .false
+    ? epoch_missing (./err 'epoch_required)
+    = epoch query.epoch.fall(state.top)
+    ? !(eq epoch state.top) (./err 'epoch_conflict)
+    ?> (./some source) (physical_read/lookup query.pax state.idx)
+      | ./err 'path_missing
+    = own (physical_read/describe epoch source)
+    ? (eq_iota query.collection 'children)
+      | ./ok (physical_read/children query epoch own source)
+    ? (physical_read/record own)
+     > .unknown (./err 'record_missing)
+     > .null (./err 'record_deleted)
+     > (./known held)
+       | ./ok (physical_read/slots query epoch own (unpin held))

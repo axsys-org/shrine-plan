@@ -148,6 +148,17 @@ class ProtocolTests(unittest.TestCase):
             path.write_text('"FETCH-ORDER-read"\n"FETCH-ORDER-recv"\n')
             self.assertEqual(runner.report_log(path), path.read_text())
 
+    def test_external_template_uses_its_own_publication_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template = root / 'template-external'
+            template.mkdir()
+            (root / 'stage.lock').touch()
+            for name in ('data.mdb', 'pins.pack'):
+                (template / name).write_bytes(b'compiler-only-fixture')
+            runner.copy_template(template, root / 'copy')
+            self.assertEqual((root / 'copy/data.mdb').read_bytes(), b'compiler-only-fixture')
+
     def test_timeout_and_crash(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
