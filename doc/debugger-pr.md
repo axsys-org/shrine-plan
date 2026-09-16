@@ -63,7 +63,8 @@ Artifacts remain after shutdown. Never restart a user's preview to run tests.
 For an explicit port, `python3 x/eden --debug --port 8140` uses the same staged
 native assets and a compiler-only snapshot; add `--srs` for the example app.
 `--srs` alone retains the original SRS explorer, not the debugger. `/ns` is the
-legacy explorer. `/debug` requires a published Grove page and returns 503 if
+legacy explorer. `/debug` requires the installed `/app/debug/page` view (from
+the `/gov/debug` template) and returns 503 if
 it is missing. There is no legacy browser build; `--legacy` is rejected.
 
 ## Paired PR order
@@ -71,7 +72,7 @@ it is missing. There is no legacy browser build; `--legacy` is rejected.
 1. **Mash:** reusable tree/path-row, overlay, tooltip, menu, scrollbar, triptych,
    icon and semantic-token contracts with their tests and catalogue examples.
    Keep debugger-specific namespace policy out of component implementations.
-2. **Shrine:** Grove declarations, generic Weft fragment bridge, opt-in debugger
+2. **Shrine:** Grove application template, generic installed Weft/Tack adapter, opt-in debugger
    data contract, namespace HTTP adapter, binding code and verification tools.
    Link the Mash PR and pin its exact resulting commit in
    `debug-dependencies.json` before treating this as a release build.

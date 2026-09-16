@@ -1,6 +1,7 @@
 # Namespace-native Grove debugger
 
-Branch: `debug-prototype`. Served at `/debug`; `/ns` remains the original explorer.
+Served at `/debug`; `/ns` remains the original explorer. Definitions live at
+`/gov/debug`, with an installed application at `/app/debug`.
 
 Current build, architecture and PR gates: [Debugger PR guide](debugger-pr.md).
 Performance changes and remaining boundaries: [Debugger performance](debugger-performance.md).
@@ -43,11 +44,12 @@ application purpose from a generic record-kind sentence.
 
 ## Component-first interface
 
-The v1 debugger is declared in `src/grove/debugger.grove` and published under
-`/weft/debug/v1` by `x/eden --debug` (also enabled by `--srs`). Its page, shell,
-inspector and HTML response use real Grove types, norms and sewn values. The
-[declaration audit](debugger-declaration-audit.md) distinguishes this route from
-compatibility code for namespaces that were compiled before the migration.
+The debugger is declared in `src/grove/debugger.grove` and its sibling modules.
+Its application slots, inspection role and instance tree are declared in
+`src/grove/debugger/application.grove`. `x/eden --debug` (also enabled by `--srs`)
+publishes `/gov/debug` and instantiates its template at `/app/debug`. Page, shell,
+inspector and HTML response use real Grove types, norms and sewn values. See the
+[declaration audit](debugger-declaration-audit.md) for the request-local adapter boundary.
 
 Newly compiled namespaces emit `#debug-main[data-debug-fragment="inspect"]` as
 the complete primary inspection document. The published Grove page owns its heading,
@@ -55,8 +57,8 @@ lore, semantic content, slot partition, child destinations, operation slots,
 and implementation disclosures. Mash's attributes own accordion, path-preview,
 form-label, overflow-mask, and scroll behavior; application initialization does
 not replace this fragment. `document-fragment.js` connects namespace value and
-lazy child reads without mirroring component open state. The old document
-reconstruction branch remains solely for already-running older kernels.
+lazy child reads without mirroring component open state. There is no legacy
+document reconstruction fallback in this build.
 
 Mounted records carrying a typed `mani` in their `pact` slot lead with a Manifest
 section: name and authored lore, declared kooks, seed records with inlined Mash

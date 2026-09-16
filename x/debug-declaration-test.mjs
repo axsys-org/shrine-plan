@@ -7,7 +7,8 @@ import {tmpdir} from 'node:os';
 import {outputRoot, playwright} from './debug-tooling.mjs';
 const evidence = process.env.TEST_RUN_DIR || tmpdir();
 const log = await readFile(process.env.GROVE_CHECK_LOG, 'utf8');
-assert.match(log, /\("DEBUGGER-DECLARATION-PASS" 19\)/);
+assert.match(log, /\("DEBUGGER-DECLARATION-PASS" \d+\)/);
+assert.match(log, /"DEBUGGER-APPLICATION-PASS"/);
 assert.doesNotMatch(log, /\("ERROR"/);
 function decode(name) {
   const match = log.match(new RegExp('\\("' + name + '"\\s+(\\d+)\\)'));

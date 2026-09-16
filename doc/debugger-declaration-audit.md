@@ -1,12 +1,19 @@
 # Debugger declaration boundary
 
-The debugger UI is declared in Grove, published under `/weft/debug/v1`, and
-rendered by calling its real Weft sewn value. This is not a parallel JavaScript
-renderer dressed in Mash tags.
+The debugger definitions are published under `/gov/debug`, including a reusable
+Grove template. An instance is installed at `/app/debug` through the same
+`grove_install/instantiate` path as SRS. Its `/page` tree declares `weft: %/page`
+and an instance-relative `tack` to `/input`; its title and head assets are data
+on that installed view. This supersedes the earlier renderer-only registry.
 
 ## Ownership
 
-- `src/grove/debugger.grove`: typed page, composition and inspector contracts.
+- `src/grove/debugger/application.grove`: inspection slots, codecs and role.
+  Optional page/cursor metadata is separate from the
+  selected records, target, version metadata, operation list and presentation scope.
+- `src/grove/debugger.grove`: page/inspector norms and sewn transformations.
+- `src/grove/debugger/instance.grove`: concrete instance seeds, declared after
+  their norms and sewn transformations.
 - `src/grove/debugger/chrome.grove`: shell, sidebar, menus and named templates.
 - `src/grove/debugger/presentation.grove`: Weft formatting helpers.
 - `src/grove/debugger/model.grove`: namespace presentation data interpretation.
@@ -15,9 +22,15 @@ renderer dressed in Mash tags.
   compilation unit. It does not generate HTML or select a host renderer.
 - `grove_ui_runtime.foil` is the reusable fragment/record bridge. Default Grove
   compilation uses the role prelude; UI is an explicit host choice.
-- `debugger_contract.foil` holds this application's typed input carrier. Only
-  the debugger host opts into it. General Grove compilation does not import it.
-- `web.foil` owns hydration, typed transport data, HTTP framing and assets.
+- `grove_app.foil` captures an installed view's real weft/tack pins and uses the
+  sewn input norm's stored role schema to project named request inputs. The sewn
+  transformation still checks both norms; malformed inputs cannot bypass them.
+- `debugger_contract.foil` holds internal transport carriers and explicit leaf
+  wrappers. The aggregate is no longer a single opaque `/data` application slot.
+  Only the debugger host opts into these codecs.
+- `web.foil` adapts finite inspection results to named inputs and HTTP framing.
+  It no longer chooses a `page` entry from a captured component registry or
+  chooses the application stylesheets/scripts.
   A missing published debugger returns 503; it never silently renders the old UI.
 - Mash owns Web Component implementation, public props, interaction primitives,
   focus/ARIA contracts, semantic tokens and catalogue recipes.
@@ -43,6 +56,21 @@ normal compiler separately, builds real Mash source with its pinned package
 manager, and exercises Mash-only/desktop/dark/touch/exact-case fixtures without
 contacting a live namespace. Missing declarations must fail without enhancement.
 Real HTTP verification is a separate, manifest-owned disposable runtime test.
+
+## Request-local state and current limits
+
+The installed `/input` is a valid empty inspection. Each HTTP response projects
+its own finite selected data onto that input in memory, without writing a
+navigation event or advancing the namespace epoch. It does not bind the input to
+the inspected namespace root with an unbounded y/z dependency. Saved paths and
+browser history remain client-local preferences, not shared sovereign state.
+
+The generic adapter currently supports own-record input norms and HTML output;
+it is not a universal Grove application server, reactive binding mechanism, or
+capability sandbox. It captures a view for the server lifetime. Updating an
+installed declaration does not hot-swap an already captured renderer. This
+application restructuring and the newer namespace-runtime API port are separate
+verification gates; no rebase compatibility is implied by an app test passing.
 
 Earlier findings and migration notes are local-only archives; this document
 and the PR guide describe the supported declaration boundary.

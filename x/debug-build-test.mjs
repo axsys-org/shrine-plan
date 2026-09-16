@@ -19,7 +19,13 @@ assert.doesNotMatch(text, /beginStylesheetHandoff|__DEBUG_STYLE_|createTooltips/
 const host = await readFile(resolve(root, 'src/foil/web.foil'), 'utf8');
 const debuggerHost = host.slice(host.indexOf('+  debugger\n'), host.indexOf('+  zoo\n'));
 assert.doesNotMatch(debuggerHost, /debug_model\/|web_style\/css|page_with_bundle/);
-assert.match(debuggerHost, /weft\/page_with_assets/);
+assert.match(debuggerHost, /grove_app\/document/);
+assert.doesNotMatch(debuggerHost, /href=|script\[src=|components\.dip/);
+const app = await readFile(resolve(root, 'src/grove/debugger/application.grove'), 'utf8');
+assert.match(app, /inspection =\s+@role/);
+const instance = await readFile(resolve(root, 'src/grove/debugger/instance.grove'), 'utf8');
+assert.match(instance, /"\/page" =\s+@tree/);
+assert.match(instance, /tack: '@\/y\/%\/input/);
 const registry = await readFile(resolve(mashRoot(),'packages/components/src/icon/carbon-icons.generated.ts'),'utf8');
 const names = new Set([...registry.matchAll(/^\s+"([^"]+)": \{/gm)].map(match=>match[1]));
 const icons = await readFile(resolve(root,'src/foil/debug/icons.js'),'utf8');
