@@ -24,6 +24,7 @@ assert.doesNotMatch(document, /href="\/style\.css"|<style\b/);
 assert.match(document, /href="\/debug-components\.css"/);
 assert.match(document, /href="\/debug\.css"/);
 assert.doesNotMatch(shell + details, /x-bad-selector/);
+assert.match(shell, /class="debug-shell"[^>]*data-mash-size="compact"/, 'Grove owns the coordinated Mash density');
 assert.doesNotMatch(shell, /id="wb-rendered"|class="wb-render-frame"|<iframe\b/, 'no retired Preview declaration');
 for (const name of ['namespace-row', 'page-row', 'path-segment', 'hover-myth', 'button', 'value-window']) assert.ok(shell.includes('id="debug-template-' + name + '"'), name);
 const assets = new Map(await Promise.all([
