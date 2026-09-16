@@ -29,8 +29,11 @@ renderer dressed in Mash tags.
 browser-local preferences are sovereign namespace state. The browser's retired
 renderer and compatibility build have been removed. A build-time check rejects any application `createElement`
 call; Mash's own implementation is intentionally outside that restriction.
-Older Foil presentation helpers still have isolated semantic tests; they are
-not a runtime fallback for a missing published Grove declaration.
+The duplicate Foil debugger renderer and model are removed. Semantic tests in
+`src/grove/tests/debugger.grove` import the actual published Grove modules.
+Toolbar hints are declared `ui-tooltip` compositions, not a document-wide
+JavaScript controller. The debugger loads only its own CSS and Mash's recipe;
+it has no legacy `/style.css` fallback or stylesheet handoff machinery.
 
 ## Evidence and release gates
 

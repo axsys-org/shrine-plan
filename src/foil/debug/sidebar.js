@@ -7,14 +7,6 @@ const isPath = path => typeof path === 'string' && path.startsWith('/') && path.
   !path.split('/').some(segment => segment === '.' || segment === '..');
 const PAGE_SIZE = 60;
 const RECENT_LIMIT = 30;
-const PLACES = [
-  { path: '/', label: 'Namespace', glyph: 'branch' },
-  { path: '/app', label: 'Applications', glyph: 'record' },
-  { path: '/gov', label: 'Groves', glyph: 'subtree' },
-  { path: '/weft', label: 'Components', glyph: 'roots' },
-  { path: '/log', label: 'Activity', glyph: 'activity' },
-  { path: '/sys', label: 'System', glyph: 'settings' },
-];
 const kindGlyph = kind => {
   if (kind === 'record') return 'record';
   if (/(?:journal|event|request)/.test(kind)) return 'activity';
@@ -42,17 +34,11 @@ function orderedChildren(view) {
 export function createSidebar({ initialView, currentPath, navigate, toggleSaved, debugURL, visitURL, closeSidebar, report, read }) {
   const host = document.querySelector('#debug-sidebar');
   const input = document.querySelector('#debug-filter');
-  function control(id, label, glyph, action) {
+  function control(id, action) {
     const result = host.querySelector('#' + id);
     if (!result) throw new Error('Missing declared debugger control: ' + id);
-    result.id = id;
     if (action) result.addEventListener('click', action);
     return result;
-  }
-  function instantiate(name) {
-    const template = document.querySelector('#debug-template-' + name);
-    if (!template?.content?.firstElementChild) throw new Error('Missing Grove row declaration: ' + name);
-    return template.content.firstElementChild.cloneNode(true);
   }
   const preferencesKey = 'shrine-debug.sidebar.v2';
   const cache = new BoundedCache(128, 30000, [[initialView.path, initialView]]);
@@ -79,7 +65,7 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     catch { /* Page saving reports storage availability through navigation. */ }
   }
   function pathLabel(path, title) {
-    const label = instantiate('path-label');
+    const label = declaredTemplate('path-label');
     label.setAttribute('path', path);
     const text = label.querySelector('ui-label'); text.textContent = title; text.text = title;
     return label;
@@ -92,10 +78,9 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     label.highlight = text.toLocaleLowerCase().length === text.length &&
       query.toLocaleLowerCase().length === query.length ? query : '';
   }
-  function section(name, title, glyph, contentId) {
+  function section(name, contentId) {
     const section = host.querySelector('#debug-section-' + name);
-    section.id = 'debug-section-' + name; section.value = name; section.title = title; section.open = preferences[name];
-    section.setAttribute('heading-level', '2');
+    section.open = preferences[name];
     const content = section.querySelector('#' + contentId);
 
     section.addEventListener('ui-accordion-item-change', event => {
@@ -107,19 +92,10 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     return { section, content };
   }
 
-  const composer = host.querySelector('#debug-filter-composer'); composer.id = 'debug-filter-composer'; composer.slot = 'search';
-  composer.setAttribute('size', 'small'); composer.setAttribute('touch-target', '');
-  const places = host.querySelector('#debug-root-menu'); places.id = 'debug-root-menu';
-  places.slot = 'prefix';
-  places.setAttribute('label', 'Namespace places'); places.setAttribute('density', 'compact');
-  places.setAttribute('placement', 'bottom'); places.setAttribute('align', 'start');
-  const search = control('debug-root-toggle', 'Choose namespace place', 'search'); search.slot = 'trigger';
-  search.setAttribute('size', 'small');
+  const places = host.querySelector('#debug-root-menu');
 
-  for (const place of PLACES) {
-    const choice = [...places.querySelectorAll('ui-menu-item')].find(item => item.getAttribute('value') === place.path);
-    choice.value = place.path;
-    choice.href = debugURL(place.path);
+  for (const choice of places.querySelectorAll('ui-menu-item[value]')) {
+    const path = choice.getAttribute('value');
 
     // Keep native link gestures intact. Selection events do not carry the
     // original pointer modifiers and cannot decide whether to route this tab.
@@ -127,7 +103,7 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
       event.preventDefault(); event.stopPropagation();
       if (state.busy) return;
-      if (await navigate(place.path)) {
+      if (await navigate(path)) {
         input.value = ''; filter();
         // Places navigate the real tree, not a second hard-coded hierarchy.
         sections.get('tree').open = true; preferences.tree = true; persist();
@@ -136,51 +112,34 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       }
     });
   }
-  input.slot = 'control'; input.setAttribute('label', 'Filter loaded paths');
-  input.setAttribute('size', 'inherit');
-  input.setAttribute('autocomplete', 'off'); input.placeholder = 'Filter paths…';
-  const clear = control('debug-filter-clear', 'Clear path filter', 'close', () => { input.value = ''; filter(); input.focus(); });
-  clear.setAttribute('size', 'small');
-  clear.id = 'debug-filter-clear'; clear.slot = 'suffix';
+  const clear = control('debug-filter-clear', () => { input.value = ''; filter(); input.focus(); });
 
-  const container = host.querySelector('#debug-sidebar-sections'); container.id = 'debug-sidebar-sections';
-  // Set the policy before mounting remembered open items; default single mode
-  // must not collapse another section during its initial slot synchronization.
-  container.setAttribute('mode', 'multiple'); container.setAttribute('size', 'compact');
-  container.setAttribute('variant', 'quiet');
-  const savedSection = section('saved', 'Saved', 'record', 'debug-saved');
-  const recentSection = section('recent', 'Recent', 'clock', 'debug-history');
-  const treeSection = section('tree', 'Tree', 'branch', 'debug-children');
+  const savedSection = section('saved', 'debug-saved');
+  const recentSection = section('recent', 'debug-history');
+  const treeSection = section('tree', 'debug-children');
 
-  const toolbar = host.querySelector('#debug-tree-toolbar'); toolbar.id = 'debug-tree-toolbar';
-  const actions = host.querySelector('#debug-tree-actions'); actions.id = 'debug-tree-actions';
-  actions.setAttribute('label', 'Namespace tree actions');
-  actions.setAttribute('data-mash-size', 'small');
-  const rootLabel = host.querySelector('#debug-tree-root'); rootLabel.id = 'debug-tree-root';
-  const reset = control('debug-tree-namespace', 'Browse entire namespace', 'back', () => setRoot('/'));
-  reset.id = 'debug-tree-namespace';
-  const collapse = control('debug-tree-collapse', 'Collapse all branches', 'branch', () => {
+  const rootLabel = host.querySelector('#debug-tree-root');
+  const reset = control('debug-tree-namespace', () => setRoot('/'));
+  const collapse = control('debug-tree-collapse', () => {
     expanded.clear(); expanded.add(rootPath);
     tree.querySelectorAll('ui-tree-item').forEach(item => {
       item.expanded = item.dataset.path === rootPath;
     });
     persist();
   });
-  collapse.id = 'debug-tree-collapse';
-  const refresh = control('debug-tree-refresh', 'Refresh tree root', 'live', () => {
+  const refresh = control('debug-tree-refresh', () => {
     cache.delete(rootPath);
     const item = tree.querySelector('ui-tree-item');
     if (item) { expanded.add(rootPath); item.expanded = true; void load(item, true); }
   });
-  refresh.id = 'debug-tree-refresh';
-  const save = control('debug-save', 'Save current page', 'bookmark', () => toggleSaved());
+  const save = control('debug-save', () => toggleSaved());
   for (const control of [reset, collapse, refresh, save]) control.setAttribute('size', 'small');
 
-  const graph = host.querySelector('#debug-path-tree'); graph.id = 'debug-path-tree'; graph.setAttribute('variant', 'namespace');
-  const tree = graph.querySelector('ui-tree'); tree.slot = 'tree'; tree.setAttribute('label', 'Namespace hierarchy');
+  const graph = host.querySelector('#debug-path-tree');
+  const tree = graph.querySelector('ui-tree');
   tree.selectionFollowsFocus = false;
 
-  const empty = host.querySelector('#debug-filter-empty'); empty.id = 'debug-filter-empty'; empty.hidden = true;
+  const empty = host.querySelector('#debug-filter-empty');
 
   function updateCounts() {
     const phrase = (number, noun) => number + ' ' + noun + (number === 1 ? '' : 's');
@@ -223,10 +182,8 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     bookmark.title = '';
   }
   function makeItem(path) {
-    const item = instantiate('namespace-row');
+    const item = declaredTemplate('namespace-row');
     item.dataset.path = path; item.value = path; item.path = path; item.kind = 'folder'; item.size = 'small';
-    item.setAttribute('activation', 'split');
-    item.setAttribute('actions-display', 'overlay');
     item.previewOpen = false;
     item.title = path === rootPath ? (path === '/' ? 'Namespace' : path.split('/').at(-1)) : path.split('/').at(-1);
     item.expanded = expanded.has(path);
@@ -246,7 +203,6 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       event.stopPropagation();
       toggleSaved(path);
     });
-    bookmark.setAttribute('size', 'small');
     bookmark.querySelector('ui-icon')?.classList.remove('wb-icon');
     bookmark.slot = 'actions'; bookmark.classList.add('debug-bookmark-toggle');
     item.dataset.statusId = 'debug-node-status-' + (++statusId);
@@ -481,9 +437,8 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     renderTree(); renderPages(); persist();
   }
   function pageRow(path, savedPage) {
-    const row = instantiate('page-row'); row.dataset.path = path;
+    const row = declaredTemplate('page-row'); row.dataset.path = path;
     const link = row.querySelector('ui-link'); link.href = debugURL(path);
-    link.setAttribute('variant', 'quiet'); link.setAttribute('size', 'small');
     link.label = path;
     const title = path === '/' ? 'Namespace' : path.split('/').at(-1);
     const label = link.querySelector('ui-label'); label.textContent = title; label.text = title;
@@ -504,7 +459,6 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       const remove = row.querySelector('ui-button');
       remove.setAttribute('aria-label', 'Unsave ' + path);
       remove.addEventListener('click', () => toggleSaved(path));
-      remove.setAttribute('size', 'small');
 
     } else row.querySelector('ui-button').remove();
     return row;
@@ -627,6 +581,7 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       save.disabled = state.busy;
       save.setAttribute('aria-pressed', String(state.saved.includes(state.currentPath)));
       save.setAttribute('aria-label', state.saved.includes(state.currentPath) ? 'Unsave current page' : 'Save current page');
+      save.parentElement.label = save.getAttribute('aria-label');
       save.title = '';
       if (rootPath !== '/' && (!state.saved.includes(rootPath) || !containsPath(rootPath, state.currentPath))) {
         rootPath = '/'; renderTree(); persist();

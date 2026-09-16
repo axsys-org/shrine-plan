@@ -21,15 +21,6 @@ execFileSync(pnpm, ['--filter', '@mash/catalog', 'run', 'build:iife'], {cwd:mash
 const {build} = esbuild();
 const outputs = new Map();
 
-// Match the JS enhancement to the CSS that was built with it. A link existing
-// (or a different cached build loading) is not proof that replacement is ready.
-function withReadiness(source, name) {
-  const footer = new RegExp('\\n/\\* shrine-debug stylesheet readiness \\*/\\n:root \\{ --shrine-debug-' + name + '-ready: asset-[a-f0-9]{16}; \\}\\n?$');
-  const css = source.replace(footer, '');
-  const version = 'asset-' + createHash('sha256').update(css).digest('hex').slice(0, 16);
-  return { version, css: css + '\n/* shrine-debug stylesheet readiness */\n:root { --shrine-debug-' + name + '-ready: ' + version + '; }\n' };
-}
-
 let componentCSS;
 
 // --components is accepted for old callers; components are now always built.
@@ -48,19 +39,16 @@ let componentCSS;
   componentCSS = css.join('\n');
   outputs.set(resolve(outputRoot, '.debug-assets/mash.js'), await readFile(resolve(mash, 'apps/catalog/dist/mash.js')));
 }
-const components = withReadiness(componentCSS, 'components');
 const compiledCSS = await build({ entryPoints: [resolve(root, 'src/foil/debug/styles.css')], outfile: resolve(root, 'src/foil/debug.css'), bundle: true, write: false, target: 'es2022', logLevel: 'info' });
-const app = withReadiness(compiledCSS.outputFiles[0].text, 'app');
 const compiledJS = await build({
   entryPoints: [resolve(root, 'src/foil/debug/native.js')], outfile: resolve(root, 'src/foil/debug.js'),
   bundle: true, write: false, format: 'iife', target: 'es2022', logLevel: 'info', minifySyntax:true, treeShaking:true,
-  define: { __DEBUG_STYLE_APP__: JSON.stringify(app.version), __DEBUG_STYLE_COMPONENTS__: JSON.stringify(components.version) },
 });
 if (/\bcreateElement(?:NS)?\s*\(/.test(compiledJS.outputFiles[0].text)) {
   throw new Error('Native application bundle contains a DOM factory; declare its UI in Grove.');
 }
-outputs.set(resolve(outputRoot, '.debug-assets/components.css'), components.css);
-outputs.set(resolve(outputRoot, 'debug.css'), app.css);
+outputs.set(resolve(outputRoot, '.debug-assets/components.css'), componentCSS);
+outputs.set(resolve(outputRoot, 'debug.css'), compiledCSS.outputFiles[0].contents);
 outputs.set(resolve(outputRoot, 'debug.js'), compiledJS.outputFiles[0].contents);
 outputs.set(resolve(outputRoot, 'style.css'), await readFile(resolve(root, 'src/foil/style.css')));
 const after = await mashProvenance(process.argv.includes('--release'));
@@ -68,12 +56,12 @@ if (after.sourceSha256 !== provenance.sourceSha256 || after.revision !== provena
 outputs.set(resolve(outputRoot, 'build.json'), JSON.stringify({mode:'grove', mash:provenance,
   assets:Object.fromEntries([...outputs].map(([path,body]) => [path.slice(outputRoot.length+1),createHash('sha256').update(body).digest('hex')]))}, null,2)+'\n');
 
-// Prepare all outputs before replacing any. Each replacement is atomic; mixed
-// asset requests during a build retain legacy styling through the version gate.
+// Prepare all outputs before replacing any. Each file replacement is atomic.
+// Live previews serve sealed asset snapshots, not this mutable build directory.
 await mkdir(resolve(outputRoot, '.debug-assets'), { recursive: true });
 for (const [path, contents] of outputs) {
   const temporary = path + '.' + randomUUID() + '.tmp';
   await writeFile(temporary, contents);
   await rename(temporary, path);
 }
-console.log('Debugger assets:', outputRoot, '\nStyles:', app.version, components.version);
+console.log('Debugger assets:', outputRoot);

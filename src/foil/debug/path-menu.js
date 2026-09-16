@@ -12,10 +12,6 @@ export function createPathMenu({resolvePath, report = () => {}}) {
   if (typeof resolvePath !== 'function') throw new TypeError('Path actions need a canonical target resolver.');
   const declared = document.querySelector('[data-grove-contract="debugger/v1"]');
   const menu = declared.querySelector('#wb-path-menu');
-  menu.id = 'wb-path-menu';
-  menu.setAttribute('density', 'compact');
-  menu.setAttribute('sizing', 'content');
-  menu.setAttribute('label', 'Path actions');
   const commands = new Map();
   for (const value of ['path', 'link']) {
     commands.set(value, menu.querySelector('[value="' + value + '"]'));
@@ -23,7 +19,6 @@ export function createPathMenu({resolvePath, report = () => {}}) {
   // The portable clipboard API owns platform support, fallback and errors.
   // Its hidden button is not another command or a nested focus stop.
   const clipboard = declared.querySelector('#wb-path-clipboard');
-  clipboard.hidden = true; clipboard.setAttribute('aria-hidden', 'true');
 
   let current = null, destroyed = false, copying = false;
   const observer = new MutationObserver(() => {

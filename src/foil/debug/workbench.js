@@ -1,13 +1,11 @@
 import { navigation, initialView } from './navigation.js';
 import { createPathLocator } from './locator.js';
 import { attachValueInspection, cancelValueInspections } from './value-view.js';
-import { beginStylesheetHandoff } from './stylesheets.js';
 
 import {bindCaseInspector} from './cases.js';
 import { resolvePath } from './path-targets.js';
 import { createPathPreview } from './path-preview.js';
 import { createPathMenu } from './path-menu.js';
-import { createTooltips } from './tooltips.js';
 import { bindDocumentFragment } from './document-fragment.js';
 
 const $ = selector => document.querySelector(selector);
@@ -25,12 +23,6 @@ document.addEventListener('debug:navigation-start', cancelPreviews);
 function configureChrome() {
   document.documentElement.dataset.debugWorkbench = 'true';
 
-  const header = $('.debug-header');
-  header.classList.add('wb-commandbar');
-  const tools = $('#wb-header-actions');
-  tools.setAttribute('label', 'Workspace actions');
-  tools.setAttribute('data-mash-size', 'small');
-  tools.id = 'wb-header-actions';
   const refresh = $('#wb-refresh');
   refresh.addEventListener('click', async () => {
     if (navigation.busy || !navigation.mayLeave()) return;
@@ -41,7 +33,6 @@ function configureChrome() {
       {operation: 'refresh', context: navigation.currentPath()}); }
     finally { refresh.loading = false; }
   });
-  refresh.id = 'wb-refresh';
   const inspectorToggle = $('#debug-inspector-toggle');
 
   const workspace = $('#debug-workspace');
@@ -180,17 +171,10 @@ function renderInspector(view) {
   }
 }
 
-// Keep the original explorer recipe as a fallback until this exact frontend
-// build is styled and its enhancement has initialized successfully.
-const stylesheetHandoff = beginStylesheetHandoff({
-  appVersion: typeof __DEBUG_STYLE_APP__ === 'string' ? __DEBUG_STYLE_APP__ : '',
-  componentsVersion: typeof __DEBUG_STYLE_COMPONENTS__ === 'string' ? __DEBUG_STYLE_COMPONENTS__ : '',
-});
 configureChrome();
 mountView(initialView);
 createPathPreview({resolvePath, readPreview: navigation.readPreview, initialView});
 createPathMenu({resolvePath, report: navigation.report});
-createTooltips({resolvePath});
 document.addEventListener('debug:navigate', event => {
   if (!event.detail?.document) return;
   mountView(event.detail.document);
@@ -289,4 +273,3 @@ document.addEventListener('keydown', async event => {
   }
 });
 // Any synchronous initialization failure above leaves the fallback enabled.
-stylesheetHandoff.commit();

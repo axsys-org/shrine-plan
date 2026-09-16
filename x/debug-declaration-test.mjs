@@ -17,15 +17,20 @@ function decode(name) {
 }
 const shell = decode('DEBUGGER-PAGE-HTML');
 const details = decode('DEBUGGER-DETAILS-HTML');
+const document = decode('DEBUGGER-DOCUMENT-HTML');
+assert.ok(document.includes(shell), 'HTTP framing preserves the Grove page');
+assert.doesNotMatch(document, /href="\/style\.css"|<style\b/);
+assert.match(document, /href="\/debug-components\.css"/);
+assert.match(document, /href="\/debug\.css"/);
 assert.doesNotMatch(shell + details, /x-bad-selector/);
 for (const name of ['namespace-row', 'page-row', 'path-segment', 'hover-myth', 'button', 'value-window']) assert.ok(shell.includes('id="debug-template-' + name + '"'), name);
 const assets = new Map(await Promise.all([
   ['/debug-mash.js', '.debug-assets/mash.js', 'text/javascript'],
   ['/debug-components.css', '.debug-assets/components.css', 'text/css'],
-  ['/debug.css', 'debug.css', 'text/css'], ['/style.css', 'style.css', 'text/css'],
+  ['/debug.css', 'debug.css', 'text/css'],
 ].map(async ([url, path, contentType]) => [url, {contentType, body: await readFile(resolve(outputRoot,path), 'utf8')}])));
 const compiled = {outputFiles:[{text:await readFile(resolve(outputRoot,'debug.js'),'utf8')}]};
-const html = body => '<!doctype html><html data-mash-catalogue="mash"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/debug-components.css"><link rel="stylesheet" href="/debug.css"><script defer src="/debug-mash.js"></script><script defer src="/debug.js"></script></head><body>' + body + '</body></html>';
+const html = body => document.replace(shell, () => body);
 const {chromium} = playwright();
 const browser = await chromium.launch();
 const checks = [], errors = [], violations = [], factories = [];
@@ -44,7 +49,7 @@ try {
       const scoped = name === 'navigation' && /^\?scope=(workspace|outline|preview)$/.test(url.search);
       if (req.method() !== 'GET' || url.origin !== base || (url.search && !scoped && !(name === 'legacy-view' && url.search === '?view=rendered'))) { violations.push(req.url()); return route.abort(); }
       if (url.pathname === '/debug.js') {
-        const capture = `window.__serverNodes=[...document.querySelectorAll('.debug-header,#wb-path-locator,#debug-history-nav,#wb-header-actions,#debug-sidebar,#debug-main,#wb-canvas,.wb-inspector,#wb-path-menu,#wb-action-tooltip,#wb-path-preview')];window.__factories=[];const originalCreate=document.createElement;document.createElement=function(...args){const caller=new Error().stack?.split('\\n')[2];if(caller?.includes('/debug.js'))__factories.push([args[0],caller]);return originalCreate.apply(this,args)};\n`;
+        const capture = `window.__serverNodes=[...document.querySelectorAll('.debug-header,#wb-path-locator,#debug-history-nav,#wb-header-actions,#debug-sidebar,#debug-main,#wb-canvas,.wb-inspector,#wb-path-menu,#wb-path-preview')];window.__factories=[];const originalCreate=document.createElement;document.createElement=function(...args){const caller=new Error().stack?.split('\\n')[2];if(caller?.includes('/debug.js'))__factories.push([args[0],caller]);return originalCreate.apply(this,args)};\n`;
         return route.fulfill({contentType:'text/javascript', body: app ? capture + compiled.outputFiles[0].text : ''});
       }
       if (assets.has(url.pathname)) return route.fulfill(assets.get(url.pathname));
@@ -72,6 +77,24 @@ try {
     const source = page.locator('#wb-canvas > section[aria-label=Record] ui-accordion-item[value=source]');
     await source.locator('button').first().click();
     assert.equal(await source.evaluate(el => el.open),true,'Mash owns the authored disclosure');
+    if (!touch) {
+      // This works with Mash alone: no debugger tooltip event delegation.
+      const refresh = page.locator('#wb-refresh');
+      const tip = refresh.locator('..');
+      assert.equal(await tip.evaluate(n => n.localName), 'ui-tooltip');
+      await refresh.hover();
+      await page.waitForFunction(() => document.querySelector('#wb-refresh').parentElement.open);
+      assert.equal(await tip.evaluate(n => n.label), 'Refresh current record');
+      await page.keyboard.press('Escape');
+      assert.equal(await tip.evaluate(n => n.open), false);
+      await refresh.locator('button').focus();
+      await page.keyboard.press('ArrowRight');
+      assert.equal(await page.locator('#debug-inspector-toggle').evaluate(n =>
+        n.shadowRoot.activeElement === n.shadowRoot.querySelector('button')), true,
+        'Mash toolbar navigation crosses declared tooltip wrappers');
+      await page.locator('.wb-document-title').focus();
+      await page.locator('.wb-document-title').hover();
+    }
     if (app) {
       await page.waitForFunction(() => document.querySelector('#debug-workspace').dataset.readState === 'ready');
       assert.equal(await page.locator('#wb-canvas').isVisible(),true,'native inspection remains visible');
@@ -153,12 +176,13 @@ try {
         await page.locator('#debug-saved [data-path="/other"] ui-link').click({button:'right'});
         await page.locator('#wb-path-menu ui-menu-item[value=path]').click();
         await page.waitForFunction(()=>window.__copied==='/other');
-        // Failed/missing replacement styles must restore the fallback.
-        await page.waitForFunction(()=>document.querySelector('link[href="/style.css"]').disabled);
-        await page.evaluate(()=>{window.__sheet=document.querySelector('link[href="/debug.css"]');__sheet.remove();});
-        await page.waitForFunction(()=>!document.querySelector('link[href="/style.css"]').disabled);
-        await page.evaluate(()=>document.head.append(__sheet));
-        await page.waitForFunction(()=>document.querySelector('link[href="/style.css"]').disabled);
+        await page.locator('#debug-root-toggle').click();
+        await page.locator('#debug-root-menu ui-menu-item[value="/"]').click();
+        await ready('/');
+        assert.equal(new URL(page.url()).pathname, '/debug', 'places bind the declared menu destination');
+        // Grove's asset envelope has no second styling owner to activate later.
+        assert.equal(await page.locator('link[href="/style.css"]').count(), 0);
+        assert.equal(await page.locator('link[rel=stylesheet]').count(), 2);
       }
       factories.push(...await page.evaluate(() => __factories.map(x=>[...x])));
     }
