@@ -90,7 +90,9 @@ enumerating the whole history. Zero and unreported counters remain distinct.
 State, first, now, block, and top metadata stays available below the histories.
 These are publisher-owned slots; compact UI labels do not change their stored
 identities. A local authority's epoch is never substituted for a system record's
-epoch. A newly compiled server is required for changes to the Grove declarations.
+epoch. Derived `/h`, `/o`, and `/x` views leave these counters unreported rather
+than presenting the source record's history as the derived output's history.
+A newly compiled server is required for changes to the Grove declarations.
 
 - `sh-triptych` owns the sidebar, content, and independently visible inspector.
   Navigation and view controls stay in compact, consistent chrome.
@@ -123,23 +125,17 @@ epoch. A newly compiled server is required for changes to the Grove declarations
 - `activation="split"` separates disclosure from selection: chevrons and
   Left/Right explore; selecting a label opens its record. Expansion never
   navigates the main pane.
-- A separate Preview record action opens inline details without opening children
-  or navigating. It uses Mash's optional `previewOpen` property: `true`/`false`
-  independently control preview visibility; `null` preserves the component's
-  earlier expansion-linked behavior. In markup, `preview-open` opens the preview,
-  `preview-open="false"` closes it, and omitting the attribute keeps compatibility.
-  Escape closes the sidebar preview and returns focus to its tree row.
+- Sidebar row actions are bookmarks. Path hover/focus opens a shared Myth
+  preview without navigating or expanding the hierarchy.
 - Inline previews compose `sh-myth`, `sh-limb`, `sh-slot`, and `sh-pail`.
   Slot keys remain within the record, never fabricated namespace children.
 - Main-view child paths are compact rows with deliberate inline preview controls,
   not oversized cards. Reopening a loaded, unchanged preview makes no new request.
 - Inspect reads the namespace response, bypassing custom faces.
-- Rendered view is a lazy, sandboxed, passive preview. Its scripts and forms do
-  not run. Open interface launches the original interactive face separately.
-- The activity button opens the actual `/log` journal, not browser navigation.
-  The latest 40 events show their task, target, and effect count. Individual
-  events expose acknowledgements and outbound effects; earlier paths remain
-  accessible. Journal records are read-only in the debugger.
+- There is no separate Rendered view or activity toolbar button. The actual
+  `/<node>/log` journal is browsed as namespace content. Its read-only records
+  describe committed namespace changes, not browser navigation or retired
+  task/effect/acknowledgement payloads.
 - Only actual server-authored operations are offered. Operations and the
   definition inspector open on demand; authored help is already in the page.
 
@@ -310,17 +306,11 @@ The protected legacy runtime's uncached `/log` root is deliberately not read on
 hover: that old route may serialize unbounded history. An already-loaded log
 snapshot can still be previewed. Other backend read limits are unchanged.
 
-`tooltips.js` uses one rich Mash `ui-tooltip` with native `ui-kbd` shortcut
-rendering for non-path actions. It preserves native controls, restores browser
-titles when dismissed, and associates descriptions within a control's own
-shadow scope. Passive hints do not consume an owning panel's Escape gesture.
-Touch interaction never triggers hover reads or hints.
-
-The path hover/menu suites require `DEBUG_DOCUMENT` to name a saved shell;
-all namespace responses are explicit fixtures on inert origins. They never
-fall back to the protected runtime or the system clipboard. The tooltip suite
-uses an isolated component fixture without any namespace reads. Set
-`PLAYWRIGHT_MODULE` when the local Playwright package cannot be discovered.
+Toolbar hints are declared Mash `ui-tooltip` compositions. There is no global
+application tooltip controller or parallel native-title hint. Touch interaction
+does not trigger hover reads or hints. The consolidated
+`x/debug-declaration-test.mjs` suite uses compiler-produced Grove markup and
+explicit inert namespace fixtures; it never falls back to a user's runtime.
 
 ## Isolated journal verification
 

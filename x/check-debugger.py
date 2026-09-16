@@ -55,6 +55,7 @@ def check(args):
     log = log_path.read_text(errors='replace')
     if (not runner.verdict(log, code, complete)[0]
             or '"DEBUGGER-APPLICATION-PASS"' not in log
+            or '"DEBUGGER-PINNED-BOUNDARY-PASS"' not in log
             or '("DEBUGGER-HOST-COMPILED" 1)' not in log
             or '("DEBUGGER-COMPILER-PASS" 1)' not in log):
         raise RuntimeError('Native declaration check failed: ' + str(log_path))

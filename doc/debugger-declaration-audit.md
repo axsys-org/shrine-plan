@@ -24,9 +24,13 @@ belongs to the selected immutable system publication, not that authority.
   compilation unit. It does not generate HTML or select a host renderer.
 - `grove_ui_runtime.foil` is the reusable fragment/record bridge. Default Grove
   compilation uses the role prelude; UI is an explicit host choice.
-- `grove_app.foil` captures an installed view's real weft/tack pins and uses the
-  sewn input norm's stored role schema to project named request inputs. The sewn
-  transformation still checks both norms; malformed inputs cannot bypass them.
+- `grove_app.foil` captures an installed view's real weft/tack pins and projects
+  named request inputs using the input norm schema stored with that compiled
+  sewn. It never substitutes the latest norm at the same path for a pinned
+  renderer's schema. The sewn transformation still checks both norms;
+  malformed inputs cannot bypass them.
+  Older compiled sewn metadata must be recompiled; an absent or incompatible
+  boundary fails capture instead of falling back to a mutable endpoint read.
 - `debugger_contract.foil` holds internal transport carriers and explicit leaf
   wrappers. The aggregate is no longer a single opaque `/data` application slot.
   Only the debugger host opts into these codecs.
@@ -67,6 +71,14 @@ navigation event or advancing the namespace epoch. It does not bind the input to
 the inspected namespace root with an unbounded y/z dependency. Saved paths and
 browser history remain client-local preferences, not shared sovereign state.
 
+This is a namespace-installed Grove view with a privileged inspection adapter,
+not an ordinary capability-scoped application. The host chooses the finite reads
+and supplies typed named values; the reusable `grove_app` boundary knows only
+the installed pins, the compiled input schema, and the checked HTML-producing
+transformation. The installed app's crew does not authorize those host reads.
+Request-local projection is not an update to `/input`, a subscription, or a
+promise that separately fetched sidebar and hover views form one coherent epic.
+
 The generic adapter currently supports own-record input norms and HTML output;
 it is not a universal Grove application server, reactive binding mechanism, or
 capability sandbox. It captures a view for the server lifetime. Updating an
@@ -81,6 +93,10 @@ subtree. Physical reads select the owning history before interpreting epochs.
 Journal rows show actual namespace commits and changes, not the retired task,
 effect or acknowledgement payload. Browser parser labels normalize version
 metadata for display; stored publisher-owned slot identities are preserved.
+Physical records retain their owning authority's case and epoch metadata.
+Derived `/h`, `/o`, and `/x` views do not borrow the physical source's counters:
+their history metadata is unreported until the runtime supplies it for the exact
+derived target. An underlying source's history is not the output's history.
 
 Earlier findings and migration notes are local-only archives; this document
 and the PR guide describe the supported declaration boundary.

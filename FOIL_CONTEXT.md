@@ -1067,8 +1067,12 @@ Use `@sewn`, not the former typo `@dyed`. `grove_sewn.foil` lowers an
 explicit `get` body with one `#from` and one `#to` norm. Its module exports
 unchecked `get`/`run` and checked `apply : axal[myth] -> maybe[axal[myth]]`.
 `apply` validates the input, invokes the implementation, and validates the
-output. `publisher_vocabulary/grove/sewn` stores both norm paths. External norms and sewn
-modules import through stored compiler bundles. Run
+output. `publisher_vocabulary/grove/sewn` stores both norm paths and their
+compiled schemas (`source_schema`/`target_schema`), from the same norm modules
+used by `apply`. Request-local adapters project through that pinned metadata,
+not the latest norm declaration at an endpoint path. Older compiled sewn
+metadata requires recompilation; missing or incompatible metadata fails closed.
+External norms and sewn modules import through stored compiler bundles. Run
 `x/check foil-grove-sewn-tests`.
 
 

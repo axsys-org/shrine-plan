@@ -25,6 +25,7 @@ class Document(HTMLParser):
     def __init__(self, body):
         super().__init__()
         self.workspace, self.children, self.events = {}, [], []
+        self.cases, self.case_links = {}, []
         assert b'data-grove-contract="debugger/v1"' in body
         self.feed(body.decode())
 
@@ -36,6 +37,10 @@ class Document(HTMLParser):
             self.children.append(attrs['data-path'])
         if tag == 'a' and 'debug-event' in attrs.get('class', '').split():
             self.events.append((attrs['data-reference'], attrs['href']))
+        if tag == 'ui-accordion-item' and 'data-care' in attrs:
+            self.cases[attrs['data-care']] = attrs['data-case-total']
+        if tag == 'a' and 'wb-case-link' in attrs.get('class', '').split():
+            self.case_links.append(attrs['href'])
 
 
 def check(manifest):
@@ -157,6 +162,25 @@ def check(manifest):
         error(physical(maximum, 'slots', epoch=checkpoints[0]['epoch'], after=maximum), 404, 'path_missing')
         report['maximumPhysicalMs'] = requests[-1]['ms']
         checkpoint('after-transport-edges')
+        # Source history must never be presented as a derived output's history.
+        source = Document(get(hello + '?scope=workspace'))
+        assert int(source.cases['x']) >= 1 and source.case_links
+        derived_target = '/h/x/1/2' + authority + '/hello'
+        derived = Document(get('/debug' + derived_target + '?scope=workspace'))
+        assert derived.workspace['data-path'] == derived_target
+        assert derived.workspace['data-writable'] == 'false'
+        assert derived.workspace['data-slot-count'] != '0', 'Historical record must still resolve'
+        assert derived.cases == dict(x='', y='', z='') and not derived.case_links
+        # Independently inspect a descendant within an exact historical frontier.
+        parent = Document(get('/debug' + authority + '/app?scope=workspace'))
+        assert int(parent.cases['y']) >= 1
+        descendant_target = '/h/y/' + parent.cases['y'] + '/2' + authority + '/app/debug'
+        descendant = Document(get('/debug' + descendant_target + '?scope=workspace'))
+        assert descendant.workspace['data-path'] == descendant_target
+        assert descendant.workspace['data-slot-count'] != '0'
+        assert descendant.cases == dict(x='', y='', z='') and not descendant.case_links
+        report['derivedHistoryChecked'] = [derived_target, descendant_target]
+        checkpoint('after-derived-history')
         latest, first = journal(), journal(limit=1)
         assert first.children == latest.children[:1]
         if first.workspace['data-page-next-before']:
