@@ -1,3 +1,4 @@
+import {BoundedCache} from './bounded-cache.js';
 
 import {declaredTemplate} from './declarations.js';
 
@@ -7,28 +8,25 @@ const CACHE_LIMIT = 60;
 const CACHE_TTL = 30_000;
 
 export function createMythPreview(view, href) {
-  const authored = declaredTemplate('hover-myth');
-  const myth = authored;
-  myth.setAttribute('variant', 'preview'); myth.setAttribute('data-mash-size', 'compact');
+  const myth = declaredTemplate('hover-myth');
   myth.setAttribute('title', view.label || view.path);
   const path = myth.querySelector('.wb-hover-path');
-  path.textContent = view.path; path.slot = 'path'; path.href = href;
+  path.textContent = view.path; path.href = href;
 
   if (view.description && view.description.trim() !== view.label?.trim()) {
     const description = myth.querySelector('.wb-hover-description');
-    description.hidden = false; description.textContent = view.description; description.slot = 'description';
+    description.hidden = false; description.textContent = view.description;
   }
   const slots = view.record?.slots || [];
   const slotCount = view.collection?.slotCount ?? slots.length;
   const shown = slots.filter(slot => !['/sys/lede','/sys/help','/sys/lash'].includes(slot.key)).slice(0, 3);
   for (const slot of shown) {
     const limb = declaredTemplate('hover-slot');
-    const key = limb.querySelector('sh-slot'); key.slot = 'label'; key.setAttribute('title', slot.key);
+    const key = limb.querySelector('sh-slot'); key.setAttribute('title', slot.key);
     const definition = key.querySelector('ui-button'); definition.textContent = slot.key;
-    definition.setAttribute('variant', 'text'); definition.setAttribute('size', 'small'); definition.setAttribute('type', 'button');
     definition.dataset.inspect = slot.key; definition.setAttribute('aria-label', 'Inspect slot definition ' + slot.key);
 
-    const value = limb.querySelector('sh-pail'); value.slot = 'value';
+    const value = limb.querySelector('sh-pail');
     const candidate = slot.reference || (slot.links?.length === 1 &&
       [slot.links[0].text, slot.links[0].path].includes(slot.text) ? slot.links[0].path : null);
     const reference = typeof candidate === 'string' && candidate.startsWith('/') &&
@@ -38,7 +36,7 @@ export function createMythPreview(view, href) {
     if (reference) text.href = '/debug' + reference.split('/').filter(Boolean).map(part => '/' + encodeURIComponent(part)).join('');
      myth.append(limb);
   }
-  const metadata = myth.querySelector('.wb-hover-meta'); metadata.slot = 'meta';
+  const metadata = myth.querySelector('.wb-hover-meta');
   const children = view.pagination?.total ?? String(view.collection?.childCount ?? view.children.length);
   metadata.textContent = (view.record ? slotCount + (slotCount === 1 ? ' slot' : ' slots') :
     view.state === 'tombstone' ? 'Removed record' : 'No own record') + ' · ' + children + (children === '1' ? ' child' : ' children');
@@ -46,28 +44,23 @@ export function createMythPreview(view, href) {
   if (shown.length) {
     const note = myth.querySelector('.wb-hover-note');
     note.hidden = false; note.textContent = 'Preview · ' + shown.length + ' of ' + slotCount + ' slots';
-    note.slot = 'annotation';
   }
-  const open = myth.querySelector('.wb-hover-open'); open.slot = 'actions'; open.href = href;
+  const open = myth.querySelector('.wb-hover-open'); open.href = href;
   open.setAttribute('aria-label', 'Open ' + view.path);
   return myth;
 }
 
 export function createPathPreview({resolvePath, readPreview, initialView, renderRecord = createMythPreview}) {
-  const card = document.querySelector('#wb-path-preview'); card.id = 'wb-path-preview';
-  card.setAttribute('trigger', 'manual'); card.setAttribute('placement', 'right'); card.setAttribute('align', 'start');
-  card.setAttribute('collision-padding', '12'); card.setAttribute('offset', '8');
-  card.setAttribute('data-mash-size', 'compact');
+  const card = document.querySelector('#wb-path-preview');
 
   let target = null, openTimer, closeTimer, request = null, generation = 0, suppressed = null, menuOpen = false;
   let navigationQuiet = false, lastPointer = null;
-  const cache = new Map();
+  const cache = new BoundedCache(CACHE_LIMIT, CACHE_TTL, [], () => performance.now());
   const controller = new AbortController();
   const listen = (name, handler, capture = false) => document.addEventListener(name, handler, {capture, signal: controller.signal});
   const remember = view => {
     if (!view?.path || view.scope === 'outline') return;
-    cache.delete(view.path); cache.set(view.path, {view, time: performance.now()});
-    while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(view.path, view);
   };
   remember(initialView);
   function cancelRead() { generation++; request?.abort(); request = null; }
@@ -82,8 +75,8 @@ export function createPathPreview({resolvePath, readPreview, initialView, render
   async function load(chosen) {
     cancelRead(); const token = generation;
     const stored = cache.get(chosen.path);
-    if (stored && performance.now() - stored.time < CACHE_TTL) {
-      setContent('ready', renderRecord(stored.view, chosen.href)); return;
+    if (stored) {
+      setContent('ready', renderRecord(stored, chosen.href)); return;
     }
     if (chosen.path === '/log') {
       const note = declaredTemplate('context-note'); note.textContent = 'Open activity to inspect its entries.';

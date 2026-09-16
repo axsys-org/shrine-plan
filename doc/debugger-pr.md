@@ -77,7 +77,7 @@ it is missing. There is no legacy browser build; `--legacy` is rejected.
    `debug-dependencies.json` before treating this as a release build.
 
 The paired Mash changes are committed as
-`568b50db204abf56369d4af4abdefcd41aaa79fa` and pinned in
+`ef49979fe7c4b1386a9fb12200a00ff37f787233` and pinned in
 `debug-dependencies.json`. `node x/build-debug.mjs --release` and
 `python3 x/check-debugger.py --release` reject an absent pin, mismatched SHA,
 dirty Mash checkout or wrong pnpm version. Development build provenance still
@@ -132,6 +132,10 @@ No commit, staging operation or PR publication is implied by running this gate.
 Twenty-eight prototype-era browser harnesses are removed, not carried as a
 second compatibility gate. Exact value parser checks now live in a compact pure
 suite; case/layout/navigation checks share compiler-produced Grove markup.
-The old standalone Preview mode and browser DOM factory implementation are gone.
+The old standalone Preview mode, browser DOM factory, duplicate Foil debugger
+renderer/model, stylesheet handoff and global tooltip controller are gone.
+Semantic/fidelity tests now import the published Grove modules; HTTP transport
+tests keep their boundary and pagination assertions. Toolbar hints use declared
+Mash tooltips without application-side enhancement.
 This does not claim full kernel regression coverage or migration of every old
 visual assertion. Run the specific transport gates when changing that boundary.

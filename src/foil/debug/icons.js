@@ -32,24 +32,14 @@ export function icon(name) {
   const sourceName = iconNames[name];
   if (!sourceName) throw new TypeError('Unknown debugger icon: ' + name);
   const element = declaredTemplate('icon');
-  element.classList.add('wb-icon');
   element.setAttribute('name', sourceName);
-  element.setAttribute('size', 'small');
-  element.setAttribute('aria-hidden', 'true');
-  element.dataset.iconSource = 'Mash';
   return element;
 }
 
 export function button(label, glyph, action, text = '') {
-  const authored = declaredTemplate('button');
-  const button = authored;
-  button.setAttribute('type', 'button');
+  const button = declaredTemplate('button');
   button.setAttribute('size', text ? 'small' : 'compact');
-  button.setAttribute('variant', 'ghost');
-  button.setAttribute('tone', 'neutral');
   button.setAttribute('aria-label', label);
-  // Empty title blocks inherited native hints; icon help belongs to ui-tooltip.
-  button.title = '';
   button.className = text ? 'wb-button' : 'wb-icon-button';
   if (!text) button.setAttribute('icon-only', '');
   else { button.removeAttribute('icon-only'); button.setAttribute('touch-target', ''); }

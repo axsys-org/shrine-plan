@@ -15,6 +15,11 @@ const {outputFiles:[{text}]} = await esbuild().build({
 });
 assert.doesNotMatch(text, /\bcreateElement(?:NS)?\s*\(/);
 assert.doesNotMatch(text, /__DEBUG_LEGACY__|legacyElement|enhanceForms/);
+assert.doesNotMatch(text, /beginStylesheetHandoff|__DEBUG_STYLE_|createTooltips/);
+const host = await readFile(resolve(root, 'src/foil/web.foil'), 'utf8');
+const debuggerHost = host.slice(host.indexOf('+  debugger\n'), host.indexOf('+  zoo\n'));
+assert.doesNotMatch(debuggerHost, /debug_model\/|web_style\/css|page_with_bundle/);
+assert.match(debuggerHost, /weft\/page_with_assets/);
 const registry = await readFile(resolve(mashRoot(),'packages/components/src/icon/carbon-icons.generated.ts'),'utf8');
 const names = new Set([...registry.matchAll(/^\s+"([^"]+)": \{/gm)].map(match=>match[1]));
 const icons = await readFile(resolve(root,'src/foil/debug/icons.js'),'utf8');

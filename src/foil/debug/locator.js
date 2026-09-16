@@ -1,3 +1,4 @@
+import {BoundedCache} from './bounded-cache.js';
 import {iconNames} from './icons.js';
 import {declaredTemplate} from './declarations.js';
 
@@ -29,32 +30,17 @@ export function createPathLocator({ navigation, form, initialView }) {
     throw new TypeError('A path locator needs navigation, the existing path form, and an initial view.');
   }
   const root = document.querySelector('#wb-path-locator');
-  root.id = 'wb-path-locator';
   const trail = root.querySelector('.wb-path-trail');
-  trail.setAttribute('aria-label', 'Namespace location');
   const scroll = trail.querySelector('.wb-path-scroll');
-  scroll.setAttribute('label', 'Namespace ancestors');
-  scroll.setAttribute('orientation', 'horizontal');
-  scroll.setAttribute('mode', 'scrolling');
-  scroll.setAttribute('size', 'medium');
   const segments = scroll.querySelector('.wb-path-segments');
 
   const editButton = root.querySelector('#wb-path-edit');
   editButton.addEventListener('click', () => edit());
-  editButton.id = 'wb-path-edit';
-  editButton.title = '';
-  editButton.setAttribute('aria-controls', form.id);
-  editButton.setAttribute('aria-expanded', 'false');
   editButton.setAttribute('aria-keyshortcuts', '/ Control+L Meta+L');
   const cancelButton = form.querySelector('.wb-path-cancel');
   cancelButton.addEventListener('click', () => close());
-  cancelButton.classList.add('wb-path-cancel');
   const inputGroup = form.querySelector('ui-input-group');
-  if (inputGroup) cancelButton.slot = 'suffix';
   const input = form.querySelector('ui-input');
-  input.setAttribute('label', 'Namespace path');
-  input.setAttribute('aria-label', 'Namespace path');
-  form.setAttribute('aria-label', 'Open namespace path');
 
   let view = initialView;
   let editorOpen = false;
@@ -63,22 +49,7 @@ export function createPathLocator({ navigation, form, initialView }) {
   let generation = 0;
   const menus = new Set();
   const pending = new Map();
-  const cache = new Map();
-
-  function rememberView(snapshot) {
-    cache.delete(snapshot.path);
-    cache.set(snapshot.path, { view: snapshot, readAt: performance.now() });
-    while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
-  }
-
-  function cachedView(path) {
-    const entry = cache.get(path);
-    if (!entry) return null;
-    cache.delete(path);
-    if (performance.now() - entry.readAt >= CACHE_TTL_MS) return null;
-    cache.set(path, entry);
-    return entry.view;
-  }
+  const cache = new BoundedCache(CACHE_LIMIT, CACHE_TTL_MS, [], () => performance.now());
 
   function closeMenus(except = null) {
     for (const menu of menus) if (menu !== except && menu.open) menu.dismiss('imperative');
@@ -201,7 +172,7 @@ export function createPathLocator({ navigation, form, initialView }) {
   }
 
   async function load(menu, path) {
-    const cached = cachedView(path);
+    const cached = cache.get(path);
     if (cached) { populate(menu, cached); return; }
     if (pending.has(menu)) return;
     const token = generation;
@@ -214,7 +185,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     try {
       const answer = await navigation.readPreview(path, { signal: controller.signal, scope: 'outline' });
       if (destroyed || token !== generation || controller.signal.aborted || !menu.isConnected) return;
-      rememberView(answer.view);
+      cache.set(answer.view.path, answer.view);
       populate(menu, answer.view);
     } catch (error) {
       if (destroyed || controller.signal.aborted || token !== generation || !menu.isConnected) return;
@@ -273,7 +244,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     closeMenus();
     view = nextView;
     if (refresh) cache.clear();
-    rememberView(view);
+    cache.set(view.path, view);
     menus.clear();
     root.dataset.path = view.path;
     trail.title = view.path;

@@ -205,20 +205,14 @@ def seal_assets(path, asset_source):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(original, target)
         copied[url] = dict(path=relative, sha256=sha(target), bytes=target.stat().st_size)
-    markers = {}
-    for kind, relative in [('app', 'foil/debug.css'), ('components', 'foil/.debug-assets/components.css')]:
-        match = re.search(r'--shrine-debug-' + kind + r'-ready:\s*(asset-[0-9a-f]+)', (source / relative).read_text())
-        if not match:
-            raise RuntimeError('Final CSS readiness marker is missing: ' + kind)
-        markers[kind] = match.group(1)
-    sealed = dict(assets=copied, assetVersions=markers, assetBuild=build, assetsSealedAt=time.time())
+    sealed = dict(assets=copied, assetBuild=build, assetsSealedAt=time.time())
     seal = Path(manifest['work']) / 'assets.json'
     if seal.exists():
         raise RuntimeError('Immutable asset provenance already exists')
     save(seal, sealed)
     manifest.update(sealed)
     save(path.resolve(), manifest)
-    print(json.dumps(dict(event='assets-sealed', manifest=str(path.resolve()), versions=markers)), flush=True)
+    print(json.dumps(dict(event='assets-sealed', manifest=str(path.resolve()), assets=copied)), flush=True)
 
 
 def main():

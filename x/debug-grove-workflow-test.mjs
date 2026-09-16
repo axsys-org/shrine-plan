@@ -13,7 +13,7 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const manifestPath = resolve(process.env.GROVE_RUNTIME);
 const verified = JSON.parse(execFileSync('python3', [resolve(root, 'x/debug-grove-runtime.py'), 'verify', manifestPath], {encoding: 'utf8'}));
 const seal = JSON.parse(await readFile(resolve(verified.work, 'assets.json'), 'utf8'));
-assert.ok(seal.assets && seal.assetVersions.app && seal.assetVersions.components, 'Final frontend assets must be sealed before UI starts');
+assert.ok(seal.assets?.['/debug.css']?.sha256 && seal.assets?.['/debug-components.css']?.sha256, 'Final frontend assets must be sealed before UI starts');
 const base = verified.origin;
 assert.equal(new URL(base).hostname, '127.0.0.1'); assert.notEqual(new URL(base).port, '8138');
 assert.notEqual(new URL(base).port, '51571');
@@ -33,7 +33,7 @@ const allowedValueReads = new Set();
 let authorizedInstall = null, postCount = 0, activePage = null;
 const run = {version: 1, evidence: 'real disposable Grove runtime, not fixture data', runtimeId: verified.id,
   origin: base, pid: verified.pid, backendSourceFiles: verified.backendSourceFiles,
-  assets: seal.assets, assetVersions: seal.assetVersions, requests, replies, failures, unexpected, pageErrors,
+  assets: seal.assets, requests, replies, failures, unexpected, pageErrors,
   screenshots, checks, startedAt: new Date().toISOString(), passed: false};
 const browser = await chromium.launch();
 
