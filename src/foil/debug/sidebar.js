@@ -1,5 +1,5 @@
 import {button, iconNames} from './icons.js';
-import { assertJournalPage } from './journal.js';
+import { isJournalRoot, assertJournalPage } from './journal.js';
 import {declaredTemplate} from './declarations.js';
 import {BoundedCache} from './bounded-cache.js';
 const containsPath = (root, path) => root === '/' || root === path || path.startsWith(root + '/');
@@ -22,8 +22,8 @@ const genericDescriptions = new Set([
 ]);
 function orderedChildren(view) {
   const paths = [...new Set((view.children || []).filter(isPath))];
-  if (view.path === '/log') paths.sort((a, b) => {
-    const left = a.slice(5), right = b.slice(5);
+  if (isJournalRoot(view.path)) paths.sort((a, b) => {
+    const left = a.slice(view.path.length + 1), right = b.slice(view.path.length + 1);
     if (/^\d+$/.test(left) && /^\d+$/.test(right)) return BigInt(left) > BigInt(right) ? -1 : BigInt(left) < BigInt(right) ? 1 : 0;
     return /^\d+$/.test(left) ? -1 : /^\d+$/.test(right) ? 1 : left.localeCompare(right);
   });

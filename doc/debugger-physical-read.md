@@ -1,11 +1,9 @@
 # Physical read selection
 
-Status: internal implementation on `debug-prototype`, now used by the separate
-[bounded wire projection](debugger-physical-wire.md). The adapter is not yet
-wired into the debugger UI or activated in the existing port-8138 runtime.
-This is the selection layer of the
-[read-contract plan](debugger-read-contract-audit.md), not a claim that ordinary
-namespace or derived reads are now bounded.
+The debugger's physical selection layer, also used by the separate
+[bounded wire projection](debugger-physical-wire.md). The namespace adapter
+selects the path's authority before calling the sovereign selector below.
+This does not make ordinary namespace or derived evaluation bounded.
 
 ## Contract
 
@@ -132,6 +130,5 @@ See the [performance report](debugger-performance.md) for current measurements
 and limitations. These initial results are functional and
 traversal checks, not cold-I/O or HTTP latency benchmarks.
 
-The selection slice alone performs no live state migration. The newer HTTP
-route is described in its separate contract; preserve port 8138. A safe
-activation plan remains a separate requirement.
+The selector performs no live state migration. Verify changes in a disposable
+namespace; an existing preview is not evidence of the current source build.

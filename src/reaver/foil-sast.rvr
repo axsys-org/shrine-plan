@@ -127,6 +127,13 @@
 ;; bracket after a word), are re-attached to their heads.
 (define (regroup ks)
   (define (spec-head? k) (Or (rx-word? k) (cref-nest? k)))
+  ;; A continuation line flattens lexical juxts into its operand row.
+  ;; Only reattach adjacent brackets: `name [value]` is two operands,
+  ;; while `row[nat]` is one specialized type.
+  (define (spec-tail? head tail)
+    (And (spec-head? head)
+      (And (spec-brack? tail)
+        (Eq (span-end (rx-span head)) (span-off (rx-span tail))))))
   (define (go rest acc)
     (Ifz (Sz rest)
       acc
@@ -137,13 +144,13 @@
             (let ((n (cond
                        ((Eq 0 (Sz more)) 0)
                        ((And (Gt (Sz more) 1)
-                          (And (spec-head? (_0 more)) (spec-brack? (_1 more))))
+                          (spec-tail? (_0 more) (_1 more)))
                          2)
                        (else 1))))
               (go (drop n more)
                 (snoc (rx-juxt (rx-span k) (Weld [k] (take n more))) acc))))
           ((And (Gt (Sz more) 0)
-             (And (spec-head? k) (spec-brack? (_0 more))))
+             (spec-tail? k (_0 more)))
             (go (drop 1 more)
               (snoc (rx-juxt (rx-span k) [k (_0 more)]) acc)))
           (else (go more (snoc k acc)))))))
@@ -547,6 +554,14 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
   ;; its operands and splice them.  A > head is the retired arm
   ;; spelling (> is match/guard only) — a located diagnostic.
   (define (parse-pairs arm-msg unpaired-msg kids)
+    (define (pair next rest acc)
+      (If (Gt (Sz rest) 1)
+        (next (drop 2 rest)
+          (snoc
+            (surf-arm (parse-type-sast (_0 rest))
+              (parse-val-sast (_1 rest)))
+            acc))
+        (sast-error-at (_0 rest) unpaired-msg (_0 rest))))
     (define (go rest acc)
       (cond
         ((Eq 0 (Sz rest)) acc)
@@ -555,15 +570,12 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
         ((rx-plain? "clear" (_0 rest))
           (go (Weld (hr-stem (rx-nest-kids (_0 rest))) (drop 1 rest)) acc))
         ((rx-juxt? (_0 rest))
-          (go (Weld (regroup (hr-stem (rx-juxt-kids (_0 rest)))) (drop 1 rest))
+          ;; Regroup once, then consume the pair. Re-entering `go`
+          ;; here would repeatedly flatten and rebuild a specialized
+          ;; pattern such as `row[nat]`, without consuming anything.
+          (pair go (Weld (regroup (hr-stem (rx-juxt-kids (_0 rest)))) (drop 1 rest))
             acc))
-        ((Gt (Sz rest) 1)
-          (go (drop 2 rest)
-            (snoc
-              (surf-arm (parse-type-sast (_0 rest))
-                (parse-val-sast (_1 rest)))
-              acc)))
-        (else (sast-error-at (_0 rest) unpaired-msg (_0 rest)))))
+        (else (pair go rest acc))))
     (go (hr-stem kids) []))
   (define (parse-letrec kids heir)
     (surf-letrec

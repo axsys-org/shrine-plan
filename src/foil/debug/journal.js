@@ -1,8 +1,17 @@
 // A journal cursor is a physical epoch key, not a JavaScript number or offset.
-// Path identity stays /log; only these independently validated options may
-// become query parameters. Older kernels remain usable at the default page.
+// The journal belongs to its hexadecimal namespace authority. Bare /log is
+// accepted only for old bookmarks and saved parser artifacts.
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/;
 export const DEFAULT_JOURNAL_PAGE = Object.freeze({ before: null, limit: 40 });
+
+export function isJournalRoot(path) {
+  if (typeof path !== 'string') return false;
+  if (path === '/log') return true;
+  // Shrine hex is minimal little-endian bytes, not conventional hex digits:
+  // 0x0001 is valid, while an odd nibble count or trailing zero byte is not.
+  const match = /^\/0x((?:[0-9a-f]{2})+)\/log$/.exec(path);
+  return Boolean(match && !match[1].endsWith('00'));
+}
 
 export function journalPage(value = DEFAULT_JOURNAL_PAGE) {
   if (!value || (value.before !== null && !DECIMAL.test(value.before)) ||
@@ -51,7 +60,7 @@ export function parseJournalPagination(workspace, path, children) {
   if (!workspace.dataset.paging) return null;
   const data = workspace.dataset;
   const invalid = () => { throw new Error('The runtime returned invalid journal pagination metadata.'); };
-  if (path !== '/log' || data.paging !== 'journal' ||
+  if (!isJournalRoot(path) || data.paging !== 'journal' ||
       !DECIMAL.test(data.childCount || '') || !DECIMAL.test(data.pageEpoch || '') ||
       !/^(?:[1-9]|[1-3][0-9]|40)$/.test(data.pageLimit || '') ||
       data.pageBefore === undefined || data.pageNextBefore === undefined) invalid();
@@ -61,19 +70,20 @@ export function parseJournalPagination(workspace, path, children) {
   const limit = Number(data.pageLimit);
   if (children.length > limit || BigInt(data.childCount) < BigInt(children.length)) invalid();
   let previous = before === null ? null : BigInt(before);
-  for (const path of children) {
-    const key = path.slice(5);
-    if (!path.startsWith('/log/') || !DECIMAL.test(key)) invalid();
+  const prefix = path + '/';
+  for (const child of children) {
+    const key = child.slice(prefix.length);
+    if (!child.startsWith(prefix) || !DECIMAL.test(key)) invalid();
     const epoch = BigInt(key);
     if (epoch > BigInt(data.pageEpoch) || (previous !== null && epoch >= previous)) invalid();
     previous = epoch;
   }
-  if (nextBefore !== null && (!children.length || nextBefore !== children.at(-1).slice(5))) invalid();
+  if (nextBefore !== null && (!children.length || nextBefore !== children.at(-1).slice(prefix.length))) invalid();
   return { kind: 'journal', before, nextBefore, limit, total: data.childCount, epoch: data.pageEpoch };
 }
 
 export function assertJournalPage(view, requested) {
-  if (view.path !== '/log') return;
+  if (!isJournalRoot(view.path)) return;
   const page = journalPage(requested);
   if (view.pagination ? !sameJournalPage(view.pagination, page) : !sameJournalPage(page, DEFAULT_JOURNAL_PAGE)) {
     throw new Error('The runtime did not return the requested journal page. The current view has been kept.');

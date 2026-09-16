@@ -91,7 +91,7 @@ def main():
                     return json.loads(body)
                 return body.decode()
 
-            doc = Document(request('/debug/demo', save='document.html'))
+            doc = Document(request('/debug/0x11/demo', save='document.html'))
             fields = doc.fields
             assert fields['/text']['data-value-state'] == 'complete'
             assert fields['/threshold']['data-value-state'] == 'complete'
@@ -106,15 +106,15 @@ def main():
             assert fields['/invalid']['data-preview-reason'] == 'non-text-bytes'
             epoch = fields['/text']['data-value-epoch']
             assert epoch.isdecimal()
-            root = Document(request('/debug', save='root.html'))
+            root = Document(request('/debug/0x11', save='root.html'))
             assert root.fields and all(f['data-value-epoch'].isdecimal() for f in root.fields.values())
 
-            def url(slot='/text', at=epoch, offset=0, limit=4096, path='/demo'):
+            def url(slot='/text', at=epoch, offset=0, limit=4096, path='/0x11/demo'):
                 return '/debug-read/value?' + urllib.parse.urlencode(dict(path=path, slot=slot, epoch=at, offset=offset, limit=limit))
             def chunk(slot='/text', at=epoch, offset=0, limit=4096, expected_hex=None, save=None):
                 out = request(url(slot, at, offset, limit), save=save)
                 assert out['version'] == 1 and out['encoding'] == 'hex'
-                assert out['path'] == '/demo' and out['slot'] == slot and out['epoch'] == str(at)
+                assert out['path'] == '/0x11/demo' and out['slot'] == slot and out['epoch'] == str(at)
                 assert 0 < int(out['recordEpoch']) <= int(at)
                 assert out['offset'] == str(offset) and out['total'].isdecimal()
                 assert re.fullmatch(r'(?:[0-9a-f]{2})*', out['hex'])
@@ -126,7 +126,7 @@ def main():
                     assert out['hex'] == expected_hex, out
                 return out
 
-            before = Document(request('/debug/log')).workspace
+            before = Document(request('/debug/0x11/log')).workspace
             original = chunk(expected_hex='68656c6c6f', save='text.json')
             chunk(offset=2, limit=2, expected_hex='6c6c', save='middle.json')
             chunk(offset=5, limit=1, expected_hex='', save='eof.json')
@@ -145,13 +145,13 @@ def main():
             assert bytes.fromhex(first['hex'] + last['hex']) == b'a' * 70000 + b'END'
             assert first['recordEpoch'] == last['recordEpoch']
             quoted_path = '/$quote"slash\\'
-            quoted = request(url(path=quoted_path, slot=quoted_path))
-            assert quoted['path'] == quoted_path and quoted['slot'] == quoted_path
+            quoted = request(url(path='/0x11' + quoted_path, slot=quoted_path))
+            assert quoted['path'] == '/0x11' + quoted_path and quoted['slot'] == quoted_path
             assert quoted['hex'] == b'quoted identifier'.hex()
             for path, status, error in [
                 (url(at='123456789012345678901234567890'), 409, 'future_epoch'),
                 (url(at='0'), 404, 'record_missing'),
-                (url(path='/missing'), 404, 'record_missing'),
+                (url(path='/0x11/missing'), 404, 'record_missing'),
                 (url(slot='/missing'), 404, 'slot_missing'),
                 (url(slot='/opaque'), 422, 'unsupported_type'),
                 (url(path='/x/demo'), 422, 'derived_path'),
@@ -163,28 +163,28 @@ def main():
             invalid = [base + '&epoch=2', base + '&%65poch=2', base + '&unknown=1', base + '&',
                 base.replace('epoch=' + epoch, 'epoch=01'), base.replace('offset=0', 'offset=-1'),
                 base.replace('limit=4096', 'limit=65537'), base.replace('limit=4096', 'limit=0'),
-                base.replace('path=%2Fdemo', 'path=demo'), base.replace('path=%2Fdemo', 'path=%2Fdemo%2F'),
-                base.replace('path=%2Fdemo', 'path=%2F.%2Fdemo'), base.replace('path=%2Fdemo', 'path=%00'),
-                base.replace('path=%2Fdemo', 'path=%2F%09'), base.replace('path=%2Fdemo', 'path=%2F%0A'),
+                base.replace('path=%2F0x11%2Fdemo', 'path=demo'), base.replace('path=%2F0x11%2Fdemo', 'path=%2Fdemo%2F'),
+                base.replace('path=%2F0x11%2Fdemo', 'path=%2F.%2Fdemo'), base.replace('path=%2F0x11%2Fdemo', 'path=%00'),
+                base.replace('path=%2F0x11%2Fdemo', 'path=%2F%09'), base.replace('path=%2F0x11%2Fdemo', 'path=%2F%0A'),
                 base.replace('slot=%2Ftext', 'slot=%2F%7F'),
-                base.replace('path=%2Fdemo', 'path=%zz'), '/debug-read/value']
+                base.replace('path=%2F0x11%2Fdemo', 'path=%zz'), '/debug-read/value']
             for target in invalid:
                 assert request(target, 400) == {'version': 1, 'error': 'invalid_query'}
             assert request(base, 405, method='POST') == {'version': 1, 'error': 'method_not_allowed'}
             with ThreadPoolExecutor(max_workers=4) as clients:
                 values = list(clients.map(lambda _: chunk(expected_hex='68656c6c6f'), range(8)))
             assert all(v == original for v in values)
-            after = Document(request('/debug/log')).workspace
+            after = Document(request('/debug/0x11/log')).workspace
             assert before == after, 'Success, errors and concurrent value reads must not mint or journal.'
 
-            assert 'committed' in request('/edit/demo', 200, method='POST', data={'text': 'changed'})
-            changed = Document(request('/debug/demo', save='changed.html'))
+            assert 'committed' in request('/edit/0x11/demo', 200, method='POST', data={'text': 'changed'})
+            changed = Document(request('/debug/0x11/demo', save='changed.html'))
             new_epoch = changed.fields['/text']['data-value-epoch']
             new = chunk(at=new_epoch, expected_hex=b'changed'.hex(), save='changed.json')
             assert int(new['recordEpoch']) > int(original['recordEpoch'])
             assert chunk(expected_hex='68656c6c6f', save='old-after-change.json') == original
-            assert 'committed' in request('/vine/demo', 200, method='POST', data={'verb': 'cull'})
-            latest = Document(request('/debug/log')).workspace['data-page-epoch']
+            assert 'committed' in request('/vine/0x11/demo', 200, method='POST', data={'verb': 'cull'})
+            latest = Document(request('/debug/0x11/log')).workspace['data-page-epoch']
             assert request(url(at=latest), 410) == {'version': 1, 'error': 'record_deleted'}
             assert chunk(expected_hex='68656c6c6f', save='old-after-delete.json') == original
             (work / 'results.json').write_text(json.dumps(dict(port=port, passed=True, requests=results), indent=2))

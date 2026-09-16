@@ -43,6 +43,10 @@ def key(*segments):
     return 'v1' + ''.join(map(segment, segments))
 
 
+def local_key(*segments):
+    return key(('x', 17), *segments)
+
+
 class Workspace(HTMLParser):
     def __init__(self, html):
         super().__init__()
@@ -134,10 +138,10 @@ def main():
                     (work / save).write_bytes(body)
                 return json.loads(body) if ctype == 'application/json' else body.decode()
 
-            def url(path_key=key('demo'), collection='children', **options):
+            def url(path_key=local_key('demo'), collection='children', **options):
                 return '/debug-read/physical?' + urllib.parse.urlencode(dict(pathKey=path_key, collection=collection, **options), safe='/:')
 
-            def page(path_key=key('demo'), collection='children', save=None, **options):
+            def page(path_key=local_key('demo'), collection='children', save=None, **options):
                 out = request(url(path_key, collection, **options), save=save)
                 assert out['version'] == 1 and out['resolution'] == 'physical'
                 assert out['pathKey'] == path_key and out['collection'] == collection
@@ -153,7 +157,7 @@ def main():
                 return out
 
             if args.scenario == 'epoch':
-                before_log = Workspace(request('/debug/log', save='epoch-journal-before.html')).attrs
+                before_log = Workspace(request('/debug/0x11/log', save='epoch-journal-before.html')).attrs
                 before = page(collection='slots', save='epoch-before.json')
                 epoch = before['epoch']
                 assert before['total'] == '11' and before['own']['fields'] == '11'
@@ -162,9 +166,9 @@ def main():
                 next_page = page(collection='slots', epoch=epoch, after=first['next'],
                     limit=2, save='epoch-next.json')
                 assert first['entries'] + next_page['entries'] == before['entries'][:4]
-                assert before_log == Workspace(request('/debug/log',
+                assert before_log == Workspace(request('/debug/0x11/log',
                     save='epoch-journal-after-reads.html')).attrs
-                assert 'committed' in request('/edit/demo', method='POST', data={'text': 'changed'})
+                assert 'committed' in request('/edit/0x11/demo', method='POST', data={'text': 'changed'})
                 fresh = page(collection='slots', save='epoch-after.json')
                 assert int(fresh['epoch']) > int(epoch)
                 assert fresh['own']['recordEpoch'] == fresh['epoch']
@@ -177,11 +181,11 @@ def main():
                 print(f'PASS clean epoch transition: {len(results)} HTTP requests; artifacts: {work}', flush=True)
                 return
 
-            baseline = Workspace(request('/debug/log', save='journal-before.html')).attrs
+            baseline = Workspace(request('/debug/0x11/log', save='journal-before.html')).attrs
             assert baseline['data-page-epoch'] == '3' and baseline['data-child-count'] == '1'
             demo = page(collection='slots', save='demo-slots.json')
             epoch = demo['epoch']
-            maximum = 'v1' + '/f:' * 2730
+            maximum = local_key() + '/f:' * 2727 + '/rd:'
             assert len(maximum) == 8192
             assert request(url(maximum, 'slots', epoch=epoch, after=maximum), 404,
                 save='maximum-identities.json') == dict(version=1, error='path_missing')
@@ -207,27 +211,27 @@ def main():
             assert page(collection='slots', limit=1, save='demo-first.json')['own'] == own
             continued = page(collection='slots', epoch=epoch, after='v1', limit=1, save='demo-after-empty.json')
             assert continued['own'] == own and continued['entries'][0]['key'] != 'v1'
-            assert page(key('empty'), 'slots', save='empty.json')['complete']
-            spine = page(key('spine'), save='spine.json')
+            assert page(local_key('empty'), 'slots', save='empty.json')['complete']
+            spine = page(local_key('spine'), save='spine.json')
             assert spine['own']['state'] == 'unknown' and spine['total'] == '1'
             assert spine['entries'][0]['node']['state'] == 'live'
-            assert page(key('dead'), save='dead-children.json')['own']['state'] == 'tombstone'
-            page('v1', 'slots', save='root-slots.json')
-            ordered = page(key('order'), save='order.json')
+            assert page(local_key('dead'), save='dead-children.json')['own']['state'] == 'tombstone'
+            page(local_key(), 'slots', save='root-slots.json')
+            ordered = page(local_key('order'), save='order.json')
             assert ordered['total'] == '35'
-            walk = page(key('order'), epoch=epoch, limit=1, save='order-first.json')
+            walk = page(local_key('order'), epoch=epoch, limit=1, save='order-first.json')
             seen_order = []
             for _ in range(40):
                 seen_order.extend(entry['key'] for entry in walk['entries'])
                 assert len(set(seen_order)) == len(seen_order), 'Opaque aura cursor re-admitted an earlier key'
                 if walk['complete']:
                     break
-                walk = page(key('order'), epoch=epoch, after=walk['next'], limit=1)
+                walk = page(local_key('order'), epoch=epoch, after=walk['next'], limit=1)
             assert walk['complete'] and seen_order == [entry['key'] for entry in ordered['entries']]
             print('PASS metadata, exact scalar previews, opaque keys and native aura ordering', flush=True)
 
             for name, collection in [('big', 'children'), ('slots', 'slots')]:
-                out = page(key(name), collection, save=f'{name}-first.json')
+                out = page(local_key(name), collection, save=f'{name}-first.json')
                 assert out['total'] == '10000'
                 seen = []
                 index = 0
@@ -236,17 +240,17 @@ def main():
                     if out['complete']:
                         break
                     index += 1
-                    out = page(key(name), collection, epoch=epoch, after=out['next'],
+                    out = page(local_key(name), collection, epoch=epoch, after=out['next'],
                         save=f'{name}-second.json' if index == 1 else None)
                 assert seen == [key(('u', n)) for n in range(10000)]
-                page(key(name), collection, epoch=epoch, after=key(('u', 9999)), save=f'{name}-terminal.json')
-                absent = page(key(name), collection, epoch=epoch, after=key(('u', 20000)), save=f'{name}-absent.json')
+                page(local_key(name), collection, epoch=epoch, after=key(('u', 9999)), save=f'{name}-terminal.json')
+                absent = page(local_key(name), collection, epoch=epoch, after=key(('u', 20000)), save=f'{name}-absent.json')
                 assert absent['complete'] and not absent['entries']
                 print(f'PASS all 10000 {collection} exactly once across {index+1} HTTP pages', flush=True)
 
-            wide = page(key('wide'), 'slots', save='wide-first.json')
+            wide = page(local_key('wide'), 'slots', save='wide-first.json')
             assert 0 < len(wide['entries']) < 20 and not wide['complete']
-            second = page(key('wide'), 'slots', epoch=epoch, after=wide['next'], save='wide-second.json')
+            second = page(local_key('wide'), 'slots', epoch=epoch, after=wide['next'], save='wide-second.json')
             assert second['complete'] and len(wide['entries']) + len(second['entries']) == 20
             assert not ({entry['key'] for entry in wide['entries']} & {entry['key'] for entry in second['entries']})
             assert request(url(maximum, 'slots', epoch=epoch, after=maximum), 404,
@@ -254,17 +258,17 @@ def main():
             print(f'PASS paired maximum identities after large walks: {results[-1]["ms"]}ms', flush=True)
 
             for target, status, error in [
-                (url(key('missing')), 404, 'path_missing'),
-                (url(key('spine'), 'slots'), 404, 'record_missing'),
-                (url(key('dead'), 'slots'), 410, 'record_deleted'),
+                (url(local_key('missing')), 404, 'path_missing'),
+                (url(local_key('spine'), 'slots'), 404, 'record_missing'),
+                (url(local_key('dead'), 'slots'), 410, 'record_deleted'),
                 (url(key('x', 'demo')), 422, 'derived_path'),
                 (url(key('o', 'demo')), 422, 'derived_path'),
                 (url(key('h', 'demo')), 422, 'derived_path'),
                 (url(epoch='2'), 409, 'epoch_conflict'),
                 (url(epoch='4'), 409, 'epoch_conflict'),
                 (url(epoch='9'*128), 409, 'epoch_conflict'),
-                (url(key('oversized')), 422, 'key_too_large'),
-                (url(key('zzzbroken')), 500, 'read_failed')]:
+                (url(local_key('oversized')), 422, 'key_too_large'),
+                (url(local_key('zzzbroken')), 500, 'read_failed')]:
                 assert request(target, status, save=f'error-{error}.json') == dict(version=1, error=error)
                 assert page(collection='slots') == demo, 'Error must not strand pending read or mutate state'
             base = url()
@@ -314,12 +318,12 @@ def main():
             print('PASS strict queries, raw control bytes, stable errors and recovery', flush=True)
 
             def concurrent(n):
-                return page(key('big'), epoch=epoch, after=key(('u', n*100)), limit=3)
+                return page(local_key('big'), epoch=epoch, after=key(('u', n*100)), limit=3)
             with ThreadPoolExecutor(max_workers=4) as clients:
                 replies = list(clients.map(concurrent, range(8)))
             for n, out in enumerate(replies):
                 assert [entry['key'] for entry in out['entries']] == [key(('u', i)) for i in range(n*100+1, n*100+4)]
-            after = Workspace(request('/debug/log', save='journal-after.html')).attrs
+            after = Workspace(request('/debug/0x11/log', save='journal-after.html')).attrs
             assert baseline == after, 'Physical success/error/concurrent reads must not mint or journal'
             report = dict(port=port, scenario='large', passed=True, requests=results)
             (work/'results.json').write_text(json.dumps(report, indent=2))

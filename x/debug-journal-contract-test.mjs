@@ -39,8 +39,9 @@ try {
         older: doc.querySelector('[data-journal-older]')?.getAttribute('href') || null,
         latest: doc.querySelector('[data-journal-latest]')?.getAttribute('href') || null};
     }, {html, parserURL});
-    const children = Array.from({length: contract.count}, (_, index) => '/log/' + (contract.first - index));
-    assert.equal(actual.path, '/log'); assert.equal(actual.kind, 'journal'); assert.equal(actual.writable, false);
+    const journalRoot = '/0x11/log';
+    const children = Array.from({length: contract.count}, (_, index) => journalRoot + '/' + (contract.first - index));
+    assert.equal(actual.path, journalRoot); assert.equal(actual.kind, 'journal'); assert.equal(actual.writable, false);
     assert.deepEqual(actual.pagination, {kind: 'journal', before: contract.before, nextBefore: contract.nextBefore,
       limit: contract.limit, total: '10000', epoch: '10000'}, name + ': exact physical metadata');
     assert.deepEqual(actual.children, children, name + ': descending selected keys');

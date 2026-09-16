@@ -4,6 +4,10 @@ import {readFileSync} from 'node:fs';
 const load = async name => import('data:text/javascript;base64,' + Buffer.from(readFileSync(new URL('../src/foil/debug/' + name, import.meta.url))).toString('base64'));
 const {createReadCoordinator} = await load('read-coordinator.js');
 const {BoundedCache} = await load('bounded-cache.js');
+const {isJournalRoot} = await load('journal.js');
+for (const path of ['/0x11/log', '/0x0001/log', '/0xff/log']) assert.ok(isJournalRoot(path));
+for (const path of ['/0x1/log', '/0x00/log', '/0x1100/log', '/0xFF/log', '/sys/log', '/0x11/log/1'])
+  assert.equal(isJournalRoot(path), false, path);
 const started = [], pending = new Map();
 let active = 0, maximum = 0;
 const fetcher = (url, {signal}) => new Promise((resolve, reject) => {
@@ -79,7 +83,7 @@ const start = navigationSource.indexOf('  async function navigate(');
 const end = navigationSource.indexOf('  async function inspect(', start);
 assert.ok(start >= 0 && end > start);
 const navigations = new Map();
-const harness = new Function('read', 'document', 'history', 'CustomEvent', `
+const harness = new Function('read', 'document', 'history', 'CustomEvent', 'isJournalRoot', `
   let busy=false, activeNavigation=null, current='/initial', visits=['/initial'], visitPages=[null], visitCollections=[''], cursor=0, page=null, collection='';
   const collectionQuery=value=>value||'';
   const mayLeave=()=>true, focusedWithinMain=()=>false, setBusy=value=>{busy=value;};
@@ -88,7 +92,7 @@ const harness = new Function('read', 'document', 'history', 'CustomEvent', `
   ${navigationSource.slice(start, end)}
   return {navigate, current:()=>current, busy:()=>busy, lock:()=>{busy=true; activeNavigation=null;}};
 `)((path, options) => new Promise(resolve => navigations.set(path, {resolve, signal: options.signal})),
-  {dispatchEvent() {}}, {pushState() {}}, class {constructor(type, data) {this.type=type; this.detail=data?.detail;}});
+  {dispatchEvent() {}}, {pushState() {}}, class {constructor(type, data) {this.type=type; this.detail=data?.detail;}}, isJournalRoot);
 const first = harness.navigate('/first');
 const second = harness.navigate('/second');
 assert.ok(navigations.get('/first').signal.aborted);

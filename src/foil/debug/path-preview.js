@@ -1,4 +1,5 @@
 import {BoundedCache} from './bounded-cache.js';
+import {isJournalRoot} from './journal.js';
 
 import {declaredTemplate} from './declarations.js';
 
@@ -78,7 +79,7 @@ export function createPathPreview({resolvePath, readPreview, initialView, render
     if (stored) {
       setContent('ready', renderRecord(stored, chosen.href)); return;
     }
-    if (chosen.path === '/log') {
+    if (isJournalRoot(chosen.path)) {
       const note = declaredTemplate('context-note'); note.textContent = 'Open activity to inspect its entries.';
       setContent('unavailable', note); return;
     }

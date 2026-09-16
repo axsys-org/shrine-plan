@@ -1,16 +1,18 @@
 # Debugger declaration boundary
 
-The debugger definitions are published under `/gov/debug`, including a reusable
-Grove template. An instance is installed at `/app/debug` through the same
+The debugger definitions are published under `/<node>/gov/debug`, including a reusable
+Grove template. An instance is installed at `/<node>/app/debug` through the same
 `grove_install/instantiate` path as SRS. Its `/page` tree declares `weft: %/page`
 and an instance-relative `tack` to `/input`; its title and head assets are data
 on that installed view. This supersedes the earlier renderer-only registry.
+`<node>` is the configured hexadecimal authority, for example `0x11`; `/sys`
+belongs to the selected immutable system publication, not that authority.
 
 ## Ownership
 
 - `src/grove/debugger/application.grove`: inspection slots, codecs and role.
   Optional page/cursor metadata is separate from the
-  selected records, target, version metadata, operation list and presentation scope.
+  selected records, target, local authority, version metadata, operation list and presentation scope.
 - `src/grove/debugger.grove`: page/inspector norms and sewn transformations.
 - `src/grove/debugger/instance.grove`: concrete instance seeds, declared after
   their norms and sewn transformations.
@@ -69,8 +71,16 @@ The generic adapter currently supports own-record input norms and HTML output;
 it is not a universal Grove application server, reactive binding mechanism, or
 capability sandbox. It captures a view for the server lifetime. Updating an
 installed declaration does not hot-swap an already captured renderer. This
-application restructuring and the newer namespace-runtime API port are separate
-verification gates; no rebase compatibility is implied by an app test passing.
+application restructuring and the namespace-runtime API port are separate
+verification gates. The latter must exercise separate local/system histories,
+qualified paths, immutable system records, and read-only derived views; a
+successful rebase alone is not evidence of runtime compatibility.
+
+The composed namespace root exposes authority links without hydrating either
+subtree. Physical reads select the owning history before interpreting epochs.
+Journal rows show actual namespace commits and changes, not the retired task,
+effect or acknowledgement payload. Browser parser labels normalize version
+metadata for display; stored publisher-owned slot identities are preserved.
 
 Earlier findings and migration notes are local-only archives; this document
 and the PR guide describe the supported declaration boundary.

@@ -43,7 +43,9 @@ guess or ignored/prebuilt asset input. It writes `.check/debug-assets/foil` by
 default. `DEBUG_OUTPUT_ROOT` can name another staging directory. The launcher
 chooses a free port, freezes source and verifies build hashes before listening.
 It never copies a live namespace snapshot. SRS is opt-in via
-`--entry start-debug-srs`; ordinary `start-debug` does not publish `/gov/srs`.
+`--entry start-debug-srs`; ordinary `start-debug` does not publish
+`/<node>/gov/srs`. `--node` selects a nonzero hexadecimal authority; the
+disposable preview default is `0x11`.
 Do not point build output at an active preview's served files.
 
 After the controller prints its manifest, a separate terminal can verify it:
@@ -63,8 +65,8 @@ Artifacts remain after shutdown. Never restart a user's preview to run tests.
 For an explicit port, `python3 x/eden --debug --port 8140` uses the same staged
 native assets and a compiler-only snapshot; add `--srs` for the example app.
 `--srs` alone retains the original SRS explorer, not the debugger. `/ns` is the
-legacy explorer. `/debug` requires the installed `/app/debug/page` view (from
-the `/gov/debug` template) and returns 503 if
+legacy explorer. `/debug` requires the installed `/<node>/app/debug/page` view (from
+the `/<node>/gov/debug` template) and returns 503 if
 it is missing. There is no legacy browser build; `--legacy` is rejected.
 
 ## Paired PR order
@@ -103,6 +105,9 @@ staged change in a development checkout still makes that checkout dirty.
   real Eden scenarios publish into their disposable namespace. Keep pagination,
   immutable values, mutation/epoch conflicts and malformed-request coverage;
   remove obsolete renderer/layout assumptions instead of deleting that coverage.
+- Run authority-isolation and derived-read coverage when porting runtime APIs.
+  A composed root has no single physical epoch; `/sys` and `/<node>` histories
+  must not borrow each other's clocks or write permissions.
 - Run Mash type checks and its touched component/browser suites. Run the
   restored Shrine inventory gate for the intended scope; focused debugger
   success does not substitute for full kernel/transport regression coverage.

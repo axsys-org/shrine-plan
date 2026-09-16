@@ -15,12 +15,16 @@ const verified = JSON.parse(execFileSync('python3', [resolve(root, 'x/debug-grov
 const seal = JSON.parse(await readFile(resolve(verified.work, 'assets.json'), 'utf8'));
 assert.ok(seal.assets?.['/debug.css']?.sha256 && seal.assets?.['/debug-components.css']?.sha256, 'Final frontend assets must be sealed before UI starts');
 const base = verified.origin;
+assert.match(verified.node, /^0x(?:[0-9a-f]{2})+$/);
+assert.ok(!verified.node.endsWith('00'));
+const authority = '/' + verified.node;
+const templatePath = authority + '/gov/srs';
 assert.equal(new URL(base).hostname, '127.0.0.1'); assert.notEqual(new URL(base).port, '8138');
 assert.notEqual(new URL(base).port, '51571');
 assert.notEqual(verified.pid, 39258);
 const output = await mkdtemp(resolve(verified.work, 'ui-workflow-'));
 // Every run owns a distinct install, even when diagnosing a harness failure.
-const target = '/app/workflow_' + Date.now();
+const target = authority + '/app/workflow_' + Date.now();
 const cardPath = target + '/cards/demo';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 for (const asset of Object.values(seal.assets))
@@ -38,17 +42,8 @@ const run = {version: 1, evidence: 'real disposable Grove runtime, not fixture d
 const browser = await chromium.launch();
 
 async function context(options = {}) {
-  // Playwright 1.62's serviceWorkers:block script reads navigator.serviceWorker
-  // inside every frame, throwing in the application's intentionally sandboxed
-  // preview. Block registration without evaluating that forbidden getter.
-  const context = await browser.newContext({viewport: {width: 1440, height: 960}, ...options});
+  const context = await browser.newContext({viewport: {width: 1440, height: 960}, serviceWorkers: 'block', ...options});
   context.setDefaultTimeout(5000); context.setDefaultNavigationTimeout(20_000);
-  await context.addInitScript(() => {
-    if (typeof ServiceWorkerContainer !== 'undefined') Object.defineProperty(ServiceWorkerContainer.prototype, 'register', {
-      configurable: true,
-      value() { return Promise.reject(new Error('Service worker registration blocked by the isolated Grove workflow harness')); },
-    });
-  });
   await context.addInitScript(origin => {
     if (window !== window.top || location.origin !== origin || sessionStorage.getItem('grove-owned-profile')) return;
     localStorage.setItem('shrine-debug.v1.saved', '[]');
@@ -69,7 +64,7 @@ async function context(options = {}) {
       const form = new URLSearchParams(request.postData());
       const exact = authorizedInstall && url.pathname === '/grove/install' && !url.search &&
         form.get('source') === authorizedInstall.source && form.get('version') === authorizedInstall.version &&
-        form.get('root') === authorizedInstall.root && form.get('back') === '/debug/gov/srs' &&
+        form.get('root') === authorizedInstall.root && form.get('back') === '/debug' + templatePath &&
         [...form.keys()].sort().join(',') === 'back,root,source,version' && postCount < 2;
       if (!exact) { unexpected.push({reason: 'unapproved write', ...record}); return route.abort(); }
       record.purpose = authorizedInstall.purpose; record.fields = [...form];
@@ -172,12 +167,12 @@ try {
   const desktop = await context();
   try {
     const page = await desktop.newPage(); activePage = page;
-    await page.goto(base + '/debug/gov/srs'); await ready(page, '/gov/srs');
+    await page.goto(base + '/debug' + templatePath); await ready(page, templatePath);
     const install = page.locator('.wb-semantics form[action="/grove/install"]');
     await install.waitFor();
     const source = await install.locator('input[name=source]').inputValue();
     const version = await install.locator('input[name=version]').inputValue();
-    assert.equal(source, '/gov/srs'); assert.match(version, /^[1-9]\d*$/);
+    assert.equal(source, templatePath); assert.match(version, /^[1-9]\d*$/);
     assert.match(await page.locator('#debug-main').innerText(), /Create an independent instance/);
     await capture(page, 'real-template-desktop');
     authorizedInstall = {purpose: 'install', source, version, root: target};
@@ -188,7 +183,7 @@ try {
     assert.equal(installed.status(), 200); assert.match(await installed.text(), /committed;/);
     await page.waitForFunction(() => /^Committed /.test(document.querySelector('#debug-status').textContent) &&
       document.querySelector('#debug-workspace').getAttribute('aria-busy') !== 'true', null, {timeout: 20_000});
-    await ready(page, '/gov/srs');
+    await ready(page, templatePath);
     checks.push('Real server-authored Install instance form committed exactly the chosen owned target');
 
     await go(page, cardPath);
@@ -204,18 +199,26 @@ try {
     await page.locator('.wb-slot-key[data-inspect="/sys/req"]').first().click();
     await page.waitForFunction(() => document.querySelector('#debug-workspace').dataset.inspectorPath === '/sys/req' &&
       document.querySelector('#debug-workspace').getAttribute('aria-busy') !== 'true', null, {timeout: 20_000});
-    assert.match(await page.locator('.wb-inspector').innerText(), /The request record on a driver-minted node/);
+    // Compiler publication owns this system definition. The new runtime
+    // publishes its mold and artifact, not the prototype's injected help text.
+    const definition = await sourceDocument(page, '/sys/req');
+    assert.equal(definition.workspace.path, '/sys/req');
+    assert.equal(definition.workspace.writable, 'false');
+    assert.equal(definition.fields.find(field => field.key === '/sys/mold')?.text, '/sys/types/path@x1');
+    assert.equal(definition.fields.find(field => field.key === authority + '/compiler/artifact')?.text, 'code');
+    assert.match(await page.locator('.wb-inspector').innerText(), /\/sys\/types\/path@x1/);
+    run.slotDefinition = definition;
     assert.equal(await page.locator('#debug-workspace').getAttribute('data-path'), cardPath);
-    await capture(page, 'real-field-definition');
+    await capture(page, 'real-slot-definition');
     await page.locator('#debug-inspector-toggle').click();
     checks.push('Installed starter card and its real slot definition render without fixture replacement');
 
-    await go(page, '/gov/srs/card');
+    await go(page, templatePath + '/card');
     assert.equal(await page.locator('#debug-workspace').getAttribute('data-kind'), 'role');
     assert.match(await page.locator('#debug-main').innerText(), /Review card/);
     await capture(page, 'real-source-role');
-    await go(page, '/gov/srs/finish');
-    const action = await sourceDocument(page, '/gov/srs/finish');
+    await go(page, templatePath + '/finish');
+    const action = await sourceDocument(page, templatePath + '/finish');
     assert.equal(action.workspace.kind, 'action');
     assert.match(await page.locator('#debug-main').innerText(), /Finish review/);
     run.action = action;
@@ -232,7 +235,7 @@ try {
     // /x treats its entire tail as the defining datum, not as a subtree
     // address. The resolver's /h framing separates target from result path.
     // This newly installed defining datum has exactly its first local case.
-    const pinnedQueue = '/h/z/1/4' + queuePath;
+    const pinnedQueue = '/h/z/1/' + queuePath.split('/').filter(Boolean).length + queuePath;
     await go(page, pinnedQueue);
     const queuedRow = page.locator('.wb-child-row[data-path="' + pinnedQueue + '/0"]');
     await queuedRow.locator('[part="toggle"]').click();
@@ -241,21 +244,21 @@ try {
     await capture(page, 'real-derived-queue');
     checks.push('Actual source role/action and read-only sewn queue are distinguishable; no speculative grade was sent');
 
-    await go(page, '/gov/srs');
+    await go(page, templatePath);
     authorizedInstall = {purpose: 'duplicate-install', source, version, root: target};
     await install.locator('ui-input[name=root] input').fill(target);
     const rejectedResponse = page.waitForResponse(response => response.request().method() === 'POST', {timeout: 30_000});
     await install.getByRole('button', {name: 'Install instance', exact: true}).click();
     const rejected = await rejectedResponse;
     assert.equal(rejected.status(), 409); assert.match(await rejected.text(), /Installation rejected/);
-    await ready(page, '/gov/srs');
+    await ready(page, templatePath);
     assert.equal(await install.locator('ui-input[name=root] input').inputValue(), target, 'Actual rejected installation retains its draft');
     assert.match(await page.locator('#wb-feedback').innerText(), /Operation rejected \(HTTP 409\)/);
     await capture(page, 'real-install-rejection');
     page.once('dialog', async dialog => {
       assert.match(dialog.message(), /discard unsubmitted operation inputs/); await dialog.accept();
     });
-    const historical = '/h/x/e' + prompt.valueEpoch + '/4' + cardPath;
+    const historical = '/h/x/e' + prompt.valueEpoch + '/' + cardPath.split('/').filter(Boolean).length + cardPath;
     await go(page, historical);
     const old = await sourceDocument(page, historical);
     assert.equal(old.fields.find(field => field.key === '/sys/req')?.text, prompt.text);
@@ -287,7 +290,10 @@ try {
   await Promise.all([...responseTasks]);
   assert.equal(postCount, 2);
   assert.deepEqual(unexpected, []); assert.deepEqual(pageErrors, []); assert.deepEqual(failures, []);
-  for (const [url, asset] of Object.entries(seal.assets)) assert.equal(assetReplies.get(url)?.sha256, asset.sha256,
+  assert.deepEqual([...assetReplies.keys()].sort(),
+    ['/debug-components.css', '/debug-mash.js', '/debug.css', '/debug.js'].sort(),
+    'The Grove debugger loads exactly its declared assets, never legacy /style.css');
+  for (const [url, reply] of assetReplies) assert.equal(reply.sha256, seal.assets[url].sha256,
     'Actual HTTP-served asset is the exact sealed candidate: ' + url);
   run.passed = true;
   console.log(JSON.stringify({passed: true, requests: requests.length, realOwnedPosts: postCount,

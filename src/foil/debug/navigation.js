@@ -5,7 +5,7 @@ import {declaredTemplate} from './declarations.js';
 import { parseDebugDocument } from './namespace.js';
 import { createSidebar } from './sidebar.js';
 import {debugReads} from './read-coordinator.js';
-import { journalPage, journalPageFromURL, journalQuery, sameJournalPage, assertJournalPage } from './journal.js';
+import { isJournalRoot, journalPage, journalPageFromURL, journalQuery, sameJournalPage, assertJournalPage } from './journal.js';
 export const initialView = parseDebugDocument(document);
 export let navigation;
 (() => {
@@ -30,7 +30,7 @@ export let navigation;
     }
     return output.toString();
   };
-  let collection = currentPath() === '/log' ? '' : collectionQuery(location.search);
+  let collection = isJournalRoot(currentPath()) ? '' : collectionQuery(location.search);
   let visitCollections = [collection];
   let cursor = 0;
   let sidebar;
@@ -46,12 +46,12 @@ export let navigation;
         session.visits.every(validPath) && Number.isInteger(session.cursor) &&
         session.cursor >= 0 && session.cursor < session.visits.length &&
         session.visits[session.cursor] === currentPath()) {
-      const pages = session.visits.map((path, index) => path === '/log'
+      const pages = session.visits.map((path, index) => isJournalRoot(path)
         ? journalPage(session.pages?.[index] || undefined) : null);
       visits = session.visits;
       cursor = session.cursor;
       visitPages = pages;
-      visitCollections = visits.map((path, index) => path === '/log' ? '' : collectionQuery(session.collections?.[index] || ''));
+      visitCollections = visits.map((path, index) => isJournalRoot(path) ? '' : collectionQuery(session.collections?.[index] || ''));
       // The server document is authoritative after a direct link/reload.
       visitPages[cursor] = page;
       visitCollections[cursor] = collection;
@@ -118,7 +118,7 @@ export let navigation;
       throw new Error('Use a canonical namespace path, without . or .. segments.');
     }
     return '/debug' + (segments.length ? '/' + segments.map(encodeURIComponent).join('/') : '') +
-      (segments.length === 1 && segments[0] === 'log' && page ? journalQuery(page) : '');
+      (isJournalRoot('/' + segments.join('/')) && page ? journalQuery(page) : '');
   }
 
   // Recent links retain the recorded page, including native modifier opens.
@@ -132,7 +132,6 @@ export let navigation;
   function currentURL() {
     const url = new URL(debugURL(currentPath(), page), location.href);
     if (collection) url.search = collection;
-    if (get('#debug-workspace').dataset.viewMode === 'rendered') url.searchParams.set('view', 'rendered');
     return url.pathname + url.search;
   }
 
@@ -197,7 +196,7 @@ export let navigation;
       // the pending-work lock but do not require write access to this record.
       const caseNavigation = button.closest('form[data-debug-navigation="case"]');
       button.disabled = authoredDisabled.has(button) || value || (!caseNavigation &&
-        (get('#debug-workspace').dataset.viewMode === 'rendered' || get('#debug-workspace').dataset.writable !== 'true'));
+        get('#debug-workspace').dataset.writable !== 'true');
     });
     controls();
     if (!value) {
@@ -212,7 +211,7 @@ export let navigation;
     if (query) for (const [key, value] of new URLSearchParams(query)) {
       if (['epoch', 'children', 'slots'].includes(key)) url.searchParams.set(key, value);
     }
-    if (path !== '/log') url.searchParams.set('scope', scope);
+    if (!isJournalRoot(path)) url.searchParams.set('scope', scope);
     // A richer in-flight fragment can satisfy a smaller read, never the
     // reverse. Each consumer still parses its own inert Document.
     const alternatives = (scope === 'outline' ? ['preview', 'workspace'] : scope === 'preview' ? ['workspace'] : [])
@@ -243,7 +242,7 @@ export let navigation;
 
   function show({ workspace, view, query = '' }, notify = true, refreshed = false, focusMain = false) {
     const root = get('#debug-workspace');
-    for (const name of ['path', 'writable', 'kind', 'label', 'description', 'descriptionSource', 'renderUrl']) {
+    for (const name of ['path', 'namespaceRoot', 'writable', 'kind', 'label', 'description', 'descriptionSource']) {
       root.dataset[name] = workspace.dataset[name] || '';
     }
     for (const name of ['paging', 'pageBefore', 'pageNextBefore', 'pageLimit', 'childCount', 'pageEpoch', 'scope', 'readEpoch', 'nextChildren', 'nextSlots', 'slotCount']) {
@@ -257,7 +256,6 @@ export let navigation;
     root.querySelector('[slot=inspector]').replaceWith(workspace.querySelector('[slot=inspector]'));
     root.dataset.inspectorPath = currentPath();
     get('#debug-go ui-input').value = currentPath();
-    get('.debug-locator ui-path')?.setAttribute('path', debugURL(currentPath()));
     document.title = 'Shrine debug · ' + currentPath();
     prepare({ freshMain: true });
     sidebar.seed(view);
@@ -297,9 +295,9 @@ export let navigation;
     const focusMain = focusedWithinMain();
     setBusy(true);
     try {
-      const nextPage = path === '/log' ? journalPage(requestedPage ||
+      const nextPage = isJournalRoot(path) ? journalPage(requestedPage ||
         (visit !== null ? visitPages[visit] : undefined) || undefined) : null;
-      const nextCollection = path === '/log' ? '' : collectionQuery(requestedCollection ?? (visit !== null ? visitCollections[visit] : '') ?? '');
+      const nextCollection = isJournalRoot(path) ? '' : collectionQuery(requestedCollection ?? (visit !== null ? visitCollections[visit] : '') ?? '');
       const answer = await read(path, { page: nextPage, query: nextCollection, signal: controller.signal });
       if (activeNavigation !== controller) return false;
       show(answer, false);
@@ -350,16 +348,12 @@ export let navigation;
     // temporarily disabled. Capture availability only from a fresh document.
     if (freshMain) get('#debug-main').querySelectorAll('form ui-button[type=submit][disabled], form button[type=submit][disabled]')
       .forEach(control => authoredDisabled.add(control));
-    // Older running Foil sessions still emit the retired inspector header.
-    // Remove its entire slot so the component also reclaims its layout space.
-    get('#debug-workspace [slot=inspector-locator]')?.remove();
     get('#debug-workspace').dataset.inspectorPath ||= currentPath();
     // Arrow keys explore the hierarchy; Enter/Space activates navigation.
     const navigation = get('#debug-path-tree ui-tree');
     if (navigation) navigation.selectionFollowsFocus = false;
     // Keep reference and history links in the debugger.
     document.querySelectorAll('#debug-workspace a[href^="/ns"]').forEach((link) => {
-      if (link.matches('.wb-render-open')) return;
       const href = link.getAttribute('href');
       if (href === '/ns' || href.startsWith('/ns/')) link.setAttribute('href', '/debug' + href.slice(3));
     });
@@ -386,7 +380,7 @@ export let navigation;
       try {
         const path = decodeURIComponent(url.pathname.slice(6)) || '/';
         void navigate(path, target.dataset.visit === undefined ? null : Number(target.dataset.visit), false,
-          path === '/log' ? journalPageFromURL(url) : undefined, collectionQuery(url.search));
+          isJournalRoot(path) ? journalPageFromURL(url) : undefined, collectionQuery(url.search));
       } catch (error) { report(error.message, true, {operation: 'navigate', context: url.pathname}); }
     }
   });
@@ -395,7 +389,7 @@ export let navigation;
     try {
       const path = decodeURIComponent(location.pathname.slice(6)) || '/';
       const index = Number.isInteger(event.state?.cursor) && visits[event.state.cursor] === path ? event.state.cursor : null;
-      if (await navigate(path, index, true, path === '/log' ? journalPageFromURL(new URL(location.href)) : undefined, collectionQuery(location.search))) return;
+      if (await navigate(path, index, true, isJournalRoot(path) ? journalPageFromURL(new URL(location.href)) : undefined, collectionQuery(location.search))) return;
     } catch (error) { report(error.message, true, {operation: 'navigate', context: location.pathname}); }
     history.pushState({ shrineDebug: true, cursor }, '', currentURL());
   });
@@ -434,8 +428,7 @@ export let navigation;
       await navigate(path);
       return;
     }
-    if (get('#debug-workspace').dataset.writable !== 'true' ||
-        get('#debug-workspace').dataset.viewMode === 'rendered') {
+    if (get('#debug-workspace').dataset.writable !== 'true') {
       report('This view is read-only. No operation was sent.', true, {operation: 'write', context: form.getAttribute('action')});
       return;
     }
@@ -484,19 +477,12 @@ export let navigation;
 
   // Bind the persistent Grove sidebar; Mash owns its keyboard contract.
   sidebar = createSidebar({ initialView, currentPath, navigate, inspect, toggleSaved, debugURL, visitURL, closeSidebar, report, read: readPreview });
-  // Keep already-running Foil sessions compatible with the leaner header.
-  get('#debug-refresh')?.remove();
   get('#debug-status').textContent = 'Snapshot loaded.';
   prepare({ freshMain: true });
   // Bind the persistent, declared session panel.
   const sessionPanel = get('.debug-footer');
   sessionPanel.querySelector('details').open = true;
   const clearActivity = get('#debug-clear-activity');
-  clearActivity.id = 'debug-clear-activity';
-  clearActivity.setAttribute('type', 'button');
-  clearActivity.setAttribute('size', 'small');
-  clearActivity.setAttribute('variant', 'ghost');
-  clearActivity.textContent = 'Clear activity';
   clearActivity.addEventListener('click', () => get('#debug-activity').replaceChildren());
 
   const wide = !window.matchMedia('(max-width: 832px)').matches;

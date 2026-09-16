@@ -3,9 +3,14 @@ import unittest
 import tempfile
 import json
 import hashlib
+import importlib.util
 from pathlib import Path
 from debug_runtime_helpers import startup_failed, verify_asset_build, ASSET_PATHS
 from debug_transport_fixture import MODES, RETURNED, startup_source, require_declaration, SlotDocument
+
+runtime_spec = importlib.util.spec_from_file_location('debug_grove_runtime', Path(__file__).with_name('debug-grove-runtime.py'))
+runtime = importlib.util.module_from_spec(runtime_spec)
+runtime_spec.loader.exec_module(runtime)
 
 
 class TransportFixtureTests(unittest.TestCase):
@@ -40,6 +45,16 @@ class TransportFixtureTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
+    def test_grove_startup_selects_publication_and_node(self):
+        for entry in ('start-srs', 'start-debug', 'start-debug-srs'):
+            source = runtime.startup_source(entry, 49152, 17)
+            self.assertIn('bootstrap:build-system', source)
+            self.assertIn(f'(eden:{entry} ("x" 17) system resolve slot 49152)', source)
+            self.assertIn('(Try launch 0)', source)
+        for entry, port, node in [('missing', 49152, 17), ('start-debug', 8138, 17), ('start-debug', 49152, 0)]:
+            with self.assertRaises(ValueError):
+                runtime.startup_source(entry, port, node)
+
     def test_caught_compiler_error_is_not_a_failed_launch(self):
         self.assertFalse(startup_failed('(\"error\" (0 \"newtype\" \"unknown row face\"))\n', 'RETURNED'))
 

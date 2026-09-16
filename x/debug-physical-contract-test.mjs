@@ -339,7 +339,7 @@ async function verifyArtifacts(directory, epochDirectory) {
   assert.equal(mergePhysicalPages(first, afterEmpty).entries.length, 2);
   assert.equal(page('empty').complete, true); assert.equal(page('empty').entries.length, 0);
   assert.equal(page('spine').own.state, 'unknown'); assert.equal(page('spine').entries[0].node.state, 'live');
-  assert.equal(page('dead-children').own.state, 'tombstone'); assert.equal(page('root-slots').pathKey, 'v1');
+  assert.equal(page('dead-children').own.state, 'tombstone'); assert.equal(page('root-slots').pathKey, 'v1/x:11');
 
   // Independently spell the persisted fixture's native order. Do not sort the
   // response with the comparator under test and then compare it to itself.
@@ -372,7 +372,7 @@ async function verifyArtifacts(directory, epochDirectory) {
     assert.ok(maximum, 'both actual maximum-key boundary requests are required');
     assert.equal(maximum.error.code, 'path_missing');
     const pathKey = maximum.request.searchParams.get('pathKey'), after = maximum.request.searchParams.get('after');
-    assert.equal(pathKey, 'v1' + '/f:'.repeat(2730)); assert.equal(after, pathKey);
+    assert.equal(pathKey, 'v1/x:11' + '/f:'.repeat(2727) + '/rd:'); assert.equal(after, pathKey);
     const constructed = physicalRequest({pathKey, collection: 'slots', epoch: maximum.request.searchParams.get('epoch'), after});
     assert.ok(constructed.url.split('?')[1].length <= 32768, 'both complete identities retain a usable continuation query');
   }
@@ -382,7 +382,7 @@ async function verifyArtifacts(directory, epochDirectory) {
   const epoch = await loadArtifacts(epochDirectory, 'epoch');
   const before = epoch.page('epoch-before'), epochFirst = epoch.page('epoch-first'), epochNext = epoch.page('epoch-next');
   const changed = epoch.page('epoch-after');
-  assert.equal(before.pathKey, symbol('demo')); assert.equal(before.collection, 'slots'); assert.equal(before.total, '11');
+  assert.equal(before.pathKey, 'v1/x:11/ts:64656d6f'); assert.equal(before.collection, 'slots'); assert.equal(before.total, '11');
   assert.equal(before.complete, true); assert.equal(before.entries.length, 11);
   assert.equal(before.own.labelSource, 'lede'); assert.equal(before.own.label.hex, text('Authored fixture').hex);
   assert.equal(before.own.helpSource, 'lore-body'); assert.equal(before.own.helpLine, 1); assert.equal(before.own.help.hex, text('Authored help').hex);
@@ -403,7 +403,7 @@ async function verifyArtifacts(directory, epochDirectory) {
   assert.equal(stale.error.code, 'epoch_conflict'); assert.equal(stale.error.status, 409);
   assert.equal(stale.request.searchParams.get('epoch'), before.epoch);
   assert.equal(stale.request.searchParams.get('after'), epochFirst.next); assert.equal(stale.request.searchParams.get('limit'), '2');
-  assert.ok(epoch.run.requests.some(entry => entry.path === '/edit/demo' && entry.method === 'POST' && entry.status === 200),
+  assert.ok(epoch.run.requests.some(entry => entry.path === '/edit/0x11/demo' && entry.method === 'POST' && entry.status === 200),
     'the clean runtime recorded an actual successful HTTP edit between its snapshots');
   console.log('PASS: untouched two-scenario real HTTP artifact bridge: large ' + results.size + ' successful pages/' + errorCount + ' errors; clean epoch ' + epoch.results.size + ' successful pages/' + epoch.errorCount + ' errors.');
   console.log('Verified exact metadata/bytes/native order, five within-runtime continuation pairs, both maximum-key requests, terminal gaps and a real clean-runtime write/epoch conflict.');

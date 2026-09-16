@@ -20,6 +20,7 @@ import tempfile
 import time
 import uuid
 from debug_runtime_helpers import startup_failed, verify_asset_build
+from namespace_identity import parse_node_identity
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,27 @@ ASSETS = {
     '/debug-mash.js': 'foil/.debug-assets/mash.js',
     '/debug-components.css': 'foil/.debug-assets/components.css',
 }
+
+
+def startup_source(entry, port, node_number):
+    """Select one trusted system and publisher before invoking the real entry."""
+    if entry not in ('start-srs', 'start-debug', 'start-debug-srs'):
+        raise ValueError('Unknown Grove runtime entry')
+    if not isinstance(port, int) or not 1 <= port <= 65535 or port == PROTECTED_PORT:
+        raise ValueError('Unsafe Grove runtime port')
+    if not isinstance(node_number, int) or node_number <= 0:
+        raise ValueError('A nonzero node identity is required')
+    return f'''(#bind eden (#module eden))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind std (#module std))
+(#import std)
+(define (launch ignored)
+  (define (resolve name) [["x" {node_number}] ["ts" "lib"] ["ts" name]])
+  (define slot [("x" {node_number}) ("ts" "compiler") ("ts" "artifact")])
+  (define system (bootstrap:build-system (Pin eden:{entry}) resolve slot))
+  (eden:{entry} ("x" {node_number}) system resolve slot {port}))
+(print ("GROVE-LAUNCH-RETURNED" (Try launch 0)))
+'''
 
 
 def sha(path):
@@ -80,6 +102,7 @@ def owned(path, require_ready=True):
 
 
 def launch(args):
+    node_number, node = parse_node_identity(args.node)
     if args.template:
         template = args.template.resolve()
     else:
@@ -122,7 +145,7 @@ def launch(args):
                     backendSourceFiles=source_files, template=str(template),
                     templateFiles={name: sha(template / name) for name in ('data.mdb', 'pins.pack')},
                     wisp=str(executable), wispSha256=sha(executable), controllerPid=os.getpid(),
-                    port=port, origin=f'http://127.0.0.1:{port}', pid=None,
+                    port=port, origin=f'http://127.0.0.1:{port}', node=node, pid=None,
                     assets=None, startedAt=time.time(), entry='eden:' + args.entry)
     manifest_path = work / 'runtime.json'
     save(manifest_path, manifest)
@@ -143,7 +166,7 @@ def launch(args):
             save(manifest_path, manifest)
             print(json.dumps(dict(event='compiling', manifest=str(manifest_path),
                                   pid=process.pid, controllerPid=os.getpid(), port=port)), flush=True)
-            process.stdin.write(f'(#bind eden (#module eden))\n(print ("GROVE-LAUNCH-RETURNED" (Try (lambda (ignored) (eden:{args.entry} {port})) 0)))\n')
+            process.stdin.write(startup_source(args.entry, port, node_number))
             process.stdin.flush()
             deadline = started + args.startup_timeout
             while True:
@@ -226,6 +249,8 @@ def main():
     start.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'),
                        help='Wisp executable (defaults to WISP or PATH)')
     start.add_argument('--entry', choices=('start-srs', 'start-debug', 'start-debug-srs'), default='start-debug')
+    start.add_argument('--node', default='0x11',
+                       help='Explicit node identity; disposable previews default to fixture identity 0x11')
     start.add_argument('--startup-timeout', type=int, default=900)
     assets = commands.add_parser('assets')
     assets.add_argument('manifest', type=Path)

@@ -11,13 +11,11 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import test_runner
 from debug_runtime_helpers import startup_failed, verify_asset_build
 
 
@@ -51,6 +49,8 @@ parser.add_argument('--request-timeout', type=int, default=30,
                     help='Seconds allowed per socket check request (default: 30)')
 parser.add_argument('--srs', action='store_true',
                     help='Publish Grove SRS definitions and offer instance installation in the UI')
+parser.add_argument('--debug', action='store_true',
+                    help='Launch the installed Grove debugger; optional SRS uses --srs')
 parser.add_argument('--codex', action='store_true',
                     help='Start the Codex desk driver; --check uses a fake app server')
 parser.add_argument('--codex-bin', default='codex',
@@ -58,6 +58,8 @@ parser.add_argument('--codex-bin', default='codex',
 parser.add_argument('--profile-boot', action='store_true',
                     help='Report startup phases from the disposable source copy')
 args = parser.parse_args()
+if args.debug and args.codex:
+    parser.error('--debug and --codex are separate entry points; choose one')
 boot_started = time.monotonic()
 if args.codex and not args.check and not shutil.which(args.codex_bin):
     parser.error('--codex requires a Codex executable; set --codex-bin')
@@ -85,6 +87,16 @@ except (RuntimeError, OSError) as error:
 staged_at = time.monotonic()
 work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
 shutil.copytree(root / 'src', work / 'src')
+if args.debug:
+    assets = Path(os.environ.get('DEBUG_OUTPUT_ROOT', root / '.check/debug-assets/foil'))
+    try:
+        build = verify_asset_build(assets)
+    except (RuntimeError, OSError) as error:
+        parser.error(str(error))
+    for relative in build['assets']:
+        target = work / 'src' / 'foil' / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(assets / relative, target)
 if args.codex:
     for name in ('codex_slots', 'codex_json', 'codex', 'codex_foot', 'codex_ui', 'codex_driver'):
         shutil.copy2(work / 'src' / 'desks' / 'codex' / (name + '.foil'),
@@ -95,19 +107,6 @@ if args.profile_boot:
 (work / 'snap').mkdir()
 for name in ('data.mdb', 'pins.pack'):
     shutil.copyfile(template / name, work / 'snap' / name)
-source = root / 'src'
-if args.debug:
-    assets = Path(os.environ.get('DEBUG_OUTPUT_ROOT', root / '.check/debug-assets/foil'))
-    try:
-        build = verify_asset_build(assets)
-    except (RuntimeError, OSError) as error:
-        parser.error(str(error))
-    source = work / 'src'
-    shutil.copytree(root / 'src', source)
-    for relative in build['assets']:
-        target = source / 'foil' / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(assets / relative, target)
 url = f'http://127.0.0.1:{args.port}'
 log_path = work / 'out.log'
 print(f'Compiling Eden. Log: {log_path}', flush=True)
@@ -128,9 +127,12 @@ with ExitStack() as cleanup, log_path.open('w') as log:
         cleanup.callback(bridge.close)
     process = subprocess.Popen(
         [runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_'],
-        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True,
+        restore_signals=False)
     try:
         entry = 'start-srs' if args.srs else 'start'
+        if args.debug:
+            entry = 'start-debug-srs' if args.srs else 'start-debug'
         if args.codex:
             entry += '-codex'
         extra = f' {bridge.port} {rvr_string(bridge.token)}' if bridge else ''
@@ -143,7 +145,7 @@ with ExitStack() as cleanup, log_path.open('w') as log:
   (define slot [("x" {node_number}) ("ts" "compiler") ("ts" "artifact")])
   (define system (bootstrap:build-system (Pin eden:{entry}) resolve slot))
   (eden:{entry} ("x" {node_number}) system resolve slot {args.port}{extra}))
-(launch 0)
+(print ("EDEN-LAUNCH-RETURNED" (Try launch 0)))
 """
         process.stdin.write(launch_source)
         process.stdin.flush()
@@ -176,12 +178,18 @@ with ExitStack() as cleanup, log_path.open('w') as log:
             print(f'Boot host staging: {staged_at-boot_started:.3f}s; copy: {prepared_at-staged_at:.3f}s; runtime: {ready_at-prepared_at:.3f}s; total: {ready_at-boot_started:.3f}s', flush=True)
             report(output, work / 'boot-timings.json')
         print(f'Foil HTTP interface: {url}/ns', flush=True)
+        if args.debug:
+            print(f'Grove debugger: {url}/debug/{node}/app/debug', flush=True)
         if args.codex:
             print(f'Codex driver: {url}/ns/{node}/io/codex', flush=True)
         if args.check:
             def get(path='/'):
                 with urllib.request.urlopen(url + path, timeout=args.request_timeout) as response:
                     return response.read().decode()
+            if args.debug:
+                page = get(f'/debug/{node}/app/debug')
+                assert 'data-grove-contract="debugger/v1"' in page
+                assert f'data-path="/{node}/app/debug"' in page
             if args.codex:
                 console = f'/ns/{node}/io/codex'
                 assert 'What should Codex do?' in get(console)

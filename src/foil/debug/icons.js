@@ -28,14 +28,6 @@ export const iconNames = Object.freeze({
   warning: 'status.warning',
 });
 
-export function icon(name) {
-  const sourceName = iconNames[name];
-  if (!sourceName) throw new TypeError('Unknown debugger icon: ' + name);
-  const element = declaredTemplate('icon');
-  element.setAttribute('name', sourceName);
-  return element;
-}
-
 export function button(label, glyph, action, text = '') {
   const button = declaredTemplate('button');
   button.setAttribute('size', text ? 'small' : 'compact');

@@ -8,6 +8,9 @@ import {playwright} from './debug-tooling.mjs';
 const root=fileURLToPath(new URL('..',import.meta.url));
 assert.ok(process.env.GROVE_RUNTIME);
 const runtime=JSON.parse(execFileSync(process.env.PYTHON || 'python3',[root+'/x/debug-grove-runtime.py','verify',process.env.GROVE_RUNTIME],{encoding:'utf8'}));
+assert.match(runtime.node, /^0x(?:[0-9a-f]{2})+$/);
+assert.ok(!runtime.node.endsWith('00'));
+const authority = '/' + runtime.node;
 assert.notEqual(new URL(runtime.origin).port,'8138');
 const seal=JSON.parse(await readFile(runtime.work+'/assets.json','utf8'));
 const {chromium}=playwright();
@@ -30,7 +33,7 @@ try {
     const path=new URL(response.url()).pathname,asset=seal.assets[path];
     if(asset)pending.push(response.body().then(body=>assert.equal(createHash('sha256').update(body).digest('hex'),asset.sha256,path)));
   });
-  await page.goto(runtime.origin+'/debug');
+  await page.goto(runtime.origin+'/debug'+authority);
   await page.waitForFunction(()=>document.querySelector('#debug-workspace')?.dataset.readState==='ready');
   assert.equal(await page.locator('[data-grove-contract="debugger/v1"]').count(),1);
   assert.match(await page.locator('.wb-manifest').innerText(),/eden/);
@@ -59,11 +62,11 @@ try {
   await page.screenshot({path:runtime.work+'/grove-debugger-narrow.png'});
   checks.push('responsive document without horizontal overflow');
   if(runtime.entry === 'eden:start-debug') {
-    await page.goto(runtime.origin + '/debug/gov');
+    await page.goto(runtime.origin + '/debug' + authority + '/gov');
     await page.waitForFunction(()=>document.querySelector('#debug-workspace')?.dataset.readState === 'ready');
     const children = await page.locator('#debug-source-metadata').evaluate(template =>
       [...template.content.querySelectorAll('[data-path]')].map(node=>node.dataset.path));
-    assert.ok(!children.includes('/gov/srs'),'debugger-only startup does not publish the optional SRS app');
+    assert.ok(!children.includes(authority + '/gov/srs'),'debugger-only startup does not publish the optional SRS app');
     assert.equal(await page.locator('[data-grove-contract="debugger/v1"]').count(),1);
     checks.push('debugger startup independent of SRS');
   }

@@ -7,7 +7,7 @@ import {tmpdir} from 'node:os';
 import {outputRoot, playwright} from './debug-tooling.mjs';
 const evidence = process.env.TEST_RUN_DIR || tmpdir();
 const log = await readFile(process.env.GROVE_CHECK_LOG, 'utf8');
-assert.match(log, /\("DEBUGGER-DECLARATION-PASS" \d+\)/);
+assert.match(log, /"DEBUGGER-DECLARATION-PASS"/);
 assert.match(log, /"DEBUGGER-APPLICATION-PASS"/);
 assert.doesNotMatch(log, /\("ERROR"/);
 function decode(name) {
@@ -24,6 +24,7 @@ assert.doesNotMatch(document, /href="\/style\.css"|<style\b/);
 assert.match(document, /href="\/debug-components\.css"/);
 assert.match(document, /href="\/debug\.css"/);
 assert.doesNotMatch(shell + details, /x-bad-selector/);
+assert.doesNotMatch(shell, /id="wb-rendered"|class="wb-render-frame"|<iframe\b/, 'no retired Preview declaration');
 for (const name of ['namespace-row', 'page-row', 'path-segment', 'hover-myth', 'button', 'value-window']) assert.ok(shell.includes('id="debug-template-' + name + '"'), name);
 const assets = new Map(await Promise.all([
   ['/debug-mash.js', '.debug-assets/mash.js', 'text/javascript'],
@@ -100,6 +101,7 @@ try {
       await page.waitForFunction(() => document.querySelector('#debug-workspace').dataset.readState === 'ready');
       assert.equal(await page.locator('#wb-canvas').isVisible(),true,'native inspection remains visible');
       assert.equal(new URL(page.url()).searchParams.has('view'),false,'retired view state is normalized');
+      assert.equal(await page.locator('#debug-workspace').getAttribute('data-view-mode'), null, 'inspection does not create retired mode state');
       assert.deepEqual(errors,[], 'initialization errors');
       await page.screenshot({path:resolve(evidence,'grove-declaration-' + name + '.png')});
       assert.equal(await page.evaluate(() => __serverNodes.length > 8 && __serverNodes.every(n => n.isConnected)),true,'Grove node identity survives data binding');

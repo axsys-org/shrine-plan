@@ -193,6 +193,10 @@ class ProtocolTests(unittest.TestCase):
                                     for name in runner.reaver_closure(['foil-grove-tree-tests'])
                                     if (runner.ROOT / 'src/reaver' / (name + '.rvr')).exists()))
         self.assertTrue(suites['foil-grove-tree-tests']['enabled'])
+        for name in ('backend', 'action', 'norm', 'role', 'sewn', 'tree'):
+            suite = suites['foil-grove-' + name + '-tests']
+            self.assertEqual(suite['entrypoint'], 'run' if name == 'backend' else 'check')
+            self.assertEqual(suite['fixture'], ['foil-grove-fixture', 'create'])
 
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}

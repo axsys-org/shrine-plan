@@ -103,8 +103,8 @@ try {
   }, {files, cases, requests: run.requests});
 
   const original = parsed.documents['document.html'], changed = parsed.documents['changed.html'];
-  assert.equal(original.path, '/demo'); assert.equal(changed.path, '/demo');
-  assert.equal(parsed.documents['root.html'].path, '/');
+  assert.equal(original.path, '/0x11/demo'); assert.equal(changed.path, '/0x11/demo');
+  assert.equal(parsed.documents['root.html'].path, '/0x11');
   assert.deepEqual(Object.keys(original.slots).sort(), ['/a/b', '/body', '/escaped', '/huge', '/invalid', '/large', '/long', '/nul', '/opaque', '/text', '/threshold', '/zero'].sort());
   const expected = {
     '/text': ['complete', null, '5', '5', 'utf8-bytes'],
@@ -125,12 +125,12 @@ try {
     const metadata = original.slots[key].fidelity;
     assert.deepEqual([metadata.state, metadata.reason, metadata.bytes, metadata.previewBytes, metadata.representation], values, 'exact server fidelity for ' + key);
     assert.equal(metadata.epoch, epoch, 'one original record carries one immutable read epoch');
-    assert.equal(metadata.path, '/demo'); assert.equal(metadata.slot, key);
+    assert.equal(metadata.path, '/0x11/demo'); assert.equal(metadata.slot, key);
     if (key === '/opaque') assert.equal(metadata.url, null);
     else {
       const url = new URL(metadata.url, origin);
       assert.equal(url.pathname, '/debug-read/value');
-      assert.equal(url.searchParams.get('path'), '/demo'); assert.equal(url.searchParams.get('slot'), key);
+      assert.equal(url.searchParams.get('path'), '/0x11/demo'); assert.equal(url.searchParams.get('slot'), key);
       assert.equal(url.searchParams.get('epoch'), epoch); assert.equal(url.searchParams.get('offset'), '0');
       assert.equal(url.searchParams.get('limit'), '65536');
     }
@@ -141,7 +141,7 @@ try {
   assert.equal(original.slots['/body'].text, 'b'.repeat(1024) + '…');
   assert.equal(original.slots['/escaped'].text, '<script>alert(1)</script> & quoted');
   assert.equal(original.slots['/a/b'].text, 'opaque slot key');
-  assert.equal(original.children.includes('/demo/a'), false, 'the opaque multi-segment slot key is not manufactured into a child namespace');
+  assert.equal(original.children.includes('/0x11/demo/a'), false, 'the opaque multi-segment slot key is not manufactured into a child namespace');
   assert.equal(original.slots['/opaque'].reference, '/other', 'opaque exact inspection does not erase authored reference semantics');
   for (const [name, fields] of Object.entries(parsed.explicit)) {
     assert.ok(fields.length > 0, name + ' exposes real slot metadata');

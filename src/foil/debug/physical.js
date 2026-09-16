@@ -12,7 +12,8 @@ const PREVIEW_FIELDS = ['type', 'encoding', 'hex', 'total', 'complete'];
 const REQUEST_FIELDS = ['pathKey', 'collection', 'epoch', 'after', 'limit'];
 const STATUS = Object.freeze({invalid_query: 400, invalid_limit: 400, invalid_collection: 400, invalid_cursor: 400,
   epoch_required: 400, epoch_conflict: 409, derived_path: 422, path_missing: 404, record_missing: 404,
-  record_deleted: 410, key_too_large: 422, read_failed: 500, response_too_large: 500});
+  record_deleted: 410, key_too_large: 422, unknown_authority: 404, authority_required: 422,
+  read_failed: 500, response_too_large: 500});
 const MAX_COUNTER = (1n << 256n) - 1n;
 const encoder = new TextEncoder();
 const requests = new WeakSet();

@@ -22,6 +22,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from debug_runtime_helpers import startup_failed
@@ -90,7 +91,7 @@ with log_path.open('w') as log:
                 raise RuntimeError(f'Startup deadline exceeded: {output[-6000:]}')
             time.sleep(0.25)
         origin = f'http://127.0.0.1:{port}'
-        def get(path='/debug/log', expected=200, save=None, method='GET'):
+        def get(path='/debug/0x11/log', expected=200, save=None, method='GET'):
             start = time.monotonic()
             request = urllib.request.Request(origin + path, method=method)
             try:
@@ -114,7 +115,7 @@ with log_path.open('w') as log:
             assert data['data-page-next-before'] == next_before, data
             assert data['data-child-count'] == total, data
             assert data['data-page-epoch'] == epoch, data
-            paths = ['/log/' + str(key) for key in expected_keys]
+            paths = ['/0x11/log/' + str(key) for key in expected_keys]
             assert document.children == paths, (document.children, paths)
             assert [event['data-reference'] for event in document.events] == paths
             assert [event['href'] for event in document.events] == ['/debug' + path for path in paths]
@@ -125,20 +126,25 @@ with log_path.open('w') as log:
             repeated = get()
             assert initial.workspace == repeated.workspace
             assert initial.children == repeated.children
-            assert get('/debug/hello').workspace['data-path'] == '/hello'
+            assert get('/debug/0x11/hello').workspace['data-path'] == '/0x11/hello'
+            assert get().workspace == initial.workspace, 'A debugger read must not append an event.'
+            edit = urllib.request.Request(origin + '/edit/0x11/hello',
+                data=urllib.parse.urlencode({'message': 'Journal permalink fixture'}).encode())
+            with urllib.request.urlopen(edit, timeout=10) as response:
+                assert 'committed' in response.read().decode()
             populated = get(save='eden-populated')
-            assert populated.events, 'An ordinary HTTP namespace read must be journaled.'
+            assert populated.events, 'The owned fixture edit must be journaled.'
             permalink = populated.events[0]['href']
             detail = get(permalink, save='eden-permalink')
             assert detail.workspace['data-path'] == permalink.removeprefix('/debug')
             assert not detail.workspace.get('data-paging')
-            assert get('/debug/hello').workspace['data-path'] == '/hello'
-            paths = ['/debug/hello', '/debug/log?limit=2'] * 4
+            assert get('/debug/0x11/hello').workspace['data-path'] == '/0x11/hello'
+            paths = ['/debug/0x11/hello', '/debug/0x11/log?limit=2'] * 4
             with ThreadPoolExecutor(max_workers=4) as clients:
                 mixed = list(clients.map(get, paths))
             for path, document in zip(paths, mixed):
-                assert document.workspace['data-path'] == ('/hello' if path.endswith('hello') else '/log')
-                if document.workspace['data-path'] == '/log':
+                assert document.workspace['data-path'] == ('/0x11/hello' if path.endswith('hello') else '/0x11/log')
+                if document.workspace['data-path'] == '/0x11/log':
                     assert document.workspace['data-page-limit'] == '2'
                     assert len(document.children) == 2
             latest = get(save='eden-latest')
@@ -149,27 +155,29 @@ with log_path.open('w') as log:
             print(f'PASS: {len(results)} real Eden requests; permalinks and mixed legacy/read-only connections coexist.', flush=True)
             raise SystemExit(0)
         latest = get(save='latest')
+        legacy = get('/debug/log')
+        assert legacy.workspace == latest.workspace and legacy.children == latest.children
         check(latest, '', 40, range(10000, 9960, -1), '9961')
-        assert next(event for event in latest.events if event['data-reference'] == '/log/9996')['data-event-valid'] == 'false'
-        older = get('/debug/log?before=9961&limit=40', save='older')
+        assert next(event for event in latest.events if event['data-reference'] == '/0x11/log/9996')['data-event-valid'] == 'false'
+        older = get('/debug/0x11/log?before=9961&limit=40', save='older')
         check(older, '9961', 40, range(9960, 9920, -1), '9921')
         assert not set(latest.children) & set(older.children)
-        check(get('/debug/log?before=1', save='empty'), '1', 40, [], '')
-        check(get('/debug/log?before=0'), '0', 40, [], '')
-        check(get('/debug/log?before=2&limit=1', save='last'), '2', 1, [1], '')
-        check(get('/debug/log?limit=1'), '', 1, [10000], '10000')
-        check(get('/debug/log?before=123456789012345678901234567890&limit=2', save='huge'),
+        check(get('/debug/0x11/log?before=1', save='empty'), '1', 40, [], '')
+        check(get('/debug/0x11/log?before=0'), '0', 40, [], '')
+        check(get('/debug/0x11/log?before=2&limit=1', save='last'), '2', 1, [1], '')
+        check(get('/debug/0x11/log?limit=1'), '', 1, [10000], '10000')
+        check(get('/debug/0x11/log?before=123456789012345678901234567890&limit=2', save='huge'),
             '123456789012345678901234567890', 2, [10000, 9999], '9999')
-        check(get('/debug/log?view=rendered'), '', 40, range(10000, 9960, -1), '9961')
+        check(get('/debug/0x11/log?view=rendered'), '', 40, range(10000, 9960, -1), '9961')
         for query in ['before=', 'before=-1', 'before=1.0', 'before=1e3', 'before=+1',
                       'before=%201', 'before=01', 'before=00', 'limit=01', 'before=1&before=2',
                       'before=1&%62efore=2', 'limit=0', 'limit=41', 'limit=-1', 'limit=1.0',
                       'limit=', 'limit=3&limit=3', 'view=other', 'view=rendered&view=rendered',
                       'offset=40', 'care=z', 'before=%zz', 'before=3?limit=2', 'limit=3&', '=1']:
-            get('/debug/log?' + query, 400)
-        get('/debug/log', 405, method='POST')
+            get('/debug/0x11/log?' + query, 400)
+        get('/debug/0x11/log', 405, method='POST')
         with ThreadPoolExecutor(max_workers=4) as clients:
-            concurrent = list(clients.map(lambda _: get('/debug/log?limit=3'), range(8)))
+            concurrent = list(clients.map(lambda _: get('/debug/0x11/log?limit=3'), range(8)))
         for document in concurrent:
             check(document, '', 3, [10000, 9999, 9998], '9998')
         check(get(save='repeated'), '', 40, range(10000, 9960, -1), '9961')

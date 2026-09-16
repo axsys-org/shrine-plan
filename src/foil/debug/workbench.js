@@ -10,7 +10,6 @@ import { bindDocumentFragment } from './document-fragment.js';
 
 const $ = selector => document.querySelector(selector);
 let currentView = initialView;
-let sourceWritable = Boolean(initialView.writable);
 let feedbackTimer;
 let inspectorReturnFocus = null;
 const previewRequests = new Set();
@@ -111,43 +110,37 @@ function configureChrome() {
   createPathLocator({navigation, form: $('#debug-go'), initialView});
 }
 
-function setReadonly() {
-  $('#debug-workspace').dataset.writable = String(sourceWritable);
+function setReadonly(writable) {
+  $('#debug-workspace').dataset.writable = String(writable);
   $('#debug-main').querySelectorAll('ui-button[type=submit], button[type=submit]').forEach(control => {
-    control.disabled = navigation.isAuthoredDisabled(control) || !sourceWritable || navigation.busy;
+    const caseNavigation = control.closest('form[data-debug-navigation="case"]');
+    control.disabled = navigation.isAuthoredDisabled(control) || (!caseNavigation && !writable) || navigation.busy;
   });
-
 }
 
-function enableInspection() {
-  $('#debug-workspace').dataset.viewMode = 'inspect';
-  $('#wb-canvas').hidden = false;
-  $('#wb-rendered').hidden = true;
-  const control = $('#wb-mode-inspect');
-  if (control) { control.setAttribute('aria-pressed', 'true'); control.selected = true; }
-  // Old Preview links resolve to the native inspection document.
+function normalizeRetiredViewURL() {
+  // Retain old bookmarks without retaining a second rendering mode or iframe.
   const url = new URL(location.href);
+  if (!url.searchParams.has('view')) return;
   url.searchParams.delete('view');
   history.replaceState(history.state, '', url.pathname + url.search);
-  setReadonly();
 }
 
 function mountView(view) {
   cancelPreviews();
   cancelValueInspections();
   currentView = view;
-  sourceWritable = Boolean(view.writable);
   const workspace = $('#debug-workspace');
   const main = $('#debug-main');
   if (main.dataset.debugFragment !== 'inspect') throw new Error('Missing Grove inspect fragment');
   // The HTTP foot owns the document. Mash upgrades its declarative controls;
   // application code only connects namespace reads and write verdicts.
-  main.querySelector('#wb-mode-inspect')?.addEventListener('click', enableInspection);
   bindDocumentFragment(main, view, {readPreview: navigation.readPreview, attachValueInspection, requests: previewRequests});
   workspace.dataset.kind = view.kind;
   workspace.dataset.readState = 'ready';
   renderInspector(view);
-  enableInspection();
+  normalizeRetiredViewURL();
+  setReadonly(Boolean(view.writable));
   document.dispatchEvent(new CustomEvent('debug:read-complete', {detail: view}));
 }
 

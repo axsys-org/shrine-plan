@@ -1,7 +1,9 @@
 # Namespace-native Grove debugger
 
 Served at `/debug`; `/ns` remains the original explorer. Definitions live at
-`/gov/debug`, with an installed application at `/app/debug`.
+`/<node>/gov/debug`, with an installed application at `/<node>/app/debug`.
+`<node>` is the configured hexadecimal namespace authority (for example `0x11`).
+`/sys` is the selected system publication; `/` links the available authorities.
 
 Current build, architecture and PR gates: [Debugger PR guide](debugger-pr.md).
 Performance changes and remaining boundaries: [Debugger performance](debugger-performance.md).
@@ -38,16 +40,18 @@ not a parallel set of hand-written descriptions for each kind of record.
   accessible completeness note; mixed and standalone values keep their own
   annotations. This never upgrades unknown completeness to complete.
 
-For example, when an SRS instance exists, `/app` presents the child identifier
+For example, when an SRS instance exists, `/<node>/app` presents the child identifier
 `srs` alongside its authored lede. `/sys/about` presents its own help. The debugger does not synthesize an
 application purpose from a generic record-kind sentence.
 
 ## Component-first interface
 
 The debugger is declared in `src/grove/debugger.grove` and its sibling modules.
-Its application slots, inspection role and instance tree are declared in
-`src/grove/debugger/application.grove`. `x/eden --debug` (also enabled by `--srs`)
-publishes `/gov/debug` and instantiates its template at `/app/debug`. Page, shell,
+Its application slots and inspection role are declared in
+`src/grove/debugger/application.grove`; instance seeds live in `instance.grove`.
+`x/eden --debug` publishes `/<node>/gov/debug` and instantiates its template at
+`/<node>/app/debug`. Add `--srs` for the optional example; `--srs` alone keeps
+the ordinary explorer. Page, shell,
 inspector and HTML response use real Grove types, norms and sewn values. See the
 [declaration audit](debugger-declaration-audit.md) for the request-local adapter boundary.
 
@@ -64,7 +68,7 @@ Mounted records carrying a typed `mani` in their `pact` slot lead with a Manifes
 section: name and authored lore, declared kooks, seed records with inlined Mash
 previews, and requested versus granted capabilities. Seed and kook destinations
 are rooted at the inspected mount, including history paths. The namespace path
-`/pact` is the mounting behavior, not Eden's manifest. The original manifest slot
+`/<node>/pact` is the mounting behavior, not Eden's manifest. The original manifest slot
 remains in Source slots; its structured presentation does not claim the printed
 representation is complete.
 
@@ -83,10 +87,10 @@ not a sovereign epoch, and the shape counter is not used as a history address.
 Each Mash accordion starts open with up to five native case links. Older/newer
 ranges require no reads; an exact-case input reaches any reported case without
 enumerating the whole history. Zero and unreported counters remain distinct.
-The original `/state`, `/first`, `/now`, `/block`, and `/top` metadata stays
-available below the histories. This works from existing server metadata without
-restarting the live namespace; it does not make the server's legacy case-link
-serialization bounded.
+State, first, now, block, and top metadata stays available below the histories.
+These are publisher-owned slots; compact UI labels do not change their stored
+identities. A local authority's epoch is never substituted for a system record's
+epoch. A newly compiled server is required for changes to the Grove declarations.
 
 - `sh-triptych` owns the sidebar, content, and independently visible inspector.
   Navigation and view controls stay in compact, consistent chrome.

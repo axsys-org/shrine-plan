@@ -44,6 +44,8 @@ def check(args):
     source = '\n'.join([
         '(#bind suite (#module foil-grove-debugger-tests))',
         '(#bind backend-tests (#module foil-grove-backend-tests))',
+        '(#bind backend-fixture (#module foil-grove-fixture))',
+        '(print ("DEBUGGER-COMPILER-PASS" (backend-tests:run (backend-fixture:create 0))))',
         '(print "TEST-RUN-DONE")', '',
     ])
     code, complete, seconds = runner.run_process(
@@ -53,7 +55,8 @@ def check(args):
     log = log_path.read_text(errors='replace')
     if (not runner.verdict(log, code, complete)[0]
             or '"DEBUGGER-APPLICATION-PASS"' not in log
-            or '("DEBUGGER-HOST-COMPILED" 1)' not in log):
+            or '("DEBUGGER-HOST-COMPILED" 1)' not in log
+            or '("DEBUGGER-COMPILER-PASS" 1)' not in log):
         raise RuntimeError('Native declaration check failed: ' + str(log_path))
     if source_digest() != before:
         raise RuntimeError('Backend sources changed during compilation; rerun the gate.')
