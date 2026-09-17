@@ -170,6 +170,19 @@ try {
     const page = await context.newPage(); page.on('pageerror', e => errors.push(name + ': ' + e.message));
     await page.goto(base + '/debug/hello' + (name === 'legacy-view' ? '?view=rendered' : ''));
     await page.waitForFunction(() => document.querySelector('sh-triptych')?.shadowRoot && customElements.get('ui-menu'));
+    const lucide = await page.locator('#wb-refresh ui-icon').evaluate(async icon => {
+      await icon.updateComplete;
+      const svg = icon.shadowRoot.querySelector('svg[part=source]');
+      return svg && {viewBox:svg.getAttribute('viewBox'), fill:getComputedStyle(svg).fill,
+        stroke:getComputedStyle(svg).stroke, color:getComputedStyle(svg).color,
+        width:svg.getAttribute('stroke-width'), cap:svg.getAttribute('stroke-linecap')};
+    });
+    assert.ok(lucide, 'Mash realizes the declared icon');
+    assert.equal(lucide.viewBox,'0 0 24 24');
+    assert.equal(lucide.fill,'none', 'debugger styles preserve Lucide outline glyphs');
+    assert.equal(lucide.stroke,lucide.color);
+    assert.equal(lucide.width,'2');
+    assert.equal(lucide.cap,'round');
     assert.equal(await page.locator('[data-grove-contract="debugger/v1"]').count(),1);
     assert.match(await page.locator('#debug-main').innerText(), /An authored slot/);
     const source = page.locator('#wb-canvas > section[aria-label=Record] ui-accordion-item[value=source]');

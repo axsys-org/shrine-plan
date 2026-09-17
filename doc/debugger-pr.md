@@ -79,8 +79,9 @@ it is missing. There is no legacy browser build; `--legacy` is rejected.
    Link the Mash PR and pin its exact resulting commit in
    `debug-dependencies.json` before treating this as a release build.
 
-The paired Mash changes are committed as
-`ef49979fe7c4b1386a9fb12200a00ff37f787233` and pinned in
+The paired Mash changes ([Lucide PR #58](https://github.com/axsys-org/mash/pull/58),
+stacked on the debugger components) are committed as
+`8eed9f2d63bc380ac57a349f5263f908beca09b5` and pinned in
 `debug-dependencies.json`. `node x/build-debug.mjs --release` and
 `python3 x/check-debugger.py --release` reject an absent pin, mismatched SHA,
 dirty Mash checkout or wrong pnpm version. Development build provenance still
@@ -89,12 +90,16 @@ an earlier base commit while relying on uncommitted component changes. Use a
 clean checkout of the pinned commit for release verification; an unrelated
 staged change in a development checkout still makes that checkout dirty.
 
+The build requires Mash's semantic Lucide entry point; the older Carbon
+checkout is not accepted. Grove keeps semantic icon names rather than importing
+Lucide or installing an application-owned icon pack.
+
 ## Review boundary and checklist
 
 - Read [the declaration audit](debugger-declaration-audit.md) for precise
   ownership. “Grove-declared” describes UI declarations, not a JS-free runtime.
-- Review the complete dirty diffs before staging. The staged Mash
-  `.prettierrc.json` deletion is unrelated and must not enter these PRs.
+- Review the complete dirty diffs before staging; exclude unrelated local
+  documents and operating-system metadata instead of blanket-staging them.
 - Broad namespace transport changes (physical/value/journal reads) have their
   own tests. Include only required dependency changes, or stack separately;
   do not blanket-stage the worktree.

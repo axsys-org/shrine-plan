@@ -1,4 +1,4 @@
-// Application intent mapped to Mash's existing semantic icon registry.
+// Application intent mapped to Mash's semantic names, realized by its Lucide pack.
 // No application SVG overrides or external icon sources are installed.
 import {declaredTemplate} from './declarations.js';
 export const iconNames = Object.freeze({

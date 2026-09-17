@@ -39,10 +39,21 @@ try {
   assert.match(await page.locator('.wb-manifest').innerText(),/eden/);
   assert.match(await page.locator('.wb-manifest').innerText(),/Eden: the live namespace/);
   checks.push('published Grove page renders the native mani');
+  const glyph = await page.locator('#wb-refresh ui-icon').evaluate(async icon => {
+    await icon.updateComplete;
+    const svg=icon.shadowRoot.querySelector('svg[part=source]');
+    return svg && {viewBox:svg.getAttribute('viewBox'),fill:getComputedStyle(svg).fill,
+      stroke:getComputedStyle(svg).stroke,color:getComputedStyle(svg).color,width:svg.getAttribute('stroke-width')};
+  });
+  assert.ok(glyph); assert.equal(glyph.viewBox,'0 0 24 24');
+  assert.equal(glyph.fill,'none'); assert.equal(glyph.stroke,glyph.color); assert.equal(glyph.width,'2');
+  assert.equal(await page.locator('#wb-path-menu ui-menu-item[value=link] ui-icon').getAttribute('name'),'action.link');
+  checks.push('Mash Lucide glyphs with semantic copy-link icon');
   const kooks=page.locator('.wb-manifest ui-accordion-item[value=kooks]');
   await kooks.locator('button').first().click();assert.equal(await kooks.evaluate(n=>n.open),false);
   await kooks.locator('button').first().click();assert.equal(await kooks.evaluate(n=>n.open),true);
   const seed=page.locator('.wb-manifest sh-path-row[previewable]').first();
+  assert.equal(await seed.locator('ui-icon[part=disclosure] svg').evaluate(svg=>getComputedStyle(svg).fill),'none');
   await seed.locator('ui-button').click();assert.equal(await seed.evaluate(n=>n.open),true);
   checks.push('Mash disclosures and inline seed previews');
   const menu=page.locator('.wb-path-menu').first();
@@ -70,6 +81,16 @@ try {
     assert.equal(await page.locator('[data-grove-contract="debugger/v1"]').count(),1);
     checks.push('debugger startup independent of SRS');
   }
+  await page.goto(runtime.origin + '/debug' + authority + '/gov/debug');
+  await page.waitForFunction(()=>document.querySelector('#debug-workspace')?.dataset.readState === 'ready');
+  const definitions = await page.locator('#debug-workspace > #debug-read-descriptor').evaluate(template =>
+    JSON.parse(template.content.textContent).children.filter(child=>!/^grove_(metadata|tree_\d+)$/.test(child.path.split('/').at(-1))));
+  assert.equal(definitions.length,35);
+  for(const definition of definitions){
+    assert.ok(definition.label && definition.label!==definition.path.split('/').at(-1),definition.path + ' lede');
+    assert.ok(definition.description,definition.path + ' help');
+  }
+  checks.push('all authored debugger definitions expose lede and help');
   await Promise.all(pending);assert.deepEqual(errors,[]);assert.deepEqual(violations,[]);
   const evidence={passed:true,origin:runtime.origin,runtimeId:runtime.id,checks,errors,violations,requests};
   await writeFile(runtime.work+'/declaration-ui-evidence.json',JSON.stringify(evidence,null,2));

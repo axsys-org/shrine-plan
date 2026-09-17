@@ -83,7 +83,9 @@ keyboard focus reveals a small bookmark over the row, without reserving width
 or shifting text. Touch and forced-colors modes keep separate visible actions.
 Authored lore uses `ui-path`'s measured overflow mask, not an application observer.
 
-The debugger uses Mash components and its stock semantic `ui-icon` registry.
+The debugger uses Mash components and its stock semantic `ui-icon` registry,
+with Lucide supplied by Mash's icon registration. Grove keeps semantic names
+such as `object.folder` and `action.search`; it does not import Lucide directly.
 There are no application-installed SVG packs, bespoke icons, case-pinning
 controls, or comparison workbenches. Native case navigation remains available.
 
