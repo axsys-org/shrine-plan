@@ -101,7 +101,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     returnFocus = null;
   }
 
-  function item(path, label = basename(path), glyph = 'record', className = '') {
+  function item(path, label = basename(path), glyph = iconNames.record, className = '') {
     const option = declaredTemplate('path-option');
     if (className) option.classList.add(className);
     option.setAttribute('value', path);
@@ -109,7 +109,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     option.setAttribute('aria-label', 'Open ' + path);
     option.dataset.path = path;
     const prefix = option.querySelector('ui-icon');
-    prefix.setAttribute('name', iconNames[glyph]);
+    prefix.setAttribute('name', glyph);
     prefix.slot = 'prefix';
     option.querySelector('.wb-path-option-name').textContent = label;
     if (path === view.path) {
@@ -123,7 +123,7 @@ export function createPathLocator({ navigation, form, initialView }) {
   }
 
   function parentItem(path) {
-    const open = item(path, path, 'roots', 'wb-path-menu-parent');
+    const open = item(path, path, iconNames.roots, 'wb-path-menu-parent');
     if (path !== view.path) {
       const affordance = open.querySelector('[slot=shortcut]');
       affordance.hidden = false; affordance.textContent = 'Open';
@@ -144,10 +144,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     const rows = [];
     for (const path of children.slice(0, CHILD_LIMIT)) {
       const child = summaries.get(path);
-      const glyph = { namespace: 'roots', template: 'roots', norm: 'branch',
-        sewn: 'subtree', module: 'subtree', action: 'run',
-        event: 'activity', journal: 'activity', http: 'activity' }[child?.kind] || 'record';
-      const row = item(path, basename(path), glyph, 'wb-path-menu-child');
+      const row = item(path, basename(path), child?.glyph, 'wb-path-menu-child');
       // Keep the complete authored text available to accessibility and copying.
       // The menu's caption has a visual two-line bound, not a data truncation.
       const lede = child?.label && child.label !== path && child.label !== basename(path) ? child.label : '';
@@ -165,7 +162,7 @@ export function createPathLocator({ navigation, form, initialView }) {
     }
     const count = declaredTemplate('menu-heading');
     const total = parentView.collection?.childCount ?? children.length;
-    count.textContent = total > Math.min(children.length, CHILD_LIMIT)
+    count.textContent = BigInt(total) > BigInt(Math.min(children.length, CHILD_LIMIT))
       ? `First ${Math.min(children.length, CHILD_LIMIT)} of ${total} paths · open path for more` : 'Paths';
     replaceOptions(menu, parentItem(parentView.path), ...(children.length ? [count] : []), ...rows);
     menu.removeAttribute('aria-busy');
@@ -262,12 +259,8 @@ export function createPathLocator({ navigation, form, initialView }) {
       link.setAttribute('label', path === '/' ? 'Namespace root' : 'Open ' + path);
       if (current) { link.setAttribute('current', ''); wrapper.dataset.current = 'true'; }
       if (path === '/') link.classList.add('wb-path-root');
-      const glyph = path === '/' || !current ? 'roots' : {
-        namespace: 'roots', template: 'roots', norm: 'branch', sewn: 'subtree',
-        module: 'subtree', action: 'run', event: 'activity', journal: 'activity', http: 'activity',
-      }[view.kind] || 'record';
       const prefix = link.querySelector('ui-icon');
-      prefix.setAttribute('name', iconNames[glyph]);
+      prefix.setAttribute('name', current ? view.glyph : iconNames.roots);
       prefix.slot = 'prefix';
       link.querySelector('.wb-path-name').textContent = basename(path);
       makeMenu(path, wrapper.querySelector('ui-menu'));

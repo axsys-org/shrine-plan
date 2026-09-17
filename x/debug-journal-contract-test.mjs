@@ -10,11 +10,9 @@ if (!directory) throw new Error('Pass the artifact directory from the isolated j
 const {chromium} = playwright();
 const dataURL = source => 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 const journalSource = await readFile(new URL('../src/foil/debug/journal.js', import.meta.url), 'utf8');
-const valueSource = await readFile(new URL('../src/foil/debug/values.js', import.meta.url), 'utf8');
 const parserSource = await readFile(new URL('../src/foil/debug/namespace.js', import.meta.url), 'utf8');
 assert.ok(parserSource.includes("from './journal.js'"), 'use the production parser dependency');
-const parserURL = dataURL(parserSource.replace("from './journal.js'", 'from ' + JSON.stringify(dataURL(journalSource)))
-  .replace("from './values.js'", 'from ' + JSON.stringify(dataURL(valueSource))));
+const parserURL = dataURL(parserSource.replace("from './journal.js'", 'from ' + JSON.stringify(dataURL(journalSource))));
 const expected = {
   latest: {before: null, nextBefore: '9961', limit: 40, first: 10000, count: 40},
   older: {before: '9961', nextBefore: '9921', limit: 40, first: 9960, count: 40},

@@ -231,6 +231,14 @@ export let navigation;
       throw new Error('The server did not return the requested debug workspace.');
     }
     const view = parseDebugDocument(next);
+    const scopeDepth = {document: 3, workspace: 3, preview: 2, outline: 1};
+    if (scopeDepth[view.scope] < scopeDepth[scope]) {
+      throw new Error('The runtime returned a smaller inspection scope than requested. The current view has been kept.');
+    }
+    const epoch = url.searchParams.get('epoch');
+    if (epoch !== null && view.collection.epoch !== epoch) {
+      throw new Error('The runtime returned a different collection epoch. The current view has been kept.');
+    }
     assertJournalPage(view, page || undefined);
     document.dispatchEvent(new CustomEvent('debug:path-snapshot', {detail: {view}}));
     return { workspace, view, query: collectionQuery(query) };
@@ -252,6 +260,8 @@ export let navigation;
     page = view.pagination ? journalPage(view.pagination) : null;
     collection = query;
     delete root.dataset.dirty;
+    root.querySelector(':scope > template#debug-read-descriptor')
+      .replaceWith(workspace.querySelector(':scope > template#debug-read-descriptor'));
     get('#debug-main').replaceWith(workspace.querySelector('#debug-main'));
     root.querySelector('[slot=inspector]').replaceWith(workspace.querySelector('[slot=inspector]'));
     root.dataset.inspectorPath = currentPath();

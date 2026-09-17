@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {readFile, writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {tmpdir} from 'node:os';
-import {outputRoot, playwright} from './debug-tooling.mjs';
+import {outputRoot, playwright, esbuild, root} from './debug-tooling.mjs';
 const evidence = process.env.TEST_RUN_DIR || tmpdir();
 const log = await readFile(process.env.GROVE_CHECK_LOG, 'utf8');
 assert.match(log, /"DEBUGGER-DECLARATION-PASS"/);
@@ -19,11 +19,13 @@ function decode(name) {
 const shell = decode('DEBUGGER-PAGE-HTML');
 const details = decode('DEBUGGER-DETAILS-HTML');
 const document = decode('DEBUGGER-DOCUMENT-HTML');
+const edge = decode('DEBUGGER-EDGE-HTML');
 assert.ok(document.includes(shell), 'HTTP framing preserves the Grove page');
 assert.doesNotMatch(document, /href="\/style\.css"|<style\b/);
 assert.match(document, /href="\/debug-components\.css"/);
 assert.match(document, /href="\/debug\.css"/);
 assert.doesNotMatch(shell + details, /x-bad-selector/);
+assert.doesNotMatch(shell, /id="debug-source-metadata"|id="debug-version-metadata"/, 'no presentation-shaped transport copies');
 assert.match(shell, /class="debug-shell"[^>]*data-mash-size="compact"/, 'Grove owns the coordinated Mash density');
 assert.doesNotMatch(shell, /id="wb-rendered"|class="wb-render-frame"|<iframe\b/, 'no retired Preview declaration');
 for (const name of ['namespace-row', 'page-row', 'path-segment', 'hover-myth', 'button', 'value-window']) assert.ok(shell.includes('id="debug-template-' + name + '"'), name);
@@ -33,12 +35,91 @@ const assets = new Map(await Promise.all([
   ['/debug.css', 'debug.css', 'text/css'],
 ].map(async ([url, path, contentType]) => [url, {contentType, body: await readFile(resolve(outputRoot,path), 'utf8')}])));
 const compiled = {outputFiles:[{text:await readFile(resolve(outputRoot,'debug.js'),'utf8')}]};
+const parser = await esbuild().build({entryPoints:[resolve(root,'src/foil/debug/namespace.js')],bundle:true,write:false,format:'esm'});
+const parserURL = 'data:text/javascript;base64,' + Buffer.from(parser.outputFiles[0].text).toString('base64');
 const html = body => document.replace(shell, () => body);
 const {chromium} = playwright();
 const browser = await chromium.launch();
 const checks = [], errors = [], violations = [], factories = [];
 const base = 'http://grove-declaration.invalid';
 try {
+  // The model must come only from the versioned descriptor. Deliberately
+  // contradictory presentation proves this is not another HTML scraper.
+  const contractPage = await browser.newPage();
+  await contractPage.route('**/*', route => route.abort());
+  const contract = await contractPage.evaluate(async ({parserURL, shell, edge, framedHtml}) => {
+    const {parseDebugDocument} = await import(parserURL);
+    const huge = '900719925474099312345';
+    const descriptor = {version:1,path:'/0x11/example',namespaceRoot:'/0x11',scope:'document',kind:'custom-kind',
+      glyph:'object.document',label:'Authored label',description:'Authored help',state:'live',hasRecord:true,writable:false,
+      children:[{path:'/0x11/example/child',label:'Child',description:'Child help',kind:'custom-child',glyph:'object.folder'}],
+      collection:{epoch:huge,nextChildren:null,nextSlots:null,childCount:huge,slotCount:huge},pagination:null,
+      previewSlots:[{key:'/opaque/slot',text:'summary',reference:null}]};
+    const escape = text => text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    const template = value => '<template id="debug-read-descriptor">' + escape(JSON.stringify(value)) + '</template>';
+    const workspace = (content,path='/0x11/example') => '<sh-triptych id="debug-workspace" data-path="' + path + '">' + content + '</sh-triptych>';
+    const document = content => new DOMParser().parseFromString(content,'text/html');
+    const clean = parseDebugDocument(document(workspace(template(descriptor))));
+    const distracting = '<main id="debug-main"><section aria-label="Record"><sh-myth><sh-limb data-value-kind="text">' +
+      '<sh-slot title="/sys/lede"></sh-slot><sh-pail>Wrong label</sh-pail></sh-limb></sh-myth></section>' +
+      '<section aria-label="Operations"><form action="/wrong"><button type="submit">Wrong operation</button></form></section></main>' +
+      '<ui-table label="version"><ui-table-row><ui-table-cell>/x_data</ui-table-cell><ui-table-cell>1</ui-table-cell></ui-table-row></ui-table>';
+    const noisy = parseDebugDocument(document(workspace(distracting + template(descriptor))));
+    const failures = [];
+    const rejects = (name, markup) => { try {parseDebugDocument(document(markup)); failures.push(name);} catch {} };
+    rejects('missing', workspace(distracting));
+    rejects('malformed JSON', workspace('<template id="debug-read-descriptor">{broken</template>' + distracting));
+    rejects('unsupported version', workspace(template({...descriptor,version:2})));
+    rejects('identity mismatch', workspace(template({...descriptor,path:'/0x11/other'})));
+    rejects('nested descriptor', workspace('<div>' + template(descriptor) + '</div>'));
+    rejects('duplicate descriptor', workspace(template(descriptor) + template(descriptor)));
+    rejects('numeric epoch', workspace(template({...descriptor,collection:{...descriptor.collection,epoch:Number(huge)}})));
+    rejects('non-child path', workspace(template({...descriptor,children:[{...descriptor.children[0],path:'/0x11/elsewhere'}]})));
+    rejects('oversized child page', workspace(template({...descriptor,children:Array.from({length:41},(_,index)=>
+      ({...descriptor.children[0],path:'/0x11/example/child-' + index}))})));
+    rejects('live state without record', workspace(template({...descriptor,hasRecord:false,previewSlots:[]})));
+    rejects('tombstone state with record', workspace(template({...descriptor,state:'tombstone',previewSlots:[]})));
+    const journal = {...descriptor,path:'/0x11/log',kind:'journal',hasRecord:false,state:'structural',previewSlots:[],
+      children:[{...descriptor.children[0],path:'/0x11/log/' + huge}],
+      collection:{...descriptor.collection,childCount:'1'},
+      pagination:{kind:'journal',before:null,nextBefore:null,limit:1,total:'1',epoch:huge}};
+    const journalView = parseDebugDocument(document(workspace(template(journal),journal.path)));
+    rejects('journal total mismatch', workspace(template({...journal,pagination:{...journal.pagination,total:'2'}}),journal.path));
+    const compiled = parseDebugDocument(document(shell));
+    const edgeDocument = document(edge), edgeView = parseDebugDocument(edgeDocument);
+    const measuredDocument = document(framedHtml);
+    for (let index=0;index<150;index++) parseDebugDocument(measuredDocument);
+    const measure = action => Array.from({length:7},() => {
+      const start=performance.now(); for (let index=0;index<300;index++) action();
+      return (performance.now()-start)/300;
+    }).sort((left,right)=>left-right);
+    const model=measure(()=>parseDebugDocument(measuredDocument));
+    const total=measure(()=>parseDebugDocument(document(framedHtml)));
+    return {clean,noisy,failures,journalView,compiled,edgeView,edgeMarkup:edgeDocument.querySelectorAll('img,script,[onerror],[onclick]').length,
+      descriptorCount:document(shell).querySelectorAll('#debug-workspace > #debug-read-descriptor').length,
+      benchmark:{samples:7,iterationsPerSample:300,modelMedianMs:model[3],modelRangeMs:[model[0],model[6]],
+        documentAndModelMedianMs:total[3],documentAndModelRangeMs:[total[0],total[6]]}};
+  }, {parserURL,shell,edge,framedHtml:document});
+  assert.deepEqual(contract.noisy,contract.clean,'presentation changes do not change namespace meaning');
+  assert.deepEqual(contract.failures,[],'missing, malformed or mismatched descriptors fail closed');
+  assert.equal(contract.clean.collection.epoch,'900719925474099312345');
+  assert.equal(contract.clean.collection.childCount,'900719925474099312345');
+  assert.equal(contract.clean.collection.slotCount,'900719925474099312345');
+  assert.equal(contract.journalView.pagination.epoch,'900719925474099312345');
+  assert.deepEqual(contract.clean.children,['/0x11/example/child']);
+  assert.equal(contract.clean.childSummaries[0].glyph,'object.folder','Grove owns glyph choice');
+  assert.equal(contract.clean.kind,'custom-kind','new namespace kinds need no browser classification');
+  for (const field of ['record','slots','operations','version','lore','semanticSlots']) assert.equal(Object.hasOwn(contract.clean,field),false,field + ' is not duplicated');
+  assert.equal(contract.descriptorCount,1);
+  assert.equal(contract.compiled.path,'/hello');
+  assert.equal(contract.edgeMarkup,0,'real Grove encoder cannot break out of the inert text descriptor');
+  assert.ok(JSON.stringify(contract.edgeView).includes('</template>'),'adversarial authored text round-trips through the real Grove encoder');
+  assert.deepEqual(contract.edgeView.previewSlots.map(slot=>slot.key),['/a','/b','/c'],'only three non-metadata excerpts travel with the descriptor');
+  assert.equal(contract.edgeView.previewSlots[0].text,'€'.repeat(59) + '…','the 180-byte preview limit preserves UTF-8 boundaries');
+  assert.equal(contract.edgeView.previewSlots[2].reference,'/reference');
+  for (const field of ['epoch','childCount','slotCount']) assert.equal(contract.edgeView.collection[field],'900719925474099312345',field + ' is lossless through the real backend encoder');
+  await contractPage.close();
+  checks.push('versioned descriptor independent of presentation');
   for (const [name, app, width, touch, colorScheme] of [['mash-only',false,1440,false,'light'],['desktop',true,1440,false,'light'],['dark',true,1440,false,'dark'],['touch',true,390,true,'light'],['cases',true,1440,false,'light'],['legacy-view',true,1440,false,'light'],['navigation',true,1440,false,'light']]) {
     const context = await browser.newContext({viewport: {width, height: 1000}, hasTouch: touch, isMobile: touch, colorScheme, reducedMotion: 'reduce'});
     context.setDefaultTimeout(5000);
@@ -50,20 +131,34 @@ try {
     await context.route('**/*', route => {
       const req = route.request(), url = new URL(req.url());
       const scoped = name === 'navigation' && /^\?scope=(workspace|outline|preview)$/.test(url.search);
-      if (req.method() !== 'GET' || url.origin !== base || (url.search && !scoped && !(name === 'legacy-view' && url.search === '?view=rendered'))) { violations.push(req.url()); return route.abort(); }
+      const pinned = name === 'navigation' && url.pathname === '/debug/epoch' && url.searchParams.size === 2 &&
+        url.searchParams.get('epoch') === '900719925474099312345' && url.searchParams.get('scope') === 'workspace';
+      if (req.method() !== 'GET' || url.origin !== base || (url.search && !scoped && !pinned && !(name === 'legacy-view' && url.search === '?view=rendered'))) { violations.push(req.url()); return route.abort(); }
       if (url.pathname === '/debug.js') {
         const capture = `window.__serverNodes=[...document.querySelectorAll('.debug-header,#wb-path-locator,#debug-history-nav,#wb-header-actions,#debug-sidebar,#debug-main,#wb-canvas,.wb-inspector,#wb-path-menu,#wb-path-preview')];window.__factories=[];const originalCreate=document.createElement;document.createElement=function(...args){const caller=new Error().stack?.split('\\n')[2];if(caller?.includes('/debug.js'))__factories.push([args[0],caller]);return originalCreate.apply(this,args)};\n`;
         return route.fulfill({contentType:'text/javascript', body: app ? capture + compiled.outputFiles[0].text : ''});
       }
       if (assets.has(url.pathname)) return route.fulfill(assets.get(url.pathname));
       if (name === 'navigation' && url.pathname === '/debug/fail') return route.fulfill({status:503,body:'Expected unavailable fixture'});
+      if (name === 'navigation' && url.pathname === '/debug/malformed') {
+        const body = shell.replaceAll('/hello','/malformed').replace(/<template id="debug-read-descriptor">[\s\S]*?<\/template>/,'');
+        return route.fulfill({contentType:'text/html',body:html(body)});
+      }
+      if (name === 'navigation' && ['/debug/poor-scope','/debug/epoch'].includes(url.pathname)) {
+        let body = shell.replaceAll('/hello',url.pathname.slice('/debug'.length));
+        if (url.pathname === '/debug/poor-scope') {
+          const poorer = body.replace(/((?:&quot;|")scope(?:&quot;|")\s*:\s*(?:&quot;|"))document((?:&quot;|"))/,'$1outline$2');
+          assert.notEqual(poorer,body,'fixture changes only the descriptor scope'); body=poorer;
+        }
+        return route.fulfill({contentType:'text/html',body:html(body)});
+      }
       if (url.pathname === '/debug/hello' || name === 'navigation' && ['/debug/other','/debug'].includes(url.pathname)) {
         // Reuse the compiler-authored declaration; vary data, never rebuild its DOM.
         const path = url.pathname.slice('/debug'.length) || '/';
         let body = shell.replaceAll('/hello',path);
         if (path === '/other') body = body.replaceAll('Hello namespace','Other namespace');
         if (name === 'cases') {
-          const start = body.indexOf('<div class="wb-inspector"'), end = body.indexOf('<template id="debug-source-metadata"');
+          const start = body.indexOf('<div class="wb-inspector"'), end = body.indexOf('<div class="wb-bottom"',start);
           assert.ok(start > 0 && end > start);
           body = body.slice(0,start) + details + body.slice(end);
         }
@@ -159,6 +254,29 @@ try {
         assert.equal(new URL(page.url()).pathname,'/debug/other','failed read does not move the address');
         assert.match(await page.locator('#debug-main').innerText(),/Other namespace/);
         await page.keyboard.press('Escape'); // Failed locator input remains editable until dismissed.
+        await go('/malformed');
+        await page.waitForFunction(() => document.querySelector('#wb-feedback').textContent.includes('Navigation failed'));
+        await ready('/other');
+        assert.equal(new URL(page.url()).pathname,'/debug/other','missing descriptor does not replace the current route');
+        assert.match(await page.locator('#debug-main').innerText(),/Other namespace/);
+        await page.keyboard.press('Escape');
+        await go('/poor-scope');
+        await page.waitForFunction(() => document.querySelector('#wb-feedback').textContent.includes('Navigation failed'));
+        await ready('/other');
+        assert.equal(new URL(page.url()).pathname,'/debug/other','a poorer descriptor cannot replace workspace content');
+        await page.keyboard.press('Escape');
+        // Add only a test link; invoke the real delegated navigation gesture.
+        await page.evaluate(() => {
+          const link=document.createElement('a'); link.id='test-pinned-read'; link.textContent='Read pinned fixture';
+          link.href='/debug/epoch?epoch=900719925474099312345'; document.querySelector('#debug-main').prepend(link);
+        });
+        await page.locator('#test-pinned-read').click();
+        await page.waitForFunction(() => document.querySelector('#wb-feedback').textContent.includes('Navigation failed'));
+        await ready('/other');
+        assert.equal(new URL(page.url()).pathname,'/debug/other','a mismatched epoch cannot replace the selected version');
+        assert.match(await page.locator('#debug-main').innerText(),/Other namespace/);
+        assert.equal(await workspace.locator(':scope > #debug-read-descriptor').evaluate(template=>JSON.parse(template.content.textContent).path),'/other');
+        await page.locator('#test-pinned-read').evaluate(link=>link.remove());
         await page.locator('#debug-filter input').fill('hello');
         assert.equal(await page.locator('#debug-saved [data-path="/other"]').isVisible(),false);
         await page.locator('#debug-filter-clear').click();
@@ -211,5 +329,6 @@ try {
   assert.equal(await absent.locator('sh-triptych,ui-tree').count(),0,'no legacy document enhancement');
   await missing.close();
   checks.push('missing declaration rejected');
-  console.log(JSON.stringify({passed:checks,liveGETs:0,errors,violations,factories}));
+  console.log(JSON.stringify({passed:checks,liveGETs:0,errors,violations,factories,
+    measurement:{htmlBytes:{page:Buffer.byteLength(shell),details:Buffer.byteLength(details),document:Buffer.byteLength(document)},parser:contract.benchmark}}));
 } finally {await browser.close();}

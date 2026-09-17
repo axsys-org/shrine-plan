@@ -18,9 +18,8 @@ export function createMythPreview(view, href) {
     const description = myth.querySelector('.wb-hover-description');
     description.hidden = false; description.textContent = view.description;
   }
-  const slots = view.record?.slots || [];
-  const slotCount = view.collection?.slotCount ?? slots.length;
-  const shown = slots.filter(slot => !['/sys/lede','/sys/help','/sys/lash'].includes(slot.key)).slice(0, 3);
+  const slotCount = view.collection.slotCount;
+  const shown = view.previewSlots;
   for (const slot of shown) {
     const limb = declaredTemplate('hover-slot');
     const key = limb.querySelector('sh-slot'); key.setAttribute('title', slot.key);
@@ -28,18 +27,15 @@ export function createMythPreview(view, href) {
     definition.dataset.inspect = slot.key; definition.setAttribute('aria-label', 'Inspect slot definition ' + slot.key);
 
     const value = limb.querySelector('sh-pail');
-    const candidate = slot.reference || (slot.links?.length === 1 &&
-      [slot.links[0].text, slot.links[0].path].includes(slot.text) ? slot.links[0].path : null);
-    const reference = typeof candidate === 'string' && candidate.startsWith('/') &&
-      !candidate.split('/').some(part => part === '.' || part === '..') ? candidate : null;
+    const reference = slot.reference;
     const text = value.querySelector(reference ? 'a' : 'span');
     text.hidden = false; text.textContent = slot.text === '' ? '""' : slot.text;
     if (reference) text.href = '/debug' + reference.split('/').filter(Boolean).map(part => '/' + encodeURIComponent(part)).join('');
-     myth.append(limb);
+    myth.append(limb);
   }
   const metadata = myth.querySelector('.wb-hover-meta');
-  const children = view.pagination?.total ?? String(view.collection?.childCount ?? view.children.length);
-  metadata.textContent = (view.record ? slotCount + (slotCount === 1 ? ' slot' : ' slots') :
+  const children = view.pagination?.total ?? view.collection.childCount;
+  metadata.textContent = (view.hasRecord ? slotCount + (slotCount === '1' ? ' slot' : ' slots') :
     view.state === 'tombstone' ? 'Removed record' : 'No own record') + ' · ' + children + (children === '1' ? ' child' : ' children');
 
   if (shown.length) {

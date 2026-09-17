@@ -64,8 +64,8 @@ try {
   if(runtime.entry === 'eden:start-debug') {
     await page.goto(runtime.origin + '/debug' + authority + '/gov');
     await page.waitForFunction(()=>document.querySelector('#debug-workspace')?.dataset.readState === 'ready');
-    const children = await page.locator('#debug-source-metadata').evaluate(template =>
-      [...template.content.querySelectorAll('[data-path]')].map(node=>node.dataset.path));
+    const children = await page.locator('#debug-workspace > #debug-read-descriptor').evaluate(template =>
+      JSON.parse(template.content.textContent).children.map(child=>child.path));
     assert.ok(!children.includes(authority + '/gov/srs'),'debugger-only startup does not publish the optional SRS app');
     assert.equal(await page.locator('[data-grove-contract="debugger/v1"]').count(),1);
     checks.push('debugger startup independent of SRS');

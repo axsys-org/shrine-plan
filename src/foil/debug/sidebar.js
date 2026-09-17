@@ -1,4 +1,4 @@
-import {button, iconNames} from './icons.js';
+import {button} from './icons.js';
 import { isJournalRoot, assertJournalPage } from './journal.js';
 import {declaredTemplate} from './declarations.js';
 import {BoundedCache} from './bounded-cache.js';
@@ -7,19 +7,7 @@ const isPath = path => typeof path === 'string' && path.startsWith('/') && path.
   !path.split('/').some(segment => segment === '.' || segment === '..');
 const PAGE_SIZE = 60;
 const RECENT_LIMIT = 30;
-const kindGlyph = kind => {
-  if (kind === 'record') return 'record';
-  if (/(?:journal|event|request)/.test(kind)) return 'activity';
-  if (/(?:action|operation|behavior|handler)/.test(kind)) return 'run';
-  if (/(?:norm|role|type|definition|grove|module|template)/.test(kind)) return 'subtree';
-  if (/(?:face|component|render)/.test(kind)) return 'roots';
-  return null;
-};
 const normalizedLabel = value => String(value || '').trim().replace(/^\/+|[.:]+$/g, '').toLocaleLowerCase();
-const genericDescriptions = new Set([
-  'Own record slots and namespace relationships.',
-  'A structural namespace path. Child records may exist without a record here.',
-]);
 function orderedChildren(view) {
   const paths = [...new Set((view.children || []).filter(isPath))];
   if (isJournalRoot(view.path)) paths.sort((a, b) => {
@@ -192,9 +180,8 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
     label.path = path;
     const text = label.querySelector('ui-label'); text.textContent = item.title; text.text = item.title;
     const summary = cache.get(path) || summaries.get(path);
-    const glyph = kindGlyph(summary?.kind || '') || (summary?.record ? 'record' : 'branch');
     const mark = item.querySelector(':scope > [slot=icon]'); mark.slot = 'icon';
-    mark.setAttribute('name', iconNames[glyph]);
+    if (summary?.glyph) mark.setAttribute('name', summary.glyph);
     const disclosure = item.querySelector(':scope > [slot=disclosure]'); disclosure.slot = 'disclosure';
     // The namespace recipe owns adornment geometry, including RTL rotation.
     mark.classList.remove('wb-icon'); disclosure.classList.remove('wb-icon');
@@ -230,15 +217,14 @@ export function createSidebar({ initialView, currentPath, navigate, toggleSaved,
       lede.textContent = title; lede.text = title;
     } else lede?.closest('ui-path')?.remove();
     const description = String(view?.description || '').trim();
-    if (description && !genericDescriptions.has(description)) item.setAttribute('aria-description', description);
+    if (description) item.setAttribute('aria-description', description);
     else item.removeAttribute('aria-description');
   }
   function fill(item, view) {
     item.dataset.readState = 'ready'; item.removeAttribute('aria-busy');
     item.dataset.kind = view.kind || '';
     updateSummary(item, view);
-    const glyph = kindGlyph(view.kind || '') || (view.record ? 'record' : 'branch');
-    item.querySelector(':scope > [slot=icon]').setAttribute('name', iconNames[glyph]);
+    item.querySelector(':scope > [slot=icon]').setAttribute('name', view.glyph);
     item.querySelector(':scope > [slot=preview]')?.remove();
     item.previewOpen = false;
     item.querySelector(':scope > .debug-load-more')?.remove();

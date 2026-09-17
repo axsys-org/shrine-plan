@@ -51,18 +51,30 @@ class Document(HTMLParser):
         self.children = []
         self.events = []
         self.links = []
+        self.descriptor_text = ''
+        self.in_descriptor = False
         require_declaration(html)
         self.feed(html)
+        self.descriptor = json.loads(self.descriptor_text)
+        assert self.descriptor['version'] == 1
+        assert self.descriptor['path'] == self.workspace['data-path']
+        self.children = [child['path'] for child in self.descriptor['children']]
     def handle_starttag(self, tag, attrs):
         data = dict(attrs)
         if data.get('id') == 'debug-workspace':
             self.workspace = data
-        if tag == 'ui-tree-item' and 'data-path' in data:
-            self.children.append(data['data-path'])
+        if tag == 'template' and data.get('id') == 'debug-read-descriptor':
+            self.in_descriptor = True
         if tag == 'a' and data.get('class') == 'debug-event':
             self.events.append(data)
         if tag == 'a':
             self.links.append(data)
+    def handle_endtag(self, tag):
+        if tag == 'template':
+            self.in_descriptor = False
+    def handle_data(self, data):
+        if self.in_descriptor:
+            self.descriptor_text += data
 
 with socket.socket() as listener:
     listener.bind(('127.0.0.1', 0))
@@ -115,6 +127,9 @@ with log_path.open('w') as log:
             assert data['data-page-next-before'] == next_before, data
             assert data['data-child-count'] == total, data
             assert data['data-page-epoch'] == epoch, data
+            assert document.descriptor['pagination'] == dict(kind='journal', before=before or None,
+                nextBefore=next_before or None, limit=limit, total=total, epoch=epoch)
+            assert document.descriptor['collection']['childCount'] == total
             paths = ['/0x11/log/' + str(key) for key in expected_keys]
             assert document.children == paths, (document.children, paths)
             assert [event['data-reference'] for event in document.events] == paths

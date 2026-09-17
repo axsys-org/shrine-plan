@@ -26,21 +26,46 @@ class Document(HTMLParser):
         super().__init__()
         self.workspace, self.children, self.events = {}, [], []
         self.cases, self.case_links = {}, []
+        self.descriptor, self.descriptor_text = None, []
+        self.in_descriptor = False
         assert b'data-grove-contract="debugger/v1"' in body
         self.feed(body.decode())
+        assert self.descriptor is not None, 'Missing Grove read descriptor'
+        data = self.descriptor
+        assert data['version'] == 1 and data['path'] == self.workspace['data-path']
+        assert data['scope'] == self.workspace['data-scope']
+        assert data['writable'] == (self.workspace['data-writable'] == 'true')
+        collection = data['collection']
+        assert collection['childCount'] == self.workspace['data-child-count']
+        if self.workspace['data-slot-count']:
+            assert collection['slotCount'] == self.workspace['data-slot-count']
+        assert collection['epoch'] == (self.workspace.get('data-read-epoch') or None)
+        self.children = [child['path'] for child in data['children']]
+        assert len(data['previewSlots']) <= 3
+        assert all(len(slot['text'].encode()) <= 180 for slot in data['previewSlots'])
 
     def handle_starttag(self, tag, attributes):
         attrs = dict(attributes)
         if attrs.get('id') == 'debug-workspace':
             self.workspace = attrs
-        if tag == 'ui-tree-item' and 'data-path' in attrs:
-            self.children.append(attrs['data-path'])
+        if tag == 'template' and attrs.get('id') == 'debug-read-descriptor':
+            assert self.descriptor is None and not self.in_descriptor
+            self.in_descriptor = True
         if tag == 'a' and 'debug-event' in attrs.get('class', '').split():
             self.events.append((attrs['data-reference'], attrs['href']))
         if tag == 'ui-accordion-item' and 'data-care' in attrs:
             self.cases[attrs['data-care']] = attrs['data-case-total']
         if tag == 'a' and 'wb-case-link' in attrs.get('class', '').split():
             self.case_links.append(attrs['href'])
+
+    def handle_data(self, data):
+        if self.in_descriptor:
+            self.descriptor_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'template' and self.in_descriptor:
+            self.descriptor = json.loads(''.join(self.descriptor_text))
+            self.in_descriptor = False
 
 
 def check(manifest):

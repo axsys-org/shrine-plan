@@ -1,10 +1,11 @@
 // The server owns these nodes; Mash owns their controls. This module only
 // attaches namespace data reads, with cancellation and no disclosure mirroring.
+import {valueBinding} from './values.js';
+
 export function bindDocumentFragment(main, view, {readPreview, attachValueInspection, requests}) {
   const pending = new WeakMap();
-  const slots = new Map(view.record?.slots.map(slot => [slot.key, slot]) || []);
   for (const limb of main.querySelectorAll('#wb-canvas > section[aria-label=Record] sh-limb[data-key]')) {
-    const slot = slots.get(limb.dataset.key);
+    const slot = valueBinding(limb, view.path);
     if (slot) attachValueInspection(limb.querySelector(':scope > sh-pail'), slot);
   }
   main.addEventListener('sh-path-row-toggle', async event => {

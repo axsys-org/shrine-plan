@@ -119,6 +119,31 @@ overlay can still be expensive. Derived x/y/z addresses continue through their
 actual resolver; physical child paging must not silently change care semantics.
 Operation registries are not yet paginated.
 
+### Read-descriptor verification, 2026-09-16
+
+Grove now supplies a bounded read descriptor instead of a hidden source tree and
+browser-reconstructed record model. In paired inert-fixture measurements, model
+parsing fell from 0.073 to 0.019 ms; the small leaf document grew from 24,771 to
+25,128 bytes. These measurements ran under host load and are not end-to-end
+navigation speedup claims. The native release gate, nine isolated browser
+scenarios, and real Mash controls/responsive-layout checks passed.
+
+The maximum-size physical path/cursor gate remains unresolved on this build:
+controlled reads returned the correct `404 path_missing` but took 28.29 and
+28.28 seconds, exceeding the unchanged 20-second limit. An active stack sample
+found 9 of 11 samples in copying garbage collection. Neither the allocation
+source nor a causal link to the descriptor is established; physical transport
+does not invoke its renderer. This is a release-verification failure, not a
+passing performance result or a reason to increase the timeout.
+The 10,000-event journal fixture also exceeded its unchanged 900-second startup
+guard after the fixture-ready marker, including a serial rerun. Those logs did
+not isolate the slow startup phase. A later unmodified-source, startup-only
+control listened in 280.091 seconds; it did not run the journal HTTP checks or
+explain the earlier timing spike. The value fixture
+completed 56 HTTP checks before its first edit exceeded 20 seconds during the
+concurrent run; its remaining mutation and saved-artifact checks are unverified.
+All disposable workers were stopped; these gates still require successful reruns.
+
 The existing `/x/...` grammar treats its entire tail as the defining datum;
 appending a rendered result-child key is not a valid way to address that child.
 Case-qualified `/h/z/<case>/<target-length>/...target/...child` reads do work.

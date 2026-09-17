@@ -58,23 +58,27 @@ try {
   await page.goto(origin);
   const parsed = await page.evaluate(async ({files, cases, requests}) => {
     const {parseDebugDocument} = await import('/bridge/namespace.js');
-    const {parseValueMetadata, valueWindowURL, parseValueChunk, renderValueWindow} = await import('/bridge/values.js');
+    const {parseValueMetadata, valueBinding, valueWindowURL, parseValueChunk, renderValueWindow} = await import('/bridge/values.js');
     const documents = {}, explicit = {};
     for (const name of ['document.html', 'root.html', 'changed.html']) {
       // Parse the server bytes directly. No selectors, metadata or content are
       // inserted/rewritten before either production parser sees this document.
       const doc = new DOMParser().parseFromString(files[name], 'text/html');
       const view = parseDebugDocument(doc);
-      if (!view.record) throw new Error(name + ' did not expose a real own record.');
-      const slots = Object.fromEntries(view.record.slots.map(slot => [slot.key, slot]));
+      if (!view.hasRecord) throw new Error(name + ' did not expose a real own record.');
+      const slots = {};
       explicit[name] = [];
       for (const limb of doc.querySelectorAll('#debug-main section[aria-label="Record"] sh-myth > sh-limb')) {
-        const key = limb.querySelector(':scope > sh-slot')?.getAttribute('title');
-        // The namespace adapter deliberately quarantines malformed metadata.
-        // Calling the strict parser too proves no server field was silently
-        // downgraded to unknown by that compatibility behavior.
+        const binding = valueBinding(limb, view.path);
+        if (!binding) throw new Error(name + ' has a value without an explicit slot identity.');
+        const key = binding.key;
+        // Presentation assertions stay in this test, not the browser model.
+        // Exact reads bind only to the authored slot identity and fidelity.
+        const value = limb.querySelector(':scope > sh-pail')?.cloneNode(true);
+        value?.querySelectorAll('script,style,template,summary').forEach(node => node.remove());
+        slots[key] = {...binding, text: value?.textContent, reference: limb.dataset.reference || null};
         const fidelity = parseValueMetadata(limb, view.path, key);
-        explicit[name].push({key, fidelity, adapted: slots[key]?.fidelity});
+        explicit[name].push({key, fidelity, adapted: binding.fidelity});
       }
       documents[name] = {path: view.path, slots, children: view.children};
     }

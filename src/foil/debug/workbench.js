@@ -1,6 +1,7 @@
 import { navigation, initialView } from './navigation.js';
 import { createPathLocator } from './locator.js';
 import { attachValueInspection, cancelValueInspections } from './value-view.js';
+import {valueBinding} from './values.js';
 
 import {bindCaseInspector} from './cases.js';
 import { resolvePath } from './path-targets.js';
@@ -157,9 +158,8 @@ function renderInspector(view) {
   panel.querySelector('[data-inspector-hint]').hidden = reference;
   workspace.dataset.inspectorPath = view.path;
   bindCaseInspector(panel, {navigate: navigation.navigate});
-  const slots = new Map(view.record?.slots.map(slot => [slot.key, slot]) || []);
   for (const limb of panel.querySelectorAll('sh-limb[data-key]')) {
-    const slot = slots.get(limb.dataset.key);
+    const slot = valueBinding(limb, view.path);
     if (slot) attachValueInspection(limb.querySelector(':scope > sh-pail'), slot);
   }
 }

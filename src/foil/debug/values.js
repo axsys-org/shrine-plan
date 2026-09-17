@@ -64,6 +64,17 @@ export function parseValueMetadata(limb, recordPath, slotKey) {
   return result;
 }
 
+/** Bind a rendered limb's explicit read contract without interpreting its
+ * displayed value or looking up a second copy in the document descriptor. */
+export function valueBinding(limb, recordPath) {
+  const key = limb.dataset.key;
+  if (!key) return null;
+  let fidelity;
+  try { fidelity = parseValueMetadata(limb, recordPath, key); }
+  catch { fidelity = {state: 'unknown'}; }
+  return {key, fidelity};
+}
+
 export function valueWindowURL(metadata, start = '0') {
   if (!metadata.url || metadata.bytes === null) throw new Error('Exact inspection is unavailable for this value.');
   const url = endpoint(metadata.url, metadata);

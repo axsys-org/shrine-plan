@@ -19,6 +19,7 @@ belongs to the selected immutable system publication, not that authority.
 - `src/grove/debugger/chrome.grove`: shell, sidebar, menus and named templates.
 - `src/grove/debugger/presentation.grove`: Weft formatting helpers.
 - `src/grove/debugger/model.grove`: namespace presentation data interpretation.
+- `src/grove/debugger/read.grove`: versioned, bounded browser read descriptor.
 - `src/grove/debugger/document.grove`: lore, mani, slots, children and operations.
 - `grove-debugger-source.rvr` concatenates those source parts into one Grove
   compilation unit. It does not generate HTML or select a host renderer.
@@ -43,6 +44,24 @@ belongs to the selected immutable system publication, not that authority.
 - Browser application code owns namespace requests, data binding, navigation,
   cache/queue limits, local preferences and anchored-overlay coordination.
   It clones concrete Grove templates rather than inventing tag/layout trees.
+
+The page carries one direct-child `template#debug-read-descriptor` inside its
+workspace. Grove encodes JSON as escaped Weft text, not executable script. This
+descriptor owns identity, scope, state, authored label/help, Mash glyphs, the
+selected child page, exact decimal-string counts/epochs, opaque collection cursors, and at most three
+180-byte hover excerpts. It is not another copy of the record or a read capability.
+The browser validates the schema and workspace identity before navigation;
+missing or malformed data fails closed. Visible markup is never parsed back
+into record slots, lore, operations, versions, or kind-to-icon classification.
+The old hidden source-tree and version-table copies are removed.
+State reflects evidence in the requested scope: an outline without assertion
+metadata may report `unknown`; an absent own record never implies deletion.
+
+Exact-value controls bind directly to the rendered limb's explicit
+`data-key`/`data-value-*` attributes. Their endpoint, epoch, slot identity, and
+byte-window validation remain separate from the hover excerpts. Updating the
+document replaces its descriptor and primary fragments, not the persistent
+Mash shell, sidebar state, or request coordinator.
 
 “Grove-declared” does not mean JavaScript-free, a capability sandbox, or that
 browser-local preferences are sovereign namespace state. The browser's retired
@@ -91,8 +110,8 @@ successful rebase alone is not evidence of runtime compatibility.
 The composed namespace root exposes authority links without hydrating either
 subtree. Physical reads select the owning history before interpreting epochs.
 Journal rows show actual namespace commits and changes, not the retired task,
-effect or acknowledgement payload. Browser parser labels normalize version
-metadata for display; stored publisher-owned slot identities are preserved.
+effect or acknowledgement payload. Grove formats version metadata for display;
+stored publisher-owned slot identities are preserved.
 Physical records retain their owning authority's case and epoch metadata.
 Derived `/h`, `/o`, and `/x` views do not borrow the physical source's counters:
 their history metadata is unreported until the runtime supplies it for the exact

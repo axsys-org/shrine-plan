@@ -135,10 +135,10 @@ async function sourceDocument(page, path) {
   return page.evaluate(html => {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     return {workspace: {...doc.querySelector('#debug-workspace').dataset},
-      children: [...(doc.querySelector('#debug-source-metadata')?.content || doc)
-        .querySelectorAll('#debug-children ui-tree-item[data-path]')].map(item => item.dataset.path),
+      children: JSON.parse(doc.querySelector('#debug-workspace > #debug-read-descriptor').content.textContent)
+        .children.map(child => child.path),
       fields: [...doc.querySelectorAll('#debug-main section[aria-label=Record] sh-myth > sh-limb')].map(limb => ({
-        key: limb.querySelector('sh-slot')?.getAttribute('title'), text: limb.querySelector('sh-pail')?.textContent,
+        key: limb.dataset.key, text: limb.querySelector('sh-pail')?.textContent,
         ...limb.dataset,
       })), operations: [...doc.querySelectorAll('#debug-main section[aria-label=Operations] form')].map(form => ({
         action: form.getAttribute('action'), op: form.querySelector('[name=op]')?.getAttribute('value'),

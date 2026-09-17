@@ -64,6 +64,12 @@ not replace this fragment. `document-fragment.js` connects namespace value and
 lazy child reads without mirroring component open state. There is no legacy
 document reconstruction fallback in this build.
 
+Grove also emits an inert, versioned read descriptor alongside the fragments.
+Sidebar/locator bindings consume its authored metadata and Mash glyph names;
+they do not infer namespace meaning from the visible HTML. Hover data is limited
+to three 180-byte excerpts. Full-value inspection keeps its separate, explicit
+limb contract and exact epoch/byte-window checks.
+
 Mounted records carrying a typed `mani` in their `pact` slot lead with a Manifest
 section: name and authored lore, declared kooks, seed records with inlined Mash
 previews, and requested versus granted capabilities. Seed and kook destinations
@@ -294,8 +300,9 @@ or moving any existing control.
 `path-preview.js` composes one Mash `ui-preview-card` with an actual Shrine
 Myth and Mash scroll area. Pointer/focus intent waits 320ms; a 180ms leave grace
 bridges the path and its leaf-out. Authored lore and at most three slots are
-excerpts, not a claim of complete values. Long text remains intact in the DOM
-with three-line visual clamps. Open record retains the normal native URL.
+excerpts, not a claim of complete values. Slot excerpts are capped at 180 UTF-8
+bytes (including the ellipsis) and visually clamped to three lines; opening the
+record exposes the separate exact-value controls. Open record retains the normal native URL.
 Snapshots are shared across tree/main/inspector reads in a bounded 60-entry,
 30-second cache. New reads use the existing cancellable preview queue.
 Navigation cancels pending previews and ignores replacement rows under a

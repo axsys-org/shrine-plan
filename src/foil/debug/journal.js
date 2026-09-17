@@ -56,30 +56,30 @@ export function sameJournalPage(left, right) {
     (left?.limit ?? 40) === (right?.limit ?? 40);
 }
 
-export function parseJournalPagination(workspace, path, children) {
-  if (!workspace.dataset.paging) return null;
-  const data = workspace.dataset;
+export function parseJournalPagination(data, path, children) {
+  if (data === null) return null;
   const invalid = () => { throw new Error('The runtime returned invalid journal pagination metadata.'); };
-  if (!isJournalRoot(path) || data.paging !== 'journal' ||
-      !DECIMAL.test(data.childCount || '') || !DECIMAL.test(data.pageEpoch || '') ||
-      !/^(?:[1-9]|[1-3][0-9]|40)$/.test(data.pageLimit || '') ||
-      data.pageBefore === undefined || data.pageNextBefore === undefined) invalid();
-  const before = data.pageBefore || null;
-  const nextBefore = data.pageNextBefore || null;
-  if ((before !== null && !DECIMAL.test(before)) || (nextBefore !== null && !DECIMAL.test(nextBefore))) invalid();
-  const limit = Number(data.pageLimit);
-  if (children.length > limit || BigInt(data.childCount) < BigInt(children.length)) invalid();
+  const fields = ['kind', 'before', 'nextBefore', 'limit', 'total', 'epoch'];
+  if (!data || typeof data !== 'object' || Array.isArray(data) ||
+      Object.keys(data).length !== fields.length || fields.some(key => !Object.hasOwn(data, key)) ||
+      !isJournalRoot(path) || data.kind !== 'journal' ||
+      typeof data.total !== 'string' || !DECIMAL.test(data.total) ||
+      typeof data.epoch !== 'string' || !DECIMAL.test(data.epoch)) invalid();
+  const {before, nextBefore, limit} = data;
+  journalPage({before, limit});
+  if (nextBefore !== null && (typeof nextBefore !== 'string' || !DECIMAL.test(nextBefore))) invalid();
+  if (children.length > limit || BigInt(data.total) < BigInt(children.length)) invalid();
   let previous = before === null ? null : BigInt(before);
   const prefix = path + '/';
   for (const child of children) {
     const key = child.slice(prefix.length);
     if (!child.startsWith(prefix) || !DECIMAL.test(key)) invalid();
     const epoch = BigInt(key);
-    if (epoch > BigInt(data.pageEpoch) || (previous !== null && epoch >= previous)) invalid();
+    if (epoch > BigInt(data.epoch) || (previous !== null && epoch >= previous)) invalid();
     previous = epoch;
   }
   if (nextBefore !== null && (!children.length || nextBefore !== children.at(-1).slice(prefix.length))) invalid();
-  return { kind: 'journal', before, nextBefore, limit, total: data.childCount, epoch: data.pageEpoch };
+  return { kind: 'journal', before, nextBefore, limit, total: data.total, epoch: data.epoch };
 }
 
 export function assertJournalPage(view, requested) {
