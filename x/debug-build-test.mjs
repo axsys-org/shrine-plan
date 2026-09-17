@@ -26,11 +26,21 @@ assert.match(app, /inspection =\s+@role/);
 const instance = await readFile(resolve(root, 'src/grove/debugger/instance.grove'), 'utf8');
 assert.match(instance, /"\/page" =\s+@tree/);
 assert.match(instance, /tack: '@\/y\/%\/input/);
-const registry = await readFile(resolve(mashRoot(),'packages/components/src/icon/carbon-icons.generated.ts'),'utf8');
+const registry = await readFile(resolve(mashRoot(),'packages/components/src/icon/lucide-icons.generated.ts'),'utf8');
 const names = new Set([...registry.matchAll(/^\s+"([^"]+)": \{/gm)].map(match=>match[1]));
 const icons = await readFile(resolve(root,'src/foil/debug/icons.js'),'utf8');
 assert.doesNotMatch(icons, /registerIcon|createElementNS|shrine-icons|<svg\b/);
 const aliases = [...icons.matchAll(/^\s+\w+: '([^']+)'/gm)].map(match=>match[1]);
 assert.ok(aliases.length > 20);
 for (const name of aliases) assert.ok(names.has(name),'Stock Mash icon: ' + name);
+// Grove owns static glyphs and read-descriptor glyphs, not just browser aliases.
+for (const file of ['debugger.grove', 'debugger/chrome.grove', 'debugger/model.grove', 'debugger/document.grove']) {
+  const source = await readFile(resolve(root,'src/grove',file),'utf8');
+  for (const [name] of source.matchAll(/\b(?:action|object|navigation|status)\.[a-z.-]+\b/g)) {
+    assert.ok(names.has(name), 'Stock Mash Lucide icon in ' + file + ': ' + name);
+  }
+}
+const registration = await readFile(resolve(mashRoot(),'packages/components/src/icon/register.ts'),'utf8');
+assert.match(registration, /installLucideIcons\(\)/, 'Mash installs the pack; the application does not');
+assert.doesNotMatch(registration, /installCarbonIcons/);
 console.log('DEBUGGER-BUILD-BOUNDARY-PASS');

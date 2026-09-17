@@ -33,6 +33,8 @@ export async function mashProvenance(release = false) {
   validateMashRevision(dependency, revision, dirty, release);
   const manifest = JSON.parse(await readFile(resolve(checkout, 'package.json'), 'utf8'));
   if (manifest.packageManager !== dependency.packageManager) throw new Error('Mash package manager does not match the declared dependency.');
+  const ui = JSON.parse(await readFile(resolve(checkout, 'packages/components/package.json'), 'utf8'));
+  if (!ui.exports?.['./icon/lucide']) throw new Error('Debugger requires Mash with the semantic Lucide icon pack.');
   const hash = createHash('sha256');
   const inputs = git('ls-files', '-co', '--exclude-standard').split('\n').filter(p =>
     p === 'pnpm-lock.yaml' || p === 'pnpm-workspace.yaml' || p.endsWith('package.json') ||
