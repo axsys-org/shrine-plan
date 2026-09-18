@@ -1,0 +1,173 @@
+- codex
+
++ codex_foot
+  + task
+    & feet/task/fact
+      feet/task/page
+      feet/task/ack
+      codex_foot/line
+      codex_foot/lost
+  + line
+    : text=str
+  + lost
+    : reason=str
+  + bar
+    \ text=str
+    ^ nat
+    | add (str/to_atom text) (bex (mul 8 text.len))
+  + unbar
+    \ bytes=nat
+    ^ str
+    | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + reader
+    '  One outstanding frame per reader; the mailbox remains responsive.
+    \ fd=nat self=nat
+    ^ nat
+    = ;[initial caps] (Recv[nat] 0)
+      parent caps.at(0)
+    % chunks=row[str] [] size=nat 0 rest=str ""
+    ? (eq rest.len 0)
+      = ;result (Try (\ ignored=nat (Read fd 16384)) 0)
+      ? result
+       > (./err cause)
+        ; (Send parent (codex_foot/lost "socket read failed"))
+        | CloseHandle parent
+       > (./ok bytes)
+        ? (le bytes 1)
+          ; (Send parent (codex_foot/lost "app-server disconnected"))
+          | CloseHandle parent
+        | _ chunks size (codex_foot/unbar bytes)
+    ? (str/find (str/from_atom 10) rest)
+     > (./some end)
+      ? (gt (add size end) 4194304)
+        ; (Send parent (codex_foot/lost "frame exceeds 4 MiB"))
+        | CloseHandle parent
+      = line (str/cat_all chunks.snoc(rest.slice(0 end)))
+      ; (SendCaps parent (codex_foot/line line) [0])
+      = ;[ack extras] (Recv[nat] 0)
+      ; (helm/supervisor/close_caps extras)
+      ? (eq ack 0) (CloseHandle parent)
+      | _ [] 0 rest.slice(end.inc (sub rest.len end.inc))
+     > .none
+      = next (add size rest.len)
+      ? (gt next 4194304)
+        ; (Send parent (codex_foot/lost "frame exceeds 4 MiB"))
+        | CloseHandle parent
+      | _ chunks.snoc(rest) next ""
+  + send_one
+    \ fd=nat ignored=nat message=json
+    ^ nat
+    ; ignored
+    = text (str/cat (str/from_atom 10) (show message))
+    | Write fd (codex_foot/bar text)
+  + send
+    \ fd=nat messages=row[json]
+    ^ nat
+    | messages.fold 0 (codex_foot/send_one fd)
+  + send_if_live
+    \ dead=bool fd=nat messages=row[json] ignored=nat
+    ^ nat
+    ? dead 0
+    | codex_foot/send fd messages
+  + pending
+    : batch=codex/batch binding=axal[saga] waiting=bool
+  + flush
+    '  Only one unacknowledged namespace write, so ack correlation is exact.
+    \ parent=nat p=codex_foot/pending
+    ^ codex_foot/pending
+    ? p.waiting p
+    ? (eq p.batch.writes.len 0) p
+    = write p.batch.writes.at(0)
+      operation=writ
+        ? p.binding.get([write.key])
+         > .none (writ/make write.record)
+         > (./some _) (writ/poke write.record)
+    ; (Send parent (feet/gift/pass [write.key] operation))
+    | p.set_waiting(.true)
+  + acknowledge
+    \ err=maybe[pail] p=codex_foot/pending
+    ^ codex_foot/pending
+    ? !(p.waiting) p
+    ? err
+     > .none
+      | p.set_waiting(.false).set_batch(p.batch.set_writes(p.batch.writes.drop(1)))
+     > (./some cause)
+      | p.set_waiting(.false).set_batch((codex/fail "namespace write rejected" p.batch.set_writes([])))
+  + start_wire
+    \ fd=nat token=str ignored=nat
+    ^ nat
+    ; (Write fd (codex_foot/bar (str/cat (str/from_atom 10) token)))
+    | codex_foot/send fd (codex/boot).wire
+  + credit
+    \ dead=bool ignored=nat handle=nat
+    ^ nat
+    ; ignored
+    ; (Send handle (? dead 0 1))
+    | CloseHandle handle
+  + run
+    \ initial=feet/task/init self=nat
+    ^ nat
+    = config=myth
+        ? initial.ax.fil
+         > (./some version) (unpin version.myth)
+        myth/new
+      ;connected (Try (\ ignored=nat (Connect 0 "127.0.0.1" config.nat_at(codex_slots/port 0))) 0)
+    ? connected
+     > (./err cause)
+      | codex_foot/loop 0 initial.parent
+        (codex_foot/pending (codex/fail "bridge connection failed" (codex/stale initial.ax (codex/begin codex/initial))) initial.ax .false)
+     > (./ok fd)
+      = ;started (Try (codex_foot/start_wire fd config.txt_at(codex_slots/token)) 0)
+      ? started
+       > (./err cause)
+        ; (CloseFd fd)
+        | codex_foot/loop 0 initial.parent
+          (codex_foot/pending (codex/fail "bridge initialization failed" (codex/stale initial.ax (codex/begin codex/initial))) initial.ax .false)
+       > (./ok _)
+        = ;reader (Spawn (codex_foot/reader fd))
+        ; (SendCaps reader 0 [0])
+        ; (CloseHandle reader)
+        | codex_foot/loop fd initial.parent
+          (codex_foot/pending (codex/stale initial.ax (codex/begin (codex/boot).state)) initial.ax .false)
+  + loop
+    \ fd=nat parent=nat initial=codex_foot/pending
+    ^ nat
+    = ;p (codex_foot/flush parent initial)
+      ;[message caps] (Recv[codex_foot/task] 0)
+      next=codex_foot/pending
+        ? message
+         > (./fact binding)
+          ? binding.fil
+           > .none
+            | p.set_batch((codex/fail "driver removed" p.batch)).set_binding(binding)
+           > (./some _)
+            | p.set_batch((codex/scan binding p.batch)).set_binding(binding)
+         > (./ack err)
+          | codex_foot/acknowledge err p
+         > (codex_foot/lost reason)
+          | p.set_batch((codex/fail reason p.batch))
+         > (codex_foot/line text)
+          ? (gt text.len 4194304)
+            | p.set_batch((codex/fail "frame exceeds 4 MiB" p.batch))
+          ? (codex_json/decode text)
+           > (./err why rest)
+            | p.set_batch((codex/fail why p.batch))
+           > (./ok value rest)
+            | p.set_batch((codex/scan p.binding (codex/incoming value p.batch)))
+         > (./page path page) p
+      next
+        ? (gt next.batch.writes.len 4096)
+          | next.set_batch((codex/fail "namespace output backlog exceeded" next.batch))
+        next
+      ;sent (Try (codex_foot/send_if_live next.batch.state.dead fd next.batch.wire) 0)
+      next
+        ? sent
+         > (./ok _) next
+         > (./err cause) next.set_batch((codex/fail "socket write failed" next.batch))
+    ; (row/fold[nat nat] 0 (codex_foot/credit next.batch.state.dead) caps)
+    = ;next_fd
+        ? (? next.batch.state.dead (gt fd 0) .false)
+          ; (CloseFd fd)
+          0
+        fd
+    | _ next_fd parent next.set_batch(next.batch.set_wire([]))

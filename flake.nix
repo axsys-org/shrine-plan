@@ -7,13 +7,7 @@
   inputs.enki = {
     url = "github:axsys-org/enki/lf/ice-opcode";
   };
-  inputs.shrine-extras = {
-    type = "git";
-    url = "https://github.com/axsys-org/shrine-extras.git";
-    flake = false;
-  };
-
-  outputs = { self, nixpkgs, rex, enki, shrine-extras }:
+  outputs = { self, nixpkgs, rex, enki }:
     let
       systems = [
         "x86_64-linux"
@@ -23,7 +17,6 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
     in {
-      extrasSource = toString shrine-extras;
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};

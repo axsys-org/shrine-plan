@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Run application suites against a disposable combined test fixture tree."""
+import argparse
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--core-root', type=Path, default=ROOT.parent)
+parser.add_argument('--mount', action='append')
+parser.add_argument('--jobs', type=int, default=2)
+parser.add_argument('--timeout', type=int, default=1200)
+parser.add_argument('--contracts-only', action='store_true', help='Typecheck selected activation, HTTP and driver entrypoints')
+args = parser.parse_args()
+sys.path.insert(0, str(args.core_root.resolve() / 'x'))
+from eden_mounts import select, catalog
+import test_runner as runner
+mounts = select(ROOT, args.mount or list(catalog(ROOT)))
+# Test-only helper dependencies do not become runtime dependencies.
+if any(m.name == 'debugger' for m in mounts):
+    mounts = select(ROOT, [m.name for m in mounts] + ['srs'])
+runtime = os.environ.get('WISP') or shutil.which('wisp')
+if not runtime:
+    parser.error('Set WISP or enter the core Nix shell')
+template = runner.stage(runtime, False, args.timeout)
+work = Path(tempfile.mkdtemp(prefix='shrine-extras-tests-'))
+shutil.copytree(args.core_root / 'src', work / 'src')
+for mount in mounts:
+    for old, leaf in mount.manifest.get('files', {}).items():
+        if old.startswith('src/'):
+            path = work / old
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mount.root / leaf, path)
+    for name, leaf in {**mount.manifest.get('modules', {}), **mount.manifest.get('tests', {})}.items():
+        path = work / 'src/foil' / (name + '.foil')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(mount.root / leaf, path)
+    for path in mount.root.glob('*.rvr'):
+        shutil.copyfile(path, work / 'src/reaver' / path.name)
+# Application tests consume the same checked-in module sources as production.
+# Core's schema-compiler fixtures synthesize these names; extras must not hide a
+# missing or malformed declared OpenRouter dependency behind that fixture reader.
+(work / 'src/reaver/foil-test-deps.rvr').write_text('(#bind std (#module std))\n(#import std)\n(#bind fixture (#module foil-test-context))\n(#bind source (#module foil-source))\n(define (prepare cache mods) (fixture:prepare source:read-module cache mods))\n(define (generated? name) 0)\n(define module-file-stamps [])\n(#export prepare generated? module-file-stamps)\n')
+helpers = {'app_test_world', 'eden_srs', 'eden_debug', 'tests/eden_srs',
+           'tests/debug_http', 'tests/grove_debugger'}
+groups = []
+contracts = ['- http_foot']
+declarations = ['+ mount_contracts']
+signatures = {'activate': r'{\ namespace}either[pail namespace]',
+              'http': r'{\ row[[str nat]] namespace}http_foot/config',
+              'start': r'{\ nat row[str]}nat'}
+for mount in mounts:
+    for kind, signature in signatures.items():
+        hook = mount.manifest.get(kind)
+        if hook:
+            alias = 'hook_' + str(len(contracts))
+            contracts.append('- ' + hook['module'] + ' [at=' + alias + ']')
+            declarations.extend(['  + ' + alias, '    ^ ' + signature,
+                                 '    ' + alias + '/' + '/'.join(hook['entry'])])
+if len(contracts) > 1:
+    (work / 'src/foil/mount_contracts.foil').write_text('\n'.join(contracts + declarations) + '\n')
+    (work / 'src/reaver/extras-mount-contract-tests.rvr').write_text('''(#bind std (#module std))
+(#import std)
+(#bind source (#module foil-source))
+(#bind fixture (#module foil-test-context))
+(define (check ignored)
+  (define checked (source:compile (fixture:files 0 ["mount_contracts"]) 0 "mount_contracts"))
+  (DeepSeq checked 1))
+(print ("MOUNT-CONTRACTS-PASS" (check 0)))
+''')
+    groups.append([dict(name='extras-mount-contract-tests', target='extras-mount-contract-tests',
+                        kind='reaver', group='mount-contracts', timeout=args.timeout)])
+for mount in ([] if args.contracts_only else mounts):
+    suites = [dict(name='foil:' + name, target=name, kind='native',
+                   group=mount.name, timeout=args.timeout)
+              for name in mount.manifest.get('tests', {}) if name not in helpers]
+    if suites:
+        groups.append(suites)
+    if mount.name == 'debugger':
+        groups.append([dict(name='foil-grove-debugger-tests', target='foil-grove-debugger-tests',
+                            kind='reaver', group='grove-debugger', timeout=args.timeout)])
+print('Extras test results: ' + str(work), flush=True)
+with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    futures = [pool.submit(runner.run_group, group, runtime, template, work, args.timeout)
+               for group in groups]
+    results = [future.result() for future in futures]
+(work / 'results.json').write_text(json.dumps(results, indent=2))
+raise SystemExit(int(not all(result['passed'] for result in results)))

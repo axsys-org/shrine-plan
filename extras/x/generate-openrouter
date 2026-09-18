@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Regenerate the checked-in OpenRouter source mount using core's schema compiler."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--core-root', type=Path, default=ROOT.parent)
+args = parser.parse_args()
+sys.path.insert(0, str(args.core_root.resolve() / 'x'))
+import test_runner as runner
+runtime = os.environ.get('WISP') or shutil.which('wisp')
+if not runtime:
+    parser.error('Set WISP or enter the core Nix shell')
+work = Path(tempfile.mkdtemp(prefix='shrine-openrouter-'))
+shutil.copytree(args.core_root / 'src', work / 'src')
+shutil.copyfile(ROOT / 'mounts/openrouter/openrouter.json', work / 'src/spec/openrouter.json')
+(work / 'src/generated').mkdir()
+runner.copy_template(runner.stage(runtime, False, 1200), work / 'snap')
+code, complete, _ = runner.run_process([runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_'], work, '''(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind source (#module foil-source))
+(#bind fixture (#module foil-test-context))
+(#bind schemagen (#module schemagen))
+(#bind driver (#module foil-new-env))
+(#bind abi (#module foil-abi))
+(define (generate ignored)
+  (define js (_1 (source:compile (fixture:files 0 ["json"]) 0 "json")))
+  (define string (abi:constructor js ["json" "str"]))
+  (define array (abi:constructor js ["json" "arr"]))
+  (define show (driver:get-perc ["show"] js))
+  (define (wire tree)
+    (cond
+      ((Eq (Hd tree) "leaf") (array [(string "leaf") (string (_1 tree)) (string (_2 tree))]))
+      ((Eq (Hd tree) "nest") (array [(string "nest") (string (_1 tree)) (string (_2 tree)) (array (map wire (_3 tree)))]))
+      ((Eq (Hd tree) "juxt") (array [(string "juxt") (array (map wire (_1 tree)))]))
+      (else (error ["Unsupported normalized source" tree]))))
+  (define schema (schemagen:sg-schema-value js (read-text-file "spec/openrouter.json")))
+  (define parts (schemagen:sg-spec-parts schema ["get_models" "send_chat_completion_request"]))
+  (write-text-file "generated/open_router_api.json" (show (wire (_1 (schemagen:sg-swagger-types-tree parts)))))
+  (write-text-file "generated/open_router_api_hand.json" (show (wire (_1 (schemagen:sg-swagger-hand-tree parts)))))
+  (print "OPENROUTER-GENERATED"))
+(generate 0)
+''', 1200)
+log = (work / 'out.log').read_text()
+if code or not complete or '("ERROR"' in log or '"OPENROUTER-GENERATED"' not in log:
+    raise SystemExit('Generation failed; inspect ' + str(work / 'out.log'))
+from source_text import render
+import json
+for name in ('open_router_api', 'open_router_api_hand'):
+    tree = json.loads((work / 'src/generated' / (name + '.json')).read_text())
+    (work / 'src/generated' / (name + '.foil')).write_text(render(tree) + '\n')
+verify = '''(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind sast (#module foil-sast))
+(DeepSeq (sast:parse-module-sast 0 (rex:ParseRexNormFile (read-text-file "generated/open_router_api.foil"))) 0)
+(DeepSeq (sast:parse-module-sast 0 (rex:ParseRexNormFile (read-text-file "generated/open_router_api_hand.foil"))) 0)
+(print "OPENROUTER-SOURCE-VALID")
+'''
+code, complete, _ = runner.run_process([runtime, '--file-root', str(work / 'src'),
+                                       'snap', 'root', '_'], work / 'verify', verify, 120, cwd=work)
+log = (work / 'verify/out.log').read_text()
+if code or not complete or '("ERROR"' in log or '"OPENROUTER-SOURCE-VALID"' not in log:
+    raise SystemExit('Generated syntax failed; inspect ' + str(work / 'verify/out.log'))
+for name in ('open_router_api', 'open_router_api_hand'):
+    shutil.copyfile(work / 'src/generated' / (name + '.foil'), ROOT / 'mounts/openrouter' / (name + '.foil'))
+print('Updated OpenRouter source mount')
