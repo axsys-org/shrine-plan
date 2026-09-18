@@ -118,11 +118,10 @@
       (rowify (bst:bst-ltap cache)))))
 
 ;; Returns [lowered subject, exact own key set].
-(define (elab-mod-info sut decls)
+(define (elab-mod-info-in compiler sut decls)
   (define mod
     (foil-new-elab:compiler-subject
-      (foil-new-elab:elab-mod
-        (foil-new-elab:compiler-for sut) decls)))
+      (foil-new-elab:elab-mod compiler decls)))
   (define final (foil-lower:materialize-consts mod))
   (define declared
     (map (lambda (d) (foil-subject:root-path final (Ix 1 d)))
@@ -133,6 +132,8 @@
       (canonical-path-set (Weld declared (map (Ix 0) delta))))
   (define lowered (foil-lower:lower-tc-unit sut final own-keys))
   [(force lowered) own-keys])
+(define (elab-mod-info sut decls)
+  (elab-mod-info-in (foil-new-elab:compiler-for sut) sut decls))
 
 ;; -> [cache prev-pins direct-layers]: the row of import-subject PINS
 ;; (later-import-first, substrate last), plus the DIRECT imports as
@@ -196,7 +197,8 @@
 ;; A direct prefix changes only that layer's spelling. Its dependencies
 ;; enter the transitive, unprefixed scope. Dedup by spelling AND identity
 ;; after ranking, so an earlier deep visit cannot hide a nearer import.
-(define (mark-imports-visible root base layers sut)
+;; -> the [layer spelling] mounts in marking order, substrate first.
+(define (import-mounts root base layers)
   (define (level todo seen ranked)
     (Ifz (Sz todo)
       ranked
@@ -220,25 +222,36 @@
         (rev layers))
       (ca:putax [root (foil-subject:sut-root base)] 1 ca:empty-ax)
       []))
-  (foldl (lambda (s pair) (mark-layer-under (_1 pair) (_0 pair) s))
-    (mark-layer-under root base sut) ranked))
+  (Weld [[base root]] ranked))
+(define (mark-mounts mounts sut)
+  (foldl (lambda (s pair) (mark-layer-under (_1 pair) (_0 pair) s)) sut mounts))
+(define (mark-imports-visible root base layers sut)
+  (mark-mounts (import-mounts root base layers) sut))
 
 ;; make-head : Cord -> Subject -> [Pin] -> [[Subject Path]] -> [Decl] -> Subject
 ;; The fresh head uses the assigned context over the shared
 ;; import pins, with the whole closure's names (substrate included) and
 ;; the module's own decls marked into it.
-(define (make-head context mod base prev-pins layers decls)
+;; make-head-mounts answers [head mounts]: the mounts, as [layer-root
+;; spelling] rows, are every mark the head carries besides its own decls,
+;; which lets the compiler answer alias queries without inverting the index
+;; (foil-subject:mount-aliases).  A caller that marks the head any further
+;; must not pass them on.
+(define (make-head-mounts context mod base prev-pins layers decls)
   (define unit (contexts:module (contexts:require-context context) mod))
   (define root (contexts:storage-root unit))
   (define head
     (foil-subject:set-sut-root root
       (foil-subject:head-onto-pins prev-pins base)))
+  (define mounts (import-mounts root base layers))
   ;; the substrate goes FIRST (lowest precedence: imports and own decls
   ;; shadow builtins) and explicitly — a module with no imports has no
   ;; chain through which the substrate would otherwise be reached
-  (mark-own-visible decls
-    (mark-imports-visible root base layers
-      (foil-subject:set-sut-context unit head))))
+  [(mark-own-visible decls
+     (mark-mounts mounts (foil-subject:set-sut-context unit head)))
+   (map (lambda (pair) [(foil-subject:sut-root (_0 pair)) (_1 pair)]) mounts)])
+(define (make-head context mod base prev-pins layers decls)
+  (_0 (make-head-mounts context mod base prev-pins layers decls)))
 
 ;; Reject duplicate source declarations before constructing or lowering a head.
 ;; Reopening a namespace remains valid when its declared member paths differ.
@@ -265,7 +278,8 @@
   ;; The fresh head uses the context over the shared import pins; all
   ;; naming authority (substrate, the whole import closure, own decls)
   ;; is marked into it — the pinned tail layers carry entries only
-  (define sut (make-head context mod base prev-pins layers decls))
+  (define headed (make-head-mounts context mod base prev-pins layers decls))
+  (define sut (_0 headed))
   ;; Force the head — and through its visibility marks every import's
   ;; compile — HERE, at driver level.  Left lazy, a failing import first
   ;; fails inside the importer's per-declaration Try in foil-new-elab
@@ -274,7 +288,8 @@
   ;; that as a fatal <<loop>> instead of the import's error.  (The prev
   ;; pins stop DeepSeq; the unpinned direct layers in the marks do not.)
   (DeepSeq sut 0)
-  (define out (elab-mod-info sut decls))
+  (define out
+    (elab-mod-info-in (foil-new-elab:compiler-for-mounts (_1 headed) sut) sut decls))
   (define perc ($Perc rexn sast (_0 out) mod (_1 out)
     (foil-lore:capture-lore rexn)))
   ;; Publish only a completed result, including the requested root module.
