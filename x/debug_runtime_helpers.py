@@ -9,7 +9,7 @@ ASSET_PATHS = frozenset(('debug.js', 'debug.css', 'style.css', '.debug-assets/ma
 def verify_asset_build(root):
     manifest = root / 'build.json'
     if not manifest.is_file():
-        raise RuntimeError('Build native assets first: MASH_ROOT=/path/to/mash node x/build-debug.mjs')
+        raise RuntimeError(f'Missing debugger asset manifest: {manifest}')
     build = json.loads(manifest.read_text())
     if build.get('mode') != 'grove' or set(build.get('assets', {})) != ASSET_PATHS:
         raise RuntimeError('Expected a complete Grove asset build, not a legacy or partial bundle.')

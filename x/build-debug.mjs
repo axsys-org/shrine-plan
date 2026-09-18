@@ -4,11 +4,11 @@ import { resolve, dirname, delimiter } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import {execFileSync} from 'node:child_process';
-import {root, outputRoot, mashRoot, mashProvenance, esbuild} from './debug-tooling.mjs';
+import {root, outputRoot, mashRoot, mashProvenance, isNixMash, esbuild} from './debug-tooling.mjs';
 if (process.argv.includes('--legacy')) throw new Error('The legacy debugger renderer has been removed; build the Grove declaration.');
 const provenance = await mashProvenance(process.argv.includes('--release'));
-// Build actual workspace sources every time. No ignored/prebuilt input is
-// accepted as evidence of which Mash revision this application contains.
+// Nix builds the pinned workspace in the store. Editable checkouts rebuild
+// their sources here; neither route consumes unverified local dist/ files.
 const mash = mashRoot();
 const pnpm = process.env.PNPM || 'pnpm';
 const env = process.env.PNPM ? {...process.env, PATH:dirname(resolve(pnpm)) + delimiter + process.env.PATH} : process.env;
@@ -16,8 +16,10 @@ const pnpmVersion = execFileSync(pnpm, ['--version'], {cwd:mash, encoding:'utf8'
 if ('pnpm@' + pnpmVersion !== provenance.packageManager) throw new Error('Use ' + provenance.packageManager + '; found pnpm@' + pnpmVersion + '. Set PNPM to its executable if needed.');
 // Dependency installation is explicit: pnpm install --frozen-lockfile in Mash.
 // A build must not replace an existing checkout's node_modules/store layout.
-execFileSync(pnpm, ['run', 'build'], {cwd:mash, stdio:'inherit',env});
-execFileSync(pnpm, ['--filter', '@mash/catalog', 'run', 'build:iife'], {cwd:mash, stdio:'inherit',env});
+if (!isNixMash()) {
+  execFileSync(pnpm, ['run', 'build'], {cwd:mash, stdio:'inherit',env});
+  execFileSync(pnpm, ['--filter', '@mash/catalog', 'run', 'build:iife'], {cwd:mash, stdio:'inherit',env});
+}
 const {build} = esbuild();
 const outputs = new Map();
 

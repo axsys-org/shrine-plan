@@ -7,8 +7,16 @@
   inputs.enki = {
     url = "github:axsys-org/enki/main";
   };
+  inputs.mash = {
+    # Use Git's credential helper for the private repository.
+    type = "git";
+    url = "https://github.com/axsys-org/mash.git";
+    rev = "12e5f9345d9745cb75cab4f58e39aa33da83e14e";
+    allRefs = true;
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
-  outputs = { self, nixpkgs, rex, enki }:
+  outputs = { self, nixpkgs, rex, enki, mash }:
     let
       systems = [
         "x86_64-linux"
@@ -22,7 +30,14 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           enkiPkg = enki.packages.${system}.default;
-
+          mashPackages = mash.packages.${system};
+          debuggerTools = [
+            enkiPkg
+            mashPackages.nodejs
+            mashPackages.pnpm
+            pkgs.python3
+            pkgs.lsof
+          ];
 
           hsPkgs = pkgs.haskellPackages.override {
             overrides = hfinal: hprev: {
@@ -33,16 +48,20 @@
             };
           };
         in {
+          debugger = pkgs.mkShell {
+            packages = debuggerTools;
+            MASH_NIX_ROOT = "${mashPackages.workspace}";
+          };
           default = hsPkgs.shellFor {
             packages = hp: [ hp.plan-assembler ];
+            MASH_NIX_ROOT = "${mashPackages.workspace}";
             nativeBuildInputs = [
               hsPkgs.ghcid
               hsPkgs.stylish-haskell
               hsPkgs.cabal-install
               pkgs.rlwrap
               pkgs.samply
-              enkiPkg
-            ];
+            ] ++ debuggerTools;
             # buildInputs = with hsPkgs; [
             #   text primitive pretty-show containers deepseq
             #   optics ghc-prim mtl transformers cryptohash-sha256

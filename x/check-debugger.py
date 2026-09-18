@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build current Grove + Mash sources and verify the native declaration in an inert browser.
 
-Requires WISP (or wisp on PATH), Node, pnpm, and an explicit MASH_ROOT checkout
-with dependencies installed from its lockfile. Never reads a live namespace.
+Use nix develop .#debugger, or supply WISP, Node, pnpm, and an explicit
+MASH_ROOT checkout with locked dependencies. Never reads a live namespace.
 """
 import argparse
 import hashlib
@@ -30,8 +30,8 @@ def check(args):
     node = os.environ.get('NODE') or shutil.which('node')
     if not wisp or not node:
         raise RuntimeError('Set WISP and NODE or put wisp and node on PATH.')
-    if not args.backend_only and not os.environ.get('MASH_ROOT'):
-        raise RuntimeError('Set MASH_ROOT to the explicit paired Mash checkout.')
+    if not args.backend_only and not (os.environ.get('MASH_ROOT') or os.environ.get('MASH_NIX_ROOT')):
+        raise RuntimeError('Enter nix develop .#debugger or set MASH_ROOT to the paired Mash checkout.')
     work = Path(tempfile.mkdtemp(prefix='shrine-debugger-check-')).resolve()
     print('Debugger check artifacts: ' + str(work), flush=True)
     code, complete, _ = runner.run_process([sys.executable,str(runner.ROOT / 'x/debug-runtime-tests.py')],

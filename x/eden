@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run the Eden namespace explorer; --check exercises the real socket."""
+"""Run the Eden debugger with its pinned Nix tools; --check exercises the real socket."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import hashlib
 import sys
 import os
 import re
@@ -17,6 +18,37 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from debug_runtime_helpers import startup_failed, verify_asset_build
+
+
+def enter_environment(root, argv):
+    """Re-exec once through the flake, keeping the caller's arguments and cwd."""
+    if os.environ.pop('_EDEN_NIX_ROOT', None) == str(root):
+        return
+    nix = shutil.which('nix')
+    if not nix:
+        raise RuntimeError('x/eden requires Nix on PATH to prepare its tools.')
+    print('Preparing Eden’s Nix environment…', flush=True)
+    os.execvpe(nix, [
+        nix, '--extra-experimental-features', 'nix-command flakes',
+        'develop', '--no-update-lock-file', f'{root}#debugger',
+        # Keep logs and the bootstrap snapshot outside Nix's auto-cleaned TMPDIR.
+        '--command', 'env', f'_EDEN_NIX_ROOT={root}', f'TMPDIR={tempfile.gettempdir()}',
+        'python3', str(root / 'x/eden'), *argv,
+    ], os.environ)
+
+
+def build_assets(root, assets, mash_root=None):
+    """Build and verify a private bundle for this launch, never shared output."""
+    env = dict(os.environ, DEBUG_OUTPUT_ROOT=str(assets))
+    # Old shell exports must not replace the workspace selected by the flake.
+    env.pop('MASH_ROOT', None)
+    if mash_root is not None:
+        env['MASH_ROOT'] = str(mash_root.resolve())
+    print('Building debugger assets…', flush=True)
+    subprocess.run(
+        [os.environ.get('NODE', 'node'), str(root / 'x/build-debug.mjs')],
+        cwd=root, env=env, check=True)
+    return verify_asset_build(assets)
 
 
 def runtime_exit_status(returncode, log_path):
@@ -41,7 +73,8 @@ from namespace_identity import parse_node_identity
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--port', type=int, default=8130)
-parser.add_argument('--node', help='Explicit node public-key hash in canonical Shrine hex, e.g. 0x0102 (no keypair is generated)')
+parser.add_argument('--node', default='0x11',
+                    help='Node public-key hash in canonical Shrine hex (default: disposable fixture 0x11; no keypair is generated)')
 parser.add_argument('--check', action='store_true')
 parser.add_argument('--startup-timeout', type=int, default=1200,
                     help='Seconds allowed for compilation and listener startup (default: 1200)')
@@ -49,8 +82,10 @@ parser.add_argument('--request-timeout', type=int, default=30,
                     help='Seconds allowed per socket check request (default: 30)')
 parser.add_argument('--srs', action='store_true',
                     help='Publish Grove SRS definitions and offer instance installation in the UI')
-parser.add_argument('--debug', action='store_true',
-                    help='Launch the installed Grove debugger; optional SRS uses --srs')
+parser.add_argument('--debug', action=argparse.BooleanOptionalAction, default=None,
+                    help='Launch the Grove debugger (default); --no-debug selects the original explorer')
+parser.add_argument('--mash-root', type=Path,
+                    help='Build an explicit Mash checkout instead of the pinned Nix workspace')
 parser.add_argument('--codex', action='store_true',
                     help='Start the Codex desk driver; --check uses a fake app server')
 parser.add_argument('--codex-bin', default='codex',
@@ -60,13 +95,10 @@ parser.add_argument('--profile-boot', action='store_true',
 args = parser.parse_args()
 if args.debug and args.codex:
     parser.error('--debug and --codex are separate entry points; choose one')
-boot_started = time.monotonic()
-if args.codex and not args.check and not shutil.which(args.codex_bin):
-    parser.error('--codex requires a Codex executable; set --codex-bin')
-if args.node is None and not args.check:
-    parser.error('--node is required; --check uses deterministic fixture identity 0x11')
+if args.debug is None:
+    args.debug = not args.codex
 try:
-    node_number, node = parse_node_identity(args.node or '0x11')
+    node_number, node = parse_node_identity(args.node)
 except ValueError as error:
     parser.error(str(error))
 if args.startup_timeout <= 0:
@@ -75,9 +107,26 @@ if args.request_timeout <= 0:
     parser.error('--request-timeout must be positive')
 if not 1 <= args.port <= 65535:
     parser.error('--port must be between 1 and 65535')
+try:
+    enter_environment(root, sys.argv[1:])
+except (RuntimeError, OSError) as error:
+    parser.error(str(error))
+boot_started = time.monotonic()
+if args.codex and not args.check and not shutil.which(args.codex_bin):
+    parser.error('--codex requires a Codex executable; set --codex-bin')
 runtime = os.environ.get('WISP') or shutil.which('wisp') or str(root / 'wisp')
 if not os.access(runtime, os.X_OK):
     parser.error('Set WISP to a working runtime executable (see doc/actor-abort-investigation.md).')
+work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
+if args.debug:
+    assets = work / 'debug-assets' / 'foil'
+    try:
+        build = build_assets(root, assets, args.mash_root)
+    except subprocess.CalledProcessError as error:
+        print(f'Debugger asset build failed (exit {error.returncode}).', file=sys.stderr)
+        raise SystemExit(error.returncode if error.returncode > 0 else 128 - error.returncode)
+    except (RuntimeError, OSError, ValueError) as error:
+        parser.error(str(error))
 # A template is tied to both compiler inputs and the runtime binary. Picking
 # the newest directory can mix runtimes or silently reuse stale compiler code.
 try:
@@ -85,14 +134,8 @@ try:
 except (RuntimeError, OSError) as error:
     parser.error(str(error))
 staged_at = time.monotonic()
-work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
 shutil.copytree(root / 'src', work / 'src')
 if args.debug:
-    assets = Path(os.environ.get('DEBUG_OUTPUT_ROOT', root / '.check/debug-assets/foil'))
-    try:
-        build = verify_asset_build(assets)
-    except (RuntimeError, OSError) as error:
-        parser.error(str(error))
     for relative in build['assets']:
         target = work / 'src' / 'foil' / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -190,6 +233,15 @@ with ExitStack() as cleanup, log_path.open('w') as log:
                 page = get(f'/debug/{node}/app/debug')
                 assert 'data-grove-contract="debugger/v1"' in page
                 assert f'data-path="/{node}/app/debug"' in page
+                for route, relative in {
+                    '/debug.js': 'debug.js',
+                    '/debug.css': 'debug.css',
+                    '/style.css': 'style.css',
+                    '/debug-mash.js': '.debug-assets/mash.js',
+                    '/debug-components.css': '.debug-assets/components.css',
+                }.items():
+                    with urllib.request.urlopen(url + route, timeout=args.request_timeout) as response:
+                        assert hashlib.sha256(response.read()).hexdigest() == build['assets'][relative], route
             if args.codex:
                 console = f'/ns/{node}/io/codex'
                 assert 'What should Codex do?' in get(console)
