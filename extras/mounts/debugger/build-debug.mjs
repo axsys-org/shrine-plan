@@ -1,0 +1,69 @@
+// Bundle browser sources into the two asset names the running HTTP foot serves.
+// This updates UI assets only; it does not restart or mutate the namespace.
+import { resolve, dirname, delimiter } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import {execFileSync} from 'node:child_process';
+import {root, outputRoot, mashRoot, mashProvenance, isNixMash, esbuild} from './debug-tooling.mjs';
+if (process.argv.includes('--legacy')) throw new Error('The legacy debugger renderer has been removed; build the Grove declaration.');
+const provenance = await mashProvenance(process.argv.includes('--release'));
+// Nix builds the pinned workspace in the store. Editable checkouts rebuild
+// their sources here; neither route consumes unverified local dist/ files.
+const mash = mashRoot();
+const pnpm = process.env.PNPM || 'pnpm';
+const env = process.env.PNPM ? {...process.env, PATH:dirname(resolve(pnpm)) + delimiter + process.env.PATH} : process.env;
+const pnpmVersion = execFileSync(pnpm, ['--version'], {cwd:mash, encoding:'utf8',env}).trim();
+if ('pnpm@' + pnpmVersion !== provenance.packageManager) throw new Error('Use ' + provenance.packageManager + '; found pnpm@' + pnpmVersion + '. Set PNPM to its executable if needed.');
+// Dependency installation is explicit: pnpm install --frozen-lockfile in Mash.
+// A build must not replace an existing checkout's node_modules/store layout.
+if (!isNixMash()) {
+  execFileSync(pnpm, ['run', 'build'], {cwd:mash, stdio:'inherit',env});
+  execFileSync(pnpm, ['--filter', '@mash/catalog', 'run', 'build:iife'], {cwd:mash, stdio:'inherit',env});
+}
+const {build} = esbuild();
+const outputs = new Map();
+
+let componentCSS;
+
+// --components is accepted for old callers; components are now always built.
+{
+  async function recipe(path, stack = []) {
+    if (stack.includes(path)) throw new Error('Cyclic component CSS import: ' + path);
+    let text = await readFile(path, 'utf8');
+    for (const match of [...text.matchAll(/@import\s+"(\.\/[^"\n]+)"\s*;/g)]) {
+      const imported = await recipe(resolve(path, '..', match[1]), [...stack, path]);
+      text = text.replace(match[0], imported);
+    }
+    return text;
+  }
+  const css = await Promise.all(['components', 'shrine-components'].map(packageName =>
+    recipe(resolve(mash, 'packages', packageName, 'src/catalogue/mash.css'))));
+  componentCSS = css.join('\n');
+  outputs.set(resolve(outputRoot, 'mash.js'), await readFile(resolve(mash, 'apps/catalog/dist/mash.js')));
+}
+const compiledCSS = await build({ entryPoints: [resolve(root, 'styles.css')], outfile: resolve(root, 'debug.css'), bundle: true, write: false, target: 'es2022', logLevel: 'info' });
+const compiledJS = await build({
+  entryPoints: [resolve(root, 'native.js')], outfile: resolve(root, 'debug.js'),
+  bundle: true, write: false, format: 'iife', target: 'es2022', logLevel: 'info', minifySyntax:true, treeShaking:true,
+});
+if (/\bcreateElement(?:NS)?\s*\(/.test(compiledJS.outputFiles[0].text)) {
+  throw new Error('Native application bundle contains a DOM factory; declare its UI in Grove.');
+}
+outputs.set(resolve(outputRoot, 'components.css'), componentCSS);
+outputs.set(resolve(outputRoot, 'debug.css'), compiledCSS.outputFiles[0].contents);
+outputs.set(resolve(outputRoot, 'debug.js'), compiledJS.outputFiles[0].contents);
+
+const after = await mashProvenance(process.argv.includes('--release'));
+if (after.sourceSha256 !== provenance.sourceSha256 || after.revision !== provenance.revision) throw new Error('Mash source changed during build; rerun.');
+outputs.set(resolve(outputRoot, 'build.json'), JSON.stringify({mode:'grove', mash:provenance,
+  assets:Object.fromEntries([...outputs].map(([path,body]) => [path.slice(outputRoot.length+1),createHash('sha256').update(body).digest('hex')]))}, null,2)+'\n');
+
+// Prepare all outputs before replacing any. Each file replacement is atomic.
+// Live previews serve sealed asset snapshots, not this mutable build directory.
+await mkdir(outputRoot, { recursive: true });
+for (const [path, contents] of outputs) {
+  const temporary = path + '.' + randomUUID() + '.tmp';
+  await writeFile(temporary, contents);
+  await rename(temporary, path);
+}
+console.log('Debugger assets:', outputRoot);

@@ -1,0 +1,406 @@
+- apps/hyp/main
+
+' A local scheduler. Each guest owns a separate namespace and index.
+' All values are persistent; a host edit and a guest delivery are
+' separate commits. Native devices are not implicitly inherited.
++ hyp_runtime
+  : host=namespace root=path schema=path
+    guests=row[hyp_runtime/guest] next=nat
+  + guest
+    : ref=hyp/instance_ref owner=path boot=hyp/config
+      state=namespace index=hive running=bool
+
+  + new
+    \ host=namespace root=path schema=path
+    ^ hyp_runtime
+    | hyp_runtime host root schema [] 1
+
+  + slot
+    \ name=iota run=hyp_runtime
+    ^ path
+    | run.schema.snoc name
+
+  + record
+    \ name=path host=namespace
+    ^ myth
+    | (sovereign_peek name host).fil.fall myth/new
+
+  + patch
+    ' Driver commits do not go through the user mutation endpoint.
+    \ name=path add=myth run=hyp_runtime
+    ^ hyp_runtime
+    =   diffs
+     | (axal/new[note] .none).put name (note/poke add)
+    ? (namespace/step diffs 0 0 run.host)
+     > (./rejected why) (hyp/panic (helm/supervisor/rejection why) run)
+     > (./accepted done) run.set_host(done.state)
+
+  + child
+    \ ref=hyp/instance_ref run=hyp_runtime
+    ^ maybe[nat]
+    % idx=nat 0
+    ^ maybe[nat]
+    ? (eq idx run.guests.len) .none
+    ? (equal ref run.guests.at(idx).ref) (./some idx)
+    | _ idx.inc
+
+  + owned
+    \ name=path run=hyp_runtime
+    ^ maybe[nat]
+    % idx=nat run.guests.len
+    ^ maybe[nat]
+    ? (eq idx 0) .none
+    ? (equal name run.guests.at(idx.dec).owner)
+      (./some idx.dec)
+    | _ idx.dec
+
+  + replace_guest
+    \ idx=nat guest=hyp_runtime/guest run=hyp_runtime
+    ^ hyp_runtime
+    =   guests
+     | run.guests.take(idx).snoc(guest).weld
+       run.guests.drop(idx.inc)
+    run.set_guests(guests)
+
+  + collection
+    \ kind=iota run=hyp_runtime
+    ^ row[[path myth]]
+    | (sovereign_peek (run.root.snoc(kind)) run.host).tap
+
+  + config
+    \ rec=myth run=hyp_runtime
+    ^ maybe[hyp/config]
+    | rec.get(run.slot('config)).then(hyp/config/read)
+
+  + wanted
+    \ rec=myth run=hyp_runtime
+    ^ maybe[hyp/wanted]
+    | rec.get(run.slot('want)).then(hyp/wanted/read)
+
+  + reference
+    \ rec=myth run=hyp_runtime
+    ^ maybe[hyp/instance_ref]
+    | rec.get(run.slot('instance)).then(hyp/instance_ref/read)
+
+  + validate_node
+    \ name=path rec=myth before=hyp_runtime
+    ^ maybe[iota]
+    ?> (./some cfg) before.config(rec)
+      (./some 'hyp_config_required)
+    ?> (./some want) before.wanted(rec)
+      (./some 'hyp_want_required)
+    ? cfg.devices.tap.len (./some 'hyp_devices_unsupported)
+    ?> (./ok _) (namespace/create cfg.self cfg.initial cfg.system)
+      (./some 'hyp_invalid_boot)
+    =   old
+     | hyp_runtime/record name before.host
+    ? !(equal old.get(before.slot('observed))
+          rec.get(before.slot('observed)))
+      (./some 'hyp_observation_owned)
+    ? (eq old.tap.len 0) .none
+    ? !(equal old.get(before.slot('config))
+          rec.get(before.slot('config)))
+      (./some 'hyp_config_immutable)
+    .none
+
+  + validate_entry
+    \ kind=iota name=path rec=myth before=hyp_runtime
+    ^ maybe[iota]
+    ? (eq_iota kind 'instances)
+      | hyp_runtime/validate_node name rec before
+    =   old
+     | hyp_runtime/record name before.host
+    ? !(equal old.get(['sys 'res]) rec.get(['sys 'res]))
+      (./some 'hyp_response_owned)
+    ? (eq_iota kind 'requests)
+      ?> (./some req)
+          (rec.get(['sys 'req]).then(hyp/request/read))
+        (./some 'hyp_request_required)
+      ? (eq old.tap.len 0) .none
+      ? !(equal old.get(['sys 'req]) rec.get(['sys 'req]))
+        (./some 'hyp_request_immutable)
+      .none
+    ?> (./some ref) before.reference(rec)
+      (./some 'hyp_instance_required)
+    ?> (./some _) before.child(ref)
+      (./some 'hyp_instance_unknown)
+    ? (eq_iota kind 'mounts) .none
+    ? !(equal old.get(before.slot('revision))
+          rec.get(before.slot('revision)))
+      (./some 'hyp_revision_owned)
+    ?> (./some _)
+        (rec.get(before.slot('query)).then(hyp/query/read))
+      (./some 'hyp_query_required)
+    .none
+
+  + validate
+    \ before=hyp_runtime after=hyp_runtime
+    ^ maybe[iota]
+    =   tree
+     | sovereign_peek after.root after.host
+    % rows=row[[path myth]] tree.tap
+    ^ maybe[iota]
+    ? (eq rows.len 0) .none
+    =   [rel rec]
+     rows.at(0)
+    ? (eq rel.len 0) (_ rows.drop(1))
+    =   kind
+     | rel.at 0
+    =   kinds=row[iota]
+     ['instances 'mounts 'requests 'watches]
+    ? !(kinds.has(kind))
+      (./some 'hyp_unknown_collection)
+    ? (eq rel.len 1) (_ rows.drop(1))
+    ? !(eq rel.len 2) (./some 'hyp_invalid_depth)
+    =   key
+     | rel.at 1
+    ? (eq_iota kind 'requests)
+      ? !(eq (aura_tag key) "u")
+        (./some 'hyp_request_id)
+      ? (hyp_runtime/validate_entry kind
+          after.root.weld(rel) rec before)
+       > (./some why) (./some why)
+       > .none (_ rows.drop(1))
+    ? !(is_text key) (./some 'hyp_alias_required)
+    ? (hyp_runtime/validate_entry kind
+        after.root.weld(rel) rec before)
+     > (./some why) (./some why)
+     > .none (_ rows.drop(1))
+
+  + report
+    \ name=path epoc=nat ref=hyp/instance_ref phase=hyp/phase
+      run=hyp_runtime
+    ^ hyp_runtime
+    | hyp_runtime/patch name
+      (myth/sing (run.slot('observed))
+        (hyp/observation epoc ref phase)) run
+
+  + reconcile_node
+    \ name=path rec=myth before=hyp_runtime
+      run=hyp_runtime
+    ^ hyp_runtime
+    ?> (./some cfg) run.config(rec) run
+    ?> (./some want) run.wanted(rec) run
+    =   old
+     | hyp_runtime/record name before.host
+    =   changed
+     | !(equal before.wanted(old) run.wanted(rec))
+    =   epoc
+     | add (old.nat_at(before.slot('epoch) 0)) changed
+    =   epoc
+     ? epoc epoc 1
+    =   run
+     | hyp_runtime/patch name
+       (myth/sing (run.slot('epoch)) (pails/n epoc)) run
+    =   running
+     | ?=(.running want)
+    =   owned=maybe[nat]
+     (? (eq old.tap.len 0) .none run.owned(name))
+    ? owned
+     > (./some idx)
+      =   guest
+       | run.guests.at idx
+      =   next
+       | hyp_runtime/replace_guest idx
+         guest.set_running(running) run
+      =   phase=hyp/phase
+       ? running .running .stopped
+      | hyp_runtime/report name epoc guest.ref phase next
+     > .none
+      ?> (./ok state)
+          (namespace/create cfg.self cfg.initial cfg.system)
+        run
+      =   ref
+       | hyp/instance_ref run.next 1
+      =   guest
+       | hyp_runtime/guest ref name cfg state
+         (sovereign_hive state) running
+      =   next
+       | run.set_guests(run.guests.snoc(guest))
+      =   next
+       | next.set_next(run.next.inc)
+      =   phase=hyp/phase
+       ? running .running .stopped
+      | hyp_runtime/report name epoc ref phase next
+
+  + deliver
+    \ req=hyp/request run=hyp_runtime
+    ^ [hyp_runtime hyp/response]
+    ?> (./some idx) run.child(req.instance)
+      [run (hyp/response/rejected 'hyp_instance_unknown)]
+    =   guest
+     | run.guests.at idx
+    ? !(guest.running)
+      [run (hyp/response/rejected 'hyp_instance_stopped)]
+    =   [next index reply]
+     | helm/supervisor/handle req.command guest.state guest.index
+    =   result
+     | hyp_runtime/response req.command next reply
+    =   guest
+     | guest.set_state(next).set_index(index)
+    [(hyp_runtime/replace_guest idx guest run) result]
+
+  + requests
+    \ run=hyp_runtime
+    ^ hyp_runtime
+    | run.collection('requests).fold run
+      \ run [rel rec]
+      ? !(eq rel.len 1) run
+      ? rec.has(['sys 'res]) run
+      ?> (./some req)
+          (rec.get(['sys 'req]).then(hyp/request/read))
+        run
+      =   stopped
+       | hyp_runtime/stopped req.instance run
+      ? stopped run
+      =   [next reply]
+       | hyp_runtime/deliver req run
+      | hyp_runtime/patch (run.root.snoc('requests).weld(rel))
+        (myth/sing ['sys 'res] (hyp/response/write reply)) next
+
+  + watches
+    \ run=hyp_runtime
+    ^ hyp_runtime
+    | run.collection('watches).fold run
+      \ run [rel rec]
+      ? !(eq rel.len 1) run
+      ?> (./some ref) run.reference(rec) run
+      ?> (./some query)
+          (rec.get(run.slot('query)).then(hyp/query/read))
+        run
+      ?> (./some idx) run.child(ref) run
+      =   guest
+       | run.guests.at idx
+      =   page
+       | namespace/page query.care query.version query.target
+         guest.state
+      =   answer
+       | hyp/response/page query page
+      =   data
+       | (myth/sing ['sys 'res] answer).put
+         (run.slot('revision)) (pails/n guest.state.local.top)
+      | hyp_runtime/patch (run.root.snoc('watches).weld(rel))
+        data run
+
+  + settle
+    \ before=hyp_runtime run=hyp_runtime
+    ^ hyp_runtime
+    =   next
+     | run.collection('instances).fold run
+       \ run [rel rec]
+       ? !(eq rel.len 1) run
+       | hyp_runtime/reconcile_node
+         (run.root.snoc('instances).weld(rel)) rec before run
+    =   next
+     | next.collection('mounts).fold next
+       \ run [rel rec]
+       ? !(eq rel.len 1) run
+       =   name
+        | run.root.snoc('mounts).weld rel
+       =   old
+        | hyp_runtime/record name before.host
+       =   diff
+        | !(equal before.reference(old) run.reference(rec))
+       =   gen
+        | add (old.nat_at(run.slot('generation) 0)) diff
+       | hyp_runtime/patch name
+         (myth/sing (run.slot('generation)) (pails/n gen)) run
+    =   next
+     | next.collection('watches).fold next
+       \ run [rel rec]
+       ? !(eq rel.len 1) run
+       =   name
+        | run.root.snoc('watches).weld rel
+       =   old
+        | hyp_runtime/record name before.host
+       =   changed
+        | (\ a=bool b=bool (a || b))
+          !(equal before.reference(old) run.reference(rec))
+          !(equal old.get(run.slot('query))
+            rec.get(run.slot('query)))
+       =   epoc
+        | add (old.nat_at(run.slot('epoch) 0)) changed
+       | hyp_runtime/patch name
+         (myth/sing (run.slot('epoch)) (pails/n epoc)) run
+    | hyp_runtime/watches | hyp_runtime/requests next
+
+  + resolve
+    \ pax=path run=hyp_runtime
+    ^ maybe[[index=nat target=path]]
+    ? (lt pax.len 2) .none
+    ? !(eq_iota pax.at(0) 'hyp) .none
+    =   rec
+     | hyp_runtime/record
+       (run.root.snoc('mounts).snoc(pax.at(1))) run.host
+    < ref run.reference(rec)
+    < idx run.child(ref)
+    | ./some [idx pax.drop(2)]
+
+  + page
+    \ car=care cas=maybe[nat] pax=path run=hyp_runtime
+    ^ res[axal[saga]]
+    ?> (./some route) run.resolve(pax)
+      (namespace/page car cas pax run.host)
+    =   [idx target]
+     route
+    =   guest
+     | run.guests.at idx
+    | namespace/page car cas target guest.state
+
+  + handle
+    \ card=helm/card run=hyp_runtime index=hive
+    ^ [hyp_runtime hive feet/task[unit]]
+    ? card
+     > (./peek car cas path)
+      [run index (feet/task/page path run.page(car cas path))]
+    ' Writes use request records, never implicitly cross a mount.
+    =   [host next_index reply]
+     | helm/supervisor/handle card run.host index
+    =   candidate
+     | run.set_host host
+    ? (hyp_runtime/validate run candidate)
+     > (./some why)
+      [run index (helm/supervisor/denied why)]
+     > .none
+      =   next
+       | hyp_runtime/settle run candidate
+      [next (sovereign_hive next.host) reply]
+
+  + access
+    ^ helm/supervisor/access[hyp_runtime]
+    | helm/supervisor/access[hyp_runtime]
+      hyp_runtime/page hyp_runtime/handle
+      (\ run (sovereign_hive run.host))
+      (\ run run.host.local.top)
+      (\ target run (namespace/permitted target run.host))
+
++ hyp_runtime
+  + stopped
+    \ ref=hyp/instance_ref run=hyp_runtime
+    ^ bool
+    ?> (./some idx) run.child(ref) .false
+    !(run.guests.at(idx).running)
+
+  + response
+    \ cmd=helm/card next=namespace reply=feet/task[unit]
+    ^ hyp/response
+    ? reply
+     > (./page target value)
+      =   query
+       | hyp_runtime/query cmd target
+      | hyp/response/page query value
+     > (./ack err)
+      ? err
+       > .none (hyp/response/accepted next.local.top)
+       > (./some why)
+        ?> deny=helm/supervisor/rejection why
+          (hyp/response/rejected 'hyp_guest_rejected)
+        | hyp/response/rejected deny.reason
+    | hyp/response/rejected 'hyp_unexpected_reply
+
+  + query
+    \ cmd=helm/card target=path
+    ^ hyp/query
+    ? cmd
+     > (./peek car cas pax) (hyp/query pax car cas)
+    | hyp/query target .y .none

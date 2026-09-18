@@ -1,0 +1,836 @@
+- browser_page
+-  sept [order=10]
+-  shrine_types [order=20]
+-  shrine [order=30]
+-  lain_types [order=38]
+-  lain_peek [order=39]
+-  lain_poke [order=40]
+-  weft [order=50]
+-  pact [order=60]
+-  web [order=70]
+-  lainapp [order=80]
+-  semidoc [order=90]
+-  tmpl [order=95]
+'  nenex: a personal wiki corpus on the namespace (v1 of the Nenex
+'  proposal) — kept deliberately small so it can double as a worked,
+'  literate example of a shrine app.  Read it top to bottom: each
+'  part opens with a narrative block like this one, and every
+'  declaration carries its own commentary.
+'
+'  The world this app lives in, briefly.  Shrine is a versioned
+'  namespace: every name holds a record (a myth) mapping path-shaped
+'  keys to typed values (pails), and every committed change opens a
+'  new epoch while the /h overlay keeps every prior revision
+'  addressable — history belongs to the namespace, not to the app.
+'  Behavior attaches to names as kooks.  A kook's init runs when its
+'  node is made, its talk when the node is poked (an HTTP form post
+'  arrives as a poke), its hear when something it watches changes.
+'  Each returns a yell: a row of [path writ] writes to commit in the
+'  same transaction, plus the node's own new record — where a writ
+'  is make (create), poke (update), or cull (drop from the current
+'  state).  The kook receives its event as a bowl: b.here is the
+'  node's path, b.crew holds hydrated views of whatever it declared
+'  it watches.
+'
+'  Nenex builds a wiki from exactly three kooks:
+'    doc   one page — expands its semidoc source into child records,
+'          re-expands the delta on every edit            (part I)
+'    hub   the corpus container — watches its own subtree, answers
+'          the create and search forms, maintains backlinks  (III)
+'    face  the HTML view over everything                     (IV)
+'  with a shared hydration pass between them (II) and the seeds and
+'  manifest at the end (V).  Because pages, edits, queries, and
+'  backlinks are all ordinary namespace state, the app gets
+'  versioning, addressability, and interop for free — that is the
+'  design payoff this file demonstrates.
+'
+'  Conventions: links between pages are written absolutely
+'  (;/nenex/w/<name>) — that is what the backlink scan matches.
+'  Page names should stick to word characters (odd names will not
+'  URL-parse).  Future work, per the proposal: templates,
+'  transclusion, typed relationship views, aliases beyond semidoc's
+'  lexical ones, workspaces, imports, spellcheck, maintenance
+'  commands.
+'
+'  ==================================================================
+'  I.  Documents: a page is its source, expanded
+'  ==================================================================
+'  A page lives at /nenex/w/<name>.  Its record carries the raw
+'  semidoc source under ['src]; expanding that source mounts one
+'  child record per document node (sections, items, quotes, code),
+'  so the document IS a subtree of the namespace.  The delicate part
+'  is editing: the new source must be diffed against what the OLD
+'  source mounted — nodes still present are poked, new ones made,
+'  vanished ones culled — all in one transaction, so a half-expanded
+'  document is never observable and every committed revision stays
+'  scrubbable under /h.
+'
+'  The diff also has a mirror now: the doc kook WATCHES its own
+'  subtree, and when the records change by any hand other than
+'  expand — a direct poke from the explorer, another app annotating
+'  a node — its hear regenerates ['src] from the records through
+'  semidoc's unparse.  Source and records never diverge; whichever
+'  side moves, the other follows.
++  old_mounts
+  '  What a source expanded to, records and all — the diff's and the
+  '  sweep's ground truth.  (bowl.kids is the care-y FRONTIER, one
+  '  record deep, so the previous source is what the diff must
+  '  trust.)  Text is a nat in foil (packed bytes), so 0 doubles as
+  '  the empty source.
+  \  s=nat
+  ^  row[smount]
+  ?  (eq 0 s)
+     []
+  =  [t kids]  (own_myth (parse s))
+  (myths_kids [] kids)
++  src_paths
+  '  The node set a source expands to.
+  \  s=nat
+  ^  row[path]
+  (old_mounts s).map((\ m m.p))
++  has_path
+  '  Membership in a path row.  (eq_pith p) is a partial
+  '  application — row.any wants a one-argument test.
+  \  p=path ps=row[path]
+  ^  bool
+  ps.any((eq_pith p))
++  sfound
+  '  One search hit: the page, its score, and the explanation.
+  :  p=path score=nat why=nat
++  found_insert
+  '  Insert into a score-descending row (ties keep corpus order).
+  '  run_search folds this over the hits — an insertion sort, honest
+  '  and fine at wiki scale.
+  \  f=sfound fs=row[sfound]
+  ^  row[sfound]
+  =  hi  fs.keep((\ e (ge e.score f.score)))
+     lo  fs.keep((\ e (lt e.score f.score)))
+  hi.snoc(f).weld(lo)
++  container_kids
+  '  The kid row when a node is a container (doc, sect, item,
+  '  quote) — the kinds whose record can stand as a document root.
+  '  ./doc and friends are relative variants of the semidoc node
+  '  sum: the match binds each kid row positionally and ignores the
+  '  other fields with _.
+  \  nd=snode
+  ^  maybe[row[snode]]
+  ?  nd
+   > (./doc _ _ kids)    (./some kids)
+   > (./sect _ _ kids)   (./some kids)
+   > (./item _ _ kids)   (./some kids)
+   > (./quote _ _ kids)  (./some kids)
+  .none
++  own_myth
+  '  The doc node's own record for a parsed source: a single
+  '  container node becomes the record itself; anything else gets a
+  '  bare doc record with the whole tree as kids.
+  \  tree=row[snode]
+  ^  [t=myth kids=row[snode]]
+  =  bare  [(myth/new).put(['kind] (pails/t "doc")) tree]
+  ?  (eq 1 tree.len)
+     =  nd  tree.at(0)
+     ?>  (./some kids) (container_kids nd)
+         bare
+     [(node_myth nd) kids]
+  bare
++  keep_slot
+  '  One slot carried over from the old record, when it is there.
+  \ cur=myth s=path t=myth
+  ^ myth
+  | myth/copy_slot s cur t
++  app_slot
+  '  The slots the APP rides on a page's own record — never document
+  '  content: the source, the expand error, the hub's backlink rows.
+  '  (/sys machinery — kook and crew — is already reserved
+  '  semidoc-side.)
+  \  s=path
+  ^  bool
+  ?  (eq_pith s ['src])
+     .true
+  ?  (eq_pith s ['err])
+     .true
+  (pith_prefix links_in s)
++  page_fil
+  '  A page's own record as document content: app slots stripped.
+  \  mt=maybe[myth]
+  ^  maybe[myth]
+  ?>  (./some t) mt
+      .none
+  (./some t.tap.fold((myth/new) (\ acc e (if (app_slot e.key) acc acc.put(e.key e.val)))))
++  page_nodes
+  '  The document a page's records carry, read back: own record and
+  '  numbered kids as nodes, app slots stripped first — the record
+  '  side of the sync law, and what the face renders.
+  \  fat=axal[myth]
+  ^  row[snode]
+  (nodes_of fat.set_fil((page_fil fat.fil)))
++  src_image
+  '  What a source's expansion reads back as: parse, mount, read the
+  '  mounts back through node_back.  Multi-valued attributes flatten,
+  '  valueless ones vanish, attribute order sorts, a single container
+  '  collapses into the page record — comparing hear's view against
+  '  THIS, never the raw parse, is why an author's text survives
+  '  every normalization the record projection performs.
+  \  src=nat
+  ^  row[snode]
+  ?  (eq 0 src)
+     []
+  =  [t kids]  (own_myth (parse src))
+  (nodes_of (remount kids).set_fil((./some t)))
++  writ_at
+  '  The upsert writ for one mount: poke what the old source wrote
+  '  (update in place, identity and history intact), make what it
+  '  did not.  Poke MELDS — so any slot the old record carried that
+  '  the new one does not is swept to the empty text pail, the same
+  '  move as the hub's empty-row link sweeps: without it a withdrawn
+  '  ;@ attribute would linger on the record forever, and the sync
+  '  hear would write it back into the author's source.
+  \  here=path oldms=row[smount] m=smount
+  ^  [p=path q=writ]
+  =  hit  oldms.keep((\ o (eq_pith o.p m.p)))
+  ?  (eq 0 hit.len)
+     [here.weld(m.p) (writ/make m.t)]
+  =  swept
+       hit.at(0).t.tap.fold(m.t ;
+         \  acc e
+         ?  (reserved_slot e.key)
+            acc
+         ?>  (./some v) m.t.get(e.key)
+             acc.put(e.key (pails/t ""))
+         acc)
+  [here.weld(m.p) (writ/poke swept)]
++  cull_at
+  '  The cull writ for one stale path — removal from the CURRENT
+  '  state only; /h still serves every revision that had it.
+  \  here=path p=path
+  ^  [p=path q=writ]
+  [here.weld(p) (writ/cull)]
++  expand
+  '  The document transaction: parse the source and re-expand this
+  '  node's subtree against what the OLD source wrote — present
+  '  nodes poke, new ones make, stale ones cull deepest-first — and
+  '  the node's own record becomes the new document root, source and
+  '  kook riding along.  One event, one epoch; /h keeps every prior
+  '  revision addressable.
+  \  b=bowl cur=myth src=nat oldsrc=nat
+  ^  yell
+  =  tree  (parse src)
+  ?  (eq 0 tree.len)
+     (yell [] cur.put(['err] (pails/t "empty document")))
+  =  [ownt kids]  (own_myth tree)
+  =  ms  (myths_kids [] kids)
+  =  fresh  ms.map((\ m m.p))
+  =  oldms  (old_mounts oldsrc)
+  =  old  oldms.map((\ m m.p))
+  =  upserts  ms.map((writ_at b.here oldms))
+  =  stale  old.rev.keep((\ p !(has_path p fresh))).map((cull_at b.here))
+  =  own  ownt.put(['src] (pails/t (str/from_atom src)))
+  =  own2  (keep_slot cur crew_slot (keep_slot cur limb_slot own))
+  (yell stale.weld(upserts) own2)
++  doc_init
+  '  A fresh page: a z-care crew on its own subtree (the sync hear's
+  '  standing watch), then the making card's source expands —
+  '  creation is one make, and the page is born fully expanded.
+  '  Pages made before the crew existed will not sync until re-made.
+  \  b=bowl t=myth
+  ^  yell
+  =  t2  t.put(crew_slot (cpail (crew/sing ['self] (dep .z b.here))))
+  =  src  (myth/txt_at ['src] t)
+  ?  (eq 0 src)
+     (yell [] t2)
+  (expand b t2 src 0)
++  doc_talk
+  '  An edit: posted source (the editor's /post field, or a direct
+  '  ['src] poke) re-expands the delta.  Anything else defers to
+  '  def_talk, the stock poke behavior.
+  \  b=bowl cur=myth nu=myth
+  ^  yell
+  =  posted  (myth/txt_at ['post 'src] nu)
+  =  src
+       ?  posted
+          posted
+       (myth/txt_at ['src] nu)
+  ?  (eq 0 src)
+     (def_talk b cur nu)
+  (expand b cur src (myth/txt_at ['src] cur))
++  doc_hear
+  '  Full sync, record side: any committed change under the page
+  '  recompares the document its records carry (page_nodes — app
+  '  slots stripped) with what the committed source expands to
+  '  (src_image).  A divergence — a direct record poke from the
+  '  explorer or another app — regenerates ['src] as canonical
+  '  unparse text, so source and records never diverge.  Quiescence:
+  '  the written value is a pure function of the records alone and
+  '  ['src] is stripped from the comparison, so the round after a
+  '  regeneration either compares equal or recomputes the identical
+  '  cord — and a deep-equal write raises no event.  An ordinary
+  '  source edit compares equal on the first round (expand sweeps
+  '  what it stops writing), so the author's layout is never
+  '  canonicalized under them.  The write rides hear's own yell
+  '  state, never a self-addressed poke card — so talk and expand
+  '  cannot re-run on a regeneration.
+  \  b=bowl cur=myth r=row[dep]
+  ^  yell
+  =  view  b.crew.gut(['self] (axal/new[myth] .none))
+  =  ns  (page_nodes view)
+  =  src  (myth/txt_at ['src] cur)
+  ?  (equal ns (src_image src))
+     (yell [] cur)
+  =  nu  (unparse ns)
+  ?  (equal nu src)
+     (yell [] cur)
+  (yell [] cur.put(['src] (pails/t (str/from_atom nu))))
++  doc_form
+  '  The page behavior, assembled: init expands, talk re-expands,
+  '  hear syncs the source back from direct record edits.  A form is
+  '  a record of handlers over def_form's defaults.
+  ^  form
+  def_form.set_init(doc_init).set_talk(doc_talk).set_hear(doc_hear)
+'  ==================================================================
+'  II.  Edges and the hydrated corpus
+'  ==================================================================
+'  Relations between pages are not a side index the app maintains —
+'  they are read off the records a page's source mounts: any
+'  path-valued slot is an outgoing edge (the shrine design's
+'  relations-become-names move).  The hub and the face both want the
+'  same per-page bundle — name, title, source, own record, edges —
+'  so one hydration pass (scan) turns the watched subtree into a row
+'  of spage values and everything downstream consumes those.
++  sedge
+  '  One outgoing edge: the predicate slot it rode (empty for a bare
+  '  reference) and the path it targets.
+  :  pred=path tgt=path
++  slot_edge
+  '  The edge one slot declares, if any: path-valued slots outside
+  '  ['id]; ['ref] rides untyped, anything else typed by its key.
+  '  Slot values are pails — an OPEN union of record types — so the
+  '  match picks out the path pail and needs a fallthrough for
+  '  everything else.
+  \  e=mop/kv[path pail]
+  ^  maybe[sedge]
+  ?  (eq 0 e.key.len)
+     .none
+  ?  (eq_pith e.key ['id])
+     .none
+  ?  e.val
+   > pp=pails/p
+     ?  (eq_pith e.key ['ref])
+        (./some (sedge [] pp.p))
+     (./some (sedge e.key pp.p))
+  .none
++  myth_edges
+  '  The edges on one record.  .tap lists the record's slots; .sift
+  '  maps a maybe-returning function and keeps the hits — the shape
+  '  of most collection passes in this file.
+  \  t=myth
+  ^  row[sedge]
+  t.tap.sift(slot_edge)
++  src_edges
+  '  Every edge a page's SOURCE declares: parse and walk what it
+  '  would mount.  The source is the diff's ground truth here for
+  '  the same reason it is in /expand — pokes meld, so a withdrawn
+  '  attribute lingers as a namespace slot, but a relation the
+  '  source no longer declares must not survive as an edge.
+  \  src=nat
+  ^  row[sedge]
+  ?  (eq 0 src)
+     []
+  =  [t kids]  (own_myth (parse src))
+  (myth_edges t).weld((myths_kids [] kids).bind((\ m (myth_edges m.t))))
++  spage
+  '  One page hydrated for a corpus pass: its name, key, title,
+  '  source, its own record when present, and the edges its source
+  '  declares.
+  :  name=nat key=iota title=nat src=nat fil=maybe[myth] edges=row[sedge]
++  page_scan
+  '  One kid hydrated for a corpus pass, when it is a page.  The
+  '  watched subtree arrives as an axal[myth] — a tree of records —
+  '  whose kids are keyed by iota (path segment): pages have text
+  '  keys, matched here as ($ts name), while semidoc mounts content
+  '  under numbered keys, so ($u 0) is the document's first node,
+  '  where the title lives.  .fil is the record at the node itself,
+  '  absent for a bare container.
+  \  e=bee/kv[axal[myth]]
+  ^  maybe[spage]
+  ?>  ($ts name=nat) e.key
+      .none
+  =  src
+       ?>  (./some t) e.val.fil
+           0
+       (myth/txt_at ['src] t)
+  =  title
+       ?>  (./some head) e.val.get([($u 0)])
+           0
+       (myth/txt_at ['title] head)
+  (./some (spage name e.key title src e.val.fil (src_edges src)))
++  scan
+  '  Every page hydrated for a corpus pass.
+  \  fat=axal[myth]
+  ^  row[spage]
+  fat.kid_tap.sift(page_scan)
+'  ==================================================================
+'  III.  The hub: the corpus container
+'  ==================================================================
+'  The container at /nenex/w carries the hub kook.  Its init
+'  declares a crew — the kook's standing watch — on its own subtree;
+'  from then on any committed change beneath it re-runs hear with a
+'  fresh hydrated view.  Watching yourself while writing yourself is
+'  the part worth staring at: hear's pokes are deterministic
+'  recomputes that resolve by deep value equality, so the round
+'  after an edit writes the new backlinks and the round after that
+'  changes nothing — a fixpoint, not a loop.  The hub's talk is the
+'  index page's form handler, and a search commits its query and
+'  results as ordinary slots: run one and it is namespace state,
+'  with history, like everything else here.
++  links_in
+  '  The protocol slot for a page's plain incoming links; typed
+  '  predicates nest beneath it.
+  ^  path
+  ['links 'in]
++  hub_init
+  '  The corpus container: a z-care crew on its own subtree (built
+  '  from the bowl, so any mount root works) and empty search slots.
+  '  .z is deep care — the whole subtree, not just this node.
+  \  b=bowl t=myth
+  ^  yell
+  =  t2  t.put(crew_slot (cpail (crew/sing ['corpus] (dep .z b.here))))
+  (yell [] t2.put(['q] (pails/t "")).put(['results] (pails/ps [])))
++  score_hit
+  '  Score one page against a query: body counts, title counts
+  '  three-fold, plus a backlink bonus — none scoring means no hit.
+  \  here=path q=nat pg=spage
+  ^  maybe[sfound]
+  ?>  (./some t) pg.fil
+      .none
+  =  body  (cord/count q pg.src)
+  =  title  (cord/count q pg.title)
+  ?  (eq 0 (add body title))
+     .none
+  =  links
+       ?>  (./some pl) t.get(links_in)
+           0
+       ?  pl
+        > bp=pails/ps  bp.ps.len
+       0
+  =  why
+       (weft/cat
+         [(weft/show_nat body) " in body, "
+          (weft/show_nat title) " in title, "
+          (weft/show_nat links) " backlinks"])
+  (./some (sfound here.snoc(pg.key) (add body (add (mul 3 title) links)) why))
++  make_page
+  '  ['post 'new]: make a page whose making card carries a starter
+  '  source and the doc kook (absolute — a runtime card is not
+  '  rebased).
+  \  b=bowl cur=myth name=nat
+  ^  yell
+  =  at  b.here.snoc(($ts name))
+  =  starter
+       (joined 10
+         [(cord/cat ";. " (show/path at))
+          ""
+          (cord/cat "  ;= " name)
+          ""
+          "    A fresh page."])
+  =  root=path  b.here.take(b.here.len.dec)
+  =  kp  root.weld(['kook 'doc])
+  (yell [[at (writ/make (kooked [kp]).put(['src] (pails/t (str/from_atom starter))))]] cur)
++  run_search
+  '  ['post 'q]: scan every page's source against the query and
+  '  commit the query and its matches as slots — a search is a
+  '  namespace object, and /h scrubs the query history.
+  \  b=bowl cur=myth q=nat
+  ^  yell
+  =  hits  (scan b.crew.gut(['corpus] (axal/new[myth] .none))).sift((score_hit b.here q))
+  =  found=row[sfound]  hits.fold([] (\ out f (found_insert f out)))
+  =  paths  (pails/ps found.map((\ f f.p)))
+  =  whys  (pails/t (str/from_atom (joined 10 found.map((\ f f.why)))))
+  (yell [] cur.put(['q] (pails/t (str/from_atom q))).put(['results] paths).put(['why] whys))
++  hub_talk
+  '  The index page's verbs: ['post 'new] makes a page, ['post 'q]
+  '  commits a search, anything else is the default talk.
+  \  b=bowl cur=myth nu=myth
+  ^  yell
+  =  name  (myth/txt_at ['post 'new] nu)
+  ?  name
+     (make_page b cur name)
+  =  q  (myth/txt_at ['post 'q] nu)
+  ?  (eq 0 q)
+     (def_talk b cur nu)
+  (run_search b cur q)
++  cited_by
+  '  The edges from page o into the subtree at tp, as incoming
+  '  sedges — o itself (skip) casts no vote.
+  \  here=path tp=path skip=iota o=spage
+  ^  row[sedge]
+  ?  (eq_iota o.key skip)
+     []
+  o.edges.keep((\ ed (pith_prefix tp ed.tgt))).map((\ ed (sedge ed.pred here.snoc(o.key))))
++  page_card
+  '  One page's relations card — the page and the poke that
+  '  refreshes it: ['links 'in] holds every citing page,
+  '  ['links 'in <pred..>] the pages whose typed edges target it,
+  '  and predicates the corpus no longer declares sweep to [].
+  \  here=path pages=row[spage] tgt=spage
+  ^  [p=path q=writ]
+  =  tp  here.snoc(tgt.key)
+  =  incoming  pages.bind((cited_by here tp tgt.key))
+  =  preds  (row/uniq[path] incoming.map((\ e e.pred)).keep((\ p p.len)))
+  =  base  (myth/sing links_in (pails/ps (row/uniq[path] incoming.map((\ e e.tgt)))))
+  =  typed
+       preds.fold(base ;
+         \  acc pr
+         =  srcs  (row/uniq[path] incoming.keep((\ e (eq_pith e.pred pr))).map((\ e e.tgt)))
+         acc.put(links_in.weld(pr) (pails/ps srcs)))
+  =  swept
+       ?>  (./some tm) tgt.fil
+           typed
+       tm.tap.fold(typed ;
+         \  acc e
+         ?  !(pith_prefix links_in e.key)
+            acc
+         ?  (le e.key.len 2)
+            acc
+         ?  (has_path e.key.drop(2) preds)
+            acc
+         acc.put(e.key (pails/ps [])))
+  [tp (writ/poke swept)]
++  hub_hear
+  '  The relations pass: any committed change under the corpus
+  '  recomputes every page's incoming edges — ['links 'in] holds
+  '  every citing page, and ['links 'in <pred..>] holds the pages
+  '  whose typed edges (path-valued attribute slots) target it.
+  '  Predicates that vanish re-poke as empty rows (pokes meld); the
+  '  face skips empties.  Recomputation is deterministic and pokes
+  '  resolve by deep value equality, so the self-watch reaches its
+  '  fixpoint one round after any edit.
+  \  b=bowl cur=myth r=row[dep]
+  ^  yell
+  =  pages  (scan b.crew.gut(['corpus] (axal/new[myth] .none)))
+  (yell pages.map((page_card b.here pages)) cur)
++  hub_form
+  '  The corpus behavior: init watches, talk answers the forms, hear
+  '  maintains the backlinks.
+  ^  form
+  def_form.set_init(hub_init).set_talk(hub_talk).set_hear(hub_hear)
+'  ==================================================================
+'  IV.  The face: HTML over the hydrated view
+'  ==================================================================
+'  The face kook renders.  lain routes an HTTP request to a face as
+'  a talk whose incoming record carries the request target under
+'  ['vpath]; the face answers by committing ['res_status],
+'  ['res_body], and ['res_ctype] slots — the response is namespace
+'  state like everything else.  Markup is weft: el, leaf, att, and
+'  tx build a node tree, browser_page/page wraps it in a document.  Forms
+'  post to /post/<path>, which lands as a ['post <field>] poke on
+'  the node at <path> — that is the entire wiring between the HTML
+'  below and the kooks above.
++  root_of
+  '  A request under /<publisher>/app/<instance>, or a direct publisher child.
+  \ tgt=path
+  ^ path
+  ? (lt tgt.len 3) tgt
+  ? (eq_iota tgt.at(1) 'app) tgt.take(3)
+  tgt.take(2)
++  edit_form
+  '  The wiki's pen: the committed source in a textarea, posting to
+  '  the page's doc talk through /post.
+  \  docp=path tgt=path src=nat
+  ^  weft/node
+  (weft/el "form"
+    [(weft/att "method" "post")
+     (weft/att "action" (weft/cat2 "/post" (show/path docp)))
+     (weft/cls "edit")]
+    [(weft/el "input"
+       [(weft/att "type" "hidden") (weft/att "name" "back")
+        (weft/att "value" (show/path tgt))] [])
+     (weft/el "textarea"
+       [(weft/att "name" "src") (weft/att "rows" "16")] [(weft/tx src)])
+     (weft/leaf "button" [] "commit")])
++  hub_field_form
+  '  A one-field form posting to the corpus container.
+  \  wpath=path back=path field=nat label=nat
+  ^  weft/node
+  (weft/el "form"
+    [(weft/att "method" "post")
+     (weft/att "action" (weft/cat2 "/post" (show/path wpath)))
+     (weft/cls "hubform")]
+    [(weft/el "input"
+       [(weft/att "type" "hidden") (weft/att "name" "back")
+        (weft/att "value" (show/path back))] [])
+     (weft/el "input"
+       [(weft/att "type" "text") (weft/att "name" field)
+        (weft/att "autocomplete" "off")] [])
+     (weft/leaf "button" [] label)])
++  path_links
+  '  A row of paths as links to their pages.
+  \  ps=row[path]
+  ^  row[weft/node]
+  ps.bind((\ p [(weft/tx " ") (weft/leaf "a" [(weft/href (show/path p))] (show/path p))]))
++  mention_row
+  '  The report line when o says t's name as a word without an edge.
+  \  wpath=path t=spage o=spage
+  ^  maybe[weft/node]
+  ?  (eq_iota o.key t.key)
+     .none
+  ?  !(word_mention t.name o.src)
+     .none
+  =  tp=path  wpath.snoc(t.key)
+  ?  o.edges.any((\ ed (pith_prefix tp ed.tgt)))
+     .none
+  =  op=path  wpath.snoc(o.key)
+  (./some
+    (weft/el "div" [(weft/cls "item")]
+      [(weft/leaf "a" [(weft/href (show/path op))] (show/path op))
+       (weft/tx "  mentions  ")
+       (weft/leaf "a" [(weft/href (show/path tp))] t.name)
+       (weft/tx "  without linking it")]))
++  mention_rows
+  '  Unlinked mentions: page O's source says page T's name as a word
+  '  but declares no edge to T — a connection that should probably
+  '  exist.  Computed at render from the hydrated view: a bounded
+  '  report, not kernel state.  Every page name is its own alias.
+  \  wpath=path pages=row[spage]
+  ^  row[weft/node]
+  pages.bind((\ t pages.sift((mention_row wpath t))))
++  nenex_css
+  '  semidoc's stylesheet plus the wiki chrome: the editor, the two
+  '  hub forms, the query panel, and the backlink rows.
+  ^  nat
+  (weft/cat2 sd_css " .edit{display:flex;flex-direction:column;gap:.5em;margin-top:2em;border-top:1px solid #dde;padding-top:1em} textarea{font-family:monospace;font-size:.9em;padding:.5em} .edit button{align-self:flex-start} .hubform{display:flex;gap:.5em;margin:.6em 0} .query{margin:1em 0;padding:.5em;background:#f4f5f7;border-radius:6px} .backlinks{font-size:.85em;color:#667;margin:.6em 0}")
++  index_item
+  '  One page's line on the index: its link and its title.
+  \  wpath=path pg=spage
+  ^  weft/node
+  =  pp  wpath.snoc(pg.key)
+  (weft/el "div" [(weft/cls "item")]
+    [(weft/leaf "a" [(weft/href (show/path pp))] pg.name)
+     (weft/tx "  ")
+     (weft/el "span" [(weft/cls "muted")] [(weft/tx pg.title)])])
++  hit_row
+  '  One committed search hit: its link and its why line.
+  \  pw=[path nat]
+  ^  weft/node
+  =  [pth why]  pw
+  (weft/el "div" [(weft/cls "item")]
+    [(weft/leaf "a" [(weft/href (show/path pth))] (show/path pth))
+     (weft/tx "  ")
+     (weft/el "span" [(weft/cls "muted")] [(weft/tx why)])])
++  query_section
+  '  The last committed query and its result rows, as a section —
+  '  empty when no search has run.
+  \  fat=axal[myth]
+  ^  row[weft/node]
+  ?>  (./some t) fat.fil
+      []
+  =  q  (myth/txt_at ['q] t)
+  ?  (eq 0 q)
+     []
+  =  res=row[weft/node]
+       ?>  (./some pl) t.get(['results])
+           []
+       ?>  ps=pails/ps pl
+           []
+       =  whys  (split_byte 10 (myth/txt_at ['why] t))
+       (row/zip[path nat] ps.ps whys).map(hit_row)
+  =  head=row[weft/node]
+       [(weft/leaf "span" [(weft/cls "pred")] (weft/cat2 "last search: " q))]
+  [(weft/el "div" [(weft/cls "query")] head.weld(res))]
++  index_page
+  '  The corpus front page: every page listed with its title, the
+  '  create and search forms, and the last committed query with its
+  '  results.
+  \  wpath=path tgt=path fat=axal[myth]
+  ^  nat
+  =  pages  (scan fat)
+  =  rows  pages.map((index_item wpath))
+  =  qrow  (query_section fat)
+  =  head=row[weft/node]
+       [(weft/leaf "h1" [] "nenex")
+        (weft/el "div" [(weft/cls "muted")] [(weft/tx "a personal wiki corpus; every page, edit, query, and backlink is namespace state")])]
+  =  mentions  (mention_rows wpath pages)
+  =  msec=row[weft/node]
+       ?  (eq 0 mentions.len)
+          []
+       (mentions.cons((weft/leaf "h2" [] "unlinked mentions")))
+  =  body
+       head.weld(rows).weld(qrow).weld(msec).weld([(hub_field_form wpath tgt "new" "new page") (hub_field_form wpath tgt "q" "search")])
+  (browser_page/page "nenex" nenex_css body)
++  back_row
+  '  One incoming-edge row: the plain backlinks when the slot is
+  '  ['links 'in], a predicate-labeled row beneath it, empties skipped.
+  \  e=mop/kv[path pail]
+  ^  maybe[weft/node]
+  ?  !(pith_prefix links_in e.key)
+     .none
+  ?>  ps=pails/ps e.val
+      .none
+  ?  (eq 0 ps.ps.len)
+     .none
+  =  label
+       ?  (eq 2 e.key.len)
+          "linked from:"
+       (weft/cat2 (show/path e.key.drop(2)) ":")
+  (./some
+    (weft/el "div" [(weft/cls "backlinks")]
+      (path_links ps.ps).cons((weft/tx label))))
++  in_rows
+  '  The incoming-edge rows for a page: the plain backlinks and one
+  '  row per typed predicate, empties skipped.
+  \  t=myth
+  ^  row[weft/node]
+  t.tap.sift(back_row)
++  page_html
+  '  The document component's projection: the whole rendered page
+  '  body — the document its records carry — as a pure function of
+  '  the page subtree.  Because the page body is a component, the
+  '  omni-scrubber rewinds the wiki's PROSE like any fragment, and
+  '  two windows editing one page converge without reloads.
+  \  fat=axal[myth]
+  ^  myth
+  (frag/html "div" [(weft/cls "sdpage")] (render_fat fat.set_fil((page_fil fat.fil))))
++  page_view
+  '  The document component: a felt over the page subtree.
+  ^  pail
+  (felt page_html .none)
++  weft_seed
+  '  The document component seed — code-built: a template cannot
+  '  carry a component ctor pail.
+  ^  [p=path t=myth]
+  [['weft 'page]
+   (weft_card page_view (pact/rel ['w 'home])
+     (lore "The document component: a wiki page's whole rendered body, a felt over the page subtree."
+           ["The document component: a wiki page's whole rendered body, a felt over the page subtree."
+            "Input: the z view of a page node - numbered semidoc-record kids, the app's own slots ignored."
+            "Output: the rendered document, embeds mounted live."
+            "Point it at any subtree whose records carry semidoc kinds."]
+           []))]
++  face_talk
+  '  The corpus face: the container (or the app root) serves the
+  '  index; anything deeper serves its document page — the document
+  '  body mounted as a component, backlinks, the editor, and the
+  '  omni-scrubber beneath.  Same responder contract as the
+  '  explorer.  cur.meld(nu) folds the request's slots into the
+  '  record before reading them, and the same record, response slots
+  '  added, rides back out through the yell.
+  \  b=bowl cur=myth nu=myth
+  ^  yell
+  =  out  cur.meld(nu)
+  =  tgt=path
+       | (myth/path_at ['vpath] out).fall []
+  =  view   b.crew.gut(['view] (axal/new[myth] .none))
+     root   (root_of tgt)
+     wpath  root.weld(['w])
+  =  html
+       ?  (le tgt.len wpath.len)
+          =  fat
+               ?  (eq tgt.len root.len)
+                  view.dip(['w])
+               view
+          (index_page wpath tgt fat)
+       =  docp=path  tgt.take(wpath.len.inc)
+       =  bl
+            ?>  (./some t) view.fil
+                []
+            (in_rows t)
+       =  src
+            ?>  (./some t) view.fil
+                0
+            (myth/txt_at ['src] t)
+       =  top  (frag/ver_nat b publisher_vocabulary/version/top)
+       =  scrub=row[weft/node]
+            ?  top
+               [(frag/scrubber (frag/ver_nat b publisher_vocabulary/version/first) top)]
+            []
+       =  core  [(frag/mount "doc" root.weld(['weft 'page]) docp 2)]
+       =  body  core.weld(bl).weld([(edit_form docp tgt src)]).weld(scrub).snoc(frag/script)
+       (browser_page/page "nenex" nenex_css body)
+  (yell []
+    out.put(['res_status] (pd 200)).put(['res_body] (pd html)).put(['res_ctype] (pd "text/html; charset=utf-8")))
++  face_form
+  '  The face behavior: talk renders.
+  ^  form
+  def_form.set_talk(face_talk)
+'  ==================================================================
+'  V.  Seeds and the manifest
+'  ==================================================================
+'  What ships with the app: two starter pages and the manifest that
+'  binds names, kooks, and mounts together.  The seed sources double
+'  as a working tour of semidoc: ;. names the document, ;= titles
+'  it, ;- is a list item, ;@ declares a typed attribute slot, ;$
+'  opens a code block, and a bare ;/path line is a reference — the
+'  edge form that part III turns into a backlink.
++  corpus_tmpl
+  '  The whole starter corpus as ONE template: the hub at w riding
+  '  the hub kook, the two seeded pages as named nodes riding the
+  '  doc kook, their content mounted directly as records — no seeded
+  '  ['src].  A template page is born already expanded (doc_init
+  '  finds no source and only declares the sync crew), and the first
+  '  hear round regenerates ['src] from the records through unparse
+  '  — the record side of the sync law doing the seeding work.  The
+  '  ;@ attributes and the closing reference to /nenex/w/ideas
+  '  become edges exactly as they did when expand mounted them.
+  ^  nat
+  (joined 10
+    [";."
+     ""
+     "  ;@ /doc/kook ;/./kook/hub"
+     "  ;. w"
+     ""
+     "    ;@ /doc/kook ;/./kook/doc"
+     "    ;. w/home"
+     ""
+     "      ;= A programmable interior for thought"
+     ""
+     "        Every page here is a subtree of namespace records: edit"
+     "        the source below and one transaction rebuilds the delta;"
+     "        the /h overlay scrubs every revision of every page."
+     ""
+     (weft/cat2 "        ;- Pages link absolutely: see ;" (show/path (publisher_vocabulary/service ['nenex 'w 'ideas])))
+     ""
+     "        ;- Searches commit their query and results as slots."
+     ""
+     "        ;@ /doc/interpret_as /formats/test"
+     "        ;@ /doc/eval_with sept"
+     ""
+     "        ;$ foil"
+     ""
+     "          (eq 4 (add 2 2))"
+     ""
+     "        ;= Live state, transcluded"
+     ""
+     "          A reference attributed /doc/embed renders as a LIVE"
+     "          component over the referenced node — the board below"
+     "          is the running life app, not a picture of it."
+     ""
+     (weft/cat2 "          ;@ /doc/embed ;" (show/path (publisher_vocabulary/service ['app 'life 'weft 'board])))
+     (weft/cat2 "          ;" (show/path (publisher_vocabulary/service ['app 'life 'board])))
+     ""
+     (weft/cat2 "        ;" (show/path (publisher_vocabulary/service ['nenex 'w 'ideas])))
+     ""
+     "    ;@ /doc/kook ;/./kook/doc"
+     "    ;. w/ideas"
+     ""
+     "      ;= Ideas"
+     ""
+     (weft/cat2 "        ;@ /rel/supports ;" (show/path (publisher_vocabulary/service ['nenex 'w 'home])))
+     ""
+     "        Somewhere for loose thoughts to accumulate structure."])
++  app
+  '  The nenex app, assembled: a mani names it, a lore describes it
+  '  (the lede plus help lines the explorer shows), the kook/decls
+  '  register the three behaviors, and the seeds are the corpus
+  '  template's — the container (hub kook) and the two starter
+  '  pages, mounted pre-expanded.
+  ^  mani
+  (mani 'nenex
+        (lore "A personal wiki corpus: pages, edits, queries, and backlinks as namespace state."
+              ["A personal wiki corpus: pages, edits, queries, and backlinks as namespace state."
+               "Pages are semidoc trees at /nenex/w/<name>, each carrying its source and rebuilding its subtree from edits in one transaction; /h scrubs every revision."
+               "The corpus container watches its own subtree: backlinks recompute reactively, and searches commit their query and result paths as ordinary slots."]
+              [])
+        [(kook/decl 'hub hub_form (lore/line "The corpus container: init watches the subtree, talk answers the create and search forms, hear maintains backlinks."))
+         (kook/decl 'doc doc_form (lore/line "One page: init expands a fresh page from its source, talk re-expands the edit delta, hear syncs the source back from direct record edits."))
+         (kook/decl 'face face_form (lore/line "The HTML face: the index at the root, document pages with backlinks and the editor beneath."))]
+        (tmpl/seeds corpus_tmpl).snoc(weft_seed)
+        [])

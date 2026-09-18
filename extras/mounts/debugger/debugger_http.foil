@@ -1,0 +1,121 @@
+- browser_routes
+- debugger_view
+
++ debugger_http
+  + debug_query
+    \ target=str
+    ^ http_foot/action
+    = parts (http_foot/split 63 target)
+      pax (browser_routes/target parts.at(0).slice(6 parts.at(0).len))
+      invalid (http_foot/action/reply (http_driver/response 400 "Invalid debugger query"))
+    ? (gt parts.len 2) invalid
+    = fields (? (eq parts.len 2) (http_foot/fields parts.at(1)) [])
+    % i=nat 0 seen=row[str] [] epoch=maybe[nat] .none
+      children=maybe[path] .none slots=maybe[path] .none scope=iota 'document
+    ^ http_foot/action
+    ? (eq i fields.len)
+      = continuation ((maybe/is_some children) || (maybe/is_some slots))
+      ? (? continuation (maybe/is_none epoch) .false) invalid
+      | ./inspect (debugger_http/query pax epoch children slots scope)
+    = [key value] fields.at(i)
+    ? (seen.any((\ known=str (equal[str] key known)))) invalid
+    = next seen.snoc(key)
+    ? (equal[str] key "scope")
+      ? !((equal[str] value "workspace") || (equal[str] value "outline") || (equal[str] value "preview")) invalid
+      | _ i.inc next epoch children slots ($ts value)
+    ? (equal[str] key "view")
+      ? !(equal[str] value "rendered") invalid
+      | _ i.inc next epoch children slots scope
+    ? (equal[str] key "epoch")
+      ?> (./some number) (nat/parse value) invalid
+      ? !(equal[str] value (nat/show number)) invalid
+      | _ i.inc next (./some number) children slots scope
+    ? ((equal[str] key "children") || (equal[str] key "slots"))
+      ?> (./some cursor) (physical_key/decode value) invalid
+      ? (equal[str] key "children")
+        ? !(eq cursor.len 1) invalid
+        | _ i.inc next epoch (./some cursor) slots scope
+      | _ i.inc next epoch children (./some cursor) scope
+    invalid
+
+  + journal_response
+    \ result=either[iota helm/journal_page]
+    ^ http_response
+    | debugger_http/journal_response_with .none result
+  + journal_response_with
+    \ components=maybe[grove_app/binding] result=either[iota helm/journal_page]
+    ^ http_response
+    ? result
+     > (./err reason)
+       | http_driver/response 500 (weft/cat2 "Journal read rejected: " (iota_show reason))
+     > (./ok page)
+       > (./some registry) components
+         | http_driver/response 503 "Grove debugger unavailable: install /app/debug."
+       = body
+             | debugger/declared_page registry page.target
+               (page.view.run((\ version=saga (unpin version.myth))))
+               (axal/new[myth] .none) [] (./some page)
+       | http_response 200 body "text/html; charset=utf-8"
+  + debug_response
+    \ components=maybe[grove_app/binding] result=either[iota inspect_read/result]
+    ^ http_response
+    ? result
+     > (./err reason)
+      = status
+          ? (eq_iota reason 'epoch_conflict) 409
+          ? (eq_iota reason 'unknown_authority) 404
+          ? (eq_iota reason 'read_failed) 500
+          400
+      | http_foot/value_error reason status
+     > (./ok read)
+      > (./some registry) components
+        | http_driver/response 503 "Grove debugger unavailable: install /app/debug."
+      = data (grove_debug_data read.target read.view read.versions read.operations .none
+          read.writable read.tag (./some read.paging))
+        body (debugger/render_declared registry data)
+      | http_response 200 body "text/html; charset=utf-8"
+
+  + query
+    \ pax=path epoch=maybe[nat] children=maybe[path]
+      slots=maybe[path] scope=iota
+    ^ inspect_read/request
+    = outline | eq_iota scope 'outline
+      preview | eq_iota scope 'preview
+      metadata=row[path]
+        [bond/lede bond/help publisher_vocabulary/grove/role
+         publisher_vocabulary/grove/action
+         publisher_vocabulary/grove/norm publisher_vocabulary/grove/sewn
+         publisher_vocabulary/grove/template publisher_vocabulary/grove/module
+         ['pact] bond/form ['ev] ['method] ['part]
+         ['grants 'fetch] ['grants 'serve]]
+    | inspect_read/request pax epoch children slots scope
+      !outline !outline !(outline || preview) metadata
+  + plan
+    \ assets=row[http_foot/asset] root=path
+      request=http_foot/request now=nat
+    ^ http_foot/action
+    = request | browser_routes/local_route root request
+      url (http_foot/split 63 request.target).at(0)
+    ? !(equal[str] request.method "GET")
+      | ./reply (http_driver/response 405 "GET required")
+    ? (equal[str] url "/debug-read/value")
+      | browser_routes/value_query request.target
+    ? (equal[str] url "/debug-read/physical")
+      | browser_routes/physical_query request.target
+    ? (http_foot/route_is "/debug-read" url)
+      | ./reply (http_driver/response 404 "Not found")
+    ? (http_foot/route_is "/debug" url)
+      = pax | browser_routes/target url.slice(6 url.len)
+      ? (eq_pith pax ['log])
+        | browser_routes/journal_query request.target
+      | debugger_http/debug_query request.target
+    % idx=nat 0
+    ^ http_foot/action
+    ? (eq idx assets.len)
+      | ./reply (http_driver/response 404 "Not found")
+    = item assets.at(idx)
+    ? (equal url item.url)
+      | ./reply (http_response 200
+          (str/to_atom (http_foot/unbar item.bytes))
+          (str/to_atom item.mime))
+    | _ idx.inc

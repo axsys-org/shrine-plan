@@ -1,0 +1,286 @@
+- apps/hyp/boot
+- tests/namespace [at=fixture]
+- testing
+
++ hyp_tests
+  + initial
+    ^ hyp_runtime
+    | hyp_runtime/new fixture/namespace_tests/initial
+      [($x 1) 'hyp] [($x 1) 'gov 'hyp]
+
+  + apply
+    \ path=path wit=writ run=hyp_runtime
+    ^ [hyp_runtime feet/task[unit]]
+    =   [next index reply]
+     | hyp_runtime/handle (helm/card/step path wit) run
+       (sovereign_hive run.host)
+    [next reply]
+
+  + write
+    \ path=path rec=myth run=hyp_runtime
+    ^ hyp_runtime
+    =   [next reply]
+     | hyp_tests/apply path (writ/make rec) run
+    ?> (./ack ack) reply
+      (hyp/panic[hyp_runtime] (pails/t "Expected write ack") run)
+    ? ack
+     > .none next
+     > (./some why) (hyp/panic[hyp_runtime] why run)
+
+  + node
+    \ key=iota want=hyp/wanted run=hyp_runtime
+    ^ hyp_runtime
+    =   cfg
+     | hyp/config ($x 2) run.host.system sov/new myth/new
+    =   rec
+     . (myth/new)
+       put(run.slot('config) cfg)
+       put(run.slot('want) (hyp/wanted/write want))
+       put(run.slot('epoch) (pails/n 1))
+    | hyp_tests/write (run.root.weld(['instances key])) rec run
+
+  + ref
+    \ key=iota run=hyp_runtime
+    ^ hyp/instance_ref
+    =   rec
+     | hyp_runtime/record (run.root.weld(['instances key]))
+       run.host
+    ?> (./some obs)
+        (rec.get(run.slot('observed)).then(hyp/observation/read))
+      (hyp/panic (pails/t "Missing observation")
+        (hyp/instance_ref 0 0))
+    obs.instance
+
+  + mount
+    \ alias=iota ref=hyp/instance_ref run=hyp_runtime
+    ^ hyp_runtime
+    =   rec
+     | (myth/sing (run.slot('instance)) ref).put
+       (run.slot('generation)) (pails/n 1)
+    | hyp_tests/write (run.root.weld(['mounts alias])) rec run
+
+  + send
+    \ id=nat ref=hyp/instance_ref cmd=helm/card
+      run=hyp_runtime
+    ^ hyp_runtime
+    | hyp_tests/write (run.root.weld(['requests ($u id)]))
+      (myth/sing ['sys 'req] (hyp/request ref cmd)) run
+
+  + answer
+    \ id=nat run=hyp_runtime
+    ^ maybe[hyp/response]
+    =   rec
+     | hyp_runtime/record (run.root.weld(['requests ($u id)]))
+       run.host
+    | rec.get(['sys 'res]).then(hyp/response/read)
+
+  + want
+    \ key=iota want=hyp/wanted run=hyp_runtime
+    ^ hyp_runtime
+    =   path
+     | run.root.weld ['instances key]
+    =   rec
+     | hyp_runtime/record path run.host
+    | hyp_tests/write path
+      (rec.put(run.slot('want) (hyp/wanted/write want))) run
+
+  + check
+    \ title=str yes=bool
+    ^ testing/check
+    | testing/nat title 1 yes
+
+  + lifecycle
+    \ ignored=unit
+    ^ row[testing/check]
+    =   first
+     | hyp_tests/node 'one .running hyp_tests/initial
+    =   both
+     | hyp_tests/node 'two .running first
+    =   one
+     | hyp_tests/ref 'one both
+    =   two
+     | hyp_tests/ref 'two both
+    =   mounted
+     | hyp_tests/mount 'dev one both
+    =   target=path
+     [($x 2) 'hello]
+    =   record
+     | fixture/namespace_tests/record 42
+    =   command
+     | helm/card/step target (writ/make record)
+    =   wrote
+     | hyp_tests/send 1 one command mounted
+    =   read
+     | wrote.page .x .none ['hyp 'dev ($x 2) 'hello]
+    =   isolated
+     | both.guests.at(1).state.page .x .none target
+    =   host_before
+     | mounted.host
+    =   [delivered response]
+     | hyp_runtime/deliver
+       (hyp/request one command) mounted
+    =   stopped
+     | hyp_tests/want 'one .stopped wrote
+    =   pending
+     | hyp_tests/send 2 one
+       (helm/card/step target
+         (writ/poke (fixture/namespace_tests/record 43))) stopped
+    =   resumed
+     | hyp_tests/want 'one .running pending
+    =   rebound
+     | hyp_tests/mount 'dev two resumed
+    =   pinned
+     | hyp_tests/send 3 one (helm/card/peek .x .none target)
+       rebound
+    =   unknown
+     | hyp_tests/send 4 (hyp/instance_ref 999 1)
+       command pinned
+    =   [unmounted ack]
+     | hyp_tests/apply
+       (unknown.root.weld(['mounts 'dev])) .cull unknown
+    =   [removed ack]
+     | hyp_tests/apply
+       (unmounted.root.weld(['instances 'one])) .cull unmounted
+    =   recreated
+     | hyp_tests/node 'one .running removed
+    =   newref
+     | hyp_tests/ref 'one recreated
+    [(hyp_tests/check "two independent instances"
+       (and (eq both.guests.len 2) !(equal one two)))
+     (testing/nat "mounted guest read" 42
+       (fixture/namespace_tests/value read))
+     (hyp_tests/check "same-authority sibling is unchanged"
+       !(?=((./known _) isolated)))
+     (hyp_tests/check "guest delivery leaves host store unchanged"
+       (equal delivered.host host_before))
+     (hyp_tests/check "write receipt"
+       (hyp_tests/accepted (hyp_tests/answer 1 wrote)))
+     (hyp_tests/check "stopped instance queues work"
+       ?=(.none (hyp_tests/answer 2 pending)))
+     (testing/nat "resume drains pending work" 43
+       (fixture/namespace_tests/value
+         (hyp_runtime/page .x .none ['hyp 'dev ($x 2) 'hello] resumed)))
+     (hyp_tests/check "rebind does not redirect old instance request"
+       (hyp_tests/known_page (hyp_tests/answer 3 pinned)))
+     (hyp_tests/check "missing instance has rejection receipt"
+       (hyp_tests/rejected (hyp_tests/answer 4 unknown)))
+     (hyp_tests/check "unmount retains guest state"
+       (equal unmounted.guests unknown.guests))
+     (hyp_tests/check "recreated control gets fresh identity"
+       !(equal one newref))]
+
+  + validation
+    \ ignored=unit
+    ^ row[testing/check]
+    =   run
+     | hyp_tests/node 'one .running hyp_tests/initial
+    =   path
+     | run.root.weld ['instances 'one]
+    =   rec
+     | hyp_runtime/record path run.host
+    =   cfg
+     | hyp/config ($x 3) run.host.system sov/new myth/new
+    =   [changed ack]
+     | hyp_tests/apply path
+       (writ/poke (myth/sing (run.slot('config)) cfg)) run
+    =   [forged ack]
+     | hyp_tests/apply path
+       (writ/poke (myth/sing (run.slot('observed))
+         (hyp/observation 1 (hyp/instance_ref 9 1) .running))) run
+    =   cfg
+     | hyp/config 'sys run.host.system sov/new myth/new
+    =   [invalid ack]
+     | hyp_tests/apply
+       (run.root.weld(['instances 'bad]))
+       (writ/make rec.put(run.slot('config) cfg)) run
+    =   [deep ack]
+     | hyp_tests/apply
+       (run.root.weld(['instances 'one 'child]))
+       (writ/make myth/new) run
+    =   same
+     | hyp_tests/want 'one .running run
+    [(hyp_tests/check "boot configuration is immutable"
+       (equal changed run))
+     (hyp_tests/check "driver observation cannot be forged"
+       (equal forged run))
+     (hyp_tests/check "invalid guest authority rejected"
+       (equal invalid run))
+     (hyp_tests/check "nested control records rejected"
+       (equal deep run))
+     (hyp_tests/check "repeated lifecycle intent is a no-op"
+       (equal same run))]
+
+  + watches
+    \ ignored=unit
+    ^ row[testing/check]
+    =   run
+     | hyp_tests/node 'one .running hyp_tests/initial
+    =   ref
+     | hyp_tests/ref 'one run
+    =   target=path
+     [($x 2) 'hello]
+    =   watcher
+     | run.root.weld ['watches 'hello]
+    =   record
+     . (myth/new)
+       put(run.slot('instance) ref)
+       put(run.slot('query) (hyp/query target .x .none))
+       put(run.slot('epoch) (pails/n 1))
+    =   watching
+     | hyp_tests/write watcher record run
+    =   changed
+     | hyp_tests/send 1 ref
+       (helm/card/step target
+         (writ/make (fixture/namespace_tests/record 7))) watching
+    =   rec
+     | hyp_runtime/record watcher changed.host
+    =   value
+     | hyp_tests/page_value rec
+    =   again
+     | hyp_runtime/settle changed changed
+    =   [cleared ack]
+     | hyp_tests/apply watcher .cull changed
+    =   later
+     | hyp_tests/send 2 ref
+       (helm/card/step target
+         (writ/make (fixture/namespace_tests/record 8))) cleared
+    [(testing/nat "watch commits child answer" 7 value)
+     (hyp_tests/check "unchanged answers do not mint revisions"
+       (equal again changed))
+     (hyp_tests/check "culled watch is not recreated"
+       (eq (hyp_runtime/record watcher later.host).tap.len 0))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "Hyp lifecycle and routing" hyp_tests/lifecycle)
+   (testing/case "Hyp control validation" hyp_tests/validation)
+   (testing/case "Hyp standing reads" hyp_tests/watches)]
+
++ hyp_tests
+  + page_value
+    \ rec=myth
+    ^ nat
+    ?> (./some response)
+        (rec.get(['sys 'res]).then(hyp/response/read))
+      0
+    ?> (./page query answer) response 0
+    | fixture/namespace_tests/value answer
+
+  + accepted
+    \ answer=maybe[hyp/response]
+    ^ bool
+    ?> (./some response) answer .false
+    ?=((./accepted _) response)
+
+  + rejected
+    \ answer=maybe[hyp/response]
+    ^ bool
+    ?> (./some response) answer .false
+    ?=((./rejected _) response)
+
+  + known_page
+    \ answer=maybe[hyp/response]
+    ^ bool
+    ?> (./some response) answer .false
+    ?> (./page query value) response .false
+    ?=((./known _) value)
