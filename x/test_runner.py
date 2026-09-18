@@ -397,8 +397,9 @@ def main():
     selected = []
     if args.suites:
         for choice in args.suites:
-            matches = [s for s in suites if choice in (s['name'], s['group'])
-                       or choice == 'foil' and s['kind'] == 'native']
+            matches = [s for s in suites if choice == s['name']
+                       or s['enabled'] and (choice == s['group']
+                           or choice == 'foil' and s['kind'] == 'native')]
             if not matches:
                 parser.error('unknown suite/group: ' + choice)
             selected.extend(s for s in matches if s not in selected)

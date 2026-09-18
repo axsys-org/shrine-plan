@@ -1,8 +1,6 @@
 - helm
 - http_response
 - http
-- weft
-- web
 
 + http_foot
   + request
@@ -15,11 +13,11 @@
       http_foot/action/journal
       http_foot/action/value
       http_foot/action/physical
-      http_foot/action/debug
+      http_foot/action/inspect
     + reply
       : response=http_response
     + install
-      : source=path version=nat target=path
+      : source=path version=nat target=path back=str
     + write
       : pax=path wit=writ back=str
     + wait
@@ -30,8 +28,8 @@
       : query=value_read/request
     + physical
       : query=physical_read/request
-    + debug
-      : query=debug_read/request
+    + inspect
+      : query=inspect_read/request
   + task
     '  Supervisor messages and namespace actions from connections.
     & feet/task/init
@@ -40,7 +38,7 @@
       feet/task/journal
       feet/task/value
       feet/task/physical
-      feet/task/debug
+      feet/task/inspect
       feet/task/ack
       http_foot/action/install
       http_foot/action/write
@@ -48,7 +46,7 @@
       http_foot/action/journal
       http_foot/action/value
       http_foot/action/physical
-      http_foot/action/debug
+      http_foot/action/inspect
   + pending
     ' Text r<serial> keys belong to ordinary HTTP namespace records.
     ' Numeric serial keys correlate read-only supervisor requests.
@@ -139,10 +137,6 @@
     \ raw=str
     ^ path
     = text (http_foot/decode .false raw)
-      text=str
-        ? (equal[str] text "/ns") "/"
-        ? (equal[str] text.slice(0 4) "/ns/") text.slice(3 text.len)
-        text
     = absolute=str
         ? (eq text.len 0) "/"
         ? (eq text.at(0) 47) text
@@ -154,319 +148,9 @@
   + route_is
     \ prefix=str target=str
     ^ bool
+    ? (equal prefix "/") (eq target.at(0) 47)
     ? (equal prefix target) .true
     | equal[str] target.slice(0 prefix.len.inc) prefix.cat("/")
-  + form_record
-    \ kind=str fields=row[[key=str value=str]] now=nat
-    ^ myth
-    | fields.fold (? (equal[str] kind "op") (myth/sing ['when] (pd now)) myth/new)
-    \ record [key value]
-    ? (equal[str] key "back") record
-    ? (equal[str] key "") record
-    ? (equal[str] kind "op")
-      ? (equal[str] key "op") record
-      = pax (http_foot/target key)
-      ? (nat/parse value)
-       > (./some n) record.put(pax (pd n))
-       > .none record.put(pax (pails/t value))
-    = pax=path
-        ? (equal[str] kind "post") ['post ($ts key)]
-        [($ts key)]
-    | record.put pax (pails/t value)
-  + journal_query
-    ' Strict paging grammar. Decode before checking duplicates, retain
-    ' arbitrary-size decimal epochs as naturals, and never accept an
-    ' unknown parameter as an accidentally ignored cursor.
-    \ target=str
-    ^ http_foot/action
-    = parts (http_foot/split 63 target)
-    ? (gt parts.len 2)
-      | ./reply (http_driver/response 400 "Invalid journal query")
-    = query=str (? (eq parts.len 2) parts.at(1) "")
-    ? (eq query.len 0) (./journal .none 40)
-    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/fields query)
-      | ./reply (http_driver/response 400 "Invalid journal query encoding")
-    % i=nat 0 before=maybe[nat] .none limit=maybe[nat] .none viewed=bool .false
-    ^ http_foot/action
-    ? (eq i fields.len) (./journal before limit.fall(40))
-    = [key value] fields.at(i)
-    ? (equal[str] key "before")
-      ? (maybe/is_some before)
-        | ./reply (http_driver/response 400 "Duplicate before cursor")
-      ?> (./some n) (nat/parse value)
-        | ./reply (http_driver/response 400 "before must be a decimal epoch")
-      ? !(equal[str] value (nat/show n))
-        | ./reply (http_driver/response 400 "before must be a canonical decimal epoch")
-      | _ i.inc (./some n) limit viewed
-    ? (equal[str] key "limit")
-      ? (maybe/is_some limit)
-        | ./reply (http_driver/response 400 "Duplicate page limit")
-      ?> (./some n) (nat/parse value)
-        | ./reply (http_driver/response 400 "limit must be an integer from 1 to 40")
-      ? ((eq n 0) || (gt n 40) || !(equal[str] value (nat/show n)))
-        | ./reply (http_driver/response 400 "limit must be an integer from 1 to 40")
-      | _ i.inc before (./some n) viewed
-    ? (equal[str] key "view")
-      ? (viewed || !(equal[str] value "rendered"))
-        | ./reply (http_driver/response 400 "Invalid or duplicate view mode")
-      | _ i.inc before limit .true
-    | ./reply (http_driver/response 400 "Unknown journal query parameter")
-
-  + value_path
-    ' Query values are already percent-decoded. Require the canonical
-    ' namespace spelling, without aliases, dot paths, or a second decode.
-    \ text=str
-    ^ maybe[path]
-    ? ((eq text.len 0) || (gt text.len 4096) || !(eq text.at(0) 47)) .none
-    ? !(value_read/identifier text) .none
-    ? (text.split_byte(47).any((\ part=str ((equal[str] part ".") || (equal[str] part ".."))))) .none
-    ?> (./some pax) (path_parse text) .none
-    ? !(equal[str] text (path_show pax)) .none
-    | ./some pax
-  + value_number
-    \ text=str
-    ^ maybe[nat]
-    ?> (./some n) (nat/parse text) .none
-    ? !(equal[str] text (nat/show n)) .none
-    | ./some n
-  + value_query
-    \ target=str
-    ^ http_foot/action
-    = bad (http_foot/action/reply (http_foot/value_error 'invalid_query 400))
-      parts (http_foot/split 63 target)
-    ? ((gt target.len 32768) || !(eq parts.len 2)) bad
-    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/fields parts.at(1)) bad
-    % i=nat 0 pax=maybe[path] .none slot=maybe[path] .none
-      epoch=maybe[nat] .none offset=maybe[nat] .none limit=maybe[nat] .none
-    ^ http_foot/action
-    ? (eq i fields.len)
-      ?> (./some p) pax bad
-      ?> (./some k) slot bad
-      ?> (./some e) epoch bad
-      ?> (./some o) offset bad
-      ?> (./some n) limit bad
-      | ./value (value_read/request p k e o n)
-    = [key value] fields.at(i)
-    ? (equal[str] key "path")
-      ? (maybe/is_some pax) bad
-      ?> (./some p) (http_foot/value_path value) bad
-      | _ i.inc (./some p) slot epoch offset limit
-    ? (equal[str] key "slot")
-      ? (maybe/is_some slot) bad
-      ?> (./some k) (http_foot/value_path value) bad
-      | _ i.inc pax (./some k) epoch offset limit
-    ? (equal[str] key "epoch")
-      ? (maybe/is_some epoch) bad
-      ?> (./some e) (http_foot/value_number value) bad
-      | _ i.inc pax slot (./some e) offset limit
-    ? (equal[str] key "offset")
-      ? (maybe/is_some offset) bad
-      ?> (./some o) (http_foot/value_number value) bad
-      | _ i.inc pax slot epoch (./some o) limit
-    ? (equal[str] key "limit")
-      ? (maybe/is_some limit) bad
-      ?> (./some n) (http_foot/value_number value) bad
-      ? ((eq n 0) || (gt n 65536)) bad
-      | _ i.inc pax slot epoch offset (./some n)
-    bad
-
-  + physical_ascii
-    ' The structural wire codec and parameter names are printable ASCII.
-    ' Check raw fields before split can drop a trailing packed NUL.
-    \ text=str
-    ^ bool
-    % i=nat 0
-    ? (eq i text.len) .true
-    = byte text.at(i)
-    ? ((lt byte 33) || (gt byte 126)) .false
-    | _ i.inc
-  + physical_query
-    \ target=str
-    ^ http_foot/action
-    = bad (http_foot/action/reply (http_foot/value_error 'invalid_query 400))
-    ? (gt target.len 32800) bad
-    ? !(http_foot/physical_ascii target) bad
-    = parts (http_foot/split 63 target)
-    ? !(eq parts.len 2) bad
-    = raw parts.at(1)
-    ? ((eq raw.len 0) || (gt raw.len 32768)) bad
-    ?> (./ok fields) (Try[str row[[key=str value=str]]] http_foot/physical_fields raw) bad
-    % i=nat 0 pax=maybe[path] .none collection=maybe[iota] .none
-      epoch=maybe[nat] .none after=maybe[path] .none limit=maybe[nat] .none
-    ^ http_foot/action
-    ? (eq i fields.len)
-      ?> (./some p) pax bad
-      ?> (./some c) collection bad
-      ? (? (maybe/is_some after) (maybe/is_none epoch) .false) bad
-      ? (? (eq_iota c 'children) (after.run((\ key=path !(eq key.len 1))).fall(.false)) .false) bad
-      | ./physical (physical_read/request p epoch c after limit.fall(40))
-    = [key value] fields.at(i)
-    ? ((eq value.len 0) || !(http_foot/physical_ascii key) || !(http_foot/physical_ascii value)) bad
-    ? (equal[str] key "pathKey")
-      ? (maybe/is_some pax) bad
-      ?> (./some p) (physical_key/decode value) bad
-      | _ i.inc (./some p) collection epoch after limit
-    ? (equal[str] key "collection")
-      ? (maybe/is_some collection) bad
-      ? (equal[str] value "children") (_ i.inc pax (./some 'children) epoch after limit)
-      ? (equal[str] value "slots") (_ i.inc pax (./some 'slots) epoch after limit)
-      bad
-    ? (equal[str] key "epoch")
-      ? ((maybe/is_some epoch) || (gt value.len 128)) bad
-      ?> (./some e) (http_foot/value_number value) bad
-      | _ i.inc pax collection (./some e) after limit
-    ? (equal[str] key "after")
-      ? (maybe/is_some after) bad
-      ?> (./some a) (physical_key/decode value) bad
-      | _ i.inc pax collection epoch (./some a) limit
-    ? (equal[str] key "limit")
-      ? ((maybe/is_some limit) || (gt value.len 2)) bad
-      ?> (./some n) (http_foot/value_number value) bad
-      ? ((eq n 0) || (gt n 40)) bad
-      | _ i.inc pax collection epoch after (./some n)
-    bad
-
-  + physical_decode
-    ' Called only after the raw physical query passed printable ASCII.
-    ' Canonical codec strings need no allocation or byte-by-byte rebuild.
-    ' Encoded input keeps the existing strict percent/NUL/plus behavior.
-    \ text=str
-    ^ str
-    % i=nat 0
-    ? (eq i text.len) text
-    = byte text.at(i)
-    ? ((eq byte 37) || (eq byte 43)) (http_foot/decode .true text)
-    | _ i.inc
-  + physical_fields
-    \ raw=str
-    ^ row[[key=str value=str]]
-    | (http_foot/split 38 raw).map
-    \ field=str
-    ? (http_foot/find "=" field)
-     > (./some at)
-       [(http_foot/physical_decode field.slice(0 at))
-        (http_foot/physical_decode field.slice(at.inc field.len))]
-     > .none [(http_foot/physical_decode field) ""]
-
-  + debug_query
-    \ target=str
-    ^ http_foot/action
-    = parts (http_foot/split 63 target)
-      pax (http_foot/target parts.at(0).slice(6 parts.at(0).len))
-      invalid (http_foot/action/reply (http_driver/response 400 "Invalid debugger query"))
-    ? (gt parts.len 2) invalid
-    = fields (? (eq parts.len 2) (http_foot/fields parts.at(1)) [])
-    % i=nat 0 seen=row[str] [] epoch=maybe[nat] .none
-      children=maybe[path] .none slots=maybe[path] .none scope=iota 'document
-    ^ http_foot/action
-    ? (eq i fields.len)
-      = continuation ((maybe/is_some children) || (maybe/is_some slots))
-      ? (? continuation (maybe/is_none epoch) .false) invalid
-      | ./debug (debug_read/request pax epoch children slots scope)
-    = [key value] fields.at(i)
-    ? (seen.any((\ known=str (equal[str] key known)))) invalid
-    = next seen.snoc(key)
-    ? (equal[str] key "scope")
-      ? !((equal[str] value "workspace") || (equal[str] value "outline") || (equal[str] value "preview")) invalid
-      | _ i.inc next epoch children slots ($ts value)
-    ? (equal[str] key "view")
-      ? !(equal[str] value "rendered") invalid
-      | _ i.inc next epoch children slots scope
-    ? (equal[str] key "epoch")
-      ?> (./some number) (nat/parse value) invalid
-      ? !(equal[str] value (nat/show number)) invalid
-      | _ i.inc next (./some number) children slots scope
-    ? ((equal[str] key "children") || (equal[str] key "slots"))
-      ?> (./some cursor) (physical_key/decode value) invalid
-      ? (equal[str] key "children")
-        ? !(eq cursor.len 1) invalid
-        | _ i.inc next epoch (./some cursor) slots scope
-      | _ i.inc next epoch children (./some cursor) scope
-    invalid
-
-  + plan
-    \ request=http_foot/request now=nat
-    ^ http_foot/action
-    = url (http_foot/split 63 request.target).at(0)
-      fields (http_foot/fields request.body)
-    ? (http_foot/route_is "/debug-read" url)
-      ? !((equal[str] url "/debug-read/value") || (equal[str] url "/debug-read/physical"))
-        | ./reply (http_foot/value_error 'route_missing 404)
-      ? !(equal[str] request.method "GET")
-        | ./reply (http_foot/value_error 'method_not_allowed 405)
-      = parse={\ str}http_foot/action
-          ? (equal[str] url "/debug-read/physical") http_foot/physical_query
-          http_foot/value_query
-      ? (Try parse request.target)
-       > (./ok action) action
-       > (./err _) (./reply (http_foot/value_error 'invalid_query 400))
-    ? (equal[str] url "/w.js")
-      | ./reply (http_response 200 weft/runtime "application/javascript")
-    ? (equal[str] url "/style.css")
-      | ./reply (http_response 200
-          (http_foot/unbar (ReadFile "foil/style.css")) "text/css")
-    ? (equal[str] url "/debug.js")
-      | ./reply (http_response 200
-          (http_foot/unbar (ReadFile "foil/debug.js")) "application/javascript")
-    ? (equal[str] url "/debug.css")
-      | ./reply (http_response 200
-          (http_foot/unbar (ReadFile "foil/debug.css")) "text/css")
-    ? (equal[str] url "/debug-mash.js")
-      | ./reply (http_response 200
-          (http_foot/unbar (ReadFile "foil/.debug-assets/mash.js")) "application/javascript")
-    ? (equal[str] url "/debug-components.css")
-      | ./reply (http_response 200
-          (http_foot/unbar (ReadFile "foil/.debug-assets/components.css")) "text/css")
-    ? (http_foot/route_is "/grove/install" url)
-      ? !(equal[str] request.method "POST")
-        | ./reply (http_driver/response 405 "POST required")
-      ?> (./some version)
-          (nat/parse (http_foot/field "version" fields))
-        | ./reply (http_driver/response 400 "Template version required")
-      = source (http_foot/field "source" fields)
-      ? (eq source.len 0)
-        | ./reply (http_driver/response 400 "Published Grove path required")
-      = target (http_foot/field "root" fields)
-      ? ((eq target.len 0) || !(eq target.at(0) 47))
-        | ./reply (http_driver/response 400 "Instance root required")
-      | ./install (http_foot/target source) version
-          (http_foot/target target)
-    ? (http_foot/route_is "/chore" url)
-      | ./reply (http_driver/response 501 "Compiler service is not installed.")
-    = post (http_foot/route_is "/post" url)
-      edit (http_foot/route_is "/edit" url)
-      op (http_foot/route_is "/op" url)
-      vine (http_foot/route_is "/vine" url)
-    ? (post || edit || op || vine)
-      ? !(equal[str] request.method "POST")
-        | ./reply (http_driver/response 405 "POST required")
-      = pax (http_foot/target url.slice((? op 3 5) url.len))
-        back (http_foot/field "back" fields)
-        back
-          ? (back.len || edit) (? edit (str/cat_all ["/ns" (path_show pax)]) back)
-          (str/cat_all ["/ns" (path_show pax)])
-      ? vine
-        ? (equal[str] (http_foot/field "verb" fields) "cull")
-          | ./write pax .cull back
-        | ./reply (http_driver/response 501 "Expression writes require the compiler service.")
-      ? op
-        = operation (http_foot/target (http_foot/field "op" fields))
-        ? (eq operation.len 0)
-          | ./reply (http_driver/response 400 "op= must name an operation")
-        | ./write pax (writ/warp operation (http_foot/form_record "op" fields now)) back
-      | ./write pax (writ/poke (http_foot/form_record (? post "post" "edit") fields now)) back
-    ? !(equal[str] request.method "GET")
-      | ./reply (http_driver/response 405 "GET required")
-    ? (http_foot/route_is "/debug" url)
-      = pax (http_foot/target url.slice(6 url.len))
-      ? (eq_pith pax ['log]) (http_foot/journal_query request.target)
-      | http_foot/debug_query request.target
-    ? (http_foot/route_is "/frag" url)
-      = prefix=path ['o]
-        pax prefix.weld((http_foot/target url.slice(5 url.len)))
-      | ./wait (http/req request.method url request.body pax).put(['frag] (pails/t "1"))
-    | ./wait (http/req request.method url request.body (http_foot/target url))
-
   + header_end
     ' The framing delimiter is fixed: compare its bytes without slicing
     ' the remaining large request atom at every candidate offset.
@@ -571,24 +255,9 @@
        "Content-Type: " (str/from_atom response.ctype) http_foot/crlf
        "Content-Length: " (nat/show (wid response.body)) http_foot/crlf
        "Connection: close" http_foot/crlf http_foot/crlf (str/from_atom response.body)]
-  + local_route
-    \ root=path request=http_foot/request
-    ^ http_foot/request
-    = parts (http_foot/split 63 request.target)
-      url parts.at(0)
-      local_journal=bool
-        ? !(http_foot/route_is "/debug" url) .false
-        | eq_pith (http_foot/target url.slice(6 url.len)) root.snoc('log)
-    ? local_journal
-      | request.set_target
-        (str/cat_all ["/debug/log" request.target.slice(url.len request.target.len)])
-    ? (http_foot/route_is "/weft" request.target)
-      | request.set_target
-        (str/join "" ["/ns" (path_show root) request.target])
-    request
   + connection
     '  Plan locally; ask the foot only for namespace work.
-    \ fd=nat self=nat
+    \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
@@ -599,7 +268,7 @@
           =   ;planned
             | Try[http_foot/request http_foot/action]
               (\ r=http_foot/request
-                | http_foot/plan (http_foot/local_route root r)
+                | http_foot/dispatch config.routes r
                     (div (Now 0) 1000000000))
               parsed
           ? planned
@@ -615,13 +284,13 @@
     ; (CloseFd fd)
     | CloseHandle foot
   + listener
-    \ fd=nat self=nat
+    \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
     % ignored=nat 0
     = ;connection (Accept fd)
-      ;actor (Spawn (http_foot/connection connection))
+      ;actor (Spawn (http_foot/connection config connection))
     ; (SendCaps actor root [foot])
     ; (CloseHandle actor)
     | _ 0
@@ -630,54 +299,18 @@
     ^ nat
     ; (Send conn response)
     | CloseHandle conn
-  + journal_response
-    \ result=either[iota helm/journal_page]
-    ^ http_response
-    | http_foot/journal_response_with .none result
-  + journal_response_with
-    \ components=maybe[grove_app/binding] result=either[iota helm/journal_page]
-    ^ http_response
-    ? result
-     > (./err reason)
-       | http_driver/response 500 (weft/cat2 "Journal read rejected: " (iota_show reason))
-     > (./ok page)
-       > (./some registry) components
-         | http_driver/response 503 "Grove debugger unavailable: install /app/debug."
-       = body
-             | debugger/declared_page registry page.target
-               (page.view.run((\ version=saga (unpin version.myth))))
-               (axal/new[myth] .none) [] (./some page)
-       | http_response 200 body "text/html; charset=utf-8"
-  + debug_response
-    \ components=maybe[grove_app/binding] result=either[iota debug_read/result]
-    ^ http_response
-    ? result
-     > (./err reason)
-      = status
-          ? (eq_iota reason 'epoch_conflict) 409
-          ? (eq_iota reason 'unknown_authority) 404
-          ? (eq_iota reason 'read_failed) 500
-          400
-      | http_foot/value_error reason status
-     > (./ok read)
-      > (./some registry) components
-        | http_driver/response 503 "Grove debugger unavailable: install /app/debug."
-      = data (grove_debug_data read.target read.view read.versions read.operations .none
-          read.writable read.scope (./some read.paging))
-        body (debugger/render_declared registry data)
-      | http_response 200 body "text/html; charset=utf-8"
-  + debug_renderer
+  + inspect_renderer
     ' One renderer retains the immutable Grove registry, not a fresh actor
     ' and transferred renderer closure per request. The foot/coordinator
     ' remains free to acknowledge writes and deliver bounded reads.
-    \ components=maybe[grove_app/binding] self=nat
+    \ render={\ either[iota inspect_read/result]}http_response self=nat
     ^ nat
     % ignored=nat 0
-    = ;[result caps] (Recv[either[iota debug_read/result]] 0)
+    = ;[result caps] (Recv[either[iota inspect_read/result]] 0)
       response
-        ? (Try (http_foot/debug_response components) result)
+        ? (Try render result)
          > (./ok ready) ready
-         > (./err _) (http_driver/response 500 "Debugger rendering failed")
+         > (./err _) (http_driver/response 500 "Inspection rendering failed")
     ; (http_foot/reply caps.at(0) response)
     | _ 0
   + value_error
@@ -721,9 +354,9 @@
   + run
     \ initial=feet/task/init self=nat
     ^ nat
-    | http_foot/run_with .none initial self
+    | http_foot/run_with http_foot/empty initial self
   + run_with
-    \ components=maybe[grove_app/binding] initial=feet/task/init self=nat
+    \ config=http_foot/config initial=feet/task/init self=nat
     ^ nat
     = root=path
         ? initial.ax.fil
@@ -735,18 +368,17 @@
          > (./some version) (unpin version.myth).nat_at(['port] 0)
         0
       ;fd (Listen port)
-      ;pump (Spawn (http_foot/listener fd))
-      ;renderer (Spawn (http_foot/debug_renderer components))
+      ;pump (Spawn (http_foot/listener config fd))
+      ;renderer (Spawn (http_foot/inspect_renderer config.inspect))
     ; (SendCaps pump root [0])
     ; (CloseHandle pump)
     ; (Trace "HTTP foot listening" 0)
     % serial=nat 0 pending=row[http_foot/pending] [] queue=row[http_foot/ack] []
     = ;[message caps] (Recv[http_foot/task] 0)
     ? message
-     > (http_foot/action/install source version target)
+     > (http_foot/action/install source version target back)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
-        back (str/cat_all ["/ns" (path_show target)])
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/install source version target))
       | _ serial.inc pending
@@ -783,13 +415,13 @@
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/physical serial query))
       | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
-     > (http_foot/action/debug query)
+     > (http_foot/action/inspect query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
-      ; (Send initial.parent (feet/gift/debug serial query))
+      ; (Send initial.parent (feet/gift/inspect serial query))
       | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
-     > (feet/task/debug request result)
+     > (feet/task/inspect request result)
       ; (helm/supervisor/close_caps caps)
       = empty=row[http_foot/pending] []
         ;left
@@ -834,7 +466,7 @@
      > (feet/task/journal request result)
       ; (helm/supervisor/close_caps caps)
       = response
-          ? (Try (http_foot/journal_response_with components) result)
+          ? (Try config.journal result)
            > (./ok ready) ready
            > (./err _) (http_driver/response 500 "Journal rendering failed")
         empty=row[http_foot/pending] []
@@ -892,3 +524,74 @@
        > .cleanup (_ serial pending tail)
     ; (helm/supervisor/close_caps caps)
     | _ serial pending queue
+
+  + route
+    : prefix=str plan={\ http_foot/request nat}http_foot/action
+  + config
+    : routes=row[http_foot/route]
+      inspect={\ either[iota inspect_read/result]}http_response
+      journal={\ either[iota helm/journal_page]}http_response
+  + asset
+    : url=str bytes=nat mime=str
+  + asset_body
+    \ url=str assets=row[http_foot/asset]
+    ^ str
+    % idx=nat 0
+    ? (eq idx assets.len) ""
+    = item assets.at(idx)
+    ? (equal url item.url) (http_foot/unbar item.bytes)
+    | _ idx.inc
+  + empty
+    ^ http_foot/config
+    | http_foot/config []
+      (\ ignored (http_driver/response 404 "Not found"))
+      (\ ignored (http_driver/response 404 "Not found"))
+  + matches
+    \ prefix=str url=str
+    ^ bool
+    ? (equal prefix "/") .true
+    | http_foot/route_is prefix url
+  + dispatch
+    \ routes=row[http_foot/route] request=http_foot/request now=nat
+    ^ http_foot/action
+    = url (http_foot/split 63 request.target).at(0)
+    % idx=nat 0 best=maybe[http_foot/route] .none
+    ^ http_foot/action
+    ? (eq idx routes.len)
+      ?> (./some hit) best
+        | ./reply (http_driver/response 404 "Not found")
+      = run hit.plan
+      | run request now
+    = item routes.at(idx)
+      longer
+        ?> (./some hit) best .true
+        | gt item.prefix.len hit.prefix.len
+      next=maybe[http_foot/route]
+        ? (and longer (http_foot/matches item.prefix url))
+          | ./some item
+        best
+    | _ idx.inc next
+  + route_collision
+    \ prefix=str routes=row[http_foot/route] count=nat
+    ^ bool
+    % idx=nat 0
+    ? (eq idx count) .false
+    = item routes.at(idx)
+    ? (equal[str] prefix item.prefix) .true
+    | _ idx.inc
+  + add_routes
+    \ extra=row[http_foot/route] config=http_foot/config
+    ^ http_foot/config
+    = routes=row[http_foot/route] config.routes.weld(extra)
+    % idx=nat 0
+    ^ http_foot/config
+    ? (eq idx routes.len) config.set_routes(routes)
+    = item routes.at(idx)
+    ? (http_foot/route_collision item.prefix routes idx)
+      | http_foot/invalid_routes config
+    | _ idx.inc
+  + invalid_routes
+    \ config=http_foot/config
+    ^ http_foot/config
+    ; (error (http_foot/fault "Duplicate HTTP route"))
+    config

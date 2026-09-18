@@ -176,9 +176,9 @@ class ProtocolTests(unittest.TestCase):
         names = [s['name'] for s in suites]
         self.assertEqual(len(names), len(set(names)))
         self.assertIn('foil:tests/json', names)
-        self.assertIn('foil:apps/chat/tests', names)
-        self.assertIn('foil:apps/loom/tests', names)
-        self.assertIn('foil:apps/nenex/tests', names)
+        self.assertNotIn('foil:apps/chat/tests', names)
+        self.assertNotIn('foil:apps/loom/tests', names)
+        self.assertNotIn('foil:apps/nenex/tests', names)
         self.assertIn('doc:sept', names)
         self.assertIn('foil:tests/supervisor', names)
         self.assertIn('foil:tests/http_foot', names)
@@ -186,7 +186,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_generated_helpers_are_covered_without_running_as_suites(self):
         suites = {s['name']: s for s in runner.inventory()}
-        for helper in ('grove_backend', 'grove_install', 'eden_srs'):
+        for helper in ('grove_backend', 'grove_install', 'grove_publication'):
             self.assertNotIn('foil:tests/' + helper, suites)
             self.assertIn('"tests/' + helper + '"',
                           '\n'.join((runner.ROOT / 'src/reaver' / (name + '.rvr')).read_text()
@@ -200,7 +200,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}
-        for name in ('web', 'pact', 'sept', 'semidoc', 'weft'):
+        for name in ('pact', 'sept', 'semidoc', 'weft'):
             self.assertNotIn('foil-' + name + '-tests', suites)
             self.assertTrue(suites['foil:tests/' + name]['enabled'])
         self.assertTrue(suites['foil-sept-layout-tests']['enabled'])
@@ -216,7 +216,7 @@ class ProtocolTests(unittest.TestCase):
                              ('loom', 'apps/loom/tests'),
                              ('tmpl', 'tests/tmpl')]:
             self.assertNotIn('foil-' + name + '-tests', suites)
-            self.assertTrue(suites['foil:' + target]['enabled'])
+            self.assertNotIn('foil:' + target, suites)
         self.assertFalse(runner.needs_corpus('foil-semidoc-layout-tests'))
 
     def test_compiler_inputs_exclude_suites(self):
