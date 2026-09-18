@@ -5,7 +5,7 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/main";
+    url = "github:axsys-org/enki/lf/ice-opcode";
   };
   inputs.mash = {
     # Use Git's credential helper for the private repository.
