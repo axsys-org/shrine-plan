@@ -1,0 +1,211 @@
+- shrine
+- lain_peek
+- json
+' Exact, read-only physical slot bytes. No derived evaluation or subtree read.
++ value_read
+  + request
+    : pax=path slot=path epoch=nat offset=nat limit=nat
+  + chunk
+    : pax=path slot=path epoch=nat record_epoch=nat kind=str total=nat offset=nat next=maybe[nat] hex=str
+  + physical
+    \ pax=path
+    ^ bool
+    | !((is_h pax) || (is_o pax) || (is_xv pax))
+  + bytes
+    \ held=pail
+    ^ maybe[[kind=str bytes=nat]]
+    ? held
+     > t=pails/t (./some ["text" (str/to_atom t.t)])
+     > n=pails/n (./some ["natural" n.n])
+    .none
+  + representation
+    \ kind=str
+    ^ str
+    ? (equal[str] kind "text") "utf8-bytes"
+    "natural-le-bytes"
+  + hex_slice
+    ' Visit only the requested window. Balanced byte-range recursion avoids
+    ' a 65K-element intermediate row; each leaf packs at most 32 byte pairs.
+    \ bytes=nat offset=nat count=nat
+    ^ str
+    ? (le count 32) (value_read/hex_block bytes offset count)
+    = half (div count 2)
+      left (_ bytes offset half)
+      right (_ bytes (add offset half) (sub count half))
+    | left.cat(right)
+  + hex_block
+    \ bytes=nat offset=nat count=nat
+    ^ str
+    % i=nat 0 packed=nat 0
+    ? (eq i count) (str/from_atom packed)
+    = byte (load8 (add offset i) bytes)
+      pair (add (hex/digit (div byte 16)) (mul 256 (hex/digit (mod byte 16))))
+    | _ i.inc (add packed (lsh pair (mul 16 i)))
+  + read
+    \ req=value_read/request state=sov
+    ^ either[iota value_read/chunk]
+    ? !((value_read/physical req.pax)) (./err 'derived_path)
+    ? ((eq req.limit 0) || (gt req.limit 65536)) (./err 'invalid_limit)
+    ? (gt req.epoch state.top) (./err 'future_epoch)
+    = history=uon[ass] (sov/hist req.pax state)
+      resolved=res[myth] (ass/res req.epoch history)
+    ? resolved
+     > .unknown (./err 'record_missing)
+     > .null (./err 'record_deleted)
+     > (./known record=myth)
+      ?> (./some held) record.get(req.slot)
+          (./err 'slot_missing)
+      ?> (./some pair) (value_read/bytes held)
+          (./err 'unsupported_type)
+      = [kind bytes] pair
+      | value_read/make req (value_read/record_epoch req.epoch history) kind bytes
+  + namespace_safe_read
+    ' Epochs belong to the addressed authority, not the local node by default.
+    \ req=value_read/request state=namespace
+    ^ either[iota value_read/chunk]
+    ? !(value_read/physical req.pax) (./err 'derived_path)
+    ?> (./some history) state.history(req.pax)
+      | ./err 'unknown_authority
+    | value_read/safe_read req history
+  + record_epoch
+    \ epoch=nat history=uon[ass]
+    ^ nat
+    ?> (./some entry) (uon/floor[ass] ($u epoch) history) 0
+    = [key assertion] entry
+    | (dig_of key).fall(0)
+  + safe_read
+    ' Force the selected bounded byte window inside the error boundary,
+    ' so a malformed stored payload cannot strand the supervisor reply.
+    \ req=value_read/request state=sov
+    ^ either[iota value_read/chunk]
+    ? (Try value_read/force_read [req state])
+     > (./ok value) value
+     > (./err _) (./err 'read_failed)
+  + force_read
+    \ input=[value_read/request sov]
+    ^ either[iota value_read/chunk]
+    = [query source] input
+    ? (value_read/read query source)
+     > (./err reason) (./err reason)
+     > (./ok chunk)
+       ; (str/len chunk.hex)
+       | ./ok chunk
+  + make
+    \ req=value_read/request record_epoch=nat kind=str bytes=nat
+    ^ either[iota value_read/chunk]
+    = total (wid bytes)
+    ? (gt req.offset total) (./err 'offset_out_of_range)
+    = remaining (sub total req.offset)
+      count (? (lt remaining req.limit) remaining req.limit)
+      end (add req.offset count)
+      next=maybe[nat] (? (lt end total) (./some end) .none)
+    | ./ok (value_read/chunk req.pax req.slot req.epoch record_epoch kind total req.offset next
+        (value_read/hex_slice bytes req.offset count))
+  + json
+    ' The payload is produced only by hex_slice: lowercase ASCII hex cannot
+    ' contain JSON delimiters. Escape all external metadata normally, then
+    ' copy those already encoded bytes once rather than rescan 128K chars.
+    \ chunk=value_read/chunk
+    ^ str
+    = envelope | show (json/obj
+      [(jkv "version" (json/num .false 1))
+       (jkv "path" (json/str (path_show chunk.pax)))
+       (jkv "slot" (json/str (path_show chunk.slot)))
+       (jkv "epoch" (json/str (nat/show chunk.epoch)))
+       (jkv "recordEpoch" (json/str (nat/show chunk.record_epoch)))
+       (jkv "type" (json/str chunk.kind))
+       (jkv "representation" (json/str (value_read/representation chunk.kind)))
+       (jkv "encoding" (json/str "hex"))
+       (jkv "total" (json/str (nat/show chunk.total)))
+       (jkv "offset" (json/str (nat/show chunk.offset)))
+       (jkv "next" (chunk.next.run((\ n (json/str (nat/show n)))).fall((json/nul 0))))
+       (jkv "complete" (json/boo !(maybe/is_some chunk.next)))])
+      quote (str/from_atom 34)
+    | str/cat_all [envelope.slice(0 envelope.len.dec) "," (show_str "hex") ":" quote chunk.hex quote "}"]
+  + error_json
+    \ reason=iota
+    ^ str
+    | show (json/obj [(jkv "version" (json/num .false 1)) (jkv "error" (json/str (iota_show reason)))])
+  + status
+    \ reason=iota
+    ^ nat
+    ? (eq_iota reason 'future_epoch) 409
+    ? (eq_iota reason 'unknown_authority) 404
+    ? (eq_iota reason 'record_deleted) 410
+    ? ((eq_iota reason 'record_missing) || (eq_iota reason 'slot_missing)) 404
+    ? ((eq_iota reason 'derived_path) || (eq_iota reason 'unsupported_type)) 422
+    ? (eq_iota reason 'offset_out_of_range) 416
+    ? ((eq_iota reason 'invalid_query) || (eq_iota reason 'invalid_limit)) 400
+    500
+  + percent
+    \ text=str
+    ^ str
+    = parts
+        % i=nat 0 out=list[str] .nil
+        ^ list[str]
+        ? (eq i text.len) out
+        = byte text.at(i)
+          safe ((value_read/between byte 65 90) || (value_read/between byte 97 122) ||
+            (value_read/between byte 48 57) || (eq byte 45) || (eq byte 46) || (eq byte 95) || (eq byte 126))
+          part (? safe (str/snoc_byte byte "") (str/cat_all ["%" (hex/byte byte)]))
+        | _ i.inc (list/cons[str] part out)
+    | str/cat_all parts.row.rev
+  + identifier
+    \ text=str
+    ^ bool
+    ? !(value_read/text_bytes (str/to_atom text)) .false
+    % i=nat 0
+    ? (eq i text.len) .true
+    = byte text.at(i)
+    ? ((lt byte 32) || (eq byte 127)) .false
+    | _ i.inc
+  + url
+    \ pax=path slot=path epoch=nat
+    ^ str
+    | str/cat_all ["/debug-read/value?path=" (value_read/percent (path_show pax))
+       "&slot=" (value_read/percent (path_show slot)) "&epoch=" (nat/show epoch) "&offset=0&limit=65536"]
+  + continuation
+    \ byte=nat
+    ^ bool
+    | value_read/between byte 128 191
+  + between
+    \ n=nat lower=nat upper=nat
+    ^ bool
+    ? (lt n lower) .false
+    | le n upper
+  + text_bytes
+    ' HTML normalizes CR and cannot preserve NUL/invalid UTF-8. Do not
+    ' advertise those renderings as complete; the hex read remains exact.
+    \ bytes=nat
+    ^ bool
+    = length (wid bytes)
+    % i=nat 0
+    ? (eq i length) .true
+    = b (load8 i bytes)
+    ? (lt b 128)
+      ? !((eq b 9) || (eq b 10) || (ge b 32)) .false
+      | _ i.inc
+    = count
+        ? (value_read/between b 194 223) 2
+        ? (value_read/between b 224 239) 3
+        ? (value_read/between b 240 244) 4
+        0
+    ? ((eq count 0) || (gt (add i count) length)) .false
+    = second (load8 i.inc bytes)
+    ? !(value_read/continuation second) .false
+    ? (? (eq b 224) (lt second 160) .false) .false
+    ? (? (eq b 237) (gt second 159) .false) .false
+    ? (? (eq b 240) (lt second 144) .false) .false
+    ? (? (eq b 244) (gt second 143) .false) .false
+    ? (? (ge count 3) !(value_read/continuation (load8 (add i 2) bytes)) .false) .false
+    ? (? (eq count 4) !(value_read/continuation (load8 (add i 3) bytes)) .false) .false
+    | _ (add i count)
+  + preview_count
+    ' A bounded text preview ends before an incomplete UTF-8 sequence.
+    \ limit=nat bytes=nat
+    ^ nat
+    ? (le (wid bytes) limit) (wid bytes)
+    % end=nat limit
+    ? (eq end 0) 0
+    ? !(value_read/continuation (load8 end bytes)) end
+    | _ end.dec

@@ -192,13 +192,6 @@
 ;; note-poke :: Def -> Span -> Note
 (define note-poke $NotePoke)
 
-;; note-tag :: Note -> Cord
-(define (note-tag note)
-  (? Note note
-    (NoteMake NOTE-MAKE)
-    (NoteCull NOTE-CULL)
-    (NotePoke NOTE-POKE)))
-
 ;; note-body :: Note -> Def
 (define (note-body note)
   (? Note note
@@ -252,21 +245,28 @@
   (Seq (foldl step cairn:empty-ax entries) entries))
 
 ;; entry-covered-by-cull? :: Row [Path Note] -> [Path Note] -> Bool
-(define (entry-covered-by-cull? entries pair)
+;; `culls` is the cull-note subset of the layer, not the whole layer:
+;; the note-cull? test used to run inside the scan, so every entry
+;; walked every entry.
+(define (entry-covered-by-cull? culls pair)
   (define path (pair-path pair))
-  (any
-    (lambda (other)
-      (And (note-cull? (pair-value other))
-        (path-strict-prefix? (pair-path other) path)))
-    entries))
+  (any (lambda (other) (path-strict-prefix? (pair-path other) path)) culls))
 
 ;; normalize-layer-entries :: Row [Path Note] -> Row [Path Note]
+;; The cull filter was O(entries^2) — a full scan per entry — and
+;; make-export-layer / extend-derived-environment build a layer with one
+;; entry per own key, so it was the compiler's largest superlinear term
+;; (measured: 3.5x for 2x the module, against ~2x for everything else).
+;; Culls are a small minority and usually absent, so partition once and
+;; scan only those; a cull-free layer skips the filter entirely.
 (define (normalize-layer-entries raw)
   (define checked (validate-layer-entries raw))
+  (define culls (filter (lambda (p) (note-cull? (pair-value p))) checked))
   (sort entry-path-cmp
-    (filter
-      (lambda (pair) (Nil (entry-covered-by-cull? checked pair)))
-      checked)))
+    (Ifz (Sz culls)
+      checked
+      (filter (lambda (pair) (Nil (entry-covered-by-cull? culls pair)))
+        checked))))
 
 ;; make-layer :: Data -> Row [Path Note] -> Layer
 (define (make-layer label entries)
@@ -277,14 +277,6 @@
   (unless (IsPin ref)
     (error ["foil-env-malformed-layer-ref" ref])
     ($Layer label (entries-tree (normalize-layer-entries entries)) ref)))
-
-;; make-layer-tree :: Data -> AX[Note] -> Layer
-(define (make-layer-tree label tree)
-  (make-layer label (tree-entries tree)))
-
-;; make-layer-tree-ref :: Data -> AX[Note] -> LayerRef -> Layer
-(define (make-layer-tree-ref label tree ref)
-  (make-layer-ref label (tree-entries tree) ref))
 
 ;; layer? :: Data -> Bool
 (define (layer? layer) (typed-value? Layer layer))
@@ -516,18 +508,6 @@
 ;; bind-tomb :: Span -> Provenance -> Bind
 (define bind-tomb $BindTomb)
 
-;; bind-tag :: Bind -> Cord
-(define (bind-tag bind)
-  (? Binding bind
-    (BindDef BIND-DEF)
-    (BindTomb BIND-TOMB)))
-
-;; bind-body :: Bind -> Def
-(define (bind-body bind)
-  (? Binding bind
-    (BindDef [body] body)
-    (BindTomb 0)))
-
 ;; bind-span :: Bind -> Span
 (define (bind-span bind)
   (? Binding bind
@@ -539,9 +519,6 @@
   (? Binding bind
     (BindDef [from] from)
     (BindTomb [from] from)))
-
-;; bind-def? :: Bind -> Bool
-(define (bind-def? bind) (typed-value? BindDef bind))
 
 ;; bind-tomb? :: Bind -> Bool
 (define (bind-tomb? bind) (typed-value? BindTomb bind))
@@ -573,9 +550,6 @@
 ;; warning-winning-from :: Warning -> Provenance
 (define warning-winning-from OcclusionWarning.winning-from)
 
-;; warning-span :: Warning -> Span
-(define warning-span OcclusionWarning.span)
-
 (define RES-KNOWN "FOIL_ENV_RES_KNOWN")
 (define RES-NULL "FOIL_ENV_RES_NULL")
 (define RES-UNKNOWN "FOIL_ENV_RES_UNKNOWN")
@@ -595,13 +569,6 @@
     (ResKnown RES-KNOWN)
     (ResNull RES-NULL)
     (ResUnknown RES-UNKNOWN)))
-
-;; res-path :: Res -> Path
-(define (res-path res)
-  (? ResolutionResult res
-    (ResKnown [path] path)
-    (ResNull [path] path)
-    (ResUnknown [path] path)))
 
 ;; res-from :: Res -> Maybe Provenance
 (define (res-from res)
@@ -638,9 +605,6 @@
 
 ;; resolution-from :: Resolution -> Provenance
 (define resolution-from Resolution.from)
-
-;; resolution-kind :: Resolution -> Cord
-(define resolution-kind Resolution.kind)
 
 ;;; Sources and environments ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -786,6 +750,17 @@
       (apply-source
         (make-source layer [] no-mount-order 0 (source-from source) 0)
         env))))
+
+;; environment-tombless? :: Environment -> Bool
+;;
+;; One scan of the sealed tree.  A hot caller that classifies many
+;; misses (extend-derived-environment asks about every written key)
+;; can skip the per-key covering-tomb prefix walks entirely when no
+;; cull ever produced a tomb — the overwhelmingly common case.
+(define (environment-tombless? env)
+  (Nil
+    (find (lambda (pair) (bind-tomb? (_1 pair)))
+      (rowify (cairn:tapax (environment-tree env))))))
 
 ;; find-covering-tomb :: Path -> AX[Bind] -> Maybe Bind
 (define (find-covering-tomb path tree)
@@ -1002,9 +977,9 @@
  ResolutionResult ResKnown ResNull ResUnknown Resolution
  Source Environment Unit
  path-prefix? path-strict-prefix?
- note-make note-cull note-poke note-tag note-body note-span
+ note-make note-cull note-poke note-body note-span
  note-make? note-cull? note-poke?
- make-layer make-layer-ref make-layer-tree make-layer-tree-ref layer?
+ make-layer make-layer-ref layer?
  layer-label layer-tree layer-ref-override layer-entries layer-get
  layer-identity layer-ref layer-with-ref
  no-mount-order explicit-mount-order make-mount mount? mount-layer mount-at
@@ -1012,14 +987,15 @@
  mount-identity validate-mounts
  from-import from-own from-base from-kind from-ref from-label
  from-import? from-own? from-base?
- bind-def bind-tomb bind-tag bind-body bind-span bind-from bind-def? bind-tomb?
- warning-tag warning-path warning-occluded-from warning-winning-from warning-span
- res-tag res-path res-from res-value res-known? res-null? res-unknown?
+ bind-def bind-tomb bind-span bind-from bind-tomb?
+ warning-tag warning-path warning-occluded-from warning-winning-from
+ res-tag res-from res-value res-known? res-null? res-unknown?
  make-resolution
- resolution-site resolution-path resolution-from resolution-kind
+ resolution-site resolution-path resolution-from
  source-layer source-at source-order source-span source-from source-warns?
  environment? environment-tree environment-warnings environment-sources
  environment-resolutions environment-with-resolutions environment-bind
+ environment-tombless?
  empty-environment
  build-environment build-environment-with-base extend-environment
  extend-own-derived

@@ -16,8 +16,9 @@
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
-(#bind ty (#module foil-types))
 (#bind nt (#module foil-new-types))
+(#bind brand (#module shrine-brand))
+(#bind quip (#module quip))
 
 (#bind foil-lore (#module foil-lore))
 
@@ -69,61 +70,13 @@
 ;; /ty-ap paths display as applications: bst[nat], bst[row[nat]],
 ;; bst[@v]. (print-path on the raw encoding would try to print the
 ;; length markers.)
-(define (path-text p)
-  (define parts (ty-ap-decode p))
-  (Ifz parts
-    (cond
-      ((ty-var-path? p) (strcat ["@" (Ix 1 p)]))
-      ((ty-val-path? p)
-        (If (printable-text? (Ix 1 p))
-          (strcat ["'$" (Ix 1 p)])
-          (showNat (Ix 1 p))))
-      (else (print-path p)))
-    (strcat
-      [(path-text (Ix 0 parts)) "["
-       (join-str " " (map path-text (drop 1 parts))) "]"])))
-
-(define (legacy-ty-text t)
-  (define tag (ty:type-tag t))
-  (define (many sep ts) (join-str sep (map legacy-ty-text ts)))
-  (cond
-    ((Eq tag "TNOM") (path-text (ty:tnom-ref t)))
-    ((Eq tag "TNAT")
-      (cond
-        ((Ifz (ty:tnat-cube t) 1 0) "nat")
-        ((printable-text? (ty:tnat-cube t))
-          (strcat ["'$" (ty:tnat-cube t)]))
-        (else (showNat (ty:tnat-cube t)))))
-    ((Eq tag "TFUN")
-      (strcat ["{" (many " " (ty:tfun-args t)) "; "
-               (legacy-ty-text (ty:tfun-ret t)) "}"]))
-    ((Eq tag "TROW")
-      (strcat [(If (ty:trow-cstr t) (atom-str (ty:trow-cstr t)) "")
-               "[" (many " " (ty:trow-vals t)) "]"]))
-    ((Eq tag "TSUM") (strcat ["(" (many " | " (ty:tsum-opts t)) ")"]))
-    ((Eq tag "TFAC")
-      (strcat [(atom-str (ty:tfac-face t)) "="
-               (legacy-ty-text (ty:tfac-val t))]))
-    ((Eq tag "TQUA")
-      (strcat ["@" (atom-str (ty:tqua-name t)) " "
-        (legacy-ty-text (ty:tqua-body-value t))]))
-    ((Eq tag "TVAR") (strcat ["@" (atom-str (ty:tvar-index t))]))
-    ((Eq tag "TPIN") (strcat ["pin[" (legacy-ty-text (ty:tpin-val t)) "]"]))
-    ((Eq tag "TSELF")
-      (strcat ["self[" (legacy-ty-text (ty:tself-val t)) "]"]))
-    ((Eq tag "TARR") (strcat ["row[" (legacy-ty-text (ty:tarr-item t)) "]"]))
-    ((Eq tag "TANY") "any")
-    ((Eq tag "TBOT") "bot")
-    ((Eq tag "TTYP") (strcat ["type " (legacy-ty-text (ty:ttyp-type t))]))
-    (else "?")))
-
 ;;; Stage-1 type rendering ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; foil-new-types values render through the kernel's public reflection
 ;; vocabulary only — predicates, projections, and path codecs — in the
-;; same surface conventions as the legacy renderer.  Unit-qualified
+;; Foil surface conventions. Unit-qualified
 ;; storage keys display as ~/local/path (the pin itself is unprintable).
-(define (new-path-text p)
+(define (path-text p)
   (define parts (ty-ap-decode p))
   (Ifz parts
     (cond
@@ -136,8 +89,16 @@
         (strcat ["~" (print-path (unit-qualified-path-local p))]))
       (else (print-path p)))
     (strcat
-      [(new-path-text (Ix 0 parts)) "["
-       (join-str " " (map new-path-text (drop 1 parts))) "]"])))
+      [(path-text (Ix 0 parts)) "["
+       (join-str " " (map path-text (drop 1 parts))) "]"])))
+
+(define (constructor-text value)
+  (define decoded (brand:decode value))
+  (Ifz (Sz decoded) (atom-str value)
+    (let ((reference (_0 decoded)))
+      (strcat [(quip:print-path (map (lambda (segment)
+        ((_0 segment) (_1 segment))) (_0 reference)))
+        "@x" (showNat (_1 reference))]))))
 
 (define (new-ty-text t)
   (define (many sep ts) (join-str sep (map new-ty-text ts)))
@@ -167,7 +128,7 @@
       (strcat
         [(strcat (map param-text (nt:scheme-parameters t)))
          (new-ty-text (nt:scheme-body t))]))
-    ((nt:type-ref? t) (new-path-text (nt:type-ref-path t)))
+    ((nt:type-ref? t) (path-text (nt:type-ref-path t)))
     ((nt:any-type? t) "any")
     ((nt:pail-type? t) "pail")
     ((nt:pin-type? t)
@@ -177,11 +138,15 @@
       (If (Ifz (nt:nat-aura t) 1 0) "nat"
         (strcat ["nat/" (atom-str (nt:nat-aura t))])))
     ((nt:const-type? t) (const-text (nt:const-value t)))
+    ;; {\ a b}c — arguments inside the braces, the result glued after
+    ;; (tyshow.foil renders the same text; keep them in lockstep)
     ((nt:fun-type? t)
-      (strcat ["{" (many " " (nt:fun-args t)) "; "
-               (new-ty-text (nt:fun-return t)) "}"]))
+      (If (Sz (nt:fun-args t))
+        (strcat ["{\ " (many " " (nt:fun-args t)) "}"
+                 (new-ty-text (nt:fun-return t))])
+        (strcat ["{\}" (new-ty-text (nt:fun-return t))])))
     ((nt:row-type? t)
-      (strcat [(If (nt:row-cstr t) (atom-str (nt:row-cstr t)) "")
+      (strcat [(If (nt:row-cstr t) (constructor-text (nt:row-cstr t)) "")
                "[" (items-text (nt:row-items t)) "]"]))
     ((nt:sum-type? t) (strcat ["(" (many " | " (nt:sum-options t)) ")"]))
     ((nt:array-type? t)
@@ -193,13 +158,12 @@
     ((nt:const-var? t) (strcat ["@" (atom-str (nt:const-var-name t))]))
     ((nt:type-app? t)
       (strcat
-        [(new-path-text (nt:ty-app-base t)) "["
+        [(path-text (nt:ty-app-base t)) "["
          (join-str " " (map argument-text (nt:ty-app-arguments t))) "]"]))
     (else "?")))
 
-;; One renderer for both algebras during the migration.
 (define (ty-text t)
-  (If (nt:type-value? t) (new-ty-text t) (legacy-ty-text t)))
+  (new-ty-text (nt:require-type-value "render" t)))
 
 ;;; PLAN value rendering — one renderer for every stage ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -228,7 +192,7 @@
 (define diag-nl (strcat [10]))
 
 (define (ty-node? v)
-  (And (IsApp v) (ty:type-tag v)))
+  (nt:type-value? v))
 
 ;; The head tag of an error payload: apps carry it in Hd; rows have a
 ;; zero head, their tag sits at Ix 0.
@@ -283,8 +247,7 @@
 ;; itself be a located error payload (per-decl parse recovery); then
 ;; its own message and location win.
 (define (located-inner? tag)
-  (Or (Eq tag "foil-sast-error")
-    (Or (Eq tag "foil-elab-error") (Eq tag "foil-new-elab"))))
+  (Or (Eq tag "foil-sast-error") (Eq tag "foil-new-elab")))
 
 (define (in-decl-line d)
   (define msg (Ix 2 d))
@@ -300,13 +263,7 @@
 (define (diag-lines e)
   (define tag (diag-tag e))
   (cond
-    ((Eq tag "foil-elab-error")
-      (Weld
-        [(diag-flat (Ix 1 e))
-         (strcat ["  at " (at-text (Ix 1 (Ix 2 e)))])]
-        (detail-lines (Ix 3 e))))
-    ;; the new elaborator's single located error: same layout as the
-    ;; legacy one — [tag what ["at" blurb] detail]
+    ;; the elaborator's single located error: [tag what ["at" blurb] detail]
     ((Eq tag "foil-new-elab")
       (Weld
         [(diag-flat (Ix 1 e))
@@ -331,19 +288,8 @@
       (cons "types are not well-formed" (map in-decl-line (Ix 1 e))))
     ((Eq tag "foil-unsupported")
       (cons "unsupported syntax" (map in-decl-line (Ix 1 e))))
-    ;; Per-decl elaboration failures: [[name err] ...], every failed
-    ;; decl of the module at once.
-    ((Eq tag "foil-elab-errors")
-      (cons "the module does not elaborate"
-        (foldl
-          (lambda (acc d)
-            (Weld acc
-              (cons (strcat ["  in " (path-text (Ix 0 d)) ":"])
-                (map (strWeld "    ") (diag-lines (Ix 1 d))))))
-          []
-          (Ix 1 e))))
-    ;; the new elaborator's per-decl failures: a row of in-decl rows,
-    ;; each already carrying its own blurb
+    ;; per-decl elaboration failures: a row of in-decl rows, each
+    ;; already carrying its own blurb
     ((Eq tag "foil-new-elab-errors")
       (cons "the module does not elaborate"
         (map in-decl-line (Ix 1 e))))
@@ -379,8 +325,6 @@
         (strcat ["in " (path-text (Ix 1 d)) ": " (diag-flat msg)])
         (Ix 3 d))))
   (cond
-    ((Eq tag "foil-elab-error")
-      (located (diag-flat (Ix 1 e)) (Ix 1 (Ix 2 e))))
     ((Eq tag "foil-new-elab")
       (located (diag-flat (Ix 1 e)) (Ix 1 (Ix 2 e))))
     ((Eq tag "foil-sast-error")
@@ -404,16 +348,6 @@
       (foldl (lambda (acc d) (Weld acc (in-decl-row d))) [] (Ix 1 e)))
     ((Eq tag "foil-unsupported")
       (foldl (lambda (acc d) (Weld acc (in-decl-row d))) [] (Ix 1 e)))
-    ((Eq tag "foil-elab-errors")
-      (foldl
-        (lambda (acc d)
-          (Weld acc
-            (map
-              (lambda (r)
-                [(Ix 0 r) (Ix 1 r)
-                 (strcat ["in " (path-text (Ix 0 d)) ": " (Ix 2 r)])])
-              (diag-rows (Ix 1 d)))))
-        [] (Ix 1 e)))
     ((Eq tag "foil-new-elab-errors")
       (foldl (lambda (acc d) (Weld acc (in-decl-row d))) [] (Ix 1 e)))
     ((Eq tag "foil-in-module")

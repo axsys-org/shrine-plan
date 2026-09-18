@@ -1,0 +1,597 @@
+- helm
+- http_response
+- http
+
++ http_foot
+  + request
+    : method=str target=str body=str
+  + action
+    & http_foot/action/reply
+      http_foot/action/install
+      http_foot/action/write
+      http_foot/action/wait
+      http_foot/action/journal
+      http_foot/action/value
+      http_foot/action/physical
+      http_foot/action/inspect
+    + reply
+      : response=http_response
+    + install
+      : source=path version=nat target=path back=str
+    + write
+      : pax=path wit=writ back=str
+    + wait
+      : record=myth
+    + journal
+      : before=maybe[nat] limit=nat
+    + value
+      : query=value_read/request
+    + physical
+      : query=physical_read/request
+    + inspect
+      : query=inspect_read/request
+  + task
+    '  Supervisor messages and namespace actions from connections.
+    & feet/task/init
+      feet/task/fact
+      feet/task/page
+      feet/task/journal
+      feet/task/value
+      feet/task/physical
+      feet/task/inspect
+      feet/task/ack
+      http_foot/action/install
+      http_foot/action/write
+      http_foot/action/wait
+      http_foot/action/journal
+      http_foot/action/value
+      http_foot/action/physical
+      http_foot/action/inspect
+  + pending
+    ' Text r<serial> keys belong to ordinary HTTP namespace records.
+    ' Numeric serial keys correlate read-only supervisor requests.
+    : key=iota conn=nat
+  + ack
+    & http_foot/ack/request
+      http_foot/ack/write
+      http_foot/ack/install
+      http_foot/ack/cleanup
+    + request
+      : key=iota
+    + write
+      : conn=nat back=str
+    + install
+      : conn=nat back=str
+    + cleanup
+      :
+  + fault
+    : reason=str
+  + crlf
+    ^ str
+    | str/from_atom 2573
+  + bar
+    \ text=nat
+    ^ nat
+    | add text (bex (mul 8 (wid text)))
+  + unbar
+    \ bytes=nat
+    ^ str
+    | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + split
+    \ separator=nat text=str
+    ^ row[str]
+    | str/split_byte separator text
+  + ascii_lower
+    \ text=str
+    ^ str
+    | str/ascii_lower text
+  + trim
+    \ text=str
+    ^ str
+    | str/trim_ascii text
+  + find
+    \ needle=str text=str
+    ^ maybe[nat]
+    | str/find needle text
+  + hex
+    \ c=nat
+    ^ maybe[nat]
+    = digit | hex/value c
+    ? (eq digit 16) .none
+    | ./some digit
+  + decode
+    \ plus=bool text=str
+    ^ str
+    % i=nat 0 out=str ""
+    ? (eq i text.len) out
+    = c text.at(i)
+    ? (eq c 37)
+      ?> (./some hi) (http_foot/hex text.at(i.inc))
+          (error (http_foot/fault "Invalid percent escape"))
+      ?> (./some lo) (http_foot/hex text.at((add i 2)))
+          (error (http_foot/fault "Invalid percent escape"))
+      = byte (add (mul 16 hi) lo)
+      ? (eq byte 0) (error (http_foot/fault "NUL is not valid text"))
+      | _ (add i 3) out.snoc_byte(byte)
+    | _ i.inc out.snoc_byte((? plus (? (eq c 43) 32 c) c))
+  + fields
+    \ body=str
+    ^ row[[key=str value=str]]
+    | (http_foot/split 38 body).map
+    \ field
+    = split (http_foot/find "=" field)
+    ? split
+     > (./some at)
+      [(http_foot/decode .true field.slice(0 at))
+       (http_foot/decode .true field.slice(at.inc field.len))]
+     > .none [(http_foot/decode .true field) ""]
+  + field
+    \ key=str fields=row[[key=str value=str]]
+    ^ str
+    % i=nat 0
+    ? (eq i fields.len) ""
+    = [name value] fields.at(i)
+    ? (equal name key) value
+    | _ i.inc
+  + target
+    \ raw=str
+    ^ path
+    = text (http_foot/decode .false raw)
+    = absolute=str
+        ? (eq text.len 0) "/"
+        ? (eq text.at(0) 47) text
+        | str/cat_all ["/" text]
+    ?> (./some path) (path_parse absolute)
+        ; (error (http_foot/fault "Invalid namespace path"))
+        []
+    path
+  + route_is
+    \ prefix=str target=str
+    ^ bool
+    ? (equal prefix "/") (eq target.at(0) 47)
+    ? (equal prefix target) .true
+    | equal[str] target.slice(0 prefix.len.inc) prefix.cat("/")
+  + header_end
+    ' The framing delimiter is fixed: compare its bytes without slicing
+    ' the remaining large request atom at every candidate offset.
+    \ text=str
+    ^ maybe[nat]
+    % i=nat 0
+    ^ maybe[nat]
+    ? (gt (add i 4) text.len) .none
+    ? !(eq text.at(i) 13) (_ i.inc)
+    ? !(eq text.at(i.inc) 10) (_ i.inc)
+    ? !(eq text.at((add i 2)) 13) (_ i.inc)
+    ? !(eq text.at((add i 3)) 10) (_ i.inc)
+    | ./some (add i 4)
+  + content_length
+    \ headers=str
+    ^ nat
+    = lines (http_foot/split 10 headers)
+    % i=nat 1 length=maybe[nat] .none
+    ? (ge i lines.len)
+      ? length
+       > (./some n) n
+       > .none 0
+    = line (http_foot/trim lines.at(i))
+    ? (eq line.len 0)
+      | _ i.inc length
+    ?> (./some colon) (http_foot/find ":" line)
+        (error (http_foot/fault "Malformed header"))
+    = name (http_foot/ascii_lower line.slice(0 colon))
+      value (http_foot/trim line.slice(colon.inc line.len))
+    ? (equal[str] name "transfer-encoding")
+      | error (http_foot/fault "Transfer-Encoding is unsupported")
+    ? !(equal[str] name "content-length")
+      | _ i.inc length
+    ? (maybe/is_some length)
+      | error (http_foot/fault "Duplicate Content-Length")
+    ?> (./some n) (nat/parse value)
+        (error (http_foot/fault "Invalid Content-Length"))
+    ? (gt n 1048576) (error (http_foot/fault "Request body too large"))
+    | _ i.inc (./some n)
+  + bad_request
+    \ reason=str
+    ^ http_foot/request
+    ; (error (http_foot/fault reason))
+    | http_foot/request "" "" ""
+  + request_line_valid
+    ' Validate before splitting/packing a target ending in NUL, which
+    ' would otherwise lose that byte and alias a different request.
+    \ line=str
+    ^ bool
+    % i=nat 0
+    ? (eq i line.len) .true
+    = byte line.at(i)
+    ? ((lt byte 32) || (eq byte 127))
+      ? (? (eq byte 13) (eq i.inc line.len) .false) .true
+      .false
+    | _ i.inc
+  + request_chunk
+    ' Read returns a length-preserving high sentinel. Removing it into a
+    ' packed str would erase a terminal NUL before line validation. Reject
+    ' that already-unrepresentable input at each socket chunk boundary.
+    \ bytes=nat
+    ^ str
+    = length (wid bytes)
+    ? (? (gt length 1) (eq (load8 (sub length 2) bytes) 0) .false)
+      ; (error (http_foot/fault "NUL at request chunk boundary"))
+      ""
+    | http_foot/unbar bytes
+  + read_request
+    \ fd=nat
+    ^ http_foot/request
+    % input=str ""
+    ^ http_foot/request
+    = end (http_foot/header_end input)
+    ? end
+     > (./some at)
+      ? (gt at 65536) (http_foot/bad_request "Headers too large")
+      = length (http_foot/content_length input.slice(0 at))
+      ? (ge input.len (add at length))
+        = line (http_foot/split 10 input).at(0)
+        ? !(http_foot/request_line_valid line) (http_foot/bad_request "Invalid request target bytes")
+        = words (http_foot/split 32 (http_foot/trim line))
+        ? !(eq words.len 3) (http_foot/bad_request "Malformed request line")
+        ? !(equal[str] words.at(2) "HTTP/1.0")
+          ? !(equal[str] words.at(2) "HTTP/1.1")
+            (http_foot/bad_request "Unsupported HTTP version")
+          | http_foot/request words.at(0) words.at(1) input.slice(at length)
+        | http_foot/request words.at(0) words.at(1) input.slice(at length)
+      = ;bytes (Read fd 16384)
+      ? (eq bytes 0) (http_foot/bad_request "Incomplete request body")
+      | _ input.cat((http_foot/request_chunk bytes))
+     > .none
+      ? (gt input.len 65536) (http_foot/bad_request "Headers too large")
+      = ;bytes (Read fd 16384)
+      ? (eq bytes 0) (http_foot/bad_request "Incomplete request headers")
+      | _ input.cat((http_foot/request_chunk bytes))
+  + encode
+    \ response=http_response
+    ^ nat
+    | http_foot/bar
+    | str/cat_all
+      ["HTTP/1.0 " (nat/show response.status) " Response" http_foot/crlf
+       "Content-Type: " (str/from_atom response.ctype) http_foot/crlf
+       "Content-Length: " (nat/show (wid response.body)) http_foot/crlf
+       "Connection: close" http_foot/crlf http_foot/crlf (str/from_atom response.body)]
+  + connection
+    '  Plan locally; ask the foot only for namespace work.
+    \ config=http_foot/config fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      foot caps.at(0)
+    = response=http_response
+        ? (Try http_foot/read_request fd)
+         > (./err _) (http_driver/response 400 "Malformed HTTP request")
+         > (./ok parsed)
+          =   ;planned
+            | Try[http_foot/request http_foot/action]
+              (\ r=http_foot/request
+                | http_foot/dispatch config.routes r
+                    (div (Now 0) 1000000000))
+              parsed
+          ? planned
+           > (./err _)
+            | http_driver/response 400 "Invalid request"
+           > (./ok action)
+            ? action
+             > (./reply ready) ready
+            ; (SendCaps foot action [0])
+            = ;[answer extra] (Recv[http_response] 0)
+            answer
+    ; (Try (\ response=http_response (Write fd (http_foot/encode response))) response)
+    ; (CloseFd fd)
+    | CloseHandle foot
+  + listener
+    \ config=http_foot/config fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      foot caps.at(0)
+    % ignored=nat 0
+    = ;connection (Accept fd)
+      ;actor (Spawn (http_foot/connection config connection))
+    ; (SendCaps actor root [foot])
+    ; (CloseHandle actor)
+    | _ 0
+  + reply
+    \ conn=nat response=http_response
+    ^ nat
+    ; (Send conn response)
+    | CloseHandle conn
+  + inspect_renderer
+    ' One renderer retains the immutable Grove registry, not a fresh actor
+    ' and transferred renderer closure per request. The foot/coordinator
+    ' remains free to acknowledge writes and deliver bounded reads.
+    \ render={\ either[iota inspect_read/result]}http_response self=nat
+    ^ nat
+    % ignored=nat 0
+    = ;[result caps] (Recv[either[iota inspect_read/result]] 0)
+      response
+        ? (Try render result)
+         > (./ok ready) ready
+         > (./err _) (http_driver/response 500 "Inspection rendering failed")
+    ; (http_foot/reply caps.at(0) response)
+    | _ 0
+  + value_error
+    \ reason=iota status=nat
+    ^ http_response
+    | http_response status (str/to_atom (value_read/error_json reason)) "application/json; charset=utf-8"
+  + value_response
+    \ result=either[iota value_read/chunk]
+    ^ http_response
+    ? result
+     > (./err reason) (http_foot/value_error reason (value_read/status reason))
+     > (./ok chunk)
+       = ;body (str/to_atom (value_read/json chunk))
+       | http_response 200 body "application/json; charset=utf-8"
+  + physical_response
+    \ result=either[iota str]
+    ^ http_response
+    ? result
+     > (./err reason) (http_foot/value_error reason (physical_projection/status reason))
+     > (./ok body)
+       | http_response 200 (str/to_atom body) "application/json; charset=utf-8"
+  + finish
+    \ parent=nat binding=axal[saga] pending=row[http_foot/pending] queue=row[http_foot/ack]
+    ^ [pending=row[http_foot/pending] queue=row[http_foot/ack]]
+    % i=nat 0 left=row[http_foot/pending] [] acks=row[http_foot/ack] queue
+    ? (eq i pending.len) [left acks]
+    = item pending.at(i)
+    ? (maybe/is_some (dig_of item.key))
+      | _ i.inc left.snoc(item) acks
+    =
+      response=maybe[http_response]
+        ? binding.get([item.key])
+         > (./some version) (http_driver/result (./known (unpin version.myth)))
+         > .none .none
+    ? response
+     > .none (_ i.inc left.snoc(item) acks)
+     > (./some ready)
+      ; (http_foot/reply item.conn ready)
+      ; (Send parent (feet/gift/pass [item.key] .cull))
+      | _ i.inc left acks.snoc(.cleanup)
+  + run
+    \ initial=feet/task/init self=nat
+    ^ nat
+    | http_foot/run_with http_foot/empty initial self
+  + run_with
+    \ config=http_foot/config initial=feet/task/init self=nat
+    ^ nat
+    = root=path
+        ? initial.ax.fil
+         > (./some version)
+          | (unpin version.myth).path_at(['namespace_root]).fall []
+        []
+      port=nat
+        ? initial.ax.fil
+         > (./some version) (unpin version.myth).nat_at(['port] 0)
+        0
+      ;fd (Listen port)
+      ;pump (Spawn (http_foot/listener config fd))
+      ;renderer (Spawn (http_foot/inspect_renderer config.inspect))
+    ; (SendCaps pump root [0])
+    ; (CloseHandle pump)
+    ; (Trace "HTTP foot listening" 0)
+    % serial=nat 0 pending=row[http_foot/pending] [] queue=row[http_foot/ack] []
+    = ;[message caps] (Recv[http_foot/task] 0)
+    ? message
+     > (http_foot/action/install source version target back)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/install source version target))
+      | _ serial.inc pending
+          queue.snoc((http_foot/ack/install conn back))
+     > (http_foot/action/write pax wit back)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/poke pax wit))
+      | _ serial.inc pending queue.snoc((http_foot/ack/write conn back))
+     > (http_foot/action/wait record)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+        key=iota ($ts (str/cat_all ["r" (nat/show serial)]))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/pass [key] (writ/make record)))
+      | _ serial.inc pending.snoc((http_foot/pending key conn))
+        queue.snoc((http_foot/ack/request key))
+     > (http_foot/action/journal before limit)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/journal serial before limit))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/value query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/value serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/physical query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/physical serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/inspect query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/inspect serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/inspect request result)
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (SendCaps renderer result [item.conn])
+          ; (CloseHandle item.conn)
+          out
+      | _ serial left queue
+     > (feet/task/physical request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try http_foot/physical_response result)
+           > (./ok ready) ready
+           > (./err _) (http_foot/value_error 'read_failed 500)
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
+     > (feet/task/value request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try http_foot/value_response result)
+           > (./ok ready) ready
+           > (./err _) (http_foot/value_error 'read_failed 500)
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
+     > (feet/task/journal request result)
+      ; (helm/supervisor/close_caps caps)
+      = response
+          ? (Try config.journal result)
+           > (./ok ready) ready
+           > (./err _) (http_driver/response 500 "Journal rendering failed")
+        empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn response)
+          out
+      | _ serial left queue
+     > (./fact binding)
+      = ;[left acks] (http_foot/finish initial.parent binding pending queue)
+      | _ serial left acks
+     > (./ack err)
+      ? (eq queue.len 0) (_ serial pending queue)
+      = head queue.at(0)
+        tail queue.drop(1)
+      ? head
+       > (./install conn back)
+        = response
+            ? err
+             > .none (http_driver/back back)
+             > (./some cause)
+              = reason=str
+                  ? cause
+                   > fault=helm/supervisor/rejection
+                    | str/from_atom (iota_show fault.reason)
+                  "installation_failed"
+              | http_driver/response 409
+                  (str/cat_all ["Installation rejected: " reason
+                    ". Refresh the Grove template before retrying."])
+        ; (http_foot/reply conn response)
+        | _ serial pending tail
+       > (./write conn back)
+        = response
+            ? err
+             > .none (http_driver/back back)
+             > (./some _) (http_driver/response 500 "Namespace write rejected")
+        ; (http_foot/reply conn response)
+        | _ serial pending tail
+       > (./request key)
+        ? err
+         > .none (_ serial pending tail)
+         > (./some _)
+          = empty=row[http_foot/pending] []
+            ;left
+              | pending.fold empty
+              \ ;out=row[http_foot/pending] item=http_foot/pending
+              ^ row[http_foot/pending]
+              ? !(equal item.key key) out.snoc(item)
+              ; (http_foot/reply item.conn (http_driver/response 500 "Namespace request rejected"))
+              out
+          | _ serial left tail
+       > .cleanup (_ serial pending tail)
+    ; (helm/supervisor/close_caps caps)
+    | _ serial pending queue
+
+  + route
+    : prefix=str plan={\ http_foot/request nat}http_foot/action
+  + config
+    : routes=row[http_foot/route]
+      inspect={\ either[iota inspect_read/result]}http_response
+      journal={\ either[iota helm/journal_page]}http_response
+  + asset
+    : url=str bytes=nat mime=str
+  + asset_body
+    \ url=str assets=row[http_foot/asset]
+    ^ str
+    % idx=nat 0
+    ? (eq idx assets.len) ""
+    = item assets.at(idx)
+    ? (equal url item.url) (http_foot/unbar item.bytes)
+    | _ idx.inc
+  + empty
+    ^ http_foot/config
+    | http_foot/config []
+      (\ ignored (http_driver/response 404 "Not found"))
+      (\ ignored (http_driver/response 404 "Not found"))
+  + matches
+    \ prefix=str url=str
+    ^ bool
+    ? (equal prefix "/") .true
+    | http_foot/route_is prefix url
+  + dispatch
+    \ routes=row[http_foot/route] request=http_foot/request now=nat
+    ^ http_foot/action
+    = url (http_foot/split 63 request.target).at(0)
+    % idx=nat 0 best=maybe[http_foot/route] .none
+    ^ http_foot/action
+    ? (eq idx routes.len)
+      ?> (./some hit) best
+        | ./reply (http_driver/response 404 "Not found")
+      = run hit.plan
+      | run request now
+    = item routes.at(idx)
+      longer
+        ?> (./some hit) best .true
+        | gt item.prefix.len hit.prefix.len
+      next=maybe[http_foot/route]
+        ? (and longer (http_foot/matches item.prefix url))
+          | ./some item
+        best
+    | _ idx.inc next
+  + route_collision
+    \ prefix=str routes=row[http_foot/route] count=nat
+    ^ bool
+    % idx=nat 0
+    ? (eq idx count) .false
+    = item routes.at(idx)
+    ? (equal[str] prefix item.prefix) .true
+    | _ idx.inc
+  + add_routes
+    \ extra=row[http_foot/route] config=http_foot/config
+    ^ http_foot/config
+    = routes=row[http_foot/route] config.routes.weld(extra)
+    % idx=nat 0
+    ^ http_foot/config
+    ? (eq idx routes.len) config.set_routes(routes)
+    = item routes.at(idx)
+    ? (http_foot/route_collision item.prefix routes idx)
+      | http_foot/invalid_routes config
+    | _ idx.inc
+  + invalid_routes
+    \ config=http_foot/config
+    ^ http_foot/config
+    ; (error (http_foot/fault "Duplicate HTTP route"))
+    config

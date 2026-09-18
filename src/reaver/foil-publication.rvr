@@ -1,0 +1,209 @@
+;;;; Freeze the complete definition batch before any elaboration.
+;;;; Resolver names select modules; only supplied Shrine roots name definitions.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind ca (#module cairn))
+(#bind context (#module foil-context))
+(#bind driver (#module foil-new-env))
+(#bind sast (#module foil-sast))
+(#bind subject (#module foil-subject))
+(#bind entry (#module foil-entry))
+(#bind elab (#module foil-new-elab))
+(#bind core (#module foil-type-core))
+(#bind nt (#module foil-new-types))
+(#bind host (#module foil-builtins))
+
+(define plan-tag "foil/prepared-publication/v2")
+(define compiled-tag "foil/compiled-publication/v2")
+
+;; previous receives a canonical aura/payload path and returns its current
+;; x data case (zero when absent). Imports supplied as pinned artifacts reuse
+;; their assigned moments and are never included in the new revision batch.
+(define (prepare system compiler read-rex roots artifacts previous)
+  (define (artifact name)
+    (find (lambda (pair) (Equal name (_0 pair))) artifacts))
+  (define source-roots
+    (filter (lambda (pair) (Nil (artifact (_0 pair)))) roots))
+  (Ifz (Sz source-roots) 0
+    (DeepSeq (map (lambda (pair)
+      (define authority (_0 (_1 (_0 source-roots))))
+      (If (Equal (_0 (_1 pair)) authority) 0
+        (error ["mixed-publication-authorities" (_0 pair)]))) source-roots) 0))
+  (define sources
+    (force (map (lambda (pair) [(_0 pair) (read-rex (_0 pair))]) source-roots)))
+  (define (source name)
+    (_1 (need (find (lambda (pair) (Equal name (_0 pair))) sources))))
+  (define (definitions pair)
+    (define root (_1 pair))
+    (define decls (sast:parse-module-sast 0 (source (_0 pair))))
+    (driver:check-declarations decls)
+    (DeepSeq
+      (map (lambda (import)
+        (define name (driver:import-module import))
+        (If (find (lambda (binding) (Equal name (_0 binding))) roots)
+          0 (error ["unresolved-publication-import" (_0 pair) name])))
+        (filter driver:mod-import? decls))
+      (map (lambda (decl)
+        (Weld root (map (lambda (part) ["ts" part]) (_1 decl))))
+        (filter driver:mod-decl? decls))))
+  (define names (map (lambda (pair) [(_0 pair) (definitions pair)]) source-roots))
+  (define expected
+    (force (foldl (lambda (all pair)
+      (foldl (lambda (out path)
+        (If (ca:getax path out)
+          (error ["duplicate-publication-definition" path])
+          (let ((version (previous path)))
+            (If (IsNat version) (ca:putax path version out)
+              (error ["invalid-publication-predecessor" path version])))))
+        all (_1 pair))) ca:empty-ax names)))
+  (define assigned
+    (map (lambda (pair)
+      [(_0 pair) (map (lambda (path)
+        [path (Inc (_0 (ca:getax path expected)))]) (_1 pair))]) names))
+  (define imported
+    (map (lambda (pair)
+      (define perc
+        (If (IsPin (_1 pair)) (driver:require-perc (Unpin (_1 pair)))
+          (error ["publication-import-requires-pin" (_0 pair)])))
+      (define unit (subject:sut-context (driver:perc-subject perc)))
+      (Ifz unit (error ["unversioned-publication-import" (_0 pair)])
+        [(_0 pair) (rowify (ca:tapax (_1 unit)))])) artifacts))
+  (define ctx
+    (context:create system compiler (Pin (sort cmp-total sources)) roots
+      (Weld assigned imported) artifacts))
+  (force (plan-tag ctx sources names expected 0)))
+
+(define (checked plan)
+  (If (And (Eq plan-tag (Hd plan)) (Eq 5 (Sz plan))) plan
+    (error "invalid-prepared-publication")))
+(define (compilation-context plan) (_0 (checked plan)))
+(define (expected-cases plan) (_3 (checked plan)))
+(define (definition-names plan) (_2 (checked plan)))
+
+;; The system selection is prepared before elaboration, from the complete
+;; declaration set. Freeze the loader once; its preliminary plan contains
+;; no compiled artifacts and is never exposed as a publication.
+(define (compare-path left right)
+  (cond
+    ((Nil (Sz left)) (Ifz (Sz right) sym-eq sym-lt))
+    ((Nil (Sz right)) sym-gt)
+    ((host:iota-eq (_0 left) (_0 right))
+      (compare-path (drop 1 left) (drop 1 right)))
+    ((host:iota-lt (_0 left) (_0 right)) sym-lt)
+    (else sym-gt)))
+(define (assign-system names)
+  (Pin (map (lambda (name) [name 1]) (sort compare-path names))))
+
+(define (prepare-system compiler read-rex roots)
+  (DeepSeq (map (lambda (pair)
+    (If (Equal ["ts" "sys"] (_0 (_1 pair))) 0
+      (error ["system-module-outside-authority" (_0 pair)]))) roots) 0)
+  (define preliminary
+    (prepare (Pin "unpublished-system-preparation") compiler read-rex
+      roots [] (lambda (path) 0)))
+  (define names
+    (foldl Weld [] (map (lambda (pair)
+      (map (lambda (path)
+        (map (lambda (segment) ((_0 segment) (_1 segment))) path))
+        (_1 pair))) (definition-names preliminary))))
+  (define selection
+    (assign-system
+      (Weld names (map (lambda (name)
+        (Weld [("ts" "sys") ("ts" "types")]
+          (map (lambda (part) ("ts" part)) name))) core:system-names))))
+  (define (frozen name)
+    (_1 (need (find (lambda (pair) (Equal name (_0 pair))) (_1 preliminary)))))
+  (define prepared
+    (prepare selection compiler frozen roots [] (lambda (path) 0)))
+  (define expected
+    (foldl (lambda (out name)
+      (define path (Weld [["ts" "sys"] ["ts" "types"]]
+        (map (lambda (part) ["ts" part]) name)))
+      (If (ca:getax path out)
+        (error ["duplicate-system-definition" path])
+        (ca:putax path 0 out))) (expected-cases prepared) core:system-names))
+  (force (plan-tag (_0 prepared) (_1 prepared) (_2 prepared) expected 1)))
+
+;; Frozen source trees, including generated modules, are the only loader.
+;; A missing artifact/source cannot silently fall through to the filesystem.
+(define (compile plan cache)
+  (define ctx (compilation-context plan))
+  (define (read name)
+    (define found (find (lambda (pair) (Equal name (_0 pair))) (_1 plan)))
+    (If found (_1 (_0 found)) (error ["unprepared-publication-source" name])))
+  (define result
+    (foldl (lambda (state pair)
+      (define result (driver:compile-context ctx read (_0 state) (_0 pair)))
+      [(_0 result) (snoc [(_0 pair) (Pin (_1 result))] (_1 state))])
+      [cache []] (_2 plan)))
+  (force (compiled-tag (Pin plan) (_0 result) (_1 result))))
+
+;; Recheck every predecessor against the store selected for commit. Neither
+;; compiler cache results nor partially built artifacts are a publication.
+(define (verify-predecessors compiled previous)
+  (If (Nil (And (Eq compiled-tag (Hd compiled)) (Eq 3 (Sz compiled))))
+    (error "invalid-compiled-publication")
+    (DeepSeq
+      (map (lambda (pair)
+        (If (Equal (_1 pair) (previous (_0 pair))) 0
+          (error ["stale-publication-definition" (_0 pair)])))
+        (rowify (ca:tapax (expected-cases (Unpin (_0 compiled))))))
+      compiled)))
+
+(define (definition-records compiled)
+  (define plan (Unpin (_0 compiled)))
+  (define ctx (compilation-context plan))
+  (define native
+    (Ifz (_4 plan) []
+      (let* ((sut (core:system-subject ctx))
+             (unit (subject:sut-context sut))
+             (keys (map (lambda (name) (Weld (subject:sut-root sut) name))
+               core:system-names))
+             (artifact (Pin (driver:native-artifact "$system/core" sut keys))))
+        (map (lambda (name)
+          (define key (Weld (subject:sut-root sut) name))
+          [(map (lambda (part) ((_0 part) (_1 part)))
+             (context:public-path unit name))
+           0 (elab:reflect-in-subject sut 0 (nt:type-ref key)) artifact])
+          core:system-names))))
+  (foldl (lambda (records binding)
+    (define name (_0 binding))
+    (define artifact (_1 binding))
+    (define perc (driver:require-perc (Unpin artifact)))
+    (define sut (driver:perc-subject perc))
+    (define unit (context:module ctx name))
+    (define names (_1 (need (find (lambda (pair) (Equal name (_0 pair)))
+      (definition-names plan)))))
+    (Weld records (map (lambda (path)
+      (define prior (_0 (ca:getax path (expected-cases plan))))
+      (define local (need (context:local-definition unit [path (Inc prior)])))
+      (define key (subject:root-path sut local))
+      (define part (entry:entry-parts sut key))
+      [(map (lambda (segment) ((_0 segment) (_1 segment))) path)
+       prior (elab:reflect-in-subject sut 0 (subject:tc-ty (entry:ent-tc part)))
+       artifact]) names))) native (_2 compiled)))
+
+;; Foil owns history validation and the atomic store replacement. Products
+;; keep the compiler's expected predecessor, descriptor and pinned artifact
+;; together; no record can be exposed by an incomplete compilation.
+(define (publish policy slot authority compiled now block state)
+  ((driver:get-perc ["compiler_publication" "publish"] policy)
+    slot authority (force (definition-records compiled)) now block state))
+
+(define (publish-local policy slot compiled now block state)
+  (define ctx (compilation-context (Unpin (_0 compiled))))
+  ((driver:get-perc ["compiler_publication" "local"] policy)
+    (context:publication-key ctx) slot (force (definition-records compiled))
+    now block state))
+
+(define (publish-system policy slot compiled now block)
+  (define ctx (compilation-context (Unpin (_0 compiled))))
+  ((driver:get-perc ["compiler_publication" "system"] policy)
+    (context:publication-key ctx) slot (force (definition-records compiled))
+    now block))
+
+(#export prepare compilation-context expected-cases definition-names
+         compile verify-predecessors definition-records publish publish-local
+         prepare-system assign-system publish-system)

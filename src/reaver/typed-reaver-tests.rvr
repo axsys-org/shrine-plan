@@ -11,8 +11,8 @@
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
-(#bind ty (#module foil-types))
-(#bind core (#module foil-core-types))
+(#bind nt (#module foil-new-types))
+(#bind core (#module foil-type-core))
 
 (#bind typed-reaver (#module typed-reaver))
 (#import typed-reaver)
@@ -110,7 +110,7 @@ assert(Equal malformed-elements (row-id-ffi malformed-elements))
   (Try (lambda (ignored) (plus-ffi (Pin 1) 2)) 0))
 (define bad-output
   (Try (boundary-result core:core-subject ["typed" "bad-output"]
-         (ty:TNAT 0))
+         (nt:tnat 0))
     (Pin 1)))
 assert(Eq 1 (Hd bad-input))
 assert(Eq 1 (Hd bad-output))
@@ -123,11 +123,11 @@ assert(Eq "output" (_1 (_2 (_0 bad-output))))
   (Try (install-foil-provides foil-api) typed-subject))
 assert(Eq 1 (Hd collision))
 
-;; Public type parsing covers all v1 constructors, including rank-1 All.
-assert(Equal (ty:TPIN (ty:TNAT 0))
+;; Public type parsing covers all supported constructors, including rank-1 All.
+assert(Equal (nt:tpin (nt:tnat 0))
   (parse-type "test" '(Pin Nat)))
-assert(Eq "TQUA" (ty:type-tag
-  (parse-type "test" '(All (a) (-> ((Row a)) (Either a Unit))))))
+assert(nt:scheme?
+  (parse-type "test" '(All (a) (-> ((Row a)) (Either a Unit)))))
 
 ;; Malformed annotations are rejected by the parser with a located error.
 (define malformed-type (Try (parse-type "malformed") '(Row Nat Nat)))
@@ -144,13 +144,13 @@ assert(Eq 1 (Hd malformed-type))
 
 (define wrong-return
   (Try (check-expr "wrong-return" 0 [] '1)
-    (ty:TPIN (ty:TNAT 0))))
+    (nt:tpin (nt:tnat 0))))
 (define wrong-call-argument
   (Try (check-expr "wrong-call" add-global [] '(Add [1] 2))
-    (ty:TNAT 0)))
+    (nt:tnat 0)))
 (define wrong-call-arity
   (Try (check-expr "wrong-arity" add-global [] '(Add 1))
-    (ty:TNAT 0)))
+    (nt:tnat 0)))
 (define untyped-global-use
   (Try (synth-expr "untyped-global" raw-global []) "raw-global"))
 (define unknown-macro-use
@@ -165,5 +165,82 @@ assert(Eq 1 (Hd wrong-call-arity))
 assert(Eq 1 (Hd untyped-global-use))
 assert(Eq 1 (Hd unknown-macro-use))
 assert(Eq 1 (Hd unsupported-local-recursion))
+
+;;; New-kernel contracts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(#bind builtins (#module foil-builtins))
+(#bind types (#module typed-reaver-types))
+
+(define (new-type? typ)
+  (And (nt:type-value? typ)
+    (Nil (nt:type-any? (lambda (node) (Nil (nt:monotype? node)))
+      (types:body typ)))))
+(define (check-builtins z)
+  (define paths (subject-order builtins:default-subject))
+  (DeepSeq (map (lambda (path)
+    (define tc (got-entry-tc path builtins:default-subject))
+    (cond
+      ((Eq "TC_FFI" (Hd tc)) assert(new-type? (tc-ty tc)))
+      ((Eq "TC_TYP" (Hd tc)) assert(new-type? (tc-typ-inner tc)))
+      (else 1))) paths) 1))
+assert(check-builtins 0)
+assert(nt:fun-type? (_1 (_0 foil-api)))
+assert(typed-info? (typed-info (nt:tnat 0)))
+assert(Nil (typed-info? ["typed-reaver/v1" (nt:tnat 0)]))
+assert(Nil (typed-info? [typed-info-tag ("/foil/types/tnat" 0)]))
+(define stale-global
+  (Pin ["stale" 1 "value" 0 ["typed-reaver/v1" (nt:tnat 0)]]))
+assert(Eq 1 (Hd (Try (synth-expr "stale" stale-global []) "stale")))
+assert(Eq 1 (Hd (Try (parse-type "rank") '(Row (All (a) a)))))
+assert(Eq 1 (Hd (Try (parse-type "duplicate") '(All (a a) a))))
+
+assert(Equal (nt:tconst 3) (synth-expr "group" 0 [] '(3)))
+assert(Eq 1 (Hd (Try (parse-type "shadow") '(All (a) (All (a) a)))))
+assert(Nil (typed-info?
+  [typed-info-tag (nt:tarr ("/foil/types/tnat" 0))]))
+
+(define/typed (partial-add x) (-> (Nat) Nat) ((Add 1) x))
+assert(Equal (nt:tnat 0)
+  (synth-expr "pinned-call" 0 [] '((Pin Inc) 4)))
+(define/typed (renamed-id x) (All (other) (-> (other) other))
+  (typed-id x))
+(define/typed (choose-first x y) (All (a b) (-> (a b) a)) x)
+(define partial-type
+  (types:apply-type
+    (parse-type "partial" '(All (a b) (-> (a b) a))) [(nt:tconst 7)]))
+assert(types:compatible?
+  (parse-type "partial" '(All (other) (-> (other) Nat))) partial-type)
+assert(Equal (nt:tnat 0)
+  (types:apply-type partial-type [(nt:tpin (nt:tnat 0))]))
+assert(Eq 6 (partial-add 5))
+assert(Eq 8 (renamed-id 8))
+assert(Eq 1 (Hd (Try (check-expr "rigid" 0
+    [["x" (nt:type-var "a")]] 'x) (nt:type-var "b"))))
+assert(Eq 1 (Hd (Try (synth-expr "inconsistent" 0 [])
+  '(Equal 1 (Pin 1)))))
+assert(types:compatible? nt:tany (nt:tpin (nt:tnat 0)))
+assert(types:compatible? (nt:tnat 0) nt:tany)
+
+;; The validator resolves declarations, but never inspects their fields.
+(define (fit typ val)
+  (types:shape-fits core:default-type-world [] typ val))
+assert(Nil (fit core:unit-ty "/unit"))
+assert(Nil (Nil (fit core:unit-ty "/boot/unit")))
+assert(Nil (fit (core:maybe-of (nt:tnat 0))
+  ("/boot/maybe/some" (Pin 9))))
+assert(Nil (fit (core:maybe-of (nt:tnat 0)) "/boot/maybe/none"))
+assert(Nil (Nil (fit (core:maybe-of (nt:tnat 0)) "none")))
+assert(Nil (fit (core:list-of (nt:tnat 0))
+  ("cons" (Pin 1) (error "must not inspect tail"))))
+assert(Nil (fit (nt:tarr (nt:tnat 0)) [(error "must not inspect item")]))
+assert(Nil (fit (nt:tpin (nt:tnat 0)) (Pin [1 2])))
+(define local-shape
+  (nt:trow "/typed/local" [(nt:trow-item 0 (nt:tnat 0))]))
+(define local-subject
+  (insert-tc ["typed" "local"] wack-span
+    (tc-typ (nt:mono local-shape)) core:core-subject))
+assert(Equal ("/typed/local" (Pin 1))
+  (boundary-result local-subject ["test"]
+    (nt:type-ref ["typed" "local"]) ("/typed/local" (Pin 1))))
 
 (print "all typed Reaver tests passed")

@@ -1,0 +1,253 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Native compiler adapter exercised through compiled Foil policy.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(define (require pred fail) (If pred 0 fail))
+(define (ts s) ("ts" s))
+(#bind backend (#module foil-grove-backend))
+(#bind source (#module foil-source))
+(#bind driver (#module foil-new-env))
+
+(define (run local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define checks (grove_fixture:module code "tests/grove_backend"))
+  (define (check name) (driver:get-perc ["grove_backend_checks" name] checks))
+  (define (path parts) (map ts parts))
+  (define (parse text)
+    (define result ((driver:get-perc ["grove" "parse"] policy) text))
+    (require (Eq "ok" (Hd result)) (error ["fixture parse failed" result]))
+    (_0 result))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define root (path ["src" "example"]))
+  (define (build lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified root) (parse text)))
+  (define (success result)
+    (require (Eq "ok" (Hd result)) (error ["build failed" result]))
+    (_0 result))
+  (define fixture (read-text-file "grove/backend.grove"))
+  (define records (success (build missing root fixture)))
+  assert(Gt (Sz records) 3)
+  (define (record rows names) (grove_fixture:record local rows (path names)))
+  (define token (record records ["src" "example" "token"]))
+  (define counter (record records ["src" "example" "counter"]))
+  (define label (record records ["src" "example" "label"]))
+  ;; The row type exports itself, three field accessors and the generated
+  ;; branded-pail conversion added by the current elaborator.
+  assert(Eq 5 ((check "size") token))
+  assert(Eq 2 ((check "size") counter))
+  assert(Eq 0 ((check "size") label))
+  assert(Equal "Counter" ((check "title") counter))
+  assert(Equal 7 ((check "count") counter))
+  assert(Equal 42 (((check "export") (path ["read"]) counter)
+    (((check "export") (path ["make"]) counter) 42)))
+
+  ;; A fresh host cache has only the policy/prelude. External declarations
+  ;; come exclusively from stored records; no producer source is consulted.
+  (define restored (backend:prepare code))
+  (define lookup (grove_fixture:lookup local records))
+  (define (import alias target)
+    (strcat ["#import " alias "=" 34 target 34 10]))
+  (define consumer (strcat
+    [(import "tok" "/src/example/token")
+     (import "count" "/src/example/counter")
+     "
+  use =
+    @slot
+    ! foil
+    + value
+      ^ tok
+      | count/make 73
+    + result
+      ^ nat
+      | count/read use/value
+    + roundtrip
+      ^ nat
+      ? (tok/try_from_pail use/value)
+       > (./some value) (count/read value)
+       > .none 0
+  "]))
+  (define imported (success (backend:compile restored grove_fixture:previous lookup (grove_fixture:qualified (path ["src" "consumer"])) (parse consumer))))
+  assert(Gt (Sz imported) 0)
+  assert(Eq 73 ((check "export") (path ["result"])
+    (record imported ["src" "consumer" "use"])))
+  assert(Eq 73 ((check "export") (path ["roundtrip"])
+    (record imported ["src" "consumer" "use"])))
+
+  ;; The same input root deterministically retains nominal identity.
+  (define rebuilt (success (build missing root fixture)))
+  assert(Equal (_1 ((check "module") token))
+    (_1 ((check "module") (record rebuilt ["src" "example" "token"]))))
+  assert(Equal (((check "export") (path ["make"]) counter) 8)
+    (((check "export") (path ["make"]) (record rebuilt ["src" "example" "counter"])) 8))
+
+  (define (failure result)
+    (require (Eq "err" (Hd result)) (error ["expected atomic failure" (Hd result)]))
+    (_0 result))
+  (define (reject text)
+    (Seq (print ["reject" text]) (failure (build missing root text))))
+  assert(Eq 2 (_0 (_0 (reject "bad =
+    @tree
+  "))))
+
+  ;; Selecting counter must not expose token, other declaration names, or
+  ;; the artifact's canonical compiler root through source spellings.
+  (define (isolated expression)
+    (Seq (print ["isolated" expression]) 0)
+    (failure (build lookup (path ["src" "isolation"])
+      (strcat [(import "chosen" "/src/example/counter") "
+  use =
+    ! foil
+    ^ nat
+    " expression 10]))))
+  (isolated "token/value")
+  (isolated "chosen/token/value")
+  (isolated "counter/read")
+  (isolated "boot/hidden")
+
+  ;; Aliases link the same bundle through ordinary path syntax too.
+  (define path-import (success (build lookup (path ["src" "paths"])
+    "#import chosen=src/example/counter
+
+  use =
+    ! foil
+    ^ nat
+    | chosen/read (chosen/make 12)
+  ")))
+  assert(Eq 12 ((check "export") [] (record path-import ["src" "paths" "use"])))
+
+  ;; Namespace aliases need no artifact; code imports require a valid bundle.
+  (define only-import (import "dep" "/src/example/token"))
+  (failure (build missing root only-import))
+  (define (empty-entry key) ((abi:option policy "some") (abi:constructor policy ["mop" "empty"])))
+  (success (build empty-entry root only-import))
+  (define use-import (strcat [only-import "
+  use =
+    ! foil
+    ^ dep
+    | dep 7
+  "]))
+  (failure (build empty-entry root use-import))
+  (define (wrong-version key)
+    ((abi:option policy "some") ((check "version") 9 token)))
+  (failure (build wrong-version root only-import))
+  (define (wrong-artifact key)
+    ((abi:option policy "some") ((check "without_artifact") token)))
+  (failure (build wrong-artifact root only-import))
+  (failure (build wrong-artifact root use-import))
+
+  (reject "same =
+    @slot
+
+  same =
+    @type
+  ")
+  (reject (strcat [only-import only-import]))
+  (reject (strcat [only-import "
+  dep =
+    @slot
+  "]))
+  (reject "bad =
+    #with ; other
+  ")
+  (reject "bad =
+    #or ;
+      foo: nat
+  ")
+  (reject "bad =
+    foo: nat
+  ")
+  (define tree-root (success (build missing root
+    (strcat [34 "/" 34 " =
+    @tree
+  "]))))
+  ;; Generated definitions may accompany the template publication.
+  assert(Gt (Sz tree-root) 0)
+  assert(Equal (grove_fixture:qualified root) (_0 (_0 tree-root)))
+  (define (metadata slot value)
+    (strcat ["    " 34 slot 34 ": " value 10]))
+  (reject (strcat ["bad =
+    #meta ;
+  " (metadata "/0x11/lib/publisher_vocabulary/publisher_vocabulary/grove/module" "(pails/n 1)")]))
+  (reject (strcat ["bad =
+    #meta ;
+  " (metadata "/0x11/vocabulary/title" "(pails/n 1)")
+     (metadata "/0x11/vocabulary/title" "(pails/n 2)")]))
+  (reject (strcat ["bad =
+    #meta ;
+  " (metadata "/0x11/vocabulary/title" "1")]))
+  (reject "medium =
+    ! foil
+    ^ nat
+    3
+
+  bad =
+    ! foil
+    ^ nat
+    undefined
+  ")
+  (reject "bad =
+    ! foil
+    - sept
+    ^ nat
+    3
+  ")
+
+  ;; Alias expansion participates in slot collision checks.
+  ;; These are namespace aliases, not another declaration's compiler bundle:
+  ;; compiled imports intentionally resolve to their stored canonical origin.
+  (define alias-doc (success (build empty-entry
+    (path ["src" "alias_metadata"])
+    (strcat [(import "title" "/0x11/vocabulary/title") "
+  note =
+    @slot
+    #meta ;
+      title: (pails/t " 34 "Alias title" 34 ")
+  "]))))
+  assert(Equal "Alias title" ((check "title") (record alias-doc ["src" "alias_metadata" "note"])))
+  (failure (build empty-entry root
+    (strcat [(import "system" "/0x11/lib/publisher_vocabulary/publisher_vocabulary/grove") "
+  note =
+    #meta ;
+      system/module: (pails/n 1)
+  "])))
+  (define located (reject "bad =
+    #meta ;
+      /0x11/vocabulary/title: 1
+  "))
+  assert(Gt (_0 (_0 located)) 0)
+  assert(Gt (_2 (_0 located)) 0)
+
+  ;; Full progression with missing imports returns no partial records.
+  (define progression-failure (reject (read-text-file "grove/fixtures/progression.grove")))
+
+  assert(Gt (_0 (_0 progression-failure)) 0)
+  ;; Even an empty module publishes its assigned root and artifact.
+  (define empty-records (success (build missing root "")))
+  assert(Eq 1 (Sz empty-records))
+  assert(Equal (grove_fixture:qualified root) (_0 (_0 empty-records)))
+
+  ;; Structural Grove references use the enclosing declaration, or another
+  ;; local declaration, while literal contents remain data.
+  (define shorthand (success (build missing (path ["src" "short"])
+  "adjustment =
+    @type
+    ! foil
+    + reset :
+    & %/reset
+
+  value =
+    ! foil
+    ^ adjustment
+    | %/adjustment/reset
+  ")))
+  assert(Gt (Sz shorthand) 2)
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export run)

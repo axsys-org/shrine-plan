@@ -1,0 +1,192 @@
+(#bind fixture (#module foil-test-context))
+;;;; Copyright (c) 2026 Axiomatic Systems
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind foil-rex (#module foil-rex))
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind schemagen (#module schemagen))
+(define module-file-stamps ["spec/openrouter-full.json"])
+
+(define (check z)
+  ;; Explicit vendor-wide census; not part of the default gate.
+  (define jsut (_1 (source:compile (fixture:files 0 ["json"]) 0 "json")))
+  (DeepSeq jsut 0)
+
+  ;;; C. the OpenAPI 3.1 dialect reads: components.schemas, servers[0].url,
+  ;;;    responses.200.content["application/json"].schema.
+
+  ;; The boot fixture is an intentional two-operation slice. Keep coverage
+  ;; pinned to the complete document retained from commit b501e0a.
+  (define oa-v (schemagen:sg-schema-value jsut
+                 (read-text-file "spec/openrouter-full.json")))
+  assert(Equal [1 "open_router_api" "https://openrouter.ai/api/v1" 713 89]
+    (schemagen:spec-summary oa-v))
+  (define oa-ids (schemagen:spec-opids oa-v))
+  assert(Equal 89 (Sz oa-ids))
+  ;; camelCase operationIds arrive normalized
+  assert(Eq 1 (includes (Eq "get_models") oa-ids))
+  assert(Eq 1 (includes (Eq "send_chat_completion_request") oa-ids))
+
+  ;;; Slicing: a client wants a few operations, not 713 schemas (~2100
+  ;;; generated top-levels, all of which a module load forces).
+  assert(Equal 20 (Sz (schemagen:spec-slice oa-v ["get_models"])))
+  assert(Equal 132 (Sz (schemagen:spec-slice oa-v ["send_chat_completion_request"])))
+  ;; these two share nothing — model metadata and chat traffic are
+  ;; separate type families — so their union is exactly the sum
+  assert(Equal 152 (Sz (schemagen:spec-slice oa-v
+                         ["get_models" "send_chat_completion_request"])))
+  ;; and either way a slice is a small fraction of the whole
+  assert(Eq 1 (Lt 152 713))
+
+  ;;; D. THE RATCHET.  How many named schemas the typedef IR can express.
+  ;;; This number may only go UP.  Raise it when a phase lands; never
+  ;;; lower it to make a change pass.
+  ;;;   116  phase 0 (dialect only)
+  ;;;   257  phase 1 (nullable unions, numbers, allOf, aliases, lifting)
+  ;;;   613  phase 2a (enums by wire value, constants, any-JSON)
+  ;;;   690  phase 2b (tag-discriminated unions)
+  ;;;   692  phase 2c (shape-discriminated unions)
+  ;;;   696  phase 2d (union arms lift)
+  ;;;   700  phase 2e (a property-less object is any JSON object)
+  ;;;   705  phase 2f (a named array mints its element)
+  ;;;   709  phase 2g (digit-leading names, numeric enums, enum unions)
+  ;;;   711  phase 2h (set-valued tags, and a union's own fallback arm)
+  ;;;   713  phase 2i (arms grouped by shape, each group settled on its own)
+  ;;;
+  ;;; 713 of 713.  Every NAMED schema in the document expresses.  That is
+  ;;; not the same as every operation generating — see the second ratchet
+  ;;; below, which is at least 80 of 89, because a lifted field-position type
+  ;;; can fail where no named schema does.
+
+  (define oa-cov (schemagen:spec-coverage oa-v))
+  assert(Equal 713 (Ix 1 oa-cov))
+  assert(Eq 1 (Ge (_0 oa-cov) 713))
+  assert(Equal [] (Ix 2 oa-cov))
+
+  (define oa-whys (schemagen:dedupe-eq (map (lambda (b) (Ix 1 b)) (Ix 2 oa-cov))))
+  (define (why? w) (includes (Eq w) oa-whys))
+
+  ;;; A SECOND ratchet, because the first one understates the work.
+  ;;; spec-coverage counts NAMED schemas only, so a failure inside a
+  ;;; lifted field-position type never reaches it — and field position is
+  ;;; where the shape unions overwhelmingly live (39 of this document's
+  ;;; 43, against 4 named).  This counts operations whose whole module
+  ;;; builds, which is the number a caller actually cares about.
+  ;;;    46  phase 2b (tag-discriminated unions)
+  ;;;    49  phase 2c (shape-discriminated unions)
+  ;;;    49  phase 2d (union arms lift — named schemas only)
+  ;;;    51  phase 2e (property-less objects; ImageConfig is in chat's closure)
+  ;;;    53  phase 2g (digit-leading names, numeric enums, enum unions)
+  ;;;    74  phase 3a (any 2xx, inline op schemas minted, reserved names
+  ;;;                  mangled) — the biggest single jump, and none of it
+  ;;;                  was about what the type IR can say
+  ;;;    80  phase 3b (a bare string arm beside an enum is dropped)
+  ;;;
+  ;;; The 9 that remain are not gaps in the IR.  Four are binary payloads
+  ;;; (audio/*, video/mp4, octet-stream, multipart) with no schema to
+  ;;; generate at all; one operation declares no 2xx body; and four are
+  ;;; unions that are genuinely undecidable — an empty array matches all
+  ;;; four of createEmbeddings' array arms, and the 49-arm Inputs union
+  ;;; carries `type: "message"` on three of them.
+  (define (op-builds? id)
+    (define r (Try (lambda (z)
+                     (let ((p (schemagen:sg-spec-parts oa-v [id])))
+                     (DeepSeq p 1)))
+                0))
+    (If (Eq 1 (Hd r)) 0 1))
+  assert(Eq 1 (Ge (Sz (filter op-builds? oa-ids)) 80))
+
+  ;;; What earlier phases retired.  These must stay absent: each was a
+  ;;; whole class of schema the IR could not say, and a regression would
+  ;;; show up here long before the count moved much.
+  assert(Eq 0 (why? "nullable-type-union (type: [T,null])"))
+  assert(Eq 0 (why? "float-unsupported (no honest representation yet)"))
+  assert(Eq 0 (why? "untyped-field (want type or $ref)"))
+
+  assert(Eq 0 (why? "union of real types (needs oneOf support)"))
+  assert(Eq 0 (why? "unsupported-def (want object or enum)"))
+
+  ;;; A union's ARMS now lift the way a record's properties do, so an arm
+  ;;; that is an inline object, enum or union gets a name of its own.
+  ;;; That retired the last structural gap: BaseInputs and Inputs are
+  ;;; `string | array-of-<union>`, settled by shape and then by lifting
+  ;;; the element type.
+  assert(Eq 0 (why? "inline-union (hoist to $defs)"))
+
+  ;;; Nothing is left.  Each of these was a whole CLASS of schema the IR
+  ;;; could not say, and every one is now retired — a regression would show
+  ;;; up here long before the count moved much.
+  assert(Eq 0 (why? "union has no discriminating field or shape"))
+  ;; a name that cannot start a foil identifier is mangled, not rejected
+  assert(Eq 0 (why? "bad-name (want [a-z][a-z0-9_]*)"))
+  ;; a numeric enum is carried by value rather than named
+  assert(Eq 0 (why? "expected-string"))
+  ;; a property-less object is any JSON object, not a failure
+  assert(Eq 0 (why? "empty-object"))
+  ;; and an inline type anywhere lifting reaches now gets a name
+  assert(Eq 0 (why? "inline-enum (hoist to $defs)"))
+  assert(Eq 0 (why? "inline-object (hoist to $defs)"))
+
+  ;;; E. /models expresses COMPLETELY — every schema in its closure —
+  ;;; which is what makes it the first operation a real client can use.
+  (define oa-models (schemagen:spec-coverage-of oa-v ["get_models"]))
+  assert(Equal [20 20 []] oa-models)
+
+  ;;; ...and its whole module generates: 29 query parameters, all
+  ;;; optional, typed str/int/num.
+  (define oa-parts (schemagen:sg-spec-parts oa-v ["get_models"]))
+  assert(Equal "open_router_api" (_0 oa-parts))
+  assert(Equal "https://openrouter.ai/api/v1" (Ix 1 oa-parts))
+  assert(Equal 1 (Sz (Ix 3 oa-parts)))
+  (define oa-op (_0 (Ix 3 oa-parts)))
+  assert(Equal "get_models" (_0 oa-op))
+  assert(Equal "get" (Ix 1 oa-op))
+  assert(Equal [["lit" "models"]] (Ix 2 oa-op))
+  assert(Equal [] (Ix 3 oa-op))
+  assert(Equal 29 (Sz (Ix 4 oa-op)))
+  ;; a nullable integer, a plain integer, an enum-as-string, a number
+  (define (qp nm) (_0 (find (lambda (p) (Eq nm (_0 p))) (Ix 4 oa-op))))
+  assert(Equal ["offset" ["int"] 0] (qp "offset"))
+  assert(Equal ["limit" ["int"] 0] (qp "limit"))
+  assert(Equal ["category" ["str"] 0] (qp "category"))
+  assert(Equal ["min_price" ["num"] 0] (qp "min_price"))
+
+  ;;; F. What an operation needs beyond its schemas expressing.
+
+  ;;; A created or accepted body is the same thing to a client as an OK
+  ;;; one.  Six of this document's operations only ever answer 201 or 202,
+  ;;; and read as having no response at all until 2xx was accepted.
+  (define oa-created (schemagen:sg-spec-parts oa-v ["create_workspace"]))
+  assert(Equal 1 (Sz (Ix 3 oa-created)))
+  assert(Equal "create_workspace" (_0 (_0 (Ix 3 oa-created))))
+
+  ;;; An operation may write its schema INLINE rather than as a $ref.
+  ;;; Everything downstream addresses types by name, so those had nowhere
+  ;;; to be addressed from; the type is now minted from the operation id.
+  (define oa-inline (schemagen:sg-spec-parts oa-v ["get_analytics_meta"]))
+  (define oa-iop (_0 (Ix 3 oa-inline)))
+  assert(Equal "get_analytics_meta_res" (Ix 6 oa-iop))
+  ;; and the minted type is really emitted, not just named
+  assert(Eq 1 (includes (Eq "get_analytics_meta_res")
+                (map (lambda (td) (Ix 1 td)) (Ix 2 oa-inline))))
+
+  ;;; A name the generated module already uses is mangled, not rejected.
+  ;;; This document has schemas called `json` and `ws`, and an operationId
+  ;;; `list` — which is reserved only because json.foil came to need it.
+  (define oa-resv (schemagen:sg-spec-parts oa-v ["list"]))
+  assert(Equal "list_" (_0 (_0 (Ix 3 oa-resv))))
+
+  (print "schema exhaustive census passed")
+
+  1)
+
+assert(Equal 1 (check 0))

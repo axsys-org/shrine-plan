@@ -1,13 +1,14 @@
+- sept
 '  weft: an HTML templating library — node trees rendered to cords.
 '  .
-'  Cords are LE byte-packed nats.  The small cord utilities (cat2,
-'  join, show_nat) are arithmetic: welding shifts by 256^len.  But
-'  rendering never welds as it goes — that pays bignum work per
+'  Cords are LE byte-packed nats. Text utilities delegate to Sept.
+'  Rendering never welds as it goes — that pays bignum work per
 '  append, quadratic in the page.  Instead render assembles a
 '  CordTree (str_text / str_slice / str_cat nodes, O(1) each) and
 '  str_run flattens it in one native pass; esc slices whole runs of
 '  safe bytes found by scan8 rather than dividing per byte.  Text
 '  nodes escape at render time; raw nodes (style bodies) do not.
+'  ~ weft/build constructs these same nodes with the generic builder syntax.
 +  weft
   +  blen
     '  Byte length of a cord (the native width).
@@ -27,30 +28,39 @@
     '  Weld two cords: b lands above a's bytes.
     '  ?=  ((weft/cat2 "ab" "cd") "abcd")
     '  ?=  ((weft/cat2 0 "x") "x")
-    \  a=nat b=nat
-    ^  nat
-    (add a (lsh b (mul 8 (wid a))))
+    \ a=nat b=nat
+    ^ nat
+    | cord/cat a b
   +  cat
-    '  Weld a row of cords in order.
+    '  Build a CordTree and flatten once, including compile-time constants.
     '  ?=  ((weft/cat ["a" "b" "c"]) "abc")
-    \  xs=row[nat]
-    ^  nat
-    |  > i=nat 0  > acc=nat 0
-    ?  (eq i xs.len)
-       acc
-    (_ i.inc (weft/cat2 acc xs.at(i)))
+    '  ?=  ((weft/cat []) 0)
+    '  ?=  ((weft/cat [0 "ab" 0 "cd" 0]) "abcd")
+    \ xs=row[nat]
+    ^ nat
+    = tree
+        % i=nat 0 acc=any (str_text 0)
+        ^ any
+        ? (eq i xs.len) acc
+        | _ i.inc (str_cat acc (str_text xs.at(i)))
+    | str_run tree
   +  join
-    '  Weld with a separator between elements.
+    '  Build separated pieces as a CordTree and flatten once.
     '  ?=  ((weft/join "/" ["a" "b"]) "a/b")
     '  ?=  ((weft/join "/" []) 0)
-    \  sep=nat xs=row[nat]
-    ^  nat
-    |  > i=nat 0  > acc=nat 0
-    ?  (eq i xs.len)
-       acc
-    ?  (eq i 0)
-       (_ 1 xs.at(0))
-    (_ i.inc (weft/cat2 acc (weft/cat2 sep xs.at(i))))
+    '  ?=  ((weft/join "/" [0 "a" 0]) "/a/")
+    '  ?=  ((weft/join "/" ["a"]) "a")
+    \ sep=nat xs=row[nat]
+    ^ nat
+    = tree
+        % i=nat 0 acc=any (str_text 0)
+        ^ any
+        ? (eq i xs.len) acc
+        = before=any
+            ? (eq i 0) acc
+            | str_cat acc (str_text sep)
+        | _ i.inc (str_cat before (str_text xs.at(i)))
+    | str_run tree
   +  esc_class
     '  The scan8 byte-set of the four dangerous bytes (& < > quote).
     \  _z=nat
@@ -73,7 +83,7 @@
     '  Weld a row of CordTrees.
     \  xs=row[any]
     ^  any
-    |  > i=nat 0  > acc=any (str_text 0)
+    %  i=nat 0  acc=any (str_text 0)
     ^  any
     ?  (eq i xs.len)
        acc
@@ -84,14 +94,14 @@
     '  with the escape count, not the byte count.
     \  s=nat
     ^  any
-    =  > n (wid s)
-    =  > cls (weft/esc_class 0)
-    |  > i=nat 0  > acc=any (str_text 0)
+    =  n (wid s)
+    =  cls (weft/esc_class 0)
+    %  i=nat 0  acc=any (str_text 0)
     ^  any
     ?  (ge i n)
        acc
-    =  > e (scan8_end s i cls 0)
-    =  > acc2 (str_cat acc (str_slice s i (sub e i)))
+    =  e (scan8_end s i cls 0)
+    =  acc2 (str_cat acc (str_slice s i (sub e i)))
     ?  (ge e n)
        acc2
     (_ e.inc (str_cat acc2 (str_text (weft/ent (load8 e s)))))
@@ -106,14 +116,9 @@
     '  Decimal rendering of a nat.
     '  ?=  ((weft/show_nat 0) "0")
     '  ?=  ((weft/show_nat 407) "407")
-    \  n=nat
-    ^  nat
-    ?  (eq 0 n)
-       "0"
-    |  > x=nat n  > acc=nat 0
-    ?  (eq 0 x)
-       acc
-    (_ (div x 10) (weft/cat2 (add 48 (mod x 10)) acc))
+    \ n=nat
+    ^ nat
+    | str/to_atom (nat/show n)
   +  att
     '  One attribute.
     :  k=nat v=nat
@@ -132,6 +137,9 @@
 
     +  el
       :  tag=nat as=row[weft/att] kids=row[weft/node]
+  +  id
+    \  v=nat
+    (weft/att "id" v)
   +  cls
     \  v=nat
     ^  weft/att
@@ -157,28 +165,279 @@
     \  tag=nat as=row[weft/att] s=nat
     ^  weft/node
     (weft/node/el tag as [(weft/node/tx s)])
+  +  item
+    '  Anything that can appear in an element body: attributes and
+    '  kids ride one interleaved list, splices flatten, nil
+    '  vanishes.  weft/h partitions; the short ctors (a c hf t k ks)
+    '  build members.
+    &  weft/item/at
+       weft/item/ats
+       weft/item/kid
+       weft/item/kids
+       weft/item/nil
+
+    +  at
+      :  a=weft/att
+
+    +  ats
+      :  as=row[weft/att]
+
+    +  kid
+      :  n=weft/node
+
+    +  kids
+      :  ns=row[weft/node]
+
+    +  nil
+      :
+  +  a
+    '  An attribute item.
+    \  k=nat v=nat
+    ^  weft/item
+    (./at (weft/att k v))
+  +  c
+    '  A class attribute item.
+    \  v=nat
+    ^  weft/item
+    (./at (weft/att "class" v))
+  +  hf
+    '  An href attribute item.
+    \  v=nat
+    ^  weft/item
+    (./at (weft/att "href" v))
+  +  t
+    '  A text kid item (escaped at render).
+    \  s=nat
+    ^  weft/item
+    (./kid (weft/node/tx s))
+  +  k
+    '  A node kid item.
+    \  n=weft/node
+    ^  weft/item
+    (./kid n)
+  +  ks
+    '  A splice: a row of nodes welded into the kids in place.
+    \  ns=row[weft/node]
+    ^  weft/item
+    (./kids ns)
+  +  slice
+    '  n bytes of s from byte offset i.
+    '  ?=  ((weft/slice "abcdef" 2 3) "cde")
+    \  s=nat i=nat n=nat
+    ^  nat
+    (mod (div s (weft/bex8 i)) (weft/bex8 n))
+  +  sel_class
+    '  The scan8 byte-set of the selector delimiters . # [ .
+    \  _z=nat
+    ^  nat
+    (add (bex 35) (add (bex 46) (bex 91)))
+  +  sel_kv
+    '  The scan8 byte-set ending an attribute key: = or ] .
+    \  _z=nat
+    ^  nat
+    (add (bex 61) (bex 93))
+  +  sel
+    '  A selector cord "tag.cls#id[k=v][k2]" parsed to its element
+    '  tag and static attributes: classes join space-separated and
+    '  emit first, #id is the id attribute, [k=v] is verbatim (v may
+    '  hold any byte but "]"), bare [k] gets k as its value (the
+    '  defer="defer" idiom).  ok=.false on a malformed selector —
+    '  empty tag, empty class/id/key, or an unclosed [ — so weft/h
+    '  can render the mistake loudly rather than guess.
+    \  s=nat
+    ^  [tag=nat as=row[weft/att] ok=bool]
+    =  n   (wid s)
+       te  (scan8_end s 0 (weft/sel_class 0) 0)
+    ?  (eq te 0)
+       [s [] .false]
+    =  tag  (weft/slice s 0 te)
+    %  i=nat te  cls=nat 0  rest=row[weft/att] []
+    ^  [tag=nat as=row[weft/att] ok=bool]
+    ?  (ge i n)
+       =  as
+            ?  (eq cls 0)
+               rest
+            rest.cons((weft/att "class" cls))
+       [tag as .true]
+    =  b  (load8 i s)
+    ?  (eq b 46)
+       =  e  (scan8_end s i.inc (weft/sel_class 0) 0)
+       ?  (eq e i.inc)
+          [tag [] .false]
+       =  seg  (weft/slice s i.inc (sub e i.inc))
+          cls2
+            ?  (eq cls 0)
+               seg
+            (weft/cat [cls " " seg])
+       (_ e cls2 rest)
+    ?  (eq b 35)
+       =  e  (scan8_end s i.inc (weft/sel_class 0) 0)
+       ?  (eq e i.inc)
+          [tag [] .false]
+       (_ e cls rest.snoc((weft/att "id" (weft/slice s i.inc (sub e i.inc)))))
+    ?  (eq b 91)
+       =  ke  (scan8_end s i.inc (weft/sel_kv 0) 0)
+       ?  (ge ke n)
+          [tag [] .false]
+       ?  (eq ke i.inc)
+          [tag [] .false]
+       =  key  (weft/slice s i.inc (sub ke i.inc))
+       ?  (eq 93 (load8 ke s))
+          (_ ke.inc cls rest.snoc((weft/att key key)))
+       =  ve  (scan8_end s ke.inc (bex 93) 0)
+       ?  (ge ve n)
+          [tag [] .false]
+       (_ ve.inc cls
+          rest.snoc((weft/att key (weft/slice s ke.inc (sub ve ke.inc)))))
+    [tag [] .false]
+  +  h
+    '  An element from one interleaved item list — attributes and
+    '  kids in document order, splices flattened, nils dropped.  The
+    '  tag may carry weft/sel static-attribute shorthand; a selector
+    '  class and (weft/c ..) items on the same element both emit, so
+    '  pick one spelling per element.  A malformed selector renders
+    '  as an x-bad-selector element carrying the offending cord.
+    '  ?=  ((weft/render (weft/h "b" [(weft/t "hi")])) "<b>hi</b>")
+    '  ?=  ((weft/render (weft/h "p.big" [])) (weft/cat ["<p class=" 34 "big" 34 "></p>"]))
+    '  ?=  ((weft/render (weft/h "p." [])) "<x-bad-selector>p.</x-bad-selector>")
+    \  tag=nat items=row[weft/item]
+    ^  weft/node
+    =  [stag sas ok]  (weft/sel tag)
+    ?  !ok
+       (weft/node/el "x-bad-selector" [] [(weft/node/tx tag)])
+    %  idx=nat 0  as=row[weft/att] sas  kids=row[weft/node] []
+    ^  weft/node
+    ?  (eq idx items.len)
+       (weft/node/el stag as kids)
+    ?  items.at(idx)
+     > (./at a=weft/att)           (_ idx.inc as.snoc(a) kids)
+     > (./ats more=row[weft/att])  (_ idx.inc as.weld(more) kids)
+     > (./kid n=weft/node)         (_ idx.inc as kids.snoc(n))
+     > (./kids ns=row[weft/node])  (_ idx.inc as kids.weld(ns))
+     > .nil                        (_ idx.inc as kids)
+  +  build
+    '  Builder target over the existing node representation and CordTree renderer.
+    '  Use ~ weft/build; fragments are row[weft/node], including one root.
+    +  child
+      weft/node
+    +  text
+      \ value=nat
+      ^ weft/node
+      | weft/tx value
+    +  texts
+      \ values=row[nat]
+      ^ weft/node
+      | weft/tx | weft/cat values
+    +  field
+      \ key=nat value=nat
+      ^ weft/att
+      | weft/att key value
+    +  node
+      '  Preserve Weft selectors, attribute ordering, and malformed-head output.
+      \ head=nat fields=row[weft/att] children=row[weft/node]
+      ^ weft/node
+      = [tag attrs ok] | weft/sel head
+      ? !ok
+        | weft/el "x-bad-selector" [] [(| weft/tx head)]
+      | weft/el tag attrs.weld(fields) children
+    +  bind
+      (@ v)
+      \ values=row[v] f={\ v}row[weft/node]
+      ^ row[weft/node]
+      % i=nat 0 out=row[weft/node] []
+      ? (eq i values.len) out
+      | _ i.inc out.weld((| f values.at(i)))
+  +  lnk
+    '  A link leaf: an anchor with one text kid.
+    \ u=nat s=nat
+    ^ weft/node
+    = nodes
+        ~ weft/build
+        ~# 'a
+          'href u
+          ~. s
+    nodes.at(0)
+  +  when
+    '  The item when the guard holds, nothing otherwise. For new markup,
+    '  a builder ? branch expresses conditional children directly.
+    '  ?=  ((weft/render (weft/h "b" [(weft/when .false (weft/t "x"))])) "<b></b>")
+    \  p=bool it=weft/item
+    ^  weft/item
+    ?  p
+       it
+    .nil
+  +  each
+    '  One node per row element, spliced in order.
+    '  ?=  ((weft/render (weft/h "u" [(weft/each[nat] ["a" "b"] weft/tx)])) "<u>ab</u>")
+    (@ v)
+    \  xs=row[v] f={\ v}weft/node
+    ^  weft/item
+    =  ns
+         %  idx=nat 0  out=row[weft/node] []
+         ?  (eq idx xs.len)
+            out
+         (_ idx.inc out.snoc((f xs.at(idx))))
+    (./kids ns)
+  +  eachi
+    '  each with the element index.
+    (@ v)
+    \  xs=row[v] f={\ nat v}weft/node
+    ^  weft/item
+    =  ns
+         %  idx=nat 0  out=row[weft/node] []
+         ?  (eq idx xs.len)
+            out
+         (_ idx.inc out.snoc((f idx xs.at(idx))))
+    (./kids ns)
+  +  wget
+    '  w-get: this element is a fragment mount fetching the URL.
+    '  The w-ctors are the typed spellings of the /w.js attribute
+    '  contract (see weft/runtime) — a typo here is a compile error,
+    '  not a silently inert page.
+    \  url=nat
+    ^  weft/item
+    (./at (weft/att "w-get" url))
+  +  wevery
+    '  w-trigger="every Ns": re-fetch the mount on an interval.
+    \  secs=nat
+    ^  weft/item
+    (./at (weft/att "w-trigger" (weft/cat ["every " (weft/show_nat secs) "s"])))
+  +  wouter
+    '  w-swap="outer": fetched markup replaces the element itself.
+    ^  weft/item
+    (./at (weft/att "w-swap" "outer"))
+  +  wpost
+    '  w-post on a form: intercept submit, POST the fields, then
+    '  refresh the fragment mounts named by these element ids.
+    \  refresh=row[nat]
+    ^  weft/item
+    (./ats [(weft/att "w-post" "1") (weft/att "w-refresh" (weft/join " " refresh))])
+  +  wscrub
+    '  w-scrub on a range input: the omni-scrubber.
+    ^  weft/item
+    (./at (weft/att "w-scrub" "1"))
   +  render_tree
     '  A node tree as a CordTree: O(1) per piece, welded exactly once
     '  by the str_run in render.  Attribute values are quoted with
     '  byte 34 (cord literals cannot hold a double quote).
     \  nd0=weft/node
     ^  any
-    |  > nd=weft/node nd0
+    %  nd=weft/node nd0
     ^  any
-    =  > me (_)
+    =  me (_)
     ?  nd
      > (./tx s=nat)  (weft/esc_tree s)
      > (./raw s=nat)  (str_text s)
      > (./el tag=nat as=row[weft/att] kids=row[weft/node])
-       =  > astr
-            |  > i=nat 0  > acc=any (str_text 0)
+       =  astr
+            %  i=nat 0  acc=any (str_text 0)
             ^  any
             ?  (eq i as.len)
                acc
-            =  > a as.at(i)
+            =  a as.at(i)
             (_ i.inc (weft/tcat [acc (str_text " ") (str_text a.k) (str_text "=") (str_text 34) (weft/esc_tree a.v) (str_text 34)]))
-       =  > kstr
-            |  > j=nat 0  > acc2=any (str_text 0)
+       =  kstr
+            %  j=nat 0  acc2=any (str_text 0)
             ^  any
             ?  (eq j kids.len)
                acc2
@@ -192,11 +451,105 @@
     \  nd0=weft/node
     ^  nat
     (str_run (weft/render_tree nd0))
-  +  page
-    '  A full document: title, a raw css block, body nodes.
-    \  title=nat css=nat body=row[weft/node]
+  +  render_many
+    '  Render a builder fragment with one CordTree flatten, including empty rows.
+    \ nodes=row[weft/node]
+    ^ nat
+    | str_run | weft/tcat nodes.map(weft/render_tree)
+  +  runtime
+    '  The shared client runtime served at /w.js — the whole
+    '  interactivity story for faces, as attributes:
+    '  .
+    '  w-get="/frag/..."      the element is a fragment mount; fetch
+    '                         the URL and swap the markup in
+    '  w-trigger="every Ns"   re-fetch on an interval (fetch-on-load
+    '                         always happens)
+    '  w-swap="inner|outer"   how the swap lands (default inner)
+    '  w-post (on a form)     intercept submit, POST the fields,
+    '                         then refresh the fragments named in
+    '                         w-refresh and clear the text inputs
+    '  w-refresh="id id.."    fragment element ids a w-post refreshes
+    '  w-scrub (on a range)   the omni-scrubber: pin every fragment
+    '                         on the page to the slider's sovereign
+    '                         epoch (max = now = unpinned).  While
+    '                         pinned, polls idle — history is
+    '                         constant — and every fetch rides /h's
+    '                         epoch spelling on its data path.  The
+    '                         pin mirrors into location.hash as
+    '                         #e<epoch>, so any moment of a page is
+    '                         a shareable, bookmarkable URL
+    '  w-edit="rel slot"      the text run is editable in place:
+    '                         click, retype, blur (enter commits,
+    '                         escape cancels) — the runtime pokes
+    '                         the slot at the enclosing mount's data
+    '                         path plus rel through /edit, and the
+    '                         namespace re-renders whatever the
+    '                         write means.  Inert while scrubbed and
+    '                         outside mounts
+    '  w-op="up rel" (form)   an op form inside a mount: at submit
+    '                         the runtime aims the form at the
+    '                         enclosing mount's data path — action
+    '                         becomes /op/<dp> and the hidden `op`
+    '                         input becomes dp minus `up` segments
+    '                         plus rel (the op card's path).  The
+    '                         submit itself is a PLAIN post: the
+    '                         kernel's verdict bounces the browser
+    '                         like any /post form
+    '  .
+    '  Swaps are skipped when the fetched text is byte-identical to
+    '  the last applied text (client-side staleness compare — the
+    '  poll is cheap, the DOM stays quiet, form state survives).
+    '  Mounts that ARRIVE inside a swapped fragment are armed after
+    '  the swap (w-armed marks the done ones), so components nest.
+    '  Cord literals cannot hold a double-quote byte, so the script
+    '  is single-quote-only.
     ^  nat
-    =  > hd (weft/el "head" [] [(weft/leaf "title" [] title) (weft/el "style" [] [(weft/raw css)])])
-    =  > bd (weft/el "body" [] body)
-    =  > doc (weft/el "html" [] [hd bd])
-    (str_run (str_cat (str_text "<!doctype html>") (weft/render_tree doc)))
+    =  jopen  "(function(){var pin=null;"
+       jpin   "function pinurl(u){if(pin===null){return u}var p=u.split('/');if(p[1]!=='frag'){return u}var olen=parseInt(p[3]);var di=4+olen;var dlen=parseInt(p[di]);return p.slice(0,di).concat([String(dlen+4),'h','z','e'+pin,String(dlen)]).concat(p.slice(di+1,di+1+dlen)).join('/')}"
+       jswap  "function swap(el,t){if(el.getAttribute('data-w-last')===t){return}el.setAttribute('data-w-last',t);if(el.getAttribute('w-swap')==='outer'){el.outerHTML=t}else{el.innerHTML=t;rearm(el)}}"
+       jload  "function load(el){var p0=pin;fetch(pinurl(el.getAttribute('w-get'))).then(function(r){return r.ok?r.text():null}).then(function(t){if(t!==null&&t!==undefined&&p0===pin){swap(el,t)}})}"
+       jarm   "function arm(el){el.setAttribute('w-armed','1');load(el);var tr=el.getAttribute('w-trigger')||'';if(tr.indexOf('every ')===0){var n=parseFloat(tr.slice(6));if(n>0){setInterval(function(){if(pin===null&&document.contains(el)){load(el)}},n*1000)}}}"
+       jrearm "function rearm(root){var els=root.querySelectorAll('[w-get]:not([w-armed])');var i;for(i=0;i<els.length;i++){arm(els[i])}}"
+       jrel   "function reload(){var els=document.querySelectorAll('[w-get]');var i;for(i=0;i<els.length;i++){load(els[i])}}"
+       jscr   "function bindscrub(s){var lab=s.parentNode?s.parentNode.querySelector('.wscrub-lab'):null;if(pin!==null){s.value=String(pin);if(lab){lab.textContent='epoch '+pin}}s.addEventListener('input',function(){var v=parseInt(s.value);var mx=parseInt(s.getAttribute('max'));if(v>=mx){pin=null;if(lab){lab.textContent='now'}location.hash=''}else{pin=v;if(lab){lab.textContent='epoch '+v}location.hash='e'+v}reload()})}"
+       jwire  "function wire(f){f.addEventListener('submit',function(e){e.preventDefault();fetch(f.getAttribute('action'),{method:'POST',body:new URLSearchParams(new FormData(f))}).then(function(){var ids=(f.getAttribute('w-refresh')||'').split(' ');var i;for(i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el&&el.getAttribute('w-get')){load(el)}}});var ins=f.querySelectorAll('input[type=text],textarea');var j;for(j=0;j<ins.length;j++){ins[j].value=''}})}"
+       jedt   "function edtarget(t){var m=t.closest('[w-get]');if(!m){return null}var p=m.getAttribute('w-get').split('/');var olen=parseInt(p[3]);var di=4+olen;var dlen=parseInt(p[di]);var dp=p.slice(di+1,di+1+dlen);var spec=(t.getAttribute('w-edit')||'').split(' ');if(spec.length<2){return null}var rel=spec[0]==='.'?[]:spec[0].split('/');return{path:dp.concat(rel).join('/'),slot:spec[1]}}"
+       jeds   "function edsend(t){var tg=edtarget(t);if(!tg){return}var b=new URLSearchParams();b.append(tg.slot,t.textContent);fetch('/edit/'+tg.path,{method:'POST',body:b}).then(function(){var m=t.closest('[w-get]');if(m){load(m)}})}"
+       jedc   "function ededit(e){if(pin!==null){return}var t=e.target.closest?e.target.closest('[w-edit]'):null;if(!t||t.isContentEditable){return}t.setAttribute('data-w-orig',t.textContent);t.contentEditable='true';t.focus()}"
+       jedb   "function edblur(e){var t=e.target;if(!t.getAttribute||!t.getAttribute('w-edit')||t.contentEditable!=='true'){return}t.contentEditable='false';if(t.textContent!==t.getAttribute('data-w-orig')){edsend(t)}}"
+       jedk   "function edkey(e){var t=e.target;if(!t.getAttribute||!t.getAttribute('w-edit')){return}if(e.key==='Enter'||e.keyCode===13){e.preventDefault();t.blur()}if(e.key==='Escape'||e.keyCode===27){t.textContent=t.getAttribute('data-w-orig');t.blur()}}"
+       jwop   "function wopfix(e){var f=e.target;if(!f.getAttribute||!f.getAttribute('w-op')){return}var m=f.closest('[w-get]');if(!m){return}var p=m.getAttribute('w-get').split('/');var olen=parseInt(p[3]);var di=4+olen;var dlen=parseInt(p[di]);var dp=p.slice(di+1,di+1+dlen);var spec=f.getAttribute('w-op').split(' ');if(spec.length<2){return}var up=parseInt(spec[0]);var op=dp.slice(0,dp.length-up).concat(spec[1].split('/'));f.setAttribute('action','/op/'+dp.join('/'));var i=f.querySelector('input[name=op]');if(i){i.value='/'+op.join('/')}var b=f.querySelector('input[name=back]');if(b&&!b.value){b.value='/'+dp.join('/')}}"
+       jboot  "function boot(){var h=location.hash;if(h.indexOf('#e')===0){var hv=parseInt(h.slice(2));if(hv>0){pin=hv}}var sc=document.querySelectorAll('input[w-scrub]');var m;for(m=0;m<sc.length;m++){bindscrub(sc[m])}rearm(document);var fs=document.querySelectorAll('form[w-post]');var j;for(j=0;j<fs.length;j++){wire(fs[j])}document.addEventListener('click',ededit);document.addEventListener('focusout',edblur);document.addEventListener('keydown',edkey);document.addEventListener('submit',wopfix,true)}"
+       jgo    "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',boot)}else{boot()}})();"
+    (weft/cat [jopen jpin jswap jload jarm jrearm jrel jscr jwire jedt jeds jedc jedb jedk jwop jboot jgo])
+  + page
+    ' A document with caller-supplied inline CSS and no application assets.
+    \ title=nat css=nat body=row[weft/node]
+    ^ nat
+    | weft/page_with_assets title [(weft/el "style" [] [(weft/raw css)])] body
+
+  + page_with_assets
+    ' Shared document framing. The caller declares its assets; no implicit CSS.
+    \ title=nat assets=row[weft/node] body=row[weft/node]
+    ^ nat
+    | weft/page_with_body_attributes title assets [] body
+
+  + page_with_body_attributes
+    \ title=nat assets=row[weft/node] attributes=row[weft/att] body=row[weft/node]
+    ^ nat
+    = document
+        ~ weft/build
+        ~# 'html
+          'lang "en"
+          ~| 'head
+            ~# 'meta
+              'charset "utf-8"
+            ~# 'meta
+              'name "viewport"
+              'content "width=device-width, initial-scale=1"
+            ~. 'title title
+            assets
+          [(weft/el "body" attributes body)]
+    | str_run
+    | str_cat (str_text "<!doctype html>")
+    | weft/tcat document.map(weft/render_tree)

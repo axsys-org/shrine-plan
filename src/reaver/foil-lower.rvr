@@ -10,11 +10,9 @@
 
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
-
 (#bind cairn (#module cairn))
-(#import cairn)
 
-(#bind ty (#module foil-types))
+
 (#bind new-ty (#module foil-new-types))
 (#bind cgen (#module codegen))
 (#bind profile-zone (#module profile-zone))
@@ -22,7 +20,7 @@
 ;;; Lowered module entries ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (make-ir-entry key span val tc ir)
-  ("IR_ENTRY" key span val tc ir))
+  ("IR_ENTRY" key span val tc ir cgen:ir-version))
 
 ;; Unit-grouped entries do not embed their compiled value directly: the
 ;; whole group's runtime row (and IR) is serialized behind ONE pin, and
@@ -70,7 +68,7 @@
   ;; kids]: constructor head + arity at each node, recursing into
   ;; constrained fields (nested variant patterns) through Ix probes.
   ;; This is sound because elaboration rejects arms an earlier arm's
-  ;; key subsumes — see check-arms-distinct in foil-elab.rvr.
+  ;; key subsumes — see the unreachable-arm check in foil-new-elab.rvr.
   ;; Nonzero result = no match (arms chain through Ifz).
   (define (lower-arm-test key)
     (define (probe val key)
@@ -111,7 +109,7 @@
   (define (lower-match val)
     ;; Match lowers to one let holding the scrutinee.  Arm bodies and the
     ;; fallthrough therefore see one more lexical slot than the scrutinee.
-    (cgen:L (recur (tc-match-scrut val))
+    (cgen:L 0 (recur (tc-match-scrut val))
       (lower-arms (Inc depth) (tc-match-fall val) (tc-match-arms val))))
   ;; Local bindings lower to nested lets: binding i's value sits inside
   ;; i enclosing lets, matching the one-local-per-binding elaboration.
@@ -119,12 +117,20 @@
     (define (go d bs)
       (Ifz bs
         (at d (tc-letrec-body val))
-        (cgen:L (at d (_0 bs)) (go (Inc d) (drop 1 bs)))))
+        (let ((v (_0 bs)))
+          (cgen:L (Eq "TC_DEMAND" (Hd v))
+            (at d (If (Eq "TC_DEMAND" (Hd v)) (tc-demand-val v) v))
+            (go (Inc d) (drop 1 bs))))))
     (go depth (tc-letrec-binds val)))
+  (define (lower-call f x)
+    (If (Eq "TC_DEMAND" (Hd x))
+      ;; A saturated intermediate operator finishes before this argument.
+      (cgen:L 1 f
+        (cgen:L 1 (cgen:shift 1 0 (recur (tc-demand-val x)))
+          (cgen:A (cgen:V 1) (cgen:V 0))))
+      (cgen:A f (recur x))))
   (define (lower-row row)
-    (fold-app
-      (cgen:K (tc-row-hd row))
-      (map recur (tc-row-items row))))
+    (foldl lower-call (cgen:K (tc-row-hd row)) (tc-row-items row)))
   (define (lower-local-path path)
     (define (go acc idx)
       (cgen:A (cgen:A (cgen:K Ix) (cgen:K idx)) acc))
@@ -141,8 +147,10 @@
       (resolve-global depth (tc-global-path val)))
     ((tag-is "TC_LIT")    (cgen:K (tc-lit-val val)))
     ((tag-is "TC_FFI")    (cgen:K (tc-ffi-val val)))
-    ((tag-is "TC_APP")    (cgen:A (recur (tc-app-f val))
-                             (recur (tc-app-x val))))
+    ((tag-is "TC_APP") (lower-call (recur (tc-app-f val)) (tc-app-x val)))
+    ((tag-is "TC_DEMAND") (cgen:L 1 (recur (tc-demand-val val)) (cgen:V 0)))
+    ((tag-is "TC_BEFORE") (cgen:before (recur (tc-before-val val))
+                             (recur (tc-before-body val))))
     ((tag-is "TC_LAM")    (lower-lam val))
     ((tag-is "TC_ROW")    (lower-row val))
     ((tag-is "TC_TYP")    (cgen:K val))
@@ -152,52 +160,22 @@
     (else (error ("lowering" val)))))
 
 ;; lower-tc : Subject -> TC -> IR
-;; Legacy entry-at-a-time lowering: every global is resolved immediately to
-;; the pinned entry already present in the progressively lowered subject.
+;; Expression lowering for doctests: globals resolve to compiled subject values.
 (define (lower-tc sut val)
-  (define (legacy-global depth path)
+  (define (resolve-global depth path)
     (cgen:G (got-const path sut)))
-  (lower-tc-go legacy-global sut 0 val))
-
-;; Lowering resolves TC_GLOBAL references from =out= — the subject that
-;; accumulates IR entries — so a referee's compiled value is available
-;; by the time its referrers lower (declaration order is
-;; define-before-use, enforced by elaboration).
-(define (lower-tc-entry out key ent)
-  (define tc (tc-entry-contents ent))
-  (define ir (lower-tc out tc))
-  (define span (tc-entry-span ent))
-  (define val (cgen:compile-expr ir))
-  (define ent1 (make-ir-entry key span val tc ir))
-  (insert-entry-sut key ent1 out))
-
-;; Profiling keeps lowering and PLAN code generation separate.  The final
-;; subject insertion is intentionally outside either forced zone so we do not
-;; repeatedly deep-force the cumulative module subject.
-(define (lower-tc-entry-profiled out key ent)
-  (define label (print-path key))
-  (define tc (tc-entry-contents ent))
-  (define ir
-    (profile-zone:force-zone (strcat ["foil.lower.ir." label])
-      (lower-tc out tc)))
-  (define span (tc-entry-span ent))
-  (define val
-    (profile-zone:force-zone (strcat ["foil.lower.codegen." label])
-      (cgen:compile-expr ir)))
-  (define ent1 (make-ir-entry key span val tc ir))
-  (insert-entry-sut key ent1 out))
+  (lower-tc-go resolve-global sut 0 val))
 
 ;; FFI entries are already runtime values, type entries have no runtime
 ;; representation, IR entries were lowered previously, and members that
 ;; reference const generic parameters cannot lower at the base — their
 ;; instantiations materialize (materialize-consts) and lower instead.
 (define (type-const-param-count typ)
+  (new-ty:require-type-value "lowering" typ)
   (cond
     ((new-ty:scheme? typ) (new-ty:scheme-const-parameter-count typ))
-    ;; New monotypes never carry quantifiers.  Keep the legacy walk wholly on
-    ;; legacy values so a stage-0 Path/Fun is not fed to FoilType matching.
     ((new-ty:monotype? typ) 0)
-    (else (ty:count-cqua typ))))
+    (else (error ["invalid lowering type" typ]))))
 
 (define (const-param-base-tc? tc)
   (Or (tc-has-cparam? tc) (Lt 0 (type-const-param-count (tc-ty tc)))))
@@ -230,14 +208,27 @@
 ;; Compile all lowerable entries owned by one sealed unit behind one recursive
 ;; dispatcher law.  Calling the dispatcher produces the canonical member row;
 ;; a same-unit reference projects from a recursive call through the dispatcher's
-;; lexical self.  Unlike PLAN's strict sequential lets, this representation can
+;; lexical self. This representation can
 ;; construct mutually recursive closures without first constructing a cyclic
 ;; runtime value.  (A letrec (cgen:R) variant was prototyped 2026-07-27 and
 ;; reverted: it knots genuinely cyclic heap values, which the content-addressed
 ;; store cannot pin — the acyclicity here is a load-bearing invariant.)
 ;; Imported references remain pinned G edges through `base`.
+;; Sub-zone helper: open, FORCE
+;; INSIDE, close.  Closing before the value is demanded attributes none
+;; of the work to the zone — laziness smears it onto whoever forces it.
+;; c-lower and c-consts had no internal zones at all, which is why the
+;; remaining superlinearity could not be attributed.
+(define (lspan lbl v)
+  (define h (ZoneStart lbl))
+  (Seq h (Seq (DeepSeq v 0) (Seq (ZoneEnd h) v))))
+
 (define (lower-tc-unit-go base final own-keys profiled?)
-  (define paths (unit-own-lowerable-keys final own-keys))
+  ;; NB: this zone is the first thing to force `final`'s entries (canon
+  ;; and the lowerable filter touch each one), so it absorbs work that
+  ;; logically belongs to the phases after it.  Read it as "keys plus
+  ;; whatever forcing the subject costs", not as sorting alone.
+  (define paths (lspan "l-keys" (unit-own-lowerable-keys final own-keys)))
   (define (slot-of path)
     ;; Runtime erases ordinary type arguments.  Prefer an exact materialized
     ;; const-generic entry, then let a virtual /ty-ap reference share the slot
@@ -265,12 +256,13 @@
   (define binds
     (If profiled?
       (profile-zone:force-zone "foil.lower.unit.ir" (lower-all 0))
-      (lower-all 0)))
+      (lspan "l-ir" (lower-all 0))))
   (Ifz (Sz paths)
     final
     (let* ((row-body
-             (fold-app (cgen:K 0)
-               binds))
+             (lspan "l-foldapp"
+               (fold-app (cgen:K 0)
+                 binds)))
            ;; At row-body depth zero, V 0 is UNIT's self and V 1 is its
            ;; deliberately unused forcing argument.  Entry-local lambdas add
            ;; their complete frames to the resolver depth above.
@@ -280,8 +272,8 @@
              (If profiled?
                (profile-zone:force-zone "foil.lower.unit.codegen"
                  (cgen:compile-expr group-ir))
-               (cgen:compile-expr group-ir)))
-           (values-pin (Pin values))
+               (lspan "l-codegen" (cgen:compile-expr group-ir))))
+           (values-pin (lspan "l-pin" (Pin values)))
            (insert-one
              (lambda (out pair[i key])
                (let* ((old (got-entry key final))
@@ -296,18 +288,15 @@
                  (insert-entry-sut key ent out)))))
       ;; The shared dispatcher is compiled once; every entry stores an indexed
       ;; value and a projection IR suitable for downstream caches/debugging.
-      (foldl insert-one final
-        (zip (gen (Sz paths) (lambda (i) i)) paths)))))
+      (lspan "l-insert"
+        (foldl insert-one final
+          (zip (gen (Sz paths) (lambda (i) i)) paths))))))
 
 ;; lower-tc-unit : Subject -> Subject -> [Path] -> Subject
 ;; `base` contains mounted/imported lowered entries; `final` is the sealed,
 ;; elaborated unit subject; `own-keys` identifies this unit's layer.
 (define (lower-tc-unit base final own-keys)
   (lower-tc-unit-go base final own-keys 0))
-
-;; lower-tc-unit-profiled : Subject -> Subject -> [Path] -> Subject
-(define (lower-tc-unit-profiled base final own-keys)
-  (lower-tc-unit-go base final own-keys 1))
 
 ;;; Const-parameter materialization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -349,12 +338,10 @@
           (error ["unsubstituted const parameter" (tc-cparam-name tc)])
           (let ((arg (_1 (_0 hit))))
             (If (ty-val-path? arg)
-              ;; The literal's singleton type follows the parameter's algebra.
+              ;; Const values retain their singleton type after substitution.
               (let ((v (Ix 1 arg)))
                 (tc-lit
-                  (If (new-ty:type-value? (tc-ty tc))
-                    (new-ty:tconst v)
-                    (ty:TNAT v))
+                  (new-ty:tconst v)
                   v))
               (let ((referee (got-entry-tc arg sut)))
                 (If (Eq "TC_LAM" (Hd referee))
@@ -362,6 +349,10 @@
                   referee)))))))
     ((tag-is "TC_GLOBAL")
       (tc-global (tc-ty tc) (subst-path-args mapping (tc-global-path tc))))
+    ((tag-is "TC_DEMAND")
+      (tc-demand (tc-ty tc) (recur (tc-demand-val tc))))
+    ((tag-is "TC_BEFORE")
+      (tc-before (tc-ty tc) (recur (tc-before-val tc)) (recur (tc-before-body tc))))
     ((tag-is "TC_APP")
       (tc-app (tc-ty tc) (recur (tc-app-f tc)) (recur (tc-app-x tc))))
     ((tag-is "TC_LAM")
@@ -399,10 +390,10 @@
   (_1
     (foldl
       (lambda (st d)
-        (Ifz (getax d (_0 st))
-          [(putax d 1 (_0 st)) (snoc d (_1 st))]
+        (Ifz (cairn:getax d (_0 st))
+          [(cairn:putax d 1 (_0 st)) (snoc d (_1 st))]
           st))
-      [empty-ax []] (go x))))
+      [cairn:empty-ax []] (go x))))
 
 ;; Materialize every referenced ground instantiation: walk the order;
 ;; before each referrer, DFS-insert its (transitive) materializations.
@@ -411,33 +402,39 @@
   ;; Keep cache/linking projection bugs inside the compiler's structured
   ;; diagnostic vocabulary instead of leaking an unlocated `need-fail`.
   (define (materialize-entry phase key ax)
-    (define hit (getax key ax))
+    ;; the walk's accumulator first (own + fresh materializations),
+    ;; then the subject's lazy mounts — an imported generic base or
+    ;; instantiation is no longer materialized into the trie
+    (define hit0 (cairn:getax key ax))
+    (define hit (If hit0 hit0 (foil-subject:sut-find key sut)))
     (Ifz hit
       (error ["foil-materialize-missing-entry" ["phase" phase] ["path" key]])
       (unpin-soft (_0 hit))))
   (define (member-mapping key)
     (define base (ty-ap-base key))
-    (define bentry (materialize-entry "member-mapping" base (_0 sut)))
+    (define bentry (materialize-entry "member-mapping" base (sut-ax sut)))
     (define bty (tc-ty (tc-entry-contents bentry)))
-    ;; Parameter names in declaration order, from whichever algebra the
-    ;; base's type belongs to.
+    ;; Parameter names in declaration order from the base scheme.
     (define names
       (If (new-ty:scheme? bty)
         (map new-ty:parameter-name (new-ty:scheme-parameters bty))
-        (Weld (ty:tqua-names bty) (map (Ix 0) (ty:cqua-pairs bty)))))
+        (error ["generic base requires a Scheme" base bty])))
     (zip names (drop 1 (ty-ap-decode key))))
   (define (materialize st key)
     (define ax (_0 st))
     (define done (_1 st))
     (define order (_2 st))
     (cond
-      ((Ifz (getax key done) 0 1) st)
+      ((Ifz (cairn:getax key done) 0 1) st)
       ;; An imported subject already materialized (and lowered) this
       ;; exact instantiation: reuse its entry.  Overwriting it with a
       ;; fresh TC would lower it a second time and duplicate its key
       ;; in the order.
-      ((Ifz (getax key ax) 0 1)
-        [ax (putax key 1 done) order])
+      ((Ifz (cairn:getax key ax) 0 1)
+        [ax (cairn:putax key 1 done) order (Ix 3 st)])
+      ;; an import already materialized it — behind the mount stack now
+      ((Ifz (foil-subject:sut-find key sut) 0 1)
+        [ax (cairn:putax key 1 done) order (Ix 3 st)])
       (else
         (let* ((base (ty-ap-base key))
                (bent (materialize-entry "generic-base" base ax))
@@ -448,50 +445,35 @@
                         (strcat ["foil.materialize.const." (print-path key)])
                         mtc0)
                       mtc0))
-               (st1 (foldl materialize [ax (putax key 1 done) order]
+               (st1 (foldl materialize [ax (cairn:putax key 1 done) order (Ix 3 st)]
                       (const-deps sut mtc))))
-          [(putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
+          [(cairn:putax key (Pin (make-tc-entry key (tc-entry-span bent) mtc))
              (_0 st1))
            (_1 st1)
-           (snoc key (_2 st1))]))))
+           (snoc key (_2 st1))
+           ;; created keys bypass the logged writers; collect them so
+           ;; the seal below can join them to the subject's write log
+           (lcons key (Ix 3 st1))]))))
   (define (walk st key)
     (define ent (materialize-entry "subject-order" key (_0 st)))
     (define st1
       (If (Eq (Hd ent) "TC")
         (foldl materialize st (const-deps sut (tc-entry-contents ent)))
         st))
-    [(_0 st1) (_1 st1) (snoc key (_2 st1))])
+    [(_0 st1) (_1 st1) (snoc key (_2 st1)) (Ix 3 st1)])
   ;; done is a pure membership set (never read as a list) — an AX
+  ;; One zone, on the fold that walks the whole subject-order.  Do NOT
+  ;; add a second zone around the seal below: it forces `final`, so it
+  ;; absorbs this fold's work and reports it twice (measured — mc-seal
+  ;; and mc-walk came back with segment counts two apart).  Per-entry
+  ;; zones inside walk are worse still: ~30% overhead and, because the
+  ;; order accumulator is lazy, each one re-forces its predecessors.
   (define final
-    (foldl walk [(_0 sut) empty-ax []] (subject-order sut)))
+    (lspan "mc-walk"
+      (foldl walk [(sut-ax sut) cairn:empty-ax [] 0] (subject-order sut))))
+  ;; created keys already joined the order in the walk; the module
+  ;; delta walks the order (the slot-7 write log is retired)
   (set-subject-order (_2 final) (snap 0 (lambda (z) (_0 final)) sut)))
 
 (define (materialize-consts sut)
   (materialize-consts-go sut 0))
-
-(define (materialize-consts-profiled sut)
-  (materialize-consts-go sut 1))
-
-(define (lower-tc-mod-go sut out)
-  (define n[next sut1] (pop-subject-order sut))
-  (define entry (got-entry next sut))
-  (Ifz (subject-order sut) out
-    (let ((out1 (If (lowerable-entry? entry)
-                  (lower-tc-entry out next entry)
-                  out)))
-      (lower-tc-mod-go sut1 out1))))
-
-(define (lower-tc-mod sut out)
-  (lower-tc-mod-go sut out))
-
-(define (lower-tc-mod-profiled-go sut out)
-  (define n[next sut1] (pop-subject-order sut))
-  (define entry (got-entry next sut))
-  (Ifz (subject-order sut) out
-    (let ((out1 (If (lowerable-entry? entry)
-                  (lower-tc-entry-profiled out next entry)
-                  out)))
-      (lower-tc-mod-profiled-go sut1 out1))))
-
-(define (lower-tc-mod-profiled sut out)
-  (lower-tc-mod-profiled-go sut out))

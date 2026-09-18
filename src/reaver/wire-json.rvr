@@ -1,9 +1,7 @@
 ;;;; JSON text plumbing for the buddy's wire port: encoders that build
-;;;; response text directly (no value tree), and rep-walkers over
-;;;; json.foil's decoded values (nominal member rows — see
-;;;; doc/buddy-wire.md).  The PARSER itself stays in json.foil; a
-;;;; caller compiles it (compile-mod-cached "json" — it imports
-;;;; nothing) and hands the jres to these walkers.
+;;;; response text directly, and a compiled-module codec for json.foil's
+;;;; nominal values. The parser stays in json.foil. Its exact constructor
+;;;; identities are supplied by its artifact, never reconstructed from names.
 
 (#bind std (#module std))
 (#import std)
@@ -11,6 +9,7 @@
 (#bind reef (#module reef))
 (#import reef)
 
+(#bind abi (#module foil-abi))
 (#bind parse (#module parse))
 (#import parse)
 
@@ -58,35 +57,70 @@
 
 (define (jarr-str xs) (jarr (map jq xs)))
 
-;;; Decoding: walkers over json.foil's runtime reps ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; parse -> ("/boot/jres/ok" v rest) | ("/boot/jres/err" why rest)
-;;; v -> ("/boot/json/obj" kvs) kvs=[("/boot/jkv" k v)..]
-;;;      ("/boot/json/str" s) ("/boot/json/num" neg n)
-;;;      ("/boot/json/arr" xs) ("/boot/json/boo" b) ("/boot/json/nul" z)
+;;; The compiled JSON module supplies every nominal identity. Decoded
+;;; values are translated once into a private host tree; these layout tags
+;;; are not Shrine brands and never escape as Foil values.
+(define (codec perc)
+  [(abi:constructor perc ["jres" "ok"])
+   (abi:constructor perc ["jres" "err"])
+   (abi:constructor perc ["jkv"])
+   (map (lambda (pair)
+     [(_0 pair) (abi:constructor perc ["json" (_0 pair)]) (_1 pair)])
+     [["nul" 1] ["boo" 1] ["num" 2] ["real" 1]
+      ["str" 1] ["arr" 1] ["obj" 1]])])
 
-(define (jok? r) (And (IsApp r) (Eq "/boot/jres/ok" (Hd r))))
-(define (jval r) (_0 r))
+(define (shaped? brand arity value)
+  (And (IsApp value)
+    (And (Eq brand (Hd value)) (Eq arity (Sz value)))))
+(define (jok? codec result) (shaped? (_0 codec) 2 result))
+(define (jval result) (_0 result))
 
-;; The value at key k of an object, or 0.
-(define (jget k v)
-  (If (And (IsApp v) (Eq "/boot/json/obj" (Hd v)))
-    (let ((hit (find (lambda (kv) (Eq k (_0 kv))) (_0 v))))
-      (Ifz hit 0 (_1 (_0 hit))))
-    0))
+(define (normalize codec value)
+  (define found (find (lambda (entry)
+    (shaped? (_1 entry) (_2 entry) value)) (_3 codec)))
+  (Ifz found (error ["unknown-json-brand-or-shape" value])
+    (let ((name (_0 (_0 found))))
+      (cond
+        ((Equal name "arr")
+          ("wire/json/arr" (map (normalize codec) (_0 value))))
+        ((Equal name "obj")
+          ("wire/json/obj" (map (lambda (member)
+            (If (shaped? (_2 codec) 2 member)
+              [(_0 member) (normalize codec (_1 member))]
+              (error ["unknown-json-member-brand-or-shape" member]))) (_0 value))))
+        ((Equal name "num") ("wire/json/num" (_0 value) (_1 value)))
+        (else ((strWeld "wire/json/" name) (_0 value)))))))
 
-;; A json string's text (0 for anything else — "" and absent collapse,
-;; which every wire op treats the same).
-(define (jstr v)
-  (If (And (IsApp v) (Eq "/boot/json/str" (Hd v))) (_0 v) 0))
+(define (schema-value codec result)
+  (If (jok? codec result) (normalize codec (_0 result))
+    (If (shaped? (_1 codec) 2 result)
+      (error ["schema-json" (_0 result) (_1 result)])
+      (error ["unknown-json-result-brand-or-shape" result]))))
 
-;; A non-negative json integer, dflt otherwise.
-(define (jnat dflt v)
-  (If (And (IsApp v) (Eq "/boot/json/num" (Hd v)))
-    (If (_0 v) dflt (_1 v))
-    dflt))
+(define (jget key value)
+  (If (shaped? "wire/json/obj" 1 value)
+    (let ((hit (find (lambda (member) (Eq key (_0 member))) (_0 value))))
+      (If hit (_1 (_0 hit)) 0)) 0))
+(define (jstr value)
+  (If (shaped? "wire/json/str" 1 value) (_0 value) 0))
+(define (jnat fallback value)
+  (If (shaped? "wire/json/num" 2 value)
+    (If (_0 value) fallback (_1 value)) fallback))
+(define (jget-str key value) (jstr (jget key value)))
+(define (jget-nat key fallback value) (jnat fallback (jget key value)))
 
-(define (jget-str k v) (jstr (jget k v)))
-(define (jget-nat k dflt v) (jnat dflt (jget k v)))
+(define (jshow value)
+  (cond
+    ((shaped? "wire/json/nul" 1 value) "null")
+    ((shaped? "wire/json/boo" 1 value) (If (_0 value) "true" "false"))
+    ((shaped? "wire/json/str" 1 value) (jq (_0 value)))
+    ((shaped? "wire/json/real" 1 value) (_0 value))
+    ((shaped? "wire/json/num" 2 value)
+      (strWeld (If (_0 value) "-" "") (showNat (_1 value))))
+    ((shaped? "wire/json/arr" 1 value) (jarr (map jshow (_0 value))))
+    ((shaped? "wire/json/obj" 1 value)
+      (jobj (map (lambda (member) [(_0 member) (jshow (_1 member))]) (_0 value))))
+    (else (error ["invalid-host-json-value" value]))))
 
 ;;; Diagnostic rows as a JSON array ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

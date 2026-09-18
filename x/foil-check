@@ -1,0 +1,195 @@
+#!/bin/sh
+# x/foil-check --node 0xPUBKEY MODULE...      (foil/sept.foil, src/foil/sept.foil, sept, http)
+#
+# Compiles each module through foil-source and the sole foil-new-env driver,
+# forces every lowered entry the compile produced, and prints the
+# diagnostics as located lines.  Exit 1 when any module fails.
+#
+# This is the "does it compile" check for a migrated .foil file; use
+# x/sast-diff for "did the parse change".  Imports compile along the
+# way, so a module whose imports are still unmigrated reports THEIR
+# diagnostics (under "in module <name>:").
+#
+# Warms from the matching x/check template (run x/check once first).
+# FOIL_SRC=<dir> compiles from another source root (default src): a
+# scratch copy of src with a patched import, say, so one module can be
+# checked while an import it needs is mid-edit.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="${FOIL_SRC:-$ROOT/src}"
+WISP="${WISP:-$(command -v wisp || echo "$ROOT/wisp")}"
+if [ ! -x "$WISP" ]; then
+  echo "x/foil-check: no wisp on PATH and no $ROOT/wisp" >&2; exit 2
+fi
+TPL="$(python3 - "$ROOT" "$WISP" <<'PYCODE'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / 'x'))
+from test_runner import compiler_key
+print(root / '.check' / ('template-' + compiler_key(sys.argv[2])))
+PYCODE
+)"
+if [ -z "$TPL" ] || [ ! -e "$TPL/data.mdb" ]; then
+  echo "x/foil-check: no matching compiler/runtime template - run x/check first" >&2; exit 2
+fi
+if [ $# -eq 0 ]; then
+  echo "usage: x/foil-check MODULE..." >&2; exit 2
+fi
+if [ "$1" != "--node" ] || [ $# -lt 3 ]; then
+  echo "usage: x/foil-check --node 0xPUBKEY MODULE..." >&2; exit 2
+fi
+NODE_NUMBER="$(python3 - "$ROOT/x" "$2" <<'PYCODE'
+import sys
+sys.path.insert(0, sys.argv[1])
+from namespace_identity import parse_node_identity
+try:
+    value, spelling = parse_node_identity(sys.argv[2])
+except ValueError as error:
+    raise SystemExit(str(error))
+print(value)
+PYCODE
+)"
+shift 2
+MODS=""
+for a in "$@"; do
+  m="$a"
+  m="${m#$ROOT/}"; m="${m#src/}"; m="${m#foil/}"; m="${m%.foil}"
+  MODS="$MODS $m"
+done
+
+DIR="$ROOT/.check/foil-check"
+rm -rf "$DIR"; mkdir -p "$DIR/snap"
+cp "$TPL/data.mdb" "$TPL/pins.pack" "$DIR/snap/"
+{
+  printf '(define publisher-authority ("x" %s))\n' "$NODE_NUMBER"
+  cat <<'EOF'
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind foil-subject (#module foil-subject))
+(#import foil-subject)
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind publication (#module foil-publication))
+(#bind contexts (#module foil-context))
+(Seq (define system-plan (publication:prepare-system
+  (Pin driver:compile) source:read-module bootstrap:system-roots))
+  (DeepSeq system-plan 0))
+(Seq (define system-code (publication:compile system-plan driver:empty-foil-cache))
+  (DeepSeq system-code 0))
+(define (module-root name)
+  (define found (find (lambda (pair) (Equal name (_0 pair))) bootstrap:system-roots))
+  (If found (_1 (_0 found))
+    [["x" (_0 publisher-authority)] ["ts" "lib"] ["ts" name]]))
+(#bind lower (#module foil-lower))
+(#bind foil-render (#module foil-render))
+;; Delta entries are canonical storage keys, including imported generic
+;; instantiations.  Do not resolve them again as root-relative source names.
+;; Force one lowered entry; 0 = fine, else the error
+(define (force-entry sut p)
+  (let ((r (Try (lambda (z) (Seq (DeepSeq (lower:ir-entry-val (got-entry p sut)) 1) 0)) 0)))
+    (If (Eq 1 (Hd r)) (_0 r) 0)))
+;; Render a diagnostic tree defensively: the nested shapes are walked
+;; here (foil-in-module, foil-new-elab-errors, in-decl) and every leaf
+;; goes through foil-render:diag-lines under Try, falling back to the
+;; plain printer, so one odd shape cannot swallow the rest.
+(define (leaf-lines e)
+  (let ((r (Try (lambda (z) (let ((ls (foil-render:diag-lines e))) (Seq (DeepSeq ls 1) ls))) 0)))
+    (If (Eq 1 (Hd r)) [(foil-render:render-plain e)] (_0 r))))
+(define (say prefix l) (print ("FCL" (strWeld prefix l))))
+(define (emit prefix e)
+  (define tag (If (IsApp e) (_0 e) 0))
+  ;; nested: top-level mutual recursion does not resolve in rvr
+  ;; ("in-decl" path inner (0 "line" n "col" m)); nats go through
+  ;; showNat because the plain printer shows a printable nat as text
+  (define (blurb-text b)
+    (If (And (IsApp b) (Eq 4 (Sz b)))
+      (strcat ["line " (showNat (_1 b)) " col " (showNat (_3 b))])
+      (foil-render:render-plain b)))
+  (define (emit-decl d)
+    (Seq (say prefix (strcat [(foil-render:path-text (_1 d)) "  (" (blurb-text (_3 d)) ")"]))
+      (emit (strWeld prefix "  ") (_2 d))))
+  (cond
+    ;; a reader error: ("rex" (0 "unbalanced close paren" "line" n "col" m))
+    ((And (IsApp e) (Eq "rex" (Hd e)))
+      (let ((m (_0 e)))
+        (say prefix
+          (If (And (IsApp m) (Eq 5 (Sz m)))
+            (strcat ["rex: " (_0 m) " at line " (showNat (_2 m)) ", col " (showNat (_4 m))])
+            (strcat ["rex: " (foil-render:render-plain m)])))))
+    ((Eq tag "foil-in-module")
+      (Seq (say prefix (strcat ["in module " (foil-render:atom-str (_1 e)) ":"]))
+        (emit (strWeld prefix "  ") (_2 e))))
+    ((Eq tag "foil-new-elab-errors")
+      (DeepSeq (map emit-decl (_1 e)) 1))
+    (else (DeepSeq (map (lambda (l) (say prefix l)) (leaf-lines e)) 1))))
+(define (check mod)
+  (define result (Try (lambda (z)
+    (define plan (source:prepare-publication
+      (contexts:publication-key (publication:compilation-context system-plan))
+      (Pin driver:compile) module-root (_2 system-code) (lambda (path) 0) [mod]))
+    (force (_1 (source:compile (publication:compilation-context plan)
+      (_1 system-code) mod)))) 0))
+  (If (Eq 1 (Hd result))
+    (Seq (print ("FC" mod "FAIL")) (emit "" (_0 result)))
+    (let* ((perc (_0 result))
+           (sut (driver:perc-subject perc))
+           (own (driver:perc-own-keys perc))
+           (bad (filter (lambda (pe) (Truth (_1 pe)))
+             (map (lambda (p) [p (force-entry sut p)]) own))))
+      (If (Sz bad)
+        (Seq (print ("FC" mod "FAIL"))
+          (DeepSeq (map (lambda (pe) (emit "  " (_1 pe))) bad) 1))
+        (print ("FC" mod "OK" (Sz own) (Sz own)))))))
+
+EOF
+  for m in $MODS; do echo "(check \"$m\")"; done
+  echo '(print ("FC-DONE" 0))'
+} > "$DIR/input"
+( cd "$DIR" && "$WISP" --file-root "$SRC" snap root _ < input > out.log 2>&1 ) || true
+
+RC=0
+if ! grep -aq '^("FC-DONE"' "$DIR/out.log"; then
+  echo "x/foil-check: the session did not finish (see $DIR/out.log)" >&2
+  grep -a -m3 -A6 '^("ERROR"\|^("Error"' "$DIR/out.log" | cut -c1-200 >&2
+  exit 2
+fi
+# a print can appear twice in a row (stdout+stderr are merged) and the
+# printer wraps long rows across lines: parse the FC/FCL forms with
+# python, dropping only ADJACENT repeats (the same text recurs
+# legitimately across diagnostics: "unbound reference" twice)
+python3 - "$DIR/out.log" <<'PY'
+import re, sys
+log = open(sys.argv[1], 'rb').read().decode('utf8', 'replace')
+prev = None
+def unq(s):  # a printed cord: "..." with "" for an embedded quote, \\ for a backslash
+    s = s.strip()
+    if s.startswith('"') and s.endswith('"'):
+        s = s[1:-1]
+    return s.replace('""', '"').replace('\\\\', '\\')
+# verdict rows are one line; text rows may wrap: the value sits on the
+# next line(s) and the print ends at a line ending in ")
+pat = re.compile(r'^\("FC" ([^\n]*)\)$|^\("FCL"[ \t]*((?:[^\n]*\n)*?[^\n]*")\)$', re.M)
+for m in pat.finditer(log):
+    if m.group(1) is not None:
+        key = ('FC', m.group(1))
+        if key == prev: continue
+        prev = key
+        parts = re.findall(r'"(?:[^"]|"")*"|\S+', m.group(1))
+        mod = unq(parts[0]); verdict = unq(parts[1])
+        if verdict == 'OK':
+            print(f"{mod}: OK  ({parts[2]} entries, {parts[3]} lowered)")
+        else:
+            print(f"{mod}: FAIL")
+    else:
+        key = ('FCL', m.group(2))
+        if key == prev: continue
+        prev = key
+        for line in unq(m.group(2)).split('\n'):
+            print('    ' + line)
+PY
+grep -aq '^("FC" "[^"]*" "FAIL")' "$DIR/out.log" && RC=1
+exit $RC

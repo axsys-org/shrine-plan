@@ -42,7 +42,7 @@ This example establishes the visual grammar and several preferred idioms:
 +  sum_to
   \  n=nat
   ^  nat
-  |  > i=nat n  > acc=nat 0
+  %  i=nat n  acc=nat 0
   ?  (eq i 0)
      acc
   (_ (dec i) (add acc i))
@@ -89,6 +89,13 @@ casts, calls, and row literals all produce values.
 ## Modules, declarations, and namespaces
 
 ### Imports
+
+The new `foil-new-env` driver uses nearest-definition precedence, then
+later source-order ties, with transitive unprefixed visibility. It rejects
+`[order=...]`. Prefixes change spelling, not defining-module identity.
+See `doc/foil-new-env-imports.md` for the exact rules. `foil-new-env` is
+the sole compiler. File callers use `foil-source`, which normalizes the
+shared sources’ historical order annotations before invoking the driver.
 
 ```foil
 -  sept
@@ -169,8 +176,9 @@ nullary constant.
 | `row[nat]` | homogeneous builtin row |
 | `box[v]` | generic application |
 | `[x=nat y=nat]` | fixed anonymous structural row |
-| `{nat; nat}` | one `nat` argument returning `nat` |
-| `{a; b; c}` | arguments `a`, `b`, returning `c` |
+| `{\ nat}nat` | one `nat` argument returning `nat` |
+| `{\ a b}c` | arguments `a`, `b`, returning `c` |
+| `{\}unit` | no arguments, returning `unit` |
 | `pail` | open union of all named row types in the namespace |
 
 Specialization uses square brackets and is positional:
@@ -184,6 +192,18 @@ bst/insert[nat]
 
 `=type` is an autonamed face. For example, `: =lock epochs=uon[nat]`
 means `: lock=lock epochs=uon[nat]`.
+
+`and : {\ bool bool}bool` is the named conjunction operation. Like `&&`,
+it does not evaluate its right operand when the left operand is false.
+
+### Sibling references
+
+`%/name` resolves relative to the parent of the current declaration.
+Inside `fs_foot/on_fact`, `%/on_bind` names `fs_foot/on_bind`.
+At module top level, `%/name` names a module-level declaration.
+Nested namespaces establish their own sibling scope; resolution does not
+search ancestors if that exact sibling is missing. The syntax also works
+in type annotations and with suffixes such as `%/helpers/read`.
 
 ### Named rows
 
@@ -207,6 +227,13 @@ l.data
 l.set_data(4)
 l.over_data(inc)
 ```
+
+Named records also get `T/try_from_pail : {\ pail}maybe[T]`.
+It returns `.some` for the record's exact nominal brand and arity, or
+`.none` otherwise, preserving the complete record as the payload.
+For a generic record use `box/try_from_pail[nat]`. Like `pail/as[T]`,
+this checks nominal identity and arity; generic arguments are erased.
+The helper name is reserved within a record declaration.
 
 Updates are functional and return a new row. `.#` and `.%` parse but are not
 implemented; always use `set_<field>` and `over_<field>`.
@@ -338,13 +365,13 @@ No commas or named argument syntax are used. A parenthesized call with fewer
 arguments may be a partial application when its expected function type makes
 that valid, as in `(add 3)`.
 
-### The call rune `%`
+### The call rune `|`
 
-`%` is a call written as a rune instead of parentheses: its children and
+`|` is a call written as a rune instead of parentheses: its children and
 its heir become one application.
 
 ```foil
-%  f
+|  f
    x
    y
 z
@@ -352,7 +379,7 @@ z
 
 means `(f x y z)`. The first child is the function; every later child,
 then the heir, is an argument. Children may also sit on the rune's own
-line, so `%  f x y` with heir `z` is the same call.
+line, so `|  f x y` with heir `z` is the same call.
 
 This is what a call spread over lines looks like when an argument is
 long enough that a parenthesized call would wrap badly, and — because
@@ -360,15 +387,40 @@ the heir is the rest of the body — it is also how a call takes
 everything that follows as its final argument:
 
 ```foil
-%  (if (eq a 0) b)
+|  (if (eq a 0) b)
 (_ (dec a) (inc b))
 ```
 
 means `(if (eq a 0) b (_ (dec a) (inc b)))`. A head that is already a
 call flattens into one application rather than nesting.
 
-In a position with no heir, the children alone make the call: `(% f x y)`
-is `(f x y)`. `%` with a single child and nothing to apply is that child.
+In a position with no heir, the children alone make the call: `(| f x y)`
+is `(f x y)`. `|` with a single child and nothing to apply is that child.
+
+A dotted head folds the operands into its last method segment:
+`|  recv.method a b` is `recv.method(a b)` — the same UFCS call with the
+receiver passed last, spread over lines.
+
+`#` on a call head reverses the arguments: `(#str/cat a b)` is
+`(str/cat b a)`, so a receiver-last builtin reads left to right without
+UFCS. It is an involution (`##f` is `f`), it prefixes only a saturated
+call (a partial `(#f a)` or a bare `#f` is a diagnostic), and it has no
+tall form — `#f`, `#str/cat`, `#(expr)`, or as a `|` head.
+
+Operand lines are siblings, one operand each, with one exception: a
+`\` operand line followed by sibling lines takes them as its body
+chain, the way a lambda line does at the top of a body, and closes the
+operand list. The heir is still the call's last argument:
+
+```foil
+|  l.kid.uno
+   \ k2 aw bw
+   | axal/k[v] | pin | me k2 (unpin aw.held) | unpin bw.held
+r.kid
+```
+
+is `l.kid.uno((\ k2 aw bw (axal/k[v] ...)) r.kid)`. Only `\` chains this
+way; a `|` or `?` operand followed by a sibling line stays two operands.
 
 ### UFCS methods
 
@@ -519,11 +571,12 @@ A bare stage `f` means `(f accumulator)`. A call-shaped stage `g(a b)` means
 
 ### Loops
 
-`|` creates an immediately applied loop with typed parameters and initial
-values:
+`%` creates an immediately applied loop from `name=type init` pairs — each
+is a typed parameter with its initial value (no `>` arms: `>` is match and
+guard only):
 
 ```foil
-|  > i=nat n  > acc=nat 0
+%  i=nat n  acc=nat 0
 ?  (eq i 0)
    acc
 (_ (dec i) (add acc i))
@@ -546,10 +599,10 @@ Modern Foil accepts bare name/value pairs:
 body_using_both
 ```
 
-Typed bindings use `>` arms:
+Typed bindings use an annotated pattern:
 
 ```foil
-=  > item=nat expression
+=  item=nat expression
 body
 ```
 
@@ -644,7 +697,7 @@ declaration and all descendants:
 ```foil
 +  transform
   (@ v w)
-  \  f={v; w} x=v
+  \  f={\ v}w x=v
   ^  w
   (f x)
 ```
@@ -665,7 +718,7 @@ Compile-time constant parameters are faced entries in a generic variable
 list:
 
 ```foil
-(@@ k lt={k; k; nat})
+(@@ k lt={\ k k}nat)
 ```
 
 Instantiate both the type and constant: `map[nat lt]`. Constant arguments are
@@ -678,7 +731,9 @@ UFCS extension, repeat the original `@@` parameter names and order.
 ### Literals
 
 - `42` is a nat literal. Nonzero literals initially have singleton types;
-  inference widens them where needed. `0` is the general nat case.
+  inference widens them where needed. `0` is the general nat case. A bare
+  nat never flows into `str`/`sym` on its own; the explicit cast `^ str 3`
+  claims the aura (and changes nothing at runtime).
 - `"text"` is a packed-nat cord literal.
 - `'reason`, `'%symbol`, and `'0x1f` are tagged quip literals.
 - `'$name` in a type position is a constant symbol type.
@@ -753,8 +808,9 @@ When asked to create or change Foil:
    annotate ambiguous constructions.
 6. Use prefix calls for ordinary functions and UFCS for real receiver-oriented
    operations. Verify the receiver-last parameter order.
-7. Model failure with an option/result sum. Foil has no general user-level
-   crash/abort primitive.
+7. Model recoverable failure with an option/result sum. `error` has type
+   `{\ pail}nat` and raises its named-row payload when evaluated. It never
+   returns; `nat` is the declared result without a divergence type.
 8. Add or update a slug doctest for small public behavior when practical.
 9. Compile the real module. Import behavior cannot be validated by the
    in-memory `compile-inline` test helper.
@@ -771,7 +827,9 @@ When asked to create or change Foil:
 \  x=type y=type BODY             function/lambda
 ^  type BODY                      type/result ascription
 (f a b)                           prefix call
-%  f / a / b                      call rune: children + heir = (f a b ..)
+|  f / a / b                      call rune: children + heir = (f a b ..)
+(#f a b)                          the same call with the arguments reversed (## = id)
+|  recv.m a / b                   call rune, dotted head: recv.m(a b)
 f[type const]                     explicit specialization
 [a b c]                           row value
 [x=type y=type]                   anonymous row type/pattern
@@ -780,14 +838,15 @@ recv.method(a b)                  UFCS; receiver passed last
 ?  cond YES / NO                  truthy conditional
 ?  value / > PAT BODY ...         pattern match
 ?> PAT value / ELSE / REST        bind-or-else guard
+<  PAT value / MAPPER? / REST     bind-or-propagate (either err/ok, maybe some/none)
 ?=(PAT value)                     pattern predicate
 !?=(PAT value)                    negated pattern predicate
 !value                            truthy negation
 (a || b)                          truthy disjunction
 =  name VALUE / BODY              sequential local binding
-=  > name=type VALUE / BODY       typed local binding
+=  name=type VALUE / BODY         typed local binding
 =  [a b] VALUE / BODY             positional destructuring
-|  > x=type init / BODY           loop
+%  x=type init / BODY             loop (pairs; no > arms)
 (_ args...)                       recurse/re-enter
 (_)                               bare self function
 |> seed / f / g(a b)              first-argument pipeline
@@ -795,3 +854,261 @@ recv.method(a b)                  UFCS; receiver passed last
 (./tag args...)                   relative payload variant
 '  text                           doc/slug comment
 ```
+
+
+### Native actor and snapshot operations
+
+The raw builtins retain their runtime spellings:
+
+- `Save : (@ a) {\ pin[a]}nat` writes a pinned snapshot root.
+- `Spawn : (@ a) {\ {\ nat}a}nat` starts a compiled function with
+  self handle `0` and returns a handle local to the spawning actor.
+- `Send : {\ nat any}nat` sends a message without capabilities.
+- `SendCaps : {\ nat any row[nat]}nat` transfers the listed actor
+  capabilities with the message.
+- `Recv : (@ message) {\ nat}[message=message caps=row[nat]]` receives
+  from the current actor's mailbox; use `(Recv[my_message] 0)` and
+  destructure the returned row.
+- `CloseHandle : {\ nat}nat` drops a local actor handle; it does not
+  stop the target actor.
+
+Use explicit demand to sequence these operations. A handle number inside
+the message is just data: transfer capabilities through `SendCaps` and use
+the recipient-local handles returned by `Recv`. The chosen message type
+is trusted, not checked by the transport; it must match the foot's protocol.
+`Save` changes
+the runtime snapshot root, so save the intended continuation, not an
+arbitrary intermediate value. Adding these operations does not enable
+automatic application persistence.
+
+### Explicit demand (`;`)
+
+Foil remains lazy by default. `= ;x=nat expr` and `= x ;expr` demand
+one shared initializer before continuing; `(f ;expr)` demands the operand
+at its call boundary even if `f` ignores it. `\ ;x=nat y=nat` demands `x`
+when the original function body is entered, not when partially applied.
+A tall `; expr` sequences that demand before the following body, and a
+final `;expr` demands and returns the result. Branches and unused lazy
+initializers keep their own evaluation boundaries. Demand uses runtime
+`Seq`, so a row's fields remain lazy. Existing block-mode argument
+separators retain their meaning.
+
+The final codegen let is `L now value body` (0 lazy, 1 strict). `TC_DEMAND`
+and `TC_BEFORE` are temporary typed nodes consumed by lowering. `F` and
+`A` have no strictness metadata. IR_ENTRY version 2 rejects old persisted
+IR caches; clear and rebuild them. `x/strict-let-check` verifies exact
+traces against a memoizing interpreter and through the Foil compiler.
+
+
+### Foil supervisor and feet
+
+`helm.foil` owns the supervisor and the `feet/task` / `feet/gift`
+protocol. `supervisor/handle` executes pure namespace transitions;
+`supervisor/run` sequences registration, binding updates, and replies.
+Bootstrap code sends `helm/card` or `supervisor/register` with a reply
+capability. Each foot receives a dedicated endpoint that resolves relative
+paths and delivers replies to that foot. It is not a write-permission policy.
+Changed `%y` bindings arrive before the write acknowledgment.
+
+`src/reaver/eden.rvr` compiles Eden and invokes it. `eden/main` boots the
+namespace and registers `http_foot/run`. There are no Reaver Helm adapters,
+`driver_in` / `driver_out` records, or duties. Registration is explicit and
+in memory. Persistence, actor discovery/restarts, crew subscriptions, and
+outbound move routing are not implemented. Incomplete cascades and kernel
+outbound moves reject atomically.
+
+Run `x/check foil:tests/supervisor foil:tests/http_foot` and
+`x/eden --check` for the actual HTTP path. See `doc/helm-foil.md` and
+`doc/foil-feet.md`.
+
+### Shared builtin type core
+
+`foil-type-core.rvr` owns the new builtin type declarations. Its single
+TypeEntry table supplies both `default-type-world` and a type-only
+`core-subject` containing new Scheme-backed TC_TYP entries. It is independent
+of the elaborator, FFI implementations, and the old solver. `foil-new-elab`
+uses this world and shares its aura vocabulary and builtin maybe brands.
+Typed Reaver and every production builtin FFI signature now use this core
+and the new kernel. `typed-reaver-types.rvr` adapts generic application and
+shallow runtime shape checks without importing the old solver or compiler.
+Typed metadata is `typed-reaver/v2`; stale v1 and old-algebra payloads are
+rejected. Production still installs raw FFI values after static checking;
+checked manifest wrappers remain available. Subject-to-world replay lives
+in the shared core so those wrappers can resolve local declarations.
+The elaborator, lowering, renderer, relocation, and inspection consumers
+now accept the new representation. Inspection distinguishes sum/row/type
+entries and walks semantic TC/type positions for reference edges; literal,
+FFI, and const payloads remain opaque. The unused old `got-type` API is
+removed; type consumers use the kernel or the explicit TC_TYP payload.
+Subject span lookup reads TC/IR_ENTRY source spans.
+`foil-types.rvr`, `foil-core-types.rvr`, and `foil-types-tests.rvr` have
+been deleted. Guards reject their return to source modules, imports,
+test inventory, or source-browser listings. Old type tags remain only in
+stale-payload rejection tests. `newtype.rvr` remains the shared descriptor
+and record-construction foundation, not a second Foil solver.
+See `doc/foil-type-system-retirement.md`.
+
+## Shared text and record utilities
+
+Prefer Sept's `str/cat_all`, `str/join`, and `nat/show` to local string
+accumulators. `str/split_byte` retains empty segments (including empty
+input); `str/split_nonempty` drops zero-length spans. Both scan bytes.
+`str/find` returns the first byte offset, `str/trim_ascii` trims boundary
+bytes <= 32, `str/ascii_lower` folds A..Z, and `str/repeat` repeats a chunk.
+Legacy nat-cord callers can use `cord/join`, `cord/split_byte`, and
+`cord/split_nonempty`. Do not replace permissive app number parsers with
+strict `nat/parse` without explicitly changing their contract.
+
+`myth/path_at slot record` returns `maybe[path]`: use `.fall([])` only when
+missing and root should mean the same thing. `myth/crew_at slot record`
+returns an empty crew for absent or foreign pails. `myth/copy_slot slot src
+dst` copies any present pail and leaves the destination untouched on absence.
+These live in `lain_types`, not Sept. `mop/filter` takes a key/value predicate;
+`mop/del` removes a comparator-equal key. Both currently rebuild in key order
+(O(n log n)); neither changes the map's nominal representation.
+
+## Rex bindings
+
+Import `rex` for native-compatible surface and normalized syntax trees.
+`rex/parse` parses a whole file into `either[any rex]`; `parse_block` keeps
+the native single-block convention and `parse_normalized` explicitly applies
+normalization. The builtin `rex` sum has all nine native variants and a
+zero-headed `rex/source_span`; do not redeclare their constructor brands.
+`rex/parse_blocks` returns `either[any row[rex]]` using reference block
+boundaries; use it for documents such as Grove. Empty documents yield an empty
+row. The existing `rex/parse` keeps compiler-style whole-file layout.
+
+`rex/word`, `cord`, `rune`, `paren`, `path`, and `dot` build zero-span trees.
+`children`, `map_children`, `walk`, and `rex/fold[value]` support inspection
+and transformation. Walk is bottom-up and never revisits replacement trees.
+
+Use surface `rex/open` nodes when printing prefix declarations. The native
+printer renders normalized clear rune Nests in infix form; printing is not a
+universal inverse of normalization. Feed normalized generated trees directly
+to the compiler when possible. See `doc/foil-rex.md` and the executable
+`test_fixtures/rex_example` for a parse/rewrite/generate/print example.
+
+## Grove v2 syntax AST
+
+`src/foil/grove.foil` parses Grove v2 with `grove/parse` or
+`grove/from_blocks`, returning `either[grove/error grove/document]`.
+It uses reference-style Rex blocks and preserves expressions, types,
+and embedded Foil as surface Rex. It performs no resolution or lowering.
+`! foil` consumes the rest of its enclosing body; do not put blank lines
+inside that code. See `doc/grove-v2.md` and `src/grove/srs.grove`.
+The Reaver Grove implementation is a separate, older design.
+
+### Grove declaration backend
+
+`grove_backend/compile root document ports` returns a located diagnostic or
+canonical `[path myth]` publication records. The host adapter requires a
+compiled publication in `prepare`, then `compile prepared previous lookup root
+ast`. The predecessor reader participates in assigning every generated and
+nested definition before elaboration. Imported artifacts retain their defining
+moments, independently of source mount spelling.
+
+Every nominal definition has a navigable `/sys/mold` record. Compiler bundles
+and source-free exports live at the canonical publisher-owned paths returned by
+`publisher_vocabulary/grove/*`. Native compiler artifacts preserve the prepared
+plan and expected cases. `publish` checks and commits the complete batch through
+the namespace journal. Compiler artifacts, Grove bundles and templates are
+version three; stale products require rebuilding.
+
+### Grove roles and system vocabulary
+
+System slots are defined by `src/foil/sys/slots.foil` in the pinned system
+publication. Grove resolves their records as namespace aliases with no code
+exports. It does not republish a second `/sys` vocabulary.
+`src/grove/value_codecs.grove` supplies publisher-owned wrappers around system
+value carriers. SRS mounts its `sys/types/*` source imports onto those published
+codecs; this does not relocate their identities. Time and duration retain their
+existing scalar erasure and pails/n codecs.
+
+`grove_roles.foil` preprocesses roles before backend indexing: required
+properties, inherited `#with`, inclusive `#or`, and `#opt` become nominal
+records, checked `from_myth`/`to_myth`, and a lash. Curbs contain exact definition
+references, including each admitted constructor of a sum. Optional/OR fields
+are `maybe` payloads. `extra` preserves unrelated slots. Publisher-owned role
+schemas and exported codecs support source-free inheritance. Definitions and
+instance creation are separate; SRS definitions publish under `/<self>/gov/srs`.
+
+### Grove actions
+
+`grove_actions.foil` runs before role generation. `@action` requires one
+`#on` role, ordered required argument properties, and explicit Foil code.
+Generated `run` checks the argument/receiver/result types. `apply` accepts
+an argument myth and receiver myth, decodes through type and role codecs,
+and returns `maybe[myth]`; invalid input or output is `.none`. Metadata at
+`publisher_vocabulary/grove/action` stores the receiver path and argument schema. Nothing
+is installed in the live namespace or `/sys/op`. Stored bundles support
+source-free action imports. SRS now compiles through `finish` (six decls);
+full compilation includes the tree declarations. Run
+`x/check foil-grove-action-tests`. Tight annotations such as
+`value=%/grade` are rewritten structurally by the backend.
+
+### Grove norms
+
+`grove_norms.foil` runs before actions and roles. Each `@norm` has one
+`#here` quoted path pattern, `#with` roles, and inline role constraints.
+It exports an `axal[myth]` alias, an `item` role module, `check`, `validate`,
+and a descriptive `soma` spec. `publisher_vocabulary/grove/norm` stores segment and item
+schemas. Literal path segments use the native path codec; captures use
+`[name=@aura]`, with `@tas` mapped to `ts`. Validation checks every occupied
+record, permitting empty myths only at matching strict prefixes. Empty
+collections are valid. `validate` returns the first invalid relative path;
+`check` returns the unchanged tree on success. No live installation.
+Run `x/check foil-grove-norm-tests`. The first eight SRS declarations now
+compile under `/gov/srs`. Sewn synthesis adds `queue` as the ninth.
+
+
+### Grove sewn transformations
+
+Use `@sewn`, not the former typo `@dyed`. `grove_sewn.foil` lowers an
+explicit `get` body with one `#from` and one `#to` norm. Its module exports
+unchecked `get`/`run` and checked `apply : axal[myth] -> maybe[axal[myth]]`.
+`apply` validates the input, invokes the implementation, and validates the
+output. `publisher_vocabulary/grove/sewn` stores both norm paths and their
+compiled schemas (`source_schema`/`target_schema`), from the same norm modules
+used by `apply`. Request-local adapters project through that pinned metadata,
+not the latest norm declaration at an endpoint path. Older compiled sewn
+metadata requires recompilation; missing or incompatible metadata fails closed.
+External norms and sewn modules import through stored compiler bundles. Run
+`x/check foil-grove-sewn-tests`.
+
+
+### Grove templates and instance installation
+
+`grove_trees.foil` lowers cord-named `@tree` declarations into relative
+seeds in a versioned `grove_template`, stored at `publisher_vocabulary/grove/template` on
+the published source root. Named declarations remain individual records
+under that source root. Definition names and instance paths are separate
+namespaces. The compiler validates all seed norms before publication.
+
+Slot keys, `#like` source paths, and sewn code references are absolute
+references to shared definitions. `tack: '@/y/%/cards` becomes a typed
+`grove_instance_ref`; only these explicit local references rebase when
+instantiating. Opaque user values and definition paths are never rewritten
+by prefix matching. Templates retain contracts and existing ward/fresh
+behavior. Live instance records carry no module bundles.
+
+`grove_install/instantiate source version target state` resolves the
+published template, checks its version and the previewed source x case,
+and mounts at the target atomically through Pact. `publisher_vocabulary/grove/source`
+on the instance root records the source version. Existing targets and
+missing referenced code/input reject. The source template stays unchanged
+and can be instantiated repeatedly. `grove_install/mount` is the lower
+level publication/mount helper; the state supplies Pact, ward, and fresh.
+Run `x/check foil-grove-tree-tests` for compilation, shared definitions,
+independent instances, queue isolation, and contract validation.
+
+### Eden with SRS
+
+`x/eden --srs` compiles and publishes system vocabulary and SRS definitions
+before serving HTTP. `eden_srs/compile` builds publication records without
+live state; `eden_srs/publish` publishes them and `eden_srs/boot` combines
+Eden boot with publication. No instance data is installed at `/gov/srs`.
+Open `/ns/gov/srs`, enter an instance root, and click **Install instance**.
+The UI can create multiple instances using the same published template.
+`x/eden --srs --check` verifies definition publication, two HTTP installs,
+stale/conflicting rejection, and the instance card and queue.
+The default launcher remains base Eden. See `doc/eden-boot.md`.

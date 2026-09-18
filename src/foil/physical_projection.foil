@@ -1,0 +1,255 @@
+- physical_read
+- physical_key
+- pact
+- json
+
+' Wire projection of physical reads. No arbitrary pail formatter, derived
+' evaluation, descendant traversal, or whole-document lore enumeration.
++ physical_projection
+  + max_bytes
+    ^ nat
+    131072
+  + decimal
+    ' Counters have a bounded canonical representation accepted by transport.
+    \ value=nat
+    ^ json
+    ? (gt (wid value) 32) (json/str (str/from_atom (Throw 812)))
+    | json/str (nat/show value)
+  + optional_text
+    \ text=maybe[str]
+    ^ json
+    | text.run((\ value=str (json/str value))).fall((json/nul 0))
+  + bytes
+    ' Raw scalar bytes are preserved even when not printable UTF-8. The
+    ' frontend may decode only a valid prefix; completeness is explicit.
+    \ kind=str value=nat
+    ^ json
+    = total (wid value)
+      count (? (gt total 256) 256 total)
+    | json/obj
+      [(jkv "type" (json/str kind))
+       (jkv "encoding" (json/str "hex"))
+       (jkv "hex" (json/str (value_read/hex_slice value 0 count)))
+       (jkv "total" (physical_projection/decimal total))
+       (jkv "complete" (json/boo (eq count total)))]
+  + opaque
+    \ reason=str
+    ^ json
+    | json/obj [(jkv "type" (json/str "opaque")) (jkv "reason" (json/str reason))]
+  + value
+    \ held=pail
+    ^ json
+    ? held
+     > t=pails/t (physical_projection/bytes "text" (str/to_atom t.t))
+     > n=pails/n (physical_projection/bytes "natural" n.n)
+     > p=pails/p
+       ? (physical_key/encode p.p)
+        > (./err _) (physical_projection/opaque "key_too_large")
+        > (./ok key)
+          | json/obj
+            [(jkv "type" (json/str "path"))
+             (jkv "pathKey" (json/str key))
+             (jkv "displayPath" (physical_projection/optional_text (physical_key/display p.p)))]
+    ' A safe reference has care/version semantics; do not reduce it to path.
+    | physical_projection/opaque "unsupported_type"
+  + kind
+    \ record=myth
+    ^ str
+    ? (record.has(publisher_vocabulary/grove/role)) "role"
+    ? (record.has(publisher_vocabulary/grove/action)) "action"
+    ? (record.has(publisher_vocabulary/grove/norm)) "norm"
+    ? (record.has(publisher_vocabulary/grove/sewn)) "sewn"
+    ? (record.has(publisher_vocabulary/grove/template)) "template"
+    = event=bool
+        ?> (./some held) record.get(bond/content) .false
+        ?> value=namespace_event held .false
+        .true
+    ? event "event"
+    ? (record.has(['method])) "http"
+    ? (record.has(bond/form)) "behavior"
+    ? (record.has(publisher_vocabulary/grove/module)) "module"
+    "record"
+  + label
+    \ record=myth
+    ^ [value=json source=json]
+    = lede=maybe[str]
+        ?> (./some held) record.get(bond/lede) .none
+        ?> text=pails/t held .none
+        ? (eq text.t.len 0) .none
+        | ./some text.t
+    ? lede
+     > (./some text)
+       [(physical_projection/bytes "text" (str/to_atom text)) (json/str "lede")]
+     > .none
+       ?> (./some held) record.get(bond/help) [(json/nul 0) (json/nul 0)]
+       ?> doc=lore held [(json/nul 0) (json/nul 0)]
+       ? (eq doc.head.len 0) [(json/nul 0) (json/nul 0)]
+       [(physical_projection/bytes "text" (str/to_atom doc.head)) (json/str "lore-head")]
+  + help
+    ' Select at most one line from the first four body entries. The line
+    ' index makes this an authored excerpt, not a claim of full lore access.
+    \ record=myth
+    ^ [value=json source=json line=json]
+    ?> (./some held) record.get(bond/help) [(json/nul 0) (json/nul 0) (json/nul 0)]
+    ? held
+     > text=pails/t
+       [(physical_projection/bytes "text" (str/to_atom text.t)) (json/str "help-text") (json/nul 0)]
+     > doc=lore
+       = count (? (gt doc.body.len 4) 4 doc.body.len)
+       % i=nat 0
+       ^ [value=json source=json line=json]
+       ? (eq i count) [(json/nul 0) (json/nul 0) (json/nul 0)]
+       = line doc.body.at(i)
+       ? (eq line.len 0) (_ i.inc)
+       [(physical_projection/bytes "text" (str/to_atom line)) (json/str "lore-body") (json/num .false i)]
+    [(json/nul 0) (json/nul 0) (json/nul 0)]
+  + node
+    \ node=physical_read/node
+    ^ json
+    = own (physical_read/record node)
+      state=str
+        ? own
+         > .unknown "unknown"
+         > .null "tombstone"
+         > (./known _) "live"
+      record=maybe[myth]
+        ? own
+         > (./known held) (./some (unpin held))
+        .none
+      label record.run(physical_projection/label).fall([(json/nul 0) (json/nul 0)])
+      help record.run(physical_projection/help).fall([(json/nul 0) (json/nul 0) (json/nul 0)])
+      [label_value label_source] label
+      [help_value help_source help_line] help
+    | json/obj
+      [(jkv "state" (json/str state))
+       (jkv "recordEpoch" (node.epoch.run(physical_projection/decimal).fall((json/nul 0))))
+       (jkv "children" (physical_projection/decimal node.children))
+       (jkv "fields" (record.run((\ card=myth (physical_projection/decimal card.size))).fall((json/nul 0))))
+       (jkv "label" label_value)
+       (jkv "labelSource" label_source)
+       (jkv "help" help_value)
+       (jkv "helpSource" help_source)
+       (jkv "helpLine" help_line)
+       (jkv "kind" (json/str (record.run(physical_projection/kind).fall("namespace"))))]
+  + entry_key
+    \ entry=physical_read/entry
+    ^ path
+    ? entry
+     > (./child key _) [key]
+     > (./slot key _) key
+  + entry
+    \ entry=physical_read/entry
+    ^ either[iota [key=str body=str]]
+    = path (physical_projection/entry_key entry)
+    ?> (./ok key) (physical_key/encode path) (./err 'key_too_large)
+    = detail
+        ? entry
+         > (./child _ node) (jkv "node" (physical_projection/node node))
+         > (./slot _ value) (jkv "value" (physical_projection/value value))
+      body (show (json/obj
+        [(jkv "key" (json/str key))
+         (jkv "displayKey" (physical_projection/optional_text (physical_key/display path)))
+         detail]))
+    | ./ok [key body]
+  + selected
+    : bodies=row[str] next=maybe[str]
+  + select
+    ' Reserve 32K for request/cursor identities and bounded own metadata.
+    ' Stop at the last included entry, not the selector's later cursor.
+    \ page=physical_read/page
+    ^ either[iota physical_projection/selected]
+    % i=nat 0 used=nat 0 bodies=row[str] [] last=maybe[str] .none
+    ^ either[iota physical_projection/selected]
+    ? (eq i page.entries.len)
+      | ./ok (physical_projection/selected bodies (? (maybe/is_some page.next) last .none))
+    ?> (./ok encoded) (physical_projection/entry page.entries.at(i)) (./err 'key_too_large)
+    = [key body] encoded
+      cost (add body.len 1)
+    ? (gt (add used cost) 98304)
+      ? (eq i 0) (./err 'response_too_large)
+      | ./ok (physical_projection/selected bodies last)
+    | _ i.inc (add used cost) bodies.snoc(body) (./some key)
+  + json
+    \ page=physical_read/page
+    ^ either[iota str]
+    ?> (./ok key) (physical_key/encode page.pax) (./err 'key_too_large)
+    = after=either[iota maybe[str]]
+        ? page.after
+         > .none (./ok .none)
+         > (./some cursor)
+           ?> (./ok encoded) (physical_key/encode cursor) (./err 'key_too_large)
+           | ./ok (./some encoded)
+    ?> (./ok cursor) after (./err 'key_too_large)
+    = selection (physical_projection/select page)
+    ?> (./ok selected) selection
+      ? selection
+       > (./err reason) (./err reason)
+       > (./ok _) (./err 'read_failed)
+    = envelope (show (json/obj
+        [(jkv "version" (json/num .false 1))
+         (jkv "resolution" (json/str "physical"))
+         (jkv "pathKey" (json/str key))
+         (jkv "displayPath" (physical_projection/optional_text (physical_key/display page.pax)))
+         (jkv "epoch" (physical_projection/decimal page.epoch))
+         (jkv "collection" (json/str (? (eq_iota page.collection 'children) "children" "slots")))
+         (jkv "after" (physical_projection/optional_text cursor))
+         (jkv "next" (physical_projection/optional_text selected.next))
+         (jkv "limit" (json/num .false page.limit))
+         (jkv "total" (physical_projection/decimal page.total))
+         (jkv "complete" (json/boo (maybe/is_none selected.next)))
+         (jkv "own" (physical_projection/node page.own))]))
+      body (str/cat_all [envelope.slice(0 envelope.len.dec) "," (show_str "entries")
+        ":[" (str/join "," selected.bodies) "]}"])
+    ? (gt body.len physical_projection/max_bytes) (./err 'response_too_large)
+    | ./ok body
+  + force_json
+    \ input=[physical_read/request sov]
+    ^ either[iota str]
+    = [query state] input
+    ? (physical_read/read query state)
+     > (./err reason) (./err reason)
+     > (./ok page)
+       ? (physical_projection/json page)
+        > (./err reason) (./err reason)
+        > (./ok body)
+          ; body.len
+          | ./ok body
+  + safe_json
+    ' Force the complete encoded scalar before handing it to the actor.
+    \ query=physical_read/request state=sov
+    ^ either[iota str]
+    ? (Try physical_projection/force_json [query state])
+     > (./ok reply) reply
+     > (./err _) (./err 'read_failed)
+  + status
+    \ reason=iota
+    ^ nat
+    ? (eq_iota reason 'epoch_conflict) 409
+    ? (eq_iota reason 'record_deleted) 410
+    ? (eq_iota reason 'unknown_authority) 404
+    ? (eq_iota reason 'authority_required) 422
+    ? ((eq_iota reason 'record_missing) || (eq_iota reason 'path_missing)) 404
+    ? ((eq_iota reason 'derived_path) || (eq_iota reason 'key_too_large)) 422
+    ? ((eq_iota reason 'invalid_query) || (eq_iota reason 'invalid_limit) ||
+       (eq_iota reason 'invalid_collection) || (eq_iota reason 'invalid_cursor) ||
+       (eq_iota reason 'epoch_required)) 400
+    500
+  + namespace_safe_json
+    ' Global root is a composed browsing view, never a physical store.
+    \ query=physical_read/request state=namespace
+    ^ either[iota str]
+    ? (Try physical_projection/namespace_force_json [query state])
+     > (./ok reply) reply
+     > (./err _) (./err 'read_failed)
+  + namespace_force_json
+    \ input=[physical_read/request namespace]
+    ^ either[iota str]
+    = [query state] input
+    ? (physical_read/namespace_read query state)
+     > (./err reason) (./err reason)
+     > (./ok page)
+       ? (physical_projection/json page)
+        > (./err reason) (./err reason)
+        > (./ok body)
+          ; body.len
+          | ./ok body

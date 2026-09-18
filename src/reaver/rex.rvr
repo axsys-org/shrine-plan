@@ -294,11 +294,19 @@
 (define (rex-lines src)
   (If (Eq 0 (Bytes src)) [] (rex-lines-go src 0 0 0)))
 
+;; One flat strcat over indexed pieces, instead of recursing on
+;; (drop 1 lines) — that re-sliced the row every step AND nested a
+;; strcat per line, re-concatenating the whole tail each time.
 (define (rex-unlines-go lines)
+  (define n (Sz lines))
   (cond
-    ((Eq 0 (Sz lines)) "")
-    ((Eq 1 (Sz lines)) (_0 lines))
-    (else (strcat [(_0 lines) "\n" (rex-unlines-go (drop 1 lines))]))))
+    ((Eq 0 n) "")
+    ((Eq 1 n) (_0 lines))
+    (else
+      (strcat
+        (gen n
+          (lambda (i)
+            (If (Eq 0 i) (Ix 0 lines) (strcat [10 (Ix i lines)]))))))))
 
 (define rex-unlines rex-unlines-go)
 
@@ -334,7 +342,7 @@
              (min-indent (rex-min-nonblank-indent-go rest 0 REX_MAX_INT)))
         (strcat [first
                  (foldl (lambda (acc line)
-                          (strcat [acc "\n" (rex-strip-n min-indent line)]))
+                          (strcat [acc 10 (rex-strip-n min-indent line)]))
                         ""
                         rest)]))))
 
@@ -699,6 +707,12 @@
 
 (define (rex-push-into node nlin noff end st)
   (define top (_0 st))
+  ;; Pushing into an EMPTY stack means the root block was popped by a
+  ;; stray close paren; without this the recursion below would build an
+  ;; endless lazy list of non-entries for the next dispatch to choke on.
+  (unless st
+    (rex-error ["unbalanced close paren" "line" nlin])
+    1)
   (If (Eq (rex-stack-tag top) "ctx")
       (lcons (rex-stack-ctx (rex-append-node node nlin noff end (rex-stack-val top)))
              (_1 st))
@@ -926,6 +940,9 @@
                              (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
                (rex-open-clump (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)
                                (lcons (rex-stack-ctx ctx) rest))))
+      ;; a close paren with nothing open beneath this context is stray
+      ((And (Eq ty "END") (Nil rest))
+        (rex-error ["unbalanced close paren" "line" (rex-tok-lin tok) "col" (rex-tok-col tok)]))
       ((Eq ty "END")
         (rex-pop (rex-update-top-end (rex-tok-end tok)
                   (rex-close-clump (lcons (rex-stack-ctx ctx) rest)))))
@@ -966,12 +983,22 @@
           (dispatch tok
             (lcons (rex-stack-ctx (rex-mk-ctx "item" "clear" (rex-tok-lin tok) (rex-tok-col tok) (rex-tok-off tok)))
                    (lcons (rex-stack-ctx ctx1) rest)))))
+      ;; A close paren reaching the ROOT block (no enclosing nest) is a
+      ;; stray one: a located error, not a pop past the root.
+      ((And (Eq ty "END") (Nil rest))
+        (rex-error ["unbalanced close paren" "line" (rex-tok-lin tok) "col" (rex-tok-col tok)]))
       ((Eq ty "END")
         (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest))))
       (else
         (lcons (rex-stack-ctx ctx) rest)))))
 
 (define (rex-dispatch tok st)
+  ;; A stray close paren pops the context stack past its root; the
+  ;; next token would then match an empty stack against RexStackEntry
+  ;; ("impossible total union match").  Name the token instead.
+  (unless st
+    (rex-error ["unbalanced close" "line" (rex-tok-lin tok) "col" (rex-tok-col tok)])
+    1)
   (let* ((top (_0 st))
          (rest (_1 st)))
     (? RexStackEntry top
@@ -1085,7 +1112,7 @@
 (define (rex-trad-to-rex sp s)
   (If (rex-str-prefix? REX_DQUOTE s)
       (let* ((after-open (rex-str-drop 1 s)))
-        (If (rex-str-prefix? "\n" after-open)
+        (If (rex-str-prefix? 10 after-open)
             (let* ((r (rex-strip-tape s (rex-span-col sp) (rex-str-drop 1 after-open))))
               (rex-result-leaf sp "tape" s r))
             (let* ((r (rex-strip-cord sp s after-open)))
@@ -1130,7 +1157,7 @@
   (define n (rex-count-quotes s 0))
   (If (Ge n 2)
       (let* ((after-open (rex-str-drop n s)))
-        (If (rex-str-prefix? "\n" after-open)
+        (If (rex-str-prefix? 10 after-open)
             (let* ((r (rex-strip-page n (rex-str-drop 1 after-open))))
               (rex-result-leaf sp "page" s r))
             (let* ((r (rex-strip-span sp n after-open)))
@@ -1144,7 +1171,11 @@
     (else s)))
 
 (define (rex-strip-slug s)
-  (rex-unlines (map rex-strip-slug-line (rex-lines s))))
+  (rex-unlines
+    (map (lambda (line)
+      (rex-strip-slug-line
+        (rex-strip-n (rex-leading-spaces line) line)))
+      (rex-lines s))))
 
 (define (rex-leaf-to-rex sp lf)
   (define tag (rex-leaf-tag lf))
@@ -1578,6 +1609,17 @@
         (rex-from-block-tree slice tree))
       0))
 
+;; Reference document parsing retains the block splitter and each block's
+;; absolute source spans. Empty blocks contribute no trees.
+(define (ParseRexBlocks src)
+  (rowify
+    (lcat
+      (lmap (lambda (tree)
+        (define slice
+          (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src))
+        (stream (rex-from-block-tree slice tree)))
+        (rex-parse-trees (rex-bsplit (rex-lex src)))))))
+
 (define (ParseRex src)
   (define r (rex-parse-src src))
   (If r (_0 r) (Throw "bad rex parse")))
@@ -1765,10 +1807,15 @@
   (map (lambda (line) (strcat [prefix line])) lines))
 
 (define (rex-join-str sep row)
+  (define n (Sz row))
   (cond
-    ((Eq 0 (Sz row)) "")
-    ((Eq 1 (Sz row)) (_0 row))
-    (else (strcat [(_0 row) sep (rex-join-str sep (drop 1 row))]))))
+    ((Eq 0 n) "")
+    ((Eq 1 n) (_0 row))
+    (else
+      (strcat
+        (gen n
+          (lambda (i)
+            (If (Eq 0 i) (Ix 0 row) (strcat [sep (Ix i row)]))))))))
 
 ;; A real newline byte.  String literals here do NOT process escapes —
 ;; "\n" is a two-byte backslash-n cord, which is how the printer's
@@ -1934,6 +1981,7 @@
 
 (#export
   Rex
+  RexSpan
   Leaf
   Nest
   Expr
@@ -1953,6 +2001,7 @@
   MakeJuxt
   MakeHeir
   ParseRex
+  ParseRexBlocks
   ParseRexFile
   ParseRexNorm
   ParseRexNormFile

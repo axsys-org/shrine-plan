@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Exercise sovereign Eden over HTTP with deterministic fixture identity 0x11."""
+import argparse
+import os
+import re
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+import urllib.request
+
+from test_runner import stage
+
+root = Path(__file__).resolve().parent.parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--port', type=int, default=18135)
+parser.add_argument('--startup-timeout', type=int, default=1200,
+                    help='Seconds allowed for compilation and listener startup (default: 1200)')
+parser.add_argument('--request-timeout', type=int, default=120,
+                    help='Seconds allowed per socket check request (default: 120)')
+args = parser.parse_args()
+if args.startup_timeout <= 0:
+    parser.error('--startup-timeout must be positive')
+if args.request_timeout <= 0:
+    parser.error('--request-timeout must be positive')
+if not 1 <= args.port <= 65535:
+    parser.error('--port must be between 1 and 65535')
+runtime = os.environ.get('WISP') or shutil.which('wisp') or str(root / 'wisp')
+if not os.access(runtime, os.X_OK):
+    parser.error('Set WISP to a working runtime executable (see doc/actor-abort-investigation.md).')
+# A template is tied to both compiler inputs and the runtime binary. Picking
+# the newest directory can mix runtimes or silently reuse stale compiler code.
+try:
+    template = stage(runtime, False, args.startup_timeout)
+except (RuntimeError, OSError) as error:
+    parser.error(str(error))
+work = Path(tempfile.mkdtemp(prefix='foil-eden-'))
+shutil.copytree(root / 'src', work / 'src')
+(work / 'snap').mkdir()
+for name in ('data.mdb', 'pins.pack'):
+    shutil.copyfile(template / name, work / 'snap' / name)
+url = f'http://127.0.0.1:{args.port}'
+log_path = work / 'out.log'
+print(f'Compiling Eden. Log: {log_path}', flush=True)
+with log_path.open('w') as log:
+    process = subprocess.Popen(
+        [runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_'],
+        cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+    try:
+        launch = f"""(#bind eden (#module eden))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind std (#module std))
+(#import std)
+(define (launch ignored)
+  (define (resolve name) [["x" 17] ["ts" "lib"] ["ts" name]])
+  (define slot [("x" 17) ("ts" "compiler") ("ts" "artifact")])
+  (define system (bootstrap:build-system (Pin eden:start) resolve slot))
+  (eden:start ("x" 17) system resolve slot {args.port}))
+(launch 0)
+"""
+        process.stdin.write(launch)
+        process.stdin.flush()
+        deadline = time.monotonic() + args.startup_timeout
+        while True:
+            output = log_path.read_text(errors='replace')
+            if '("ERROR"' in output or process.poll() is not None or 'pump: listen failed' in output or 'bind/listen failed' in output:
+                raise RuntimeError(output[-5000:])
+            if re.search(r'^"?HTTP foot listening"?$', output, re.MULTILINE):
+                try:
+                    with socket.create_connection(('127.0.0.1', args.port), timeout=0.2):
+                        break
+                except (ConnectionRefusedError, TimeoutError):
+                    pass
+            if time.monotonic() > deadline:
+                raise RuntimeError(f'Server startup timed out; inspect {log_path}')
+            time.sleep(0.25)
+        print(f'Foil HTTP interface: {url}/ns', flush=True)
+        def get(path):
+            with urllib.request.urlopen(url + path, timeout=args.request_timeout) as response:
+                return response.read().decode()
+        assert 'Hello from Eden.' in get('/ns/0x11/hello')
+        assert 'no record at this node' not in get('/ns/sys/mold')
+        assert 'no record at this node' not in get('/ns/sys/types/mop/node')
+        assert 'no record at this node' not in get('/ns/0x11/lib/eden/eden/boot')
+        assert 'sh-triptych' in get('/ns')
+        print('Sovereign HTTP smoke passed: local Eden, both roots, and system definitions.', flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()

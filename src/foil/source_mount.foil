@@ -1,0 +1,206 @@
+- fs_sync
+- helm
+
+' A source scan is retained even when its publication fails.
++ source_mount
+  + failure
+    : message=str cause=any
+  + spec
+    : name=str manifest=str
+  + status
+    : epoch=nat ready=bool message=str publication=nat
+  + image
+    : modules=any
+  + ports
+    : publish={\ path namespace}either[pail namespace]
+  + slot
+    \ name=iota
+    ^ path
+    | publisher_vocabulary/locate ['fs 'source name]
+  + crash
+    \ state=namespace message=str
+    ^ namespace
+    ; (error (pails/t message))
+    state
+  + record
+    \ home=path state=namespace
+    ^ myth
+    | (sovereign_peek home state).fil.fall(myth/new)
+  + write
+    \ home=path record=myth state=namespace
+    ^ namespace
+    = request (helm/card/step home (writ/poke record))
+    = [next index reply]
+        (helm/supervisor/handle request state
+          (sovereign_hive state))
+    ?> (./ack ack) reply
+      (source_mount/crash state "Invalid mount reply")
+    ? (maybe/is_some ack)
+      (source_mount/crash state "Mount record write rejected")
+    next
+  + images
+    \ home=path state=namespace
+    ^ maybe[any]
+    . (source_mount/record home state)
+      get((source_mount/slot 'image))
+      then(source_mount/image/try_from_pail)
+      run(source_mount/image/modules)
+  + save_images
+    \ home=path images=any state=namespace
+    ^ namespace
+    = value (source_mount/image images)
+    = record (myth/sing (source_mount/slot 'image) value)
+    | source_mount/write home record state
+  + snapshot
+    ' Missing files stay in history but never enter compiler input.
+    \ home=path state=namespace
+    ^ row[[str nat]]
+    = record (source_mount/record home state)
+    ?> (./some held) record.get(bond/res) []
+    ?> report=fs/report held []
+    = tree
+        % idx=nat 0 out=axal[nat] (axal/new[nat] .none)
+        ^ axal[nat]
+        ? (eq idx report.known.len) out
+        = name report.known.at(idx)
+        ? (report.missing.has(name)) (_ idx.inc out)
+        = path (report.target.snoc(($ta name)))
+        = item (source_mount/record path state)
+        | _ idx.inc out.put([($ta name)] item.nat_at(bond/content 0))
+    | row/map[[path nat] [str nat]]
+      (\ [key bytes] [(str/from_atom (quip_val key.at(0))) bytes])
+      tree.tap
+  + status_at
+    \ home=path state=namespace
+    ^ source_mount/status
+    . (source_mount/record home state)
+      get((source_mount/slot 'status))
+      then(source_mount/status/try_from_pail)
+      fall((source_mount/status 0 .false "Not scanned" 0))
+  + status_record
+    \ status=source_mount/status
+    ^ myth
+    . (myth/sing (source_mount/slot 'status) status)
+      put((source_mount/slot 'epoch) (pails/n status.epoch))
+      put((source_mount/slot 'ready) (pails/n (? status.ready 1 0)))
+      put((source_mount/slot 'message) (pails/t status.message))
+      put((source_mount/slot 'publication) (pails/n status.publication))
+  + reconcile_one
+    \ ports=source_mount/ports home=path state=namespace
+    ^ namespace
+    = record (source_mount/record home state)
+    = prior (source_mount/status_at home state)
+    ?> (./some held) record.get(bond/res) state
+    ? held
+     > failure=fs/failure
+      ? !(gt failure.epoch prior.epoch) state
+      = status (source_mount/status failure.epoch .false
+          failure.reason prior.publication)
+      | source_mount/write home
+        (source_mount/status_record status) state
+    ?> report=fs/report held state
+    ? !(gt report.epoch prior.epoch) state
+    = files (source_mount/snapshot home state)
+    = fingerprint (pin files)
+    = old (record.get((source_mount/slot 'snapshot)))
+    = same
+        ?> (./some held) old .false
+        ?> saved=pails/code held .false
+        | equal saved.v fingerprint
+    = publish ports.publish
+    = result=either[pail namespace]
+        ? same (./ok state)
+        | publish home state
+    = next
+        ? result
+         > (./ok updated) updated
+         > (./err _) state
+    = status
+        ? result
+         > (./ok _)
+          (source_mount/status report.epoch .true "Published"
+            (? same prior.publication next.local.top))
+         > (./err why)
+          (source_mount/status report.epoch .false
+            "Publication failed; inspect diagnostic" prior.publication)
+    = update (source_mount/status_record status)
+    = update
+        ? result
+         > (./ok _)
+          . update
+            put((source_mount/slot 'snapshot) (pails/code fingerprint))
+            put((source_mount/slot 'diagnostic) (pails/t ""))
+         > (./err why)
+          update.put((source_mount/slot 'diagnostic) why)
+    | source_mount/write home update next
+  + reconcile
+    \ ports=source_mount/ports homes=row[path] state=namespace
+    ^ namespace
+    | homes.fold state
+      \ state=namespace home=path
+      | source_mount/reconcile_one ports home state
+  + handle
+    \ ports=source_mount/ports homes=row[path]
+      card=helm/card state=namespace index=hive
+    ^ [namespace hive feet/task[unit]]
+    = [next index reply]
+        (helm/supervisor/handle card state index)
+    = updated
+        ? card
+         > (./step _ _)
+          (source_mount/reconcile ports homes next)
+        next
+    = index
+        ? (eq updated.local.top next.local.top) index
+        | sovereign_hive updated
+    [updated index reply]
+  + access
+    \ ports=source_mount/ports homes=row[path]
+    ^ helm/supervisor/access[namespace]
+    | helm/supervisor/access/set_handle[namespace]
+      (source_mount/handle ports homes)
+      helm/supervisor/local_access
+  + rescan
+    \ ignored=myth current=myth
+    ^ myth
+    . current
+      put(bond/epoch (pails/n current.nat_at(bond/epoch 0).inc))
+      put(bond/pending (pails/b .true))
+  + load
+    \ reader={\ str}either[str row[fs_read/file]]
+      name=str folder=str manifest=str state=namespace
+    ^ namespace
+    = home=path [state.self 'io 'fs ($ts name)]
+    = target (home.snoc('source))
+    = base (fs/cfg folder target (fs/extensions (mop/empty))
+        [state.self 'kook 'fs])
+    = spec (source_mount/spec name manifest)
+    = cfg base.put((source_mount/slot 'spec) spec)
+    = request (helm/card/step home (writ/make cfg))
+    = [ready index reply]
+        (helm/supervisor/handle request state
+          (sovereign_hive state))
+    ?> (./ack ack) reply
+      (source_mount/crash state "Invalid mount reply")
+    ? (maybe/is_some ack)
+      (source_mount/crash state "Mount installation rejected")
+    = operation
+        | myth/sing ['sys 'op]
+          (op 'rescan 'host [] 'scan "Request a fresh source scan" source_mount/rescan)
+    = [ready index reply]
+        | helm/supervisor/handle
+          (helm/card/step home.weld(['op 'rescan]) (writ/make operation))
+          ready (sovereign_hive ready)
+    = pending (source_mount/write home
+        (myth/sing bond/pending (pails/b .true)) ready)
+    = current (source_mount/record home pending)
+    = ;scan (reader folder)
+    ?> (./ok files) scan
+      (source_mount/crash state "Mount scan failed")
+    = batch (fs/batch current.nat_at(bond/epoch 0) current files)
+    | source_mount/write home (myth/sing bond/res batch) pending
+  + require_ready
+    \ homes=row[path] state=namespace
+    ^ namespace
+    ? (homes.all((\ home=path (source_mount/status_at home state).ready))) state
+    | source_mount/crash state "Initial mount publication failed"

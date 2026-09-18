@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Differential strict-let tests against a memoizing reference evaluator."""
+import json
+import os
+import pathlib
+import random
+import re
+import shutil
+import subprocess
+import tempfile
+
+from test_runner import compiler_key
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+def K(x): return ('K', x)
+def P(x): return ('P', x)
+def V(i): return ('V', i)
+def A(f, *xs):
+    for x in xs: f = ('A', f, x)
+    return f
+
+def L(now, v, b): return ('L', int(now), v, b)
+def F(n, b): return ('F', n, b)
+def R(vs, b): return ('R', vs, b)
+def tick(label, val): return A(P('tick'), K(str(label)), val)
+def before(e, b): return L(1, e, shift(b, 1))
+def shift(e, delta, cutoff=0):
+    t = e[0]
+    if t == 'V': return V(e[1] + delta if e[1] >= cutoff else e[1])
+    if t in ('K', 'P'): return e
+    if t == 'A': return A(shift(e[1], delta, cutoff), shift(e[2], delta, cutoff))
+    if t == 'L': return L(e[1], shift(e[2], delta, cutoff), shift(e[3], delta, cutoff+1))
+    if t == 'F': return F(e[1], shift(e[2], delta, cutoff+e[1]+1))
+    if t == 'R': return R([shift(x, delta, cutoff+len(e[1])) for x in e[1]], shift(e[2], delta, cutoff+len(e[1])))
+    raise AssertionError(e)
+
+class Failed(Exception): pass
+class Cell:
+    def __init__(self, thunk): self.thunk, self.state, self.value = thunk, 0, None
+    def force(self):
+        if self.state == 1: raise Failed('cyclic demand')
+        if self.state == 0:
+            self.state = 1
+            self.value = self.thunk()
+            self.state = 2
+        return self.value
+
+class Function:
+    def __init__(self, arity, run, args=()): self.arity, self.run, self.args = arity, run, args
+    def apply(self, arg):
+        args = self.args + (arg,)
+        return self.run(args) if len(args) == self.arity else Function(self.arity, self.run, args)
+
+def reference(expr):
+    trace, steps = [], [0]
+    def primitive(name):
+        def run(args):
+            if name == 'tick':
+                trace.append(str(args[0].force()))
+                return args[1].force()
+            if name == 'ignore': return 0
+            if name == 'pair': return args  # no demand on either field
+            if name == 'add': return args[0].force() + args[1].force()
+            if name == 'if': return args[1 if args[0].force() else 2].force()
+            if name == 'fail': raise Failed('failure')
+            raise AssertionError(name)
+        return Function({'tick':2, 'ignore':1, 'pair':2, 'add':2, 'if':3, 'fail':1}[name], run)
+    def ev(e, env):
+        steps[0] += 1
+        if steps[0] > 10000: raise Failed('bounded divergence')
+        t = e[0]
+        if t == 'K': return e[1]
+        if t == 'P': return primitive(e[1])
+        if t == 'V': return env[e[1]].force()
+        if t == 'A': return ev(e[1], env).apply(Cell(lambda: ev(e[2], env)))
+        if t == 'L':
+            cell = Cell(lambda: ev(e[2], env))
+            if e[1]: cell.force()
+            return ev(e[3], [cell] + env)
+        if t == 'R':
+            extended = []
+            cells = [Cell(lambda v=v: ev(v, extended)) for v in e[1]]
+            extended.extend(cells + env)
+            return ev(e[2], extended)
+        if t == 'F':
+            fn = Function(e[1], lambda args: ev(e[2], [Cell(lambda: fn)] + list(args) + env))
+            return fn
+        raise AssertionError(e)
+    try:
+        value = ev(expr, [])
+        return ('ok', value if isinstance(value, int) else 'value'), trace
+    except Failed:
+        return ('fail', None), trace
+
+def emit(e):
+    t = e[0]
+    if t == 'K': return '(cg:K ' + (json.dumps('STRICT-EVENT-'+e[1]) if isinstance(e[1], str) else str(e[1])) + ')'
+    if t == 'P': return '(cg:K ' + {'tick':'Trace', 'ignore':'ignore', 'pair':'pair', 'add':'Add', 'if':'If', 'fail':'error'}[e[1]] + ')'
+    if t == 'V': return f'(cg:V {e[1]})'
+    if t == 'A': return f'(cg:A {emit(e[1])} {emit(e[2])})'
+    if t == 'L': return f'(cg:L {e[1]} {emit(e[2])} {emit(e[3])})'
+    if t == 'R': return '(cg:R [' + ' '.join(map(emit, e[1])) + '] ' + emit(e[2]) + ')'
+    if t == 'F': return f'(cg:F 0 0 0 "strict-test" {e[1]} {emit(e[2])})'
+    raise AssertionError(e)
+
+cases = {
+    'lazy': L(0, tick('a', K(1)), K(0)),
+    'strict': L(1, tick('a', K(1)), K(0)),
+    'shared': L(1, tick('a', K(1)), A(P('add'), V(0), V(0))),
+    'distinct': L(1, tick('a', K(1)), L(1, tick('a', K(1)), K(0))),
+    'alias': L(1, tick('a', K(1)), L(1, V(0), V(0))),
+    'unselected': A(P('if'), K(0), L(1, tick('a', K(1)), K(0)), K(7)),
+    'deferred': L(0, L(1, tick('a', K(1)), K(0)), K(7)),
+    'shallow': L(1, A(P('pair'), tick('a', K(1)), tick('b', K(2))), K(0)),
+    'uncalled': L(0, F(1, before(tick('a', V(1)), K(0))), K(0)),
+    'partial': L(1, A(F(2, before(tick('a', V(1)), K(0))), K(1)), K(0)),
+    'entry': A(F(2, before(V(1), before(V(2), K(0)))), tick('a', K(1)), tick('b', K(2))),
+    'failure': L(1, A(P('fail'), K(0)), before(tick('later', K(1)), K(0))),
+    'recursive': R([tick('x', V(1)), tick('y', K(2))], before(V(0), before(V(1), K(0)))),
+    'capture': L(0, tick('outer', K(3)), A(F(1, before(V(2), A(P('add'), V(1), V(2)))), K(4))),
+}
+rng = random.Random(714)
+def gen(depth, env):
+    if not depth: return V(rng.randrange(env)) if env and rng.randrange(2) else K(rng.randrange(8))
+    choice = rng.randrange(5)
+    if choice == 0: return L(rng.randrange(2), gen(depth-1, env), gen(depth-1, env+1))
+    if choice == 1: return tick(str(rng.randrange(5)), gen(depth-1, env))
+    if choice == 2: return A(P('if'), K(rng.randrange(2)), gen(depth-1, env), gen(depth-1, env))
+    if choice == 3: return A(P('ignore'), gen(depth-1, env))
+    return A(P('add'), gen(depth-1, env), gen(depth-1, env))
+for i in range(60): cases[f'generated{i}'] = gen(4, 0)
+
+FOIL = {'lazy':[], 'binder':['1'], 'initializer':['1'], 'both':['1'], 'argument':['1'],
+        'body':['1','2'], 'branch':[], 'deferred':[], 'caller':['2','1'], 'final':['1'],
+        'destructure':[], 'shadows':['1','9'], 'partial':[], 'partial_call':['1'],
+        'explicit_partial':['1'], 'explicit_partial_call':[], 'captured':[], 'captured_call':['3'],
+        'boundary':['1','2'], 'tall_boundary':['1','2'], 'operator':['1'],
+        'row_mark':['1'], 'branch_yes':['1'], 'parameters':['1','2'], 'nested':['1'], 'failure':['1']}
+
+def run(input_text, name, timeout=180, expect_timeout=False):
+    runtime = os.environ.get('WISP') or shutil.which('wisp') or str(ROOT/'wisp')
+    template = pathlib.Path(os.environ['TEST_TEMPLATE']) if 'TEST_TEMPLATE' in os.environ else ROOT/'.check'/('template-' + compiler_key(runtime))
+    if not (template/'data.mdb').exists():
+        raise SystemExit('No matching test snapshot: run x/check --fast first.')
+    sources = os.environ.get('TEST_SOURCE_ROOT', str(ROOT/'src'))
+    directory = pathlib.Path(tempfile.mkdtemp(prefix=name+'-', dir=os.environ.get('TEST_RUN_DIR')))
+    (directory/'snap').mkdir()
+    for part in ('data.mdb','pins.pack'): shutil.copyfile(template/part, directory/'snap'/part)
+    (directory/'input').write_text(input_text)
+    with (directory/'input').open() as inp, (directory/'out.log').open('w') as out:
+        try:
+            result = subprocess.run([runtime, '--file-root', sources, 'snap', 'root', '_'],
+                                    cwd=directory, stdin=inp, stdout=out, stderr=out, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if not expect_timeout: raise
+            result = None
+    if expect_timeout and result is not None: raise AssertionError(f'Expected divergence: {directory}')
+    log = (directory/'out.log').read_text(errors='replace')
+    if (result is not None and result.returncode) or re.search(r'^\("(?:ERROR|Error)"', log, re.M):
+        raise AssertionError(f'Runtime/compiler failure: {directory}/out.log')
+    return log, directory
+
+def traces(log):
+    current, found = None, {}
+    for line in log.splitlines():
+        m = re.fullmatch(r'"STRICT-BEGIN-(.*)"', line)
+        if m:
+            current = m[1]
+            found.setdefault(current, [])
+        m = re.fullmatch(r'"STRICT-END-(.*)"', line)
+        if m: current = None
+        m = re.fullmatch(r'"STRICT-EVENT-(.*)"', line)
+        if m:
+            if current is None: raise AssertionError('Event outside execution boundary: '+line)
+            found[current].append(m[1])
+    return found
+
+def main():
+    lines = ['(#bind std (#module std))', '(#import std)', '(#bind reef (#module reef))', '(#import reef)',
+             '(#bind cg (#module codegen))', '(define (ignore x) 0)', '(define (pair a b) [a b])']
+    expected = {}
+    for i, (name, expr) in enumerate(cases.items()):
+        outcome, expected[name] = reference(expr)
+        # Compiling and forcing the function value must produce no events.
+        lines += [f'(define f{i} (cg:compile-expr {emit(F(1, shift(expr, 2)))}))', f'(Seq f{i} 0)',
+                  f'(print "STRICT-BEGIN-{name}")',
+                  f'(define r{i} (Try (lambda (z) (let ((value (f{i} 0))) (Seq value value))) 0))']
+        lines += [f'assert(Eq {1 if outcome[0]=="fail" else 0} (Hd r{i}))']
+        if isinstance(outcome[1], int): lines += [f'assert(Eq {outcome[1]} (_0 r{i}))']
+        lines += [f'(print "STRICT-END-{name}")']
+    scope_cases = [V(0), L(0, V(0), A(V(0), V(1))),
+                   R([V(1), V(3)], F(1, A(V(4), V(5))))]
+    for expr in list(cases.values()) + scope_cases:
+        lines += [f'assert(Equal {emit(shift(expr, 2))} (cg:shift 2 0 {emit(expr)}))']
+    lines += ['assert(Eq 1 (Hd (Try (lambda (z) (cg:compile-expr ["s_strict" (cg:K 0)])) 0)))',
+              'assert(Equal (cg:M (cg:V 3)) (cg:shift 2 0 (cg:M (cg:V 1))))',
+              'assert(Eq 1 (Hd (Try (lambda (z) (cg:L 2 (cg:K 0) (cg:K 0))) 0)))',
+              'assert(Eq 1 (Hd (Try (lambda (z) (cg:compile-expr ["L_" (cg:K 0) (cg:K 0)])) 0)))',
+              '(print "STRICT-DONE")']
+    log, directory = run('\n'.join(lines)+'\n', 'strict-codegen')
+    assert '"STRICT-DONE"' in log, directory
+    actual = traces(log)
+    for name, trace in expected.items(): assert actual.get(name) == trace, (name, trace, actual.get(name), directory)
+    print(f'{len(cases)} codegen/reference cases passed ({directory})', flush=True)
+    log, directory = run('(#bind tests (#module foil-strict-tests))\n(print "STRICT-DONE")\n', 'strict-foil')
+    assert '"foil strict tests passed"' in log, directory
+    actual = traces(log)
+    for name, trace in FOIL.items(): assert actual.get(name) == trace, (name, trace, actual.get(name), directory)
+    print(f'{len(FOIL)} Foil traces passed ({directory})', flush=True)
+    # An arity-one self call loops after the first event. Kill the subprocess
+    # only after allowing enough time to load and enter the execution region.
+    loop = F(1, A(V(0), V(1)))
+    divergent = before(tick('entered', K(0)), L(1, A(loop, K(0)), tick('later', K(0))))
+    source = '\n'.join(['(#bind std (#module std))', '(#import std)',
+                         '(#bind cg (#module codegen))',
+                         f'(define diverge (cg:compile-expr {emit(F(1, shift(divergent, 2)))}))',
+                         '(print "STRICT-BEGIN-divergence")', '(diverge 0)']) + '\n'
+    log, directory = run(source, 'strict-divergence', timeout=15, expect_timeout=True)
+    assert traces(log) == {'divergence':['entered']}, directory
+    print(f'Bounded divergence check passed ({directory})', flush=True)
+
+if __name__ == '__main__': main()

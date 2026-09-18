@@ -1,0 +1,87 @@
+;;;; Build a system publication without relying on a preexisting Foil store.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind source (#module foil-source))
+(#bind driver (#module foil-new-env))
+(#bind publication (#module foil-publication))
+(#bind context (#module foil-context))
+(#bind subject (#module foil-subject))
+
+(define tag "foil/system-build/v1")
+(define system-roots
+  (Weld [["sys/slots" [["ts" "sys"]]]]
+    (map (lambda (name)
+      [(strWeld "sys/" name) [["ts" "sys"] ["ts" name]]])
+      ["types" "shrine" "schema" "hand" "view"])))
+
+;; resolve supplies publisher-owned module roots. The artifact slot is also
+;; explicitly publisher-owned. Compilation and publication are pure; the
+;; completed pin becomes trusted only when the caller chooses to use it.
+(define (build-system compiler resolve slot)
+  (define prepared
+    (publication:prepare-system compiler source:read-module system-roots))
+  (define compiled (publication:compile prepared driver:empty-foil-cache))
+  (define selection (context:publication-key
+    (publication:compilation-context prepared)))
+  (define images (_2 compiled))
+  (define (module-root name)
+    (define found (find (lambda (pair) (Equal name (_0 pair))) system-roots))
+    (If found (_1 (_0 found)) (resolve name)))
+  (define policy-plan
+    (source:prepare-publication selection compiler module-root images
+      (lambda (path) 0) ["compiler_publication"]))
+  (define policy-code (publication:compile policy-plan (_1 compiled)))
+  (define policy
+    (Unpin (_1 (need (find (lambda (pair)
+      (Equal "compiler_publication" (_0 pair))) (_2 policy-code))))))
+  (define result (publication:publish-system policy slot compiled 0 0))
+  (If (Equal "err" (Hd result))
+    (error ["system-publication-failed" (_0 result)])
+    (force (tag (_0 result) images policy-code policy))))
+
+(define (checked value)
+  (If (And (Equal tag (Hd value)) (Eq 4 (Sz value))) value
+    (error "stale-system-build: rebuild system publication")))
+(define (trusted value) (_0 (checked value)))
+(define (system-images value) (_1 (checked value)))
+(define (publisher-code value) (_2 (checked value)))
+(define (policy value) (_3 (checked value)))
+
+;; Publish the compiler/store policy and requested local source graph into
+;; a fresh local sovereign before an application creates any instances.
+;; The caller provides its node identity and publication-location resolver.
+(define (build-local self build resolve slot modules)
+  (define pub (trusted build))
+  (define store-policy (policy build))
+  (define policy-code (publisher-code build))
+  (define previous-context
+    (publication:compilation-context (Unpin (_0 policy-code))))
+  (define images (Weld (system-images build) (_2 policy-code)))
+  (define (module-root name)
+    (define image (find (lambda (pair) (Equal name (_0 pair))) images))
+    (If image
+      (_0 (subject:sut-context
+        (driver:perc-subject (Unpin (_1 (_0 image))))))
+      (resolve name)))
+  (define prepared
+    (source:prepare-publication (context:publication-key previous-context)
+      (context:compiler-key previous-context) module-root images
+      (lambda (path) 0) modules))
+  (define code (publication:compile prepared (_1 policy-code)))
+  (define initial
+    ((driver:get-perc ["namespace" "create"] store-policy)
+      self (driver:get-perc ["sov" "new"] store-policy) pub))
+  (define (accepted result)
+    (If (Equal "ok" (Hd result)) (_0 result)
+      (error ["local-publication-failed" (_0 result)])))
+  (define policy-state
+    (_0 (accepted (publication:publish-local store-policy slot policy-code
+      0 0 (accepted initial)))))
+  (define state
+    (_0 (accepted (publication:publish-local store-policy slot code
+      0 0 policy-state))))
+  (force [state code]))
+
+(#export build-system build-local system-roots trusted system-images publisher-code policy)

@@ -4,11 +4,10 @@
 
 ;; Surface Foil -> the production TC_* IR, checked by foil-new-types.
 ;;
-;; The old FoilType algebra appears only in `legacy-scheme`, the compatibility
-;; seam used when a source program refers to a production builtin.  Every type
-;; produced, stored in a new declaration, compared, or attached to TC below is
-;; a stage-1 newtype value.
+;; Every builtin signature, declaration, and TC annotation uses the shared
+;; type kernel. Old or malformed type payloads fail at the entry boundary.
 
+(#bind brands (#module shrine-brand))
 (#bind std (#module std))
 (#import std)
 
@@ -26,7 +25,7 @@
 
 (#bind foil-env (#module foil-env))
 (#bind nt (#module foil-new-types))
-(#bind legacy (#module foil-types))
+(#bind core (#module foil-type-core))
 (#bind quip (#module quip))
 (#bind cairn (#module cairn))
 ;; NOTE on profiling: do NOT wrap the lazily-threaded pass state in
@@ -43,7 +42,19 @@
 (declare-cstr NewCompiler FOIL_NEW_ELAB_ROOT
   [subject tany]
   [world tany]
-  [resolutions (tarr tany)])
+  [resolutions (tarr tany)]
+  ;; The visibility inverse (canonical -> written aliases), derived
+  ;; once per compiler from the subject chain and carried row-wrapped
+  ;; ([inv]) so the constructor's WHNF force does not compute it.
+  ;; Same-module marks made after construction (generated accessors)
+  ;; are absent by design: mounted-extension members always come from
+  ;; import layers, whose marks predate the compiler.
+  [member-inverse tany]
+  ;; The selected system substrate is fixed for this compiler. Discover its
+  ;; storage root once, not by walking the import DAG for every literal or
+  ;; generic specialization. Row-wrapping keeps discovery lazy, like the
+  ;; member inverse; declaration passes preserve this same cached root.
+  [system-root tany])
 
 (declare-cstr LocalBinding FOIL_NEW_ELAB_ROOT
   [name (tnat 0)]
@@ -57,13 +68,13 @@
   [span tany]
   [name (tarr (tnat 0))])
 
-(define make-compiler $NewCompiler)
 (define compiler-subject NewCompiler.subject)
 (define compiler-world NewCompiler.world)
 (define compiler-with-subject NewCompiler.=subject)
 (define compiler-with-world NewCompiler.=world)
 (define compiler-resolutions NewCompiler.resolutions)
 (define compiler-with-resolutions NewCompiler.=resolutions)
+(define compiler-member-inverse NewCompiler.member-inverse)
 
 (define local-name LocalBinding.name)
 (define local-type LocalBinding.type)
@@ -73,7 +84,6 @@
 (define env-const-vars ElabEnv.const-vars)
 (define env-goal ElabEnv.goal)
 (define env-span ElabEnv.span)
-(define env-name ElabEnv.name)
 (define env-with-locals ElabEnv.=locals)
 (define env-with-type-vars ElabEnv.=type-vars)
 (define env-with-const-vars ElabEnv.=const-vars)
@@ -125,8 +135,9 @@
 ;; (see run-decl-pass below).  References must fail with a readable cascade
 ;; diagnostic instead of consuming the poison as a type.
 (define (failed-declaration? compiler path)
-  (And (get-const path (compiler-subject compiler))
-    (Eq "TC_MEAN" (Hd (got-entry-tc path (compiler-subject compiler))))))
+  (define hit (get-const path (compiler-subject compiler)))
+  (And hit
+    (Eq "TC_MEAN" (Hd (entry-tc path (unpin-soft (_0 hit)))))))
 
 (define prototype-mark "FOIL_NEW_UNTYPED_PROTOTYPE")
 (define (prototype-tc) (tc-const nt:tany prototype-mark))
@@ -137,107 +148,14 @@
 
 ;;; New builtin type world ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define nat-ref (nt:type-ref ["nat"]))
-
-;; The fourteen kernel auras (doc/aura-spec.md).  aura-tag? gates the
-;; nat/<aura> surface spelling; iota-body is the tagged-pair sum the
-;; goal-directed literal rules recognize.
-(define aura-tags
-  ["dm" "dr" "ds" "f" "r" "rd" "rs" "s" "ta" "ts" "tu" "u" "w" "x"])
-(define (aura-tag? a)
-  (includes (Eq a) aura-tags))
-(define iota-body
-  (nt:tsum
-    (map (lambda (tag)
-      (nt:trow tag [(nt:trow-item 0 nat-ref)]))
-      aura-tags)))
-
-(define (install-core-world world)
-  ;; Every core entry has runtime arity 0 and the "builtin" source; each
-  ;; `builtin` call yields one pipe stage awaiting the world.
-  (define (builtin path scm brand)
-    (lambda (w) (nt:declare-type w path scm brand 0 "builtin")))
-  (pipe world
-    (builtin ["nat"] (nt:mono (nt:tnat 0)) "nat")
-    (builtin ["uint"] (nt:mono (nt:tnat 0)) "uint")
-    (builtin ["bool"] (nt:mono (nt:tnat 0)) "bool")
-    (builtin ["unit"]
-      (nt:mono (nt:trow (print-path ["unit"]) []))
-      (print-path ["unit"]))
-    (builtin ["pail"] (nt:mono nt:tpail) 0)
-    (builtin ["any"] (nt:mono nt:tany) 0)
-    (builtin ["row"]
-      (nt:scheme [(nt:type-param "a")]
-        (nt:tarr (nt:type-var "a")))
-      0)
-    (builtin ["list"]
-      (nt:scheme [(nt:type-param "a")]
-        (nt:tsum
-          [(nt:trow "nil" [])
-           (nt:trow "cons"
-             [(nt:trow-item 0 (nt:type-var "a"))
-              (nt:trow-item 1
-                (nt:type-app ["list"]
-                  [(nt:type-arg (nt:type-var "a"))]))])]))
-      0)
-    (builtin ["either"]
-      (nt:scheme [(nt:type-param "a") (nt:type-param "b")]
-        (nt:tsum
-          [(nt:trow "left"
-             [(nt:trow-item 0 (nt:type-var "a"))])
-           (nt:trow "right"
-             [(nt:trow-item 0 (nt:type-var "b"))])]))
-      0)
-    (builtin ["iota"] (nt:mono iota-body) 0)
-    ;; Aura'd nat aliases: a sym/str value is a bare nat whose aura
-    ;; rides the type and widens away to plain nat.
-    (builtin ["sym"] (nt:mono (nt:tnat "ts")) 0)
-    (builtin ["str"] (nt:mono (nt:tnat "tu")) 0)
-    ;; The reflection descriptor sum: (^ expr) values.  Closed and
-    ;; non-generic; recursion is by nominal self-reference (a type-app
-    ;; here would be a template node, which wf rejects in resolved
-    ;; types).  Member shapes must stay in sync with the legacy mirror
-    ;; in foil-core-types.rvr (type-typ) and with reflect-encode below.
-    (builtin ["type"]
-      (let ((self (nt:type-ref ["type"])))
-        (nt:mono
-          (nt:tsum
-            [(nt:trow "any" [])
-             (nt:trow "pail" [])
-             (nt:trow "bot" [])
-             ;; An opaque constant: a non-nat const value (a baked
-             ;; comparator, say) that reflection cannot decompose.
-             (nt:trow "opq" [])
-             (nt:trow "nat" [(nt:trow-item "aura" nat-ref)])
-             (nt:trow "cst" [(nt:trow-item "val" nat-ref)])
-             (nt:trow "var" [(nt:trow-item "name" nat-ref)])
-             (nt:trow "arr" [(nt:trow-item "item" self)])
-             (nt:trow "pin" [(nt:trow-item "item" self)])
-             (nt:trow "fun"
-               [(nt:trow-item "args" (nt:tarr self))
-                (nt:trow-item "ret" self)])
-             (nt:trow "sum" [(nt:trow-item "opts" (nt:tarr self))])
-             (nt:trow "rec"
-               [(nt:trow-item "cstr" nat-ref)
-                (nt:trow-item "items"
-                  (nt:tarr
-                    (nt:trow 0
-                      [(nt:trow-item "face" nat-ref)
-                       (nt:trow-item "item" self)])))])
-             (nt:trow "nom"
-               [(nt:trow-item "path" (nt:tarr nat-ref))
-                (nt:trow-item "args" (nt:tarr self))])
-             (nt:trow "gen"
-               [(nt:trow-item "params"
-                  (nt:tarr
-                    (nt:trow 0
-                      [(nt:trow-item "cnst" nat-ref)
-                       (nt:trow-item "name" nat-ref)
-                       (nt:trow-item "cty" self)])))
-                (nt:trow-item "body" self)])])))
-      0)))
-
-(define default-type-world (install-core-world nt:empty-type-world))
+(define nat-ref core:nat-ref)
+(define aura-tags core:aura-tags)
+(define aura-tag? core:aura-tag?)
+(define iota-body core:iota-body)
+(define maybe-some-brand core:maybe-some-brand)
+(define maybe-none-brand core:maybe-none-brand)
+(define install-core-world core:install-core-world)
+(define default-type-world core:default-type-world)
 
 ;; The structural view of the current goal: unfold nominal/application
 ;; layers (bounded, like meth-function's resolve) so alias goals
@@ -265,7 +183,11 @@
 ;; renderer byte for byte.  Nominal depth: refs and applications stay
 ;; paths + argument descriptors — nothing unfolds.  Non-nat constants
 ;; (baked comparator values) are opaque: "opq".
-(define (reflect-encode env typ)
+(define (reflect-with identity env typ)
+  (define (nominal path args)
+    (define exact (identity path))
+    (If (Eq exact "opq") "opq"
+      (If exact ("ref" (_0 exact) args) ("nom" path args))))
   (define (enc-const v) (If (IsNat v) ("cst" v) "opq"))
   ;; One reference path -> descriptor.  /ty-ap-encoded applications
   ;; decode to a nom with argument descriptors; @var and '$val parts
@@ -279,10 +201,10 @@
         ((ty-val-path? p) (enc-const (Ix 1 p)))
         ((unit-qualified-path? p)
           ("nom" (Weld ["~"] (unit-qualified-path-local p)) []))
-        (else ("nom" p [])))
+        (else (nominal p [])))
       (let ((base (enc-ref (Ix 0 parts))))
-        (If (And (IsApp base) (Eq "nom" (Hd base)))
-          ("nom" (Ix 0 base) (map enc-ref (drop 1 parts)))
+        (If (And (IsApp base) (includes (Eq (Hd base)) ["nom" "ref"]))
+          ((Hd base) (Ix 0 base) (map enc-ref (drop 1 parts)))
           (new-elab-error env "unreflectable type application base" p)))))
   (define (enc t)
     (cond
@@ -316,7 +238,7 @@
       ((nt:type-var? t) ("var" (nt:ty-var-name t)))
       ((nt:const-var? t) ("var" (nt:const-var-name t)))
       ((nt:type-app? t)
-        ("nom" (nt:ty-app-base t)
+        (nominal (nt:ty-app-base t)
           (map
             (lambda (garg)
               (If (Eq "type" (nt:argument-kind garg))
@@ -328,6 +250,18 @@
       (else (new-elab-error env "unreflectable type" t))))
   (enc typ))
 
+(define (reflect-encode env typ)
+  (reflect-with (lambda (path) 0) env typ))
+(define (reflect-in-subject sut env typ)
+  (reflect-with (lambda (path)
+    (define found (definition-moment path sut))
+    (If found
+      [(brands:encode (_0 (_0 found)) (_1 (_0 found)))]
+      (If (And (sut-context sut) (get-const path sut))
+        (If (Eq "TC_FFI" (Hd (got-entry-tc path sut))) "opq" 0)
+        0))) env typ))
+
+
 
 ;;; Deriving the TypeWorld from a subject ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -336,145 +270,37 @@
 ;; path, and a unit compile derives its TypeWorld by replaying those entries
 ;; over the builtin core.  Materialized /ty-ap overlays are a cache and are
 ;; deliberately not persisted; they re-materialize lazily on lookup.
-(define (subject-entry-tc ent0)
-  (define ent (If (IsPin ent0) (Unpin ent0) ent0))
-  (cond
-    ((Nil (IsApp ent)) 0)
-    ((Eq "TC" (Hd ent)) (_1 ent))
-    ((Eq "IR_ENTRY" (Hd ent)) (_3 ent))
-    (else 0)))
+(define subject-entry-tc core:subject-entry-tc)
+(define subject-type-declaration core:subject-type-declaration)
+(define world-from-layer core:world-from-layer)
+(define world-from-subject core:world-from-subject)
 
-(define (subject-type-declaration world pair)
-  (define tc (subject-entry-tc (_1 pair)))
-  (Ifz (And tc (Eq "TC_TYP" (Hd tc)))
-    world
-    (let* ((path (_0 pair))
-           (inner (tc-typ-inner tc))
-           (scm
-             (cond
-               ((nt:scheme? inner) inner)
-               ((nt:monotype? inner) (nt:mono inner))
-               ;; A TC_TYP whose type is not a stage-1 value is a legacy
-               ;; declaration; the legacy pipeline owns it.
-               (else 0))))
-      (cond
-        ((Nil scm) world)
-        ((nt:type-bound? world path) world)
-        (else
-          (let* ((mono (nt:scheme-body scm))
-                 (brand (If (nt:row-type? mono) (nt:row-cstr mono) 0))
-                 (arity (If (nt:row-type? mono) (Sz (nt:row-items mono)) 0)))
-            (nt:declare-type world path scm brand arity 0)))))))
-
-(define (world-from-subject subject)
-  ;; Slot 0 of a subject is its entry ax (the same access get-const uses).
-  (foldl subject-type-declaration default-type-world
-    (rowify (cairn:tapax (Ix 0 subject)))))
+(define (resolve-system-root subject)
+  (define root (core:system-path subject 0))
+  ;; Scratch subjects have an empty storage root. Canonicalize the empty
+  ;; Weld result to nat zero before retaining it in a saveable compiler.
+  (If (Sz root) root 0))
 
 (define (compiler-for subject)
-  ($NewCompiler subject (world-from-subject subject) []))
+  ($NewCompiler subject (world-from-subject subject) []
+    [(foil-subject:derive-vis-inverse subject)]
+    [(resolve-system-root subject)]))
 
+;; compiler-for-with :: TypeWorld -> Subject -> NewCompiler
+;;
+;; The world is a pure function of the subject; a caller evaluating
+;; many expressions against ONE subject builds it once (or reads the
+;; cache row's lazily shared copy) instead of re-deriving it per
+;; expression.
+(define (compiler-for-with world subject)
+  ($NewCompiler subject world []
+    [(foil-subject:derive-vis-inverse subject)]
+    [(resolve-system-root subject)]))
 
-;;; Legacy builtin signature adapter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; A legacy nominal reference may be a /ty-ap selector whose parts include
-;; template (/ty-var) segments — builtin signatures encode `List a` that
-;; way.  Those become symbolic stage-1 applications; ground selectors and
-;; plain paths stay nominal references.
-(define (legacy-nominal-reference path)
-  (If (Nil (ty-ap-path? path))
-    (nt:type-ref path)
-    (let ((parts (ty-ap-decode path)))
-      (If (Nil (any ty-var-path? parts))
-        (nt:type-ref path)
-        (nt:type-app (_0 parts)
-          (map
-            (lambda (part)
-              (cond
-                ((ty-var-path? part)
-                  (nt:type-arg (nt:type-var (Ix 1 part))))
-                ((ty-val-path? part) (nt:const-arg (Ix 1 part)))
-                (else (nt:type-arg (legacy-nominal-reference part)))))
-            (drop 1 parts)))))))
-
-(define (legacy-monotype compiler typ)
-  (define tag (legacy:type-tag typ))
-  (define (recur c t) (legacy-monotype c t))
-  (define (many c xs) (nt:thread-map recur c xs))
-  (cond
-    ((Eq tag "TBOT") [compiler nt:tbot])
-    ((Eq tag "TANY") [compiler nt:tany])
-    ((Eq tag "TPAIL") [compiler nt:tpail])
-    ((Eq tag "TNAT")
-      [compiler
-       (Ifz (legacy:tnat-cube typ)
-         (nt:tnat 0)
-         (nt:tconst (legacy:tnat-cube typ)))])
-    ((Eq tag "TNOM")
-      [compiler (legacy-nominal-reference (legacy:tnom-ref typ))])
-    ((Eq tag "TVAR") [compiler (nt:type-var (legacy:tvar-index typ))])
-    ((Eq tag "TFAC") (recur compiler (legacy:tfac-val typ)))
-    ((Eq tag "TSELF") (recur compiler (legacy:tself-val typ)))
-    ((Eq tag "TPIN")
-      (let ((r (recur compiler (legacy:tpin-val typ))))
-        [(_0 r) (nt:tpin (_1 r))]))
-    ((Eq tag "TARR")
-      (let ((r (recur compiler (legacy:tarr-item typ))))
-        [(_0 r) (nt:tarr (_1 r))]))
-    ((Eq tag "TFUN")
-      (let* ((ar (many compiler (legacy:tfun-args typ)))
-             (rr (recur (_0 ar) (legacy:tfun-ret typ))))
-        [(_0 rr) (nt:tfun (_1 ar) (_1 rr))]))
-    ((Eq tag "TROW")
-      (let ((r
-              (nt:thread-map
-                (lambda (c pair)
-                  (define i (_0 pair))
-                  (define item (_1 pair))
-                  (define faced (Eq "TFAC" (legacy:type-tag item)))
-                  (define face (If faced (legacy:tfac-face item) i))
-                  (define raw (If faced (legacy:tfac-val item) item))
-                  (let ((ir (recur c raw)))
-                    [(_0 ir) (nt:trow-item face (_1 ir))]))
-                compiler
-                (zip (gen (Sz (legacy:trow-vals typ)) (lambda (i) i))
-                  (legacy:trow-vals typ)))))
-        [(_0 r) (nt:trow (legacy:trow-cstr typ) (_1 r))]))
-    ((Eq tag "TSUM")
-      (let ((r (many compiler (legacy:tsum-opts typ))))
-        [(_0 r) (nt:tsum (_1 r))]))
-    ((Eq tag "TTYP") (recur compiler (legacy:ttyp-type typ)))
-    (else
-      (error ["foil-new-elab" "unsupported legacy builtin type" typ]))))
-
-(define (legacy-scheme compiler typ)
-  (define (go c params t)
-    (define tag (legacy:type-tag t))
-    (cond
-      ((Eq tag "TQUA")
-        (go c (snoc (nt:type-param (legacy:tqua-name t)) params)
-          (legacy:tqua-body-value t)))
-      ((Eq tag "TCQUA")
-        (let ((tr (legacy-monotype c (legacy:tcqua-type t))))
-          (go (_0 tr)
-            (snoc (nt:const-param (legacy:tcqua-name t) (_1 tr)) params)
-            (legacy:tcqua-body t))))
-      (else
-        (let ((r (legacy-monotype c t)))
-          [(_0 r) (nt:scheme params (_1 r))]))))
-  (go compiler [] typ))
 
 (define (normalize-tc compiler tc)
-  (define typ (tc-ty tc))
-  (If (nt:type-value? typ)
-    [compiler tc]
-    (let ((r (legacy-scheme compiler typ)))
-      [(_0 r)
-       (set-tc-ty
-         (Ifz (Sz (nt:scheme-parameters (_1 r)))
-           (nt:scheme-body (_1 r))
-           (_1 r))
-         tc)])))
+  (nt:require-type-value "TC annotation" (tc-ty tc))
+  [compiler tc])
 
 
 ;;; Surface type elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -488,14 +314,16 @@
   (And hit (_0 hit)))
 
 (define (type-path compiler path)
-  (canon-path path (compiler-subject compiler)))
+  (define sut (compiler-subject compiler))
+  (If (sut-context sut) (resolve-source-path path sut)
+    (canon-path path sut)))
 
 (define (surf-strip-spans surf)
   (If (Eq "s_span" (_0 surf)) (surf-strip-spans (_2 surf)) surf))
 
 ;; Expand every current-namespace reference (%/x, s_cref) into an
 ;; ordinary s_ref of anchor+suffix.  The anchor is the enclosing
-;; declaration's source path, determined structurally BEFORE any
+;; declaration's parent source path, determined structurally BEFORE any
 ;; declaration elaborates: %/ performs no parent search and no
 ;; rooted-first fallback of its own — it forms one exact written path,
 ;; which then resolves through the ordinary environment machinery
@@ -508,10 +336,10 @@
       (gen (Sz x) (lambda (i) (cref-expand anchor (Ix i x)))))))
 
 ;; A declaration row with its body's %/ references expanded at the
-;; declaration's own namespace position.
+;; enclosing namespace (siblings of the declaration itself).
 (define (expand-decl-crefs row)
   (If (And (IsApp row) (Eq "s_decl" (_0 row)))
-    (Up 3 (cref-expand (_1 row) (_3 row)) row)
+    (Up 3 (cref-expand (Init (_1 row)) (_3 row)) row)
     row))
 
 ;; The sealed environment riding the subject (an Environment during
@@ -548,20 +376,20 @@
 ;; spelling, so invert the subject's visibility projection — preferring
 ;; an alias whose own or parent path was already recorded (the alias the
 ;; receiver's type resolved through), otherwise the first written alias.
-(define (record-member-resolution compiler env member vis-pairs)
+;; writtens: the member's written aliases (the visibility inverse row
+;; for its canonical key) — already filtered, no index scan here.
+(define (record-member-resolution compiler env member writtens)
   (define subject (compiler-subject compiler))
-  (Ifz (Sz vis-pairs)
+  (Ifz (Sz writtens)
     compiler
     (let* ((root (sut-root subject))
            (sources
              (map
-               (lambda (pair)
-                 (let ((written (_0 pair)))
-                   (If (foil-env:path-prefix? root written)
-                     (drop (Sz root) written)
-                     written)))
-               (filter (lambda (pair) (Equal member (_1 pair)))
-                 vis-pairs)))
+               (lambda (written)
+                 (If (foil-env:path-prefix? root written)
+                   (drop (Sz root) written)
+                   written))
+               writtens))
            (prior (compiler-resolutions compiler))
            (preferred
              (find
@@ -614,7 +442,7 @@
     ((Or (Eq tag "s_ref") (Eq tag "s_var"))
       (let* ((path0
                (If (Eq tag "s_var") [(_1 arg)] (surf-ref-path arg)))
-             (path (canon-path path0 (compiler-subject compiler))))
+             (path (type-path compiler path0)))
         (If (get-const path (compiler-subject compiler))
           (nt:const-arg path)
           (new-elab-error env "unbound const argument reference" arg))))
@@ -811,7 +639,7 @@
 ;; mentions is dropped — uniform for @ and @@, so namespace-scoped vars
 ;; cost nothing on members that don't use them.  A const parameter also
 ;; survives when the value body references it (TC_CPARAM): its type may
-;; be var-free (add_n's {nat; nat}).
+;; be var-free (add_n's {\ nat}nat).
 (define (tc-with-parameters params tc)
   (define typ (tc-ty tc))
   (define body (If (nt:scheme? typ) (nt:scheme-body typ) typ))
@@ -873,6 +701,10 @@
 ;; would bounce them off the visibility index.
 (define (global-reference-canonical compiler env path)
   (define world (compiler-world compiler))
+  ;; One lookup serves poison checking, presence checking and decoding.
+  ;; Imported entries are immutable; no cross-compilation state is retained.
+  (define hit (get-const path (compiler-subject compiler)))
+  (define raw (And hit (entry-tc path (unpin-soft (_0 hit)))))
   (cond
     ((nt:type-bound? world path)
       (let* ((lr (nt:lookup-type-entry world path))
@@ -883,12 +715,11 @@
                  (nt:type-ref path)
                  scm)))
         [(compiler-with-world (_0 lr) compiler) (tc-typ inner)]))
-    ((failed-declaration? compiler path)
+    ((And hit (Eq "TC_MEAN" (Hd raw)))
       (new-elab-error env
         "reference to a declaration that failed to elaborate" path))
-    ((get-const path (compiler-subject compiler))
-      (let* ((raw (got-entry-tc path (compiler-subject compiler)))
-             (nr (normalize-tc compiler raw))
+    (hit
+      (let* ((nr (normalize-tc compiler raw))
              (tc (_1 nr)))
         (If (prototype-tc? tc)
           (new-elab-error env
@@ -900,10 +731,24 @@
     (else (new-elab-error env "unbound reference" path))))
 
 (define (global-reference compiler env path0)
-  (flow compiler
-    ((tc (global-reference-canonical compiler env
-           (canon-path path0 (compiler-subject compiler)))))
-    [(record-resolution compiler env path0) tc]))
+  (define canonical (type-path compiler path0))
+  ;; Visibility tombstones are internal. Diagnose the spelling the author
+  ;; actually used, not the sentinel installed for a hidden/cut reference.
+  (If (Equal canonical ["/foil-env/unbound"])
+    (new-elab-error env "unbound reference" path0)
+    (flow compiler
+      ((tc (global-reference-canonical compiler env canonical)))
+      [(record-resolution compiler env path0) tc])))
+
+;; An aura'd nat type (str, sym, nat/<aura>): the refinement an
+;; explicit ^ cast may claim for any nat.
+(define (aura-nat-type? t)
+  (And (nt:nat-type? t) (Ifz (nt:nat-aura t) 0 1)))
+;; A viewed type whose values are bare nats: a nat of any aura, or a
+;; nat constant.
+(define (nat-ish-type? t)
+  (Or (nt:nat-type? t)
+    (And (nt:const-type? t) (IsNat (nt:const-value t)))))
 
 (define (view-type compiler env typ what)
   (need env (Nil (nt:scheme? typ))
@@ -944,11 +789,15 @@
         "lambda goal has the wrong arity" (env-goal env))
       vr)))
 
+(define (unmark surf)
+  (define node (surf-strip-spans surf))
+  (If (Eq "s_strict" (_0 node)) (unmark (_1 node)) node))
+
 (define (lambda-parameters compiler env args goal-fun)
   (foldl
     (lambda (state pair)
       (define i (_0 pair))
-      (define arg (_1 pair))
+      (define arg (unmark (_1 pair)))
       (define tag (_0 arg))
       (define inferred
         (If goal-fun (Ix i (nt:fun-args goal-fun)) 0))
@@ -976,9 +825,9 @@
     (cond
       ((Eq "s_span" (_0 node)) (go (_2 node)))
       ((Eq "s_ref" (_0 node))
-        (canon-path (surf-ref-path node) (compiler-subject compiler)))
+        (type-path compiler (surf-ref-path node)))
       ((Eq "s_var" (_0 node))
-        (canon-path [(_1 node)] (compiler-subject compiler)))
+        (type-path compiler [(_1 node)]))
       ((Eq "s_spec" (_0 node))
         (let ((inner (tc-typ-inner tc)))
           (And (nt:type-ref? inner) (nt:type-ref-path inner))))
@@ -990,9 +839,9 @@
 (define (specialization-base-path compiler surf)
   (cond
     ((Eq "s_ref" (_0 surf))
-      (canon-path (surf-ref-path surf) (compiler-subject compiler)))
+      (type-path compiler (surf-ref-path surf)))
     ((Eq "s_var" (_0 surf))
-      (canon-path [(_1 surf)] (compiler-subject compiler)))
+      (type-path compiler [(_1 surf)]))
     ((Eq "s_span" (_0 surf)) (specialization-base-path compiler (_2 surf)))
     (else 0)))
 
@@ -1007,7 +856,7 @@
 
 ;; The member tag of a structural row constructor: its last /-separated
 ;; segment (a rootless constructor is its own tag).
-(define (cstr-tag cstr)
+(define (legacy-cstr-tag cstr)
   (define n (Bytes cstr))
   (define (go i last)
     (If (Ge i n)
@@ -1015,6 +864,10 @@
       (go (Inc i)
         (If (Eq 47 (Mod (Rsh cstr (Mul 8 i)) 256)) (Inc i) last))))
   (go 0 0))
+
+(define (cstr-tag cstr)
+  (If (brands:brand? cstr) (brands:member-name cstr)
+    (legacy-cstr-tag cstr)))
 
 (define (option-member-tag option)
   (cond
@@ -1069,6 +922,23 @@
 ;; The scrutinee rides the arm frame under a name no source binder can
 ;; produce, so bare names and s_self keep resolving past it.
 (define match-scrutinee-name "#foil-new-elab/scrutinee")
+
+;; A structural-row binder pattern ([f=fate a=maybe[path]]) binds the
+;; field under a name no source binder can produce; its faces spread as
+;; bare names through local-face-reference like any row-typed local.
+(define row-binder-name "#foil-new-elab/row-binder")
+
+;; The failure binder of a < (bind-or-propagate) desugaring.
+(define prop-fail-name "#foil-new-elab/prop-fail")
+
+;; A brand: a branded row with exactly one faceless item - the `:  T`
+;; declaration.  UFCS on a brand receiver forwards to the payload
+;; (meth-function's resolve) with the receiver projected to the item.
+(define (brand-row? t)
+  (And (nt:row-type? t)
+    (And (Ifz (nt:row-cstr t) 0 1)
+      (And (Eq 1 (Sz (nt:row-items t)))
+        (Eq 0 (nt:row-item-face (_0 (nt:row-items t))))))))
 
 ;; A field projection (Ix idx scrutinee) as a TC, for binder lets whose
 ;; scrutinee sits `distance` slots up the frame.
@@ -1132,6 +1002,12 @@
 ;; are quantified with the type's own parameters; receiver-driven method
 ;; specialization instantiates them at use.  Positional fields (face =
 ;; index) generate nothing.
+;; Generated members join source visibility only when an explicit
+;; index exists (union-mount subjects), so an explicit (point/x fst)
+;; call resolves; bare/legacy subjects keep inferring from storage.
+(define (mark-derived key sut)
+  (If (sut-visible sut) (mark-visible key key sut) sut))
+
 (define (gen-accessors path scm subject)
   (define params (nt:scheme-parameters scm))
   (define row (nt:scheme-body scm))
@@ -1140,12 +1016,10 @@
       (nt:type-ref path)
       (nt:type-app path (map nt:parameter-template-argument params))))
   (define (qua typ) (Ifz (Sz params) typ (nt:scheme params typ)))
-  ;; Generated members join source visibility only when an explicit
-  ;; index exists (union-mount subjects), so an explicit (point/x fst)
-  ;; call resolves; bare/legacy subjects keep inferring from storage.
-  (define (mark-derived key sut)
-    (If (sut-visible sut) (mark-visible key key sut) sut))
-  (define (go sut pair)
+  ;; one batched insert for the whole record's accessor set (three
+  ;; entries per field — the per-entry path paid an order snoc each),
+  ;; then the visibility marks, which are already incremental
+  (define (field-rows pair)
     (define idx (_0 pair))
     (define item (_1 pair))
     (define face (nt:row-item-face item))
@@ -1154,24 +1028,187 @@
     (define set-key (Weld path [(strWeld "set_" face)]))
     (define over-key (Weld path [(strWeld "over_" face)]))
     (If (Eq face idx)
-      sut
-      (pipe sut
-        (insert-tc get-key wack-span
-          (tc-ffi (qua (nt:tfun [self-ty] fty)) (Ix idx)))
-        (mark-derived get-key)
-        (insert-tc set-key wack-span
-          (tc-ffi (qua (nt:tfun [fty self-ty] self-ty)) (row-set-at idx)))
-        (mark-derived set-key)
-        (insert-tc over-key wack-span
-          (tc-ffi (qua (nt:tfun [(nt:tfun [fty] fty) self-ty] self-ty))
-            (row-over-at idx)))
-        (mark-derived over-key))))
-  (foldl go subject
-    (zip (gen (Sz (nt:row-items row)) (lambda (i) i)) (nt:row-items row))))
+      []
+      [[get-key wack-span (tc-ffi (qua (nt:tfun [self-ty] fty)) (Ix idx))]
+       [set-key wack-span
+        (tc-ffi (qua (nt:tfun [fty self-ty] self-ty)) (row-set-at idx))]
+       [over-key wack-span
+        (tc-ffi (qua (nt:tfun [(nt:tfun [fty] fty) self-ty] self-ty))
+          (row-over-at idx))]]))
+  (define rows
+    (foldl (lambda (acc pair) (Weld acc (field-rows pair)))
+      []
+      (zip (gen (Sz (nt:row-items row)) (lambda (i) i)) (nt:row-items row))))
+  (foldl (lambda (s r) (mark-derived (_0 r) s))
+    (insert-tcs rows subject)
+    rows))
+
+;;; Derived union members: S/is_c and S/try_c ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; An option's runtime shape is its key [brand arity]: a nullary case is
+;; the bare brand cord, a payload case an app of the brand over exactly
+;; `arity` fields (lower-arm-test's probe without the kid tests).  Both
+;; helpers bake into tc-ffi constants partially applied to the key, the
+;; way accessors bake (Ix idx).
+(define (sum-is-case brand arity v)
+  (Ifz arity
+    (Eq brand v)
+    (And (IsApp v) (And (Eq brand (Hd v)) (Eq arity (Sz v))))))
+(define (sum-try-case some none brand arity unwrap? v)
+  (If (sum-is-case brand arity v)
+    (some (If unwrap? (Ix 0 v) v))
+    none))
+;; pail/as[t]: some when the pail value carries t's brand at t's arity.
+(define (pail-as-key some none brand arity p)
+  (If (sum-is-case brand arity p) (some p) none))
+
+(define (system-path compiler name)
+  (Weld (_0 (NewCompiler.system-root compiler)) name))
+(define (option-brands compiler)
+  (Ifz (sut-context (compiler-subject compiler))
+    [maybe-some-brand maybe-none-brand]
+    (map (lambda (name)
+      (_0 (_1 (nt:runtime-key (compiler-world compiler)
+        (nt:type-ref (system-path compiler ["maybe" name]))))))
+      ["some" "none"])))
+
+;; pail/as[t] is the one specialization whose runtime value depends on
+;; its type argument: t must be a declared record (the pail universe is
+;; branded rows only - sums, anonymous rows and nat have no key), and
+;; the value is a tc-ffi at the specialized type over pail-as-key.
+(define (elab-pail-as compiler env spec-ty gargs)
+  (define t (nt:argument-value (_0 gargs)))
+  ;; nat/uint/bool carry substrate brands too, so the test is on the
+  ;; VIEWED shape: only a branded row inhabits pail.
+  (define vr
+    (view-type compiler env t
+      "pail/as needs a declared record as its type argument"))
+  (define row (_1 vr))
+  (need env (And (nt:row-type? row) (Ifz (nt:row-cstr row) 0 1))
+    "pail/as needs a declared record as its type argument - sums, anonymous rows and nat do not inhabit pail"
+    t)
+  (define kr (nt:runtime-key (compiler-world (_0 vr)) row))
+  (define key (_1 kr))
+  (define options (option-brands compiler))
+  [(compiler-with-world (_0 kr) (_0 vr))
+   (tc-ffi spec-ty (pail-as-key (_0 options) (_1 options) (_0 key) (_1 key)))])
+
+;; The row an option denotes, WITHOUT interning: a structural row is
+;; itself; a nominal member's row is its entry's scheme body; a generic
+;; member's is that body instantiated at the option's arguments
+;; (template arguments included - nothing needs a /ty-ap key).  0 when
+;; the option denotes no row (an alias to a non-row): only is_ derives.
+(define (option-row world option)
+  (cond
+    ((nt:row-type? option) [world option])
+    ((nt:type-ref? option)
+      (let* ((r (nt:lookup-type-entry world (nt:type-ref-path option)))
+             (body (nt:scheme-body (nt:type-entry-scheme (_1 r)))))
+        [(_0 r) (If (nt:row-type? body) body 0)]))
+    ((nt:type-app? option)
+      (let* ((r (nt:lookup-type-entry world (nt:ty-app-base option)))
+             (sr (nt:specialize-scheme (_0 r)
+                   (nt:type-entry-scheme (_1 r))
+                   (nt:ty-app-arguments option))))
+        [(_0 sr) (If (nt:row-type? (_1 sr)) (_1 sr) 0)]))
+    (else [world 0])))
+
+;; Named records expose the same checked pail projection as pail/as[T].
+;; Type parameters remain type information; nominal runtime identity is
+;; the defining record's exact moment, independent of specialization.
+(define (gen-pail-member compiler path scm declared)
+  (define params (nt:scheme-parameters scm))
+  (define row (nt:scheme-body scm))
+  (define key (Weld path ["try_from_pail"]))
+  (define env (env-with-name path empty-env))
+  (need env
+    (And (Nil (includes (Equal key) declared))
+      (Nil (includes
+        (lambda (item) (Equal "try_from_pail" (nt:row-item-face item)))
+        (nt:row-items row))))
+    ["derived pail member collides with a declaration or field"
+     (print-path key)]
+    ["record" (print-path path)])
+  (define self-ty
+    (Ifz (Sz params)
+      (nt:type-ref path)
+      (nt:type-app path (map nt:parameter-template-argument params))))
+  (define typ
+    (nt:tfun [nt:tpail]
+      (nt:type-app (system-path compiler ["maybe"])
+        [(nt:type-arg self-ty)])))
+  (define options (option-brands compiler))
+  [compiler
+   [[key wack-span
+     (tc-ffi (Ifz (Sz params) typ (nt:scheme params typ))
+       (pail-as-key (_0 options) (_1 options)
+         (nt:row-cstr row) (Sz (nt:row-items row))))]]])
+
+;; gen-sum-members :: compiler -> path -> scheme -> [path] -> [compiler rows]
+;; Per option with a runtime key: S/is_c : {\ S}bool and, for a payload
+;; case, S/try_c : {\ S}maybe[payload] - payload = the single field's
+;; type of a one-field case, else the case row itself.  A generic union
+;; quantifies both like accessors do; the receiver instantiates them.
+;; A derived key that names a declaration of this module is an error on
+;; the union (last-write-wins inserts would otherwise silently shadow).
+(define (gen-sum-members compiler path scm declared)
+  (define params (nt:scheme-parameters scm))
+  (define env (env-with-name path empty-env))
+  (define self-ty
+    (Ifz (Sz params)
+      (nt:type-ref path)
+      (nt:type-app path (map nt:parameter-template-argument params))))
+  (define (qua typ) (Ifz (Sz params) typ (nt:scheme params typ)))
+  (define bool-ty (nt:type-ref (system-path compiler ["bool"])))
+  (define (maybe-of typ)
+    (nt:type-app (system-path compiler ["maybe"]) [(nt:type-arg typ)]))
+  (define options (option-brands compiler))
+  (define (derived-key stem tag)
+    (define key (Weld path [(strWeld stem tag)]))
+    (need env (Nil (includes (Equal key) declared))
+      ["derived union member collides with a declaration - rename the declared member"
+       (print-path key)]
+      ["union" (print-path path)])
+    key)
+  (define (option-rows state option)
+    (define c0 (_0 state))
+    (define tag (option-member-tag option))
+    (define kr (nt:runtime-key (compiler-world c0) option))
+    (define key (_1 kr))
+    (define c1 (compiler-with-world (_0 kr) c0))
+    (Ifz key
+      [c1 (_1 state)]
+      (let* ((brand (_0 key))
+             (arity (_1 key))
+             (rr (option-row (compiler-world c1) option))
+             (row (_1 rr))
+             (c2 (compiler-with-world (_0 rr) c1))
+             (is-row
+               [(derived-key "is_" tag) wack-span
+                (tc-ffi (qua (nt:tfun [self-ty] bool-ty))
+                  (sum-is-case brand arity))])
+             (try-rows
+               (If (Or (Ifz arity 1 0) (Ifz row 1 0))
+                 []
+                 (let* ((items (nt:row-items row))
+                        (unwrap? (Eq 1 (Sz items)))
+                        (payload
+                          (If unwrap? (nt:row-item-value (_0 items)) option)))
+                   [[(derived-key "try_" tag) wack-span
+                     (tc-ffi (qua (nt:tfun [self-ty] (maybe-of payload)))
+                       (sum-try-case (_0 options) (_1 options)
+                         brand arity unwrap?))]]))))
+        [c2 (Weld (_1 state) (Weld [is-row] try-rows))])))
+  (foldl option-rows [compiler []] (nt:sum-options (nt:scheme-body scm))))
 
 ;;; Core expression elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (elab-value-go compiler env surf)
+  ;; A branch result annotation is inside the selected branch, not a
+  ;; caller-side annotation on If's lazy operand.
+  (define (region tc)
+    (If (Eq "TC_DEMAND" (Hd tc))
+      (tc-letrec (tc-ty tc) [tc] (tc-local (tc-ty tc) 0 "#strict-result")) tc))
   (define (check-value compiler env surf expected)
     (define r (elab-value-go compiler (env-with-goal expected env) surf))
     (define tc (_1 r))
@@ -1313,17 +1350,24 @@
           ["member arity mismatch" tag] ["want" (Sz fields) "got" (Sz args)])
         (let ((er (elab-values (_0 mr) env args fields)))
           [(_0 er) (tc-row goal (nt:row-cstr row) (_1 er))]))))
-  (define (elab-ordinary-call compiler env fsurf args)
+  ;; The call proper, over an already-elaborated head (elab-ordinary-call
+  ;; and elab-flipped-call below supply it).
+  (define (elab-call-with compiler env f fsurf args)
     (flow compiler
-      ((f (elab-value-go compiler (clear-goal env) fsurf)))
+      ((f [compiler f]))
       (If (Eq "TC_TYP" (Hd f))
         (let ((path (constructor-path compiler fsurf f)))
           (If path
             (flow compiler
               ((entry
                  (lift-world compiler
-                   (nt:lookup-type-entry (compiler-world compiler) path))))
-              (define body (nt:type-entry-body entry))
+                   (nt:lookup-type-entry (compiler-world compiler) path)))
+               (body
+                 (If (Or (Nil (nt:type-entry-body entry))
+                         (nt:row-type? (nt:type-entry-body entry)))
+                   [compiler (nt:type-entry-body entry)]
+                   (view-type compiler env (nt:type-entry-body entry)
+                     "called type is not a row constructor"))))
               (cond
                 ((Nil body)
                   ;; A generic constructor instantiates from the
@@ -1387,6 +1431,10 @@
             ((inst (infer-generic compiler env (tc-ty f) args [] (tc-ty f))))
             (elab-checked-apply compiler env (set-tc-ty inst f) args))
           (elab-checked-apply compiler env f args)))))
+  (define (elab-ordinary-call compiler env fsurf args)
+    (flow compiler
+      ((f (elab-value-go compiler (clear-goal env) fsurf)))
+      (elab-call-with compiler env f fsurf args)))
   ;; An absolute variant call constructs by tag: against a goal it is a
   ;; relative variant (typed as the expected union); without one it
   ;; synthesizes a structural row.
@@ -1402,6 +1450,33 @@
                (zip (gen (Sz (_1 ar)) (lambda (i) i)) (_1 ar))))
            tag
            (_1 ar))])))
+  ;; (#f a b): the head's argument order reversed.  # is an involution
+  ;; (## is the identity) and prefixes only a SATURATED call, so the
+  ;; reversal is a rewrite of the argument list - free at runtime and
+  ;; indifferent to generics.  A partial (#f a) or a bare #f is a
+  ;; diagnostic.  A constructor head reverses its fields the same way.
+  (define (elab-flipped-call compiler env fhead args)
+    (define (unwrap surf n)
+      (let ((s (surf-strip-spans surf)))
+        (If (Eq "s_flip" (_0 s)) (unwrap (_1 s) (Inc n)) [s n])))
+    (define u (unwrap fhead 0))
+    (define inner (_0 u))
+    (define odd? (Mod (_1 u) 2))
+    (flow compiler
+      ((f (elab-value-go compiler (clear-goal env) inner)))
+      (define typ (tc-ty f))
+      (If (Eq "TC_TYP" (Hd f))
+        (elab-call-with compiler env f inner (If odd? (rev args) args))
+        (flow compiler
+          ((fun
+             (If (nt:scheme? typ)
+               [compiler (nt:scheme-body typ)]
+               (view-type compiler env typ "flip (#) needs a function head"))))
+          (need env (nt:fun-type? fun) "flip (#) needs a function head" typ)
+          (need env (Eq (Sz args) (Sz (nt:fun-args fun)))
+            "flip (#) needs a saturated call - every argument supplied"
+            ["want" (Sz (nt:fun-args fun)) "got" (Sz args)])
+          (elab-call-with compiler env f inner (If odd? (rev args) args))))))
   (define (elab-call compiler env fsurf args)
     (define fhead (surf-strip-spans fsurf))
     (cond
@@ -1409,6 +1484,8 @@
         (relvar-construct compiler env (_1 fhead) args))
       ((Eq "s_variant" (_0 fhead))
         (variant-construct compiler env (_1 fhead) args))
+      ((Eq "s_flip" (_0 fhead))
+        (elab-flipped-call compiler env fhead args))
       (else (elab-ordinary-call compiler env fsurf args))))
   (define (elab-specialization compiler env val args)
     (flow compiler
@@ -1440,6 +1517,9 @@
              (lift-world compiler
                (nt:specialize-scheme (compiler-world compiler)
                  scm gargs))))
+          (If (Equal (system-path compiler ["pail" "as"])
+                     (specialization-base-path compiler val))
+            (elab-pail-as compiler env spec gargs)
           (Ifz (nt:scheme-const-parameter-count scm)
             ;; Type-only specialization erases at runtime: the value
             ;; is the base itself at its specialized type.
@@ -1458,7 +1538,7 @@
                (tc-global spec
                  (ty-ap-encode
                    (Weld [(tc-global-path base)]
-                     (map specialization-argument-part gargs))))]))))))
+                     (map specialization-argument-part gargs))))])))))))
   ;; One match arm -> [compiler [arm-tc key]].  env already carries the
   ;; scrutinee local (slot 0), matching lower-match's one-let framing; a
   ;; binder pattern adds TC_LET projections over that slot.
@@ -1470,6 +1550,51 @@
       (If goal
         (check-value c e body-surf goal)
         (elab-value-go c (clear-goal e) body-surf)))
+    ;; Positional binders over a row's items: a hole skips, a bare name
+    ;; binds the field, a faced binder imposes its annotation (the field
+    ;; must fit it), and a structural-row binder is a hidden faced
+    ;; binder whose faces spread as bare names.  -> [compiler env binds]
+    (define (bind-positional c0 e0 items binders)
+      (foldl
+        (lambda (state pair)
+          (define i (_0 pair))
+          (define binder (surf-strip-spans (_1 pair)))
+          (define fty (nt:row-item-value (Ix i items)))
+          (define c (_0 state))
+          (define e (_1 state))
+          (define binds (_2 state))
+          (define (annotated name ann-surf)
+            (let* ((tr (elab-type c env ann-surf 0))
+                   (ann (_1 tr))
+                   (c1 (ensure-subtype (_0 tr) env fty ann
+                         "pattern annotation does not fit the member field")))
+              [c1
+               (push-local name ann e)
+               (snoc (field-projection-tc scrut-ty ann i (Sz binds)) binds)]))
+          (cond
+            ((Eq "s_hole" (_0 binder)) state)
+            ((And (Eq "s_ref" (_0 binder))
+               (Eq 1 (Sz (surf-ref-path binder))))
+              [c
+               (push-local (_0 (surf-ref-path binder)) fty e)
+               (snoc (field-projection-tc scrut-ty fty i (Sz binds))
+                 binds)])
+            ((Eq "s_face" (_0 binder))
+              (annotated (surf-face-name binder) (surf-face-kid binder)))
+            ((Eq "s_trow" (_0 binder))
+              (annotated row-binder-name binder))
+            (else
+              (new-elab-error env "unsupported pattern binder" binder))))
+        [c0 e0 []]
+        (zip (gen (Sz binders) (lambda (i) i)) binders)))
+    ;; The arm body over the binders' lets -> [compiler [arm-tc key]].
+    (define (finish-arm bound narrowed key)
+      (define br (arm-body (_0 bound) (_1 bound)))
+      (define body-tc
+        (Ifz (Sz (_2 bound))
+          (_1 br)
+          (tc-letrec (tc-ty (_1 br)) (_2 bound) (_1 br))))
+      [(_0 br) [(tc-arm (tc-ty (_1 br)) narrowed body-tc key) key]])
     (define (member-arm tag binders)
       (define mr (relvar-member compiler env tag scrut-ty "a pattern"))
       (define row (_1 mr))
@@ -1479,46 +1604,38 @@
       (need env (Or (Nil (Sz binders)) (Eq (Sz binders) (Sz items)))
         ["member arity mismatch in pattern" tag]
         ["want" (Sz items) "got" (Sz binders)])
-      (define bound
-        (foldl
-          (lambda (state pair)
-            (define i (_0 pair))
-            (define binder (surf-strip-spans (_1 pair)))
-            (define fty (nt:row-item-value (Ix i items)))
-            (define c (_0 state))
-            (define e (_1 state))
-            (define binds (_2 state))
-            (cond
-              ((Eq "s_hole" (_0 binder)) state)
-              ((And (Eq "s_ref" (_0 binder))
-                 (Eq 1 (Sz (surf-ref-path binder))))
-                [c
-                 (push-local (_0 (surf-ref-path binder)) fty e)
-                 (snoc (field-projection-tc scrut-ty fty i (Sz binds))
-                   binds)])
-              ;; A faced binder imposes its annotation as the binder's
-              ;; type; the member's field must fit the annotation.
-              ((Eq "s_face" (_0 binder))
-                (let* ((tr (elab-type c env (surf-face-kid binder) 0))
-                       (ann (_1 tr))
-                       (c1 (ensure-subtype (_0 tr) env fty ann
-                             "pattern annotation does not fit the member field")))
-                  [c1
-                   (push-local (surf-face-name binder) ann e)
-                   (snoc (field-projection-tc scrut-ty ann i (Sz binds))
-                     binds)]))
-              (else
-                (new-elab-error env "unsupported pattern binder" binder))))
-          ;; Arm bodies see the scrutinee narrowed to the member, so its
-          ;; faces spread as bare names alongside any explicit binders.
-          [(_0 mr) (narrow-scrutinee env narrowed) []]
-          (zip (gen (Sz binders) (lambda (i) i)) binders)))
-      (define br (arm-body (_0 bound) (_1 bound)))
-      (define body-tc
-        (Ifz (Sz (_2 bound))
-          (_1 br)
-          (tc-letrec (tc-ty (_1 br)) (_2 bound) (_1 br))))
-      [(_0 br) [(tc-arm (tc-ty (_1 br)) narrowed body-tc key) key]])
+      ;; Arm bodies see the scrutinee narrowed to the member, so its
+      ;; faces spread as bare names alongside any explicit binders.
+      (finish-arm
+        (bind-positional (_0 mr) (narrow-scrutinee env narrowed) items binders)
+        narrowed key))
+    ;; A named-row binder arm (> pt[x y], > wrap[v], > res/hit[h]): the
+    ;; head names a ground row type and the kids bind its items
+    ;; positionally, exactly like a member arm.  A generic head has no
+    ;; ground items to bind.
+    (define (typed-binder-arm head-surf binders)
+      (let* ((tr (elab-type compiler env head-surf 0))
+             (typ (_1 tr)))
+        (need env (Nil (nt:scheme? typ))
+          "binder pattern needs a ground named row type - a generic type cannot bind positionally"
+          typ)
+        (let* ((vr (view-type (_0 tr) env typ
+                     "binder pattern is not a row (constructor) type"))
+               (row (_1 vr)))
+          (need env (nt:row-type? row)
+            "binder pattern is not a row (constructor) type" typ)
+          (let* ((items (nt:row-items row))
+                 (kr (nt:runtime-key (compiler-world (_0 vr)) row))
+                 (key (flat-arm-key (_1 kr)))
+                 (c1 (compiler-with-world (_0 kr) (_0 vr))))
+            (need env (Or (Ifz opt-keys 1 0) (includes (Equal key) opt-keys))
+              "match arm is not a member of the scrutinee union" typ)
+            (need env (Eq (Sz binders) (Sz items))
+              "binder arity mismatch in pattern"
+              ["want" (Sz items) "got" (Sz binders)])
+            (finish-arm
+              (bind-positional c1 (narrow-scrutinee env typ) items binders)
+              typ key)))))
     ;; A named-type arm: narrow the scrutinee to the pattern type.  With a
     ;; binder name (the classic (name : Type) arm) the whole member binds
     ;; as one local, via a let over the re-typed scrutinee slot.
@@ -1562,6 +1679,14 @@
           (pattern-member-tag
             (surf-strip-spans (_0 (surf-tapp-kids pat))))
           (drop 1 (surf-tapp-kids pat))))
+      ;; A named-row head with binder kids: > pt[x y].
+      ((And (Eq "s_tapp" (_0 pat))
+         (let ((h (surf-strip-spans (_0 (surf-tapp-kids pat)))))
+           (Or (Eq "s_ref" (_0 h)) (Eq "s_var" (_0 h)))))
+        (let ((h (surf-strip-spans (_0 (surf-tapp-kids pat)))))
+          (typed-binder-arm
+            (If (Eq "s_var" (_0 h)) (surf-ref [(_1 h)]) h)
+            (drop 1 (surf-tapp-kids pat)))))
       ((Eq "s_face" (_0 pat))
         (typed-arm (surf-face-name pat) (surf-face-kid pat)))
       ((Or (Eq "s_ref" (_0 pat)) (Eq "s_var" (_0 pat)))
@@ -1571,16 +1696,16 @@
       ((Eq "s_trow" (_0 pat))
         (typed-arm 0 pat))
       (else (new-elab-error env "unsupported match arm pattern" pat))))
-  (define (elab-case compiler env surf)
+  ;; A match over an already-elaborated scrutinee: elab-case's body,
+  ;; shared with the < desugaring (elab-prop) which synthesizes arms.
+  (define (elab-case-go compiler env scrut arms fall)
     (define goal (env-goal env))
-    (define sr (elab-value-go compiler (clear-goal env) (_1 surf)))
-    (define scrut (_1 sr))
     (define scrut-ty (tc-ty scrut))
     ;; A pail (or Any) scrutinee is the open universe of branded rows:
     ;; every nominal row arm is admissible, coverage is unknowable, and
     ;; the fallthrough is mandatory.  opt-keys 0 marks the open mode.
     (define svr
-      (view-type (_0 sr) env scrut-ty
+      (view-type compiler env scrut-ty
         "match scrutinee is not a union or row type"))
     (define open?
       (Or (nt:any-type? (_1 svr)) (nt:pail-type? (_1 svr))))
@@ -1600,7 +1725,7 @@
         (lambda (state arm)
           (let ((r (elab-case-arm (_0 state) env1 scrut-ty opt-keys arm)))
             [(_0 r) (snoc (_1 r) (_1 state))]))
-        [(_0 okr) []] (_2 surf)))
+        [(_0 okr) []] arms))
     (define infos (_1 ar))
     (define arm-tcs (map (Ix 0) infos))
     (define arm-keys (map (Ix 1) infos))
@@ -1612,7 +1737,6 @@
     (need env (Nil (dup? arm-keys))
       "match arm unreachable (an earlier arm already matches everything it matches)"
       arm-keys)
-    (define fall (_3 surf))
     (define no-heir? (Eq foil-no-heir fall))
     (define uncovered
       (Ifz opt-keys
@@ -1643,6 +1767,64 @@
            (If no-heir? nt:tbot (tc-ty (_1 fallr)))]
           arm-tcs)))
     [(_0 out-r) (tc-match (_1 out-r) scrut arm-tcs (_1 fallr))])
+  (define (elab-case compiler env surf)
+    (define sr (elab-value-go compiler (clear-goal env) (_1 surf)))
+    (elab-case-go (_0 sr) env (_1 sr) (_2 surf) (_3 surf)))
+  ;; < pat src [mapper] body (bind-or-propagate) desugars to a match on
+  ;; src: the success arm binds pat over the case's payload and runs
+  ;; body; the failure arm re-wraps the failure into the DECLARED result
+  ;; (./err e, or .none), through the mapper when one is given.  The
+  ;; case pair comes from src's viewed type - either (err/ok) or maybe
+  ;; (some/none) - and the result type must carry the same failure case,
+  ;; so the failure type (or the mapper's result) must fit it.  A goal
+  ;; is required: the failure arm constructs at it.
+  (define (elab-prop compiler env surf)
+    (define goal (env-goal env))
+    (need env goal
+      "< needs a declared result type here - add ^ to the enclosing function, or a cast"
+      surf)
+    (define pat (_1 surf))
+    (define mapper (_3 surf))
+    (define body (Ix 4 surf))
+    (define sr (elab-value-go compiler (clear-goal env) (_2 surf)))
+    (define src (_1 sr))
+    (define or0
+      (union-options (_0 sr) env (tc-ty src)
+        "< source must be an either (err/ok) or a maybe (some/none)"))
+    (define tags (map option-member-tag (_1 or0)))
+    (define (has? tag) (includes (Eq tag) tags))
+    (define either?
+      (cond
+        ((And (has? "ok") (has? "err")) 1)
+        ((And (has? "some") (has? "none")) 0)
+        (else
+          (new-elab-error env
+            "< source must be an either (err/ok) or a maybe (some/none)"
+            (tc-ty src)))))
+    (define fail-tag (If either? "err" "none"))
+    (define ok-tag (If either? "ok" "some"))
+    (define gr
+      (union-options (_0 or0) env goal
+        "< result type must be an either or a maybe"))
+    (need env (includes (Eq fail-tag) (map option-member-tag (_1 gr)))
+      ["< result type lacks the failure case the source can produce - the failure arm rewraps into the declared result"
+       fail-tag]
+      goal)
+    (need env (Or (Ifz mapper 1 0) either?)
+      "< error mapper applies to either sources only (a maybe carries no failure payload)"
+      surf)
+    (define ok-arm
+      (surf-arm (surf-tapp [(surf-relvar ok-tag) pat]) body))
+    (define fail-arm
+      (If either?
+        (surf-arm
+          (surf-tapp [(surf-relvar "err") (surf-ref [prop-fail-name])])
+          (surf-app (surf-relvar "err")
+            [(Ifz mapper
+               (surf-var prop-fail-name)
+               (surf-app mapper [(surf-var prop-fail-name)]))]))
+        (surf-arm (surf-relvar "none") (surf-relvar "none"))))
+    (elab-case-go (_0 gr) env src [ok-arm fail-arm] foil-no-heir))
   ;; A loop (|) is an immediately-applied anonymous lambda: params come
   ;; from the arm patterns, inits elaborate in the OUTER env (parallel
   ;; binding - it is one call), and (_ ...) re-enters via the self slot.
@@ -1701,6 +1883,11 @@
         ;; their nominal namespace via the reference clauses above.
         ((And (nt:row-type? t) (Ifz (nt:row-cstr t) 1 0))
           ["row"])
+        ;; An aura'd nat dispatches through its alias namespace however
+        ;; it was produced (a literal at a str goal types as nat/tu, not
+        ;; as the alias): s.len on a str, s.text on a sym.
+        ((And (nt:nat-type? t) (Eq "tu" (nt:nat-aura t))) ["str"])
+        ((And (nt:nat-type? t) (Eq "ts" (nt:nat-aura t))) ["sym"])
         ((nt:nat-type? t) ["nat"])
         (else 0)))
     ;; The receiver's nominal path is already canonical — for a mounted
@@ -1712,22 +1899,33 @@
     ;; canonical prefix.  Only the written namespace unifies the prefix:
     ;; reverse-map the canonical base to its written aliases and resolve
     ;; the member through the visibility index.
-    ;; One shared inversion of the visibility index: written->canonical
-    ;; pairs, computed lazily (forced only by mounted-receiver probes)
-    ;; and scanned by the alias/extension/recording steps below instead
-    ;; of each re-walking the index.
+    ;; The visibility inverse (canonical -> written aliases) is
+    ;; maintained incrementally on the subject by mark-visible.  The
+    ;; per-call-site inversion this replaces enumerated the WHOLE
+    ;; visibility index per method segment — O(marks) each, the
+    ;; dominant cost of compiling code against a large import surface
+    ;; (a chat-sized module re-walked ~19k marks per `.method(...)`).
+    ;; A pre-inverse subject (hydrated old cache row) rebuilds once
+    ;; per resolution, which is exactly the old cost.
+    ;; HEAD vis only — per-compile naming authority, the same rule as
+    ;; canon-path's visible branch (tail layers' marks must not leak
+    ;; extension members into scope).
     (define vis (sut-visible subject))
-    (define vis-pairs (Ifz vis [] (rowify (cairn:tapax vis))))
+    ;; The inverse rides the compiler, row-wrapped and lazily derived
+    ;; from the head index (derive-vis-inverse); forcing it here on
+    ;; first use keeps the O(log) per-segment probes without subject
+    ;; state.
+    (define inv (_0 (compiler-member-inverse compiler)))
+    (define (aliases-of canonical)
+      (fall [] (cairn:getax canonical inv)))
     (define (extension-member nominal)
-      (define (member-at pair)
-        (And (Equal nominal (_1 pair))
-          (let ((m (cairn:getax (Weld (_0 pair) [name]) vis)))
-            (And m (And (get-const (_0 m) subject) (_0 m))))))
-      (let ((hit (find member-at vis-pairs)))
-        (If hit (member-at (_0 hit)) 0)))
+      (define (try-written written)
+        (let ((m (cairn:getax (Weld written [name]) vis)))
+          (And m (And (get-const (_0 m) subject) (_0 m)))))
+      (let ((hit (find (lambda (w) (Truth (try-written w))) (aliases-of nominal))))
+        (If hit (try-written (_0 hit)) 0)))
     (define (visible-canonical? key)
-      (Truth
-        (find (lambda (pair) (Equal key (_1 pair))) vis-pairs)))
+      (Truth (Sz (aliases-of key))))
     (define (member-for nominal)
       (And nominal
         (let* ((raw (snoc name nominal))
@@ -1745,7 +1943,9 @@
             ;; not leak methods into scope.
             ((And stored (visible-canonical? raw)) raw)
             (else
-              (let* ((mp (canon-path raw subject))
+              (let* ((mp (If (sut-context subject)
+                           (resolve-source-path raw subject)
+                           (canon-path raw subject)))
                      (hit (And (get-const mp subject) mp))
                      (ext (Ifz hit (extension-member nominal) 0)))
                 (cond
@@ -1766,24 +1966,38 @@
     ;; member actually resolved AGAINST — a ground const-generic alias
     ;; (myth = mop[path pail lt_pith]) supplies the /ty-ap arguments
     ;; its target's methods specialize from.
+    ;; -> [compiler f against-ty [project? [[from to] ...]]]: the last
+    ;; element tells elab-meth-step how to reshape the receiver.  A
+    ;; member hit projects nothing ([1 []]); a brand forwards to its
+    ;; payload with one projection per unwrapped layer; the bare-global
+    ;; fallback ([0 []]) takes the receiver as written.
     (define (resolve c t depth)
       (define member (member-for (nominal-of t)))
       (cond
         (member
           (let ((gr (global-reference-canonical c env member)))
-            [(record-member-resolution (_0 gr) env member vis-pairs)
-             (_1 gr) t]))
+            [(record-member-resolution (_0 gr) env member (aliases-of member))
+             (_1 gr) t [1 []]]))
+        ;; A brand (one faceless item) forwards to its payload: the
+        ;; member resolves against the item's type and the receiver is
+        ;; projected to it.  T's own namespace was probed first, above.
+        ((And (Lt depth 8) (brand-row? t))
+          (let* ((payload (nt:row-item-value (_0 (nt:row-items t))))
+                 (r (resolve c payload (Inc depth)))
+                 (pj (_3 r)))
+            [(_0 r) (_1 r) (_2 r)
+             (If (_0 pj) [1 (Weld [[t payload]] (_1 pj))] pj)]))
         ((And (Lt depth 8)
            (Or (nt:type-ref? t) (nt:type-app? t)))
           (let* ((vr (nt:view (compiler-world c) t))
                  (c1 (compiler-with-world (_0 vr) c)))
             (If (Equal (_1 vr) t)
               (let ((r (global-reference c1 env [name])))
-                [(_0 r) (_1 r) rcvr-ty])
+                [(_0 r) (_1 r) rcvr-ty [0 []]])
               (resolve c1 (_1 vr) (Inc depth)))))
         (else
           (let ((r (global-reference c env [name])))
-            [(_0 r) (_1 r) rcvr-ty]))))
+            [(_0 r) (_1 r) rcvr-ty [0 []]]))))
     (resolve compiler rcvr-ty 0))
   ;; A generic method instantiates from its receiver: a template-typed
   ;; receiver (bst[@v]) supplies its symbolic arguments, a ground /ty-ap
@@ -1840,6 +2054,17 @@
     (define name (surf-mseg-name seg))
     (define margs (surf-mseg-args seg))
     (define fr0 (meth-function (_0 state) env (tc-ty rcvr) name))
+    ;; A brand receiver is projected to the payload the method resolved
+    ;; against (one Ix 0 per forwarded layer) before the call.
+    (define pj (_3 fr0))
+    (define rcvr1
+      (If (_0 pj)
+        (foldl
+          (lambda (r pair)
+            (fold-tc-app (tc-ffi (nt:tfun [(_0 pair)] (_1 pair)) (Ix 0))
+              [r] (_1 pair)))
+          rcvr (_1 pj))
+        rcvr))
     (flow compiler
       ((f
          (If (nt:scheme? (tc-ty (_1 fr0)))
@@ -1856,10 +2081,10 @@
                ["want" (Sz (nt:fun-args fun)) "got" (Inc (Sz margs))])
              (elab-values compiler env margs
                (take (Sz margs) (nt:fun-args fun)))))))
-      [(ensure-subtype compiler env (tc-ty rcvr)
+      [(ensure-subtype compiler env (tc-ty rcvr1)
          (Ix (Sz margs) (nt:fun-args fun))
          "receiver does not fit the method's trailing parameter")
-       (fold-tc-app f (snoc rcvr margs-tc) (nt:fun-return fun))]))
+       (fold-tc-app f (snoc rcvr1 margs-tc) (nt:fun-return fun))]))
   (define (elab-meth compiler env surf)
     (define els (_1 surf))
     (define head (_0 els))
@@ -1883,7 +2108,8 @@
       (let* ((gv (goal-view compiler env))
              (gc (_0 gv))
              (goal (_1 gv))
-             (iota-goal? (And goal (Equal iota-body goal)))
+             (iota-goal? (And goal
+               (Equal (nt:relocate-type (system-path compiler) iota-body) goal)))
              (aura-goal
                (If (And goal
                      (And (nt:nat-type? goal)
@@ -1904,7 +2130,7 @@
           ;; row[iota]; check-value's subtype pass admits it at path
           ;; (and other alias) goals.
           ((And (Eq "quip" (_1 surf)) (Eq "/" (Load8 0 (_2 surf))))
-            [gc (tc-lit (nt:tarr (nt:type-ref ["iota"]))
+            [gc (tc-lit (nt:tarr (nt:type-ref (system-path compiler ["iota"])))
                   (quip:parse-path (_2 surf)))])
           ((Eq "quip" (_1 surf))
             (let* ((p (quip:parse-quip (_2 surf)))
@@ -1934,8 +2160,7 @@
               ;; a bare face only captures names the namespace cannot
               ;; see.
               (let* ((gpath
-                       (canon-path [(_1 surf)]
-                         (compiler-subject compiler)))
+                       (type-path compiler [(_1 surf)]))
                      (bound
                        (Or
                          (nt:type-bound?
@@ -1949,10 +2174,34 @@
                       fr
                       (global-reference compiler env
                         [(_1 surf)]))))))))))
+    ;; ^ T v: v elaborates at goal T and must fit it.  One coercion
+    ;; lives here and nowhere else: when T views to an aura'd nat
+    ;; (str, sym, nat/<aura>) any nat fits.  The aura is a refinement
+    ;; the bare value cannot witness, so implicit flow is one-way
+    ;; (aura'd -> nat, subtype-go in foil-new-types) and the explicit
+    ;; cast is the programmer's claim of it.  The value is untouched:
+    ;; (^ str 3) is the nat 3 at type str.
     ((Eq tag "s_cast")
       (let* ((tr (elab-type compiler env (surf-cast-ty surf) 0))
-             (vr (check-value (_0 tr) env (_2 surf) (_1 tr))))
-        [(_0 vr) (set-tc-ty (_1 tr) (_1 vr))]))
+             (target (_1 tr))
+             (tv (If (nt:scheme? target)
+                   [(_0 tr) 0]
+                   (view-type (_0 tr) env target "cast")))
+             (aura? (And (_1 tv) (aura-nat-type? (_1 tv)))))
+        (If aura?
+          (let* ((vr (elab-value-go (_0 tv) (env-with-goal target env)
+                       (_2 surf)))
+                 (actual (tc-ty (_1 vr)))
+                 (av (If (nt:scheme? actual)
+                       [(_0 vr) 0]
+                       (view-type (_0 vr) env actual "type mismatch")))
+                 (c1 (If (And (_1 av) (nat-ish-type? (_1 av)))
+                       (_0 av)
+                       (ensure-subtype (_0 av) env actual target
+                         "type mismatch"))))
+            [c1 (set-tc-ty target (_1 vr))])
+          (let ((vr (check-value (_0 tv) env (_2 surf) target)))
+            [(_0 vr) (set-tc-ty target (_1 vr))]))))
     ;; (^ expr) — unary type reflection: elaborate the operand, take
     ;; the type elaboration assigned to it (a named type reflects its
     ;; inner type), and splice the descriptor as a literal.  The
@@ -1975,7 +2224,15 @@
                     (_1 dv)
                     typ0)))
         [(_0 dv)
-         (tc-lit (nt:type-ref ["type"]) (reflect-encode env typ))]))
+         (tc-lit (nt:type-ref (system-path compiler ["type"])) (reflect-in-subject (compiler-subject (_0 dv)) env typ))]))
+    ((Eq tag "s_strict")
+      (let ((r (elab-value-go compiler env (_1 surf))))
+        [(_0 r) (If (Eq "TC_DEMAND" (Hd (_1 r))) (_1 r)
+                   (tc-demand (tc-ty (_1 r)) (_1 r)))]))
+    ((Eq tag "s_before")
+      (let* ((v (elab-value-go compiler (clear-goal env) (_1 surf)))
+             (b (elab-value-go (_0 v) env (_2 surf))))
+        [(_0 b) (tc-before (tc-ty (_1 b)) (_1 v) (_1 b))]))
     ((Eq tag "s_fun")
       ;; A positional-row parameter ((\ acc [key val] ...)) desugars to
       ;; a fresh parameter destructured by the letrec machinery.  Fresh
@@ -1987,11 +2244,12 @@
                  (lambda (st pair)
                    (define i (_0 pair))
                    (define a (_1 pair))
-                   (define stripped (surf-strip-spans a))
+                   (define clean (unmark a))
+                   (define stripped (surf-strip-spans clean))
                    (If (Eq "s_trow" (_0 stripped))
                      [(snoc ["s_ref" [(Inc i)]] (_0 st))
                       (snoc [0 stripped ["s_var" (Inc i)]] (_1 st))]
-                     [(snoc a (_0 st)) (_1 st)]))
+                     [(snoc clean (_0 st)) (_1 st)]))
                  [[] []]
                  (zip (gen (Sz raw-args) (lambda (i) i)) raw-args)))
              (fun-args (_0 dr))
@@ -2029,7 +2287,12 @@
                  (_0 br)))
              (out-type (If goal-fun (env-goal env) typ)))
         [c1
-         (tc-lam out-type 0 (Weld [self-type] arg-types) (_1 br))]))
+         (tc-lam out-type 0 (Weld [self-type] arg-types)
+           (foldr (lambda (i body)
+             (If (Eq "s_strict" (_0 (surf-strip-spans (Ix i raw-args))))
+               (tc-before (tc-ty body) (tc-local (Ix i arg-types) (Inc i) "#strict-parameter") body)
+               body))
+             (_1 br) (gen (Sz raw-args) (lambda (i) i))))]))
     ((Eq tag "s_self")
       (let ((self (find-local env 0)))
         (need env self "recursive call outside a function" surf)
@@ -2064,6 +2327,11 @@
     ((Eq tag "s_relvar")
       (relvar-construct compiler env (_1 surf) []))
     ((Eq tag "s_case") (elab-case compiler env surf))
+    ((Eq tag "s_prop") (elab-prop compiler env surf))
+    ((Eq tag "s_flip")
+      (new-elab-error env
+        "flip (#) only prefixes a saturated call head: (#f a b) - a bare #f has no value"
+        surf))
     ((Eq tag "s_loop") (elab-loop compiler env surf))
     ((Eq tag "s_meth") (elab-meth compiler env surf))
     ((Eq tag "s_ufcs_put")
@@ -2140,7 +2408,7 @@
                  (tc-ty yes) (tc-ty no))))))
         [compiler
          (fold-tc-app (tc-ffi (nt:tfun [(nt:tnat 0) out out] out) If)
-           [cnd yes no] out)]))
+           [cnd (region yes) (region no)] out)]))
     ((Eq tag "s_letrec")
       (let* ((outer-goal (env-goal env))
              (lr
@@ -2149,8 +2417,10 @@
                    (define c (_0 state))
                    (define e (_1 state))
                    (define binds (_2 state))
-                   (define pat (_1 arm))
-                   (define value (_2 arm))
+                   (define outer (surf-strip-spans (_1 arm)))
+                   (define marked (Eq "s_strict" (_0 outer)))
+                   (define pat (unmark (_1 arm)))
+                   (define value (If marked (surf-strict (_2 arm)) (_2 arm)))
                    (define stripped (surf-strip-spans pat))
                    (If (Eq "s_trow" (_0 stripped))
                      ;; = [a b] value — positional destructure: the whole
@@ -2351,7 +2621,9 @@
       ;; declaration's Try (see run-decl-pass); an unforced error would
       ;; otherwise fire in whichever neighbor demands it first.
       (Seq (DeepSeq scm 1)
-        ($NewCompiler subject1 world1 (compiler-resolutions compiler))))))
+        ($NewCompiler subject1 world1 (compiler-resolutions compiler)
+          (compiler-member-inverse compiler)
+          (NewCompiler.system-root compiler))))))
 
 (define (refine-type-declaration compiler row)
   (define path (root-path (compiler-subject compiler) (_1 row)))
@@ -2359,7 +2631,8 @@
   (Ifz (type-declaration? compiler body)
     compiler
     (let* ((env (env-with-name path empty-env))
-           (sr (elab-scheme compiler env body (print-path path)))
+           (sr (elab-scheme compiler env body
+                 (definition-brand (compiler-subject compiler) (_1 row))))
            (scm (_1 sr))
            (mono (nt:scheme-body scm))
            ;; A row body brands itself; an alias body (type-ref/app to
@@ -2384,7 +2657,39 @@
                (gen-accessors path scm subject1)
                subject1)))
       (Seq (DeepSeq scm 1)
-        ($NewCompiler subject2 world1 (compiler-resolutions compiler))))))
+        ($NewCompiler subject2 world1 (compiler-resolutions compiler)
+          (compiler-member-inverse compiler)
+          (NewCompiler.system-root compiler))))))
+
+;; Between refine and seed-value: records get T/try_from_pail and
+;; unions get S/is_c and S/try_c members. This must follow
+;; EVERY refine - a nominal member's brand is final only once its own
+;; refine ran, and on-decl emits the union before its member kids - and
+;; precede seed-value, so extend-derived-environment classifies the
+;; inserted entries as derived.  The rows are forced here so a collision
+;; lands in this pass's Try as a diagnostic on the union.
+(define (derive-type-members-pass declared)
+  (lambda (compiler row)
+    (define path (root-path (compiler-subject compiler) (_1 row)))
+    (If (Nil (type-declaration? compiler (_3 row)))
+      compiler
+      (let* ((r (nt:lookup-type-entry (compiler-world compiler) path))
+             (scm (nt:type-entry-scheme (_1 r)))
+             (c0 (compiler-with-world (_0 r) compiler)))
+        (define mono (nt:scheme-body scm))
+        (If (Nil (Or (nt:sum-type? mono) (nt:row-type? mono)))
+          c0
+          (let* ((gr
+                   (If (nt:row-type? mono)
+                     (gen-pail-member c0 path scm declared)
+                     (gen-sum-members c0 path scm declared)))
+                 (rows (_1 gr))
+                 (subject
+                   (foldl (lambda (s r) (mark-derived (_0 r) s))
+                     (insert-tcs rows (compiler-subject (_0 gr)))
+                     rows)))
+            (Seq (DeepSeq rows 1)
+              (compiler-with-subject subject (_0 gr)))))))))
 
 (define (prototype-value compiler env surf)
   (define tag (_0 surf))
@@ -2410,7 +2715,7 @@
     ;; A reflection's type is always the descriptor sum: forward
     ;; references to reflect-bodied declarations need no annotation.
     ((Eq tag "s_reflect")
-      [compiler (tc-const (nt:type-ref ["type"]) 0)])
+      [compiler (tc-const (nt:type-ref (system-path compiler ["type"])) 0)])
     ((Eq tag "s_fun")
       (let* ((pr (lambda-parameters compiler env (surf-fun-args surf) 0))
              (rr (peek-return-type (_0 pr) env (surf-fun-ret surf))))
@@ -2549,11 +2854,21 @@
                (If (foil-env:path-prefix? root key)
                  (drop (Sz root) key)
                  key)))
+           ;; classify by an exact-bind probe first: a declared key has
+           ;; a bind and is never derived.  The covering-tomb prefix
+           ;; walk (the expensive half of resolve) only matters when
+           ;; the environment holds tombs at all — checked once, not
+           ;; once per written key (a generated module writes 8k).
+           (tombless (foil-env:environment-tombless? unit))
            (derived
              (filter
                (lambda (pair)
-                 (foil-env:res-unknown?
-                   (foil-env:resolve (local-path (_0 pair)) unit)))
+                 (let ((lp (local-path (_0 pair))))
+                   (Ifz (foil-env:environment-bind lp unit)
+                     (If tombless
+                       1
+                       (foil-env:res-unknown? (foil-env:resolve lp unit)))
+                     0)))
                (subject-entry-delta base-subject subject))))
       (Ifz (Sz derived)
         compiler
@@ -2612,18 +2927,29 @@
 
 (define (elab-mod-diags compiler mod)
   (define base-subject (compiler-subject compiler))
+  (If (sut-context base-subject) 0
+    (error "module-elaboration-requires-compilation-context"))
   ;; %/ references expand structurally at each declaration's own
   ;; namespace position before any pass consumes the bodies.
-  (define decls (map expand-decl-crefs (module-declarations mod)))
+  ;; The five passes were zoned; the cref expansion before them and the
+  ;; environment sealing after them were NOT, and together those were
+  ;; the majority of c-elab that no zone accounted for.
+  (define decls (ez "e-crefs" (map expand-decl-crefs (module-declarations mod))))
   (define state0 [compiler (module-scan-diags mod) []])
   (define seeded-types (ez "e-seed-types" (run-pass seed-type-declaration state0 decls)))
   (define refined-types (ez "e-refine-types" (run-pass refine-type-declaration seeded-types decls)))
-  (define seeded-values (ez "e-seed-values" (run-pass seed-value-declaration refined-types decls)))
+  ;; derived union members: after every refine, before seed-value
+  (define declared (map (lambda (r) (root-path base-subject (_1 r))) decls))
+  (define derived-sums
+    (ez "e-derive-sums"
+      (run-pass (derive-type-members-pass declared) refined-types decls)))
+  (define seeded-values (ez "e-seed-values" (run-pass seed-value-declaration derived-sums decls)))
   (define elabbed (ez "e-elab-decls" (run-pass elab-declaration seeded-values decls)))
   (define result (ez "e-wf" (run-pass wf-declaration elabbed decls)))
-  [(retain-resolutions
-     (extend-derived-environment base-subject (_0 result)))
-   (_1 result)])
+  (define extended
+    (ez "e-extend" (extend-derived-environment base-subject (_0 result))))
+  (define retained (ez "e-retain" (retain-resolutions extended)))
+  [retained (_1 result)])
 
 ;; elab-mod :: NewCompiler -> ModuleSAST -> NewCompiler
 ;; The throwing contract of the production elaborator: one error carrying
@@ -2633,6 +2959,3 @@
   (Ifz (Sz (_1 r))
     (_0 r)
     (error ["foil-new-elab-errors" (_1 r)])))
-
-(define (elab-mod-from subject world mod)
-  (elab-mod ($NewCompiler subject world []) mod))

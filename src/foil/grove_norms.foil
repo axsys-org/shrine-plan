@@ -1,0 +1,217 @@
+- publisher_vocabulary
+- grove_actions
+- sept
+
+' A single path pattern and role constraints describe occupied records.
++ grove_norms
+  + is_norm
+    \ body=row[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) (equal kind (grove/tag_kind/norm))
+    .false
+  + segment
+    \ span=rex/source_span text=str
+    ^ either[grove/error grove_norm_segment]
+    ? (eq (str/slice 0 1 text) "[")
+      ? !(eq (str/slice (dec text.len) 1 text) "]")
+        | grove_roles/fail[grove_norm_segment] span
+          "Unclosed norm capture."
+      = parts (str/split_byte 61 (str/slice 1 (sub text.len 2) text))
+      ? !(eq parts.len 2)
+        | grove_roles/fail[grove_norm_segment] span
+          "Norm captures use [name=@aura]."
+      | grove_norms/capture span parts.at(0) parts.at(1)
+    > (./some parts) (path_parse (str/join "" ["/" text]))
+      | grove_roles/fail[grove_norm_segment] span
+        "Invalid literal norm path segment."
+    ? !(eq parts.len 1)
+      | grove_roles/fail[grove_norm_segment] span
+        "Expected one literal norm path segment."
+    | ./ok (grove_norm_segment "" (zeta/lit parts.at(0)))
+  + capture
+    \ span=rex/source_span label=str type=str
+    ^ either[grove/error grove_norm_segment]
+    > (./some name) (str/sym label)
+      | grove_roles/fail[grove_norm_segment] span
+        "Invalid norm capture name."
+    ? !(eq (str/slice 0 1 type) "@")
+      | grove_roles/fail[grove_norm_segment] span
+        "Norm captures require an aura."
+    = raw_aura (str/slice 1 (dec type.len) type)
+    = aura=str (? (eq raw_aura "tas") "ts" raw_aura)
+      allowed=row[str]
+        ["dm" "dr" "ds" "f" "r" "rd" "rs" "s"
+         "ta" "ts" "tu" "u" "w" "x"]
+    ? !(allowed.has(aura))
+      | grove_roles/fail[grove_norm_segment] span
+        "Unknown norm capture aura."
+    | ./ok
+      (grove_norm_segment label (zeta/var (str/to_atom aura)))
+
+  + pattern
+    \ tree=rex
+    ^ either[grove/error row[grove_norm_segment]]
+    > (./leaf span shape text) tree
+      | grove_roles/fail[row[grove_norm_segment]] tree.span
+        "#here requires a quoted path pattern."
+    = cord (equal tree.leaf_kind (maybe/some[str] "cord"))
+      quip (equal tree.leaf_kind (maybe/some[str] "quip"))
+    ? !(cord || quip)
+      | grove_roles/fail[row[grove_norm_segment]] span
+        "#here requires a quoted path pattern."
+    = prefix=str (? cord "/" "'/")
+    ? !(eq (str/slice 0 prefix.len text) prefix)
+      | grove_roles/fail[row[grove_norm_segment]] span
+        "Norm patterns require an absolute path."
+    = source (str/slice prefix.len (sub text.len prefix.len) text)
+    ? (eq source "") (./ok [])
+    % rest=row[str] (str/split_byte 47 source)
+      out=row[grove_norm_segment] [] names=row[str] []
+    ^ either[grove/error row[grove_norm_segment]]
+    ? (eq rest.len 0) (./ok out)
+    ? (eq rest.at(0) "")
+      | grove_roles/fail[row[grove_norm_segment]] span
+        "Empty norm path segment."
+    < segment (grove_norms/segment span rest.at(0))
+    ? !(eq segment.name "")
+      ? names.has(segment.name)
+        | grove_roles/fail[row[grove_norm_segment]] span
+          "Duplicate norm capture name."
+      | _ rest.drop(1) out.snoc(segment) names.snoc(segment.name)
+    | _ rest.drop(1) out.snoc(segment) names
+  + body
+    \ span=rex/source_span body=row[grove/statement]
+    ^ either[grove/error rex]
+    % rest=row[grove/statement] body target=maybe[rex] .none
+    ^ either[grove/error rex]
+    ? (eq rest.len 0)
+      ? target
+       > (./some tree) (./ok tree)
+       > .none
+        | grove_roles/fail[rex] span "Norm requires one #here pattern."
+    ? rest.at(0)
+     > (grove/tag at kind)
+      ? ((equal kind (grove/tag_kind/norm)) ||
+         (equal kind (grove/tag_kind/slot)))
+        | _ rest.drop(1) target
+      | grove_roles/fail[rex] at "Incompatible norm tag."
+     > (grove/directive at kind tree)
+      ? !(equal kind (grove/directive_kind/here))
+        | _ rest.drop(1) target
+      ? target
+       > (./some old)
+        | grove_roles/fail[rex] at "Duplicate norm path pattern."
+       > .none (_ rest.drop(1) (./some tree))
+    | _ rest.drop(1) target
+  + role_body
+    \ body=row[grove/statement]
+    ^ row[grove/statement]
+    | body.keep
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) .false
+     > (grove/directive span kind target)
+      | ! (equal kind (grove/directive_kind/here))
+    .true
+  + segment_code
+    \ segment=grove_norm_segment
+    ^ rex
+    = pattern
+        ? segment.pattern
+         > (zeta/var aura)
+          | rex/paren [(rex/path ["zeta" "var"])
+            (rex/cord (str/from_atom aura))]
+         > (zeta/lit value)
+          = values (grove_roles/path_value [value])
+          | rex/paren [(rex/path ["zeta" "lit"])
+            values.children.at(0)]
+    | rex/paren [(rex/word "grove_norm_segment")
+      (rex/cord segment.name) pattern]
+  + code
+    \ span=rex/source_span name=str
+      segments=row[grove_norm_segment] shape=grove_roles/shape
+    ^ row[rex]
+    = self (rex/path [name])
+      item (grove_roles/member ["item"] self)
+      schema_value
+        | rex/paren [(rex/word "grove_norm_schema")
+          (rex/brack segments.map(grove_norms/segment_code))
+          (grove_roles/schema_code shape)]
+      schema
+        | grove_roles/template span
+          (str/join (str/from_atom 10) ["^ grove_norm_schema" "| VALUE"])
+          [["VALUE" schema_value]]
+      pairs=row[[str rex]]
+        [["SELF" self] ["ITEM" item]
+         ["SEGMENTS"
+          (rex/brack segments.map(grove_norms/segment_code))]]
+      accepts
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " card=myth"])
+             "^ bool" "| maybe/is_some (ITEM/from_myth card)"]) pairs
+      validate
+        | grove_roles/template span
+          "(grove_norm_runtime/validate SEGMENTS SELF/accepts)" pairs
+      check
+        | grove_roles/template span
+          (str/join (str/from_atom 10)
+            [(str/join "" [(str/from_atom 92) " tree=axal[myth]"])
+             "^ maybe[axal[myth]]"
+             "? (SELF/validate tree)"
+             " > (./some path) .none"
+             " > .none (./some tree)"]) pairs
+      spec
+        | grove_roles/template span
+          "(grove_norm_runtime/spec SEGMENTS ITEM/spec)" pairs
+    [(grove_roles/template span "axal[myth]" [])
+     (grove_roles/decl "item"
+       (rex/group (grove_roles/code_at span item shape)))
+     (grove_roles/decl "schema" schema)
+     (grove_roles/decl "accepts" accepts)
+     (grove_roles/decl "validate" validate)
+     (grove_roles/decl "check" check)
+     (grove_roles/decl "spec" spec)]
+  + prepare
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    % rest=row[grove/item] doc.items out=row[grove/item] []
+    ^ either[grove/error grove/document]
+    ? (eq rest.len 0) (./ok (grove/document out))
+    > (grove/declaration span name body) rest.at(0)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    ? !(grove_norms/is_norm body)
+      | _ rest.drop(1) out.snoc(rest.at(0))
+    > (grove/name/identifier text) name
+      | grove_roles/fail[grove/document] span "Norms need a name."
+    < target (grove_norms/body span body)
+    < segments (grove_norms/pattern target)
+    < shape (grove_roles/analyze root doc lookup [] text
+        (grove_norms/role_body body))
+    = kept
+        | body.keep
+        \ stmt
+        ? stmt
+         > (grove/comment at text) .true
+         > (grove/block at kind kids)
+          | equal kind (grove/block_kind/meta)
+        .false
+      schema (grove_roles/member ["schema"] (rex/path [text]))
+      prop=grove/statement
+        | grove/property span (rex/cord (path_show publisher_vocabulary/grove/norm)) schema
+      meta=grove/statement
+        | grove/block span (grove/block_kind/meta) [prop]
+      trees (grove_norms/code span text segments shape)
+      code=grove/statement
+        | grove/implementation span
+          trees.map((grove_actions/located span))
+    | _ rest.drop(1)
+      out.snoc((grove/declaration span name kept.snoc(meta).snoc(code)))
+  + prepare_all
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error grove/document]
+    < doc (grove_norms/prepare root doc lookup)
+    | grove_actions/prepare_all root doc lookup

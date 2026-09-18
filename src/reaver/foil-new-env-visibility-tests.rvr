@@ -1,0 +1,427 @@
+(#bind brand (#module shrine-brand))
+(#bind contexts (#module foil-context))
+(#bind fixture (#module foil-test-context))
+;;;; New-driver import precedence and nominal identity.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind driver (#module foil-new-env))
+
+(define (tree text) (rex:ParseRexNormFile text))
+(define (read-source name)
+  (tree
+    (cond
+      ((Equal name "nv_a") "+ choice
+  ^ nat
+  10
+")
+      ((Equal name "nv_b") "+ choice
+  ^ nat
+  20
+")
+      ((Equal name "nv_wrap_a") "- nv_a
+")
+      ((Equal name "nv_wrap_b") "- nv_b
+")
+      ((Equal name "nv_deep_a") "- nv_wrap_a
+")
+      ((Equal name "nv_override") "- nv_a
++ choice
+  ^ nat
+  30
+")
+      ((Equal name "nv_builtin") "+ equal
+  ^ nat
+  12
+")
+      (else (error ["unknown fixture" name])))))
+(define (run text)
+  (define (load name)
+    (If (Equal name "nv_root") (tree text) (read-source name)))
+  (driver:compile-with (fixture:graph load driver:empty-foil-cache ["nv_root"]) load driver:empty-foil-cache "nv_root"))
+(define (value path result) (driver:get-perc path (_1 result)))
+(define tail "
++ result
+  ^ nat
+  choice
+")
+(define (winner imports) (value ["result"] (run (strWeld imports tail))))
+
+;; Later direct siblings win, but a later deep import cannot displace a
+;; nearer definition. Reverse the graph to expose traversal dependence.
+assert(Eq 20 (winner "- nv_a
+- nv_b"))
+assert(Eq 10 (winner "- nv_b
+- nv_a"))
+assert(Eq 10 (winner "- nv_a
+- nv_wrap_b"))
+assert(Eq 10 (winner "- nv_wrap_b
+- nv_a"))
+assert(Eq 20 (winner "- nv_wrap_a
+- nv_b"))
+assert(Eq 20 (winner "- nv_wrap_a
+- nv_wrap_b"))
+assert(Eq 10 (winner "- nv_wrap_b
+- nv_wrap_a"))
+assert(Eq 20 (winner "- nv_wrap_b
+- nv_deep_a"))
+;; A shared leaf first reached through a deep branch must still win when
+;; it is imported directly later. Its identity is deduped, not its rank.
+assert(Eq 10 (winner "- nv_override
+- nv_a"))
+assert(Eq 30 (winner "- nv_a
+- nv_override"))
+assert(Eq 99 (value ["result"] (run
+  "- nv_a
+- nv_b
++ choice
+  ^ nat
+  99
++ result
+  ^ nat
+  choice
+")))
+assert(Eq 12 (value ["result"] (run
+  "- nv_builtin
+- nv_wrap_a
++ result
+  ^ nat
+  equal
+")))
+assert(Eq 13 (value ["result"] (run
+  "- nv_builtin
++ equal
+  ^ nat
+  13
++ result
+  ^ nat
+  equal
+")))
+
+
+
+;; Prefixes are local spellings; transitive declarations remain bare.
+assert(Eq 30 (value ["result"] (run
+  "- nv_a [at=left]
+- nv_b [at=right]
++ result
+  ^ nat
+  | add left/choice right/choice
+")))
+assert(Eq 20 (value ["result"] (run
+  "- nv_a [at=left]
+- nv_a [at=right]
++ result
+  ^ nat
+  | add left/choice right/choice
+")))
+assert(Eq 10 (value ["result"] (run
+  "- nv_wrap_a [at=wrapped]
++ result
+  ^ nat
+  choice
+")))
+(define hidden
+  (Try (lambda (z) (run
+    "- nv_a [at=left]
++ result
+  ^ nat
+  choice
+")) 0))
+assert(Eq 1 (Hd hidden))
+
+;; Named rows and their generated/UFCS methods retain defining identity
+;; through two prefix spellings and a transitive import.
+(define type-source
+  "+ token
+  : value=nat
+  + bump
+    \ t=token
+    ^ nat
+    | add 1 t.value
++ box
+  (@@ a)
+  : value=a
+  + get
+    \ b=box[a]
+    ^ a
+    b.value
++ alias
+  token
++ sample
+  | token 7
+")
+(define type-cache
+  (_0 (driver:compile-rex (fixture:tree driver:empty-foil-cache "nv_types" (tree type-source)) driver:empty-foil-cache "nv_types"
+    (tree type-source))))
+(define (types text)
+  (driver:compile-rex (fixture:tree type-cache "nv_use" (tree text)) type-cache "nv_use" (tree text)))
+(define typed
+  (types "- nv_types [at=left]
+- nv_types [at=right]
++ copied
+  ^ right/token
+  | left/token 8
++ aliased
+  ^ left/alias
+  | right/token 8
++ result
+  ^ nat
+  = t | left/token 3
+  | add t.set_value(9).bump t.over_value(inc).value
++ generic
+  ^ nat
+  = b | left/box[nat] 17
+  b.get
+"))
+assert(Equal ((brand:encode (Weld (fixture:root "nv_types") [["ts" "token"]]) 1) 8) (value ["copied"] typed))
+assert(Equal (value ["copied"] typed) (value ["aliased"] typed))
+assert(Eq 14 (value ["result"] typed))
+assert(Eq 17 (value ["generic"] typed))
+(define wrapper
+  (driver:compile-rex (fixture:tree type-cache "nv_types_wrap" (tree "- nv_types [at=hidden]
++ exported
+  ^ hidden/token
+  hidden/sample
+")) type-cache "nv_types_wrap"
+    (tree "- nv_types [at=hidden]
++ exported
+  ^ hidden/token
+  hidden/sample
+")))
+(define transit
+  (driver:compile-rex (fixture:tree (_0 wrapper) "nv_transit" (tree "- nv_types_wrap
++ result
+  ^ nat
+  exported.bump
+")) (_0 wrapper) "nv_transit"
+    (tree "- nv_types_wrap
++ result
+  ^ nat
+  exported.bump
+")))
+assert(Eq 8 (value ["result"] transit))
+(define other-cache
+  (_0 (driver:compile-rex (fixture:tree type-cache "nv_other" (tree type-source)) type-cache "nv_other"
+    (tree type-source))))
+(define distinct
+  (driver:compile-rex (fixture:tree other-cache "nv_distinct" (tree "- nv_types [at=left]
+- nv_other [at=right]
++ a | left/token 1
++ b | right/token 1
+")) other-cache "nv_distinct"
+    (tree "- nv_types [at=left]
+- nv_other [at=right]
++ a | left/token 1
++ b | right/token 1
+")))
+assert(Ne (Hd (value ["a"] distinct)) (Hd (value ["b"] distinct)))
+(define mismatch
+  (Try (lambda (z)
+    (driver:compile-rex (fixture:tree other-cache "nv_mismatch" (tree "- nv_types [at=left]
+- nv_other [at=right]
++ bad
+  ^ right/token
+  | left/token 1
+")) other-cache "nv_mismatch"
+      (tree "- nv_types [at=left]
+- nv_other [at=right]
++ bad
+  ^ right/token
+  | left/token 1
+"))) 0))
+assert(Eq 1 (Hd mismatch))
+
+ ;; Preparation freezes imports before the driver runs; an unresolved
+;; dependency is rejected there, including historically annotated imports.
+(define ordered
+  (Try (lambda (z) (run "- missing_ordered_module [order=0]
+")) 0))
+assert(Eq 1 (Hd ordered))
+assert(Equal ["foil-publication-inputs" ["nv_root"]
+  ["foil-in-module" "missing_ordered_module"
+    ["unknown fixture" "missing_ordered_module"]]] (_0 ordered))
+(define ordered-prefix
+  (Try (lambda (z) (run "- nv_a [at=left order=10]
+")) 0))
+assert(Eq 1 (Hd ordered-prefix))
+;; The shared parser already rejects order on a prefix mount.
+
+;; Cached dependencies must not change the graph's collision winner.
+(define cached (run "- nv_override
+- nv_a
++ result
+  ^ nat
+  choice
+"))
+(define (warm-source name)
+  (If (Equal name "nv_warm")
+    (tree "- nv_a
+- nv_override
++ result
+  ^ nat
+  choice
+")
+    (error ["warm import unexpectedly read" name])))
+assert(Eq 30 (value ["result"]
+  (driver:compile-with (fixture:graph warm-source (_0 cached) ["nv_warm"]) warm-source (_0 cached) "nv_warm")))
+
+;; Const-generic materializations use defining-module keys through mounts.
+;; Keep these results local: retaining their caches currently hits Wisp's
+;; empty-APP save limitation (doc/foil-new-env-imports.md).
+(define (check-constants z)
+  (define const-cache
+    (_0 (driver:compile-rex (fixture:tree driver:empty-foil-cache "nv_consts" (tree "+ labeled
+  (@@ n=nat)
+  + number
+    \ ignored=nat
+    ^ nat
+    n
+")) driver:empty-foil-cache "nv_consts"
+      (tree "+ labeled
+  (@@ n=nat)
+  + number
+    \ ignored=nat
+    ^ nat
+    n
+"))))
+  (define constants
+    (driver:compile-rex (fixture:tree const-cache "nv_const_use" (tree "- nv_consts [at=left]
+- nv_consts [at=right]
++ a
+  ^ nat
+  | left/labeled/number[3] 0
++ b
+  ^ nat
+  | right/labeled/number[7] 0
+")) const-cache "nv_const_use"
+      (tree "- nv_consts [at=left]
+- nv_consts [at=right]
++ a
+  ^ nat
+  | left/labeled/number[3] 0
++ b
+  ^ nat
+  | right/labeled/number[7] 0
+")))
+  assert(Eq 3 (value ["a"] constants))
+  assert(Eq 7 (value ["b"] constants))
+  (define map-result
+    (value ["result"] (driver:compile-rex (fixture:tree driver:empty-foil-cache "nv_map_use" (tree "- map [at=lib]
++ result
+  ^ nat
+  = m | lib/map/insert[nat lt] 4 12 (lib/map/empty)
+  m.get(4 0)
+")) driver:empty-foil-cache "nv_map_use"
+      (tree "- map [at=lib]
++ result
+  ^ nat
+  = m | lib/map/insert[nat lt] 4 12 (lib/map/empty)
+  m.get(4 0)
+"))))
+  assert(Eq 12 map-result)
+
+  1)
+assert(Eq 1 (check-constants 0))
+
+;; Nested prefixes and colliding prefix mounts use the same precedence.
+assert(Eq 20 (value ["result"] (run
+  "- nv_a [at=deps/shared]
+- nv_b [at=deps/shared]
++ result
+  ^ nat
+  deps/shared/choice
+")))
+assert(Eq 10 (value ["result"] (run
+  "- nv_b [at=deps/shared]
+- nv_a [at=deps/shared]
++ result
+  ^ nat
+  deps/shared/choice
+")))
+;; A prefix can share a diamond leaf with an unprefixed transitive path.
+assert(Eq 20 (value ["result"] (run
+  "- nv_a [at=direct]
+- nv_wrap_a
++ result
+  ^ nat
+  | add direct/choice choice
+")))
+(print "foil-new-env visibility tests passed")
+
+;; Generated record projections use defining identities through imports.
+(define pail-projections
+  (types "- nv_types [at=left]
+- nv_types [at=right]
++ accepted
+  ^ nat
+  ? (left/token/try_from_pail (right/token 23))
+   > (./some value) value.value
+   > .none 0
++ rejected
+  ^ nat
+  ? (left/token/try_from_pail (right/box[nat] 23))
+   > (./some _) 0
+   > .none 1
++ generic
+  ^ nat
+  ? (left/box/try_from_pail[nat] (right/box[nat] 31))
+   > (./some value) value.value
+   > .none 0
+"))
+assert(Eq 23 (value ["accepted"] pail-projections))
+assert(Eq 1 (value ["rejected"] pail-projections))
+assert(Eq 31 (value ["generic"] pail-projections))
+
+(define nullary-projections
+  (run "+ token
+  :
++ accepted
+  \ p=pail
+  ^ nat
+  ? (token/try_from_pail p)
+   > (./some _) 1
+   > .none 0
+"))
+(define empty-token-brand
+  (brand:encode (Weld (fixture:root "nv_root") [["ts" "token"]]) 1))
+assert(Eq 1 ((value ["accepted"] nullary-projections) empty-token-brand))
+assert(Eq 0 ((value ["accepted"] nullary-projections) 999))
+assert(Eq 0 ((value ["accepted"] nullary-projections) (empty-token-brand 0)))
+assert(Eq 0 ((value ["accepted"] nullary-projections)
+  (brand:encode (Weld (fixture:root "nv_root") [["ts" "token"]]) 2)))
+
+(define pail-member-collision
+  (Try (lambda (ignored)
+    (run "+ token
+  : value=nat
+  + try_from_pail
+    0
+")) 0))
+assert(Eq 1 (Hd pail-member-collision))
+
+;; Sibling references stay relative to their defining module when mounted.
+(define (sibling-source name)
+  (tree (If (Equal name "siblings")
+    "+ fs_foot
+  + on_bind
+    \ n=nat
+    ^ nat
+    | add n 1
+  + on_fact
+    \ n=nat
+    ^ nat
+    | %/on_bind n
+"
+    "- siblings [at=mounted]
++ result
+  ^ nat
+  | mounted/fs_foot/on_fact 41
+")))
+(define sibling-import
+  (driver:compile-with
+    (fixture:graph sibling-source driver:empty-foil-cache ["sibling_user"])
+    sibling-source driver:empty-foil-cache "sibling_user"))
+assert(Eq 42 (value ["result"] sibling-import))

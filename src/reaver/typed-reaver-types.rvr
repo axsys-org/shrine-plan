@@ -1,0 +1,120 @@
+;;;; Copyright (c) 2026 xoCore Technologies, Benjamin Summers
+;;;; SPDX-License-Identifier: MIT
+;;;; See LICENSE for full terms.
+
+;; Typed Reaver policy at the shared type-kernel boundary.  Inference and
+;; subtyping are kernel operations; runtime checks inspect only value heads.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind nt (#module foil-new-types))
+(#bind core (#module foil-type-core))
+
+(define world core:default-type-world)
+(define (body typ)
+  (If (nt:scheme? typ) (nt:scheme-body typ) typ))
+(define (callable typ)
+  (define open (_1 (nt:view world (body typ))))
+  (If (nt:pin-type? open) (callable (nt:pin-item open)) open))
+
+(define (binding bindings name)
+  (find (lambda (b) (Eq name (_0 b))) bindings))
+
+;; Freshen inferred variables against the caller's rigid variables.  This
+;; also makes alpha-renamed declarations behave identically.
+(define (fresh-scheme scm actuals)
+  (define params (nt:scheme-parameters scm))
+  (define (fresh i suffix)
+    (define name (strWeld "__typed_" (strWeld (showNat i) suffix)))
+    (If (any (nt:type-any? (lambda (t)
+          (And (nt:type-var? t) (Eq name (nt:ty-var-name t))))) actuals)
+      (fresh i (strWeld suffix "_")) name))
+  (define names (gen (Sz params) (lambda (i) (fresh i ""))))
+  (define opened (_1 (nt:specialize-scheme world scm
+    (map (lambda (name) (nt:type-arg (nt:type-var name))) names))))
+  (core:quantify names opened))
+
+(define (specialize scm bindings)
+  (_1 (nt:specialize-scheme world scm
+    (map (lambda (p)
+      (define name (nt:parameter-name p))
+      (define hit (binding bindings name))
+      (nt:type-arg (If hit (_1 (_0 hit)) (nt:type-var name))))
+      (nt:scheme-parameters scm)))))
+
+(define (compatible? expected actual)
+  (define want (body expected))
+  (If (nt:scheme? actual)
+    (let* ((scm (fresh-scheme actual [want]))
+           (matched (nt:match-template world [] (body scm) want)))
+      (And matched
+        (nt:consistent-subtype? world (specialize scm (_1 matched)) want)))
+    (nt:consistent-subtype? world actual want)))
+
+(define (apply-type-go typ actuals)
+  (define scm (If (nt:scheme? typ) (fresh-scheme typ actuals) 0))
+  (define fun (callable (If scm scm typ)))
+  (unless (nt:fun-type? fun)
+    (error ["typed-reaver" "cannot apply" typ actuals]) 1)
+  (define params (nt:fun-args fun))
+  (define count (min (Sz params) (Sz actuals)))
+  (define pairs (zip (take count params) (take count actuals)))
+  (define matched
+    (If scm
+      (foldl (lambda (state pair)
+        (And state
+          (nt:match-template (_0 state) (_1 state) (_0 pair) (_1 pair))))
+        [world []] pairs)
+      [world []]))
+  (unless matched
+    (error ["typed-reaver" "cannot infer application" typ actuals]) 1)
+  (define open (If scm (callable (specialize scm (_1 matched))) fun))
+  (unless (all (lambda (pair) (compatible? (_0 pair) (_1 pair)))
+      (zip (take count (nt:fun-args open)) (take count actuals)))
+    (error ["typed-reaver" "argument type mismatch" typ actuals]) 1)
+  (define ret (nt:tfun (drop count (nt:fun-args open)) (nt:fun-return open)))
+  (define remaining
+    (If scm
+      (filter (lambda (p) (Nil (binding (_1 matched) (nt:parameter-name p))))
+        (nt:scheme-parameters scm)) []))
+  (define result (If (Sz remaining) (nt:scheme remaining ret) ret))
+  (If (Gt (Sz actuals) count)
+    (apply-type-go result (drop count actuals)) result))
+
+;; An empty Reaver application is grouping, including a non-function head.
+(define (apply-type typ actuals)
+  (Ifz (Sz actuals) typ (apply-type-go typ actuals)))
+
+(define (shape-fits world seen typ val)
+  (define open (body typ))
+  (define (bad reason) [reason])
+  (define (branded? c) (And (IsNat c) (Eq 47 (Mod c 256))))
+  (cond
+    ((Or (nt:any-type? open) (nt:type-var? open)) 0)
+    ((nt:nat-type? open) (If (IsNat val) 0 (bad "not nat")))
+    ((nt:const-type? open)
+      (If (Equal (nt:const-value open) val) 0 (bad "not constant")))
+    ((nt:fun-type? open)
+      (If (Or (IsLaw val) (And (IsPin val) (IsLaw (Unpin val))))
+        0 (bad "not law")))
+    ((nt:pin-type? open) (If (IsPin val) 0 (bad "not pin")))
+    ((nt:array-type? open) (If (is-row? val) 0 (bad "not row")))
+    ((nt:row-type? open)
+      (let ((brand (nt:row-cstr open)) (arity (Sz (nt:row-items open))))
+        (If (Or (And (Eq 0 arity) (And (IsNat val) (Eq brand val)))
+              (And (IsApp val) (And (Eq brand (Hd val)) (Eq arity (Sz val)))))
+          0 (bad "row constructor or arity mismatch"))))
+    ((nt:sum-type? open)
+      (If (any (lambda (opt) (Nil (shape-fits world seen opt val)))
+            (nt:sum-options open)) 0 (bad "fell through sum")))
+    ((Or (nt:type-ref? open) (nt:type-app? open))
+      (If (includes (Equal open) seen) (bad "recursive type without shape")
+        (let ((view (nt:view world open)))
+          (shape-fits (_0 view) (cons open seen) (_1 view) val))))
+    ((nt:pail-type? open)
+      (If (Or (branded? val) (And (IsApp val) (branded? (Hd val))))
+        0 (bad "not a pail")))
+    (else (bad "invalid or empty expected type"))))
+
+(#export body callable compatible? apply-type shape-fits)

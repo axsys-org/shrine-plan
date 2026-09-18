@@ -1,0 +1,172 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Tree transformations validate both sides of their norm boundary.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (path xs) (map (lambda (x) ("ts" x)) xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result)
+    (error ["sewn-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define progression (parse (read-text-file "grove/fixtures/progression.grove")))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "progression"]))) ((helper "first") 9 progression))))
+  assert(Gt (Sz records) 9)
+  (define ordered (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "ordered"]))))
+  (define (export rec key) ((helper "export") (path [key]) rec))
+  (define apply (export ordered "apply"))
+  (define empty ((helper "queue_input") 0))
+  ;; Compiled endpoint metadata must support forward norm declarations too.
+  (define forward (ok (compile lookup ["gov" "forward"] (strcat ["#import text=codecs/text
+
+identity =
+  @sewn
+  #from ; input
+  #to ; output
+  get :
+    ! foil
+    \ tree=axal[myth]
+    ^ axal[myth]
+    tree
+
+input =
+  @norm
+  #here ; " 34 "/" 34 "
+  " 34 "/message" 34 ": text
+
+output =
+  @norm
+  #here ; " 34 "/" 34 "
+  " 34 "/message" 34 ": text
+"]))))
+  (define forward-apply (export (grove_fixture:record local forward
+    (grove_fixture:qualified (path ["gov" "forward" "identity"]))) "apply"))
+  assert(Equal ((abi:option policy "some") empty) (forward-apply empty))
+  assert(Equal ((abi:option policy "some") empty) (apply empty))
+  (define tied (apply ((helper "queue_ties") 0)))
+  assert(Equal (abi:option policy "some") (Hd tied))
+  assert(Equal [[0 100 (path ["a"])] [1 100 (path ["b"])]
+    [2 100 (path ["c"])]] ((helper "queue_summary") (_0 tied)))
+  assert(Equal tied (apply ((helper "queue_ties") 1)))
+  (define input ((helper "queue_input") 12))
+  (define result (apply input))
+  assert(Equal (abi:option policy "some") (Hd result))
+  (define summary ((helper "queue_summary") (_0 result)))
+  assert(Eq 10 (Sz summary))
+  assert(Equal (map (lambda (i) [i (Inc i)
+    (path [(strcat ["entry" (showNat (Sub 11 i))])])])
+    [0 1 2 3 4 5 6 7 8 9])
+    summary)
+  assert(Equal (map (lambda (p) (grove_fixture:qualified (path p))) [["gov" "progression" "by_name"]
+    ["gov" "progression" "by_index"]]) ((helper "sewn_summary") ordered))
+  (define base ((helper "req_data") ((helper "recall_data") 0 1)))
+  assert(Equal (abi:option policy "none")
+    (apply ((helper "norm_tree") 2 base)))
+
+  (define stored (grove_fixture:lookup local records))
+  (define fresh (backend:prepare code))
+  (define imported (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "consumer"]))) (parse "#import src=gov/progression/by_name
+#import dst=gov/progression/by_index
+#import ordered=gov/progression/ordered
+
+identity =
+  @sewn
+  #from ; %/src
+  #to ; src
+  get :
+    ! foil
+    \ tree=axal[myth]
+    ^ axal[myth]
+    tree
+
+bad_output =
+  @sewn
+  #from ; src
+  #to ; dst
+  get :
+    ! foil
+    \ tree=axal[myth]
+    ^ axal[myth]
+    tree
+
+forward =
+  ! foil
+  + apply ordered/apply
+"))))
+  assert(Equal ((abi:option policy "some") input)
+    ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "identity"]))) "apply") input))
+  assert(Equal (abi:option policy "none")
+    ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "bad_output"]))) "apply") input))
+  assert(Equal result ((export (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "consumer" "forward"]))) "apply") input))
+  (define (reject text)
+    (define result (compile stored ["gov" "bad"] text))
+    assert(Equal "err" (Hd result))
+    assert(Gt (_0 (_0 (_0 result))) 0)
+    1)
+  assert(Eq 1 (reject "bad =
+  @sewn
+"))
+  assert(Eq 1 (reject "bad =
+  @sewn
+  #from ; missing
+"))
+  assert(Eq 1 (reject "#import src=gov/progression/by_name
+
+bad =
+  @sewn
+  #from ; src
+  #from ; src
+"))
+  assert(Eq 1 (reject "#import src=gov/progression/by_name
+
+bad =
+  @sewn
+  #from ; src
+  #to ; src
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/entry
+
+bad =
+  @sewn
+  #from ; role
+"))
+  assert(Eq 1 (reject "#import src=gov/progression/by_name
+
+bad =
+  @sewn
+  #from ; src
+  #to ; src
+  get :
+    ! foil
+    \ tree=axal[myth]
+    ^ nat
+    0
+"))
+  (define typo ((driver:get-perc ["grove" "parse"] policy)
+    "bad =
+  @dyed
+"))
+  assert(Equal "err" (Hd typo))
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

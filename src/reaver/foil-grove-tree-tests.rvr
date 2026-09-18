@@ -1,0 +1,132 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Tree transformations validate both sides of their norm boundary.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (path xs) (map (lambda (x) ("ts" x)) xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result)
+    (error ["sewn-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  assert(Eq 1 ((helper "path_codec_checks") ("unit")))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define progression (parse (read-text-file "grove/fixtures/progression.grove")))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path ["gov" "progression"])) progression)))
+  assert(Gt (Sz records) 10)
+  (define stored (grove_fixture:lookup local records))
+  assert(Eq 1 ((helper "tree_seed_checks") records))
+  (define (tree key body)
+    (strcat [34 key 34 " =
+  @tree
+" body "
+"]))
+  (define (reject text)
+    (define result (compile stored ["gov" "bad"] text))
+    assert(Equal "err" (Hd result))
+    assert(Gt (_0 (_0 (_0 result))) 0)
+    1)
+  assert(Eq 1 (reject (strcat [(tree "/same" "")
+    (tree "/same" "")])))
+  ;; Definition and instance names remain distinct. Generated nominal
+  ;; definitions also have their own publication records.
+  (define separate (ok (compile missing ["gov" "separate"]
+    (strcat ["same =
+  @slot
+
+" (tree "/same" "")]))))
+  (define (has-record names records)
+    (If (find (lambda (record)
+      (Equal (grove_fixture:qualified (path names)) (_0 record))) records) 1 0))
+  assert(Eq 1 (has-record ["gov" "separate"] separate))
+  assert(Eq 1 (has-record ["gov" "separate" "same"] separate))
+  assert(Eq 1 (reject (tree "/a//b" "")))
+  assert(Eq 1 (reject (tree "/a/../b" "")))
+  assert(Eq 1 (reject (tree "/view" "  tack: '@/y/%/missing
+")))
+  assert(Eq 1 (reject (strcat [
+    "#import n=gov/progression/by_name
+
+"
+    (tree "/items" "  #like ; n
+  #like ; n
+") ])))
+  assert(Eq 1 (reject (strcat [
+    "#import n=gov/progression/by_name
+
+"
+    (tree "/items" "  #like ; n
+")
+    (tree "/items/bad" "") ])))
+  assert(Eq 1 (reject (strcat [
+    "#import n=gov/progression/entry
+
+"
+    (tree "/items" "  #like ; n
+") ])))
+  assert(Eq 1 (reject (strcat [
+    "#import n=gov/progression/entry
+
+"
+    (tree "/view" (strcat ["  " 34 "/sys/weft" 34
+      ": n
+  " 34 "/sys/tack" 34 ": '@/y/%/entries
+"])) ])))
+  (define fresh (backend:prepare code))
+  (define external (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (path ["gov" "external"])) (parse (strcat ["#import n=gov/progression/by_name
+
+"
+      (tree "/items" "  #like ; n
+")])))))
+  assert(Eq 1 (has-record ["gov" "external"] external))
+  (define boot-code (_1 (grove_fixture:boot local)))
+  (define (boot-module name)
+    (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) (_2 boot-code))))))
+  (define install-mod (boot-module "tests/grove_install"))
+  (define install (driver:get-perc ["grove_install_checks" "check"] install-mod))
+  assert(Eq 1 (ok (install records)))
+  ;; Real boot imports pinned /sys slots and publishes only local definitions.
+  (define boot-mod (boot-module "tests/grove_publication"))
+  (define (boot-helper name) (driver:get-perc ["grove_publication_fixture" name] boot-mod))
+  (define case (driver:get-perc ["namespace" "case"] boot-mod))
+  (define (previous state path)
+    (define found (case (abi:constructor boot-mod ["care" "x"])
+      (map (lambda (part) ((_0 part) (_1 part))) path) state))
+    (If (Eq (abi:option boot-mod "some") (Hd found)) (_0 found) 0))
+  (define ports ((abi:constructor boot-mod ["grove_publication_fixture" "ports"])
+    (lambda (state request) (backend:compile-port prepared (previous state) request))
+    (lambda (state records) (backend:publish prepared records 0 0 state))))
+  (define (boot port)
+    ((boot-helper "boot") ("x" 17) (_2 (_0 local))
+      (_1 (_0 local)) port
+      (read-text-file "grove/fixtures/value_codecs.grove")
+      (read-text-file "grove/fixtures/progression.grove") ports))
+  (define first (boot 18131))
+  (define second (boot 18132))
+  assert(Equal "ok" (Hd first))
+  assert(Equal "ok" (Hd second))
+  assert(Eq 1 ((driver:get-perc
+    ["grove_publication_fixture_checks" "instance_install"] boot-mod) (ok first)))
+  assert(Equal "err" (Hd (backend:publish prepared records 0 0 (ok first))))
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

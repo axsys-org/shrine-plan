@@ -14,3 +14,6 @@ Foil is documented in
 sharp edges are documented in [PAPERCUTS.md](PAPERCUTS.md).
 
 
+
+Tree-building syntax and the Sail HTML library are documented in
+[Foil builders](doc/foil-builder.md).

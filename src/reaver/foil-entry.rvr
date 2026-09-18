@@ -1,0 +1,103 @@
+;;;; Shared entry inspection, independent of compiler orchestration.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind newtype (#module newtype))
+(#import newtype)
+(#bind foil-subject (#module foil-subject))
+(#bind foil-lower (#module foil-lower))
+(#bind nt (#module foil-new-types))
+(#import foil-subject)
+
+(define Ent
+  (trow "ENT"
+    [["path" tany] ["tc" tany] ["span" tany]
+     ["ir" tany] ["val" tany] ["lowered" tany]]))
+
+(define (entry-parts sut path)
+  (define ent (foil-subject:got-entry path sut))
+  (If (Eq (Hd ent) "IR_ENTRY")
+    ($Ent path (foil-lower:ir-entry-tc ent) (Ix 1 ent)
+      (foil-lower:ir-entry-ir ent) (foil-lower:ir-entry-val ent) 1)
+    ($Ent path (foil-subject:tc-entry-contents ent)
+      (foil-subject:tc-entry-span ent) 0 0 0)))
+
+(define ent-tc Ent.tc)
+(define ent-span Ent.span)
+(define ent-val Ent.val)
+(define ent-lowered Ent.lowered)
+
+(define (entry-kind sut path tc)
+  (define hd (Hd tc))
+  (cond
+    ((Eq hd "TC_TYP")
+      (let* ((typ (nt:require-type-value "entry kind" (tc-typ-inner tc)))
+             (body (If (nt:scheme? typ) (nt:scheme-body typ) typ)))
+        (cond
+          ((nt:sum-type? body) "sum type")
+          ((nt:row-type? body) "row type")
+          (else "type"))))
+    ((Eq hd "TC_LAM") "function")
+    ((Eq hd "TC_FFI") "generated")
+    ((Eq hd "TC_LIT") "literal")
+    ((Eq hd "TC_ROW") "value")
+    ((Eq hd "TC_LET") "value")
+    ((Eq hd "TC_APP") "value")
+    (else "entry")))
+
+;; An entry's own source text, from its span's offset/len into the
+;; module source.
+(define (source-slice src espan)
+  (define off (Ix 2 espan))
+  (define len (Ix 3 espan))
+  (If len (Trunc (Mul 8 len) (Rsh src (Mul 8 off))) ""))
+
+(define (snoc-new x xs)
+  (If (includes (Equal x) xs) xs (snoc x xs)))
+
+;; References come only from semantic TC/type positions. Runtime literals,
+;; FFI closures, const arguments, row brands, and diagnostics stay opaque.
+(define (collect-refs tcv)
+  (define (path-ref acc path)
+    (cond
+      ((Or (ty-val-path? path) (ty-var-path? path)) acc)
+      ((ty-ap-path? path)
+        (foldl path-ref (snoc-new ["type" path] acc) (ty-ap-decode path)))
+      (else (snoc-new ["type" path] acc))))
+  (define (type-refs acc typ)
+    (define own
+      (cond
+        ((nt:type-ref? typ) (path-ref acc (nt:type-ref-path typ)))
+        ((nt:type-app? typ) (path-ref acc (nt:ty-app-base typ)))
+        (else acc)))
+    (foldl type-refs own (nt:type-children typ)))
+  (define (go acc code)
+    (define tag (Hd code))
+    (define refs
+      (type-refs acc (nt:require-type-value "reference annotation" (tc-ty code))))
+    (cond
+      ((Eq tag "TC_MEAN") acc)
+      ((Eq tag "TC_GLOBAL")
+        (snoc-new ["call" (tc-global-path code)] refs))
+      ((Eq tag "TC_APP") (go (go refs (tc-app-f code)) (tc-app-x code)))
+      ((Eq tag "TC_LAM")
+        (go (foldl type-refs refs (tc-lam-args code)) (tc-lam-body code)))
+      ((Eq tag "TC_ROW") (foldl go refs (tc-row-items code)))
+      ((Eq tag "TC_LET")
+        (go (foldl go refs (tc-letrec-binds code)) (tc-letrec-body code)))
+      ((Eq tag "TC_DEMAND") (go refs (tc-demand-val code)))
+      ((Eq tag "TC_BEFORE")
+        (go (go refs (tc-before-val code)) (tc-before-body code)))
+      ((Eq tag "TC_MATCH")
+        (let ((arms (foldl go (go refs (tc-match-scrut code))
+                      (tc-match-arms code)))
+              (fall (tc-match-fall code)))
+          (If fall (go arms fall) arms)))
+      ((Eq tag "TC_ARM")
+        (go (type-refs refs (tc-arm-pat code)) (tc-arm-val code)))
+      ((includes (Eq tag)
+         ["TC_LOCAL" "TC_LIT" "TC_CONST" "TC_CPARAM" "TC_FFI" "TC_TYP"])
+        refs)
+      (else (error ["unknown reference TC" tag]))))
+  (go [] tcv))

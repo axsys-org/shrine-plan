@@ -1,0 +1,228 @@
+#!/bin/sh
+# x/profile-parse — profile Foil compilation under a sampling profiler
+# (samply) or the Tracy build, with everything that is NOT the profiled
+# load pushed into a snapshot beforehand.
+#
+#   x/profile-parse                      # whole compilation of lain through the foil-new-env pipeline
+#   x/profile-parse --parse-only         # only read + rex parse + surface parse of lain's closure files
+#   x/profile-parse --mods "lain web"    # root modules to compile (or, with --parse-only, files to parse)
+#   x/profile-parse --uncached       # compile each root with a fresh import cache
+#                                        # (default = each module once)
+#   x/profile-parse --samply | --tracy   # profiler (default: samply when on PATH, else the Tracy build)
+#   x/profile-parse --fresh              # rebuild the staged snapshot first
+#   x/profile-parse --no-p2              # stage without the P2 compiler install
+#
+#   SAMPLY_FLAGS="-r 100000"             # samply record flags (default); add -n to not open the UI, -s to only save
+#   TRACY_FLAGS="--wait-for-tracy"       # wisp-tracy flags (default); "--profile-json /abs/trace.json" for a chrome trace
+#   WISP_ENV="ENKI_QUANTUM=1000000 ENKI_ROOT_QUANTUM=1000000 ENKI_TRACY_LAW_SAMPLE_RATE=512"   # env for the profiled session
+#   WISP=<interpreter for staging>       # default: wisp on PATH (the nix build boots the plan; a local
+#                                        # debug build may assert during boot), else ./wisp
+#   WISP_RUN=<interpreter to profile>    # default: $WISP.  Point it at a local build with symbols for samply
+#                                        # (WISP_RUN=./wisp) once that build runs a snapshot — the 2026-09-03
+#                                        # ./wisp asserts in register_canonical on boot AND on running a snapshot.
+#                                        # --tracy uses WISP_TRACY (./wisp-tracy) instead.
+#
+# Stage 1 (plain wisp, cached in .profile/parse/snap, keyed by a hash of every
+# src/reaver/*.rvr + src/plan): boot + stdlib (+P2), bind the whole compiler
+# chain (rex, foil-source, foil-new-elab, foil-lower, foil-new-env ...), define the
+# loads, and RUN the compile load ONCE so law bytecode compilation and every
+# other first-use cost lands in the snapshot.
+# Stage 2 runs on a copy of the bootstrap. Compile mode measures each root
+# and the total load through the sole driver. Parse-only mode measures read,
+# Rex, and SAST stages. Results contain counts, never saved compiler caches.
+# Fine-grained compilation is not reimplemented by this profiling harness.
+#
+# The Tracy build needs a CONNECTED client: --wait-for-tracy blocks until one
+# connects (=N gives up waiting after N seconds and runs anyway), and with no
+# client attached it buffers every zone event in memory — a lone lain parse
+# reached 24.7GB RSS and died after 132s (measured 2026-09-02).
+set -e
+
+FRESH=""; MODS=""; P2="--p2"; MODE="compile"; USE_CACHE=1; PROFILER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fresh) FRESH=1 ;;
+    --no-p2) P2="" ;;
+    --parse-only) MODE="parse" ;;
+    --uncached) USE_CACHE=0 ;;
+    --samply) PROFILER="samply" ;;
+    --tracy) PROFILER="tracy" ;;
+    --mods) shift; MODS="$1" ;;
+    *) echo "x/profile-parse: unknown argument $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ -z "$MODS" ]; then
+  if [ "$MODE" = "parse" ]; then MODS="lain shrine sept shrine_types bond"; else MODS="lain"; fi
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WISP="${WISP:-$(echo "$ROOT/wisp")}"
+WISP_TRACY="${WISP_TRACY:-$ROOT/wisp-tracy}"
+WISP_RUN="${WISP_RUN:-$WISP}"
+if [ -z "$PROFILER" ]; then
+  if command -v samply >/dev/null 2>&1; then PROFILER="samply"; else PROFILER="tracy"; fi
+fi
+if [ "$PROFILER" = "samply" ] && ! command -v samply >/dev/null 2>&1; then
+  echo "x/profile-parse: samply not on PATH (cargo install samply, or --tracy)" >&2; exit 2
+fi
+if [ "$PROFILER" = "tracy" ] && [ ! -x "$WISP_TRACY" ]; then
+  echo "x/profile-parse: no Tracy build at $WISP_TRACY (set WISP_TRACY, or --samply)" >&2; exit 2
+fi
+if [ ! -x "$WISP" ]; then
+  echo "x/profile-parse: no interpreter for staging (set WISP; wisp on PATH or ./wisp)" >&2; exit 2
+fi
+SAMPLY_FLAGS="${SAMPLY_FLAGS--r 100000}"
+TRACY_FLAGS="${TRACY_FLAGS---wait-for-tracy}"
+WISP_ENV="${WISP_ENV-}"
+
+DIR="$ROOT/.profile/parse"
+mkdir -p "$DIR"
+HASH="$( { find "$ROOT/src/reaver" -name '*.rvr' -print0 | sort -z | xargs -0 cat; find "$ROOT/src/plan" -type f -print0 | sort -z | xargs -0 cat; } | shasum | cut -c1-16)"
+
+# The loads, defined identically in both sessions (the staged definitions are
+# what the profiled session finds; redefining is negligible either way).
+defs () {
+cat <<'EOF'
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rex (#module rex))
+(#bind source (#module foil-source))
+(#bind fixture (#module foil-test-context))
+(#bind foil-sast (#module foil-sast))
+(#bind foil-builtins (#module foil-builtins))
+(#bind foil-new-elab (#module foil-new-elab))
+(#bind foil-lower (#module foil-lower))
+(#bind foil-subject (#module foil-subject))
+(#bind foil-surface (#module foil-surface))
+(#bind nfoil (#module foil-new-env))
+(#bind ca (#module cairn))
+;; A zone forced INSIDE the zone and timed in ms; prints ("STAGE" label ms).
+(define (tz lbl thunk)
+  (define t0 (Now 0))
+  (define h (Seq t0 (ZoneStart lbl)))
+  (define r (Seq h (thunk 0)))
+  (define d (DeepSeq r 0))
+  (define e (Seq d (ZoneEnd h)))
+  (define t1 (Seq e (Now 0)))
+  (define msg (print ("STAGE" lbl (Div (Sub t1 t0) 1000000))))
+  (seqN t0 h r d e t1 msg r))
+(define (parse-one mod)
+  (define src (tz (strcat ["parse.read." mod]) (lambda (_) (read-text-file (strcat ["foil/" mod ".foil"])))))
+  (define rexn (Seq src (tz (strcat ["parse.rex." mod]) (lambda (_) (rex:ParseRexNormFile src)))))
+  (define sast (Seq rexn (tz (strcat ["parse.sast." mod]) (lambda (_) (foil-sast:parse-module-sast 0 rexn)))))
+  (seqN src rexn sast sast))
+(define (parse-load mods)
+  (tz "parse.load" (lambda (_) (map (lambda (m) (Sz (parse-one m))) mods))))
+(define (compile-one use-cache? cache mod)
+  (tz (strcat ["compile.mod." mod]) (lambda (_)
+    (define selected (If use-cache? cache nfoil:empty-foil-cache))
+    (source:compile (fixture:files selected [mod]) selected mod))))
+(define (compile-load use-cache? mods)
+  (tz "compile.load" (lambda (_)
+    (_1 (foldl (lambda (st mod)
+      (define result (compile-one use-cache? (_0 st) mod))
+      [(_0 result) (snoc (Sz (nfoil:perc-own-keys (_1 result))) (_1 st))])
+      [nfoil:empty-foil-cache []] mods)))))
+
+EOF
+}
+
+mods_row () { printf '['; for m in $MODS; do printf '"%s" ' "$m"; done; printf ']'; }
+load_form () {
+  if [ "$MODE" = "parse" ]; then printf '(print ("LOAD" (parse-load %s)))\n' "$(mods_row)"
+  else printf '(print ("LOAD" (compile-load %s %s)))\n' "$USE_CACHE" "$(mods_row)"; fi
+}
+
+if [ -n "$FRESH" ] || [ "$(cat "$DIR/stamp" 2>/dev/null)" != "$HASH" ] || [ ! -e "$DIR/snap/data.mdb" ]; then
+  echo "x/profile-parse: staging snapshot $HASH (boot + stdlib${P2:+ + P2} + compiler chain + one warm compile of lain)" >&2
+  rm -rf "$DIR/snap" "$DIR/stage.log" "$DIR/stamp"
+  cd "$DIR"
+  . "$ROOT/x/stage-lib"
+  stage_repl "$WISP" "$ROOT" $P2 > stage.log 2>&1
+  { defs; printf '(print ("WARMUP" (compile-load 1 ["lain"])))\n'; } \
+    | "$WISP" --file-root "$ROOT/src" snap root _ >> stage.log 2>&1
+  if grep -aq '^("ERROR"' stage.log || grep -aq 'Assertion .* failed\|arena exhausted' stage.log \
+     || ! grep -aq '^("STAGE" "compile.load"' stage.log; then
+    echo "x/profile-parse: staging FAILED (see $DIR/stage.log)" >&2
+    grep -a -m1 -A6 '^("ERROR"' stage.log >&2 || true
+    exit 1
+  fi
+  rm -f snap/lock.mdb
+  echo "$HASH" > stamp
+  echo "x/profile-parse: staged (warm lain compile $(grep -a '^("STAGE" "compile.load"' stage.log | grep -o '[0-9]*)$' | tr -d ')')ms)" >&2
+fi
+
+# The profiled session runs on a copy so the staged snapshot stays pristine.
+RUN="$DIR/run"
+rm -rf "$RUN"; mkdir -p "$RUN/snap"
+cp "$DIR/snap/data.mdb" "$DIR/snap/pins.pack" "$RUN/snap/"
+{ defs; load_form; } > "$RUN/input"
+cd "$RUN"
+# samply on macOS refuses to inject into signed system binaries, so no `env`
+# wrapper: extra environment is exported here and inherited by the session
+# shellcheck disable=SC2086
+[ -z "$WISP_ENV" ] || export $WISP_ENV
+if [ "$MODE" = "parse" ]; then WHAT="parse of [$MODS]"; else WHAT="compile of [$MODS]$( [ "$USE_CACHE" = 1 ] || printf ' (fresh cache per root)')"; fi
+# shellcheck disable=SC2086
+if [ "$PROFILER" = "samply" ]; then
+  echo "x/profile-parse: $WHAT: samply $SAMPLY_FLAGS on $WISP_RUN -> $RUN/profile.json.gz" >&2
+  samply record $SAMPLY_FLAGS -o "$RUN/profile.json.gz" -- "$WISP_RUN" --file-root "$ROOT/src" snap root _ < input > run.log 2>&1 && RC=0 || RC=$?
+else
+  echo "x/profile-parse: $WHAT under $WISP_TRACY $TRACY_FLAGS" >&2
+  "$WISP_TRACY" $TRACY_FLAGS --file-root "$ROOT/src" snap root _ < input > run.log 2>&1 && RC=0 || RC=$?
+fi
+
+if grep -aq '^("ERROR"' run.log || grep -aq 'Assertion .* failed\|arena exhausted' run.log; then
+  echo "x/profile-parse: run FAILED (see $RUN/run.log)" >&2
+  grep -a -m1 -A6 '^("ERROR"' run.log >&2
+  exit 1
+fi
+if ! grep -aq '^("STAGE" "[a-z]*\.load"' run.log; then
+  echo "x/profile-parse: the load did not complete (exit $RC, $(grep -ac '^("STAGE"' run.log) stages logged; see $RUN/run.log)" >&2
+  if [ "$PROFILER" = "tracy" ]; then
+    echo "  --wait-for-tracy[=N] runs anyway once N seconds pass without a Tracy client; without a client the" >&2
+    echo "  Tracy build buffers zone events in memory until it dies (a lone lain parse reached 24.7GB, exit 137)." >&2
+    echo "  Connect the Tracy profiler first, or use TRACY_FLAGS=\"--profile-json /abs/trace.json\" for a client-free trace." >&2
+  fi
+  exit 1
+fi
+echo "x/profile-parse: done — log $RUN/run.log$( [ "$PROFILER" = samply ] && printf ', profile %s (samply load <file> reopens it)' "$RUN/profile.json.gz")"
+# Per-stage table.  The printer renders a nat whose bytes are all printable
+# as a cord ("8{JW"): decode those little-endian so the table stays numeric.
+grep -a '^("STAGE" ' run.log | perl -e '
+  my (%row, %occ, @order, %tot);
+  my @stages = qw(read rex sast imports head elab consts delta lower);
+  sub val { my $v = shift; if ($v =~ /^"(.*)"$/) { my $n = 0; $n = $n * 256 + $_ for reverse unpack("C*", $1); return $n } $v }
+  while (<STDIN>) {
+    next unless /^\("STAGE" "([^"]+)" (\d+|"[^"]{1,8}")\)/;
+    my ($lbl, $ms) = ($1, val($2));
+    if ($lbl =~ /^(parse|compile)\.load$/) { $tot{load} = $ms; next }
+    my ($kind, $st, $mod) = $lbl =~ /^(parse|compile)\.([a-z]+)\.(.+)$/ or next;
+    my $key = "$mod#" . ($occ{$mod} // 0);
+    push @order, $key unless exists $row{$key};
+    if ($st eq "mod") { $row{$key}{total} = $ms; $occ{$mod}++; next }
+    $row{$key}{$st} = $ms;
+  }
+  my $compile = grep { exists $row{$_}{total} } keys %row;
+  my @cols = $compile ? () : qw(read rex sast);
+  printf "%-14s" . ("%8s" x @cols) . ($compile ? "%8s%8s" : "") . "\n", "module", @cols, ($compile ? ("total", "excl") : ());
+  my %sum;
+  for my $k (@order) {
+    my ($mod) = $k =~ /^(.*)#/; my $r = $row{$k};
+    my @v = map { $r->{$_} // 0 } @cols;
+    $sum{$_} += $r->{$_} // 0 for @cols;
+    if ($compile) {
+      my $t = $r->{total} // 0; my $ex = $t - ($r->{imports} // 0);
+      printf "%-14s" . ("%8d" x @cols) . "%8d%8d\n", $mod, @v, $t, $ex;
+    } else { printf "%-14s" . ("%8d" x @cols) . "\n", $mod, @v }
+  }
+  my @sumcols = grep { $_ ne "imports" } @cols;
+  printf "%-14s" . ("%8d" x @cols) . "\n", "sum(excl)", map { $_ eq "imports" ? 0 : $sum{$_} } @cols;
+  my %n; $n{ (split /#/, $_)[0] }++ for @order;
+  my @dup = grep { $n{$_} > 1 } sort keys %n;
+  print "compiled more than once: " . join(", ", map { "$_ x$n{$_}" } @dup) . "\n" if @dup;
+  printf "load total %d ms\n", $tot{load} if defined $tot{load};
+'

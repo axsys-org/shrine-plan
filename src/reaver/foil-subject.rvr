@@ -6,153 +6,287 @@
 (#bind cairn (#module cairn))
 (#import cairn)
 
+(#bind newtype (#module newtype))
+(#import newtype)
+
+(#bind contexts (#module foil-context))
+
 (#bind print (#module print))
 (#import print)
 
+;;; TC nodes ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Typed constructors (newtype) over the HISTORICAL brands: consumers
+;; across the compiler (foil-lower, foil-new-elab, foil-relocate, ...)
+;; dispatch on (Hd node) cords like "TC_APP", and pinned subjects
+;; persist these nodes, so the tags stay "TC_*" cords rather than
+;; declare-cstr-minted type paths.  trow + $/. keep the representation
+;; bit-identical while adding checked construction and named faces.
+
 (define (tc tag) (strWeld "TC_" tag))
-(define tc-ty (Ix 0))
-(define set-tc-ty (Up 0))
-(define (tc-local ty slot face)
-  (tc "LOCAL" ty slot face))
-(define tc-local-slot (Ix 1))
-(define (tc-global ty path)
-  (tc "GLOBAL" ty path))
-(define (tc-lit ty lit)
-  (tc "LIT" ty lit))
-(define tc-lit-val (Ix 1))
-(define tc-global-path (Ix 1))
-(define (tc-const ty val)
-  (tc "CONST" ty val))
-(define tc-const-val (Ix 1))
+
+;; typed-value? :: RowType -> Data -> Bool
+;; (Row.cstr is (_0): `Row` itself is unreachable here — the wisp
+;; builtin of the same name wins over newtype's imported type.)
+(define (typed-value? typ value)
+  (And (IsApp value) (Eq (_0 typ) (Hd value))))
+
+(define TcLocal (trow (tc "LOCAL") [["ty" tany] ["slot" tany] ["face" tany]]))
+(define TcGlobal (trow (tc "GLOBAL") [["ty" tany] ["path" tany]]))
+(define TcLit (trow (tc "LIT") [["ty" tany] ["val" tany]]))
+(define TcConst (trow (tc "CONST") [["ty" tany] ["val" tany]]))
 ;; A const generic parameter reference inside a generic body — a typed
 ;; placeholder.  Deliberately has NO lowering case: one leaking past
 ;; materialization fails loudly.
-(define (tc-cparam ty name)
-  (tc "CPARAM" ty name))
-(define tc-cparam-name (Ix 1))
+(define TcCparam (trow (tc "CPARAM") [["ty" tany] ["name" tany]]))
+(define TcFfi (trow (tc "FFI") [["ty" tany] ["val" tany]]))
+(define TcApp (trow (tc "APP") [["ty" tany] ["f" tany] ["x" tany]]))
+(define TcTyp (trow (tc "TYP") [["ty" tany]]))
+(define TcMean (trow (tc "MEAN") [["cause" tany]]))
+(define TcLam
+  (trow (tc "LAM") [["ty" tany] ["meta" tany] ["args" tany] ["body" tany]]))
+(define TcDemand (trow (tc "DEMAND") [["ty" tany] ["val" tany]]))
+(define TcBefore (trow (tc "BEFORE") [["ty" tany] ["val" tany] ["body" tany]]))
+(define TcLetrec (trow (tc "LET") [["ty" tany] ["binds" tany] ["body" tany]]))
+(define TcRow (trow (tc "ROW") [["ty" tany] ["hd" tany] ["items" tany]]))
+(define TcMatch
+  (trow (tc "MATCH") [["ty" tany] ["scrut" tany] ["arms" tany] ["fall" tany]]))
+;; An arm's key is its runtime dispatch tree ["key" cstr arity kids]:
+;; kids has one entry per field — 0 for an unconstrained binder, or a
+;; nested key for a nested variant pattern (tested by lower-arm-test).
+(define TcArm
+  (trow (tc "ARM") [["ty" tany] ["pat" tany] ["val" tany] ["key" tany]]))
+
+(decl-union Tc
+  TcLocal TcGlobal TcLit TcConst TcCparam TcFfi TcApp TcTyp TcMean
+  TcLam TcDemand TcBefore TcLetrec TcRow TcMatch TcArm)
+
+;; Every TC node carries its type at slot 0 (TcMean: its cause), so
+;; these two stay shape-generic across the union.
+(define tc-ty (Ix 0))
+(define set-tc-ty (Up 0))
+
+(define tc-local $TcLocal)
+(define tc-local-slot TcLocal.slot)
+(define tc-global $TcGlobal)
+(define tc-global-path TcGlobal.path)
+(define tc-lit $TcLit)
+(define tc-lit-val TcLit.val)
+(define tc-const $TcConst)
+(define tc-const-val TcConst.val)
+(define tc-cparam $TcCparam)
+(define tc-cparam-name TcCparam.name)
 (define (tc-has-cparam? x)
   (If (IsApp x)
-    (If (Eq "TC_CPARAM" (Hd x))
+    (If (typed-value? TcCparam x)
       1
       (any tc-has-cparam? (gen (Sz x) (lambda (i) (Ix i x)))))
     0))
 (define (tc-uses-cparam? name x)
   (If (IsApp x)
-    (If (Eq "TC_CPARAM" (Hd x))
-      (Eq name (Ix 1 x))
+    (If (typed-value? TcCparam x)
+      (Eq name (TcCparam.name x))
       (any (tc-uses-cparam? name) (gen (Sz x) (lambda (i) (Ix i x)))))
     0))
-(define (tc-ffi ty val)
-  (tc "FFI" ty val))
-(define tc-ffi-val (Ix 1))
-(define (tc-app ty f x)
-  (tc "APP" ty f x))
-(define tc-app-f (Ix 1))
-(define tc-app-x (Ix 2))
-(define (tc-typ ty)
-  (tc "TYP" ty))
-(define tc-typ-inner (Ix 0))
-(define (tc-mean cause)
-  (tc "MEAN" cause))
+(define tc-ffi $TcFfi)
+(define tc-ffi-val TcFfi.val)
+(define tc-app $TcApp)
+(define tc-app-f TcApp.f)
+(define tc-app-x TcApp.x)
+(define tc-typ $TcTyp)
+(define tc-typ-inner TcTyp.ty)
+(define tc-mean $TcMean)
 
-(define (tc-lam ty meta args body)
-  (tc "LAM" ty meta args body))
-(define tc-lam-args (Ix 2))
-(define (tc-lam-arity l) (Sz (Ix 2 l)))
-(define tc-lam-body (Ix 3))
+(define tc-lam $TcLam)
+(define tc-lam-args TcLam.args)
+(define (tc-lam-arity l) (Sz (TcLam.args l)))
+(define tc-lam-body TcLam.body)
 
-(define (tc-letrec ty binds body)
-  (tc "LET" ty binds body))
-(define tc-letrec-binds (Ix 1))
-(define tc-letrec-body (Ix 2))
+(define tc-demand $TcDemand)
+(define tc-demand-val TcDemand.val)
+(define tc-before $TcBefore)
+(define tc-before-val TcBefore.val)
+(define tc-before-body TcBefore.body)
+(define tc-letrec $TcLetrec)
+(define tc-letrec-binds TcLetrec.binds)
+(define tc-letrec-body TcLetrec.body)
 
-(define (tc-row ty hd row)
-  (tc "ROW" ty hd row))
-(define tc-row-hd (Ix 1))
-(define tc-row-items (Ix 2))
+(define tc-row $TcRow)
+(define tc-row-hd TcRow.hd)
+(define tc-row-items TcRow.items)
 
-(define (tc-match ty scrut arms fall)
-  (tc "MATCH" ty scrut arms fall))
-(define tc-match-scrut (Ix 1))
-(define tc-match-arms (Ix 2))
-(define tc-match-fall (Ix 3))
-;; An arm's key is its runtime dispatch tree ["key" cstr arity kids]:
-;; kids has one entry per field — 0 for an unconstrained binder, or a
-;; nested key for a nested variant pattern (tested by lower-arm-test).
-(define (tc-arm ty pat val key)
-  (tc "ARM" ty pat val key))
-(define tc-arm-pat (Ix 1))
-(define tc-arm-val (Ix 2))
-(define tc-arm-key (Ix 3))
+(define tc-match $TcMatch)
+(define tc-match-scrut TcMatch.scrut)
+(define tc-match-arms TcMatch.arms)
+(define tc-match-fall TcMatch.fall)
+
+(define tc-arm $TcArm)
+(define tc-arm-pat TcArm.pat)
+(define tc-arm-val TcArm.val)
+(define tc-arm-key TcArm.key)
 
 
 
-;; A subject is ("SUT" ax order tvars root unit visible).  The axal accepts
-;; total-ordered PLAN path segments, including unit-identity pins.  The first four
-;; fields are the historical ABI.  `unit` is the optional union-mount unit
-;; record retained for tooling, and `visible` is either 0 (legacy lookup) or
-;; an AX mapping rooted source paths to canonical storage paths.  Keeping
-;; visibility separate from storage lets prefix-mounted code retain the
-;; canonical entries needed for linking and type expansion without leaking
-;; those entries as unqualified source names.
-;;
-;; Older four-field subjects are still readable through the tolerant
-;; accessors below; every subject constructed here uses the extended shape.
-;;
-;; The root is the
-;; compilation's namespace prefix: entry keys are stored rooted, source
-;; references resolve relative to it (canon-path), and row brands are
-;; therefore real namespace paths.  The boot process (builtins and the
-;; modules compiled against them) lives at /boot; an empty root is the
-;; unrooted (test/legacy) subject.
-(define sut-tvar (Ix 2))
-(define set-sut-tvar (Up 2))
-(define (sut-get-tvar? tvar sut) (find-idx (Eq tvar) (sut-tvar sut)))
-(define (sut-put-tvar tvar sut) (snap 2 (snoc tvar) sut))
-(define sut-root (Ix 3))
-(define set-sut-root (Up 3))
+;; Compiler storage is private. Public definition locations and moments
+;; belong to the explicit compilation context. The visibility index maps
+;; source spellings to storage keys; import pins carry defining layers.
+;; Version two requires the context slot even during entrypoint migration.
+;; Retired slots remain zero, but old or wider payloads are never upgraded.
+(define Subject
+  (trow "foil/subject/v2"
+    [["ax" tany] ["order" tany] ["tvar" tany] ["root" tany]
+     ["unit" tany] ["visible" tany] ["vis-inverse" tany]
+     ["write-log" tany] ["lazy" tany] ["prev" tany]
+     ["context" tany]]))
+
+(define (subject? x)
+  (And (IsApp x)
+    (And (Eq (Hd x) "foil/subject/v2") (Eq (Sz x) 11))))
+(define (require-subject sut)
+  (If (subject? sut) sut
+    (error "stale-compiler-subject: rebuild compiler artifacts and snapshots")))
+
+(define (sut-ax sut) (Subject.ax (require-subject sut)))
+(define (sut-root sut) (Subject.root (require-subject sut)))
+(define (set-sut-root root sut) (Subject.=root root (require-subject sut)))
 (define (root-path sut p) (Weld (sut-root sut) p))
-
-;; sut-unit :: Subject -> Unit | 0
-(define (sut-unit sut)
-  (If (Gt (Sz sut) 4) (Ix 4 sut) 0))
-
-;; sut-visible :: Subject -> Ax CanonPath | 0
-(define (sut-visible sut)
-  (If (Gt (Sz sut) 5) (Ix 5 sut) 0))
-
-;; upgrade-subject :: Subject -> Subject
-;;
-;; `Up` leaves an application unchanged when its index is out of range.  A
-;; direct write to slot 4 or 5 therefore cannot extend a retained historical
-;; four-field subject.  Rebuild old/intermediate values in the current shape
-;; before either extended-field setter runs; current and future wider subjects
-;; pass through unchanged.
-(define (upgrade-subject sut)
-  (If (And (IsApp sut)
-        (And (Eq "SUT" (Hd sut)) (Ge (Sz sut) 4)))
-    (If (Gt (Sz sut) 5)
-      sut
-      ("SUT" (_0 sut) (Ix 1 sut) (Ix 2 sut) (Ix 3 sut)
-        (If (Gt (Sz sut) 4) (Ix 4 sut) 0)
-        0))
-    (error ["foil-malformed-subject" sut])))
+(define (sut-context sut) (Subject.context (require-subject sut)))
+(define (sut-prev sut) (Subject.prev (require-subject sut)))
+(define (sut-unit sut) (Subject.unit (require-subject sut)))
+(define (sut-visible sut) (Subject.visible (require-subject sut)))
+(define (sut-vis-inverse sut) (Subject.vis-inverse (require-subject sut)))
 
 ;; set-sut-unit :: Unit | 0 -> Subject -> Subject
-(define (set-sut-unit unit sut) (Up 4 unit (upgrade-subject sut)))
+(define (set-sut-context context sut)
+  (Subject.=context context (require-subject sut)))
+(define (set-sut-unit unit sut) (Subject.=unit unit (require-subject sut)))
 
 ;; set-sut-visible :: Ax CanonPath | 0 -> Subject -> Subject
-(define (set-sut-visible visible sut) (Up 5 visible (upgrade-subject sut)))
+(define (set-sut-visible visible sut)
+  (Subject.=visible visible (require-subject sut)))
 
-(define (make-subject ax) ("SUT" ax 0 0 [] 0 0))
-(define subject-order Ix1)
-(define set-subject-order (Up 1))
+
+;; Retired slot 8 is always zero; import layers live in prev.
+(define (sut-lazy sut) (Subject.lazy (require-subject sut)))
+
+;; sut-find :: Path -> Subject -> Maybe (Pin Entry)
+;;
+;; The prev slot holds a ROW of import-subject PINS (newest-first), or
+;; 0.  Storing the imports' own cache pins — rather than re-parenting a
+;; single chain — is what shares structure: a diamond-imported module
+;; is ONE pin referenced from many prev rows, no spine is rebuilt, and
+;; two compiles of the same graph produce Equal prev rows (the artifact
+;; warm-hit contract).  Each pinned import is itself a full subject with
+;; its own prevs, so the chain is a shared DAG walked depth-first,
+;; newest import first (later-import-wins).  Own layer first, then the
+;; prevs — nearest layer wins.
+(define (sut-prevs sut)
+  (define p (sut-prev sut))
+  (Ifz p [] p))
+
+(define (search-layers visit sut)
+  (define hit (visit sut))
+  ;; Revisited pins cannot produce a new result. Shared system imports make
+  ;; diamonds common; walking their tails again made misses exponential.
+  (define (fp seen prevs)
+    (Ifz (Sz prevs) 0
+      (let ((pin (_0 prevs)) (rest (drop 1 prevs)))
+        (If (includes (Equal pin) seen) (fp seen rest)
+          (let* ((layer (Unpin pin)) (h (visit layer)))
+            (If h h
+              (fp (snoc pin seen) (Weld (sut-prevs layer) rest))))))))
+  (If hit
+    hit
+    (fp [] (sut-prevs sut))))
+
+(define (sut-find key sut)
+  (search-layers (lambda (layer) (getax key (sut-ax layer))) sut))
+
+;; Every layer subject reachable through the chain (head, then each
+;; import DAG), for the order-flattening consumers.
+(define (sut-layers sut)
+  ;; Preserve the existing right-to-left layer fold, retaining only each
+  ;; pin's first occurrence. This does not change source-name precedence.
+  (define (walk seen pending)
+    (Ifz (Sz pending) 0
+      (let ((pin (_0 pending)) (rest (drop 1 pending)))
+        (If (includes (Equal pin) seen) (walk seen rest)
+          (let ((layer (Unpin pin)))
+            (lcons layer (walk (snoc pin seen)
+              (Weld (rev (sut-prevs layer)) rest))))))))
+  (lcons sut (walk [] (rev (sut-prevs sut)))))
+
+;; RETIRED slot 7 (write-log, 2026-09-01): the log existed so the two
+;; per-compile deltas could avoid deep-Equal-walking a projection-fat
+;; order.  Under layered subjects a compile's own layer IS the write
+;; set — its order is small and authoritative — so the delta walks the
+;; order again and the log has nothing left to accelerate.
+;; Constructors leave the retired slot zero.
+
+;; derive-vis-inverse :: Subject -> Ax (Row WrittenPath)
+;;
+;; The visibility index inverted (canonical -> every written alias),
+;; derived on demand from the chain's per-layer indexes — head first,
+;; so a nearer layer's claim on a written path shadows a tail's, the
+;; same nearest-wins rule vis-find applies forward.  This retired the
+;; subject's slot-6 inverse cache (2026-09-01): the inverse is now
+;; derived once per NewCompiler and cached there, so it is no longer
+;; subject state, mark-visible no longer maintains it, and the durable
+;; boundary has nothing to strip.
+(define (derive-vis-inverse sut)
+  ;; sorted, deduped alias insertion — one canonical row order no
+  ;; matter which layer order contributed the aliases
+  (define (insert-written written row)
+    (Ifz (Sz row)
+      [written]
+      (Case3 (cmp-total written (_0 row))
+        (Weld [written] row)
+        row
+        (Weld [(_0 row)] (insert-written written (drop 1 row))))))
+  ;; HEAD vis only — the inverse mirrors the compile's own naming
+  ;; authority, same rule as visible-canon.
+  (define vis (sut-visible sut))
+  (Ifz vis
+    empty-ax
+    (foldl
+      (lambda (inv pair)
+        (putax (_1 pair)
+          (insert-written (_0 pair) (fall [] (getax (_1 pair) inv)))
+          inv))
+      empty-ax (rowify (tapax vis)))))
+
+;; Construct only the current format.
+(define (make-subject ax) ($Subject ax 0 0 [] 0 0 0 0 0 0 0))
+(define subject-order Subject.order)
+(define set-subject-order Subject.=order)
 (define (push-subject-order name sut)
   (set-subject-order (snoc name (subject-order sut)) sut))
-(define (pop-subject-order sut)
-  (define ord (subject-order sut))
-  [(_0 ord) (set-subject-order (drop 1 ord) sut)])
 (define empty-subject (make-subject empty-ax))
+
+;; head-onto-pins :: [Pin Subject] -> Subject -> Subject
+;; A fresh head over the given import pins (stored verbatim — they are
+;; the shared cache pins).  Inherits the base subject's root.
+;;
+;; Every prev pin is ICED here.  The chain walks (search-layers, sut-layers)
+;; dedup visited layers with Equal on these pins, once per name lookup.  An
+;; unsaved pin has no hash, so that Equal walked both SUBJECTS — and each
+;; compile pins its own copy of the builtin substrate, equal in content but
+;; never in pointer, so meeting another module's base meant walking the whole
+;; substrate.  That was ~two thirds of an Eden boot.  Prev pins are completed
+;; layers; finalizing one forces whatever its entry pins had left lazy.
+(define (head-onto-pins prevs base)
+  ($Subject empty-ax 0 0 (sut-root base) 0 0 0 0 0 (force (map iced prevs))
+    (sut-context base)))
+
+;; push-layer :: Subject -> Subject — a fresh head over one subject,
+;; pinned here (the test/single-import convenience).
+(define (push-layer sut)
+  (head-onto-pins [(Pin sut)] sut))
+
+(define (subject-order-all sut)
+  (foldl (lambda (acc p) (Weld acc (subject-order-all (Unpin p))))
+    (subject-order sut) (sut-prevs sut)))
+
 ;; Replacing an existing entry must not duplicate its key in the order:
 ;; the order is a set, and passes that walk it (e.g. lowering) rely on
 ;; visiting each entry once.  A key absent from the ax cannot be in the
@@ -161,7 +295,7 @@
 ;; order scan; only genuine replacements (reopens, materializations
 ;; over aliases) pay it.
 (define (insert-entry-sut key val sut)
-  (define fresh (Ifz (getax key (Ix 0 sut)) 1 0))
+  (define fresh (Ifz (getax key (sut-ax sut)) 1 0))
   (define sut1 (snap 0 (putax key (Pin val)) sut))
   (cond
     (fresh (push-subject-order key sut1))
@@ -174,59 +308,110 @@
 ;; the existing deterministic order slot; a fresh canonical entry joins the
 ;; order exactly once.
 (define (put-entry-pin key pin sut)
-  (define fresh (Ifz (getax key (_0 sut)) 1 0))
+  (define fresh (Ifz (getax key (sut-ax sut)) 1 0))
   (define sut1 (snap 0 (putax key pin) sut))
   (If fresh (push-subject-order key sut1) sut1))
 
-;; overlay-subject :: [Path] -> Subject -> Subject -> Subject
+;; put-entry-pins :: [[Path (Pin Entry)]] -> Subject -> Subject
 ;;
-;; Top-biased storage projection used by the union-mount compiler.  Name
-;; visibility and warning policy live in foil-env; this helper only makes the
-;; winning compiled entries available for linking and type expansion.
-(define (overlay-subject keys upper lower)
-  (foldl
-    (lambda (acc key) (put-entry-pin key (gotax key (_0 upper)) acc))
-    lower keys))
-
-;; graft-subject :: Path -> [Path] -> Subject -> Subject -> Subject
-;;
-;; Prefix-mount only: graft the layer's own entries below `prefix` without
-;; also unioning their canonical names at the root.  The stored entry keeps
-;; its canonical key, so canon-path can normalize the mounted spelling.
-(define (graft-subject prefix keys upper lower)
-  (define root (sut-root lower))
-  (define nroot (Sz root))
-  (foldl
-    (lambda (acc key)
-      (let ((mounted (Weld root (Weld prefix (drop nroot key)))))
-        (snap 0 (putax mounted (gotax key (_0 upper))) acc)))
-    lower keys))
+;; The batch form of put-entry-pin: one trie fold and ONE order append
+;; for all fresh keys, instead of a row-copying snoc per key — the
+;; snoc is O(order) per fresh key, which made a big import's
+;; projection quadratic (measured 0.25ms/key on an empty subject,
+;; 23ms/key by the time the second generated module landed).  The
+;; result is bit-identical to the sequential fold: last write wins in
+;; the trie, and a fresh key joins the order at its first occurrence,
+;; in batch order.
+(define (put-entry-pins pairs sut)
+  (define ax0 (sut-ax sut))
+  (define sut1
+    (snap 0
+      (lambda (ax)
+        (foldl (lambda (a pair) (putax (_0 pair) (_1 pair) a)) ax pairs))
+      sut))
+  ;; fresh keys collect on a cons list (O(1) each — a row snoc here
+  ;; would rebuild the very quadratic this function removes), reversed
+  ;; back to encounter order so the appended order is bit-identical to
+  ;; the sequential fold's
+  (define fresh
+    (rev (rowify
+      (_1
+        (foldl
+          (lambda (st pair)
+            (let ((k (_0 pair)))
+              (If (getax k ax0)
+                st
+                (If (getax k (_0 st))
+                  st
+                  [(putax k 1 (_0 st)) (lcons k (_1 st))]))))
+          [empty-ax 0] pairs)))))
+  (define sut2 sut1)
+  (If (Sz fresh)
+    (set-subject-order (Weld (subject-order sut2) fresh) sut2)
+    sut2))
 
 ;; mark-visible :: Path -> Path -> Subject -> Subject
 (define (mark-visible written canonical sut)
   ;; `sut-visible` is the AX itself, not a Maybe-wrapped AX.  Using `fall`
   ;; here unwrapped the first AX field after the first insertion and silently
   ;; discarded the accumulated visibility map.
+  ;; (The slot-6 inverse is no longer maintained here — it derives on
+  ;; demand per compiler; see derive-vis-inverse.)
   (define vis (Ifz (sut-visible sut) empty-ax (sut-visible sut)))
   (set-sut-visible (putax written canonical vis) sut))
-(define (make-tc-entry key span tc)
-  ("TC" key tc span))
-(define tc-entry-contents (Ix 1))
-(define tc-entry-span (Ix 2))
+;; The "TC" brand rides the historical entry shape ("TC" key tc span).
+(define TcEntry
+  (trow "TC" [["key" tany] ["contents" tany] ["span" tany]]))
+(define (make-tc-entry key span tc) ($TcEntry key tc span))
+(define tc-entry-contents TcEntry.contents)
+(define tc-entry-span TcEntry.span)
 (define (insert-tc key span tc sut)
   (define ent (make-tc-entry key span tc))
   (insert-entry-sut key ent sut))
+
+;; insert-tcs :: [[Path Span TC]] -> Subject -> Subject
+;;
+;; The batched insert-tc: identical semantics — last write wins, a
+;; fresh key joins the order at first occurrence, a replacement joins
+;; only if absent from the order — but ONE order append for the whole
+;; batch.  gen-accessors writes three entries per record field
+;; (thousands per generated module), and the one-at-a-time path paid
+;; an order snoc each.
+(define (insert-tcs rows sut)
+  (define pairs
+    (map (lambda (r) [(_0 r) (Pin (make-tc-entry (_0 r) (_1 r) (_2 r)))])
+      rows))
+  (define ax0 (sut-ax sut))
+  (define sut1
+    (snap 0
+      (lambda (ax)
+        (foldl (lambda (a p) (putax (_0 p) (_1 p) a)) ax pairs))
+      sut))
+  (define sut2 sut1)
+  (define joins
+    (rev (rowify
+      (_1
+        (foldl
+          (lambda (st p)
+            (let ((k (_0 p)))
+              (If (getax k ax0)
+                ;; replacement: order-membership discipline, per key
+                ;; (rare — materializations over aliases)
+                (If (includes (Equal k) (subject-order sut))
+                  st
+                  [(_0 st) (lcons k (_1 st))])
+                (If (getax k (_0 st))
+                  st
+                  [(putax k 1 (_0 st)) (lcons k (_1 st))]))))
+          [empty-ax 0] pairs)))))
+  (If (Sz joins)
+    (set-subject-order (Weld (subject-order sut2) joins) sut2)
+    sut2))
 (define wack-span [0 0 0 0])
 
 (define (insert-ffi key val ty sut)
   (define tc (tc-ffi ty val))
   (insert-tc key wack-span tc sut))
-
-;; A navigation-only alias: the entry pinned at target also resolves
-;; at key.  Mount-style — the alias never joins the order, and
-;; canon-path normalizes through it to the target's canonical name.
-(define (alias-entry key target sut)
-  (snap 0 (putax key (gotax target (Ix 0 sut))) sut))
 
 (define (unpin-soft x)
   (If (IsPin x) (Unpin x) x))
@@ -330,40 +515,59 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; materialization, so elaboration semantics are unchanged.
 (define (get-const name sut)
   (If (ty-ap-path? name)
-    (let ((direct (getax name (_0 sut))))
-      (Ifz direct (getax (ty-ap-base name) (_0 sut)) direct))
-    (getax name (_0 sut))))
+    (let ((direct (sut-find name sut)))
+      (Ifz direct (sut-find (ty-ap-base name) sut) direct))
+    (sut-find name sut)))
 (define (got-entry path sut)
   (unpin-soft (need (get-const path sut))))
 (define (got-const name sut) (need (get-const name sut)))
 
-(define (got-entry-tc path sut)
-  (define ent (got-entry path sut))
+;; Resolve a public definition moment through the defining layers, never
+;; through the importing source's visibility table. Return the private key
+;; separately so namespace addresses cannot be mistaken for storage keys.
+(define (definition-key identity sut)
+  (search-layers (lambda (layer)
+    (define context (sut-context layer))
+    (define local (If context (contexts:local-definition context identity) 0))
+    (define own (If local (root-path layer (_0 local)) 0))
+    (If (And own (getax own (sut-ax layer))) [own] 0)) sut))
+
+(define (definition-moment key sut)
+  (search-layers (lambda (layer)
+    (define unit (sut-context layer))
+    (define root (sut-root layer))
+    (define own (And unit
+      (And (Equal root (take (Sz root) key)) (getax key (sut-ax layer)))))
+    (If own (contexts:find-moment unit (drop (Sz root) key)) 0)) sut))
+
+(define (get-definition identity sut)
+  (define key (definition-key identity sut))
+  (If key (get-const (_0 key) sut) 0))
+
+;; Decode an already-found entry without walking the import graph again.
+(define (entry-tc path ent)
   (cond
-    ((Eq (Hd ent) "TC") (_1 ent))
+    ((typed-value? TcEntry ent) (tc-entry-contents ent))
+    ;; IR_ENTRY belongs to foil-lower (which imports this module);
+    ;; its tc slot stays positional here to avoid a cycle.
     ((Eq (Hd ent) "IR_ENTRY") (_3 ent))
     (else
       (error ("bad entry" path)))))
 
-(define (got-type path sut)
-  (define tc (got-entry-tc path sut))
-  (define ent (got-entry path sut))
-  (unless (Eq (Hd tc) "TC_TYP") (error ("bad type" path (Hd tc)))
-    (_0 (tc-typ-inner tc))))
+(define (got-entry-tc path sut)
+  (entry-tc path (got-entry path sut)))
 
 (define (print-path x)
   (foldl strWeld "" (map (cork print-nat (strWeld "/")) x)))
 
-(define (bind-span x)
-  (define ty (_4 x))
-  ; (print ("bind-span" x ty))
-  (If (Eq (Hd ty) "/foil/types/ttyp") (_0 ty) 0))
-
-
 (define (get-span name sut)
-  (define entry (get-const name sut))
-  (Ifz entry 0
-    (bind-span (_0 entry))))
+  (define hit (get-const name sut))
+  (Ifz hit 0
+    (let ((entry (unpin-soft (_0 hit))))
+      (cond
+        ((Eq "TC" (Hd entry)) (tc-entry-span entry))
+        ((Eq "IR_ENTRY" (Hd entry)) (_1 entry))
+        (else (error ["bad span entry" name]))))))
 
 (define (got-span name sut)
   (define res (get-span name sut))
@@ -376,20 +580,32 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; mounted import resolves to the same pinned entry, and nominal type
 ;; identity must not depend on which name the source used.  Entries
 ;; carry their canonical key at Ix 0 ("TC" and "IR_ENTRY" alike).
+;; Visibility on a chained subject is per-layer, like the entries: each
+;; Visibility is HEAD-only naming authority (per-compile): the chain
+;; carries entries, never names, so canon-path reads the head index
+;; directly.
+
+(define (definition-brand sut local)
+  (If (sut-context sut)
+    (contexts:runtime-brand (sut-context sut) local)
+    (error "definition-brand-requires-compilation-context")))
+
+;; Source spelling has its own lookup operation. In particular, a source
+;; name beginning with a compiler-storage discriminator gains no privilege.
+(define (resolve-source-path path sut)
+  (define visible (sut-visible sut))
+  (Ifz visible (error "source-resolution-requires-visibility")
+    (let ((hit (getax (Weld (sut-root sut) path) visible)))
+      (If hit (_0 hit) ["/foil-env/unbound"]))))
+
 (define (canon-path path sut)
-  ;; path-prefix? :: Path -> Path -> Bool
-  (define (path-prefix? prefix whole)
-    (And (Le (Sz prefix) (Sz whole))
-      (Equal prefix (take (Sz prefix) whole))))
-  ;; Legacy subjects infer visibility from storage.  A union-mount subject
-  ;; has an explicit visible-path index: relative source names must pass
-  ;; through it, while already-canonical rooted paths remain available to
-  ;; compiler internals (type expansion and symbolic global edges).
+  ;; Compiled subjects resolve source spellings only through their explicit
+  ;; visibility index. Canonical identity lookup uses definition-key instead.
+  ;; Unindexed scratch subjects are used for internal type construction.
   (define (visible-canon p)
     (define vis (sut-visible sut))
     (define root (sut-root sut))
-    (define absolute? (And (Sz root) (path-prefix? root p)))
-    (If (Or (Nil vis) absolute?)
+    (If (Nil vis)
       0
       (let ((hit (getax (Weld root p) vis)))
         (Ifz hit
@@ -425,45 +641,6 @@ assert(ty-var-path? ["ty-var" "v"])
                     (_0 (unpin-soft (_0 got)))))
                 (_0 (unpin-soft (_0 rgot)))))))))))
 
-;; Merge a compiled module's declared entries into sut at their
-;; canonical paths.  An identical entry at an occupied path is the
-;; diamond-import case and dedupes; a differing one is a collision.
-(define (merge-subject blurb keys imp sut)
-  (define (merge-one acc key)
-    (define pin (gotax key (_0 imp)))
-    (define mine (getax key (_0 acc)))
-    (cond
-      ((Ifz mine 1 0)
-        ;; The order is a subset of the ax keys, so a key absent from
-        ;; the ax cannot be in the order — push without scanning it
-        ;; (the scan made merging K keys O(K^2)).
-        (push-subject-order key (snap 0 (putax key pin) acc)))
-      ((Equal (need mine) pin) acc)
-      (else
-        (error ["foil-import-collision" ["path" key] ["at" blurb]]))))
-  (foldl merge-one sut keys))
-
-;; Mount: the same pinned entries additionally reachable under a path
-;; prefix.  Navigation only — mounted names never join the order (the
-;; entries are already lowered under their canonical names) and types
-;; written through them normalize via canon-path.
-(define (mount-subject blurb prefix keys imp sut)
-  ;; Mounted names live under the root like everything else: the
-  ;; canonical key is root ++ decl-path, so the mount is
-  ;; root ++ prefix ++ decl-path (source `vec/x` resolves through the
-  ;; canon-path root retry).
-  (define root (sut-root sut))
-  (define (mount-one acc key)
-    (define pin (gotax key (_0 imp)))
-    (define mkey (Weld root (Weld prefix (drop (Sz root) key))))
-    (define mine (getax mkey (_0 acc)))
-    (cond
-      ((Ifz mine 1 0) (snap 0 (putax mkey pin) acc))
-      ((Equal (need mine) pin) acc)
-      (else
-        (error ["foil-import-collision" ["path" mkey] ["at" blurb]]))))
-  (foldl mount-one sut keys))
-
 ;; subject-delta-keys :: Subject -> Subject -> Row Path
 ;;
 ;; Imported entries are already present in `base`; generated accessors, own
@@ -471,9 +648,12 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; entry differs from the base subject.
 (define (subject-delta-keys base final)
   (define (changed? key)
-    (define old (getax key (_0 base)))
-    (define new (gotax key (_0 final)))
+    (define old (getax key (sut-ax base)))
+    (define new (gotax key (sut-ax final)))
     (Or (Nil old) (Nil (Equal (need old) new))))
+  ;; Walk final's order: under layered subjects the compile's own
+  ;; layer holds exactly the writes, so the order IS the write set
+  ;; (the slot-7 log this once filtered is retired).
   (filter changed? (subject-order final)))
 
 ;; subject-entry-delta :: Subject -> Subject -> Row [Path Pin]
@@ -481,54 +661,10 @@ assert(ty-var-path? ["ty-var" "v"])
 ;; Preserve the historical public projection used by callers that only need
 ;; the changed keys or replacement pins.
 (define (subject-entry-delta base final)
-  (map (lambda (key) [key (gotax key (_0 final))])
+  (map (lambda (key) [key (gotax key (sut-ax final))])
     (subject-delta-keys base final)))
 
-;; subject-entry-replay-delta :: Subject -> Subject
-;;                            -> Row [Path (Maybe Pin) Pin]
-;;
-;; Artifact replay additionally records the exact old pin (Maybe-wrapped in
-;; Cairn's native get shape).  This distinguishes an authorized own-layer
-;; replacement from a cache assembled over the wrong import graph.
-(define (subject-entry-replay-delta base final)
-  (map
-    (lambda (key)
-      [key (getax key (_0 base)) (gotax key (_0 final))])
-    (subject-delta-keys base final)))
 
-;; Replay a module delta without rebuilding or re-pinning its entries.
-;;
-;; Three-field checked entries authorize a replacement only when the current
-;; pin matches the recorded old Maybe Pin.  A current pin already equal to the
-;; new value is the idempotent/diamond case.  Historical two-field additions
-;; retain their strict insert-or-identical behavior for API compatibility.
-(define (apply-entry-delta blurb delta sut)
-  (define (collision key expected actual)
-    (error ["foil-artifact-collision" ["path" key]
-            ["expected" expected] ["actual" actual] ["at" blurb]]))
-  (define (apply-legacy acc pair)
-    (define key (_0 pair))
-    (define pin (_1 pair))
-    (define mine (getax key (_0 acc)))
-    (cond
-      ((Nil mine) (put-entry-pin key pin acc))
-      ((Equal (need mine) pin) acc)
-      (else (collision key 0 mine))))
-  (define (apply-checked acc pair)
-    (define key (_0 pair))
-    (define expected (_1 pair))
-    (define pin (_2 pair))
-    (define mine (getax key (_0 acc)))
-    (cond
-      ((Equal expected mine) (put-entry-pin key pin acc))
-      ((And mine (Equal (need mine) pin)) acc)
-      (else (collision key expected mine))))
-  (define (apply-one acc pair)
-    (cond
-      ((Eq 2 (Sz pair)) (apply-legacy acc pair))
-      ((Eq 3 (Sz pair)) (apply-checked acc pair))
-      (else (error ["foil-malformed-entry-delta" pair]))))
-  (foldl apply-one sut delta))
 
 
 
@@ -536,6 +672,25 @@ assert(ty-var-path? ["ty-var" "v"])
 
 
 (#export
+ Tc
+ TcLocal
+ TcGlobal
+ TcLit
+ TcConst
+ TcCparam
+ TcFfi
+ TcApp
+ TcTyp
+ TcMean
+ TcLam
+ TcDemand
+ TcBefore
+ TcLetrec
+ TcRow
+ TcMatch
+ TcArm
+ TcEntry
+ Subject
  tc
  tc-ty
  set-tc-ty
@@ -559,6 +714,11 @@ assert(ty-var-path? ["ty-var" "v"])
  tc-lam-args
  tc-lam-arity
  tc-lam-body
+ tc-demand
+ tc-demand-val
+ tc-before
+ tc-before-val
+ tc-before-body
  tc-letrec
  tc-letrec-binds
  tc-letrec-body
@@ -573,10 +733,11 @@ assert(ty-var-path? ["ty-var" "v"])
  tc-arm-pat
  tc-arm-val
  tc-arm-key
- sut-tvar
- set-sut-tvar
- sut-get-tvar?
- sut-put-tvar
+ sut-ax
+ sut-context
+ set-sut-context
+ definition-brand
+ resolve-source-path
  sut-root
  set-sut-root
  root-path
@@ -584,35 +745,36 @@ assert(ty-var-path? ["ty-var" "v"])
  set-sut-unit
  sut-visible
  set-sut-visible
- upgrade-subject
+ sut-vis-inverse
+ derive-vis-inverse
+ sut-lazy
+ sut-find
+ require-subject
  make-subject
  subject-order
  set-subject-order
  push-subject-order
- pop-subject-order
  empty-subject
  insert-entry-sut
  put-entry-pin
- overlay-subject
- graft-subject
+ put-entry-pins
  mark-visible
  make-tc-entry
  tc-entry-contents
  tc-entry-span
  insert-tc
+ insert-tcs
  wack-span
  insert-ffi
- alias-entry
  got-entry
  get-const
+ definition-key
+ definition-moment
+ get-definition
  got-const
  unpin-soft
  canon-path
- merge-subject
- mount-subject
  subject-entry-delta
- subject-entry-replay-delta
- apply-entry-delta
  tc-cparam
  tc-cparam-name
  tc-has-cparam?
@@ -631,9 +793,15 @@ assert(ty-var-path? ["ty-var" "v"])
  ty-ap-decode
  ty-ap-base
  resolve-path
+ entry-tc
  got-entry-tc
- got-type
  print-path
  got-span
  get-span
+ subject?
+ subject-order-all
+ push-layer
+ head-onto-pins
+ sut-prevs
+ sut-layers
  )

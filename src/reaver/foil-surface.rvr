@@ -5,147 +5,307 @@
 (#bind std (#module std))
 (#import std)
 
-;;; Surface AST constructors ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(#bind newtype (#module newtype))
+(#import newtype)
+
+;;; Surface AST schema ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; SAST nodes are HEADLESS bracket rows carrying their brand in slot 0
+;; (["s_app" f args] has Hd 0 and reads its tag with (_0 node)).  That
+;; shape is historical ABI: every consumer dispatches on (_0 node) and
+;; cached surface values persist it.  declare-row keeps the
+;; representation bit-identical (its rows are headed by 0) while a
+;; tconst tag field pins each brand at construction; the surf-*
+;; wrappers below supply the tag so call sites stay unchanged.
+;;
+;; Because the brand is a field rather than the head, these types
+;; cannot form a decl-union (every constructor is 0) — dispatch stays
+;; tag conds, written against the predicates below.
 
 (define foil-no-heir "no-heir")
 
+(define (surf-tagged? tag x)
+  (And (IsApp x) (Eq tag (_0 x))))
+
+(declare-row SRef
+  [tag (tconst "s_ref")]
+  [path (tarr tany)])
 (define (surf-ref ref)
   assert(Gt (Sz ref) 0)
-  ["s_ref" ref])
-(define surf-ref-path (Ix 1))
+  ($SRef "s_ref" ref))
+(define surf-ref-path SRef.path)
 
 ;; A current-namespace reference: %/name anchors at the namespace
 ;; position containing the form (the enclosing declaration's path, or
 ;; the compilation root at module level).  Phase-neutral: valid wherever
 ;; an ordinary reference is.  Elaboration expands it structurally to an
 ;; s_ref of anchor+suffix before anything else consumes it.
+(declare-row SCref
+  [tag (tconst "s_cref")]
+  [path (tarr tany)])
 (define (surf-cref ref)
   assert(Gt (Sz ref) 0)
-  ["s_cref" ref])
-(define surf-cref-path (Ix 1))
-
+  ($SCref "s_cref" ref))
+(declare-row SLit
+  [tag (tconst "s_lit")]
+  [val tany])
 (define (surf-lit lit)
-  ["s_lit" lit])
-(define surf-lit-val (Ix 1))
+  ($SLit "s_lit" lit))
+(define surf-lit-val SLit.val)
 
+(declare-row SVar
+  [tag (tconst "s_var")]
+  [name (tnat 0)])
 (define (surf-var v)
-  assert(IsNat v)
-  ["s_var" v])
+  ($SVar "s_var" v))
 
-(define (surf-typ-mode x)
-  ["s_typ"])
-
+(declare-row SArm
+  [tag (tconst "s_arm")]
+  [pat tany]
+  [val tany])
 (define (surf-arm pat val)
-  ["s_arm" pat val])
-(define surf-arm-pat (Ix 1))
-(define surf-arm-val (Ix 2))
+  ($SArm "s_arm" pat val))
+(define surf-arm-pat SArm.pat)
+(define surf-arm-val SArm.val)
 
-(define (surf-self args) ["s_self" args])
+(declare-row SSelf
+  [tag (tconst "s_self")]
+  [args (tarr tany)])
+(define (surf-self args)
+  ($SSelf "s_self" args))
 
-(define (surf-tvar var body)
-  assert(IsNat var)
-  ["s_tvar" var body])
+(declare-row STvars
+  [tag (tconst "s_tvars")]
+  [vars (tarr tany)]
+  [body tany])
 (define (surf-tvars vars body)
-  ["s_tvars" vars body])
+  ($STvars "s_tvars" vars body))
 
 ;; Const generic parameters: consts = [[name type-sast] ...].  Nests
 ;; inside s_tvars so the declared types may mention sibling tvars.
+(declare-row SCvars
+  [tag (tconst "s_cvars")]
+  [consts (tarr tany)]
+  [body tany])
 (define (surf-cvars consts body)
-  ["s_cvars" consts body])
+  ($SCvars "s_cvars" consts body))
 
 ;; A constant symbol type: '$foo is the singleton type of the bare
 ;; symbol nat "foo" (TNAT with a symbol cube).
+(declare-row STsym
+  [tag (tconst "s_tsym")]
+  [sym (tnat 0)])
 (define (surf-tsym n)
-  ["s_tsym" n])
+  ($STsym "s_tsym" n))
+
+(define (surf-strict value) ["s_strict" value])
+(define (surf-before value body) ["s_before" value body])
+
+(declare-row SLetrec
+  [tag (tconst "s_letrec")]
+  [arms (tarr tany)]
+  [body tany])
 (define (surf-letrec arms body)
-  ["s_letrec" arms body])
-;; A loop (|): an immediately-applied lambda.  Each arm declares one
-;; loop parameter (pattern = faced type) with its initial value; the
-;; body re-enters via the self-call (_ ...).
+  ($SLetrec "s_letrec" arms body))
+
+;; A loop (%): an immediately-applied lambda.  Each arm is one
+;; `name=type init` pair — a loop parameter (pattern = faced type) with
+;; its initial value; the body re-enters via the self-call (_ ...).
+(declare-row SLoop
+  [tag (tconst "s_loop")]
+  [arms (tarr tany)]
+  [body tany])
 (define (surf-loop arms body)
-  ["s_loop" arms body])
+  ($SLoop "s_loop" arms body))
+
+(declare-row SUfcsPut
+  [tag (tconst "s_ufcs_put")]
+  [var tany]
+  [app tany])
 (define (surf-ufcs-put var app)
-  ["s_ufcs_put" var app])
+  ($SUfcsPut "s_ufcs_put" var app))
+
+(declare-row SUfcsOver
+  [tag (tconst "s_ufcs_over")]
+  [var tany]
+  [app tany])
 (define (surf-ufcs-over var app)
-  ["s_ufcs_over" var app])
+  ($SUfcsOver "s_ufcs_over" var app))
+
+(declare-row SLiteral
+  [tag (tconst "s_literal")]
+  [shape (tnat 0)]
+  [text (tnat 0)])
 (define (surf-literal shape text)
-  ["s_literal" shape text])
+  ($SLiteral "s_literal" shape text))
 
+(declare-row SSpec
+  [tag (tconst "s_spec")]
+  [val tany]
+  [args (tarr tany)])
 (define (surf-spec val args)
-  ["s_spec" val args])
-(define surf-spec-val (Ix 1))
-(define surf-spec-args (Ix 2))
+  ($SSpec "s_spec" val args))
+(define surf-spec-val SSpec.val)
+(define surf-spec-args SSpec.args)
 
+(declare-row SCast
+  [tag (tconst "s_cast")]
+  [ty tany]
+  [body tany])
 (define (surf-cast ty body)
-  ["s_cast" ty body])
-(define surf-cast-ty (Ix 1))
+  ($SCast "s_cast" ty body))
+(define surf-cast-ty SCast.ty)
 
 ;; Unary type reflection: (^ expr) reifies the type elaboration
 ;; assigned to expr as an ordinary value of the builtin closed sum
 ;; `type`.  The operand is never evaluated.
+(declare-row SReflect
+  [tag (tconst "s_reflect")]
+  [val tany])
 (define (surf-reflect val)
-  ["s_reflect" val])
-(define surf-reflect-val (Ix 1))
+  ($SReflect "s_reflect" val))
+(declare-row SUnion
+  [tag (tconst "s_union")]
+  [opts (tarr tany)])
 (define (surf-union opts)
-  ["s_union" opts])
-(define surf-union-opts (Ix 1))
+  ($SUnion "s_union" opts))
+(define surf-union-opts SUnion.opts)
+
+(declare-row SCase
+  [tag (tconst "s_case")]
+  [scrut tany]
+  [arms (tarr tany)]
+  [fall tany])
 (define (surf-case scrut arms fall)
-  ["s_case" scrut arms fall])
+  ($SCase "s_case" scrut arms fall))
+
+;; < pat src [mapper] body: bind-or-propagate.  On the success case of
+;; src (ok/some) pat binds the payload and body runs; on the failure
+;; case (err/none) the failure re-wraps into the declared result, an
+;; either's error through the optional mapper.  mapper is 0 when absent.
+(declare-row SProp
+  [tag (tconst "s_prop")]
+  [pat tany]
+  [src tany]
+  [mapper tany]
+  [body tany])
+(define (surf-prop pat src mapper body)
+  ($SProp "s_prop" pat src mapper body))
+
+;; #f: the call head f with its argument order reversed.  Only a
+;; saturated call head - (#f a b) - elaborates; # is an involution.
+(declare-row SFlip
+  [tag (tconst "s_flip")]
+  [fun tany])
+(define (surf-flip fun)
+  ($SFlip "s_flip" fun))
+
+(declare-row SIf
+  [tag (tconst "s_if")]
+  [scrut tany]
+  [yes tany]
+  [no tany])
 (define (surf-if scrut yes no)
-  ["s_if" scrut yes no])
+  ($SIf "s_if" scrut yes no))
 
+(declare-row SApp
+  [tag (tconst "s_app")]
+  [f tany]
+  [args (tarr tany)])
 (define (surf-app f x)
-  ["s_app" f x])
+  ($SApp "s_app" f x))
+(define surf-app? (surf-tagged? "s_app"))
+
+(declare-row STapp
+  [tag (tconst "s_tapp")]
+  [args (tarr tany)])
 (define (surf-tapp args)
-  ["s_tapp" args])
-(define surf-tapp-kids (Ix 1))
+  ($STapp "s_tapp" args))
+(define surf-tapp-kids STapp.args)
 
+(declare-row SFace
+  [tag (tconst "s_face")]
+  [name (tnat 0)]
+  [kid tany])
 (define (surf-face face ty)
-  ["s_face" face ty])
-(define surf-face-name (Ix 1))
-(define surf-face-kid (Ix 2))
+  ($SFace "s_face" face ty))
+(define surf-face-name SFace.name)
+(define surf-face-kid SFace.kid)
 
+(declare-row SRow
+  [tag (tconst "s_row")]
+  [kids (tarr tany)])
 (define (surf-row row)
-  ["s_row" row])
-(define surf-row-kids (Ix 1))
-(define (surf-trow row)
-  ["s_trow" row])
-(define (surf-sum vars)
-  ["s_sum" vars])
+  ($SRow "s_row" row))
+(define surf-row-kids SRow.kids)
 
+(declare-row STrow
+  [tag (tconst "s_trow")]
+  [kids (tarr tany)])
+(define (surf-trow row)
+  ($STrow "s_trow" row))
+
+(declare-row SVariant
+  [tag (tconst "s_variant")]
+  [name (tnat 0)])
 (define (surf-variant tag)
-  ["s_variant" tag])
+  ($SVariant "s_variant" tag))
 
 ;; A relative variant: .tag / (./tag args) resolves against the type
 ;; the context expects (the scrutinee in patterns, the goal in
 ;; expressions) — the member analog of a relative path.
+(declare-row SRelvar
+  [tag (tconst "s_relvar")]
+  [name (tnat 0)])
 (define (surf-relvar tag)
-  ["s_relvar" tag])
-(define surf-relvar-tag (Ix 1))
-
+  ($SRelvar "s_relvar" tag))
+(declare-row SFun
+  [tag (tconst "s_fun")]
+  [args (tarr tany)]
+  [ret tany])
 (define (surf-fun args ret)
-  ["s_fun" args ret])
-(define surf-fun-args (Ix 1))
-(define surf-fun-ret (Ix 2))
+  ($SFun "s_fun" args ret))
+(define surf-fun-args SFun.args)
+(define surf-fun-ret SFun.ret)
+
+(declare-row STfun
+  [tag (tconst "s_tfun")]
+  [args (tarr tany)]
+  [ret tany])
 (define (surf-tfun args ret)
-  ["s_tfun" args ret])
+  ($STfun "s_tfun" args ret))
 
+(declare-row SMeth
+  [tag (tconst "s_meth")]
+  [args (tarr tany)])
 (define (surf-meth args)
-  ["s_meth" args])
+  ($SMeth "s_meth" args))
+
+(declare-row SMseg
+  [tag (tconst "s_mseg")]
+  [name (tnat 0)]
+  [args (tarr tany)])
 (define (surf-mseg name args)
-  ["s_mseg" name args])
+  ($SMseg "s_mseg" name args))
+;; Accessors accept the historical bare-word segment spelling as well
+;; as the row form.
 (define (surf-mseg-name seg)
-  (If (IsNat seg) seg (Ix 1 seg)))
+  (If (IsNat seg) seg (SMseg.name seg)))
 (define (surf-mseg-args seg)
-  (If (IsNat seg) [] (Ix 2 seg)))
+  (If (IsNat seg) [] (SMseg.args seg)))
 
-(define surf-hole ["s_hole"])
+(declare-row SHole
+  [tag (tconst "s_hole")])
+(define surf-hole $SHole)
 
-(define (surf-mod decls)
-  ["s_mod" decls])
-
+(declare-row SDecl
+  [tag (tconst "s_decl")]
+  [name (tarr tany)]
+  [span tany]
+  [clause tany])
 (define (surf-decl name span clause)
-  ["s_decl" name span clause])
+  ($SDecl "s_decl" name span clause))
+(define surf-decl? (surf-tagged? "s_decl"))
 
 ;; An import/mount declaration.  `at` is the explicit mount point, or the
 ;; enclosing declaration path supplied by the parser for the legacy nested
@@ -155,23 +315,39 @@
 ;;
 ;; Keep the historical three-argument constructor as the unordered form so
 ;; callers which construct surface imports directly continue to work.
+(declare-row SImport
+  [tag (tconst "s_import")]
+  [at tany]
+  [span tany]
+  [modname (tnat 0)]
+  [order tany])
 (define (surf-import-at-order at span modname order)
-  ["s_import" at span modname order])
+  ($SImport "s_import" at span modname order))
 (define (surf-import at span modname)
   (surf-import-at-order at span modname 0))
 
 ;; Accessors accept both the new row and historical four-field imports.  This
 ;; makes cached/test surface values readable while the compiler migrates to
 ;; the extended representation.
-(define surf-import-at (Ix 1))
-(define surf-import-mount surf-import-at)
-(define surf-import-span (Ix 2))
-(define surf-import-modname (Ix 3))
+(define surf-import-at SImport.at)
+(define surf-import-span SImport.span)
+(define surf-import-modname SImport.modname)
 (define (surf-import-order imp)
-  (If (Gt (Sz imp) 4) (Ix 4 imp) 0))
+  (If (Gt (Sz imp) 4) (SImport.order imp) 0))
 
+(declare-row SSpan
+  [tag (tconst "s_span")]
+  [span tany]
+  [val tany])
 (define (surf-span span val)
-  ["s_span" span val])
+  ($SSpan "s_span" span val))
 
-(define (surf-doc text kids)
-  ["s_doc" text kids])
+;; A malformed declaration, recorded in place so its siblings still
+;; parse; elab-mod's scan pass collects these into diagnostics.
+(declare-row SBad
+  [tag (tconst "s_bad")]
+  [here (tarr tany)]
+  [span tany]
+  [err tany])
+(define (surf-bad here span err)
+  ($SBad "s_bad" here span err))

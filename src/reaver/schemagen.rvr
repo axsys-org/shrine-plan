@@ -6,7 +6,7 @@
 ;;;; source text at all.  The schema (parsed by json.foil) maps to a
 ;;;; typedef IR, the IR emits NORMALIZED REX directly (Leaf/Nest/Juxt
 ;;;; with inert zero spans — the structure refactor made spans pure
-;;;; diagnostics), and the tree feeds foil:compile-rex.  A human view
+;;;; diagnostics), and the tree feeds source:compile-rex.  A human view
 ;;;; is a printer concern, not a compilation artifact.
 ;;;;
 ;;;; v1 subset: records (object + required/optional -> maybe), string/
@@ -22,21 +22,24 @@
 (#import reef)
 
 (#bind rex (#module rex))
+(#bind rex-build (#module rex-build))
+(#import rex-build)
 
 (#bind foil-subject (#module foil-subject))
 (#import foil-subject)
 
-(#bind foil (#module foil))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind wire (#module wire-json))
 
-;;; json value access (reps probed 2026-07-28: cstr-headed apps,
-;;; brands "/boot/json/<v>", fields from Ix 0) ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Access to the private host JSON tree decoded at the module boundary.
 
 (define (sg-error why what) (error ["schemagen" why what]))
 
 (define (jv? tag v) (And (IsApp v) (Eq tag (Hd v))))
-(define (jv-obj? v) (jv? "/boot/json/obj" v))
-(define (jv-str? v) (jv? "/boot/json/str" v))
-(define (jv-arr? v) (jv? "/boot/json/arr" v))
+(define (jv-obj? v) (jv? "wire/json/obj" v))
+(define (jv-str? v) (jv? "wire/json/str" v))
+(define (jv-arr? v) (jv? "wire/json/arr" v))
 
 (define (jv-str! v)
   (Ifz (jv-str? v) (sg-error "expected-string" v) (Ix 0 v)))
@@ -230,14 +233,14 @@
 (define (sg-enum-vals v)
   (define r (jv-get "enum" v))
   (Ifz r []
-    (filter (lambda (x) (Ifz (jv? "/boot/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
+    (filter (lambda (x) (Ifz (jv? "wire/json/nul" x) 1 0)) (jv-xs! (_0 r)))))
 
 ;; Enum values this IR can name.  A foil variant's name comes from the
 ;; wire STRING, so a numeric enum has nothing to make variants out of —
 ;; this document's EndpointStatus is [0,-1,-2,-3,-5,-10].  Such a schema
 ;; is not an enumeration here; sg-ftype-go carries it by value instead.
 (define (sg-jv-num? x)
-  (Or (jv? "/boot/json/num" x) (jv? "/boot/json/real" x)))
+  (Or (jv? "wire/json/num" x) (jv? "wire/json/real" x)))
 (define (sg-str-enum-vals v)
   (define xs (sg-enum-vals v))
   (If (all jv-str? xs) xs []))
@@ -532,7 +535,7 @@
         (Ifz (Nil (sg-null-union v)) 1
           (let ((en (jv-get "enum" v)))
             (Ifz en 0
-              (If (any (lambda (x) (jv? "/boot/json/nul" x)) (jv-xs! (_0 en)))
+              (If (any (lambda (x) (jv? "wire/json/nul" x)) (jv-xs! (_0 en)))
                 1 0))))))))
 (define (sg-nullable? env v) (sg-nullable-go env v 0))
 
@@ -1057,45 +1060,24 @@
 ;;; Tree emitter ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; Emits normalized rex DIRECTLY — Leaf/Nest/Juxt with inert zero
-;;; spans, straight into foil:compile-rex.  Shapes mirror what
+;;; spans, straight into source:compile-rex.  Shapes mirror what
 ;;; ParseRexNormFile produces for the same source (probe-transcribed);
 ;;; the dev oracle was Equal against the span-zapped parse of the text
 ;;; emitter's output.
 
-(define nzsp [0 0 0 0])
-(define (nw s) (rex:MakeLeaf nzsp "word" s))
-(define (nc s) (rex:MakeLeaf nzsp "cord" s))
-(define (nrn rune kids) (rex:MakeNest nzsp "clear" rune kids))
-(define (npar kids) (rex:MakeNest nzsp "paren" "" kids))
-(define (nbrk kids) (rex:MakeNest nzsp "brack" "" kids))
-(define (nbrko rune kids) (rex:MakeNest nzsp "brack" rune kids))
-(define (njx kids) (rex:MakeJuxt nzsp kids))
-(define (ngrp kids) (If (Eq 1 (Sz kids)) (_0 kids) (nrn "" kids)))
-
-;; BUG-COMPATIBLE, twice over: the parser's lore-line join writes a
-;; LITERAL backslash-n (rex-unlines-go, rex.rvr:301 — string literals
-;; process no escapes), and DECL-level continuation lines keep a "' "
-;; prefix while top-level ones are stripped.  Match both so generated
-;; lore is indistinguishable from parsed lore; flip in lockstep when
-;; the newline bug is fixed.
-(define (nslug-join sep lines)
+;; Match the decoded slug text produced by the textual emitter's
+;; two-space comment markers: one content space remains on each line.
+(define (nslug lines)
   (rex:MakeLeaf nzsp "slug"
     (foldl (lambda (acc l)
-             (Ifz acc (strcat [" " l]) (strcat [acc sep l])))
+             (Ifz acc (strcat [" " l]) (strcat [acc 10 " " l])))
       0 lines)))
-(define (nslug-top lines) (nslug-join (strcat ["\n" " "]) lines))
-(define (nslug lines) (nslug-join (strcat ["\n" "  '  "]) lines))
+(define nslug-top nslug)
 
-(define (npth segs) (nrn "/" (map nw segs)))
 (define (nfc name ty) (nrn "=" [(nw name) ty]))
-;; "." chains are FLAT in normalized rex (a.b.c(x) is ONE "." nest with
-;; kids [a b c-juxt]; parse-meth rejects a nested "." receiver), so a
-;; "."-nest receiver splices its kids.
-(define (ndot a b)
-  (If (And (Eq "nest" (Hd a))
-        (And (Eq "clear" (Ix 1 a)) (Eq "." (Ix 2 a))))
-    (nrn "." (snoc b (Ix 3 a)))
-    (nrn "." [a b])))
+;; %  i=nat 0  out=row[t] []  — a loop head: `name=type init` pairs as
+;; flat operands (the parser pairs them positionally; no > arms).
+(define (nloop pairs) (nrn "%" (foldl Weld [] pairs)))
 (define (ndotw a b) (ndot (nw a) (nw b)))
 (define (nmeth recv seg args)
   (ndot recv (njx [(nw seg) (npar args)])))
@@ -1104,14 +1086,19 @@
   (npar (cons (nrn "./" [(nw name)]) args)))
 (define (nspec name args) (njx [(nw name) (nbrk args)]))
 
+;; Typed concatenation: str/cat keeps the receiver last and preserves
+;; the text aura; the raw #str/cat intrinsic returns an unrefined nat.
+(define (nstr-cat left right)
+  (npar [(npth ["str" "cat"]) right left]))
+
 ;; foil type tree of an ftype.
 (define (sg-ft-ty-t ft)
   (cond
-    ((Eq "str" (_0 ft)) (nw "nat"))
+    ((Eq "str" (_0 ft)) (nw "str"))
     ((Eq "int" (_0 ft)) (nw "nat"))
     ((Eq "bool" (_0 ft)) (nw "bool"))
     ;; decimal text, not an arithmetic value
-    ((Eq "num" (_0 ft)) (nw "nat"))
+    ((Eq "num" (_0 ft)) (nw "str"))
     ;; the value exactly as it arrived, undecoded
     ((Eq "any" (_0 ft)) (nw "json"))
     ((Eq "ref" (_0 ft)) (nw (Ix 1 ft)))
@@ -1129,7 +1116,7 @@
      (nrn "&" [(npth [name "ok"]) (npth [name "err"])])
      (nrn "+" [(nw "ok") (nrn ":" [(nfc "v" vty)])])
      (nrn "+" [(nw "err")
-               (nrn ":" [(nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])])]))
+               (nrn ":" [(nfc "path" (nw "str")) (nfc "why" (nw "str"))])])]))
 
 (define (sg-dval-tree ft)
   (define key (sg-ft-key ft))
@@ -1163,10 +1150,9 @@
                   (nrn ">" [(nfc "t" (npth ["json" "real"])) (ok (ndotw "t" "lex"))])
                   (nrn ">" [(nfc "t" (npth ["json" "num"]))
                             (nrn "?" [(ndotw "t" "neg")
-                                      (ok (npar [(nw "cat2") (nc "-")
-                                                 (npar [(nw "show_nat")
-                                                        (ndotw "t" "n")])]))])
-                            (ok (npar [(nw "show_nat") (ndotw "t" "n")]))])
+                                      (ok (nstr-cat (nc "-") (npar [(npth ["nat" "show"])
+                                                        (ndotw "t" "n")])))])
+                            (ok (npar [(npth ["nat" "show"]) (ndotw "t" "n")]))])
                   (err "expected-number")]))
       ((Eq "row" (_0 ft))
         (let* ((et (Ix 1 ft))
@@ -1176,11 +1162,8 @@
             [(nw "j")
              (nrn ">"
                [(nfc "t" (npth ["json" "arr"]))
-                ;; one-line arm chains: the second > rides as a kid
-                ;; of the first (loop-arm-chain unchains them)
-                (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
-                                    (nrn ">" [(nfc "out" (nspec "row" [ety]))
-                                              (nbrk [])])])])
+                (nloop [[(nfc "i" (nw "nat")) (nw "0")]
+                        [(nfc "out" (nspec "row" [ety])) (nbrk [])]])
                 (nrn "^" [(nw rs)])
                 (nrn "?" [(npar [(nw "eq") (nw "i")
                                  (nrn "." [(nw "t") (nw "xs") (nw "len")])])
@@ -1191,7 +1174,7 @@
                                     (njx [(nw "at") (npar [(nw "i")])])])
                           (npar [(nw "jidx") (nw "p") (nw "i")])])
                    (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                                    (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                                    (nfc "path" (nw "str")) (nfc "why" (nw "str"))])
                              (nvap rs "err" [(nw "path") (nw "why")])])
                    (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ety)])
                              (npar [(nw "_") (ndotw "i" "inc")
@@ -1200,7 +1183,7 @@
       (else (sg-error "dval-of-ref" ft))))
   (nrn "+"
     [(nw (strcat ["d_val_" key]))
-     (nrn "\" [(nfc "j" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "j" (nw "json")) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rs)])
      body]))
 
@@ -1210,7 +1193,7 @@
   (define dv (sg-ft-dval ft))
   (nrn "+"
     [(nw (strcat ["d_req_" key]))
-     (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rs)])
      (nrn "?"
        [(nw "m")
@@ -1223,7 +1206,7 @@
     (nrn "?"
       [(npar [(nw dv) (nw "j") (nw "p")])
        (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                        (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                        (nfc "path" (nw "str")) (nfc "why" (nw "str"))])
                  (nvap ors "err" [(nw "path") (nw "why")])])
        (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" ty)])
                  (nvap ors "ok" [(nrelap "some" [(nw "v")])])])]))
@@ -1246,7 +1229,7 @@
   [(sg-sum-tree ors (sg-maybe-t ty))
    (nrn "+"
      [(nw (strcat ["d_opt_" key]))
-      (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "nat"))])
+      (nrn "\" [(nfc "m" (sg-maybe-t (nw "json"))) (nfc "p" (nw "str"))])
       (nrn "^" [(nw ors)])
       ;; An explicit null reads as absent.  A key the server sends as
       ;; null is not a value this field can hold, and EVERY nullable
@@ -1305,8 +1288,8 @@
                   (npar [(nw "jget") (nc fname) (ndotw "o" "kvs")])
                   (npar [(nw "jpath") (nw "p") (nc fname)])])
            (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                            (nfc (strcat ["path" ix]) (nw "nat"))
-                            (nfc (strcat ["why" ix]) (nw "nat"))])
+                            (nfc (strcat ["path" ix]) (nw "str"))
+                            (nfc (strcat ["why" ix]) (nw "str"))])
                      (nvap rsum "err"
                        [(nw (strcat ["path" ix])) (nw (strcat ["why" ix]))])])
            (nrn ">" [(npar [(nrn "./" [(nw "ok")])
@@ -1316,7 +1299,7 @@
     [(nw (strcat [name "_from"]))
      (nslug [(strcat ["Decode a " name " from a json value; p is the"])
              "breadcrumb prefix."])
-     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rsum)])
      (nrn "?"
        [(nw "v")
@@ -1342,9 +1325,8 @@
 ;; sit in one function without colliding.  Rows cannot go through
 ;; sg-enc-t: they need a loop, and the loop needs that fresh index.
 (define (sg-enc-row-loop ix outv src et)
-  [(nrn "|" [(nrn ">" [(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")
-                       (nrn ">" [(nfc outv (nspec "row" [(nw "json")]))
-                                 (nbrk [])])])])
+  [(nloop [[(nfc (strcat ["i" ix]) (nw "nat")) (nw "0")]
+           [(nfc outv (nspec "row" [(nw "json")])) (nbrk [])]])
    (nrn "?" [(npar [(nw "eq") (nw (strcat ["i" ix]))
                     (nrn "." (snoc (nw "len") src))])
              (nw outv)])
@@ -1445,7 +1427,7 @@
       ;; the only one that ever holds anything, so it says what it is
       (map (lambda (v)
              (nrn "+" [(nw v)
-                       (nrn ":" [(nfc (If (Eq v els) "s" "z") (nw "nat"))])]))
+                       (nrn ":" [(nfc (If (Eq v els) "s" "z") (nw (If (Eq v els) "str" "nat")))])]))
         vns))))
 
 (define (sg-enum-from-tree name vals)
@@ -1456,7 +1438,7 @@
      (nslug [(strcat ["Decode a " name "; an undeclared value rides in"])
              (strcat [els ", which encodes back to the same string.  A"])
              "non-string is still an error: the schema does say string."])
-     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rsum)])
      (nrn "?"
        [(nw "v")
@@ -1532,7 +1514,7 @@
   (nrn "?"
     [(npar [(nw (sg-ft-dval (Ix 1 a))) (nw "v") (nw "p")])
      (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                      (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                      (nfc "path" (nw "str")) (nfc "why" (nw "str"))])
                (nvap rsum "err" [(nw "path") (nw "why")])])
      (nrn ">" [(npar [(nrn "./" [(nw "ok")])
                       (nfc "av" (sg-ft-ty-t (Ix 1 a)))])
@@ -1550,7 +1532,7 @@
     [(nw (strcat [name "_from"]))
      (nslug [(strcat ["Decode a " name " by the json constructor it"])
              "arrived as; any other shape rides undecoded."])
-     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rsum)])
      (nrn "?"
        (Weld [(nw "v")]
@@ -1596,7 +1578,7 @@
     [(nw (strcat [name "_from"]))
      (nslug [(strcat ["Decode a " name " by its " tagf " tag; an"])
              "unrecognised tag rides undecoded."])
-     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "nat"))])
+     (nrn "\" [(nfc "v" (nw "json")) (nfc "p" (nw "str"))])
      (nrn "^" [(nw rsum)])
      (nrn "?"
        [(nw "v")
@@ -1640,9 +1622,9 @@
    (nrn "+"
      [(nw "jget")
       (nslug ["The value at key k, if present."])
-      (nrn "\" [(nfc "k" (nw "nat")) (nfc "kvs" (nspec "row" [(nw "jkv")]))])
+      (nrn "\" [(nfc "k" (nw "str")) (nfc "kvs" (nspec "row" [(nw "jkv")]))])
       (nrn "^" [(sg-maybe-t (nw "json"))])
-      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")])])
+      (nloop [[(nfc "i" (nw "nat")) (nw "0")]])
       (nrn "^" [(sg-maybe-t (nw "json"))])
       (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "kvs" "len")])
                 (nrelv "none")])
@@ -1653,20 +1635,16 @@
    (nrn "+"
      [(nw "jpath")
       (nslug ["Breadcrumb: p.f, or f at the root."])
-      (nrn "\" [(nfc "p" (nw "nat")) (nfc "f" (nw "nat"))])
-      (nrn "^" [(nw "nat")])
+      (nrn "\" [(nfc "p" (nw "str")) (nfc "f" (nw "str"))])
+      (nrn "^" [(nw "str")])
       (nrn "?" [(npar [(nw "eq") (nw "p") (nw "0")]) (nw "f")])
-      (npar [(nw "cat2") (npar [(nw "cat2") (nw "p") (nc ".")]) (nw "f")])])
+      (nstr-cat (nstr-cat (nw "p") (nc ".")) (nw "f"))])
    (nrn "+"
      [(nw "jidx")
       (nslug ["Breadcrumb: p[i]."])
-      (nrn "\" [(nfc "p" (nw "nat")) (nfc "i" (nw "nat"))])
-      (nrn "^" [(nw "nat")])
-      (npar [(nw "cat2")
-             (npar [(nw "cat2")
-                    (npar [(nw "cat2") (nw "p") (nc "[")])
-                    (npar [(nw "show_nat") (nw "i")])])
-             (nc "]")])])])
+      (nrn "\" [(nfc "p" (nw "str")) (nfc "i" (nw "nat"))])
+      (nrn "^" [(nw "str")])
+      (nstr-cat (nstr-cat (nstr-cat (nw "p") (nc "[")) (npar [(npth ["nat" "show"]) (nw "i")])) (nc "]"))])])
 
 (define (sg-td-trees seen td)
   (define kind (_0 td))
@@ -1725,6 +1703,23 @@
            [(sg-rec-from-tree name fields)
             (sg-rec-to-tree name fields)]))]))))
 
+;; parse_<t> for every distinct response type: JSON text -> <t>_r.
+(define (sg-resp-parser-tree tname)
+  (define rsum (strcat [tname "_r"]))
+  (nrn "+"
+    [(nw (strcat ["parse_" tname]))
+     (nslug [(strcat ["Decode a " tname " from JSON text."])])
+     (nrn "\" [(nfc "s" (nw "str"))])
+     (nrn "^" [(nw rsum)])
+     (nrn "?"
+       [(npar [(nw "parse") (nw "s")])
+        (nrn ">" [(npar [(nrn "./" [(nw "err")])
+                         (nfc "why" (nw "str")) (nfc "rest" (nw "nat"))])
+                  (nvap rsum "err" [(nc "") (nw "why")])])
+        (nrn ">" [(npar [(nrn "./" [(nw "ok")])
+                         (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
+                  (npar [(nw (strcat [tname "_from"])) (nw "v") (nc "")])])])]))
+
 (define (sg-root-trees root-name examples)
   (define rsum (strcat [root-name "_r"]))
   (define rt-lore
@@ -1735,40 +1730,33 @@
              (strcat ["?=  ((rt " (qq (dq-escape ex)) ") "
                       (qq (dq-escape ex)) ")"]))
         examples)))
-  [(nrn "+"
-     [(nw (strcat ["parse_" root-name]))
-      (nslug [(strcat ["Decode a " root-name " from JSON text."])])
-      (nrn "\" [(nfc "s" (nw "nat"))])
-      (nrn "^" [(nw rsum)])
-      (nrn "?"
-        [(npar [(nw "parse") (nw "s")])
-         (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                          (nfc "why" (nw "nat")) (nfc "rest" (nw "nat"))])
-                   (nvap rsum "err" [(nw "0") (nw "why")])])
-         (nrn ">" [(npar [(nrn "./" [(nw "ok")])
-                          (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
-                   (npar [(nw (strcat [root-name "_from"])) (nw "v") (nw "0")])])])])
+  [(sg-resp-parser-tree root-name)
    (nrn "+"
      [(nw (strcat ["show_" root-name]))
       (nslug [(strcat ["Encode a " root-name " compactly."])])
       (nrn "\" [(nfc "x" (nw root-name))])
-      (nrn "^" [(nw "nat")])
+      (nrn "^" [(nw "str")])
       (npar [(nw "show") (npar [(nw (strcat [root-name "_to"])) (nw "x")])])])
    (nrn "+"
      [(nw "rt")
       (nslug rt-lore)
-      (nrn "\" [(nfc "s" (nw "nat"))])
-      (nrn "^" [(nw "nat")])
+      (nrn "\" [(nfc "s" (nw "str"))])
+      (nrn "^" [(nw "str")])
       (nrn "?"
         [(npar [(nw (strcat ["parse_" root-name])) (nw "s")])
          (nrn ">"
            [(npar [(nrn "./" [(nw "err")])
-                   (nfc "path" (nw "nat")) (nfc "why" (nw "nat"))])
+                   (nfc "path" (nw "str")) (nfc "why" (nw "str"))])
             (nrn "?" [(npar [(nw "eq") (nw "path") (nw "0")]) (nw "why")])
-            (npar [(nw "cat2") (npar [(nw "cat2") (nw "path") (nc ":")])
-                   (nw "why")])])
+            (nstr-cat (nstr-cat (nw "path") (nc ":")) (nw "why"))])
          (nrn ">" [(npar [(nrn "./" [(nw "ok")]) (nfc "v" (nw root-name))])
                    (npar [(nw (strcat ["show_" root-name])) (nw "v")])])])])])
+
+(define (sg-typedef-trees tds)
+  (_1 (foldl (lambda (st td)
+                 (let ((r (sg-td-trees (_0 st) td)))
+                   [(_0 r) (Weld (_1 st) (_1 r))]))
+          [[] []] tds)))
 
 ;; -> [root-name tree]
 (define (sg-gen-tree show-fn sv)
@@ -1779,10 +1767,7 @@
   (define examples
     (Ifz exs-r [] (map show-fn (jv-xs! (_0 exs-r)))))
   (define td-trees
-    (_1 (foldl (lambda (st td)
-                 (let ((r (sg-td-trees (_0 st) td)))
-                   [(_0 r) (Weld (_1 st) (_1 r))]))
-          [[] []] tds)))
+    (sg-typedef-trees tds))
   [root-name
    (ngrp
      (Weld sg-prelude-trees
@@ -2098,7 +2083,7 @@
         (jv-xs! (_0 (jv-get "parameters" opv))))))
   (define (req-of p)
     (If (Nil (jv-get "required" p)) 0
-      (If (jv? "/boot/json/boo" (_0 (jv-get "required" p)))
+      (If (jv? "wire/json/boo" (_0 (jv-get "required" p)))
         (Ix 0 (_0 (jv-get "required" p))) 0)))
   ;; 3.x puts a parameter's type under `schema`; 2.0 inlines it.
   ;; An enum in a path or query parameter stays a STRING: on the wire
@@ -2142,6 +2127,23 @@
 ;; -> [name basepath [typedef ..] [op ..]]
 ;; opids = [] means every operation; otherwise the named ones only,
 ;; and the typedefs are cut down to their transitive closure.
+;; A lifted inline type is minted from the field POSITION that carries
+;; it, so ONE inline schema reached along two paths mints the same
+;; name twice — and a module cannot declare a name twice (the compiler
+;; rejects it as foil-env-duplicate-layer-path, which is how this was
+;; found: openrouter's chat_request lifts chat_request_reasoning_effort
+;; from two positions).  Identical twins collapse to one.  Two
+;; DIFFERENT shapes under one name is a real collision and fails
+;; loudly, exactly as sg-name-map does for schema names.
+(define (sg-dedupe-tds tds)
+  (foldl
+    (lambda (acc td)
+      (let ((hit (find (lambda (o) (Eq (Ix 1 td) (Ix 1 o))) acc)))
+        (Ifz hit (snoc td acc)
+          (If (Equal (_0 hit) td) acc
+            (sg-error "duplicate type name, different shape" (Ix 1 td))))))
+    [] tds))
+
 (define (sg-spec-parts sv opids)
   (define v3 (sg-v3? sv))
   (define name (sg-spec-title sv))
@@ -2170,35 +2172,19 @@
   (define nm-ok (sg-name-map wanted))
   (define tds
     (sg-topo
-      (foldl
-        (lambda (acc nm)
-          (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
-            (Ifz hit (sg-error "dangling-ref (no such schema)" nm)
-              (Weld acc (sg-typedefs-of env (sg-name nm) (Ix 1 (_0 hit)))))))
-        [] (Seq nm-ok wanted))))
+      (sg-dedupe-tds
+        (foldl
+          (lambda (acc nm)
+            (let ((hit (find (lambda (e) (Eq nm (Ix 0 e))) schemas)))
+              (Ifz hit (sg-error "dangling-ref (no such schema)" nm)
+                (Weld acc (sg-typedefs-of env (sg-name nm) (Ix 1 (_0 hit)))))))
+          [] (Seq nm-ok wanted)))))
   (define ops
     (map (lambda (e) (sg-op-of env sv v3 (Ix 0 e) (Ix 1 e) (Ix 2 e))) ents))
   [name base tds ops (sg-spec-auth sv) (sg-spec-url-prefix sv)])
 
 ;; Back-compat: the whole document, every operation.
 (define (sg-swagger-parts sv) (sg-spec-parts sv []))
-
-;; parse_<t> for every distinct response type: JSON text -> <t>_r.
-(define (sg-resp-parser-tree tname)
-  (define rsum (strcat [tname "_r"]))
-  (nrn "+"
-    [(nw (strcat ["parse_" tname]))
-     (nslug [(strcat ["Decode a " tname " from JSON text."])])
-     (nrn "\" [(nfc "s" (nw "nat"))])
-     (nrn "^" [(nw rsum)])
-     (nrn "?"
-       [(npar [(nw "parse") (nw "s")])
-        (nrn ">" [(npar [(nrn "./" [(nw "err")])
-                         (nfc "why" (nw "nat")) (nfc "rest" (nw "nat"))])
-                  (nvap rsum "err" [(nw "0") (nw "why")])])
-        (nrn ">" [(npar [(nrn "./" [(nw "ok")])
-                         (nfc "v" (nw "json")) (nfc "rest" (nw "nat"))])
-                  (npar [(nw (strcat [tname "_from"])) (nw "v") (nw "0")])])])]))
 
 ;; The swagger TYPES module: definitions + serde + per-response
 ;; parsers.  (The hand emit joins this tree; reference phase first.)
@@ -2208,10 +2194,7 @@
   (define ops (Ix 3 parts))
   (define resps (dedupe-eq (map (lambda (o) (Ix 6 o)) ops)))
   (define td-trees
-    (_1 (foldl (lambda (st td)
-                 (let ((r (sg-td-trees (_0 st) td)))
-                   [(_0 r) (Weld (_1 st) (_1 r))]))
-          [[] []] tds)))
+    (sg-typedef-trees tds))
   [name
    (ngrp
      (Weld sg-prelude-trees
@@ -2231,8 +2214,10 @@
   [(nrn "-" [(nw "sept") (nbrko "=" [(nw "order") (nw "10")])])
    (nrn "-" [(nw "json") (nbrko "=" [(nw "order") (nw "20")])])
    (nrn "-" [(nw "shrine_types") (nbrko "=" [(nw "order") (nw "30")])])
-   (nrn "-" [(nw "lain") (nbrko "=" [(nw "order") (nw "40")])])
-   (nrn "-" [(nw "web") (nbrko "=" [(nw "order") (nw "50")])])
+   (nrn "-" [(nw "lain_types") (nbrko "=" [(nw "order") (nw "38")])])
+   (nrn "-" [(nw "lain_peek") (nbrko "=" [(nw "order") (nw "39")])])
+   (nrn "-" [(nw "lain_poke") (nbrko "=" [(nw "order") (nw "40")])])
+   (nrn "-" [(nw "fetch") (nbrko "=" [(nw "order") (nw "51")])])
    (nrn "-" [(nw "bond") (nbrko "=" [(nw "order") (nw "60")])])
    (nrn "-" [(nw "pact") (nbrko "=" [(nw "order") (nw "70")])])])
 
@@ -2261,39 +2246,71 @@
 ;; row[[p=path q=writ]]
 (define ncards-ty
   (nspec "row" [(nbrk [(nfc "p" (nw "path")) (nfc "q" (nw "writ"))])]))
-;; the i/cards/out loop head (one-line > chain nests successively)
+;; the i/cards/out loop head
 (define nloop-head
-  (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
-                      (nrn ">" [(nfc "cards" ncards-ty) (nbrk [])
-                                (nrn ">" [(nfc "out" (nw "myth"))
-                                          (nw "cur")])])])]))
+  (nloop [[(nfc "i" (nw "nat")) (nw "0")]
+          [(nfc "cards" ncards-ty) (nbrk [])]
+          [(nfc "out" (nw "myth")) (nw "cur")]]))
+
+;; ($ts x) — an iota constructor application: a plain paren whose
+;; head is the $-rune variant nest with its single aura kid (oracle:
+;; ParseRexNormFile "($ts 7)" — the $ nest does NOT absorb into the
+;; paren, unlike nparp's single-rune-kid (a/b) shape).
+(define (niota aura kids)
+  (npar (cons (nrn "$" [(nw aura)]) kids)))
 
 (define sg-hand-fixed-trees-a
   [(nrn "+"
+     [(nw "seg_txt")
+      (nslug ["One path segment as text: text auras verbatim, the"
+              "rest as their decimal payload."])
+      (nrn "\" [(nfc "i" (nw "iota"))])
+      (nrn "^" [(nw "str")])
+      (nrn "?" [(npar [(nw "is_text") (nw "i")])
+                (nrn "^" [(nw "str") (npar [(nw "quip_val") (nw "i")])])])
+      (npar [(npth ["nat" "show"]) (nrn "^" [(nw "str") (npar [(nw "quip_val") (nw "i")])])])])
+   (nrn "+"
+     [(nw "flat_seg")
+      (nslug ["A path flattened to one _-joined text segment - the"
+              "fetch node's kid name, unique per hand instance, so"
+              "two hands' request kids never collide at /io."])
+      (nrn "\" [(nfc "p" (nw "path"))])
+      (nrn "^" [(nw "iota")])
+      (nloop [[(nfc "i" (nw "nat")) (nw "0")]
+              [(nfc "acc" (nw "str")) (nc "")]])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "p" "len")])
+                (niota "ts" [(nw "acc")])])
+      (nrn "?" [(npar [(nw "eq") (nw "i") (nw "0")])
+                (nself [(nw "1")
+                        (npar [(nw "seg_txt")
+                               (nmeth (nw "p") "at" [(nw "0")])])])])
+      (nself [(ndotw "i" "inc")
+              (nstr-cat (nstr-cat (nw "acc") (nc "_")) (npar [(nw "seg_txt")
+                            (nmeth (nw "p") "at" [(nw "i")])]))])])
+   (nrn "+"
      [(nw "base_of")
       (nslug ["The server base url from the root record's ['base]."])
       (nrn "\" [(nfc "cur" (nw "myth"))])
-      (nrn "^" [(nw "nat")])
+      (nrn "^" [(nw "str")])
       (nrn "?"
         [(nmget (nw "cur") (npl ["base"]))
          (nsome-arm "held" (nw "pail")
            [(nrn "?" [(nw "held")
                       (nrn ">" [(nfc "t" (npth ["pails" "t"]))
-                                (ndotw "t" "t")])
-                      (nw "0")])])
-         (nw "0")])])
+                                (nrn "^" [(nw "str") (ndotw "t" "t")])])
+                      (nc "")])])
+         (nc "")])])
    (nrn "+"
      [(nw "qjoin")
       (nslug ["The query string from k=v fragments, skipping the absent"
               "ones (0): ? before the first that is set, & between the"
               "rest.  Empty when nothing is set.  Values are spliced"
               "verbatim — percent-encoding is not done yet."])
-      (nrn "\" [(nfc "ps" (nspec "row" [(nw "nat")]))])
-      (nrn "^" [(nw "nat")])
-      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
-                          (nrn ">" [(nfc "out" (nw "nat")) (nw "0")
-                                    (nrn ">" [(nfc "some" (nw "bool"))
-                                              (nrelv "false")])])])])
+      (nrn "\" [(nfc "ps" (nspec "row" [(nw "str")]))])
+      (nrn "^" [(nw "str")])
+      (nloop [[(nfc "i" (nw "nat")) (nw "0")]
+              [(nfc "out" (nw "str")) (nc "")]
+              [(nfc "some" (nw "bool")) (nrelv "false")]])
       (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "ps" "len")])
                 (nw "out")])
       (nrn "=" [(nw "p") (nmeth (nw "ps") "at" [(nw "i")])])
@@ -2301,28 +2318,26 @@
                 (nself [(ndotw "i" "inc") (nw "out") (nw "some")])])
       (nrn "?" [(nw "some")
                 (nself [(ndotw "i" "inc")
-                        (npar [(nw "cat2")
-                               (npar [(nw "cat2") (nw "out") (nc "&")])
-                               (nw "p")])
+                        (nstr-cat (nstr-cat (nw "out") (nc "&")) (nw "p"))
                         (nrelv "true")])])
       (nself [(ndotw "i" "inc")
-              (npar [(nw "cat2") (nc "?") (nw "p")])
+              (nstr-cat (nc "?") (nw "p"))
               (nrelv "true")])])
    (nrn "+"
      [(nw "auth_of")
-      (nslug ["The credential from the root record's ['auth], or 0 when"
+      (nslug ["The credential from the root record's ['auth], or empty when"
               "none was injected — an unauthenticated call is a real"
               "case, so a missing credential is not an error here."])
       (nrn "\" [(nfc "cur" (nw "myth"))])
-      (nrn "^" [(nw "nat")])
+      (nrn "^" [(nw "str")])
       (nrn "?"
         [(nmget (nw "cur") (npl ["auth"]))
          (nsome-arm "held" (nw "pail")
            [(nrn "?" [(nw "held")
                       (nrn ">" [(nfc "t" (npth ["pails" "t"]))
-                                (ndotw "t" "t")])
-                      (nw "0")])])
-         (nw "0")])])
+                                (nrn "^" [(nw "str") (ndotw "t" "t")])])
+                      (nc "")])])
+         (nc "")])])
    (nrn "+"
      [(nw "crew_of_rec")
       (nslug ["The crew mop in a record's /sys/crew, or empty."])
@@ -2364,9 +2379,8 @@
       (nrn "="
         [(nw "c2")
          (ngrp
-           [(nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")
-                                (nrn ">" [(nfc "acc" (nw "crew"))
-                                          (npar [(npth ["mop" "empty"])])])])])
+           [(nloop [[(nfc "i" (nw "nat")) (nw "0")]
+                    [(nfc "acc" (nw "crew")) (npar [(npth ["mop" "empty"])])]])
             (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "es" "len")])
                       (nw "acc")])
             (nrn "=" [(nw "h") (nmeth (nw "es") "at" [(nw "i")])])
@@ -2384,7 +2398,7 @@
       (nrn "^" [(nspec "maybe" [(nw "path")])])
       (nrn "=" [(nw "es")
                 (ndot (npar [(nw "crew_of_rec") (nw "cur")]) (nw "tap"))])
-      (nrn "|" [(nrn ">" [(nfc "i" (nw "nat")) (nw "0")])])
+      (nloop [[(nfc "i" (nw "nat")) (nw "0")]])
       (nrn "^" [(nspec "maybe" [(nw "path")])])
       (nrn "?" [(npar [(nw "eq") (nw "i") (ndotw "es" "len")])
                 (nrelv "none")])
@@ -2442,7 +2456,12 @@
                               (nsome-arm
                                 "hp"
                                 (nw "path")
-                                [(nrn "=" [(nw "dst") (nmeth (nw "hp") "weld" [(nw "gp")])])
+                                [(nrn "="
+                                   [(nw "dst")
+                                    (nmeth (nw "hp") "snoc"
+                                      [(npar [(nw "flat_seg")
+                                              (nmeth (ndotw "b" "here") "weld"
+                                                [(nw "gp")])])])])
                                   (nself
                                     [(nw "next")
                                       (nmeth
@@ -2516,7 +2535,7 @@
                                   [(nw "okf")
                                     (npar [(nw "res_body_nat") (nw "fm") (npl ["res_ok"])])
                                     (njx
-                                      [(nw "body") (npar [(nw "res_body_nat") (nw "fm") (npl ["res_body"])])])])
+                                      [(nw "body") (nrn "^" [(nw "str") (npar [(nw "res_body_nat") (nw "fm") (npl ["res_body"])])])])])
                                 (nrn "?"
                                   [(nmget (ndotw "b" "kids") (nw "k"))
                                     (nnone-arm nskip)
@@ -2531,11 +2550,9 @@
                                               (nw "pail")
                                               [(nrn "="
                                                   [(nw "ecode")
-                                                    (npar
-                                                      [(nw "cat2")
-                                                        (nc "fetch-err-")
-                                                        (npar
-                                                          [(nw "show_nat") (npar [(nw "res_body_nat") (nw "fm") (npl ["res_err"])])])])])
+                                                    (nstr-cat (nc "fetch-err-")
+                                                      (npar
+                                                        [(npth ["nat" "show"]) (npar [(nw "res_body_nat") (nw "fm") (npl ["res_err"])])]))])
                                                 (nrn "="
                                                   [(nw "resp")
                                                     (npar [(nw "resp_for") (nw "held") (nw "okf") (nw "body") (nw "ecode")])])
@@ -2546,7 +2563,16 @@
                                                       (nw "cards")
                                                       "snoc"
                                                       [(nbrk
-                                                          [(nw "k")
+                                                          ;; b.here.weld(k), NOT k: `k` is the
+                                                          ;; crew SLOT name, which is the request
+                                                          ;; kid's key relative to this node.  A
+                                                          ;; card path is absolute, so a bare `k`
+                                                          ;; addressed a top-level /<kid> — outside
+                                                          ;; the app's subtree, hence a move, and
+                                                          ;; helm/moves applies only /io moves, so
+                                                          ;; every answer was dropped in silence.
+                                                          [(nmeth (ndotw "b" "here") "weld"
+                                                             [(nw "k")])
                                                             (npar
                                                               [(npth ["writ" "poke"])
                                                                 (npar
@@ -2577,7 +2603,7 @@
   (define qparams (Ix 4 op))
   (define (conv ft x)
     (cond
-      ((Eq "int" (_0 ft)) (npar [(nw "show_nat") x]))
+      ((Eq "int" (_0 ft)) (npar [(npth ["nat" "show"]) x]))
       ((Eq "str" (_0 ft)) x)
       ;; a number is already carried as its decimal text
       ((Eq "num" (_0 ft)) x)
@@ -2610,8 +2636,8 @@
     (foldl
       (lambda (acc pc)
         (If (IsApp pc)
-          (npar [(nw "cat2") acc (conv (pft (Ix 1 pc)) (nw (Ix 1 pc)))])
-          (npar [(nw "cat2") acc (nc pc)])))
+          (nstr-cat acc (conv (pft (Ix 1 pc)) (nw (Ix 1 pc))))
+          (nstr-cat acc (nc pc))))
       (nw "u0")
       pieces))
   (define params
@@ -2629,27 +2655,26 @@
   (define (qfrag qp)
     (define qn (Ix 0 qp))
     (define pref (nc (strcat [qn "="])))
-    (define (kv x) (npar [(nw "cat2") pref (conv (Ix 1 qp) x)]))
+    (define (kv x) (nstr-cat pref (conv (Ix 1 qp) x)))
     (nrn "="
-      [(nw (strcat ["q_" qn]))
+      [(nfc (strcat ["q_" qn]) (nw "str"))
        (If (Ix 2 qp)
          (kv (nw qn))
          (nrn "?" [(nw qn)
-                   (nnone-arm (nw "0"))
+                   (nnone-arm (nc ""))
                    (nsome-arm "qv" 0 [(kv (nw "qv"))])]))]))
   (define qtail
     (Ifz (Sz qparams) [(nw "u1")]
       (Weld (map qfrag qparams)
-        [(npar [(nw "cat2") (nw "u1")
-                (npar [(nw "qjoin")
+        [(nstr-cat (nw "u1") (npar [(nw "qjoin")
                        (nbrk (map (lambda (qp)
                                     (nw (strcat ["q_" (Ix 0 qp)])))
-                               qparams))])])])))
+                               qparams))]))])))
   (nrn "+"
     (Weld
       [(nw (strcat ["url_" opid]))
-       (nrn "\" (Weld [(nfc "u0" (nw "nat"))] params))
-       (nrn "^" [(nw "nat")])
+       (nrn "\" (Weld [(nfc "u0" (nw "str"))] params))
+       (nrn "^" [(nw "str")])
        (nrn "=" [(nw "u1") url-expr])]
       qtail)))
 
@@ -2685,7 +2710,7 @@
       (nmeth req "put"
         [(npl ["hdr" (_0 auth)])
          (npar [(nw "pd")
-                (npar [(nw "cat2") (nc (Ix 1 auth)) (nw "auth")])])])))
+                (nstr-cat (nc (Ix 1 auth)) (nw "auth"))])])))
   (define (arm i op)
     (define opid (Ix 0 op))
     (define b (nw (strcat ["g" (nat-str i)])))
@@ -2718,7 +2743,7 @@
       [(nw "fetch_for")
        (nslug ["The driver request myth for one req variant, or empty"
                "row when the pail is not a request."])
-       (nrn "\" [(nfc "base" (nw "nat")) (nfc "auth" (nw "nat"))
+       (nrn "\" [(nfc "base" (nw "str")) (nfc "auth" (nw "str"))
                  (nfc "held" (nw "pail"))])
        (nrn "^" [(nspec "row" [(nw "myth")])])]
       (Weld [(nrn "?" (Weld [(nw "held")]
@@ -2752,7 +2777,7 @@
        (nslug ["The bond/res pail for one completed fetch: parse per the"
                "originating operation, or the op's error record."])
        (nrn "\" [(nfc "held" (nw "pail")) (nfc "okf" (nw "nat"))
-                 (nfc "body" (nw "nat")) (nfc "ecode" (nw "nat"))])
+                 (nfc "body" (nw "str")) (nfc "ecode" (nw "str"))])
        (nrn "^" [(nspec "row" [(nw "pail")])])]
       [(nrn "?" (Weld [(nw "held")]
                   (Weld (map (lambda (i) (arm i (Ix i ops)))
@@ -2786,18 +2811,16 @@
 
 ;;; Public API ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-;; Parse a schema document with json.foil's parse (jsut: a compiled
-;; json subject).
-(define (sg-schema-value jsut txt)
-  (define r ((foil:source-entry-val ["parse"] jsut) txt))
-  (If (Eq "/boot/jres/ok" (Hd r))
-    (Ix 0 r)
-    (sg-error "schema-json" (Ix 0 r))))
+;; Parse a schema document with json.foil's parse (jperc: a compiled
+;; json Perc).
+(define (sg-schema-value jperc txt)
+  (wire:schema-value (wire:codec jperc)
+    ((driver:get-perc ["parse"] jperc) txt)))
 
 ;; Generate the module tree for a schema document.  -> [name tree]
-(define (gen-tree jsut schema-txt)
-  (sg-gen-tree (foil:source-entry-val ["show"] jsut)
-    (sg-schema-value jsut schema-txt)))
+(define (gen-tree jperc schema-txt)
+  (sg-gen-tree wire:jshow
+    (sg-schema-value jperc schema-txt)))
 
 ;;; Spec inspection ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -2852,36 +2875,45 @@
   (define bad (filter (lambda (x) (Ifz (Nil x) 1 0)) rs))
   [(Sub (Sz names) (Sz bad)) (Sz names) bad])
 
-;; Generate AND compile.  -> [name tree subject]
-(define (compile-schema sut jsut schema-txt)
-  (define g (gen-tree jsut schema-txt))
-  [(_0 g) (_1 g)
-   (foil:compile-rex sut (_0 g) (_1 g))])
+;; Generate AND compile.  -> [cache' [name tree Perc]].
+;; Independent schemas start from an imports-only cache: generated names
+;; can collide.
+(define (compile-schema-cached context cache jperc schema-txt)
+  (define g (gen-tree jperc schema-txt))
+  (define c (source:compile-rex context cache (_0 g) (_1 g)))
+  [(_0 c) [(_0 g) (_1 g) (_1 c)]])
+
+(define (compile-schema context jperc schema-txt)
+  (_1 (compile-schema-cached context driver:empty-foil-cache jperc schema-txt)))
 
 ;; Swagger: generate the TYPES module tree.  -> [name basepath ops tree]
 ;; opids = [] for the whole document, or the operations wanted — a real
 ;; spec is far larger than any one client needs, and module load forces
 ;; every top-level, so naming the operations is the normal case.
-(define (gen-swagger-types jsut swagger-txt opids)
-  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
+(define (gen-swagger-types jperc swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jperc swagger-txt) opids))
   (define nt (sg-swagger-types-tree parts))
   [(_0 nt) (Ix 1 parts) (Ix 3 parts) (_1 nt)])
 
 ;; Swagger: generate the HAND module tree (imports the types module by
 ;; name).  -> [hand-name tree]
-(define (gen-swagger-hand jsut swagger-txt opids)
+(define (gen-swagger-hand jperc swagger-txt opids)
   (sg-swagger-hand-tree
-    (sg-spec-parts (sg-schema-value jsut swagger-txt) opids)))
+    (sg-spec-parts (sg-schema-value jperc swagger-txt) opids)))
 
 ;; Generate AND compile both modules: the types module first, then the
 ;; hand against a cache holding it (a tree-fed module has no file, so
 ;; the hand's by-name import must resolve from the cache).
-;; -> [types-name hand-name subject]
-(define (compile-swagger-hand sut jsut swagger-txt opids)
-  (define parts (sg-spec-parts (sg-schema-value jsut swagger-txt) opids))
+;; -> [cache' [types-name hand-name Perc]]
+(define (compile-swagger-hand-cached context cache jperc swagger-txt opids)
+  (define parts (sg-spec-parts (sg-schema-value jperc swagger-txt) opids))
   (define tname (_0 parts))
   (define tnt (sg-swagger-types-tree parts))
-  (define c1 (foil:compile-rex-cached 0 sut tname (_1 tnt)))
+  (define c1 (source:compile-rex context cache tname (_1 tnt)))
   (define hnt (sg-swagger-hand-tree parts))
-  (define c2 (foil:compile-rex-cached (_0 c1) sut (_0 hnt) (_1 hnt)))
-  [tname (_0 hnt) (_1 c2)])
+  (define c2 (source:compile-rex context (_0 c1) (_0 hnt) (_1 hnt)))
+  [(_0 c2) [tname (_0 hnt) (_1 c2)]])
+
+(define (compile-swagger-hand context jperc swagger-txt opids)
+  (_1 (compile-swagger-hand-cached context driver:empty-foil-cache
+    jperc swagger-txt opids)))

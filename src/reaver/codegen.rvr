@@ -8,11 +8,36 @@
 (define (K v) ["K_" v]) ;; constant
 (define (G v) ["G_" v]) ;; name
 (define (A f x) ["A_" f x]) ;; app
-(define (L v b) ["L_" v b]) ;; let
+;; AST version 2: lets carry an explicit, ordered demand bit.
+(define ir-version 2)
+(define (L now v b)
+  (If (Or (Eq now 0) (Eq now 1)) ["L_" now v b]
+    (error ["strict-let: expected boolean" now])))
 (define (R vs b) ["R_" vs b]) ;; letrec
 (define (M s) ["M_" s]) ;; mark
 ;; function
 (define (F pin mark rec name arity body) ["F_" pin mark rec name arity body])
+
+
+;; Raise free de Bruijn indices, respecting each constructor's scope.
+;; F prepends self plus its parameters; M wraps an expression, not metadata.
+(define (shift delta cutoff e)
+  (define tag (_0 e))
+  (define (same x) (shift delta cutoff x))
+  (cond
+    ((Eq tag "V_") (V (If (Ge (_1 e) cutoff) (Add delta (_1 e)) (_1 e))))
+    ((Or (Eq tag "K_") (Eq tag "G_")) e)
+    ((Eq tag "A_") (A (same (_1 e)) (same (_2 e))))
+    ((Eq tag "L_") (L (_1 e) (same (_2 e)) (shift delta (Inc cutoff) (_3 e))))
+    ((Eq tag "R_")
+      (let ((inside (Add cutoff (Sz (_1 e)))))
+        (R (map (shift delta inside) (_1 e)) (shift delta inside (_2 e)))))
+    ((Eq tag "M_") (M (same (_1 e))))
+    ((Eq tag "F_") (Up 6 (shift delta (Add cutoff (Inc (_5 e))) (_6 e)) e))
+    (else (error ["shift: invalid codegen AST" e]))))
+
+;; e and body share the incoming scope; the administrative binder is unused.
+(define (before e body) (L 1 e (shift 1 0 body)))
 
 (define f-pinned (Ix 1)) (define set-f-pinned (Up 1))
 (define f-marked (Ix 2)) (define set-f-marked (Up 2))
@@ -340,7 +365,11 @@ assert(Equal "end" (ctdn-law 3))
 
 
 
-(define (ingest-let ingest compile s env0 l[_ v b])
+(define (ingest-let ingest compile s env0 l)
+  (define valid (And (Eq 4 (Sz l)) (Or (Eq 0 (_1 l)) (Eq 1 (_1 l)))))
+  (define now (If valid (_1 l) (error ["obsolete or invalid let AST; recompile cache" l])))
+  (define v (_2 l))
+  (define b (_3 l))
   (define ilet[env1 vr] (ingest compile s v env0))
   (define nex1 (Sz env1))
   (define is-app (Eq "APP" (_0 vr)))
@@ -349,7 +378,8 @@ assert(Equal "end" (ctdn-law 3))
   ;; apply the bind value to the env, mangling the binds row whenever a
   ;; let bound an application (every lowered match scrutinee).
   (define env2 (If is-app (snoc vr env1) env1))
-  (ingest compile s2 b env2))
+  (define body[env3 result] (ingest compile s2 b env2))
+  [env3 (If now (APP (APP (VAL Seq) (lix-error "strict-let" 0 s2)) result) result)])
 
 (define (ingest-letrec-step ingest compile s env0 pair[vx k])
   (define one[env1 vr] (ingest compile s vx env0))
@@ -401,7 +431,9 @@ assert(Equal "end" (ctdn-law 3))
     ((hed-eq "A_") ingest-apply)
     ((hed-eq "L_") ingest-let)
     ((hed-eq "R_") ingest-letrec)
-    ((hed-eq "F_") ingest-lambda)) ingest compile scope env ir))
+    ((hed-eq "F_") ingest-lambda)
+    (else (error ["invalid codegen AST (residual annotation or unknown node)" ir])))
+    ingest compile scope env ir))
 
 
 
@@ -432,6 +464,9 @@ assert(Equal "end" (ctdn-law 3))
         (fold-app (A f (_0 xs)) (drop 1 xs))))
 
 (#export
+ ir-version
+ shift
+ before
  V
  K
  G

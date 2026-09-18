@@ -1,0 +1,194 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Checked action synthesis against the real progression prefix.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (path xs) (map (lambda (x) ("ts" x)) xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result)
+    (error ["action-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define progression (parse (read-text-file "grove/fixtures/progression.grove")))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "progression"]))) ((helper "first") 6 progression))))
+  assert(Gt (Sz records) 6)
+  (define stored (grove_fixture:lookup local records))
+  (define values (ok (compile stored ["test" "grades"]
+    "#import adjustment=gov/progression/adjustment
+
+values =
+  ! foil
+  + reset
+    ^ pail
+    | adjustment/write .reset
+  + small
+    ^ pail
+    | adjustment/write .small
+  + medium
+    ^ pail
+    | adjustment/write .medium
+  + large
+    ^ pail
+    | adjustment/write .large
+")))
+  (define adjustment (grove_fixture:record local values (path ["test" "grades" "values"])))
+  (define action (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "advance"]))))
+  (define (export rec key) ((helper "export") (path [key]) rec))
+  assert(Equal (map (lambda (p) (grove_fixture:qualified (path p))) [["gov" "progression" "positioned"]
+    ["gov" "progression" "adjustment"] ["sys" "now"]])
+    ((helper "action_summary") action))
+  (define apply (export action "apply"))
+  (define base ((helper "role_data") 7
+    ((helper "recall_data") 100 8)))
+  (define (args name)
+    ((helper "action_args") (export adjustment name) 200))
+  (define (expect name stride)
+    (define result (apply (args name) base))
+    (define expected ((helper "role_data") 7
+      ((helper "recall_data") (Add 200 stride) stride)))
+    (If (Equal ((abi:option policy "some") expected) result) 0
+      (error ["outcome" name (export adjustment name) result expected]))
+    1)
+  assert(Eq 1 (expect "reset" 1))
+  assert(Eq 1 (expect "small" 10))
+  assert(Eq 1 (expect "medium" 16))
+  assert(Eq 1 (expect "large" 24))
+  (define medium (args "medium"))
+  assert(Equal (abi:option policy "none")
+    (apply medium (abi:constructor policy ["mop" "empty"])))
+  (define (bad mode)
+    assert(Equal (abi:option policy "none")
+      (apply ((helper "invalid_args") mode medium) base))
+    1)
+  assert(Equal [1 1 1 1] (map bad [0 1 2 3]))
+  ;; Import the stored action without its source or original cache.
+  (define fresh (backend:prepare code))
+  (define forwarded (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "forward"]))) (parse "#import action=gov/progression/advance
+
+forward =
+  ! foil
+  + apply action/apply
+"))))
+  assert(Equal (apply medium base)
+    ((export (grove_fixture:record local forwarded (grove_fixture:qualified (path ["gov" "forward" "forward"]))) "apply") medium base))
+
+  ;; Imported receivers and zero-argument actions still validate output.
+  (define clear (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "clear"]))) (parse "#import role=gov/progression/entry
+
+clear =
+  @action
+  #on ; %/role
+  ! foil
+  \ value=role
+  ^ role
+  value.set_req(.none).set_about(.none)
+"))))
+  assert(Equal [(grove_fixture:qualified (path ["gov" "progression" "entry"]))]
+    ((helper "action_summary") (grove_fixture:record local clear (grove_fixture:qualified (path ["gov" "clear" "clear"])))))
+  assert(Equal (abi:option policy "none")
+    ((export (grove_fixture:record local clear (grove_fixture:qualified (path ["gov" "clear" "clear"]))) "apply") medium
+      ((helper "req_data") base)))
+
+  (define (reject text)
+    (define result (backend:compile prepared grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "bad"]))) (parse text)))
+    assert(Equal "err" (Hd result))
+    assert(Gt (_0 (_0 (_0 result))) 0)
+    1)
+  assert(Eq 1 (reject "bad =
+  @action
+"))
+  assert(Eq 1 (reject "bad =
+  @action
+  #on ; unknown
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  #on ; role
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  #opt ;
+    x: role
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  x: role
+  x: role
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  ! foil
+  \ value=role
+  ^ nat
+  0
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  x: role
+  ! foil
+  \ x=nat value=role
+  ^ role
+  value
+"))
+  assert(Eq 1 (reject "#import adjustment=gov/progression/adjustment
+
+bad =
+  @action
+  #on ; adjustment
+"))
+  assert(Eq 1 (reject "#import role=gov/progression/positioned
+
+bad =
+  @action
+  #on ; role
+  #meta ;
+    /0x11/lib/publisher_vocabulary/publisher_vocabulary/grove/action: (pails/n 1)
+  ! foil
+  \ value=role
+  ^ role
+  value
+"))
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

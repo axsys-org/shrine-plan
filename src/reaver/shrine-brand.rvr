@@ -1,0 +1,114 @@
+;;;; Exact nominal identity, independent of compiler and storage layouts.
+;;;; Wire: SHRINE-BRAND, version byte, segment count, (aura,value)*, case.
+;;;; Counts use u64be; atoms use a u64be byte count and minimal big-endian
+;;;; bytes. The entire byte sequence is a big-endian PLAN Nat.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+
+(define domain "SHRINE-BRAND")
+(define auras ["dm" "dr" "ds" "f" "r" "rd" "rs" "s"
+              "ta" "ts" "tu" "u" "w" "x"])
+(define (bytes-be value count)
+  (gen count (lambda (i)
+    (Mod (Rsh value (Mul 8 (Sub (Dec count) i))) 256))))
+(define (from-bytes bytes)
+  (foldl (lambda (n b) (Add (Mul n 256) b)) 0 bytes))
+(define (u64 value)
+  (If (Lt value (Lsh 1 64)) (bytes-be value 8)
+    (error "brand-length-overflow")))
+(define (atom value)
+  (If (IsNat value)
+    (Weld (u64 (Bytes value)) (bytes-be value (Bytes value)))
+    (error "brand-non-atomic-segment")))
+(define (segment? value)
+  (And (IsApp value) (And (Eq 0 (Hd value))
+    (And (Eq 2 (Sz value))
+      (And (includes (Eq (_0 value)) auras) (IsNat (_1 value)))))))
+(define (path? path)
+  (And (IsApp path) (And (Eq 0 (Hd path))
+    (And (Gt (Sz path) 0)
+      (And (all segment? path)
+        (Or (Equal (_0 path) ["ts" "sys"])
+          (And (Eq "x" (_0 (_0 path))) (Gt (_1 (_0 path)) 0))))))))
+(define (encode path version)
+  (define prefix
+    (Weld (gen (Bytes domain) (lambda (i) (Load8 i domain))) [1]))
+  (If (Nil (path? path)) (error "brand-invalid-path")
+    (If (Nil (And (IsNat version) (Gt version 0)))
+      (error "brand-invalid-case")
+  (from-bytes
+    (Weld (foldl (lambda (out segment)
+                    (Weld out (Weld (atom (_0 segment))
+                                   (atom (_1 segment)))))
+                 (Weld prefix (u64 (Sz path))) path)
+          (atom version))))))
+
+;; Decoders return [] or [value,next-offset]. Never index before bounds.
+(define (read-count bytes offset)
+  (If (Gt (Add offset 8) (Sz bytes)) []
+    [(from-bytes (take 8 (drop offset bytes))) (Add offset 8)]))
+(define (read-atom bytes offset)
+  (define count (read-count bytes offset))
+  (Ifz (Sz count) []
+    (let ((size (_0 count)) (start (_1 count)))
+      (If (Gt size (Sub (Sz bytes) start)) []
+        (If (And size (Eq 0 (Ix start bytes))) []
+          [(from-bytes (take size (drop start bytes)))
+           (Add start size)])))))
+(define frame-prefix
+  (Weld (gen (Bytes domain) (lambda (i) (Load8 i domain))) [1]))
+(define prefix-nat (from-bytes frame-prefix))
+(define (framed? value)
+  (And (IsNat value)
+    (And (Ge (Bytes value) (Sz frame-prefix))
+      (Eq prefix-nat
+        (Rsh value (Mul 8 (Sub (Bytes value) (Sz frame-prefix))))))))
+(define (decode value)
+  (If (Nil (framed? value)) []
+    (let* ((bytes (bytes-be value (Bytes value)))
+           (prefix (Weld (gen (Bytes domain)
+                      (lambda (i) (Load8 i domain))) [1])))
+      (If (Nil (Equal prefix (take (Sz prefix) bytes))) []
+        (let ((count (read-count bytes (Sz prefix))))
+          (Ifz (Sz count) []
+            ;; Each segment needs at least two eight-byte length words.
+            (If (Gt (_0 count) (Div (Sub (Sz bytes) (_1 count)) 16)) []
+              (letrec ((go (lambda (left offset path)
+                (Ifz left
+                  (let ((version (read-atom bytes offset)))
+                    (If (And (Sz version)
+                          (And (Gt (_0 version) 0)
+                            (And (Eq (_1 version) (Sz bytes)) (path? path))))
+                      [[path (_0 version)]] []))
+                  (let ((aura (read-atom bytes offset)))
+                    (Ifz (Sz aura) []
+                      (let ((payload (read-atom bytes (_1 aura))))
+                        (Ifz (Sz payload) []
+                          (go (Dec left) (_1 payload)
+                            (snoc [(_0 aura) (_0 payload)] path))))))))))
+                (go (_0 count) (_1 count) [])))))))))
+(define (brand? value) (Truth (Sz (decode value))))
+(define (value-brand value)
+  (define head (If (IsApp value) (Hd value) value))
+  (If (brand? head) head 0))
+(define (member-name value)
+  (define decoded (decode value))
+  (If (Sz decoded) (_1 (Last (_0 (_0 decoded))))
+    (error "not-a-definition-brand")))
+
+(define (encode-path path version)
+  (define (segment value)
+    (If (And (IsApp value) (Eq 1 (Sz value)))
+      [(Hd value) (_0 value)]
+      (error "brand-invalid-path-segment")))
+  (encode (map segment path) version))
+(define (decode-path value)
+  (define decoded (decode value))
+  (Ifz (Sz decoded) []
+    (let ((moment (_0 decoded)))
+      [[(map (lambda (segment) ((_0 segment) (_1 segment))) (_0 moment))
+         (_1 moment)]])))
+
+(#export encode decode brand? member-name encode-path decode-path value-brand)

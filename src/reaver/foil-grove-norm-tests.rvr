@@ -1,0 +1,168 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Closed occupied paths with inherited and inline record constraints.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (path xs) (map (lambda (x) ("ts" x)) xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result)
+    (error ["norm-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing key) (grove_fixture:lookup local [] key))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define progression (parse (read-text-file "grove/fixtures/progression.grove")))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "progression"]))) ((helper "first") 8 progression))))
+  assert(Gt (Sz records) 8)
+  (define ids (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "by_name"]))))
+  (define list (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "by_index"]))))
+  (define (export rec key) ((helper "export") (path [key]) rec))
+  assert(Equal ["ts"] ((helper "norm_summary") ids))
+  assert(Equal ["u"] ((helper "norm_summary") list))
+  assert(Equal 1 ((helper "norm_spec_at") (path ["alpha"]) ids))
+  assert(Equal 0 ((helper "norm_spec_at") [] ids))
+  assert(Equal 0 ((helper "norm_spec_at") (path ["alpha" "x"]) ids))
+  (define entry ((helper "role_data") 7
+    ((helper "req_data") ((helper "recall_data") 100 8))))
+  (define (tree mode) ((helper "norm_tree") mode entry))
+  (define (accept rec tree)
+    assert(Equal ((abi:option policy "some") tree)
+      ((export rec "check") tree))
+    assert(Equal (abi:option policy "none") ((export rec "validate") tree))
+    1)
+  (define (reject-tree rec tree)
+    assert(Equal (abi:option policy "none") ((export rec "check") tree))
+    assert(Equal (abi:option policy "some")
+      (Hd ((export rec "validate") tree)))
+    1)
+  assert(Eq 1 (accept ids (tree 0)))
+  assert(Eq 1 (accept ids (tree 1)))
+  assert(Eq 1 (reject-tree ids (tree 2)))
+  assert(Eq 1 (reject-tree ids (tree 3)))
+  assert(Eq 1 (reject-tree ids (tree 4)))
+  assert(Eq 1 (accept ids (tree 5)))
+  assert(Eq 1 (reject-tree ids
+    ((helper "norm_tree") 1 (abi:constructor policy ["mop" "empty"]))))
+  assert(Eq 1 (reject-tree ids
+    ((helper "norm_tree") 1 ((helper "role_data") 3 entry))))
+  assert(Eq 1 (accept list (tree 0)))
+  assert(Eq 1 (reject-tree list (tree 2)))
+  assert(Eq 1 (reject-tree list (tree 5)))
+  assert(Eq 1 (accept list (tree 6)))
+  assert(Eq 1 (reject-tree list (tree 7)))
+  assert(Equal ((abi:option policy "some") [])
+    ((export ids "validate") (tree 3)))
+
+  ;; Fresh compiler restores both the norm and its receiver codecs.
+  (define fresh (backend:prepare code))
+  (define stored (grove_fixture:lookup local records))
+  (define imported (ok (backend:compile fresh grove_fixture:previous stored (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "nested"]))) (parse (strcat ["#import role=gov/progression/entry
+#import norm=gov/progression/by_name
+
+nested =
+  @norm
+  #here ; '/entries/[id=@ts]
+  #with ; role
+
+forward =
+  ! foil
+  + check norm/check
+  + validate norm/validate
+
+root =
+  @norm
+  #here ; " 34 "/" 34 "
+  #with ; role
+
+literal =
+  @norm
+  #here ; '/0
+  #with ; role
+
+captures =
+  @norm
+  #here ; '/[first=@ts]/[second=@ts]
+  #with ; role
+"])))))
+  (define nested (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "nested"]))))
+  assert(Equal ["/entries" "ts"] ((helper "norm_summary") nested))
+  assert(Eq 1 (accept nested (tree 8)))
+  assert(Eq 1 (accept nested (tree 9)))
+  assert(Eq 1 (reject-tree nested (tree 10)))
+  assert(Eq 1 (reject-tree nested (tree 11)))
+  assert(Eq 1 (accept (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "forward"]))) (tree 1)))
+  assert(Eq 1 (accept (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "root"]))) (tree 3)))
+  assert(Eq 1 (reject-tree (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "root"]))) (tree 1)))
+  assert(Eq 1 (accept (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "literal"]))) (tree 2)))
+  assert(Eq 1 (reject-tree (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "literal"]))) (tree 1)))
+  assert(Eq 1 (accept (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "captures"]))) (tree 8)))
+  assert(Eq 1 (reject-tree (grove_fixture:record local imported (grove_fixture:qualified (path ["gov" "nested" "captures"]))) (tree 1)))
+
+  (define (reject text)
+    (define result (compile stored ["gov" "bad"] text))
+    (If (Eq "err" (Hd result)) 0
+      (error ["norm-expected-rejection" text (Hd result)]))
+    assert(Gt (_0 (_0 (_0 result))) 0)
+    1)
+  assert(Eq 1 (reject "bad =
+  @norm
+"))
+  assert(Eq 1 (reject "bad =
+  @norm
+  #here ; '/[x=@u]
+  #here ; '/[y=@u]
+"))
+  (define (bad-pattern pattern)
+    (reject (strcat ["bad =" 10 "  @norm" 10
+      "  #here ; " pattern 10])))
+  assert(Equal [1 1 1 1 1 1]
+    (map bad-pattern ["'/[x=@wat]" "'/[x=u]" "'/[x=@u]/[x=@u]"
+      "'/a//b" "'/[x=@u" "unquoted"]))
+  assert(Eq 1 (reject "bad =
+  @norm
+  #here ; '/[x=@u]
+  #with ; missing
+"))
+  assert(Eq 1 (reject "bad =
+  @norm
+  #here ; '/[x=@u]
+  ! foil
+  nat
+"))
+  assert(Eq 1 (reject "bad =
+  @norm
+  #here ; '/[x=@u]
+  #meta ;
+    /0x11/lib/publisher_vocabulary/publisher_vocabulary/grove/norm: (pails/n 1)
+"))
+  assert(Eq 1 (reject "bad =
+  @norm
+  #here ; '/[x=@u]
+  #to ; missing
+"))
+  assert(Eq 1 (reject "bad =
+  @norm
+  @role
+  #here ; '/[x=@u]
+"))
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

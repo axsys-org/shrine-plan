@@ -1,0 +1,132 @@
+(#bind grove_fixture (#module foil-grove-fixture))
+(#bind abi (#module foil-abi))
+;;;; Compile the real system vocabularies and the progression role prefix.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind backend (#module foil-grove-backend))
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(define (ts x) ("ts" x))
+(define (path xs) (map ts xs))
+(define (ok result)
+  (If (Eq "ok" (Hd result)) (_0 result) (error ["role-build" result])))
+(define (check local)
+  (define code (_1 local))
+  (define prepared (backend:prepare code))
+  (define policy (_1 prepared))
+  (define helpers (grove_fixture:module code "tests/grove_backend"))
+  (define (helper name)
+    (driver:get-perc ["grove_backend_checks" name] helpers))
+  (define (parse text)
+    (ok ((driver:get-perc ["grove" "parse"] policy) text)))
+  (define (missing path) (abi:option policy "none"))
+  (define (compile lookup root text)
+    (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (path root)) (parse text)))
+  (define types (ok (compile missing ["lib" "grove" "types"]
+    (read-text-file "grove/fixtures/value_codecs.grove"))))
+  (define lookup (grove_fixture:lookup local types))
+  (define progression (parse (read-text-file "grove/fixtures/progression.grove")))
+  (define first-five ((helper "first_five") progression))
+  (define records (ok (backend:compile prepared grove_fixture:previous lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "progression"]))) first-five)))
+  assert(Gt (Sz records) 5)
+  (define positioned (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "positioned"]))))
+  (define entry (grove_fixture:record local records (grove_fixture:qualified (path ["gov" "progression" "entry"]))))
+  (define (export rec name) ((helper "export") (path [name]) rec))
+  (define empty (abi:constructor policy ["mop" "empty"]))
+  assert(Equal (abi:option policy "none") ((export positioned "from_myth") empty))
+  (define base ((helper "recall_data") 100 8))
+  (define decoded ((export positioned "from_myth") base))
+  assert(Equal (abi:option policy "some") (Hd decoded))
+  assert(Eq 100 (_0 (_0 decoded)))
+  assert(Eq 8 (_1 (_0 decoded)))
+  assert(Equal ((abi:option policy "some") base)
+    ((export positioned "to_myth") (_0 decoded)))
+  assert(Equal (abi:option policy "none") ((export entry "from_myth") base))
+  (define one ((helper "req_data") base))
+  (define decoded-entry ((export entry "from_myth") one))
+  assert(Equal (abi:option policy "some") (Hd decoded-entry))
+  assert(Equal ((abi:option policy "some") one)
+    ((export entry "to_myth") (_0 decoded-entry)))
+  ;; OR is inclusive, and every present field must have the right type.
+  (define read-entry (export entry "from_myth"))
+  (define write-entry (export entry "to_myth"))
+  (define data (helper "role_data"))
+  (define both (data 2 one))
+  assert(Equal (abi:option policy "some") (Hd (read-entry (data 2 base))))
+  assert(Equal (abi:option policy "some") (Hd (read-entry both)))
+  assert(Equal (abi:option policy "none") (read-entry (data 3 both)))
+  assert(Equal (abi:option policy "none") (read-entry (data 4 both)))
+  assert(Equal (abi:option policy "none") (read-entry (data 5 both)))
+  assert(Equal (abi:option policy "none") (read-entry (data 8 both)))
+  (define rich (data 7 (data 6 both)))
+  assert(Equal ((abi:option policy "some") rich)
+    (write-entry (_0 (read-entry rich))))
+  assert(Equal [5 3 2] ((helper "role_summary") entry))
+
+  ;; A manually constructed value with both alternatives absent still
+  ;; cannot be converted to a valid myth.
+  (define val (_0 decoded-entry))
+  (define neither ((Hd val) (_0 val) (_1 val)
+    (abi:option policy "none") (abi:option policy "none") (_4 val) (_5 val)))
+  assert(Equal (abi:option policy "none") (write-entry neither))
+
+  ;; Restore a role through only its stored schema and module bundle.
+  (define fresh (backend:prepare code))
+  (define role-lookup (grove_fixture:lookup local records))
+  (define child (ok (backend:compile fresh grove_fixture:previous role-lookup (grove_fixture:qualified (grove_fixture:qualified (path ["gov" "child"]))) (parse "#import parent=gov/progression/entry
+
+child =
+  @role
+  #with ; parent
+"))))
+  (define restored (grove_fixture:record local child (grove_fixture:qualified (path ["gov" "child" "child"]))))
+  (define read-child (export restored "from_myth"))
+  assert(Equal (abi:option policy "none") (read-child base))
+  assert(Equal (abi:option policy "some") (Hd (read-child rich)))
+  assert(Equal ((abi:option policy "some") rich)
+    ((export restored "to_myth") (_0 (read-child rich))))
+
+  (define (reject text)
+    (define result (compile missing ["gov" "bad"] text))
+    assert(Equal "err" (Hd result))
+    assert(Gt (_0 (_0 (_0 result))) 0)
+    1)
+  assert(Eq 1 (reject "a =
+  @role
+  #with ; b
+
+b =
+  @role
+  #with ; a
+"))
+  assert(Eq 1 (reject "a =
+  @role
+  #with ; absent
+"))
+  assert(Eq 1 (reject "a =
+  @role
+  x: nat
+  x: nat
+"))
+  assert(Eq 1 (reject "a =
+  @role
+  #or ;
+    ' Empty group.
+"))
+  assert(Eq 1 (reject "a =
+  @role
+  #opt ;
+    #with ; other
+"))
+  assert(Eq 1 (reject "a =
+  @role
+  ! foil
+  nat
+"))
+  1)
+
+
+;; Execute after module loading; evaluation must not mutate cached fixture pins.
+(#export check)

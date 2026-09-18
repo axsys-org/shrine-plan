@@ -1,0 +1,172 @@
+;;;; New-driver inspection. Protocol constructors and path policy come
+;;;; from the caller's compiled boot tools; compiler values stay opaque.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind driver (#module foil-new-env))
+(#bind abi (#module foil-abi))
+(#bind source (#module foil-source))
+(#bind subject (#module foil-subject))
+(#bind entry (#module foil-entry))
+(#bind lore (#module foil-lore))
+(#bind render (#module foil-render))
+(#bind elab (#module foil-new-elab))
+(#bind doctest (#module doctest))
+(#bind ca (#module cairn))
+(#bind rex (#module rex))
+(#bind rx (#module foil-rex))
+
+(define (ts s) ("ts" s))
+(define (local-path perc key)
+  (define root (driver:perc-root perc))
+  (unless (Equal root (take (Sz root) key))
+    (error ["entry outside module root" (driver:perc-name perc) key]))
+  (drop (Sz root) key))
+(define (documented-keys perc)
+  (filter (lambda (key) (Nil (subject:ty-ap-path? key)))
+    (driver:perc-own-keys perc)))
+(define (node mirror-root tool perc key)
+  ((tool ["boot_mirror" "node"]) mirror-root
+    (map ts ((tool ["boot_mirror" "segments"]) (driver:perc-name perc)))
+    (map ts (local-path perc key))))
+
+;; Canonical keys already carry defining-module identity. No Unit pins,
+;; relocation, or import-pack reconstruction is needed for references.
+(define (ref-table mirror-root tool cache)
+  (define results (driver:cache-results cache))
+  (define nodes (foldl (lambda (ax perc)
+    (foldl (lambda (a key) (ca:putax key (node mirror-root tool perc key) a))
+      ax (documented-keys perc))) ca:empty-ax results))
+  (_1 (foldl (lambda (state perc)
+    (foldl (lambda (st key)
+      (define from (node mirror-root tool perc key))
+      (foldl (lambda (out ref)
+        (define hit (ca:getax (subject:resolve-path (_1 ref)) nodes))
+        (Ifz hit out
+          (let ((edge [from (_0 hit)]))
+            (If (ca:getax edge (_0 out)) out
+              [(ca:putax edge 1 (_0 out)) (snoc edge (_1 out))]))))
+        st (entry:collect-refs
+          (subject:got-entry-tc key (driver:perc-subject perc)))))
+      state (documented-keys perc))) [ca:empty-ax []] results)))
+
+(define (typed-lore brand hit)
+  (Ifz hit ((brand "compiler_lore") 0 0 [] [])
+    (let ((doc (_0 hit)))
+      ((brand "compiler_lore") 1 (lore:lore-head doc)
+        (lore:lore-body doc) (lore:lore-test-pairs doc)))))
+
+(define (read-source name)
+  (read-text-file (strcat ["foil/" name ".foil"])))
+;; A disk file is usable only if it still describes the compiled tree.
+;; Generated, adapted, and changed inputs render their retained Rex instead.
+(define (source-info read perc)
+  (define got (Try (lambda (z)
+    (define text (read (driver:perc-name perc)))
+    (If (Equal (source:new-imports (rex:ParseRexNormFile text)) (driver:perc-rex perc))
+      [text 1] 0)) 0))
+  (If (And (Eq 0 (Hd got)) (_0 got)) (_0 got)
+    [(rex:PrintRex (driver:perc-rex perc)) 0]))
+
+;; Clip heir chains to the entry span before printing retained source.
+(define (span-tree span tree)
+  (define off (Ix 2 span))
+  (define end (Add off (Ix 3 span)))
+  (define (clip n)
+    (define sp (rx:rx-span n))
+    (If (Or (Ge (Ix 2 sp) end)
+            (Le (Add (Ix 2 sp) (Ix 3 sp)) off)) []
+      (cond
+        ((rx:rx-nest? n)
+          [(rx:rx-nest sp (rx:rx-nest-color n) (rx:rx-nest-rune n)
+            (foldl (lambda (acc kid) (Weld acc (clip kid))) []
+              (rx:rx-nest-kids n)))])
+        ((rx:rx-juxt? n)
+          [(rx:rx-juxt sp
+            (foldl (lambda (acc kid) (Weld acc (clip kid))) []
+              (rx:rx-juxt-kids n)))])
+        (else [n]))))
+  (define (seek n)
+    (If (Eq off (Ix 2 (rx:rx-span n))) (clip n)
+      (foldl (lambda (acc kid) (If (Sz acc) acc (seek kid))) []
+        (cond ((rx:rx-nest? n) (rx:rx-nest-kids n))
+              ((rx:rx-juxt? n) (rx:rx-juxt-kids n))
+              (else [])))))
+  (Ifz (Ix 3 span) [] (seek tree)))
+(define (entry-source info perc span)
+  (If (_1 info) (entry:source-slice (_0 info) span)
+    (let ((hit (span-tree span (driver:perc-rex perc))))
+      (Ifz hit "" (rex:PrintRex (_0 hit))))))
+
+;; Visible names are the actual resolver spellings, including prefixes
+;; and transitive visibility, not a union of dependencies' own names.
+(define (visible-names perc)
+  (define root (driver:perc-root perc))
+  (map (lambda (pair) (drop (Sz root) (_0 pair)))
+    (filter (lambda (pair)
+      (Equal root (take (Sz root) (_0 pair))))
+      (rowify (ca:tapax (subject:sut-visible (driver:perc-subject perc)))))))
+
+(define (describe-cache mirror-root policy read refs? docs? laws? cache)
+  (define (tool path) (driver:get-perc path policy))
+  (define (brand name) (abi:constructor policy [name]))
+  (define some (abi:option policy "some"))
+  (define axes ((tool ["boot_mirror" "ref_axes"])
+    (If refs? (ref-table mirror-root tool cache) [])))
+  (map (lambda (perc)
+    (define sut (driver:perc-subject perc))
+    (define info (source-info read perc))
+    (define docs (If docs? (driver:perc-lore perc) []))
+    (define (describe key)
+      (define part (entry:entry-parts sut key))
+      (define name (local-path perc key))
+      (define span (driver:perc-entry-span key perc))
+      (define refs ((tool ["boot_mirror" "refs_of"]) axes (node mirror-root tool perc key)))
+      ((brand "compiler_entry") (map ts name) (entry:ent-val part)
+        (entry:entry-kind sut key (entry:ent-tc part))
+        (entry-source info perc span) (entry:ent-lowered part)
+        (typed-lore brand (lore:lore-for docs name))
+        (some (elab:reflect-in-subject sut 0
+          (subject:tc-ty (entry:ent-tc part))))
+        (If (And laws? (entry:ent-lowered part))
+          (If (render:law-like? (entry:ent-val part))
+            (render:render-law (entry:ent-val part)) 0) 0)
+        (_0 span) (_0 refs) (_1 refs)))
+    ((brand "compiler_module")
+      (map ts ((tool ["boot_mirror" "segments"]) (driver:perc-name perc)))
+      (_0 info) (typed-lore brand (lore:lore-for docs []))
+      (map describe (documented-keys perc))
+      (map (lambda (name) (map ts name)) (filter Sz (visible-names perc)))
+      ;; Read-only descriptions do not publish a restorable cache image.
+      0)) (driver:cache-results cache)))
+
+(define (ns-groups mirror-root tool cache)
+  (define names (map (lambda (perc)
+    [(map ts ((tool ["boot_mirror" "segments"]) (driver:perc-name perc)))
+     (map (lambda (key) (map ts (local-path perc key)))
+       (documented-keys perc))]) (driver:cache-results cache)))
+  (map (lambda (g) [(_0 (_0 g)) (_1 g)])
+    ((tool ["boot_mirror" "names"]) mirror-root names)))
+
+(define (doctest-work mirror-root tool brand cache)
+  (foldl (lambda (acc perc)
+    (define docs (driver:perc-lore perc))
+    (define context (doctest:bundle-with (driver:perc-world perc)
+      (driver:perc-subject perc)))
+    (define (work name)
+      (define hit (lore:lore-for docs name))
+      (Ifz hit []
+        (let ((doc (_0 hit)))
+          [((brand "doctest_work")
+            (Ifz name
+              (Weld mirror-root (map ts
+                ((tool ["boot_mirror" "segments"]) (driver:perc-name perc))))
+              (node mirror-root tool perc (Weld (driver:perc-root perc) name)))
+            (Sz (lore:lore-tests doc))
+            (lambda (z) (doctest:run-lore context doc)))])))
+    (Weld acc (Weld (work [])
+      (foldl (lambda (out key)
+        (Weld out (work (local-path perc key))))
+        [] (driver:perc-declared-keys perc)))))
+    [] (driver:cache-results cache)))
