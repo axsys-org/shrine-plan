@@ -272,11 +272,13 @@ class NativeTests(unittest.TestCase):
             with self.subTest(care=care), tempfile.TemporaryDirectory() as folder:
                 session = Session(self.ns, NoCalls(), Path(folder))
                 self.op("make", "/users/ian", {})
+                self.ns.op({"op": "make", "path": "/goals/release", "fields": {
+                    "note": "Users ready", "/app/goal": {"conditions": {}}}}, internal=True)
                 args = {"path": "/goals/release", "note": "Users ready", "why": "Track users",
                         "conditions": {"users": {"path": "/users", "care": care, "note": "Users ready", "met": True}}}
                 with self.assertRaisesRegex(ValueError, "Make /users"):
                     session.goal_operation(args)
-                self.assertEqual(self.op("read", "/goals")["records"], [])
+                self.assertEqual(self.goal_state()["conditions"], {})
                 self.op("make", "/users", {})
                 self.assertTrue(session.goal_operation(args)["ok"])
                 before = self.op("read", "/goals/release")["records"]
@@ -396,6 +398,10 @@ class NativeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             session = Session(self.ns, NoCalls(), Path(folder))
             args = {"path": "/goals/release", "note": "Keep release ready", "conditions": self.goal_conditions(), "why": "Track readiness"}
+            with self.assertRaisesRegex(ValueError, "New goals require"):
+                session.goal_operation(args)
+            self.ns.op({"op": "make", "path": args["path"], "fields": {
+                "note": args["note"], "/app/goal": {"conditions": {}}}}, internal=True)
             self.assertTrue(session.goal_operation(args)["ok"])
             self.op("poke", "/goals/release", {"owner": "Ian"})
             result = session.goal_operation({**args, "conditions": self.goal_conditions(True, True)})

@@ -2,11 +2,12 @@
 
 A fixed OpenRouter model uses `read`, `make`, `poke`, and `cull` against a real,
 isolated Shrine sovereign. Each actual result is returned to the model, and the
-complete conversation is kept. No training or crystallization is involved.
+conversation is kept until the user approves context compression. No training or crystallization is involved.
 The native `/sys/crew` slot also lets the model leave notes that return when
 their dependencies change.
-The `goal` tool is a convenience that installs or updates the same native goal
-records through those operations. It does not evaluate conditions in Python.
+The `goal` tool updates explicitly created native goals through those operations.
+It does not evaluate conditions in Python. New goals come from **+ New goal** or
+an explicitly approved compression proposal, never an inferred ordinary chat request.
 
 The page is rendered by `src/foil/apps/rl-agent/main.foil`, using `weft`.
 Python serves that rendered page and its local CSS/JS. This is a separate local
@@ -28,7 +29,7 @@ staged snapshot; `--runtime /private/work/directory` chooses runtime storage.
 Use a separate runtime directory for tests and for every concurrently running app.
 
 The fixed model is `anthropic/claude-sonnet-5`, routed only to Anthropic, with
-fallback disabled. The process budget persists across UI session resets. Actual
+fallback disabled and an 8,192-token output allowance. The process budget persists across UI session resets. Actual
 reported costs, model/provider IDs, input/output tokens, request sizes and latency
 are recorded. Uncertain network calls reserve their conservative cost envelope;
 there are no automatic retries. Pricing in the guard was verified September 20,
@@ -163,17 +164,48 @@ rewire them, or Cull to remove the goal. Cross-goal cycles remain subject to the
 runtime's cascade limit. A watch waits for changes, so it does not replace doing
 available work now. The app has no canned goal/demo runner or goal scoring panel.
 
-There are two entry points. **+ New goal** immediately creates a native pending
+**+ New goal** immediately creates a native pending
 goal from the submitted description and records the request in the conversation.
 That UI-only creation may temporarily have zero conditions; native fulfillment
 remains false. The model then uses `goal(path, note, conditions, why)` to define the
 conditions and confirms the result in chat. If the provider fails or clarification
-is needed, the requested goal remains saved. Ordinary chat can also imply ongoing
-work; the model is instructed to use the same goal tool when appropriate. Both paths
-use the same native `crud/goal` payload and Foil behavior. The tool preserves unrelated
-fields when updating a goal and refuses to overwrite an ordinary record.
+is needed, the requested goal remains saved. Creating a goal keeps the conversation
+context. The model may revise existing goals, but new goals through either `goal`
+or raw `ns` are rejected. Ordinary requested behavior can still use dependency notes.
+The tool preserves unrelated fields when updating a goal and refuses to overwrite
+an ordinary record.
 
-The UI's context metric is serialized request KB, not a claim about token count.
+## Reviewed compression
+
+Ask the agent to compress the conversation. It can read current state and call
+`propose_compression(summary, goals)` with self-contained goal notes and conditions.
+This creates a real observation record under `/agent/events`, with a review panel;
+it does not create application goals or remove any model context. The summary
+explains the proposed retention/omissions, but only native goal records carry into
+the fresh context. Lasting rules, exceptions, bindings and unresolved work must be
+expressed in goal/condition notes or referenced existing application records.
+
+Send corrections in chat to obtain a revised proposal. New input or external
+operations withdraw the old approval target. **Keep current context** dismisses it.
+**Approve & compact** is the only context-reset action; a model tool or a chat reply
+cannot approve itself. Approval references the exact current native proposal and
+revalidates all prospective goal writes against native state. The host applies the
+approved goals using real Make/Poke, preserving unrelated existing goal fields.
+Any installation failure keeps the old context and reports actual partial effects.
+
+After successful installation, fresh model input contains the ordinary protocol,
+all persistent native goal records, and any actual notifications from installation.
+The original model messages are archived under `sessions/contexts/<chat>/`, and the
+entire visible observation stream remains native and inspectable. A compaction event
+records the context boundary. Historical runtime reads are unavailable to the model
+after compaction, so it cannot silently refill its context from the old transcript.
+Application state, watches, and goals remain intact. This resets context at approval;
+it does not yet reset context independently at every subsequent activation.
+
+Pending reviews and compacted contexts survive restart and switching chats. Replay
+does not approve a proposal or invoke the model. No automatic compaction is performed.
+
+The UI's context metric is the current serialized message KB, not a token count.
 Actual API token counts are in the exported transcript. The runner stops before
 its configured context limit instead of silently summarizing/truncating history.
 
@@ -181,7 +213,7 @@ its configured context limit instead of silently summarizing/truncating history.
 
 The sovereign and its native version history live in the running Wisp process.
 Every mutation and response is also appended to `operations.jsonl`. Sessions,
-complete model messages, metrics and checks are saved under `sessions/`.
+active model messages, metrics and checks are saved under `sessions/`.
 **New chat** saves the current chat's operation tape, then starts a separate real
 Shrine namespace. The chat picker restores that chat's conversation and executes
 its recorded operations through Shrine to rebuild its namespace, cases and native
@@ -205,13 +237,14 @@ external services. The UI has no destructive namespace-reset control.
 
 ```sh
 cd tools/ns-agent
-python3 -m unittest test_native -v  # validation tests; native tests skip without WISP
+python3 -m unittest test_native test_context -v  # native tests skip without WISP
 WISP=/path/to/wisp AGENT_RUNTIME=/private/fresh-test-directory \
-  AGENT_SEED=/path/to/staged/snap python3 -m unittest test_native -v
+  AGENT_SEED=/path/to/staged/snap python3 -m unittest test_native test_context -v
 ```
 
 Native tests check CRUD semantics, dependency delivery, ordered operation batches,
-partial failure, causal links and session replay. Scripted clients in protocol
+partial failure, causal links, explicit goal creation, review/approval/correction,
+context boundaries, and session replay. Scripted clients in protocol
 tests exercise transport behavior; they do not measure model capability.
 
 `test_live_dependencies.py` is a separate, explicitly invoked paid test (a $0.35

@@ -1,8 +1,8 @@
 const $ = id => document.getElementById(id);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-let lastVersion = '', previousSession = '', busy = false, eventLength = 0, lastChats = '', posting = false;
+let lastVersion = '', previousSession = '', busy = false, eventLength = 0, lastChats = '', posting = false, lastProposal = '';
 const drafts = new Map();
-const labels = { user: 'You', model: 'Model', operation: 'Operation', result: 'Shrine', external: 'External change', dependency: 'Dependency note', check: 'Independent check', error: 'Stopped' };
+const labels = { user: 'You', model: 'Model', operation: 'Operation', result: 'Shrine', external: 'External change', dependency: 'Dependency note', check: 'Independent check', error: 'Stopped', compression_proposal: 'Compression proposal', compaction: 'Context compacted', compression_cancelled: 'Context kept' };
 function scalar(value) { return JSON.stringify(value); }
 
 function goalNode(goal) {
@@ -40,7 +40,7 @@ function eventNode(e) {
   } else if (e.kind === 'result') {
     const line = el('div', 'ack-line');
     line.append(el('span', 'ack-dot', d.ok ? '✓' : '×'));
-    line.append(el('span', '', d.ok ? (d.ack ? `ACK ${d.ack}` : `${(d.records || []).length} records read`) : d.error));
+    line.append(el('span', '', d.ok ? (d.review || (d.ack ? `ACK ${d.ack}` : `${(d.records || []).length} records read`)) : d.error));
     if (d.ack) line.append(el('span', '', `· ${(d.changes || []).length} changes`));
     if (d.runtime_ms !== undefined) line.append(el('span', '', `· ${d.runtime_ms} ms`));
     box.append(line);
@@ -71,6 +71,11 @@ function eventNode(e) {
     card.append(el('div', 'op-fields', 'Changed: '+d.changed.map(x=>`${x.path} (${x.care})`).join(', ')));
     const details=el('details',''); details.append(el('summary','','Dependency context'),el('pre','',JSON.stringify(d.dependencies,null,2)));
     card.append(details);box.append(card);
+  } else if (e.kind === 'compression_proposal') {
+    box.append(el('div', 'event-text', d.summary));
+    const details=el('details',''); details.append(el('summary','','Proposed goals'),el('pre','',JSON.stringify(d.goals,null,2)));box.append(details);
+  } else if (e.kind === 'compaction') {
+    box.append(el('div','event-text',d.text),el('div','op-why',`${(d.before_bytes/1024).toFixed(1)} KB → ${(d.after_bytes/1024).toFixed(1)} KB of model context`));
   } else if (e.kind === 'check') {
     box.append(el('div', `check-result ${d.pass ? '' : 'failed'}`, `${d.pass ? '✓' : '×'} Step ${d.step} · ${d.checks.filter(c => c.pass).length}/${d.checks.length} state checks passed`));
     const details = el('details', ''); details.append(el('summary', '', 'Inspect independent checks'), el('pre', '', JSON.stringify(d.checks, null, 2))); box.append(details);
@@ -78,6 +83,35 @@ function eventNode(e) {
     box.append(el('div', 'event-text', d.text || (e.kind === 'model' ? 'Choosing the next operation.' : '')));
   }
   return box;
+}
+
+function renderCompression(s) {
+  const box=$('compression-review'), p=s.pending_compression;
+  if(!box)return; // An already-open page may predate the newly deployed template.
+  const version=JSON.stringify([s.session_id,p]);
+  if(version!==lastProposal){
+    lastProposal=version;box.replaceChildren();box.hidden=!p;
+    if(p){
+      box.append(el('h3','','Review before compacting'),el('p','event-text',p.summary));
+      for(const g of p.goals){
+        const details=el('details','compression-goal');
+        details.append(el('summary','',g.path),el('p','event-text',g.note));
+        for(const [name,c] of Object.entries(g.conditions)) details.append(el('p','goal-note',`${name}: ${c.note} (${c.path}, ${c.care}; ${c.met ? 'assessed met' : 'not established'})`));
+        box.append(details);
+      }
+      box.append(el('p','review-help','Approval installs these goals and starts fresh model context from persistent goals. Your namespace and visible history stay. Send corrections in chat to revise this proposal.'));
+      const actions=el('div','goal-actions');
+      const revise=el('button','secondary','Send corrections');revise.id='compression-revise';
+      revise.onclick=()=>{$('prompt').value='Revise the compression proposal: ';$('prompt').focus();};
+      const dismiss=el('button','quiet','Keep current context');dismiss.id='compression-dismiss';
+      dismiss.onclick=()=>post('dismiss_compression',{proposal_ref:p.ref}).catch(fail);
+      const accept=el('button','','Approve & compact');accept.id='compression-approve';
+      accept.onclick=()=>post('approve_compression',{proposal_ref:p.ref}).catch(fail);
+      actions.append(revise,dismiss,accept);box.append(actions);
+    }
+  }
+  for(const button of box.querySelectorAll('button'))button.disabled=busy||posting;
+  $('context-status').textContent=s.context_generation ? `Context compacted ${s.context_generation} time${s.context_generation===1?'':'s'}. Earlier history is kept for your inspection.` : 'Conversation stays in context until you approve compression.';
 }
 
 function renderNamespace(records, count) {
@@ -125,7 +159,7 @@ async function refresh() {
     for (const id of ['send', 'new-chat', 'new-goal', 'chat-select', 'inject', 'goal-submit']) $(id).disabled = busy || posting;
     $('model-label').textContent = s.model.replace('anthropic/', '') + ' · OpenRouter';
     const m = s.metrics;
-    const stats = [['Model calls', m.calls], ['NS operations', m.operations], ['Context', (m.context_bytes/1024).toFixed(1), 'KB'], ['API cost', '$'+m.cost.toFixed(3)]];
+    const stats = [['Model calls', m.calls], ['NS operations', m.operations], ['Context', ((s.context_bytes ?? m.context_bytes)/1024).toFixed(1), 'KB'], ['API cost', '$'+m.cost.toFixed(3)]];
     $('metrics').replaceChildren(...stats.map(([label,value,unit]) => { const cell=el('div','metric'), val=el('div','metric-value',String(value)); if(unit)val.append(el('small','',unit)); cell.append(el('div','metric-label',label),val); return cell; }));
     $('event-count').textContent = `${s.events.length} events`;
     const stream = $('stream');
@@ -141,6 +175,7 @@ async function refresh() {
       $('chat-select').value = s.session_id; lastChats = chatVersion;
     }
     if (!busy) $('chat-select').value = s.session_id;
+    renderCompression(s);
     if (s.events.length > eventLength) {
       if (!eventLength) stream.replaceChildren();
       for (const e of s.events.slice(eventLength)) stream.append(eventNode(e));

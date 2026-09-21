@@ -96,14 +96,18 @@ def main():
                 if not isinstance(body, dict):
                     raise ValueError("Expected an object")
                 action = self.path.removeprefix("/api/")
-                if action not in {"turn", "goal", "new_chat", "switch_chat"}:
+                if action not in {"turn", "goal", "new_chat", "switch_chat", "approve_compression", "dismiss_compression"}:
                     return self.send(404, {"error": "Not found"})
-                if action in {"turn", "goal"} and body.get("chat_id") != session.session_id:
+                if action in {"turn", "goal", "approve_compression", "dismiss_compression"} and body.get("chat_id") != session.session_id:
                     raise ValueError("The active chat changed; review it before submitting")
                 if action == "goal" and (not isinstance(body.get("description"), str) or not body["description"].strip()):
                     raise ValueError("Describe the goal")
                 if action == "switch_chat" and (not isinstance(body.get("chat_id"), str) or not body["chat_id"].isdigit()):
                     raise ValueError("Choose a saved chat")
+                if action in {"approve_compression", "dismiss_compression"}:
+                    pending = session.pending_compression
+                    if not pending or body.get("proposal_ref") != pending["ref"]:
+                        raise ValueError("This proposal is no longer current; request a revised proposal")
                 if action == "turn":
                     if "external" in body:
                         validate(body["external"])

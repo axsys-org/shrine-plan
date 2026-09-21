@@ -158,10 +158,16 @@ class Native:
             return response
 
     def op(self, operation, *, internal=False):
+        with self.lock:
+            payload = self.check(operation, internal=internal)
+            return self._execute(operation, payload)
+
+    def check(self, operation, *, internal=False):
+        """Validate a prospective write against native state without executing it."""
         payload = validate(operation, internal=internal)
         with self.lock:
             self._require_watch_roots(payload)
-            return self._execute(operation, payload)
+        return payload
 
     def _require_watch_roots(self, payload):
         """Check watch prerequisites using Shrine's records before committing a write."""

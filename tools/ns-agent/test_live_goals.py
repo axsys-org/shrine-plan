@@ -21,11 +21,11 @@ def main():
 
         def goal():
             return next((r["fields"].get("/app/goal") for r in session.records
-                         if r["path"] == "/goals/release"), None)
+                         if "/app/goal" in r["fields"]), None)
 
         for name, ready in [("tests", True), ("approval", False)]:
             session.turn(external={"op": "make", "path": f"/release/{name}", "fields": {"ready": ready}})
-        session.turn("Create a persistent goal at /goals/release: the release is ready when "
+        session.turn(goal_description="The release is ready when "
                      "/release/tests has ready true AND /release/approval has ready true. "
                      "Assess what holds now and keep watching so it reopens if either changes. "
                      "Those source records are external facts: only observe them; don't modify them.")
