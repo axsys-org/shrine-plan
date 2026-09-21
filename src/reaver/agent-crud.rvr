@@ -1,0 +1,55 @@
+;;;; Minimal line protocol. The only execution engine is agent_crud.foil
+;;;; calling Shrine's cycle. The host holds the immutable sovereign.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind foil (#module foil))
+(#bind wire (#module wire-json))
+
+(define compiled (Pin (foil:compile-mod-cached 0 foil:default-subject "apps/rl-agent/main")))
+(define (entry p) (foil:source-entry-val p (_1 (Unpin compiled))))
+(define parse-json (entry ["parse"]))
+(define show-json (entry ["show"]))
+(define path-of (entry ["crud" "path_of"]))
+(define apply-crud (entry ["crud" "apply"]))
+(define initial (entry ["crud" "initial"]))
+(define page (entry ["agent_page"]))
+
+(define (request text state)
+  (define parsed (parse-json text))
+  (If (wire:jok? parsed)
+    (let* ((v (wire:jval parsed))
+           (op (wire:jget-str "op" v)))
+      (cond
+        ((Eq op "page") [state (wire:jobj [["html" (wire:jq page)]])])
+        ((Eq op "reset") [initial (wire:jobj [["ok" "true"]])])
+        ((Or (Eq op "read") (Or (Eq op "make") (Or (Eq op "poke") (Eq op "cull"))))
+          (let* ((p (path-of (wire:jget "path" v)))
+                 (fields (wire:jget "fields" v))
+                 (r (apply-crud op p fields state)))
+            [(Ix 0 r) (show-json (Ix 1 r))]))
+        (else [state (wire:jobj [["ok" "false"] ["error" (wire:jq "unknown operation")]])])))
+    [state (wire:jobj [["ok" "false"] ["error" (wire:jq "invalid JSON")]])]))
+
+;; Read exactly one newline-delimited request; Input is the runtime's
+;; existing stream primitive. No socket or new network authority.
+(define (read-line z)
+  (define (go acc)
+    (define raw (Input 1))
+    (If (Le raw 1) 0
+      (let ((c (Load8 0 raw)))
+        (If (Eq c 10) (lstrcat (lrev acc))
+          (go (lcons c acc))))))
+  (go 0))
+(define (put-line s) (Write 1 (strWeld (strcat ["NS_AGENT " s 10]) 1)))
+(define (serve z)
+  (define (loop state)
+    (define line (read-line 0))
+    (Ifz line 0
+      (let* ((r (request line state)) (next (Pin (Ix 0 r))))
+        (Seq (put-line (Ix 1 r)) (loop (Unpin next))))))
+  (Seq (DeepSeq [apply-crud parse-json show-json page] 0)
+    (Seq (put-line (wire:jobj [["ready" "true"]])) (loop initial))))
+(define module-file-stamps (foil:foil-closure-files ["apps/rl-agent/main"]))
+(#export request initial serve module-file-stamps)
