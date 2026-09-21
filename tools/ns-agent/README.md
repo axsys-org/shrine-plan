@@ -58,6 +58,7 @@ page / prompt → runner.py → OpenRouter tool call
   implement namespace semantics or an expression evaluator.
 - `runtime.py`: subprocess lifetime, path/value validation and operation journal.
 - `runner.py`: model protocol, growing conversation, causal event links and costs.
+- `context.py`: project real observations into concise model receipts and one current copy of each observed record; it never executes operations or matches dependencies.
 - `app.py` and `web/`: local server and the live observation/namespace interface.
 
 The model can emit up to 16 tool operations in one response. They execute in
@@ -66,6 +67,8 @@ This is not atomic: on failure, earlier successes remain and remaining calls
 receive explicit not-executed results. The model then sees all results together.
 It is instructed to wait when choosing another operation requires feedback.
 The `why` argument is a brief operation purpose, not a transcript of hidden reasoning.
+Requests explicitly disable extended reasoning with `reasoning: {enabled: false}`.
+Previously returned reasoning blocks remain intact in saved history for protocol continuity.
 
 Application paths are ordinary absolute addresses such as `/users/ian`.
 The model cannot write root, `/agent`, `/log`, `/boot`, `/h`, or `/io`.
@@ -205,7 +208,22 @@ it does not yet reset context independently at every subsequent activation.
 Pending reviews and compacted contexts survive restart and switching chats. Replay
 does not approve a proposal or invoke the model. No automatic compaction is performed.
 
-The UI's context metric is the current serialized message KB, not a token count.
+The UI's context metric is the projected model-message KB, not a token count.
+Model requests retain conversation text, tool calls and provider reasoning fields.
+Tool responses contain acknowledgements, errors, field deltas, read listings and
+causal event references instead of repeated complete before/after snapshots.
+One working-context packet supplies the current native values of paths already
+observed in this conversation. It does not insert unseen namespace records.
+Fired watches are grouped with every cause until the model finishes its turn;
+an interrupted response keeps those activations when the user continues.
+Read and dependency-view membership is labelled with its observation, not
+presented as a fresh query. Missing records are distinct from empty records.
+
+Full observations remain in the native event tree, UI, replay tape and raw
+`messages` export. `/api/export` also includes `model_messages` (the current
+request projection) and `raw_context_bytes` for comparison. This removes repeated
+payloads without summarizing conversation meaning. Observed records and concise
+history still grow; the user-reviewed compression flow remains the semantic reset.
 Actual API token counts are in the exported transcript. The runner stops before
 its configured context limit instead of silently summarizing/truncating history.
 
@@ -237,9 +255,9 @@ external services. The UI has no destructive namespace-reset control.
 
 ```sh
 cd tools/ns-agent
-python3 -m unittest test_native test_context -v  # native tests skip without WISP
+python3 -m unittest test_native test_context test_projection -v  # native tests skip without WISP
 WISP=/path/to/wisp AGENT_RUNTIME=/private/fresh-test-directory \
-  AGENT_SEED=/path/to/staged/snap python3 -m unittest test_native test_context -v
+  AGENT_SEED=/path/to/staged/snap python3 -m unittest test_native test_context test_projection -v
 ```
 
 Native tests check CRUD semantics, dependency delivery, ordered operation batches,

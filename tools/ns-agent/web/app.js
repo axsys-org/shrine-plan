@@ -111,7 +111,7 @@ function renderCompression(s) {
     }
   }
   for(const button of box.querySelectorAll('button'))button.disabled=busy||posting;
-  $('context-status').textContent=s.context_generation ? `Context compacted ${s.context_generation} time${s.context_generation===1?'':'s'}. Earlier history is kept for your inspection.` : 'Conversation stays in context until you approve compression.';
+  $('context-status').textContent=(s.context_generation ? `Context compacted ${s.context_generation} time${s.context_generation===1?'':'s'}. ` : '') + 'Model sees concise receipts and current observed records once. Full history stays inspectable; conversation resets only with your approval.';
 }
 
 function renderNamespace(records, count) {

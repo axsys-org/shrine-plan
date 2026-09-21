@@ -81,6 +81,44 @@ class ContextTests(unittest.TestCase):
         result = self.session.goal_operation({**self.proposal()["goals"][0], "path": record["path"]})
         self.assertTrue(result["ok"])
 
+    def test_native_cascade_uses_factored_input_and_keeps_full_native_observations(self):
+        s = self.session
+        self.native.op({"op": "make", "path": "/derived", "fields": {
+            "ready": False, "note": "Mirror source readiness; don't change source", "/sys/crew": {
+                "source": {"path": "/source", "care": "x"}}}})
+        s._refresh()
+        s.client = Client(call("ns", {"op": "poke", "path": "/derived", "fields": {"ready": True},
+                                     "why": "Source became ready"}),
+                          {"role": "assistant", "content": "Derived readiness now follows source."})
+        s.turn(external={"op": "poke", "path": "/source", "fields": {"ready": True}})
+        first = s.client.inputs[0]
+        self.assertIn("Native outcome:", first[-2]["content"])
+        self.assertNotIn("watcher_record", json.dumps(first))
+        context = json.loads(first[-1]["content"].split("\n", 1)[1])
+        self.assertTrue(context["records"]["/source"]["fields"]["ready"])
+        self.assertEqual(context["activations"][0]["watcher"], "/derived")
+        native_result = next(e for e in s.events if e["kind"] == "result")
+        self.assertIn("watcher_record", native_result["data"]["notifications"][0])
+        self.assertIn("watcher_record", s.messages[1]["content"])
+        stored = self.native.op({"op": "read", "path": native_result["ref"]})["records"][0]
+        self.assertEqual(stored["fields"]["data"], native_result["data"])
+        self.assertTrue(next(r for r in s.records if r["path"] == "/derived")["fields"]["ready"])
+        before = s.model_messages()
+        restored = Session(self.native, Client(), self.output, resume=True)
+        self.assertEqual(restored.model_messages(), before)
+
+    def test_failed_model_turn_keeps_fired_watches_when_user_continues(self):
+        s = self.session
+        self.native.op({"op": "make", "path": "/note", "fields": {"note": "Check source readiness",
+            "/sys/crew": {"source": {"path": "/source", "care": "x"}}}})
+        with self.assertRaisesRegex(RuntimeError, "No scripted response"):
+            s.turn(external={"op": "poke", "path": "/source", "fields": {"ready": True}})
+        s.client = Client({"role": "assistant", "content": "Source is ready."})
+        s.turn("Continue")
+        context = json.loads(s.client.inputs[0][-1]["content"].split("\n", 1)[1])
+        self.assertEqual(context["activations"][0]["watcher"], "/note")
+        self.assertTrue(context["records"]["/source"]["fields"]["ready"])
+
     def test_proposal_has_no_application_effect_until_approved(self):
         s = self.session
         s.messages.append({"role": "user", "content": "UNNEEDED-OLD-DETAIL"})

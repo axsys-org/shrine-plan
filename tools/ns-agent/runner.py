@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 
 from runtime import validate
+from context import model_context
 
 MODEL = "anthropic/claude-sonnet-5"
 MAX_OPERATIONS = 16
@@ -27,7 +28,15 @@ This is not an atomic transaction: earlier successes remain if a later call fail
 On a failure, the remaining calls are skipped and returned as not executed.
 Group operations whose arguments you already know. If choosing an operation needs
 a read, result, or dependency notification, wait for that feedback first.
+For large records with notes and dependencies, use batches of at most four calls
+so the response fits the output allowance. Continue after their results arrive.
 Notifications describe state at that operation; later calls can change it again.
+Tool results are concise native receipts: read listings, changed fields, ACKs and
+notification references. The runtime working context supplies the CURRENT records
+you have observed, once per path, and groups fired watches with their causes.
+Earlier receipts are historical; don't mistake an earlier value for current state.
+The full native observations remain in the UI/export. Conversation and your tool
+arguments remain in context until the user approves semantic compression.
 Paths /agent, /log, /boot, /h, /io and / itself cannot be mutated by you.
 Fields hold strings, numbers, booleans, null, arrays or objects. Most field keys
 are simple slot names. The special /sys/crew slot declares REAL Shrine dependencies.
@@ -159,6 +168,7 @@ class OpenRouter:
     def complete(self, messages):
         body = {"model": MODEL, "messages": messages, "tools": TOOLS,
                 "tool_choice": "auto", "max_tokens": MAX_OUTPUT_TOKENS,
+                "reasoning": {"enabled": False},
                 "provider": {"only": ["anthropic"], "allow_fallbacks": False,
                              "require_parameters": True}}
         encoded = json.dumps(body).encode()
@@ -168,7 +178,7 @@ class OpenRouter:
         if self.spent + envelope > self.budget:
             raise RuntimeError("Session cost cap reached; increase --budget to continue")
         if len(encoded) > 700_000:
-            raise RuntimeError("Full-context experiment reached its byte limit; no history was truncated")
+            raise RuntimeError("Model input reached its byte limit; use reviewed compression to continue")
         req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions",
                                      data=encoded, headers={"Authorization": "Bearer " + self.key,
                                      "Content-Type": "application/json", "X-Title": "Shrine Observation Lab"})
@@ -330,7 +340,8 @@ class Session:
                     "metrics": self.metrics, "status": self.status, "busy": self.busy,
                     "pending_compression": self.pending_compression,
                     "context_generation": self.context_generation, "last_compaction": self.last_compaction,
-                    "context_bytes": len(json.dumps(self.messages, ensure_ascii=False).encode()),
+                    "context_bytes": len(json.dumps(self.model_messages(), ensure_ascii=False).encode()),
+                    "raw_context_bytes": len(json.dumps(self.messages, ensure_ascii=False).encode()),
                     "budget": self.client.budget, "total_spent": self.client.spent, "updated_at": time.time()}
             text = json.dumps(data, ensure_ascii=False, indent=2)
             temp = self.output / "session.tmp"
@@ -344,6 +355,15 @@ class Session:
     def snapshot(self):
         with self.lock:
             return json.loads((self.output / "session.json").read_text())
+
+    def model_messages(self):
+        return model_context(self.messages, self.records, self.events)
+
+    def observation_message(self, intro, result, eid, *, label="Actual Shrine result"):
+        # Preserve the original host transcript for inspection. Only the API
+        # projection substitutes a receipt and shared native record contents.
+        return {"role": "user", "content": intro + "\n" + label + ": " + json.dumps(result),
+                "_context_text": intro, "_context_observation": f"/agent/events/{eid}"}
 
     def event(self, kind, data, parent=None):
         with self.lock:
@@ -438,7 +458,7 @@ class Session:
         if exact is None or exact["fields"].get("data") != proposal:
             raise ValueError("The native proposal record does not match the review")
         operations = [self._goal_write(g, allow_create=True) for g in proposal["goals"]]
-        previous_bytes = len(json.dumps(self.messages, ensure_ascii=False).encode())
+        previous_bytes = len(json.dumps(self.model_messages(), ensure_ascii=False).encode())
         archive = self.output / "contexts" / self.session_id
         archive.mkdir(parents=True, exist_ok=True)
         archive = archive / f"{time.time_ns()}.json"
@@ -447,16 +467,17 @@ class Session:
         self.pending_compression = None
         parent = self.event("user", {"text": "Approved this proposal and requested context compaction.",
                                     "intent": "compression", "proposal_ref": proposal_ref}, proposal_ref.rsplit("/", 1)[-1])
-        notices = []
+        notices, installation_results = [], []
         for operation in operations:
             opid = self.event("operation", operation, parent)
             result = self.native.op(operation)
             self.metrics["operations"] += 1
             parent = self.event("result", result, opid)
+            installation_results.append(f"/agent/events/{parent}")
             notices.extend(self.notifications(result, parent))
             self._refresh()
-            self.messages.append({"role": "user", "content": "User-approved compression goal write: " +
-                                  json.dumps(operation) + "\nActual Shrine result: " + json.dumps(result)})
+            self.messages.append(self.observation_message("User-approved compression goal write: " +
+                                  json.dumps(operation), result, parent))
             if not result.get("ok") or result.get("cascade_error"):
                 self._save()
                 raise RuntimeError("Goal installation did not complete; context retained. Review actual results before retrying.")
@@ -468,11 +489,14 @@ class Session:
             json.dumps(goals, ensure_ascii=False)}]
         if notices:
             new_messages.append({"role": "user", "content": "Native dependency notifications during goal installation:\n" +
-                json.dumps([self.events[int(eid[1:]) - 1]["data"] for eid in notices], ensure_ascii=False)})
+                json.dumps([self.events[int(eid[1:]) - 1]["data"] for eid in notices], ensure_ascii=False),
+                "_context_text": "Native outcomes during goal installation:",
+                "_context_observations": installation_results})
         generation = self.context_generation + 1
         eid = self.event("compaction", {"text": "Goals committed. Earlier conversation removed from model context; namespace and observation history retained.",
             "proposal_ref": proposal_ref, "generation": generation, "goal_paths": [g["path"] for g in goals],
-            "before_bytes": previous_bytes, "after_bytes": len(json.dumps(new_messages, ensure_ascii=False).encode())}, notices or parent)
+            "before_bytes": previous_bytes, "after_bytes": len(json.dumps(
+                model_context(new_messages, self.records, self.events), ensure_ascii=False).encode())}, notices or parent)
         self.messages = new_messages
         self.context_generation, self.last_compaction = generation, f"/agent/events/{eid}"
         self.status = "Ready · context compacted"
@@ -495,18 +519,18 @@ class Session:
             if not result.get("ok"):
                 raise RuntimeError("Shrine could not save the requested goal")
             self._refresh()
-            self.messages.append({"role": "user", "content": "New goal requested through the UI: " +
+            self.messages.append(self.observation_message("New goal requested through the UI: " +
                 goal_description + "\nThe UI has already saved this native goal at " + goal_path +
                 ". Define its watched conditions with the goal tool at this exact path and confirm in chat. "
-                "If necessary, ask for missing information; the requested goal is already saved.\nActual Shrine result: " + json.dumps(result)})
+                "If necessary, ask for missing information; the requested goal is already saved.", result, parent))
         elif external is not None:
             parent = self.event("external", external)
             result = self.native.op(external)
             parent = self.event("result", result, parent)
             notices = self.notifications(result, parent)
             self._refresh()
-            self.messages.append({"role": "user", "content": "External namespace operation: " +
-                                  json.dumps(external) + "\nActual result: " + json.dumps(result)})
+            self.messages.append(self.observation_message("External namespace operation: " +
+                                  json.dumps(external), result, parent, label="Actual result"))
             if not notices:
                 self.status = "Applied · no dependency notifications" if result.get("ok") else result.get("error", "Rejected")
                 self._save()
@@ -521,7 +545,7 @@ class Session:
         for _ in range(24):
             self.status = "Model is observing…"
             self._save()
-            message, meta = self.client.complete(copy.deepcopy(self.messages))
+            message, meta = self.client.complete(self.model_messages())
             self.metrics["calls"] += 1
             self.metrics["input_tokens"] += meta["usage"].get("prompt_tokens", 0)
             self.metrics["output_tokens"] += meta["usage"].get("completion_tokens", 0)

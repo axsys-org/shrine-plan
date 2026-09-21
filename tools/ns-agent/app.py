@@ -77,6 +77,11 @@ def main():
                 if path == "/api/state":
                     data.pop("messages", None)
                     data["chats"] = session.chats()
+                else:
+                    # Project this exact saved snapshot, including on an export
+                    # during a running turn; don't mix two runtime moments.
+                    from context import model_context
+                    data["model_messages"] = model_context(data["messages"], data["records"], data["events"])
                 self.send(200, data)
             elif path in {"/assets/app.js", "/assets/style.css"}:
                 name = path.rsplit("/", 1)[-1]
