@@ -233,16 +233,17 @@
 ;; derived once per NewCompiler and cached there, so it is no longer
 ;; subject state, mark-visible no longer maintains it, and the durable
 ;; boundary has nothing to strip.
+;; sorted, deduped alias insertion — one canonical row order no
+;; matter which layer order contributed the aliases
+(define (insert-written written row)
+  (Ifz (Sz row)
+    [written]
+    (Case3 (cmp-total written (_0 row))
+      (Weld [written] row)
+      row
+      (Weld [(_0 row)] (insert-written written (drop 1 row))))))
+
 (define (derive-vis-inverse sut)
-  ;; sorted, deduped alias insertion — one canonical row order no
-  ;; matter which layer order contributed the aliases
-  (define (insert-written written row)
-    (Ifz (Sz row)
-      [written]
-      (Case3 (cmp-total written (_0 row))
-        (Weld [written] row)
-        row
-        (Weld [(_0 row)] (insert-written written (drop 1 row))))))
   ;; HEAD vis only — the inverse mirrors the compile's own naming
   ;; authority, same rule as visible-canon.
   (define vis (sut-visible sut))
@@ -254,6 +255,56 @@
           (insert-written (_0 pair) (fall [] (getax (_1 pair) inv)))
           inv))
       empty-ax (rowify (tapax vis)))))
+
+;; vis-aliases :: Subject -> (CanonPath -> Row WrittenPath)
+;;
+;; The inverse as the point query its one consumer makes.  Any head answers
+;; this way; the whole index is inverted on the first query.
+(define (vis-aliases sut)
+  (define inv (derive-vis-inverse sut))
+  (lambda (canonical) (fall [] (getax canonical inv))))
+
+;; mount-aliases :: Row [LayerRoot Spell] -> Ax CanonPath -> (CanonPath -> Row WrittenPath)
+;;
+;; The same answer without inverting anything, for a head whose marks are all
+;; regular.  An import layer is marked under a spelling — spell ++ the key
+;; below its layer's root, or spell ++ the whole key for a key outside that
+;; root — and an own declaration marks itself, so a canonical key's possible
+;; aliases follow from the mount table alone.  The head index then says which
+;; of them survived shadowing, exactly as the inverted index would: an alias
+;; of `canonical` is a written path the index still maps to it.
+;;
+;; Inverting costs a put per name in the whole import closure, per compile,
+;; to serve a few lookups; this costs the mounts once and a few gets per
+;; lookup.  A head carrying any other kind of mark must use vis-aliases.
+(define (mount-aliases mounts vis)
+  (define spells
+    (foldl (lambda (out pair)
+      (If (includes (Equal (_1 pair)) out) out (snoc (_1 pair) out))) [] mounts))
+  (define by-root
+    (foldl (lambda (out pair)
+      (define known (fall [] (getax (_0 pair) out)))
+      (If (includes (Equal (_1 pair)) known) out
+        (putax (_0 pair) (snoc (_1 pair) known) out))) empty-ax mounts))
+  (define lengths
+    (foldl (lambda (out pair)
+      (define n (Sz (_0 pair)))
+      (If (includes (Eq n) out) out (snoc n out))) [] mounts))
+  (define (below canonical)
+    (foldl (lambda (out n)
+      (If (Gt n (Sz canonical)) out
+        (foldl (lambda (found spell) (snoc (Weld spell (drop n canonical)) found))
+          out (fall [] (getax (take n canonical) by-root))))) [] lengths))
+  (define (candidates canonical)
+    (foldl (lambda (out spell) (snoc (Weld spell canonical) out))
+      (snoc canonical (below canonical)) spells))
+  (Ifz vis
+    (lambda (canonical) [])
+    (lambda (canonical)
+      (foldl (lambda (row written)
+        (define hit (getax written vis))
+        (If (And hit (Equal canonical (_0 hit))) (insert-written written row) row))
+        [] (candidates canonical)))))
 
 ;; Construct only the current format.
 (define (make-subject ax) ($Subject ax 0 0 [] 0 0 0 0 0 0 0))
@@ -747,6 +798,8 @@ assert(ty-var-path? ["ty-var" "v"])
  set-sut-visible
  sut-vis-inverse
  derive-vis-inverse
+ vis-aliases
+ mount-aliases
  sut-lazy
  sut-find
  require-subject
