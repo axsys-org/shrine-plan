@@ -13,4 +13,9 @@ Foil is documented in
 [doc/foil-semantics.md](doc/foil-semantics.md), and the current implementation
 sharp edges are documented in [PAPERCUTS.md](PAPERCUTS.md).
 
+The [Shrine v5 bridge](tools/shrine-mcp/README.md) exposes native authoring,
+observations, persistent context and the separate inspector. The
+[Coursebook Canvas demo](tools/canvas-shrine/README.md) uses that bridge and
+actual Foil forms to maintain coursework observations, deadline states and
+local planning. Personal Canvas configuration and data are not included.
 
