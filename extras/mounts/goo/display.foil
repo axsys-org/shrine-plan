@@ -1,0 +1,367 @@
+- goo_app/compile
+- goo_app/measurement
+
+' Inspection consumes typed pass outputs. Wire JSON here is a private projection,
+' never a replacement compiler input. Only identity fields receive display aliases.
++ goo_display
+  + get
+    \ value=json key=str
+    ^ json
+    > (json/obj fields) value jnull
+    ? (goo_codec/field fields key)
+     > (./some value) value
+    jnull
+  + text
+    \ value=json
+    ^ str
+    ? value
+     > (json/str text) text
+    ""
+  + array
+    \ value=json
+    ^ row[json]
+    ? value
+     > (json/arr values) values
+    []
+  + pair
+    : key=str value=rex
+  + record
+    \ fields=row[goo_display/pair]
+    ^ rex
+    ? (eq fields.len 0) (rex/expr rex/zero_span "curly" [])
+    ? (eq fields.len 1) (goo_display/member "curly" fields.at(0))
+    | rex/nest rex/zero_span "curly" "," fields.map((goo_display/member "clear"))
+  + member
+    \ color=str field=goo_display/pair
+    ^ rex
+    | rex/nest rex/zero_span color ":" [(rex/expr rex/zero_span "brack" [(rex/word field.key)]) field.value]
+  + call
+    \ name=str args=row[rex]
+    ^ rex
+    = arguments=rex
+        ? (le args.len 1) (rex/expr rex/zero_span "paren" args)
+        | rex/nest rex/zero_span "paren" "," args
+    | rex/juxt rex/zero_span [(rex/word name) arguments]
+  + string
+    \ text=str
+    ^ rex
+    = escaped=bool
+        % i=nat 0
+        ? (eq i text.len) .false
+        = byte text.at(i)
+        ? ((eq byte 10) || (eq byte 13) || (eq byte 9)) .true
+        | _ i.inc
+    ? !escaped (rex/cord text)
+    = encoded (show (json/str text))
+    | goo_display/call "escaped" [(rex/cord encoded.slice(1 (sub encoded.len 2)))]
+  + less
+    \ left=str right=str
+    ^ bool
+    % i=nat 0
+    ? (eq i left.len) (lt i right.len)
+    ? (eq i right.len) .false
+    ? !(eq left.at(i) right.at(i)) (lt left.at(i) right.at(i))
+    | _ i.inc
+  + insert
+    \ field=jkv fields=row[jkv]
+    ^ row[jkv]
+    % i=nat 0 out=row[jkv] [] placed=bool .false
+    ? (eq i fields.len) (? placed out out.snoc(field))
+    = next fields.at(i)
+      before=bool (? placed .false (goo_display/less field.k next.k))
+      out (? before out.snoc(field) out)
+    | _ i.inc out.snoc(next) (placed || before)
+  + sorted
+    \ fields=row[jkv]
+    ^ row[jkv]
+    | row/fold[jkv row[jkv]] [] (\ out field (goo_display/insert field out)) fields
+  + zeros
+    \ n=nat
+    ^ str
+    % i=nat 0 out=str ""
+    ? (eq i n) out
+    | _ i.inc out.snoc_byte(48)
+  + decimal
+    ' Shortest round-tripping decimal, rounded to nearest with ties to even.
+    ' Exponent is biased by 400 so all arithmetic remains natural.
+    \ value=goo/scalar
+    ^ str
+    > (./some ratio) (goo_number/ratio (show (goo_number/encode value))) "0"
+    ? (eq ratio.numerator 0) "0"
+    = scaled
+        % n=nat ratio.numerator d=nat ratio.denominator exp=nat 400
+        ^ row[nat]
+        ? (ge n (mul 10 d)) (_ n (mul 10 d) exp.inc)
+        ? (lt n d) (_ (mul n 10) d (sub exp 1))
+        [n d exp]
+      digits
+        % places=nat 1
+        ^ row[nat]
+        = coefficient (goo_number/round (mul scaled.at(0) (goo_number/power 10 (sub places 1))) scaled.at(1))
+          exponent (sub scaled.at(2) (sub places 1))
+          n (? (ge exponent 400) (mul coefficient (goo_number/power 10 (sub exponent 400))) coefficient)
+          d (? (ge exponent 400) 1 (goo_number/power 10 (sub 400 exponent)))
+          roundtrip (goo_number/finite ratio.negative n d)
+          equal=bool
+            ? roundtrip
+             > (./some result) (eq result.bits value.bits)
+            .false
+        ? (equal || (ge places 17)) [coefficient exponent]
+        | _ places.inc
+      stripped
+        % coefficient=nat digits.at(0) exponent=nat digits.at(1)
+        ^ row[nat]
+        ? (eq (mod coefficient 10) 0) (_ (div coefficient 10) exponent.inc)
+        [coefficient exponent]
+      coefficient stripped.at(0).show
+      exponent stripped.at(1)
+      point (add exponent coefficient.len)
+      sign=str (? ratio.negative "-" "")
+      zeros (\ n=nat (goo_display/zeros n))
+      body=str
+        ? (ge exponent 400) (str/cat_all [coefficient (zeros (sub exponent 400))])
+        ? (gt point 400) (str/cat_all [coefficient.slice(0 (sub point 400)) "." coefficient.slice((sub point 400) coefficient.len)])
+        ? (gt point 394) (str/cat_all ["0." (zeros (sub 400 point)) coefficient])
+        | str/cat_all [coefficient.slice(0 1) "." (? (eq coefficient.len 1) "0" coefficient.slice(1 coefficient.len)) "e-" (sub 401 point).show]
+    | str/cat_all [sign body]
+  + value
+    \ value=json
+    ^ rex
+    ? value
+     > (json/str text) (goo_display/string text)
+     > (json/obj fields) (goo_display/record (goo_display/sorted fields).map((\ field=jkv (goo_display/pair field.k (goo_display/value field.v)))))
+     > (json/arr values) (rex/expr rex/zero_span "brack" values.map(goo_display/value))
+     > (json/real _)
+      ? (goo_number/decode value)
+       > (./some number) (rex/word (goo_display/decimal number))
+      (rex/word (show value))
+    | rex/word (show value)
+  + alias
+    \ ids=row[str] key=str value=json
+    ^ json
+    ? value
+     > (json/obj fields) (json/obj fields.map((\ field=jkv (jkv field.k (goo_display/alias ids field.k field.v)))))
+     > (json/str text)
+      ? !((eq key "id") || (eq key "leftId") || (eq key "rightId") || (eq key "parent")) value
+      % i=nat 0
+      ^ json
+      ? (eq i ids.len) value
+      ? (eq ids.at(i) text) (json/str (str/cat_all ["node-" i.inc.show]))
+      | _ i.inc
+    value
+  + collect
+    \ tree=json
+    ^ row[str]
+    = id (goo_display/text (goo_display/get (goo_display/get tree "attrs") "id"))
+      kids (goo_display/array (goo_display/get tree "children"))
+      initial=row[str] (? (eq id "") [] [id])
+    | row/fold[json row[str]] initial (\ out child out.weld((goo_display/collect child))) kids
+  + fields
+    \ attrs=json ids=row[str]
+    ^ row[goo_display/pair]
+    = keys=row[str] ["slot" "optional" "origin" "grow" "maxIdeal" "primary" "toggle" "label" "optionLabel" "value" "max" "id" "after" "metrics" "layout"]
+    > (json/obj fields) attrs []
+    % i=nat 0 out=row[goo_display/pair] []
+    ? (eq i keys.len) out
+    = key keys.at(i)
+      next=row[goo_display/pair]
+        ? (goo_codec/field fields key)
+         > (./some value) out.snoc((goo_display/pair key (goo_display/value (goo_display/alias ids key value))))
+        out
+    | _ i.inc next
+  + tree
+    \ ids=row[str] tree=json
+    ^ rex
+    ? tree
+     > (json/nul _) (goo_display/value jnull)
+    = cfg (goo_display/record (goo_display/fields (goo_display/get tree "attrs") ids))
+      constructor (goo_display/text (goo_display/get tree "constructor"))
+      kids (goo_display/array (goo_display/get tree "children"))
+    ? ((eq constructor "flow") || (eq constructor "group") || (eq constructor "opt"))
+      = name=str
+          ? (eq constructor "flow") (? (eq (goo_display/text (goo_display/get tree "direction")) "Row") "row" "col")
+          constructor
+        args=row[rex] (? (eq name "opt") [cfg (goo_display/value (goo_display/get tree "rank"))] [cfg])
+        items (row/fold[json row[rex]] [] (\ out child out.weld((goo_display/items (goo_display/tree ids child)))) kids)
+      | rex/expr rex/zero_span "clear" [(goo_display/call name args) (rex/expr rex/zero_span "curly" items)]
+    = name=str (? (eq constructor "primitive") (goo_display/text (goo_display/get tree "kind")) constructor)
+      payload (goo_display/text (goo_display/get tree (? (eq constructor "image") "src" "text")))
+    | goo_display/call name [cfg (goo_display/string payload)]
+  + items
+    \ tree=rex
+    ^ row[rex]
+    ? tree
+     > (./expr _ color kids) (? (eq color "clear") kids [tree])
+    [tree]
+  + name
+    \ name=str
+    ^ str
+    ? ((eq name "core") || (eq name "normalized")) "normalize"
+    ? (eq name "visible") "visibility"
+    name
+  + summary
+    \ name=str
+    ^ str
+    ? (eq name "parse") "Source → Rex trees"
+    ? (eq name "read") "Rex → typed source Goo"
+    ? (eq name "normalize") "Normalize source sugar; allocate UUIDs once"
+    ? (eq name "visibility") "Optional budget and host hiding → surviving named groups"
+    "Exact parent-owned sibling adjacency"
+  + output
+    \ ids=row[str] value=goo_result/output
+    ^ row[rex]
+    ? value
+     > (./parsed trees) trees
+    [(goo_display/tree ids (goo_inspect/output value))]
+  + snapshot
+    \ ids=row[str] entry=goo_result/entry
+    ^ json
+    = name (goo_display/name entry.name)
+      actual=row[rex]
+        ? entry.result
+         > (./succeeded value _) (goo_display/output [] value)
+        []
+      aliased=row[rex]
+        ? entry.result
+         > (./succeeded value _) (goo_display/output ids value)
+        []
+      ds=row[goo_result/diagnostic]
+        ? entry.result
+         > (./succeeded _ ds) ds
+         > (./rejected _ ds) ds
+        []
+    | json/obj [(jkv "name" (json/str name)) (jkv "summary" (json/str (goo_display/summary name))) (jkv "trees" (json/arr actual.map(goo_rex_boundary/node))) (jkv "diffTrees" (json/arr aliased.map(goo_rex_boundary/node))) (jkv "diffable" (json/boo ((eq name "visibility") || (eq name "semantic")))) (jkv "diagnostics" (json/arr ds.map((goo_inspect/diagnostic name))))]
+  + compile
+    \ trees=row[rex] options=str identities=str
+    ^ str
+    | show (goo_display/compile_value trees options identities)
+  + compile_value
+    \ trees=row[rex] options=str identities=str
+    ^ json
+    | goo_display/compile_mode trees options identities .true
+  + compile_mode
+    \ trees=row[rex] options=str identities=str inspect=bool
+    ^ json
+    > (./ok options _) (parse options) (goo_compile/protocol_value unit/unit)
+    > (./some request) (goo_compile/request options) (goo_compile/protocol_value unit/unit)
+    > (./ok ids _) (parse identities) (goo_compile/protocol_value unit/unit)
+    > (./some ids) (goo_compile/ids ids) (goo_compile/protocol_value unit/unit)
+    = state (goo_compile/execute trees request ids)
+      entries state.checkpoint.passes
+      snaps=row[json]
+        ? inspect
+          = aliases (row/fold[goo_result/entry row[str]] [] goo_display/aliases entries)
+          | row/fold[goo_result/entry row[json]] [] (goo_display/append_snapshot aliases) entries
+        | entries.map(goo_display/diagnostic_snapshot)
+      success=bool
+        ? state
+         > (./ended result)
+          ? result.completion
+           > (./succeeded _) .true
+          .false
+        .false
+      tree=json
+        ? state
+         > (./ended result)
+          ? result.completion
+           > (./succeeded tree) (goo_codec/optional_json[goo/semantic] goo_codec/semantic_json tree)
+          jnull
+        jnull
+      crash=json
+        ? state
+         > (./ended result)
+          ? result.completion
+           > (./crashed stage message) (json/obj [(jkv "name" (json/str (goo_display/name stage))) (jkv "message" (json/str message))])
+          jnull
+        jnull
+    | (json/obj [(jkv "version" (goo_codec/number 1)) (jkv "ok" (json/boo .true)) (jkv "success" (json/boo success)) (jkv "viewPath" (json/str request.context.view_path.display)) (jkv "tree" tree) (jkv "snapshots" (json/arr snaps)) (jkv "crash" crash)])
+  + aliases
+    \ out=row[str] entry=goo_result/entry
+    ^ row[str]
+    ? entry.result
+     > (./succeeded value _)
+      ? value
+       > (./normalized tree) (goo_display/collect (goo_inspect/normalized tree))
+      out
+    out
+  + append_snapshot
+    \ aliases=row[str] out=row[json] entry=goo_result/entry
+    ^ row[json]
+    ? entry.result
+     > (./crashed _) out
+     > (./succeeded _ _)
+      ? (eq entry.name "core") out
+      out.snoc((goo_display/snapshot aliases entry))
+    out.snoc((goo_display/snapshot aliases entry))
+  + geometry
+    \ plan=goo_measure/plan
+    ^ json
+    = rows=json
+        ? plan.rows
+         > ./none jnull
+         > (./some rows) (json/arr rows.map(goo_display/geometry_row))
+    | json/obj [(jkv "w" (goo_number/encode plan.width)) (jkv "h" (goo_number/encode plan.height)) (jkv "cost" (goo_number/encode plan.cost)) (jkv "rows" rows)]
+  + geometry_row
+    \ row=goo_measure/plan_row
+    ^ json
+    = gaps=json
+        ? row.gaps
+         > ./none jnull
+         > (./some gaps) (json/arr gaps.map(goo_number/encode))
+    | json/obj [(jkv "start" (goo_codec/number row.start)) (jkv "end" (goo_codec/number row.end)) (jkv "gap" (goo_number/encode row.gap)) (jkv "h" (goo_number/encode row.height)) (jkv "rowGaps" gaps)]
+  + measured_tree
+    \ sizes=json plans=row[goo_measure/plan] layout=bool tree=json
+    ^ json
+    > (json/obj fields) tree tree
+    > (json/obj attrs) (goo_display/get tree "attrs") tree
+    = id (goo_display/text (goo_display/get (json/obj attrs) "id"))
+      attrs attrs.snoc((jkv "metrics" (goo_display/get sizes id)))
+      attrs=row[jkv]
+        ? !layout attrs
+        % i=nat 0
+        ^ row[jkv]
+        ? (eq i plans.len) attrs
+        ? (eq plans.at(i).id.text id) attrs.snoc((jkv "layout" (goo_display/geometry plans.at(i))))
+        | _ i.inc
+    | json/obj fields.map((\ field=jkv (goo_display/measured_field sizes plans layout attrs field)))
+  + measured_field
+    \ sizes=json plans=row[goo_measure/plan] layout=bool attrs=row[jkv] field=jkv
+    ^ jkv
+    ? (eq field.k "attrs") (jkv "attrs" (json/obj attrs))
+    ? (eq field.k "children") (jkv "children" (json/arr (goo_display/array field.v).map((goo_display/measured_tree sizes plans layout))))
+    field
+  + measured_snapshot
+    \ name=str summary=str diffable=bool tree=rex
+    ^ json
+    = trees (json/arr [(goo_rex_boundary/node tree)])
+    | json/obj [(jkv "name" (json/str name)) (jkv "summary" (json/str summary)) (jkv "diffable" (json/boo diffable)) (jkv "trees" trees) (jkv "diffTrees" trees) (jkv "diagnostics" (json/arr []))]
+  + measured
+    \ input=str
+    ^ str
+    | show (goo_display/measured_value input)
+  + measured_value
+    \ input=str
+    ^ json
+    > (./ok value _) (parse input) (goo_compile/protocol_value unit/unit)
+    > (./some result) (goo_measure/decode_result value) (goo_compile/protocol_value unit/unit)
+    = raw result.value
+      tree (goo_codec/optional_json[goo/semantic] goo_inspect/semantic raw.tree)
+      sizes (goo_measure/encode_sizes raw.sizes)
+      plans=row[goo_measure/plan]
+        ? raw.plan
+         > ./none []
+         > (./some plan) (goo_measure/plans plan)
+      metric (goo_display/tree [] (goo_display/measured_tree sizes plans .false tree))
+      layout (goo_display/tree [] (goo_display/measured_tree sizes plans .true tree))
+      trace (goo_display/call "trace" [(goo_display/record []) (goo_display/value (json/arr raw.traces.map(goo_measure/encode_trace)))])
+      snapshots=row[json] [(goo_display/measured_snapshot "metric" "Measured leaf sizes → recursive group summaries" .false metric) (goo_display/measured_snapshot "layout" "Quantized widths → optimal contiguous rows and geometry" .true layout) (goo_display/measured_snapshot "adjacency-trace" "Effective gaps, cuts, exact rule IDs, and owning parents" .false trace)]
+    | (json/obj [(jkv "ok" (json/boo .true)) (jkv "snapshots" (json/arr snapshots))])
+  + diagnostic_snapshot
+    \ entry=goo_result/entry
+    ^ json
+    = ds=row[goo_result/diagnostic]
+        ? entry.result
+         > (./succeeded _ diagnostics) diagnostics
+         > (./rejected _ diagnostics) diagnostics
+        []
+    | json/obj [(jkv "diagnostics" (json/arr ds.map((goo_inspect/diagnostic (goo_display/name entry.name)))))]

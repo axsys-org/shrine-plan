@@ -1,0 +1,341 @@
+- goo_app/pages
+- goo_app/application_json
+
++ goo_views
+  + txt
+    \ value=json key=str
+    ^ str
+    | goo_display/text (goo_display/get value key)
+  + yes
+    \ value=json key=str
+    ^ bool
+    ? (goo_display/get value key)
+     > (json/boo value) value
+    .false
+  + cls
+    \ names=str
+    ^ goo_html/attribute
+    = utils (str/split_nonempty 32 names).map(goo_views/utility)
+    | goo_html/attribute "class" (str/cat_all utils.map((\ text=str (str/cat_all [" " text]))).cons(names))
+  + tag
+    \ tag=str cls=str content=str
+    ^ str
+    | goo_html/tag tag [(goo_views/cls cls)] content
+  + inline
+    \ text=str
+    ^ str
+    = segments (str/split_byte 96 text)
+    % i=nat 0 out=row[str] []
+    ? (eq i segments.len) (str/cat_all out)
+    = text (goo_html/escape segments.at(i))
+      text=str (? (eq (mod i 2) 1) (goo_views/tag "code" "font-mono bg-canvas px-1 rounded" text) text)
+    | _ i.inc out.snoc(text)
+  + location
+    \ diag=json
+    ^ str
+    = loc (goo_display/get diag "location")
+    ? loc
+     > (json/nul _) "-"
+    | str/cat_all [(show (goo_display/get loc "line")) ":" (show (goo_display/get loc "column"))]
+  + diagnostic
+    \ pass=bool diag=json
+    ^ str
+    = severity=str (? (eq (goo_views/txt diag "severity") "error") "err" "warn")
+      loc (goo_display/get diag "location")
+      attrs=row[goo_html/attribute] [(goo_views/cls (str/cat_all ["diag " severity]))]
+      attrs=row[goo_html/attribute]
+        ? loc
+         > (json/nul _) attrs
+        attrs.weld([(goo_html/attribute "data-line" (show (goo_display/get loc "line"))) (goo_html/attribute "data-col" (show (goo_display/get loc "column"))) (goo_html/attribute "title" "Jump to source")])
+      content (str/cat_all [(goo_views/tag "span" "loc" (goo_views/location diag)) (? pass (goo_views/tag "span" "diag-pass" (goo_html/escape (goo_views/txt diag "stage"))) "") (goo_views/tag "span" "msg" (str/cat_all [(goo_views/tag "strong" "font-semibold" (str/cat_all [severity ": "])) (goo_views/inline (goo_views/txt diag "message"))]))])
+    | goo_html/tag "li" attrs content
+  + count
+    \ ds=row[json] severity=str
+    ^ nat
+    | row/fold[json nat] 0 (\ n d (add n (? (eq (goo_views/txt d "severity") severity) 1 0))) ds
+  + badge
+    \ ds=row[json] severity=str cls=str
+    ^ str
+    = count (goo_views/count ds severity)
+    ? (eq count 0) ""
+    | goo_views/tag "span" (str/cat_all ["badge " cls]) (str/cat_all [count.show " " severity (? (eq count 1) "" "s")])
+  + line
+    : kind=nat text=str
+  + lines
+    \ text=str
+    ^ row[str]
+    ? (eq text "") []
+    = values (str/split_byte 10 text)
+    ? (eq text.at((sub text.len 1)) 10) values.take((sub values.len 1))
+    values
+  + snake
+    \ a=row[str] b=row[str] path=goo_views/path
+    ^ goo_views/path
+    % x=nat path.x y=nat path.y lines=list[goo_views/line] path.lines
+    ? ((eq x a.len) || (eq y b.len)) (goo_views/path x y lines)
+    ? !(eq a.at(x) b.at(y)) (goo_views/path x y lines)
+    | _ x.inc y.inc (list/cons (goo_views/line 0 a.at(x)) lines)
+  + path
+    : x=nat y=nat lines=list[goo_views/line]
+  + diff
+    ' Myers shortest edit script; diagonal index is biased by the edit depth.
+    \ a=row[str] b=row[str]
+    ^ row[goo_views/line]
+    ? (goo_views/subsequence a b 1)
+     > (./some lines) lines
+    ? (goo_views/subsequence b a 2)
+     > (./some lines) lines
+    = initial (goo_views/snake a b (goo_views/path 0 0 .nil))
+    ? ((eq initial.x a.len) || (eq initial.y b.len)) (goo_views/tail a b initial)
+    % depth=nat 1 previous=row[goo_views/path] [initial]
+    = next=row[goo_views/path]
+        % k=nat 0 out=list[goo_views/path] .nil
+        ? (gt k depth) out.row.rev
+        = add=bool
+            ? (eq k 0) .true
+            ? (eq k depth) .false
+            | lt previous.at((sub k 1)).x previous.at(k).x
+          base=goo_views/path (? add previous.at(k) previous.at((sub k 1)))
+          valid=bool (? add (lt base.y b.len) (lt base.x a.len))
+          path=goo_views/path
+            ? !valid base
+            ? add (goo_views/path base.x base.y.inc (list/cons (goo_views/line 1 b.at(base.y)) base.lines))
+            | goo_views/path base.x.inc base.y (list/cons (goo_views/line 2 a.at(base.x)) base.lines)
+        | _ k.inc (list/cons (goo_views/snake a b path) out)
+      done=maybe[row[goo_views/line]]
+        % i=nat 0
+        ^ maybe[row[goo_views/line]]
+        ? (eq i next.len) .none
+        = p next.at(i)
+        ? (eq p.x a.len)
+          ? (eq p.y b.len) (./some (goo_views/forward p.lines))
+          (_ i.inc)
+        | _ i.inc
+    ? done
+     > (./some lines) lines
+    | _ depth.inc next
+  + tail
+    \ a=row[str] b=row[str] path=goo_views/path
+    ^ row[goo_views/line]
+    = lines (goo_views/forward path.lines).weld(a.drop(path.x).map((\ text=str (goo_views/line 2 text))))
+    | lines.weld(b.drop(path.y).map((\ text=str (goo_views/line 1 text))))
+  + far
+    \ lines=row[goo_views/line] index=nat
+    ^ bool
+    ? !(eq lines.at(index).kind 0) .false
+    % i=nat (sub index 2)
+    ? (ge i lines.len) .true
+    ? (gt i (add index 2)) .true
+    ? !(eq lines.at(i).kind 0) .false
+    | _ i.inc
+  + line_html
+    \ cls=str line=goo_views/line
+    ^ str
+    | goo_views/tag "span" cls (goo_html/escape (? (eq line.text "") " " line.text))
+  + render_lines
+    \ lines=row[goo_views/line]
+    ^ str
+    % i=nat 0 out=list[str] .nil
+    ? (eq i lines.len) (str/cat_all out.row.rev)
+    ? (goo_views/far lines i)
+      = end
+          % end=nat i
+          ? (eq end lines.len) end
+          ? !(goo_views/far lines end) end
+          | _ end.inc
+        count (sub end i)
+        gap (goo_views/tag "span" "ln gap" (str/cat_all ["⋯ " count.show " unchanged line" (? (eq count 1) "" "s")]))
+        run (str/cat_all lines.drop(i).take(count).map((goo_views/line_html "ln far")))
+      | _ end (list/cons (str/cat_all [gap run]) out)
+    = line lines.at(i)
+      cls=str (? (eq line.kind 1) "ln add" (? (eq line.kind 2) "ln del" "ln"))
+    | _ i.inc (list/cons (goo_views/line_html cls line) out)
+  + card
+    \ index=nat previous=maybe[json] snapshot=json
+    ^ str
+    = diffable (goo_views/yes snapshot "diffable")
+      output (goo_views/lines (goo_views/txt snapshot "output"))
+      lines=row[goo_views/line]
+        ? previous
+         > (./some prev)
+          ? diffable (goo_views/diff (goo_views/lines (goo_views/txt prev "diffOutput")) (goo_views/lines (goo_views/txt snapshot "diffOutput")))
+          output.map((\ text=str (goo_views/line 0 text)))
+        output.map((\ text=str (goo_views/line 0 text)))
+      stats=str
+        ? previous
+         > (./some _)
+          ? !diffable ""
+          = added (row/fold[goo_views/line nat] 0 (\ n line (add n (? (eq line.kind 1) 1 0))) lines)
+            removed (row/fold[goo_views/line nat] 0 (\ n line (add n (? (eq line.kind 2) 1 0))) lines)
+          ? (eq (add added removed) 0) (goo_views/tag "span" "stat same" "no change")
+          | str/cat_all [(goo_views/tag "span" "stat add" (str/cat_all ["+" added.show])) (goo_views/tag "span" "stat del" (str/cat_all ["−" removed.show]))]
+        ""
+      diagnostics (goo_display/array (goo_display/get snapshot "diagnostics"))
+      name (goo_views/txt snapshot "name")
+      title (goo_views/tag "div" "pass-title" (str/cat_all [(goo_views/tag "span" "idx" index.show) (goo_views/tag "span" "name" (goo_html/escape name)) stats (goo_views/badge diagnostics "error" "err") (goo_views/badge diagnostics "warning" "warn")]))
+      desc (goo_views/tag "div" "desc" (goo_views/inline (goo_views/txt snapshot "summary")))
+      summary (goo_views/tag "summary" "list-none cursor-pointer px-3 py-2" (str/cat_all [title desc]))
+      ds=str (? (eq diagnostics.len 0) "" (goo_views/tag "ul" "diags" (str/cat_all diagnostics.map((goo_views/diagnostic .false)))))
+      wrap=bool (? diffable .false (row/any[str] (\ text=str (? (le text.len 160) .false (gt (goo_views/characters text) 160))) output))
+      pre (goo_views/tag "pre" (? wrap "ir wrap" "ir") (goo_views/render_lines lines))
+    | goo_html/tag "details" [(goo_views/cls "pass") (goo_html/attribute "data-pass" name) (goo_html/attribute "open" "")] (str/cat_all [summary ds pre])
+  + cards
+    \ measured=bool snapshots=row[json]
+    ^ str
+    % i=nat 0 out=row[str] []
+    ? (eq i snapshots.len) (str/cat_all out)
+    = previous=maybe[json] (? (measured || (eq i 0)) .none (./some snapshots.at((sub i 1))))
+    | _ i.inc out.snoc((goo_views/card (add i (? measured 6 1)) previous snapshots.at(i)))
+  + safe_json
+    \ value=json
+    ^ str
+    | goo_app_json/script value
+  + preview
+    \ path=str tree=json
+    ^ str
+    = context (goo/path/trusted path)
+      input (json/obj [(jkv "version" (goo_codec/number 1)) (jkv "viewPath" (json/str path)) (jkv "tree" tree)])
+      root (goo_html/tag "div" [(goo_html/attribute "id" "goo-render-root") (goo_html/attribute "style" (str/cat_all ["outline:2px solid " (goo_html/color context) ";outline-offset:2px"]))] "")
+      script (goo_html/tag "script" [(goo_html/attribute "id" "goo-render-input") (goo_html/attribute "type" "application/json")] (goo_views/safe_json input))
+    | str/cat_all ["<!DOCTYPE HTML><html><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1""><title>Goo reference layout</title><link rel=""stylesheet"" href=""static/goo.generated.css""><link rel=""stylesheet"" href=""/static/reference.css""><link rel=""stylesheet"" href=""/static/ascii-fonts.css""></head><body>" root script "</body></html>"]
+  + diag_before
+    \ left=json right=json
+    ^ bool
+    = a (goo_display/get left "location")
+      b (goo_display/get right "location")
+    ? a
+     > (json/nul _) .false
+    ? b
+     > (json/nul _) .true
+    = al (goo_display/get a "line")
+      bl (goo_display/get b "line")
+    > (./some al) (goo_number/integer al) .false
+    > (./some bl) (goo_number/integer bl) .false
+    ? !(eq al bl) (lt al bl)
+    > (./some ac) (goo_number/integer (goo_display/get a "column")) .false
+    > (./some bc) (goo_number/integer (goo_display/get b "column")) .false
+    | lt ac bc
+  + diag_insert
+    \ ds=row[json] diag=json
+    ^ row[json]
+    % i=nat 0 out=row[json] [] placed=bool .false
+    ? (eq i ds.len) (? placed out out.snoc(diag))
+    = before=bool (? placed .false (goo_views/diag_before diag ds.at(i)))
+      out (? before out.snoc(diag) out)
+    | _ i.inc out.snoc(ds.at(i)) (placed || before)
+  + lower
+    \ result=json
+    ^ json
+    | goo_views/lower_mode result .true
+  + lower_mode
+    \ result=json include_passes=bool
+    ^ json
+    = snapshots (goo_display/array (goo_display/get result "snapshots"))
+      path (goo_views/txt result "viewPath")
+      ds (row/fold[json row[json]] [] (\ out snap out.weld((goo_display/array (goo_display/get snap "diagnostics")))) snapshots)
+      ds (row/fold[json row[json]] [] goo_views/diag_insert ds)
+      diagnostics=str
+        ? (eq ds.len 0) (goo_views/tag "li" "diag ok" "No problems")
+        | str/cat_all ds.map((goo_views/diagnostic .true))
+      active (goo_views/tag "div" "active-view muted" (goo_html/escape (str/cat_all ["View: " path])))
+      output=str (? (goo_views/yes result "success") (goo_views/preview path (goo_display/get result "tree")) "")
+      crash (goo_display/get result "crash")
+      crash_body=str
+        ? crash
+         > (json/nul _) ""
+        | str/cat_all [(goo_html/tag "strong" [] (goo_html/escape (str/cat_all ["Pass `" (goo_views/txt crash "name") "` threw an exception"]))) (goo_html/tag "pre" [] (goo_html/escape (goo_views/txt crash "message")))]
+      crash_card=str (? (eq crash_body "") "" (goo_views/tag "div" "crash" crash_body))
+      output=str (? (eq crash_body "") output (goo_views/crash_page crash))
+      crash_name=json
+        ? crash
+         > (json/nul _) jnull
+        (goo_display/get crash "name")
+    | json/obj [(jkv "viewPath" (json/str path)) (jkv "passes" (json/str (? include_passes (str/cat_all [active (goo_views/cards .false snapshots) crash_card]) ""))) (jkv "diagnostics" (json/str diagnostics)) (jkv "output" (json/str output)) (jkv "errors" (goo_codec/number (goo_views/count ds "error"))) (jkv "warnings" (goo_codec/number (goo_views/count ds "warning"))) (jkv "crashed" crash_name)]
+  + run
+    \ source=str
+    ^ str
+    > (./ok request _) (parse source) (goo_compile/protocol_error unit/unit)
+    = action (goo_views/txt request "action")
+      result=json
+        ? (eq action "lower") (goo_views/lower (goo_display/get request "result"))
+        ? (eq action "rendered") (json/obj [(jkv "passes" (json/str (goo_views/cards .true (goo_display/array (goo_display/get request "snapshots")))) )])
+        ? (eq action "page") (json/obj [(jkv "html" (json/str (goo_pages/inspector (goo_display/array (goo_display/get request "names")).map(goo_display/text) (goo_views/txt request "current") (goo_views/txt request "source"))))])
+        ? (eq action "gallery") (json/obj [(jkv "html" (json/str (goo_pages/gallery (goo_display/array (goo_display/get request "examples")))))])
+        jnull
+    | goo_app_json/encode result
+  + utility
+    \ name=str
+    ^ str
+    ? (eq name "inspector") "m-0 p-0 font-ui text-sm leading-normal bg-canvas text-ink"
+    ? (eq name "bar") "flex flex-wrap items-center gap-4 px-4 py-2 bg-panel border-b border-line"
+    ? (eq name "brand") "flex items-baseline gap-2"
+    ? (eq name "controls") "flex flex-wrap items-center gap-2"
+    ? (eq name "control") "border border-line rounded-control bg-panel text-ink px-2 py-1 text-sm outline-accent outline-offset-2"
+    ? (eq name "muted") "text-muted"
+    ? (eq name "status") "ml-auto text-xs px-2 py-1 rounded-full bg-canvas text-muted"
+    ? (eq name "goo-panes") "grid min-h-0"
+    ? (eq name "pane") "flex flex-col min-w-0 min-h-0 bg-panel border-r border-line"
+    ? (eq name "pane-head") "flex flex-wrap items-center justify-between gap-2 px-3 py-2 border-b border-line"
+    ? (eq name "toggle") "inline-flex items-center gap-1 text-muted text-xs cursor-pointer select-none whitespace-nowrap"
+    ? (eq name "editor") "flex-1 min-h-0 w-full resize-none border-0 outline-none p-3 bg-canvas text-ink font-mono text-sm leading-relaxed whitespace-pre overflow-auto"
+    ? (eq name "source-foot") "overflow-auto border-t border-line"
+    ? (eq name "diags") "list-none m-0 py-1"
+    ? (eq name "diag") "flex gap-2 items-baseline px-3 py-1 text-xs"
+    ? (eq name "loc") "font-mono text-muted shrink-0"
+    ? (eq name "diag-pass") "font-mono text-muted"
+    ? (eq name "reference") "border-t border-line px-3 py-2"
+    ? (eq name "passes") "flex-1 overflow-auto p-3"
+    ? (eq name "active-view") "px-3 py-2 text-xs break-words"
+    ? (eq name "pass") "bg-panel border border-line rounded-lg mb-2 overflow-hidden"
+    ? (eq name "pass-title") "flex flex-wrap items-center gap-2"
+    ? (eq name "idx") "inline-grid place-items-center w-5 h-5 rounded-full bg-canvas text-muted text-xs tabular-nums"
+    ? (eq name "name") "font-mono font-semibold"
+    ? (eq name "stat") "font-mono text-xs"
+    ? (eq name "same") "text-muted"
+    ? (eq name "add") "text-accent bg-selected"
+    ? (eq name "del") "text-danger bg-red-50"
+    ? (eq name "badge") "text-xs px-2 rounded-full font-semibold"
+    ? (eq name "err") "text-danger bg-red-50"
+    ? (eq name "warn") "text-amber-800 bg-amber-50"
+    ? (eq name "ok") "text-accent"
+    ? (eq name "desc") "mt-1 ml-7 text-muted text-xs"
+    ? (eq name "ir") "m-0 py-2 border-t border-line font-mono text-xs leading-relaxed overflow-x-auto"
+    ? (eq name "ln") "block relative pl-6 pr-3 whitespace-pre w-max min-w-full"
+    ? (eq name "gap") "text-muted italic"
+    ? (eq name "crash") "border border-danger bg-red-50 text-danger rounded-lg px-3 py-2"
+    ? (eq name "frame-wrap") "flex-1 min-h-0 flex justify-center overflow-auto bg-canvas"
+    ""
+  + crash_page
+    \ crash=json
+    ^ str
+    = title (goo_views/tag "h1" "text-xl font-semibold" (goo_html/escape (str/cat_all ["Pass `" (goo_views/txt crash "name") "` threw an exception"])))
+      message (goo_views/tag "pre" "whitespace-pre-wrap font-mono text-sm" (goo_html/escape (goo_views/txt crash "message")))
+    | str/cat_all ["<!DOCTYPE HTML><html><head><link rel=""stylesheet"" href=""static/goo.generated.css""></head>" (goo_views/tag "body" "p-6 font-ui bg-canvas text-danger" (str/cat_all [title message])) "</html>"]
+  + characters
+    \ text=str
+    ^ nat
+    % i=nat 0 count=nat 0
+    ? (eq i text.len) count
+    = byte text.at(i)
+    | _ i.inc (add count (? ((lt byte 128) || (ge byte 192)) 1 0))
+  + forward
+    \ reversed=list[goo_views/line]
+    ^ row[goo_views/line]
+    = forward=list[goo_views/line]
+        % rest=list[goo_views/line] reversed out=list[goo_views/line] .nil
+        ? rest.is_nil out
+        | _ rest.tail (list/cons rest.head out)
+    | list/row[goo_views/line] forward
+  + subsequence
+    ' Pure insertion/deletion scripts have a single greedy shortest path.
+    ' Recognize them before opening a quadratic Myers frontier.
+    \ small=row[str] large=row[str] kind=nat
+    ^ maybe[row[goo_views/line]]
+    % i=nat 0 j=nat 0 reversed=list[goo_views/line] .nil
+    ^ maybe[row[goo_views/line]]
+    ? (eq j large.len)
+      ? (eq i small.len) (./some (goo_views/forward reversed))
+      .none
+    = same=bool (? (eq i small.len) .false (eq small.at(i) large.at(j)))
+      line (goo_views/line (? same 0 kind) large.at(j))
+    | _ (add i (? same 1 0)) j.inc (list/cons line reversed)

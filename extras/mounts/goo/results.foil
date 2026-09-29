@@ -1,0 +1,140 @@
+- goo_app/types
+- goo_app/rex_boundary
+- rex
+
++ goo_result
+  + severity
+    & goo_result/severity/error goo_result/severity/warning
+    + error
+      :
+    + warning
+      :
+  + diagnostic
+    : severity=goo_result/severity location=maybe[goo/loc] message=str
+    + is_error
+      \ value=goo_result/diagnostic
+      ^ bool
+      ? value.severity
+       > ./error .true
+       > ./warning .false
+    + render_location
+      \ value=goo_result/diagnostic
+      ^ str
+      ? value.location
+       > (./some loc) (str/cat_all [(nat/show loc.line) ":" (nat/show loc.column)])
+       > ./none "-"
+  + has_errors
+    \ diagnostics=row[goo_result/diagnostic]
+    ^ bool
+    | row/any[goo_result/diagnostic] goo_result/diagnostic/is_error diagnostics
+  + rex_diagnostics
+    \ tree=rex
+    ^ row[goo_result/diagnostic]
+    ? tree.leaf_error
+     > (./some reason)
+      = sp tree.span
+        location=maybe[goo/loc]
+          ? (eq sp.line 0) .none
+          | ./some (goo/loc sp.line (? (eq sp.column 0) 1 sp.column))
+      [(goo_result/diagnostic (goo_result/severity/error) location (goo_rex_boundary/reason_text reason))]
+    | row/fold[rex row[goo_result/diagnostic]] [] (\ acc child acc.weld((goo_result/rex_diagnostics child))) tree.children
+  + pass
+    (@@ v)
+    & goo_result/pass/succeeded[v] goo_result/pass/rejected[v] goo_result/pass/crashed
+    + succeeded
+      : value=v diagnostics=row[goo_result/diagnostic]
+    + rejected
+      : partial=maybe[v] diagnostics=row[goo_result/diagnostic]
+    + crashed
+      : message=str
+    + classify
+      ' An error can retain partial output. Warnings alone never reject a pass.
+      \ value=v diagnostics=row[goo_result/diagnostic]
+      ^ goo_result/pass[v]
+      ? (goo_result/has_errors diagnostics) (goo_result/pass/rejected[v] (./some value) diagnostics)
+      | goo_result/pass/succeeded[v] value diagnostics
+    + failed
+      \ value=goo_result/pass[v]
+      ^ bool
+      ? value
+       > (./succeeded _ _) .false
+      .true
+  + attempt
+    ' Cancellation is control flow, not a pass diagnostic or crash.
+    (@@ v)
+    & goo_result/attempt/delivered[v] goo_result/attempt/cancelled
+    + delivered
+      : result=goo_result/pass[v]
+    + cancelled
+      :
+  + output
+    & goo_result/output/parsed goo_result/output/read goo_result/output/core
+      goo_result/output/normalized goo_result/output/visible goo_result/output/semantic
+    + parsed
+      : trees=row[rex]
+    + read
+      : tree=goo/source
+    + core
+      : tree=goo/core
+    + normalized
+      : tree=goo/normalized
+    + visible
+      : tree=maybe[goo/visible]
+    + semantic
+      : tree=maybe[goo/semantic]
+  + entry
+    : name=str summary=str result=goo_result/pass[goo_result/output]
+  + progress
+    : context=goo/compile_context passes=row[goo_result/entry]
+  + completion
+    & goo_result/completion/succeeded goo_result/completion/rejected goo_result/completion/crashed
+    + succeeded
+      : tree=maybe[goo/semantic]
+    + rejected
+      :
+    + crashed
+      : stage=str message=str
+  + compiled
+    : progress=goo_result/progress completion=goo_result/completion
+  + control
+    & goo_result/control/active goo_result/control/ended goo_result/control/cancelled
+    + active
+      : progress=goo_result/progress
+    + ended
+      : result=goo_result/compiled
+    + cancelled
+      : progress=goo_result/progress
+    + start
+      \ context=goo/compile_context
+      ^ goo_result/control
+      | goo_result/control/active (goo_result/progress context [])
+    + checkpoint
+      \ state=goo_result/control
+      ^ goo_result/progress
+      ? state
+       > (./active progress) progress
+       > (./ended result) result.progress
+       > (./cancelled progress) progress
+    + step
+      ' This records a supplied pass; it does not choose or implement the pipeline.
+      ' Terminal states never evaluate a later action. No blanket exception catch.
+      \ name=str summary=str action={\ unit}goo_result/attempt[goo_result/output] state=goo_result/control
+      ^ goo_result/control
+      ? state
+       > (./active progress)
+        ? (action unit/unit)
+         > ./cancelled (goo_result/control/cancelled progress)
+         > (./delivered result)
+          = next (goo_result/progress progress.context progress.passes.snoc((goo_result/entry name summary result)))
+          ? result
+           > (./succeeded _ _) (goo_result/control/active next)
+           > (./rejected _ _) (goo_result/control/ended (goo_result/compiled next (goo_result/completion/rejected)))
+           > (./crashed message) (goo_result/control/ended (goo_result/compiled next (goo_result/completion/crashed name message)))
+      state
+    + finish
+      ' some tree and none are both successful, unlike rejection or active state.
+      \ tree=maybe[goo/semantic] state=goo_result/control
+      ^ goo_result/control
+      ? state
+       > (./active progress) (goo_result/control/ended (goo_result/compiled progress (goo_result/completion/succeeded tree)))
+      state

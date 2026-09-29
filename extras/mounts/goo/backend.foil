@@ -1,0 +1,167 @@
+- goo_app/compile
+- goo_app/layout_api
+- goo_app/html
+
+' Rendering starts only after successful typed semantic compilation.
++ goo_backend
+  + dimensions
+    : width=goo/scalar scale=goo/scalar rtl=bool
+  + options
+    \ value=json
+    ^ maybe[goo_backend/dimensions]
+    > (json/obj fields) value .none
+    < width (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "width"))
+    < scale (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "textScale"))
+    = w=goo/scalar
+        ? width
+         > ./none (goo_fp/integer 752)
+         > (./some v) v
+      s=goo/scalar
+        ? scale
+         > ./none (goo_fp/integer 1)
+         > (./some v) v
+    ? ((goo_fp/lte s (goo/scalar 0)) || !(goo_fp/lte s (goo_fp/integer 10)) || !(goo_fp/lte w (goo_fp/integer 100000))) .none
+    < direction (goo_codec/optional[str] goo_codec/text (goo_codec/field fields "direction"))
+    = direction=str
+        ? direction
+         > ./none "ltr"
+         > (./some value) value
+    ? !((eq direction "ltr") || (eq direction "rtl")) .none
+    | ./some (goo_backend/dimensions w s (eq direction "rtl"))
+  + produce
+    \ options=goo_backend/dimensions samples=maybe[json] tree=maybe[goo/semantic] ignored=unit
+    ^ either[str goo_measure/result]
+    = result=maybe[goo_measure/result]
+        ? samples
+         > (./some measurements) (goo_layout/plan_with (goo_layout_api/recorded_size measurements) (goo_layout_api/recorded_height measurements) tree options.width)
+         > ./none (goo_layout/plan_with (\ n (./some (goo_ascii/leaf_size options.scale n))) (\ n w (./some (goo_ascii/leaf_height options.scale n w))) tree options.width)
+      error=maybe[str]
+        ? samples
+         > (./some _) .none
+        ? tree
+         > (./some node) (goo_ascii/check node)
+        .none
+    ? error
+     > (./some message) (./err message)
+    ? result
+     > ./none (./err "invalid layout measurements")
+     > (./some result) (./ok result)
+  + response
+    \ prefix=row[json] options=goo_backend/dimensions samples=maybe[json] tree=maybe[goo/semantic]
+    ^ json
+    = attempt (Try (goo_backend/produce options samples tree) unit/unit)
+      pass=goo_result/pass[goo_measure/result]
+        ? attempt
+         > (./err _) (goo_result/pass/crashed "Foil synchronous exception")
+         > (./ok result)
+          ? result
+           > (./err message) (goo_result/pass/rejected[goo_measure/result] .none [(goo_result/diagnostic (goo_result/severity/error) .none message)])
+           > (./ok result) (goo_result/pass/succeeded[goo_measure/result] result [])
+      outcome=str
+        ? pass
+         > (./succeeded _ _) "incomplete"
+         > (./rejected _ _) "rejected"
+         > (./crashed _) "crashed"
+      stages=row[json]
+        ? pass
+         > (./succeeded measured _)
+          = r measured.value
+          [(goo_inspect/stage "metrics" "ok" (json/obj [(jkv "sizes" (goo_measure/encode_sizes r.sizes)) (jkv "width" (goo_number/encode r.width))]) [])
+           (goo_inspect/stage "layout" "ok" (goo_codec/optional_json[goo_measure/plan] goo_measure/encode_plan r.plan) [])
+           (goo_inspect/stage "trace" "ok" (json/arr r.traces.map(goo_measure/encode_trace)) [])]
+         > (./rejected _ diagnostics)
+          [(goo_inspect/stage "metrics" "skipped" jnull []) (goo_inspect/stage "layout" "failed" jnull diagnostics.map((goo_inspect/diagnostic "layout"))) (goo_inspect/stage "trace" "skipped" jnull [])]
+         > (./crashed message)
+          [(goo_inspect/stage "metrics" "skipped" jnull []) (goo_inspect/stage "layout" "crashed" jnull [(json/obj [(jkv "stage" (json/str "layout")) (jkv "severity" (json/str "exception")) (jkv "location" jnull) (jkv "message" (json/str message))])]) (goo_inspect/stage "trace" "skipped" jnull [])]
+    = finished=goo_backend/finished
+        ? pass
+         > (./succeeded _ _)
+          ? samples
+           > ./none (goo_backend/render options tree)
+          | goo_backend/finished outcome [(goo_inspect/stage "prepared" "skipped" jnull []) (goo_inspect/stage "html" "skipped" jnull [])]
+        | goo_backend/finished outcome [(goo_inspect/stage "prepared" "skipped" jnull []) (goo_inspect/stage "html" "skipped" jnull [])]
+    | json/obj [(jkv "version" (goo_codec/number 1)) (jkv "ok" (json/boo .true)) (jkv "outcome" (json/str finished.outcome)) (jkv "stages" (json/arr prefix.weld(stages).weld(finished.stages)))]
+  + source
+    \ trees=row[rex] options=str identities=str
+    ^ str
+    = decoded=maybe[json]
+        > (./ok value _) (parse options) .none
+        | ./some value
+      parameters=maybe[goo/compile_request]
+        < value decoded
+        | goo_compile/request value
+      dimensions=maybe[goo_backend/dimensions]
+        < value decoded
+        | goo_backend/options value
+      ids=maybe[row[goo/node_id]]
+        > (./ok value _) (parse identities) .none
+        | goo_compile/ids value
+    > (./some request) parameters (goo_compile/protocol_error unit/unit)
+    > (./some dimensions) dimensions (goo_compile/protocol_error unit/unit)
+    > (./some ids) ids (goo_compile/protocol_error unit/unit)
+    = compiled (goo_compile/execute trees request ids)
+    ? compiled
+     > (./ended result)
+      ? result.completion
+       > (./succeeded tree)
+        | show (goo_backend/response result.progress.passes.map(goo_inspect/entry) dimensions .none tree)
+      | show (goo_inspect/response compiled)
+    | show (goo_inspect/response compiled)
+  + fixture_value
+    \ value=json
+    ^ maybe[json]
+    > (json/obj fields) value .none
+    < version_json (goo_codec/field fields "version")
+    < version (goo_number/integer version_json)
+    ? !(eq version 1) .none
+    < request (goo_compile/request value)
+    < dimensions (goo_backend/options value)
+    < tree_json (goo_codec/field fields "tree")
+    < tree (goo_codec/optional[goo/normalized] goo_codec/decode_normalized (./some tree_json))
+    = visible=maybe[goo/visible]
+        ? tree
+         > ./none .none
+         > (./some node) (goo_pass/visibility request.options node)
+      semantic (goo_compile/semantic request.options.uniform_edges visible)
+      prefix=row[json]
+        [(goo_inspect/stage "parse" "skipped" jnull []) (goo_inspect/stage "read" "skipped" jnull []) (goo_inspect/stage "core" "skipped" jnull [])
+         (goo_inspect/stage "normalized" "ok" (goo_codec/optional_json[goo/normalized] goo_inspect/normalized tree) [])
+         (goo_inspect/stage "visible" "ok" (goo_codec/optional_json[goo/visible] goo_inspect/visible visible) [])
+         (goo_inspect/stage "semantic" "ok" (goo_codec/optional_json[goo/semantic] goo_inspect/semantic semantic) [])]
+    | ./some (goo_backend/response prefix dimensions (goo_codec/field fields "measurements") semantic)
+  + fixture
+    \ source=str
+    ^ str
+    = result=maybe[json]
+        > (./ok value _) (parse source) .none
+        | goo_backend/fixture_value value
+    ? result
+     > ./none (goo_compile/protocol_error unit/unit)
+     > (./some value) (show value)
+
+  + finished
+    : outcome=str stages=row[json]
+  + prepared_output
+    : value=goo_html_internal/prepared projection=json
+  + prepare
+    \ options=goo_backend/dimensions tree=maybe[goo/semantic] ignored=unit
+    ^ either[str goo_backend/prepared_output]
+    < value (goo_html/prepare tree options.width options.scale options.rtl)
+    | ./ok (goo_backend/prepared_output value (goo_html/inspect value))
+  + crash
+    \ stage=str
+    ^ json
+    | goo_inspect/stage stage "crashed" jnull [(json/obj [(jkv "stage" (json/str stage)) (jkv "severity" (json/str "exception")) (jkv "location" jnull) (jkv "message" (json/str "Foil synchronous exception"))])]
+  + render
+    \ options=goo_backend/dimensions tree=maybe[goo/semantic]
+    ^ goo_backend/finished
+    ? (Try (goo_backend/prepare options tree) unit/unit)
+     > (./err _) (goo_backend/finished "crashed" [(goo_backend/crash "prepared") (goo_inspect/stage "html" "skipped" jnull [])])
+     > (./ok result)
+      ? result
+       > (./err message) (goo_backend/finished "rejected" [(goo_inspect/stage "prepared" "failed" jnull [(goo_inspect/diagnostic "prepared" (goo_result/diagnostic (goo_result/severity/error) .none message))]) (goo_inspect/stage "html" "skipped" jnull [])])
+       > (./ok prepared)
+        = stage (goo_inspect/stage "prepared" "ok" prepared.projection [])
+        ? (Try goo_html/fragment prepared.value)
+         > (./err _) (goo_backend/finished "crashed" [stage (goo_backend/crash "html")])
+         > (./ok html) (goo_backend/finished "complete" [stage (goo_inspect/stage "html" "ok" (json/str html) [])])
