@@ -24,6 +24,7 @@ provider, mutation, or navigation expression is executed.
 | Grove expressions versus concrete v2 payloads | Evaluate literals and direct role fields at render time. Missing fields disappear. Unsupported expressions are errors; nested receiver evaluation remains unimplemented. |
 | A Grove view body can contain several roots; v2 requires one | Add one column-flow root. Preserve explicit groups and presentation boundaries. |
 | Grove's `or` has no v2 node | Choose the first present alternative before producing v2 source. This is the existing preview fallback behavior, not competing-view precedence. |
+| Grove unquoted absolute paths versus the v2 literal reader | Resolve absolute slot paths with the Grove path parser before adapting their role. Quoted style paths remain supported. |
 | Grove style paths versus v2 leaf roles | Map exact legacy `/sys/slot/title`, `content`, `label`, `summary`, `caption`, and `icon` paths to `title`, `body`, `label`, `summary`, `caption`, and `icon`. Apply v2's existing aliases for its canonical paths. Preserve all unknown slots verbatim. |
 | Singular `/sys/slot/...` versus v2 view context `/sys/slots/...` | Adapt only `label`, `summary`, and `scar` for v2's visibility defaults. Do not rename namespace declarations or data slots. |
 | `action` versus `button` | Materialize a v2 button. Keep action arguments in the symbolic template and leave execution disabled. |

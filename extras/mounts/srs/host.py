@@ -12,6 +12,8 @@ def check(url, node, timeout):
                      'What does a Shrine name identify?', 'Missing view for role and slot',
                      'disabled="disabled"']:
         assert expected in views, expected
+    assert views.count('class="goo-preview"') == 3, 'Base, front, and edit must render'
+    assert 'Show' in views, 'Front view must render its action'
     preview = get(f'/ns/{node}/gov/srs')
     assert 'Install instance' in preview
     assert 'name="root"' in preview
