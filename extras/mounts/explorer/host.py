@@ -6,3 +6,12 @@ def check(url, node, timeout):
             assert expected in response.read().decode()
     with urllib.request.urlopen(url + '/style.css', timeout=timeout) as response:
         assert response.read()
+    for path, mime in [('/static/goo-reference.css', 'text/css'),
+                       ('/static/goo-fonts.css', 'text/css'),
+                       ('/static/goo-Sans400.ttf', 'font/ttf')]:
+        with urllib.request.urlopen(url + path, timeout=timeout) as response:
+            assert response.headers.get_content_type() == mime
+            body = response.read()
+            assert body
+            if mime == 'font/ttf':
+                assert body[:4] == bytes([0, 1, 0, 0])

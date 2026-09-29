@@ -112,12 +112,11 @@ namespace in the sidebar; the detail pane displays every published view whose
 role contract admits the selected record. The initial catalog scans the local
 publisher's namespace on each request. It has no indexing or pagination yet.
 
-The browser is a read-only preview: `group`/`present` render their children,
-`or` chooses the first nonempty child, scalar values render as escaped text,
-and path values link back into the browser. Actions and inputs are disabled.
-The evaluator supports literals and direct receiver fields; arbitrary Rex
-expressions and nested record evaluation are not implemented. Style arguments
-remain in IR; the preview currently uses one simple HTML style.
+The browser binds the symbolic template into Goo v2's `goo/source` IR, then
+uses its normalization, visibility, adjacency, measurement, layout, and prepared
+HTML renderer. Actions and inputs remain disabled previews. See
+[the integration and mismatch report](../../extras/mounts/explorer/GOO-V2.md)
+for the exact constructor, slot, expression, and identity adaptations.
 
 Run `x/eden --mount srs`, then open
 `http://127.0.0.1:8130/views/0x11/app/srs/cards/demo` for the sample card.

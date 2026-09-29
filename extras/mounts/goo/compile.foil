@@ -1,0 +1,212 @@
+- goo_app/passes
+- goo_app/inspection
+
++ goo_compile
+  + produced
+    (@@ v)
+    : value=v output=goo_result/output
+  + stepped
+    (@@ v)
+    : state=goo_result/control value=maybe[v]
+  + step
+    (@@ v)
+    \ name=str summary=str wrap={\ v}goo_result/output action={\ unit}either[goo_result/diagnostic v] state=goo_result/control
+    ^ goo_compile/stepped[v]
+    ? state
+     > (./active _)
+      = attempt (Try (goo_compile/produce[v] wrap action) unit/unit)
+        pass=goo_result/pass[goo_result/output]
+          ? attempt
+           > (./err _) (goo_result/pass/crashed "Foil synchronous exception")
+           > (./ok value)
+            ? value
+             > (./err diagnostic) (goo_result/pass/rejected[goo_result/output] .none [diagnostic])
+             > (./ok tree) (goo_result/pass/succeeded[goo_result/output] tree.output [])
+        next (goo_result/control/step name summary (\ ignored=unit (goo_result/attempt/delivered[goo_result/output] pass)) state)
+        value=maybe[v]
+          ? attempt
+           > (./ok result)
+            ? result
+             > (./ok tree) (./some tree.value)
+            .none
+          .none
+      | goo_compile/stepped[v] next value
+    | goo_compile/stepped[v] state .none
+  + prepare
+    \ trees=row[rex]
+    ^ str
+    = attempt (Try goo_compile/prepare_count trees)
+      count=nat
+        ? attempt
+         > (./ok count) count
+        0
+    ' Replay unexpected preflight failures inside the attributed stage boundary.
+    | show (json/obj [(jkv "count" (goo_codec/number count))])
+  + prepare_count
+    \ trees=row[rex]
+    ^ nat
+    = diagnostics (row/fold[rex row[goo_result/diagnostic]] [] (\ acc tree acc.weld((goo_result/rex_diagnostics tree))) trees)
+    ? (goo_result/has_errors diagnostics) 0
+    ? (goo_read/source trees)
+     > (./ok source)
+      ? (goo_pass/normalize source)
+       > (./ok core) (goo_pass/count core)
+      0
+    0
+  + bad_ids
+    : count=nat
+  + allocate
+    \ core=goo/core ids=row[goo/node_id] ignored=unit
+    ^ either[goo_result/diagnostic goo/normalized]
+    ? (!(eq ids.len (goo_pass/count core)) || !(goo_codec/unique ids.map((\ id=goo/node_id id.text))))
+      | Seq[either[goo_result/diagnostic goo/normalized]] (error (goo_compile/bad_ids ids.len)) (./err (goo_result/diagnostic (goo_result/severity/error) .none "UUID provider failed"))
+    | ./ok (goo_pass/assign core ids 0).tree
+  + execute
+    \ trees=row[rex] request=goo/compile_request ids=row[goo/node_id]
+    ^ goo_result/control
+    = diagnostics (row/fold[rex row[goo_result/diagnostic]] [] (\ acc tree acc.weld((goo_result/rex_diagnostics tree))) trees)
+      parsed (goo_result/pass/classify[goo_result/output] (goo_result/output/parsed trees) diagnostics)
+      start (goo_result/control/start request.context)
+      state (goo_result/control/step "parse" "Source to Rex trees" (\ ignored=unit (goo_result/attempt/delivered[goo_result/output] parsed)) start)
+    ? (goo_result/has_errors diagnostics) state
+    = read (goo_compile/step[goo/source] "read" "Rex to typed source Goo" goo_compile/wrap_read (\ ignored=unit (goo_read/source trees)) state)
+    > (./some source) read.value read.state
+    = normalized (goo_compile/step[goo/core] "core" "Normalize source sugar" goo_compile/wrap_core (\ ignored=unit (goo_pass/normalize source)) read.state)
+    > (./some core) normalized.value normalized.state
+    = assigned (goo_compile/step[goo/normalized] "normalized" "Allocate UUIDs once" goo_compile/wrap_normalized (goo_compile/allocate core ids) normalized.state)
+    > (./some tree) assigned.value assigned.state
+    | goo_compile/finish request tree assigned.state
+  + finish
+    \ request=goo/compile_request tree=goo/normalized state=goo_result/control
+    ^ goo_result/control
+    = visible (goo_compile/step[maybe[goo/visible]] "visible" "Optional budget and host hiding" goo_compile/wrap_visible (\ ignored=unit (either/ok[goo_result/diagnostic maybe[goo/visible]] (goo_pass/visibility request.options tree))) state)
+    > (./some surviving) visible.value visible.state
+    = semantic (goo_compile/step[maybe[goo/semantic]] "semantic" "Exact parent-owned sibling adjacency" goo_compile/wrap_semantic (\ ignored=unit (either/ok[goo_result/diagnostic maybe[goo/semantic]] (goo_compile/semantic request.options.uniform_edges surviving))) visible.state)
+    > (./some result) semantic.value semantic.state
+    | goo_result/control/finish result semantic.state
+  + ids
+    \ value=json
+    ^ maybe[row[goo/node_id]]
+    > (json/arr values) value .none
+    % i=nat 0 out=row[goo/node_id] []
+    ^ maybe[row[goo/node_id]]
+    ? (eq i values.len) (./some out)
+    < id (goo_codec/identifier values.at(i))
+    | _ i.inc out.snoc(id)
+  + path
+    \ value=json
+    ^ maybe[row[nat]]
+    > (json/arr values) value .none
+    % i=nat 0 out=row[nat] []
+    ^ maybe[row[nat]]
+    ? (eq i values.len) (./some out)
+    < index (goo_number/integer values.at(i))
+    | _ i.inc out.snoc(index)
+  + paths
+    \ value=json
+    ^ maybe[row[row[nat]]]
+    > (json/arr values) value .none
+    % i=nat 0 out=row[row[nat]] []
+    ^ maybe[row[row[nat]]]
+    ? (eq i values.len) (./some out)
+    < path (goo_compile/path values.at(i))
+    | _ i.inc out.snoc(path)
+  + request
+    \ value=json
+    ^ maybe[goo/compile_request]
+    > (json/obj fields) value .none
+    < width (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "width"))
+    < scale (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "textScale"))
+    = valid_width=bool
+        ? width
+         > ./none .true
+         > (./some number) (le (mod number.bits 9223372036854775808) 4681608360884174848)
+      valid_scale=bool
+        ? scale
+         > ./none .true
+         > (./some number) !((eq (mod number.bits 9223372036854775808) 0) || (gt number.bits 4621819117588971520))
+    ? !valid_width .none
+    ? !valid_scale .none
+    < path (goo_codec/optional[str] goo_codec/text (goo_codec/field fields "viewPath"))
+    = path=str
+        ? path
+         > ./none "/full"
+         > (./some text) text
+    < path (goo/path/parse_absolute path)
+    = context (goo/compile_context path)
+      defaults (goo_pass/options context)
+    < budget (goo_codec/optional[goo/rank] goo_codec/rank (goo_codec/field fields "budget"))
+    < ids (goo_codec/optional[row[goo/node_id]] goo_compile/ids (goo_codec/field fields "hiddenIds"))
+    < paths (goo_codec/optional[row[row[nat]]] goo_compile/paths (goo_codec/field fields "hiddenPaths"))
+    < uniform (goo_codec/optional[bool] goo_codec/boolean (goo_codec/field fields "uniform"))
+    = rank=goo/rank
+        ? budget
+         > ./none defaults.optional_budget
+         > (./some value) value
+      ids=row[goo/node_id]
+        ? ids
+         > ./none []
+         > (./some value) value
+      paths=row[row[nat]]
+        ? paths
+         > ./none []
+         > (./some value) value
+      uniform=bool
+        ? uniform
+         > ./none .false
+         > (./some value) value
+    | ./some (goo/compile_request context (goo/render_options rank ids paths uniform))
+  + source
+    \ trees=row[rex] options=str identities=str
+    ^ str
+    = request=maybe[goo/compile_request]
+        ? (parse options)
+         > (./ok value _) (goo_compile/request value)
+        .none
+      ids=maybe[row[goo/node_id]]
+        ? (parse identities)
+         > (./ok value _) (goo_compile/ids value)
+        .none
+    > (./some request) request (goo_compile/protocol_error unit/unit)
+    > (./some ids) ids (goo_compile/protocol_error unit/unit)
+    | show (goo_inspect/response (goo_compile/execute trees request ids))
+  + protocol_error
+    \ ignored=unit
+    ^ str
+    | show (goo_compile/protocol_value ignored)
+  + protocol_value
+    \ ignored=unit
+    ^ json
+    | (json/obj [(jkv "version" (goo_codec/number 1)) (jkv "ok" (json/boo .false)) (jkv "stage" (json/str "protocol")) (jkv "error" (json/str "invalid compile request"))])
+  + wrap_read
+    \ tree=goo/source
+    ^ goo_result/output
+    | goo_result/output/read tree
+  + wrap_core
+    \ tree=goo/core
+    ^ goo_result/output
+    | goo_result/output/core tree
+  + wrap_normalized
+    \ tree=goo/normalized
+    ^ goo_result/output
+    | goo_result/output/normalized tree
+  + wrap_visible
+    \ tree=maybe[goo/visible]
+    ^ goo_result/output
+    | goo_result/output/visible tree
+  + wrap_semantic
+    \ tree=maybe[goo/semantic]
+    ^ goo_result/output
+    | goo_result/output/semantic tree
+  + produce
+    (@@ v)
+    \ wrap={\ v}goo_result/output action={\ unit}either[goo_result/diagnostic v] ignored=unit
+    ^ either[goo_result/diagnostic goo_compile/produced[v]]
+    < value (action ignored)
+    | ./ok (goo_compile/produced[v] value (wrap value))
+  + semantic
+    \ uniform=bool tree=maybe[goo/visible]
+    ^ maybe[goo/semantic]
+    ? tree
+     > ./none .none
+     > (./some tree) (./some (goo_pass/adjacency uniform .none tree))
