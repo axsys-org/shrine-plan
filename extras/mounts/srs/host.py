@@ -7,6 +7,11 @@ def check(url, node, timeout):
     def get(path):
         with urllib.request.urlopen(url + path, timeout=timeout) as response:
             return response.read().decode()
+    views = get(f'/views/{node}/app/srs/cards/demo')
+    for expected in ['card_base', 'card_front', 'card_back', 'card_edit',
+                     'What does a Shrine name identify?', 'Missing view for role and slot',
+                     'disabled="disabled"']:
+        assert expected in views, expected
     preview = get(f'/ns/{node}/gov/srs')
     assert 'Install instance' in preview
     assert 'name="root"' in preview

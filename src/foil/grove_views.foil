@@ -1,0 +1,263 @@
+- goo
+- grove_roles
+
+' A frontend target, independent of HTML rendering and namespace installation.
+' Imported role field types and native constructors are explicit inputs; no
+' reflection fallback or competing-view precedence is chosen here.
++ grove_views
+  + context
+    : root=path document=grove/document lookup={\ path}maybe[myth]
+      roles=row[goo/role] renderers=row[goo/renderer] views=row[goo/view]
+  + is_view
+    \ body=row[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) (equal kind (grove/tag_kind/view))
+    .false
+  + reference
+    \ root=path doc=grove/document lookup={\ path}maybe[myth] tree=rex
+    ^ either[grove/error path]
+    ? tree
+     > (./leaf span shape text)
+      ? (equal tree.leaf_kind (maybe/some[str] "quip"))
+        ? !(eq (str/slice 0 2 text) "'/")
+          | goo/fail[path] span "Expected an absolute path."
+        > (./some value) (path_parse (str/slice 1 (dec text.len) text))
+          | goo/fail[path] span "Invalid absolute path."
+        | ./ok value
+      | grove_roles/slot root doc lookup tree
+    | grove_roles/slot root doc lookup tree
+  + finish
+    \ root=path span=rex/source_span name=str role=maybe[path]
+      slot=maybe[path] code=maybe[goo/body]
+    ^ either[grove/error goo/view]
+    > (./some role) role
+      | goo/fail[goo/view] span "View requires one #on role."
+    > (./some slot) slot
+      | goo/fail[goo/view] span "View requires one #for slot."
+    > (./some code) code
+      | goo/fail[goo/view] span "View requires a Goo body."
+    | ./ok (goo/view span root.snoc(($ts name)) role slot code.binding code.children)
+  + is_presentation
+    \ stmt=grove/statement
+    ^ bool
+    ? stmt
+     > (grove/presentation at trees) .true
+    .false
+  + declaration
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      span=rex/source_span name=str body=row[grove/statement]
+    ^ either[grove/error goo/view]
+    % rest=row[grove/statement] body role=maybe[path] .none
+      slot=maybe[path] .none code=maybe[goo/body] .none
+    ^ either[grove/error goo/view]
+    ? (eq rest.len 0)
+      | grove_views/finish root span name role slot code
+    ? rest.at(0)
+     > (grove/comment at text) (_ rest.drop(1) role slot code)
+     > (grove/tag at kind)
+      ? (equal kind (grove/tag_kind/view)) (_ rest.drop(1) role slot code)
+      | goo/fail[goo/view] at "Incompatible view tag."
+     > (grove/block at kind kids)
+      ? (equal kind (grove/block_kind/meta)) (_ rest.drop(1) role slot code)
+      | goo/fail[goo/view] at "Only #meta blocks are allowed on views."
+     > (grove/directive at kind target)
+      < path (grove_views/reference root doc lookup target)
+      ? (equal kind (grove/directive_kind/on))
+        ? (maybe/is_some role)
+          | goo/fail[goo/view] at "Duplicate #on on view."
+        | _ rest.drop(1) (./some path) slot code
+      ? (equal kind (grove/directive_kind/for))
+        ? (maybe/is_some slot)
+          | goo/fail[goo/view] at "Duplicate #for on view."
+        | _ rest.drop(1) role (./some path) code
+      | goo/fail[goo/view] at "Views support #on and #for only."
+     > (grove/presentation at trees)
+      ? (maybe/is_some code)
+        | goo/fail[goo/view] at "Duplicate Goo body."
+      < parsed (goo/parse trees)
+      | _ rest.drop(1) role slot (./some parsed)
+    | goo/fail[goo/view] span "Expected a Goo view declaration."
+  + index
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+    ^ either[grove/error row[goo/view]]
+    % items=row[grove/item] doc.items out=row[goo/view] []
+    ^ either[grove/error row[goo/view]]
+    ? (eq items.len 0) (./ok out)
+    > (grove/declaration span name body) items.at(0)
+      | _ items.drop(1) out
+    ? !(grove_views/is_view body)
+      ? body.any(grove_views/is_presentation)
+        | goo/fail[row[goo/view]] span "Goo bodies require @view."
+      | _ items.drop(1) out
+    > (grove/name/identifier name) name
+      | goo/fail[row[goo/view]] span "Views require declaration names."
+    < view (grove_views/declaration root doc lookup span name body)
+    ? (out.any((\ old (equal old.name view.name))))
+      | goo/fail[row[goo/view]] span "Duplicate view name."
+    | _ items.drop(1) out.snoc(view)
+  + role_fields
+    \ context=grove_views/context stack=row[path] role=path span=rex/source_span
+    ^ either[grove/error row[goo/field]]
+    ? stack.has(role)
+      | goo/fail[row[goo/field]] span "Cyclic role inheritance."
+    = external (context.roles.keep((\ schema (equal schema.name role))))
+    ? (gt external.len 1)
+      | goo/fail[row[goo/field]] span "Competing imported role schemas."
+    ? external.len (./ok external.at(0).fields)
+    % items=row[grove/item] context.document.items
+    ^ either[grove/error row[goo/field]]
+    ? (eq items.len 0)
+      | goo/fail[row[goo/field]] span "Unknown role; imported roles require field type information."
+    > (grove/declaration at name body) items.at(0)
+      | _ items.drop(1)
+    > (grove/name/identifier name) name
+      | _ items.drop(1)
+    ? !(equal context.root.snoc(($ts name)) role) (_ items.drop(1))
+    ? !(grove_roles/is_role body)
+      | goo/fail[row[goo/field]] at "View receiver is not a role."
+    < fields (grove_views/fields context stack.snoc(role) .false body)
+    % rest=row[goo/field] fields names=row[str] [] slots=row[path] []
+    ^ either[grove/error row[goo/field]]
+    ? (eq rest.len 0) (./ok fields)
+    = field rest.at(0)
+    ? (names.has(field.name) || slots.has(field.slot))
+      | goo/fail[row[goo/field]] at "Duplicate or inherited role field."
+    | _ rest.drop(1) names.snoc(field.name) slots.snoc(field.slot)
+  + fields
+    \ context=grove_views/context stack=row[path] optional=bool
+      body=row[grove/statement]
+    ^ either[grove/error row[goo/field]]
+    ? (eq body.len 0) (./ok [])
+    < tail (grove_views/fields context stack optional body.drop(1))
+    ? body.at(0)
+     > (grove/property span slot type)
+      < slot (grove_views/reference context.root context.document context.lookup slot)
+      < type (grove_views/reference context.root context.document context.lookup type)
+      ? (eq slot.len 0)
+        | goo/fail[row[goo/field]] span "Empty role field path."
+      = name (str/from_atom (quip_val slot.at((dec slot.len))))
+      | ./ok tail.cons((goo/field name slot type optional))
+     > (grove/block span kind kids)
+      ? (equal kind (grove/block_kind/meta)) (./ok tail)
+      ? !((equal kind (grove/block_kind/or)) || (equal kind (grove/block_kind/opt)))
+        | goo/fail[row[goo/field]] span "Unsupported role block."
+      < fields (grove_views/fields context stack .true kids)
+      | ./ok fields.weld(tail)
+     > (grove/directive span kind target)
+      ? !(equal kind (grove/directive_kind/with))
+        | goo/fail[row[goo/field]] span "Unsupported role directive."
+      < role (grove_views/reference context.root context.document context.lookup
+        (grove_views/local_role context.document target))
+      < fields (grove_views/role_fields context stack role span)
+      | ./ok fields.weld(tail)
+     > (grove/tag span kind) (./ok tail)
+     > (grove/comment span text) (./ok tail)
+    | goo/fail[row[goo/field]] rex/zero_span "Invalid role body."
+  + local_role
+    ' #with historically permits bare local names as well as %/name.
+    \ doc=grove/document tree=rex
+    ^ rex
+    ? !(equal tree.leaf_kind (maybe/some[str] "word")) tree
+    = name
+        ? tree
+         > (./leaf span shape text) text
+        ""
+    ? ((grove_roles/imports doc).any((\ imp (eq imp.alias name)))) tree
+    | rex/rune "%/" [tree]
+  + expression_type
+    \ context=grove_views/context view=goo/view expression=rex
+    ^ either[grove/error path]
+    ? (equal expression.leaf_kind (maybe/some[str] "word"))
+      ? expression
+       > (./leaf span shape text)
+        ? (eq text view.binding) (./ok view.role)
+        | goo/fail[path] expression.span "Unbound Goo value."
+      | goo/fail[path] expression.span "Unbound Goo value."
+    ? expression
+     > (./nest span color rune kids)
+      ? (and (eq rune ".") (eq kids.len 2))
+        < role (grove_views/expression_type context view kids.at(0))
+        < name (grove/word kids.at(1))
+        < fields (grove_views/role_fields context [] role span)
+        = matching (fields.keep((\ field (eq field.name name))))
+        ? !(eq matching.len 1)
+          | goo/fail[path] span "Unknown or ambiguous role field."
+        | ./ok matching.at(0).type
+      | goo/fail[path] expression.span "Cannot determine Goo expression type."
+    | goo/fail[path] expression.span "Cannot determine Goo expression type."
+  + renderer
+    \ context=grove_views/context view=goo/view expression=rex
+    ^ either[grove/error str]
+    ? (equal expression.leaf_kind (maybe/some[str] "cord")) (./ok "text")
+    ? (equal expression.leaf_kind (maybe/some[str] "quip"))
+      < path (grove_views/reference context.root context.document context.lookup expression)
+      | ./ok "link"
+    < type (grove_views/expression_type context view expression)
+    = matches (context.renderers.keep((\ renderer (equal renderer.type type))))
+    ? (eq matches.len 0)
+      | goo/fail[str] expression.span "No native UI constructor for this type."
+    ? !(eq matches.len 1)
+      | goo/fail[str] expression.span "Competing native UI constructors for this type."
+    = constructor matches.at(0).constructor
+    ? ((eq constructor "show") || ((eq constructor "present") || (eq constructor "")))
+      | goo/fail[str] expression.span "Expected a native UI constructor."
+    | ./ok constructor
+  + select
+    \ context=grove_views/context role=path slot=path span=rex/source_span
+    ^ either[grove/error goo/view]
+    = matches
+        | context.views.keep (\ view (and (equal view.role role) (equal view.slot slot)))
+    ? (eq matches.len 0)
+      | goo/fail[goo/view] span "Missing view for role and slot; reflection fallback is not implemented."
+    ? !(eq matches.len 1)
+      | goo/fail[goo/view] span "Competing views for role and slot; precedence is not defined."
+    | ./ok matches.at(0)
+  + lower_nodes
+    \ context=grove_views/context stack=row[path] view=goo/view nodes=row[goo/node]
+    ^ either[grove/error row[goo/node]]
+    ? (eq nodes.len 0) (./ok [])
+    < head (grove_views/lower_node context stack view nodes.at(0))
+    < tail (grove_views/lower_nodes context stack view nodes.drop(1))
+    | ./ok tail.cons(head)
+  + lower_node
+    \ context=grove_views/context stack=row[path] view=goo/view node=goo/node
+    ^ either[grove/error goo/node]
+    ? ((eq node.constructor "show") || (eq node.constructor "present"))
+      ? !(and (eq node.arguments.len 2) (eq node.children.len 0))
+        | goo/fail[goo/node] node.span "show/present require a value and slot, with no explicit children."
+      = value node.arguments.at(0)
+      < slot (grove_views/reference context.root context.document context.lookup node.arguments.at(1))
+      ? (eq node.constructor "show")
+        < constructor (grove_views/renderer context view value)
+        | ./ok node.set_constructor(constructor)
+      < role (grove_views/expression_type context view value)
+      < target (grove_views/select context role slot node.span)
+      ? stack.has(target.name)
+        | goo/fail[goo/node] node.span "Cyclic view presentation."
+      < children (grove_views/lower_nodes context stack.snoc(target.name) target target.children)
+      | ./ok node.set_children(children.map((goo/bind_node target.binding value)))
+    = constructors=row[str]
+        ["group" "or" "action" "input" "text" "link" "number"
+         "time" "duration" "boolean" "image" "icon" "divider"]
+    ? !(constructors.has(node.constructor))
+      | goo/fail[goo/node] node.span "Unknown Goo constructor."
+    < children (grove_views/lower_nodes context stack view node.children)
+    | ./ok node.set_children(children)
+  + compile
+    ' Compile one entry view and its reachable presentations. Other views may
+    ' be indexed without requiring their missing reflection-generated views.
+    \ root=path doc=grove/document lookup={\ path}maybe[myth]
+      imported_roles=row[goo/role] renderers=row[goo/renderer] name=str
+    ^ either[grove/error goo/view]
+    < views (grove_views/index root doc lookup)
+    = context (grove_views/context root doc lookup imported_roles renderers views)
+      matching (views.keep((\ view (equal view.name root.snoc(($ts name))))))
+    ? !(eq matching.len 1)
+      | goo/fail[goo/view] rex/zero_span "Unknown entry view."
+    = view matching.at(0)
+    < fields (grove_views/role_fields context [] view.role view.span)
+    < children (grove_views/lower_nodes context [view.name] view view.children)
+    | ./ok view.set_children(children)
