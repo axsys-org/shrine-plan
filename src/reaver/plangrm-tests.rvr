@@ -798,4 +798,51 @@ assert(Eq 1 (_0 (headCensus (procCode (optimized 6 t-sum)))))
   (If (Eq x 0) 10 (If (Eq x 1) 11 (If (Eq x 2) 12 13))))
 assert(Eq 3 (_2 (headCensus (procCode (optimized 5 t-chain)))))
 
+;; a nested law inlined into an existing BR arm gets its prim wrappers
+;; rewritten there too, so its own tail If lowers
+(define (t-arm x)
+  (define (inner y) (If (Eq y 5) 50 51))
+  (If (Eq x 0) 10 (inner x)))
+assert(Eq 2 (_2 (headCensus (procCode (optimized 5 t-arm)))))
+assert(Eq 0 (_1 (headCensus (procCode (optimized 5 t-arm)))))
+
+;; local-function blocks: a recursive nested law called from an eager
+;; site becomes a block, and its eager self-calls become LOCAL block
+;; calls (OP_CALL / OP_TAILBLK at codegen)
+(define (localBlocksOf level l) (localBlocks level (optimized level l)))
+(define (localCalls b)
+  (foldl
+    (lambda (n s)
+      (? Stmt s
+        (CALL [key op args] (? Op op (LOCAL [key] (Inc n)) (_ n)))
+        (PROC [key body] (Add n (localCalls (procCode body))))
+        (BR [x arms]
+          (foldl (lambda (m kp) (Add m (localCalls (procCode (_1 kp))))) n arms))
+        (_ n)))
+    0 b))
+(define (lb-sum n)
+  (define (go i acc) (Ifz i acc (go (Dec i) (Add acc i))))
+  (go n 0))
+(define lb-sum-r (localBlocksOf 5 lb-sum))
+assert(Eq 1 (Sz (_1 lb-sum-r)))
+assert(Eq 1 (localCalls (procCode (_0 lb-sum-r))))          ;; entry
+assert(Eq 1 (localCalls (procCode (_0 (_1 lb-sum-r)))))     ;; self tail call
+assert(Eq 0 (_0 (headCensus (procCode (_0 (_1 lb-sum-r))))))  ;; no law heads left
+;; captured outer variables are leading block arguments
+(define (lb-scaled n step)
+  (define (go i acc) (If (Ge i n) acc (go (Add i step) (Add acc (Mul i step)))))
+  (go 0 0))
+assert(Eq 1 (Sz (_1 (localBlocksOf 5 lb-scaled))))
+;; lazy call sites and escaping closures keep the interpreted law
+(define (lb-parity n)
+  (define (ev k)
+    (define (od j) (Ifz j 0 (ev (Dec j))))
+    (Ifz k 1 (od (Dec k))))
+  [(ev n) (ev (Inc n))])
+assert(Eq 0 (Sz (_1 (localBlocksOf 5 lb-parity))))
+(define (lb-closure xs)
+  (define (tri k) (Ifz k 0 (Add k (tri (Dec k)))))
+  (foldl (lambda (acc x) (Add acc (tri x))) 0 xs))
+assert(Eq 0 (Sz (_1 (localBlocksOf 5 lb-closure))))
+
 (print "plangrm tests passed")

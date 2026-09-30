@@ -1478,6 +1478,7 @@
 (define OP_CALL_KNOWN 13)
 (define OP_CALL_FAST 14)
 (define OP_CALL_SLOW 15)
+(define OP_TAILBLK 27)
 (define BANE_FAST 1)
 (define BANE_SLOW 2)
 (define BANE_PRIM 3)
@@ -2538,7 +2539,11 @@
         (If (And (bitSet? a i) (bitSet? b i)) (Add acc (argBit i)) acc))))
   (go 1 0))
 
-(define (codegenOpt lawSig selfSig noupd depth top)
+;; blockArgs: [] for a law; for a local function block, its parameter
+;; keys, which live in operand slots 0..n-1 of the block's frame (the
+;; caller's OP_CALL/OP_TAILBLK puts the arguments there).  Returns the
+;; unflattened items; codegenOpt flattens a law's.
+(define (codegenItems lawSig selfSig noupd depth top blockArgs)
   (define selfArity (Dec (Sz (procArgs top))))
   (define topBlock (procCode top))
   ;; strict-entry prologue (self-call sites hint with exactly proMask)
@@ -2677,6 +2682,11 @@
             [(weld (emitAtom st fn)
                (weld (cat (map (emitAtom st) args))
                  [OP_CALL_SLOW (Sz args)]))])
+          ;; a local function block (no local proc survives to codegen);
+          ;; the target is patched once the blocks are laid out
+          (LOCAL [key]
+            [(weld (cat (map (emitAtom st) args))
+               [OP_CALL ["BLK" key] (Sz args)])])
           (_ 0))
         (begin
           (define oppin (? Op op (FAST [val] val) (_ 0)))
@@ -2691,7 +2701,6 @@
         (? Stmt s
           (CALL [key op args]
             (? Op op
-              (LOCAL 0)
               (_
                 (Ifz (Eq 1 (bst-gut key 0 counts)) 0
                   (? Stmt (Ix (Inc i) block)
@@ -2782,8 +2791,12 @@
                   (_ (error "codegenOpt: unsupported statement")))
                 [(_0 st) (_1 st)
                  (weld (_2 st)
-                   (weld (emitThkBuild st (_0 (_0 tc)) (_1 (_0 tc)) 0 1)
-                     [OP_RET]))]))))
+                   (? Op (_0 (_0 tc))
+                     (LOCAL [key]
+                       (weld (cat (map (emitAtom st) (_1 (_0 tc))))
+                         [OP_TAILBLK ["BLK" key] (Sz (_1 (_0 tc))) OP_RET]))
+                     (_ (weld (emitThkBuild st (_0 (_0 tc)) (_1 (_0 tc)) 0 1)
+                          [OP_RET]))))]))))
         st0
         emitOrder))
     (_2 done))
@@ -2793,9 +2806,16 @@
         (cons ["entry"]
           (filter (lambda (i) (Nil (set-member i proIdxs)))
             (gen (Sz topBlock) (lambda (i) i)))))))
-  (define items (emitBlock topBlock [0 E []] mainOrder))
-  ;; opcode-aware flatten: ["ARM" ...] markers occupy exactly the BR
-  ;; target slots; arms are appended after the targets, depth-first.
+  (define argSlots
+    (foldl (lambda (m i) (bst-insert (Ix i blockArgs) i m)) E
+      (gen (Sz blockArgs) (lambda (i) i))))
+  (define items (emitBlock topBlock [(Sz blockArgs) argSlots []] mainOrder))
+  items)
+
+;; opcode-aware flatten: ["ARM" ...] markers occupy exactly the BR
+;; target slots; arms are appended after the targets, depth-first.
+;; pos is the absolute position the code will occupy.
+(define (flattenItems items pos)
   (define (flatten its pos)
     (define m (Sz its))
     (define (walk i out)
@@ -2828,14 +2848,17 @@
                     (drop i its)))))
             ((Or (Eq op OP_RET) (Eq op OP_FORCE))
               (walk (Inc i) (snoc op out)))
-            ((Or (Eq op OP_CALL) (Eq op OP_CALL_FAST))
+            ((Or (Eq op OP_CALL) (Or (Eq op OP_CALL_FAST) (Eq op OP_TAILBLK)))
               (walk (Add i 3) (weld out (take 3 (drop i its)))))
             ((Eq op OP_CALL_KNOWN)
               (walk (Add i 4) (weld out (take 4 (drop i its)))))
             (else
               (walk (Add i 2) (weld out (take 2 (drop i its)))))))))
     (walk 0 []))
-  (flatten items 0))
+  (flatten items pos))
+
+(define (codegenOpt lawSig selfSig noupd depth top)
+  (flattenItems (codegenItems lawSig selfSig noupd depth top []) 0))
 
 ;; inlinePrimWrappers: a FAST call to a bplan-style wrapper law — one
 ;; whose whole body is (0 <oppin> (0 "Name" 1..n)) at matching arity —
@@ -2948,6 +2971,19 @@
               (begin
                 (define r[uqb code2] (goBlock (procCode body) uqa))
                 [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+            ;; arms too: inlineNestedLaws can splice a nested law's
+            ;; wrapper calls into an arm after the BR already exists
+            (BR [x arms]
+              (begin
+                (define rr
+                  (foldl
+                    (lambda (a2 kp)
+                      (begin
+                        (define r2[uqy code2] (goBlock (procCode (_1 kp)) (_0 a2)))
+                        [uqy (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) code2)] (_1 a2))]))
+                    [uqa []]
+                    arms))
+                [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
             (_ [uqa (snoc s out)]))))
       [uq0 []]
       b))
@@ -3763,6 +3799,174 @@
             (define ri[uqi pi] (inlineSingleUseProcs pd uqf))
             [(eagerTailCalls (reforce (brSink (deadCodeElim pi)))) finalSig]))))))
 
+;;; Local function blocks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; A nested law that cannot be inlined (recursive, or too big) still
+;;; has no code of its own: called by literal head it runs interpreted,
+;;; and so does all its recursion.  From level 5 on, every such law that
+;;; is called at exact arity from an EAGER site of the law being
+;;; compiled becomes a local function: optimized on its own, emitted as
+;;; a block appended to this law's code, and called with OP_CALL (its
+;;; arguments become the block frame's operand base) or, in tail
+;;; position, OP_TAILBLK (constant space).  Its own eager self-calls
+;;; become block calls too, and so do its eager calls of other such
+;;; laws, which are compiled in turn.
+;;;
+;;; What stays as before: lazy calls (a thunk needs a head value, not a
+;;; block) and closures that escape — both still enter the law
+;;; interpreted.  A lazy self-call inside a block becomes a FAST call of
+;;; the law literal (var 0 in a block would read the ENCLOSING law).
+;;; Blocks are plain code reading only their operand slots (never an
+;;; env var), and no local proc survives to codegen, so a LOCAL op at
+;;; codegen time always names a block: key = block index.
+
+(define BLOCK_MAX 400)
+(define BLOCKS_PER_LAW 16)
+(define NONE_BLOCK 1000000) ;; "not a block" (block indices are small)
+
+;; eager call sites: the main block, PROC bodies, BR arms (never DELAY
+;; bodies).  -> distinct unpinned law heads called at exact arity
+(define (eagerLawHeads p)
+  (define (goBlock acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args]
+            (? Op op
+              (FAST [val]
+                (If (And (IsLaw val) (Eq (Sz args) (Arity val)))
+                  (If (any (lambda (h) (Equal h val)) a) a (snoc val a))
+                  a))
+              (_ a)))
+          (PROC [key body] (goBlock a (procCode body)))
+          (BR [x arms] (foldl (lambda (a2 kp) (goBlock a2 (procCode (_1 kp)))) a arms))
+          (_ a)))
+      acc b))
+  (goBlock [] (procCode p)))
+
+;; a nested law, optimized as a local function body, or 0: same shape
+;; limits as inlining (no self reference as a value, a flattenable let
+;; prelude), but recursion is fine
+(define (localFnProc level v)
+  (Ifz (And (IsLaw v) (Le (Arity v) 16)) 0
+    (begin
+      (define r[depthL p0] (ingestLawOpt v))
+      (define pl (recurLower p0))
+      (Ifz (Eq 0 (bst-gut 0 0 (refcounts pl))) 0
+        (begin
+          (define fl[ok body] (flattenPrelude (procCode pl)))
+          (Ifz (And ok (Le (blockSize body) BLOCK_MAX)) 0
+            (begin
+              (define p1 (mkProc (procArgs pl) body))
+              (define maxk (max depthL (bstMaxKey (refcounts p1))))
+              ;; level 5 passes: law signatures are for the law's own
+              ;; entry, and a block has none
+              (_0 (optPasses (If (Ge level 6) 5 level) 0 (Arity v) p1 maxk)))))))))
+
+;; eager FAST calls of block laws -> LOCAL block calls; in a block, its
+;; eager self-calls -> LOCAL self, lazy ones -> FAST of the law literal
+(define (toBlockCalls idxOf selfIdx selfLaw p)
+  (define (goProc p0 eager)
+    (define (goStmt s)
+      (define (conv op args)
+        (? Op op
+          (FAST [val]
+            (If (And eager (And (IsLaw val) (Eq (Sz args) (Arity val))))
+              (begin
+                (define i (idxOf val))
+                (If (Lt i NONE_BLOCK) ($LOCAL i) op))
+              op))
+          (RECUR
+            (If (Eq selfIdx NONE_BLOCK) op
+              (If eager ($LOCAL selfIdx) ($FAST selfLaw))))
+          (_ op)))
+      (? Stmt s
+        (CALL [key op args] ($CALL key (conv op args) args))
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY [body] ($LET key ($DELAY (goProc body 0))))
+            (CLOSE s)))
+        (PROC [key body] ($PROC key (goProc body eager)))
+        (BR [x arms] ($BR x (map (lambda (kp) [(_0 kp) (goProc (_1 kp) eager)]) arms)))
+        (_ s)))
+    (mkProc (procArgs p0) (map goStmt (procCode p0))))
+  (goProc p 1))
+
+;; -> [main' blocks] ; blocks: row of converted block procs, index = key
+(define (localBlocks level main)
+  ;; discovery: [laws procs] in index order, following block bodies
+  (define (discover laws procs pending)
+    (Ifz (Sz pending) [laws procs]
+      (begin
+        (define v (_0 pending))
+        (define rest (drop 1 pending))
+        (If (Or (Ge (Sz laws) BLOCKS_PER_LAW) (any (lambda (h) (Equal h v)) laws))
+          (discover laws procs rest)
+          (begin
+            (define bp (localFnProc level v))
+            (Ifz bp
+              (discover laws procs rest)
+              (discover (snoc v laws) (snoc bp procs)
+                (weld rest (eagerLawHeads bp)))))))))
+  (define d[laws procs] (discover [] [] (eagerLawHeads main)))
+  (define (idxOf2 v)
+    (define hit (find-idx (lambda (h) (Equal h v)) laws))
+    (Ifz hit NONE_BLOCK (_0 hit)))
+  [(toBlockCalls idxOf2 NONE_BLOCK 0 main)
+   (map
+     (lambda (i) (toBlockCalls idxOf2 i (Ix i laws) (Ix i procs)))
+     (gen (Sz laws) (lambda (i) i)))])
+
+;; flat code: point every OP_CALL / OP_TAILBLK ["BLK" k] target at the
+;; block's absolute offset
+(define (patchBlocks code offsets)
+  (define n (Sz code))
+  (define (target x)
+    (If (And (IsApp x) (Eq "BLK" (_0 x))) (Ix (_1 x) offsets) x))
+  (define (walk i out)
+    (If (Ge i n) out
+      (begin
+        (define op (Ix i code))
+        (cond
+          ((Eq op OP_BR)
+            (begin
+              (define w (Add 2 (Ix (Inc i) code)))
+              (walk (Add i w) (weld out (take w (drop i code))))))
+          ((Eq op OP_MK_THK)
+            (begin
+              (define w (If (Eq 4 (Mod (Ix (Add i 2) code) 8)) 5 3))
+              (walk (Add i w) (weld out (take w (drop i code))))))
+          ((Or (Eq op OP_RET) (Eq op OP_FORCE)) (walk (Inc i) (snoc op out)))
+          ((Or (Eq op OP_CALL) (Eq op OP_TAILBLK))
+            (walk (Add i 3)
+              (weld out [op (target (Ix (Inc i) code)) (Ix (Add i 2) code)])))
+          ((Eq op OP_CALL_FAST) (walk (Add i 3) (weld out (take 3 (drop i code)))))
+          ((Eq op OP_CALL_KNOWN) (walk (Add i 4) (weld out (take 4 (drop i code)))))
+          (else (walk (Add i 2) (weld out (take 2 (drop i code)))))))))
+  (walk 0 []))
+
+;; the law's code followed by its blocks, targets patched
+(define (codegenWithBlocks lawSig selfSig noupd depth main blocks)
+  (define mainFlat
+    (flattenItems (codegenItems lawSig selfSig noupd depth main []) 0))
+  (define blkItems
+    (map
+      (lambda (b)
+        (codegenItems 0 0 noupd 0 b (map argKey (drop 1 (procArgs b)))))
+      blocks))
+  (define lay
+    (foldl
+      (lambda (acc it)
+        (begin
+          (define a[offs at] acc)
+          [(snoc at offs) (Add at (Sz (flattenItems it 0)))]))
+      [[] (Sz mainFlat)] blkItems))
+  (define offsets (_0 lay))
+  (define flats
+    (map (lambda (i) (flattenItems (Ix i blkItems) (Ix i offsets)))
+      (gen (Sz blkItems) (lambda (i) i))))
+  (patchBlocks (weld mainFlat (cat flats)) offsets))
+
 (define (compileOptLevel level noupd l)
   (define attempt
     (Try
@@ -3773,7 +3977,11 @@
           (define maxk (bstMaxKey (refcounts p)))
           (define selfSig (If (Ge level 6) (sigOfLaw l) 0))
           (define rp[p2 lawSig] (optPasses level selfSig depth p maxk))
-          (codegenOpt lawSig selfSig noupd depth p2)))
+          (define lb
+            (If (Ge level 5) (localBlocks level p2) [p2 []]))
+          (Ifz (Sz (_1 lb))
+            (codegenOpt lawSig selfSig noupd depth p2)
+            (codegenWithBlocks lawSig selfSig noupd depth (_0 lb) (_1 lb)))))
       0))
   (If (Hd attempt)
     (codegenLaw l) ;; anything unlowerable: byte-identical dumb output
