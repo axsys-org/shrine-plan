@@ -1479,6 +1479,7 @@
 (define OP_CALL_FAST 14)
 (define OP_CALL_SLOW 15)
 (define OP_TAILBLK 27)
+(define OP_LAWBLK 28) ;; row-only directory entry behind the code
 (define BANE_FAST 1)
 (define BANE_SLOW 2)
 (define BANE_PRIM 3)
@@ -3801,27 +3802,28 @@
 
 ;;; Local function blocks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
-;;; A nested law that cannot be inlined (recursive, or too big) still
-;;; has no code of its own: called by literal head it runs interpreted,
-;;; and so does all its recursion.  From level 5 on, every such law that
-;;; is called at exact arity from an EAGER site of the law being
-;;; compiled becomes a local function: optimized on its own, emitted as
-;;; a block appended to this law's code, and called with OP_CALL (its
-;;; arguments become the block frame's operand base) or, in tail
-;;; position, OP_TAILBLK (constant space).  Its own eager self-calls
-;;; become block calls too, and so do its eager calls of other such
-;;; laws, which are compiled in turn.
+;;; A nested law that cannot be inlined (recursive, or too big) has no
+;;; code of its own: every entry of it would run interpreted.  From
+;;; level 5 on, every nested law literal of the law being compiled (and,
+;;; in turn, of those laws) becomes a local function: optimized on its
+;;; own and emitted as a block appended to this law's code.  Eager calls
+;;; at exact arity jump straight to it with OP_CALL (its arguments
+;;; become the block frame's operand base) or, in tail position,
+;;; OP_TAILBLK (constant space).  Every other entry -- a lazy call, a
+;;; closure applied inside another law, a std HOF calling its f -- has
+;;; only the law value in hand: the directory behind the code
+;;; ([OP_LAWBLK law offset] rows) tells the runtime which block
+;;; implements that law, and it enters the block from there.
 ;;;
-;;; What stays as before: lazy calls (a thunk needs a head value, not a
-;;; block) and closures that escape — both still enter the law
-;;; interpreted.  A lazy self-call inside a block becomes a FAST call of
-;;; the law literal (var 0 in a block would read the ENCLOSING law).
-;;; Blocks are plain code reading only their operand slots (never an
-;;; env var), and no local proc survives to codegen, so a LOCAL op at
-;;; codegen time always names a block: key = block index.
+;;; A lazy self-call inside a block becomes a FAST call of the law
+;;; literal (var 0 in a block would read the ENCLOSING law), and so
+;;; does the law's self used as a value.  Blocks are plain code reading
+;;; only their operand slots (never an env var), and no local proc
+;;; survives to codegen, so a LOCAL op at codegen time always names a
+;;; block: key = block index.
 
 (define BLOCK_MAX 400)
-(define BLOCKS_PER_LAW 16)
+(define BLOCKS_PER_LAW 48)
 (define NONE_BLOCK 1000000) ;; "not a block" (block indices are small)
 
 ;; eager call sites: the main block, PROC bodies, BR arms (never DELAY
@@ -3844,24 +3846,60 @@
       acc b))
   (goBlock [] (procCode p)))
 
+;; every unpinned law literal in p: closure heads, lazy call heads, laws
+;; passed as values -- anything that can reach a call site outside this
+;; law's code, where only the law value itself is at hand
+(define (lawLiterals p)
+  (define (appHead v) (If (IsApp v) (appHead (Hd v)) v))
+  (define (addVal a v0)
+    (begin
+      (define v (appHead v0))
+      (If (And (IsLaw v) (Nil (any (lambda (h) (Equal h v)) a))) (snoc v a) a)))
+  (define (addAtom a x) (? Atom x (CNS [val] (addVal a val)) (_ a)))
+  (define (addOp a op)
+    (? Op op
+      (FAST [val] (addVal a val))
+      (SLOW [fn] (addAtom a fn))
+      (_ a)))
+  (define (goBlock acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args] (foldl addAtom (addOp a op) args))
+          (LET [key rhs]
+            (? Alloc rhs
+              (CLOSE [fn args] (foldl addAtom (addAtom a fn) args))
+              (DELAY [body] (goBlock a (procCode body)))))
+          (RET [x] (addAtom a x))
+          (PROC [key body] (goBlock a (procCode body)))
+          (BR [x arms]
+            (foldl (lambda (a2 kp) (goBlock a2 (procCode (_1 kp)))) (addAtom a x) arms))
+          (_ a)))
+      acc b))
+  (goBlock [] (procCode p)))
+
 ;; a nested law, optimized as a local function body, or 0: same shape
-;; limits as inlining (no self reference as a value, a flattenable let
-;; prelude), but recursion is fine
+;; limits as inlining (a flattenable let prelude), but recursion is fine.
+;; The law's self as a VALUE (a nested lambda capturing it, say) is the
+;; law literal itself: the block pushes that, and the directory sends
+;; its entries back here.
 (define (localFnProc level v)
   (Ifz (And (IsLaw v) (Le (Arity v) 16)) 0
     (begin
       (define r[depthL p0] (ingestLawOpt v))
-      (define pl (recurLower p0))
-      (Ifz (Eq 0 (bst-gut 0 0 (refcounts pl))) 0
+      (define pr (recurLower p0))
+      (define pl
+        (If (Eq 0 (bst-gut 0 0 (refcounts pr))) pr
+          (mkProc (procArgs pr)
+            (subst (bst-insert 0 ($CNS v) E) (procCode pr)))))
+      (define fl[ok body] (flattenPrelude (procCode pl)))
+      (Ifz (And ok (Le (blockSize body) BLOCK_MAX)) 0
         (begin
-          (define fl[ok body] (flattenPrelude (procCode pl)))
-          (Ifz (And ok (Le (blockSize body) BLOCK_MAX)) 0
-            (begin
-              (define p1 (mkProc (procArgs pl) body))
-              (define maxk (max depthL (bstMaxKey (refcounts p1))))
-              ;; level 5 passes: law signatures are for the law's own
-              ;; entry, and a block has none
-              (_0 (optPasses (If (Ge level 6) 5 level) 0 (Arity v) p1 maxk)))))))))
+          (define p1 (mkProc (procArgs pl) body))
+          (define maxk (max depthL (bstMaxKey (refcounts p1))))
+          ;; level 5 passes: law signatures are for the law's own
+          ;; entry, and a block has none
+          (_0 (optPasses (If (Ge level 6) 5 level) 0 (Arity v) p1 maxk)))))))
 
 ;; eager FAST calls of block laws -> LOCAL block calls; in a block, its
 ;; eager self-calls -> LOCAL self, lazy ones -> FAST of the law literal
@@ -3892,7 +3930,11 @@
     (mkProc (procArgs p0) (map goStmt (procCode p0))))
   (goProc p 1))
 
-;; -> [main' blocks] ; blocks: row of converted block procs, index = key
+;; -> [main' blocks laws] ; blocks: row of converted block procs, index =
+;; key; laws: the nested law each block implements.  Eagerly called laws
+;; come first (they also become direct block calls); every other law
+;; literal gets a block too, reached through the directory behind the
+;; code when its value is entered elsewhere.
 (define (localBlocks level main)
   ;; discovery: [laws procs] in index order, following block bodies
   (define (discover laws procs pending)
@@ -3907,15 +3949,17 @@
             (Ifz bp
               (discover laws procs rest)
               (discover (snoc v laws) (snoc bp procs)
-                (weld rest (eagerLawHeads bp)))))))))
-  (define d[laws procs] (discover [] [] (eagerLawHeads main)))
+                (weld rest (weld (eagerLawHeads bp) (lawLiterals bp))))))))))
+  (define d[laws procs]
+    (discover [] [] (weld (eagerLawHeads main) (lawLiterals main))))
   (define (idxOf2 v)
     (define hit (find-idx (lambda (h) (Equal h v)) laws))
     (Ifz hit NONE_BLOCK (_0 hit)))
   [(toBlockCalls idxOf2 NONE_BLOCK 0 main)
    (map
      (lambda (i) (toBlockCalls idxOf2 i (Ix i laws) (Ix i procs)))
-     (gen (Sz laws) (lambda (i) i)))])
+     (gen (Sz laws) (lambda (i) i)))
+   laws])
 
 ;; flat code: point every OP_CALL / OP_TAILBLK ["BLK" k] target at the
 ;; block's absolute offset
@@ -3945,8 +3989,10 @@
           (else (walk (Add i 2) (weld out (take 2 (drop i code)))))))))
   (walk 0 []))
 
-;; the law's code followed by its blocks, targets patched
-(define (codegenWithBlocks lawSig selfSig noupd depth main blocks)
+;; the law's code followed by its blocks, targets patched, then the
+;; directory: [OP_LAWBLK law offset] per block (the runtime enters the
+;; block wherever that law value is applied)
+(define (codegenWithBlocks lawSig selfSig noupd depth main blocks laws)
   (define mainFlat
     (flattenItems (codegenItems lawSig selfSig noupd depth main []) 0))
   (define blkItems
@@ -3965,7 +4011,9 @@
   (define flats
     (map (lambda (i) (flattenItems (Ix i blkItems) (Ix i offsets)))
       (gen (Sz blkItems) (lambda (i) i))))
-  (patchBlocks (weld mainFlat (cat flats)) offsets))
+  (weld (patchBlocks (weld mainFlat (cat flats)) offsets)
+    (cat (map (lambda (i) [OP_LAWBLK (Ix i laws) (Ix i offsets)])
+           (gen (Sz laws) (lambda (i) i))))))
 
 (define (compileOptLevel level noupd l)
   (define attempt
@@ -3978,10 +4026,10 @@
           (define selfSig (If (Ge level 6) (sigOfLaw l) 0))
           (define rp[p2 lawSig] (optPasses level selfSig depth p maxk))
           (define lb
-            (If (Ge level 5) (localBlocks level p2) [p2 []]))
+            (If (Ge level 5) (localBlocks level p2) [p2 [] []]))
           (Ifz (Sz (_1 lb))
             (codegenOpt lawSig selfSig noupd depth p2)
-            (codegenWithBlocks lawSig selfSig noupd depth (_0 lb) (_1 lb)))))
+            (codegenWithBlocks lawSig selfSig noupd depth (_0 lb) (_1 lb) (_2 lb)))))
       0))
   (If (Hd attempt)
     (codegenLaw l) ;; anything unlowerable: byte-identical dumb output
