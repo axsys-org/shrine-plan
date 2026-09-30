@@ -8,6 +8,16 @@ and printing use the retained, locked Rex component. Goo interpretation, normali
 and orchestration run in Foil; the host supplies process I/O and UUID entropy.
 The Haskell Goo compiler is used only by differential tests.
 
+Intermediate Grove/Goo sequences use `list`: Grove declarations and statements,
+role fields and requirements, view arguments and children, pass diagnostics and
+history, semantic children, measurements, layout plans, traces, and prepared HTML.
+Ordered consumers walk list tails; builders prepend and reverse where practical.
+Rex syntax trees, JSON arrays/objects, compiler publication interfaces and namespace
+paths retain their existing external representations. Fixed tuples and static
+font/rule tables are unchanged. Convert at those boundaries, rather than between
+compiler or rendering stages.
+
+
 From the parent repository, with Nix and Python 3 available:
 
 ```sh
