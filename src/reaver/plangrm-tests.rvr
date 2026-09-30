@@ -696,4 +696,162 @@ assert(Eq 1 (sigOfLaw t-gg))
 assert(Eq 1 (sigOfLaw t-ff))
 assert(Eq 0 (sigOfLawB 0 t-ff)) ;; prim-only base case sees nothing
 
+;;; inlineSingleUseProcs ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define kh-probe-law (Law 1 1 1))
+
+;; one batch inlines both procs; the second one's body uses the first
+;; one's result, so it must be inlined as substituted, not as captured
+;; when the batch was chosen (that left REF 2 unbound)
+(define test_inline_batch_uses_current_bodies
+  (Equal
+    (_1 (inlineSingleUseProcs
+          (blockProc
+            [($PROC 1 (blockProc [($RET ($CNS 7))]))
+             ($CALL 2 ($LOCAL 1) [])
+             ($PROC 3 (blockProc [($CALL 4 ($FAST kh-probe-law) [($REF 2)])
+                                  ($RET ($REF 4))]))
+             ($CALL 5 ($LOCAL 3) [])
+             ($RET ($REF 5))])
+          10))
+    (blockProc [($CALL 4 ($FAST kh-probe-law) [($CNS 7)]) ($RET ($REF 4))])))
+assert(test_inline_batch_uses_current_bodies)
+
+
+;;; known heads: nested laws ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; call census over a whole proc: [unpinned-law FAST calls, SLOW calls,
+;; BR statements]
+(define (headCensus b)
+  (foldl
+    (lambda (acc s)
+      (begin
+        (define a[laws slows brs] acc)
+        (define (add r) [(Add laws (_0 r)) (Add slows (_1 r)) (Add brs (_2 r))])
+        (define (callOp op)
+          (? Op op
+            (FAST [val] [(If (IsLaw val) 1 0) 0 0])
+            (SLOW [0 1 0])
+            (_ [0 0 0])))
+        (? Stmt s
+          (CALL [key op args] (add (callOp op)))
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body] (add (headCensus (procCode body))))
+              (CLOSE acc)))
+          (PROC [key body] (add (headCensus (procCode body))))
+          (BR [x arms]
+            (foldl
+              (lambda (a2 kp)
+                (begin
+                  (define r (headCensus (procCode (_1 kp))))
+                  [(Add (_0 a2) (_0 r)) (Add (_1 a2) (_1 r)) (Add (_2 a2) (_2 r))]))
+              [laws slows (Inc brs)] arms))
+          (_ acc))))
+    [0 0 0] b))
+
+(define (optimized level l)
+  (begin
+    (define r[depth p0] (ingestLawOpt l))
+    (define p (recurLower p0))
+    (_0 (optPasses level 0 depth p (bstMaxKey (refcounts p))))))
+
+;; lowerPartialApps: an under-applied literal law call is its CLOSE
+(define kh-law2 (Law 1 2 (0 (0 Add 1) 2)))
+assert(Equal
+  (lowerPartialApps
+    (blockProc [($CALL 1 ($SLOW ($CNS kh-law2)) [($CNS 5)]) ($RET ($REF 1))]))
+  [1 (blockProc [($LET 1 ($CLOSE ($CNS kh-law2) [($CNS 5)])) ($RET ($REF 1))])])
+
+;; resolveKnownClosures: a saturating call through a known closure is
+;; a FAST call of its law, captured args first
+assert(Equal
+  (resolveKnownClosures
+    (blockProc
+      [($LET 1 ($CLOSE ($CNS kh-law2) [($CNS 5)]))
+       ($CALL 2 ($SLOW ($REF 1)) [($CNS 6)])
+       ($RET ($REF 2))]))
+  [1 (blockProc
+       [($LET 1 ($CLOSE ($CNS kh-law2) [($CNS 5)]))
+        ($CALL 2 ($FAST kh-law2) [($CNS 5) ($CNS 6)])
+        ($RET ($REF 2))])])
+
+;; a non-recursive nested function taking a closure: after inlining it
+;; and resolving the closure calls nothing unknown or unpinned is left
+(define (t-quad a b)
+  (define (sq x) (Mul x x))
+  (define (twice g y) (g (g y)))
+  (twice sq (Add a b)))
+assert(Equal [0 0 0] (headCensus (procCode (optimized 5 t-quad))))
+assert(Equal [0 0 0] (headCensus (procCode (optimized 6 t-quad))))
+assert(Eq 16 (t-quad 1 1))
+
+;; a recursive nested function is not inlined, but its calls stay known
+(define (t-sum n)
+  (define (go i acc) (Ifz i acc (go (Dec i) (Add acc i))))
+  (go n 0))
+assert(Eq 0 (_1 (headCensus (procCode (optimized 6 t-sum)))))
+assert(Eq 1 (_0 (headCensus (procCode (optimized 6 t-sum)))))
+
+;; brLower lowers a whole tail-If chain, not one level per round
+(define (t-chain x)
+  (If (Eq x 0) 10 (If (Eq x 1) 11 (If (Eq x 2) 12 13))))
+assert(Eq 3 (_2 (headCensus (procCode (optimized 5 t-chain)))))
+
+;; a nested law inlined into an existing BR arm gets its prim wrappers
+;; rewritten there too, so its own tail If lowers
+(define (t-arm x)
+  (define (inner y) (If (Eq y 5) 50 51))
+  (If (Eq x 0) 10 (inner x)))
+assert(Eq 2 (_2 (headCensus (procCode (optimized 5 t-arm)))))
+assert(Eq 0 (_1 (headCensus (procCode (optimized 5 t-arm)))))
+
+;; local-function blocks: a recursive nested law called from an eager
+;; site becomes a block, and its eager self-calls become LOCAL block
+;; calls (OP_CALL / OP_TAILBLK at codegen)
+(define (localBlocksOf level l) (localBlocks level (optimized level l)))
+(define (localCalls b)
+  (foldl
+    (lambda (n s)
+      (? Stmt s
+        (CALL [key op args] (? Op op (LOCAL [key] (Inc n)) (_ n)))
+        (PROC [key body] (Add n (localCalls (procCode body))))
+        (BR [x arms]
+          (foldl (lambda (m kp) (Add m (localCalls (procCode (_1 kp))))) n arms))
+        (_ n)))
+    0 b))
+(define (lb-sum n)
+  (define (go i acc) (Ifz i acc (go (Dec i) (Add acc i))))
+  (go n 0))
+(define lb-sum-r (localBlocksOf 5 lb-sum))
+assert(Eq 1 (Sz (_1 lb-sum-r)))
+assert(Eq 1 (localCalls (procCode (_0 lb-sum-r))))          ;; entry
+assert(Eq 1 (localCalls (procCode (_0 (_1 lb-sum-r)))))     ;; self tail call
+assert(Eq 0 (_0 (headCensus (procCode (_0 (_1 lb-sum-r))))))  ;; no law heads left
+;; captured outer variables are leading block arguments
+(define (lb-scaled n step)
+  (define (go i acc) (If (Ge i n) acc (go (Add i step) (Add acc (Mul i step)))))
+  (go 0 0))
+assert(Eq 1 (Sz (_1 (localBlocksOf 5 lb-scaled))))
+;; lazily called and escaping laws are blocks too, reached through the
+;; law directory behind the code
+(define (lb-parity n)
+  (define (ev k)
+    (define (od j) (Ifz j 0 (ev (Dec j))))
+    (Ifz k 1 (od (Dec k))))
+  [(ev n) (ev (Inc n))])
+;; ev hands itself to od (self as a value, pushed as its literal); od,
+;; not recursive on its own, is inlined into ev
+assert(Eq 1 (Sz (_1 (localBlocksOf 5 lb-parity))))
+(define (lb-closure xs)
+  (define (tri k) (Ifz k 0 (Add k (tri (Dec k)))))
+  (foldl (lambda (acc x) (Add acc (tri x))) 0 xs))
+;; the lambda handed to foldl, and tri, which it calls eagerly
+assert(Eq 2 (Sz (_1 (localBlocksOf 5 lb-closure))))
+(define lbc-code (compileP5 lb-closure))
+(define lbc-n (Sz lbc-code))
+assert(Eq OP_LAWBLK (Ix (Sub lbc-n 3) lbc-code))
+assert(IsLaw (Ix (Sub lbc-n 2) lbc-code))
+assert(Lt (Ix (Sub lbc-n 1) lbc-code) (Sub lbc-n 3))
+
 (print "plangrm tests passed")

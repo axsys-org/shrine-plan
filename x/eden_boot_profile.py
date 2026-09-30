@@ -43,14 +43,14 @@ def instrument(source):
         wrap('(publication:publish-local store-policy slot code\n      0 0 policy-state)', 'local.publish', '[store-policy code policy-state]'),
     ])
     edit('foil-new-env.rvr', [
-        ('(define out (elab-mod-info sut decls))',
-         '(define out (measure:timed (strWeld "module." mod) [sut decls] (lambda (_) (elab-mod-info sut decls))))'),
-        ('(foil-new-elab:compiler-subject\n      (foil-new-elab:elab-mod\n        (foil-new-elab:compiler-for sut) decls))',
-         '(measure:timed "elaborate" 0 (lambda (_) (foil-new-elab:compiler-subject (foil-new-elab:elab-mod (foil-new-elab:compiler-for sut) decls))))'),
+        ('  (define mod\n    (foil-new-elab:compiler-subject\n      (foil-new-elab:elab-mod compiler decls)))',
+         '  (define mod\n    (measure:timed "elaborate" [decls] (lambda (_) (foil-new-elab:compiler-subject\n      (foil-new-elab:elab-mod compiler decls)))))'),
         ('(define final (foil-lower:materialize-consts mod))',
          '(define final (measure:timed "materialize" mod (lambda (_) (foil-lower:materialize-consts mod))))'),
         ('(define lowered (foil-lower:lower-tc-unit sut final own-keys))',
          '(define lowered (measure:timed "lower" [final own-keys] (lambda (_) (foil-lower:lower-tc-unit sut final own-keys))))'),
+        ('  (define out\n    (elab-mod-info-in (foil-new-elab:compiler-for-mounts (_1 headed) sut) sut decls))',
+         '  (define out\n    (measure:timed (strWeld "module." mod) [sut decls] (lambda (_) (elab-mod-info-in (foil-new-elab:compiler-for-mounts (_1 headed) sut) sut decls))))'),
     ])
     path = reaver / 'foil-new-elab.rvr'
     text = path.read_text()
