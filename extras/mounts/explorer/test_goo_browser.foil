@@ -2,6 +2,8 @@
 - explorer_mount
 - testing
 - http_foot
+- tests/overlay_cache [at=cache_fixture]
+- tests/namespace [at=ns_fixture]
 
 + goo_browser_checks
   + fixture
@@ -31,6 +33,25 @@
      (testing/nat "missing optional values render nothing" 0
        (either/ok_val (goo_bridge/nodes published myth/new published.view.children)).len)]
 
+  + temporal
+    \ ignored=unit
+    ^ row[testing/check]
+    = dm (quip_val '@2026.9.30..12.0.0)
+      ds (quip_val '@@2026.9.30..12.0.0)
+      published goo_browser_checks/fixture
+      expression (rex/rune "." [(rex/word "card") (rex/word "req")])
+      view published.view.set_children([(goo/node rex/zero_span "time" [expression] [])])
+      html (either/ok_val (goo_bridge/render published (myth/sing ['sys 'req] (pails/ds ds)) view))
+    [(testing/text "legacy timestamp" "2026-09-30 12:00:00 UTC"
+       (either/ok_val (goo_bridge/formatted "time" (pails/n dm))))
+     (testing/text "legacy duration" "1h 30m"
+       (either/ok_val (goo_bridge/formatted "duration" (pails/n 5400000))))
+     (testing/text "ordinary numbers remain decimal" "5400000"
+       (either/ok_val (goo_bridge/formatted "number" (pails/n 5400000))))
+     (testing/text "tagged duration in text" "250ms"
+       (either/ok_val (goo_bridge/text (pails/dr 250))))
+     (testing/nat "precise timestamp renders in HTML" 1
+       (maybe/is_some (http_foot/find "2026-09-30 12:00:00 UTC" html)))]
   + success
     (@ a)
     \ result=either[str a]
@@ -55,6 +76,13 @@
       present (goo/node rex/zero_span "present"
         [(rex/word "card") (rex/rune "/" [(rex/word "sys") (rex/word "slot") (rex/word "label")])] [leaf])
       front (goo_bridge/render published card view.set_children([present]))
+      native_slot (goo_bridge/slot published card (rex/cord "action/copy"))
+      escaped (rex/juxt rex/zero_span [(rex/word "escaped") (rex/expr rex/zero_span "paren" [(rex/cord "One\nTwo")])])
+      decoded (goo_bridge/value published card (rex/normalize escaped))
+      record (rex/normalize (rex/nest rex/zero_span "curly" ":"
+        [(rex/brack [(rex/word "primary")]) (rex/word "true")]))
+      button (goo/node rex/zero_span "button" [record (rex/cord "Save") (rex/cord "action")] [])
+      configured (goo_bridge/render published card view.set_children([button]))
       markup (goo_bridge/render published card view)
       path_text=str
         ? path_source.at(0)
@@ -66,12 +94,129 @@
      (testing/text "unknown slot preserved" "/custom/title" (goo_bridge/role ['custom 'title]))
      (testing/nat "label context hides optional content" 1 (maybe/is_none (either/ok_val hidden)))
      (testing/nat "present accepts Grove absolute slot paths" 1 (goo_browser_checks/success front))
+     (testing/text "native role literals survive binding" "action/copy" (either/ok_val native_slot))
+     (testing/nat "escaped text survives binding" 1 (equal decoded (maybe/some[pail] (pails/t (str/cat_all ["One" (str/from_atom 10) "Two"])))))
+     (testing/nat "normalized config brackets reach v2" 1 (goo_browser_checks/success configured))
      (testing/nat "v2 produces prepared HTML" 1 (goo_browser_checks/success markup))
      (testing/nat "v2 rejects non-ASCII measurement" 0 (goo_browser_checks/success unicode))
      (testing/nat "unsupported constructor diagnosed" 0 (goo_browser_checks/success unsupported))
      (testing/text "path values materialize as v2 text" "/demo" path_text)]
 
+  + indexed_matches
+    \ ignored=unit
+    ^ row[testing/check]
+    = base goo_browser_checks/fixture
+      alternate base.set_contract((grove_role_runtime/spec [] [[['a] ['b]]]))
+      conjunction base.set_contract((grove_role_runtime/spec [] [[['a] ['b]] [['c]]]))
+      unconditional base.set_contract((grove_role_runtime/spec [] []))
+      impossible base.set_contract((grove_role_runtime/spec [] [[]]))
+      typed base.set_contract((grove_role_runtime/spec
+        [[['a] (curb/of_type (^ pails/t))]] [[['a]]]))
+      synthetic base.set_contract((grove_role_runtime/spec [] [[['sys 'lash]]]))
+      views=row[goo/published] [base alternate conjunction unconditional impossible typed synthetic]
+      index (goo_browser/index views)
+      cards=row[myth]
+        [myth/new
+         (myth/sing ['sys 'req] (pails/t "Name"))
+         (myth/sing ['a] (pails/t "A"))
+         (myth/sing ['b] (pails/t "B"))
+         (myth/sing ['a] (pails/n 3))
+         (myth/sing ['a] (pails/t "A")).put(['b] (pails/t "B")).put(['c] (pails/t "C"))
+         (myth/sing ['c] (pails/t "C"))]
+      same
+        | cards.all
+        \ card
+        | equal (views.keep((goo_browser/matches card))) (goo_browser/matching card index)
+      specific (goo_browser/index [base base base alternate conjunction typed])
+      name (myth/sing ['sys 'req] (pails/t "Name"))
+    [(testing/nat "index agrees with full scan for OR, AND, empty needs, type rejection and synthetic lash" 1 same)
+     (testing/nat "index excludes unrelated view contracts" 3 (goo_browser/candidates name specific).len)
+     (testing/nat "current object slots select new candidates immediately" 0
+       (goo_browser/matching myth/new specific).len)
+     (testing/nat "OR-group hits do not duplicate views" 5
+       (goo_browser/candidates cards.at(5) index).len)]
+
+  + development_routes
+    \ ignored=unit
+    ^ row[testing/check]
+    = route
+        \ method=str target=str body=str
+        | explorer_dev/plan [] (http_foot/request method target body) 0
+      read (route "GET" "/grove/dev/status?selected=%2F0x11%2Fapp%2Fdemo" "")
+      valid (route "POST" "/grove/dev/replace"
+        "source=%2F0x11%2Fgov%2Fdemo&root=%2F0x11%2Fapp%2Fdemo&version=3&expected=7&scan=2")
+      status_code
+        \ action=http_foot/action
+        ^ nat
+        ?> (./reply response) action 0
+        response.status
+      read_ok
+        ?> (./develop query) read .false
+        | equal query.operation "status"
+      write_ok
+        ?> (./develop query) valid .false
+        | and (eq query.version 3) (equal query.expected (maybe/some[nat] 7))
+    [(testing/nat "development status uses read-only request" 1 read_ok)
+     (testing/nat "development writes retain version guards" 1 write_ok)
+     (testing/nat "GET cannot delete" 405 (status_code (route "GET" "/grove/dev/delete" "")))
+     (testing/nat "POST cannot masquerade as status read" 405 (status_code (route "POST" "/grove/dev/status" "")))
+     (testing/nat "invalid expected version is rejected" 400 (status_code (route "POST" "/grove/dev/replace" "expected=no")))
+     (testing/nat "unknown development operation rejected" 404 (status_code (route "POST" "/grove/dev/unknown" "")))]
+
+  + cached_catalog_checks
+    \ ignored=unit
+    ^ row[testing/check]
+    = root=path [($x 1) 'gov]
+      transform=path [($x 1) 'weft 'catalog]
+      target=path [($x 1) 'weft 'catalog_cache]
+      initial ns_fixture/namespace_tests/initial
+      initial (cache_fixture/overlay_cache_tests/write root (writ/make myth/new) initial)
+      initial (cache_fixture/overlay_cache_tests/write transform
+        (writ/make (myth/sing bond/weft (felt goo_browser/catalog_overlay .none))) initial)
+      ready
+        ? (overlay_cache/install target (overlay_cache/path 1 transform root) initial)
+         > (./ok state) state
+         > (./err _) initial
+      published goo_browser_checks/fixture
+      view (myth/sing publisher_vocabulary/grove/view published)
+      added (cache_fixture/overlay_cache_tests/write root.snoc('view) (writ/make view) ready)
+      changed_view (myth/sing publisher_vocabulary/grove/view
+        published.set_result((goo/fail[goo/view] rex/zero_span "Updated")))
+      changed (cache_fixture/overlay_cache_tests/write root.snoc('view) (writ/make changed_view) added)
+      unrelated (cache_fixture/overlay_cache_tests/write [($x 1) 'request] (writ/make myth/new) changed)
+      rebound (cache_fixture/overlay_cache_tests/write root.snoc('view)
+        (writ/make (myth/sing publisher_vocabulary/grove/view
+          published.set_contract((grove_role_runtime/spec [] [[['other]]])))) unrelated)
+      removed (cache_fixture/overlay_cache_tests/write root.snoc('view) .cull unrelated)
+      cached (goo_browser/cached_catalog (sovereign_care .x target changed))
+    [(testing/nat "changed contract removes old index entry" 0
+       (goo_browser/candidates (myth/sing ['sys 'req] (pails/t "Name"))
+         (goo_browser/cached_index (sovereign_care .x target rebound))).len)
+     (testing/nat "changed contract adds new index entry" 1
+       (goo_browser/matching (myth/sing ['other] (pails/t "New"))
+         (goo_browser/cached_index (sovereign_care .x target rebound))).len)
+     (testing/nat "cached index matches newly published view" 1
+       (goo_browser/matching (myth/sing ['sys 'req] (pails/t "Name"))
+         (goo_browser/cached_index (sovereign_care .x target added))).len)
+     (testing/nat "deleted publication leaves no matching candidates" 0
+       (goo_browser/candidates (myth/sing ['sys 'req] (pails/t "Name"))
+         (goo_browser/cached_index (sovereign_care .x target removed))).len)
+     (testing/nat "empty catalog cache" 0
+       (goo_browser/cached_catalog (sovereign_care .x target ready)).len)
+     (testing/nat "publication adds view to cached catalog" 1
+       (goo_browser/cached_catalog (sovereign_care .x target added)).len)
+     (testing/nat "publication updates cached view" 1
+       (equal cached.at(0).result (goo/fail[goo/view] rex/zero_span "Updated")))
+     (testing/nat "HTTP-like unrelated write keeps catalog version" 1
+       (equal (changed.case(.x target)) (unrelated.case(.x target))))
+     (testing/nat "publication removal updates cached catalog" 0
+       (goo_browser/cached_catalog (sovereign_care .x target removed)).len)]
+
 + tests
   ^ row[testing/case]
   [(testing/case "view previews" goo_browser_checks/render)
-   (testing/case "v2 bridge" goo_browser_checks/bridge)]
+   (testing/case "temporal values" goo_browser_checks/temporal)
+   (testing/case "v2 bridge" goo_browser_checks/bridge)
+   (testing/case "indexed matches" goo_browser_checks/indexed_matches)
+   (testing/case "development routes" goo_browser_checks/development_routes)
+   (testing/case "cached catalog" goo_browser_checks/cached_catalog_checks)]

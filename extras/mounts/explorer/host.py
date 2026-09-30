@@ -1,4 +1,5 @@
 import urllib.request
+from pathlib import Path
 
 def check(url, node, timeout):
     for path, expected in [('/views', 'Namespace'), ('/views/' + node + '/hello', 'No published views match this object.'), ('/ns', 'sh-triptych'), ('/ns/' + node + '/hello', 'Hello from Eden.')]:
@@ -14,4 +15,4 @@ def check(url, node, timeout):
             body = response.read()
             assert body
             if mime == 'font/ttf':
-                assert body[:4] == bytes([0, 1, 0, 0])
+                assert body == (Path(__file__).parent / "goo-Sans400.ttf").read_bytes()

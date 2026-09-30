@@ -1,0 +1,152 @@
+- grove_install
+- fs_sync
+- json
+
++ grove_dev
+  + request
+    : operation=str source=path target=path version=nat expected=maybe[nat] selected=path scan=nat
+  + unit
+    : source=path home=path name=str files=row[str]
+  + metadata_slot
+    ^ path
+    | publisher_vocabulary/locate ['fs 'source 'manifest]
+  + slot
+    \ name=iota
+    ^ path
+    | publisher_vocabulary/locate ['fs 'source name]
+  + field
+    \ name=str value=json
+    ^ json
+    ?> (json/obj entries) value jnull
+    | entries.fold jnull (\ out entry (? (equal name entry.k) entry.v out))
+  + text
+    \ value=json
+    ^ str
+    ?> (json/str text) value ""
+    text
+  + items
+    \ value=json
+    ^ row[json]
+    ?> (json/arr values) value []
+    values
+  + record
+    \ target=path state=namespace
+    ^ myth
+    | (sovereign_care .x target state).fil.fall(myth/new)
+  + mount_units
+    \ home=path record=myth self=iota
+    ^ row[grove_dev/unit]
+    ?> (jres/ok manifest rest) (parse (record.txt_at(grove_dev/metadata_slot))) []
+    = name (grove_dev/text (grove_dev/field "name" manifest))
+      entries (grove_dev/items (grove_dev/field "grove" manifest))
+    | entries.map
+      \ entry=json
+      = root (grove_dev/items (grove_dev/field "root" entry))
+        components=path
+          | root.map
+            \ part=json
+            ^ iota
+            | $ts (grove_dev/text part)
+        source=path components.cons(self)
+        files ((grove_dev/items (grove_dev/field "files" entry)).map(grove_dev/text))
+      | grove_dev/unit source home name files
+  + units
+    \ state=namespace
+    ^ row[grove_dev/unit]
+    = tree (sovereign_care .y [state.self 'io 'fs] state)
+    | tree.kid_tap.bind
+      \ [key child]
+      | grove_dev/mount_units [state.self 'io 'fs key] child.fil.fall(myth/new) state.self
+  + origin
+    \ record=myth
+    ^ maybe[safe]
+    ?> (./some held) record.get(grove_templates/source_slot) .none
+    ?> source=safe held .none
+    | ./some source
+  + enclosing
+    \ selected=path state=namespace
+    ^ path
+    % length=nat selected.len
+    ? (lt length 3) []
+    = root selected.take(length)
+    ? (maybe/is_some (grove_dev/origin (grove_dev/record root state))) root
+    | _ length.dec
+  + number
+    \ value=nat
+    ^ json
+    | json/str (nat/show value)
+  + optional
+    \ value=maybe[nat]
+    ^ json
+    | value.run(grove_dev/number).fall(jnull)
+  + unit_json
+    \ unit=grove_dev/unit state=namespace
+    ^ json
+    = mount (grove_dev/record unit.home state)
+      record (grove_dev/record unit.source state)
+      version (state.case(.x unit.source))
+      present (record.has(grove_templates/slot))
+    | json/obj
+      [(jkv "source" (json/str (path_show unit.source)))
+       (jkv "home" (json/str (path_show unit.home)))
+       (jkv "mount" (json/str unit.name))
+       (jkv "files" (json/arr (unit.files.map((\ file (json/str file))))))
+       (jkv "version" (grove_dev/optional (? present version .none)))
+       (jkv "requested" (grove_dev/number (mount.nat_at(bond/epoch 0))))
+       (jkv "completed" (grove_dev/number (mount.nat_at((grove_dev/slot 'epoch) 0))))
+       (jkv "ready" (json/boo !(eq (mount.nat_at((grove_dev/slot 'ready) 0)) 0)))
+       (jkv "message" (json/str (mount.txt_at((grove_dev/slot 'message)))))
+       (jkv "diagnostic" (json/str (mount.txt_at((grove_dev/slot 'diagnostic_text)))))]
+  + status
+    \ query=grove_dev/request state=namespace
+    ^ str
+    = located (grove_dev/enclosing query.selected state)
+      target (? query.target.len query.target located)
+      record (grove_dev/record target state)
+      origin (grove_dev/origin record)
+      source=path
+        ? origin
+         > (./some reference) reference.path
+        query.source
+      installed=maybe[nat]
+        ? origin
+         > (./some reference) (./some reference.ver)
+        .none
+    | show (json/obj
+      [(jkv "units" (json/arr ((grove_dev/units state).map((\ unit (grove_dev/unit_json unit state))))))
+       (jkv "source" (json/str (path_show source)))
+       (jkv "root" (json/str (path_show target)))
+       (jkv "installed" (grove_dev/optional installed))
+       (jkv "expected" (grove_dev/optional (state.case(.z target))))
+       (jkv "occupied" (json/boo (? target.len !(eq (sovereign_peek target state).wyt 0) .false)))
+       (jkv "selected" (json/str (path_show (? (maybe/is_some (sovereign_care .x query.selected state).fil) query.selected target))))])
+  + apply
+    \ query=grove_dev/request state=namespace
+    ^ either[iota namespace]
+    = matches ((grove_dev/units state).keep((\ unit (equal unit.source query.source))))
+    ? !(eq matches.len 1) (./err 'unknown_grove_source)
+    = unit matches.at(0)
+      mount (grove_dev/record unit.home state)
+    ? (equal query.operation "rescan")
+      ? !(eq query.scan (mount.nat_at(bond/epoch 0))) (./err 'stale_scan)
+      | grove_install/change unit.home (writ/warp unit.home.weld(['op 'rescan]) myth/new) state
+    ? (equal query.operation "delete")
+      | grove_install/remove query.source query.target query.expected state
+    ? !(equal (maybe/some[nat] query.version) (state.case(.x query.source))) (./err 'stale_template)
+    ? !(eq query.scan (mount.nat_at((grove_dev/slot 'epoch) 0))) (./err 'stale_publication)
+    ? !(eq query.scan (mount.nat_at(bond/epoch 0))) (./err 'publication_pending)
+    ? (eq (mount.nat_at((grove_dev/slot 'ready) 0)) 0) (./err 'publication_failed)
+    ? (equal query.operation "replace")
+      | grove_install/replace query.source query.version query.target query.expected state
+    ? (equal query.operation "install")
+      < checked (grove_install/validate_instance query.source query.target query.expected state)
+      | grove_install/instantiate query.source query.version query.target state
+    | ./err 'unknown_development_operation
+  + run
+    \ query=grove_dev/request state=namespace
+    ^ [namespace nat str]
+    ? (equal query.operation "status") [state 200 (grove_dev/status query state)]
+    ? (grove_dev/apply query state)
+     > (./ok next) [next 200 (grove_dev/status query next)]
+     > (./err why)
+      [state 409 (show (json/obj [(jkv "error" (json/str (str/from_atom (iota_show why))))]))]

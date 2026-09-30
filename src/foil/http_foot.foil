@@ -6,7 +6,9 @@
   + request
     : method=str target=str body=str
   + action
-    & http_foot/action/reply
+    & http_foot/action/develop
+      http_foot/action/reply
+      http_foot/action/bytes
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
@@ -14,8 +16,12 @@
       http_foot/action/value
       http_foot/action/physical
       http_foot/action/inspect
+    + develop
+      : query=grove_dev/request
     + reply
       : response=http_response
+    + bytes
+      : status=nat body=nat ctype=nat
     + install
       : source=path version=nat target=path back=str
     + write
@@ -40,6 +46,8 @@
       feet/task/physical
       feet/task/inspect
       feet/task/ack
+      feet/task/develop
+      http_foot/action/develop
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
@@ -255,15 +263,26 @@
        "Content-Type: " (str/from_atom response.ctype) http_foot/crlf
        "Content-Length: " (nat/show (wid response.body)) http_foot/crlf
        "Connection: close" http_foot/crlf http_foot/crlf (str/from_atom response.body)]
+  + encode_bytes
+    ' Body is a byte bar: its sentinel preserves trailing zero bytes.
+    \ status=nat body=nat ctype=nat
+    ^ nat
+    = header=str
+        | str/cat_all
+          ["HTTP/1.0 " (nat/show status) " Response" http_foot/crlf
+           "Content-Type: " (str/from_atom ctype) http_foot/crlf
+           "Content-Length: " (nat/show (dec (wid body))) http_foot/crlf
+           "Connection: close" http_foot/crlf http_foot/crlf]
+    | add (str/to_atom header) (mul body (bex (mul 8 header.len)))
   + connection
     '  Plan locally; ask the foot only for namespace work.
     \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
-    = response=http_response
+    = encoded=nat
         ? (Try http_foot/read_request fd)
-         > (./err _) (http_driver/response 400 "Malformed HTTP request")
+         > (./err _) (http_foot/encode (http_driver/response 400 "Malformed HTTP request"))
          > (./ok parsed)
           =   ;planned
             | Try[http_foot/request http_foot/action]
@@ -273,14 +292,15 @@
               parsed
           ? planned
            > (./err _)
-            | http_driver/response 400 "Invalid request"
+            | http_foot/encode (http_driver/response 400 "Invalid request")
            > (./ok action)
             ? action
-             > (./reply ready) ready
+             > (./reply ready) (http_foot/encode ready)
+             > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
             ; (SendCaps foot action [0])
             = ;[answer extra] (Recv[http_response] 0)
-            answer
-    ; (Try (\ response=http_response (Write fd (http_foot/encode response))) response)
+            | http_foot/encode answer
+    ; (Try (\ wire=nat (Write fd wire)) encoded)
     ; (CloseFd fd)
     | CloseHandle foot
   + listener
@@ -376,6 +396,23 @@
     % serial=nat 0 pending=row[http_foot/pending] [] queue=row[http_foot/ack] []
     = ;[message caps] (Recv[http_foot/task] 0)
     ? message
+     > (http_foot/action/develop query)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/develop serial query))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/develop request status body)
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn (http_response status (str/to_atom body) "application/json; charset=utf-8"))
+          out
+      | _ serial left queue
      > (http_foot/action/install source version target back)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
