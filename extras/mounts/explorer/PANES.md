@@ -279,3 +279,38 @@ source; transport and operation state are shared host code.
 
 Load `/static/goo-workspace.js` after the shared session, pane, and action scripts.
 It attaches controllers to server-rendered workspace containers automatically.
+
+### Creating an object with an action
+
+A creation group keeps the presenting receiver and names a separate, absent
+write destination:
+
+```text
+group(make = creator.creation_target, role = %/created_card, myth = {
+  '/sys/req = .input("")
+  '/sys/res = .input("")
+}) {
+  input('/sys/req)
+  input('/sys/res)
+  action("Create card")
+}
+```
+
+`make` accepts a literal absolute path or a direct path-typed receiver field.
+`role` names a published role. `make` is mutually exclusive with `on` and
+`action`; the creation itself is the operation. The presenting object must still
+exist, match its view, and pass the ordinary freshness checks. The server resolves
+the destination from that current receiver, checks application write authority,
+validates the supplied initial fields against the creation role, and atomically
+installs the record and its contract only if the destination subtree is empty.
+An occupied destination never becomes an update. Failed validation leaves the
+namespace unchanged; retries with the same invocation identity return the
+original successful receipt.
+
+Creation inputs use literal text defaults from their `.input(...)` bindings,
+not same-named slots on the presenting object. Other displayed expressions keep
+the enclosing receiver. Successful creation uses the existing refresh behavior;
+it does not implicitly navigate or select the new object.
+
+`grove-dev/creation.grove` supplies a runnable example at
+`/views/0x11/app/demo/creator`, creating `/0x11/app/demo/created`.

@@ -10,7 +10,7 @@
     : operation=str target=path subject=path view=path control=row[nat]
       expected=nat displayed=nat publication=nat inputs=row[[str str]] now=nat
   + scope
-    : receiver=maybe[rex] action=maybe[rex] values=list[rex]
+    : receiver=maybe[rex] action=maybe[rex] values=list[rex] make=maybe[rex] role=maybe[rex]
   + read_path
     \ expression=rex
     ^ maybe[path]
@@ -64,10 +64,14 @@
     = receiver (goo_runtime/named "on" node.arguments)
       action (goo_runtime/named "action" node.arguments)
       values (goo_runtime/named "myth" node.arguments)
+      make (goo_runtime/named "make" node.arguments)
+      role (goo_runtime/named "role" node.arguments)
     | goo_runtime/scope
       (? (maybe/is_some receiver) receiver scope.receiver)
       (? (maybe/is_some action) action scope.action)
       scope.values.weld(values.run(goo_runtime/fields).fall((list/nil[rex])))
+      (? (maybe/is_some make) make scope.make)
+      (? (maybe/is_some role) role scope.role)
   + locate
     \ nodes=list[goo/node] indices=row[nat] scope=goo_runtime/scope
     ^ maybe[[goo/node goo_runtime/scope]]
@@ -323,6 +327,10 @@
     ^ either[str [goo/node goo_runtime/scope]]
     = [node scope] found
     ? !(eq node.constructor "action") (./err "Expected an action control.")
+    ? (maybe/is_some scope.make)
+      ? ((maybe/is_some scope.receiver) || (maybe/is_some scope.action)) (./err "make cannot be combined with on or action.")
+      ? (maybe/is_none scope.role) (./err "make requires a role.")
+      | ./ok found
     ?> (./some receiver) scope.receiver (./err "Action group requires on = receiver.")
     ? !(eq receiver.print binding) (./err "Only the current receiver is supported.")
     | ./ok found
@@ -330,7 +338,7 @@
     \ query=goo_runtime/request published=goo/published current=myth
     ^ either[str [goo/node goo_runtime/scope]]
     < lowered (goo_runtime/matching_view published current)
-    = empty=goo_runtime/scope (goo_runtime/scope .none .none .nil)
+    = empty=goo_runtime/scope (goo_runtime/scope .none .none .nil .none .none)
     ?> (./some found) (goo_runtime/locate lowered.children query.control empty)
       | ./err "Unknown control."
     | goo_runtime/bound_control published.view.binding found
@@ -349,6 +357,18 @@
     ?> (./ok result) (Try (invoke arguments) current) (./err "Action failed during execution; the object was not changed.")
     ?> (./some next) result (./err "Action rejected its arguments or receiver.")
     | ./ok next
+  + prepared
+    \ query=goo_runtime/request published=myth current=myth state=namespace
+    ^ either[str myth]
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+      bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
+    < lowered (goo_runtime/matching_view view current)
+    < nodes (goo_runtime/bind_sources view current lowered.children)
+    < bound (goo_runtime/bound_captures nodes query.control scope.values.weld(bindings) query.inputs)
+    < validated (goo_runtime/validate_captures query.inputs scope.values.weld(bindings) state)
+    | goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings)
   + updated
     \ query=goo_runtime/request published=myth current=myth state=namespace
     ^ either[str myth]
@@ -356,13 +376,27 @@
     < found (goo_runtime/control query view current)
     = [node scope] found
     ?> (./some action) scope.action (./err "Action group requires an action.")
-    = bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
-    < lowered (goo_runtime/matching_view view current)
-    < nodes (goo_runtime/bind_sources view current lowered.children)
-    < bound (goo_runtime/bound_captures nodes query.control scope.values.weld(bindings) query.inputs)
-    < validated (goo_runtime/validate_captures query.inputs scope.values.weld(bindings) state)
-    < arguments (goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings))
+    < arguments (goo_runtime/prepared query published current state)
     | goo_runtime/dispatch action arguments current view.contract state
+  + create
+    \ query=goo_runtime/request published=myth current=myth state=namespace scope=goo_runtime/scope
+    ^ either[str namespace]
+    < view (goo_runtime/published published)
+    ?> (./some expression) scope.make (./err "Missing creation destination.")
+    ?> (./some target) (goo_runtime/source_path view current expression) (./err "Creation destination must have a path value.")
+    ? !(and state.permitted(target) (pith_prefix [state.self 'app] target)) (./err "Creation destination is outside application authority.")
+    ? (sovereign_peek target state).wyt (./err "Creation destination is occupied.")
+    ?> (./some expression) scope.role (./err "Missing creation role.")
+    ?> (./some role_path) (goo_runtime/read_path expression) (./err "Creation role must be a declaration path.")
+    ?> (./some role) (goo_runtime/record .x role_path state) (./err "Creation role is unavailable.")
+    ?> (./some held) role.get(publisher_vocabulary/grove/role_contract) (./err "Creation role has no contract.")
+    ?> contract=lash held (./err "Invalid creation role contract.")
+    < arguments (goo_runtime/prepared query published current state)
+    = next arguments.put(['sys 'lash] contract)
+    ? (maybe/is_some (fit_check next)) (./err "Initial fields violate the creation role.")
+    ? (grove_install/change target (writ/make next) state)
+     > (./ok next) (./ok next)
+     > (./err why) (./err (str/from_atom (iota_show why)))
   + apply
     \ query=goo_runtime/request state=namespace
     ^ either[str namespace]
@@ -375,6 +409,10 @@
     ? !(eq query.expected (state.case(.x target)).fall(0)) (./err "Object changed; refresh before submitting.")
     ?> (./some current) (goo_runtime/record .x target state) (./err "Object no longer exists.")
     ?> (./some published) (goo_runtime/record .x query.view state) (./err "View no longer exists.")
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+    ? (maybe/is_some scope.make) (goo_runtime/create query published current state scope)
     < next (goo_runtime/updated query published current state)
     ? (grove_install/change target (writ/make next) state)
      > (./ok next) (./ok next)
