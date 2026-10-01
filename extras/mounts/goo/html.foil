@@ -1,0 +1,307 @@
+- goo_app/display
+- goo_app/layout
+
+' Internal prepared representation. Public entry points accept semantic trees,
+' never caller-built rows, lines, or plans. Preparation owns their shared context.
++ goo_html_internal
+  + node
+    : semantic=goo/semantic plan=goo_measure/plan lines=maybe[list[str]] rows=list[goo_html_internal/paint_row]
+  + paint_row
+    : gap=goo/scalar gaps=list[goo/scalar] children=list[goo_html_internal/node]
+  + prepared
+    : width=goo/scalar scale=goo/scalar rtl=bool measurement=goo_measure/result tree=maybe[goo_html_internal/node]
+  + lookup
+    \ nodes=list[goo/semantic] id=goo/node_id
+    ^ maybe[goo/semantic]
+    ? nodes.is_nil .none
+    ? (eq nodes.head.node_id.text id.text) (./some nodes.head)
+    | goo_html_internal/lookup nodes.tail id
+  + build
+    \ nodes=list[goo/semantic] scale=goo/scalar plan=goo_measure/plan
+    ^ maybe[goo_html_internal/node]
+    < node (goo_html_internal/lookup nodes plan.id)
+    = source_rows (plan.rows.fall((list/nil[goo_measure/plan_row])))
+    < rows
+      | source_rows.traverse_maybe
+        \ row=goo_measure/plan_row
+        < children (row.children.traverse_maybe((goo_html_internal/build nodes scale)))
+        | ./some (goo_html_internal/paint_row row.gap row.gaps.fall((list/nil[goo/scalar])) children)
+    | ./some (goo_html_internal/node node plan (goo_ascii/text_lines scale node plan.width) rows)
+
++ goo_html
+  + cat
+    \ chunks=list[str]
+    ^ str
+    | str/cat_all chunks.row
+  + prepare
+    \ tree=maybe[goo/semantic] width=goo/scalar scale=goo/scalar rtl=bool
+    ^ either[str goo_html_internal/prepared]
+    ? (!(goo_layout/valid width) || !(goo_layout/valid scale) || !(goo_fp/lte width (goo_fp/integer 100000)) || (goo_fp/lte scale (goo/scalar 0)) || !(goo_fp/lte scale (goo_fp/integer 10))) (./err "invalid render dimensions")
+    = invalid=maybe[str]
+        ? tree
+         > ./none .none
+         > (./some node) (goo_ascii/check node)
+    ? invalid
+     > (./some message) (./err message)
+    > (./some measured) (goo_layout/plan_with (\ n (./some (goo_ascii/leaf_size scale n))) (\ n w (./some (goo_ascii/leaf_height scale n w))) tree width) (./err "invalid layout measurements")
+    = built=maybe[maybe[goo_html_internal/node]]
+        ? measured.value.plan
+         > ./none (./some .none)
+         > (./some plan)
+          < root tree
+          < node (goo_html_internal/build (goo_measure/nodes root) scale plan)
+          | ./some (./some node)
+    > (./some built) built (./err "render plan references unknown node")
+    | ./ok (goo_html_internal/prepared width scale rtl measured built)
+  + escape
+    ' Copy unescaped runs once. Preserve Blaze's C0 filtering and escaping.
+    \ text=str
+    ^ str
+    = pieces=list[str]
+        % i=nat 0 start=nat 0 out=list[str] .nil
+        ^ list[str]
+        ? (eq i text.len) (list/cons text.slice(start (sub i start)) out).reverse
+        = c text.at(i)
+          control=bool (? (lt c 32) !((eq c 9) || (eq c 10) || (eq c 13)) .false)
+        ? !((eq c 38) || (eq c 60) || (eq c 62) || (eq c 34) || (eq c 39) || control) (_ i.inc start out)
+        = escaped=str
+            ? control ""
+            ? (eq c 38) "&amp;"
+            ? (eq c 60) "&lt;"
+            ? (eq c 62) "&gt;"
+            ? (eq c 34) "&quot;"
+            "&#39;"
+          out (list/cons escaped (list/cons text.slice(start (sub i start)) out))
+        | _ i.inc i.inc out
+    | str/cat_all pieces.row
+  + number
+    \ value=goo/scalar
+    ^ str
+    = text (goo_display/decimal value)
+      fraction=bool
+        % i=nat 0
+        ? (eq i text.len) .false
+        ? ((eq text.at(i) 46) || (eq text.at(i) 101)) .true
+        | _ i.inc
+    | str/cat_all [text (? fraction "" ".0")]
+  + px
+    \ value=goo/scalar
+    ^ str
+    | str/cat_all [(goo_html/number value) "px"]
+  + attribute
+    : name=str value=str
+  + attributes
+    \ attrs=list[goo_html/attribute]
+    ^ str
+    | str/cat_all attrs.map((\ a=goo_html/attribute (str/cat_all [" " a.name "=" "".snoc_byte(34) (goo_html/escape a.value) "".snoc_byte(34)]))).row
+  + tag
+    \ name=str attrs=list[goo_html/attribute] content=str
+    ^ str
+    | str/cat_all ["<" name (goo_html/attributes attrs) ">" content "</" name ">"]
+  + void
+    \ name=str attrs=list[goo_html/attribute]
+    ^ str
+    | str/cat_all ["<" name (goo_html/attributes attrs) ">"]
+  + label
+    \ node=goo/semantic fallback=str
+    ^ str
+    ? node.attrs.common.config.label
+     > (./some text)
+      ? !(eq text "") text
+      fallback
+    fallback
+  + percent
+    \ value=goo/scalar maximum=goo/scalar
+    ^ str
+    = r (goo_fp/ratio value)
+    ? (goo_number/finite r.negative (mul r.numerator 100) r.denominator)
+     > (./some product) (goo_html/number (goo_fp/quotient product maximum))
+     > ./none "Infinity"
+  + bar_style
+    \ node=goo/semantic
+    ^ str
+    ? !(eq (goo_ascii/kind node) "bar") ""
+    ? node.attrs.common.config.value
+     > ./none ""
+     > (./some value)
+      = maximum=goo/scalar
+          ? node.attrs.common.config.max
+           > ./none (goo_fp/integer 100)
+           > (./some maximum) maximum
+        percent (goo_html/percent value maximum)
+      | str/cat_all [";background:linear-gradient(to right,#76965e " percent "%,#e4ead8 " percent "%)"]
+  + base
+    \ node=goo_html_internal/node margin=goo/scalar cls=str
+    ^ list[goo_html/attribute]
+    = n node.semantic
+      attrs ((((list/one (goo_html/attribute "style" (str/cat_all ["width:" (goo_html/px node.plan.width) ";margin-inline-start:" (goo_html/px margin) (goo_html/bar_style n)]))).cons((goo_html/attribute "data-slot" n.attrs.common.slot.text))).cons((goo_html/attribute "data-node" n.node_id.text))).cons((goo_html/attribute "class" (str/cat_all ["goo-node " cls]))))
+    ? (eq (goo_ascii/kind n) "group") attrs
+    | attrs.snoc((goo_html/attribute "data-leaf" "1"))
+  + content
+    \ node=goo_html_internal/node fallback=str
+    ^ str
+    ? node.lines
+     > ./none (goo_html/escape fallback)
+     > (./some lines)
+      = is_status=bool
+          ? node.semantic
+           > (goo/semantic/text _ _) (eq (goo_ascii/role node.semantic) "status")
+          .false
+      ? (eq lines.len 0) ""
+      | str/cat_all [(goo_html/line is_status lines.at(0)) (str/cat_all lines.drop(1).map((goo_html/line .false)).row)]
+  + line
+    \ marked=bool text=str
+    ^ str
+    = marker=str (? marked (goo_html/tag "span" ((list/one (goo_html/attribute "aria-hidden" "true")).cons((goo_html/attribute "class" "goo-status-mark"))) "") "")
+    | goo_html/tag "span" (list/one (goo_html/attribute "class" "goo-ascii-line")) (str/cat_all [marker (goo_html/escape text)])
+  + image_attrs
+    \ node=goo/semantic kind=str payload=str
+    ^ list[goo_html/attribute]
+    ((list/one (goo_html/attribute "aria-label" (goo_html/label node (? (eq payload "") kind payload)))).cons((goo_html/attribute "role" "img")))
+  + stacked
+    \ node=goo_html_internal/node
+    ^ bool
+    ? node.semantic
+     > (goo/semantic/flow _ direction children)
+      ? direction
+       > ./col (gt children.len 1)
+       > ./row .false
+    .false
+  + paint_row
+    \ row=goo_html_internal/paint_row
+    ^ str
+    = parts (goo_html/paint_children row.children row.gaps (goo/scalar 0))
+      align=str (? (list/any[goo_html_internal/node] goo_html/stacked row.children) "flex-start" "center")
+    | goo_html/tag "div" ((list/one (goo_html/attribute "style" (str/cat_all ["margin-block-start:" (goo_html/px row.gap) ";align-items:" align]))).cons((goo_html/attribute "class" "goo-row"))) (str/cat_all parts.row)
+  + paint_children
+    \ children=list[goo_html_internal/node] gaps=list[goo/scalar] margin=goo/scalar
+    ^ list[str]
+    ? children.is_nil .nil
+    = next (? gaps.is_nil (goo/scalar 0) gaps.head)
+    | (goo_html/paint_children children.tail gaps.tail next).cons((goo_html/paint children.head margin))
+  + paint
+    \ node=goo_html_internal/node margin=goo/scalar
+    ^ str
+    = n node.semantic
+      kind (goo_ascii/kind n)
+      cfg n.attrs.common.config
+      slot n.attrs.common.slot.text
+    ? n
+     > (goo/semantic/flow _ _ _) (goo_html/tag "div" (goo_html/base node margin "goo-group") (str/cat_all node.rows.map(goo_html/paint_row).row))
+     > (goo/semantic/text _ text) (goo_html/tag "div" (goo_html/base node margin (str/cat_all ["goo-text goo-" (goo_ascii/role n)])) (goo_html/content node text))
+     > (goo/semantic/image _ url)
+      = image_kind=str (? ((eq slot "icon") || (eq slot "avatar")) "avatar" "media")
+        label=str
+          ? cfg.label
+           > ./none ""
+           > (./some label) label
+      | goo_html/tag "div" (goo_html/base node margin (str/cat_all ["goo-" image_kind])).weld((goo_html/image_attrs n image_kind "")) (goo_html/void "img" (((list/one (goo_html/attribute "style" "position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit")).cons((goo_html/attribute "alt" label))).cons((goo_html/attribute "src" url))))
+    = text (goo_ascii/payload n)
+    ? (eq kind "button")
+      = primary=bool
+          ? cfg.primary
+           > ./none .false
+           > (./some value) value
+        cls (str/cat_all ["goo-button" (? primary " primary" "") (? (eq slot "action/destructive") " destructive" "")])
+      | goo_html/tag "button" (goo_html/base node margin cls).snoc((goo_html/attribute "type" "button")) (goo_html/content node text)
+    ? (eq kind "input") (goo_html/void "input" (goo_html/base node margin "goo-input").weld((((list/one (goo_html/attribute "aria-label" (goo_html/label n slot))).cons((goo_html/attribute "value" text))).cons((goo_html/attribute "type" "text")))))
+    ? (eq kind "code") (goo_html/tag "pre" (goo_html/base node margin "goo-code") (goo_html/content node text))
+    ? (eq kind "bar")
+      = extra=list[goo_html/attribute]
+          ? cfg.value
+           > ./none .nil
+           > (./some value)
+            = maximum=goo/scalar
+                ? cfg.max
+                 > ./none (goo_fp/integer 100)
+                 > (./some maximum) maximum
+            (((list/one (goo_html/attribute "aria-valuenow" (goo_html/number value))).cons((goo_html/attribute "aria-valuemax" (goo_html/number maximum)))).cons((goo_html/attribute "aria-valuemin" "0")))
+      | goo_html/tag "div" (goo_html/base node margin "goo-bar").weld(((list/one (goo_html/attribute "aria-label" (goo_html/label n slot))).cons((goo_html/attribute "role" "progressbar")))).weld(extra) (goo_html/content node text)
+    | goo_html/tag "div" (goo_html/base node margin (str/cat_all ["goo-" kind])).weld((goo_html/image_attrs n kind text)) (goo_html/content node text)
+  + fragment
+    \ prepared=goo_html_internal/prepared
+    ^ str
+    ? !(goo_html/valid prepared) (Seq[str] (error (goo_fp/fault "invalid prepared render tree")) "")
+    = body=str
+        ? prepared.tree
+         > ./none ""
+         > (./some root) (goo_html/paint root (goo/scalar 0))
+    | goo_html/tag "div" (((list/one (goo_html/attribute "style" (str/cat_all ["width:" (goo_html/px prepared.measurement.value.width) ";--goo-text-scale:" (goo_html/number prepared.scale)]))).cons((goo_html/attribute "dir" (? prepared.rtl "rtl" "ltr")))).cons((goo_html/attribute "class" "goo-surface"))) body
+  + color
+    \ path=goo/path
+    ^ str
+    = p path.display
+    ? (eq p "/sys/slots/scar") "#ef4444"
+    ? (eq p "/sys/slots/label") "#f97316"
+    ? (eq p "/sys/slots/summary") "#f59e0b"
+    ? (eq p "/sys/slots/inspect") "#22c55e"
+    ? (eq p "/sys/slots/detail") "#3b82f6"
+    ? (eq p "/sys/slots/full") "#8b5cf6"
+    "#6b7280"
+  + document
+    \ path=goo/path prepared=goo_html_internal/prepared
+    ^ str
+    = head (goo_html/cat ((((((list/one (goo_html/void "link" ((list/one (goo_html/attribute "href" "/static/ascii-fonts.css")).cons((goo_html/attribute "rel" "stylesheet"))))).cons((goo_html/void "link" ((list/one (goo_html/attribute "href" "/static/reference.css")).cons((goo_html/attribute "rel" "stylesheet")))))).cons((goo_html/void "link" ((list/one (goo_html/attribute "href" "static/goo.generated.css")).cons((goo_html/attribute "rel" "stylesheet")))))).cons((goo_html/tag "title" .nil "Goo"))).cons((goo_html/void "meta" ((list/one (goo_html/attribute "content" "width=device-width, initial-scale=1")).cons((goo_html/attribute "name" "viewport")))))).cons((goo_html/void "meta" (list/one (goo_html/attribute "charset" "utf-8"))))))
+      border=str
+        ? prepared.tree
+         > ./none ""
+         > (./some _) (str/cat_all ["width:fit-content;outline:2px solid " (goo_html/color path) ";outline-offset:2px"])
+      body (goo_html/tag "div" ((list/one (goo_html/attribute "style" border)).cons((goo_html/attribute "id" "goo-render-root"))) (goo_html/fragment prepared))
+    | str/cat_all ["<!DOCTYPE HTML>" (goo_html/tag "html" .nil (goo_html/cat ((list/one (goo_html/tag "body" .nil body)).cons((goo_html/tag "head" .nil head)))))]
+  + line_record
+    \ scale=goo/scalar nodes=list[goo/semantic] plan=goo_measure/plan
+    ^ json
+    = lines=json
+        ? (goo_html_internal/lookup nodes plan.id)
+         > ./none jnull
+         > (./some n) (goo_codec/optional_json[list[str]] (\ lines (json/arr lines.map((\ line=str (json/str line))).row)) (goo_ascii/text_lines scale n plan.width))
+      natural=goo/scalar
+        ? (goo_html_internal/lookup nodes plan.id)
+         > ./none (goo/scalar 0)
+         > (./some n) (goo_ascii/natural_width scale n)
+    | json/obj [(jkv "id" (json/str plan.id.text)) (jkv "lines" lines) (jkv "naturalWidth" (goo_number/encode natural))]
+  + inspect
+    \ prepared=goo_html_internal/prepared
+    ^ json
+    = nodes=list[goo/semantic]
+        ? prepared.measurement.value.tree
+         > ./none .nil
+         > (./some n) (goo_measure/nodes n)
+      plans=list[goo_measure/plan]
+        ? prepared.measurement.value.plan
+         > ./none .nil
+         > (./some p) (goo_measure/plans p)
+      measurement=json
+        ? (goo_measure/encode prepared.measurement)
+         > ./none jnull
+         > (./some value) value
+    | json/obj [(jkv "context" (json/obj [(jkv "width" (goo_number/encode prepared.width)) (jkv "textScale" (goo_number/encode prepared.scale)) (jkv "direction" (json/str (? prepared.rtl "RTL" "LTR")))])) (jkv "measurement" measurement) (jkv "lines" (json/arr plans.map((goo_html/line_record prepared.scale nodes)).row))]
+
+  + valid
+    \ prepared=goo_html_internal/prepared
+    ^ bool
+    = width prepared.width
+      scale prepared.scale
+    ? (!(goo_layout/valid width) || !(goo_layout/valid scale) || !(goo_fp/lte width (goo_fp/integer 100000)) || (goo_fp/lte scale (goo/scalar 0)) || !(goo_fp/lte scale (goo_fp/integer 10))) .false
+    > (./some checked) (goo_measure/make prepared.measurement.value) .false
+    ? !(equal[goo/scalar] checked.value.width (goo_layout/quantize width)) .false
+    ? checked.value.tree
+     > ./none (equal[maybe[goo_html_internal/node]] prepared.tree .none)
+     > (./some root)
+      ? (maybe/is_some (goo_ascii/check root)) .false
+      > (./some sizes) (goo_layout/summaries (\ n (./some (goo_ascii/leaf_size scale n))) root) .false
+      ? !(equal[list[goo_measure/named_size]] sizes checked.value.sizes) .false
+      > (./some plan) checked.value.plan .false
+      = nodes (goo_measure/nodes root)
+        plans (goo_measure/plans plan)
+        heights_ok=bool
+          % i=nat 0
+          ^ bool
+          ? (eq i plans.len) .true
+          > (./some n) (goo_html_internal/lookup nodes plans.at(i).id) .false
+          ? !(eq (goo_ascii/kind n) "group")
+            ? !(equal[goo/scalar] plans.at(i).height (goo_ascii/leaf_height scale n plans.at(i).width)) .false
+            | _ i.inc
+          | _ i.inc
+      ? !heights_ok .false
+      | equal[maybe[goo_html_internal/node]] prepared.tree (goo_html_internal/build nodes scale plan)

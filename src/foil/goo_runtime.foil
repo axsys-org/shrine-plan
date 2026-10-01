@@ -1,0 +1,465 @@
+- grove_role_runtime
+- grove_install
+- grove_view_publication
+- json
+
+' Browser requests identify published controls. Only source-declared arguments
+' can be supplied, and all writes pass through the namespace event loop.
++ goo_runtime
+  + request
+    : operation=str target=path subject=path view=path control=row[nat]
+      expected=nat displayed=nat publication=nat inputs=row[[str str]] now=nat
+  + scope
+    : receiver=maybe[rex] action=maybe[rex] values=list[rex] make=maybe[rex] role=maybe[rex]
+  + read_path
+    \ expression=rex
+    ^ maybe[path]
+    ?> (./leaf _ _ text) expression .none
+    ? !(equal expression.leaf_kind (maybe/some[str] "quip")) .none
+    | path_parse text.slice(1 text.len.dec)
+  + named
+    \ name=str arguments=list[rex]
+    ^ maybe[rex]
+    % rest=list[rex] arguments
+    ^ maybe[rex]
+    ? (eq rest.len 0) .none
+    ?> (./nest _ _ rune kids) rest.at(0) (_ rest.drop(1))
+    ? !(and (eq rune "=") (eq kids.len 2)) (_ rest.drop(1))
+    ? !(equal kids.at(0).print name) (_ rest.drop(1))
+    | ./some kids.at(1)
+  + chained_fields
+    ' Rex joins newline-separated equals inside brackets into one chain:
+    ' key0 = (value0 key1) = value1. Recover the pairs before dispatch.
+    \ children=row[rex] original=rex
+    ^ list[rex]
+    ? (lt children.len 2) (list/one original)
+    % key=rex children.at(0) rest=row[rex] children.drop(1) out=list[rex] .nil
+    ^ list[rex]
+    ? (eq rest.len 1) out.snoc((rex/rune "=" [key rest.at(0)]))
+    ?> (./nest _ color rune kids) rest.at(0) (list/one original)
+    ? !(eq color "clear") (list/one original)
+    ? !(eq rune "") (list/one original)
+    ? !(eq kids.len 2) (list/one original)
+    | _ kids.at(1) rest.drop(1) out.snoc((rex/rune "=" [key kids.at(0)]))
+  + fields
+    \ expression=rex
+    ^ list[rex]
+    ? expression
+     > (./expr _ color kids) (? (eq color "curly") kids.stream (list/one expression))
+     > (./nest _ color rune kids)
+      ? !(eq color "curly") (list/one expression)
+      ? (eq rune "=") (goo_runtime/chained_fields kids expression)
+      kids.stream
+    (list/one expression)
+  + mentions
+    \ name=str expression=rex
+    ^ bool
+    ? expression
+     > (./leaf _ _ text) (eq text name)
+    | row/any[rex] (goo_runtime/mentions name) expression.children
+  + enter
+    \ scope=goo_runtime/scope node=goo/node
+    ^ goo_runtime/scope
+    ? !(eq node.constructor "group") scope
+    = receiver (goo_runtime/named "on" node.arguments)
+      action (goo_runtime/named "action" node.arguments)
+      values (goo_runtime/named "myth" node.arguments)
+      make (goo_runtime/named "make" node.arguments)
+      role (goo_runtime/named "role" node.arguments)
+    | goo_runtime/scope
+      (? (maybe/is_some receiver) receiver scope.receiver)
+      (? (maybe/is_some action) action scope.action)
+      scope.values.weld(values.run(goo_runtime/fields).fall((list/nil[rex])))
+      (? (maybe/is_some make) make scope.make)
+      (? (maybe/is_some role) role scope.role)
+  + locate
+    \ nodes=list[goo/node] indices=row[nat] scope=goo_runtime/scope
+    ^ maybe[[goo/node goo_runtime/scope]]
+    ? (eq indices.len 0) .none
+    ? (ge indices.at(0) nodes.len) .none
+    = node nodes.at(indices.at(0))
+      next (goo_runtime/enter scope node)
+    ? (eq indices.len 1) (./some [node next])
+    | goo_runtime/locate node.children indices.drop(1) next
+  + record
+    \ care=care target=path state=namespace
+    ^ maybe[myth]
+    | (sovereign_care care target state).fil
+  + target
+    ' A sewn projection may point back through its declared tack and sys/from.
+    ' Validate the projection against the concrete record; never write into /o.
+    \ target=path state=namespace
+    ^ maybe[path]
+    ? (maybe/is_some (goo_runtime/record .x target state)) (./some target)
+    < card (goo_runtime/record .y target state)
+    < relative card.path_at(['sys 'from])
+    % length=nat target.len.dec
+    ^ maybe[path]
+    ? (lt length 3) .none
+    = ancestor (goo_runtime/record .x target.take(length) state).fall(myth/new)
+    ?> (./some held) ancestor.get(['sys 'tack]) (_ length.dec)
+    ?> source=safe held .none
+    = actual source.path.weld(relative)
+    < current (goo_runtime/record .x actual state)
+    ? !(equal card.del(['sys 'from]) current.del(['sys 'from])) .none
+    | ./some actual
+  + publication
+    \ state=namespace
+    ^ nat
+    | (state.case(.z [state.self 'gov])).fall(0)
+  + lifetime
+    ' x.shape changes on removal/recreation, never on an ordinary live edit.
+    \ target=path state=namespace
+    ^ nat
+    ?> (./some history) state.history(target) 0
+    | (history.ever_at(target)).x.lock.shape
+  + member
+    \ source=path target=path state=namespace
+    ^ json
+    = current (goo_runtime/record .x target state)
+    | json/obj
+      [(jkv "key" (json/str (path_show target)))
+       (jkv "subject" (json/str (path_show target)))
+       (jkv "source" (json/str (path_show source)))
+       (jkv "sourceLife" (json/str (nat/show (goo_runtime/lifetime source state))))
+       (jkv "life" (json/str (nat/show (goo_runtime/lifetime target state))))
+       (jkv "type" (json/str "namespace-record"))
+       (jkv "expected" (json/str (nat/show (state.case(.x target)).fall(0))))
+       (jkv "status" (json/str (? (maybe/is_some current) "available" "unavailable")))]
+  + source
+    ' Finite direct-child source. Read physical keys with a bounded range;
+    ' never flatten the subtree or scan to find a selected member.
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    = source query.target
+      history (state.history(source))
+      keys=row[iota]
+        ?> (./some history) history []
+        | history.idx.dip(source).kid.range_after(.none 65).map((\ entry entry.key))
+    | show (json/obj
+      [(jkv "id" (json/str (path_show source)))
+       (jkv "life" (json/str (nat/show (goo_runtime/lifetime source state))))
+       (jkv "type" (json/str "namespace-record"))
+       (jkv "bounded" (json/boo (le keys.len 64)))
+       (jkv "members" (json/arr (keys.take((? (lt keys.len 64) keys.len 64)).map((\ key (goo_runtime/member source source.snoc(key) state))))))])
+  + status
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    = target (goo_runtime/target query.target state)
+      expected=nat
+        ? target
+         > (./some target) (state.case(.x target)).fall(0)
+        0
+    | show (json/obj
+      [(jkv "life" (json/str (nat/show (goo_runtime/lifetime target.fall([]) state))))
+       (jkv "target" (json/str (path_show target.fall([]))))
+       (jkv "expected" (json/str (nat/show expected)))
+       (jkv "displayed" (json/str (nat/show (state.case(.y query.target)).fall(0))))
+       (jkv "publication" (json/str (nat/show (goo_runtime/publication state))))])
+  + json_field
+    \ key=str value=json
+    ^ json
+    ?> (json/obj entries) value jnull
+    | entries.fold jnull (\ out entry (? (eq entry.k key) entry.v out))
+  + json_text
+    \ value=json
+    ^ str
+    ?> (json/str text) value ""
+    text
+  + capture_value
+    \ input=row[[str str]] slot=path
+    ^ either[str json]
+    = matches (input.keep((\ [key value] (eq key (path_show slot)))))
+    ? !(eq matches.len 1) (./err "Missing or duplicate selection capture.")
+    = [key text] matches.at(0)
+    ?> (jres/ok value rest) (parse text) (./err "Invalid selection capture.")
+    | ./ok (goo_runtime/json_field "member" value)
+  + operand_path
+    \ expression=rex
+    ^ maybe[path]
+    ? (goo_runtime/read_path expression)
+     > (./some path) (./some path)
+    % rest=row[rex] expression.children
+    ^ maybe[path]
+    ? (eq rest.len 0) .none
+    ? (goo_runtime/operand_path rest.at(0))
+     > (./some path) (./some path)
+    | _ rest.drop(1)
+  + source_path
+    \ published=goo/published card=myth expression=rex
+    ^ maybe[path]
+    ? (goo_runtime/read_path expression)
+     > (./some path) (./some path)
+    ?> (./nest _ _ rune kids) expression .none
+    ? !(and (eq rune ".") (eq kids.len 2)) .none
+    ? !(eq kids.at(0).print published.view.binding) .none
+    = fields published.fields.keep((\ field (eq field.name kids.at(1).print)))
+    ? !(eq fields.len 1) .none
+    ?> (./some held) card.get(fields.at(0).slot) .none
+    ?> value=pails/p held .none
+    | ./some value.p
+  + source_arguments
+    \ published=goo/published card=myth node=goo/node
+    ^ either[str list[rex]]
+    ? !((eq node.constructor "selection") || (eq node.constructor "list") || (eq node.constructor "navigate")) (./ok node.arguments)
+    ?> (./some expression) (goo_runtime/named "source" node.arguments) (./err "Missing pane source.")
+    ?> (./some path) (goo_runtime/source_path published card expression) (./err "Pane source has no path value.")
+    = rewrite
+        \ argument=rex
+        ^ rex
+        ? (maybe/is_some (goo_runtime/named "source" (list/one argument)))
+          | rex/rune "=" [(rex/word "source") (rex/quip (str/cat_all ["'" (path_show path)]))]
+        argument
+    | ./ok node.arguments.map(rewrite)
+  + bind_sources
+    \ published=goo/published card=myth nodes=list[goo/node]
+    ^ either[str list[goo/node]]
+    ? nodes.is_nil (./ok .nil)
+    = node nodes.head
+    < children (goo_runtime/bind_sources published card node.children)
+    < arguments (goo_runtime/source_arguments published card node)
+    < tail (goo_runtime/bind_sources published card nodes.tail)
+    | ./ok tail.cons(node.set_arguments(arguments).set_children(children))
+  + selection_source
+    \ key=path nodes=list[goo/node] route=row[nat] found=maybe[path]
+    ^ maybe[path]
+    ? (eq route.len 0) found
+    ? (ge route.at(0) nodes.len) .none
+    = node nodes.at(route.at(0))
+      next=maybe[path]
+        ? !(eq node.constructor "selection") found
+        ? (eq node.arguments.len 0) found
+        ? !(equal (goo_runtime/read_path node.arguments.head) (maybe/some[path] key)) found
+        ?> (./some source) (goo_runtime/named "source" node.arguments) .none
+        | goo_runtime/read_path source
+    | goo_runtime/selection_source key node.children route.drop(1) next
+  + bound_captures
+    \ nodes=list[goo/node] route=row[nat] fields=list[rex] input=row[[str str]]
+    ^ either[str unit]
+    ? fields.is_nil (./ok [])
+    ?> (./nest _ _ rune kids) fields.head (goo_runtime/bound_captures nodes route fields.tail input)
+    ? !(and (eq rune "=") (eq kids.len 2)) (goo_runtime/bound_captures nodes route fields.tail input)
+    ? !(goo_runtime/mentions "capture" kids.at(1)) (goo_runtime/bound_captures nodes route fields.tail input)
+    ?> (./some key) (goo_runtime/operand_path kids.at(1)) (./err "Capture must name a lexical selection.")
+    ?> (./some source) (goo_runtime/selection_source key nodes route .none) (./err "Capture selection is not in scope.")
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (./err "Invalid capture slot.")
+    < member (goo_runtime/capture_value input slot)
+    ? !(eq (path_show source) (goo_runtime/json_text (goo_runtime/json_field "source" member)))
+      | ./err "Capture source does not match the published selection declaration."
+    | goo_runtime/bound_captures nodes route fields.tail input
+  + validate_captures
+    \ input=row[[str str]] fields=list[rex] state=namespace
+    ^ either[str unit]
+    ? fields.is_nil (./ok [])
+    = field fields.head
+    ?> (./nest _ _ rune kids) field (goo_runtime/validate_captures input fields.tail state)
+    ? !(and (eq rune "=") (eq kids.len 2)) (goo_runtime/validate_captures input fields.tail state)
+    ? !(goo_runtime/mentions "capture" kids.at(1)) (goo_runtime/validate_captures input fields.tail state)
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (./err "Invalid capture argument slot.")
+    < value (goo_runtime/capture_value input slot)
+    = text (\ key=str (goo_runtime/json_text (goo_runtime/json_field key value)))
+    ?> (./some source) (path_parse (text "source")) (./err "Invalid capture source.")
+    ?> (./some subject) (path_parse (text "subject")) (./err "Invalid capture subject.")
+    ? !(and (eq (text "type") "namespace-record") (eq (text "key") (path_show subject)))
+      | ./err "Incompatible capture membership."
+    ? !(and (eq subject.len source.len.inc) (pith_prefix source subject))
+      | ./err "Capture is not a member of its finite source."
+    ? !(and (state.permitted(subject)) (pith_prefix [state.self 'app] subject))
+      | ./err "Captured subject is outside application authority."
+    ? !(and (eq (text "life") (nat/show (goo_runtime/lifetime subject state)))
+         (eq (text "sourceLife") (nat/show (goo_runtime/lifetime source state))))
+      | ./err "Captured membership was removed or replaced."
+    ? !(eq (text "expected") (nat/show (state.case(.x subject)).fall(0)))
+      | ./err "Captured subject changed before admission."
+    ? (maybe/is_none (goo_runtime/record .x subject state)) (./err "Captured subject is unavailable.")
+    ? (maybe/is_none (goo_runtime/record .x source state)) (./err "Captured source is unavailable.")
+    | goo_runtime/validate_captures input fields.tail state
+  + argument
+    \ published=myth input=row[[str str]] now=nat slot=path value=rex
+    ^ either[str pail]
+    ? (goo_runtime/mentions "capture" value)
+      < member (goo_runtime/capture_value input slot)
+      ?> (./some subject) (path_parse (goo_runtime/json_text (goo_runtime/json_field "subject" member)))
+        | ./err "Invalid captured subject."
+      | ./ok (pails/p subject)
+    ? (goo_runtime/mentions "provider" value)
+      ? !(equal[path] slot ['sys 'now]) (./err "Unknown provider; only /sys/now is available.")
+      | ./ok (pails/dm (add (quip_val '@1970.1.1..0.0.0) (mul now 1024)))
+    ? (goo_runtime/mentions "input" value)
+      = matches (input.keep((\ [key value] (equal[str] key (path_show slot)))))
+      ? !(eq matches.len 1) (./err "Missing or duplicate input value.")
+      = [key text] matches.at(0)
+      | ./ok (pails/t text)
+    ? (equal[maybe[str]] value.leaf_kind (maybe/some[str] "cord"))
+      ?> (./leaf _ _ text) value (./err "Invalid text argument.")
+      | ./ok (pails/t text)
+    ?> (./some path) (goo_runtime/read_path value) (./err "Unsupported action argument.")
+    ?> (./some held) published.get(grove_view_publication/constants_slot)
+      | ./err "Missing compiled action constants."
+    ?> constants=grove_view_constants held (./err "Invalid compiled action constants.")
+    ?> (./some value) constants.values.get(path) (./err "Unknown compiled action constant.")
+    | ./ok value
+  + arguments
+    \ published=myth input=row[[str str]] now=nat fields=list[rex]
+    ^ either[str myth]
+    % rest=list[rex] fields out=myth myth/new
+    ^ either[str myth]
+    ? (eq rest.len 0) (./ok out)
+    ?> (./nest _ _ rune kids) rest.at(0) (./err "Invalid action binding.")
+    ? !(and (eq rune "=") (eq kids.len 2)) (./err "Invalid action binding.")
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (./err "Expected an argument slot path.")
+    < value (goo_runtime/argument published input now slot kids.at(1))
+    | _ rest.drop(1) out.put(slot value)
+  + published
+    \ record=myth
+    ^ either[str goo/published]
+    ?> (./some held) record.get(publisher_vocabulary/grove/view) (./err "Not a published view.")
+    ?> view=goo/published held (./err "Invalid published view.")
+    | ./ok view
+  + matching_view
+    \ published=goo/published current=myth
+    ^ either[str goo/view]
+    ? (maybe/is_some (fit_check current.put(['sys 'lash] published.contract))) (./err "Object no longer matches this view.")
+    ?> (./ok lowered) published.result (./err "View has compiler errors.")
+    | ./ok lowered
+  + bound_control
+    \ binding=str found=[goo/node goo_runtime/scope]
+    ^ either[str [goo/node goo_runtime/scope]]
+    = [node scope] found
+    ? !(eq node.constructor "action") (./err "Expected an action control.")
+    ? (maybe/is_some scope.make)
+      ? ((maybe/is_some scope.receiver) || (maybe/is_some scope.action)) (./err "make cannot be combined with on or action.")
+      ? (maybe/is_none scope.role) (./err "make requires a role.")
+      | ./ok found
+    ?> (./some receiver) scope.receiver (./err "Action group requires on = receiver.")
+    ? !(eq receiver.print binding) (./err "Only the current receiver is supported.")
+    | ./ok found
+  + control
+    \ query=goo_runtime/request published=goo/published current=myth
+    ^ either[str [goo/node goo_runtime/scope]]
+    < lowered (goo_runtime/matching_view published current)
+    = empty=goo_runtime/scope (goo_runtime/scope .none .none .nil .none .none)
+    ?> (./some found) (goo_runtime/locate lowered.children query.control empty)
+      | ./err "Unknown control."
+    | goo_runtime/bound_control published.view.binding found
+  + dispatch
+    \ action=rex arguments=myth current=myth contract=lash state=namespace
+    ^ either[str myth]
+    ? (goo_runtime/mentions "poke" action)
+      = next current.meld(arguments)
+      ? (maybe/is_some (fit_check next.put(['sys 'lash] contract))) (./err "Edited fields violate the view's role.")
+      | ./ok next
+    ?> (./some path) (goo_runtime/read_path action) (./err "Invalid action reference.")
+    ?> (./some declaration) (goo_runtime/record .x path state) (./err "Action no longer exists.")
+    ?> (./some held) declaration.get(['sys 'grove 'action_handler]) (./err "Action has no compiled handler.")
+    ?> handler=grove_action_handler held (./err "Invalid compiled action handler.")
+    = invoke handler.apply
+    ?> (./ok result) (Try (invoke arguments) current) (./err "Action failed during execution; the object was not changed.")
+    ?> (./some next) result (./err "Action rejected its arguments or receiver.")
+    | ./ok next
+  + prepared
+    \ query=goo_runtime/request published=myth current=myth state=namespace
+    ^ either[str myth]
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+      bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
+    < lowered (goo_runtime/matching_view view current)
+    < nodes (goo_runtime/bind_sources view current lowered.children)
+    < bound (goo_runtime/bound_captures nodes query.control scope.values.weld(bindings) query.inputs)
+    < validated (goo_runtime/validate_captures query.inputs scope.values.weld(bindings) state)
+    | goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings)
+  + updated
+    \ query=goo_runtime/request published=myth current=myth state=namespace
+    ^ either[str myth]
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+    ?> (./some action) scope.action (./err "Action group requires an action.")
+    < arguments (goo_runtime/prepared query published current state)
+    | goo_runtime/dispatch action arguments current view.contract state
+  + create
+    \ query=goo_runtime/request published=myth current=myth state=namespace scope=goo_runtime/scope
+    ^ either[str namespace]
+    < view (goo_runtime/published published)
+    ?> (./some expression) scope.make (./err "Missing creation destination.")
+    ?> (./some target) (goo_runtime/source_path view current expression) (./err "Creation destination must have a path value.")
+    ? !(and state.permitted(target) (pith_prefix [state.self 'app] target)) (./err "Creation destination is outside application authority.")
+    ? (sovereign_peek target state).wyt (./err "Creation destination is occupied.")
+    ?> (./some expression) scope.role (./err "Missing creation role.")
+    ?> (./some role_path) (goo_runtime/read_path expression) (./err "Creation role must be a declaration path.")
+    ?> (./some role) (goo_runtime/record .x role_path state) (./err "Creation role is unavailable.")
+    ?> (./some held) role.get(publisher_vocabulary/grove/role_contract) (./err "Creation role has no contract.")
+    ?> contract=lash held (./err "Invalid creation role contract.")
+    < arguments (goo_runtime/prepared query published current state)
+    = next arguments.put(['sys 'lash] contract)
+    ? (maybe/is_some (fit_check next)) (./err "Initial fields violate the creation role.")
+    ? (grove_install/change target (writ/make next) state)
+     > (./ok next) (./ok next)
+     > (./err why) (./err (str/from_atom (iota_show why)))
+  + apply
+    \ query=goo_runtime/request state=namespace
+    ^ either[str namespace]
+    ? !(eq query.publication (goo_runtime/publication state)) (./err "Views changed; refresh before submitting.")
+    ? !(eq query.displayed (state.case(.y query.target)).fall(0)) (./err "Object changed; refresh before submitting.")
+    ?> (./some target) (goo_runtime/target query.target state) (./err "This presentation has no writable source object.")
+    ? !(equal[path] target query.subject) (./err "The presentation now refers to a different object; refresh before submitting.")
+    ? !(state.permitted(target)) (./err "Object is outside this namespace's authority.")
+    ? !(pith_prefix [state.self 'app] target) (./err "Only application objects are writable here.")
+    ? !(eq query.expected (state.case(.x target)).fall(0)) (./err "Object changed; refresh before submitting.")
+    ?> (./some current) (goo_runtime/record .x target state) (./err "Object no longer exists.")
+    ?> (./some published) (goo_runtime/record .x query.view state) (./err "View no longer exists.")
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+    ? (maybe/is_some scope.make) (goo_runtime/create query published current state scope)
+    < next (goo_runtime/updated query published current state)
+    ? (grove_install/change target (writ/make next) state)
+     > (./ok next) (./ok next)
+     > (./err why) (./err (str/from_atom (iota_show why)))
+  + receipt
+    : identity=str request=goo_runtime/request body=str
+  + receipts
+    : entries=list[goo_runtime/receipt]
+  + receipt_slot
+    ^ path
+    ['sys 'goo 'receipts]
+  + act
+    \ query=goo_runtime/request state=namespace
+    ^ [namespace nat str]
+    = identities (query.inputs.keep((\ [key value] (eq key "$invocation"))))
+      identity=str
+        ? (eq identities.len 1)
+          = [key value] identities.at(0)
+          value
+        ""
+      home=path [state.self 'weft 'goo_receipts]
+      journal (goo_runtime/record .x home state).fall(myth/new)
+      entries=list[goo_runtime/receipt]
+        ?> (./some held) journal.get(goo_runtime/receipt_slot) .nil
+        ?> receipts=goo_runtime/receipts held .nil
+        receipts.entries
+      prior (entries.keep((\ entry (eq entry.identity identity))))
+      request query.set_now(0)
+    ? (and (gt identity.len 0) (gt prior.len 0))
+      ? (equal request prior.head.request) [state 200 prior.head.body]
+      [state 409 (show (json/obj [(jkv "error" (json/str "Invocation identity was reused with changed arguments."))]))]
+    ? (and (gt identity.len 0) (ge entries.len 1024))
+      [state 409 (show (json/obj [(jkv "error" (json/str "Development invocation journal is full; restart the namespace."))]))]
+    ? (goo_runtime/apply query state)
+     > (./ok next)
+      = body (goo_runtime/status query next)
+      ? (eq identity.len 0) [next 200 body]
+      = record (journal.put(goo_runtime/receipt_slot
+          (goo_runtime/receipts entries.snoc((goo_runtime/receipt identity request body)))))
+      ? (grove_install/change home (writ/make record) next)
+       > (./ok committed) [committed 200 body]
+       > (./err _) [state 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
+     > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
+  + run
+    \ query=goo_runtime/request state=namespace
+    ^ [namespace nat str]
+    ? (eq query.operation "status") [state 200 (goo_runtime/status query state)]
+    ? (eq query.operation "source") [state 200 (goo_runtime/source query state)]
+    ? !(eq query.operation "act") [state 400 "{}"]
+    | goo_runtime/act query state

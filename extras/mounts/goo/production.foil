@@ -1,0 +1,167 @@
+- goo_app/views
+- goo_app/html_api
+
+' Production keeps intermediate Goo values inside one leased runtime worker.
+' Only Rex printer batches and final application responses cross the host boundary.
++ goo_production
+  + compact
+    \ node=json
+    ^ json
+    = get (goo_display/get node)
+      tag (goo_display/text (get "tag"))
+      base=row[json] [(get "tag") (get "span")]
+      kids (json/arr (goo_display/array (get "kids")).map(goo_production/compact))
+      rest=row[json]
+        ? (eq tag "leaf") [(get "shape") (get "text")]
+        ? (eq tag "nest") [(get "color") (get "rune") kids]
+        ? (eq tag "expr") [(get "color") kids]
+        ? (eq tag "pref") [(get "rune") (goo_production/compact (get "kid"))]
+        ? (eq tag "bloc") [(get "color") (get "rune") (goo_production/compact (get "head")) kids]
+        ? ((eq tag "tyte") || (eq tag "open")) [(get "rune") kids]
+        [kids]
+    | json/arr base.weld(rest)
+  + start
+    \ trees=row[rex] options=str ids=str
+    ^ json
+    = mode=str
+        ? (parse options)
+         > (./ok value _) (goo_views/txt value "mode")
+        "lower"
+      value (goo_display/compile_value trees options ids)
+    | json/obj [(jkv "mode" (json/str mode)) (jkv "value" value)]
+  + start_measured
+    \ source=str
+    ^ json
+    | json/obj [(jkv "mode" (json/str "rendered")) (jkv "value" (goo_display/measured_value source))]
+  + printer_request
+    \ pending=json
+    ^ str
+    = value (goo_display/get pending "value")
+      snapshots (goo_display/array (goo_display/get value "snapshots"))
+      batches (row/fold[json row[json]] [] (\ out snap out.weld([(json/arr (goo_display/array (goo_display/get snap "trees")).map(goo_production/compact)) (json/arr (goo_display/array (goo_display/get snap "diffTrees")).map(goo_production/compact))])) snapshots)
+    | goo_app_json/encode (json/obj [(jkv "ok" (goo_display/get value "ok")) (jkv "batches" (json/arr batches))])
+  + replace
+    \ value=json name=str replacement=json
+    ^ json
+    > (json/obj fields) value value
+    | json/obj fields.map((\ field=jkv (? (eq field.k name) (jkv name replacement) field)))
+  + printed
+    \ snapshot=json output=str diff=str
+    ^ json
+    > (json/obj fields) snapshot snapshot
+    | json/obj fields.filter((\ field=jkv !((eq field.k "trees") || (eq field.k "diffTrees")))).weld([(jkv "output" (json/str output)) (jkv "diffOutput" (json/str diff))])
+  + finish
+    \ pending=json printed=str
+    ^ str
+    = value (goo_display/get pending "value")
+      snapshots (goo_display/array (goo_display/get value "snapshots"))
+    ? !(goo_views/yes value "ok") (goo_app_json/encode value)
+    > (./ok replies _) (parse printed) (goo_compile/protocol_error unit/unit)
+    > (json/arr texts) replies (goo_compile/protocol_error unit/unit)
+    ? !(eq texts.len (mul 2 snapshots.len)) (goo_compile/protocol_error unit/unit)
+    = replaced=row[json]
+        % i=nat 0 out=row[json] []
+        ? (eq i snapshots.len) out
+        | _ i.inc out.snoc((goo_production/printed snapshots.at(i) (goo_display/text texts.at((mul 2 i))) (goo_display/text texts.at((add 1 (mul 2 i))))))
+      value (goo_production/replace value "snapshots" (json/arr replaced))
+      mode (goo_views/txt pending "mode")
+      response=json
+        ? (eq mode "rendered") (json/obj [(jkv "passes" (json/str (goo_views/cards .true replaced)))])
+        ? (eq mode "passes") (goo_production/pass_text value)
+        | goo_views/lower value
+    | goo_app_json/encode response
+  + diagnostic_text
+    \ prefix=str diagnostic=json
+    ^ str
+    = location (goo_display/get diagnostic "location")
+      at=str
+        ? location
+         > (json/nul _) "-"
+        | str/cat_all [(show (goo_display/get location "line")) ":" (show (goo_display/get location "column"))]
+    | str/cat_all [prefix at ": " (goo_views/txt diagnostic "message")]
+  + pass_text
+    \ value=json
+    ^ json
+    = parts (goo_display/array (goo_display/get value "snapshots")).map((\ snapshot=json (str/cat_all ["──── " (goo_views/txt snapshot "name") " ── " (goo_views/txt snapshot "summary") (str/snoc_byte 10 "") (str/cat_all (goo_display/array (goo_display/get snapshot "diagnostics")).map((\ d=json (str/cat_all [(goo_production/diagnostic_text "  " d) (str/snoc_byte 10 "")])))) (goo_views/txt snapshot "output") (str/snoc_byte 10 "")])))
+    | json/obj [(jkv "ok" (json/boo .true)) (jkv "success" (goo_display/get value "success")) (jkv "crash" (goo_display/get value "crash")) (jkv "text" (json/str (str/cat_all parts)))]
+  + pass_diagnostics
+    \ value=goo_result/pass[goo_result/output]
+    ^ list[goo_result/diagnostic]
+    ? value
+     > (./succeeded _ ds) ds
+     > (./rejected _ ds) ds
+    .nil
+  + diagnostics
+    \ state=goo_result/control
+    ^ row[json]
+    | list/fold[goo_result/entry row[json]] [] (\ out entry out.weld((goo_production/pass_diagnostics entry.result).map((goo_inspect/diagnostic (goo_display/name entry.name))).row) ) state.checkpoint.passes
+  + ssr_value
+    \ trees=row[rex] options=str identities=str
+    ^ json
+    > (./ok options _) (parse options) (goo_compile/protocol_value unit/unit)
+    > (./some request) (goo_production/compile_options options) (goo_compile/protocol_value unit/unit)
+    > (./ok ids _) (parse identities) (goo_compile/protocol_value unit/unit)
+    > (./some ids) (goo_compile/ids ids) (goo_compile/protocol_value unit/unit)
+    = state (goo_compile/execute trees request ids)
+      ds (goo_production/diagnostics state).map((goo_production/diagnostic_text ""))
+      fields=row[jkv] [(jkv "diagnostics" (json/arr ds.map((\ text=str (json/str text)))))]
+      result=json
+        ? state
+         > (./ended result)
+          ? result.completion
+           > (./succeeded tree)
+            ? (goo_backend/options options)
+             > ./none (json/obj fields.weld([(jkv "success" (json/boo .false)) (jkv "error" (json/str (goo_production/dimension_error options)))]))
+             > (./some dims)
+              ? (goo_html/prepare tree dims.width dims.scale dims.rtl)
+               > (./err message) (json/obj fields.weld([(jkv "success" (json/boo .false)) (jkv "error" (json/str message))]))
+               > (./ok prepared) (json/obj fields.weld([(jkv "success" (json/boo .true)) (jkv "document" (json/str (goo_html/document request.context.view_path prepared)))]))
+           > (./crashed stage message) (json/obj fields.weld([(jkv "success" (json/boo .false)) (jkv "crash" (json/obj [(jkv "name" (json/str (goo_display/name stage))) (jkv "message" (json/str message))]))]))
+          | json/obj fields.weld([(jkv "success" (json/boo .false))])
+        | json/obj fields.weld([(jkv "success" (json/boo .false))])
+    | result
+  + layout
+    \ source=str
+    ^ str
+    > (./ok value _) (parse source) (goo_compile/protocol_error unit/unit)
+    > (./some rendered) (goo_html_api/evaluate value) (goo_compile/protocol_error unit/unit)
+    ? !(goo_views/yes rendered "ok") (goo_app_json/encode rendered)
+    = prepared (goo_display/get rendered "prepared")
+      lines (goo_display/array (goo_display/get prepared "lines"))
+      text_lines (json/obj (lines.filter(goo_production/has_lines).map((\ line=json (jkv (goo_views/txt line "id") (goo_display/get line "lines"))))))
+    | goo_app_json/encode (json/obj [(jkv "ok" (json/boo .true)) (jkv "measurement" (goo_display/get prepared "measurement")) (jkv "textLines" text_lines) (jkv "html" (goo_display/get rendered "html"))])
+  + has_lines
+    \ line=json
+    ^ bool
+    ? (goo_display/get line "lines")
+     > (json/nul _) .false
+    .true
+  + dimension_error
+    \ options=json
+    ^ str
+    = finite=str "Error in $: expected finite nonnegative number"
+    > (json/obj fields) options finite
+    > (./some _) (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "width")) finite
+    > (./some _) (goo_codec/optional[goo/scalar] goo_number/nonnegative (goo_codec/field fields "textScale")) finite
+    "Error in $: textScale must be >0 and <=10; width must be <=100000"
+  + preview
+    \ trees=row[rex] options=str identities=str
+    ^ str
+    = value (goo_display/compile_mode trees options identities .false)
+    ? !(goo_views/yes value "ok") (goo_app_json/encode value)
+    > (json/obj fields) (goo_views/lower_mode value .false) (goo_compile/protocol_error unit/unit)
+    | goo_app_json/encode (json/obj fields.filter((\ field=jkv !(eq field.k "passes"))))
+  + compile_options
+    \ options=json
+    ^ maybe[goo/compile_request]
+    > (json/obj fields) options .none
+    | goo_compile/request (json/obj fields.filter((\ field=jkv !((eq field.k "width") || (eq field.k "textScale")))))
+  + ssr_wire
+    \ trees=row[rex] options=str identities=str
+    ^ row[str]
+    = value (goo_production/ssr_value trees options identities)
+      document (goo_views/txt value "document")
+      metadata=json
+        > (json/obj fields) value value
+        | json/obj fields.filter((\ field=jkv !(eq field.k "document")))
+    | [(goo_app_json/encode metadata) document]

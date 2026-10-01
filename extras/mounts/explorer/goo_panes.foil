@@ -1,0 +1,192 @@
+- goo_bridge
+- weft
+- grove_dev
+- value_read
+- http_foot
+
+' Read-only retained session descriptions. Native subject content still uses
+' Goo's normal typed source -> layout -> HTML backend. No owners are created here.
++ goo_panes
+  + local
+    \ kind=str
+    ^ bool
+    = kinds=row[str] ["pane" "selection" "list" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"]
+    | kinds.has(kind)
+  + contains
+    \ node=goo/node
+    ^ bool
+    ? (goo_panes/local node.constructor) .true
+    | node.children.any goo_panes/contains
+  + text
+    \ expression=rex
+    ^ str
+    ? (goo_runtime/read_path expression)
+     > (./some path) (path_show path)
+    ? expression
+     > (./leaf _ _ text) text
+    expression.print
+  + property
+    \ name=str node=goo/node
+    ^ str
+    | (goo_runtime/named name node.arguments).run(goo_panes/text).fall("")
+  + path_in
+    \ expression=rex
+    ^ maybe[path]
+    ? (goo_runtime/read_path expression)
+     > (./some path) (./some path)
+    % rest=row[rex] expression.children
+    ^ maybe[path]
+    ? (eq rest.len 0) .none
+    ? (goo_panes/path_in rest.at(0))
+     > (./some path) (./some path)
+    | _ rest.drop(1)
+  + captures
+    \ scope=goo_runtime/scope node=goo/node
+    ^ row[json]
+    = values
+        | scope.values.weld(node.arguments.drop(1)).bind
+        \ field=rex
+        ^ list[json]
+        ?> (./nest _ _ rune kids) field .nil
+        ? !(and (eq rune "=") (eq kids.len 2)) .nil
+        ? !(goo_runtime/mentions "capture" kids.at(1)) .nil
+        ?> (./some slot) (goo_runtime/read_path kids.at(0)) .nil
+        ?> (./some selection) (goo_panes/path_in kids.at(1)) .nil
+        | list/one (json/obj [(jkv "slot" (json/str (path_show slot)))
+            (jkv "selection" (json/str (path_show selection)))])
+    values.row
+  + controls
+    \ published=goo/published card=myth node=goo/node route=row[nat]
+    ^ row[json]
+    = chunk published.view.set_children((list/one node))
+      own published.set_result((./ok chunk))
+      controls (goo_bridge/controls own card chunk.children [] 1)
+    | controls.map
+      \ value=json
+      ^ json
+      ?> (json/obj entries) value value
+      = original (row/fold[jkv str] "" (\ out entry (? (eq entry.k "control") (goo_panes/json_text entry.v) out)) entries)
+        indices ((str/split_byte 46 original).map((\ text (nat/parse text).fall(0))))
+        absolute route.weld(indices.drop(1))
+        captures=row[json]
+          ?> (./ok view) published.result []
+          ?> (./some found) (goo_runtime/locate view.children absolute (goo_runtime/scope .none .none .nil .none .none)) []
+          = [control scope] found
+          | goo_panes/captures scope control
+        invoke=bool
+          ?> (./ok view) published.result .false
+          ?> (./some found) (goo_runtime/locate view.children absolute (goo_runtime/scope .none .none .nil .none .none)) .false
+          = [control scope] found
+          | ((maybe/is_some scope.action) || (maybe/is_some scope.make))
+      = rewrite
+          \ entry=jkv
+          ^ jkv
+          ? (eq entry.k "control") (jkv "control" (json/str (str/join "." absolute.map(nat/show))))
+          ? (eq entry.k "invoke") (jkv "invoke" (json/boo invoke))
+          entry
+      | json/obj (entries.map(rewrite)).snoc((jkv "captures" (json/arr captures)))
+  + json_text
+    \ value=json
+    ^ str
+    ?> (json/str text) value ""
+    text
+  + node
+    \ published=goo/published card=myth route=row[nat] node=goo/node
+    ^ either[str json]
+    ? !(goo_panes/contains node)
+      < html (goo_bridge/render published card published.view.set_children((list/one node)))
+      | ./ok (json/obj [(jkv "kind" (json/str "native"))
+          (jkv "html" (json/str html))
+          (jkv "controls" (json/arr (goo_panes/controls published card node route)))])
+    < children (goo_panes/nodes published card route node.children)
+    = key=str (? node.arguments.len (goo_panes/text node.arguments.head) "")
+      slot (goo_panes/property "slot" node)
+      seed (goo_runtime/named "initial" node.arguments)
+      initial=maybe[path]
+        ?> (./some expression) seed .none
+        ? !(goo_runtime/mentions "member" expression) .none
+        | goo_panes/path_in expression
+      properties=row[jkv]
+        [(jkv "kind" (json/str node.constructor))
+         (jkv "key" (json/str key))
+         (jkv "source" (json/str (goo_panes/property "source" node)))
+         (jkv "selection" (json/str (goo_panes/property "selection" node)))
+         (jkv "label" (json/str (goo_panes/property "label" node)))
+         (jkv "mode" (json/str (goo_panes/property "mode" node)))
+         (jkv "browse" (json/str (goo_panes/property "browse" node)))
+         (jkv "operation" (json/str (goo_panes/property "operation" node)))
+         (jkv "slot" (json/str (? slot.len slot "/sys/slot/content")))
+         (jkv "initial" (initial.run((\ path (json/str (path_show path)))).fall(jnull)))
+         (jkv "children" (json/arr children))]
+    ? (and (maybe/is_some seed) (maybe/is_none initial))
+      | ./err "initial requires .member(path), naming a source membership rather than a subject or ordinal."
+    = value (json/obj properties)
+    ? ((eq node.constructor "navigate") || (eq node.constructor "operation") || (eq node.constructor "operation_status"))
+      | ./ok (json/obj properties.snoc((jkv "html" (json/str (str/from_atom
+          (weft/render (weft/el "div" [] (goo_panes/host_control value))))))))
+    | ./ok value
+  + nodes
+    \ published=goo/published card=myth route=row[nat] nodes=list[goo/node]
+    ^ either[str row[json]]
+    % rest=list[goo/node] nodes ordinal=nat 0 out=row[json] []
+    ^ either[str row[json]]
+    ? rest.is_nil (./ok out)
+    < node (goo_panes/node published card route.snoc(ordinal) rest.head)
+    | _ rest.tail ordinal.inc out.snoc(node)
+  + description
+    \ published=goo/published card=myth view=goo/view
+    ^ either[str str]
+    < bound (goo_runtime/bind_sources published card view.children)
+    < nodes (goo_panes/nodes published card [] bound)
+    | ./ok (show (json/arr nodes))
+
+  + navigation_url
+    \ target=str
+    ^ nat
+    | str/to_atom (str/cat_all ["?path=" (value_read/percent target)])
+  + host_control
+    \ node=json
+    ^ row[weft/node]
+    = kind (grove_dev/text (grove_dev/field "kind" node))
+      label (str/to_atom (grove_dev/text (grove_dev/field "label" node)))
+      source (grove_dev/text (grove_dev/field "source" node))
+      mode (grove_dev/text (grove_dev/field "mode" node))
+    ? (eq kind "navigate")
+      ? (eq mode "input")
+        [(weft/el "form" [(weft/att "method" "get")]
+          [(weft/el "input" [(weft/att "name" "path") (weft/att "aria-label" label)
+             (weft/att "value" (str/to_atom source))] [])
+           (weft/leaf "button" [(weft/att "type" "submit")] label)])]
+      = path (http_foot/target source)
+        target=str (? (eq mode "parent") (path_show path.take(path.len.dec)) source)
+      [(weft/leaf "a" [(weft/href (goo_panes/navigation_url target))] label)]
+    ? (eq kind "operation")
+      [(weft/leaf "button" [(weft/att "type" "button")] label)]
+    [(weft/el "details" [(weft/att "hidden" "hidden") (weft/att "role" "status")]
+      [(weft/leaf "summary" [] label) (weft/leaf "pre" [] "")])]
+  + markup
+    ' Emit the same wrappers that the browser adopts, before creating owners.
+    \ nodes=row[json] route=row[nat] members={\ json}row[weft/node]
+    ^ row[weft/node]
+    % idx=nat 0 out=row[weft/node] []
+    ^ row[weft/node]
+    ? (eq idx nodes.len) out
+    = node nodes.at(idx)
+      here route.snoc(idx)
+      kind (grove_dev/text (grove_dev/field "kind" node))
+      key (grove_dev/text (grove_dev/field "key" node))
+      attrs=row[weft/att]
+        [(weft/cls (str/to_atom (str/cat_all ["goo-" kind])))
+         (weft/att "data-goo-node" (str/to_atom (str/join "." here.map(nat/show))))]
+      attrs (? (eq kind "pane") attrs.snoc((weft/att "aria-label" (str/to_atom key))) attrs)
+      children=row[weft/node]
+        ? (eq kind "native") [(weft/raw (str/to_atom (grove_dev/text (grove_dev/field "html" node))))]
+        ? (eq kind "list") (members node)
+        ? ((eq kind "navigate") || (eq kind "operation") || (eq kind "operation_status")) (goo_panes/host_control node)
+        | goo_panes/markup (grove_dev/items (grove_dev/field "children" node)) here members
+    | _ idx.inc out.snoc((weft/el "div" attrs children))
+  + server_body
+    \ description=str members={\ json}row[weft/node]
+    ^ row[weft/node]
+    ?> (jres/ok value rest) (parse description) []
+    | goo_panes/markup (grove_dev/items value) [] members

@@ -1,0 +1,156 @@
+- grove
+
+' Goo surface nodes and lowered IR share the same tree shape. The frontend
+' removes show and fills present.children; all argument expressions stay Rex.
++ goo
+  + node
+    : span=rex/source_span constructor=str arguments=list[rex]
+      children=list[goo/node]
+  + body
+    : binding=str children=list[goo/node]
+  + view
+    : span=rex/source_span name=path role=path slot=path
+      binding=str children=list[goo/node]
+  + field
+    : name=str slot=path type=path optional=bool
+  + role
+    : name=path fields=list[goo/field]
+  + renderer
+    : type=path constructor=str
+  + html_types
+    ' The caller supplies the canonical namespace of the value codecs.
+    \ root=path
+    ^ list[goo/renderer]
+    ((((list/one (goo/renderer root.snoc('duration) "duration")).cons((goo/renderer root.snoc('time) "time"))).cons((goo/renderer root.snoc('path) "link"))).cons((goo/renderer root.snoc('text) "text")))
+  + fail
+    (@ a)
+    \ span=rex/source_span message=str
+    ^ either[grove/error a]
+    | ./err (grove/error/syntax span message)
+  + curly
+    \ tree=rex
+    ^ maybe[row[rex]]
+    ? tree
+     > (./expr span color kids)
+      ? (eq color "curly") (./some kids) .none
+    .none
+  + arguments
+    \ tree=rex
+    ^ either[grove/error list[rex]]
+    ? tree
+     > (./expr span color kids)
+      ? (eq color "paren") (./ok kids.stream.map(rex/normalize))
+      | goo/fail[list[rex]] span "Expected Goo call arguments."
+     > (./nest span color rune kids)
+      ? (eq color "paren")
+        ? (eq rune ",") (./ok kids.stream.map(rex/normalize))
+        | ./ok (list/one[rex] (rex/normalize (rex/nest span "clear" rune kids)))
+      | goo/fail[list[rex]] span "Expected Goo call arguments."
+    | goo/fail[list[rex]] tree.span "Expected Goo call arguments."
+  + head
+    \ tree=rex
+    ^ either[grove/error goo/node]
+    ? tree
+     > (./leaf span shape text)
+      < name (grove/word tree)
+      | ./ok (goo/node span name .nil .nil)
+     > (./juxt span kids)
+      ? (eq kids.len 2)
+        < name (grove/word kids.at(0))
+        < args (goo/arguments kids.at(1))
+        | ./ok (goo/node span name args .nil)
+      | goo/fail[goo/node] span "Expected a Goo call."
+    | goo/fail[goo/node] tree.span "Expected a Goo constructor or call."
+  + nodes
+    \ trees=row[rex]
+    ^ either[grove/error list[goo/node]]
+    | goo/nodes_list trees.stream
+  + nodes_list
+    \ trees=list[rex]
+    ^ either[grove/error list[goo/node]]
+    ? trees.is_nil (./ok .nil)
+    = first trees.head
+    ? (equal first.leaf_kind (maybe/some[str] "slug"))
+      | goo/nodes_list trees.tail
+    ' A spaced head and its child block may form an explicit clear expression.
+    ? first
+     > (./expr span color kids)
+      ? (eq color "clear") (goo/nodes_list kids.stream.weld(trees.tail))
+      | goo/nodes_head trees
+    | goo/nodes_head trees
+  + nodes_head
+    \ trees=list[rex]
+    ^ either[grove/error list[goo/node]]
+    < node (goo/head trees.head)
+    = rest trees.tail
+    ? rest.len
+      ? (goo/curly rest.head)
+       > (./some kids)
+        < children (goo/nodes kids)
+        < tail (goo/nodes_list rest.tail)
+        | ./ok tail.cons(node.set_children(children))
+      < tail (goo/nodes_list rest)
+      | ./ok tail.cons(node)
+    | ./ok (list/one node)
+  + rhs
+    \ tree=rex
+    ^ either[grove/error list[goo/node]]
+    ? tree
+     > (./expr span color kids)
+      ? ((eq color "clear") || (eq color "curly")) (goo/nodes kids)
+      | goo/nodes [tree]
+    | goo/nodes [tree]
+  + parse
+    \ code=row[rex]
+    ^ either[grove/error goo/body]
+    ' After ! goo, Rex may represent the binding as a leaf followed by
+    ' an Open => rather than a Nest =>. Both carry the same Goo expression.
+    ? (eq code.len 2) (goo/open_binding code.at(0) code.at(1))
+    ? !(eq code.len 1)
+      | goo/fail[goo/body] rex/zero_span "Expected one Goo binding: name => body."
+    = tree code.at(0)
+    ? tree
+     > (./nest span color rune kids)
+      ? (and (eq color "clear") (and (eq rune "=>") (eq kids.len 2)))
+        < binding (grove/word kids.at(0))
+        < nodes (goo/rhs kids.at(1))
+        | ./ok (goo/body binding nodes)
+      | goo/fail[goo/body] span "Expected a Goo binding: name => body."
+    | goo/fail[goo/body] tree.span "Expected a Goo binding: name => body."
+  + open_binding
+    \ binding=rex tree=rex
+    ^ either[grove/error goo/body]
+    > (./open span rune kids) tree
+      | goo/fail[goo/body] tree.span "Expected => after Goo binding."
+    ? !(eq rune "=>")
+      | goo/fail[goo/body] span "Expected => after Goo binding."
+    < binding (grove/word binding)
+    = body (? (eq kids.len 1) kids.at(0) (rex/expr span "clear" kids))
+    < nodes (goo/rhs body)
+    | ./ok (goo/body binding nodes)
+  + substitute
+    ' Substitute a binding only in expression positions, never member names,
+    ' namespace paths, enum names, or named-argument keys.
+    \ binding=str value=rex tree=rex
+    ^ rex
+    ? tree
+     > (./leaf span shape text)
+      ? (and (eq text binding)
+          (equal tree.leaf_kind (maybe/some[str] "word"))) value
+      tree
+     > (./nest span color rune kids)
+      ? ((eq rune "/") || (eq rune "%/")) tree
+      ? (eq rune ".")
+        ? !(eq kids.len 2) tree
+        | rex/nest span color rune
+          [(goo/substitute binding value kids.at(0)) kids.at(1)]
+      ? (and (eq rune "=") (eq kids.len 2))
+        | rex/nest span color rune
+          [kids.at(0) (goo/substitute binding value kids.at(1))]
+      | tree.map_children((goo/substitute binding value))
+    | tree.map_children((goo/substitute binding value))
+  + bind_node
+    \ binding=str value=rex node=goo/node
+    ^ goo/node
+    = node node.set_arguments(node.arguments.map((goo/substitute binding value)))
+    | node.set_children(node.children.map((goo/bind_node binding value)))

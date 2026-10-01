@@ -1,0 +1,339 @@
+- goo_app/codecs
+- goo_app/results
+- rex
+
++ goo_read
+  + bad
+    (@@ v)
+    \ tree=rex message=str
+    ^ either[goo_result/diagnostic v]
+    = span tree.span
+      loc=maybe[goo/loc]
+        ? (eq span.line 0) .none
+        | ./some (goo/loc span.line (? (eq span.column 0) 1 span.column))
+    | ./err (goo_result/diagnostic (goo_result/severity/error) loc message)
+  + need
+    (@@ v)
+    \ tree=rex message=str value=maybe[v]
+    ^ either[goo_result/diagnostic v]
+    ? value
+     > (./some item) (./ok item)
+     > ./none (goo_read/bad[v] tree message)
+  + word
+    \ tree=rex
+    ^ maybe[str]
+    ? tree.leaf_kind
+     > (./some kind)
+      ? (eq kind "word") (./some (goo_read/leaf_text tree))
+      .none
+    .none
+  + spelling
+    \ tree=rex
+    ^ maybe[str]
+    ? tree
+     > (./pref _ rune kid)
+      < text (goo_read/spelling kid)
+      | ./some (str/cat_all [rune text])
+     > (./tyte _ rune kids)
+      % rest=list[rex] kids.stream parts=list[str] .nil
+      ^ maybe[str]
+      ? rest.is_nil (./some (str/join rune parts.reverse.row))
+      < text (goo_read/spelling rest.head)
+      | _ rest.tail parts.cons(text)
+    | goo_read/word tree
+  + text
+    \ tree=rex
+    ^ either[goo_result/diagnostic str]
+    = escaped=maybe[rex]
+        ? tree
+         > (./juxt _ kids)
+          ? !(eq kids.len 2) .none
+          ? !(equal[maybe[str]] (goo_read/word kids.at(0)) (./some "escaped")) .none
+          ? kids.at(1)
+           > (./expr _ color args)
+            ? !(eq color "paren") .none
+            ? (eq args.len 1) (./some args.at(0))
+            .none
+          .none
+        .none
+    ? escaped
+     > (./some literal)
+      < encoded (goo_read/text literal)
+      = value (parse (str/cat_all [(str/from_atom 34) encoded (str/from_atom 34)]))
+      ? value
+       > (./ok decoded _)
+        ? decoded
+         > (json/str text) (./ok text)
+        | goo_read/bad[str] tree "escaped expects JSON string escapes (\n, \t, \r, \\)"
+      | goo_read/bad[str] tree "escaped expects JSON string escapes (\n, \t, \r, \\)"
+     > ./none
+      ? tree.leaf_kind
+       > (./some kind)
+        ? ((eq kind "cord") || (eq kind "tape") || (eq kind "page") || (eq kind "span") || (eq kind "slug"))
+          | goo_read/need[str] tree "expected a Rex string" (./some (goo_read/leaf_text tree))
+        | goo_read/bad[str] tree "expected a Rex string"
+      | goo_read/bad[str] tree "expected a Rex string"
+  + scalar
+    \ tree=rex
+    ^ either[goo_result/diagnostic json]
+    ? (goo_read/word tree)
+     > (./some word)
+      ? (eq word "true") (./ok (json/boo .true))
+      ? (eq word "false") (./ok (json/boo .false))
+      < number (goo_read/need[goo/scalar] tree "expected a string, finite number, or boolean" (goo_read/number word))
+      | ./ok (goo_number/encode number)
+     > ./none
+      = number=maybe[goo/scalar]
+          < spelling (goo_read/spelling tree)
+          | goo_read/number spelling
+      ? number
+       > (./some value) (./ok (goo_number/encode value))
+       > ./none
+        < text (goo_read/text tree)
+        | ./ok (json/str text)
+  + slot
+    \ tree=rex
+    ^ either[goo_result/diagnostic str]
+    ? (goo_read/spelling tree)
+     > (./some text)
+      ? (eq text.at(0) 37)
+        ? (gt text.len 1) (./ok text.slice(1 (sub text.len 1)))
+        | goo_read/text tree
+      ? (eq text.at(0) 47)
+        < path (goo_read/need[goo/path] tree "View path must be absolute, with nonempty segments and no . or .. segments." (goo/path/parse_absolute text))
+        | ./ok (goo_read/alias path.display)
+      | goo_read/text tree
+     > ./none (goo_read/text tree)
+  + alias
+    \ text=str
+    ^ str
+    = pairs=row[[str str]] [["/sys/slots/icon" "icon"] ["/sys/slots/lede" "title"] ["/sys/slots/caption" "caption"] ["/sys/slots/code" "code"] ["/sys/slots/label" "label"] ["/sys/slots/summary" "summary"] ["/sys/containers/row" "row"] ["/sys/containers/col" "col"] ["/sys/containers/card" "card"]]
+    % i=nat 0
+    ? (eq i pairs.len) text
+    = [key value] pairs.at(i)
+    ? (eq key text) value
+    | _ i.inc
+  + record
+    \ tree=rex
+    ^ bool
+    ? tree
+     > (./expr _ color _) (eq color "curly")
+     > (./nest _ color _ _) (eq color "curly")
+    .false
+  + field
+    \ key=rex value=rex
+    ^ either[goo_result/diagnostic jkv]
+    = name=maybe[str]
+        ? key
+         > (./expr _ color kids)
+          ? !(eq color "brack") .none
+          ? (eq kids.len 1) (goo_read/word kids.at(0))
+          .none
+        .none
+    < name (goo_read/need[str] key "expected [field-name]" name)
+    < scalar (goo_read/scalar value)
+    | ./ok (jkv name scalar)
+  + pair
+    \ tree=rex
+    ^ either[goo_result/diagnostic jkv]
+    ? tree
+     > (./nest _ _ rune kids)
+      ? (eq rune ":")
+        ? (eq kids.len 2) (goo_read/field kids.at(0) kids.at(1))
+        | goo_read/bad[jkv] tree "expected [field]: value"
+      | goo_read/bad[jkv] tree "expected [field]: value"
+    | goo_read/bad[jkv] tree "expected [field]: value"
+  + config
+    \ tree=rex
+    ^ either[goo_result/diagnostic row[jkv]]
+    = fields=either[goo_result/diagnostic row[jkv]]
+        ? tree
+         > (./expr _ color kids)
+          ? (eq color "curly")
+            ? (eq kids.len 0) (./ok [])
+            | goo_read/bad[row[jkv]] tree "expected {[field]: value}"
+          | goo_read/bad[row[jkv]] tree "expected {[field]: value}"
+         > (./nest _ color rune kids)
+          ? !(eq color "curly") (goo_read/bad[row[jkv]] tree "expected {[field]: value}")
+          ? (eq rune ":")
+            < pair (goo_read/pair tree)
+            | ./ok [pair]
+          ? !(eq rune ",") (goo_read/bad[row[jkv]] tree "expected {[field]: value}")
+          % i=nat 0 out=row[jkv] []
+          ^ either[goo_result/diagnostic row[jkv]]
+          ? (eq i kids.len) (./ok out)
+          < pair (goo_read/pair kids.at(i))
+          | _ i.inc out.snoc(pair)
+        | goo_read/bad[row[jkv]] tree "expected {[field]: value}"
+    < fields fields
+    ? !(goo_codec/unique fields.map((\ pair=jkv pair.k)).stream) (goo_read/bad[row[jkv]] tree "duplicate config field")
+    | ./ok fields
+  + invalid_field
+    \ f=jkv
+    ^ bool
+    = allowed ((eq f.k "slot") || (eq f.k "optional") || (eq f.k "grow") || (eq f.k "maxIdeal") || (eq f.k "primary") || (eq f.k "toggle") || (eq f.k "label") || (eq f.k "optionLabel") || (eq f.k "value") || (eq f.k "max"))
+    ? !allowed .true
+    ? f.v
+     > (json/nul _) .true
+    .false
+  + annotation
+    \ tree=rex slot=str fields=row[jkv]
+    ^ either[goo_result/diagnostic goo/source_attrs]
+    = valid (row/any[jkv] goo_read/invalid_field fields)
+      parsed=maybe[goo/common]
+        < config (goo_codec/config fields)
+        < rank (goo_codec/optional[goo/rank] goo_codec/rank (goo_codec/field fields "optional"))
+        < named (goo_codec/optional[str] goo_codec/text (goo_codec/field fields "slot"))
+        = name=str
+            ? named
+             > (./some n) n
+             > ./none slot
+          rank=goo/rank
+            ? rank
+             > (./some r) r
+             > ./none (goo/rank/required)
+          span tree.span
+          loc=maybe[goo/loc]
+            ? (eq span.line 0) .none
+            | ./some (goo/loc span.line (? (eq span.column 0) 1 span.column))
+        | ./some (goo/common (goo/slot name) rank config loc)
+    ? valid (goo_read/bad[goo/source_attrs] tree "invalid node config (slot, optional, grow, maxIdeal, primary, label, value, max)")
+    < common (goo_read/need[goo/common] tree "invalid node config (slot, optional, grow, maxIdeal, primary, label, value, max)" parsed)
+    | ./ok (goo/source_attrs common)
+  + call
+    : name=str args=list[rex]
+  + constructor
+    \ tree=rex
+    ^ maybe[goo_read/call]
+    ? (goo_read/word tree)
+     > (./some name) (./some (goo_read/call name .nil))
+    ? tree
+     > (./juxt _ kids)
+      ? !(eq kids.len 2) .none
+      < name (goo_read/word kids.at(0))
+      ? kids.at(1)
+       > (./expr _ color args)
+        ? (eq color "paren") (./some (goo_read/call name args.stream))
+        .none
+       > (./nest _ color rune args)
+        ? !(eq color "paren") .none
+        ? (eq rune ",") (./some (goo_read/call name args.stream))
+        .none
+      .none
+    .none
+  + forms
+    \ trees=list[rex]
+    ^ either[goo_result/diagnostic list[goo/source]]
+    % rest=list[rex] trees out=list[goo/source] .nil
+    ^ either[goo_result/diagnostic list[goo/source]]
+    ? rest.is_nil (./ok out.reverse)
+    = tree rest.head
+    < call (goo_read/need[goo_read/call] tree "expected a UI constructor" (goo_read/constructor tree))
+    ? (eq call.name "opt")
+      = rank=either[goo_result/diagnostic goo/rank]
+          ? (eq call.args.len 0) (./ok (goo/rank/compact))
+          ? !(eq call.args.len 1) (goo_read/bad[goo/rank] tree "expected opt(1) or opt(2)")
+          < value (goo_read/scalar call.args.at(0))
+          < rank (goo_read/need[goo/rank] call.args.at(0) "opt rank must be 1 or 2" (goo_codec/rank value))
+          ? (eq rank.to_nat 0) (goo_read/bad[goo/rank] call.args.at(0) "opt rank must be 1 or 2")
+          | ./ok rank
+      < rank rank
+      < kids (goo_read/body tree rest 1)
+      < attrs (goo_read/annotation tree "opt" [])
+      | _ rest.drop(2) out.cons((goo/source/opt attrs rank kids))
+    = record (gt call.args.len 0)
+      record (? record (goo_read/record call.args.at(0)) .false)
+      config=either[goo_result/diagnostic row[jkv]]
+        ? record (goo_read/config call.args.at(0))
+        | ./ok []
+      args (? record call.args.drop(1) call.args)
+      group ((eq call.name "row") || (eq call.name "flow") || (eq call.name "group") || (eq call.name "col") || (eq call.name "stack"))
+    < config config
+    ? group
+      = slot=either[goo_result/diagnostic str]
+          ? (eq args.len 0) (./ok call.name)
+          ? (eq args.len 1) (goo_read/slot args.at(0))
+          | goo_read/bad[str] tree "group expects a slot or config record"
+      < slot slot
+      < attrs (goo_read/annotation tree slot config)
+      < kids (goo_read/body tree rest 1)
+      = node=goo/source
+          ? (eq call.name "group") (goo/source/group attrs kids)
+          | goo/source/flow attrs (? ((eq call.name "col") || (eq call.name "stack")) (goo/direction/col) (goo/direction/row)) kids
+      | _ rest.drop(2) out.cons(node)
+    ? !((eq call.name "text") || (eq call.name "image") || (eq call.name "button") || (eq call.name "input") || (eq call.name "code") || (eq call.name "avatar") || (eq call.name "presence") || (eq call.name "media") || (eq call.name "bar")) (goo_read/bad[list[goo/source]] tree "unknown UI constructor")
+    ? (gt args.len 2) (goo_read/bad[list[goo/source]] tree "atom expects optional config, text, and slot")
+    < text (? (eq args.len 0) (either/ok[goo_result/diagnostic str] "") (goo_read/text args.at(0)))
+    < slot (? (eq args.len 2) (goo_read/slot args.at(1)) (either/ok[goo_result/diagnostic str] call.name))
+    < attrs (goo_read/annotation tree slot config)
+    = progress (? (eq call.name "bar") (goo_codec/progress attrs.common.config) .true)
+    ? !progress (goo_read/bad[list[goo/source]] tree "progress requires max > 0 and 0 <= value <= max")
+    = node=goo/source
+        ? (eq call.name "text") (goo/source/text attrs text)
+        ? (eq call.name "image") (goo/source/image attrs text)
+        ? (goo/primitive_kind/parse call.name)
+         > (./some kind) (goo/source/jet attrs (goo/primitive/make kind text))
+        | goo/source/text attrs text
+    | _ rest.tail out.cons(node)
+  + body
+    \ head=rex trees=list[rex] index=nat
+    ^ either[goo_result/diagnostic list[goo/source]]
+    ? (lt index trees.len)
+      ? trees.at(index)
+       > (./expr _ color kids)
+        ? (eq color "curly") (goo_read/forms kids.stream)
+        | goo_read/bad[list[goo/source]] head "expected a curly-braced body"
+      | goo_read/bad[list[goo/source]] head "expected a curly-braced body"
+    | goo_read/bad[list[goo/source]] head "expected a curly-braced body"
+  + source
+    \ trees=row[rex]
+    ^ either[goo_result/diagnostic goo/source]
+    = items (trees.stream.bind(goo_read/items))
+    < roots (goo_read/forms items)
+    ? (eq roots.len 1) (./ok roots.at(0))
+    | ./err (goo_result/diagnostic (goo_result/severity/error) (./some (goo/loc 1 1)) "expected exactly one UI root")
+  + items
+    \ tree=rex
+    ^ list[rex]
+    ? tree
+     > (./expr _ color kids)
+      ? ((eq color "clear") || (eq color "paren")) kids.stream
+      (list/one tree)
+    (list/one tree)
+  + leaf_text
+    \ tree=rex
+    ^ str
+    ? tree
+     > (./leaf _ _ text) text
+    ""
+  + number
+    ' Match readMaybe Double at the source boundary, including leading zeros/bases.
+    \ text=str
+    ^ maybe[goo/scalar]
+    = negative (eq text.at(0) 45)
+      start (? negative 1 0)
+      marker text.at(start.inc)
+      base=nat
+        ? !(eq text.at(start) 48) 10
+        ? ((eq marker 120) || (eq marker 88)) 16
+        ? ((eq marker 111) || (eq marker 79)) 8
+        10
+    ? !(eq base 10)
+      = first (add start 2)
+      % i=nat first value=nat 0
+      ^ maybe[goo/scalar]
+      ? (eq i text.len)
+        ? (eq i first) .none
+        | goo_number/finite negative value 1
+      = c text.at(i)
+        digit=nat
+          ? !((lt c 48) || (gt c 57)) (sub c 48)
+          ? !((lt c 65) || (gt c 70)) (add (sub c 65) 10)
+          ? !((lt c 97) || (gt c 102)) (add (sub c 97) 10)
+          16
+      ? (ge digit base) .none
+      | _ i.inc (add (mul value base) digit)
+    = whole (goo_number/digits text start)
+    ? (eq whole.end start) .none
+    < rational (goo_number/fraction text negative whole)
+    | goo_number/finite rational.negative rational.numerator rational.denominator
