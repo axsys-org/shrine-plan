@@ -225,17 +225,11 @@
     \ ignored=unit
     ^ row[testing/check]
     = source (goo_checks/extra
-        ["panes =" "  @pane" "  #on ; %/card" "  #for ; /sys/slot/workspace"
-         "  card => pane('/workspace) {"
-         "    selection('/current, source = '/0x11/app/cards) {"
-         "      split {"
-         "        pane('/queue) { list('/rows, source = '/0x11/app/cards, selection = '/current, slot = '/sys/slot/summary) }"
-         "        deck('/details) {"
-         "          pane('/detail) { follow('/subject, selection = '/current, slot = '/sys/slot/content) }"
-         "          pane('/other) { present(card, '/sys/slot/label) }"
-         "        }"
-         "      }"
-         "    }"
+        ["detail =" "  @pane" "  #on ; %/card" "  #for ; /detail" "  #port ; /chosen"
+         "  c => { follow('/subject, selection = '/chosen) present(c, '/sys/slot/label) }" ""
+         "panes =" "  @pane" "  #on ; %/card" "  #for ; /sys/slot/workspace"
+         "  card => selection('/current, source = '/0x11/app/cards) {"
+         "    pane(%/detail, ports = { '/chosen = '/current })"
          "  }"])
       result (goo_checks/compile source "panes" goo_checks/renderers)
       bad (goo_checks/reject
@@ -244,14 +238,14 @@
     [(testing/text "S01 local descriptions compile with ordinary present" "unexpected success" (goo_checks/error result))
      (testing/text "S01 pane remains in IR" "pane" (either/ok_val result).children.head.constructor)
      (testing/text "S01 selection remains in IR" "selection" (either/ok_val result).children.head.children.head.constructor)
-     (testing/text "S13 unkeyed pane is a compiler diagnostic" "Local declarations require a stable literal key." bad)]
+     (testing/text "S13 unkeyed pane is a compiler diagnostic" "Use pane(declaration); inline pane bodies are not supported." bad)]
 
   + declaration_boundary
     \ ignored=unit
     ^ row[testing/check]
     = pane_source (goo_checks/extra
         ["workspace =" "  @pane" "  #on ; %/card" "  #for ; /sys/slot/label"
-         "  c => pane('/root) { present(c, '/sys/slot/label) }"])
+         "  c => { present(c, '/sys/slot/label) }"])
       pane (goo_checks/compile pane_source "workspace" goo_checks/renderers)
     [(testing/text "capture is allowed as a receiver name and literal text" "unexpected success"
        (goo_checks/reject ["bad =" "  @view" "  #on ; %/card" "  #for ; /bad"
@@ -286,9 +280,64 @@
        (goo_checks/reject ["bad =" "  @pane" "  @view" "  #on ; %/card" "  #for ; /bad"
          "  c => {} "]))]
 
+  + composed
+    \ body=str
+    ^ either[grove/error goo/view]
+    | goo_checks/compile
+      (goo_checks/extra ["child =" "  @pane" "  #on ; %/card" "  #for ; /child"
+       "  #port ; /chosen" "  child => follow('/value, selection = '/chosen)" ""
+       "bad =" "  @pane" "  #on ; %/card" "  #for ; /bad" body]) "bad" goo_checks/renderers
+  + pane_composition
+    \ ignored=unit
+    ^ row[testing/check]
+    = good (goo_checks/composed "  card => selection('/current, source = '/objects) { pane(%/child, ports = { '/chosen = '/current }) }")
+      capture (goo_checks/compile
+        (goo_checks/extra ["bad =" "  @pane" "  #on ; %/card" "  #for ; /bad"
+         "  c => selection('/current, source = '/objects) {"
+         "    group(on = c, action = .poke, myth = { '/sys/about = .capture('/current) }) { action(""Remember"") }"
+         "  }"]) "bad" goo_checks/renderers)
+      capture_group (either/ok_val capture).children.head.children.head.children.head
+      root (either/ok_val good).children.head
+      selection root.children.head
+      child selection.children.head
+      follower child.children.head
+      repeated (goo_checks/composed "  card => selection('/current, source = '/objects) { pane(%/child, ports = { '/chosen = '/current }) pane(%/child, ports = { '/chosen = '/current }) }")
+      keyed (goo_checks/composed "  card => selection('/current, source = '/objects) { pane(%/child, key = '/left, ports = { '/chosen = '/current }) pane(%/child, key = '/right, ports = { '/chosen = '/current }) }")
+      unbound (goo_checks/composed "  card => pane(%/child, ports = { '/chosen = '/missing })")
+      missing (goo_checks/composed "  card => selection('/current, source = '/objects) { pane(%/child) }")
+    [(testing/nat "declared child with explicit port compiles" 1 (either/is_ok good))
+     (testing/nat "capture operands resolve to owning selection" 1
+       (maybe/is_some (str/find "/demo/bad/selection/current" (grove_views/local_named "myth" capture_group).fall((rex/word "missing")).print)))
+     (testing/nat "entry pane identity is declaration path" 1
+       (equal (grove_views/local_path root.arguments.head) (either/ok[grove/error path] ['demo 'bad])))
+     (testing/nat "child pane identity is declaration path" 1
+       (equal (grove_views/local_path child.arguments.head) (either/ok[grove/error path] ['demo 'child])))
+     (testing/nat "port aliases resolve to owning selection" 1
+       (equal (grove_views/local_named "selection" follower) (maybe/some[rex] selection.arguments.head)))
+     (testing/nat "explicit keys support repeated declarations" 1 (either/is_ok keyed))
+     (testing/text "unknown pane argument rejected" "Unknown pane argument."
+       (goo_checks/error (goo_checks/composed "  card => pane(%/child, typo = '/value)")))
+     (testing/text "duplicate pane argument rejected" "Duplicate pane argument."
+       (goo_checks/error (goo_checks/composed "  card => pane(%/child, key = '/a, key = '/b)")))
+     (testing/text "duplicate pane instances rejected" "Repeated pane declaration requires distinct instance keys." (goo_checks/error repeated))
+     (testing/text "missing port rejected" "Pane requires all declared selection ports." (goo_checks/error missing))
+     (testing/text "out of scope port rejected" "Unbound selection; declare #port and connect it explicitly." (goo_checks/error unbound))
+     (testing/text "child cannot inherit selection implicitly" "Unbound selection; declare #port and connect it explicitly."
+       (goo_checks/reject ["child =" "  @pane" "  #on ; %/card" "  #for ; /child"
+         "  c => follow('/value, selection = '/current)" ""
+         "bad =" "  @pane" "  #on ; %/card" "  #for ; /bad"
+         "  c => selection('/current, source = '/objects) { pane(%/child) }"]))
+     (testing/text "pane composition cycles rejected" "Cyclic pane composition."
+       (goo_checks/reject ["bad =" "  @pane" "  #on ; %/card" "  #for ; /bad" "  c => pane(%/bad)"]))
+     (testing/text "views cannot declare selection ports" "Selection ports require @pane."
+       (goo_checks/reject ["bad =" "  @view" "  #on ; %/card" "  #for ; /bad" "  #port ; /chosen" "  c => {} "]))
+     (testing/text "pane cannot mount an ordinary view" "pane requires an @pane declaration."
+       (goo_checks/reject ["bad =" "  @pane" "  #on ; %/card" "  #for ; /bad" "  c => pane(%/label)"]))]
+
 + tests
   ^ row[testing/case]
-  [(testing/case "Declaration boundary" goo_checks/declaration_boundary)
+  [(testing/case "Pane composition" goo_checks/pane_composition)
+   (testing/case "Declaration boundary" goo_checks/declaration_boundary)
    (testing/case "Retained local descriptions" goo_checks/local_descriptions)
    (testing/case "lowering" goo_checks/lowering)
    (testing/case "diagnostics" goo_checks/diagnostics)

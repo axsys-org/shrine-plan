@@ -1,7 +1,7 @@
 # Goo inspector
 
-A small server-rendered Goo workspace: a bounded namespace child list and a
-synthetic Values pane following the selected child. The layout is authored in
+A small server-rendered Goo workspace: a bounded namespace list tree and a
+synthetic Values pane following the selected record. The layout is authored in
 `inspector.grove`. Views provide content; the workspace owns selection and panes.
 
 ```sh
@@ -11,10 +11,18 @@ WISP=/path/to/wisp python3 x/eden --compiler none --mount goo-inspector --mount 
 Open `http://127.0.0.1:8178/goo-inspector?path=/0x11/app/srs/cards`.
 The address form and Parent/Browse children links perform ordinary navigation.
 Select a row to inspect its synthetic values. Local selection never invokes a
-domain action. Existing records with at most 64 direct physical children are
-supported. Structural roots, larger collections, pagination, matching-view
-catalogs, and evidence panels are outside this version. To inspect a leaf,
-browse its parent and select it.
+domain action. The tree includes the selected root and descendants on `z`, up to
+64 nodes. Structural paths can be expanded; records can be selected. A leaf can
+be inspected directly. Larger trees report a source bound error; navigate to a
+smaller subtree. Change `axis = "z"` to `"y"` in the workspace's `selection` to
+show only the nearest-record frontier.
+
+
+The workspace, Namespace, and Values panes are separate `@pane` declarations.
+The workspace owns `/object` and connects it to each child's required `#port`
+with `pane(%/Namespace, ports = { '/object = '/object })` (and likewise for
+Values). The declaration path supplies each pane's identity; layout wrappers do
+not. Selection sharing is explicit at these call sites.
 
 The server renders pane wrappers, native content and the child summaries in the
 initial HTTP response. The shared browser adapter adopts that DOM, validates the

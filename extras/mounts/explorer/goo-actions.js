@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const metrics = {activations: 0, dispatches: 0};
-  const same = (a, b) => ['target', 'expected', 'displayed', 'publication', 'life'].every(k => a[k] === b[k]);
+  const same = (a, b) => ['target', 'expected', 'displayed', 'publication', 'life', 'subject'].every(k => a[k] === b[k]);
   async function status(target) {
     const response = await fetch(`/goo/status?${new URLSearchParams({target})}`, {cache: 'no-store'});
     if (!response.ok) throw new Error(await response.text());

@@ -52,7 +52,7 @@
       | goo/fail[goo/view] span "View requires one #for slot."
     > (./some code) code
       | goo/fail[goo/view] span "View requires a Goo body."
-    | ./ok (goo/view span root.snoc(($ts name)) role slot code.binding code.children .false)
+    | ./ok (goo/view span root.snoc(($ts name)) role slot code.binding code.children .false .nil)
   + is_presentation
     \ stmt=grove/statement
     ^ bool
@@ -66,35 +66,41 @@
     ? (and (grove_views/is_view body) (grove_views/is_pane body))
       | goo/fail[goo/view] span "A declaration cannot be both @view and @pane."
     % rest=list[grove/statement] body role=maybe[path] .none
-      slot=maybe[path] .none code=maybe[goo/body] .none
+      slot=maybe[path] .none code=maybe[goo/body] .none ports=list[path] .nil
     ^ either[grove/error goo/view]
     ? (eq rest.len 0)
       < view (grove_views/finish root span name role slot code)
-      | ./ok view.set_is_pane((grove_views/is_pane body))
+      | ./ok view.set_is_pane((grove_views/is_pane body)).set_ports(ports.reverse)
     ? rest.at(0)
-     > (grove/comment at text) (_ rest.drop(1) role slot code)
+     > (grove/comment at text) (_ rest.drop(1) role slot code ports)
      > (grove/tag at kind)
-      ? ((equal kind (grove/tag_kind/view)) || (equal kind (grove/tag_kind/pane))) (_ rest.drop(1) role slot code)
+      ? ((equal kind (grove/tag_kind/view)) || (equal kind (grove/tag_kind/pane))) (_ rest.drop(1) role slot code ports)
       | goo/fail[goo/view] at "Incompatible view tag."
      > (grove/block at kind kids)
-      ? (equal kind (grove/block_kind/meta)) (_ rest.drop(1) role slot code)
+      ? (equal kind (grove/block_kind/meta)) (_ rest.drop(1) role slot code ports)
       | goo/fail[goo/view] at "Only #meta blocks are allowed on views."
      > (grove/directive at kind target)
       < path (grove_views/reference root doc lookup target)
+      ? (equal kind (grove/directive_kind/port))
+        ? !(grove_views/is_pane body)
+          | goo/fail[goo/view] at "Selection ports require @pane."
+        ? (ports.has(path))
+          | goo/fail[goo/view] at "Duplicate selection port."
+        | _ rest.drop(1) role slot code ports.cons(path)
       ? (equal kind (grove/directive_kind/on))
         ? (maybe/is_some role)
           | goo/fail[goo/view] at "Duplicate #on on view."
-        | _ rest.drop(1) (./some path) slot code
+        | _ rest.drop(1) (./some path) slot code ports
       ? (equal kind (grove/directive_kind/for))
         ? (maybe/is_some slot)
           | goo/fail[goo/view] at "Duplicate #for on view."
-        | _ rest.drop(1) role (./some path) code
+        | _ rest.drop(1) role (./some path) code ports
       | goo/fail[goo/view] at "Views support #on and #for only."
      > (grove/presentation at trees)
       ? (maybe/is_some code)
         | goo/fail[goo/view] at "Duplicate Goo body."
       < parsed (goo/parse trees)
-      | _ rest.drop(1) role slot (./some parsed)
+      | _ rest.drop(1) role slot (./some parsed) ports
     | goo/fail[goo/view] span "Expected a Goo view declaration."
   + index
     \ root=path doc=grove/document lookup={\ path}maybe[myth]
@@ -264,11 +270,15 @@
     ? !(context.renderers.any((\ renderer (and (equal renderer.type type) (eq renderer.constructor "link")))))
       | goo/fail[unit] value.span "Pane source must have path type."
     | ./ok []
+  + topos
+    \ kind=str
+    ^ bool
+    | ((eq kind "list") || (eq kind "diagram_tree") || (eq kind "list_tree"))
   + local_validate
     \ context=grove_views/context view=goo/view node=goo/node
     ^ either[grove/error unit]
-    = keyed=row[str] ["pane" "selection" "list" "follow" "deck" "navigate" "operation" "operation_status"]
-      leaf=row[str] ["list" "follow" "navigate" "operation" "operation_status"]
+    = keyed=row[str] ["pane" "selection" "list" "diagram_tree" "list_tree" "follow" "deck" "navigate" "operation" "operation_status"]
+      leaf=row[str] ["list" "diagram_tree" "list_tree" "follow" "navigate" "operation" "operation_status"]
     ? !(keyed.has(node.constructor)) (./ok [])
     ? (eq node.arguments.len 0) (goo/fail[unit] node.span "Local declarations require a stable literal key.")
     ? !(grove_views/local_key node.arguments.head) (goo/fail[unit] node.span "Local keys must be path or text literals.")
@@ -281,11 +291,18 @@
       ?> (./some value) (grove_views/local_named "operation" node) (goo/fail[unit] node.span "Host controls require an operation key.")
       ? !(grove_views/local_key value) (goo/fail[unit] node.span "Operation keys must be literals.")
       | ./ok []
-    = source=bool ((eq node.constructor "selection") || (eq node.constructor "list"))
+    = source=bool ((eq node.constructor "selection") || (grove_views/topos node.constructor))
     ? source
       ?> (./some value) (grove_views/local_named "source" node) (goo/fail[unit] node.span "selection/list require source = namespace path.")
       < valid (grove_views/source_validate context view value)
-      ? (eq node.constructor "selection") (./ok [])
+      ? (eq node.constructor "selection")
+        = axis (grove_views/local_named "axis" node).fall((rex/cord "z"))
+        ? !((eq axis.print (rex/cord "x").print) || ((eq axis.print (rex/cord "y").print) || (eq axis.print (rex/cord "z").print)))
+          | goo/fail[unit] node.span "Selection axis must be x, y, or z."
+        ?> (./some topology) (grove_views/local_named "topology" node) (./ok [])
+        ? !((eq topology.print (rex/cord "tree").print) || (eq topology.print (rex/cord "children").print))
+          | goo/fail[unit] node.span "Selection topology must be tree or children."
+        | ./ok []
       ?> (./some port) (grove_views/local_named "selection" node) (goo/fail[unit] node.span "list requires a selection port.")
       ? !(grove_views/local_key port) (goo/fail[unit] node.span "Selection port must name a local key.")
       (./ok [])
@@ -328,7 +345,7 @@
     \ view=goo/view node=goo/node
     ^ either[grove/error unit]
     ? view.is_pane (./ok [])
-    = exclusive=row[str] ["pane" "selection" "list" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"]
+    = exclusive=row[str] ["pane" "_pane_instance" "selection" "list" "diagram_tree" "list_tree" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"]
     ? (exclusive.has(node.constructor))
       | goo/fail[unit] node.span "Pane controls require @pane; @view is an object projection."
     ? (node.arguments.any(grove_views/captures))
@@ -345,6 +362,9 @@
     \ context=grove_views/context stack=list[path] view=goo/view node=goo/node
     ^ either[grove/error goo/node]
     < scope (grove_views/scope_validate view node)
+    ? (eq node.constructor "_pane_instance") (./ok node.set_constructor("pane"))
+    ? (eq node.constructor "pane")
+      | goo/fail[goo/node] node.span "Use pane(declaration); inline pane bodies are not supported."
     ? ((eq node.constructor "show") || (eq node.constructor "present"))
       ? !(and (eq node.arguments.len 2) (eq node.children.len 0))
         | goo/fail[goo/node] node.span "show/present require a value and slot, with no explicit children."
@@ -362,7 +382,7 @@
     = constructors=row[str]
         ["group" "or" "action" "input" "text" "link" "number"
          "time" "duration" "boolean" "image" "icon" "divider"
-         "pane" "selection" "list" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"
+         "pane" "selection" "list" "diagram_tree" "list_tree" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"
          "row" "col" "flow" "stack" "opt" "button" "code" "avatar" "presence" "media" "bar"]
     ? !(constructors.has(node.constructor))
       | goo/fail[goo/node] node.span "Unknown Goo constructor."
@@ -383,5 +403,213 @@
       | goo/fail[goo/view] rex/zero_span "Unknown entry view."
     = view matching.at(0)
     < fields (grove_views/role_fields context .nil view.role view.span)
-    < children (grove_views/lower_nodes context (list/one view.name) view view.children)
-    | ./ok view.set_children(children)
+    | grove_views/lower_view context view
+
+  + path_literal
+    \ path=path
+    ^ rex
+    | rex/quip (str/cat_all ["'" (path_show path)])
+  + port_lookup
+    \ env=list[[path path]] key=path span=rex/source_span
+    ^ either[grove/error path]
+    ? env.is_nil (goo/fail[path] span "Unbound selection; declare #port and connect it explicitly.")
+    = [local actual] env.head
+    ? (equal local key) (./ok actual)
+    | grove_views/port_lookup env.tail key span
+  + local_path
+    \ value=rex
+    ^ either[grove/error path]
+    ?> (./leaf _ _ text) value (goo/fail[path] value.span "Expected a local path key.")
+    ? (equal value.leaf_kind (maybe/some[str] "quip"))
+      ?> (./some path) (path_parse (str/slice 1 (dec text.len) text)) (goo/fail[path] value.span "Expected a local path key.")
+      | ./ok path
+    ? (equal value.leaf_kind (maybe/some[str] "cord"))
+      | ./ok [($ts text)]
+    | goo/fail[path] value.span "Expected a local path key."
+  + capture_ports
+    \ env=list[[path path]] expression=rex
+    ^ either[grove/error rex]
+    = operand=bool
+        ? expression
+         > (./juxt _ kids)
+          ? (eq kids.len 0) .false
+          | grove_views/captures kids.at(0)
+        ?> (./nest _ _ rune kids) expression .false
+        ? !(and (eq rune ".") (eq kids.len 1)) .false
+        | grove_views/capture_head kids.at(0)
+    ? operand
+      < next (grove_views/capture_operand env expression)
+      | ./ok next
+    < children (grove_views/port_expressions env expression.children.stream)
+    ' map_children retains shape; pair each child with its rewritten counterpart.
+    = rewrite
+        \ old=rex
+        ^ rex
+        % before=row[rex] expression.children after=list[rex] children
+        ^ rex
+        ? (eq before.len 0) old
+        ? (equal old before.at(0)) after.head
+        | _ before.drop(1) after.tail
+    | ./ok expression.map_children(rewrite)
+  + capture_operand
+    \ env=list[[path path]] expression=rex
+    ^ either[grove/error rex]
+    ? ((equal expression.leaf_kind (maybe/some[str] "quip")) || (equal expression.leaf_kind (maybe/some[str] "cord")))
+      < key (grove_views/local_path expression)
+      < actual (grove_views/port_lookup env key expression.span)
+      | ./ok (grove_views/path_literal actual)
+    < children (grove_views/capture_operands env expression.children.stream)
+    = rewrite
+        \ old=rex
+        ^ rex
+        % before=row[rex] expression.children after=list[rex] children
+        ^ rex
+        ? (eq before.len 0) old
+        ? (equal old before.at(0)) after.head
+        | _ before.drop(1) after.tail
+    | ./ok expression.map_children(rewrite)
+  + capture_operands
+    \ env=list[[path path]] expressions=list[rex]
+    ^ either[grove/error list[rex]]
+    ? expressions.is_nil (./ok .nil)
+    < head (grove_views/capture_operand env expressions.head)
+    < tail (grove_views/capture_operands env expressions.tail)
+    | ./ok tail.cons(head)
+  + port_expressions
+    \ env=list[[path path]] expressions=list[rex]
+    ^ either[grove/error list[rex]]
+    ? expressions.is_nil (./ok .nil)
+    < head (grove_views/capture_ports env expressions.head)
+    < tail (grove_views/port_expressions env expressions.tail)
+    | ./ok tail.cons(head)
+  + port_bindings
+    \ context=grove_views/context target=goo/view env=list[[path path]] node=goo/node
+    ^ either[grove/error list[[path path]]]
+    = supplied (grove_views/local_named "ports" node)
+      fields=list[rex]
+        ?> (./some value) supplied .nil
+        ?> (./nest _ color rune kids) value (list/one value)
+        ? !(eq color "curly") (list/one value)
+        ? (eq rune "=") (list/one (rex/rune "=" kids))
+        kids.stream
+    % rest=list[rex] fields out=list[[path path]] .nil
+    ^ either[grove/error list[[path path]]]
+    ? rest.is_nil
+      ? !(eq out.len target.ports.len)
+        | goo/fail[list[[path path]]] node.span "Pane requires all declared selection ports."
+      | ./ok out
+    ?> (./nest _ _ rune kids) rest.head (goo/fail[list[[path path]]] node.span "Expected ports = { local = selection }.")
+    ? !(and (eq rune "=") (eq kids.len 2))
+      | goo/fail[list[[path path]]] node.span "Expected ports = { local = selection }."
+    < local (grove_views/local_path kids.at(0))
+    ? !(target.ports.has(local))
+      | goo/fail[list[[path path]]] node.span "Unknown pane selection port."
+    ? (out.any((\ [key value] (equal key local))))
+      | goo/fail[list[[path path]]] node.span "Duplicate pane selection port binding."
+    < key (grove_views/local_path kids.at(1))
+    < actual (grove_views/port_lookup env key node.span)
+    | _ rest.tail out.cons([local actual])
+  + pane_arguments
+    \ node=goo/node
+    ^ either[grove/error unit]
+    % rest=list[rex] node.arguments.tail seen=list[str] .nil
+    ^ either[grove/error unit]
+    ? rest.is_nil (./ok [])
+    ?> (./nest _ _ rune kids) rest.head (goo/fail[unit] node.span "Expected named pane arguments: key, ports, on.")
+    ? !(and (eq rune "=") (eq kids.len 2))
+      | goo/fail[unit] node.span "Expected named pane arguments: key, ports, on."
+    = name kids.at(0).print
+    ? !((eq name "key") || (eq name "ports") || (eq name "on"))
+      | goo/fail[unit] node.span "Unknown pane argument."
+    ? seen.has(name) (goo/fail[unit] node.span "Duplicate pane argument.")
+    | _ rest.tail seen.cons(name)
+  + pane_children_keys
+    \ nodes=list[goo/node]
+    ^ list[rex]
+    | nodes.bind
+      \ node
+      ? (eq node.constructor "pane") (list/one node.arguments.head)
+      | grove_views/pane_children_keys node.children
+  + pane_instance
+    \ context=grove_views/context stack=list[path] view=goo/view env=list[[path path]] key=path prefix=path
+    ^ either[grove/error goo/node]
+    < composed (grove_views/compose_nodes context stack view env prefix view.children)
+    < children (grove_views/lower_nodes context stack view composed)
+    = keys (grove_views/pane_children_keys children)
+    ? (keys.any((\ key (gt (keys.keep((\ other (equal key other)))).len 1))))
+      | goo/fail[goo/node] view.span "Repeated pane declaration requires distinct instance keys."
+    | ./ok (goo/node view.span "_pane_instance" (list/one (grove_views/path_literal key)) children)
+  + compose_nodes
+    \ context=grove_views/context stack=list[path] view=goo/view env=list[[path path]] prefix=path nodes=list[goo/node]
+    ^ either[grove/error list[goo/node]]
+    ? nodes.is_nil (./ok .nil)
+    < head (grove_views/compose_node context stack view env prefix nodes.head)
+    < tail (grove_views/compose_nodes context stack view env prefix nodes.tail)
+    | ./ok tail.cons(head)
+  + compose_node
+    \ context=grove_views/context stack=list[path] view=goo/view env=list[[path path]] prefix=path node=goo/node
+    ^ either[grove/error goo/node]
+    ? (eq node.constructor "_pane_instance")
+      | goo/fail[goo/node] node.span "Reserved pane constructor."
+    ? (eq node.constructor "pane")
+      ? ((eq node.arguments.len 0) || (gt node.children.len 0))
+        | goo/fail[goo/node] node.span "Use pane(declaration); inline pane bodies are not supported."
+      < _ (grove_views/pane_arguments node)
+      < name (grove_views/reference context.root context.document context.lookup node.arguments.head)
+      = matches (context.views.keep((\ pane (and pane.is_pane (equal pane.name name)))))
+      ? !(eq matches.len 1)
+        | goo/fail[goo/node] node.span "pane requires an @pane declaration."
+      = target matches.head
+      ? stack.has(name) (goo/fail[goo/node] node.span "Cyclic pane composition.")
+      = receiver (grove_views/local_named "on" node).fall((rex/word view.binding))
+      ? !(eq receiver.print view.binding)
+        | goo/fail[goo/node] node.span "Pane composition currently requires the current receiver."
+      ? !(equal target.role view.role)
+        | goo/fail[goo/node] node.span "Pane receiver role must match its declaration."
+      < bindings (grove_views/port_bindings context target env node)
+      = explicit (grove_views/local_named "key" node)
+      = key=either[grove/error path]
+          ? explicit
+           > (./some value)
+            < local (grove_views/local_path value)
+            | ./ok name.snoc('instance).weld(local)
+          | ./ok name
+      < key key
+      < pane (grove_views/pane_instance context stack.snoc(name) target bindings key prefix.snoc(($x key.len)).weld(key))
+      | ./ok (goo/bind_node target.binding receiver pane)
+    = nested=either[grove/error list[[path path]]]
+        ? !(eq node.constructor "selection") (./ok env)
+        ? (eq node.arguments.len 0) (goo/fail[list[[path path]]] node.span "Selection requires a local key.")
+        < local (grove_views/local_path node.arguments.head)
+        | ./ok env.cons([local prefix.snoc('selection).weld(local)])
+    < nested nested
+    < arguments (grove_views/port_expressions nested node.arguments)
+    = mapped=either[grove/error list[rex]]
+        ? (eq node.constructor "selection")
+          < local (grove_views/local_path node.arguments.head)
+          < actual (grove_views/port_lookup nested local node.span)
+          | ./ok arguments.tail.cons((grove_views/path_literal actual))
+        ? ((grove_views/topos node.constructor) || (eq node.constructor "follow"))
+          ?> (./some port) (grove_views/local_named "selection" node) (goo/fail[list[rex]] node.span "list/follow require a selection port.")
+          < local (grove_views/local_path port)
+          < actual (grove_views/port_lookup env local node.span)
+          = rewrite
+              \ argument=rex
+              ^ rex
+              ? (maybe/is_some (grove_views/local_named "selection" node.set_arguments((list/one argument))))
+                | rex/rune "=" [(rex/word "selection") (grove_views/path_literal actual)]
+              argument
+          | ./ok arguments.map(rewrite)
+        | ./ok arguments
+    < arguments mapped
+    < children (grove_views/compose_nodes context stack view nested prefix node.children)
+    | ./ok node.set_arguments(arguments).set_children(children)
+  + lower_view
+    \ context=grove_views/context view=goo/view
+    ^ either[grove/error goo/view]
+    ? !(view.is_pane)
+      < children (grove_views/lower_nodes context (list/one view.name) view view.children)
+      | ./ok view.set_children(children)
+    = ports (view.ports.map((\ port [port port])))
+    < pane (grove_views/pane_instance context (list/one view.name) view ports view.name view.name)
+    | ./ok view.set_children((list/one pane.set_constructor("pane")))

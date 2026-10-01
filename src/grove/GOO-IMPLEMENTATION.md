@@ -18,6 +18,24 @@ nested in argument expressions. A pane presenting a view does not grant pane
 capabilities to that view. Object-local actions, creation, and `become` remain
 valid in views.
 
+## Declared pane composition
+
+`goo/view.ports` records required selection ports. A `#port` directive is legal
+only on panes. `lower_view` gives every pane an owner keyed by its declaration
+path. `pane(declaration, key=..., ports=...)` resolves a pane by declaration path,
+checks the current-receiver role and complete port bindings, and expands its
+body. Cycles, inline bodies, and duplicate instances without distinct keys are
+rejected. Port-bearing declarations publish reusable definitions but are excluded
+from standalone previews and workspace entry points.
+
+Composition resolves local selections and port aliases before ordinary lowering.
+Selection identifiers include the instance ancestry; child ancestry uses a
+length-prefixed path so instance boundaries are unambiguous. `list`, `follow`,
+and `.capture` operands receive the resolved identifier. A child's environment
+contains only its declared ports and local selections. The existing session,
+source binding, and action validation consume the resulting ordinary pane tree.
+Source-node routes continue to identify action controls within the expanded tree.
+
 ## Pipeline and IR
 
 The pipeline is Grove parsing and reference resolution → typed Goo view IR →
@@ -140,3 +158,30 @@ inspection can expose published role contracts, view IR, and declaration provena
 | Native HTML primitives | [html.foil](../../extras/mounts/goo/html.foil) |
 
 For lifecycle design details see [Panes](../../extras/mounts/explorer/PANES.md).
+
+## Topoi
+
+`list`, `diagram_tree`, and `list_tree` lower to a retained `topos` description
+with a `renderer` field. Session identity is `(owner, topos, key)`, independent
+of the renderer. `goo-topoi.js` owns the member wrappers and translates gestures;
+`goo-panes.js` supplies slot-selected member HTML and object-local actions.
+`goo-tree` and `goo-tidy-tree` come from the Mash revision pinned in Extras, via
+the explorer's generated component bundle. No debugger mount is required.
+
+`selection(..., topology = "tree")` requests `/goo/source?topology=tree`.
+`goo_runtime/tree_paths` walks the physical child index with a 65-node cutoff,
+without flattening the subtree. Responses include a root and parent references,
+source/member lifetime evidence, and whether the complete source fits the bound.
+Capture admission checks the declared topology and current finite membership.
+The tree components receive the same keyed memberships: WA gets one nested DOM
+hierarchy; the diagram gets direct nodes with parent references. Neither component
+owns the accepted selection or action admission.
+
+Topos sources carry a selection-owned `axis` (`x`, `y`, or `z`, default `z`).
+`/goo/source` applies namespace care before walking its tree, so physical,
+historical, and overlay paths share membership semantics. The walk preserves
+parent paths and stops at 65 nodes to detect the 64-node bound. It does not
+flatten and rebuild the tree. Member records are read from that projection.
+Axis participates in browser membership identity and server capture admission.
+Status separates the displayed `subject` from the writable `target`; read-only
+virtual subjects can therefore be followed without inventing write authority.

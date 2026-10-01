@@ -109,3 +109,26 @@ test('S26/S28: pure planning and reflection describe actual owners/ports/depende
  assert.deepEqual(choice.followers,[follow.id]); assert.equal(follower.selectionPort,sel.id); assert.equal(reflected.captures[0].values[0].member.key,'A');
  reflected.owners[0].key='forged'; assert.notEqual(s.inspect().owners[0].key,'forged');
 });
+
+test('topos identity and selection survive renderer changes',async()=> {
+ const s=new GooSession();
+ const make=renderer=>[{kind:'pane',key:'p',children:[{kind:'selection',key:'choice',source:source(),children:[
+   {kind:'topos',key:'collection',renderer,selection:'choice',source:'/cards',type:'namespace-record'}]}]}];
+ await s.reconcile(make('list')); const topo=state(s,'topos'), selection=state(s,'selection');
+ s.focus(topo.ref,B); await select(s,selection,B);
+ await s.reconcile(make('diagram_tree'));
+ assert.equal(state(s,'topos').ref,topo.ref); assert.equal(topo.focus.key,'B'); assert.equal(selection.accepted.key,'B');
+ await s.reconcile(make('list_tree')); assert.equal(state(s,'topos').ref,topo.ref);
+});
+
+test('source axis participates in membership and rebinding', async()=> {
+ const s=new GooSession(), spec=description();
+ const selection=spec[0].children[0];
+ selection.source.axis='y'; selection.source.members=selection.source.members.map(m=>({...m,axis:'y'}));
+ await s.reconcile(spec);
+ const sel=state(s,'selection');
+ assert.throws(()=>s.validateMember(sel.source,{...sel.source.members[0],axis:'z'}),/incompatible-member-reference/);
+ const changed=structuredClone(spec); changed[0].children[0].source.axis='z';
+ changed[0].children[0].source.members=changed[0].children[0].source.members.map(m=>({...m,axis:'z'}));
+ await assert.rejects(s.reconcile(changed),/incompatible-source-rebinding/);
+});

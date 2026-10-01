@@ -9,7 +9,7 @@ class Element {
   append(...nodes) { for(const node of nodes) { node.parentElement=this; this.children.push(node); } }
   prepend(node) { node.parentElement=this; this.children.unshift(node); }
   replaceChildren(...nodes) { this.children=[]; this.append(...nodes); }
-  get classList() { return {contains: name => this.className.split(' ').includes(name)}; }
+  get classList() { return {contains: name => this.className.split(' ').includes(name), add: name => {this.className += ' '+name;}}; }
   get nextElementSibling() { const nodes=this.parentElement?.children || []; return nodes[nodes.indexOf(this)+1] || null; }
   insertBefore(node, before) {
     if(node.parentElement) node.parentElement.children=node.parentElement.children.filter(n=>n!==node);
@@ -41,6 +41,7 @@ async function setup() {
  context.document={createElement:tag=>new Element(tag),activeElement:null};
  let invocations=0;
  context.GooActions={load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
+ vm.runInNewContext(fs.readFileSync(require.resolve('../goo-topoi.js'),'utf8'),context);
  vm.runInNewContext(fs.readFileSync(require.resolve('../goo-panes.js'),'utf8'),context);
  const controller=new context.GooPanes(new Element(),{target:'/study',view:'/view',report:()=>{}});
  await controller.session.reconcile(tree);
@@ -65,11 +66,11 @@ test('S15: actual follow adapter discards delayed A after accepted B and older r
 test('S02/S07/S14: real row listeners select locally, separate focus and suppress nested controls',async()=>{
  const {controller:c,list,selection:s,context}=await setup(); const body=new Element();
  c.list(list,body,{slot:'summary',key:'rows'},[]);
- const b=list.rows.get('B');
- await b.fire('focus'); assert.equal(s.accepted.key,'A'); assert.equal(list.focus.key,'B');
+ const b=list.topos.items.get('B');
+ await b.fire('focusin'); assert.equal(s.accepted.key,'A'); assert.equal(list.focus.key,'B');
  await b.fire('click',{target:{closest:()=>({tagName:'button'})}}); assert.equal(s.accepted.key,'A');
  await b.fire('keydown',{key:'Enter'}); await Promise.resolve(); await Promise.resolve(); assert.equal(s.accepted.key,'B');
- for(const key of ['C','B']) { await list.rows.get(key).fire('click'); await Promise.resolve(); await Promise.resolve(); }
+ for(const key of ['C','B']) { await list.topos.items.get(key).fire('click'); await Promise.resolve(); await Promise.resolve(); }
  assert.equal(s.accepted.key,'B'); assert.equal(context.GooActions.metrics.dispatches,0);
 });
 test('S16/S17/S27: actual text input guard retains draft and newer candidate supersedes inline prompt',async()=>{
@@ -138,4 +139,28 @@ test('server pane and native content are adopted without replacing their DOM', a
  assert.equal(c.body.children[0],pane); assert.equal(pane.children[0],native);
  assert.equal(native.children[0],input); assert.equal(native.innerHTML,undefined);
  assert.equal(c.serverNodes.size,0);
+});
+
+test('follow renders a projection whose writable target differs', async()=> {
+ const {controller:c,follower:f,element:e,pending:p}=await setup();
+ const loaded=c.follow(f,e), result=response('/concrete-source','Projected values');
+ result.snapshot.subject='/a';
+ p[0].resolve(result); await loaded;
+ assert.equal(e.dataset.status,'current'); assert.equal(e.children[0].textContent,'Projected values');
+});
+test('follow still rejects a response for the wrong displayed subject', async()=> {
+ const {controller:c,follower:f,element:e,pending:p}=await setup();
+ const loaded=c.follow(f,e), result=response('/a','Wrong projection');
+ result.snapshot.subject='/other';
+ p[0].resolve(result); await loaded;
+ assert.equal(e.dataset.status,'unavailable'); assert.match(e.textContent,/removed or replaced/);
+});
+
+test('virtual and structural sources need no physical lifetime', async()=> {
+ const {controller,context}=await setup(); let requested;
+ context.URLSearchParams=URLSearchParams;
+ const value={id:'/h/z/1/1/root',life:'0',bounded:true,axis:'y',type:'namespace-record',members:[]};
+ context.fetch=async url=>{requested=url;return {ok:true,json:async()=>value};};
+ assert.equal(await controller.source(value.id,'tree','y'),value);
+ assert.match(requested,/axis=y/);
 });

@@ -57,7 +57,7 @@ workspace =
   @pane
   #on ; %/study
   #for ; /sys/slot/workspace
-  study => pane('/workspace) {
+  study => {
     present(study, '/sys/slot/summary)
   }
 ```
@@ -74,9 +74,9 @@ only `@view` declarations; a pane is not a candidate. Workspace endpoints requir
 an `@pane` declaration. The explorer lists panes separately from view matching,
 with their declaration kind shown beside the slot.
 
-Both kinds currently require `#on` and `#for`. The `@pane` declaration opts in;
-`pane(key) { ... }` inside its body creates a local owner. Nested panes remain
-inline constructors, not references resolved through `present`.
+Both kinds currently require `#on` and `#for`. Each `@pane` declaration creates
+its own local owner. Mount a child with `pane(%/child)`; inline pane bodies are
+not supported. `present` still selects views, never panes.
 
 ### Calls and expressions
 
@@ -149,9 +149,9 @@ receiver field. Details and restrictions follow the table. All keyed constructor
 | `media` | `media(value[, slot])` — reference media primitive. |
 | `bar` | `bar(value[, slot])` — reference progress primitive, with numeric config. |
 | `action` | `action(label[, become=path][, argument=value, ...])` — invoke enclosing action and/or change recipe. |
-| `pane` | `pane(key) { ... }` — local ownership boundary. |
+| `pane` | `pane(declaration[, key=local_key][, ports={...}][, on=receiver])` — mount a declared pane. |
 | `selection` | `selection(key, source=source[, initial=.member(path)]) { ... }` — lexical selection port. |
-| `list` | `list(key, source=source, selection=key[, slot=view_slot][, browse=text])` — selectable namespace members. |
+| `list`, `diagram_tree`, `list_tree` | `list(key, source=source, selection=key[, slot=view_slot][, browse=text])` — selectable namespace members. |
 | `follow` | `follow(key, selection=key[, slot=view_slot])` — present the accepted selection. |
 | `split` | `split { ... }` — side-by-side panes. |
 | `deck` | `deck(key) { ... }` — local tabs over child panes. |
@@ -162,7 +162,7 @@ receiver field. Details and restrictions follow the table. All keyed constructor
 | `icon`, `divider` | Reserved but **not currently renderable**. Using them produces a diagnostic. |
 
 `show` and `present` take exactly two arguments and no authored child block.
-`list`, `follow`, `navigate`, `operation`, and `operation_status` have no child
+`pane`, `list`, `follow`, `navigate`, `operation`, and `operation_status` have no child
 block. Unknown constructors are rejected. Parser acceptance is not a promise
 that every arbitrary named argument has runtime meaning.
 
@@ -381,40 +381,143 @@ and [SRS action examples](../../extras/mounts/srs/srs.grove).
 
 ## Panes and local selection
 
-The following body belongs to an `@pane` declaration:
-
-```goo
-study => pane('/workspace) {
-  selection('/current, source = '/0x11/app/panes/cards) {
+```grove
+workspace =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/workspace
+  study => selection('/current, source = study.cards) {
     split {
-      pane('/queue) {
-        list('/rows, source = '/0x11/app/panes/cards, selection = '/current, slot = '/sys/slot/summary)
-      }
-      pane('/detail) {
-        follow('/subject, selection = '/current, slot = '/sys/slot/content)
-      }
+      pane(%/queue, ports = { '/chosen = '/current })
+      pane(%/detail, ports = { '/chosen = '/current })
     }
   }
+
+queue =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/queue
+  #port ; /chosen
+  study => list('/rows, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+
+detail =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/detail
+  #port ; /chosen
+  study => follow('/subject, selection = '/chosen, slot = '/sys/slot/content)
+```
+
+Every pane has a declaration. Its body belongs directly to that pane; no outer
+`pane(...) { ... }` wrapper is needed. It can mount child declarations and present
+ordinary views. A followed member's `@view` cannot introduce pane features.
+
+### Pane identity and explicit ports
+
+`pane(%/detail)` uses the declaration's canonical path as its stable identity,
+scoped under the owning pane. Reordering it or placing it in another layout
+wrapper preserves that identity. Changing its `#on` or `#for` does not rename it.
+
+Mounting the same declaration twice under one owner requires distinct keys:
+
+```goo
+pane(%/detail, key = '/left, ports = { '/chosen = '/current })
+pane(%/detail, key = '/right, ports = { '/chosen = '/current })
+```
+
+The instance identity includes both the declaration and the explicit key. Changing
+the key or the declaration creates a different instance. A duplicate unkeyed
+mount is a compile error. Layout groups, selection scopes, splits and decks do
+not introduce an owning pane.
+
+`#port ; /chosen` declares a required selection input. `ports` connects each
+callee port (left side) to a selection in the caller's scope (right side). Supply
+all ports, with no duplicate or unknown names. Use commas between multiple
+bindings. A child cannot implicitly use a selection from its parent's body;
+forward it explicitly, including through intermediate pane declarations.
+The port works with `list`, `follow`, and `.capture(...)`. Local selections can
+shadow port names without changing the parent's selection.
+
+Pane composition currently resolves declarations in the same Grove document.
+`on` defaults to the current receiver. The current implementation permits only
+that receiver, with the same declared role as the child. It does not construct
+or evaluate another receiver for the child. Composition cycles are rejected.
+Panes requiring ports are reusable components, not standalone explorer previews
+or workspace entry points.
+
+### Topoi: lists and trees
+
+A **topos** presents a collection's members and connects gestures to a selection
+port. Its member content is still an ordinary slot-selected `@view`. The three
+constructors share the same arguments and ownership semantics:
+
+```goo
+list('/items, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+diagram_tree('/items, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+list_tree('/items, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+```
+
+`list` is flat, `diagram_tree` lays out the parent relation spatially with pan/zoom,
+and `list_tree` is an expandable outline with keyboard traversal. Switching the
+constructor while keeping the key and owning pane preserves the topos's identity,
+focus reference, and shared selection. Simultaneous topoi need distinct keys.
+Disclosure and the diagram camera are presentation state; they do not invoke
+object actions. Buttons, links, and inputs in a member view keep their own behavior.
+
+The source defaults to direct children on `z`. Request namespace-tree
+membership on the **selection** to share it across all three renderers:
+
+```goo
+selection('/chosen, source = study.cards, topology = "tree") {
+  list('/flat, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+  list_tree('/outline, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+  diagram_tree('/diagram, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+  follow('/detail, selection = '/chosen, slot = '/sys/slot/content)
 }
 ```
 
-A pane owns local state and can contain other panes and native presentations.
-Selections are lexical ports, not namespace records. A list proposes a choice;
-a follower presents the accepted choice. A followed member's `@view` cannot itself
-introduce pane features; this is enforced during compilation. Keep
-workspace composition in the pane structure and subject presentation in views.
+Choose the namespace projection on the selection: `axis = "x"`, `"y"`, or `"z"`
+(default `"z"`). All connected topoi inherit it.
 
-### Keys, sources, and initial selection
+- `x`: the root record only; a children selection is empty.
+- `y`: the root and nearest live descendant records, retaining structural paths
+  between them. Traversal stops at those records.
+- `z`: the full subtree, including nested records.
 
-`pane`, `selection`, `list`, `follow`, `deck`, `navigate`, `operation`, and
-`operation_status` require stable path or text literal keys. Identity combines
+For example, `selection('/chosen, source = '/0x11/app, topology = "tree", axis = "y")`
+provides a frontier tree. Virtual namespace paths such as `/o/...` and `/h/...`
+use the same namespace projection machinery. Their views can be inspected;
+projection does not confer write authority. Actions still require a validated
+writable source, and captures retain server-side application authority checks.
+
+Tree membership includes the source root and its projected descendants. Each member
+has an explicit parent reference; the root has none. Structural nodes can connect
+the hierarchy but cannot be selected as objects. Both source forms are bounded at
+64 nodes; a larger source reports an error instead of silently truncating it.
+There is no lazy subtree loading in this first version. Trees require a single
+root and reject missing parents, duplicate members, and cycles. Use `topology =
+"tree"` with tree renderers; `"children"` is the default.
+
+Selection capture works for tree descendants as well as direct children. The
+server checks the published selection's topology, bounded membership, and source
+and object lifetimes before admitting the action. A renderer cannot enlarge the
+selection's authority.
+
+The `panes` mount's `topoi_demo` declaration demonstrates all three on the same
+namespace tree, followed detail, editing, and a capture action.
+
+### Other keys, sources, and initial selection
+
+`selection`, `list`, `follow`, `deck`, `navigate`, `operation`, and
+`operation_status` still take local path or text literal keys. Identity combines
 the owning pane, handle kind, and key. Equal keys in different owners can coexist;
-duplicates of the same kind within an owner are diagnosed. Layout groups,
-selection scopes, and layout wrappers do not become identity ancestors.
+duplicates of the same kind within an owner are diagnosed. Use path literals for
+selection ports and capture operands.
 
-A source is an existing namespace record with at most **64 direct physical child
-keys**. It can be a literal path or a direct path-typed field. This is not a
-query, recursive traversal, arbitrary collection expression, or pagination API.
+A source is a namespace path projected on the selected axis, bounded to **64
+nodes**. It can be a literal path or a direct path-typed field. Choose direct
+children or recursive tree topology; arbitrary queries and pagination are not
+supported.
 Member presentations must satisfy the selected view's role contract.
 
 ```goo
@@ -435,12 +538,12 @@ separate from accepting that member as the selection.
 
 ```goo
 deck('/tabs) {
-  pane('/summary) { text("Summary") }
-  pane('/details) { text("Details") }
+  pane(%/summary_pane)
+  pane(%/details_pane)
 }
 pane_stack {
-  pane('/back) { text("Back") }
-  pane('/front) { text("Front") }
+  pane(%/back)
+  pane(%/front)
 }
 ```
 
@@ -480,7 +583,7 @@ generic workspace host integration. Labels,
 mode, browse text, and operation keys are authored literals, not dynamic templates.
 
 ```goo
-pane('/Inspector) {
+inspector => {
   navigate('/address, source = inspector.source_path, mode = "input", label = "Inspect path")
   navigate('/parent, source = inspector.source_path, mode = "parent", label = "Parent")
   operation('/reload, operation = '/mount_reload, label = "Reload mount assets")

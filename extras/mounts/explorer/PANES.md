@@ -39,39 +39,40 @@ workspace =
   @pane
   #on ; %/study
   #for ; /sys/slot/workspace
-  study => pane('/workspace) {
-    selection('/current, source = '/0x11/app/panes/cards) {
-      split {
-        pane('/queue) {
-          list('/rows, source = '/0x11/app/panes/cards,
-            selection = '/current, slot = '/sys/slot/summary)
-        }
-        pane('/detail) {
-          follow('/subject, selection = '/current,
-            slot = '/sys/slot/content)
-        }
-      }
+  study => selection('/current, source = study.cards) {
+    split {
+      pane(%/queue, ports = { '/chosen = '/current })
+      pane(%/detail, ports = { '/chosen = '/current })
     }
   }
+
+queue =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/queue
+  #port ; /chosen
+  study => list('/rows, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+
+detail =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/detail
+  #port ; /chosen
+  study => follow('/subject, selection = '/chosen, slot = '/sys/slot/content)
 ```
 
-Use the single-line calls in `../panes/panes.grove` for the executable specimen.
-The spelling adapts the proposed binder/match surface to the existing parser:
+Each `@pane` declaration supplies its default instance identity. Composition uses
+`pane(%/declaration, ports = { '/chosen = '/current })`; repeat a declaration
+under the same owner with distinct `key` arguments. Inline pane bodies are
+rejected. `#port` declarations and call-site bindings make cross-pane selection
+connections explicit. See [the reference](../../../src/grove/GOO.md#pane-identity-and-explicit-ports)
+for complete syntax and the current receiver restriction.
 
-| Proposed form | This slice |
-| --- | --- |
-| `selection(key) { current => ... }` | `selection(key, source = path) { ... }`; ports resolve the selection's literal key lexically |
-| `list(study.cards, selection=current) { card => present(card, slot) }` | `list(key, source=path, selection=key, slot=slot)`; a bounded namespace-member presentation |
-| `match current.subject ... present(card, slot)` | `follow(key, selection=key, slot=slot)`; a tracked optional selection read and continuing subject encounter |
-| Creation-only typed seed | `initial = .member('/0x11/app/panes/cards/a)` names a **membership key** in the advertised source, resolved once from its bounded snapshot |
-| Overlapping `stack` | `pane_stack { pane(key) { ... } ... }`; existing vertical `stack` is unchanged |
-| Deferred selection operand | `.capture('/current)` in an ordinary group's `myth` |
-
-`pane`, `selection`, `list`, `follow` and `deck` require keys. The key is local,
-not a globally executable namespace handle. Use path-literal selection keys for `.capture`. Pane and selection are different
-handle kinds. Equal keys in separate workspaces are independent. Groups,
-selection scopes, split/deck/stack wrappers are not addressing ancestors.
-Duplicate owner/kind/key declarations are diagnosed.
+The compiler resolves aliases to hygienic selection keys in the retained tree.
+The session consumes ordinary keyed pane and selection nodes; layout wrappers
+remain outside the ownership hierarchy. Declaration expansion does not grant a
+child access to ambient selections. Source and lifetime validation still applies
+to captured values after alias resolution.
 
 A source is an installed namespace record with at most 64 physical direct child
 keys. `/goo/source` returns captured direct-child membership references. Their
@@ -320,3 +321,21 @@ it does not implicitly navigate or select the new object.
 
 `grove-dev/creation.grove` supplies a runnable example at
 `/views/0x11/app/demo/creator`, creating `/0x11/app/demo/created`.
+
+## Topoi
+
+`list`, `diagram_tree`, and `list_tree` are presentations of one keyed topos.
+They share selection ports, source evidence, member views, and capture semantics.
+A renderer change does not replace the semantic owner. Tree sources opt in with
+`selection(..., topology = "tree")`; the root and descendants are bounded at
+64 physical nodes. The runtime walks the child index with a cutoff and emits
+parent references. Disclosure and camera state never call domain actions.
+
+`goo-topoi.js` adapts native lists, Mash `goo-tree`, and Mash `goo-tidy-tree`.
+The explorer builds its own pinned component bundle, so selecting the debugger
+mount is unnecessary. `extras/flake.nix` temporarily overrides the stale pnpm
+cache hash shipped in Mash revision `93954c6ef57629839b88762bc486babb5c348813`.
+The upstream source revision is unchanged.
+
+Run the `panes` mount and open `/views/0x11/app/panes/study`; `topoi_demo` shows a
+list, outline, and diagram sharing a detail view and a descendant capture action.

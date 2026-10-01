@@ -116,7 +116,10 @@
   + member
     \ source=path target=path state=namespace
     ^ json
-    = current (goo_runtime/record .x target state)
+    | goo_runtime/member_status (maybe/is_some (goo_runtime/record .x target state)) source target state
+  + member_status
+    \ available=bool source=path target=path state=namespace
+    ^ json
     | json/obj
       [(jkv "key" (json/str (path_show target)))
        (jkv "subject" (json/str (path_show target)))
@@ -124,24 +127,63 @@
        (jkv "sourceLife" (json/str (nat/show (goo_runtime/lifetime source state))))
        (jkv "life" (json/str (nat/show (goo_runtime/lifetime target state))))
        (jkv "type" (json/str "namespace-record"))
-       (jkv "expected" (json/str (nat/show (state.case(.x target)).fall(0))))
-       (jkv "status" (json/str (? (maybe/is_some current) "available" "unavailable")))]
-  + source
-    ' Finite direct-child source. Read physical keys with a bounded range;
-    ' never flatten the subtree or scan to find a selected member.
-    \ query=goo_runtime/request state=namespace
+       (jkv "expected" (json/str (nat/show (state.case(.x target)).fall(state.local.top))))
+       (jkv "status" (json/str (? available "available" "unavailable")))]
+  + axis
+    \ query=goo_runtime/request
+    ^ str
+    = values query.inputs.keep((\ [key value] (eq key "$axis")))
+    ? (eq values.len 0) "z"
+    = [key value] values.at(0)
+    value
+  + projection
+    \ axis=str source=path state=namespace
+    ^ axal[myth]
+    | sovereign_care (? (eq axis "x") .x (? (eq axis "y") .y .z)) source state
+  + projected_paths
+    ' Walk the projection's tree directly; do not flatten and rebuild it.
+    \ root=axal[myth] path=path
+    ^ list[path]
+    % pending=list[[path axal[myth]]] (list/one [path root]) out=list[path] .nil
+    ^ list[path]
+    ? (pending.is_nil || (ge out.len 65)) out.reverse
+    = [path node] pending.head
+      children (node.kid.range_after(.none (sub 65 out.len))).stream.map((\ entry [path.snoc(entry.key) (unpin entry.val.held)]))
+    | _ children.weld(pending.tail) out.cons(path)
+  + projected_source
+    \ tree=bool query=goo_runtime/request state=namespace
     ^ str
     = source query.target
-      history (state.history(source))
-      keys=row[iota]
-        ?> (./some history) history []
-        | history.idx.dip(source).kid.range_after(.none 65).map((\ entry entry.key))
+      axis (goo_runtime/axis query)
+      projected (goo_runtime/projection axis source state)
+      paths=list[path]
+        ? !(projected.wyt) .nil
+        ? tree (goo_runtime/projected_paths projected source)
+        | projected.kid.range_after(.none 65).stream.map((\ entry source.snoc(entry.key)))
+      members
+        | paths.take(64).map
+          \ path
+          = member (goo_runtime/member_status (maybe/is_some projected.dip(path.drop(source.len)).fil) source path state)
+          ?> (json/obj fields) member member
+          = fields fields.snoc((jkv "axis" (json/str axis)))
+          ? !tree (json/obj fields)
+          | json/obj fields.snoc((jkv "topology" (json/str "tree"))).snoc((jkv "parent" (? (equal path source) jnull (json/str (path_show path.take(path.len.dec))))))
     | show (json/obj
       [(jkv "id" (json/str (path_show source)))
        (jkv "life" (json/str (nat/show (goo_runtime/lifetime source state))))
        (jkv "type" (json/str "namespace-record"))
-       (jkv "bounded" (json/boo (le keys.len 64)))
-       (jkv "members" (json/arr (keys.take((? (lt keys.len 64) keys.len 64)).map((\ key (goo_runtime/member source source.snoc(key) state))))))])
+       (jkv "axis" (json/str axis))
+       (jkv "topology" (json/str (? tree "tree" "children")))
+       (jkv "bounded" (json/boo (le paths.len 64)))
+       (jkv "members" (json/arr members.row))])
+  + source
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    | goo_runtime/projected_source .false query state
+  + tree_source
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    | goo_runtime/projected_source .true query state
   + status
     \ query=goo_runtime/request state=namespace
     ^ str
@@ -151,7 +193,8 @@
          > (./some target) (state.case(.x target)).fall(0)
         0
     | show (json/obj
-      [(jkv "life" (json/str (nat/show (goo_runtime/lifetime target.fall([]) state))))
+      [(jkv "life" (json/str (nat/show (goo_runtime/lifetime query.target state))))
+       (jkv "subject" (json/str (path_show query.target)))
        (jkv "target" (json/str (path_show target.fall([]))))
        (jkv "expected" (json/str (nat/show expected)))
        (jkv "displayed" (json/str (nat/show (state.case(.y query.target)).fall(0))))
@@ -201,7 +244,7 @@
   + source_arguments
     \ published=goo/published card=myth node=goo/node
     ^ either[str list[rex]]
-    ? !((eq node.constructor "selection") || (eq node.constructor "list") || (eq node.constructor "navigate")) (./ok node.arguments)
+    ? !((eq node.constructor "selection") || (grove_views/topos node.constructor) || (eq node.constructor "navigate")) (./ok node.arguments)
     ?> (./some expression) (goo_runtime/named "source" node.arguments) (./err "Missing pane source.")
     ?> (./some path) (goo_runtime/source_path published card expression) (./err "Pane source has no path value.")
     = rewrite
@@ -233,6 +276,32 @@
         ?> (./some source) (goo_runtime/named "source" node.arguments) .none
         | goo_runtime/read_path source
     | goo_runtime/selection_source key node.children route.drop(1) next
+  + selection_tree
+    \ key=path nodes=list[goo/node] route=row[nat] found=bool
+    ^ bool
+    ? (eq route.len 0) found
+    ? (ge route.at(0) nodes.len) .false
+    = node nodes.at(route.at(0))
+      next=bool
+        ? !(eq node.constructor "selection") found
+        ? (eq node.arguments.len 0) found
+        ? !(equal (goo_runtime/read_path node.arguments.head) (maybe/some[path] key)) found
+        | eq (goo_runtime/named "topology" node.arguments).fall((rex/cord "children")).print (rex/cord "tree").print
+    | goo_runtime/selection_tree key node.children route.drop(1) next
+  + selection_axis
+    \ key=path nodes=list[goo/node] route=row[nat] found=str
+    ^ str
+    ? (eq route.len 0) found
+    ? (ge route.at(0) nodes.len) ""
+    = node nodes.at(route.at(0))
+      next=str
+        ? !(eq node.constructor "selection") found
+        ? (eq node.arguments.len 0) found
+        ? !(equal (goo_runtime/read_path node.arguments.head) (maybe/some[path] key)) found
+        = value (goo_runtime/named "axis" node.arguments).fall((rex/cord "z"))
+        ?> (./leaf _ _ text) value ""
+        text
+    | goo_runtime/selection_axis key node.children route.drop(1) next
   + bound_captures
     \ nodes=list[goo/node] route=row[nat] fields=list[rex] input=row[[str str]]
     ^ either[str unit]
@@ -246,6 +315,15 @@
     < member (goo_runtime/capture_value input slot)
     ? !(eq (path_show source) (goo_runtime/json_text (goo_runtime/json_field "source" member)))
       | ./err "Capture source does not match the published selection declaration."
+    ?> (./some subject) (path_parse (goo_runtime/json_text (goo_runtime/json_field "subject" member))) (./err "Invalid capture subject.")
+    = axis (goo_runtime/json_text (goo_runtime/json_field "axis" member))
+    ? !(eq (goo_runtime/selection_axis key nodes route "z") (? axis.len axis "z"))
+      | ./err "Capture axis does not match the published selection declaration."
+    = tree (goo_runtime/selection_tree key nodes route .false)
+    ? !(eq tree (eq (goo_runtime/json_text (goo_runtime/json_field "topology" member)) "tree"))
+      | ./err "Capture topology does not match the published selection declaration."
+    ? !(and (pith_prefix source subject) (tree || (eq subject.len source.len.inc)))
+      | ./err "Capture is outside the declared source topology."
     | goo_runtime/bound_captures nodes route fields.tail input
   + validate_captures
     \ input=row[[str str]] fields=list[rex] state=namespace
@@ -262,7 +340,15 @@
     ?> (./some subject) (path_parse (text "subject")) (./err "Invalid capture subject.")
     ? !(and (eq (text "type") "namespace-record") (eq (text "key") (path_show subject)))
       | ./err "Incompatible capture membership."
-    ? !(and (eq subject.len source.len.inc) (pith_prefix source subject))
+    = tree (eq (text "topology") "tree")
+      axis_text=str (text "axis")
+      axis=str (? (gt axis_text.len 0) axis_text "z")
+      projected (goo_runtime/projection axis source state)
+      belongs=bool
+        ? !tree (and (and (eq subject.len source.len.inc) (pith_prefix source subject)) (maybe/is_some projected.dip(subject.drop(source.len)).fil))
+        = members (goo_runtime/projected_paths projected source)
+        | and (le members.len 64) (and members.has(subject) (maybe/is_some projected.dip(subject.drop(source.len)).fil))
+    ? !belongs
       | ./err "Capture is not a member of its finite source."
     ? !(and (state.permitted(subject)) (pith_prefix [state.self 'app] subject))
       | ./err "Captured subject is outside application authority."
@@ -272,7 +358,7 @@
     ? !(eq (text "expected") (nat/show (state.case(.x subject)).fall(0)))
       | ./err "Captured subject changed before admission."
     ? (maybe/is_none (goo_runtime/record .x subject state)) (./err "Captured subject is unavailable.")
-    ? (maybe/is_none (goo_runtime/record .x source state)) (./err "Captured source is unavailable.")
+    ? !(projected.wyt) (./err "Captured source is unavailable.")
     | goo_runtime/validate_captures input fields.tail state
   + argument
     \ published=myth input=row[[str str]] now=nat slot=path value=rex
@@ -460,6 +546,7 @@
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]
     ? (eq query.operation "status") [state 200 (goo_runtime/status query state)]
+    ? (eq query.operation "tree-source") [state 200 (goo_runtime/tree_source query state)]
     ? (eq query.operation "source") [state 200 (goo_runtime/source query state)]
     ? !(eq query.operation "act") [state 400 "{}"]
     | goo_runtime/act query state

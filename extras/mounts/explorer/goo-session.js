@@ -5,7 +5,7 @@
   const fail = (code) => { throw Object.assign(new Error(code), {code}); };
   const identity = (value) => JSON.stringify(value);
   const binding = (member) => member && identity([member.subject, member.life, member.policy || 'live']);
-  const membership = (member) => member && identity([member.source, member.sourceLife, member.key, member.life]);
+  const membership = (member) => member && identity([member.source, member.sourceLife, member.axis || 'z', member.key, member.life]);
   const copy = (value) => structuredClone(value);
   class GooSession {
     constructor() {
@@ -35,7 +35,7 @@
         for (const node of nodes) {
           const kind = node.kind;
           let parent = owner, nested = scopes;
-          if (['pane', 'selection', 'list', 'follow', 'deck', 'navigate', 'operation', 'operation_status'].includes(kind)) {
+          if (['pane', 'selection', 'list', 'topos', 'follow', 'deck', 'navigate', 'operation', 'operation_status'].includes(kind)) {
             if (typeof node.key !== 'string' || !node.key) fail('missing-local-key');
             if (['navigate','operation','operation_status'].includes(kind) && owner === 'session') fail('host-control-requires-pane');
             const id = owner + '|' + identity([kind, node.key, context]);
@@ -61,9 +61,9 @@
             this.validateMember(spec.source, member);
           }
           const old = this.owners.get(spec.id);
-          if (old && identity([old.source.id, old.source.life, old.source.type]) !== identity([spec.source.id, spec.source.life, spec.source.type])) fail('incompatible-source-rebinding');
+          if (old && identity([old.source.id, old.source.life, old.source.type, old.source.topology || 'children', old.source.axis || 'z']) !== identity([spec.source.id, spec.source.life, spec.source.type, spec.source.topology || 'children', spec.source.axis || 'z'])) fail('incompatible-source-rebinding');
         }
-        if (['follow', 'list'].includes(spec.kind)) {
+        if (['follow', 'list', 'topos'].includes(spec.kind)) {
           const selection = [...spec.scopes].reverse().map(id => plan.get(id)).find(s => s.key === spec.selection);
           if (!selection) fail('unbound-selection-port');
           if (spec.source && (spec.source !== selection.source.id || spec.type !== selection.source.type)) fail('incompatible-selection-port');
@@ -73,7 +73,7 @@
       return plan;
     }
     validateMember(source, member) {
-      if (!member || member.source !== source.id || member.sourceLife !== source.life || member.type !== source.type || typeof member.key !== 'string' || !member.key || !member.subject || !member.life) fail('incompatible-member-reference');
+      if (!member || (member.axis || 'z') !== (source.axis || 'z') || member.source !== source.id || member.sourceLife !== source.life || member.type !== source.type || typeof member.key !== 'string' || !member.key || !member.subject || !member.life) fail('incompatible-member-reference');
     }
     async reconcile(descriptions) {
       const plan = this.plan(descriptions), order = ++this.reconcileOrder;
@@ -127,7 +127,7 @@
         }
         for (const state of this.owners.values()) {
           state.observers.clear();
-          if (['follow', 'list'].includes(state.kind)) state.selection = this.owners.get(state.spec.selectionId).ref;
+          if (['follow', 'list', 'topos'].includes(state.kind)) state.selection = this.owners.get(state.spec.selectionId).ref;
           if (state.kind === 'deck') this.reconcileDeck(state, plan);
         }
         for (const state of this.owners.values()) {
@@ -235,7 +235,9 @@
       return copy({accepted: state.accepted, revision: state.revision, pending: state.pending, diagnostic: state.diagnostic});
     }
     focus(ref, member) {
-      const state = this.get(ref, 'list'), selection = this.get(state.selection, 'selection');
+      const state = this.get(ref);
+      if (!['list','topos'].includes(state.kind)) fail('wrong-handle-kind');
+      const selection = this.get(state.selection, 'selection');
       this.validateMember(selection.source, member);
       state.focus = copy(member); this.emit('focus', {id: state.id});
     }

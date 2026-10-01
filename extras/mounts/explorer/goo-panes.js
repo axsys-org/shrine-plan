@@ -18,12 +18,11 @@
       this.session.subscribe(() => { this.paint(); });
       this.inspection.addEventListener('toggle', () => this.reflect());
     }
-    async source(path) {
-      const response = await fetch(`/goo/source?${new URLSearchParams({target: path})}`, {cache: 'no-store'});
+    async source(path, topology = '', axis = 'z') {
+      const response = await fetch(`/goo/source?${new URLSearchParams({target: path, topology, axis: axis || 'z'})}`, {cache: 'no-store'});
       if (!response.ok) throw new Error('Source unavailable');
       const value = await response.json();
-      if (!value.bounded) throw new Error('Finite source exceeds 64 physical members.');
-      if (value.life === '0') throw new Error('Source must be an installed namespace record.');
+      if (!value.bounded) throw new Error('Finite source exceeds 64 members.');
       return value;
     }
     async update(description, snapshot) {
@@ -31,16 +30,18 @@
         this.deferredUpdate = [description, snapshot]; return;
       }
       const sequence = ++this.serial, sources = new Map();
+      this.memberLoads = new Map();
       const prepare = async nodes => Promise.all(nodes.map(async node => {
         const out = {...node, children: await prepare(node.children || [])};
         if (node.kind === 'selection') {
-          if (!sources.has(node.source)) sources.set(node.source, this.source(node.source));
-          out.source = await sources.get(node.source);
+          const key = JSON.stringify([node.source,node.topology,node.axis]);
+          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis));
+          out.source = await sources.get(key);
           if (node.initial != null) {
             out.initial = out.source.members.find(m => m.key === node.initial) || {key: node.initial};
           }
         }
-        if (node.kind === 'list') out.type = 'namespace-record';
+        if (['list','topos'].includes(node.kind)) out.type = 'namespace-record';
         return out;
       }));
       const nodes = await prepare(description);
@@ -96,7 +97,7 @@
           if (!adopted && !state.hostBound) element.innerHTML = node.html;
           this.hostControl(state, element, node);
         }
-        else if (node.kind === 'list') this.list(state, element, node, scopes);
+        else if (['list','topos'].includes(node.kind)) this.list(state, element, node, scopes);
         else if (node.kind === 'follow') { /* Tracked render scheduled in paint. */ }
         else if (node.kind === 'deck') {
           if (!state.tabs) { state.tabs = el('div'); state.tabs.setAttribute('role', 'tablist'); element.prepend(state.tabs); }
@@ -177,60 +178,47 @@
       catch (error) { this.context.report(error.message); }
     }
     list(state, element, node, scopes) {
-      const selection = this.session.get(state.selection), source = selection.source;
-      if (!state.listBody) {
-        const clear = el('button', '', 'Clear selection'); clear.type = 'button'; clear.addEventListener('click', () => this.select(state, null));
-        state.listBody = element.querySelector('[data-goo-members]') || el('div'); state.listBody.setAttribute('role', 'listbox'); state.listBody.setAttribute('aria-label', node.key);
-        element.prepend(clear); if (!state.listBody.parentElement) element.append(state.listBody); state.rows = new Map();
-        state.serverRows = new Map([...state.listBody.children].map(row => [row.dataset.key,row]));
+      const source = this.session.get(state.selection, 'selection').source;
+      if (!state.topos) {
+        const clear=el('button','','Clear selection'); clear.type='button'; clear.addEventListener('click',()=>this.select(state,null));
+        state.rows=new Map(); state.serverRows=new Map([...element.querySelectorAll('[data-goo-members] > [data-key]')].map(row=>[row.dataset.key,row]));
+        element.replaceChildren(clear);
+        state.topos=new root.GooTopoi.Topos(element,node.key,member=>this.select(state,member),member=>this.session.focus(state.ref,member));
       }
-      const visible = source.members.filter(m => m.status === 'available'), keys = new Set(visible.map(m => m.key));
-      for (const [key,row] of state.serverRows || []) if (!keys.has(key)) { row.remove(); state.serverRows.delete(key); }
-      for (const [key, row] of state.rows) if (!keys.has(key)) { row.remove(); state.rows.delete(key); }
-      for (const member of visible) {
-        let row = state.rows.get(member.key);
-        if (!row || row.dataset.life !== member.life) {
-          row?.remove(); row = state.serverRows?.get(member.key) || el('div', 'goo-member', member.key); state.serverRows?.delete(member.key); row.dataset.life = member.life; row.dataset.key = member.key;
-          row.setAttribute('role', 'option'); row.tabIndex = state.focus?.key === member.key || !state.focus && member === visible[0] ? 0 : -1;
-          row.addEventListener('click', event => { if (!interactive(event)) this.select(state, member); });
-          row.addEventListener('focus', () => this.session.focus(state.ref, member));
-          row.addEventListener('keydown', event => {
-            if (interactive(event)) return;
-            if (event.key === 'Enter') { event.preventDefault(); this.select(state, member); }
-            if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
-              event.preventDefault(); const rows = [...state.listBody.children], at = rows.indexOf(row);
-              const next = event.key === 'Home' ? 0 : event.key === 'End' ? rows.length - 1 : (at + (event.key === 'ArrowUp' ? -1 : 1) + rows.length) % rows.length;
-              rows[next].focus();
-            }
+      const renderer=node.renderer||'list';
+      const members=renderer==='list'?source.members.filter(m=>m.status==='available'):source.members;
+      const keys=new Set(members.map(m=>m.key));
+      for(const [key,row] of state.rows) if(!keys.has(key)) { row.remove();state.rows.delete(key); }
+      state.topos.reconcile(renderer,members,member=> {
+        let row=state.rows.get(member.key);
+        if(!row || row.dataset.life!==member.life) {
+          row?.remove(); row=state.serverRows.get(member.key)||el('div','goo-member',member.key); state.serverRows.delete(member.key);
+          row.dataset.life=member.life; row.dataset.key=member.key; state.rows.set(member.key,row);
+          const browse=row.querySelector('[data-goo-navigation]');
+          if(browse) browse.addEventListener('click',async event=> {
+            if(event.metaKey||event.ctrlKey||event.shiftKey||event.altKey||!this.context.navigate) return;
+            event.preventDefault(); if(await this.close()) this.context.navigate(member.subject);
           });
-          const browse = row.querySelector('[data-goo-navigation]');
-          if (browse) browse.addEventListener('click', async event => {
-            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !this.context.navigate) return;
-            event.preventDefault();
-            if (await this.close()) this.context.navigate(member.subject);
-          });
-          state.rows.set(member.key, row);
-          // Bounded row summary fetch; individual namespace controls retain
-          // their explicit member receiver and normal admission checks.
         }
-        if (row.dataset.expected !== member.expected) {
-          row.dataset.expected = member.expected;
-          const expected = member.expected;
-          row.inert = true;
-          root.GooActions.load(member.subject).then(data => {
-            if (!state.live || !row.isConnected || row.dataset.expected !== expected || data.snapshot.life !== member.life) return;
-            const template = root.GooActions.choose(data.templates, node.slot);
-            if (template.querySelector('.goo-session')) throw new Error('Nested local-session member views are not supported.');
-            const navigation = row.querySelector('[data-goo-navigation]');
-            row.replaceChildren(template.cloneNode(true));
-            if (navigation) row.append(navigation);
-            root.GooActions.bind(row, this.actionContext(member.subject, template.dataset.view, data.snapshot, null, scopes));
-          }).catch(error => { if (state.live && row.dataset.expected === expected) row.textContent = `${member.key}: ${error.message}`; })
-            .finally(() => { if (row.dataset.expected === expected) row.inert = false; });
+        const expected=JSON.stringify([member.expected,node.slot,this.snapshot?.publication]);
+        if(member.status==='available' && row.dataset.expected!==expected) {
+          row.dataset.expected=expected;
+          row.inert=true;
+          const cacheKey=JSON.stringify([member.subject,member.life,member.expected,this.snapshot?.publication]);
+          this.memberLoads ||= new Map();
+          if(!this.memberLoads.has(cacheKey)) this.memberLoads.set(cacheKey,root.GooActions.load(member.subject));
+          this.memberLoads.get(cacheKey).then(data=> {
+            if(!state.live||!row.isConnected||row.dataset.expected!==expected||data.snapshot.life!==member.life) return;
+            const template=root.GooActions.choose(data.templates,node.slot);
+            if(template.querySelector('.goo-session')) throw new Error('Member presentations must be views.');
+            const navigation=row.querySelector('[data-goo-navigation]');
+            row.replaceChildren(template.cloneNode(true)); if(navigation) row.append(navigation);
+            root.GooActions.bind(row,this.actionContext(member.subject,template.dataset.view,data.snapshot,null,scopes));
+          }).catch(error=> { if(state.live&&row.dataset.expected===expected) row.textContent=`${member.key}: ${error.message}`; })
+            .finally(()=> { if(row.dataset.expected===expected) row.inert=false; });
         }
-        // Avoid detach/reappend of stable rows on ordinary reevaluation.
-        if (state.listBody.children[[...keys].indexOf(member.key)] !== row) state.listBody.append(row);
-      }
+        return row;
+      });
     }
     registerWork(state, element) {
       this.session.guard(state.ref, async reason => {
@@ -308,12 +296,8 @@
           const active = tab.dataset.pane === state.active; tab.setAttribute('aria-selected', String(active)); tab.tabIndex = active ? 0 : -1;
           if (!state.active) element.dataset.empty = 'true';
         }
-        if (state.kind === 'list' && state.rows) {
-          const choice = session.read(state.selection).accepted;
-          for (const [key, row] of state.rows) {
-            row.setAttribute('aria-selected', String(choice?.key === key && choice.life === row.dataset.life));
-            if (state.focus) row.tabIndex = state.focus.key === key ? 0 : -1;
-          }
+        if (['list','topos'].includes(state.kind) && state.topos) {
+          state.topos.paint(session.read(state.selection).accepted,state.focus);
         }
         if (state.kind === 'follow' && !state.suspended) this.follow(state, element);
       }
@@ -336,7 +320,7 @@
       try {
         const data = await root.GooActions.load(member.subject);
         if (!this.session.current(ticket) || state.suspended) return;
-        if (data.snapshot.life !== member.life || data.snapshot.target !== member.subject) throw new Error('Selected subject was removed or replaced.');
+        if (data.snapshot.life !== member.life || (data.snapshot.subject || data.snapshot.target) !== member.subject) throw new Error('Selected subject was removed or replaced.');
         const template = root.GooActions.choose(data.templates, state.encounter.recipe);
         if (template.querySelector('.goo-session')) throw new Error('Nested local-session member views are not supported.');
         // Never detach an active composition to apply asynchronous rendering.
