@@ -2,9 +2,8 @@ import urllib.request
 
 def check(url, node, timeout):
     for path, expected in [('/goo-inspector', 'Goo inspector'),
-                           ('/goo-inspector/config.js', '/' + node),
-                           ('/goo-inspector/app.js', 'new GooPanes'),
-                           ('/goo-inspector/model.js', 'inspector_summary')]:
+                           ('/static/goo-workspace.js', 'class GooWorkspace'),
+                           ('/goo-inspector?path=/' + node + '/app/debug', 'data-goo-node')]:
         with urllib.request.urlopen(url + path, timeout=timeout) as response:
             assert expected in response.read().decode()
     request = urllib.request.Request(url + '/goo-inspector', data=b'', method='POST')

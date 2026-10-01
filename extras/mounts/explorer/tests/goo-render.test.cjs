@@ -128,3 +128,14 @@ test('S20/S21: actual deck renderer retains keyed tab controls through reevaluat
  await render(tabs([b,a])); assert.equal(deck.tabs.children[0],second); assert.equal(deck.tabs.children[1],first);
  assert.equal(deck.active,state(c.session,'pane').id);
 });
+test('server pane and native content are adopted without replacing their DOM', async()=>{
+ const {controller:c}=await setup();
+ const pane=new Element(), native=new Element(), input=new Element('input'); native.append(input);
+ c.body.append(pane); pane.append(native);
+ c.serverNodes=new Map([['0',pane],['0.0',native]]); c.snapshot={target:'/study'};
+ const nodes=[{kind:'pane',key:'server',children:[{kind:'native',html:'server HTML',controls:[]}]}];
+ await c.session.reconcile(nodes); c.usedWrappers=new Set(); c.layout(nodes,c.body,'session',[]);
+ assert.equal(c.body.children[0],pane); assert.equal(pane.children[0],native);
+ assert.equal(native.children[0],input); assert.equal(native.innerHTML,undefined);
+ assert.equal(c.serverNodes.size,0);
+});

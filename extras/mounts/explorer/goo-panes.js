@@ -12,7 +12,9 @@
       this.inspection = el('details', 'goo-runtime-inspection');
       this.inspection.append(el('summary', '', 'Inspect local runtime')); this.output = el('pre'); this.inspection.append(this.output);
       this.status = el('p', 'goo-local-status'); this.status.setAttribute('role', 'status');
-      this.body = el('div'); host.replaceChildren(this.status, this.body, this.inspection);
+      this.body = host.querySelector('[data-goo-body]') || el('div');
+      this.serverNodes = new Map([...this.body.querySelectorAll('[data-goo-node]')].map(n => [n.dataset.gooNode,n]));
+      host.replaceChildren(this.status, this.body, this.inspection);
       this.session.subscribe(() => { this.paint(); });
       this.inspection.addEventListener('toggle', () => this.reflect());
     }
@@ -55,15 +57,19 @@
       this.paint();
     }
     state(owner, kind, key) { return this.session.owners.get(id(owner, kind, key)); }
-    layout(nodes, parent, owner, scopes) {
+    layout(nodes, parent, owner, scopes, route = []) {
       const desired = [];
-      for (const node of nodes) {
+      for (const [ordinal, node] of nodes.entries()) {
+        const here = [...route,ordinal], serverKey = here.join('.');
+        const server = this.serverNodes.get(serverKey);
+        this.serverNodes.delete(serverKey);
+        let adopted = false;
         let element, children = node.children || [], nextOwner = owner, nextScopes = scopes;
         const state = this.state(owner, node.kind, node.key);
         if (state) {
           element = this.elements.get(state.id);
           if (!element) {
-            element = el('div', `goo-${node.kind}`); this.elements.set(state.id, element); element.dataset.owner = state.id;
+            element = server || el('div', `goo-${node.kind}`); adopted = !!server; this.elements.set(state.id, element); element.dataset.owner = state.id;
             if (node.kind === 'follow') this.registerWork(state, element);
           }
         } else {
@@ -73,8 +79,9 @@
           const wrapperKey = JSON.stringify([owner,node.kind,node.key,scopes.map(s=>s.id),descendants([node]),node.kind === 'native' ? [node.html,node.controls] : null]);
           this.usedWrappers.add(wrapperKey);
           element = this.wrappers.get(wrapperKey);
-          if (!element) { element = el('div', `goo-${node.kind}`); this.wrappers.set(wrapperKey,element); }
+          if (!element) { element = server || el('div', `goo-${node.kind}`); adopted = !!server; this.wrappers.set(wrapperKey,element); }
         }
+        if (adopted) element.removeAttribute('data-goo-node');
         if (node.kind === 'pane') { nextOwner = state.id; element.setAttribute('aria-label', node.key); }
         if (node.kind === 'selection') {
           nextScopes = [...scopes, state];
@@ -83,15 +90,19 @@
         if (node.kind === 'native') {
           if (element.dataset.boundSnapshot === JSON.stringify(this.snapshot)) { desired.push(element); continue; }
           element.dataset.boundSnapshot = JSON.stringify(this.snapshot);
-          element.innerHTML = node.html;
+          if (!adopted) element.innerHTML = node.html;
           root.GooActions.bind(element, this.actionContext(this.context.target, this.context.view, this.snapshot, node.controls, scopes));
-        } else if (node.kind === 'list') this.list(state, element, node, scopes);
+        } else if (['navigate','operation','operation_status'].includes(node.kind)) {
+          if (!adopted && !state.hostBound) element.innerHTML = node.html;
+          this.hostControl(state, element, node);
+        }
+        else if (node.kind === 'list') this.list(state, element, node, scopes);
         else if (node.kind === 'follow') { /* Tracked render scheduled in paint. */ }
         else if (node.kind === 'deck') {
           if (!state.tabs) { state.tabs = el('div'); state.tabs.setAttribute('role', 'tablist'); element.prepend(state.tabs); }
           if (!state.empty) { state.empty = el('p', 'goo-local-status', 'No panes in this deck.'); element.append(state.empty); }
           state.empty.hidden = !!state.active;
-          this.layout(children, element, owner, scopes);
+          this.layout(children, element, owner, scopes, here);
           state.tabButtons ||= new Map();
           const paneStates = state.children.map(key => this.session.owners.get(key));
           for (const [key, button] of state.tabButtons) if (!state.children.includes(key)) { button.remove(); state.tabButtons.delete(key); }
@@ -111,7 +122,7 @@
             const at = paneStates.indexOf(pane);
             if (state.tabs.children[at] !== button) state.tabs.insertBefore(button, state.tabs.children[at] || null);
           }
-        } else this.layout(children, element, nextOwner, nextScopes);
+        } else this.layout(children, element, nextOwner, nextScopes, here);
         desired.push(element);
       }
       // Keyed elements are moved only when order changes, preserving native
@@ -126,6 +137,41 @@
         before = element.nextElementSibling;
       }
     }
+    hostControl(state, element, node) {
+      if (state.hostBound) return;
+      state.hostBound = true;
+      if (node.kind === 'navigate') {
+        const form = element.querySelector('form'), link = element.querySelector('a');
+        const navigate = async event => {
+          if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          const path = form ? form.querySelector('input').value : new URL(link.href, location.href).searchParams.get('path');
+          if (!path?.startsWith('/')) { this.context.report('Enter an absolute namespace path.'); return; }
+          if (!this.context.navigate) { this.context.report('Workspace navigation is unavailable.'); return; }
+          if (await this.close()) this.context.navigate(path);
+        };
+        (form || link)?.addEventListener(form ? 'submit' : 'click', navigate);
+        return;
+      }
+      const operations = this.context.operations;
+      if (!operations) { element.textContent = 'Workspace operations are unavailable.'; return; }
+      const button = element.querySelector('button'), details = element.querySelector('details');
+      const paint = () => {
+        const status = operations.state(node.operation);
+        if (button) { button.disabled = status.phase === 'pending'; button.setAttribute('aria-busy', String(button.disabled)); }
+        if (details) { details.hidden = status.phase === 'idle'; details.open = status.phase === 'error' || status.phase === 'pending'; details.dataset.phase = status.phase; details.querySelector('pre').textContent = status.message; }
+      };
+      const unsubscribe = operations.subscribe(paint);
+      this.session.resource(state.ref, {release:unsubscribe});
+      if (button) button.addEventListener('click', async () => {
+        if (operations.state(node.operation).phase === 'pending') return;
+        // Reload will discard local buffers; use the same departure guards.
+        for (const owner of this.session.owners.values()) if (!(await this.session.depart(owner, {kind:'host-operation'}))) return;
+        if (!state.live) return;
+        try { await operations.run(node.operation); } catch (error) { this.context.report(error.message); }
+      });
+      paint();
+    }
     async select(state, member) {
       try { await this.session.deliver(this.session.intent(state.selection || state.ref, member)); }
       catch (error) { this.context.report(error.message); }
@@ -134,15 +180,17 @@
       const selection = this.session.get(state.selection), source = selection.source;
       if (!state.listBody) {
         const clear = el('button', '', 'Clear selection'); clear.type = 'button'; clear.addEventListener('click', () => this.select(state, null));
-        state.listBody = el('div'); state.listBody.setAttribute('role', 'listbox'); state.listBody.setAttribute('aria-label', node.key);
-        element.append(clear, state.listBody); state.rows = new Map();
+        state.listBody = element.querySelector('[data-goo-members]') || el('div'); state.listBody.setAttribute('role', 'listbox'); state.listBody.setAttribute('aria-label', node.key);
+        element.prepend(clear); if (!state.listBody.parentElement) element.append(state.listBody); state.rows = new Map();
+        state.serverRows = new Map([...state.listBody.children].map(row => [row.dataset.key,row]));
       }
       const visible = source.members.filter(m => m.status === 'available'), keys = new Set(visible.map(m => m.key));
+      for (const [key,row] of state.serverRows || []) if (!keys.has(key)) { row.remove(); state.serverRows.delete(key); }
       for (const [key, row] of state.rows) if (!keys.has(key)) { row.remove(); state.rows.delete(key); }
       for (const member of visible) {
         let row = state.rows.get(member.key);
         if (!row || row.dataset.life !== member.life) {
-          row?.remove(); row = el('div', 'goo-member', member.key); row.dataset.life = member.life; row.dataset.key = member.key;
+          row?.remove(); row = state.serverRows?.get(member.key) || el('div', 'goo-member', member.key); state.serverRows?.delete(member.key); row.dataset.life = member.life; row.dataset.key = member.key;
           row.setAttribute('role', 'option'); row.tabIndex = state.focus?.key === member.key || !state.focus && member === visible[0] ? 0 : -1;
           row.addEventListener('click', event => { if (!interactive(event)) this.select(state, member); });
           row.addEventListener('focus', () => this.session.focus(state.ref, member));
@@ -154,6 +202,12 @@
               const next = event.key === 'Home' ? 0 : event.key === 'End' ? rows.length - 1 : (at + (event.key === 'ArrowUp' ? -1 : 1) + rows.length) % rows.length;
               rows[next].focus();
             }
+          });
+          const browse = row.querySelector('[data-goo-navigation]');
+          if (browse) browse.addEventListener('click', async event => {
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !this.context.navigate) return;
+            event.preventDefault();
+            if (await this.close()) this.context.navigate(member.subject);
           });
           state.rows.set(member.key, row);
           // Bounded row summary fetch; individual namespace controls retain
@@ -167,7 +221,9 @@
             if (!state.live || !row.isConnected || row.dataset.expected !== expected || data.snapshot.life !== member.life) return;
             const template = root.GooActions.choose(data.templates, node.slot);
             if (template.querySelector('.goo-session')) throw new Error('Nested local-session member views are not supported.');
+            const navigation = row.querySelector('[data-goo-navigation]');
             row.replaceChildren(template.cloneNode(true));
+            if (navigation) row.append(navigation);
             root.GooActions.bind(row, this.actionContext(member.subject, template.dataset.view, data.snapshot, null, scopes));
           }).catch(error => { if (state.live && row.dataset.expected === expected) row.textContent = `${member.key}: ${error.message}`; })
             .finally(() => { if (row.dataset.expected === expected) row.inert = false; });

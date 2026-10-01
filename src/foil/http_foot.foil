@@ -10,6 +10,7 @@
       http_foot/action/develop
       http_foot/action/reply
       http_foot/action/bytes
+      http_foot/action/asset
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
@@ -23,6 +24,8 @@
       : query=grove_dev/request
     + reply
       : response=http_response
+    + asset
+      : home=path name=str mime=nat
     + bytes
       : status=nat body=nat ctype=nat
     + install
@@ -48,6 +51,7 @@
       feet/task/value
       feet/task/physical
       feet/task/inspect
+      feet/task/asset
       feet/task/ack
       feet/task/develop
       http_foot/action/interact
@@ -59,6 +63,9 @@
       http_foot/action/value
       http_foot/action/physical
       http_foot/action/inspect
+      http_foot/action/asset
+  + answer
+    & http_response http_foot/action/bytes
   + pending
     ' Text r<serial> keys belong to ordinary HTTP namespace records.
     ' Numeric serial keys correlate read-only supervisor requests.
@@ -302,8 +309,10 @@
              > (./reply ready) (http_foot/encode ready)
              > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
             ; (SendCaps foot action [0])
-            = ;[answer extra] (Recv[http_response] 0)
-            | http_foot/encode answer
+            = ;[answer extra] (Recv[http_foot/answer] 0)
+            ? answer
+             > response=http_response (http_foot/encode response)
+             > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     ; (Try (\ wire=nat (Write fd wire)) encoded)
     ; (CloseFd fd)
     | CloseHandle foot
@@ -400,6 +409,27 @@
     % serial=nat 0 pending=row[http_foot/pending] [] queue=row[http_foot/ack] []
     = ;[message caps] (Recv[http_foot/task] 0)
     ? message
+     > (http_foot/action/asset home name mime)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/asset serial home name mime))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/asset request mime bytes)
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (? bytes
+              > (./some body)
+                ; (Send item.conn (http_foot/action/bytes 200 body mime))
+                | CloseHandle item.conn
+              > .none (http_foot/reply item.conn (http_driver/response 404 "Asset not published")))
+          out
+      | _ serial left queue
      > (http_foot/action/interact query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
@@ -642,3 +672,33 @@
     ^ http_foot/config
     ; (error (http_foot/fault "Duplicate HTTP route"))
     config
+
+  + live_plan
+    \ home=path bindings=row[[str str]]
+      plan={\ http_foot/request nat}http_foot/action
+      request=http_foot/request now=nat
+    ^ http_foot/action
+    = original (plan request now)
+    ? !(equal request.method "GET") original
+    = mime=maybe[nat]
+        ? original
+         > (./bytes status body mime) (? (eq status 200) (./some mime) .none)
+         > (./reply response) (? (eq response.status 200) (./some response.ctype) .none)
+        .none
+    ?> (./some mime) mime original
+    = url (http_foot/split 63 request.target).at(0)
+    % idx=nat 0
+    ^ http_foot/action
+    ? (eq idx bindings.len) original
+    = [route name] bindings.at(idx)
+    ? (equal route url) (./asset home name mime)
+    | _ idx.inc
+  + live_assets
+    ' Only manifest-declared asset URLs use the published mount bundle.
+    \ home=path manifest=str config=http_foot/config
+    ^ http_foot/config
+    = bindings (mount_assets/bindings manifest)
+    | config.set_routes
+      | config.routes.map
+        \ route=http_foot/route
+        | route.set_plan (http_foot/live_plan home bindings route.plan)

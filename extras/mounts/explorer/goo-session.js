@@ -35,8 +35,9 @@
         for (const node of nodes) {
           const kind = node.kind;
           let parent = owner, nested = scopes;
-          if (['pane', 'selection', 'list', 'follow', 'deck'].includes(kind)) {
+          if (['pane', 'selection', 'list', 'follow', 'deck', 'navigate', 'operation', 'operation_status'].includes(kind)) {
             if (typeof node.key !== 'string' || !node.key) fail('missing-local-key');
+            if (['navigate','operation','operation_status'].includes(kind) && owner === 'session') fail('host-control-requires-pane');
             const id = owner + '|' + identity([kind, node.key, context]);
             if (plan.has(id)) fail('duplicate-local-key');
             const spec = {...node, id, owner, context, scopes};

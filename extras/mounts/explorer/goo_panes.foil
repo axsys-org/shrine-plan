@@ -1,4 +1,8 @@
 - goo_bridge
+- weft
+- grove_dev
+- value_read
+- http_foot
 
 ' Read-only retained session descriptions. Native subject content still uses
 ' Goo's normal typed source -> layout -> HTML backend. No owners are created here.
@@ -6,7 +10,7 @@
   + local
     \ kind=str
     ^ bool
-    = kinds=row[str] ["pane" "selection" "list" "follow" "split" "deck" "pane_stack"]
+    = kinds=row[str] ["pane" "selection" "list" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"]
     | kinds.has(kind)
   + contains
     \ node=goo/node
@@ -107,12 +111,20 @@
          (jkv "key" (json/str key))
          (jkv "source" (json/str (goo_panes/property "source" node)))
          (jkv "selection" (json/str (goo_panes/property "selection" node)))
+         (jkv "label" (json/str (goo_panes/property "label" node)))
+         (jkv "mode" (json/str (goo_panes/property "mode" node)))
+         (jkv "browse" (json/str (goo_panes/property "browse" node)))
+         (jkv "operation" (json/str (goo_panes/property "operation" node)))
          (jkv "slot" (json/str (? slot.len slot "/sys/slot/content")))
          (jkv "initial" (initial.run((\ path (json/str (path_show path)))).fall(jnull)))
          (jkv "children" (json/arr children))]
     ? (and (maybe/is_some seed) (maybe/is_none initial))
       | ./err "initial requires .member(path), naming a source membership rather than a subject or ordinal."
-    | ./ok (json/obj properties)
+    = value (json/obj properties)
+    ? ((eq node.constructor "navigate") || (eq node.constructor "operation") || (eq node.constructor "operation_status"))
+      | ./ok (json/obj properties.snoc((jkv "html" (json/str (str/from_atom
+          (weft/render (weft/el "div" [] (goo_panes/host_control value))))))))
+    | ./ok value
   + nodes
     \ published=goo/published card=myth route=row[nat] nodes=list[goo/node]
     ^ either[str row[json]]
@@ -124,5 +136,57 @@
   + description
     \ published=goo/published card=myth view=goo/view
     ^ either[str str]
-    < nodes (goo_panes/nodes published card [] view.children)
+    < bound (goo_runtime/bind_sources published card view.children)
+    < nodes (goo_panes/nodes published card [] bound)
     | ./ok (show (json/arr nodes))
+
+  + navigation_url
+    \ target=str
+    ^ nat
+    | str/to_atom (str/cat_all ["?path=" (value_read/percent target)])
+  + host_control
+    \ node=json
+    ^ row[weft/node]
+    = kind (grove_dev/text (grove_dev/field "kind" node))
+      label (str/to_atom (grove_dev/text (grove_dev/field "label" node)))
+      source (grove_dev/text (grove_dev/field "source" node))
+      mode (grove_dev/text (grove_dev/field "mode" node))
+    ? (eq kind "navigate")
+      ? (eq mode "input")
+        [(weft/el "form" [(weft/att "method" "get")]
+          [(weft/el "input" [(weft/att "name" "path") (weft/att "aria-label" label)
+             (weft/att "value" (str/to_atom source))] [])
+           (weft/leaf "button" [(weft/att "type" "submit")] label)])]
+      = path (http_foot/target source)
+        target=str (? (eq mode "parent") (path_show path.take(path.len.dec)) source)
+      [(weft/leaf "a" [(weft/href (goo_panes/navigation_url target))] label)]
+    ? (eq kind "operation")
+      [(weft/leaf "button" [(weft/att "type" "button")] label)]
+    [(weft/el "details" [(weft/att "hidden" "hidden") (weft/att "role" "status")]
+      [(weft/leaf "summary" [] label) (weft/leaf "pre" [] "")])]
+  + markup
+    ' Emit the same wrappers that the browser adopts, before creating owners.
+    \ nodes=row[json] route=row[nat] members={\ json}row[weft/node]
+    ^ row[weft/node]
+    % idx=nat 0 out=row[weft/node] []
+    ^ row[weft/node]
+    ? (eq idx nodes.len) out
+    = node nodes.at(idx)
+      here route.snoc(idx)
+      kind (grove_dev/text (grove_dev/field "kind" node))
+      key (grove_dev/text (grove_dev/field "key" node))
+      attrs=row[weft/att]
+        [(weft/cls (str/to_atom (str/cat_all ["goo-" kind])))
+         (weft/att "data-goo-node" (str/to_atom (str/join "." here.map(nat/show))))]
+      attrs (? (eq kind "pane") attrs.snoc((weft/att "aria-label" (str/to_atom key))) attrs)
+      children=row[weft/node]
+        ? (eq kind "native") [(weft/raw (str/to_atom (grove_dev/text (grove_dev/field "html" node))))]
+        ? (eq kind "list") (members node)
+        ? ((eq kind "navigate") || (eq kind "operation") || (eq kind "operation_status")) (goo_panes/host_control node)
+        | goo_panes/markup (grove_dev/items (grove_dev/field "children" node)) here members
+    | _ idx.inc out.snoc((weft/el "div" attrs children))
+  + server_body
+    \ description=str members={\ json}row[weft/node]
+    ^ row[weft/node]
+    ?> (jres/ok value rest) (parse description) []
+    | goo_panes/markup (grove_dev/items value) [] members

@@ -9,7 +9,7 @@ normalize action arguments, sample providers, or write domain receipts.
 
 - `src/foil/grove_views.foil`: validates keyed local constructors and retains
   them alongside ordinary lowered `show` and expanded `present` nodes.
-- `goo_panes.foil`: read-only description serialization. Native fragments still
+- `goo_panes.foil`: read-only description serialization and initial server HTML. Native fragments still
   pass through `goo_bridge` and Goo v2 normalization, layout and HTML.
 - `goo-session.js`: private typed handles, reconciliation, source/member
   validation, tracked selection reads, encounters, guard ordering, capture and
@@ -203,3 +203,79 @@ must additionally exercise the actual row/button/input/deck DOM; isolated owner
 tests alone are not evidence of rendered integration.
 
 See [verification and rehearsal](PANES-VERIFICATION.md) for observed results and coverage boundaries.
+
+## Server rendering and path-valued sources
+
+`selection` and `list` also accept a direct path-typed receiver field, for example
+`source = inspector.source_path`. The compiler checks the field type. Rendering
+binds its value from the receiver; missing values produce a diagnostic. Action
+capture validation resolves the source again from the current receiver, so a
+browser cannot substitute a different source. Changing a source requires a new
+workspace; incompatible rebinding of an existing owner remains rejected.
+
+`goo_panes/server_body` emits native fragments and pane wrappers with temporary
+hydration addresses. Its read-only callback supplies initial list members from
+the caller's captured observation. The browser adopts those wrappers and native
+content rather than replacing them. It validates live membership before enabling
+list interaction and continues to fetch subject presentations through the shared
+server renderer. Initial deck activation and local ownership remain browser
+responsibilities. This does not add query-backed or paginated sources.
+
+### Hosting a workspace
+
+`goo_workspace` hosts a server-rendered workspace independently of the inspector.
+A mount constructs a `goo_workspace/endpoint` with:
+
+- `declaration`: the absolute published workspace declaration path;
+- `source_slot`: the path-typed slot used to construct its transient receiver;
+- `initial`: the subject path when the request has no `path` query parameter;
+- `validate(selected)`: optional source-policy diagnostic;
+- `operations`: pairs of local capability key and mount source path for rescan;
+- `document(target, content)`: the surrounding HTML document.
+
+Delegate the mount's workspace route to `goo_workspace/request endpoint request
+now`. Activate it with `goo_workspace/install endpoint fallback state`, passing
+the previous HTTP talk handler as `fallback` (normally `goo_browser/talk`).
+Endpoints dispatch by declaration, so hosts can chain handlers for different
+workspace declarations. The configuration is fixed by the mount: URL parameters
+select the subject, not the declaration or receiver slot.
+
+The host captures the subject subtree and the local cached view catalog, checks
+the configured declaration and receiver contract, binds source fields, and emits
+the shared pane markup. `document` receives either the server-rendered workspace container
+or a diagnostic. Load the shared Goo scripts and attach `GooPanes` to `#workspace`
+using its `data-target` and `data-description`. Source limits and document chrome
+remain host policy; the generic endpoint imposes no inspector-specific 64-child
+limit. Child summaries are rendered by the shared host from the list's source and slot. Only record-bearing children are advertised; `browse` adds ordinary workspace navigation for each member.
+
+
+### Workspace navigation and operations
+
+These controls belong inside a pane. They do not invoke domain actions or create
+nested workspaces inside content views:
+
+```text
+navigate('/address, source = inspector.source_path, mode = "input", label = "Inspect path")
+navigate('/parent, source = inspector.source_path, mode = "parent", label = "Parent")
+operation('/reload, operation = '/mount_reload, label = "Reload mount assets")
+operation_status('/publication, operation = '/mount_reload, label = "Mount publication")
+```
+
+`navigate` accepts a path-typed receiver field or literal path. `mode = "input"`
+emits a GET form; `"parent"` links to its parent; the default links to the source.
+Navigation preserves the workspace URL and changes its `path` query parameter.
+`list(..., browse = "Browse children")` adds a link for each member without
+changing selection. Ordinary clicks use the session's departure guards; links
+also support normal browser new-tab behavior.
+
+`operation` names a host-configured capability, not a URL. The first host binding
+is mount rescan/publication: `operations = [[key source]]`. The shared
+`goo-workspace.js` adapter polls the requested scan, disables duplicates, and
+reloads only after successful publication. `operation_status` observes the same
+capability and presents pending, success, or expandable failure details. Reload
+checks local departure guards, never resets installed instances, and preserves
+the current page when publication fails. Labels and control placement are Goo
+source; transport and operation state are shared host code.
+
+Load `/static/goo-workspace.js` after the shared session, pane, and action scripts.
+It attaches controllers to server-rendered workspace containers automatically.
