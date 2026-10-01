@@ -1,5 +1,8 @@
 # Grove → Goo v2
 
+For the current language reference, see [Goo reference](../../../src/grove/GOO.md).
+This file records the integration history; early limitations below may have been superseded.
+
 The namespace browser uses `lf/goo-v2`'s typed IR and renderer. Grove publication
 still stores a symbolic expression template: `show` is resolved by field type,
 and `present` receives the selected view's children. When an object is selected,

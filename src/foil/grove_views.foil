@@ -16,6 +16,19 @@
     ? stmt
      > (grove/tag span kind) (equal kind (grove/tag_kind/view))
     .false
+  + is_pane
+    \ body=list[grove/statement]
+    ^ bool
+    | body.any
+    \ stmt
+    ? stmt
+     > (grove/tag span kind) (equal kind (grove/tag_kind/pane))
+    .false
+  + is_goo
+    \ body=list[grove/statement]
+    ^ bool
+    ? (grove_views/is_view body) .true
+    | grove_views/is_pane body
   + reference
     \ root=path doc=grove/document lookup={\ path}maybe[myth] tree=rex
     ^ either[grove/error path]
@@ -39,7 +52,7 @@
       | goo/fail[goo/view] span "View requires one #for slot."
     > (./some code) code
       | goo/fail[goo/view] span "View requires a Goo body."
-    | ./ok (goo/view span root.snoc(($ts name)) role slot code.binding code.children)
+    | ./ok (goo/view span root.snoc(($ts name)) role slot code.binding code.children .false)
   + is_presentation
     \ stmt=grove/statement
     ^ bool
@@ -50,15 +63,18 @@
     \ root=path doc=grove/document lookup={\ path}maybe[myth]
       span=rex/source_span name=str body=list[grove/statement]
     ^ either[grove/error goo/view]
+    ? (and (grove_views/is_view body) (grove_views/is_pane body))
+      | goo/fail[goo/view] span "A declaration cannot be both @view and @pane."
     % rest=list[grove/statement] body role=maybe[path] .none
       slot=maybe[path] .none code=maybe[goo/body] .none
     ^ either[grove/error goo/view]
     ? (eq rest.len 0)
-      | grove_views/finish root span name role slot code
+      < view (grove_views/finish root span name role slot code)
+      | ./ok view.set_is_pane((grove_views/is_pane body))
     ? rest.at(0)
      > (grove/comment at text) (_ rest.drop(1) role slot code)
      > (grove/tag at kind)
-      ? (equal kind (grove/tag_kind/view)) (_ rest.drop(1) role slot code)
+      ? ((equal kind (grove/tag_kind/view)) || (equal kind (grove/tag_kind/pane))) (_ rest.drop(1) role slot code)
       | goo/fail[goo/view] at "Incompatible view tag."
      > (grove/block at kind kids)
       ? (equal kind (grove/block_kind/meta)) (_ rest.drop(1) role slot code)
@@ -88,9 +104,9 @@
     ? (eq items.len 0) (./ok out.reverse)
     > (grove/declaration span name body) items.at(0)
       | _ items.drop(1) out
-    ? !(grove_views/is_view body)
+    ? !(grove_views/is_goo body)
       ? body.any(grove_views/is_presentation)
-        | goo/fail[list[goo/view]] span "Goo bodies require @view."
+        | goo/fail[list[goo/view]] span "Goo bodies require @view or @pane."
       | _ items.drop(1) out
     > (grove/name/identifier name) name
       | goo/fail[list[goo/view]] span "Views require declaration names."
@@ -209,7 +225,7 @@
     \ context=grove_views/context role=path slot=path span=rex/source_span
     ^ either[grove/error goo/view]
     = matches
-        | context.views.keep (\ view (and (equal view.role role) (equal view.slot slot)))
+        | context.views.keep (\ view (and !(view.is_pane) (and (equal view.role role) (equal view.slot slot))))
     ? (eq matches.len 0)
       | goo/fail[goo/view] span "Missing view for role and slot; reflection fallback is not implemented."
     ? !(eq matches.len 1)
@@ -289,6 +305,35 @@
     ?> (./some role) (grove_views/local_named "role" node) (goo/fail[unit] node.span "make requires a role.")
     < path (grove_views/reference context.root context.document context.lookup role)
     | ./ok []
+  + capture_head
+    \ expression=rex
+    ^ bool
+    ? expression
+     > (./leaf _ _ text)
+      | and (eq text "capture") (equal expression.leaf_kind (maybe/some[str] "word"))
+     > (./juxt _ kids)
+      ? (eq kids.len 0) .false
+      | grove_views/capture_head kids.at(0)
+    .false
+  + captures
+    \ expression=rex
+    ^ bool
+    = own=bool
+        ?> (./nest _ _ rune kids) expression .false
+        ? !(and (eq rune ".") (eq kids.len 1)) .false
+        | grove_views/capture_head kids.at(0)
+    ? own .true
+    | expression.children.any(grove_views/captures)
+  + scope_validate
+    \ view=goo/view node=goo/node
+    ^ either[grove/error unit]
+    ? view.is_pane (./ok [])
+    = exclusive=row[str] ["pane" "selection" "list" "follow" "split" "deck" "pane_stack" "navigate" "operation" "operation_status"]
+    ? (exclusive.has(node.constructor))
+      | goo/fail[unit] node.span "Pane controls require @pane; @view is an object projection."
+    ? (node.arguments.any(grove_views/captures))
+      | goo/fail[unit] node.span "Selection capture requires @pane."
+    | ./ok []
   + lower_nodes
     \ context=grove_views/context stack=list[path] view=goo/view nodes=list[goo/node]
     ^ either[grove/error list[goo/node]]
@@ -299,6 +344,7 @@
   + lower_node
     \ context=grove_views/context stack=list[path] view=goo/view node=goo/node
     ^ either[grove/error goo/node]
+    < scope (grove_views/scope_validate view node)
     ? ((eq node.constructor "show") || (eq node.constructor "present"))
       ? !(and (eq node.arguments.len 2) (eq node.children.len 0))
         | goo/fail[goo/node] node.span "show/present require a value and slot, with no explicit children."

@@ -20,7 +20,7 @@
     throw new Error('Object changed during rendering; refresh to retry.');
   }
   const choose = (templates, slot, role) => {
-    const choices = templates.filter(n => n.dataset.slot === slot && (!role || n.dataset.role === role));
+    const choices = templates.filter(n => n.dataset.declarationKind !== 'pane' && n.dataset.slot === slot && (!role || n.dataset.role === role));
     if (choices.length !== 1) throw new Error(choices.length ? 'Competing views for this slot.' : 'No view for this slot.');
     return choices[0];
   };
@@ -108,7 +108,7 @@
           }
           frame.data = data;
           const install = (slot) => {
-            const next = choose(data.templates, slot, template.dataset.role).cloneNode(true);
+            const next = (slot === template.dataset.slot ? template : choose(data.templates, slot, template.dataset.role)).cloneNode(true);
             // Native inputs keep page-owned working values across rerenders.
             if (frame.element.querySelector('input:focus') || frame.composing) { frame.next = slot; return; }
             frame.element.replaceWith(next); frame.element = next; frame.recipe = slot;

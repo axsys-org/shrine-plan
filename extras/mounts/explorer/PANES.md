@@ -1,5 +1,11 @@
 # Goo panes and local selection
 
+For the complete constructor and syntax reference, see [Goo reference](../../../src/grove/GOO.md).
+
+`@pane` declarations opt into local workspace features; `@view` declarations
+retain projection, object-local actions, and `become`. Selection capture requires
+`@pane`; changing an object's presentation recipe does not.
+
 The explorer owns a private, page-local semantic session. A selection changes
 presentation context; an action captures that context and uses the existing
 namespace action adapter. Selection and deck gestures do not call `/goo/act`,
@@ -30,7 +36,7 @@ subject data.
 
 ```grove
 workspace =
-  @view
+  @pane
   #on ; %/study
   #for ; /sys/slot/workspace
   study => pane('/workspace) {
