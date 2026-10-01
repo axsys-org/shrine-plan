@@ -43,3 +43,26 @@ Those frontend errors stay visible independently of other views.
 result, codec, semantic, ASCII, layout, and HTML checks. The standalone package's
 Haskell differential-oracle scripts referenced by its README are not present at
 those paths in this merged repository; these checks do not claim oracle parity.
+
+## Synthetic object view
+
+Every selected object also has a read-only `/sys/slot/synthetic` presentation,
+alongside its matching authored views. `goo_reflection.foil` turns slots into
+labeled Goo source nodes. Scalar pails retain their normal text, path, boolean,
+and temporal formatting; published record descriptors provide field labels and
+nested types, including tuples and arrays. The existing catalog overlay caches
+these descriptors from `/gov`, indexed by exact versioned nominal brand.
+Publication changes invalidate that cache with the authored view catalog.
+Unknown nominal brands remain opaque; functions are never invoked.
+
+Inspection is bounded to 64 slots, 24 fields/items per collection, five levels,
+and a shared expansion budget. Individual text previews stop at 512 bytes.
+Truncation is marked, with the Objects inspector available for further detail.
+Synthetic text escapes non-ASCII/control bytes as `\xNN` for the current ASCII
+measurer, while preserving the stored value. This does not change authored-view
+rendering or add a fallback to `present` resolution.
+
+## Local panes and selection
+
+See [Goo panes](PANES.md) for keyed pane composition, selection-following views,
+local lifecycle rules, and deferred selection capture into domain actions.

@@ -103,6 +103,41 @@
     \ state=namespace
     ^ nat
     | (state.case(.z [state.self 'gov])).fall(0)
+  + lifetime
+    ' x.shape changes on removal/recreation, never on an ordinary live edit.
+    \ target=path state=namespace
+    ^ nat
+    ?> (./some history) state.history(target) 0
+    | (history.ever_at(target)).x.lock.shape
+  + member
+    \ source=path target=path state=namespace
+    ^ json
+    = current (goo_runtime/record .x target state)
+    | json/obj
+      [(jkv "key" (json/str (path_show target)))
+       (jkv "subject" (json/str (path_show target)))
+       (jkv "source" (json/str (path_show source)))
+       (jkv "sourceLife" (json/str (nat/show (goo_runtime/lifetime source state))))
+       (jkv "life" (json/str (nat/show (goo_runtime/lifetime target state))))
+       (jkv "type" (json/str "namespace-record"))
+       (jkv "expected" (json/str (nat/show (state.case(.x target)).fall(0))))
+       (jkv "status" (json/str (? (maybe/is_some current) "available" "unavailable")))]
+  + source
+    ' Finite direct-child source. Read physical keys with a bounded range;
+    ' never flatten the subtree or scan to find a selected member.
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    = source query.target
+      history (state.history(source))
+      keys=row[iota]
+        ?> (./some history) history []
+        | history.idx.dip(source).kid.range_after(.none 65).map((\ entry entry.key))
+    | show (json/obj
+      [(jkv "id" (json/str (path_show source)))
+       (jkv "life" (json/str (nat/show (goo_runtime/lifetime source state))))
+       (jkv "type" (json/str "namespace-record"))
+       (jkv "bounded" (json/boo (le keys.len 64)))
+       (jkv "members" (json/arr (keys.take((? (lt keys.len 64) keys.len 64)).map((\ key (goo_runtime/member source source.snoc(key) state))))))])
   + status
     \ query=goo_runtime/request state=namespace
     ^ str
@@ -112,13 +147,102 @@
          > (./some target) (state.case(.x target)).fall(0)
         0
     | show (json/obj
-      [(jkv "target" (json/str (path_show target.fall([]))))
+      [(jkv "life" (json/str (nat/show (goo_runtime/lifetime target.fall([]) state))))
+       (jkv "target" (json/str (path_show target.fall([]))))
        (jkv "expected" (json/str (nat/show expected)))
        (jkv "displayed" (json/str (nat/show (state.case(.y query.target)).fall(0))))
        (jkv "publication" (json/str (nat/show (goo_runtime/publication state))))])
+  + json_field
+    \ key=str value=json
+    ^ json
+    ?> (json/obj entries) value jnull
+    | entries.fold jnull (\ out entry (? (eq entry.k key) entry.v out))
+  + json_text
+    \ value=json
+    ^ str
+    ?> (json/str text) value ""
+    text
+  + capture_value
+    \ input=row[[str str]] slot=path
+    ^ either[str json]
+    = matches (input.keep((\ [key value] (eq key (path_show slot)))))
+    ? !(eq matches.len 1) (./err "Missing or duplicate selection capture.")
+    = [key text] matches.at(0)
+    ?> (jres/ok value rest) (parse text) (./err "Invalid selection capture.")
+    | ./ok (goo_runtime/json_field "member" value)
+  + operand_path
+    \ expression=rex
+    ^ maybe[path]
+    ? (goo_runtime/read_path expression)
+     > (./some path) (./some path)
+    % rest=row[rex] expression.children
+    ^ maybe[path]
+    ? (eq rest.len 0) .none
+    ? (goo_runtime/operand_path rest.at(0))
+     > (./some path) (./some path)
+    | _ rest.drop(1)
+  + selection_source
+    \ key=path nodes=list[goo/node] route=row[nat] found=maybe[path]
+    ^ maybe[path]
+    ? (eq route.len 0) found
+    ? (ge route.at(0) nodes.len) .none
+    = node nodes.at(route.at(0))
+      next=maybe[path]
+        ? !(eq node.constructor "selection") found
+        ? (eq node.arguments.len 0) found
+        ? !(equal (goo_runtime/read_path node.arguments.head) (maybe/some[path] key)) found
+        ?> (./some source) (goo_runtime/named "source" node.arguments) .none
+        | goo_runtime/read_path source
+    | goo_runtime/selection_source key node.children route.drop(1) next
+  + bound_captures
+    \ nodes=list[goo/node] route=row[nat] fields=list[rex] input=row[[str str]]
+    ^ either[str unit]
+    ? fields.is_nil (./ok [])
+    ?> (./nest _ _ rune kids) fields.head (goo_runtime/bound_captures nodes route fields.tail input)
+    ? !(and (eq rune "=") (eq kids.len 2)) (goo_runtime/bound_captures nodes route fields.tail input)
+    ? !(goo_runtime/mentions "capture" kids.at(1)) (goo_runtime/bound_captures nodes route fields.tail input)
+    ?> (./some key) (goo_runtime/operand_path kids.at(1)) (./err "Capture must name a lexical selection.")
+    ?> (./some source) (goo_runtime/selection_source key nodes route .none) (./err "Capture selection is not in scope.")
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (./err "Invalid capture slot.")
+    < member (goo_runtime/capture_value input slot)
+    ? !(eq (path_show source) (goo_runtime/json_text (goo_runtime/json_field "source" member)))
+      | ./err "Capture source does not match the published selection declaration."
+    | goo_runtime/bound_captures nodes route fields.tail input
+  + validate_captures
+    \ input=row[[str str]] fields=list[rex] state=namespace
+    ^ either[str unit]
+    ? fields.is_nil (./ok [])
+    = field fields.head
+    ?> (./nest _ _ rune kids) field (goo_runtime/validate_captures input fields.tail state)
+    ? !(and (eq rune "=") (eq kids.len 2)) (goo_runtime/validate_captures input fields.tail state)
+    ? !(goo_runtime/mentions "capture" kids.at(1)) (goo_runtime/validate_captures input fields.tail state)
+    ?> (./some slot) (goo_runtime/read_path kids.at(0)) (./err "Invalid capture argument slot.")
+    < value (goo_runtime/capture_value input slot)
+    = text (\ key=str (goo_runtime/json_text (goo_runtime/json_field key value)))
+    ?> (./some source) (path_parse (text "source")) (./err "Invalid capture source.")
+    ?> (./some subject) (path_parse (text "subject")) (./err "Invalid capture subject.")
+    ? !(and (eq (text "type") "namespace-record") (eq (text "key") (path_show subject)))
+      | ./err "Incompatible capture membership."
+    ? !(and (eq subject.len source.len.inc) (pith_prefix source subject))
+      | ./err "Capture is not a member of its finite source."
+    ? !(and (state.permitted(subject)) (pith_prefix [state.self 'app] subject))
+      | ./err "Captured subject is outside application authority."
+    ? !(and (eq (text "life") (nat/show (goo_runtime/lifetime subject state)))
+         (eq (text "sourceLife") (nat/show (goo_runtime/lifetime source state))))
+      | ./err "Captured membership was removed or replaced."
+    ? !(eq (text "expected") (nat/show (state.case(.x subject)).fall(0)))
+      | ./err "Captured subject changed before admission."
+    ? (maybe/is_none (goo_runtime/record .x subject state)) (./err "Captured subject is unavailable.")
+    ? (maybe/is_none (goo_runtime/record .x source state)) (./err "Captured source is unavailable.")
+    | goo_runtime/validate_captures input fields.tail state
   + argument
     \ published=myth input=row[[str str]] now=nat slot=path value=rex
     ^ either[str pail]
+    ? (goo_runtime/mentions "capture" value)
+      < member (goo_runtime/capture_value input slot)
+      ?> (./some subject) (path_parse (goo_runtime/json_text (goo_runtime/json_field "subject" member)))
+        | ./err "Invalid captured subject."
+      | ./ok (pails/p subject)
     ? (goo_runtime/mentions "provider" value)
       ? !(equal[path] slot ['sys 'now]) (./err "Unknown provider; only /sys/now is available.")
       | ./ok (pails/dm (add (quip_val '@1970.1.1..0.0.0) (mul now 1024)))
@@ -198,6 +322,9 @@
     = [node scope] found
     ?> (./some action) scope.action (./err "Action group requires an action.")
     = bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
+    < lowered (goo_runtime/matching_view view current)
+    < bound (goo_runtime/bound_captures lowered.children query.control scope.values.weld(bindings) query.inputs)
+    < validated (goo_runtime/validate_captures query.inputs scope.values.weld(bindings) state)
     < arguments (goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings))
     | goo_runtime/dispatch action arguments current view.contract state
   + apply
@@ -216,11 +343,49 @@
     ? (grove_install/change target (writ/make next) state)
      > (./ok next) (./ok next)
      > (./err why) (./err (str/from_atom (iota_show why)))
+  + receipt
+    : identity=str request=goo_runtime/request body=str
+  + receipts
+    : entries=list[goo_runtime/receipt]
+  + receipt_slot
+    ^ path
+    ['sys 'goo 'receipts]
+  + act
+    \ query=goo_runtime/request state=namespace
+    ^ [namespace nat str]
+    = identities (query.inputs.keep((\ [key value] (eq key "$invocation"))))
+      identity=str
+        ? (eq identities.len 1)
+          = [key value] identities.at(0)
+          value
+        ""
+      home=path [state.self 'weft 'goo_receipts]
+      journal (goo_runtime/record .x home state).fall(myth/new)
+      entries=list[goo_runtime/receipt]
+        ?> (./some held) journal.get(goo_runtime/receipt_slot) .nil
+        ?> receipts=goo_runtime/receipts held .nil
+        receipts.entries
+      prior (entries.keep((\ entry (eq entry.identity identity))))
+      request query.set_now(0)
+    ? (and (gt identity.len 0) (gt prior.len 0))
+      ? (equal request prior.head.request) [state 200 prior.head.body]
+      [state 409 (show (json/obj [(jkv "error" (json/str "Invocation identity was reused with changed arguments."))]))]
+    ? (and (gt identity.len 0) (ge entries.len 1024))
+      [state 409 (show (json/obj [(jkv "error" (json/str "Development invocation journal is full; restart the namespace."))]))]
+    ? (goo_runtime/apply query state)
+     > (./ok next)
+      = body (goo_runtime/status query next)
+      ? (eq identity.len 0) [next 200 body]
+      = record (journal.put(goo_runtime/receipt_slot
+          (goo_runtime/receipts entries.snoc((goo_runtime/receipt identity request body)))))
+      ? (grove_install/change home (writ/make record) next)
+       > (./ok committed) [committed 200 body]
+       > (./err _) [state 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
+     > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
   + run
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]
     ? (eq query.operation "status") [state 200 (goo_runtime/status query state)]
+    ? (eq query.operation "source") [state 200 (goo_runtime/source query state)]
     ? !(eq query.operation "act") [state 400 "{}"]
-    ? (goo_runtime/apply query state)
-     > (./ok next) [next 200 (goo_runtime/status query next)]
-     > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
+    | goo_runtime/act query state
