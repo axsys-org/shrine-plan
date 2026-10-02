@@ -1,9 +1,12 @@
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
 
 def prepare(root, work, check, cleanup, context):
+    root = root.resolve()
+    subprocess.run([sys.executable, str(root.parent / 'goo/scripts/sync-mash-profile.py'), '--check'], check=True)
     bag = work / 'bag'
     bag.mkdir(parents=True)
     for source in root.iterdir():
@@ -21,8 +24,8 @@ def check(url, node, timeout):
             assert expected in response.read().decode()
     with urllib.request.urlopen(url + '/style.css', timeout=timeout) as response:
         assert response.read()
-    for path, mime in [('/static/goo-reference.css', 'text/css'),
-                       ('/static/goo-fonts.css', 'text/css'),
+    for path, mime in [('/static/goo-profile.css', 'text/css'),
+                       ('/static/goo-profile.json', 'application/json'),
                        ('/static/goo-topoi-components.js', 'text/javascript'),
                        ('/static/goo-topoi-components.css', 'text/css'),
                        ('/static/goo-topoi.js', 'text/javascript'),
@@ -32,5 +35,7 @@ def check(url, node, timeout):
             assert actual == mime or (mime == "text/javascript" and actual == "application/javascript")
             body = response.read()
             assert body
+            if path in ('/static/goo-profile.css', '/static/goo-profile.json'):
+                assert body == (Path(__file__).parent / path.rsplit('/', 1)[1]).read_bytes()
             if mime == 'font/ttf':
                 assert body == (Path(__file__).parent / "goo-Sans400.ttf").read_bytes()

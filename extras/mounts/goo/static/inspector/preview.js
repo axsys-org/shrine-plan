@@ -6,7 +6,8 @@
     const config=decodeInput(JSON.parse(input.textContent)),target=doc.getElementById('goo-render-root');
     const scale=options.textScale??1;
     if(!Number.isFinite(scale)||scale<=0||scale>10)throw Error('Text scale must be >0 and <=10');
-    doc.documentElement.dir=options.direction??'ltr';
+    const direction=options.direction??'ltr';
+    doc.documentElement.dir=direction;
     doc.documentElement.style.setProperty('--goo-text-scale',scale);
     if(options.contentWidth!==undefined)target.style.width=finite(options.contentWidth,'Content width')+'px';
     let stopped=false,lastWidth=-1,revision=0,request;
@@ -18,7 +19,7 @@
       const current=++revision;request?.abort();request=new AbortController();
       try {
         const response=await host.fetch('/layout',{method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({version:VERSION,tree:config.tree,width,textScale:scale}),signal:request.signal});
+          body:JSON.stringify({version:VERSION,tree:config.tree,width,textScale:scale,direction}),signal:request.signal});
         if(!response.ok)throw Error(await response.text());
         const data=await response.json();if(stopped||revision!==current)return;
         const result=data.measurement;
@@ -29,7 +30,6 @@
         target.style.outlineStyle=result.plan?'solid':'none';
         if(typeof data.html!=='string')throw Error('Missing server-rendered HTML');
         target.innerHTML=data.html;
-        target.firstElementChild?.setAttribute('dir',options.direction??'ltr');
         for(const e of target.querySelectorAll('[data-node]')) {
           if(e.tagName==='INPUT'&&previousInputs.has(e.dataset.node))e.value=previousInputs.get(e.dataset.node);
           if(focusId===e.dataset.node){e.focus({preventScroll:true});if(selection)e.setSelectionRange(...selection);}

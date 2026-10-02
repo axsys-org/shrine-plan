@@ -28,7 +28,8 @@ class Element {
   focus() { for(const fn of this.listeners.focus || []) fn({target:this}); }
   async fire(kind,fields={}) { const event={target:this,preventDefault(){},stopPropagation(){},...fields}; for(const fn of this.listeners[kind] || []) await fn(event); }
 }
-const defer=()=>{let resolve;const promise=new Promise(r=>resolve=r);return {promise,resolve};};
+const defer=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
 const A={key:'A',subject:'/a',life:'1',source:'/cards',sourceLife:'1',type:'namespace-record',expected:'1',status:'available'};
 const B={...A,key:'B',subject:'/b'}, C={...A,key:'C',subject:'/c'};
 const tree=[{kind:'pane',key:'workspace',children:[{kind:'selection',key:'current',source:{id:'/cards',life:'1',type:'namespace-record',members:[A,B,C]},initial:A,children:[
@@ -37,10 +38,10 @@ const tree=[{kind:'pane',key:'workspace',children:[{kind:'selection',key:'curren
 ]}]}];
 const state=(s,kind)=>[...s.owners.values()].find(x=>x.kind===kind);
 async function setup() {
- const pending=[], context={GooSession, console, structuredClone, confirm:()=>true};
+ const pending=[], context={GooSession, console, structuredClone, AbortController, confirm:()=>true};
  context.document={createElement:tag=>new Element(tag),activeElement:null};
  let invocations=0;
- context.GooActions={load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
+ context.GooActions={context:()=>({width:400,textScale:1,direction:'ltr'}),observe:()=>()=>{},mount:(element,data)=>{element.replaceChildren(data.template.cloneNode(true));},load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
  vm.runInNewContext(fs.readFileSync(require.resolve('../goo-topoi.js'),'utf8'),context);
  vm.runInNewContext(fs.readFileSync(require.resolve('../goo-panes.js'),'utf8'),context);
  const controller=new context.GooPanes(new Element(),{target:'/study',view:'/view',report:()=>{}});
@@ -49,7 +50,7 @@ async function setup() {
  const element=new Element(); controller.elements.set(follower.id,element);
  return {controller,follower,selection,list,element,pending,context,bindings:()=>invocations};
 }
-function response(target,label) { const template=new Element(); template.dataset.view='/content';template.textContent=label;return {snapshot:{life:'1',target},templates:[template]}; }
+function response(target,label) { const template=new Element(); template.dataset.view='/content';template.textContent=label;return {snapshot:{life:'1',target},view:'/content',controls:[],template}; }
 test('S15: actual follow adapter discards delayed A after accepted B and older recipe after become',async()=>{
  const {controller:c,follower:f,selection:s,element:e,pending:p}=await setup();
  const old=c.follow(f,e); assert.equal(p.length,1);
@@ -163,4 +164,172 @@ test('virtual and structural sources need no physical lifetime', async()=> {
  context.fetch=async url=>{requested=url;return {ok:true,json:async()=>value};};
  assert.equal(await controller.source(value.id,'tree','y'),value);
  assert.match(requested,/axis=y/);
+});
+
+test('native removal is admitted while its draft is visible and unregisters the surviving pane guard',async()=>{
+ const {controller:c}=await setup();
+ const native={kind:'native',node:'native-editor',controls:[]};
+ const description=children=>[{kind:'pane',key:'survivor',children}];
+ await c.update(description([native]),{target:'/study',life:'1',publication:'1'});
+ const [element,work]=[...c.nativeWorks][0], parent=c.session.get(work.ref);
+ work.inputs.set('/draft',{value:'unsaved',dirty:true,composing:false});
+ const refused=c.update(description([]),{target:'/study',life:'1',publication:'2'});await flush();
+ assert(work.departure);assert.equal(work.live,true);assert.equal(element.isConnected,true);
+ work.departure.finish(false);assert.equal((await refused).status,'refused');assert.equal(c.nativeWorks.get(element),work);
+ const accepted=c.update(description([]),{target:'/study',life:'1',publication:'2'});await flush();
+ work.departure.finish(true);assert.equal((await accepted).status,'applied');
+ assert.equal(work.live,false);assert.equal(c.nativeWorks.size,0);assert.equal(parent.guards.size,0);assert.equal(parent.resources.size,0);
+ assert.equal(await c.close(),true,'removed native work cannot leave an invisible departure prompt');
+});
+
+test('native replacement cannot mount an old response after an awaited departure guard',async()=>{
+ const {controller:c,pending:p}=await setup();
+ const native={kind:'native',node:'native-editor'};
+ await c.update([{kind:'pane',key:'survivor',children:[native]}],{target:'/study',life:'1',publication:'1'});
+ const [element,work]=[...c.nativeWorks][0];
+ p.at(-1).resolve({...response('/study','first'),snapshot:{subject:'/study',life:'1',publication:'1'}});await flush();
+ work.inputs.set('/draft',{value:'draft',dirty:true,composing:false});
+ c.snapshot={target:'/study',life:'1',publication:'2'};
+ const old=c.renderNative(native,element,[],c.session.get(work.ref).id);
+ p.at(-1).resolve({...response('/study','stale'),snapshot:{subject:'/study',life:'1',publication:'2'}});await flush();assert(work.departure);
+ const oldDeparture=work.departure;
+ c.snapshot={target:'/study',life:'1',publication:'3'};
+ const latest=c.renderNative(native,element,[],c.session.get(work.ref).id);
+ oldDeparture.finish(true);await old;
+ assert.equal(element.children[0].textContent,'first');assert.equal(work.inputs.get('/draft').value,'draft');
+ p.at(-1).resolve({...response('/study','current'),snapshot:{subject:'/study',life:'1',publication:'3'}});await flush();
+ work.departure.finish(true);await latest;
+ assert.equal(element.children[0].textContent,'current');assert.equal(work.inputs.size,0);
+});
+
+test('editable member work defers preparation through composition and guards membership removal',async()=>{
+ const {controller:c,list,selection:s,pending:p,context}=await setup();
+ const body=new Element();c.list(list,body,{slot:'summary',key:'rows'},[]);
+ const row=list.rows.get('B'),work=c.rowWorks.get(row);
+ assert(work);assert.equal(work.ref,list.ref);
+ p.find(request=>request.target==='/b').resolve(response('/b','original'));await flush();
+ const input=new Element('input');input.value='draft';
+ c.actionContext('/b','/view',{target:'/b'},[],[],work).input('/draft',input);
+ await input.fire('compositionstart');input.value='composing';await input.fire('input');
+ const before=p.length;context.GooActions.context=()=>({width:550,textScale:2,direction:'rtl'});
+ await c.observations.get(row).callback();assert.equal(p.length,before);
+ assert.equal(await c.session.depart(list,{kind:'retirement'}),false);
+ const changed=structuredClone(tree);changed[0].children[0].source.members=[A,C];
+ c.source=async()=>changed[0].children[0].source;
+ const raw=structuredClone(changed);raw[0].children[0].source='/cards';
+ await c.update(raw,{target:'/study',publication:'2'});assert(c.deferredUpdate);assert.equal(c.rowWorks.get(row),work);
+ await input.fire('compositionend');await flush();
+ assert(work.departure);assert.equal(work.inputs.get('/draft').value,'composing');assert.equal(s.accepted.key,'A');
+ work.departure.finish(false);await flush();assert.equal(work.live,true);assert.equal(c.rowWorks.get(row),work);
+ const remove=c.update(raw,{target:'/study',publication:'2'});await flush();work.departure.finish(true);await remove;
+ assert.equal(work.live,false);assert.equal(c.rowWorks.has(row),false);assert.equal(s.accepted.key,'A');
+});
+
+test('a suspended or inert editor presents its departure decision in the visible session shell',async()=>{
+ const {controller:c,follower:f,element:e}=await setup();c.registerWork(f,e);
+ f.inputs.set('/draft',{value:'hidden draft',dirty:true});
+ e.closest=selector=>selector==='[hidden],[inert]'?{}:null;
+ const departure=c.session.depart(f,{kind:'retirement'});
+ assert.equal(f.departure.prompt.parentElement,c.host);assert.equal(e.children.length,0);
+ f.departure.finish(false);assert.equal(await departure,false);assert.equal(f.inputs.get('/draft').value,'hidden draft');
+});
+
+test('a failed context reprepare keeps the mounted editor and working draft visible for retry',async()=>{
+ const {controller:c,follower:f,element:e,pending:p,context}=await setup();
+ const reports=[];c.context.report=value=>reports.push(value);
+ const original=c.follow(f,e);p[0].resolve(response('/a','Mounted editor'));await original;
+ const editor=e.children[0];f.inputs.set('/draft',{value:'unsaved',dirty:true});
+ context.GooActions.context=()=>({width:550,textScale:1,direction:'rtl'});
+ const failed=c.follow(f,e);p[1].reject(Error('Server temporarily unavailable'));await failed;
+ assert.equal(e.children[0],editor);assert.equal(f.inputs.get('/draft').value,'unsaved');
+ assert.equal(e.dataset.status,'error');assert.match(reports[0],/temporarily unavailable/);
+ const retry=c.follow(f,e);assert.equal(p.length,3);p[2].resolve(response('/a','Retried'));await retry;
+ assert.equal(e.dataset.status,'current');assert.equal(e.children[0].textContent,'Retried');
+});
+
+test('a replaced member publication admits departure then mounts a fresh input lifetime',async()=>{
+ const {controller:c,list,pending:p,context}=await setup();
+ const preserved=[];const mount=context.GooActions.mount;
+ context.GooActions.mount=(element,data,preserve)=>{preserved.push(preserve);mount(element,data);};
+ c.list(list,new Element(),{slot:'summary',key:'rows'},[]);
+ const row=list.rows.get('B'),work=c.rowWorks.get(row);
+ p.find(request=>request.target==='/b').resolve({...response('/b','original'),snapshot:{target:'/b',life:'1',publication:'1'}});await flush();
+ work.inputs.set('/draft',{value:'unsaved',dirty:true});c.snapshot={publication:'2'};
+ const render=c.observations.get(row).callback();
+ p.at(-1).resolve({...response('/b','replaced'),snapshot:{target:'/b',life:'1',publication:'2'}});await flush();
+ assert(work.departure);work.departure.finish(true);await render;
+ assert.equal(preserved.at(-1),false);assert.equal(work.inputs.size,0);
+});
+
+test('native children reject a parent snapshot mismatch and coalesce enclosing refreshes without losing work',async()=>{
+ const {controller:c,pending:p,context}=await setup();
+ const parent={target:'/study',subject:'/study',life:'1',displayed:'10',publication:'20'};
+ const nodes=[{kind:'native',node:'first'},{kind:'native',node:'second'}];
+ const refresh=defer();let refreshed=0;c.context.refresh=()=>{refreshed++;return refresh.promise;};
+ await c.update([{kind:'pane',key:'survivor',children:nodes}],parent);
+ const entries=[...c.nativeWorks];
+ for(const pending of p.splice(0))pending.resolve({...response('/study','mounted'),snapshot:{...parent}});await flush();
+ for(const [element,work] of entries)work.inputs.set('/draft',{value:`draft-${work.encounter.id}`,dirty:true});
+ context.GooActions.context=()=>({width:600,textScale:1,direction:'ltr'});
+ const renders=entries.map(([element,work],index)=>c.renderNative(nodes[index],element,[],c.session.get(work.ref).id));
+ p[0].resolve({...response('/study','too new'),snapshot:{...parent,publication:'21'}});
+ p[1].resolve({...response('/study','wrong displayed'),snapshot:{...parent,displayed:'11'}});
+ await Promise.all(renders);await flush();
+ assert.equal(refreshed,1);
+ for(const [element,work] of entries) {
+   assert.equal(element.children[0].textContent,'mounted');assert.equal(work.inputs.size,1);assert.equal(work.departure,undefined);
+ }
+ for(const mismatch of [{...parent,subject:'/other'},{...parent,life:'2'}])assert.equal(c.nativeSnapshotCurrent(mismatch),false);
+ assert.equal(c.nativeSnapshotCurrent({...parent}),true);
+ assert.equal(refreshed,1);refresh.resolve();await flush();
+});
+
+test('caller cancellation closes visible retirement prompts without applying the new description',async()=>{
+ const {controller:c}=await setup();
+ const initial=[{kind:'pane',key:'survivor',children:[{kind:'native',node:'editor'}]}];
+ assert.equal((await c.update(initial,{target:'/study'})).status,'applied');
+ const [element,work]=[...c.nativeWorks][0];work.inputs.set('/draft',{value:'stay',dirty:true});
+ const abort=new AbortController();
+ const removing=c.update([{kind:'pane',key:'survivor',children:[]}],{target:'/study'},{signal:abort.signal});await flush();
+ const prompt=work.departure.prompt;abort.abort();
+ assert.equal((await removing).status,'superseded');assert.equal(prompt.isConnected,false);assert.equal(work.departure,null);
+ assert.equal(element.isConnected,true);assert.equal(work.inputs.get('/draft').value,'stay');
+ const retireAbort=new AbortController(),retiring=c.update([],{target:'/study'},{signal:retireAbort.signal});await flush();
+ assert(work.departure);retireAbort.abort();assert.equal((await retiring).status,'superseded');
+ assert.equal(work.departure,null);assert.equal(c.session.get(work.ref).live,true);
+});
+
+test('a close begun during an old source read prevents that update from superseding its retirement',async()=>{
+ const {controller:c}=await setup();
+ const initial=[{kind:'pane',key:'survivor',children:[{kind:'native',node:'editor'}]}];await c.update(initial,{target:'/study'});
+ const [element,work]=[...c.nativeWorks][0];work.inputs.set('/draft',{value:'unsaved',dirty:true});
+ const source=defer();c.source=()=>source.promise;
+ const old=c.update([{kind:'pane',key:'survivor',children:[{kind:'selection',key:'source',source:'/cards',children:[]}]}],{target:'/study'});
+ const closing=c.close();await flush();assert(work.departure);
+ source.resolve({id:'/cards',life:'1',type:'namespace-record',members:[A]});
+ assert.equal((await old).status,'superseded');assert.equal(work.live,true);assert.equal(element.isConnected,true);
+ work.departure.finish(true);assert.equal(await closing,true);assert.equal(c.session.closed,true);assert.equal(c.session.owners.size,0);
+});
+
+test('an aborted composition-deferred caller cannot replay after composition ends',async()=>{
+ const {controller:c}=await setup();await c.update([{kind:'pane',key:'survivor',children:[{kind:'native',node:'editor'}]}],{target:'/study'});
+ const [element,work]=[...c.nativeWorks][0],input=new Element('input');input.value='draft';
+ c.actionContext('/study','/view',{target:'/study'},[],[],work).input('/draft',input);await input.fire('compositionstart');
+ let applied=0;const abort=new AbortController();assert.equal((await c.update([],{target:'/study'},{signal:abort.signal,onApplied:()=>applied++})).status,'deferred');
+ abort.abort();await input.fire('compositionend');await flush();
+ assert.equal(c.nativeWorks.get(element),work);assert.equal(work.live,true);assert.equal(work.departure,undefined);
+ assert.equal(c.rawDescription[0].key,'survivor');
+ assert.equal(applied,0);
+});
+
+test('an accepted deferred update publishes metadata only when composition has ended',async()=>{
+ const {controller:c}=await setup(),description=[{kind:'pane',key:'survivor',children:[{kind:'native',node:'editor'}]}];
+ await c.update(description,{target:'/study'});
+ const [element,work]=[...c.nativeWorks][0],input=new Element('input');input.value='draft';
+ c.actionContext('/study','/view',{target:'/study'},[],[],work).input('/draft',input);
+ await input.fire('compositionstart');let applied=0;
+ const result=await c.update(description,{target:'/study',publication:'2'},{onApplied:()=>applied++});
+ assert.equal(result.status,'deferred');assert.equal(applied,0);
+ await input.fire('compositionend');await flush();assert.equal(applied,1);assert.equal(c.snapshot.publication,'2');
+ assert.equal(c.nativeWorks.get(element),work);
 });

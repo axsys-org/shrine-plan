@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -16,11 +17,20 @@ parser.add_argument('--mount', action='append')
 parser.add_argument('--jobs', type=int, default=2)
 parser.add_argument('--timeout', type=int, default=1200)
 parser.add_argument('--contracts-only', action='store_true', help='Typecheck selected activation, HTTP and driver entrypoints')
+parser.add_argument('--goo-application', action='store_true', help='After native checks, run the real Eden/Goo/Mash browser application gate')
 args = parser.parse_args()
 sys.path.insert(0, str(args.core_root.resolve() / 'x'))
 from eden_mounts import select, catalog
 import test_runner as runner
 mounts = select(ROOT, args.mount or list(catalog(ROOT)))
+# Mounted Goo consumes the same verified profile as standalone production.
+# Catch stale generated Foil/CSS before a native pass can mask asset drift.
+if any(m.name == 'goo' for m in mounts):
+    profile_scripts = ROOT / 'mounts/goo/scripts'
+    for script, options in [('sync-mash-profile.py', ['--check']),
+                            ('generate-fonts.py', ['--check']),
+                            ('test-sync-mash-profile.py', [])]:
+        subprocess.run([sys.executable, str(profile_scripts / script), *options], check=True)
 # Test-only helper dependencies do not become runtime dependencies.
 if any(m.name == 'debugger' for m in mounts):
     mounts = select(ROOT, [m.name for m in mounts] + ['srs'])
@@ -90,4 +100,10 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
                for group in groups]
     results = [future.result() for future in futures]
 (work / 'results.json').write_text(json.dumps(results, indent=2))
-raise SystemExit(int(not all(result['passed'] for result in results)))
+passed = all(result['passed'] for result in results)
+if passed and args.goo_application:
+    application = subprocess.run([sys.executable,
+        str(ROOT / 'mounts/explorer/scripts/check-integration.py'),
+        '--output', str(work / 'goo-application')])
+    passed = application.returncode == 0
+raise SystemExit(int(not passed))

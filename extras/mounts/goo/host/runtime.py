@@ -10,8 +10,8 @@ ATOM=r'("(?:[^"\\]|\\.|"")*"|[0-9]+)'
 
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def inputs():
-    files=[*PACKAGE.glob('*.foil'),*PACKAGE.glob('host/*.py'),PACKAGE/'package.json',PACKAGE/'mount.json',PACKAGE/'bin/goo-foil',PACKAGE/'flake.lock',PACKAGE/'flake.nix',ROOT/'flake.lock',ROOT/'flake.nix',PACKAGE/'rex/Main.hs',PACKAGE/'rex/Goo/Rex/Layout.hs',ROOT/'x/stage-lib',PACKAGE/'scripts/generate-rules.py',PACKAGE/'scripts/generate-fonts.py']
-    for folder in ['fonts','rules']:
+    files=[*PACKAGE.glob('*.foil'),*PACKAGE.glob('host/*.py'),PACKAGE/'package.json',PACKAGE/'mount.json',PACKAGE/'bin/goo-foil',PACKAGE/'flake.lock',PACKAGE/'flake.nix',ROOT/'flake.lock',ROOT/'flake.nix',PACKAGE/'rex/Main.hs',PACKAGE/'rex/Goo/Rex/Layout.hs',ROOT/'x/stage-lib',PACKAGE/'scripts/generate-rules.py',PACKAGE/'scripts/generate-fonts.py',PACKAGE/'scripts/sync-mash-profile.py']
+    for folder in ['fonts','rules','profile']:
         files.extend(p for p in (PACKAGE/folder).rglob('*') if p.is_file())
     files.extend([*sorted((PACKAGE/'static').glob('goo-*.ttf')),PACKAGE/'static/reference.css',PACKAGE/'static/ascii-fonts.css'])
     for directory,suffix in [('foil','*.foil'),('reaver','*.rvr'),('plan','*.plan')]:files.extend((ROOT/'src'/directory).rglob(suffix))
@@ -168,6 +168,7 @@ def build(wisp=None):
             wisp=out.strip()
         wisp=str(pathlib.Path(wisp).resolve())
         run([sys.executable,str(PACKAGE/'scripts/generate-rules.py'),'--check'],ROOT)
+        run([sys.executable,str(PACKAGE/'scripts/sync-mash-profile.py'),'--check'],ROOT)
         run([sys.executable,str(PACKAGE/'scripts/generate-fonts.py'),'--check'],ROOT)
         source_hashes=inputs();runtime_hash=sha(pathlib.Path(wisp))
         key=hashlib.sha256(json.dumps([source_hashes,runtime_hash],sort_keys=True).encode()).hexdigest()[:20]

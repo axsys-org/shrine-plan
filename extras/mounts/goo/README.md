@@ -6,7 +6,13 @@ This package implements Goo's compiler, geometry planner, HTML renderer and appl
 [semantic passes](SEMANTICS.md), and [ASCII leaf measurement](ASCII.md), [layout](LAYOUT.md), and [prepared HTML rendering](HTML.md), and [CLI/HTTP application](APPLICATION.md). Parsing
 and printing use the retained, locked Rex component. Goo interpretation, normalization, visibility, adjacency,
 and orchestration run in Foil; the host supplies process I/O and UUID entropy.
-The Haskell Goo compiler is used only by differential tests.
+The Haskell Goo compiler is used only by historical differential tests.
+
+Rendering uses the `mash-goo` version-1 profile. Mash owns the pinned fonts,
+typography, primitive geometry and HTML recipes; Goo owns semantic interpretation,
+measurement, adjacency, wrapping and layout on the server. Other renderers can
+consume Goo's checked, absolute display list without implementing those layout
+semantics. See [the renderer boundary](HTML.md).
 
 Intermediate Grove/Goo sequences use `list`: Grove declarations and statements,
 role fields and requirements, view arguments and children, pass diagnostics and
@@ -23,13 +29,7 @@ From the parent repository, with Nix and Python 3 available:
 ```sh
 extras/mounts/goo/bin/goo build
 extras/mounts/goo/bin/goo fmt --check
-goo/scripts/porting/build-codec-oracle.sh # test-only Haskell codec oracle
-goo/scripts/porting/build-semantic-oracle.sh # test-only full Haskell oracle
-goo/scripts/porting/build-ascii-oracle.sh # test-only direct Haskell measurer
-goo/scripts/porting/build-layout-oracle.sh # test-only direct Haskell planner
-goo/scripts/porting/build-html-oracle.sh # test-only direct Haskell renderer
-extras/mounts/goo/bin/goo test
-extras/mounts/goo/bin/goo test-types
+python3 extras/mounts/goo/scripts/sync-mash-profile.py --check
 printf 'text("Hello")' | extras/mounts/goo/bin/goo passes
 extras/mounts/goo/bin/goo html --width 375.25 extras/mounts/goo/examples/profile.goo
 extras/mounts/goo/bin/goo serve --port 8000
@@ -43,6 +43,37 @@ Large JSON arguments use balanced transport chunks to avoid enormous decimal
 literals in the runtime reader; output uses indexed UTF-8 JSON frames rather than
 integer pretty-printing. Static SSR sends its HTML as length-delimited UTF-8 bytes
 with a small status frame. Payload bytes and numeric lexemes are unchanged.
+
+## Renderer profile
+
+Mash's `@mash/goo-profile` package is the source of the versioned renderer profile.
+The committed `profile/` bundle contains `profile.json`, its schema, CSS, pinned
+Inter/Roboto Mono fonts, glyph metrics, licenses and an asset manifest. The
+profile revision binds the definition and asset hashes. Production builds verify
+this bundle locally; a sibling Mash checkout, Node and a browser are not runtime
+dependencies.
+
+To deliberately update it, build Mash's package and import its distribution from
+the Reaver repository root:
+
+```sh
+pnpm --dir ../mash run goo:profile
+python3 extras/mounts/goo/scripts/sync-mash-profile.py --mash-root ../mash
+python3 extras/mounts/goo/scripts/sync-mash-profile.py --check
+```
+
+The importer verifies the complete asset inventory and revision, then generates
+`profile.foil` and `fonts.foil`. Do not edit the vendored files or generated
+constants independently. `--check` requires no Mash checkout; adding
+`--mash-root ../mash` also checks that the local import matches that distribution.
+Static font and profile stylesheet links resolve to the same canonical bundle.
+
+Render context carries the actual available width, text scale and direction.
+Goo produces final boxes, text lines and baselines for that context and profile
+revision. A changed context requires another server preparation. The browser
+paints the prepared HTML and supports interaction; it does not measure text or
+choose new wrapping and adjacency. Version 1 explicitly supports ASCII measured
+payloads. Unsupported Unicode is rejected, not approximated with fallback fonts.
 
 ## Build
 
@@ -60,8 +91,8 @@ The deterministic development authority is local and unpublished. Deployment
 identity and packaging belong to item 34.
 
 A successful build atomically selects a generation under `.build/`. Its manifest
-records SHA-256 hashes of source inputs, both locks, the runtime, retained Rex
-executable and Foil snapshot. Builds reuse an unchanged verified generation;
+records SHA-256 hashes of source inputs, the renderer profile bundle, both locks,
+the runtime, retained Rex executable and Foil snapshot. Builds reuse an unchanged verified generation;
 source changes require another build. One-shot invocations clone the immutable
 snapshot into a temporary directory and run against a private data-only file root. The
 HTTP server keeps a bounded pool of preloaded snapshots with exclusive leases and
@@ -73,16 +104,16 @@ One JSON value on stdin produces one JSON value on stdout. An object produces an
 object; an array of requests produces an ordered array of responses. Version is
 exactly integer `1`. Supported actions are:
 
-- `capabilities`: reports the implemented stages and `complete: true` for the eleven compiler stages.
+- `capabilities`: reports the renderer profile identity/revision, implemented stages and `complete: true` for the eleven compiler stages.
 - `source`: the item-01 oracle envelope, including all eleven stage names.
 - `parse`, `echo`, `print`, `goo-print`: the item-02 Rex boundary protocol.
 - `codec`: checked normalized/semantic tree decoding and encoding (see [CODECS.md](CODECS.md)).
 - `validate-measurement`: checked plan/metric/trace/result transport (see [MEASUREMENT.md](MEASUREMENT.md)).
 - `ascii`: native leaf styles, widths, sizes, lines and heights (see [ASCII.md](ASCII.md)).
-- `fonts`: compiled frozen font metadata and glyph advances.
+- `fonts`: compiled pinned font metadata and glyph advances, with the profile identity/revision.
 - `layout`, `plan`: ASCII or injected measurements through the native planner (see [LAYOUT.md](LAYOUT.md)).
 - `fixture`: normalized wire tree through visibility, adjacency, and the planner.
-- `render`: semantic tree to prepared inspection, HTML fragment, and static document (see [HTML.md](HTML.md)).
+- `render`: semantic tree to a portable `display` list, prepared inspection, HTML fragment, and static document (see [HTML.md](HTML.md)).
 - `tests`: structured Foil unit-test results.
 
 For `source`, the first six stages (`parse`, `read`, `core`, `normalized`,
@@ -117,8 +148,34 @@ while permitting source changes; rebuild after formatting.
 
 ## Tests
 
-`test` runs compiled Foil checks, positive/negative compiler clients, actual
-signal/cancellation checks, 1,070 differential codec cases and 954 round trips,
+The renderer profile conformance check is the current acceptance gate. With the
+locked Wisp runtime available, run from the repository root:
+
+```sh
+WISP=/path/to/the/locked/wisp python3 extras/mounts/goo/scripts/check-profile.py
+WISP=/path/to/the/locked/wisp python3 extras/mounts/goo/scripts/check-profile.py --mash-root ../mash
+python3 extras/mounts/goo/scripts/test-sync-mash-profile.py
+```
+
+The first command verifies the vendored bundle and native prepared contract.
+Adding `--mash-root` verifies the paired Mash distribution and runs real Chromium
+geometry checks plus an SVG consumer using Mash's installed Playwright and
+Chromium. Page JavaScript is disabled during HTML conformance checks. The
+consumers paint server output without importing Goo's planner. `--output DIR`
+retains native logs, fixtures and consumer artifacts at a chosen location.
+The integrity tests exercise changed font bytes, changed definitions and unlisted
+assets. These checks do not require the historical oracle tree.
+
+The older differential suites below are historical comparators, not the current
+profile's browser acceptance contract. They require the old top-level `goo/`
+oracle sources, fixtures and scripts, which are not included in this Extras
+mount. Changes to profile metadata, stylesheet references and portable display
+output intentionally extend the old response/HTML contract; frozen oracle
+equality alone cannot validate them.
+
+With that historical checkout available, `test` runs compiled Foil checks,
+positive/negative compiler clients, actual signal/cancellation checks,
+1,070 differential codec cases and 954 round trips,
 and exact semantic-prefix comparisons against 397 frozen oracle responses.
 It also checks every one of the 369 source files at budgets 0/1/2, adversarial
 inputs, all ordered rules and uniform provenance, UUID allocation/lifetime,
@@ -132,8 +189,9 @@ and text lines, all eight faces/760 glyphs, and wrapping boundary probes.
 `test-metrics` runs just Gate M. `test-gate` runs the semantic and measurement
 differential suites; `test-types` runs compiler clients.
 `python3 goo/scripts/porting/check-ascii-corpus.py` additionally measures every
-frozen nonempty semantic tree against Haskell. The oracle builders above are test setup only.
-Unicode remains outside this port's current scope. Gate S evidence is in
+frozen nonempty semantic tree against Haskell. Its historical oracle builders are
+test setup only. Unicode remains outside profile version 1's measured-text scope.
+Gate S evidence is in
 `../../../goo/porting/gate-s/`; the later gates have corresponding `gate-m`, `gate-l`,
 `gate-h` and `gate-u` evidence directories. Packaging begins at item 34.
 
@@ -161,7 +219,9 @@ The standalone executable is `bin/goo`. Its default asset/example root is this
 package; `GOO_ROOT` selects an alternative. The build uses this package's locked
 Rex toolchain and the parent repository's locked Foil runtime. It does not build
 or load the Haskell Goo compiler. Historical oracles and differential evidence
-remain in the top-level `goo/` tree and are needed only for the test commands.
+are external inputs to the older test commands under the former top-level
+`goo/` path. They are not dependencies of profile conformance, adapter execution
+or serving.
 
 `html` compiles, measures, lays out and paints within Foil. Inspector operations
 retain intermediate values in the leased worker while the retained Haskell

@@ -8,6 +8,7 @@ import urllib.request
 
 
 def prepare(root, work, check, cleanup, context):
+    root = root.resolve()
     work.mkdir(parents=True)
     bag = work / 'bag'
     bag.mkdir()
@@ -22,6 +23,7 @@ _generations = {}
 _expected_assets = {}
 
 def scan(root, bag):
+    root = root.resolve()
     global _expected_assets
     key = str(bag.resolve())
     digest = hashlib.sha256()

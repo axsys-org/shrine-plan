@@ -32,6 +32,47 @@ owners; it does not create a privileged `/ui` namespace. Namespace domain state
 and its existing observation/versioning mechanisms remain authoritative for
 subject data.
 
+## Live preparation contract
+
+`POST /goo/render` accepts form fields `target`, `width`, `textScale` and
+`direction` (`ltr` or `rtl`). Width is the available content width in CSS pixels,
+excluding Explorer's heading, border and padding. Scale must be positive and at
+most 10; width must be between 0 and 100000. There is no implicit live context.
+
+Without a selector, the response contains `views`, including read-only synthetic
+inspection. `view` selects one declaration; `slot` with optional `role` selects
+one unambiguous subject view. `view` plus `node` selects a native subtree using
+its original dot-separated Goo child route. A hosted workspace also sends its
+installed `workspace` declaration. The server reconstructs its receiver from
+trusted mount configuration; the client cannot supply a receiver or source slot.
+
+Responses carry `version: 1`, `ok`, the immutable `profile` identity, the requested
+`context`, and a namespace `snapshot`. A presentation carries `view`, `slot`,
+`role`, `kind`, prepared `display`, `html` and `controls`. Pane presentations carry
+a structured `description` and prepare their native surfaces separately at each
+surface's actual width. A failed catalogue entry carries an `error`, allowing
+other presentations to remain usable. Failed exact requests return a diagnostic.
+
+The namespace supervisor evaluates rendering and action-version evidence in one
+read-only snapshot. This prevents a display from accidentally being paired with
+tokens from a different namespace state. The callback cannot return a changed
+namespace. A native pane response from a newer parent publication is discarded
+until the parent description refreshes.
+
+`goo-actions.js` validates the installed profile and response context before
+mounting. It sends changes to available width, inherited `--goo-text-scale` and
+direction back to server preparation. It consumes the structured response;
+whole-page HTML is no longer a data API. Initial server HTML uses a compatibility
+context while the browser obtains the real container dimensions. Synthetic
+inspection then follows the same live preparation path as declared views.
+
+Repreparation within an encounter retains native input elements, working values,
+caret and selection. Composition defers replacement. Publication, member or
+recipe replacement uses the same departure guards as selection changes; delayed
+responses must still match their owner, encounter and latest render request.
+Action retries preserve their original invocation, captures and submitted input,
+and pending actions are scoped to the presenting instance.
+
 ## Actual source spelling
 
 ```grove
@@ -111,6 +152,11 @@ without implying that a superseded presentation transition also succeeds.
 This repository has no independent draft/checkpoint service; the built-in UI
 provides discard/refusal, not a fabricated autosave service.
 
+Native pane fragments and editable member rows use the same working-input and
+departure guards as following panes. Retiring a row or native fragment removes
+its guards and resources after admission. A guard for a suspended pane appears
+in the visible workspace so its decision remains reachable.
+
 Composition defers structural reevaluation and refuses destructive departure.
 Retirement releases resources only after guards allow it. Full page reload has
 no retained UI-session continuity. A refresh explicitly observes domain/source
@@ -134,6 +180,9 @@ Filtering/unloading a known member is not deletion. Confirmed deletion leaves
 an explicit unavailable selection. A recreated record at the same path does not
 inherit the old choice. An incompatible source lifetime requires removing and
 redeclaring the selection, rather than silent rebinding/reseeding.
+When the displayed workspace root itself is replaced, the host guards and closes
+the old controller, then creates a fresh session for that root lifetime. Ordinary
+data edits and render-context changes continue within the existing session.
 
 ## Captures and domain actions
 
@@ -192,12 +241,13 @@ session to 256 semantic owners. Reflection retains the last 64 local events.
 ## Run and test
 
 ```sh
-WISP=/path/to/wisp python3 x/eden --mount panes --port 8172
-# Open http://127.0.0.1:8172/views/0x11/app/panes/study
+WISP=/path/to/wisp python3 extras/mounts/explorer/scripts/check-integration.py
 node --test extras/mounts/explorer/tests/*.test.cjs
-WISP=/path/to/wisp python3 extras/x/check --mount panes --jobs 2
+WISP=/path/to/wisp python3 extras/x/check --mount explorer --jobs 2
 ```
 
+The specimen now lives in `extras/tests/fixtures/panes`, outside the production
+mount catalogue. The gate installs it only in its disposable test namespace.
 The study is an ordinary record at `/0x11/app/panes/study`, alongside `/cards`.
 Do not use the installation root as this action receiver: its pact manifest
 replays seed records when changed.
@@ -210,6 +260,8 @@ must additionally exercise the actual row/button/input/deck DOM; isolated owner
 tests alone are not evidence of rendered integration.
 
 See [verification and rehearsal](PANES-VERIFICATION.md) for observed results and coverage boundaries.
+The [real application integration gate](APPLICATION-INTEGRATION.md) boots Eden,
+compiles Grove and exercises these production adapters with actual Mash components.
 
 ## Server rendering and path-valued sources
 
@@ -247,11 +299,18 @@ Endpoints dispatch by declaration, so hosts can chain handlers for different
 workspace declarations. The configuration is fixed by the mount: URL parameters
 select the subject, not the declaration or receiver slot.
 
+A hosted workspace's synthetic receiver is for presentation and host controls.
+It cannot dispatch domain invocations from its native fragments: `/goo/render`
+rejects those controls explicitly. Put domain actions in member or follower
+presentations, whose displayed receiver and action receiver are the same real
+namespace record. Navigation and configured host operations remain available.
+
 The host captures the subject subtree and the local cached view catalog, checks
 the configured declaration and receiver contract, binds source fields, and emits
 the shared pane markup. `document` receives either the server-rendered workspace container
 or a diagnostic. Load the shared Goo scripts and attach `GooPanes` to `#workspace`
-using its `data-target` and `data-description`. Source limits and document chrome
+using its `data-target`, `data-view` and `data-workspace`. Live refresh obtains a
+new description and snapshot through `/goo/render`. Source limits and document chrome
 remain host policy; the generic endpoint imposes no inspector-specific 64-child
 limit. Child summaries are rendered by the shared host from the list's source and slot. Only record-bearing children are advertised; `browse` adds ordinary workspace navigation for each member.
 
@@ -319,8 +378,9 @@ not same-named slots on the presenting object. Other displayed expressions keep
 the enclosing receiver. Successful creation uses the existing refresh behavior;
 it does not implicitly navigate or select the new object.
 
-`grove-dev/creation.grove` supplies a runnable example at
-`/views/0x11/app/demo/creator`, creating `/0x11/app/demo/created`.
+`grove-dev/creation.grove` retains the creation roles and seed receiver. Its Goo
+form has been removed; creation bindings remain covered by the compiler and
+action regression suites.
 
 ## Topoi
 
@@ -333,9 +393,9 @@ parent references. Disclosure and camera state never call domain actions.
 
 `goo-topoi.js` adapts native lists, Mash `goo-tree`, and Mash `goo-tidy-tree`.
 The explorer builds its own pinned component bundle, so selecting the debugger
-mount is unnecessary. `extras/flake.nix` temporarily overrides the stale pnpm
-cache hash shipped in Mash revision `93954c6ef57629839b88762bc486babb5c348813`.
-The upstream source revision is unchanged.
+mount is unnecessary. `extras/flake.nix` pins the profile-enabled Mash revision
+`e6b81238d81242f9f053e21d9b498d84f5129383` without dependency overrides.
+Production asset builds verify the vendored profile against that Nix artifact.
 
-Run the `panes` mount and open `/views/0x11/app/panes/study`; `topoi_demo` shows a
+The application gate installs the test-only `panes` fixture; `topoi_demo` shows a
 list, outline, and diagram sharing a detail view and a descendant capture action.

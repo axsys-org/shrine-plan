@@ -21,6 +21,8 @@
     }
     return byKey;
   }
+  const sameMember = (a, b) => !!a && !!b && ['key','life','source','sourceLife'].every(key => a[key] === b[key]) && (a.axis || 'z') === (b.axis || 'z');
+  const focusMember = (members, focused) => members.find(member => member.status === 'available' && sameMember(member, focused)) || members.find(member => member.status === 'available') || null;
   const interactive = event => !!event.target.closest('button,a,input,select,textarea,summary,[contenteditable],[data-goo-tree-interactive]');
   class Topos {
     constructor(host, key, select, focus) {
@@ -29,6 +31,8 @@
     }
     reconcile(renderer, members, content) {
       const next = topology(members, renderer);
+      const active = this.body?.contains(document.activeElement) ? document.activeElement : null;
+      const changedRenderer = this.renderer !== renderer;
       if (this.renderer !== renderer) {
         this.body?.remove(); this.items.clear(); this.renderer=renderer;
         this.body=document.createElement(renderer === 'diagram_tree' ? 'goo-tidy-tree' : renderer === 'list_tree' ? 'goo-tree' : 'div');
@@ -43,7 +47,11 @@
           });
           this.body.addEventListener('goo-tree-toggle',event=> {
             event.detail.expanded ? this.expanded.add(event.detail.subject) : this.expanded.delete(event.detail.subject);
+            this.scheduleFocus();
           });
+          // WA restores a tab stop on its tree after blur. The adapter projects
+          // one member tab stop, including when focus is outside the tree.
+          this.body.addEventListener('focusout',()=>this.scheduleFocus());
         } else {
           this.tree=this.body;
           this.body.setAttribute('role','listbox'); this.body.setAttribute('aria-label',this.key);
@@ -55,6 +63,12 @@
       for(const member of members) if(this.lives.get(member.key)!==member.life) {
         this.expanded.delete(member.key); if(member.parent==null) this.expanded.add(member.key);
         this.lives.set(member.key,member.life);
+      }
+      if (changedRenderer && renderer === 'list_tree') {
+        // A diagram/list may have focused a descendant that the newly created
+        // hierarchy would otherwise hide. Reveal its ancestry without choosing it.
+        let parent = focusMember(members,this.focused)?.parent;
+        while (parent != null) { this.expanded.add(parent); parent=next.get(parent)?.parent; }
       }
       for (const [key,item] of this.items) if (!next.has(key)) { item.remove(); this.items.delete(key); this.expanded.delete(key); }
       for (const member of members) {
@@ -88,7 +102,13 @@
         if (renderer==='diagram_tree') member.parent==null ? item.removeAttribute('parent') : item.setAttribute('parent',member.parent);
         if (renderer==='list_tree') {
           const expanded=this.expanded.has(member.key);
+          // The wrapper preserves declarative expansion during WA connection;
+          // set the attribute before insertion as well as the live property.
+          item.toggleAttribute('expanded',expanded);
           if (item.expanded!==expanded) item.expanded=expanded;
+          item.disabled=member.status!=='available';
+        } else {
+          item.setAttribute('aria-disabled',String(member.status!=='available'));
         }
       }
       // Reconcile the one real hierarchy; preserve labels and component instances.
@@ -101,18 +121,66 @@
         positions.set(parent,index+1);
       }
       this.paint(this.choice,this.focused);
+      if (active) {
+        // Reparented caller controls keep drafts/caret and retain their exact
+        // element. Removed members/renderer hosts recover at the valid tab stop.
+        this.restoreFocus=active;
+        this.scheduleFocus();
+      }
     }
     choose(key) { const member=this.members.get(key); if(member?.status==='available') this.select(member); }
     paint(choice, focused) {
       this.choice=choice; this.focused=focused;
-      const first=[...this.members.values()].find(m=>m.status==='available');
       for (const [key,item] of this.items) {
         const selected=choice?.key===key && choice.life===item.dataset.life;
         if(this.renderer==='list_tree') { if(item.selected!==selected) item.selected=selected; }
-        else { item.setAttribute('aria-selected',String(selected)); item.tabIndex=(focused?.key||first?.key)===key?0:-1; }
+        else item.setAttribute('aria-selected',String(selected));
       }
+      this.syncFocus(); this.scheduleFocus();
+    }
+    tabStop() {
+      const members=[...this.members.values()];
+      let member=focusMember(members,this.focused);
+      if(this.renderer!=='list_tree') return member;
+      const visible=m=> {
+        for(let parent=m.parent; parent!=null; parent=this.members.get(parent)?.parent) if(!this.expanded.has(parent)) return false;
+        return true;
+      };
+      while(member && !visible(member)) member=this.members.get(member.parent);
+      return member?.status==='available' ? member : members.find(m=>m.status==='available' && visible(m));
+    }
+    syncFocus() {
+      const target=this.tabStop();
+      for(const [key,item] of this.items) item.tabIndex=key===target?.key?0:-1;
+      if(this.renderer==='list_tree') this.tree.tabIndex=-1;
+    }
+    scheduleFocus() {
+      if(this.focusQueued) return;
+      this.focusQueued=true;
+      this.ready=Promise.resolve().then(async()=> {
+        const body=this.body;
+        await Promise.all([body,this.tree,...this.items.values()].map(item=>item?.updateComplete));
+        if(this.renderer==='list_tree') {
+          // The wrapper restores declared branch expansion after descendants'
+          // first update. Focus only after that connection work has painted.
+          await new Promise(resolve=>requestAnimationFrame(resolve));
+        }
+        this.focusQueued=false;
+        if(body!==this.body) { this.scheduleFocus(); return; }
+        this.syncFocus();
+        const previous=this.restoreFocus; this.restoreFocus=null;
+        if(!previous) return;
+        // Do not reclaim focus after a user moved to another control while
+        // custom elements were updating.
+        const active=document.activeElement;
+        if(active!==previous && active!==document.body && !body.contains(active)) return;
+        const owner=previous.closest('.goo-topos-member');
+        const retained=owner && this.items.get(owner.dataset.key)===owner && this.members.get(owner.dataset.key)?.status==='available';
+        const target=retained && previous.isConnected ? previous : this.items.get(this.tabStop()?.key);
+        if(target && active!==target) target.focus({preventScroll:true});
+      });
     }
   }
-  root.GooTopoi={Topos,topology};
+  root.GooTopoi={Topos,topology,focusMember};
   if(typeof module!=='undefined') module.exports=root.GooTopoi;
 })(globalThis);

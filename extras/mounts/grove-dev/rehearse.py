@@ -68,7 +68,7 @@ def main():
         print(f'Rebuild including replacement: {time.perf_counter()-started:.3f}s', flush=True)
         return after
     try:
-        assert 'Hello from Grove' in page('/views')
+        assert 'Hello from Grove' in page('/ns')
         assert status()['installed'] is not None
         code, other_state = mutate('install', target=other)
         assert code == 200, other_state
@@ -77,18 +77,17 @@ def main():
         with urllib.request.urlopen(args.url + '/edit' + selected, data=data, timeout=60) as response:
             assert response.status == 200
         assert 'Temporary runtime edit' in page('/ns')
-        changed = original.split('"/notes/second"')[0].replace('Hello from Grove', 'Updated live from Grove').replace('Edit demo.grove, then rebuild.', 'View updated without restarting.')
+        changed = original.split('"/notes/second"')[0].replace('Hello from Grove', 'Updated live from Grove')
         changed += '"/notes/third" =\n  @tree\n  lede: "New child"\n  %/title: "Added live"\n'
         path.write_text(changed)
         updated = rebuild()
-        assert 'Updated live from Grove' in page('/views')
-        assert 'View updated without restarting.' in page('/views')
+        assert 'Updated live from Grove' in page('/ns')
         assert 'Temporary runtime edit' not in page('/ns')
-        assert 'Added live' in page('/views', root + '/notes/third')
-        assert 'Inspect my slots' not in page('/views', root + '/notes/second')
+        assert 'Added live' in page('/ns', root + '/notes/third')
+        assert 'Inspect my slots' not in page('/ns', root + '/notes/second')
         code, missing = request('status', selected_path=root + '/notes/second')
         assert code == 200 and missing['selected'] == root, missing
-        assert 'Hello from Grove' in page('/views', other + '/notes/welcome')
+        assert 'Hello from Grove' in page('/ns', other + '/notes/welcome')
         code, error = mutate('replace', updated, version='1')
         assert code == 409 and error['error'] == 'stale_template', error
         bad = changed + '\nthis = (\n'
@@ -96,7 +95,7 @@ def main():
         before, failed = publish(False)
         assert failed['installed'] == before['installed'] and failed['expected'] == before['expected']
         assert unit(failed)['diagnostic'], failed
-        assert 'Updated live from Grove' in page('/views')
+        assert 'Updated live from Grove' in page('/ns')
         code, error = mutate('replace', failed)
         assert code == 409, error
         path.write_text(changed)
@@ -106,9 +105,9 @@ def main():
         assert unit(deleted)['version'] is not None
         code, installed = mutate('install', deleted)
         assert code == 200 and installed['installed'] is not None, installed
-        assert 'Updated live from Grove' in page('/views')
+        assert 'Updated live from Grove' in page('/ns')
         # Read source/declaration and instance pages through the actual debugger.
-        for target in [source, source + '/note', source + '/note_view', selected]:
+        for target in [source, source + '/note', selected]:
             assert 'debugger/v1' in page('/debug', target)
         print('PASS: edit, rescan, atomic replace, child removal/addition, failure recovery, reset, delete/reinstall, independent instance, and debugger', flush=True)
     finally:

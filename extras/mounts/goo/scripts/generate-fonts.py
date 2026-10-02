@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Import frozen metrics; never regenerate fonts, CSS, or Haskell tables."""
+"""Import pinned metrics from the verified, vendored Mash renderer profile."""
 import hashlib,json,pathlib,sys
 root=pathlib.Path(__file__).resolve().parents[1]
-faces=json.loads((root/'fonts/metrics.json').read_text())
+profile=json.loads((root/'profile/profile.json').read_text())
+faces=json.loads((root/'profile/metrics.json').read_text())
 sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+font_files={f['metricsKey']:f['file'] for f in profile['fonts'].values()}
 for name,f in faces.items():
- assert sha(root/'fonts'/f['source'])==f['sourceSHA256'],name
- assert sha(root/'static'/('goo-'+name+'.ttf'))==f['fontSHA256'],name
+ assert sha(root/'profile'/font_files[name])==f['fontSHA256'],name
  assert len(f['advances'])==95 and f['unitsPerEm']>0,name
 s='''- goo_app/binary64
 - json
 
-' Generated from frozen fonts/metrics.json by generate-foil-fonts.py.
+' Generated from the pinned Mash profile/metrics.json by scripts/generate-fonts.py.
 + goo_fonts
   + face
     & '''+' '.join('goo_fonts/face/'+n.lower() for n in faces)+'\n'

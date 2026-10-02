@@ -1,5 +1,9 @@
 # Panes verification and rehearsal
 
+This is a historical rehearsal record. SRS Goo views and their row controls have
+since been removed, and the panes specimen is now test-only. Current automated
+coverage and commands are in [APPLICATION-INTEGRATION.md](APPLICATION-INTEGRATION.md).
+
 Verified September 30, 2026. API, implementation map, source spellings and limits
 are in [PANES.md](PANES.md). The runnable fixture is
 [`../panes/panes.grove`](../panes/panes.grove).
@@ -11,7 +15,7 @@ Commands executed from the repository root:
 ```sh
 node --test extras/mounts/explorer/tests/*.test.cjs
 WISP=/nix/store/x42s38g8973a3lzjk3qw7dyyd2hlnca1-enki-pgo-0.1.0/bin/wisp \
-  python3 extras/x/check --mount panes --jobs 2
+  python3 extras/x/check --mount explorer --jobs 2
 git diff --check
 ```
 
@@ -80,11 +84,11 @@ for actions authored directly on an installation root.
 ## Run the specimen
 
 ```sh
-WISP=/path/to/wisp python3 x/eden --mount panes --port 8172
+WISP=/path/to/wisp python3 extras/mounts/explorer/scripts/check-integration.py
 ```
 
 Open `http://127.0.0.1:8172/views/0x11/app/panes/study`. The mount includes explorer,
-codecs and SRS. Use the default node `0x11`; the fixture's finite source paths
+codecs. Use the default node `0x11`; the fixture's finite source paths
 are explicit. For a short demonstration, repeat steps 1–5 above and expand
 Inspect local runtime to distinguish focus, accepted/pending choice and capture.
 

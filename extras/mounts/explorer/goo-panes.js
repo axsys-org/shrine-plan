@@ -9,33 +9,38 @@
     constructor(host, context) {
       this.host = host; this.context = context; this.session = new root.GooSession();
       this.elements = new Map(); this.wrappers = new Map(); this.loading = new Map(); this.rendered = new Map(); this.serial = 0;
+      this.observations=new Map(); this.requests=new Map(); this.nativeWorks=new Map(); this.rowWorks=new Map();
+      this.context.workspace ||= host.dataset.workspace; this.context.view ||= host.dataset.view;
       this.inspection = el('details', 'goo-runtime-inspection');
       this.inspection.append(el('summary', '', 'Inspect local runtime')); this.output = el('pre'); this.inspection.append(this.output);
       this.status = el('p', 'goo-local-status'); this.status.setAttribute('role', 'status');
       this.body = host.querySelector('[data-goo-body]') || el('div');
       this.serverNodes = new Map([...this.body.querySelectorAll('[data-goo-node]')].map(n => [n.dataset.gooNode,n]));
       host.replaceChildren(this.status, this.body, this.inspection);
-      this.session.subscribe(() => { this.paint(); });
+      this.session.subscribe(() => { if (!this.updating) this.paint(); });
       this.inspection.addEventListener('toggle', () => this.reflect());
     }
-    async source(path, topology = '', axis = 'z') {
-      const response = await fetch(`/goo/source?${new URLSearchParams({target: path, topology, axis: axis || 'z'})}`, {cache: 'no-store'});
+    async source(path, topology = '', axis = 'z', signal) {
+      const response = await fetch(`/goo/source?${new URLSearchParams({target: path, topology, axis: axis || 'z'})}`, {cache: 'no-store',signal});
       if (!response.ok) throw new Error('Source unavailable');
       const value = await response.json();
       if (!value.bounded) throw new Error('Finite source exceeds 64 members.');
       return value;
     }
-    async update(description, snapshot) {
-      if ([...this.session.owners.values()].some(s => [...s.inputs.values()].some(v => v.composing))) {
-        this.deferredUpdate = [description, snapshot]; return;
+    async update(description, snapshot, options={}) {
+      const {signal}=options;
+      if(signal?.aborted || this.session.closed) return {status:'superseded'};
+      const sequence=++this.serial, current=()=>sequence===this.serial && !signal?.aborted && !this.session.closed;
+      if (this.composing()) {
+        this.deferredUpdate = [description, snapshot,options]; return {status:'deferred'};
       }
-      const sequence = ++this.serial, sources = new Map();
+      const sources = new Map();
       this.memberLoads = new Map();
       const prepare = async nodes => Promise.all(nodes.map(async node => {
         const out = {...node, children: await prepare(node.children || [])};
         if (node.kind === 'selection') {
           const key = JSON.stringify([node.source,node.topology,node.axis]);
-          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis));
+          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis,signal));
           out.source = await sources.get(key);
           if (node.initial != null) {
             out.initial = out.source.members.find(m => m.key === node.initial) || {key: node.initial};
@@ -44,18 +49,63 @@
         if (['list','topos'].includes(node.kind)) out.type = 'namespace-record';
         return out;
       }));
-      const nodes = await prepare(description);
-      if (sequence !== this.serial) return;
-      const result = await this.session.reconcile(nodes);
-      if (sequence !== this.serial || result.status !== 'accepted') return;
-      this.snapshot = snapshot; this.description = nodes;
+      let nodes;
+      try {nodes=await prepare(description);} catch(error) {if(!current())return {status:'superseded'};throw error;}
+      if (!current()) return {status:'superseded'};
+      if(this.composing()) {this.deferredUpdate=[description,snapshot,options];return {status:'deferred'};}
+      const retiringWork = this.retiringWork(nodes);
+      for (const work of retiringWork) {
+        const allowed=await this.session.depart(work,{kind:'presentation-retirement'},{signal});
+        if(!current())return {status:'superseded'};
+        if(!allowed)return {status:'refused'};
+      }
+      if(this.composing()) {this.deferredUpdate=[description,snapshot,options];return {status:'deferred'};}
+      this.updating = (this.updating||0)+1;
+      let result;
+      try { result = await this.session.reconcile(nodes,{signal}); } finally { this.updating--; }
+      if(!current())return {status:'superseded'};
+      if(result.status!=='accepted')return {status:result.status};
+      for (const work of retiringWork) work.release?.();
+      this.snapshot = snapshot; this.description = nodes; this.rawDescription=description;
       this.usedWrappers = new Set();
       const focus = this.host.contains(document.activeElement) ? document.activeElement : null;
       this.layout(nodes, this.body, 'session', []);
       if (focus?.isConnected && document.activeElement !== focus) focus.focus({preventScroll:true});
       for (const key of this.wrappers.keys()) if (!this.usedWrappers.has(key)) this.wrappers.delete(key);
       for (const [key, element] of this.elements) if (!this.session.owners.has(key)) { element.remove(); this.elements.delete(key); this.rendered.delete(key); }
+      for (const [element,held] of this.observations) if (!element.isConnected) { held.stop(); this.observations.delete(element); this.requests.get(element)?.abort(); this.requests.delete(element); }
       this.paint();
+      if(current())options.onApplied?.();
+      return {status:'applied'};
+    }
+    composing() {
+      return [...this.session.owners.values(),...this.nativeWorks.values(),...this.rowWorks.values()]
+        .some(work=>[...work.inputs.values()].some(value=>value.composing));
+    }
+    wrapperKey(owner,node,scopes,serverKey) {
+      const descendants = nodes => nodes.flatMap(n => n.key ? [[n.kind,n.key]] : descendants(n.children || []));
+      return JSON.stringify([owner,node.kind,node.key,scopes,descendants([node]),node.kind==='native'?node.node||serverKey:null]);
+    }
+    retiringWork(nodes) {
+      const plan=this.session.plan(nodes), nativeKeys=new Set();
+      const visit=(nodes,owner='session',scopes=[],route=[])=>{
+        for(const [ordinal,node] of nodes.entries()) {
+          const here=[...route,ordinal], key=id(owner,node.kind,node.key);
+          if(node.kind==='native') nativeKeys.add(this.wrapperKey(owner,node,scopes,here.join('.')));
+          visit(node.children||[],node.kind==='pane'?key:owner,node.kind==='selection'?[...scopes,key]:scopes,here);
+        }
+      };
+      visit(nodes);
+      const retired=[...this.nativeWorks.values()].filter(work=>!nativeKeys.has(work.wrapperKey));
+      for(const work of this.rowWorks.values()) {
+        const topoi=plan.get(work.ownerId), selection=topoi && plan.get(topoi.selectionId);
+        const member=selection?.source.members.find(member=>member.key===work.member.key);
+        if(!member || member.status!=='available' || selection.source.deleted?.includes(member.key) ||
+          JSON.stringify([member.source,member.sourceLife,member.axis||'z',member.key,member.life,member.subject,topoi.slot])!==work.binding) retired.push(work);
+      }
+      // Retiring semantic owners already admit/release their attached work via
+      // GooSession. Only surviving owners need this additional presentation gate.
+      return retired.filter(work=>!work.ref || plan.has(this.session.get(work.ref).id));
     }
     state(owner, kind, key) { return this.session.owners.get(id(owner, kind, key)); }
     layout(nodes, parent, owner, scopes, route = []) {
@@ -76,11 +126,11 @@
         } else {
           // This key retains a rendering wrapper only; it never becomes an
           // ownership/addressing ancestor. Semantic child keys survive reorder.
-          const descendants = nodes => nodes.flatMap(n => n.key ? [[n.kind,n.key]] : descendants(n.children || []));
-          const wrapperKey = JSON.stringify([owner,node.kind,node.key,scopes.map(s=>s.id),descendants([node]),node.kind === 'native' ? [node.html,node.controls] : null]);
+          const wrapperKey = this.wrapperKey(owner,node,scopes.map(s=>s.id),serverKey);
           this.usedWrappers.add(wrapperKey);
           element = this.wrappers.get(wrapperKey);
           if (!element) { element = server || el('div', `goo-${node.kind}`); adopted = !!server; this.wrappers.set(wrapperKey,element); }
+          element.gooWrapperKey=wrapperKey;
         }
         if (adopted) element.removeAttribute('data-goo-node');
         if (node.kind === 'pane') { nextOwner = state.id; element.setAttribute('aria-label', node.key); }
@@ -89,10 +139,7 @@
           if (!state.notice) { state.notice = el('p', 'goo-local-status'); element.prepend(state.notice); }
         }
         if (node.kind === 'native') {
-          if (element.dataset.boundSnapshot === JSON.stringify(this.snapshot)) { desired.push(element); continue; }
-          element.dataset.boundSnapshot = JSON.stringify(this.snapshot);
-          if (!adopted) element.innerHTML = node.html;
-          root.GooActions.bind(element, this.actionContext(this.context.target, this.context.view, this.snapshot, node.controls, scopes));
+          this.native(node,element,scopes,owner,adopted);
         } else if (['navigate','operation','operation_status'].includes(node.kind)) {
           if (!adopted && !state.hostBound) element.innerHTML = node.html;
           this.hostControl(state, element, node);
@@ -138,6 +185,71 @@
         before = element.nextElementSibling;
       }
     }
+    observe(element, callback) {
+      let held = this.observations.get(element);
+      if (held) { held.callback = callback; return; }
+      held = {callback}; this.observations.set(element,held);
+      held.stop = root.GooActions.observe(element, () => {
+        Promise.resolve(held.callback()).catch(error => { if (error.name !== 'AbortError') this.context.report(error.message); });
+      });
+    }
+    async request(element, target, selector) {
+      this.requests.get(element)?.abort();
+      const request = new AbortController(); this.requests.set(element,request);
+      const data = await root.GooActions.load(target,{...selector,context:root.GooActions.context(element),signal:request.signal});
+      if (this.requests.get(element) !== request || !element.isConnected) return null;
+      return data;
+    }
+    native(node, element, scopes, owner, adopted) {
+      this.observe(element, () => this.renderNative(node,element,scopes,owner));
+      if (!this.nativeWorks.has(element)) {
+        const parent = this.session.owners.get(owner) || scopes.at(-1);
+        const work = {id:`native:${owner}:${node.node}`,kind:'native',live:true,inputs:new Map(),generation:0,encounter:{id:node.node},ref:parent?.ref,wrapperKey:element.gooWrapperKey};
+        this.nativeWorks.set(element,work);
+        this.registerWork(work,element);
+      }
+      // Adopted SSR remains visible while the actual container is prepared.
+      if (adopted) element.removeAttribute('data-goo-node');
+      this.renderNative(node,element,scopes,owner).catch(error => { if (error.name !== 'AbortError') this.context.report(error.message); });
+    }
+    nativeSnapshotCurrent(snapshot) {
+      const parent=this.snapshot;
+      const same=parent && (parent.subject||parent.target)===(snapshot.subject||snapshot.target) &&
+        ['life','displayed','publication'].every(key=>parent[key]===snapshot[key]);
+      if(same) return true;
+      // A native fragment shares its enclosing description's scopes and action
+      // authority. Refresh that description before accepting a new publication.
+      if(!this.session.closed && !this.parentRefresh && this.context.refresh) {
+        this.parentRefresh=Promise.resolve().then(()=>{if(!this.session.closed)return this.context.refresh();})
+          .catch(error=>this.context.report(error.message)).finally(()=>{this.parentRefresh=null;});
+      }
+      return false;
+    }
+    async renderNative(node, element, scopes, owner) {
+      const work = this.nativeWorks.get(element);
+      if (!work?.live || [...work.inputs.values()].some(value => value.composing)) return;
+      const context = root.GooActions.context(element);
+      if (!context.width) return;
+      const key = JSON.stringify([node.node,this.snapshot,context]);
+      if (element.dataset.renderKey === key || element.dataset.loadingKey === key) return;
+      element.dataset.loadingKey = key;
+      try {
+        const data = await this.request(element,this.context.target,{view:this.context.view,node:node.node,workspace:this.context.workspace});
+        if (!data || !work.live || element.dataset.loadingKey !== key || [...work.inputs.values()].some(value => value.composing)) return;
+        if(!this.nativeSnapshotCurrent(data.snapshot)) return;
+        const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.publication]);
+        if (work.lifetime && work.lifetime !== lifetime) {
+          if (!(await this.session.depart(work,{kind:'native-replaced'}))) return;
+          if (!work.live || !element.isConnected || element.dataset.loadingKey!==key || [...work.inputs.values()].some(value=>value.composing)) return;
+          if(!this.nativeSnapshotCurrent(data.snapshot)) return;
+          work.inputs.clear(); work.generation++;
+        }
+        const preserve = !work.lifetime || work.lifetime === lifetime; work.lifetime = lifetime;
+        root.GooActions.mount(element,data,preserve,false);
+        root.GooActions.bind(element,this.actionContext(this.context.target,data.view,data.snapshot,data.controls,scopes,work));
+        element.dataset.renderKey = key;
+      } finally { if (element.dataset.loadingKey === key) delete element.dataset.loadingKey; }
+    }
     hostControl(state, element, node) {
       if (state.hostBound) return;
       state.hostBound = true;
@@ -178,7 +290,7 @@
       catch (error) { this.context.report(error.message); }
     }
     list(state, element, node, scopes) {
-      const source = this.session.get(state.selection, 'selection').source;
+      const selection = this.session.get(state.selection, 'selection'), source = selection.source;
       if (!state.topos) {
         const clear=el('button','','Clear selection'); clear.type='button'; clear.addEventListener('click',()=>this.select(state,null));
         state.rows=new Map(); state.serverRows=new Map([...element.querySelectorAll('[data-goo-members] > [data-key]')].map(row=>[row.dataset.key,row]));
@@ -186,42 +298,65 @@
         state.topos=new root.GooTopoi.Topos(element,node.key,member=>this.select(state,member),member=>this.session.focus(state.ref,member));
       }
       const renderer=node.renderer||'list';
-      const members=renderer==='list'?source.members.filter(m=>m.status==='available'):source.members;
-      const keys=new Set(members.map(m=>m.key));
+      const projected=source.members.map(member=>selection.members.get(member.key)||member);
+      const members=renderer==='list'?projected.filter(member=>member.status==='available'):projected;
+      const keys=new Set(members.map(member=>member.key));
       for(const [key,row] of state.rows) if(!keys.has(key)) { row.remove();state.rows.delete(key); }
       state.topos.reconcile(renderer,members,member=> {
         let row=state.rows.get(member.key);
-        if(!row || row.dataset.life!==member.life) {
+        if(!row || row.dataset.life!==member.life || (member.status==='available' && !this.rowWorks.has(row))) {
           row?.remove(); row=state.serverRows.get(member.key)||el('div','goo-member',member.key); state.serverRows.delete(member.key);
           row.dataset.life=member.life; row.dataset.key=member.key; state.rows.set(member.key,row);
-          const browse=row.querySelector('[data-goo-navigation]');
-          if(browse) browse.addEventListener('click',async event=> {
-            if(event.metaKey||event.ctrlKey||event.shiftKey||event.altKey||!this.context.navigate) return;
-            event.preventDefault(); if(await this.close()) this.context.navigate(member.subject);
-          });
         }
-        const expected=JSON.stringify([member.expected,node.slot,this.snapshot?.publication]);
-        if(member.status==='available' && row.dataset.expected!==expected) {
-          row.dataset.expected=expected;
-          row.inert=true;
-          const cacheKey=JSON.stringify([member.subject,member.life,member.expected,this.snapshot?.publication]);
-          this.memberLoads ||= new Map();
-          if(!this.memberLoads.has(cacheKey)) this.memberLoads.set(cacheKey,root.GooActions.load(member.subject));
-          this.memberLoads.get(cacheKey).then(data=> {
-            if(!state.live||!row.isConnected||row.dataset.expected!==expected||data.snapshot.life!==member.life) return;
-            const template=root.GooActions.choose(data.templates,node.slot);
-            if(template.querySelector('.goo-session')) throw new Error('Member presentations must be views.');
-            const navigation=row.querySelector('[data-goo-navigation]');
-            row.replaceChildren(template.cloneNode(true)); if(navigation) row.append(navigation);
-            root.GooActions.bind(row,this.actionContext(member.subject,template.dataset.view,data.snapshot,null,scopes));
-          }).catch(error=> { if(state.live&&row.dataset.expected===expected) row.textContent=`${member.key}: ${error.message}`; })
-            .finally(()=> { if(row.dataset.expected===expected) row.inert=false; });
+        if(member.status!=='available') { row.textContent=`${member.key}: unavailable`; return row; }
+        let work=this.rowWorks.get(row);
+        if(!work) {
+          const binding=JSON.stringify([member.source,member.sourceLife,member.axis||'z',member.key,member.life,member.subject,node.slot]);
+          work={id:`member:${state.id}:${member.key}`,kind:'member',live:true,inputs:new Map(),generation:0,encounter:{id:binding},ref:state.ref,ownerId:state.id,member,binding};
+          this.rowWorks.set(row,work);this.registerWork(work,row);
         }
+        const render = async () => {
+          if (!state.live || !work.live || !row.isConnected || member.status !== 'available' || [...work.inputs.values()].some(value=>value.composing)) return;
+          const context = root.GooActions.context(row);
+          if (!context.width) return;
+          const expected=JSON.stringify([member.subject,member.life,member.expected,node.slot,this.snapshot?.publication,context]);
+          if (row.dataset.expected===expected || row.dataset.loadingKey===expected) return;
+          row.dataset.loadingKey=expected; if(!row.dataset.expected) row.inert=true;
+          try {
+            const data=await this.request(row,member.subject,{slot:node.slot});
+            if (!data || !state.live || !work.live || row.dataset.loadingKey!==expected || data.snapshot.life!==member.life || [...work.inputs.values()].some(value=>value.composing)) return;
+            if (data.description) throw new Error('Member presentations must be views.');
+            const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.publication]);
+            if(work.lifetime && work.lifetime!==lifetime) {
+              if(!(await this.session.depart(work,{kind:'member-view-replaced'}))) return;
+              if(!work.live || !row.isConnected || row.dataset.loadingKey!==expected || [...work.inputs.values()].some(value=>value.composing)) return;
+              work.inputs.clear();work.generation++;
+            }
+            const preserve=!work.lifetime || work.lifetime===lifetime;work.lifetime=lifetime;
+            root.GooActions.mount(row,data,preserve);
+            if (node.browse) {
+              const navigation=el('a','',node.browse); navigation.dataset.gooNavigation='';
+              navigation.href=`?path=${encodeURIComponent(member.subject)}`;
+              navigation.addEventListener('click',async event=> {
+                if(event.metaKey||event.ctrlKey||event.shiftKey||event.altKey||!this.context.navigate) return;
+                event.preventDefault(); if(await this.close()) this.context.navigate(member.subject);
+              }); row.append(navigation);
+            }
+            root.GooActions.bind(row,this.actionContext(member.subject,data.view,data.snapshot,data.controls,scopes,work));
+            row.dataset.expected=expected;
+          } catch (error) { if(error.name!=='AbortError' && state.live && row.dataset.loadingKey===expected) this.context.report(`${member.key}: ${error.message}`); }
+          finally { if(row.dataset.loadingKey===expected) {delete row.dataset.loadingKey;row.inert=false;} }
+        };
+        this.observe(row,render); render();
         return row;
       });
     }
     registerWork(state, element) {
-      this.session.guard(state.ref, async reason => {
+      if(state.release) return;
+      state.guards ||= new Set();
+      const guard = async (reason,{signal}={}) => {
+        if(signal?.aborted) return false;
+        if (!state.live) return true;
         if ([...state.inputs.values()].some(v => v.composing)) { state.diagnostic = 'composition-in-progress'; return false; }
         if (![...state.inputs.values()].some(v => v.dirty)) return true;
         if (state.departure) state.departure.finish(false);
@@ -229,35 +364,55 @@
           const prompt = el('div', 'goo-departure'); prompt.setAttribute('role', 'status');
           prompt.append(el('p', '', 'Unsaved input: stay here, or discard it and leave.'));
           const stay = el('button', '', 'Stay'), leave = el('button', '', 'Discard and leave');
-          stay.type = leave.type = 'button'; prompt.append(stay, leave); element.append(prompt);
+          stay.type = leave.type = 'button'; prompt.append(stay, leave);
+          // Suspended deck contents and pending/inert presentations cannot host
+          // an actionable prompt. Keep its guard on the same work, but present
+          // the decision in the visible session shell.
+          const promptHost=state.suspended || element.closest?.('[hidden],[inert]') ? this.host : element;
+          promptHost.append(prompt);
           const finish = allowed => {
             if (state.departure?.prompt !== prompt) return;
-            prompt.remove(); state.departure = null; resolve(allowed);
+            signal?.removeEventListener('abort',cancel);prompt.remove(); state.departure = null; resolve(allowed);
           };
+          const cancel=()=>finish(false);
           state.departure = {prompt, finish}; stay.addEventListener('click', () => finish(false));
           leave.addEventListener('click', () => finish(![...state.inputs.values()].some(v => v.composing)));
+          signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
         });
-      });
-      this.session.resource(state.ref, {
+      };
+      state.guards.add(guard);
+      const unguard = state.ref ? this.session.guard(state.ref, guard) : ()=>{};
+      let unregister=()=>{}, released=false;
+      state.release=()=>{
+        if(released) return;released=true;
+        state.departure?.finish(false);state.live=false;state.generation++;
+        unguard();unregister();state.guards.delete(guard);state.inputs.clear();element.remove();
+        this.requests.get(element)?.abort();this.requests.delete(element);
+        this.observations.get(element)?.stop();this.observations.delete(element);
+        this.nativeWorks.delete(element);this.rowWorks.delete(element);this.loading.delete(state.id);this.rendered.delete(state.id);
+      };
+      const resource={
         suspend: () => { for (const media of element.querySelectorAll('video,audio')) media.pause(); },
         resume: () => { this.rendered.delete(state.id); },
-        release: () => { element.remove(); this.loading.delete(state.id); this.rendered.delete(state.id); }
-      });
+        release: state.release
+      };
+      if(state.ref) unregister=this.session.resource(state.ref,resource);
     }
     actionContext(target, view, snapshot, controls, scopes, follower) {
       const encounter = follower?.encounter?.id, generation = follower?.generation;
       const continuing = () => follower?.live && follower.encounter?.id === encounter && follower.generation === generation;
-      return {target, view, snapshot, controls, report: this.context.report,
-        input: (key, input) => {
+      return {target, view, snapshot, controls, actionScope:follower, report: this.context.report,
+        input: (key, input, signal) => {
           if (!follower) return;
           let work = follower.inputs.get(key);
           if (!work) { work = {value: input.value, dirty: false, composing: false}; follower.inputs.set(key, work); }
+          if (!work.dirty && !work.composing) work.value = input.getAttribute?.('value') ?? input.value;
           input.value = work.value;
-          input.addEventListener('input', () => { work.value = input.value; work.dirty = true; this.reflect(); });
-          input.addEventListener('compositionstart', () => { work.composing = true; });
+          input.addEventListener('input', () => { work.value = input.value; work.dirty = true; this.reflect(); },{signal});
+          input.addEventListener('compositionstart', () => { work.composing = true; },{signal});
           input.addEventListener('compositionend', () => { work.value = input.value; work.composing = false;
             if (this.deferredUpdate) { const args = this.deferredUpdate; this.deferredUpdate = null; this.update(...args).catch(e=>this.context.report(e.message)); }
-            else this.paint(); });
+            else { this.paint(); for (const held of this.observations.values()) Promise.resolve(held.callback()).catch(e=>this.context.report(e.message)); } },{signal});
         },
         capture: (operands, invocation) => {
           const refs = operands.map(op => {
@@ -268,7 +423,7 @@
           return operands.map((op, index) => ({slot: op.slot, value: values[index]}));
         },
         become: async slot => {
-          if (!follower) throw new Error('This control requires a present encounter.');
+          if (!follower || follower.kind !== 'follow') throw new Error('This control requires a present encounter.');
           if (!continuing()) return;
           if (!(await this.session.depart(follower, {kind: 'recipe'}))) return;
           if (!continuing()) return;
@@ -304,44 +459,57 @@
       this.reflect();
     }
     async follow(state, element) {
+      this.observe(element, () => this.follow(state,element));
       const selection = this.session.read(state.selection), ticket = this.session.ticket(state.ref);
-      const key = JSON.stringify({...ticket, ref: undefined});
+      const context = root.GooActions.context(element);
+      if (!context.width) return;
+      const key = JSON.stringify([{...ticket,ref:undefined},context]);
       if (this.rendered.get(state.id) === key || this.loading.get(state.id) === key) return;
-      if ([...state.inputs.values()].some(v => v.composing)) return;
+      if ([...state.inputs.values()].some(value => value.composing)) return;
       const member = selection.accepted;
       if (!member || member.status !== 'available') {
-        this.loading.delete(state.id); element.inert = false; element.removeAttribute('aria-busy');
+        this.requests.get(element)?.abort(); this.loading.delete(state.id); element.inert=false; element.removeAttribute('aria-busy');
         element.textContent = member ? 'Selected member is unavailable.' : 'Choose a member.';
-        this.rendered.set(state.id, key); return;
+        this.rendered.set(state.id,key); return;
       }
-      this.loading.set(state.id, key); element.setAttribute('aria-busy', 'true');
-      element.inert = true;
-      element.dataset.status = 'loading'; this.status.textContent = 'Loading accepted selection…';
+      this.loading.set(state.id,key); element.setAttribute('aria-busy','true');
+      // Keep an existing editor interactive during context-only preparation.
+      if (element.dataset.encounter !== String(ticket.encounter)) element.inert=true;
+      element.dataset.status='loading'; this.status.textContent='Loading accepted selection…';
       try {
-        const data = await root.GooActions.load(member.subject);
-        if (!this.session.current(ticket) || state.suspended) return;
-        if (data.snapshot.life !== member.life || (data.snapshot.subject || data.snapshot.target) !== member.subject) throw new Error('Selected subject was removed or replaced.');
-        const template = root.GooActions.choose(data.templates, state.encounter.recipe);
-        if (template.querySelector('.goo-session')) throw new Error('Nested local-session member views are not supported.');
-        // Never detach an active composition to apply asynchronous rendering.
-        if ([...state.inputs.values()].some(v => v.composing)) return;
-        if (element.contains(document.activeElement) && document.activeElement.matches('input,textarea')) {
-          document.activeElement.addEventListener('blur', () => this.paint(), {once:true}); return;
-        }
-        element.replaceChildren(template.cloneNode(true));
-        const scopes = state.spec.scopes.map(id => this.session.owners.get(id));
-        root.GooActions.bind(element, this.actionContext(member.subject, template.dataset.view, data.snapshot, null, scopes, state));
-        this.rendered.set(state.id, key); element.dataset.status = 'current';
+        const data=await this.request(element,member.subject,{slot:state.encounter.recipe});
+        if (!data || !this.session.current(ticket) || state.suspended || this.loading.get(state.id)!==key) return;
+        if (data.snapshot.life!==member.life || (data.snapshot.subject||data.snapshot.target)!==member.subject) throw new Error('Selected subject was removed or replaced.');
+        if (data.description) throw new Error('Nested local-session member views are not supported.');
+        if ([...state.inputs.values()].some(value=>value.composing)) return;
+        const preserve=element.dataset.encounter===String(ticket.encounter);
+        root.GooActions.mount(element,data,preserve);
+        element.dataset.encounter=String(ticket.encounter);
+        const scopes=state.spec.scopes.map(id=>this.session.owners.get(id));
+        root.GooActions.bind(element,this.actionContext(member.subject,data.view,data.snapshot,data.controls,scopes,state));
+        this.rendered.set(state.id,key); element.dataset.status='current';
       } catch (error) {
-        if (this.session.current(ticket)) { element.textContent = error.message; element.dataset.status = 'unavailable'; this.rendered.set(state.id, key); }
+        if (error.name!=='AbortError' && this.session.current(ticket) && this.loading.get(state.id)===key) {
+          if(element.dataset.encounter===String(ticket.encounter)) {
+            element.dataset.status='error';this.context.report(error.message);
+          } else {
+            element.textContent=error.message;element.dataset.status='unavailable';this.rendered.set(state.id,key);
+          }
+        }
       } finally {
-        if (this.loading.get(state.id) === key) { this.loading.delete(state.id); element.removeAttribute('aria-busy'); element.inert = false; this.status.textContent = ''; }
+        if(this.loading.get(state.id)===key) { this.loading.delete(state.id);element.removeAttribute('aria-busy');element.inert=false;this.status.textContent=''; }
       }
     }
     reflect() { if (this.inspection.open) this.output.textContent = JSON.stringify({...this.session.inspect(), domainActions: root.GooActions.metrics}, null, 2); }
-    async close() { const result = await this.session.reconcile([]); if (result.status !== 'accepted') return false; this.serial++; this.session.closed = true; return true; }
+    async close() {
+      ++this.serial;this.deferredUpdate=null;
+      for(const work of [...this.nativeWorks.values(),...this.rowWorks.values()]) if(!work.ref && !(await this.session.depart(work,{kind:'retirement'}))) return false;
+      const result=await this.session.reconcile([]);if(result.status!=='accepted') return false;
+      this.session.closed=true;
+      for(const work of [...this.nativeWorks.values(),...this.rowWorks.values()]) work.release?.();
+      for(const held of this.observations.values()) held.stop();this.observations.clear();
+      for(const request of this.requests.values()) request.abort();this.requests.clear();return true;
+    }
   }
-  const update = GooPanes.prototype.update;
-  GooPanes.prototype.update = function (description, snapshot) { this.rawDescription = description; return update.call(this, description, snapshot); };
   root.GooPanes = GooPanes;
 })(globalThis);

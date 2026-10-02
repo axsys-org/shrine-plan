@@ -95,7 +95,7 @@ def lower(source,options=None,output_only=False):return production_source(source
 
 def layout(request):
     if not isinstance(request,dict) or 'width' not in request or 'tree' not in request:raise ValueError('Invalid layout JSON.')
-    result=native('production-layout',{**request,'direction':'ltr','viewPath':DEFAULT_VIEW},verify()[0])
+    result=native('production-layout',{'direction':'ltr','viewPath':DEFAULT_VIEW,**request},verify()[0])
     if not result.pop('ok',False):raise ValueError(result.get('error','Invalid layout JSON.'))
     return result
 
@@ -231,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
                 (root/'examples'/(parts[1]+'.goo')).write_text(self.body().decode('utf-8','replace'),encoding='utf-8')
                 return self.send(204)
         if method=='GET' and parts==['version']:
-            files=[*(root/'static').glob('*'),*(root/'static/inspector').glob('*'),root/'src/goo.generated.css']
+            files=[*(root/'static').glob('*'),*(root/'static/inspector').glob('*'),*(PACKAGE/'profile').glob('*'),root/'src/goo.generated.css']
             return self.json(dict(boot=self.server.boot,assets=max((stamp(p) for p in files if p.is_file()),default='')))
         if method=='GET' and ((len(parts)==2 and parts[0]=='static') or (len(parts)==3 and parts[:2]==['static','inspector'])) and valid_file(parts[-1]):
             path=root.joinpath(*parts)
@@ -239,7 +239,7 @@ class Handler(BaseHTTPRequestHandler):
             if parts==['static','goo.generated.css']:
                 path=root/'src/goo.generated.css';tag='"'+stamp(path)+':'+str(path.stat().st_size)+'"';headers.append(('ETag',tag))
                 if self.headers.get('If-None-Match')==tag:return self.send(304,b'','text/css; charset=utf-8',headers)
-            mime={'.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.ttf':'font/ttf','.html':'text/html; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'}.get(path.suffix,'application/octet-stream')
+            mime={'.json':'application/json','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.ttf':'font/ttf','.html':'text/html; charset=utf-8','.svg':'image/svg+xml','.png':'image/png'}.get(path.suffix,'application/octet-stream')
             return self.send(200,path.read_bytes(),mime,headers)
         self.send(404,'not found')
 

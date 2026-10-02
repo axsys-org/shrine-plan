@@ -1,0 +1,220 @@
+- goo_app/layout
+- goo_app/profile
+
+' Checked, renderer-neutral preparation. The legacy type namespace is retained
+' for source compatibility; no HTML or browser API is used by this module.
+' Public consumers revalidate the shared semantic tree, plan and text context.
++ goo_html_internal
+  + node
+    : semantic=goo/semantic plan=goo_measure/plan lines=maybe[list[str]] rows=list[goo_html_internal/paint_row]
+  + paint_row
+    : gap=goo/scalar gaps=list[goo/scalar] children=list[goo_html_internal/node]
+  + prepared
+    : width=goo/scalar scale=goo/scalar rtl=bool measurement=goo_measure/result tree=maybe[goo_html_internal/node]
+  + lookup
+    \ nodes=list[goo/semantic] id=goo/node_id
+    ^ maybe[goo/semantic]
+    ? nodes.is_nil .none
+    ? (eq nodes.head.node_id.text id.text) (./some nodes.head)
+    | goo_html_internal/lookup nodes.tail id
+  + build
+    \ nodes=list[goo/semantic] scale=goo/scalar plan=goo_measure/plan
+    ^ maybe[goo_html_internal/node]
+    < node (goo_html_internal/lookup nodes plan.id)
+    = source_rows (plan.rows.fall((list/nil[goo_measure/plan_row])))
+    < rows
+      | source_rows.traverse_maybe
+        \ row=goo_measure/plan_row
+        < children (row.children.traverse_maybe((goo_html_internal/build nodes scale)))
+        | ./some (goo_html_internal/paint_row row.gap row.gaps.fall((list/nil[goo/scalar])) children)
+    | ./some (goo_html_internal/node node plan (goo_ascii/text_lines scale node plan.width) rows)
+
++ goo_prepared
+  + result
+    goo_html_internal/prepared
+  + prepare
+    \ tree=maybe[goo/semantic] width=goo/scalar scale=goo/scalar rtl=bool
+    ^ either[str goo_html_internal/prepared]
+    ? (!(goo_layout/valid width) || !(goo_layout/valid scale) || !(goo_fp/lte width (goo_fp/integer 100000)) || (goo_fp/lte scale (goo/scalar 0)) || !(goo_fp/lte scale (goo_fp/integer 10))) (./err "invalid render dimensions")
+    = invalid=maybe[str]
+        ? tree
+         > ./none .none
+         > (./some node) (goo_ascii/check node)
+    ? invalid
+     > (./some message) (./err message)
+    > (./some measured) (goo_layout/plan_with (\ n (./some (goo_ascii/leaf_size scale n))) (\ n w (./some (goo_ascii/leaf_height scale n w))) tree width) (./err "invalid layout measurements")
+    = built=maybe[maybe[goo_html_internal/node]]
+        ? measured.value.plan
+         > ./none (./some .none)
+         > (./some plan)
+          < root tree
+          < node (goo_html_internal/build (goo_measure/nodes root) scale plan)
+          | ./some (./some node)
+    > (./some built) built (./err "render plan references unknown node")
+    | ./ok (goo_html_internal/prepared width scale rtl measured built)
+  + valid
+    \ prepared=goo_html_internal/prepared
+    ^ bool
+    = width prepared.width
+      scale prepared.scale
+    ? (!(goo_layout/valid width) || !(goo_layout/valid scale) || !(goo_fp/lte width (goo_fp/integer 100000)) || (goo_fp/lte scale (goo/scalar 0)) || !(goo_fp/lte scale (goo_fp/integer 10))) .false
+    > (./some checked) (goo_measure/make prepared.measurement.value) .false
+    ? !(equal[goo/scalar] checked.value.width (goo_layout/quantize width)) .false
+    ? checked.value.tree
+     > ./none (equal[maybe[goo_html_internal/node]] prepared.tree .none)
+     > (./some root)
+      ? (maybe/is_some (goo_ascii/check root)) .false
+      > (./some sizes) (goo_layout/summaries (\ n (./some (goo_ascii/leaf_size scale n))) root) .false
+      ? !(equal[list[goo_measure/named_size]] sizes checked.value.sizes) .false
+      > (./some plan) checked.value.plan .false
+      = nodes (goo_measure/nodes root)
+        plans (goo_measure/plans plan)
+        heights_ok=bool
+          % i=nat 0
+          ^ bool
+          ? (eq i plans.len) .true
+          > (./some n) (goo_html_internal/lookup nodes plans.at(i).id) .false
+          ? !(eq (goo_ascii/kind n) "group")
+            ? !(equal[goo/scalar] plans.at(i).height (goo_ascii/leaf_height scale n plans.at(i).width)) .false
+            | _ i.inc
+          | _ i.inc
+      ? !heights_ok .false
+      ? !(goo_prepared/geometry_valid plan) .false
+      | equal[maybe[goo_html_internal/node]] prepared.tree (goo_html_internal/build nodes scale plan)
+  + geometry_valid
+    ' Consumer boundaries also check the aggregate geometry used for positioning.
+    \ plan=goo_measure/plan
+    ^ bool
+    ? plan.rows
+     > ./none .true
+     > (./some rows)
+      ? !(equal[goo/scalar] plan.height (goo_layout/total rows.map((\ row=goo_measure/plan_row (goo_fp/plus row.gap row.height))))) .false
+      ? !(equal[goo/scalar] rows.head.gap (goo/scalar 0)) .false
+      | list/all[goo_measure/plan_row] goo_prepared/row_geometry_valid rows
+  + row_geometry_valid
+    \ row=goo_measure/plan_row
+    ^ bool
+    ? !(equal[goo/scalar] row.height (goo_layout/largest row.children.map((\ child=goo_measure/plan child.height)))) .false
+    | list/all[goo_measure/plan] goo_prepared/geometry_valid row.children
+  + stacked
+    \ node=goo_html_internal/node
+    ^ bool
+    ? node.semantic
+     > (goo/semantic/flow _ direction children)
+      ? direction
+       > ./col (gt children.len 1)
+       > ./row .false
+    .false
+  + top_aligned
+    \ row=goo_html_internal/paint_row
+    ^ bool
+    | list/any[goo_html_internal/node] goo_prepared/stacked row.children
+  + row_height
+    \ row=goo_html_internal/paint_row
+    ^ goo/scalar
+    | goo_layout/largest row.children.map((\ child=goo_html_internal/node child.plan.height))
+  + positioned
+    ' Absolute physical coordinates in CSS pixels, independent of a painter.
+    : node=goo_html_internal/node parent=maybe[goo/node_id] x=goo/scalar y=goo/scalar
+  + positions
+    \ node=goo_html_internal/node parent=maybe[goo/node_id] x=goo/scalar y=goo/scalar rtl=bool
+    ^ list[goo_prepared/positioned]
+    | (goo_prepared/position_rows node.rows node.plan.width node.semantic.node_id x y rtl).cons((goo_prepared/positioned node parent x y))
+  + position_rows
+    \ rows=list[goo_html_internal/paint_row] width=goo/scalar parent=goo/node_id x=goo/scalar y=goo/scalar rtl=bool
+    ^ list[goo_prepared/positioned]
+    ? rows.is_nil .nil
+    = row rows.head
+      height (goo_prepared/row_height row)
+      top (goo_fp/plus y row.gap)
+      children (goo_prepared/position_children row.children row.gaps width height (goo_prepared/top_aligned row) parent x top (goo/scalar 0) rtl)
+    | children.weld((goo_prepared/position_rows rows.tail width parent x (goo_fp/plus top height) rtl))
+  + position_children
+    \ children=list[goo_html_internal/node] gaps=list[goo/scalar] width=goo/scalar height=goo/scalar top_aligned=bool parent=goo/node_id x=goo/scalar y=goo/scalar inline=goo/scalar rtl=bool
+    ^ list[goo_prepared/positioned]
+    ? children.is_nil .nil
+    = child children.head
+      left (goo_fp/plus x (? rtl (goo_fp/minus (goo_fp/minus width inline) child.plan.width) inline))
+      top (goo_fp/plus y (? top_aligned (goo/scalar 0) (goo_fp/quotient (goo_fp/minus height child.plan.height) (goo_fp/integer 2))))
+      next (goo_fp/plus (goo_fp/plus inline child.plan.width) (? gaps.is_nil (goo/scalar 0) gaps.head))
+    | (goo_prepared/positions child (./some parent) left top rtl).weld((goo_prepared/position_children children.tail gaps.tail width height top_aligned parent x y next rtl))
+  + box_json
+    \ x=goo/scalar y=goo/scalar width=goo/scalar height=goo/scalar
+    ^ json
+    | json/obj [(jkv "x" (goo_number/encode x)) (jkv "y" (goo_number/encode y)) (jkv "width" (goo_number/encode width)) (jkv "height" (goo_number/encode height))]
+  + style_json
+    \ scale=goo/scalar node=goo/semantic
+    ^ json
+    = style (goo_ascii/text_style scale node)
+      font (goo_fonts/metadata style.face)
+    | json/obj [(jkv "fontId" (json/str (goo_profile/font_id style.face))) (jkv "fontSHA256" (json/str font.font_sha256)) (jkv "family" (json/str (goo_profile/font_family style.face))) (jkv "weight" (goo_codec/number (goo_profile/font_weight style.face))) (jkv "style" (json/str (goo_profile/font_style style.face))) (jkv "fontSize" (goo_number/encode style.pixels)) (jkv "lineHeight" (goo_number/encode style.leading)) (jkv "letterSpacing" (goo_number/encode style.tracking)) (jkv "insetX" (goo_number/encode style.inset_x)) (jkv "insetY" (goo_number/encode style.inset_y)) (jkv "kerning" (json/boo .false)) (jkv "ligatures" (json/boo .false))]
+  + lines
+    \ node=goo_html_internal/node
+    ^ list[str]
+    ' Editable contents belong to the native control, inside its allocated box.
+    ' Static lines would misrepresent tabs and immediately become stale on edit.
+    ? (eq (goo_ascii/kind node.semantic) "input") .nil
+    ? node.lines
+     > (./some lines) lines
+    ? node.semantic
+     > (goo/semantic/image _ _) .nil
+     > (goo/semantic/flow _ _ _) .nil
+    = text (goo_ascii/payload node.semantic)
+    ? (eq text "") .nil
+    | list/one (goo_ascii/words (goo_ascii/normalized text))
+  + lines_json
+    ' Line boxes are absolute. textX is the physical left edge of the text;
+    ' firstLinePrefix reserves the status marker without changing source text.
+    \ scale=goo/scalar rtl=bool positioned=goo_prepared/positioned
+    ^ json
+    = node positioned.node
+      style (goo_ascii/text_style scale node.semantic)
+      kind (goo_ascii/kind node.semantic)
+      centered ((eq kind "button") || (eq kind "avatar"))
+      lines (goo_prepared/lines node)
+      prefix (goo_ascii/prefix scale node.semantic)
+      baseline_offset (goo_fp/plus (goo_fp/quotient style.leading (goo_fp/integer 2)) (goo_fp/quotient (goo_fp/times style.pixels (goo_fp/quotient (goo_fp/integer (sub (goo_profile/font_ascent style.face) (goo_profile/font_descent style.face))) (goo_fp/integer (goo_profile/font_units style.face)))) (goo_fp/integer 2)))
+      inset_x (goo_fp/quotient style.inset_x (goo_fp/integer 2))
+      inset_y (? (eq kind "avatar") (goo_fp/quotient (goo_fp/minus node.plan.height style.leading) (goo_fp/integer 2)) (goo_fp/quotient style.inset_y (goo_fp/integer 2)))
+      output=list[json]
+        % remaining=list[str] lines index=nat 0
+        ^ list[json]
+        ? remaining.is_nil .nil
+        = text_width (goo_ascii/width_of style remaining.head)
+          marker (? (eq index 0) prefix (goo/scalar 0))
+          width (goo_fp/plus text_width marker)
+          offset (? centered (goo_fp/quotient (goo_fp/minus node.plan.width width) (goo_fp/integer 2)) (? rtl (goo_fp/minus (goo_fp/minus node.plan.width inset_x) width) inset_x))
+          x (goo_fp/plus positioned.x offset)
+          y (goo_fp/plus positioned.y (goo_fp/plus inset_y (goo_fp/times (goo_fp/integer index) style.leading)))
+          text_x (goo_fp/plus x (? rtl (goo/scalar 0) marker))
+          record (json/obj [(jkv "text" (json/str remaining.head)) (jkv "box" (goo_prepared/box_json x y width style.leading)) (jkv "textX" (goo_number/encode text_x)) (jkv "baseline" (goo_number/encode (goo_fp/plus y baseline_offset))) (jkv "prefixAdvance" (goo_number/encode marker))])
+        | (_ remaining.tail index.inc).cons(record)
+    | json/arr output.row
+  + node_json
+    \ scale=goo/scalar rtl=bool positioned=goo_prepared/positioned
+    ^ json
+    = node positioned.node
+      semantic node.semantic
+      fields=row[jkv]
+        [(jkv "id" (json/str semantic.node_id.text)) (jkv "parentId" (goo_codec/optional_json[goo/node_id] (\ id (json/str id.text)) positioned.parent)) (jkv "kind" (json/str (goo_ascii/kind semantic))) (jkv "role" (json/str (goo_ascii/role semantic))) (jkv "slot" (json/str semantic.attrs.common.slot.text)) (jkv "config" (json/obj (goo_codec/config_json semantic.attrs.common.config))) (jkv "payload" (json/str (goo_ascii/payload semantic))) (jkv "box" (goo_prepared/box_json positioned.x positioned.y node.plan.width node.plan.height)) (jkv "textStyle" (goo_prepared/style_json scale semantic)) (jkv "lines" (goo_prepared/lines_json scale rtl positioned))]
+      fields=row[jkv]
+        ? semantic
+         > (goo/semantic/image _ src) fields.snoc((jkv "src" (json/str src)))
+        fields
+    | json/obj fields
+  + encode
+    ' Export only checked preparation. Consumers paint boxes and line boxes;
+    ' they never need flow, adjacency, wrapping, or a browser measurement pass.
+    \ prepared=goo_html_internal/prepared
+    ^ maybe[json]
+    ? !(goo_prepared/valid prepared) .none
+    = nodes=list[goo_prepared/positioned]
+        ? prepared.tree
+         > ./none .nil
+         > (./some root) (goo_prepared/positions root .none (goo/scalar 0) (goo/scalar 0) prepared.rtl)
+      height=goo/scalar
+        ? prepared.tree
+         > ./none (goo/scalar 0)
+         > (./some root) root.plan.height
+      context (json/obj [(jkv "width" (goo_number/encode prepared.width)) (jkv "textScale" (goo_number/encode prepared.scale)) (jkv "direction" (json/str (? prepared.rtl "rtl" "ltr")))])
+    | ./some (json/obj [(jkv "version" (goo_codec/number 1)) (jkv "profile" (goo_profile/metadata unit/unit)) (jkv "context" context) (jkv "coordinates" (json/str "absolute-css-px")) (jkv "width" (goo_number/encode prepared.measurement.value.width)) (jkv "height" (goo_number/encode height)) (jkv "nodes" (json/arr nodes.map((goo_prepared/node_json prepared.scale prepared.rtl)).row))])

@@ -52,12 +52,32 @@
   if (!root.document) return;
   for (const host of document.querySelectorAll('.goo-session[data-operations]')) {
     const operations = new GooWorkspace(JSON.parse(host.dataset.operations));
+    let revision=0, request, controller, lifetime;
     const report = message => { controller.status.textContent = message; };
-    const controller = new root.GooPanes(host, {
-      target:host.dataset.target, view:'', operations, report,
+    const refresh = async () => {
+      const current=++revision; request?.abort(); request=new AbortController();
+      try {
+        const data=await root.GooActions.load(host.dataset.target,{workspace:host.dataset.workspace,view:host.dataset.view,context:root.GooActions.context(host),signal:request.signal});
+        if(current!==revision) return;
+        const nextLifetime=JSON.stringify([data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.view]);
+        if(lifetime && lifetime!==nextLifetime && !controller.session.closed) {
+          if(!(await controller.close()) || current!==revision) return;
+        }
+        if(controller.session.closed) controller=createController();
+        lifetime=nextLifetime;
+        await controller.update(data.description,data.snapshot,{signal:request.signal,onApplied:()=>{
+          if(current!==revision) return;
+          host.dataset.renderContext=JSON.stringify(data.context); host.dataset.profileRevision=data.profile.revision;
+        }});
+      } catch(error) { if(error.name!=='AbortError' && current===revision) report(error.message); }
+    };
+    const createController = () => new root.GooPanes(host, {
+      target:host.dataset.target, view:host.dataset.view, workspace:host.dataset.workspace, operations, report,
       navigate: path => { const url = new URL(root.location.href); url.searchParams.set('path',path); root.location.assign(url); },
-      refresh: () => root.location.reload()
+      refresh
     });
-    controller.update(JSON.parse(host.dataset.description), {path:host.dataset.target}).catch(error => report(error.message));
+    controller=createController();
+    root.GooActions.observe(host,refresh);
+    refresh();
   }
 })(globalThis);

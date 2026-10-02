@@ -121,6 +121,32 @@ test('topos identity and selection survive renderer changes',async()=> {
  await s.reconcile(make('list_tree')); assert.equal(state(s,'topos').ref,topo.ref);
 });
 
+test('focus follows only live projected identities without changing accepted selection',async()=> {
+ const {s,sel,list}=await setup(B);
+ s.focus(list.ref,B);
+ await s.reconcile(description(null,[C,A]));
+ assert.equal(list.focus.key,'C'); assert.equal(sel.accepted.key,'B'); assert.equal(sel.accepted.status,'available');
+ assert.throws(()=>s.focus(list.ref,B),/unavailable-focus-member/);
+ await s.reconcile(description(null,[{...C,status:'unavailable'},A]));
+ assert.equal(list.focus.key,'A'); assert.equal(sel.accepted.key,'B');
+ const deleted=description(null,[A,C]); deleted[0].children[0].source.deleted=['A'];
+ await s.reconcile(deleted); assert.equal(list.focus.key,'C');
+ assert.throws(()=>s.focus(list.ref,A),/unavailable-focus-member/);
+ await s.reconcile(description(null,[])); assert.equal(list.focus,null); assert.equal(sel.accepted.key,'B');
+ assert.equal(s.events.some(event=>event.kind==='selection-accepted'),false);
+});
+
+test('reused keys cannot silently retain old focus lifetime or forge current metadata',async()=> {
+ const {s,sel,list}=await setup(B);
+ s.focus(list.ref,B);
+ const replacement=member('B','new-B','2');
+ await s.reconcile(description(null,[C,replacement]));
+ assert.equal(list.focus.key,'C'); assert.equal(sel.accepted.life,'1'); assert.equal(sel.accepted.status,'unavailable');
+ assert.throws(()=>s.focus(list.ref,B),/unavailable-focus-member/);
+ s.focus(list.ref,{...replacement,expected:'forged'});
+ assert.equal(list.focus.expected,'1'); assert.equal(list.focus.life,'2');
+});
+
 test('source axis participates in membership and rebinding', async()=> {
  const s=new GooSession(), spec=description();
  const selection=spec[0].children[0];
@@ -131,4 +157,13 @@ test('source axis participates in membership and rebinding', async()=> {
  const changed=structuredClone(spec); changed[0].children[0].source.axis='z';
  changed[0].children[0].source.members=changed[0].children[0].source.members.map(m=>({...m,axis:'z'}));
  await assert.rejects(s.reconcile(changed),/incompatible-source-rebinding/);
+});
+
+test('cancelled retirement never mutates accepted owners even when a custom guard resolves late',async()=>{
+ const {s,sel,follow}=await setup(A), gate=defer(), abort=new AbortController();
+ s.guard(follow.ref,()=>gate.promise);
+ const retiring=s.reconcile([],{signal:abort.signal});abort.abort();
+ assert.equal((await retiring).status,'superseded');assert.equal(sel.live,true);assert.equal(sel.accepted.key,'A');
+ gate.resolve(true);await Promise.resolve();await Promise.resolve();
+ assert.equal(s.get(follow.ref),follow);assert.equal(sel.accepted.key,'A');
 });

@@ -75,11 +75,12 @@
     validateMember(source, member) {
       if (!member || (member.axis || 'z') !== (source.axis || 'z') || member.source !== source.id || member.sourceLife !== source.life || member.type !== source.type || typeof member.key !== 'string' || !member.key || !member.subject || !member.life) fail('incompatible-member-reference');
     }
-    async reconcile(descriptions) {
+    async reconcile(descriptions, {signal}={}) {
+      if(signal?.aborted) return {status:'superseded'};
       const plan = this.plan(descriptions), order = ++this.reconcileOrder;
       const retiring = [...this.owners.values()].filter(s => !plan.has(s.id));
-      const allowed = await Promise.all(retiring.map(s => this.depart(s, {kind: 'retirement'})));
-      if (order !== this.reconcileOrder || this.closed) return {status: 'superseded'};
+      const allowed = await Promise.all(retiring.map(s => this.depart(s, {kind: 'retirement'}, {signal})));
+      if (signal?.aborted || order !== this.reconcileOrder || this.closed) return {status: 'superseded'};
       if (allowed.some(ok => !ok)) { this.emit('retirement-refused'); return {status: 'refused'}; }
       this.reconciling = true;
       try {
@@ -128,6 +129,7 @@
         for (const state of this.owners.values()) {
           state.observers.clear();
           if (['follow', 'list', 'topos'].includes(state.kind)) state.selection = this.owners.get(state.spec.selectionId).ref;
+          if (['list', 'topos'].includes(state.kind)) this.reconcileFocus(state);
           if (state.kind === 'deck') this.reconcileDeck(state, plan);
         }
         for (const state of this.owners.values()) {
@@ -172,11 +174,17 @@
       this.owners.delete(state.id);
       this.emit('retired', {id: state.id, incarnation: state.incarnation});
     }
-    async depart(state, reason) {
+    async depart(state, reason, {signal}={}) {
+      if(signal?.aborted) return false;
+      let cancel;
       try {
-        const outcomes = await Promise.all([...state.guards].map(guard => guard(reason)));
-        return outcomes.every(Boolean);
+        const cancelled=signal && new Promise(resolve=>{
+          cancel=()=>resolve(false);signal.addEventListener('abort',cancel,{once:true});
+        });
+        const outcomes=Promise.all([...state.guards].map(guard=>guard(reason,{signal}))).then(values=>values.every(Boolean));
+        return await (cancelled?Promise.race([outcomes,cancelled]):outcomes);
       } catch (error) { state.diagnostic = `departure-failed: ${error.message}`; return false; }
+      finally {if(cancel)signal.removeEventListener('abort',cancel);}
     }
     guard(ref, callback) { const state = this.get(ref); state.guards.add(callback); return () => state.guards.delete(callback); }
     resource(ref, resource) { const state = this.get(ref); state.resources.add(resource); return () => state.resources.delete(resource); }
@@ -234,12 +242,26 @@
       const state = this.get(ref, 'selection');
       return copy({accepted: state.accepted, revision: state.revision, pending: state.pending, diagnostic: state.diagnostic});
     }
+    projectedMembers(selection) {
+      return selection.source.members.map(member => selection.members.get(member.key))
+        .filter(member => member?.status === 'available');
+    }
+    reconcileFocus(state) {
+      // Keyboard position belongs to the presentation's finite projection.
+      // Unlike accepted selection it cannot point at an omitted/dead member.
+      const available = this.projectedMembers(this.get(state.selection, 'selection'));
+      const retained = state.focus && available.find(member => membership(member) === membership(state.focus));
+      state.focus = copy(retained || available[0] || null);
+    }
     focus(ref, member) {
       const state = this.get(ref);
       if (!['list','topos'].includes(state.kind)) fail('wrong-handle-kind');
       const selection = this.get(state.selection, 'selection');
       this.validateMember(selection.source, member);
-      state.focus = copy(member); this.emit('focus', {id: state.id});
+      const projected = this.projectedMembers(selection).find(candidate => membership(candidate) === membership(member));
+      if (!projected) fail('unavailable-focus-member');
+      if (identity(state.focus) === identity(projected)) return;
+      state.focus = copy(projected); this.emit('focus', {id: state.id});
     }
     become(ref, recipe) {
       const state = this.get(ref, 'follow');
