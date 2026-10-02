@@ -854,4 +854,134 @@ assert(Eq OP_LAWBLK (Ix (Sub lbc-n 3) lbc-code))
 assert(IsLaw (Ix (Sub lbc-n 2) lbc-code))
 assert(Lt (Ix (Sub lbc-n 1) lbc-code) (Sub lbc-n 3))
 
+;;; Literal-headed data construction is WHNF, even with lazy elements.
+(define row-call-op ($SLOW ($CNS 0)))
+(define row-call-args [($REF 1) ($REF 2)])
+(define row-call-body
+  (blockProc [($CALL 4 row-call-op row-call-args) ($RET ($REF 4))]))
+assert(Equal
+  [1 (blockProc
+       [($LET 4 ($CLOSE ($CNS 0) row-call-args)) ($RET ($REF 4))])]
+  (lowerRowCalls row-call-body))
+
+;; A delayed constructor must become a CLOSE itself, rather than a
+;; general-code DELAY (which the bytecode emitter cannot represent).
+(define row-delay
+  (blockProc [($LET 3 ($DELAY row-call-body)) ($RET ($REF 3))]))
+assert(Equal
+  [1 (blockProc
+       [($LET 3 ($CLOSE ($CNS 0) row-call-args)) ($RET ($REF 3))])]
+  (lowerRowCalls row-delay))
+
+;; Do not enter delayed element computations or change their sharing.
+(define lazy-row-body
+  (blockProc
+    [(thunk 1 [($CALL 8 ($FAST Add) [($CNS 1) ($CNS 2)]) ($RET ($REF 8))])
+     ($LET 3 ($DELAY (blockProc
+       [($CALL 4 row-call-op [($REF 1) ($REF 1)]) ($RET ($REF 4))])))
+     ($RET ($REF 3))]))
+assert(Equal
+  (procCode (_1 (lowerRowCalls lazy-row-body)))
+  [(thunk 1 [($CALL 8 ($FAST Add) [($CNS 1) ($CNS 2)]) ($RET ($REF 8))])
+   ($LET 3 ($CLOSE ($CNS 0) [($REF 1) ($REF 1)]))
+   ($RET ($REF 3))])
+
+;; Nat heads need not be zero or fit in an immediate machine word.
+(define huge-row-head (Lsh 1 80))
+assert(Equal
+  [1 (blockProc
+       [($LET 3 ($CLOSE ($CNS huge-row-head) [($REF 1)])) ($RET ($REF 3))])]
+  (lowerRowCalls
+    (blockProc
+      [($CALL 3 ($SLOW ($CNS huge-row-head)) [($REF 1)]) ($RET ($REF 3))])))
+
+;; Pinned nats execute primitives; dynamic heads and partial laws can
+;; execute too. Empty calls are outside this rewrite's contract.
+(define (unchanged-row-call op args)
+  (define p (blockProc [($CALL 3 op args) ($RET ($REF 3))]))
+  (Equal [0 p] (lowerRowCalls p)))
+assert(unchanged-row-call ($SLOW ($CNS (Pin "B"))) [($REF 1)])
+assert(unchanged-row-call ($SLOW ($REF 0)) [($REF 1)])
+assert(unchanged-row-call ($SLOW ($CNS (Add 1))) [($REF 1)])
+assert(unchanged-row-call row-call-op [])
+
+;; Branch arms and local procedures are independent eager contexts.
+(define nested-row-code
+  (blockProc
+    [($BR ($REF 0)
+       [[6 (blockProc [($PROC 5 row-call-body) ($RET ($CNS 0))])]])]))
+assert(Equal
+  [1 (blockProc
+       [($BR ($REF 0)
+          [[6 (blockProc
+                 [($PROC 5 (_1 (lowerRowCalls row-call-body)))
+                  ($RET ($CNS 0))])]])])]
+  (lowerRowCalls nested-row-code))
+assert(Equal [0 (_1 (lowerRowCalls nested-row-code))]
+  (lowerRowCalls (_1 (lowerRowCalls nested-row-code))))
+
+;;; Sequencing is ordered demand, not a call around a lazy continuation.
+(define seq-ir
+  (blockProc
+    [($LET 10 ($CLOSE ($CNS "Seq2") [($REF 1) ($REF 2) ($REF 3)]))
+     ($CALL 11 ($FAST (Pin "B")) [($REF 10)])
+     ($RET ($REF 11))]))
+assert(Equal
+  [22 (blockProc
+        [($LET 10 ($CLOSE ($CNS "Seq2") [($REF 1) ($REF 2) ($REF 3)]))
+         ($FORCE 21 ($REF 1)) ($FORCE 22 ($REF 2))
+         ($FORCE 11 ($REF 3)) ($RET ($REF 11))]) 1]
+  (lowerSeqCalls seq-ir 20))
+(define seq-delayed (blockProc [($LET 12 ($DELAY seq-ir)) ($RET ($REF 12))]))
+assert(Equal [20 seq-delayed 0] (lowerSeqCalls seq-delayed 20))
+(define seq-other-opset
+  (blockProc
+    [($LET 10 ($CLOSE ($CNS "Seq2") [($REF 1) ($REF 2) ($REF 3)]))
+     ($CALL 11 ($FAST (Pin "R")) [($REF 10)]) ($RET ($REF 11))]))
+assert(Equal [20 seq-other-opset 0] (lowerSeqCalls seq-other-opset 20))
+
+;; An earlier explicit force is a barrier to hoisting the Add demand.
+(define seq-barrier
+  (blockProc
+    [($LET 10 ($CLOSE ($CNS "Add") [($REF 1) ($CNS 1)]))
+     ($FORCE 20 ($REF 2))
+     ($CALL 11 ($FAST (Pin "B")) [($REF 10)]) ($RET ($REF 11))]))
+assert(Equal
+  [32 (blockProc
+        [($LET 10 ($CLOSE ($CNS "Add") [($REF 1) ($CNS 1)]))
+         ($FORCE 20 ($REF 2)) ($FORCE 31 ($REF 1))
+         ($LET 32 ($CLOSE ($CNS "Add") [($REF 31) ($CNS 1)]))
+         ($CALL 11 ($FAST (Pin "B")) [($REF 32)]) ($RET ($REF 11))])]
+  (strictify 0 0 0 2 seq-barrier 30))
+
+;; Hoisting over allocations is useful: reforce must make a later
+;; thunk capture the returned WHNF reference instead of the old IND.
+(define seq-hoist
+  (blockProc
+    [($LET 10 ($CLOSE ($CNS "Add") [($REF 1) ($CNS 1)]))
+     (thunk 12 [($CALL 13 ($FAST Inc) [($REF 1)]) ($RET ($REF 13))])
+     ($CALL 11 ($FAST (Pin "B")) [($REF 10)]) ($RET ($REF 11))]))
+assert(Equal
+  (blockProc
+    [($FORCE 31 ($REF 1))
+     ($LET 10 ($CLOSE ($CNS "Add") [($REF 31) ($CNS 1)]))
+     (thunk 12 [($CALL 13 ($FAST Inc) [($REF 31)]) ($RET ($REF 13))])
+     ($CALL 11 ($FAST (Pin "B")) [($REF 10)]) ($RET ($REF 11))])
+  (reforce (_1 (strictify 0 0 0 1 seq-hoist 30))))
+
+(define seq-tail-body
+  (blockProc [($CALL 6 ($FAST Inc) [($REF 1)]) ($RET ($REF 6))]))
+(define seq-tail
+  (blockProc [($LET 5 ($DELAY seq-tail-body)) ($RET ($REF 5))]))
+assert(Equal seq-tail-body (eagerTailCalls seq-tail))
+(define seq-shared-tail
+  (blockProc
+    [($LET 5 ($DELAY seq-tail-body))
+     ($LET 7 ($CLOSE ($CNS 0) [($REF 5)])) ($RET ($REF 5))]))
+assert(Equal seq-shared-tail (eagerTailCalls seq-shared-tail))
+(define seq-tail-branch (blockProc [($BR ($REF 0) [[8 seq-tail]])]))
+assert(Equal
+  (blockProc [($BR ($REF 0) [[8 seq-tail-body]])])
+  (eagerTailCalls seq-tail-branch))
+
 (print "plangrm tests passed")
