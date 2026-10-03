@@ -153,7 +153,7 @@ def prepare(mounts, work, check, cleanup, context):
 def runtime_specs(prepared, source_root):
     """Allocate scan bags in the runtime file root; never overlay core modules."""
     directory = source_root / 'mounts'
-    directory.mkdir()
+    directory.mkdir(exist_ok=True)
     specs = []
     selected = {mount.name: mount for mount, _, _, _ in prepared}
     def dependencies(mount):
@@ -167,7 +167,7 @@ def runtime_specs(prepared, source_root):
         return result
     for mount, folder, args, _ in prepared:
         # A request-scoped scanner refreshes this bag from the live checkout.
-        (directory / mount.name).mkdir()
+        (directory / mount.name).mkdir(exist_ok=True)
         data = mount.manifest
         def hook(key):
             value = data.get(key)

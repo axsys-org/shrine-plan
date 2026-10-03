@@ -6,6 +6,12 @@
 
 ' Bind the Grove expression template to an object before entering Goo v2.
 + goo_bridge
+  + compiled
+    ' Native programs produce rendering and correspondence together. Keep the
+    ' declarative Goo layout pipeline available without imposing it on them.
+    \ captured=goo_runtime/captured_surface state=namespace
+    ^ either[str grove_surface_output]
+    | goo_runtime/render_surface captured state
   + surface
     ' Grove normalizes empty-rune brackets; the v2 literal reader uses Expr.
     \ tree=rex
@@ -248,8 +254,12 @@
   + render
     \ published=goo/published card=myth view=goo/view
     ^ either[str str]
+    | goo_bridge/render_at 720 published card view
+  + render_at
+    \ width=nat published=goo/published card=myth view=goo/view
+    ^ either[str str]
     < semantic (goo_bridge/semantic published card view)
-    < prepared (goo_html/prepare semantic (goo_fp/integer 720) (goo_fp/integer 1) .false)
+    < prepared (goo_html/prepare semantic (goo_fp/integer width) (goo_fp/integer 1) .false)
     | ./ok (goo_html/fragment prepared)
   + source_count
     \ source=goo/source
@@ -265,7 +275,7 @@
     | sources.fold 0
       \ total=nat source=goo/source
       | add total (goo_bridge/source_count source)
-  + controls
+  + occurrences
     ' Walk the emitted core order, including flattened opt/or nodes. This is
     ' the same order used by assign; invisible controls simply have no DOM id.
     \ published=goo/published card=myth nodes=list[goo/node] parent=row[nat] start=nat
@@ -280,7 +290,7 @@
       is_action (eq node.constructor "action")
       is_input (eq node.constructor "input")
       own=row[json]
-        ? !(and (gt count 0) (is_action || is_input)) []
+        ? ((eq count 0) || ((eq node.constructor "or") || (eq node.constructor "opt"))) []
         = become (goo_runtime/named "become" node.arguments)
           slot=maybe[path]
             ? is_input
@@ -294,7 +304,10 @@
             = [button scope] found
             | maybe/is_some scope.action
         [(json/obj [(jkv "invoke" (json/boo invoke)) (jkv "id" (json/str id))
-          (jkv "kind" (json/str (? is_action "action" "input")))
+          (jkv "kind" (json/str node.constructor))
+          (jkv "line" (json/str (nat/show node.span.line)))
+          (jkv "column" (json/str (nat/show node.span.column)))
+          (jkv "reads" (json/arr (node.arguments.bind((goo_bridge/read_slots published)).map((\ slot (json/str (path_show slot)))).row)))
           (jkv "control" (json/str (str/join "." route.map(nat/show))))
           (jkv "slot" (json/str (path_show slot.fall([]))))
           (jkv "become" (json/boo (maybe/is_some become)))])]
@@ -304,7 +317,28 @@
           ^ row[json]
           ? (eq children.len 0) []
           ? (eq (goo_bridge/node_count published card children.at(0)) 0) (_ children.drop(1) index.inc)
-          | goo_bridge/controls published card node.children.take(index.inc) route position
-        | goo_bridge/controls published card node.children route
+          | goo_bridge/occurrences published card node.children.take(index.inc) route position
+        | goo_bridge/occurrences published card node.children route
             (? (eq node.constructor "opt") position position.inc)
     | _ rest.drop(1) ordinal.inc (add position count) out.weld(own).weld(nested)
+  + read_slots
+    \ published=goo/published expression=rex
+    ^ list[path]
+    = nested (expression.children.stream.bind((goo_bridge/read_slots published)))
+    ?> (./nest _ _ rune kids) expression nested
+    ? !(and (eq rune ".") (eq kids.len 2)) nested
+    ?> (./leaf _ _ receiver) kids.at(0) nested
+    ?> (./leaf _ _ name) kids.at(1) nested
+    ? !(eq receiver published.view.binding) nested
+    | published.fields.keep((\ field (eq field.name name))).map((\ field field.slot))
+  + controls
+    \ published=goo/published card=myth nodes=list[goo/node] parent=row[nat] start=nat
+    ^ row[json]
+    | (goo_bridge/occurrences published card nodes parent start).keep
+      \ item=json
+      ?> (json/obj fields) item .false
+      | fields.any
+        \ field=jkv
+        ? !(eq field.k "kind") .false
+        ?> (json/str kind) field.v .false
+        | ((eq kind "action") || (eq kind "input"))

@@ -1,0 +1,271 @@
+- goo_bridge
+- goo_catalog
+- inspect_read
+- grove_dev
+- source_mount
+- presentation_edit
+
+' Native presentation projection. No application-specific browser schema.
++ canvas_surface
+  + text
+    \ name=str input=json
+    ^ str
+    | grove_dev/text (grove_dev/field name input)
+  + number
+    \ value=nat
+    ^ json
+    | json/str (nat/show value)
+  + path
+    \ value=path
+    ^ json
+    | json/str (path_show value)
+  + error
+    \ state=namespace code=nat message=str
+    ^ [namespace nat str]
+    [state code (show (json/obj [(jkv "error" (json/str message))]))]
+  + catalog
+    ' Page physical records, including absent structural parents. A bounded
+    ' catalog is only a discovery result; truncation never establishes absence.
+    \ state=namespace
+    ^ [list[goo/published] bool]
+    % queue=list[[path maybe[path]]] (list/one[[path maybe[path]]] [[state.self 'gov] .none])
+      steps=nat 0 out=list[goo/published] .nil
+    ^ [list[goo/published] bool]
+    ? queue.is_nil [out .true]
+    ? (ge steps 256) [out .false]
+    = [target cursor] queue.head
+      query (inspect_read/request target (? (maybe/is_some cursor) (./some state.local.top) .none)
+        cursor .none 'canvas .false .false .false [publisher_vocabulary/grove/view])
+    ?> (./ok result) (inspect_read/namespace_safe_read query state) [out .false]
+    = own=list[goo/published]
+        ? (maybe/is_some cursor) .nil
+        | goo_catalog/catalog (axal/new[myth] result.view.fil)
+      children=list[[path maybe[path]]]
+        | result.view.kid_tap.stream.map
+        \ [key child]
+        ^ [path maybe[path]]
+        [target.snoc(key) .none]
+      more=list[[path maybe[path]]]
+        ? result.paging.next_children
+         > (./some next) (list/one[[path maybe[path]]] [target (./some next)])
+        .nil
+    | _ queue.tail.weld(children).weld(more) steps.inc out.weld(own)
+  + field
+    \ field=goo/field card=myth
+    ^ json
+    = value=json
+        ? card.get(field.slot)
+         > (./some value)
+          ? (goo_bridge/text value)
+           > (./ok text) (json/str text)
+          | json/str "Opaque native value"
+        jnull
+    | json/obj [(jkv "name" (json/str field.name)) (jkv "slot" (canvas_surface/path field.slot))
+        (jkv "slot_key" (json/str (either/ok_val (physical_key/encode field.slot))))
+        (jkv "type" (canvas_surface/path field.type)) (jkv "optional" (json/boo field.optional))
+        (jkv "value" value)]
+  + view
+    \ published=goo/published card=myth state=namespace
+    ^ json
+    | canvas_surface/view_at 720 published card state
+  + view_at
+    \ width=nat published=goo/published card=myth state=namespace
+    ^ json
+    = rendered=either[str str]
+        ? published.result
+         > (./ok view) (goo_bridge/render_at width published card view)
+         > (./err _) (./err "This published view has a native compilation diagnostic.")
+      html=json
+        ? rendered
+         > (./ok html) (json/str html)
+        jnull
+      diagnostic=json
+        ? rendered
+         > (./err why) (json/str why)
+        jnull
+      occurrences=row[json]
+        ? published.result
+         > (./ok view) (goo_bridge/occurrences published card view.children [] 1)
+        []
+    | json/obj [(jkv "id" (canvas_surface/path published.view.name))
+        (jkv "role" (canvas_surface/path published.view.role))
+        (jkv "slot" (canvas_surface/path published.view.slot))
+        (jkv "revision" (canvas_surface/number (state.case(.x published.view.name)).fall(0)))
+        (jkv "fields" (json/arr published.fields.map((\ field (canvas_surface/field field card))).row))
+        (jkv "html" html) (jkv "diagnostic" diagnostic) (jkv "occurrences" (json/arr occurrences))]
+  + read
+    \ input=json state=namespace
+    ^ [namespace nat str]
+    = width (nat/parse (canvas_surface/text "width" input)).fall(720)
+    ? ((lt width 160) || (gt width 1600)) (canvas_surface/error state 400 "Presentation width must be 160–1600 pixels.")
+    = raw (canvas_surface/text "target" input)
+      target=maybe[path]
+        ? (eq raw "") (./some [state.self 'app 'workspace])
+        | path_parse raw
+    ?> (./some target) target (canvas_surface/error state 400 "Invalid subject reference.")
+    ? !(pith_prefix [state.self 'app] target)
+      | canvas_surface/error state 403 "Presentation reads are scoped to application subjects."
+    = epoch (nat/parse (canvas_surface/text "epoch" input))
+      cursor_text (canvas_surface/text "children" input)
+      cursor=maybe[path]
+        ? (eq cursor_text "") .none
+        | physical_key/decode cursor_text
+    ? (and (gt cursor_text.len 0) (maybe/is_none cursor))
+      | canvas_surface/error state 400 "Invalid child continuation."
+    = query (inspect_read/request target epoch cursor .none 'canvas .false .false .false [bond/lede])
+    ?> (./ok result) (inspect_read/namespace_safe_read query state)
+      | canvas_surface/error state 409 "This namespace page changed. Read from the beginning."
+    = card (goo_runtime/record .y target state).fall(myth/new)
+      [catalog complete] (canvas_surface/catalog state)
+      matching (goo_catalog/matching card (goo_catalog/index catalog))
+      children
+        | result.view.kid_tap.map
+        \ [key child]
+        = name target.snoc(key)
+          label child.fil.fall(myth/new).txt_at(bond/lede)
+        | json/obj [(jkv "id" (canvas_surface/path name))
+            (jkv "label" (json/str (? (eq label "") (path_show name) label)))]
+      next=json
+        ? result.paging.next_children
+         > (./some path) (json/str (either/ok_val (physical_key/encode path)))
+        jnull
+      subject (goo_runtime/target target state).fall(target)
+    [state 200 (show (json/obj [(jkv "protocol" (json/str "canvas-surface/1"))
+      (jkv "target" (canvas_surface/path target)) (jkv "subject" (canvas_surface/path subject))
+      (jkv "label" (json/str (card.txt_at(bond/lede))))
+      (jkv "expected" (canvas_surface/number (state.case(.x subject)).fall(0)))
+      (jkv "displayed" (canvas_surface/number (state.case(.y target)).fall(0)))
+      (jkv "publication" (canvas_surface/number (goo_runtime/publication state)))
+      (jkv "width" (canvas_surface/number width))
+      (jkv "capabilities" (json/obj [(jkv "presentation_refinement" (json/boo .true))]))
+      (jkv "epoch" (canvas_surface/number result.paging.epoch))
+      (jkv "children" (json/arr children)) (jkv "next_children" next)
+      (jkv "catalog_complete" (json/boo complete))
+      (jkv "views" (json/arr (matching.take(12).map((\ view (canvas_surface/view_at width view card state))).row)))
+      (jkv "more_views" (json/boo (gt matching.len 12)))]))]
+  + action
+    \ input=json state=namespace
+    ^ [namespace nat str]
+    ?> (./some target) (path_parse (canvas_surface/text "target" input)) (canvas_surface/error state 400 "Invalid target.")
+    ?> (./some subject) (path_parse (canvas_surface/text "subject" input)) (canvas_surface/error state 400 "Invalid subject.")
+    ?> (./some view) (path_parse (canvas_surface/text "view" input)) (canvas_surface/error state 400 "Invalid view.")
+    ? !(and (pith_prefix [state.self 'app 'workspace] target) (pith_prefix [state.self 'app 'workspace] subject))
+      | canvas_surface/error state 403 "This action is outside the workspace."
+    ?> (./some expected) (nat/parse (canvas_surface/text "expected" input)) (canvas_surface/error state 400 "Expected subject case required.")
+    ?> (./some displayed) (nat/parse (canvas_surface/text "displayed" input)) (canvas_surface/error state 400 "Displayed case required.")
+    ?> (./some publication) (nat/parse (canvas_surface/text "publication" input)) (canvas_surface/error state 400 "Publication case required.")
+    = parts (canvas_surface/text "control" input).split_byte(46)
+    ? !(and (and (gt parts.len 0) (le parts.len 64)) parts.all((\ text (maybe/is_some (nat/parse text)))))
+      | canvas_surface/error state 400 "Invalid published control route."
+    = inputs=row[[str str]]
+        ?> (json/obj fields) (grove_dev/field "inputs" input) []
+        | fields.map (\ item [item.k (grove_dev/text item.v)])
+    ? (gt inputs.len 40) (canvas_surface/error state 400 "Too many action inputs.")
+    ?> (./some record) (goo_runtime/record .x view state) (canvas_surface/error state 409 "View is unavailable.")
+    ?> (./ok published) (goo_runtime/published record) (canvas_surface/error state 409 "View is unavailable.")
+    ?> (./ok lowered) published.result (canvas_surface/error state 409 "View has compilation diagnostics.")
+    ?> (./some found) (goo_runtime/locate lowered.children parts.map((\ part (nat/parse part).fall(0)))
+        (goo_runtime/scope .none .none .nil)) (canvas_surface/error state 409 "Control is unavailable.")
+    = [control scope] found
+    ? scope.values.weld(control.arguments).any((goo_runtime/mentions "provider"))
+      | canvas_surface/error state 409 "This action needs a physical provider not yet supplied by Canvas."
+    | goo_runtime/run (goo_runtime/request "act" target subject view parts.map((\ part (nat/parse part).fall(0)))
+        expected displayed publication inputs 0) state
+  + source_excerpt
+    \ target=path file=[str nat]
+    ^ row[str]
+    = [name bytes] file
+      text (str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes))))))
+    ?> (./some excerpt) (presentation_edit/excerpt target text) []
+    [excerpt]
+  + source
+    ' Only the currently published input set is shown as source. A failed or
+    ' pending scan must not substitute newer disk text for the installed view.
+    \ input=json state=namespace
+    ^ [namespace nat str]
+    ?> (./some target) (path_parse (canvas_surface/text "target" input)) (canvas_surface/error state 400 "View reference required.")
+    ? !(pith_prefix [state.self 'gov] target) (canvas_surface/error state 403 "Source is scoped to published presentations.")
+    ?> (./some expected) (nat/parse (canvas_surface/text "revision" input)) (canvas_surface/error state 400 "View revision required.")
+    ? !(eq expected (state.case(.x target)).fall(0)) (canvas_surface/error state 409 "The presentation changed; inspect its current revision.")
+    ?> (./some record) (goo_runtime/record .x target state) (canvas_surface/error state 404 "Presentation is absent.")
+    ?> (./ok published) (goo_runtime/published record) (canvas_surface/error state 400 "This is not a published presentation.")
+    = units (grove_dev/units state).keep((\ unit (pith_prefix unit.source target)))
+    ? !(eq units.len 1) (canvas_surface/error state 409 "No unambiguous source unit is established for this presentation.")
+    = unit units.at(0)
+      mount (source_mount/record unit.home state)
+      status (source_mount/status_at unit.home state)
+    ? !(and status.ready (eq status.epoch (mount.nat_at(bond/epoch 0))))
+      | canvas_surface/error state 409 "Source has an uncompleted or failed publication. Installed source is not replaced by that edit."
+    = snapshot (source_mount/snapshot unit.home state)
+      selected (snapshot.keep((\ [name bytes] (unit.files.has(name)))))
+    ? !(eq selected.len unit.files.len) (canvas_surface/error state 409 "The published source input set is incomplete.")
+    = bytes (row/fold[[str nat] nat] 0 (\ size [name bytes] (add size (wid bytes))) selected)
+    ? ((gt selected.len 16) || (gt bytes 65536))
+      | canvas_surface/error state 413 "This source unit exceeds the inline inspection limit."
+    = files
+        | selected.map
+        \ [name bytes]
+        | json/obj [(jkv "name" (json/str name))
+            (jkv "text" (json/str (str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes))))))))]
+      excerpts=row[str]
+        | row/bind[[str nat] str] (canvas_surface/source_excerpt target) selected
+      editable=json
+        ? !(eq excerpts.len 1) jnull
+        | json/str excerpts.at(0)
+    [state 200 (show (json/obj [(jkv "target" (canvas_surface/path target))
+      (jkv "revision" (canvas_surface/number expected))
+      (jkv "publication" (canvas_surface/number status.publication))
+      (jkv "files" (json/arr files))
+      (jkv "editable_source" editable)]))]
+  + refine
+    ' Ephemeral native compilation: neither source nor candidate code is
+    ' installed here. Preview controls are descriptions, never dispatch targets.
+    \ input=json state=namespace
+    ^ [namespace nat str]
+    = width (nat/parse (canvas_surface/text "width" input)).fall(720)
+    ? ((lt width 160) || (gt width 1600)) (canvas_surface/error state 400 "Presentation width must be 160–1600 pixels.")
+    ?> (./some target) (path_parse (canvas_surface/text "target" input)) (canvas_surface/error state 400 "Subject reference required.")
+    ? !(pith_prefix [state.self 'app 'workspace] target)
+      | canvas_surface/error state 403 "Presentation refinement is scoped to workspace subjects."
+    ?> (./some view) (path_parse (canvas_surface/text "view" input)) (canvas_surface/error state 400 "Presentation reference required.")
+    ? !(pith_prefix [state.self 'gov] view)
+      | canvas_surface/error state 403 "Select a published presentation."
+    ?> (./some revision) (nat/parse (canvas_surface/text "revision" input)) (canvas_surface/error state 400 "Presentation revision required.")
+    ?> (./some publication) (nat/parse (canvas_surface/text "publication" input)) (canvas_surface/error state 400 "Publication basis required.")
+    ? !(and (eq revision (state.case(.x view)).fall(0)) (eq publication (goo_runtime/publication state)))
+      | canvas_surface/error state 409 "The presentation basis changed. Read its current version."
+    ?> (./some record) (goo_runtime/record .x view state) (canvas_surface/error state 404 "Presentation is absent.")
+    ?> (./ok original) (goo_runtime/published record) (canvas_surface/error state 400 "This is not a native presentation.")
+    = card (goo_runtime/record .y target state).fall(myth/new)
+    ?> (./ok previous) (goo_runtime/matching_view original card)
+      | canvas_surface/error state 409 "The selected subject does not satisfy this presentation's contract."
+    = lookup
+        \ name=path
+        ^ maybe[myth]
+        ? !((pith_prefix [state.self 'gov] name) || (pith_prefix [state.self 'lib] name)) .none
+        | goo_runtime/record .x name state
+      source (canvas_surface/text "source" input)
+    ? (presentation_edit/compile original source lookup)
+     > (./err cause)
+      = message=str
+          ? cause
+           > (grove/error/syntax span text)
+            | str/cat_all [(nat/show span.line) ":" (nat/show span.column) " " text]
+          "Grove source could not be parsed."
+      | canvas_surface/error state 422 message
+     > (./ok proposed)
+      ?> (./ok lowered) proposed.result (canvas_surface/error state 422 "Presentation lowering failed.")
+      ?> (./ok html) (goo_bridge/render_at width proposed card lowered)
+        | canvas_surface/error state 422 "The native renderer cannot present this candidate. No behavior was installed."
+      [state 200 (show (json/obj
+        [(jkv "kind" (json/str "presentation-preview"))
+         (jkv "target" (canvas_surface/path target))
+         (jkv "subject" (canvas_surface/path (goo_runtime/target target state).fall(target)))
+         (jkv "displayed" (canvas_surface/number (state.case(.y target)).fall(0)))
+         (jkv "publication" (canvas_surface/number publication))
+         (jkv "source" (json/str source))
+         (jkv "width" (canvas_surface/number width))
+         (jkv "before" (canvas_surface/view_at width original card state))
+         (jkv "after" (canvas_surface/view_at width proposed card state))
+         (jkv "installed" (json/boo .false))
+         (jkv "coverage" (json/str "This subject, the pinned receiver contract and structurally preserved controls. No behavioral change or publication is authorized by this preview."))]))]

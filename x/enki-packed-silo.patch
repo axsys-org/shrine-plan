@@ -1,0 +1,243 @@
+--- a/pkg/plan/src/store_silo.c
++++ b/pkg/plan/src/store_silo.c
+@@ -12,6 +12,7 @@
+ #include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
++#include <zlib.h>
+ 
+ #include "axsys/ds.h"
+ 
+@@ -35,6 +36,7 @@
+   int pack_fd;
+   bool has_roots; /* absent when inspecting a pre-journal store read-only */
+   bool rdonly;
++  bool packed; /* revision 3: lossless physical envelopes, unchanged Silo hashes */
+   silo_index_entry* staged;
+   pl_staged_blob* staged_kv;
+ } silo_backend;
+@@ -45,6 +47,7 @@
+   const uint8_t* bytes;
+   size_t len;
+   size_t pos;
++  uint8_t* inflated;
+ } pack_reader;
+ 
+ struct pl_silo_batch {
+@@ -64,7 +67,8 @@
+ static const uint8_t format_key[] = "format";
+ /* Persistence revision 2 changes object identity from canonical text to the
+  * SHA-256 of the canonical Silo stream.  Revision-1 stores are rejected. */
+-static const uint8_t format_value[] = {'S', 'I', 'L', 'O', 2};
++static const uint8_t format_value[] = {'S', 'I', 'L', 'O', 3};
++static const uint8_t legacy_format[] = {'S', 'I', 'L', 'O', 2};
+ static const uint8_t root_key[] = "root";
+ 
+ static bool pack_error(char* err, size_t cap, const char* fmt, ...) {
+@@ -500,9 +504,31 @@
+     return true;
+ 
+   uint64_t off = batch->pack_end;
+-  if (!batch_append(batch, bytes, len, err, err_cap))
+-    return false;
+-  silo_index_entry entry = {.value = {.off = off, .len = len}};
++  /* Compression belongs to the physical backend, never the canonical stream.
++   * Every revision-3 object has an envelope: 0 + raw bytes, or 1 + LE logical
++   * length + zlib bytes. Old engines reject revision 3 before opening objects. */
++  uint8_t header[9] = {0};
++  uint8_t* compressed = NULL;
++  const uint8_t* payload = bytes;
++  size_t payload_len = len, header_len = 1;
++  if (len >= 1024 && len <= 128u * 1024u * 1024u) {
++    uLongf capacity = compressBound((uLong)len);
++    compressed = malloc(capacity);
++    if (compressed != NULL &&
++        compress2(compressed, &capacity, bytes, (uLong)len, Z_BEST_SPEED) == Z_OK &&
++        capacity + 9 < len - len / 8) {
++      header[0] = 1;
++      index_put64(header + 1, len);
++      header_len = sizeof(header);
++      payload = compressed;
++      payload_len = capacity;
++    }
++  }
++  bool appended = batch_append(batch, header, header_len, err, err_cap) &&
++                  batch_append(batch, payload, payload_len, err, err_cap);
++  free(compressed);
++  if (!appended) return false;
++  silo_index_entry entry = {.value = {.off = off, .len = header_len + payload_len}};
+   memcpy(entry.key.b, hash, sizeof(entry.key.b));
+   ax_hmput(batch->pending, entry.key, entry.value);
+   batch->changed = true;
+@@ -702,11 +728,35 @@
+                       .mapping_len = mapping_len,
+                       .bytes = (const uint8_t*)mapping + (size_t)delta,
+                       .len = (size_t)len};
++  if (b->packed) {
++    if (pr->len < 2 || pr->bytes[0] > 1) goto bad_envelope;
++    if (pr->bytes[0] == 0) {
++      pr->bytes++;
++      pr->len--;
++    } else {
++      if (pr->len <= 9) goto bad_envelope;
++      uint64_t logical = index_get64(pr->bytes + 1);
++      if (!logical || logical > 128u * 1024u * 1024u) goto bad_envelope;
++      pr->inflated = malloc((size_t)logical);
++      if (pr->inflated == NULL) goto bad_envelope;
++      uLongf output_len = logical;
++      uLong input_len = pr->len - 9;
++      if (uncompress2(pr->inflated, &output_len, pr->bytes + 9, &input_len) != Z_OK ||
++          output_len != logical || input_len != pr->len - 9) goto bad_envelope;
++      pr->bytes = pr->inflated;
++      pr->len = logical;
++    }
++  }
+   *out = (pl_silo_reader){.ctx = pr,
+                           .read = pack_reader_read,
+                           .rewind = pack_reader_rewind,
+-                          .len = len};
+-  return true;
++                          .len = pr->len};
++  return true;
++bad_envelope:
++  munmap(pr->mapping, pr->mapping_len);
++  free(pr->inflated);
++  free(pr);
++  return pack_error(err, err_cap, "invalid compressed Silo envelope");
+ }
+ 
+ void pl_store_silo_close_reader(pl_silo_reader* r) {
+@@ -715,6 +765,7 @@
+   pack_reader* pr = r->ctx;
+   if (pr != NULL) {
+     (void)munmap(pr->mapping, pr->mapping_len);
++    free(pr->inflated);
+     free(pr);
+   }
+   memset(r, 0, sizeof(*r));
+@@ -749,6 +800,7 @@
+     goto fail_pack;
+   }
+   b->has_roots = true;
++  b->packed = true;
+   MDB_val fkey = {.mv_size = sizeof(format_key) - 1,
+                   .mv_data = (void*)format_key};
+   MDB_val found;
+@@ -827,10 +879,12 @@
+   MDB_val found;
+   if (mdb_get(txn, b->meta, &fkey, &found) != 0 ||
+       found.mv_size != sizeof(format_value) ||
+-      memcmp(found.mv_data, format_value, sizeof(format_value)) != 0) {
++      (memcmp(found.mv_data, format_value, sizeof(format_value)) != 0 &&
++       memcmp(found.mv_data, legacy_format, sizeof(legacy_format)) != 0)) {
+     mdb_txn_abort(txn);
+     goto fail_pack;
+   }
++  b->packed = memcmp(found.mv_data, format_value, sizeof(format_value)) == 0;
+   /* Commit rather than abort: DBI handles opened in an aborted read
+    * transaction must not be reused. */
+   if (mdb_txn_commit(txn) != 0)
+--- a/tests/unit/test_plan_store.c
++++ b/tests/unit/test_plan_store.c
+@@ -1749,20 +1749,18 @@
+   pl_store_free(silo);
+   ASSERT_NEQ(memcmp(memory_hash, silo_hash, 32), 0);
+ 
+-  char path[96];
+-  snprintf(path, sizeof(path), "%s/pins.pack", dir);
+-  int fd = open(path, O_RDONLY);
+-  ASSERT_GTE(fd, 0);
+-  struct stat st;
+-  ASSERT_EQ(fstat(fd, &st), 0);
+-  ASSERT_GT(st.st_size, 0);
+-  uint8_t* bytes = malloc((size_t)st.st_size);
++  silo = pl_store_new_silo_ro(dir, (size_t)64 << 20);
++  ASSERT_NOT_NULL(silo);
++  pl_silo_reader reader = {0}; char err[192] = {0};
++  ASSERT(pl_store_silo_open(silo, silo_hash, &reader, err, sizeof(err)));
++  uint8_t* bytes = malloc(reader.len);
+   ASSERT_NOT_NULL(bytes);
+-  ASSERT(fd_read_exact(fd, bytes, (size_t)st.st_size));
+-  ASSERT_EQ(close(fd), 0);
++  ASSERT(reader.read(reader.ctx, bytes, reader.len));
+   uint8_t expected[32];
+-  ax_sha256(bytes, (size_t)st.st_size, expected);
++  ax_sha256(bytes, reader.len, expected);
+   free(bytes);
++  pl_store_silo_close_reader(&reader);
++  pl_store_free(silo);
+   ASSERT_EQ(memcmp(expected, silo_hash, sizeof(expected)), 0);
+   cleanup_store_dir(dir, true);
+ }
+@@ -1990,6 +1988,60 @@
+   cleanup_store_dir(dir, true);
+ }
+ 
++TEST(store, silo_compressed_objects_keep_hash_and_cold_value) {
++  char dir[96], pack[128];
++  snprintf(dir, sizeof(dir), "/tmp/enki-test-silo-compressed-%lu", (unsigned long)getpid());
++  ASSERT_EQ(mkdir(dir, 0700), 0);
++  pl_store* s = mk_silo(dir);
++  ASSERT_NOT_NULL(s);
++  pl_heap* h = pl_heap_new(1 << 16, s);
++  pl_thread* t = pl_thread_new(h);
++  pl_val args[6000];
++  for (size_t i = 0; i < 6000; i++) args[i] = i % 11;
++  pl_vpush(t, test_app(t, 0, 6000, args));
++  pl_vpush(t, pl_pin(t, t->vstack[0]));
++  char err[192] = {0};
++  uint8_t hash[32];
++  ASSERT(pl_store_save_root(s, t->vstack[1], hash, err, sizeof(err)), "%s", err);
++  pl_silo_reader reader = {0};
++  ASSERT(pl_store_silo_open(s, hash, &reader, err, sizeof(err)));
++  size_t n = reader.len;
++  uint8_t* encoded = malloc(n);
++  ASSERT_NOT_NULL(encoded);
++  ASSERT(reader.read(reader.ctx, encoded, n));
++  uint8_t digest[32];
++  ax_sha256(encoded, n, digest);
++  ASSERT_EQ(memcmp(hash, digest, 32), 0);
++  pl_store_silo_close_reader(&reader);
++  snprintf(pack, sizeof(pack), "%s/pins.pack", dir);
++  struct stat st;
++  ASSERT_EQ(stat(pack, &st), 0);
++  ASSERT_LT(st.st_size, n / 2);
++  free(encoded);
++  pl_thread_free(t); pl_heap_free(h); pl_store_free(s);
++  s = pl_store_new_silo_ro(dir, (size_t)64 << 20);
++  ASSERT_NOT_NULL(s);
++  h = pl_heap_new(1 << 16, s); t = pl_thread_new(h);
++  pl_val loaded = pl_store_load(t, hash);
++  pl_cell* body = pl_ptr(pl_pin_body(pl_ptr(loaded)));
++  ASSERT_EQ(pl_app_n(body), 6000);
++  for (size_t i = 0; i < 6000; i++) ASSERT_EQ(pl_app_args(body)[i], i % 11);
++  pl_thread_free(t); pl_heap_free(h); pl_store_free(s);
++  /* A damaged compression checksum must fail before any value is published. */
++  int fd = open(pack, O_RDWR);
++  ASSERT_GTE(fd, 0);
++  uint8_t last;
++  ASSERT_EQ(pread(fd, &last, 1, st.st_size - 1), 1);
++  last ^= 1;
++  ASSERT_EQ(pwrite(fd, &last, 1, st.st_size - 1), 1);
++  close(fd);
++  s = pl_store_new_silo_ro(dir, (size_t)64 << 20);
++  ASSERT_NOT_NULL(s);
++  ASSERT_FALSE(pl_store_silo_open(s, hash, &reader, err, sizeof(err)));
++  pl_store_free(s);
++  cleanup_store_dir(dir, true);
++}
++
+ TEST(store, silo_read_only_open_inspects_the_store) {
+   char dir[64];
+   snprintf(dir, sizeof(dir), "/tmp/enki-test-silo-ro-%lu",
+--- a/Makefile
++++ b/Makefile
+@@ -122,7 +122,7 @@
+ 
+ CPPFLAGS_ALL := $(BASE_CPPFLAGS) $(CPPFLAGS)
+ CFLAGS_ALL := $(BASE_CFLAGS) $(WARN_CFLAGS) $(BUILD_CFLAGS_$(BUILD_TYPE)) $(CFLAGS)
+-LDFLAGS_ALL := $(BUILD_LDFLAGS_$(BUILD_TYPE)) $(LDFLAGS) -pthread $(HOST_LDFLAGS) -lgmp -llmdb -lcrypto -lcurl -lsodium -lblake3
++LDFLAGS_ALL := $(BUILD_LDFLAGS_$(BUILD_TYPE)) $(LDFLAGS) -pthread $(HOST_LDFLAGS) -lgmp -llmdb -lcrypto -lcurl -lsodium -lblake3 -lz
+ 
+ ifeq ($(PROFILE),tracy)
+ CPPFLAGS_ALL += -I/opt/homebrew/opt/tracy/include/tracy

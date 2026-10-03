@@ -12,6 +12,11 @@
 (#bind backend (#module foil-grove-backend))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind abi (#module foil-abi))
+(#bind checkpoint (#module eden-checkpoint))
+(#bind wire (#module wire-json))
+
+(define (wait-for-owner ignored)
+  (Seq (Recv 0) (wait-for-owner 0)))
 
 (define (module images name)
   (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
@@ -28,9 +33,9 @@
 ;; Spec: name, folder, manifest, modules, Grove units, activation, HTTP,
 ;; post-start hook, hook arguments, inspection-provider flag.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token)
+(define (mounted identity self system resolve slot port specs scan-port scan-token)
   (define local (bootstrap:build-local self system resolve slot
-    ["eden" "source_mount" "grove_backend" "grove_role_runtime"]))
+    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_authoring" "grove_surface_wire"]))
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
@@ -132,11 +137,60 @@
   (define (hook state spec index)
     (define binding (Ix index spec))
     (driver:get-perc (_1 binding) (module (images state) (_0 binding))))
+  ;; The authoring boundary uses the source-mount compiler and type identities.
+  ;; Pure denies physical effects and bounds generated-code execution.
+  (define authoring (module core-images "grove_authoring"))
+  ;; ABI lookup runs the native compiler's member/type resolution. These
+  ;; constructors are fixed by the pinned compiler, not by an interaction.
+  ;; Resolve them once: doing this after every Pure call turns a field edit
+  ;; into several full TypeWorld traversals.
+  (define authoring-ok (abi:result authoring "ok"))
+  (define authoring-err (abi:result authoring "err"))
+  (DeepSeq authoring-ok 0)
+  (DeepSeq authoring-err 0)
+  (define prepared-authoring (backend:prepare-with core-code "grove_surface_wire"))
+  (define authoring-policy (_1 prepared-authoring))
+  (define authoring-parse (driver:get-perc ["grove" "parse"] authoring-policy))
+  ;; Resolve the compiler's pinned foundation once, outside a candidate's budget.
+  ;; Generated source is still parsed, compiled and published under Pure.
+  (DeepSeq prepared-authoring 0)
+  (DeepSeq authoring-parse 0)
+  (define (authoring-stage label limit f)
+    (define result (Pure limit f []))
+    (If (Eq 1 (Hd result))
+      (error [label (backend:error-text (_0 result))]) (_0 result)))
+  (define (compile-authored root text state)
+    (define (lookup requested)
+      (define target
+        (If (Or (Equal ("ts" "sys") (_0 requested))
+                (Eq "x" (Hd (_0 requested)))) requested
+          (Weld [self] requested)))
+      (_0 ((tool ["sovereign_peek"]) target state)))
+    (define result (Try (lambda (ignored)
+      (define document (authoring-stage "parse" 250000000 (lambda (ignored)
+        (need-ok (authoring-parse text)))))
+      (define records (authoring-stage "compile" 250000000 (lambda (ignored)
+        (need-ok (backend:compile prepared-authoring (previous state) lookup root document)))))
+      ;; Force each bounded stage before starting the next one. Otherwise lazy
+      ;; parse/compile thunks consume publication's allowance as nested Pure calls.
+      (Seq document (Seq records
+        (authoring-stage "publish" 250000000 (lambda (ignored)
+          (_0 (need-ok (backend:publish prepared-authoring records 0 0 state)))))))) []))
+    (If (Eq 1 (Hd result))
+      (authoring-err (backend:error-text (_0 result)))
+      (authoring-ok (_0 result))))
+  (define (pure-authored thunk)
+    (define result (Pure 12000000 thunk []))
+    (If (Eq 1 (Hd result))
+      (authoring-err (backend:error-text (_0 result)))
+      (authoring-ok (_0 result))))
+  (define with-authoring (need-ok ((driver:get-perc ["grove_authoring" "install"] authoring)
+    ((abi:constructor authoring ["grove_authoring" "ports"]) compile-authored pure-authored) loaded)))
   (define installed
     (foldl (lambda (state spec)
       (If (Sz (_5 spec))
         (Seq (print ["Activating mount" (_0 spec)])
-          (need-ok ((hook state spec 5) state))) state)) loaded specs))
+          (need-ok ((hook state spec 5) state))) state)) with-authoring specs))
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
   (define config
@@ -151,21 +205,48 @@
                    0 (error ["undeclared-mount-routes" (_0 spec)]))
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
-  (define server ((driver:get-perc ["eden" "serve_read"] eden)
-    ((tool ["source_mount" "access"]) ports homes) reader installed
-    ((driver:get-perc ["http_foot" "run_with"] http) config)))
-  (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
-  (Seq server (foldl (lambda (ignored spec)
-    (Ifz (Sz (_7 spec)) 0
-      (Seq ((hook installed spec 7) server (Ix 8 spec)) 0))) 0 specs))
-  server)
+  (define ephemeral-reader (If (Sz identity) 0 reader))
+  (define (serve saved persist arguments)
+    (define json (module core-images "json"))
+    (define session
+      (If (Sz identity)
+        (wire:schema-value (wire:codec json)
+          ((driver:get-perc ["parse"] json) (bignat-to-text (ReadFile "session.json")))) 0))
+    (define active-reader
+      (If (Sz identity)
+        ((tool ["fs_read" "remote"])
+          (wire:jget-nat "scan_port" 0 session) (wire:jget-str "scan_token" session)) ephemeral-reader))
+    (define deferred
+      ((abi:constructor core ["source_mount" "ports"])
+        (lambda (path state)
+          ((abi:result core "err")
+            ((abi:constructor core ["source_mount" "failure"])
+              "Source captured; explicit candidate publication required" path)))))
+    (define access ((tool ["source_mount" "access"]) (If (Sz identity) deferred ports) homes))
+    (define guarded
+      (If (Sz identity) ((tool ["helm" "supervisor" "persisted_access"]) access persist) access))
+    (define server ((driver:get-perc ["eden" "serve_read"] eden)
+      guarded active-reader saved ((driver:get-perc ["http_foot" "run_with"] http) config)))
+    (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
+    (Seq server (foldl (lambda (ignored spec)
+      (Ifz (Sz (_7 spec)) 0
+        (let ((args (If (Sz identity)
+                (map wire:jstr (_0 (wire:jget (_0 spec) (wire:jget "hooks" session))))
+                (Ix 8 spec))))
+          (Seq ((hook saved spec 7) server args) 0)))) 0 specs))
+    (If (Sz identity)
+      (Seq (print "EDEN-WORLD-READY") (wait-for-owner 0)) server))
+  (If (Sz identity) (checkpoint:start identity serve installed [])
+    (serve installed (lambda (state) 0) [])))
 
 (define (start self system resolve slot port specs scan-port scan-token)
   (If (Sz specs)
-    (mounted self system resolve slot port specs scan-port scan-token)
+    (mounted [] self system resolve slot port specs scan-port scan-token)
     (let* ((local (bootstrap:build-local self system resolve slot ["eden"]))
            (eden (module (_2 (_1 local)) "eden"))
            (state (need-ok ((driver:get-perc ["eden" "boot"] eden)
              self (bootstrap:trusted system) (_1 (_0 local)) port))))
       ((driver:get-perc ["eden" "serve"] eden) state))))
-(#export start)
+(define (start-world identity self system resolve slot port specs scan-port scan-token)
+  (mounted identity self system resolve slot port specs scan-port scan-token))
+(#export start start-world)

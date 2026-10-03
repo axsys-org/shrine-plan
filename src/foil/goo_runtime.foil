@@ -2,6 +2,9 @@
 - grove_install
 - grove_view_publication
 - json
+- grove_ui_runtime
+- grove_authoring
+- commitment
 
 ' Browser requests identify published controls. Only source-declared arguments
 ' can be supplied, and all writes pass through the namespace event loop.
@@ -157,8 +160,15 @@
     \ published=goo/published current=myth
     ^ either[str goo/view]
     ? (maybe/is_some (fit_check current.put(['sys 'lash] published.contract))) (./err "Object no longer matches this view.")
-    ?> (./ok lowered) published.result (./err "View has compiler errors.")
-    | ./ok lowered
+    ? published.result
+     > (./ok lowered) (./ok lowered)
+     > (./err cause)
+      ? cause
+       > (grove/error/syntax span message)
+        | ./err (str/cat_all ["View " (path_show published.view.name) " at "
+            (nat/show span.line) ":" (nat/show span.column) ": " message])
+       > (grove/error/parser cause)
+        | ./err "View parser failed before lowering."
   + bound_control
     \ binding=str found=[goo/node goo_runtime/scope]
     ^ either[str [goo/node goo_runtime/scope]]
@@ -200,9 +210,253 @@
     = bindings=list[rex] (node.arguments.drop(1).keep((\ arg=rex (maybe/is_none (goo_runtime/named "become" (list/one arg))))))
     < arguments (goo_runtime/arguments published query.inputs query.now scope.values.weld(bindings))
     | goo_runtime/dispatch action arguments current view.contract state
-  + apply
-    \ query=goo_runtime/request state=namespace
+  + prepared_action
+    : target=path before=myth after=myth
+
+  + surface_slot
+    ^ path
+    ['sys 'goo 'surface]
+  + program_slot
+    ^ path
+    ['sys 'goo 'program]
+  + commitments_slot
+    ^ path
+    ['sys 'goo 'commitments]
+  + action_assessment
+    : context=grove_surface_context plan=grove_change_plan
+  + action_commitments
+    : retained=row[commitment/retained[goo_runtime/action_assessment]]
+  + action_findings
+    : findings=row[commitment/finding]
+  + assess_action
+    \ policy=goo_runtime/action_commitments context=grove_surface_context plan=grove_change_plan
+    ^ row[commitment/finding]
+    | commitment/assess policy.retained (goo_runtime/action_assessment context plan)
+  + check_commitments
+    ' Read checkers from the installed owner, independently of the action's
+    ' proposed checks. The proposed code cannot remove its own failed promise.
+    \ captured=goo_runtime/captured_surface plan=grove_change_plan state=namespace
+    ^ either[str unit]
+    = owner (goo_runtime/record .x captured.owner.path state).fall(myth/new)
+    ?> (./some held) owner.get(goo_runtime/commitments_slot) (./ok [])
+    ?> policy=goo_runtime/action_commitments held (./err "Invalid retained commitments.")
+    ? !(commitment/unique policy.retained) (./err "Retained commitment identities conflict.")
+    ? (eq policy.retained.len 0) (./ok [])
+    ?> (./some ports) (grove_authoring/get state) (./err "Bounded commitment evaluation is unavailable.")
+    = thunk
+        \ ignored=unit
+        ^ any
+        | goo_runtime/action_findings (goo_runtime/assess_action policy captured.context plan)
+    < value (ports.pure thunk)
+    ?> result=goo_runtime/action_findings value (./err "Invalid commitment findings.")
+    ? !(commitment/admissible .true result.findings) (./err "A retained commitment failed or remains unknown.")
+    | ./ok []
+  + captured_surface
+    : owner=safe binding=grove_surface_binding program=grove_surface_program
+      context=grove_surface_context
+  + prepared_surface_action
+    : captured=goo_runtime/captured_surface occurrence=grove_occurrence
+      plan=grove_change_plan
+  + surface_render_result
+    : value=either[str grove_surface_output]
+  + surface_resolve_result
+    : value=either[str grove_occurrence]
+  + surface_prepare_result
+    : value=either[str grove_change_plan]
+  + capture_surface
+    ' Capture only the installed explicit read scopes, not an ambient namespace
+    ' capability. Limits bound this operation rather than the namespace size.
+    \ subject=path viewport=myth state=namespace
+    ^ either[str goo_runtime/captured_surface]
+    ?> (./some card) (goo_runtime/record .x subject state) (./err "Surface subject is absent.")
+    ?> (./some held) card.get(goo_runtime/surface_slot) (./err "No native surface binding.")
+    ?> binding=grove_surface_binding held (./err "Invalid native surface binding.")
+    = code binding.implementation
+    ? !(equal[care] code.care .x) (./err "Surface implementation requires exact code care.")
+    ? (eq code.ver 0) (./err "Surface implementation must be pinned.")
+    ?> (./known tree) (sovereign_view code.care code.ver code.path state) (./err "Pinned surface implementation is unavailable.")
+    ?> (./some held) tree.fil.fall(myth/new).get(goo_runtime/program_slot) (./err "No compiled native surface program.")
+    ?> program=grove_surface_program held (./err "Invalid native surface program.")
+    ? (gt binding.reads.len 128) (./err "Surface read page exceeds its bound.")
+    = inputs=row[grove_observed]
+        | binding.reads.map
+        \ at=dep
+        | grove_observed at (sovereign_case at.c at.p state) (sovereign_view at.c 0 at.p state)
+      bounded=bool
+        | inputs.all
+        \ input=grove_observed
+        ? input.value
+         > (./known tree) (le tree.wyt 2048)
+        .true
+    ? !bounded (./err "Surface tree exceeds its page bound; narrow its native input scope.")
+    | ./ok (goo_runtime/captured_surface
+        (safe (state.case(.x subject)).fall(0) .x subject) binding program
+        (grove_surface_context subject inputs viewport code binding.writes))
+  + surface_current
+    \ captured=goo_runtime/captured_surface state=namespace
+    ^ bool
+    ? !(equal (maybe/some[nat] captured.owner.ver) (state.case(.x captured.owner.path))) .false
+    | captured.context.inputs.all
+      \ input=grove_observed
+      | equal input.basis (sovereign_case input.dependency.c input.dependency.p state)
+  + render_surface
+    \ captured=goo_runtime/captured_surface state=namespace
+    ^ either[str grove_surface_output]
+    ? !(goo_runtime/surface_current captured state) (./err "Surface inputs changed.")
+    ?> (./some ports) (grove_authoring/get state) (./err "Bounded native execution is unavailable.")
+    = thunk
+        \ ignored=unit
+        ^ any
+        | goo_runtime/surface_render_result (captured.program.render captured.context)
+    < value (ports.pure thunk)
+    ?> result=goo_runtime/surface_render_result value (./err "Invalid surface rendering result.")
+    < rendered result.value
+    ? (gt rendered.occurrences.len 4096) (./err "Surface occurrence page is too large.")
+    % rest=row[grove_occurrence] rendered.occurrences out=row[grove_occurrence] []
+    ^ either[str grove_surface_output]
+    ? (eq rest.len 0) (./ok rendered.set_occurrences(out))
+    ? (out.any((\ item (equal[path] item.key rest.at(0).key)))) (./err "Duplicate surface occurrence identity.")
+    < item (goo_runtime/seal_occurrence captured rest.at(0) state)
+    | _ rest.drop(1) out.snoc(item)
+  + resolve_surface
+    \ captured=goo_runtime/captured_surface key=path parameters=myth state=namespace
+    ^ either[str grove_occurrence]
+    ? !(goo_runtime/surface_current captured state) (./err "Surface inputs changed.")
+    ?> (./some ports) (grove_authoring/get state) (./err "Bounded native execution is unavailable.")
+    = thunk
+        \ ignored=unit
+        ^ any
+        | goo_runtime/surface_resolve_result (captured.program.resolve captured.context key parameters)
+    < value (ports.pure thunk)
+    ?> result=goo_runtime/surface_resolve_result value (./err "Invalid correspondence result.")
+    < item result.value
+    ? !(equal[path] key item.key) (./err "Correspondence returned a different occurrence.")
+    | goo_runtime/seal_occurrence captured item state
+  + prepare_surface_action
+    \ captured=goo_runtime/captured_surface key=path parameters=myth arguments=myth state=namespace
+    ^ either[str goo_runtime/prepared_surface_action]
+    < item (goo_runtime/resolve_surface captured key parameters state)
+    ?> (./some action) item.action (./err "This occurrence has no declared action.")
+    ?> (./some ports) (grove_authoring/get state) (./err "Bounded native execution is unavailable.")
+    = thunk
+        \ ignored=unit
+        ^ any
+        | goo_runtime/surface_prepare_result (captured.program.prepare captured.context item arguments)
+    < value (ports.pure thunk)
+    ?> result=goo_runtime/surface_prepare_result value (./err "Invalid action preparation result.")
+    < plan result.value
+    < checked (goo_runtime/surface_plan_allowed captured plan state)
+    | ./ok (goo_runtime/prepared_surface_action captured item plan)
+  + focus_allowed
+    \ captured=goo_runtime/captured_surface focus=grove_focus
+    ^ bool
+    | captured.context.inputs.any
+      \ input=grove_observed
+      = at input.dependency
+      ? (equal[path] at.p focus.source.path)
+        | ((equal[care] focus.source.care .x) ||
+            (equal[care] at.c focus.source.care) || (equal[care] at.c .z))
+      ? !(equal[care] at.c .z) .false
+      | pith_prefix at.p focus.source.path
+  + seal_occurrence
+    ' A program supplies correspondence, not authority. Resolve live references
+    ' to exact cases only inside the captured input scope.
+    \ captured=goo_runtime/captured_surface item=grove_occurrence state=namespace
+    ^ either[str grove_occurrence]
+    ? !(goo_runtime/surface_current captured state) (./err "Surface inputs changed.")
+    ? !(goo_runtime/focus_allowed captured item.focus) (./err "Correspondence is outside the captured native inputs.")
+    = ref item.focus.source
+    ?> (./some basis) (sovereign_case ref.care ref.path state) (./err "Correspondence target is unavailable.")
+    ? (and (gt ref.ver 0) !(eq ref.ver basis)) (./err "Correspondence names a different native basis.")
+    = focus item.focus.set_source((safe basis ref.care ref.path))
+    | ./ok item.set_focus(focus)
+  + surface_plan_allowed
+    \ captured=goo_runtime/captured_surface plan=grove_change_plan state=namespace
+    ^ either[str unit]
+    ? !(goo_runtime/surface_current captured state) (./err "Surface inputs changed; preserve the draft and refresh.")
+    ? (gt plan.edits.len 256) (./err "Action exceeds the native transaction bound.")
+    ? !(plan.checks.all((\ check (either/is_ok check)))) (./err "An action check did not hold.")
+    % rest=row[grove_record_edit] plan.edits seen=row[path] []
+    ^ either[str unit]
+    ? (eq rest.len 0) (goo_runtime/check_commitments captured plan state)
+    = edit rest.at(0)
+    ? (seen.has(edit.target)) (./err "An action must compose changes to the same subject explicitly.")
+    ? (pith_prefix [state.self 'journal 'grove 'events] edit.target)
+      | ./err "Native action receipts are written only by the owner."
+    ? !(state.permitted(edit.target)) (./err "Action target is outside local authority.")
+    ? !(equal edit.before (goo_runtime/record .x edit.target state)) (./err "An action target changed.")
+    = scopes (captured.binding.writes.keep((\ scope (equal[path] scope.target edit.target))))
+    ? !(eq scopes.len 1) (./err "Action target lacks an exact installed write scope.")
+    ' Creation/deletion requires a separate owned construction operation, not a
+    ' field editor pretending that a missing record is an empty record.
+    ?> (./some before) edit.before (./err "This action does not have construction authority.")
+    ?> (./some after) edit.after (./err "This action does not have deletion authority.")
+    = scope scopes.at(0)
+      protected=row[path] [goo_runtime/surface_slot goo_runtime/commitments_slot ['sys 'interaction 'endpoint]
+        ['sys 'interaction 'indexed_endpoint] limb_slot ['sys 'lash]]
+      allowed
+        | before.meld(after).tap.all
+        \ item
+        ? (equal (before.get(item.key)) (after.get(item.key))) .true
+        ? (protected.has(item.key)) .false
+        | scope.slots.has(item.key)
+    ? !allowed (./err "Action modifies a slot outside its installed write scope.")
+    | _ rest.drop(1) seen.snoc(edit.target)
+  + reverse_plan
+    ' Reverse only the originally changed slots. Other later observations and
+    ' unrelated writes survive. A later change to one of those slots conflicts.
+    ' No external effect is represented as reversed by this operation.
+    \ original=grove_change_plan state=namespace
+    ^ either[str grove_change_plan]
+    % rest=row[grove_record_edit] original.edits out=row[grove_record_edit] []
+    ^ either[str grove_change_plan]
+    ? (eq rest.len 0) (./ok (grove_change_plan out []))
+    = edit rest.at(0)
+    ?> (./some before) edit.before (./err "Construction requires an explicit inverse.")
+    ?> (./some after) edit.after (./err "Deletion requires an explicit inverse.")
+    ?> (./some current) (goo_runtime/record .x edit.target state) (./err "The original target is absent.")
+    = changed=row[mop/kv[path pail]] (before.meld(after).tap.keep((\ entry=mop/kv[path pail] !(equal before.get(entry.key) after.get(entry.key)))))
+    ? !(changed.all((\ entry (equal current.get(entry.key) after.get(entry.key)))))
+      | ./err "A changed slot has a later value; undo needs an explicit reconciliation."
+    = restored
+        | changed.fold current
+        \ card entry
+        ? before.get(entry.key)
+         > (./some value) card.put(entry.key value)
+        | card.del entry.key
+    | _ rest.drop(1) out.snoc((grove_record_edit edit.target (./some current) (./some restored)))
+  + commit_surface_action
+    \ prepared=goo_runtime/prepared_surface_action state=namespace
     ^ either[str namespace]
+    < commands (goo_runtime/surface_commands prepared state)
+    ? (grove_install/change_many commands state)
+     > (./ok next) (./ok next)
+     > (./err why) (./err (str/from_atom (iota_show why)))
+  + surface_commands
+    ' The owner may append its own receipt to this same transaction. Nothing
+    ' supplied by the browser bypasses the installed native write scopes.
+    \ prepared=goo_runtime/prepared_surface_action state=namespace
+    ^ either[str row[[path writ]]]
+    < checked (goo_runtime/surface_plan_allowed prepared.captured prepared.plan state)
+    % rest=row[grove_record_edit] prepared.plan.edits commands=row[[path writ]] []
+    ^ either[str row[[path writ]]]
+    ? (eq rest.len 0) (./ok commands)
+    = edit rest.at(0)
+      before edit.before.fall(myth/new)
+      after edit.after.fall(myth/new)
+    ? (equal before after) (_ rest.drop(1) commands)
+    = removed (before.tap.any((\ item !(after.has(item.key)))))
+    ? (and removed before.has(limb_slot)) (./err "Slot removal needs the subject's native operation.")
+    = delta
+        | after.tap.fold myth/new
+        \ out item
+        ? (equal (before.get(item.key)) (after.get(item.key))) out
+        | out.put item.key item.val
+      command=writ (? removed (./make after) (./poke delta))
+    | _ rest.drop(1) commands.snoc([edit.target command])
+  + prepare
+    \ query=goo_runtime/request state=namespace
+    ^ either[str goo_runtime/prepared_action]
     ? !(eq query.publication (goo_runtime/publication state)) (./err "Views changed; refresh before submitting.")
     ? !(eq query.displayed (state.case(.y query.target)).fall(0)) (./err "Object changed; refresh before submitting.")
     ?> (./some target) (goo_runtime/target query.target state) (./err "This presentation has no writable source object.")
@@ -213,7 +467,30 @@
     ?> (./some current) (goo_runtime/record .x target state) (./err "Object no longer exists.")
     ?> (./some published) (goo_runtime/record .x query.view state) (./err "View no longer exists.")
     < next (goo_runtime/updated query published current state)
-    ? (grove_install/change target (writ/make next) state)
+    | ./ok (goo_runtime/prepared_action target current next)
+  + apply
+    \ query=goo_runtime/request state=namespace
+    ^ either[str namespace]
+    < prepared (goo_runtime/prepare query state)
+    | goo_runtime/change prepared.target prepared.before prepared.after state
+  + change
+    ' A data edit must not initialize the existing controller again. In
+    ' particular, resending Pact's manifest replays its installation seeds.
+    ' Route only changed slots through talk. Slot removal on a formed record
+    ' needs an authored native operation; do not silently resurrect the slot.
+    \ target=path current=myth next=myth state=namespace
+    ^ either[str namespace]
+    ? (equal current next) (./ok state)
+    = removed current.tap.any((\ item !(next.has(item.key))))
+    ? (and removed current.has(limb_slot))
+      | ./err "Removing slots from a behavior-owned subject requires an authored native operation."
+    = delta
+        | next.tap.fold myth/new
+        \ out=myth item=mop/kv[path pail]
+        ? (equal current.get(item.key) (maybe/some[pail] item.val)) out
+        | out.put item.key item.val
+      command=writ (? removed (./make next) (./poke delta))
+    ? (grove_install/change target command state)
      > (./ok next) (./ok next)
      > (./err why) (./err (str/from_atom (iota_show why)))
   + run
