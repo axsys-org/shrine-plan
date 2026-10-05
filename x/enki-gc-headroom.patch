@@ -1,0 +1,55 @@
+--- a/pkg/plan/src/heap.c
++++ b/pkg/plan/src/heap.c
+@@ -539,7 +539,13 @@
+   if (ax_likely(h->free + cells <= h->limit))
+     return;
+   pl_gc_collect(t, h);
+-  if (h->free + cells > h->limit)
++  /* A dense surviving graph can leave enough room for this single
++   * allocation while collecting again after only a few more cells.
++   * Apply the grow path's existing proportional margin at collection
++   * boundaries, including when the immediate allocation still fits. */
++  size_t headroom = (size_t)(h->limit - h->free);
++  size_t margin = h->live_cells / 2 + 4096;
++  if (cells > headroom || headroom - cells < margin)
+     pl_gc_grow(t, h, cells);
+   ax_assume(h->free + cells <= h->limit, "heap exhausted after grow");
+ }
+--- a/tests/unit/test_plan_core.c
++++ b/tests/unit/test_plan_core.c
+@@ -280,6 +280,35 @@
+ }
+ 
+ #ifndef PL_GC_STRESS
++TEST(gc, dense_live_heap_keeps_allocation_headroom) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  size_t capacity = pl_gc_headroom(t);
++  size_t live = capacity - 32;
++  uint32_t count = (uint32_t)(live - PL_APP_CELLS(0));
++  pl_val* args = calloc(count, sizeof(*args));
++  ASSERT_NOT_NULL(args);
++  args[count - 1] = 17;
++  pl_vpush(t, test_app(t, 0, count, args));
++  free(args);
++  pl_gc_reserve(t, 32);
++  (void)pl_bump(t, 32); /* unreachable garbage fills the old space */
++
++  /* A one-cell allocation fits after collection. It must still gain
++   * proportional headroom, rather than copying the whole live graph
++   * again for every 32 subsequent cells of garbage. */
++  pl_gc_reserve(t, 1);
++  ASSERT(pl_gc_headroom(t) >= live / 2);
++  pl_cell* row = pl_as(PL_TAG_APP, t->vstack[t->vsp - 1]);
++  ASSERT_EQ(pl_app_n(row), count);
++  ASSERT_EQ(pl_app_args(row)[count - 1], 17);
++
++  t->vsp = 0;
++  pl_gc_trim(t);
++  ASSERT(pl_gc_headroom(t) <= 8192);
++  test_rt_free(&rt);
++}
++
+ TEST(gc, pressure_collection_is_amortized) {
+   test_rt rt = test_rt_new();
+   pl_thread* t = rt.t;

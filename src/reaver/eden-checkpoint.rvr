@@ -1,0 +1,41 @@
+;;;; Durable roots are runnable native closures, never serialized actors.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind bytecode (#module plangrm))
+
+(define protocol "canvas/1")
+(define format "eden/world/v4")
+
+;; Checkpoint the native graph. The store shares immutable pinned subgraphs;
+;; serializing the evolving world into one wire atom defeats that sharing and
+;; duplicates the entire accumulated delta at each acknowledgement. Wire data
+;; remains a boundary transport, not the representation of the durable world.
+;; This new protocol does not reinterpret historical world formats.
+(define (store basis state)
+  (1 (Pin state) 0))
+(define (restore basis saved)
+  (If (And (Eq 1 (Hd saved)) (Eq 2 (Sz saved)))
+    (Unpin (_0 saved)) (error "invalid-checkpoint-state")))
+
+;; serve receives immutable state and a persistence callback. It recreates
+;; actor registrations and physical connections using saved native recipes.
+;; Nothing in the captured graph may contain a live process-local handle.
+(define (resume identity serve basis saved args)
+  (define (checkpoint state)
+    (Save (Pin (resume identity serve basis (store basis state)))))
+  ;; Install is process state. A custom saved root bypasses reaver's repl-main,
+  ;; so it must restore the pinned compiler before recreating actors.
+  ;; The compiler is part of this saved root; old worlds retain their compiler.
+  ;; No process-local code cache is captured in a checkpoint.
+  (Seq (Install bytecode:codegenLaw)
+    (Seq (print ["EDEN-WORLD" protocol format identity])
+      ((Unpin serve) (restore basis saved) checkpoint args))))
+
+(define (start identity serve state args)
+  (define basis (Pin state))
+  (define root (Pin (resume identity (Pin serve) basis (store basis state))))
+  (Seq (Save root) ((Unpin root) args)))
+
+(#export protocol format resume start store restore)

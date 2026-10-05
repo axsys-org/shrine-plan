@@ -1,0 +1,380 @@
+--- a/pkg/enki/app/wisp.c
++++ b/pkg/enki/app/wisp.c
+@@ -32,7 +32,7 @@
+  * loadAssembly / runRepl drivers.
+  */
+ 
+-#define BOOT_HEAP_CELLS                ((size_t)1 << 26) /* 512 MiB per semispace, grows */
++#define BOOT_HEAP_CELLS                ((size_t)1 << 23) /* 64 MiB per semispace, grows */
+ #define BOOT_GC_ALLOCATION_FLOOR_CELLS ((size_t)1 << 20) /* 8 MiB */
+ // ./build/release/bin/wisp --file-root ../reaver/src ../reaver/src/plan
+ // main  35.43s user 0.55s system 99% cpu 36.136 total
+@@ -492,13 +492,31 @@
+   w->env = NULL;
+ 
+   pl_store* store = pl_heap_store(w->t->heap);
++  bool silo_entry_f = mod_c[0] == '@';
+   bool silo_root_f = store->format == PL_STORE_FORMAT_SILO_V1 &&
+                      (strcmp(ctx->src_dir_c, "snap") == 0 ||
+                       strcmp(ctx->src_dir_c, "./snap") == 0) &&
+-                     strcmp(mod_c, "root") == 0;
++                     (strcmp(mod_c, "root") == 0 || silo_entry_f);
+   if (silo_root_f) {
+     uint8_t hash[32];
+-    if (!pl_store_get_root(store, hash)) {
++    if (silo_entry_f) {
++      /* A committed immutable worker closure is an entry point, not a new
++       * application root. Load its dependency closure only; never alter root. */
++      if (strlen(mod_c) != 65) {
++        fprintf(stderr, "wisp: expected @ followed by 64 lowercase hex digits\n");
++        return false;
++      }
++      const char* digits = "0123456789abcdef";
++      for (size_t i = 0; i < 32; i++) {
++        const char* hi = strchr(digits, mod_c[1 + i * 2]);
++        const char* lo = strchr(digits, mod_c[2 + i * 2]);
++        if (hi == NULL || lo == NULL) {
++          fprintf(stderr, "wisp: invalid Silo entry hash\n");
++          return false;
++        }
++        hash[i] = (uint8_t)(((hi - digits) << 4) | (lo - digits));
++      }
++    } else if (!pl_store_get_root(store, hash)) {
+       fprintf(stderr, "wisp: Silo store has no root\n");
+       return false;
+     }
+--- a/pkg/plan/src/store.c
++++ b/pkg/plan/src/store.c
+@@ -949,7 +949,9 @@
+   memcpy(s->compiler, hash, 32);
+   bool sweep = s->compiler_f;
+   if (sweep) {
+-    s->compiler_h = pl_heap_new(((size_t)1 << 26), s);
++    /* Collect compiler scratch sooner instead of retaining up to 512 MiB
++     * of garbage per semispace. The live heap still grows when necessary. */
++    s->compiler_h = pl_heap_new(((size_t)1 << 23), s);
+     s->compiler_t = pl_thread_new(s->compiler_h);
+   }
+   pl_store_unlock(s);
+--- a/pkg/plan/src/heap.c
++++ b/pkg/plan/src/heap.c
+@@ -5,6 +5,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/mman.h>
+ 
+ #include "axsys/assume.h"
+ #include "axsys/perf.h"
+@@ -211,12 +212,31 @@
+ /* ── Heap lifecycle ────────────────────────────────────────────────────── */
+ 
+ static pl_cell* pl_space_alloc(size_t cells) {
+-  pl_cell* p = malloc(cells * sizeof(pl_cell));
+-  ax_assume(p != NULL, "heap semispace allocation failed (%zu cells)", cells);
++  pl_cell* p = mmap(NULL, cells * sizeof(pl_cell), PROT_READ | PROT_WRITE,
++                    MAP_PRIVATE | MAP_ANON, -1, 0);
++  ax_assume(p != MAP_FAILED, "heap semispace allocation failed (%zu cells)", cells);
+   ax_assume(((uintptr_t)p & 7u) == 0, "semispace not 8-aligned");
+   ax_assume(((uintptr_t)(p + cells) & ~PL_ADDR_MASK) == 0,
+             "heap address exceeds 56 bits");
+   return p;
++}
++
++static void pl_space_free(pl_cell* space, size_t cells) {
++  (void)munmap(space, cells * sizeof(pl_cell));
++}
++static void pl_space_discard(pl_cell* space, size_t cells) {
++#if defined(__APPLE__)
++  (void)madvise(space, cells * sizeof(pl_cell), MADV_FREE_REUSABLE);
++#else
++  (void)madvise(space, cells * sizeof(pl_cell), MADV_DONTNEED);
++#endif
++}
++static void pl_space_reuse(pl_cell* space, size_t cells) {
++#if defined(__APPLE__)
++  (void)madvise(space, cells * sizeof(pl_cell), MADV_FREE_REUSE);
++#else
++  (void)space; (void)cells;
++#endif
+ }
+ 
+ pl_heap* pl_heap_new(size_t cells, pl_store* store) {
+@@ -236,8 +256,8 @@
+ void pl_heap_free(pl_heap* h) {
+   if (h == NULL)
+     return;
+-  free(h->from);
+-  free(h->to);
++  pl_space_free(h->from, h->cells);
++  pl_space_free(h->to, h->cells);
+   free(h->roots);
+   free(h);
+ }
+@@ -481,14 +501,19 @@
+ }
+ 
+ static void pl_gc_collect(pl_thread* t, pl_heap* h) {
++  pl_space_reuse(h->to, h->cells);
+   pl_collect_into(t, h, h->to);
+   pl_cell* old_from = h->from;
+   h->from = h->to;
+   h->to = old_from;
+   h->limit = h->from + h->cells;
++  /* Every reachable moving object has been evacuated. The other semispace
++   * is scratch for the next collection, not retained application memory. */
++  pl_space_discard(h->to, h->cells);
+ }
+ 
+ static void pl_gc_grow(pl_thread* t, pl_heap* h, size_t need_cells) {
++  size_t old_cells = h->cells;
+   size_t want = h->cells;
+   while (want < h->live_cells + need_cells + (h->live_cells / 2) + 4096)
+     want *= 2;
+@@ -502,8 +527,8 @@
+   h->to = nto;
+   h->cells = want;
+   h->limit = h->from + want;
+-  free(old_from);
+-  free(old_to);
++  pl_space_free(old_from, old_cells);
++  pl_space_free(old_to, old_cells);
+ }
+ 
+ void pl_gc_reserve(pl_thread* t, size_t cells) {
+--- a/pkg/plan/src/pin.c
++++ b/pkg/plan/src/pin.c
+@@ -346,6 +346,12 @@
+     return v;
+   if (pl_tag(v) == PL_TAG_PIN)
+     return save_canonical_pin(c, v);
++  /* A canonical store graph is already closed, immutable and non-moving.
++   * Copying it into every new snapshot retains the entire unchanged world
++   * again. Sharing within this store changes neither Silo bytes nor hashes.
++   * Transient preparation still uses its own representation. */
++  if (!transient && pl_store_owns(c->store, v))
++    return v;
+   ptrdiff_t hit = ax_hmgeti(*map, v);
+   if (hit >= 0)
+     return (*map)[hit].value;
+@@ -565,6 +571,7 @@
+    * in the durable store may retain those Save-local pointers. */
+   ax_hmfree(c->canonical);
+   c->canonical = NULL;
++  copy_entry* copies = NULL;
+   for (ptrdiff_t i = 0; i < ax_arrlen(c->items); i++) {
+     save_item* item = &c->items[i];
+     const uint8_t* known = pl_pin_hash(item->source);
+@@ -588,10 +595,8 @@
+       continue;
+     }
+ 
+-    copy_entry* copies = NULL;
+     pl_val body = save_copy_promoted(c, &copies,
+                                      pl_pin_body(pl_ptr(item->source)), false);
+-    ax_hmfree(copies);
+     pl_val* subpins = NULL;
+     for (ptrdiff_t j = 0; j < ax_arrlen(item->table); j++)
+       ax_arrpush(subpins, save_canonical_pin(c, item->table[j]));
+@@ -600,6 +605,7 @@
+     ax_hmput(c->canonical, item->hash, item->canonical);
+     ax_arrfree(subpins);
+   }
++  ax_hmfree(copies);
+ }
+ 
+ static void save_publish_targets(save_ctx* c) {
+--- a/tests/unit/test_plan_store.c
++++ b/tests/unit/test_plan_store.c
+@@ -383,6 +383,63 @@
+   ASSERT_NEQ(pl_pin_proxy_target(pl_ptr(child)), 0);
+   ASSERT_NEQ(pl_pin_proxy_target(pl_ptr(parent)), 0);
+ 
++  pl_thread_free(t);
++  pl_heap_free(heap);
++  pl_store_free(store);
++}
++
++TEST(store, snapshots_share_closed_store_graphs) {
++  pl_store* store = pl_store_new_mem();
++  pl_heap* heap = pl_heap_new(1 << 16, store);
++  pl_thread* t = pl_thread_new(heap);
++  size_t base = t->vsp;
++  pl_vpush(t, 0);
++  for (size_t i = 0; i < 512; i++)
++    t->vstack[base] = test_app2(t, 0, i, t->vstack[base]);
++  t->vstack[base] = pl_pin(t, t->vstack[base]);
++  uint8_t hash[32];
++  char err[192] = {0};
++  ASSERT(pl_store_save_root(store, t->vstack[base], hash, err, sizeof(err)), "%s", err);
++  pl_val shared = pl_pin_body(pl_ptr(t->vstack[base]));
++  size_t before = pl_store_mark(store);
++  for (size_t i = 0; i < 20; i++) {
++    pl_vpush(t, test_app2(t, 0, i, shared));
++    t->vstack[base + 1] = pl_pin(t, t->vstack[base + 1]);
++    ASSERT(pl_store_save_root(store, t->vstack[base + 1], hash, err, sizeof(err)), "%s", err);
++    pl_val body = pl_pin_body(pl_ptr(t->vstack[base + 1]));
++    ASSERT_EQ(pl_app_args(pl_ptr(body))[1], shared);
++    t->vsp = base + 1;
++  }
++  ASSERT_LT(pl_store_mark(store) - before, 4096);
++  /* Persisted values retain their ordinary hashes and are still loadable. */
++  pl_val loaded = pl_store_load(t, hash);
++  ASSERT_EQ(pl_app_args(pl_ptr(pl_pin_body(pl_ptr(loaded))))[0], 19);
++  t->vsp = base;
++  pl_thread_free(t);
++  pl_heap_free(heap);
++  pl_store_free(store);
++}
++
++TEST(store, pins_saved_together_share_moving_substructure) {
++  pl_store* store = pl_store_new_mem();
++  pl_heap* heap = pl_heap_new(1 << 16, store);
++  pl_thread* t = pl_thread_new(heap);
++  pl_vpush(t, 0);
++  for (size_t i = 0; i < 512; i++)
++    t->vstack[0] = test_app2(t, 0, i, t->vstack[0]);
++  pl_vpush(t, test_app2(t, 0, 1, t->vstack[0]));
++  t->vstack[1] = pl_pin(t, t->vstack[1]);
++  pl_vpush(t, test_app2(t, 0, 2, t->vstack[0]));
++  t->vstack[2] = pl_pin(t, t->vstack[2]);
++  pl_vpush(t, test_app2(t, 0, t->vstack[1], t->vstack[2]));
++  t->vstack[3] = pl_pin(t, t->vstack[3]);
++  uint8_t hash[32];
++  char err[192] = {0};
++  ASSERT(pl_store_save_root(store, t->vstack[3], hash, err, sizeof(err)), "%s", err);
++  pl_val left = pl_pin_body(pl_ptr(t->vstack[1]));
++  pl_val right = pl_pin_body(pl_ptr(t->vstack[2]));
++  ASSERT_EQ(pl_app_args(pl_ptr(left))[1], pl_app_args(pl_ptr(right))[1]);
++  t->vsp = 0;
+   pl_thread_free(t);
+   pl_heap_free(heap);
+   pl_store_free(store);
+--- a/pkg/enki/src/actor.c
++++ b/pkg/enki/src/actor.c
+@@ -341,7 +341,14 @@
+   pl_thread* t = a->t;
+   size_t base = t->vsp;
+   pl_vpush(t, v);
++  bool snapshot_stats = getenv("ENKI_SNAPSHOT_STATS") != NULL;
++  size_t before = snapshot_stats ? pl_store_memory_bytes(a->sys->store) : 0;
+   *out = pl_store_snapshot_normal(t, t->vstack[base]);
++  if (snapshot_stats) {
++    size_t after = pl_store_memory_bytes(a->sys->store);
++    fprintf(stderr, "[trace] snapshot actor=%llu added=%zu store=%zu\n",
++            (unsigned long long)a->id, after - before, after);
++  }
+   t->vsp = base;
+   return true;
+ }
+@@ -684,9 +691,14 @@
+     break;
+   case PL_RUN_DONE:
+     a->status = ER_ACTOR_HALTED; /* result discarded (kept for tests) */
++    /* A stopped actor never reaches another allocation safepoint. Retain its
++     * rooted result for embedders, but release unreachable working memory now
++     * rather than once the entire (potentially long-lived) scheduler exits. */
++    pl_gc_trim(a->t);
+     break;
+   case PL_RUN_EXN:
+     er_crash(a);
++    pl_gc_trim(a->t);
+     break;
+   case PL_RUN_BLOCKED:
+     er_service(sys, a, locked);
+--- a/tests/unit/test_enki_actor.c
++++ b/tests/unit/test_enki_actor.c
+@@ -826,3 +826,28 @@
+   er_scheduler_free(sys);
+   test_rt_free(&rt);
+ }
++
++TEST(actor, halted_actor_releases_unreachable_scratch) {
++  test_rt rt = test_rt_new();
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){.heap_cells = 262144});
++  for (size_t i = 0; i < 16; i++) {
++    er_actor* a = er_scheduler_actor(sys);
++    pl_thread* t = er_actor_thread(a);
++    size_t capacity = pl_gc_headroom(t);
++    /* An HTTP connection can finish long before filling its semispace.
++     * Its abandoned scratch must not wait for scheduler shutdown to collect. */
++    for (size_t j = 0; j < 4096; j++)
++      (void)test_app2(t, 0, j, j + 1);
++    ASSERT(pl_gc_headroom(t) < capacity - 4096, "fixture allocates dead scratch");
++    er_actor_start(a, actor_fn(t, 42));
++    ASSERT_EQ(er_scheduler_run(sys), ER_RUN_IDLE);
++    ASSERT_EQ(er_actor_state(a), ER_ACTOR_HALTED);
++    ASSERT_EQ(er_actor_result(a), 42);
++    ASSERT(pl_gc_live_cells(t->heap) < 64,
++           "terminated actor retains only its live result, not scratch");
++    ASSERT(pl_gc_headroom(t) + pl_gc_live_cells(t->heap) <= 8192,
++           "terminated actor releases its oversized physical semispaces");
++  }
++  er_scheduler_free(sys);
++  test_rt_free(&rt);
++}
+--- a/pkg/plan/include/plan/store.h
++++ b/pkg/plan/include/plan/store.h
+@@ -102,6 +102,8 @@
+  * with a live writer; every mutating store operation fails cleanly. */
+ pl_store* pl_store_new_silo_ro(const char* path, size_t map_size);
+ void pl_store_free(pl_store* s);
++/* Bytes allocated in the immutable native arena (diagnostic, not a limit). */
++size_t pl_store_memory_bytes(pl_store* s);
+ 
+ /* Address-range test used by the collector (store vals are terminal).  The
+  * region bounds are immutable after construction, and this runs for every
+--- a/pkg/plan/src/store.c
++++ b/pkg/plan/src/store.c
+@@ -421,6 +421,10 @@
+   size_t mark = s->region->off_o;
+   pl_store_unlock(s);
+   return mark;
++}
++
++size_t pl_store_memory_bytes(pl_store* s) {
++  return pl_store_mark(s);
+ }
+ 
+ void pl_store_release(pl_store* s, size_t mark) {
+--- a/pkg/plan/src/heap.c
++++ b/pkg/plan/src/heap.c
+@@ -579,6 +579,27 @@
+   pl_gc_collect(t, t->heap);
+ }
+ 
++void pl_gc_trim(pl_thread* t) {
++  pl_heap* h = t->heap;
++  pl_gc_collect(t, h);
++  size_t want = 4096;
++  while (want < h->live_cells + 4096)
++    want *= 2;
++  if (want >= h->cells)
++    return;
++  size_t old_cells = h->cells;
++  pl_cell* old_from = h->from;
++  pl_cell* old_to = h->to;
++  pl_cell* next = pl_space_alloc(want);
++  pl_collect_into(t, h, next);
++  h->from = next;
++  h->to = pl_space_alloc(want);
++  h->cells = want;
++  h->limit = next + want;
++  pl_space_free(old_from, old_cells);
++  pl_space_free(old_to, old_cells);
++}
++
+ /* ── Thread ────────────────────────────────────────────────────────────── */
+ 
+ static _Atomic uint64_t pl_next_profile_lane = 1;
+--- a/pkg/plan/include/plan/heap.h
++++ b/pkg/plan/include/plan/heap.h
+@@ -362,6 +362,8 @@
+  */
+ bool pl_gc_collect_if_pressure(pl_thread* t, size_t allocation_floor_cells);
+ void pl_gc_collect_now(pl_thread* t); /* for tests */
++/* Collect and release oversized semispaces at a dormant machine boundary. */
++void pl_gc_trim(pl_thread* t);
+ 
+ /* ── No-collect windows (debug accounting) ─────────────────────────────── */
+ 

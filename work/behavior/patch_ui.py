@@ -1,0 +1,12 @@
+from pathlib import Path
+p=Path('extras/mounts/medium/workshop/app.js');s=p.read_text().replace('let canvasPoint=null;','let canvasPoint=null,activeDial=null;')
+s=s.replace("name.draggable=true;name.title=n.id;name.ondragstart=e=>e.dataTransfer.setData('application/grove-collection',n.id);", "name.title=n.id;fieldDraggable(name,{collection:n.id,whole:true});")
+s=s.replace("if(d.moved){suppressFieldClick=true;if(b)","if(d.reference.whole){const id=d.reference.collection;if(!d.moved){if(pointing){bindCollection(byId(pointing),id);pointing=null;}else ask('Show '+nativeName(id)+' as the most useful collection view',null,{collection:id});}else if(target?.closest('#viewport')){canvasPoint={gesture:'drop',workspace:maker,target:b?.id||null,point:pointAt(event)};if(b?.componentRevision)proposeComponentBinding(byId(b.componentRevision.subject),id,null,b);else if(b)bindCollection(b,id);else ask('Show '+nativeName(id)+' as the most useful view',pointAt(event),{collection:id});}return;}\n if(d.moved){suppressFieldClick=true;if(b)")
+s=s.replace("result.handler==='local'&&result.choice.action.op==='question'","result.handler==='local'&&['question','place','view'].includes(result.choice.action.op)")
+s=s.replace("commit:commitField,say}));", "commit:commitField,say,gesture:active=>activeDial=active?b.id:null}));")
+s=s.replace("!document.hidden&&!drag&&!fieldDrag", "!document.hidden&&!drag&&!fieldDrag&&!activeDial&&!rowDrag")
+s=s.replace("!connected||drag||fieldDrag)return", "!connected||drag||fieldDrag||activeDial||rowDrag)return")
+s=s.replace("p.componentRevision?.instance===instance&&!p.authoringOnly", "p.componentRevision?.instance===instance&&p.id!==instanceRoot.id&&!p.authoringOnly")
+s=s.replace("['radius','fill','shape','points','notes','behavior','rules']", "['radius','fill','shape','points','notes','behavior','rules','authoringOnly']")
+p.write_text(s)
+p=Path('extras/mounts/medium/workshop/dial.mjs');s=p.read_text().replace('{pending,refresh,commit,say}', '{pending,refresh,commit,say,gesture=()=>{}}').replace('say("Editing target · release to save");','gesture(true);say("Editing target · release to save");').replace('marker.onpointerup=()=>{marker.onpointermove=null;marker.onpointerup=null;if(patch)', 'marker.onpointerup=()=>{gesture(false);marker.onpointermove=null;marker.onpointerup=null;marker.onpointercancel=null;if(patch)').replace('marker.onpointercancel=()=>{marker.onpointermove=null;', 'marker.onpointercancel=()=>{gesture(false);marker.onpointermove=null;');p.write_text(s)

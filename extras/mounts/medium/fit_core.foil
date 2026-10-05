@@ -1,0 +1,280 @@
+- grove_surface_wire
+
+' Native arrangement and contract operations. JSON is a transport value, never
+' executable code. Model output can refer to user content but cannot replace it.
++ fit_core
+  + field
+    \ name=str value=json
+    ^ json
+    | grove_dev/field name value
+  + text
+    \ name=str value=json
+    ^ str
+    | grove_surface_wire/text name value
+  + array
+    \ value=json
+    ^ row[json]
+    ?> arr=json/arr value []
+    arr.xs
+  + texts
+    \ value=json
+    ^ row[str]
+    | (fit_core/array value).map((\ item (fit_core/string item)))
+  + string
+    \ value=json
+    ^ str
+    ?> text=json/str value ""
+    text.s
+  + bool
+    \ value=json
+    ^ bool
+    ?> flag=json/boo value .false
+    flag.b
+  + unique
+    \ values=row[str]
+    ^ bool
+    | values.all((\ value (eq (values.keep((\ other (eq value other)))).len 1)))
+  + contains
+    \ values=row[str] value=str
+    ^ bool
+    | values.any((\ candidate (eq candidate value)))
+  + either_bool
+    \ a=bool b=bool
+    ^ bool
+    ? a .true
+    b
+  + block_kinds
+    ^ row[str]
+    ["text" "card" "number" "image" "video" "audio" "map" "chart" "table" "list" "scene" "canvas" "timeline" "button" "input" "frame" "sketch" "component" "material"]
+  + bounded_number
+    \ value=json limit=nat positive=bool
+    ^ bool
+    ?> number=json/num value .false
+    | and !(number.neg) (and (le number.n limit) (fit_core/either_bool !positive (gt number.n 0)))
+  + valid_rect
+    \ rect=json
+    ^ bool
+    | and (fit_core/bounded_number (fit_core/field "x" rect) 1000000 .false)
+      (and (fit_core/bounded_number (fit_core/field "y" rect) 1000000 .false)
+        (and (fit_core/bounded_number (fit_core/field "w" rect) 16384 .true)
+             (fit_core/bounded_number (fit_core/field "h" rect) 16384 .true)))
+  + valid_block
+    \ block=json
+    ^ bool
+    = id (fit_core/text "id" block)
+      kind (fit_core/text "kind" block)
+      content (fit_core/array (fit_core/field "content" block))
+      ids content.map((\ item (fit_core/text "id" item)))
+    ? !(fit_core/valid_rect (fit_core/field "rect" block)) .false
+    ? ((eq kind "component") || (eq kind "material"))
+      = source (fit_core/field "source" block)
+      ?> (./some target) (path_parse (fit_core/text "subject" source)) .false
+      ? (eq (fit_core/text "revision" source) "") .false
+      | and !(eq id "") (and (fit_core/unique ids) (row/all[str] (\ value=str !(eq value "")) ids))
+    | and !(eq id "") (and (fit_core/contains fit_core/block_kinds kind)
+        (and (fit_core/unique ids) (row/all[json] (\ item=json !(eq (fit_core/text "id" item) "")) content)))
+  + is_array
+    \ value=json
+    ^ bool
+    ?> arr=json/arr value .false
+    .true
+  + acyclic
+    \ blocks=row[json] id=str seen=row[str] fuel=nat
+    ^ bool
+    ? (eq id "") .true
+    ? ((eq fuel 0) || (seen.has(id))) .false
+    = matches blocks.keep((\ block (eq (fit_core/text "id" block) id)))
+    ? !(eq matches.len 1) .false
+    | fit_core/acyclic blocks (fit_core/text "parent" matches.at(0)) seen.snoc(id) fuel.dec
+  + validate_arrangement
+    \ arrangement=json
+    ^ either[str unit]
+    = blocks (fit_core/array (fit_core/field "blocks" arrangement))
+      ids blocks.map((\ block (fit_core/text "id" block)))
+      content (fit_core/content_ids arrangement)
+    ? !(fit_core/is_array (fit_core/field "blocks" arrangement)) (./err "An arrangement must have a blocks array.")
+    ? !(blocks.all((\ block (fit_core/is_array (fit_core/field "content" block))))) (./err "Every block must declare its content array.")
+    ? !(blocks.all((\ block (fit_core/acyclic blocks (fit_core/text "id" block) [] blocks.len.inc)))) (./err "Containment must be acyclic.")
+    ? (gt blocks.len 256) (./err "Use at most 256 blocks in one arrangement.")
+    ? !(fit_core/unique ids) (./err "Block identities must be unique.")
+    ? !(fit_core/unique content) (./err "Content identities must be unique across the arrangement.")
+    ? !(blocks.all(fit_core/valid_block)) (./err "Every block needs a prepared kind and exact content identities.")
+    | ./ok []
+  + content_ids
+    \ arrangement=json
+    ^ row[str]
+    | (fit_core/array (fit_core/field "blocks" arrangement)).bind
+        \ block=json
+        | (fit_core/array (fit_core/field "content" block)).map((\ item (fit_core/text "id" item)))
+
+  + validate_reading
+    ' All content must be accounted for exactly once, including explicit unplaced
+    ' content. Terms carry references only; original bytes stay in the arrangement.
+    \ arrangement=json reading=json
+    ^ either[str unit]
+    < valid (fit_core/validate_arrangement arrangement)
+    = ids (fit_core/content_ids arrangement)
+      used (fit_core/texts (fit_core/field "content" reading))
+      unplaced (fit_core/texts (fit_core/field "unplaced" reading))
+      accounted used.weld(unplaced)
+    ? !(and (fit_core/is_array (fit_core/field "content" reading)) (fit_core/is_array (fit_core/field "unplaced" reading))) (./err "Fit must declare placed and unplaced content.")
+    ? !(fit_core/unique accounted) (./err "Fit cannot duplicate a content identity.")
+    ? !(and (eq accounted.len ids.len) (row/all[str] (\ id=str (ids.has(id))) accounted))
+      | ./err "Fit must retain every content identity, or explicitly mark it unplaced."
+    | ./ok []
+  + compatible
+    ' Bounded structural subtyping. Extra record fields are accepted only by an
+    ' open target. Optional source fields cannot satisfy a required target field.
+    \ fuel=nat have=json need=json
+    ^ bool
+    ? (eq fuel 0) .false
+    ? !(and (fit_core/shape_valid fuel have) (fit_core/shape_valid fuel need)) .false
+    = h (fit_core/text "t" have)
+      n (fit_core/text "t" need)
+    ? !(eq h n) .false
+    ? !(fit_core/contains ["Text" "Number" "Bool" "Color" "Quantity" "Money" "Percent" "Date" "Time" "Duration" "Enum" "Record" "Many" "Ref" "Range" "Raster" "Point" "Path" "Polygon" "Along" "Clock" "Media" "Var"] n) .false
+    ? (eq n "Var") .false
+    ? (eq n "Record")
+      = hs (fit_core/array (fit_core/field "fields" have))
+        ns (fit_core/array (fit_core/field "fields" need))
+      ? !(and (fit_core/unique hs.map((\ f (fit_core/text "name" f))))
+          (fit_core/unique ns.map((\ f (fit_core/text "name" f))))) .false
+      ? !(fit_core/either_bool (fit_core/bool (fit_core/field "open" need)) (eq hs.len ns.len)) .false
+      | ns.all
+          \ wanted=json
+          = matching hs.keep((\ f (eq (fit_core/text "name" f) (fit_core/text "name" wanted))))
+          ? (eq matching.len 0) !(fit_core/bool (fit_core/field "required" wanted))
+          = actual matching.at(0)
+          | and (fit_core/either_bool !(fit_core/bool (fit_core/field "required" wanted)) (fit_core/bool (fit_core/field "required" actual)))
+              (fit_core/compatible fuel.dec (fit_core/field "type" actual) (fit_core/field "type" wanted))
+    ? ((eq n "Many") || (eq n "Ref") || (eq n "Range") || (eq n "Raster"))
+      | fit_core/compatible fuel.dec (fit_core/field "of" have) (fit_core/field "of" need)
+    ? (eq n "Enum")
+      = options (fit_core/texts (fit_core/field "values" need))
+      | (fit_core/texts (fit_core/field "values" have)).all((\ value (options.has(value))))
+    ? ((eq n "Point") || (eq n "Path") || (eq n "Polygon") || (eq n "Along"))
+      | and !(eq (fit_core/text "space" have) "") (equal[json] have need)
+    | equal[json] have need
+  + shape_valid
+    \ fuel=nat shape=json
+    ^ bool
+    ? (eq fuel 0) .false
+    = kind (fit_core/text "t" shape)
+    ? (fit_core/contains ["Text" "Number" "Bool" "Color" "Percent" "Date" "Time" "Duration" "Clock"] kind) .true
+    ? (eq kind "Quantity") !(eq (fit_core/text "unit" shape) "")
+    ? (eq kind "Money") .true
+    ? (eq kind "Media") (fit_core/contains ["audio" "video" "image"] (fit_core/text "kind" shape))
+    ? (eq kind "Var") !(eq (fit_core/text "name" shape) "")
+    ? (fit_core/contains ["Point" "Path" "Polygon" "Along"] kind) !(eq (fit_core/text "space" shape) "")
+    ? (fit_core/contains ["Many" "Ref" "Range" "Raster"] kind)
+      | fit_core/shape_valid fuel.dec (fit_core/field "of" shape)
+    ? (eq kind "Enum")
+      = values (fit_core/texts (fit_core/field "values" shape))
+      | and (gt values.len 0) (and (fit_core/unique values) (row/all[str] (\ value=str !(eq value "")) values))
+    ? (eq kind "Record")
+      = fields (fit_core/array (fit_core/field "fields" shape))
+        names fields.map((\ field (fit_core/text "name" field)))
+      | and (fit_core/is_array (fit_core/field "fields" shape))
+          (and (fit_core/unique names) (and (row/all[str] (\ name=str !(eq name "")) names)
+            (fields.all((\ field (fit_core/shape_valid fuel.dec (fit_core/field "type" field)))))))
+    .false
+  + write_port
+    \ port=json
+    ^ bool
+    ? !(eq (fit_core/text "dir" port) "intent") .true
+    = writes (fit_core/field "writes" port)
+    | (fit_core/contains ["set" "move" "create" "delete" "transfer" "run" "snapshot"] (fit_core/text "op" writes))
+  + port_valid
+    \ port=json
+    ^ bool
+    ? !(fit_core/shape_valid 32 (fit_core/field "type" port)) .false
+    | and !(eq (fit_core/text "name" port) "")
+        (and (fit_core/contains ["in" "out" "param" "intent" "event"] (fit_core/text "dir" port)) (fit_core/write_port port))
+  + contract_valid
+    \ contract=json
+    ^ bool
+    = ports (fit_core/array (fit_core/field "ports" contract))
+      names ports.map((\ port (fit_core/text "name" port)))
+    ? (eq (fit_core/text "name" contract) "") .false
+    = arrays=row[str] ["slots" "ports" "spaces" "labelRules" "brings"]
+    ? !(arrays.all((\ key (fit_core/is_array (fit_core/field key contract))))) .false
+    | and !(eq (fit_core/text "rev" contract) "")
+        (and (fit_core/unique names) (ports.all(fit_core/port_valid)))
+  + direction
+    \ from=str to=str
+    ^ bool
+    | fit_core/either_bool (and (eq from "out") (eq to "in"))
+        (fit_core/either_bool (and (eq from "event") (eq to "intent")) (and (eq from "param") (eq to "param")))
+  + wire
+    \ from=json to=json
+    ^ json
+    = compatible (and (fit_core/direction (fit_core/text "dir" from) (fit_core/text "dir" to))
+        (fit_core/compatible 32 (fit_core/field "type" from) (fit_core/field "type" to)))
+    | json/obj [(jkv "r" (json/str (? compatible "bind" "hole")))
+        (jkv "have" (fit_core/field "type" from)) (jkv "need" (fit_core/field "type" to))
+        (jkv "question" (json/str (? compatible "" "Choose a compatible port or propose an explicit adapter.")))]
+  + fact
+    \ kind=str key=str value=str
+    ^ json
+    | json/obj [(jkv "k" (json/str kind)) (jkv key (json/str value))]
+  + split_text
+    \ separator=str text=str
+    ^ row[str]
+    % rest=str text out=row[str] []
+    ^ row[str]
+    ?> (./some at) (str/find separator rest) out.snoc((str/trim_ascii rest))
+    | _ (str/slice (add at separator.len) rest.len rest)
+        out.snoc((str/trim_ascii (str/slice 0 at rest)))
+  + label
+    ' Notes and quoted literals are protected before punctuation is interpreted.
+    ' Unknown words survive intact. Parsing never establishes domain identity.
+    \ original=str note=bool
+    ^ json
+    = text (str/trim_ascii original)
+    ? note (fit_core/fact "sentence" "text" original)
+    ? (and (ge text.len 2) (and (eq text.at(0) 34) (eq text.at(text.len.dec) 34)))
+      | fit_core/fact "literal" "text" (str/slice 1 (sub text.len 2) text)
+    ? (and (ge text.len 2) (and (eq text.at(0) 91) (eq text.at(text.len.dec) 93)))
+      | fit_core/fact "action" "verb" (str/trim_ascii (str/slice 1 (sub text.len 2) text))
+    ? (and (gt text.len 0) (eq text.at(0) 63))
+      | fit_core/fact "hole" "want" (str/trim_ascii (str/slice 1 text.len text))
+    ? (and (gt text.len 0) (eq text.at(0) 61))
+      | fit_core/fact "derived" "expression" (str/trim_ascii (str/slice 1 text.len text))
+    ? (eq (str/slice 0 3 text) "by ")
+      | fit_core/fact "group" "field" (str/trim_ascii (str/slice 3 text.len text))
+    ? (eq (str/slice 0 4 text) "per ")
+      | fit_core/fact "group" "field" (str/trim_ascii (str/slice 4 text.len text))
+    = arrows=row[[str str str]] [["→ " "produces" "target"] ["← " "from" "source"]]
+      arrow arrows.keep((\ [prefix _ _] (eq (str/slice 0 prefix.len text) prefix)))
+    ? (gt arrow.len 0)
+      = [prefix kind key] arrow.at(0)
+      | fit_core/fact kind key (str/trim_ascii (str/slice prefix.len text.len text))
+    = metrics=row[[str str]] [["$ " "money"] ["% " "percent"] ["# " "count"] ["Σ " "sum"]]
+      metric metrics.keep((\ [prefix _] (eq (str/slice 0 prefix.len text) prefix)))
+    ? (gt metric.len 0)
+      = [prefix agg] metric.at(0)
+      | json/obj [(jkv "k" (json/str "metric")) (jkv "agg" (json/str agg))
+          (jkv "of" (json/str (str/trim_ascii (str/slice prefix.len text.len text))))]
+    = separators=row[str] [" by " " per " " over "]
+      found separators.keep((\ separator (maybe/is_some (str/find separator text))))
+    ? (gt found.len 0)
+      = separator found.at(0)
+        at (str/find separator text).fall(0)
+      | json/obj [(jkv "k" (json/str "by")) (jkv "measure" (json/str (str/trim_ascii (str/slice 0 at text))))
+          (jkv "key" (json/str (str/trim_ascii (str/slice (add at separator.len) text.len text))))]
+    = setting (str/find ": " text)
+    ? (maybe/is_some setting)
+      = at setting.fall(0)
+      | json/obj [(jkv "k" (json/str "setting")) (jkv "name" (json/str (str/slice 0 at text)))
+          (jkv "value" (json/str (str/slice (add at 2) text.len text)))]
+    = unit (str/find " (" text)
+    ? (and (maybe/is_some unit) (and (gt text.len 0) (eq text.at(text.len.dec) 41)))
+      = at unit.fall(0)
+      | json/obj [(jkv "k" (json/str "unit")) (jkv "field" (json/str (str/slice 0 at text)))
+          (jkv "unit" (json/str (str/slice (add at 2) (sub text.len (add at 3)) text)))]
+    = separators=row[str] [" · " " / " " | " ", "]
+      found separators.keep((\ separator (maybe/is_some (str/find separator text))))
+    ? (gt found.len 0)
+      | json/obj [(jkv "k" (json/str "values"))
+          (jkv "items" (json/arr (fit_core/split_text found.at(0) text).map((\ value=str (json/str value)))))]
+    | fit_core/fact "word" "text" original

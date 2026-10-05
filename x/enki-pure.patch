@@ -1,0 +1,265 @@
+--- a/pkg/plan/include/plan/heap.h
++++ b/pkg/plan/include/plan/heap.h
+@@ -64,6 +64,7 @@
+                    /* vstack at argbase; the head slot is argbase-1     */
+   PL_F_MEMO,       /* memo barrier (op 66 Memo); a: f pin, b: x pin,    */
+                    /* epoch: effect-epoch watermark at entry            */
++  PL_F_PURE,      /* bounded, effect-free, deeply normalized application */
+   PL_F_KIND_COUNT, /* sentinel: sizes pl_run's RETURN dispatch table    */
+ } pl_frame_kind;
+ 
+@@ -214,6 +215,8 @@
+   /* The reference vMode: op 82 (rplan I/O) is callable only in RPLAN
+    * mode (REPL / snapshot execution), never while assembling modules. */
+   bool rplan_f;
++  uint32_t pure_depth;
++  uint64_t pure_remaining;
+ 
+   /* When non-NULL, ReadFile and ReadFolder resolve their arguments relative
+    * to this root and refuse paths whose canonical target escapes it. */
+--- a/pkg/plan/src/op.c
++++ b/pkg/plan/src/op.c
+@@ -870,6 +870,28 @@
+   pl_push_nf(t);
+   pl_push_apply(t, ARG(1));
+   return ARG(0);
++}
++
++/* Pure limit f x returns Try's result shape after deep normalization.
++ * The frame survives yields and unwinds; nested calls share the outer budget. */
++static pl_val op_pure(pl_thread* t, size_t ab) {
++  uint64_t limit = pl_nat_u64_clamp(pl_nat_coerce(ARG(0)));
++  if (limit > UINT64_C(1000000000)) limit = UINT64_C(1000000000);
++  pl_frame* fr = pl_fpush(t);
++  fr->kind = PL_F_PURE;
++  fr->argbase = (uint32_t)(ab - 1);
++  fr->profile_mark = t->profile_next_generation;
++  fr->k = t->pure_depth;
++  /* Preserve the outer budget beyond this nested call's allowance. The
++   * nested computation charges its actual consumption, not its full limit. */
++  fr->argc = t->pure_depth != 0 && t->pure_remaining > limit
++      ? (uint32_t)(t->pure_remaining - limit) : 0;
++  if (t->pure_depth == 0 || limit < t->pure_remaining)
++    t->pure_remaining = limit;
++  t->pure_depth++;
++  pl_push_nf(t);
++  pl_push_apply(t, ARG(2));
++  return ARG(1);
+ }
+ 
+ /*
+@@ -1351,6 +1373,7 @@
+     OP83_LOCAL("HmacSha256", 2, 0b11, pl_op83_hmac_sha256),
+ 
+     OP66(ax_s3('I', 'c', 'e'), 1, 0b1, 0b1, op_ice),
++    OP66(ax_s4('P', 'u', 'r', 'e'), 3, 0b001, 0, op_pure),
+ };
+ 
+ const size_t pl_nops = sizeof(pl_ops) / sizeof(pl_ops[0]);
+@@ -1374,7 +1397,7 @@
+     8,  9,  10, 11, 12, 13, 14, 31, 32, 33, 36, 37, 43, 47, 50,  64, 66,
+     69, 70, 73, 84, 87, 88, 89, 92, 93, 94, 95, 96, 97, 98, 102, 133};
+ static const uint16_t pl_op66_argc3[] = {4,  15, 30, 34, 35, 48, 51,
+-                                         61, 62, 63, 67, 68, 90, 91};
++                                         61, 62, 63, 67, 68, 90, 91, 142};
+ static const uint16_t pl_op66_argc4[] = {16, 49, 129};
+ static const uint16_t pl_op66_argc5[] = {17};
+ static const uint16_t pl_op66_argc6[] = {5, 18};
+--- a/pkg/plan/src/eval.c
++++ b/pkg/plan/src/eval.c
+@@ -77,6 +77,11 @@
+   ax_assume(base <= t->fsp, "frame unwind below live stack");
+   for (size_t i = t->fsp; i > base; i--) {
+     pl_frame* fr = &t->fstack[i - 1];
++    if (fr->kind == PL_F_PURE) {
++      t->pure_remaining += fr->argc;
++      t->pure_depth = fr->k;
++      continue;
++    }
+     if (fr->kind == PL_F_UPDATE) {
+       pl_cell* p = pl_ptr(fr->a);
+       ax_assume(pl_hdr_kind(p[0]) == PL_K_BH,
+@@ -701,7 +706,7 @@
+       [PL_F_UPD] = &&ret_upd,       [PL_F_TRY] = &&ret_try,
+       [PL_F_JUDGE] = &&ret_judge,   [PL_F_NIL] = &&ret_nil,
+       [PL_F_PROF] = &&ret_prof,     [PL_F_APPLYN] = &&ret_applyn,
+-      [PL_F_MEMO] = &&ret_memo,
++      [PL_F_MEMO] = &&ret_memo, [PL_F_PURE] = &&ret_pure,
+   };
+ 
+   if (entry == PL_RES_RETURN)
+@@ -710,6 +715,10 @@
+     goto exec;
+ 
+ eval:
++  if (ax_unlikely(t->pure_depth != 0)) {
++    if (t->pure_remaining == 0) pl_raise_msg(t, "Pure: evaluation budget exhausted");
++    t->pure_remaining--;
++  }
+   /*
+    * The per-step safepoint: one decrement and one branch.  Fuel is the
+    * only yield trigger.  At this position the complete machine
+@@ -863,6 +872,11 @@
+ #define NEXT() (assert(fr->k < fr->code->nops), fr->code->ops[fr->k++])
+ #define DISPATCH()                                                             \
+   do {                                                                         \
++    if (ax_unlikely(t->pure_depth != 0)) {                                     \
++      if (t->pure_remaining == 0)                                              \
++        pl_raise_msg(t, "Pure: evaluation budget exhausted");                   \
++      t->pure_remaining--;                                                    \
++    }                                                                         \
+     pl_op_t op_ = NEXT();                                                      \
+     assert(op_ < PL_OP_COUNT);                                                 \
+     goto* op_tbl[op_];                                                         \
+@@ -1821,6 +1835,11 @@
+   pl_vpush(t, v); /* deliver to operand stack */
+   goto exec;
+ 
++ret_pure:
++  t->pure_remaining += fr->argc;
++  t->pure_depth = fr->k;
++  goto ret_try;
++
+ ret_try: {
+   /* force (f x) succeeded under the barrier: the reference planTry's
+    * Right, wrapped as (0 v).  The Left path lives in pl_run_caught. */
+@@ -2112,6 +2131,25 @@
+   t->fsp--; /* pop before the body so its frames take this slot */
+ op_body_ready: {
+   const pl_opdesc* d = &pl_ops[op_idx];
++  /* Compiler profiling is observational only. A pure worker makes these
++   * instrumentation calls inert rather than granting profiling authority. */
++  if (ax_unlikely(t->pure_depth != 0) && d->name_c != NULL &&
++      (strcmp(d->name_c, "ZoneStart") == 0 || strcmp(d->name_c, "ZoneEnd") == 0)) {
++    t->vsp = op_base - 1;
++    v = 0;
++    goto ret;
++  }
++  if (ax_unlikely(t->pure_depth != 0) &&
++      (d->opset == 82 || d->coord || d->host_effect ||
++       (d->opset == 66 && (d->name == ax_s4('S','a','v','e') ||
++         d->name == ax_s7('I','n','s','t','a','l','l') ||
++         d->name == ax_s7('U','p','g','r','a','d','e') || d->name == ax_s5('T','r','a','c','e'))) ||
++       (d->name_c != NULL && (strcmp(d->name_c, "ZoneStart") == 0 ||
++                              strcmp(d->name_c, "ZoneEnd") == 0))))
++    pl_raise_msgf(t, "Pure: external effect denied (%u/%llu)",
++      (unsigned)d->opset, (unsigned long long)d->name);
++  /* Ice interns immutable content, as Equal/Pin hashing already can. It
++   * cannot publish a world root; Save/Install remain denied above. */
+   uint32_t opi = op_idx;
+   size_t argbase = op_base;
+   t->centry_depth++; /* op bodies are C-entry regions */
+@@ -2191,11 +2229,20 @@
+     }
+     t->handler = c.prev;
+     t->centry_depth = c.centry;
+-    if (t->exn_msg == NULL) { /* runtime errors are not catchable */
++    if (t->exn_msg == NULL || t->pure_depth != 0) {
++      /* Only Pure catches runtime failures. Try retains its existing contract. */
+       size_t i = t->fsp;
+-      while (i > base && t->fstack[i - 1].kind != PL_F_TRY)
++      while (i > base) {
++        uint8_t kind = t->fstack[i - 1].kind;
++        if (kind == PL_F_PURE || (t->exn_msg == NULL && kind == PL_F_TRY)) break;
+         i--;
++      }
+       if (i > base) {
++        if (t->exn_msg != NULL) {
++          const char* message = t->exn_msg;
++          t->exn = pl_nat_from_bytes(t, (const uint8_t*)message, strlen(message));
++          t->exn_msg = NULL;
++        }
+         /* unwind to the barrier and deliver (1 exn) */
+         uint64_t profile_mark = t->fstack[i - 1].profile_mark;
+         uint32_t argbase = t->fstack[i - 1].argbase;
+--- a/pkg/plan/src/op.c
++++ b/pkg/plan/src/op.c
+@@ -890,6 +890,10 @@
+   if (t->pure_depth == 0 || limit < t->pure_remaining)
+     t->pure_remaining = limit;
+   t->pure_depth++;
++  if (getenv("PLAN_PURE_STATS") != NULL)
++    fprintf(stderr, "[pure] enter depth=%u allowance=%llu requested=%llu\n",
++            t->pure_depth, (unsigned long long)t->pure_remaining,
++            (unsigned long long)limit);
+   pl_push_nf(t);
+   pl_push_apply(t, ARG(2));
+   return ARG(1);
+--- a/pkg/plan/src/eval.c
++++ b/pkg/plan/src/eval.c
+@@ -78,6 +78,9 @@
+   for (size_t i = t->fsp; i > base; i--) {
+     pl_frame* fr = &t->fstack[i - 1];
+     if (fr->kind == PL_F_PURE) {
++      if (getenv("PLAN_PURE_STATS") != NULL)
++        fprintf(stderr, "[pure] unwind depth=%u remaining=%llu\n",
++                t->pure_depth, (unsigned long long)t->pure_remaining);
+       t->pure_remaining += fr->argc;
+       t->pure_depth = fr->k;
+       continue;
+@@ -1836,6 +1839,9 @@
+   goto exec;
+ 
+ ret_pure:
++  if (getenv("PLAN_PURE_STATS") != NULL)
++    fprintf(stderr, "[pure] return depth=%u remaining=%llu\n",
++            t->pure_depth, (unsigned long long)t->pure_remaining);
+   t->pure_remaining += fr->argc;
+   t->pure_depth = fr->k;
+   goto ret_try;
+--- a/tests/unit/test_plan_eval.c
++++ b/tests/unit/test_plan_eval.c
+@@ -645,6 +645,53 @@
+   ASSERT_NOT_NULL(p);
+   ASSERT_EQ(pl_app_head(p), 0);
+   ASSERT_EQ(pl_app_args(p)[0], 9);
++  test_rt_free(&rt);
++}
++
++TEST(ops, pure_bounds_and_recovers) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  pl_vpush(t, test_law(t, 1, 0, 1));
++  size_t identity = t->vsp - 1;
++  const uint64_t budgets[] = {0, 1, 1000000000};
++  for (size_t i = 0; i < 3; i++) {
++    pl_val args[3] = {budgets[i], t->vstack[identity], 9};
++    pl_val r = test_op66(t, ax_s4('P', 'u', 'r', 'e'), 3, args);
++    pl_cell* p = pl_as(PL_TAG_APP, r);
++    ASSERT_NOT_NULL(p);
++    ASSERT_EQ(pl_app_head(p), i == 0 ? 1 : 0);
++    if (i != 0) ASSERT_EQ(pl_app_args(p)[0], 9);
++    ASSERT_EQ(t->pure_depth, 0);
++  }
++  test_rt_free(&rt);
++}
++
++TEST(ops, pure_denies_trace_and_normalizes_lazy_results) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  size_t base = t->vsp;
++  pl_val fields[2] = {42, 7};
++  pl_vpush(t, test_app(t, ax_s5('T', 'r', 'a', 'c', 'e'), 2, fields));
++  pl_vpush(t, test_app1(t, 0, t->vstack[base]));
++  pl_vpush(t, test_app1(t, 0, test_p66(t)));
++  pl_vpush(t, test_app2(t, 0, t->vstack[base + 2], t->vstack[base + 1]));
++  pl_vpush(t, test_law(t, 1, 0, t->vstack[base + 3]));
++  pl_val denied[3] = {10000, t->vstack[base + 4], 0};
++  pl_cell* p = pl_as(PL_TAG_APP,
++      test_op66(t, ax_s4('P', 'u', 'r', 'e'), 3, denied));
++  ASSERT_NOT_NULL(p);
++  ASSERT_EQ(pl_app_head(p), 1);
++  ASSERT_EQ(t->pure_depth, 0);
++  pl_vpush(t, test_law(t, 1, 0, 1));
++  pl_vpush(t, test_app1_thunk_to(t, 17));
++  pl_val allowed[3] = {10000, t->vstack[t->vsp - 2], t->vstack[t->vsp - 1]};
++  p = pl_as(PL_TAG_APP, test_op66(t, ax_s4('P', 'u', 'r', 'e'), 3, allowed));
++  ASSERT_NOT_NULL(p);
++  ASSERT_EQ(pl_app_head(p), 0);
++  pl_cell* result = pl_as(PL_TAG_APP, pl_app_args(p)[0]);
++  ASSERT_NOT_NULL(result);
++  ASSERT_EQ(pl_resolve(pl_app_args(result)[0]), 17);
++  ASSERT_EQ(t->pure_depth, 0);
+   test_rt_free(&rt);
+ }
+ 

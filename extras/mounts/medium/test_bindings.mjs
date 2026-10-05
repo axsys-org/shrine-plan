@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {choicesFor,bindPart,requirements} from './workshop/bindings.mjs';
+import {inversePatch,layout} from './workshop/encodings.mjs';
+const fields=[{label:'who',slot:'/who',type:'Text',role:'title'},{label:'room',slot:'/room',type:'Enum',role:'group',choices:['K','P','D']},{label:'from',slot:'/from',type:'Date',role:'start'},{label:'to',slot:'/to',type:'Date',role:'end'}];
+const part={rect:{w:100,h:30},mapping:{x:'start',width:'duration',row:'assignee',label:'title',colour:'status'},properties:{x:{type:'Date',role:'start',mode:'input',field:'start',axis:{origin:20727,scale:30,snap:1}},width:{type:'Duration',role:'duration',mode:'input',field:'duration',axis:{scale:30,snap:1}},row:{type:'Ref',role:'ref',mode:'source'},label:{type:'Text',role:'title',mode:'source'},colour:{type:'Enum',role:'group',mode:'source',choices:['Todo','Done']}}};
+const needs=requirements({parts:[part]});const selected=Object.fromEntries(needs.map(r=>[r.name,choicesFor(r,fields)[0]?.value||'']));
+assert.deepEqual(selected,{start:'from',duration:{adapter:'end-minus-start',start:'from',end:'to'},assignee:'room',title:'who',status:''});
+const bound=bindPart(structuredClone(part),part,selected,fields);
+const row={id:'p',who:'Painter',room:'D',from:'2026-10-09',to:'2026-10-11'};
+const before=layout(bound,[row])[0];assert.equal(before.width,60);
+assert.deepEqual(inversePatch(bound,'x',before.x+30,row),{from:'2026-10-10',to:'2026-10-12'});
+const locked=bindPart(structuredClone(part),part,selected,fields.map(f=>({...f,writable:f.label!=='to'})));
+assert.throws(()=>inversePatch(locked,'x',before.x+30,row),/writable/);
+console.log('PASS structural reuse, Date adapter, optional style, stable ID and read-only inverse');

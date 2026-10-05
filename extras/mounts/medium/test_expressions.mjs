@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {countExpression,countText} from './workshop/expressions.mjs';
+const nodes=[{id:'native-a',parent:'/',label:'Readings',properties:[{label:'phase',slot:'/phase',choices:['New','Done']}]}];
+const term=countExpression('= count(Readings) · count(phase = Done)',nodes);
+assert.equal(term.segments[0].collection,'native-a');
+assert.equal(countText(term,()=>[{id:'b',phase:'Done'},{id:'a',phase:'New'}]),'2 readings · 1 done');
+assert.equal(countText(term,()=>[{id:'a',phase:'Done'},{id:'b',phase:'Done'}]),'2 readings · 2 done');
+assert.throws(()=>countExpression('= count(Readings) · count(phase = Fake)',nodes));
+assert.throws(()=>countExpression('= count(unknown)',nodes));
+assert.throws(()=>countExpression('= fetch(secret)',nodes));
+console.log('PASS closed count syntax, exact identities, updates, and unresolved fields');

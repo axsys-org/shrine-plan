@@ -1,0 +1,209 @@
+- medium
+- testing
+- tests/grove_install [at=fixture]
+
++ medium_checks
+  + identity
+    \ ignored=unit
+    ^ row[testing/check]
+    = original (fixture/grove_install_checks/bootstrap [])
+      state (either/ok_val (medium/install original))
+      root=path [state.self 'app 'medium]
+      expected (state.case(.x root)).fall(0)
+      body (show (json/obj [(jkv "label" (json/str "Person"))]))
+      request (interaction_runtime/request root "administrator" "define" expected "person" body)
+      [next status response] (interaction_runtime/run request state)
+      [duplicate code _] (interaction_runtime/run request next)
+      [stale stale_code _] (interaction_runtime/run request.set_event("other") next)
+      [denied denied_code _] (interaction_runtime/run request.set_principal("agent") state)
+    [(testing/nat "definition created natively" 200 status)
+     (testing/nat "duplicate gesture is idempotent" 200 code)
+     (testing/nat "duplicate gesture does not mutate" 1 (equal duplicate next))
+     (testing/nat "stale gesture rejected" 409 stale_code)
+     (testing/nat "stale gesture preserves world" 1 (equal stale next))
+     (testing/nat "unscoped model cannot install" 403 denied_code)
+     (testing/text "definition identity lives at native subject" "Person" ((medium/record root.snoc(($ta "person")) next).txt_at(['sys 'lede])))]
+
+  + dependency_scope
+    \ ignored=unit
+    ^ row[testing/check]
+    = initial (fixture/grove_install_checks/bootstrap [])
+      root=path [initial.self 'app 'dependency_test]
+      a root.snoc('a)
+      b root.snoc('b)
+      c root.snoc('c)
+      input (medium/selection a [['sys 'lede]] "0")
+      card (myth/sing ['sys 'lede] (pails/t "A")).put(medium/node_slot (medium/node "Input" [] "" "" []))
+      own (myth/sing medium/node_slot (medium/node "Dependent" [input] "" "" []))
+      before (either/ok_val (grove_install/mount root [[a card] [b own] [c card]] initial))
+      irrelevant (either/ok_val (grove_install/change a (writ/poke (myth/sing ['sys 'content] (pails/t "Unrelated"))) before))
+      relevant (either/ok_val (grove_install/change a (writ/poke (myth/sing ['sys 'lede] (pails/t "Changed"))) before))
+      suspended (either/ok_val (grove_install/change a (writ/poke (myth/sing medium/availability_slot (medium/availability .false []))) before))
+    [(testing/nat "unchanged subject is not reassessed" 0 (medium/affected b before before))
+     (testing/nat "unread slot does not trigger consumer" 0 (medium/affected b before irrelevant))
+     (testing/nat "changed selected slot triggers consumer" 1 (medium/affected b before relevant))
+     (testing/nat "unavailable input triggers consumer even with same values" 1 (medium/affected b before suspended))
+     (testing/nat "unrelated subject stays unaffected" 0 (medium/affected c before relevant))]
+
+  + ownership
+    \ ignored=unit
+    ^ row[testing/check]
+    = root=path [($x 17) 'gov 'medium 'own]
+      own root.snoc('value)
+      shared=path [($x 17) 'gov 'other 'value]
+      before (myth/sing own (pails/n 1)).put(shared (pails/n 2)).put(medium/open_slot (medium/open_positions [0]))
+    [(testing/nat "own value may change without touching shared slots" 1 (medium/owned_output root before before.put(own (pails/n 3))))
+     (testing/nat "another definition's slot may not change" 0 (medium/owned_output root before before.put(shared (pails/n 3))))
+     (testing/nat "another definition's slot may not disappear" 0 (medium/owned_output root before before.del(shared)))
+     (testing/nat "actions cannot resolve their own binding bookkeeping" 0 (medium/owned_output root before before.put(medium/open_slot (medium/open_positions []))))]
+
+  + history_undo
+    \ ignored=unit
+    ^ row[testing/check]
+    = initial (fixture/grove_install_checks/bootstrap [])
+      target=path [initial.self 'app 'history_test]
+      card (myth/sing ['sys 'lede] (pails/t "Before"))
+      before (either/ok_val (grove_install/mount target [[target card]] initial))
+      world (medium/world [target] [] .nil)
+      saved (medium/save world before)
+      [saved_path saved_version] saved.records.at(0)
+      changed (either/ok_val (grove_install/change target (writ/poke (myth/sing ['sys 'lede] (pails/t "After"))) before))
+      restored (medium/restore saved changed)
+      missing (medium/restore (medium/saved [[target 999999]] [target]) changed)
+    [(testing/nat "undo stores exact native data case" (before.case(.x target)).fall(0) saved_version)
+     (testing/nat "undo resolves original from retained history" 1 ?=((./ok _) restored))
+     (testing/text "undo restores original record" "Before" ((medium/record target (either/ok_val restored)).txt_at(['sys 'lede])))
+     (testing/nat "undo does not rewind native history" 1 (gt (either/ok_val restored).local.top changed.local.top))
+     (testing/nat "missing history is rejected rather than fabricated" 1 ?=((./err _) missing))]
+
+  + typing_boundary
+    \ ignored=unit
+    ^ row[testing/check]
+    = initial (fixture/grove_install_checks/bootstrap [])
+      target=path [initial.self 'app 'medium 'typed]
+      source=path [initial.self 'app 'medium 'origin]
+      key=path [initial.self 'gov 'opaque ($u 42)]
+      selection (medium/selection source [key] "2.0")
+      node (medium/node "Composition" [selection] "" "" [])
+      card (myth/sing medium/node_slot node).put(medium/open_slot (medium/open_positions [0]))
+      state (either/ok_val (grove_install/mount target [[target card]] initial))
+      typing (medium/typing_json target node state)
+      positions (grove_dev/items (grove_dev/field "positions" typing))
+      position positions.at(0)
+      prior (grove_dev/field "selection" position)
+      contract (grove_dev/field "contract" position)
+      field (medium/role_field_json (goo/field "count" key ['lib 'custom 'count] .false) state)
+    [(testing/text "open input remains a requirement position" "open" (medium/text "status" position))
+     (testing/text "open input retains exact prior subject provenance" (path_show source) (medium/text "subject" prior))
+     (testing/text "opaque field identity is exported losslessly" (path_show key) (medium/text "slot" field))
+     (testing/text "codec type is an exact reference not a label" "/lib/custom/count" (medium/text "address" (grove_dev/field "type" field)))
+     (testing/text "hole retains its executable contract reference" (path_show (medium/code_root target state).snoc('accepts)) (medium/text "address" contract))
+     (testing/nat "unpublished role stays explicitly absent" 1 (equal (grove_dev/field "role" typing) jnull))]
+
+  + edit_holes
+    \ ignored=unit
+    ^ row[testing/check]
+    = a (medium/selection ['a] [['opaque ($u 42)]] "1.0")
+      b (medium/selection ['b] [] "")
+      kept (medium/preserve_open [a b] [a b] [0])
+      replaced (medium/preserve_open [a b] [b b] [0])
+      removed (medium/preserve_open [a b] [] [0])
+      reordered (medium/preserve_open [a b] [b a] [0])
+      closed (medium/preserve_open [a b] [b a] [])
+    [(testing/nat "source edit retains detached requirement" 1 (equal kept (either/ok[str row[nat]] [0])))
+     (testing/nat "source edit cannot replace a former filler" 1 ?=((./err _) replaced))
+     (testing/nat "source edit cannot erase an open requirement" 1 ?=((./err _) removed))
+     (testing/nat "source edit cannot silently reindex an open requirement" 1 ?=((./err _) reordered))
+     (testing/nat "ordinary bound changes remain assessable" 1 ?=((./ok _) closed))]
+
+  + topology
+    \ ignored=unit
+    ^ row[testing/check]
+    = original (fixture/grove_install_checks/bootstrap [])
+      initial (either/ok_val (medium/install original))
+      root=path [initial.self 'app 'medium]
+      call
+        \ state=namespace kind=str event=str body=json
+        | interaction_runtime/run (interaction_runtime/request root "administrator" kind (state.case(.x root)).fall(0) event (show body)) state
+      [a _ _] (call initial "define" "a" (json/obj [(jkv "label" (json/str "A"))]))
+      [b _ _] (call a "define" "b" (json/obj [(jkv "label" (json/str "B"))]))
+      pa root.snoc(($ta "a"))
+      pb root.snoc(($ta "b"))
+      before (medium/record pb b)
+      [placed code _] (call b "place" "place" (json/obj [(jkv "target" (medium/location pb)) (jkv "parent" (medium/location pa))]))
+      [cycle cycle_code _] (call placed "place" "cycle" (json/obj [(jkv "target" (medium/location pa)) (jkv "parent" (medium/location pb))]))
+      [blocked blocked_code _] (call placed "retire" "blocked" (json/obj [(jkv "target" (medium/location pa))]))
+      [related relation_code _] (call placed "relate" "rel" (json/obj [(jkv "source" (medium/location pa)) (jkv "destination" (medium/location pb))]))
+      pr root.snoc(($ta "rel"))
+      [out out_code _] (call related "place" "out" (json/obj [(jkv "target" (medium/location pb)) (jkv "parent" (json/str "/"))]))
+      [used used_code _] (call out "retire" "used" (json/obj [(jkv "target" (medium/location pb))]))
+      [retired retired_code _] (call out "retire" "retired" (json/obj [(jkv "target" (medium/location pr))]))
+      [undone undo_code _] (call retired "undo" "undo" (json/obj []))
+      preserved (medium/preserve_topology (medium/record pb placed) before)
+    [(testing/nat "containment is an immediate native action" 200 code)
+     (testing/nat "containment retains data and identity" 1 (equal[myth] (medium/material before) (medium/material (medium/record pb placed))))
+     (testing/nat "parent is an exact native reference" 1 (equal[path] pa (medium/parent pb placed)))
+     (testing/nat "containment cycle rejected" 422 cycle_code)
+     (testing/nat "cycle rejection leaves state intact" 1 (equal cycle placed))
+     (testing/nat "parent with children cannot be retired" 422 blocked_code)
+     (testing/nat "relation is created separately" 200 relation_code)
+     (testing/nat "uninterpreted relation is not executable" 0 (medium/ready pr related))
+     (testing/nat "pulling out does not remove behavior relations" 200 out_code)
+     (testing/nat "relations retain their original endpoints" 1 (equal[path] (medium/get_node pr out).fall((medium/node "" [] "" "" [])).inputs.at(1).subject pb))
+     (testing/nat "bound endpoint cannot be retired" 422 used_code)
+     (testing/nat "unused relation may be retired" 200 retired_code)
+     (testing/nat "retirement preserves native history record" 1 (maybe/is_some (medium/get_node pr retired)))
+     (testing/nat "retirement is undoable" 200 undo_code)
+     (testing/nat "behavior computation cannot erase placement" 1 (preserved.has(medium/placement_slot)))]
+
+  + literal_properties
+    \ ignored=unit
+    ^ row[testing/check]
+    = original (fixture/grove_install_checks/bootstrap [])
+      initial (either/ok_val (medium/install original))
+      root=path [initial.self 'app 'medium]
+      call
+        \ state=namespace kind=str event=str body=json
+        | interaction_runtime/run (interaction_runtime/request root "administrator" kind (state.case(.x root)).fall(0) event (show body)) state
+      [a _ _] (call initial "define" "person" (json/obj [(jkv "label" (json/str "Emma"))]))
+      target root.snoc(($ta "person"))
+      body (json/obj [(jkv "target" (medium/location target)) (jkv "label" (json/str "Birthday")) (jkv "value" (json/str "October 2"))])
+      [added code _] (call a "property" "birthday" body)
+      fields (medium/properties_of (medium/record target added))
+      slot (medium/code_root target added).snoc(($ta "birthday"))
+      changed (json/obj [(jkv "target" (medium/location target)) (jkv "slot" (medium/location slot)) (jkv "value" (json/str "October 3"))])
+      [edited edit_code _] (call added "property" "edit" changed)
+      [duplicate duplicate_code _] (call edited "property" "again" body)
+      [restored undo_code _] (call edited "undo" "undo" (json/obj []))
+    [(testing/nat "property is native without authored source" 200 code)
+     (testing/nat "property has one stable slot" 1 fields.len)
+     (testing/text "literal value retained" "October 2" (medium/record target added).txt_at(slot))
+     (testing/nat "property updates by exact slot" 200 edit_code)
+     (testing/text "updated value retained" "October 3" (medium/record target edited).txt_at(slot))
+     (testing/nat "duplicate property is not silently added" 409 duplicate_code)
+     (testing/nat "duplicate rejection preserves state" 1 (equal duplicate edited))
+     (testing/nat "property undo is native" 200 undo_code)
+     (testing/text "undo restores prior property value" "October 2" (medium/record target restored).txt_at(slot))]
+
+  + descriptions
+    \ ignored=unit
+    ^ row[testing/check]
+    = slot=path ['example 'value]
+      card (myth/sing medium/descriptions_slot (medium/descriptions [[[] "Whole subject"] [slot "The literal value"]]))
+      preserved (medium/preserve_topology card (medium/material card))
+    [(testing/nat "description entries are native" 2 (medium/descriptions_of card).len)
+     (testing/text "subject description is recovered" "Whole subject" (medium/description_of [] card))
+     (testing/text "property description is recovered" "The literal value" (medium/description_of slot card))
+     (testing/text "description survives realization" "Whole subject" (medium/description_of [] preserved))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "Native definition identity and gesture guards" medium_checks/identity)
+   (testing/case "Declared projection dependencies" medium_checks/dependency_scope)
+   (testing/case "Action output ownership" medium_checks/ownership)
+   (testing/case "Undo references retained native history" medium_checks/history_undo)
+   (testing/case "Operational typing and open-position provenance" medium_checks/typing_boundary)
+   (testing/case "Source edits preserve unbound requirements" medium_checks/edit_holes)
+   (testing/case "Containment, relations and retirement are distinct" medium_checks/topology)
+   (testing/case "Literal properties are immediate native records" medium_checks/literal_properties)
+   (testing/case "Description metadata survives realization" medium_checks/descriptions)]

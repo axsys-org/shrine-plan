@@ -1,0 +1,234 @@
+--- a/pkg/enki/src/actor.c
++++ b/pkg/enki/src/actor.c
+@@ -105,6 +105,7 @@
+   a->t->host = a; /* effect attribution for the pl_io_hook */
+   a->t->rplan_effect_f = er_actor_rplan_effect;
+   a->adopted = adopted;
++  a->host_root = true;
+   a->handle_cap = 8;
+   a->handle_v = calloc(a->handle_cap, sizeof(er_actor*));
+   ax_assume(a->handle_v != NULL, "oom");
+@@ -132,6 +133,77 @@
+   return er_register(sys, t->heap, t, true);
+ }
+ 
++static void er_actor_free(er_actor* a) {
++  er_mailbox_clear(a);
++  free(a->handle_v);
++  a->t->host = NULL;
++  a->t->rplan_effect_f = NULL;
++  if (!a->adopted) {
++    pl_thread_free(a->t);
++    pl_heap_free(a->heap);
++  }
++  free(a);
++}
++
++/* Spawn's handle is its ownership edge, not the scheduler's all-actors list.
++ * Keep live actors, embedder roots, and everything reachable from their
++ * handles or queued capabilities. Unreachable terminated Spawn actors can
++ * release their entire thread/heap, including the minimum semispaces which
++ * trim alone retained for every completed HTTP connection. IDs never reuse.
++ * Called only at scheduler boundaries, with mu held in the MT executor. */
++static void er_collect_terminated(er_scheduler* sys) {
++  if (sys->next_id - sys->collected_at < 32)
++    return;
++  sys->collected_at = sys->next_id;
++  er_actor** work = NULL;
++  for (er_actor* a = sys->all_head; a != NULL; a = a->all_next) {
++    a->marked = a->host_root || a->adopted || a->owner != NULL ||
++                (a->status != ER_ACTOR_HALTED && a->status != ER_ACTOR_CRASHED);
++    if (a->marked)
++      ax_arrpush(work, a);
++  }
++  for (size_t i = 0; i < ax_arrlenu(work); i++) {
++    er_actor* a = work[i];
++    for (size_t j = 0; j < a->handle_n; j++) {
++      er_actor* target = a->handle_v[j];
++      if (target != NULL && !target->marked) {
++        target->marked = true;
++        ax_arrpush(work, target);
++      }
++    }
++    for (er_msg* m = a->mbox_head; m != NULL; m = m->next)
++      for (uint32_t j = 0; j < m->ncaps; j++) {
++        er_actor* target = m->caps[j];
++        if (!target->marked) {
++          target->marked = true;
++          ax_arrpush(work, target);
++        }
++      }
++  }
++  ax_arrfree(work);
++  er_actor** link = &sys->all_head;
++  sys->all_tail = NULL;
++  while (*link != NULL) {
++    er_actor* a = *link;
++    if (!a->marked) {
++      *link = a->all_next;
++      er_actor_free(a);
++    } else {
++      sys->all_tail = a;
++      link = &a->all_next;
++    }
++  }
++  if (sys->mt == NULL && getenv("ENKI_LIFETIME_STATS") != NULL && sys->next_id % 512 == 0) {
++    fprintf(stderr, "[lifetime] created=%llu store=%zu\n",
++            (unsigned long long)sys->next_id, pl_store_memory_bytes(sys->store));
++    for (er_actor* a = sys->all_head; a != NULL; a = a->all_next)
++      if (a->status != ER_ACTOR_HALTED && a->status != ER_ACTOR_CRASHED)
++        fprintf(stderr, "[lifetime] actor=%llu live=%zu headroom=%zu values=%zu frames=%zu updates=%zu handles=%zu\n",
++                (unsigned long long)a->id, pl_gc_live_cells(a->heap),
++                pl_gc_headroom(a->t), a->t->vsp, a->t->fsp, a->t->usp, a->handle_n);
++  }
++}
++
+ void er_scheduler_free(er_scheduler* sys) {
+   if (sys == NULL)
+     return;
+@@ -140,15 +212,7 @@
+   er_http_teardown(sys); /* before the actors: transfers reference them */
+   for (er_actor* a = sys->all_head; a != NULL;) {
+     er_actor* next = a->all_next;
+-    er_mailbox_clear(a);
+-    free(a->handle_v);
+-    a->t->host = NULL; /* the backpointer dies with the actor */
+-    a->t->rplan_effect_f = NULL;
+-    if (!a->adopted) { /* adopted threads/heaps stay with the embedder */
+-      pl_thread_free(a->t);
+-      pl_heap_free(a->heap);
+-    }
+-    free(a);
++    er_actor_free(a);
+     a = next;
+   }
+   pthread_cond_destroy(&sys->cv);
+@@ -705,6 +769,7 @@
+       return;
+     }
+     er_actor* child = er_scheduler_actor(sys);
++    child->host_root = false;
+     pl_val child_fn = er_payload_import(child->t, &fn);
+     er_actor_start(child, child_fn); /* child queued before parent resumes */
+     free(fn.cells);
+@@ -839,6 +904,7 @@
+     ax_assume(!a->adopted,
+               "er_scheduler_run: adopted actors run under er_scheduler_drive");
+     er_step(sys, a, pl_thread_run(a->t, sys->cfg.quantum), false);
++    er_collect_terminated(sys);
+   }
+ }
+ 
+@@ -1036,6 +1102,7 @@
+     if (w->role == ER_MT_BOUND && w->actor == a &&
+         (a->status == ER_ACTOR_HALTED || a->status == ER_ACTOR_CRASHED))
+       er_mt_release_bound_locked(w);
++    er_collect_terminated(sys);
+     er_mt_maybe_complete_locked(ex);
+     er_mt_notify_controller_locked(ex);
+   }
+@@ -1166,6 +1233,7 @@
+     }
+     if (a != root) {
+       er_step(sys, a, pl_thread_run(a->t, sys->cfg.quantum), false);
++      er_collect_terminated(sys);
+       continue;
+     }
+     switch (pl_thread_run(a->t, sys->cfg.quantum)) {
+--- a/pkg/enki/src/actor_internal.h
++++ b/pkg/enki/src/actor_internal.h
+@@ -41,6 +41,8 @@
+   er_actor_status status;
+   bool started;
+   bool adopted;      /* embedder-owned thread/heap; never HALTED, never freed */
++  bool host_root;    /* C API actors remain inspectable until scheduler free */
++  bool marked;       /* actor-capability reachability, under scheduler mutex */
+   er_msg* mbox_head; /* arrival-order FIFO (matches reaver's Chan) */
+   er_msg* mbox_tail;
+   er_actor** handle_v; /* dense handle table; NULL = closed; [0] = self */
+@@ -89,6 +91,7 @@
+   er_actor* all_head; /* every actor, creation order */
+   er_actor* all_tail;
+   uint64_t next_id;
++  uint64_t collected_at; /* bounded batches of ephemeral actor allocations */
+   er_mode mode;
+   er_log* rec;        /* RECORD sink */
+   const er_log* play; /* REPLAY source */
+--- a/pkg/enki/include/enki/actor.h
++++ b/pkg/enki/include/enki/actor.h
+@@ -153,10 +153,12 @@
+ 
+ er_actor_status er_actor_state(const er_actor* a);
+ uint64_t er_actor_id(const er_actor* a);
+-/* Creation-ordered lookup (spawn order defines ids); NULL if unknown. */
++/* Creation-ordered lookup; IDs never reuse. A Spawn actor with no remaining
++ * capability may be reclaimed after termination. Lookups are borrowed;
++ * C-created/adopted actors remain roots until er_scheduler_free. */
+ er_actor* er_scheduler_actor_by_id(er_scheduler* sys, uint64_t id);
+-/* Normal-form result of a HALTED actor (the reference discards it; we
+- * keep the heap until er_scheduler_free so embedders/tests can read). */
++/* Normal-form result of a retained HALTED actor. C-created actors keep their
++ * result until scheduler_free; Spawn actors follow capability reachability. */
+ pl_val er_actor_result(er_actor* a);
+ 
+ /*
+--- a/tests/unit/test_enki_actor.c
++++ b/tests/unit/test_enki_actor.c
+@@ -831,6 +831,57 @@
+   er_scheduler_free(sys);
+   test_rt_free(&rt);
+ }
++
++static void run_spawn_lifetime(bool mt) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  t->rplan_f = true;
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){.quantum = 2});
++  er_actor* root = er_scheduler_adopt(sys, t);
++  er_mt_executor* ex = mt ? er_mt_executor_new(sys, (er_mt_config){.workers = 2}) : NULL;
++  for (size_t i = 0; i < 256; i++) {
++    size_t base = t->vsp;
++    pl_val invalid[2] = {999999, 0};
++    pl_val child_body = i % 2 == 0 ? 42 : code_effect(t, ax_s4('S','e','n','d'), 2, invalid);
++    pl_vpush(t, actor_fn(t, child_body));
++    pl_val spawn[1] = {t->vstack[base]};
++    pl_vpush(t, code_effect(t, ax_s5('S','p','a','w','n'), 1, spawn));
++    /* Keep the first child's capability in a queued message, close its
++     * original handle, then create enough dead actors to force collection. */
++    pl_val body = t->vstack[base + 1];
++    if (i == 0) {
++      pl_vpush(t, test_app1(t, 0, 1));
++      pl_val send[3] = {0, 7, t->vstack[base + 2]};
++      pl_vpush(t, code_effect(t, ax_s8('S','e','n','d','C','a','p','s'), 3, send));
++      body = code_seq(t, t->vstack[base + 1], t->vstack[base + 3]);
++    }
++    pl_vpush(t, body);
++    size_t body_slot = t->vsp - 1;
++    pl_vpush(t, pl_nat_from_bytes(t, (const uint8_t*)"CloseHandle", 11));
++    pl_val close[1] = {i + 1};
++    pl_vpush(t, code_effect(t, t->vstack[t->vsp - 1], 1, close));
++    body = code_seq(t, t->vstack[body_slot], t->vstack[t->vsp - 1]);
++    t->vsp = base;
++    root_start_body(t, body);
++    ASSERT_EQ(mt ? er_mt_executor_drive(ex, root) : er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++    ASSERT_EQ(mt ? er_mt_executor_run(ex) : er_scheduler_run(sys), ER_RUN_IDLE);
++  }
++  size_t retained = 0;
++  for (er_actor* a = sys->all_head; a != NULL; a = a->all_next) retained++;
++  ASSERT(retained <= 35, "finished actors without capabilities must be reclaimed in bounded batches");
++  er_actor* kept = er_scheduler_actor_by_id(sys, 1);
++  ASSERT_NOT_NULL(kept);
++  ASSERT_EQ(er_actor_result(kept), 42);
++  ASSERT_NOT_NULL(root->mbox_head);
++  ASSERT_EQ(root->mbox_head->caps[0], kept);
++  ASSERT_NULL(er_scheduler_actor_by_id(sys, 2));
++  if (ex != NULL) er_mt_executor_free(ex);
++  er_scheduler_free(sys);
++  test_rt_free(&rt);
++}
++
++TEST(actor, spawned_lifetime_follows_capabilities) { run_spawn_lifetime(false); }
++TEST(actor, mt_spawned_lifetime_follows_capabilities) { run_spawn_lifetime(true); }
+ 
+ TEST(actor, halted_actor_releases_unreachable_scratch) {
+   test_rt rt = test_rt_new();

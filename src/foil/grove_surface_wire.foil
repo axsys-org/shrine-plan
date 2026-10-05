@@ -1,0 +1,291 @@
+- goo_runtime
+- grove_dev
+- inspect_read
+- interaction_runtime
+
+' Wire encoding only. The compiled native presentation resolves correspondence,
+' prepares changes and supplies checks. There is no application dispatch here.
++ grove_surface_wire
+  + text
+    \ key=str value=json
+    ^ str
+    | grove_dev/text (grove_dev/field key value)
+  + location
+    \ target=path
+    ^ json
+    | json/str (path_show target)
+  + number
+    \ n=nat
+    ^ json
+    | json/str (nat/show n)
+  + optional
+    \ n=maybe[nat]
+    ^ json
+    | n.run(grove_surface_wire/number).fall(jnull)
+  + care
+    \ value=care
+    ^ str
+    ? value
+     > .x "x"
+     > .y "y"
+     > .z "z"
+  + reference
+    \ ref=safe
+    ^ json
+    | json/obj [(jkv "subject" (grove_surface_wire/location ref.path))
+        (jkv "care" (json/str (grove_surface_wire/care ref.care)))
+        (jkv "case" (grove_surface_wire/number ref.ver))]
+  + input_basis
+    \ input=grove_observed
+    ^ json
+    = status=str
+        ? input.value
+         > (./known _) "known"
+         > .unknown "unknown"
+         > .null "deleted"
+    | json/obj [(jkv "subject" (grove_surface_wire/location input.dependency.p))
+        (jkv "care" (json/str (grove_surface_wire/care input.dependency.c)))
+        (jkv "case" (grove_surface_wire/optional input.basis))
+        (jkv "status" (json/str status))]
+  + basis
+    \ captured=goo_runtime/captured_surface
+    ^ json
+    | json/obj [(jkv "owner" (grove_surface_wire/reference captured.owner))
+        (jkv "implementation" (grove_surface_wire/reference captured.binding.implementation))
+        (jkv "inputs" (json/arr captured.context.inputs.map(grove_surface_wire/input_basis)))
+        (jkv "viewport" (json/arr captured.context.viewport.tap.map(grove_surface_wire/field)))]
+  + field
+    \ item=mop/kv[path pail]
+    ^ json
+    = value=json
+        ? item.val
+         > v=pails/t (json/str v.t)
+         > v=pails/n (grove_surface_wire/number v.n)
+         > v=pails/p (grove_surface_wire/location v.p)
+         > v=pails/b (json/boo v.b)
+        jnull
+      kind=str
+        ? item.val
+         > v=pails/t "text"
+         > v=pails/n "natural"
+         > v=pails/p "reference"
+         > v=pails/b "boolean"
+        "native"
+    | json/obj [(jkv "slot" (grove_surface_wire/location item.key))
+        (jkv "kind" (json/str kind)) (jkv "value" value)]
+  + discover
+    \ subject=path input=json state=namespace
+    ^ either[str json]
+    = cursor (path_parse (grove_surface_wire/text "cursor" input))
+      slots (path_parse (grove_surface_wire/text "slot_cursor" input))
+      epoch (nat/parse (grove_surface_wire/text "epoch" input))
+      query (inspect_read/request subject epoch cursor slots 'canvas .true .false .false [['sys 'lede]])
+    ?> (./ok found) (inspect_read/namespace_read query state) (./err "Namespace page changed or is unavailable; restart this page.")
+    = children
+        | found.view.kid_tap.map
+        \ [key child]
+        | json/obj [(jkv "subject" (grove_surface_wire/location subject.snoc(key)))
+            (jkv "label" (json/str child.fil.fall(myth/new).txt_at(['sys 'lede])))]
+    | ./ok (json/obj [(jkv "subject" (grove_surface_wire/location subject))
+        (jkv "epoch" (grove_surface_wire/number found.paging.epoch))
+        (jkv "next" (found.paging.next_children.run(grove_surface_wire/location).fall(jnull)))
+        (jkv "next_slots" (found.paging.next_slots.run(grove_surface_wire/location).fall(jnull)))
+        (jkv "children" (json/arr children))
+        (jkv "slots" (json/arr found.view.fil.fall(myth/new).tap.map(grove_surface_wire/field)))])
+  + argument
+    ' Only boundary scalar codecs. Domain structures are interpreted by their
+    ' native codecs or referenced in NS, never by a host expression language.
+    \ item=json
+    ^ either[str [path pail]]
+    ?> (./some slot) (path_parse (grove_surface_wire/text "slot" item)) (./err "Argument needs an opaque native slot.")
+    = kind (grove_surface_wire/text "kind" item)
+      text (grove_surface_wire/text "value" item)
+    ? (eq kind "text") (./ok [slot (pails/t text)])
+    ? (eq kind "natural")
+      ?> (./some n) (nat/parse text) (./err "Expected a natural number.")
+      | ./ok [slot (pails/n n)]
+    ? (eq kind "reference")
+      ?> (./some ref) (path_parse text) (./err "Expected a native reference.")
+      | ./ok [slot (pails/p ref)]
+    ? (eq kind "boolean")
+      ?> (json/boo value) (grove_dev/field "value" item) (./err "Expected a boolean.")
+      | ./ok [slot (pails/b value)]
+    ? (eq kind "points")
+      ?> (json/arr values) (grove_dev/field "value" item) (./err "Expected pointer samples.")
+      ? (gt values.len 64) (./err "Pointer sample batch exceeds its bound.")
+      % rest=row[json] values out=row[grove_pointer_sample] []
+      ^ either[str [path pail]]
+      ? (eq rest.len 0) (./ok [slot (grove_pointer_samples out)])
+      ?> (./some x) (nat/parse (grove_surface_wire/text "x" rest.at(0))) (./err "Invalid pointer x coordinate.")
+      ?> (./some y) (nat/parse (grove_surface_wire/text "y" rest.at(0))) (./err "Invalid pointer y coordinate.")
+      | _ rest.drop(1) out.snoc((grove_pointer_sample x y))
+    | ./err "This boundary value needs an explicit native codec."
+  + arguments
+    \ value=json
+    ^ either[str myth]
+    ?> (json/arr items) value (./err "Expected typed native arguments.")
+    ? (gt items.len 64) (./err "Argument page is too large.")
+    % rest=row[json] items out=myth myth/new
+    ^ either[str myth]
+    ? (eq rest.len 0) (./ok out)
+    < pair (grove_surface_wire/argument rest.at(0))
+    = [slot value] pair
+    ? out.has(slot) (./err "Duplicate argument slot.")
+    | _ rest.drop(1) out.put(slot value)
+  + occurrence
+    \ item=grove_occurrence
+    ^ json
+    | json/obj [(jkv "key" (grove_surface_wire/location item.key))
+        (jkv "focus" (grove_surface_wire/reference item.focus.source))
+        (jkv "slot" (grove_surface_wire/location item.focus.slot))
+        (jkv "typed_selection" (json/boo (maybe/is_some item.focus.selector)))
+        (jkv "action" (item.action.run(grove_surface_wire/location).fall(jnull)))
+        (jkv "description" (json/str item.description))
+        (jkv "source_line" (grove_surface_wire/number item.source.line))
+        (jkv "source_column" (grove_surface_wire/number item.source.column))]
+  + rendered_html
+    : text=str
+  + frame
+    \ captured=goo_runtime/captured_surface state=namespace
+    ^ either[str json]
+    < output (goo_runtime/render_surface captured state)
+    ?> (./some ports) (grove_authoring/get state) (./err "Bounded rendering is unavailable.")
+    = thunk
+        \ ignored=unit
+        ^ any
+        | grove_surface_wire/rendered_html (str/from_atom (weft/render output.html))
+    < value (ports.pure thunk)
+    ?> html=grove_surface_wire/rendered_html value (./err "Invalid native rendering result.")
+    ? (gt html.text.len 524288) (./err "Visible rendering exceeds its page bound.")
+    | ./ok (json/obj [(jkv "protocol" (json/str "grove-native/1"))
+        (jkv "basis" (grove_surface_wire/basis captured))
+        (jkv "coverage" (json/str "declared-read-scopes"))
+        (jkv "html" (json/str html.text))
+        (jkv "occurrences" (json/arr output.occurrences.map(grove_surface_wire/occurrence)))
+        (jkv "families" (json/arr output.families.map(grove_surface_wire/location)))])
+  + receipt
+    : principal=str surface=path basis=json key=path parameters=myth arguments=myth
+      operation=str prior=str
+  + receipt_slot
+    ^ path
+    ['sys 'grove 'interaction_receipt]
+  + change_slot
+    ^ path
+    ['sys 'grove 'change_plan]
+  + action_origin
+    : implementation=safe occurrence=grove_occurrence
+  + origin_slot
+    ^ path
+    ['sys 'grove 'action_origin]
+  + undo_occurrence
+    ' Undo addresses a committed change, not the old pointer in today's shape.
+    ' Preserve historical correspondence without granting it new authority.
+    \ captured=goo_runtime/captured_surface origin=grove_surface_wire/action_origin
+    ^ either[str grove_occurrence]
+    ? !(equal[safe] origin.implementation captured.binding.implementation)
+      | ./err "The original implementation changed; undo needs explicit reconciliation."
+    ? !(goo_runtime/focus_allowed captured origin.occurrence.focus)
+      | ./err "The original focus is outside the current native inputs."
+    | ./ok origin.occurrence
+  + reverse
+    \ captured=goo_runtime/captured_surface prior=str principal=str state=namespace
+    ^ either[str goo_runtime/prepared_surface_action]
+    ? ((eq prior.len 0) || (gt prior.len 80)) (./err "Undo requires the original event identity.")
+    = target=path [state.self 'journal 'grove 'events ($ta prior)]
+    ?> (./some record) (goo_runtime/record .x target state) (./err "Original event is unavailable.")
+    ?> (./some held) record.get(grove_surface_wire/receipt_slot) (./err "No native action receipt.")
+    ?> origin=grove_surface_wire/receipt held (./err "Invalid original receipt.")
+    ? !(equal[path] origin.surface captured.owner.path) (./err "Undo belongs to another native subject.")
+    ? !(eq origin.principal principal) (./err "Undo requires the original principal.")
+    ?> (./some held) record.get(grove_surface_wire/change_slot) (./err "No reversible native change was retained.")
+    ?> original=grove_change_plan held (./err "Invalid retained native change.")
+    ?> (./some held) record.get(grove_surface_wire/origin_slot) (./err "Original native correspondence was not retained; undo needs explicit reconciliation.")
+    ?> provenance=grove_surface_wire/action_origin held (./err "Invalid original native correspondence.")
+    < occurrence (grove_surface_wire/undo_occurrence captured provenance)
+    < plan (goo_runtime/reverse_plan original state)
+    < checked (goo_runtime/surface_plan_allowed captured plan state)
+    | ./ok (goo_runtime/prepared_surface_action captured occurrence plan)
+  + reply
+    \ state=namespace status=nat value=json
+    ^ [namespace nat str]
+    [state status (show value)]
+  + fail
+    \ state=namespace status=nat message=str
+    ^ [namespace nat str]
+    | grove_surface_wire/reply state status (json/obj [(jkv "error" (json/str message))])
+  + reply_indexed
+    \ state=namespace index=hive status=nat value=json
+    ^ [namespace hive nat str]
+    [state index status (show value)]
+  + fail_indexed
+    \ state=namespace index=hive status=nat message=str
+    ^ [namespace hive nat str]
+    | grove_surface_wire/reply_indexed state index status (json/obj [(jkv "error" (json/str message))])
+  + handle
+    ' Compatibility for callers without an owner index. The live route uses
+    ' handle_indexed and carries the same maintained index across requests.
+    \ request=interaction_runtime/request state=namespace
+    ^ [namespace nat str]
+    = [next index status body] (grove_surface_wire/handle_indexed request state (sovereign_hive state))
+    [next status body]
+  + handle_indexed
+    \ request=interaction_runtime/request state=namespace index=hive
+    ^ [namespace hive nat str]
+    ? !(eq request.principal "administrator") (grove_surface_wire/fail_indexed state index 403 "This connection lacks native workspace authority.")
+    ?> (jres/ok body rest) (parse request.body) (grove_surface_wire/fail_indexed state index 400 "Invalid request.")
+    ? !(eq rest 0) (grove_surface_wire/fail_indexed state index 400 "Trailing request input.")
+    ?> (./some subject) (path_parse (grove_surface_wire/text "subject" body)) (grove_surface_wire/fail_indexed state index 400 "Native subject required.")
+    ? (eq request.operation "native/discover")
+      ? (grove_surface_wire/discover subject body state)
+       > (./ok page) (grove_surface_wire/reply_indexed state index 200 page)
+       > (./err why) (grove_surface_wire/fail_indexed state index 409 why)
+    ?> (./ok viewport) (grove_surface_wire/arguments (grove_dev/field "viewport" body)) (grove_surface_wire/fail_indexed state index 400 "Typed viewport required.")
+    ?> (./ok captured) (goo_runtime/capture_surface subject viewport state)
+      | grove_surface_wire/fail_indexed state index 409 "Native surface is unresolved or its binding is unavailable."
+    ? (eq request.operation "native/frame")
+      ? (grove_surface_wire/frame captured state)
+       > (./ok frame) (grove_surface_wire/reply_indexed state index 200 frame)
+       > (./err why) (grove_surface_wire/fail_indexed state index 422 why)
+    ?> (./some key) (path_parse (grove_surface_wire/text "key" body)) (grove_surface_wire/fail_indexed state index 400 "Native occurrence key required.")
+    ?> (./ok parameters) (grove_surface_wire/arguments (grove_dev/field "parameters" body)) (grove_surface_wire/fail_indexed state index 400 "Typed selection parameters required.")
+    = basis (grove_dev/field "basis" body)
+      current (grove_surface_wire/basis captured)
+    ? (eq request.operation "native/inspect")
+      ? !(equal[json] basis current) (grove_surface_wire/fail_indexed state index 409 "The displayed basis changed; retain the selection and refresh.")
+      ? (goo_runtime/resolve_surface captured key parameters state)
+       > (./ok item)
+        | grove_surface_wire/reply_indexed state index 200 (json/obj
+            [(jkv "occurrence" (grove_surface_wire/occurrence item))
+             (jkv "basis" current) (jkv "parameters" (grove_dev/field "parameters" body))])
+       > (./err why) (grove_surface_wire/fail_indexed state index 422 why)
+    ? !((eq request.operation "native/act") || (eq request.operation "native/undo")) (grove_surface_wire/fail_indexed state index 400 "Unknown native interaction.")
+    ?> (./ok args) (grove_surface_wire/arguments (grove_dev/field "arguments" body)) (grove_surface_wire/fail_indexed state index 400 "Typed action arguments required.")
+    ? ((eq request.event.len 0) || (gt request.event.len 80)) (grove_surface_wire/fail_indexed state index 400 "Event identity required.")
+    = receipt_path=path [state.self 'journal 'grove 'events ($ta request.event)]
+      prior (grove_surface_wire/text "prior" body)
+      receipt (grove_surface_wire/receipt request.principal subject basis key parameters args request.operation prior)
+      previous (goo_runtime/record .x receipt_path state)
+    ? (maybe/is_some previous)
+      ? !(equal previous.fall(myth/new).get(grove_surface_wire/receipt_slot) (maybe/some[pail] receipt))
+        | grove_surface_wire/fail_indexed state index 409 "Event identity already used for a different native action."
+      | grove_surface_wire/reply_indexed state index 200 (json/obj [(jkv "committed" (json/boo .true)) (jkv "duplicate" (json/boo .true))])
+    ? !(equal[json] basis current) (grove_surface_wire/fail_indexed state index 409 "The displayed basis changed; the draft still addresses its original target.")
+    = preparation
+        ? (eq request.operation "native/undo") (grove_surface_wire/reverse captured prior request.principal state)
+        | goo_runtime/prepare_surface_action captured key parameters args state
+    ?> (./ok prepared) preparation
+      | grove_surface_wire/fail_indexed state index 422 (grove_surface_wire/preparation_error preparation)
+    ?> (./ok commands) (goo_runtime/surface_commands prepared state) (grove_surface_wire/fail_indexed state index 409 "The prepared native change became stale.")
+    = origin (grove_surface_wire/action_origin captured.binding.implementation prepared.occurrence)
+      audit (myth/sing grove_surface_wire/receipt_slot receipt).put(grove_surface_wire/change_slot prepared.plan).put(grove_surface_wire/origin_slot origin)
+      commands commands.snoc([receipt_path (writ/make audit)])
+    ?> (./ok committed) (grove_install/change_many_with commands state index) (grove_surface_wire/fail_indexed state index 422 "Native transaction failed; committed work is unchanged.")
+    = [next next_index] committed
+    | grove_surface_wire/reply_indexed next next_index 200 (json/obj [(jkv "committed" (json/boo .true)) (jkv "duplicate" (json/boo .false))
+        (jkv "receipt" (grove_surface_wire/location receipt_path))])
+  + preparation_error
+    \ result=either[str goo_runtime/prepared_surface_action]
+    ^ str
+    ? result
+     > (./err why) why
+    "Native action did not establish a result."

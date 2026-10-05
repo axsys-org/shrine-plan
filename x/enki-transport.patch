@@ -1,0 +1,534 @@
+--- a/pkg/enki/src/actor.c
++++ b/pkg/enki/src/actor.c
+@@ -27,6 +27,7 @@
+ static pl_val er_folder_result_build(pl_thread* t, const uint8_t* data,
+                                      uint64_t data_n);
+ static void er_actor_rplan_effect(pl_thread* t);
++static void er_mailbox_clear(er_actor* a);
+ 
+ /* The currently executing pool worker, if this OS thread is one.  The
+  * adopted root runs on the caller thread and deliberately has no worker. */
+@@ -139,11 +140,7 @@
+   er_http_teardown(sys); /* before the actors: transfers reference them */
+   for (er_actor* a = sys->all_head; a != NULL;) {
+     er_actor* next = a->all_next;
+-    for (er_msg* m = a->mbox_head; m != NULL;) {
+-      er_msg* mn = m->next;
+-      free(m);
+-      m = mn;
+-    }
++    er_mailbox_clear(a);
+     free(a->handle_v);
+     a->t->host = NULL; /* the backpointer dies with the actor */
+     a->t->rplan_effect_f = NULL;
+@@ -327,37 +324,150 @@
+   er_enqueue(a);
+ }
+ 
+-/*
+- * Snapshot a payload out of the sender's moving heap.  Payloads arrive deeply
+- * normalized — the coordination ops carry deep masks, so forcing (and any
+- * effects or exceptions inside it) happened at initiation as the sender's own
+- * execution.  The explicit snapshot is therefore a pure store copy: it never
+- * hashes, persists, or publishes a root.  In particular, an unresolved heap
+- * PIN becomes a closed store proxy rather than leaking an edge into this
+- * actor's heap.  The bool return is retained for the service-call contract;
+- * normalization failures have already been delivered before this point.
+- */
+-static bool er_pin_payload(er_actor* a, pl_val v, pl_val* out) {
+-  pl_thread* t = a->t;
+-  size_t base = t->vsp;
+-  pl_vpush(t, v);
+-  bool snapshot_stats = getenv("ENKI_SNAPSHOT_STATS") != NULL;
+-  size_t before = snapshot_stats ? pl_store_memory_bytes(a->sys->store) : 0;
+-  *out = pl_store_snapshot_normal(t, t->vstack[base]);
+-  if (snapshot_stats) {
+-    size_t after = pl_store_memory_bytes(a->sys->store);
+-    fprintf(stderr, "[trace] snapshot actor=%llu added=%zu store=%zu\n",
+-            (unsigned long long)a->id, after - before, after);
+-  }
+-  t->vsp = base;
++/* Payloads have already been deeply normalized by the coordination op in
++ * the sender. Capture does no evaluation, heap reserve, hashing or interning.
++ * An iterative graph walk preserves sharing without using the C stack for
++ * deeply nested messages. Only existing store graphs are shared. */
++typedef struct er_copy_entry {
++  pl_val key;
++  size_t value; /* cell offset in the owned allocation */
++} er_copy_entry;
++
++static pl_val er_payload_canonical(pl_store* store, pl_val v) {
++  if (pl_tag(v) == PL_TAG_PIN) {
++    pl_val target = pl_pin_proxy_target(pl_ptr(v));
++    if (target != 0) {
++      ax_assume(pl_store_owns(store, target), "message: foreign PIN target");
++      return target;
++    }
++  }
++  return v;
++}
++
++/* The only pointer-bearing slots of a normal moving object. PIN objects
++ * here are unresolved fixed-size proxies, never compiled canonical PINs. */
++static void er_payload_edges(pl_cell* p, size_t* first, size_t* end) {
++  switch (pl_hdr_kind(p[0])) {
++  case PL_K_NAT: *first = *end = 0; return;
++  case PL_K_LAW: *first = 2; *end = 4; return;
++  case PL_K_APP: *first = 1; *end = pl_hdr_cells(p[0]); return;
++  case PL_K_PIN:
++    ax_assume(pl_pin_is_proxy(p) &&
++                  pl_hdr_cells(p[0]) == PL_PIN_CELLS(0),
++              "message: non-proxy PIN outside store");
++    *first = 5; *end = 6; return;
++  default: ax_abort("message: non-normal object");
++  }
++}
++
++static void er_payload_discover(pl_store* store, er_copy_entry** map,
++                                 size_t* count, pl_val v) {
++  v = er_payload_canonical(store, v);
++  if (pl_is_nat63(v) || pl_store_owns(store, v) || ax_hmgeti(*map, v) >= 0)
++    return;
++  size_t first, end;
++  er_payload_edges(pl_ptr(v), &first, &end); /* reject non-normal kinds */
++  size_t cells = pl_hdr_cells(pl_ptr(v)[0]);
++  ax_assume(cells > 0 && *count <= SIZE_MAX / sizeof(pl_cell) - cells,
++            "message: graph too large");
++  ax_hmput(*map, v, *count);
++  *count += cells;
++}
++
++static pl_val er_payload_edge(pl_store* store, er_copy_entry* map,
++                              pl_cell* cells, pl_val v) {
++  v = er_payload_canonical(store, v);
++  if (pl_is_nat63(v) || pl_store_owns(store, v))
++    return v;
++  ptrdiff_t at = ax_hmgeti(map, v);
++  ax_assume(at >= 0, "message: uncaptured edge");
++  return pl_make(pl_tag(v), cells + map[at].value);
++}
++
++static bool er_capture_payload(er_actor* a, pl_val v, er_payload* out) {
++  pl_store* store = a->sys->store;
++  ax_assume(pl_is_nat(v) ||
++                (pl_hdr_flags(pl_ptr(er_payload_canonical(store, v))[0]) &
++                 PL_F_NORMAL) != 0,
++            "message requires a normal payload");
++  er_copy_entry* map = NULL;
++  size_t count = 0;
++  er_payload_discover(store, &map, &count, v);
++  for (ptrdiff_t i = 0; i < ax_hmlen(map); i++) {
++    pl_cell* p = pl_ptr(map[i].key);
++    size_t first, end;
++    er_payload_edges(p, &first, &end);
++    for (size_t j = first; j < end; j++)
++      er_payload_discover(store, &map, &count, p[j]);
++  }
++  pl_cell* cells = count == 0 ? NULL : malloc(count * sizeof(pl_cell));
++  ax_assume(count == 0 || cells != NULL, "oom");
++  for (ptrdiff_t i = 0; i < ax_hmlen(map); i++) {
++    pl_cell* p = pl_ptr(map[i].key);
++    pl_cell* dest = cells + map[i].value;
++    memcpy(dest, p, (size_t)pl_hdr_cells(p[0]) * sizeof(pl_cell));
++    size_t first, end;
++    er_payload_edges(p, &first, &end);
++    for (size_t j = first; j < end; j++)
++      dest[j] = er_payload_edge(store, map, cells, p[j]);
++  }
++  *out = (er_payload){.value = er_payload_edge(store, map, cells, v),
++                       .cells = cells, .count = count};
++  ax_hmfree(map);
+   return true;
+ }
+ 
++static pl_val er_payload_relocate(const er_payload* src, pl_cell* dest,
++                                   pl_val v) {
++  if (pl_is_nat63(v))
++    return v;
++  uintptr_t address = pl_addr(v), lo = (uintptr_t)src->cells;
++  if (address < lo || address - lo >= src->count * sizeof(pl_cell))
++    return v;
++  return pl_make(pl_tag(v), dest + (address - lo) / sizeof(pl_cell));
++}
++
++/* One reserve, then a no-collect copy. No edge into the transport allocation
++ * remains in the receiver, including recursive edges and unresolved PINs. */
++static pl_val er_payload_import(pl_thread* t, const er_payload* src) {
++  if (src->count == 0)
++    return src->value;
++  pl_gc_reserve(t, src->count);
++  PL_GC_FORBID(t);
++  pl_cell* dest = pl_bump(t, src->count);
++  memcpy(dest, src->cells, src->count * sizeof(pl_cell));
++  for (size_t at = 0; at < src->count;) {
++    pl_cell* p = dest + at;
++    size_t first, end;
++    er_payload_edges(p, &first, &end);
++    for (size_t j = first; j < end; j++)
++      p[j] = er_payload_relocate(src, dest, p[j]);
++    at += pl_hdr_cells(p[0]);
++  }
++  pl_val result = er_payload_relocate(src, dest, src->value);
++  PL_GC_ALLOW(t);
++  return result;
++}
++
++static void er_mailbox_clear(er_actor* a) {
++  for (er_msg* m = a->mbox_head; m != NULL;) {
++    er_msg* next = m->next;
++    free(m->payload.cells);
++    free(m);
++    m = next;
++  }
++  a->mbox_head = a->mbox_tail = NULL;
++}
++
+ static void er_recv_ready(er_actor* a);
+ 
+ /* Append to the mailbox; wake the receiver if it is parked on Recv. */
+-static void er_deliver(er_actor* to, pl_val payload, uint32_t ncaps,
++static void er_deliver(er_actor* to, er_payload payload, uint32_t ncaps,
+                        er_actor* const* caps) {
++  if (to->status == ER_ACTOR_HALTED || to->status == ER_ACTOR_CRASHED) {
++    free(payload.cells);
++    return;
++  }
+   er_msg* m = malloc(sizeof(er_msg) + (size_t)ncaps * sizeof(er_actor*));
+   ax_assume(m != NULL, "oom");
+   m->payload = payload;
+@@ -389,6 +499,7 @@
+ 
+   pl_thread* t = a->t;
+   size_t base = t->vsp;
++  pl_vpush(t, er_payload_import(t, &m->payload));
+   pl_val capsrow = 0; /* valRow [] is the nat 0 */
+   if (m->ncaps > 0) {
+     pl_gc_reserve(t, PL_APP_CELLS(m->ncaps));
+@@ -404,10 +515,11 @@
+   pl_vpush(t, capsrow);
+   pl_gc_reserve(t, PL_APP_CELLS(2));
+   PL_GC_FORBID(t);
+-  pl_val fields[2] = {m->payload, t->vstack[base]};
++  pl_val fields[2] = {t->vstack[base], t->vstack[base + 1]};
+   pl_val resp = pl_mk_app_from(t, 0, 2, fields);
+   PL_GC_ALLOW(t);
+   t->vsp = base;
++  free(m->payload.cells);
+   free(m);
+ 
+   pl_thread_deposit(t, resp);
+@@ -419,6 +531,7 @@
+ 
+ static void er_crash(er_actor* a) {
+   a->status = ER_ACTOR_CRASHED; /* never resumed */
++  er_mailbox_clear(a);
+ }
+ 
+ /* Service-detected crash (no PLAN raise happened): leave a message in
+@@ -529,10 +642,10 @@
+       er_crash_msg(a, "invalid actor handle");
+       return;
+     }
+-    pl_val payload;
++    er_payload payload;
+     pl_val payload_arg = args[1];
+     er_service_unlock(sys, locked);
+-    bool ok = er_pin_payload(a, payload_arg, &payload);
++    bool ok = er_capture_payload(a, payload_arg, &payload);
+     er_service_relock(sys, locked);
+     if (!ok) {
+       er_crash(a);
+@@ -559,8 +672,8 @@
+     er_actor** caps;
+     er_service_unlock(sys, locked);
+     int64_t ncaps = er_load_caps(a, base + 1, &caps);
+-    pl_val payload;
+-    bool ok = ncaps >= 0 && er_pin_payload(a, t->vstack[base], &payload);
++    er_payload payload;
++    bool ok = ncaps >= 0 && er_capture_payload(a, t->vstack[base], &payload);
+     er_service_relock(sys, locked);
+     t->vsp = base;
+     if (ncaps < 0) {
+@@ -582,17 +695,19 @@
+ 
+   if (er_op_is(name, "Spawn")) {
+     ax_assume(argc == 1, "Spawn arity");
+-    pl_val fn;
++    er_payload fn;
+     pl_val fn_arg = args[0];
+     er_service_unlock(sys, locked);
+-    bool ok = er_pin_payload(a, fn_arg, &fn);
++    bool ok = er_capture_payload(a, fn_arg, &fn);
+     er_service_relock(sys, locked);
+     if (!ok) {
+       er_crash(a);
+       return;
+     }
+     er_actor* child = er_scheduler_actor(sys);
+-    er_actor_start(child, fn); /* child queued before the parent resumes */
++    pl_val child_fn = er_payload_import(child->t, &fn);
++    er_actor_start(child, child_fn); /* child queued before parent resumes */
++    free(fn.cells);
+     uint64_t h = er_handle_alloc(a, child);
+     pl_thread_deposit(t, h);
+     a->status = ER_ACTOR_RUNNABLE;
+@@ -691,6 +806,7 @@
+     break;
+   case PL_RUN_DONE:
+     a->status = ER_ACTOR_HALTED; /* result discarded (kept for tests) */
++    er_mailbox_clear(a);
+     /* A stopped actor never reaches another allocation safepoint. Retain its
+      * rooted result for embedders, but release unreachable working memory now
+      * rather than once the entire (potentially long-lived) scheduler exits. */
+@@ -1414,7 +1530,7 @@
+                   memcmp(e->data, buf, (size_t)n) == 0,
+               "er_log: replay divergence at a host injection");
+   }
+-  er_deliver(to, payload, 0, NULL);
++  er_deliver(to, (er_payload){.value = payload}, 0, NULL);
+   pthread_mutex_unlock(&sys->mu);
+ }
+ 
+--- a/pkg/enki/src/actor_internal.h
++++ b/pkg/enki/src/actor_internal.h
+@@ -14,8 +14,17 @@
+ #include "plan/heap.h"
+ #include "plan/value.h"
+ 
++/* Closed, normalized graph owned by one mailbox (or a spawn in transit).
++ * Only canonical store edges may escape this allocation. It is imported
++ * into the receiver's moving heap before the allocation is released. */
++typedef struct er_payload {
++  pl_val value;
++  pl_cell* cells;
++  size_t count;
++} er_payload;
++
+ typedef struct er_msg {
+-  pl_val payload; /* nat63 or store-resident — terminal for every GC */
++  er_payload payload;
+   struct er_msg* next;
+   uint32_t ncaps;
+   er_actor* caps[]; /* actor refs, translated at send */
+--- a/pkg/enki/include/enki/actor.h
++++ b/pkg/enki/include/enki/actor.h
+@@ -23,9 +23,10 @@
+  * arrives decoded while Content-Length/Content-Encoding response
+  * headers still describe the wire form.
+  *
+- * Messaging: payloads cross actors only as store-resident
+- * values — the sender snapshots at send, the mailbox holds store addresses,
+- * the receiver's heap points into the shared immutable store.  PLAN
++ * Messaging: deeply normalized payloads cross actors in mailbox-owned
++ * transport storage, then are copied into the receiver's collected heap.
++ * Existing canonical store graphs may be shared; sending does not promote
++ * transient values into the permanent store or publish persistence. PLAN
+  * code addresses actors through per-actor handle tables; handle 0 is
+  * self, fresh handles are minted by Spawn and by cap transfer in Recv.
+  */
+--- a/tests/unit/test_enki_actor.c
++++ b/tests/unit/test_enki_actor.c
+@@ -793,9 +793,9 @@
+   test_rt_free(&rt);
+ }
+ 
+-TEST(actor, cross_actor_payload_is_store_resident) {
++TEST(actor, cross_actor_payload_is_receiver_owned) {
+   /* Send a structured payload (a law) to a recv-blocked child: it must
+-   * arrive intact through the store, forced at send. */
++   * arrive intact in the receiver's collected heap, forced at send. */
+   test_rt rt = test_rt_new();
+   er_scheduler* sys = er_scheduler_new(rt.store, (er_config){0});
+   er_actor* parent = er_scheduler_actor(sys);
+@@ -810,7 +810,7 @@
+   pl_val body = code_seq(t, t->vstack[base + 2], t->vstack[base + 3]);
+   t->vsp = base;
+   er_actor_start(parent, actor_fn(t, body));
+-
++  size_t store_before = pl_store_memory_bytes(rt.store);
+   ASSERT_EQ(er_scheduler_run(sys), ER_RUN_IDLE);
+   er_actor* child = er_scheduler_actor_by_id(sys, 1);
+   ASSERT_NOT_NULL(child);
+@@ -821,8 +821,13 @@
+   ASSERT_NOT_NULL(law);
+   ASSERT_EQ(pl_law_arity(law), 2);
+   ASSERT_EQ(pl_law_name(law), ax_s1('K'));
+-  ASSERT(pl_store_owns(rt.store, pl_app_args(r)[0]),
+-         "payload must live in the shared store");
++  ASSERT_FALSE(pl_store_owns(rt.store, pl_app_args(r)[0]));
++  ASSERT_EQ(pl_store_memory_bytes(rt.store), store_before);
++  pl_gc_collect_now(er_actor_thread(parent));
++  pl_gc_collect_now(er_actor_thread(child));
++  r = pl_as(PL_TAG_APP, er_actor_result(child));
++  law = pl_as(PL_TAG_LAW, pl_app_args(r)[0]);
++  ASSERT_EQ(pl_law_name(law), ax_s1('K'));
+   er_scheduler_free(sys);
+   test_rt_free(&rt);
+ }
+@@ -833,11 +838,18 @@
+   for (size_t i = 0; i < 16; i++) {
+     er_actor* a = er_scheduler_actor(sys);
+     pl_thread* t = er_actor_thread(a);
+-    size_t capacity = pl_gc_headroom(t);
+     /* An HTTP connection can finish long before filling its semispace.
+      * Its abandoned scratch must not wait for scheduler shutdown to collect. */
+-    for (size_t j = 0; j < 4096; j++)
+-      (void)test_app2(t, 0, j, j + 1);
++    /* One allocation window also builds real dead scratch under GC_STRESS;
++     * calling test_app2 repeatedly would collect it on every iteration. */
++    pl_gc_reserve(t, 4096 * PL_APP_CELLS(2));
++    size_t capacity = pl_gc_headroom(t);
++    PL_GC_FORBID(t);
++    for (size_t j = 0; j < 4096; j++) {
++      pl_val fields[2] = {j, j + 1};
++      (void)pl_mk_app_from(t, 0, 2, fields);
++    }
++    PL_GC_ALLOW(t);
+     ASSERT(pl_gc_headroom(t) < capacity - 4096, "fixture allocates dead scratch");
+     er_actor_start(a, actor_fn(t, 42));
+     ASSERT_EQ(er_scheduler_run(sys), ER_RUN_IDLE);
+@@ -851,3 +863,133 @@
+   er_scheduler_free(sys);
+   test_rt_free(&rt);
+ }
++
++TEST(actor, owned_mail_survives_collection_with_shared_proxies_and_caps) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  t->rplan_f = true;
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){.quantum = 2});
++  er_actor* root = er_scheduler_adopt(sys, t);
++  size_t base = t->vsp;
++  pl_vpush(t, pl_nat_from_bytes(t, (const uint8_t*)"owned transport payload", 23));
++  pl_vpush(t, pl_pin(t, t->vstack[base]));
++  pl_vpush(t, test_app2(t, 0, t->vstack[base + 1], t->vstack[base + 1]));
++  pl_vpush(t, test_app1(t, 0, 0));
++  pl_val args[3] = {0, t->vstack[base + 2], t->vstack[base + 3]};
++  pl_val body = code_effect(t, ax_s8('S', 'e', 'n', 'd', 'C', 'a', 'p', 's'),
++                            3, args);
++  t->vsp = base;
++  root_start_body(t, body);
++  size_t store_before = pl_store_memory_bytes(rt.store);
++  ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++  ASSERT_NOT_NULL(root->mbox_head);
++  ASSERT(root->mbox_head->payload.count > 0);
++  ASSERT_FALSE(pl_store_owns(rt.store, root->mbox_head->payload.value));
++
++  /* Forget the sender's entire computation before receiving the message. */
++  pl_thread_start(t, 0);
++  ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++  pl_gc_collect_now(t);
++  root_start_body(t, recv_code(t));
++  ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++  pl_gc_collect_now(t);
++  pl_cell* response = pl_as(PL_TAG_APP, pl_thread_result(t));
++  ASSERT_NOT_NULL(response);
++  pl_cell* row = pl_as(PL_TAG_APP, pl_app_args(response)[0]);
++  ASSERT_NOT_NULL(row);
++  pl_val pin = pl_app_args(row)[0];
++  ASSERT_EQ(pin, pl_app_args(row)[1], "message graph sharing was lost");
++  ASSERT_EQ(pl_tag(pin), PL_TAG_PIN);
++  ASSERT(pl_pin_is_proxy(pl_ptr(pin)));
++  ASSERT_FALSE(pl_store_owns(rt.store, pin));
++  ASSERT(nat_text_eq(pl_pin_body(pl_ptr(pin)), "owned transport payload"));
++  pl_cell* caps = pl_as(PL_TAG_APP, pl_app_args(response)[1]);
++  ASSERT_NOT_NULL(caps);
++  ASSERT_EQ(pl_app_args(caps)[0], 1);
++  ASSERT_EQ(root->handle_v[1], root);
++  ASSERT_EQ(root->mbox_head, NULL);
++  ASSERT_EQ(pl_store_memory_bytes(rt.store), store_before);
++  er_scheduler_free(sys);
++  test_rt_free(&rt);
++}
++
++TEST(actor, unchanged_messages_do_not_grow_store) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  t->rplan_f = true;
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){0});
++  er_actor* root = er_scheduler_adopt(sys, t);
++  size_t store_before = pl_store_memory_bytes(rt.store);
++  for (size_t i = 0; i < 10000; i++) {
++    size_t base = t->vsp;
++    pl_vpush(t, test_app2(t, 0, 17, 23));
++    pl_val args[2] = {0, t->vstack[base]};
++    pl_val send = code_effect(t, ax_s4('S', 'e', 'n', 'd'), 2, args);
++    t->vsp = base;
++    root_start_body(t, send);
++    ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++    root_start_body(t, recv_code(t));
++    ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++    pl_cell* response = pl_as(PL_TAG_APP, pl_thread_result(t));
++    pl_cell* row = pl_as(PL_TAG_APP, pl_app_args(response)[0]);
++    ASSERT_EQ(pl_app_args(row)[0], 17);
++    ASSERT_EQ(pl_app_args(row)[1], 23);
++    ASSERT_EQ(root->mbox_head, NULL);
++    if (i % 100 == 0)
++      pl_gc_collect_now(t);
++  }
++  ASSERT_EQ(pl_store_memory_bytes(rt.store), store_before);
++  er_scheduler_free(sys);
++  test_rt_free(&rt);
++}
++
++static void run_abandoned_owned_mail(bool crash) {
++  test_rt rt = test_rt_new();
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){0});
++  er_actor* actor = er_scheduler_actor(sys);
++  pl_thread* t = er_actor_thread(actor);
++  size_t base = t->vsp;
++  pl_vpush(t, test_app2(t, 0, 12, 34));
++  pl_val args[2] = {0, t->vstack[base]};
++  pl_vpush(t, code_effect(t, ax_s4('S', 'e', 'n', 'd'), 2, args));
++  pl_val body = t->vstack[base + 1];
++  if (crash) {
++    pl_val invalid[2] = {9999, 0};
++    pl_vpush(t, code_effect(t, ax_s4('S', 'e', 'n', 'd'), 2, invalid));
++    body = code_seq(t, t->vstack[base + 1], t->vstack[base + 2]);
++  }
++  t->vsp = base;
++  er_actor_start(actor, actor_fn(t, body));
++  size_t store_before = pl_store_memory_bytes(rt.store);
++  ASSERT_EQ(er_scheduler_run(sys), ER_RUN_IDLE);
++  ASSERT_EQ(er_actor_state(actor), crash ? ER_ACTOR_CRASHED : ER_ACTOR_HALTED);
++  ASSERT_EQ(actor->mbox_head, NULL);
++  ASSERT_EQ(actor->mbox_tail, NULL);
++  ASSERT_EQ(pl_store_memory_bytes(rt.store), store_before);
++  er_scheduler_free(sys);
++  test_rt_free(&rt);
++}
++
++TEST(actor, termination_discards_owned_mail) {
++  run_abandoned_owned_mail(false);
++  run_abandoned_owned_mail(true);
++}
++
++TEST(actor, scheduler_shutdown_discards_unreceived_owned_mail) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  t->rplan_f = true;
++  er_scheduler* sys = er_scheduler_new(rt.store, (er_config){0});
++  er_actor* root = er_scheduler_adopt(sys, t);
++  size_t base = t->vsp;
++  pl_vpush(t, test_app2(t, 0, 12, 34));
++  pl_val args[2] = {0, t->vstack[base]};
++  pl_val body = code_effect(t, ax_s4('S', 'e', 'n', 'd'), 2, args);
++  t->vsp = base;
++  root_start_body(t, body);
++  ASSERT_EQ(er_scheduler_drive(sys, root), ER_DRIVE_DONE);
++  ASSERT_NOT_NULL(root->mbox_head);
++  ASSERT(root->mbox_head->payload.count > 0);
++  er_scheduler_free(sys); /* ASan/leak checks cover the unreceived graph. */
++  test_rt_free(&rt);
++}
+--- /dev/null
++++ b/tests/support/lsan-macos.supp
+@@ -0,0 +1,8 @@
++# macOS process/thread initialization caches reported by LLVM 19 LSan.
++# Deliberately name allocation sites, not whole system libraries: native
++# actor, mailbox, heap and store allocations must remain visible.
++leak:AutoreleasePoolPage::autoreleaseNoPage
++leak:__CFTSDGetTable
++leak:dyld4::RuntimeState::_instantiateTLVs
++leak:__Balloc_D2A
++leak:_fetchInitializingClassList

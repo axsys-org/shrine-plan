@@ -1,0 +1,217 @@
+' Native collection value codecs. JSON is a wire format, never the stored
+' representation of a list, object, or sequence. These are typed native values.
+
+decode_json =
+  ! foil
+  \ text=str
+  ^ jres
+  | parse text
+
+number_valid =
+  ! foil
+  \ value=str
+  ^ bool
+  ? (eq value.len 0) .false
+  = start (? (eq value.at(0) 45) 1 0)
+  ? (ge start value.len) .false
+  % i=nat start digits=nat 0 dots=nat 0 fraction=nat 0
+  ^ bool
+  ? (ge i value.len) (and (gt digits 0) ((eq dots 0) || (gt fraction 0)))
+  = c value.at(i)
+  ? (and (ge c 48) (le c 57)) (_ i.inc digits.inc dots (? (eq dots 1) fraction.inc fraction))
+  ? (and (eq c 46) (and (eq dots 0) (gt digits 0))) (_ i.inc digits 1 0)
+  .false
+
+valid =
+  ! foil
+  \ value=json depth=nat
+  ^ bool
+  ? (gt depth 8) .false
+  ? value
+   > (json/real text) (number_valid text)
+   > (json/arr items) (and (le items.len 512) items.all((\ item (valid item depth.inc))))
+   > (json/obj fields) (and (le fields.len 64) fields.all((\ field (and (le field.k.len 120) (valid field.v depth.inc)))))
+   > (json/str text) (le text.len 8192)
+  .true
+
+number =
+  @type
+  ! foil
+  : value=json
+  + parse
+    \ text=str
+    ^ maybe[number]
+    ? !(number_valid text) .none
+    ?> (jres/ok value rest) (decode_json text) .none
+    ? !(eq rest 0) .none
+    | ./some (number value)
+  + read
+    \ value=pail
+    ^ maybe[number]
+    ?> value=number value .none
+    | ./some value
+  + write
+    \ value=number
+    ^ pail
+    value
+  + format
+    \ value=number
+    ^ str
+    | show value.value
+  + contract
+    ^ curb
+    | curb/of_type (^ number)
+
+list =
+  @type
+  ! foil
+  : items=row[json]
+  + parse
+    \ text=str
+    ^ maybe[list]
+    ?> (jres/ok value rest) (decode_json text) .none
+    ? !(eq rest 0) .none
+    ? !(valid value 0) .none
+    ?> (json/arr items) value .none
+    | ./some (list items)
+  + read
+    \ value=pail
+    ^ maybe[list]
+    ?> value=list value .none
+    | ./some value
+  + write
+    \ value=list
+    ^ pail
+    value
+  + format
+    \ value=list
+    ^ str
+    | show (json/arr value.items)
+  + contract
+    ^ curb
+    | curb/of_type (^ list)
+
+sequence =
+  @type
+  ! foil
+  : items=row[json]
+  + parse
+    \ text=str
+    ^ maybe[sequence]
+    < decoded (list/parse text)
+    = numeric
+        \ item=json
+        ^ bool
+        ? item
+         > (json/num sign n) .true
+         > (json/real text) (number_valid text)
+        .false
+    ? !(decoded.items.all(numeric)) .none
+    | ./some (sequence decoded.items)
+  + read
+    \ value=pail
+    ^ maybe[sequence]
+    ?> value=sequence value .none
+    | ./some value
+  + write
+    \ value=sequence
+    ^ pail
+    value
+  + format
+    \ value=sequence
+    ^ str
+    | show (json/arr value.items)
+  + contract
+    ^ curb
+    | curb/of_type (^ sequence)
+
+object =
+  @type
+  ! foil
+  : fields=row[jkv]
+  + parse
+    \ text=str
+    ^ maybe[object]
+    ?> (jres/ok value rest) (decode_json text) .none
+    ? !(eq rest 0) .none
+    ? !(valid value 0) .none
+    ?> (json/obj fields) value .none
+    | ./some (object fields)
+  + read
+    \ value=pail
+    ^ maybe[object]
+    ?> value=object value .none
+    | ./some value
+  + write
+    \ value=object
+    ^ pail
+    value
+  + format
+    \ value=object
+    ^ str
+    | show (json/obj value.fields)
+  + contract
+    ^ curb
+    | curb/of_type (^ object)
+
+duration =
+  @type
+  ! foil
+  : days=nat
+  + parse
+    \ text=str
+    ^ maybe[duration]
+    < days (nat/parse text)
+    | ./some (duration days)
+  + read
+    \ value=pail
+    ^ maybe[duration]
+    > value=duration value .none
+    | ./some value
+  + write
+    \ value=duration
+    ^ pail
+    value
+  + format
+    \ value=duration
+    ^ str
+    | nat/show value.days
+  + contract
+    ^ curb
+    | curb/of_type (^ duration)
+
+many =
+  @type
+  ! foil
+  : refs=row[path]
+  + parse
+    \ text=str
+    ^ maybe[many]
+    ?> (jres/ok value rest) (decode_json text) .none
+    ? !(eq rest 0) .none
+    ?> (json/arr values) value .none
+    ? (gt values.len 512) .none
+    % rest=row[json] values out=row[path] []
+    ^ maybe[many]
+    ? (eq rest.len 0) (./some (many out))
+    ?> (json/str name) rest.at(0) .none
+    < ref (path_parse name)
+    ? (eq ref.len 0) .none
+    ? out.has(ref) .none
+    | _ rest.drop(1) out.snoc(ref)
+  + read
+    \ value=pail
+    ^ maybe[many]
+    > value=many value .none
+    | ./some value
+  + write
+    \ value=many
+    ^ pail
+    value
+  + format
+    \ value=many
+    ^ str
+    | show (json/arr value.refs.map((\ ref (json/str (path_show ref)))))
+  + contract
+    ^ curb
+    | curb/of_type (^ many)

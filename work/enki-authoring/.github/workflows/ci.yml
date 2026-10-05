@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - run: make nix-ci
+
+  #
+  # fuzz-smoke:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: DeterminateSystems/determinate-nix-action@v3
+  #     - uses: DeterminateSystems/magic-nix-cache-action@v14
+  #     - run: nix run .#fuzz -- -max_total_time=60 -error_exitcode=1
+
+  coverage:
+    runs-on: macos-15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/determinate-nix-action@v3
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - run: nix build .#coverage
+      - name: Report coverage
+        uses: actions/github-script@v9
+        env:
+          LCOV_FILE: ./result/enki.info
+        with:
+          script: |
+            const fs = require("fs");
+
+            const totals = {
+              Lines: { found: 0, hit: 0 },
+              Functions: { found: 0, hit: 0 },
+              Branches: { found: 0, hit: 0 },
+            };
+            const fields = {
+              LF: ["Lines", "found"],
+              LH: ["Lines", "hit"],
+              FNF: ["Functions", "found"],
+              FNH: ["Functions", "hit"],
+              BRF: ["Branches", "found"],
+              BRH: ["Branches", "hit"],
+            };
+
+            for (const line of fs.readFileSync(process.env.LCOV_FILE, "utf8").split(/\r?\n/)) {
+              const match = /^(LF|LH|FNF|FNH|BRF|BRH):(\d+)$/.exec(line);
+              if (!match) continue;
+              const [metric, field] = fields[match[1]];
+              totals[metric][field] += Number(match[2]);
+            }
+
+            const rows = Object.entries(totals)
+              .filter(([, value]) => value.found > 0)
+              .map(([metric, value]) => {
+                const percent = (100 * value.hit / value.found).toFixed(2);
+                return `| ${metric} | ${percent}% | ${value.hit}/${value.found} |`;
+              });
+            if (rows.length === 0) {
+              core.setFailed(`No coverage counters found in ${process.env.LCOV_FILE}`);
+              return;
+            }
+
+            const marker = "<!-- enki-lcov-report -->";
+            const body = [
+              marker,
+              "### LCOV coverage",
+              "| Metric | Coverage | Hit / Total |",
+              "| --- | ---: | ---: |",
+              ...rows,
+            ].join("\n");
+
+            await core.summary.addRaw(body).write();
+
+            const pullRequest = context.payload.pull_request;
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (
+              !pullRequest ||
+              pullRequest.head.repo.full_name !== repository ||
+              pullRequest.user.login === "dependabot[bot]"
+            ) return;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: pullRequest.number,
+            });
+            const previous = comments.find(comment =>
+              comment.user?.type === "Bot" && comment.body?.includes(marker)
+            );
+            if (previous) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: pullRequest.number,
+                body,
+              });
+            }

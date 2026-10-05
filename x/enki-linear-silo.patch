@@ -1,0 +1,329 @@
+--- a/pkg/plan/src/silo.c
++++ b/pkg/plan/src/silo.c
+@@ -1130,14 +1130,31 @@
+   return false;
+ }
+ 
++static bool decode_node_opcode(silo_dec* d, uint32_t depth, uint8_t opcode,
++                               pl_val* out, silo_node_info* info);
++
+ static bool decode_node(silo_dec* d, uint32_t depth, pl_val* out,
+                         silo_node_info* info) {
+   if (depth > PL_SILO_MAX_DEPTH)
+     return silo_error(d->err, d->err_cap, "Silo nesting exceeds %u",
+                       PL_SILO_MAX_DEPTH);
+   uint8_t opcode;
+-  if (!dread(d, &opcode, 1))
+-    return false;
++  if (!dread(d, &opcode, 1)) return false;
++  return decode_node_opcode(d, depth, opcode, out, info);
++}
++
++static bool decode_node_body(silo_dec* d, uint32_t depth, uint8_t opcode,
++                             pl_val* out, silo_node_info* info);
++
++static bool decode_node_opcode(silo_dec* d, uint32_t depth, uint8_t opcode,
++                               pl_val* out, silo_node_info* info) {
++  bool ok = decode_node_body(d, depth, opcode, out, info);
++  if (ok && d->build) *out = pl_store_reuse_decoded(d->store, *out);
++  return ok;
++}
++
++static bool decode_node_body(silo_dec* d, uint32_t depth, uint8_t opcode,
++                             pl_val* out, silo_node_info* info) {
+   memset(info, 0, sizeof(*info));
+ 
+   if (opcode >= 0x80 && opcode <= 0xbf) {
+@@ -1156,70 +1173,73 @@
+     return decode_mnat(d, out, info);
+ 
+   if (opcode >= 0x08 && opcode <= 0x78 && (opcode & 7u) == 0) {
+-    uint8_t n = opcode >> 3;
++    /* The wire splits one flat APP into 15-argument head chunks. Retaining
++     * every growing prefix in the store arena is quadratic. Accumulate the
++     * chunk widths, decode their arguments, then allocate only the final APP.
++     * Depth and canonical validation still follow the original wire tree. */
++    uint8_t* widths = NULL;
++    pl_val* args = NULL;
++    uint64_t total = 0;
++    uint32_t head_depth = depth;
++    do {
++      uint8_t n = opcode >> 3;
++      if (d->canonical && ax_arrlen(widths) != 0 && n != 15) {
++        silo_error(d->err, d->err_cap, "noncanonical APP spine flattening");
++        goto app_fail;
++      }
++      ax_arrpush(widths, n);
++      total += n;
++      if (++head_depth > PL_SILO_MAX_DEPTH || total > UINT32_MAX - 2u) {
++        silo_error(d->err, d->err_cap, "decoded APP exceeds depth or size limit");
++        goto app_fail;
++      }
++      if (!dread(d, &opcode, 1)) goto app_fail;
++    } while (opcode >= 0x08 && opcode <= 0x78 && (opcode & 7u) == 0);
+     pl_val head = 0;
+     silo_node_info head_info;
+-    if (!decode_node(d, depth + 1, &head, &head_info))
+-      return false;
+-    if (d->canonical && head_info.kind == SILO_NODE_APP &&
+-        head_info.wire_app_n != 15)
+-      return silo_error(d->err, d->err_cap,
+-                        "noncanonical APP spine flattening");
+-
+-    pl_val* args = NULL;
++    if (!decode_node_opcode(d, head_depth, opcode, &head, &head_info))
++      goto app_fail;
+     if (d->build) {
+-      args = malloc((size_t)n * sizeof(*args));
+-      if (args == NULL)
+-        return silo_error(d->err, d->err_cap, "out of memory for APP args");
+-    }
+-    for (uint8_t i = 0; i < n; i++) {
+-      pl_val arg = 0;
+-      silo_node_info arg_info;
+-      if (!decode_node(d, depth + 1, &arg, &arg_info)) {
+-        free(args);
+-        return false;
++      args = malloc((size_t)total * sizeof(*args));
++      if (args == NULL) {
++        silo_error(d->err, d->err_cap, "out of memory for APP args");
++        goto app_fail;
+       }
+-      if (d->build)
+-        args[i] = arg;
++    }
++    size_t at = 0;
++    for (size_t chunk = (size_t)ax_arrlen(widths); chunk > 0; chunk--) {
++      for (uint8_t i = 0; i < widths[chunk - 1]; i++) {
++        pl_val arg = 0;
++        silo_node_info arg_info;
++        if (!decode_node(d, depth + (uint32_t)chunk, &arg, &arg_info))
++          goto app_fail;
++        if (d->build) args[at++] = arg;
++      }
+     }
+     info->kind = SILO_NODE_APP;
+-    info->wire_app_n = n;
+-    if (!d->build)
+-      return true;
+-
+-    uint64_t inner_n = 0;
+-    pl_val flat_head = head;
+-    pl_cell* hp = pl_as(PL_TAG_APP, head);
+-    if (hp != NULL) {
+-      inner_n = pl_app_n(hp);
+-      flat_head = pl_app_head(hp);
+-    }
+-    uint64_t total = inner_n + n;
+-    if (total == 0 || total > UINT32_MAX - 2u) {
+-      free(args);
+-      return silo_error(d->err, d->err_cap, "decoded APP is too large");
+-    }
+-    uint64_t arity = pl_arity(flat_head);
+-    uint64_t need64 = (arity == 0 || arity <= total) ? 0 : arity - total;
+-    if (need64 >= (UINT64_C(1) << 20)) {
+-      free(args);
+-      return silo_error(d->err, d->err_cap,
+-                        "decoded APP need exceeds runtime limit");
+-    }
+-    pl_cell* p = decode_alloc(d, PL_APP_CELLS((uint32_t)total));
+-    if (p == NULL) {
+-      free(args);
+-      return false;
+-    }
+-    p[0] = pl_hdr_make(PL_K_APP, PL_F_NORMAL, (uint32_t)need64,
+-                       PL_APP_CELLS((uint32_t)total));
+-    p[1] = flat_head;
+-    if (hp != NULL)
+-      memcpy(p + 2, pl_app_args(hp), (size_t)inner_n * sizeof(pl_val));
+-    memcpy(p + 2 + inner_n, args, (size_t)n * sizeof(pl_val));
++    info->wire_app_n = widths[0];
++    if (d->build) {
++      uint64_t arity = pl_arity(head);
++      uint64_t need = (arity == 0 || arity <= total) ? 0 : arity - total;
++      if (need >= (UINT64_C(1) << 20)) {
++        silo_error(d->err, d->err_cap, "decoded APP need exceeds runtime limit");
++        goto app_fail;
++      }
++      pl_cell* p = decode_alloc(d, PL_APP_CELLS((uint32_t)total));
++      if (p == NULL) goto app_fail;
++      p[0] = pl_hdr_make(PL_K_APP, PL_F_NORMAL, (uint32_t)need,
++                         PL_APP_CELLS((uint32_t)total));
++      p[1] = head;
++      memcpy(p + 2, args, (size_t)total * sizeof(pl_val));
++      *out = pl_make(PL_TAG_APP, p);
++    }
+     free(args);
+-    *out = pl_make(PL_TAG_APP, p);
++    ax_arrfree(widths);
+     return true;
++app_fail:
++    free(args);
++    ax_arrfree(widths);
++    return false;
+   }
+ 
+   if (opcode == 0xf0) {
+--- a/pkg/plan/src/store.c
++++ b/pkg/plan/src/store.c
+@@ -430,7 +430,51 @@
+ void pl_store_release(pl_store* s, size_t mark) {
+   pl_store_lock(s);
+   s->region->off_o = mark;
++  if (s->decoded_values != NULL)
++    memset(s->decoded_values, 0, (1u << 18) * sizeof(pl_val));
+   pl_store_unlock(s);
++}
++
++/* Saved versions often repeat the same unpinned immutable subtrees. Their
++ * bytes, hashes and values are unchanged by sharing their decoded storage.
++ * A bounded direct-mapped cache makes eviction a performance issue only.
++ * Only the newest, unpublished allocation may be rewound. PIN identities
++ * never enter this cache. A failed load clears it before arena rollback. */
++pl_val pl_store_reuse_decoded(pl_store* s, pl_val value) {
++  if (pl_is_nat63(value) || pl_tag(value) == PL_TAG_PIN) return value;
++  pl_cell* p = pl_ptr(value);
++  size_t bytes = (size_t)pl_hdr_cells(p[0]) * sizeof(pl_cell);
++  pl_store_lock(s);
++  size_t start = (size_t)(pl_addr(value) - (uintptr_t)s->region->ptr);
++  if (start + bytes != s->region->off_o) {
++    pl_store_unlock(s);
++    return value;
++  }
++  if (s->decoded_values == NULL)
++    s->decoded_values = calloc(1u << 18, sizeof(pl_val));
++  if (s->decoded_values == NULL) {
++    pl_store_unlock(s);
++    return value;
++  }
++  uint64_t hash = UINT64_C(0x9e3779b97f4a7c15);
++  for (size_t i = 0; i < bytes / sizeof(pl_cell); i++) {
++    hash ^= p[i] + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2);
++  }
++  hash ^= hash >> 33;
++  hash *= UINT64_C(0xff51afd7ed558ccd);
++  hash ^= hash >> 33;
++  size_t index = (size_t)hash & ((1u << 18) - 1);
++  pl_val prior = s->decoded_values[index];
++  if (prior != 0 && pl_tag(prior) == pl_tag(value) &&
++      pl_hdr_cells(pl_ptr(prior)[0]) == pl_hdr_cells(p[0]) &&
++      memcmp(pl_ptr(prior), p, bytes) == 0) {
++    s->region->off_o = start;
++    value = prior;
++  } else {
++    s->decoded_values[index] = value;
++  }
++  pl_store_unlock(s);
++  return value;
+ }
+ 
+ /* ── Intern table ──────────────────────────────────────────────────────── */
+@@ -955,7 +999,7 @@
+   if (sweep) {
+     /* Collect compiler scratch sooner instead of retaining up to 512 MiB
+      * of garbage per semispace. The live heap still grows when necessary. */
+-    s->compiler_h = pl_heap_new(((size_t)1 << 23), s);
++    s->compiler_h = pl_heap_new(((size_t)1 << 20), s);
+     s->compiler_t = pl_thread_new(s->compiler_h);
+   }
+   pl_store_unlock(s);
+@@ -1153,6 +1197,7 @@
+   ax_arrfree(s->loading);
+   if (s->be.close != NULL)
+     s->be.close(s->be.ctx);
++  free(s->decoded_values);
+   ax_arena_destroy(s->region);
+   pthread_mutex_destroy(&s->mu);
+   pthread_mutex_destroy(&s->save_mu);
+--- a/pkg/plan/src/store_internal.h
++++ b/pkg/plan/src/store_internal.h
+@@ -22,6 +22,7 @@
+ pl_cell* pl_store_alloc(pl_store* s, size_t cells);
+ size_t pl_store_mark(pl_store* s);
+ void pl_store_release(pl_store* s, size_t mark);
++pl_val pl_store_reuse_decoded(pl_store* s, pl_val value);
+ 
+ void pl_store_lock(pl_store* s);
+ void pl_store_unlock(pl_store* s);
+--- a/pkg/plan/include/plan/store.h
++++ b/pkg/plan/include/plan/store.h
+@@ -89,6 +89,7 @@
+   pl_thread* compiler_t;
+   pl_heap* compiler_h;
+   bool compiler_f;
++  pl_val* decoded_values; /* bounded cache of immutable decoded subtrees */
+ } pl_store;
+ 
+ pl_store* pl_store_new(pl_store_backend backend);
+--- a/tests/unit/test_plan_silo.c
++++ b/tests/unit/test_plan_silo.c
+@@ -3,6 +3,7 @@
+ #include <string.h>
+ 
+ #include "../../pkg/plan/src/silo_internal.h"
++#include "../../pkg/plan/src/store_internal.h"
+ #include "axsys/sha256.h"
+ #include "test_plan.h"
+ 
+@@ -540,3 +541,61 @@
+   free(encoded.bytes);
+   test_rt_free(&rt);
+ }
++
++/* A long row is encoded in 15-argument chunks. Loading must not retain
++ * each flattened prefix in the permanent store arena. */
++TEST(silo, wide_application_decode_uses_linear_store_space) {
++  test_rt rt = test_rt_new();
++  const uint32_t n = 6000;
++  pl_val* args = malloc(n * sizeof(*args));
++  ASSERT_NOT_NULL(args);
++  for (uint32_t i = 0; i < n; i++) args[i] = i % 61;
++  pl_val row = test_app(rt.t, 0, n, args);
++  pl_vpush(rt.t, row);
++  mem_stream encoded = {0}, roundtrip = {0};
++  encode(&encoded, row, NULL, 0);
++  char err[192] = {0};
++  pl_silo_scan shape = {0};
++  ASSERT(scan(&encoded, true, &shape, err), "%s", err);
++  pl_silo_reader reader = {.ctx = &encoded, .read = mem_read,
++      .rewind = mem_rewind, .len = encoded.len};
++  size_t before = pl_store_mark(rt.store);
++  pl_val decoded;
++  ASSERT(pl_silo_build_stream(&reader, rt.store, &shape, NULL,
++                              &decoded, err, sizeof(err)), "%s", err);
++  size_t allocated = pl_store_mark(rt.store) - before;
++  encode(&roundtrip, decoded, NULL, 0);
++  ASSERT_EQ(encoded.len, roundtrip.len);
++  ASSERT_EQ(memcmp(encoded.bytes, roundtrip.bytes, encoded.len), 0);
++  ASSERT(allocated <= 2 * PL_APP_CELLS(n) * sizeof(pl_cell),
++         "wide row allocated %zu bytes for %u fields", allocated, n);
++  pl_silo_scan_free(&shape);
++  free(args); free(encoded.bytes); free(roundtrip.bytes);
++  test_rt_free(&rt);
++}
++
++TEST(silo, decoded_sharing_is_exact_and_rollback_drops_cache) {
++  test_rt rt = test_rt_new();
++  pl_val args[3] = {11, 22, 33};
++  pl_val row = test_app(rt.t, 0, 3, args);
++  pl_vpush(rt.t, row);
++  mem_stream encoded = {0}; encode(&encoded, row, NULL, 0);
++  char err[192] = {0}; pl_silo_scan shape = {0};
++  ASSERT(scan(&encoded, true, &shape, err), "%s", err);
++  pl_silo_reader reader = {.ctx=&encoded, .read=mem_read,
++      .rewind=mem_rewind, .len=encoded.len};
++  size_t start = pl_store_mark(rt.store);
++  pl_val first, second, third;
++  ASSERT(pl_silo_build_stream(&reader, rt.store, &shape, NULL, &first, err, sizeof(err)), "%s", err);
++  size_t once = pl_store_mark(rt.store);
++  ASSERT(pl_silo_build_stream(&reader, rt.store, &shape, NULL, &second, err, sizeof(err)), "%s", err);
++  ASSERT_EQ(first, second);
++  ASSERT_EQ(pl_store_mark(rt.store), once);
++  pl_store_release(rt.store, start);
++  ASSERT(pl_silo_build_stream(&reader, rt.store, &shape, NULL, &third, err, sizeof(err)), "%s", err);
++  ASSERT_EQ(pl_store_mark(rt.store), once);
++  mem_stream again = {0}; encode(&again, third, NULL, 0);
++  ASSERT_EQ(again.len, encoded.len);
++  ASSERT_EQ(memcmp(again.bytes, encoded.bytes, again.len), 0);
++  pl_silo_scan_free(&shape); free(again.bytes); free(encoded.bytes); test_rt_free(&rt);
++}

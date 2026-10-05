@@ -1,5 +1,6 @@
 """Failure-path tests for the gate; run with python3 x/test_runner_tests.py."""
 import os
+import json
 import shutil
 import tempfile
 import unittest
@@ -11,6 +12,159 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_compact_sources_round_trip_exact_inputs_and_preserve_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            root = cache / 'run-finished'
+            source = root / 'src'
+            (source / 'empty').mkdir(parents=True)
+            code = source / 'fixture.foil'
+            code.write_bytes(b'actual native source\n' * 100)
+            code.chmod(0o755)
+            os.utime(code, ns=(1700000000123456789, 1700000000123456789))
+            (root / 'results.json').write_text('[{"passed": true}]')
+            (root / 'out.log').write_text('kept execution evidence')
+            (root / 'snap').mkdir()
+            (root / 'snap/pins.pack').write_bytes(b'never a cleanup target')
+            before = runner.source_inventory(source)
+            runner.compact_test_sources(root, cache)
+            self.assertFalse(source.exists())
+            self.assertTrue((root / 'source.tar.gz').exists())
+            self.assertEqual((root / 'out.log').read_text(), 'kept execution evidence')
+            self.assertEqual((root / 'snap/pins.pack').read_bytes(), b'never a cleanup target')
+            with patch.object(runner, 'require_disk_space'):
+                runner.restore_test_sources(root, cache)
+            self.assertEqual(runner.source_inventory(source), before)
+            runner.compact_test_sources(root, cache)
+            self.assertFalse(source.exists())
+
+    def test_compaction_refuses_incomplete_linked_and_durable_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            root = cache / 'run-pending'
+            (root / 'src').mkdir(parents=True)
+            (root / 'src/file').write_text('preserve')
+            with self.assertRaisesRegex(ValueError, 'completed'):
+                runner.compact_test_sources(root, cache)
+            (root / 'results.json').write_text('[{"passed": true}]')
+            (root / 'world.json').write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'completed'):
+                runner.compact_test_sources(root, cache)
+            (root / 'world.json').unlink()
+            (root / 'src/link').symlink_to(root / 'src/file')
+            with self.assertRaisesRegex(ValueError, 'Linked'):
+                runner.compact_test_sources(root, cache)
+            self.assertEqual((root / 'src/file').read_text(), 'preserve')
+
+    def test_failed_archive_verification_never_removes_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            root = cache / 'run-finished'
+            (root / 'src').mkdir(parents=True)
+            (root / 'src/file').write_text('preserve')
+            (root / 'results.json').write_text('[{"passed": false}]')
+            with patch.object(runner, 'verify_source_archive', side_effect=ValueError('corrupt')):
+                with self.assertRaisesRegex(ValueError, 'corrupt'):
+                    runner.compact_test_sources(root, cache)
+            self.assertEqual((root / 'src/file').read_text(), 'preserve')
+            self.assertFalse((root / 'source.tar.gz.tmp').exists())
+
+    def test_restore_rejects_tampered_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            root = cache / 'run-finished'
+            (root / 'src').mkdir(parents=True)
+            (root / 'src/file').write_text('preserve')
+            (root / 'results.json').write_text('[{"passed": true}]')
+            runner.compact_test_sources(root, cache)
+            with (root / 'source.tar.gz').open('ab') as output:
+                output.write(b'tampered')
+            with self.assertRaisesRegex(ValueError, 'digest'):
+                runner.restore_test_sources(root, cache)
+            self.assertFalse((root / 'src').exists())
+
+    def failed_run(self, cache, name, timestamp, *, keep=False):
+        root = cache / name
+        group = root / 'native'
+        (group / 'snap').mkdir(parents=True)
+        (group / 'snap/pins.pack').write_bytes(b'disposable frozen test store')
+        (root / 'src').mkdir()
+        (root / 'src/fixture.foil').write_text('exact reproduction input')
+        (root / 'results.json').write_text('[{"passed": false}]')
+        (group / 'result.json').write_text(json.dumps(dict(passed=False, keep_snapshot=keep)))
+        os.utime(group / 'result.json', ns=(timestamp, timestamp))
+        (group / 'out.log').write_text('actual failed execution evidence')
+        (group / 'input').write_text('actual native command')
+        return group
+
+    def test_retention_rotates_without_prompt_or_false_diagnosis(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            oldest = self.failed_run(cache, 'run-z-old', 1000000000)
+            newest = self.failed_run(cache, 'run-a-new', 2000000000)
+            runner.compact_test_sources(oldest.parent, cache)
+            root = cache / 'run-next'
+            root.mkdir()
+            with patch.object(runner, 'run_group_owned') as execute:
+                runner.run_group([], 'engine', cache, root, 1)
+                execute.assert_called_once()
+            self.assertEqual(len(runner.unresolved_stores(cache)), 1)
+            self.assertFalse((oldest / 'snap').exists())
+            self.assertTrue((newest / 'snap').exists())
+            self.assertEqual((oldest / 'out.log').read_text(), 'actual failed execution evidence')
+            self.assertEqual((oldest / 'input').read_text(), 'actual native command')
+            self.assertTrue((oldest.parent / 'source.tar.gz').is_file())
+            receipt = json.loads((oldest / 'retention.json').read_text())
+            self.assertFalse(receipt['diagnosed'])
+            self.assertEqual(receipt['discarded'], 'snap')
+
+    def test_retention_does_not_remove_unfinished_held_or_durable_stores(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            held = self.failed_run(cache, 'run-held', 1, keep=True)
+            incomplete = self.failed_run(cache, 'run-incomplete', 2)
+            (incomplete / 'result.json').unlink()
+            durable = self.failed_run(cache, 'run-durable', 3)
+            (durable.parent / 'world.json').write_text('{}')
+            reproducible = self.failed_run(cache, 'run-disposable', 4)
+            self.assertEqual(runner.rotate_failure_stores(cache, limit=0), [reproducible.resolve()])
+            for group in (held, incomplete, durable):
+                self.assertTrue((group / 'snap').is_dir())
+
+    def test_retention_requires_verified_source_reproduction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            group = self.failed_run(cache, 'run-failed', 1)
+            runner.compact_test_sources(group.parent, cache)
+            with (group.parent / 'source.tar.gz').open('ab') as archive:
+                archive.write(b'tampered')
+            with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+                runner.rotate_failure_stores(cache, limit=0)
+            self.assertTrue((group / 'snap').exists())
+            self.assertFalse((group / 'retention.json').exists())
+
+    def test_diagnosis_cannot_delete_durable_or_linked_stores(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            group = cache / 'run-one/native'
+            (group / 'snap').mkdir(parents=True)
+            (group / 'result.json').write_text('{"passed": false}')
+            (group / 'world.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'durable world'):
+                runner.diagnose_store(group, 'diagnosed', cache)
+            (group / 'world.json').unlink()
+            link = cache / 'run-one/linked'
+            link.symlink_to(group, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, 'unlinked'):
+                runner.diagnose_store(link, 'diagnosed', cache)
+            self.assertTrue((group / 'snap').is_dir())
+
+    def test_check_root_is_local_or_explicit(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIn('/.local/share/shrine/checks/', str(runner.check_root()))
+        with patch.dict(os.environ, {'SHRINE_CHECK_ROOT': '/tmp/explicit-shrine-tests'}):
+            self.assertEqual(runner.check_root(), Path('/tmp/explicit-shrine-tests').resolve())
+
     def test_shared_fixture_is_built_once_and_passed_to_each_entrypoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -159,6 +313,18 @@ class ProtocolTests(unittest.TestCase):
             runner.copy_template(template, root / 'copy')
             self.assertEqual((root / 'copy/data.mdb').read_bytes(), b'compiler-only-fixture')
 
+    def test_private_engine_copies_share_cache_but_content_edits_do_not(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first, second = root / 'engine', root / 'private-engine'
+            first.write_bytes(b'engine version 1')
+            shutil.copyfile(first, second)
+            self.assertEqual(runner.compiler_key(first), runner.compiler_key(second))
+            stamp = second.stat()
+            second.write_bytes(b'engine version 2')
+            os.utime(second, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            self.assertNotEqual(runner.compiler_key(first), runner.compiler_key(second))
+
     def test_timeout_and_crash(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
@@ -170,6 +336,51 @@ class ProtocolTests(unittest.TestCase):
                 [sys.executable, '-c', 'raise SystemExit(9)'], path, '', 5)
             self.assertTrue(completed)
             self.assertEqual(code, 9)
+
+    def test_low_space_stops_child_and_cannot_pass(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            with patch.object(runner, 'check_world_storage', side_effect=RuntimeError('disk reserve reached')):
+                code, complete, seconds = runner.run_process(
+                    [sys.executable, '-c', 'import time; time.sleep(10)'], path, '', 5)
+            self.assertFalse(complete)
+            self.assertNotEqual(code, 0)
+            self.assertLess(seconds, 2)
+            self.assertIn('disk reserve reached', (path / 'out.log').read_text())
+
+    def test_memory_growth_stops_child_and_preserves_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            (path / 'snap').mkdir()
+            pins = path / 'snap/pins.pack'
+            pins.write_bytes(b'committed native state')
+            code, complete, seconds = runner.run_process(
+                [sys.executable, '-c',
+                 'import time; data=bytearray(48*1024**2); time.sleep(10)'],
+                path, '', 5, memory_bytes=32 * 1024**2)
+            self.assertFalse(complete)
+            self.assertNotEqual(code, 0)
+            self.assertLess(seconds, 3)
+            self.assertIn('Owned process memory exceeds', (path / 'out.log').read_text())
+            report = json.loads((path / 'memory.json').read_text())
+            self.assertGreater(report['sampled_peak_bytes'], report['limit_bytes'])
+            self.assertEqual(pins.read_bytes(), b'committed native state')
+
+    def test_retention_only_removes_disposable_store(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            (path / 'snap').mkdir()
+            (path / 'snap/pins.pack').write_bytes(b'copied test pins')
+            (path / 'out.log').write_text('test evidence')
+            (path / 'world.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'durable world'):
+                runner.discard_test_snapshot(path)
+            self.assertTrue((path / 'snap/pins.pack').exists())
+            (path / 'world.json').unlink()
+            runner.discard_test_snapshot(path)
+            self.assertFalse((path / 'snap').exists())
+            self.assertEqual((path / 'out.log').read_text(), 'test evidence')
 
     def test_inventory_is_complete(self):
         suites = runner.inventory()

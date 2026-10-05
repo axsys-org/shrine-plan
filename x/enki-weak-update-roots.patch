@@ -1,0 +1,183 @@
+--- a/pkg/plan/src/heap.c
++++ b/pkg/plan/src/heap.c
+@@ -475,6 +475,51 @@
+   }
+ }
+ 
++static void pl_thread_roots(pl_root_visit visit, void* gc_ctx, void* src_ctx);
++
++/* An update target is needed only if another root can still observe that
++ * thunk. Keeping it alive solely to memoize a result nobody can read retains
++ * every suspended tail call in a long-lived actor. Run after the strong graph
++ * has been completely evacuated: shared blackholes (including their retry
++ * environments) have forwarding pointers; unobserved targets may disappear.
++ * This does not drop shared updates or redirect partially executed effects. */
++static pl_val pl_live_update_target(pl_gc_ctx* gc, pl_val value) {
++  if (value == 0)
++    return 0;
++  if (gc->h->store != NULL && pl_store_owns(gc->h->store, value))
++    return value;
++  pl_cell* p = pl_ptr(value);
++  return pl_hdr_kind(p[0]) == PL_K_FWD ? (pl_val)p[1] : 0;
++}
++
++static void pl_collect_update_targets(pl_gc_ctx* gc, pl_thread* t) {
++  size_t out = 0;
++  for (size_t i = 0; i < t->fsp; i++) {
++    pl_frame* fr = &t->fstack[i];
++    if (fr->kind != PL_F_UPD)
++      continue;
++    uint32_t previous_count = fr->argc;
++    size_t previous_base = fr->argbase;
++    pl_val first = pl_live_update_target(gc, fr->a);
++    uint32_t count = first != 0;
++    size_t start = out;
++    for (uint32_t j = 1; j < previous_count; j++) {
++      pl_val value = pl_live_update_target(gc, t->ustack[previous_base + j - 1]);
++      if (value == 0)
++        continue;
++      if (count == 0)
++        first = value;
++      else
++        t->ustack[out++] = value;
++      count++;
++    }
++    fr->a = first;
++    fr->argbase = (uint32_t)start;
++    fr->argc = count;
++  }
++  t->usp = out;
++}
++
+ static void pl_collect_into(pl_thread* t, pl_heap* h, pl_cell* target) {
+ #ifndef PL_CACHE_STATS
+   (void)t;
+@@ -496,6 +541,9 @@
+   for (size_t i = 0; i < h->nroots; i++)
+     h->roots[i].fn(pl_gc_visit, &gc, h->roots[i].ctx);
+   pl_cheney_scan(&gc);
++  for (size_t i = 0; i < h->nroots; i++)
++    if (h->roots[i].fn == pl_thread_roots)
++      pl_collect_update_targets(&gc, h->roots[i].ctx);
+   h->live_cells = (size_t)(gc.target_free - target);
+   h->free = gc.target_free;
+ }
+@@ -618,15 +666,14 @@
+   for (size_t i = 0; i < t->vsp; i++)
+     if (!pl_is_nat63(t->vstack[i]))
+       visit(&t->vstack[i], gc_ctx);
+-  for (size_t i = 0; i < t->usp; i++)
+-    if (!pl_is_nat63(t->ustack[i]))
+-      visit(&t->ustack[i], gc_ctx);
+   for (size_t i = 0; i < t->fsp; i++) {
+ #ifdef PL_CACHE_STATS
+     if ((unsigned)t->fstack[i].kind < PL_CACHE_FRAME_CAP)
+       t->cache_stats.gc_frame_kinds[t->fstack[i].kind]++;
+ #endif
+-    if (!pl_is_nat63(t->fstack[i].a))
++    /* THKE update targets are weak; the post-scan phase keeps only targets
++     * also reachable through the actual computation or another consumer. */
++    if (t->fstack[i].kind != PL_F_UPD && !pl_is_nat63(t->fstack[i].a))
+       visit(&t->fstack[i].a, gc_ctx);
+     if (!pl_is_nat63(t->fstack[i].b))
+       visit(&t->fstack[i].b, gc_ctx);
+--- a/pkg/plan/src/eval.c
++++ b/pkg/plan/src/eval.c
+@@ -96,6 +96,8 @@
+     }
+     if (fr->kind != PL_F_UPD)
+       continue;
++    if (fr->argc == 0)
++      continue; /* GC found no remaining observer of these update targets. */
+     if (fr->argc == 1) {
+       pl_restore_thke(fr->a);
+       continue;
+@@ -610,7 +612,10 @@
+     pl_frame* fr = &t->fstack[t->fsp - 1];
+     if (fr->kind == PL_F_UPD) {
+       ax_assume(fr->argc < UINT32_MAX, "update chain is too large");
+-      if (fr->argc == 1) {
++      if (fr->argc == 0) {
++        fr->a = thke;
++        fr->argc = 1;
++      } else if (fr->argc == 1) {
+         size_t start = t->usp;
+         pl_upush(t, thke);
+         fr->argbase = (uint32_t)start;
+@@ -1592,7 +1597,9 @@
+   goto ret;
+ 
+ ret_upd:
+-  if (fr->argc == 1) {
++  if (fr->argc == 0) {
++    /* All consumers disappeared during collection; preserve the result. */
++  } else if (fr->argc == 1) {
+     pl_thke_update(t, fr->a, v);
+   } else {
+     ax_assume(fr->argc >= 2 && (size_t)fr->argbase + fr->argc - 1 == t->usp,
+--- a/pkg/plan/include/plan/heap.h
++++ b/pkg/plan/include/plan/heap.h
+@@ -55,7 +55,8 @@
+                       group size; a = 0 until an op that captures an
+                       env reifies one on demand.  RET resets to b.     */
+   PL_F_UPD,        /* newstyle thunk update chain: a is the first target;
+-                      argbase owns argc-1 further targets in ustack */
++                      argbase owns argc-1 further targets in ustack;
++                      argc may be zero after weak-target collection */
+   PL_F_TRY,        /* exception barrier (op 66 Try); argbase: vsp mark  */
+   PL_F_JUDGE,      /* forcing a law-body chain node; argbase: hbase     */
+   PL_F_NIL,        /* RETURN planNil(v): 1 if the value is 0, else 0    */
+--- a/tests/unit/test_plan_eval.c
++++ b/tests/unit/test_plan_eval.c
+@@ -1442,6 +1442,51 @@
+   ASSERT_EQ(pl_hdr_kind(pl_ptr(t->vstack[base])[0]), PL_K_IND);
+ 
+   test_rt_free(&rt);
++}
++
++static void test_update_chain_reachability(bool shared) {
++  test_rt rt = test_rt_new();
++  pl_thread* t = rt.t;
++  size_t base = t->vsp;
++  enum { DEPTH = 6000 };
++  pl_vpush(t, 7);
++  pl_vpush(t, 0);
++  for (unsigned i = 0; i < DEPTH; i++) {
++    pl_gc_reserve(t, PL_THKE_CELLS(1));
++    t->vstack[base] = pl_mk_thke(t, PL_BAN_SLOW, 1, &t->vstack[base]);
++    if (shared && i == 5000)
++      t->vstack[base + 1] = t->vstack[base];
++  }
++  pl_val chain = t->vstack[base];
++  t->vstack[base] = 0; /* the caller does not retain the outer computation */
++  pl_thread_start(t, chain);
++  ASSERT_EQ(pl_thread_run(t, DEPTH / 2), PL_RUN_YIELDED);
++  size_t before = t->usp;
++  ASSERT(before > 1000);
++  pl_gc_collect_now(t);
++  if (shared) {
++    ASSERT(t->usp > 1000); /* the shared middle and its inner targets survive */
++    ASSERT(t->usp < before);
++  } else {
++    ASSERT_EQ(t->usp, 0); /* bookkeeping alone must not retain old work */
++  }
++  pl_run_status status;
++  while ((status = pl_thread_run(t, 100000)) == PL_RUN_YIELDED)
++    ;
++  ASSERT_EQ(status, PL_RUN_DONE);
++  ASSERT_EQ(pl_thread_result(t), 7);
++  ASSERT_EQ(t->usp, 0);
++  if (shared)
++    ASSERT_EQ(pl_whnf(t, t->vstack[base + 1]), 7);
++  test_rt_free(&rt);
++}
++
++TEST(exec, unreachable_update_targets_do_not_retain_tail_history) {
++  test_update_chain_reachability(false);
++}
++
++TEST(exec, shared_update_targets_keep_call_by_need_results) {
++  test_update_chain_reachability(true);
+ }
+ 
+ TEST(exec, runtime_error_restores_unwound_thke) {

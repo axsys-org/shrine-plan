@@ -1,0 +1,80 @@
+;;;; Actor differential scenarios: run the same module through the
+;;;; enki wisp and the reaver plan-assembler and compare stdout.
+;;;;
+;;;;   wisp tests/plan actors ping    -> hello-via-echo
+;;;;   wisp tests/plan actors count   -> 3
+;;;;
+;;;; All prints happen in the root actor, so the output is deterministic
+;;;; under both the fuel scheduler and reaver's preemptive GHC threads
+;;;; (per-actor observables are schedule-independent).
+
+(#bind R (#pin "R"))
+(#bind B (#pin "B"))
+
+;;; echo: receive [msg caps], send msg back through caps[0], loop.
+
+(#bind step
+  (#pin (#law "step" (step k mc)
+    (B ("Seq" (R ("Send" (B ("Ix0" (B ("Ix1" mc)))) (B ("Ix0" mc))))
+              (k 0))))))
+
+(#bind echo
+  (#pin (#law "echo" (echo z)
+    (step echo (R ("Recv" 0))))))
+
+;;; ping: spawn echo, send it a string with our own cap (handle 0), and
+;;; print the reflection.
+
+(#bind ping
+  (#pin (#law "ping" (ping args)
+    (B ("Seq" (R ("SendCaps" (R ("Spawn" echo))
+                             "hello-via-echo"
+                             (B ("Rep" 0 0 1))))
+              (R ("Print" (B ("Ix0" (R ("Recv" 0)))))))))))
+
+;;; counter: integer state in the loop argument; "inc" increments,
+;;; anything else is treated as "get": send the count to the reply cap.
+
+(#bind cstep
+  (#pin (#law "cstep" (cstep k n mc)
+    (B ("If" (B ("Equal" (B ("Ix0" mc)) "inc"))
+             (k (B ("Inc" n)))
+             (B ("Seq" (R ("Send" (B ("Ix0" (B ("Ix1" mc)))) n))
+                       (k n))))))))
+
+(#bind counter
+  (#pin (#law "counter" (counter n)
+    (cstep counter n (R ("Recv" 0))))))
+
+;;; tryrecv: a Recv beneath Try — the barrier is a machine frame, so
+;;; blocking under it suspends and resumes.
+
+(#bind getmsg
+  (#pin (#law "getmsg" (getmsg z)
+    (B ("Ix0" (R ("Recv" 0)))))))
+
+(#bind tryrecv
+  (#pin (#law "tryrecv" (tryrecv args)
+    (B ("Seq" (R ("Send" 0 "tm"))
+              (R ("Print" (B ("Ix0" (B ("Try" getmsg 0)))))))))))
+
+;;; stuck: a Recv that nobody will ever answer — the executor reports a
+;;; deadlock (reaver: BlockedIndefinitelyOnMVar).
+
+(#bind stuck
+  (#pin (#law "stuck" (stuck args)
+    (R ("Recv" 0)))))
+
+;;; count: spawn a counter, inc it three times, fetch the value with a
+;;; "get" carrying our cap, print it as an ascii digit.
+
+(#bind count
+  (#pin (#law "count" (count args)
+    h(R ("Spawn" counter))
+    (B ("Seq3" (R ("Send" h "inc"))
+               (R ("Send" h "inc"))
+               (R ("Send" h "inc"))
+               (B ("Seq" (R ("SendCaps" h "get" (B ("Rep" 0 0 1))))
+                         (R ("Print"
+                             (B ("Add" 48
+                                       (B ("Ix0" (R ("Recv" 0)))))))))))))))

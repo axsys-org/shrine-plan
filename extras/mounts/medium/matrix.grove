@@ -1,0 +1,158 @@
+' A raster is an ordinary native matrix with native operations. The browser
+' only draws supplied RGB samples and delivers bounded physical coordinates.
+
+raster =
+  @slot
+  #meta ;
+    "/sys/lede": "Matrix surface"
+    "/sys/goo/program": (grove_surface_program raster/render raster/resolve raster/prepare)
+  ! foil
+  + input
+    \ context=grove_surface_context
+    ^ either[str [path myth native_matrix/value[nat]]]
+    ? !(eq context.inputs.len 1) (./err "Bind one matrix subject.")
+    = input context.inputs.at(0)
+    ?> (./known tree) input.value (./err "The matrix input is unresolved.")
+    ?> (./some card) tree.fil (./err "The matrix record is absent.")
+    ?> (./some held) card.get(['matrix]) (./err "The matrix slot is missing.")
+    ?> matrix=native_matrix/value[nat] held (./err "This input requires an explicit matrix adaptation.")
+    ? !(native_matrix/valid matrix) (./err "Matrix shape is inconsistent.")
+    | ./ok [input.dependency.p card matrix]
+  + resolve
+    \ context=grove_surface_context key=path parameters=myth
+    ^ either[str grove_occurrence]
+    < input (raster/input context)
+    = [target card matrix] input
+      source (safe 0 .x target)
+    ? (equal[path] key ['pixel])
+      = x parameters.nat_at(['x] matrix.width)
+        y parameters.nat_at(['y] matrix.height)
+      ? !(and (eq parameters.nat_at(['width] 0) matrix.width) (eq parameters.nat_at(['height] 0) matrix.height))
+        | ./err "The displayed matrix shape changed."
+      ?> (./some value) (native_matrix/read matrix x y) (./err "Pixel is outside the matrix.")
+      = selection (native_matrix/position x y matrix.width matrix.height)
+        description (str/cat_all ["Matrix [" (nat/show x) ", " (nat/show y) "] · RGB " (nat/show value)])
+      | ./ok (grove_occurrence key (grove_focus source ['matrix] (./some selection))
+        (./some context.implementation.path.snoc('prepare)) rex/zero_span description)
+    ? !((equal[path] key ['invert]) || (equal[path] key ['transpose]) ||
+        (equal[path] key ['paint]) || (equal[path] key ['crop])) (./err "Unknown native matrix action.")
+    | ./ok (grove_occurrence key (grove_focus source ['matrix] .none)
+      (./some context.implementation.path.snoc('prepare)) rex/zero_span (str/cat_all ["Native matrix operation " (path_show key)]))
+  + button
+    \ key=path label=str
+    ^ weft/node
+    | weft/el "button" [(weft/att "type" "button") (weft/att "data-grove-key" (show/path key))
+        (weft/att "data-grove-act" "click")] [(weft/tx (str/to_atom label))]
+  + render
+    \ context=grove_surface_context
+    ^ either[str grove_surface_output]
+    < input (raster/input context)
+    = [target card matrix] input
+    ? (gt matrix.cells.len 4096) (./err "Select a bounded native matrix region before rendering this value.")
+    ? !(matrix.cells.all((\ color (lt color 16777216)))) (./err "RGB values must be unsigned 24-bit samples.")
+    = pixels (show (json/arr matrix.cells.map((\ color (json/num .false color)))))
+      controls=row[path] [['paint] ['crop] ['invert] ['transpose]]
+      occurrences (controls.map((\ key (either/ok_val (raster/resolve context key myth/new)))))
+      mode card.txt_at(['mode])
+      html (weft/node/el "figure" [(weft/att "class" "matrix-surface")]
+        [(weft/el "style" [] [(weft/raw ".matrix-surface{margin:0;padding:22px;background:#fcfbf7;box-shadow:0 2px 18px #16261d12;width:max-content;border:1px solid #d5dacf}.matrix-surface header{display:flex;gap:24px;align-items:baseline;margin-bottom:18px}.matrix-surface h2{font-size:18px;font-weight:500;margin:0}.matrix-surface small{color:#6c7568}.matrix-surface canvas{display:block;width:480px;height:auto;image-rendering:pixelated;background:#fff;touch-action:none;cursor:crosshair;outline:1px solid #d8ddcf}.matrix-surface footer{display:flex;gap:8px;margin-top:18px}.matrix-surface footer button{font-size:12px;border:0;background:#ebefe4}")])
+         (weft/el "header" [] [(weft/el "h2" [] [(weft/tx (str/to_atom card.txt_at(['sys 'lede])))])
+           (weft/el "small" [] [(weft/tx (str/to_atom (str/cat_all [(nat/show matrix.width) " × " (nat/show matrix.height) " · " mode])))])])
+         (weft/el "canvas" [(weft/att "data-grove-key" "/pixel")
+           (weft/att "data-grove-pointer" "samples") (weft/att "data-grove-raster" pixels)
+           (weft/att "width" (str/to_atom (nat/show matrix.width)))
+           (weft/att "height" (str/to_atom (nat/show matrix.height)))
+           (weft/att "aria-label" "Native matrix; drag to paint or select a crop")
+           (weft/att "tabindex" "0")] [])
+         (weft/el "footer" [] [(raster/button ['paint] "Paint") (raster/button ['crop] "Select crop")
+           (raster/button ['invert] "Invert") (raster/button ['transpose] "Transpose")])])
+    | ./ok (grove_surface_output html occurrences [['pixel]])
+  + changed
+    \ target=path before=myth after=myth
+    ^ either[str grove_change_plan]
+    | ./ok (grove_change_plan [(grove_record_edit target (./some before) (./some after))] [])
+  + prepare
+    \ context=grove_surface_context occurrence=grove_occurrence arguments=myth
+    ^ either[str grove_change_plan]
+    < input (raster/input context)
+    = [target card matrix] input
+      key occurrence.key
+    ? (equal[path] key ['paint]) (raster/changed target card card.put(['mode] (pails/t "paint")))
+    ? (equal[path] key ['crop]) (raster/changed target card card.put(['mode] (pails/t "crop")))
+    ? (equal[path] key ['invert])
+      = transformed (native_matrix/map (\ color=nat (sub 16777215 color)) matrix)
+      | raster/changed target card card.put(['matrix] transformed)
+    ? (equal[path] key ['transpose])
+      < transformed (native_matrix/transpose matrix)
+      | raster/changed target card card.put(['matrix] transformed)
+    ? !(equal[path] key ['pixel]) (./err "No native matrix operation.")
+    ?> (./some held) occurrence.focus.selector (./err "Select an exact matrix position.")
+    ?> selection=native_matrix/position held (./err "This is not a matrix position.")
+    ?> (./some held) arguments.get(['points]) (./err "Pointer samples are missing.")
+    ?> samples=grove_pointer_samples held (./err "Expected native pointer samples.")
+    ? (eq samples.values.len 0) (./err "No positions were selected.")
+    ? !(samples.values.all((\ point (native_matrix/contains matrix point.x point.y)))) (./err "A selected position is outside the matrix.")
+    ? (eq card.txt_at(['mode]) "crop")
+      = end samples.values.at(samples.values.len.dec)
+        left (? (lt selection.x end.x) selection.x end.x)
+        top (? (lt selection.y end.y) selection.y end.y)
+        right (? (gt selection.x end.x) selection.x end.x)
+        bottom (? (gt selection.y end.y) selection.y end.y)
+      < cropped (native_matrix/region matrix left top (sub right left).inc (sub bottom top).inc)
+      | raster/changed target card card.put(['matrix] cropped).put(['mode] (pails/t "paint"))
+    = color card.nat_at(['ink] 2835772)
+    < painted (native_matrix/paint[nat] matrix samples.values.map((\ sample [sample.x sample.y])) color)
+    | raster/changed target card card.put(['matrix] painted)
+
+' A second construction reuses the exact same matrix, paint operation,
+' correspondence and raster presentation. The transition rule is native.
+
+cellular =
+  @slot
+  #meta ;
+    "/sys/lede": "Cellular matrix transition"
+    "/sys/goo/program": (grove_surface_program cellular/render cellular/resolve cellular/prepare)
+  ! foil
+  + resolve
+    \ context=grove_surface_context key=path parameters=myth
+    ^ either[str grove_occurrence]
+    ? !(equal[path] key ['step]) (raster/resolve context key parameters)
+    < input (raster/input context)
+    = [target card matrix] input
+    | ./ok (grove_occurrence key (grove_focus (safe 0 .x target) ['matrix] .none)
+      (./some context.implementation.path.snoc('prepare)) rex/zero_span "One native cellular transition")
+  + render
+    \ context=grove_surface_context
+    ^ either[str grove_surface_output]
+    < original (raster/render context)
+    < step (cellular/resolve context ['step] myth/new)
+    = html (weft/node/el original.html.tag original.html.as
+        original.html.kids.snoc((weft/el "footer" [] [(raster/button ['step] "Step generation")])))
+    | ./ok original.set_html(html).set_occurrences(original.occurrences.snoc(step))
+  + advance
+    \ matrix=native_matrix/value[nat]
+    ^ native_matrix/value[nat]
+    | native_matrix/generate matrix.width matrix.height
+      \ x y
+      = left (? (eq x 0) 0 x.dec)
+        top (? (eq y 0) 0 y.dec)
+        right (? (lt x.inc matrix.width) x.inc matrix.width.dec)
+        bottom (? (lt y.inc matrix.height) y.inc matrix.height.dec)
+        neighbors
+          | (row/range top bottom.inc).fold 0
+          \ total row
+          | (row/range left right.inc).fold total
+            \ total column
+            ? (and (eq column x) (eq row y)) total
+            ? !(eq (native_matrix/read matrix column row).fall(16777215) 0) total
+            total.inc
+        alive (eq (native_matrix/read matrix x y).fall(16777215) 0)
+      ? ((eq neighbors 3) || (and alive (eq neighbors 2))) 0
+      16777215
+  + prepare
+    \ context=grove_surface_context occurrence=grove_occurrence arguments=myth
+    ^ either[str grove_change_plan]
+    ? !(equal[path] occurrence.key ['step]) (raster/prepare context occurrence arguments)
+    < input (raster/input context)
+    = [target card matrix] input
+    | raster/changed target card card.put(['matrix] (cellular/advance matrix))

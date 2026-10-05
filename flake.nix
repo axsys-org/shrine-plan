@@ -20,7 +20,9 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = enki.packages.${system}.default.overrideAttrs (old: {
+            patches = (old.patches or []) ++ [ ./x/enki-pure.patch ./x/enki-pure-diagnostics.patch ./x/enki-native-wire.patch ./x/enki-memory.patch ./x/enki-transport.patch ./x/enki-gc-headroom.patch ./x/enki-actor-lifetime.patch ./x/enki-tail-continuation.patch ];
+          });
           edenTools = [ enkiPkg pkgs.python3 pkgs.lsof ];
 
           hsPkgs = pkgs.haskellPackages.override {
@@ -52,7 +54,9 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = enki.packages.${system}.default.overrideAttrs (old: {
+            patches = (old.patches or []) ++ [ ./x/enki-pure.patch ./x/enki-pure-diagnostics.patch ./x/enki-native-wire.patch ./x/enki-memory.patch ./x/enki-transport.patch ./x/enki-gc-headroom.patch ./x/enki-actor-lifetime.patch ./x/enki-tail-continuation.patch ];
+          });
         in {
           default = pkgs.runCommand "reaver-tests" {
             nativeBuildInputs = [ enkiPkg pkgs.python3 ];

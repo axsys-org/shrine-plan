@@ -9,11 +9,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, runtime_literal
-from eden_runtime import runtime_exit_status, startup_failed, startup_ready
+from eden_runtime import (runtime_exit_status, startup_failed, startup_ready, World,
+                          require_disk_space, check_world_storage, MemoryMonitor, TerminationSignals)
 from namespace_identity import parse_node_identity
 from test_runner import stage
 
@@ -40,6 +42,10 @@ def literal(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--runtime', type=Path, help='Use an explicitly selected native runtime without Nix')
+    parser.add_argument('--world', type=Path, help='Own and resume a pinned durable world')
+    parser.add_argument('--protocol', choices=('arbiter/2', 'arbiter/3', 'canvas/1'), default='canvas/1',
+                        help='Explicit protocol for this world; never migrates an existing journal')
     parser.add_argument('--mount', action='append', default=[], metavar='NAME')
     parser.add_argument('--extras-root', type=Path,
                         help='Mount source directory (default: this checkout’s extras/)')
@@ -49,6 +55,14 @@ def main():
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
+    parser.add_argument('--profile-json', type=Path,
+                        help='Write the native runtime profile when this owner exits')
+    parser.add_argument('--min-free-mib', type=int, default=2048,
+                        help='Stop native work below this free disk reserve')
+    parser.add_argument('--max-pins-mib', type=int, default=1024,
+                        help='Stop the owner if its pin store exceeds this size')
+    parser.add_argument('--max-memory-mib', type=int, default=1536,
+                        help='Sample and bound charged memory of the launcher and its children')
     args = parser.parse_args()
     try:
         number, node = parse_node_identity(args.node)
@@ -56,36 +70,72 @@ def main():
             raise ValueError('--port must be between 1 and 65535')
         if args.startup_timeout <= 0 or args.request_timeout <= 0:
             raise ValueError('Timeouts must be positive')
+        if args.min_free_mib <= 0 or args.max_pins_mib <= 0 or args.max_memory_mib <= 0:
+            raise ValueError('Resource budgets must be positive')
         extras = (args.extras_root or ROOT / 'extras').resolve()
         if args.list_mounts:
             for name in catalog(extras):
                 print(name)
             return 0
         selected = select(extras, args.mount) if args.mount else []
-        enter_environment(sys.argv[1:])
-        runtime = os.environ.get('WISP') or shutil.which('wisp')
+        if args.protocol == 'arbiter/3' and (not args.world or not any(m.name == 'arbiter' for m in selected)):
+            raise ValueError('arbiter/3 requires a pinned world and the arbiter mount')
+        if not args.runtime:
+            enter_environment(sys.argv[1:])
+        runtime = str(args.runtime.resolve()) if args.runtime else os.environ.get('WISP') or shutil.which('wisp')
         if not runtime or not os.access(runtime, os.X_OK):
             raise ValueError('Set WISP to a working runtime executable')
-        work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
-        template = stage(runtime, False, args.startup_timeout)
-        shutil.copytree(ROOT / 'src', work / 'src')
-        (work / 'snap').mkdir()
-        for name in ('data.mdb', 'pins.pack'):
-            shutil.copyfile(template / name, work / 'snap' / name)
         with ExitStack() as cleanup:
-            prepared = prepare(selected, work, args.check, cleanup,
-                               {"node": node, "timeout": args.startup_timeout})
+            cleanup.enter_context(TerminationSignals())
+            world = cleanup.enter_context(World(args.world, runtime, ROOT / 'src',
+                [m.name for m in selected], node, args.port, protocol=args.protocol)) if args.world else None
+            work = world.path if world else Path(tempfile.mkdtemp(prefix='shrine-eden-'))
+            require_disk_space(work)
+            memory = cleanup.enter_context(MemoryMonitor(args.max_memory_mib * 2**20,
+                                                         work / 'memory.json'))
+            def check_storage():
+                memory.check()
+                check_world_storage(work, args.min_free_mib * 2**20,
+                                    args.max_pins_mib * 2**20)
+            check_storage()
+            if world:
+                runtime = str(world.runtime)
+            else:
+                shutil.copytree(ROOT / 'src', work / 'src')
+            if not world or not world.resuming:
+                template = stage(runtime, False, args.startup_timeout)
+                (work / 'snap').mkdir()
+                for name in ('data.mdb', 'pins.pack'):
+                    shutil.copyfile(template / name, work / 'snap' / name)
+            companion_work = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='shrine-session-')))
+            native_ready = threading.Event()
+            prepared = prepare(selected, companion_work, args.check, cleanup,
+                               {"node": node, "port": args.port, "timeout": args.startup_timeout,
+                                "protocol": args.protocol, "native_ready": native_ready,
+                                "world": str(world.path) if world else None,
+                                "worker_capacity": memory.worker_capacity,
+                                "check_worker": memory.check_worker})
             specs = runtime_specs(prepared, work / 'src')
             scanner = cleanup.enter_context(ScanBridge(prepared, work / 'src')) if specs else None
             scan_port = scanner.port if scanner else 0
             scan_token = scanner.token if scanner else ''
+            if world:
+                world.session(scan_port, scan_token, {m.name: argv for m, _, argv, _ in prepared})
+                # Session hook arguments can contain credentials. Registration
+                # loads them from session.json after every restart instead.
+                specs = [list(spec) for spec in specs]
+                for spec in specs:
+                    spec[8] = []
             log_path = work / 'out.log'
+            if log_path.exists():
+                log_path.rename(work / f'out-{time.time_ns()}.log')
             print(f'Compiling Eden. Log: {log_path}', flush=True)
             log = cleanup.enter_context(log_path.open('w'))
-            process = subprocess.Popen([runtime, '--file-root', str(work / 'src'),
+            profile = ['--profile-json', str(args.profile_json.resolve())] if args.profile_json else []
+            process = subprocess.Popen([runtime, *profile, '--file-root', str(work / 'src'),
                                         'snap', 'root', '_'], cwd=work,
                                        stdin=subprocess.PIPE, stdout=log, stderr=log,
-                                       text=True, restore_signals=False)
+                                       text=True, restore_signals=False, start_new_session=True)
             def stop():
                 if process.poll() is None:
                     process.terminate()
@@ -95,7 +145,10 @@ def main():
                         process.kill()
                         process.wait()
             cleanup.callback(stop)
-            process.stdin.write(f'''(#bind eden (#module eden))
+            if not world or not world.resuming:
+                entry = 'start-world' if world else 'start'
+                identity = literal([args.protocol, node, world.manifest['engine_sha256']]) + ' ' if world else ''
+                process.stdin.write(f'''(#bind eden (#module eden))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind std (#module std))
 (#import std)
@@ -103,26 +156,33 @@ def main():
   (define (resolve name) [["x" {number}] ["ts" "lib"] ["ts" name]])
   (define slot [("x" {number}) ("ts" "compiler") ("ts" "artifact")])
   (define system (bootstrap:build-system (Pin eden:start) resolve slot))
-  (eden:start ("x" {number}) system resolve slot {args.port} {literal(specs)} {scan_port} {literal(scan_token)}))
+  (eden:{entry} {identity}("x" {number}) system resolve slot {args.port} {literal(specs)} {scan_port} {literal(scan_token)}))
 (print ("EDEN-LAUNCH-RETURNED" (Try launch 0)))
 ''')
-            process.stdin.flush()
+                process.stdin.flush()
             deadline = time.monotonic() + args.startup_timeout
             while True:
+                check_storage()
                 output = log_path.read_text(errors='replace')
                 if process.poll() is not None:
                     return runtime_exit_status(process.returncode, log_path) or 1
                 if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
-                    raise RuntimeError(output[-6000:])
-                if startup_ready(output, 'EDEN-LAUNCH-RETURNED'):
+                    raise RuntimeError(f'Native startup failed; inspect {log_path}')
+                ready = 'EDEN-WORLD-READY' in output if world else startup_ready(output, 'EDEN-LAUNCH-RETURNED')
+                if ready:
+                    if world:
+                        world.confirm_native_root()
                     try:
-                        with socket.create_connection(('127.0.0.1', args.port), timeout=.2):
-                            break
+                        with socket.create_connection(('127.0.0.1', args.port), timeout=.2) as probe:
+                            probe.sendall(b'GET /__eden_unregistered__ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
+                            if probe.recv(256).startswith(b'HTTP/'):
+                                break
                     except OSError:
                         pass
                 if time.monotonic() > deadline:
                     raise RuntimeError(f'Startup timed out; inspect {log_path}')
                 time.sleep(.25)
+            native_ready.set()
             url = f'http://127.0.0.1:{args.port}'
             print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}', flush=True)
             if args.check:
@@ -143,7 +203,10 @@ def main():
                             raise RuntimeError(f'{mount.name}: {error.code} at {error.url}: {error.read().decode(errors="replace")[:1200]}') from error
                 print('Eden checks passed.', flush=True)
                 return 0
-            return runtime_exit_status(process.wait(), log_path)
+            while process.poll() is None:
+                check_storage()
+                time.sleep(.5)
+            return runtime_exit_status(process.returncode, log_path)
     except KeyboardInterrupt:
         return 130
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:

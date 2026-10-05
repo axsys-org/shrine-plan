@@ -1,0 +1,169 @@
+- fit_core
+
+' Arrangements and fit proposals are native records. Client edits address a block
+' and its revision; unrelated block edits do not invalidate that draft.
++ fit_store
+  + arrangement
+    : blocks=row[json] revision=nat reading=json
+  + proposal
+    : reading=json revision=nat
+  + entry
+    : operation=str request=str before=fit_store/arrangement after=fit_store/arrangement
+  + slot
+    ^ path
+    ['sys 'grove 'arrangement]
+  + root
+    \ state=namespace
+    ^ path
+    [state.self 'app 'user 'arrangement]
+  + get
+    \ state=namespace
+    ^ fit_store/arrangement
+    = card (goo_runtime/record .x (fit_store/root state) state).fall(myth/new)
+    ?> (./some held) card.get(fit_store/slot) (fit_store/arrangement [] 0 jnull)
+    ?> value=fit_store/arrangement held (fit_store/arrangement [] 0 jnull)
+    value
+  + json
+    \ value=fit_store/arrangement
+    ^ json
+    | json/obj [(jkv "blocks" (json/arr value.blocks))
+        (jkv "revision" (json/num .false value.revision)) (jkv "reading" value.reading)]
+  + fail
+    \ state=namespace index=hive status=nat message=str
+    ^ [namespace hive nat str]
+    | grove_surface_wire/fail_indexed state index status message
+  + save
+    \ request=interaction_runtime/request before=fit_store/arrangement after=fit_store/arrangement state=namespace index=hive
+    ^ [namespace hive nat str]
+    = root (fit_store/root state)
+      existing (goo_runtime/record .x root state)
+      card existing.fall(myth/new)
+      next_card card.put(fit_store/slot after).put(['sys 'lede] (pails/t "Arrangement"))
+      receipt=path [state.self 'journal 'grove 'arrangements ($ta request.event)]
+      history (myth/sing ['entry] (fit_store/entry request.operation request.body before after))
+    = command=writ
+        ? (maybe/is_some existing) (writ/poke next_card)
+        | writ/make next_card
+    ?> (./ok next) (grove_install/change_many [[root command] [receipt (writ/make history)]] state)
+      | fit_store/fail state index 422 "Arrangement transaction failed; content is unchanged."
+    | grove_surface_wire/reply_indexed next (sovereign_hive next) 200 (fit_store/json after)
+  + handle
+    \ request=interaction_runtime/request state=namespace index=hive
+    ^ [namespace hive nat str]
+    ? !(eq request.principal "administrator") (fit_store/fail state index 403 "Local owner authority required.")
+    = current (fit_store/get state)
+    ? (eq request.operation "fit/read")
+      | grove_surface_wire/reply_indexed state index 200 (fit_store/json current)
+    ?> (jres/ok body rest) (parse request.body) (fit_store/fail state index 400 "Invalid fit request.")
+    ? !(eq rest 0) (fit_store/fail state index 400 "Trailing fit request input.")
+    ? (eq request.operation "fit/label")
+      | grove_surface_wire/reply_indexed state index 200
+          (fit_core/label (fit_core/text "text" body) (fit_core/bool (fit_core/field "note" body)))
+    ? (eq request.operation "fit/check-wire")
+      | grove_surface_wire/reply_indexed state index 200
+          (fit_core/wire (fit_core/field "from" body) (fit_core/field "to" body))
+    ? ((eq request.event "") || (gt request.event.len 80)) (fit_store/fail state index 400 "An event identity is required.")
+    = receipt=path [state.self 'journal 'grove 'arrangements ($ta request.event)]
+      prior (goo_runtime/record .x receipt state)
+    ? (maybe/is_some prior)
+      = previous prior.fall(myth/new)
+      ?> (./some held) previous.get(['entry]) (fit_store/fail state index 409 "Invalid event receipt.")
+      ?> entry=fit_store/entry held (fit_store/fail state index 409 "Receipt type mismatch.")
+      ? !(and (eq entry.operation request.operation) (eq entry.request request.body)) (fit_store/fail state index 409 "This event already names a different edit.")
+      | grove_surface_wire/reply_indexed state index 200 (fit_store/json current)
+    ? (eq request.operation "fit/block")
+      | fit_store/block_request request body current state index
+    ? (eq request.operation "fit/prepare")
+      | fit_store/prepare_request request body current state index
+    ? (eq request.operation "fit/undo")
+      | fit_store/undo_request request body current state index
+    | fit_store/fail state index 400 "Unknown fit operation."
+
+  + block_request
+    \ request=interaction_runtime/request body=json current=fit_store/arrangement state=namespace index=hive
+    ^ [namespace hive nat str]
+    = block (fit_core/field "block" body)
+      id (fit_core/text "id" block)
+      old current.blocks.keep((\ item (eq id (fit_core/text "id" item))))
+      expected (fit_core/field "expected" body)
+    ? !(fit_core/valid_block block) (fit_store/fail state index 422 "Invalid prepared block or content identity.")
+    ? !(equal[json] expected (fit_store/expected_revision old))
+      | fit_store/fail state index 409 "This block changed. Its draft is retained; unrelated blocks are unaffected."
+    ?> revision=json/num (fit_core/field "revision" block) (fit_store/fail state index 422 "A block requires an integer revision.")
+    ? (eq revision.neg .true) (fit_store/fail state index 422 "A block revision cannot be negative.")
+    = old_revision (fit_store/prior_revision old)
+    ? !(eq revision.n old_revision.inc) (fit_store/fail state index 409 "A block revision must advance exactly once.")
+    = source_ok (fit_store/source_current block state)
+    ? !source_ok (fit_store/fail state index 409 "The dropped native reference is absent or its revision changed. Reinspect it; labels cannot establish identity.")
+    = blocks (fit_store/update_block block current.blocks)
+      after (fit_store/arrangement blocks current.revision.inc current.reading)
+      checked (fit_core/validate_arrangement (fit_store/json after))
+    ?> (./ok _) checked (fit_store/fail state index 422 "Invalid containment or duplicate content identity.")
+    | fit_store/save request current after state index
+  + prepare_request
+    \ request=interaction_runtime/request body=json current=fit_store/arrangement state=namespace index=hive
+    ^ [namespace hive nat str]
+    ? !(equal[json] (fit_core/field "revision" body) (json/num .false current.revision))
+      | fit_store/fail state index 409 "The arrangement changed during fitting; keep the current content."
+    = reading (fit_core/field "reading" body)
+      checked (fit_core/validate_reading (fit_store/json current) reading)
+    ?> (./ok _) checked (fit_store/fail state index 422 "Fit does not account for every original content identity exactly once.")
+    = at=path [state.self 'journal 'grove 'fits ($ta request.event)]
+      candidate (myth/sing ['proposal] (fit_store/proposal reading current.revision))
+      prior (goo_runtime/record .x at state)
+    ? (maybe/is_some prior)
+      ? !(equal prior (maybe/some[myth] candidate))
+        | fit_store/fail state index 409 "This fit event already identifies a different candidate."
+      | grove_surface_wire/reply_indexed state index 200
+          (json/obj [(jkv "proposal" (json/str (path_show at))) (jkv "reading" reading)
+            (jkv "state" (json/str "proposed")) (jkv "coverage" (json/str "Content identity validation only; term compilation and activation are pending."))])
+    ?> (./ok next) (grove_install/change at (writ/make candidate) state)
+      | fit_store/fail state index 422 "Could not retain the fit proposal."
+    | grove_surface_wire/reply_indexed next (sovereign_hive next) 200
+        (json/obj [(jkv "proposal" (json/str (path_show at))) (jkv "reading" reading)
+          (jkv "state" (json/str "proposed"))
+          (jkv "coverage" (json/str "Content identity validation only; term compilation and activation are pending."))])
+  + undo_request
+    \ request=interaction_runtime/request body=json current=fit_store/arrangement state=namespace index=hive
+    ^ [namespace hive nat str]
+    = original (fit_core/text "event" body)
+    ? ((eq original "") || (gt original.len 80)) (fit_store/fail state index 400 "Choose the original arrangement event.")
+    = at=path [state.self 'journal 'grove 'arrangements ($ta original)]
+    ?> (./some record) (goo_runtime/record .x at state) (fit_store/fail state index 404 "No original arrangement event.")
+    ?> (./some held) record.get(['entry]) (fit_store/fail state index 422 "No undo information.")
+    ?> entry=fit_store/entry held (fit_store/fail state index 422 "Invalid undo information.")
+    ? !(and (equal current.blocks entry.after.blocks) (equal current.reading entry.after.reading))
+      | fit_store/fail state index 409 "Later edits exist; undo them first. Current content is preserved."
+    | fit_store/save request current entry.before.set_revision(current.revision.inc) state index
+
+  + prior_revision
+    \ blocks=row[json]
+    ^ nat
+    ? (eq blocks.len 0) 0
+    ?> previous=json/num (fit_core/field "revision" blocks.at(0)) 0
+    previous.n
+  + source_current
+    \ block=json state=namespace
+    ^ bool
+    = kind (fit_core/text "kind" block)
+      source (fit_core/field "source" block)
+    ? !((eq kind "component") || (eq kind "material")) .true
+    ?> (./some target) (path_parse (fit_core/text "subject" source)) .false
+    ?> (./some version) (state.case(.x target)) .false
+    | eq (nat/show version) (fit_core/text "revision" source)
+
+  + expected_revision
+    \ blocks=row[json]
+    ^ json
+    ? (eq blocks.len 0) jnull
+    | fit_core/field "revision" blocks.at(0)
+  + update_block
+    \ block=json blocks=row[json]
+    ^ row[json]
+    = id (fit_core/text "id" block)
+      old blocks.keep((\ item (eq id (fit_core/text "id" item))))
+    ? (eq old.len 0) blocks.snoc(block)
+    | blocks.map
+        \ item=json
+        ? (eq id (fit_core/text "id" item)) block
+        item

@@ -1,0 +1,132 @@
+- goo_runtime
+
+' Compile an authored presentation against its existing native contract. This
+' deliberately handles presentation refinement, not arbitrary application code.
+' The native Grove parser and lowering pass remain the only evaluator.
++ presentation_edit
+  + literal_error
+    \ node=rex children=row[maybe[grove/error]]
+    ^ maybe[grove/error]
+    ? node.leaf_error
+     > (./some why) (./some (grove/error/syntax node.span why))
+    = failed (children.keep(maybe/is_some[grove/error]))
+    ? failed.len failed.at(0) .none
+  + parse
+    \ source=str
+    ^ either[grove/error grove/document]
+    ?> (./ok trees) (rex/parse_blocks source)
+      | grove/parse source
+    = errors (trees.map((rex/fold[maybe[grove/error]] presentation_edit/literal_error))).keep(maybe/is_some[grove/error])
+    ? errors.len (./err errors.at(0).fall((grove/error/syntax rex/zero_span "Invalid literal.")))
+    | grove/from_blocks trees
+  + selects
+    \ selected=path item=grove/item
+    ^ bool
+    ?> (grove/declaration _ name body) item .false
+    ?> (grove/name/identifier text) name .false
+    | and (equal selected.at(selected.len.dec) ($ts text)) (grove_views/is_view body)
+  + excerpt
+    ' Return the exact authored declaration and imports using native Rex spans.
+    ' This is source selection, never generated or reverse-engineered source.
+    \ selected=path source=str
+    ^ maybe[str]
+    ?> (./ok document) (grove/parse source) .none
+    = declarations (document.items.keep((presentation_edit/selects selected)))
+    ? !(eq declarations.len 1) .none
+    = snippets
+        | document.items.bind
+        \ item=grove/item
+        ^ list[str]
+        = chosen=maybe[rex/source_span]
+            ? item
+             > (grove/import_decl span _ _) (./some span)
+             > (grove/declaration span _ _)
+              ? (equal item declarations.head) (./some span) .none
+            .none
+        ?> (./some span) chosen .nil
+        | list/one source.slice(span.offset span.length)
+    | ./some (str/join ((str/from_atom 10).repeat(2)) snippets.row)
+  + interaction
+    : kind=str receiver=maybe[rex] action=maybe[rex]
+      values=list[rex] arguments=list[rex]
+  + named
+    \ expression=rex
+    ^ bool
+    ?> (./nest _ _ rune _) expression .false
+    | eq rune "="
+  + interactions
+    \ nodes=list[goo/node] scope=goo_runtime/scope
+    ^ list[presentation_edit/interaction]
+    | nodes.bind
+      \ node=goo/node
+      = inner (goo_runtime/enter scope node)
+        arguments=list[rex]
+          ? (eq node.constructor "action") (node.arguments.keep(presentation_edit/named))
+          ? (eq node.constructor "input") node.arguments
+          .nil
+        own=list[presentation_edit/interaction]
+          ? !((eq node.constructor "action") || (eq node.constructor "input")) .nil
+          | list/one (presentation_edit/interaction node.constructor
+              inner.receiver.run(rex/strip_spans) inner.action.run(rex/strip_spans)
+              inner.values.map(rex/strip_spans) arguments.map(rex/strip_spans))
+      | own.weld((presentation_edit/interactions node.children inner))
+  + same_interactions
+    ' Preserve multiplicity while allowing a different visual ordering. This is
+    ' structural equality of authored native actions, not semantic equivalence.
+    \ old=goo/view next=goo/view
+    ^ bool
+    = scope (goo_runtime/scope .none .none .nil)
+      before (presentation_edit/interactions old.children scope)
+      after (presentation_edit/interactions next.children scope)
+    ? !(eq before.len after.len) .false
+    | before.all
+      \ entry=presentation_edit/interaction
+      | eq (before.keep((\ item (equal entry item)))).len
+          (after.keep((\ item (equal entry item)))).len
+  + bounded
+    \ nodes=list[goo/node]
+    ^ bool
+    % queue=list[[goo/node nat]] (nodes.map((\ node [node 1]))) count=nat 0
+    ^ bool
+    ? queue.is_nil .true
+    ? (ge count 256) .false
+    = [node depth] queue.head
+    ? (gt depth 24) .false
+    | _ queue.tail.weld(node.children.map((\ child [child depth.inc]))) count.inc
+  + allowed_item
+    \ item=grove/item
+    ^ bool
+    ? item
+     > (grove/comment _ _) .true
+     > (grove/import_decl _ _ _) .true
+     > (grove/declaration _ _ body) (grove_views/is_view body)
+  + compile
+    \ original=goo/published source=str lookup={\ path}maybe[myth]
+    ^ either[grove/error goo/published]
+    ? ((eq source.len 0) || (gt source.len 8192))
+      | goo/fail[goo/published] rex/zero_span "Presentation source must contain 1–8192 bytes."
+    < document (presentation_edit/parse source)
+    ? !(document.items.all(presentation_edit/allowed_item))
+      | goo/fail[goo/published] rex/zero_span "This candidate accepts a presentation only; behavior and role changes need their own assessment."
+    = root original.view.name.take(original.view.name.len.dec)
+    < views (grove_views/index root document lookup)
+    ? !(eq views.len 1)
+      | goo/fail[goo/published] rex/zero_span "Refine exactly one selected presentation."
+    = view views.at(0)
+    ? !(and (equal view.name original.view.name)
+        (and (equal view.role original.view.role) (equal view.slot original.view.slot)))
+      | goo/fail[goo/published] view.span "Preserve the selected presentation, receiver role and presentation slot."
+    ? !(eq view.binding original.view.binding)
+      | goo/fail[goo/published] view.span "Preserve the receiver binding in this presentation refinement."
+    ? !(presentation_edit/bounded view.children)
+      | goo/fail[goo/published] view.span "Presentation exceeds 256 nodes or 24 levels."
+    = context (grove_views/context root document lookup
+        (list/one (goo/role original.view.role original.fields))
+        (grove_view_publication/renderers lookup) views)
+    < children (grove_views/lower_nodes context (list/one view.name) view view.children)
+    = lowered view.set_children(children)
+    ?> (./ok previous) original.result
+      | goo/fail[goo/published] view.span "The selected presentation must have a valid installed basis."
+    ? !(presentation_edit/same_interactions previous lowered)
+      | goo/fail[goo/published] view.span "The proposed presentation changes native actions or input placements. Assess that as a behavioral change."
+    | ./ok original.set_view(view).set_result((./ok lowered))
