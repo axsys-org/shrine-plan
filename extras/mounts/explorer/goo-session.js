@@ -53,7 +53,7 @@
       for (const spec of plan.values()) {
         if (spec.kind === 'selection') {
           if (!spec.source || !spec.source.id || !spec.source.life || !spec.source.type) fail('invalid-source');
-          if (spec.source.members.length > 64) fail('source-bound-exceeded');
+          if (spec.source.members.length > (spec.multiple ? 20000 : spec.source.incremental && spec.source.topology==='tree' ? 4096 : 64)) fail('source-bound-exceeded');
           const keys = new Set();
           for (const member of spec.source.members) {
             if (keys.has(member.key)) fail('duplicate-member-key');
@@ -113,12 +113,17 @@
             // The finite projection plus the chosen member is the retention bound.
             const retained = new Set(spec.source.members.map(m => m.key));
             if (state.accepted) retained.add(state.accepted.key);
+            for (const member of state.acceptedMany || []) retained.add(member.key);
             for (const key of state.members.keys()) if (!retained.has(key)) state.members.delete(key);
             for (const key of spec.source.deleted || []) {
               const member = state.members.get(key);
               if (member) state.members.set(key, {...member, status: 'unavailable'});
             }
             state.source = copy(spec.source);
+            state.acceptedMany = (state.acceptedMany || []).map(member => {
+              const fresh = state.members.get(member.key);
+              return fresh && membership(fresh) === membership(member) ? copy(fresh) : {...member, status:'unavailable'};
+            });
             if (state.accepted) {
               const fresh = state.members.get(state.accepted.key);
               if (fresh && membership(fresh) === membership(state.accepted)) state.accepted = copy(fresh);
@@ -195,8 +200,41 @@
       const intent = Object.freeze({ref, order: ++state.intentOrder, member: member && copy(member)});
       this.intents.add(intent); return intent;
     }
+    intentMany(ref, members, mode = 'replace') {
+      const state = this.get(ref, 'selection');
+      if (!state.spec.multiple || !['replace','add','toggle'].includes(mode)) fail('invalid-group-selection');
+      const intent = Object.freeze({ref, order: ++state.intentOrder, members:copy(members), mode});
+      this.intents.add(intent); return intent;
+    }
+    async deliverMany(intent) {
+      const state=this.get(intent.ref,'selection');
+      if(intent.order!==state.intentOrder || intent.order <= (state.delivered||0))return {status:'superseded'};
+      state.delivered=intent.order;
+      const chosen=new Map((intent.mode==='replace'?[]:state.acceptedMany||[]).map(m=>[membership(m),m]));
+      for(const member of intent.members) {
+        this.validateMember(state.source,member);
+        const known=state.members.get(member.key);
+        if(!known || membership(known)!==membership(member) || known.status!=='available')fail('stale-member');
+        const key=membership(known);
+        if(intent.mode==='toggle' && chosen.has(key))chosen.delete(key);else chosen.set(key,copy(known));
+      }
+      // Group owners use the same departure guards; a scalar follower cannot
+      // silently choose a representative of a multiple selection.
+      if(state.observers.size)fail('group-selection-has-scalar-follower');
+      const allowed=await this.depart(state,{kind:'selection',intent:intent.order});
+      if(!state.live || intent.order!==state.intentOrder)return {status:'superseded'};
+      if(!allowed)return {status:'refused'};
+      for(const member of chosen.values()) {
+        const fresh=state.members.get(member.key);
+        if(!fresh || membership(fresh)!==membership(member) || fresh.status!=='available')return {status:'refused'};
+      }
+      state.acceptedMany=[...chosen.values()];state.revision++;
+      this.emit('selection-accepted',{id:state.id,acceptedRevision:state.revision});
+      return {status:'accepted',revision:state.revision};
+    }
     async deliver(intent) {
       if (!this.intents.has(intent)) fail('unknown-local-intent');
+      if (intent.members) return this.deliverMany(intent);
       const state = this.get(intent.ref, 'selection');
       if (intent.order !== state.intentOrder || intent.order <= (state.delivered || 0)) return {status: 'superseded'};
       state.delivered = intent.order;
@@ -240,11 +278,11 @@
     }
     read(ref) {
       const state = this.get(ref, 'selection');
-      return copy({accepted: state.accepted, revision: state.revision, pending: state.pending, diagnostic: state.diagnostic});
+      return copy({accepted: state.accepted, acceptedMany: state.acceptedMany || [], revision: state.revision, pending: state.pending, diagnostic: state.diagnostic});
     }
     projectedMembers(selection) {
       return selection.source.members.map(member => selection.members.get(member.key))
-        .filter(member => member?.status === 'available');
+        .filter(member => member && (member.status === 'available' || member.hasChildren));
     }
     reconcileFocus(state) {
       // Keyboard position belongs to the presentation's finite projection.
@@ -279,6 +317,7 @@
         return ['incarnation', 'generation', 'encounter', 'revision', 'evidence'].every(k => fresh[k] === ticket[k]);
       } catch { return false; }
     }
+    releaseCapture(invocation) { this.invocations.delete(invocation); }
     capture(refs, invocation) {
       if (this.invocations.has(invocation)) return this.invocations.get(invocation);
       if (this.invocations.size >= 128) fail('invocation-bound-exceeded');

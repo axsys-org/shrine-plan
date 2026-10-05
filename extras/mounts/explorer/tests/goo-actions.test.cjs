@@ -165,3 +165,43 @@ test('independent action owners may invoke the same control with their own worki
   assert.equal(forms[0].get('input:/req'),'first draft');assert.equal(forms[1].get('input:/req'),'other pane');
   gate.resolve(response({ok:true}));await Promise.all([a,b]);
 });
+
+test('shared captured activation cannot change protected evidence or arguments on retry',async()=>{
+  const bodies=[];const {actions}=setup((_url,options)=>{bodies.push(options.body.toString());return response({ok:true});});
+  const fixture=bindingFixture(actions),control=fixture.context.controls[0];
+  const captured=actions.captureActivation(fixture.container,fixture.context,control);
+  fixture.context.target='/different';fixture.input.value='later';
+  await actions.activateCaptured(captured,[['/gesture','{"kind":"move-nodes"}']]);
+  await actions.activateCaptured(captured,[['/gesture','{"kind":"move-nodes"}']]);
+  assert.equal(bodies.length,1);const form=new URLSearchParams(bodies[0]);
+  assert.equal(form.get('target'),'/item');assert.equal(form.get('input:/req'),'first draft');assert.equal(form.get('invocation'),captured.operationId);
+  await assert.rejects(actions.activateCaptured(captured,[['/gesture','changed']]),/arguments changed/);
+  await assert.rejects(actions.activateCaptured({...captured},[]),/Unknown captured/);
+});
+
+test('unknown operation survives owner disposal, reconciles later, and retry keeps exact ID',async()=>{
+  const bodies=[];let online=false;
+  const {actions}=setup((_url,options)=>{bodies.push(options.body.toString());if(!online)throw Error('offline');return response({ok:true});});
+  const fixture=bindingFixture(actions),captured=actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]);
+  const receipts=[];const stop=actions.subscribeOutcomes(r=>receipts.push(r));
+  await assert.rejects(actions.activateCaptured(captured),/Outcome unknown/);assert.equal(actions.outcome(captured.operationId).outcome,'unknown');
+  stop();online=true;await actions.activateCaptured(captured);assert.equal(actions.outcome(captured.operationId).outcome,'accepted');
+  assert.equal(receipts.length,1);assert.equal(new Set(bodies).size,1);
+});
+
+test('definite rejection is terminal; a server failure remains unknown',async()=>{
+  for(const status of [400,500]){
+    let calls=0;const {actions}=setup(()=>{calls++;return response({error:'Not committed?'},false,status);});
+    const fixture=bindingFixture(actions),captured=actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]);
+    await assert.rejects(actions.activateCaptured(captured));
+    assert.equal(actions.outcome(captured.operationId).outcome,status===400?'rejected':'unknown');
+    if(status===400){await assert.rejects(actions.activateCaptured(captured));assert.equal(calls,1);}
+  }
+});
+
+test('cancelled unsent capture releases common selection evidence without dispatch',async()=>{
+  const {actions,calls}=setup(()=>{throw Error('unexpected fetch');});const fixture=bindingFixture(actions);const released=[];
+  fixture.context.releaseCapture=id=>released.push(id);
+  const captured=actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]);actions.discardCaptured(captured);
+  await assert.rejects(actions.activateCaptured(captured),/Unknown captured/);assert.deepEqual(released,[captured.operationId]);assert.equal(calls.length,0);
+});

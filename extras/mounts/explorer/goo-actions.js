@@ -81,33 +81,104 @@
     const body = document.createElement('div'); body.className = 'goo-presentation'; body.innerHTML = data.html;
     section.append(body); return section;
   }
-  function mount(container, data, preserve = false, section = true) {
+  function prepareMount(container, data, preserve = false, section = true) {
     const next = section ? presentation(data) : document.createElement('div');
     if (!section) next.innerHTML = data.html;
-    const active = container.contains(document.activeElement) ? document.activeElement : null;
-    const selection = active?.tagName === 'INPUT' ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
-    const existing = preserve ? new Map([...container.querySelectorAll('input[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
-    for (const control of data.controls || []) if (control.kind === 'input') {
-      const input = [...next.querySelectorAll('input[data-node]')].find(element => element.dataset.node === control.id);
-      if (!input) continue;
-      input.dataset.inputSlot = control.slot;
-      const held = existing.get(control.slot);
-      if (!held) continue;
-      // Preserve the actual native control, including its working value/caret.
-      for (const attr of [...held.attributes]) if (!input.hasAttribute(attr.name)) held.removeAttribute(attr.name);
-      for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
-      input.replaceWith(held);
-    }
-    container.replaceChildren(...(section ? [next] : [...next.childNodes]));
-    container.dataset.renderContext = JSON.stringify(data.context);
-    container.dataset.profileRevision = data.profile?.revision || '';
-    container.gooDisplay = data.display;
-    if (active?.isConnected && document.activeElement !== active) {
-      active.focus({preventScroll:true});
-      if (selection && selection[0] !== null) active.setSelectionRange(...selection);
-    }
-    return section ? next : container;
+    // Preparation never moves a working input or touches the installed DOM.
+    return {proposed:next, commit() {
+      const active = container.contains(document.activeElement) ? document.activeElement : null;
+      const selection = active?.tagName === 'INPUT' ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
+      const existing = preserve ? new Map([...container.querySelectorAll('input[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
+      for (const control of data.controls || []) if (control.kind === 'input') {
+        const input = [...next.querySelectorAll('input[data-node]')].find(element => element.dataset.node === control.id);
+        if (!input) continue;
+        input.dataset.inputSlot = control.slot;
+        const held = existing.get(control.slot);
+        if (!held) continue;
+        for (const attr of [...held.attributes]) if (!input.hasAttribute(attr.name)) held.removeAttribute(attr.name);
+        for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
+        input.replaceWith(held);
+      }
+      container.replaceChildren(...(section ? [next] : [...next.childNodes]));
+      container.dataset.renderContext = JSON.stringify(data.context);
+      container.dataset.profileRevision = data.profile?.revision || '';
+      container.gooDisplay = data.display;
+      if (active?.isConnected && document.activeElement !== active) {
+        active.focus({preventScroll:true});
+        if (selection && selection[0] !== null) active.setSelectionRange(...selection);
+      }
+      return section ? next : container;
+    }};
   }
+  function mount(container, data, preserve = false, section = true) {
+    return prepareMount(container,data,preserve,section).commit();
+  }
+  // Shared activation boundary for native controls and direct-manipulation topoi.
+  // Protected receiver/publication/control evidence is captured once, before async work.
+  const activations = new WeakMap();
+  const outcomes = new Map();
+  const outcomeListeners = new Set();
+  function captureActivation(container, context, control) {
+    const operationId = crypto.randomUUID(), activationRef = crypto.randomUUID();
+    const captures = context.capture?.(control.captures || [], operationId) || [];
+    const snapshot = context.snapshot;
+    const body = new URLSearchParams({target:context.target,subject:snapshot.target,
+      view:context.view,control:control.control,expected:snapshot.expected,
+      displayed:snapshot.displayed,publication:snapshot.publication,invocation:operationId});
+    const savedInputs = new Map();
+    for (const input of container.querySelectorAll('input[data-input-slot]')) {
+      body.append(`input:${input.dataset.inputSlot}`,input.value);savedInputs.set(input.dataset.inputSlot,input.value);
+    }
+    for (const capture of captures) body.append(`input:${capture.slot}`,JSON.stringify(capture.value));
+    const handle = Object.freeze({operationId,activationRef});
+    activations.set(handle,{body:body.toString(),savedInputs,context,control});
+    return handle;
+  }
+  function discardCaptured(handle) {
+    const held=activations.get(handle);
+    if(held && held.arguments===undefined){held.context.releaseCapture?.(handle.operationId);activations.delete(handle);}
+  }
+  function recordOutcome(operationId, outcome, result) {
+    const previous=outcomes.get(operationId);
+    if(previous?.outcome==='accepted'||previous?.outcome==='rejected') return previous;
+    const receipt=Object.freeze({operationId,outcome,result});outcomes.set(operationId,receipt);
+    // Bound completed history; unresolved records are never described as failures.
+    while(outcomes.size>128){const key=[...outcomes].find(([,v])=>v.outcome!=='unknown')?.[0];if(!key)break;outcomes.delete(key);}
+    for(const listener of outcomeListeners){try{listener(receipt);}catch{/* A presentation listener cannot rewrite a recorded domain outcome. */}}return receipt;
+  }
+  async function activateCaptured(handle, inputs = []) {
+    const held=activations.get(handle);if(!held)throw new Error('Unknown captured activation');
+    const serialized=JSON.stringify(inputs);
+    if(held.arguments!==undefined&&held.arguments!==serialized)throw new Error('Captured invocation arguments changed');
+    if(held.promise)return held.promise;
+    if(held.result)return held.result;
+    if(held.rejection)throw held.rejection;
+    if(held.arguments===undefined){
+      if([...outcomes.values()].filter(v=>v.outcome==='unknown').length>=128)throw new Error('Unresolved invocation bound exceeded');
+      held.arguments=serialized;
+      const body=new URLSearchParams(held.body);
+      for(const [slot,value] of inputs){if(typeof slot!=='string'||typeof value!=='string')throw new Error('Invalid bound input');body.set(`input:${slot}`,value);}
+      held.body=body.toString();metrics.activations++;
+    }
+    held.promise=(async()=>{
+      let response;
+      try {
+        for(let attempt=0;attempt<2;attempt++){
+          try {metrics.dispatches++;response=await fetch('/goo/act',{method:'POST',body:new URLSearchParams(held.body)});break;}
+          catch(error){if(attempt)throw error;}
+        }
+        const result=await response.json();
+        if(!response.ok&&response.status>=500)throw new Error('Uncertain server outcome');
+        if(!response.ok){recordOutcome(handle.operationId,'rejected',result);held.context.releaseCapture?.(handle.operationId);held.rejection=Object.assign(new Error(result.error||'Action failed.'),{rejected:true});throw held.rejection;}
+        held.result={result,savedInputs:held.savedInputs};recordOutcome(handle.operationId,'accepted',result);held.context.releaseCapture?.(handle.operationId);return held.result;
+      } catch(error) {
+        if(!error.rejected){recordOutcome(handle.operationId,'unknown',null);throw Object.assign(new Error('Outcome unknown; reconcile before retrying.'),{code:'outcome-unknown'});}
+        throw error;
+      } finally {held.promise=null;}
+    })();
+    return held.promise;
+  }
+  function subscribeOutcomes(listener){outcomeListeners.add(listener);return ()=>outcomeListeners.delete(listener);}
   function bind(container, context) {
     const scope=context.actionScope || container;
     if(!pendingScopes.has(scope)) pendingScopes.set(scope,new Map());
@@ -133,35 +204,18 @@
         if (pendingActions.has(actionKey)) return;
         try {
           if (control.become && !control.invoke) { await context.become(control.slot); return; }
-          // Capture before any asynchronous work. The exact form and invocation
-          // identity are retained for network retry; no live selection operand.
-          metrics.activations++;
-          const invocation = crypto.randomUUID();
-          const captures = context.capture?.(control.captures || [], invocation) || [];
-          const snapshot = context.snapshot;
-          const body = new URLSearchParams({target: context.target, subject: snapshot.target,
-            view: context.view, control: control.control, expected: snapshot.expected,
-            displayed: snapshot.displayed, publication: snapshot.publication, invocation});
-          const savedInputs = new Map();
-          for (const input of container.querySelectorAll('input[data-input-slot]')) {
-            body.append(`input:${input.dataset.inputSlot}`, input.value); savedInputs.set(input.dataset.inputSlot, input.value);
-          }
-          for (const capture of captures) body.append(`input:${capture.slot}`, JSON.stringify(capture.value));
-          pending = {body:body.toString(),elements:new Map([[element,binding]])}; pendingActions.set(actionKey,pending); element.disabled = true;
+          const captured=captureActivation(container,context,control);
+          pending = {captured,elements:new Map([[element,binding]])}; pendingActions.set(actionKey,pending); element.disabled = true;
           context.report('Applying…');
-          let response;
-          for (let attempt = 0; attempt < 2; attempt++) {
-            try { metrics.dispatches++; response = await fetch('/goo/act', {method: 'POST', body: new URLSearchParams(pending.body)}); break; }
-            catch (error) { if (attempt) throw error; }
-          }
-          const result = await response.json();
-          if (!response.ok) throw new Error(result.error || 'Action failed.');
+          const held=pending;held.unsubscribe=subscribeOutcomes(receipt=>{if(receipt.operationId!==captured.operationId||receipt.outcome==='unknown')return;held.unsubscribe?.();held.unsubscribe=null;if(pendingActions.get(actionKey)===held){pendingActions.delete(actionKey);for(const [element,owner] of held.elements)if(bindings.get(element)===owner)element.disabled=false;}});
+          const {result,savedInputs}=await activateCaptured(captured);
           await context.saved?.(result, savedInputs);
           if (control.become) await context.become(control.slot);
           context.report('Saved.');
         } catch (error) { context.report(error.message); }
         finally {
-          if (pending && pendingActions.get(actionKey) === pending) {
+          if (pending && pendingActions.get(actionKey) === pending && outcomes.get(pending.captured.operationId)?.outcome!=='unknown') {
+            pending.unsubscribe?.();
             pendingActions.delete(actionKey);
             for(const [held,owner] of pending.elements) if(bindings.get(held)===owner) held.disabled=false;
           }
@@ -170,7 +224,7 @@
       }, {signal:binding.signal});
     }
   }
-  root.GooActions = {status, load, bind, context, observe, mount, presentation, metrics};
+  root.GooActions = {status, load, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
   async function start() {
     const main = document.querySelector('main[data-target]'); if (!main) return;
     const target = main.dataset.target, frames = new Map();

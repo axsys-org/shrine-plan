@@ -2,6 +2,8 @@
 (function(root) {
   'use strict';
   const renderers = new Set(['list', 'diagram_tree', 'list_tree']);
+  const hasOutline = (nodes, selection) => nodes.some(node => node.kind!=='selection' &&
+    ((node.renderer==='list_tree' && node.selection===selection) || hasOutline(node.children||[],selection)));
   function topology(members, renderer) {
     if (!renderers.has(renderer)) throw new Error('Unknown topos renderer');
     const byKey = new Map();
@@ -21,12 +23,73 @@
     }
     return byKey;
   }
+  // Materialization requests only; semantic membership remains in GooSession.
+  class TreeSource {
+    constructor(path, axis, fetchPage) {
+      this.path=path;this.axis=axis;this.fetchPage=fetchPage;this.requested=new Map();
+    }
+    request(member, more=false) {
+      const previous=this.requested.get(member.key);
+      const pages=previous?.life===member.life ? previous.pages : 0;
+      this.requested.set(member.key,{life:member.life,pages:more?Math.max(1,pages)+1:Math.max(1,pages)});
+    }
+    commit(source) {
+      const live=new Map(source.members.map(member=>[member.key,member.life]));
+      for(const [key,plan] of this.requested)if(live.get(key)!==plan.life)this.requested.delete(key);
+    }
+    async read(signal) {
+      const wanted=new Map(this.requested), records=new Map();
+      const first=await this.fetchPage({},signal);
+      const check=(page,parent)=> {
+        if(page.id!==this.path || page.axis!==this.axis || page.topology!=='tree' || !page.incremental ||
+           page.life!==first.life || page.epoch!==first.epoch || page.parent!==parent || !Array.isArray(page.members))
+          throw new Error('Tree page changed; refresh before continuing.');
+      };
+      const add=(page,parent,initial=false)=> {
+        check(page,parent);
+        if(page.members.length>(initial?65:64))throw new Error('Tree child page exceeds its bound.');
+        for(const member of page.members) {
+          const isRoot=initial && member.key===this.path && member.parent===null;
+          if(!isRoot && member.parent!==parent)throw new Error('Invalid tree child parent.');
+          if(records.has(member.key))throw new Error('Duplicate tree child.');
+          records.set(member.key,{...member,childrenLoaded:!member.hasChildren});
+        }
+        if(records.size>4096)throw new Error('Loaded tree exceeds 4096 nodes; inspect a smaller subtree.');
+      };
+      add(first,this.path,true);
+      if(!records.has(this.path))throw new Error('Missing tree root.');
+      const queue=[{parent:this.path,page:first}];
+      for(let index=0;index<queue.length;index++) {
+        const {parent,page}=queue[index], member=records.get(parent);
+        const plan=wanted.get(parent);
+        const desired=plan?.life===member.life?plan.pages:1;
+        let next=page.next, pages=1;
+        const cursors=new Set();
+        while(next && pages<desired) {
+          if(cursors.has(next))throw new Error('Repeated tree cursor.');cursors.add(next);
+          const continuation=await this.fetchPage({parent,after:next,epoch:first.epoch},signal);
+          add(continuation,parent);next=continuation.next;pages++;
+        }
+        member.childrenLoaded=true;member.moreChildren=!!next;
+        // Only explicitly expanded branches are requested; never recursively walk
+        // an unopened subtree. Parent order also drops requests for removed nodes.
+        for(const child of records.values()) {
+          if(child.parent!==parent || !child.hasChildren || wanted.get(child.key)?.life!==child.life)continue;
+          const page=await this.fetchPage({parent:child.key,epoch:first.epoch},signal);
+          add(page,child.key);queue.push({parent:child.key,page});
+        }
+      }
+      topology([...records.values()],'list_tree');
+      return {...first,members:[...records.values()]};
+    }
+  }
   const sameMember = (a, b) => !!a && !!b && ['key','life','source','sourceLife'].every(key => a[key] === b[key]) && (a.axis || 'z') === (b.axis || 'z');
-  const focusMember = (members, focused) => members.find(member => member.status === 'available' && sameMember(member, focused)) || members.find(member => member.status === 'available') || null;
+  const focusable = member => member && (member.status === 'available' || member.hasChildren);
+  const focusMember = (members, focused) => members.find(member => focusable(member) && sameMember(member, focused)) || members.find(focusable) || null;
   const interactive = event => !!event.target.closest('button,a,input,select,textarea,summary,[contenteditable],[data-goo-tree-interactive]');
   class Topos {
-    constructor(host, key, select, focus) {
-      this.host=host; this.key=key; this.select=select; this.focus=focus;
+    constructor(host, key, select, focus, loadChildren) {
+      this.host=host; this.key=key; this.select=select; this.focus=focus;this.loadChildren=loadChildren;
       this.items=new Map(); this.expanded=new Set(); this.lives=new Map(); this.renderer=null; this.members=new Map();
     }
     reconcile(renderer, members, content) {
@@ -47,6 +110,10 @@
           });
           this.body.addEventListener('goo-tree-toggle',event=> {
             event.detail.expanded ? this.expanded.add(event.detail.subject) : this.expanded.delete(event.detail.subject);
+            if(event.detail.expanded) {
+              const member=this.members.get(event.detail.subject);
+              if(member?.hasChildren && !member.childrenLoaded)this.load(member);
+            }
             this.scheduleFocus();
           });
           // WA restores a tab stop on its tree after blur. The adapter projects
@@ -81,7 +148,7 @@
           this.items.set(member.key,item);
           item.addEventListener('focusin',event=> {
             if(renderer==='list_tree' && event.composedPath?.().find(n=>n.tagName?.toLowerCase()==='wa-tree-item')!==item) return;
-            const m=this.members.get(member.key); if(m?.status==='available') this.focus(m);
+            const m=this.members.get(member.key); if(focusable(m)) this.focus(m);
           });
           if (renderer !== 'list_tree') {
             item.setAttribute('role','option');
@@ -106,7 +173,17 @@
           // set the attribute before insertion as well as the live property.
           item.toggleAttribute('expanded',expanded);
           if (item.expanded!==expanded) item.expanded=expanded;
-          item.disabled=member.status!=='available';
+          item.toggleAttribute('branch',!!member.hasChildren);
+          item.disabled=member.status!=='available' && !member.hasChildren;
+          if(member.moreChildren && this.loadChildren) {
+            if(!item.moreButton) {
+              item.moreButton=document.createElement('button');item.moreButton.type='button';
+              item.moreButton.textContent='Load more children';
+              item.moreButton.addEventListener('click',()=>this.load(this.members.get(member.key),true));
+              item.append(item.moreButton);
+            }
+            item.moreButton.setAttribute('aria-label',`Load more children of ${member.key}`);
+          } else {item.moreButton?.remove();item.moreButton=null;}
         } else {
           item.setAttribute('aria-disabled',String(member.status!=='available'));
         }
@@ -128,6 +205,17 @@
         this.scheduleFocus();
       }
     }
+    async load(member,more=false) {
+      const item=this.items.get(member?.key);
+      if(!item || item.loadingChildren || !this.loadChildren)return;
+      item.loadingChildren=true;item.setAttribute('aria-busy','true');
+      if(item.moreButton)item.moreButton.disabled=true;
+      try {await this.loadChildren(member,more);}
+      finally {
+        item.loadingChildren=false;item.removeAttribute('aria-busy');
+        if(item.moreButton)item.moreButton.disabled=false;
+      }
+    }
     choose(key) { const member=this.members.get(key); if(member?.status==='available') this.select(member); }
     paint(choice, focused) {
       this.choice=choice; this.focused=focused;
@@ -147,7 +235,7 @@
         return true;
       };
       while(member && !visible(member)) member=this.members.get(member.parent);
-      return member?.status==='available' ? member : members.find(m=>m.status==='available' && visible(m));
+      return focusable(member) ? member : members.find(m=>focusable(m) && visible(m));
     }
     syncFocus() {
       const target=this.tabStop();
@@ -181,6 +269,6 @@
       });
     }
   }
-  root.GooTopoi={Topos,topology,focusMember};
+  root.GooTopoi={Topos,TreeSource,topology,focusMember,hasOutline};
   if(typeof module!=='undefined') module.exports=root.GooTopoi;
 })(globalThis);

@@ -1,0 +1,152 @@
+- grove_app
+- goo_patch
+
+' A small real application: three boxes and at most one directed connection.
+' The saved resolved scene is this application's layout state, never browser state.
++ patch_demo
+  + field
+    \ name=str value=json
+    ^ json
+    | goo_runtime/json_field name value
+  + text
+    \ name=str value=json
+    ^ str
+    | goo_runtime/json_text (patch_demo/field name value)
+  + put
+    \ name=str value=json object=json
+    ^ json
+    ?> (json/obj fields) object jnull
+    | json/obj (fields.keep((\ entry !(eq entry.k name)))).snoc((jkv name value))
+  + read
+    \ text=str
+    ^ maybe[json]
+    ? (gt text.len 100000) .none
+    ?> (jres/ok value rest) (parse text) .none
+    | ./some value
+  + nodes
+    \ scene=json
+    ^ row[json]
+    | goo_patch/items (patch_demo/field "nodes" scene)
+  + node
+    \ scene=json target=json
+    ^ maybe[json]
+    = matches ((patch_demo/nodes scene).keep((\ node (eq (patch_demo/text "key" node) (patch_demo/text "node" target)))))
+    ? !(eq matches.len 1) .none
+    | ./some matches.at(0)
+  + port
+    \ scene=json target=json
+    ^ maybe[json]
+    < node (patch_demo/node scene target)
+    ? !(and (eq (patch_demo/text "kind" target) "port") (eq (patch_demo/text "nodeLifetime" target) (patch_demo/text "lifetime" node))) .none
+    = ports ((goo_patch/items (patch_demo/field "ports" node)).keep((\ port (eq (patch_demo/text "key" port) (patch_demo/text "port" target)))))
+    ? !(eq ports.len 1) .none
+    ? !(eq (patch_demo/text "lifetime" target) (patch_demo/text "lifetime" ports.at(0))) .none
+    | ./some ports.at(0)
+  + point
+    \ value=json
+    ^ maybe[json]
+    < x (goo_number/decode (patch_demo/field "x" value))
+    < y (goo_number/decode (patch_demo/field "y" value))
+    ? !(and (goo_fp/lte (goo/scalar 0) x) (goo_fp/lte x (goo_fp/integer 10000))) .none
+    ? !(and (goo_fp/lte (goo/scalar 0) y) (goo_fp/lte y (goo_fp/integer 10000))) .none
+    | ./some (json/obj [(jkv "x" (goo_number/encode x)) (jkv "y" (goo_number/encode y))])
+  + origin
+    \ scene=json target=json
+    ^ maybe[json]
+    < node (patch_demo/node scene target)
+    < port (patch_demo/port scene target)
+    = rect (patch_demo/field "rect" node) anchor (patch_demo/field "anchor" port)
+    < x (goo_number/decode (patch_demo/field "x" rect))
+    < y (goo_number/decode (patch_demo/field "y" rect))
+    < ax (goo_number/decode (patch_demo/field "x" anchor))
+    < ay (goo_number/decode (patch_demo/field "y" anchor))
+    | ./some (json/obj [(jkv "x" (goo_number/encode (goo_fp/plus x ax))) (jkv "y" (goo_number/encode (goo_fp/plus y ay)))])
+  + route
+    \ scene=json connection=json
+    ^ maybe[json]
+    = ends (goo_patch/items (patch_demo/field "endpoints" connection))
+    ? !(eq ends.len 2) .none
+    < a (patch_demo/origin scene (patch_demo/field "port" ends.at(0)))
+    < b (patch_demo/origin scene (patch_demo/field "port" ends.at(1)))
+    = end (\ key=str (json/obj [(jkv "kind" (json/str "endpoint")) (jkv "key" (json/str key))]))
+      command (\ op=str point=json (json/obj [(jkv "op" (json/str op)) (jkv "to" point)]))
+      segment (json/obj [(jkv "key" (json/str "route")) (jkv "from" (end "from")) (jkv "to" (end "to"))
+        (jkv "commands" (json/arr [(command "M" a) (command "L" b)])) (jkv "endMarker" (json/str "arrow"))])
+    | ./some (patch_demo/put "segments" (json/arr [segment]) connection)
+  + move
+    \ scene=json args=json
+    ^ maybe[json]
+    = changes (goo_patch/items (patch_demo/field "nodes" args))
+    ? ((eq changes.len 0) || (gt changes.len 3)) .none
+    % rest=row[json] changes nodes=row[json] (patch_demo/nodes scene) seen=row[str] []
+    ^ maybe[json]
+    ? (eq rest.len 0) (./some (patch_demo/put "nodes" (json/arr nodes) scene))
+    = change rest.at(0) target (patch_demo/field "target" change) key (patch_demo/text "node" target)
+    < node (patch_demo/node scene target)
+    ? ((seen.has(key)) || !(eq (patch_demo/text "kind" target) "node") || !(eq (patch_demo/text "lifetime" target) (patch_demo/text "lifetime" node))) .none
+    < base (patch_demo/point (patch_demo/field "baseOrigin" change))
+    < actual (patch_demo/point (patch_demo/field "rect" node))
+    ? !(equal[json] base actual) .none
+    < origin (patch_demo/point (patch_demo/field "proposedOrigin" change))
+    = rect (patch_demo/put "x" (patch_demo/field "x" origin) (patch_demo/field "rect" node))
+      rect (patch_demo/put "y" (patch_demo/field "y" origin) rect)
+      updated (patch_demo/put "rect" rect node)
+    | _ rest.drop(1) (nodes.map((\ n (? (eq (patch_demo/text "key" n) key) updated n)))) seen.snoc(key)
+  + edit
+    \ scene=json args=json
+    ^ maybe[json]
+    = kind (patch_demo/text "kind" args) connections (goo_patch/items (patch_demo/field "connections" scene))
+      header (patch_demo/field "header" scene)
+    ? (eq kind "move-nodes") (patch_demo/move scene args)
+    = connection=maybe[json]
+        ? (eq kind "connect")
+          ? !(eq connections.len 0) .none
+          < from (patch_demo/port scene (patch_demo/field "from" args))
+          < to (patch_demo/port scene (patch_demo/field "to" args))
+          ? !(and (eq (patch_demo/text "direction" from) "output") (eq (patch_demo/text "direction" to) "input")) .none
+          = endpoint (\ key=str port=json (json/obj [(jkv "key" (json/str key)) (jkv "port" port)]))
+            life (str/cat_all ["wire:" (show (patch_demo/field "viewSeq" header))])
+          | ./some (json/obj [(jkv "key" (json/str "wire")) (jkv "lifetime" (json/str life))
+              (jkv "selectorRef" (json/str "wire")) (jkv "topologyRef" (json/str life)) (jkv "z" (json/num .false 0))
+              (jkv "endpoints" (json/arr [(endpoint "from" (patch_demo/field "from" args)) (endpoint "to" (patch_demo/field "to" args))]))
+              (jkv "junctions" (json/arr [])) (jkv "parts" (json/arr [])) (jkv "labels" (json/arr []))
+              (jkv "reconnectable" (json/boo .true)) (jkv "disconnectable" (json/boo .true))])
+        ? !(eq connections.len 1) .none
+        = existing connections.at(0) target (patch_demo/field "connection" args)
+        ? !(and (eq (patch_demo/text "kind" target) "connection") (and (eq (patch_demo/text "connection" target) "wire") (eq (patch_demo/text "lifetime" target) (patch_demo/text "lifetime" existing)))) .none
+        ? !(eq (patch_demo/text "topologyRef" args) (patch_demo/text "topologyRef" existing)) .none
+        ? (eq kind "disconnect") (./some jnull)
+        ? !(eq kind "reconnect") .none
+        = endpoint (patch_demo/text "endpoint" args)
+        ? !((eq endpoint "from") || (eq endpoint "to")) .none
+        < port (patch_demo/port scene (patch_demo/field "to" args))
+        ? !(eq (patch_demo/text "direction" port) (? (eq endpoint "from") "output" "input")) .none
+        = endpoints (goo_patch/items (patch_demo/field "endpoints" existing))
+          endpoints (endpoints.map((\ end (? (eq (patch_demo/text "key" end) endpoint) (patch_demo/put "port" (patch_demo/field "to" args) end) end))))
+          updated (patch_demo/put "endpoints" (json/arr endpoints) existing)
+        | ./some (patch_demo/put "topologyRef" (json/str (str/cat_all ["topology:" (show (patch_demo/field "viewSeq" header))])) updated)
+    < connection connection
+    | ./some (patch_demo/put "connections" (json/arr (? (eq kind "disconnect") [] [connection])) scene)
+  + apply
+    \ operation=str current=str
+    ^ maybe[str]
+    < scene (patch_demo/read current)
+    < args (patch_demo/read operation)
+    < next (patch_demo/edit scene args)
+    = header (patch_demo/field "header" next)
+    ?> (json/num negative seq) (patch_demo/field "viewSeq" header) .none
+    ? negative .none
+    ? (ge seq 9007199254740991) .none
+    = header (patch_demo/put "viewSeq" (json/num .false seq.inc) header)
+      header (patch_demo/put "sourceRev" (json/str (nat/show seq.inc)) header)
+      header (patch_demo/put "layoutRev" (json/str (nat/show seq.inc)) header)
+      next (patch_demo/put "header" header next)
+      connections (goo_patch/items (patch_demo/field "connections" next))
+    % rest=row[json] connections routes=row[json] []
+    ^ maybe[str]
+    ? (eq rest.len 0) (./some (show (patch_demo/put "connections" (json/arr routes) next)))
+    < routed (patch_demo/route next rest.at(0))
+    | _ rest.drop(1) routes.snoc(routed)
+  + initial
+    ^ str
+    "{""header"":{""protocol"":1,""surface"":""patch"",""encounter"":""patch-board:1"",""viewSeq"":1,""sourceRev"":""source:1"",""layoutRev"":""layout:1"",""rendererEpoch"":""goo-renderer:1""},""extent"":{""x"":0,""y"":0,""width"":1000,""height"":550},""initialCamera"":{""kind"":""fit"",""paddingPx"":32},""policy"":{""minScale"":0.125,""maxScale"":4,""dragThresholdPx"":4,""touchDragThresholdPx"":8,""snapTolerancePx"":6,""portTolerancePx"":12,""touchPortTolerancePx"":22,""wireTolerancePx"":6,""alignmentSnap"":true,""autoPanBandPx"":32,""autoPanMaxPxPerSecond"":480},""offers"":{""moveNodes"":""move-nodes"",""connect"":""connect"",""reconnect"":""reconnect"",""disconnect"":""disconnect""},""nodes"":[{""key"":""source"",""lifetime"":""node-life:source"",""selectorRef"":""sel:source"",""rect"":{""x"":40,""y"":80,""width"":200,""height"":128},""z"":10,""presentation"":""node"",""draggable"":true,""ports"":[{""key"":""out"",""lifetime"":""port-life:source:out"",""selectorRef"":""sel:source:out"",""anchor"":{""x"":200,""y"":64},""outward"":{""x"":1,""y"":0},""hitRect"":{""x"":188,""y"":52,""width"":24,""height"":24},""direction"":""output"",""connectable"":true}]},{""key"":""transform"",""lifetime"":""node-life:transform"",""selectorRef"":""sel:transform"",""rect"":{""x"":360,""y"":56,""width"":240,""height"":200},""z"":10,""presentation"":""node"",""draggable"":true,""ports"":[{""key"":""in"",""lifetime"":""port-life:transform:in"",""selectorRef"":""sel:transform:in"",""anchor"":{""x"":0,""y"":72},""outward"":{""x"":-1,""y"":0},""hitRect"":{""x"":-12,""y"":60,""width"":24,""height"":24},""direction"":""input"",""connectable"":true},{""key"":""state"",""lifetime"":""port-life:transform:state"",""selectorRef"":""sel:transform:state"",""anchor"":{""x"":0,""y"":144},""outward"":{""x"":-1,""y"":0},""hitRect"":{""x"":-12,""y"":132,""width"":24,""height"":24},""direction"":""input"",""connectable"":true},{""key"":""out"",""lifetime"":""port-life:transform:out"",""selectorRef"":""sel:transform:out"",""anchor"":{""x"":240,""y"":96},""outward"":{""x"":1,""y"":0},""hitRect"":{""x"":228,""y"":84,""width"":24,""height"":24},""direction"":""output"",""connectable"":true}]},{""key"":""sink"",""lifetime"":""node-life:sink"",""selectorRef"":""sel:sink"",""rect"":{""x"":740,""y"":112,""width"":200,""height"":160},""z"":10,""presentation"":""node"",""draggable"":true,""ports"":[{""key"":""in"",""lifetime"":""port-life:sink:in"",""selectorRef"":""sel:sink:in"",""anchor"":{""x"":0,""y"":48},""outward"":{""x"":-1,""y"":0},""hitRect"":{""x"":-12,""y"":36,""width"":24,""height"":24},""direction"":""input"",""connectable"":true},{""key"":""preview"",""lifetime"":""port-life:sink:preview"",""selectorRef"":""sel:sink:preview"",""anchor"":{""x"":0,""y"":112},""outward"":{""x"":-1,""y"":0},""hitRect"":{""x"":-12,""y"":100,""width"":24,""height"":24},""direction"":""input"",""connectable"":true}]}],""connections"":[]}"

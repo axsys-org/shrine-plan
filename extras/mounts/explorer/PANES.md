@@ -387,14 +387,22 @@ action regression suites.
 `list`, `diagram_tree`, and `list_tree` are presentations of one keyed topos.
 They share selection ports, source evidence, member views, and capture semantics.
 A renderer change does not replace the semantic owner. Tree sources opt in with
-`selection(..., topology = "tree")`; the root and descendants are bounded at
-64 physical nodes. The runtime walks the child index with a cutoff and emits
-parent references. Disclosure and camera state never call domain actions.
+`selection(..., topology = "tree")`. Sources consumed by an outline (`list_tree`)
+use immediate-child pages
+of at most 64 members, materializes branches on disclosure, and offers a native
+continuation button for wide branches. The root's first page also includes the
+root itself. Each page carries parent, continuation, branch hints and a namespace
+epoch; continuations cannot escape their source or mix epochs. Loaded material
+is bounded at 4096 nodes per tree source and uses the existing selection owner,
+input guards and refresh cancellation. Standalone diagram/flat presentations and
+the legacy complete-source endpoint keep their complete, 64-member projection.
+Views sharing an outline's selection see the same materialized source.
+Disclosure and camera state never call domain actions.
 
 `goo-topoi.js` adapts native lists, Mash `goo-tree`, and Mash `goo-tidy-tree`.
 The explorer builds its own pinned component bundle, so selecting the debugger
-mount is unnecessary. `extras/flake.nix` pins the profile-enabled Mash revision
-`e6b81238d81242f9f053e21d9b498d84f5129383` without dependency overrides.
+mount is unnecessary. `extras/flake.nix` pins the profile- and patch-enabled Mash revision
+`16b8a9079e8a45dc2681cf3210e1d186e5cbe622` without dependency overrides.
 Production asset builds verify the vendored profile against that Nix artifact.
 
 The application gate installs the test-only `panes` fixture; `topoi_demo` shows a

@@ -57,6 +57,20 @@ class ProfileIntegrityTests(unittest.TestCase):
             SYNC.canonical({"z":1e-7,"b":[14.0,-0.0,-0.65,1.48],"a":1e-5}),
         )
 
+    def test_browser_profile_links_resolve_to_the_vendored_profile(self):
+        # Browsers fetch these paths over HTTP. They must stay symlinks into the
+        # single vendored profile so the served contract cannot diverge from the
+        # verified bundle that produced the layout. A missing or re-pointed link
+        # (broken by a partial checkout or a profile bump) must fail the check.
+        for link in SYNC.browser_profile_links():
+            self.assertTrue(link.is_symlink(), f"browser profile is not a symlink: {link}")
+            name = "profile.css" if link.name.endswith(".css") else "profile.json"
+            source = SYNC.VENDOR / name
+            self.assertTrue(source.is_file(), source)
+            self.assertEqual(link.resolve(), source.resolve(),
+                             f"browser profile link does not resolve to the vendored profile: {link}")
+        SYNC.check_browser_profile_links()
+
 
 if __name__ == "__main__":
     unittest.main()

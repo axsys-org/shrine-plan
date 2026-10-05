@@ -11,10 +11,15 @@ WISP=/path/to/wisp python3 x/eden --compiler none --mount goo-inspector --mount 
 Open `http://127.0.0.1:8178/goo-inspector?path=/0x11/app/srs/cards`.
 The address form and Parent/Browse children links perform ordinary navigation.
 Select a row to inspect its synthetic values. Local selection never invokes a
-domain action. The tree includes the selected root and descendants on `z`, up to
-64 nodes. Structural paths can be expanded; records can be selected. A leaf can
-be inspected directly. Larger trees report a source bound error; navigate to a
-smaller subtree. Change `axis = "z"` to `"y"` in the workspace's `selection` to
+domain action. The tree initially loads the root and up to 64 immediate children
+on `z`. Expanding a branch loads its children; a **Load more children** button
+fetches the next sibling page. Structural paths remain expandable even when they
+have no record to select. Collapse/reopen retains loaded nodes and selection.
+Pages share a namespace epoch; a changed epoch rejects the update and retains
+the displayed tree. Refresh or expand again to retry. The session retains up to
+4096 materialized nodes; inspect a smaller subtree if that limit is reached.
+Keys without a Goo path spelling report an error instead of hanging the request;
+the physical debugger can inspect those keys. Change `axis = "z"` to `"y"` in the workspace's `selection` to
 show only the nearest-record frontier.
 
 

@@ -184,6 +184,65 @@
     \ query=goo_runtime/request state=namespace
     ^ str
     | goo_runtime/projected_source .true query state
+  + input_text
+    \ key=str query=goo_runtime/request
+    ^ str
+    = values query.inputs.keep((\ [name value] (eq name key)))
+    ? !(eq values.len 1) ""
+    = [name value] values.at(0)
+    value
+  + printable_path
+    \ path=path
+    ^ bool
+    ? (Try path_show path)
+     > (./ok _) .true
+     > (./err _) .false
+  + tree_page
+    ' Page only immediate children. Continuations are tied to one namespace epoch.
+    \ query=goo_runtime/request state=namespace
+    ^ either[str str]
+    = source query.target axis (goo_runtime/axis query)
+      parent_text (goo_runtime/input_text "$parent" query)
+      after_text (goo_runtime/input_text "$after" query)
+      epoch (nat/show state.local.rec.len)
+      expected (goo_runtime/input_text "$epoch" query)
+    ?> (./some parent) (path_parse (? parent_text.len parent_text (path_show source))) (./err "Invalid tree parent.")
+    ? !(pith_prefix source parent) (./err "Tree parent is outside its source.")
+    ? (and expected.len !(eq expected epoch)) (./err "Tree changed; refresh its children.")
+    ? (and after_text.len !(expected.len)) (./err "Tree continuation requires its epoch.")
+    = projected (goo_runtime/projection axis source state)
+      subtree projected.dip(parent.drop(source.len))
+      after=maybe[path]
+        ? !(after_text.len) .none
+        | path_parse after_text
+    ? (and after_text.len (maybe/is_none after)) (./err "Invalid tree cursor.")
+    ? (after.run((\ path !(and (eq path.len parent.len.inc) (pith_prefix parent path)))).fall(.false))
+      | ./err "Tree cursor is outside its parent."
+    ? !(subtree.wyt) (./err "Tree parent is unavailable.")
+    = selected subtree.kid.range_after(after.run((\ path path.at(parent.len))) 65)
+      count (? (gt selected.len 64) 64 selected.len)
+      paths=row[path] (selected.take(count).map((\ entry parent.snoc(entry.key))))
+    ? !(paths.all(goo_runtime/printable_path))
+      | ./err "Tree contains a key without a Goo path spelling; use the physical debugger for that branch."
+    =
+      describe
+        \ path=path node=axal[myth]
+        ^ json
+        = member (goo_runtime/member_status (maybe/is_some node.fil) source path state)
+        ?> (json/obj fields) member member
+        | json/obj fields.weld([(jkv "axis" (json/str axis)) (jkv "topology" (json/str "tree"))
+            (jkv "parent" (? (equal path source) jnull (json/str (path_show path.take(path.len.dec)))))
+            (jkv "hasChildren" (json/boo (gt node.kid.size 0)))])
+      members (selected.take(count).map((\ entry (describe parent.snoc(entry.key) (unpin entry.val.held)))))
+      members (? (and !(parent_text.len) !(after_text.len)) members.cons((describe source projected)) members)
+      next (? (gt selected.len 64) (json/str (path_show parent.snoc(selected.at(count.dec).key))) jnull)
+    | ./ok (show (json/obj [(jkv "id" (json/str (path_show source)))
+        (jkv "life" (json/str (nat/show (goo_runtime/lifetime source state))))
+        (jkv "type" (json/str "namespace-record")) (jkv "axis" (json/str axis))
+        (jkv "topology" (json/str "tree")) (jkv "incremental" (json/boo .true))
+        (jkv "bounded" (json/boo .true)) (jkv "epoch" (json/str epoch))
+        (jkv "parent" (json/str (path_show parent))) (jkv "next" next)
+        (jkv "members" (json/arr members))]))
   + status
     \ query=goo_runtime/request state=namespace
     ^ str
@@ -193,7 +252,9 @@
          > (./some target) (state.case(.x target)).fall(0)
         0
     | show (json/obj
-      [(jkv "life" (json/str (nat/show (goo_runtime/lifetime query.target state))))
+      [(jkv "projectionSeq" (json/num .false state.local.rec.len))
+       (jkv "coveredOperationIds" (json/arr ((goo_runtime/journal state).keep((\ entry (equal entry.request.target query.target))).map((\ entry (json/str entry.identity))).row)))
+       (jkv "life" (json/str (nat/show (goo_runtime/lifetime query.target state))))
        (jkv "subject" (json/str (path_show query.target)))
        (jkv "target" (json/str (path_show target.fall([]))))
        (jkv "expected" (json/str (nat/show expected)))
@@ -346,8 +407,7 @@
       projected (goo_runtime/projection axis source state)
       belongs=bool
         ? !tree (and (and (eq subject.len source.len.inc) (pith_prefix source subject)) (maybe/is_some projected.dip(subject.drop(source.len)).fil))
-        = members (goo_runtime/projected_paths projected source)
-        | and (le members.len 64) (and members.has(subject) (maybe/is_some projected.dip(subject.drop(source.len)).fil))
+        | and (pith_prefix source subject) (maybe/is_some projected.dip(subject.drop(source.len)).fil)
     ? !belongs
       | ./err "Capture is not a member of its finite source."
     ? !(and (state.permitted(subject)) (pith_prefix [state.self 'app] subject))
@@ -510,6 +570,24 @@
   + receipt_slot
     ^ path
     ['sys 'goo 'receipts]
+  + journal
+    \ state=namespace
+    ^ list[goo_runtime/receipt]
+    = record (goo_runtime/record .x [state.self 'weft 'goo_receipts] state).fall(myth/new)
+    ?> (./some held) record.get(goo_runtime/receipt_slot) .nil
+    ?> receipts=goo_runtime/receipts held .nil
+    receipts.entries
+  + operation_status
+    \ query=goo_runtime/request state=namespace
+    ^ str
+    = ids (query.inputs.keep((\ [key value] (eq key "$invocation"))))
+      identity=str
+        ? !(eq ids.len 1) ""
+        = [key value] ids.at(0)
+        value
+      matches ((goo_runtime/journal state).keep((\ entry (and (eq entry.identity identity) (equal entry.request.target query.target)))))
+    | show (json/obj [(jkv "operationId" (json/str identity))
+        (jkv "outcome" (json/str (? matches.is_nil "unknown" "accepted")))])
   + act
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]
@@ -545,7 +623,12 @@
   + run
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]
+    ? (eq query.operation "operation-status") [state 200 (goo_runtime/operation_status query state)]
     ? (eq query.operation "status") [state 200 (goo_runtime/status query state)]
+    ? (eq query.operation "tree-page")
+      ? (goo_runtime/tree_page query state)
+       > (./ok body) [state 200 body]
+       > (./err why) [state 409 why]
     ? (eq query.operation "tree-source") [state 200 (goo_runtime/tree_source query state)]
     ? (eq query.operation "source") [state 200 (goo_runtime/source query state)]
     ? !(eq query.operation "act") [state 400 "{}"]

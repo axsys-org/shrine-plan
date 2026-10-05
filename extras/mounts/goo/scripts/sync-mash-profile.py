@@ -2,7 +2,8 @@
 """Vendor a verified Mash renderer profile and generate Goo's native constants.
 
 An update requires --mash-root explicitly. --check is entirely repository-local;
-it checks the complete vendored bundle and the Foil constants derived from it.
+it checks the complete vendored bundle, the Foil constants derived from it, and
+the browser-facing profile links that serve that bundle over HTTP.
 """
 from __future__ import annotations
 
@@ -152,6 +153,39 @@ def generate(profile):
     return "\n".join(out) + "\n"
 
 
+def browser_profile_links():
+    """The paths browsers fetch to get the profile over HTTP.
+
+    These are symlinks into the single vendored profile directory (the Goo
+    static tree and the Explorer consumer both serve them). Keeping them as
+    symlinks is what guarantees the served contract can never diverge from the
+    verified bundle that produced the server-side preparation.
+    """
+    explorer = ROOT.parents[1] / "mounts" / "explorer"
+    return [
+        ROOT / "static" / "goo-profile.css",
+        ROOT / "static" / "goo-profile.json",
+        explorer / "goo-profile.css",
+        explorer / "goo-profile.json",
+    ]
+
+
+def check_browser_profile_links(profile=VENDOR):
+    """Guard the browser-facing profile against a missing or re-pointed link.
+
+    A profile bump or a partial checkout can leave one of these links broken or
+    pointing elsewhere; that would let the browser serve a stale or absent
+    profile while preparation uses the current bundle. Each link must remain a
+    symlink that resolves to the corresponding vendored profile file.
+    """
+    for link in browser_profile_links():
+        if not link.is_symlink():
+            raise ValueError(f"browser profile must be a symlink into the vendored profile: {link}")
+        source = profile / ("profile.css" if link.name.endswith(".css") else "profile.json")
+        if not source.is_file() or link.resolve() != source.resolve():
+            raise ValueError(f"browser profile link does not resolve to the vendored profile: {link} -> {link.resolve()}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mash-root", type=pathlib.Path, help="explicit Mash checkout containing packages/goo-profile/dist")
@@ -192,6 +226,8 @@ def main():
         else:
             target.write_text(generated)
         subprocess.run([sys.executable, str(ROOT / "scripts/generate-fonts.py"), *(["--check"] if args.check else [])], check=True)
+        if args.check:
+            check_browser_profile_links()
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Mash Goo profile: {error}\n")
     print(f"Mash Goo profile verified: {profile['id']} v{profile['version']} {profile['revision']}")

@@ -167,3 +167,39 @@ test('cancelled retirement never mutates accepted owners even when a custom guar
  gate.resolve(true);await Promise.resolve();await Promise.resolve();
  assert.equal(s.get(follow.ref),follow);assert.equal(sel.accepted.key,'A');
 });
+
+test('group selection reuses owner ordering, guards, membership and retention', async()=>{
+ const s=new GooSession();
+ const describe=members=>[{kind:'selection',key:'many',multiple:true,source:source(members),children:[]}];
+ await s.reconcile(describe([A,B,C]));const sel=state(s,'selection');
+ const old=s.intentMany(sel.ref,[A]);const current=s.intentMany(sel.ref,[A,B]);
+ assert.equal((await s.deliver(old)).status,'superseded');
+ assert.equal((await s.deliver(current)).status,'accepted');
+ assert.deepEqual(s.read(sel.ref).acceptedMany.map(m=>m.key),['A','B']);
+ const unguard=s.guard(sel.ref,()=>false);
+ assert.equal((await s.deliver(s.intentMany(sel.ref,[C]))).status,'refused');unguard();
+ await s.deliver(s.intentMany(sel.ref,[A],'toggle'));
+ assert.deepEqual(s.read(sel.ref).acceptedMany.map(m=>m.key),['B']);
+ await s.reconcile(describe([A,C]));assert.equal(s.read(sel.ref).acceptedMany[0].key,'B');
+ await s.reconcile(describe([A,member('B','B','2'),C]));
+ assert.equal(s.read(sel.ref).acceptedMany[0].status,'unavailable');
+ await assert.rejects(s.deliver(s.intentMany(sel.ref,[B])),/stale-member/);
+});
+
+test('incremental tree materialization preserves selection and draft work beyond one page',async()=>{
+ const members=Array.from({length:130},(_,i)=>({...member('n'+i),parent:i? 'n0':null,hasChildren:i===0}));
+ const describe=items=>{const d=description(null,items);Object.assign(d[0].children[0].source,{incremental:true,topology:'tree'});return d;};
+ const s=new GooSession();await s.reconcile(describe(members.slice(0,65)));
+ const sel=state(s,'selection'),follow=state(s,'follow');
+ await select(s,sel,members[4]);const encounter=follow.encounter;
+ follow.inputs.set('/draft',{value:'unsaved',dirty:true});let departures=0;
+ s.guard(follow.ref,()=>{departures++;return false;});
+ await s.reconcile(describe(members));
+ assert.equal(sel.accepted.key,'n4');assert.equal(follow.encounter,encounter);
+ assert.equal(follow.inputs.get('/draft').value,'unsaved');assert.equal(departures,0);
+ const structural={...members[0],status:'unavailable'};
+ await s.reconcile(describe([structural,...members.slice(1)]));
+ s.focus(state(s,'list').ref,structural);
+ await assert.rejects(select(s,sel,structural),/unavailable-member/);
+ const ordinary=description(null,members);await assert.rejects(s.reconcile(ordinary),/source-bound-exceeded/);
+});

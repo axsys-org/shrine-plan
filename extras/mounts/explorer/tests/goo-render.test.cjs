@@ -160,9 +160,10 @@ test('follow still rejects a response for the wrong displayed subject', async()=
 test('virtual and structural sources need no physical lifetime', async()=> {
  const {controller,context}=await setup(); let requested;
  context.URLSearchParams=URLSearchParams;
- const value={id:'/h/z/1/1/root',life:'0',bounded:true,axis:'y',type:'namespace-record',members:[]};
+ const value={id:'/h/z/1/1/root',life:'0',bounded:true,axis:'y',type:'namespace-record',topology:'tree',incremental:true,epoch:'1',parent:'/h/z/1/1/root',next:null,members:[{key:'/h/z/1/1/root',parent:null,life:'0',hasChildren:false}]};
  context.fetch=async url=>{requested=url;return {ok:true,json:async()=>value};};
- assert.equal(await controller.source(value.id,'tree','y'),value);
+ assert.equal((await controller.source(value.id,'tree','y')).life,'0');
+ assert.match(requested,/paged=1/);
  assert.match(requested,/axis=y/);
 });
 

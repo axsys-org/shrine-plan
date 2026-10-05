@@ -15,6 +15,9 @@ def prepare(root, work, check, cleanup, context):
     subprocess.run(['nix', '--extra-experimental-features', 'nix-command flakes',
                     'develop', '--no-update-lock-file', f'path:{root.parent.parent}#debugger',
                     '--command', 'node', str(root / 'build-topoi.mjs'), str(bag)], check=True)
+    subprocess.run(['nix', '--extra-experimental-features', 'nix-command flakes',
+                    'develop', '--no-update-lock-file', f'path:{root.parent.parent}#debugger',
+                    '--command', 'node', str(root / 'build-patch.mjs'), str(bag)], check=True)
     return bag, []
 
 

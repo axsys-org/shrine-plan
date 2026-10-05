@@ -3,7 +3,7 @@
   inputs.mash = {
     type = "git";
     url = "https://github.com/axsys-org/mash.git";
-    rev = "e6b81238d81242f9f053e21d9b498d84f5129383";
+    rev = "16b8a9079e8a45dc2681cf3210e1d186e5cbe622";
     allRefs = true;
     inputs.nixpkgs.follows = "nixpkgs";
   };

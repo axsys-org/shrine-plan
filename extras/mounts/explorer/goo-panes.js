@@ -8,6 +8,7 @@
   class GooPanes {
     constructor(host, context) {
       this.host = host; this.context = context; this.session = new root.GooSession();
+      this.treeSources = new Map();
       this.elements = new Map(); this.wrappers = new Map(); this.loading = new Map(); this.rendered = new Map(); this.serial = 0;
       this.observations=new Map(); this.requests=new Map(); this.nativeWorks=new Map(); this.rowWorks=new Map();
       this.context.workspace ||= host.dataset.workspace; this.context.view ||= host.dataset.view;
@@ -20,7 +21,20 @@
       this.session.subscribe(() => { if (!this.updating) this.paint(); });
       this.inspection.addEventListener('toggle', () => this.reflect());
     }
-    async source(path, topology = '', axis = 'z', signal) {
+    async source(path, topology = '', axis = 'z', signal, incremental = true) {
+      if(topology==='tree' && incremental) {
+        const key=JSON.stringify([path,axis]);
+        let loader=this.treeSources.get(key);
+        if(!loader) {
+          loader=new root.GooTopoi.TreeSource(path,axis,async(params,signal)=> {
+            const response=await fetch(`/goo/source?${new URLSearchParams({target:path,topology:'tree',axis,paged:'1',...params})}`,{cache:'no-store',signal});
+            if(!response.ok)throw new Error(await response.text());
+            return response.json();
+          });
+          this.treeSources.set(key,loader);
+        }
+        return loader.read(signal);
+      }
       const response = await fetch(`/goo/source?${new URLSearchParams({target: path, topology, axis: axis || 'z'})}`, {cache: 'no-store',signal});
       if (!response.ok) throw new Error('Source unavailable');
       const value = await response.json();
@@ -34,18 +48,23 @@
       if (this.composing()) {
         this.deferredUpdate = [description, snapshot,options]; return {status:'deferred'};
       }
-      const sources = new Map();
+      const sources = new Map(), sourceValues = new Map();
       this.memberLoads = new Map();
       const prepare = async nodes => Promise.all(nodes.map(async node => {
         const out = {...node, children: await prepare(node.children || [])};
         if (node.kind === 'selection') {
-          const key = JSON.stringify([node.source,node.topology,node.axis]);
-          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis,signal));
+          // Only an outline provides disclosure. Standalone diagram/flat views
+          // keep their complete-source behavior; shared views use its projection.
+          const incremental=root.GooTopoi.hasOutline(node.children||[],node.key);
+          const key = JSON.stringify([node.source,node.topology,node.axis,incremental]);
+          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis,signal,incremental));
           out.source = await sources.get(key);
+          sourceValues.set(key,out.source);
           if (node.initial != null) {
             out.initial = out.source.members.find(m => m.key === node.initial) || {key: node.initial};
           }
         }
+        if (node.kind === 'patch') out.children = root.GooPatchHost.population(node);
         if (['list','topos'].includes(node.kind)) out.type = 'namespace-record';
         return out;
       }));
@@ -65,6 +84,14 @@
       try { result = await this.session.reconcile(nodes,{signal}); } finally { this.updating--; }
       if(!current())return {status:'superseded'};
       if(result.status!=='accepted')return {status:result.status};
+      const trees=new Set();
+      for(const source of sourceValues.values()) {
+        if(source.incremental) {
+          const key=JSON.stringify([source.id,source.axis||'z']);trees.add(key);
+          this.treeSources.get(key)?.commit(source);
+        }
+      }
+      for(const key of this.treeSources.keys())if(!trees.has(key))this.treeSources.delete(key);
       for (const work of retiringWork) work.release?.();
       this.snapshot = snapshot; this.description = nodes; this.rawDescription=description;
       this.usedWrappers = new Set();
@@ -91,7 +118,11 @@
       const visit=(nodes,owner='session',scopes=[],route=[])=>{
         for(const [ordinal,node] of nodes.entries()) {
           const here=[...route,ordinal], key=id(owner,node.kind,node.key);
-          if(node.kind==='native') nativeKeys.add(this.wrapperKey(owner,node,scopes,here.join('.')));
+          if(['native','patch'].includes(node.kind)) {
+            const wrapper=this.wrapperKey(owner,node,scopes,here.join('.'));
+            const prior=[...this.nativeWorks.values()].find(work=>work.wrapperKey===wrapper);
+            if(node.kind!=='patch'||!prior||prior.encounter?.id===node.scene.header.encounter)nativeKeys.add(wrapper);
+          }
           visit(node.children||[],node.kind==='pane'?key:owner,node.kind==='selection'?[...scopes,key]:scopes,here);
         }
       };
@@ -138,7 +169,9 @@
           nextScopes = [...scopes, state];
           if (!state.notice) { state.notice = el('p', 'goo-local-status'); element.prepend(state.notice); }
         }
-        if (node.kind === 'native') {
+        if (node.kind === 'patch') {
+          root.GooPatchHost.render(this,node,element,scopes,owner);
+        } else if (node.kind === 'native') {
           this.native(node,element,scopes,owner,adopted);
         } else if (['navigate','operation','operation_status'].includes(node.kind)) {
           if (!adopted && !state.hostBound) element.innerHTML = node.html;
@@ -295,7 +328,17 @@
         const clear=el('button','','Clear selection'); clear.type='button'; clear.addEventListener('click',()=>this.select(state,null));
         state.rows=new Map(); state.serverRows=new Map([...element.querySelectorAll('[data-goo-members] > [data-key]')].map(row=>[row.dataset.key,row]));
         element.replaceChildren(clear);
-        state.topos=new root.GooTopoi.Topos(element,node.key,member=>this.select(state,member),member=>this.session.focus(state.ref,member));
+        state.topos=new root.GooTopoi.Topos(element,node.key,member=>this.select(state,member),member=>this.session.focus(state.ref,member),async(member,more)=> {
+          const loader=this.treeSources.get(JSON.stringify([source.id,source.axis||'z']));
+          if(!loader || !state.live)return;
+          loader.request(member,more);
+          // Shared refresh owns cancellation, input guards, composition and source
+          // admission; child materialization has no independent application state.
+          try {
+            if(this.context.refresh)await this.context.refresh();
+            else await this.update(this.rawDescription,this.snapshot);
+          }catch(error){this.context.report(error.message);}
+        });
       }
       const renderer=node.renderer||'list';
       const projected=source.members.map(member=>selection.members.get(member.key)||member);
@@ -308,7 +351,7 @@
           row?.remove(); row=state.serverRows.get(member.key)||el('div','goo-member',member.key); state.serverRows.delete(member.key);
           row.dataset.life=member.life; row.dataset.key=member.key; state.rows.set(member.key,row);
         }
-        if(member.status!=='available') { row.textContent=`${member.key}: unavailable`; return row; }
+        if(member.status!=='available') { row.textContent=member.hasChildren?member.key:`${member.key}: unavailable`; return row; }
         let work=this.rowWorks.get(row);
         if(!work) {
           const binding=JSON.stringify([member.source,member.sourceLife,member.axis||'z',member.key,member.life,member.subject,node.slot]);
@@ -351,6 +394,11 @@
         return row;
       });
     }
+    registerPatchSurface(surface, work) {
+      if(!work.live) throw new Error('Retired patch owner');
+      work.patchSurfaces ||= new Set();work.patchSurfaces.add(surface);
+      return ()=>work.patchSurfaces.delete(surface);
+    }
     registerWork(state, element) {
       if(state.release) return;
       state.guards ||= new Set();
@@ -386,14 +434,15 @@
       state.release=()=>{
         if(released) return;released=true;
         state.departure?.finish(false);state.live=false;state.generation++;
+        for(const surface of state.patchSurfaces||[])surface.retire();state.patchSurfaces?.clear();
         unguard();unregister();state.guards.delete(guard);state.inputs.clear();element.remove();
         this.requests.get(element)?.abort();this.requests.delete(element);
         this.observations.get(element)?.stop();this.observations.delete(element);
         this.nativeWorks.delete(element);this.rowWorks.delete(element);this.loading.delete(state.id);this.rendered.delete(state.id);
       };
       const resource={
-        suspend: () => { for (const media of element.querySelectorAll('video,audio')) media.pause(); },
-        resume: () => { this.rendered.delete(state.id); },
+        suspend: () => { for(const surface of state.patchSurfaces||[])surface.suspend(); for (const media of element.querySelectorAll('video,audio')) media.pause(); },
+        resume: () => { for(const surface of state.patchSurfaces||[])surface.resume(); this.rendered.delete(state.id); },
         release: state.release
       };
       if(state.ref) unregister=this.session.resource(state.ref,resource);
@@ -411,9 +460,11 @@
           input.addEventListener('input', () => { work.value = input.value; work.dirty = true; this.reflect(); },{signal});
           input.addEventListener('compositionstart', () => { work.composing = true; },{signal});
           input.addEventListener('compositionend', () => { work.value = input.value; work.composing = false;
+            for(const surface of follower.patchSurfaces||[])surface.flushDeferred();
             if (this.deferredUpdate) { const args = this.deferredUpdate; this.deferredUpdate = null; this.update(...args).catch(e=>this.context.report(e.message)); }
             else { this.paint(); for (const held of this.observations.values()) Promise.resolve(held.callback()).catch(e=>this.context.report(e.message)); } },{signal});
         },
+        releaseCapture: invocation => this.session.releaseCapture(invocation),
         capture: (operands, invocation) => {
           const refs = operands.map(op => {
             const state = [...scopes].reverse().find(s => s.key === op.selection);
