@@ -27,7 +27,12 @@ page.on('response', async response => {
     return;
   }
   if (new URL(response.url()).pathname !== '/goo/render') return;
-  try { renders.push({request:Object.fromEntries(new URLSearchParams(response.request().postData())),status:response.status(),body:await response.json()}); } catch {}
+  try {
+    const request=Object.fromEntries(new URLSearchParams(response.request().postData()));
+    const packet=await response.json();
+    const body=packet.layouts?.findLast(entry=>entry.render.context.width<=Number(request.width))?.render || packet;
+    renders.push({request,status:response.status(),body});
+  } catch {}
 });
 await page.addInitScript(() => {
   // Observe actual session instances without replacing their behavior.
@@ -82,7 +87,7 @@ async function assertGeometry() {
   }));
   lastGeometry=widths;
   assert(widths.length>0,'Expected a mounted portable display');
-  assert(widths.every(({available,prepared})=>Math.abs(available-prepared)<.75),JSON.stringify(widths));
+  assert(widths.every(({available,prepared})=>prepared>0 && prepared<=available+.75),JSON.stringify(widths));
 }
 
 try {

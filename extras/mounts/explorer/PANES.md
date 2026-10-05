@@ -382,6 +382,48 @@ it does not implicitly navigate or select the new object.
 form has been removed; creation bindings remain covered by the compiler and
 action regression suites.
 
+## Pane layout sizes
+
+Live Explorer/Goo panes select layouts using their own allocated content width,
+after host padding, preview chrome and tree indentation. A narrow sidebar stays
+small on a wide monitor. `pane-v1` offers `sm` at 240 CSS pixels, `md` at 480 and
+`lg` at 720. The largest allocation that fits is selected. A pane below 240 pixels
+requests a small variant at its available integer width; a zero-width hidden pane
+defers rendering. These are layout allocations, separate from Mash's control
+density settings. Unused space remains in the pane; content is not stretched or
+scaled to fill the gap between breakpoints.
+
+`POST /goo/render` accepts `layouts=pane-v1` alongside its existing target,
+view/slot/native-node selector, width, textScale and direction fields. It returns
+three named `layouts`, each containing a complete ordinary `render` response.
+Slot/role resolution is shared across the three sizes. All three run through
+`goo_browser/render_result` and the existing Goo layout and HTML backend against
+the same immutable supervisor snapshot. HTML, portable
+display, control evidence and profile stay together. Omitting `layouts` retains
+the exact-width API. No new Grove declarations or custom layout language are
+required: ordinary Goo layout rules are evaluated at each allocation.
+
+`GooActions.context(host)` reads the allocated host box, never a rendered node,
+port or label. `GooActions.load` validates the whole bundle before selecting a
+variant. Native, member and follower owners retain one bundle for their current
+selector, semantic basis, text scale and direction. Crossing a breakpoint uses
+that bundle through the existing mount/input-preservation path; content or
+publication refreshes invalidate it. Composition still defers installation.
+There are no three hidden editor copies. `data-goo-layout` exposes the installed
+size for inspection. Patch scene geometry remains server-owned.
+
+The initial policy is deliberately bounded to three allocations. A fresh bundle
+costs three ordinary render preparations and sends all three results; it trades
+initial work/payload for local breakpoint changes. It is not a persistent render
+cache or a fluid CSS layout engine. Intrinsically unbreakable content can still
+need scrolling inside its own presentation.
+
+The real browser gate is `scripts/check-layout-browser.mjs BASE MASH_ROOT OUT`.
+Run Eden with both test-only `tree-pages` and `panes` mounts. It checks Inspector
+overflow, nested selection, per-pane breakpoints, cached switching, retained
+draft/focus/caret, synthetic composition deferral, scale/direction and real save
+refreshes in Chromium, Firefox and WebKit.
+
 ## Topoi
 
 `list`, `diagram_tree`, and `list_tree` are presentations of one keyed topos.

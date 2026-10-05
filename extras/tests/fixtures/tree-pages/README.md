@@ -49,3 +49,31 @@ Verified on 2026-10-05:
   actual HTTP rejection of stale epochs and out-of-source parents passed.
 - The server returned HTTP 409 for a compiler key without a Goo path spelling;
   that branch remains available through the physical debugger.
+
+For the responsive pane regression, also symlink `extras/tests/fixtures/panes`
+as `mounts/panes` in the temporary extras root, launch with both
+`--mount tree-pages --mount panes`, then run:
+
+```sh
+node extras/mounts/explorer/scripts/check-layout-browser.mjs \
+  http://127.0.0.1:8095 /path/to/mash /tmp/goo-layout-results
+```
+
+This gate uses real server-prepared `sm`/`md`/`lg` variants. It checks sidebar and
+page overflow at 380, 532 and 1400 pixels, deep selection, local variant switching
+without additional render requests, native input/caret preservation, synthetic
+composition deferral, sub-sm panes, text scale/RTL and a real action followed by
+fresh layouts. It restores the fixture's Card A title after its save assertion.
+Run browser gates sequentially against the boot-compiler fixture server to avoid
+their concurrent 64-child render bursts competing with each other's deadlines.
+
+Responsive verification on 2026-10-05: 71 JavaScript tests and 643 native
+assertions passed. The layout gate passed in Chromium 151.0.7922.34,
+Firefox 153.0 and WebKit 26.5. Synthetic composition coverage does not claim
+manual platform IME testing. The incremental-tree gate also passed in all three
+engines with the size variants enabled, including continuation beyond 64 members
+and nine existing focus/topos cases per engine. Its original 30-second deadlines
+remain unchanged; slot/role lookup is shared across a row's three variants.
+The Chromium application gate also passed all 10 scenarios with 105 real render
+responses and one deliberate domain action, covering stale replies, instance
+replacement, independent selections, dirty-input guards and control remounting.

@@ -89,27 +89,82 @@ test('catalogue keeps valid views usable alongside an individual preparation dia
   assert.equal(result.views[0].html,valid.html);assert.equal(result.views[1].error,'Unsupported primitive');
 });
 
-test('render context measures content width and observes scale/direction without noisy rerenders',()=>{
+test('pane allocation selects breakpoints and observes scale/direction without within-class rerenders',()=>{
   const {actions,observers,frame}=setup(()=>{throw Error('unexpected fetch');});
   const style={paddingLeft:'12px',paddingRight:'8px',direction:'rtl',getPropertyValue:()=> '1.25'};
   const element={clientWidth:500,style,isConnected:true,getBoundingClientRect:()=>({width:900})};
-  assert.deepEqual(JSON.parse(JSON.stringify(actions.context(element))),{width:480,textScale:1.25,direction:'rtl'});
+  assert.deepEqual(JSON.parse(JSON.stringify(actions.context(element))),{width:480,textScale:1.25,direction:'rtl',layout:'md'});
   const seen=[];const stop=actions.observe(element,value=>seen.push(JSON.parse(JSON.stringify(value))));
   observers.forEach(observer=>observer.callback());frame();assert.equal(seen.length,0);
   element.clientWidth=600;observers.forEach(observer=>observer.callback());frame();
-  assert.deepEqual(seen,[{width:580,textScale:1.25,direction:'rtl'}]);
+  assert.deepEqual(seen,[]);
+  element.clientWidth=740;observers[0].callback();frame();
+  assert.deepEqual(seen,[{width:720,textScale:1.25,direction:'rtl',layout:'lg'}]);
   style.direction='ltr';style.getPropertyValue=()=> '2';observers[1].callback();frame();
-  assert.deepEqual(seen[1],{width:580,textScale:2,direction:'ltr'});
+  assert.deepEqual(seen[1],{width:720,textScale:2,direction:'ltr',layout:'lg'});
   stop();element.clientWidth=700;observers[0].callback();frame();assert.equal(seen.length,2);
   assert(observers.every(observer=>observer.disconnected));
   style.getPropertyValue=()=> 'nope';assert.throws(()=>actions.context(element),/Invalid Goo text scale/);
 });
 
-test('prepared context excludes the mounted Explorer presentation chrome',()=>{
+test('pane context reads the host allocation, excludes chrome and ignores oversized prepared content',()=>{
   const {actions}=setup(()=>{throw Error('unexpected fetch');});
   const content={clientWidth:458,style:{paddingLeft:'0',paddingRight:'0',direction:'rtl',getPropertyValue:()=> '1.25'},getBoundingClientRect:()=>({width:458})};
-  const outer={querySelector:()=>content,clientWidth:500};
-  assert.deepEqual(JSON.parse(JSON.stringify(actions.context(outer))),{width:458,textScale:1.25,direction:'rtl'});
+  content.style.paddingLeft='20px';content.style.paddingRight='22px';
+  const outer={querySelector:()=>content,clientWidth:500,style:{paddingLeft:'0',paddingRight:'0',direction:'rtl',getPropertyValue:()=> '1.25'}};
+  assert.deepEqual(JSON.parse(JSON.stringify(actions.context(outer))),{width:240,textScale:1.25,direction:'rtl',layout:'sm'});
+  content.clientWidth=2000;content.getBoundingClientRect=()=>{throw Error('child geometry read');};
+  assert.equal(actions.context(outer).width,240);
+  outer.clientWidth=222;assert.equal(actions.context(outer).width,180);
+  outer.clientWidth=0;assert.equal(actions.context(outer).width,0);
+});
+
+const paneContext=(width,layout)=>({width,textScale:1.5,direction:'rtl',layout});
+const bundle=(requested)=>({version:1,ok:true,layoutPolicy:'pane-v1',context:requested,
+  layouts:[['sm',Math.min(240,requested.width)],['md',480],['lg',720]].map(([size,width])=>{
+    const render=envelope();render.context={...context,width};render.display.context={...render.context};
+    render.html=`<p>${size}</p>`;return {size,render};
+  })});
+test('server layouts are selected per owner and cached only within the same semantic basis',async()=>{
+  const owner={}, other={}, requests=[];
+  const {actions}=setup((url,options)=>{
+    if(url==='/static/goo-profile.json')return response(profile);
+    const width=Number(options.body.get('width'));requests.push(options.body);
+    assert.equal(options.body.get('layouts'),'pane-v1');
+    return response(bundle({...context,width}));
+  });
+  const load=(width,layout,basis='v1',host=owner)=>actions.load('/item',{context:paneContext(width,layout),owner:host,basis,slot:'/content'});
+  assert.equal((await load(240,'sm')).layout,'sm');
+  assert.equal((await load(720,'lg')).html,'<p>lg</p>');
+  assert.equal((await load(480,'md')).display.context.width,480);
+  assert.equal(requests.length,1,'crossing a breakpoint uses an already resolved layout');
+  await load(480,'md','v2');assert.equal(requests.length,2,'semantic refresh invalidates variants');
+  await load(480,'md','v2',other);assert.equal(requests.length,3,'cache is scoped to its presentation owner');
+  await load(180,'sm','v2');assert.equal(requests.length,4,'sub-sm panes request a fitting small layout');
+  await load(240,'sm','v2');assert.equal(requests.length,5,'a clipped small variant is not reused as full sm');
+});
+test('all layout variants are validated before admission, including unselected ones',async()=>{
+  for(const mutate of [
+    data=>data.layouts[2].render.snapshot.life='other',
+    data=>data.layouts[2].render.display.context.width=999,
+    data=>data.layouts[1].size='sm',
+    data=>data.layouts.pop(),
+    data=>data.layouts[1].render.profile.revision='stale',
+    data=>data.context.width=800
+  ]) {
+    const requested=paneContext(240,'sm'),data=bundle(requested);mutate(data);
+    const {actions}=setup(url=>response(url==='/static/goo-profile.json'?profile:data));
+    await assert.rejects(actions.load('/item',{context:requested,owner:{},basis:'v1'}));
+  }
+});
+test('an aborted layout request cannot populate the retained owner cache',async()=>{
+  const gate=defer(),owner={},controller=new AbortController();let renders=0;
+  const requested=paneContext(240,'sm');
+  const {actions}=setup(url=>url==='/static/goo-profile.json'?response(profile):(renders++,gate.promise));
+  const first=actions.load('/item',{context:requested,owner,basis:'v1',signal:controller.signal});
+  controller.abort();gate.resolve(response(bundle(requested)));
+  await assert.rejects(first,{name:'AbortError'});
+  await actions.load('/item',{context:requested,owner,basis:'v1'});assert.equal(renders,2);
 });
 
 class Control {

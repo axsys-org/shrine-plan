@@ -22,6 +22,11 @@ Keys without a Goo path spelling report an error instead of hanging the request;
 the physical debugger can inspect those keys. Change `axis = "z"` to `"y"` in the workspace's `selection` to
 show only the nearest-record frontier.
 
+Content uses the shared [pane layout sizes](../explorer/PANES.md#pane-layout-sizes):
+server-prepared `sm` (240px), `md` (480px) and `lg` (720px), selected by each
+pane's available width. Tree indentation reduces the row allocation. Resizing
+selects a cached layout while preserving native inputs; a smaller-than-sm pane
+requests a fitting server layout. Rendered content cannot expand its host frame.
 
 The workspace, Namespace, and Values panes are separate `@pane` declarations.
 The workspace owns `/object` and connects it to each child's required `#port`

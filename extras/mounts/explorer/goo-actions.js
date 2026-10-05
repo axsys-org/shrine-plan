@@ -4,6 +4,8 @@
   const metrics = {activations: 0, dispatches: 0};
   const bindings = new WeakMap();
   const pendingScopes = new WeakMap();
+  const layoutCache = new WeakMap();
+  const layoutSizes = Object.freeze([['sm',240],['md',480],['lg',720]].map(Object.freeze));
   let profileRequest;
   const same = (a, b) => ['target', 'expected', 'displayed', 'publication', 'life', 'subject'].every(k => a[k] === b[k]);
   async function status(target) {
@@ -12,14 +14,19 @@
     return response.json();
   }
   function context(element) {
-    // Explorer chrome is outside Goo's allocation. Once mounted, measure the
-    // presentation's content box, including the narrower member/follow frame.
-    const content = element.querySelector?.(':scope > .preview > .goo-presentation') || element;
-    const style = getComputedStyle(content), rect = content.getBoundingClientRect();
-    const width = Math.max(0, Math.min(100000, (content.clientWidth || rect.width) - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0)));
+    // Read only the allocated host box, never the prepared Goo descendants.
+    // Preview chrome consumes part of that allocation but cannot enlarge it.
+    const style = getComputedStyle(element);
+    const preview = element.querySelector?.(':scope > .preview');
+    const chrome = preview ? getComputedStyle(preview) : null;
+    const horizontal = (style, names) => names.reduce((total,name)=>total+(parseFloat(style?.[name])||0),0);
+    const width = Math.floor(Math.max(0, Math.min(100000, element.clientWidth
+      - horizontal(style,['paddingLeft','paddingRight'])
+      - horizontal(chrome,['paddingLeft','paddingRight','borderLeftWidth','borderRightWidth','marginLeft','marginRight']))));
     const textScale = Number(style.getPropertyValue('--goo-text-scale').trim() || 1);
     if (!Number.isFinite(textScale) || textScale <= 0 || textScale > 10) throw new Error('Invalid Goo text scale');
-    return {width, textScale, direction: style.direction === 'rtl' ? 'rtl' : 'ltr'};
+    const [layout, allocation] = layoutSizes.findLast(([,minimum])=>minimum<=width) || ['sm',width];
+    return {width:allocation, textScale, direction: style.direction === 'rtl' ? 'rtl' : 'ltr', layout};
   }
   function observe(element, changed) {
     let previous = JSON.stringify(context(element)), queued = false, stopped = false;
@@ -51,14 +58,52 @@
   async function load(target, options = {}) {
     const requested = options.context;
     if (!requested || !Number.isFinite(requested.width) || requested.width < 0 || requested.width > 100000 || !Number.isFinite(requested.textScale) || requested.textScale <= 0 || requested.textScale > 10 || !['ltr','rtl'].includes(requested.direction)) throw new Error('A valid render context is required');
+    if (requested.layout !== undefined && !layoutSizes.some(([name,width])=>name===requested.layout && (width===requested.width || name==='sm' && requested.width<width))) throw new Error('Invalid pane layout context');
     const fields = {target, width:String(requested.width), textScale:String(requested.textScale), direction:requested.direction};
+    if (requested.layout) fields.layouts='pane-v1';
     for (const name of ['view','slot','role','node','workspace']) if (options[name] !== undefined && options[name] !== '') fields[name] = options[name];
+    // A cache belongs to one existing presentation owner and a semantic basis.
+    // Refreshes/retirements change that basis; geometry changes alone do not.
+    const cacheKey = requested.layout && options.owner && options.basis !== undefined
+      ? JSON.stringify([target,...['view','slot','role','node','workspace'].map(key=>fields[key]||''),options.basis,requested.textScale,requested.direction]) : null;
+    const cached = cacheKey && layoutCache.get(options.owner);
+    const choose = layouts => layouts.findLast(({render})=>render.context.width<=requested.width);
+    if (cached?.key===cacheKey) {
+      const chosen=choose(cached.layouts);
+      if(chosen?.size===requested.layout && chosen.render.context.width===requested.width) {
+        options.signal?.throwIfAborted();
+        return {...chosen.render,layout:chosen.size};
+      }
+    }
     const [profile, response] = await Promise.all([installedProfile(), fetch('/goo/render', {
       method:'POST', cache:'no-store', body:new URLSearchParams(fields), signal:options.signal
     })]);
     if (response.headers?.get('content-type') && !response.headers.get('content-type').includes('json')) throw new Error(await response.text() || `Goo render failed (${response.status})`);
-    const data = await response.json();
+    let data = await response.json();
     if (!response.ok || data.ok === false) throw new Error(data.error || `Goo render failed (${response.status})`);
+    if (requested.layout) {
+      if(data.version!==1 || data.layoutPolicy!=='pane-v1' || !Array.isArray(data.layouts) || data.layouts.length!==3) throw new Error('Invalid pane layout bundle');
+      if(!data.context || ['width','textScale','direction'].some(key=>data.context[key]!==requested[key])) throw new Error('Goo render context mismatch');
+      let snapshot;
+      for(const [index,variant] of data.layouts.entries()) {
+        const [name,width]=layoutSizes[index];
+        if(variant.size!==name || !variant.render) throw new Error('Invalid pane layout variant');
+        const expected={...requested,width:name==='sm'?Math.min(width,requested.width):width};
+        validate(variant.render,expected,profile);
+        const basis=JSON.stringify(variant.render.snapshot);
+        if(snapshot!==undefined && snapshot!==basis) throw new Error('Mixed pane layout snapshots');
+        snapshot=basis;
+      }
+      const chosen=choose(data.layouts);
+      if(!chosen || chosen.size!==requested.layout || chosen.render.context.width!==requested.width) throw new Error('No fitting pane layout');
+      options.signal?.throwIfAborted();
+      if(cacheKey)layoutCache.set(options.owner,{key:cacheKey,layouts:data.layouts});
+      return {...chosen.render,layout:chosen.size};
+    }
+    validate(data,requested,profile);
+    return data;
+  }
+  function validate(data,requested,profile) {
     if (data.version !== 1 || !data.snapshot) throw new Error('Unsupported Goo render response');
     if (!data.profile || ['id','version','revision'].some(key => data.profile[key] !== profile[key])) throw new Error('Goo renderer profile mismatch');
     if (!data.context || ['width','textScale','direction'].some(key => data.context[key] !== requested[key])) throw new Error('Goo render context mismatch');
@@ -69,7 +114,6 @@
       if (view.display && ['id','version','revision'].some(key => view.display.profile?.[key] !== profile[key])) throw new Error('Goo display profile mismatch');
       if (view.display && ['width','textScale','direction'].some(key => view.display.context?.[key] !== requested[key])) throw new Error('Goo display context mismatch');
     }
-    return data;
   }
   function presentation(data) {
     const section = document.createElement('section'); section.className = 'preview';
@@ -101,6 +145,8 @@
       }
       container.replaceChildren(...(section ? [next] : [...next.childNodes]));
       container.dataset.renderContext = JSON.stringify(data.context);
+      if(data.layout)container.dataset.gooLayout=data.layout;
+      else delete container.dataset.gooLayout;
       container.dataset.profileRevision = data.profile?.revision || '';
       container.gooDisplay = data.display;
       if (active?.isConnected && document.activeElement !== active) {

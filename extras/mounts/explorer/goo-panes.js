@@ -226,10 +226,10 @@
         Promise.resolve(held.callback()).catch(error => { if (error.name !== 'AbortError') this.context.report(error.message); });
       });
     }
-    async request(element, target, selector) {
+    async request(element, target, selector, basis) {
       this.requests.get(element)?.abort();
       const request = new AbortController(); this.requests.set(element,request);
-      const data = await root.GooActions.load(target,{...selector,context:root.GooActions.context(element),signal:request.signal});
+      const data = await root.GooActions.load(target,{...selector,context:root.GooActions.context(element),signal:request.signal,owner:element,basis});
       if (this.requests.get(element) !== request || !element.isConnected) return null;
       return data;
     }
@@ -267,7 +267,7 @@
       if (element.dataset.renderKey === key || element.dataset.loadingKey === key) return;
       element.dataset.loadingKey = key;
       try {
-        const data = await this.request(element,this.context.target,{view:this.context.view,node:node.node,workspace:this.context.workspace});
+        const data = await this.request(element,this.context.target,{view:this.context.view,node:node.node,workspace:this.context.workspace},JSON.stringify([node.node,this.snapshot]));
         if (!data || !work.live || element.dataset.loadingKey !== key || [...work.inputs.values()].some(value => value.composing)) return;
         if(!this.nativeSnapshotCurrent(data.snapshot)) return;
         const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.publication]);
@@ -366,7 +366,7 @@
           if (row.dataset.expected===expected || row.dataset.loadingKey===expected) return;
           row.dataset.loadingKey=expected; if(!row.dataset.expected) row.inert=true;
           try {
-            const data=await this.request(row,member.subject,{slot:node.slot});
+            const data=await this.request(row,member.subject,{slot:node.slot},JSON.stringify([member,work.binding,this.snapshot]));
             if (!data || !state.live || !work.live || row.dataset.loadingKey!==expected || data.snapshot.life!==member.life || [...work.inputs.values()].some(value=>value.composing)) return;
             if (data.description) throw new Error('Member presentations must be views.');
             const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.publication]);
@@ -528,7 +528,7 @@
       if (element.dataset.encounter !== String(ticket.encounter)) element.inert=true;
       element.dataset.status='loading'; this.status.textContent='Loading accepted selection…';
       try {
-        const data=await this.request(element,member.subject,{slot:state.encounter.recipe});
+        const data=await this.request(element,member.subject,{slot:state.encounter.recipe},JSON.stringify([{...ticket,ref:undefined},this.snapshot]));
         if (!data || !this.session.current(ticket) || state.suspended || this.loading.get(state.id)!==key) return;
         if (data.snapshot.life!==member.life || (data.snapshot.subject||data.snapshot.target)!==member.subject) throw new Error('Selected subject was removed or replaced.');
         if (data.description) throw new Error('Nested local-session member views are not supported.');
