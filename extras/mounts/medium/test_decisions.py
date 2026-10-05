@@ -29,6 +29,12 @@ class DecisionsTest(unittest.TestCase):
         encodings=[o['action'] for o in catalog(self.scene,self.material,scope=scope) if o['action']['op']=='encoding']
         self.assertIn('angle',{a['channel'] for a in encodings})
 
+    def test_share_choices_survive_empty_data(self):
+        self.collection['properties'][0].update(type='Enum', choices=['Queued','Ready'])
+        self.material['nodes']=self.material['nodes'][:1]
+        options=catalog(self.scene,self.material,scope={'target':'shape','field':{'collection':'/source','slot':'/phase'}})
+        self.assertEqual([o['action']['equals'] for o in options if o['action']['op']=='shape_share'],['Queued','Ready'])
+
     def test_empty_collection_is_still_presentable(self):
         self.material['nodes']=self.material['nodes'][:1]
         options=catalog(self.scene,self.material,scope={'collection':'/source'})

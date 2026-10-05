@@ -124,13 +124,29 @@ def prepare(server,source,cases,key=None,probe=None):
     return {**result,'hash':digest,'cases':cases,'pure_source':source}
 
 
+# Immutable pure inputs and pinned code can reuse the same checked native result.
+# A per-key lock coalesces reloads and simultaneous views; it never memoizes writes.
+EVALUATION_LOCKS={}
+EVALUATION_LOCKS_GUARD=threading.Lock()
+
 def evaluate(server,descriptor,value):
     surface=descriptor['surface']
     if not re.fullmatch(r'/0x11/app/user/pure_[a-z0-9_]+/surface',surface):raise ValueError('Select a checked pure computation')
-    frame=call(server,'native/frame',{'subject':surface,'viewport':[{'slot':'/input','kind':'text','value':json.dumps(value,separators=(',',':'))}]})
     pinned=descriptor.get('implementation')
-    if pinned is not None and frame['basis']['implementation']!=pinned:raise ValueError('The computation revision changed')
-    return {'value':output(frame),'implementation':frame['basis']['implementation']}
+    key=hashlib.sha256(json.dumps([surface,pinned,value],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    cache=server.world/'pure-programs'/'results'/f'{key}.json'
+    with EVALUATION_LOCKS_GUARD:lock=EVALUATION_LOCKS.setdefault((str(server.world),key),threading.Lock())
+    with lock:
+        if pinned is not None and cache.exists():
+            held=json.loads(cache.read_text())
+            if held.get('implementation')==pinned:return {**held,'cached':True}
+        frame=call(server,'native/frame',{'subject':surface,'viewport':[{'slot':'/input','kind':'text','value':json.dumps(value,separators=(',',':'))}]})
+        if pinned is not None and frame['basis']['implementation']!=pinned:raise ValueError('The computation revision changed')
+        result={'value':output(frame),'implementation':frame['basis']['implementation']}
+        if pinned is not None:
+            cache.parent.mkdir(parents=True,exist_ok=True)
+            temporary=cache.with_suffix('.tmp');temporary.write_text(json.dumps(result));temporary.replace(cache)
+        return {**result,'cached':False}
 
 
 def activate(server,candidate):
@@ -352,7 +368,7 @@ def run(server,request,model):
             structured={p['label'] for p in schema if p.get('type') in {'Many','List','Sequence','Object'}}
             rows=[{k:(json.loads(v) if k in structured and isinstance(v,str) and v else v) for k,v in row.items()} for row in sandbox]
         unplaced=[r['id'] for r in rows if any(r.get(f) in (None,'') for f in job['requires'])]
-        rows=[r for r in rows if r['id'] not in unplaced]
+        rows=[{key:r[key] for key in ['id',*job['requires']] if key in r} for r in rows if r['id'] not in unplaced]
         if job['descriptor'].get('evaluation')=='per-record':
             values=[];t=time.monotonic()
             for row in rows:
