@@ -38,7 +38,7 @@ The HTTP foot was built for one action per request and one reply per connection:
 
 1. **`ask`.** A route handler hands the request record to a named worker's home and the HTTP request completes when that record carries a response. About 60 lines. This is what lets a tool call run several kernel operations.
 2. **Headers.** `http_foot/request` gains `headers=row[[str str]]`; the parser already walks them for `Content-Length`. About 40 lines, plus the three constructors in the web mount that build a request. This is what makes a bearer token or a cookie possible.
-3. **Streaming.** A `stream` action: the connection stays open, the response is `text/event-stream`, and events poked onto the stream's record by a worker are written to the socket as they arrive; a closed socket ends the stream. The per-connection actor gets a second loop; the foot forwards events from its binding updates; the registry keeps open streams. About 170 lines, plus 60 of tests. This is what carries `list_changed`, progress and server messages, and lets `tools/call` answer over SSE where a client asks for it.
+3. **Streaming.** Deferred on 5 October at Ian's call. The server answers JSON only; clients re-list tools when the registry changes, and `tools/call` answers when the work is done. When wanted: a `stream` action with the connection kept open as `text/event-stream`, events poked onto the stream's record written to the socket as they arrive; about 170 lines plus 60 of tests.
 4. **Local binding.** The world listens on every interface with no authentication. Enki `pkg/plan/src/rplan.c`, about 5 lines, binds `Listen` to localhost unless told otherwise.
 
 Step 4 adds the fifth: loading a mount into a running world without a restart.
@@ -55,6 +55,10 @@ client --GET /mcp (SSE)--> http foot --stream--> /io/http/s3 (stream record, ope
                            http foot --write event--> socket, until the client closes
 ```
 
+## Status, 6 October
+
+Step 1 is built on branch `ic-mcp` and verified in a running world through curl: the token is enforced; `initialize`, `ping`, `tools/list` and `tools/call` answer; every one of the twelve tools has run against the live world (`get-our-id`, `read`, `write` creating and changing, `delete`, `press` on a button and on a form with inputs, `list-mounts`, `list-files`, `get-file`, `commit`, `insert-file` with a compile that failed and one that passed, `install-app` with `replace`, `history`). A contract-refused write comes back as a refusal. A tool call takes about 150 ms; a commit about 2 seconds. Kernel changes: `ask` and request headers in `http_foot.foil` (64 lines); streaming deferred. Known gaps: `history` reports version counters only, because the kernel's inspect read leaves an application path's versions unreported; `insert-file` goes through the host companion until compile-from-text exists.
+
 ## Steps
 
 Each step is usable on its own and ends with Claude Code or Codex connected: `claude mcp add --transport http shrine http://127.0.0.1:8440/mcp/<token>`.
@@ -65,8 +69,8 @@ Each step is usable on its own and ends with Claude Code or Codex connected: `cl
 
 | File | Lines | What |
 |---|---|---|
-| `src/foil/http_foot.foil` | ~270 | `ask`; headers on `request`; `stream` action with the open-connection loop and event forwarding |
-| `src/foil/tests/http_foot.foil` | ~120 | Cases for ask, headers, and a stream that receives three events and ends on close |
+| `src/foil/http_foot.foil` | ~100 | `ask`; headers on `request` (done: 17 + 47 lines) |
+| `src/foil/tests/http_foot.foil` | ~60 | Cases for ask and headers |
 | `extras/mounts/web/browser_routes.foil`, `browser_request.foil` | ~10 | Request constructors gain the headers field |
 | **Enki** `pkg/plan/src/rplan.c` | ~5 | Bind to localhost by default |
 
@@ -84,7 +88,7 @@ Each step is usable on its own and ends with Claude Code or Codex connected: `cl
 | `mcp_tests.foil` | 160 | Framing, dispatch, each built-in against a fixture binding |
 | `skills/shrine-mcp/SKILL.md` | 120 | The port of the skill: ground rules and workflows in Shrine terms |
 
-Step 1: about 1,700 new, 400 changed (405 with Enki). Done when a client lists the tools, reads a record, writes one, recompiles a mount with the failure text coming back, and sees a `list_changed` arrive over the SSE stream when a tool is added.
+Step 1: about 1,700 new, 200 changed (205 with Enki). Done when a client lists the tools, reads a record, writes one, and recompiles a mount with the failure text coming back.
 
 ### Step 2. Resources and prompts
 
