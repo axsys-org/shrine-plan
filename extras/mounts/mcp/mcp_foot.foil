@@ -1,0 +1,221 @@
+- helm
+- mcp_rpc
+- mcp_tools
+
+'  The worker that runs tool calls. A request record arrives under its home
+'  from the /mcp route; the worker does the kernel work the tool needs and
+'  writes the HTTP response onto the record the request names in ['reply].
++ mcp_foot
+  + task
+    & feet/task/fact
+      feet/task/page
+      feet/task/ack
+      feet/task/develop
+      feet/task/inspect
+  + write
+    : target=path wit=writ
+  + job
+    '  One tool call in flight: its request kid and what it is waiting for.
+    : kid=iota id=json reply=path call=json awaiting=path
+  + state
+    : home=path token=str seen=row[iota] jobs=row[mcp_foot/job] writes=row[mcp_foot/write] waiting=bool
+  + value_text
+    '  A property value as text, by representation.
+    \ held=pail
+    ^ str
+    ? held
+     > x=pails/t x.t
+     > n=pails/n (nat/show n.n)
+     > p=pails/p (path_show p.p)
+     > q=pails/q (iota_show q.q)
+    "[opaque]"
+  + record_json
+    '  A record as a JSON object: property path to text.
+    \ t=myth
+    ^ json
+    = members
+        | t.tap.map
+        \ [key val]
+        | jkv (path_show key) (json/str (mcp_foot/value_text val))
+    | json/obj members
+  + page_json
+    '  A peeked page: the thing's properties and, when present, its children.
+    \ pax=path tree=axal[saga]
+    ^ json
+    = properties
+        ? tree.fil
+         > (./some version) (mcp_foot/record_json (unpin version.myth))
+        | json/obj []
+      children
+        | tree.kid_tap.map
+        \ [key child]
+        = own
+            ? child.fil
+             > (./some version) (mcp_foot/record_json (unpin version.myth))
+            | json/obj []
+        | json/obj [(jkv "name" (json/str (iota_show key))) (jkv "properties" own)]
+    | json/obj
+      [(jkv "path" (json/str (path_show pax)))
+       (jkv "exists" (json/boo (maybe/is_some tree.fil)))
+       (jkv "properties" properties)
+       (jkv "children" (json/arr children))]
+  + response
+    '  The HTTP response record for a finished call.
+    \ status=nat body=str
+    ^ myth
+    . (myth/new)
+      put(['res_status] (pd status))
+      put(['res_body] (pd (str/to_atom body)))
+      put(['res_ctype] (pd (str/to_atom (? (eq status 202) "text/plain; charset=utf-8" "application/json; charset=utf-8"))))
+  + finish_with
+    '  Write the response onto the request record, then nudge the HTTP
+    '  foot's home so it reads the record and replies.
+    \ job=mcp_foot/job status=nat body=str s=mcp_foot/state
+    ^ mcp_foot/state
+    = answer (mcp_foot/write job.reply (writ/poke (mcp_foot/response status body)))
+      http=path [s.home.at(0) 'io 'http]
+      nudge (mcp_foot/write http (writ/poke (myth/new).put(['nudge] (pd s.seen.len))))
+      left s.jobs.filter((\ other=mcp_foot/job !(equal other.kid job.kid)))
+    | s.set_writes(s.writes.snoc(answer).snoc(nudge)).set_jobs(left)
+  + finish
+    \ job=mcp_foot/job body=str s=mcp_foot/state
+    ^ mcp_foot/state
+    | mcp_foot/finish_with job 200 body s
+  + fail
+    \ job=mcp_foot/job message=str s=mcp_foot/state
+    ^ mcp_foot/state
+    | mcp_foot/finish job (mcp_rpc/result job.id (mcp_rpc/text_content message .true)) s
+  + absolute
+    '  A path as the caller wrote it, with the node put back when left off.
+    \ node=iota text=str
+    ^ maybe[path]
+    ?> (./some parsed) (path_parse text) .none
+    ? (eq parsed.len 0) (./some [node])
+    ? (equal (iota_show parsed.at(0)) (iota_show node)) (./some parsed)
+    | ./some parsed.cons(node)
+  + serve
+    '  Answer one JSON-RPC call: the protocol methods here, tools through start.
+    \ parent=nat job=mcp_foot/job method=str s=mcp_foot/state
+    ^ mcp_foot/state
+    = node s.home.at(0)
+    ? (equal method "initialize")
+      | mcp_foot/finish job (mcp_rpc/result job.id (mcp_rpc/initialize (str/cat_all ["shrine " (iota_show node)]))) s
+    ? (equal method "notifications/initialized") (mcp_foot/finish_with job 202 "" s)
+    ? (equal method "ping") (mcp_foot/finish job (mcp_rpc/result job.id (json/obj [])) s)
+    ? (equal method "tools/list") (mcp_foot/finish job (mcp_rpc/result job.id (mcp_tools/listing mcp_tools/builtins)) s)
+    ? (equal method "tools/call") (mcp_foot/start parent job s)
+    | mcp_foot/finish job (mcp_rpc/failure job.id 32601 (str/cat_all ["Method not found: " method])) s
+  + start
+    '  Begin one tool call: answer at once, or ask the kernel and wait.
+    \ parent=nat job=mcp_foot/job s=mcp_foot/state
+    ^ mcp_foot/state
+    = name (mcp_rpc/text_at "name" job.call)
+      arguments (mcp_rpc/object_at "arguments" job.call)
+      node s.home.at(0)
+    ? (equal name "mcp/get-our-id")
+      = body (json/obj [(jkv "node" (json/str (iota_show node)))])
+      | mcp_foot/finish job (mcp_rpc/result job.id (mcp_rpc/structured body)) s
+    ? (equal name "mcp/read")
+      ?> (./some target) (mcp_foot/absolute node (mcp_rpc/text_at "path" arguments))
+        (mcp_foot/fail job "path is not a namespace path" s)
+      ; (Send parent (feet/gift/peek target))
+      | s.set_jobs(s.jobs.snoc(job.set_awaiting(target)))
+    ? (maybe/is_some (mcp_tools/find name mcp_tools/builtins))
+      | mcp_foot/fail job (str/cat_all [name " is not served by the worker yet."]) s
+    | mcp_foot/fail job (str/cat_all ["Unknown tool: " name]) s
+  + consider
+    '  A new request kid becomes a job.
+    \ parent=nat s=mcp_foot/state entry=[path saga]
+    ^ mcp_foot/state
+    = [pax version] entry
+    ? !(eq pax.len 1) s
+    = kid pax.at(0)
+      record (unpin version.myth)
+      body record.txt_at(['body])
+    ? (eq body.len 0) s
+    ? (eq record.nat_at(['res_status] 0) 0)
+      ? s.seen.any((\ other=iota (equal other kid))) s
+      = reply=path record.path_at(['reply]).fall([])
+        marked s.set_seen(s.seen.snoc(kid))
+      ? (eq reply.len 0) marked
+      = bare (mcp_foot/job kid jnull reply (json/obj []) [])
+        auth record.txt_at(['auth])
+      ? !(equal auth (str/cat_all ["Bearer " s.token]))
+        | mcp_foot/finish_with bare 401 (mcp_rpc/failure jnull 32000 "Unauthorized: a bearer token is required") marked
+      ? (mcp_rpc/parse_call body)
+       > (./err why) (mcp_foot/finish bare (mcp_rpc/failure jnull 32700 why) marked)
+       > (./ok call)
+        | mcp_foot/serve parent (mcp_foot/job kid call.id reply call.params []) call.method marked
+    s
+  + scan
+    \ parent=nat binding=axal[saga] s=mcp_foot/state
+    ^ mcp_foot/state
+    | binding.tap.fold s (mcp_foot/consider parent)
+  + answered
+    '  A peeked page answers the job that waits for that path.
+    \ pax=path page=res[axal[saga]] s=mcp_foot/state
+    ^ mcp_foot/state
+    = matches s.jobs.filter((\ job=mcp_foot/job (equal job.awaiting pax)))
+    ? (eq matches.len 0) s
+    = job matches.at(0)
+    ? page
+     > (./known tree) (mcp_foot/finish job (mcp_rpc/result job.id (mcp_rpc/structured (mcp_foot/page_json pax tree))) s)
+     > .null (mcp_foot/finish job (mcp_rpc/result job.id (mcp_rpc/structured (json/obj [(jkv "path" (json/str (path_show pax))) (jkv "exists" (json/boo .false))]))) s)
+    | mcp_foot/fail job "That path cannot be read" s
+  + flush
+    \ parent=nat s=mcp_foot/state
+    ^ mcp_foot/state
+    ? s.waiting s
+    ? (eq s.writes.len 0) s
+    = write s.writes.at(0)
+    ; (Send parent (feet/gift/poke write.target write.wit))
+    | s.set_waiting(.true)
+  + loop
+    \ parent=nat initial=mcp_foot/state
+    ^ nat
+    ; (Trace "mcp foot waiting" 0)
+    = ;s (mcp_foot/flush parent initial)
+    ; (Trace (? s.waiting "mcp foot: a write is out" "mcp foot: idle") 0)
+    = ;[message caps] (Recv[mcp_foot/task] 0)
+    = ;next=mcp_foot/state
+        ? message
+         > (./fact binding) (mcp_foot/scan parent binding s)
+         > (./ack err)
+          ? (maybe/is_some err)
+            ; (Trace "mcp foot: a write was rejected" 0)
+            | s.set_waiting(.false).set_writes(s.writes.drop(1))
+          | s.set_waiting(.false).set_writes(s.writes.drop(1))
+         > (./page pax page) (mcp_foot/answered pax page s)
+         > (./develop request status body) s
+         > (./inspect request result) s
+        s
+    ; (helm/supervisor/close_caps caps)
+    | _ parent next
+  + run
+    \ home=path token=str initial=feet/task/init self=nat
+    ^ nat
+    = ;s (mcp_foot/scan initial.parent initial.ax (mcp_foot/state home token [] [] [] .false))
+    ; (Trace (str/cat_all ["mcp foot running, " (nat/show s.jobs.len) " jobs"]) 0)
+    | mcp_foot/loop initial.parent s
+  + accepted
+    \ reply=feet/task[unit]
+    ^ bool
+    ? reply
+     > (./ack err)
+      ? err
+       > .none .true
+       > (./some _) .false
+    .false
+  + install
+    \ server=nat home=path token=str
+    ^ nat
+    ; (SendCaps server (helm/card/step home (writ/make (myth/new).put(['lede] (pails/t "MCP worker")))) [0])
+    = ;[made caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? !(mcp_foot/accepted made) (error (pails/t "The MCP worker's home could not be created"))
+    = registration (helm/supervisor/register home (mcp_foot/run home token))
+    ; (SendCaps server registration [0])
+    = ;[reply extra] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps extra)
+    ? !(mcp_foot/accepted reply) (error (pails/t "The MCP worker could not be registered"))
+    server
