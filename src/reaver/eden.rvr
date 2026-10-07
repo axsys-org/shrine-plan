@@ -44,9 +44,12 @@
   (define (images-at path state)
     (define result ((tool ["source_mount" "images"]) path state))
     (If (Eq 1 (Sz result)) (_0 result) []))
+  ;; The mounts the world holds, read from their records: the boot list
+  ;; while booting, and whatever was mounted since.
+  (define (specs-of state) ((tool ["source_mount" "runtime_specs"]) state))
   (define (images state)
     (foldl (lambda (out spec)
-      (merge-images out (images-at (home self spec) state))) core-images specs))
+      (merge-images out (images-at (home self spec) state))) core-images (specs-of state)))
   ;; Resolved once: `previous` runs per definition path, and the constructor
   ;; lookup derives the core module's whole TypeWorld (driver:perc-world).
   (define case (tool ["namespace" "case"]))
@@ -56,7 +59,7 @@
       (map (lambda (part) ((_0 part) (_1 part))) path) state))
     (If (Eq 1 (Sz found)) (_0 found) 0))
   (define (publish-mount path state)
-    (define spec (need (find (lambda (spec) (Equal path (home self spec))) specs)))
+    (define spec (need (find (lambda (spec) (Equal path (home self spec))) (specs-of state))))
     (define files ((tool ["source_mount" "snapshot"]) path state))
     (define (read-file leaf)
       (define found (find (lambda (pair) (Equal leaf (_0 pair))) files))
@@ -115,29 +118,114 @@
         ((abi:result core "err")
           ((abi:constructor core ["source_mount" "failure"]) "Compilation failed" (_0 result))))
       ((abi:result core "ok") (_0 result))))
-  (define ports ((abi:constructor core ["source_mount" "ports"]) attempt))
-  (define homes (map (home self) specs))
+  ;; The second door on the same compiler: one module given as text, in the
+  ;; running world's context, checked and never published. The module's own
+  ;; earlier image, if any, is left out so the text is compiled fresh.
+  (define (compile-text name text state)
+    (define origin (publication:compilation-context (Unpin (_0 core-code))))
+    (define imported (filter (lambda (pair) (If (Equal (_0 pair) name) 0 1)) (images state)))
+    (define (read requested)
+      (If (Equal requested name) (rex:ParseRexNormFile text)
+        (source:read-module requested)))
+    (define (root requested)
+      (define found (find (lambda (pair) (Equal requested (_0 pair))) imported))
+      (If found
+        (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
+        (resolve requested)))
+    (define prepared (source:prepare-publication-with read
+      (context:publication-key origin) (context:compiler-key origin)
+      root imported (previous state) [name]))
+    (define code (publication:compile prepared (_1 core-code)))
+    (Sz (force (publication:definition-records code))))
+  (define (attempt-text name text state)
+    (define result (Try (lambda (ignored) (force (compile-text name text state))) 0))
+    (If (Eq 1 (Hd result))
+      ((abi:result core "err")
+        ((abi:constructor core ["source_mount" "failure"]) "Compilation failed" (_0 result)))
+      ((abi:result core "ok") (_0 result))))
+  ;; Run one published entry, module/name, on the call's [name value] text
+  ;; pairs; the entry answers JSON text. Only entries of that shape are
+  ;; reachable this way, and only from mounts the world loaded.
+  (define (apply-entry mod entry args state)
+    (define image (module (images state) mod))
+    ((driver:get-perc [mod entry] image) args))
+  (define (attempt-apply mod entry args state)
+    (define result (Try (lambda (ignored) (force (apply-entry mod entry args state))) 0))
+    (If (Eq 1 (Hd result))
+      ((abi:result core "err")
+        ((abi:constructor core ["source_mount" "failure"]) "Application failed" (_0 result)))
+      ((abi:result core "ok") (_0 result))))
+  (define reader ((tool ["fs_read" "remote"]) scan-port scan-token))
+  (define http (module core-images "http_foot"))
+  ;; A hook entry is looked up by its bare name first, then by its path:
+  ;; images published at boot answer the bare name, images published for a
+  ;; mount loaded later answer the path (as the apply port already relies
+  ;; on). One form for both is a question for the driver.
+  (define (hook state spec index)
+    (define binding (Ix index spec))
+    (define image (module (images state) (_0 binding)))
+    (define bare (Try (lambda (ignored) (force (driver:get-perc (_1 binding) image))) 0))
+    (If (Eq 1 (Hd bare)) (driver:get-perc [(_0 binding) (_1 binding)] image) (_0 bare)))
+  ;; One more mount, after boot: the same steps the boot fold takes, on the
+  ;; live state. Routes and start hooks are not wired here yet. Reconciling
+  ;; only publishes, so a publish-only ports record serves it.
+  (define refuse-mount (lambda (spec state)
+    ((abi:result core "err") ((abi:constructor core ["source_mount" "failure"]) "Not while mounting" 0))))
+  (define publish-ports ((abi:constructor core ["source_mount" "ports"]) attempt attempt-text attempt-apply refuse-mount))
+  ;; Each step is named in its failure, and a publication that fails leaves
+  ;; the mount record saying so rather than failing the mount: the worker
+  ;; reads that record and reports the diagnostic.
+  (define (step label thunk)
+    (define result (Try thunk 0))
+    (If (Eq 1 (Hd result)) (error [label (_0 result)]) (_0 result)))
+  (define (mount-later spec state)
+    (define scanned (step "load" (lambda (ignored) ((tool ["source_mount" "load"])
+      reader (_0 spec) (_1 spec) (_2 spec) spec state))))
+    (define published (step "publish" (lambda (ignored)
+      ((tool ["source_mount" "reconcile_one"]) publish-ports (home self spec) scanned))))
+    (Ifz ((tool ["source_mount" "is_ready"]) (home self spec) published) published
+      (let* ((activated (If (Sz (_5 spec))
+                (step "activate" (lambda (ignored) (need-ok ((hook published spec 5) published))))
+                published))
+             ;; Routes go to the HTTP foot through its routes record; a start hook
+             ;; waits under /io/mcp/starts for the mcp worker, which holds the server.
+             (routed (Ifz (Sz (_6 spec)) activated
+               (let* ((plan (step "routes:hook" (lambda (ignored) (hook activated spec 6))))
+                      (files (step "routes:snapshot" (lambda (ignored) ((tool ["source_mount" "snapshot"]) (home self spec) activated))))
+                      (frozen (step "routes:config" (lambda (ignored) (plan files activated))))
+                      (extra (step "routes:assets" (lambda (ignored)
+                        ((driver:get-perc ["http_foot" "live_assets"] http) (home self spec) (_2 spec) frozen)))))
+                 (step "routes:offer" (lambda (ignored)
+                   ((driver:get-perc ["http_foot" "offer_routes"] http) (mount-key (_0 spec)) (_0 extra) activated)))))))
+        (Ifz (Sz (_7 spec)) routed
+          (Seq routed
+            (let* ((run (step "start:hook" (lambda (ignored) (hook routed spec 7)))))
+              (step "start:offer" (lambda (ignored)
+                ((tool ["source_mount" "offer_start"]) (mount-key (_0 spec))
+                  ((abi:constructor core ["helm" "starter"]) run (Ix 8 spec)) routed)))))))))
+  (define (attempt-mount spec state)
+    (define result (Try (lambda (ignored) (force (mount-later spec state))) 0))
+    (If (Eq 1 (Hd result))
+      ((abi:result core "err")
+        ((abi:constructor core ["source_mount" "failure"]) "Mount failed" (_0 result)))
+      ((abi:result core "ok") (_0 result))))
+  (define ports ((abi:constructor core ["source_mount" "ports"]) attempt attempt-text attempt-apply attempt-mount))
   (Seq (print "Core publication compiled") 0)
   (define initial (need-ok ((driver:get-perc ["eden" "boot"] eden)
     self (bootstrap:trusted system) (_1 (_0 local)) port)))
-  (define reader ((tool ["fs_read" "remote"]) scan-port scan-token))
   (define loaded
     (foldl (lambda (state spec)
       (define scanned ((tool ["source_mount" "load"])
-        reader (_0 spec) (_1 spec) (_2 spec) state))
+        reader (_0 spec) (_1 spec) (_2 spec) spec state))
       (define published ((tool ["source_mount" "reconcile_one"])
         ports (home self spec) scanned))
       ((tool ["source_mount" "require_ready"]) [(home self spec)] published))
       initial specs))
-  (define (hook state spec index)
-    (define binding (Ix index spec))
-    (driver:get-perc (_1 binding) (module (images state) (_0 binding))))
   (define installed
     (foldl (lambda (state spec)
       (If (Sz (_5 spec))
         (Seq (print ["Activating mount" (_0 spec)])
           (need-ok ((hook state spec 5) state))) state)) loaded specs))
-  (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
   (define config
     (foldl (lambda (config spec)
@@ -154,7 +242,7 @@
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
   (define server ((driver:get-perc ["eden" "serve_read"] eden)
-    ((tool ["source_mount" "access"]) ports homes) reader installed
+    ((tool ["source_mount" "access"]) ports) reader installed
     ((driver:get-perc ["http_foot" "run_with"] http) config)))
   (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
   (Seq server (foldl (lambda (ignored spec)

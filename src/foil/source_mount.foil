@@ -1,5 +1,7 @@
 - fs_sync
 - helm
+- http_foot
+- json
 - show
 
 ' A source scan is retained even when its publication fails.
@@ -13,7 +15,17 @@
   + image
     : modules=any
   + ports
+    ' publish compiles a mount's source records and publishes them.
+    ' compile checks one module given as text, in the running world's
+    ' context, and publishes nothing; it answers the entry count.
+    ' apply runs one published entry, module and name, on [name value]
+    ' text pairs; the entry answers JSON text.
+    ' mount loads, publishes and activates one more mount, given its
+    ' runtime spec, in the running world.
     : publish={\ path namespace}either[pail namespace]
+      compile={\ str str namespace}either[pail nat]
+      apply={\ str str row[[name=str value=str]] namespace}either[pail str]
+      mount={\ any namespace}either[pail namespace]
   + slot
     \ name=iota
     ^ path
@@ -148,32 +160,133 @@
           update.put((source_mount/slot 'diagnostic) why).put((source_mount/slot 'diagnostic_text)
             (pails/t (str/from_atom (show/pail why))))
     | source_mount/write home update next
+  + homes
+    '  Every mount the world holds: the children of /io/fs carrying a
+    '  manifest. Read each time, so a mount loaded after boot counts.
+    \ state=namespace
+    ^ row[path]
+    = root=path [state.self 'io 'fs]
+      none=row[path] []
+    | (sovereign_peek root state).kid_tap.fold none
+    \ out=row[path] [key child]
+    ? child.fil
+     > (./some record)
+      ? (maybe/is_some record.get(grove_dev/metadata_slot)) out.snoc(root.snoc(key))
+      | out
+    out
+  + runtime_specs
+    '  The runtime spec each mount was loaded with, as the host wrote it.
+    \ state=namespace
+    ^ row[any]
+    = none=row[any] []
+    | (source_mount/homes state).fold none
+    \ out=row[any] home=path
+    ? (source_mount/record home state).get((source_mount/slot 'runtime))
+     > (./some held)
+      ? held
+       > x=pails/code out.snoc(x.v)
+      out
+    out
   + reconcile
-    \ ports=source_mount/ports homes=row[path] state=namespace
+    \ ports=source_mount/ports state=namespace
     ^ namespace
-    | homes.fold state
+    | (source_mount/homes state).fold state
       \ state=namespace home=path
       | source_mount/reconcile_one ports home state
+  + deep
+    '  Any value as text, rows in parentheses: compile failures are nested
+    '  rows and the standard printer cuts them at three levels.
+    \ v=any depth=nat
+    ^ str
+    ? (gt depth 24) "..."
+    ? (rep_pin v) (source_mount/deep (rep_unpin v) depth)
+    ? (rep_law v) "law"
+    ? !(rep_app v) (str/from_atom (show/leaf v))
+    = n (rep_sz v)
+      h (rep_hd v)
+      parts
+        % idx=nat 0 out=row[str] []
+        ? (ge idx n) out
+        ? (gt idx 64) out.snoc("...")
+        | _ idx.inc out.snoc((source_mount/deep (rep_ix idx v) depth.inc))
+      head=str (? (eq h 0) "" (str/cat_all [(str/from_atom (show/leaf h)) " "]))
+    | str/cat_all ["(" head (str/join " " parts) ")"]
+  + compiled_json
+    \ entries=nat
+    ^ str
+    | show (json/obj [(jkv "ready" (json/boo .true)) (jkv "entries" (json/num .false entries))])
+  + failure_json
+    \ why=pail
+    ^ str
+    | show (json/obj [(jkv "ready" (json/boo .false)) (jkv "failure" (json/str (source_mount/deep why 0)))])
+  + starts_home
+    \ self=iota key=iota
+    ^ path
+    [self 'io 'mcp 'starts key]
+  + offer_start
+    '  A mount's start hook and its arguments, left where the mcp worker
+    '  looks for them after a mount; the worker runs the hook with the
+    '  server handle it was given at its own start.
+    \ key=iota starter=helm/starter state=namespace
+    ^ namespace
+    = home (source_mount/starts_home state.self key)
+      record (myth/new).put(['hook] (pails/code starter))
+      request (helm/card/step home (writ/make record))
+      [next index reply] (helm/supervisor/handle request state (sovereign_hive state))
+    next
+  + cull
+    \ target=path state=namespace
+    ^ namespace
+    = [next index reply] (helm/supervisor/handle (helm/card/step target .cull) state (sovereign_hive state))
+    next
+  + unmount
+    '  Forget a mount: withdraw its routes, drop its start hook, cull its
+    '  record and sources. Its publication stays in /lib until a restart;
+    '  a worker it started keeps running.
+    \ key=iota state=namespace
+    ^ namespace
+    = withdrawn (http_foot/offer_routes key [] state)
+      unstarted (source_mount/cull (source_mount/starts_home state.self key) withdrawn)
+    | source_mount/cull [state.self 'io 'fs key] unstarted
   + handle
-    \ ports=source_mount/ports homes=row[path]
+    '  The compile, apply and mount cards are answered here, where the ports
+    '  are; every other card takes the supervisor's ordinary path, and a
+    '  step may leave a mount pending, which reconcile then publishes.
+    \ ports=source_mount/ports
       card=helm/card state=namespace index=hive
     ^ [namespace hive feet/task[unit]]
+    ? card
+     > (./compile request name text)
+      ? (ports.compile name text state)
+       > (./ok entries) [state index (feet/task/develop request 200 (source_mount/compiled_json entries))]
+       > (./err why) [state index (feet/task/develop request 409 (source_mount/failure_json why))]
+     > (./apply request module name args)
+      ? (ports.apply module name args state)
+       > (./ok text) [state index (feet/task/develop request 200 text)]
+       > (./err why) [state index (feet/task/develop request 409 (source_mount/failure_json why))]
+     > (./mount request spec)
+      ? (ports.mount spec state)
+       > (./ok next) [next (sovereign_hive next) (feet/task/develop request 200 (source_mount/compiled_json 0))]
+       > (./err why) [state index (feet/task/develop request 409 (source_mount/failure_json why))]
+     > (./unmount request key)
+      = next (source_mount/unmount key state)
+      [next (sovereign_hive next) (feet/task/develop request 200 (source_mount/compiled_json 0))]
     = [next index reply]
         (helm/supervisor/handle card state index)
     = updated
         ? card
          > (./step _ _)
-          (source_mount/reconcile ports homes next)
+          (source_mount/reconcile ports next)
         next
     = index
         ? (eq updated.local.top next.local.top) index
         | sovereign_hive updated
     [updated index reply]
   + access
-    \ ports=source_mount/ports homes=row[path]
+    \ ports=source_mount/ports
     ^ helm/supervisor/access[namespace]
     | helm/supervisor/access/set_handle[namespace]
-      (source_mount/handle ports homes)
+      (source_mount/handle ports)
       helm/supervisor/local_access
   + rescan
     \ ignored=myth current=myth
@@ -189,15 +302,21 @@
     ? (eq parts.len 1) parts.at(0)
     | $ta name
   + load
+    '  runtime is the host's spec row for this mount; it rides on the mount
+    '  record so the world can list its mounts without the boot list.
     \ reader={\ str}either[str row[fs_read/file]]
-      name=str folder=str manifest=str state=namespace
+      name=str folder=str manifest=str runtime=any state=namespace
     ^ namespace
     = home=path [state.self 'io 'fs (source_mount/mount_key name)]
     = target (home.snoc('source))
     = base (fs/cfg folder target (fs/extensions (mop/empty))
         [state.self 'kook 'fs])
     = spec (source_mount/spec name manifest)
-    = cfg base.put((source_mount/slot 'spec) spec).put(grove_dev/metadata_slot (pails/t manifest))
+    = cfg
+        . base
+          put((source_mount/slot 'spec) spec)
+          put(grove_dev/metadata_slot (pails/t manifest))
+          put((source_mount/slot 'runtime) (pails/code runtime))
     = request (helm/card/step home (writ/make cfg))
     = [ready index reply]
         (helm/supervisor/handle request state
@@ -224,6 +343,11 @@
     = [loaded index] (source_mount/write_with home
         (myth/sing bond/res batch) pending index)
     loaded
+  + is_ready
+    \ home=path state=namespace
+    ^ nat
+    ? (source_mount/status_at home state).ready 1
+    0
   + require_ready
     \ homes=row[path] state=namespace
     ^ namespace
