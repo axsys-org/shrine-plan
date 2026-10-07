@@ -63,7 +63,12 @@ mounts, and a mount is recompiled in the running world when its files change.
 ### Develop a mount
 
 1. `mcp/list-files` and `mcp/get-file` to read the Grove and Foil.
-2. `mcp/insert-file` with the complete new text. Read the result.
+2. `mcp/test-build` with a module as text to check it before writing it
+   anywhere: `ready` with the entry count, or `failure` with the line and
+   column. The text sees every module the world has loaded, so imports
+   work; nothing is installed. The first call after a boot takes about
+   fifteen seconds while the compiler warms; later ones a quarter second.
+3. `mcp/insert-file` with the complete new text. Read the result.
 3. `mcp/commit` to recompile from the files on disk when they were changed
    another way.
 4. `mcp/install-app` to install an instance, or with `replace: true` to
