@@ -1,5 +1,6 @@
 - fs_sync
 - helm
+- json
 - show
 
 ' A source scan is retained even when its publication fails.
@@ -13,7 +14,14 @@
   + image
     : modules=any
   + ports
+    ' publish compiles a mount's source records and publishes them.
+    ' compile checks one module given as text, in the running world's
+    ' context, and publishes nothing; it answers the entry count.
+    ' apply runs one published entry, module and name, on [name value]
+    ' text pairs; the entry answers JSON text.
     : publish={\ path namespace}either[pail namespace]
+      compile={\ str str namespace}either[pail nat]
+      apply={\ str str row[[name=str value=str]] namespace}either[pail str]
   + slot
     \ name=iota
     ^ path
@@ -154,10 +162,48 @@
     | homes.fold state
       \ state=namespace home=path
       | source_mount/reconcile_one ports home state
+  + deep
+    '  Any value as text, rows in parentheses: compile failures are nested
+    '  rows and the standard printer cuts them at three levels.
+    \ v=any depth=nat
+    ^ str
+    ? (gt depth 24) "..."
+    ? (rep_pin v) (source_mount/deep (rep_unpin v) depth)
+    ? (rep_law v) "law"
+    ? !(rep_app v) (str/from_atom (show/leaf v))
+    = n (rep_sz v)
+      h (rep_hd v)
+      parts
+        % idx=nat 0 out=row[str] []
+        ? (ge idx n) out
+        ? (gt idx 64) out.snoc("...")
+        | _ idx.inc out.snoc((source_mount/deep (rep_ix idx v) depth.inc))
+      head=str (? (eq h 0) "" (str/cat_all [(str/from_atom (show/leaf h)) " "]))
+    | str/cat_all ["(" head (str/join " " parts) ")"]
+  + compiled_json
+    \ entries=nat
+    ^ str
+    | show (json/obj [(jkv "ready" (json/boo .true)) (jkv "entries" (json/num .false entries))])
+  + failure_json
+    \ why=pail
+    ^ str
+    | show (json/obj [(jkv "ready" (json/boo .false)) (jkv "failure" (json/str (source_mount/deep why 0)))])
   + handle
+    '  The compile card is answered here, where the ports are; every other
+    '  card takes the supervisor's ordinary path, and a step may leave a
+    '  mount pending, which reconcile then publishes.
     \ ports=source_mount/ports homes=row[path]
       card=helm/card state=namespace index=hive
     ^ [namespace hive feet/task[unit]]
+    ? card
+     > (./compile request name text)
+      ? (ports.compile name text state)
+       > (./ok entries) [state index (feet/task/develop request 200 (source_mount/compiled_json entries))]
+       > (./err why) [state index (feet/task/develop request 409 (source_mount/failure_json why))]
+     > (./apply request module name args)
+      ? (ports.apply module name args state)
+       > (./ok text) [state index (feet/task/develop request 200 text)]
+       > (./err why) [state index (feet/task/develop request 409 (source_mount/failure_json why))]
     = [next index reply]
         (helm/supervisor/handle card state index)
     = updated
