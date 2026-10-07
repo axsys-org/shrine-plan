@@ -150,6 +150,25 @@ def prepare(mounts, work, check, cleanup, context):
     return result
 
 
+def runtime_spec(mount, args, dependencies):
+    """The row the world is handed for one mount: name, bag, manifest, modules,
+    Grove units, the three hooks, hook arguments, inspection flag, dependencies,
+    assets and routes."""
+    data = mount.manifest
+    def hook(key):
+        value = data.get(key)
+        return [value['module'], value['entry']] if value else []
+    return [mount.name, 'mounts/' + mount.name,
+            json.dumps(data, sort_keys=True),
+            list(data.get('modules', {}).items()),
+            [[u['root'], u['files'], u.get('prelude', 'grove_role_runtime')]
+             for u in data.get('grove', [])],
+            hook('activate'), hook('http'), hook('start'), args,
+            int(bool(data.get('inspection'))),
+            dependencies,
+            list(data.get('assets', {}).values()), data.get('routes', [])]
+
+
 def runtime_specs(prepared, source_root):
     """Allocate scan bags in the runtime file root; never overlay core modules."""
     directory = source_root / 'mounts'
@@ -168,19 +187,7 @@ def runtime_specs(prepared, source_root):
     for mount, folder, args, _ in prepared:
         # A request-scoped scanner refreshes this bag from the live checkout.
         (directory / mount.name).mkdir()
-        data = mount.manifest
-        def hook(key):
-            value = data.get(key)
-            return [value['module'], value['entry']] if value else []
-        specs.append([mount.name, 'mounts/' + mount.name,
-                      json.dumps(data, sort_keys=True),
-                      list(data.get('modules', {}).items()),
-                      [[u['root'], u['files'], u.get('prelude', 'grove_role_runtime')]
-                       for u in data.get('grove', [])],
-                      hook('activate'), hook('http'), hook('start'), args,
-                      int(bool(data.get('inspection'))),
-                      dependencies(mount),
-                      list(data.get('assets', {}).values()), data.get('routes', [])])
+        specs.append(runtime_spec(mount, args, dependencies(mount)))
     return specs
 
 
@@ -221,6 +228,36 @@ class ScanBridge:
         self.server = socketserver.TCPServer(('127.0.0.1', 0), Handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def add(self, mount, work, cleanup, context):
+        """Stage a mount that appeared after boot and serve its bag from now on.
+        Returns its runtime spec. Only a mount without dependencies is taken:
+        the world already holds everything it could depend on, or it does not."""
+        key = 'mounts/' + mount.name
+        if key in self.roots:
+            raise ValueError('Mount already staged')
+        if mount.manifest.get('dependencies'):
+            raise ValueError('A mount added after boot cannot declare dependencies')
+        prepared = prepare([mount], work, False, cleanup, context)
+        m, folder, args, module = prepared[0]
+        (self.destination / key).mkdir()
+        self.roots[key] = folder
+        self.originals[key] = m.root
+        self.scanners[key] = (m, folder, module)
+        self.manifests[key] = m.manifest
+        self.refresh(key)
+        return runtime_spec(m, args, [])
+
+    def remove(self, name):
+        """Stop serving a mount's bag; the world forgets it separately."""
+        key = 'mounts/' + name
+        if key not in self.roots:
+            raise ValueError('Unknown source mount')
+        for table in (self.roots, self.originals, self.scanners, self.manifests):
+            table.pop(key, None)
+        staged = self.destination / key
+        if staged.exists():
+            shutil.rmtree(staged)
 
     def refresh(self, name):
         if name not in self.roots:

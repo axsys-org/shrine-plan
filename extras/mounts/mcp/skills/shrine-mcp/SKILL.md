@@ -78,21 +78,43 @@ mounts, and a mount is recompiled in the running world when its files change.
 
 `mcp/add-tool` takes a Foil function `+ <name>` with
 `\ args=row[[name=str value=str]] ^ str` that answers JSON text
-(`mcp_tools_user/arg "text" args` reads one argument). It is checked
-together with the `mcp-tools` module first, so a mistake comes back as the
-compiler's error and nothing is written; then it is appended to that
-module, compiled and published like any mount code, declared under
-`/app/mcp_tools/mcp`, and listed as `mcp_tools/<name>`. Calling the tool
-runs the function and returns its JSON. A function that outgrows the
-scratch module belongs in a mount of its own.
+(`scratch/arg "text" args` reads one argument). It is checked together
+with the `scratch` package first, so a mistake comes back as the compiler's
+error and nothing is written; then it is appended to that package with its
+tools table regenerated, compiled and published like any mount code, and
+listed as `scratch/<name>`. A function that outgrows `scratch` belongs in a
+package of its own: `mcp/new-mount`.
+
+### Packages
+
+A mount is a package: a folder of source the world loads. Some packages are
+apps (Grove types, views, an instance under `/app`); some are libraries
+(`scratch`, `web`, the `mcp` server itself). The namespace is where things
+live: `/lib/<package>/<module>/<entry>` for published code, `/app/<name>`
+for running instances. Package is not app.
+
+- `mcp/new-mount name` makes a package in the running world: a folder in
+  the checkout with one empty module, staged, loaded and published. Give
+  `manifest` (the mount.json text) and `files` to make a complete package
+  in one call, with Grove, routes and a start hook; its routes serve and
+  its worker runs without a restart. It cannot declare dependencies.
+- `mcp/unload-mount name` removes one: its instance, routes, record and
+  sources. The folder is archived, not deleted.
+- The server imports published tools a few seconds after it starts;
+  list the tools again if one you expect is missing right after a boot.
+- A package declares the tools it publishes in code: a module entry
+  `tools` that answers a JSON array of `{name, description, params}`;
+  each named entry is a function of the add-tool shape. `mcp/import-tools`
+  finds them and lists them as `<package>/<name>`.
 
 ## Tools apps publish
 
 Tools named `<app>/<name>` (such as `demo/grade`) come from records the app
 seeded under `/app/<app>/mcp`; each is a read, a press or a write with the
-path and button fixed by the app. After `mcp/install-app` or a change to
-those records, call `mcp/import-tools` and list the tools again. The
-convention is in the mount's `PUBLISH.md`.
+path and button fixed by the app, or a `foil` function. After
+`mcp/install-app`, `mcp/new-mount` or a change to those records, call
+`mcp/import-tools` and list the tools again. The convention is in the
+mount's `PUBLISH.md`.
 
 ## Chorus slips
 

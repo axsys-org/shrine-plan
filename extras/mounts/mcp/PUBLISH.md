@@ -1,9 +1,15 @@
-# Publishing tools from an app
+# Publishing tools
+
+One rule: a thing declares the tools it publishes, where it already lives.
+There are two forms.
+
+## An app: records under its instance
 
 An app publishes a tool by seeding a record under its instance at
 `/app/<app>/mcp/<name>`. The MCP server lists it as `<app>/<name>` and runs
-it through one of its own built-ins. No code runs in the publishing app: a
-published tool names a thing, a button or a set of properties.
+it through one of its own built-ins. No code runs in the publishing app
+unless the kind is `foil`: a published tool names a thing, a button, a set
+of properties, or a function.
 
 | Slot | Meaning |
 |---|---|
@@ -34,6 +40,22 @@ tool_kind =
 
 `extras/mounts/grove-dev/demo.grove` carries three: `demo/grade` (press),
 `demo/show_card` (read) and `demo/add_note` (write).
+
+## A package: a `tools` entry in code
+
+A package without an instance (a library such as `scratch`) declares its
+tools in a module entry named `tools`:
+
+```
+  + tools
+    \ ignored=row[[name=str value=str]]
+    ^ str
+    | show (json/arr [(json/obj [(jkv "name" (json/str "word_count")) (jkv "description" (json/str "Count words.")) (jkv "params" (json/str "text: The text"))])])
+```
+
+Each named entry is a function `\ args=row[[name=str value=str]] ^ str`
+answering JSON text, in the same module. The server lists them as
+`<package>/<name>`; `mcp/add-tool` maintains such a table in `scratch`.
 
 The server imports published tools when it starts and whenever
 `mcp/import-tools` is called; call it after `mcp/install-app` or a change

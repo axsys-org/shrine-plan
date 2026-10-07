@@ -23,8 +23,11 @@
       mcp_foot/tick
       mcp_foot/wrote
       mcp_foot/fetched
+      mcp_foot/started
   + fetched
     : kid=iota ok=bool text=str
+  + started
+    : kid=iota ok=bool
   + tick
     : kid=iota
   + wrote
@@ -36,7 +39,7 @@
     : kid=iota id=json reply=path call=json awaiting=path serial=nat stage=str data=json
   + state
     : home=path token=str host=str hostkey=str seen=row[iota] jobs=row[mcp_foot/job]
-      writes=row[mcp_foot/write] waiting=bool serial=nat published=row[mcp_tools/published]
+      writes=row[mcp_foot/write] waiting=bool serial=nat published=row[mcp_tools/published] server=nat
   + bar
     \ text=str
     ^ nat
@@ -221,6 +224,19 @@
     = serial s.serial.inc
     ; | Send parent | feet/gift/apply serial module name args
     | (mcp_foot/keep job.set_serial(serial).set_stage(stage) s).set_serial(serial)
+  + ask_mount
+    '  Load a staged mount from its runtime spec; the reply arrives as a develop.
+    \ parent=nat spec=any job=mcp_foot/job stage=str s=mcp_foot/state
+    ^ mcp_foot/state
+    = serial s.serial.inc
+    ; | Send parent | feet/gift/mount serial spec
+    | (mcp_foot/keep job.set_serial(serial).set_stage(stage) s).set_serial(serial)
+  + ask_unmount
+    \ parent=nat key=iota job=mcp_foot/job stage=str s=mcp_foot/state
+    ^ mcp_foot/state
+    = serial s.serial.inc
+    ; | Send parent | feet/gift/unmount serial key
+    | (mcp_foot/keep job.set_serial(serial).set_stage(stage) s).set_serial(serial)
   + ask_compile
     '  Check one module given as text; the reply arrives as a develop.
     \ parent=nat name=str text=str job=mcp_foot/job stage=str s=mcp_foot/state
@@ -277,6 +293,56 @@
           ? (eq status 200) (mcp_foot/fetched kid .true (mcp_foot/unbar body))
           | mcp_foot/fetched kid .false (str/cat_all ["The page answered " (nat/show status)])
     ; | Send parent outcome
+    | CloseHandle parent
+  + mounter
+    '  Asks the host to create a mount folder (with the manifest and files
+    '  given, or one empty module) and stage it; answers the JSON reply.
+    \ host=str hostkey=str arguments=json kid=iota self=nat
+    ^ nat
+    = ;[ignored caps] (Recv[nat] 0)
+      parent caps.at(0)
+      body (show arguments)
+      headers [[(mcp_foot/bar "x-token") (mcp_foot/bar hostkey)] [(mcp_foot/bar "content-type") (mcp_foot/bar "application/json")]]
+      ;result (Fetch [(mcp_foot/bar "POST") (mcp_foot/bar (str/cat_all [host "/mount"])) headers [(mcp_foot/bar body)]] [[] 30000 0 [65536]])
+      outcome=mcp_foot/fetched
+        ? result
+         > (./err code) (mcp_foot/fetched kid .false (str/cat_all ["The host could not be reached: fetch error " (nat/show code)]))
+         > (./ok response)
+          = [status url hs answer] response
+          ? (eq status 200) (mcp_foot/fetched kid .true (mcp_foot/unbar answer))
+          | mcp_foot/fetched kid .false (str/cat_all ["The host refused the mount: " (mcp_foot/unbar answer)])
+    ; | Send parent outcome
+    | CloseHandle parent
+  + unmounter
+    '  Asks the host to forget a mount's folder; it is archived, not deleted.
+    \ host=str hostkey=str mount=str kid=iota self=nat
+    ^ nat
+    = ;[ignored caps] (Recv[nat] 0)
+      parent caps.at(0)
+      body (show (json/obj [(jkv "name" (json/str mount))]))
+      headers [[(mcp_foot/bar "x-token") (mcp_foot/bar hostkey)] [(mcp_foot/bar "content-type") (mcp_foot/bar "application/json")]]
+      ;result (Fetch [(mcp_foot/bar "POST") (mcp_foot/bar (str/cat_all [host "/unmount"])) headers [(mcp_foot/bar body)]] [[] 30000 0 [65536]])
+      outcome=mcp_foot/fetched
+        ? result
+         > (./err code) (mcp_foot/fetched kid .false (str/cat_all ["The host could not be reached: fetch error " (nat/show code)]))
+         > (./ok response)
+          = [status url hs answer] response
+          ? (eq status 200) (mcp_foot/fetched kid .true (mcp_foot/unbar answer))
+          | mcp_foot/fetched kid .false (str/cat_all ["The host refused: " (mcp_foot/unbar answer)])
+    ; | Send parent outcome
+    | CloseHandle parent
+  + starter_run
+    '  Runs a mount's start hook with the server handle, as boot would have.
+    \ st=helm/starter server=nat kid=iota self=nat
+    ^ nat
+    = ;[ignored caps] (Recv[nat] 0)
+      parent caps.at(0)
+      ;result (Try (\ ignored=nat (st.run server st.args)) 0)
+      ok=bool
+        ? result
+         > (./ok _) .true
+         > (./err _) .false
+    ; | Send parent | mcp_foot/started kid ok
     | CloseHandle parent
   + later
     \ ms=nat job=mcp_foot/job stage=str s=mcp_foot/state
@@ -432,13 +498,26 @@
       ? (eq module.len 0) (mcp_foot/fail job "name is required" s)
       ? (eq text.len 0) (mcp_foot/fail job "text is required" s)
       | mcp_foot/ask_compile parent module text job "build-result" s
+    ? (equal name "mcp/new-mount")
+      = mount (mcp_rpc/text_at "name" arguments)
+      ? (eq mount.len 0) (mcp_foot/fail job "name is required" s)
+      = ;helper (Spawn (mcp_foot/mounter s.host s.hostkey arguments job.kid))
+      ; | SendCaps helper 0 [0]
+      ; | CloseHandle helper
+      | mcp_foot/keep job.set_stage("mount-staged") s
+    ? (equal name "mcp/unload-mount")
+      = mount (mcp_rpc/text_at "name" arguments)
+      ? (eq mount.len 0) (mcp_foot/fail job "name is required" s)
+      ? (equal mount "mcp") (mcp_foot/fail job "The mcp mount serves this call" s)
+      ' A Grove instance goes first, through the develop status.
+      | mcp_foot/ask_develop parent (mcp_foot/status_query [node 'gov (mcp_foot/mount_key mount)] [node 'app (mcp_foot/mount_key mount)]) job "unload-status" s
     ? (equal name "mcp/add-tool")
       = fn (mcp_rpc/text_at "function" arguments)
         text (mcp_rpc/text_at "text" arguments)
       ? !(mcp_foot/entry_name_ok fn) (mcp_foot/fail job "function is a Foil name: lowercase letters, digits and underscores, starting with a letter" s)
       ? (eq text.len 0) (mcp_foot/fail job "text is required" s)
       ' The current module first; the function is checked as part of it.
-      | mcp_foot/ask_page parent [node 'io 'fs ($ta "mcp-tools") 'source ($ta "tools.foil")] job "tool-read" s
+      | mcp_foot/ask_page parent [node 'io 'fs 'scratch 'source ($ta "main.foil")] job "tool-read" s
     ? (equal name "chorus/publish-slip") (mcp_foot/slip_publish parent job s)
     ? (equal name "chorus/fetch-slip") (mcp_foot/slip_fetch parent job s)
     ? (equal name "chorus/discard-slip") (mcp_foot/slip_discard parent job s)
@@ -597,6 +676,180 @@
       [(jkv "path" (json/str (path_show pax)))
        (jkv "drawer" (json/boo .true))
        (jkv "holds" (mcp_foot/strings_json tree.kid_tap.map((\ [key child] (iota_show key)))))]
+  ' ---- mounts made after boot
+  + item
+    \ items=row[json] i=nat
+    ^ json
+    ? (lt i items.len) items.at(i)
+    jnull
+  + text_in
+    \ value=json
+    ^ str
+    | (mcp_rpc/text_of value).fall("")
+  + strings_in
+    \ value=json
+    ^ row[str]
+    ? value
+     > (./arr xs) xs.map(mcp_foot/text_in)
+    []
+  + num_in
+    \ value=json
+    ^ nat
+    ? value
+     > (./num neg n) n
+    0
+  + pairs_in
+    \ value=json
+    ^ row[[str str]]
+    = none=row[[str str]] []
+    ? value
+     > (./arr xs)
+      | xs.fold none
+      \ out=row[[str str]] x=json
+      = parts (mcp_foot/strings_in x)
+      ? (lt parts.len 2) out
+      | out.snoc([parts.at(0) parts.at(1)])
+    none
+  + units_in
+    \ value=json
+    ^ row[[str row[str] str]]
+    = none=row[[str row[str] str]] []
+    ? value
+     > (./arr xs)
+      | xs.fold none
+      \ out=row[[str row[str] str]] x=json
+      ? x
+       > (./arr parts) out.snoc([(mcp_foot/text_in (mcp_foot/item parts 0)) (mcp_foot/strings_in (mcp_foot/item parts 1)) (mcp_foot/text_in (mcp_foot/item parts 2))])
+      out
+    none
+  + spec_of
+    '  The host's runtime spec row, as eden hands it to the world at boot:
+    '  name, bag, manifest, modules, Grove units, three hooks, hook
+    '  arguments, inspection flag, dependencies, assets, routes.
+    \ value=json
+    ^ [str str str row[[str str]] row[[str row[str] str]] row[str] row[str] row[str] row[str] nat row[str] row[str] row[str]]
+    = items=row[json]
+        ? value
+         > (./arr xs) xs
+        []
+    [(mcp_foot/text_in (mcp_foot/item items 0))
+     (mcp_foot/text_in (mcp_foot/item items 1))
+     (mcp_foot/text_in (mcp_foot/item items 2))
+     (mcp_foot/pairs_in (mcp_foot/item items 3))
+     (mcp_foot/units_in (mcp_foot/item items 4))
+     (mcp_foot/strings_in (mcp_foot/item items 5))
+     (mcp_foot/strings_in (mcp_foot/item items 6))
+     (mcp_foot/strings_in (mcp_foot/item items 7))
+     (mcp_foot/strings_in (mcp_foot/item items 8))
+     (mcp_foot/num_in (mcp_foot/item items 9))
+     (mcp_foot/strings_in (mcp_foot/item items 10))
+     (mcp_foot/strings_in (mcp_foot/item items 11))
+     (mcp_foot/strings_in (mcp_foot/item items 12))]
+  + on_staged
+    '  The host made and staged the folder: ask the world to load it.
+    \ parent=nat job=mcp_foot/job ok=bool text=str s=mcp_foot/state
+    ^ mcp_foot/state
+    ? !ok (mcp_foot/fail job text s)
+    = answer (mcp_foot/status_json text)
+      spec (mcp_foot/spec_of (mcp_rpc/field "spec" answer).fall(jnull))
+      named job.set_data((json/obj [(jkv "mount" (json/str (mcp_rpc/text_at "name" answer)))]))
+    | mcp_foot/ask_mount parent spec named "mount-done" s
+  ' ---- the scratch package's generated tools table
+  + has_quote
+    \ text=str
+    ^ bool
+    % i=nat 0
+    ^ bool
+    ? (ge i text.len) .false
+    ? (eq text.at(i) 34) .true
+    | _ i.inc
+  + quoted_in
+    '  The double-quoted strings on one line, in order.
+    \ line=str
+    ^ row[str]
+    = none=row[str] []
+    % i=nat 0 start=maybe[nat] .none out=row[str] none
+    ^ row[str]
+    ? (ge i line.len) out
+    ? !(eq line.at(i) 34) (_ i.inc start out)
+    ? start
+     > (./some from) (_ i.inc .none out.snoc(line.slice(from (sub i from))))
+     > .none (_ i.inc (./some i.inc) out)
+    out
+  + table_marker
+    ^ str
+    "  ' ---- tools, maintained by mcp/add-tool: name, description, params"
+  + table_rows
+    '  The rows of the generated table in a module's text.
+    \ text=str
+    ^ row[[str str str]]
+    = none=row[[str str str]] []
+      lines text.split_byte(10)
+      marker mcp_foot/table_marker
+    % i=nat 0 seen=bool .false out=row[[str str str]] none
+    ^ row[[str str str]]
+    ? (ge i lines.len) out
+    = line lines.at(i)
+    ? !seen (_ i.inc (equal line marker) out)
+    ' The rows end where the tools entry begins.
+    ? (equal line "  + tools") out
+    = quoted (mcp_foot/quoted_in line)
+    ? (lt quoted.len 3) (_ i.inc seen out)
+    | _ i.inc seen out.snoc([quoted.at(0) quoted.at(1) quoted.at(2)])
+  + table_text
+    \ rows=row[[str str str]]
+    ^ str
+    = q (str/from_atom 34)
+      bs (str/from_atom 92)
+      nl (str/from_atom 10)
+      cells rows.map((\ [name desc params] (str/cat_all ["[" q name q " " q desc q " " q params q "]"])))
+    | str/cat_all
+      [mcp_foot/table_marker nl
+       "  + table" nl "    ^ row[[str str str]]" nl
+       "    [" (str/join (str/cat_all [nl "     "]) cells) "]" nl
+       "  + tools" nl
+       "    " bs " ignored=row[[name=str value=str]]" nl
+       "    ^ str" nl
+       "    = rows scratch/table" nl
+       "    | show (json/arr rows.map((" bs " [name desc params] (json/obj [(jkv " q "name" q " (json/str name)) (jkv " q "description" q " (json/str desc)) (jkv " q "params" q " (json/str params))]))))" nl]
+  + or_bool
+    \ a=bool b=bool
+    ^ bool
+    ? a .true
+    b
+  + without_entry
+    '  The module text without the top-level entry of this name, if any.
+    \ text=str fn=str
+    ^ str
+    = nl (str/from_atom 10)
+      lines text.split_byte(10)
+      opener (str/cat_all ["  + " fn])
+      none=row[str] []
+      kept
+        % i=nat 0 skipping=bool .false out=row[str] none
+        ^ row[str]
+        ? (ge i lines.len) out
+        = line lines.at(i)
+          starts (and (gt line.len 3) (equal line.slice(0 4) "  + "))
+          marker (equal line mcp_foot/table_marker)
+        ? (equal line opener) (_ i.inc .true out)
+        ? (and skipping !(mcp_foot/or_bool starts marker)) (_ i.inc .true out)
+        | _ i.inc .false out.snoc(line)
+    | str/join nl kept
+  + with_tool
+    '  The module text with one function appended before the generated
+    '  table (replacing one of the same name), and the table regenerated
+    '  with the function declared.
+    \ current=str fn=str desc=str params=str body=str
+    ^ str
+    = nl (str/from_atom 10)
+      rows (mcp_foot/table_rows current).filter((\ [name d p] !(equal name fn)))
+      cleaned (mcp_foot/without_entry current fn)
+      head
+        ? (str/find mcp_foot/table_marker cleaned)
+         > (./some at) cleaned.slice(0 at)
+         > .none cleaned
+    | str/cat_all [head (mcp_foot/indented body) nl (mcp_foot/table_text rows.snoc([fn desc params]))]
   ' ---- tools added from text
   + entry_name_ok
     \ name=str
@@ -636,16 +889,6 @@
     = original (mcp_rpc/object_at "original" job.data)
       rest job.set_data((mcp_foot/with_field job.data "chain" (mcp_foot/strings_json steps.drop(1))))
       node s.home.at(0)
-    ? (equal steps.at(0) "declare")
-      ' The declaration is a record, found again by import-tools after any restart.
-      = fn (mcp_rpc/text_at "function" original)
-        declaration
-          . (myth/new)
-            put(['sys 'lede] (pails/t (mcp_rpc/text_at "description" original)))
-            put([($ts "tool_kind")] (pails/t "foil"))
-            put([($ts "tool_target")] (pails/t (str/cat_all ["mcp_tools_user/" fn])))
-            put([($ts "tool_params")] (pails/t (mcp_rpc/text_at "params" original)))
-      | mcp_foot/ask_write [node 'app 'mcp_tools 'mcp ($ts fn)] (writ/make declaration) rest "declared" s
     ? (equal steps.at(0) "import")
       | mcp_foot/ask_page parent [node 'app] rest "import-apps" s
     | mcp_foot/done job value s
@@ -711,10 +954,51 @@
       i (mcp_rpc/num_at "i" 0 job.data)
       node s.home.at(0)
     ? (ge i apps.len)
-      | mcp_foot/done job (json/obj [(jkv "tools" (mcp_foot/strings_json s.published.map((\ pub=mcp_tools/published pub.name))))]) s
+      ' Apps done: the packages next, from the mount records under /io/fs.
+      | mcp_foot/ask_inspect parent (mcp_foot/inspect_query [node 'io 'fs] .false) job.set_awaiting([node 'io 'fs]) "import-fs" s
     = app apps.at(i)
       next job.set_data((json/obj [(jkv "apps" (mcp_foot/strings_json apps)) (jkv "i" (json/num .false i.inc))]))
     | mcp_foot/ask_page parent [node 'app (mcp_foot/mount_key app) 'mcp] next "import-app" s
+  + import_done
+    \ job=mcp_foot/job s=mcp_foot/state
+    ^ mcp_foot/state
+    | mcp_foot/done job (json/obj [(jkv "tools" (mcp_foot/strings_json s.published.map((\ pub=mcp_tools/published pub.name))))]) s
+  + import_mount_next
+    '  Read the next mount's record for its modules, or finish.
+    \ parent=nat job=mcp_foot/job s=mcp_foot/state
+    ^ mcp_foot/state
+    = mounts (mcp_foot/strings_at "mounts" job.data)
+      i (mcp_rpc/num_at "mi" 0 job.data)
+      node s.home.at(0)
+    ? (ge i mounts.len) (mcp_foot/import_done job s)
+    ? (mcp_foot/absolute node mounts.at(i))
+     > (./some home)
+      = next job.set_data((mcp_foot/with_field job.data "mi" (json/num .false i.inc)))
+      | mcp_foot/ask_page parent home next "import-mount" s
+    | mcp_foot/import_mount_next parent job.set_data((mcp_foot/with_field job.data "mi" (json/num .false i.inc))) s
+  + import_module_next
+    '  Ask the next module of the current mount for its tools entry, or move on.
+    \ parent=nat job=mcp_foot/job s=mcp_foot/state
+    ^ mcp_foot/state
+    = modules (mcp_foot/strings_at "modules" job.data)
+      j (mcp_rpc/num_at "mj" 0 job.data)
+    ? (ge j modules.len) (mcp_foot/import_mount_next parent job s)
+    = next job.set_data((mcp_foot/with_field (mcp_foot/with_field job.data "mj" (json/num .false j.inc)) "module" (json/str modules.at(j))))
+    | mcp_foot/ask_apply parent modules.at(j) "tools" [] next "import-module" s
+  + declared_tools
+    '  The tools a module's tools entry declares, as published entries.
+    \ package=str module=str value=json
+    ^ row[mcp_tools/published]
+    = none=row[mcp_tools/published] []
+    ? value
+     > (./arr xs)
+      | xs.fold none
+      \ out=row[mcp_tools/published] x=json
+      = name (mcp_rpc/text_at "name" x)
+      ? (eq name.len 0) out
+      | out.snoc((mcp_tools/published (str/cat_all [package "/" name]) package "foil" (str/cat_all [module "/" name]) ""
+          (mcp_rpc/text_at "description" x) (mcp_tools/parse_params (mcp_rpc/text_at "params" x))))
+    none
   + tail_text
     '  The text held by the slot whose last segment has this name, or the empty string.
     \ name=str record=myth
@@ -887,15 +1171,57 @@
         ? (gt tries 400) (mcp_foot/fail job "The scan did not finish in two minutes" s)
         | mcp_foot/later 300 job.set_data((mcp_foot/with_field job.data "tries" (json/num .false tries.inc))) "rescan-wait" s
       (mcp_foot/fail job "The mount disappeared while scanning" s)
+    ? (equal job.stage "import-mount")
+      ? (mcp_foot/record_of page)
+       > (./some record)
+        = manifest (mcp_foot/status_json record.txt_at(grove_dev/metadata_slot))
+          modules (mcp_rpc/pairs_of (mcp_rpc/object_at "modules" manifest)).map((\ [name file] name))
+          package (mcp_rpc/text_at "name" manifest)
+          next job.set_data((mcp_foot/with_field (mcp_foot/with_field (mcp_foot/with_field job.data "modules" (mcp_foot/strings_json modules)) "mj" (json/num .false 0)) "package" (json/str package)))
+          kept s.published.filter((\ pub=mcp_tools/published !(equal pub.app package)))
+        | mcp_foot/import_module_next parent next s.set_published(kept)
+      (mcp_foot/import_mount_next parent job s)
     ? (equal job.stage "tool-read")
       ? (mcp_foot/record_of page)
        > (./some record)
-        = nl (str/from_atom 10)
-          current (mcp_foot/unbar record.nat_at(bond/content 0))
-          grown (str/cat_all [current nl (mcp_foot/indented (mcp_rpc/text_at "text" arguments)) nl])
+        = current (mcp_foot/unbar record.nat_at(bond/content 0))
+          desc (mcp_rpc/text_at "description" arguments)
+          params (mcp_rpc/text_at "params" arguments)
+          fn (mcp_rpc/text_at "function" arguments)
+        ? (mcp_foot/has_quote (str/cat_all [desc params])) (mcp_foot/fail job "description and params cannot contain a double quote" s)
+        = grown (mcp_foot/with_tool current fn desc params (mcp_rpc/text_at "text" arguments))
           plan (json/obj [(jkv "grown" (json/str grown)) (jkv "original" arguments)])
-        | mcp_foot/ask_compile parent "mcp_tools_user" grown job.set_data(plan) "tool-check" s
-      (mcp_foot/fail job "The mcp-tools mount is not loaded" s)
+        | mcp_foot/ask_compile parent "scratch" grown job.set_data(plan) "tool-check" s
+      (mcp_foot/fail job "The scratch package is not loaded" s)
+    ? (equal job.stage "mount-status")
+      = mount (mcp_rpc/text_at "mount" job.data)
+      ? (mcp_foot/record_of page)
+       > (./some record)
+        = summary (mcp_foot/with_field (mcp_foot/mount_summary mount record) "home" (json/str (path_show pax)))
+        ' Published: a start hook, if the mount brought one, waits under /io/mcp/starts.
+        ? (mcp_rpc/bool_at "ready" .false summary)
+          | mcp_foot/ask_page parent [node 'io 'mcp 'starts (mcp_foot/mount_key mount)] job.set_data((mcp_foot/with_field job.data "summary" summary)) "mount-start" s
+        | mcp_foot/done job summary s
+      (mcp_foot/fail job "The mount was not loaded" s)
+    ? (equal job.stage "mount-start")
+      = mount (mcp_rpc/text_at "mount" job.data)
+        answer (mcp_rpc/object_at "summary" job.data)
+      ? (mcp_foot/record_of page)
+       > (./some record)
+        ? record.get(['hook])
+         > (./some held)
+          ? held
+           > x=pails/code
+            ? x.v
+             > st=helm/starter
+              = ;helper (Spawn (mcp_foot/starter_run st s.server job.kid))
+              ; | SendCaps helper 0 [0]
+              ; | CloseHandle helper
+              | mcp_foot/keep job.set_data(answer).set_stage("mount-started") s
+            (mcp_foot/done job answer s)
+          (mcp_foot/done job answer s)
+        (mcp_foot/done job answer s)
+      (mcp_foot/done job answer s)
     ? (equal job.stage "import-apps")
       = apps=row[str]
           ? page
@@ -1031,12 +1357,52 @@
       ? !(mcp_rpc/bool_at "ready" .false value) (mcp_foot/done job value s)
       ' It compiles with the rest of the module: write it through the ordinary insert path.
       = call (mcp_foot/call_json "mcp/insert-file"
-          [(jkv "mount" (json/str "mcp-tools")) (jkv "name" (json/str "tools.foil")) (jkv "text" (json/str (mcp_rpc/text_at "grown" job.data)))])
-        kept (json/obj [(jkv "original" (mcp_rpc/object_at "original" job.data)) (jkv "chain" (mcp_foot/strings_json ["declare" "import"]))])
+          [(jkv "mount" (json/str "scratch")) (jkv "name" (json/str "main.foil")) (jkv "text" (json/str (mcp_rpc/text_at "grown" job.data)))])
+        kept (json/obj [(jkv "original" (mcp_rpc/object_at "original" job.data)) (jkv "chain" (mcp_foot/strings_json ["import"]))])
       | mcp_foot/start parent job.set_call(call).set_data(kept) s
+    ? (equal job.stage "import-module")
+      ' A module without a tools entry answers 409; that is not an error.
+      = added
+          ? (eq status 200) (mcp_foot/declared_tools (mcp_rpc/text_at "package" job.data) (mcp_rpc/text_at "module" job.data) value)
+          []
+      | mcp_foot/import_module_next parent job s.set_published(s.published.weld(added))
+    ? (equal job.stage "unload-status")
+      = target (mcp_rpc/text_at "name" arguments)
+      ? (mcp_foot/unit_named target value)
+       > (./some unit)
+        = source=path (path_parse (mcp_rpc/text_at "source" unit)).fall(gov)
+          root=path (path_parse (mcp_rpc/text_at "root" value)).fall([])
+          expected=maybe[nat]
+            ? (mcp_rpc/field "expected" value)
+             > (./some held)
+              ? held
+               > (./num neg n) (./some n)
+               > (./str t) (nat/parse t)
+              .none
+             > .none .none
+        ? !(mcp_rpc/bool_at "occupied" .false value) (mcp_foot/ask_unmount parent (mcp_foot/mount_key target) job "unload-unmounted" s)
+        | mcp_foot/ask_develop parent (grove_dev/request "delete" source root (mcp_rpc/num_at "version" 0 unit) expected root (mcp_rpc/num_at "completed" 0 unit)) job "unload-deleted" s
+       > .none (mcp_foot/ask_unmount parent (mcp_foot/mount_key target) job "unload-unmounted" s)
+      s
+    ? (equal job.stage "unload-deleted")
+      ? !(eq status 200) (mcp_foot/fail job (str/cat_all ["The instance could not be removed: " body]) s)
+      | mcp_foot/ask_unmount parent (mcp_foot/mount_key (mcp_rpc/text_at "name" arguments)) job "unload-unmounted" s
+    ? (equal job.stage "unload-unmounted")
+      ? (eq status 501) (mcp_foot/fail job body s)
+      ? !(eq status 200) (mcp_foot/fail job (mcp_rpc/text_at "failure" value) s)
+      = ;helper (Spawn (mcp_foot/unmounter s.host s.hostkey (mcp_rpc/text_at "name" arguments) job.kid))
+      ; | SendCaps helper 0 [0]
+      ; | CloseHandle helper
+      | mcp_foot/keep job.set_stage("unload-host") s
     ? (equal job.stage "tool-apply")
       ? !(eq status 200) (mcp_foot/fail job (mcp_rpc/text_at "failure" value) s)
       | mcp_foot/done job value s
+    ? (equal job.stage "mount-done")
+      ? (eq status 501) (mcp_foot/fail job body s)
+      ? !(eq status 200) (mcp_foot/fail job (str/cat_all ["The mount did not load: " (mcp_rpc/text_at "failure" value)]) s)
+      ' Loaded: the mount's own record says whether it published.
+      = mount (mcp_rpc/text_at "mount" job.data)
+      | mcp_foot/ask_page parent (mcp_foot/mount_home node mount) job "mount-status" s
     ? !(eq status 200)
       | mcp_foot/fail job (str/cat_all ["The world answered " (nat/show status) ": " body]) s
     ? (equal job.stage "mounts") (mcp_foot/done job value s)
@@ -1209,6 +1575,11 @@
           | mcp_foot/history_next parent job.set_data(plan) s
         (mcp_foot/done job (json/obj [(jkv "path" (json/str (path_show job.awaiting))) (jkv "cases" (json/num .false 0)) (jkv "versions" (json/arr []))]) s)
       ? (equal job.stage "read-inspect") (mcp_foot/done job (mcp_foot/view_json job.awaiting found.view) s)
+      ? (equal job.stage "import-fs")
+        = node s.home.at(0)
+          mounts found.view.kid_tap.map((\ [key child] (path_show [node 'io 'fs key])))
+          next job.set_data((mcp_foot/with_field (mcp_foot/with_field job.data "mounts" (mcp_foot/strings_json mounts)) "mi" (json/num .false 0)))
+        | mcp_foot/import_mount_next parent next s
       ? (equal job.stage "resource-inspect")
         | mcp_foot/finish job (mcp_rpc/result job.id (mcp_resources/text_contents (mcp_rpc/text_at "uri" job.data) "application/json" (show (mcp_foot/view_json job.awaiting found.view)))) s
       ? (equal job.stage "history-case")
@@ -1355,9 +1726,17 @@
            > (./some job)
             | mcp_foot/on_wrote parent job (mcp_foot/wrote kid ok note) s
           s
+         > (mcp_foot/started kid ok)
+          ? (mcp_foot/job_by_kid kid s)
+           > (./some job) (mcp_foot/done job (mcp_foot/with_field job.data "started" (json/boo ok)) s)
+          s
          > (mcp_foot/fetched kid ok text)
           ? (mcp_foot/job_by_kid kid s)
            > (./some job)
+            ? (equal job.stage "mount-staged") (mcp_foot/on_staged parent job ok text s)
+            ? (equal job.stage "unload-host")
+              ? ok (mcp_foot/done job (mcp_foot/with_field (mcp_foot/status_json text) "note" (json/str "The mount's publication stays in /lib until a restart; a worker it started keeps running.")) s)
+              | mcp_foot/fail job text s
             ? ok (mcp_foot/finish job (mcp_rpc/result job.id (mcp_resources/text_contents (mcp_rpc/text_at "uri" job.data) "text/plain" text)) s)
             | mcp_foot/finish job (mcp_rpc/failure job.id 32002 text) s
           s
@@ -1365,18 +1744,15 @@
     ; | helm/supervisor/close_caps caps
     | _ parent next
   + run
-    \ home=path token=str host=str hostkey=str initial=feet/task/init self=nat
+    \ home=path token=str host=str hostkey=str server=nat initial=feet/task/init self=nat
     ^ nat
-    = ;s (mcp_foot/scan initial.parent initial.ax (mcp_foot/state home token host hostkey [] [] [] .false 0 []))
+    = ;s (mcp_foot/scan initial.parent initial.ax (mcp_foot/state home token host hostkey [] [] [] .false 0 [] server))
       ' The worker's own first job: import the tools apps publish.
       kick (mcp_foot/job ($ts "import") jnull [] (json/obj []) [] 0 "" (json/obj []))
       ;imported (mcp_foot/ask_page initial.parent [home.at(0) 'app] kick "import-apps" s)
       ' And the cabinet's root record, so / lists the drawers.
       cabinet (mcp_foot/job ($ts "cabinet") jnull [] (json/obj []) [] 0 "" (json/obj [(jkv "lede" (json/str "Chorus cabinet"))]))
-      ;rooted (mcp_foot/ask_page initial.parent (mcp_foot/cabinet home.at(0)) cabinet "cabinet-probe" imported)
-      ' And /app/mcp_tools/mcp, where add-tool declares what it adds.
-      tools (mcp_foot/job ($ts "tools") jnull [] (json/obj []) [] 0 "" (json/obj [(jkv "lede" (json/str "Tools added through mcp/add-tool"))]))
-      ;ready (mcp_foot/ask_page initial.parent [home.at(0) 'app 'mcp_tools 'mcp] tools "cabinet-probe" rooted)
+      ;ready (mcp_foot/ask_page initial.parent (mcp_foot/cabinet home.at(0)) cabinet "cabinet-probe" imported)
     ; | Trace (str/cat_all ["mcp foot running, " (nat/show ready.jobs.len) " jobs"]) 0
     | mcp_foot/loop initial.parent ready
   + accepted
@@ -1395,7 +1771,7 @@
     = ;[made caps] (Recv[feet/task[unit]] 0)
     ; | helm/supervisor/close_caps caps
     ? !(mcp_foot/accepted made) (error (pails/t "The MCP worker's home could not be created"))
-    = registration (helm/supervisor/register home (mcp_foot/run home token host hostkey))
+    = registration (helm/supervisor/register home (mcp_foot/run home token host hostkey server))
     ; | SendCaps server registration [0]
     = ;[reply extra] (Recv[feet/task[unit]] 0)
     ; | helm/supervisor/close_caps extra
