@@ -74,6 +74,18 @@ mounts, and a mount is recompiled in the running world when its files change.
 4. `mcp/install-app` to install an instance, or with `replace: true` to
    recreate it.
 
+### Add a tool from one function
+
+`mcp/add-tool` takes a Foil function `+ <name>` with
+`\ args=row[[name=str value=str]] ^ str` that answers JSON text
+(`mcp_tools_user/arg "text" args` reads one argument). It is checked
+together with the `mcp-tools` module first, so a mistake comes back as the
+compiler's error and nothing is written; then it is appended to that
+module, compiled and published like any mount code, declared under
+`/app/mcp_tools/mcp`, and listed as `mcp_tools/<name>`. Calling the tool
+runs the function and returns its JSON. A function that outgrows the
+scratch module belongs in a mount of its own.
+
 ## Tools apps publish
 
 Tools named `<app>/<name>` (such as `demo/grade`) come from records the app

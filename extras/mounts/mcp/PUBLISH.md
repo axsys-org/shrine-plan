@@ -8,8 +8,8 @@ published tool names a thing, a button or a set of properties.
 | Slot | Meaning |
 |---|---|
 | `lede` | The tool's description, shown to the model. |
-| `tool_kind` | `read`, `press` or `write`: the built-in that runs it. |
-| `tool_target` | The path acted on. `{argument}` is filled from the call. |
+| `tool_kind` | `read`, `press` or `write`: the built-in that runs it; or `foil`: a published function is run. |
+| `tool_target` | The path acted on. `{argument}` is filled from the call. For `foil`: `module/entry`, a function `\ args=row[[name=str value=str]] ^ str` answering JSON text. |
 | `tool_label` | For `press`: the button's label. May also hold `{argument}`. |
 | `tool_params` | `name: description; name: description`. Every parameter is text and required. |
 
