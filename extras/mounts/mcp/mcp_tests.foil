@@ -1,0 +1,115 @@
+- mcp_rpc
+- mcp_tools
+- mcp_foot
+- testing
+
+'  The server's pure parts: framing, the tool table, and the worker's helpers.
++ mcp_tests
+  + call_text
+    '  A tools/call request as text, built rather than quoted: Foil literals hold no quotes.
+    \ id=nat name=str path=str
+    ^ str
+    = arguments (json/obj [(jkv "path" (json/str path))])
+      params (json/obj [(jkv "name" (json/str name)) (jkv "arguments" arguments)])
+    | show (json/obj [(jkv "jsonrpc" (json/str "2.0")) (jkv "id" (json/num .false id)) (jkv "method" (json/str "tools/call")) (jkv "params" params)])
+  + framing
+    \ ignored=unit
+    ^ row[testing/check]
+    = parsed (mcp_rpc/parse_call (mcp_tests/call_text 7 "mcp/read" "/app"))
+      method=str
+        ? parsed
+         > (./ok call) call.method
+         > (./err why) why
+      name=str
+        ? parsed
+         > (./ok call) (mcp_rpc/text_at "name" call.params)
+         > (./err why) ""
+      bad=str
+        ? (mcp_rpc/parse_call (show (json/obj [(jkv "jsonrpc" (json/str "2.0")) (jkv "id" (json/num .false 1))])))
+         > (./ok call) "accepted"
+         > (./err why) why
+      noise=str
+        ? (mcp_rpc/parse_call "not json")
+         > (./ok call) "accepted"
+         > (./err why) why.slice(0 11)
+      framed (show (json/obj [(jkv "jsonrpc" (json/str "2.0")) (jkv "id" (json/num .false 7)) (jkv "result" (json/obj []))]))
+      detail (json/obj [(jkv "code" (json/num .true 32601)) (jkv "message" (json/str "no"))])
+      failed (show (json/obj [(jkv "jsonrpc" (json/str "2.0")) (jkv "id" jnull) (jkv "error" detail)]))
+      block (json/obj [(jkv "type" (json/str "text")) (jkv "text" (json/str "x"))])
+      content (show (json/obj [(jkv "content" (json/arr [block])) (jkv "isError" (json/boo .true))]))
+    [(testing/text "method is read" "tools/call" method)
+     (testing/text "params are kept" "mcp/read" name)
+     (testing/text "a request without a method is refused" "Invalid Request: no method" bad)
+     (testing/text "text that is not JSON is a parse error" "Parse error" noise)
+     (testing/text "a result is framed" framed (mcp_rpc/result (json/num .false 7) (json/obj [])))
+     (testing/text "an error carries a negative code" failed (mcp_rpc/failure jnull 32601 "no"))
+     (testing/text "a text result says whether it is an error" content (show (mcp_rpc/text_content "x" .true)))
+     (testing/text "the protocol version is current" "2025-11-25" (mcp_rpc/text_at "protocolVersion" (mcp_rpc/initialize "shrine 0x11")))]
+  + tools
+    \ ignored=unit
+    ^ row[testing/check]
+    = listing (mcp_tools/listing mcp_tools/builtins)
+      count=nat
+        ? (mcp_rpc/field "tools" listing)
+         > (./some tools)
+          ? tools
+           > (./arr xs) xs.len
+          0
+        0
+      read=str
+        ? (mcp_tools/find "mcp/read" mcp_tools/builtins)
+         > (./some tool)
+          tool.desc.slice(0 12)
+        "missing"
+      required=nat
+        ? (mcp_tools/find "mcp/insert-file" mcp_tools/builtins)
+         > (./some tool)
+          tool.required.len
+        0
+      params (mcp_tools/parse_params "card: The card's name; grade: Again, Hard, Good or Easy;")
+      second=mcp_tools/param (? (eq params.len 2) params.at(1) (mcp_tools/param "" "" ""))
+      pub (mcp_tools/published "demo/grade" "demo" "press" "/app/demo/cards/{card}" "{grade}" "Grade a card." params)
+    [(testing/nat "sixteen tools are listed" 16 count)
+     (testing/text "a tool is found by name" "Read a thing" read)
+     (testing/nat "params split on semicolons, an empty tail dropped" 2 params.len)
+     (testing/text "a param's name is stripped" "grade" second.name)
+     (testing/text "a param's description keeps its commas" "Again, Hard, Good or Easy" second.desc)
+     (testing/text "stripping spaces" "x y" (mcp_tools/strip "   x y  "))
+     (testing/nat "a published tool requires every param" 2 (mcp_tools/as_tool pub).required.len)
+     (testing/nat "insert-file requires three arguments" 3 required)
+     (testing/nat "an unknown name is not found" 1 (? (maybe/is_none (mcp_tools/find "mcp/nope" mcp_tools/builtins)) 1 0))]
+  + helpers
+    \ ignored=unit
+    ^ row[testing/check]
+    = node (path_parse "/0x11").fall([($u 17)]).at(0)
+      short (mcp_foot/absolute node "/app/x").fall([])
+      full (mcp_foot/absolute node "/0x11/app/x").fall([])
+      root (mcp_foot/absolute node "/").fall([])
+      props (mcp_foot/properties_record (json/obj [(jkv "properties" (json/obj [(jkv "note" (json/str "hi")) (jkv "/sys/lede" (json/str "L"))]))]))
+      good=str
+        ? (mcp_foot/slip_path node "/projects/chorus/kademlia-2")
+         > (./ok pax) (path_show pax)
+         > (./err why) why
+      samples=row[str] ["projects/x" "/Projects/x" "/a//b" "/a/b_c" "/" ""]
+      bad=nat
+        | samples.fold 0
+        \ count=nat text=str
+        ? (mcp_foot/slip_path node text)
+         > (./ok pax) count
+         > (./err why) count.inc
+    [(testing/text "a cabinet path lands under the cabinet" "/0x11/app/chorus/cabinet/projects/chorus/$kademlia-2" good)
+     (testing/nat "six bad cabinet paths are refused" 6 bad)
+     (testing/nat "html is a < before a letter or slash" 1 (? (mcp_foot/has_html "a <b>c</b>") 1 0))
+     (testing/nat "a bare < is not html" 0 (? (mcp_foot/has_html "1 < 2 and x <- y") 1 0))
+     (testing/text "a short path gains the node" "/0x11/app/x" (path_show short))
+     (testing/text "a full path is kept" "/0x11/app/x" (path_show full))
+     (testing/nat "the root is the node alone" 1 root.len)
+     (testing/text "a bare property name is a text segment" "hi" props.txt_at([($ts "note")]))
+     (testing/text "a slash-led property name is a slot path" "L" props.txt_at(['sys 'lede]))
+     (testing/nat "the mount key of a plain name is a symbol" 1 (? (eq_iota (mcp_foot/mount_key "demo") 'demo) 1 0))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "framing" mcp_tests/framing)
+   (testing/case "tools" mcp_tests/tools)
+   (testing/case "helpers" mcp_tests/helpers)]

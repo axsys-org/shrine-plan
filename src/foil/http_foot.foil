@@ -4,7 +4,31 @@
 
 + http_foot
   + request
-    : method=str target=str body=str
+    '  Header names are lower-cased; values are trimmed.
+    : method=str target=str body=str headers=row[[name=str value=str]]
+  + header
+    '  One header's value, or the empty string.
+    \ name=str request=http_foot/request
+    ^ str
+    = matches request.headers.filter((\ [key value] (equal[str] key name)))
+    ? (eq matches.len 0) ""
+    = [key value] matches.at(0)
+    value
+  + headers_of
+    '  Every header line of a request head as [name value].
+    \ head=str
+    ^ row[[name=str value=str]]
+    = lines (http_foot/split 10 head)
+    % i=nat 1 out=row[[name=str value=str]] []
+    ? (ge i lines.len) out
+    = line (http_foot/trim lines.at(i))
+    ? (eq line.len 0) (_ i.inc out)
+    ? (http_foot/find ":" line)
+     > (./some colon)
+      = name (http_foot/ascii_lower line.slice(0 colon))
+        value (http_foot/trim line.slice(colon.inc line.len))
+      | _ i.inc out.snoc([name value])
+    | _ i.inc out
   + action
     & http_foot/action/interact
       http_foot/action/develop
@@ -14,6 +38,7 @@
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
+      http_foot/action/ask
       http_foot/action/journal
       http_foot/action/value
       http_foot/action/physical
@@ -34,6 +59,12 @@
       : pax=path wit=writ back=str
     + wait
       : record=myth
+    + ask
+      '  Like wait, but the request record is made under another worker's
+      '  home; ['reply] names that record. The worker writes res_status,
+      '  res_body and res_ctype onto it and then pokes anything onto this
+      '  foot's home record, which makes the foot read the record and reply.
+      : home=path record=myth
     + journal
       : before=maybe[nat] limit=nat
     + value
@@ -59,6 +90,7 @@
       http_foot/action/install
       http_foot/action/write
       http_foot/action/wait
+      http_foot/action/ask
       http_foot/action/journal
       http_foot/action/value
       http_foot/action/physical
@@ -69,7 +101,9 @@
   + pending
     ' Text r<serial> keys belong to ordinary HTTP namespace records.
     ' Numeric serial keys correlate read-only supervisor requests.
-    : key=iota conn=nat
+    ' remote names an asked request record under another worker's home;
+    ' it is empty for everything else.
+    : key=iota conn=nat remote=path
   + ack
     & http_foot/ack/request
       http_foot/ack/write
@@ -213,7 +247,7 @@
     \ reason=str
     ^ http_foot/request
     ; (error (http_foot/fault reason))
-    | http_foot/request "" "" ""
+    | http_foot/request "" "" "" []
   + request_line_valid
     ' Validate before splitting/packing a target ending in NUL, which
     ' would otherwise lose that byte and alias a different request.
@@ -255,8 +289,8 @@
         ? !(equal[str] words.at(2) "HTTP/1.0")
           ? !(equal[str] words.at(2) "HTTP/1.1")
             (http_foot/bad_request "Unsupported HTTP version")
-          | http_foot/request words.at(0) words.at(1) input.slice(at length)
-        | http_foot/request words.at(0) words.at(1) input.slice(at length)
+          | http_foot/request words.at(0) words.at(1) input.slice(at length) (http_foot/headers_of input.slice(0 at))
+        | http_foot/request words.at(0) words.at(1) input.slice(at length) (http_foot/headers_of input.slice(0 at))
       = ;bytes (Read fd 16384)
       ? (eq bytes 0) (http_foot/bad_request "Incomplete request body")
       | _ input.cat((http_foot/request_chunk bytes))
@@ -384,6 +418,36 @@
       ; (http_foot/reply item.conn ready)
       ; (Send parent (feet/gift/pass [item.key] .cull))
       | _ i.inc left acks.snoc(.cleanup)
+  + look_remote
+    '  Ask for every asked request record still pending.
+    \ parent=nat pending=row[http_foot/pending]
+    ^ nat
+    | pending.fold 0
+    \ ;ignored=nat item=http_foot/pending
+    ? (eq item.remote.len 0) 0
+    | Send parent (feet/gift/peek item.remote)
+  + finish_remote
+    '  A page of an asked request record: reply when it carries a response.
+    \ parent=nat pax=path axe=res[axal[saga]] pending=row[http_foot/pending] queue=row[http_foot/ack]
+    ^ [pending=row[http_foot/pending] queue=row[http_foot/ack]]
+    = response=maybe[http_response]
+        ? axe
+         > (./known tree)
+          ? tree.fil
+           > (./some version) (http_driver/result (./known (unpin version.myth)))
+           > .none .none
+         > .null .none
+         > .unknown .none
+    ? response
+     > .none [pending queue]
+     > (./some ready)
+      % i=nat 0 left=row[http_foot/pending] [] acks=row[http_foot/ack] queue
+      ? (eq i pending.len) [left acks]
+      = item pending.at(i)
+      ? !(equal item.remote pax) (_ i.inc left.snoc(item) acks)
+      ; (http_foot/reply item.conn ready)
+      ; (Send parent (feet/gift/poke pax .cull))
+      | _ i.inc left acks.snoc(.cleanup)
   + run
     \ initial=feet/task/init self=nat
     ^ nat
@@ -414,7 +478,7 @@
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/asset serial home name mime))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (feet/task/asset request mime bytes)
       ; (helm/supervisor/close_caps caps)
       = empty=row[http_foot/pending] []
@@ -435,13 +499,13 @@
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/interact serial query))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (http_foot/action/develop query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/develop serial query))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (feet/task/develop request status body)
       ; (helm/supervisor/close_caps caps)
       = empty=row[http_foot/pending] []
@@ -472,32 +536,42 @@
         key=iota ($ts (str/cat_all ["r" (nat/show serial)]))
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/pass [key] (writ/make record)))
-      | _ serial.inc pending.snoc((http_foot/pending key conn))
+      | _ serial.inc pending.snoc((http_foot/pending key conn []))
+        queue.snoc((http_foot/ack/request key))
+     > (http_foot/action/ask home record)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+        key=iota ($ts (str/cat_all ["r" (nat/show serial)]))
+        remote=path home.snoc(key)
+        asked record.put(['reply] (pails/p remote))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/poke remote (writ/make asked)))
+      | _ serial.inc pending.snoc((http_foot/pending key conn remote))
         queue.snoc((http_foot/ack/request key))
      > (http_foot/action/journal before limit)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/journal serial before limit))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (http_foot/action/value query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/value serial query))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (http_foot/action/physical query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/physical serial query))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (http_foot/action/inspect query)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/inspect serial query))
-      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn [])) queue
      > (feet/task/inspect request result)
       ; (helm/supervisor/close_caps caps)
       = empty=row[http_foot/pending] []
@@ -557,6 +631,11 @@
       | _ serial left queue
      > (./fact binding)
       = ;[left acks] (http_foot/finish initial.parent binding pending queue)
+      ; (http_foot/look_remote initial.parent left)
+      | _ serial left acks
+     > (./page pax axe)
+      ; (helm/supervisor/close_caps caps)
+      = ;[left acks] (http_foot/finish_remote initial.parent pax axe pending queue)
       | _ serial left acks
      > (./ack err)
       ? (eq queue.len 0) (_ serial pending queue)
