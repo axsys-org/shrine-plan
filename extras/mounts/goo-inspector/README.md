@@ -67,3 +67,11 @@ mount contracts, and 26 JavaScript checks. Browser rehearsal covered path entry,
 Parent/Browse navigation, selected-child values, failed publication preserving
 the page with expanded diagnostics, and successful publication updating the Goo
 text without a restart.
+
+
+**Inspect a presentation** captures any installed summary, follower, native
+surface or workspace; **Alt+I** works from a focused control. The observation is
+rendered by Goo itself and has links to its subject, receiver and recipe. Use
+**Capture again** for a new observation. See
+[the capture boundary](../explorer/PANES.md#inspect-this-presentation) for lifetime,
+provenance and persistence limits.
