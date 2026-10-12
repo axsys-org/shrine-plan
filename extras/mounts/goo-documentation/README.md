@@ -17,6 +17,8 @@ the synthetic Goo presentation, using each slot definition's `/sys/lede` as its
 label. A missing, empty, or non-text title falls back to the slot path.
 Structured lore is reflected into its heading, body lines, and authored example
 pairs even when the view catalog supplies no type descriptor for it.
+Other values without a known descriptor use the bounded value pretty-printer,
+preserving their exact type identity and showing positional contents.
 Browser Back/Forward restores the
 browsing root, not page-local expansion or selection state.
 
