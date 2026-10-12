@@ -135,6 +135,7 @@ receiver field. Details and restrictions follow the table. All keyed constructor
 | `col`, `stack` | `col([slot]) { ... }` — vertical layout aliases. |
 | `opt` | `opt([rank]) { ... }` — optional content, rank `1` or `2`. |
 | `text` | `text(value[, slot])` — text. |
+| `path` | `path(receiver_or_path[, slot])` — display the receiver’s namespace path or a typed path value. |
 | `link` | `link(value[, slot])` — currently text formatting, **not a hyperlink**. |
 | `number` | `number(value[, slot])` — scalar text formatting. |
 | `time` | `time(value[, slot])` — temporal text formatting. |
@@ -188,6 +189,35 @@ Use the current receiver; nested receiver expressions are not supported.
 The explorer additionally offers a reflection view at `/sys/slot/synthetic` for
 records. It is read-only and bounded, and can be requested by `follow`. It is
 **not** an implicit fallback for a failed compile-time `present`.
+
+### `path`
+
+```goo
+record => {
+  or {
+    show(record.lede, '/sys/slot/label)
+    path(record, '/sys/slot/label)
+  }
+}
+```
+
+`path(record, slot)` displays the bound receiver's canonical namespace path.
+The host supplies its displayed identity during SSR and live rendering; a
+projection therefore shows its own path, even when actions resolve to a
+different writable receiver. No synthetic data slot is added to the record.
+
+`path(record.about, slot)` accepts a direct field declared with the path type;
+`path('/sys/req, slot)` accepts a path literal. Current Grove compilation rejects
+the root-only literal `'/` in an authored expression; a typed root path field
+or the root receiver still displays `/`. Missing optional fields emit no
+node, so they participate in `or` normally. Text values, foreign receivers and
+child blocks are rejected. The presentation slot is optional and defaults to
+body text. `path` does not take a configuration record.
+
+This constructor formats a leaf through Goo's existing server text layout; it
+adds no navigation or client measurement. Synthetic slot headings use the same
+formatter. Non-ASCII or control bytes use visible `\xNN` escapes under the
+current ASCII measurement contract, without changing the namespace identity.
 
 ### Missing values and `or`
 

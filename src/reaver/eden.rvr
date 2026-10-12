@@ -12,6 +12,7 @@
 (#bind backend (#module foil-grove-backend))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind abi (#module foil-abi))
+(#bind documentation (#module goo-documentation-bridge))
 
 (define (module images name)
   (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
@@ -26,11 +27,12 @@
   (Weld [self] (map (lambda (name) ("ts" name)) names)))
 
 ;; Spec: name, folder, manifest, modules, Grove units, activation, HTTP,
-;; post-start hook, hook arguments, inspection-provider flag.
+;; post-start hook, hook arguments, inspection-provider flag, dependencies,
+;; required assets, route claims, declarative-workspace flag.
 ;; Every source read below comes from the mount's captured namespace records.
 (define (mounted self system resolve slot port specs scan-port scan-token)
   (define local (bootstrap:build-local self system resolve slot
-    ["eden" "source_mount" "grove_backend" "grove_role_runtime"]))
+    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
@@ -107,7 +109,14 @@
           (lookup state) (qualify self (_0 unit)) document)))
         (_0 (need-ok (backend:publish compiled records 0 0 state))))
         candidate (_4 spec)))
-    ((tool ["source_mount" "save_images"]) path (_2 code) published))
+    ;; Validate and persist registrations in this candidate, before reconcile
+    ;; makes any of its Grove definitions or assets visible.
+    (define registered
+      (If (Ix 13 spec)
+        (need-ok ((driver:get-perc ["goo_workspace_mount" "publish"]
+                    (module all-images "goo_workspace_mount"))
+                  path (_2 spec) published)) published))
+    ((tool ["source_mount" "save_images"]) path (_2 code) registered))
   (define (attempt path state)
     (define result (Try (lambda (ignored) (force (publish-mount path state))) 0))
     (If (Eq 1 (Hd result))
@@ -116,6 +125,37 @@
           ((abi:constructor core ["source_mount" "failure"]) "Compilation failed" (_0 result))))
       ((abi:result core "ok") (_0 result))))
   (define ports ((abi:constructor core ["source_mount" "ports"]) attempt))
+  ;; Namespace drafts use exactly the mounted compiler substrate and publisher.
+  ;; The registration supplies the prelude, never the HTTP request or scene.
+  (define draft-policy (module core-images "grove_draft"))
+  (define (draft-tool name) (driver:get-perc ["grove_draft" name] draft-policy))
+  (define (compile-draft root text prelude state)
+    (define complete ((Hd core-code) (_0 core-code) (_1 core-code) (images state)))
+    (define prepared (backend:prepare-with complete prelude))
+    (define policy (_1 prepared))
+    (define (lookup requested)
+      (define target
+        (If (Or (Equal ("ts" "sys") (_0 requested))
+                (Eq "x" (Hd (_0 requested)))) requested (Weld [self] requested)))
+      (_0 ((tool ["sovereign_peek"]) target state)))
+    (define (build ignored)
+      (define parsed ((draft-tool "parse") text))
+      (define compiled (If (Equal "err" (Hd parsed)) parsed
+        (backend:compile prepared (previous state) lookup root (_0 parsed))))
+      (define result (If (Equal "err" (Hd compiled)) compiled
+        ((draft-tool "validate_views") (_0 compiled))))
+      (If (Equal "err" (Hd result)) result
+        (let ((committed (backend:publish prepared (_0 result) 0 0 state)))
+          (If (Equal "err" (Hd committed))
+            ((abi:result policy "err") ((abi:constructor policy ["grove_backend" "diagnostic"])
+              (driver:get-perc ["rex" "zero_span"] policy) "Draft publication conflict" 0))
+            ((abi:result policy "ok") (_0 (_0 committed)))))))
+    (define result (Try (lambda (ignored) (force (build 0))) 0))
+    (If (Eq 1 (Hd result))
+      ((abi:result policy "err") ((abi:constructor policy ["grove_backend" "diagnostic"])
+        (driver:get-perc ["rex" "zero_span"] policy) "Draft compilation failed" 0))
+      (_0 result)))
+  (define draft-ports ((abi:constructor draft-policy ["grove_draft" "ports"]) compile-draft))
   (define homes (map (home self) specs))
   (Seq (print "Core publication compiled") 0)
   (define initial (need-ok ((driver:get-perc ["eden" "boot"] eden)
@@ -132,19 +172,37 @@
   (define (hook state spec index)
     (define binding (Ix index spec))
     (driver:get-perc (_1 binding) (module (images state) (_0 binding))))
-  (define installed
+  (define activated
     (foldl (lambda (state spec)
       (If (Sz (_5 spec))
         (Seq (print ["Activating mount" (_0 spec)])
           (need-ok ((hook state spec 5) state))) state)) loaded specs))
+  (define (workspace-tool state name)
+    (driver:get-perc ["goo_workspace_mount" name]
+      (module (images state) "goo_workspace_mount")))
+  (define installed
+    (foldl (lambda (state spec)
+      (If (Ix 13 spec)
+        (need-ok ((workspace-tool state "install") (home self spec) state)) state))
+      activated specs))
+  (define documented
+    (let ((binding (find (lambda (pair) (Equal (_0 pair) "goo_documentation")) (images installed))))
+      (If binding
+        (let ((policy (Unpin (_1 (_0 binding)))))
+          (need-ok ((driver:get-perc ["goo_documentation" "install_reader"] policy)
+            (documentation:reader policy slot) installed))) installed)))
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
   (define config
     (foldl (lambda (config spec)
-      (Ifz (Sz (_6 spec)) config
-        (let* ((frozen ((hook installed spec 6)
-                        ((tool ["source_mount" "snapshot"]) (home self spec) installed)
-                        installed))
+      (Ifz (Or (Sz (_6 spec)) (Ix 13 spec)) config
+        (let* ((manual (If (Sz (_6 spec))
+                        ((hook installed spec 6)
+                          ((tool ["source_mount" "snapshot"]) (home self spec) installed)
+                          installed) empty))
+               (frozen (If (Ix 13 spec)
+                         ((workspace-tool installed "http")
+                           (home self spec) (_2 spec) installed manual) manual))
                (extra ((driver:get-perc ["http_foot" "live_assets"] http)
                          (home self spec) (_2 spec) frozen))
                (joined ((driver:get-perc ["http_foot" "add_routes"] http) (_0 extra) config)))
@@ -154,7 +212,8 @@
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
   (define server ((driver:get-perc ["eden" "serve_read"] eden)
-    ((tool ["source_mount" "access"]) ports homes) reader installed
+    ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes))
+    reader ((draft-tool "reconcile") draft-ports documented)
     ((driver:get-perc ["http_foot" "run_with"] http) config)))
   (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
   (Seq server (foldl (lambda (ignored spec)
