@@ -864,9 +864,17 @@
       (else
         (dispatch tok rest)))))
 
-(define (rex-step-poem dispatch tok ctx rest)
+(define (rex-step-poem mode dispatch tok ctx rest)
   (let* ((ty (rex-tok-ty tok))
-         (is-real (rex-real-token? ty)))
+         (is-real (rex-real-token? ty))
+         ;; "haskell" mode keeps the reference's heir-rune exception
+         ;; (Tree2.hs isHeirRune): a free rune whose LAST character
+         ;; sits on the anchor stays in the poem although it starts
+         ;; left of it.
+         (heir-rune
+           (And (Eq mode "haskell")
+                (And (Eq ty "FREE")
+                     (Eq (rex-free-pos tok) (rex-ctx-pos ctx))))))
     ;; A poem ctx's pos is its ANCHOR: the head rune's last character
     ;; (rex reference §8.3-8.4).  Tokens at the anchor or right of it
     ;; stay in the node list; conversion splits peers (start <= anchor)
@@ -876,7 +884,9 @@
     ;; demanded free-pos EQUALITY for peers, which swallowed wider
     ;; runes as nested poems — the origin of every column repair that
     ;; used to live in foil-sast.)
-    (If (And is-real (Lt (rex-tok-col tok) (rex-ctx-pos ctx)))
+    (If (And is-real
+             (And (Lt (rex-tok-col tok) (rex-ctx-pos ctx))
+                  (Nil heir-rune)))
         (dispatch tok (rex-pop (lcons (rex-stack-ctx ctx) rest)))
         (cond
           ((rex-leaf-token? ty)
@@ -992,7 +1002,20 @@
       (else
         (lcons (rex-stack-ctx ctx) rest)))))
 
-(define (rex-dispatch tok st)
+;; Parse modes.  "reaver" is this parser's own column discipline
+;; (peers split at a rune's START column, body lines regrouped by
+;; rex-body-items); "haskell" reproduces the reference implementation's
+;; poem rules exactly (Tree2.hs stepPoem, Rex.hs convertPoem): the
+;; heir-rune exception while building, then children = nodes whose
+;; column (a rune's LAST char, a nested poem's anchor) lies right of
+;; the anchor, converted flat and in order, and the first node at or
+;; left of it starts the heir chain.
+(define (rex-mode-check mode)
+  (If (Or (Eq mode "reaver") (Eq mode "haskell"))
+      0
+      (rex-error ["unknown-rex-mode" mode])))
+
+(define (rex-dispatch-in mode tok st)
   ;; A stray close paren pops the context stack past its root; the
   ;; next token would then match an empty stack against RexStackEntry
   ;; ("impossible total union match").  Name the token instead.
@@ -1000,19 +1023,23 @@
     (rex-error ["unbalanced close" "line" (rex-tok-lin tok) "col" (rex-tok-col tok)])
     1)
   (let* ((top (_0 st))
-         (rest (_1 st)))
+         (rest (_1 st))
+         (dispatch (rex-dispatch-in mode)))
     (? RexStackEntry top
       (Ctx [value]
         (let* ((ty (rex-ctx-ty value)))
           (cond
-            ((Eq ty "clump") (rex-step-clump rex-dispatch tok value rest))
-            ((Eq ty "poem")  (rex-step-poem rex-dispatch tok value rest))
-            ((Eq ty "block") (rex-step-block rex-dispatch tok value rest))
-            ((Eq ty "item")  (rex-step-item rex-dispatch tok value rest))
-            (else            (rex-step-spaced rex-dispatch tok value rest)))))
+            ((Eq ty "clump") (rex-step-clump dispatch tok value rest))
+            ((Eq ty "poem")  (rex-step-poem mode dispatch tok value rest))
+            ((Eq ty "block") (rex-step-block dispatch tok value rest))
+            ((Eq ty "item")  (rex-step-item dispatch tok value rest))
+            (else            (rex-step-spaced dispatch tok value rest)))))
       (Quip [line column offset]
-        (rex-step-quip rex-dispatch tok
+        (rex-step-quip dispatch tok
           line column offset rest)))))
+
+(define (rex-dispatch tok st)
+  (rex-dispatch-in "reaver" tok st))
 
 (define (rex-emit-root reset p)
   (let* ((st (rex-pop-all (_0 p)))
@@ -1022,14 +1049,17 @@
          (st-next (If reset [(rex-stack-ctx rex-root-ctx)] st)))
     [st-next (lcons tree out)]))
 
-(define (rex-tree-step p tok)
+(define (rex-tree-step mode p tok)
   (define ty (rex-tok-ty tok))
   (If (Or (Eq ty "EOF") (Eq ty "EOB"))
       (rex-emit-root 1 p)
-      [(rex-dispatch tok (_0 p)) (_1 p)]))
+      [(rex-dispatch-in mode tok (_0 p)) (_1 p)]))
+
+(define (rex-parse-trees-in mode toks)
+  (lrev (_1 (lfoldl (rex-tree-step mode) [[(rex-stack-ctx rex-root-ctx)] 0] toks))))
 
 (define (rex-parse-trees toks)
-  (lrev (_1 (lfoldl rex-tree-step [[(rex-stack-ctx rex-root-ctx)] 0] toks))))
+  (rex-parse-trees-in "reaver" toks))
 
 ;;; Rex normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1526,12 +1556,42 @@
             (go (_1 lead)))))))
   (start (stream nodes)))
 
-(define (rex-convert-poem convert src block-off sp pos nodes)
+;; Reference split (Rex.hs splitHeir): the first node whose column —
+;; a rune's LAST char, a nested poem's anchor — is at or left of the
+;; anchor starts the heir chain.
+(define (rex-split-heir-hs-go pos acc rest)
+  (Ifz rest [(rowify (lrev acc)) []]
+    (If (Le (rex-node-col (_0 rest)) pos)
+        [(rowify (lrev acc)) (rowify rest)]
+        (rex-split-heir-hs-go pos (lcons (_0 rest) acc) (_1 rest)))))
+
+(define (rex-split-heir-hs pos nodes)
+  (rex-split-heir-hs-go pos 0 (stream nodes)))
+
+;; Reference poem conversion (Rex.hs convertPoem): children are
+;; converted flat and in order — no operand/body split, no per-line
+;; juxts, no sub-blocks — and the heirs flatten behind the open.
+(define (rex-convert-poem-hs convert src block-off sp pos rune rest)
+  (let* ((split (rex-split-heir-hs pos rest))
+         (children (_0 split))
+         (heir-nodes (_1 split))
+         (conv (lambda (n) (rex-convert-node convert src block-off n)))
+         (open ($Open sp rune (map conv children))))
+    (If (Eq 0 (Sz heir-nodes))
+        open
+        (rex-mk-heir sp
+          (lcons open
+            (rex-concat-flattened
+              (lmap conv (stream heir-nodes))))))))
+
+(define (rex-convert-poem mode convert src block-off sp pos nodes)
   (If (Eq 0 (Sz nodes))
       (rex-error "empty-poem")
       (let* ((first (_0 nodes)))
         (? RexNode first
           (Rune [rune]
+           (If (Eq mode "haskell")
+            (rex-convert-poem-hs convert src block-off sp pos rune (drop 1 nodes))
             ;; Split against the ANCHOR — the head rune's last char,
             ;; which is exactly the rune node's span col (rex-free-node
             ;; stores free-pos).  Peers START at or left of the anchor
@@ -1565,7 +1625,7 @@
                   (rex-mk-heir sp
                     (lcons open
                       (rex-concat-flattened
-                        (lmap conv (stream heir-nodes))))))))
+                        (lmap conv (stream heir-nodes)))))))))
           (LeafNode [span leaf]
             (let* ((slug (rex-leaf-to-rex
                            span leaf))
@@ -1581,48 +1641,60 @@
          (s (rex-str-slice (Sub qoff block-off) qlen src)))
     ($Leaf (rex-tree-span tree) "quip" (rex-normalize-quip-indent s))))
 
-(define (rex-convert-with src block-off tree)
+(define (rex-convert-in mode src block-off tree)
   (let* ((sh (rex-tree-shape tree))
          (sp (rex-tree-span tree))
-         (nodes (rex-tree-nodes tree)))
+         (nodes (rex-tree-nodes tree))
+         (convert (rex-convert-in mode)))
     (cond
-      ((Eq sh "nest")  (rex-convert-nest rex-convert-with src block-off sp (rex-tree-color tree) nodes))
-      ((Eq sh "clump") (rex-convert-clump rex-convert-with src block-off sp nodes))
-      ((Eq sh "poem")  (rex-convert-poem rex-convert-with src block-off sp (rex-tree-pos tree) nodes))
-      ((Eq sh "item")  (rex-convert-spaced rex-convert-with src block-off sp "clear" nodes))
+      ((Eq sh "nest")  (rex-convert-nest convert src block-off sp (rex-tree-color tree) nodes))
+      ((Eq sh "clump") (rex-convert-clump convert src block-off sp nodes))
+      ((Eq sh "poem")  (rex-convert-poem mode convert src block-off sp (rex-tree-pos tree) nodes))
+      ((Eq sh "item")  (rex-convert-spaced convert src block-off sp "clear" nodes))
       ((Eq sh "quip")  (rex-quip-to-rex src block-off tree))
       (else (rex-error ["bad-tree-shape" sh])))))
 
-(define (rex-from-block-tree src tree)
+(define (rex-convert-with src block-off tree)
+  (rex-convert-in "reaver" src block-off tree))
+
+(define (rex-from-block-tree mode src tree)
   (If (And (Eq (rex-tree-shape tree) "nest") (Eq (rex-tree-color tree) "clear"))
       (If (Eq 0 (Sz (rex-tree-nodes tree)))
           0
-          [(rex-convert-spaced rex-convert-with src (rex-tree-off tree)
+          [(rex-convert-spaced (rex-convert-in mode) src (rex-tree-off tree)
                                (rex-tree-span tree) "clear" (rex-tree-nodes tree))])
       (rex-error "top-level-tree-not-clear")))
 
-(define (rex-parse-src src)
-  (define trees (rex-parse-trees (rex-bsplit (rex-lex src))))
+(define (rex-parse-src mode src)
+  (define trees (rex-parse-trees-in mode (rex-bsplit (rex-lex src))))
   (If (Eq 1 (llen trees))
       (let* ((tree (_0 trees))
              (slice (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src)))
-        (rex-from-block-tree slice tree))
+        (rex-from-block-tree mode slice tree))
       0))
 
 ;; Reference document parsing retains the block splitter and each block's
 ;; absolute source spans. Empty blocks contribute no trees.
+(define (ParseRexBlocksWith mode src)
+  (Seq (rex-mode-check mode)
+    (rowify
+      (lcat
+        (lmap (lambda (tree)
+          (define slice
+            (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src))
+          (stream (rex-from-block-tree mode slice tree)))
+          (rex-parse-trees-in mode (rex-bsplit (rex-lex src))))))))
+
 (define (ParseRexBlocks src)
-  (rowify
-    (lcat
-      (lmap (lambda (tree)
-        (define slice
-          (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src))
-        (stream (rex-from-block-tree slice tree)))
-        (rex-parse-trees (rex-bsplit (rex-lex src)))))))
+  (ParseRexBlocksWith "reaver" src))
+
+(define (ParseRexWith mode src)
+  (Seq (rex-mode-check mode)
+    (let* ((r (rex-parse-src mode src)))
+      (If r (_0 r) (Throw "bad rex parse")))))
 
 (define (ParseRex src)
-  (define r (rex-parse-src src))
-  (If r (_0 r) (Throw "bad rex parse")))
+  (ParseRexWith "reaver" src))
 
 ;; Whole-file parse: blank lines are ordinary whitespace, never block
 ;; breaks.  Block splitting only ever replaces boundary EOLs with EOB
@@ -1631,17 +1703,21 @@
 ;; file already produces) and indentation relationships survive blank
 ;; lines inside and between declarations.  Used for whole-file languages
 ;; (.foil modules); the repl keeps the blank-line block discipline.
-(define (rex-parse-src-file src)
-  (define trees (rex-parse-trees (rex-lex src)))
+(define (rex-parse-src-file mode src)
+  (define trees (rex-parse-trees-in mode (rex-lex src)))
   (If (Eq 1 (llen trees))
       (let* ((tree (_0 trees))
              (slice (rex-str-slice (rex-tree-off tree) (rex-tree-len tree) src)))
-        (rex-from-block-tree slice tree))
+        (rex-from-block-tree mode slice tree))
       0))
 
+(define (ParseRexFileWith mode src)
+  (Seq (rex-mode-check mode)
+    (let* ((r (rex-parse-src-file mode src)))
+      (If r (_0 r) (Throw "bad rex parse")))))
+
 (define (ParseRexFile src)
-  (define r (rex-parse-src-file src))
-  (If r (_0 r) (Throw "bad rex parse")))
+  (ParseRexFileWith "reaver" src))
 
 ;;; Final three-case normalization ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1732,8 +1808,14 @@
     (Heir [span kids]
       ($Nest span "clear" "" (map NormalizeRex kids)))))
 
+(define (ParseRexNormWith mode src)
+  (NormalizeRex (ParseRexWith mode src)))
+
 (define (ParseRexNorm src)
   (NormalizeRex (ParseRex src)))
+
+(define (ParseRexNormFileWith mode src)
+  (NormalizeRex (ParseRexFileWith mode src)))
 
 (define (ParseRexNormFile src)
   (NormalizeRex (ParseRexFile src)))
@@ -2005,5 +2087,10 @@
   ParseRexFile
   ParseRexNorm
   ParseRexNormFile
+  ParseRexWith
+  ParseRexBlocksWith
+  ParseRexFileWith
+  ParseRexNormWith
+  ParseRexNormFileWith
   NormalizeRex
   PrintRex)
