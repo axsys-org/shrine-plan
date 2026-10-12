@@ -37,9 +37,10 @@
       const live=new Map(source.members.map(member=>[member.key,member.life]));
       for(const [key,plan] of this.requested)if(live.get(key)!==plan.life)this.requested.delete(key);
     }
-    async read(signal) {
-      const wanted=new Map(this.requested), records=new Map();
-      const first=await this.fetchPage({},signal);
+    async read(signal, fetchPage=this.fetchPage) {
+      const wanted=new Map(this.requested), records=new Map(), presentations=[];
+      let omitted=0;
+      const first=await fetchPage({},signal);
       const check=(page,parent)=> {
         if(page.id!==this.path || page.axis!==this.axis || page.topology!=='tree' || !page.incremental ||
            page.life!==first.life || page.epoch!==first.epoch || page.parent!==parent || !Array.isArray(page.members))
@@ -47,6 +48,9 @@
       };
       const add=(page,parent,initial=false)=> {
         check(page,parent);
+        if(page.omitted!==undefined && (!Number.isSafeInteger(page.omitted)||page.omitted<0||page.omitted>64))throw new Error('Invalid omitted tree count.');
+        omitted+=page.omitted||0;
+        if(page.presentations)presentations.push(...page.presentations);
         if(page.members.length>(initial?65:64))throw new Error('Tree child page exceeds its bound.');
         for(const member of page.members) {
           const isRoot=initial && member.key===this.path && member.parent===null;
@@ -67,7 +71,7 @@
         const cursors=new Set();
         while(next && pages<desired) {
           if(cursors.has(next))throw new Error('Repeated tree cursor.');cursors.add(next);
-          const continuation=await this.fetchPage({parent,after:next,epoch:first.epoch},signal);
+          const continuation=await fetchPage({parent,after:next,epoch:first.epoch},signal);
           add(continuation,parent);next=continuation.next;pages++;
         }
         member.childrenLoaded=true;member.moreChildren=!!next;
@@ -75,12 +79,12 @@
         // an unopened subtree. Parent order also drops requests for removed nodes.
         for(const child of records.values()) {
           if(child.parent!==parent || !child.hasChildren || wanted.get(child.key)?.life!==child.life)continue;
-          const page=await this.fetchPage({parent:child.key,epoch:first.epoch},signal);
+          const page=await fetchPage({parent:child.key,epoch:first.epoch},signal);
           add(page,child.key);queue.push({parent:child.key,page});
         }
       }
       topology([...records.values()],'list_tree');
-      return {...first,members:[...records.values()]};
+      return {...first,omitted,members:[...records.values()],...(first.presentations?{presentations}:{})};
     }
   }
   const sameMember = (a, b) => !!a && !!b && ['key','life','source','sourceLife'].every(key => a[key] === b[key]) && (a.axis || 'z') === (b.axis || 'z');

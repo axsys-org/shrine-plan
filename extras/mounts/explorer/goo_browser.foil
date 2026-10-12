@@ -2,6 +2,7 @@
 - goo_bridge
 - goo_panes
 - goo_reflection
+- goo_documentation
 - overlay_cache
 
 + goo_browser
@@ -112,8 +113,9 @@
     = receiver host.receiver
     | receiver target state
   + render_fields
-    \ context=goo_bridge/render_context published=goo/published card=myth route=maybe[row[nat]]
+    \ context=goo_bridge/render_context target=path published=goo/published card=myth route=maybe[row[nat]]
     ^ either[str row[jkv]]
+    = published (goo_bridge/receiver target published)
     < view (goo_runtime/matching_view published card)
     ? route
      > (./some route)
@@ -141,7 +143,9 @@
     ^ row[jkv]
     [(jkv "view" (json/str (path_show published.view.name)))
      (jkv "slot" (json/str (path_show published.view.slot)))
-     (jkv "role" (json/str (path_show published.view.role)))]
+     (jkv "role" (json/str (path_show published.view.role)))
+     (jkv "origin" (json/obj [(jkv "line" (json/num .false published.view.span.line))
+       (jkv "column" (json/num .false published.view.span.column))]))]
   + domain_controls
     \ value=json
     ^ bool
@@ -164,17 +168,30 @@
         (jkv "kind" (json/str "view")) (jkv "profile" (goo_profile/metadata unit/unit))
         (jkv "context" (goo_bridge/context_json context)) (jkv "display" display)
         (jkv "html" (json/str (goo_html/fragment prepared))) (jkv "controls" (json/arr []))]
+  + recipe_base
+    \ base=row[jkv] snapshot=json view=path state=namespace
+    ^ row[jkv]
+    ?> (json/obj fields) snapshot base
+    = fields (fields.map((\ entry (? (eq entry.k "recipePublication") (jkv "recipePublication" (json/str (nat/show (state.case(.x view)).fall(0)))) entry))))
+    | base.map((\ entry (? (eq entry.k "snapshot") (jkv "snapshot" (json/obj fields)) entry)))
   + render_result
     \ context=goo_bridge/render_context target=path view=path slot=path role=path workspace=path route=maybe[row[nat]] state=namespace
     ^ either[str json]
     < card (goo_browser/render_card target workspace state)
     ? (and (gt workspace.len 0) !(equal view workspace)) (./err "Workspace render requires its installed declaration.")
-    = query (goo_runtime/request "status" target target view [] 0 0 0 [] 0)
+    = builtin ((goo_documentation/handles slot) || (equal slot goo_reflection/slot))
+      view (? (and (eq view.len 0) builtin) slot view)
+      query (goo_runtime/request "status" target target view [] 0 0 0 [] 0)
       snapshot=json
         ?> (jres/ok value rest) (parse (goo_runtime/status query state)) jnull
         value
       base=row[jkv]
         [(jkv "version" (json/num .false 1)) (jkv "ok" (json/boo .true)) (jkv "snapshot" snapshot)]
+    = documentation_slot (? (goo_documentation/handles view) view slot)
+    ? (and (goo_documentation/handles documentation_slot) ((eq view.len 0) || (goo_documentation/handles view)))
+      ? (maybe/is_some route) (./err "Documentation has no native control route.")
+      = card (? (equal documentation_slot goo_documentation/slot) (goo_documentation/enrich target card state) card)
+      | ./ok (json/obj base.weld((goo_documentation/fields context target documentation_slot card)))
     ? ((equal view goo_reflection/slot) || (and (eq view.len 0) (equal slot goo_reflection/slot)))
       ? (maybe/is_some route) (./err "Synthetic inspection has no native control route.")
       < fields (goo_browser/synthetic_fields context target card state)
@@ -182,7 +199,7 @@
     ? (gt view.len 0)
       ?> (./some record) (goo_runtime/record .x view state) (./err "View no longer exists.")
       < published (goo_runtime/published record)
-      < fields (goo_browser/render_fields context published card route)
+      < fields (goo_browser/render_fields context target published card route)
       ? (and (gt workspace.len 0) (goo_browser/domain_controls (json/obj fields)))
         | ./err "Workspace receivers are synthetic; domain actions require a member or follower presentation."
       | ./ok (json/obj base.weld((goo_browser/render_identity published)).weld(fields))
@@ -195,14 +212,15 @@
       = matches (matches.keep((\ published !(published.view.is_pane))))
       ? !(eq matches.len 1) (./err "View selection is unavailable or ambiguous.")
       = published matches.head
-      < fields (goo_browser/render_fields context published card .none)
+        base (goo_browser/recipe_base base snapshot published.view.name state)
+      < fields (goo_browser/render_fields context target published card .none)
       | ./ok (json/obj base.weld((goo_browser/render_identity published)).weld(fields))
     = entries
         | matches.map
         \ published=goo/published
         ^ json
         = identity (goo_browser/render_identity published)
-        ? (goo_browser/render_fields context published card .none)
+        ? (goo_browser/render_fields context target published card .none)
          > (./ok fields) (json/obj identity.weld(fields))
          > (./err message) (json/obj identity.snoc((jkv "kind" (json/str (? published.view.is_pane "pane" "view")))).snoc((jkv "error" (json/str message))))
     = synthetic=json
@@ -253,6 +271,51 @@
      > (./ok value) [200 (show value)]
      > (./err message) [409 (show (json/obj [(jkv "version" (json/num .false 1))
          (jkv "ok" (json/boo .false)) (jkv "error" (json/str message))]))]
+  + tree_layouts
+    ' Child identities and their ordinary Goo views are prepared in one snapshot.
+    ' Reuse one catalog for the page; never ask the browser to resolve content.
+    \ context=goo_bridge/render_context query=goo_runtime/request slots=row[path] state=namespace
+    ^ either[str json]
+    < text (goo_runtime/tree_page query state)
+    ?> (jres/ok page rest) (parse text) (./err "Invalid tree page.")
+    ?> (json/obj fields) page (./err "Invalid tree page.")
+    = catalog (goo_browser/index (goo_browser/catalog (sovereign_care .z [state.self 'gov] state)))
+      members (grove_dev/items (grove_dev/field "members" page))
+      prepared=either[str row[json]]
+        % members=row[json] members out=row[json] []
+        ^ either[str row[json]]
+        ? (eq members.len 0) (./ok out)
+        = member members.at(0)
+        ? !(eq (grove_dev/text (grove_dev/field "status" member)) "available") (_ members.drop(1) out)
+        ?> (./some subject) (path_parse (grove_dev/text (grove_dev/field "subject" member))) (./err "Invalid tree subject.")
+        < card (goo_browser/render_card subject [] state)
+        = views (goo_browser/matching card catalog)
+          presentations=either[str row[json]]
+            % slots=row[path] slots entries=row[json] []
+            ^ either[str row[json]]
+            ? (eq slots.len 0) (./ok entries)
+            = slot slots.at(0)
+              matches (views.keep((\ published (and published.view.ports.is_nil (equal published.view.slot slot)))))
+            = builtin ((equal slot goo_reflection/slot) || (goo_documentation/handles slot))
+            ? (and !builtin !(eq matches.len 1)) (./err "Child view selection is unavailable or ambiguous.")
+            = view (? builtin slot matches.head.view.name)
+            < bundle (goo_browser/pane_layouts context subject view slot [] [] .none state)
+            | _ slots.drop(1) entries.snoc((json/obj [(jkv "key" (grove_dev/field "key" member))
+                (jkv "slot" (json/str (path_show slot))) (jkv "bundle" bundle)]))
+        < presentations presentations
+        | _ members.drop(1) out.weld(presentations)
+    < prepared prepared
+    | ./ok (json/obj fields.snoc((jkv "presentations" (json/arr prepared))))
+  + tree_layout_response
+    \ context=goo_bridge/render_context query=goo_runtime/request slots=row[path] state=namespace
+    ^ [nat str]
+    ? (goo_browser/tree_layouts context query slots state)
+     > (./ok value) [200 (show value)]
+     > (./err message) [409 message]
+  + preview_at
+    \ target=path card=myth published=goo/published
+    ^ weft/node
+    | goo_browser/preview card (goo_bridge/receiver target published)
   + preview
     \ card=myth published=goo/published
     ^ weft/node
@@ -330,7 +393,7 @@
         = index (goo_browser/cached_index catalog)
           views (goo_browser/matching card index)
           panes (goo_browser/matching_panes card index)
-        | (views.weld(panes).map((goo_browser/preview card))).snoc(
+        | (views.weld(panes).map((goo_browser/preview_at target card))).snoc(
             (goo_browser/synthetic target card index.types)).row
       header
         [(weft/leaf "a" [(weft/href (str/to_atom (str/cat_all ["/grove/dev?selected=" (path_show target)]))) (weft/att "target" "_top")] "Develop this Grove")
@@ -344,12 +407,33 @@
        (weft/el "script" [(weft/att "src" "/static/goo-patch-components.js") (weft/att "defer" "defer")] [])
        (weft/el "script" [(weft/att "src" "/static/goo-patch.js") (weft/att "defer" "defer")] [])
        (weft/el "script" [(weft/att "src" "/static/goo-panes.js") (weft/att "defer" "defer")] [])
+       (weft/el "script" [(weft/att "src" "/static/goo-inspection.js") (weft/att "defer" "defer")] [])
        (weft/el "script" [(weft/att "src" "/static/goo-actions.js") (weft/att "defer" "defer")] [])
        (weft/el "link" [(weft/att "rel" "stylesheet") (weft/href "/static/goo-profile.css")] [])
        (weft/el "link" [(weft/att "rel" "stylesheet") (weft/href "/static/goo-panes.css")] [])
        (weft/el "style" [] [(weft/raw goo_browser/css)])]
       [(weft/el "aside" [] navigation.weld(links))
        (weft/el "main" [(weft/att "data-target" (str/to_atom (path_show target)))] header.weld(content))]
+  + presentation_assets
+    ^ row[weft/node]
+    = scripts=row[str] ["goo-session" "goo-topoi-components" "goo-topoi" "goo-patch-components" "goo-patch" "goo-panes" "goo-inspection" "goo-actions"]
+      assets (scripts.map((\ name (weft/el "script" [(weft/att "src" (str/to_atom (str/cat_all ["/static/" name ".js"]))) (weft/att "defer" "defer")] []))))
+      styles=row[str] ["/static/goo-profile.css" "/static/goo-panes.css" "/static/goo-topoi-components.css"]
+    | assets.weld((styles.map((\ url (weft/el "link" [(weft/att "rel" "stylesheet") (weft/href (str/to_atom url))] [])))))
+  + presentation_page
+    \ target=path slot=path selected=axal[myth] catalog=axal[myth]
+    ^ nat
+    = card selected.fil.fall(myth/new) index (goo_browser/cached_index catalog)
+      matches ((goo_browser/matching card index).weld((goo_browser/matching_panes card index))).keep((\ item (equal item.view.slot slot)))
+      content=row[weft/node]
+        ? !(eq matches.len 1) [(weft/leaf "p" [(weft/att "role" "status")] "No unique matching presentation for this subject and slot. Open the subject to choose a different slot.")]
+        | [(weft/el "main" [(weft/att "data-target" (str/to_atom (path_show target)))
+            (weft/att "data-view" (str/to_atom (path_show matches.head.view.name)))]
+            [(goo_browser/preview_at target card matches.head)])]
+      css=nat "*{box-sizing:border-box}body{margin:0;background:#fff;color:#292a25;font:13px system-ui}main{padding:8px;min-width:0}.preview{margin:0;border:0;padding:0}.preview>h2,.preview>.meta{display:none}.goo-preview{border:0;padding:0;margin:0;min-width:0}button,a{font:inherit}body>a{display:block;padding:8px;color:#596348;font-size:11px}main>p:empty{display:none}main>button{font-size:10px;margin:0 0 8px}"
+    | weft/page_with_assets "Goo presentation"
+        (goo_browser/presentation_assets).snoc((weft/el "style" [] [(weft/raw css)]))
+        content.snoc((weft/leaf "a" [(weft/href (goo_browser/url target)) (weft/att "target" "_blank") (weft/att "rel" "noopener")] "Open subject ↗"))
   + talk
     \ =bowl cur=myth add=myth
     ^ yell
@@ -361,6 +445,6 @@
       done
         . out
           put(['res_status] (pd 200))
-          put(['res_body] (pd (goo_browser/page target selected catalog)))
+          put(['res_body] (pd (? (out.has(['goo_presentation])) (goo_browser/presentation_page target (out.path_at(['presentation_slot])).fall([]) selected catalog) (goo_browser/page target selected catalog))))
           put(['res_ctype] (pd "text/html; charset=utf-8"))
     | yell [] done

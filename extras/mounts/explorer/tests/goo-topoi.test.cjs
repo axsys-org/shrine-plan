@@ -27,6 +27,18 @@ test('tab position requires an available member with the same life and source',(
 const {TreeSource}=require('../goo-topoi.js');
 const m=(key,parent,hasChildren=false,life='1')=>({key,parent,hasChildren,life,status:'available'});
 const page=(parent,members,next=null,epoch='1')=>({id:'/root',life:'1',axis:'z',topology:'tree',incremental:true,bounded:true,epoch,parent,members,next});
+test('opaque cursors advance through pages of omitted raw keys without losing the root',async()=>{
+ const calls=[];
+ const loader=new TreeSource('/root','z',async q=>{
+  calls.push(q);
+  return q.after?{...page('/root',[m('/root/named','/root')]),omitted:1}
+   :{...page('/root',[m('/root',null,true)],'v1/ts:00'),omitted:64};
+ });
+ const first=await loader.read();assert.equal(first.omitted,64);assert(first.members[0].moreChildren);
+ loader.request(first.members[0],true);
+ const next=await loader.read();assert.equal(calls.at(-1).after,'v1/ts:00');
+ assert.equal(next.omitted,65);assert.equal(next.members.length,2);assert(!next.members[0].moreChildren);
+});
 test('incremental trees fetch only expanded child pages, retain identity, and drop removed branches',async()=>{
  const calls=[];let branchLife='1',remove=false;
  const loader=new TreeSource('/root','z',async query=>{
@@ -67,4 +79,15 @@ test('incremental loading is owned by an outline on the same lexical selection',
  assert.equal(hasOutline([{...outline,renderer:'diagram_tree'}],'current'),false);
  assert.equal(hasOutline([outline],'other'),false);
  assert.equal(hasOutline([{kind:'selection',key:'current',children:[outline]}],'current'),false);
+});
+
+test('child presentation packets travel with all loaded pages without entering member references',async()=>{
+ const fetch=async q=>q.after
+   ?{...page('/root',[m('/root/b','/root')]),presentations:[{key:'/root/b'}]}
+   :{...page('/root',[m('/root',null,true),m('/root/a','/root')],'/root/a'),presentations:[{key:'/root'},{key:'/root/a'}]};
+ const loader=new TreeSource('/root','z',fetch);
+ loader.request(m('/root',null,true),true);loader.request(m('/root',null,true),true);
+ const source=await loader.read();
+ assert.deepEqual(source.presentations.map(p=>p.key),['/root','/root/a','/root/b']);
+ assert(source.members.every(m=>!m.presentations));
 });

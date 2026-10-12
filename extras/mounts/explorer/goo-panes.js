@@ -21,19 +21,27 @@
       this.session.subscribe(() => { if (!this.updating) this.paint(); });
       this.inspection.addEventListener('toggle', () => this.reflect());
     }
-    async source(path, topology = '', axis = 'z', signal, incremental = true) {
+    async source(path, topology = '', axis = 'z', signal, incremental = true, presentation) {
       if(topology==='tree' && incremental) {
         const key=JSON.stringify([path,axis]);
         let loader=this.treeSources.get(key);
         if(!loader) {
-          loader=new root.GooTopoi.TreeSource(path,axis,async(params,signal)=> {
-            const response=await fetch(`/goo/source?${new URLSearchParams({target:path,topology:'tree',axis,paged:'1',...params})}`,{cache:'no-store',signal});
-            if(!response.ok)throw new Error(await response.text());
-            return response.json();
-          });
+          loader=new root.GooTopoi.TreeSource(path,axis,null);
           this.treeSources.set(key,loader);
         }
-        return loader.read(signal);
+        // Each read captures its own request options, including overlapping refreshes.
+        const fetchPage=async(params,signal)=> {
+          const fields=new URLSearchParams({target:path,topology:'tree',axis,paged:'1',...params});
+          if(presentation?.slots.length) {
+            fields.set('presentations','pane-v1');
+            fields.set('textScale',presentation.context.textScale);fields.set('direction',presentation.context.direction);
+            for(const slot of presentation.slots)fields.append('slot',slot);
+          }
+          const response=await fetch(`/goo/source?${fields}`,{cache:'no-store',signal});
+          if(!response.ok)throw new Error(await response.text());
+          return response.json();
+        };
+        return loader.read(signal,fetchPage);
       }
       const response = await fetch(`/goo/source?${new URLSearchParams({target: path, topology, axis: axis || 'z'})}`, {cache: 'no-store',signal});
       if (!response.ok) throw new Error('Source unavailable');
@@ -56,9 +64,25 @@
           // Only an outline provides disclosure. Standalone diagram/flat views
           // keep their complete-source behavior; shared views use its projection.
           const incremental=root.GooTopoi.hasOutline(node.children||[],node.key);
-          const key = JSON.stringify([node.source,node.topology,node.axis,incremental]);
-          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis,signal,incremental));
-          out.source = await sources.get(key);
+          const consumers=[];
+          const visit=nodes=>{for(const child of nodes)if(child.kind!=='selection') {
+            if(['list','topos'].includes(child.kind) && child.selection===node.key)consumers.push(child);
+            visit(child.children||[]);
+          }};
+          visit(out.children);
+          const slots=[...new Set(consumers.map(child=>child.slot))];
+          const context=root.GooActions.context(this.host);
+          const presentation=incremental && node.topology==='tree' && slots.length ? {slots,context} : null;
+          const key = JSON.stringify([node.source,node.topology,node.axis,incremental,presentation]);
+          if (!sources.has(key)) sources.set(key, this.source(node.source,node.topology,node.axis,signal,incremental,presentation));
+          const source=await sources.get(key);
+          if(presentation) {
+            const prepared=await root.GooActions.prepareChildren(source,slots,context);
+            for(const child of consumers)child.prepared=prepared;
+          }
+          // Prepared HTML is adapter data, never selection/intent payload.
+          const {presentations,...membership}=source;
+          out.source = membership;
           sourceValues.set(key,out.source);
           if (node.initial != null) {
             out.initial = out.source.members.find(m => m.key === node.initial) || {key: node.initial};
@@ -190,7 +214,8 @@
           for (const pane of paneStates) {
             let button = state.tabButtons.get(pane.id);
             if (!button) {
-            button = el('button', '', pane.key); button.type = 'button'; button.setAttribute('role', 'tab'); button.dataset.pane = pane.id;
+            button = el('button', '', pane.spec.label || pane.key.split('/').filter(Boolean).at(-1) || pane.key);
+            button.title = pane.key; button.type = 'button'; button.setAttribute('role', 'tab'); button.dataset.pane = pane.id;
             button.addEventListener('click', () => this.session.activate(state.ref, pane.ref));
             button.addEventListener('keydown', event => {
               if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
@@ -270,7 +295,7 @@
         const data = await this.request(element,this.context.target,{view:this.context.view,node:node.node,workspace:this.context.workspace},JSON.stringify([node.node,this.snapshot]));
         if (!data || !work.live || element.dataset.loadingKey !== key || [...work.inputs.values()].some(value => value.composing)) return;
         if(!this.nativeSnapshotCurrent(data.snapshot)) return;
-        const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.publication]);
+        const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication]);
         if (work.lifetime && work.lifetime !== lifetime) {
           if (!(await this.session.depart(work,{kind:'native-replaced'}))) return;
           if (!work.live || !element.isConnected || element.dataset.loadingKey!==key || [...work.inputs.values()].some(value=>value.composing)) return;
@@ -328,6 +353,7 @@
         const clear=el('button','','Clear selection'); clear.type='button'; clear.addEventListener('click',()=>this.select(state,null));
         state.rows=new Map(); state.serverRows=new Map([...element.querySelectorAll('[data-goo-members] > [data-key]')].map(row=>[row.dataset.key,row]));
         element.replaceChildren(clear);
+        state.omittedNotice=el('p','goo-tree-notice');element.append(state.omittedNotice);
         state.topos=new root.GooTopoi.Topos(element,node.key,member=>this.select(state,member),member=>this.session.focus(state.ref,member),async(member,more)=> {
           const loader=this.treeSources.get(JSON.stringify([source.id,source.axis||'z']));
           if(!loader || !state.live)return;
@@ -341,6 +367,8 @@
         });
       }
       const renderer=node.renderer||'list';
+      state.omittedNotice.hidden=!source.omitted;
+      state.omittedNotice.textContent=source.omitted?`${source.omitted} raw keys on these pages have no Goo path spelling. Use the physical namespace debugger to inspect them.`:'';
       const projected=source.members.map(member=>selection.members.get(member.key)||member);
       const members=renderer==='list'?projected.filter(member=>member.status==='available'):projected;
       const keys=new Set(members.map(member=>member.key));
@@ -348,7 +376,7 @@
       state.topos.reconcile(renderer,members,member=> {
         let row=state.rows.get(member.key);
         if(!row || row.dataset.life!==member.life || (member.status==='available' && !this.rowWorks.has(row))) {
-          row?.remove(); row=state.serverRows.get(member.key)||el('div','goo-member',member.key); state.serverRows.delete(member.key);
+          row?.remove(); row=state.serverRows.get(member.key)||el('div','goo-member'); state.serverRows.delete(member.key);
           row.dataset.life=member.life; row.dataset.key=member.key; state.rows.set(member.key,row);
         }
         if(member.status!=='available') { row.textContent=member.hasChildren?member.key:`${member.key}: unavailable`; return row; }
@@ -358,18 +386,22 @@
           work={id:`member:${state.id}:${member.key}`,kind:'member',live:true,inputs:new Map(),generation:0,encounter:{id:binding},ref:state.ref,ownerId:state.id,member,binding};
           this.rowWorks.set(row,work);this.registerWork(work,row);
         }
+        const basis=JSON.stringify([member,work.binding,this.snapshot]);
+        const bundle=node.prepared?.get(JSON.stringify([member.key,node.slot]));
+        if(bundle)root.GooActions.adoptLayouts(member.subject,{slot:node.slot,owner:row,basis},bundle);
         const render = async () => {
-          if (!state.live || !work.live || !row.isConnected || member.status !== 'available' || [...work.inputs.values()].some(value=>value.composing)) return;
-          const context = root.GooActions.context(row);
+          if (!state.live || !work.live || (!row.isConnected && !bundle) || member.status !== 'available' || [...work.inputs.values()].some(value=>value.composing)) return;
+          let context = root.GooActions.context(row);
+          if (!context.width && bundle)context={...bundle.context,layout:'sm'};
           if (!context.width) return;
-          const expected=JSON.stringify([member.subject,member.life,member.expected,node.slot,this.snapshot?.publication,context]);
+          const expected=JSON.stringify([member.subject,member.life,member.expected,node.slot,this.snapshot?.publication,bundle?.layouts[0].render.snapshot,context]);
           if (row.dataset.expected===expected || row.dataset.loadingKey===expected) return;
           row.dataset.loadingKey=expected; if(!row.dataset.expected) row.inert=true;
           try {
-            const data=await this.request(row,member.subject,{slot:node.slot},JSON.stringify([member,work.binding,this.snapshot]));
+            const data=(bundle && root.GooActions.chooseLayout(bundle,context)) || await this.request(row,member.subject,{slot:node.slot},basis);
             if (!data || !state.live || !work.live || row.dataset.loadingKey!==expected || data.snapshot.life!==member.life || [...work.inputs.values()].some(value=>value.composing)) return;
             if (data.description) throw new Error('Member presentations must be views.');
-            const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.publication]);
+            const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication]);
             if(work.lifetime && work.lifetime!==lifetime) {
               if(!(await this.session.depart(work,{kind:'member-view-replaced'}))) return;
               if(!work.live || !row.isConnected || row.dataset.loadingKey!==expected || [...work.inputs.values()].some(value=>value.composing)) return;
@@ -447,10 +479,19 @@
       };
       if(state.ref) unregister=this.session.resource(state.ref,resource);
     }
+    inspectionState(work) {
+      const inputs=[...(work?.inputs?.values()||[])];
+      const selection=work?.selection && this.session.handles.get(work.selection);
+      return {revision:this.session.revision,owner:work?.id||'workspace',incarnation:work?.incarnation,
+        encounter:work?.encounter?.id,generation:work?.generation,
+        selection:selection?.accepted?.subject||selection?.accepted?.key||'',pending:!!selection?.pending,
+        dirty:inputs.filter(value=>value.dirty).length,composing:inputs.filter(value=>value.composing).length,
+        live:!this.session.closed && (!work || work.live)};
+    }
     actionContext(target, view, snapshot, controls, scopes, follower) {
       const encounter = follower?.encounter?.id, generation = follower?.generation;
       const continuing = () => follower?.live && follower.encounter?.id === encounter && follower.generation === generation;
-      return {target, view, snapshot, controls, actionScope:follower, report: this.context.report,
+      return {target, view, snapshot, controls, actionScope:follower, inspect:()=>({...this.inspectionState(follower),encounter,generation}), report: this.context.report,
         input: (key, input, signal) => {
           if (!follower) return;
           let work = follower.inputs.get(key);
@@ -520,7 +561,7 @@
       const member = selection.accepted;
       if (!member || member.status !== 'available') {
         this.requests.get(element)?.abort(); this.loading.delete(state.id); element.inert=false; element.removeAttribute('aria-busy');
-        element.textContent = member ? 'Selected member is unavailable.' : 'Choose a member.';
+        element.textContent = member ? (member.hasChildren ? 'This name has no record; expand its children to choose a record.' : 'Selected member is unavailable.') : 'Choose a member.';
         this.rendered.set(state.id,key); return;
       }
       this.loading.set(state.id,key); element.setAttribute('aria-busy','true');

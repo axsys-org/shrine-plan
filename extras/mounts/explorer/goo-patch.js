@@ -41,10 +41,22 @@
             if(members.some(member=>!member))throw new Error('Selection target is unavailable.');
             await panes.session.deliver(panes.session.intentMany(selection.ref,members,request.mode));
             surface.setSelection(panes.session.read(selection.ref).acceptedMany.map(member=>member.target));
+            surface.dispatchEvent(new CustomEvent('goo-patch-selection-accepted',{bubbles:true,
+              detail:panes.session.read(selection.ref).acceptedMany.map(member=>member.target)}));
           }catch(error){panes.context.report(error.message);}
         },
-        // No offer means unknown compatibility; the bound action remains authority.
-        query:()=>{},
+        query:async request=>{
+          if(!surface.installedScene?.offers[request.kind==='create-picker'?'createPicker':request.kind])return;
+          try {
+            const response=await fetch('/goo/patch-query',{method:'POST',body:new URLSearchParams({
+              target:panes.context.target,view:panes.context.view,query:JSON.stringify(request)})});
+            if(!response.ok)return; // Unknown compatibility still goes through admission.
+            const result=await response.json();
+            if(!work.live || !surface.isConnected || surface.installedScene?.header.viewSeq!==request.basis.viewSeq)return;
+            if(request.kind==='compatibility')surface.receiveCompatibility(result);
+            else surface.dispatchEvent(new CustomEvent('goo-patch-query-result',{bubbles:true,detail:{request,result}}));
+          }catch(error){panes.context.report(`Patch query: ${error.message}`);}
+        },
         repair:code=>{panes.context.report(`Patch presentation: ${code}`);
           if(work.repairAt!==panes.snapshot.projectionSeq){work.repairAt=panes.snapshot.projectionSeq;queueMicrotask(()=>panes.context.refresh?.());}
         },

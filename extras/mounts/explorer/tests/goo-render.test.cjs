@@ -17,6 +17,7 @@ class Element {
   }
   setAttribute(k,v) { this.attrs[k]=v; }
   removeAttribute(k) { delete this.attrs[k]; }
+  toggleAttribute(k,on) { if(on)this.setAttribute(k,'');else this.removeAttribute(k); }
   getAttribute(k) { return this.attrs[k]; }
   addEventListener(k,fn) { (this.listeners[k] ||= []).push(fn); }
   remove() { if(this.parentElement) this.parentElement.children=this.parentElement.children.filter(n=>n!==this); this.isConnected=false; }
@@ -38,7 +39,7 @@ const tree=[{kind:'pane',key:'workspace',children:[{kind:'selection',key:'curren
 ]}]}];
 const state=(s,kind)=>[...s.owners.values()].find(x=>x.kind===kind);
 async function setup() {
- const pending=[], context={GooSession, console, structuredClone, AbortController, confirm:()=>true};
+ const pending=[], context={GooSession, console, structuredClone, AbortController, requestAnimationFrame:setImmediate, confirm:()=>true};
  context.document={createElement:tag=>new Element(tag),activeElement:null};
  let invocations=0;
  context.GooActions={context:()=>({width:400,textScale:1,direction:'ltr'}),observe:()=>()=>{},mount:(element,data)=>{element.replaceChildren(data.template.cloneNode(true));},load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
@@ -333,4 +334,51 @@ test('an accepted deferred update publishes metadata only when composition has e
  assert.equal(result.status,'deferred');assert.equal(applied,0);
  await input.fire('compositionend');await flush();assert.equal(applied,1);assert.equal(c.snapshot.publication,'2');
  assert.equal(c.nativeWorks.get(element),work);
+});
+
+test('prepared tree rows mount before attachment and refresh retains rows until validation completes',async()=>{
+ const {controller:c,context}=await setup();
+ // Retire the initial fixture without scheduling its follower.
+ await c.session.reconcile([]);
+ const member={...A,key:'/cards',subject:'/cards',parent:null,hasChildren:false,axis:'z'};
+ const source={id:'/cards',life:'1',type:'namespace-record',axis:'z',topology:'tree',incremental:true,epoch:'1',members:[member],presentations:[]};
+ const description=[{kind:'selection',key:'selected',source:'/cards',topology:'tree',axis:'z',children:[
+   {kind:'topos',key:'outline',selection:'selected',renderer:'list_tree',slot:'/summary'}]}];
+ c.source=async()=>source;
+ const data=response('/cards','Prepared child');
+ const prepared=new Map([[JSON.stringify(['/cards','/summary']),{context:{width:240,textScale:1,direction:'ltr'},layouts:[{render:data}],data}]]);
+ context.GooActions.prepareChildren=async()=>prepared;
+ context.GooActions.adoptLayouts=()=>{};
+ context.GooActions.chooseLayout=bundle=>bundle.data;
+ let mounted=0;
+ context.GooActions.mount=(row,value)=>{assert(!row.parentElement,'new row is prepared before insertion');row.replaceChildren(value.template.cloneNode(true));mounted++;};
+ assert.equal((await c.update(description,{publication:'1'})).status,'applied');
+ const top=state(c.session,'topos'), row=top.rows.get('/cards');
+ assert.equal(mounted,1);assert.equal(row.textContent,'');assert.equal(row.children[0].textContent,'Prepared child');
+ assert.equal(state(c.session,'selection').source.presentations,undefined);
+ const gate=defer();context.GooActions.prepareChildren=()=>gate.promise;
+ const updating=c.update(description,{publication:'2'});await flush();
+ assert.equal(top.rows.get('/cards'),row);assert.equal(row.children[0].textContent,'Prepared child');
+ gate.reject(Error('stale prepared page'));await assert.rejects(updating,/stale prepared page/);
+ assert.equal(top.rows.get('/cards'),row);assert.equal(c.snapshot.publication,'1');
+});
+
+
+test('unrelated catalogue publications rebind native authority while preserving the recipe input lifetime',async()=>{
+ const {controller:c,pending:p}=await setup();
+ const node={kind:'native',node:'editor'},parent={target:'/study',subject:'/study',life:'1',displayed:'10',publication:'20',recipePublication:'7'};
+ await c.update([{kind:'pane',key:'survivor',children:[node]}],parent);
+ const [element,work]=[...c.nativeWorks][0];
+ p.at(-1).resolve({...response('/study','first'),snapshot:{...parent}});await flush();
+ work.inputs.set('/draft',{value:'unsaved',dirty:true});
+ c.snapshot={...parent,publication:'21'};
+ const refresh=c.renderNative(node,element,[],c.session.get(work.ref).id);
+ p.at(-1).resolve({...response('/study','rebound'),snapshot:{...c.snapshot}});await refresh;
+ assert.equal(work.departure,undefined);assert.equal(work.inputs.get('/draft').value,'unsaved');
+ assert.equal(element.children[0].textContent,'rebound');
+ c.snapshot={...c.snapshot,publication:'22',recipePublication:'8'};
+ const replaced=c.renderNative(node,element,[],c.session.get(work.ref).id);
+ p.at(-1).resolve({...response('/study','new recipe'),snapshot:{...c.snapshot}});await flush();
+ assert(work.departure);work.departure.finish(false);await replaced;
+ assert.equal(element.children[0].textContent,'rebound');assert.equal(work.inputs.get('/draft').value,'unsaved');
 });

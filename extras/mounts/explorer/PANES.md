@@ -441,6 +441,30 @@ the legacy complete-source endpoint keep their complete, 64-member projection.
 Views sharing an outline's selection see the same materialized source.
 Disclosure and camera state never call domain actions.
 
+Paging examines at most 64 raw keys plus one lookahead. Keys without a Goo path
+spelling are omitted and counted in `omitted`; outlines display that count rather
+than failing the whole branch. `next` is an opaque `physical_key` continuation, so
+even an entirely omitted page can advance. Legacy path-shaped cursors remain
+accepted, with the same parent/source and epoch checks. The physical debugger
+remains the interface for inspecting those raw keys.
+
+The outline adapter requests `presentations=pane-v1` on `/goo/source`, with
+repeated `slot` parameters (at most eight), `textScale`, and `direction`. The
+server prepares each available member's ordinary Goo view in `sm`/`md`/`lg`
+from the same immutable namespace as that child page, reusing one catalog for
+the page. The response adds `presentations: [{key, slot, bundle}]` alongside
+membership; these packets never become selection or capture payloads.
+
+The adapter validates all packets, their profile and contexts, subject/lifetime,
+and page epoch before admitting the refreshed projection. Existing rows remain
+visible during preparation or failure. New record rows mount prepared content
+before attachment, avoiding a raw-path placeholder while hydration runs. The
+variants seed the existing presentation owner's cache; narrower-than-sm panes
+and later scale/direction changes still use the ordinary contextual render API.
+Structural branches without a record retain their path labels. Preparation
+failure rejects the page and reports the backend diagnostic without partially
+replacing the tree.
+
 `goo-topoi.js` adapts native lists, Mash `goo-tree`, and Mash `goo-tidy-tree`.
 The explorer builds its own pinned component bundle, so selecting the debugger
 mount is unnecessary. `extras/flake.nix` pins the profile- and patch-enabled Mash revision
@@ -449,3 +473,47 @@ Production asset builds verify the vendored profile against that Nix artifact.
 
 The application gate installs the test-only `panes` fixture; `topoi_demo` shows a
 list, outline, and diagram sharing a detail view and a descendant capture action.
+
+
+## Inspect this presentation
+
+Use **Inspect a presentation**, then click a mounted Goo presentation; or press
+**Alt+I** while focused inside it. Picking consumes that gesture without changing
+selection or invoking a domain action. **Capture again** explicitly samples the
+currently installed presentation. Closing inspection restores the prior focus.
+
+The browser captures the last committed render packet, not an in-flight response.
+`GooInspection` retains only its subject/action version metadata, recipe and source
+location, layout context/profile, and node count. The local adapter contributes
+session revision, owner/lifetime/encounter identity, selection, and counts of dirty
+or composing inputs. Input contents, action handles and executable controls are
+excluded. Opening inspection does not remount the inspected surface.
+
+`POST /goo/inspect` accepts a bounded, whitelisted observation and constructs
+`goo_inspection`'s typed capture, subject, recipe, preparation and encounter
+records. Its slots belong to the publisher's `goo/inspection` vocabulary. The
+ordinary synthetic reflection, normalization, layout and HTML pipeline renders
+those records. The formatter has no namespace argument and cannot dispatch a
+write. Its reply carries no domain controls.
+
+This is a **browser-reported observation**, including the copied server metadata;
+it is not a fresh or independently verified namespace read. Namespace cases and
+browser revisions remain separate. References open current records in another
+tab. The source location refers to the published declaration; a zero location
+means unavailable/generated. The existing publication token describes the view
+catalogue version, not a newly invented per-declaration version.
+
+Observations are transient: capture IDs and owner IDs are page-local, not durable
+namespace paths. The panel's generated presentation can itself be inspected, with
+an explicit parent-capture link and no automatic recursive expansion. Resize
+reprepares the same observation. Late responses and responses to a closed panel
+cannot replace newer captures.
+
+This first slice does not persist observations, reconstruct history, explain
+individual `or` choices, or retain compiler transformation provenance. It exposes
+installed render/encounter evidence rather than claiming that those traces exist.
+
+Run `scripts/check-inspection-browser.mjs BASE MASH OUTPUT` against an Eden with
+`goo-inspector`, `tree-pages`, and `panes`. It checks real captures, unchanged
+namespace and selection, stale responses, inspection of the inspector, and native
+input/caret/composition preservation in Chromium, Firefox and WebKit.

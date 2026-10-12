@@ -67,6 +67,7 @@
         lifetime=nextLifetime;
         await controller.update(data.description,data.snapshot,{signal:request.signal,onApplied:()=>{
           if(current!==revision) return;
+          root.GooInspection?.record(host,data,()=>controller.inspectionState());
           host.dataset.renderContext=JSON.stringify(data.context); host.dataset.profileRevision=data.profile.revision;
         }});
       } catch(error) { if(error.name!=='AbortError' && current===revision) report(error.message); }

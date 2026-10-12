@@ -188,7 +188,7 @@ test('action retries retain one invocation, capture and exact working inputs',as
   await Promise.resolve();await Promise.resolve();
   fixture.input.value='later draft';await fixture.button.fire('click');
   assert.equal(bodies.length,2);assert.equal(bodies[0],bodies[1]);
-  const form=new URLSearchParams(bodies[0]);assert.equal(form.get('input:/req'),'first draft');assert(form.get('invocation'));
+  const form=new URLSearchParams(bodies[0]);assert.equal(form.get('input:/req'),'first draft');assert(form.get('invocation'));assert.equal(fixture.button.dataset.gooInvocation,form.get('invocation'));
   gate.resolve(response({ok:true}));await first;
   assert.equal(fixture.saved.length,1);assert.equal(fixture.saved[0][1].get('/req'),'first draft');
   assert.equal(actions.metrics.activations,1);assert.equal(actions.metrics.dispatches,2);assert.equal(fixture.button.disabled,false);
@@ -259,4 +259,37 @@ test('cancelled unsent capture releases common selection evidence without dispat
   fixture.context.releaseCapture=id=>released.push(id);
   const captured=actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]);actions.discardCaptured(captured);
   await assert.rejects(actions.activateCaptured(captured),/Unknown captured/);assert.deepEqual(released,[captured.operationId]);assert.equal(calls.length,0);
+});
+
+test('prepared children validate the entire snapshot before seeding the existing layout cache',async()=>{
+  const requested=paneContext(240,'sm'), owner={};
+  const make=()=>{
+    const value=bundle(requested);for(const item of value.layouts)item.render.snapshot.projectionSeq=12;
+    return {epoch:'12',members:[{key:'/item',subject:'/item',life:'4',expected:'2',status:'available'}],
+      presentations:[{key:'/item',slot:'/content',bundle:value}]};
+  };
+  const {actions,calls}=setup(url=>{assert.equal(url,'/static/goo-profile.json');return response(profile);});
+  const prepared=await actions.prepareChildren(make(),['/content'],requested);
+  const value=prepared.get(JSON.stringify(['/item','/content']));
+  actions.adoptLayouts('/item',{owner,basis:'page-12',slot:'/content'},value);
+  const selected=await actions.load('/item',{owner,basis:'page-12',slot:'/content',context:paneContext(720,'lg')});
+  assert.equal(selected.layout,'lg');assert.equal(calls.length,1,'no per-child render fetch');
+  for(const mutate of [
+    page=>page.presentations.pop(),
+    page=>page.presentations.push(page.presentations[0]),
+    page=>page.presentations[0].key='/another',
+    page=>page.presentations[0].slot='/wrong',
+    page=>page.epoch='13',
+    page=>page.members[0].life='5',
+    page=>page.members[0].subject='/another',
+    page=>page.presentations[0].bundle.layouts[2].render.profile.revision='wrong',
+    page=>page.presentations[0].bundle.layouts[1].render.description=[],
+  ]) {
+    const page=make();mutate(page);await assert.rejects(actions.prepareChildren(page,['/content'],requested));
+  }
+  const projection=make();projection.members[0].expected='99';
+  for(const item of projection.presentations[0].bundle.layouts)item.render.snapshot.target='/writable-receiver';
+  assert.equal((await actions.prepareChildren(projection,['/content'],requested)).size,1);
+  const page=make();page.members.push({key:'/branch',status:'unavailable',hasChildren:true});
+  assert.equal((await actions.prepareChildren(page,['/content'],requested)).size,1,'structural branches need no fabricated view');
 });

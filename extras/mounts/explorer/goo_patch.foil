@@ -1,8 +1,85 @@
 - goo_bridge
 - weft
+- http_foot
+- value_read
 
 ' Server-resolved patch scenes. This is HTML lowering, never a layout solver.
 + goo_patch
+  + query_provider
+    : target=path read={\ json namespace}either[str json]
+  + query_path
+    \ self=iota view=path
+    ^ path
+    = root=path [self 'weft 'goo_patch_queries]
+    | root.weld(view)
+  + query_response
+    \ fields=row[[str str]] state=namespace
+    ^ [nat str]
+    = get (\ key=str (http_foot/field key fields))
+      view (http_foot/target (get "view")) target (http_foot/target (get "target"))
+    ?> (./some card) (goo_runtime/record .x (goo_patch/query_path state.self view) state) [404 "No patch query provider"]
+    ?> (./some held) card.get(['sys 'goo 'patch_query]) [404 "No patch query provider"]
+    ?> provider=goo_patch/query_provider held [409 "Invalid patch query provider"]
+    ? !(equal target provider.target) [409 "Query target does not match its presentation"]
+    ?> (jres/ok query rest) (parse (get "query")) [400 "Invalid query"]
+    = read provider.read
+    ? (read query state)
+     > (./ok response) [200 (show response)]
+     > (./err message) [409 message]
+  + occurrence
+    : kind=str key=str body=list[goo/node]
+  + population
+    ' Server-authored native content for a runtime population. Mutations remain
+    ' in statically published patch_operation bindings, never in scene JSON.
+    : occurrences=row[goo_patch/occurrence]
+  + passive
+    \ node=goo/node
+    ^ bool
+    = allowed=row[str] ["image" "patch_presentation" "text" "path" "row" "col" "group" "or" "opt" "patch_port" "patch_handle" "patch_select" "patch_label"]
+    | (and allowed.has(node.constructor) node.children.all(goo_patch/passive))
+  + presentation_frame
+    ' Server-authored embedded Goo document, never an arbitrary iframe URL.
+    \ node=goo/node
+    ^ either[str goo_patch/fragment]
+    = target (goo_patch/property "target" node) slot (goo_patch/property "slot" node)
+      label (goo_patch/property "label" node) key (goo_patch/key node)
+    ?> (./some subject) (path_parse target) (./err "Presentation requires an absolute subject path")
+    ?> (./some lexical) (path_parse slot) (./err "Presentation requires an absolute slot path")
+    ? ((eq subject.len 0) || (eq lexical.len 0) || (eq label.len 0) || (eq key.len 0) || !(node.children.is_nil)) (./err "Invalid presentation frame")
+    ?> (./some width) (nat/parse (goo_patch/property "width" node)) (./err "Presentation width required")
+    ?> (./some height) (nat/parse (goo_patch/property "height" node)) (./err "Presentation height required")
+    ?> (./some top) (nat/parse (goo_patch/property "top" node)) (./err "Presentation top required")
+    ? ((lt width 32) || (gt width 2000) || (lt height 32) || (gt height 2000) || (gt top 2000)) (./err "Invalid presentation rectangle")
+    = url (str/cat_all ["/goo-presentation?path=" (value_read/percent target) "&slot=" (value_read/percent slot)])
+      style (str/cat_all ["position:absolute;left:16px;top:" (nat/show top) "px;width:" (nat/show width) "px;height:" (nat/show height) "px;border:0;background:transparent"])
+    | ./ok (goo_patch/fragment (str/from_atom (weft/render (weft/el "iframe"
+        [(weft/att "data-goo-presentation-frame" (str/to_atom key)) (weft/att "title" (str/to_atom label))
+         (weft/att "src" (str/to_atom url)) (weft/att "style" (str/to_atom style))] []))) [])
+  + population_contents
+    \ context=goo_bridge/render_context published=goo/published card=myth node=goo/node scene=json route=row[nat]
+    ^ either[str row[json]]
+    ?> (./some expression) (goo_runtime/named "population" node.arguments) (./ok [])
+    ?> (./some held) (goo_bridge/value published card expression) (./err "Patch population unavailable")
+    ?> population=goo_patch/population held (./err "Patch population must be typed server content")
+    ? (gt population.occurrences.len 4096) (./err "Patch population exceeds its bound")
+    % rest=row[goo_patch/occurrence] population.occurrences ordinal=nat 0 out=row[json] [] keys=row[[str str]] []
+    ^ either[str row[json]]
+    ? (eq rest.len 0) (./ok out)
+    = item rest.at(0) identity=[str str] [item.kind item.key]
+    ? (keys.has(identity)) (./err "Duplicate dynamic occurrence")
+    ? !((eq item.kind "patch_node") || (eq item.kind "patch_connection")) (./err "Invalid dynamic occurrence kind")
+    ? !(item.body.all(goo_patch/passive)) (./err "Dynamic content requires passive Goo; use published operations for actions")
+    = matches ((goo_patch/items (goo_patch/field "nodes" scene)).keep((\ record (eq (goo_patch/text (goo_patch/field "key" record)) item.key))))
+      width=goo/scalar
+        ? !(eq item.kind "patch_node") context.width
+        ? !(eq matches.len 1) context.width
+        | (goo_number/nonnegative (goo_patch/field "width" (goo_patch/field "rect" matches.at(0)))).fall(context.width)
+      local context.set_width(width)
+    < body (goo_patch/body local published card item.body route.snoc(ordinal) (\ node route []))
+    | _ rest.drop(1) ordinal.inc out.snoc((json/obj
+        [(jkv "kind" (json/str item.kind)) (jkv "key" (json/str item.key))
+         (jkv "html" (json/str body.html)) (jkv "controls" (json/arr []))
+         (jkv "context" (goo_bridge/context_json local))])) keys.snoc(identity)
   + field
     \ name=str value=json
     ^ json
@@ -33,7 +110,7 @@
   + special
     \ node=goo/node
     ^ bool
-    | ((eq node.constructor "patch_port") || (eq node.constructor "patch_handle") || (eq node.constructor "patch_label") || node.children.any(goo_patch/special))
+    | ((eq node.constructor "patch_port") || (eq node.constructor "patch_handle") || (eq node.constructor "patch_select") || (eq node.constructor "patch_label") || node.children.any(goo_patch/special))
   + fragment
     : html=str controls=row[json]
   + native
@@ -66,19 +143,20 @@
     = node rest.head here route.snoc(ordinal) kind node.constructor
       key (goo_patch/key node) label (goo_patch/property "label" node)
       fragment=either[str goo_patch/fragment]
-        ? ((eq kind "patch_port") || (eq kind "patch_handle"))
-          ? !(node.children.is_nil) (./err "patch_port/patch_handle are named native controls without children.")
+        ? (eq kind "patch_presentation") (goo_patch/presentation_frame node)
+        ? ((eq kind "patch_port") || (eq kind "patch_handle") || (eq kind "patch_select"))
+          ? !(node.children.is_nil) (./err "Patch controls are named native controls without children.")
           ? !(gt label.len 0) (./err "patch controls require label = accessible text.")
           = button (weft/leaf "button" [(weft/att "type" "button")
-              (weft/att (? (eq kind "patch_port") "data-patch-anchor" "data-patch-handle") "")
-              (weft/att "aria-label" (str/to_atom label))]
-              (? (eq kind "patch_port") "+" "Move"))
+              (weft/att (? (eq kind "patch_port") "data-patch-anchor" (? (eq kind "patch_select") "data-patch-select" "data-patch-handle")) "")
+              (weft/att "aria-label" (str/to_atom label)) (weft/att "title" (str/to_atom label))]
+              (? (eq kind "patch_port") "+" (? (eq kind "patch_select") "Select" "Move")))
             moves=row[weft/node]
-              ? (eq kind "patch_port") []
+              ? !(eq kind "patch_handle") []
               | goo_patch/move_controls label
             wrapper (weft/el (? (eq kind "patch_port") "goo-patch-port" "span")
               [(weft/att "data-key" (str/to_atom key))
-               (weft/att "style" (? (eq kind "patch_port") "" "position:absolute;bottom:4px;left:4px;z-index:1"))] moves.cons(button))
+               (weft/att "style" (? (eq kind "patch_port") "" (? (eq kind "patch_select") "position:absolute;inset:0" "position:absolute;bottom:4px;left:4px;z-index:1")))] moves.cons(button))
           | ./ok (goo_patch/fragment (str/from_atom (weft/render wrapper)) [])
         ? (eq kind "patch_label")
           < inside (goo_patch/body context published card node.children here metadata)
@@ -96,7 +174,8 @@
     ?> value=pails/t value (./err "Patch scene must be JSON text.")
     ? (gt value.t.len 16777216) (./err "Patch scene exceeds the payload bound.")
     ?> (jres/ok scene rest) (parse value.t) (./err "Invalid patch scene JSON.")
-    % children=list[goo/node] node.children ordinal=nat 0 contents=row[json] [] offers=row[json] []
+    < dynamic (goo_patch/population_contents context published card node scene route)
+    % children=list[goo/node] node.children ordinal=nat 0 contents=row[json] dynamic offers=row[json] []
     ^ either[str json]
     ? children.is_nil
       | ./ok (json/obj [(jkv "kind" (json/str "patch")) (jkv "key" (json/str (goo_patch/key node)))

@@ -1,5 +1,6 @@
 - browser_routes
 - goo_browser
+- goo_inspection
 
 + explorer_dev
   + interact
@@ -7,6 +8,11 @@
     ^ http_foot/action
     = parts (http_foot/split 63 request.target)
       source (equal parts.at(0) "/goo/source")
+    ? (equal parts.at(0) "/goo/inspect") (explorer_dev/inspect request)
+    ? (equal parts.at(0) "/goo/patch-query")
+      ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
+      ? (gt request.body.len 65536) (./reply (http_driver/response 413 "Patch query is too large"))
+      | ./snapshot (goo_patch/query_response (http_foot/fields request.body))
     ? (equal parts.at(0) "/goo/render") (explorer_dev/render request)
     = receipt (equal parts.at(0) "/goo/operation-status")
       reading ((equal parts.at(0) "/goo/status") || source || receipt)
@@ -28,11 +34,42 @@
       inputs (inputs.map((\ [key value] [key.slice(6 (sub key.len 6)) value])))
       inputs (? source inputs.snoc(["$axis" (? (get "axis").len (get "axis") "z")]) inputs)
       inputs (? source inputs.weld([["$parent" (get "parent")] ["$after" (get "after")] ["$epoch" (get "epoch")]]) inputs)
-    | ./interact (goo_runtime/request (? source (? (eq (get "topology") "tree") (? (eq (get "paged") "1") "tree-page" "tree-source") "source") (? receipt "operation-status" (? reading "status" "act")))
+    = query (goo_runtime/request (? source (? (eq (get "topology") "tree") (? (eq (get "paged") "1") "tree-page" "tree-source") "source") (? receipt "operation-status" (? reading "status" "act")))
         (browser_routes/target (get "target")) (browser_routes/target (get "subject")) (browser_routes/target (get "view"))
         (indices.map((\ index (nat/parse index).fall(0))))
         expected displayed publication
         (? (eq (get "invocation").len 0) inputs inputs.snoc(["$invocation" (get "invocation")])) now)
+    ? (and source (eq (get "presentations") "pane-v1"))
+      ? !(and (eq (get "topology") "tree") (eq (get "paged") "1"))
+        | ./reply (http_driver/response 400 "Prepared children require tree paging")
+      = slots=row[str] (fields.keep((\ [key value] (eq key "slot")))).map((\ [key value] value))
+      ? ((eq slots.len 0) || (gt slots.len 8) || !(slots.all((\ slot=str (maybe/is_some (path_parse slot))))))
+        | ./reply (http_driver/response 400 "Invalid child presentation slots")
+      ?> (./some scale) (explorer_dev/render_number (get "textScale")) (./reply (http_driver/response 400 "Invalid text scale"))
+      ? ((goo_fp/lte scale (goo_fp/integer 0)) || !(goo_fp/lte scale (goo_fp/integer 10)))
+        | ./reply (http_driver/response 400 "Invalid text scale")
+      ? !((eq (get "direction") "ltr") || (eq (get "direction") "rtl"))
+        | ./reply (http_driver/response 400 "Invalid direction")
+      = context (goo_bridge/render_context (goo_fp/integer 240) scale (eq (get "direction") "rtl"))
+      | ./snapshot (goo_browser/tree_layout_response context query (slots.map((\ slot=str (path_parse slot).fall([])))))
+    | ./interact query
+  + inspect
+    \ request=http_foot/request
+    ^ http_foot/action
+    ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
+    ? (gt request.body.len 65536) (./reply (http_driver/response 413 "Inspection is too large"))
+    = fields (http_foot/fields request.body)
+      get (\ key=str (http_foot/field key fields))
+    ?> (./some width) (explorer_dev/render_number (get "width")) (./reply (http_driver/response 400 "Invalid width"))
+    ?> (./some scale) (explorer_dev/render_number (get "textScale")) (./reply (http_driver/response 400 "Invalid text scale"))
+    ? (!(goo_fp/lte width (goo_fp/integer 100000)) || (goo_fp/lte scale (goo_fp/integer 0)) || !(goo_fp/lte scale (goo_fp/integer 10)))
+      | ./reply (http_driver/response 400 "Invalid render bounds")
+    ? !((eq (get "direction") "ltr") || (eq (get "direction") "rtl"))
+      | ./reply (http_driver/response 400 "Invalid direction")
+    = context (goo_bridge/render_context width scale (eq (get "direction") "rtl"))
+    ? (goo_inspection/prepare context fields)
+     > (./err message) (./reply (http_driver/response 400 message))
+     > (./ok value) (./bytes 200 (http_foot/bar (str/to_atom (show value))) "application/json; charset=utf-8")
   + render_number
     \ text=str
     ^ maybe[goo/scalar]

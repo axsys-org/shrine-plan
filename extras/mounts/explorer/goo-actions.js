@@ -55,6 +55,51 @@
     }).catch(error => { profileRequest = null; throw error; });
     return profileRequest;
   }
+  const layoutKey = (target, options, requested) => requested.layout && options.owner && options.basis !== undefined
+    ? JSON.stringify([target,...['view','slot','role','node','workspace'].map(key=>options[key]||''),options.basis,requested.textScale,requested.direction]) : null;
+  function validateLayouts(data, requested, profile) {
+    if(data.version!==1 || data.ok!==true || data.layoutPolicy!=='pane-v1' || !Array.isArray(data.layouts) || data.layouts.length!==3) throw new Error('Invalid pane layout bundle');
+    if(!data.context || ['width','textScale','direction'].some(key=>data.context[key]!==requested[key])) throw new Error('Goo render context mismatch');
+    let snapshot;
+    for(const [index,variant] of data.layouts.entries()) {
+      const [name,width]=layoutSizes[index];
+      if(variant.size!==name || !variant.render) throw new Error('Invalid pane layout variant');
+      validate(variant.render,{...requested,width:name==='sm'?Math.min(width,requested.width):width},profile);
+      const basis=JSON.stringify(variant.render.snapshot);
+      if(snapshot!==undefined && snapshot!==basis) throw new Error('Mixed pane layout snapshots');
+      snapshot=basis;
+    }
+  }
+  async function prepareChildren(page, slots, requested) {
+    const profile=await installedProfile(), prepared=new Map();
+    if(!Array.isArray(page.presentations))throw new Error('Missing prepared child presentations');
+    const members=new Map(page.members.map(member=>[member.key,member]));
+    for(const {key,slot,bundle} of page.presentations) {
+      const member=members.get(key), identity=JSON.stringify([key,slot]);
+      if(!member || member.status!=='available' || !slots.includes(slot) || prepared.has(identity))throw new Error('Unexpected child presentation');
+      validateLayouts(bundle,{...requested,width:240},profile);
+      // Action versions belong to the resolved writable receiver, which may
+      // differ from this projected member. Subject/life and page epoch bind it.
+      for(const {render} of bundle.layouts) {
+        if(render.description || render.slot!==slot || (render.snapshot.subject||render.snapshot.target)!==member.subject ||
+          render.snapshot.life!==member.life ||
+          String(render.snapshot.projectionSeq)!==page.epoch)throw new Error('Child presentation changed; refresh before continuing.');
+      }
+      prepared.set(identity,bundle);
+    }
+    for(const member of members.values())if(member.status==='available')for(const slot of slots)
+      if(!prepared.has(JSON.stringify([member.key,slot])))throw new Error('Missing child presentation');
+    return prepared;
+  }
+  function adoptLayouts(target, options, bundle) {
+    const key=layoutKey(target,options,{...bundle.context,layout:'sm'});
+    if(key)layoutCache.set(options.owner,{key,layouts:bundle.layouts});
+  }
+  function chooseLayout(bundle, requested) {
+    if(['textScale','direction'].some(key=>bundle.context[key]!==requested[key]))return null;
+    const chosen=bundle.layouts.findLast(({render})=>render.context.width<=requested.width);
+    return chosen?.size===requested.layout && chosen.render.context.width===requested.width ? {...chosen.render,layout:chosen.size} : null;
+  }
   async function load(target, options = {}) {
     const requested = options.context;
     if (!requested || !Number.isFinite(requested.width) || requested.width < 0 || requested.width > 100000 || !Number.isFinite(requested.textScale) || requested.textScale <= 0 || requested.textScale > 10 || !['ltr','rtl'].includes(requested.direction)) throw new Error('A valid render context is required');
@@ -64,8 +109,7 @@
     for (const name of ['view','slot','role','node','workspace']) if (options[name] !== undefined && options[name] !== '') fields[name] = options[name];
     // A cache belongs to one existing presentation owner and a semantic basis.
     // Refreshes/retirements change that basis; geometry changes alone do not.
-    const cacheKey = requested.layout && options.owner && options.basis !== undefined
-      ? JSON.stringify([target,...['view','slot','role','node','workspace'].map(key=>fields[key]||''),options.basis,requested.textScale,requested.direction]) : null;
+    const cacheKey = layoutKey(target,options,requested);
     const cached = cacheKey && layoutCache.get(options.owner);
     const choose = layouts => layouts.findLast(({render})=>render.context.width<=requested.width);
     if (cached?.key===cacheKey) {
@@ -82,18 +126,7 @@
     let data = await response.json();
     if (!response.ok || data.ok === false) throw new Error(data.error || `Goo render failed (${response.status})`);
     if (requested.layout) {
-      if(data.version!==1 || data.layoutPolicy!=='pane-v1' || !Array.isArray(data.layouts) || data.layouts.length!==3) throw new Error('Invalid pane layout bundle');
-      if(!data.context || ['width','textScale','direction'].some(key=>data.context[key]!==requested[key])) throw new Error('Goo render context mismatch');
-      let snapshot;
-      for(const [index,variant] of data.layouts.entries()) {
-        const [name,width]=layoutSizes[index];
-        if(variant.size!==name || !variant.render) throw new Error('Invalid pane layout variant');
-        const expected={...requested,width:name==='sm'?Math.min(width,requested.width):width};
-        validate(variant.render,expected,profile);
-        const basis=JSON.stringify(variant.render.snapshot);
-        if(snapshot!==undefined && snapshot!==basis) throw new Error('Mixed pane layout snapshots');
-        snapshot=basis;
-      }
+      validateLayouts(data,requested,profile);
       const chosen=choose(data.layouts);
       if(!chosen || chosen.size!==requested.layout || chosen.render.context.width!==requested.width) throw new Error('No fitting pane layout');
       options.signal?.throwIfAborted();
@@ -143,12 +176,28 @@
         for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
         input.replaceWith(held);
       }
-      container.replaceChildren(...(section ? [next] : [...next.childNodes]));
+      const proposedFrames = !section && preserve ? [...next.children].filter(node => node.matches('iframe[data-goo-presentation-frame]')) : [];
+      const retainedFrames = proposedFrames.map(node => [...container.children].find(old =>
+        old.matches('iframe[data-goo-presentation-frame]') && old.dataset.gooPresentationFrame === node.dataset.gooPresentationFrame && old.getAttribute('src') === node.getAttribute('src')));
+      // One direct presentation document per occurrence. Changing its subject/slot
+      // retires it; title or geometry changes keep its actual focused/composing DOM.
+      if (proposedFrames.length === 1 && retainedFrames[0]) {
+        const proposed = proposedFrames[0], held = retainedFrames[0];
+        for (const attr of [...held.attributes]) if (!proposed.hasAttribute(attr.name)) held.removeAttribute(attr.name);
+        for (const attr of [...proposed.attributes]) if (held.getAttribute(attr.name) !== attr.value) held.setAttribute(attr.name, attr.value);
+        for (const child of [...container.childNodes]) if (child !== held) child.remove();
+        let after = false;
+        for (const child of [...next.childNodes]) {
+          if (child === proposed) { after = true; continue; }
+          if (after) container.append(child); else container.insertBefore(child, held);
+        }
+      } else container.replaceChildren(...(section ? [next] : [...next.childNodes]));
       container.dataset.renderContext = JSON.stringify(data.context);
       if(data.layout)container.dataset.gooLayout=data.layout;
       else delete container.dataset.gooLayout;
       container.dataset.profileRevision = data.profile?.revision || '';
       container.gooDisplay = data.display;
+      root.GooInspection?.record(container,data);
       if (active?.isConnected && document.activeElement !== active) {
         active.focus({preventScroll:true});
         if (selection && selection[0] !== null) active.setSelectionRange(...selection);
@@ -226,6 +275,7 @@
   }
   function subscribeOutcomes(listener){outcomeListeners.add(listener);return ()=>outcomeListeners.delete(listener);}
   function bind(container, context) {
+    root.GooInspection?.bind(container,context.inspect || (()=>({owner:"view",generation:context.actionScope?.generation,dirty:context.actionScope?.inputs?.size||0,composing:context.actionScope?.composing?1:0,live:true})));
     const scope=context.actionScope || container;
     if(!pendingScopes.has(scope)) pendingScopes.set(scope,new Map());
     const pendingActions=pendingScopes.get(scope);
@@ -251,6 +301,8 @@
         try {
           if (control.become && !control.invoke) { await context.become(control.slot); return; }
           const captured=captureActivation(container,context,control);
+          // Receipt correlation for hosts invoking an ordinary bound control.
+          element.dataset.gooInvocation=captured.operationId;
           pending = {captured,elements:new Map([[element,binding]])}; pendingActions.set(actionKey,pending); element.disabled = true;
           context.report('Applying…');
           const held=pending;held.unsubscribe=subscribeOutcomes(receipt=>{if(receipt.operationId!==captured.operationId||receipt.outcome==='unknown')return;held.unsubscribe?.();held.unsubscribe=null;if(pendingActions.get(actionKey)===held){pendingActions.delete(actionKey);for(const [element,owner] of held.elements)if(bindings.get(element)===owner)element.disabled=false;}});
@@ -270,7 +322,7 @@
       }, {signal:binding.signal});
     }
   }
-  root.GooActions = {status, load, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
+  root.GooActions = {status, load, prepareChildren, adoptLayouts, chooseLayout, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
   async function start() {
     const main = document.querySelector('main[data-target]'); if (!main) return;
     const target = main.dataset.target, frames = new Map();
@@ -281,10 +333,10 @@
     async function refresh() {
       const current = ++revision; request?.abort(); request = new AbortController(); button.disabled = true;
       try {
-        const data = await load(target,{context:context(main),signal:request.signal});
+        const data = await load(target,{view:main.dataset.view || undefined,context:context(main),signal:request.signal});
         if (current !== revision) return;
         const seen = new Set(), errors = [];
-        for (const view of data.views) {
+        for (const view of data.views || [data]) {
           const key = view.view; seen.add(key);
           let frame = frames.get(key);
           if (!frame) {
@@ -343,6 +395,7 @@
         }
         await frame.controller.update(data.description,data.snapshot,{signal:frame.request.signal,onApplied:() => {
           if (generation !== frame.generation) return;
+          root.GooInspection?.record(frame.element,data,()=>frame.controller.inspectionState());
           frame.element.dataset.renderContext = JSON.stringify(data.context);
           frame.element.dataset.profileRevision = data.profile.revision;
         }});
@@ -353,7 +406,7 @@
         if(closed && frame.controller===controller) frame.controller=null;
         if(generation!==frame.generation || !frame.element.isConnected || !closed) return;
       }
-      const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.publication,data.view]);
+      const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication,data.view]);
       if (frame.lifetime && frame.lifetime !== lifetime && frame.inputs.size) {
         if (!confirm('This view was replaced. Discard its unsaved input?')) return;
         frame.inputs.clear();
