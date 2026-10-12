@@ -22,6 +22,14 @@ for(const name of (process.env.BROWSERS||'chromium,firefox,webkit').split(',')) 
   await article('/0x11/lib/pact/lore').waitFor();
   assert((await article('/0x11/lib/pact/lore').innerText()).includes('Structured documentation'));
   assert((await article('/0x11/lib/pact/lore').locator('.doc-signature').innerText()).includes('/0x11/lib/pact/lore@x1['));
+  const contextPath=await page.locator('#workspace').getAttribute('data-target');
+  assert.match(contextPath,/^\/0x11\/goo\/ses\/[0-9]+$/);
+  const contextValue=await page.request.post(base+'/goo/render',{form:{target:contextPath,slot:'/sys/slot/synthetic',width:'800',textScale:'1',direction:'ltr'}});
+  assert.equal(contextValue.status(),200);
+  const stored=await contextValue.json();
+  assert(stored.html.includes('source_path'));
+  assert(stored.html.includes('/0x11/lib/pact/lore'));
+  check('workspace receiver is an inspectable namespace context with a numeric session ID');
   check('real Grove workspace resolves its initial namespace selection');
   await member('/0x11/lib/pact/lore/line').press('Enter');
   await article('/0x11/lib/pact/lore/line').waitFor();

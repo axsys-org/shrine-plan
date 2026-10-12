@@ -22,6 +22,13 @@ preserving their exact type identity and showing positional contents.
 Browser Back/Forward restores the
 browsing root, not page-local expansion or selection state.
 
+Each workspace page allocates a context record at `/{self}/goo/ses/[numeric-id]`.
+The record holds the role's `source_path` slot; render refreshes read that record
+instead of constructing a receiver from the requested browsing path. IDs increase
+across workspace endpoints and mount reinstalls. Context records remain in the
+namespace after the page closes; a new page load allocates a new context. Browser
+selection, active tabs, and expansion remain page-local.
+
 The reader uses the stored `/sys/lede`, `/sys/help` (structured `lore` or text),
 `/sys/mold`, and `/sys/src` fields. It also recognizes Grove source text.
 Foil definition publication writes the captured heading to `/sys/lede` and the
