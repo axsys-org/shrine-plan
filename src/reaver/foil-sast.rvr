@@ -600,17 +600,37 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           ((rx-plain? "clear" item) (rx-nest-kids item))
           (else [item]))))
     (hr-stem (foldl flat-one 0 items)))
+  ;; A 3-ary > — a pattern, a source, a failure value — is ALWAYS the
+  ;; refutable bind, never a match arm (an arm is binary: a pattern
+  ;; and a body, which may be a chain of statements at one column).
+  ;; The source tells them apart: it sits on the rune's own line
+  ;; (failure inline or indented below), or hangs deeper than the
+  ;; failure; an arm's statements share a column below the rune.
+  ;; Generated trees carry zero spans, where the shape cannot be
+  ;; told; they keep the arm reading.
+  (define (guard-shaped? k)
+    (And (rx-rune? ">" k)
+      (let ((ks (rx-rune-kids k)))
+        (And (Ge (Sz ks) 3)
+          (let ((l0 (span-line (rx-span k)))
+                (l1 (span-line (rx-span (_1 ks))))
+                (c1 (span-col (rx-span (_1 ks))))
+                (c2 (span-col (rx-span (_2 ks)))))
+            (Or (And (Gt l0 0) (Eq l0 l1))
+                (Gt c1 c2)))))))
+  (define (arm-rune? k)
+    (And (rx-rune? ">" k) (Nil (guard-shaped? k))))
   ;; A ? with match arms has a >-rune (single arm) or a juxt starting
   ;; with one (several arms) as its second kid; anything else with a
   ;; heir is a truthy-if.
   (define (arm-ish? k)
-    (Or (rx-rune? ">" k)
+    (Or (arm-rune? k)
       (Or (And (rx-juxt? k)
-            (rx-rune? ">" (_0 (rx-juxt-kids k))))
+            (arm-rune? (_0 (rx-juxt-kids k))))
         ;; arms arrive as one vertical group kid
         (And (rx-plain? "clear" k)
           (And (Sz (rx-nest-kids k))
-            (rx-rune? ">" (_0 (rx-nest-kids k))))))))
+            (arm-rune? (_0 (rx-nest-kids k))))))))
   ;; A pipeline stage receives the accumulated value as its FIRST
   ;; argument: |> x / f / g(a b)  =>  (g (f x) a b).  A call-shaped
   ;; stage f(a b) is a juxt (word + arg parens), which no other body
@@ -767,7 +787,11 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           (cond
             ((Eq 0 (Sz items))
               (sast-error "call rune (|) needs a function to call" val))
-            ((find (lambda (k) (rx-rune? ">" k)) items)
+            ;; only the call's own operands: a \ operand's body chain
+            ;; follows it among the items and may hold > binds
+            ((find (lambda (k) (rx-rune? ">" k))
+               (let ((cut (find-idx (lambda (k) (rx-rune? "\" k)) items)))
+                 (Ifz cut items (take (_0 cut) items))))
               (sast-error "loops are spelled % now: `%  name=type init ...` with no > arms (| is the multi-line call rune)" val))
             (else
               (let ((extra
@@ -813,7 +837,7 @@ assert(Equal (surf-app (surf-ref ["f"]) [(surf-lit 1) (surf-lit 2)])
           ;; chain (a fallthrough written at the arms' column rides
           ;; inside the poem instead of chaining as the heir).
           (let* ((items (hr-stem (rx-juxt-flat (drop 1 kids))))
-                 (na (find-idx (lambda (k) (Nil (rx-rune? ">" k))) items))
+                 (na (find-idx (lambda (k) (Nil (arm-rune? k))) items))
                  (arms (Ifz na items (take (_0 na) items)))
                  (trail (Ifz na [] (drop (_0 na) items))))
             (unless (Or (Ifz (Sz trail) 1 0) (Eq foil-no-heir heir))
