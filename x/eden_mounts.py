@@ -37,6 +37,72 @@ class Mount:
     manifest: dict
 
 
+def workspace_routes(data):
+    """Declarative hosts claim their pages and assets without a second routes list."""
+    workspaces = data.get('workspaces', [])
+    return (data.get('routes', []) + [w['route'] for w in workspaces]
+            + (list(data.get('assets', {})) if workspaces else []))
+
+
+def validate_workspaces(data):
+    name = data['name']
+    def reject(message):
+        raise ValueError(f'{name}: workspace {message}')
+    def fields(value, allowed, required):
+        if not isinstance(value, dict) or set(value) - set(allowed) or set(required) - set(value):
+            reject('has unknown or missing fields')
+    def path(value, empty=False):
+        if (not isinstance(value, list) or (not value and not empty) or
+                any(not isinstance(x, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', x) for x in value)):
+            reject('paths must be arrays of namespace names')
+    items = data.get('workspaces', [])
+    if not isinstance(items, list):
+        reject('registrations must be an array')
+    names, entries = set(), set()
+    for item in items:
+        fields(item, ('name', 'route', 'entry', 'receiver', 'shell'), ('name', 'route', 'entry', 'receiver'))
+        key = item['name']
+        if not isinstance(key, str) or not re.fullmatch(r'[a-z][a-z0-9_-]*', key) or key in names:
+            reject('name must be unique and canonical')
+        names.add(key)
+        route = item['route']
+        if not isinstance(route, str) or not re.fullmatch(r'/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*', route):
+            reject('route must be canonical and non-root')
+        path(item['entry'])
+        entry = tuple(item['entry'])
+        if entry in entries:
+            reject('entry pane cannot have two hosted receivers')
+        entries.add(entry)
+        receiver = item['receiver']
+        fields(receiver, ('slot', 'initial', 'admission'), ('slot', 'initial'))
+        path(receiver['slot']); path(receiver['initial'], empty=True)
+        if receiver.get('admission', 'namespace') not in ('namespace', 'record'):
+            reject('admission must be namespace or record')
+        for loc in (item['entry'], receiver['slot']):
+            if not any(loc[:len(u['root'])] == u['root'] for u in data.get('grove', [])):
+                reject('entry and receiver slot must belong to this mount’s Grove roots')
+        shell = item.get('shell', {})
+        fields(shell, ('title', 'brand', 'subtitle', 'stylesheet', 'breadcrumbs', 'navigation', 'footer'), ())
+        for key in ('title', 'brand', 'subtitle', 'stylesheet', 'footer'):
+            if key in shell and not isinstance(shell[key], str):
+                reject(f'shell {key} must be text')
+        if 'breadcrumbs' in shell and not isinstance(shell['breadcrumbs'], bool):
+            reject('breadcrumbs must be boolean')
+        if shell.get('stylesheet') and shell['stylesheet'] not in data.get('assets', {}):
+            reject('stylesheet must name a declared asset')
+        if not isinstance(shell.get('navigation', []), list):
+            reject('navigation must be an array')
+        for link in shell.get('navigation', []):
+            if not isinstance(link, list) or len(link) != 2 or not isinstance(link[0], str):
+                reject('navigation entries must contain a label and path')
+            path(link[1], empty=True)
+    for route in workspace_routes(data):
+        if not isinstance(route, str) or not route.startswith('/') or '?' in route or '#' in route:
+            reject('invalid asset or route URL')
+    if len(workspace_routes(data)) != len(set(workspace_routes(data))):
+        reject('page, asset and manual routes must be distinct')
+
+
 def catalog(root):
     folder = Path(root).resolve() / 'mounts'
     result = {}
@@ -68,6 +134,7 @@ def catalog(root):
             hook = data.get(key)
             if hook and (hook['module'] not in data.get('modules', {}) or not hook.get('entry')):
                 raise ValueError(f'{name}: invalid {key} entrypoint')
+        validate_workspaces(data)
         result[name] = Mount(name, path.parent, data)
     return result
 
@@ -111,7 +178,14 @@ def select(root, names):
                 if key[:len(old)] == old or old[:len(key)] == key:
                     raise ValueError(f'Conflicting publication roots: {owner} and {mount.name}: {key}')
             roots[key] = mount.name
-        for route in data.get('routes', []):
+        def provides_workspace_host(dependency):
+            item = available[dependency].manifest
+            return ('goo_workspace_mount' in item.get('modules', {}) or
+                    any(provides_workspace_host(parent) for parent in item.get('dependencies', [])))
+        if data.get('workspaces') and not any(
+                provides_workspace_host(parent) for parent in data.get('dependencies', [])):
+            raise ValueError(f'{mount.name}: workspaces require the explorer dependency')
+        for route in workspace_routes(data):
             if route in routes:
                 raise ValueError(f'Duplicate HTTP route {route}: {routes[route]} and {mount.name}')
             routes[route] = mount.name
@@ -180,7 +254,8 @@ def runtime_specs(prepared, source_root):
                       hook('activate'), hook('http'), hook('start'), args,
                       int(bool(data.get('inspection'))),
                       dependencies(mount),
-                      list(data.get('assets', {}).values()), data.get('routes', [])])
+                      list(data.get('assets', {}).values()), workspace_routes(data),
+                      int(bool(data.get('workspaces')))])
     return specs
 
 
@@ -229,7 +304,7 @@ class ScanBridge:
         if hasattr(self, 'manifests'):
             current = json.loads((self.originals[name] / 'mount.json').read_text())
             keys = ('version', 'name', 'dependencies', 'modules', 'grove', 'assets', 'roots',
-                    'activate', 'http', 'start', 'host', 'routes', 'inspection')
+                    'activate', 'http', 'start', 'host', 'routes', 'inspection', 'workspaces')
             if any(current.get(key) != self.manifests[name].get(key) for key in keys):
                 raise ValueError('Mount descriptor changed; restart Eden to change registrations')
             mount, prepared, module = self.scanners[name]

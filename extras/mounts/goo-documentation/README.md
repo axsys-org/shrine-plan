@@ -13,17 +13,24 @@ The initial page opens the installed node's `lib/pact/lore` documentation. Libra
 Declarations, Applications, System, breadcrumbs, Parent, and the path form all
 navigate the same endpoint. **Browse** makes a tree member the new browsing root.
 Select a record to read; expand a branch to load its children. **Values** shows
-the existing synthetic Goo presentation. Browser Back/Forward restores the
+the synthetic Goo presentation, using each slot definition's `/sys/lede` as its
+label. A missing, empty, or non-text title falls back to the slot path.
+Structured lore is reflected into its heading, body lines, and authored example
+pairs even when the view catalog supplies no type descriptor for it.
+Browser Back/Forward restores the
 browsing root, not page-local expansion or selection state.
 
-The reader uses the actual `/sys/lede`, `/sys/help` (structured `lore` or text),
-publisher documentation, `/sys/mold`, and `/sys/src` records. It also recognizes
-publisher Grove source text. For code records without stored lore, Eden installs
-a read-only adapter to the existing compiler metadata interfaces: it reads the
-exact pinned artifact on the record, resolves the definition in that artifact's
-assigned context, and extracts its captured lore and normalized Rex definition.
-It neither reads current source files nor recompiles. Normalized source is
-labelled explicitly, and stored documentation takes precedence. Examples show authored source and expected output;
+The reader uses the stored `/sys/lede`, `/sys/help` (structured `lore` or text),
+`/sys/mold`, and `/sys/src` fields. It also recognizes Grove source text.
+Foil definition publication writes the captured heading to `/sys/lede` and the
+remaining body and examples to `/sys/help`, without repeating the heading there.
+Documentation and Values read the same stored prose.
+For code records, Eden installs a read-only adapter to the existing compiler
+metadata interfaces: it reads the exact pinned artifact on the record, resolves
+the definition in that artifact's assigned context, and extracts its normalized
+Rex definition and kind. It does not synthesize documentation from artifact
+comments, read current source files, or recompile. Normalized source is
+labelled explicitly. Examples show authored source and expected output;
 they do not execute or claim a pass/fail result. Missing documentation has an
 explicit empty state. Source starts collapsed. All prose and code are escaped
 server-side; Unicode is retained.
@@ -49,7 +56,7 @@ server-side; Unicode is retained.
   This allows natural document flow and full Unicode without introducing a second
   application runtime. The Values pane remains the existing Goo renderer.
 - `goo-documentation-bridge.rvr` supplies that metadata adapter using
-  `perc-lore`, `perc-entry-span`, the existing `compiler-inspect/entry-source`,
+  `perc-entry-span`, the existing `compiler-inspect/entry-source`,
   `entry-parts`, and the artifact's defining
   context. Its derived reading card does not mutate the namespace record.
 - Initial membership can name a path-valued receiver field; the server resolves
