@@ -1,0 +1,1120 @@
+-  sept
+-  rex
+'  lint: the Foil style checker.  A pure function from a surface rex
+'  tree to located errors and warnings, one rule id per clause of
+'  style-guide.md.  Columns are 0-based inside; spans stay 1-based.
++  lint
+  +  diag
+    '  One finding.  The span's column is the node's 1-based start.
+    : span=rex/source_span rule=str level=str message=str
+
+  +  report
+    : errors=row[lint/diag] warnings=row[lint/diag]
+
+  +  config
+    : max_width=nat suspect_width=nat flat_width=nat
+      wide_runes=row[str] deprecated_runes=row[str] rules=row[str]
+      lapidary_lines=nat lapidary_len=nat max_decl_lines=nat
+      max_depth=nat
+
+  +  ctx
+    '  Walker context: the innermost declaration's height (0 at
+    '  module level), the rune nesting depth below it, and whether
+    '  the node is in statement position.
+    : decl_lines=nat depth=nat statement=bool
+
+  +  mark
+    '  A width sample: a line, the width a node reaches on it, and
+    '  the 0-based column that node starts at.
+    : line=nat width=nat col=nat
+
+  +  info
+    '  Width-pass fold result: the marks so far, the last line
+    '  touched, and that line's start offset when it is known.
+    : marks=row[lint/mark] last_line=nat last_start=maybe[nat]
+
+  +  default_rules
+    ^ row[str]
+    ["line-too-long" "line-suspect" "decl-children" "decl-head-gap"
+     "rune-gap" "gutter" "let-queenside" "let-kingside-multiline"
+     "let-kingside-align" "let-gap" "wide-form" "prefer-tall"
+     "too-simple" "snake-case" "deprecated-rune" "decl-too-long"
+     "deep-nesting"]
+
+  +  all_rules
+    '  The default rules plus the ones gated on the guide's TODOs.
+    ^ row[str]
+    = base lint/default_rules
+    base.weld(["lapidary" "ufcs-lift"])
+
+  +  error_rules
+    '  The guide's hard rules: a cap, a never, two alwayses.
+    ^ row[str]
+    ["line-too-long" "let-kingside-multiline" "wide-form" "snake-case"]
+
+  +  default_config
+    ^ lint/config
+    = wide=row[str] ["|"]
+      old=row[str]  ["?>" "||" "!"]
+    | lint/config 72 54 54 wide old lint/default_rules 40 5 40 7
+
+  +  level_of
+    '  ?=  ((lint/level_of "wide-form") "error")
+    '  ?=  ((lint/level_of "gutter") "warning")
+    \ rule=str
+    ^ str
+    ? (row/has[str] rule lint/error_rules) "error"
+    "warning"
+
+  +  check
+    '  Lint with the default configuration.
+    \ tree=rex
+    ^ lint/report
+    | lint/check_with lint/default_config tree
+
+  +  check_all
+    '  Lint with every rule on, the TODO-gated ones included.
+    \ tree=rex
+    ^ lint/report
+    = cfg lint/default_config
+    | lint/check_with cfg.set_rules(lint/all_rules) tree
+
+  +  check_text
+    \ text=str
+    ^ either[any lint/report]
+    < tree (rex/parse text)
+    | ./ok (lint/check tree)
+
+  +  check_with
+    \ cfg=lint/config tree=rex
+    ^ lint/report
+    = found | lint/width_rules cfg tree
+      seen  | lint/walk cfg lint/top_ctx tree
+      kept  | lint/enabled cfg found.weld(seen)
+      done  | lint/sorted kept
+      errs  | lint/of_level "error" done
+      warns | lint/of_level "warning" done
+    | lint/report errs warns
+
+  +  enabled
+    \ cfg=lint/config diags=row[lint/diag]
+    ^ row[lint/diag]
+    diags.keep((\ d (row/has[str] d.rule cfg.rules)))
+
+  +  of_level
+    \ level=str diags=row[lint/diag]
+    ^ row[lint/diag]
+    diags.keep((\ d (eq d.level level)))
+
+  +  sorted
+    \ diags=row[lint/diag]
+    ^ row[lint/diag]
+    (list/sort_by[lint/diag] lint/diag_lte diags.stream).row
+
+  +  diag_lte
+    '  Line, then column, then rule id.
+    \ a=lint/diag b=lint/diag
+    ^ bool
+    ? (lt a.span.line b.span.line) .true
+    ? (lt b.span.line a.span.line) .false
+    ? (lt a.span.column b.span.column) .true
+    ? (lt b.span.column a.span.column) .false
+    | lte_str a.rule.to_atom b.rule.to_atom
+
+  +  emit
+    \ rule=str node=rex message=str
+    ^ lint/diag
+    | lint/diag (lint/pos_span node) rule (lint/level_of rule) message
+
+  +  emit_at
+    '  A finding at a bare line and 0-based column.
+    \ rule=str line=nat col=nat message=str
+    ^ lint/diag
+    = span | rex/make_span line col.inc 0 0
+    | lint/diag span rule (lint/level_of rule) message
+
+  +  pos_span
+    '  The node's span with the column moved to its 1-based start.
+    \ node=rex
+    ^ rex/source_span
+    = span node.span
+      col  (lint/start_col node).inc
+    | rex/make_span span.line col span.offset span.length
+
+  +  col_msg
+    \ what=str col=nat
+    ^ str
+    | str/cat_all [what " belongs at column " (nat/show col.inc)]
+
+  '  Geometry over start-only spans.
+
+  +  start_col
+    '  0-based column of the node's first byte.  An open's span
+    '  column is its anchor (the rune's last byte); heirs and blocs
+    '  read their first kid.
+    \ node=rex
+    ^ nat
+    ? node
+     > (./open span rune kids) (sub span.column rune.len)
+     > (./heir span kids) (lint/first_col span kids)
+     > (./bloc span color rune head items) (lint/start_col head)
+    node.span.column.dec
+
+  +  first_col
+    \ span=rex/source_span kids=row[rex]
+    ^ nat
+    ? (eq kids.len 0) span.column.dec
+    | lint/start_col kids.at(0)
+
+  +  first_line
+    \ node=rex
+    ^ nat
+    ? node
+     > (./heir span kids)
+      | if (eq kids.len 0) span.line (lint/first_line kids.at(0))
+     > (./bloc span color rune head items) (lint/first_line head)
+    node.span.line
+
+  +  end_offset
+    '  Exclusive end byte of a tight node; an open counts its rune.
+    \ node=rex
+    ^ nat
+    ? node
+     > (./open span rune kids) (add span.offset rune.len)
+     > (./heir span kids) span.offset
+     > (./bloc span color rune head items) span.offset
+    | add node.span.offset node.span.length
+
+  +  count_nl
+    '  ?=  ((lint/count_nl "ab") 0)
+    \ text=str
+    ^ nat
+    % i=nat 0 n=nat 0
+    ? (eq i text.len) n
+    | _ i.inc (if (eq text.at(i) 10) n.inc n)
+
+  +  max2
+    '  ?=  ((lint/max2 3 7) 7)
+    \ a=nat b=nat
+    ^ nat
+    ? (lt a b) b
+    a
+
+  +  min2
+    \ a=nat b=nat
+    ^ nat
+    ? (lt b a) b
+    a
+
+  +  own_last_line
+    \ node=rex
+    ^ nat
+    ? node
+     > (./leaf span shape text) (add span.line (lint/count_nl text))
+    | lint/first_line node
+
+  +  last_line_step
+    \ node=rex subs=row[nat]
+    ^ nat
+    | subs.fold (lint/own_last_line node) lint/max2
+
+  +  last_line
+    '  The last source line a node touches, from its leaves.
+    \ node=rex
+    ^ nat
+    | rex/fold[nat] lint/last_line_step node
+
+  +  is_multiline
+    \ node=rex
+    ^ bool
+    | lt (lint/first_line node) (lint/last_line node)
+
+  +  height
+    \ node=rex
+    ^ nat
+    | add 1 (sub (lint/last_line node) (lint/first_line node))
+
+  +  is_kind
+    '  Is the node a leaf of the given native kind?
+    \ kind=str node=rex
+    ^ bool
+    > (./some found) node.leaf_kind
+     .false
+    | eq found kind
+
+  +  is_slug
+    \ node=rex
+    ^ bool
+    | lint/is_kind "slug" node
+
+  +  is_word
+    \ node=rex
+    ^ bool
+    | lint/is_kind "word" node
+
+  +  is_name
+    '  A word that is not a number.
+    \ node=rex
+    ^ bool
+    ? node
+     > (./leaf span shape text)
+      ? (not (lint/is_word node)) .false
+      ? (eq text.len 0) .false
+      | not (digit_byte text.at(0))
+    .false
+
+  +  is_open
+    \ node=rex
+    ^ bool
+    ? node
+     > (./open span rune kids) .true
+    .false
+
+  +  is_brack
+    \ node=rex
+    ^ bool
+    ? node
+     > (./expr span color kids) (eq color "brack")
+    .false
+
+  +  is_line_juxt
+    '  Several nodes on one body line (their spans do not touch),
+    '  as opposed to a lexical clump such as f(x).
+    \ node=rex
+    ^ bool
+    ? node
+     > (./juxt span kids)
+      ? (lt kids.len 2) .false
+      | lt (lint/end_offset kids.at(0)) kids.at(1).span.offset
+    .false
+
+  +  splice
+    '  Statement kids as the compiler sees them: slugs dropped and
+    '  body-line juxts spread out; a heir sub-block stays one kid.
+    \ kids=row[rex]
+    ^ row[rex]
+    | kids.fold [] lint/splice_one
+
+  +  splice_one
+    \ acc=row[rex] kid=rex
+    ^ row[rex]
+    ? (lint/is_slug kid) acc
+    ? (lint/is_line_juxt kid) acc.weld(kid.children)
+    acc.snoc(kid)
+
+  +  pairs
+    '  Pattern/value pairs of a = or % kid list; a dangling kid is
+    '  dropped (the compiler reports it).
+    \ kids=row[rex]
+    ^ row[[pat=rex val=rex]]
+    = flat | lint/splice kids
+    % i=nat 0 out=row[[pat=rex val=rex]] []
+    ? (ge i.inc flat.len) out
+    | _ (add i 2) out.snoc([flat.at(i) flat.at(i.inc)])
+
+  '  Width pass: rules line-too-long and line-suspect.
+
+  +  width_rules
+    \ cfg=lint/config tree=rex
+    ^ row[lint/diag]
+    = all   (rex/fold[lint/info] lint/width_step tree).marks
+      lines | lint/line_widths all
+    | row/sift[lint/mark lint/diag] (lint/width_diag cfg) lines
+
+  +  width_diag
+    \ cfg=lint/config m=lint/mark
+    ^ maybe[lint/diag]
+    ? (gt m.width cfg.max_width)
+     | ./some (lint/width_at "line-too-long" cfg.max_width m)
+    ? (gt m.width cfg.suspect_width)
+     | ./some (lint/width_at "line-suspect" cfg.suspect_width m)
+    .none
+
+  +  width_at
+    \ rule=str cap=nat m=lint/mark
+    ^ lint/diag
+    = text | str/cat_all ["line is " (nat/show m.width) " columns wide"]
+      msg  | str/cat_all [text " (limit " (nat/show cap) ")"]
+    | lint/emit_at rule m.line m.col msg
+
+  +  line_widths
+    '  One entry per line: the widest mark and the leftmost column.
+    \ marks=row[lint/mark]
+    ^ row[lint/mark]
+    = order   | list/sort_by[lint/mark] lint/mark_lte marks.stream
+      ordered | list/row[lint/mark] order
+    | row/fold[lint/mark row[lint/mark]] [] lint/widen ordered
+
+  +  mark_lte
+    \ a=lint/mark b=lint/mark
+    ^ bool
+    | le a.line b.line
+
+  +  widen
+    \ acc=row[lint/mark] m=lint/mark
+    ^ row[lint/mark]
+    ? (eq acc.len 0) [m]
+    = last acc.at(acc.len.dec)
+    ? (lt last.line m.line) acc.snoc(m)
+    = width | lint/max2 last.width m.width
+      col   | lint/min2 last.col m.col
+    | acc.take(acc.len.dec).snoc((lint/mark m.line width col))
+
+  +  width_step
+    \ node=rex subs=row[lint/info]
+    ^ lint/info
+    = merged | lint/merge_info subs
+    ? node
+     > (./leaf span shape text) (lint/leaf_info span text node)
+     > (./open span rune kids) (lint/open_info span rune merged)
+     > (./expr span color kids) (lint/bracket_info span merged)
+     > (./nest span color rune kids)
+      | if (eq color "clear") merged (lint/bracket_info span merged)
+    merged
+
+  +  merge_info
+    \ subs=row[lint/info]
+    ^ lint/info
+    | subs.fold (lint/info [] 0 .none) lint/merge_two
+
+  +  merge_two
+    '  Later kids win ties, so the last line's start comes from the
+    '  last kid on it.
+    \ acc=lint/info next=lint/info
+    ^ lint/info
+    = marks acc.marks.weld(next.marks)
+    ? (lt next.last_line acc.last_line)
+     | lint/info marks acc.last_line acc.last_start
+    | lint/info marks next.last_line next.last_start
+
+  +  leaf_info
+    \ span=rex/source_span text=str node=rex
+    ^ lint/info
+    = col   span.column.dec
+      nl    | lint/count_nl text
+      start | sub span.offset col
+    ? (eq nl 0)
+     | lint/one_info span.line (add col span.length) col start
+    ? (lint/is_slug node)
+     | lint/slug_info span.line col text
+    = first (str/split_byte 10 text).at(0)
+      wide  | lint/mark span.line (add col first.len.inc) col
+    | lint/info [wide] (add span.line nl) .none
+
+  +  one_info
+    '  A single-line node with an exact end column.
+    \ line=nat width=nat col=nat start=nat
+    ^ lint/info
+    | lint/info [(lint/mark line width col)] line (./some start)
+
+  +  slug_info
+    '  One mark per slug line: the tick, one space, then the text.
+    \ line=nat col=nat text=str
+    ^ lint/info
+    = lines | str/split_byte 10 text
+      marks | lint/slug_marks line col lines
+    | lint/info marks (add line lines.len.dec) .none
+
+  +  slug_marks
+    \ line=nat col=nat lines=row[str]
+    ^ row[lint/mark]
+    % i=nat 0 out=row[lint/mark] []
+    ? (eq i lines.len) out
+    = width | add col (add 2 lines.at(i).len)
+    | _ i.inc out.snoc((lint/mark (add line i) width col))
+
+  +  open_info
+    '  The rune's own width, for a rune alone on its line.
+    \ span=rex/source_span rune=str merged=lint/info
+    ^ lint/info
+    = col   | sub span.column rune.len
+      own   | lint/mark span.line span.column col
+      marks merged.marks.cons(own)
+    ? (lt merged.last_line span.line)
+     | lint/info marks span.line (./some (sub span.offset col))
+    | lint/info marks merged.last_line merged.last_start
+
+  +  bracket_info
+    '  A bracket form: single-line ones are exact; otherwise the
+    '  closer is charged to the last line the contents reach.
+    \ span=rex/source_span merged=lint/info
+    ^ lint/info
+    ? (gt merged.last_line span.line)
+     | lint/closer_info span merged
+    = col   span.column.dec
+      start | sub span.offset col
+      own   | lint/mark span.line (add col span.length) col
+    | lint/info merged.marks.cons(own) span.line (./some start)
+
+  +  closer_info
+    \ span=rex/source_span merged=lint/info
+    ^ lint/info
+    > (./some ls) merged.last_start
+     merged
+    = end   | add span.offset span.length
+      own   | lint/mark merged.last_line (sub end ls) span.column.dec
+      marks merged.marks.cons(own)
+    | lint/info marks merged.last_line merged.last_start
+
+  '  The contextual walker: every other rule.
+
+  +  top_ctx
+    ^ lint/ctx
+    | lint/ctx 0 0 .true
+
+  +  walk
+    \ cfg=lint/config ctx=lint/ctx node=rex
+    ^ row[lint/diag]
+    = own | lint/deprecated cfg node
+    | own.weld (lint/walk_in cfg ctx node)
+
+  +  deprecated
+    '  Rule deprecated-rune: the ?> guard and the || and ! truthy
+    '  conveniences are retired.
+    \ cfg=lint/config node=rex
+    ^ row[lint/diag]
+    > (./some rune) (lint/rune_of node)
+     []
+    ? (row/has[str] rune cfg.deprecated_runes)
+     [(lint/emit "deprecated-rune" node (lint/deprecated_msg rune))]
+    []
+
+  +  deprecated_msg
+    \ rune=str
+    ^ str
+    = hint | lint/replacement rune
+    | str/cat_all ["deprecated rune " rune ": use " hint]
+
+  +  replacement
+    '  ?=  ((lint/replacement "?>") "a > guard")
+    \ rune=str
+    ^ str
+    ? (eq rune "?>") "a > guard"
+    ? (eq rune "||") "or"
+    ? (eq rune "!") "not"
+    "another spelling"
+
+  +  rune_of
+    '  The rune a node carries, if any.
+    \ node=rex
+    ^ maybe[str]
+    ? node
+     > (./open span rune kids) (./some rune)
+     > (./nest span color rune kids) (./some rune)
+     > (./tyte span rune kids) (./some rune)
+     > (./pref span rune kid) (./some rune)
+     > (./bloc span color rune head items) (./some rune)
+    .none
+
+  +  walk_in
+    \ cfg=lint/config ctx=lint/ctx node=rex
+    ^ row[lint/diag]
+    ? node
+     > (./heir span kids)
+      | lint/walk_all cfg ctx.set_statement(.true) kids
+     > (./open span rune kids) (lint/poem cfg ctx node rune kids)
+     > (./expr span color kids)
+      | lint/expr_node cfg ctx node color kids
+     > (./tyte span rune kids) (lint/tyte_node cfg ctx node rune kids)
+     > (./pref span rune kid)
+      | lint/walk cfg ctx.set_statement(.false) kid
+     > (./bloc span color rune head items)
+      | lint/walk_all cfg ctx.set_statement(.false) items.cons(head)
+    | lint/walk_all cfg ctx.set_statement(.false) node.children
+
+  +  walk_all
+    \ cfg=lint/config ctx=lint/ctx kids=row[rex]
+    ^ row[lint/diag]
+    | kids.fold [] (\ acc kid acc.weld((lint/walk cfg ctx kid)))
+
+  +  expr_node
+    \ cfg=lint/config ctx=lint/ctx node=rex color=str kids=row[rex]
+    ^ row[lint/diag]
+    = own | lint/expr_rules cfg ctx node color kids
+    | own.weld (lint/walk_all cfg ctx.set_statement(.false) kids)
+
+  +  tyte_node
+    \ cfg=lint/config ctx=lint/ctx node=rex rune=str kids=row[rex]
+    ^ row[lint/diag]
+    = own | lint/ufcs_rule node rune kids
+    | own.weld (lint/walk_all cfg ctx.set_statement(.false) kids)
+
+  +  poem
+    '  Split a rune's kids into operands (on its line) and body
+    '  (later lines), run the rune's rules, then descend.
+    \ cfg=lint/config ctx=lint/ctx node=rex rune=str kids=row[rex]
+    ^ row[lint/diag]
+    = line  node.span.line
+      start | lint/start_col node
+      ops   kids.keep((\ k (eq (lint/first_line k) line)))
+      body  kids.keep((\ k (gt (lint/first_line k) line)))
+      inner | lint/inner_ctx ctx node rune
+      own   | lint/poem_rules cfg ctx node rune start ops body
+      deep  | lint/deep_rule cfg ctx node rune
+      flat  | lint/too_simple cfg node rune start kids
+      under | lint/walk_all cfg inner.set_statement(.false) ops
+      below | lint/walk_all cfg inner body
+    own.weld(deep).weld(flat).weld(under).weld(below)
+
+  +  deep_rule
+    '  Rule deep-nesting: reported once per branch, at the first rune
+    '  poem nested deeper than the limit inside its declaration.
+    \ cfg=lint/config ctx=lint/ctx node=rex rune=str
+    ^ row[lint/diag]
+    ? (eq ctx.decl_lines 0) []
+    ? (eq rune "+") []
+    ? (ne ctx.depth cfg.max_depth) []
+    = msg | lint/limit_msg "nesting depth" ctx.depth.inc cfg.max_depth
+    [(lint/emit "deep-nesting" node msg)]
+
+  +  limit_msg
+    \ what=str got=nat cap=nat
+    ^ str
+    = lead | str/cat_all [what " is " (nat/show got)]
+    | str/cat_all [lead " (limit " (nat/show cap) ")"]
+
+  +  inner_ctx
+    \ ctx=lint/ctx node=rex rune=str
+    ^ lint/ctx
+    ? (eq rune "+") (lint/ctx (lint/height node) 0 .true)
+    | lint/ctx ctx.decl_lines ctx.depth.inc .true
+
+  +  poem_rules
+    \ cfg=lint/config ctx=lint/ctx node=rex rune=str start=nat
+      ops=row[rex] body=row[rex]
+    ^ row[lint/diag]
+    ? (eq rune "+") (lint/decl_rules cfg ctx node start ops body)
+    ? (eq rune "=") (lint/let_rules cfg ctx start ops body)
+    | lint/rune_rules cfg ctx rune start ops body
+
+  '  Rules decl-children and decl-head-gap.
+
+  +  decl_rules
+    \ cfg=lint/config ctx=lint/ctx node=rex start=nat ops=row[rex]
+      body=row[rex]
+    ^ row[lint/diag]
+    = head  | lint/head_gap start ops
+      kids  | row/bind[rex lint/diag] (lint/decl_kid start) body
+      names | lint/name_rule cfg ctx .false (lint/decl_names ops body)
+      size  | lint/size_rule cfg node body
+    head.weld(kids).weld(names).weld(size)
+
+  +  size_rule
+    '  Rule decl-too-long: a leaf declaration (no nested +) over the
+    '  code-line limit; slugs and blank lines do not count.
+    \ cfg=lint/config node=rex body=row[rex]
+    ^ row[lint/diag]
+    ? (row/any[rex] lint/is_decl body) []
+    = lines | lint/code_lines node
+    ? (le lines cfg.max_decl_lines) []
+    = msg | lint/limit_msg "declaration length" lines cfg.max_decl_lines
+    [(lint/emit "decl-too-long" node msg)]
+
+  +  is_decl
+    \ node=rex
+    ^ bool
+    ? node
+     > (./open span rune kids) (eq rune "+")
+    .false
+
+  +  lines
+    '  Distinct code lines a subtree touches: the first, the last,
+    '  and how many; count 0 is the empty result.
+    : first=nat last=nat count=nat
+
+  +  code_lines
+    \ node=rex
+    ^ nat
+    (rex/fold[lint/lines] lint/lines_step node).count
+
+  +  lines_step
+    \ node=rex subs=row[lint/lines]
+    ^ lint/lines
+    | subs.fold (lint/own_lines node) lint/lines_join
+
+  +  own_lines
+    '  A leaf covers its own lines (a slug none); a rune covers the
+    '  line it sits on; brackets and clumps add nothing themselves.
+    \ node=rex
+    ^ lint/lines
+    ? node
+     > (./leaf span shape text)
+      ? (lint/is_slug node) (lint/lines 0 0 0)
+      = nl | lint/count_nl text
+      | lint/lines span.line (add span.line nl) nl.inc
+     > (./open span rune kids) (lint/lines span.line span.line 1)
+    | lint/lines 0 0 0
+
+  +  lines_join
+    '  Kids arrive in source order, so only the boundary line can be
+    '  shared between two results.
+    \ acc=lint/lines next=lint/lines
+    ^ lint/lines
+    ? (eq acc.count 0) next
+    ? (eq next.count 0) acc
+    = both (add acc.count next.count)
+    ? (eq acc.last next.first)
+     | lint/lines acc.first next.last both.dec
+    | lint/lines acc.first next.last both
+
+  +  head_gap
+    '  A declaration's name sits two spaces after its rune.
+    \ start=nat ops=row[rex]
+    ^ row[lint/diag]
+    ? (eq ops.len 0) []
+    = name    ops.at(0)
+      msg=str "two spaces between + and the name"
+    ? (eq (lint/start_col name) (add start 3)) []
+    [(lint/emit "decl-head-gap" name msg)]
+
+  +  decl_kid
+    \ start=nat kid=rex
+    ^ row[lint/diag]
+    = want | add start 2
+      msg  | lint/col_msg "declaration body" want
+    ? (eq (lint/start_col kid) want) []
+    [(lint/emit "decl-children" kid msg)]
+
+  +  decl_names
+    '  Binding sites a declaration owns: its name and generic params.
+    \ ops=row[rex] body=row[rex]
+    ^ row[rex]
+    = head (if (eq ops.len 0) [] ops.take(1))
+    | head.weld (row/bind[rex rex] lint/generic_names body)
+
+  +  generic_names
+    \ kid=rex
+    ^ row[rex]
+    ? kid
+     > (./expr span color kids)
+      ? (eq kids.len 0) []
+      ? (lint/is_generic kids.at(0)) kids.at(0).children
+      []
+    []
+
+  +  is_generic
+    \ node=rex
+    ^ bool
+    ? node
+     > (./open span rune kids) (or (eq rune "@") (eq rune "@@"))
+    .false
+
+  '  Rules rune-gap and gutter, plus the binding sites of runes.
+
+  +  rune_rules
+    \ cfg=lint/config ctx=lint/ctx rune=str start=nat ops=row[rex]
+      body=row[rex]
+    ^ row[lint/diag]
+    = gap    | lint/rune_gap rune start ops
+      gutter | lint/gutter_rules ctx rune start ops body
+      local  | row/has[str] rune ["\" "%" "<"]
+      pats   | lint/rune_patterns rune ops body
+      names  | lint/name_rule cfg ctx local pats
+    gap.weld(gutter).weld(names)
+
+  +  rune_gap
+    '  One space between a rune and its first operand; an import
+    '  rune may take two.
+    \ rune=str start=nat ops=row[rex]
+    ^ row[lint/diag]
+    ? (eq ops.len 0) []
+    ? (lint/is_slug ops.at(0)) []
+    = got | sub (lint/start_col ops.at(0)) (add start rune.len)
+    ? (eq got 1) []
+    ? (if (eq rune "-") (eq got 2) 0) []
+    [(lint/emit "rune-gap" ops.at(0) (lint/gap_msg rune got))]
+
+  +  gap_msg
+    \ rune=str got=nat
+    ^ str
+    | str/cat_all ["one space after " rune ", found " (nat/show got)]
+
+  +  gutter_rules
+    '  Inside a declaration a rune's body kids sit one column in
+    '  from the rune (past a multi-byte rune).  Operand-list runes
+    '  may instead continue under their first operand.
+    \ ctx=lint/ctx rune=str start=nat ops=row[rex] body=row[rex]
+    ^ row[lint/diag]
+    ? (eq ctx.decl_lines 0) []
+    = want | add start (lint/max2 1 rune.len)
+      alt  (if (lint/aligns rune ops) (lint/start_col ops.at(0)) want)
+    | row/bind[rex lint/diag] (lint/gutter_kid want alt) body
+
+  +  aligns
+    \ rune=str ops=row[rex]
+    ^ bool
+    ? (eq ops.len 0) .false
+    | row/has[str] rune ["\" "^" ":" "&" "%" "|"]
+
+  +  gutter_kid
+    \ want=nat alt=nat kid=rex
+    ^ row[lint/diag]
+    ? (lint/is_slug kid) []
+    = col | lint/start_col kid
+    ? (or (eq col want) (eq col alt)) []
+    [(lint/emit "gutter" kid (lint/col_msg "body" want))]
+
+  +  rune_patterns
+    '  Which kids of a rune bind names.
+    \ rune=str ops=row[rex] body=row[rex]
+    ^ row[rex]
+    = all | lint/splice ops.weld(body)
+    ? (eq rune "\") all.keep(lint/is_param)
+    ? (eq rune ":") all
+    ? (eq rune "%") (lint/pairs all).map((\ [pat val] pat))
+    ? (eq rune "<") all.take(1)
+    ? (eq rune ">") (lint/arm_heads ops)
+    []
+
+  +  is_param
+    '  A parameter shape: word, name=type, ;name, or [a b].
+    \ node=rex
+    ^ bool
+    ? node
+     > (./leaf span shape text) (lint/is_name node)
+     > (./tyte span rune kids) (eq rune "=")
+     > (./pref span rune kid) (eq rune ";")
+     > (./expr span color kids) (eq color "brack")
+    .false
+
+  +  arm_heads
+    '  The pattern of a > arm: its first operand, minus a constructor.
+    \ ops=row[rex]
+    ^ row[rex]
+    ? (eq ops.len 0) []
+    ? ops.at(0)
+     > (./expr span color kids)
+      ? (eq color "paren") kids.drop(1)
+      [ops.at(0)]
+    [ops.at(0)]
+
+  '  Rules let-gap, let-queenside, let-kingside-multiline and
+  '  let-kingside-align.
+
+  +  let_rules
+    \ cfg=lint/config ctx=lint/ctx start=nat ops=row[rex] body=row[rex]
+    ^ row[lint/diag]
+    = pats   (lint/pairs ops.weld(body)).map((\ [pat val] pat))
+      layout | lint/let_layout start ops body
+      gap    | lint/let_gap start ops
+      names  | lint/name_rule cfg ctx .true pats
+    layout.weld(gap).weld(names)
+
+  +  let_layout
+    \ start=nat ops=row[rex] body=row[rex]
+    ^ row[lint/diag]
+    ? (eq ops.len 0) []
+    ? (eq ops.len 1) (lint/queenside start ops.at(0) body)
+    | lint/kingside start ops body
+
+  +  let_gap
+    '  = takes one space (kingside) or three (queenside).
+    \ start=nat ops=row[rex]
+    ^ row[lint/diag]
+    ? (eq ops.len 0) []
+    = got | sub (lint/start_col ops.at(0)) start.inc
+    ? (eq got 1) []
+    ? (if (eq got 3) (eq ops.len 1) 0) []
+    [(lint/emit "let-gap" ops.at(0) (lint/let_gap_msg got))]
+
+  +  let_gap_msg
+    \ got=nat
+    ^ str
+    = lead=str "one space (kingside) or three (queenside), found "
+    | str/cat_all [lead (nat/show got)]
+
+  +  queenside
+    '  Queenside: patterns four columns in from the =, values two,
+    '  each value one statement.
+    \ start=nat pat=rex body=row[rex]
+    ^ row[lint/diag]
+    = kids | lint/splice body.cons(pat)
+      odd  (if (eq (mod kids.len 2) 1) (lint/queen_extra kids) [])
+    % i=nat 0 out=row[lint/diag] odd
+    ? (eq i kids.len) out
+    = kid  kids.at(i)
+      even | eq (mod i 2) 0
+      want (if even (add start 4) (add start 2))
+      what | lint/queen_what even
+      msg  | lint/col_msg what want
+    ? (eq (lint/start_col kid) want) (_ i.inc out)
+    | _ i.inc out.snoc((lint/emit "let-queenside" kid msg))
+
+  +  queen_what
+    \ even=bool
+    ^ str
+    ? even "queenside pattern"
+    "queenside value"
+
+  +  queen_extra
+    '  An odd kid count: some value spilled into a second statement.
+    \ kids=row[rex]
+    ^ row[lint/diag]
+    = last    kids.at(kids.len.dec)
+      msg=str "a queenside value must be one statement"
+    [(lint/emit "let-queenside" last msg)]
+
+  +  kingside
+    '  Kingside: a multi-line value demands queenside for the whole
+    '  group; otherwise several bindings align their values and
+    '  their names.
+    \ start=nat ops=row[rex] body=row[rex]
+    ^ row[lint/diag]
+    = all   | lint/pairs ops.weld(body)
+      vals  all.map((\ [pat val] val))
+      pats  all.drop(1).map((\ [pat val] pat))
+      multi | row/bind[rex lint/diag] lint/multiline_value vals
+    ? (gt multi.len 0) multi
+    = align | lint/align_values vals
+      names | lint/align_patterns (add start 2) pats
+    align.weld(names)
+
+  +  multiline_value
+    \ val=rex
+    ^ row[lint/diag]
+    = msg=str "a value spans lines: go queenside"
+    ? (not (lint/is_multiline val)) []
+    [(lint/emit "let-kingside-multiline" val msg)]
+
+  +  align_values
+    \ vals=row[rex]
+    ^ row[lint/diag]
+    ? (lt vals.len 2) []
+    = want | lint/start_col vals.at(0)
+    | row/bind[rex lint/diag] (lint/align_kid "value" want) vals
+
+  +  align_patterns
+    \ want=nat pats=row[rex]
+    ^ row[lint/diag]
+    | row/bind[rex lint/diag] (lint/align_kid "binding name" want) pats
+
+  +  align_kid
+    \ what=str want=nat kid=rex
+    ^ row[lint/diag]
+    ? (eq (lint/start_col kid) want) []
+    [(lint/emit "let-kingside-align" kid (lint/col_msg what want))]
+
+  '  Rules wide-form and prefer-tall.
+
+  +  expr_rules
+    \ cfg=lint/config ctx=lint/ctx node=rex color=str kids=row[rex]
+    ^ row[lint/diag]
+    ? (not (eq color "paren")) []
+    ? (eq kids.len 0) []
+    = head kids.at(0)
+    ? (lint/wide_head cfg head)
+     [(lint/emit "wide-form" node "wide form: write the call tall")]
+    ? (not (lint/call_head head)) []
+    ? (lt kids.len 2) []
+    ? (or ctx.statement (lint/is_multiline node))
+     [(lint/emit "prefer-tall" node "prefer the tall form | f x y")]
+    []
+
+  +  wide_head
+    \ cfg=lint/config head=rex
+    ^ bool
+    ? head
+     > (./open span rune kids) (row/has[str] rune cfg.wide_runes)
+    .false
+
+  +  call_head
+    '  A word, a path, or a specialised one such as f[t].
+    \ head=rex
+    ^ bool
+    ? head
+     > (./leaf span shape text) (lint/is_name head)
+     > (./tyte span rune kids) (eq rune "/")
+     > (./juxt span kids)
+      ? (lt kids.len 2) .false
+      ? (lint/call_head kids.at(0)) (lint/is_brack kids.at(1))
+      .false
+    .false
+
+  '  Rule too-simple.
+
+  +  too_simple
+    '  A | or . poem laid out vertically although it fits on a line.
+    \ cfg=lint/config node=rex rune=str start=nat kids=row[rex]
+    ^ row[lint/diag]
+    ? (not (row/has[str] rune ["|" "."])) []
+    ? (not (lint/is_multiline node)) []
+    ? (row/any[rex] lint/is_lambda kids) []
+    > (./some width) (lint/flat_width node)
+     []
+    ? (gt (add start width) cfg.flat_width) []
+    [(lint/emit "too-simple" node "too simple for its height")]
+
+  +  is_lambda
+    '  A lambda operand line takes the lines after it as its body,
+    '  so such a poem cannot be flattened without changing meaning.
+    \ node=rex
+    ^ bool
+    ? node
+     > (./open span rune kids) (eq rune "\")
+    .false
+
+  +  flat_width
+    '  Width of the one-line rendering, or none when the node needs
+    '  vertical layout (slug, multi-line literal, heir, bloc).
+    \ node=rex
+    ^ maybe[nat]
+    ? node
+     > (./leaf span shape text)
+      ? (gt (lint/count_nl text) 0) .none
+      ? (lint/is_slug node) .none
+      | ./some span.length
+     > (./open span rune kids) (lint/flat_kids 1 rune.len.inc kids)
+     > (./expr span color kids) (lint/flat_kids 1 2 kids)
+     > (./nest span color rune kids) (lint/flat_nest color rune kids)
+     > (./tyte span rune kids) (lint/flat_kids rune.len 0 kids)
+     > (./juxt span kids) (lint/flat_kids 0 0 kids)
+     > (./pref span rune kid) (lint/flat_pref rune kid)
+    .none
+
+  +  flat_nest
+    \ color=str rune=str kids=row[rex]
+    ^ maybe[nat]
+    = extra (if (eq color "clear") 0 2)
+    | lint/flat_kids (add 2 rune.len) extra kids
+
+  +  flat_pref
+    \ rune=str kid=rex
+    ^ maybe[nat]
+    > (./some w) (lint/flat_width kid)
+     .none
+    | ./some (add rune.len w)
+
+  +  flat_kids
+    '  extra plus the kids' widths with sep between; an open kid
+    '  that is not last needs parentheses.
+    \ sep=nat extra=nat kids=row[rex]
+    ^ maybe[nat]
+    % i=nat 0 acc=nat extra
+    ^ maybe[nat]
+    ? (eq i kids.len) (./some acc)
+    > (./some w) (lint/flat_width kids.at(i))
+     .none
+    = last  | eq i.inc kids.len
+      paren (if (if (lint/is_open kids.at(i)) (not last) 0) 2 0)
+      gap   (if (eq i 0) 0 sep)
+    | _ i.inc (add acc (add w (add paren gap)))
+
+  '  Rules snake-case and lapidary.
+
+  +  name_rule
+    \ cfg=lint/config ctx=lint/ctx local=bool pats=row[rex]
+    ^ row[lint/diag]
+    = words | lint/patterns pats
+    | row/bind[rex lint/diag] (lint/name_check cfg ctx local) words
+
+  +  patterns
+    '  The words bound by a row of pattern nodes.
+    \ nodes=row[rex]
+    ^ row[rex]
+    | row/bind[rex rex] lint/pattern_words nodes
+
+  +  pattern_words
+    \ node=rex
+    ^ row[rex]
+    ? node
+     > (./leaf span shape text)
+      ? (lint/is_name node) [node]
+      []
+     > (./tyte span rune kids)
+      ? (eq kids.len 0) []
+      ? (eq rune "=") (lint/pattern_words kids.at(0))
+      []
+     > (./pref span rune kid)
+      ? (eq rune ";") (lint/pattern_words kid)
+      []
+     > (./expr span color kids)
+      ? (eq color "brack") (lint/patterns kids)
+      []
+    []
+
+  +  name_check
+    \ cfg=lint/config ctx=lint/ctx local=bool word=rex
+    ^ row[lint/diag]
+    ? word
+     > (./leaf span shape text)
+      = snake | lint/snake_diag word text
+        lapi  (if local (lint/lapidary cfg ctx word text) [])
+      snake.weld(lapi)
+    []
+
+  +  snake_diag
+    \ word=rex text=str
+    ^ row[lint/diag]
+    ? (lint/is_snake text) []
+    [(lint/emit "snake-case" word text.cat(" is not snake_case"))]
+
+  +  lapidary
+    '  Short functions take 3-5 letter names (guide TODO; off by
+    '  default).
+    \ cfg=lint/config ctx=lint/ctx word=rex text=str
+    ^ row[lint/diag]
+    ? (eq ctx.decl_lines 0) []
+    ? (ge ctx.decl_lines cfg.lapidary_lines) []
+    ? (le text.len cfg.lapidary_len) []
+    [(lint/emit "lapidary" word "prefer a 3-5 letter name here")]
+
+  +  is_snake
+    '  ?=  ((lint/is_snake "foo_bar") 1)
+    '  ?=  ((lint/is_snake "SendCaps") 0)
+    '  ?=  ((lint/is_snake "") 0)
+    \ name=str
+    ^ bool
+    ? (eq name.len 0) .false
+    % i=nat 0
+    ? (eq i name.len) .true
+    ? (lint/snake_byte name.at(i) i) (_ i.inc)
+    .false
+
+  +  snake_byte
+    '  Lowercase or underscore anywhere; digits after the first byte.
+    \ c=nat i=nat
+    ^ bool
+    ? (if (ge c "a") (le c "z") 0) .true
+    ? (eq c 95) .true
+    ? (eq i 0) .false
+    | digit_byte c
+
+  '  Rule ufcs-lift (guide TODO; off by default).
+
+  +  ufcs_rule
+    \ node=rex rune=str kids=row[rex]
+    ^ row[lint/diag]
+    ? (not (eq rune ".")) []
+    ? (eq kids.len 0) []
+    ? (not (lint/deep_call kids.at(kids.len.dec))) []
+    [(lint/emit "ufcs-lift" node "lift the nested argument into a =")]
+
+  +  deep_call
+    '  A method segment f(args) with a call nested two deep in an arg.
+    \ seg=rex
+    ^ bool
+    ? seg
+     > (./juxt span kids)
+      ? (lt kids.len 2) .false
+      | row/any[rex] lint/deep_arg kids.at(1).children
+    .false
+
+  +  deep_arg
+    \ arg=rex
+    ^ bool
+    | ge (lint/call_depth arg) 2
+
+  +  call_depth
+    \ node=rex
+    ^ nat
+    | rex/fold[nat] lint/call_depth_step node
+
+  +  call_depth_step
+    \ node=rex subs=row[nat]
+    ^ nat
+    = deepest subs.fold(0 lint/max2)
+    ? node
+     > (./expr span color kids)
+      ? (if (eq color "paren") (ge kids.len 2) 0) deepest.inc
+      deepest
+    deepest
