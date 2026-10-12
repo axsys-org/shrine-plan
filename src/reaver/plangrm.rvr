@@ -499,10 +499,17 @@
 ;; call sites of other targets inside spliced code are still found.
 ;; Used by inlineSingleUseProcs to avoid a full refcount + rescan per
 ;; individual target.
+;;
+;; A target is inlined with its CURRENT body — the definition as the
+;; walk last passed it — not the body captured when the batch was
+;; chosen: inlining one target substitutes its result into the rest of
+;; the block, which can include another target's definition (a single-
+;; use proc whose body uses the first one's result).  The definition
+;; always precedes its call, so the walk refreshes the entry first.
 (define (inlineProcsMap targets p uq)
-  (define (goBlock b uq2)
+  (define (goBlock b uq2 tg)
     (define (goProc p2 uqp)
-      (define r[uqx code] (goBlock (procCode p2) uqp))
+      (define r[uqx code] (goBlock (procCode p2) uqp tg))
       [uqx (mkProc (procArgs p2) code)])
     (define (goAlloc a uqa)
       (? Alloc a
@@ -512,7 +519,7 @@
             (define r[uqx p2] (goProc body uqa))
             [uqx ($DELAY p2)]))))
     (define (goTail s cont uqt)
-      (define r[uqx rest] (goBlock cont uqt))
+      (define r[uqx rest] (goBlock cont uqt tg))
       [uqx (cons s rest)])
     (Ifz (Sz b) [uq2 []]
       (begin
@@ -523,16 +530,16 @@
             (begin
               (define hit
                 (? Op op
-                  (LOCAL [key] (bst-search key targets))
+                  (LOCAL [key] (bst-search key tg))
                   (_ 0)))
               (Ifz hit
                 (goTail s cont uq2)
                 (begin
                   (define r[uq3 inlined] (inline key (_0 hit) args cont uq2))
-                  (goBlock inlined uq3)))))
+                  (goBlock inlined uq3 tg)))))
           (PROC [key body]
-            (If (bst-has key targets)
-              (goBlock cont uq2)
+            (If (bst-has key tg)
+              (goBlock cont uq2 (bst-insert key body tg))
               (begin
                 (define r[uq3 p2] (goProc body uq2))
                 (goTail ($PROC key p2) cont uq3))))
@@ -567,7 +574,7 @@
                   binds))
               (goTail ($REC (_1 rb)) cont (_0 rb))))
           (_ (goTail s cont uq2))))))
-  (define r[uq2 code] (goBlock (procCode p) uq))
+  (define r[uq2 code] (goBlock (procCode p) uq targets))
   [uq2 (mkProc (procArgs p) code)])
 
 ;; listOfProcs :: Proc -> [(Key, Proc)]  (a list of [key proc] pairs)
@@ -1471,6 +1478,8 @@
 (define OP_CALL_KNOWN 13)
 (define OP_CALL_FAST 14)
 (define OP_CALL_SLOW 15)
+(define OP_TAILBLK 27)
+(define OP_LAWBLK 28) ;; row-only directory entry behind the code
 (define BANE_FAST 1)
 (define BANE_SLOW 2)
 (define BANE_PRIM 3)
@@ -2150,60 +2159,84 @@
 ;; RET arm.  Only tail position is lowered (arms end in RET, returning
 ;; from the frame); non-tail Ifs would need join points.
 (define (brLower p uq)
-  (define (goBlock b uq0)
-    (define n (Sz b))
-    (define counts (foldl (lambda (c s) (stmtCounts s c)) E b))
-    (define closes
-      (foldl
-        (lambda (m s)
-          (? Stmt s
-            (LET [key rhs]
-              (? Alloc rhs (CLOSE [fn args] (bst-insert key [fn args] m)) (DELAY m)))
-            (_ m)))
-        E b))
-    (define delays
-      (foldl
-        (lambda (m s)
-          (? Stmt s
-            (LET [key rhs]
-              (? Alloc rhs (DELAY [body] (bst-insert key body m)) (CLOSE m)))
-            (_ m)))
-        E b))
+  ;; The If's row and branch thunks are looked up across the whole proc,
+  ;; not just the block holding the call: an arm made from a thunk body
+  ;; holds only the call, with its row and branches bound in the parent.
+  ;; Keys are unique and a binding dominates its uses, so single use is
+  ;; checked against whole-proc counts, and a consumed binding is dropped
+  ;; from whichever enclosing block holds it.
+  (define counts (refcounts p))
+  (define (collectAllocs acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (LET [key rhs]
+            (? Alloc rhs
+              (CLOSE [fn args] [(bst-insert key [fn args] (_0 a)) (_1 a)])
+              (DELAY [body]
+                (collectAllocs [(_0 a) (bst-insert key body (_1 a))] (procCode body)))))
+          (PROC [key body] (collectAllocs a (procCode body)))
+          (BR [x arms] (foldl (lambda (a2 kp) (collectAllocs a2 (procCode (_1 kp)))) a arms))
+          (_ a)))
+      acc b))
+  (define allocs (collectAllocs [E E] (procCode p)))
+  (define closes (_0 allocs))
+  (define delays (_1 allocs))
+  ;; -> [uq' block consumed-keys].  Only eager blocks look beyond
+  ;; themselves: a DELAY body must stay a single call for codegen, so
+  ;; there a lowering needs its row and branches bound locally (as
+  ;; before).
+  (define (goBlock b uq0 eager)
     ;; first recurse into sub-procs (PROC bodies, existing BR arms)
     (define sub
       (foldl
         (lambda (acc s)
           (begin
-            (define st[uqa out] acc)
+            (define st[uqa out used] acc)
             (? Stmt s
               (PROC [key body]
                 (begin
-                  (define r[uqb code2] (goBlock (procCode body) uqa))
-                  [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+                  (define r[uqb code2 u2] (goBlock (procCode body) uqa 1))
+                  [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out) (weld used u2)]))
               (BR [x arms]
                 (begin
                   (define rr
                     (foldl
                       (lambda (a2 kp)
                         (begin
-                          (define st2[uqx done] a2)
-                          (define r2[uqy code2] (goBlock (procCode (_1 kp)) uqx))
-                          [uqy (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) code2)] done)]))
-                      [uqa []]
+                          (define st2[uqx done u] a2)
+                          (define r2[uqy code2 u2] (goBlock (procCode (_1 kp)) uqx 1))
+                          [uqy (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) code2)] done)
+                           (weld u u2)]))
+                      [uqa [] used]
                       arms))
-                  [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
+                  [(_0 rr) (snoc ($BR x (_1 rr)) out) (_2 rr)]))
               (LET [key rhs]
                 (? Alloc rhs
                   (DELAY [body]
                     (begin
-                      (define r[uqb code2] (goBlock (procCode body) uqa))
-                      [uqb (snoc ($LET key ($DELAY (mkProc (procArgs body) code2))) out)]))
-                  (CLOSE [uqa (snoc s out)])))
-              (_ [uqa (snoc s out)]))))
-        [uq0 []]
+                      (define r[uqb code2 u2] (goBlock (procCode body) uqa 0))
+                      [uqb (snoc ($LET key ($DELAY (mkProc (procArgs body) code2))) out)
+                       (weld used u2)]))
+                  (CLOSE [uqa (snoc s out) used])))
+              (_ [uqa (snoc s out) used]))))
+        [uq0 [] []]
         b))
     (define uq1 (_0 sub))
-    (define b2 (_1 sub))
+    (define childUsed (_2 sub))
+    ;; bindings a lowering below consumed, if they live in this block
+    (define b2
+      (filter
+        (lambda (s)
+          (? Stmt s
+            (LET [key rhs] (Nil (set-member key childUsed)))
+            (_ 1)))
+        (_1 sub)))
+    (define n (Sz b2))
+    ;; bindings this block may consume: its own, or any when eager
+    (define localKeys
+      (map-maybe (lambda (s) (? Stmt s (LET [key rhs] [key]) (_ []))) b2))
+    (define (reachable k) (Or eager (set-member k localKeys)))
     ;; tail pattern: [.., CALL k (FAST oppin) [REF rowk], RET (REF k)]
     (define hit
       (Ifz (Ge n 2) 0
@@ -2217,7 +2250,9 @@
                       (begin
                         (define rowk (REF.key (_0 args)))
                         (define ch (bst-search rowk closes))
-                        (Ifz (And (Truth ch) (Eq 1 (bst-gut rowk 0 counts))) 0
+                        (Ifz (And (Truth ch)
+                               (And (Eq 1 (bst-gut rowk 0 counts)) (reachable rowk)))
+                          0
                           (begin
                             (define fn (_0 (_0 ch)))
                             (define elems (_1 (_0 ch)))
@@ -2236,7 +2271,7 @@
                     (CNS 0))))
               (_ 0)))
           (_ 0))))
-    (Ifz hit [uq1 b2]
+    (Ifz hit [uq1 b2 childUsed]
       (begin
         (define callk (_0 (_0 hit)))
         (define rowk (_1 (_0 hit)))
@@ -2253,7 +2288,8 @@
               (begin
                 (define k2 (REF.key a))
                 (define dh (bst-search k2 delays))
-                (If (And (Truth dh) (Eq 1 (bst-gut k2 0 counts)))
+                (If (And (Truth dh)
+                      (And (Eq 1 (bst-gut k2 0 counts)) (reachable k2)))
                   [uqx (_0 dh) [k2]]
                   [(Inc uqx) (blockProc [($RET a)]) []])))
             (CNS [(Inc uqx) (blockProc [($RET a)]) []])))
@@ -2317,15 +2353,31 @@
            (weld kept
              [($LET tk ($CLOSE ($CNS (If (Eq ifname "If") "Truth" "Nil")) [cond]))
               ($CALL nk ($FAST oppin) [($REF tk)])
-              ($BR ($REF nk) [[kb elseP] [ka thenP]])])]
+              ($BR ($REF nk) [[kb elseP] [ka thenP]])])
+           (weld childUsed consumed)]
           [kb
            (weld kept
              [($BR cond
                 (If (Eq ifname "If")
                   [[kb elseP] [ka thenP]]
-                  [[ka thenP] [kb elseP]]))])]))))
-  (define r[uq2 code2] (goBlock (procCode p) uq))
+                  [[ka thenP] [kb elseP]]))])
+           (weld childUsed consumed)]))))
+  (define r[uq2 code2 used] (goBlock (procCode p) uq 1))
   [uq2 (mkProc (procArgs p) code2)])
+
+;; brLower lowers one level of a nested tail-If chain per call: an
+;; arm's own tail If only becomes visible once its parent is lowered.
+;; Lowering is exact at every step, so iterate to a fixed point here
+;; rather than spending one optimization round per nesting level (the
+;; rounds stop long before deep chains such as a type dispatch are
+;; done, leaving every branch body a lazy thunk).  A lowering always
+;; takes fresh keys, so an unchanged key counter means nothing fired.
+(define BR_LOWER_ROUNDS 32)
+(define (brLowerAll p uq)
+  (define (go i p0 uq0)
+    (define r[uq1 p1] (brLower p0 uq0))
+    (If (And (Gt uq1 uq0) (Gt i 1)) (go (Dec i) p1 uq1) [uq1 p1]))
+  (go BR_LOWER_ROUNDS p uq))
 
 ;; brCondClean: strip a BR's Truth/Nil normalization once the branch
 ;; chain has eagerized.  brLower must normalize pessimistically (at
@@ -2488,7 +2540,11 @@
         (If (And (bitSet? a i) (bitSet? b i)) (Add acc (argBit i)) acc))))
   (go 1 0))
 
-(define (codegenOpt lawSig selfSig noupd depth top)
+;; blockArgs: [] for a law; for a local function block, its parameter
+;; keys, which live in operand slots 0..n-1 of the block's frame (the
+;; caller's OP_CALL/OP_TAILBLK puts the arguments there).  Returns the
+;; unflattened items; codegenOpt flattens a law's.
+(define (codegenItems lawSig selfSig noupd depth top blockArgs)
   (define selfArity (Dec (Sz (procArgs top))))
   (define topBlock (procCode top))
   ;; strict-entry prologue (self-call sites hint with exactly proMask)
@@ -2627,6 +2683,11 @@
             [(weld (emitAtom st fn)
                (weld (cat (map (emitAtom st) args))
                  [OP_CALL_SLOW (Sz args)]))])
+          ;; a local function block (no local proc survives to codegen);
+          ;; the target is patched once the blocks are laid out
+          (LOCAL [key]
+            [(weld (cat (map (emitAtom st) args))
+               [OP_CALL ["BLK" key] (Sz args)])])
           (_ 0))
         (begin
           (define oppin (? Op op (FAST [val] val) (_ 0)))
@@ -2641,7 +2702,6 @@
         (? Stmt s
           (CALL [key op args]
             (? Op op
-              (LOCAL 0)
               (_
                 (Ifz (Eq 1 (bst-gut key 0 counts)) 0
                   (? Stmt (Ix (Inc i) block)
@@ -2732,8 +2792,12 @@
                   (_ (error "codegenOpt: unsupported statement")))
                 [(_0 st) (_1 st)
                  (weld (_2 st)
-                   (weld (emitThkBuild st (_0 (_0 tc)) (_1 (_0 tc)) 0 1)
-                     [OP_RET]))]))))
+                   (? Op (_0 (_0 tc))
+                     (LOCAL [key]
+                       (weld (cat (map (emitAtom st) (_1 (_0 tc))))
+                         [OP_TAILBLK ["BLK" key] (Sz (_1 (_0 tc))) OP_RET]))
+                     (_ (weld (emitThkBuild st (_0 (_0 tc)) (_1 (_0 tc)) 0 1)
+                          [OP_RET]))))]))))
         st0
         emitOrder))
     (_2 done))
@@ -2743,9 +2807,16 @@
         (cons ["entry"]
           (filter (lambda (i) (Nil (set-member i proIdxs)))
             (gen (Sz topBlock) (lambda (i) i)))))))
-  (define items (emitBlock topBlock [0 E []] mainOrder))
-  ;; opcode-aware flatten: ["ARM" ...] markers occupy exactly the BR
-  ;; target slots; arms are appended after the targets, depth-first.
+  (define argSlots
+    (foldl (lambda (m i) (bst-insert (Ix i blockArgs) i m)) E
+      (gen (Sz blockArgs) (lambda (i) i))))
+  (define items (emitBlock topBlock [(Sz blockArgs) argSlots []] mainOrder))
+  items)
+
+;; opcode-aware flatten: ["ARM" ...] markers occupy exactly the BR
+;; target slots; arms are appended after the targets, depth-first.
+;; pos is the absolute position the code will occupy.
+(define (flattenItems items pos)
   (define (flatten its pos)
     (define m (Sz its))
     (define (walk i out)
@@ -2778,14 +2849,17 @@
                     (drop i its)))))
             ((Or (Eq op OP_RET) (Eq op OP_FORCE))
               (walk (Inc i) (snoc op out)))
-            ((Or (Eq op OP_CALL) (Eq op OP_CALL_FAST))
+            ((Or (Eq op OP_CALL) (Or (Eq op OP_CALL_FAST) (Eq op OP_TAILBLK)))
               (walk (Add i 3) (weld out (take 3 (drop i its)))))
             ((Eq op OP_CALL_KNOWN)
               (walk (Add i 4) (weld out (take 4 (drop i its)))))
             (else
               (walk (Add i 2) (weld out (take 2 (drop i its)))))))))
     (walk 0 []))
-  (flatten items 0))
+  (flatten items pos))
+
+(define (codegenOpt lawSig selfSig noupd depth top)
+  (flattenItems (codegenItems lawSig selfSig noupd depth top []) 0))
 
 ;; inlinePrimWrappers: a FAST call to a bplan-style wrapper law — one
 ;; whose whole body is (0 <oppin> (0 "Name" 1..n)) at matching arity —
@@ -2898,6 +2972,19 @@
               (begin
                 (define r[uqb code2] (goBlock (procCode body) uqa))
                 [uqb (snoc ($PROC key (mkProc (procArgs body) code2)) out)]))
+            ;; arms too: inlineNestedLaws can splice a nested law's
+            ;; wrapper calls into an arm after the BR already exists
+            (BR [x arms]
+              (begin
+                (define rr
+                  (foldl
+                    (lambda (a2 kp)
+                      (begin
+                        (define r2[uqy code2] (goBlock (procCode (_1 kp)) (_0 a2)))
+                        [uqy (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) code2)] (_1 a2))]))
+                    [uqa []]
+                    arms))
+                [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
             (_ [uqa (snoc s out)]))))
       [uq0 []]
       b))
@@ -3078,6 +3165,425 @@
         (mkProc (procArgs p0) (weld kept (procCode (_1 (_0 hit))))))))
   (go p))
 
+;;; Known heads: nested laws ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; reaver lambda-lifts local functions into unpinned law literals inside
+;;; the enclosing law: captured variables (the enclosing self included)
+;;; become leading parameters, and a local function that is passed
+;;; around travels as a partial application of its law.  An unpinned law
+;;; never gets code of its own, and a call through a parameter or a
+;;; closure is an unknown head.  Three exact rewrites turn such calls
+;;; into calls of known laws, and inline the non-recursive ones:
+;;;
+;;;   lowerPartialApps     an under-applied call of a literal law is
+;;;                        already the partial-application value: CLOSE
+;;;   resolveKnownClosures a saturating call through a CLOSE of a
+;;;                        literal law (or of such a literal directly) is
+;;;                        a FAST call of that law, captured args first
+;;;   inlineNestedLaws     a FAST call of a non-recursive unpinned law at
+;;;                        an eager site is replaced by the law's body:
+;;;                        its parameters become the call's atoms, so
+;;;                        closures passed in become known in turn
+;;;
+;;; Only eager sites are inlined: a DELAY body must stay a single call
+;;; for codegen.  Lazy calls become eager sites once dethunk converts
+;;; them, so the rewrites run inside every optimization round.
+
+;; v is a law, or a pin of a law
+(define (lawVal? v)
+  (Or (IsLaw v) (And (IsPin v) (IsLaw (Unpin v)))))
+
+;; rename every key (bound, referenced, proc argument) through f
+(define (mapKeysBlock f block)
+  (define (mAtom a)
+    (? Atom a
+      (REF [key] ($REF (f key)))
+      (CNS a)))
+  (define (mOper o)
+    (? Op o
+      (SLOW [fn] ($SLOW (mAtom fn)))
+      (LOCAL [key] ($LOCAL (f key)))
+      (_ o)))
+  (define (mStmt s)
+    (define (mProc p)
+      (mkProc
+        (map (lambda (a) ($ARG (f (argKey a)) (argStrict a))) (procArgs p))
+        (map mStmt (procCode p))))
+    (define (mAlloc a)
+      (? Alloc a
+        (CLOSE [fn args] ($CLOSE (mAtom fn) (map mAtom args)))
+        (DELAY [body] ($DELAY (mProc body)))))
+    (? Stmt s
+      (RET [x] ($RET (mAtom x)))
+      (CALL [key op args] ($CALL (f key) (mOper op) (map mAtom args)))
+      (FORCE [key x] ($FORCE (f key) (mAtom x)))
+      (PROC [key body] ($PROC (f key) (mProc body)))
+      (LET [key rhs] ($LET (f key) (mAlloc rhs)))
+      (REC [binds]
+        ($REC (map (lambda (kv) [(f (_0 kv)) (mAlloc (_1 kv))]) binds)))
+      (BR [x arms]
+        ($BR (mAtom x)
+          (map (lambda (br) [(f (_0 br)) (mProc (_1 br))]) arms)))))
+  (map mStmt block))
+
+;; does a RECUR call occur anywhere in the block (thunk bodies included)
+(define (blockHasRecur b)
+  (any
+    (lambda (s)
+      (? Stmt s
+        (CALL [key op args] (? Op op (RECUR 1) (_ 0)))
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY [body] (blockHasRecur (procCode body)))
+            (CLOSE 0)))
+        (REC [binds]
+          (any
+            (lambda (kv)
+              (? Alloc (_1 kv)
+                (DELAY [body] (blockHasRecur (procCode body)))
+                (CLOSE 0)))
+            binds))
+        (PROC [key body] (blockHasRecur (procCode body)))
+        (BR [x arms]
+          (any (lambda (kp) (blockHasRecur (procCode (_1 kp)))) arms))
+        (_ 0)))
+    b))
+
+;; statements in a block, thunk bodies and sub-blocks included
+(define (blockSize b)
+  (foldl
+    (lambda (n s)
+      (Inc
+        (Add n
+          (? Stmt s
+            (LET [key rhs]
+              (? Alloc rhs
+                (DELAY [body] (blockSize (procCode body)))
+                (CLOSE 0)))
+            (REC [binds]
+              (foldl
+                (lambda (m kv)
+                  (? Alloc (_1 kv)
+                    (DELAY [body] (Add m (blockSize (procCode body))))
+                    (CLOSE m)))
+                0 binds))
+            (PROC [key body] (blockSize (procCode body)))
+            (BR [x arms]
+              (foldl (lambda (m kp) (Add m (blockSize (procCode (_1 kp))))) 0 arms))
+            (_ 0)))))
+    0 b))
+
+;; The let prelude of an ingested law, flattened for inlining: each bind
+;; is a DELAY whose body allocates its operand thunks and returns an
+;; atom.  Allocation is pure, so the operand allocations move into the
+;; enclosing block and the bind's key becomes an alias of its atom — the
+;; same value, with the same sharing.  Binds are emitted in dependency
+;; order; a cyclic knot cannot be flattened.  -> [ok block]
+(define (flattenPrelude block)
+  (Ifz (Sz block) [1 block]
+    (? Stmt (_0 block)
+      (REC [binds]
+        (begin
+          (define slots (map (lambda (kv) (_0 kv)) binds))
+          ;; [pending out table progressed]
+          (define (step st)
+            (define r[pending out table]  st)
+            (foldl
+              (lambda (acc kv)
+                (begin
+                  (define a[pend o tb prog] acc)
+                  (define deps
+                    (? Alloc (_1 kv)
+                      (DELAY [body]
+                        (filter
+                          (lambda (k) (And (set-member k slots) (Nil (bst-has k tb))))
+                          (procFree body)))
+                      (CLOSE [0])))
+                  (Ifz (Sz deps)
+                    (? Alloc (_1 kv)
+                      (DELAY [body]
+                        (begin
+                          (define code (subst tb (procCode body)))
+                          (define n (Sz code))
+                          (? Stmt (Ix (Dec n) code)
+                            (RET [x]
+                              [pend (weld o (take (Dec n) code))
+                               (bst-insert (_0 kv) x tb) 1])
+                            (_ [(snoc kv pend) o tb prog]))))
+                      (CLOSE [(snoc kv pend) o tb prog]))
+                    [(snoc kv pend) o tb prog])))
+              [[] out table 0]
+              pending))
+          (define (go st)
+            (define r[pending out table] st)
+            (Ifz (Sz pending) [1 (weld out (subst table (drop 1 block)))]
+              (begin
+                (define s2 (step st))
+                (Ifz (_3 s2) [0 block] (go [(_0 s2) (_1 s2) (_2 s2)])))))
+          (go [binds [] E])))
+      (_ [1 block]))))
+
+;; A nested law, ready to inline at a call site: its body with the let
+;; prelude flattened and every key moved above uq, and fresh argument
+;; keys for its parameters.  0 unless the law is unpinned, small,
+;; non-recursive, and never refers to itself (var 0 would otherwise
+;; have to become the law value at every use).  -> 0 | [[uq' proc]]
+(define NEST_INLINE_MAX 80)
+(define (nestedLawProc v uq)
+  (Ifz (And (IsLaw v) (Le (Arity v) 16)) 0
+    (begin
+      (define r[depthL p0] (ingestLawOpt v))
+      (define pl (recurLower p0))
+      (Ifz (Nil (Or (blockHasRecur (procCode pl))
+                    (Gt (bst-gut 0 0 (refcounts pl)) 0)))
+        0
+        (begin
+          (define fl[ok body] (flattenPrelude (procCode pl)))
+          (Ifz (And ok (Le (blockSize body) NEST_INLINE_MAX)) 0
+            (begin
+              (define maxk (max depthL (bstMaxKey (refcounts (blockProc body)))))
+              (define (f k) (Add k uq))
+              [[(Add uq maxk)
+                (mkProc (gen (Arity v) (lambda (i) ($ARG (f (Inc i)) $LAZY)))
+                  (mapKeysBlock f body))]])))))))
+
+;; under-applied call of a literal law -> the partial-application CLOSE
+;; -> [changed proc]
+(define (lowerPartialApps p)
+  (define (partialHead op args)
+    (? Op op
+      (SLOW [fn]
+        (? Atom fn
+          (CNS [val]
+            (If (And (lawVal? val)
+                  (And (Sz args) (Lt (Sz args) (planArity val))))
+              [fn] []))
+          (_ [])))
+      (_ [])))
+  (define (go p0)
+    (define r
+      (foldl
+        (lambda (acc s)
+          (begin
+            (define changed (_0 acc))
+            (define out (_1 acc))
+            (? Stmt s
+              (CALL [key op args]
+                (begin
+                  (define h (partialHead op args))
+                  (Ifz (Sz h) [changed (snoc s out)]
+                    [1 (snoc ($LET key ($CLOSE (_0 h) args)) out)])))
+              (LET [key rhs]
+                (? Alloc rhs
+                  (DELAY [body]
+                    (begin
+                      (define shape (delayCallShape (procCode body)))
+                      (define h
+                        (Ifz shape [] (partialHead (_0 (_0 shape)) (_1 (_0 shape)))))
+                      (Ifz (Sz h)
+                        (begin
+                          (define rr (go body))
+                          [(Or changed (_0 rr)) (snoc ($LET key ($DELAY (_1 rr))) out)])
+                        [1 (snoc ($LET key ($CLOSE (_0 h) (_1 (_0 shape)))) out)])))
+                  (_ [changed (snoc s out)])))
+              (PROC [key body]
+                (begin
+                  (define rr (go body))
+                  [(Or changed (_0 rr)) (snoc ($PROC key (_1 rr)) out)]))
+              (BR [x arms]
+                (begin
+                  (define rr
+                    (foldl
+                      (lambda (a kp)
+                        (begin
+                          (define rr2 (go (_1 kp)))
+                          [(Or (_0 a) (_0 rr2)) (snoc [(_0 kp) (_1 rr2)] (_1 a))]))
+                      [changed []] arms))
+                  [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
+              (_ [changed (snoc s out)]))))
+        [0 []] (procCode p0)))
+    [(_0 r) (mkProc (procArgs p0) (_1 r))])
+  (go p))
+
+;; saturating calls through known closures -> FAST calls of their laws
+;; -> [changed proc]
+(define (resolveKnownClosures p)
+  ;; every CLOSE binding and FORCE alias in the proc (keys are unique and
+  ;; there are no forward references, so a binding dominates its uses)
+  (define (collect acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (LET [key rhs]
+            (? Alloc rhs
+              (CLOSE [fn args] [(bst-insert key [fn args] (_0 a)) (_1 a)])
+              (DELAY [body] (collect a (procCode body)))))
+          (FORCE [key x] [(_0 a) (bst-insert key x (_1 a))])
+          (PROC [key body] (collect a (procCode body)))
+          (BR [x arms] (foldl (lambda (a2 kp) (collect a2 (procCode (_1 kp)))) a arms))
+          (REC [binds]
+            (foldl
+              (lambda (a2 kv)
+                (? Alloc (_1 kv)
+                  (DELAY [body] (collect a2 (procCode body)))
+                  (CLOSE a2)))
+              a binds))
+          (_ a)))
+      acc b))
+  (define env (collect [E E] (procCode p)))
+  (define closes (_0 env))
+  (define aliases (_1 env))
+  ;; atom -> 0 | [[lawval captured-atoms]]
+  (define (closureOf a)
+    (? Atom a
+      (REF [key]
+        (begin
+          (define c (bst-search key closes))
+          (Ifz c
+            (begin
+              (define al (bst-search key aliases))
+              (Ifz al 0 (closureOf (_0 al))))
+            (? Atom (_0 (_0 c))
+              (CNS [val] (If (lawVal? val) [[val (_1 (_0 c))]] 0))
+              (_ 0)))))
+      ;; a literal law, or a literal partial application of one (a
+      ;; lifted function that captures nothing but other literals)
+      (CNS [val]
+        (cond
+          ((lawVal? val) [[val []]])
+          ((And (IsApp val) (lawVal? (Hd val)))
+            [[(Hd val) (gen (Sz val) (lambda (i) ($CNS (Ix i val))))]])
+          (else 0)))))
+  (define (resolve op args)
+    (? Op op
+      (SLOW [fn]
+        (begin
+          (define c (closureOf fn))
+          (Ifz c 0
+            (begin
+              (define v (_0 (_0 c)))
+              (define cargs (_1 (_0 c)))
+              (If (Eq (planArity v) (Add (Sz cargs) (Sz args)))
+                [($FAST v) (weld cargs args)]
+                0)))))
+      (_ 0)))
+  (define (goProc p0)
+    (define r
+      (foldl
+        (lambda (acc s)
+          (begin
+            (define changed (_0 acc))
+            (define out (_1 acc))
+            (? Stmt s
+              (CALL [key op args]
+                (begin
+                  (define rs (resolve op args))
+                  (Ifz rs [changed (snoc s out)]
+                    [1 (snoc ($CALL key (_0 rs) (_1 rs)) out)])))
+              (LET [key rhs]
+                (? Alloc rhs
+                  (DELAY [body]
+                    (begin
+                      (define shape (delayCallShape (procCode body)))
+                      (define rs
+                        (Ifz shape 0 (resolve (_0 (_0 shape)) (_1 (_0 shape)))))
+                      (Ifz rs
+                        (begin
+                          (define rr (goProc body))
+                          [(Or changed (_0 rr)) (snoc ($LET key ($DELAY (_1 rr))) out)])
+                        (begin
+                          (define ck (? Stmt (_0 (procCode body)) (CALL [key op args] key) (_ 0)))
+                          [1 (snoc ($LET key ($DELAY
+                                     (mkProc []
+                                       [($CALL ck (_0 rs) (_1 rs)) ($RET ($REF ck))])))
+                                   out)]))))
+                  (CLOSE [changed (snoc s out)])))
+              (PROC [key body]
+                (begin
+                  (define rr (goProc body))
+                  [(Or changed (_0 rr)) (snoc ($PROC key (_1 rr)) out)]))
+              (BR [x arms]
+                (begin
+                  (define rr
+                    (foldl
+                      (lambda (a kp)
+                        (begin
+                          (define rr2 (goProc (_1 kp)))
+                          [(Or (_0 a) (_0 rr2)) (snoc [(_0 kp) (_1 rr2)] (_1 a))]))
+                      [changed []] arms))
+                  [(_0 rr) (snoc ($BR x (_1 rr)) out)]))
+              (_ [changed (snoc s out)]))))
+        [0 []] (procCode p0)))
+    [(_0 r) (mkProc (procArgs p0) (_1 r))])
+  (goProc p))
+
+;; inline FAST calls of non-recursive nested laws at eager sites (the
+;; main block, PROC bodies, BR arms), rescanning the inlined code for
+;; the literals it contains.  fuel bounds the inlines per call.
+;; -> [uq' proc changed]
+(define NEST_INLINE_FUEL 24)
+(define (inlineNestedLaws p uq)
+  (define (siteOf s uq0)
+    (? Stmt s
+      (CALL [key op args]
+        (? Op op
+          (FAST [val]
+            (If (And (IsLaw val) (Eq (Sz args) (Arity val)))
+              (begin
+                (define np (nestedLawProc val uq0))
+                (Ifz np 0 [[(_0 (_0 np)) (_1 (_0 np)) key args]]))
+              0))
+          (_ 0)))
+      (_ 0)))
+  ;; -> [uq' block changed fuel']
+  (define (goBlock b uq0 fuel)
+    ;; eager sub-blocks of a non-site statement: PROC bodies, BR arms
+    (define (goStmt s uq1 fuel1)
+      (? Stmt s
+        (PROC [key body]
+          (begin
+            (define r[uq2 b1 c f1] (goBlock (procCode body) uq1 fuel1))
+            [uq2 ($PROC key (mkProc (procArgs body) b1)) c f1]))
+        (BR [x arms]
+          (begin
+            (define rr
+              (foldl
+                (lambda (acc kp)
+                  (begin
+                    (define a[uqa done ch fa] acc)
+                    (define r[uqb b1 c fb] (goBlock (procCode (_1 kp)) uqa fa))
+                    [uqb (snoc [(_0 kp) (mkProc (procArgs (_1 kp)) b1)] done)
+                     (Or ch c) fb]))
+                [uq1 [] 0 fuel1] arms))
+            [(_0 rr) ($BR x (_1 rr)) (_2 rr) (_3 rr)]))
+        (_ [uq1 s 0 fuel1])))
+    (Ifz (Sz b) [uq0 [] 0 fuel]
+      (begin
+        (define s (_0 b))
+        (define rest (drop 1 b))
+        (define site (Ifz fuel 0 (siteOf s uq0)))
+        (Ifz site
+          (begin
+            (define r1[uq1 s2 c1 f1] (goStmt s uq0 fuel))
+            (define r2[uq2 rest2 c2 f2] (goBlock rest uq1 f1))
+            [uq2 (cons s2 rest2) (Or c1 c2) f2])
+          (begin
+            (define st[uq1 proc key args] (_0 site))
+            (define ri[uq2 tail] (inline key proc args rest uq1))
+            (define r3[uq3 b3 c3 f3] (goBlock tail uq2 (Dec fuel)))
+            [uq3 b3 1 f3])))))
+  (define r[uq2 b2 c f] (goBlock (procCode p) uq NEST_INLINE_FUEL))
+  [uq2 (mkProc (procArgs p) b2) c])
+
+;; the three rewrites, then recurLower again: an inlined law that was
+;; handed the enclosing self turns its calls into self-calls
+;; -> [uq' proc changed]
+(define (knownHeads p uq)
+  (define r1[c1 p1] (lowerPartialApps p))
+  (define r2[c2 p2] (resolveKnownClosures p1))
+  (define r3[uq3 p3 c3] (inlineNestedLaws p2 uq))
+  [uq3 (Ifz c3 p3 (recurLower p3)) (Or c1 (Or c2 c3))])
+
 ;; Signature memoization: every distinct non-primop FAST head in a
 ;; proc is a callee whose signature the pipeline will ask for — at
 ;; every call site, in every round.  Collect them once, sig each once,
@@ -3209,7 +3715,11 @@
   ;; table built from the fixed point's heads covers codegen's heads
   ;; and sigOfLaw is pure — the emitted hints are byte-identical.
   (define (round p0 uq0)
-    (define r0[uqw pw] (inlinePrimWrappers p0 uq0))
+    ;; nested laws first: inlining exposes prim wrappers and calls the
+    ;; rest of the round works on
+    (define rk[uqk pk headsChanged]
+      (Ifz (Ge level 5) [uq0 p0 0] (knownHeads p0 uq0)))
+    (define r0[uqw pw] (inlinePrimWrappers pk uqk))
     (define rr[rowChanged pr] (lowerRowCalls pw))
     (define rs[uqs ps] (lowerSeqCalls pr uqw))
     (define r1[uq1 p1] (strictify 0 0 0 depth ps uqs))
@@ -3218,7 +3728,7 @@
     ;; (P5) with branch-eager code but no sig cascade and no checked
     ;; prologues; level 6 adds the signature machinery on top
     (define rbl[uqb p1b]
-      (Ifz (Ge level 5) [uq1 p1] (brLower p1 uq1)))
+      (Ifz (Ge level 5) [uq1 p1] (brLowerAll p1 uq1)))
     ;; brSink deliberately does NOT run inside the round: sinking a
     ;; pure bind into a BR arm mid-fixpoint leaves later rounds
     ;; re-walking a proc whose arm-local binds their strictify/
@@ -3233,7 +3743,12 @@
     ;; Drop stale argument rows before counting thunk uses.
     (define rd[dethunked p3] (dethunkOpt (deadCodeElim p2)))
     (define r2[uq2 p4] (inlineSingleUseProcs p3 uqb))
-    [uq2 (Or rowChanged (Or dethunked (_2 rs))) (deadCodeElim p4)])
+    ;; a BR lowering is progress too: an arm's own tail If only becomes
+    ;; lowerable after this round's cleanup, so keep iterating while
+    ;; branches are still being lowered (a lowering takes fresh keys)
+    (define brChanged (Gt uqb uq1))
+    [uq2 (Or brChanged (Or headsChanged (Or rowChanged (Or dethunked (_2 rs)))))
+     (deadCodeElim p4)])
   (cond
     ((Eq level 1) [p 0])
     ((Eq level 2)
@@ -3285,6 +3800,221 @@
             (define ri[uqi pi] (inlineSingleUseProcs pd uqf))
             [(eagerTailCalls (reforce (brSink (deadCodeElim pi)))) finalSig]))))))
 
+;;; Local function blocks ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;
+;;; A nested law that cannot be inlined (recursive, or too big) has no
+;;; code of its own: every entry of it would run interpreted.  From
+;;; level 5 on, every nested law literal of the law being compiled (and,
+;;; in turn, of those laws) becomes a local function: optimized on its
+;;; own and emitted as a block appended to this law's code.  Eager calls
+;;; at exact arity jump straight to it with OP_CALL (its arguments
+;;; become the block frame's operand base) or, in tail position,
+;;; OP_TAILBLK (constant space).  Every other entry -- a lazy call, a
+;;; closure applied inside another law, a std HOF calling its f -- has
+;;; only the law value in hand: the directory behind the code
+;;; ([OP_LAWBLK law offset] rows) tells the runtime which block
+;;; implements that law, and it enters the block from there.
+;;;
+;;; A lazy self-call inside a block becomes a FAST call of the law
+;;; literal (var 0 in a block would read the ENCLOSING law), and so
+;;; does the law's self used as a value.  Blocks are plain code reading
+;;; only their operand slots (never an env var), and no local proc
+;;; survives to codegen, so a LOCAL op at codegen time always names a
+;;; block: key = block index.
+
+(define BLOCK_MAX 400)
+(define BLOCKS_PER_LAW 48)
+(define NONE_BLOCK 1000000) ;; "not a block" (block indices are small)
+
+;; eager call sites: the main block, PROC bodies, BR arms (never DELAY
+;; bodies).  -> distinct unpinned law heads called at exact arity
+(define (eagerLawHeads p)
+  (define (goBlock acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args]
+            (? Op op
+              (FAST [val]
+                (If (And (IsLaw val) (Eq (Sz args) (Arity val)))
+                  (If (any (lambda (h) (Equal h val)) a) a (snoc val a))
+                  a))
+              (_ a)))
+          (PROC [key body] (goBlock a (procCode body)))
+          (BR [x arms] (foldl (lambda (a2 kp) (goBlock a2 (procCode (_1 kp)))) a arms))
+          (_ a)))
+      acc b))
+  (goBlock [] (procCode p)))
+
+;; every unpinned law literal in p: closure heads, lazy call heads, laws
+;; passed as values -- anything that can reach a call site outside this
+;; law's code, where only the law value itself is at hand
+(define (lawLiterals p)
+  (define (appHead v) (If (IsApp v) (appHead (Hd v)) v))
+  (define (addVal a v0)
+    (begin
+      (define v (appHead v0))
+      (If (And (IsLaw v) (Nil (any (lambda (h) (Equal h v)) a))) (snoc v a) a)))
+  (define (addAtom a x) (? Atom x (CNS [val] (addVal a val)) (_ a)))
+  (define (addOp a op)
+    (? Op op
+      (FAST [val] (addVal a val))
+      (SLOW [fn] (addAtom a fn))
+      (_ a)))
+  (define (goBlock acc b)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args] (foldl addAtom (addOp a op) args))
+          (LET [key rhs]
+            (? Alloc rhs
+              (CLOSE [fn args] (foldl addAtom (addAtom a fn) args))
+              (DELAY [body] (goBlock a (procCode body)))))
+          (RET [x] (addAtom a x))
+          (PROC [key body] (goBlock a (procCode body)))
+          (BR [x arms]
+            (foldl (lambda (a2 kp) (goBlock a2 (procCode (_1 kp)))) (addAtom a x) arms))
+          (_ a)))
+      acc b))
+  (goBlock [] (procCode p)))
+
+;; a nested law, optimized as a local function body, or 0: same shape
+;; limits as inlining (a flattenable let prelude), but recursion is fine.
+;; The law's self as a VALUE (a nested lambda capturing it, say) is the
+;; law literal itself: the block pushes that, and the directory sends
+;; its entries back here.
+(define (localFnProc level v)
+  (Ifz (And (IsLaw v) (Le (Arity v) 16)) 0
+    (begin
+      (define r[depthL p0] (ingestLawOpt v))
+      (define pr (recurLower p0))
+      (define pl
+        (If (Eq 0 (bst-gut 0 0 (refcounts pr))) pr
+          (mkProc (procArgs pr)
+            (subst (bst-insert 0 ($CNS v) E) (procCode pr)))))
+      (define fl[ok body] (flattenPrelude (procCode pl)))
+      (Ifz (And ok (Le (blockSize body) BLOCK_MAX)) 0
+        (begin
+          (define p1 (mkProc (procArgs pl) body))
+          (define maxk (max depthL (bstMaxKey (refcounts p1))))
+          ;; level 5 passes: law signatures are for the law's own
+          ;; entry, and a block has none
+          (_0 (optPasses (If (Ge level 6) 5 level) 0 (Arity v) p1 maxk)))))))
+
+;; eager FAST calls of block laws -> LOCAL block calls; in a block, its
+;; eager self-calls -> LOCAL self, lazy ones -> FAST of the law literal
+(define (toBlockCalls idxOf selfIdx selfLaw p)
+  (define (goProc p0 eager)
+    (define (goStmt s)
+      (define (conv op args)
+        (? Op op
+          (FAST [val]
+            (If (And eager (And (IsLaw val) (Eq (Sz args) (Arity val))))
+              (begin
+                (define i (idxOf val))
+                (If (Lt i NONE_BLOCK) ($LOCAL i) op))
+              op))
+          (RECUR
+            (If (Eq selfIdx NONE_BLOCK) op
+              (If eager ($LOCAL selfIdx) ($FAST selfLaw))))
+          (_ op)))
+      (? Stmt s
+        (CALL [key op args] ($CALL key (conv op args) args))
+        (LET [key rhs]
+          (? Alloc rhs
+            (DELAY [body] ($LET key ($DELAY (goProc body 0))))
+            (CLOSE s)))
+        (PROC [key body] ($PROC key (goProc body eager)))
+        (BR [x arms] ($BR x (map (lambda (kp) [(_0 kp) (goProc (_1 kp) eager)]) arms)))
+        (_ s)))
+    (mkProc (procArgs p0) (map goStmt (procCode p0))))
+  (goProc p 1))
+
+;; -> [main' blocks laws] ; blocks: row of converted block procs, index =
+;; key; laws: the nested law each block implements.  Eagerly called laws
+;; come first (they also become direct block calls); every other law
+;; literal gets a block too, reached through the directory behind the
+;; code when its value is entered elsewhere.
+(define (localBlocks level main)
+  ;; discovery: [laws procs] in index order, following block bodies
+  (define (discover laws procs pending)
+    (Ifz (Sz pending) [laws procs]
+      (begin
+        (define v (_0 pending))
+        (define rest (drop 1 pending))
+        (If (Or (Ge (Sz laws) BLOCKS_PER_LAW) (any (lambda (h) (Equal h v)) laws))
+          (discover laws procs rest)
+          (begin
+            (define bp (localFnProc level v))
+            (Ifz bp
+              (discover laws procs rest)
+              (discover (snoc v laws) (snoc bp procs)
+                (weld rest (weld (eagerLawHeads bp) (lawLiterals bp))))))))))
+  (define d[laws procs]
+    (discover [] [] (weld (eagerLawHeads main) (lawLiterals main))))
+  (define (idxOf2 v)
+    (define hit (find-idx (lambda (h) (Equal h v)) laws))
+    (Ifz hit NONE_BLOCK (_0 hit)))
+  [(toBlockCalls idxOf2 NONE_BLOCK 0 main)
+   (map
+     (lambda (i) (toBlockCalls idxOf2 i (Ix i laws) (Ix i procs)))
+     (gen (Sz laws) (lambda (i) i)))
+   laws])
+
+;; flat code: point every OP_CALL / OP_TAILBLK ["BLK" k] target at the
+;; block's absolute offset
+(define (patchBlocks code offsets)
+  (define n (Sz code))
+  (define (target x)
+    (If (And (IsApp x) (Eq "BLK" (_0 x))) (Ix (_1 x) offsets) x))
+  (define (walk i out)
+    (If (Ge i n) out
+      (begin
+        (define op (Ix i code))
+        (cond
+          ((Eq op OP_BR)
+            (begin
+              (define w (Add 2 (Ix (Inc i) code)))
+              (walk (Add i w) (weld out (take w (drop i code))))))
+          ((Eq op OP_MK_THK)
+            (begin
+              (define w (If (Eq 4 (Mod (Ix (Add i 2) code) 8)) 5 3))
+              (walk (Add i w) (weld out (take w (drop i code))))))
+          ((Or (Eq op OP_RET) (Eq op OP_FORCE)) (walk (Inc i) (snoc op out)))
+          ((Or (Eq op OP_CALL) (Eq op OP_TAILBLK))
+            (walk (Add i 3)
+              (weld out [op (target (Ix (Inc i) code)) (Ix (Add i 2) code)])))
+          ((Eq op OP_CALL_FAST) (walk (Add i 3) (weld out (take 3 (drop i code)))))
+          ((Eq op OP_CALL_KNOWN) (walk (Add i 4) (weld out (take 4 (drop i code)))))
+          (else (walk (Add i 2) (weld out (take 2 (drop i code)))))))))
+  (walk 0 []))
+
+;; the law's code followed by its blocks, targets patched, then the
+;; directory: [OP_LAWBLK law offset] per block (the runtime enters the
+;; block wherever that law value is applied)
+(define (codegenWithBlocks lawSig selfSig noupd depth main blocks laws)
+  (define mainFlat
+    (flattenItems (codegenItems lawSig selfSig noupd depth main []) 0))
+  (define blkItems
+    (map
+      (lambda (b)
+        (codegenItems 0 0 noupd 0 b (map argKey (drop 1 (procArgs b)))))
+      blocks))
+  (define lay
+    (foldl
+      (lambda (acc it)
+        (begin
+          (define a[offs at] acc)
+          [(snoc at offs) (Add at (Sz (flattenItems it 0)))]))
+      [[] (Sz mainFlat)] blkItems))
+  (define offsets (_0 lay))
+  (define flats
+    (map (lambda (i) (flattenItems (Ix i blkItems) (Ix i offsets)))
+      (gen (Sz blkItems) (lambda (i) i))))
+  (weld (patchBlocks (weld mainFlat (cat flats)) offsets)
+    (cat (map (lambda (i) [OP_LAWBLK (Ix i laws) (Ix i offsets)])
+           (gen (Sz laws) (lambda (i) i))))))
+
 (define (compileOptLevel level noupd l)
   (define attempt
     (Try
@@ -3295,7 +4025,11 @@
           (define maxk (bstMaxKey (refcounts p)))
           (define selfSig (If (Ge level 6) (sigOfLaw l) 0))
           (define rp[p2 lawSig] (optPasses level selfSig depth p maxk))
-          (codegenOpt lawSig selfSig noupd depth p2)))
+          (define lb
+            (If (Ge level 5) (localBlocks level p2) [p2 [] []]))
+          (Ifz (Sz (_1 lb))
+            (codegenOpt lawSig selfSig noupd depth p2)
+            (codegenWithBlocks lawSig selfSig noupd depth (_0 lb) (_1 lb) (_2 lb)))))
       0))
   (If (Hd attempt)
     (codegenLaw l) ;; anything unlowerable: byte-identical dumb output
