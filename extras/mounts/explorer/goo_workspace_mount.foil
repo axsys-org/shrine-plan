@@ -1,0 +1,167 @@
+- goo_workspace
+- source_mount
+- browser_routes
+
+' Shared declarative HTTP host. The manifest is schema-checked by Eden before
+' import; the compiled entry contract is checked in the publication candidate.
++ goo_workspace_mount
+  + registration
+    : name=str route=str declaration=path source_slot=path initial=path
+      record_only=bool title=str brand=str subtitle=str stylesheet=str
+      breadcrumbs=bool navigation=row[[str path]] footer=str
+  + bundle
+    : registrations=row[goo_workspace_mount/registration] validated_at=nat
+  + slot
+    ^ path
+    | source_mount/slot 'workspaces
+  + qualify
+    \ self=iota value=json
+    ^ path
+    = parts=path (grove_dev/items value).map((\ part ($ts (grove_dev/text part))))
+    ? (and parts.len (eq_iota parts.at(0) 'sys)) parts
+    | parts.cons(self)
+  + decode
+    \ self=iota manifest=str
+    ^ row[goo_workspace_mount/registration]
+    ?> (jres/ok doc rest) (parse manifest) []
+    | (grove_dev/items (grove_dev/field "workspaces" doc)).map
+      \ item=json
+      = receiver (grove_dev/field "receiver" item)
+        shell (grove_dev/field "shell" item)
+        title (grove_dev/text (grove_dev/field "title" shell))
+        brand (grove_dev/text (grove_dev/field "brand" shell))
+        route (grove_dev/text (grove_dev/field "route" item))
+        navigation
+          | (grove_dev/items (grove_dev/field "navigation" shell)).map
+            \ link=json
+            = pair (grove_dev/items link)
+            [(grove_dev/text pair.at(0)) (goo_workspace_mount/qualify self pair.at(1))]
+      | goo_workspace_mount/registration
+          (grove_dev/text (grove_dev/field "name" item)) route
+          (goo_workspace_mount/qualify self (grove_dev/field "entry" item))
+          (goo_workspace_mount/qualify self (grove_dev/field "slot" receiver))
+          (goo_workspace_mount/qualify self (grove_dev/field "initial" receiver))
+          (equal (grove_dev/text (grove_dev/field "admission" receiver)) "record")
+          (? title.len title "Goo workspace") (? brand.len brand route)
+          (grove_dev/text (grove_dev/field "subtitle" shell))
+          (grove_dev/text (grove_dev/field "stylesheet" shell))
+          (equal (grove_dev/field "breadcrumbs" shell) (json/boo .true)) navigation
+          (grove_dev/text (grove_dev/field "footer" shell))
+  + query_valid
+    \ target=str
+    ^ bool
+    = parts (http_foot/split 63 target)
+    ? (gt parts.len 2) .false
+    = query=str (? (eq parts.len 2) parts.at(1) "")
+    ? (eq query.len 0) .true
+    ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields query) .false
+    ? !(eq fields.len 1) .false
+    = [key value] fields.at(0)
+    | and (eq key "path") (maybe/is_some (browser_routes/value_path value))
+  + admit
+    \ registration=goo_workspace_mount/registration selected=axal[myth]
+    ^ maybe[str]
+    ? (? registration.record_only (maybe/is_some selected.fil) selected.wyt) .none
+    | ./some "This namespace path is unavailable. Choose an available namespace path."
+  + url
+    \ registration=goo_workspace_mount/registration target=path
+    ^ nat
+    | str/to_atom (str/cat_all [registration.route "?path=" (value_read/percent (path_show target))])
+  + page
+    \ registration=goo_workspace_mount/registration target=path content=row[weft/node]
+    ^ nat
+    = nav registration.navigation.map((\ [label path] (weft/leaf "a" [(weft/href (goo_workspace_mount/url registration path))] (str/to_atom label))))
+      ancestors (row/range 0 target.len.inc).map((\ size (weft/leaf "a" [(weft/href (goo_workspace_mount/url registration target.take(size)))] (? size (show/iota target.at(size.dec)) "/"))))
+      assets (goo_browser/presentation_assets).snoc((weft/el "script" [(weft/att "src" "/static/goo-workspace.js") (weft/att "defer" "defer")] []))
+      assets (? registration.stylesheet.len assets.snoc((weft/el "link" [(weft/att "rel" "stylesheet") (weft/href (str/to_atom registration.stylesheet))] [])) assets)
+      header (weft/el "header" [(weft/cls "goo-workspace-header")]
+        [(weft/leaf "a" [(weft/cls "goo-workspace-brand") (weft/href (str/to_atom registration.route))] (str/to_atom registration.brand))
+         (weft/leaf "p" [] (str/to_atom registration.subtitle))
+         (weft/el "nav" [(weft/att "aria-label" "Namespace roots")] nav)])
+      crumbs=row[weft/node] (? registration.breadcrumbs [(weft/el "nav" [(weft/cls "goo-workspace-breadcrumbs") (weft/att "aria-label" "Namespace ancestors")] ancestors)] [])
+    | weft/page_with_assets (str/to_atom registration.title) assets
+        (crumbs.cons(header).weld([(weft/el "main" [] content) (weft/leaf "footer" [] (str/to_atom registration.footer))]))
+  + endpoint
+    \ registration=goo_workspace_mount/registration
+    ^ goo_workspace/endpoint
+    | goo_workspace/endpoint registration.declaration registration.source_slot registration.initial
+        (goo_workspace_mount/admit registration) [] (goo_workspace_mount/page registration)
+  + validate_view
+    \ registration=goo_workspace_mount/registration published=goo/published
+    ^ either[str unit]
+    ? !(published.view.is_pane) (./err "Workspace endpoint requires an @pane declaration.")
+    ? !(published.view.ports.is_nil) (./err "Workspace entry pane must not require selection ports.")
+    ?> (./ok view) published.result (./err "Workspace failed compilation.")
+    ? (published.fields.keep((\ field (equal field.slot registration.source_slot)))).is_nil
+      | ./err "Workspace receiver slot is absent from the entry role."
+    = card (myth/sing registration.source_slot (pails/p registration.initial))
+    ? !(goo_browser/matches card published) (./err "Workspace receiver does not satisfy its role.")
+    < description (goo_panes/description (goo_bridge/receiver registration.initial published) card view)
+    | ./ok []
+  + publish
+    \ home=path manifest=str state=namespace
+    ^ either[str namespace]
+    = registrations (goo_workspace_mount/decode state.self manifest)
+    < checked
+      | registrations.fold (either/ok[str unit] [])
+        \ prior=either[str unit] registration=goo_workspace_mount/registration
+        < ignored prior
+        ?> (./some record) (goo_runtime/record .x registration.declaration state)
+          | ./err "Workspace declaration is unavailable."
+        ?> (./ok published) (goo_runtime/published record)
+          | ./err "Workspace declaration is not a published Goo view."
+        | goo_workspace_mount/validate_view registration published
+    | ./ok (source_mount/write home (myth/sing goo_workspace_mount/slot
+        (goo_workspace_mount/bundle registrations state.local.top)) state)
+  + registrations
+    \ home=path state=namespace
+    ^ row[goo_workspace_mount/registration]
+    ?> (./some held) (source_mount/record home state).get(goo_workspace_mount/slot) []
+    ?> bundle=goo_workspace_mount/bundle held []
+    | bundle.registrations
+  + install
+    \ home=path state=namespace
+    ^ either[pail namespace]
+    | (goo_workspace_mount/registrations home state).fold (either/ok[pail namespace] state)
+      \ previous=either[pail namespace] registration=goo_workspace_mount/registration
+      < next previous
+      | goo_workspace/install (goo_workspace_mount/endpoint registration) goo_browser/talk next
+  + request
+    \ registration=goo_workspace_mount/registration request=http_foot/request now=nat
+    ^ http_foot/action
+    ? !(eq request.method "GET") (./reply (http_driver/response 405 "GET required"))
+    = url (http_foot/split 63 request.target).at(0)
+    ? !((equal url registration.route) || (equal url (str/cat registration.route "/")))
+      | ./reply (http_driver/response 404 "Not found")
+    ? !(goo_workspace_mount/query_valid request.target)
+      | ./reply (http_driver/response 400 "Use one canonical absolute namespace path.")
+    | goo_workspace/request (goo_workspace_mount/endpoint registration) request now
+  + asset
+    \ home=path url=str filename=str request=http_foot/request now=nat
+    ^ http_foot/action
+    ? !(eq request.method "GET") (./reply (http_driver/response 405 "GET required"))
+    ? !(equal url (http_foot/split 63 request.target).at(0)) (./reply (http_driver/response 404 "Not found"))
+    = parts (http_foot/split 46 filename)
+      extension parts.at(parts.len.dec)
+      mime=nat
+        ? (equal extension "css") "text/css"
+        ? (equal extension "js") "text/javascript"
+        ? (equal extension "json") "application/json"
+        ? (equal extension "svg") "image/svg+xml"
+        ? (equal extension "png") "image/png"
+        ? (equal extension "jpg") "image/jpeg"
+        ? (equal extension "woff2") "font/woff2"
+        "application/octet-stream"
+    | ./asset home filename mime
+  + http
+    \ home=path manifest=str state=namespace config=http_foot/config
+    ^ http_foot/config
+    = pages
+        | (goo_workspace_mount/registrations home state).map
+          \ registration=goo_workspace_mount/registration
+          | http_foot/route registration.route (goo_workspace_mount/request registration)
+      assets
+        | (mount_assets/bindings manifest).map
+          \ [url filename]
+          | http_foot/route url (goo_workspace_mount/asset home url filename)
+    | http_foot/add_routes pages.weld(assets) config

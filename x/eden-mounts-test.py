@@ -63,7 +63,7 @@ class MountTests(unittest.TestCase):
             '(#bind std (#module std))', '(#import std)',
             '(#bind reef (#module reef))',
             '(define spec (_0 ' + runtime_literal(specs) + '))',
-            '(define good (And (Eq (Sz spec) 13) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
+            '(define good (And (Eq (Sz spec) 14) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
             '(print (If good "MOUNT-ENCODING-PASS" "MOUNT-ENCODING-FAIL"))',
             '(print "TEST-RUN-DONE")', ''])
         code, complete, _ = runner.run_process([os.environ['WISP'], '--file-root', str(source), 'snap', 'root', '_'], work, script, 60)
@@ -124,6 +124,98 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Missing mount descriptor'):
             scanner.refresh('mounts/app')
         self.assertTrue((root/'mounts/app/mount.json').exists())
+
+    def workspace(self):
+        return dict(name='reader', route='/reader', entry=['gov', 'reader', 'workspace'],
+                    receiver=dict(slot=['gov', 'reader', 'source'], initial=['lib']),
+                    shell=dict(stylesheet='/reader/style.css'))
+
+    def workspace_bag(self, **overrides):
+        self.bag('explorer', modules={'goo_workspace_mount': 'host.foil'})
+        options = dict(dependencies=['explorer'],
+                       grove=[dict(root=['gov', 'reader'], files=['reader.grove'])],
+                       assets={'/reader/style.css': 'style.css'}, workspaces=[self.workspace()])
+        options.update(overrides)
+        return self.bag('reader', **options)
+
+    def test_workspace_routes_and_runtime_registration(self):
+        bag = self.workspace_bag()
+        selected = select(self.root, ['reader'])
+        source = self.root / 'runtime'; source.mkdir()
+        specs = runtime_specs([(m, m.root, [], None) for m in selected], source)
+        self.assertEqual(specs[-1][12], ['/reader', '/reader/style.css'])
+        self.assertEqual(specs[-1][13], 1)
+        self.assertEqual(specs[-1][5:7], [[], []])
+        self.assertEqual(specs[0][13], 0)
+
+    def test_workspace_schema_rejects_invalid_contracts(self):
+        bag = self.workspace_bag()
+        original = json.loads((bag / 'mount.json').read_text())
+        mutations = [
+            lambda w: w.update(unknown=True),
+            lambda w: w.update(route='/reader/'),
+            lambda w: w.update(entry=['lib', 'foreign']),
+            lambda w: w['receiver'].update(slot=['sys', 'foreign']),
+            lambda w: w['receiver'].update(admission='anything'),
+            lambda w: w['receiver'].update(initial='/sys'),
+            lambda w: w['shell'].update(stylesheet='/undeclared.css'),
+            lambda w: w['shell'].update(navigation=[['invalid']]),
+            lambda w: w['shell'].update(breadcrumbs='yes'),
+        ]
+        for mutate in mutations:
+            data = json.loads(json.dumps(original)); mutate(data['workspaces'][0])
+            (bag / 'mount.json').write_text(json.dumps(data))
+            with self.subTest(data=data), self.assertRaisesRegex(ValueError, 'workspace'):
+                select(self.root, ['reader'])
+
+    def test_multiple_workspaces_and_optional_shell(self):
+        first = self.workspace(); first.pop('shell')
+        second = self.workspace()
+        second.update(name='secondary', route='/secondary', entry=['gov', 'reader', 'secondary'])
+        second['receiver'].update(initial=['sys'], admission='record')
+        self.workspace_bag(workspaces=[first, second])
+        selected = select(self.root, ['reader'])
+        self.assertEqual(len(selected[-1].manifest['workspaces']), 2)
+
+    def test_workspace_requires_dependency_not_merely_selected_provider(self):
+        self.workspace_bag(dependencies=[])
+        with self.assertRaisesRegex(ValueError, 'explorer dependency'):
+            select(self.root, ['explorer', 'reader'])
+
+    def test_workspace_duplicate_receivers_and_route_collisions(self):
+        bag = self.workspace_bag()
+        original = json.loads((bag / 'mount.json').read_text())
+        other = self.workspace(); other.update(name='other', route='/other')
+        data = dict(original, workspaces=[self.workspace(), other])
+        (bag / 'mount.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'two hosted receivers'):
+            select(self.root, ['reader'])
+        data = dict(original, routes=['/reader'])
+        (bag / 'mount.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'distinct'):
+            select(self.root, ['reader'])
+        (bag / 'mount.json').write_text(json.dumps(original))
+        self.bag('other', routes=['/reader/style.css'])
+        with self.assertRaisesRegex(ValueError, 'Duplicate HTTP route'):
+            select(self.root, ['reader', 'other'])
+
+    def test_workspace_descriptor_change_requires_restart_and_retains_scan(self):
+        bag = self.workspace_bag()
+        mount = select(self.root, ['reader'])[-1]
+        root = self.root / 'runtime'; (root / 'mounts' / 'reader').mkdir(parents=True)
+        scanner = ScanBridge.__new__(ScanBridge)
+        scanner.roots = {'mounts/reader': bag}; scanner.originals = scanner.roots
+        scanner.manifests = {'mounts/reader': mount.manifest}
+        scanner.scanners = {'mounts/reader': (mount, bag, None)}
+        scanner.destination = root
+        scanner.refresh('mounts/reader')
+        data = json.loads((bag / 'mount.json').read_text())
+        data['workspaces'][0]['receiver']['slot'][-1] = 'changed'
+        (bag / 'mount.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'restart Eden'):
+            scanner.refresh('mounts/reader')
+        captured = json.loads((root / 'mounts/reader/mount.json').read_text())
+        self.assertEqual(captured, mount.manifest)
 
     def test_host_cleanup_after_startup_preparation_failure(self):
         first = self.bag('first', host='host.py')

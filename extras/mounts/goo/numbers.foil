@@ -1,0 +1,132 @@
+- goo_app/types
+- json
+
+' Decimal wire numbers and exact finite binary64 payloads. No host float casts.
++ goo_number
+  + scanned
+    : value=nat end=nat
+  + rational
+    : negative=bool numerator=nat denominator=nat
+  + power
+    \ base=nat exponent=nat
+    ^ nat
+    % n=nat exponent out=nat 1 b=nat base
+    ? (eq n 0) out
+    | _ (div n 2) (? (eq (mod n 2) 1) (mul out b) out) (mul b b)
+  + digits
+    \ text=str start=nat
+    ^ goo_number/scanned
+    % i=nat start n=nat 0
+    ? !(digit_byte text.at(i)) (goo_number/scanned n i)
+    | _ i.inc (add (mul n 10) (sub text.at(i) 48))
+  + ratio
+    ' Strict JSON decimal grammar; signed zero follows Aeson's Scientific value.
+    \ text=str
+    ^ maybe[goo_number/rational]
+    = negative (eq text.at(0) 45)
+      start (? negative 1 0)
+      whole (goo_number/digits text start)
+    ? (eq start whole.end) .none
+    ? (eq text.at(start) 48)
+      ? (gt whole.end start.inc) .none
+      | goo_number/fraction text negative whole
+    | goo_number/fraction text negative whole
+  + fraction
+    \ text=str negative=bool whole=goo_number/scanned
+    ^ maybe[goo_number/rational]
+    = dot (eq text.at(whole.end) 46)
+      frac (? dot (goo_number/digits text whole.end.inc) (goo_number/scanned 0 whole.end))
+      places (? dot (sub frac.end whole.end.inc) 0)
+    ? dot
+      ? (eq places 0) .none
+      | goo_number/exponent text negative (add (mul whole.value (goo_number/power 10 places)) frac.value) places frac.end
+    | goo_number/exponent text negative whole.value 0 whole.end
+  + exponent
+    \ text=str negative=bool coefficient=nat places=nat index=nat
+    ^ maybe[goo_number/rational]
+    = exp ((eq text.at(index) 101) || (eq text.at(index) 69))
+      minus (eq text.at(index.inc) 45)
+      sign (minus || (eq text.at(index.inc) 43))
+      start (add index.inc (? sign 1 0))
+      digits (? exp (goo_number/digits text start) (goo_number/scanned 0 index))
+    ? exp
+      ? (eq digits.end start) .none
+      | goo_number/scaled text negative coefficient places digits minus
+    | goo_number/scaled text negative coefficient places digits .false
+  + scaled
+    \ text=str negative=bool coefficient=nat places=nat exponent=goo_number/scanned minus=bool
+    ^ maybe[goo_number/rational]
+    ? !(eq exponent.end text.len) .none
+    ? (eq coefficient 0) (./some (goo_number/rational .false 0 1))
+    = down (? minus (add places exponent.value) places)
+      up (? minus 0 exponent.value)
+    ' Bounds avoid allocating astronomically large powers from tiny inputs.
+    ? (gt up (add down 400)) .none
+    ? (gt down (add up coefficient.show.len.add(400))) (./some (goo_number/rational negative 1 (goo_number/power 10 401)))
+    ? (ge up down) (./some (goo_number/rational negative (mul coefficient (goo_number/power 10 (sub up down))) 1))
+    | ./some (goo_number/rational negative coefficient (goo_number/power 10 (sub down up)))
+  + round
+    \ numerator=nat denominator=nat
+    ^ nat
+    = quotient (div numerator denominator)
+      twice (mul 2 (mod numerator denominator))
+    ? (gt twice denominator) quotient.inc
+    ? (eq twice denominator) (add quotient (mod quotient 2))
+    quotient
+  + finite
+    \ negative=bool numerator=nat denominator=nat
+    ^ maybe[goo/scalar]
+    = expanded (mul numerator (lsh 1 1074))
+      quotient (div expanded denominator)
+      skip (sub (mul (wid quotient) 8) 60)
+      shift
+        % n=nat (rsh quotient skip) bits=nat skip
+        ? (lt n 9007199254740992) bits
+        | _ (div n 2) bits.inc
+      rounded (goo_number/round expanded (mul denominator (lsh 1 shift)))
+      magnitude (add (mul shift 4503599627370496) rounded)
+    ? (ge magnitude 9218868437227405312) .none
+    | goo/scalar/from_bits (add magnitude (? negative 9223372036854775808 0))
+  + decode
+    \ value=json
+    ^ maybe[goo/scalar]
+    = text=str
+        ? value
+         > (json/num neg n) (str/cat_all [(? neg "-" "") n.show])
+         > (json/real lex) lex
+        ""
+    < ratio (goo_number/ratio text)
+    | goo_number/finite ratio.negative ratio.numerator ratio.denominator
+  + nonnegative
+    \ value=json
+    ^ maybe[goo/scalar]
+    < number (goo_number/decode value)
+    ? (gt number.bits 9223372036854775808) .none
+    | ./some number
+  + integer
+    \ value=json
+    ^ maybe[nat]
+    = text=str
+        ? value
+         > (json/num neg n) (str/cat_all [(? neg "-" "") n.show])
+         > (json/real lex) lex
+        ""
+    < r (goo_number/ratio text)
+    ? r.negative .none
+    ? !(eq (mod r.numerator r.denominator) 0) .none
+    = n (div r.numerator r.denominator)
+    ? (gt n 9223372036854775807) .none
+    | ./some n
+  + encode
+    ' Exact decimal expansion; Aeson canonicalizes either signed zero to 0.
+    \ value=goo/scalar
+    ^ json
+    = negative (ge value.bits 9223372036854775808)
+      magnitude (mod value.bits 9223372036854775808)
+      exponent (div magnitude 4503599627370496)
+      mantissa (add (mod magnitude 4503599627370496) (? (eq exponent 0) 0 4503599627370496))
+      shift (? (eq exponent 0) 1074 (sub 1075 exponent))
+      digits (? (ge exponent 1075) (mul mantissa (lsh 1 (sub exponent 1075))) (mul mantissa (goo_number/power 5 shift)))
+      text (str/cat_all [(? negative "-" "") digits.show (? (eq shift 0) "" (str/cat_all ["e-" shift.show]))])
+    ? (eq magnitude 0) (json/num .false 0)
+    | json/real text

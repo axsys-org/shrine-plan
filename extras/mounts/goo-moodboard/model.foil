@@ -1,0 +1,110 @@
+- goo_patch
+
+' Persisted board data. IDs never recycle; placement is separate from content.
++ moodboard
+  + card
+    : id=nat kind=str title=str value=str slot=str
+  + placement
+    : id=nat bx=nat by=nat
+  + board
+    : serial=nat revision=nat cards=row[moodboard/card] places=row[moodboard/placement]
+  + number
+    \ n=nat
+    ^ json
+    | json/num .false n
+  + world
+    \ biased=nat
+    ^ json
+    | json/num (lt biased 100000) (? (lt biased 100000) (sub 100000 biased) (sub biased 100000))
+  + coordinate
+    \ value=json
+    ^ maybe[nat]
+    < ratio (goo_number/ratio (show value))
+    ? (gt ratio.numerator (mul 100000 ratio.denominator)) .none
+    = result (goo_number/round ratio.numerator ratio.denominator)
+    | ./some (? ratio.negative (sub 100000 result) (add 100000 result))
+  + field
+    \ name=str args=json
+    ^ str
+    | goo_patch/text (goo_patch/field name args)
+  + life
+    \ id=nat
+    ^ str
+    | str/cat_all ["card:" (nat/show id)]
+  + at
+    \ board=moodboard/board id=nat
+    ^ maybe[moodboard/card]
+    = matches (board.cards.keep((\ card (eq card.id id))))
+    ? (eq matches.len 1) (./some matches.at(0)) .none
+  + printable
+    ' Match the installed Goo ASCII metrics; reject unrenderable saved text.
+    \ value=str
+    ^ bool
+    | (row/range 0 value.len).all((\ i (and (ge value.at(i) 32) (le value.at(i) 126))))
+  + image_url
+    \ value=str
+    ^ bool
+    ' Image requests only. No HTML, data URLs, or scheme-relative destinations.
+    | and (and (gt value.len 0) (moodboard/printable value)) (and (maybe/is_none (http_foot/find (str/from_atom 92) value))
+        ((eq value.slice(0 8) "https://") || (and (eq value.slice(0 1) "/") !(eq value.slice(0 2) "//"))))
+  + valid
+    \ card=moodboard/card
+    ^ bool
+    ? ((eq card.title.len 0) || (gt card.title.len 120) || (gt card.value.len 4096)) .false
+    ? !(moodboard/printable card.title) .false
+    ? (eq card.kind "note") (moodboard/printable card.value)
+    ? (eq card.kind "image") (moodboard/image_url card.value)
+    ? !(eq card.kind "presentation") .false
+    ?> (./some target) (path_parse card.value) .false
+    ?> (./some slot) (path_parse card.slot) .false
+    | and (gt target.len 0) (gt slot.len 0)
+  + initial
+    ^ moodboard/board
+    | moodboard/board 3 1
+      [(moodboard/card 1 "note" "A place to collect" "Pin an idea, a visual reference, or a live Goo presentation. Move cards by their handles. The content stays alive." "")
+       (moodboard/card 2 "image" "Colour & form study" "/goo-moodboard/study.svg" "")
+       (moodboard/card 3 "presentation" "Live project brief" "/0x11/app/goo_moodboard/brief" "/sys/slot/content")]
+      [(moodboard/placement 1 100040 100040) (moodboard/placement 2 100430 100080) (moodboard/placement 3 100830 100020)]
+  + apply
+    \ board=moodboard/board args=json
+    ^ either[str moodboard/board]
+    = kind (moodboard/field "kind" args)
+      id (nat/parse (moodboard/field "id" args)).fall(0)
+    ? (eq kind "move-nodes")
+      = changes (goo_patch/items (goo_patch/field "nodes" args))
+      ? ((eq changes.len 0) || (gt changes.len board.cards.len)) (./err "Invalid move population")
+      % changes=row[json] changes places=row[moodboard/placement] board.places seen=row[nat] []
+      ^ either[str moodboard/board]
+      ? (eq changes.len 0) (./ok board.set_places(places).set_revision(board.revision.inc))
+      = change changes.at(0) target (goo_patch/field "target" change)
+        id (nat/parse (moodboard/field "node" target)).fall(0)
+        old (places.keep((\ place (eq place.id id))))
+        base (goo_patch/field "baseOrigin" change) point (goo_patch/field "proposedOrigin" change)
+      ? !(and (eq (moodboard/field "kind" target) "node") (eq (moodboard/field "lifetime" target) (moodboard/life id))) (./err "Card lifetime changed")
+      ? ((seen.has(id)) || !(eq old.len 1) || (maybe/is_none (moodboard/at board id))) (./err "Card is unavailable or repeated")
+      ?> (./some bx) (moodboard/coordinate (goo_patch/field "x" base)) (./err "Invalid base x")
+      ?> (./some by) (moodboard/coordinate (goo_patch/field "y" base)) (./err "Invalid base y")
+      ? !(and (eq old.at(0).bx bx) (eq old.at(0).by by)) (./err "Placement changed during movement")
+      ?> (./some x) (moodboard/coordinate (goo_patch/field "x" point)) (./err "Invalid x")
+      ?> (./some y) (moodboard/coordinate (goo_patch/field "y" point)) (./err "Invalid y")
+      | _ changes.drop(1) (places.map((\ place (? (eq place.id id) (moodboard/placement id x y) place)))) seen.snoc(id)
+    ? (eq kind "create")
+      ? (ge board.cards.len 64) (./err "This board holds at most 64 cards")
+      = id board.serial.inc
+        card (moodboard/card id (moodboard/field "tag" args) (moodboard/field "title" args) (moodboard/field "value" args) (moodboard/field "slot" args))
+      ? !(moodboard/valid card) (./err "Use note, image (HTTPS or local URL), or presentation (absolute subject and slot paths); give the card a title (current Goo text supports printable ASCII)")
+      = offset (mul (mod id 8) 40)
+      | ./ok board.set_serial(id).set_revision(board.revision.inc).set_cards(board.cards.snoc(card)).set_places(board.places.snoc((moodboard/placement id (add 100040 offset) (add 100040 offset))))
+    ?> (./some old) (moodboard/at board id) (./err "Card no longer exists")
+    ? (eq kind "delete")
+      | ./ok board.set_revision(board.revision.inc).set_cards((board.cards.keep((\ card !(eq card.id id))))).set_places((board.places.keep((\ place !(eq place.id id)))))
+    ? !(eq kind "update") (./err "Unknown board operation")
+    = card old.set_title((moodboard/field "title" args)).set_value((moodboard/field "value" args)).set_slot((moodboard/field "slot" args))
+    ? !(moodboard/valid card) (./err "Invalid content, URL, or paths; current Goo text supports printable ASCII")
+    | ./ok board.set_revision(board.revision.inc).set_cards((board.cards.map((\ old (? (eq old.id id) card old)))))
+  + error
+    \ result=either[str moodboard/board]
+    ^ str
+    ? result
+     > (./err message) message
+     > (./ok _) ""

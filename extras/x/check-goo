@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Required Goo compatibility suite against the production Mash Nix artifact."""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+EXPLORER = ROOT / 'extras/mounts/explorer'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
+    if not (os.environ.get('WISP') or shutil.which('wisp')):
+        parser.error('Enter nix develop .#eden, or set WISP to the locked runtime')
+    output = (args.output or Path(tempfile.mkdtemp(prefix='goo-compatibility-'))).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    spec = importlib.util.spec_from_file_location('goo_integration', EXPLORER / 'scripts/check-integration.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    mash, provenance = gate.production_mash()
+    (output / 'mash-provenance.json').write_text(json.dumps(dict(provenance, storePath=str(mash)), indent=2) + '\n')
+    # Only the inspector is a deployed Goo view consumer. Regression mounts live
+    # outside the production catalogue and cannot be accidentally enabled there.
+    sys.path.insert(0, str(ROOT / 'x'))
+    from eden_mounts import catalog, select
+    mounts = catalog(ROOT / 'extras')
+    assert not {'panes', 'goo-explorer', 'goo-examples'} & mounts.keys()
+    select(ROOT / 'extras', list(mounts))
+    for mount in mounts.values():
+        for unit in mount.manifest.get('grove', []):
+            for leaf in unit['files']:
+                if re.search(r'^\s*@(?:view|pane)\b', (mount.root / leaf).read_text(), re.M):
+                    assert mount.name in {'goo-inspector', 'patch-demo'}, f'Unexpected production Goo consumer: {mount.name}'
+    shell = ['nix', '--extra-experimental-features', 'nix-command flakes',
+             'develop', '--no-update-lock-file', f'path:{ROOT / "extras"}#debugger', '--command']
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        domain_port = str(probe.getsockname()[1])
+    commands = [
+        [sys.executable, str(ROOT / 'extras/x/check'), '--mount', 'goo-inspector',
+         '--mount', 'srs', '--mount', 'grove-dev'],
+        [sys.executable, str(ROOT / 'x/eden'), '--mount', 'grove-dev', '--mount', 'srs',
+         '--mount', 'goo-inspector', '--port', domain_port, '--check'],
+        [*shell, 'node', '--test', *map(str, sorted((EXPLORER / 'tests').glob('*.test.cjs')))],
+        [*shell, 'python3', str(ROOT / 'extras/mounts/goo/scripts/check-profile.py'),
+         '--mash-root', str(mash), '--output', str(output / 'profile')],
+        [sys.executable, str(EXPLORER / 'scripts/check-integration.py'),
+         '--output', str(output / 'application')],
+    ]
+    for command in commands:
+        subprocess.run(command, cwd=ROOT, check=True)
+    print(f'Production Goo compatibility passed. Artifacts: {output}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

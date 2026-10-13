@@ -3,7 +3,7 @@
   inputs.mash = {
     type = "git";
     url = "https://github.com/axsys-org/mash.git";
-    rev = "12e5f9345d9745cb75cab4f58e39aa33da83e14e";
+    rev = "16b8a9079e8a45dc2681cf3210e1d186e5cbe622";
     allRefs = true;
     inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -12,6 +12,9 @@
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       each = nixpkgs.lib.genAttrs systems;
     in {
+      packages = each (system: {
+        mash-workspace = mash.packages.${system}.workspace;
+      });
       devShells = each (system: {
         debugger = nixpkgs.legacyPackages.${system}.mkShell {
           packages = [ mash.packages.${system}.nodejs mash.packages.${system}.pnpm

@@ -1,0 +1,386 @@
+- grove_playground/scene
+
+' Route proposals are geometry, never executable content. All signed coordinates
+' are represented internally with a 100000 offset so comparisons stay exact.
++ playground_routing
+  + point
+    : x=nat y=nat
+  + box
+    : x=nat y=nat width=nat height=nat
+  + route
+    : connection=json points=row[playground_routing/point]
+  + set
+    \ key=str value=json object=json
+    ^ json
+    ?> (json/obj entries) object object
+    | json/obj (entries.map((\ entry (? (eq entry.k key) (jkv key value) entry))))
+  + scalar
+    \ value=json
+    ^ maybe[nat]
+    ?> (json/num negative n) value .none
+    ? (gt n 100000) .none
+    | ./some (? negative (sub 100000 n) (add 100000 n))
+  + read_point
+    \ value=json
+    ^ maybe[playground_routing/point]
+    < x (playground_routing/scalar (goo_patch/field "x" value))
+    < y (playground_routing/scalar (goo_patch/field "y" value))
+    | ./some (playground_routing/point x y)
+  + number
+    \ n=nat
+    ^ json
+    | json/num (lt n 100000) (? (lt n 100000) (sub 100000 n) (sub n 100000))
+  + json_point
+    \ point=playground_routing/point
+    ^ json
+    | json/obj [(jkv "x" (playground_routing/number point.x)) (jkv "y" (playground_routing/number point.y))]
+  + rect
+    \ box=playground_routing/box
+    ^ json
+    | json/obj [(jkv "x" (playground_routing/number box.x)) (jkv "y" (playground_routing/number box.y))
+        (jkv "width" (playground_scene/number box.width)) (jkv "height" (playground_scene/number box.height))]
+  + min
+    \ a=nat b=nat
+    ^ nat
+    ? (lt a b) a b
+  + max
+    \ a=nat b=nat
+    ^ nat
+    ? (gt a b) a b
+  + distance
+    \ a=playground_routing/point b=playground_routing/point
+    ^ nat
+    | add (add (sub a.x b.x) (sub b.x a.x)) (add (sub a.y b.y) (sub b.y a.y))
+  + read_points
+    \ values=row[json]
+    ^ maybe[row[playground_routing/point]]
+    % values=row[json] values out=row[playground_routing/point] []
+    ^ maybe[row[playground_routing/point]]
+    ? (eq values.len 0) (./some out)
+    ?> (./some point) (playground_routing/read_point values.at(0)) .none
+    | _ values.drop(1) out.snoc(point)
+  + node_box
+    \ node=json padding=nat
+    ^ playground_routing/box
+    = rect (goo_patch/field "rect" node)
+    | playground_routing/box (sub (playground_routing/known_coordinate (goo_patch/field "x" rect)) padding)
+        (sub (playground_routing/known_coordinate (goo_patch/field "y" rect)) padding)
+        (add (playground/id "width" rect) (mul 2 padding)) (add (playground/id "height" rect) (mul 2 padding))
+  + intersects
+    \ a=playground_routing/point b=playground_routing/point box=playground_routing/box
+    ^ bool
+    ? (eq a.y b.y)
+      | (and (and (gt a.y box.y) (lt a.y (add box.y box.height)))
+          (and (gt (playground_routing/max a.x b.x) box.x) (lt (playground_routing/min a.x b.x) (add box.x box.width))))
+    | (and (and (gt a.x box.x) (lt a.x (add box.x box.width)))
+        (and (gt (playground_routing/max a.y b.y) box.y) (lt (playground_routing/min a.y b.y) (add box.y box.height))))
+  + clear
+    \ nodes=row[json] connection=json points=row[playground_routing/point]
+    ^ bool
+    = endpoints (goo_patch/items (goo_patch/field "endpoints" connection))
+      source (playground/field "node" (goo_patch/field "port" endpoints.at(0)))
+      target (playground/field "node" (goo_patch/field "port" endpoints.at(1)))
+    | (row/range 0 points.len.dec).all
+      \ i
+      = a points.at(i) b points.at(i.inc)
+      ? (equal a b) .false
+      ? !((eq a.x b.x) || (eq a.y b.y)) .false
+      | nodes.all
+        \ node
+        = key (playground/field "key" node)
+        ? ((and (eq i 0) (eq key source)) || (and (eq i.inc points.len.dec) (eq key target))) .true
+        | !(playground_routing/intersects a b (playground_routing/node_box node 12))
+  + command
+    \ op=str point=playground_routing/point
+    ^ json
+    | json/obj [(jkv "op" (json/str op)) (jkv "to" (playground_routing/json_point point))]
+  + midpoint
+    \ a=playground_routing/point b=playground_routing/point
+    ^ playground_routing/point
+    | playground_routing/point (div (add a.x b.x) 2) (div (add a.y b.y) 2)
+  + scaled_point
+    \ p=playground_routing/point
+    ^ playground_routing/point
+    | playground_routing/point (mul p.x 32) (mul p.y 32)
+  + hull
+    \ a=playground_routing/point b=playground_routing/point c=playground_routing/point d=playground_routing/point
+    ^ playground_routing/box
+    = min playground_routing/min max playground_routing/max
+      x (min (min a.x b.x) (min c.x d.x)) y (min (min a.y b.y) (min c.y d.y))
+    | playground_routing/box x y (sub (max (max a.x b.x) (max c.x d.x)) x) (sub (max (max a.y b.y) (max c.y d.y)) y)
+  ' Directed integer intervals enclose de Casteljau subdivisions at 1/32
+  ' units. Exact port endpoints stay exact: inflating the entire sub-hull by
+  ' a rounding allowance falsely rejects a cable departing a card boundary.
+  + interval
+    : lo=playground_routing/point hi=playground_routing/point
+  + interval_midpoint
+    \ a=playground_routing/interval b=playground_routing/interval
+    ^ playground_routing/interval
+    | playground_routing/interval (playground_routing/midpoint a.lo b.lo)
+        (playground_routing/point (div (add (add a.hi.x b.hi.x) 1) 2) (div (add (add a.hi.y b.hi.y) 1) 2))
+  + spline_clear
+    \ boxes=row[playground_routing/box] a=playground_routing/interval b=playground_routing/interval
+      c=playground_routing/interval d=playground_routing/interval depth=nat
+    ^ bool
+    = lo (playground_routing/hull a.lo b.lo c.lo d.lo)
+      hi (playground_routing/hull a.hi b.hi c.hi d.hi)
+      hull (playground_routing/box lo.x lo.y (sub (add hi.x hi.width) lo.x) (sub (add hi.y hi.height) lo.y))
+      boxes (boxes.keep((\ box (playground_routing/box_overlap hull box))))
+    ? (eq boxes.len 0) .true
+    ? (eq depth 0) .false
+    = midpoint playground_routing/interval_midpoint
+      ab (midpoint a b) bc (midpoint b c) cd (midpoint c d)
+      abc (midpoint ab bc) bcd (midpoint bc cd) m (midpoint abc bcd)
+      clear (playground_routing/spline_clear boxes)
+    | and (clear a ab abc m depth.dec) (clear m bcd cd d depth.dec)
+  + controls_clear
+    \ boxes=row[playground_routing/box] a=playground_routing/point b=playground_routing/point c=playground_routing/point d=playground_routing/point
+    ^ bool
+    = scale
+        \ p=playground_routing/point
+        = p (playground_routing/scaled_point p)
+        | playground_routing/interval p p
+    | playground_routing/spline_clear boxes (scale a) (scale b) (scale c) (scale d) 10
+  + spline_box
+    \ node=json
+    ^ playground_routing/box
+    = box (playground_routing/node_box node 0)
+    | playground_routing/box (mul box.x 32) (mul box.y 32) (mul box.width 32) (mul box.height 32)
+  + step
+    \ p=playground_routing/point from=playground_routing/point to=playground_routing/point amount=nat
+    ^ playground_routing/point
+    | playground_routing/point
+        (sub (add p.x (? (gt to.x from.x) amount 0)) (? (lt to.x from.x) amount 0))
+        (sub (add p.y (? (gt to.y from.y) amount 0)) (? (lt to.y from.y) amount 0))
+  + handle
+    \ points=row[playground_routing/point] i=nat divisor=nat outgoing=bool
+    ^ playground_routing/point
+    = p points.at(i)
+    ? ((eq i 0) || (eq i points.len.dec))
+      = length (playground_routing/min 160 (playground_routing/distance p (? (eq i 0) points.at(1) points.at(i.dec))))
+        amount (playground_routing/max 1 (div length (div divisor 2)))
+      | playground_routing/point (? outgoing (add p.x amount) (sub p.x amount)) p.y
+    = prev points.at(i.dec) next points.at(i.inc)
+      amount (div (playground_routing/min 160 (playground_routing/min (playground_routing/distance prev p) (playground_routing/distance p next))) (div divisor 2))
+      step playground_routing/step
+      first (step p (? outgoing prev p) (? outgoing p prev) amount)
+    | step first (? outgoing p next) (? outgoing next p) amount
+  + cubic
+    \ c1=playground_routing/point c2=playground_routing/point to=playground_routing/point
+    ^ json
+    | json/obj [(jkv "op" (json/str "C")) (jkv "c1" (playground_routing/json_point c1))
+        (jkv "c2" (playground_routing/json_point c2)) (jkv "to" (playground_routing/json_point to))]
+  + spline
+    \ boxes=row[playground_routing/box] points=row[playground_routing/point] divisor=nat
+    ^ maybe[row[json]]
+    % i=nat 0 out=row[json] [(playground_routing/command "M" points.at(0))]
+    ^ maybe[row[json]]
+    ? (eq i points.len.dec) (./some out)
+    = a points.at(i) d points.at(i.inc)
+      b (playground_routing/handle points i divisor .true) c (playground_routing/handle points i.inc divisor .false)
+    ? !(playground_routing/controls_clear boxes a b c d) .none
+    | _ i.inc out.snoc((playground_routing/cubic b c d))
+  ' Fit a whole cable with one shared, horizontal tangent at its crest.
+  ' The route supplies the detour side and clearance envelope, not curve knots.
+  + port_reach
+    \ boxes=row[playground_routing/box] point=playground_routing/point reach=nat outgoing=bool
+    ^ nat
+    = p (playground_routing/scaled_point point)
+    = limit
+        % boxes=row[playground_routing/box] boxes limit=nat (mul reach 32)
+        ^ nat
+        ? (eq boxes.len 0) limit
+        = box boxes.at(0) right (add box.x box.width)
+        ? !(and (gt p.y box.y) (lt p.y (add box.y box.height))) (_ boxes.drop(1) limit)
+        ? outgoing
+          ? (lt box.x p.x) (_ boxes.drop(1) limit)
+          | _ boxes.drop(1) (playground_routing/min limit (sub box.x p.x))
+        ? (gt right p.x) (_ boxes.drop(1) limit)
+        | _ boxes.drop(1) (playground_routing/min limit (sub p.x right))
+    | div limit 32
+  + sweep
+    \ boxes=row[playground_routing/box] points=row[playground_routing/point] margin=nat above=bool bias=nat
+    ^ maybe[row[json]]
+    = a points.at(0) d points.at(points.len.dec)
+      ys (points.map((\ p p.y)))
+      top (row/fold[nat nat] a.y playground_routing/min ys)
+      bottom (row/fold[nat nat] a.y playground_routing/max ys)
+      m (playground_routing/point (div (add (mul a.x bias) (mul d.x (sub 4 bias))) 4) (? above (sub top margin) (add bottom margin)))
+      width (add (sub a.x d.x) (sub d.x a.x))
+      reach (playground_routing/min 320 (playground_routing/max 64 (div (add width margin) 3)))
+      tangent (playground_routing/max 32 (div width 4))
+      exit_reach (? (gt d.x a.x) (playground_routing/min reach (sub m.x a.x)) reach)
+      entry_reach (? (gt d.x a.x) (playground_routing/min reach (sub d.x m.x)) reach)
+      b (playground_routing/point (add a.x (playground_routing/port_reach boxes a exit_reach .true)) a.y)
+      c (playground_routing/point (? (le d.x a.x) (add m.x tangent) (sub m.x tangent)) m.y)
+      e (playground_routing/point (? (le d.x a.x) (sub m.x tangent) (add m.x tangent)) m.y)
+      f (playground_routing/point (sub d.x (playground_routing/port_reach boxes d entry_reach .false)) d.y)
+      clear (playground_routing/controls_clear boxes)
+    ? !(and (clear a b c m) (clear m e f d)) .none
+    | ./some [(playground_routing/command "M" a) (playground_routing/cubic b c m) (playground_routing/cubic e f d)]
+  ' Dynamic programming chooses the fewest clear spans through any subset of
+  ' guide knots. Shared handles preserve C1 continuity even across skipped knots.
+  ' Bound the quadratic search; larger guides retain the linear safe fallback.
+  + shortcut
+    \ boxes=row[playground_routing/box] points=row[playground_routing/point] divisor=nat
+    ^ maybe[row[json]]
+    ? (gt points.len 32) (playground_routing/spline boxes points divisor)
+    % i=nat points.len.dec tails=row[row[json]] [[]]
+    ^ maybe[row[json]]
+    ? (eq i 0)
+      ? (eq tails.at(0).len 0) .none
+      | ./some (tails.at(0).cons((playground_routing/command "M" points.at(0))))
+    = from i.dec a points.at(from) b (playground_routing/handle points from divisor .true)
+      best
+        % j=nat i best=row[json] []
+        ^ row[json]
+        ? (eq j points.len) best
+        = tail tails.at((sub j i))
+        ? (and (lt j points.len.dec) (eq tail.len 0)) (_ j.inc best)
+        ? (and (gt best.len 0) (ge tail.len.inc best.len)) (_ j.inc best)
+        = c (playground_routing/handle points j divisor .false) d points.at(j)
+        ? !(playground_routing/controls_clear boxes a b c d) (_ j.inc best)
+        | _ j.inc tail.cons((playground_routing/cubic b c d))
+    | _ from tails.cons(best)
+  + commands
+    \ nodes=row[json] points=row[playground_routing/point]
+    ^ row[json]
+    = boxes (nodes.map(playground_routing/spline_box))
+      a points.at(0) d points.at(points.len.dec)
+      handle (playground_routing/min 240 (playground_routing/max 48 (div (playground_routing/distance a d) 2)))
+      handle (? (and (eq a.y d.y) (gt d.x a.x)) (playground_routing/min handle (div (sub d.x a.x) 3)) handle)
+      b (playground_routing/point (add a.x handle) a.y) c (playground_routing/point (sub d.x handle) d.y)
+    ? (playground_routing/controls_clear boxes a b c d)
+      | [(playground_routing/command "M" a) (playground_routing/cubic b c d)]
+    = ys (points.map((\ p p.y)))
+      top (row/fold[nat nat] a.y playground_routing/min ys)
+      bottom (row/fold[nat nat] a.y playground_routing/max ys)
+      above (gt (sub (playground_routing/min a.y d.y) top) (sub bottom (playground_routing/max a.y d.y)))
+      swept
+        % margin=nat 48
+        ^ maybe[row[json]]
+        ? (gt margin 192) .none
+        = candidate
+            % biases=row[nat] [2 3 1]
+            ^ maybe[row[json]]
+            ? (eq biases.len 0) .none
+            ? (playground_routing/sweep boxes points margin above biases.at(0))
+             > (./some commands) (./some commands)
+             > .none (_ biases.drop(1))
+        ? candidate
+         > (./some commands) (./some commands)
+         > .none (_ (mul margin 2))
+    ? swept
+     > (./some commands) commands
+     > .none
+      % divisor=nat 6
+      ^ row[json]
+      ? (gt divisor 384)
+        | ((row/range 0 points.len.dec).map((\ i (playground_routing/cubic points.at(i) points.at(i.inc) points.at(i.inc))))).cons((playground_routing/command "M" points.at(0)))
+      ? (playground_routing/shortcut boxes points divisor)
+       > (./some commands) commands
+       > .none (_ (mul divisor 2))
+  + box_overlap
+    \ a=playground_routing/box b=playground_routing/box
+    ^ bool
+    | (and (and (lt a.x (add b.x b.width)) (gt (add a.x a.width) b.x))
+        (and (lt a.y (add b.y b.height)) (gt (add a.y a.height) b.y)))
+  + admit
+    \ draft=playground/draft proposal=json
+    ^ either[str str]
+    ?> (jres/ok base rest) (parse (playground_scene/scene draft)) (./err "Scene unavailable")
+    = header (goo_patch/field "header" base) basis (playground/field "layoutRev" header)
+      nodes (goo_patch/items (goo_patch/field "nodes" base))
+      connections (goo_patch/items (goo_patch/field "connections" base))
+      routes (goo_patch/items (goo_patch/field "routes" proposal))
+    ? !(eq (playground/field "basis" proposal) basis) (./err "Routing basis changed")
+    ? ((gt connections.len 512) || !(eq routes.len connections.len)) (./err "Invalid route population")
+    % routes=row[json] routes seen=row[str] [] prepared=row[playground_routing/route] [] count=nat 0
+    ^ either[str str]
+    ? (eq routes.len 0) (./ok (playground_routing/install base prepared))
+    = route routes.at(0) key (playground/field "key" route)
+      matches (connections.keep((\ edge (eq (playground/field "key" edge) key))))
+      raw (goo_patch/items (goo_patch/field "points" route))
+    ? ((seen.has(key)) || !(eq matches.len 1)) (./err "Duplicate or retired route")
+    = connection matches.at(0)
+    ? !(and (eq (playground/field "lifetime" route) (playground/field "lifetime" connection))
+        (eq (playground/field "topologyRef" route) (playground/field "topologyRef" connection))) (./err "Route topology changed")
+    ? ((lt raw.len 2) || (gt raw.len 128) || (gt (add count raw.len) 8192)) (./err "Route size bound exceeded")
+    ?> (./some points) (playground_routing/read_points raw) (./err "Invalid route coordinates")
+    = commands (goo_patch/items (goo_patch/field "commands" (goo_patch/items (goo_patch/field "segments" connection)).at(0)))
+      from (goo_patch/field "to" commands.at(0)) to (goo_patch/field "to" commands.at(commands.len.dec))
+    ? !(and (equal (playground_routing/json_point points.at(0)) from)
+        (equal (playground_routing/json_point points.at(points.len.dec)) to)) (./err "Route endpoints changed")
+    = start points.at(0) after points.at(1) end points.at(points.len.dec) before points.at((sub points.len 2))
+    ? !(and (and (eq start.y after.y) (ge after.x (add start.x 12)))
+        (and (eq before.y end.y) (ge end.x (add before.x 12)))) (./err "Route must follow port directions")
+    ? !(playground_routing/clear nodes connection points) (./err "Route crosses a card or is not orthogonal")
+    | _ routes.drop(1) seen.snoc(key) prepared.snoc((playground_routing/route connection points)) (add count raw.len)
+  + known_coordinate
+    \ value=json
+    ^ nat
+    ?> (json/num negative n) value 100000
+    | ? negative (sub 100000 n) (add 100000 n)
+  + known_point
+    \ object=json key=str
+    ^ playground_routing/point
+    = point (goo_patch/field key object) coordinate playground_routing/known_coordinate
+    | playground_routing/point (coordinate (goo_patch/field "x" point)) (coordinate (goo_patch/field "y" point))
+  + spline_label
+    \ nodes=row[json] commands=row[json]
+    ^ playground_routing/box
+    % remaining=row[json] commands.drop(1) a=playground_routing/point (playground_routing/known_point commands.at(0) "to")
+      best=playground_routing/box (playground_routing/box 100000 100000 96 24) score=nat 0
+    ^ playground_routing/box
+    ? (eq remaining.len 0) best
+    = command remaining.at(0) point (playground_routing/known_point command)
+      b (point "c1") c (point "c2") d (point "to") midpoint playground_routing/midpoint
+      m (midpoint (midpoint (midpoint a b) (midpoint b c)) (midpoint (midpoint b c) (midpoint c d)))
+      above (playground_routing/box (sub m.x 48) (sub m.y 28) 96 24)
+      below (playground_routing/box (sub m.x 48) (add m.y 4) 96 24)
+      free (\ box=playground_routing/box (nodes.all((\ node !(playground_routing/box_overlap box (playground_routing/node_box node 4))))))
+      candidate (? (free above) above below)
+      rank (add (playground_routing/distance a d) (? (free candidate) 1000000 0))
+    | _ remaining.drop(1) d (? (gt rank score) candidate best) (playground_routing/max score rank)
+  + install_connection
+    \ nodes=row[json] route=playground_routing/route
+    ^ json
+    = connection route.connection
+      segment (goo_patch/items (goo_patch/field "segments" connection)).at(0)
+      commands (playground_routing/commands nodes route.points)
+      segment (playground_routing/set "commands" (json/arr commands) segment)
+      labels (goo_patch/items (goo_patch/field "labels" connection))
+      labels (labels.map((\ label (playground_routing/set "rect" (playground_routing/rect (playground_routing/spline_label nodes commands)) label))))
+    | playground_routing/set "labels" (json/arr labels) (playground_routing/set "segments" (json/arr [segment]) connection)
+  + include_point
+    \ bounds=playground_routing/box point=playground_routing/point
+    ^ playground_routing/box
+    = x (playground_routing/min bounds.x (sub point.x 112)) y (playground_routing/min bounds.y (sub point.y 48))
+      right (playground_routing/max (add bounds.x bounds.width) (add point.x 112)) bottom (playground_routing/max (add bounds.y bounds.height) (add point.y 48))
+    | playground_routing/box x y (sub right x) (sub bottom y)
+  + include_command
+    \ bounds=playground_routing/box command=json
+    ^ playground_routing/box
+    = include playground_routing/include_point point (playground_routing/known_point command)
+      bounds (include bounds (point "to"))
+    ? !(eq (playground/field "op" command) "C") bounds
+    | include (include bounds (point "c1")) (point "c2")
+  + include_connection
+    \ bounds=playground_routing/box connection=json
+    ^ playground_routing/box
+    = segment (goo_patch/items (goo_patch/field "segments" connection)).at(0)
+      commands (goo_patch/items (goo_patch/field "commands" segment))
+    | row/fold[json playground_routing/box] bounds playground_routing/include_command commands
+  + install
+    \ base=json routes=row[playground_routing/route]
+    ^ str
+    = nodes (goo_patch/items (goo_patch/field "nodes" base))
+      connections (routes.map((playground_routing/install_connection nodes)))
+      header (goo_patch/field "header" base)
+      header (playground_routing/set "layoutRev" (json/str (str/cat_all [(playground/field "layoutRev" header) ":spline-v3"])) header)
+      extent (goo_patch/field "extent" base)
+      bounds (playground_routing/box (playground_routing/known_coordinate (goo_patch/field "x" extent))
+        (playground_routing/known_coordinate (goo_patch/field "y" extent)) (playground/id "width" extent) (playground/id "height" extent))
+      bounds (row/fold[json playground_routing/box] bounds playground_routing/include_connection connections)
+    | show (playground_routing/set "extent" (playground_routing/rect bounds)
+        (playground_routing/set "header" header (playground_routing/set "connections" (json/arr connections) base)))

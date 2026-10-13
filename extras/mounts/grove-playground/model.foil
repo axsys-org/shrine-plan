@@ -1,0 +1,406 @@
+- grove_draft
+- goo_patch
+
+' The authoring document is typed namespace data. JSON is only command/scene I/O.
++ playground
+  + node
+    : id=nat kind=str name=str value=str slot=str
+  + edge
+    : id=nat source=nat port=str target=nat value=str
+  + placement
+    ' Signed world positions encoded with the routing system's 100000 offset.
+    ' Explicit field names distinguish this representation from legacy x/y data.
+    : id=nat bx=nat by=nat
+  + positive_placement
+    \ id=nat x=nat y=nat
+    ^ playground/placement
+    | playground/placement id (add 100000 x) (add 100000 y)
+  + world_number
+    \ biased=nat
+    ^ json
+    | json/num (lt biased 100000) (? (lt biased 100000) (sub 100000 biased) (sub biased 100000))
+  + draft
+    : serial=nat revision=nat nodes=row[playground/node] edges=row[playground/edge]
+      places=row[playground/placement] collapsed=row[nat] hidden_kinds=row[str]
+  + kinds
+    ^ row[str]
+    ["slot" "role" "sample" "view" "group" "row" "col" "or" "opt" "show" "text" "path" "present"]
+  + card_kinds
+    ^ row[str]
+    ["role" "sample" "view"]
+  + card_kind
+    \ node=playground/node
+    ^ str
+    ? ((eq node.kind "slot") || (eq node.kind "role") || (eq node.kind "sample")) node.kind
+    "view"
+  + card_label
+    \ kind=str
+    ^ str
+    ? (eq kind "view") "View / pane" kind
+  + containers
+    ^ row[str]
+    ["view" "group" "row" "col" "or" "opt"]
+  + node_at
+    \ draft=playground/draft id=nat
+    ^ maybe[playground/node]
+    = found (draft.nodes.keep((\ node (eq node.id id))))
+    ? (eq found.len 1) (./some found.at(0)) .none
+  + edges_at
+    \ draft=playground/draft id=nat port=str
+    ^ row[playground/edge]
+    | draft.edges.keep((\ edge (and (eq edge.source id) (eq edge.port port))))
+  + reference
+    \ draft=playground/draft id=nat port=str
+    ^ maybe[playground/node]
+    = edges (playground/edges_at draft id port)
+    ? !(eq edges.len 1) .none
+    | playground/node_at draft edges.at(0).target
+  + component
+    \ node=playground/node
+    ^ bool
+    = kinds=row[str] ["slot" "role" "sample" "view"]
+    | !(kinds.has(node.kind))
+  + valid_name
+    \ text=str
+    ^ bool
+    ? ((eq text.len 0) || (gt text.len 64)) .false
+    = letters=str "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+      allowed (str/cat_all [letters "0123456789"])
+    ? !(maybe/is_some (str/find text.slice(0 1) letters)) .false
+    | (row/range 0 text.len).all((\ i (maybe/is_some (str/find text.slice(i 1) allowed))))
+  + ports
+    \ node=playground/node
+    ^ row[str]
+    ? (eq node.kind "role") ["field"]
+    ? (eq node.kind "sample") ["on" "field"]
+    ? (eq node.kind "view") ["on" "for" "child"]
+    ? ((playground/containers).has(node.kind)) ["child"]
+    ? (eq node.kind "present") ["view"]
+    = leaves=row[str] ["show" "text" "path"]
+    ? (leaves.has(node.kind)) ["field"]
+    []
+  + reaches
+    \ draft=playground/draft from=nat target=nat budget=nat
+    ^ bool
+    ? (eq from target) .true
+    ? (eq budget 0) .false
+    | (playground/edges_at draft from "child").any
+      (\ edge (playground/reaches draft edge.target target budget.dec))
+  + compatible
+    \ draft=playground/draft source=nat port=str target=nat
+    ^ bool
+    ?> (./some a) (playground/node_at draft source) .false
+    ?> (./some b) (playground/node_at draft target) .false
+    ? !((playground/ports a).has(port)) .false
+    ? (eq port "child")
+      | (and (playground/component b) (and !(playground/reaches draft target source draft.nodes.len) !(draft.edges.any((\ edge (and (eq edge.port "child") (eq edge.target target)))))))
+    ? (eq port "on") (eq b.kind "role")
+    ? (eq port "view") (eq b.kind "view")
+    | eq b.kind "slot"
+  + admissible
+    \ draft=playground/draft source=nat port=str target=nat
+    ^ bool
+    ? !(playground/compatible draft source port target) .false
+    ?> (./some owner) (playground/node_at draft source) .false
+    = prior (playground/edges_at draft source port)
+    ? (prior.any((\ edge (eq edge.target target)))) .false
+    ? (and (eq port "field") (playground/component owner)) (eq prior.len 0)
+    ? ((eq port "child") || (eq port "field")) .true
+    | eq prior.len 0
+  + quote
+    \ text=str
+    ^ str
+    = mark (str/from_atom 34)
+    | str/cat_all [mark (str/join (str/cat_all [mark mark]) (str/split_byte 34 text)) mark]
+  + lines
+    \ values=row[str]
+    ^ str
+    | str/join (str/from_atom 10) values
+  + body
+    \ draft=playground/draft node=playground/node depth=nat
+    ^ either[str str]
+    < source (playground/raw_body draft node depth)
+    ? (eq node.kind "view") (./ok source)
+    | ./ok (str/cat_all [(str/from_atom 10) "    " source])
+  + raw_body
+    \ draft=playground/draft node=playground/node depth=nat
+    ^ either[str str]
+    ? (gt depth 64) (./err "Component nesting exceeds 64")
+    = field (playground/reference draft node.id "field")
+    = value=str
+        ? field
+         > (./some field) (str/cat_all ["record." field.name])
+        ? (eq node.kind "path") "record"
+        | playground/quote node.value
+      slot=str (? node.slot.len node.slot "/sys/slot/label")
+    ? ((playground/containers).has(node.kind))
+      = name=str (? (eq node.kind "view") "group" node.kind)
+        arguments=str
+          ? (eq node.kind "opt") (? node.value.len node.value "1")
+          ? node.slot.len (str/cat_all ["'" node.slot]) ""
+      ? (and (eq node.kind "opt") !((eq arguments "1") || (eq arguments "2"))) (./err "Optional rank must be 1 or 2")
+      % edges=row[playground/edge] (playground/edges_at draft node.id "child") out=row[str] []
+      ^ either[str str]
+      ? (eq edges.len 0)
+        | ./ok (str/cat_all [name "(" arguments ") { " (str/join " " out) " }"])
+      ?> (./some child) (playground/node_at draft edges.at(0).target) (./err "Missing child")
+      < source (playground/body draft child depth.inc)
+      | _ edges.drop(1) out.snoc(source)
+    ? (eq node.kind "present")
+      ?> (./some view) (playground/reference draft node.id "view") (./err "Connect present to a view")
+      = owners (draft.nodes.keep((\ owner (and (eq owner.kind "view") (playground/reaches draft owner.id node.id draft.nodes.len)))))
+      ? (and owners.len !(equal (playground/reference draft owners.at(0).id "on") (playground/reference draft view.id "on"))) (./err "Present requires a view for the same receiver role")
+      = selected (playground/reference draft view.id "for")
+        slot=str
+          ? selected
+           > (./some slot) (str/cat_all ["%/" slot.name])
+          | str/cat_all ["'" (? view.slot.len view.slot "/sys/slot/content")]
+      | ./ok (str/cat_all ["present(record, " slot ")"])
+    | ./ok (str/cat_all [node.kind "(" value ", '" slot ")"])
+  + declaration
+    \ draft=playground/draft node=playground/node
+    ^ either[str str]
+    ? (playground/component node) (./ok "")
+    ? !(playground/valid_name node.name) (./err "Use a Grove identifier for the declaration name")
+    = head (str/cat_all [node.name " ="])
+    ? (eq node.kind "slot") (./ok (playground/lines [head "  @slot"]))
+    ? (eq node.kind "role")
+      % edges=row[playground/edge] (playground/edges_at draft node.id "field") out=row[str] [head "  @role"]
+      ^ either[str str]
+      ? (eq edges.len 0) (./ok (playground/lines out))
+      ?> (./some slot) (playground/node_at draft edges.at(0).target) (./err "Missing field slot")
+      | _ edges.drop(1) out.snoc((str/cat_all ["  %/" slot.name ": text"]))
+    ? (eq node.kind "view")
+      ?> (./some role) (playground/reference draft node.id "on") (./err "Connect the view to its receiver role")
+      < body (playground/body draft node 0)
+      = selected (playground/reference draft node.id "for")
+        slot=str
+          ? selected
+           > (./some slot) (str/cat_all ["%/" slot.name])
+          ? node.slot.len node.slot "/sys/slot/content"
+      | ./ok (playground/lines [head "  @view" (str/cat_all ["  #on ; %/" role.name])
+          (str/cat_all ["  #for ; " slot]) (str/cat_all ["  record => " body])])
+    | playground/sample_source draft node
+  + sample_source
+    \ draft=playground/draft node=playground/node
+    ^ either[str str]
+    ?> (./some role) (playground/reference draft node.id "on") (./err "Connect sample data to its role")
+    = fields (playground/edges_at draft role.id "field")
+    ? !((playground/edges_at draft node.id "field").all((\ value (fields.any((\ field (eq field.target value.target))))))) (./err "Sample field is not declared by its role")
+    % edges=row[playground/edge] (playground/edges_at draft role.id "field")
+      out=row[str] [(str/cat_all [(playground/quote (str/cat_all ["/" node.name])) " ="]) "  @tree"]
+    ^ either[str str]
+    ? (eq edges.len 0) (./ok (playground/lines out))
+    ?> (./some slot) (playground/node_at draft edges.at(0).target) (./err "Missing sample slot")
+    = values ((playground/edges_at draft node.id "field").keep((\ edge (eq edge.target slot.id))))
+      value (? values.len values.at(0).value node.value)
+    | _ edges.drop(1) out.snoc((str/cat_all ["  %/" slot.name ": " (playground/quote value)]))
+  + annotated_declaration
+    \ draft=playground/draft node=playground/node
+    ^ either[str str]
+    ? (playground/declaration draft node)
+     > (./ok source) (./ok source)
+     > (./err why) (./err (str/cat_all ["Node " (nat/show node.id) ": " why]))
+  + source
+    \ draft=playground/draft
+    ^ either[str str]
+    % nodes=row[playground/node] draft.nodes out=row[str] ["#import text=lib/grove/types/text"] names=row[str] []
+    ^ either[str str]
+    ? (eq nodes.len 0) (./ok (str/join (str/from_atom 2570) out))
+    = node nodes.at(0)
+    ? (and (!(playground/component node)) (names.has(node.name))) (./err (str/cat_all ["Node " (nat/show node.id) ": Duplicate declaration name"]))
+    < text (playground/annotated_declaration draft node)
+    | _ nodes.drop(1) (? text.len out.snoc((str/cat_all ["' node " (nat/show node.id) (str/from_atom 2570) text])) out) (? (playground/component node) names names.snoc(node.name))
+  + initial
+    ^ playground/draft
+    | playground/draft 10 1
+      [(playground/node 1 "slot" "lede" "" "")
+       (playground/node 2 "role" "record" "" "")
+       (playground/node 3 "sample" "example" "Hello from the Grove playground" "")
+       (playground/node 4 "view" "summary" "" "/sys/slot/content")
+       (playground/node 5 "show" "title" "" "/sys/slot/title")]
+      [(playground/edge 6 2 "field" 1 "") (playground/edge 7 3 "on" 2 "")
+       (playground/edge 8 4 "on" 2 "") (playground/edge 9 4 "child" 5 "")
+       (playground/edge 10 5 "field" 1 "")]
+      [(playground/positive_placement 1 40 40) (playground/positive_placement 2 340 40)
+       (playground/positive_placement 3 40 300) (playground/positive_placement 4 640 40)
+       (playground/positive_placement 5 640 300)] [] []
+  + field
+    \ key=str value=json
+    ^ str
+    | goo_patch/text (goo_patch/field key value)
+  + id
+    \ key=str value=json
+    ^ nat
+    = raw (goo_patch/field key value)
+    ? raw
+     > (json/num neg n) (? neg 0 n)
+    | (nat/parse (goo_patch/text raw)).fall(0)
+  + target
+    \ draft=playground/draft value=json
+    ^ maybe[nat]
+    = id (playground/id "node" value) kind (playground/field "kind" value)
+    ? !((eq kind "node") || (eq kind "port")) .none
+    < node (playground/node_at draft id)
+    = life (str/cat_all ["node:" (nat/show id)])
+    ? !(eq life (playground/field (? (eq (playground/field "kind" value) "port") "nodeLifetime" "lifetime") value)) .none
+    ? (eq (playground/field "kind" value) "port")
+      = port (playground/field "port" value)
+      ? !(eq (playground/field "lifetime" value) (str/cat_all [life ":" port])) .none
+      ? !((eq port "ref") || ((playground/ports node).has(port))) .none
+      | ./some id
+    | ./some id
+  + edit_error
+    \ result=either[str playground/draft]
+    ^ str
+    ? result
+     > (./err why) why
+     > (./ok _) ""
+  + apply
+    \ draft=playground/draft args=json
+    ^ either[str playground/draft]
+    = kind (playground/field "kind" args)
+      id (playground/id "id" args)
+    ? (eq kind "create-from-port") (playground/create_from draft args)
+    ? (eq kind "create")
+      = tag (playground/field "tag" args) name (playground/field "name" args)
+        next draft.serial.inc
+      ? !((playground/kinds).has(tag)) (./err "Unknown declaration or component")
+      ? (gt name.len 64) (./err "Name exceeds its size bound")
+      ? (ge draft.nodes.len 128) (./err "This playground is limited to 128 nodes")
+      = node (playground/node next tag (? name.len name (str/cat_all [tag (nat/show next)])) "" "/sys/slot/label")
+      | ./ok draft.set_serial(next).set_nodes(draft.nodes.snoc(node)).set_revision(draft.revision.inc).set_places(draft.places.snoc((playground/positive_placement next (add 40 (mul (mod next 4) 300)) (add 40 (mul (div next 4) 230)))))
+    ? (eq kind "update")
+      ?> (./some node) (playground/node_at draft id) (./err "Node no longer exists")
+      = name (playground/field "name" args) value (playground/field "value" args) slot (playground/field "slot" args)
+      ? ((gt value.len 8192) || (gt name.len 64) || (gt slot.len 512)) (./err "Property exceeds its size bound")
+      ? (and (slot.len) !(maybe/is_some (path_parse slot))) (./err "Presentation slot must be an absolute path")
+      = node node.set_name(name).set_value(value).set_slot(slot)
+      | ./ok draft.set_revision(draft.revision.inc).set_nodes(draft.nodes.map((\ old (? (eq old.id id) node old))))
+    ? (eq kind "delete")
+      ? (draft.edges.any((\ edge ((eq edge.source id) || (eq edge.target id))))) (./err "Disconnect this node before deleting it")
+      ?> (./some node) (playground/node_at draft id) (./err "Node no longer exists")
+      | ./ok draft.set_revision(draft.revision.inc).set_nodes(draft.nodes.keep((\ node !(eq node.id id)))).set_places(draft.places.keep((\ place !(eq place.id id)))).set_collapsed(draft.collapsed.keep((\ old !(eq old id))))
+    ? (eq kind "visibility")
+      = tag (playground/field "tag" args) value (playground/field "value" args)
+      ? !((eq tag "*") || (playground/card_kinds).has(tag)) (./err "Unknown card kind")
+      ? !((eq value "show") || (eq value "hide")) (./err "Visibility must be show or hide")
+      = hidden=row[str]
+          ? (eq tag "*") (? (eq value "show") [] playground/card_kinds)
+          ? (eq value "show") (draft.hidden_kinds.keep((\ old !(eq old tag))))
+          ? (draft.hidden_kinds.has(tag)) draft.hidden_kinds
+          | draft.hidden_kinds.snoc(tag)
+      | ./ok draft.set_hidden_kinds(hidden)
+    ? (eq kind "collapse")
+      ?> (./some node) (playground/node_at draft id) (./err "View no longer exists")
+      ? !(eq node.kind "view") (./err "Only view components can be collapsed")
+      | ./ok draft.set_collapsed((? (draft.collapsed.has(id)) (draft.collapsed.keep((\ old !(eq old id)))) draft.collapsed.snoc(id)))
+    ? (eq kind "move-nodes")
+      = changes (goo_patch/items (goo_patch/field "nodes" args))
+      ? ((eq changes.len 0) || (gt changes.len draft.nodes.len)) (./err "Invalid move population")
+      % changes=row[json] changes places=row[playground/placement] draft.places seen=row[nat] []
+      ^ either[str playground/draft]
+      ? (eq changes.len 0) (./ok draft.set_places(places))
+      = change changes.at(0)
+      ?> (./some id) (playground/target draft (goo_patch/field "target" change)) (./err "Move target retired")
+      ? (seen.has(id)) (./err "Duplicate move target")
+      = old (places.keep((\ place (eq place.id id))))
+        base (goo_patch/field "baseOrigin" change) point (goo_patch/field "proposedOrigin" change)
+      ? !(eq old.len 1) (./err "Missing placement")
+      ?> (./some bx) (playground/coordinate (goo_patch/field "x" base)) (./err "Invalid base x coordinate")
+      ?> (./some by) (playground/coordinate (goo_patch/field "y" base)) (./err "Invalid base y coordinate")
+      ? !(and (eq old.at(0).bx bx) (eq old.at(0).by by)) (./err "Placement changed during movement")
+      ?> (./some x) (playground/coordinate (goo_patch/field "x" point)) (./err "Invalid x coordinate")
+      ?> (./some y) (playground/coordinate (goo_patch/field "y" point)) (./err "Invalid y coordinate")
+      | _ changes.drop(1) (places.map((\ place (? (eq place.id id) (playground/placement id x y) place)))) seen.snoc(id)
+    ? ((eq kind "connect") || (eq kind "link"))
+      = from (goo_patch/field "from" args) to (goo_patch/field "to" args)
+        source=maybe[nat] (? (eq kind "link") (./some (playground/id "source" args)) (playground/target draft from))
+        target=maybe[nat] (? (eq kind "link") (./some (playground/id "target" args)) (playground/target draft to))
+        port (? (eq kind "link") (playground/field "port" args) (playground/field "port" from))
+      ?> (./some source) source (./err "Source occurrence retired")
+      ?> (./some target) target (./err "Target occurrence retired")
+      ? (and (eq kind "connect") !(eq (playground/field "port" to) "ref")) (./err "Connect to the reference port")
+      ? !(playground/admissible draft source port target) (./err "Incompatible, duplicate, or occupied relationship")
+      = next draft.serial.inc
+      | ./ok draft.set_serial(next).set_revision(draft.revision.inc).set_edges(draft.edges.snoc((playground/edge next source port target (playground/field "value" args))))
+    = connection (goo_patch/field "connection" args)
+      id (? id id (playground/id "connection" connection))
+      matches (draft.edges.keep((\ edge (eq edge.id id))))
+    ? !(eq matches.len 1) (./err "Relationship no longer exists")
+    = edge matches.at(0)
+      remaining draft.set_edges(draft.edges.keep((\ old !(eq old.id id))))
+    ? !(equal connection jnull)
+      ? !(eq (playground/field "lifetime" connection) (str/cat_all ["edge:" (nat/show id)])) (./err "Connection occurrence retired")
+      ? !(eq (playground/field "topologyRef" args) (str/cat_all ["edge:" (nat/show id) ":" (nat/show edge.source) ":" (nat/show edge.target)])) (./err "Connection topology changed")
+      | playground/edit_edge draft remaining edge args
+    | playground/edit_edge draft remaining edge args
+  + edit_edge
+    \ draft=playground/draft remaining=playground/draft edge=playground/edge args=json
+    ^ either[str playground/draft]
+    = kind (playground/field "kind" args)
+    ? (eq kind "disconnect") (./ok remaining.set_revision(draft.revision.inc))
+    ? (eq kind "edge-value")
+      ? (gt (playground/field "value" args).len 8192) (./err "Field value exceeds its size bound")
+      | ./ok draft.set_revision(draft.revision.inc).set_edges(draft.edges.map((\ old (? (eq old.id edge.id) edge.set_value((playground/field "value" args)) old))))
+    ? (eq kind "reorder")
+      ? !(eq edge.port "child") (./err "Only component children have display order")
+      = index (playground/id "index" args)
+        related (playground/edges_at remaining edge.source edge.port)
+      ? (gt index related.len) (./err "Order is outside the child list")
+      = others (remaining.edges.keep((\ old !(and (eq old.source edge.source) (eq old.port edge.port)))))
+      | ./ok remaining.set_revision(draft.revision.inc).set_edges(others.weld(related.take(index)).snoc(edge).weld(related.drop(index)))
+    ? !(eq kind "reconnect") (./err "Unknown operation")
+    = to (goo_patch/field "to" args) endpoint (playground/field "endpoint" args)
+    ?> (./some node) (playground/target draft to) (./err "Reconnect target retired")
+    ? !((eq endpoint "from") || (eq endpoint "to")) (./err "Unknown endpoint")
+    = source (? (eq endpoint "from") node edge.source)
+      port (? (eq endpoint "from") (playground/field "port" to) edge.port)
+      target (? (eq endpoint "to") node edge.target)
+    ? (and (eq endpoint "to") !(eq (playground/field "port" to) "ref")) (./err "Connect to the reference port")
+    ? !(playground/admissible remaining source port target) (./err "Incompatible or occupied reconnection")
+    = updated edge.set_source(source).set_port(port).set_target(target)
+    | ./ok draft.set_revision(draft.revision.inc).set_edges(draft.edges.map((\ old (? (eq old.id edge.id) updated old))))
+  + coordinate
+    \ value=json
+    ^ maybe[nat]
+    < ratio (goo_number/ratio (show value))
+    ? (gt ratio.numerator (mul 100000 ratio.denominator)) .none
+    = result (goo_number/round ratio.numerator ratio.denominator)
+    ? (gt result 100000) .none
+    | ./some (? ratio.negative (sub 100000 result) (add 100000 result))
+  + choices
+    \ port=str
+    ^ row[str]
+    ? (eq port "on") ["role"]
+    ? ((eq port "field") || (eq port "for")) ["slot"]
+    ? (eq port "view") ["view"]
+    ? (eq port "child") ["group" "row" "col" "or" "opt" "show" "text" "path" "present"]
+    []
+  + creatable
+    \ draft=playground/draft source=nat port=str kind=str
+    ^ bool
+    ? (ge draft.nodes.len 128) .false
+    = next draft.serial.inc
+      node (playground/node next kind "candidate" "" "")
+    | playground/admissible draft.set_nodes(draft.nodes.snoc(node)) source port next
+  + choice_ref
+    \ draft=playground/draft source=nat port=str kind=str
+    ^ str
+    | str/join ":" [(nat/show draft.revision) (nat/show source) port kind]
+  + create_from
+    \ draft=playground/draft args=json
+    ^ either[str playground/draft]
+    = from (goo_patch/field "from" args) port (playground/field "port" from)
+    ?> (./some source) (playground/target draft from) (./err "Creation source retired")
+    = choices ((playground/choices port).keep((\ kind (eq (playground/choice_ref draft source port kind) (playground/field "choiceRef" args)))))
+    ? !(eq choices.len 1) (./err "Creation choice expired")
+    = next draft.serial.inc kind choices.at(0)
+      node (playground/node next kind (str/cat_all [kind (nat/show next)]) "" "/sys/slot/label")
+      grown draft.set_serial(next).set_nodes(draft.nodes.snoc(node))
+    ? (ge draft.nodes.len 128) (./err "This playground is limited to 128 nodes")
+    ? !(playground/admissible grown source port next) (./err "Creation is no longer compatible")
+    = point (goo_patch/field "worldPoint" args)
+    ?> (./some x) (playground/coordinate (goo_patch/field "x" point)) (./err "Invalid placement")
+    ?> (./some y) (playground/coordinate (goo_patch/field "y" point)) (./err "Invalid placement")
+    | ./ok grown.set_serial(next.inc).set_revision(draft.revision.inc).set_edges(draft.edges.snoc((playground/edge next.inc source port next ""))).set_places(draft.places.snoc((playground/placement next x y)))

@@ -1008,8 +1008,9 @@ nested definition before elaboration. Imported artifacts retain their defining
 moments, independently of source mount spelling.
 
 Every nominal definition has a navigable `/sys/mold` record. Compiler bundles
-and source-free exports live at the canonical publisher-owned paths returned by
-`publisher_vocabulary/grove/*`. Native compiler artifacts preserve the prepared
+and source-free exports use the shared `/sys/grove/*` slot keys returned by
+`system_vocabulary/grove/*`. The documented slot catalog and generation rules
+are in [slots/README.md](slots/README.md). Native compiler artifacts preserve the prepared
 plan and expected cases. `publish` checks and commits the complete batch through
 the namespace journal. Compiler artifacts, Grove bundles and templates are
 version three; stale products require rebuilding.
@@ -1039,7 +1040,7 @@ instance creation are separate; SRS definitions publish under `/<self>/gov/srs`.
 Generated `run` checks the argument/receiver/result types. `apply` accepts
 an argument myth and receiver myth, decodes through type and role codecs,
 and returns `maybe[myth]`; invalid input or output is `.none`. Metadata at
-`publisher_vocabulary/grove/action` stores the receiver path and argument schema. Nothing
+`system_vocabulary/grove/action` stores the receiver path and argument schema. Nothing
 is installed in the live namespace or `/sys/op`. Stored bundles support
 source-free action imports. SRS now compiles through `finish` (six decls);
 full compilation includes the tree declarations. Run
@@ -1051,7 +1052,7 @@ full compilation includes the tree declarations. Run
 `grove_norms.foil` runs before actions and roles. Each `@norm` has one
 `#here` quoted path pattern, `#with` roles, and inline role constraints.
 It exports an `axal[myth]` alias, an `item` role module, `check`, `validate`,
-and a descriptive `soma` spec. `publisher_vocabulary/grove/norm` stores segment and item
+and a descriptive `soma` spec. `system_vocabulary/grove/norm` stores segment and item
 schemas. Literal path segments use the native path codec; captures use
 `[name=@aura]`, with `@tas` mapped to `ts`. Validation checks every occupied
 record, permitting empty myths only at matching strict prefixes. Empty
@@ -1067,7 +1068,7 @@ Use `@sewn`, not the former typo `@dyed`. `grove_sewn.foil` lowers an
 explicit `get` body with one `#from` and one `#to` norm. Its module exports
 unchecked `get`/`run` and checked `apply : axal[myth] -> maybe[axal[myth]]`.
 `apply` validates the input, invokes the implementation, and validates the
-output. `publisher_vocabulary/grove/sewn` stores both norm paths and their
+output. `system_vocabulary/grove/sewn` stores both norm paths and their
 compiled schemas (`source_schema`/`target_schema`), from the same norm modules
 used by `apply`. Request-local adapters project through that pinned metadata,
 not the latest norm declaration at an endpoint path. Older compiled sewn
@@ -1079,7 +1080,7 @@ External norms and sewn modules import through stored compiler bundles. Run
 ### Grove templates and instance installation
 
 `grove_trees.foil` lowers cord-named `@tree` declarations into relative
-seeds in a versioned `grove_template`, stored at `publisher_vocabulary/grove/template` on
+seeds in a versioned `grove_template`, stored at `system_vocabulary/grove/template` on
 the published source root. Named declarations remain individual records
 under that source root. Definition names and instance paths are separate
 namespaces. The compiler validates all seed norms before publication.
@@ -1093,7 +1094,7 @@ behavior. Live instance records carry no module bundles.
 
 `grove_install/instantiate source version target state` resolves the
 published template, checks its version and the previewed source x case,
-and mounts at the target atomically through Pact. `publisher_vocabulary/grove/source`
+and mounts at the target atomically through Pact. `system_vocabulary/grove/source`
 on the instance root records the source version. Existing targets and
 missing referenced code/input reject. The source template stays unchanged
 and can be instantiated repeatedly. `grove_install/mount` is the lower

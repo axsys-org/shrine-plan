@@ -1,0 +1,128 @@
+- goo_app/read
+- goo_app/rules
+
++ goo_pass
+  + rank_max
+    \ a=goo/rank b=goo/rank
+    ^ goo/rank
+    ? (gt a.to_nat b.to_nat) a b
+  + core_attrs
+    \ rank=goo/rank attrs=goo/source_attrs
+    ^ goo/core_attrs
+    = c attrs.common
+    | goo/core_attrs (goo/common c.slot (goo_pass/rank_max rank c.optional) c.config c.origin)
+  + normalize_nodes
+    \ rank=goo/rank tree=goo/source
+    ^ list[goo/core]
+    = attrs (goo_pass/core_attrs rank tree.attrs)
+    ? tree
+     > (./text _ text) (list/one[goo/core] (goo/core/text attrs text))
+     > (./image _ url) (list/one[goo/core] (goo/core/image attrs url))
+     > (./jet _ primitive) (list/one[goo/core] (goo/core/jet attrs primitive))
+     > (./opt _ r kids) (kids.bind((goo_pass/normalize_nodes (goo_pass/rank_max rank r))))
+     > (./group _ kids) (list/one[goo/core] (goo/core/flow attrs (goo/direction/row) (goo_pass/core_children kids)))
+     > (./flow _ direction kids) (list/one[goo/core] (goo/core/flow attrs direction (goo_pass/core_children kids)))
+  + core_children
+    \ kids=list[goo/source]
+    ^ list[goo/core]
+    | kids.bind((goo_pass/normalize_nodes (goo/rank/required)))
+  + normalize
+    \ tree=goo/source
+    ^ either[goo_result/diagnostic goo/core]
+    = nodes (goo_pass/normalize_nodes (goo/rank/required) tree)
+    ? (eq nodes.len 1) (./ok nodes.at(0))
+    | ./err (goo_result/diagnostic (goo_result/severity/error) tree.attrs.common.origin "expected exactly one normalized UI root")
+  + count
+    \ tree=goo/core
+    ^ nat
+    | list/fold[goo/core nat] 1 (\ n child (add n (goo_pass/count child))) tree.children
+  + assigned
+    : tree=goo/normalized next=nat remaining=list[goo/node_id]
+  + assign
+    \ tree=goo/core ids=list[goo/node_id] index=nat
+    ^ goo_pass/assigned
+    | goo_pass/assign_next tree ids.drop(index) index
+  + assign_next
+    ' Consume UUIDs in preorder, before visibility pruning.
+    \ tree=goo/core ids=list[goo/node_id] index=nat
+    ^ goo_pass/assigned
+    = attrs (goo/normalized_attrs tree.attrs.common ids.head)
+    ? tree
+     > (./text _ text) (goo_pass/assigned (goo/normalized/text attrs text) index.inc ids.tail)
+     > (./image _ url) (goo_pass/assigned (goo/normalized/image attrs url) index.inc ids.tail)
+     > (./jet _ primitive) (goo_pass/assigned (goo/normalized/jet attrs primitive) index.inc ids.tail)
+     > (./flow _ direction kids)
+      % rest=list[goo/core] kids next=nat index.inc out=list[goo/normalized] .nil remaining=list[goo/node_id] ids.tail
+      ^ goo_pass/assigned
+      ? rest.is_nil (goo_pass/assigned (goo/normalized/flow attrs direction out.reverse) next remaining)
+      = result (goo_pass/assign_next rest.head remaining next)
+      | _ rest.tail result.next out.cons(result.tree) result.remaining
+  + options
+    \ context=goo/compile_context
+    ^ goo/render_options
+    = path context.view_path.display
+      rank=goo/rank
+        ? ((eq path "/sys/slots/scar") || (eq path "/sys/slots/label")) (goo/rank/required)
+        ? (eq path "/sys/slots/summary") (goo/rank/compact)
+        (goo/rank/full)
+    | goo/render_options rank .nil .nil .false
+  + resolve
+    \ tree=goo/normalized path=list[nat]
+    ^ maybe[goo/node_id]
+    ? (eq path.len 0) (./some tree.node_id)
+    ? (ge path.at(0) tree.children.len) .none
+    | goo_pass/resolve tree.children.at(path.at(0)) path.drop(1)
+  + visibility
+    \ opts=goo/render_options tree=goo/normalized
+    ^ maybe[goo/visible]
+    = hidden opts.hidden_ids.weld((list/sift[list[nat] goo/node_id] (goo_pass/resolve tree) opts.hidden_paths))
+    | goo_pass/visible opts.optional_budget hidden tree
+  + visible
+    \ budget=goo/rank hidden=list[goo/node_id] tree=goo/normalized
+    ^ maybe[goo/visible]
+    ? (gt tree.attrs.common.optional.to_nat budget.to_nat) .none
+    ? (list/any[goo/node_id] (\ id (equal[goo/node_id] id tree.node_id)) hidden) .none
+    = attrs (goo/visible_attrs tree.attrs.common tree.node_id)
+    ? tree
+     > (./text _ text) (./some (goo/visible/text attrs text))
+     > (./image _ url) (./some (goo/visible/image attrs url))
+     > (./jet _ primitive) (./some (goo/visible/jet attrs primitive))
+     > (./flow _ direction kids)
+      = children (list/sift[goo/normalized goo/visible] (goo_pass/visible budget hidden) kids)
+      ? (eq children.len 0) .none
+      | ./some (goo/visible/flow attrs direction children)
+  + edge
+    \ uniform=bool parent=goo/visible left=goo/visible right=goo/visible
+    ^ goo/edge
+    = match (goo_rules/find left.attrs.common.slot right.attrs.common.slot)
+      rule=maybe[nat]
+        ? match
+         > ./none .none
+         > (./some r) (./some r.number)
+      bind=goo/affinity
+        ? uniform (goo/affinity/normal)
+        ? match
+         > ./none (goo/affinity/normal)
+         > (./some r) r.bind
+      source=goo/edge_source
+        ? uniform (goo/edge_source/uniform)
+        ? match
+         > ./none (goo/edge_source/fallback)
+         > (./some _) (goo/edge_source/exact)
+    | goo/edge left.attrs.common.slot right.attrs.common.slot left.node_id right.node_id bind rule source parent.node_id parent.attrs.common.slot
+  + adjacency
+    \ uniform=bool after=maybe[goo/edge] tree=goo/visible
+    ^ goo/semantic
+    = attrs (goo/semantic_attrs tree.attrs.common tree.node_id after)
+    ? tree
+     > (./text _ text) (goo/semantic/text attrs text)
+     > (./image _ url) (goo/semantic/image attrs url)
+     > (./jet _ primitive) (goo/semantic/jet attrs primitive)
+     > (./flow _ direction kids)
+      % rest=list[goo/visible] kids out=list[goo/semantic] .nil
+      ^ goo/semantic
+      ? rest.is_nil (goo/semantic/flow attrs direction out.reverse)
+      = next=maybe[goo/edge]
+          ? rest.tail.is_nil .none
+          | ./some (goo_pass/edge uniform tree rest.head rest.tail.head)
+      | _ rest.tail out.cons((goo_pass/adjacency uniform next rest.head))

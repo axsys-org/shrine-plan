@@ -1,5 +1,8 @@
 # Shrine extras
 
+For a worked example, read [Making a Grove and Goo mount](tutorials/grove-goo-mount.md).
+Its runnable `hello-grove` mount includes a notes list, reader, and editor.
+
 Optional applications shipped in the core repository. Each directory under
 `extras/mounts/` is a flat source bag. From the repository root, `x/eden` reads
 these live sources by default:
@@ -68,11 +71,20 @@ From the repository root, enter core's Nix shell (or set `WISP`) for Foil checks
 extras/x/check
 extras/x/check --contracts-only
 extras/x/check --mount life --mount codex
+extras/x/check-goo
 extras/x/check-rescan
 extras/x/hyp --check
 python3 extras/mounts/codex/codex_bridge_tests.py
 nix develop path:./extras#debugger --command python3 extras/mounts/debugger/check-debugger.py
 ```
+
+`extras/x/check-goo` is the production compatibility suite, also run by CI.
+It builds the locked Mash Nix artifact and validates native contracts, prepared
+geometry, and a disposable real Eden instance in Chromium. The application gate
+uses production asset hooks and a test-only panes fixture. `goo-inspector` is the
+only deployed Goo view consumer; SRS and Grove-dev retain domain/development
+behavior without Goo views. See the
+[application integration guide](mounts/explorer/APPLICATION-INTEGRATION.md).
 
 The extras test runner assembles a disposable test fixture tree from core and the
 flat descriptors. That compatibility layout exists only inside the test worker.

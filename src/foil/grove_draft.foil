@@ -1,0 +1,112 @@
+- system_vocabulary
+- helm
+- grove_backend
+
+' Namespace source adapter. Registered hosts own destinations and compiler context.
+' Draft records contain descriptions, never compiler capabilities.
++ grove_draft
+  + job
+    : source=str revision=nat attempted=nat ready=nat request=nat published=nat
+      message=str line=nat
+  + registration
+    : draft=path job_slot=path preview_source=path preview_target=path
+      public_source=path public_target=path prelude=str
+  + ports
+    : compile={\ path str str namespace}either[grove_backend/diagnostic namespace]
+  + parse
+    \ source=str
+    ^ either[grove_backend/diagnostic grove/document]
+    ? (grove/parse source)
+     > (./ok document) (./ok document)
+     > (./err why)
+      ? why
+       > (grove/error/syntax span message)
+        | ./err (grove_backend/diagnostic span message .none)
+       > (grove/error/parser cause)
+        | ./err (grove_backend/diagnostic rex/zero_span "Invalid generated Grove source" (./some cause))
+  + validate_views
+    ' Normal publications may retain diagnostic views for inspection. A runnable
+    ' draft preview requires every published recipe to have lowered successfully.
+    \ records=row[[path myth]]
+    ^ either[grove_backend/diagnostic row[[path myth]]]
+    % rest=row[[path myth]] records
+    ^ either[grove_backend/diagnostic row[[path myth]]]
+    ? (eq rest.len 0) (./ok records)
+    = [name card] rest.at(0)
+    ?> (./some held) card.get(system_vocabulary/grove/view) (_ rest.drop(1))
+    ?> published=goo/published held (./err (grove_backend/diagnostic rex/zero_span "Invalid draft view publication" .none))
+    ? published.result
+     > (./ok view) (_ rest.drop(1))
+     > (./err why)
+      ? why
+       > (grove/error/syntax span message) (./err (grove_backend/diagnostic span message .none))
+       > (grove/error/parser cause) (./err (grove_backend/diagnostic rex/zero_span "Invalid draft view" (./some cause)))
+  + slot
+    ^ path
+    system_vocabulary/grove/draft
+  + registry
+    \ self=iota
+    ^ path
+    [self 'weft 'grove_drafts]
+  + write
+    \ target=path card=myth state=namespace
+    ^ namespace
+    = command (? (maybe/is_some (sovereign_peek target state).fil) (writ/poke card) (writ/make card))
+      [next index reply] (helm/supervisor/handle
+        (helm/card/step target command) state (sovereign_hive state))
+    ?> (./ack failure) reply (Seq[namespace] (error (pails/t "Draft write returned no acknowledgement")) state)
+    ? failure
+     > (./some why) (Seq[namespace] (error why) state)
+    next
+  + install
+    \ source=path target=path state=namespace
+    ^ either[grove_backend/diagnostic namespace]
+    = version (state.case(.x source)).fall(0)
+      result (grove_install/replace source version target (state.case(.z target)) state)
+    ? result
+     > (./ok next) (./ok next)
+     > (./err why) (./err (grove_backend/diagnostic rex/zero_span "Draft installation failed" (./some why)))
+  + reconcile_one
+    \ ports=grove_draft/ports registration=grove_draft/registration state=namespace
+    ^ namespace
+    = card (sovereign_peek registration.draft state).fil.fall(myth/new)
+    ?> (./some held) card.get(registration.job_slot) state
+    ?> job=grove_draft/job held state
+    = publishing (and (eq job.request job.revision) (and (eq job.ready job.revision) (gt job.request job.published)))
+      building (gt job.revision job.attempted)
+    ? !(building || publishing) state
+    = source (? building registration.preview_source registration.public_source)
+      target (? building registration.preview_target registration.public_target)
+      compile ports.compile
+      result=either[grove_backend/diagnostic namespace]
+        < next (compile source job.source registration.prelude state)
+        | grove_draft/install source target next
+    ? result
+     > (./err why)
+      = failed job.set_attempted(job.revision).set_request(0).set_message(why.message).set_line(why.span.line)
+      | grove_draft/write registration.draft (myth/sing registration.job_slot failed) state
+     > (./ok next)
+      = done
+          ? building job.set_attempted(job.revision).set_ready(job.revision).set_message("Preview ready").set_line(0)
+          | job.set_published(job.revision).set_message("Published").set_line(0)
+      | grove_draft/write registration.draft (myth/sing registration.job_slot done) next
+  + reconcile
+    \ ports=grove_draft/ports state=namespace
+    ^ namespace
+    = registrations (sovereign_care .y (grove_draft/registry state.self) state).kid_tap
+    | registrations.fold state
+      \ state [key node]
+      ?> (./some held) node.fil.fall(myth/new).get(grove_draft/slot) state
+      ?> registration=grove_draft/registration held state
+      | grove_draft/reconcile_one ports registration state
+  + handle
+    \ ports=grove_draft/ports base=helm/supervisor/access[namespace] card=helm/card state=namespace index=hive
+    ^ [namespace hive feet/task[unit]]
+    = handle base.handle
+      [next index reply] (handle card state index)
+      changed (? (eq next.local.top state.local.top) next (grove_draft/reconcile ports next))
+    [changed (? (eq changed.local.top next.local.top) index (sovereign_hive changed)) reply]
+  + access
+    \ ports=grove_draft/ports base=helm/supervisor/access[namespace]
+    ^ helm/supervisor/access[namespace]
+    | base.set_handle((grove_draft/handle ports base))

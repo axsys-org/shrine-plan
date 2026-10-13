@@ -1,0 +1,86 @@
+- grove_dev
+- helm
+- testing
+- tests/grove_install [at=installer]
+- tests/grove_template [at=templates]
+- json
+
++ grove_dev_checks
+  + unwrap
+    \ prior=namespace result=either[iota namespace]
+    ^ namespace
+    ? result
+     > (./ok next) next
+     > (./err _) prior
+  + checks
+    \ ignored=unit
+    ^ row[testing/check]
+    = source=path [($x 17) 'gov 'demo]
+      root=path [($x 17) 'app 'demo]
+      home=path [($x 17) 'io 'fs ($ta "grove-dev")]
+      child root.snoc('old)
+      first_template (grove_template grove_templates/version
+        [[['old] (myth/sing ['value] (pails/n 1))]])
+      second_template (grove_template grove_templates/version
+        [[['new] (myth/sing ['value] (pails/n 2))]])
+      initial (installer/grove_install_checks/bootstrap [])
+      published (templates/grove_template_checks/seed source
+        (note/make (myth/sing grove_templates/slot first_template)) initial)
+      installed (grove_dev_checks/unwrap published (grove_install/instantiate source 1 root published))
+      changed (templates/grove_template_checks/seed source
+        (note/poke (myth/sing grove_templates/slot second_template)) installed)
+      expected (changed.case(.z root))
+      replaced (grove_dev_checks/unwrap changed (grove_install/replace source 2 root expected changed))
+      deleted (grove_dev_checks/unwrap replaced (grove_install/remove source root (replaced.case(.z root)) replaced))
+      reinstalled (grove_dev_checks/unwrap deleted (grove_install/instantiate source 2 root deleted))
+      unrelated (templates/grove_template_checks/seed [($x 17) 'app 'other]
+        (note/make (myth/sing ['value] (pails/n 9))) changed)
+      broken (templates/grove_template_checks/seed source
+        (note/poke (myth/sing grove_templates/slot second_template.set_version(999))) changed)
+      failure (grove_install/replace source 3 root expected broken)
+      kept (grove_dev_checks/unwrap broken failure)
+      manifest (show (json/obj
+        [(jkv "name" (json/str "demo"))
+         (jkv "grove" (json/arr [(json/obj
+           [(jkv "root" (json/arr [(json/str "gov") (json/str "demo")]))
+            (jkv "files" (json/arr [(json/str "demo.grove")]))])]))]))
+      metadata (myth/sing grove_dev/metadata_slot (pails/t manifest))
+      metadata metadata.put((grove_dev/slot 'ready) (pails/n 1)).put((grove_dev/slot 'epoch) (pails/n 1)).put(bond/epoch (pails/n 1))
+      mounted (templates/grove_template_checks/seed home (note/make metadata) changed)
+      broken_mounted (templates/grove_template_checks/seed home (note/make metadata) broken)
+      broken_query (grove_dev/request "replace" source root 3 expected child 1)
+      [rolled_back rollback_code rollback_body] (grove_dev/run broken_query broken_mounted)
+      edited (templates/grove_template_checks/seed child (note/poke (myth/sing ['value] (pails/n 99))) changed)
+      query (grove_dev/request "status" source root 2 expected child 1)
+      [read_state code body] (grove_dev/run query mounted)
+      [failed_state failed_code failed_body] (grove_dev/run query.set_operation("replace").set_version(1) mounted)
+    [(testing/nat "status serializes mounted names and provenance" 1 (gt body.len 100))
+     (testing/nat "API rolls back a failed install after candidate deletion" 1 (equal rolled_back broken_mounted))
+     (testing/nat "API reports failed install" 409 rollback_code)
+     (testing/nat "descendant edit invalidates replacement guard" 1 (templates/grove_template_checks/reason 'stale_instance
+       (grove_install/replace source 2 root expected edited)))
+     (testing/nat "replacement removes obsolete child" 0 (sovereign_peek child replaced).wyt)
+     (testing/nat "replacement installs new seed data" 2 (grove_dev/record root.snoc('new) replaced).nat_at(['value] 0))
+     (testing/nat "delete removes entire instance subtree" 0 (sovereign_peek root deleted).wyt)
+     (testing/nat "delete retains published template" 1 (grove_dev/record source deleted).has(grove_templates/slot))
+     (testing/nat "reinstall after deletion succeeds" 2 (grove_dev/record root.snoc('new) reinstalled).nat_at(['value] 0))
+     (testing/nat "stale instance rejected" 1 (templates/grove_template_checks/reason 'stale_instance
+       (grove_install/replace source 2 root .none changed)))
+     (testing/nat "stale template rejected" 1 (templates/grove_template_checks/reason 'stale_template
+       (grove_install/replace source 1 root expected changed)))
+     (testing/nat "foreign provenance rejected" 1 (templates/grove_template_checks/reason 'unrelated_instance
+       (grove_install/remove source [($x 17) 'app 'other] (unrelated.case(.z [($x 17) 'app 'other])) unrelated)))
+     (testing/nat "cannot delete app root" 1 (templates/grove_template_checks/reason 'invalid_instance_root
+       (grove_install/remove source [($x 17) 'app] (changed.case(.z [($x 17) 'app])) changed)))
+     (testing/nat "failed installation reports failure" 1 (templates/grove_template_checks/reason 'grove_template_version failure))
+     (testing/nat "failed installation retains instance and journal" 1 (equal kept broken))
+     (testing/nat "finds enclosing installation from child" 1 (equal root (grove_dev/enclosing child mounted)))
+     (testing/nat "discovers mounted Grove units" 1 (grove_dev/units mounted).len)
+     (testing/nat "status is read only" 1 (equal read_state mounted))
+     (testing/nat "status succeeds" 200 code)
+     (testing/nat "failed development operation preserves state" 1 (equal failed_state mounted))
+     (testing/nat "failed development operation is conflict" 409 failed_code)]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "Grove development lifecycle" grove_dev_checks/checks)]

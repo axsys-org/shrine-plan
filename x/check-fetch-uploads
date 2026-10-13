@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Validate real op-83 Fetch binary uploads against a loopback receiver.
+
+Usage: python3 x/check-fetch-uploads [--sizes 10 25 50 75 100]
+Sizes are decimal MB. Logs/results are retained under .check; payloads are removed.
+"""
+import argparse
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--sizes', type=int, nargs='+', default=[10, 25, 50, 75, 100])
+    parser.add_argument('--runtime', default=os.environ.get('WISP', str(root / 'wisp')))
+    args = parser.parse_args()
+    if any(size <= 0 for size in args.sizes):
+        parser.error('sizes must be positive')
+    runtime = str(Path(args.runtime).resolve())
+    (root / '.check').mkdir(exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix='fetch-uploads-', dir=root / '.check'))
+    shutil.copytree(root / 'src', work / 'src')
+    records = []
+
+    class Receiver(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            self.connection.settimeout(120)
+            start = time.monotonic()
+            remaining = int(self.headers['Content-Length'])
+            digest = hashlib.sha256()
+            count = 0
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                count += len(chunk)
+                remaining -= len(chunk)
+            record = dict(path=self.path, bytes=count, sha256=digest.hexdigest(),
+                          content_length=int(self.headers['Content-Length']),
+                          receive_seconds=round(time.monotonic() - start, 4))
+            records.append(record)
+            body = f"{count}:{digest.hexdigest()}".encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Receiver)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f'Runtime: {runtime}\nResults: {work}', flush=True)
+
+    def run(label, command, source='', cwd=work):
+        start = time.monotonic()
+        with (work / f'{label}.log').open('w') as log:
+            try:
+                result = subprocess.run(command, input=source, text=True, cwd=cwd,
+                                        stdout=log, stderr=log, timeout=180)
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                code = 'timeout'
+        return code, round(time.monotonic() - start, 4)
+
+    results = []
+    try:
+        code, _ = run('boot', [runtime, '--file-root', str(work / 'src'),
+                               str(work / 'src/plan'), 'reaver', 'main'])
+        if code != 0:
+            raise RuntimeError(f'boot failed ({code}); see {work}/boot.log')
+        for size in args.sizes:
+            n = size * 1_000_000
+            payload = work / 'src/upload.bin'
+            # Every byte value, including embedded NULs, plus explicit trailing NULs.
+            block = bytes(range(256)) * 4096
+            digest = hashlib.sha256()
+            with payload.open('wb') as out:
+                remaining = n - 16
+                while remaining:
+                    chunk = block[:min(remaining, len(block))]
+                    out.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                out.write(b'\0' * 16)
+                digest.update(b'\0' * 16)
+            expected = digest.hexdigest()
+            case = work / f'case-{size}'
+            case.mkdir()
+            shutil.copytree(work / 'snap', case / 'snap')
+            source = f'''(#bind std (#module std))
+(#import std)
+(#bind http (#module http-client))
+(define (test-upload ignored)
+(define payload (ReadFile "upload.bin"))
+assert(Eq {n} (Dec (Bytes payload)))
+(define result (http:Fetch
+  [(http:mk-bar "POST") (http:mk-bar "http://127.0.0.1:{server.server_port}/{size}")
+   (http:mk-headers [["Content-Type" "application/octet-stream"]]) [payload]]
+  (http:mk-cfg 5000 120000 0 1024)))
+(print ("UPLOAD-RESULT" {size} result))
+assert(http:fetch-ok? result)
+assert(Eq 200 (http:res-status result))
+assert(Equal "{n}:{expected}" (http:res-body result))
+(print "UPLOAD-PASS-{size}"))
+(test-upload 0)
+'''
+            (work / f'{size}.rvr').write_text(source)
+            code, elapsed = run(str(size), ['/usr/bin/time', '-l', runtime,
+                                '--file-root', str(work / 'src'), 'snap', 'root', '_'],
+                                source, case)
+            log = (work / f'{size}.log').read_text(errors='replace')
+            received = [r for r in records if r['path'] == f'/{size}']
+            passed = (code == 0 and f'"UPLOAD-PASS-{size}"' in log
+                      and not re.search(r'^\("ERROR"|Assertion .* failed', log, re.M)
+                      and len(received) == 1 and received[0]['bytes'] == n
+                      and received[0]['content_length'] == n
+                      and received[0]['sha256'] == expected)
+            rss = re.search(r'^\s*(\d+) +maximum resident set size', log, re.M)
+            row = dict(size_mb=size, bytes=n, passed=passed, returncode=code,
+                       process_seconds=elapsed, expected_sha256=expected,
+                       peak_rss_bytes=int(rss[1]) if rss else None, received=received)
+            results.append(row)
+            print(json.dumps(row), flush=True)
+            payload.unlink()
+            shutil.rmtree(case)
+        (work / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+    finally:
+        server.shutdown()
+        server.server_close()
+        (work / 'src/upload.bin').unlink(missing_ok=True)
+    return 0 if all(row['passed'] for row in results) else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

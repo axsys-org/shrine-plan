@@ -1,0 +1,519 @@
+# Goo panes and local selection
+
+For the complete constructor and syntax reference, see [Goo reference](../../../src/grove/GOO.md).
+
+`@pane` declarations opt into local workspace features; `@view` declarations
+retain projection, object-local actions, and `become`. Selection capture requires
+`@pane`; changing an object's presentation recipe does not.
+
+The explorer owns a private, page-local semantic session. A selection changes
+presentation context; an action captures that context and uses the existing
+namespace action adapter. Selection and deck gestures do not call `/goo/act`,
+normalize action arguments, sample providers, or write domain receipts.
+
+## Integration map
+
+- `src/foil/grove_views.foil`: validates keyed local constructors and retains
+  them alongside ordinary lowered `show` and expanded `present` nodes.
+- `goo_panes.foil`: read-only description serialization and initial server HTML. Native fragments still
+  pass through `goo_bridge` and Goo v2 normalization, layout and HTML.
+- `goo-session.js`: private typed handles, reconciliation, source/member
+  validation, tracked selection reads, encounters, guard ordering, capture and
+  reflection. Description planning does not create owners.
+- `goo-panes.js`: the explorer's native list/deck gestures, retained DOM, actual
+  input integration and selection-following subject presentations.
+- `goo-actions.js`: shared action adapter for ordinary previews and panes.
+- `src/foil/goo_runtime.foil`: bounded namespace source reads, lifetime/data
+  evidence validation, normal argument/receiver admission and invocation retry.
+
+There was no earlier pane/session store, list/topos, or draft checkpoint service
+in this explorer. The session is the minimal shared primitive for those local
+owners; it does not create a privileged `/ui` namespace. Namespace domain state
+and its existing observation/versioning mechanisms remain authoritative for
+subject data.
+
+## Live preparation contract
+
+`POST /goo/render` accepts form fields `target`, `width`, `textScale` and
+`direction` (`ltr` or `rtl`). Width is the available content width in CSS pixels,
+excluding Explorer's heading, border and padding. Scale must be positive and at
+most 10; width must be between 0 and 100000. There is no implicit live context.
+
+Without a selector, the response contains `views`, including read-only synthetic
+inspection. `view` selects one declaration; `slot` with optional `role` selects
+one unambiguous subject view. `view` plus `node` selects a native subtree using
+its original dot-separated Goo child route. A hosted workspace also sends its
+installed `workspace` declaration. The server reconstructs its receiver from
+trusted mount configuration; the client cannot supply a receiver or source slot.
+
+Responses carry `version: 1`, `ok`, the immutable `profile` identity, the requested
+`context`, and a namespace `snapshot`. A presentation carries `view`, `slot`,
+`role`, `kind`, prepared `display`, `html` and `controls`. Pane presentations carry
+a structured `description` and prepare their native surfaces separately at each
+surface's actual width. A failed catalogue entry carries an `error`, allowing
+other presentations to remain usable. Failed exact requests return a diagnostic.
+
+The namespace supervisor evaluates rendering and action-version evidence in one
+read-only snapshot. This prevents a display from accidentally being paired with
+tokens from a different namespace state. The callback cannot return a changed
+namespace. A native pane response from a newer parent publication is discarded
+until the parent description refreshes.
+
+`goo-actions.js` validates the installed profile and response context before
+mounting. It sends changes to available width, inherited `--goo-text-scale` and
+direction back to server preparation. It consumes the structured response;
+whole-page HTML is no longer a data API. Initial server HTML uses a compatibility
+context while the browser obtains the real container dimensions. Synthetic
+inspection then follows the same live preparation path as declared views.
+
+Repreparation within an encounter retains native input elements, working values,
+caret and selection. Composition defers replacement. Publication, member or
+recipe replacement uses the same departure guards as selection changes; delayed
+responses must still match their owner, encounter and latest render request.
+Action retries preserve their original invocation, captures and submitted input,
+and pending actions are scoped to the presenting instance.
+
+## Actual source spelling
+
+```grove
+workspace =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/workspace
+  study => selection('/current, source = study.cards) {
+    split {
+      pane(%/queue, ports = { '/chosen = '/current })
+      pane(%/detail, ports = { '/chosen = '/current })
+    }
+  }
+
+queue =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/queue
+  #port ; /chosen
+  study => list('/rows, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
+
+detail =
+  @pane
+  #on ; %/study
+  #for ; /sys/slot/detail
+  #port ; /chosen
+  study => follow('/subject, selection = '/chosen, slot = '/sys/slot/content)
+```
+
+Each `@pane` declaration supplies its default instance identity. Composition uses
+`pane(%/declaration, ports = { '/chosen = '/current })`; repeat a declaration
+under the same owner with distinct `key` arguments. Inline pane bodies are
+rejected. `#port` declarations and call-site bindings make cross-pane selection
+connections explicit. See [the reference](../../../src/grove/GOO.md#pane-identity-and-explicit-ports)
+for complete syntax and the current receiver restriction.
+
+The compiler resolves aliases to hygienic selection keys in the retained tree.
+The session consumes ordinary keyed pane and selection nodes; layout wrappers
+remain outside the ownership hierarchy. Declaration expansion does not grant a
+child access to ambient selections. Source and lifetime validation still applies
+to captured values after alias resolution.
+
+A source is an installed namespace record with at most 64 physical direct child
+keys. `/goo/source` returns captured direct-child membership references. Their
+source and subject lifetimes use the namespace's **x shape counter**, which
+changes on creation/removal but not an ordinary live edit. Subject data version
+is separate evidence. No subtree flattening or whole-source lookup occurs.
+The initial member must exist in that snapshot; invalid seeds are explicit
+local diagnostics. No seed means no selection.
+
+The adapter's port type is `namespace-record`, paired with the exact source
+identity and lifetime. The selected recipe's normal published role contract
+still decides whether it can present that record. This is not a general typed
+collection/query language or a projection correspondence mechanism.
+
+## Continuity and guards
+
+The accepted selection is the only choice authority. A follower derives its
+binding from that selection; it has no writable navigation subject. Membership
+changes can preserve the encounter when subject bindings are equal. Ordinary
+live data revisions preserve encounter and recipe. `become` changes only that
+encounter's recipe. Choosing the same member is a no-op.
+
+Pointer activation selects. Arrow keys move list focus; Enter selects. Clear
+uses the same local protocol. Nested buttons, inputs and links own their events.
+Usable row references remain usable after another member is selected. Intent
+sequence is allocated by the session; retrying an old intent cannot undo a later
+choice. Handles from another session, retired incarnations and reflected JSON
+snapshots cannot execute local operations.
+
+The real Goo text inputs in following panes retain working values separately
+from server seed values. A dirty departure shows an inline Stay / Discard and
+leave decision. Accepted selection and its usable encounter remain unchanged
+while a candidate is pending. All affected followers are guarded. A newer
+candidate supersedes an older guard result. Checkpoint callbacks can succeed
+without implying that a superseded presentation transition also succeeds.
+This repository has no independent draft/checkpoint service; the built-in UI
+provides discard/refusal, not a fabricated autosave service.
+
+Native pane fragments and editable member rows use the same working-input and
+departure guards as following panes. Retiring a row or native fragment removes
+its guards and resources after admission. A guard for a suspended pane appears
+in the visible workspace so its decision remains reachable.
+
+Composition defers structural reevaluation and refuses destructive departure.
+Retirement releases resources only after guards allow it. Full page reload has
+no retained UI-session continuity. A refresh explicitly observes domain/source
+changes; this slice does not add background watchers.
+
+`split` uses equal flexible columns with a deterministic one-column narrow
+fallback. `deck(key)` uses local keyed alternative selection. It seeds the first
+child once, preserves an active child across reorder and picks the first
+survivor after guarded removal. Empty decks have no active child. Inactive
+panes are suspended and removed from keyboard navigation while keeping inputs
+and encounters; their subject view is refreshed before reuse. `pane_stack`
+overlaps panes in declaration order without history, modality or focus traps.
+
+Asynchronous subject output carries owner incarnation, accepted selection
+revision, encounter, recipe generation and member evidence. Stale output cannot
+replace the current encounter. Old content is marked loading and made inert
+while a newly accepted subject loads. Queue and adjacent pane owners survive
+that detail update.
+
+Filtering/unloading a known member is not deletion. Confirmed deletion leaves
+an explicit unavailable selection. A recreated record at the same path does not
+inherit the old choice. An incompatible source lifetime requires removing and
+redeclaring the selection, rather than silent rebinding/reseeding.
+When the displayed workspace root itself is replaced, the host guards and closes
+the old controller, then creates a fresh session for that root lifetime. Ordinary
+data edits and render-context changes continue within the existing session.
+
+## Captures and domain actions
+
+```grove
+group(on = study, action = %/archive, myth = {
+  %/archived = .capture('/current)
+}) {
+  action("Remember selected card")
+}
+```
+
+The binding is deferred. Activation freezes the **accepted** membership and
+observation evidence, even if another candidate is pending. Multiple operands
+from one owner are captured synchronously; cross-owner atomic capture is
+rejected. The invocation retains this immutable payload when retried.
+
+For this single-selection adapter, validated capture normalizes to the existing
+**path codec** naming the concrete subject. Source/member identity, lifetime,
+data version and accepted local revision accompany it in the invocation
+snapshot; they are not a live selection reference passed to the action handler.
+An empty/unavailable selection fails. Server-side validation checks membership,
+the published lexical selection source, source and subject lifetimes, current data version, existence and application
+authority before the existing typed action handler/receiver checks run.
+
+`/goo/act` stores successful invocation identities and exact request payloads in
+`/<self>/weft/goo_receipts`. Identical retries return the original response;
+changed payloads using the same ID are rejected. Recording the receipt and
+exposing the candidate domain state succeed together. This development journal
+is bounded to 1024 invocations per namespace; the page capture cache is bounded
+to 128. Exhaustion is an explicit error, not silent receipt eviction. Legacy
+requests without an invocation ID remain compatible.
+
+Existing grading/provider actions retain their card receiver and normal
+admission. Selection gives no additional mutation authority. The specimen's
+`archive` action simply stores the captured path on its study object; it is
+local fixture authority, not external Shrine integration.
+
+## Inspection and limits
+
+“Inspect local runtime” serializes the actual session owners, keys, lifetimes,
+selection ports, read dependencies, accepted/pending choice, focus, encounters,
+recipe generation, suspension, input buffers, resources, local outcomes and
+captured invocation arguments. These are read-only snapshots of executed state,
+not a second inspector model.
+
+Version one is single-select, a finite namespace source, page-local lifetime,
+and explicit refresh. No general history, cross-owner transfer, new medium,
+arbitrary application JavaScript, rich-text editor, automatic migration or
+cross-device persistence is implied. The finite list adapter selects an ordinary Goo subject recipe by slot; it does
+not accept a custom repeated body or dynamically nest another local-session
+view inside a member recipe. Such nested recipes produce an explicit diagnostic.
+Static `present` expansion containing pane declarations remains supported.
+A source is bounded to 64 records and a
+session to 256 semantic owners. Reflection retains the last 64 local events.
+
+## Run and test
+
+```sh
+WISP=/path/to/wisp python3 extras/mounts/explorer/scripts/check-integration.py
+node --test extras/mounts/explorer/tests/*.test.cjs
+WISP=/path/to/wisp python3 extras/x/check --mount explorer --jobs 2
+```
+
+The specimen now lives in `extras/tests/fixtures/panes`, outside the production
+mount catalogue. The gate installs it only in its disposable test namespace.
+The study is an ordinary record at `/0x11/app/panes/study`, alongside `/cards`.
+Do not use the installation root as this action receiver: its pact manifest
+replays seed records when changed.
+
+The Node suite uses deterministic deferred guards/render tickets (no sleeps).
+The mount tests include real Grove parsing/lowering, source lifetime/capture
+validation, invocation retry, the existing Goo action/provider regressions,
+explorer reflection, and Goo v2 rendering/layout regressions. Browser rehearsal
+must additionally exercise the actual row/button/input/deck DOM; isolated owner
+tests alone are not evidence of rendered integration.
+
+See [verification and rehearsal](PANES-VERIFICATION.md) for observed results and coverage boundaries.
+The [real application integration gate](APPLICATION-INTEGRATION.md) boots Eden,
+compiles Grove and exercises these production adapters with actual Mash components.
+
+## Server rendering and path-valued sources
+
+`selection` and `list` also accept a direct path-typed receiver field, for example
+`source = inspector.source_path`. The compiler checks the field type. Rendering
+binds its value from the receiver; missing values produce a diagnostic. Action
+capture validation resolves the source again from the current receiver, so a
+browser cannot substitute a different source. Changing a source requires a new
+workspace; incompatible rebinding of an existing owner remains rejected.
+
+`goo_panes/server_body` emits native fragments and pane wrappers with temporary
+hydration addresses. Its read-only callback supplies initial list members from
+the caller's captured observation. The browser adopts those wrappers and native
+content rather than replacing them. It validates live membership before enabling
+list interaction and continues to fetch subject presentations through the shared
+server renderer. Initial deck activation and local ownership remain browser
+responsibilities. This does not add query-backed or paginated sources.
+
+### Hosting a workspace
+
+`goo_workspace` hosts a server-rendered workspace independently of the inspector.
+A mount constructs a `goo_workspace/endpoint` with:
+
+- `declaration`: the absolute published workspace declaration path;
+- `source_slot`: the path-typed slot used to construct its transient receiver;
+- `initial`: the subject path when the request has no `path` query parameter;
+- `validate(selected)`: optional source-policy diagnostic;
+- `operations`: pairs of local capability key and mount source path for rescan;
+- `document(target, content)`: the surrounding HTML document.
+
+Delegate the mount's workspace route to `goo_workspace/request endpoint request
+now`. Activate it with `goo_workspace/install endpoint fallback state`, passing
+the previous HTTP talk handler as `fallback` (normally `goo_browser/talk`).
+Endpoints dispatch by declaration, so hosts can chain handlers for different
+workspace declarations. The configuration is fixed by the mount: URL parameters
+select the subject, not the declaration or receiver slot.
+
+A hosted workspace's synthetic receiver is for presentation and host controls.
+It cannot dispatch domain invocations from its native fragments: `/goo/render`
+rejects those controls explicitly. Put domain actions in member or follower
+presentations, whose displayed receiver and action receiver are the same real
+namespace record. Navigation and configured host operations remain available.
+
+The host captures the subject subtree and the local cached view catalog, checks
+the configured declaration and receiver contract, binds source fields, and emits
+the shared pane markup. `document` receives either the server-rendered workspace container
+or a diagnostic. Load the shared Goo scripts and attach `GooPanes` to `#workspace`
+using its `data-target`, `data-view` and `data-workspace`. Live refresh obtains a
+new description and snapshot through `/goo/render`. Source limits and document chrome
+remain host policy; the generic endpoint imposes no inspector-specific 64-child
+limit. Child summaries are rendered by the shared host from the list's source and slot. Only record-bearing children are advertised; `browse` adds ordinary workspace navigation for each member.
+
+
+### Workspace navigation and operations
+
+These controls belong inside a pane. They do not invoke domain actions or create
+nested workspaces inside content views:
+
+```text
+navigate('/address, source = inspector.source_path, mode = "input", label = "Inspect path")
+navigate('/parent, source = inspector.source_path, mode = "parent", label = "Parent")
+operation('/reload, operation = '/mount_reload, label = "Reload mount assets")
+operation_status('/publication, operation = '/mount_reload, label = "Mount publication")
+```
+
+`navigate` accepts a path-typed receiver field or literal path. `mode = "input"`
+emits a GET form; `"parent"` links to its parent; the default links to the source.
+Navigation preserves the workspace URL and changes its `path` query parameter.
+`list(..., browse = "Browse children")` adds a link for each member without
+changing selection. Ordinary clicks use the session's departure guards; links
+also support normal browser new-tab behavior.
+
+`operation` names a host-configured capability, not a URL. The first host binding
+is mount rescan/publication: `operations = [[key source]]`. The shared
+`goo-workspace.js` adapter polls the requested scan, disables duplicates, and
+reloads only after successful publication. `operation_status` observes the same
+capability and presents pending, success, or expandable failure details. Reload
+checks local departure guards, never resets installed instances, and preserves
+the current page when publication fails. Labels and control placement are Goo
+source; transport and operation state are shared host code.
+
+Load `/static/goo-workspace.js` after the shared session, pane, and action scripts.
+It attaches controllers to server-rendered workspace containers automatically.
+
+### Creating an object with an action
+
+A creation group keeps the presenting receiver and names a separate, absent
+write destination:
+
+```text
+group(make = creator.creation_target, role = %/created_card, myth = {
+  '/sys/req = .input("")
+  '/sys/res = .input("")
+}) {
+  input('/sys/req)
+  input('/sys/res)
+  action("Create card")
+}
+```
+
+`make` accepts a literal absolute path or a direct path-typed receiver field.
+`role` names a published role. `make` is mutually exclusive with `on` and
+`action`; the creation itself is the operation. The presenting object must still
+exist, match its view, and pass the ordinary freshness checks. The server resolves
+the destination from that current receiver, checks application write authority,
+validates the supplied initial fields against the creation role, and atomically
+installs the record and its contract only if the destination subtree is empty.
+An occupied destination never becomes an update. Failed validation leaves the
+namespace unchanged; retries with the same invocation identity return the
+original successful receipt.
+
+Creation inputs use literal text defaults from their `.input(...)` bindings,
+not same-named slots on the presenting object. Other displayed expressions keep
+the enclosing receiver. Successful creation uses the existing refresh behavior;
+it does not implicitly navigate or select the new object.
+
+`grove-dev/creation.grove` retains the creation roles and seed receiver. Its Goo
+form has been removed; creation bindings remain covered by the compiler and
+action regression suites.
+
+## Pane layout sizes
+
+Live Explorer/Goo panes select layouts using their own allocated content width,
+after host padding, preview chrome and tree indentation. A narrow sidebar stays
+small on a wide monitor. `pane-v1` offers `sm` at 240 CSS pixels, `md` at 480 and
+`lg` at 720. The largest allocation that fits is selected. A pane below 240 pixels
+requests a small variant at its available integer width; a zero-width hidden pane
+defers rendering. These are layout allocations, separate from Mash's control
+density settings. Unused space remains in the pane; content is not stretched or
+scaled to fill the gap between breakpoints.
+
+`POST /goo/render` accepts `layouts=pane-v1` alongside its existing target,
+view/slot/native-node selector, width, textScale and direction fields. It returns
+three named `layouts`, each containing a complete ordinary `render` response.
+Slot/role resolution is shared across the three sizes. All three run through
+`goo_browser/render_result` and the existing Goo layout and HTML backend against
+the same immutable supervisor snapshot. HTML, portable
+display, control evidence and profile stay together. Omitting `layouts` retains
+the exact-width API. No new Grove declarations or custom layout language are
+required: ordinary Goo layout rules are evaluated at each allocation.
+
+`GooActions.context(host)` reads the allocated host box, never a rendered node,
+port or label. `GooActions.load` validates the whole bundle before selecting a
+variant. Native, member and follower owners retain one bundle for their current
+selector, semantic basis, text scale and direction. Crossing a breakpoint uses
+that bundle through the existing mount/input-preservation path; content or
+publication refreshes invalidate it. Composition still defers installation.
+There are no three hidden editor copies. `data-goo-layout` exposes the installed
+size for inspection. Patch scene geometry remains server-owned.
+
+The initial policy is deliberately bounded to three allocations. A fresh bundle
+costs three ordinary render preparations and sends all three results; it trades
+initial work/payload for local breakpoint changes. It is not a persistent render
+cache or a fluid CSS layout engine. Intrinsically unbreakable content can still
+need scrolling inside its own presentation.
+
+The real browser gate is `scripts/check-layout-browser.mjs BASE MASH_ROOT OUT`.
+Run Eden with both test-only `tree-pages` and `panes` mounts. It checks Inspector
+overflow, nested selection, per-pane breakpoints, cached switching, retained
+draft/focus/caret, synthetic composition deferral, scale/direction and real save
+refreshes in Chromium, Firefox and WebKit.
+
+## Topoi
+
+`list`, `diagram_tree`, and `list_tree` are presentations of one keyed topos.
+They share selection ports, source evidence, member views, and capture semantics.
+A renderer change does not replace the semantic owner. Tree sources opt in with
+`selection(..., topology = "tree")`. Sources consumed by an outline (`list_tree`)
+use immediate-child pages
+of at most 64 members, materializes branches on disclosure, and offers a native
+continuation button for wide branches. The root's first page also includes the
+root itself. Each page carries parent, continuation, branch hints and a namespace
+epoch; continuations cannot escape their source or mix epochs. Loaded material
+is bounded at 4096 nodes per tree source and uses the existing selection owner,
+input guards and refresh cancellation. Standalone diagram/flat presentations and
+the legacy complete-source endpoint keep their complete, 64-member projection.
+Views sharing an outline's selection see the same materialized source.
+Disclosure and camera state never call domain actions.
+
+Paging examines at most 64 raw keys plus one lookahead. Keys without a Goo path
+spelling are omitted and counted in `omitted`; outlines display that count rather
+than failing the whole branch. `next` is an opaque `physical_key` continuation, so
+even an entirely omitted page can advance. Legacy path-shaped cursors remain
+accepted, with the same parent/source and epoch checks. The physical debugger
+remains the interface for inspecting those raw keys.
+
+The outline adapter requests `presentations=pane-v1` on `/goo/source`, with
+repeated `slot` parameters (at most eight), `textScale`, and `direction`. The
+server prepares each available member's ordinary Goo view in `sm`/`md`/`lg`
+from the same immutable namespace as that child page, reusing one catalog for
+the page. The response adds `presentations: [{key, slot, bundle}]` alongside
+membership; these packets never become selection or capture payloads.
+
+The adapter validates all packets, their profile and contexts, subject/lifetime,
+and page epoch before admitting the refreshed projection. Existing rows remain
+visible during preparation or failure. New record rows mount prepared content
+before attachment, avoiding a raw-path placeholder while hydration runs. The
+variants seed the existing presentation owner's cache; narrower-than-sm panes
+and later scale/direction changes still use the ordinary contextual render API.
+Structural branches without a record retain their path labels. Preparation
+failure rejects the page and reports the backend diagnostic without partially
+replacing the tree.
+
+`goo-topoi.js` adapts native lists, Mash `goo-tree`, and Mash `goo-tidy-tree`.
+The explorer builds its own pinned component bundle, so selecting the debugger
+mount is unnecessary. `extras/flake.nix` pins the profile- and patch-enabled Mash revision
+`16b8a9079e8a45dc2681cf3210e1d186e5cbe622` without dependency overrides.
+Production asset builds verify the vendored profile against that Nix artifact.
+
+The application gate installs the test-only `panes` fixture; `topoi_demo` shows a
+list, outline, and diagram sharing a detail view and a descendant capture action.
+
+
+## Inspect this presentation
+
+Use **Inspect a presentation**, then click a mounted Goo presentation; or press
+**Alt+I** while focused inside it. Picking consumes that gesture without changing
+selection or invoking a domain action. **Capture again** explicitly samples the
+currently installed presentation. Closing inspection restores the prior focus.
+
+The browser captures the last committed render packet, not an in-flight response.
+`GooInspection` retains only its subject/action version metadata, recipe and source
+location, layout context/profile, and node count. The local adapter contributes
+session revision, owner/lifetime/encounter identity, selection, and counts of dirty
+or composing inputs. Input contents, action handles and executable controls are
+excluded. Opening inspection does not remount the inspected surface.
+
+`POST /goo/inspect` accepts a bounded, whitelisted observation and constructs
+`goo_inspection`'s typed capture, subject, recipe, preparation and encounter
+records. Its slots belong to the publisher's `goo/inspection` vocabulary. The
+ordinary synthetic reflection, normalization, layout and HTML pipeline renders
+those records. The formatter has no namespace argument and cannot dispatch a
+write. Its reply carries no domain controls.
+
+This is a **browser-reported observation**, including the copied server metadata;
+it is not a fresh or independently verified namespace read. Namespace cases and
+browser revisions remain separate. References open current records in another
+tab. The source location refers to the published declaration; a zero location
+means unavailable/generated. The existing publication token describes the view
+catalogue version, not a newly invented per-declaration version.
+
+Observations are transient: capture IDs and owner IDs are page-local, not durable
+namespace paths. The panel's generated presentation can itself be inspected, with
+an explicit parent-capture link and no automatic recursive expansion. Resize
+reprepares the same observation. Late responses and responses to a closed panel
+cannot replace newer captures.
+
+This first slice does not persist observations, reconstruct history, explain
+individual `or` choices, or retain compiler transformation provenance. It exposes
+installed render/encounter evidence rather than claiming that those traces exist.
+
+Run `scripts/check-inspection-browser.mjs BASE MASH OUTPUT` against an Eden with
+`goo-inspector`, `tree-pages`, and `panes`. It checks real captures, unchanged
+namespace and selection, stale responses, inspection of the inspector, and native
+input/caret/composition preservation in Chromium, Firefox and WebKit.
