@@ -216,10 +216,10 @@
             if (!button) {
             button = el('button', '', pane.spec.label || pane.key.split('/').filter(Boolean).at(-1) || pane.key);
             button.title = pane.key; button.type = 'button'; button.setAttribute('role', 'tab'); button.dataset.pane = pane.id;
-            button.addEventListener('click', () => this.session.activate(state.ref, pane.ref));
+            button.addEventListener('click', () => {if(this.paneAvailable(pane))this.session.activate(state.ref, pane.ref);});
             button.addEventListener('keydown', event => {
               if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
-              event.preventDefault(); const buttons = [...state.tabs.children], at = buttons.indexOf(button);
+              event.preventDefault(); const buttons = [...state.tabs.children].filter(tab=>!tab.hidden), at = buttons.indexOf(button);
               const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (at + (event.key === 'ArrowLeft' ? -1 : 1) + buttons.length) % buttons.length;
               buttons[next].focus();
             });
@@ -434,11 +434,14 @@
     registerWork(state, element) {
       if(state.release) return;
       state.guards ||= new Set();
+      const framedWork=()=>[...element.querySelectorAll('iframe[data-goo-presentation-frame]')].map(frame=>{
+        try{return frame.contentWindow?.GooActions?.workState()||{};}catch{return {};}
+      });
       const guard = async (reason,{signal}={}) => {
         if(signal?.aborted) return false;
         if (!state.live) return true;
-        if ([...state.inputs.values()].some(v => v.composing)) { state.diagnostic = 'composition-in-progress'; return false; }
-        if (![...state.inputs.values()].some(v => v.dirty)) return true;
+        if ([...state.inputs.values(),...framedWork()].some(v => v.composing)) { state.diagnostic = 'composition-in-progress'; return false; }
+        if (![...state.inputs.values(),...framedWork()].some(v => v.dirty)) return true;
         if (state.departure) state.departure.finish(false);
         return new Promise(resolve => {
           const prompt = el('div', 'goo-departure'); prompt.setAttribute('role', 'status');
@@ -456,7 +459,7 @@
           };
           const cancel=()=>finish(false);
           state.departure = {prompt, finish}; stay.addEventListener('click', () => finish(false));
-          leave.addEventListener('click', () => finish(![...state.inputs.values()].some(v => v.composing)));
+          leave.addEventListener('click', () => finish(![...state.inputs.values(),...framedWork()].some(v => v.composing)));
           signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
         });
       };
@@ -524,29 +527,47 @@
         saved: async (_result, savedInputs = new Map()) => {
           if (continuing()) {
             for (const [key, work] of follower.inputs) if (savedInputs.get(key) === work.value) work.dirty = false;
-            this.rendered.delete(follower.id);
+            this.rendered.clear();
+            this.contentRevision=(this.contentRevision||0)+1;
           }
           if (this.context.refresh) await this.context.refresh();
           else await this.update(this.rawDescription, await root.GooActions.status(this.context.target));
         }
       };
     }
+    paneAvailable(pane) {
+      if(!pane)return false;
+      // The preferred-pane follower is optional: its selection advertises a
+      // path-valued /sys/face. Resolution and role checks remain on the server.
+      for(const work of this.session.owners.values()) {
+        if(work.kind==='follow' && work.owner===pane.id && work.spec.slot==='/sys/slot/panes') {
+          const member=this.session.read(work.selection).accepted;
+          if(member?.status!=='available'||!member.face)return false;
+        }
+      }
+      return true;
+    }
     paint() {
       const session = this.session;
+      for(const deck of session.owners.values())if(deck.kind==='deck'&&deck.active&&!this.paneAvailable(session.owners.get(deck.active))) {
+        const next=deck.children.map(id=>session.owners.get(id)).find(pane=>this.paneAvailable(pane));
+        if(next){session.activate(deck.ref,next.ref);return;}
+      }
       for (const state of session.owners.values()) {
         const element = this.elements.get(state.id); if (!element) continue;
         if (state.kind === 'selection' && state.notice) {
           state.notice.textContent = state.pending ? `Pending choice: ${state.pending.member?.key || 'none'}; accepted: ${state.accepted?.key || 'none'}` : state.diagnostic || `Selected: ${state.accepted?.key || 'none'}`;
         }
-        if (state.kind === 'pane') { element.hidden = state.suspended; element.inert = state.suspended; }
+        if (state.kind === 'pane') { element.hidden = state.suspended || !this.paneAvailable(state); element.inert = element.hidden; }
         if (state.kind === 'deck' && state.tabs) for (const tab of state.tabs.children) {
-          const active = tab.dataset.pane === state.active; tab.setAttribute('aria-selected', String(active)); tab.tabIndex = active ? 0 : -1;
+          tab.hidden=!this.paneAvailable(session.owners.get(tab.dataset.pane));
+          const active = !tab.hidden && tab.dataset.pane === state.active; tab.setAttribute('aria-selected', String(active)); tab.tabIndex = active ? 0 : -1;
           if (!state.active) element.dataset.empty = 'true';
         }
         if (['list','topos'].includes(state.kind) && state.topos) {
           state.topos.paint(session.read(state.selection).accepted,state.focus);
         }
-        if (state.kind === 'follow' && !state.suspended) this.follow(state, element);
+        if (state.kind === 'follow' && !state.suspended && this.paneAvailable(session.owners.get(state.owner))) this.follow(state, element);
       }
       this.reflect();
     }
@@ -555,7 +576,7 @@
       const selection = this.session.read(state.selection), ticket = this.session.ticket(state.ref);
       const context = root.GooActions.context(element);
       if (!context.width) return;
-      const key = JSON.stringify([{...ticket,ref:undefined},context]);
+      const key = JSON.stringify([{...ticket,ref:undefined},context,this.contentRevision||0]);
       if (this.rendered.get(state.id) === key || this.loading.get(state.id) === key) return;
       if ([...state.inputs.values()].some(value => value.composing)) return;
       const member = selection.accepted;
@@ -569,7 +590,7 @@
       if (element.dataset.encounter !== String(ticket.encounter)) element.inert=true;
       element.dataset.status='loading'; this.status.textContent='Loading accepted selection…';
       try {
-        const data=await this.request(element,member.subject,{slot:state.encounter.recipe},JSON.stringify([{...ticket,ref:undefined},this.snapshot]));
+        const data=await this.request(element,member.subject,{slot:state.encounter.recipe},JSON.stringify([{...ticket,ref:undefined},this.snapshot,this.contentRevision||0]));
         if (!data || !this.session.current(ticket) || state.suspended || this.loading.get(state.id)!==key) return;
         if (data.snapshot.life!==member.life || (data.snapshot.subject||data.snapshot.target)!==member.subject) throw new Error('Selected subject was removed or replaced.');
         if (data.description) throw new Error('Nested local-session member views are not supported.');

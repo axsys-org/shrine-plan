@@ -49,14 +49,18 @@ those paths in this merged repository; these checks do not claim oracle parity.
 
 ## Synthetic object view
 
-Every selected object also has a read-only `/sys/slot/synthetic` presentation,
+Every selected object also has a `/sys/slot/synthetic` presentation,
 alongside its matching authored views. `goo_reflection.foil` turns slots into
 labeled Goo source nodes. Scalar pails retain their normal text, path, boolean,
 and temporal formatting; published record descriptors provide field labels and
 nested types, including tuples and arrays. The existing catalog overlay caches
 these descriptors from `/gov`, indexed by exact versioned nominal brand.
 Publication changes invalidate that cache with the authored view catalog.
-Unknown nominal brands remain opaque; functions are never invoked.
+Unknown nominal brands use bounded value pretty-printing; rendering never invokes functions.
+Writable records include direct scalar inputs and a Foil expression fallback.
+Saves validate the physical record version and use ordinary namespace writes;
+trusted system records remain read-only. `/sys/slot/views` embeds a gallery of
+matching authored views, excluding the synthetic presentation.
 
 Inspection is bounded to 64 slots, 24 fields/items per collection, five levels,
 and a shared expansion budget. Individual text previews stop at 512 bytes.

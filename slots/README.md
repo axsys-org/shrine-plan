@@ -21,7 +21,7 @@ generated declarations. `x/check` runs it before the runtime suites.
     {
       "path": "/sys/face",
       "title": "Presentation binding",
-      "summary": "Component constructor and cared scope used to present a datum."
+      "summary": "Preferred pane path, or a legacy component constructor and cared scope."
     }
   ]
 }

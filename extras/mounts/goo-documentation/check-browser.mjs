@@ -37,7 +37,7 @@ for(const name of (process.env.BROWSERS||'chromium,firefox,webkit').split(',')) 
   await article('/0x11/lib/pact/lore').waitFor();
   assert((await article('/0x11/lib/pact/lore').innerText()).includes('Structured documentation'));
   await page.getByRole('tab',{name:'Values',exact:true}).click();
-  await page.locator('.goo-pane:not([hidden]) .goo-follow .goo-surface').waitFor();
+  await page.locator('.goo-pane:not([hidden]) .goo-follow .goo-surface').first().waitFor();
   await page.getByRole('tab',{name:'Documentation',exact:true}).click();
   await article('/0x11/lib/pact/lore').waitFor();
   check('keyboard selection reads published lore; Values and Documentation share selection');

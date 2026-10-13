@@ -382,3 +382,17 @@ test('unrelated catalogue publications rebind native authority while preserving 
  assert(work.departure);work.departure.finish(false);await replaced;
  assert.equal(element.children[0].textContent,'rebound');assert.equal(work.inputs.get('/draft').value,'unsaved');
 });
+
+test('preferred-pane tabs follow path-valued face availability on the accepted selection',async()=>{
+ const {controller:c,follower:f,selection:s}=await setup();
+ f.spec.slot='/sys/slot/panes';
+ const pane=c.session.owners.get(f.owner);
+ assert.equal(c.paneAvailable(pane),false);
+ s.members.set('B',{...B,face:'/gov/cards/workspace'});
+ await c.session.deliver(c.session.intent(s.ref,s.members.get('B')));
+ assert.equal(c.paneAvailable(pane),true);
+ await c.session.deliver(c.session.intent(s.ref,A));
+ assert.equal(c.paneAvailable(pane),false);
+ f.spec.slot='/sys/slot/documentation';
+ assert.equal(c.paneAvailable(pane),true);
+});

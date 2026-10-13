@@ -4,6 +4,7 @@
   const metrics = {activations: 0, dispatches: 0};
   const bindings = new WeakMap();
   const pendingScopes = new WeakMap();
+  const valueEdits = new WeakMap();
   const layoutCache = new WeakMap();
   const layoutSizes = Object.freeze([['sm',240],['md',480],['lg',720]].map(Object.freeze));
   let profileRequest;
@@ -164,7 +165,7 @@
     // Preparation never moves a working input or touches the installed DOM.
     return {proposed:next, commit() {
       const active = container.contains(document.activeElement) ? document.activeElement : null;
-      const selection = active?.tagName === 'INPUT' ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
+      const selection = ['INPUT','TEXTAREA'].includes(active?.tagName) ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
       const existing = preserve ? new Map([...container.querySelectorAll('input[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
       for (const control of data.controls || []) if (control.kind === 'input') {
         const input = [...next.querySelectorAll('input[data-node]')].find(element => element.dataset.node === control.id);
@@ -176,8 +177,24 @@
         for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
         input.replaceWith(held);
       }
-      const proposedFrames = !section && preserve ? [...next.children].filter(node => node.matches('iframe[data-goo-presentation-frame]')) : [];
-      const retainedFrames = proposedFrames.map(node => [...container.children].find(old =>
+      if (preserve) {
+        const values = new Map([...container.querySelectorAll('[data-value-key]')].map(node => [node.dataset.valueKey,node]));
+        for (const input of next.querySelectorAll('[data-value-key]')) {
+          const held=values.get(input.dataset.valueKey);
+          if (!held || held.tagName!==input.tagName) continue;
+          for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
+          if(held.tagName==='SELECT') {
+            const value=held.value;held.replaceChildren(...input.childNodes);held.value=value;
+          }
+          input.replaceWith(held);
+        }
+        const open = new Set([...container.querySelectorAll('details[data-value-slot][open]')].map(node=>node.dataset.valueSlot));
+        for (const details of next.querySelectorAll('details[data-value-slot]')) details.open=open.has(details.dataset.valueSlot);
+      }
+      const proposedHost=section ? next.querySelector('.goo-presentation') : next;
+      const retainedHost=section ? container.querySelector(':scope > .preview > .goo-presentation') : container;
+      const proposedFrames = preserve ? [...proposedHost.children].filter(node => node.matches('iframe[data-goo-presentation-frame]')) : [];
+      const retainedFrames = proposedFrames.map(node => [...(retainedHost?.children||[])].find(old =>
         old.matches('iframe[data-goo-presentation-frame]') && old.dataset.gooPresentationFrame === node.dataset.gooPresentationFrame && old.getAttribute('src') === node.getAttribute('src')));
       // One direct presentation document per occurrence. Changing its subject/slot
       // retires it; title or geometry changes keep its actual focused/composing DOM.
@@ -185,11 +202,17 @@
         const proposed = proposedFrames[0], held = retainedFrames[0];
         for (const attr of [...held.attributes]) if (!proposed.hasAttribute(attr.name)) held.removeAttribute(attr.name);
         for (const attr of [...proposed.attributes]) if (held.getAttribute(attr.name) !== attr.value) held.setAttribute(attr.name, attr.value);
-        for (const child of [...container.childNodes]) if (child !== held) child.remove();
+        if(section) {
+          const wrapper=retainedHost.parentElement;
+          Object.assign(wrapper.dataset,next.dataset);
+          wrapper.querySelector('h2').textContent=next.querySelector('h2').textContent;
+          wrapper.querySelector('.meta').textContent=next.querySelector('.meta').textContent;
+        }
+        for (const child of [...retainedHost.childNodes]) if (child !== held) child.remove();
         let after = false;
-        for (const child of [...next.childNodes]) {
+        for (const child of [...proposedHost.childNodes]) {
           if (child === proposed) { after = true; continue; }
-          if (after) container.append(child); else container.insertBefore(child, held);
+          if (after) retainedHost.append(child); else retainedHost.insertBefore(child, held);
         }
       } else container.replaceChildren(...(section ? [next] : [...next.childNodes]));
       container.dataset.renderContext = JSON.stringify(data.context);
@@ -202,7 +225,7 @@
         active.focus({preventScroll:true});
         if (selection && selection[0] !== null) active.setSelectionRange(...selection);
       }
-      return section ? next : container;
+      return section ? container.firstElementChild : container;
     }};
   }
   function mount(container, data, preserve = false, section = true) {
@@ -274,7 +297,67 @@
     return held.promise;
   }
   function subscribeOutcomes(listener){outcomeListeners.add(listener);return ()=>outcomeListeners.delete(listener);}
+  function workState() {
+    const inputs=[...document.querySelectorAll('[data-input-slot],[data-value-key]')];
+    return {dirty:inputs.some(input=>input.value!==(input.getAttribute('value')||'')),composing:inputs.some(input=>input.gooComposing)};
+  }
+  function trackComposition(input,signal) {
+    input.addEventListener('compositionstart',()=>{input.gooComposing=true;},{signal});
+    input.addEventListener('compositionend',()=>{input.gooComposing=false;},{signal});
+  }
+  function bindValues(container, context) {
+    for (const form of container.querySelectorAll('form[data-goo-value]')) {
+      bindings.get(form)?.abort(); const binding=new AbortController(); bindings.set(form,binding);
+      const fields=[...form.querySelectorAll('[data-value-key]')];
+      const scope=context.actionScope||container;
+      if(!valueEdits.has(scope))valueEdits.set(scope,new Map());
+      const edits=valueEdits.get(scope), key=JSON.stringify([context.target,context.snapshot.life,form.dataset.gooValue]);
+      let edit=edits.get(key);
+      if(!edit){edit={target:context.target,expected:context.snapshot.expected,pending:false,message:''};edits.set(key,edit);}
+      const dirty=fields.some(input=>{const work=scope.inputs?.get(input.dataset.valueKey);return work?.dirty||input.value!==(input.getAttribute('value')||'');});
+      if(!dirty&&!edit.pending)edit.expected=context.snapshot.expected;
+      for(const input of fields) {
+        bindings.get(input)?.abort(); const owner=new AbortController();bindings.set(input,owner);
+        context.input?.(input.dataset.valueKey,input,owner.signal);
+        trackComposition(input,owner.signal);
+      }
+      const kind=form.querySelector('[data-value-input="kind"]'), value=form.querySelector('[data-value-input="value"]');
+      const status=form.querySelector('[role="status"]'), button=form.querySelector('[type="submit"]');
+      const showMode=()=>{for(const node of form.querySelectorAll('[data-foil-context]'))node.hidden=kind.value!=='foil';};
+      edit.button=button;edit.status=status;
+      showMode();button.disabled=edit.pending;status.textContent=edit.message;
+      kind.addEventListener('change',()=>{value.value='';value.dispatchEvent(new Event('input',{bubbles:true}));showMode();},{signal:binding.signal});
+      form.querySelector('[data-value-cancel]').addEventListener('click',()=>{
+        for(const input of fields){input.value=input.getAttribute('value')||'';input.dispatchEvent(new Event('input',{bubbles:true}));
+          const work=context.actionScope?.inputs?.get(input.dataset.valueKey);if(work&&typeof work==='object')work.dirty=false;}
+        edit.expected=context.snapshot.expected;edit.message='';status.textContent='';showMode();form.closest('details').open=false;
+      },{signal:binding.signal});
+      form.addEventListener('submit',async event=>{
+        event.preventDefault();if(edit.pending)return;
+        if(fields.some(input=>input.gooComposing||context.actionScope?.inputs?.get(input.dataset.valueKey)?.composing))return;
+        const savedInputs=new Map(fields.map(input=>[input.dataset.valueKey,input.value]));
+        const body=new URLSearchParams({target:context.target,slot:form.dataset.gooValue,expected:edit.expected,
+          kind:kind.value,value:value.value,context:form.querySelector('[data-value-input="context"]').value});
+        const expected=edit.expected;
+        edit.pending=true;button.disabled=true;edit.message='Saving…';status.textContent=edit.message;
+        try {
+          let response;
+          try { response=await fetch('/goo/edit-value',{method:'POST',body}); }
+          catch { throw new Error('Save outcome unknown. Refresh Values before retrying; your draft has been kept.'); }
+          const result=await response.json();
+          if(!response.ok)throw new Error(result.error||'Unable to save value.');
+          for(const other of edits.values())if(other.target===context.target&&other.expected===expected)other.expected=result.expected;
+          edit.pending=false;edit.message='';
+          await context.saved?.(result,savedInputs);
+          context.report('Saved.');
+          for(const frame of document.querySelectorAll('iframe[data-goo-presentation-frame]'))frame.contentWindow?.postMessage({type:'goo-values-saved'},location.origin);
+        } catch(error) {edit.message=error.message;edit.status.textContent=error.message;context.report(error.message);}
+        finally {edit.pending=false;edit.button.disabled=false;}
+      },{signal:binding.signal});
+    }
+  }
   function bind(container, context) {
+    bindValues(container,context);
     root.GooInspection?.bind(container,context.inspect || (()=>({owner:"view",generation:context.actionScope?.generation,dirty:context.actionScope?.inputs?.size||0,composing:context.actionScope?.composing?1:0,live:true})));
     const scope=context.actionScope || container;
     if(!pendingScopes.has(scope)) pendingScopes.set(scope,new Map());
@@ -289,6 +372,7 @@
       if (control.kind === 'input') {
         element.dataset.inputSlot = control.slot;
         context.input?.(control.slot, element, binding.signal);
+        trackComposition(element,binding.signal);
         continue;
       }
       const actionKey=JSON.stringify([context.target,context.view,context.snapshot.life,context.snapshot.publication,control.control]);
@@ -322,7 +406,7 @@
       }, {signal:binding.signal});
     }
   }
-  root.GooActions = {status, load, prepareChildren, adoptLayouts, chooseLayout, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
+  root.GooActions = {workState, status, load, prepareChildren, adoptLayouts, chooseLayout, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
   async function start() {
     const main = document.querySelector('main[data-target]'); if (!main) return;
     const target = main.dataset.target, frames = new Map();
@@ -333,10 +417,11 @@
     async function refresh() {
       const current = ++revision; request?.abort(); request = new AbortController(); button.disabled = true;
       try {
-        const data = await load(target,{view:main.dataset.view || undefined,context:context(main),signal:request.signal});
+        const data = await load(target,{...(main.hasAttribute('data-face') ? {slot:'/sys/slot/face'} : {view:main.dataset.view || undefined}),context:context(main),signal:request.signal});
         if (current !== revision) return;
         const seen = new Set(), errors = [];
-        for (const view of data.views || [data]) {
+        const visible=(data.views||[data]).filter(view=>!main.hasAttribute('data-views-only')||view.slot!=='/sys/slot/synthetic');
+        for (const view of visible) {
           const key = view.view; seen.add(key);
           let frame = frames.get(key);
           if (!frame) {
@@ -368,7 +453,7 @@
           if (frame.inputs.size && !confirm('This view was removed. Discard its unsaved input?')) continue;
           frame.stop(); frame.request?.abort(); frame.element.remove(); frames.delete(key);
         }
-        report(errors.join(' '));
+        report(errors.join(' ') || (visible.length ? '' : 'No Goo views match this entry.'));
       } catch (error) { if (error.name !== 'AbortError' && current === revision) report(error.message); }
       finally { if (current === revision) button.disabled = false; }
     }
@@ -443,6 +528,7 @@
     // boundary instead of parsing a second whole page.
     for (const node of main.querySelectorAll(':scope > .preview[data-view]')) node.remove();
     button.addEventListener('click',refresh);
+    root.addEventListener('message',event=>{if(event.origin===location.origin&&event.source===root.parent&&event.data?.type==='goo-values-saved')refresh();});
     observe(main,() => refresh());
     await refresh();
   }

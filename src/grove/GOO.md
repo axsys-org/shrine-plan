@@ -187,8 +187,17 @@ Missing views, competing matches, and recursive presentation cycles are errors.
 Use the current receiver; nested receiver expressions are not supported.
 
 The explorer additionally offers a reflection view at `/sys/slot/synthetic` for
-records. It is read-only and bounded, and can be requested by `follow`. It is
+records. Its display is bounded and can be requested by `follow`; writable
+records include slot editors with typed scalar inputs and a Foil fallback. It is
 **not** an implicit fallback for a failed compile-time `present`.
+
+A record can nominate a complete application pane by storing its declaration
+path in `/sys/face`. The documentation browser then offers a **Panes** tab.
+`/sys/slot/panes` is the optional follower presentation, and `/sys/slot/face`
+resolves the declared pane against the current receiver. The declaration must
+be an `@pane`, match the record, and have no unconnected selection ports.
+A pane containing the preferred-pane follower is hidden from its deck when the
+accepted member has no path-valued `/sys/face`.
 
 ### `path`
 
