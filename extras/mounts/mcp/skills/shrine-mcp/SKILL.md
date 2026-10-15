@@ -38,10 +38,11 @@ three kinds of slots:
   holding a reference.
 
 Read `/x/<cell path>` for the result and `/c/x/<cell path>` for its context:
-the parameters it ran with, `/missing` when a parameter was absent, `/fault`
-for a cycle, a bad reference, or a live cell read at a pinned case. A cell
-always reads: a failed cell is an empty tree with the reason in its context. A cell whose input is another
-cell's `/x` composes. Results are computed on read and never stored.
+the parameters it ran with, `/sys/view/missing` when a parameter was absent
+(the input then passes through unchanged), `/sys/view/fault` for a cycle, a
+bad reference, or a live cell read at a pinned case. A faulted cell reads
+unknown at `/x`; its context says why. A cell whose input is another cell's
+`/x` composes. Results are computed on read and never stored.
 
 Example: count the members of a team.
 
