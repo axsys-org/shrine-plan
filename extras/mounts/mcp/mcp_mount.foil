@@ -1,0 +1,270 @@
+- http_foot
+- lain_peek
+- json
+- mcp_rpc
+- bond
+
+' MCP over the native cards and nothing else: a read is one snapshot
+' (no event), a write is one poke (one event), history is a snapshot
+' over the record's cases, apply is one warp (one event).  Local only.
++ mcp_mount
+  + http
+    \ files=row[[str nat]] state=namespace
+    ^ http_foot/config
+    = plan
+        \ request=http_foot/request now=nat
+        ^ http_foot/action
+        ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
+        ? (mcp_rpc/parse_call request.body)
+         > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
+         > (./ok call) (mcp_mount/dispatch state.self call)
+    | http_foot/add_routes [(http_foot/route "/mcp" plan)] http_foot/empty
+  + json
+    \ body=str
+    ^ http_response
+    | http_response 200 (str/to_atom body) "application/json"
+  + reply
+    \ id=json value=json
+    ^ http_foot/action
+    | ./reply (mcp_mount/json (mcp_rpc/result id value))
+  + fail
+    \ id=json code=nat message=str
+    ^ http_foot/action
+    | ./reply (mcp_mount/json (mcp_rpc/failure id code message))
+  + refuse
+    ' A tool-level error: the call is well formed, the arguments are not.
+    \ id=json message=str
+    ^ http_foot/action
+    | mcp_mount/reply id (mcp_rpc/text_content message .true)
+  + dispatch
+    \ self=iota call=mcp_rpc/call
+    ^ http_foot/action
+    ? (equal call.method "initialize") (mcp_mount/reply call.id (mcp_rpc/initialize "shrine"))
+    ? (equal call.method "notifications/initialized") (./reply (http_driver/response 202 ""))
+    ? (equal call.method "ping") (mcp_mount/reply call.id (json/obj []))
+    ? (equal call.method "tools/list") (mcp_mount/reply call.id (mcp_mount/listing mcp_mount/builtins))
+    ? !(equal call.method "tools/call") (mcp_mount/fail call.id 32601 "Method not found")
+    = name (mcp_rpc/text_at "name" call.params)
+      args (mcp_rpc/object_at "arguments" call.params)
+    ?> (./some pax) (mcp_mount/target self (mcp_rpc/text_at "path" args))
+      | mcp_mount/refuse call.id "path: a segmented namespace address is required"
+    ? (equal name "mcp/read")
+      = c (mcp_mount/care (mcp_rpc/text_at "care" args))
+      | ./snapshot (\ state=namespace (mcp_mount/read call.id c pax state))
+    ? (equal name "mcp/history")
+      = limit (mcp_rpc/num_at "limit" 10 args)
+      | ./snapshot (\ state=namespace (mcp_mount/history call.id pax limit state))
+    ? (equal name "mcp/write")
+      = action (mcp_rpc/text_at "action" args)
+      ? (equal action "cull") (mcp_mount/commit call.id pax .cull)
+      ?> (./some record) (mcp_mount/record (mcp_rpc/object_at "properties" args))
+        | mcp_mount/refuse call.id "properties: slot names to text, numbers, booleans or {type, value}"
+      ? (equal action "poke") (mcp_mount/commit call.id pax (writ/poke record))
+      | mcp_mount/commit call.id pax (writ/make record)
+    ? (equal name "mcp/apply")
+      ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
+        | mcp_mount/refuse call.id "operation: the address of an op card is required"
+      ?> (./some input) (mcp_mount/record (mcp_rpc/object_at "inputs" args))
+        | mcp_mount/refuse call.id "inputs: argument slots to values"
+      | mcp_mount/commit call.id pax (writ/warp op input)
+    | mcp_mount/refuse call.id "Unknown tool"
+  ' ---- addresses and values
+  + target
+    \ self=iota text=str
+    ^ maybe[path]
+    ? (eq text.len 0) .none
+    ?> (./some parsed) (path_parse text) .none
+    ? (eq parsed.len 0) (./some [self])
+    ? (eq_iota parsed.at(0) self) (./some parsed)
+    ? ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys))))) (./some parsed)
+    | ./some parsed.cons(self)
+  + care
+    \ text=str
+    ^ care
+    ? (equal text "x") .x
+    ? (equal text "z") .z
+    .y
+  + care_of
+    \ seg=iota
+    ^ maybe[care]
+    ? (eq_iota seg 'x) (./some .x)
+    ? (eq_iota seg 'y) (./some .y)
+    ? (eq_iota seg 'z) (./some .z)
+    .none
+  + reference
+    ' /h/<care>/<case>/<len>/<path>; case 0 is live.
+    \ text=str
+    ^ maybe[safe]
+    ?> (./some p) (path_parse text) .none
+    ? (lt p.len 4) .none
+    ? !(eq_iota p.at(0) 'h) .none
+    ?> (./some c) (mcp_mount/care_of p.at(1)) .none
+    ?> (./some ver) (dig_of p.at(2)) .none
+    ?> (./some ln) (dig_of p.at(3)) .none
+    = tgt p.drop(4)
+    ? !(eq tgt.len ln) .none
+    | ./some (safe ver c tgt)
+  + pail_of
+    \ value=json
+    ^ maybe[pail]
+    ? value
+     > (./str s) (./some (pails/t s))
+     > (./num neg n) (? neg .none (./some (pails/n n)))
+     > (./boo b) (./some (pails/b b))
+     > (./obj kvs)
+      = kind (mcp_rpc/text_at "type" value)
+        text (mcp_rpc/text_at "value" value)
+      ? (equal kind "str") (./some (pails/t text))
+      ? (equal kind "bool") (./some (pails/b (equal text "true")))
+      ? (equal kind "nat")
+        ?> (./some n) (nat/parse text) .none
+        | ./some (pails/n n)
+      ? (equal kind "path")
+        ?> (./some p) (path_parse text) .none
+        | ./some (pails/p p)
+      ? (equal kind "reference")
+        ?> (./some pin) (mcp_mount/reference text) .none
+        | ./some pin
+      .none
+    .none
+  + record
+    ' Slot names are paths: "sys/weft" and "/sys/weft" both name /sys/weft.
+    \ properties=json
+    ^ maybe[myth]
+    ? properties
+     > (./obj kvs)
+      % i=nat 0 out=myth myth/new
+      ^ maybe[myth]
+      ? (eq i kvs.len) (./some out)
+      = entry kvs.at(i)
+        name (? (and (gt entry.k.len 0) (eq entry.k.at(0) 47)) entry.k (str/cat_all ["/" entry.k]))
+      ?> (./some slot) (path_parse name) .none
+      ?> (./some held) (mcp_mount/pail_of entry.v) .none
+      | _ i.inc out.put(slot held)
+    .none
+  + value_text
+    \ held=pail
+    ^ str
+    ? held
+     > x=pails/t x.t
+     > n=pails/n (nat/show n.n)
+     > b=pails/b (? b.b "true" "false")
+     > p=pails/p (path_show p.p)
+     > q=pails/q (iota_show q.q)
+     > pin=safe (path_show pin.spell)
+    "<opaque>"
+  + record_json
+    \ t=myth
+    ^ json
+    | json/obj t.tap.map((\ [key val] (jkv (path_show key) (json/str (mcp_mount/value_text val)))))
+  + view_json
+    \ pax=path tree=axal[myth] reference=maybe[safe]
+    ^ json
+    = children (tree.kid_tap.map((\ [key child] (mcp_mount/view_json pax.snoc(key) child .none))))
+      props
+        ?> (./some record) tree.fil (json/obj [])
+        | mcp_mount/record_json record
+      pinned
+        ?> (./some pin) reference jnull
+        | json/str (path_show pin.spell)
+    | json/obj
+      [(jkv "path" (json/str (path_show pax)))
+       (jkv "exists" (json/boo (maybe/is_some tree.fil)))
+       (jkv "reference" pinned)
+       (jkv "properties" props)
+       (jkv "children" (json/arr children))]
+  + case_of
+    \ pax=path state=namespace
+    ^ maybe[nat]
+    ? ((is_xv pax) || (is_cx pax)) (xv_case pax state.local)
+    ? ((is_h pax) || (is_o pax)) .none
+    | state.local.x_case(pax)
+  ' ---- the four answers
+  + read
+    \ id=json c=care pax=path state=namespace
+    ^ [nat str]
+    = tree (sorge[myth] c (sovereign_peek pax state))
+      reference=maybe[safe]
+        ?> (./some n) (mcp_mount/case_of pax state) .none
+        | ./some (safe n .x pax)
+    | [200 (mcp_rpc/result id (mcp_rpc/structured (mcp_mount/view_json pax tree reference)))]
+  + history
+    \ id=json pax=path limit=nat state=namespace
+    ^ [nat str]
+    = cases (mcp_mount/case_of pax state).fall(0)
+      bound (? ((eq limit 0) || (gt limit 40)) 40 limit)
+      count (? (lt cases bound) cases bound)
+    % i=nat 0 out=row[json] []
+    ^ [nat str]
+    ? (eq i count)
+      | [200 (mcp_rpc/result id (mcp_rpc/structured (json/obj
+          [(jkv "path" (json/str (path_show pax))) (jkv "cases" (json/num .false cases)) (jkv "versions" (json/arr out))])))]
+    = pin (safe (sub cases i) .x pax)
+      tree (sovereign_peek pin.spell state)
+      props
+        ?> (./some record) tree.fil (json/obj [])
+        | mcp_mount/record_json record
+      item (json/obj [(jkv "case" (json/num .false (sub cases i))) (jkv "reference" (json/str (path_show pin.spell))) (jkv "properties" props)])
+    | _ i.inc out.snoc(item)
+  + commit
+    \ id=json pax=path wit=writ
+    ^ http_foot/action
+    | ./commit pax wit (\ err=maybe[pail] (mcp_mount/written id pax err))
+  + written
+    \ id=json pax=path err=maybe[pail]
+    ^ http_response
+    ? err
+     > .none
+      | mcp_mount/json (mcp_rpc/result id (mcp_rpc/structured (json/obj [(jkv "path" (json/str (path_show pax))) (jkv "written" (json/boo .true))])))
+     > (./some _)
+      | mcp_mount/json (mcp_rpc/result id (mcp_rpc/text_content "Namespace write rejected" .true))
+  ' ---- the tool list
+  + param
+    : name=str kind=str desc=str
+  + tool
+    : name=str desc=str params=row[mcp_mount/param] required=row[str]
+  + p
+    \ name=str kind=str desc=str
+    ^ mcp_mount/param
+    | mcp_mount/param name kind desc
+  + path_param
+    ^ mcp_mount/param
+    | mcp_mount/p "path" "string" "Segmented namespace address, absolute (/<node>/...) or relative to the node. Derived addresses read too: /x/<cell> is a cell's result, /c/x/<cell> its context (parameters, /missing, /fault), /h/<care>/<case>/<len>/<path> a pinned view."
+  + builtins
+    ^ row[mcp_mount/tool]
+    [(mcp_mount/tool "mcp/read" "Read a record, its slots, its children and its pinned reference. Inert: no event."
+       [mcp_mount/path_param (mcp_mount/p "care" "string" "x the record, y the record and its children, z the subtree. Default y.")]
+       ["path"])
+     (mcp_mount/tool "mcp/write" "Write slots through ordinary admission: one event. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (a /h/<care>/<case>/<len>/<path> spelling; case 0 is live)."
+       [mcp_mount/path_param (mcp_mount/p "properties" "object" "Slot names to values. A cell is /sys/weft (reference to a standard cell under /weft/stdlib, x care) plus /sys/tack (reference to its input, y care) plus its parameters.")
+        (mcp_mount/p "action" "string" "Omitted or make writes the whole record (creating or replacing it); poke merges slots into an existing record; cull deletes the subtree.")]
+       ["path"])
+     (mcp_mount/tool "mcp/history" "The record's x cases, newest first, each with its pinned reference and slots. Inert."
+       [mcp_mount/path_param (mcp_mount/p "limit" "number" "Newest cases to return. Default 10, maximum 40.")]
+       ["path"])
+     (mcp_mount/tool "mcp/apply" "Apply a declared /op to the record with transient inputs: one event."
+       [mcp_mount/path_param (mcp_mount/p "operation" "string" "Address of the op card.")
+        (mcp_mount/p "inputs" "object" "Argument slots to values, encoded as for write.")]
+       ["path" "operation"])]
+  + param_json
+    \ param=mcp_mount/param
+    ^ jkv
+    | jkv param.name (json/obj [(jkv "type" (json/str param.kind)) (jkv "description" (json/str param.desc))])
+  + schema
+    \ tool=mcp_mount/tool
+    ^ json
+    | json/obj
+      [(jkv "type" (json/str "object"))
+       (jkv "properties" (json/obj tool.params.map(mcp_mount/param_json)))
+       (jkv "required" (json/arr tool.required.map((\ name=str (json/str name)))))]
+  + to_json
+    \ tool=mcp_mount/tool
+    ^ json
+    | json/obj
+      [(jkv "name" (json/str tool.name))
+       (jkv "description" (json/str tool.desc))
+       (jkv "inputSchema" (mcp_mount/schema tool))]
+  + listing
+    \ tools=row[mcp_mount/tool]
+    ^ json
+    | json/obj [(jkv "tools" (json/arr tools.map(mcp_mount/to_json)))]
