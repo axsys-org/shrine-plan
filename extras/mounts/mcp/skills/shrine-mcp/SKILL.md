@@ -27,15 +27,14 @@ whole record; `action: poke` merges slots into an existing record and
 A cell is a record that derives its value from other records. It has
 three kinds of slots:
 
-- `/sys/weft`: a reference to a standard cell under `/weft/stdlib`
-  (`count`, `sum`, `where`, `add`, `subtract`, `multiply`, `divide`). Read the
-  standard cell first and use its `reference`.
+- `/sys/weft`: a reference to a standard cell under `/weft/stdlib` (read the
+  standard cell first and use its `reference`).
 - `/sys/tack`: a reference to the input, y care. Case 0 is live:
   `/h/y/0/<len>/<path>` makes the cell follow the input; a pinned case freezes it.
-- parameters: the cell's own slots (`slot`, `into`, `key`, `value`, `left`,
-  `right`). A number is a literal; a path reads a slot of the input's root;
-  `/views/<name>/<slot>` reads a secondary input, which is any other slot
-  holding a reference.
+- parameters: the cell's own slots, named per formula below. A number
+  parameter is a literal (`"12.5"`), a slot of the input root (`/total`), or
+  `/views/<name>/<slot>` of a secondary input. Any other slot holding a
+  reference is a secondary input, reachable as `/views/<slot name>`.
 
 Read `/x/<cell path>` for the result and `/c/x/<cell path>` for its context:
 the parameters it ran with, `/sys/view/missing` when a parameter was absent
@@ -43,6 +42,54 @@ the parameters it ran with, `/sys/view/missing` when a parameter was absent
 bad reference, or a live cell read at a pinned case. A faulted cell reads
 unknown at `/x`; its context says why. A cell whose input is another cell's
 `/x` composes. Results are computed on read and never stored.
+
+### Numbers and dates
+
+A number slot holds a natural. A record may carry `/scale`: every number in
+that record is an integer scaled by ten to that power (`1250` with `/scale 2`
+is 12.50). Formulas align scales to the larger one and write `/scale` on
+their output root; `round` rescales to `/places`. Dates and durations are
+numbers in their own unit and compare as such.
+
+### The standard cells
+
+| formula | parameters | result |
+|---|---|---|
+| `count` | `into` (default `/count`) | number of children |
+| `sum`, `min`, `max`, `avg` | `slot`, `into` | the figure over the children's `slot`, with `/scale`; `avg` rounds half up |
+| `any`, `all` | `slot`, `into` | whether any / every child's `slot` is true |
+| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains) | the matching children |
+| `sort` | `slot`, `order` (asc, desc) | children re-keyed 1, 2, 3, old key at `/key` |
+| `top` | `slot`, `count` (default 3) | the largest, ranked |
+| `latest`, `earliest` | `slot` | the one child, as the root, key at `/key` |
+| `each` | `left`, `op`, `right`, `into` | a derived slot per child; sides are literals or the child's slots |
+| `lookup` | `key`, `take`, `match` (default `key`), `into`, `from` (default `table`) and a secondary input named by `from` | brings `take` from the matching table row |
+| `distinct` | `slot` | rows with `/value` and `/count` |
+| `select` | `slots` (space separated) | only those slots, on root and children |
+| `by` | `key`, `op` (count, sum, min, max, avg), `slot`, `into` | one row per group value |
+| `grid` | `row`, `col`, `op`, `slot` | rows by `row`, a slot per `col` |
+| `flatten` | | every record below the root, keyed by path |
+| `merge` | secondary inputs | the input's children plus theirs |
+| `add`, `subtract`, `multiply`, `divide` | `left`, `right`, `into` | one figure on the root |
+| `pick` | `from`, `into` | copies a slot (also `/views/...`) onto the root |
+| `put` | `into`, `value` | sets a literal on the root |
+| `round` | `slot`, `places`, `into` | rescales a root number |
+| `since` | `slot`, `from`, `into` | `slot` minus `from` |
+| `between` | `slot`, `from`, `to` | children within the range |
+| `amend` | `notes` (default `notes`) and a secondary input of that name | the input with notes laid over it |
+
+### Hand edits that survive recomputation
+
+Keep overrides beside a cell, in a notes folder: each note is a record with
+`/slot` (the answer slot it changes), `/value`, and `/case` (the input's x
+case when the note was written; read the input cell and copy its
+reference's case). Make a cell with `amend`: its tack is the computed cell's
+`/x`, and a slot named `notes` references the folder. On read, `amend` lays
+each note over the answer. A note whose case equals the input's current case
+applies quietly; a note behind it still applies and `/c/x` reports it at
+`/sys/view/note/<key>` ("note at case N, input now at case M").
+`/sys/view/amended` counts the notes. Removing a note is deleting its
+record. Nothing is cached or replayed.
 
 Example: count the members of a team.
 

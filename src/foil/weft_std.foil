@@ -9,7 +9,17 @@
 ' the input tree from the tack, and returns the context and the
 ' derived tree.  A missing or malformed parameter passes the input
 ' tree through and names the parameter at /sys/view/missing in context'.
+'
+' Numbers.  A number slot holds a natural.  A record may carry /scale
+' (a natural): every number slot in that record is an integer scaled
+' by ten to that power, so 1250 with /scale 2 is 12.50.  Formulas read
+' a number with its record's scale, align scales to the larger one,
+' and write /scale on their output root.  A literal parameter may
+' carry a point: "12.5" is 125 at scale 1.  Dates and durations are
+' numbers too (pails/dm, pails/ds, pails/dr), compared in their own
+' unit.  Nothing here calls, loops or branches on anything but data.
 + weft_std
+  ' ---- answers
   + missing
     ' A parameter the ctor asked for and did not get: say so in the
     ' context' and pass the input tree through unchanged.
@@ -20,6 +30,16 @@
     \ context=myth slot=path value=pail
     ^ [myth axal[myth]]
     | [context (axal/new[myth] (./some (myth/sing slot value)))]
+  + figure
+    ' A root record holding one scaled number.
+    \ context=myth slot=path n=nat s=nat
+    ^ [myth axal[myth]]
+    | [context (axal/new[myth] (./some (myth/sing slot (pails/n n)).put(['scale] (pails/n s))))]
+  + done
+    \ context=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | [context tree]
+  ' ---- parameters
   + text
     ' A text parameter of the cell.
     \ record=myth key=path
@@ -27,88 +47,534 @@
     ?> (./some held) record.get(key) .none
     ? held
      > t=pails/t (./some t.t)
+     > n=pails/n (./some (nat/show n.n))
     .none
+  + text_or
+    \ record=myth key=path default=str
+    ^ str
+    | (weft_std/text record key).fall(default)
   + slot
     ' A slot-path parameter of the cell, with a default when absent.
     \ record=myth key=path default=path
     ^ maybe[path]
     ?> (./some t) (weft_std/text record key) (./some default)
     | path_parse t
-  + number
-    ' A numeric parameter: a literal natural, a slot of the input root, or /views/<slot>/<path> of a secondary input.
-    \ record=myth key=path tree=axal[myth]
+  + slots
+    ' A space-separated list of slot paths.
+    \ record=myth key=path
+    ^ row[path]
+    ?> (./some t) (weft_std/text record key) []
+    | t.split_byte(32).fold []
+      \ acc part
+      ?> (./some pax) (path_parse part) acc
+      acc.snoc(pax)
+  + count_param
+    \ record=myth key=path default=nat
+    ^ nat
+    ?> (./some t) (weft_std/text record key) default
+    | (nat/parse t).fall(default)
+  + view
+    ' A secondary input by its slot name.
+    \ record=myth name=iota
+    ^ maybe[axal[myth]]
+    ?> (./some held) record.get(['views name]) .none
+    ?> v=cell_view held .none
+    | ./some (unpin v.tree)
+  ' ---- numbers
+  + pow10
+    \ k=nat
+    ^ nat
+    % i=nat 0 acc=nat 1
+    ? (eq i k) acc
+    | _ i.inc (mul acc 10)
+  + scale_of
+    \ record=myth
+    ^ nat
+    ?> (./some held) record.get(['scale]) 0
+    ? held
+     > n=pails/n n.n
+    0
+  + nat_of
+    ' The natural a pail holds: numbers, dates, durations, booleans.
+    \ held=pail
     ^ maybe[nat]
-    ?> (./some t) (weft_std/text record key) .none
-    ? (nat/parse t)
-     > (./some n) (./some n)
+    ? held
+     > n=pails/n (./some n.n)
+     > d=pails/dm (./some d.n)
+     > d=pails/ds (./some d.n)
+     > d=pails/dr (./some d.n)
+     > b=pails/b (./some (? b.b 1 0))
+    .none
+  + slot_figure
+    ' A number slot of a record, with the record's scale.
+    \ record=myth pax=path
+    ^ maybe[[nat nat]]
+    ?> (./some held) record.get(pax) .none
+    ?> (./some n) (weft_std/nat_of held) .none
+    | ./some [n (weft_std/scale_of record)]
+  + literal
+    ' "125" is 125 at scale 0; "12.5" is 125 at scale 1.
+    \ t=str
+    ^ maybe[[nat nat]]
+    = parts t.split_byte(46)
+    ? (eq parts.len 1)
+      ?> (./some n) (nat/parse t) .none
+      | ./some [n 0]
+    ? !(eq parts.len 2) .none
+    = whole parts.at(0)
+      frac parts.at(1)
+    ?> (./some w) (nat/parse (? (eq whole.len 0) "0" whole)) .none
+    ?> (./some f) (nat/parse frac) .none
+    | ./some [(add (mul w (weft_std/pow10 frac.len)) f) frac.len]
+  + figure_in
+    ' A numeric parameter resolved against a record: a literal, a slot
+    ' of that record, or /views/<slot>/<path> of a secondary input.
+    \ context=myth key=path record=myth
+    ^ maybe[[nat nat]]
+    ?> (./some t) (weft_std/text context key) .none
+    ? (weft_std/literal t)
+     > (./some fig) (./some fig)
      > .none
       ?> (./some pax) (path_parse t) .none
-      ' /views/<slot>/<path> reads a secondary input's root record.
       ? (and (gt pax.len 2) (eq_iota pax.at(0) 'views))
-        ?> (./some held) record.get(pax.take(2)) .none
-        ?> view=cell_view held .none
-        = other (unpin view.tree)
-        ?> (./some root) other.fil .none
-        ?> (./some h) root.get(pax.drop(2)) .none
-        ? h
-         > n=pails/n (./some n.n)
-        .none
-      ?> (./some root) tree.fil .none
-      ?> (./some held) root.get(pax) .none
-      ? held
-       > n=pails/n (./some n.n)
-      .none
+        ?> (./some other) (weft_std/view context pax.at(1)) .none
+        ?> (./some orec) other.fil .none
+        | weft_std/slot_figure orec pax.drop(2)
+      | weft_std/slot_figure record pax
+  + figure_of
+    ' A numeric parameter against the input root.
+    \ context=myth key=path tree=axal[myth]
+    ^ maybe[[nat nat]]
+    | weft_std/figure_in context key tree.fil.fall(myth/new)
+  + rescale
+    ' Move a number from one scale to another, rounding half up.
+    \ n=nat from=nat to=nat
+    ^ nat
+    ? (eq from to) n
+    ? (lt from to) (mul n (weft_std/pow10 (sub to from)))
+    = d (weft_std/pow10 (sub from to))
+    | div (add n (div d 2)) d
+  + align
+    ' Two figures at the larger of their scales.
+    \ a=[nat nat] b=[nat nat]
+    ^ [nat nat nat]
+    = [an as] a
+      [bn bs] b
+      s (? (lt as bs) bs as)
+    | [(weft_std/rescale an as s) (weft_std/rescale bn bs s) s]
+  + show_figure
+    \ n=nat s=nat
+    ^ str
+    ? (eq s 0) (nat/show n)
+    = d (weft_std/pow10 s)
+      frac (nat/show (mod n d))
+      pad
+        % i=nat frac.len acc=str ""
+        ? (eq i s) acc
+        | _ i.inc acc.cat("0")
+    | str/cat_all [(nat/show (div n d)) "." pad frac]
+  + show_pail
+    ' The text a pail compares and groups by.
+    \ held=pail
+    ^ str
+    ? held
+     > t=pails/t t.t
+     > n=pails/n (nat/show n.n)
+     > b=pails/b (? b.b "true" "false")
+     > q=pails/q (iota_show q.q)
+     > p=pails/p (path_show p.p)
+     > d=pails/dm (nat/show d.n)
+     > d=pails/ds (nat/show d.n)
+     > d=pails/dr (nat/show d.n)
+    ""
+  ' ---- rows
+  + children
+    \ tree=axal[myth]
+    ^ row[[iota axal[myth]]]
+    | tree.kid_tap.map (\ entry [entry.key entry.val])
+  + child_record
+    \ child=axal[myth]
+    ^ myth
+    | child.fil.fall(myth/new)
+  + keyed
+    ' Children ranked by a slot: [number key child], at the children's
+    ' larger scale, skipping children without the slot.
+    \ tree=axal[myth] slot=path
+    ^ [row[[nat iota axal[myth]]] nat]
+    = rows (weft_std/children tree)
+      s
+        | rows.fold 0
+          \ acc [key child]
+          = cs (weft_std/scale_of (weft_std/child_record child))
+          | ? (lt acc cs) cs acc
+      none=row[[nat iota axal[myth]]] []
+      items
+        | rows.fold none
+          \ acc [key child]
+          ?> (./some fig) (weft_std/slot_figure (weft_std/child_record child) slot) acc
+          = [n cs] fig
+          | acc.snoc([(weft_std/rescale n cs s) key child])
+    | [items s]
+  + ranked
+    ' Insertion sort of ranked rows, ascending or descending by number.
+    \ items=row[[nat iota axal[myth]]] desc=bool
+    ^ row[[nat iota axal[myth]]]
+    = none=row[[nat iota axal[myth]]] []
+    | items.fold none
+      \ out item
+      = [n key child] item
+      % i=nat 0
+      ^ row[[nat iota axal[myth]]]
+      ? (eq i out.len) out.snoc(item)
+      = [m k2 c2] out.at(i)
+      ? (? desc (gt n m) (lt n m)) out.take(i).snoc(item).weld(out.drop(i))
+      | _ i.inc
+  + numbered
+    ' Children re-keyed by rank, each keeping its original key at /key.
+    \ root=maybe[myth] items=row[[nat iota axal[myth]]]
+    ^ axal[myth]
+    % i=nat 0 out=axal[myth] (axal/new[myth] root)
+    ^ axal[myth]
+    ? (eq i items.len) out
+    = [n key child] items.at(i)
+      rec (weft_std/child_record child).put(['key] (pails/q key))
+    | _ i.inc out.rep([($u i.inc)] child.put([] rec))
+  + truthy
+    \ record=myth slot=path
+    ^ bool
+    ?> (./some held) record.get(slot) .false
+    ? held
+     > b=pails/b b.b
+     > n=pails/n (gt n.n 0)
+     > t=pails/t (gt t.t.len 0)
+    .false
+  + matches
+    ' One comparison, by operator: equals, over, under, before, after, contains.
+    \ op=str held=pail value=str
+    ^ bool
+    ? (equal op "contains") (maybe/is_some (str/find value (weft_std/show_pail held)))
+    ? (equal op "equals") (equal (weft_std/show_pail held) value)
+    ?> (./some n) (weft_std/nat_of held) .false
+    ?> (./some lit) (weft_std/literal value) .false
+    = [ln ls] lit
+      m (weft_std/rescale n 0 ls)
+    ? ((equal op "over") || (equal op "after")) (gt m ln)
+    ? ((equal op "under") || (equal op "before")) (lt m ln)
+    .false
+  + reduce
+    ' count, sum, min, max or avg of a slot over ranked rows at scale s.
+    \ op=str items=row[[nat iota axal[myth]]] s=nat
+    ^ [nat nat]
+    ? (equal op "count") [items.len 0]
+    = ns=row[nat] items.map((\ [n key child] n))
+      total=nat ns.fold(0 (\ acc=nat n=nat (add acc n)))
+    ? (equal op "sum") [total s]
+    ? (eq ns.len 0) [0 s]
+    ? (equal op "min") [ns.fold(ns.at(0) (\ acc=nat n=nat (? (lt n acc) n acc))) s]
+    ? (equal op "max") [ns.fold(ns.at(0) (\ acc=nat n=nat (? (gt n acc) n acc))) s]
+    | [(div (add total (div ns.len 2)) ns.len) s]
+  ' ---- reduce a tree to a figure
   + count
     ' The number of children of the input, at /count (or /into).
     \ record=myth tree=axal[myth]
     ^ [myth axal[myth]]
     ?> (./some into) (weft_std/slot record ['into] ['count]) (weft_std/missing record tree "Supply /into as a slot path")
     | weft_std/root record into (pails/n tree.kid.size)
-  + sum
-    ' The sum of the natural at /slot over every record of the input, at /total (or /into).
-    \ record=myth tree=axal[myth]
+  + fold_slot
+    \ record=myth tree=axal[myth] op=str default=path
     ^ [myth axal[myth]]
     ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot as a slot path")
     ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
-    ?> (./some into) (weft_std/slot record ['into] ['total]) (weft_std/missing record tree "Supply /into as a slot path")
-    = total
-        | tree.tap.fold 0
-          \ acc [p q]
-          ?> (./some held) q.get(slot) acc
-          ? held
-           > n=pails/n (add acc n.n)
-          acc
-    | weft_std/root record into (pails/n total)
+    ?> (./some into) (weft_std/slot record ['into] default) (weft_std/missing record tree "Supply /into as a slot path")
+    = [items s] (weft_std/keyed tree slot)
+      [n rs] (weft_std/reduce op items s)
+    | weft_std/figure record into n rs
+  + sum
+    ' The sum of /slot over the children, at /total (or /into).
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/fold_slot record tree "sum" ['total]
+  + min
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/fold_slot record tree "min" ['min]
+  + max
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/fold_slot record tree "max" ['max]
+  + avg
+    ' The mean of /slot over the children, rounded half up at the input's scale, at /avg.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/fold_slot record tree "avg" ['avg]
+  + any
+    ' Whether any child has a true (or non-zero, non-empty) /slot, at /any.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    ?> (./some into) (weft_std/slot record ['into] ['any]) (weft_std/missing record tree "Supply /into as a slot path")
+    | weft_std/root record into (pails/b (weft_std/children tree).any((\ [key child] (weft_std/truthy (weft_std/child_record child) slot))))
+  + all
+    ' Whether every child has a true /slot, at /all.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    ?> (./some into) (weft_std/slot record ['into] ['all]) (weft_std/missing record tree "Supply /into as a slot path")
+    | weft_std/root record into (pails/b (weft_std/children tree).all((\ [key child] (weft_std/truthy (weft_std/child_record child) slot))))
+  ' ---- keep or reshape rows
   + where
-    ' The children of the input whose /key slot equals /value, under the input root.
+    ' The children whose /key slot matches /value under /op (equals, over, under, before, after, contains), under the input root.
     \ record=myth tree=axal[myth]
     ^ [myth axal[myth]]
     ?> (./some key) (weft_std/slot record ['key] []) (weft_std/missing record tree "Supply /key as a slot path")
     ? (eq key.len 0) (weft_std/missing record tree "Supply /key")
     ?> (./some value) (weft_std/text record ['value]) (weft_std/missing record tree "Supply /value")
-    = kept
+    = op (weft_std/text_or record ['op] "equals")
+      kept
         | tree.kid_tap.fold (axal/new[myth] tree.fil)
           \ out entry
           ?> (./some rec) entry.val.fil out
           ?> (./some held) rec.get(key) out
-          ? held
-           > t=pails/t (? (equal t.t value) out.rep([entry.key] entry.val) out)
+          ? (weft_std/matches op held value) out.rep([entry.key] entry.val)
           out
-    | [record kept]
+    | weft_std/done record kept
+  + sort
+    ' The children ranked by /slot (ascending, or /order desc), re-keyed 1, 2, 3 with the old key at /key.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    = desc (equal (weft_std/text_or record ['order] "asc") "desc")
+      [items s] (weft_std/keyed tree slot)
+    | weft_std/done record (weft_std/numbered tree.fil (weft_std/ranked items desc))
+  + top
+    ' The /count (default 3) children with the largest /slot, ranked.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    = n (weft_std/count_param record ['count] 3)
+      [items s] (weft_std/keyed tree slot)
+    | weft_std/done record (weft_std/numbered tree.fil (weft_std/ranked items .true).take(n))
+  + extreme
+    \ record=myth tree=axal[myth] desc=bool
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    = [items s] (weft_std/keyed tree slot)
+      sorted (weft_std/ranked items desc)
+    ? (eq sorted.len 0) (weft_std/done record (axal/new[myth] .none))
+    = [n key child] sorted.at(0)
+    | weft_std/done record (axal/new[myth] (./some (weft_std/child_record child).put(['key] (pails/q key))))
+  + latest
+    ' The child with the largest /slot (a date, usually), as the root, its key at /key.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/extreme record tree .true
+  + earliest
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    | weft_std/extreme record tree .false
+  + arith_op
+    \ op=str a=[nat nat] b=[nat nat]
+    ^ either[str [nat nat]]
+    = [an bn s] (weft_std/align a b)
+    ? (equal op "add") (./ok [(add an bn) s])
+    ? (equal op "multiply") (./ok [(weft_std/rescale (mul an bn) (mul s 2) s) s])
+    ? (equal op "subtract")
+      ? (lt an bn) (./err "Left is smaller than right")
+      | ./ok [(sub an bn) s]
+    ? (equal op "divide")
+      ? (eq bn 0) (./err "Division by zero")
+      | ./ok [(div (add (mul an (weft_std/pow10 s)) (div bn 2)) bn) s]
+    | ./err "Unknown /op: add, subtract, multiply or divide"
+  + each
+    ' A derived slot per child: /into = /left /op /right, where each side is a literal or a slot of the child.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some into) (weft_std/slot record ['into] ['result]) (weft_std/missing record tree "Supply /into as a slot path")
+    = op (weft_std/text_or record ['op] "add")
+      out
+        | tree.kid_tap.fold (axal/new[myth] tree.fil)
+          \ acc entry
+          = rec (weft_std/child_record entry.val)
+          ?> (./some a) (weft_std/figure_in record ['left] rec) acc.rep([entry.key] entry.val)
+          ?> (./some b) (weft_std/figure_in record ['right] rec) acc.rep([entry.key] entry.val)
+          ? (weft_std/arith_op op a b)
+           > (./ok fig)
+            = [n s] fig
+            | acc.rep([entry.key] entry.val.put([] rec.put(into (pails/n n)).put(['scale] (pails/n s))))
+           > (./err _) acc.rep([entry.key] entry.val)
+    | weft_std/done record out
+  + lookup
+    ' For each child, bring /take from the row of /views/<from> whose /match equals the child's /key, into /into.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some key) (weft_std/slot record ['key] []) (weft_std/missing record tree "Supply /key")
+    ?> (./some take) (weft_std/slot record ['take] []) (weft_std/missing record tree "Supply /take")
+    ? ((eq key.len 0) || (eq take.len 0)) (weft_std/missing record tree "Supply /key and /take as slot paths")
+    ?> (./some match) (weft_std/slot record ['match] key) (weft_std/missing record tree "Supply /match as a slot path")
+    ?> (./some into) (weft_std/slot record ['into] take) (weft_std/missing record tree "Supply /into as a slot path")
+    = from ($ts (weft_std/text_or record ['from] "table"))
+    ?> (./some table) (weft_std/view record from) (weft_std/missing record tree "Supply a reference to the table as a slot named by /from")
+    = rows (weft_std/children table)
+      out
+        | tree.kid_tap.fold (axal/new[myth] tree.fil)
+          \ acc entry
+          = rec (weft_std/child_record entry.val)
+          ?> (./some held) rec.get(key) acc.rep([entry.key] entry.val)
+          = wanted (weft_std/show_pail held)
+            nothing=maybe[pail] .none
+            found
+              | rows.fold nothing
+                \ hit [rkey row]
+                ? (maybe/is_some hit) hit
+                = rrec (weft_std/child_record row)
+                ?> (./some mh) rrec.get(match) hit
+                ? !(equal (weft_std/show_pail mh) wanted) hit
+                | rrec.get(take)
+          ?> (./some value) found acc.rep([entry.key] entry.val)
+          | acc.rep([entry.key] entry.val.put([] rec.put(into value)))
+    | weft_std/done record out
+  + distinct
+    ' The values /slot takes over the children, as rows keyed 1, 2, 3 with /value and /count.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    = none=row[[str pail nat]] []
+      groups
+        | (weft_std/children tree).fold none
+          \ acc [key child]
+          ?> (./some held) (weft_std/child_record child).get(slot) acc
+          = shown (weft_std/show_pail held)
+          % i=nat 0
+          ^ row[[str pail nat]]
+          ? (eq i acc.len) acc.snoc([shown held 1])
+          = [s2 h2 c2] acc.at(i)
+          ? (equal s2 shown) acc.take(i).snoc([s2 h2 c2.inc]).weld(acc.drop(i.inc))
+          | _ i.inc
+    % i=nat 0 out=axal[myth] (axal/new[myth] tree.fil)
+    ^ [myth axal[myth]]
+    ? (eq i groups.len) (weft_std/done record out)
+    = [shown held c] groups.at(i)
+    | _ i.inc out.put([($u i.inc)] (myth/sing ['value] held).put(['count] (pails/n c)))
+  + select
+    ' Keep only the slots named in /slots (space separated) on the root and each child.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    = wanted (weft_std/slots record ['slots])
+    ? (eq wanted.len 0) (weft_std/missing record tree "Supply /slots: slot paths separated by spaces")
+    = trim
+        \ rec=myth
+        ^ myth
+        | wanted.fold myth/new
+          \ acc pax
+          ?> (./some held) rec.get(pax) acc
+          acc.put(pax held)
+      out
+        | tree.kid_tap.fold (axal/new[myth] tree.fil.run(trim))
+          \ acc entry
+          | acc.put([entry.key] (trim (weft_std/child_record entry.val)))
+    | weft_std/done record out
+  ' ---- change the shape
+  + by
+    ' Group the children by /key, then /op (count, sum, min, max, avg) their /slot: rows keyed by group value with /value and /into.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some key) (weft_std/slot record ['key] []) (weft_std/missing record tree "Supply /key")
+    ? (eq key.len 0) (weft_std/missing record tree "Supply /key")
+    = op (weft_std/text_or record ['op] "count")
+      slot (weft_std/slot record ['slot] key).fall(key)
+    ?> (./some into) (weft_std/slot record ['into] [($ts op)]) (weft_std/missing record tree "Supply /into as a slot path")
+    = none=row[[str pail axal[myth]]] []
+      groups
+        | (weft_std/children tree).fold none
+          \ acc [k child]
+          ?> (./some held) (weft_std/child_record child).get(key) acc
+          = shown (weft_std/show_pail held)
+          % i=nat 0
+          ^ row[[str pail axal[myth]]]
+          ? (eq i acc.len) acc.snoc([shown held (axal/new[myth] .none).rep([k] child)])
+          = [s2 h2 sub] acc.at(i)
+          ? (equal s2 shown) acc.take(i).snoc([s2 h2 sub.rep([k] child)]).weld(acc.drop(i.inc))
+          | _ i.inc
+    % i=nat 0 out=axal[myth] (axal/new[myth] tree.fil)
+    ^ [myth axal[myth]]
+    ? (eq i groups.len) (weft_std/done record out)
+    = [shown held sub] groups.at(i)
+      [items s] (weft_std/keyed sub slot)
+      [n rs] (? (equal op "count") [sub.kid.size 0] (weft_std/reduce op items s))
+    | _ i.inc out.put([($ts shown)] (myth/sing ['value] held).put(into (pails/n n)).put(['scale] (pails/n rs)))
+  + grid
+    ' Rows keyed by /row value, one slot per /col value, holding /op of /slot.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some rowk) (weft_std/slot record ['row] []) (weft_std/missing record tree "Supply /row")
+    ?> (./some colk) (weft_std/slot record ['col] []) (weft_std/missing record tree "Supply /col")
+    ? ((eq rowk.len 0) || (eq colk.len 0)) (weft_std/missing record tree "Supply /row and /col as slot paths")
+    = op (weft_std/text_or record ['op] "count")
+      slot (weft_std/slot record ['slot] rowk).fall(rowk)
+      none=row[[str str axal[myth]]] []
+      cells
+        | (weft_std/children tree).fold none
+          \ acc [k child]
+          = rec (weft_std/child_record child)
+          ?> (./some rh) rec.get(rowk) acc
+          ?> (./some ch) rec.get(colk) acc
+          = r (weft_std/show_pail rh)
+            c (weft_std/show_pail ch)
+          % i=nat 0
+          ^ row[[str str axal[myth]]]
+          ? (eq i acc.len) acc.snoc([r c (axal/new[myth] .none).rep([k] child)])
+          = [r2 c2 sub] acc.at(i)
+          ? (and (equal r2 r) (equal c2 c)) acc.take(i).snoc([r2 c2 sub.rep([k] child)]).weld(acc.drop(i.inc))
+          | _ i.inc
+    % i=nat 0 out=axal[myth] (axal/new[myth] tree.fil)
+    ^ [myth axal[myth]]
+    ? (eq i cells.len) (weft_std/done record out)
+    = [r c sub] cells.at(i)
+      [items s] (weft_std/keyed sub slot)
+      [n rs] (? (equal op "count") [sub.kid.size 0] (weft_std/reduce op items s))
+      rrec (out.get([($ts r)])).fall(myth/new)
+    | _ i.inc out.put([($ts r)] rrec.put([($ts c)] (pails/n n)))
+  + flatten
+    ' Every record below the root as a child keyed by its path.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    = out
+        | tree.tap.fold (axal/new[myth] tree.fil)
+          \ acc [p q]
+          ? (eq p.len 0) acc
+          | acc.put([($ts (path_show p))] q)
+    | weft_std/done record out
+  + merge
+    ' The input's children plus every secondary input's children (a later view wins a shared key).
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    = out
+        | record.tap.fold (axal/new[myth] tree.fil).uni(tree)
+          \ acc [k v]
+          ? !(and (gt k.len 1) (eq_iota k.at(0) 'views)) acc
+          ?> view=cell_view v acc
+          | (weft_std/children (unpin view.tree)).fold acc
+            \ acc2 [key child]
+            | acc2.rep([key] child)
+    | weft_std/done record out
+  ' ---- combine figures
   + arith
-    ' /left and /right are literal naturals or slots of the input root; the answer goes to /into (or /result).
     \ record=myth tree=axal[myth] op=str
     ^ [myth axal[myth]]
-    ?> (./some left) (weft_std/number record ['left] tree) (weft_std/missing record tree "Supply /left: a number or a slot of the input")
-    ?> (./some right) (weft_std/number record ['right] tree) (weft_std/missing record tree "Supply /right: a number or a slot of the input")
+    ?> (./some left) (weft_std/figure_of record ['left] tree) (weft_std/missing record tree "Supply /left: a number or a slot of the input")
+    ?> (./some right) (weft_std/figure_of record ['right] tree) (weft_std/missing record tree "Supply /right: a number or a slot of the input")
     ?> (./some into) (weft_std/slot record ['into] ['result]) (weft_std/missing record tree "Supply /into as a slot path")
-    ? (equal op "add") (weft_std/root record into (pails/n (add left right)))
-    ? (equal op "multiply") (weft_std/root record into (pails/n (mul left right)))
-    ? (equal op "subtract")
-      ? (lt left right) (weft_std/missing record tree "Left is smaller than right")
-      | weft_std/root record into (pails/n (sub left right))
-    ? (eq right 0) (weft_std/missing record tree "Division by zero")
-    | weft_std/root record into (pails/n (div left right))
+    ? (weft_std/arith_op op left right)
+     > (./ok fig)
+      = [n s] fig
+      | weft_std/figure record into n s
+     > (./err why) (weft_std/missing record tree why)
   + add
     \ record=myth tree=axal[myth]
     ^ [myth axal[myth]]
@@ -125,6 +591,107 @@
     \ record=myth tree=axal[myth]
     ^ [myth axal[myth]]
     | weft_std/arith record tree "divide"
+  + value_in
+    ' Any slot: of the input root, or /views/<slot>/<path> of a secondary input.
+    \ context=myth pax=path tree=axal[myth]
+    ^ maybe[pail]
+    ? (and (gt pax.len 2) (eq_iota pax.at(0) 'views))
+      ?> (./some other) (weft_std/view context pax.at(1)) .none
+      ?> (./some orec) other.fil .none
+      | orec.get(pax.drop(2))
+    ?> (./some root) tree.fil .none
+    | root.get(pax)
+  + pick
+    ' Copy the slot at /from (of the input root, or /views/<slot>/<path>) to /into on the root.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some from) (weft_std/slot record ['from] []) (weft_std/missing record tree "Supply /from")
+    ? (eq from.len 0) (weft_std/missing record tree "Supply /from")
+    ?> (./some into) (weft_std/slot record ['into] from.drop((? (eq_iota from.at(0) 'views) 2 0))) (weft_std/missing record tree "Supply /into")
+    ?> (./some held) (weft_std/value_in record from tree) (weft_std/missing record tree "No value at /from")
+    | weft_std/done record (axal/new[myth] (./some tree.fil.fall(myth/new).put(into held)))
+  + put
+    ' Set /into on the root to the literal /value (a number if it parses, else text).
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some into) (weft_std/slot record ['into] []) (weft_std/missing record tree "Supply /into")
+    ? (eq into.len 0) (weft_std/missing record tree "Supply /into")
+    ?> (./some value) (weft_std/text record ['value]) (weft_std/missing record tree "Supply /value")
+    = held=pail
+        ? (nat/parse value)
+         > (./some n) (pails/n n)
+         > .none (pails/t value)
+    | weft_std/done record (axal/new[myth] (./some tree.fil.fall(myth/new).put(into held)))
+  + round
+    ' Rescale the root's /slot to /places digits (half up), at /into (default: the same slot).
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    ?> (./some into) (weft_std/slot record ['into] slot) (weft_std/missing record tree "Supply /into")
+    = places (weft_std/count_param record ['places] 0)
+      root tree.fil.fall(myth/new)
+    ?> (./some fig) (weft_std/slot_figure root slot) (weft_std/missing record tree "No number at /slot")
+    = [n s] fig
+    | weft_std/figure record into (weft_std/rescale n s places) places
+  ' ---- time
+  + since
+    ' /slot minus /from (a date or number; a literal or a slot), at /since, in the slot's own unit.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some later) (weft_std/figure_of record ['slot] tree) (weft_std/missing record tree "Supply /slot: a date slot of the input")
+    ?> (./some earlier) (weft_std/figure_of record ['from] tree) (weft_std/missing record tree "Supply /from: a date or a slot")
+    ?> (./some into) (weft_std/slot record ['into] ['since]) (weft_std/missing record tree "Supply /into")
+    = [ln en s] (weft_std/align later earlier)
+    ? (lt ln en) (weft_std/missing record tree "/from is later than /slot")
+    | weft_std/figure record into (sub ln en) s
+  + between
+    ' The children whose /slot lies within /from and /to (inclusive), under the input root.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    ?> (./some slot) (weft_std/slot record ['slot] []) (weft_std/missing record tree "Supply /slot")
+    ? (eq slot.len 0) (weft_std/missing record tree "Supply /slot")
+    ?> (./some from) (weft_std/text record ['from]) (weft_std/missing record tree "Supply /from")
+    ?> (./some to) (weft_std/text record ['to]) (weft_std/missing record tree "Supply /to")
+    = kept
+        | tree.kid_tap.fold (axal/new[myth] tree.fil)
+          \ out entry
+          ?> (./some held) (weft_std/child_record entry.val).get(slot) out
+          ? (and !(weft_std/matches "under" held from) !(weft_std/matches "over" held to)) out.rep([entry.key] entry.val)
+          out
+    | weft_std/done record kept
+  ' ---- hand edits that survive recomputation
+  + amend
+    ' Lay the notes at /views/<notes> over the input root, slot by slot.
+    ' A note is a record with /slot (a path), /value, and /case: the
+    ' input's x case when it was written.  A note whose case is behind
+    ' the input's current case still applies, and the context' says so.
+    \ record=myth tree=axal[myth]
+    ^ [myth axal[myth]]
+    = name ($ts (weft_std/text_or record ['notes] "notes"))
+    ?> (./some notes) (weft_std/view record name) (weft_std/missing record tree "Supply a reference to the notes folder as a slot named by /notes")
+    = current
+        ?> (./some held) record.get(['sys 'tack 'case]) 0
+        | (weft_std/nat_of held).fall(0)
+      start [record tree.fil.fall(myth/new)]
+      laid
+        | (weft_std/children notes).fold start
+          \ acc [key note]
+          = [ctx root] acc
+            nrec (weft_std/child_record note)
+          ?> (./some slot) (weft_std/slot nrec ['slot] []) acc
+          ?> (./some value) nrec.get(['value]) acc
+          ? (eq slot.len 0) acc
+          = stamp
+              ?> (./some held) nrec.get(['case]) 0
+              | (weft_std/nat_of held).fall(0)
+            ctx2
+              ? (eq stamp current) ctx
+              | ctx.put(['sys 'view 'note key] (pails/t (str/cat_all ["note at case " (nat/show stamp) ", input now at case " (nat/show current)])))
+          | [ctx2 root.put(slot value)]
+      [ctx root] laid
+    | [ctx.put(['sys 'view 'amended] (pails/n notes.kid.size)) (axal/new[myth] (./some root)).uni(tree)]
+  ' ---- the registry
   + by_name
     ' The ctor a standard cell record names.  Records never hold the
     ' closure itself: a closure in the namespace is copied with every
@@ -134,25 +701,57 @@
     ^ maybe[cell]
     ? (eq_iota name 'count) (./some (cell weft_std/count))
     ? (eq_iota name 'sum) (./some (cell weft_std/sum))
+    ? (eq_iota name 'min) (./some (cell weft_std/min))
+    ? (eq_iota name 'max) (./some (cell weft_std/max))
+    ? (eq_iota name 'avg) (./some (cell weft_std/avg))
+    ? (eq_iota name 'any) (./some (cell weft_std/any))
+    ? (eq_iota name 'all) (./some (cell weft_std/all))
     ? (eq_iota name 'where) (./some (cell weft_std/where))
+    ? (eq_iota name 'sort) (./some (cell weft_std/sort))
+    ? (eq_iota name 'top) (./some (cell weft_std/top))
+    ? (eq_iota name 'latest) (./some (cell weft_std/latest))
+    ? (eq_iota name 'earliest) (./some (cell weft_std/earliest))
+    ? (eq_iota name 'each) (./some (cell weft_std/each))
+    ? (eq_iota name 'lookup) (./some (cell weft_std/lookup))
+    ? (eq_iota name 'distinct) (./some (cell weft_std/distinct))
+    ? (eq_iota name 'select) (./some (cell weft_std/select))
+    ? (eq_iota name 'by) (./some (cell weft_std/by))
+    ? (eq_iota name 'grid) (./some (cell weft_std/grid))
+    ? (eq_iota name 'flatten) (./some (cell weft_std/flatten))
+    ? (eq_iota name 'merge) (./some (cell weft_std/merge))
     ? (eq_iota name 'add) (./some (cell weft_std/add))
     ? (eq_iota name 'subtract) (./some (cell weft_std/subtract))
     ? (eq_iota name 'multiply) (./some (cell weft_std/multiply))
     ? (eq_iota name 'divide) (./some (cell weft_std/divide))
+    ? (eq_iota name 'pick) (./some (cell weft_std/pick))
+    ? (eq_iota name 'put) (./some (cell weft_std/put))
+    ? (eq_iota name 'round) (./some (cell weft_std/round))
+    ? (eq_iota name 'since) (./some (cell weft_std/since))
+    ? (eq_iota name 'between) (./some (cell weft_std/between))
+    ? (eq_iota name 'amend) (./some (cell weft_std/amend))
     .none
   + record
     ' The record of one standard cell: the ctor's name and a title.
     \ name=iota title=str
     ^ myth
     | (myth/sing bond/weft (pails/q name)).put bond/lede (pails/t title)
+  + names
+    ^ row[[iota str]]
+    [['count "Count the input's children"] ['sum "Sum /slot over the children"] ['min "Smallest /slot"] ['max "Largest /slot"]
+     ['avg "Mean of /slot"] ['any "Whether any child has /slot true"] ['all "Whether every child has /slot true"]
+     ['where "Keep the children whose /key matches /value under /op"] ['sort "Rank the children by /slot"] ['top "The /count largest by /slot"]
+     ['latest "The child with the largest /slot"] ['earliest "The child with the smallest /slot"] ['each "A derived slot per child: /left /op /right into /into"]
+     ['lookup "Bring /take from the table row whose /match equals each child's /key"] ['distinct "The values /slot takes, with counts"]
+     ['select "Keep only /slots"] ['by "Group by /key, then /op of /slot"] ['grid "Rows by /row, a slot per /col, /op of /slot"]
+     ['flatten "Every record below the root as a child keyed by its path"] ['merge "The input's children plus every secondary input's"]
+     ['add "Add"] ['subtract "Subtract"] ['multiply "Multiply"] ['divide "Divide"] ['pick "Copy /from to /into on the root"]
+     ['put "Set /into on the root to /value"] ['round "Rescale /slot to /places digits"] ['since "/slot minus /from"]
+     ['between "Keep the children whose /slot lies within /from and /to"] ['amend "Lay the notes at /views/notes over the input, with case stamps"]]
   + seeds
     ' Boot seeds under /weft/stdlib.
     ^ row[[path myth]]
-    [[['weft 'stdlib] (myth/sing bond/lede (pails/t "Standard cells"))]
-     [['weft 'stdlib 'count] (weft_std/record 'count "Count the input's children")]
-     [['weft 'stdlib 'sum] (weft_std/record 'sum "Sum a slot over the input")]
-     [['weft 'stdlib 'where] (weft_std/record 'where "Keep the children whose slot equals a value")]
-     [['weft 'stdlib 'add] (weft_std/record 'add "Add")]
-     [['weft 'stdlib 'subtract] (weft_std/record 'subtract "Subtract")]
-     [['weft 'stdlib 'multiply] (weft_std/record 'multiply "Multiply")]
-     [['weft 'stdlib 'divide] (weft_std/record 'divide "Divide")]]
+    = all weft_std/names
+      first=row[[path myth]] [[['weft 'stdlib] (myth/sing bond/lede (pails/t "Standard cells"))]]
+    | all.fold first
+      \ acc [name title]
+      | acc.snoc([['weft 'stdlib name] (weft_std/record name title)])
