@@ -91,6 +91,12 @@ applies quietly; a note behind it still applies and `/c/x` reports it at
 `/sys/view/amended` counts the notes. Removing a note is deleting its
 record. Nothing is cached or replayed.
 
+A note's `/slot` is a slot of the answer's root (`/revenue`), or a path into
+the answer tree with the slot last (`/d1/amount` corrects one row of a
+`where` result, `/eng/total` one leaf of a `by` breakdown). The record at
+that path must already exist in the answer; otherwise `/c/x` reports the
+note as dangling ("no record at /d9 in the answer") and nothing is created.
+
 Example: count the members of a team.
 
 ```
