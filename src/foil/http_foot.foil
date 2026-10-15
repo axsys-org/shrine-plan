@@ -300,11 +300,24 @@
            "Connection: close" http_foot/crlf http_foot/crlf]
     | add (str/to_atom header) (mul body (bex (mul 8 header.len)))
   + connection
-    '  Plan locally; ask the foot only for namespace work.
-    \ config=http_foot/config fd=nat self=nat
+    '  Plan locally; ask the foot only for namespace work.  A small pool
+    '  of these serves every connection: each is spawned once with the
+    '  routes, and connections reach it as bare fds.  (A fresh actor per
+    '  connection transferred the whole route configuration, with every
+    '  closure's environment, through the message copier on each request;
+    '  that copy was the per-request floor, and it grew with the loaded
+    '  mounts: 319 ms for a one-slot read with the explorer loaded.)
+    \ config=http_foot/config self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
+    % ignored=nat 0
+    = ;[fd extra] (Recv[nat] 0)
+    ; (http_foot/serve config fd foot)
+    | _ 0
+  + serve
+    \ config=http_foot/config fd=nat foot=nat
+    ^ nat
     = encoded=nat
         ? (Try http_foot/read_request fd)
          > (./err _) (http_foot/encode (http_driver/response 400 "Malformed HTTP request"))
@@ -328,19 +341,28 @@
              > response=http_response (http_foot/encode response)
              > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     ; (Try (\ wire=nat (Write fd wire)) encoded)
-    ; (CloseFd fd)
-    | CloseHandle foot
+    | CloseFd fd
+  + pool_size
+    ^ nat
+    4
   + listener
+    '  Connections go round the pool, so one slow connection holds up at
+    '  most its share of the others.
     \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
-    % ignored=nat 0
+      ;workers=row[nat]
+        % i=nat 0 out=row[nat] []
+        ^ row[nat]
+        ? (eq i http_foot/pool_size) out
+        = ;worker (Spawn (http_foot/connection config))
+        ; (SendCaps worker root [foot])
+        | _ i.inc out.snoc(worker)
+    % next=nat 0
     = ;connection (Accept fd)
-      ;actor (Spawn (http_foot/connection config connection))
-    ; (SendCaps actor root [foot])
-    ; (CloseHandle actor)
-    | _ 0
+    ; (Send workers.at(next) connection)
+    | _ (mod next.inc workers.len)
   + reply
     \ conn=nat response=http_response
     ^ nat
