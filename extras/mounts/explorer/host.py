@@ -42,3 +42,13 @@ def check(url, node, timeout):
                 assert body == (Path(__file__).parent / path.rsplit('/', 1)[1]).read_bytes()
             if mime == 'font/ttf':
                 assert body == (Path(__file__).parent / "goo-Sans400.ttf").read_bytes()
+    with urllib.request.urlopen(url + '/live', timeout=timeout) as response:
+        assert response.headers.get_content_type() == 'text/html'
+        assert 'id="live"' in response.read().decode()
+    for path, mime in [('/static/goo-live.html', 'text/html'),
+                       ('/static/goo-live.css', 'text/css'),
+                       ('/static/goo-live.js', 'text/javascript')]:
+        with urllib.request.urlopen(url + path, timeout=timeout) as response:
+            actual = response.headers.get_content_type()
+            assert actual == mime or (mime == "text/javascript" and actual == "application/javascript")
+            assert response.read() == (Path(__file__).parent / path.rsplit('/', 1)[1]).read_bytes()

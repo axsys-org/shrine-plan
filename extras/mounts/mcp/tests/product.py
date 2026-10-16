@@ -396,6 +396,37 @@ def check(base, node, timeout):
     expect('20 a default read answers 100 nodes', tool('read', 'read (1000 records, plain)', path=big, care='y')['nodes'], 100)
     expect('20 a cursor from another read is refused', tool_error('read', path=deals, care='y', next=plain['next']), True)
 
+    # 21. a reads list of three mixed entries costs zero events and agrees with the singles
+    e0 = epoch()
+    trio = tool('read', 'read (reads x3)', reads=[members + '/alice', {'path': deals, 'care': 'y', 'limit': 5}, {'path': deals, 'formula': 'where', 'settings': {'key': '/status', 'value': 'closed'}, 'care': 'y'}])
+    single_a = read(members + '/alice', 'x'); single_b = tool('read', 'read', path=deals, care='y', limit=5); single_c = tool('read', 'read (formula)', path=deals, care='y', formula='where', settings={'key': '/status', 'value': 'closed'})
+    expect('21 a reads list of three mixed entries costs zero events', epoch() - e0, 0)
+    expect('21 and agrees with the singles at the same epoch', (trio['answers'][0]['properties'], [c['path'] for c in trio['answers'][1]['children']], len(trio['answers'][2]['result']['children'])), (single_a['properties'], [c['path'] for c in single_b['children']], len(single_c['result']['children'])))
+    mixed = tool('read', 'read (reads x3)', reads=[members + '/alice', '/x/nowhere/at/all', {'path': deals, 'formula': 'nosuch'}])
+    expect('21 a failed entry answers {path, error} without failing the call', (mixed['answers'][0]['exists'], mixed['answers'][1].get('exists'), mixed['answers'][2].get('error')), (True, False, 'formula: not a standard cell'))
+
+    # 22. a write with a formula read in then
+    then_f = tool('write', 'write (then formula)', records=[{'path': deals + '/f1', 'slots': {'amount': 5, 'status': 'closed'}}],
+                  then=[{'path': deals, 'formula': 'where', 'settings': {'key': '/status', 'value': 'closed'}, 'care': 'y'}, '/x' + cells + '/closed'])
+    expect('22 then takes a formula read and answers it on the admitted state', (any(c['path'].endswith('/f1') for c in then_f['then'][deals]['result']['children']), any(c['path'].endswith('/f1') for c in then_f['then']['/x' + cells + '/closed']['children'])), (True, True))
+
+    # 23. history after with x on the batch and the undo: values as of that epoch
+    before_u = read(members + '/alice', 'x')
+    write(members + '/alice', kind='write (poke)', action='poke', salary=777)
+    e_poke = epoch()
+    tool('write', 'write (undo)', records=[{'path': members + '/alice', 'from': before_u['reference']}])
+    page = tool('history', 'history (events)', after=e_poke - 1, limit=5, **{'with': 'x'})
+    poked, undone = page['events'][0], page['events'][1]
+    expect('23 with shows the poke as the merged record and the undo as the earlier record, each as of its epoch, both tagged', (poked['with'][members + '/alice']['properties'].get('/salary'), undone['with'][members + '/alice']['properties'].get('/salary'), poked['who'], undone['who']), ('777', before_u['properties']['/salary'], 'mcp', 'mcp'))
+    tool('write', 'write (cull)', records=[{'path': deals + '/f1', 'action': 'cull'}])
+    culled = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
+    expect('23 a cull shows exists false', culled['with'][deals + '/f1']['exists'], False)
+
+    # 24. present answers as usual and leaves the epoch unchanged
+    e0 = epoch()
+    shown = tool('read', 'read (present)', path=members + '/alice', care='x', present=True)
+    expect('24 present answers as usual and moves no epoch', (shown['exists'], epoch() - e0), (True, 0))
+
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}
     rows = []
