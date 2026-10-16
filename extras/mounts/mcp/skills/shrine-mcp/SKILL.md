@@ -17,7 +17,9 @@ read     path                               a record, a folder, /x/<cell>, /c/x/
          case     0                         0 live, or a case to read as of then
          formula  where                     run a standard cell over what was read; no record made
          settings {key: "/status", value: "closed"}
-         -> the tree (root slots, children, each with its pinned reference), or unknown with the reason in /c/x
+         limit    100                       nodes per answer, in tap order (a node, then its children by name); never more than 500
+         next     <cursor>                  the next a previous page answered: continue after it
+         -> the tree (root slots, children, each with its pinned reference), nodes, next; or unknown with the reason in /c/x
 
 write    records  [{path, slots, action}, ...]   one or many, one event, admitted whole or refused whole
          from     /h/x/3/<path>             on a record: copy it as it was at that case (undo, redo)
@@ -41,6 +43,16 @@ A read is inert (no event): it returns the record's slots as text, its
 children, whether it exists, and a pinned reference `/h/x/<case>/<len>/<path>`
 that always reads the same value. `care` chooses how much: `x` the record,
 `y` the record and its children (default), `z` the whole subtree.
+
+An answer is at most `limit` nodes (default 100, never more than 500),
+counted in tap order: a node, then its children by name, so a page is the
+tree cut at the same place for the same case and can be re-read. When
+nodes remain the answer names `next`, the last path it rendered; the same
+read with that `next` continues from there, and a node an earlier page
+rendered that still has children comes back as a shell (`paged: true`,
+path and children only). The cap is what bounds the cost of any one call
+to the world: ask a folder a question with `formula` and page what is left,
+never read the world.
 
 A write is one event, however many records it carries: `properties` (or
 `slots`) maps slot names to values.

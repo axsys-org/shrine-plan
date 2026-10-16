@@ -267,7 +267,7 @@ def check(base, node, timeout, seed=None, calls=2000):
     def plain(path, care, kind):
         def go():
             e0 = epoch(); t0 = time.perf_counter()
-            view = tool('read', path=path, care=care)
+            view = tool('read', path=path, care=care, limit=500)       # the cap: an answer is at most 500 nodes
             ms = 1000 * (time.perf_counter() - t0); e1 = epoch()
             samples.append((kind, ms, (e1 - e0) if e0 is not None and e1 is not None else None, count_nodes(view)))
         return go

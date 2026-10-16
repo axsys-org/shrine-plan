@@ -243,6 +243,8 @@ def check(base, node, timeout):
     expect('13 the raise is in the log with its path', any(members + '/alice' in e['touched'] for e in tool('history', 'history (events)', limit=40)['events']), True)
     earlier = tool('history', 'history (events)', before=log['next'], limit=5)
     expect('13 the next cursor pages backwards', earlier['events'][0]['epoch'] < log['events'][-1]['epoch'], True)
+    tail_page = tool('history', 'history (events)', before=6, limit=40)        # fewer events left than the limit: the last page, not a failure
+    expect('13 the last page of the log is the events left, not a refusal', (len(tail_page['events']), tail_page['next']), (5, None))
 
     # 14. concurrency: ten clients, mixed reads and writes on the same cells
     arena = org + '/arena'
@@ -371,9 +373,16 @@ def check(base, node, timeout):
     big = org + '/big'
     for chunk in range(10):
         tool('write', 'write (batch of 100)', records=[{'path': big + '/r' + str(chunk * 100 + i), 'slots': {'status': 'closed' if i % 2 else 'open', 'amount': i}} for i in range(100)])
-    plain = tool('read', 'read (1000 records, plain)', path=big, care='y')
-    searched = tool('read', 'read (1000 records, where)', path=big, care='y', formula='where', settings={'key': '/status', 'value': 'closed'})
-    expect('20 a thousand records: plain read and where read both answer', (len(plain['children']), len(searched['result']['children'])), (1000, 500))
+    plain = tool('read', 'read (1000 records, plain)', path=big, care='y', limit=500)
+    searched = tool('read', 'read (1000 records, where)', path=big, care='y', formula='where', settings={'key': '/status', 'value': 'closed'}, limit=500)
+    expect('20 a thousand records: the plain read answers a page of 500 nodes (the cap, root included) and names the next; so does the where read (500 matches plus the root)', (plain['nodes'], len(plain['children']), plain['next'] is not None, len(searched['result']['children']), searched['next'] is not None), (500, 499, True, 499, True))
+    page2 = tool('read', 'read (1000 records, plain)', path=big, care='y', limit=500, next=plain['next'])
+    page3 = tool('read', 'read (1000 records, plain)', path=big, care='y', limit=500, next=page2['next'])
+    seen = [c['path'] for c in plain['children']] + [c['path'] for c in page2['children']] + [c['path'] for c in page3['children']]
+    expect('20 three pages cover the thousand once, the root shell on the later pages', (len(set(seen)), len(seen), page2.get('paged'), page3['next']), (1000, 1000, True, None))
+    expect('20 the cap holds whatever the limit asks', tool('read', 'read (1000 records, plain)', path=big, care='y', limit=5000)['nodes'], 500)
+    expect('20 a default read answers 100 nodes', tool('read', 'read (1000 records, plain)', path=big, care='y')['nodes'], 100)
+    expect('20 a cursor from another read is refused', tool_error('read', path=deals, care='y', next=plain['next']), True)
 
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}

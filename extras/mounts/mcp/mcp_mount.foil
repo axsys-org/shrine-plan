@@ -63,11 +63,16 @@
         formula (mcp_rpc/text_at "formula" args)
         at (mcp_rpc/num_at "case" 0 args)
         pax (? (and (gt at 0) !(mcp_mount/derived pax)) (safe at c pax).spell pax)
+        limit (mcp_rpc/num_at "limit" 100 args)
+        budget (? ((eq limit 0) || (gt limit 500)) 500 limit)
+        next_text (mcp_rpc/text_at "next" args)
+      ?> (./some cursor) (mcp_mount/cursor self pax next_text)
+        | mcp_mount/refuse call.id "next: the cursor a previous page of this same read answered"
       ? (gt formula.len 0)
         ?> (./some settings) (mcp_mount/record (mcp_rpc/object_at "settings" args))
           | mcp_mount/refuse call.id "settings: the formula's parameters, as slot names to values"
-        | ./snapshot (\ state=namespace (mcp_mount/searched call.id c pax ($ts formula) settings state))
-      | ./snapshot (\ state=namespace (mcp_mount/read call.id c pax state))
+        | ./snapshot (\ state=namespace (mcp_mount/searched call.id c pax ($ts formula) settings cursor budget state))
+      | ./snapshot (\ state=namespace (mcp_mount/read call.id c pax cursor budget state))
     ? (equal name "mcp/history")
       = limit (mcp_rpc/num_at "limit" 10 args)
       | ./snapshot (\ state=namespace (mcp_mount/history call.id pax limit state))
@@ -217,32 +222,89 @@
     ' A read with a formula: the named standard cell run over the
     ' snapshot with the settings as its context.  A cell that was never
     ' written: no event, no record, the same evaluation.
-    \ id=json c=care pax=path name=iota settings=myth state=namespace
+    \ id=json c=care pax=path name=iota settings=myth after=maybe[path] budget=nat state=namespace
     ^ [nat str]
     ?> (./some ck) (weft_std/by_name name)
       | [200 (mcp_rpc/result id (mcp_rpc/text_content "formula: not a standard cell" .true))]
     = tree (sorge[myth] c (sovereign_peek pax state))
       [ctx out] (ck.get settings tree)
-      body (json/obj [(jkv "formula" (json/str (mcp_mount/iota_text name))) (jkv "result" (mcp_mount/view_json pax out state))
-                      (jkv "context" (mcp_mount/record_json ctx))])
+      [view nodes last more] (mcp_mount/paged pax out state after budget)
+      body (json/obj [(jkv "formula" (json/str (mcp_mount/iota_text name))) (jkv "result" view)
+                      (jkv "context" (mcp_mount/record_json ctx))
+                      (jkv "nodes" (json/num .false nodes)) (jkv "next" (mcp_mount/cursor_json last more))])
     | [200 (mcp_rpc/result id (mcp_rpc/structured body))]
-  + view_json
-    ' A tree as JSON; every node carries its own pinned reference.
+  + node_json
+    ' One node's own fields, without its children.
     \ pax=path tree=axal[myth] state=namespace
-    ^ json
-    = children (tree.kid_tap.map((\ [key child] (mcp_mount/view_json pax.snoc(key) child state))))
-      props
+    ^ row[jkv]
+    = props
         ?> (./some record) tree.fil (json/obj [])
         | mcp_mount/record_json record
-      pinned (mcp_mount/reference_of pax state)
-    | json/obj
-      [(jkv "path" (json/str (mcp_mount/shown pax)))
+    | [(jkv "path" (json/str (mcp_mount/shown pax)))
        (jkv "exists" (json/boo (maybe/is_some tree.fil)))
-       (jkv "reference" pinned)
+       (jkv "reference" (mcp_mount/reference_of pax state))
        (jkv "reference_y" (mcp_mount/reference_y pax state))
        (jkv "reference_z" (mcp_mount/reference_z pax state))
-       (jkv "properties" props)
-       (jkv "children" (json/arr children))]
+       (jkv "properties" props)]
+  + paged
+    ' A tree rendered in tap order (a node, then its children by name)
+    ' within a budget of nodes, continuing after a cursor (the last
+    ' path a previous page rendered, relative to this node): the json,
+    ' the nodes rendered, the last path rendered, and whether nodes
+    ' remain.  A node an earlier page rendered that still has children
+    ' to render comes back as a shell (path and children, "paged"
+    ' true); shells do not count against the budget.  Every page is
+    ' the same tree cut at the same places for the same case, so a
+    ' page can be re-read.
+    \ pax=path tree=axal[myth] state=namespace after=maybe[path] budget=nat
+    ^ [json nat maybe[path] bool]
+    = fresh !(maybe/is_some after)
+    ? (and fresh (eq budget 0)) [jnull 0 .none .true]
+    = none=maybe[path] .none
+      seek=maybe[iota]
+        ?> (./some c) after .none
+        ? (eq c.len 0) .none
+        | ./some c.at(0)
+      rest=maybe[path]
+        ?> (./some c) after .none
+        ? (eq c.len 0) .none
+        | ./some c.drop(1)
+      empty=row[json] []
+      ' phase: 0 seeking the cursor's child, 1 rendering, 2 stopped with nodes remaining
+      start=[nat row[json] maybe[path] nat] [(? fresh budget.dec budget) empty (? fresh (./some pax) none) (? (maybe/is_some seek) 0 1)]
+      [left out last phase]
+        | tree.kid_tap.fold start
+          \ acc [key child]
+          = [l o la ph] acc
+          ? (eq ph 2) acc
+          = on_cursor (and (eq ph 0) (eq_iota key (seek.fall(key))))
+          ? (and (eq ph 0) !on_cursor) acc
+          = below=maybe[path] (? on_cursor rest none)
+          ? (and !on_cursor (eq l 0)) [l o la 2]
+          = [j n la2 m2] (mcp_mount/paged pax.snoc(key) child state below l)
+          ' a shell with nothing rendered beneath it (the cursor node itself, say) is not sent again
+          | [(sub l n) (? (eq n 0) o o.snoc(j)) (? (maybe/is_some la2) la2 la) (? m2 2 1)]
+      children (jkv "children" (json/arr out))
+      shown=json
+        ? fresh (json/obj (mcp_mount/node_json pax tree state).snoc(children))
+        | json/obj [(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "paged" (json/boo .true)) children]
+    | [shown (sub budget left) last (eq phase 2)]
+  + cursor
+    ' The cursor of a read: the last path a previous page rendered,
+    ' which must lie under the path being read; none when absent.
+    \ self=iota pax=path text=str
+    ^ maybe[maybe[path]]
+    = none=maybe[path] .none
+    ? (eq text.len 0) (./some none)
+    ?> (./some p) (mcp_mount/target self text) .none
+    ? !(and (ge p.len pax.len) (pith_prefix pax p)) .none
+    | ./some (./some p.drop(pax.len))
+  + cursor_json
+    \ last=maybe[path] more=bool
+    ^ json
+    ? !more jnull
+    ?> (./some p) last jnull
+    | json/str (mcp_mount/shown p)
   + case_of
     \ pax=path state=namespace
     ^ maybe[nat]
@@ -251,10 +313,18 @@
     | state.local.x_case(pax)
   ' ---- the four answers
   + read
-    \ id=json c=care pax=path state=namespace
+    ' A read answers at most `budget` nodes (the limit, never above
+    ' 500) in tap order and names the last path rendered as `next`
+    ' when nodes remain; the same read with that `next` continues.
+    \ id=json c=care pax=path after=maybe[path] budget=nat state=namespace
     ^ [nat str]
     = tree (sorge[myth] c (sovereign_peek pax state))
-    | [200 (mcp_rpc/result id (mcp_rpc/structured (mcp_mount/view_json pax tree state)))]
+      [view nodes last more] (mcp_mount/paged pax tree state after budget)
+      body=json
+        ? view
+         > (./obj kvs) (json/obj kvs.snoc((jkv "nodes" (json/num .false nodes))).snoc((jkv "next" (mcp_mount/cursor_json last more))))
+        view
+    | [200 (mcp_rpc/result id (mcp_rpc/structured body))]
   + history
     \ id=json pax=path limit=nat state=namespace
     ^ [nat str]
@@ -330,7 +400,11 @@
           | json/obj [(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "written" (json/boo admitted))
                       (jkv "reference" (? admitted (mcp_mount/reference_of pax state) jnull))]
       reads=row[jkv]
-        | then.map (\ pax=path (jkv (mcp_mount/shown pax) (mcp_mount/view_json pax (sorge[myth] .y (sovereign_peek pax state)) state)))
+        | then.map
+          \ pax=path
+          = none=maybe[path] .none
+            [view nodes last more] (mcp_mount/paged pax (sorge[myth] .y (sovereign_peek pax state)) state none 100)
+          | jkv (mcp_mount/shown pax) view
       body (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "records" (json/arr records)) (jkv "refused" (json/boo refused)) (jkv "then" (json/obj reads))])
     ? refused
       | [200 (mcp_rpc/result id (mcp_rpc/structured_error body))]
@@ -406,7 +480,7 @@
           ? (and (gt before 0) !(lt n before)) acc
           acc.snoc(n)
       newest (weft_std/ranked epochs.map((\ n=nat [n [($u n)] myth/new])) .true)
-      page newest.take(bound)
+      page newest.take((? (lt newest.len bound) newest.len bound))
       items=row[json]
         | page.map
           \ [n p rec]
@@ -453,7 +527,9 @@
   + builtins
     ^ row[mcp_mount/tool]
     [(mcp_mount/tool "mcp/read" "Read a record, its slots, its children and its pinned reference. Inert: no event."
-       [mcp_mount/path_param (mcp_mount/p "care" "string" "x the record, y the record and its children, z the subtree. Default y.")]
+       [mcp_mount/path_param (mcp_mount/p "care" "string" "x the record, y the record and its children, z the subtree. Default y.")
+        (mcp_mount/p "limit" "number" "Nodes per answer, in tap order (a node, then its children by name). Default 100, never more than 500.")
+        (mcp_mount/p "next" "string" "The next cursor a previous page of this same read answered: the page after it.")]
        ["path"])
      (mcp_mount/tool "mcp/write" "Write slots through ordinary admission: one event. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (a /h/<care>/<case>/<len>/<path> spelling; case 0 is live)."
        [mcp_mount/path_param (mcp_mount/p "properties" "object" "Slot names to values. A cell is /sys/weft (reference to a standard cell under /weft/stdlib, x care) plus /sys/tack (reference to its input, y care) plus its parameters.")
