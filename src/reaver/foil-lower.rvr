@@ -34,8 +34,15 @@
 (define (group-slot? v)
   (And (IsApp v) (And (Eq 3 (Sz v)) (Eq "#group" (_0 v)))))
 
+;; A grouped entry's value is its member law applied to the member row:
+;; the row is a constant of pinned laws, and each member takes it as its
+;; first argument, so same-unit references project from the row instead
+;; of rebuilding it (see lower-tc-unit-go).
 (define (entry-slot v)
-  (If (group-slot? v) (Ix (_2 v) (Unpin (_1 v))) v))
+  (If (group-slot? v)
+    (let ((row (Unpin (_1 v))))
+      ((Ix (_2 v) row) row))
+    v))
 
 (define (ir-entry-val ent) (entry-slot (Ix 2 ent)))
 (define ir-entry-tc (Ix 3))
@@ -45,8 +52,8 @@
 
 (define fold-app cgen:fold-app)
 
-(define (lower-tc-go resolve-global sut depth val)
-  (define (at d x) (lower-tc-go resolve-global sut d x))
+(define (lower-tc-go-named label resolve-global sut depth val)
+  (define (at d x) (lower-tc-go-named label resolve-global sut d x))
   (define recur (at depth))
   (define (tag-is x) (Eq (Hd val) x))
   (define (lower-lam lam)
@@ -57,7 +64,8 @@
       (at (Add depth (Sz (tc-lam-args lam))) (tc-lam-body lam)))
     ;; tc-lam-args holds the whole frame (self + args); the PLAN law
     ;; arity is the argument count only.  Flags: pinned, marked, recur.
-    (cgen:F yes yes yes "LAM" (Dec (tc-lam-arity val)) body))
+    ;; The law name is profiling metadata: Tracy attributes time per law.
+    (cgen:F yes yes yes label (Dec (tc-lam-arity val)) body))
   (define (call1 f a)
     (cgen:A (cgen:K f) a))
   (define (call2 f a b)
@@ -161,6 +169,14 @@
 
 ;; lower-tc : Subject -> TC -> IR
 ;; Expression lowering for doctests: globals resolve to compiled subject values.
+;; Entries lowered without a definition name keep the historical LAM label.
+(define (lower-tc-go resolve-global sut depth val)
+  (lower-tc-go-named "LAM" resolve-global sut depth val))
+
+;; A law named after its definition path: /unit/entry.
+(define (law-label key)
+  (strcat (map (lambda (seg) (strcat ["/" seg])) key)))
+
 (define (lower-tc sut val)
   (define (resolve-global depth path)
     (cgen:G (got-const path sut)))
@@ -205,14 +221,18 @@
     keys))
 
 ;; lower-tc-unit-go : Subject -> Subject -> [Path] -> Bool -> Subject
-;; Compile all lowerable entries owned by one sealed unit behind one recursive
-;; dispatcher law.  Calling the dispatcher produces the canonical member row;
-;; a same-unit reference projects from a recursive call through the dispatcher's
-;; lexical self. This representation can
-;; construct mutually recursive closures without first constructing a cyclic
-;; runtime value.  (A letrec (cgen:R) variant was prototyped 2026-07-27 and
-;; reverted: it knots genuinely cyclic heap values, which the content-addressed
-;; store cannot pin — the acyclicity here is a load-bearing invariant.)
+;; Compile all lowerable entries owned by one sealed unit as one constant
+;; member row.  Each member is a one-argument law that receives the row and
+;; returns the member's value; a same-unit reference projects the member law
+;; from the row and applies it to the row.  The row is a tree of pinned laws
+;; that mention the row only through their argument, so mutually recursive
+;; members never form a cyclic runtime value.  (The previous shape, a
+;; recursive dispatcher law whose call rebuilt the whole row of member
+;; closures, cost one row construction per same-unit reference: `UNIT/1` at
+;; 58% of supervisor law time in the 2026-10-15 profile.  A letrec (cgen:R)
+;; variant was prototyped 2026-07-27 and reverted: it knots genuinely cyclic
+;; heap values, which the content-addressed store cannot pin — the
+;; acyclicity here is a load-bearing invariant.)
 ;; Imported references remain pinned G edges through `base`.
 ;; Sub-zone helper: open, FORCE
 ;; INSIDE, close.  Closing before the value is demanded attributes none
@@ -246,11 +266,14 @@
         (Ifz external?
           (error ["foil-lower-unit-unsealed-global" ["path" path]])
           (cgen:G (got-const path base))))
-      (let ((unit-row (cgen:A (cgen:V depth) (cgen:K 0))))
-        (cgen:A (cgen:A (cgen:K Ix) (cgen:K (_0 hit))) unit-row))))
+      ;; The member row is the enclosing member law's argument: slot 1 of
+      ;; the outermost frame (slot 0 is that law's self).
+      (let ((row (cgen:V (Add depth 1))))
+        (cgen:A (cgen:A (cgen:A (cgen:K Ix) (cgen:K (_0 hit))) row) row))))
   (define (lower-one key)
     (define ent (got-entry key final))
-    (lower-tc-go resolve-global final 0 (tc-entry-contents ent)))
+    (cgen:F yes yes yes "ROW" 1
+      (lower-tc-go-named (law-label key) resolve-global final 0 (tc-entry-contents ent))))
   (define (lower-all z)
     (map lower-one paths))
   (define binds
@@ -259,20 +282,19 @@
       (lspan "l-ir" (lower-all 0))))
   (Ifz (Sz paths)
     final
-    (let* ((row-body
+    (let* ((row-ir
              (lspan "l-foldapp"
                (fold-app (cgen:K 0)
                  binds)))
-           ;; At row-body depth zero, V 0 is UNIT's self and V 1 is its
-           ;; deliberately unused forcing argument.  Entry-local lambdas add
-           ;; their complete frames to the resolver depth above.
-           (dispatcher (cgen:F yes yes yes "UNIT" 1 row-body))
-           (group-ir (cgen:A dispatcher (cgen:K 0)))
+           ;; The row is a constant: every bind is a closed one-argument law
+           ;; whose body sees V 0 as its own self and V 1 as the row.
+           ;; Entry-local lambdas add their complete frames to the resolver
+           ;; depth above.
            (values
              (If profiled?
                (profile-zone:force-zone "foil.lower.unit.codegen"
-                 (cgen:compile-expr group-ir))
-               (lspan "l-codegen" (cgen:compile-expr group-ir))))
+                 (cgen:compile-expr row-ir))
+               (lspan "l-codegen" (cgen:compile-expr row-ir))))
            (values-pin (lspan "l-pin" (Pin values)))
            (insert-one
              (lambda (out pair[i key])
@@ -286,8 +308,8 @@
                       (ent (make-ir-entry key (tc-entry-span old)
                              ["#group" values-pin i] tc 0)))
                  (insert-entry-sut key ent out)))))
-      ;; The shared dispatcher is compiled once; every entry stores an indexed
-      ;; value and a projection IR suitable for downstream caches/debugging.
+      ;; The row is compiled once; every entry stores its index into it and
+      ;; a projection IR suitable for downstream caches/debugging.
       (lspan "l-insert"
         (foldl insert-one final
           (zip (gen (Sz paths) (lambda (i) i)) paths))))))
