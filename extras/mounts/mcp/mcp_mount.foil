@@ -103,9 +103,10 @@
     ? (equal name "mcp/apply")
       ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
         | mcp_mount/refuse call.id "operation: the address of an op card is required"
-      ?> (./some input) (mcp_mount/record (mcp_rpc/object_at "inputs" args))
-        | mcp_mount/refuse call.id "inputs: argument slots to values"
-      | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] "mcp" (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj []))
+      ? (mcp_mount/record (mcp_rpc/object_at "inputs" args))
+       > (./err why) (mcp_mount/refuse call.id (str/cat "inputs: " why))
+       > (./ok input)
+        | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] "mcp" (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj []))
     | mcp_mount/refuse call.id "Unknown tool"
   ' ---- addresses and values
   + target
@@ -168,19 +169,31 @@
     .none
   + record
     ' Slot names are paths: "sys/weft" and "/sys/weft" both name /sys/weft.
+    ' A slot that does not parse names itself in the refusal.
     \ properties=json
-    ^ maybe[myth]
+    ^ either[str myth]
     ? properties
      > (./obj kvs)
       % i=nat 0 out=myth myth/new
-      ^ maybe[myth]
-      ? (eq i kvs.len) (./some out)
+      ^ either[str myth]
+      ? (eq i kvs.len) (./ok out)
       = entry kvs.at(i)
         name (? (and (gt entry.k.len 0) (eq entry.k.at(0) 47)) entry.k (str/cat_all ["/" entry.k]))
-      ?> (./some slot) (path_parse name) .none
-      ?> (./some held) (mcp_mount/pail_of entry.v) .none
+      ?> (./some slot) (path_parse name) (./err (str/cat_all ["slots: " name " is not a slot name"]))
+      ?> (./some held) (mcp_mount/pail_of entry.v) (./err (mcp_mount/slot_error name entry.v))
       | _ i.inc out.put(slot held)
-    .none
+    (./err "slots: an object of slot names to text, numbers, booleans or {type, value} is required")
+  + slot_error
+    ' Why one slot value was refused, by its form.
+    \ name=str value=json
+    ^ str
+    ? value
+     > (./obj kvs)
+      = kind (mcp_rpc/text_at "type" value)
+      ? (equal kind "reference")
+        (str/cat_all ["slots: " name ": a reference is /h/<care>/<case>/<len>/<path>, len the number of segments after it (the x of a cell's answer counts)"])
+      | str/cat_all ["slots: " name ": {type, value} with type str, bool, nat, path or reference"]
+    (str/cat_all ["slots: " name ": text, a number, a boolean or {type, value}"])
   + shown
     ' A path as text, never raising: a key that is not a printable
     ' symbol renders as a marker instead of failing the read.
@@ -439,10 +452,10 @@
       budget (? ((eq limit 0) || (gt limit 500)) 500 limit)
       formula (mcp_rpc/text_at "formula" obj)
       present (mcp_rpc/bool_at "present" .false obj)
-      settings=maybe[myth]
-        ? (eq formula.len 0) (./some myth/new)
+      settings=either[str myth]
+        ? (eq formula.len 0) (./ok myth/new)
         | mcp_mount/record (mcp_rpc/object_at "settings" obj)
-    ?> (./some given) settings (./err "settings: the formula's parameters, as slot names to values")
+    ?> (./ok given) settings (./err "settings: the formula's parameters, as slot names to values")
     ?> (./some cursor) (mcp_mount/cursor self pinned (mcp_rpc/text_at "next" obj)) (./err "next: the cursor a previous page of this same read answered")
     | ./ok (mcp_mount/spec pinned c at formula given budget cursor present)
   + specs
@@ -522,9 +535,11 @@
       ? (mcp_mount/derived pax) (./err (str/cat_all ["path: " (mcp_mount/shown pax) " is derived and cannot be written"]))
       = action (mcp_rpc/text_at "action" spec)
       ? (equal action "cull") (./ok out.snoc([pax .cull]))
-      ?> (./some record) (mcp_mount/record (mcp_mount/slots_of spec)) (./err "slots: slot names to text, numbers, booleans or {type, value}")
-      ? (equal action "poke") (./ok out.snoc([pax (writ/poke record)]))
-      | ./ok out.snoc([pax (writ/make record)])
+      ? (mcp_mount/record (mcp_mount/slots_of spec))
+       > (./err why) (./err why)
+       > (./ok record)
+        ? (equal action "poke") (./ok out.snoc([pax (writ/poke record)]))
+        | ./ok out.snoc([pax (writ/make record)])
   + batch
     ' The records as one event (admitted whole or refused whole), with
     ' the writer's tag record riding in the same event, then the then
@@ -779,7 +794,10 @@
     | [(json/obj head.snoc((jkv "exists" (json/boo .false))).snoc((jkv "properties" (json/obj [])))) (add text.len 80)]
   + with_json
     ' Each record an event wrote, from the event's own diff (no peek),
-    ' and for a written cell its /x and /c/x at that epoch; at most
+    ' and for a written cell its /x and /c/x: the derivation is spelled
+    ' over the record pinned to the epoch (/x/h/x/e<epoch>/<len>/<path>),
+    ' so the cell is as it was then; a live input is read as it is now.
+    ' At most
     ' `left` nodes per event; returns the json and about how many bytes
     ' it renders to.
     \ self=iota entry=axal[myth] with=maybe[care] epoch=nat left=nat state=namespace
@@ -806,9 +824,10 @@
             c_seg=iota 'c
             xp p.cons(x_seg)
             cp xp.cons(c_seg)
-            [xv xn xl xm b2] (mcp_mount/paged xp (sorge[myth] c (sovereign_peek (mcp_mount/at_epoch c epoch xp) state)) state none (? (lt l2 50) l2 50) .true)
+            pinned (mcp_mount/at_epoch .x epoch p)
+            [xv xn xl xm b2] (mcp_mount/paged xp (sorge[myth] c (sovereign_peek pinned.cons(x_seg) state)) state none (? (lt l2 50) l2 50) .true)
             l3 (sub l2 xn)
-            [cv cn cl cm b3] (mcp_mount/paged cp (sorge[myth] .x (sovereign_peek (mcp_mount/at_epoch .x epoch cp) state)) state none (? (lt l3 50) l3 50) .true)
+            [cv cn cl cm b3] (mcp_mount/paged cp (sorge[myth] .x (sovereign_peek pinned.cons(x_seg).cons(c_seg) state)) state none (? (lt l3 50) l3 50) .true)
           | [kept.snoc((jkv (mcp_mount/shown xp) xv)).snoc((jkv (mcp_mount/shown cp) cv)) (sub l3 cn) (add used (add b1 (add b2 b3)))]
     | [(json/obj kvs) used]
   + at_epoch

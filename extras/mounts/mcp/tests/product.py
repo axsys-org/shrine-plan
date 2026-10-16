@@ -421,6 +421,11 @@ def check(base, node, timeout):
     tool('write', 'write (cull)', records=[{'path': deals + '/f1', 'action': 'cull'}])
     culled = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
     expect('23 a cull shows exists false', culled['with'][deals + '/f1']['exists'], False)
+    traced = cell('traced_count', 'count', live(members), into='/n')
+    told = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
+    expect('23 a written cell inlines its /x and /c/x: the answer exists with its figure, the context names the weft', (told['with']['/x' + traced]['exists'], told['with']['/x' + traced]['properties'].get('/n'), told['with']['/c/x' + traced]['properties'].get('/sys/weft')), (True, str(len(read(members)['children'])), stdlib['count']['value']))
+    short = rpc('tools/call', {'name': 'mcp/write', 'arguments': {'records': [{'path': cells + '/short', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': ref('/h/y/0/5/x' + traced)}}]}}, 'write (refused)')['result']['content'][0]['text']
+    expect('23 a reference whose len is short is refused naming the slot and the rule', ('/sys/tack' in short, 'len' in short), (True, True))
 
     # 24. present answers as usual and leaves the epoch unchanged
     e0 = epoch()

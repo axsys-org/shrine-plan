@@ -62,7 +62,8 @@ history  path     /user/org/deals/d1   a record's cases, newest first, with refe
          after    <epoch>              the event log after that epoch, oldest first (next = the last epoch given)
          limit    40                   never over 200
          with     x | y                each event's written records inline, as they were at that epoch
-                                       (a written cell's /x and /c/x too; not ancestors, never the system folders)
+                                       (a written cell's /x and /c/x too: the cell as it was then, over a live
+                                       input as it is now; not ancestors, never the system folders)
          who      all | <id>           which writers: absent, every writer but system; all; one writer
          -> {events: [{epoch, who, touched, touched_count, with}], next}
 ```
@@ -103,7 +104,9 @@ three kinds of slots:
 - `/sys/tack`: a reference to the input at a care: `x` the record alone,
   `y` the record and its children, `z` the whole subtree (interior records
   included). Case 0 is live: `/h/y/0/<len>/<path>` makes the cell follow the
-  input; a pinned case freezes it. A folder with no record of its own is a
+  input; a pinned case freezes it. `<len>` counts every segment of the path
+  that follows, so another cell's answer is `/h/y/0/6/x/0x11/user/org/views/open`
+  (the `x` counts). A folder with no record of its own is a
   fine input (its children are the rows) but has no case of its own to pin
   or stamp against: write a record at the folder (even an empty one) and
   its cases track its children from then on.
