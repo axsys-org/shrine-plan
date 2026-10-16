@@ -284,10 +284,10 @@ def check(base, node, timeout, seed=None, calls=2000):
 
     def poke(i):
         p = rng.choice(records)
-        return lambda: tool('write', 'write poke', path=p, action='poke', properties={'status': 'closed', 'touched': i})
+        return lambda: tool('write', 'write poke', path=p, action='poke', properties={'status': 'closed', 'touched': i + salt[0]})
 
     def make(i):
-        return lambda: tool('write', 'write make', path=home + '/made/m' + str(i), properties={'amount': i, 'status': 'open'})
+        return lambda: tool('write', 'write make', path=home + '/made/m' + str(i), properties={'amount': i + salt[0], 'status': 'open'})
 
     def cull_revive(i):
         folder = scratch[i % len(scratch)]
@@ -299,13 +299,12 @@ def check(base, node, timeout, seed=None, calls=2000):
         return go
 
     def batch20(i):
-        recs = [{'path': home + '/batch/b' + str(i) + '_' + str(k), 'slots': {'amount': k, 'status': 'open'}} for k in range(20)]
-        return lambda: tool('write', 'write batch of 20', records=recs)
+        return lambda: tool('write', 'write batch of 20', records=[{'path': home + '/batch/b' + str(i) + '_' + str(k), 'slots': {'amount': k + salt[0], 'status': 'open'}} for k in range(20)])
 
     def with_then(i):
         folder = rng.choice(folder_list)
         p = folder + '/r' + str(rng.randrange(folders[folder][1]))
-        return lambda: tool('write', 'write with then (x2)', records=[{'path': p, 'action': 'poke', 'slots': {'amount': 1000 + i}}],
+        return lambda: tool('write', 'write with then (x2)', records=[{'path': p, 'action': 'poke', 'slots': {'amount': 1000 + i + salt[0]}}],
                             then=['/x' + sums[folder], '/c/x' + sums[folder]])
 
     def undo(i):
@@ -356,7 +355,7 @@ def check(base, node, timeout, seed=None, calls=2000):
             return None
 
     def journal():
-        return len(read('/' + node + '/log', 'y').get('children', []))
+        return epoch()      # one journal entry per event: the epoch is the journal's size (a read of /log is capped at 500 nodes)
 
     def pct(values, q):
         s = sorted(values)
@@ -382,7 +381,9 @@ def check(base, node, timeout, seed=None, calls=2000):
 
     rss0, journal0 = rss_kb(), journal()
     runs = []
+    salt = [0]      # the warm run writes different values: the same values again would be admitted as no-ops (0 events)
     for label in ('cold run', 'warm run'):
+        salt[0] += 10000
         samples.clear()
         t0 = time.perf_counter()
         for step in plan:
