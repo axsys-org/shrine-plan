@@ -911,7 +911,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
             if time.time() > deadline:
                 raise
             time.sleep(2)
-    assert len(stdlib) == 33, sorted(stdlib)
+    assert len(stdlib) == 34, sorted(stdlib)      # thirty-three formulas and ask
     home = '/' + node_ + '/user/sig/' + str(seed)
     earlier = read(home, 'y')
     if earlier['exists'] or earlier['children']:          # a rerun with the same seed gets its own home under the seed's

@@ -74,7 +74,7 @@ def check(base, node, timeout):
     # 1. the standard library
     lib = read('/' + node + '/weft/stdlib', kind='read stdlib')
     stdlib = {c['path'].rsplit('/', 1)[1]: ref(c['reference']) for c in lib['children']}
-    expect('1 thirty-three formulas present', len(stdlib), 33)
+    expect('1 thirty-four library entries present (thirty-three formulas and ask)', len(stdlib), 34)
     expect('1 each formula has a title', all('/sys/lede' in c['properties'] for c in lib['children']), True)
 
     # 2. the raw data
@@ -243,8 +243,20 @@ def check(base, node, timeout):
     expect('13 the raise is in the log with its path', any(members + '/alice' in e['touched'] for e in tool('history', 'history (events)', limit=40)['events']), True)
     earlier = tool('history', 'history (events)', before=log['next'], limit=5)
     expect('13 the next cursor pages backwards', earlier['events'][0]['epoch'] < log['events'][-1]['epoch'], True)
-    tail_page = tool('history', 'history (events)', before=6, limit=40)        # fewer events left than the limit: the last page, not a failure
+    tail_page = tool('history', 'history (events)', before=6, limit=40, who='all')        # fewer events left than the limit (boot ones: who all): the last page, not a failure
     expect('13 the last page of the log is the events left, not a refusal', (len(tail_page['events']), tail_page['next']), (5, None))
+    seen = log['events'][-1]['epoch']
+    forward = tool('history', 'history (events)', after=seen - 3, limit=2, **{'with': 'x'})
+    expect('13 history after pages forward, oldest first, with each touched record inline', ([e['epoch'] for e in forward['events']], forward['next'], all(isinstance(e['with'], dict) and e['with'] for e in forward['events'])), ([seen - 2, seen - 1], seen - 1, True))
+    resumed = tool('history', 'history (events)', after=forward['next'], limit=40)
+    expect('13 resuming from next continues to the top and stops', (resumed['events'][0]['epoch'], resumed['next']), (seen, None))
+    six = [members + '/alice', members + '/bob', '/x' + cells + '/payroll', '/c/x' + cells + '/payroll', deals + '/d101', org + '/budgets/2026/eng']
+    many = tool('read', 'read (paths)', paths=six, care='x')
+    expect('13 six paths in one read: one tree each, in order, the same shape, zero events', ([a['path'] for a in many['answers']], many['answers'][2]['properties']['/total'], events['read (paths)'][-1]), (six, prop('payroll', '/total'), 0))
+    batch_epoch = tool('write', 'write (batch of 20)', records=[{'path': org + '/wake/w' + str(i), 'slots': {'amount': i}} for i in range(20)])['epoch']
+    woke = tool('history', 'history (events)', after=batch_epoch - 1, limit=40, **{'with': 'x'})
+    first = woke['events'][0]
+    expect('13 history after returns the batch as one item with its twenty records inline', (first['epoch'], len([p for p in first['touched'] if '/w' in p]), sum(1 for p in first['with'] if '/w' in p), first['with'][org + '/wake/w3']['properties']['/amount']), (batch_epoch, 20, 20, '3'))
 
     # 14. concurrency: ten clients, mixed reads and writes on the same cells
     arena = org + '/arena'

@@ -40,7 +40,7 @@ def check(base, node, timeout):
 
     stdlib = {c['path'].rsplit('/', 1)[1]: {'type': 'reference', 'value': c['reference']}
               for c in read('/' + node + '/weft/stdlib')['children']}
-    assert len(stdlib) == 33, sorted(stdlib)
+    assert len(stdlib) == 34, sorted(stdlib)
 
     home = '/' + node + '/user/demo'
     deals = home + '/deals'
