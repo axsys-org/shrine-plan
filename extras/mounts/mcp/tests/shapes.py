@@ -143,9 +143,12 @@ def check(base, node, timeout):
     def run(care, shape, formula, tack, expected, read_care='z', **params):
         """Make the cell, read /x at z (the whole output), compare the whole tree."""
         path = cell(formula, tack, care, **params)
-        e0 = epoch(); t0 = time.perf_counter()
-        view = read('/x' + path, read_care)
-        ms = 1000 * (time.perf_counter() - t0); e1 = epoch()
+        e0 = epoch(); samples = []
+        for _ in range(3):          # three reads, the median: a lone runtime pause of hundreds of ms is not the formula's cost
+            t0 = time.perf_counter()
+            view = read('/x' + path, read_care)
+            samples.append(1000 * (time.perf_counter() - t0))
+        ms = statistics.median(samples); e1 = epoch()
         leaked.extend((formula, shape, k) for k in sys_slots(view))
         got = shape_of(view)
         ok = got == expected

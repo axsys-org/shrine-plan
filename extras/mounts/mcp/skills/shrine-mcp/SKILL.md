@@ -95,6 +95,10 @@ three kinds of slots:
   A live secondary input that resolves to nothing is an empty view, noted at
   `/sys/view/empty/<name>` in `/c/x`; a pinned one, and the tack, must exist.
 
+Ranking (`sort`, `top`, `latest`, `earliest`) and the reductions (`sum`, `min`,
+`max`, `avg`) are by number: a row whose slot is absent or text is left out;
+there is no text ordering.
+
 Three conventions hold in every formula:
 
 - The rows of an input are every record below its root at the tack's care:
@@ -133,11 +137,11 @@ numbers in their own unit and compare as such.
 | `count` | `into` (default `/count`) | number of children |
 | `sum`, `min`, `max`, `avg` | `slot`, `into` | the figure over the children's `slot`, with `/scale`; `avg` rounds half up |
 | `any`, `all` | `slot`, `into` | whether any / every child's `slot` is true |
-| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains) | the matching children |
+| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains) | the matching rows; a number slot compares by value at its scale (`136` at scale 2 is 1.36), anything else as text |
 | `sort` | `slot`, `order` (asc, desc) | rows re-keyed 1, 2, 3, old key at `/key` (a name, or the path as text for a deeper row) |
-| `top` | `slot`, `count` (default 3) | the largest, ranked |
-| `latest`, `earliest` | `slot` | the one child, as the root, key at `/key` |
-| `each` | `left`, `op`, `right`, `into` | a derived slot per child; sides are literals or the child's slots |
+| `top` | `slot`, `count` (default 3) | the largest, ranked; fewer rows than `count` gives fewer |
+| `latest`, `earliest` | `slot` | the one child, as the root, key at `/key`; no row with a number there gives an empty root |
+| `each` | `left`, `op`, `right`, `into` (all four) | a derived slot per child; sides are literals or the child's slots |
 | `lookup` | `key`, `take`, `match` (default `key`), `into`, `from` (default `table`) and a secondary input named by `from` | brings `take` from the matching table row |
 | `distinct` | `slot` | rows with `/value` and `/count` |
 | `select` | `slots` (space separated) | only those slots, on root and children |
@@ -145,9 +149,9 @@ numbers in their own unit and compare as such.
 | `grid` | `row`, `col`, `op`, `slot` | rows by `row`, a slot per `col` |
 | `flatten` | | every record below the root as a direct child, keyed by its path with underscores (`a_x_deep`) |
 | `merge` | secondary inputs | the input's children plus theirs |
-| `except` | `from` (default `other`) naming a secondary input, `key` (optional) | the rows the other view does not have, by `key`'s value or by path |
-| `intersect` | as `except` | the rows the other view also has |
-| `diff` | as `except` | `/added/<row>`, `/removed/<row>`, `/changed/<row>` (each differing slot as `<slot>/from` and `<slot>/to`), counts on the root; against a `/h` reference of the same path it is the change since that case |
+| `except` | `from` (default `other`) naming a secondary input, `key` (optional) | the rows the other view does not have. A row's identity is its path, or with `key` its value there (a row without one is kept) |
+| `intersect` | as `except` | the rows the other view also has (with `key`, a row without a value is dropped) |
+| `diff` | as `except` | `/added/<row>`, `/removed/<row>`, `/changed/<row>` (each differing slot as `<slot>/from` and `<slot>/to`), counts on the root; with `key`, rows without a value are ignored and `changed` compares a row with the first row of the same value; every row counts. Against a `/h` reference of the same path it is the change since that case |
 | `add`, `subtract`, `multiply`, `divide` | `left`, `right`, `into` | one figure on the root |
 | `pick` | `from`, `into` | copies a slot (also `/views/...`) onto the root |
 | `put` | `into`, `value` | sets a literal on the root |
