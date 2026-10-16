@@ -76,6 +76,17 @@ cheap. `touched` lists the first hundred paths the event touched and
 `touched_count` the number. A presented read appears once as `{shown,
 epoch}`.
 
+## The stream
+
+`GET <world-url>/mcp/stream` keeps the connection open as `text/event-stream`
+and receives one line per admitted write, `{epoch, label, who, touched,
+with}` (the written records rendered on the admitted snapshot, the same
+page render `then` uses), and one per presented read, `{shown: {path, care,
+case}}`. A commit never waits on a stream; a stream that stalls is dropped.
+`hands/stream.py` follows it from Python and polls `history after … with x`
+whenever the stream is not there, yielding the same lines either way; the
+ask hand runs on that.
+
 ## Apply
 
 ```

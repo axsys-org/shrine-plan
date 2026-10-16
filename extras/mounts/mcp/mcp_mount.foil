@@ -17,6 +17,9 @@
       plan
         \ request=http_foot/request now=nat
         ^ http_foot/action
+        = url (http_foot/split 63 request.target).at(0)
+          opening=http_foot/action .stream
+        ? (and (equal request.method "GET") (equal url "/mcp/stream")) opening
         ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
         ? (mcp_rpc/parse_call request.body)
          > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
@@ -71,7 +74,9 @@
     ? (equal name "mcp/read")
       ? (mcp_mount/read_spec self args args)
        > (./err why) (mcp_mount/refuse call.id why)
-       > (./ok spec) (./snapshot (\ state=namespace (mcp_mount/read call.id spec state)))
+       > (./ok spec)
+        ? spec.present (./told (\ state=namespace (mcp_mount/read call.id spec state)) (mcp_mount/shown_line spec))
+        | ./snapshot (\ state=namespace (mcp_mount/read call.id spec state))
     ?> (./some pax) (mcp_mount/target self first)
       | mcp_mount/refuse call.id "path: a segmented namespace address is required"
     ? (equal name "mcp/history")
@@ -91,16 +96,16 @@
           ? !(eq w.len 1) []
           | [[[self 'agent 'journal w.at(0)] (writ/make (myth/sing ['wrote] (pails/n specs.len)))]]
       ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
-        | mcp_mount/write_from self call.id specs tag then
+        | mcp_mount/write_from self call.id specs tag who then
       ? (mcp_mount/writes self specs)
-       > (./ok writes) (mcp_mount/batch call.id writes tag then)
+       > (./ok writes) (mcp_mount/batch call.id writes tag who then)
        > (./err why) (mcp_mount/refuse call.id why)
     ? (equal name "mcp/apply")
       ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
         | mcp_mount/refuse call.id "operation: the address of an op card is required"
       ?> (./some input) (mcp_mount/record (mcp_rpc/object_at "inputs" args))
         | mcp_mount/refuse call.id "inputs: argument slots to values"
-      | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj []))
+      | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] "mcp" (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj []))
     | mcp_mount/refuse call.id "Unknown tool"
   ' ---- addresses and values
   + target
@@ -525,9 +530,43 @@
     ' the writer's tag record riding in the same event, then the then
     ' reads on the admitted state, in one answer that lists the records
     ' asked for.
-    \ id=json writes=row[[path writ]] tag=row[[path writ]] then=row[mcp_mount/spec]
+    \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
     ^ http_foot/action
-    | ./batch writes.weld(tag) (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+    | ./batch_told writes.weld(tag)
+        (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+        (\ outcome=maybe[pail] state=namespace (mcp_mount/told_line writes who outcome state))
+  + told_line
+    ' The line every open stream receives for an admitted write:
+    ' {epoch, label, who, touched, with}, with the written records
+    ' rendered on the admitted snapshot through the same page render
+    ' then uses (50 nodes each, 500 for the line); nothing on refusal.
+    \ writes=row[[path writ]] who=str outcome=maybe[pail] state=namespace
+    ^ str
+    ? (maybe/is_some outcome) ""
+    = none=maybe[path] .none
+      empty=row[jkv] []
+      label=str (? (eq writes.len 1) "write" (str/cat_all ["batch of " (nat/show writes.len)]))
+      touched (json/arr writes.map((\ [pax wit] (json/str (mcp_mount/shown pax)))))
+      start=[row[jkv] nat] [empty 500]
+      [kvs left]
+        | writes.fold start
+          \ acc [pax wit]
+          = [out l] acc
+          ? (eq l 0) acc
+          = [view nodes last more bytes] (mcp_mount/paged pax (sorge[myth] .x (sovereign_peek pax state)) state none (? (lt l 50) l 50) .true)
+          | [out.snoc((jkv (mcp_mount/shown pax) view)) (sub l nodes)]
+    | show (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "label" (json/str label)) (jkv "who" (json/str who))
+                      (jkv "touched" touched) (jkv "with" (json/obj kvs))])
+  + shown_line
+    ' The line a presented read pushes: {shown: {path, care, case}}.
+    \ spec=mcp_mount/spec
+    ^ str
+    = care_text=str
+        ? spec.c
+         > .x "x"
+         > .y "y"
+        "z"
+    | show (json/obj [(jkv "shown" (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "care" (json/str care_text)) (jkv "case" (json/num .false spec.at))]))])
   + finished
     \ id=json writes=row[[path writ]] then=row[mcp_mount/spec] outcome=maybe[pail] state=namespace
     ^ [nat str]
@@ -568,7 +607,7 @@
     ' Records whose content comes from another path (an earlier case,
     ' usually): one snapshot renders every source with its types, then
     ' the batch runs; a missing source refuses the whole write.
-    \ self=iota id=json specs=row[json] tag=row[[path writ]] then=row[mcp_mount/spec]
+    \ self=iota id=json specs=row[json] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
     ^ http_foot/action
     = read
         \ state=namespace
@@ -594,7 +633,7 @@
           = filled=row[json]
               | sources.map (\ e=jkv (json/obj [(jkv "path" (json/str e.k)) (jkv "properties" e.v)]))
           ? (mcp_mount/writes self filled)
-           > (./ok writes) (mcp_mount/batch id writes tag then)
+           > (./ok writes) (mcp_mount/batch id writes tag who then)
            > (./err why) (mcp_mount/refuse id why)
     | ./after read next
   + no_json

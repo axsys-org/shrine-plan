@@ -15,11 +15,16 @@ OPENROUTER_API_KEY or OPENAI_API_KEY in the environment is sent as a bearer when
 model (a deterministic summary of the input), for tests. Where the hand left off is /agent/hands/ask/seen {epoch}.
 """
 import argparse
+import importlib.util
 import json
 import os
 import sys
 import time
 import urllib.request
+
+_spec = importlib.util.spec_from_file_location('stream_hand', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream.py'))
+_stream = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_stream)
+stream_follow, stream_poll = _stream.follow, _stream.poll
 
 DEFAULT_ENDPOINT = 'http://127.0.0.1:11434/v1/chat/completions'
 DEFAULT_MODEL = 'llama3.2'
@@ -112,22 +117,30 @@ class Hand:
         weft = props.get('/sys/weft') or ''
         return weft.endswith('/weft/stdlib/ask') or weft.split('/', 5)[-1:] == [self.ask_key]
 
+    def handle(self, line):
+        """One stream line (or one history item shaped like it): learn the ask cells it wrote, note what changed."""
+        if 'epoch' in line:
+            self.seen = max(self.seen, line['epoch'])
+        changed = set()
+        for path, view in (line.get('with') or {}).items():
+            if path.startswith('/x/') or path.startswith('/c/x/'):
+                continue
+            props = view.get('properties') or {}
+            if self.is_ask(props) and props.get('/sys/tack'):
+                self.asks[path] = tack_target(props['/sys/tack'])
+            changed.add(path)
+        return changed
+
     def discover(self):
-        """Every ask cell the log has seen since the hand's seen epoch; the hand's own events are skipped."""
+        """Catch up from the log (the poll's shape) since the hand's seen epoch."""
         changed = set()
         while True:
-            page = self.w.tool('history', after=self.seen, limit=40, **{'with': 'x'})
-            for event in page['events']:
-                for path, view in (event.get('with') or {}).items():
-                    if path.startswith('/x/') or path.startswith('/c/x/'):
-                        continue
-                    props = view.get('properties') or {}
-                    if self.is_ask(props) and props.get('/sys/tack'):
-                        self.asks[path] = tack_target(props['/sys/tack'])
-                    changed.add(path)
-                self.seen = event['epoch']
-            if page.get('next') is None:
+            lines, nxt = stream_poll(self.w.base, self.w.node, self.seen)
+            for line in lines:
+                changed |= self.handle(line)
+            if not lines or nxt == self.seen:
                 break
+            self.seen = nxt
         return changed
 
     def answer(self, cell):
@@ -163,17 +176,29 @@ class Hand:
         return answered
 
 
+    def run(self, follow_lines):
+        """The hand's life: every line the stream (or its poll fallback) yields, then answer what is asking."""
+        for line in follow_lines:
+            self.handle(line)
+            if line.get('who') == 'ask':
+                continue                                  # the hand's own writes
+            for cell in list(self.asks):
+                try:
+                    self.answer(cell)
+                except Exception as e:
+                    self.log(f'ask {cell}: {e}')
+            self.w.tool('write', records=[{'path': self.home + '/seen', 'slots': {'epoch': self.seen}}], who='ask')
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('base'); p.add_argument('--node', default='0x11'); p.add_argument('--model'); p.add_argument('--endpoint')
     p.add_argument('--fake', action='store_true'); p.add_argument('--once', action='store_true'); p.add_argument('--interval', type=float, default=2.0)
     a = p.parse_args(argv)
     hand = Hand(World(a.base, a.node), a.model, a.endpoint, a.fake)
-    while True:
-        n = hand.tick()
-        if a.once:
-            return n
-        time.sleep(a.interval)
+    if a.once:
+        return hand.tick()
+    hand.run(stream_follow(a.base, a.node, seen=hand.seen, interval=a.interval, log=hand.log))
 
 
 if __name__ == '__main__':
