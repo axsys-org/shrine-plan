@@ -15,6 +15,9 @@
       http_foot/action/install
       http_foot/action/write
       http_foot/action/commit
+      http_foot/action/commit_many
+      http_foot/action/batch
+      http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
       http_foot/action/value
@@ -41,6 +44,19 @@
       ' A write whose answer the caller builds from the admission result:
       ' the same poke gift as write, for clients that want JSON back.
       : pax=path wit=writ done={\ maybe[pail]}http_response
+    + commit_many
+      ' Several writes admitted whole or refused whole as one event
+      ' (one journal entry); answered like commit.
+      : writes=row[[pax=path wit=writ]] done={\ maybe[pail]}http_response
+    + batch
+      ' One commit_many, then one snapshot on the admitted state: finish
+      ' receives the event's outcome and that state.  The connection
+      ' actor runs the pair; the foot sees one commit and a snapshot.
+      : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str]
+    + after
+      ' A snapshot whose answer decides the next action: a read that
+      ' feeds a write, in one request.
+      : read={\ namespace}[nat str] next={\ nat str}http_foot/action
     + wait
       : record=myth
     + journal
@@ -69,6 +85,9 @@
       http_foot/action/install
       http_foot/action/write
       http_foot/action/commit
+      http_foot/action/commit_many
+      http_foot/action/batch
+      http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
       http_foot/action/value
@@ -110,6 +129,13 @@
     \ bytes=nat
     ^ str
     | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + body_text
+    ' The text of a response built by a mount: its body is a plain
+    ' atom, never barred, so no byte is stripped (unbar is for the
+    ' marked request and asset bytes only).
+    \ response=http_response
+    ^ str
+    | str/from_atom response.body
   + split
     \ separator=nat text=str
     ^ row[str]
@@ -345,15 +371,51 @@
     = encoded=nat
         ? planned
          > (./done ready) ready
-         > (./ask action)
-          ; (SendCaps foot action [0])
-          = ;[answer extra] (Recv[http_foot/answer] 0)
-          ? answer
-           > response=http_response (http_foot/encode response)
-           > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+         > (./ask action) (http_foot/perform foot action)
     ; (Try (\ wire=nat (Write fd wire)) encoded)
     ; (CloseFd fd)
     | CloseHandle foot
+  + outcome
+    ' The commit answer a batch step reads: 200 admitted, 409 refused.
+    \ err=maybe[pail]
+    ^ http_response
+    ? err
+     > .none (http_driver/response 200 "admitted")
+     > (./some _) (http_driver/response 409 "refused")
+  + ask
+    \ foot=nat action=http_foot/action
+    ^ http_foot/answer
+    ; (SendCaps foot action [0])
+    = ;[answer extra] (Recv[http_foot/answer] 0)
+    answer
+  + encode_answer
+    \ answer=http_foot/answer
+    ^ nat
+    ? answer
+     > response=http_response (http_foot/encode response)
+     > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+  + perform
+    ' Ask the foot and encode its answer.  A batch is one commit_many
+    ' (one event for every record), then one snapshot; an after is a
+    ' snapshot whose answer picks the next action.
+    \ foot=nat action=http_foot/action
+    ^ nat
+    ? action
+     > (./batch writes finish)
+      = ;answer (http_foot/ask foot (http_foot/action/commit_many writes http_foot/outcome))
+        outcome=maybe[pail]
+          ? answer
+           > response=http_response (? (eq response.status 200) .none (./some (pails/t "refused")))
+           > (./bytes status body ctype) .none
+      | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state))))
+     > (./after read next)
+      = ;answer (http_foot/ask foot (http_foot/action/snapshot read))
+      ? answer
+       > response=http_response (http_foot/perform foot (next response.status (http_foot/body_text response)))
+       > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+     > (./reply response) (http_foot/encode response)
+     > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+    | http_foot/encode_answer (http_foot/ask foot action)
   + listener
     \ config=http_foot/config fd=nat self=nat
     ^ nat
@@ -511,11 +573,27 @@
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/poke pax wit))
       | _ serial.inc pending queue.snoc((http_foot/ack/write conn back))
+     > (http_foot/action/batch writes finish)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (http_foot/action/after read next)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "An after is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
      > (http_foot/action/commit pax wit done)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/poke pax wit))
+      | _ serial.inc pending queue.snoc((http_foot/ack/commit conn done))
+     > (http_foot/action/commit_many writes done)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/batch writes))
       | _ serial.inc pending queue.snoc((http_foot/ack/commit conn done))
      > (http_foot/action/wait record)
       ? (eq caps.len 0) (_ serial pending queue)

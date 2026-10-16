@@ -40,22 +40,32 @@ def check(base, node, timeout):
 
     stdlib = {c['path'].rsplit('/', 1)[1]: {'type': 'reference', 'value': c['reference']}
               for c in read('/' + node + '/weft/stdlib')['children']}
-    assert len(stdlib) == 30, sorted(stdlib)
+    assert len(stdlib) == 33, sorted(stdlib)
 
     home = '/' + node + '/user/demo'
     deals = home + '/deals'
+    # a rerun on the same world starts clean: cull the home, then revive it with everything beneath it in one event
+    try:
+        tool('write', records=[{'path': home, 'action': 'cull'}])
+    except AssertionError:
+        pass
+    seed = [(home, {'title': 'demo'})]
+    def put(path, **slots):
+        seed.append((path, slots))
+    put(deals, title='Deals')     # cases belong to records: the folder's record is what a cell's stamp tracks
     for key, amount, status, when, owner in [('d1', 50, 'closed', 10, 'ann'), ('d2', 70, 'open', 20, 'bo'), ('d3', 25, 'closed', 30, 'ann')]:
-        write(deals + '/' + key, amount=amount, status=status, when=when, owner=owner)
-    write(home + '/prices/p1', sku='a', price=5)
-    write(home + '/prices/p2', sku='b', price=7)
-    write(home + '/items/i1', sku='a', qty=2)
-    write(home + '/items/i2', sku='b', qty=3)
-    write(home + '/money/m1', amount=1250, scale=2)
-    write(home + '/money/m2', amount=75, scale=1)
-    write(home + '/flags/f1', ok=True)
-    write(home + '/flags/f2', ok=False)
-    write(home + '/extra/e1', amount=1)
-    write(home + '/budget', amount=300)
+        put(deals + '/' + key, amount=amount, status=status, when=when, owner=owner)
+    put(home + '/prices/p1', sku='a', price=5)
+    put(home + '/prices/p2', sku='b', price=7)
+    put(home + '/items/i1', sku='a', qty=2)
+    put(home + '/items/i2', sku='b', qty=3)
+    put(home + '/money/m1', amount=1250, scale=2)
+    put(home + '/money/m2', amount=75, scale=1)
+    put(home + '/flags/f1', ok=True)
+    put(home + '/flags/f2', ok=False)
+    put(home + '/extra/e1', amount=1)
+    put(home + '/budget', amount=300)
+    tool('write', records=[{'path': p, 'slots': v} for p, v in seed])
 
     cells = home + '/cells'
 
@@ -160,7 +170,7 @@ def check(base, node, timeout):
     expect('a pinned read of a live cell reads unknown', read(pinned, 'x')['exists'], False)
 
     # amend: a note stamped with the input's current case, and a stale one.
-    stamp = int(read('/x' + cells + '/closed_revenue', 'x')['reference'].split('/')[3])
+    stamp = int(read('/c/x' + cells + '/closed_revenue', 'x')['properties']['/sys/tack/case'])
     write(cells + '/notes/n1', slot='/revenue', value=80, case=stamp)
     write(cells + '/notes/n2', slot='/extra', value='x', case=0)
     cell('amended', 'amend', live('/x' + cells + '/closed_revenue'), notes=live(cells + '/notes'))

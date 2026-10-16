@@ -33,12 +33,13 @@ convention. Point the agent at it, or paste it into the system prompt.
 
 ## 3. The walkthrough, as tool calls
 
-Write some data (one event each):
+Write some data (one call, one event, one history entry naming the four paths; the folder gets a record of its own so its cases track its children):
 
 ```
-mcp/write  path=/user/demo/deals/d1  properties={amount: 50, status: "closed", owner: "ann"}
-mcp/write  path=/user/demo/deals/d2  properties={amount: 70, status: "open",   owner: "bo"}
-mcp/write  path=/user/demo/deals/d3  properties={amount: 25, status: "closed", owner: "ann"}
+mcp/write  records=[{path: /user/demo/deals,    slots: {title: "Deals"}},
+                    {path: /user/demo/deals/d1, slots: {amount: 50, status: "closed", owner: "ann"}},
+                    {path: /user/demo/deals/d2, slots: {amount: 70, status: "open",   owner: "bo"}},
+                    {path: /user/demo/deals/d3, slots: {amount: 25, status: "closed", owner: "ann"}}]
 ```
 
 Find the standard cell to use and keep its reference (no event):
@@ -82,8 +83,8 @@ Freeze an answer: the `reference` on any read of `/x/<cell>` is a pinned
 view that always reads the same value.
 
 Override by hand without losing the formula: write a note beside the cell
-with the answer slot, the value and the input's case (the case in the
-cell's reference), then an `amend` cell over it:
+with the answer slot, the value and the input's case (`/sys/tack/case` in
+the computed cell's `/c/x`), then an `amend` cell over it:
 
 ```
 mcp/write  path=/user/demo/cells/notes/n1  properties={slot: "/revenue", value: 80, case: 1}
