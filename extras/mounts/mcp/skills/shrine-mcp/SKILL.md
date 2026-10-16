@@ -41,7 +41,9 @@ the schema knows the word cell.
 
 A read is inert (no event): it returns the record's slots as text, its
 children, whether it exists, and a pinned reference `/h/x/<case>/<len>/<path>`
-that always reads the same value. `care` chooses how much: `x` the record,
+that always reads the same value. The root of an answer also carries
+`reference_y` and `reference_z`, the pinned y and z views a tack uses to
+freeze an input; children carry `reference` only (read a child to pin it). `care` chooses how much: `x` the record,
 `y` the record and its children (default), `z` the whole subtree.
 
 An answer is at most `limit` nodes (default 100, never more than 500),
