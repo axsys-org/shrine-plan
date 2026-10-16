@@ -136,8 +136,15 @@ test('answerOf reads the fault or note from the context and the tree from /x', (
   assert.deepEqual(adapt.answerOf('u', {...xOf('/u', {}), exists: false}, cOf('/u', {})), {bad: 'unknown'});
   assert.deepEqual(adapt.answerOf('e', {path: '/x/e', error: 'too large, page it'}, cOf('/e', {})), {bad: 'too large, page it'});
 });
-test('eventOf labels a history item by its first touched path when the line carries none', () => {
-  assert.deepEqual(adapt.eventOf({epoch: 9, who: 'mcp', touched: [N + '/deals/d1', N + '/deals/d2'], touched_count: 2}), {epoch: 9, label: 'd1 (+1)', who: 'mcp', touched: ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2'], count: 2, with: null});
+test('writtenOf lists the records an event wrote: the with keys without a cell\'s /x and /c/x, else touched without the node root, the journal tag and the ancestors that moved', () => {
+  const w = {['/x' + N + '/views/v']: {}, ['/c/x' + N + '/views/v']: {}, [N + '/views/v']: {}, [N + '/deals/d1']: {}};
+  assert.deepEqual(adapt.writtenOf({touched: ['/0x11', N, N + '/views/v'], with: w}), ['0x11/user/org/views/v', '0x11/user/org/deals/d1']);
+  assert.deepEqual(adapt.writtenOf({touched: ['/0x11', '/0x11/agent/journal/claude', N, N + '/deals', N + '/deals/d1', N + '/deals/d2'], with: null}), ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2']);
+  assert.equal(adapt.eventOf({epoch: 54, who: 'claude', touched: ['/0x11', '/0x11/agent/journal/claude', N, N + '/views', N + '/views/a', N + '/views/b'], touched_count: 6, with: null}).label, 'a (+1)');
+});
+
+test('eventOf labels a history item by its first written record when the line carries none', () => {
+  assert.deepEqual(adapt.eventOf({epoch: 9, who: 'mcp', touched: [N + '/deals/d1', N + '/deals/d2'], touched_count: 2}), {epoch: 9, label: 'd1 (+1)', who: 'mcp', touched: ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2'], records: ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2'], count: 2, with: null});
   assert.equal(adapt.eventOf({epoch: 10, label: 'make cell vendors', who: 'tester', touched: [N + '/views/vendors']}).label, 'make cell vendors');
 });
 

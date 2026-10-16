@@ -20,7 +20,8 @@ function mountViewer(el, source, opts = {}) {
   }
   async function fillAction(det, ev, openRecords) {
     const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
-    const paths = ev.shown ? [ev.shown.path] : ev.touched;
+    const paths = ev.shown ? [ev.shown.path] : (ev.records || ev.touched);
+    openRecords = openRecords && paths.length <= 8;   // a big batch opens record by record, on a click
     const items = await Promise.all(paths.map(async p => {
       const r = await source.read(p, 'x', ev.shown ? ev.shown.case : 0);
       let line;
@@ -30,11 +31,12 @@ function mountViewer(el, source, opts = {}) {
       return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span><span class="p">${esc(p)}</span>${line}</summary><div class="body"></div></details>`;
     }));
     body.innerHTML = items.join('');
-    for (const d of body.querySelectorAll('details.sv-recd')) { if (d.open) await fillRecord(d, ev); d.addEventListener('toggle', () => d.open && fillRecord(d, ev)); }
+    for (const d of body.querySelectorAll('details.sv-recd')) { if (d.open) await fillRecord(d, ev, 'y'); d.addEventListener('toggle', () => d.open && fillRecord(d, ev, 'z')); }
   }
-  async function fillRecord(det, ev) {
+  // a record opened by the page shows itself and its children (y); one the person opens shows its whole subtree (z)
+  async function fillRecord(det, ev, care) {
     const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
-    const r = await source.read(det.dataset.path, 'z', ev.shown ? ev.shown.case : 0);
+    const r = await source.read(det.dataset.path, care, ev.shown ? ev.shown.case : 0);
     body.innerHTML = r ? await recordHTML(source, r, false, new Set()) : '';
   }
 
@@ -63,7 +65,7 @@ const moved = (source, touched) => { const out = new Set(); for (const t of touc
 
 // one action: a line; opens into its records, each a line that opens into the card
 function actionHTML(source, ev, open) {
-  const n = ev.touched.length, mv = moved(source, ev.touched);
+  const n = (ev.records || ev.touched).length, mv = moved(source, ev.touched);
   const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
   return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
 }
@@ -290,9 +292,18 @@ function answerOf(path, x, c) {
   return { tree };
 }
 const summary = t => { const s = Object.entries(t.slots); return s.length ? s[0][1].toLocaleString() + ' ' + s[0][0] : t.kids.length + ' rows'; };
-// a journaled event as the viewer's event; the label the line carries, else the first touched path's tail (+N)
-const labelOf = touched => touched.length ? last(local(touched[0])) + (touched.length > 1 ? ` (+${touched.length - 1})` : '') : 'write';
-const eventOf = e => ({ epoch: e.epoch, label: e.label || labelOf(e.touched || []), who: e.who || 'agent', touched: (e.touched || []).map(local), count: e.touched_count, with: e.with || null });
+// the records an event wrote, as the page lists them: the keys of its `with` (the written records; a cell's
+// /x and /c/x ride along and are left out), else its touched paths without the node root, the writer's
+// journal tag and the ancestors whose cases moved (a touched path that is a proper prefix of another)
+const writtenOf = e => {
+  const w = e.with && typeof e.with === 'object' ? Object.keys(e.with).filter(k => !/^\/x\/|^\/c\/x\//.test(k)) : [];
+  if (w.length) return w.map(local);
+  const t = (e.touched || []).map(local);
+  return t.filter(p => p.includes('/') && !/^[^/]+\/agent\/journal\//.test(p) && !t.some(q => q !== p && q.startsWith(p + '/')));
+};
+// a journaled event as the viewer's event; the label the line carries, else the first written record's tail (+N)
+const labelOf = written => written.length ? last(written[0]) + (written.length > 1 ? ` (+${written.length - 1})` : '') : 'write';
+const eventOf = e => { const records = writtenOf(e); return { epoch: e.epoch, label: e.label || labelOf(records), who: e.who || 'agent', touched: (e.touched || []).map(local), records, count: e.touched_count, with: e.with || null }; };
 
 function mcpSource(opts = {}) {
   const base = opts.base || '', views = local(opts.views), who = opts.who || '';
@@ -379,7 +390,7 @@ function start(doc) {
 }
 
 const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML,
-  adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, summary, world, local, spelling } };
+  adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
 if (typeof document !== 'undefined') { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => start(document)); else start(document); }
