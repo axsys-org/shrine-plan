@@ -244,10 +244,13 @@ def check(base, node, timeout, seed=None, calls=2000):
 
     # ---- apply: an op card is planted by a mount, never written over MCP; use one if the world has any, else measure the refusal
     ops = []
-    for mount in read('/' + node, 'y')['children']:
-        for child in read(mount['path'], 'y').get('children', []):
-            if child['path'].endswith('/op'):
-                ops += [(mount['path'], c['path']) for c in read(child['path'], 'y').get('children', [])]
+    for name in ('app', 'io', 'weft'):      # never the node root at y: that renders the whole world
+        try:
+            for child in read('/' + node + '/' + name, 'y').get('children', []):
+                if child['path'].endswith('/op'):
+                    ops += [('/' + node + '/' + name, c['path']) for c in read(child['path'], 'y').get('children', [])]
+        except Exception:
+            pass
     print(f'apply: {len(ops)} op cards in the world' + ('' if ops else ' (the apply rows measure the refused call)'))
 
     # ---- the mix, built once in a fixed shuffled order and run twice
