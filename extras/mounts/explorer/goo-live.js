@@ -74,7 +74,7 @@ function actionHTML(source, ev, open) {
 // the standing outline: every cell of the views folder with what it says now (the scoreboard, the bug list, the plan)
 function cellsHTML(cells) {
   if (!cells.length) return '';
-  return `<div class="sv-outline">${cells.map(c => `<div class="sv-cell ${c.bad ? 'bad' : c.note ? 'note' : ''}" data-path="${esc(c.path)}"><span class="n">${esc(last(c.path))}</span><span class="f">${esc(c.formula)}</span><span class="a">${esc(c.bad || c.note || c.answer || '')}</span></div>`).join('')}</div>`;
+  return `<div class="sv-outline">${cells.map(c => `<div class="sv-cell ${c.bad ? 'bad' : c.note ? 'note' : ''}" data-path="${esc(c.path)}"><span class="n">${esc(c.rel || last(c.path))}</span><span class="f">${esc(c.formula)}</span><span class="a">${esc(c.bad || c.note || c.answer || '')}</span></div>`).join('')}</div>`;
 }
 // ---------- rendering ----------
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -347,17 +347,29 @@ function mcpSource(opts = {}) {
     const a = await rpc('read', { paths: ['/x' + w, '/c/x' + w], care: 'z', limit: 200 });
     return answerOf(path, a.answers[0], a.answers[1]);
   }
+  // the cells under the views folder, three levels down (a plan, a qa tree with its diff and score folders);
+  // a folder with a hundred or more children is left unopened
   async function graph() {
     if (!views) return { sources: [], cells: [] };
     const folder = await rpc('read', { path: world(views), care: 'y', limit: 500 });
-    const cells = [], sources = new Set();
-    for (const ch of folder.children || []) {
-      if (!ch.properties || !('/sys/weft' in ch.properties)) continue;
+    const cells = [], sources = new Set(), seen = new Set();
+    const take = ch => {
+      if (!ch.properties || !('/sys/weft' in ch.properties) || seen.has(ch.path)) return;
+      seen.add(ch.path);
       const slots = slotsOf(ch.properties), inputs = [], settings = [];
       const o = refOf(slots.over); if (o) inputs.push({ path: o.path, pin: o.pin });
       for (const [k, v] of Object.entries(slots)) { if (k === 'formula' || k === 'over') continue; const r = refOf(v); if (r) inputs.push({ path: r.path, pin: r.pin, view: true }); else settings.push(k + ' ' + v); }
       for (const i of inputs) if (!i.path.startsWith('/x/')) sources.add(i.path);
-      cells.push({ path: local(ch.path), formula: slots.formula.slice(16), settings: settings.join(' '), inputs });
+      cells.push({ path: local(ch.path), rel: local(ch.path).slice(local(views).length + 1), formula: slots.formula.slice(16), settings: settings.join(' '), inputs });
+    };
+    const folders = f => (f.children || []).filter(ch => ch.exists !== false && !(ch.properties && '/sys/weft' in ch.properties) && (ch.children || []).length < 100 && !(ch.properties && '/sys/tack' in ch.properties));
+    let level = [folder];
+    for (let depth = 0; depth < 3 && level.length; depth++) {
+      for (const f of level) for (const ch of f.children || []) take(ch);
+      const below = level.flatMap(folders).filter(ch => depth < 2 && (ch.children || []).length);
+      if (!below.length) break;
+      const pages = await rpc('read', { reads: below.map(ch => ({ path: ch.path, care: 'y', limit: 100 })) });
+      level = (pages.answers || []).filter(a => a && !a.error);
     }
     if (cells.length) {
       const a = await rpc('read', { reads: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });

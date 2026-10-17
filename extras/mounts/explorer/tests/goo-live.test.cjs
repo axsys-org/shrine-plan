@@ -193,10 +193,22 @@ test('graph reads the views folder once and answers every cell in one reads list
   assert.deepEqual(g.sources.map(s => s.path), ['0x11/user/org/members', '0x11/user/org/budgets/2026']);
   assert.equal(g.cells.length, 2);
   const [hc, pr] = g.cells;
-  assert.deepEqual(hc, {path: '0x11/user/org/views/headcount', formula: 'count', settings: 'into /headcount', inputs: [{path: '0x11/user/org/members', pin: null}], answer: '2 headcount', note: undefined, bad: undefined});
+  assert.deepEqual(hc, {path: '0x11/user/org/views/headcount', rel: 'headcount', formula: 'count', settings: 'into /headcount', inputs: [{path: '0x11/user/org/members', pin: null}], answer: '2 headcount', note: undefined, bad: undefined});
   assert.deepEqual(pr.inputs, [{path: '0x11/user/org/members', pin: 4}, {path: '0x11/user/org/budgets/2026', pin: null, view: true}]);
   assert.equal(pr.note, 'Supply /slot'); assert.equal(pr.settings, 'slot /salary into /total');
   assert.deepEqual(await mcpSource({fetch: m.fetch, EventSource: null}).graph(), {sources: [], cells: []}, 'no views folder, no outline');
+});
+
+test('graph walks three levels under the views folder, so a qa tree\'s diff and score cells show, and leaves a wide folder unopened', async () => {
+  const cellAt = (p, f) => ({path: p, exists: true, reference: ref('x', 1, p), properties: {'/sys/weft': '/h/x/1/4/0x11/weft/stdlib/' + f, '/sys/tack': '/h/y/0/4/0x11/user/org/members'}, children: []});
+  const folderAt = (p, kids) => ({path: p, exists: true, reference: ref('x', 1, p), properties: {'/title': 't'}, children: kids});
+  const A = '/0x11/agent/claude';
+  const top = folderAt(A, [folderAt(A + '/qa', [folderAt(A + '/qa/diff', [cellAt(A + '/qa/diff/x', 'diff')]), folderAt(A + '/qa/score', [cellAt(A + '/qa/score/n', 'count')])]), folderAt(A + '/plan', [{path: A + '/plan/s1', exists: true, reference: ref('x', 1, A + '/plan/s1'), properties: {'/text': 's'}, children: []}]), folderAt(A + '/glossary', Array.from({length: 120}, (_, i) => ({path: A + '/glossary/w' + i, exists: true, properties: {'/w': '1'}, children: []}))), cellAt(A + '/views_top', 'sum')]);
+  const byPath = {}; const walk = n => { byPath[n.path] = n; (n.children || []).forEach(walk); }; walk(top);
+  const m = fakeMcp((name, a) => a.reads ? {answers: a.reads.map(r => typeof r === 'string' ? (r.startsWith('/c/x') ? cOf(r.slice(4), {}) : xOf(r.slice(2), {'/n': '1'})) : byPath[r.path])} : top);
+  const g = await mcpSource({fetch: m.fetch, views: A, EventSource: null}).graph();
+  assert.deepEqual(g.cells.map(c => c.rel).sort(), ['qa/diff/x', 'qa/score/n', 'views_top']);
+  assert.ok(!m.calls.some(c => c.args.reads && c.args.reads.some(r => r.path === A + '/glossary')), 'the wide folder is not opened');
 });
 test('follow without a stream delivers the backlog, then polls history after with x; system events are hidden and a read answers from with', async () => {
   const ticks = [], timers = {setInterval: (f, ms) => { ticks.push({f, ms}); return 1; }, clearInterval: () => {}, setTimeout: () => {}};
