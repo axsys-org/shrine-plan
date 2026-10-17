@@ -138,9 +138,21 @@ test('answerOf reads the fault or note from the context and the tree from /x', (
 });
 test('writtenOf lists the records an event wrote: the with keys without a cell\'s /x and /c/x, else touched without the node root, the journal tag and the ancestors that moved', () => {
   const w = {['/x' + N + '/views/v']: {}, ['/c/x' + N + '/views/v']: {}, [N + '/views/v']: {}, [N + '/deals/d1']: {}};
-  assert.deepEqual(adapt.writtenOf({touched: ['/0x11', N, N + '/views/v'], with: w}), ['0x11/user/org/views/v', '0x11/user/org/deals/d1']);
+  assert.deepEqual(adapt.writtenOf({touched: ['/0x11', N, N + '/views/v'], with: w}), ['0x11/user/org/deals/d1', '0x11/user/org/views/v']);
   assert.deepEqual(adapt.writtenOf({touched: ['/0x11', '/0x11/agent/journal/claude', N, N + '/deals', N + '/deals/d1', N + '/deals/d2'], with: null}), ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2']);
   assert.equal(adapt.eventOf({epoch: 54, who: 'claude', touched: ['/0x11', '/0x11/agent/journal/claude', N, N + '/views', N + '/views/a', N + '/views/b'], touched_count: 6, with: null}).label, 'a (+1)');
+});
+
+test('the standing outline lists every cell with what it says now; a diff reads agree or its counts; a record line puts the telling slot first', () => {
+  const html = GooLive.cellsHTML([{path: 'a/qa/diff/x', formula: 'diff', answer: 'agree'}, {path: 'a/qa/score/n', formula: 'count', answer: '7 checks'}, {path: 'a/p/bad', formula: 'count', bad: 'cycle: the input contains this cell'}]);
+  assert.match(html, /class="sv-outline"/); assert.match(html, /<span class="n">x<\/span><span class="f">diff<\/span><span class="a">agree<\/span>/); assert.match(html, /sv-cell bad".*cycle/);
+  assert.equal(adapt.summary({slots: {added: 0, removed: 0, changed: 0}, kids: []}), 'agree');
+  assert.equal(adapt.summary({slots: {added: 2, removed: 0, changed: 1}, kids: []}), '2 added · 1 changed');
+  assert.equal(adapt.summary({slots: {scale: 2, title: 'Orders'}, kids: [1, 2, 3]}), '3 rows');
+  assert.equal(adapt.summary({slots: {scale: 2, total: 30}, kids: []}), '30 total');
+  assert.equal(GooLive.lineHTML({epoch: 52, n: 1, state: 'done', text: 'plan written, eight steps'}), 'text plan written, eight steps · epoch 52');
+  assert.equal(GooLive.lineHTML({amount: 480, category: 'food', day: 2, what: 'pastéis de nata'}), 'what pastéis de nata · amount 480');
+  assert.equal(GooLive.lineHTML({count: 1, scale: 0, value: 'free'}), 'count 1 · scale 0 · value free');
 });
 
 test('eventOf labels a history item by its first written record when the line carries none', () => {
@@ -172,9 +184,9 @@ test('read and answer go through tools/call mcp/read with the plan\'s arguments'
   assert.deepEqual(m.calls[1].args, {paths: ['/x' + hc, '/c/x' + hc], care: 'z', limit: 200});
   assert.deepEqual(a.tree.slots, {headcount: 2}); assert.equal(a.tree.kids[0].slots.salary, 165);
 });
-test('graph reads the views folder once and answers every cell in one paths read', async () => {
+test('graph reads the views folder once and answers every cell in one reads list', async () => {
   const views = {path: N + '/views', exists: true, reference: ref('x', 1, N + '/views'), reference_y: null, reference_z: null, properties: {}, children: [headcount, payroll, {path: N + '/views/readme', exists: true, reference: ref('x', 1, N + '/views/readme'), properties: {'/text': 'not a cell'}, children: []}], nodes: 4, next: null};
-  const m = fakeMcp((name, a) => a.paths ? {answers: a.paths.map(p => p.startsWith('/c/x') ? cOf(p.slice(4), p.includes('payroll') ? {'/sys/view/missing': 'Supply /slot'} : {}) : xOf(p.slice(2), p.includes('payroll') ? {} : {'/headcount': '2'}))} : views);
+  const m = fakeMcp((name, a) => a.reads ? {answers: a.reads.map(p => p.startsWith('/c/x') ? cOf(p.slice(4), p.includes('payroll') ? {'/sys/view/missing': 'Supply /slot'} : {}) : xOf(p.slice(2), p.includes('payroll') ? {} : {'/headcount': '2'}))} : views);
   const g = await mcpSource({fetch: m.fetch, views: '/0x11/user/org/views', EventSource: null}).graph();
   assert.equal(m.calls.length, 2);
   assert.deepEqual(m.calls[0].args, {path: N + '/views', care: 'y', limit: 500});

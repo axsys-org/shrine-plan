@@ -8,7 +8,7 @@
 
 function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-when"></div></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
   const $ = sel => el.querySelector(sel);
   const state = { events: [], shown: null };
 
@@ -26,8 +26,8 @@ function mountViewer(el, source, opts = {}) {
       const r = await source.read(p, 'x', ev.shown ? ev.shown.case : 0);
       let line;
       if (r && r.record === null) line = '<span class="m gone">deleted</span>';
-      else if (r && isCell(r.record)) { const a = await source.answer(p); const sl = a.tree ? Object.entries(a.tree.slots) : []; line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (sl.length ? sl[0][1].toLocaleString() + ' ' + sl[0][0] : (a.tree ? a.tree.kids.length + ' rows' : '')))}</span>`; }
-      else { const sl = r ? Object.entries(r.record || {}).slice(0, 3) : []; line = `<span class="m">${sl.map(([k, v]) => esc(k) + ' ' + (typeof v === 'number' ? v.toLocaleString() : esc(String(v)).slice(0, 24))).join(' · ')}</span>`; }
+      else if (r && isCell(r.record)) { const a = await source.answer(p); line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
+      else line = `<span class="m">${r ? lineHTML(r.record) : ''}</span>`;
       return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span><span class="p">${esc(p)}</span>${line}</summary><div class="body"></div></details>`;
     }));
     body.innerHTML = items.join('');
@@ -42,6 +42,7 @@ function mountViewer(el, source, opts = {}) {
 
   async function draw(ev) {
     await index();
+    $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
     const nowEl = $('.sv-now'), earlier = $('.sv-earlier');
     nowEl.innerHTML = actionHTML(source, ev, true);
     const det = nowEl.querySelector('details.sv-act'); await fillAction(det, ev, true);
@@ -65,11 +66,16 @@ const moved = (source, touched) => { const out = new Set(); for (const t of touc
 
 // one action: a line; opens into its records, each a line that opens into the card
 function actionHTML(source, ev, open) {
-  const n = (ev.records || ev.touched).length, mv = moved(source, ev.touched);
-  const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
+  const n = (ev.records || ev.touched).length, more = ev.count && ev.count > n + 3 ? '+' : '', mv = moved(source, ev.touched);
+  const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + more + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
   return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
 }
 
+// the standing outline: every cell of the views folder with what it says now (the scoreboard, the bug list, the plan)
+function cellsHTML(cells) {
+  if (!cells.length) return '';
+  return `<div class="sv-outline">${cells.map(c => `<div class="sv-cell ${c.bad ? 'bad' : c.note ? 'note' : ''}" data-path="${esc(c.path)}"><span class="n">${esc(last(c.path))}</span><span class="f">${esc(c.formula)}</span><span class="a">${esc(c.bad || c.note || c.answer || '')}</span></div>`).join('')}</div>`;
+}
 // ---------- rendering ----------
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 const last = p => p ? p.split('/').pop() : 'namespace';
@@ -291,15 +297,28 @@ function answerOf(path, x, c) {
   const tree = nodeOf(x); tree.path = local(path); tree.name = last(tree.path);
   return { tree };
 }
-const summary = t => { const s = Object.entries(t.slots); return s.length ? s[0][1].toLocaleString() + ' ' + s[0][0] : t.kids.length + ' rows'; };
+// what an answer is, in a few words: its first figure, else its first telling slot, else its row count;
+// the input's own title and scale ride on a result's root and say nothing about it
+const telling = slots => Object.entries(slots || {}).filter(([k]) => !/^(scale|title|sys\/)/.test(k) && !k.endsWith('/scale'));
+const summary = t => {
+  const sl = t.slots || {};
+  if ('added' in sl && 'removed' in sl && 'changed' in sl) { const d = ['added', 'removed', 'changed'].filter(k => Number(sl[k])).map(k => sl[k] + ' ' + k); return d.length ? d.join(' · ') : 'agree'; }
+  const s = telling(sl), num = s.find(([, v]) => typeof v === 'number');
+  return num ? num[1].toLocaleString() + ' ' + num[0] : s.length ? String(s[0][1]).slice(0, 24) + ' ' + s[0][0] : t.kids.length + (t.kids.length === 1 ? ' row' : ' rows');
+};
+// a record's line: the slots that tell what it is first (text, title, name, what, asked, word), two of them, with room
+const TELLING = ['text', 'title', 'name', 'what', 'asked', 'word', 'question', 'error', 'cause', 'about'];
+const lineSlots = rec => { const e = Object.entries(rec || {}); const first = TELLING.flatMap(k => e.filter(([kk]) => kk === k)); const rest = e.filter(([k]) => !TELLING.includes(k)); return first.concat(rest).slice(0, first.length ? 2 : 3); };
+const lineHTML = rec => lineSlots(rec).map(([k, v]) => esc(k) + ' ' + (typeof v === 'number' ? v.toLocaleString() : esc(String(v)).slice(0, 48))).join(' · ');
 // the records an event wrote, as the page lists them: the keys of its `with` (the written records; a cell's
 // /x and /c/x ride along and are left out), else its touched paths without the node root, the writer's
 // journal tag and the ancestors whose cases moved (a touched path that is a proper prefix of another)
 const writtenOf = e => {
-  const w = e.with && typeof e.with === 'object' ? Object.keys(e.with).filter(k => !/^\/x\/|^\/c\/x\//.test(k)) : [];
-  if (w.length) return w.map(local);
   const t = (e.touched || []).map(local);
-  return t.filter(p => p.includes('/') && !/^[^/]+\/agent\/journal\//.test(p) && !t.some(q => q !== p && q.startsWith(p + '/')));
+  const out = t.filter(p => p.includes('/') && !/^[^/]+\/agent\/journal\//.test(p) && !t.some(q => q !== p && q.startsWith(p + '/')));
+  const w = e.with && typeof e.with === 'object' ? Object.keys(e.with).filter(k => !/^\/x\/|^\/c\/x\//.test(k)).map(local) : [];
+  for (const p of w) if (!out.includes(p)) out.push(p);
+  return out.sort();
 };
 // a journaled event as the viewer's event; the label the line carries, else the first written record's tail (+N)
 const labelOf = written => written.length ? last(written[0]) + (written.length > 1 ? ` (+${written.length - 1})` : '') : 'write';
@@ -341,7 +360,7 @@ function mcpSource(opts = {}) {
       cells.push({ path: local(ch.path), formula: slots.formula.slice(16), settings: settings.join(' '), inputs });
     }
     if (cells.length) {
-      const a = await rpc('read', { paths: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });
+      const a = await rpc('read', { reads: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });
       cells.forEach((c, i) => { const r = answerOf(c.path, a.answers[2 * i], a.answers[2 * i + 1]); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
@@ -389,7 +408,7 @@ function start(doc) {
   return mountViewer(el, mcpSource({ views, who }), { crumb: views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;

@@ -45,7 +45,8 @@ comes back as `{type, size, reference}`, never inline.
   steps, so the plan has a case and a history.
 - Try a question with a formula read before keeping it: `read path
   formula settings` runs any standard cell over a folder and writes
-  nothing; change the settings until the answer is right.
+  nothing; it answers `{path, formula, result, context}`, the result the
+  tree the cell would give; change the settings until it is right.
 - Keep what is right as a cell: the same formula and settings written at a
   path (`/sys/weft` the formula's reference, `/sys/tack` the input's). From
   then on `/x/<path>` is the answer, live, and a cell over it composes.
