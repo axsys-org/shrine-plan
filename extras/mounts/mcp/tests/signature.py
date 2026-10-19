@@ -73,6 +73,17 @@ def rows(t, care):
     return out
 
 
+def keyname(value):
+    """A child name made from a value, as the world spells it: letters, digits and underscores kept, any other byte an
+    underscore; digits alone a number, a text starting with a letter a symbol, the rest a text atom shown with $."""
+    clean = re.sub(r'[^A-Za-z0-9_]', '_', value)
+    if clean == '':
+        return 'empty'
+    if clean.isdigit() or re.match(r'[A-Za-z]', clean):
+        return clean
+    return '$' + clean
+
+
 def key_of(rel):
     """A row's key: its name, or the path as text for a deeper row (sort, top, latest)."""
     return rel[0] if len(rel) == 1 else '/' + '/'.join(rel)
@@ -98,6 +109,13 @@ def slot_text(n, rel, slot):
     if slot == '/name' and '/name' not in n['props']:
         return rel[-1] if rel else None
     return n['props'].get(slot)
+
+
+def disp(n, rel, slot):
+    """The text of a row's slot as a read shows it: a number with its own scale as the decimal; the text entries read this."""
+    if slot in n['props']:
+        return shown(n['props']).get(slot)
+    return slot_text(n, rel, slot)
 
 
 def scale_of(n, slot):
@@ -379,7 +397,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         into = P('into') or '/joined'
         out = clone(inp)
         for rel, r in rows(out, care):
-            texts = [t for t in (slot_text(r, rel, w) for w in wanted) if t is not None]
+            texts = [t for t in (disp(r, rel, w) for w in wanted) if t is not None]
             if texts:
                 r['props'][into] = sep.join(texts)
         return out, ctx
@@ -402,7 +420,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         into = P('into') or slot
         out = clone(inp)
         for rel, r in rows(out, care):
-            t = slot_text(r, rel, slot)
+            t = disp(r, rel, slot)
             if t is not None:
                 for i, part in enumerate(t.split(sep) if sep else [t], 1):
                     r['props'][into + '/' + str(i)] = part
@@ -474,7 +492,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         out = node(inp['props'], rec=inp['rec'])
         for v, members in groups.items():
             figure, scale = (str(len(members)), 0) if op == 'count' else (lambda f, s: (fig(f, s), s))(*reduce_(op, members, slot))
-            out['kids'][v] = node({'/value': v, into: figure, '/scale': str(scale)})
+            out['kids'][keyname(v)] = node({'/value': v, into: figure, '/scale': str(scale)})
         return out, ctx
     if formula == 'grid':
         row, col, op, slot = P('row'), P('col'), P('op') or 'count', P('slot')
@@ -487,10 +505,10 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
                 cells.setdefault(rv, {}).setdefault(cv, []).append(r)
         out = node(inp['props'], rec=inp['rec'])
         for rv, cols in cells.items():
-            out['kids'][rv] = node({'/' + cv: (str(len(m)) if op == 'count' else fig(*reduce_(op, m, slot))) for cv, m in cols.items()})
+            out['kids'][keyname(rv)] = node({'/' + keyname(cv): (str(len(m)) if op == 'count' else fig(*reduce_(op, m, slot))) for cv, m in cols.items()})
         return out, ctx
     if formula == 'flatten':
-        return node(inp['props'], {'_'.join(rel): node(r['props']) for rel, r in R}, inp['rec']), ctx
+        return node(inp['props'], {keyname('_'.join(rel)): node(r['props']) for rel, r in R}, inp['rec']), ctx
     if formula == 'merge':
         out = clone(inp)
         for name in sorted(views):
@@ -718,7 +736,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         into = P('into') or {'length': '/length', 'starts': '/starts', 'ends': '/ends'}.get(formula, slot)
         out = clone(inp)
         for rel, r in rows(out, care):
-            t = slot_text(r, rel, slot)
+            t = disp(r, rel, slot)
             if t is None:
                 continue
             if formula == 'trim':
@@ -819,7 +837,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         for rel, r in R:
             v = slot_text(r, rel, key)
             if v is not None:
-                place(out, (v,) + rel, node(r['props']))
+                place(out, (keyname(v),) + rel, node(r['props']))
         return out, ctx
     if formula in ('rename', 'drop'):
         if formula == 'rename' and (P('from') is None or P('to') is None):
@@ -847,7 +865,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         out = node(inp['props'], rec=inp['rec'])
         for rel, r in R:
             if len(rel) == 1 and '_' in rel[0]:
-                place(out, tuple(seg or 'empty' for seg in rel[0].split('_')), node(r['props']))
+                place(out, tuple(keyname(seg) for seg in rel[0].split('_')), node(r['props']))
             else:
                 place(out, rel, node(r['props']))
         return out, ctx
@@ -858,7 +876,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         sep = ' ' if P('with') is None else P('with')
         out = node(inp['props'], rec=inp['rec'])
         for rel, r in R:
-            t = slot_text(r, rel, slot)
+            t = disp(r, rel, slot)
             if t is None:
                 place(out, rel, node(r['props']))
                 continue
@@ -915,6 +933,125 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
     raise ValueError(formula)
 
 
+# ============================================================================ coverage
+# What each entry consumes, by value kind of the slot it reads: natural, scaled, signed, text, boolean, reference, missing (a row
+# without the slot), date text; and by shape: empty (no rows), one (one row), cap (fifty rows or more).
+KINDS = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'empty', 'one', 'cap']
+NUMERIC = ['natural', 'scaled', 'signed', 'missing']
+TEXTUAL = ['text', 'reference', 'date', 'natural', 'missing']
+ROWS = ['empty', 'one', 'cap']
+CONSUMES = {}
+for _f in ('sum', 'min', 'max', 'avg', 'sort', 'top', 'latest', 'earliest', 'between', 'running', 'change', 'moving', 'percent',
+           'median', 'percentile', 'variance', 'stddev', 'each'):
+    CONSUMES[_f] = NUMERIC + ROWS
+for _f in ('where', 'match', 'split', 'join', 'date', 'distinct', 'select', 'by', 'grid', 'lookup', 'when', 'coalesce', 'trim', 'case',
+           'replace', 'length', 'starts', 'ends', 'reference', 'mode', 'group', 'explode', 'validate', 'unique', 'except', 'intersect', 'diff'):
+    CONSUMES[_f] = TEXTUAL + ROWS
+for _f in ('any', 'all'):
+    CONSUMES[_f] = ['boolean', 'natural', 'missing'] + ROWS
+for _f in ('part', 'shift'):
+    CONSUMES[_f] = ['date', 'natural', 'missing'] + ROWS
+CONSUMES['follow'] = ['reference', 'missing'] + ROWS
+for _f in ('count', 'rank', 'flatten', 'unflatten', 'merge', 'gather', 'rename', 'drop'):
+    CONSUMES[_f] = ROWS
+for _f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since'):
+    CONSUMES[_f] = ['natural', 'scaled', 'signed', 'missing']
+CONSUMES['pick'] = ['natural', 'text', 'missing']
+CONSUMES['put'] = []
+SLOT_PARAMS = {'where': 'key', 'match': 'key', 'when': 'key', 'validate': 'key', 'unique': 'key', 'group': 'key', 'by': 'key', 'lookup': 'key',
+               'except': 'key', 'intersect': 'key', 'diff': 'key',
+               'reference': 'key', 'grid': 'row', 'each': 'left', 'add': 'left', 'subtract': 'left', 'multiply': 'left', 'divide': 'left',
+               'select': 'slots', 'join': 'slots', 'drop': 'slots', 'pick': 'from', 'rename': 'from'}
+
+
+def value_kind(text):
+    if text is None:
+        return 'missing'
+    if text.startswith('/h/'):
+        return 'reference'
+    if text in ('true', 'false'):
+        return 'boolean'
+    if re.match(r'\d{4}-\d{2}-\d{2}', text):
+        return 'date'
+    if is_num(text):
+        return 'signed' if text.startswith('-') else 'natural'
+    if DEC.match(text):
+        return 'signed' if text.startswith('-') else 'scaled'
+    return 'text'
+
+
+def kinds_of(formula, params, inp, care):
+    """The value kinds the entry meets on this input: on the slot its first parameter names (every slot when it names none),
+    across the rows (the root for root entries), plus the shape kinds."""
+    if inp is None:
+        return set()
+    R = rows(cut(inp, care), care)
+    root_only = formula in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'pick', 'put')
+    members = [((), inp)] if root_only else R
+    key = params.get(SLOT_PARAMS.get(formula, 'slot'))
+    slots = str(key).split() if key is not None else None
+    found = set()
+    for rel, r in members:
+        for slot in (slots or [k for k in r['props'] if not k.endswith('/scale')]):
+            if not str(slot).startswith('/'):
+                continue
+            t = slot_text(r, rel, slot)
+            k = value_kind(t)
+            if k == 'natural' and slot in r['props'] and scale_of(r, slot) > 0:
+                k = 'scaled'
+            found.add(k)
+    if not root_only:
+        found.add('empty' if not R else 'one' if len(R) == 1 else 'cap' if len(R) >= 50 else 'some')
+    return found
+
+
+class Coverage:
+    def __init__(self):
+        self.cells = {}
+        self.chains = {}
+
+    def add(self, formula, kinds, care, pinned, viewed, depth):
+        for k in kinds:
+            key = (formula, k, care, 'pinned' if pinned else 'live', 'view' if viewed else 'none')
+            self.cells[key] = self.cells.get(key, 0) + 1
+        self.chains[(depth, care, 'view' if viewed else 'none')] = self.chains.get((depth, care, 'view' if viewed else 'none'), 0) + 1
+
+    def wants(self, formula):
+        """The kinds and margins this entry has not met yet: what the next case should go for."""
+        have = {key[1] for key in self.cells if key[0] == formula}
+        margins = {d for key in self.cells if key[0] == formula for d in key[2:]}
+        root_only = formula in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'pick', 'put')
+        needs_view = formula in ('lookup', 'except', 'intersect', 'diff', 'reference', 'follow')
+        want = {k for k in CONSUMES.get(formula, []) if k not in have}
+        for d in ('x', 'y', 'z', 'pinned', 'live', 'view', 'none'):
+            if d not in margins and not (root_only and d in ('y', 'z')) and not (needs_view and d == 'none'):
+                want.add(d)
+        return want
+
+    def report(self, strict):
+        print('| entry | ' + ' | '.join(KINDS) + ' | x | y | z | pinned | live | view | none |')
+        print('|---|' + '---|' * (len(KINDS) + 7))
+        zero = []
+        for f in sorted(CONSUMES):
+            by_kind = {k: sum(n for key, n in self.cells.items() if key[0] == f and key[1] == k) for k in KINDS}
+            margins = {d: sum(n for key, n in self.cells.items() if key[0] == f and d in key[2:]) for d in ('x', 'y', 'z', 'pinned', 'live', 'view', 'none')}
+            print('| %s | %s | %s |' % (f, ' | '.join(str(by_kind[k]) for k in KINDS), ' | '.join(str(margins[d]) for d in ('x', 'y', 'z', 'pinned', 'live', 'view', 'none'))))
+            zero += [(f, k) for k in CONSUMES[f] if by_kind[k] == 0]
+            zero += [(f, d) for d in margins if margins[d] == 0 and not (f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'pick', 'put') and d in ('y', 'z'))
+                     and not (f in ('lookup', 'except', 'intersect', 'diff', 'reference', 'follow') and d == 'none')]
+        fine = sum(1 for f in CONSUMES for k in CONSUMES[f] for c in 'xyz' for p in ('pinned', 'live') for v in ('view', 'none')
+                   if self.cells.get((f, k, c, p, v), 0) == 0)
+        total = sum(len(CONSUMES[f]) * 12 for f in CONSUMES)
+        print('chains (depth, care, view): ' + ', '.join('%s=%d' % (k, n) for k, n in sorted(self.chains.items())))
+        print('coverage: %d entry-kind cells, %d zero; %d of %d fine cells (entry x kind x care x pinned x view) filled' % (
+            sum(len(CONSUMES[f]) for f in CONSUMES), len(zero), total - fine, total))
+        if zero:
+            print('ZERO COVERAGE', zero)
+        if strict and zero:
+            raise AssertionError('the generator never drew these entry-kind cells: %s' % zero)
+        return zero
+
+
 # ============================================================================ generators
 FORMULAS = ['count', 'sum', 'min', 'max', 'avg', 'any', 'all', 'where', 'sort', 'top', 'latest', 'earliest', 'each', 'lookup',
             'distinct', 'select', 'by', 'grid', 'flatten', 'merge', 'gather', 'except', 'intersect', 'diff', 'add', 'subtract', 'multiply',
@@ -922,7 +1059,8 @@ FORMULAS = ['count', 'sum', 'min', 'max', 'avg', 'any', 'all', 'where', 'sort', 
             'when', 'coalesce', 'part', 'shift', 'running', 'rank', 'change', 'moving', 'percent', 'trim', 'case', 'replace', 'length',
             'starts', 'ends', 'follow', 'reference', 'median', 'percentile', 'variance', 'stddev', 'mode', 'group', 'rename', 'drop',
             'unflatten', 'explode', 'validate', 'unique']          # amend has its own stage (notes need the world's stamps)
-KINDS = ['rec1', 'recN', 'recM', 'list', 'map', 'set', 'table', 'bag', 'attach', 'tree', 'grouped', 'matrix', 'hier', 'uneven']
+SHAPES = ['rec1', 'recN', 'recM', 'list', 'map', 'set', 'table', 'bag', 'attach', 'tree', 'grouped', 'matrix', 'hier', 'uneven', 'empty', 'one', 'list', 'map', 'table']
+WIDE_EVERY = 25          # one cap-sized shape (fifty rows or more) in every batch of cases
 REQUIRED = {'where': ['key', 'value'], 'each': ['left', 'right', 'op'], 'lookup': ['key', 'take'], 'select': ['slots'], 'by': ['key'],
             'grid': ['row', 'col'], 'pick': ['from', 'into'], 'put': ['into', 'value'], 'round': ['slot', 'places'],
             'since': ['slot', 'from'], 'between': ['slot', 'from', 'to'], 'join': ['slots'], 'match': ['key', 'value'],
@@ -983,8 +1121,8 @@ def fmt(v):
 
 
 class Gen:
-    def __init__(self, rng, node_):
-        self.rng, self.node = rng, node_
+    def __init__(self, rng, node_, coverage=None):
+        self.rng, self.node, self.coverage = rng, node_, coverage
 
     def coin(self, p=0.5):
         return self.rng.random() < p
@@ -1009,10 +1147,47 @@ class Gen:
             return node(p)
 
         def root(**kw):
-            return node(props(**kw)) if self.coin(0.6) else node(rec=False)
+            if not self.coin(0.6):
+                return node(rec=False)
+            p = props(**kw)
+            if self.coin(0.4):
+                p['/n'] = text(num())
+                if self.coin(0.4):
+                    p['/scale'] = str(rng.randint(1, 2))
+            return node(p)
         k = rng.randint(2, 5)
+
+        def extras(p):
+            # what imported data looks like: some rows carry a reference, a date, a boolean; some lack a slot
+            if self.coin(0.25):
+                p['/rf'] = '/h/x/0/2/' + self.node + '/user'
+            if self.coin(0.2):
+                p['/d'] = '%d-%02d-%02d' % (rng.randint(1990, 2026), rng.randint(1, 12), rng.randint(1, 28))
+            if self.coin(0.2):
+                p['/ok'] = text(self.coin())
+            if self.coin(0.15):
+                for slot in list(p):
+                    if slot in ('/n', '/t', '/amount', '/region') and self.coin():
+                        p.pop(slot, None)
+                        p.pop(slot + '/scale', None)
+            return p
+        if kind == 'empty':
+            return root()
+        if kind == 'one':
+            r = root()
+            r['kids'][rng.choice(NAMES)] = row(n=num(), t=self.word())
+            return r
+        if kind == 'wide':
+            r = root(title='wide')
+            for i in range(rng.randint(50, 60)):
+                p = row(n=rng.randint(1, 400), t=self.word())
+                r['kids']['w' + str(i + 1)] = p
+            return r
         if kind == 'rec1':
-            return node(props(n=num()))
+            p = props(n=num())
+            if self.coin(0.4):
+                p['/scale'] = str(rng.randint(1, 2))
+            return node(p)
         if kind == 'recN':
             return row('amount', n=num(), t=self.word(), ok=self.coin(), when=rng.randint(1, 99), amount=num(), d='%d-%02d-%02d' % (rng.randint(1990, 2026), rng.randint(1, 12), rng.randint(1, 28)))
         if kind == 'recM':
@@ -1021,10 +1196,12 @@ class Gen:
             r = root(title='list')
             for i in range(k):
                 r['kids'][str(i + 1)] = row(n=num(), t=self.word())
+                extras(r['kids'][str(i + 1)]['props'])
         elif kind == 'map':
             r = root()
             for nm in rng.sample(NAMES, k):
                 r['kids'][nm] = row(n=num(), region=self.word())
+                extras(r['kids'][nm]['props'])
         elif kind == 'set':
             r = root()
             for nm in rng.sample(NAMES, k):
@@ -1033,6 +1210,7 @@ class Gen:
             r = root(title='table')
             for i in range(k):
                 r['kids']['r' + str(i + 1)] = row('amount', region=self.word(), status=rng.choice(['open', 'closed']), amount=num(), when=rng.randint(1, 99))
+                extras(r['kids']['r' + str(i + 1)]['props'])
         elif kind == 'bag':
             r = root()
             vals = rng.sample(TEXT, 2)
@@ -1108,10 +1286,27 @@ class Gen:
             mods.append({'path': path + '/new', 'slots': unrender(fresh['props'])})
         return {'kind': kind + ('+h' if mods else ''), 'path': path, 'state0': state0, 'state': state, 'mods': mods, 'has_root': state0['rec']}
 
-    def params(self, f, inp, care, views):
-        """Settings that are valid for this input most of the time."""
-        rng, pick = self.rng, self.rng.choice
+    def params(self, f, inp, care, views, wants=frozenset()):
+        """Settings that are valid for this input most of the time; a slot that carries a kind the entry has not met
+        yet is preferred (wants), so the coverage matrix fills."""
+        rng = self.rng
         R = rows(inp, care)
+        members = [((), inp)] if f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'pick', 'put') else (R or [((), inp)])
+
+        def slot_kinds(slot):
+            found = set()
+            for rel, r in members:
+                t = slot_text(r, rel, slot)
+                k = value_kind(t)
+                if k == 'natural' and slot in r['props'] and scale_of(r, slot) > 0:
+                    k = 'scaled'
+                found.add(k)
+            return found
+
+        def pick(cands):
+            cands = list(cands)
+            steered = [sl for sl in cands if isinstance(sl, str) and sl.startswith('/') and slot_kinds(sl) & wants]
+            return rng.choice(steered) if steered else rng.choice(cands)
 
         def kinds(ps):
             keys = [s for s in ps if s != '/scale' and not s.endswith('/scale')]
@@ -1146,13 +1341,17 @@ class Gen:
             if self.coin(0.3):
                 p['into'] = '/cnt'
         elif f in ('sum', 'min', 'max', 'avg'):
-            p['slot'] = pick(rown)
+            p['slot'] = pick(rown + (rowt if wants & {'text', 'missing'} else []))
             if self.coin(0.3):
                 p['into'] = '/fig'
         elif f in ('any', 'all'):
             p['slot'] = pick(rowb + rown)
         elif f == 'where':
             op = pick(['equals', 'equals', 'equals', 'over', 'under', 'before', 'after', 'contains'])
+            if wants & {'reference', 'date', 'text', 'boolean', 'missing'}:
+                op = pick(['equals', 'contains'])
+            if 'natural' in wants:
+                rowt = rowt + rown
             if op == 'equals':
                 p['key'] = pick(rowt + rowb)
                 p['value'] = pick(vals(p['key']) or [self.word()])
@@ -1177,6 +1376,8 @@ class Gen:
         elif f == 'each':
             p['left'], p['op'], p['right'], p['into'] = pick(rown), pick(['add', 'subtract', 'multiply', 'divide']), pick([lit(), lit(), pick(rown)]), '/out'
         elif f == 'lookup':
+            if 'natural' in wants:
+                rowt = rowt + rown
             name = next((n for n in views if n not in ('v1', 'v2')), 'table')
             if name != 'table':
                 p['from'] = name
@@ -1198,27 +1399,27 @@ class Gen:
         elif f == 'select':
             p['slots'] = ' '.join(rng.sample(sorted(set(rown + rowt + rowb)), rng.randint(1, 2)))
         elif f == 'join':
-            p['slots'] = ' '.join(rng.sample(sorted(set(rowt + rown)), rng.randint(1, 2)))
+            p['slots'] = ' '.join(dict.fromkeys([pick(rowt + rown)] + rng.sample(sorted(set(rowt + rown)), rng.randint(0, 1))))
             if self.coin():
                 p['with'] = pick([', ', '-', ''])
             if self.coin(0.3):
                 p['into'] = '/full'
         elif f == 'match':
-            p['key'], p['value'] = pick(rowt), pick(['e', 'o', 'st', 'th', 'a', 'west', 'z'])
+            p['key'], p['value'] = pick(rowt + (rown if 'natural' in wants else [])), pick(['e', 'o', 'st', 'th', 'a', 'west', 'z', '1'])
             if self.coin():
                 p['op'] = pick(['contains', 'starts', 'ends'])
         elif f == 'split':
-            p['slot'] = pick(rowt)
+            p['slot'] = pick(rowt + (rown if 'natural' in wants else []))
             if self.coin():
                 p['with'] = pick(['-', 'e', 'o', ' '])
             if self.coin(0.3):
                 p['into'] = '/part'
         elif f == 'date':
-            p['slot'] = pick(rowt)
+            p['slot'] = pick(rowt + (rown if 'natural' in wants else []))
             if self.coin(0.3):
                 p['into'] = '/on'
         elif f == 'by':
-            p['key'] = pick(rowt + rowb)
+            p['key'] = pick(rowt + rowb + (rown if 'natural' in wants else []))
             op = pick(['count', 'count', 'sum', 'min', 'max', 'avg'])
             if op != 'count' or self.coin():
                 p['op'] = op
@@ -1227,7 +1428,7 @@ class Gen:
             if self.coin(0.3):
                 p['into'] = '/fig'
         elif f == 'grid':
-            p['row'], p['col'] = pick(rowt), pick(rowt + rowb)
+            p['row'], p['col'] = pick(rowt + (rown if 'natural' in wants else [])), pick(rowt + rowb)
             op = pick(['count', 'count', 'sum', 'min', 'max', 'avg'])
             if op != 'count':
                 p['op'], p['slot'] = op, pick(rown)
@@ -1278,7 +1479,8 @@ class Gen:
             if self.coin(0.3):
                 p['into'] = '/filled'
         elif f in ('part', 'shift'):
-            p['slot'] = pick(rowt + rown)
+            dates = [sl for sl in rowt if any(value_kind(v) == 'date' for v in vals(sl))]
+            p['slot'] = pick(dates) if dates and self.coin(0.8) else pick(rowt + rown)
             if f == 'part':
                 p['unit'] = pick(['year', 'quarter', 'month', 'week', 'weekday'])
             else:
@@ -1297,7 +1499,7 @@ class Gen:
             if self.coin(0.3):
                 p['into'] = '/pos'
         elif f in ('trim', 'length', 'case', 'replace', 'starts', 'ends', 'explode'):
-            p['slot'] = pick(rowt)
+            p['slot'] = pick(rowt + (rown if 'natural' in wants else []))
             if f == 'case':
                 p['to'] = pick(['lower', 'upper'])
             if f == 'replace':
@@ -1311,12 +1513,14 @@ class Gen:
             if f in ('trim', 'case', 'replace', 'length', 'starts', 'ends') and self.coin(0.3):
                 p['into'] = '/txt'
         elif f == 'follow':
-            p['slot'] = '/ref'
+            p['slot'] = '/ref' if self.coin(0.8) else pick(rowt)
             if views and self.coin(0.4):
                 p['from'] = pick(sorted(views))
             if self.coin(0.3):
                 p['into'] = '/pointed'
         elif f == 'reference':
+            if 'natural' in wants:
+                rowt = rowt + rown
             name = next((n for n in views if n not in ('v1', 'v2')), 'table')
             if name != 'table':
                 p['from'] = name
@@ -1332,16 +1536,20 @@ class Gen:
             p['into'] = '/ref_to'
         elif f == 'mode':
             p['slot'] = pick(rowt + rown)
+        if f in ('except', 'intersect', 'diff') and 'key' not in p and wants & {'reference', 'date', 'missing', 'natural'}:
+            p['key'] = pick(rowt + rown)
             if self.coin(0.3):
                 p['into'] = '/common'
         elif f in ('group', 'unique'):
-            p['key'] = pick(rowt + rowb)
+            p['key'] = pick(rowt + rowb + (rown if 'natural' in wants else []))
         elif f == 'rename':
             p['from'], p['to'] = pick(rown + rowt), '/renamed'
         elif f == 'drop':
             p['slots'] = ' '.join(rng.sample(sorted(set(rown + rowt + rowb)), rng.randint(1, 2)))
         elif f == 'validate':
             op = pick(['equals', 'over', 'under', 'contains', 'present'])
+            if wants & {'reference', 'date', 'text', 'boolean', 'missing'}:
+                op = pick(['equals', 'contains', 'present'])
             p['key'] = pick(rown) if op in ('over', 'under') else pick(rowt + rowb + rown)
             if op != 'equals' or self.coin():
                 p['op'] = op
@@ -1361,29 +1569,87 @@ def view_rows_of(views, name):
     return [] if v is None or v[0] is None else rows(v[0], v[1])
 
 
+def inject(g, shape, wants):
+    """Put a wanted value kind on the shape where the generator would rarely draw it: a row without its slot, a row with a
+    reference, a date, a boolean, a negative or a scaled number; a negative or scaled number on the root for the root entries.
+    Only rows history leaves alone change, so what the world holds is what the oracle sees."""
+    rng = g.rng
+    pairs = [(r0, record_at(shape['state'], rel)) for rel, r0 in rows(shape['state0'], 'z')]
+    pairs = [(a, b) for a, b in pairs if b is not None and a['props'] == b['props']]
+    if not pairs:
+        pairs = []
+    root_pair = (shape['state0'], shape['state']) if shape['state0']['rec'] else None
+
+    def both(pair, f):
+        for n in pair:
+            f(n['props'])
+    for kind in sorted(wants):
+        # one value, set on both copies of the row: the world holds the first, the oracle reads the second
+        if kind == 'missing' and pairs:
+            def drop(p):
+                for slot in ('/n', '/t', '/amount', '/region'):
+                    if slot in p:
+                        p.pop(slot); p.pop(slot + '/scale', None); return
+            both(rng.choice(pairs), drop)
+        elif kind == 'reference' and pairs:
+            both(rng.choice(pairs), lambda p: p.__setitem__('/rf', '/h/x/0/2/' + g.node + '/user'))
+        elif kind == 'date' and pairs:
+            day = '%d-%02d-%02d' % (rng.randint(1990, 2026), rng.randint(1, 12), rng.randint(1, 28))
+            both(rng.choice(pairs), lambda p: p.__setitem__('/d', day))
+        elif kind == 'boolean' and pairs:
+            flag = text(g.coin())
+            both(rng.choice(pairs), lambda p: p.__setitem__('/ok', flag))
+        elif kind == 'signed':
+            for pair in ([rng.choice(pairs)] if pairs else []) + ([root_pair] if root_pair else []):
+                v = str(-rng.randint(1, 99))
+                both(pair, lambda p: p.__setitem__('/n', v))
+        elif kind == 'scaled':
+            for pair in ([rng.choice(pairs)] if pairs else []) + ([root_pair] if root_pair else []):
+                v, sc = str(rng.randint(1, 999)), str(rng.randint(1, 2))
+                both(pair, lambda p: (p.__setitem__('/n', v), p.__setitem__('/n/scale', sc)))
+
+
 def gen_case(g, i, home):
     """One case: a primary shape, 0-2 secondary shapes, a chain of 1-4 cells, each with its oracle expectation."""
     rng = g.rng
     base = home + '/d/' + str(i)
-    prim = g.shape(rng.choice(KINDS), base + '/p', history=g.coin(0.35))
+    # the first entry is drawn first; what it still lacks in the coverage matrix steers the shape, care, pinning and views
+    first = rng.choice(FORMULAS)
+    if g.coverage is not None:
+        first = max((rng.choice(FORMULAS) for _ in range(3)), key=lambda f: len(g.coverage.wants(f)))
+    wants = g.coverage.wants(first) if g.coverage is not None else set()
+    kind = ('wide' if 'cap' in wants else 'one' if 'one' in wants else 'empty' if 'empty' in wants else
+            rng.choice(['table', 'list', 'map']) if wants & {'date', 'reference', 'boolean', 'missing', 'scaled', 'signed'} else
+            rng.choice(SHAPES))
+    if i % WIDE_EVERY == 0:
+        kind = 'wide'
+    prim = g.shape(kind, base + '/p', history=g.coin(0.35))
+    inject(g, prim, wants)
     shapes = [prim]
     for j in range(rng.choice([0, 1, 1, 2])):
-        shapes.append(g.shape(rng.choice(KINDS), base + '/v' + str(j + 1)))
-    care = rng.choice('xyz')
-    pinned = prim['has_root'] and g.coin(0.2)
+        shapes.append(g.shape(rng.choice(SHAPES), base + '/v' + str(j + 1)))
+    depth = 1 if g.coin(0.5) else rng.randint(2, 4)
+    if (depth > 1 or 'view' in wants) and len(shapes) == 1:
+        shapes.append(g.shape(rng.choice(SHAPES), base + '/v1'))        # a chain gets a secondary input somewhere
+    view_step = 0 if 'view' in wants else (rng.randint(1, depth - 1) if 'none' in wants and depth > 1 else rng.randint(0, depth - 1))
+    care = next((c for c in 'xyz' if c in wants), rng.choice('xyz'))
+    pinned = prim['has_root'] and ('pinned' in wants or (g.coin(0.2) and 'live' not in wants))
     tack = {'kind': 'shape', 'shape': 0, 'care': care, 'pinned': pinned}
 
     def at(shape, care, pinned):
-        """A shape as an input at a care: at x a folder with no record of its own is nothing."""
+        """A shape as an input at a care: at x a folder with no record of its own is nothing, and so is a folder with no
+        record anywhere beneath it at any care."""
         tree = shape['state0'] if pinned else shape['state']
-        return None if care == 'x' and not tree['rec'] else cut(tree, care)
+        if not tree['rec'] and (care == 'x' or not rows(tree, 'z')):
+            return None
+        return cut(tree, care)
     inp = at(prim, care, pinned)
     cells = []
-    for step in range(1 if g.coin(0.7) else rng.randint(2, 4)):
-        f = rng.choice(FORMULAS)
+    for step in range(depth):
+        f = first if step == 0 else rng.choice(FORMULAS)
         needs = {'lookup': 'table', 'except': 'other', 'intersect': 'other', 'diff': 'other', 'reference': 'table', 'follow': 'table'}.get(f)
         if needs and len(shapes) == 1 and g.coin(0.8):
-            shapes.append(g.shape(rng.choice(KINDS), base + '/v1'))
+            shapes.append(g.shape(rng.choice(SHAPES), base + '/v1'))
         views = {}
         available = list(range(1, len(shapes)))
         if needs and step == 0 and prim['mods'] and g.coin(0.7):
@@ -1394,7 +1660,7 @@ def gen_case(g, i, home):
             name = needs if g.coin(0.7) else 'ref'
             idx = available.pop(0)
             views[name] = {'kind': 'shape', 'shape': idx, 'care': rng.choice('xyz'), 'pinned': shapes[idx]['has_root'] and g.coin(0.3)}
-        for idx in available:
+        for idx in (available if (step == view_step or needs) and not (step == 0 and 'none' in wants and not needs) else []):
             name = ('extra' if 'extra' not in views else 'more') if f in ('merge', 'gather') else ('v1' if 'v1' not in views else 'v2')
             views[name] = {'kind': 'shape', 'shape': idx, 'care': rng.choice('xyz'), 'pinned': shapes[idx]['has_root'] and g.coin(0.3)}
         bad = rng.choice(['omit', 'badslot', 'emptyview', 'badtack', 'wrongkind']) if g.coin(0.15) else None
@@ -1422,7 +1688,7 @@ def gen_case(g, i, home):
                         path = target_shape['path'] + '/' + '/'.join(trel)
                         r0['props']['/ref'] = r1['props']['/ref'] = '/h/x/0/' + str(len(path.strip('/').split('/'))) + path
                 inp = at(prim, care, tack.get('pinned', False)) if tack['kind'] == 'shape' else inp
-        params = g.params(f, inp if inp is not None else node(), care, view_trees)
+        params = g.params(f, inp if inp is not None else node(), care, view_trees, wants if step == 0 else frozenset())
         if bad == 'omit' and REQUIRED.get(f):
             params.pop(rng.choice(REQUIRED[f]), None)
         elif bad == 'badslot':
@@ -1435,6 +1701,8 @@ def gen_case(g, i, home):
                 params['slot' if 'slot' in params else 'left'] = rng.choice(texts)
         view_paths = {name: shapes[v['shape']]['path'] for name, v in views.items() if v['kind'] == 'shape'}
         expect = evaluate(f, params, inp, care, view_trees, view_paths=view_paths)
+        if g.coverage is not None:
+            g.coverage.add(f, kinds_of(f, params, inp, care), care, tack.get('pinned', False), bool(views), step + 1)
         cells.append({'path': home + '/c/' + str(i) + '/s' + str(step), 'formula': f, 'params': params, 'tack': tack, 'views': views,
                       'care': care, 'expect': expect, 'bad': bad, 'nviews': len(views)})
         care = rng.choice('xyz')
@@ -1449,7 +1717,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
     seed = seed if seed is not None else random.randrange(10 ** 8)
     print('seed', seed, 'cases', cases, flush=True)
     rng = random.Random(seed)
-    g = Gen(rng, node_)
+    g = Gen(rng, node_, Coverage())
     seq = [0]
     pool = ThreadPoolExecutor(max_workers=8)
 
@@ -1475,7 +1743,33 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
         return result['structuredContent']
 
     def read(path, care='y'):
-        return tool('read', path=path, care=care)
+        """The whole answer: a cap-sized shape pages, so the pages are followed and merged by path."""
+        page = tool('read', path=path, care=care, limit=500)
+        first = page
+        while page.get('next'):
+            page = tool('read', path=path, care=care, limit=500, next=page['next'])
+            merge_page(first, page)
+        return first
+
+    def merge_page(into, page):
+        index = {}
+
+        def walk(n):
+            index[n['path']] = n
+            for ch in n.get('children', []):
+                walk(ch)
+        walk(into)
+
+        def absorb(n):
+            for ch in n.get('children', []):
+                if ch['path'] in index:
+                    absorb(ch)
+                else:
+                    parent = index.get(n['path'])
+                    if parent is not None:
+                        parent.setdefault('children', []).append(ch)
+                        walk(ch)
+        absorb(page)
 
     def shape_of(view):
         return {'props': view.get('properties', {}), 'kids': {ch['path'].rsplit('/', 1)[1]: shape_of(ch) for ch in view.get('children', [])}}
@@ -1660,6 +1954,8 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
         print('mismatch class', f, '|', what, '|', n)
     print(json.dumps({'seed': seed, 'cases': cases, 'cells': total, 'passed': total - failed, 'failed': failed, 'skipped_downstream': skipped[0],
                       'round_trips': seq[0], 'wall_s': round(wall, 1)}), flush=True)
+    # the coverage matrix: what the generator actually drew; at a full run a zero cell for a kind an entry consumes fails
+    g.coverage.report(strict=cases >= 500)
     assert not mismatches, [m[:3] for m in mismatches]
 
 
