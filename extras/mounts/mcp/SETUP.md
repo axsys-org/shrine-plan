@@ -87,13 +87,16 @@ filtered by it. An agent keeps its plan, scratch and `seen` epoch under
 agents in one world are fine: a write is one event, admitted whole or refused
 whole, and a cell is computed on read.
 
-A world lives as long as its process. A new boot is a new world: the standard
-cells and the mounts' seeds are there, your records are not. Until a world is
-proven to keep its records across a reboot, keep what you would not want to
-retype as a batch you can write again (one `records` list is one event), and
-mirror anything you must not lose, such as a QA tree's bugs and score, to a
-file at the end of a stretch. `tests/perf.py` and `tests/product.py` show
-the seeding shape.
+A world lives as long as its process. The runtime keeps a store on disk (the
+`snap` folder of the world's work directory, and it does grow with your
+records), but every boot calls `eden:start`, which builds a new namespace at
+epoch 0; nothing yet reattaches the previous one. So a new boot is a new
+world: the standard cells and the mounts' seeds are there, your records are
+not, even on the same snapshot. Until a resume path exists, keep what you
+would not want to retype as a batch you can write again (one `records` list
+is one event), and mirror anything you must not lose, such as a QA tree's
+bugs and score, to a file at the end of a stretch. `tests/perf.py` and
+`tests/product.py` show the seeding shape.
 
 ## Check it
 
