@@ -7,8 +7,9 @@ description: >-
 # Shrine MCP
 
 The world serves `<world-url>/mcp` on localhost only, with no credential:
-anything on the machine can read and write the world. Three verbs; this
-page shows the one form of each you will use most. Every knob is on the
+anything on the machine can read and write the world (booting one and
+connecting is `SETUP.md` beside this skill). Three verbs; this page shows
+the one form of each you will use most. Every knob is on the
 second page, `knobs.md`, read it when you need one (`apply` is there too).
 The shape is frozen: a new knob needs a measured round trip it removes.
 
@@ -46,6 +47,8 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 ## Thinking in the world
 
+- Pick a name and write with `who: <name>` every time; history filters by
+  it and the page shows it on every event.
 - Plan first as a record under `/agent/<name>/plan`: the question and the
   steps, so the plan has a case and a history.
 - Try a question with a formula read before keeping it: `read path
@@ -61,7 +64,9 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   at the end; `then` shows the effect in the same call; `from` an earlier
   case changes your mind.
 - When stopping, write `/agent/<name>/seen {epoch}`; wake with `history
-  after <epoch> with x` and continue from what changed.
+  after <epoch> with x` and continue from what changed. A world lives as
+  long as its process: after a reboot it is a new world, so keep what you
+  would not want to retype as one `records` batch you can write again.
 - Ask the world instead of reasoning over a copy; page what is left; never
   read the world whole.
 - The live page is how the person sees your work. Open

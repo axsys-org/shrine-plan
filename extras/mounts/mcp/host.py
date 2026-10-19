@@ -4,7 +4,7 @@ from pathlib import Path
 
 def prepare(root, work, check, cleanup, context):
     if not check:
-        print('MCP: http://127.0.0.1:<port>/mcp (local, unauthenticated)', flush=True)
+        print('MCP at /mcp of the world\'s URL (local, no credential); the live page at /live?views=/0x11/user/<folder>; setup in extras/mounts/mcp/SETUP.md', flush=True)
     return root, []
 
 
