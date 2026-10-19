@@ -2,10 +2,12 @@
 """Boot Shrine with explicitly selected filesystem source mounts."""
 import argparse
 from contextlib import ExitStack
+import json
 import os
 import re
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -39,14 +41,37 @@ def literal(value):
     return runtime_literal(value)
 
 
+def read_world(world):
+    """The descriptor a kept world's directory holds, or None for a new one."""
+    if world is None or not (world / 'world.json').is_file():
+        return None
+    try:
+        kept = json.loads((world / 'world.json').read_text())
+        mounts, port, node = kept['mounts'], kept['port'], kept['node']
+    except (ValueError, KeyError, TypeError) as error:
+        raise ValueError(f'{world / "world.json"} is not a world descriptor ({error})')
+    # The descriptor alone says a world is kept here; the runtime is the one
+    # that knows what a store looks like and complains if it is missing.
+    return {'mounts': list(mounts), 'port': int(port), 'node': str(node)}
+
+
+def resumed(output):
+    # A saved world prints EDEN-RESUMED before its HTTP foot listens again.
+    return 'EDEN-RESUMED' in output and 'HTTP foot listening' in output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mount', action='append', default=[], metavar='NAME')
     parser.add_argument('--extras-root', type=Path,
                         help='Mount source directory (default: this checkout’s extras/)')
     parser.add_argument('--list-mounts', action='store_true')
-    parser.add_argument('--node', default='0x11')
-    parser.add_argument('--port', type=int, default=8130)
+    parser.add_argument('--node', default=None, help='Node identity (default 0x11)')
+    parser.add_argument('--port', type=int, default=None, help='HTTP port (default 8130)')
+    parser.add_argument('--world', type=Path, metavar='DIR',
+                        help='Keep the world in DIR: a missing or empty DIR is booted into '
+                             'and kept, and a world kept there before resumes with every '
+                             'record it had (default: a temporary directory, kept nowhere)')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
@@ -54,11 +79,27 @@ def main():
                         help='plangrm compiler tier to Install for the session '
                              '(P1..P6, or none for the boot compiler; default P6)')
     args = parser.parse_args()
+    # A terminated launcher takes its world down with it (the ExitStack
+    # runs on SystemExit), instead of leaving the runtime behind.
+    signal.signal(signal.SIGTERM, lambda *ignored: sys.exit(143))
     try:
-        number, node = parse_node_identity(args.node)
+        world = args.world.resolve() if args.world else None
+        kept = read_world(world)
+        if kept:
+            given = {'--mount': (sorted(args.mount), sorted(kept['mounts'])) if args.mount else None,
+                     '--port': (args.port, kept['port']) if args.port is not None else None,
+                     '--node': (args.node, kept['node']) if args.node is not None else None}
+            for flag, pair in given.items():
+                if pair and pair[0] != pair[1]:
+                    raise ValueError(f'{flag} differs from the world kept in {world} '
+                                     f'({pair[1]}); omit it or pass the same')
+            mounts, port, node_text = kept['mounts'], kept['port'], kept['node']
+        else:
+            mounts, port, node_text = args.mount, args.port or 8130, args.node or '0x11'
+        number, node = parse_node_identity(node_text)
         if args.compiler != 'none' and not re.fullmatch(r'P[1-6]', args.compiler):
             raise ValueError('--compiler must be P1..P6 or none')
-        if not 1 <= args.port <= 65535:
+        if not 1 <= port <= 65535:
             raise ValueError('--port must be between 1 and 65535')
         if args.startup_timeout <= 0 or args.request_timeout <= 0:
             raise ValueError('Timeouts must be positive')
@@ -67,17 +108,35 @@ def main():
             for name in catalog(extras):
                 print(name)
             return 0
-        selected = select(extras, args.mount) if args.mount else []
+        selected = select(extras, mounts) if mounts else []
         enter_environment(sys.argv[1:])
         runtime = os.environ.get('WISP') or shutil.which('wisp')
         if not runtime or not os.access(runtime, os.X_OK):
             raise ValueError('Set WISP to a working runtime executable')
-        work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
-        template = stage(runtime, False, args.startup_timeout)
+        if world:
+            world.mkdir(parents=True, exist_ok=True)
+            work = world
+        else:
+            work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
+        if not kept:
+            template = stage(runtime, False, args.startup_timeout)
+            if (work / 'snap').exists():
+                shutil.rmtree(work / 'snap')
+            (work / 'snap').mkdir()
+            for name in ('data.mdb', 'pins.pack'):
+                shutil.copyfile(template / name, work / 'snap' / name)
+        elif not (work / 'snap').is_dir():
+            raise ValueError(f'{work} has a world descriptor but no snap directory; remove world.json to boot it afresh')
+        # The source and the mounts' host workspaces are this checkout's,
+        # refreshed on every run; the snapshot is the world's.
+        if (work / 'src').exists():
+            shutil.rmtree(work / 'src')
         shutil.copytree(ROOT / 'src', work / 'src')
-        (work / 'snap').mkdir()
-        for name in ('data.mdb', 'pins.pack'):
-            shutil.copyfile(template / name, work / 'snap' / name)
+        for mount in selected:
+            shutil.rmtree(work / mount.name, ignore_errors=True)
+        if world and not kept:
+            (world / 'world.json').write_text(json.dumps(
+                {'mounts': mounts, 'port': port, 'node': node_text}) + '\n')
         with ExitStack() as cleanup:
             prepared = prepare(selected, work, args.check, cleanup,
                                {"node": node, "timeout": args.startup_timeout})
@@ -86,29 +145,81 @@ def main():
             scan_port = scanner.port if scanner else 0
             scan_token = scanner.token if scanner else ''
             log_path = work / 'out.log'
-            print(f'Compiling Eden. Log: {log_path}', flush=True)
             log = cleanup.enter_context(log_path.open('w'))
-            process = subprocess.Popen([runtime, '--file-root', str(work / 'src'),
-                                        'snap', 'root', '_'], cwd=work,
-                                       stdin=subprocess.PIPE, stdout=log, stderr=log,
-                                       text=True, restore_signals=False)
-            def stop():
+            def stop(process):
                 if process.poll() is None:
+                    # A resumed world reads stdin like the repl: closing the
+                    # pipe is its stop; the signal is for whatever is left.
+                    if process.stdin:
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            pass
                     process.terminate()
                     try:
                         process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
-            cleanup.callback(stop)
-            # The repl re-installs the boot compiler at every session start, so
-            # the requested tier is installed here, per session.  Compiled
-            # code is attached lazily and cached across processes by the
-            # runtime, so only laws the boot actually runs pay for the tier.
-            install = ''
-            if args.compiler != 'none':
-                install = f'(#bind opt (#module plangrm))\n(Install opt:compile{args.compiler})\n'
-            process.stdin.write(install + f'''(#bind eden (#module eden))
+            def spawn(resume):
+                # A saved world's root is a program applied to the argument
+                # row (eden/resume); the boot repl takes its script on stdin.
+                # Both read stdin to stay alive, so the pipe stays open.
+                command = [runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_']
+                if resume:
+                    command += [str(scan_port), scan_token]
+                process = subprocess.Popen(command, cwd=work, stdin=subprocess.PIPE,
+                                           stdout=log, stderr=log, text=True, restore_signals=False)
+                cleanup.callback(stop, process)
+                return process
+            def listening():
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                        return True
+                except OSError:
+                    return False
+            deadline = time.monotonic() + args.startup_timeout
+            process = None
+            if kept:
+                print(f'Resuming the world kept in {work}. Log: {log_path}', flush=True)
+                process = spawn(True)
+                # A saved world ignores its input; the boot repl, still the root
+                # when nothing was admitted since the boot, evaluates it and
+                # prints the probe, which says there is no saved world here.
+                process.stdin.write('(print "EDEN-REPL-ROOT")\n')
+                process.stdin.flush()
+                while True:
+                    output = log_path.read_text(errors='replace')
+                    if process.poll() is not None:
+                        return runtime_exit_status(process.returncode, log_path) or 1
+                    if 'EDEN-REPL-ROOT' in output:
+                        print(f'No event was kept in {work} since its boot; booting it afresh.',
+                              flush=True)
+                        stop(process)
+                        process = None
+                        break
+                    if startup_failed(output, 'EDEN-RESUMED'):
+                        raise RuntimeError(output[-6000:])
+                    if resumed(output) and listening():
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f'Startup timed out; inspect {log_path}')
+                    time.sleep(.25)
+            if process is None:
+                print(f'Compiling Eden. Log: {log_path}', flush=True)
+                process = spawn(False)
+                # The repl re-installs the boot compiler at every session start, so
+                # the requested tier is installed here, per session.  Compiled
+                # code is attached lazily and cached across processes by the
+                # runtime, so only laws the boot actually runs pay for the tier.
+                # The same install thunk travels with the saved world, so a
+                # resumed process compiles at the same tier.
+                install = ''
+                installer = '0'
+                if args.compiler != 'none':
+                    install = f'(#bind opt (#module plangrm))\n(Install opt:compile{args.compiler})\n'
+                    installer = f'(Install opt:compile{args.compiler})'
+                process.stdin.write(install + f"""(#bind eden (#module eden))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind std (#module std))
 (#import std)
@@ -116,28 +227,25 @@ def main():
   (define (resolve name) [["x" {number}] ["ts" "lib"] ["ts" name]])
   (define slot [("x" {number}) ("ts" "compiler") ("ts" "artifact")])
   (define system (bootstrap:build-system (Pin eden:start) resolve slot))
-  (eden:start ("x" {number}) system resolve slot {args.port} {literal(specs)} {scan_port} {literal(scan_token)}))
+  (define (install ignored) {installer})
+  (eden:start ("x" {number}) system resolve slot {port} {literal(specs)} {scan_port} {literal(scan_token)} install))
 (print ("EDEN-LAUNCH-RETURNED" (Try launch 0)))
-''')
-            process.stdin.flush()
-            deadline = time.monotonic() + args.startup_timeout
-            while True:
-                output = log_path.read_text(errors='replace')
-                if process.poll() is not None:
-                    return runtime_exit_status(process.returncode, log_path) or 1
-                if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
-                    raise RuntimeError(output[-6000:])
-                if startup_ready(output, 'EDEN-LAUNCH-RETURNED'):
-                    try:
-                        with socket.create_connection(('127.0.0.1', args.port), timeout=.2):
-                            break
-                    except OSError:
-                        pass
-                if time.monotonic() > deadline:
-                    raise RuntimeError(f'Startup timed out; inspect {log_path}')
-                time.sleep(.25)
-            url = f'http://127.0.0.1:{args.port}'
-            print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}', flush=True)
+""")
+                process.stdin.flush()
+                while True:
+                    output = log_path.read_text(errors='replace')
+                    if process.poll() is not None:
+                        return runtime_exit_status(process.returncode, log_path) or 1
+                    if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
+                        raise RuntimeError(output[-6000:])
+                    if startup_ready(output, 'EDEN-LAUNCH-RETURNED') and listening():
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f'Startup timed out; inspect {log_path}')
+                    time.sleep(.25)
+            url = f'http://127.0.0.1:{port}'
+            print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}'
+                  + (f'; world: {work}' if world else ''), flush=True)
             if args.check:
                 for path in ('/__eden_unregistered__',):
                     try:
