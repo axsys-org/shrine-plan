@@ -261,10 +261,54 @@ Final verification:
   response integration passes (15.42 seconds). The macOS app also saved and
   displayed the persisted reread from this server and inspected its binding.
 
-Cold HTTP rendering exceeded the old 20/30-second test deadlines. A diagnostic
-run measured 38.06 seconds for the first ported render and 0.848 seconds for the
-next; an unmodified-main baseline measured 12.549 and 0.132 seconds. These are
-local observations, not controlled benchmarks. The browser gate permits 120
-seconds only for its first read. The egui client allows 120 seconds for render
-requests, retaining its 20-second save/status deadline and exact-retry behavior.
-Cold-start cost and the observed warm-render overhead remain performance work.
+### Rendering performance follow-up (2026-10-19)
+
+The earlier 38.06-second port / 12.549-second main observations mixed compiler
+cache states. A fresh process is not necessarily a cold compiler: P6 code and
+signature memoization persist across processes. The earlier 0.848-second second
+render did not reproduce in the matched small-editor fixture.
+
+The paint generator now selects varying recipe fields and constructs the common
+JSON envelope once, sharing nested paint values locally. Generated `profile.foil`
+shrinks from 38,381 to 21,801 bytes and from 214 to 51 JSON object constructor
+sites. The CSS-derived values, profile identity, prepared geometry, semantics,
+and control authority are unchanged. Eight complete HTTP response bodies at
+640, 420, and 800 CSS px match the original port byte-for-byte.
+
+Matched measurements used the pinned Wisp runtime and P6, the disposable egui
+note fixture, `PL_CODECACHE=0`, and fresh namespaces. Startup completed before
+requests were timed; measurements ran serially with the other servers idle and
+verification jobs finished. Warm values are medians of four identical requests.
+
+| Implementation | First render, shared caches disabled | Warm median |
+| --- | ---: | ---: |
+| Main `f373423` | 81.124 s | 140 ms |
+| Original port `fd7ef90` | 88.036 s | 154 ms |
+| Shared paint builder | 82.185 s | 155 ms |
+
+The cold overhead above main falls from 6.912 to 1.062 seconds. Steady-state
+throughput is essentially unchanged by this optimization. A separate first-use
+probe with the normal development cache took 7.751 seconds; a fresh process
+with already cached original-port code took 0.235 seconds. These normal-cache
+first-use samples have different cache populations and are not a controlled
+before/after speedup claim. The end-to-end benchmark script then measured a
+fresh optimized server with the populated cache: 0.198 seconds for its first
+HTTP render and a 0.155-second warm median (63.101 seconds of server startup,
+measured separately). A separate runtime trace showed long lazy compiler
+spans and hit its 150-second read deadline; it is excluded from the timing table.
+
+A completely cold P6 runtime remains slow on main too. The browser gate retains
+its 120-second first-read allowance; the egui client retains its 120-second
+render deadline and 20-second action/status deadline.
+
+Follow-up verification passes: 9 profile integrity tests, all 36 compiled paint
+recipes against the CSS resolver, 15 prepared assertions, Chromium/SVG parity
+for 14 fixtures (79 boxes, 48 explicit lines), 777 web/Explorer/moodboard
+assertions plus 2 mount-contract checks, and the disposable egui edit/save,
+dirty resize, hidden completion, unknown outcome, receipt, exact retry, stale
+response, and guarded-removal integration (14.91 seconds).
+
+The egui checkout's `scripts/benchmark-render.py` reproduces the cache-disabled
+comparison using disposable fixtures and archived revisions without changing a
+checkout. It saves timings and exact received responses, separates startup from
+rendering, and offers `--warm-cache` for normal development-cache measurements.

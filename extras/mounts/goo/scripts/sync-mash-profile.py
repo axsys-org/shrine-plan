@@ -200,10 +200,9 @@ def foil_json(value):
     return "(json/real " + quote(canonical(value)) + ")"
 
 
-def generate_paint(profile, css):
+def paint_cases(profile, css):
+    """Ordered cascade cases, including the final fallback, with resolved states."""
     rules = paint_rules(css)
-    out = ["  + paint_style", "    \\ kind=str role=str primary=bool destructive=bool", "    ^ json"]
-    constants = []
     cases = []
     for primary, destructive in ((True, True), (True, False), (False, True), (False, False)):
         condition = '(eq kind "button")'
@@ -214,20 +213,52 @@ def generate_paint(profile, css):
         cases.append((f'(and (eq kind "text") (eq role {quote(role)}))', "text", role, False, False))
     for kind in ("input", "code", "avatar", "presence", "media", "bar"):
         cases.append((f'(eq kind {quote(kind)})', kind, "", False, False))
-    for index, (condition, kind, role, primary, destructive) in enumerate(cases):
+    cases.append((None, "group", "", False, False))
+    resolved = []
+    for condition, kind, role, primary, destructive in cases:
         recipe = paint_recipe(profile, rules, kind, role, primary, destructive)
-        # State recipes describe local presentation, not remotely-owned focus.
-        recipe["states"] = {state: paint_recipe(profile, rules, kind, role, primary, destructive, state).get("outline")
-                            for state in ("highlight", "focus")
-                            if "outline" in paint_recipe(profile, rules, kind, role, primary, destructive, state)}
-        name = f"paint_recipe_{index}"
-        constants.extend([f"  + {name}", "    ^ json", "    " + foil_json(recipe)])
-        out.append(f"    ? {condition} goo_profile/{name}")
-    recipe = paint_recipe(profile, rules, "group")
-    recipe["states"] = {"highlight": paint_recipe(profile, rules, "group", state="highlight")["outline"]}
-    constants.extend(["  + paint_default", "    ^ json", "    " + foil_json(recipe)])
-    out.append("    goo_profile/paint_default")
-    return constants + out
+        recipe["states"] = {}
+        for state in ("highlight", "focus"):
+            appearance = paint_recipe(profile, rules, kind, role, primary, destructive, state)
+            if "outline" in appearance:
+                recipe["states"][state] = appearance["outline"]
+        resolved.append((condition, recipe))
+    return resolved
+
+
+def generate_paint(profile, css):
+    # A full JSON constructor per case made the Foil module dispatcher expensive
+    # to compile on the first render. Select data, then build the envelope once.
+    # Share nested values locally too (especially focus/highlight and corners).
+    cases = paint_cases(profile, css)
+    fallback = cases[-1][1]
+    if any(list(recipe) != list(fallback) for _, recipe in cases):
+        raise ValueError("portable paint recipes have inconsistent fields")
+    varying = [key for key in fallback if any(recipe[key] != fallback[key] for _, recipe in cases)]
+    shared = {}
+
+    def selected(recipe):
+        fields = []
+        for key in varying:
+            value = recipe[key]
+            encoded = foil_json(value)
+            if isinstance(value, (dict, list)):
+                if encoded not in shared:
+                    shared[encoded] = f"paint_{len(shared)}"
+                fields.append(shared[encoded])
+            else:
+                fields.append(encoded)
+        return "[" + " ".join(fields) + "]"
+
+    choices = ["        " + (f"? {condition} " if condition else "") + selected(recipe)
+               for condition, recipe in cases]
+    fields = [f'(jkv {quote(key)} ' +
+              (f"selected.at({varying.index(key)})" if key in varying else foil_json(value)) + ")"
+              for key, value in fallback.items()]
+    return (["  + paint_style", "    \\ kind=str role=str primary=bool destructive=bool", "    ^ json"] +
+            ["    = " + name + " " + encoded for encoded, name in shared.items()] +
+            ["    = selected=row[json]"] + choices +
+            ["    | json/obj [" + " ".join(fields) + "]"])
 
 
 def generate(profile, css=None):

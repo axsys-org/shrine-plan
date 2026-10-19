@@ -59,6 +59,13 @@ class ProfileIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "failed verification"):
             SYNC.verify_bundle(self.bundle)
 
+    def test_codegen_does_not_drop_a_style_specific_field(self):
+        profile = SYNC.verify_bundle(self.bundle)
+        css = (self.bundle / "profile.css").read_text()
+        css += '\n.goo-surface .goo-button:not(.goo-text) {outline: 1px solid #ffffff;}'
+        with self.assertRaisesRegex(ValueError, "inconsistent fields"):
+            SYNC.generate_paint(profile, css)
+
     def test_resealed_asset_hash_cannot_hide_a_changed_profile_revision(self):
         profile_path = self.bundle / "profile.json"
         profile = json.loads(profile_path.read_text())
