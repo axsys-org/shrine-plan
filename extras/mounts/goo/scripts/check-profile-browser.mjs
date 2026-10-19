@@ -36,6 +36,8 @@ try {
       const origin = surface.getBoundingClientRect();
       const box = (rect) => ({ x: rect.x - origin.x, y: rect.y - origin.y, width: rect.width, height: rect.height });
       return { surface: box(origin), nodes: [...surface.querySelectorAll('[data-node]')].map((node) => ({
+        paint: (() => { const s = getComputedStyle(node); return {foreground: s.color, background: s.backgroundImage === 'none' ? s.backgroundColor : s.backgroundImage, borderWidth: parseFloat(s.borderWidth), borderColor: s.borderColor, radius: s.borderTopLeftRadius, clip: s.overflow === 'hidden'}; })(),
+        accessibility: {role: node.getAttribute('role'), label: node.getAttribute('aria-label')},
         id: node.dataset.node, box: box(node.getBoundingClientRect()),
         rawLine: (() => {
           if (!node.hasAttribute('data-leaf') || node.tagName === 'INPUT' || node.querySelector('.goo-ascii-line') || !node.textContent) return null;
@@ -61,6 +63,21 @@ try {
       const actual = measured.nodes.find((node) => node.id === expected.id);
       assert.ok(actual, `${fixture.name}/${expected.id} missing from SSR`);
       for (const key of ['x', 'y', 'width', 'height']) near(actual.box[key], expected.box[key], `${fixture.name}/${expected.id}/${key}`);
+      assert.equal(expected.paint.version, 1);
+      assert.equal(expected.semantics.version, 1);
+      const p = expected.paint;
+      const rgb = (hex) => `rgb(${[1,3,5].map(i => parseInt(hex.slice(i,i+2),16)).join(', ')})`;
+      assert.equal(actual.paint.foreground, rgb(p.foreground), `${fixture.name}/${expected.id}/foreground`);
+      assert.equal(actual.paint.borderWidth, p.border.width);
+      assert.equal(actual.paint.borderColor, rgb(p.border.color));
+      assert.equal(actual.paint.radius, p.corners.kind === 'ellipse' ? '50%' : `${p.corners.radius}px`);
+      assert.equal(actual.paint.clip, p.clip);
+      const bg = p.background;
+      const background = bg.kind === 'none' ? 'rgba(0, 0, 0, 0)' : bg.kind === 'solid' ? rgb(bg.color)
+        : `linear-gradient(${bg.angleDegrees === 90 ? 'to right' : `${bg.angleDegrees}deg`}, ${bg.stops.map((stop, i) => `${rgb(stop.color)}${stop.offset === i && expected.kind !== 'bar' ? '' : ` ${stop.offset * 100}%`}`).join(', ')})`;
+      assert.equal(actual.paint.background, background, `${fixture.name}/${expected.id}/background`);
+      if (actual.accessibility.label !== null) assert.equal(actual.accessibility.label, expected.semantics.label.replace(/\r\n?/g, '\n'));
+      if (actual.accessibility.role !== null) assert.equal(actual.accessibility.role, expected.semantics.role === 'image' ? 'img' : expected.semantics.role);
       boxes++;
       if (expected.kind !== 'group') {
         assert.equal(actual.font.family, expected.textStyle.family);
@@ -101,7 +118,7 @@ try {
           assert.equal(typeof line.baseline, 'number', 'display must resolve the text baseline');
           const rtl = display.context.direction === 'rtl';
           const textX = line.textX + (rtl ? line.box.width - line.prefixAdvance : 0);
-          return `<text direction="${display.context.direction}" text-anchor="${rtl ? 'end' : 'start'}" x="${textX}" y="${line.baseline}" font-family="${escape(s.family)}" font-size="${s.fontSize}" font-weight="${s.weight}" font-style="${escape(s.style)}" letter-spacing="${s.letterSpacing}" xml:space="preserve">${escape(line.text)}</text>`;
+          return `<text fill="${node.paint.foreground}" direction="${display.context.direction}" text-anchor="${rtl ? 'end' : 'start'}" x="${textX}" y="${line.baseline}" font-family="${escape(s.family)}" font-size="${s.fontSize}" font-weight="${s.weight}" font-style="${escape(s.style)}" letter-spacing="${s.letterSpacing}" xml:space="preserve">${escape(line.text)}</text>`;
         })];
     }).join('');
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${display.width}" height="${Math.max(display.height, 1)}"><style>${css.replaceAll('&', '&amp;').replaceAll('<', '&lt;')} text{font-kerning:none;font-variant-ligatures:none;font-feature-settings:"kern" 0,"liga" 0,"clig" 0;font-synthesis:none}</style>${shapes}</svg>`;

@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--mash-root', type=Path)
     parser.add_argument('--output', type=Path, help='Keep native logs, fixtures and SVG consumer output here')
     parser.add_argument('--timeout', type=int, default=180)
+    parser.add_argument('--compiler', choices=('P6', 'none'), default='P6',
+                        help='Production optimizer by default; none is for boot-compiler diagnosis')
     args = parser.parse_args()
     sys.set_int_max_str_digits(0)
     sys.path[:0] = [str(ROOT / 'x'), str(ROOT / 'extras/x')]
@@ -65,6 +67,10 @@ def main():
 (check 0)
 (print "TEST-RUN-DONE")
 '''
+    # Exercise the production tier: boot-only execution can hide expensive
+    # descriptor construction inside a function body.
+    if args.compiler != 'none':
+        source = '(#bind opt (#module plangrm))\n(Install opt:compileP6)\n' + source
     code, completed, _ = runner.run_process(
         [wisp, '--file-root', str(output / 'src'), 'snap', 'root', '_'],
         native, source, args.timeout)

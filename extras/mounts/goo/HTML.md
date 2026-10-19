@@ -25,7 +25,8 @@ version-1 display list contains:
   `nodes`. The root width includes Goo's normal layout quantization.
 - Each node's `id`, `parentId`, `kind`, semantic `role`, full `slot`, `config`,
   original `payload`, absolute `box`, `textStyle` and explicit `lines`. Images
-  additionally retain their `src`.
+  additionally retain their `src`. Each node also carries versioned `paint` and
+  `semantics` descriptors; see [the portable contract](PORTABLE.md).
 - Each text style's pinned font ID/hash, family, weight, style, font size,
   line height, letter spacing and insets. Kerning and ligatures are disabled
   for this profile's deterministic glyph-advance model.
@@ -105,7 +106,8 @@ WISP=/path/to/the/locked/wisp python3 extras/mounts/goo/scripts/check-profile.py
 ```
 
 Without `--mash-root`, the script verifies the vendored profile and native
-preparation, including guard rejection and display fixtures. With that argument,
+preparation under the production P6 compiler, including guard rejection and display fixtures.
+`--compiler none` is available for boot-compiler diagnosis. With that argument,
 it also verifies the paired Mash distribution and uses Mash's installed
 Playwright/Chromium to compare actual HTML geometry with the server's display
 list. Page JavaScript is disabled. An SVG consumer independently paints the

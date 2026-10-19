@@ -70,8 +70,8 @@ async function step(name, run) {
   results.push({name,milliseconds:Date.now()-start});
   console.log(`PASS ${name}`);
 }
-async function render(target, view, overrides = {}) {
-  const response = await page.request.post(`${base}/goo/render`, {form:{target,view,width:'360',textScale:'1',direction:'ltr',...overrides}});
+async function render(target, view, overrides = {}, timeout = 30000) {
+  const response = await page.request.post(`${base}/goo/render`, {timeout,form:{target,view,width:'360',textScale:'1',direction:'ltr',...overrides}});
   assert.equal(response.status(), 200, await response.text());
   const data = await response.json();
   assert.equal(data.ok,true);
@@ -92,7 +92,8 @@ async function assertGeometry() {
 
 try {
   await step('real compiled endpoint and inert hydration', async () => {
-    const data = await render(`${cards}/a`, '/0x11/gov/panes/content');
+    // The first read can compile cold P6 code; later requests keep the normal deadline.
+    const data = await render(`${cards}/a`, '/0x11/gov/panes/content', {}, 120000);
     assert.equal(data.profile.id,'mash-goo');
     assert.equal(data.context.width,360);
     assert.equal(data.context.direction,'ltr');
@@ -251,6 +252,15 @@ try {
       await expect(content).toContainText('Selection owns the context.');
       assert(renders.slice(requestStart).some(r=>r.status===200&&r.request.workspace?.endsWith('/workspace')),'Expected trusted workspace render request');
       assert(renders.slice(requestStart).some(r=>r.status===200&&r.request.slot==='/sys/slot/synthetic'),'Expected structured synthetic follower render');
+      const hosted = renders.slice(requestStart).find(r=>r.status===200&&r.request.workspace?.endsWith('/workspace')).body;
+      assert.equal(hosted.host.version, 1);
+      assert.equal(hosted.host.kind, 'workspace');
+      assert.equal(hosted.host.declaration, await host.getAttribute('data-workspace'));
+      assert.equal(hosted.host.navigation.kind, 'workspace-session');
+      assert.match(hosted.host.navigation.sourceSlot, /^\//);
+      assert.match(hosted.snapshot.subject, /\/goo\/ses\/\d+$/);
+      assert.deepEqual(hosted.host.operations, JSON.parse(await host.getAttribute('data-operations')));
+      await writeFile(join(output,'portable-host.json'),JSON.stringify(hosted,null,2)+'\n');
       await host.evaluate(element=>{element.style.width='700px';element.dir='rtl';element.style.setProperty('--goo-text-scale','1.1');});
       await expect.poll(async () => host.evaluate(element=>{const c=JSON.parse(element.dataset.renderContext||'{}');return c.direction==='rtl'&&c.textScale===1.1&&c.width<=700;})).toBe(true);
       await expect.poll(async () => { try { await assertGeometry(); return true; } catch { return false; } }).toBe(true);
@@ -260,6 +270,23 @@ try {
       await page.screenshot({path:join(output,`${hostName}.png`),fullPage:true});
     });
   }
+  function checkPortable(value) {
+    if (Array.isArray(value)) { value.forEach(checkPortable); return; }
+    if (!value || typeof value !== 'object') return;
+    for (const node of value.display?.nodes || []) {
+      assert.equal(node.paint.version, 1);
+      assert.equal(node.semantics.version, 1);
+    }
+    for (const control of value.controls || []) {
+      if (!['input','action'].includes(control.kind)) continue;
+      assert.equal(control.binding.version, 1);
+      assert.equal(control.binding.nodeId, control.id);
+      assert.equal(control.binding.route, control.control);
+      assert.deepEqual(control.binding.captures, control.captures);
+    }
+    for (const key of ['description','children','contents','content']) checkPortable(value[key]);
+  }
+  renders.filter(r=>r.status===200).forEach(r=>checkPortable(r.body));
   assert.deepEqual(failures,[],'uncaught browser errors');
   await page.screenshot({path:join(output,'application.png'),fullPage:true});
   await writeFile(join(output,'browser-results.json'),JSON.stringify({base,subset:subset||null,results,renderResponses:renders.length,actionRequests:actions.length,actionResponses,failures},null,2)+'\n');
