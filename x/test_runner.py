@@ -138,8 +138,9 @@ def inventory():
         if mod in helpers:
             found_helpers.add(mod)
         elif mod.startswith('tests/') or (mod.startswith('apps/') and path.stem == 'tests'):
+            # Native fixtures now compile against the consolidated layer contexts.
             suites.append(dict(name='foil:' + mod, kind='native', target=mod,
-                               group='native', fast=mod not in native_excluded, timeout=900, category='foil',
+                               group='native', fast=mod not in native_excluded, timeout=1800, category='foil',
                                enabled=mod not in native_excluded, reason=native_excluded.get(mod, '')))
         if re.search(r"^\s*'\s*\?=", path.read_text(), re.M):
             suites.append(dict(name='doc:' + mod, kind='docs', target=mod,

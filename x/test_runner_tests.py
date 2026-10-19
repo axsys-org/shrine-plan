@@ -181,7 +181,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn('foil:apps/chat/tests', names)
         self.assertNotIn('foil:apps/loom/tests', names)
         self.assertNotIn('foil:apps/nenex/tests', names)
-        self.assertIn('doc:sept', names)
+        self.assertIn('doc:stdlib/base', names)
         self.assertIn('foil:tests/supervisor', names)
         self.assertIn('foil:tests/http_foot', names)
         self.assertFalse(any(name.startswith('helm-') for name in names))
@@ -391,7 +391,7 @@ assert(check 0)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             shutil.copytree(runner.ROOT / 'src', root / 'src')
-            (root / 'src/foil/test_probe.foil').write_text(r'''-  testing
+            (root / 'src/foil/test_probe.foil').write_text(r'''-  stdlib/base
 +  identity
   '  ?=  ((identity 1) 1)
   '  ?=  ((identity 1) 2)

@@ -34,7 +34,7 @@ def instrument(source):
     edit('foil-bootstrap.rvr', [
         wrap('(publication:prepare-system compiler source:read-module system-roots)', 'system.prepare'),
         wrap('(publication:compile prepared driver:empty-foil-cache)', 'system.compile', 'prepared'),
-        wrap('(source:prepare-publication selection compiler module-root images\n      (lambda (path) 0) ["compiler_publication"])', 'policy.prepare', 'compiled'),
+        wrap('(source:prepare-publication selection compiler module-root images\n      (lambda (path) 0) ["stdlib/runtime"])', 'policy.prepare', 'compiled'),
         wrap('(publication:compile policy-plan (_1 compiled))', 'policy.compile', '[policy-plan compiled]'),
         wrap('(publication:publish-system policy slot compiled 0 0)', 'system.publish', '[policy compiled]'),
         wrap('(source:prepare-publication (context:publication-key previous-context)\n      (context:compiler-key previous-context) module-root images\n      (lambda (path) 0) modules)', 'local.prepare', '[previous-context images]'),

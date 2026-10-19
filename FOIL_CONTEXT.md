@@ -2,7 +2,7 @@
 
 Use this file as operational context when reading, writing, or editing Foil in
 this repository. It describes the currently implemented language and favors
-the modern style exercised end-to-end by `src/foil/shrine.foil`.
+the modern style exercised end-to-end by `src/foil/namespace.foil`.
 
 Foil is an alpha, statically typed, expression-oriented language that compiles
 to PLAN. Its surface syntax is Rex: indentation, alignment, parentheses, and
@@ -12,8 +12,8 @@ Rust, Scheme, or conventional brace-and-semicolon syntax.
 When repository examples disagree, prefer, in order:
 
 1. compiling code and tests;
-2. `src/foil/shrine.foil` for the modern dot dialect;
-3. `src/foil/demo.foil`, `bst.foil`, and `sept.foil` for established idioms;
+2. `src/foil/namespace.foil` for the modern dot dialect;
+3. `src/foil/test_fixtures/demo.foil`, `bst.foil`, and `sept.foil` for established idioms;
 4. `doc/getting-started.md`, `doc/foil-semantics.md`, and
    `doc/PAPERCUTS.md` for broader explanations.
 
@@ -98,8 +98,8 @@ the sole compiler. File callers use `foil-source`, which normalizes the
 shared sources’ historical order annotations before invoking the driver.
 
 ```foil
--  sept
--  shrine_types
+-  stdlib/base
+-  stdlib/base
 ```
 
 `- module` imports the named `.foil` module and merges its compiled entries.
@@ -109,7 +109,7 @@ An import nested beneath a declaration is also mounted at that namespace:
 
 ```foil
 +  app
-  -  vec
+  -  test_fixtures/vec
 ```
 
 The canonical `vec` entries are then navigable through `app/vec` as well.
@@ -196,14 +196,19 @@ means `: lock=lock epochs=uon[nat]`.
 `and : {\ bool bool}bool` is the named conjunction operation. Like `&&`,
 it does not evaluate its right operand when the left operand is false.
 
-### Sibling references
+### Sibling and child references
 
-`%/name` resolves relative to the parent of the current declaration.
-Inside `fs_foot/on_fact`, `%/on_bind` names `fs_foot/on_bind`.
-At module top level, `%/name` names a module-level declaration.
-Nested namespaces establish their own sibling scope; resolution does not
-search ancestors if that exact sibling is missing. The syntax also works
-in type annotations and with suffixes such as `%/helpers/read`.
+`;/name` resolves relative to the parent of the current declaration.
+Inside `fs_foot/on_fact`, `;/on_bind` names `fs_foot/on_bind`.
+At module top level, `;/name` names a module-level declaration.
+
+`#/name` resolves relative to the current declaration itself. Inside
+`grove/tag_kind`, `#/slot` names `grove/tag_kind/slot`. This includes
+references in a declaration's type or function body; nested declarations
+establish their own anchors. Neither form searches ancestors when the exact
+path is missing. Both work in types, values, patterns, and specializations,
+including `p=#/box[nat]` and `#/helpers/read`. Live expressions outside a
+declaration anchor both forms at the module root.
 
 ### Named rows
 
@@ -306,6 +311,34 @@ The modern `shrine.foil` style defines a sum from named member rows:
   +  unknown
     :
 ```
+
+A sum whose cases are all nullary constructors gets a generated
+`T/read_str : {\ str}maybe[T]` helper:
+
+```foil
++ color
+  & #/red #/blue
+  + red
+    :
+  + blue
+    :
+
++ parse_color
+  \ text=str
+  ^ maybe[color]
+  | color/read_str text
+```
+
+The reader matches exact, case-sensitive member names (`"red"`, `"blue"`),
+not qualified paths or runtime brands. Unknown names return `.none`.
+Explicit one-case enums also get a reader. Payload-bearing sums do not.
+The generated name `read_str` is reserved on enums; cases must have distinct
+member names.
+Imported and aliased readers return the defining enum's values.
+
+With `stdlib/base`, `option.ok_or(error)` converts `maybe[v]` to
+`either[e v]`: `.some value` becomes `.ok value`, while `.none` becomes
+`.err error`. Pass the error payload, not an already-wrapped `either`.
 
 The older ad-hoc payload style (`& ($some v) $none`) still parses, but the
 tree has migrated off it entirely. Do not write new code with it; declare
@@ -990,7 +1023,7 @@ to the compiler when possible. See `doc/foil-rex.md` and the executable
 
 ## Grove v2 syntax AST
 
-`src/foil/grove.foil` parses Grove v2 with `grove/parse` or
+`src/foil/stdlib/runtime.foil` parses Grove v2 with `grove/parse` or
 `grove/from_blocks`, returning `either[grove/error grove/document]`.
 It uses reference-style Rex blocks and preserves expressions, types,
 and embedded Foil as surface Rex. It performs no resolution or lowering.
@@ -1045,7 +1078,7 @@ is installed in the live namespace or `/sys/op`. Stored bundles support
 source-free action imports. SRS now compiles through `finish` (six decls);
 full compilation includes the tree declarations. Run
 `x/check foil-grove-action-tests`. Tight annotations such as
-`value=%/grade` are rewritten structurally by the backend.
+`value=;/grade` are rewritten structurally by the backend.
 
 ### Grove norms
 

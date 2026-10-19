@@ -73,6 +73,15 @@ class MountTests(unittest.TestCase):
         self.assertIn('"MOUNT-ENCODING-PASS"', log)
         self.assertNotIn('"MOUNT-ENCODING-FAIL"', log)
 
+    def test_runtime_grove_default_prelude_resolves(self):
+        bag = self.bag('example', grove=[dict(root=['gov', 'example'], files=['main.grove'])])
+        source = self.root / 'src'
+        source.mkdir()
+        specs = runtime_specs([(select(self.root, ['example'])[0], bag, [], None)], source)
+        prelude = specs[0][4][0][2]
+        self.assertTrue((Path(__file__).resolve().parent.parent / 'src/foil' /
+                         (prelude + '.foil')).is_file(), prelude)
+
     def test_unknown_and_cycles(self):
         self.bag('a', dependencies=['b'])
         self.bag('b', dependencies=['a'])
@@ -238,7 +247,7 @@ class MountTests(unittest.TestCase):
         self.assertFalse((first / 'companion-alive').exists())
 
     def test_core_modules_cannot_be_overridden(self):
-        self.bag('shadow', modules={'eden': 'eden.foil'})
+        self.bag('shadow', modules={'stdlib/runtime': 'eden.foil'})
         with self.assertRaisesRegex(ValueError, 'belongs to core'):
             select(self.root, ['shadow'])
 

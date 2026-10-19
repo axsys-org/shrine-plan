@@ -8,7 +8,7 @@ GOO_PATCH_MASH_ROOT=/path/to/mash WISP=/path/to/wisp \
   python3 x/eden --compiler none --mount goo-documentation --port 8136
 ```
 
-Open `/goo-documentation`, or deep-link with `?path=/0x11/lib/pact/lore`.
+Open `/goo-documentation`, or deep-link with `?path=/0x11/lib/vanes/lore`.
 The initial page opens the installed node's `lib/pact/lore` documentation. Library,
 Declarations, Applications, System, breadcrumbs, Parent, and the path form all
 navigate the same endpoint. **Browse** makes a tree member the new browsing root.

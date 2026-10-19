@@ -60,13 +60,29 @@ def declarations(slots, aliases=False):
     return '\n'.join(lines) + '\n'
 
 
+def replace_generated(text, name, body):
+    begin = "' BEGIN GENERATED " + name + "\n"
+    end = "' END GENERATED " + name + "\n"
+    if text.count(begin) != 1 or text.count(end) != 1:
+        raise ValueError('expected exactly one generated section: ' + name)
+    start = text.index(begin) + len(begin)
+    finish = text.index(end)
+    if finish < start:
+        raise ValueError('reversed generated section: ' + name)
+    return text[:start] + body + text[finish:]
+
+
+def generated_file(module, name, body):
+    return replace_generated((ROOT / 'src/foil' / (module + '.foil')).read_text(), name, body)
+
+
 def outputs(slots):
     banner = "' Generated from slots/system.slots.json by x/slot_catalog.py; edit the catalog.\n"
     system = '- sys/types\n\n' + banner + declarations(slots)
     # Foil's transitive imports do not retain a direct import's at= prefix.
     # Emit the same catalog constants under a namespace instead of importing
     # sys/slots, whose bare form/res/etc. would shadow application types.
-    facade = '- sys/shrine\n\n' + banner + '+ system_vocabulary\n'
+    facade = banner + '+ system_vocabulary\n'
     facade += ''.join('  ' + line + '\n' for line in declarations(slots, True).splitlines())
     facade += '''  + locate
     ' Dynamic families use the same fixed system authority.
@@ -80,7 +96,7 @@ def outputs(slots):
 '''
     def cord(value):
         return '"' + value.replace('"', '""') + '"'
-    seeds = '- pact\n\n' + banner + '''+ slot_documentation
+    seeds = banner + '''+ slot_documentation
   + entries
     ^ row[[path str str]]
     ['''
@@ -95,8 +111,8 @@ def outputs(slots):
       | out.put name ((myth/sing bond/lede (pails/t title)).put(bond/help (lore "" [summary] [])))
 '''
     return {ROOT / 'src/foil/sys/slots.foil': system,
-            ROOT / 'src/foil/system_vocabulary.foil': facade,
-            ROOT / 'src/foil/slot_documentation.foil': seeds}
+            ROOT / 'src/foil/stdlib/base.foil': generated_file('stdlib/base', 'system_vocabulary', facade),
+            ROOT / 'src/foil/stdlib/runtime.foil': generated_file('stdlib/runtime', 'slot_documentation', seeds)}
 
 
 def main():

@@ -81,7 +81,7 @@ def compile_source():
 (Seq (define system-code (publication:compile system-plan driver:empty-foil-cache)) (DeepSeq system-code 0))
 (define (local-root name)
   (define found (find (lambda (pair) (Equal name (_0 pair))) bootstrap:system-roots))
-  (If found (_1 (_0 found)) [["x" {authority}] ["ts" "goo-development"] ["ts" name]]))
+  (If found (_1 (_0 found)) (Weld [["x" {authority}] ["ts" "goo-development"]] (source:module-segments name))))
 (Seq (define app-plan (source:prepare-publication (context:publication-key (publication:compilation-context system-plan)) compiler local-root (_2 system-code) (lambda (path) 0) ["goo_app/types" "goo_app/results" "goo_app/adapter" "goo_app/tests"])) (DeepSeq app-plan 0))
 (Seq (define app-code (publication:compile app-plan (_1 system-code))) (DeepSeq app-code 0))
 (define (app-subject name)

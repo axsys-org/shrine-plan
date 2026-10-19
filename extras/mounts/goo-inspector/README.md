@@ -30,7 +30,7 @@ requests a fitting server layout. Rendered content cannot expand its host frame.
 
 The workspace, Namespace, and Values panes are separate `@pane` declarations.
 The workspace owns `/object` and connects it to each child's required `#port`
-with `pane(%/Namespace, ports = { '/object = '/object })` (and likewise for
+with `pane(;/Namespace, ports = { '/object = '/object })` (and likewise for
 Values). The declaration path supplies each pane's identity; layout wrappers do
 not. Selection sharing is explicit at these call sites.
 

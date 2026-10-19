@@ -41,10 +41,10 @@ grade =
   +  hard  :
   +  good  :
   +  easy  :
-  & %/again
-    %/hard
-    %/good
-    %/easy
+  & ;/again
+    ;/hard
+    ;/good
+    ;/easy
   + read
     \ raw=pail
     ^ maybe[grade]
@@ -82,8 +82,8 @@ recall =
   @role
   #meta ;
     lede: "Recall metadata"
-  %/due: time
-  %/interval: duration
+  ;/due: time
+  ;/interval: duration
 
 card =
   @role
@@ -106,11 +106,11 @@ finish =
   #meta ;
     lede: "Finish review"
   #on ; recall
-  %/grade: %/grade
+  ;/grade: ;/grade
   now: time
   ! foil
-  \ grade=%/grade now=time rec=%/recall
-  ^ %/recall
+  \ grade=;/grade now=time rec=;/recall
+  ^ ;/recall
   = next_interval
     ? grade
       > .again 1
@@ -154,9 +154,9 @@ queue =
       ^ nat
       = [xsrc x] left
       = [ysrc y] right
-      > (./some cx) (%/card/from_myth x)
+      > (./some cx) (;/card/from_myth x)
         0
-      > (./some cy) (%/card/from_myth y)
+      > (./some cy) (;/card/from_myth y)
         0
       ' Equal due times are ordered by source identifier.
       ' The input norm guarantees one-segment paths.
@@ -180,15 +180,15 @@ queue =
     \ x=axal[myth]
     ^ axal[myth]
     = occupied
-      | x.tap.keep(%/get/occupied)
+      | x.tap.keep(;/get/occupied)
     = entries
       | list/row[[path myth]]
-        (occupied.stream.sort_by(%/get/cmp).take(10))
+        (occupied.stream.sort_by(;/get/cmp).take(10))
     = acc=[nat axal[myth]]
       [0 (axal/new[myth] .none)]
     = [count out]
       | row/fold[[path myth] [nat axal[myth]]]
-        acc %/get/push entries
+        acc ;/get/push entries
     out
 
 
@@ -199,7 +199,7 @@ content =
   @view
   #meta ;
     lede: "Question and answer"
-  #on ; %/card
+  #on ; ;/card
   #for ; /sys/slot/content
   card => {
     or {
@@ -216,7 +216,7 @@ review =
   @view
   #meta ;
     lede: "Review card"
-  #on ; %/card
+  #on ; ;/card
   #for ; /sys/slot/review
   card => {
     present(card, '/sys/slot/content)
@@ -226,13 +226,13 @@ review =
       show("Interval", '/sys/slot/label)
       show(card.interval, '/sys/slot/content)
     }
-    group(on = card, action = %/finish, myth = {
+    group(on = card, action = ;/finish, myth = {
       '/sys/now = .provider
     }) {
-      action("Again", %/grade = %/grade/again)
-      action("Hard", %/grade = %/grade/hard)
-      action("Good", %/grade = %/grade/good)
-      action("Easy", %/grade = %/grade/easy)
+      action("Again", ;/grade = ;/grade/again)
+      action("Hard", ;/grade = ;/grade/hard)
+      action("Good", ;/grade = ;/grade/good)
+      action("Easy", ;/grade = ;/grade/easy)
     }
   }
 
@@ -247,7 +247,7 @@ workspace =
   @pane
   #meta ;
     lede: "Spaced repetition"
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/srs_workspace
   study => {
     selection('/current, source = study.from) {
@@ -271,10 +271,10 @@ workspace =
   @tree
   req: "What does a Shrine name identify?"
   res: "A versioned locus of state."
-  %/due: 0
-  %/interval: 1
+  ;/due: 0
+  ;/interval: 1
 
 "/next" =
   @tree
-  weft: %/queue
+  weft: ;/queue
   tack: '@/y/%/cards

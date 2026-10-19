@@ -30,7 +30,7 @@ card =
 
 card_label =
   @view
-  #on ; %/card
+  #on ; ;/card
   #for ; /sys/slot/label
   ! goo
   card => {
@@ -55,7 +55,7 @@ binding syntax:
 ```grove
 workspace =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/workspace
   study => {
     present(study, '/sys/slot/summary)
@@ -75,7 +75,7 @@ an `@pane` declaration. The explorer lists panes separately from view matching,
 with their declaration kind shown beside the slot.
 
 Both kinds currently require `#on` and `#for`. Each `@pane` declaration creates
-its own local owner. Mount a child with `pane(%/child)`; inline pane bodies are
+its own local owner. Mount a child with `pane(;/child)`; inline pane bodies are
 not supported. `present` still selects views, never panes.
 
 ### Calls and expressions
@@ -92,7 +92,7 @@ The underlying reader is Rex, not JavaScript.
 | `card.req` | A field of the bound receiver, resolved against its declared role. |
 | `'/sys/slot/title` | Absolute path literal. The leading apostrophe has **no closing apostrophe**. |
 | `/sys/slot/title` | Bare absolute path also accepted in path positions, as in `#for` and `present`. Quoted paths are the consistent spelling in bodies. |
-| `%/card`, `%/finish`, `%/grade/good` | Grove-relative declaration references, resolved during compilation. These are not arbitrary string interpolation. |
+| `;/card`, `;/finish`, `;/grade/good` | Grove-relative declaration references, resolved during compilation. These are not arbitrary string interpolation. |
 | `name = expression` | A named argument, such as `become = '/sys/slot/res`. |
 | `{ '/sys/req = .input(card.req) }` | An action argument record, used by `myth`. |
 | `{[grow]: 1, [maxIdeal]: 320}` | Native configuration record; a different syntax from `myth`. |
@@ -351,17 +351,17 @@ but use a data-slot path to bind an actual editable argument.
 ### Invoke a declared action
 
 ```goo
-group(on = card, action = %/finish, myth = {
+group(on = card, action = ;/finish, myth = {
   '/sys/now = .provider
 }) {
-  action("Again", %/grade = %/grade/again)
-  action("Good", %/grade = %/grade/good)
+  action("Again", ;/grade = ;/grade/again)
+  action("Good", ;/grade = ;/grade/good)
 }
 ```
 
-`%/finish` refers to a Grove `@action`. The group supplies common arguments;
+`;/finish` refers to a Grove `@action`. The group supplies common arguments;
 individual buttons supply additional arguments. Declaration references such as
-`%/grade/good` resolve registered constants of the action's argument type.
+`;/grade/good` resolve registered constants of the action's argument type.
 A declared action transforms the current object. Goo does not execute arbitrary
 code in a button expression.
 
@@ -392,7 +392,7 @@ a domain operation. Dirty inputs are guarded before departing their encounter.
 ### Create an object at an absent path
 
 ```goo
-creator => group(make = creator.creation_target, role = %/created_card, myth = {
+creator => group(make = creator.creation_target, role = ;/created_card, myth = {
   '/sys/req = .input("")
   '/sys/res = .input("")
 }) {
@@ -423,25 +423,25 @@ and [SRS action examples](../../extras/mounts/srs/srs.grove).
 ```grove
 workspace =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/workspace
   study => selection('/current, source = study.cards) {
     split {
-      pane(%/queue, ports = { '/chosen = '/current })
-      pane(%/detail, ports = { '/chosen = '/current })
+      pane(;/queue, ports = { '/chosen = '/current })
+      pane(;/detail, ports = { '/chosen = '/current })
     }
   }
 
 queue =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/queue
   #port ; /chosen
   study => list('/rows, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
 
 detail =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/detail
   #port ; /chosen
   study => follow('/subject, selection = '/chosen, slot = '/sys/slot/content)
@@ -453,15 +453,15 @@ ordinary views. A followed member's `@view` cannot introduce pane features.
 
 ### Pane identity and explicit ports
 
-`pane(%/detail)` uses the declaration's canonical path as its stable identity,
+`pane(;/detail)` uses the declaration's canonical path as its stable identity,
 scoped under the owning pane. Reordering it or placing it in another layout
 wrapper preserves that identity. Changing its `#on` or `#for` does not rename it.
 
 Mounting the same declaration twice under one owner requires distinct keys:
 
 ```goo
-pane(%/detail, key = '/left, ports = { '/chosen = '/current })
-pane(%/detail, key = '/right, ports = { '/chosen = '/current })
+pane(;/detail, key = '/left, ports = { '/chosen = '/current })
+pane(;/detail, key = '/right, ports = { '/chosen = '/current })
 ```
 
 The instance identity includes both the declaration and the explicit key. Changing
@@ -577,12 +577,12 @@ separate from accepting that member as the selection.
 
 ```goo
 deck('/tabs) {
-  pane(%/summary_pane)
-  pane(%/details_pane)
+  pane(;/summary_pane)
+  pane(;/details_pane)
 }
 pane_stack {
-  pane(%/back)
-  pane(%/front)
+  pane(;/back)
+  pane(;/front)
 }
 ```
 
@@ -599,8 +599,8 @@ Dirty input departure is guarded with Stay/Discard behavior. Composition delays
 departure. A pending choice is not the accepted selection.
 
 ```goo
-group(on = study, action = %/choose, myth = {
-  %/chosen = .capture('/current)
+group(on = study, action = ;/choose, myth = {
+  ;/chosen = .capture('/current)
 }) {
   action("Use selected object")
 }

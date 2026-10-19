@@ -4,7 +4,7 @@
               [--no-text-checks] [--baseline FILE] [--write-baseline FILE]
 
 Style linter for .foil files (style-guide.md).  One wisp session, warmed
-from the x/check template, compiles src/foil/lint.foil once, parses each
+from the x/check template, compiles src/foil/stdlib/base.foil once, parses each
 file with the native Rex reader and applies lint/check_all; this script
 adds the two text-level rules a Rex tree cannot see (tabs,
 trailing-space), filters rules, sorts, and prints
@@ -54,7 +54,7 @@ SESSION = r'''
 (#bind render (#module foil-render))
 (define (ms-since start) (Div (Sub (Now 0) start) 1000000))
 (define t-compile (Now 0))
-(define loaded (Seq t-compile (source:compile (fixture:files 0 ["lint"]) 0 "lint")))
+(define loaded (Seq t-compile (source:compile (fixture:files 0 ["stdlib/base"]) 0 "stdlib/base")))
 (define lint-sut (foil:perc-subject (_1 loaded)))
 (define lint-check (foil:source-entry-val ["lint" "check_all"] lint-sut))
 (define (optional-row path)

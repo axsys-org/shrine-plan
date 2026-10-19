@@ -196,7 +196,7 @@ source_path =
 
 context =
   @role
-  %/source_path: path_type
+  ;/source_path: path_type
 
 note =
   @role
@@ -211,7 +211,7 @@ The note role requires both text fields. It does not create any note instances.
 The separate `context` role is the workspace's input contract: its `source_path`
 field tells the list which collection to browse.
 
-`%/source_path` resolves within this Grove publication. After publication its
+`;/source_path` resolves within this Grove publication. After publication its
 identity is `/0x11/gov/hello_grove/source_path`. The host uses that exact slot to
 construct the receiver. The list and reader eventually operate on the actual
 note records, not on that temporary context record.
@@ -221,7 +221,7 @@ Some syntax to recognize before proceeding:
 - `@role`, `@view`, `@pane`, and `@tree` identify declaration kinds.
 - `#on ;` identifies the receiver role of a presentation.
 - `#for ;` identifies the purpose, or presentation slot, that the view serves.
-- `%/name` refers to a declaration in the current Grove unit.
+- `;/name` refers to a declaration in the current Grove unit.
 - `'/sys/slot/label` is a path literal used as a constructor argument.
 - `record => { ... }` names the presentation's receiver and defines its body.
 
@@ -236,13 +236,13 @@ Append:
 ```plaintext
 summary =
   @view
-  #on ; %/note
+  #on ; ;/note
   #for ; /sys/slot/hello_note_summary
   note => { show(note.lede, '/sys/slot/label) }
 
 detail =
   @view
-  #on ; %/note
+  #on ; ;/note
   #for ; /sys/slot/hello_note_detail
   note => {
     show(note.lede, '/sys/slot/title)
@@ -275,7 +275,7 @@ Append:
 ```plaintext
 edit =
   @view
-  #on ; %/note
+  #on ; ;/note
   #for ; /sys/slot/hello_note_edit
   note => group(on = note, action = .poke, myth = {
     '/sys/lede = .input(note.lede)
@@ -313,18 +313,18 @@ Append the workspace and two child panes:
 ```plaintext
 workspace =
   @pane
-  #on ; %/context
+  #on ; ;/context
   #for ; /sys/slot/hello_workspace
   context => selection('/current, source = context.source_path) {
     split {
-      pane(%/Notes, ports = { '/current = '/current })
-      pane(%/Reader, ports = { '/current = '/current })
+      pane(;/Notes, ports = { '/current = '/current })
+      pane(;/Reader, ports = { '/current = '/current })
     }
   }
 
 Notes =
   @pane
-  #on ; %/context
+  #on ; ;/context
   #for ; /sys/slot/pane/HelloNotes
   #port ; /current
   context => {
@@ -333,7 +333,7 @@ Notes =
 
 Reader =
   @pane
-  #on ; %/context
+  #on ; ;/context
   #for ; /sys/slot/pane/HelloReader
   #port ; /current
   context => {

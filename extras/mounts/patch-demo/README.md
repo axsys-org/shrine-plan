@@ -40,7 +40,7 @@ The shape used by `main.grove` is:
 ```grove
 editor =
   @pane
-  #on ; %/board
+  #on ; ;/board
   #for ; /sys/slot/content
   board => patch('/canvas, scene = board.scene, label = "Board") {
     patch_node("source") {
@@ -50,8 +50,8 @@ editor =
     }
     patch_connection("wire") {}
     patch_operation("move-nodes", slot = '/0x11/gov/patch_demo/operation) {
-      group(on = board, action = %/edit, myth = {
-        %/operation = .input("")
+      group(on = board, action = ;/edit, myth = {
+        ;/operation = .input("")
       }) {
         input('/0x11/gov/patch_demo/operation)
         action("Apply move")

@@ -78,7 +78,7 @@ def main():
             assert response.status == 200
         assert 'Temporary runtime edit' in page('/ns')
         changed = original.split('"/notes/second"')[0].replace('Hello from Grove', 'Updated live from Grove')
-        changed += '"/notes/third" =\n  @tree\n  lede: "New child"\n  %/title: "Added live"\n'
+        changed += '"/notes/third" =\n  @tree\n  lede: "New child"\n  ;/title: "Added live"\n'
         path.write_text(changed)
         updated = rebuild()
         assert 'Updated live from Grove' in page('/ns')

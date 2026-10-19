@@ -10,7 +10,7 @@ for name,f in faces.items():
  assert sha(root/'profile'/font_files[name])==f['fontSHA256'],name
  assert len(f['advances'])==95 and f['unitsPerEm']>0,name
 s='''- goo_app/binary64
-- json
+- stdlib/base
 
 ' Generated from the pinned Mash profile/metrics.json by scripts/generate-fonts.py.
 + goo_fonts

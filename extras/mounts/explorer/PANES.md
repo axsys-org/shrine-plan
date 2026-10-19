@@ -13,7 +13,7 @@ normalize action arguments, sample providers, or write domain receipts.
 
 ## Integration map
 
-- `src/foil/grove_views.foil`: validates keyed local constructors and retains
+- `src/foil/stdlib/runtime.foil`: validates keyed local constructors and retains
   them alongside ordinary lowered `show` and expanded `present` nodes.
 - `goo_panes.foil`: read-only description serialization and initial server HTML. Native fragments still
   pass through `goo_bridge` and Goo v2 normalization, layout and HTML.
@@ -23,7 +23,7 @@ normalize action arguments, sample providers, or write domain receipts.
 - `goo-panes.js`: the explorer's native list/deck gestures, retained DOM, actual
   input integration and selection-following subject presentations.
 - `goo-actions.js`: shared action adapter for ordinary previews and panes.
-- `src/foil/goo_runtime.foil`: bounded namespace source reads, lifetime/data
+- `src/foil/stdlib/runtime.foil`: bounded namespace source reads, lifetime/data
   evidence validation, normal argument/receiver admission and invocation retry.
 
 There was no earlier pane/session store, list/topos, or draft checkpoint service
@@ -78,32 +78,32 @@ and pending actions are scoped to the presenting instance.
 ```grove
 workspace =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/workspace
   study => selection('/current, source = study.cards) {
     split {
-      pane(%/queue, ports = { '/chosen = '/current })
-      pane(%/detail, ports = { '/chosen = '/current })
+      pane(;/queue, ports = { '/chosen = '/current })
+      pane(;/detail, ports = { '/chosen = '/current })
     }
   }
 
 queue =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/queue
   #port ; /chosen
   study => list('/rows, source = study.cards, selection = '/chosen, slot = '/sys/slot/summary)
 
 detail =
   @pane
-  #on ; %/study
+  #on ; ;/study
   #for ; /sys/slot/detail
   #port ; /chosen
   study => follow('/subject, selection = '/chosen, slot = '/sys/slot/content)
 ```
 
 Each `@pane` declaration supplies its default instance identity. Composition uses
-`pane(%/declaration, ports = { '/chosen = '/current })`; repeat a declaration
+`pane(;/declaration, ports = { '/chosen = '/current })`; repeat a declaration
 under the same owner with distinct `key` arguments. Inline pane bodies are
 rejected. `#port` declarations and call-site bindings make cross-pane selection
 connections explicit. See [the reference](../../../src/grove/GOO.md#pane-identity-and-explicit-ports)
@@ -187,8 +187,8 @@ data edits and render-context changes continue within the existing session.
 ## Captures and domain actions
 
 ```grove
-group(on = study, action = %/archive, myth = {
-  %/archived = .capture('/current)
+group(on = study, action = ;/archive, myth = {
+  ;/archived = .capture('/current)
 }) {
   action("Remember selected card")
 }
@@ -355,7 +355,7 @@ A creation group keeps the presenting receiver and names a separate, absent
 write destination:
 
 ```text
-group(make = creator.creation_target, role = %/created_card, myth = {
+group(make = creator.creation_target, role = ;/created_card, myth = {
   '/sys/req = .input("")
   '/sys/res = .input("")
 }) {

@@ -265,7 +265,7 @@ def runtime_specs(prepared, source_root):
         specs.append([mount.name, 'mounts/' + mount.name,
                       json.dumps(data, sort_keys=True),
                       list(data.get('modules', {}).items()),
-                      [[u['root'], u['files'], u.get('prelude', 'grove_role_runtime')]
+                      [[u['root'], u['files'], u.get('prelude', 'stdlib/runtime')]
                        for u in data.get('grove', [])],
                       hook('activate'), hook('http'), hook('start'), args,
                       int(bool(data.get('inspection'))),

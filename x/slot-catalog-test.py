@@ -50,6 +50,24 @@ class CatalogTests(unittest.TestCase):
         self.doc['slots'].reverse()
         self.assertEqual(first, catalog.outputs(self.load(self.doc)))
 
+    def test_generated_sections_preserve_handwritten_code(self):
+        before = "- types\n+ handwritten 42\n"
+        after = "+ handwritten_after 43\n"
+        text = before + "' BEGIN GENERATED vocabulary\nstale\n' END GENERATED vocabulary\n" + after
+        updated = catalog.replace_generated(text, 'vocabulary', '+ generated 1\n')
+        self.assertTrue(updated.startswith(before))
+        self.assertTrue(updated.endswith(after))
+        self.assertIn('+ generated 1\n', updated)
+        self.assertNotIn('stale', updated)
+        self.assertEqual(updated, catalog.replace_generated(updated, 'vocabulary', '+ generated 1\n'))
+
+    def test_generated_markers_must_be_unique_and_ordered(self):
+        begin = "' BEGIN GENERATED vocabulary\n"
+        end = "' END GENERATED vocabulary\n"
+        for text in ('', begin, end + begin, begin + begin + end, begin + end + end):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                catalog.replace_generated(text, 'vocabulary', '')
+
     def test_catalog_is_current(self):
         for path, content in catalog.outputs(catalog.load(catalog.CATALOG)).items():
             self.assertEqual(path.read_text(), content, str(path))

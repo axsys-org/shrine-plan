@@ -11,7 +11,7 @@ for(const name of (process.env.BROWSERS||'chromium,firefox,webkit').split(',')) 
  const browser=await engines[name].launch({headless:true});
  const page=await browser.newPage({viewport:{width:1440,height:1100}});page.setDefaultTimeout(45000);
  const errors=[],checks=[];page.on('pageerror',error=>errors.push(error.message));
- const target='/0x11/lib/pact/lore', title='/sys/lede';
+ const target='/0x11/lib/vanes/lore', title='/sys/lede';
  const check=text=>{checks.push(text);console.log(name,text);};
  const tab=(p,name)=>p.getByRole('tab',{name,exact:true});
  const form=(p,slot=title)=>p.locator(`form[data-goo-value="${slot}"]`);
@@ -50,7 +50,7 @@ for(const name of (process.env.BROWSERS||'chromium,firefox,webkit').split(',')) 
   assert.equal(await field(page).inputValue(),'Unsaved draft');
   await tab(page,'Documentation').click();await tab(page,'Values').click();
   assert.equal(await field(page).inputValue(),'Unsaved draft');
-  await page.locator('wa-tree-item[subject="/0x11/lib/pact/lore/line"]').press('Enter');
+  await page.locator('wa-tree-item[subject="/0x11/lib/vanes/lore/line"]').press('Enter');
   await page.getByRole('button',{name:'Stay',exact:true}).click();
   assert.equal(await field(page).inputValue(),'Unsaved draft');
   await form(page).getByRole('button',{name:'Cancel',exact:true}).click();

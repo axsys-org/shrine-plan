@@ -5,7 +5,7 @@ import urllib.error
 
 def check(url, node, timeout):
     for path, expected in [('/goo-documentation', 'Goo documentation'),
-                           ('/goo-documentation?path=/' + node + '/lib/pact', 'data-workspace'),
+                           ('/goo-documentation?path=/' + node + '/lib/vanes', 'data-workspace'),
                            ('/goo-documentation/style.css', '.goo-documentation')]:
         with urllib.request.urlopen(url + path, timeout=timeout) as response:
             assert response.status == 200
