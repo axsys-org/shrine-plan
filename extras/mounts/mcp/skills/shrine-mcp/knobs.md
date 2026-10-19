@@ -181,11 +181,11 @@ numbers in their own unit and compare as such; a day is the number
 | `count` | `into` (default `/count`) | number of children |
 | `sum`, `min`, `max`, `avg` | `slot`, `into` | the figure over the children's `slot`, with `/scale`; `avg` rounds half up |
 | `any`, `all` | `slot`, `into` | whether any / every child's `slot` is true |
-| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains) | the matching rows; a number slot compares by value at its scale (`136` at scale 2 is 1.36), anything else as text |
+| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains); or `expr` | the matching rows; a number slot compares by value at its scale (`136` at scale 2 is 1.36), anything else as text |
 | `sort` | `slot` (one, or two space separated: the second breaks ties), `order` (asc, desc) | rows re-keyed 1, 2, 3, old key at `/key` (a name, or the path as text for a deeper row) |
 | `top` | `slot`, `count` (default 3) | the largest, ranked; fewer rows than `count` gives fewer |
 | `latest`, `earliest` | `slot` | the one child, as the root, key at `/key`; no row with a number there gives an empty root |
-| `each` | `left`, `op`, `right`, `into` (all four) | a derived slot per child, `/scale` on each row where the sides carried one; sides are literals or the child's slots |
+| `each` | `left`, `op`, `right`, `into` (all four); or `expr`, `into` | a derived slot per child, `/scale` on each row where the sides carried one; sides are literals or the child's slots |
 | `lookup` | `key`, `take`, `match` (default `key`), `into`, `from` (default `table`) and a secondary input named by `from` | brings `take` from the matching table row |
 | `distinct` | `slot` | one row per distinct value, keyed 1, 2, 3 in order of first appearance, each `/value` and `/count`; the root gains `/count`: how many |
 | `select` | `slots` (space separated) | only those slots, on root and children |
@@ -209,7 +209,7 @@ numbers in their own unit and compare as such; a day is the number
 | `split` | `slot`, `with` (default a space), `into` (default `slot`) | each row gains `into/1`, `into/2`, … , the slot's text cut at `with` |
 | `date` | `slot`, `into` (default `/day`) | each row gains `into`: the text date `YYYY-MM-DD` (anything after the day ignored) as the natural `YYYYMMDD`, which `sort`, `between`, `latest` and `since` can use |
 | `ask` | `prompt`, `model` (default the hand's) | the stored answer at `<cell>/result` while its stamp (input case, model, prompt) is current; else empty, with `/sys/view/asking` in the context |
-| `when` | `key`, `op` (as `where`), `value`, `then`, `else` (optional), `into` | each row gains `into`: `then` when its `key` matches, else `else`; without `else` a row that does not match is left as it is |
+| `when` | `key`, `op` (as `where`), `value`, or `expr`; `then`, `else` (optional), `into` | each row gains `into`: `then` when its `key` matches, else `else`; without `else` a row that does not match is left as it is |
 | `coalesce` | `slot`, `value`, `into` (default `slot`) | each row gains `into`: its `slot` when present, else `value` |
 | `part` | `slot` (a day number `YYYYMMDD` or a text date), `unit` (year, quarter, month, week, weekday), `into` (default `/<unit>`) | each row gains `into`: that part of its day; week counts sevens from January 1st, weekday is 1 Monday to 7 Sunday |
 | `shift` | `slot`, `by` (a whole number, signed), `unit` (day default, week, month, year), `into` (default `slot`) | each row gains `into`: its day moved; a month or year move keeps the day, clamped to the month |
@@ -230,8 +230,33 @@ numbers in their own unit and compare as such; a day is the number
 | `drop` | `slots` (space separated) | the root and every row without those slots: the inverse of `select` |
 | `unflatten` | | a child named with underscores lands at the path they spell: the inverse of `flatten` |
 | `explode` | `slot`, `with` (default a space) | the pieces of the row's `slot` text as rows `1`, `2`, `3` under the row's name, each the row with its piece at `slot` |
-| `validate` | `key`, `op` (as `where`, or `present`), `value`, `reason` (optional) | the rows that break the rule, each with `/reason`: `reason`, else the rule in words (`/amount is not over 40`, `/amount is absent`) |
+| `validate` | `key`, `op` (as `where`, or `present`), `value`, or `expr`; `reason` (optional) | the rows that break the rule, each with `/reason`: `reason`, else the rule in words (`/amount is not over 40`, `/amount is absent`) |
 | `unique` | `key` | the rows whose `key` value another row shares, each with `/count` |
+
+### Expressions
+
+`each`, `when`, `where` and `validate` take `expr` instead of their settings:
+a text, parsed once per read and evaluated per row with the row's slots as
+the only variables. `each` writes the value at `into` (a number with its own
+scale, a text or a boolean); `where` keeps the rows where it is true; `when`
+writes `then` or `else` by it; `validate` keeps the rows where it is false,
+the expression as the reason unless `reason` is given.
+
+```
+amount * 2 + 1                       slot names, whole and decimal numbers, signed; + - * /
+status = 'closed' and amount > 30    = != < <= > >=, and or not, in (text inside text), parens
+round(amount / 3, 1)                 min max abs round len lower upper trim contains starts ends
+```
+
+Usual precedence (`or` below `and` below `not` below comparisons below `+ -`
+below `* /` below unary minus). A product or quotient is rounded half up at
+the larger of its operands' scales (`50 / 3` is 17; write `50.0 / 3` for
+16.7). A slot the row lacks is a hole on that row, noted at
+`/sys/view/hole/<row>` in the context: `where` drops the row, `each` and
+`when` leave it, `validate` fails it. A bad expression is one fault with
+its position; division by zero and a number against a text in arithmetic
+fault, naming the row; `expr` beside the old settings faults. A formula
+read takes `expr` in its settings like any other.
 
 ### Hand edits that survive recomputation
 
