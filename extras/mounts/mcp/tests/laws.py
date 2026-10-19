@@ -163,6 +163,33 @@ def check(base, node, timeout, seed=None, shapes=24):
             total_v = value(total, '/total')
             if parts and total_v:
                 law('percent sums to 100 at scale', abs(sum(parts) - 100) <= Fraction(1, 100) * len(parts), (float(sum(parts)), len(parts)))
+            # expressions
+            name = slot.lstrip('/')
+            # 11. each "x" is a copy of x on every row
+            copied = read(cell('copied', 'each', tack, expr=name, into='/copy'), 'z')
+            law('each of a slot name copies the slot', all(value(p, '/copy') == value(p, slot) for _, p in tree_rows(copied) if slot in p),
+                [(p.get('/copy'), p.get(slot)) for _, p in tree_rows(copied) if slot in p])
+            # 12. where "true" is identity, where "false" is empty
+            n_true = int(read(cell('ntrue', 'count', live(cell('always', 'where', tack, expr='true'), care)), 'x')['properties']['/count'])
+            n_false = int(read(cell('nfalse', 'count', live(cell('never', 'where', tack, expr='false'), care)), 'x')['properties']['/count'])
+            law('where true is identity and where false is empty', (n_true, n_false) == (n_all, 0), (n_true, n_false, n_all))
+            # 13. when c then a else b: a on the rows where c keeps, b on the rows where not c keeps
+            cond = name + ' > ' + str(int(rng.choice([v for v in (num_of(r, slot) for _, r in R) if v is not None] or [Fraction(0)])))
+            chosen = read(cell('chosen', 'when', tack, expr=cond, then='yes', into='/k', **{'else': 'no'}), 'z')
+            yes = {rel for rel, _ in tree_rows(read(cell('yes', 'where', tack, expr=cond), 'z'))}
+            no = {rel for rel, _ in tree_rows(read(cell('no', 'where', tack, expr='not (' + cond + ')'), 'z'))}
+            law('when c then a else b is a on where c and b on where not c',
+                all((p.get('/k') == 'yes') == (rel in yes) and (p.get('/k') == 'no') == (rel in no) for rel, p in tree_rows(chosen) if rel in yes or rel in no), cond)
+            # 14. round(x, 0) in an expression is the round entry
+            rounded = read(cell('rounded', 'each', tack, expr='round(' + name + ', 0)', into='/r'), 'z')
+            for rel, p in tree_rows(rounded):
+                if '/r' in p:
+                    entry = tool('read', path=path + '/' + '/'.join(rel), care='x', formula='round', settings={'slot': slot, 'places': '0'})['result'].get('properties', {})
+                    law('round(x, 0) is the round entry', value(p, '/r') == value(entry, slot), (p.get('/r'), entry))
+            # 15. each "a + b" is each left a add right b
+            summed = read(cell('summed', 'each', tack, expr=name + ' + ' + name, into='/s'), 'z')
+            added = read(cell('added', 'each', tack, left=slot, op='add', right=slot, into='/s'), 'z')
+            law('each a + b is each left a add right b', [(rel, value(p, '/s')) for rel, p in tree_rows(summed)] == [(rel, value(p, '/s')) for rel, p in tree_rows(added)], kind)
     print(json.dumps({'seed': seed, 'shapes': shapes, 'laws': {k: v[0] for k, v in passed.items()}, 'round_trips': seq[0]}), flush=True)
     return passed
 
