@@ -47,11 +47,21 @@ class Stream:
             pass
 
 
-def poll(base, node, seen, timeout=120):
-    """One page of events after `seen`, with x, as stream-shaped lines; returns (lines, new seen)."""
-    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': 'mcp/history', 'arguments': {'after': seen, 'limit': 40, 'with': 'x'}})).encode()
-    req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
-    page = json.load(urllib.request.urlopen(req, timeout=timeout))['result']['structuredContent']
+def poll(base, node, seen, timeout=120, limit=40):
+    """One page of events after `seen`, with x, as stream-shaped lines; returns (lines, new seen). A page the world
+    refuses as too large (events that wrote many big records) is asked for again with half the limit, down to one."""
+    while True:
+        body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': 'mcp/history', 'arguments': {'after': seen, 'limit': limit, 'with': 'x'}})).encode()
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        result = json.load(urllib.request.urlopen(req, timeout=timeout))['result']
+        if 'structuredContent' in result:
+            page = result['structuredContent']
+            break
+        text = ''.join(c.get('text', '') for c in result.get('content', []))
+        if 'too large' in text and limit > 1:
+            limit = max(1, limit // 2)
+            continue
+        raise OSError('history refused: ' + text[:200])
     lines = [{'epoch': e['epoch'], 'label': 'history', 'who': e.get('who'), 'touched': e['touched'], 'with': e.get('with') or {}} for e in page['events']]
     return lines, (page.get('next') or (lines[-1]['epoch'] if lines else seen))
 

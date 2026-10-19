@@ -60,7 +60,9 @@ def rows(t, care):
     out = []
 
     def walk(n, rel):
-        for name in sorted(n['kids']):
+        # tap order: symbol names sorted as text, then numeric names in numeric order (a bag's rows 1, 2, 3 come
+        # after a row called new)
+        for name in sorted(n['kids'], key=lambda nm: (1, int(nm)) if nm.isdigit() else (0, nm)):
             k = n['kids'][name]
             if k['rec']:
                 out.append((rel + (name,), k))
@@ -84,6 +86,7 @@ def place(t, rel, n):
 
 
 INT = re.compile(r'-?\d+$')
+DEC = re.compile(r'-?\d+\.\d+$')
 
 
 def is_num(text):
@@ -103,13 +106,34 @@ def scale_of(n, slot):
 
 
 def num_of(n, slot):
+    """A slot's number: a natural at the record's or the slot's scale, or the decimal the world shows for a slot with its own
+    scale (already the value), signed either way."""
     v = n['props'].get(slot)
+    if v is not None and DEC.match(v):
+        return Fraction(v)
     return Fraction(int(v), 10 ** scale_of(n, slot)) if is_num(v) else None
 
 
 def fig(v, scale):
-    """A figure rendered at a scale, half up."""
-    return str(math.floor(v * 10 ** scale + Fraction(1, 2)))
+    """A figure rendered at a scale: the magnitude rounded half up, then the sign (the world rounds magnitudes)."""
+    m = math.floor(abs(v) * 10 ** scale + Fraction(1, 2))
+    return str(-m if v < 0 and m else m)
+
+
+def shown(props):
+    """What a read shows for these props: a number slot with its own <slot>/scale is shown as the decimal it was written
+    as (45 with /n/scale 1 reads 4.5), everything else as is."""
+    out = dict(props)
+    for k, v in props.items():
+        sc = props.get(k + '/scale')
+        if is_num(v) and sc is not None and is_num(sc) and int(sc) > 0:
+            m, s = abs(int(v)), int(sc)
+            out[k] = ('-' if int(v) < 0 else '') + str(m // 10 ** s) + '.' + str(m % 10 ** s).rjust(s, '0')
+    return out
+
+
+def shown_tree(t):
+    return {'props': shown(t['props']), 'kids': {k: shown_tree(v) for k, v in t['kids'].items()}}
 
 
 def literal(text):
@@ -139,7 +163,7 @@ def arith(op, left, right):
     if op == 'add':
         return lv + rv, scale
     if op == 'subtract':
-        return (lv - rv, scale) if lv >= rv else None
+        return lv - rv, scale
     if op == 'multiply':
         return lv * rv, scale
     if op == 'divide':
@@ -272,6 +296,54 @@ def evaluate(formula, params, inp, care, views, stamp=None):
                 r['props'][into] = fig(*res)
                 r['props']['/scale'] = str(res[1])
         return out, ctx
+    if formula == 'join':
+        wanted = (P('slots') or '').split()
+        if not wanted:
+            return missing()
+        sep = ' ' if P('with') is None else P('with')
+        into = P('into') or '/joined'
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            texts = [t for t in (slot_text(r, rel, w) for w in wanted) if t is not None]
+            if texts:
+                r['props'][into] = sep.join(texts)
+        return out, ctx
+    if formula == 'match':
+        key, value, op = P('key'), P('value'), P('op') or 'contains'
+        if key is None or value is None:
+            return missing()
+
+        def hit(rel, r):
+            t = slot_text(r, rel, key)
+            if t is None:
+                return False
+            return t.startswith(value) if op == 'starts' else t.endswith(value) if op == 'ends' else value in t
+        return filter_rows(inp, care, hit), ctx
+    if formula == 'split':
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        sep = ' ' if P('with') is None else P('with')
+        into = P('into') or slot
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            t = slot_text(r, rel, slot)
+            if t is not None:
+                for i, part in enumerate(t.split(sep) if sep else [t], 1):
+                    r['props'][into + '/' + str(i)] = part
+        return out, ctx
+    if formula == 'date':
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        into = P('into') or '/day'
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            t = slot_text(r, rel, slot)
+            m = re.match(r'(\d{4})-(\d{2})-(\d{2})', t or '')
+            if m and 1 <= int(m.group(2)) <= 12 and 1 <= int(m.group(3)) <= 31:
+                r['props'][into] = str(int(m.group(1)) * 10000 + int(m.group(2)) * 100 + int(m.group(3)))
+        return out, ctx
     if formula == 'lookup':
         key, take = P('key'), P('take')
         match, into, frm = P('match') or key, P('into') or take, P('from') or 'table'
@@ -346,6 +418,17 @@ def evaluate(formula, params, inp, care, views, stamp=None):
             if tree is not None:
                 out['kids'].update(cut(tree, vcare)['kids'])
         return out, ctx
+    if formula == 'gather':
+        # the skill: each secondary input lands whole under its slot name, root and children; a root without a
+        # record, or an empty view, is an empty record there
+        out = clone(inp)
+        for name in sorted(views):
+            tree, vcare = views[name]
+            nested = clone(cut(tree, vcare)) if tree is not None else node({})
+            nested['rec'] = True
+            nested['props'] = nested.get('props') or {}
+            out['kids'][name] = nested
+        return out, ctx
     if formula in ('except', 'intersect', 'diff'):
         frm, key = P('from') or 'other', P('key')
         if frm not in views:
@@ -370,6 +453,13 @@ def evaluate(formula, params, inp, care, views, stamp=None):
         added = [(rel, r) for i, rel, r in mine_rows if i not in others]
         removed = [(rel, r) for i, rel, r in theirs if i not in mine]
         changed = [(rel, r, others[i][1]) for i, rel, r in mine_rows if i in others and r['props'] != others[i][1]['props']]
+        # the skill: the two roots' slots compare too, as one more changed row named root (from the other view's
+        # root, to the input's); a root without a record is an empty one
+        vt, _ = views[frm]
+        mine_root = inp['props'] if inp.get('rec') else {}
+        other_root = vt['props'] if vt is not None and vt.get('rec') else {}
+        if mine_root != other_root:
+            changed.append((('root',), node(mine_root), node(other_root)))
         out = node({'/added': str(len(added)), '/removed': str(len(removed)), '/changed': str(len(changed))})
         for name, found in (('added', added), ('removed', removed)):
             if found:
@@ -422,7 +512,7 @@ def evaluate(formula, params, inp, care, views, stamp=None):
     if formula == 'since':
         slot, frm = P('slot'), number(P('from'))
         v = num_of(inp, slot) if slot else None
-        if v is None or frm is None or v < frm[0]:
+        if v is None or frm is None:
             return missing()
         scale = max(scale_of(inp, slot), frm[1])
         return node({P('into') or '/since': fig(v - frm[0], scale), '/scale': str(scale)}), ctx
@@ -456,12 +546,13 @@ def evaluate(formula, params, inp, care, views, stamp=None):
 
 # ============================================================================ generators
 FORMULAS = ['count', 'sum', 'min', 'max', 'avg', 'any', 'all', 'where', 'sort', 'top', 'latest', 'earliest', 'each', 'lookup',
-            'distinct', 'select', 'by', 'grid', 'flatten', 'merge', 'except', 'intersect', 'diff', 'add', 'subtract', 'multiply',
-            'divide', 'pick', 'put', 'round', 'since', 'between']          # amend has its own stage (notes need the world's stamps)
+            'distinct', 'select', 'by', 'grid', 'flatten', 'merge', 'gather', 'except', 'intersect', 'diff', 'add', 'subtract', 'multiply',
+            'divide', 'pick', 'put', 'round', 'since', 'between', 'join', 'match', 'split', 'date']          # amend has its own stage (notes need the world's stamps)
 KINDS = ['rec1', 'recN', 'recM', 'list', 'map', 'set', 'table', 'bag', 'attach', 'tree', 'grouped', 'matrix', 'hier', 'uneven']
 REQUIRED = {'where': ['key', 'value'], 'each': ['left', 'right', 'op'], 'lookup': ['key', 'take'], 'select': ['slots'], 'by': ['key'],
             'grid': ['row', 'col'], 'pick': ['from', 'into'], 'put': ['into', 'value'], 'round': ['slot', 'places'],
-            'since': ['slot', 'from'], 'between': ['slot', 'from', 'to']}
+            'since': ['slot', 'from'], 'between': ['slot', 'from', 'to'], 'join': ['slots'], 'match': ['key', 'value'],
+            'split': ['slot'], 'date': ['slot']}
 for _f in ('add', 'subtract', 'multiply', 'divide'):
     REQUIRED[_f] = ['left', 'right']
 for _f in ('sum', 'min', 'max', 'avg', 'any', 'all', 'sort', 'top', 'latest', 'earliest', 'distinct'):
@@ -485,6 +576,8 @@ def unrender(rendered):
         k = k.lstrip('/')
         if is_num(v):
             out[k] = int(v)
+        elif DEC.match(v):
+            out[k] = float(v)
         elif v in ('true', 'false'):
             out[k] = v == 'true'
         elif v.startswith('/h/'):
@@ -522,7 +615,11 @@ class Gen:
     def build(self, kind):
         rng = self.rng
         pool = rng.sample(range(1, 400), 40)
-        num = pool.pop
+        negative = self.coin(0.3)
+
+        def num():
+            v = pool.pop()
+            return -v if negative and rng.random() < 0.4 else v
         mode = rng.choice(['none', 'none', 'record', 'slot'])
 
         def row(slot='n', **kw):
@@ -537,7 +634,7 @@ class Gen:
         if kind == 'rec1':
             return node(props(n=num()))
         if kind == 'recN':
-            return row('amount', n=num(), t=self.word(), ok=self.coin(), when=rng.randint(1, 99), amount=num())
+            return row('amount', n=num(), t=self.word(), ok=self.coin(), when=rng.randint(1, 99), amount=num(), d='%d-%02d-%02d' % (rng.randint(1990, 2026), rng.randint(1, 12), rng.randint(1, 28)))
         if kind == 'recM':
             return node(props(n=num(), t=self.word(), ok=self.coin(), p='/' + self.node + '/user', rf='/h/x/0/2/' + self.node + '/user'))
         if kind == 'list':
@@ -659,7 +756,7 @@ class Gen:
             return None
 
         def lit():
-            return pick([str(rng.randint(1, 9)), str(rng.randint(1, 60)), str(rng.randint(1, 9)) + '.5', str(rng.randint(10, 99)) + '.25'])
+            return pick([str(rng.randint(1, 9)), str(rng.randint(1, 60)), str(rng.randint(1, 9)) + '.5', str(rng.randint(10, 99)) + '.25', '-' + str(rng.randint(1, 30)), '-' + str(rng.randint(1, 9)) + '.5'])
 
         def number_param():
             v = view_num()
@@ -720,6 +817,26 @@ class Gen:
             p['slot'] = pick(rowt + rown)
         elif f == 'select':
             p['slots'] = ' '.join(rng.sample(sorted(set(rown + rowt + rowb)), rng.randint(1, 2)))
+        elif f == 'join':
+            p['slots'] = ' '.join(rng.sample(sorted(set(rowt + rown)), rng.randint(1, 2)))
+            if self.coin():
+                p['with'] = pick([', ', '-', ''])
+            if self.coin(0.3):
+                p['into'] = '/full'
+        elif f == 'match':
+            p['key'], p['value'] = pick(rowt), pick(['e', 'o', 'st', 'th', 'a', 'west', 'z'])
+            if self.coin():
+                p['op'] = pick(['contains', 'starts', 'ends'])
+        elif f == 'split':
+            p['slot'] = pick(rowt)
+            if self.coin():
+                p['with'] = pick(['-', 'e', 'o', ' '])
+            if self.coin(0.3):
+                p['into'] = '/part'
+        elif f == 'date':
+            p['slot'] = pick(rowt)
+            if self.coin(0.3):
+                p['into'] = '/on'
         elif f == 'by':
             p['key'] = pick(rowt + rowb)
             op = pick(['count', 'count', 'sum', 'min', 'max', 'avg'])
@@ -810,7 +927,7 @@ def gen_case(g, i, home):
             idx = available.pop(0)
             views[name] = {'kind': 'shape', 'shape': idx, 'care': rng.choice('xyz'), 'pinned': shapes[idx]['has_root'] and g.coin(0.3)}
         for idx in available:
-            name = ('extra' if 'extra' not in views else 'more') if f == 'merge' else ('v1' if 'v1' not in views else 'v2')
+            name = ('extra' if 'extra' not in views else 'more') if f in ('merge', 'gather') else ('v1' if 'v1' not in views else 'v2')
             views[name] = {'kind': 'shape', 'shape': idx, 'care': rng.choice('xyz'), 'pinned': shapes[idx]['has_root'] and g.coin(0.3)}
         bad = rng.choice(['omit', 'badslot', 'emptyview', 'badtack', 'wrongkind']) if g.coin(0.15) else None
         if bad == 'emptyview' and views:
@@ -911,7 +1028,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
             if time.time() > deadline:
                 raise
             time.sleep(2)
-    assert len(stdlib) == 34, sorted(stdlib)      # thirty-three formulas and ask
+    assert len(stdlib) == 39, sorted(stdlib)      # thirty-eight formulas and ask
     home = '/' + node_ + '/user/sig/' + str(seed)
     earlier = read(home, 'y')
     if earlier['exists'] or earlier['children']:          # a rerun with the same seed gets its own home under the seed's
@@ -952,8 +1069,8 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
         if want is None:            # unknown: no root, nothing below it
             if z['exists'] or got != {'props': {}, 'kids': {}}:
                 mismatch(case, cell, '/x at z (unknown expected)', got, None); ok = False
-        elif strip(want) != got:
-            mismatch(case, cell, '/x at z', got, strip(want)); ok = False
+        elif shown_tree(strip(want)) != got:
+            mismatch(case, cell, '/x at z', got, shown_tree(strip(want))); ok = False
         elif z['exists'] != want['rec']:
             mismatch(case, cell, '/x root exists (record or folder)', z['exists'], want['rec']); ok = False
         gctx = ctx_of(c['properties'])

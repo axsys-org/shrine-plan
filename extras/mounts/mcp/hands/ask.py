@@ -1,6 +1,7 @@
 """The ask hand: a driver that answers ask cells with a model and writes the answer stamped.
 
 Usage: python3 ask.py <base> [--node 0x11] [--model NAME] [--endpoint URL] [--fake] [--once] [--interval 2]
+A first run walks the log from epoch 0 (see Hand.__init__ for the cost); --once answers every ask pending now and exits.
 
 An ask cell is a record whose /sys/weft is /weft/stdlib/ask, with /sys/tack (the input), /prompt and an optional /model.
 The hand watches the event log (history after <seen> with x) for ask cells and for writes under their inputs, and for
@@ -104,7 +105,12 @@ class Hand:
         self.model = model or config.get('/model') or DEFAULT_MODEL
         self.endpoint = endpoint or config.get('/endpoint') or DEFAULT_ENDPOINT
         seen = self.w.read(home + '/seen', 'x').get('properties') or {}
-        self.seen = int(seen.get('/epoch') or 0) or self.epoch()     # a hand's first run starts from now, not from the world's boot
+        # A first run (no seen record) starts from epoch 0 and walks the whole log once in discover(), so an ask
+        # written before the hand existed is answered. Cost: one history page of 40 per 40 non-system events, about
+        # 60 ms a page with x on this build (system events are hidden by default, so a fresh world is one page);
+        # a world with ten thousand events is 250 pages, about 15 s, once. After that the seen record is written
+        # and every later run starts from it.
+        self.seen = int(seen.get('/epoch') or 0)
         self.asks = {}          # cell path -> (input path, care)
         self.ask_ref = next(c['reference'] for c in self.w.read('/' + world.node + '/weft/stdlib', 'y', limit=100)['children'] if c['path'].endswith('/ask'))
         self.ask_key = self.ask_ref.split('/', 5)[-1]      # the stdlib path without its case: a cell pins any case of it

@@ -70,4 +70,19 @@ def check(base, node, timeout):
     expect('5 a new prompt makes the ask stale and says so', 'prompt changed' in w.read('/c/x' + cell, 'x')['properties'].get('/sys/view/asking', ''), True)
     expect('5 the hand answers the new prompt', hand.tick(), 1)
     expect('5 lineage: the answer names the model, the case and the prompt it came from', (w.read('/x' + cell, 'x')['properties']['/prompt'], w.read('/x' + cell, 'x')['properties']['/model']), ('Which deal is largest?', 'fake'))
+    # 6. a cell with no model slot takes the hand's model as its own: the answer shows
+    tack = {'type': 'reference', 'value': w.read('/c/x' + cell, 'x')['properties']['/sys/tack']}
+    nomodel = home + '/views/nomodel'
+    w.tool('write', records=[{'path': nomodel, 'slots': {'sys/weft': stdlib['ask'], 'sys/tack': tack, 'prompt': 'How many?'}}])
+    expect('6 the hand answers a cell with no model slot', hand.tick(), 1)
+    expect('6 and the cell shows the answer, stamped with the hand\'s model', (w.read('/x' + nomodel, 'x')['exists'], w.read('/x' + nomodel, 'x')['properties'].get('/model')), (True, 'fake'))
+
+    # 7. a fresh hand's first run answers what was already asking
+    waiting = home + '/views/waiting'
+    w.tool('write', records=[{'path': waiting, 'slots': {'sys/weft': stdlib['ask'], 'sys/tack': tack, 'prompt': 'Still there?'}}])
+    w.tool('write', records=[{'path': '/' + node + '/agent/hands/ask/seen', 'action': 'cull'}], who='ask')
+    fresh = ask_hand.Hand(w, model='fake', fake=True, log=lambda *a: None)
+    expect('7 a hand with no seen record starts from epoch 0', fresh.seen, 0)
+    expect('7 and its first tick answers the ask written before it existed', fresh.tick() >= 1, True)
+    expect('7 the waiting cell shows its answer', w.read('/x' + waiting, 'x')['exists'], True)
     print(json.dumps({'checks': len(checks), 'hand_calls': w.seq}), flush=True)

@@ -40,7 +40,7 @@ def check(base, node, timeout):
 
     stdlib = {c['path'].rsplit('/', 1)[1]: {'type': 'reference', 'value': c['reference']}
               for c in read('/' + node + '/weft/stdlib')['children']}
-    assert len(stdlib) == 34, sorted(stdlib)
+    assert len(stdlib) == 39, sorted(stdlib)
 
     home = '/' + node + '/user/demo'
     deals = home + '/deals'
@@ -181,6 +181,50 @@ def check(base, node, timeout):
     expect('amended counts the notes', ctx.get('/sys/view/amended'), '2')
     expect('history has the cases', tool('history', path=deals + '/d1')['cases'] >= 1, True)
 
+    # signed and decimal numbers: a difference below zero, a negative slot summed, a decimal written and shown back
+    cell('owed', 'subtract', live(home + '/budget'), left='/amount', right='400')
+    expect('subtract below zero gives a signed figure', prop('owed', '/result'), '-100')
+    write(home + '/dec/d1', amount=4.5)
+    write(home + '/dec/d2', amount=-1.25)
+    expect('a decimal reads back as it was written, with its scale beside it', (read(home + '/dec/d1', 'x')['properties'].get('/amount'), read(home + '/dec/d1', 'x')['properties'].get('/amount/scale')), ('4.5', '1'))
+    expect('a negative decimal too', read(home + '/dec/d2', 'x')['properties'].get('/amount'), '-1.25')
+    cell('decsum', 'sum', live(home + '/dec'), slot='/amount')
+    expect('a sum over decimals and a negative aligns the scales and keeps the sign', (prop('decsum', '/total'), prop('decsum', '/scale')), ('325', '2'))
+    cell('decmin', 'min', live(home + '/dec'), slot='/amount')
+    expect('min finds the negative', prop('decmin', '/min'), '-125')
+    # text: join, match, split, date, each the shape of each or where
+    write(home + '/people/p1', first='Ann', last='Lee', tags='red-blue', born='1990-04-07')
+    write(home + '/people/p2', first='Bo', last='Ng', tags='green', born='1985-12-30')
+    cell('named', 'join', live(home + '/people'), slots='/first /last', into='/full')
+    expect('join concatenates slots with a space into a new slot', [c['properties'].get('/full') for c in x('named', 'y')['children']], ['Ann Lee', 'Bo Ng'])
+    cell('named_dash', 'join', live(home + '/people'), slots='/last /first', into='/full', **{'with': ', '})
+    expect('join takes its separator from /with', x('named_dash', 'y')['children'][0]['properties'].get('/full'), 'Lee, Ann')
+    cell('starts_b', 'match', live(home + '/people'), key='/first', value='B', op='starts')
+    expect('match keeps the rows whose slot starts with the text', [c['path'].rsplit('/', 1)[1] for c in x('starts_b', 'y')['children']], ['p2'])
+    cell('has_e', 'match', live(home + '/people'), key='/last', value='e')
+    expect('match defaults to contains', [c['path'].rsplit('/', 1)[1] for c in x('has_e', 'y')['children']], ['p1'])
+    cell('tagged', 'split', live(home + '/people'), slot='/tags', **{'with': '-'}, into='/tag')
+    expect('split lands the parts at /into/1, /into/2', (x('tagged', 'y')['children'][0]['properties'].get('/tag/1'), x('tagged', 'y')['children'][0]['properties'].get('/tag/2'), x('tagged', 'y')['children'][1]['properties'].get('/tag/2')), ('red', 'blue', None))
+    cell('bornday', 'date', live(home + '/people'), slot='/born', into='/day')
+    expect('date turns a text date into a natural YYYYMMDD that sorts', [c['properties'].get('/day') for c in x('bornday', 'y')['children']], ['19900407', '19851230'])
+    cell('eldest', 'earliest', live('/x' + cells + '/bornday'), slot='/day')
+    expect('and a ranking over it works', x('eldest', 'x')['properties'].get('/key'), 'p2')
+    # gather: each secondary input nested whole under its slot name
+    cell('gathered', 'gather', live(deals), extra=live(home + '/extra'))
+    expect('gather nests the view as one more child', kids('gathered'), len(read(deals)['children']) + 1)
+    gz = x('gathered', 'z')
+    nested = next(c for c in gz['children'] if c['path'].endswith('/extra'))
+    expect('gather keeps the view\'s rows under its name', [k['path'].rsplit('/', 1)[1] for k in nested['children']], ['e1'])
+    # diff: the roots compare too, as a /root row under changed, hand computed here from the two root records
+    cell('rootdiff', 'diff', live(deals), other=live(home + '/extra'))
+    deals_root, extra_root = read(deals, 'x')['properties'], read(home + '/extra', 'x')['properties']
+    want_root = {} if deals_root == extra_root else {k + '/to': v for k, v in deals_root.items() if extra_root.get(k) != v} | {k + '/from': v for k, v in extra_root.items() if deals_root.get(k) != v}
+    expect('diff counts the rows only one side has, and the roots as one changed row', (prop('rootdiff', '/added'), prop('rootdiff', '/removed'), prop('rootdiff', '/changed')), (str(len(read(deals)['children'])), '1', '1' if want_root else '0'))
+    if want_root:
+        dz = x('rootdiff', 'z')
+        changed = next(c for c in dz['children'] if c['path'].endswith('/changed'))
+        root_row = next(c for c in changed['children'] if c['path'].endswith('/root'))
+        expect('and the root row carries each differing slot as from and to', root_row['properties'], want_root)
     print(json.dumps({'checks': len(results), 'formulas': len(stdlib), 'round_trips': seq}), flush=True)
 
 

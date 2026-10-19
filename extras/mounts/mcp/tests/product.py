@@ -74,7 +74,7 @@ def check(base, node, timeout):
     # 1. the standard library
     lib = read('/' + node + '/weft/stdlib', kind='read stdlib')
     stdlib = {c['path'].rsplit('/', 1)[1]: ref(c['reference']) for c in lib['children']}
-    expect('1 thirty-four library entries present (thirty-three formulas and ask)', len(stdlib), 34)
+    expect('1 thirty-nine library entries present (thirty-eight formulas and ask)', len(stdlib), 39)
     expect('1 each formula has a title', all('/sys/lede' in c['properties'] for c in lib['children']), True)
 
     # 2. the raw data
@@ -228,7 +228,7 @@ def check(base, node, timeout):
     write(cells + '/rownotes/r1', slot='/d101/amount', value=6000, case=1)
     write(cells + '/rownotes/r2', slot='/d999/amount', value=1, case=1)
     cell('closed_amended', 'amend', live('/x' + cells + '/closed'), notes=live(cells + '/rownotes'))
-    expect('12 path note corrects one row', child('closed_amended', 'd101')['/amount'], '6000')
+    expect('12 path note corrects one row (the note carries its own scale, so the slot reads back as the decimal)', child('closed_amended', 'd101')['/amount'], '60.00')
     expect('12 dangling path reported, not created', ('/sys/view/note/r2' in c('closed_amended'), kids('closed_amended')), (True, 2))
     tool('write', 'write (cull)', path=cells + '/notes/n1', action='cull')
     expect('12 note removed: back to the formula', prop('amended', '/total'), '270')
@@ -311,7 +311,7 @@ def check(base, node, timeout):
     expect('17 twenty records in one call: one event', events['write (batch of 20)'][-1], 1)
     newest = tool('history', 'history (events)', limit=1)['events'][0]
     expect('17 one history entry names all twenty paths', all((deals + '/b' + str(i)) in newest['touched'] for i in range(20)), True)
-    expect('17 every path readable', read(deals + '/b19', 'x')['properties']['/amount'], '119')
+    expect('17 every path readable (amount carries its own scale, so it reads back as the decimal)', read(deals + '/b19', 'x')['properties']['/amount'], '1.19')
     chain = tool('write', 'write (batch chain)', records=[
         {'path': cells + '/bo_closed', 'properties': {'sys/weft': stdlib['where'], 'sys/tack': live(deals), 'key': '/owner', 'value': 'bo'}},
         {'path': cells + '/bo_revenue', 'properties': {'sys/weft': stdlib['sum'], 'sys/tack': live('/x' + cells + '/bo_closed'), 'slot': '/amount', 'into': '/revenue'}},
@@ -324,7 +324,7 @@ def check(base, node, timeout):
     expect('17 and nothing was written', read(deals + '/ok1', 'x')['exists'], False)
     expect('17 and it cost no event', events['write (refused)'][-1], 0)
     mixed = tool('write', 'write (batch mixed)', records=[{'path': deals + '/b0', 'action': 'poke', 'properties': {'note': 'checked'}}, {'path': deals + '/new1', 'properties': {'amount': 1}}])
-    expect('17 mixed makes and pokes: new exists, poke merged, untouched slots kept', (read(deals + '/new1', 'x')['exists'], read(deals + '/b0', 'x')['properties'].get('/note'), read(deals + '/b0', 'x')['properties'].get('/amount')), (True, 'checked', '100'))
+    expect('17 mixed makes and pokes: new exists, poke merged, untouched slots kept', (read(deals + '/new1', 'x')['exists'], read(deals + '/b0', 'x')['properties'].get('/note'), read(deals + '/b0', 'x')['properties'].get('/amount')), (True, 'checked', '1.00'))
     t0 = time.perf_counter()
     for i in range(20):
         write(deals + '/s' + str(i), kind='write (single, timed)', amount=i)
@@ -404,6 +404,8 @@ def check(base, node, timeout):
     expect('21 and agrees with the singles at the same epoch', (trio['answers'][0]['properties'], [c['path'] for c in trio['answers'][1]['children']], len(trio['answers'][2]['result']['children'])), (single_a['properties'], [c['path'] for c in single_b['children']], len(single_c['result']['children'])))
     mixed = tool('read', 'read (reads x3)', reads=[members + '/alice', '/x/nowhere/at/all', {'path': deals, 'formula': 'nosuch'}])
     expect('21 a failed entry answers {path, error} without failing the call', (mixed['answers'][0]['exists'], mixed['answers'][1].get('exists'), mixed['answers'][2].get('error')), (True, False, 'formula: not a standard cell'))
+    unparsed = tool('read', 'read (reads x3)', reads=[members + '/alice', '/0x11/user/org/c-7', {'path': '/0x11/user/org/A-100'}])
+    expect('21 an entry whose path does not parse answers {path, error} naming the rule, in its place', (len(unparsed['answers']), unparsed['answers'][1]['path'], 'underscore' in unparsed['answers'][1]['error'], unparsed['answers'][2]['path']), (3, '/0x11/user/org/c-7', True, '/0x11/user/org/A-100'))
 
     # 22. a write with a formula read in then
     then_f = tool('write', 'write (then formula)', records=[{'path': deals + '/f1', 'slots': {'amount': 5, 'status': 'closed'}}],
@@ -421,6 +423,9 @@ def check(base, node, timeout):
     tool('write', 'write (cull)', records=[{'path': deals + '/f1', 'action': 'cull'}])
     culled = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
     expect('23 a cull shows exists false', culled['with'][deals + '/f1']['exists'], False)
+    nested = tool('write', 'write (seed, one batch)', records=[{'path': org + '/nest', 'slots': {'title': 'Nest'}}, {'path': org + '/nest/egg', 'slots': {'n': 1}}])
+    folded = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
+    expect('23 a folder record written in the same batch as its child is inlined too', sorted(folded['with']), [org + '/nest', org + '/nest/egg'])
     traced = cell('traced_count', 'count', live(members), into='/n')
     told = tool('history', 'history (events)', limit=1, **{'with': 'x'})['events'][0]
     expect('23 a written cell inlines its /x and /c/x: the answer exists with its figure, the context names the weft', (told['with']['/x' + traced]['exists'], told['with']['/x' + traced]['properties'].get('/n'), told['with']['/c/x' + traced]['properties'].get('/sys/weft')), (True, str(len(read(members)['children'])), stdlib['count']['value']))
@@ -431,6 +436,60 @@ def check(base, node, timeout):
     e0 = epoch()
     shown = tool('read', 'read (present)', path=members + '/alice', care='x', present=True)
     expect('24 present answers as usual and moves no epoch', (shown['exists'], epoch() - e0), (True, 0))
+
+    # 25. a poke beside a from merges
+    def refused(name, **arguments):
+        r = rpc('tools/call', {'name': 'mcp/' + name, 'arguments': arguments}, name + ' (refused)')['result']
+        return r.get('structuredContent') or r['content'][0]['text']
+    pf = org + '/pf'
+    tool('write', 'write (seed, one batch)', records=[{'path': pf + '/a', 'slots': {'p': 1, 'q': 2}}, {'path': pf + '/b', 'slots': {'p': 1, 'q': 2}}])
+    tool('write', 'write (undo)', records=[{'path': pf + '/a', 'from': read(pf + '/a', 'x')['reference']}, {'path': pf + '/b', 'action': 'poke', 'slots': {'q': 3}}])
+    expect('25 a poke in the same batch as a from merges', read(pf + '/b', 'x')['properties'], {'/p': '1', '/q': '3'})
+
+    # 26. a refused record names itself; signed and decimal numbers land and read back
+    bad = refused('write', records=[{'path': pf + '/c', 'slots': {'ok': 1}}, {'path': pf + '/d', 'slots': {'n': {'nested': 1}}}])
+    expect('26 a refused batch names the record that carried the bad slot', (pf + '/d' in str(bad), 'slots' in str(bad)), (True, True))
+    tool('write', 'write (seed, one batch)', records=[{'path': pf + '/e', 'slots': {'delta': -3, 'rating': 4.5, 'owed': -12.75, 'n': 7}}])
+    e = read(pf + '/e', 'x')['properties']
+    expect('26 a negative, a decimal and a negative decimal read back as written, scales beside them', (e.get('/delta'), e.get('/rating'), e.get('/rating/scale'), e.get('/owed'), e.get('/owed/scale'), e.get('/n')), ('-3', '4.5', '1', '-12.75', '2', '7'))
+    signed = cell('signed_sum', 'sum', live(pf), slot='/delta', into='/total')
+    expect('26 a formula reads the sign: the sum of one delta of minus three', read('/x' + signed, 'x')['properties'].get('/total'), '-3')
+
+    # 27. a refusal says why
+    tool('write', 'write (cull)', records=[{'path': pf + '/a', 'action': 'cull'}])
+    under = refused('write', records=[{'path': pf + '/a/child', 'slots': {'n': 1}}])
+    expect('27 a write under a culled path is refused with the kernel\'s reason', (under.get('refused'), under.get('reason', '') != ''), (True, True))
+    noop = refused('apply', path=pf + '/b', operation=org + '/op/nothing', inputs={})
+    expect('27 a refused apply says why', (noop.get('refused'), noop.get('reason', '') != ''), (True, True))
+
+    # 28. a reference as {type, path, care, case}: nothing to count
+    obj = cells + '/obj'
+    tool('write', 'write cell', records=[{'path': obj, 'slots': {'sys/weft': stdlib['count'], 'sys/tack': {'type': 'reference', 'path': members, 'care': 'y'}, 'into': '/n'}}])
+    expect('28 a reference written as {type, path, care, case} reads and counts', read('/x' + obj, 'x')['properties'].get('/n'), str(len(read(members)['children'])))
+    expect('28 and spells back as /h/y/0/<len>/<path>', read('/c/x' + obj, 'x')['properties']['/sys/tack'], live(members)['value'])
+
+    # 29. a live cell read at a case is unknown; a diff over a faulted cell names the fault
+    expect('29 a live cell read at case 1 is unknown and its context says live', (tool('read', 'read /x', path='/x' + obj, care='x', case=1)['exists'], 'live' in tool('read', 'read /x', path='/c/x' + obj, care='x', case=1)['properties'].get('/sys/view/fault', '')), (False, True))
+    badpin = cells + '/badpin'
+    tool('write', 'write cell', records=[{'path': badpin, 'slots': {'sys/weft': stdlib['count'], 'sys/tack': ref('/h/y/99/' + str(len(members.strip('/').split('/'))) + members), 'into': '/n'}}])
+    over = cells + '/over_badpin'
+    tool('write', 'write cell', records=[{'path': over, 'slots': {'sys/weft': stdlib['diff'], 'sys/tack': live(members), 'other': live('/x' + badpin)}}])
+    expect('29 a diff whose other view is a faulted cell names that cell\'s fault', read('/c/x' + over, 'x')['properties'].get('/sys/view/empty/other', ''), 'the referenced cell faulted: tack: the input was not found')
+
+    # 30. a cell over a culled folder faults
+    tool('write', 'write (seed, one batch)', records=[{'path': org + '/gone', 'slots': {'title': 'Gone'}}, {'path': org + '/gone/g1', 'slots': {'n': 1}}])
+    gone_cell = cell('over_gone', 'count', live(org + '/gone'), into='/n')
+    expect('30 before the cull the cell counts', read('/x' + gone_cell, 'x')['properties'].get('/n'), '1')
+    tool('write', 'write (cull)', records=[{'path': org + '/gone', 'action': 'cull'}])
+    expect('30 after the cull it reads unknown and its context says culled', (read('/x' + gone_cell, 'x')['exists'], 'culled' in read('/c/x' + gone_cell, 'x')['properties'].get('/sys/view/fault', '')), (False, True))
+
+    # 31. a wide batch lands in bounded time
+    t0 = time.perf_counter()
+    tool('write', 'write (seed, one batch)', records=[{'path': org + '/wide/w%03d' % i, 'slots': {'n': i}} for i in range(600)])
+    wide_ms = 1000 * (time.perf_counter() - t0)
+    # the bar is the measurement plus margin, not a target: 2.8 s on the release build (4.7 ms a record) once the stream
+    # line was capped at a hundred records, 4.0 s (6.6 ms a record) before; the rest is the per-byte layer, Liam's weld
+    expect('31 six hundred records in one event land under 3.5 s, the 2.8 s measured plus margin (took %.0f ms)' % wide_ms, wide_ms < 3500, True)
 
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}

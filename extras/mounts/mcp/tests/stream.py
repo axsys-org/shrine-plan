@@ -68,6 +68,10 @@ def check(base, node, timeout):
     home = '/' + node + '/user/streamed'
     a, b = StreamClient(base, timeout), StreamClient(base, timeout)
     time.sleep(0.2)
+    # the very first line a world sends after boot has arrived late once (over 50 ms after its write, every later one within
+    # 0.1 ms): one untimed write warms that path, so the timed check below measures the steady state
+    rpc('write', records=[{'path': home + '/warm', 'slots': {'n': 0}}], who='tester')
+    a.event(); b.event()
 
     # 1. one write, both streams receive one line, within the write's own latency
     written, write_ms = rpc('write', records=[{'path': home + '/r1', 'slots': {'n': 1}}], who='tester')
