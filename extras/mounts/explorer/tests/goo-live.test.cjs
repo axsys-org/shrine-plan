@@ -155,6 +155,20 @@ test('the standing outline lists every cell with what it says now; a diff reads 
   assert.equal(GooLive.lineHTML({count: 1, scale: 0, value: 'free'}), 'count 1 · scale 0 · value free');
 });
 
+test('the QA chip: an agent\'s qa/score cell, found under /agent, drawn green at zero and with the count otherwise, linking to the QA folder', async () => {
+  const A = '/0x11/agent';
+  const m = fakeMcp((name, a) => {
+    if (a.path === A) return {path: A, exists: false, children: [{path: A + '/journal', exists: false, children: []}, {path: A + '/claude', exists: true, properties: {'/title': 'c'}, children: []}]};
+    if (a.path === '/x' + A + '/claude/qa/score') return {path: a.path, exists: true, properties: {'/added': '0', '/removed': '0', '/changed': '2'}, children: []};
+    return {path: a.path, exists: false, children: []};
+  });
+  const q = await mcpSource({fetch: m.fetch, views: '/0x11/user/org', EventSource: null}).qa();
+  assert.deepEqual(q, {folder: '0x11/agent/claude/qa', changed: '2'});
+  assert.match(GooLive.qaChipHTML(q), /class="sv-chip off" href="\?views=\/0x11\/agent\/claude\/qa"[^>]*>QA 2</);
+  assert.match(GooLive.qaChipHTML({folder: 'x/agent/a/qa', changed: '0'}), /sv-chip ok.*>QA 0</);
+  assert.equal(await mcpSource({fetch: m.fetch, EventSource: null}).qa(), null, 'no views, no node, no chip');
+});
+
 test('eventOf labels a history item by its first written record when the line carries none', () => {
   assert.deepEqual(adapt.eventOf({epoch: 9, who: 'mcp', touched: [N + '/deals/d1', N + '/deals/d2'], touched_count: 2}), {epoch: 9, label: 'd1 (+1)', who: 'mcp', touched: ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2'], records: ['0x11/user/org/deals/d1', '0x11/user/org/deals/d2'], count: 2, with: null});
   assert.equal(adapt.eventOf({epoch: 10, label: 'make cell vendors', who: 'tester', touched: [N + '/views/vendors']}).label, 'make cell vendors');

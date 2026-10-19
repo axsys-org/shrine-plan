@@ -68,14 +68,19 @@ history  path     /user/org/deals/d1   a record's cases, newest first, with refe
          -> {events: [{epoch, who, touched, touched_count, with}], next}
 ```
 
+A refused write or apply answers `refused: true` with `reason`: the kernel's
+word for it (`warp_op_unknown`, `write_outside_authority`, a tombstone).
+
 `who` on an event is its writer: the `who` the write carried (every MCP
 write carries one), `system` for an untagged event that wrote nothing under
 `/user` or `/agent` (boot, the filesystem sync, a mount's seeds), `world`
 for an untagged write from another mount. By default history lists every
 writer but system, so `history after 0` on a fresh world is empty and
 cheap. `touched` lists the first hundred paths the event touched and
-`touched_count` the number. A presented read appears once as `{shown,
-epoch}`.
+`touched_count` the number. `with` inlines at most 500 nodes and 256 KB of
+records per event; past that the rest of that event's records are left
+out, and a page of events stops before the reply ceiling. A presented read leaves no trace here: the
+stream line is its only one.
 
 ## The stream
 
@@ -94,6 +99,17 @@ ask hand runs on that.
 apply    path, operation, inputs, then [a read, ...]     an op a record carries; cells never need it
 ```
 
+## Numbers in slots
+
+A slot number may be an integer of either sign or a decimal. A negative is
+kept as a signed value and reads back as written (`-3`). A decimal is kept
+as the natural at a scale, `4.5` as `45` with `<slot>/scale: 1`, and a slot
+with its own scale reads back as the decimal (`4.5`); a record-level
+`/scale` reads raw, as it always did. Every formula reads the sign and the
+scale: `subtract` below zero gives a negative, `sum` and `min` keep signs,
+`sort` and `top` rank by signed value. `{type: int, value: "-3"}` is the
+exact form.
+
 ## Cells
 
 A cell is a record that derives its value from other records. It has
@@ -103,10 +119,12 @@ three kinds of slots:
   standard cell first and use its `reference`).
 - `/sys/tack`: a reference to the input at a care: `x` the record alone,
   `y` the record and its children, `z` the whole subtree (interior records
-  included). Case 0 is live: `/h/y/0/<len>/<path>` makes the cell follow the
-  input; a pinned case freezes it. `<len>` counts every segment of the path
-  that follows, so another cell's answer is `/h/y/0/6/x/0x11/user/org/views/open`
-  (the `x` counts). A folder with no record of its own is a
+  included). Write it as `{type: reference, path, care, case}`; case 0 is
+  live and makes the cell follow the input, a pinned case freezes it. The
+  spelled form `/h/<care>/<case>/<len>/<path>` is what reads answer and is
+  accepted too (`<len>` counts every segment after it, the `x` of another
+  cell's answer included). A culled input faults the cell (`tack: the input
+  was culled`); a live cell read at a pinned case reads unknown. A folder with no record of its own is a
   fine input (its children are the rows) but has no case of its own to pin
   or stamp against: write a record at the folder (even an empty one) and
   its cases track its children from then on.
@@ -163,17 +181,18 @@ numbers in their own unit and compare as such.
 | `sort` | `slot`, `order` (asc, desc) | rows re-keyed 1, 2, 3, old key at `/key` (a name, or the path as text for a deeper row) |
 | `top` | `slot`, `count` (default 3) | the largest, ranked; fewer rows than `count` gives fewer |
 | `latest`, `earliest` | `slot` | the one child, as the root, key at `/key`; no row with a number there gives an empty root |
-| `each` | `left`, `op`, `right`, `into` (all four) | a derived slot per child; sides are literals or the child's slots |
+| `each` | `left`, `op`, `right`, `into` (all four) | a derived slot per child, `/scale` on each row where the sides carried one; sides are literals or the child's slots |
 | `lookup` | `key`, `take`, `match` (default `key`), `into`, `from` (default `table`) and a secondary input named by `from` | brings `take` from the matching table row |
-| `distinct` | `slot` | rows with `/value` and `/count` |
+| `distinct` | `slot` | one row per distinct value, keyed 1, 2, 3 in order of first appearance, each `/value` and `/count` |
 | `select` | `slots` (space separated) | only those slots, on root and children |
 | `by` | `key`, `op` (count, sum, min, max, avg), `slot`, `into` | one row per group value |
 | `grid` | `row`, `col`, `op`, `slot` | rows by `row`, a slot per `col` |
 | `flatten` | | every record below the root as a direct child, keyed by its path with underscores (`a_x_deep`) |
-| `merge` | secondary inputs | the input's children plus theirs |
+| `merge` | secondary inputs | the input's children plus theirs, one flat list |
+| `gather` | secondary inputs | the input with each secondary input nested under its slot name (`/<slot>/...`): several cells' answers as one tree |
 | `except` | `from` (default `other`) naming a secondary input, `key` (optional) | the rows the other view does not have. A row's identity is its path, or with `key` its value there (a row without one is kept) |
 | `intersect` | as `except` | the rows the other view also has (with `key`, a row without a value is dropped) |
-| `diff` | as `except` | `/added/<row>`, `/removed/<row>`, `/changed/<row>` (each differing slot as `<slot>/from` and `<slot>/to`), counts on the root; with `key`, rows without a value are ignored and `changed` compares a row with the first row of the same value; every row counts. Against a `/h` reference of the same path it is the change since that case |
+| `diff` | as `except` | `/added/<row>`, `/removed/<row>`, `/changed/<row>` (each differing slot as `<slot>/from` and `<slot>/to`; the two roots' slots as `/changed/root`), counts on the root; with `key`, rows without a value are ignored and `changed` compares a row with the first row of the same value; every row counts. Against a `/h` reference of the same path it is the change since that case |
 | `add`, `subtract`, `multiply`, `divide` | `left`, `right`, `into` | one figure on the root |
 | `pick` | `from`, `into` | copies a slot (also `/views/...`) onto the root |
 | `put` | `into`, `value` | sets a literal on the root |
@@ -181,6 +200,10 @@ numbers in their own unit and compare as such.
 | `since` | `slot`, `from`, `into` | `slot` minus `from` |
 | `between` | `slot`, `from`, `to` | children within the range |
 | `amend` | `notes` (default `notes`) and a secondary input of that name | the input with notes laid over it |
+| `join` | `slots` (space separated), `with` (default a space), `into` (default `/joined`) | each row gains `into`: its slots' texts joined by `with`; a row with none of the slots is left as it is |
+| `match` | `key`, `value`, `op` (contains default, starts, ends) | the rows whose `key` text contains, starts with or ends with `value` |
+| `split` | `slot`, `with` (default a space), `into` (default `slot`) | each row gains `into/1`, `into/2`, … , the slot's text cut at `with` |
+| `date` | `slot`, `into` (default `/day`) | each row gains `into`: the text date `YYYY-MM-DD` (anything after the day ignored) as the natural `YYYYMMDD`, which `sort`, `between`, `latest` and `since` can use |
 | `ask` | `prompt`, `model` (default the hand's) | the stored answer at `<cell>/result` while its stamp (input case, model, prompt) is current; else empty, with `/sys/view/asking` in the context |
 
 ### Hand edits that survive recomputation

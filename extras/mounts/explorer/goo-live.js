@@ -8,7 +8,7 @@
 
 function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
   const $ = sel => el.querySelector(sel);
   const state = { events: [], shown: null };
 
@@ -40,9 +40,17 @@ function mountViewer(el, source, opts = {}) {
     body.innerHTML = r ? await recordHTML(source, r, false, new Set()) : '';
   }
 
+  // the QA chip: the score of an agent's QA tree, when one exists; a click flips the page to that folder
+  async function chip() {
+    if (!source.qa) return;
+    const q = await source.qa();
+    $('.sv-qa').innerHTML = q ? qaChipHTML(q) : '';
+    const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else root.location.search = '?views=/' + q.folder; });
+  }
   async function draw(ev) {
     await index();
     $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
+    chip();
     const nowEl = $('.sv-now'), earlier = $('.sv-earlier');
     nowEl.innerHTML = actionHTML(source, ev, true);
     const det = nowEl.querySelector('details.sv-act'); await fillAction(det, ev, true);
@@ -71,6 +79,11 @@ function actionHTML(source, ev, open) {
   return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
 }
 
+// the QA chip: green and quiet at zero, the count otherwise; the href is the QA folder on this same page
+function qaChipHTML(q) {
+  const n = Number(q.changed) || 0;
+  return `<a class="sv-chip ${n ? 'off' : 'ok'}" href="?views=/${esc(q.folder)}" title="QA: ${n ? n + ' check' + (n === 1 ? '' : 's') + ' disagree' : 'every check agrees'}">QA ${n}</a>`;
+}
 // the standing outline: every cell of the views folder with what it says now (the scoreboard, the bug list, the plan)
 function cellsHTML(cells) {
   if (!cells.length) return '';
@@ -377,6 +390,19 @@ function mcpSource(opts = {}) {
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
   }
+  // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
+  async function qa() {
+    const node = local(views).split('/')[0];
+    if (!node) return null;
+    const agents = await rpc('read', { path: '/' + node + '/agent', care: 'y', limit: 50 });
+    for (const ch of agents.children || []) {
+      const name = last(ch.path);
+      if (name === 'journal' || name === 'hands') continue;
+      const score = await rpc('read', { path: '/x/' + node + '/agent/' + name + '/qa/score', care: 'x' });
+      if (score && score.exists) return { folder: node + '/agent/' + name + '/qa', changed: (score.properties || {})['/changed'] || '0' };
+    }
+    return null;
+  }
   // follow: the stream when it answers, the history poll (700 ms, with x) when it does not; one handler, same events
   function follow(handler) {
     let last = 0, queue = Promise.resolve(), polling = null, stream = null;
@@ -409,7 +435,7 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, rpc };
+  return { read, answer, graph, follow, qa, rpc };
 }
 
 // the page: /live?views=<folder>&who=<writer>
@@ -420,7 +446,7 @@ function start(doc) {
   return mountViewer(el, mcpSource({ views, who }), { crumb: views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
