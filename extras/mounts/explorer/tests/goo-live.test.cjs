@@ -273,3 +273,47 @@ test('who= filters the poll and the stream; who=all shows system events', async 
   await new Promise(r => setImmediate(r));
   assert.deepEqual(log.map(e => e.shown ? 'shown ' + e.shown.path : `${e.epoch} ${e.who} ${e.label}`), ['3 system boot', '4 agent make cell vendors', 'shown 0x11/user/org/views']);
 });
+
+// ---- the agent's QA writes stay behind the chip
+test('qaHidden: an event written wholly under /<node>/agent/<name>/qa is hidden off that QA folder, shown on it or inside it, and a mixed event always shows', () => {
+  const {qaHidden, qaFolderOf} = live;
+  const qa = {epoch: 6, records: ['0x11/agent/claude/qa/expect/e1', '0x11/agent/claude/qa/notes/n1'], touched: ['0x11/agent/claude/qa/expect/e1']};
+  assert.equal(qaFolderOf('0x11/agent/claude/qa/expect/e1'), '0x11/agent/claude/qa');
+  assert.equal(qaFolderOf('0x11/agent/claude/qa'), '0x11/agent/claude/qa');
+  assert.equal(qaFolderOf('0x11/agent/claude/plan/s1'), null);
+  assert.equal(qaFolderOf('0x11/user/org/qa/x'), null, 'only an agent\'s qa');
+  assert.equal(qaHidden(qa, '0x11/user/org'), true);
+  assert.equal(qaHidden(qa, '/0x11/agent/claude/qa'), false);
+  assert.equal(qaHidden(qa, '0x11/agent/claude/qa/expect'), false);
+  assert.equal(qaHidden(qa, '0x11/agent/other/qa'), true, 'another agent\'s QA folder');
+  assert.equal(qaHidden({epoch: 7, records: ['0x11/agent/claude/qa/expect/e1', '0x11/user/org/deals/d1'], touched: []}, '0x11/user/org'), false, 'a mixed event shows');
+  assert.equal(qaHidden({epoch: 8, records: [], touched: ['0x11/user/org/deals/d1']}, '0x11/user/org'), false, 'touched stands in for an empty records list');
+  assert.equal(qaHidden({epoch: 'shown', touched: [], shown: {path: '0x11/agent/claude/qa', care: 'z', case: 0}}, '0x11/user/org'), false);
+});
+// a fake DOM just wide enough for mountViewer: elements keyed by selector so what was drawn can be read back
+function fakeEl() {
+  const kids = {};
+  return {classList: {add() {}}, innerHTML: '', dataset: {}, open: false, addEventListener() {}, querySelector(s) { return kids[s] || (kids[s] = fakeEl()); }, querySelectorAll() { return []; }};
+}
+const viewerSource = () => { const s = {async read() { return null; }, async answer() { return {}; }, async graph() { return {cells: []}; }, follow(h) { s.handler = h; }}; return s; };
+const person = (epoch, quiet) => ({epoch, label: 'd' + epoch, who: 'ian', touched: ['0x11/user/org/deals/d' + epoch], records: ['0x11/user/org/deals/d' + epoch], quiet});
+const qaWrite = (epoch, quiet) => ({epoch, label: 'e' + epoch, who: 'claude', touched: ['0x11/agent/claude/qa/expect/e' + epoch], records: ['0x11/agent/claude/qa/expect/e' + epoch], quiet});
+test('the work folder\'s page draws only the person\'s events; a QA write closing the backlog draws the last visible one; the QA folder\'s page draws the QA writes', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, true)); await s.handler(qaWrite(6, true)); await s.handler(qaWrite(7, false));
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="5" open>/, 'the backlog ends on a QA write: the last visible event is drawn');
+  assert.equal(el.querySelector('.sv-when').innerHTML, 'now <b>5</b>');
+  await s.handler(qaWrite(9, false));
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="5" open>/, 'a later QA write changes nothing');
+  await s.handler(person(8, false));
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="8" open>/);
+  const earlier = el.querySelector('.sv-earlier').innerHTML;
+  assert.match(earlier, /data-epoch="5"/); assert.doesNotMatch(earlier, /data-epoch="[679]"/, 'no QA write in earlier');
+  const el2 = fakeEl(), s2 = viewerSource();
+  mountViewer(el2, s2, {crumb: '0x11/agent/claude/qa', views: '/0x11/agent/claude/qa'});
+  await s2.handler(person(5, true)); await s2.handler(qaWrite(7, false));
+  assert.match(el2.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'on the QA folder the QA write is drawn');
+  assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
+});

@@ -10,7 +10,8 @@ function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
   const $ = sel => el.querySelector(sel);
-  const state = { events: [], shown: null };
+  const state = { events: [], shown: null, drawn: false };
+  const views = local(opts.views !== undefined ? opts.views : opts.crumb);   // the page's folder: an agent's QA writes show only on the QA folder's page
 
   async function index() {
     const g = await source.graph();
@@ -48,6 +49,7 @@ function mountViewer(el, source, opts = {}) {
     const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else root.location.search = '?views=/' + q.folder; });
   }
   async function draw(ev) {
+    state.drawn = true;
     await index();
     $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
     chip();
@@ -62,6 +64,7 @@ function mountViewer(el, source, opts = {}) {
   source.follow(async msg => {
     if (msg.shown) { const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev); }
     if (!msg.touched || !msg.touched.length) return;
+    if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return draw(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
     state.events.push(msg); if (msg.quiet) return;   // quiet: the backlog on load, kept for `earlier` and drawn with the last
     return draw(msg);
   });
@@ -72,6 +75,14 @@ function mountViewer(el, source, opts = {}) {
 // what a write moved: the cells that read any touched path, one hop
 const moved = (source, touched) => { const out = new Set(); for (const t of touched) for (const q of (source._asked.get(t) || [])) out.add(last(q.path) + (q.answer ? ' ' + q.answer : '')); for (const t of touched) { const seg = t.split('/'); for (let i = seg.length - 1; i > 0; i--) for (const q of (source._asked.get(seg.slice(0, i).join('/')) || [])) out.add(last(q.path) + (q.answer ? ' ' + q.answer : '')); } return [...out]; };
 
+// an agent's QA writes stay behind the chip: an event whose every written record sits under /<node>/agent/<name>/qa is
+// drawn only when the page's views folder is that QA folder or inside it; its score still reaches the chip through qa()
+const qaFolderOf = p => { const m = /^([^/]+\/agent\/[^/]+\/qa)(\/|$)/.exec(p); return m ? m[1] : null; };
+const qaHidden = (ev, views) => {
+  const recs = ev.records || ev.touched || []; if (ev.shown || !recs.length) return false;
+  const folders = recs.map(qaFolderOf); if (folders.includes(null)) return false;
+  const at = local(views); return !folders.some(f => at === f || at.startsWith(f + '/'));
+};
 // one action: a line; opens into its records, each a line that opens into the card
 function actionHTML(source, ev, open) {
   const n = (ev.records || ev.touched).length, more = ev.count && ev.count > n + 3 ? '+' : '', mv = moved(source, ev.touched);
@@ -443,10 +454,10 @@ function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
   const views = local(q.get('views') || ''), who = q.get('who') || '';
-  return mountViewer(el, mcpSource({ views, who }), { crumb: views });
+  return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
