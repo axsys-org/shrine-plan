@@ -125,6 +125,7 @@ def check(port, directory, timeout, count=20, node='0x11'):
         cell = world.write([{'path': '/user/views/kept', 'slots': {'sys/weft': weft, 'sys/tack': tack}}])
         epoch_before = cell['epoch']
         expect('writes before the stop land', world.read('/user/keep/r3')['properties'].get('/n'), '3')
+        expect('the launcher says this world is kept', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         expect('a cell counts the folder before the stop', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
         world.stop()
         print('stopped', flush=True)
@@ -133,6 +134,7 @@ def check(port, directory, timeout, count=20, node='0x11'):
         expect('the records are back after the reboot', world.read('/user/keep/r3')['properties'].get('/n'), '3')
         expect('the batch is back', world.read('/user/keep/b99')['properties'].get('/n'), '99')
         expect('the cell still counts every record', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
+        expect('the world record is written again on resume', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         history = world.tool('history', after=epoch_before - 1)
         expect('history continues from the saved epoch', history['events'][0]['epoch'], epoch_before)
         after = world.write([{'path': '/user/keep/again', 'slots': {'n': 1}}])
