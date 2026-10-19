@@ -331,25 +331,23 @@
 (define (surf-strip-spans surf)
   (If (Eq "s_span" (_0 surf)) (surf-strip-spans (_2 surf)) surf))
 
-;; Expand every current-namespace reference (%/x, s_cref) into an
-;; ordinary s_ref of anchor+suffix.  The anchor is the enclosing
-;; declaration's parent source path, determined structurally BEFORE any
-;; declaration elaborates: %/ performs no parent search and no
-;; rooted-first fallback of its own — it forms one exact written path,
-;; which then resolves through the ordinary environment machinery
-;; (canon-path: visibility, mounts, aliases).
-(define (cref-expand anchor x)
+;; Expand anchored references to exact source paths before elaboration.
+;; Neither anchor searches ancestors or falls back to a rooted spelling.
+;; The resulting ordinary reference retains normal visibility and mounts.
+(define (cref-expand siblings children x)
   (Ifz (IsApp x)
     x
-    (If (And (Sz x) (Eq "s_cref" (_0 x)))
-      ["s_ref" (Weld anchor (_1 x))]
-      (gen (Sz x) (lambda (i) (cref-expand anchor (Ix i x)))))))
+    (cond
+      ((And (Sz x) (Eq "s_cref" (_0 x)))
+        ["s_ref" (Weld siblings (_1 x))])
+      ((And (Sz x) (Eq "s_child_ref" (_0 x)))
+        ["s_ref" (Weld children (_1 x))])
+      (else
+        (gen (Sz x) (lambda (i) (cref-expand siblings children (Ix i x))))))))
 
-;; A declaration row with its body's %/ references expanded at the
-;; enclosing namespace (siblings of the declaration itself).
 (define (expand-decl-crefs row)
   (If (And (IsApp row) (Eq "s_decl" (_0 row)))
-    (Up 3 (cref-expand (Init (_1 row)) (_3 row)) row)
+    (Up 3 (cref-expand (Init (_1 row)) (_1 row) (_3 row)) row)
     row))
 
 ;; The sealed environment riding the subject (an Environment during
@@ -1153,6 +1151,48 @@
      (tc-ffi (Ifz (Sz params) typ (nt:scheme params typ))
        (pail-as-key (_0 options) (_1 options)
          (nt:row-cstr row) (Sz (nt:row-items row))))]]])
+
+;; A closed enum's source member names decode to its exact runtime brands.
+;; Unknown text is an ordinary missing value, not an exception.
+(define (enum-read-str some none cases text)
+  (define hit (find (lambda (entry) (Eq text (_0 entry))) cases))
+  (If hit (some (_1 (_0 hit))) none))
+
+(define (gen-enum-reader compiler path scm declared)
+  (define env (env-with-name path empty-env))
+  (define (collect state option)
+    (define rr (option-row (compiler-world (_0 state)) option))
+    (define c1 (compiler-with-world (_0 rr) (_0 state)))
+    (define row (_1 rr))
+    (If (And row (And (nt:row-cstr row) (Nil (Sz (nt:row-items row)))))
+      [c1 (snoc [(option-member-tag option) (nt:row-cstr row)] (_1 state)) (_2 state)]
+      [c1 (_1 state) 0]))
+  (define collected
+    (foldl collect [compiler [] 1] (nt:flat-sum-options (nt:scheme-body scm))))
+  (define c1 (_0 collected))
+  (define cases (_1 collected))
+  (If (And (_2 collected) (Sz cases))
+    (let* ((params (nt:scheme-parameters scm))
+           (self-ty
+             (Ifz (Sz params) (nt:type-ref path)
+               (nt:type-app path (map nt:parameter-template-argument params))))
+           (key (Weld path ["read_str"]))
+           (typ (nt:tfun [(nt:type-ref (system-path c1 ["str"]))]
+                  (nt:type-app (system-path c1 ["maybe"]) [(nt:type-arg self-ty)])))
+           (options (option-brands c1)))
+      (need env (Nil (includes (Equal key) declared))
+        ["derived enum reader collides with a declaration" (print-path key)]
+        ["enum" (print-path path)])
+      (define checked
+        (foldl (lambda (seen entry)
+          (need env (Nil (includes (Eq (_0 entry)) seen))
+            "enum constructor names must be unique for read_str" (_0 entry))
+          (snoc (_0 entry) seen)) [] cases))
+      (Seq (DeepSeq checked 1)
+        [c1 [[key wack-span
+          (tc-ffi (Ifz (Sz params) typ (nt:scheme params typ))
+            (enum-read-str (_0 options) (_1 options) cases))]]]))
+    [c1 []]))
 
 ;; gen-sum-members :: compiler -> path -> scheme -> [path] -> [compiler rows]
 ;; Per option with a runtime key: S/is_c : {\ S}bool and, for a payload
@@ -2550,9 +2590,9 @@
     (else (new-elab-error env "unsupported surface form" surf))))
 
 (define (elab-value compiler surf)
-  ;; A live value elaborates at module level: %/ anchors at the
+  ;; A live value elaborates at module level: both anchors name the
   ;; compilation root.
-  (elab-value-go compiler empty-env (cref-expand [] surf)))
+  (elab-value-go compiler empty-env (cref-expand [] [] surf)))
 
 
 ;;; Module sealing and elaboration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -2670,12 +2710,20 @@
           (NewCompiler.system-root compiler))))))
 
 ;; Between refine and seed-value: records get T/try_from_pail and
-;; unions get S/is_c and S/try_c members. This must follow
+;; unions get S/is_c, S/try_c, and nullary enums S/read_str. This must follow
 ;; EVERY refine - a nominal member's brand is final only once its own
 ;; refine ran, and on-decl emits the union before its member kids - and
 ;; precede seed-value, so extend-derived-environment classifies the
 ;; inserted entries as derived.  The rows are forced here so a collision
 ;; lands in this pass's Try as a diagnostic on the union.
+;; Canonical types erase singleton unions. Retain the source distinction so
+;; an explicit one-case enum still gets a reader, unlike a plain row alias.
+(define (union-declaration? surf)
+  (define node (surf-strip-spans surf))
+  (If (Or (Eq "s_tvars" (_0 node)) (Eq "s_cvars" (_0 node)))
+    (union-declaration? (_2 node))
+    (Eq "s_union" (_0 node))))
+
 (define (derive-type-members-pass declared)
   (lambda (compiler row)
     (define path (root-path (compiler-subject compiler) (_1 row)))
@@ -2685,19 +2733,21 @@
              (scm (nt:type-entry-scheme (_1 r)))
              (c0 (compiler-with-world (_0 r) compiler)))
         (define mono (nt:scheme-body scm))
-        (If (Nil (Or (nt:sum-type? mono) (nt:row-type? mono)))
-          c0
-          (let* ((gr
-                   (If (nt:row-type? mono)
-                     (gen-pail-member c0 path scm declared)
-                     (gen-sum-members c0 path scm declared)))
-                 (rows (_1 gr))
-                 (subject
-                   (foldl (lambda (s r) (mark-derived (_0 r) s))
-                     (insert-tcs rows (compiler-subject (_0 gr)))
-                     rows)))
-            (Seq (DeepSeq rows 1)
-              (compiler-with-subject subject (_0 gr)))))))))
+        (define gr
+          (cond
+            ((nt:row-type? mono) (gen-pail-member c0 path scm declared))
+            ((nt:sum-type? mono) (gen-sum-members c0 path scm declared))
+            (else [c0 []])))
+        (define er
+          (If (Or (nt:sum-type? mono) (union-declaration? (_3 row)))
+            (gen-enum-reader (_0 gr) path scm declared)
+            [(_0 gr) []]))
+        (define rows (Weld (_1 gr) (_1 er)))
+        (define subject
+          (foldl (lambda (s r) (mark-derived (_0 r) s))
+            (insert-tcs rows (compiler-subject (_0 er))) rows))
+        (Seq (DeepSeq rows 1)
+          (compiler-with-subject subject (_0 er)))))))
 
 (define (prototype-value compiler env surf)
   (define tag (_0 surf))
@@ -2937,7 +2987,7 @@
   (define base-subject (compiler-subject compiler))
   (If (sut-context base-subject) 0
     (error "module-elaboration-requires-compilation-context"))
-  ;; %/ references expand structurally at each declaration's own
+  ;; ;/ references expand structurally at each declaration's own
   ;; namespace position before any pass consumes the bodies.
   ;; The five passes were zoned; the cref expansion before them and the
   ;; environment sealing after them were NOT, and together those were
