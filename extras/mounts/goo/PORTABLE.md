@@ -187,9 +187,18 @@ the configured workspace endpoint with its `path` query; that endpoint validates
 the source and allocates a new context before returning the page. Changing the
 source is not a `/goo/render` request against an arbitrary subject.
 
-This descriptor does not add a JSON session-allocation endpoint or an endpoint URL.
-Native host support must supply an explicit entry adapter; until then it must
-reject this navigation kind. The earlier `workspace-subject` descriptor described
+The existing configured workspace endpoint now accepts `GET ?path=...&format=json`.
+It uses the same validation and stored-session allocator as HTML entry and returns
+`{version:1,target,source,view,host}` as JSON. `target` is the allocated session,
+`source` is the admitted requested path, and `view` is the installed declaration.
+Only `path` and `format=json` are accepted for JSON entry, with no duplicate keys;
+query fields cannot select a different declaration or manufacture capabilities.
+The endpoint URL remains explicit host configuration; the descriptor does not
+discover endpoints. After entry, send `target`, `view`, and `workspace=view` to
+`/goo/render`. Validate the resulting host/declaration and context before mounting.
+Navigation stages another entry and preparation before retiring local owners.
+
+The earlier `workspace-subject` descriptor described
 the pre-main synthetic receiver and must not be emitted for stored sessions. Operations identify the supported host workflow, not an
 arbitrary executable command or URL. `mount-rescan` retains the existing guarded
 status/scan/publication workflow. Unknown kinds must remain unavailable. This is
@@ -312,3 +321,15 @@ The egui checkout's `scripts/benchmark-render.py` reproduces the cache-disabled
 comparison using disposable fixtures and archived revisions without changing a
 checkout. It saves timings and exact received responses, separates startup from
 rendering, and offers `--warm-cache` for normal development-cache measurements.
+
+
+## Read-only portable Values
+
+Writable records' synthetic Values responses retain `display:null` and the existing
+browser HTML slot editor. They additionally expose `readOnlyDisplay`, containing
+the ordinary version-1 display already prepared by `goo_reflection` from the same
+namespace snapshot. Native clients may consume it for `/sys/slot/synthetic` with
+an empty controls array. Its geometry, paint, font and semantics require the same
+validation as any display. This field grants no edit/action authority. The native
+Explorer opens declared ordinary views for edits; it does not parse or reproduce
+the HTML slot editor. Read-only records continue to supply ordinary `display`.
