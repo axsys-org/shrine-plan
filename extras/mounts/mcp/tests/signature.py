@@ -180,11 +180,79 @@ def filter_rows(inp, care, pred):
     return out
 
 
-# ============================================================================ the oracle: the 33 standard cells
+def put_fig(r, into, v, scale):
+    """A derived number on a row carries the slot's own scale, so the row's other numbers keep theirs; a whole number on
+    a row that has /scale says so with <slot>/scale 0 (the world renders a slot with its own scale as the decimal)."""
+    r['props'][into] = fig(v, scale)
+    own = r['props'].get('/scale', '0')
+    if scale == 0 and (not is_num(own) or int(own) == 0):
+        r['props'].pop(into + '/scale', None)
+    else:
+        r['props'][into + '/scale'] = str(scale)
+
+
+def row_scale(R, slot):
+    return max([scale_of(r, slot) for rel, r in R if num_of(r, slot) is not None], default=0)
+
+
+def row_num(r, rel, slot):
+    """A row's number at a slot, the name convention included (a numeric name counts, at scale 0)."""
+    if slot in r['props']:
+        return num_of(r, slot)
+    t = slot_text(r, rel, slot)
+    return Fraction(int(t)) if is_num(t) else None
+
+
+def day_of(r, rel, slot):
+    """A row's day as (y, m, d): a day number YYYYMMDD with a year of at least one, or a text date."""
+    import datetime
+    t = slot_text(r, rel, slot)
+    if t is None:
+        return None
+    if is_num(t):
+        n = int(t)
+        if n < 0:
+            return None
+        y, m, d = n // 10000, (n // 100) % 100, n % 100
+    else:
+        m_ = re.match(r'(\d{4})-(\d{2})-(\d{2})', t)
+        if not m_:
+            return None
+        y, m, d = int(m_.group(1)), int(m_.group(2)), int(m_.group(3))
+    try:
+        datetime.date(y, m, d)
+    except ValueError:
+        return None
+    return y, m, d
+
+
+def ascii_case(t, upper):
+    return ''.join((c.upper() if upper else c.lower()) if 'a' <= c.lower() <= 'z' else c for c in t)
+
+
+def ref_path(text):
+    """The absolute path a rendered reference /h/<care>/<case>/<len>/<path> points at."""
+    if not text or not text.startswith('/h/'):
+        return None
+    parts = text.split('/')
+    return '/' + '/'.join(parts[5:]) if len(parts) > 5 else None
+
+
+def record_at(tree, rel):
+    """The record at a relative path of a cut view tree, if there is one."""
+    cur = tree
+    for seg in rel:
+        cur = cur['kids'].get(seg)
+        if cur is None:
+            return None
+    return cur if cur.get('rec', True) and cur is not None else None
+
+
+# ============================================================================ the oracle: the standard cells
 DEFAULT_INTO = {'count': '/count', 'sum': '/total', 'min': '/min', 'max': '/max', 'avg': '/avg', 'any': '/any', 'all': '/all'}
 
 
-def evaluate(formula, params, inp, care, views, stamp=None):
+def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
     """formula x params x input (at a care; None when the tack resolves to nothing) x views {name: (tree|None, care)}
     -> (output tree, or None for unknown) and the context': missing, fault, empty views, notes."""
     ctx = {'missing': False, 'fault': False, 'empty': set(), 'notes': set()}
@@ -250,29 +318,36 @@ def evaluate(formula, params, inp, care, views, stamp=None):
             return missing()
         hits = [truth(r, P('slot')) for _, r in R]
         return node({P('into') or DEFAULT_INTO[formula]: 'true' if (any(hits) if formula == 'any' else all(hits)) else 'false'}), ctx
+    def rule(rel, r, key, value, op):
+        # where's comparison: a number slot by value at its scale, anything else as text
+        t = slot_text(r, rel, key)
+        lit = literal(value)
+        if t is None:
+            return False
+        if op == 'equals':
+            return (num_of(r, key) if key in r['props'] else Fraction(int(t))) == lit[0] if is_num(t) and lit else t == value
+        if op in ('over', 'after', 'under', 'before'):
+            if not is_num(t) or lit is None:
+                return False
+            v = num_of(r, key) if key in r['props'] else Fraction(int(t))
+            return v > lit[0] if op in ('over', 'after') else v < lit[0]
+        return op == 'contains' and value in t
+
     if formula == 'where':
         key, value, op = P('key'), P('value'), P('op') or 'equals'
         if key is None or value is None:
             return missing()
-        lit = literal(value)
-
-        def match(rel, r):
-            t = slot_text(r, rel, key)
-            if t is None:
-                return False
-            if op == 'equals':
-                return (num_of(r, key) if key in r['props'] else Fraction(int(t))) == lit[0] if is_num(t) and lit else t == value
-            if op in ('over', 'after', 'under', 'before'):
-                if not is_num(t) or lit is None:
-                    return False
-                v = num_of(r, key) if key in r['props'] else Fraction(int(t))
-                return v > lit[0] if op in ('over', 'after') else v < lit[0]
-            return op == 'contains' and value in t
-        return filter_rows(inp, care, match), ctx
+        return filter_rows(inp, care, lambda rel, r: rule(rel, r, key, value, op)), ctx
     if formula == 'sort':
-        if P('slot') is None:
+        slots = (P('slot') or '').split()
+        if not slots:
             return missing()
-        order = ranked(P('slot'), (P('order') or 'asc') == 'desc')
+        desc = (P('order') or 'asc') == 'desc'
+        order = ranked(slots[0], desc)
+        if len(slots) > 1:
+            # a second slot breaks ties; a row without a number there counts as zero
+            second = lambda item: row_num(item[1], item[0], slots[1]) or Fraction(0)
+            order = sorted(order, key=lambda item: (row_num(item[1], item[0], slots[0]), second(item)), reverse=desc)
         return node(inp['props'], {str(i + 1): with_key(rel, r) for i, (rel, r) in enumerate(order)}, inp['rec']), ctx
     if formula == 'top':
         if P('slot') is None:
@@ -368,7 +443,8 @@ def evaluate(formula, params, inp, care, views, stamp=None):
             v = slot_text(r, rel, P('slot'))
             if v is not None:
                 counts[v] = counts.get(v, 0) + 1
-        return node(inp['props'], {str(i + 1): node({'/value': v, '/count': str(c)}) for i, (v, c) in enumerate(counts.items())}, inp['rec']), ctx
+        # the root gains /count: how many distinct values (a record from then on)
+        return node(dict(inp['props'], **{'/count': str(len(counts))}), {str(i + 1): node({'/value': v, '/count': str(c)}) for i, (v, c) in enumerate(counts.items())}), ctx
     if formula == 'select':
         if P('slots') is None:
             return missing()
@@ -385,12 +461,16 @@ def evaluate(formula, params, inp, care, views, stamp=None):
         key, op, slot = P('key'), P('op') or 'count', P('slot')
         if key is None or (op != 'count' and slot is None):
             return missing()
+        keys = key.split() if key != 'depth' else [key]
+        if not keys:
+            return missing()
         into = P('into') or '/' + op
         groups = {}
         for rel, r in R:
-            v = slot_text(r, rel, key)
-            if v is not None:
-                groups.setdefault(v, []).append(r)
+            # two keys: both values joined by an underscore, both needed
+            vs = [slot_text(r, rel, k) for k in keys] if key != 'depth' else [str(len(rel))]
+            if all(v is not None for v in vs):
+                groups.setdefault('_'.join(vs), []).append(r)
         out = node(inp['props'], rec=inp['rec'])
         for v, members in groups.items():
             figure, scale = (str(len(members)), 0) if op == 'count' else (lambda f, s: (fig(f, s), s))(*reduce_(op, members, slot))
@@ -521,6 +601,297 @@ def evaluate(formula, params, inp, care, views, stamp=None):
         if slot is None or lo is None or hi is None:
             return missing()
         return filter_rows(inp, care, lambda rel, r: num_of(r, slot) is not None and lo[0] <= num_of(r, slot) <= hi[0]), ctx
+    if formula == 'when':
+        key, value, op, then, other, into = P('key'), P('value'), P('op') or 'equals', P('then'), P('else'), P('into')
+        if None in (key, value, then, into):
+            return missing()
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            if rule(rel, r, key, value, op):
+                r['props'][into] = then
+            elif other is not None:
+                r['props'][into] = other
+        return out, ctx
+    if formula == 'coalesce':
+        slot, value = P('slot'), P('value')
+        if slot is None or value is None:
+            return missing()
+        into = P('into') or slot
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            t = slot_text(r, rel, slot)
+            if t is None:
+                r['props'][into] = value
+            elif into != slot:
+                r['props'][into] = t
+        return out, ctx
+    if formula == 'part':
+        import datetime
+        slot, unit = P('slot'), P('unit')
+        if slot is None or unit not in ('year', 'quarter', 'month', 'week', 'weekday'):
+            return missing()
+        into = P('into') or '/' + unit
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            ymd = day_of(r, rel, slot)
+            if ymd:
+                y, m, d = ymd
+                dt = datetime.date(y, m, d)
+                r['props'][into] = str({'year': y, 'quarter': (m - 1) // 3 + 1, 'month': m, 'week': (dt.timetuple().tm_yday - 1) // 7 + 1,
+                                        'weekday': dt.isoweekday()}[unit])
+        return out, ctx
+    if formula == 'shift':
+        import datetime, calendar
+        slot, by, unit = P('slot'), literal(P('by')) if P('by') else None, P('unit') or 'day'
+        if slot is None or by is None or by[1] != 0 or unit not in ('day', 'week', 'month', 'year'):
+            return missing()
+        into = P('into') or slot
+        n = int(by[0])
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            ymd = day_of(r, rel, slot)
+            if not ymd:
+                continue
+            y, m, d = ymd
+            try:
+                if unit in ('day', 'week'):
+                    moved = datetime.date(y, m, d) + datetime.timedelta(days=n * (7 if unit == 'week' else 1))
+                    y2, m2, d2 = moved.year, moved.month, moved.day
+                else:
+                    total = y * 12 + (m - 1) + n * (12 if unit == 'year' else 1)
+                    if total < 0:
+                        continue
+                    y2, m2 = total // 12, total % 12 + 1
+                    d2 = min(d, calendar.monthrange(y2, m2)[1]) if y2 >= 1 else d
+                if y2 < 1:
+                    continue
+            except (OverflowError, ValueError):
+                continue
+            r['props'][into] = str(y2 * 10000 + m2 * 100 + d2)
+        return out, ctx
+    if formula in ('running', 'change', 'moving', 'percent'):
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        into = P('into') or '/' + formula
+        window = int(P('window')) if formula == 'moving' and is_num(P('window')) else 3
+        if formula == 'moving' and window == 0:
+            return missing()
+        out = clone(inp)
+        out_rows = rows(out, care)
+        s = row_scale(out_rows, slot)
+        total, prev, recent = Fraction(0), None, []
+        all_total = sum((row_num(r, rel, slot) for rel, r in out_rows if row_num(r, rel, slot) is not None), Fraction(0))
+        for rel, r in out_rows:
+            v = row_num(r, rel, slot)
+            if v is None:
+                continue
+            if formula == 'running':
+                total += v
+                put_fig(r, into, total, s)
+            elif formula == 'change':
+                if prev is not None:
+                    put_fig(r, into, v - prev, s)
+                prev = v
+            elif formula == 'moving':
+                recent = (recent + [v])[-window:]
+                put_fig(r, into, sum(recent) / len(recent), s)
+            elif all_total != 0:
+                put_fig(r, into, v / all_total * 100, 2)
+        return out, ctx
+    if formula == 'rank':
+        into = P('into') or '/rank'
+        out = clone(inp)
+        for i, (rel, r) in enumerate(rows(out, care)):
+            r['props'][into] = str(i + 1)
+        return out, ctx
+    if formula in ('trim', 'case', 'replace', 'length', 'starts', 'ends'):
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        if formula == 'case' and P('to') not in ('lower', 'upper'):
+            return missing()
+        if formula == 'replace' and P('find') is None:
+            return missing()
+        if formula in ('starts', 'ends') and P('value') is None:
+            return missing()
+        into = P('into') or {'length': '/length', 'starts': '/starts', 'ends': '/ends'}.get(formula, slot)
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            t = slot_text(r, rel, slot)
+            if t is None:
+                continue
+            if formula == 'trim':
+                r['props'][into] = t.strip(''.join(chr(c) for c in range(33)))
+            elif formula == 'case':
+                r['props'][into] = ascii_case(t, P('to') == 'upper')
+            elif formula == 'replace':
+                r['props'][into] = t.replace(P('find'), P('with') or '') if P('find') else t
+            elif formula == 'length':
+                r['props'][into] = str(len(t.encode()))
+            else:
+                r['props'][into] = 'true' if (t.startswith(P('value')) if formula == 'starts' else t.endswith(P('value'))) else 'false'
+        return out, ctx
+    if formula == 'follow':
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        into = P('into') or slot
+        names = [P('from')] if P('from') else sorted(views)
+        names = [n for n in names if n in views]
+        if not names:
+            return missing()
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            target = ref_path(slot_text(r, rel, slot))
+            if target is None:
+                continue
+            for name in names:
+                tree, vcare = views[name]
+                root = (view_paths or {}).get(name)
+                if tree is None or root is None or not (target == root or target.startswith(root + '/')):
+                    continue
+                found = record_at(cut(tree, vcare), tuple(seg for seg in target[len(root):].split('/') if seg))
+                if found is not None and found['rec']:
+                    for k, v in found['props'].items():
+                        r['props'][into + k] = v
+                break
+        return out, ctx
+    if formula == 'reference':
+        key, into, frm = P('key'), P('into'), P('from') or 'table'
+        match = P('match') or key
+        if key is None or into is None or frm not in views or (view_paths or {}).get(frm) is None:
+            return missing()
+        table = view_rows(frm)
+        out = clone(inp)
+        for rel, r in rows(out, care):
+            kv = slot_text(r, rel, key)
+            for trel, tr in table:
+                if kv is not None and slot_text(tr, trel, match) == kv:
+                    path = view_paths[frm] + '/' + '/'.join(trel)
+                    r['props'][into] = '/h/x/0/' + str(len(path.strip('/').split('/'))) + path
+                    break
+        return out, ctx
+    if formula in ('median', 'percentile', 'variance', 'stddev'):
+        slot = P('slot')
+        at = int(P('at')) if is_num(P('at')) else 50
+        if slot is None or (formula == 'percentile' and (at > 100 or at < 0)):
+            return missing()
+        into = P('into') or '/' + formula
+        s = max([scale_of(r, slot) for rel, r in R], default=0)
+        xs = sorted(v for v in (row_num(r, rel, slot) for rel, r in R) if v is not None)
+        n = len(xs)
+        if n == 0:
+            return node({into: '0', '/scale': str(s)}), ctx
+        if formula == 'median':
+            v = (xs[(n - 1) // 2] + xs[n // 2]) / 2
+            return node({into: fig(v, s), '/scale': str(s)}), ctx
+        if formula == 'percentile':
+            k = min(max((at * n + 99) // 100, 1), n)
+            return node({into: fig(xs[k - 1], s), '/scale': str(s)}), ctx
+        X = [int(v * 10 ** s) for v in xs]
+        S = sum(X)
+        num = sum((n * x - S) ** 2 for x in X)
+        if formula == 'variance':
+            den = n ** 3 * 10 ** s
+            return node({into: str((num + den // 2) // den), '/scale': str(s)}), ctx
+        # the standard deviation at the scale, rounded half up: floor(sqrt(4 num / n^3) + 1) / 2
+        return node({into: str((math.isqrt(4 * num // n ** 3) + 1) // 2), '/scale': str(s)}), ctx
+    if formula == 'mode':
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        into = P('into') or '/mode'
+        counts = {}
+        for rel, r in R:
+            v = slot_text(r, rel, slot)
+            if v is not None:
+                counts[v] = counts.get(v, 0) + 1
+        if not counts:
+            return node({}), ctx
+        best = max(counts.items(), key=lambda kv: kv[1])[1]
+        return node({into: next(v for v, c in counts.items() if c == best)}), ctx
+    if formula == 'group':
+        key = P('key')
+        if key is None:
+            return missing()
+        out = node(inp['props'], rec=inp['rec'])
+        for rel, r in R:
+            v = slot_text(r, rel, key)
+            if v is not None:
+                place(out, (v,) + rel, node(r['props']))
+        return out, ctx
+    if formula in ('rename', 'drop'):
+        if formula == 'rename' and (P('from') is None or P('to') is None):
+            return missing()
+        if formula == 'drop' and not (P('slots') or '').split():
+            return missing()
+        out = clone(inp)
+
+        def reshape(n):
+            if formula == 'rename':
+                frm, to = P('from'), P('to')
+                if frm in n['props']:
+                    n['props'][to] = n['props'].pop(frm)
+                    if frm + '/scale' in n['props']:
+                        n['props'][to + '/scale'] = n['props'].pop(frm + '/scale')
+            else:
+                for slot in P('slots').split():
+                    n['props'].pop(slot, None)
+                    n['props'].pop(slot + '/scale', None)
+        reshape(out)
+        for rel, r in rows(out, care):
+            reshape(r)
+        return out, ctx
+    if formula == 'unflatten':
+        out = node(inp['props'], rec=inp['rec'])
+        for rel, r in R:
+            if len(rel) == 1 and '_' in rel[0]:
+                place(out, tuple(seg or 'empty' for seg in rel[0].split('_')), node(r['props']))
+            else:
+                place(out, rel, node(r['props']))
+        return out, ctx
+    if formula == 'explode':
+        slot = P('slot')
+        if slot is None:
+            return missing()
+        sep = ' ' if P('with') is None else P('with')
+        out = node(inp['props'], rec=inp['rec'])
+        for rel, r in R:
+            t = slot_text(r, rel, slot)
+            if t is None:
+                place(out, rel, node(r['props']))
+                continue
+            # the pieces as rows 1, 2, 3 under the row's name; the row itself becomes the folder holding them
+            for i, piece in enumerate(t.split(sep) if sep else [t], 1):
+                place(out, rel + (str(i),), node(dict(r['props'], **{slot: piece})))
+        return out, ctx
+    if formula == 'validate':
+        key, op, value, reason = P('key'), P('op') or 'equals', P('value'), P('reason')
+        if key is None or (op != 'present' and value is None):
+            return missing()
+        given = value or ''
+
+        def failing(rel, r):
+            has = slot_text(r, rel, key) is not None
+            return not (has if op == 'present' else has and rule(rel, r, key, given, op))
+        out = filter_rows(inp, care, failing)
+        for rel, r in rows(out, care):
+            r['props']['/reason'] = reason if reason is not None else (key + ' is absent' if slot_text(r, rel, key) is None else key + ' is not ' + op + ' ' + given)
+        return out, ctx
+    if formula == 'unique':
+        key = P('key')
+        if key is None:
+            return missing()
+        counts = {}
+        for rel, r in R:
+            v = slot_text(r, rel, key)
+            if v is not None:
+                counts[v] = counts.get(v, 0) + 1
+        out = filter_rows(inp, care, lambda rel, r: counts.get(slot_text(r, rel, key), 0) >= 2)
+        for rel, r in rows(out, care):
+            r['props']['/count'] = str(counts[slot_text(r, rel, key)])
+        return out, ctx
     if formula == 'amend':
         if 'notes' not in views:
             return missing()
@@ -547,7 +918,10 @@ def evaluate(formula, params, inp, care, views, stamp=None):
 # ============================================================================ generators
 FORMULAS = ['count', 'sum', 'min', 'max', 'avg', 'any', 'all', 'where', 'sort', 'top', 'latest', 'earliest', 'each', 'lookup',
             'distinct', 'select', 'by', 'grid', 'flatten', 'merge', 'gather', 'except', 'intersect', 'diff', 'add', 'subtract', 'multiply',
-            'divide', 'pick', 'put', 'round', 'since', 'between', 'join', 'match', 'split', 'date']          # amend has its own stage (notes need the world's stamps)
+            'divide', 'pick', 'put', 'round', 'since', 'between', 'join', 'match', 'split', 'date',
+            'when', 'coalesce', 'part', 'shift', 'running', 'rank', 'change', 'moving', 'percent', 'trim', 'case', 'replace', 'length',
+            'starts', 'ends', 'follow', 'reference', 'median', 'percentile', 'variance', 'stddev', 'mode', 'group', 'rename', 'drop',
+            'unflatten', 'explode', 'validate', 'unique']          # amend has its own stage (notes need the world's stamps)
 KINDS = ['rec1', 'recN', 'recM', 'list', 'map', 'set', 'table', 'bag', 'attach', 'tree', 'grouped', 'matrix', 'hier', 'uneven']
 REQUIRED = {'where': ['key', 'value'], 'each': ['left', 'right', 'op'], 'lookup': ['key', 'take'], 'select': ['slots'], 'by': ['key'],
             'grid': ['row', 'col'], 'pick': ['from', 'into'], 'put': ['into', 'value'], 'round': ['slot', 'places'],
@@ -555,6 +929,12 @@ REQUIRED = {'where': ['key', 'value'], 'each': ['left', 'right', 'op'], 'lookup'
             'split': ['slot'], 'date': ['slot']}
 for _f in ('add', 'subtract', 'multiply', 'divide'):
     REQUIRED[_f] = ['left', 'right']
+REQUIRED.update({'when': ['key', 'value', 'then', 'into'], 'coalesce': ['slot', 'value'], 'part': ['slot', 'unit'], 'shift': ['slot', 'by'],
+                 'case': ['slot', 'to'], 'replace': ['slot', 'find'], 'starts': ['slot', 'value'], 'ends': ['slot', 'value'], 'follow': ['slot'],
+                 'reference': ['key', 'into'], 'group': ['key'], 'rename': ['from', 'to'], 'drop': ['slots'], 'explode': ['slot'],
+                 'validate': ['key'], 'unique': ['key']})
+for _f in ('running', 'change', 'moving', 'percent', 'trim', 'length', 'median', 'percentile', 'variance', 'stddev', 'mode'):
+    REQUIRED[_f] = ['slot']
 for _f in ('sum', 'min', 'max', 'avg', 'any', 'all', 'sort', 'top', 'latest', 'earliest', 'distinct'):
     REQUIRED[_f] = ['slot']
 TEXT = ['west', 'east', 'north', 'south', 'open', 'closed', 'hot', 'cold']
@@ -885,6 +1265,94 @@ class Gen:
                 p['from'], p['to'] = fmt(lo), fmt(hi)
             else:
                 p['from'], p['to'] = str(rng.randint(1, 50)), str(rng.randint(50, 400))
+        elif f == 'when':
+            p['key'] = pick(rowt + rowb + rown)
+            p['value'] = pick(vals(p['key']) or [self.word()])
+            if self.coin():
+                p['op'] = pick(['equals', 'over', 'under', 'contains'])
+            p['then'], p['into'] = pick([self.word(), str(rng.randint(1, 9))]), '/flag'
+            if self.coin(0.7):
+                p['else'] = pick([self.word(), '0'])
+        elif f == 'coalesce':
+            p['slot'], p['value'] = pick(rown + rowt + ['/missing']), pick([self.word(), '0'])
+            if self.coin(0.3):
+                p['into'] = '/filled'
+        elif f in ('part', 'shift'):
+            p['slot'] = pick(rowt + rown)
+            if f == 'part':
+                p['unit'] = pick(['year', 'quarter', 'month', 'week', 'weekday'])
+            else:
+                p['by'], p['unit'] = pick(['3', '-10', '1', '-1', '14', '2']), pick(['day', 'day', 'week', 'month', 'year'])
+            if self.coin(0.3):
+                p['into'] = '/when2'
+        elif f in ('running', 'change', 'moving', 'percent', 'median', 'percentile', 'variance', 'stddev'):
+            p['slot'] = pick(rown)
+            if f == 'moving' and self.coin():
+                p['window'] = rng.randint(1, 3)
+            if f == 'percentile':
+                p['at'] = pick([0, 25, 50, 75, 90, 100])
+            if self.coin(0.3):
+                p['into'] = '/fig'
+        elif f == 'rank':
+            if self.coin(0.3):
+                p['into'] = '/pos'
+        elif f in ('trim', 'length', 'case', 'replace', 'starts', 'ends', 'explode'):
+            p['slot'] = pick(rowt)
+            if f == 'case':
+                p['to'] = pick(['lower', 'upper'])
+            if f == 'replace':
+                p['find'] = pick(['e', 'o', 'st', 'th'])
+                if self.coin():
+                    p['with'] = pick(['', 'X', 'ee'])
+            if f in ('starts', 'ends'):
+                p['value'] = pick(['e', 'w', 'st', 'th', 'west', 'z'])
+            if f == 'explode' and self.coin():
+                p['with'] = pick(['-', 'e', ' '])
+            if f in ('trim', 'case', 'replace', 'length', 'starts', 'ends') and self.coin(0.3):
+                p['into'] = '/txt'
+        elif f == 'follow':
+            p['slot'] = '/ref'
+            if views and self.coin(0.4):
+                p['from'] = pick(sorted(views))
+            if self.coin(0.3):
+                p['into'] = '/pointed'
+        elif f == 'reference':
+            name = next((n for n in views if n not in ('v1', 'v2')), 'table')
+            if name != 'table':
+                p['from'] = name
+            table = view_rows_of(views, name)
+            tt = set()
+            for _, r in table:
+                tt |= set(kinds(r['props'])[2])
+            tt = sorted(tt) + ['/name']
+            pairs = [(k, m) for k in rowt for m in tt if set(vals(k)) & {slot_text(r, rel, m) for rel, r in table}]
+            p['key'], match = pick(pairs) if pairs and self.coin(0.7) else (pick(rowt), pick(tt))
+            if match != p['key'] or self.coin():
+                p['match'] = match
+            p['into'] = '/ref_to'
+        elif f == 'mode':
+            p['slot'] = pick(rowt + rown)
+            if self.coin(0.3):
+                p['into'] = '/common'
+        elif f in ('group', 'unique'):
+            p['key'] = pick(rowt + rowb)
+        elif f == 'rename':
+            p['from'], p['to'] = pick(rown + rowt), '/renamed'
+        elif f == 'drop':
+            p['slots'] = ' '.join(rng.sample(sorted(set(rown + rowt + rowb)), rng.randint(1, 2)))
+        elif f == 'validate':
+            op = pick(['equals', 'over', 'under', 'contains', 'present'])
+            p['key'] = pick(rown) if op in ('over', 'under') else pick(rowt + rowb + rown)
+            if op != 'equals' or self.coin():
+                p['op'] = op
+            if op != 'present':
+                p['value'] = pick(vals(p['key']) or [self.word()]) if op != 'over' and op != 'under' else lit()
+            if self.coin(0.3):
+                p['reason'] = 'bad row'
+        if f == 'by' and self.coin(0.25):
+            p['key'] = p['key'] + ' ' + pick(rowt + rowb)
+        if f == 'sort' and self.coin(0.3):
+            p['slot'] = p['slot'] + ' ' + pick(rown)
         return p
 
 
@@ -913,7 +1381,7 @@ def gen_case(g, i, home):
     cells = []
     for step in range(1 if g.coin(0.7) else rng.randint(2, 4)):
         f = rng.choice(FORMULAS)
-        needs = {'lookup': 'table', 'except': 'other', 'intersect': 'other', 'diff': 'other'}.get(f)
+        needs = {'lookup': 'table', 'except': 'other', 'intersect': 'other', 'diff': 'other', 'reference': 'table', 'follow': 'table'}.get(f)
         if needs and len(shapes) == 1 and g.coin(0.8):
             shapes.append(g.shape(rng.choice(KINDS), base + '/v1'))
         views = {}
@@ -941,6 +1409,19 @@ def gen_case(g, i, home):
                 view_trees[name] = (None, 'y')
             else:
                 view_trees[name] = (at(shapes[v['shape']], v['care'], v['pinned']), v['care'])     # nothing at x of a folder: empty
+        shape_views = sorted(n for n in views if views[n]['kind'] == 'shape')
+        if f == 'follow' and step == 0 and shape_views:
+            # references on the primary's rows (the ones history leaves alone) into a view's rows, as an import would leave them
+            target_shape = shapes[views[rng.choice(shape_views)]['shape']]
+            targets = rows(target_shape['state0'], 'z')
+            if targets:
+                for rel, r0 in rows(prim['state0'], 'z'):
+                    r1 = record_at(prim['state'], rel)
+                    if r1 is not None and r1['props'] == r0['props'] and g.coin(0.7):
+                        trel, _ = rng.choice(targets)
+                        path = target_shape['path'] + '/' + '/'.join(trel)
+                        r0['props']['/ref'] = r1['props']['/ref'] = '/h/x/0/' + str(len(path.strip('/').split('/'))) + path
+                inp = at(prim, care, tack.get('pinned', False)) if tack['kind'] == 'shape' else inp
         params = g.params(f, inp if inp is not None else node(), care, view_trees)
         if bad == 'omit' and REQUIRED.get(f):
             params.pop(rng.choice(REQUIRED[f]), None)
@@ -952,7 +1433,8 @@ def gen_case(g, i, home):
             if f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'sum', 'min', 'max', 'avg', 'sort', 'top') and 'slot' in params or 'left' in params:
                 texts = [s for s, v in (inp or node())['props'].items() if not is_num(v)] or ['/t']
                 params['slot' if 'slot' in params else 'left'] = rng.choice(texts)
-        expect = evaluate(f, params, inp, care, view_trees)
+        view_paths = {name: shapes[v['shape']]['path'] for name, v in views.items() if v['kind'] == 'shape'}
+        expect = evaluate(f, params, inp, care, view_trees, view_paths=view_paths)
         cells.append({'path': home + '/c/' + str(i) + '/s' + str(step), 'formula': f, 'params': params, 'tack': tack, 'views': views,
                       'care': care, 'expect': expect, 'bad': bad, 'nviews': len(views)})
         care = rng.choice('xyz')
@@ -1028,7 +1510,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
             if time.time() > deadline:
                 raise
             time.sleep(2)
-    assert len(stdlib) == 39, sorted(stdlib)      # thirty-eight formulas and ask
+    assert len(stdlib) == 68, sorted(stdlib)      # sixty-seven formulas and ask
     home = '/' + node_ + '/user/sig/' + str(seed)
     earlier = read(home, 'y')
     if earlier['exists'] or earlier['children']:          # a rerun with the same seed gets its own home under the seed's
