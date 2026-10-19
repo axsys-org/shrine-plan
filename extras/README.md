@@ -3,6 +3,9 @@
 For a worked example, read [Making a Grove and Goo mount](tutorials/grove-goo-mount.md).
 Its runnable `hello-grove` mount includes a notes list, reader, and editor.
 
+The [experiments](experiments/README.md) directory contains runnable namespace
+prototypes, sample data, and replay guides.
+
 Optional applications shipped in the core repository. Each directory under
 `extras/mounts/` is a flat source bag. From the repository root, `x/eden` reads
 these live sources by default:
