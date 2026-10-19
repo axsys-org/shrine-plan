@@ -87,16 +87,21 @@ filtered by it. An agent keeps its plan, scratch and `seen` epoch under
 agents in one world are fine: a write is one event, admitted whole or refused
 whole, and a cell is computed on read.
 
-A world lives as long as its process. The runtime keeps a store on disk (the
-`snap` folder of the world's work directory, and it does grow with your
-records), but every boot calls `eden:start`, which builds a new namespace at
-epoch 0; nothing yet reattaches the previous one. So a new boot is a new
-world: the standard cells and the mounts' seeds are there, your records are
-not, even on the same snapshot. Until a resume path exists, keep what you
-would not want to retype as a batch you can write again (one `records` list
-is one event), and mirror anything you must not lose, such as a QA tree's
-bugs and score, to a file at the end of a stretch. `tests/perf.py` and
-`tests/product.py` show the seeding shape.
+A world kept with `--world DIR` survives its process:
+
+```bash
+python3 x/eden --mount mcp --mount probe --extras-root $PWD/extras --port 8300 --world ~/worlds/team
+```
+
+The first run boots into the directory; every admitted event then saves
+the world as the root of its store, and the next run with the same
+`--world` resumes it in a few seconds with every record, cell, case and
+epoch it had, and the same port and mounts (pass them again or leave them
+off). A world booted without `--world` lives in a temporary directory and
+is gone with its process. The snapshot grows by kilobytes per event; the
+agent's `seen` epoch and plan carry over like everything else. Stop a
+world with Ctrl-C or SIGTERM to the launcher, which takes the runtime down
+with it; a kill of the runtime itself loses nothing admitted before it.
 
 ## Check it
 
