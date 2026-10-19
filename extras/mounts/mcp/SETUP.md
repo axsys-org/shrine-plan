@@ -99,7 +99,9 @@ the world as the root of its store, and the next run with the same
 epoch it had, and the same port and mounts (pass them again or leave them
 off). A world booted without `--world` lives in a temporary directory and
 is gone with its process. The snapshot grows by kilobytes per event; the
-agent's `seen` epoch and plan carry over like everything else. Stop a
+agent's `seen` epoch and plan carry over like everything else. The launcher
+writes `/agent/launcher/world` (`kept`, `directory`, `mounts`) at every
+boot, so an agent can ask which kind of world it is in. Stop a
 world with Ctrl-C or SIGTERM to the launcher, which takes the runtime down
 with it; a kill of the runtime itself loses nothing admitted before it.
 
