@@ -100,8 +100,17 @@ INT = re.compile(r'-?\d+$')
 DEC = re.compile(r'-?\d+\.\d+$')
 
 
+class Text(str):
+    """A text that looks like a number: written as {type: str}, read back as the same text, never a number."""
+
+
 def is_num(text):
-    return text is not None and INT.match(text) is not None
+    return text is not None and not isinstance(text, Text) and INT.match(text) is not None
+
+
+def as_text(s):
+    """What a text entry writes is a text, even when it looks like a number."""
+    return Text(s) if INT.match(s) or DEC.match(s) else s
 
 
 def slot_text(n, rel, slot):
@@ -127,7 +136,7 @@ def num_of(n, slot):
     """A slot's number: a natural at the record's or the slot's scale, or the decimal the world shows for a slot with its own
     scale (already the value), signed either way."""
     v = n['props'].get(slot)
-    if v is not None and DEC.match(v):
+    if v is not None and not isinstance(v, Text) and DEC.match(v):
         return Fraction(v)
     return Fraction(int(v), 10 ** scale_of(n, slot)) if is_num(v) else None
 
@@ -266,6 +275,290 @@ def record_at(tree, rel):
     return cur if cur.get('rec', True) and cur is not None else None
 
 
+# ============================================================================ expressions, from the spec
+# Slot names, scaled signed numbers, quoted text, + - * /, = != < <= > >=, and or not, in, parens, min max abs round len
+# lower upper trim contains starts ends; usual precedence (or < and < not < comparison < + - < * / < unary minus < atoms).
+# A slot the row lacks is a hole on that row; a bad expression is one fault with its position; division by zero and a
+# number against a text in arithmetic fault; expr beside the old settings faults.  Written from the spec, not from the Foil.
+class ExprError(Exception):
+    pass
+
+
+class Hole(Exception):
+    pass
+
+
+TOKEN = re.compile(r'\s*(?:(\d+(?:\.\d+)?)|("[^"]*"|\'[^\']*\')|([A-Za-z_][A-Za-z0-9_]*)|(!=|<=|>=|[-+*/=<>(),])|(.))')
+
+
+def expr_tokens(src):
+    out, i = [], 0
+    while i < len(src):
+        m = TOKEN.match(src, i)
+        if m.end() == i:
+            break
+        num, txt, ident, op, bad = m.groups()
+        pos = m.start(m.lastindex) if m.lastindex else i
+        if num:
+            out.append(('num', num, pos))
+        elif txt:
+            out.append(('txt', txt[1:-1], pos))
+        elif ident:
+            out.append(('id', ident, pos))
+        elif op:
+            out.append(('op', op, pos))
+        elif bad:
+            raise ExprError('expr: a value, not %s at %d' % (bad, pos))
+        i = m.end()
+    out.append(('end', '', len(src)))
+    return out
+
+
+def expr_parse(src):
+    """The expression as a tree: ('num', Fraction, scale) | ('txt', s) | ('bit', b) | ('slot', name) | ('un', op, a) |
+    ('bin', op, a, b) | ('call', f, [args]).  A bad expression raises ExprError with its position."""
+    toks = expr_tokens(src)
+    at = [0]
+
+    def peek():
+        return toks[at[0]]
+
+    def take():
+        t = toks[at[0]]
+        at[0] += 1
+        return t
+
+    def is_op(t, *ops):
+        return t[0] == 'op' and t[1] in ops
+
+    def is_word(t, w):
+        return t[0] == 'id' and t[1] == w
+
+    def p_or():
+        a = p_and()
+        while is_word(peek(), 'or'):
+            take()
+            a = ('bin', 'or', a, p_and())
+        return a
+
+    def p_and():
+        a = p_not()
+        while is_word(peek(), 'and'):
+            take()
+            a = ('bin', 'and', a, p_not())
+        return a
+
+    def p_not():
+        if is_word(peek(), 'not'):
+            take()
+            return ('un', 'not', p_not())
+        return p_cmp()
+
+    def p_cmp():
+        a = p_add()
+        t = peek()
+        if is_op(t, '=', '!=', '<', '<=', '>', '>=') or is_word(t, 'in'):
+            take()
+            return ('bin', t[1], a, p_add())
+        return a
+
+    def p_add():
+        a = p_mul()
+        while is_op(peek(), '+', '-'):
+            a = ('bin', take()[1], a, p_mul())
+        return a
+
+    def p_mul():
+        a = p_unary()
+        while is_op(peek(), '*', '/'):
+            a = ('bin', take()[1], a, p_unary())
+        return a
+
+    def p_unary():
+        if is_op(peek(), '-'):
+            take()
+            return ('un', '-', p_unary())
+        return p_primary()
+
+    def p_primary():
+        t = take()
+        kind, text, pos = t
+        if kind == 'num':
+            lit = literal(text)
+            return ('num', lit[0], lit[1])
+        if kind == 'txt':
+            return ('txt', text)
+        if kind == 'id':
+            if text in ('true', 'false'):
+                return ('bit', text == 'true')
+            if is_op(peek(), '('):
+                take()
+                args = []
+                if is_op(peek(), ')'):
+                    take()
+                    return ('call', text, args)
+                while True:
+                    args.append(p_or())
+                    nxt = take()
+                    if is_op(nxt, ')'):
+                        return ('call', text, args)
+                    if not is_op(nxt, ','):
+                        raise ExprError('expr: a comma or a closing paren at %d' % nxt[2])
+            return ('slot', text)
+        if is_op(t, '('):
+            a = p_or()
+            nxt = take()
+            if not is_op(nxt, ')'):
+                raise ExprError('expr: a closing paren at %d' % nxt[2])
+            return a
+        if kind == 'end':
+            raise ExprError('expr: a value, not the end at %d' % pos)
+        raise ExprError('expr: a value, not %s at %d' % (text, pos))
+    tree = p_or()
+    if peek()[0] != 'end':
+        raise ExprError('expr: unexpected %s at %d' % (peek()[1], peek()[2]))
+    return tree
+
+
+def expr_slots(tree):
+    """The slot names an expression reads."""
+    kind = tree[0]
+    if kind == 'slot':
+        return {tree[1]}
+    if kind == 'un':
+        return expr_slots(tree[2])
+    if kind == 'bin':
+        return expr_slots(tree[2]) | expr_slots(tree[3])
+    if kind == 'call':
+        return set().union(*(expr_slots(a) for a in tree[2])) if tree[2] else set()
+    return set()
+
+
+def expr_ops(tree):
+    """The operators and functions an expression uses (the matrix's columns)."""
+    kind = tree[0]
+    if kind == 'un':
+        return {tree[1] if tree[1] == 'not' else 'neg'} | expr_ops(tree[2])
+    if kind == 'bin':
+        return {tree[1]} | expr_ops(tree[2]) | expr_ops(tree[3])
+    if kind == 'call':
+        return {tree[1]}.union(*(expr_ops(a) for a in tree[2])) if tree[2] else {tree[1]}
+    return set()
+
+
+def shown_number(v, scale):
+    """A number as a read shows it: the magnitude at the scale, with a point when the scale is above zero, signed."""
+    m = fig(v, scale)
+    neg = m.startswith('-')
+    digits = m.lstrip('-').rjust(scale + 1, '0')
+    return ('-' if neg else '') + (digits[:-scale] + '.' + digits[-scale:] if scale else digits)
+
+
+def value_text(v):
+    if v[0] == 'num':
+        return shown_number(v[1], v[2])
+    if v[0] == 'txt':
+        return v[1]
+    return 'true' if v[1] else 'false'
+
+
+def expr_eval(tree, r, rel):
+    """A value at a row: ('num', Fraction, scale) | ('txt', text) | ('bit', bool).  A slot the row lacks raises Hole(name);
+    a type fault raises ExprError."""
+    kind = tree[0]
+    if kind == 'num':
+        return ('num', tree[1], tree[2])
+    if kind == 'txt':
+        return ('txt', tree[1])
+    if kind == 'bit':
+        return ('bit', tree[1])
+    if kind == 'slot':
+        slot = '/' + tree[1]
+        t = slot_text(r, rel, slot)
+        if t is None:
+            raise Hole(tree[1])
+        v = row_num(r, rel, slot)
+        if v is not None:
+            return ('num', v, scale_of(r, slot) if slot in r['props'] else 0)
+        if t in ('true', 'false'):
+            return ('bit', t == 'true')
+        return ('txt', t)
+    if kind == 'un':
+        a = expr_eval(tree[2], r, rel)
+        if tree[1] == '-':
+            if a[0] != 'num':
+                raise ExprError('a text or a boolean cannot be negated')
+            return ('num', -a[1], a[2])
+        if a[0] != 'bit':
+            raise ExprError('not needs a boolean')
+        return ('bit', not a[1])
+    if kind == 'bin':
+        op, a, b = tree[1], expr_eval(tree[2], r, rel), expr_eval(tree[3], r, rel)
+        nums = a[0] == 'num' and b[0] == 'num'
+        if op in '+-*/':
+            if not nums:
+                raise ExprError('arithmetic needs two numbers')
+            scale = max(a[2], b[2])
+            if op == '+':
+                return ('num', a[1] + b[1], scale)
+            if op == '-':
+                return ('num', a[1] - b[1], scale)
+            if op == '*':
+                return ('num', Fraction(fig(a[1] * b[1], scale)) / 10 ** scale, scale)
+            if b[1] == 0:
+                raise ExprError('division by zero')
+            return ('num', Fraction(fig(a[1] / b[1], scale)) / 10 ** scale, scale)
+        if op in ('<', '<=', '>', '>='):
+            if not nums:
+                raise ExprError('only numbers can be ordered')
+            return ('bit', {'<': a[1] < b[1], '<=': a[1] <= b[1], '>': a[1] > b[1], '>=': a[1] >= b[1]}[op])
+        if op in ('=', '!='):
+            same = (a[1] == b[1]) if nums or a[0] == b[0] else False
+            return ('bit', same if op == '=' else not same)
+        if op in ('and', 'or'):
+            if a[0] != 'bit' or b[0] != 'bit':
+                raise ExprError(op + ' needs two booleans')
+            return ('bit', (a[1] and b[1]) if op == 'and' else (a[1] or b[1]))
+        if op == 'in':
+            return ('bit', value_text(a) in value_text(b))
+        raise ExprError('unknown operator ' + op)
+    f, args = tree[1], [expr_eval(x, r, rel) for x in tree[2]]
+    two = f in ('min', 'max', 'contains', 'starts', 'ends', 'round')
+    if f not in ('min', 'max', 'abs', 'round', 'len', 'lower', 'upper', 'trim', 'contains', 'starts', 'ends'):
+        raise ExprError('unknown function ' + f)
+    if len(args) != (2 if two else 1):
+        raise ExprError(f + ' takes ' + ('two arguments' if two else 'one argument'))
+    if f in ('min', 'max'):
+        if args[0][0] != 'num' or args[1][0] != 'num':
+            raise ExprError(f + ' needs two numbers')
+        a, b = args
+        pick_ = a if ((a[1] <= b[1]) if f == 'min' else (a[1] >= b[1])) else b
+        return pick_
+    if f == 'round':
+        if args[0][0] != 'num' or args[1][0] != 'num':
+            raise ExprError('round needs a number and the places')
+        places = args[1][1]
+        if places.denominator != 1 or places < 0 or args[1][2] != 0:
+            raise ExprError('round takes a whole number of places')
+        places = int(places)
+        return ('num', Fraction(fig(args[0][1], places)) / 10 ** places, places)
+    if f == 'abs':
+        if args[0][0] != 'num':
+            raise ExprError('abs needs a number')
+        return ('num', abs(args[0][1]), args[0][2])
+    a = value_text(args[0])
+    if f == 'len':
+        return ('num', Fraction(len(a.encode())), 0)
+    if f == 'lower':
+        return ('txt', ascii_case(a, False))
+    if f == 'upper':
+        return ('txt', ascii_case(a, True))
+    if f == 'trim':
+        return ('txt', a.strip(''.join(chr(c) for c in range(33))))
+    b = value_text(args[1])
+    return ('bit', {'contains': b in a, 'starts': a.startswith(b), 'ends': a.endswith(b)}[f])
+
+
 # ============================================================================ the oracle: the standard cells
 DEFAULT_INTO = {'count': '/count', 'sum': '/total', 'min': '/min', 'max': '/max', 'avg': '/avg', 'any': '/any', 'all': '/all'}
 
@@ -273,7 +566,7 @@ DEFAULT_INTO = {'count': '/count', 'sum': '/total', 'min': '/min', 'max': '/max'
 def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
     """formula x params x input (at a care; None when the tack resolves to nothing) x views {name: (tree|None, care)}
     -> (output tree, or None for unknown) and the context': missing, fault, empty views, notes."""
-    ctx = {'missing': False, 'fault': False, 'empty': set(), 'notes': set()}
+    ctx = {'missing': False, 'fault': False, 'empty': set(), 'notes': set(), 'holes': set()}
     if inp is None:
         ctx['fault'] = True
         return None, ctx
@@ -351,6 +644,60 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
             return v > lit[0] if op in ('over', 'after') else v < lit[0]
         return op == 'contains' and value in t
 
+    def fault(why):
+        ctx['fault'] = True
+        return None, ctx
+
+    if formula in ('each', 'where', 'when', 'validate') and P('expr') is not None:
+        old = ('left', 'op', 'right') if formula == 'each' else ('key', 'value', 'op')
+        if any(P(k) is not None for k in old):
+            return fault('expr: not beside the old settings')
+        if formula in ('each', 'when') and P('into') is None:
+            return missing()
+        if formula == 'when' and P('then') is None:
+            return missing()
+        try:
+            tree = expr_parse(P('expr'))
+        except ExprError as e:
+            return fault(str(e))
+        into = P('into')
+        out = node(inp['props'], rec=inp['rec'])
+        for rel, r in R:
+            row = node(r['props'])
+            try:
+                v = expr_eval(tree, r, rel)
+            except Hole as h:
+                ctx['holes'].add(keyname('_'.join(rel)))        # a row's name in the context: its path joined by underscores
+                if formula == 'where':
+                    continue
+                if formula == 'validate':
+                    row['props']['/reason'] = str(h) + ' is absent'
+                place(out, rel, row)
+                continue
+            except ExprError as e:
+                return fault('expr: %s in row %s' % (e, key_of(rel)))
+            if formula == 'each':
+                if v[0] == 'num':
+                    put_fig(row, into, v[1], v[2])
+                elif v[0] == 'txt':
+                    row['props'][into] = as_text(v[1])
+                else:
+                    row['props'][into] = 'true' if v[1] else 'false'
+            elif v[0] != 'bit':
+                return fault('expr: %s needs a boolean in row %s' % (formula, key_of(rel)))
+            elif formula == 'where':
+                if not v[1]:
+                    continue
+            elif formula == 'validate':
+                if v[1]:
+                    continue
+                row['props']['/reason'] = as_text(P('reason') if P('reason') is not None else P('expr'))
+            elif v[1]:
+                row['props'][into] = P('then')
+            elif P('else') is not None:
+                row['props'][into] = P('else')
+            place(out, rel, row)
+        return out, ctx
     if formula == 'where':
         key, value, op = P('key'), P('value'), P('op') or 'equals'
         if key is None or value is None:
@@ -399,7 +746,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
         for rel, r in rows(out, care):
             texts = [t for t in (disp(r, rel, w) for w in wanted) if t is not None]
             if texts:
-                r['props'][into] = sep.join(texts)
+                r['props'][into] = as_text(sep.join(texts))
         return out, ctx
     if formula == 'match':
         key, value, op = P('key'), P('value'), P('op') or 'contains'
@@ -423,7 +770,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
             t = disp(r, rel, slot)
             if t is not None:
                 for i, part in enumerate(t.split(sep) if sep else [t], 1):
-                    r['props'][into + '/' + str(i)] = part
+                    r['props'][into + '/' + str(i)] = as_text(part)
         return out, ctx
     if formula == 'date':
         slot = P('slot')
@@ -740,11 +1087,11 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
             if t is None:
                 continue
             if formula == 'trim':
-                r['props'][into] = t.strip(''.join(chr(c) for c in range(33)))
+                r['props'][into] = as_text(t.strip(''.join(chr(c) for c in range(33))))
             elif formula == 'case':
-                r['props'][into] = ascii_case(t, P('to') == 'upper')
+                r['props'][into] = as_text(ascii_case(t, P('to') == 'upper'))
             elif formula == 'replace':
-                r['props'][into] = t.replace(P('find'), P('with') or '') if P('find') else t
+                r['props'][into] = as_text(t.replace(P('find'), P('with') or '') if P('find') else t)
             elif formula == 'length':
                 r['props'][into] = str(len(t.encode()))
             else:
@@ -882,7 +1229,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
                 continue
             # the pieces as rows 1, 2, 3 under the row's name; the row itself becomes the folder holding them
             for i, piece in enumerate(t.split(sep) if sep else [t], 1):
-                place(out, rel + (str(i),), node(dict(r['props'], **{slot: piece})))
+                place(out, rel + (str(i),), node(dict(r['props'], **{slot: as_text(piece)})))
         return out, ctx
     if formula == 'validate':
         key, op, value, reason = P('key'), P('op') or 'equals', P('value'), P('reason')
@@ -936,7 +1283,7 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
 # ============================================================================ coverage
 # What each entry consumes, by value kind of the slot it reads: natural, scaled, signed, text, boolean, reference, missing (a row
 # without the slot), date text; and by shape: empty (no rows), one (one row), cap (fifty rows or more).
-KINDS = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'empty', 'one', 'cap']
+KINDS = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext', 'empty', 'one', 'cap']
 NUMERIC = ['natural', 'scaled', 'signed', 'missing']
 TEXTUAL = ['text', 'reference', 'date', 'natural', 'missing']
 ROWS = ['empty', 'one', 'cap']
@@ -958,6 +1305,11 @@ for _f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since'):
     CONSUMES[_f] = ['natural', 'scaled', 'signed', 'missing']
 CONSUMES['pick'] = ['natural', 'text', 'missing']
 CONSUMES['put'] = []
+EXPR_ENTRIES = ('each:x', 'where:x', 'when:x', 'validate:x')
+for _f in EXPR_ENTRIES:
+    CONSUMES[_f] = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext'] + ROWS
+OPS = ['+', '-', '*', '/', 'neg', '=', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not', 'in',
+       'min', 'max', 'abs', 'round', 'len', 'lower', 'upper', 'trim', 'contains', 'starts', 'ends']
 SLOT_PARAMS = {'where': 'key', 'match': 'key', 'when': 'key', 'validate': 'key', 'unique': 'key', 'group': 'key', 'by': 'key', 'lookup': 'key',
                'except': 'key', 'intersect': 'key', 'diff': 'key',
                'reference': 'key', 'grid': 'row', 'each': 'left', 'add': 'left', 'subtract': 'left', 'multiply': 'left', 'divide': 'left',
@@ -967,6 +1319,8 @@ SLOT_PARAMS = {'where': 'key', 'match': 'key', 'when': 'key', 'validate': 'key',
 def value_kind(text):
     if text is None:
         return 'missing'
+    if isinstance(text, Text):
+        return 'numtext'
     if text.startswith('/h/'):
         return 'reference'
     if text in ('true', 'false'):
@@ -990,6 +1344,11 @@ def kinds_of(formula, params, inp, care):
     members = [((), inp)] if root_only else R
     key = params.get(SLOT_PARAMS.get(formula, 'slot'))
     slots = str(key).split() if key is not None else None
+    if formula.endswith(':x'):
+        try:
+            slots = ['/' + n for n in sorted(expr_slots(expr_parse(params.get('expr', ''))))] or None
+        except ExprError:
+            slots = None
     found = set()
     for rel, r in members:
         for slot in (slots or [k for k in r['props'] if not k.endswith('/scale')]):
@@ -1009,11 +1368,14 @@ class Coverage:
     def __init__(self):
         self.cells = {}
         self.chains = {}
+        self.ops = {}
 
-    def add(self, formula, kinds, care, pinned, viewed, depth):
+    def add(self, formula, kinds, care, pinned, viewed, depth, ops=()):
         for k in kinds:
             key = (formula, k, care, 'pinned' if pinned else 'live', 'view' if viewed else 'none')
             self.cells[key] = self.cells.get(key, 0) + 1
+        for op in ops:
+            self.ops[(formula, op)] = self.ops.get((formula, op), 0) + 1
         self.chains[(depth, care, 'view' if viewed else 'none')] = self.chains.get((depth, care, 'view' if viewed else 'none'), 0) + 1
 
     def wants(self, formula):
@@ -1026,6 +1388,8 @@ class Coverage:
         for d in ('x', 'y', 'z', 'pinned', 'live', 'view', 'none'):
             if d not in margins and not (root_only and d in ('y', 'z')) and not (needs_view and d == 'none'):
                 want.add(d)
+        if formula in EXPR_ENTRIES:
+            want |= {'op:' + op for op in OPS if (formula, op) not in self.ops}
         return want
 
     def report(self, strict):
@@ -1039,6 +1403,11 @@ class Coverage:
             zero += [(f, k) for k in CONSUMES[f] if by_kind[k] == 0]
             zero += [(f, d) for d in margins if margins[d] == 0 and not (f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'pick', 'put') and d in ('y', 'z'))
                      and not (f in ('lookup', 'except', 'intersect', 'diff', 'reference', 'follow') and d == 'none')]
+        print('| expr entry | ' + ' | '.join(OPS) + ' |')
+        print('|---|' + '---|' * len(OPS))
+        for f in EXPR_ENTRIES:
+            print('| %s | %s |' % (f, ' | '.join(str(self.ops.get((f, op), 0)) for op in OPS)))
+            zero += [(f, op) for op in OPS if self.ops.get((f, op), 0) == 0]
         fine = sum(1 for f in CONSUMES for k in CONSUMES[f] for c in 'xyz' for p in ('pinned', 'live') for v in ('view', 'none')
                    if self.cells.get((f, k, c, p, v), 0) == 0)
         total = sum(len(CONSUMES[f]) * 12 for f in CONSUMES)
@@ -1092,7 +1461,9 @@ def unrender(rendered):
     out = {}
     for k, v in rendered.items():
         k = k.lstrip('/')
-        if is_num(v):
+        if isinstance(v, Text):
+            out[k] = {'type': 'str', 'value': str(v)}
+        elif is_num(v):
             out[k] = int(v)
         elif DEC.match(v):
             out[k] = float(v)
@@ -1165,6 +1536,8 @@ class Gen:
                 p['/d'] = '%d-%02d-%02d' % (rng.randint(1990, 2026), rng.randint(1, 12), rng.randint(1, 28))
             if self.coin(0.2):
                 p['/ok'] = text(self.coin())
+            if self.coin(0.15):
+                p['/code'] = Text(str(rng.randint(10, 99)))
             if self.coin(0.15):
                 for slot in list(p):
                     if slot in ('/n', '/t', '/amount', '/region') and self.coin():
@@ -1564,6 +1937,95 @@ class Gen:
         return p
 
 
+def gen_expr(g, f, inp, care, wants):
+    """A random expression for one of the four entries: a boolean for where, when and validate, anything for each; the
+    operators and functions the entry has not met yet (wants, as op:<name>) come first."""
+    rng, pick = g.rng, g.rng.choice
+    R = rows(inp, care) or [((), inp)]
+
+    def slots(test):
+        return sorted({k[1:] for _, r in R for k, v in r['props'].items() if '/' not in k[1:] and not k.endswith('/scale') and test(k, v)})
+    nums = slots(lambda k, v: is_num(v) or (not isinstance(v, Text) and DEC.match(v) is not None)) or ['n']
+    texts = slots(lambda k, v: not is_num(v) and v not in ('true', 'false') and not DEC.match(v)) or ['t']
+    bools = slots(lambda k, v: v in ('true', 'false'))
+    wanted = [w[3:] for w in wants if w.startswith('op:')]
+
+    def want(*ops):
+        """A wanted operator of these, taken once."""
+        hits = [op for op in wanted if op in ops]
+        if not hits:
+            return None
+        op = pick(hits)
+        wanted.remove(op)
+        return op
+
+    def lit():
+        return pick([str(rng.randint(0, 9)), str(rng.randint(1, 60)), str(rng.randint(1, 9)) + '.5', str(rng.randint(10, 99)) + '.25'])
+
+    def num(depth=0):
+        op = want('+', '-', '*', '/', 'neg', 'min', 'max', 'abs', 'round', 'len') if depth < 2 else None
+        if op in ('+', '-', '*', '/'):
+            return '%s %s %s' % (num(depth + 1), op, num(depth + 1))
+        if op == 'neg':
+            return '-' + num(depth + 1)
+        if op in ('min', 'max'):
+            return '%s(%s, %s)' % (op, num(depth + 1), num(depth + 1))
+        if op == 'abs':
+            return 'abs(%s)' % num(depth + 1)
+        if op == 'round':
+            return 'round(%s, %d)' % (num(depth + 1), rng.randint(0, 2))
+        if op == 'len':
+            return 'len(%s)' % txt(depth + 1)
+        r = rng.random()
+        if depth > 1 or r < 0.4:
+            return pick([pick(nums), pick(nums), lit(), '-' + pick(nums)])
+        if r < 0.75:
+            return '%s %s %s' % (num(depth + 1), pick(['+', '-', '*', '/']), num(depth + 1))
+        return pick(['min(%s, %s)' % (num(depth + 1), num(depth + 1)), 'max(%s, %s)' % (num(depth + 1), lit()), 'abs(%s)' % num(depth + 1),
+                     'round(%s, %d)' % (num(depth + 1), rng.randint(0, 2)), 'len(%s)' % txt(depth + 1), '(%s)' % num(depth + 1)])
+
+    def txt(depth=0):
+        op = want('lower', 'upper', 'trim') if depth < 2 else None
+        if op:
+            return '%s(%s)' % (op, txt(depth + 1))
+        r = rng.random()
+        if depth > 1 or r < 0.6:
+            return pick([pick(texts), pick(texts), "'" + pick(TEXT) + "'", "'e'"])
+        return '%s(%s)' % (pick(['lower', 'upper', 'trim']), txt(depth + 1))
+
+    def bit(depth=0):
+        op = want('=', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not', 'in', 'contains', 'starts', 'ends') if depth < 2 else None
+        if op in ('=', '!=', '<', '<=', '>', '>='):
+            return '%s %s %s' % (num(depth + 1), op, num(depth + 1)) if op not in ('=', '!=') or g.coin() else '%s %s %s' % (txt(depth + 1), op, txt(depth + 1))
+        if op in ('and', 'or'):
+            return '%s %s %s' % (bit(depth + 1), op, bit(depth + 1))
+        if op == 'not':
+            return 'not %s' % bit(depth + 1)
+        if op == 'in':
+            return '%s in %s' % (txt(depth + 1), txt(depth + 1))
+        if op in ('contains', 'starts', 'ends'):
+            return '%s(%s, %s)' % (op, txt(depth + 1), txt(depth + 1))
+        if depth < 2 and any(w in wanted for w in ('+', '-', '*', '/', 'neg', 'min', 'max', 'abs', 'round', 'len')):
+            return '%s %s %s' % (num(depth + 1), pick(['<', '<=', '>', '>=', '=', '!=']), num(depth + 1))
+        if depth < 2 and any(w in wanted for w in ('lower', 'upper', 'trim')):
+            return '%s = %s' % (txt(depth + 1), txt(depth + 1))
+        r = rng.random()
+        if depth > 1 or r < 0.5:
+            return pick(['%s %s %s' % (num(2), pick(['<', '<=', '>', '>=', '=', '!=']), num(2)), '%s = %s' % (txt(2), txt(2)),
+                         '%s in %s' % (txt(2), txt(2)), '%s(%s, %s)' % (pick(['contains', 'starts', 'ends']), txt(2), txt(2))] + (bools + ['true']) * (1 if bools else 0))
+        if r < 0.8:
+            return '%s %s %s' % (bit(depth + 1), pick(['and', 'or']), bit(depth + 1))
+        return 'not %s' % bit(depth + 1)
+    if f == 'each':
+        if any(op in wanted for op in ('=', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not', 'in', 'contains', 'starts', 'ends')):
+            return bit()
+        if any(op in wanted for op in ('lower', 'upper', 'trim')):
+            return txt()
+        choice = rng.random()
+        return num() if choice < 0.5 else txt() if choice < 0.75 else bit()
+    return bit()
+
+
 def view_rows_of(views, name):
     v = views.get(name)
     return [] if v is None or v[0] is None else rows(v[0], v[1])
@@ -1599,6 +2061,9 @@ def inject(g, shape, wants):
         elif kind == 'boolean' and pairs:
             flag = text(g.coin())
             both(rng.choice(pairs), lambda p: p.__setitem__('/ok', flag))
+        elif kind == 'numtext' and pairs:
+            code = Text(str(rng.randint(10, 99)))
+            both(rng.choice(pairs), lambda p: p.__setitem__('/code', code))
         elif kind == 'signed':
             for pair in ([rng.choice(pairs)] if pairs else []) + ([root_pair] if root_pair else []):
                 v = str(-rng.randint(1, 99))
@@ -1614,12 +2079,20 @@ def gen_case(g, i, home):
     rng = g.rng
     base = home + '/d/' + str(i)
     # the first entry is drawn first; what it still lacks in the coverage matrix steers the shape, care, pinning and views
+    def wanting(f):
+        return len(g.coverage.wants(f)) + (len(g.coverage.wants(f + ':x')) if f in ('each', 'where', 'when', 'validate') else 0)
     first = rng.choice(FORMULAS)
     if g.coverage is not None:
-        first = max((rng.choice(FORMULAS) for _ in range(3)), key=lambda f: len(g.coverage.wants(f)))
-    wants = g.coverage.wants(first) if g.coverage is not None else set()
+        first = max((rng.choice(FORMULAS) for _ in range(6)), key=wanting)
+    expr_first = first in ('each', 'where', 'when', 'validate') and g.coin(0.5)
+    wants = set()
+    if g.coverage is not None:
+        if first in ('each', 'where', 'when', 'validate'):
+            old, new = g.coverage.wants(first), g.coverage.wants(first + ':x')
+            expr_first = g.coin(0.5) if (old and new) or not (old or new) else bool(new)
+        wants = g.coverage.wants(first + ':x' if expr_first else first)
     kind = ('wide' if 'cap' in wants else 'one' if 'one' in wants else 'empty' if 'empty' in wants else
-            rng.choice(['table', 'list', 'map']) if wants & {'date', 'reference', 'boolean', 'missing', 'scaled', 'signed'} else
+            rng.choice(['table', 'list', 'map']) if wants & {'date', 'reference', 'boolean', 'missing', 'scaled', 'signed', 'numtext'} else
             rng.choice(SHAPES))
     if i % WIDE_EVERY == 0:
         kind = 'wide'
@@ -1646,7 +2119,7 @@ def gen_case(g, i, home):
     inp = at(prim, care, pinned)
     cells = []
     for step in range(depth):
-        f = first if step == 0 else rng.choice(FORMULAS)
+        f = first if step == 0 else (max((rng.choice(FORMULAS) for _ in range(3)), key=wanting) if g.coverage is not None else rng.choice(FORMULAS))
         needs = {'lookup': 'table', 'except': 'other', 'intersect': 'other', 'diff': 'other', 'reference': 'table', 'follow': 'table'}.get(f)
         if needs and len(shapes) == 1 and g.coin(0.8):
             shapes.append(g.shape(rng.choice(SHAPES), base + '/v1'))
@@ -1688,21 +2161,52 @@ def gen_case(g, i, home):
                         path = target_shape['path'] + '/' + '/'.join(trel)
                         r0['props']['/ref'] = r1['props']['/ref'] = '/h/x/0/' + str(len(path.strip('/').split('/'))) + path
                 inp = at(prim, care, tack.get('pinned', False)) if tack['kind'] == 'shape' else inp
-        params = g.params(f, inp if inp is not None else node(), care, view_trees, wants if step == 0 else frozenset())
-        if bad == 'omit' and REQUIRED.get(f):
+                # the views were cut before the references landed: cut them again, so a view of the same shape carries them
+                for name, v in views.items():
+                    if v['kind'] != 'bad':
+                        view_trees[name] = (at(shapes[v['shape']], v['care'], v['pinned']), v['care'])
+        expr_mode = f in ('each', 'where', 'when', 'validate') and (expr_first if step == 0 else
+                                                                   (len(g.coverage.wants(f + ':x')) > len(g.coverage.wants(f)) if g.coverage is not None else g.coin(0.5)))
+        if expr_mode:
+            step_wants = wants if step == 0 else (g.coverage.wants(f + ':x') if g.coverage is not None else frozenset())
+            params = {'expr': gen_expr(g, f, inp if inp is not None else node(), care, step_wants)}
+            if f in ('each', 'when'):
+                params['into'] = '/v'
+            if f == 'when':
+                params['then'] = rng.choice([g.word(), str(rng.randint(1, 9))])
+                if g.coin(0.7):
+                    params['else'] = g.word()
+            if f == 'validate' and g.coin(0.3):
+                params['reason'] = 'bad row'
+            if bad == 'badslot':
+                params['expr'] = params['expr'] + ' +'          # a bad expression: one fault with its position
+            elif bad == 'wrongkind':
+                params['key'] = '/n'                            # expr beside the old settings: a fault
+            elif bad == 'omit' and f in ('each', 'when'):
+                params.pop('into')
+        else:
+            params = g.params(f, inp if inp is not None else node(), care, view_trees, wants if step == 0 else frozenset())
+        if bad == 'omit' and REQUIRED.get(f) and not expr_mode:
             params.pop(rng.choice(REQUIRED[f]), None)
-        elif bad == 'badslot':
+        elif bad == 'badslot' and not expr_mode:
             slotty = [k for k in params if k in ('slot', 'key', 'left', 'right', 'from', 'take', 'match', 'row', 'col') and str(params[k]).startswith('/')]
             if slotty:
                 params[rng.choice(slotty)] = '/nope'
-        elif bad == 'wrongkind':
+        elif bad == 'wrongkind' and not expr_mode:
             if f in ('add', 'subtract', 'multiply', 'divide', 'round', 'since', 'sum', 'min', 'max', 'avg', 'sort', 'top') and 'slot' in params or 'left' in params:
                 texts = [s for s, v in (inp or node())['props'].items() if not is_num(v)] or ['/t']
                 params['slot' if 'slot' in params else 'left'] = rng.choice(texts)
         view_paths = {name: shapes[v['shape']]['path'] for name, v in views.items() if v['kind'] == 'shape'}
         expect = evaluate(f, params, inp, care, view_trees, view_paths=view_paths)
         if g.coverage is not None:
-            g.coverage.add(f, kinds_of(f, params, inp, care), care, tack.get('pinned', False), bool(views), step + 1)
+            entry = f + ':x' if expr_mode else f
+            ops = set()
+            if expr_mode:
+                try:
+                    ops = expr_ops(expr_parse(params['expr']))
+                except ExprError:
+                    pass
+            g.coverage.add(entry, kinds_of(entry, params, inp, care), care, tack.get('pinned', False), bool(views), step + 1, ops)
         cells.append({'path': home + '/c/' + str(i) + '/s' + str(step), 'formula': f, 'params': params, 'tack': tack, 'views': views,
                       'care': care, 'expect': expect, 'bad': bad, 'nviews': len(views)})
         care = rng.choice('xyz')
@@ -1816,7 +2320,8 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
     def ctx_of(props):
         return {'missing': '/sys/view/missing' in props, 'fault': '/sys/view/fault' in props,
                 'empty': {k[len('/sys/view/empty/'):] for k in props if k.startswith('/sys/view/empty/')},
-                'notes': {k[len('/sys/view/note/'):] for k in props if k.startswith('/sys/view/note/')}}
+                'notes': {k[len('/sys/view/note/'):] for k in props if k.startswith('/sys/view/note/')},
+                'holes': {k[len('/sys/view/hole/'):] for k in props if k.startswith('/sys/view/hole/')}}
 
     def mismatch(case, cell, what, got, want):
         mismatches.append((cell['formula'], case['kind'], cell['care'], what))
