@@ -434,6 +434,31 @@ def expr_slots(tree):
     return set()
 
 
+def expr_size(tree):
+    """(terms, and-links) of an expression: its leaves, and how many and operators it chains."""
+    kind = tree[0]
+    if kind in ('num', 'txt', 'bit', 'slot'):
+        return 1, 0
+    if kind == 'un':
+        return expr_size(tree[2])
+    if kind == 'bin':
+        a, b = expr_size(tree[2]), expr_size(tree[3])
+        return a[0] + b[0], a[1] + b[1] + (1 if tree[1] == 'and' else 0)
+    sizes = [expr_size(x) for x in tree[2]]
+    return sum(t for t, _ in sizes) or 1, sum(c for _, c in sizes)
+
+
+def paren_depth(src):
+    depth = best = 0
+    for ch in src:
+        if ch == '(':
+            depth += 1
+            best = max(best, depth)
+        elif ch == ')':
+            depth -= 1
+    return best
+
+
 def expr_ops(tree):
     """The operators and functions an expression uses (the matrix's columns)."""
     kind = tree[0]
@@ -1283,7 +1308,8 @@ def evaluate(formula, params, inp, care, views, stamp=None, view_paths=None):
 # ============================================================================ coverage
 # What each entry consumes, by value kind of the slot it reads: natural, scaled, signed, text, boolean, reference, missing (a row
 # without the slot), date text; and by shape: empty (no rows), one (one row), cap (fifty rows or more).
-KINDS = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext', 'empty', 'one', 'cap']
+KINDS = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext', 'utf8', 'empty', 'one', 'cap']
+UTF8 = ['Zoë', ' Ångström ', 'naïve-café', 'Łódź', 'Ærø', 'façade']
 NUMERIC = ['natural', 'scaled', 'signed', 'missing']
 TEXTUAL = ['text', 'reference', 'date', 'natural', 'missing']
 ROWS = ['empty', 'one', 'cap']
@@ -1307,7 +1333,9 @@ CONSUMES['pick'] = ['natural', 'text', 'missing']
 CONSUMES['put'] = []
 EXPR_ENTRIES = ('each:x', 'where:x', 'when:x', 'validate:x')
 for _f in EXPR_ENTRIES:
-    CONSUMES[_f] = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext'] + ROWS
+    CONSUMES[_f] = ['natural', 'scaled', 'signed', 'text', 'boolean', 'reference', 'missing', 'date', 'numtext', 'utf8'] + ROWS
+for _f in ('lower', 'upper', 'trim', 'length', 'split', 'match'):
+    CONSUMES[_f if _f not in ('lower', 'upper') else 'case'] = CONSUMES[_f if _f not in ('lower', 'upper') else 'case'] + ['utf8']
 OPS = ['+', '-', '*', '/', 'neg', '=', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not', 'in',
        'min', 'max', 'abs', 'round', 'len', 'lower', 'upper', 'trim', 'contains', 'starts', 'ends']
 SLOT_PARAMS = {'where': 'key', 'match': 'key', 'when': 'key', 'validate': 'key', 'unique': 'key', 'group': 'key', 'by': 'key', 'lookup': 'key',
@@ -1321,6 +1349,8 @@ def value_kind(text):
         return 'missing'
     if isinstance(text, Text):
         return 'numtext'
+    if any(ord(c) > 127 for c in text):
+        return 'utf8'
     if text.startswith('/h/'):
         return 'reference'
     if text in ('true', 'false'):
@@ -1369,6 +1399,24 @@ class Coverage:
         self.cells = {}
         self.chains = {}
         self.ops = {}
+        self.long = {'eight terms or more': 0, 'three paren levels': 0, 'and chains of three or more': 0, 'expressions': 0}
+
+    def note_expr(self, src):
+        try:
+            tree = expr_parse(src)
+        except ExprError:
+            return
+        terms, ands = expr_size(tree)
+        self.long['expressions'] += 1
+        self.long['eight terms or more'] += terms >= 8
+        self.long['three paren levels'] += paren_depth(src) >= 3
+        self.long['and chains of three or more'] += ands >= 3
+
+    def filled(self):
+        total = sum(len(CONSUMES[f]) * 12 for f in CONSUMES)
+        fine = sum(1 for f in CONSUMES for k in CONSUMES[f] for c in 'xyz' for p in ('pinned', 'live') for v in ('view', 'none')
+                   if self.cells.get((f, k, c, p, v), 0) == 0)
+        return total - fine, total
 
     def add(self, formula, kinds, care, pinned, viewed, depth, ops=()):
         for k in kinds:
@@ -1408,12 +1456,11 @@ class Coverage:
         for f in EXPR_ENTRIES:
             print('| %s | %s |' % (f, ' | '.join(str(self.ops.get((f, op), 0)) for op in OPS)))
             zero += [(f, op) for op in OPS if self.ops.get((f, op), 0) == 0]
-        fine = sum(1 for f in CONSUMES for k in CONSUMES[f] for c in 'xyz' for p in ('pinned', 'live') for v in ('view', 'none')
-                   if self.cells.get((f, k, c, p, v), 0) == 0)
-        total = sum(len(CONSUMES[f]) * 12 for f in CONSUMES)
+        reached, total = self.filled()
         print('chains (depth, care, view): ' + ', '.join('%s=%d' % (k, n) for k, n in sorted(self.chains.items())))
+        print('long expressions: ' + ', '.join('%s=%d' % (k, n) for k, n in self.long.items()))
         print('coverage: %d entry-kind cells, %d zero; %d of %d fine cells (entry x kind x care x pinned x view) filled' % (
-            sum(len(CONSUMES[f]) for f in CONSUMES), len(zero), total - fine, total))
+            sum(len(CONSUMES[f]) for f in CONSUMES), len(zero), reached, total))
         if zero:
             print('ZERO COVERAGE', zero)
         if strict and zero:
@@ -1538,6 +1585,8 @@ class Gen:
                 p['/ok'] = text(self.coin())
             if self.coin(0.15):
                 p['/code'] = Text(str(rng.randint(10, 99)))
+            if self.coin(0.1):
+                p['/name'] = rng.choice(UTF8)
             if self.coin(0.15):
                 for slot in list(p):
                     if slot in ('/n', '/t', '/amount', '/region') and self.coin():
@@ -1778,13 +1827,13 @@ class Gen:
             if self.coin(0.3):
                 p['into'] = '/full'
         elif f == 'match':
-            p['key'], p['value'] = pick(rowt + (rown if 'natural' in wants else [])), pick(['e', 'o', 'st', 'th', 'a', 'west', 'z', '1'])
+            p['key'], p['value'] = pick(rowt + (rown if 'natural' in wants else [])), pick(['e', 'o', 'st', 'th', 'a', 'west', 'z', '1', 'ë', 'Ło', 'é'])
             if self.coin():
                 p['op'] = pick(['contains', 'starts', 'ends'])
         elif f == 'split':
             p['slot'] = pick(rowt + (rown if 'natural' in wants else []))
             if self.coin():
-                p['with'] = pick(['-', 'e', 'o', ' '])
+                p['with'] = pick(['-', 'e', 'o', ' ', 'ë', 'ç'])
             if self.coin(0.3):
                 p['into'] = '/part'
         elif f == 'date':
@@ -2016,6 +2065,30 @@ def gen_expr(g, f, inp, care, wants):
         if r < 0.8:
             return '%s %s %s' % (bit(depth + 1), pick(['and', 'or']), bit(depth + 1))
         return 'not %s' % bit(depth + 1)
+    def long_num(level=0):
+        """Four to eight terms with parens up to three levels deep."""
+        parts = []
+        for _ in range(rng.randint(4, 8) if level == 0 else rng.randint(2, 3)):
+            if level < 3 and g.coin(0.35):
+                parts.append('(' + long_num(level + 1) + ')')
+            else:
+                parts.append(pick([pick(nums), pick(nums), lit()]))
+        if level == 0 and g.coin(0.5):
+            parts[0] = '(%s + (%s * (%s - %s)))' % (pick(nums), pick(nums), lit(), pick(nums))     # three levels, on purpose
+        out = parts[0]
+        for part in parts[1:]:
+            out += ' ' + pick(['+', '-', '*', '/', '+']) + ' ' + part
+        return out
+
+    def long_bit():
+        """A chain of three to five comparisons joined by and (one or, sometimes)."""
+        parts = [bit(2) for _ in range(rng.randint(3, 5))]
+        out = parts[0]
+        for part in parts[1:]:
+            out += (' or ' if g.coin(0.15) else ' and ') + part
+        return out
+    if not wanted and g.coin(0.2):
+        return long_num() if f == 'each' and g.coin(0.6) else long_bit()
     if f == 'each':
         if any(op in wanted for op in ('=', '!=', '<', '<=', '>', '>=', 'and', 'or', 'not', 'in', 'contains', 'starts', 'ends')):
             return bit()
@@ -2064,6 +2137,10 @@ def inject(g, shape, wants):
         elif kind == 'numtext' and pairs:
             code = Text(str(rng.randint(10, 99)))
             both(rng.choice(pairs), lambda p: p.__setitem__('/code', code))
+        elif kind == 'utf8' and pairs:
+            # one row with multi-byte names in its slots: the text entries are byte-level, and this is where it shows
+            name = rng.choice(UTF8)
+            both(rng.choice(pairs), lambda p: p.__setitem__('/name', name))
         elif kind == 'signed':
             for pair in ([rng.choice(pairs)] if pairs else []) + ([root_pair] if root_pair else []):
                 v = str(-rng.randint(1, 99))
@@ -2092,7 +2169,7 @@ def gen_case(g, i, home):
             expr_first = g.coin(0.5) if (old and new) or not (old or new) else bool(new)
         wants = g.coverage.wants(first + ':x' if expr_first else first)
     kind = ('wide' if 'cap' in wants else 'one' if 'one' in wants else 'empty' if 'empty' in wants else
-            rng.choice(['table', 'list', 'map']) if wants & {'date', 'reference', 'boolean', 'missing', 'scaled', 'signed', 'numtext'} else
+            rng.choice(['table', 'list', 'map']) if wants & {'date', 'reference', 'boolean', 'missing', 'scaled', 'signed', 'numtext', 'utf8'} else
             rng.choice(SHAPES))
     if i % WIDE_EVERY == 0:
         kind = 'wide'
@@ -2202,6 +2279,7 @@ def gen_case(g, i, home):
             entry = f + ':x' if expr_mode else f
             ops = set()
             if expr_mode:
+                g.coverage.note_expr(params['expr'])
                 try:
                     ops = expr_ops(expr_parse(params['expr']))
                 except ExprError:
@@ -2441,6 +2519,8 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
             for k, (case, cell, _, _) in enumerate(amends):
                 compare_cell(case, cell, *answers[4 * k:4 * k + 4])
         print('cases', min(cases, start + group), 'cells', sum(v[0] for v in stats.values()), 'mismatches', len(mismatches), 'elapsed %.1fs' % (time.perf_counter() - started), flush=True)
+        if (start + group) % 500 == 0:
+            print('matrix at %d cases: %d of %d fine cells reached' % (start + group, *g.coverage.filled()), flush=True)
 
     wall = time.perf_counter() - started
     print('| formula | primary shape | 0 views | 1 view | 2 views | cells | failed |')
