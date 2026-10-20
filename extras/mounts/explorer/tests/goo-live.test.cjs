@@ -317,3 +317,33 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   assert.match(el2.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'on the QA folder the QA write is drawn');
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
 });
+
+// ---- clickable paths and the person's cursor
+test('a record path in an action links to its folder and a reference links to itself; both carry the path the click writes', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, false));
+  const html = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.match(html, /<a class="p go" href="\?views=\/0x11\/user\/org\/deals" data-go="0x11\/user\/org\/deals\/d5" data-folder="0x11\/user\/org\/deals">0x11\/user\/org\/deals\/d5<\/a>/);
+  const grid = slotLayout({manager: '-> 0x11/user/org/members/bob', total: '-> /x/0x11/user/org/views/payroll @ 4'});
+  assert.ok(grid.includes('<span class="sv-v ref" data-path="0x11/user/org/members/bob"><a class="r go" href="?views=/0x11/user/org/members/bob" data-go="0x11/user/org/members/bob" data-folder="0x11/user/org/members/bob">-> 0x11/user/org/members/bob</a></span>'), grid);
+  assert.match(grid, /data-go="0x11\/user\/org\/views\/payroll" data-folder="0x11\/user\/org\/views\/payroll"/, 'a cell reference drops its /x and keeps its pin in the text');
+  assert.equal(adapt.folderOf('0x11/user/org/deals/d5'), '0x11/user/org/deals');
+  assert.equal(adapt.folderOf('0x11'), '0x11', 'a node has no folder above it');
+});
+
+test('a click writes the person\'s cursor under the node\'s /agent/person, signed person, then moves the page', async () => {
+  const m = fakeMcp(() => ({records: [{path: '/0x11/agent/person/cursor'}]}));
+  const s = mcpSource({fetch: m.fetch, EventSource: null});
+  await s.cursor('0x11/user/org/deals/d5');
+  assert.deepEqual(m.calls[0], {url: '/mcp', name: 'mcp/write', args: {who: 'person', records: [{path: '/0x11/agent/person/cursor', slots: {path: '/0x11/user/org/deals/d5'}}]}});
+  const {mountViewer} = live;
+  const flipped = [], written = [];
+  const v = mountViewer(fakeEl(), {...viewerSource(), async cursor(p) { written.push(p); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v.go('0x11/user/org/deals/d5', '0x11/user/org/deals');
+  assert.deepEqual([written, flipped], [['0x11/user/org/deals/d5'], ['0x11/user/org/deals']], 'the cursor is written before the page moves');
+  const v2 = mountViewer(fakeEl(), {...viewerSource(), async cursor() { throw new Error('world away'); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v2.go('0x11/user/org/deals', '0x11/user/org/deals');
+  assert.equal(flipped.length, 2, 'a refused cursor write still moves the page');
+});
