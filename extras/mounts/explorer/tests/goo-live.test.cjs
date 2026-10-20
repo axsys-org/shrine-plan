@@ -392,3 +392,8 @@ test('referencedBy reads the page folder and /agent with the referencing knob; t
   assert.match(html, /<div class="sv-refby crew">.*<span class="s">crew, z<\/span>/);
   assert.equal(live.referencedHTML({matches: [], watchers: []}), '');
 });
+
+test('a year or a day is drawn as written; a quantity is grouped', () => {
+  const html = slotLayout({year: 2005, day: 20041101, amount: 12500, n: 7});
+  assert.match(html, /<span class="sv-v">2005<\/span>/); assert.match(html, /<span class="sv-v">20041101<\/span>/); assert.match(html, /<span class="sv-v">12,500<\/span>/);
+});
