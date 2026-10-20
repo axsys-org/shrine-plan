@@ -15,38 +15,17 @@ OpenAI-compatible endpoint (ollama at 127.0.0.1:11434, model llama3.2); --model 
 OPENROUTER_API_KEY or OPENAI_API_KEY in the environment is sent as a bearer when set. --fake answers without a
 model (a deterministic summary of the input), for tests. Where the hand left off is /agent/hands/ask/seen {epoch}.
 """
-import argparse
 import importlib.util
 import json
 import os
-import sys
-import time
 import urllib.request
 
-_spec = importlib.util.spec_from_file_location('stream_hand', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream.py'))
-_stream = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_stream)
-stream_follow, stream_poll = _stream.follow, _stream.poll
+_base = importlib.util.spec_from_file_location('hand_base', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand.py'))
+_hand = importlib.util.module_from_spec(_base); _base.loader.exec_module(_hand)
+World, Hand, stream_poll = _hand.World, _hand.Hand, _hand.stream_poll
 
 DEFAULT_ENDPOINT = 'http://127.0.0.1:11434/v1/chat/completions'
 DEFAULT_MODEL = 'llama3.2'
-
-
-class World:
-    def __init__(self, base, node, timeout=120):
-        self.base, self.node, self.timeout, self.seq = base, node, timeout, 0
-
-    def tool(self, name, **arguments):
-        self.seq += 1
-        body = json.dumps(dict(jsonrpc='2.0', id=self.seq, method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json'})
-        reply = json.load(urllib.request.urlopen(req, timeout=self.timeout))
-        result = reply.get('result') or {}
-        if 'error' in reply or result.get('isError'):
-            raise RuntimeError(json.dumps(reply)[:300])
-        return result['structuredContent']
-
-    def read(self, path, care='x', **more):
-        return self.tool('read', path=path, care=care, **more)
 
 
 def live(path, care='y'):
@@ -96,115 +75,81 @@ def call_model(endpoint, model, prompt, lines, timeout=120):
     return reply['choices'][0]['message']['content'].strip()
 
 
-class Hand:
+class AskHand(Hand):
+    """The ask hand on the base: line() learns the ask cells a line wrote and answers what is asking; tick() catches
+    up and answers everything pending."""
+    name = 'ask'
+    every = 30.0
+
     def __init__(self, world, model=None, endpoint=None, fake=False, log=print):
-        self.w, self.fake, self.log = world, fake, log
-        home = '/' + world.node + '/agent/hands/ask'
-        self.home = home
-        config = self.w.read(home, 'x').get('properties') or {}
-        self.model = model or config.get('/model') or DEFAULT_MODEL
-        self.endpoint = endpoint or config.get('/endpoint') or DEFAULT_ENDPOINT
-        seen = self.w.read(home + '/seen', 'x').get('properties') or {}
-        # A first run (no seen record) starts from epoch 0 and walks the whole log once in discover(), so an ask
-        # written before the hand existed is answered. Cost: one history page of 40 per 40 non-system events, about
-        # 60 ms a page with x on this build (system events are hidden by default, so a fresh world is one page);
-        # a world with ten thousand events is 250 pages, about 15 s, once. After that the seen record is written
-        # and every later run starts from it.
-        self.seen = int(seen.get('/epoch') or 0)
+        super().__init__(world, log=log, model=model, endpoint=endpoint)
+        self.fake = fake
+        self.model = self.setting('model') or DEFAULT_MODEL
+        self.endpoint = self.setting('endpoint') or DEFAULT_ENDPOINT
         self.asks = {}          # cell path -> (input path, care)
         self.ask_ref = next(c['reference'] for c in self.w.read('/' + world.node + '/weft/stdlib', 'y', limit=100)['children'] if c['path'].endswith('/ask'))
         self.ask_key = self.ask_ref.split('/', 5)[-1]      # the stdlib path without its case: a cell pins any case of it
-
-    def epoch(self):
-        with urllib.request.urlopen(self.w.base + '/probe/read?path=/' + self.w.node, timeout=self.w.timeout) as r:
-            return int(json.load(r).get('epoch') or 0)
 
     def is_ask(self, props):
         weft = props.get('/sys/weft') or ''
         return weft.endswith('/weft/stdlib/ask') or weft.split('/', 5)[-1:] == [self.ask_key]
 
-    def handle(self, line):
-        """One stream line (or one history item shaped like it): learn the ask cells it wrote, note what changed."""
-        if 'epoch' in line:
-            self.seen = max(self.seen, line['epoch'])
-        changed = set()
+    def learn(self, line):
+        """The ask cells a line wrote."""
         for path, view in (line.get('with') or {}).items():
             if path.startswith('/x/') or path.startswith('/c/x/'):
                 continue
             props = view.get('properties') or {}
             if self.is_ask(props) and props.get('/sys/tack'):
                 self.asks[path] = tack_target(props['/sys/tack'])
-            changed.add(path)
-        return changed
 
-    def discover(self):
-        """Catch up from the log (the poll's shape) since the hand's seen epoch."""
-        changed = set()
-        while True:
-            lines, nxt = stream_poll(self.w.base, self.w.node, self.seen)
-            for line in lines:
-                changed |= self.handle(line)
-            if not lines or nxt == self.seen:
-                break
-            self.seen = nxt
-        return changed
+    def line(self, line):
+        self.learn(line)
+        return sum(self.answer(cell) for cell in list(self.asks))
+
+    def tick(self, now=None):
+        """Answer what is asking; with no time given, one whole pass (catch up, answer, mark seen), as the tests call it."""
+        if now is None:
+            return self.once()
+        return sum(self.answer(cell) for cell in list(self.asks))
 
     def answer(self, cell):
+        """One ask: nothing when it is not asking; else the whole answer computed, then one write."""
         context = self.w.read('/c/x' + cell, 'x').get('properties') or {}
         why = context.get('/sys/view/asking')
         if why is None:
-            return False
+            return 0
         case = int(context.get('/sys/tack/case') or 0)
         prompt = context.get('/prompt') or ''
         model = context.get('/model') or self.model
         path, care = self.asks[cell]
         view = self.w.read(path, care, limit=500)
         lines = render(view)
-        answer = fake_model(prompt, lines) if self.fake else call_model(self.endpoint, model, prompt, lines)
+        try:
+            answer = fake_model(prompt, lines) if self.fake else call_model(self.endpoint, model, prompt, lines)
+        except Exception as e:                      # a model failure leaves the cell asking; the next line or tick retries
+            self.log(f'ask {cell}: {e}')
+            return 0
         records = [{'path': cell + '/result', 'slots': {'answer': answer, 'case': case, 'model': model, 'prompt': prompt}}]
         if '/result' not in context:
             records.append({'path': cell, 'action': 'poke', 'slots': {'result': live(cell + '/result', 'x')}})
-        self.w.tool('write', records=records, who='ask')
+        self.write(records)
         self.log(f'ask {cell}: answered at case {case} with {model} ({why})')
-        return True
+        return 1
 
-    def tick(self):
-        self.discover()
-        answered = 0
-        for cell in list(self.asks):
-            try:
-                answered += self.answer(cell)
-            except Exception as e:                      # a model or write failure leaves the cell asking; the next tick retries
-                self.log(f'ask {cell}: {e}')
-        self.discover()                                   # the hand's own events, so they are not re-read next tick
-        self.w.tool('write', records=[{'path': self.home + '/seen', 'slots': {'epoch': self.seen}}], who='ask')
-        self.discover()
-        return answered
+    # the names the tests and the setup page use
+    def discover(self):
+        return self.catch_up()
+
+    def handle(self, line):
+        self.learn(line)
 
 
-    def run(self, follow_lines):
-        """The hand's life: every line the stream (or its poll fallback) yields, then answer what is asking."""
-        for line in follow_lines:
-            self.handle(line)
-            if line.get('who') == 'ask':
-                continue                                  # the hand's own writes
-            for cell in list(self.asks):
-                try:
-                    self.answer(cell)
-                except Exception as e:
-                    self.log(f'ask {cell}: {e}')
-            self.w.tool('write', records=[{'path': self.home + '/seen', 'slots': {'epoch': self.seen}}], who='ask')
+Hand = AskHand
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser()
-    p.add_argument('base'); p.add_argument('--node', default='0x11'); p.add_argument('--model'); p.add_argument('--endpoint')
-    p.add_argument('--fake', action='store_true'); p.add_argument('--once', action='store_true'); p.add_argument('--interval', type=float, default=2.0)
-    a = p.parse_args(argv)
-    hand = Hand(World(a.base, a.node), a.model, a.endpoint, a.fake)
-    if a.once:
-        return hand.tick()
-    hand.run(stream_follow(a.base, a.node, seen=hand.seen, interval=a.interval, log=hand.log))
+    return _hand.run(AskHand, argv, settings=('model', 'endpoint'))
 
 
 if __name__ == '__main__':
