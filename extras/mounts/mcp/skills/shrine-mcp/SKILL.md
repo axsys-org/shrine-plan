@@ -57,6 +57,40 @@ verifies a number the world already answers leaves zero records. At the
 end of a task ask what another agent can now compute, inspect or reuse
 that it could not before; if the answer is nothing, you wrote too much.
 
+Text is the devil in this system unless it is metadata: a `notes` or a
+`description` slot for a person or a search to find, a legal name, a
+decision someone made, a source document. Text pretending to be state
+is slop: a `status`, a `result`, a `calculation`, a sentence saying a
+number was verified. Observing something true is not a reason to write
+it. A check that was written as prose:
+
+```
+/checks/revenue   actual_revenue: 21   expected_revenue: 21   passed: true
+                  calculation: "8 + 13 = 21"   status: "verified"
+```
+
+depends on nothing and goes stale the moment a deal moves. The same
+check, alive:
+
+```
+/checks/revenue   actual: ref /views/revenue
+                  expected: ref /expectation/revenue
+                  passed: a diff cell over the two
+                  notes: "revenue against the expectation"
+```
+
+The expectation stays a literal at its authoritative source; `passed`
+is computed; when the deals change, the answer changes. A receipt of
+what a check said once is a different thing: pin the cases it read, do
+not copy its numbers. Likewise a name in a slot is a pronoun: `customer:
+"Northwind"` should be a reference to the customer's record or to an
+exposed view of it, or a hole at the path where it will be, so the
+computation stays hungry for what it needs instead of satisfied by a
+word. Build relationships and derivations, filling down into your
+namespace or pointing outward to an existing view; the aim is not zero
+literals, it is that the namespace accumulates reusable computation
+rather than textual claims about work done.
+
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
 connecting is `SETUP.md` beside this skill). Three verbs; this page shows
