@@ -35,6 +35,11 @@ def start(command, payload):
     return process
 
 
+def running(process):
+    """A plug may answer with a process (left running) or with nothing worth waiting on."""
+    return process is not None and hasattr(process, 'poll') and process.poll() is None
+
+
 def under(path, folder):
     return path == folder or path.startswith(folder + '/')
 
@@ -59,16 +64,19 @@ class Wake:
     def depends(self):
         """The paths the cells under the owned folders point at, read now."""
         out = set()
+        def walk(node):
+            for key, value in (node.get('properties') or {}).items():
+                if key == '/sys/weft':
+                    continue
+                ref = value.get('value') if isinstance(value, dict) else value
+                if isinstance(ref, str) and ref.startswith('/h/'):
+                    t = target_of(ref)
+                    if t:
+                        out.add(t)
+            for ch in node.get('children') or []:
+                walk(ch)
         for folder in self.owned:
-            for ch in self.w.read_all(folder, 'y').get('children', []):
-                for key, value in (ch.get('properties') or {}).items():
-                    if key in ('/sys/weft',):
-                        continue
-                    ref = value.get('value') if isinstance(value, dict) else value
-                    if isinstance(ref, str) and ref.startswith('/h/'):
-                        t = target_of(ref)
-                        if t:
-                            out.add(t)
+            walk(self.w.read_all(folder, 'y'))
         return sorted(out)
 
     def matches(self, line):
@@ -98,7 +106,7 @@ class Wake:
         self.log(f'wake {self.name}: {line.get("who")} touched {", ".join(paths)} at {line.get("epoch")}')
         if not self.run:
             return True
-        if self.process is not None and self.process.poll() is None:
+        if running(self.process):
             self.waiting = sorted(set(self.waiting) | set(paths))
             return True
         self.process = self.plug(self.run, {'name': self.name, 'from': line.get('who'), 'epoch': line.get('epoch'), 'paths': paths})
@@ -106,7 +114,7 @@ class Wake:
 
     def settle(self):
         """After a run ends, one more run for what landed meanwhile."""
-        if self.waiting and self.run and (self.process is None or self.process.poll() is not None):
+        if self.waiting and self.run and not running(self.process):
             paths, self.waiting = self.waiting, []
             self.process = self.plug(self.run, {'name': self.name, 'from': None, 'epoch': None, 'paths': paths})
 

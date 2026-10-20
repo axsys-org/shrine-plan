@@ -79,8 +79,9 @@
       : line=str
     + join
       ' A stream connection registering itself with the foot (its
-      ' handle rides as the capability), under the resident's name.
-      : who=str
+      ' handle rides as the capability), under the resident's name,
+      ' with its socket, so a departure can name it.
+      : who=str fd=nat
     + present
       ' A snapshot that first learns who has a stream open now: the
       ' fan-out answers the names, then the read runs with them.
@@ -420,7 +421,7 @@
            > (./stream _) .true
           .false
         .false
-      joining=http_foot/action (./join who)
+      joining=http_foot/action (./join who fd)
     ? streaming
       ; (Try (\ wire=nat (Write fd wire)) (http_foot/bar http_foot/stream_head))
       ; (SendCaps foot joining [0])
@@ -439,8 +440,12 @@
       http_foot/stream_msg/line
       http_foot/stream_msg/streamed
       http_foot/stream_msg/present
+      http_foot/stream_msg/left
     + join
-      : who=str
+      : who=str fd=nat
+    + left
+      ' A stream whose socket closed, by its fd: off the registry.
+      : fd=nat
     + present
       ' Who is on the stream now: the fan-out answers the asker (its
       ' handle rides as the capability) with the names, one per line.
@@ -475,10 +480,16 @@
       ? wrote
        > (./ok _)
         = acked=http_foot/stream_msg .streamed
-        ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
+        ; (? (gt caps.len 0) (SendCaps caps.at(0) acked [0]) 0)
         ; (helm/supervisor/close_caps caps)
         | _ 0
        > (./err _)
+        ' the socket is gone: tell the fan-out (its handle rode with the line) and leave
+        = gone=http_foot/stream_msg (./left fd)
+        ? (eq caps.len 0)
+          ; (CloseFd fd)
+          0
+        ; (Try (\ target=nat (SendCaps target gone [0])) caps.at(0))
         ; (helm/supervisor/close_caps caps)
         ; (CloseFd fd)
         0
@@ -486,19 +497,34 @@
     | _ 0
   + fanout
     ' The stream registry: every open stream's handle with the lines it
-    ' has not yet acknowledged.  A line is sent to each with Try; a
-    ' stream whose handle refuses, or that falls more than 64 lines
-    ' behind, is dropped.  Nothing here blocks: a commit hands the line
-    ' over and goes on.
+    ' has not yet acknowledged, its resident's name and its socket.  A
+    ' line is sent to each with Try; a stream whose handle refuses, or
+    ' that falls more than 64 lines behind, is dropped.  A stream whose
+    ' socket closed stops acknowledging (its actor is gone with the
+    ' socket), so presence counts a stream only while it is at most one
+    ' line behind.  Nothing here blocks: a commit hands the line over
+    ' and goes on.
     \ self=nat
     ^ nat
-    % streams=row[[h=nat behind=nat who=str]] []
+    % streams=row[[h=nat behind=nat who=str fd=nat]] []
     = ;[message caps] (Recv[http_foot/stream_msg] 0)
     ? message
-     > (./join who)
+     > (./join who fd)
       ? (eq caps.len 0) (_ streams)
       ; (helm/supervisor/close_caps caps.drop(1))
-      | _ streams.snoc([caps.at(0) 0 who])
+      | _ streams.snoc([caps.at(0) 0 who fd])
+     > (./left fd)
+      ' a stream whose socket closed: off the registry now, its handle released
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[[h=nat behind=nat who=str fd=nat]] []
+        kept
+          | streams.fold empty
+          \ ;out=row[[h=nat behind=nat who=str fd=nat]] [h behind who f]
+          ^ row[[h=nat behind=nat who=str fd=nat]]
+          ? !(eq f fd) out.snoc([h behind who f])
+          ; (Try (\ target=nat (CloseHandle target)) h)
+          out
+      | _ kept
      > .present
       ' the names on the stream now, one per line, to the asker
       ? (eq caps.len 0) (_ streams)
@@ -507,8 +533,8 @@
           % i=nat 0 acc=str ""
           ^ str
           ? (eq i streams.len) acc
-          = [h behind who] streams.at(i)
-          ? (eq who.len 0) (_ i.inc acc)
+          = [h behind who f] streams.at(i)
+          ? ((eq who.len 0) || (gt behind 1)) (_ i.inc acc)
           | _ i.inc (str/cat_all [acc who nl])
       ; (Try (\ target=nat (Send target (http_driver/response 200 text))) caps.at(0))
       ; (helm/supervisor/close_caps caps)
@@ -518,23 +544,23 @@
       = from caps.at(0)
         eased
           | streams.map
-            \ [h behind who]
-            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind) who]
+            \ [h behind who f]
+            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind) who f]
       ; (helm/supervisor/close_caps caps)
       | _ eased
      > (./line text)
       ; (helm/supervisor/close_caps caps)
-      = none=row[[h=nat behind=nat who=str]] []
+      = none=row[[h=nat behind=nat who=str fd=nat]] []
         ;kept
           | streams.fold none
-          \ ;out=row[[h=nat behind=nat who=str]] [h behind who]
-          ^ row[[h=nat behind=nat who=str]]
+          \ ;out=row[[h=nat behind=nat who=str fd=nat]] [h behind who f]
+          ^ row[[h=nat behind=nat who=str fd=nat]]
           ? (gt behind 64)
             ; (CloseHandle h)
             out
           = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
           ? sent
-           > (./ok _) out.snoc([h behind.inc who])
+           > (./ok _) out.snoc([h behind.inc who f])
            > (./err _)
             ; (Try (\ target=nat (CloseHandle target)) h)
             out
@@ -794,10 +820,10 @@
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A stream is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > (./join who)
-      ' a stream connection joining: its handle goes to the fan-out, under its name
+     > (./join who fd)
+      ' a stream connection joining: its handle goes to the fan-out, under its name, with its socket
       ? (eq caps.len 0) (_ serial pending queue)
-      = joined=http_foot/stream_msg (./join who)
+      = joined=http_foot/stream_msg (./join who fd)
       ; (SendCaps streams joined [caps.at(0)])
       ; (helm/supervisor/close_caps caps)
       | _ serial pending queue
