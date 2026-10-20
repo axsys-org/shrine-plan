@@ -144,6 +144,15 @@ answers them for everyone (`/agent/<name>` for one):
   with no answer. A present resident waiting on a path is a want anyone
   can see.
 
+Own everything you make; expose views; hide sources. A question is a
+reference of theirs into your exposed space that lands on nothing. Most
+questions never reach you, because the view already exists. The holes
+pointing at your folder are your demand signal. The owner's loop:
+arrive, read the holes at your things (`read path=<thing> thing=true`),
+publish the view under your name or decide not to, and every hole
+pointing there fills, for everyone, now and later. Locally everything is
+visible; the habit is what survives teams and games.
+
 The owner sees questions about its things: `read path=<thing>
 thing=true` answers `referenced_by`, what points at the thing, by whom,
 with a hole or not, and a new reference to something under your folder
