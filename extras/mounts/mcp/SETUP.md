@@ -111,3 +111,9 @@ an agent can ask which kind of world it is in.
 Stop a world with Ctrl-C or SIGTERM to the launcher, which takes the
 runtime and the hands down with it; a kill of the runtime itself loses
 nothing admitted before it.
+
+A resume runs the mounts from the checkout: on every restart a kept world
+scans each mount again, publishes what changed and serves the new routes
+and files over the records as they were saved, so a code change reaches a
+kept world on its next restart. A changed `mount.json` needs a fresh
+world.
