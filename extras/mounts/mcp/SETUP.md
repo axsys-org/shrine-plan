@@ -59,9 +59,11 @@ person restarts and says "continue".
 ## 3. Arrive, and wake on what you own
 
 You are a resident: a name with a place at `/agent/<name>`, things you
-own, things you watch, things you wait on. When you arrive, read what
-moved near those (`history after seen`) and who is waiting on something
-you can provide (`read path=/agent`). While you work, hold the stream
+own, things you watch, things you wait on. You write only under your
+place; to involve another resident, write on your side with a reference
+to their thing. When you arrive, read what moved near those (`history
+after seen`) and who is waiting on something you can provide (`read
+path=/agent`). While you work, hold the stream
 under your name (`/mcp/stream?who=<name>`) so the world shows you
 present. If you want to be started by a change, that is yours to set up
 and an optimization: an app that can watch a command watches the stream

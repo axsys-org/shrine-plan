@@ -2,9 +2,10 @@
 
     python3 wake.py <base> --name <you> [--own /user/team ...] [--run "<command>"] [--node 0x11] [--interval 2]
 
-An agent is a name that owns paths (/agent/<name>, and any --own) and depends on paths (what the cells under its
-folders point at: their tack and their reference slots). A wake is a stream line, not signed by the agent, that
-touches one of those paths or anything beneath. The paths are the address; there is no field to fill. The command
+An agent is a name that owns paths (/agent/<name>, and any --own) and depends on paths (what the records and cells
+under its folders reference). A wake is a stream line, not signed by the agent, that touches one of those paths or
+anything beneath, or that writes a record referencing something the agent owns (another resident writing on their
+own side about your thing). The paths are the address; there is no field to fill. The command
 is the agent's own plumbing (the setup page has the commands for the apps we know): it runs in a shell with
 WAKE_NAME, WAKE_FROM, WAKE_EPOCH and WAKE_PATHS set and the line as JSON on stdin, one run at a time; lines that
 land while a run is going wait and run once together after it. Without --run the wakes are printed. Never writes.
@@ -71,9 +72,21 @@ class Wake:
         return sorted(out)
 
     def matches(self, line):
-        """The touched paths that fall under something owned or depended on."""
+        """The touched paths that fall under something owned or depended on, and the written records whose references
+        point under something owned: a resident writes only at home, so a note about your thing lands in their folder
+        with a reference to yours, and that reference is what reaches you."""
         folders = self.owned + self.depends()
-        return sorted({t for t in line.get('touched') or [] if any(under(t, f) for f in folders)})
+        hit = {t for t in line.get('touched') or [] if any(under(t, f) for f in folders)}
+        for path, view in (line.get('with') or {}).items():
+            if path.startswith('/x/') or path.startswith('/c/'):
+                continue
+            for value in (view.get('properties') or {}).values():
+                ref = value.get('value') if isinstance(value, dict) else value
+                if isinstance(ref, str) and ref.startswith('/h/'):
+                    t = target_of(ref)
+                    if t and any(under(t, f) for f in self.owned):
+                        hit.add(path)
+        return sorted(hit)
 
     def line(self, line):
         """True when the line woke the agent (or joined a run already going)."""

@@ -97,11 +97,11 @@ ask hand runs on that.
 
 ## Residents
 
-`read path=/agent` answers `residents`, and `read path=/agent/<name>` a `resident`, beside the tree: `{name, present, last, owns, watches, waiting, can}`. `present` is a stream open under the name (`GET /mcp/stream?who=<name>`); `last` the newest event with that `who`; `owns` the folders written with the name (two deep under `/user` and `/agent`, from the last 400 events); `watches` what the cells under `/agent/<name>` point at plus the paths on `/agent/<name>/watch`; `waiting` the inputs of those cells nobody has written, the asks among them with no answer, plus `/agent/<name>/waiting`; `can` `{read: all, write: all, compute: [...]}` with what `/agent/<name>/can` declares. The hands, the journal and the launcher are not residents. One snapshot, zero events.
+`read path=/agent` answers `residents`, and `read path=/agent/<name>` a `resident`, beside the tree: `{name, present, last, owns, watches, waiting}`, derived only. `present` is a stream open under the name (`GET /mcp/stream?who=<name>`); `last` the newest event with that `who`; `owns` the folders written with the name (two deep under `/user` and `/agent`, from the last 400 events); `watches` what the records and cells under `/agent/<name>` reference; `waiting` the holes in its cells, an input nobody wrote or an ask with no answer. The hands, the journal and the launcher are not residents. One snapshot, zero events.
 
 ## Things
 
-`read path=<thing> thing=true` adds `thing` beside the tree: `{path, owner, last_writer, writers, assignees, grants, questions}`. `owner` is `/sys/owner` when an assign set it, else the oldest writer the journal walk finds (400 events back); `last_writer` the newest; `assignees` the names `/sys/owner` holds; `grants` the records under `<thing>/grants` (`{name, slots}`); `questions` the records one level under the thing with a `question` slot and no `answer`. Grants and assigns are the kernel's access work (`kernel-asks.md` beside the setup page); until then every write is admitted and the view is true to the records.
+`read path=<thing> thing=true` adds `thing` beside the tree: `{path, owner, last_writer, writers}`, from the journal (400 events back): `owner` the oldest writer the walk finds, the maker for anything recent; nothing moves ownership, a thing stays in the namespace that made it.
 
 ## Write only if unchanged
 

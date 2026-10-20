@@ -126,6 +126,9 @@ def check(base, node, timeout, quiet_seconds=60):
     expect('wake: a line under what it owns wakes', wk.line({'epoch': 601, 'who': 'ian', 'touched': ['/' + node + '/agent/wakey/q1'], 'with': {}}), True)
     expect('wake: its own line, or one elsewhere, does not', (wk.line({'epoch': 602, 'who': 'wakey', 'touched': ['/' + node + '/agent/wakey/q2'], 'with': {}}), wk.line({'epoch': 603, 'who': 'ian', 'touched': ['/' + node + '/user/elsewhere'], 'with': {}})), (False, False))
     expect('wake: a folder above what it owns does not wake it', wk.line({'epoch': 604, 'who': 'ian', 'touched': ['/' + node + '/agent'], 'with': {}}), False)
+    expect('wake: a record written elsewhere that references what it owns wakes it (a resident writes at home about your thing)',
+           (wk.line({'epoch': 605, 'who': 'codex', 'touched': ['/' + node + '/agent/codex/our/wakey'], 'with': {'/' + node + '/agent/codex/our/wakey': {'properties': {'/about': hand.live('/' + node + '/agent/wakey/views/count', 'x')['value'], '/question': 'how many?'}}}}), ran[-1]),
+           (True, ['/' + node + '/agent/codex/our/wakey']))
 
     # ask on the base still answers (its own test covers the rest)
     a = ask.Hand(w, model='fake', fake=True, log=quiet)

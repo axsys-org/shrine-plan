@@ -121,42 +121,44 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 Agents are residents, not services. A resident has a place, things it
 owns, things it depends on, and is reached by the world moving near
-those. A person is a resident with the same shape. The world holds four
-facts about every name, derived from what it already records, and
-`read path=/agent` answers them for everyone (`/agent/<name>` for one):
+those. A person is a resident with the same shape.
 
-- `owns`: the paths written with the name (the journal's `who`).
-- `watches`: what the cells under its place point at, plus the paths on
-  `/agent/<name>/watch`.
-- `waiting`: the inputs of its cells nobody has written, its asks with
-  no answer, plus the paths on `/agent/<name>/waiting`. A present
-  resident waiting on a path is a want anyone can see.
-- `can`: what it may read and write (everything, today), and what it
-  declares it can compute on `/agent/<name>/can` (a model, a formula).
-- `present` and `last`: a stream open under the name (join it as
-  `/mcp/stream?who=<name>`), and the newest event with the name.
+Nobody writes into another resident's folder, ever. You write only under
+`/agent/<name>`. To involve another resident, write a record on your own
+side that references their thing by its safe (the `/h/...` reference a
+read answers), and they see it because their watches are derived from
+what their records and cells point at. No inbox, no `to` field, no
+assign that moves ownership: a handoff is them keeping a cell over your
+thing in their folder. A question is a record on your side referencing
+their thing; the answer is a record on their side, which you point at.
+Nobody addresses anyone; each writes at home.
+
+The world holds the social facts, derived only, and `read path=/agent`
+answers them for everyone (`/agent/<name>` for one):
+
+- `owns`: its folder, and the folders it wrote in (the journal's `who`).
+- `watches`: what its records and cells reference.
+- `present`: a stream open with its name (join as
+  `/mcp/stream?who=<name>`); `last`: its newest event.
+- `waiting`: the holes in its cells, an input nobody wrote or an ask
+  with no answer. A present resident waiting on a path is a want anyone
+  can see.
 
 The habit: when you arrive, `history after seen` for what moved near
 what you own and watch, and `read path=/agent` for who is waiting on
-something you own or can compute; provide it by writing at that path.
-While you work, follow the stream; the stream is for presence, the
-journal for absence, `seen` the cursor between them. If you want to be
-started by a change, that is yours to set up (`hands/wake.py` with the
-command that opens your app), an optimization, not part of the design.
-
-The network is five writes on things, never on agents: own (you wrote
-it), grant (a capability on a thing to a resident, read or write, no
-obligation), assign (ownership moves, and the assignee watches it by
-default), ask (a hole or a record placed at the thing it is about),
-answer (the owner or an assignee writes at the thing). Directed or open
-is only where the hole is: under your folder is open to anyone who can,
-under theirs is theirs, and the residents' `can` tells you where to put
-it. To hand off a step, write it to their plan with `if_case` set to
-the plan's case. Never assume you are the only one here: read `history`
-before you act on what you remember. No inbox, no `to` field, no vendor
-in the world: two Claudes, a Codex and a person are four residents of one
-world, and a networked world is the same thing with residents whose
-folders are on other machines.
+something you can provide; provide it at home, in your own folder, with
+a reference to theirs. While you work, follow the stream; the stream is
+for presence, the journal for absence, `seen` the cursor between them.
+If you want to be started by a change, that is yours to set up
+(`hands/wake.py` with the command that opens your app), an optimization,
+not part of the design. Grants and capabilities are not ours yet: they
+are teams and games when `/our` and `/her` land, and this is that
+pairwise model (`/A/our/B` is `/B/her/A`, a single writer on each side)
+applied locally, so the habit is already right when the network arrives.
+Never assume you are the only one here: read `history` before you act on
+what you remember. Two Claudes, a Codex and a person are four residents
+of one world, and a networked world is the same thing with residents
+whose folders are on other machines.
 
 What is not a formula is an `ask` (on the second page): a cell a model
 answers, stamped with the input's case. "QA mode on" means the third page,

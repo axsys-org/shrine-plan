@@ -527,16 +527,15 @@ def check(base, node, timeout):
            (page['visited'], page['next'] is not None, pages > 1), (12, True, True))
     expect('33 a text in a record name is found too', [m['slot'] for m in find_all(org, 'd102')[0]], ['name'])
 
-    # 34. residents and things: the social facts derived from the journal, the records and the stream
+    # 34. residents and things: the social facts, derived from the journal, the records and the stream
     import socket as _socket
     e0 = epoch()
-    tool('write', 'write (resident)', who='tester', records=[{'path': org + '/notes/n1', 'slots': {'text': 'a note', 'question': 'who owns the deals?'}}])
+    tool('write', 'write (resident)', who='tester', records=[{'path': org + '/notes/n1', 'slots': {'text': 'a note'}}])
     tester_place = '/' + node + '/agent/tester'
     tool('write', 'write (resident)', who='tester', records=[
         {'path': tester_place + '/views/total', 'slots': {'sys/weft': stdlib['sum'], 'sys/tack': live(org + '/sales/deals'), 'slot': '/amount', 'into': '/total'}},
         {'path': tester_place + '/views/missing', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': live(org + '/nowhere')}},
-        {'path': tester_place + '/waiting', 'slots': {'forecast': org + '/views/forecast'}},
-        {'path': tester_place + '/can', 'slots': {'model': 'none, a test'}}])
+        {'path': tester_place + '/our/notes', 'slots': {'about': live(org + '/notes'), 'question': 'who keeps these?'}}])
     sock = _socket.create_connection(('127.0.0.1', int(base.rsplit(':', 1)[1])), timeout=10)
     sock.sendall(b'GET /mcp/stream?who=tester HTTP/1.0\r\nHost: localhost\r\n\r\n')
     head = b''
@@ -545,11 +544,10 @@ def check(base, node, timeout):
     try:
         agents = tool('read', 'read (residents)', path='/' + node + '/agent', care='x')
         me = [r for r in agents['residents'] if r['name'] == 'tester']
-        expect('34 /agent answers the residents: a name with a stream open is present, its last is its newest event, owns the folders it wrote in, watches what its cells point at, waits on the input nobody wrote and the ask it listed, can what it declares, zero events',
-               (len(me), me[0]['present'], me[0]['last'] >= e0 + 1, org in me[0]['owns'] or ('/' + '/'.join(org.strip('/').split('/')[:2])) in me[0]['owns'], tester_place in me[0]['owns'],
-                org + '/sales/deals' in me[0]['watches'], org + '/nowhere' in me[0]['waiting'], org + '/views/forecast' in me[0]['waiting'],
-                me[0]['can']['read'], any('model' in c.get('/model', '') or c.get('/model') for c in me[0]['can']['compute']), epoch() - e0 - 2),
-               (1, True, True, True, True, True, True, True, 'all', True, 0))
+        expect('34 /agent answers the residents, derived only: a name with a stream open is present, last is its newest event, owns the folders it wrote in, watches what its records and cells reference, waits on the input nobody wrote, zero events',
+               (len(me), me[0]['present'], me[0]['last'] >= e0 + 1, tester_place in me[0]['owns'], any(o.startswith('/' + node + '/user') for o in me[0]['owns']),
+                org + '/sales/deals' in me[0]['watches'], org + '/notes' in me[0]['watches'], org + '/nowhere' in me[0]['waiting'], 'can' in me[0], epoch() - e0 - 2),
+               (1, True, True, True, True, True, True, True, False, 0))
         one = tool('read', 'read (resident)', path=tester_place, care='x')
         expect('34 /agent/<name> answers one resident, the same facts', (one['resident']['name'], one['resident']['present']), ('tester', True))
     finally:
@@ -559,15 +557,8 @@ def check(base, node, timeout):
     expect('34 the stream closed, the resident is away; the hands, the journal and the launcher are not residents',
            ([r for r in agents['residents'] if r['name'] == 'tester'][0]['present'], {r['name'] for r in agents['residents']} & {'hands', 'journal', 'launcher'}), (False, set()))
     thing = tool('read', 'read (thing)', path=org + '/notes', thing=True)
-    expect('34 a thing: its owner is its oldest writer, its last writer the newest, the question under it is open, no grants yet, zero events',
-           (thing['thing']['owner'], thing['thing']['last_writer'], thing['thing']['questions'], thing['thing']['grants'], thing['thing']['assignees']),
-           ('tester', 'tester', [org + '/notes/n1'], [], []))
-    tool('write', 'write (grant)', who='tester', records=[{'path': org + '/notes/grants/claude', 'slots': {'read': 'true', 'write': 'true'}},
-                                                          {'path': org + '/notes/n1', 'action': 'poke', 'slots': {'answer': 'the tester'}},
-                                                          {'path': org + '/notes', 'action': 'poke', 'slots': {'sys/owner': 'claude'}}])
-    thing = tool('read', 'read (thing)', path=org + '/notes', thing=True)
-    expect('34 a grant written under the thing shows, an answered question closes, an owner set by an assign wins',
-           ([g['name'] for g in thing['thing']['grants']], thing['thing']['questions'], thing['thing']['owner'], thing['thing']['assignees']), (['claude'], [], 'claude', ['claude']))
+    expect('34 a thing: its owner is its oldest writer, its last writer the newest, zero events',
+           (thing['thing']['owner'], thing['thing']['last_writer'], 'tester' in thing['thing']['writers'], epoch() - e0 - 2), ('tester', 'tester', True, 0))
 
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}
