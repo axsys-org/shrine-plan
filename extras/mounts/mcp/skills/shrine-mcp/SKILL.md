@@ -15,8 +15,8 @@ lives. Default to it:
   is a folder, and the question is a cell.
 - Someone says a fact they will want back: a record, now, at a path they
   would guess.
-- You make a plan, a list or a finding: a record under your folder, not
-  a sentence in the chat.
+- You find something out about their data: a cell or a reference that
+  keeps answering, never a sentence copied into a slot.
 - You answer a question about their data: read the world, not your
   memory of it.
 - A session starts: read `/agent/<name>/plan` and `history after seen`
@@ -27,6 +27,35 @@ lives. Default to it:
 
 Say "kept it" when you keep something, and give the live page link once.
 Never name the tools or the formulas to the person unless they ask how.
+
+## What you leave behind
+
+The namespace is not your transcript, scratchpad or progress report. It
+is the persistent computational state of the world, and its history
+keeps everything forever.
+
+Read and compute without writing whenever you can. When you write,
+prefer primary facts, references to existing records, and executable
+views over copied results or descriptions. Do not persist a plan merely
+because you formulated one, a status merely because you completed a
+step, or an answer merely because someone asked for it. Persist
+something only when future work benefits from its continued existence.
+Keep operational state (`seen`, scratch) only where the protocol needs
+it, under your own folder, apart from the person's data.
+
+| what it is | what to do with it |
+|---|---|
+| a primary fact, a durable decision, an expectation | a record, at its authoritative path |
+| a reusable computation or relationship | a cell, or a reference slot, never the number it gives |
+| reasoning, exploration, coordination, confirmation | nothing, unless recovery or audit needs it |
+
+The unit of accomplishment is not "I did it, here is a record saying
+so." It is: the world can now answer, do or maintain something it could
+not before. That may be a cell, a reference, a source brought in, an
+authoritative fact corrected, or no write at all. A wake that only
+verifies a number the world already answers leaves zero records. At the
+end of a task ask what another agent can now compute, inspect or reuse
+that it could not before; if the answer is nothing, you wrote too much.
 
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
@@ -71,8 +100,10 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 - Pick a name and write with `who: <name>` every time; history filters by
   it and the page shows it on every event.
-- Plan first as a record under `/agent/<name>/plan`: the question and the
-  steps, so the plan has a case and a history.
+- A plan is a record under `/agent/<name>/plan` only when the work
+  outlives this session: the question and the steps, replaced as they
+  change, culled when done. Never a status, a result or a summary of what
+  you did; the journal already has that.
 - Try a question with a formula read before keeping it: `read path
   formula settings` runs any standard cell over a folder and writes
   nothing; it answers `{path, formula, result, context}`, the result the
@@ -96,8 +127,10 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   each other. `expr` (`each`, `when`, `where`, `validate`) is for a rule a
   chain cannot say: `amount * 2 + 1`, `status = 'closed' and amount > 30`,
   the row's slots as the only variables.
-- Write the expected answer as a record before the read that checks it;
-  a reading that comes first is a description, not a check.
+- An expectation is a record at its source, written before the read that
+  checks it; a check is a cell comparing the live answer to it, not a
+  copied number with "passed" beside it. A reading that comes first is a
+  description, not a check.
 - Ask the world instead of reasoning over a copy; page what is left; never
   read the world whole. To find a record you do not know the folder of,
   `read path=/user find=<text>`: the records whose name or a slot holds it.
@@ -119,16 +152,15 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 ## Working with others
 
-A convention, not a feature. Your name is your `who`. Your inbox is
-`/agent/<name>/inbox`: to ask another agent something, write a record
-there under their name and watch `history after seen` for its answer; to
-answer, write a record in theirs. To hand off a step, write the step to
-their plan with `if_case` set to the plan's case, so a plan that moved
-under you refuses the write instead of losing a step. Never assume a
-session is the only one: read `history` before you act on what you
-remember, and sign everything. Two Claudes, a Codex and a Gemini on one
-world are then coworkers with a shared journal, and no two of them need
-to speak the same wire.
+Nobody converses through the namespace. Another agent's work is cells
+and records you read and point at, never notes you exchange: no inbox,
+no acknowledgements, no copied answers. Do not ask another agent for
+what the world can compute; a count, a sum, the oldest of a folder is a
+cell you write. A step for another agent is a line in their plan with
+`if_case` set to the plan's case, and nothing else goes in another
+agent's folder. Sign everything with your `who`, and read `history`
+before you act on what you remember; never assume a session is the only
+one.
 
 What is not a formula is an `ask` (on the second page): a cell a model
 answers, stamped with the input's case. "QA mode on" means the third page,
