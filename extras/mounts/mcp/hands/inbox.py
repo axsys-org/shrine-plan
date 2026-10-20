@@ -31,7 +31,9 @@ def run(command, payload, timeout=30):
     """The command plug: a shell command with the note in its environment and on stdin."""
     env = dict(os.environ, INBOX_TO=payload['to'], INBOX_FROM=str(payload.get('from') or ''), INBOX_EPOCH=str(payload.get('epoch') or ''),
                INBOX_PATHS=' '.join(payload['paths']))
-    return subprocess.run(command, shell=True, env=env, input=json.dumps(payload), text=True, timeout=timeout, capture_output=True).returncode
+    # output goes nowhere: a command that backgrounds a long run (nohup ... &) must not hold a pipe to this hand
+    return subprocess.run(command, shell=True, env=env, input=json.dumps(payload), text=True, timeout=timeout,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
 
 PLUGS = {'post': post, 'run': run}
