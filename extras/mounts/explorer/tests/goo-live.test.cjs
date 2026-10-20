@@ -347,3 +347,31 @@ test('a click writes the person\'s cursor under the node\'s /agent/person, signe
   await v2.go('0x11/user/org/deals', '0x11/user/org/deals');
   assert.equal(flipped.length, 2, 'a refused cursor write still moves the page');
 });
+
+// ---- a presented path: read at its care, a folder is a folder, off the page's folder the page moves
+test('a presented folder is read at the care it was presented at and draws as a folder, not deleted', async () => {
+  const {mountViewer} = live;
+  const reads = [];
+  const s = viewerSource();
+  s.read = async (p, care, cas) => { reads.push([p, care, cas]); return {path: p, record: {}, kids: [{name: 'd1', path: p + '/d1', slots: {amount: 5}, kids: []}], case: '', next: null}; };
+  const el = fakeEl();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler({shown: {path: '0x11/user/org/views', care: 'z', case: 0}});
+  assert.deepEqual(reads[0], ['0x11/user/org/views', 'z', 0], 'the summary read takes the presented care');
+  const body = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.doesNotMatch(body, /deleted/); assert.match(body, /data-path="0x11\/user\/org\/views"/);
+  const folder = adapt.readOf({path: '/0x11/user/org/views', exists: false, reference: ref('x', 2, '/0x11/user/org/views'), properties: {}, children: [{path: '/0x11/user/org/views/a', exists: true, reference: ref('x', 1, '/0x11/user/org/views/a'), properties: {'/n': '1'}, children: []}], nodes: 2, next: null});
+  assert.deepEqual([folder.record, folder.kids.length], [{}, 1], 'a path with children and no record of its own is a folder');
+  assert.equal(adapt.readOf(culled).record, null, 'a culled record with nothing beneath is still deleted');
+});
+
+test('a path presented off the page\'s folder moves the page to its folder', async () => {
+  const {mountViewer} = live;
+  const flipped = [];
+  const s = viewerSource();
+  mountViewer(fakeEl(), s, {crumb: '0x11/user/org', views: '0x11/user/org', flip: f => flipped.push(f)});
+  await s.handler({shown: {path: '0x11/user/shrine/views/open_prs', care: 'z', case: 0}});
+  assert.deepEqual(flipped, ['0x11/user/shrine/views']);
+  await s.handler({shown: {path: '0x11/user/org/views/headcount', care: 'x', case: 0}});
+  assert.equal(flipped.length, 1, 'a path inside the page\'s folder draws in place');
+});

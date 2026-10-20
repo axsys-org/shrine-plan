@@ -24,7 +24,7 @@ function mountViewer(el, source, opts = {}) {
     const paths = ev.shown ? [ev.shown.path] : (ev.records || ev.touched);
     openRecords = openRecords && paths.length <= 8;   // a big batch opens record by record, on a click
     const items = await Promise.all(paths.map(async p => {
-      const r = await source.read(p, 'x', ev.shown ? ev.shown.case : 0);
+      const r = await source.read(p, ev.shown ? (ev.shown.care || 'y') : 'x', ev.shown ? ev.shown.case : 0);
       let line;
       if (r && r.record === null) line = '<span class="m gone">deleted</span>';
       else if (r && isCell(r.record)) { const a = await source.answer(p); line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
@@ -37,7 +37,7 @@ function mountViewer(el, source, opts = {}) {
   // a record opened by the page shows itself and its children (y); one the person opens shows its whole subtree (z)
   async function fillRecord(det, ev, care) {
     const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
-    const r = await source.read(det.dataset.path, care, ev.shown ? ev.shown.case : 0);
+    const r = await source.read(det.dataset.path, ev.shown && ev.shown.care === 'z' ? 'z' : care, ev.shown ? ev.shown.case : 0);
     body.innerHTML = r ? await recordHTML(source, r, false, new Set()) : '';
   }
 
@@ -61,8 +61,13 @@ function mountViewer(el, source, opts = {}) {
     $('.sv-when').innerHTML = ev.shown ? `<span class="shown">shown as is</span>` : `now <b>${ev.epoch}</b>`;
   }
 
+  const inside = p => !views || p === views || p.startsWith(views + '/');
   source.follow(async msg => {
-    if (msg.shown) { const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev); }
+    if (msg.shown) {
+      // presented off this page's folder: the page moves there, so the person sees what the agent showed
+      if (!inside(msg.shown.path)) { const folder = folderOf(msg.shown.path); if (opts.flip) return opts.flip(folder); if (root.location) { root.location.search = '?views=/' + folder; return; } }
+      const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev);
+    }
     if (!msg.touched || !msg.touched.length) return;
     if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return draw(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
     state.events.push(msg); if (msg.quiet) return;   // quiet: the backlog on load, kept for `earlier` and drawn with the last
@@ -322,7 +327,8 @@ function nodeOf(n) {
 // a read answer as the viewer's read: record null for a culled path (no record, but a case), {} for a bare folder
 function readOf(a) {
   const node = nodeOf(a);
-  return { path: node.path, record: a.exists === false ? (a.reference ? null : {}) : node.slots, kids: node.kids, case: node.case, next: a.next || null };
+  const bare = a.exists === false && (!a.reference || (a.children || []).length > 0);   // a folder: no record of its own, children beneath
+  return { path: node.path, record: a.exists === false ? (bare ? {} : null) : node.slots, kids: node.kids, case: node.case, next: a.next || null };
 }
 // a cell's answer from its /x and /c/x: the fault or note from the context, else the tree (unknown when /x is empty)
 function answerOf(path, x, c) {
