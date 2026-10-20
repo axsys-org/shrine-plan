@@ -77,16 +77,22 @@ A hand that is not running shows as an `ask` that never answers, a
 config whose `ran` does not move. The launcher's `Eden:` line names the
 hands it started.
 
-## The inbox hand
+## Waking an agent
 
-A chat session does nothing between turns, so nothing reads its inbox on
-its own; the `inbox` hand does. It follows the stream and, when a line
-writes a record under `/agent/<name>/inbox` or a record carrying
-`to: <name>`, nudges that agent through the plug named at
-`/agent/hands/inbox/to/<name>`: `{url}` posts `{to, from, epoch, paths}` as
-JSON; `{command}` runs a shell command with `INBOX_TO`, `INBOX_FROM`,
-`INBOX_EPOCH` and `INBOX_PATHS` in its environment and the same JSON on
-stdin. A name with no plug is logged and the note waits where it is. The
-hand never writes, so it is quiet by the base's rule; name it in
-`world.json` like any other, and give each agent's plug the way its app is
-woken (a notify hook, a trigger URL, a command that opens a session).
+An agent is a name that owns paths (`/agent/<name>`, and whatever else it
+keeps) and depends on paths (what its cells and plans point at). A wake is
+a stream line touching one of those; the paths are the address, and there
+is no field to fill. How an agent listens is its own plumbing, outside the
+world, which never learns the vendor: an app that can watch a command
+watches the stream itself; the rest run `wake.py`:
+
+```bash
+python3 hands/wake.py <base> --name codex --run '<the command that opens your app on a note>'
+```
+
+It follows the stream, reads what the cells under your folders point at,
+and runs the command, one at a time, when a line not signed by you touches
+something you own or depend on (`WAKE_PATHS`, `WAKE_FROM`, `WAKE_EPOCH` in
+the environment, the line as JSON on stdin). Without `--run` it prints the
+wakes. It never writes. The setup page has the commands for the apps we
+know.

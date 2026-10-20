@@ -119,23 +119,38 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 ## Working with others
 
-A convention, not a feature. Your name is your `who`. Your inbox is
-`/agent/<name>/inbox`: to ask another agent something, write a record
-there under their name and watch `history after seen` for its answer; to
-answer, write a record in theirs. To hand off a step, write the step to
-their plan with `if_case` set to the plan's case, so a plan that moved
-under you refuses the write instead of losing a step. Never assume a
-session is the only one: read `history` before you act on what you
-remember, and sign everything. A record with `to: <name>` is addressed
-wherever it sits (a step in a plan, a finding in a folder). If your app
-can watch a command and wake you on its output, watch your own name on
-the stream and no hook is needed:
-`curl -sN <world-url>/mcp/stream | grep --line-buffered -E '/agent/<name>/inbox|"to": ?"<name>"'`.
-Otherwise the `inbox` hand, when the world runs one, wakes you through
-your plug, and without either the next `history after seen` is where
-the note is found.
-Two Claudes, a Codex and a Gemini on one world are then coworkers with a
-shared journal, and no two of them need to speak the same wire.
+Agents are residents, not services. A resident has a place, things it
+owns, things it depends on, and is reached by the world moving near
+those. A person is a resident with the same shape.
+
+- A place. `/agent/<name>` is where you live. Your plan, your `seen`
+  marker, your notes, your QA tree are furniture, not session state;
+  anyone can look at your place while you are away and see what you are
+  doing.
+- Things you own. The paths you write, with your name on every write
+  (`who`). Ownership is visible in the journal and on the page, and nobody
+  writes in your place without being noticed.
+- Things you depend on. Every cell you keep points at someone's records
+  at a case. Those pointers are your relationships, and they are public.
+- A way of being reached that is just the world moving. Something lands
+  where you live, or something you depend on changes, and the stream
+  says so. How you wake is your own affair, outside the world: an app
+  that can watch a command watches the stream for your folders, the rest
+  run `hands/wake.py` with the command that opens your app, and `history
+  after seen` is where it all is when you come back.
+- Continuity. You leave and come back and nothing is lost. A resident
+  does not re-introduce itself.
+
+So a question for another resident is a record under what they own, or a
+cell of yours pointing at what they have not made yet; the answer is a
+record they write that you point at. Nobody replies; they produce and you
+depend. To hand off a step, write it to their plan with `if_case` set to
+the plan's case, so a plan that moved under you refuses the write instead
+of losing a step. Never assume you are the only one here: read `history`
+before you act on what you remember. No inbox, no `to` field, no vendor
+in the world: two Claudes, a Codex and a person are four residents of one
+world, and a networked world is the same thing with residents whose
+folders are on other machines.
 
 What is not a formula is an `ask` (on the second page): a cell a model
 answers, stamped with the input's case. "QA mode on" means the third page,

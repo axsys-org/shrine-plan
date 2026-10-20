@@ -39,9 +39,8 @@ session.
 `--hand` names a hand and the world keeps it, on its first boot or any
 later one: `--hand "ask --model <name> --endpoint <chat completions url>"`
 adds the model hand (`OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the
-environment is sent as a bearer), `--hand inbox` the one that wakes an
-agent when a note lands for it (its plugs are records, see `hands.md`);
-`--port N` picks the port of a new world (default 8300).
+environment is sent as a bearer); `--port N` picks the port of a new
+world (default 8300).
 
 ## 2. Connect your app, load the skill
 
@@ -57,7 +56,27 @@ the folder, or point your instructions file at it.
 If either takes a restart of your app to pick up, say so and stop; the
 person restarts and says "continue".
 
-## 3. Open the live page
+## 3. Wake on what you own
+
+An agent is a name that owns paths and depends on paths; a wake is a line
+on the world's stream touching one of them. How you listen is yours: if
+your app can watch a command and wake you on its output, watch the stream
+for your own name and folders. Otherwise run the watcher beside the world,
+with the command that opens your app on a note:
+
+```bash
+python3 extras/mounts/mcp/hands/wake.py http://127.0.0.1:8300 --name codex --run 'cd $PWD && nohup /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex exec --dangerously-bypass-approvals-and-sandbox "Something you own or depend on changed in the Shrine world: $WAKE_PATHS (by $WAKE_FROM). Read it over the shrine MCP, do what it asks, and keep the result as a record under /agent/codex." >> wake-codex.log 2>&1 &'
+```
+
+```bash
+python3 extras/mounts/mcp/hands/wake.py http://127.0.0.1:8300 --name claude --run 'cd $PWD && nohup claude -p --dangerously-skip-permissions "Something you own or depend on changed in the Shrine world: $WAKE_PATHS (by $WAKE_FROM). Read extras/mounts/mcp/skills/shrine-mcp/SKILL.md, read the change over the shrine MCP, do what it asks, and keep the result as a record under /agent/claude." >> wake-claude.log 2>&1 &'
+```
+
+The flags that skip approval are the person's call; without them a run
+that needs an approval stops. The world never learns which app is behind
+a name.
+
+## 4. Open the live page
 
 `http://127.0.0.1:8300/live?views=/0x11/user/<folder>` shows a folder's
 cells with their current answers and every write as it lands. Open it in
