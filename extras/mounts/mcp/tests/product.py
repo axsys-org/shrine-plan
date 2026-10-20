@@ -527,6 +527,26 @@ def check(base, node, timeout):
            (page['visited'], page['next'] is not None, pages > 1), (12, True, True))
     expect('33 a text in a record name is found too', [m['slot'] for m in find_all(org, 'd102')[0]], ['name'])
 
+    # 35. referencing: what points at a thing, walked under a folder; a waiting cell is marked; the kernel's crews ride along
+    rt = org + '/reftest'
+    e0 = epoch()
+    tool('write', 'write (reftest)', who='tester', records=[
+        {'path': rt, 'slots': {'title': 'reference test'}},
+        {'path': rt + '/things/t1', 'slots': {'n': 1}},
+        {'path': rt + '/cites/c1', 'slots': {'about': live(rt + '/things/t1', 'x'), 'text': 'cites t1'}},
+        {'path': rt + '/views/count', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': live(rt + '/things')}},
+        {'path': rt + '/views/missing', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': live(rt + '/nothing')}}])
+    got = tool('read', 'read (referencing)', path=rt, referencing=rt + '/things')
+    expect('35 referencing lists the cell over the folder and the row citing a thing beneath it, with slot, cell and no hole; zero events',
+           (sorted((m['path'], m['slot'], m['cell'], m['hole']) for m in got['matches']), got['referencing'], got['next'], epoch() - e0 - 1),
+           (sorted([(rt + '/views/count', '/sys/tack', True, False), (rt + '/cites/c1', '/about', False, False)]), rt + '/things', None, 0))
+    gone = tool('read', 'read (referencing)', path=rt, referencing=rt + '/nothing')
+    expect('35 a thing nobody wrote is still referenced, by a cell waiting on it', [(m['path'], m['hole']) for m in gone['matches']], [(rt + '/views/missing', True)])
+    nobody = tool('read', 'read (referencing)', path=rt, referencing=rt + '/cites')
+    expect('35 a thing nothing points at answers no matches', nobody['matches'], [])
+    page = tool('read', 'read (referencing)', path=rt, referencing=rt + '/things', limit=2)
+    expect('35 the walk is bounded by limit and continues with next', (page['visited'], page['next'] is not None), (2, True))
+
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}
     rows = []

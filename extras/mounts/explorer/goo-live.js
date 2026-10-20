@@ -39,6 +39,7 @@ function mountViewer(el, source, opts = {}) {
     const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
     const r = await source.read(det.dataset.path, ev.shown && ev.shown.care === 'z' ? 'z' : care, ev.shown ? ev.shown.case : 0);
     body.innerHTML = r ? await recordHTML(source, r, false, new Set()) : '';
+    if (r && source.referencedBy) { try { body.innerHTML += referencedHTML(await source.referencedBy(det.dataset.path)); } catch (e) { /* a mount without the knob */ } }
   }
 
   // the QA chip: the score of an agent's QA tree, when one exists; a click flips the page to that folder
@@ -103,6 +104,14 @@ function actionHTML(source, ev, open) {
   const n = (ev.records || ev.touched).length, more = ev.count && ev.count > n + 3 ? '+' : '', mv = moved(source, ev.touched);
   const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + more + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
   return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
+}
+
+// what references a record: cells and rows as links, a cell waiting there marked; nothing when nothing does
+function referencedHTML(rb) {
+  const ms = rb.matches || [], ws = rb.watchers || [];
+  if (!ms.length && !ws.length) return '';
+  const row = m => `<div class="sv-refby ${m.cell ? 'cell' : 'rec'} ${m.hole ? 'hole' : ''}">${goHTML(m.path, folderOf(m.path), last(m.path), 'ref')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`;
+  return `<div class="sv-refd"><div class="k">referenced by</div>${ms.map(row).join('')}${ws.map(w => `<div class="sv-refby crew">${goHTML(w.path, folderOf(w.path), last(w.path), 'ref')}<span class="s">crew, ${esc(w.care)}</span></div>`).join('')}</div>`;
 }
 
 // the QA chip: green and quiet at zero, the count otherwise; the href is the QA folder on this same page
@@ -426,6 +435,18 @@ function mcpSource(opts = {}) {
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
   }
+  // what references a path: the records and cells under the page's folder (and under /agent) whose reference slots point
+  // at it or beneath it, each with the slot and whether a cell is waiting there; plus the kernel's crews on it
+  async function referencedBy(path) {
+    const node = local(views).split('/')[0], roots = [world(views)].concat(node ? ['/' + node + '/agent'] : []);
+    const out = { matches: [], watchers: [] };
+    for (const r of roots) {
+      const a = await rpc('read', { path: r, referencing: world(path), limit: 200 });
+      out.matches.push(...(a.matches || []).map(m => ({ path: local(m.path), slot: m.slot, cell: !!m.cell, hole: !!m.hole })));
+      if (!out.watchers.length) out.watchers = (a.watchers || []).map(w => ({ path: local(w.path), care: w.care }));
+    }
+    return out;
+  }
   // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
   async function qa() {
     const node = local(views).split('/')[0];
@@ -471,7 +492,7 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc, cursor };
+  return { read, answer, graph, follow, qa, rpc, cursor, referencedBy };
 }
 
 // the page: /live?views=<folder>&who=<writer>
@@ -482,7 +503,7 @@ function start(doc) {
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;

@@ -146,8 +146,10 @@ scope that disagrees with a computed answer keeps a note beside the
 cell, laid over by `amend` and stamped with the input's case, and never
 edits the answer or the source. Culling a scoped record removes the
 thing from that scope and nothing else; culling the object faults every
-cell that read it, and those faults are the list of who still depended
-on it, so read what points at a thing before retiring it. Pin where you
+cell that read it, so read what points at a thing before retiring it:
+`read path=<folder> referencing=<thing>` lists the cells and rows under
+the folder whose references point at it, each with its slot and whether
+a cell is waiting there (the page shows the same under an open record). Pin where you
 cite, point live where you depend. Every question is then a read over
 structure, nothing is said twice, nothing drifts, and the history is
 of facts and decisions, not activity. A live view is not free: a chain
@@ -155,12 +157,11 @@ recomputes on read, so reuse what consolidates a computation many would
 repeat, not views for their own sake, and measure a slow chain before
 inventing a cache for it.
 
-The world serves `<world-url>/mcp` on localhost only, with no credential:
-anything on the machine can read and write the world (booting one and
-connecting is `SETUP.md` beside this skill). Three verbs; this page shows
-the one form of each you will use most. Every knob is on the
-second page, `knobs.md`, read it when you need one (`apply` is there too).
-The shape is frozen: a new knob needs a measured round trip it removes.
+The world serves `<world-url>/mcp` on localhost only, with no credential
+(booting one is `SETUP.md` beside this skill). Three verbs; this page is
+the contract and the one form of each verb you use most. Every knob,
+every standard cell and every value rule is on the second page,
+`knobs.md`: read it when you need one, never from memory.
 
 ```
 read     path       /user/org/deals            a record, a folder, /x/<cell>, /c/x/<cell>
@@ -183,16 +184,9 @@ history  after=312 with=x
 ```
 
 A read never costs an event; a write costs exactly one, however many
-records it carries. A slot value is text, a number or a boolean. A number
-may be negative or a decimal: `-3` is kept signed, `4.5` is kept as `45`
-with `rating/scale: 1` and reads back as `4.5`; formulas add, compare and
-rank by the signed value. `{type, value}` makes an exact `nat`, `int`,
-`str`, `bool` or `path`; a reference
-to another record is `{type: reference, path, care, case}` (care x, y or z,
-case 0 for live). A path segment is letters, digits and underscore: `c-7`
-is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
-`next` continues it. A value that is code or over 8 KB comes back as
-`{type, size, reference}`, never inline.
+records it carries. What a slot may hold, how numbers, references and
+path segments are spelled, and how big an answer gets are on the second
+page under Values.
 
 ## Thinking in the world
 

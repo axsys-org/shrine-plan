@@ -15,6 +15,10 @@ care      x | y | z            x the record, y the record and its children (defa
 case      0                    0 live (default), or a case to read as of then
 find      acme                 the records under path whose name or any slot's text contains it, in tap order,
                                limit of them visited at a time, each with the slot that matched; next continues
+referencing  /user/org/deals  the records under path whose reference slots point at that path or beneath it, in tap
+                               order, limit visited at a time: each with the slot, the target, cell (it is a cell) and hole
+                               (a cell waiting there: the target absent, an ask unanswered, a hole, a fault); next continues;
+                               plus watchers, the reactive records whose crews depend on it, from the kernel's crew index
 formula   where                run a standard cell over the tree read, settings as its context; nothing written
 settings  {key: "/status", value: "closed"}
 limit     100                  nodes per answer, in tap order (a node, then its children by name); never over 500
@@ -135,6 +139,19 @@ out the same way (`who` is the hand's name).
 ```
 apply    path, operation, inputs, then [a read, ...]     an op a record carries; cells never need it
 ```
+
+## Values
+
+A slot value is text, a number or a boolean. A number
+may be negative or a decimal: `-3` is kept signed, `4.5` is kept as `45`
+with `rating/scale: 1` and reads back as `4.5`; formulas add, compare and
+rank by the signed value. `{type, value}` makes an exact `nat`, `int`,
+`str`, `bool` or `path`; a reference
+to another record is `{type: reference, path, care, case}` (care x, y or z,
+case 0 for live). A path segment is letters, digits and underscore: `c-7`
+is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
+`next` continues it. A value that is code or over 8 KB comes back as
+`{type, size, reference}`, never inline.
 
 ## Numbers in slots
 

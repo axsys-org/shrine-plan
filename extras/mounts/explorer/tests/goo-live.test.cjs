@@ -375,3 +375,20 @@ test('a path presented off the page\'s folder moves the page to its folder', asy
   await s.handler({shown: {path: '0x11/user/org/views/headcount', care: 'x', case: 0}});
   assert.equal(flipped.length, 1, 'a path inside the page\'s folder draws in place');
 });
+
+// ---- what references a record
+test('referencedBy reads the page folder and /agent with the referencing knob; the strip lists cells and rows, a waiting cell marked', async () => {
+  const m = fakeMcp((name, a) => ({path: a.path, referencing: a.referencing, matches: a.path.endsWith('/agent') ? [] : [
+    {path: N + '/views/payroll', slot: '/sys/tack', target: N + '/members', cell: true, hole: false},
+    {path: N + '/views/budget', slot: '/sys/tack', target: N + '/members/nobody', cell: true, hole: true},
+    {path: N + '/notes/n1', slot: '/about', target: N + '/members', cell: false, hole: false}], watchers: [{path: '/0x11/app/cache', care: 'z', on: N + '/members'}], visited: 3, next: null}));
+  const s = mcpSource({fetch: m.fetch, views: '/0x11/user/org', EventSource: null});
+  const rb = await s.referencedBy('0x11/user/org/members');
+  assert.deepEqual(m.calls.map(c => [c.args.path, c.args.referencing]), [[N, N + '/members'], ['/0x11/agent', N + '/members']]);
+  assert.deepEqual(rb.matches.map(x => [x.path, x.cell, x.hole]), [['0x11/user/org/views/payroll', true, false], ['0x11/user/org/views/budget', true, true], ['0x11/user/org/notes/n1', false, false]]);
+  const html = live.referencedHTML(rb);
+  assert.match(html, /<div class="sv-refd"><div class="k">referenced by<\/div><div class="sv-refby cell "><a class="ref go" href="\?views=\/0x11\/user\/org\/views" data-go="0x11\/user\/org\/views\/payroll"/);
+  assert.match(html, /<div class="sv-refby cell hole">.*<span class="h">waiting<\/span>/);
+  assert.match(html, /<div class="sv-refby crew">.*<span class="s">crew, z<\/span>/);
+  assert.equal(live.referencedHTML({matches: [], watchers: []}), '');
+});
