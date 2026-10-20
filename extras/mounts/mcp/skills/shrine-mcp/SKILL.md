@@ -97,6 +97,40 @@ filling down into your namespace or pointing outward to an existing
 view; the aim is not zero literals, it is that the namespace accumulates
 reusable computation rather than textual claims about work done.
 
+### One object, many scopes
+
+A thing mentioned in more than one place, or with facts of its own,
+gets one record at one path (`/user/people/jane`,
+`/user/customers/northwind`); that path is its identity, and every
+other mention is a reference to it. A thing mentioned once with nothing
+of its own stays a literal; make the shared object at the second
+mention or the first fact, not before. Imported names become pointers
+once with `reference`; `find` locates the object you suspect exists
+before you make a second one; a move is a new path and a `moved_to`
+reference on the old record, never a cull.
+
+The shared object holds only what is true of the thing everywhere. What
+is true of it within a scope lives as a record in that scope's folder
+pointing at the object: `/user/org/acme/people/jane {person: ref
+/user/people/jane, role: lead, rate: 120}`. So changing Jane in respect
+to the org changes the org's record; removing her from the org culls
+the org's record; the shared object changes only for a fact true of her
+everywhere. Editing the object to fix one scope's view is a write in
+the wrong place.
+
+Views cross the boundary, data does not: a view over the scope uses
+`follow` to bring the object's slots onto the row at read time, and
+`gather` puts several scopes' answers in one tree; nothing is copied. A
+scope that disagrees with a computed answer keeps a note beside the
+cell, laid over by `amend` and stamped with the input's case, and never
+edits the answer or the source. Culling a scoped record removes the
+thing from that scope and nothing else; culling the object faults every
+cell that read it, and those faults are the list of who still depended
+on it, so read what points at a thing before retiring it. Pin where you
+cite, point live where you depend. Every question is then a read over
+structure, nothing is said twice, nothing drifts, and the history is
+of facts and decisions, not activity.
+
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
 connecting is `SETUP.md` beside this skill). Three verbs; this page shows
