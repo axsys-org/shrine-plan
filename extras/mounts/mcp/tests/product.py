@@ -557,8 +557,12 @@ def check(base, node, timeout):
     expect('34 the stream closed, the resident is away; the hands, the journal and the launcher are not residents',
            ([r for r in agents['residents'] if r['name'] == 'tester'][0]['present'], {r['name'] for r in agents['residents']} & {'hands', 'journal', 'launcher'}), (False, set()))
     thing = tool('read', 'read (thing)', path=org + '/notes', thing=True)
-    expect('34 a thing: its owner is its oldest writer, its last writer the newest, zero events',
-           (thing['thing']['owner'], thing['thing']['last_writer'], 'tester' in thing['thing']['writers'], epoch() - e0 - 2), ('tester', 'tester', True, 0))
+    expect('34 a thing: its owner is its oldest writer, its last writer the newest, and what references it is listed with its writer and no hole, zero events',
+           (thing['thing']['owner'], thing['thing']['last_writer'], 'tester' in thing['thing']['writers'], [(r['path'], r['who'], r['hole']) for r in thing['thing']['referenced_by']], epoch() - e0 - 2),
+           ('tester', 'tester', True, [(tester_place + '/our/notes', 'tester', False)], 0))
+    nowhere = tool('read', 'read (thing)', path=org + '/nowhere', thing=True)
+    expect('34 a thing nobody wrote yet is still referenced: the cell waiting on it shows with a hole',
+           [(r['path'], r['hole']) for r in nowhere['thing']['referenced_by']], [(tester_place + '/views/missing', True)])
 
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}

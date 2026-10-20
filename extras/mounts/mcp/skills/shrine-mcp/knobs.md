@@ -101,7 +101,7 @@ ask hand runs on that.
 
 ## Things
 
-`read path=<thing> thing=true` adds `thing` beside the tree: `{path, owner, last_writer, writers}`, from the journal (400 events back): `owner` the oldest writer the walk finds, the maker for anything recent; nothing moves ownership, a thing stays in the namespace that made it.
+`read path=<thing> thing=true` adds `thing` beside the tree: `{path, owner, last_writer, writers, referenced_by}`, from the journal (400 events back): `owner` the oldest writer the walk finds, the maker for anything recent; nothing moves ownership, a thing stays in the namespace that made it. `referenced_by` is what points at the thing or beneath it, `[{path, who, epoch, hole}]`, newest first: the questions about your thing, written at home by their askers, `hole` true when the pointing cell is waiting there (an input nobody wrote, an ask with no answer). The kernel's own dependency index is not readable from the mount yet; the walk stands in for it, so a reference older than 400 events is not listed. One snapshot, zero events.
 
 ## Write only if unchanged
 
