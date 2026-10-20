@@ -29,7 +29,7 @@ function mountViewer(el, source, opts = {}) {
       if (r && r.record === null) line = '<span class="m gone">deleted</span>';
       else if (r && isCell(r.record)) { const a = await source.answer(p); line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
       else line = `<span class="m">${r ? lineHTML(r.record) : ''}</span>`;
-      return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span><span class="p">${esc(p)}</span>${line}</summary><div class="body"></div></details>`;
+      return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span>${goHTML(p, folderOf(p), p, 'p')}${line}</summary><div class="body"></div></details>`;
     }));
     body.innerHTML = items.join('');
     for (const d of body.querySelectorAll('details.sv-recd')) { if (d.open) await fillRecord(d, ev, 'y'); d.addEventListener('toggle', () => d.open && fillRecord(d, ev, 'z')); }
@@ -69,7 +69,17 @@ function mountViewer(el, source, opts = {}) {
     return draw(msg);
   });
   if (opts.crumb !== undefined) $('.sv-crumb').innerHTML = crumbHTML(opts.crumb);
-  return { draw };
+  // a click on a path or a reference: the person's cursor is written (the agent sees it on the stream), then the page
+  // moves to that folder; the link itself works without script
+  async function go(path, folder) {
+    if (source.cursor) await source.cursor(path).catch(() => {});
+    if (opts.flip) opts.flip(folder); else root.location.search = '?views=/' + folder;
+  }
+  el.addEventListener('click', e => {
+    const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
+    e.preventDefault(); go(a.dataset.go, a.dataset.folder);
+  });
+  return { draw, go };
 }
 
 // what a write moved: the cells that read any touched path, one hop
@@ -103,6 +113,10 @@ function cellsHTML(cells) {
 // ---------- rendering ----------
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 const last = p => p ? p.split('/').pop() : 'namespace';
+// a record's folder is the one above it; a reference names the thing a cell reads, usually a folder, so it is its own
+const folderOf = p => { const i = String(p).lastIndexOf('/'); return i > 0 ? p.slice(0, i) : p; };
+// a path the person can click: the page moves to `folder`, and the click writes the cursor at `path`
+const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?views=/${esc(folder)}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
 const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
 const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
 
@@ -110,7 +124,7 @@ const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m
 function valueHTML(v, cls = 'sv-v') {
   if (typeof v === 'number') return `<span class="${cls}">${v.toLocaleString()}</span>`;
   const s = String(v);
-  const r = refOf(s); if (r) return `<span class="${cls} ref" data-path="${esc(r.path.replace(/^\/x\//, ''))}">${esc(s)}</span>`;
+  const r = refOf(s); if (r) { const p = r.path.replace(/^\/x\//, ''); return `<span class="${cls} ref" data-path="${esc(p)}">${goHTML(p, p, s, 'r')}</span>`; }
   if (/^blob:/.test(s)) { const [, hash, mime, size] = s.split(':'); return `<span class="${cls} blob">${mime && mime.startsWith('image') ? `<img alt="" src="/blob/${esc(hash)}">` : ''}${esc(hash.slice(0, 8))} &middot; ${esc(size || '')}</span>`; }
   if (s === 'yes' || s === 'no') return `<span class="${cls} flag ${s}">${s}</span>`;
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return `<span class="${cls}">${esc(s)}</span>`;
@@ -361,6 +375,11 @@ function mcpSource(opts = {}) {
     return j.result.structuredContent;
   }
   const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
+  // the person's cursor: one record under the node's /agent/person, signed person, so the agent sees the click as a line
+  async function cursor(path) {
+    const node = local(path).split('/')[0]; if (!node) return null;
+    return rpc('write', { who: 'person', records: [{ path: '/' + node + '/agent/person/cursor', slots: { path: world(path) } }] });
+  }
   async function read(path, care, cas) {
     const w = world(path), held = care === 'x' && !cas ? carried(w) : null;
     return readOf(held || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 }));
@@ -446,7 +465,7 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc };
+  return { read, answer, graph, follow, qa, rpc, cursor };
 }
 
 // the page: /live?views=<folder>&who=<writer>
@@ -458,7 +477,7 @@ function start(doc) {
 }
 
 const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
-  adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
+  adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
 if (typeof document !== 'undefined') { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => start(document)); else start(document); }

@@ -112,6 +112,10 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   and URL; a temporary one starts over). If you cannot open a browser, give
   the link in your reply every time it changes, as a line on its own, so it
   is always one click away.
+- The person can click any path or reference on the page. A click writes
+  `/agent/person/cursor {path}` signed `person`, a line on the stream like
+  any other. When it moves, read it, open the page at that folder, and
+  work there until they click again or say otherwise.
 
 ## Working with others
 
