@@ -115,6 +115,7 @@ HANDS = ('ask', 'clock', 'watch', 'export', 'import')
 class Hand:
     name = 'hand'
     every = 60.0            # seconds between ticks
+    lag = 100               # lines a hand may fall behind its seen mark before a tick marks it anyway
 
     def __init__(self, world, log=print, **overrides):
         self.w, self.log = world, log
@@ -124,6 +125,7 @@ class Hand:
         self.config.update({k: v for k, v in overrides.items() if v is not None})
         seen = self.w.read(self.home + '/seen', 'x').get('properties') or {}
         self.seen = int(seen.get('/epoch') or 0)
+        self.marked = self.seen
         self.last_tick = None
 
     # ---- the two methods a hand writes
@@ -151,7 +153,15 @@ class Hand:
         return self.w.tool('write', records=[record], who=self.name)
 
     def mark_seen(self):
-        self.w.tool('write', records=[{'path': self.home + '/seen', 'slots': {'epoch': self.seen}}], who=self.name)
+        """Write the seen mark when it moved.  A mark is an event: on the live page it lands on top of whatever the
+        hand just saw, so it is written after the hand's own writes, and otherwise only when the hand has fallen
+        `lag` lines behind its last mark (a restart then catches up from there, which is reads, not events)."""
+        if self.seen != self.marked:
+            self.w.tool('write', records=[{'path': self.home + '/seen', 'slots': {'epoch': self.seen}}], who=self.name)
+            self.marked = self.seen
+
+    def behind(self):
+        return self.seen - self.marked >= self.lag
 
     def catch_up(self):
         """Every line since seen, from the log (the poll's shape), through line()."""
@@ -198,13 +208,14 @@ class Hand:
             self.log(f'{self.name}: {e}')
         self.last_tick = now
         self.catch_up()
-        self.mark_seen()
+        if done or self.behind():
+            self.mark_seen()
         return done
 
     def run(self, follow_lines, clock=time.time):
         """The hand's life: a tick at start, every line as it comes, a tick every `every` seconds.  Seen is marked
-        only after the hand wrote something or on a tick: a mark is an event, and an event is a line to every other
-        hand."""
+        after the hand wrote something, or on a tick once it is `lag` lines behind its mark: a mark is an event, a
+        line to every other hand and the top of the live page, so an idle hand writes none."""
         self.once(clock())
         for item in follow_lines:
             did = self.take(item)
@@ -216,7 +227,7 @@ class Hand:
                 except Exception as e:
                     self.log(f'{self.name}: {e}')
                 self.last_tick = now
-            if did or ticked:
+            if did or (ticked and self.behind()):
                 self.mark_seen()
 
 
