@@ -139,6 +139,33 @@ tree of lettered sections. The test, before writing any slot: would a
 cell want to read this, or would only a person want to read it? The
 first is a slot; the second is a note or nothing.
 
+### Seeding: inputs first, outputs as views
+
+A record is an input or it is a cell; never both. An input holds what
+nothing can derive: a quotation, a date, a quantity as the source gives
+it, a reference to another thing. An output is anything you arrived at
+by looking at inputs: a total, a judgement, a status, a reconciliation,
+whether two sources agree. Outputs are never slots on the input they
+came from; they are cells over the inputs, read at `/x`, and the next
+view reads those. A record that carries both, `quantity: 154` beside
+`date_status: "not established"`, or `expected: 800` beside a scope
+note, has mixed what it was told with what you concluded, and no cell
+can ever be over the fact alone again.
+
+So seed in order. First the kinds: a folder per kind within a scope,
+and for each kind its shape chosen once, the slot names, their types,
+the few values a chosen slot may take; the same kind elsewhere reuses
+the same shape. Then the inputs, uniformly, every row the same slots,
+numbers as numbers, dates as `YYYYMMDD`, keys turned into references
+with `reference` once, text only as quotation or as `notes`. Then the
+views over them, and the views over those, up as far as the questions
+go; a check is a `validate` or a `diff` cell, a vocabulary is audited by
+`distinct`, a key by `unique`, and those cells stay so the next import
+is held to the same shape. What you would have typed into a slot as a
+result is the next cell to write instead. A seed is finished when a
+reader can rebuild every output from the inputs by following the
+cells, and when the inputs carry nothing a cell could have said.
+
 ### One object, many scopes
 
 A thing mentioned in more than one place, or with facts of its own,
