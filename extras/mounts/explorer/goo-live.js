@@ -134,9 +134,11 @@ const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?views=/
 const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
 const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
 
+// a number as text: a year (four digits) or a day (eight digits, YYYYMMDD) is drawn as written, a quantity grouped
+const numText = v => (Number.isInteger(v) && (String(v).length === 4 || String(v).length === 8)) ? String(v) : v.toLocaleString();
 // one value, by kind; the only place a value's kind is decided
 function valueHTML(v, cls = 'sv-v') {
-  if (typeof v === 'number') return `<span class="${cls}">${v.toLocaleString()}</span>`;
+  if (typeof v === 'number') return `<span class="${cls}">${numText(v)}</span>`;
   const s = String(v);
   const r = refOf(s); if (r) { const p = r.path.replace(/^\/x\//, ''); return `<span class="${cls} ref" data-path="${esc(p)}">${goHTML(p, p, s, 'r')}</span>`; }
   if (/^blob:/.test(s)) { const [, hash, mime, size] = s.split(':'); return `<span class="${cls} blob">${mime && mime.startsWith('image') ? `<img alt="" src="/blob/${esc(hash)}">` : ''}${esc(hash.slice(0, 8))} &middot; ${esc(size || '')}</span>`; }
@@ -150,7 +152,7 @@ const isShort = v => typeof v === 'number' || String(v).length < 24;
 function slotLayout(slots) {
   const s = Object.entries(slots || {});
   if (!s.length) return '';
-  if (s.length === 1 && typeof s[0][1] === 'number') return `<div class="sv-one">${s[0][1].toLocaleString()}<span class="u">${esc(s[0][0])}</span></div>`;
+  if (s.length === 1 && typeof s[0][1] === 'number') return `<div class="sv-one">${numText(s[0][1])}<span class="u">${esc(s[0][0])}</span></div>`;
   const long = s.some(([, v]) => typeof v !== 'number' && String(v).length > 80);
   if (s.length > 6 || long) return `<div class="sv-list">${s.map(([k, v]) => `<span class="sv-k">${esc(k)}</span>${valueHTML(v)}`).join('')}</div>`;
   return `<div class="sv-grid">${s.map(([k, v]) => `<div class="s ${isShort(v) ? '' : 'wide'}"><span class="sv-k">${esc(k)}</span>${valueHTML(v)}</div>`).join('')}</div>`;
