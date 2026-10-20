@@ -21,6 +21,9 @@ lives. Default to it:
   memory of it.
 - A session starts: read `/agent/<name>/plan` and `history after seen`
   before anything else, and say where things stand.
+- The world does not answer: run `x/setup` from the checkout, a kept
+  world resumes in seconds; continue from `seen`, reopen the live page,
+  and say you did.
 
 Say "kept it" when you keep something, and give the live page link once.
 Never name the tools or the formulas to the person unless they ask how.
@@ -109,6 +112,19 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   and URL; a temporary one starts over). If you cannot open a browser, give
   the link in your reply every time it changes, as a line on its own, so it
   is always one click away.
+
+## Working with others
+
+A convention, not a feature. Your name is your `who`. Your inbox is
+`/agent/<name>/inbox`: to ask another agent something, write a record
+there under their name and watch `history after seen` for its answer; to
+answer, write a record in theirs. To hand off a step, write the step to
+their plan with `if_case` set to the plan's case, so a plan that moved
+under you refuses the write instead of losing a step. Never assume a
+session is the only one: read `history` before you act on what you
+remember, and sign everything. Two Claudes, a Codex and a Gemini on one
+world are then coworkers with a shared journal, and no two of them need
+to speak the same wire.
 
 What is not a formula is an `ask` (on the second page): a cell a model
 answers, stamped with the input's case. "QA mode on" means the third page,
