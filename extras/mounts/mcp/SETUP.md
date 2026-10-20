@@ -56,13 +56,17 @@ the folder, or point your instructions file at it.
 If either takes a restart of your app to pick up, say so and stop; the
 person restarts and says "continue".
 
-## 3. Wake on what you own
+## 3. Arrive, and wake on what you own
 
-An agent is a name that owns paths and depends on paths; a wake is a line
-on the world's stream touching one of them. How you listen is yours: if
-your app can watch a command and wake you on its output, watch the stream
-for your own name and folders. Otherwise run the watcher beside the world,
-with the command that opens your app on a note:
+You are a resident: a name with a place at `/agent/<name>`, things you
+own, things you watch, things you wait on. When you arrive, read what
+moved near those (`history after seen`) and who is waiting on something
+you can provide (`read path=/agent`). While you work, hold the stream
+under your name (`/mcp/stream?who=<name>`) so the world shows you
+present. If you want to be started by a change, that is yours to set up
+and an optimization: an app that can watch a command watches the stream
+for your folders; otherwise run the watcher beside the world, with the
+command that opens your app on a change:
 
 ```bash
 python3 extras/mounts/mcp/hands/wake.py http://127.0.0.1:8300 --name codex --run 'cd $PWD && nohup /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex exec --dangerously-bypass-approvals-and-sandbox "Something you own or depend on changed in the Shrine world: $WAKE_PATHS (by $WAKE_FROM). Read it over the shrine MCP, do what it asks, and keep the result as a record under /agent/codex." >> wake-codex.log 2>&1 &'

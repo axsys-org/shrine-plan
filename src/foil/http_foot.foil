@@ -22,6 +22,7 @@
       http_foot/action/stream
       http_foot/action/broadcast
       http_foot/action/join
+      http_foot/action/present
       http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
@@ -71,14 +72,19 @@
       ' A GET that stays open. The connection sends the event-stream
       ' head, registers with the fan-out, and then writes each line it
       ' is given until the socket closes. Commits never wait for it.
-      :
+      ' who is the resident's name, from the join (empty when none).
+      : who=str
     + broadcast
       ' One line for every open stream, from a connection to the foot.
       : line=str
     + join
       ' A stream connection registering itself with the foot (its
-      ' handle rides as the capability).
-      :
+      ' handle rides as the capability), under the resident's name.
+      : who=str
+    + present
+      ' A snapshot that first learns who has a stream open now: the
+      ' fan-out answers the names, then the read runs with them.
+      : read={\ row[str] namespace}[nat str]
     + after
       ' A snapshot whose answer decides the next action: a read that
       ' feeds a write, in one request.
@@ -118,6 +124,7 @@
       http_foot/action/stream
       http_foot/action/broadcast
       http_foot/action/join
+      http_foot/action/present
       http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
@@ -399,14 +406,21 @@
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
-    = streaming=bool
+    = who=str
         ? planned
          > (./ask action)
           ? action
-           > .stream .true
+           > (./stream w) w
+          ""
+        ""
+      streaming=bool
+        ? planned
+         > (./ask action)
+          ? action
+           > (./stream _) .true
           .false
         .false
-      joining=http_foot/action .join
+      joining=http_foot/action (./join who)
     ? streaming
       ; (Try (\ wire=nat (Write fd wire)) (http_foot/bar http_foot/stream_head))
       ; (SendCaps foot joining [0])
@@ -424,7 +438,12 @@
     & http_foot/stream_msg/join
       http_foot/stream_msg/line
       http_foot/stream_msg/streamed
+      http_foot/stream_msg/present
     + join
+      : who=str
+    + present
+      ' Who is on the stream now: the fan-out answers the asker (its
+      ' handle rides as the capability) with the names, one per line.
       :
     + line
       : text=str
@@ -473,35 +492,49 @@
     ' over and goes on.
     \ self=nat
     ^ nat
-    % streams=row[[h=nat behind=nat]] []
+    % streams=row[[h=nat behind=nat who=str]] []
     = ;[message caps] (Recv[http_foot/stream_msg] 0)
     ? message
-     > .join
+     > (./join who)
       ? (eq caps.len 0) (_ streams)
       ; (helm/supervisor/close_caps caps.drop(1))
-      | _ streams.snoc([caps.at(0) 0])
+      | _ streams.snoc([caps.at(0) 0 who])
+     > .present
+      ' the names on the stream now, one per line, to the asker
+      ? (eq caps.len 0) (_ streams)
+      = nl (str/snoc_byte 10 "")
+        text
+          % i=nat 0 acc=str ""
+          ^ str
+          ? (eq i streams.len) acc
+          = [h behind who] streams.at(i)
+          ? (eq who.len 0) (_ i.inc acc)
+          | _ i.inc (str/cat_all [acc who nl])
+      ; (Try (\ target=nat (Send target (http_driver/response 200 text))) caps.at(0))
+      ; (helm/supervisor/close_caps caps)
+      | _ streams
      > .streamed
       ? (eq caps.len 0) (_ streams)
       = from caps.at(0)
         eased
           | streams.map
-            \ [h behind]
-            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind)]
+            \ [h behind who]
+            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind) who]
       ; (helm/supervisor/close_caps caps)
       | _ eased
      > (./line text)
       ; (helm/supervisor/close_caps caps)
-      = none=row[[h=nat behind=nat]] []
+      = none=row[[h=nat behind=nat who=str]] []
         ;kept
           | streams.fold none
-          \ ;out=row[[h=nat behind=nat]] [h behind]
-          ^ row[[h=nat behind=nat]]
+          \ ;out=row[[h=nat behind=nat who=str]] [h behind who]
+          ^ row[[h=nat behind=nat who=str]]
           ? (gt behind 64)
             ; (CloseHandle h)
             out
           = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
           ? sent
-           > (./ok _) out.snoc([h behind.inc])
+           > (./ok _) out.snoc([h behind.inc who])
            > (./err _)
             ; (Try (\ target=nat (CloseHandle target)) h)
             out
@@ -568,6 +601,13 @@
       = ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot read)))
       ; (? (gt line.len 0) (Send foot (http_foot/action/broadcast line)) 0)
       | ready
+     > (./present read)
+      = ;roster (http_foot/ask foot (http_foot/action/present read))
+        names=row[str]
+          ? roster
+           > response=http_response (http_foot/split 10 (http_foot/body_text response)).keep((\ n=str (gt n.len 0)))
+           > (./bytes _ _ _) []
+      | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (read names state))))
      > (./after read next)
       = ;answer (http_foot/ask foot (http_foot/action/snapshot read))
       ? answer
@@ -749,16 +789,23 @@
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A told read is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > .stream
+     > (./stream _)
       ? (eq caps.len 0) (_ serial pending queue)
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A stream is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > .join
-      ' a stream connection joining: its handle goes to the fan-out
+     > (./join who)
+      ' a stream connection joining: its handle goes to the fan-out, under its name
       ? (eq caps.len 0) (_ serial pending queue)
-      = joined=http_foot/stream_msg .join
+      = joined=http_foot/stream_msg (./join who)
       ; (SendCaps streams joined [caps.at(0)])
+      ; (helm/supervisor/close_caps caps)
+      | _ serial pending queue
+     > (./present _)
+      ' who is on the stream: the fan-out answers the connection itself
+      ? (eq caps.len 0) (_ serial pending queue)
+      = asked=http_foot/stream_msg .present
+      ; (SendCaps streams asked [caps.at(0)])
       ; (helm/supervisor/close_caps caps)
       | _ serial pending queue
      > (http_foot/action/broadcast line)

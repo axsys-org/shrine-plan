@@ -264,7 +264,7 @@ test('who= filters the poll and the stream; who=all shows system events', async 
   class ES { constructor(url) { this.url = url; es = this; } close() {} }
   mcpSource({fetch: fakeMcp(() => ({events: [], next: null})).fetch, EventSource: ES, who: 'all', ...timers}).follow(ev => { log.push(ev); });
   await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
-  assert.equal(es.url, '/mcp/stream');
+  assert.equal(es.url, '/mcp/stream?who=person');
   es.onopen();
   es.onmessage({data: JSON.stringify({epoch: 3, label: 'boot', who: 'system', touched: ['/0x11/weft/x'], with: {}})});
   es.onmessage({data: JSON.stringify({epoch: 4, label: 'make cell vendors', who: 'agent', touched: [N + '/views/vendors'], with: {}})});
@@ -374,4 +374,28 @@ test('a path presented off the page\'s folder moves the page to its folder', asy
   assert.deepEqual(flipped, ['0x11/user/shrine/views']);
   await s.handler({shown: {path: '0x11/user/org/views/headcount', care: 'x', case: 0}});
   assert.equal(flipped.length, 1, 'a path inside the page\'s folder draws in place');
+});
+
+// ---- the residents of the world
+test('residents: one read of /agent at care x; the strip shows present, last, owns, watches and waiting as links', async () => {
+  const m = fakeMcp((name, a) => ({path: a.path, exists: true, properties: {}, children: [], nodes: 1, next: null,
+    residents: [{name: 'codex', present: true, last: 120, owns: ['/0x11/agent/codex', '/0x11/user/shrine'], watches: ['/0x11/user/shrine'], waiting: [], can: {read: 'all', write: 'all', compute: []}},
+                {name: 'claude', present: false, last: 114, owns: ['/0x11/agent/claude'], watches: [], waiting: ['/0x11/user/org/views/forecast'], can: {}}]}));
+  const s = mcpSource({fetch: m.fetch, views: '/0x11/user/org', EventSource: null});
+  const rs = await s.residents();
+  assert.deepEqual(m.calls[0], {url: '/mcp', name: 'mcp/read', args: {path: '/0x11/agent', care: 'x'}});
+  assert.deepEqual(rs.map(r => [r.name, r.present, r.last, r.owns, r.waiting]), [['codex', true, 120, ['0x11/agent/codex', '0x11/user/shrine'], []], ['claude', false, 114, ['0x11/agent/claude'], ['0x11/user/org/views/forecast']]]);
+  const html = live.residentsHTML(rs);
+  assert.match(html, /<div class="sv-res here" data-name="codex"><span class="dot"><\/span><span class="n">codex<\/span><span class="last">at 120<\/span><span class="k">owns<\/span>/);
+  assert.match(html, /<div class="sv-res away" data-name="claude">/);
+  assert.match(html, /<span class="k wait">waiting on<\/span><span class="ps"><a class="wait go" href="\?views=\/0x11\/user\/org\/views\/forecast" data-go="0x11\/user\/org\/views\/forecast"/);
+  assert.equal(live.residentsHTML([]), '');
+});
+
+test('the page joins the stream under the viewer\'s name', () => {
+  const opened = [];
+  function ES(url) { opened.push(url); this.close = () => {}; }
+  const s = mcpSource({fetch: fakeMcp(() => ({events: [], next: null})).fetch, views: '/0x11/user/org', person: 'ian', EventSource: ES, setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0});
+  const f = s.follow(() => {});
+  return new Promise(r => setTimeout(r, 5)).then(() => { f.stop(); assert.deepEqual(opened, ['/mcp/stream?who=ian']); });
 });

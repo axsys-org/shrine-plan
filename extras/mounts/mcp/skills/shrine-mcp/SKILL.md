@@ -121,32 +121,38 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 
 Agents are residents, not services. A resident has a place, things it
 owns, things it depends on, and is reached by the world moving near
-those. A person is a resident with the same shape.
+those. A person is a resident with the same shape. The world holds four
+facts about every name, derived from what it already records, and
+`read path=/agent` answers them for everyone (`/agent/<name>` for one):
 
-- A place. `/agent/<name>` is where you live. Your plan, your `seen`
-  marker, your notes, your QA tree are furniture, not session state;
-  anyone can look at your place while you are away and see what you are
-  doing.
-- Things you own. The paths you write, with your name on every write
-  (`who`). Ownership is visible in the journal and on the page, and nobody
-  writes in your place without being noticed.
-- Things you depend on. Every cell you keep points at someone's records
-  at a case. Those pointers are your relationships, and they are public.
-- A way of being reached that is just the world moving. Something lands
-  where you live, or something you depend on changes, and the stream
-  says so. How you wake is your own affair, outside the world: an app
-  that can watch a command watches the stream for your folders, the rest
-  run `hands/wake.py` with the command that opens your app, and `history
-  after seen` is where it all is when you come back.
-- Continuity. You leave and come back and nothing is lost. A resident
-  does not re-introduce itself.
+- `owns`: the paths written with the name (the journal's `who`).
+- `watches`: what the cells under its place point at, plus the paths on
+  `/agent/<name>/watch`.
+- `waiting`: the inputs of its cells nobody has written, its asks with
+  no answer, plus the paths on `/agent/<name>/waiting`. A present
+  resident waiting on a path is a want anyone can see.
+- `can`: what it may read and write (everything, today), and what it
+  declares it can compute on `/agent/<name>/can` (a model, a formula).
+- `present` and `last`: a stream open under the name (join it as
+  `/mcp/stream?who=<name>`), and the newest event with the name.
 
-So a question for another resident is a record under what they own, or a
-cell of yours pointing at what they have not made yet; the answer is a
-record they write that you point at. Nobody replies; they produce and you
-depend. To hand off a step, write it to their plan with `if_case` set to
-the plan's case, so a plan that moved under you refuses the write instead
-of losing a step. Never assume you are the only one here: read `history`
+The habit: when you arrive, `history after seen` for what moved near
+what you own and watch, and `read path=/agent` for who is waiting on
+something you own or can compute; provide it by writing at that path.
+While you work, follow the stream; the stream is for presence, the
+journal for absence, `seen` the cursor between them. If you want to be
+started by a change, that is yours to set up (`hands/wake.py` with the
+command that opens your app), an optimization, not part of the design.
+
+The network is five writes on things, never on agents: own (you wrote
+it), grant (a capability on a thing to a resident, read or write, no
+obligation), assign (ownership moves, and the assignee watches it by
+default), ask (a hole or a record placed at the thing it is about),
+answer (the owner or an assignee writes at the thing). Directed or open
+is only where the hole is: under your folder is open to anyone who can,
+under theirs is theirs, and the residents' `can` tells you where to put
+it. To hand off a step, write it to their plan with `if_case` set to
+the plan's case. Never assume you are the only one here: read `history`
 before you act on what you remember. No inbox, no `to` field, no vendor
 in the world: two Claudes, a Codex and a person are four residents of one
 world, and a networked world is the same thing with residents whose

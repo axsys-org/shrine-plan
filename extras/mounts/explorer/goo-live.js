@@ -8,7 +8,7 @@
 
 function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-who"></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
   const $ = sel => el.querySelector(sel);
   const state = { events: [], shown: null, drawn: false };
   const views = local(opts.views !== undefined ? opts.views : opts.crumb);   // the page's folder: an agent's QA writes show only on the QA folder's page
@@ -48,11 +48,16 @@ function mountViewer(el, source, opts = {}) {
     $('.sv-qa').innerHTML = q ? qaChipHTML(q) : '';
     const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else root.location.search = '?views=/' + q.folder; });
   }
+  // the residents of the world, in the header: who is here, what they hold, what they wait on
+  async function who() {
+    if (!source.residents) return;
+    try { $('.sv-who').innerHTML = residentsHTML(await source.residents()); } catch (e) { /* a world without the view */ }
+  }
   async function draw(ev) {
     state.drawn = true;
     await index();
     $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
-    chip();
+    chip(); who();
     const nowEl = $('.sv-now'), earlier = $('.sv-earlier');
     nowEl.innerHTML = actionHTML(source, ev, true);
     const det = nowEl.querySelector('details.sv-act'); await fillAction(det, ev, true);
@@ -103,6 +108,13 @@ function actionHTML(source, ev, open) {
   const n = (ev.records || ev.touched).length, more = ev.count && ev.count > n + 3 ? '+' : '', mv = moved(source, ev.touched);
   const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + more + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
   return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
+}
+
+// the residents: a dot for present, the name, the last epoch, what they own, watch and wait on (paths as links)
+function residentsHTML(rs) {
+  if (!rs.length) return '';
+  const paths = (ps, cls) => ps.slice(0, 6).map(p => goHTML(p, p, last(p), cls)).join('') + (ps.length > 6 ? `<span class="more">+${ps.length - 6}</span>` : '');
+  return `<div class="sv-residents">${rs.map(r => `<div class="sv-res ${r.present ? 'here' : 'away'}" data-name="${esc(r.name)}"><span class="dot"></span><span class="n">${esc(r.name)}</span><span class="last">${r.last ? 'at ' + r.last : ''}</span>${r.owns.length ? `<span class="k">owns</span><span class="ps">${paths(r.owns, 'own')}</span>` : ''}${r.watches.length ? `<span class="k">watches</span><span class="ps">${paths(r.watches, 'watch')}</span>` : ''}${r.waiting.length ? `<span class="k wait">waiting on</span><span class="ps">${paths(r.waiting, 'wait')}</span>` : ''}</div>`).join('')}</div>`;
 }
 
 // the QA chip: green and quiet at zero, the count otherwise; the href is the QA folder on this same page
@@ -369,7 +381,7 @@ const labelOf = written => written.length ? last(written[0]) + (written.length >
 const eventOf = e => { const records = writtenOf(e); return { epoch: e.epoch, label: e.label || labelOf(records), who: e.who || 'agent', touched: (e.touched || []).map(local), records, count: e.touched_count, with: e.with || null }; };
 
 function mcpSource(opts = {}) {
-  const base = opts.base || '', views = local(opts.views), who = opts.who || '';
+  const base = opts.base || '', views = local(opts.views), who = opts.who || '';   // opts.person: the viewer's name on the stream
   const doFetch = opts.fetch || ((u, o) => root.fetch(u, o)), ES = 'EventSource' in opts ? opts.EventSource : root.EventSource;
   const every = opts.setInterval || root.setInterval, clear = opts.clearInterval || root.clearInterval, later = opts.setTimeout || root.setTimeout;
   let seq = 0, latest = null;   // latest: the newest event's `with`, keyed by world path; the one payload a read may answer from
@@ -426,6 +438,13 @@ function mcpSource(opts = {}) {
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
   }
+  // the residents of the world, as the mount derives them: name, present, last, owns, watches, waiting, can
+  async function residents() {
+    const node = local(views).split('/')[0];
+    if (!node) return [];
+    const a = await rpc('read', { path: '/' + node + '/agent', care: 'x' });
+    return (a.residents || []).map(r => ({ name: r.name, present: !!r.present, last: Number(r.last) || 0, owns: (r.owns || []).map(local), watches: (r.watches || []).map(local), waiting: (r.waiting || []).map(local), can: r.can || {} }));
+  }
   // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
   async function qa() {
     const node = local(views).split('/')[0];
@@ -463,7 +482,7 @@ function mcpSource(opts = {}) {
     function open() {
       if (!ES) return startPoll();
       let opened = false;
-      try { stream = new ES(base + '/mcp/stream'); } catch (e) { return startPoll(); }
+      try { stream = new ES(base + '/mcp/stream?who=' + encodeURIComponent(opts.person || 'person')); } catch (e) { return startPoll(); }
       stream.onopen = () => { opened = true; stopPoll(); poll().catch(() => {}); };
       stream.onmessage = m => { let e; try { e = JSON.parse(m.data); } catch (err) { return; } if (e.shown || (seen(e) && wanted(e))) deliver([line(e)]); };
       stream.onerror = () => { stream.close(); stream = null; startPoll(); later(open, opened ? 2000 : 30000); };
@@ -471,18 +490,18 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc, cursor };
+  return { read, answer, graph, follow, qa, rpc, cursor, residents };
 }
 
 // the page: /live?views=<folder>&who=<writer>
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
-  const views = local(q.get('views') || ''), who = q.get('who') || '';
-  return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
+  const views = local(q.get('views') || ''), who = q.get('who') || '', person = q.get('person') || 'person';
+  return mountViewer(el, mcpSource({ views, who, person }), { crumb: views, views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, residentsHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
