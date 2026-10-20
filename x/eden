@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, runtime_literal
 from eden_runtime import runtime_exit_status, startup_failed, startup_ready
+from eden_hands import parse_hand, start_hands
 from namespace_identity import parse_node_identity
 from test_runner import stage
 
@@ -52,7 +53,7 @@ def read_world(world):
         raise ValueError(f'{world / "world.json"} is not a world descriptor ({error})')
     # The descriptor alone says a world is kept here; the runtime is the one
     # that knows what a store looks like and complains if it is missing.
-    return {'mounts': list(mounts), 'port': int(port), 'node': str(node)}
+    return {'mounts': list(mounts), 'port': int(port), 'node': str(node), 'hands': list(kept.get('hands', []))}
 
 
 def announce_world(url, work, kept, mounts, timeout):
@@ -90,6 +91,9 @@ def main():
                         help='Keep the world in DIR: a missing or empty DIR is booted into '
                              'and kept, and a world kept there before resumes with every '
                              'record it had (default: a temporary directory, kept nowhere)')
+    parser.add_argument('--hand', action='append', default=[], metavar='"NAME ARGS"',
+                        help='a hand the world runs beside it (clock, watch, export, import, ask) with its arguments, '
+                             'started after the foot listens and stopped at teardown; kept in world.json with --world')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
@@ -103,15 +107,17 @@ def main():
     try:
         world = args.world.resolve() if args.world else None
         kept = read_world(world)
+        hands = [parse_hand(text) for text in args.hand]
         if kept:
             given = {'--mount': (sorted(args.mount), sorted(kept['mounts'])) if args.mount else None,
                      '--port': (args.port, kept['port']) if args.port is not None else None,
-                     '--node': (args.node, kept['node']) if args.node is not None else None}
+                     '--node': (args.node, kept['node']) if args.node is not None else None,
+                     '--hand': (hands, kept.get('hands', [])) if args.hand else None}
             for flag, pair in given.items():
                 if pair and pair[0] != pair[1]:
                     raise ValueError(f'{flag} differs from the world kept in {world} '
                                      f'({pair[1]}); omit it or pass the same')
-            mounts, port, node_text = kept['mounts'], kept['port'], kept['node']
+            mounts, port, node_text, hands = kept['mounts'], kept['port'], kept['node'], kept.get('hands', [])
         else:
             mounts, port, node_text = args.mount, args.port or 8130, args.node or '0x11'
         number, node = parse_node_identity(node_text)
@@ -154,7 +160,7 @@ def main():
             shutil.rmtree(work / mount.name, ignore_errors=True)
         if world and not kept:
             (world / 'world.json').write_text(json.dumps(
-                {'mounts': mounts, 'port': port, 'node': node_text}) + '\n')
+                {'mounts': mounts, 'port': port, 'node': node_text, 'hands': hands}) + '\n')
         with ExitStack() as cleanup:
             prepared = prepare(selected, work, args.check, cleanup,
                                {"node": node, "timeout": args.startup_timeout})
@@ -263,8 +269,11 @@ def main():
                     time.sleep(.25)
             url = f'http://127.0.0.1:{port}'
             announce_world(url, work, bool(world), [m.name for m in selected], args.request_timeout)
+            # the hands the descriptor names run beside the world, each its own process, each with its log
+            running = start_hands(hands, url, node, work, cleanup) if hands and not args.check else []
             print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}'
-                  + (f'; world: {work}' if world else ''), flush=True)
+                  + (f'; world: {work}' if world else '')
+                  + (f'; hands: {", ".join(name for name, _, _ in running)}' if running else ''), flush=True)
             if args.check:
                 for path in ('/__eden_unregistered__',):
                     try:

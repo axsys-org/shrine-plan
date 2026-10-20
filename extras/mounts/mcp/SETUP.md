@@ -65,19 +65,33 @@ folder it works in changes, closing the old tab; if its tool has no browser,
 it gives you the link on its own line. A green chip in the page header
 appears when an agent keeps a QA tree; a click opens that view, back returns.
 
-## 5. The ask hand, when a cell needs a model
+## 5. Hands: what crosses the world's boundary
 
-Formulas run in the world. An `ask` cell is answered by a hand, a process you
-start beside the world:
+Formulas run in the world, and the world is pure: it cannot read a clock,
+call a model, or reach another system. Everything external arrives through
+a hand, a process beside the world that talks to it over MCP like any agent.
+Five ship (`extras/mounts/mcp/hands`, with `hands.md` beside them): `clock`
+(the day, once a day), `watch` (posts when a cell changes), `export` (a
+folder as a file on request), `import` (a source as records on a
+schedule), `ask` (a model answers `ask` cells).
+
+The rule: a world runs the hands its descriptor names, and no others. Name
+them on the first boot and they are kept in `world.json`:
+
+```bash
+python3 x/eden --mount mcp --mount probe --extras-root $PWD/extras --port 8300 --world ~/worlds/team \
+  --hand "clock --timezone Europe/Berlin" --hand "ask --fake"
+```
+
+The launcher starts each after the foot listens, as its own process with
+its log at `DIR/hands/<name>.log`, and stops it at teardown; the `Eden:`
+line names them. A hand not listed is not running, which is the first
+thing to check when an `ask` never answers. Each hand's config is a record
+under `/0x11/agent/hands/<name>`, changed with a write. To run one by hand:
 
 ```bash
 OPENAI_API_KEY=... python3 extras/mounts/mcp/hands/ask.py http://127.0.0.1:8300 --model <name> --endpoint <chat completions url>
 ```
-
-`--fake` answers deterministically without a model, for a try. The hand
-follows the stream, answers every ask that is pending (including those
-written before it started) and writes each answer as `<cell>/result`. Its
-model and endpoint can also live in the world at `/0x11/agent/hands/ask`.
 
 ## 6. Sessions, more than one agent, and what survives
 
