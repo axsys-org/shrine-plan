@@ -11,8 +11,9 @@ description: >-
 The world is where the person's things live, and where your memory
 lives. Default to it:
 
-- Someone mentions a thing they track, count, compare or decide on: it
-  is a folder, and the question is a cell.
+- Something they track, count or compare belongs in the world: a
+  folder. Answer from existing records and views first, try a new
+  computation as a read, and keep only what is worth reusing as a cell.
 - Someone says a fact they will want back: a record, now, at a path they
   would guess.
 - You find something out about their data: a cell or a reference that
@@ -53,7 +54,9 @@ The unit of accomplishment is not "I did it, here is a record saying
 so." It is: the world can now answer, do or maintain something it could
 not before. That may be a cell, a reference, a source brought in, an
 authoritative fact corrected, or no write at all. A wake that only
-verifies a number the world already answers leaves zero records. At the
+verifies a number the world already answers leaves zero new domain
+records; the cursor the protocol requires (`seen`) is exempt, and
+skipping it is not hygiene, it is losing your place. At the
 end of a task ask what another agent can now compute, inspect or reuse
 that it could not before; if the answer is nothing, you wrote too much.
 
@@ -82,14 +85,17 @@ check, alive:
 The expectation stays a literal at its authoritative source; `passed`
 is computed; when the deals change, the answer changes. A receipt of
 what a check said once is a different thing: pin the cases it read, do
-not copy its numbers. Likewise a name in a slot is a pronoun: `customer:
-"Northwind"` should be a reference to the customer's record or to an
-exposed view of it, or a hole at the path where it will be, so the
-computation stays hungry for what it needs instead of satisfied by a
-word. Build relationships and derivations, filling down into your
-namespace or pointing outward to an existing view; the aim is not zero
-literals, it is that the namespace accumulates reusable computation
-rather than textual claims about work done.
+not copy its numbers. When text identifies another thing the computation
+depends on, prefer a reference or an unresolved binding over copying its
+name: `customer: "Northwind"` on a deal is weak, a reference to the
+customer's record or to an exposed view of it is better, and a hole at
+the path where it will be keeps the computation hungry for what it
+needs. A literal that describes a thing at its own record stays text:
+`legal_name: "Northwind Industries LLC"` on the customer is an
+authoritative fact, not a pronoun. Build relationships and derivations,
+filling down into your namespace or pointing outward to an existing
+view; the aim is not zero literals, it is that the namespace accumulates
+reusable computation rather than textual claims about work done.
 
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
@@ -192,7 +198,11 @@ no acknowledgements, no copied answers. Do not ask another agent for
 what the world can compute; a count, a sum, the oldest of a folder is a
 cell you write. A step for another agent is a line in their plan with
 `if_case` set to the plan's case, and nothing else goes in another
-agent's folder. Sign everything with your `who`, and read `history`
+agent's folder. `if_case` refuses a stale write it can see, but the
+check and the write are two turns of the world today, not one, so it is
+not yet a guarantee against a writer landing between them: a refusal is
+certain, an admission is likely, and on anything that must not be lost
+read again after writing. Sign everything with your `who`, and read `history`
 before you act on what you remember; never assume a session is the only
 one.
 
