@@ -109,6 +109,36 @@ filling down into your namespace or pointing outward to an existing
 view; the aim is not zero literals, it is that the namespace accumulates
 reusable computation rather than textual claims about work done.
 
+### Slots
+
+A record's slots are the thing's own facts: a number as a number, a
+date as a date, a quotation in the source's words, another thing as a
+reference. Four slots is normal, eight is a lot, and a slot longer than
+a line is not a fact. One vocabulary per folder, chosen once: every row
+of `deals` has the same `amount` and `status`, so a cell can read them;
+a name invented for one record (`date_range_as_pleaded` beside
+`date_range_as_published`, `year_start` beside `year_end`) is a sign
+the thing was not understood yet. Pick the plainest word and reuse it.
+
+Commentary is not a slot. What you think about a thing, its
+`interpretation`, `assessment`, `scope_note`, `reporting_chain`,
+`epistemic_status`, `inspection`, belongs in the chat, or in one
+`notes` slot of metadata, or, if it must survive, in one note record in
+your own folder that references the thing. A word that means absence
+(`not assessed`, `open`, `pending`) is not a fact either: an unanswered
+question is a cell with a hole, and the context says so. A status is a
+fact only when the source says it, in a small vocabulary the folder
+shares (`alleged`, `found`), never a sentence.
+
+Views compute; they do not narrate. A cell that carries a `title` and
+an `interpretation` is a document pretending to be a computation. If
+the person asks for a reading of the evidence, that is a text for the
+chat, or at most one record under your folder with one text slot and
+references to what it reads from, and the page's job to lay out, not a
+tree of lettered sections. The test, before writing any slot: would a
+cell want to read this, or would only a person want to read it? The
+first is a slot; the second is a note or nothing.
+
 ### One object, many scopes
 
 A thing mentioned in more than one place, or with facts of its own,
