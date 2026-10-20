@@ -96,7 +96,11 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
 - Write the expected answer as a record before the read that checks it;
   a reading that comes first is a description, not a check.
 - Ask the world instead of reasoning over a copy; page what is left; never
-  read the world whole.
+  read the world whole. To find a record you do not know the folder of,
+  `read path=/user find=<text>`: the records whose name or a slot holds it.
+- Name folders for keeps: a path is what every reference and every cell
+  points at. To move something, make the new path and point the old record
+  at it (a `moved_to` reference slot), rather than culling it.
 - The live page is how the person sees your work. Open
   `<world-url>/live?views=<folder>` in their browser when you start and
   again whenever the folder you work in changes, closing the tab you opened
