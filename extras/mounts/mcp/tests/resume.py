@@ -15,6 +15,7 @@ sys.path[:] = [entry for entry in sys.path
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -26,8 +27,9 @@ ROOT = Path(__file__).resolve().parents[4]
 
 
 class World:
-    def __init__(self, directory, port, log, timeout):
+    def __init__(self, directory, port, log, timeout, extras=None):
         self.directory, self.port, self.timeout = directory, port, timeout
+        self.extras = Path(extras) if extras else ROOT / 'extras'
         self.base = f'http://127.0.0.1:{port}'
         self.log = log
         self.process = None
@@ -36,7 +38,7 @@ class World:
 
     def boot(self):
         command = [sys.executable, str(ROOT / 'x/eden'), '--mount', 'mcp', '--mount', 'probe',
-                   '--extras-root', str(ROOT / 'extras'), '--port', str(self.port), '--world', str(self.directory)]
+                   '--extras-root', str(self.extras), '--port', str(self.port), '--world', str(self.directory)]
         env = dict(os.environ, _EDEN_NIX_ROOT=str(ROOT))
         t0 = time.perf_counter()
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, env=env, text=True)
@@ -83,6 +85,10 @@ class World:
         assert not result.get('isError'), result
         return result['structuredContent']
 
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=self.timeout) as response:
+            return response.read().decode()
+
     def read(self, path, care='y'):
         # A cell's answer is read at care x with the node in its path, as the product test does.
         return self.tool('read', path=path, care=care)
@@ -127,18 +133,23 @@ def check(port, directory, timeout, count=20, node='0x11'):
         expect('writes before the stop land', world.read('/user/keep/r3')['properties'].get('/n'), '3')
         expect('the launcher says this world is kept', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         expect('a cell counts the folder before the stop', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
+        scanned = int(world.read('/io/fs/mcp')['properties'].get('/sys/epoch') or 0)
         world.stop()
         print('stopped', flush=True)
         resume = world.boot()
         print(f'resume: {resume:.1f} s', flush=True)
         expect('the records are back after the reboot', world.read('/user/keep/r3')['properties'].get('/n'), '3')
+        expect('the resume scanned the mounts again', int(world.read('/io/fs/mcp')['properties'].get('/sys/epoch') or 0), scanned + 1)
         expect('the batch is back', world.read('/user/keep/b99')['properties'].get('/n'), '99')
         expect('the cell still counts every record', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
         expect('the world record is written again on resume', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         history = world.tool('history', after=epoch_before - 1)
         expect('history continues from the saved epoch', history['events'][0]['epoch'], epoch_before)
+        # the remount is a few events of its own (a scan, a batch and a status per mount), all under /io/fs
+        resumed_at = json.loads(world.get(f'/probe/read?path=/{node}'))['epoch']
+        expect('the remount spent its events on the mounts, nothing else', (resumed_at > epoch_before, all(t.startswith(f'/{node}/io/fs') or t == f'/{node}' or t == f'/{node}/io' for e in world.tool('history', after=epoch_before)['events'] for t in e['touched'])), (True, True))
         after = world.write([{'path': '/user/keep/again', 'slots': {'n': 1}}])
-        expect('the next epoch continues the count', after['epoch'], epoch_before + 1)
+        expect('the next epoch continues the count', after['epoch'], resumed_at + 1)
         expect('the cell is live after the resume', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '122')
         t0 = time.perf_counter()
         for i in range(count):
@@ -151,8 +162,9 @@ def check(port, directory, timeout, count=20, node='0x11'):
     finally:
         world.stop()
         log.close()
-    # A kept directory with no event since its boot holds the boot repl as its
-    # root: the launcher notices and boots it afresh instead of resuming.
+    # A kept directory that saw nothing but its boot still resumes: the launcher's own world record is the
+    # first event of every kept world, so the saved root is never the boot repl. (The launcher keeps its probe
+    # for a directory whose boot was cut before that write.)
     empty = directory.parent / (directory.name + '-empty')
     log2 = (directory.parent / (empty.name + '.log')).open('w')
     world = World(empty, port, log2, timeout)
@@ -160,11 +172,33 @@ def check(port, directory, timeout, count=20, node='0x11'):
         world.boot()
         world.stop()
         world.boot()
-        expect('a kept world with no events boots afresh', world.read('/weft/stdlib/count')['exists'], True)
-        expect('and the launcher said so', 'No event was kept' in Path(log2.name).read_text(), True)
+        expect('a kept world that saw only its boot resumes', world.read('/weft/stdlib/count')['exists'], True)
+        expect('and the launcher said so', 'Resuming the world kept in' in Path(log2.name).read_text(), True)
     finally:
         world.stop()
         log2.close()
+    # A resumed world runs the mounts as the checkout has them now: a change to a mount's code between the stop
+    # and the resume is published on the resume, and its routes serve it. The mounts are copied so the change
+    # touches nothing in the checkout.
+    extras = directory.parent / (directory.name + '-extras')
+    for name in ('mcp', 'probe'):
+        shutil.copytree(ROOT / 'extras/mounts' / name, extras / 'mounts' / name)
+    changed = directory.parent / (directory.name + '-changed')
+    log3 = (directory.parent / (changed.name + '.log')).open('w')
+    world = World(changed, port, log3, timeout, extras=extras)
+    try:
+        world.boot()
+        world.write([{'path': '/user/keep/one', 'slots': {'n': 1}}])
+        expect('the probe answers as written', world.get(f'/probe/ok?path=/{node}'), 'ok')
+        world.stop()
+        source = extras / 'mounts/probe/probe.foil'
+        source.write_text(source.read_text().replace('(http_driver/response 200 "ok")', '(http_driver/response 200 "ok again")'))
+        world.boot()
+        expect('a mount changed between the stop and the resume serves its new code', world.get(f'/probe/ok?path=/{node}'), 'ok again')
+        expect('over the records as they were saved', world.read('/user/keep/one')['properties'].get('/n'), '1')
+    finally:
+        world.stop()
+        log3.close()
     print(f'resume: {len(checks)} checks passed', flush=True)
     return checks
 
