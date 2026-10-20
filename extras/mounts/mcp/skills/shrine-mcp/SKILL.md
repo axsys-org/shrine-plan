@@ -60,6 +60,18 @@ skipping it is not hygiene, it is losing your place. At the
 end of a task ask what another agent can now compute, inspect or reuse
 that it could not before; if the answer is nothing, you wrote too much.
 
+The order of operations: discover before creating (find the thing, the
+view, the source that already exists); bind before copying (reference
+it, do not reproduce its name, value or summary); compose before
+duplicating (a cell's answer is an input to the next cell; reuse the
+chain where its meaning and scope fit); resolve authority before
+mutating (which source does the change concern); keep live dependencies
+before concluding (a view or a reference over a recorded result; pin a
+case only when the work must reproduce a past reading). Never invent a
+fact to close a hole: fill down into data you own when the computation
+needs it, point outward to a record or view that already answers, and
+otherwise leave the hole, which is the honest state of the computation.
+
 Text is the devil in this system unless it is metadata: a `notes` or a
 `description` slot for a person or a search to find, a legal name, a
 decision someone made, a source document. Text pretending to be state
@@ -107,7 +119,11 @@ of its own stays a literal; make the shared object at the second
 mention or the first fact, not before. Imported names become pointers
 once with `reference`; `find` locates the object you suspect exists
 before you make a second one; a move is a new path and a `moved_to`
-reference on the old record, never a cull.
+reference on the old record, never a cull. Bind a mention to an object
+only when the evidence says it is the same thing; two names that look
+alike are not evidence, and a wrong merge corrupts unrelated facts.
+When identity is not established, keep the observed name as source
+evidence and leave the relationship unresolved.
 
 The shared object holds only what is true of the thing everywhere. What
 is true of it within a scope lives as a record in that scope's folder
@@ -116,7 +132,12 @@ pointing at the object: `/user/org/acme/people/jane {person: ref
 to the org changes the org's record; removing her from the org culls
 the org's record; the shared object changes only for a fact true of her
 everywhere. Editing the object to fix one scope's view is a write in
-the wrong place.
+the wrong place. A computed answer is never edited: if a view says
+three projects and the person wants two, the change is to a
+relationship at its source, never `count: 2` poked into the view; when
+the edit is ambiguous, find which source fact must change before
+writing anything. A reference grants no right to change what it points
+at.
 
 Views cross the boundary, data does not: a view over the scope uses
 `follow` to bring the object's slots onto the row at read time, and
@@ -129,7 +150,10 @@ cell that read it, and those faults are the list of who still depended
 on it, so read what points at a thing before retiring it. Pin where you
 cite, point live where you depend. Every question is then a read over
 structure, nothing is said twice, nothing drifts, and the history is
-of facts and decisions, not activity.
+of facts and decisions, not activity. A live view is not free: a chain
+recomputes on read, so reuse what consolidates a computation many would
+repeat, not views for their own sake, and measure a slow chain before
+inventing a cache for it.
 
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
