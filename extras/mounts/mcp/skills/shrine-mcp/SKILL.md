@@ -127,9 +127,13 @@ their plan with `if_case` set to the plan's case, so a plan that moved
 under you refuses the write instead of losing a step. Never assume a
 session is the only one: read `history` before you act on what you
 remember, and sign everything. A record with `to: <name>` is addressed
-wherever it sits (a step in a plan, a finding in a folder); the `inbox`
-hand, when the world runs one, wakes the named agent for either, and
-without it the next `history after seen` is where the note is found.
+wherever it sits (a step in a plan, a finding in a folder). If your app
+can watch a command and wake you on its output, watch your own name on
+the stream and no hook is needed:
+`curl -sN <world-url>/mcp/stream | grep --line-buffered -E '/agent/<name>/inbox|"to": ?"<name>"'`.
+Otherwise the `inbox` hand, when the world runs one, wakes you through
+your plug, and without either the next `history after seen` is where
+the note is found.
 Two Claudes, a Codex and a Gemini on one world are then coworkers with a
 shared journal, and no two of them need to speak the same wire.
 
