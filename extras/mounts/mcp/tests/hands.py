@@ -91,7 +91,7 @@ def check(base, node, timeout, quiet_seconds=60):
     # import: a csv, the records, the references, a second run writing nothing new
     src = os.path.join(out, 'people.csv')
     with open(src, 'w', newline='') as f:
-        wr = csv.writer(f); wr.writerow(['id', 'full name', 'sku']); wr.writerow(['p-1', 'Ann Lee', 'a']); wr.writerow(['p-2', 'Bo Ng', 'b']); wr.writerow(['p-3', 'Cy', 'zz'])
+        wr = csv.writer(f); wr.writerow(['id', 'full name', 'sku', 'zip']); wr.writerow(['p-1', 'Ann Lee', 'a', '02134']); wr.writerow(['p-2', 'Bo Ng', 'b', '10001']); wr.writerow(['p-3', 'Cy', 'zz', '94110'])
     prices = '/' + node + '/user/handed/prices'
     people = '/' + node + '/user/handed/people'
     w.tool('write', records=[{'path': prices, 'slots': {'title': 'prices'}}, {'path': prices + '/p1', 'slots': {'sku': 'a', 'price': 5}}, {'path': prices + '/p2', 'slots': {'sku': 'b', 'price': 7}},
@@ -104,6 +104,7 @@ def check(base, node, timeout, quiet_seconds=60):
     expect('import writes the rows as records', written >= 3, True)
     p1 = w.read(people + '/p_1').get('properties') or {}
     expect('the field-to-slot map named the slots, the key is a slot, the id kept', (p1.get('/name'), p1.get('/sku'), p1.get('/source_id')), ('Ann Lee', 'a', 'p-1'))
+    expect('a zip code with a leading zero stays text', (p1.get('/zip'), (w.read(people + '/p_2').get('properties') or {}).get('/zip')), ('02134', '10001'))
     expect('references made once with the reference entry point at the price rows', (p1.get('/sku_ref'), (w.read(people + '/p_3').get('properties') or {}).get('/sku_ref')), ('/h/x/0/%d%s/p1' % (len(prices.strip('/').split('/')) + 1, prices), None))
     e0 = w.epoch()
     expect('a second run writes nothing new', im.tick(time.time() + 10), 0)       # a later clock, so the ran mark is a change
@@ -111,7 +112,7 @@ def check(base, node, timeout, quiet_seconds=60):
     mark = home + '/import/csv'          # touched lists the mark and the folders above it whose case moved with it
     expect('the second run left no event of its own but the ran mark', [sorted(t for t in e['touched'] if not mark.startswith(t)) for e in later['events']], [[]])
     with open(src, 'a', newline='') as f:
-        csv.writer(f).writerow(['p-4', 'Di', 'a'])
+        csv.writer(f).writerow(['p-4', 'Di', 'a', '00501'])
     expect('a new row in the source is one new record, with its reference', (im.tick(time.time() + 20) >= 1, (w.read(people + '/p_4').get('properties') or {}).get('/sku_ref') is not None), (True, True))
 
     expect('segment_of makes a name from an id, a field or a path', (hand.segment_of('p-1'), hand.segment_of('full name'), hand.segment_of('/0x11/user/views/total'), hand.segment_of('2024')), ('p_1', 'full_name', 'user_views_total', 'c_2024'))
