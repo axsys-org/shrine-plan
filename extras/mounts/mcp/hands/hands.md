@@ -24,8 +24,10 @@ fallback from `stream.py`, every write signed `who: <name>` and idempotent,
 a failure logged and retried on the next line, never a partial answer.
 The base also owns the rule that keeps two hands from ping-ponging: a line
 from any hand, or one whose touched paths all sit under `/agent/hands`,
-never causes a write by itself, and seen is marked only after a write or
-on a tick.
+never causes a write by itself, and seen is marked only after a write, or
+on a tick once the hand is a hundred lines behind its mark. A mark is an
+event, and on the live page it lands on top of what the hand just saw, so
+an idle hand writes none.
 
 A hand is a subclass with at most two methods, each returning how many
 writes it made:
