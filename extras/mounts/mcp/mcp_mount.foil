@@ -96,8 +96,6 @@
           ?> (./some w) (path_parse (str/cat who "/")) []
           ? !(eq w.len 1) []
           | [[[self 'agent 'journal w.at(0)] (writ/make (myth/sing ['wrote] (pails/n specs.len)))]]
-      ? (specs.any((\ spec=json (maybe/is_some (mcp_rpc/field "if_case" spec)))))
-        | mcp_mount/write_if_unchanged self call.id specs tag who then
       | mcp_mount/write_specs self call.id specs tag who then
     ? (equal name "mcp/apply")
       ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
@@ -800,8 +798,11 @@
       ? (mcp_mount/record (mcp_mount/slots_of spec))
        > (./err why) (./err (str/cat_all [(mcp_mount/shown pax) ": " why]))
        > (./ok record)
-        ? (equal action "poke") (./ok out.snoc([pax (writ/poke record)]))
-        | ./ok out.snoc([pax (writ/make record)])
+        = sure=myth
+            ?> (./some wanted) (mcp_rpc/field "if_case" spec) record
+            | record.put(if_case_slot (pails/n (mcp_rpc/num_at "if_case" 0 spec)))
+        ? (equal action "poke") (./ok out.snoc([pax (writ/poke sure)]))
+        | ./ok out.snoc([pax (writ/make sure)])
   + batch
     ' The records as one event (admitted whole or refused whole), with
     ' the writer's tag record riding in the same event, then the then
@@ -860,11 +861,35 @@
         | then.map (\ s=mcp_mount/spec (jkv (mcp_mount/shown s.pax) (mcp_mount/answer_json s state)))
       reason=str
         ?> (./some why) outcome ""
-        | mcp_mount/value_text why
+        = word (http_foot/reason why)
+        ? !(equal word "stale_case") word
+        | mcp_mount/stale_reason writes state
       body (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "records" (json/arr records)) (jkv "refused" (json/boo refused)) (jkv "reason" (json/str reason)) (jkv "then" (json/obj reads))])
     ? refused
       | [200 (mcp_rpc/result id (mcp_rpc/structured_error body))]
     | [200 (mcp_rpc/result id (mcp_rpc/structured body))]
+  + stale_reason
+    ' Which record moved: the first write whose precondition does not
+    ' hold now, named with the case it is at and the case it wanted.
+    \ writes=row[[path writ]] state=namespace
+    ^ str
+    % i=nat 0
+    ^ str
+    ? (eq i writes.len) "if_case: a record moved; nothing was written"
+    = [pax wit] writes.at(i)
+      carried=maybe[pail]
+        ? wit
+         > (./make m) m.get(if_case_slot)
+         > (./poke m) m.get(if_case_slot)
+         .none
+    ?> (./some held) carried (_ i.inc)
+    = want=nat
+        ? held
+         > n=pails/n n.n
+         0
+      now (mcp_mount/case_of pax state).fall(0)
+    ? (eq want now) (_ i.inc)
+    | str/cat_all ["if_case: " (mcp_mount/shown pax) " is at case " (nat/show now) ", not " (nat/show want) "; nothing was written"]
   + typed_json
     ' A record as {slot: {type, value}}: what write accepts back.
     \ t=myth
@@ -947,48 +972,6 @@
     ? (mcp_mount/writes self specs)
      > (./ok writes) (mcp_mount/batch id writes tag who then)
      > (./err why) (mcp_mount/refuse id why)
-  + write_if_unchanged
-    ' Write only if unchanged: a record spec may carry if_case, the x
-    ' case the writer read.  One snapshot reads the case every such
-    ' record is at now; the batch is admitted only if each still
-    ' matches, else refused whole, naming the record and the case it
-    ' is at (0 when it has none).  The check and the event are two
-    ' turns of the supervisor; a kernel precondition would close that
-    ' gap, and is not this mount's to build.
-    \ self=iota id=json specs=row[json] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
-    ^ http_foot/action
-    = read
-        \ state=namespace
-        ^ [nat str]
-        = empty=row[jkv] []
-          cases=row[jkv]
-            | specs.fold empty
-              \ acc=row[jkv] spec=json
-              ?> (./some wanted) (mcp_rpc/field "if_case" spec) acc
-              = text (mcp_rpc/text_at "path" spec)
-              ?> (./some pax) (mcp_mount/target self text) acc.snoc((jkv text (json/num .false 0)))
-              = now=nat (mcp_mount/case_of pax state).fall(0)
-              | acc.snoc((jkv text (json/num .false now)))
-        | [200 (show (json/obj cases))]
-      next
-        \ status=nat body=str
-        ^ http_foot/action
-        ? (mcp_rpc/parse_object body)
-         > (./err why) (mcp_mount/refuse id (str/cat_all ["if_case: " why]))
-         > (./ok cases)
-          = stale=maybe[str]
-              | specs.fold (maybe/none[str])
-                \ hit spec
-                ? (maybe/is_some hit) hit
-                ?> (./some wanted) (mcp_rpc/field "if_case" spec) hit
-                = text (mcp_rpc/text_at "path" spec)
-                  want (mcp_rpc/num_at "if_case" 0 spec)
-                  now (mcp_rpc/num_at text 0 (json/obj cases))
-                ? (eq want now) hit
-                | ./some (str/cat_all ["if_case: " text " is at case " (nat/show now) ", not " (nat/show want) "; nothing was written"])
-          ?> (./some why) stale (mcp_mount/write_specs self id specs tag who then)
-          | mcp_mount/reply id (mcp_rpc/structured_error (json/obj [(jkv "records" (json/arr [])) (jkv "refused" (json/boo .true)) (jkv "reason" (json/str why)) (jkv "then" (json/obj []))]))
-    | ./after read next
   + touched_json
     ' The paths one event's diff tree touched, from its log entry: the
     ' first hundred, and the count (a boot event touches a thousand).
@@ -1220,7 +1203,7 @@
         (mcp_mount/p "present" "boolean" "Answer as usual and push {shown: {path, care, case}} on the stream; nothing journaled, no epoch moves.")]
        [])
      (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch."
-       [(mcp_mount/p "records" "array" "[{path, slots, action, if_case}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree); if_case N admits the batch only while that record is still at x case N, else the whole batch is refused and the reason names the record and the case it is at.")
+       [(mcp_mount/p "records" "array" "[{path, slots, action, if_case}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree); if_case N admits the batch only while that record is still at x case N (judged by the kernel in the same commit), else the whole batch is refused and the reason names the record and the case it is at.")
         (mcp_mount/p "from" "string" "On a record: /h/x/<case>/<len>/<path>, copy the record as it was at that case (undo, redo).")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")
         (mcp_mount/p "who" "string" "The writer's tag, default mcp; the event carries it.")]

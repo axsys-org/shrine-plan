@@ -250,11 +250,8 @@ no acknowledgements, no copied answers. Do not ask another agent for
 what the world can compute; a count, a sum, the oldest of a folder is a
 cell you write. A step for another agent is a line in their plan with
 `if_case` set to the plan's case, and nothing else goes in another
-agent's folder. `if_case` refuses a stale write it can see, but the
-check and the write are two turns of the world today, not one, so it is
-not yet a guarantee against a writer landing between them: a refusal is
-certain, an admission is likely, and on anything that must not be lost
-read again after writing. Sign everything with your `who`, and read `history`
+agent's folder. `if_case` is judged by the kernel in the same commit
+as the write, so a stale write is refused, never raced. Sign everything with your `who`, and read `history`
 before you act on what you remember; never assume a session is the only
 one.
 
