@@ -74,7 +74,7 @@ def check(base, node, timeout):
     # 1. the standard library
     lib = read('/' + node + '/weft/stdlib', kind='read stdlib')
     stdlib = {c['path'].rsplit('/', 1)[1]: ref(c['reference']) for c in lib['children']}
-    expect('1 thirty-nine library entries present (thirty-eight formulas and ask)', len(stdlib), 39)
+    expect('1 sixty-eight library entries present (sixty-seven formulas and ask)', len(stdlib), 68)
     expect('1 each formula has a title', all('/sys/lede' in c['properties'] for c in lib['children']), True)
 
     # 2. the raw data

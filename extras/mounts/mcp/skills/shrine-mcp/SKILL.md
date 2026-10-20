@@ -1,10 +1,29 @@
 ---
 name: shrine-mcp
 description: >-
-  Operate a Shrine world through its MCP mount: read and write typed records, make cells that derive values from other records, and read history.
+  Keep the person's records, lists, plans, numbers and notes in their world, and answer questions about them from there. Use it whenever the work is data or state: a tracker, a budget, a pipeline, a roster, a log, a decision, anything to remember across sessions, any question whose answer should stay current, anything to show someone. Start every session by reading your plan and what changed since you last looked; keep what matters as records, keep answers worth keeping as cells. Not for one-off code questions or text nobody needs again.
 ---
 
 # Shrine MCP
+
+## Reach for it
+
+The world is where the person's things live, and where your memory
+lives. Default to it:
+
+- Someone mentions a thing they track, count, compare or decide on: it
+  is a folder, and the question is a cell.
+- Someone says a fact they will want back: a record, now, at a path they
+  would guess.
+- You make a plan, a list or a finding: a record under your folder, not
+  a sentence in the chat.
+- You answer a question about their data: read the world, not your
+  memory of it.
+- A session starts: read `/agent/<name>/plan` and `history after seen`
+  before anything else, and say where things stand.
+
+Say "kept it" when you keep something, and give the live page link once.
+Never name the tools or the formulas to the person unless they ask how.
 
 The world serves `<world-url>/mcp` on localhost only, with no credential:
 anything on the machine can read and write the world (booting one and
@@ -70,6 +89,12 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   `kept: false` for a temporary one that is gone with its process. In a
   temporary world keep what you would not want to retype as one `records`
   batch; in a kept one, nothing is lost and `seen` is where you left it.
+- Chains first: a question is usually two or three standard cells over
+  each other. `expr` (`each`, `when`, `where`, `validate`) is for a rule a
+  chain cannot say: `amount * 2 + 1`, `status = 'closed' and amount > 30`,
+  the row's slots as the only variables.
+- Write the expected answer as a record before the read that checks it;
+  a reading that comes first is a description, not a check.
 - Ask the world instead of reasoning over a copy; page what is left; never
   read the world whole.
 - The live page is how the person sees your work. Open

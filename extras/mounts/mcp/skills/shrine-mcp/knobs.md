@@ -137,7 +137,8 @@ three kinds of slots:
 
 Ranking (`sort`, `top`, `latest`, `earliest`) and the reductions (`sum`, `min`,
 `max`, `avg`) are by number: a row whose slot is absent or text is left out;
-there is no text ordering.
+there is no text ordering. A slot holding a reference reads as its `/h`
+spelling wherever a formula wants text.
 
 Three conventions hold in every formula:
 
@@ -167,8 +168,11 @@ A number slot holds a natural. A record may carry `/scale`: every number in
 that record is an integer scaled by ten to that power (`1250` with `/scale 2`
 is 12.50); `<slot>/scale` scales one slot only (`amount/scale: 2` leaves
 `/when` whole). Formulas align scales to the larger one and write `/scale` on
-their output root; `round` rescales to `/places`. Dates and durations are
-numbers in their own unit and compare as such.
+their output root; `round` rescales to `/places`. A number a row formula
+derives (`running`, `change`, `moving`, `percent`) carries its own
+`<slot>/scale`, so the row's other numbers keep theirs. Dates and durations are
+numbers in their own unit and compare as such; a day is the number
+`YYYYMMDD` that `date` makes and `part` and `shift` read.
 
 ### The standard cells
 
@@ -177,15 +181,15 @@ numbers in their own unit and compare as such.
 | `count` | `into` (default `/count`) | number of children |
 | `sum`, `min`, `max`, `avg` | `slot`, `into` | the figure over the children's `slot`, with `/scale`; `avg` rounds half up |
 | `any`, `all` | `slot`, `into` | whether any / every child's `slot` is true |
-| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains) | the matching rows; a number slot compares by value at its scale (`136` at scale 2 is 1.36), anything else as text |
-| `sort` | `slot`, `order` (asc, desc) | rows re-keyed 1, 2, 3, old key at `/key` (a name, or the path as text for a deeper row) |
+| `where` | `key`, `value`, `op` (equals, over, under, before, after, contains); or `expr` | the matching rows; a number slot compares by value at its scale (`136` at scale 2 is 1.36), anything else as text |
+| `sort` | `slot` (one, or two space separated: the second breaks ties), `order` (asc, desc) | rows re-keyed 1, 2, 3, old key at `/key` (a name, or the path as text for a deeper row) |
 | `top` | `slot`, `count` (default 3) | the largest, ranked; fewer rows than `count` gives fewer |
 | `latest`, `earliest` | `slot` | the one child, as the root, key at `/key`; no row with a number there gives an empty root |
-| `each` | `left`, `op`, `right`, `into` (all four) | a derived slot per child, `/scale` on each row where the sides carried one; sides are literals or the child's slots |
+| `each` | `left`, `op`, `right`, `into` (all four); or `expr`, `into` | a derived slot per child, `/scale` on each row where the sides carried one; sides are literals or the child's slots |
 | `lookup` | `key`, `take`, `match` (default `key`), `into`, `from` (default `table`) and a secondary input named by `from` | brings `take` from the matching table row |
-| `distinct` | `slot` | one row per distinct value, keyed 1, 2, 3 in order of first appearance, each `/value` and `/count` |
+| `distinct` | `slot` | one row per distinct value, keyed 1, 2, 3 in order of first appearance, each `/value` and `/count`; the root gains `/count`: how many |
 | `select` | `slots` (space separated) | only those slots, on root and children |
-| `by` | `key`, `op` (count, sum, min, max, avg), `slot`, `into` | one row per group value |
+| `by` | `key` (one slot, or two space separated: the values joined by an underscore), `op` (count, sum, min, max, avg), `slot`, `into` | one row per group value |
 | `grid` | `row`, `col`, `op`, `slot` | rows by `row`, a slot per `col` |
 | `flatten` | | every record below the root as a direct child, keyed by its path with underscores (`a_x_deep`) |
 | `merge` | secondary inputs | the input's children plus theirs, one flat list |
@@ -205,6 +209,54 @@ numbers in their own unit and compare as such.
 | `split` | `slot`, `with` (default a space), `into` (default `slot`) | each row gains `into/1`, `into/2`, … , the slot's text cut at `with` |
 | `date` | `slot`, `into` (default `/day`) | each row gains `into`: the text date `YYYY-MM-DD` (anything after the day ignored) as the natural `YYYYMMDD`, which `sort`, `between`, `latest` and `since` can use |
 | `ask` | `prompt`, `model` (default the hand's) | the stored answer at `<cell>/result` while its stamp (input case, model, prompt) is current; else empty, with `/sys/view/asking` in the context |
+| `when` | `key`, `op` (as `where`), `value`, or `expr`; `then`, `else` (optional), `into` | each row gains `into`: `then` when its `key` matches, else `else`; without `else` a row that does not match is left as it is |
+| `coalesce` | `slot`, `value`, `into` (default `slot`) | each row gains `into`: its `slot` when present, else `value` |
+| `part` | `slot` (a day number `YYYYMMDD` or a text date), `unit` (year, quarter, month, week, weekday), `into` (default `/<unit>`) | each row gains `into`: that part of its day; week counts sevens from January 1st, weekday is 1 Monday to 7 Sunday |
+| `shift` | `slot`, `by` (a whole number, signed), `unit` (day default, week, month, year), `into` (default `slot`) | each row gains `into`: its day moved; a month or year move keeps the day, clamped to the month |
+| `running` | `slot`, `into` (default `/running`) | each row with `slot` gains `into`: the total so far, in row order (`sort` first) |
+| `rank` | `into` (default `/rank`) | each row gains `into`: its position, 1, 2, 3 |
+| `change` | `slot`, `into` (default `/change`) | each row with `slot` gains `into`: `slot` minus the previous such row's; the first has none |
+| `moving` | `slot`, `window` (default 3), `into` (default `/moving`) | each row with `slot` gains `into`: the mean over the last `window` such rows, half up |
+| `percent` | `slot`, `into` (default `/percent`) | each row with `slot` gains `into`: its share of the rows' total, as `34.48` |
+| `trim`, `case`, `replace` | `slot`, `into` (default `slot`); `case` takes `to` (lower, upper); `replace` takes `find`, `with` (default nothing) | each row's `slot` text stripped of surrounding whitespace, re-cased (ASCII), or with every `find` replaced |
+| `length` | `slot`, `into` (default `/length`) | each row gains `into`: the byte length of its `slot` text |
+| `starts`, `ends` | `slot`, `value`, `into` (default `/starts`, `/ends`) | each row gains `into`: whether its `slot` text starts or ends with `value` (`match` filters; these derive) |
+| `follow` | `slot` (holding a reference), `into` (default `slot`), `from` (optional) and a secondary input holding the folder the references point into | each row gains, under `into`, the slots of the record its reference points at, found in the secondary input whose root the reference lies under (`from` names one), read at that input's case |
+| `reference` | `key`, `match` (default `key`), `from` (default `table`) and a secondary input of that name, `into` | each row gains `into`: a live reference to the first table row whose `match` equals its `key`; the one-time step after an import that turns keys into pointers, kept with a write |
+| `median`, `percentile`, `variance`, `stddev` | `slot`, `into` (default `/<name>`); `percentile` takes `at` (0 to 100, default 50) | one figure on the root at the rows' scale: the middle value (the mean of the two middles, half up), the value at the `at`th percentile (nearest rank), the population variance, the population standard deviation (half up) |
+| `mode` | `slot`, `into` (default `/mode`) | the most frequent value of `slot` on the root (the first on a tie) |
+| `group` | `key` | one folder per value of `key`, the rows under it at their own paths |
+| `rename` | `from`, `to` | the slot `from` called `to` on the root and every row, its scale with it |
+| `drop` | `slots` (space separated) | the root and every row without those slots: the inverse of `select` |
+| `unflatten` | | a child named with underscores lands at the path they spell: the inverse of `flatten` |
+| `explode` | `slot`, `with` (default a space) | the pieces of the row's `slot` text as rows `1`, `2`, `3` under the row's name, each the row with its piece at `slot` |
+| `validate` | `key`, `op` (as `where`, or `present`), `value`, or `expr`; `reason` (optional) | the rows that break the rule, each with `/reason`: `reason`, else the rule in words (`/amount is not over 40`, `/amount is absent`) |
+| `unique` | `key` | the rows whose `key` value another row shares, each with `/count` |
+
+### Expressions
+
+`each`, `when`, `where` and `validate` take `expr` instead of their settings:
+a text, parsed once per read and evaluated per row with the row's slots as
+the only variables. `each` writes the value at `into` (a number with its own
+scale, a text or a boolean); `where` keeps the rows where it is true; `when`
+writes `then` or `else` by it; `validate` keeps the rows where it is false,
+the expression as the reason unless `reason` is given.
+
+```
+amount * 2 + 1                       slot names, whole and decimal numbers, signed; + - * /
+status = 'closed' and amount > 30    = != < <= > >=, and or not, in (text inside text), parens
+round(amount / 3, 1)                 min max abs round len lower upper trim contains starts ends
+```
+
+Usual precedence (`or` below `and` below `not` below comparisons below `+ -`
+below `* /` below unary minus). A product or quotient is rounded half up at
+the larger of its operands' scales (`50 / 3` is 17; write `50.0 / 3` for
+16.7). A slot the row lacks is a hole on that row, noted at
+`/sys/view/hole/<row>` in the context: `where` drops the row, `each` and
+`when` leave it, `validate` fails it. A bad expression is one fault with
+its position; division by zero and a number against a text in arithmetic
+fault, naming the row; `expr` beside the old settings faults. A formula
+read takes `expr` in its settings like any other.
 
 ### Hand edits that survive recomputation
 
