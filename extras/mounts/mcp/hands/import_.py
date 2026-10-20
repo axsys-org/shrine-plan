@@ -43,14 +43,23 @@ PLUGS = {'csv': read_csv, 'json': read_json}
 segment = _hand.segment_of
 
 
-def typed(value):
-    """A source value as a slot: a whole number stays a number, a decimal a decimal, the rest text."""
+def typed(value, key=False):
+    """A source value as a slot: the key field is always text, and so is a digit string with a leading zero (a zip code,
+    an account number); a text that looks like a number is sent as {type: str} so the world keeps it text. Otherwise a
+    whole number is a number, a decimal a decimal, the rest text."""
     text = str(value)
+    if key or re.fullmatch(r'-?0\d+(\.\d+)?', text):
+        return {'type': 'str', 'value': text} if re.fullmatch(r'-?\d+(\.\d+)?', text) else text
     if re.fullmatch(r'-?\d+', text):
         return int(text)
     if re.fullmatch(r'-?\d+\.\d+', text):
         return float(text)
     return text
+
+
+def shown(value):
+    """The text a slot value reads back as."""
+    return value['value'] if isinstance(value, dict) else str(value)
 
 
 class Import(Hand):
@@ -82,11 +91,11 @@ class Import(Hand):
         for row in rows:
             if key not in row:
                 continue
-            slots = {mapping.get(segment(field), segment(field)): typed(value) for field, value in row.items()}
-            slots['source_id'] = str(row[key])
+            slots = {mapping.get(segment(field), segment(field)): typed(value, key=field == key) for field, value in row.items()}
+            slots['source_id'] = typed(row[key], key=True)
             path = folder + '/' + segment(row[key])
             current = existing.get(path.rsplit('/', 1)[1])
-            wanted = {'/' + k: str(v) for k, v in slots.items()}
+            wanted = {'/' + k: shown(v) for k, v in slots.items()}
             if current is not None and all(current.get(k) == v for k, v in wanted.items()):
                 continue                                  # the record is already what the source says
             records.append({'path': path, 'slots': slots, 'action': 'poke' if current is not None else 'make'})
