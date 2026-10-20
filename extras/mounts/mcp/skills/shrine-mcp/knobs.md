@@ -102,17 +102,14 @@ ask hand runs on that.
 ## Write only if unchanged
 
 A record in a write may carry `if_case`, the x case the writer read
-(`read` answers it in `reference`, `/h/x/<case>/...`). The batch is admitted
-only while every such record is still at that case; else it is refused
-whole, and `reason` names the record and the case it is at now
-(`if_case: /0x11/user/org/d1 is at case 4, not 3; nothing was written`).
-Two agents on one record rarely lose each other's work: read, write with
-the case, and on a refusal read again. But the check and the event are
-two turns of the world's supervisor, not one, so a write landing between
-them is not caught: a refusal is certain, an admission is likely, not
-guaranteed. A kernel precondition would close that gap and is on the
-kernel's list; until then, read again after a write that must not be
-lost.
+(`read` answers it in `reference`, `/h/x/<case>/...`). The precondition
+rides into the kernel with the writ and is judged in the same commit:
+the batch is admitted only while every such record is still at that
+case, else it is refused whole, nothing written, and `reason` names the
+record and the case it is at now (`if_case: /0x11/user/org/d1 is at
+case 4, not 3; nothing was written`). Two agents on one record cannot
+lose each other's work: read, write with the case, and on a refusal
+read again.
 
 ## Hands
 
