@@ -17,6 +17,19 @@ def parse_hand(text):
     return {'name': parts[0], 'args': parts[1:]}
 
 
+def merge_hands(kept, given):
+    """The hands a kept world runs after a boot that names some: the kept ones plus the new ones. A name kept with
+    other args is a change the world refuses (edit world.json for that); the same hand named again is fine."""
+    out = list(kept)
+    for hand in given:
+        same = [h for h in out if h['name'] == hand['name']]
+        if same and same[0].get('args', []) != hand.get('args', []):
+            raise ValueError(f"hand {hand['name']} is kept with args {same[0].get('args', [])}; edit world.json to change them")
+        if not same:
+            out.append(hand)
+    return out
+
+
 def hand_commands(hands, url, node, hands_dir=HANDS_DIR):
     """The argv of every listed hand; a hand that has no script is an error before anything starts."""
     out = []
@@ -26,7 +39,7 @@ def hand_commands(hands, url, node, hands_dir=HANDS_DIR):
             script = Path(hands_dir) / (hand['name'] + '_.py')      # import is a keyword
         if not script.is_file():
             raise ValueError(f"no hand called {hand['name']} in {hands_dir}")
-        out.append([sys.executable, str(script), url, '--node', node, *hand.get('args', [])])
+        out.append([sys.executable, '-u', str(script), url, '--node', node, *hand.get('args', [])])   # -u: the log shows lines as they happen
     return out
 
 

@@ -86,7 +86,13 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no hand called'):
             eden_hands.hand_commands([{'name': 'nope', 'args': []}], 'http://x', '0x11', hands_dir)
         commands = eden_hands.hand_commands([{'name': 'sleepy', 'args': ['--a', '1']}], 'http://127.0.0.1:1', '0x11', hands_dir)
-        self.assertEqual(commands[0][2:], ['http://127.0.0.1:1', '--node', '0x11', '--a', '1'])
+        self.assertEqual(commands[0][1:4], ['-u', str(hands_dir / 'sleepy.py'), 'http://127.0.0.1:1'])
+        self.assertEqual(commands[0][4:], ['--node', '0x11', '--a', '1'])
+        kept = [{'name': 'clock', 'args': ['--timezone', 'UTC']}]
+        self.assertEqual(eden_hands.merge_hands(kept, [{'name': 'inbox', 'args': []}, {'name': 'clock', 'args': ['--timezone', 'UTC']}]),
+                         kept + [{'name': 'inbox', 'args': []}])                      # a kept world gains a hand, the same hand again is fine
+        with self.assertRaisesRegex(ValueError, 'kept with args'):
+            eden_hands.merge_hands(kept, [{'name': 'clock', 'args': ['--timezone', 'Asia/Tokyo']}])
         work = self.root / 'world'
         work.mkdir()
         with ExitStack() as cleanup:

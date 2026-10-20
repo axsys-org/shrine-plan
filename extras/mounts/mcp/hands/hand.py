@@ -109,7 +109,7 @@ def case_of(reference):
     return int(reference.split('/')[3]) if reference else 0
 
 
-HANDS = ('ask', 'clock', 'watch', 'export', 'import')
+HANDS = ('ask', 'clock', 'watch', 'export', 'import', 'inbox')
 
 
 class Hand:

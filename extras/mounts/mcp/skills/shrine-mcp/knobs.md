@@ -121,6 +121,7 @@ others; the launcher's `Eden:` line lists them. Config is a record at
 | `watch` | posts to a URL when a watched cell's answer changes (`cells`, `url`) | the value at `/agent/hands/watch/<cell>` is stale |
 | `export` | a request record under `/agent/hands/export/` `{folder, format, path}` becomes a file | the request has no `done` |
 | `import` | `/agent/hands/import/<source>` `{kind, source, folder, key, every}` plus `/map` and `/refs/<slot>`; writes `who: import:<source>` | `ran` on the config does not move |
+| `inbox` | nudges an agent when a record lands under `/agent/<name>/inbox` or carries `to: <name>`; the plug per agent is `/agent/hands/inbox/to/<name>` `{url}` (a JSON post of `{to, from, epoch, paths}`) or `{command}` (a shell command with `INBOX_TO`, `INBOX_FROM`, `INBOX_EPOCH`, `INBOX_PATHS` set and the JSON on stdin); never writes | a note sits unread: the hand's log says `no plug for <name>` or nothing at all |
 | `ask` | answers `ask` cells with a model | `/c/x/<cell>` keeps saying asking |
 
 A line from a hand, or one whose touched paths all sit under `/agent/hands`,

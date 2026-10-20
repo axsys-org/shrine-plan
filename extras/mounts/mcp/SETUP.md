@@ -36,10 +36,12 @@ with no arguments resumes that world in seconds with every record, cell and
 case it had. Run it in a terminal of its own, not in the foreground of this
 session.
 
-A hand for a new world is named on its first boot and kept with it:
-`--hand "ask --model <name> --endpoint <chat completions url>"` adds the
-model hand (`OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the environment is
-sent as a bearer); `--port N` picks the port (default 8300).
+`--hand` names a hand and the world keeps it, on its first boot or any
+later one: `--hand "ask --model <name> --endpoint <chat completions url>"`
+adds the model hand (`OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the
+environment is sent as a bearer), `--hand inbox` the one that wakes an
+agent when a note lands for it (its plugs are records, see `hands.md`);
+`--port N` picks the port of a new world (default 8300).
 
 ## 2. Connect your app, load the skill
 

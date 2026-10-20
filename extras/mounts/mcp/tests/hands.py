@@ -23,7 +23,7 @@ def load(name):
 
 
 def check(base, node, timeout, quiet_seconds=60):
-    hand, clock, watch, export, imp, ask = (load(n) for n in ('hand', 'clock', 'watch', 'export', 'import_', 'ask'))
+    hand, clock, watch, export, imp, ask, inbox = (load(n) for n in ('hand', 'clock', 'watch', 'export', 'import_', 'ask', 'inbox'))
     w = hand.World(base, node, timeout)
     checks = []
     quiet = lambda *a: None
@@ -116,6 +116,19 @@ def check(base, node, timeout, quiet_seconds=60):
     expect('a new row in the source is one new record, with its reference', (im.tick(time.time() + 20) >= 1, (w.read(people + '/p_4').get('properties') or {}).get('/sku_ref') is not None), (True, True))
 
     expect('segment_of makes a name from an id, a field or a path', (hand.segment_of('p-1'), hand.segment_of('full name'), hand.segment_of('/0x11/user/views/total'), hand.segment_of('2024')), ('p_1', 'full_name', 'user_views_total', 'c_2024'))
+    # inbox: a note under an agent's inbox or a record with to: <name> nudges that agent through its plug; no plug, no nudge
+    posted, ran = [], []
+    w.tool('write', who='test', records=[{'path': home + '/inbox/to/alice', 'slots': {'url': 'http://127.0.0.1:1/nudge'}},
+                                          {'path': home + '/inbox/to/bob', 'slots': {'command': 'true'}}])
+    ib = inbox.Inbox(w, log=quiet, plugs={'post': lambda url, payload: posted.append((url, payload)), 'run': lambda cmd, payload: ran.append((cmd, payload))})
+    note = {'epoch': 500, 'who': 'ian', 'touched': ['/0x11/agent/alice/inbox/q1', '/0x11/user/plan/step_3'],
+            'with': {'/0x11/agent/alice/inbox/q1': {'properties': {'/text': 'how many?'}}, '/0x11/user/plan/step_3': {'properties': {'/to': 'bob', '/text': 'take this step'}}}}
+    expect('inbox: a line nudges the inbox owner by url and the addressee by command, and writes nothing',
+           (ib.line(note), posted, [c for c, _ in ran], ran[0][1]['paths']),
+           (0, [('http://127.0.0.1:1/nudge', {'to': 'alice', 'from': 'ian', 'epoch': 500, 'paths': ['/0x11/agent/alice/inbox/q1']})], ['true'], ['/0x11/user/plan/step_3']))
+    expect('inbox: a name with no plug is left waiting', (ib.line({'epoch': 501, 'who': 'ian', 'touched': ['/0x11/agent/nobody/inbox/q2'], 'with': {}}), len(posted) + len(ran)), (0, 2))
+    expect('inbox: a hand\'s own line is quiet', ib.take({'epoch': 502, 'who': 'import', 'touched': ['/0x11/agent/alice/inbox/q3'], 'with': {}}), 0)
+
     # ask on the base still answers (its own test covers the rest)
     a = ask.Hand(w, model='fake', fake=True, log=quiet)
     expect('the ask hand on the base reports nothing to answer when nothing asks', a.tick(), 0)

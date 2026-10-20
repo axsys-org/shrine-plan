@@ -76,3 +76,17 @@ A hand that is not running shows as an `ask` that never answers, a
 `/clock` day that is behind, an export request without `done`, an import
 config whose `ran` does not move. The launcher's `Eden:` line names the
 hands it started.
+
+## The inbox hand
+
+A chat session does nothing between turns, so nothing reads its inbox on
+its own; the `inbox` hand does. It follows the stream and, when a line
+writes a record under `/agent/<name>/inbox` or a record carrying
+`to: <name>`, nudges that agent through the plug named at
+`/agent/hands/inbox/to/<name>`: `{url}` posts `{to, from, epoch, paths}` as
+JSON; `{command}` runs a shell command with `INBOX_TO`, `INBOX_FROM`,
+`INBOX_EPOCH` and `INBOX_PATHS` in its environment and the same JSON on
+stdin. A name with no plug is logged and the note waits where it is. The
+hand never writes, so it is quiet by the base's rule; name it in
+`world.json` like any other, and give each agent's plug the way its app is
+woken (a notify hook, a trigger URL, a command that opens a session).
