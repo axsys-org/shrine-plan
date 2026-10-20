@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from eden_mounts import catalog, select, runtime_specs, ScanBridge, prepare, runtime_literal
@@ -72,6 +73,33 @@ class MountTests(unittest.TestCase):
         self.assertTrue(complete, log)
         self.assertIn('"MOUNT-ENCODING-PASS"', log)
         self.assertNotIn('"MOUNT-ENCODING-FAIL"', log)
+
+    def test_hands_named_in_the_descriptor_start_and_stop(self):
+        import eden_hands
+        from contextlib import ExitStack
+        self.assertEqual(eden_hands.parse_hand('clock --timezone UTC'), {'name': 'clock', 'args': ['--timezone', 'UTC']})
+        with self.assertRaisesRegex(ValueError, 'hand name'):
+            eden_hands.parse_hand('')
+        hands_dir = self.root / 'hands'
+        hands_dir.mkdir()
+        (hands_dir / 'sleepy.py').write_text('import sys, time\nprint("hand", sys.argv[1:], flush=True)\ntime.sleep(60)\n')
+        with self.assertRaisesRegex(ValueError, 'no hand called'):
+            eden_hands.hand_commands([{'name': 'nope', 'args': []}], 'http://x', '0x11', hands_dir)
+        commands = eden_hands.hand_commands([{'name': 'sleepy', 'args': ['--a', '1']}], 'http://127.0.0.1:1', '0x11', hands_dir)
+        self.assertEqual(commands[0][2:], ['http://127.0.0.1:1', '--node', '0x11', '--a', '1'])
+        work = self.root / 'world'
+        work.mkdir()
+        with ExitStack() as cleanup:
+            started = eden_hands.start_hands([{'name': 'sleepy', 'args': ['--a', '1']}], 'http://127.0.0.1:1', '0x11', work, cleanup, hands_dir)
+            name, process, log = started[0]
+            self.assertEqual((name, process.poll()), ('sleepy', None))        # running
+            for _ in range(50):
+                if 'hand' in log.read_text():
+                    break
+                time.sleep(0.1)
+            self.assertIn("hand ['http://127.0.0.1:1', '--node', '0x11', '--a', '1']", log.read_text())
+        self.assertIsNotNone(process.poll())                                   # stopped at teardown
+        self.assertEqual(eden_hands.hand_commands([], 'http://x', '0x11', hands_dir), [])      # a hand not listed does not run
 
     def test_unknown_and_cycles(self):
         self.bag('a', dependencies=['b'])
