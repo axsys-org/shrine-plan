@@ -333,3 +333,47 @@ an empty controls array. Its geometry, paint, font and semantics require the sam
 validation as any display. This field grants no edit/action authority. The native
 Explorer opens declared ordinary views for edits; it does not parse or reproduce
 the HTML slot editor. Read-only records continue to supply ordinary `display`.
+
+
+## Live preparation inspection (optional)
+
+The Explorer `/goo/render` request accepts `pipeline=1`. Omission keeps the normal response unchanged; unknown nonempty values are rejected. Prepared tree-page requests (`/goo/source`, `presentations=pane-v1`) also propagate this opt-in to their render variants. It never changes action evidence or enables controls.
+
+Each ordinary prepared fragment may include `pipeline: {version: 1, origin: "live-preparation", note, stages}`. Stage records use the existing compiler inspector shape `{name, status, output, diagnostics}`. They are observations of the values used in this same snapshot/preparation, not a later replay. The stage order is parse, read, source, core, normalized, visible, semantic, metrics, layout, trace, prepared, display, bindings, html. Parse/read are `skipped` with null output because publication artifacts are not retained at this boundary (synthetic typed views bypass them). Source is evaluated typed Goo, not the original Grove file. Other successful stages use `ok` and an empty diagnostics array.
+
+Source/core lack component IDs. Normalized/visible/semantic expose `attrs.id`; layout and display use `id`; metrics uses `sizes[id]`; adjacency trace uses `leftId`, `rightId`, and `parent`; bindings use `binding.nodeId`. Consumers must not infer pre-ID joins from text or ordinal. Prepared inspection provides measurement and wrapped-line records; final boxes, baselines, paint, fonts and accessibility semantics live in display. The display and bindings stage outputs are exactly the corresponding fragment fields. For synthetic Values, display corresponds to `readOnlyDisplay`; HTML is the Goo projection of that display, not the optional browser raw-value editor wrapper.
+
+The enclosing response/fragment supplies profile, context and snapshot evidence. Pane native fragments and patch bodies have independent captures; structural host components retain their existing structured contracts. These diagnostics grant no invocation authority. Unknown pipeline versions can be retained as raw data without preventing admission of an otherwise supported ordinary response. No partial failure capture is added by this extension: a failed preparation follows the existing render error path.
+
+### English text runs
+
+Prepared display version 1 has additive text-run fields. `node.textRuns` is the
+lossless source payload, encoded as an ordered array:
+
+```json
+[{"myth": {}, "lang": {"en": {"txt": "Hello"}}}]
+```
+
+`payload` remains its exact concatenated string projection. IR inspection and
+normalized/semantic codecs use the same `textRuns` beside `text`; decoding rejects
+conflicting projections, duplicate descriptor keys and unsupported languages.
+Legacy string-only input is lifted into one English run with an empty descriptor.
+
+Each static `line.runs` contains prepared fragments with `myth`, `lang: "en"`,
+`text`, absolute CSS-pixel `box`, `textX`, and `baseline`. Concatenation equals the
+line's `text`. Fragments share its text style/paint in the initial profile; their
+origins are supplied by Reaver. `prepared.lines[].runLines` retains the wrapped
+run sequences. Editable inputs expose source runs but no stale static lines.
+
+The run's RunDescriptor is a Foil `myth` (path-keyed branded pails); it grants no
+action authority. At the JSON boundary its slots use canonical path keys and
+tagged `kind`/`value` pails. The initial codec supports nat, bool, text and path
+pails; foreign brands are explicitly diagnostic/unsupported on the wire.
+Empty myths remain `{}`.
+The initial profile accepts empty descriptors only; nonempty properties are
+explicitly unsupported at preparation. Thus existing version-1 consumers using
+plain projections retain identical rendering behavior. A consumer supporting the
+extension must validate the projections, supported descriptors/languages and
+fragment geometry before mounting. This change adds no rich-text editing or
+Unicode shaping; future descriptor properties need specified measurement, paint,
+editing and accessibility behavior before being enabled.

@@ -65,3 +65,35 @@ must produce the expected elaboration diagnostic. Syntax errors or unrelated
 runtime failures cannot count as a successful rejection. Compilation tests run
 in a disposable snapshot against an empty source root; normal adapter requests
 continue to execute precompiled code.
+
+## Text runs
+
+Textual IR leaves and primitive labels carry `goo/text = row[goo/runt]` in
+source, core, normalized, visible and semantic phases. A `goo/runt` contains
+`myth=myth` and `lang=goo/lang`; the initial language variant is
+`goo/lang/en { txt=str }`. `goo/text/en` lifts an existing string into a single
+English run with an empty descriptor. Image URLs, IDs, paths and wire keys remain
+strings. Existing string-valued configuration labels remain compatibility inputs.
+
+The `myth` field is the existing Foil `myth`: `mop[path pail lt_pith]`.
+It is the run's RunDescriptor, with typed, branded pail values at path-shaped
+slots. It carries metadata, not receiver identity or action authority. Any pail
+brand survives compiler passes, slicing and normalization without conversion.
+
+JSON is only a transport adapter: canonical path strings key tagged pail values
+(`kind` and `value`). The current codec round trips `pails/n`, `pails/b`, `pails/t`
+and `pails/p`; naturals use decimal strings to preserve arbitrary precision.
+Foreign brands produce an explicit `unsupported` diagnostic with their brand
+and cannot be decoded as another type. Duplicate slots and noncanonical paths
+are rejected. This does not restrict which pails a run can hold in Foil.
+
+Descriptor properties do not have implicit styling semantics: the current
+rendering profile supports only empty myths and diagnoses nonempty myths before
+layout. No font/color/interaction property vocabulary is introduced here.
+
+Run boundaries are not word or line boundaries. Measurement sees concatenated
+text; wrapping slices the original runs and retains their descriptors. CRLF can
+cross runs, tabs expand using the rendering profile, and whitespace collapse for
+control labels retains the descriptor of the retained whitespace. Current byte
+slicing is used only with validated ASCII measurement; it is not a Unicode
+shaper. Only `en` is accepted on the wire, with the existing ASCII limitation.
