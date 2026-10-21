@@ -81,15 +81,36 @@ slots. It carries metadata, not receiver identity or action authority. Any pail
 brand survives compiler passes, slicing and normalization without conversion.
 
 JSON is only a transport adapter: canonical path strings key tagged pail values
-(`kind` and `value`). The current codec round trips `pails/n`, `pails/b`, `pails/t`
-and `pails/p`; naturals use decimal strings to preserve arbitrary precision.
-Foreign brands produce an explicit `unsupported` diagnostic with their brand
-and cannot be decoded as another type. Duplicate slots and noncanonical paths
-are rejected. This does not restrict which pails a run can hold in Foil.
+(`kind` and `value`). The codec supports `pails/n`, `pails/b`, `pails/t`, `pails/p`,
+`pails/modifiers`, and `weblink`. Foreign brands remain diagnostic data and
+cannot be decoded as another type. Duplicate slots and noncanonical paths are
+rejected. This does not restrict which pails a run can hold in Foil.
 
-Descriptor properties do not have implicit styling semantics: the current
-rendering profile supports only empty myths and diagnoses nonempty myths before
-layout. No font/color/interaction property vocabulary is introduced here.
+Rendering recognizes these typed myth slots:
+
+| Slot | Pail | Meaning |
+| --- | --- | --- |
+| `/sys/font` | `pails/p` | Path to a pinned font in the current renderer registry |
+| `/sys/modifiers` | `pails/modifiers { values=list[modifiers] }` | `italic`, `bold`, `underline` |
+| `/sys/link` | `pails/p` or `weblink { href=str }` | Internal target or HTTP(S) target; filled box highlight |
+
+`modifiers` is the closed sum of the three nullary records. `pails/modifiers`
+boxes the typed list at the myth's pail boundary. The underlying text remains
+`row[goo/runt]`; `goo/text/pail { value=goo/text }` is its namespace-field carrier.
+The explorer's ordinary `show`/text formatter preserves this carrier's runs.
+
+Font paths are `/sys/font/sans`, `/sys/font/mono`, or `/sys/font/<fontId>`.
+The registry includes the base profile faces and the `run-fonts/fonts.json`
+extension. Sans bold uses weight 750; mono bold uses 700. Italic retains the
+selected sans weight (400, 520, 550, 620, 650, 750). Mono italic, unknown font
+paths, malformed slots, duplicate modifiers, and styled native inputs are
+explicitly rejected. Arbitrary namespace font discovery is not implemented.
+
+Measurement and wrapping use each run's selected font advances. Line extents
+account for mixed fonts and all fragments share the prepared baseline.
+Underlining and link highlights are prepared paint, with no extra text advance.
+Links retain structured targets and descriptive semantics; they do not create
+Goo controls or authorize navigation/invocations.
 
 Run boundaries are not word or line boundaries. Measurement sees concatenated
 text; wrapping slices the original runs and retains their descriptors. CRLF can

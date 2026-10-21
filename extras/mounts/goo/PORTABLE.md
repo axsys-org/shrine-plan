@@ -365,15 +365,26 @@ line's `text`. Fragments share its text style/paint in the initial profile; thei
 origins are supplied by Reaver. `prepared.lines[].runLines` retains the wrapped
 run sequences. Editable inputs expose source runs but no stale static lines.
 
-The run's RunDescriptor is a Foil `myth` (path-keyed branded pails); it grants no
-action authority. At the JSON boundary its slots use canonical path keys and
-tagged `kind`/`value` pails. The initial codec supports nat, bool, text and path
-pails; foreign brands are explicitly diagnostic/unsupported on the wire.
-Empty myths remain `{}`.
-The initial profile accepts empty descriptors only; nonempty properties are
-explicitly unsupported at preparation. Thus existing version-1 consumers using
-plain projections retain identical rendering behavior. A consumer supporting the
-extension must validate the projections, supported descriptors/languages and
-fragment geometry before mounting. This change adds no rich-text editing or
-Unicode shaping; future descriptor properties need specified measurement, paint,
-editing and accessibility behavior before being enabled.
+The run's RunDescriptor is a Foil `myth` (path-keyed branded pails). The supported
+slots and font registry are documented in `TYPES.md`. Metadata is decoded and
+resolved on the server before layout. The client consumes prepared styling.
+
+A display containing styled runs has **display version 2**. Unstyled displays
+retain version 1 and identical output. Each styled fragment requires `resolved`:
+
+- `version: 1` and `textStyle`: exact font ID/hash, family, weight, style, size,
+  line height and tracking. Extra pinned faces are in `run-fonts/fonts.json`.
+- `foreground`: resolved sRGB ink.
+- Optional `highlight`: `fill`, `stroke`, inside-border `width`, and `radius`,
+  applied to that fragment's supplied box. Wrapped links have one box per line.
+- Optional `underline`: `color`, stroke `width`, and absolute CSS-pixel `y`.
+- `semantics`: `role` (`text` or `link`) and optional structured `target`
+  (`{kind:"path",path:...}` or `{kind:"weblink",href:...}`).
+
+Clients validate supported versions, source/fragment metadata joins, typography,
+font hashes, paint bounds, and link-target consistency before mounting. Link
+semantics are descriptive and supply no action route. The egui implementation
+paints the highlight and exposes its target on hover; click navigation is not
+implemented. HTML uses non-navigating spans with the same resolved styling.
+Native editing remains plain text; styled input values fail explicitly. Unicode
+shaping and arbitrary downloaded/namespace font resolution remain unsupported.
