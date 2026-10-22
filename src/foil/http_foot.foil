@@ -14,6 +14,15 @@
       http_foot/action/asset
       http_foot/action/install
       http_foot/action/write
+      http_foot/action/commit
+      http_foot/action/commit_many
+      http_foot/action/batch
+      http_foot/action/batch_told
+      http_foot/action/told
+      http_foot/action/stream
+      http_foot/action/broadcast
+      http_foot/action/join
+      http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
       http_foot/action/value
@@ -36,6 +45,44 @@
       : source=path version=nat target=path back=str
     + write
       : pax=path wit=writ back=str
+    + commit
+      ' One write. The foot admits or rejects it, then calls done with
+      ' the result (none, or the rejection) to build the response.
+      : pax=path wit=writ done={\ maybe[pail]}http_response
+    + commit_many
+      ' Several writes admitted whole or refused whole as one event
+      ' (one journal entry); answered like commit.
+      : writes=row[[pax=path wit=writ]] done={\ maybe[pail]}http_response
+    + batch
+      ' One commit_many, then one snapshot on the admitted state: finish
+      ' receives the event's outcome and that state.  The connection
+      ' actor runs the pair; the foot sees one commit and a snapshot.
+      : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str]
+    + batch_told
+      ' A batch, plus one line for the open streams. After the commit,
+      ' told runs on the new state and returns the line to send; an
+      ' empty string sends nothing.
+      : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str] told={\ maybe[pail] namespace}str
+    + told
+      ' A read that also sends a fixed line to the open streams. Nothing
+      ' is written to the journal.
+      : read={\ namespace}[nat str] line=str
+    + stream
+      ' A GET that stays open. The connection sends the event-stream
+      ' head, registers with the fan-out, and then writes each line it
+      ' is given until the socket closes. Commits never wait for it.
+      :
+    + broadcast
+      ' One line for every open stream, from a connection to the foot.
+      : line=str
+    + join
+      ' A stream connection registering itself with the foot (its
+      ' handle rides as the capability).
+      :
+    + after
+      ' A snapshot whose answer decides the next action: a read that
+      ' feeds a write, in one request.
+      : read={\ namespace}[nat str] next={\ nat str}http_foot/action
     + wait
       : record=myth
     + journal
@@ -63,6 +110,15 @@
       http_foot/action/develop
       http_foot/action/install
       http_foot/action/write
+      http_foot/action/commit
+      http_foot/action/commit_many
+      http_foot/action/batch
+      http_foot/action/batch_told
+      http_foot/action/told
+      http_foot/action/stream
+      http_foot/action/broadcast
+      http_foot/action/join
+      http_foot/action/after
       http_foot/action/wait
       http_foot/action/journal
       http_foot/action/value
@@ -78,12 +134,15 @@
   + ack
     & http_foot/ack/request
       http_foot/ack/write
+      http_foot/ack/commit
       http_foot/ack/install
       http_foot/ack/cleanup
     + request
       : key=iota
     + write
       : conn=nat back=str
+    + commit
+      : conn=nat done={\ maybe[pail]}http_response
     + install
       : conn=nat back=str
     + cleanup
@@ -101,6 +160,13 @@
     \ bytes=nat
     ^ str
     | str/from_atom (mod bytes (bex (mul 8 (dec (wid bytes)))))
+  + body_text
+    ' The text of a response built by a mount: its body is a plain
+    ' atom, never barred, so no byte is stripped (unbar is for the
+    ' marked request and asset bytes only).
+    \ response=http_response
+    ^ str
+    | str/from_atom response.body
   + split
     \ separator=nat text=str
     ^ row[str]
@@ -290,37 +356,226 @@
            "Content-Length: " (nat/show (dec (wid body))) http_foot/crlf
            "Connection: close" http_foot/crlf http_foot/crlf]
     | add (str/to_atom header) (mul body (bex (mul 8 header.len)))
+  + planned
+    '  What the listener decided for one connection: an encoded reply it
+    '  could finish locally, or an action the foot must answer.
+    & http_foot/planned/done
+      http_foot/planned/ask
+    + done
+      : encoded=nat
+    + ask
+      : action=http_foot/action
+  + plan
+    '  Read and route one request in the listener, which holds the
+    '  routes.  Only the fd and this small result cross to the
+    '  connection actor.  (A fresh actor per connection used to receive
+    '  the whole route configuration, every closure with its environment,
+    '  through the message copier on each request: that copy was the
+    '  per-request floor, and it grew with the loaded mounts.  A pool of
+    '  workers spawned once was tried and dropped: a worker waiting for
+    '  the foot's answer shares its mailbox with incoming connections.)
+    \ config=http_foot/config fd=nat
+    ^ http_foot/planned
+    ? (Try http_foot/read_request fd)
+     > (./err _) (./done (http_foot/encode (http_driver/response 400 "Malformed HTTP request")))
+     > (./ok parsed)
+      = ;attempt
+          | Try[http_foot/request http_foot/action]
+            (\ r=http_foot/request
+              | http_foot/dispatch config.routes r
+                  (div (Now 0) 1000000000))
+            parsed
+      ? attempt
+       > (./err _) (./done (http_foot/encode (http_driver/response 400 "Invalid request")))
+       > (./ok action)
+        ? action
+         > (./reply ready) (./done (http_foot/encode ready))
+         > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
+        (./ask action)
   + connection
-    '  Plan locally; ask the foot only for namespace work.
-    \ config=http_foot/config fd=nat self=nat
+    '  Finish one connection: write a local reply, or ask the foot for
+    '  namespace work and write its answer.
+    \ fd=nat planned=http_foot/planned self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
+    = streaming=bool
+        ? planned
+         > (./ask action)
+          ? action
+           > .stream .true
+          .false
+        .false
+      joining=http_foot/action .join
+    ? streaming
+      ; (Try (\ wire=nat (Write fd wire)) (http_foot/bar http_foot/stream_head))
+      ; (SendCaps foot joining [0])
+      ; (CloseHandle foot)
+      | http_foot/streaming fd
     = encoded=nat
-        ? (Try http_foot/read_request fd)
-         > (./err _) (http_foot/encode (http_driver/response 400 "Malformed HTTP request"))
-         > (./ok parsed)
-          =   ;planned
-            | Try[http_foot/request http_foot/action]
-              (\ r=http_foot/request
-                | http_foot/dispatch config.routes r
-                    (div (Now 0) 1000000000))
-              parsed
-          ? planned
-           > (./err _)
-            | http_foot/encode (http_driver/response 400 "Invalid request")
-           > (./ok action)
-            ? action
-             > (./reply ready) (http_foot/encode ready)
-             > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
-            ; (SendCaps foot action [0])
-            = ;[answer extra] (Recv[http_foot/answer] 0)
-            ? answer
-             > response=http_response (http_foot/encode response)
-             > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+        ? planned
+         > (./done ready) ready
+         > (./ask action) (http_foot/perform foot action)
     ; (Try (\ wire=nat (Write fd wire)) encoded)
     ; (CloseFd fd)
     | CloseHandle foot
+  + stream_msg
+    ' What a stream connection and the fan-out exchange.
+    & http_foot/stream_msg/join
+      http_foot/stream_msg/line
+      http_foot/stream_msg/streamed
+    + join
+      :
+    + line
+      : text=str
+    + streamed
+      ' A stream acknowledging one written line; the fan-out counts
+      ' lines outstanding per stream and drops one that stalls.
+      :
+  + stream_head
+    ' The event-stream response head: no length, the body runs until
+    ' the socket closes.
+    ^ str
+    | str/cat_all ["HTTP/1.0 200 Response" http_foot/crlf "Content-Type: text/event-stream" http_foot/crlf "Cache-Control: no-cache" http_foot/crlf "Connection: close" http_foot/crlf http_foot/crlf ": open" http_foot/crlf http_foot/crlf]
+  + frame
+    ' One server-sent event carrying the line.
+    \ text=str
+    ^ nat
+    | http_foot/bar (str/cat_all ["data: " text http_foot/crlf http_foot/crlf])
+  + streaming
+    ' A stream connection after its head is written: receive lines from
+    ' the fan-out, write each to the socket, acknowledge it; a failed
+    ' write (the tab went away) ends the connection.
+    \ fd=nat
+    ^ nat
+    % ignored=nat 0
+    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+    ? message
+     > (./line text)
+      = ;wrote (Try (\ wire=nat (Write fd wire)) (http_foot/frame text))
+      ? wrote
+       > (./ok _)
+        = acked=http_foot/stream_msg .streamed
+        ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
+        ; (helm/supervisor/close_caps caps)
+        | _ 0
+       > (./err _)
+        ; (helm/supervisor/close_caps caps)
+        ; (CloseFd fd)
+        0
+    ; (helm/supervisor/close_caps caps)
+    | _ 0
+  + fanout
+    ' The stream registry: every open stream's handle with the lines it
+    ' has not yet acknowledged.  A line is sent to each with Try; a
+    ' stream whose handle refuses, or that falls more than 64 lines
+    ' behind, is dropped.  Nothing here blocks: a commit hands the line
+    ' over and goes on.
+    \ self=nat
+    ^ nat
+    % streams=row[[h=nat behind=nat]] []
+    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+    ? message
+     > .join
+      ? (eq caps.len 0) (_ streams)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ streams.snoc([caps.at(0) 0])
+     > .streamed
+      ? (eq caps.len 0) (_ streams)
+      = from caps.at(0)
+        eased
+          | streams.map
+            \ [h behind]
+            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind)]
+      ; (helm/supervisor/close_caps caps)
+      | _ eased
+     > (./line text)
+      ; (helm/supervisor/close_caps caps)
+      = none=row[[h=nat behind=nat]] []
+        ;kept
+          | streams.fold none
+          \ ;out=row[[h=nat behind=nat]] [h behind]
+          ^ row[[h=nat behind=nat]]
+          ? (gt behind 64)
+            ; (CloseHandle h)
+            out
+          = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
+          ? sent
+           > (./ok _) out.snoc([h behind.inc])
+           > (./err _)
+            ; (Try (\ target=nat (CloseHandle target)) h)
+            out
+      | _ kept
+    | _ streams
+  + outcome
+    ' The commit answer a batch step reads: 200 admitted, or 409 with
+    ' the kernel's reason as the body.
+    \ err=maybe[pail]
+    ^ http_response
+    ? err
+     > .none (http_driver/response 200 "admitted")
+     > (./some why) (http_driver/response 409 (http_foot/reason why))
+  + reason
+    ' A rejection pail as text: the kernel names its reason as a symbol.
+    \ why=pail
+    ^ str
+    ? why
+     > q=pails/q (iota_show q.q)
+     > t=pails/t t.t
+     > n=pails/n (nat/show n.n)
+    "refused"
+  + ask
+    \ foot=nat action=http_foot/action
+    ^ http_foot/answer
+    ; (SendCaps foot action [0])
+    = ;[answer extra] (Recv[http_foot/answer] 0)
+    answer
+  + encode_answer
+    \ answer=http_foot/answer
+    ^ nat
+    ? answer
+     > response=http_response (http_foot/encode response)
+     > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+  + perform
+    ' Ask the foot and encode its answer.  A batch is one commit_many
+    ' (one event for every record), then one snapshot; an after is a
+    ' snapshot whose answer picks the next action.
+    \ foot=nat action=http_foot/action
+    ^ nat
+    ? action
+     > (./batch writes finish)
+      = ;answer (http_foot/ask foot (http_foot/action/commit_many writes http_foot/outcome))
+        outcome=maybe[pail]
+          ? answer
+           > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
+           > (./bytes status body ctype) .none
+      | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state))))
+     > (./batch_told writes finish told)
+      = ;answer (http_foot/ask foot (http_foot/action/commit_many writes http_foot/outcome))
+        outcome=maybe[pail]
+          ? answer
+           > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
+           > (./bytes status body ctype) .none
+        ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state)))))
+        ;line (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace [200 (told outcome state)])))
+      ; (? line
+          > response=http_response
+            = text (http_foot/body_text response)
+            ? (gt text.len 0) (Send foot (http_foot/action/broadcast text)) 0
+          > (./bytes status body ctype) 0)
+      | ready
+     > (./told read line)
+      = ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot read)))
+      ; (? (gt line.len 0) (Send foot (http_foot/action/broadcast line)) 0)
+      | ready
+     > (./after read next)
+      = ;answer (http_foot/ask foot (http_foot/action/snapshot read))
+      ? answer
+       > response=http_response (http_foot/perform foot (next response.status (http_foot/body_text response)))
+       > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+     > (./reply response) (http_foot/encode response)
+     > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
+    | http_foot/encode_answer (http_foot/ask foot action)
   + listener
     \ config=http_foot/config fd=nat self=nat
     ^ nat
@@ -328,7 +583,8 @@
       foot caps.at(0)
     % ignored=nat 0
     = ;connection (Accept fd)
-      ;actor (Spawn (http_foot/connection config connection))
+      ;planned (http_foot/plan config connection)
+      ;actor (Spawn (http_foot/connection connection planned))
     ; (SendCaps actor root [foot])
     ; (CloseHandle actor)
     | _ 0
@@ -408,6 +664,7 @@
       ;fd (Listen port)
       ;pump (Spawn (http_foot/listener config fd))
       ;renderer (Spawn (http_foot/inspect_renderer config.inspect))
+      ;streams (Spawn http_foot/fanout)
     ; (SendCaps pump root [0])
     ; (CloseHandle pump)
     ; (Trace "HTTP foot listening" 0)
@@ -477,6 +734,54 @@
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/poke pax wit))
       | _ serial.inc pending queue.snoc((http_foot/ack/write conn back))
+     > (http_foot/action/batch writes finish)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (http_foot/action/batch_told writes finish told)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (http_foot/action/told read line)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A told read is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > .stream
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A stream is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > .join
+      ' a stream connection joining: its handle goes to the fan-out
+      ? (eq caps.len 0) (_ serial pending queue)
+      = joined=http_foot/stream_msg .join
+      ; (SendCaps streams joined [caps.at(0)])
+      ; (helm/supervisor/close_caps caps)
+      | _ serial pending queue
+     > (http_foot/action/broadcast line)
+      ; (helm/supervisor/close_caps caps)
+      ; (Send streams (http_foot/stream_msg/line line))
+      | _ serial pending queue
+     > (http_foot/action/after read next)
+      ? (eq caps.len 0) (_ serial pending queue)
+      ; (http_foot/reply caps.at(0) (http_driver/response 500 "An after is run by the connection, not the foot"))
+      ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (http_foot/action/commit pax wit done)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/poke pax wit))
+      | _ serial.inc pending queue.snoc((http_foot/ack/commit conn done))
+     > (http_foot/action/commit_many writes done)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/batch writes))
+      | _ serial.inc pending queue.snoc((http_foot/ack/commit conn done))
      > (http_foot/action/wait record)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
@@ -595,6 +900,9 @@
              > .none (http_driver/back back)
              > (./some _) (http_driver/response 500 "Namespace write rejected")
         ; (http_foot/reply conn response)
+        | _ serial pending tail
+       > (./commit conn done)
+        ; (http_foot/reply conn (done err))
         | _ serial pending tail
        > (./request key)
         ? err

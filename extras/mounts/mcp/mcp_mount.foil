@@ -1,0 +1,1067 @@
+- http_foot
+- lain_peek
+- json
+- mcp_rpc
+- bond
+- weft_std
+- namespace
+
+' MCP over the native cards and nothing else: a read is one snapshot
+' (no event), a write is one poke (one event), history is a snapshot
+' over the record's cases, apply is one warp (one event).  Local only.
++ mcp_mount
+  + http
+    \ files=row[[str nat]] state=namespace
+    ^ http_foot/config
+    = self=iota state.self
+      plan
+        \ request=http_foot/request now=nat
+        ^ http_foot/action
+        = url (http_foot/split 63 request.target).at(0)
+          opening=http_foot/action .stream
+        ? (and (equal request.method "GET") (equal url "/mcp/stream")) opening
+        ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
+        ? (mcp_rpc/parse_call request.body)
+         > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
+         > (./ok call) (mcp_mount/dispatch self call)
+    | http_foot/add_routes [(http_foot/route "/mcp" plan)] http_foot/empty
+  + json
+    \ body=str
+    ^ http_response
+    | http_response 200 (str/to_atom body) "application/json"
+  + reply
+    \ id=json value=json
+    ^ http_foot/action
+    | ./reply (mcp_mount/json (mcp_rpc/result id value))
+  + fail
+    \ id=json code=nat message=str
+    ^ http_foot/action
+    | ./reply (mcp_mount/json (mcp_rpc/failure id code message))
+  + refuse
+    ' A tool-level error: the call is well formed, the arguments are not.
+    \ id=json message=str
+    ^ http_foot/action
+    | mcp_mount/reply id (mcp_rpc/text_content message .true)
+  + dispatch
+    \ self=iota call=mcp_rpc/call
+    ^ http_foot/action
+    ? (equal call.method "initialize") (mcp_mount/reply call.id (mcp_rpc/initialize "shrine"))
+    ? (equal call.method "notifications/initialized") (./reply (http_driver/response 202 ""))
+    ? (equal call.method "ping") (mcp_mount/reply call.id (json/obj []))
+    ? (equal call.method "tools/list") (mcp_mount/reply call.id (mcp_mount/listing mcp_mount/builtins))
+    ? !(equal call.method "tools/call") (mcp_mount/fail call.id 32601 "Method not found")
+    = name (mcp_rpc/text_at "name" call.params)
+      args (mcp_rpc/object_at "arguments" call.params)
+    = first=str
+        ?> (./some many) (mcp_rpc/field "records" args) (mcp_rpc/text_at "path" args)
+        ? many
+         > (./arr xs) (? (eq xs.len 0) "" (mcp_rpc/text_at "path" xs.at(0)))
+        (mcp_rpc/text_at "path" args)
+    ? (and (equal name "mcp/history") (eq first.len 0))
+      = with_text (mcp_rpc/text_at "with" args)
+        with=maybe[care] (? (eq with_text.len 0) .none (./some (mcp_mount/care with_text)))
+        forward (maybe/is_some (mcp_rpc/field "after" args))
+        who (mcp_rpc/text_at "who" args)
+      | ./snapshot (\ state=namespace (mcp_mount/events call.id self (mcp_rpc/num_at "before" 0 args) forward (mcp_rpc/num_at "after" 0 args) (mcp_rpc/num_at "limit" 40 args) with who state))
+    ? (and (equal name "mcp/read") (maybe/is_some (mcp_rpc/field "reads" args)))
+      = many (mcp_mount/specs self (mcp_rpc/field "reads" args) args)
+      ? (eq many.len 0) (mcp_mount/refuse call.id "reads: a list of reads, each a path or {path, care, case, formula, settings, limit, next, present}")
+      | ./snapshot (\ state=namespace (mcp_mount/read_many call.id many state))
+    ? (and (equal name "mcp/read") (maybe/is_some (mcp_rpc/field "paths" args)))
+      = many (mcp_mount/specs self (mcp_rpc/field "paths" args) args)
+      ? (eq many.len 0) (mcp_mount/refuse call.id "paths: a list of segmented namespace addresses")
+      | ./snapshot (\ state=namespace (mcp_mount/read_many call.id many state))
+    ? (equal name "mcp/read")
+      ? (mcp_mount/read_spec self args args)
+       > (./err why) (mcp_mount/refuse call.id why)
+       > (./ok spec)
+        ? spec.present (./told (\ state=namespace (mcp_mount/read call.id spec state)) (mcp_mount/shown_line spec))
+        | ./snapshot (\ state=namespace (mcp_mount/read call.id spec state))
+    ?> (./some pax) (mcp_mount/target self first)
+      | mcp_mount/refuse call.id mcp_mount/path_rule
+    ? (equal name "mcp/history")
+      = limit (mcp_rpc/num_at "limit" 10 args)
+      | ./snapshot (\ state=namespace (mcp_mount/history call.id pax limit state))
+    ? (equal name "mcp/write")
+      = then (mcp_mount/wanted (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj [])))
+        specs=row[json]
+          ?> (./some many) (mcp_rpc/field "records" args) [args]
+          ? many
+           > (./arr xs) xs
+          [args]
+      = asked (mcp_rpc/text_at "who" args)
+        who=str (? (eq asked.len 0) "mcp" asked)
+        tag=row[[path writ]]
+          ?> (./some w) (path_parse (str/cat who "/")) []
+          ? !(eq w.len 1) []
+          | [[[self 'agent 'journal w.at(0)] (writ/make (myth/sing ['wrote] (pails/n specs.len)))]]
+      ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
+        | mcp_mount/write_from self call.id specs tag who then
+      ? (mcp_mount/writes self specs)
+       > (./ok writes) (mcp_mount/batch call.id writes tag who then)
+       > (./err why) (mcp_mount/refuse call.id why)
+    ? (equal name "mcp/apply")
+      ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
+        | mcp_mount/refuse call.id "operation: the address of an op card is required"
+      ? (mcp_mount/record (mcp_rpc/object_at "inputs" args))
+       > (./err why) (mcp_mount/refuse call.id (str/cat_all ["inputs: " why]))
+       > (./ok input)
+        | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] "mcp" (mcp_mount/wanted (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj [])))
+    | mcp_mount/refuse call.id "Unknown tool"
+  ' ---- addresses and values
+  + path_rule
+    ' What a path is, for every refusal that names one.
+    ^ str
+    | "path: /<node>/... with segments of letters, digits and underscore (c-7 is c_7; keep the original as a slot)"
+  + target
+    \ self=iota text=str
+    ^ maybe[path]
+    ? (eq text.len 0) .none
+    ?> (./some parsed) (path_parse text) .none
+    ? (eq parsed.len 0) (./some [self])
+    ? (eq_iota parsed.at(0) self) (./some parsed)
+    ? ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys))))) (./some parsed)
+    | ./some parsed.cons(self)
+  + care
+    \ text=str
+    ^ care
+    ? (equal text "x") .x
+    ? (equal text "z") .z
+    .y
+  + care_of
+    \ seg=iota
+    ^ maybe[care]
+    ? (eq_iota seg 'x) (./some .x)
+    ? (eq_iota seg 'y) (./some .y)
+    ? (eq_iota seg 'z) (./some .z)
+    .none
+  + reference
+    ' /h/<care>/<case>/<len>/<path>; case 0 is live.
+    \ text=str
+    ^ maybe[safe]
+    ?> (./some p) (path_parse text) .none
+    ? (lt p.len 4) .none
+    ? !(eq_iota p.at(0) 'h) .none
+    ?> (./some c) (mcp_mount/care_of p.at(1)) .none
+    ?> (./some ver) (dig_of p.at(2)) .none
+    ?> (./some ln) (dig_of p.at(3)) .none
+    = tgt p.drop(4)
+    ? !(eq tgt.len ln) .none
+    | ./some (safe ver c tgt)
+  + pail_of
+    \ value=json
+    ^ maybe[pail]
+    ? value
+     > (./str s) (./some (pails/t s))
+     > (./num neg n) (./some (? (and neg (gt n 0)) (pails/z .true n) (pails/n n)))
+     > (./boo b) (./some (pails/b b))
+     > (./obj kvs)
+      = kind (mcp_rpc/text_at "type" value)
+        text (mcp_rpc/text_at "value" value)
+      ? (equal kind "str") (./some (pails/t text))
+      ? (equal kind "bool") (./some (pails/b (equal text "true")))
+      ? (equal kind "nat")
+        ?> (./some n) (nat/parse text) .none
+        | ./some (pails/n n)
+      ? (equal kind "int")
+        ?> (./some fig) (mcp_mount/decimal text) .none
+        = [n s neg] fig
+        | ./some (? neg (pails/z .true n) (pails/n n))
+      ? (equal kind "path")
+        ?> (./some p) (path_parse text) .none
+        | ./some (pails/p p)
+      ? (equal kind "reference")
+        ? (eq text.len 0)
+          ?> (./some p) (path_parse (mcp_rpc/text_at "path" value)) .none
+          ? (lt p.len 1) .none
+          | ./some (safe (mcp_rpc/num_at "case" 0 value) (mcp_mount/care (mcp_rpc/text_at "care" value)) p)
+        ?> (./some pin) (mcp_mount/reference text) .none
+        | ./some pin
+      .none
+    .none
+  + decimal
+    ' "4.5" is 45 at scale 1; "-3" is 3, negative; "12" is 12 at scale 0.
+    \ text=str
+    ^ maybe[[nat nat bool]]
+    = neg (and (gt text.len 0) (eq text.at(0) 45))
+      body (? neg text.slice(1 text.len) text)
+      parts body.split_byte(46)
+    ? (eq parts.len 1)
+      ?> (./some n) (nat/parse body) .none
+      | ./some [n 0 (and neg (gt n 0))]
+    ? !(eq parts.len 2) .none
+    = whole parts.at(0)
+      frac parts.at(1)
+    ? (eq frac.len 0) .none
+    ?> (./some w) (nat/parse (? (eq whole.len 0) "0" whole)) .none
+    ?> (./some f) (nat/parse frac) .none
+    = n (add (mul w (mcp_mount/pow10 frac.len)) f)
+    | ./some [n frac.len (and neg (gt n 0))]
+  + pow10
+    \ k=nat
+    ^ nat
+    % i=nat 0 acc=nat 1
+    ? (eq i k) acc
+    | _ i.inc (mul acc 10)
+  + record
+    ' Slot names are paths: "sys/weft" and "/sys/weft" both name /sys/weft.
+    ' A slot that does not parse names itself in the refusal.  A decimal
+    ' (4.5) lands as the natural at a scale (45, <slot>/scale 1); a
+    ' negative as a signed pail.
+    \ properties=json
+    ^ either[str myth]
+    ? properties
+     > (./obj kvs)
+      % i=nat 0 out=myth myth/new
+      ^ either[str myth]
+      ? (eq i kvs.len) (./ok out)
+      = entry kvs.at(i)
+        name (? (and (gt entry.k.len 0) (eq entry.k.at(0) 47)) entry.k (str/cat_all ["/" entry.k]))
+      ?> (./some slot) (path_parse name) (./err (str/cat_all ["slots: " name " is not a slot name"]))
+      ? entry.v
+       > (./real text)
+        ?> (./some fig) (mcp_mount/decimal text) (./err (mcp_mount/slot_error name entry.v))
+        = [n sc neg] fig
+          held=pail (? neg (pails/z .true n) (pails/n n))
+          scale_seg=iota 'scale
+        | _ i.inc out.put(slot held).put(slot.snoc(scale_seg) (pails/n sc))
+      ?> (./some held) (mcp_mount/pail_of entry.v) (./err (mcp_mount/slot_error name entry.v))
+      | _ i.inc out.put(slot held)
+    (./err "slots: an object of slot names to text, numbers, booleans or {type, value} is required")
+  + slot_error
+    ' Why one slot value was refused, by its form.
+    \ name=str value=json
+    ^ str
+    ? value
+     > (./obj kvs)
+      = kind (mcp_rpc/text_at "type" value)
+      ? (equal kind "reference")
+        (str/cat_all ["slots: " name ": a reference is /h/<care>/<case>/<len>/<path>, len the number of segments after it (the x of a cell's answer counts)"])
+      | str/cat_all ["slots: " name ": {type, value} with type str, bool, nat, path or reference"]
+    (str/cat_all ["slots: " name ": text, a number (an integer, signed, or a decimal), a boolean or {type, value}"])
+  + shown
+    ' A path as text, never raising: a key that is not a printable
+    ' symbol renders as a marker instead of failing the read.
+    \ pax=path
+    ^ str
+    ? (Try path_show pax)
+     > (./ok text) text
+     > (./err _) "<unprintable path>"
+  + iota_text
+    \ q=iota
+    ^ str
+    ? (Try iota_show q)
+     > (./ok text) text
+     > (./err _) "<unprintable key>"
+  + value_text
+    \ held=pail
+    ^ str
+    ? held
+     > x=pails/t x.t
+     > n=pails/n (nat/show n.n)
+     > z=pails/z (str/cat_all ["-" (nat/show z.n)])
+     > b=pails/b (? b.b "true" "false")
+     > p=pails/p (mcp_mount/shown p.p)
+     > q=pails/q (mcp_mount/iota_text q.q)
+     > pin=safe (mcp_mount/shown pin.spell)
+    "<opaque>"
+  + large
+    ' Never inline code or a large atom: a compiled law, or any atom
+    ' over 8 KB, renders as {type, size, reference} wherever a value is
+    ' rendered (read, then, with): size in bytes, reference the record's
+    ' pinned /h/x/<case>/<len>/<path>, which is its exact identity (the
+    ' slot is the key it sits under).
+    \ kind=str atom=nat ref=json
+    ^ json
+    | json/obj [(jkv "type" (json/str kind)) (jkv "size" (json/num .false (wid atom))) (jkv "reference" ref)]
+  + value_json
+    \ held=pail ref=json slot=str
+    ^ json
+    ? held
+     > x=pails/t (? (gt x.t.len 8192) (mcp_mount/large "text" (str/to_atom x.t) ref) (json/str x.t))
+     > n=pails/n (? (gt (wid n.n) 8192) (mcp_mount/large "nat" n.n ref) (json/str (nat/show n.n)))
+     > z=pails/z (json/str (str/cat_all ["-" (nat/show z.n)]))
+     > c=pails/code (mcp_mount/large "code" 0 ref)
+     > x=pails/b (json/str (? x.b "true" "false"))
+     > p=pails/p (json/str (mcp_mount/shown p.p))
+     > q=pails/q (json/str (mcp_mount/iota_text q.q))
+     > pin=safe (json/str (mcp_mount/shown pin.spell))
+    ' anything else (a compiled law under another brand, a published
+    ' module's content, a form, a blob) is code to a reader: the
+    ' reference form, never its text
+    | mcp_mount/large "code" 0 ref
+  + record_json
+    ' A record's slots; ref is the record's pinned reference, carried
+    ' by a large value's reference form.
+    \ t=myth ref=json
+    ^ json
+    = [j n] (mcp_mount/record_sized t ref)
+    | j
+  + show_decimal
+    ' A natural at a scale as decimal text, with its sign: 45 at 1 is
+    ' "4.5", 3 negative is "-3".
+    \ n=nat s=nat neg=bool
+    ^ str
+    = sign=str (? neg "-" "")
+    ? (eq s 0) (str/cat_all [sign (nat/show n)])
+    = d (mcp_mount/pow10 s)
+      frac (nat/show (mod n d))
+      pad
+        % i=nat frac.len acc=str ""
+        ? (eq i s) acc
+        | _ i.inc acc.cat("0")
+    | str/cat_all [sign (nat/show (div n d)) "." pad frac]
+  + record_sized
+    ' The slots as json, and about how many bytes they render to (the
+    ' byte bound on a reply is checked against this as a page is built).
+    ' A number slot with its own <slot>/scale renders as the decimal it
+    ' was written as.
+    \ t=myth ref=json
+    ^ [json nat]
+    = empty=row[jkv] []
+      start=[row[jkv] nat] [empty 0]
+      [kvs bytes]
+        | t.tap.fold start
+          \ acc [key val]
+          = [out n] acc
+            name (mcp_mount/shown key)
+            scale_seg=iota 'scale
+            own_scale=maybe[nat]
+              ?> (./some held) t.get(key.snoc(scale_seg)) .none
+              ? held
+               > sn=pails/n (./some sn.n)
+              .none
+            v
+              ? own_scale
+               > (./some sc)
+                ? val
+                 > vn=pails/n (json/str (mcp_mount/show_decimal vn.n sc .false))
+                 > vz=pails/z (json/str (mcp_mount/show_decimal vz.n sc vz.neg))
+                (mcp_mount/value_json val ref name)
+               > .none (mcp_mount/value_json val ref name)
+            size=nat
+              ? v
+               > x=json/str x.s.len
+              120
+          | [out.snoc((jkv name v)) (add n (add name.len (add size 8)))]
+    | [(json/obj kvs) bytes]
+  + ceiling
+    ' A reply is refused before it is built further once it would pass
+    ' this many bytes: "too large, page it".
+    ^ nat
+    2097152
+  + with_ceiling
+    ' How many bytes of records one event inlines under with before the
+    ' rest is left out: an event that wrote a hundred 7 KB records would
+    ' otherwise fill a page by itself, and three of them refuse it.  A
+    ' page of events stops one of these short of the reply ceiling.
+    ^ nat
+    262144
+  + reference_of
+    ' The pinned x view of a path, when it has a case.
+    \ pax=path state=namespace
+    ^ json
+    ?> (./some n) (mcp_mount/case_of pax state) jnull
+    | json/str (mcp_mount/shown (safe n .x pax).spell)
+  + spelled
+    ' A pinned reference as text from a path already printed:
+    ' /h/<care>/<case>/<len>/<path>, the same spelling safe.spell gives,
+    ' without printing the path again.
+    \ care=str n=nat pax=path text=str
+    ^ json
+    | json/str (str/cat_all ["/h/" care "/" (nat/show n) "/" (nat/show pax.len) text])
+  + node_json
+    ' One node's own fields, without its children.  The path is printed
+    ' once and the references spelled from it.  Every node carries its
+    ' pinned x reference; the y and z references, which a tack pins,
+    ' ride on the root of an answer only.
+    \ pax=path tree=axal[myth] state=namespace top=bool
+    ^ [row[jkv] nat]
+    = text (mcp_mount/shown pax)
+      x=json
+        ?> (./some n) (mcp_mount/case_of pax state) jnull
+        | mcp_mount/spelled "x" n pax text
+      [props pbytes]
+        ?> (./some record) tree.fil [(json/obj []) 0]
+        | mcp_mount/record_sized record x
+      y=json
+        ? (!top || (mcp_mount/derived pax)) jnull
+        ?> (./some n) state.local.y_case(pax) jnull
+        | mcp_mount/spelled "y" n pax text
+      z=json
+        ? (!top || (mcp_mount/derived pax)) jnull
+        ?> (./some n) state.local.z_case(pax) jnull
+        | mcp_mount/spelled "z" n pax text
+    | [[(jkv "path" (json/str text))
+        (jkv "exists" (json/boo (maybe/is_some tree.fil)))
+        (jkv "reference" x)
+        (jkv "reference_y" y)
+        (jkv "reference_z" z)
+        (jkv "properties" props)]
+       (add pbytes (add (mul 4 text.len) 120))]
+  + paged
+    ' A tree rendered in tap order (a node, then its children by name)
+    ' within a budget of nodes, continuing after a cursor (the last
+    ' path a previous page rendered, relative to this node): the json,
+    ' the nodes rendered, the last path rendered, and whether nodes
+    ' remain.  A node an earlier page rendered that still has children
+    ' to render comes back as a shell (path and children, "paged"
+    ' true); shells do not count against the budget.  Every page is
+    ' the same tree cut at the same places for the same case, so a
+    ' page can be re-read.
+    \ pax=path tree=axal[myth] state=namespace after=maybe[path] budget=nat top=bool
+    ^ [json nat maybe[path] bool nat]
+    = fresh !(maybe/is_some after)
+    ? (and fresh (eq budget 0)) [jnull 0 .none .true 0]
+    = none=maybe[path] .none
+      seek=maybe[iota]
+        ?> (./some c) after .none
+        ? (eq c.len 0) .none
+        | ./some c.at(0)
+      rest=maybe[path]
+        ?> (./some c) after .none
+        ? (eq c.len 0) .none
+        | ./some c.drop(1)
+      empty=row[json] []
+      [own own_bytes]
+        ? fresh (mcp_mount/node_json pax tree state top)
+        | [[(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "paged" (json/boo .true))] 60]
+      ' phase: 0 seeking the cursor's child, 1 rendering, 2 stopped with nodes remaining, 3 past the byte ceiling
+      start=[nat row[json] maybe[path] nat nat] [(? fresh budget.dec budget) empty (? fresh (./some pax) none) (? (maybe/is_some seek) 0 1) own_bytes]
+      [left out last phase bytes]
+        | tree.kid_tap.fold start
+          \ acc [key child]
+          = [l o la ph b] acc
+          ? (gt ph 1) acc
+          = on_cursor (and (eq ph 0) (eq_iota key (seek.fall(key))))
+          ? (and (eq ph 0) !on_cursor) acc
+          = below=maybe[path] (? on_cursor rest none)
+          ? (and !on_cursor (eq l 0)) [l o la 2 b]
+          = [j n la2 m2 b2] (mcp_mount/paged pax.snoc(key) child state below l .false)
+            total (add b b2)
+          ? (gt total mcp_mount/ceiling) [l o la 3 total]
+          ' a shell with nothing rendered beneath it (the cursor node itself, say) is not sent again
+          | [(sub l n) (? (eq n 0) o o.snoc(j)) (? (maybe/is_some la2) la2 la) (? m2 2 1) total]
+      children (jkv "children" (json/arr out))
+      shown=json (json/obj own.snoc(children))
+    | [shown (sub budget left) last (gt phase 1) (? (eq phase 3) (add mcp_mount/ceiling 1) bytes)]
+  + cursor
+    ' The cursor of a read: the last path a previous page rendered,
+    ' which must lie under the path being read; none when absent.
+    \ self=iota pax=path text=str
+    ^ maybe[maybe[path]]
+    = none=maybe[path] .none
+    ? (eq text.len 0) (./some none)
+    ?> (./some p) (mcp_mount/target self text) .none
+    ? !(and (ge p.len pax.len) (pith_prefix pax p)) .none
+    | ./some (./some p.drop(pax.len))
+  + cursor_json
+    \ last=maybe[path] more=bool
+    ^ json
+    ? !more jnull
+    ?> (./some p) last jnull
+    | json/str (mcp_mount/shown p)
+  + case_of
+    \ pax=path state=namespace
+    ^ maybe[nat]
+    ? ((is_xv pax) || (is_cx pax)) (xv_case pax state.local)
+    ? ((is_h pax) || (is_o pax)) .none
+    | state.local.x_case(pax)
+  ' ---- the four answers
+  + read
+    ' One read: at most `limit` nodes in tap order, `next` when nodes
+    ' remain; the formula's result and context when a formula is asked.
+    \ id=json spec=mcp_mount/spec state=namespace
+    ^ [nat str]
+    ? (mcp_mount/answer spec state)
+     > (./ok body) [200 (mcp_rpc/result id (mcp_rpc/structured body))]
+     > (./err why) (? (equal why "too large, page it") (mcp_mount/too_large id) [200 (mcp_rpc/result id (mcp_rpc/text_content why .true))])
+  + too_large
+    \ id=json
+    ^ [nat str]
+    | [200 (mcp_rpc/result id (mcp_rpc/text_content "too large, page it: this reply would pass 2 MB; ask for fewer nodes (limit) or a narrower care" .true))]
+  + read_many
+    ' Several reads in one call: one snapshot, answers in order, each
+    ' the shape a single read gives; a failed entry answers {path, error}
+    ' without failing the call.
+    \ id=json many=row[mcp_mount/entry] state=namespace
+    ^ [nat str]
+    = answers (many.map((\ e=mcp_mount/entry (mcp_mount/entry_json e state))))
+    | [200 (mcp_rpc/result id (mcp_rpc/structured (json/obj [(jkv "answers" (json/arr answers))])))]
+  + history
+    \ id=json pax=path limit=nat state=namespace
+    ^ [nat str]
+    = cases (mcp_mount/case_of pax state).fall(0)
+      bound (? ((eq limit 0) || (gt limit 40)) 40 limit)
+      count (? (lt cases bound) cases bound)
+    % i=nat 0 out=row[json] []
+    ^ [nat str]
+    ? (eq i count)
+      | [200 (mcp_rpc/result id (mcp_rpc/structured (json/obj
+          [(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "cases" (json/num .false cases)) (jkv "versions" (json/arr out))])))]
+    = pin (safe (sub cases i) .x pax)
+      tree (sovereign_peek pin.spell state)
+      props
+        ?> (./some record) tree.fil (json/obj [])
+        | mcp_mount/record_json record (json/str (mcp_mount/shown pin.spell))
+      item (json/obj [(jkv "case" (json/num .false (sub cases i))) (jkv "reference" (json/str (mcp_mount/shown pin.spell))) (jkv "properties" props)])
+    | _ i.inc out.snoc(item)
+  + spec
+    ' One read, wherever a read happens: "/path" or {path, care, case,
+    ' formula, settings, limit, next, present}.  care defaults to y,
+    ' case to 0 (live), limit to 100 (never over 500); formula runs a
+    ' standard cell over the tree read with settings as its context and
+    ' writes nothing; present answers as usual and pushes {shown} on the
+    ' stream, journaling nothing.
+    : pax=path c=care at=nat formula=str settings=myth budget=nat after=maybe[path] present=bool
+  + read_spec
+    ' base is the call's own arguments: a read given as a plain path
+    ' takes its care, case and limit from there.
+    \ self=iota x=json base=json
+    ^ either[str mcp_mount/spec]
+    = text=str
+        ? x
+         > (./str s) s
+        (mcp_rpc/text_at "path" x)
+      obj=json
+        ? x
+         > (./str s) base
+        x
+    ?> (./some pax) (mcp_mount/target self text) (./err mcp_mount/path_rule)
+    = c (mcp_mount/care (mcp_rpc/text_at "care" obj))
+      at (mcp_rpc/num_at "case" 0 obj)
+      pinned (? (and (gt at 0) !(mcp_mount/derived pax)) (safe at c pax).spell pax)
+      limit (mcp_rpc/num_at "limit" 100 obj)
+      budget (? ((eq limit 0) || (gt limit 500)) 500 limit)
+      formula (mcp_rpc/text_at "formula" obj)
+      present (mcp_rpc/bool_at "present" .false obj)
+      settings=either[str myth]
+        ? (eq formula.len 0) (./ok myth/new)
+        | mcp_mount/record (mcp_rpc/object_at "settings" obj)
+    ?> (./ok given) settings (./err "settings: the formula's parameters, as slot names to values")
+    ?> (./some cursor) (mcp_mount/cursor self pinned (mcp_rpc/text_at "next" obj)) (./err "next: the cursor a previous page of this same read answered")
+    | ./ok (mcp_mount/spec pinned c at formula given budget cursor present)
+  + entry
+    ' One entry of a reads list: its spec, or why it was refused, with
+    ' the path text it named.
+    : text=str spec=maybe[mcp_mount/spec] why=str
+  + specs
+    ' The reads in a list (reads, then, paths), each parsed or refused.
+    \ self=iota value=maybe[json] base=json
+    ^ row[mcp_mount/entry]
+    = none=row[mcp_mount/entry] []
+    ?> (./some list) value none
+    ? list
+     > (./arr xs)
+      | xs.fold none
+        \ acc=row[mcp_mount/entry] x=json
+        = text=str
+            ? x
+             > (./str s) s
+            (mcp_rpc/text_at "path" x)
+        ? (mcp_mount/read_spec self x base)
+         > (./ok s) acc.snoc((mcp_mount/entry text (./some s) ""))
+         > (./err why) acc.snoc((mcp_mount/entry text .none why))
+    none
+  + wanted
+    ' The specs of the entries that parsed (a then read that did not
+    ' is left out).
+    \ entries=row[mcp_mount/entry]
+    ^ row[mcp_mount/spec]
+    = none=row[mcp_mount/spec] []
+    | entries.fold none
+      \ acc=row[mcp_mount/spec] e=mcp_mount/entry
+      ?> (./some s) e.spec acc
+      | acc.snoc(s)
+  + entry_json
+    ' One answer of a reads list: the read's answer, or {path, error}.
+    \ e=mcp_mount/entry state=namespace
+    ^ json
+    ? e.spec
+     > (./some s) (mcp_mount/answer_json s state)
+     > .none (json/obj [(jkv "path" (json/str e.text)) (jkv "error" (json/str e.why))])
+  + peek_at
+    ' The tree a read spec names: a plain path is read through its pinned
+    ' spelling; a derived path at a case (/x/<cell> at case 1) is read at
+    ' that case, so the kernel can say a live cell has no answer there.
+    \ spec=mcp_mount/spec state=namespace
+    ^ axal[myth]
+    ? (and (gt spec.at 0) (mcp_mount/derived spec.pax))
+      = got=axal[myth]
+          ? (sovereign_view spec.c spec.at spec.pax state)
+           > (./known t) t
+          (axal/new[myth] .none)
+      | sorge[myth] spec.c got
+    | sorge[myth] spec.c (sovereign_peek spec.pax state)
+  + answer
+    ' The answer to one read: the tree page, or the formula's result with
+    ' its context, or why not.  Nothing here writes.
+    \ spec=mcp_mount/spec state=namespace
+    ^ either[str json]
+    ? (eq spec.formula.len 0)
+      = tree (mcp_mount/peek_at spec state)
+        [view nodes last more bytes] (mcp_mount/paged spec.pax tree state spec.after spec.budget .true)
+      ? (gt bytes mcp_mount/ceiling) (./err "too large, page it")
+      ? view
+       > (./obj kvs) (./ok (json/obj kvs.snoc((jkv "nodes" (json/num .false nodes))).snoc((jkv "next" (mcp_mount/cursor_json last more)))))
+      | ./ok view
+    ?> (./some ck) (weft_std/by_name ($ts spec.formula)) (./err "formula: not a standard cell")
+    = tree (mcp_mount/peek_at spec state)
+      [ctx out] (ck.get spec.settings tree)
+      [view nodes last more bytes] (mcp_mount/paged spec.pax out state spec.after spec.budget .true)
+    ? (gt bytes mcp_mount/ceiling) (./err "too large, page it")
+    | ./ok (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "formula" (json/str spec.formula)) (jkv "result" view)
+                     (jkv "context" (mcp_mount/record_json ctx jnull)) (jkv "nodes" (json/num .false nodes)) (jkv "next" (mcp_mount/cursor_json last more))])
+  + answer_json
+    ' The answer, or {path, error} in a list.
+    \ spec=mcp_mount/spec state=namespace
+    ^ json
+    ? (mcp_mount/answer spec state)
+     > (./ok j) j
+     > (./err why) (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "error" (json/str why))])
+  + paths
+    ' The paths named in a then list.
+    \ self=iota value=maybe[json]
+    ^ row[path]
+    ?> (./some list) value []
+    ? list
+     > (./arr xs)
+      = none=row[path] []
+      | xs.fold none
+        \ acc=row[path] x=json
+        ?> (./some t) (mcp_rpc/text_of x) acc
+        ?> (./some pax) (mcp_mount/target self t) acc
+        acc.snoc(pax)
+    []
+  + slots_of
+    ' The slots of a write spec: slots, or properties for older clients.
+    \ spec=json
+    ^ json
+    ?> (./some v) (mcp_rpc/field "slots" spec) (mcp_rpc/object_at "properties" spec)
+    v
+  + derived
+    \ pax=path
+    ^ bool
+    | ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax))))
+  + writes
+    ' One writ per record spec, or the reason the whole batch is refused
+    ' before any event: a derived path, a bad path, or bad properties.
+    \ self=iota specs=row[json]
+    ^ either[str row[[path writ]]]
+    = none=row[[path writ]] []
+    | specs.fold (either/ok[str row[[path writ]]] none)
+      \ acc spec
+      ?> (./ok out) acc acc
+      ?> (./some pax) (mcp_mount/target self (mcp_rpc/text_at "path" spec)) (./err (str/cat_all [mcp_mount/path_rule " (on every record)"]))
+      ? (mcp_mount/derived pax) (./err (str/cat_all ["path: " (mcp_mount/shown pax) " is derived and cannot be written"]))
+      = action (mcp_rpc/text_at "action" spec)
+      ? (equal action "cull") (./ok out.snoc([pax .cull]))
+      ? (mcp_mount/record (mcp_mount/slots_of spec))
+       > (./err why) (./err (str/cat_all [(mcp_mount/shown pax) ": " why]))
+       > (./ok record)
+        ? (equal action "poke") (./ok out.snoc([pax (writ/poke record)]))
+        | ./ok out.snoc([pax (writ/make record)])
+  + batch
+    ' The records as one event (admitted whole or refused whole), with
+    ' the writer's tag record riding in the same event, then the then
+    ' reads on the admitted state, in one answer that lists the records
+    ' asked for.
+    \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
+    ^ http_foot/action
+    | ./batch_told writes.weld(tag)
+        (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+        (\ outcome=maybe[pail] state=namespace (mcp_mount/told_line writes who outcome state))
+  + told_line
+    ' The line every open stream receives for an admitted write:
+    ' {epoch, label, who, touched, with}, with the written records
+    ' rendered on the admitted snapshot through the same page render
+    ' then uses (50 nodes each, 500 for the line, the first hundred
+    ' records of a wider batch); nothing on refusal.
+    \ writes=row[[path writ]] who=str outcome=maybe[pail] state=namespace
+    ^ str
+    ? (maybe/is_some outcome) ""
+    = none=maybe[path] .none
+      empty=row[jkv] []
+      label=str (? (eq writes.len 1) "write" (str/cat_all ["batch of " (nat/show writes.len)]))
+      touched (json/arr writes.map((\ [pax wit] (json/str (mcp_mount/shown pax)))))
+      start=[row[jkv] nat] [empty 500]
+      shown_writes (? (gt writes.len 100) writes.take(100) writes)
+      [kvs left]
+        | shown_writes.fold start
+          \ acc [pax wit]
+          = [out l] acc
+          ? (eq l 0) acc
+          = [view nodes last more bytes] (mcp_mount/paged pax (sorge[myth] .x (sovereign_peek pax state)) state none (? (lt l 50) l 50) .true)
+          | [out.snoc((jkv (mcp_mount/shown pax) view)) (sub l nodes)]
+    | show (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "label" (json/str label)) (jkv "who" (json/str who))
+                      (jkv "touched" touched) (jkv "with" (json/obj kvs))])
+  + shown_line
+    ' The line a presented read pushes: {shown: {path, care, case}}.
+    \ spec=mcp_mount/spec
+    ^ str
+    = care_text=str
+        ? spec.c
+         > .x "x"
+         > .y "y"
+        "z"
+    | show (json/obj [(jkv "shown" (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "care" (json/str care_text)) (jkv "case" (json/num .false spec.at))]))])
+  + finished
+    \ id=json writes=row[[path writ]] then=row[mcp_mount/spec] outcome=maybe[pail] state=namespace
+    ^ [nat str]
+    = refused (maybe/is_some outcome)
+      admitted !refused
+      records=row[json]
+        | writes.map
+          \ [pax wit]
+          | json/obj [(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "written" (json/boo admitted))
+                      (jkv "reference" (? admitted (mcp_mount/reference_of pax state) jnull))]
+      reads=row[jkv]
+        | then.map (\ s=mcp_mount/spec (jkv (mcp_mount/shown s.pax) (mcp_mount/answer_json s state)))
+      reason=str
+        ?> (./some why) outcome ""
+        | mcp_mount/value_text why
+      body (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "records" (json/arr records)) (jkv "refused" (json/boo refused)) (jkv "reason" (json/str reason)) (jkv "then" (json/obj reads))])
+    ? refused
+      | [200 (mcp_rpc/result id (mcp_rpc/structured_error body))]
+    | [200 (mcp_rpc/result id (mcp_rpc/structured body))]
+  + typed_json
+    ' A record as {slot: {type, value}}: what write accepts back.
+    \ t=myth
+    ^ json
+    = none=row[jkv] []
+      members
+        | t.tap.fold none
+          \ acc=row[jkv] [key val]
+          = pair=maybe[[str str]]
+              ? val
+               > x=pails/t (./some ["str" x.t])
+               > n=pails/n (./some ["nat" (nat/show n.n)])
+               > z=pails/z (./some ["int" (str/cat_all ["-" (nat/show z.n)])])
+               > b=pails/b (./some ["bool" (? b.b "true" "false")])
+               > p=pails/p (./some ["path" (mcp_mount/shown p.p)])
+               > pin=safe (./some ["reference" (mcp_mount/shown pin.spell)])
+              .none
+          ?> (./some kv) pair acc
+          = [kind text] kv
+          | acc.snoc((jkv (mcp_mount/shown key) (json/obj [(jkv "type" (json/str kind)) (jkv "value" (json/str text))])))
+    | json/obj members
+  + sourced
+    ' One record of a from batch as the snapshot hands it on: its slots
+    ' and its action (a from is a make; a poke beside it stays a poke).
+    \ slots=json action=str
+    ^ json
+    | json/obj [(jkv "properties" slots) (jkv "action" (json/str action))]
+  + from_filled
+    ' The record spec the batch runs from a sourced entry.
+    \ e=jkv
+    ^ json
+    = props
+        ?> (./some held) (mcp_rpc/field "properties" e.v) (json/obj [])
+        held
+    | json/obj [(jkv "path" (json/str e.k)) (jkv "properties" props) (jkv "action" (json/str (mcp_rpc/text_at "action" e.v)))]
+  + write_from
+    ' Records whose content comes from another path (an earlier case,
+    ' usually): one snapshot renders every source with its types, then
+    ' the batch runs; a missing source refuses the whole write.
+    \ self=iota id=json specs=row[json] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
+    ^ http_foot/action
+    = read
+        \ state=namespace
+        ^ [nat str]
+        = empty=row[jkv] []
+          sources=row[jkv]
+            | specs.fold empty
+              \ acc=row[jkv] spec=json
+              = from (mcp_rpc/text_at "from" spec)
+                action (mcp_rpc/text_at "action" spec)
+              ? (eq from.len 0) acc.snoc((jkv (mcp_rpc/text_at "path" spec) (mcp_mount/sourced (mcp_mount/slots_of spec) action)))
+              ?> (./some src) (mcp_mount/target self from) acc.snoc((jkv (mcp_rpc/text_at "path" spec) jnull))
+              ?> (./some record) (sovereign_peek src state).fil acc.snoc((jkv (mcp_rpc/text_at "path" spec) jnull))
+              | acc.snoc((jkv (mcp_rpc/text_at "path" spec) (mcp_mount/sourced (mcp_mount/typed_json record) "")))
+        | [200 (show (json/obj sources))]
+      next
+        \ status=nat body=str
+        ^ http_foot/action
+        ? (mcp_rpc/parse_object body)
+         > (./err why) (mcp_mount/refuse id (str/cat_all ["from: " why]))
+         > (./ok sources)
+          = missing (sources.any((\ e=jkv ?=((./nul _) e.v))))
+          ? missing (mcp_mount/refuse id "from: no record at that case; nothing was written")
+          = filled=row[json]
+              | sources.map (\ e=jkv (mcp_mount/from_filled e))
+          ? (mcp_mount/writes self filled)
+           > (./ok writes) (mcp_mount/batch id writes tag who then)
+           > (./err why) (mcp_mount/refuse id why)
+    | ./after read next
+  + no_json
+    ^ row[json]
+    []
+  + touched_json
+    ' The paths one event's diff tree touched, from its log entry: the
+    ' first hundred, and the count (a boot event touches a thousand).
+    \ entry=axal[myth]
+    ^ [json nat]
+    = none=row[json] []
+      start=[row[json] nat] [none 0]
+      [paths count]
+        ?> (./some record) entry.fil start
+        ?> (./some held) record.get(['sys 'content]) start
+        ?> event=namespace_event held start
+        | (unpin event.changes).tap.fold start
+          \ acc [p q]
+          = [out n] acc
+          ? (eq p.len 0) acc
+          ? (eq out.len 100) [out n.inc]
+          | [out.snoc((json/str (mcp_mount/shown p))) n.inc]
+    | [(json/arr paths) count]
+  + events
+    ' The event log newest first, a page at a time: each epoch with the
+    ' paths it touched, and a next cursor for the page before.  Epochs
+    ' are read one entry each, walking down from the top (or from the
+    ' cursor); the journal is never peeked whole, so a page costs the
+    ' page, not the world's history.
+    ' With `after`, the page runs forward from that epoch (oldest first,
+    ' next = the last epoch given: resume with after = next); with
+    ' `with`, each touched path's current tree at that care rides in
+    ' the event, all of them within one budget of 500 nodes.
+    ' `who` filters the writers: absent, every writer but system (boot
+    ' and system writes are noise to an agent); all, everything; an id,
+    ' that writer alone.
+    \ id=json self=iota before=nat forward=bool after=nat limit=nat with=maybe[care] who=str state=namespace
+    ^ [nat str]
+    = bound (? ((eq limit 0) || (gt limit 200)) 200 limit)
+      top state.local.top
+      start (? forward after.inc (? (gt before 0) before.dec top))
+      none=row[json] []
+      [items last bytes]
+        % n=nat start walked=nat 0 acc=row[json] none left=nat 0
+        ^ [row[json] nat nat]
+        ? ((eq n 0) || ((gt n top) || ((eq acc.len bound) || ((eq walked 4096) || (gt left (sub mcp_mount/ceiling mcp_mount/with_ceiling)))))) [acc n left]
+        = entry (sovereign_peek [self 'log ($u n)] state)
+          step (? forward n.inc n.dec)
+        ? !(maybe/is_some entry.fil) (_ step walked.inc acc left)
+        = writer (mcp_mount/who_of self entry)
+          wanted=bool
+            ? (eq who.len 0) !(equal writer "system")
+            ? (equal who "all") .true
+            (equal writer who)
+        ? !wanted (_ step walked.inc acc left)
+        = [carried used] (? (equal writer "system") [jnull 0] (mcp_mount/with_json self entry with n 500 state))
+          [touched count] (mcp_mount/touched_json entry)
+        | _ step walked.inc acc.snoc((json/obj [(jkv "epoch" (json/num .false n)) (jkv "who" (json/str writer)) (jkv "touched" touched) (jkv "touched_count" (json/num .false count)) (jkv "with" carried)])) (add left used)
+      next=json
+        ? forward (? (and (eq items.len bound) (lt last.dec top)) (json/num .false last.dec) jnull)
+        | (? (and (eq items.len bound) (gt last 0)) (json/num .false last.inc) jnull)
+    ? (gt bytes mcp_mount/ceiling) (mcp_mount/too_large id)
+    | [200 (mcp_rpc/result id (mcp_rpc/structured (json/obj [(jkv "events" (json/arr items)) (jkv "next" next)])))]
+  + system_path
+    ' The node's own folders and the root: boot and system writes land here.
+    \ self=iota p=path
+    ^ bool
+    | ((lt p.len 2) || ((pith_prefix [self 'weft] p) || ((pith_prefix [self 'io] p) || ((pith_prefix [self 'sys] p) || (pith_prefix [self 'log] p)))))
+  + wrote
+    ' The records an event wrote, with their notes, in tap order: what
+    ' the write named, less the ancestors the kernel projects in as
+    ' pokes with no slots, the writer's journal tag and the system
+    ' folders.
+    \ self=iota entry=axal[myth]
+    ^ row[[path note]]
+    = none=row[[path note]] []
+      all=row[[path note]]
+        ?> (./some record) entry.fil none
+        ?> (./some held) record.get(['sys 'content]) none
+        ?> event=namespace_event held none
+        | (unpin event.changes).tap
+      n all.len
+    % i=nat 0 acc=row[[path note]] none
+    ^ row[[path note]]
+    ? (eq i n) acc
+    = [p q] all.at(i)
+      bump=bool
+        ? q
+         > (./poke m) (eq m.tap.len 0)
+        .false
+    ? (bump || ((mcp_mount/system_path self p) || (pith_prefix [self 'agent 'journal] p))) (_ i.inc acc)
+    | _ i.inc acc.snoc([p q])
+  + agent_data
+    ' Where agents write: /<node>/user and /<node>/agent.
+    \ self=iota p=path
+    ^ bool
+    | ((pith_prefix [self 'user] p) || (pith_prefix [self 'agent] p))
+  + who_of
+    ' The writer of an event: the who its batch carried, as the record
+    ' under /<node>/agent/journal/<who> (every MCP write carries one,
+    ' default mcp); system when an untagged event wrote nothing under
+    ' /user or /agent (boot, the filesystem sync, a mount's seeds);
+    ' world otherwise (an untagged write from another mount).
+    \ self=iota entry=axal[myth]
+    ^ str
+    = none=row[path] []
+      all=row[path]
+        ?> (./some record) entry.fil none
+        ?> (./some held) record.get(['sys 'content]) none
+        ?> event=namespace_event held none
+        | (unpin event.changes).tap.map((\ [p q] p))
+      journal=path [self 'agent 'journal]
+      nobody=maybe[str] .none
+      tagged
+        | all.fold nobody
+          \ acc p
+          ? (maybe/is_some acc) acc
+          ? (and (eq p.len 4) (pith_prefix journal p)) (./some (mcp_mount/iota_text p.at(3)))
+          acc
+    ?> (./some w) tagged (? (all.any((\ p=path (mcp_mount/agent_data self p)))) "world" "system")
+    | w
+  + spelled_epoch
+    ' A path as of an epoch: /h/<care>/e<epoch>/<len>/<path>.
+    \ care=str epoch=nat p=path text=str
+    ^ json
+    | json/str (str/cat_all ["/h/" care "/e" (nat/show epoch) "/" (nat/show p.len) text])
+  + note_json
+    ' A written record straight from the event's diff: what this event
+    ' wrote, as it was at that epoch, with the epoch form as its
+    ' reference.  A poke shows the slots it merged, marked poked; a
+    ' cull is exists false.
+    \ epoch=nat p=path q=note
+    ^ [json nat]
+    = text (mcp_mount/shown p)
+      ref (mcp_mount/spelled_epoch "x" epoch p text)
+      head=row[jkv] [(jkv "path" (json/str text)) (jkv "reference" ref)]
+    ? q
+     > (./make m)
+       = [props b] (mcp_mount/record_sized m ref)
+       | [(json/obj head.snoc((jkv "exists" (json/boo .true))).snoc((jkv "properties" props))) (add b (add text.len 80))]
+     > (./poke m)
+       = [props b] (mcp_mount/record_sized m ref)
+       | [(json/obj head.snoc((jkv "exists" (json/boo .true))).snoc((jkv "poked" (json/boo .true))).snoc((jkv "properties" props))) (add b (add text.len 80))]
+    | [(json/obj head.snoc((jkv "exists" (json/boo .false))).snoc((jkv "properties" (json/obj [])))) (add text.len 80)]
+  + with_json
+    ' Each record an event wrote, from the event's own diff (no peek),
+    ' and for a written cell its /x and /c/x: the derivation is spelled
+    ' over the record pinned to the epoch (/x/h/x/e<epoch>/<len>/<path>),
+    ' so the cell is as it was then; a live input is read as it is now.
+    ' At most
+    ' `left` nodes per event; returns the json and about how many bytes
+    ' it renders to.
+    \ self=iota entry=axal[myth] with=maybe[care] epoch=nat left=nat state=namespace
+    ^ [json nat]
+    ?> (./some c) with [jnull 0]
+    = none=maybe[path] .none
+      empty=row[jkv] []
+      start=[row[jkv] nat nat] [empty left 0]
+      [kvs l used]
+        | (mcp_mount/wrote self entry).fold start
+          \ acc [p q]
+          = [out l used] acc
+          ? ((eq l 0) || (gt used mcp_mount/with_ceiling)) acc
+          = [node b1] (mcp_mount/note_json epoch p q)
+            kept out.snoc((jkv (mcp_mount/shown p) node))
+            cell=bool
+              ? q
+               > (./make m) m.has(bond/weft)
+               > (./poke m) m.has(bond/weft)
+              .false
+          ? (!cell || (lt l 3)) [kept l.dec (add used b1)]
+          = l2 l.dec
+            x_seg=iota 'x
+            c_seg=iota 'c
+            xp p.cons(x_seg)
+            cp xp.cons(c_seg)
+            pinned (mcp_mount/at_epoch .x epoch p)
+            [xv xn xl xm b2] (mcp_mount/paged xp (sorge[myth] c (sovereign_peek pinned.cons(x_seg) state)) state none (? (lt l2 50) l2 50) .true)
+            l3 (sub l2 xn)
+            [cv cn cl cm b3] (mcp_mount/paged cp (sorge[myth] .x (sovereign_peek pinned.cons(x_seg).cons(c_seg) state)) state none (? (lt l3 50) l3 50) .true)
+          | [kept.snoc((jkv (mcp_mount/shown xp) xv)).snoc((jkv (mcp_mount/shown cp) cv)) (sub l3 cn) (add used (add b1 (add b2 b3)))]
+    | [(json/obj kvs) used]
+  + at_epoch
+    ' A path pinned to an epoch: /h/<care>/e<epoch>/<len>/<path>, the
+    ' reader's own spelling of "as of then".
+    \ c=care epoch=nat p=path
+    ^ path
+    = care_text=str
+        ? c
+         > .x "x"
+         > .y "y"
+        "z"
+      seg=iota ($ts care_text)
+      pin=iota ($ta (str/cat (nat/show epoch) "e"))
+      head=path ['h seg pin ($u p.len)]
+    | head.weld(p)
+  + commit
+    \ id=json pax=path wit=writ
+    ^ http_foot/action
+    | ./commit pax wit (\ err=maybe[pail] (mcp_mount/written id pax err))
+  + written
+    \ id=json pax=path err=maybe[pail]
+    ^ http_response
+    ? err
+     > .none
+      | mcp_mount/json (mcp_rpc/result id (mcp_rpc/structured (json/obj [(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "written" (json/boo .true))])))
+     > (./some _)
+      | mcp_mount/json (mcp_rpc/result id (mcp_rpc/text_content "Namespace write rejected" .true))
+  ' ---- the tool list
+  + param
+    : name=str kind=str desc=str
+  + tool
+    : name=str desc=str params=row[mcp_mount/param] required=row[str]
+  + p
+    \ name=str kind=str desc=str
+    ^ mcp_mount/param
+    | mcp_mount/param name kind desc
+  + path_param
+    ^ mcp_mount/param
+    | mcp_mount/p "path" "string" "Segmented namespace address, absolute (/<node>/...) or relative to the node. Derived addresses read too: /x/<cell> is a cell's result, /c/x/<cell> its context (parameters, /sys/view/missing, /sys/view/fault), /h/<care>/<case>/<len>/<path> a pinned view."
+  + builtins
+    ^ row[mcp_mount/tool]
+    [(mcp_mount/tool "mcp/read" "Read. A read is a path, or {path, care, case, formula, settings, limit, next, present}: care x the record, y the record and its children (default), z the subtree; case 0 live (default) or a case to read as of then; formula runs a standard cell over the tree read with settings as its context, nothing written; limit nodes per answer in tap order, default 100, never over 500; next the cursor a previous page answered; present answers as usual and pushes {shown} on the stream, journaling nothing. One snapshot, zero events. Answers the tree: path, exists, reference, properties, children, nodes, next; a value that is code or over 8 KB is {type, size, reference}; a reply that would pass 2 MB is refused: page it."
+       [mcp_mount/path_param
+        (mcp_mount/p "reads" "array" "Several reads in one call ([a read, ...]): answers in order, each the shape a single read gives; a failed entry answers {path, error} without failing the call.")
+        (mcp_mount/p "care" "string" "x | y | z; default y.")
+        (mcp_mount/p "case" "number" "0 live (default), or a case to read as of then.")
+        (mcp_mount/p "formula" "string" "A standard cell to run over the tree read; nothing written.")
+        (mcp_mount/p "settings" "object" "The formula's parameters, slot names to values.")
+        (mcp_mount/p "limit" "number" "Nodes per answer, in tap order (a node, then its children by name). Default 100, never over 500.")
+        (mcp_mount/p "next" "string" "The next cursor a previous page of this same read answered: the page after it.")
+        (mcp_mount/p "present" "boolean" "Answer as usual and push {shown: {path, care, case}} on the stream; nothing journaled, no epoch moves.")]
+       [])
+     (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch."
+       [(mcp_mount/p "records" "array" "[{path, slots, action}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree).")
+        (mcp_mount/p "from" "string" "On a record: /h/x/<case>/<len>/<path>, copy the record as it was at that case (undo, redo).")
+        (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")
+        (mcp_mount/p "who" "string" "The writer's tag, default mcp; the event carries it.")]
+       ["records"])
+     (mcp_mount/tool "mcp/history" "History. With a path: the record's cases newest first with references and slots. Without one: the event log, each event {epoch, who, touched, touched_count, with}; after <epoch> pages forward (oldest first, next is the last epoch given), before <epoch> backward; with x|y inlines each event's written records as they were at that epoch (a written cell's /x and /c/x too); a presented read leaves no trace here (the stream line is its only one). Inert."
+       [mcp_mount/path_param
+        (mcp_mount/p "after" "number" "Events after this epoch, oldest first: resume from where you left off (next is the last epoch given).")
+        (mcp_mount/p "before" "number" "Events before this epoch, newest first.")
+        (mcp_mount/p "limit" "number" "Cases or events per page. Default 40, never over 200.")
+        (mcp_mount/p "with" "string" "x or y: each event's written records ride in it as of that epoch, 500 nodes per event.")
+        (mcp_mount/p "who" "string" "Writers to list: absent, every writer but system; all; or one writer's id.")]
+       [])
+     (mcp_mount/tool "mcp/apply" "Apply a declared /op to the record with transient inputs: one event. then takes reads."
+       [mcp_mount/path_param (mcp_mount/p "operation" "string" "Address of the op card.")
+        (mcp_mount/p "inputs" "object" "Argument slots to values, encoded as for write.")
+        (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")]
+       ["path" "operation"])]
+  + param_json
+    \ param=mcp_mount/param
+    ^ jkv
+    | jkv param.name (json/obj [(jkv "type" (json/str param.kind)) (jkv "description" (json/str param.desc))])
+  + schema
+    \ tool=mcp_mount/tool
+    ^ json
+    | json/obj
+      [(jkv "type" (json/str "object"))
+       (jkv "properties" (json/obj tool.params.map(mcp_mount/param_json)))
+       (jkv "required" (json/arr tool.required.map((\ name=str (json/str name)))))]
+  + to_json
+    \ tool=mcp_mount/tool
+    ^ json
+    | json/obj
+      [(jkv "name" (json/str tool.name))
+       (jkv "description" (json/str tool.desc))
+       (jkv "inputSchema" (mcp_mount/schema tool))]
+  + listing
+    \ tools=row[mcp_mount/tool]
+    ^ json
+    | json/obj [(jkv "tools" (json/arr tools.map(mcp_mount/to_json)))]

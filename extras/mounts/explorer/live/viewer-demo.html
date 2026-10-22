@@ -1,0 +1,114 @@
+<title>Shrine viewer demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Roboto+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="viewer.css">
+<style>
+  body { margin: 0; background: #fafafa; font-family: "Inter", system-ui, sans-serif; }
+  .page { padding: 16px; display: grid; gap: 10px; justify-items: center; }
+  .page > * { width: min(780px, 100%); }
+  .drive { display: flex; gap: 8px; align-items: center; font-size: 12px; color: #666; }
+  .drive button { font: inherit; font-size: 12px; padding: 5px 10px; border: 1px solid #c6d0bf; border-radius: 5px; background: transparent; color: #354e41; cursor: pointer; }
+  .drive button.primary { background: #34573e; color: #fffef6; border-color: #34573e; }
+  .drive .you { margin-left: auto; }
+  .drive .you b { color: #252525; }
+</style>
+<div class="page">
+  <div class="drive"><span>the agent, simulated:</span><button class="primary" id="next">Next write</button><button id="show">Present a read</button><span class="you" id="you"></span></div>
+  <div id="viewer"></div>
+</div>
+<script type="module">
+import { mountViewer } from './viewer.js';
+
+// ---- an in-memory world that answers like the mount ----
+const hist = {}, journal = []; let epoch = 0; const handlers = [];
+const recAt = (p, e) => { const h = hist[p]; if (!h) return undefined; let r; for (const c of h) { if (c.epoch > e) break; r = c; } return r ? r.rec : undefined; };
+const caseAt = (p, e) => (hist[p] || []).filter(c => c.epoch <= e).length;
+function commit(label, writes, who) {
+  epoch += 1;
+  for (const [p, rec, action] of writes) { const cur = recAt(p, epoch - 1); (hist[p] = hist[p] || []).push({ epoch, rec: action === 'cull' ? null : action === 'poke' ? { ...(cur || {}), ...rec } : { ...rec } }); }
+  const ev = { epoch, label, who, touched: writes.map(w => w[0]) }; journal.push(ev);
+  for (const h of handlers) h(ev);
+}
+const worldAt = e => { const w = {}; for (const p in hist) { const r = recAt(p, e); if (r) w[p] = r; } return w; };
+function treeAt(w, p, e) {
+  const prefix = p ? p + '/' : '';
+  const node = { name: p ? p.split('/').pop() : 'namespace', path: p, slots: w[p] ? { ...w[p] } : {}, kids: [], case: caseAt(p, e) };
+  const seen = new Set();
+  for (const k of Object.keys(w)) { if (p && !k.startsWith(prefix)) continue; const first = (p ? k.slice(prefix.length) : k).split('/')[0]; if (!first || seen.has(first)) continue; seen.add(first); node.kids.push(treeAt(w, p ? p + '/' + first : first, e)); }
+  node.kids.sort((a, b) => a.name.localeCompare(b.name)); return node;
+}
+const isCell = rec => rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
+const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
+const n = v => Number(v) || 0;
+function evaluate(w, e, p, seen = new Set()) {
+  const rec = w[p]; if (!isCell(rec)) return null;
+  if (seen.has(p)) return { bad: 'points back at itself' }; seen = new Set(seen); seen.add(p);
+  const formula = rec.formula.slice(16), over = refOf(rec.over); if (!over) return { note: 'needs over' };
+  let input;
+  if (over.path.startsWith('/x/')) { const r = evaluate(w, e, over.path.slice(3), seen); if (!r || r.bad) return { bad: 'points back at itself' }; if (r.note) return { note: 'waits on ' + over.path.split('/').pop() }; input = r.tree; }
+  else input = treeAt(over.pin ? worldAt(over.pin) : w, over.path, over.pin || e);
+  const kids = input.kids || [], name = p.split('/').pop(), out = (slots, k) => ({ tree: { name, path: p, slots, kids: k || [] } });
+  switch (formula) {
+    case 'count': return out({ [rec.into || 'count']: kids.length });
+    case 'sum': if (!rec.slot) return { note: 'needs slot' }; return out({ [rec.into || 'total']: kids.reduce((a, k) => a + n(k.slots[rec.slot]), 0) });
+    case 'where': if (!rec.slot) return { note: 'needs slot' }; return out({}, kids.filter(k => String(k.slots[rec.slot]) === String(rec.value)).map(k => ({ ...k, kids: [] })));
+    case 'each': return out({}, kids.map(k => ({ ...k, kids: [], slots: { ...k.slots, [rec.into]: n(k.slots[rec.left]) - n(k.slots[rec.right]) } })));
+    case 'by': { const g = {}; for (const k of kids) (g[k.slots[rec.group]] = g[k.slots[rec.group]] || []).push(k);
+      return out({ [rec.into || 'total']: kids.reduce((a, k) => a + n(k.slots[rec.sum]), 0) }, Object.entries(g).map(([gn, ks]) => ({ name: gn, path: p + '/' + gn, slots: { [rec.into || 'total']: ks.reduce((a, k) => a + n(k.slots[rec.sum]), 0) }, kids: ks.map(k => ({ name: k.name, path: p + '/' + gn + '/' + k.name, slots: { [rec.sum]: k.slots[rec.sum] }, kids: [] })) }))); }
+    case 'subtract': { const v = refOf(rec.view); const view = v ? (v.path.startsWith('/x/') ? (evaluate(w, e, v.path.slice(3), seen) || {}).tree : treeAt(w, v.path, e)) : null;
+      const l = view && view.slots ? view.slots[rec.left] : undefined, r = input.slots ? input.slots[rec.right] : undefined;
+      if (l === undefined) return { note: 'needs ' + rec.left }; if (r === undefined) return { note: 'needs ' + rec.right }; return out({ [rec.into || 'result']: n(l) - n(r) }); }
+  }
+  return { tree: input };
+}
+const summary = r => r.bad ? r.bad : r.note ? r.note : (() => { const s = Object.entries(r.tree.slots); return s.length ? s[0][1].toLocaleString() + ' ' + s[0][0] : r.tree.kids.length + ' rows'; })();
+function lineage(w, e, p, seen = new Set()) {
+  const rec = w[p];
+  if (!isCell(rec) || seen.has(p)) { const t = treeAt(w, p, e); const s0 = Object.entries(t.slots)[0]; return { kind: 'data', path: p, meta: t.kids.length ? t.kids.length + ' records' : s0 ? s0[1].toLocaleString() + ' ' + s0[0] : 'empty' }; }
+  seen = new Set(seen); seen.add(p);
+  const settings = Object.entries(rec).filter(([k]) => !['formula', 'over', 'view'].includes(k)).map(([k, v]) => k + ' ' + v).join(' ');
+  const inputs = [];
+  const over = refOf(rec.over); if (over) inputs.push({ ...lineage(w, e, over.path.replace(/^\/x\//, ''), seen), pin: over.pin });
+  const view = refOf(rec.view); if (view) inputs.push(lineage(w, e, view.path.replace(/^\/x\//, ''), seen));
+  return { kind: 'cell', path: p, formula: rec.formula.slice(16), settings, inputs, answer: summary(evaluate(w, e, p)) };
+}
+
+// the source the viewer sees: the mount's shape, in memory
+const source = {
+  async read(path, care, cas) { const e = cas || epoch, w = worldAt(e); const rec = recAt(path, e); if (rec === undefined && !path && !Object.keys(w).length) return null; const t = treeAt(w, path, e); return { path, record: rec === undefined ? (t.kids.length ? {} : undefined) ?? {} : rec, kids: care === 'x' ? [] : t.kids, case: t.case }; },
+  async answer(path) { return evaluate(worldAt(epoch), epoch, path); },
+  async lineage(path) { return lineage(worldAt(epoch), epoch, path); },
+  async graph() {
+    const w = worldAt(epoch), e = epoch, cells = Object.keys(w).filter(p => isCell(w[p]));
+    const srcs = new Set();
+    const out = cells.map(p => { const rec = w[p]; const ins = []; const o = refOf(rec.over); if (o) ins.push({ path: o.path, pin: o.pin }); const v = refOf(rec.view); if (v) ins.push({ path: v.path, pin: v.pin, view: true });
+      for (const i of ins) if (!i.path.startsWith('/x/')) srcs.add(i.path);
+      const r = evaluate(w, e, p); return { path: p, formula: rec.formula.slice(16), settings: Object.entries(rec).filter(([k]) => !['formula', 'over', 'view'].includes(k)).map(([k, v]) => k + ' ' + v).join(' '), answer: r.tree ? summary(r) : '', note: r.note, bad: r.bad, inputs: ins }; });
+    const sources = [...srcs].map(path => { const t = treeAt(w, path, e); const s0 = Object.entries(t.slots)[0]; return { path, meta: t.kids.length ? t.kids.length + ' records' : s0 ? s0[1].toLocaleString() + ' ' + s0[0] : 'empty' }; });
+    return { sources, cells: out };
+  },
+  async dependents(path) { const w = worldAt(epoch); return Object.keys(w).filter(p => isCell(w[p]) && [w[p].over, w[p].view].some(r => { const x = refOf(r); return x && x.path.replace(/^\/x\//, '') === path; })).map(p => ({ path, ...lineage(w, epoch, p), path: p })); },
+  follow(h) { handlers.push(h); },
+};
+const viewer = mountViewer(document.getElementById('viewer'), source);
+
+// ---- the session ----
+const V = 'studio/views/', cell = (f, over, s) => ({ formula: '-> /weft/stdlib/' + f, over: '-> ' + over, ...s });
+const you = t => document.getElementById('you').innerHTML = `<b>you</b> ${t}`;
+const script = [
+  () => { you('people: alice leads eng on 150, bob eng on 110, mia sales on 120'); commit('make 3 people', [['studio/people/alice', { role: 'lead', team: 'eng', salary: 150 }], ['studio/people/bob', { role: 'eng', team: 'eng', salary: 110 }], ['studio/people/mia', { role: 'sales', team: 'sales', salary: 120 }]], 'agent'); },
+  () => { you('deals: acme 50/30 closed mia, globex 70/45 open mia, hooli 90/50 closed mia, initech 25/10 closed bob'); commit('make 4 deals', [['studio/deals/acme', { amount: 50, cost: 30, status: 'closed', owner: 'mia', client: '-> studio/clients/acme' }], ['studio/deals/globex', { amount: 70, cost: 45, status: 'open', owner: 'mia' }], ['studio/deals/hooli', { amount: 90, cost: 50, status: 'closed', owner: 'mia', note: 'renewal likely in Q2 if the pilot lands; they asked for a written proposal by the 20th' }], ['studio/deals/initech', { amount: 25, cost: 10, status: 'closed', owner: 'bob' }]], 'agent'); },
+  () => { you('budget 500'); commit('make budget', [['studio/budgets/2026', { amount: 500 }]], 'agent'); },
+  () => { you('payroll'); commit('make cell payroll', [[V + 'payroll', cell('sum', 'studio/people', { slot: 'salary', into: 'total' })]], 'agent'); },
+  () => { you('closed deals, and revenue from them'); commit('make 2 cells', [[V + 'closed', cell('where', 'studio/deals', { slot: 'status', value: 'closed' })], [V + 'revenue', cell('sum', '/x/' + V + 'closed', { slot: 'amount', into: 'revenue' })]], 'agent'); },
+  () => { you('budget left after payroll'); commit('make cell budget_left', [[V + 'budget_left', cell('subtract', '/x/' + V + 'payroll', { view: '-> studio/budgets/2026', left: 'amount', right: 'total', into: 'left' })]], 'agent'); },
+  () => { you('sales by owner'); commit('make cell by_owner', [[V + 'by_owner', cell('by', 'studio/deals', { group: 'owner', sum: 'amount', into: 'total' })]], 'agent'); },
+  () => { you('hold payroll for the board'); commit('make cell payroll_board', [[V + 'payroll_board', cell('sum', 'studio/people @ ' + epoch, { slot: 'salary', into: 'total' })]], 'agent'); },
+  () => { you('globex closed'); commit('poke globex', [['studio/deals/globex', { status: 'closed' }, 'poke']], 'agent'); },
+  () => { you('alice to 165'); commit('poke alice', [['studio/people/alice', { salary: 165 }, 'poke']], 'agent'); },
+  () => { you('a vendor total, column later'); commit('make cell vendors', [[V + 'vendors', cell('sum', 'studio/deals', {})]], 'agent'); },
+];
+let step = 0;
+document.getElementById('next').addEventListener('click', () => { if (step < script.length) script[step++](); });
+document.getElementById('show').addEventListener('click', () => { you('show me the views, as they are'); for (const h of handlers) h({ shown: { path: 'studio/views', care: 'z', case: 0 } }); });
+</script>
