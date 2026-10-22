@@ -14,9 +14,8 @@ RETURNED = 'DEBUG-TRANSPORT-RETURNED'
 def compiler_template(explicit, wisp):
     """Stage compiler-only state by default; explicit templates remain opt-in."""
     template = Path(explicit) if explicit else test_runner.stage(wisp, False, 900)
-    for name in ('data.mdb', 'pins.pack'):
-        if not (template / name).is_file():
-            raise ValueError(f'Missing compiler bootstrap file: {template / name}')
+    if not (template / 'arena.dat').is_file():
+        raise ValueError(f'Missing compiler bootstrap file: {template / "arena.dat"}')
     return template
 
 

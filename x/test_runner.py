@@ -180,9 +180,10 @@ def digest(paths):
 
 
 def copy_snapshot(source, dest):
+    # PR #53 stores the committed snapshot in one native arena. Lock files
+    # belong to the runtime opening the copy; cache metadata stays at source.
     dest.mkdir(parents=True)
-    for name in ('data.mdb', 'pins.pack'):
-        shutil.copy2(source / name, dest / name)
+    shutil.copy2(source / 'arena.dat', dest / 'arena.dat')
 
 
 def compiler_key(wisp):
@@ -200,7 +201,7 @@ def stage(wisp, fresh, timeout):
     template = cache / ('template-' + key)
     with (cache / 'stage.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if (template / 'ready').exists() and not fresh:
+        if (template / 'ready').exists() and (template / 'arena.dat').is_file() and not fresh:
             return template
         directory = Path(tempfile.mkdtemp(prefix='stage-', dir=cache))
         print(f'Staging {key}: {directory}', flush=True)
@@ -208,7 +209,7 @@ def stage(wisp, fresh, timeout):
                       for m in reaver_closure(['std', 'quip', 'rex'])
                       if (ROOT / 'src/reaver' / (m + '.rvr')).exists()]
         boot = cache / ('boot-' + planhash + '-' + digest(boot_files))
-        if boot.exists() and not fresh:
+        if (boot / 'arena.dat').is_file() and not fresh:
             copy_snapshot(boot, directory / 'snap')
         else:
             env = dict(os.environ, WISP=wisp, TEST_ROOT=str(ROOT))

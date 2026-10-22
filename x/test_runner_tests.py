@@ -154,10 +154,12 @@ class ProtocolTests(unittest.TestCase):
             template = root / 'template-external'
             template.mkdir()
             (root / 'stage.lock').touch()
-            for name in ('data.mdb', 'pins.pack'):
-                (template / name).write_bytes(b'compiler-only-fixture')
+            (template / 'arena.dat').write_bytes(b'compiler-only-fixture')
+            for name in ('arena.writer.lock', 'arena.commit.lock', 'ready', 'planhash'):
+                (template / name).touch()
             runner.copy_template(template, root / 'copy')
-            self.assertEqual((root / 'copy/data.mdb').read_bytes(), b'compiler-only-fixture')
+            self.assertEqual((root / 'copy/arena.dat').read_bytes(), b'compiler-only-fixture')
+            self.assertEqual({p.name for p in (root / 'copy').iterdir()}, {'arena.dat'})
 
     def test_timeout_and_crash(self):
         with tempfile.TemporaryDirectory() as temp:

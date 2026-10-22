@@ -32,7 +32,7 @@ from debug_transport_fixture import compiler_template, startup_source, require_d
 ROOT = fixture_repository()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--template', type=pathlib.Path,
-                    help='Compiler bootstrap snapshot containing data.mdb and pins.pack')
+                    help='Compiler bootstrap snapshot containing arena.dat')
 parser.add_argument('--wisp', default=os.environ.get('WISP') or shutil.which('wisp'),
                     help='Wisp executable (or set WISP)')
 parser.add_argument('--eden', action='store_true',
@@ -82,8 +82,7 @@ with socket.socket() as listener:
     port = listener.getsockname()[1]
 assert port != 8138
 (WORK / 'snap').mkdir(exist_ok=True)
-for name in ('data.mdb', 'pins.pack'):
-    shutil.copyfile(SNAP / name, WORK / 'snap' / name)
+shutil.copyfile(SNAP / 'arena.dat', WORK / 'snap' / 'arena.dat')
 log_path = WORK / 'out.log'
 results = []
 print(f'Disposable journal runtime port: {port}; log: {log_path}', flush=True)
