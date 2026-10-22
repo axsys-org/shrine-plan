@@ -64,16 +64,20 @@ is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
   at the end; `then` shows the effect in the same call; `from` an earlier
   case changes your mind.
 - When stopping, write `/agent/<name>/seen {epoch}`; wake with `history
-  after <epoch> with x` and continue from what changed. A world lives as
-  long as its process: after a reboot it is a new world, so keep what you
-  would not want to retype as one `records` batch you can write again.
+  after <epoch> with x` and continue from what changed. Which kind of
+  world you are in is a record: `read path=/agent/launcher/world` answers
+  `kept: true` with its directory for a world that survives reboots, and
+  `kept: false` for a temporary one that is gone with its process. In a
+  temporary world keep what you would not want to retype as one `records`
+  batch; in a kept one, nothing is lost and `seen` is where you left it.
 - Ask the world instead of reasoning over a copy; page what is left; never
   read the world whole.
 - The live page is how the person sees your work. Open
   `<world-url>/live?views=<folder>` in their browser when you start and
   again whenever the folder you work in changes, closing the tab you opened
   before so there is one page and it is the right one. After a world reboot
-  open it again, the old tab is stale. If you cannot open a browser, give
+  open it again, the old tab is stale (a kept world has the same records
+  and URL; a temporary one starts over). If you cannot open a browser, give
   the link in your reply every time it changes, as a line on its own, so it
   is always one click away.
 

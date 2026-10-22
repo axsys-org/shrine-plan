@@ -39,8 +39,8 @@ Under `/agent/<name>/qa`:
 4. Read both sides of a diff at the same care.
 5. Keep the live page open on `/agent/<name>/qa` as well as where you work.
    Anything it shows that is not what you wrote is a row under `notes`.
-6. Mirror `bugs` and `score` to a file at the end of each stretch, until a
-   world is proven to keep its records across a reboot.
+6. Mirror `bugs` and `score` to a file at the end of each stretch when the
+   world is a temporary one; a world kept with `--world` keeps them.
 
 QA happens behind the work. The person's page stays on their folder; the
 score sits in its header as a chip, green at zero, the count otherwise, and
