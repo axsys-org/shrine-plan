@@ -2540,11 +2540,151 @@
         (If (And (bitSet? a i) (bitSet? b i)) (Add acc (argBit i)) acc))))
   (go 1 0))
 
+;;; Single-entry analysis for final code generation.
+;; Returns conservative Zero/Once/Many entry bounds keyed by unique IR key.
+;; Only Once is actionable; an empty map means the analysis declined.
+;; Unlike the prototype occurs pass, RET demands its result, BR demands its
+;; selector, and RECUR's actuals exclude the self slot.  FORCE/CALL results
+;; are WHNF: using their result keys does not re-enter their source thunks.
+;; Unknown calls and escaping CLOSE payloads are Many.  Only scalar op66
+;; primitives have a trusted argument summary (one entry per operand).
+;; Keep this allowlist aligned with op66 in pkg/plan/src/op.c: arity-exact,
+;; shallow strict operands, and a scalar result that cannot retain them.
+;; REC knots and surviving local PROC definitions decline the optimization:
+;; removing blackholes from potentially cyclic thunks requires more proof.
+(define entryScalarOps
+  (bst-from-pairs-list
+    ~[["Inc" 1] ["Dec" 1] ["Add" 2] ["Sub" 2] ["Mul" 2]
+      ["Div" 2] ["Mod" 2] ["Rsh" 2] ["Lsh" 2]
+      ["Eq" 2] ["Ne" 2] ["Lt" 2] ["Le" 2] ["Gt" 2] ["Ge" 2]
+      ["Cmp" 2] ["Nil" 1] ["Truth" 1]]))
+
+(define (singleEntries top)
+  (define counts (refcounts top))
+  ;; Collect globally unique CLOSE bindings, including those captured by
+  ;; DELAYs. A scalar primitive may consume its argument row once without
+  ;; letting any element escape. Multiple row references always lose this.
+  (define (collect b st)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (LET [key rhs]
+            (? Alloc rhs
+              (CLOSE [fn args] [(_0 a) (bst-insert key [fn args] (_1 a))])
+              (DELAY [body] (collect (procCode body) a))))
+          (BR [x arms]
+            (foldl (lambda (a2 kp) (collect (procCode (_1 kp)) a2)) a arms))
+          (PROC [0 (_1 a)])
+          (REC [0 (_1 a)])
+          (_ a)))
+      st b))
+  (define info (collect (procCode top) [1 E]))
+  (define closes (_1 info))
+  (define (scalarRow op args)
+    (? Op op
+      (FAST [val]
+        (Ifz (And (Equal val (Pin "B")) (Eq 1 (Sz args))) 0
+          (? Atom (_0 args)
+            (REF [key]
+              (begin
+                (define hit (bst-search key closes))
+                (Ifz (And hit (Eq 1 (bst-gut key 0 counts))) 0
+                  (? Atom (_0 (_0 hit))
+                    (CNS [val]
+                      (If (And (bst-has val entryScalarOps)
+                            (Eq (Sz (_1 (_0 hit))) (bst-gut val 0 entryScalarOps)))
+                        [[key (_1 (_0 hit))]] 0))
+                    (_ 0)))))
+            (_ 0))))
+      (_ 0)))
+  (define (scalarRows b acc)
+    (foldl
+      (lambda (a s)
+        (? Stmt s
+          (CALL [key op args]
+            (begin
+              (define row (scalarRow op args))
+              (Ifz row a (bst-insert (_0 (_0 row)) 1 a))))
+          (LET [key rhs]
+            (? Alloc rhs
+              (DELAY [body] (scalarRows (procCode body) a))
+              (_ a)))
+          (BR [x arms]
+            (foldl (lambda (a2 kp) (scalarRows (procCode (_1 kp)) a2)) a arms))
+          (_ a)))
+      acc b))
+  (define fused (scalarRows (procCode top) E))
+  (define params (map argKey (drop 1 (procArgs top))))
+  (define (analyze recurUses)
+    (define (use a n u)
+      (Ifz n u
+        (? Atom a
+          (REF [key] (bst-ups key ZERO (usesPlus n) u))
+          (CNS u))))
+    (define (useAll args n u)
+      (foldl (lambda (a x) (use x n a)) u args))
+    ;; Walk backwards: by a DELAY definition we know how many entries its
+    ;; consumers can request. Its body is charged only when reachable.
+    ;; A Many-entered thunk's captures are also charged Many, conservatively
+    ;; covering retries after exceptions instead of relying on memoization.
+    (define (walk b u mult)
+      (foldl
+        (lambda (a s)
+          (? Stmt s
+            (RET [x] (use x mult a))
+            (FORCE [key x] (use x mult a))
+            (CALL [key op args]
+              (begin
+                (define row (scalarRow op args))
+                (If row (useAll (_1 (_0 row)) mult a)
+                  (? Op op
+                    (RECUR
+                      (If (Eq (Sz args) (Sz recurUses))
+                        (foldl
+                          (lambda (a2 i)
+                            (begin
+                              (define n (Ix i recurUses))
+                              (use (Ix i args) (Ifz n ZERO (max n mult)) a2)))
+                          a (gen (Sz args) (lambda (i) i)))
+                        (useAll args MANY a)))
+                    (ADD (useAll args mult a))
+                    (SLOW [fn] (useAll args MANY (use fn MANY a)))
+                    (_ (useAll args MANY a))))))
+            (LET [key rhs]
+              (? Alloc rhs
+                (DELAY [body]
+                  (begin
+                    (define n (bst-gut key ZERO a))
+                    (Ifz n a (walk (procCode body) a (max n mult)))))
+                (CLOSE [fn args]
+                  (If (bst-has key fused) a
+                    (useAll args MANY (use fn MANY a))))))
+            (BR [x arms]
+              (use x mult
+                (foldl
+                  (lambda (a2 kp) (bstUnionMax a2 (walk (procCode (_1 kp)) a mult)))
+                  a arms)))
+            (_ a)))
+        u (rev b)))
+    (walk (procCode top) E ONCE))
+  ;; Least fixed point of entry upper bounds for recursive arguments. Each
+  ;; parameter can rise only Zero -> Once -> Many. A failed convergence
+  ;; check declines every flag, rather than trusting a partial result.
+  (define (go fuel prev)
+    (Ifz fuel E
+      (begin
+        (define occ (analyze prev))
+        (define next (map (lambda (k) (bst-gut k ZERO occ)) params))
+        (If (Equal prev next) occ (go (Dec fuel) next)))))
+  (Ifz (_0 info) E
+    (go (Inc (Mul 2 (Sz params))) (map (lambda (k) ZERO) params))))
+
 ;; blockArgs: [] for a law; for a local function block, its parameter
 ;; keys, which live in operand slots 0..n-1 of the block's frame (the
-;; caller's OP_CALL/OP_TAILBLK puts the arguments there).  Returns the
+;; caller's OP_CALL/OP_TAILBLK puts the arguments there). Returns the
 ;; unflattened items; codegenOpt flattens a law's.
 (define (codegenItems lawSig selfSig noupd depth top blockArgs)
+  (define entries (If noupd (singleEntries top) E))
   (define selfArity (Dec (Sz (procArgs top))))
   (define topBlock (procCode top))
   ;; strict-entry prologue (self-call sites hint with exactly proMask)
@@ -2756,7 +2896,9 @@
                           (Ifz shape (error "codegenOpt: general code thunk")
                             (bindSlot st key
                               (emitThkBuild st (_0 (_0 shape))
-                                (_1 (_0 shape)) 0 0)))))))
+                                (_1 (_0 shape))
+                                (If (Eq ONCE (bst-gut key MANY entries)) BANE_NOUPD 0)
+                                0)))))))
                   (FORCE [key x]
                     (bindSlot st key (weld (emitAtom st x) [OP_FORCE])))
                   (CALL [key op args]
