@@ -199,7 +199,7 @@ def build(wisp=None):
             if inputs()!=source_hashes:raise RuntimeError('Build inputs changed during compilation; run build again')
             artifact=work/'artifact';artifact.mkdir();shutil.move(str(work/'snap'),artifact/'snapshot');shutil.move(str(work/'retained-rex'),artifact/'retained-rex')
             (artifact/'empty').mkdir()
-            manifest=dict(version=1,key=key,wisp=wisp,runtime_sha256=runtime_hash,inputs=source_hashes,artifacts={str(p.relative_to(artifact)):sha(p) for p in [artifact/'retained-rex',artifact/'snapshot/data.mdb',artifact/'snapshot/pins.pack']},unit_tests=answers[1])
+            manifest=dict(version=1,key=key,wisp=wisp,runtime_sha256=runtime_hash,inputs=source_hashes,artifacts={str(p.relative_to(artifact)):sha(p) for p in [artifact/'retained-rex',artifact/'snapshot/arena.dat']},unit_tests=answers[1])
             (artifact/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
             artifact.rename(destination)
         select(key)
@@ -287,7 +287,7 @@ def invoke(requests,directory=None,check_sources=True):
         finally:worker.close()
     with tempfile.TemporaryDirectory(prefix='goo-foil-run-') as temp:
         work=pathlib.Path(temp);(work/'snap').mkdir()
-        for name in ['data.mdb','pins.pack']:shutil.copy2(directory/'snapshot'/name,work/'snap'/name)
+        shutil.copy2(directory/'snapshot'/'arena.dat',work/'snap'/'arena.dat')
         with request_files(work/'inputs') as encode_string:
             source=request_source(requests,encode_string)
             out,err=run([manifest['wisp'],'--file-root',str(work/'inputs'),'snap','root','_'],work,source)

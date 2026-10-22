@@ -126,9 +126,8 @@ def launch_with(args, cleanup):
     executable = Path(args.wisp).resolve()
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise RuntimeError('A working Wisp executable is required')
-    for name in ('data.mdb', 'pins.pack'):
-        if not (template / name).is_file():
-            raise RuntimeError('Missing compiler-only bootstrap: ' + str(template / name))
+    if not (template / 'arena.dat').is_file():
+        raise RuntimeError('Missing compiler-only bootstrap: ' + str(template / 'arena.dat'))
     work = Path(tempfile.mkdtemp(prefix='shrine-grove-runtime-')).resolve()
     source = work / 'src'
     shutil.copytree(ROOT / 'src', source)
@@ -141,8 +140,7 @@ def launch_with(args, cleanup):
     scanner = cleanup.enter_context(ScanBridge(prepared, source))
     snapshot = work / 'snap'
     snapshot.mkdir()
-    for name in ('data.mdb', 'pins.pack'):
-        shutil.copyfile(template / name, snapshot / name)
+    shutil.copyfile(template / 'arena.dat', snapshot / 'arena.dat')
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -154,7 +152,7 @@ def launch_with(args, cleanup):
     manifest = dict(version=1, id=str(uuid.uuid4()), state='starting', work=str(work),
                     sourceSnapshot=str(source), sourceRepository=str(ROOT),
                     backendSourceFiles=source_files, template=str(template),
-                    templateFiles={name: sha(template / name) for name in ('data.mdb', 'pins.pack')},
+                    templateFiles={'arena.dat': sha(template / 'arena.dat')},
                     wisp=str(executable), wispSha256=sha(executable), controllerPid=os.getpid(),
                     port=port, origin=f'http://127.0.0.1:{port}', node=node, pid=None,
                     assets=None, startedAt=time.time(), entry='eden:' + args.entry)

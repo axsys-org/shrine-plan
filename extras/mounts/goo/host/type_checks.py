@@ -104,7 +104,7 @@ def check_types(directory=None):
         lines.append(f'(Seq (print ("GOO-TYPE" {i} (If {ok} {yes} {no}))) 0)')
     with tempfile.TemporaryDirectory(prefix='goo-types-') as temp:
         work=Path(temp);(work/'snap').mkdir()
-        for name in ('data.mdb','pins.pack'):shutil.copy2(directory/'snapshot'/name,work/'snap'/name)
+        shutil.copy2(directory/'snapshot'/'arena.dat',work/'snap'/'arena.dat')
         out,err=run([manifest['wisp'],'--file-root',str(directory/'empty'),'snap','root','_'],work,'\n'.join(lines)+'\n')
     log=out+err
     (directory.parent/'last-type-checks.log').write_text(log)
