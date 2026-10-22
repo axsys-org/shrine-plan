@@ -323,13 +323,149 @@ assert(Equal "end" (ctdn-law 3))
      (Dec (plan-arity (Init x)))))
 
 
+;; Specialize a known partial law at a call site. Only captured callable
+;; values trigger this pass; ordinary data partials retain their identity.
+;; The small residual IR is [0 constant], [1 reference], [2 function arg].
+;; Never execute a saturated call here (including effects and dead branches).
+;; Recursive calls with the same static prefix become residual self calls;
+;; escaping self or a changed prefix still refers to the original law.
+;; Specialize at most two call layers, each with at most 256 syntax nodes.
+;; A callback must be used as a call head (directly or by a known callee);
+;; functions carried only as data and primitive ABI wrappers stay intact.
+;; Dynamic prefixes/captures are deliberately left on the ordinary path.
+;; Keep this algorithm in sync with src/plan/lambda.plan.
+(define (spec-call? b)
+  (And (IsApp b) (And (Equal 0 (Hd b)) (Eq 2 (Sz b)))))
+(define (spec-let? b)
+  (And (IsApp b) (And (Equal 1 (Hd b)) (Eq 2 (Sz b)))))
+(define (spec-quote? b)
+  (And (IsApp b) (And (Equal 0 (Hd b)) (Eq 1 (Sz b)))))
+
+;; Fuel counts syntax only, never the contents of a literal/pin. Returning
+;; zero rejects the specialization before decoding or walking its lets.
+(define (spec-fuel fuel outer b)
+  (Ifz fuel 0
+    (If (Or (spec-call? b) (And outer (spec-let? b)))
+      (spec-fuel (spec-fuel (Dec fuel) 0 (_0 b))
+        (And outer (spec-let? b)) (_1 b))
+      (Dec fuel))))
+(define (spec-lets b)
+  (If (spec-let? b) (Inc (spec-lets (_1 b))) 0))
+(define (spec-callable? v)
+  (Or (IsPin (Hd v)) (IsLaw (Hd v))))
+(define (spec-has-function? f)
+  (And (IsApp f)
+    (Or (spec-callable? (Last f)) (spec-has-function? (Init f)))))
+
+(define (spec-known-app specialize depth target f x)
+  (If (Ne 1 (plan-arity f))
+    [0 (f x)]
+    [2 [0 (specialize (Dec depth) f)] [0 x]]))
+(define (spec-app specialize depth target f x)
+  (If (And (Eq 0 (_0 f)) (Eq 0 (_0 x)))
+    (spec-known-app specialize depth target (_1 f) (_1 x))
+    [2 (If (Eq 0 (_0 f))
+         [0 (specialize (Dec depth) (_1 f))] f) x]))
+
+(define (spec-ref target i)
+  (Ifz i [0 (Hd target)]
+    (If (Le i (Sz target)) [0 (Ix (Dec i) target)]
+      [1 (Sub i (Sz target))])))
+;; Match self with its unchanged static parameter references syntactically.
+;; Comparing constant closures here would walk the whole compiler graph in
+;; the bootstrap's structural equality, making large modules pathological.
+(define (spec-self-prefix? n b)
+  (Ifz n (And (IsNat b) (Nil b))
+    (And (spec-call? b)
+      (And (IsNat (_1 b))
+        (And (Eq n (_1 b)) (spec-self-prefix? (Dec n) (_0 b)))))))
+(define (spec-expr specialize depth target maxref b)
+  (If (spec-self-prefix? (Sz target) b) [1 0]
+    (If (And (IsNat b) (Le b maxref))
+      (spec-ref target b)
+      (If (spec-call? b)
+        (spec-app specialize depth target
+          (spec-expr specialize depth target maxref (_0 b))
+          (spec-expr specialize depth target maxref (_1 b)))
+        [0 (If (spec-quote? b) (_0 b) b)]))))
+;; Expose the head and captured arguments of a known PAP to the bytecode
+;; compiler. Leaving (Mul 2) as a constant head would still take its slow
+;; partial-application path instead of compiling a saturated Mul call.
+(define (spec-emit-value-head v)
+  (If (And (IsApp v) (spec-callable? v))
+    (0 (spec-emit-value-head (Init v)) (0 (Last v)))
+    (0 v)))
+(define (spec-emit e)
+  (Case3 (_0 e)
+    (0 (_1 e))
+    (_1 e)
+    (0 (If (Eq 0 (_0 (_1 e)))
+         (spec-emit-value-head (_1 (_1 e)))
+         (spec-emit (_1 e)))
+       (spec-emit (_2 e)))))
+(define (spec-body specialize depth target maxref b)
+  (If (spec-let? b)
+    (1 (spec-emit (spec-expr specialize depth target maxref (_0 b)))
+       (spec-body specialize depth target maxref (_1 b)))
+    (spec-emit (spec-expr specialize depth target maxref b))))
+(define (spec-build specialize depth target law)
+  (Law (Dec (Sub (Arity law) (Sz target))) (Name law)
+    (spec-body specialize depth target (Add (Arity law) (spec-lets (Body law))) (Body law))))
+(define (spec-callback-ref? target b)
+  (And (IsNat b) (And (Gt b 0)
+    (And (Le b (Sz target)) (spec-callable? (Ix (Dec b) target))))))
+(define (spec-no-specialize depth f) f)
+(define (spec-forward-law uses depth target law)
+  (And (IsLaw law)
+    (And (Gt (Arity law) (Sz target))
+      (And (spec-fuel 257 1 (Body law))
+        (uses depth target (Add (Arity law) (spec-lets (Body law))) 1 (Body law))))))
+(define (spec-forward-value uses depth f x)
+  (And (Gt (plan-arity f) 1)
+    (spec-forward-law uses depth (f x)
+      (If (IsPin (Hd f)) (Unpin (Hd f)) (Hd f)))))
+(define (spec-forward-expr uses depth f x)
+  (And (Eq 0 (_0 f))
+    (spec-forward-value uses depth (_1 f) x)))
+(define (spec-forward? uses depth target maxref b)
+  (And (Gt depth 1)
+    (And (spec-callback-ref? target (_1 b))
+      (spec-forward-expr uses (Dec depth)
+        (spec-expr spec-no-specialize 0 target maxref (_0 b))
+        (Ix (Dec (_1 b)) target)))))
+(define (spec-uses-callback? depth target maxref outer b)
+  (If (Or (spec-call? b) (And outer (spec-let? b)))
+    (Or (And (spec-call? b)
+          (Or (spec-callback-ref? target (_0 b))
+            (spec-forward? spec-uses-callback? depth target maxref b)))
+      (Or (spec-uses-callback? depth target maxref 0 (_0 b))
+        (spec-uses-callback? depth target maxref (And outer (spec-let? b)) (_1 b))))
+    0))
+
+(define (spec-law specialize depth target law)
+  (If (And (IsLaw law)
+        (And (And (Gt (Arity law) (Sz target)) (spec-has-function? target))
+          (And (spec-fuel 257 1 (Body law))
+            (spec-uses-callback? depth target
+              (Add (Arity law) (spec-lets (Body law))) 1 (Body law)))))
+    (If (IsPin (Hd target)) (Pin (spec-build specialize depth target law))
+      (spec-build specialize depth target law))
+    target))
+(define (specialize-call-head-at depth f)
+  (If (And depth (IsApp f))
+    (spec-law specialize-call-head-at depth f (If (IsPin (Hd f)) (Unpin (Hd f)) (Hd f)))
+    f))
+
+(define (specialize-call-head f)
+  (specialize-call-head-at 2 f))
+
 (define (is-constant-app f x)
  (and (Eq "VAL" (_0 f)) (Eq "VAL" (_0 x)) (Ne 1 (plan-arity (_1 f)))))
 
 (define (folding-apply f x)
   (If (is-constant-app f x)
     (VAL ((_1 f) (_1 x)))
-    (APP f x)))
+    (APP (If (Eq "VAL" (_0 f)) (VAL (specialize-call-head (_1 f))) f) x)))
 
 (define (ingest-mark ingest compile s env m[_ x])
   (ingest compile s x env))

@@ -49,18 +49,13 @@
 ;;;; These basic optimizations (and inlining) mean that you can write
 ;;;; code in a more natural style without generating bad PLAN code.
 ;;;;
-;;;; It is important to understand that these optimizations do not affect
-;;;; performance.  The PLAN runtime backend will perform all of these
-;;;; optimizations and much more.  The purpose here is code *size* and
-;;;; *canonicity*.  This compiler is designed so that you can write
-;;;; expressions while having very specific PLAN output in mind — this
-;;;; is critical for jet definitions, where the runtime recognizes
-;;;; specific canonical law shapes and replaces them with optimized
-;;;; native code.  The optimizer must be deterministic and predictable:
-;;;; the same input must always produce the same output.  This is why
-;;;; we avoid "smart" optimizations that might fire differently depending
-;;;; on context — it would be very strange if canonical jet definitions
-;;;; contained dead code or redundant bindings.
+;;;; These canonicalization steps control code size and keep output
+;;;; predictable, including the primitive wrapper shapes recognized by
+;;;; the runtime. The bounded call-site specialization below additionally
+;;;; removes indirect callback calls: it substitutes known function
+;;;; arguments into ordinary laws and exposes their direct call heads.
+;;;; Primitive wrappers and functions that only carry callbacks as data
+;;;; retain their existing representation.
 ;;;;
 ;;;; But an even more important reason is that using the macro system
 ;;;; for meta-programming tends to generate a lot of pointless bindings
@@ -270,6 +265,142 @@
 ;; leave it as an APP node in the Code IR.  This optimization results
 ;; in slightly smaller laws.
 
+;; Specialize a known partial law at a call site. Only captured callable
+;; values trigger this pass; ordinary data partials retain their identity.
+;; The small residual IR is [0 constant], [1 reference], [2 function arg].
+;; Never execute a saturated call here (including effects and dead branches).
+;; Recursive calls with the same static prefix become residual self calls;
+;; escaping self or a changed prefix still refers to the original law.
+;; Specialize at most two call layers, each with at most 256 syntax nodes.
+;; A callback must be used as a call head (directly or by a known callee);
+;; functions carried only as data and primitive ABI wrappers stay intact.
+;; Dynamic prefixes/captures are deliberately left on the ordinary path.
+;; Keep this algorithm in sync with src/reaver/codegen.rvr.
+(patfun (spec-call? b)
+  (And (IsApp b) (And (planEq 0 (Hd b)) (Eq 2 (Sz b)))))
+(patfun (spec-let? b)
+  (And (IsApp b) (And (planEq 1 (Hd b)) (Eq 2 (Sz b)))))
+(patfun (spec-quote? b)
+  (And (IsApp b) (And (planEq 0 (Hd b)) (Eq 1 (Sz b)))))
+
+;; Fuel counts syntax only, never the contents of a literal/pin. Returning
+;; zero rejects the specialization before decoding or walking its lets.
+(patfun (spec-fuel fuel outer b)
+  (Ifz fuel 0
+    (If (Or (spec-call? b) (And outer (spec-let? b)))
+      (spec-fuel (spec-fuel (Dec fuel) 0 (.0 b))
+        (And outer (spec-let? b)) (.1 b))
+      (Dec fuel))))
+(patfun (spec-lets b)
+  (If (spec-let? b) (Inc (spec-lets (.1 b))) 0))
+(patfun (spec-callable? v)
+  (Or (IsPin (Hd v)) (IsLaw (Hd v))))
+(patfun (spec-has-function? f)
+  (And (IsApp f)
+    (Or (spec-callable? (Last f)) (spec-has-function? (Init f)))))
+
+(patfun (spec-known-app specialize depth target f x)
+  (If (Ne 1 (planArity f))
+    [0 (f x)]
+    [2 [0 (specialize (Dec depth) f)] [0 x]]))
+(patfun (spec-app specialize depth target f x)
+  (If (And (Eq 0 (.0 f)) (Eq 0 (.0 x)))
+    (spec-known-app specialize depth target (.1 f) (.1 x))
+    [2 (If (Eq 0 (.0 f))
+         [0 (specialize (Dec depth) (.1 f))] f) x]))
+
+(patfun (spec-ref target i)
+  (Ifz i [0 (Hd target)]
+    (If (Le i (Sz target)) [0 (Ix (Dec i) target)]
+      [1 (Sub i (Sz target))])))
+;; Match self with its unchanged static parameter references syntactically.
+;; Comparing constant closures here would walk the whole compiler graph in
+;; the bootstrap's structural equality, making large modules pathological.
+(patfun (spec-self-prefix? n b)
+  (Ifz n (And (IsNat b) (Nil b))
+    (And (spec-call? b)
+      (And (IsNat (.1 b))
+        (And (Eq n (.1 b)) (spec-self-prefix? (Dec n) (.0 b)))))))
+(patfun (spec-expr specialize depth target maxref b)
+  (If (spec-self-prefix? (Sz target) b) [1 0]
+    (If (And (IsNat b) (Le b maxref))
+      (spec-ref target b)
+      (If (spec-call? b)
+        (spec-app specialize depth target
+          (spec-expr specialize depth target maxref (.0 b))
+          (spec-expr specialize depth target maxref (.1 b)))
+        [0 (If (spec-quote? b) (.0 b) b)]))))
+;; Expose the head and captured arguments of a known PAP to the bytecode
+;; compiler. Leaving (Mul 2) as a constant head would still take its slow
+;; partial-application path instead of compiling a saturated Mul call.
+(patfun (spec-emit-value-head v)
+  (If (And (IsApp v) (spec-callable? v))
+    (0 (spec-emit-value-head (Init v)) (0 (Last v)))
+    (0 v)))
+(patfun (spec-emit e)
+  (Case3 (.0 e)
+    (0 (.1 e))
+    (.1 e)
+    (0 (If (Eq 0 (.0 (.1 e)))
+         (spec-emit-value-head (.1 (.1 e)))
+         (spec-emit (.1 e)))
+       (spec-emit (.2 e)))))
+(patfun (spec-body specialize depth target maxref b)
+  (If (spec-let? b)
+    (1 (spec-emit (spec-expr specialize depth target maxref (.0 b)))
+       (spec-body specialize depth target maxref (.1 b)))
+    (spec-emit (spec-expr specialize depth target maxref b))))
+(patfun (spec-build specialize depth target law)
+  (Law (Dec (Sub (Arity law) (Sz target))) (Name law)
+    (spec-body specialize depth target (Add (Arity law) (spec-lets (Body law))) (Body law))))
+(patfun (spec-callback-ref? target b)
+  (And (IsNat b) (And (Gt b 0)
+    (And (Le b (Sz target)) (spec-callable? (Ix (Dec b) target))))))
+(patfun (spec-no-specialize depth f) f)
+(patfun (spec-forward-law uses depth target law)
+  (And (IsLaw law)
+    (And (Gt (Arity law) (Sz target))
+      (And (spec-fuel 257 1 (Body law))
+        (uses depth target (Add (Arity law) (spec-lets (Body law))) 1 (Body law))))))
+(patfun (spec-forward-value uses depth f x)
+  (And (Gt (planArity f) 1)
+    (spec-forward-law uses depth (f x)
+      (If (IsPin (Hd f)) (Unpin (Hd f)) (Hd f)))))
+(patfun (spec-forward-expr uses depth f x)
+  (And (Eq 0 (.0 f))
+    (spec-forward-value uses depth (.1 f) x)))
+(patfun (spec-forward? uses depth target maxref b)
+  (And (Gt depth 1)
+    (And (spec-callback-ref? target (.1 b))
+      (spec-forward-expr uses (Dec depth)
+        (spec-expr spec-no-specialize 0 target maxref (.0 b))
+        (Ix (Dec (.1 b)) target)))))
+(patfun (spec-uses-callback? depth target maxref outer b)
+  (If (Or (spec-call? b) (And outer (spec-let? b)))
+    (Or (And (spec-call? b)
+          (Or (spec-callback-ref? target (.0 b))
+            (spec-forward? spec-uses-callback? depth target maxref b)))
+      (Or (spec-uses-callback? depth target maxref 0 (.0 b))
+        (spec-uses-callback? depth target maxref (And outer (spec-let? b)) (.1 b))))
+    0))
+
+(patfun (spec-law specialize depth target law)
+  (If (And (IsLaw law)
+        (And (And (Gt (Arity law) (Sz target)) (spec-has-function? target))
+          (And (spec-fuel 257 1 (Body law))
+            (spec-uses-callback? depth target
+              (Add (Arity law) (spec-lets (Body law))) 1 (Body law)))))
+    (If (IsPin (Hd target)) (Pin (spec-build specialize depth target law))
+      (spec-build specialize depth target law))
+    target))
+(patfun (specialize-call-head-at depth f)
+  (If (And depth (IsApp f))
+    (spec-law specialize-call-head-at depth f (If (IsPin (Hd f)) (Unpin (Hd f)) (Hd f)))
+    f))
+
+(patfun (specialize-call-head f)
+  (specialize-call-head-at 2 f))
+
 (patfun (is-constant-app f(hf) x(hx))
   (And (And (Eq VAL hf) (Eq VAL hx))
     (Ne 1 (planArity (.0 f)))))
@@ -277,7 +408,7 @@
 (patfun (folding-apply f[fv] x[xv])
   (If (is-constant-app f x)
     (VAL (fv xv))
-    (APP f x)))
+    (APP (If (Eq VAL (Hd f)) (VAL (specialize-call-head fv)) f) x)))
 
 (tests
   1(is-constant-app (VAL 1) (VAL 2))
