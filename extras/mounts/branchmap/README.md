@@ -5,11 +5,14 @@ and presentation inside Shrine. Grove declares the application and Goo prepares
 its interface for the `goo-egui` desktop client. Python imports the public
 snapshot and drives tests; no Python process executes trades.
 
-This mount builds on `lf/goo-contracts` at `1c3e3e6c`. The first MCP experiment is
-archived under [extras/experiments/branchmap](../../experiments/branchmap/README.md).
+This mount was first built on `lf/goo-contracts` at `1c3e3e6c`. It now also runs on
+the combined `ic-hands` and updated `lf/goo-contracts` branch. Use the
+[combined launcher and feedback](../../experiments/branchmap-hands/README.md)
+for MCP cells and kept-world restart. The first MCP experiment is archived under
+[extras/experiments/branchmap](../../experiments/branchmap/README.md).
 That experiment's Python controller and MCP cell library are not dependencies of
-this application. The branches diverge before the MCP/cell work, so the new
-application uses Grove actions and sewn projections available on this base.
+this application. Combining the branches adds the MCP authoring surface without
+changing the native ledger representation.
 
 ## Run
 
@@ -49,10 +52,11 @@ GOO_SERVER=http://127.0.0.1:8190 GOO_PATH=/0x11/app/branchmap \
 The server also exposes its existing browser Explorer. No application-specific
 JavaScript handles transactions.
 
-**Each launcher invocation creates a fresh world.** Transactions remain in the
-running Shrine namespace and journal. Restart recovery for this Eden launcher
-is not implemented; restarting reseeds balances. Keep the server terminal open
-while using the experiment. Do not describe it as a durable wallet.
+**This mount's original launcher creates a fresh world each time.** Transactions
+remain in that running namespace and journal. The
+[combined launcher](../../experiments/branchmap-hands/start.sh) uses Eden's new
+kept-world mode to preserve them across stop/resume. These launchers have
+different lifecycle behavior; neither establishes production wallet durability.
 
 ## Try a transaction
 
@@ -153,9 +157,13 @@ prices to price a conjunction. Split and merge remain available without a quote.
 This implements conjunction claims; it does not define a conditional-bet contract
 that refunds when its conditioning event fails.
 
-## Boundaries found while building
+## Boundaries found on the original base
 
-- The new base does not contain the old MCP standard-cell mount. Native Grove
+These findings describe the first native implementation. The
+[combined-branch report](../../experiments/branchmap-hands/FEEDBACK.md) records
+current checks and distinguishes resolved gaps from findings not retested.
+
+- The original base did not contain the MCP standard-cell mount. Native Grove
   `@sewn` projections replace those demonstration queries.
 - A single-receiver Grove action provides a clear atomic boundary. A normalized,
   independently writable multi-record ledger needs a broader domain transaction
@@ -185,8 +193,8 @@ that refunds when its conditioning event fails.
   retains the exact original snapshot.
 - Wisp's listener takes a port without a bind address. A process-local macOS
   adapter supplies loopback confinement; it does not implement domain logic.
-- Eden startup is disposable. Durable restart/recovery remains an infrastructure
-  gap and is not hidden by a Python ledger mirror.
+- The original launcher used disposable Eden startup. The combined launcher
+  exercises the new kept-world mode; crash recovery remains untested.
 - Fixed quotes and finite house inventory are a toy execution policy. There is
   no order book, AMM, external oracle, fee model, or arbitrary cross-market
   consistency proof. The receipt row grows with the session; no compaction exists.
