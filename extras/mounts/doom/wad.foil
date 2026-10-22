@@ -1,0 +1,246 @@
+- apps/doom/math
+
++ dw
+  + lump
+    : name=str bytes=nat size=nat
+  + picture
+    : width=nat height=nat left=nat top=nat cols=row[row[nat]]
+  + texture
+    : name=str image=dw/picture
+  + vertex
+    : x=nat y=nat
+  + side
+    : x=nat y=nat upper=nat lower=nat middle=nat sector=nat
+  + sector
+    : floor=nat ceiling=nat flat=nat roof=nat light=nat tag=nat sky=bool
+  + line
+    : a=dw/vertex b=dw/vertex flags=nat special=nat tag=nat right=nat left=nat length=nat
+  + seg
+    : a=dw/vertex b=dw/vertex line=nat side=nat offset=nat length=nat
+  + box
+    : top=nat bottom=nat left=nat right=nat
+  + node
+    : x=nat y=nat dx=nat dy=nat right=nat left=nat right_box=dw/box left_box=dw/box
+  + sub
+    : count=nat first=nat sector=nat
+  + thing
+    : x=nat y=nat angle=nat kind=nat flags=nat
+  + grid
+    : x=nat y=nat width=nat height=nat cells=row[row[nat]]
+  + level
+    : lumps=row[dw/lump] textures=row[dw/texture] sides=row[dw/side]
+      sectors=row[dw/sector] lines=row[dw/line] segs=row[dw/seg]
+      subs=row[dw/sub] nodes=row[dw/node] things=row[dw/thing]
+      palette=nat cmap=nat start=dw/thing grid=dw/grid
+  + failure
+    : message=str
+  + u16
+    \ at=nat bytes=nat
+    ^ nat
+    (loadvar at 2 bytes)
+  + u32
+    \ at=nat bytes=nat
+    ^ nat
+    (loadvar at 4 bytes)
+  + s16
+    \ at=nat bytes=nat
+    ^ nat
+    = n (dw/u16 at bytes)
+    ? (lt n 32768) (dz/pos n)
+    (dec (mul (sub 65536 n) 2))
+  + name
+    \ at=nat bytes=nat
+    ^ str
+    (str/from_atom (loadvar at 8 bytes))
+  + directory
+    \ bytes=nat
+    ^ row[dw/lump]
+    = size (dec (wid bytes))
+      magic (loadvar 0 4 bytes)
+      count (dw/u32 4 bytes)
+      offset (dw/u32 8 bytes)
+    ; (if (and (ge size 12) (and ((eq magic (str/to_atom "IWAD")) || (eq magic (str/to_atom "PWAD")))
+        (and (le count 10000) (le (add offset (mul count 16)) size)))) 0
+        (error (dw/failure "Invalid WAD directory")))
+    | (row/range 0 count).map
+      \ i
+      = pos (add offset (mul i 16))
+        start (dw/u32 pos bytes)
+        len (dw/u32 (add pos 4) bytes)
+      ; (if (le (add start len) size) 0 (error (dw/failure "WAD lump outside file")))
+      (dw/lump (dw/name (add pos 8) bytes) (loadvar start len bytes) len)
+  + find
+    \ name=str lumps=row[dw/lump]
+    ^ dw/lump
+    % i=nat 0
+    ? (eq i lumps.len) (dw/lump name 0 0)
+    = lump lumps.at(i)
+    ? (equal name lump.name) lump
+    (_ i.inc)
+  + required
+    \ name=str size=nat lumps=row[dw/lump]
+    ^ dw/lump
+    = lump (dw/find name lumps)
+    ; (if (ge lump.size size) 0 (error (dw/failure (str/cat_all ["Missing/short WAD lump: " name]))))
+    lump
+  + records
+    (@ v)
+    \ size=nat parse={\ nat}v lump=dw/lump
+    ^ row[v]
+    ; (if (eq (mod lump.size size) 0) 0 (error (dw/failure "Misaligned WAD records")))
+    (row/range 0 (div lump.size size)).map((\ i (parse (loadvar (mul i size) size lump.bytes))))
+  + patch_column
+    \ bytes=nat offset=nat height=nat
+    ^ row[nat]
+    % pos=nat offset col=row[nat] (row/range 0 height).map((\ _ 0)) fuel=nat height.inc
+    ? ((eq fuel 0) || (eq (load8 pos bytes) 255)) col
+    = top (load8 pos bytes)
+      len (load8 pos.inc bytes)
+    | _ (add pos (add len 4))
+      ((row/range 0 height).map((\ y (? (and (ge y top) (lt y (add top len))) (inc (load8 (add (add pos 3) (sub y top)) bytes)) col.at(y)))))
+      fuel.dec
+  + picture_of
+    \ lump=dw/lump
+    ^ dw/picture
+    = b lump.bytes
+      w (dw/u16 0 b)
+      h (dw/u16 2 b)
+    ; (if (and (le w 2048) (and (le h 2048) (le (add 8 (mul w 4)) lump.size))) 0
+        (error (dw/failure "Invalid patch dimensions")))
+    | dw/picture w h (dw/s16 4 b) (dw/s16 6 b)
+      ((row/range 0 w).map((\ x (dw/patch_column b (dw/u32 (add 8 (mul x 4)) b) h))))
+  + tex_id
+    \ name=str textures=row[dw/texture]
+    ^ nat
+    % i=nat 0
+    ? (eq i textures.len) 0
+    ? (equal name textures.at(i).name) i.inc
+    (_ i.inc)
+  + load_textures
+    \ lumps=row[dw/lump]
+    ^ row[dw/texture]
+    = pn (dw/required "PNAMES" 4 lumps)
+      tb (dw/required "TEXTURE1" 4 lumps)
+      patches=row[dw/picture] (row/range 0 (dw/u32 0 pn.bytes)).map((\ i (dw/picture_of (dw/find (dw/name (add 4 (mul i 8)) pn.bytes) lumps))))
+    | (row/range 0 (dw/u32 0 tb.bytes)).map
+      \ i
+      = off (dw/u32 (add 4 (mul i 4)) tb.bytes)
+        b (loadvar off (sub tb.size off) tb.bytes)
+        w (dw/u16 12 b)
+        h (dw/u16 14 b)
+        count (dw/u16 20 b)
+        placements (row/range 0 count)
+        cols
+          | (row/range 0 w).map
+            \ x
+            | (row/range 0 h).map
+              \ y
+              | placements.fold 0
+                \ old j
+                = p (add 22 (mul j 10))
+                  raster patches.at((dw/u16 (add p 4) b))
+                  px (dz/sub (dz/pos x) (dw/s16 p b))
+                  py (dz/sub (dz/pos y) (dw/s16 (add p 2) b))
+                ? ((dz/sign px) || (dz/sign py)) old
+                ? ((ge (dz/abs px) raster.width) || (ge (dz/abs py) raster.height)) old
+                = color raster.cols.at((dz/abs px)).at((dz/abs py))
+                ? color color
+                old
+      (dw/texture (dw/name 0 b) (dw/picture w h 0 0 cols))
+  + sector_at
+    \ level=dw/level x=nat y=nat
+    ^ nat
+    % child=nat level.nodes.len.dec fuel=nat level.nodes.len.inc
+    ? (ge child 32768) level.subs.at((sub child 32768)).sector
+    ? (eq fuel 0) 0
+    = n level.nodes.at(child)
+      cross (dz/cross n.dx n.dy (dz/sub x n.x) (dz/sub y n.y))
+    (_ (? (dz/sign cross) n.right n.left) fuel.dec)
+  + line_of
+    \ verts=row[dw/vertex] b=nat
+    ^ dw/line
+    = a verts.at((dw/u16 0 b))
+      c verts.at((dw/u16 2 b))
+    (dw/line a c (dw/u16 4 b) (dw/u16 6 b) (dw/u16 8 b)
+      (dw/u16 10 b) (dw/u16 12 b) (dz/distance a.x a.y c.x c.y))
+  + seg_of
+    \ verts=row[dw/vertex] b=nat
+    ^ dw/seg
+    = a verts.at((dw/u16 0 b))
+      c verts.at((dw/u16 2 b))
+    (dw/seg a c (dw/u16 6 b) (dw/u16 8 b) (dw/u16 10 b) (dz/distance a.x a.y c.x c.y))
+  + sub_of
+    \ segs=row[dw/seg] lines=row[dw/line] sides=row[dw/side] b=nat
+    ^ dw/sub
+    = first (dw/u16 2 b)
+      seg segs.at(first)
+      line lines.at(seg.line)
+      side sides.at((? seg.side line.left line.right))
+    (dw/sub (dw/u16 0 b) first side.sector)
+  + bounds
+    : index=nat minx=nat maxx=nat miny=nat maxy=nat
+  + build_grid
+    ' The reference WAD omits BLOCKMAP. Build a conservative 128-unit grid.
+    \ lines=row[dw/line]
+    ^ dw/grid
+    = boxes=row[dw/bounds]
+        | (row/range 0 lines.len).map
+          \ i
+          (dw/bounds i (dz/min lines.at(i).a.x lines.at(i).b.x) (dz/max lines.at(i).a.x lines.at(i).b.x)
+            (dz/min lines.at(i).a.y lines.at(i).b.y) (dz/max lines.at(i).a.y lines.at(i).b.y))
+      minx boxes.fold(boxes.at(0).minx (\ x b (dz/min x b.minx)))
+      miny boxes.fold(boxes.at(0).miny (\ y b (dz/min y b.miny)))
+      maxx boxes.fold(boxes.at(0).maxx (\ x b (dz/max x b.maxx)))
+      maxy boxes.fold(boxes.at(0).maxy (\ y b (dz/max y b.maxy)))
+      width (inc (div (dz/abs (dz/sub maxx minx)) 128))
+      height (inc (div (dz/abs (dz/sub maxy miny)) 128))
+      cells
+        | (row/range 0 (mul width height)).map
+          \ i
+          = x (dz/add minx (dz/pos (mul (mod i width) 128)))
+            y (dz/add miny (dz/pos (mul (div i width) 128)))
+            right (dz/add x 256)
+            top (dz/add y 256)
+          | (boxes.filter((\ b (and !(dz/lt b.maxx x) (and !(dz/lt right b.minx) (and !(dz/lt b.maxy y) !(dz/lt top b.miny))))))).map
+            \ b
+            b.index
+    (dw/grid minx miny width height cells)
+  + load
+    \ bytes=nat
+    ^ dw/level
+    = lumps (dw/directory bytes)
+      textures (dw/load_textures lumps)
+      verts (dw/records[dw/vertex] 4 (\ b (dw/vertex (dw/s16 0 b) (dw/s16 2 b))) (dw/required "VERTEXES" 4 lumps))
+      sides
+        | dw/records[dw/side] 30
+          (\ b (dw/side (dw/s16 0 b) (dw/s16 2 b)
+            (dw/tex_id (dw/name 4 b) textures) (dw/tex_id (dw/name 12 b) textures)
+            (dw/tex_id (dw/name 20 b) textures) (dw/u16 28 b)))
+          (dw/required "SIDEDEFS" 30 lumps)
+      sectors
+        | dw/records[dw/sector] 26
+          (\ b (dw/sector (dw/s16 0 b) (dw/s16 2 b)
+            (dw/find (dw/name 4 b) lumps).bytes (dw/find (dw/name 12 b) lumps).bytes
+            (dw/u16 20 b) (dw/u16 24 b) (equal (dw/name 12 b) "F_SKY1")))
+          (dw/required "SECTORS" 26 lumps)
+      lines (dw/records[dw/line] 14 (dw/line_of verts) (dw/required "LINEDEFS" 14 lumps))
+      segs (dw/records[dw/seg] 12 (dw/seg_of verts) (dw/required "SEGS" 12 lumps))
+      subs (dw/records[dw/sub] 4 (dw/sub_of segs lines sides) (dw/required "SSECTORS" 4 lumps))
+      nodes
+        | dw/records[dw/node] 28
+          (\ b (dw/node (dw/s16 0 b) (dw/s16 2 b) (dw/s16 4 b) (dw/s16 6 b) (dw/u16 24 b) (dw/u16 26 b)
+            (dw/box (dw/s16 8 b) (dw/s16 10 b) (dw/s16 12 b) (dw/s16 14 b))
+            (dw/box (dw/s16 16 b) (dw/s16 18 b) (dw/s16 20 b) (dw/s16 22 b))))
+          (dw/required "NODES" 28 lumps)
+      things
+        | dw/records[dw/thing] 10
+          (\ b (dw/thing (dw/s16 0 b) (dw/s16 2 b) (dw/u16 4 b) (dw/u16 6 b) (dw/u16 8 b)))
+          (dw/required "THINGS" 10 lumps)
+      start
+        % i=nat 0
+        ^ dw/thing
+        ? (eq i things.len) things.at(0)
+        ? (eq things.at(i).kind 1) things.at(i)
+        (_ i.inc)
+    | dw/level lumps textures sides sectors lines segs subs nodes things
+      (dw/required "PLAYPAL" 768 lumps).bytes (dw/required "COLORMAP" 8192 lumps).bytes start (dw/build_grid lines)
