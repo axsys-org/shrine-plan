@@ -2,6 +2,7 @@
 import copy,gzip,json,sys
 from runtime import GOO,BUILD
 from adapter import batch
+from text_contract import legacy_text_projection
 from gate_checks import oracle
 sys.path.insert(0,str(GOO/'scripts/porting'))
 from oracle_compare import first
@@ -44,7 +45,7 @@ def check_measurements():
         chunk=probes[start:start+15];requests=[dict(version=1,action='validate-measurement',result=r) for _,r in chunk]
         expected=oracle(requests);actual=batch(requests)
         for (name,request),want,got in zip(chunk,expected,actual):
-            mismatch=first(want,got) if want['ok'] and got['ok'] else None
+            mismatch=first(legacy_text_projection(want),legacy_text_projection(got)) if want['ok'] and got['ok'] else None
             if want['ok']!=got['ok'] or mismatch or (not got['ok'] and got.get('stage')!='protocol'):
                 (BUILD/'measurement-mismatch.json').write_text(json.dumps(dict(name=name,request=request,expected=want,actual=got,mismatch=mismatch),indent=2))
                 raise AssertionError((name,mismatch,want['ok'],got['ok']))

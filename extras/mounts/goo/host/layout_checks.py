@@ -3,6 +3,7 @@ import copy,gzip,hashlib,json,math,subprocess,sys
 from runtime import GOO,BUILD,verify
 from adapter import batch,codec_json
 from codec_checks import wire
+from text_contract import legacy_text_projection
 from gate_checks import oracle as semantic_oracle
 
 def require(value,message):
@@ -25,6 +26,7 @@ def difference(a,b,path='$'):
     elif type(a)==type(b) and a==b:return None
     return dict(path=path,expected=a,actual=b)
 def match(a,b,name):
+    a=legacy_text_projection(a);b=legacy_text_projection(b)
     d=difference(a,b)
     if d:
         (BUILD/'layout-mismatch.json').write_text(json.dumps(dict(name=name,mismatch=d,expected=a,actual=b),indent=2))

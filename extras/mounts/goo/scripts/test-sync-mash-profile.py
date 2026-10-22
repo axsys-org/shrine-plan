@@ -24,12 +24,47 @@ class ProfileIntegrityTests(unittest.TestCase):
         profile = SYNC.verify_bundle(self.bundle)
         self.assertEqual(SYNC.generate(profile), (SYNC.ROOT / "profile.foil").read_text())
 
+    def test_portable_paint_resolves_cascade_and_shapes(self):
+        profile = SYNC.verify_bundle(self.bundle)
+        rules = SYNC.paint_rules((self.bundle / "profile.css").read_text())
+        paint = lambda kind, **kw: SYNC.paint_recipe(profile, rules, kind, **kw)
+        destructive = paint("button", primary=True, destructive=True)
+        self.assertEqual(destructive["foreground"], "#9a4938")
+        self.assertEqual(destructive["background"], {"kind": "solid", "color": "#34573e"})
+        self.assertEqual(destructive["border"], {"width": 1, "color": "#ddbdac"})
+        self.assertEqual(paint("avatar")["corners"], {"kind": "ellipse"})
+        self.assertEqual(paint("text", role="avatar")["corners"], {"kind": "radius", "radius": 0})
+        self.assertEqual(paint("text", role="badge")["border"]["width"], 1)
+        self.assertEqual(paint("bar")["background"]["stops"][0]["offset"], .73)
+        self.assertEqual(paint("input", state="focus")["outline"]["width"], 3)
+
+    def test_portable_paint_rejects_unrepresented_profile_changes(self):
+        css = (self.bundle / "profile.css").read_text()
+        with self.assertRaisesRegex(ValueError, "paint section"):
+            SYNC.paint_rules(css.replace(SYNC.PAINT_MARKER, ""))
+        with self.assertRaisesRegex(ValueError, "properties"):
+            SYNC.paint_rules(css + "\n.goo-surface .goo-button {box-shadow: 0 0 2px red;}")
+        with self.assertRaisesRegex(ValueError, "selector"):
+            SYNC.paint_rules(css + "\n.goo-surface > .goo-button {color: #ffffff;}")
+        with self.assertRaisesRegex(ValueError, "state paint"):
+            SYNC.paint_rules(css + "\n.goo-surface .goo-button:focus-visible {background: #ffffff;}")
+        rules = SYNC.paint_rules(css.replace("#182c30", "CanvasText"))
+        with self.assertRaisesRegex(ValueError, "color"):
+            SYNC.paint_recipe(SYNC.verify_bundle(self.bundle), rules, "group")
+
     def test_changed_font_bytes_are_rejected(self):
         profile = json.loads((self.bundle / "profile.json").read_text())
         font = self.bundle / next(iter(profile["fonts"].values()))["file"]
         font.write_bytes(font.read_bytes() + b"changed")
         with self.assertRaisesRegex(ValueError, "failed verification"):
             SYNC.verify_bundle(self.bundle)
+
+    def test_codegen_does_not_drop_a_style_specific_field(self):
+        profile = SYNC.verify_bundle(self.bundle)
+        css = (self.bundle / "profile.css").read_text()
+        css += '\n.goo-surface .goo-button:not(.goo-text) {outline: 1px solid #ffffff;}'
+        with self.assertRaisesRegex(ValueError, "inconsistent fields"):
+            SYNC.generate_paint(profile, css)
 
     def test_resealed_asset_hash_cannot_hide_a_changed_profile_revision(self):
         profile_path = self.bundle / "profile.json"

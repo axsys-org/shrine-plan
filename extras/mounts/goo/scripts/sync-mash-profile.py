@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import pathlib
+import re
 import shutil
 import struct
 import subprocess
@@ -102,7 +103,165 @@ def quote(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def generate(profile):
+
+PAINT_MARKER = "/* Paint only. Typography, control padding and measured geometry are generated. */"
+
+
+def paint_rules(css):
+    """Bounded build-time lowering of the pinned profile, never a client CSS API.
+
+    Fail closed when Mash introduces a selector/property this lowering cannot
+    represent. Geometry continues to come from the verified JSON profile.
+    """
+    if css.count(PAINT_MARKER) != 1:
+        raise ValueError("portable paint requires the pinned paint section")
+    source = css.split(PAINT_MARKER, 1)[1]
+    rules = []
+    ignored = {"display", "grid-template-columns", "grid-template-rows", "place-items", "white-space", "cursor"}
+    supported = {"color", "background", "border-color", "border-radius", "overflow", "outline", "outline-offset"}
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", source):
+        properties = dict(part.strip().split(":", 1) for part in body.split(";") if part.strip())
+        properties = {k.strip(): v.strip() for k, v in properties.items()}
+        unknown = properties.keys() - supported - ignored
+        if unknown:
+            raise ValueError(f"unsupported portable paint properties: {sorted(unknown)}")
+        for selector in selectors.split(","):
+            selector = selector.strip()
+            if not re.fullmatch(r"\.goo-surface(?: \.goo-[a-z-]+(?::not\(\.goo-text\))?(?:\.[a-z-]+)?(?::focus-visible)?)?", selector):
+                raise ValueError(f"unsupported portable paint selector: {selector}")
+            if (":focus-visible" in selector or ".highlight" in selector) and properties.keys() - {"outline", "outline-offset"}:
+                raise ValueError(f"unsupported portable state paint: {selector}")
+            if properties.get("overflow", "visible") not in ("hidden", "visible"):
+                raise ValueError("unsupported portable overflow")
+            rules.append((selector, properties))
+    if re.sub(r"[^{}]+\{[^{}]*\}", "", source).strip():
+        raise ValueError("unsupported portable paint syntax")
+    return rules
+
+
+def paint_recipe(profile, rules, kind, role="", primary=False, destructive=False, state="normal"):
+    classes = {"goo-surface", "goo-node", "goo-" + kind}
+    if kind == "text":
+        classes.add("goo-" + role)
+    if primary: classes.add("primary")
+    if destructive: classes.add("destructive")
+    if state == "highlight": classes.add("highlight")
+    # Native HTML buttons have UA ButtonText, which prevents inherited surface
+    # color. Pin the existing light-profile baseline instead of delegating it to
+    # another toolkit's button defaults. Explicit primary/destructive rules win.
+    resolved = {"color": "#000000"} if kind == "button" else {}
+    applicable = []
+    for order, (selector, properties) in enumerate(rules):
+        if kind == "button" and selector == ".goo-surface": continue
+        if ":focus-visible" in selector and state != "focus": continue
+        if ":not(.goo-text)" in selector and kind == "text": continue
+        positive = selector.replace(":not(.goo-text)", "").replace(":focus-visible", "")
+        if set(re.findall(r"\.([a-z-]+)", positive)) <= classes:
+            applicable.append((selector.count(".") + selector.count(":focus-visible"), order, properties))
+    for _, _, properties in sorted(applicable): resolved.update(properties)
+    def color(value):
+        if not re.fullmatch(r"#[0-9a-f]{6}", value):
+            raise ValueError(f"unsupported portable color: {value}")
+        return value
+    background = resolved.get("background", "transparent")
+    if background == "transparent":
+        fill = {"kind": "none"}
+    elif background.startswith("#"):
+        fill = {"kind": "solid", "color": color(background)}
+    else:
+        match = re.fullmatch(r"linear-gradient\((138deg|to right), (#[0-9a-f]{6})( 73%)?, (#[0-9a-f]{6})( 73%)?\)", background)
+        if not match: raise ValueError(f"unsupported portable background: {background}")
+        angle, first, stop1, last, stop2 = match.groups()
+        fill = {"kind": "linear-gradient", "angleDegrees": 90 if angle == "to right" else 138,
+                "stops": [{"offset": .73 if stop1 else 0, "color": first}, {"offset": .73 if stop2 else 1, "color": last}]}
+    radius = resolved.get("border-radius", "0px")
+    if radius == "50%": corners = {"kind": "ellipse"}
+    elif re.fullmatch(r"[0-9]+px", radius): corners = {"kind": "radius", "radius": int(radius[:-2])}
+    else: raise ValueError(f"unsupported portable radius: {radius}")
+    border = kind in ("input", "button", "code") or (kind == "text" and role == "badge")
+    recipe = {"version": 1, "units": "css-px", "colorSpace": "srgb", "foreground": color(resolved["color"]),
+              "background": fill, "border": {"width": profile["geometry"]["controlBorder"] if border else 0,
+              "color": color(resolved.get("border-color", resolved["color"]))}, "corners": corners,
+              "clip": resolved.get("overflow") == "hidden"}
+    if "outline" in resolved:
+        match = re.fullmatch(r"([0-9]+)px solid (#[0-9a-f]{6})", resolved["outline"])
+        offset = resolved.get("outline-offset", "0px")
+        if not match or not re.fullmatch(r"[0-9]+px", offset): raise ValueError("unsupported portable outline")
+        recipe["outline"] = {"width": int(match[1]), "color": match[2], "offset": int(offset[:-2])}
+    return recipe
+
+
+def foil_json(value):
+    if isinstance(value, dict): return "(json/obj [" + " ".join(f"(jkv {quote(k)} {foil_json(v)})" for k, v in value.items()) + "])"
+    if isinstance(value, list): return "(json/arr [" + " ".join(map(foil_json, value)) + "])"
+    if isinstance(value, bool): return "(json/boo ." + ("true" if value else "false") + ")"
+    if isinstance(value, str): return "(json/str " + quote(value) + ")"
+    if isinstance(value, int): return f"(json/num .{'true' if value < 0 else 'false'} {abs(value)})"
+    return "(json/real " + quote(canonical(value)) + ")"
+
+
+def paint_cases(profile, css):
+    """Ordered cascade cases, including the final fallback, with resolved states."""
+    rules = paint_rules(css)
+    cases = []
+    for primary, destructive in ((True, True), (True, False), (False, True), (False, False)):
+        condition = '(eq kind "button")'
+        if primary: condition = f"(and {condition} primary)"
+        if destructive: condition = f"(and {condition} destructive)"
+        cases.append((condition, "button", "", primary, destructive))
+    for role in profile["textStyles"]["roles"]:
+        cases.append((f'(and (eq kind "text") (eq role {quote(role)}))', "text", role, False, False))
+    for kind in ("input", "code", "avatar", "presence", "media", "bar"):
+        cases.append((f'(eq kind {quote(kind)})', kind, "", False, False))
+    cases.append((None, "group", "", False, False))
+    resolved = []
+    for condition, kind, role, primary, destructive in cases:
+        recipe = paint_recipe(profile, rules, kind, role, primary, destructive)
+        recipe["states"] = {}
+        for state in ("highlight", "focus"):
+            appearance = paint_recipe(profile, rules, kind, role, primary, destructive, state)
+            if "outline" in appearance:
+                recipe["states"][state] = appearance["outline"]
+        resolved.append((condition, recipe))
+    return resolved
+
+
+def generate_paint(profile, css):
+    # A full JSON constructor per case made the Foil module dispatcher expensive
+    # to compile on the first render. Select data, then build the envelope once.
+    # Share nested values locally too (especially focus/highlight and corners).
+    cases = paint_cases(profile, css)
+    fallback = cases[-1][1]
+    if any(list(recipe) != list(fallback) for _, recipe in cases):
+        raise ValueError("portable paint recipes have inconsistent fields")
+    varying = [key for key in fallback if any(recipe[key] != fallback[key] for _, recipe in cases)]
+    shared = {}
+
+    def selected(recipe):
+        fields = []
+        for key in varying:
+            value = recipe[key]
+            encoded = foil_json(value)
+            if isinstance(value, (dict, list)):
+                if encoded not in shared:
+                    shared[encoded] = f"paint_{len(shared)}"
+                fields.append(shared[encoded])
+            else:
+                fields.append(encoded)
+        return "[" + " ".join(fields) + "]"
+
+    choices = ["        " + (f"? {condition} " if condition else "") + selected(recipe)
+               for condition, recipe in cases]
+    fields = [f'(jkv {quote(key)} ' +
+              (f"selected.at({varying.index(key)})" if key in varying else foil_json(value)) + ")"
+              for key, value in fallback.items()]
+    return (["  + paint_style", "    \\ kind=str role=str primary=bool destructive=bool", "    ^ json"] +
+            ["    = " + name + " " + encoded for encoded, name in shared.items()] +
+            ["    = selected=row[json]"] + choices +
+            ["    | json/obj [" + " ".join(fields) + "]"])
+
+
+def generate(profile, css=None):
     out = ["- goo_app/fonts", "", "' Generated by scripts/sync-mash-profile.py from the verified Mash bundle.", "+ goo_profile"]
 
     def constant(name, kind, value):
@@ -150,6 +309,7 @@ def generate(profile):
         constant(name, "goo/scalar", scalar(value))
     constant("tab_text", "str", quote(" " * profile["text"]["tabSpaces"]))
     constant("error_prefix", "str", quote(profile["text"]["errorPrefix"]))
+    out.extend(generate_paint(profile, css if css is not None else (VENDOR / "profile.css").read_text()))
     return "\n".join(out) + "\n"
 
 

@@ -286,7 +286,7 @@ responsibilities. This does not add query-backed or paginated sources.
 A mount constructs a `goo_workspace/endpoint` with:
 
 - `declaration`: the absolute published workspace declaration path;
-- `source_slot`: the path-typed slot used to construct its transient receiver;
+- `source_slot`: the path-typed slot stored in its workspace context record;
 - `initial`: the subject path when the request has no `path` query parameter;
 - `validate(selected)`: optional source-policy diagnostic;
 - `operations`: pairs of local capability key and mount source path for rescan;
@@ -299,7 +299,7 @@ Endpoints dispatch by declaration, so hosts can chain handlers for different
 workspace declarations. The configuration is fixed by the mount: URL parameters
 select the subject, not the declaration or receiver slot.
 
-A hosted workspace's synthetic receiver is for presentation and host controls.
+A hosted workspace's stored context receiver is for presentation and host controls.
 It cannot dispatch domain invocations from its native fragments: `/goo/render`
 rejects those controls explicitly. Put domain actions in member or follower
 presentations, whose displayed receiver and action receiver are the same real
@@ -309,7 +309,10 @@ The host captures the subject subtree and the local cached view catalog, checks
 the configured declaration and receiver contract, binds source fields, and emits
 the shared pane markup. `document` receives either the server-rendered workspace container
 or a diagnostic. Load the shared Goo scripts and attach `GooPanes` to `#workspace`
-using its `data-target`, `data-view` and `data-workspace`. Live refresh obtains a
+using its `data-target`, `data-view` and `data-workspace`. The target is an allocated
+`/{self}/goo/ses/{numeric-id}` context record, not the browsing source. The record
+retains the configured `source_slot`; a new page entry allocates a new context.
+Live refresh obtains a
 new description and snapshot through `/goo/render`. Source limits and document chrome
 remain host policy; the generic endpoint imposes no inspector-specific 64-child
 limit. Child summaries are rendered by the shared host from the list's source and slot. Only record-bearing children are advertised; `browse` adds ordinary workspace navigation for each member.
@@ -517,3 +520,10 @@ Run `scripts/check-inspection-browser.mjs BASE MASH OUTPUT` against an Eden with
 `goo-inspector`, `tree-pages`, and `panes`. It checks real captures, unchanged
 namespace and selection, stale responses, inspection of the inspector, and native
 input/caret/composition preservation in Chromium, Firefox and WebKit.
+
+## Portable renderer descriptors
+
+Live results also expose ordinary paint/semantics, complete control bindings,
+portable patch occurrence content, and installed workspace host capabilities.
+See the [version-1 descriptor contract](../goo/PORTABLE.md) for exact fields,
+compatibility, admission boundaries, and renderer responsibilities.
