@@ -386,5 +386,42 @@ font hashes, paint bounds, and link-target consistency before mounting. Link
 semantics are descriptive and supply no action route. The egui implementation
 paints the highlight and exposes its target on hover; click navigation is not
 implemented. HTML uses non-navigating spans with the same resolved styling.
-Native editing remains plain text; styled input values fail explicitly. Unicode
-shaping and arbitrary downloaded/namespace font resolution remain unsupported.
+Display v2 editing remains plain text; styled input requires the v3 contract
+below. Unicode shaping and arbitrary downloaded/namespace font resolution remain
+unsupported.
+
+## Rich-text editing (display v3)
+
+A prepared input may supply `editing` with `version:1`, `encoding:"goo-text-v1"`,
+`maxBytes:65536`, `styles:[{myth,resolved}]`, and `linkStyle`. Its `textRuns` is the
+initial structured value, `semantics.value` is its plain projection, and
+`semantics.multiline` is true. `lines` remains empty: editing, selection, caret,
+scrolling and IME use the platform editor. The supplied input box is fixed by
+Reaver. Styling options contain resolved pinned font/paint recipes; consumers
+must not invent font choices or a parallel palette. Match a run's metadata to
+an option after removing `/sys/link` and canonicalizing modifier order (an empty
+modifier list is equivalent to no modifier slot). Use `linkStyle`'s foreground
+and highlight for linked editing text; its placeholder target is descriptive
+and grants no action authority.
+
+Display v3 is required even for an empty rich value. Older native clients must
+reject it rather than flatten it into a plain input. Browser output explicitly
+diagnoses the unavailable editor; it does not expose a plain input pretending to
+edit structured runs. Ordinary plain inputs and v1/v2 displays are unchanged.
+
+The action input is a serialized Goo run array in the existing `input:<slot>`
+form field. The declaration must use a typed action argument decoder; the mount's
+`goo_edit/decode` accepts that JSON string or an existing `goo/text/pail`, checks
+its shape, metadata, pinned fonts and ASCII repertoire, and returns a typed pail.
+It never resolves code or dispatches from metadata. JSON strings are not
+automatically promoted by `.poke`: use a declared typed action. Freeze the wire
+string alongside the usual receiver, declaration, versions and invocation ID.
+A retry must reuse the exact original body. Preserve edits made after activation.
+
+Rich/plain encoding changes and removed formatting support are incompatible
+re-preparations: retain dirty owners and stage the change behind the existing
+loss-of-work guard. Compatible refresh/resize must retain run metadata, caret,
+composition, selection, typing style, undo history and pending invocations.
+Current scope is English/ASCII, bundled fonts, inline modifiers and links;
+clipboard interchange is plain text. No browser/HTML rich editor or UIKit rich
+editor is included.
