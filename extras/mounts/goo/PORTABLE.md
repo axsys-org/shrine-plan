@@ -5,6 +5,43 @@ and Explorer render contracts. Existing HTML, display version 1, publication
 routes, and action admission remain supported. UIKit adoption is separate from
 this server contract; a client does not gain support merely by decoding a field.
 
+## Protobuf response transport, wire version 2
+
+The Explorer mount accepts `wire=protobuf-v2` in queries/forms. It returns
+`application/x-protobuf` using the named domain messages in
+[protocol/goo.proto](protocol/goo.proto). Omission retains legacy JSON. Duplicate,
+unknown, and the rejected generic-v1 selector return HTTP 415 before admission.
+Transport versions are independent of display/profile versions.
+
+The response oneof carries presentations, layout bundles, source pages,
+snapshots, operation receipts, or failures. Geometry is finite binary64. Text,
+paint, semantics, bindings and branded run myths have dedicated fields and
+messages. The ordinary preparation encoder reads actual typed preparation
+objects and scalar bits, without a JSON display or HTML intermediate. BAT
+chunks share storage and flatten once at the HTTP boundary. Some existing
+server domain APIs (paint tables, binding descriptors, pane/tree descriptions)
+still require typed adapters; their arbitrary JSON shape is not the protocol.
+
+Supported response families are `/goo/render` ordinary/native/pane views and
+layout bundles, `/goo/source`, `/goo/status`, `/goo/operation-status`, `/goo/act`
+and `/goo/edit-value`. Pipeline captures, patch packets, inspection captures and
+catalogs retain JSON pending their own domain schemas. Binary pipeline, patch
+and inspection requests fail explicitly. Workspace bootstrap uses JSON because
+it may contain patch packets. See [protocol/README.md](protocol/README.md) for
+implementation boundaries and regeneration instructions.
+
+Requests remain URL-encoded. Freeze the selector with the original invocation;
+retry exactly the same ID/body. A malformed successful action reply remains an
+unknown outcome. Persisted receipt representation and action admission are
+unchanged. Descriptive metadata and skipped unknown fields grant no authority.
+
+The egui decoder bounds responses to 8 MiB, nesting to 64 levels, and total
+messages/fields to 250,000. It rejects duplicate singular fields/oneof cases,
+missing required fields, malformed wire types, invalid UTF-8, overflowing
+integers and nonfinite geometry. Models still validate profile/font identity,
+context, node IDs and binding joins before mounting. Ordinary models deserialize
+directly; diagnostic JSON is projected on demand from retained protobuf bytes.
+
 ## Ordinary paint and meaning
 
 Every `display.nodes[]` entry now has `paint` and `semantics`. Both have

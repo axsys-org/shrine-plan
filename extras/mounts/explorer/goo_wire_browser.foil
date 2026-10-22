@@ -1,0 +1,95 @@
+- goo_browser
+- goo_app/wire_prepared
+
++ goo_wire_browser
+  + json_only
+    \ value=json
+    ^ bool
+    ? value
+     > (json/arr items) items.any(goo_wire_browser/json_only)
+     > (json/obj fields)
+      ? (equal (goo_wire/field "kind" value) (json/str "patch")) .true
+      | fields.any((\ entry (goo_wire_browser/json_only entry.v)))
+    .false
+  + fallback
+    \ context=goo_bridge/render_context target=path view=path slot=path role=path workspace=path route=maybe[row[nat]] state=namespace
+    ^ either[str goo_wire/presentation]
+    < value (goo_browser/render_result context target view slot role workspace route state)
+    ? (goo_wire_browser/json_only value) (./err "Goo JSON-only contract")
+    ?> (./some value) (goo_wire/presentation_from_json value) (./err "Unsupported Goo presentation contract")
+    | ./ok value
+  + render
+    \ context=goo_bridge/render_context target=path view=path slot=path role=path workspace=path route=maybe[row[nat]] state=namespace
+    ^ either[str goo_wire/presentation]
+    < card (goo_browser/render_card target workspace state)
+    ? (and (gt workspace.len 0) !(equal view workspace)) (./err "Workspace render requires its installed declaration.")
+    ? ((goo_documentation/handles slot) || (goo_documentation/handles view) || (equal slot goo_reflection/slot) || (equal view goo_reflection/slot) || (equal view goo_browser/views_slot) || (equal view goo_browser/panes_slot) || (equal view goo_browser/face_slot))
+      | goo_wire_browser/fallback context target view slot role workspace route state
+    = selected=either[str goo/published]
+        ? (gt view.len 0)
+          ?> (./some record) (goo_runtime/record .x view state) (./err "View no longer exists.")
+          | goo_runtime/published record
+        ? (maybe/is_some route) (./err "Native node render requires an explicit view.")
+        = catalog (goo_browser/catalog (sovereign_care .z [state.self 'gov] state))
+          matches (catalog.keep((\ published (and published.view.ports.is_nil (goo_browser/matches card published)))))
+          matches (? (gt slot.len 0) (matches.keep((\ published (equal published.view.slot slot)))) matches)
+          matches (? (gt role.len 0) (matches.keep((\ published (equal published.view.role role)))) matches)
+          matches (matches.keep((\ published !(published.view.is_pane))))
+        ? !(eq matches.len 1) (./err "View selection is unavailable or ambiguous.")
+        | ./ok matches.head
+    < published selected
+    = published (goo_bridge/receiver target published)
+    < declaration (goo_runtime/matching_view published card)
+    ? (and (maybe/is_none route) (published.view.is_pane || declaration.children.any(goo_panes/contains)))
+      | goo_wire_browser/fallback context target view slot role workspace route state
+    = selected=either[str [goo/view row[json]]]
+        ? route
+         > (./some path)
+          < bound (goo_runtime/bind_sources published card declaration.children)
+          ?> (./some found) (goo_runtime/locate bound path (goo_runtime/scope .none .none .nil .none .none)) (./err "Native node is unavailable.")
+          = [node scope] found
+          ? (goo_panes/contains node) (./err "Requested node is a host container, not a native surface.")
+          | ./ok [declaration.set_children((list/one node)) (goo_panes/controls published card node path)]
+        | ./ok [declaration (goo_bridge/controls published card declaration.children [] 1)]
+    < selected selected
+    = [declaration controls] selected
+    < compiled (goo_bridge/compile context published card declaration)
+    ?> (./some display) (goo_wire/prepared compiled.prepared) (./err "Invalid prepared Goo object")
+    = controls (goo_bridge/control_bindings controls display.nodes.map(goo_wire/node/id))
+    ? (and (gt workspace.len 0) (controls.any((\ control (equal (goo_wire/field "invoke" control) (json/boo .true))))))
+      | ./err "Workspace domain actions require a member or follower presentation."
+    ?> (./some bindings) (controls.stream.traverse_maybe(goo_wire/control_from_json)) (./err "Invalid control binding")
+    = query (goo_runtime/request "status" target target (? view.len view []) [] 0 0 0 [] 0)
+    ?> (./some snapshot) (goo_wire/snapshot_from_json (goo_runtime/status_value query state)) (./err "Invalid publication snapshot")
+    = snapshot (? view.len snapshot snapshot.set_recipe_publication((./some (nat/show (state.case(.x published.view.name)).fall(0)))))
+      host (goo_wire/host_from_json (goo_browser/host_descriptor workspace state))
+    | ./ok (goo_wire/presentation 1 .true display.profile display.context (./some snapshot)
+        (./some (path_show published.view.name)) (? (maybe/is_some route) "native" "view") (./some display)
+        bindings.row .none host (./some (path_show published.view.slot)) (./some (path_show published.view.role))
+        (./some (goo_wire/origin published.view.span.line published.view.span.column))
+        .none (goo_wire/map_optional[row[nat] str] (\ route (str/join "." route.map(nat/show))) route) .none)
+  + result
+    \ layouts=bool context=goo_bridge/render_context target=path view=path slot=path role=path workspace=path route=maybe[row[nat]] state=namespace
+    ^ [nat any nat]
+    = result=either[str any]
+        ? !layouts
+          < presentation (goo_wire_browser/render context target view slot role workspace route state)
+          | ./ok (wire_proto/envelope 2 (goo_wire/presentation_bytes presentation))
+        = variants=either[str row[goo_wire/layout]]
+            % rest=row[[str nat]] [["sm" 240] ["md" 480] ["lg" 720]] out=row[goo_wire/layout] []
+            ^ either[str row[goo_wire/layout]]
+            ? (eq rest.len 0) (./ok out)
+            = [size pixels] rest.at(0)
+              width (goo_fp/integer pixels)
+              width (? (and (eq size "sm") (goo_fp/lte context.width width)) context.width width)
+            < presentation (goo_wire_browser/render context.set_width(width) target view slot role workspace route state)
+            | _ rest.drop(1) out.snoc((goo_wire/layout size presentation))
+        < variants variants
+        | ./ok (wire_proto/envelope 3 (goo_wire/layout_bundle_bytes (goo_wire/layout_bundle 1 .true "pane-v1"
+            (goo_wire/context context.width.bits context.scale.bits (? context.rtl "rtl" "ltr")) variants)))
+    ? result
+     > (./ok bytes) [200 bytes "application/x-protobuf"]
+     > (./err why)
+      ? (eq why "Goo JSON-only contract")
+        [415 (wire_proto/envelope 7 (bat_cat (wire_proto/text 1 why) (wire_proto/text 4 "json-contract"))) "application/x-protobuf"]
+      [409 (wire_proto/failure why) "application/x-protobuf"]
