@@ -13,6 +13,12 @@ present}`:
 path      /user/org/deals      a record, a folder, /x/<cell> (a cell's answer), /c/x/<cell> (its context), /h/... (pinned)
 care      x | y | z            x the record, y the record and its children (default), z the whole subtree
 case      0                    0 live (default), or a case to read as of then
+find      acme                 the records under path whose name or any slot's text contains it, in tap order,
+                               limit of them visited at a time, each with the slot that matched; next continues
+referencing  /user/org/deals  the records under path whose reference slots point at that path or beneath it, in tap
+                               order, limit visited at a time: each with the slot, the target, cell (it is a cell) and hole
+                               (a cell waiting there: the target absent, an ask unanswered, a hole, a fault); next continues;
+                               plus watchers, the reactive records whose crews depend on it, from the kernel's crew index
 formula   where                run a standard cell over the tree read, settings as its context; nothing written
 settings  {key: "/status", value: "closed"}
 limit     100                  nodes per answer, in tap order (a node, then its children by name); never over 500
@@ -93,11 +99,56 @@ case}}`. A commit never waits on a stream; a stream that stalls is dropped.
 whenever the stream is not there, yielding the same lines either way; the
 ask hand runs on that.
 
+## Write only if unchanged
+
+A record in a write may carry `if_case`, the x case the writer read
+(`read` answers it in `reference`, `/h/x/<case>/...`). The precondition
+rides into the kernel with the writ and is judged in the same commit:
+the batch is admitted only while every such record is still at that
+case, else it is refused whole, nothing written, and `reason` names the
+record and the case it is at now (`if_case: /0x11/user/org/d1 is at
+case 4, not 3; nothing was written`). Two agents on one record cannot
+lose each other's work: read, write with the case, and on a refusal
+read again.
+
+## Hands
+
+A hand is a process beside the world (`extras/mounts/mcp/hands`, with
+`hands.md` there). A world runs the hands its `world.json` names, and no
+others; the launcher's `Eden:` line lists them. Config is a record at
+`/agent/hands/<name>`, changed with a write; where a hand left off is
+`/agent/hands/<name>/seen`.
+
+| hand | what runs | how to tell it is not running |
+|---|---|---|
+| `clock` | writes `/clock {day, timezone}` once a day | `/clock` is behind |
+| `watch` | posts to a URL when a watched cell's answer changes (`cells`, `url`) | the value at `/agent/hands/watch/<cell>` is stale |
+| `export` | a request record under `/agent/hands/export/` `{folder, format, path}` becomes a file | the request has no `done` |
+| `import` | `/agent/hands/import/<source>` `{kind, source, folder, key, every}` plus `/map` and `/refs/<slot>`; writes `who: import:<source>` | `ran` on the config does not move |
+| `ask` | answers `ask` cells with a model | `/c/x/<cell>` keeps saying asking |
+
+A line from a hand, or one whose touched paths all sit under `/agent/hands`,
+never makes another hand write: an agent reading history can filter them
+out the same way (`who` is the hand's name).
+
 ## Apply
 
 ```
 apply    path, operation, inputs, then [a read, ...]     an op a record carries; cells never need it
 ```
+
+## Values
+
+A slot value is text, a number or a boolean. A number
+may be negative or a decimal: `-3` is kept signed, `4.5` is kept as `45`
+with `rating/scale: 1` and reads back as `4.5`; formulas add, compare and
+rank by the signed value. `{type, value}` makes an exact `nat`, `int`,
+`str`, `bool` or `path`; a reference
+to another record is `{type: reference, path, care, case}` (care x, y or z,
+case 0 for live). A path segment is letters, digits and underscore: `c-7`
+is `c_7`, keep the original as a slot. An answer is at most 500 nodes;
+`next` continues it. A value that is code or over 8 KB comes back as
+`{type, size, reference}`, never inline.
 
 ## Numbers in slots
 
@@ -150,10 +201,36 @@ Three conventions hold in every formula:
 - A child's name is addressable as a slot called `name` in any setting
   (`where key=/name value=beta`, `select slots=/name`, `by key=/name`,
   `lookup key=/name`); a record that carries its own `/name` slot wins.
-- A formula sees only its inputs. It cannot follow a reference held in a
-  slot: a `reference` value is data to it, nothing more. To bring in another
-  record, make it a secondary input and use `lookup` against that named
-  view; that is the join.
+- A formula sees only its inputs. A reference held in a row's slot is data
+  to it until a secondary input holds the folder it points into: then
+  `follow` brings the referenced record onto the row (the native join, at
+  that input's case), and `lookup` is for matching keys when the data has
+  no references yet (`reference` makes them once).
+
+Two worked examples of composition. A chain: cell b reads cell a's answer
+live, and carries its own settings:
+
+```
+write /user/org/views/closed     sys/weft {type: reference, value: <reference of /weft/stdlib/where>}
+                                 sys/tack {type: reference, path: /0x11/user/org/deals, care: y, case: 0}
+                                 key /status   value closed
+write /user/org/views/revenue    sys/weft {type: reference, value: <reference of /weft/stdlib/sum>}
+                                 sys/tack {type: reference, path: /x/0x11/user/org/views/closed, care: y, case: 0}
+                                 slot /amount   into /revenue
+read /x/user/org/views/revenue   ->  /revenue: 75, live: a deal closing moves it
+```
+
+A secondary input: any other slot holding a reference is a view the formula
+reaches by that slot's name:
+
+```
+write /user/org/views/priced     sys/weft {type: reference, value: <reference of /weft/stdlib/lookup>}
+                                 sys/tack {type: reference, path: /0x11/user/org/items, care: y, case: 0}
+                                 table {type: reference, path: /0x11/user/org/prices, care: y, case: 0}
+                                 key /sku   take /price
+read /x/user/org/views/priced    ->  each item row gains /price from the price row with the same /sku
+                                     (gather with the same slot nests the view whole under /table instead)
+```
 
 Read `/x/<cell path>` for the result and `/c/x/<cell path>` for its context:
 the parameters it ran with, `/sys/view/missing` when a parameter was absent

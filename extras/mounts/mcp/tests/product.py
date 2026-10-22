@@ -491,6 +491,62 @@ def check(base, node, timeout):
     # line was capped at a hundred records, 4.0 s (6.6 ms a record) before; the rest is the per-byte layer, Liam's weld
     expect('31 six hundred records in one event land under 3.5 s, the 2.8 s measured plus margin (took %.0f ms)' % wide_ms, wide_ms < 3500, True)
 
+    # 32. write only if unchanged: two writers read one record, both write with the case they read; the second is refused and told why
+    shared = org + '/shared/s1'
+    tool('write', 'write', records=[{'path': shared, 'slots': {'n': 1}}])
+    seen_case = int(read(shared, 'x')['reference'].split('/')[3])
+    first = tool('write', 'write (if_case)', records=[{'path': shared, 'slots': {'n': 2}, 'if_case': seen_case}], who='writer1')
+    second = refused('write', records=[{'path': shared, 'slots': {'n': 3}, 'if_case': seen_case}], who='writer2')
+    now_case = int(read(shared, 'x')['reference'].split('/')[3])
+    expect('32 the first writer, at the case it read, is admitted', (first['refused'], now_case), (False, seen_case + 1))
+    expect('32 the second writer, at the stale case, is refused whole and told the record and the case it is at',
+           (second.get('refused'), second.get('reason')), (True, 'if_case: %s is at case %d, not %d; nothing was written' % (shared, now_case, seen_case)))
+    expect('32 the stale write wrote nothing', read(shared, 'x')['properties'].get('/n'), '2')
+    both = refused('write', records=[{'path': shared, 'slots': {'n': 4}, 'if_case': now_case}, {'path': org + '/shared/s2', 'slots': {'n': 9}, 'if_case': 1}], who='writer2')
+    expect('32 a batch is admitted only if every carried case still holds: one stale record refuses it all',
+           (both.get('refused'), read(shared, 'x')['properties'].get('/n'), read(org + '/shared/s2', 'x')['exists']), (True, '2', False))
+
+    # 33. find: a bounded walk like a read, for a text in a name or a slot, across folders; zero events; next continues
+    def find_all(path, text, limit=500):
+        matches, cursor, pages = [], None, 0
+        while True:
+            page = tool('read', 'read (find)', path=path, find=text, limit=limit, **({'next': cursor} if cursor else {}))
+            matches += page['matches']
+            pages += 1
+            cursor = page.get('next')
+            if not cursor:
+                return matches, pages
+    e0 = epoch()
+    found, pages = find_all(org, 'acme')
+    hits = {(m['path'].replace(org, ''), m['slot']) for m in found}
+    expect('33 find answers the records under the path whose name or slot holds the text, with the slot that matched, across folders, zero events',
+           ({('/customers/c1', '/name'), ('/sales/deals/d101', '/customer'), ('/sales/deals/d103', '/customer')} <= hits,
+            all('acme' in m['value'] for m in found), ('/sales/deals/d102', '/customer') in hits, epoch() - e0), (True, True, False, 0))
+    page = tool('read', 'read (find)', path=org, find='acme', limit=12)
+    expect('33 find is bounded: limit nodes visited per answer, next continues it (the org holds the six hundred wide-batch records too)',
+           (page['visited'], page['next'] is not None, pages > 1), (12, True, True))
+    expect('33 a text in a record name is found too', [m['slot'] for m in find_all(org, 'd102')[0]], ['name'])
+
+    # 35. referencing: what points at a thing, walked under a folder; a waiting cell is marked; the kernel's crews ride along
+    rt = org + '/reftest'
+    e0 = epoch()
+    tool('write', 'write (reftest)', who='tester', records=[
+        {'path': rt, 'slots': {'title': 'reference test'}},
+        {'path': rt + '/things/t1', 'slots': {'n': 1}},
+        {'path': rt + '/cites/c1', 'slots': {'about': live(rt + '/things/t1', 'x'), 'text': 'cites t1'}},
+        {'path': rt + '/views/count', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': live(rt + '/things')}},
+        {'path': rt + '/views/missing', 'slots': {'sys/weft': stdlib['count'], 'sys/tack': live(rt + '/nothing')}}])
+    got = tool('read', 'read (referencing)', path=rt, referencing=rt + '/things')
+    expect('35 referencing lists the cell over the folder and the row citing a thing beneath it, with slot, cell and no hole; zero events',
+           (sorted((m['path'], m['slot'], m['cell'], m['hole']) for m in got['matches']), got['referencing'], got['next'], epoch() - e0 - 1),
+           (sorted([(rt + '/views/count', '/sys/tack', True, False), (rt + '/cites/c1', '/about', False, False)]), rt + '/things', None, 0))
+    gone = tool('read', 'read (referencing)', path=rt, referencing=rt + '/nothing')
+    expect('35 a thing nobody wrote is still referenced, by a cell waiting on it', [(m['path'], m['hole']) for m in gone['matches']], [(rt + '/views/missing', True)])
+    nobody = tool('read', 'read (referencing)', path=rt, referencing=rt + '/cites')
+    expect('35 a thing nothing points at answers no matches', nobody['matches'], [])
+    page = tool('read', 'read (referencing)', path=rt, referencing=rt + '/things', limit=2)
+    expect('35 the walk is bounded by limit and continues with next', (page['visited'], page['next'] is not None), (2, True))
+
     # 16. the table
     floor = {'read': 5.0, 'write': 12.0}
     rows = []

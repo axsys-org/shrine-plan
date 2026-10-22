@@ -42,6 +42,25 @@ test('slotLayout picks the figure, the grid, the list, and wraps long text', () 
   assert.match(slotLayout({held: '-> /x/studio/views/closed @ 4', amount: 5}), /data-path="studio\/views\/closed"/);
 });
 
+// ---- the chain under a cell's card
+test('chainHTML walks a cell upward by its tack, one line per stage, and stops at the data', () => {
+  const cells = new Map([
+    ['org/views/revenue', {path: 'org/views/revenue', formula: 'sum', settings: 'slot /amount into /revenue', inputs: [{path: '/x/org/views/closed', pin: null}]}],
+    ['org/views/closed', {path: 'org/views/closed', formula: 'where', settings: 'key /status value closed', inputs: [{path: 'org/deals', pin: null}]}],
+    ['org/views/priced', {path: 'org/views/priced', formula: 'lookup', settings: 'key /sku', inputs: [{path: 'org/items', pin: 4}, {path: 'org/prices', pin: null, view: true}]}],
+  ]);
+  const html = live.chainHTML({_cells: cells}, 'org/views/revenue');
+  const stages = html.split('<div class="sv-stage">').slice(1);
+  assert.equal(stages.length, 2, 'two stages: sum over closed, where over deals');
+  assert.match(stages[0], /class="f">sum<.*slot \/amount into \/revenue.*over.*data-go="org\/views\/closed".*>closed</s);
+  assert.match(stages[1], /class="f">where<.*data-go="org\/deals".*>org\/deals</s);
+  const pinned = live.chainHTML({_cells: cells}, 'org/views/priced');
+  assert.match(pinned, /held at 4/); assert.match(pinned, /class="o">\+ .*data-go="org\/prices"/);
+  assert.equal(live.chainHTML({_cells: cells}, 'org/deals'), '', 'a record that is not a cell has no chain');
+  const loop = new Map([['a', {path: 'a', formula: 'pick', settings: '', inputs: [{path: '/x/b'}]}], ['b', {path: 'b', formula: 'pick', settings: '', inputs: [{path: '/x/a'}]}]]);
+  assert.equal(live.chainHTML({_cells: loop}, 'a').split('sv-stage').length - 1, 2, 'a cycle ends the walk');
+});
+
 // ---- the record card
 const fakeSource = (answers, asked = new Map(), cells = new Map()) => ({async answer(p) { return answers[p]; }, _asked: asked, _cells: cells});
 test('recordHTML on a cell shows the answer and folds made of', async () => {
@@ -50,13 +69,19 @@ test('recordHTML on a cell shows the answer and folds made of', async () => {
   const html = await recordHTML(source, {path: 'studio/views/payroll', record: cell, kids: [], case: 3}, false, new Set());
   assert.match(html, /<div class="sv-rec " data-path="studio\/views\/payroll" data-case="3">/);
   assert.match(html, /class="sv-one">395<span class="u">total/);
-  assert.match(html, /<details class="sv-made"><summary>made of<\/summary>/);
-  assert.ok(html.indexOf('sv-one') < html.indexOf('sv-made'), 'the answer comes before made of');
-  assert.match(html, /sv-made.*sum.*studio\/people/s);
+  assert.match(html, /<details class="sv-made"><summary>sum over studio\/people<\/summary>/);
+  assert.ok(html.indexOf('sv-one') < html.indexOf('sv-made'), 'the answer comes before the formula');
+  assert.match(html, /sv-made.*sv-k">slot<.*salary/s, 'the fold holds the settings, not the formula again');
+  assert.doesNotMatch(html, /sv-from/, 'no formula line above the result');
   const faulted = await recordHTML(fakeSource({c: {bad: 'cycle through c'}}), {path: 'c', record: cell, kids: []}, false, new Set());
   assert.match(faulted, /<div class="sv-note bad">cycle through c<\/div>/);
   const gone = await recordHTML(fakeSource({}), {path: 'd', record: null, kids: []}, true, new Set());
   assert.match(gone, /<div class="sv-gone">deleted<\/div>/); assert.match(gone, /<span class="p">d<\/span>/);
+});
+test('a row never shows its scale slots', async () => {
+  const r = {path: 'a', record: {title: 'a'}, kids: [{name: 'r1', path: 'a/r1', slots: {count: 10, scale: 0, value: 'x', 'amount/scale': 2}, kids: []}]};
+  const html = await recordHTML(fakeSource({}), r, false, new Set());
+  assert.match(html, /class="k">count</); assert.match(html, /class="k">value</); assert.doesNotMatch(html, /scale/);
 });
 test('recordHTML draws children as rows, nested, folded past three levels, and bumps the touched', async () => {
   const deep = {name: 'l3', path: 'a/l1/l2/l3', slots: {n: 3}, kids: [{name: 'l4', path: 'a/l1/l2/l3/l4', slots: {n: 4}, kids: []}]};
@@ -258,7 +283,7 @@ test('who= filters the poll and the stream; who=all shows system events', async 
   const timers = {setInterval: () => 1, clearInterval: () => {}, setTimeout: () => {}};
   mcpSource({fetch: m.fetch, EventSource: null, who: 'tester', ...timers}).follow(() => {});
   await new Promise(r => setImmediate(r));
-  assert.deepEqual(seenArgs[0], {before: 0, limit: 40, who: 'tester'});
+  assert.deepEqual(seenArgs[0], {before: 0, limit: 40, with: 'x', who: 'tester'});
   // the stream: a fake EventSource handing lines straight to the page
   let es; const log = [];
   class ES { constructor(url) { this.url = url; es = this; } close() {} }
@@ -316,4 +341,115 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   await s2.handler(person(5, true)); await s2.handler(qaWrite(7, false));
   assert.match(el2.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'on the QA folder the QA write is drawn');
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
+});
+
+// ---- clickable paths and the person's cursor
+test('a record path in an action links to its folder and a reference links to itself; both carry the path the click writes', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, false));
+  const html = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.match(html, /<a class="p go" href="\?views=\/0x11\/user\/org\/deals" data-go="0x11\/user\/org\/deals\/d5" data-folder="0x11\/user\/org\/deals">0x11\/user\/org\/deals\/d5<\/a>/);
+  const grid = slotLayout({manager: '-> 0x11/user/org/members/bob', total: '-> /x/0x11/user/org/views/payroll @ 4'});
+  assert.ok(grid.includes('<span class="sv-v ref" data-path="0x11/user/org/members/bob"><a class="r go" href="?views=/0x11/user/org/members/bob" data-go="0x11/user/org/members/bob" data-folder="0x11/user/org/members/bob">-> 0x11/user/org/members/bob</a></span>'), grid);
+  assert.match(grid, /data-go="0x11\/user\/org\/views\/payroll" data-folder="0x11\/user\/org\/views\/payroll"/, 'a cell reference drops its /x and keeps its pin in the text');
+  assert.equal(adapt.folderOf('0x11/user/org/deals/d5'), '0x11/user/org/deals');
+  assert.equal(adapt.folderOf('0x11'), '0x11', 'a node has no folder above it');
+});
+
+test('a click writes the person\'s cursor under the node\'s /agent/person, signed person, then moves the page', async () => {
+  const m = fakeMcp(() => ({records: [{path: '/0x11/agent/person/cursor'}]}));
+  const s = mcpSource({fetch: m.fetch, EventSource: null});
+  await s.cursor('0x11/user/org/deals/d5');
+  assert.deepEqual(m.calls[0], {url: '/mcp', name: 'mcp/write', args: {who: 'person', records: [{path: '/0x11/agent/person/cursor', slots: {path: '/0x11/user/org/deals/d5'}}]}});
+  const {mountViewer} = live;
+  const flipped = [], written = [];
+  const v = mountViewer(fakeEl(), {...viewerSource(), async cursor(p) { written.push(p); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v.go('0x11/user/org/deals/d5', '0x11/user/org/deals');
+  assert.deepEqual([written, flipped], [['0x11/user/org/deals/d5'], ['0x11/user/org/deals']], 'the cursor is written before the page moves');
+  const v2 = mountViewer(fakeEl(), {...viewerSource(), async cursor() { throw new Error('world away'); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v2.go('0x11/user/org/deals', '0x11/user/org/deals');
+  assert.equal(flipped.length, 2, 'a refused cursor write still moves the page');
+});
+
+// ---- a presented path: read at its care, a folder is a folder, off the page's folder the page moves
+test('a presented folder is read at the care it was presented at and draws as a folder, not deleted', async () => {
+  const {mountViewer} = live;
+  const reads = [];
+  const s = viewerSource();
+  s.read = async (p, care, cas) => { reads.push([p, care, cas]); return {path: p, record: {}, kids: [{name: 'd1', path: p + '/d1', slots: {amount: 5}, kids: []}], case: '', next: null}; };
+  const el = fakeEl();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler({shown: {path: '0x11/user/org/views', care: 'z', case: 0}});
+  assert.deepEqual(reads[0], ['0x11/user/org/views', 'z', 0], 'the summary read takes the presented care');
+  const body = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.doesNotMatch(body, /deleted/); assert.match(body, /data-path="0x11\/user\/org\/views"/);
+  const folder = adapt.readOf({path: '/0x11/user/org/views', exists: false, reference: ref('x', 2, '/0x11/user/org/views'), properties: {}, children: [{path: '/0x11/user/org/views/a', exists: true, reference: ref('x', 1, '/0x11/user/org/views/a'), properties: {'/n': '1'}, children: []}], nodes: 2, next: null});
+  assert.deepEqual([folder.record, folder.kids.length], [{}, 1], 'a path with children and no record of its own is a folder');
+  assert.equal(adapt.readOf(culled).record, null, 'a culled record with nothing beneath is still deleted');
+});
+
+test('a path presented off the page\'s folder moves the page to its folder', async () => {
+  const {mountViewer} = live;
+  const flipped = [];
+  const s = viewerSource();
+  mountViewer(fakeEl(), s, {crumb: '0x11/user/org', views: '0x11/user/org', flip: f => flipped.push(f)});
+  await s.handler({shown: {path: '0x11/user/shrine/views/open_prs', care: 'z', case: 0}});
+  assert.deepEqual(flipped, ['0x11/user/shrine/views']);
+  await s.handler({shown: {path: '0x11/user/org/views/headcount', care: 'x', case: 0}});
+  assert.equal(flipped.length, 1, 'a path inside the page\'s folder draws in place');
+});
+
+// ---- what references a record
+test('referencedBy reads the page folder and /agent with the referencing knob; the strip lists cells and rows, a waiting cell marked', async () => {
+  const m = fakeMcp((name, a) => ({path: a.path, referencing: a.referencing, matches: a.path.endsWith('/agent') ? [] : [
+    {path: N + '/views/payroll', slot: '/sys/tack', target: N + '/members', cell: true, hole: false},
+    {path: N + '/views/budget', slot: '/sys/tack', target: N + '/members/nobody', cell: true, hole: true},
+    {path: N + '/notes/n1', slot: '/about', target: N + '/members', cell: false, hole: false}], watchers: [{path: '/0x11/app/cache', care: 'z', on: N + '/members'}], visited: 3, next: null}));
+  const s = mcpSource({fetch: m.fetch, views: '/0x11/user/org', EventSource: null});
+  const rb = await s.referencedBy('0x11/user/org/members');
+  assert.deepEqual(m.calls.map(c => [c.args.path, c.args.referencing]), [[N, N + '/members'], ['/0x11/agent', N + '/members']]);
+  assert.deepEqual(rb.matches.map(x => [x.path, x.cell, x.hole]), [['0x11/user/org/views/payroll', true, false], ['0x11/user/org/views/budget', true, true], ['0x11/user/org/notes/n1', false, false]]);
+  const html = live.referencedHTML(rb);
+  assert.match(html, /<div class="sv-refd"><div class="k">referenced by<\/div><div class="sv-refby cell "><a class="ref go" href="\?views=\/0x11\/user\/org\/views" data-go="0x11\/user\/org\/views\/payroll"/);
+  assert.match(html, /<div class="sv-refby cell hole">.*<span class="h">waiting<\/span>/);
+  assert.match(html, /<div class="sv-refby crew">.*<span class="s">crew, z<\/span>/);
+  assert.equal(live.referencedHTML({matches: [], watchers: []}), '');
+});
+
+test('a year or a day is drawn as written; a quantity is grouped', () => {
+  const html = slotLayout({year: 2005, day: 20041101, amount: 12500, n: 7});
+  assert.match(html, /<span class="sv-v">2005<\/span>/); assert.match(html, /<span class="sv-v">20041101<\/span>/); assert.match(html, /<span class="sv-v">12,500<\/span>/);
+});
+
+// ---- quiet lines: what the page never shows
+const click = (epoch, quiet) => ({epoch, label: 'cursor', who: 'person', touched: ['0x11', '0x11/agent', '0x11/agent/journal', '0x11/agent/journal/person', '0x11/agent/person', '0x11/agent/person/cursor'], records: ['0x11/agent/person/cursor'], quiet});
+test('quietLine: hands, seen marks, the cursor, the clock, deletions and unknown cells are never shown; data is', () => {
+  const {quietLine} = live;
+  const line = (who, touched, w) => ({who, touched, with: w || null});
+  assert.equal(quietLine(click(3)), true, 'the cursor');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/agent', '0x11/agent/claude', '0x11/agent/claude/seen', '0x11/agent/journal', '0x11/agent/journal/claude'])), true, 'an agent seen mark');
+  assert.equal(quietLine(line('clock', ['0x11', '0x11/clock'])), true, 'a hand line');
+  assert.equal(quietLine(line('source_people', ['0x11', '0x11/user/x/sources/people/p1'])), true, 'a source hand line, by its who');
+  assert.equal(quietLine(line('ian', ['0x11', '0x11/clock'])), true, 'the clock record itself');
+  assert.equal(quietLine(line('ian', ['0x11', '0x11/agent', '0x11/agent/hands', '0x11/agent/hands/source'])), true, 'the hands folder');
+  assert.equal(quietLine(line('launcher', ['0x11', '0x11/agent', '0x11/agent/launcher', '0x11/agent/launcher/world'])), true, 'the launcher record at boot');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user', '0x11/user/org'], {'/0x11/user/org': {exists: false}, '/0x11/user': {exists: false}})), true, 'a cull-only event');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/v/c'], {'/0x11/user/v/c': {exists: true, properties: {'/sys/weft': '/h/x/1/4/0x11/weft/stdlib/sum'}}, '/x/0x11/user/v/c': {exists: false}, '/c/x/0x11/user/v/c': {exists: true}})), true, 'a written cell that reads unknown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/v/c'], {'/0x11/user/v/c': {exists: true, properties: {'/sys/weft': '/h/x/1/4/0x11/weft/stdlib/sum'}}, '/x/0x11/user/v/c': {exists: true, properties: {'/total': '3'}}})), false, 'a cell that answers is shown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/org/d1'], {'/0x11/user/org/d1': {exists: true, properties: {'/amount': '5'}}})), false, 'a record written is shown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/org/d1', '0x11/user/org/d2'], {'/0x11/user/org/d1': {exists: false}, '/0x11/user/org/d2': {exists: true, properties: {'/amount': '5'}}})), false, 'a mixed event is shown');
+  assert.equal(quietLine(line('person', ['0x11', '0x11/agent/person/cursor', '0x11/user/org/deals/d1'])), false, 'a person write that touches data is shown');
+  assert.equal(quietLine({epoch: 'shown', touched: [], shown: {path: 'x', care: 'z', case: 0}}), false, 'a presented read is shown');
+});
+test('a quiet line never becomes the page\'s now and is not listed in earlier', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, true)); await s.handler(click(6, false));
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="5" open>/, 'the backlog ends on a click: the last real event is drawn');
+  await s.handler(person(7, false)); await s.handler(click(8, false)); await s.handler({epoch: 9, who: 'clock', touched: ['0x11', '0x11/clock'], records: ['0x11/clock']});
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'a later click or hand line leaves the now where it was');
+  assert.doesNotMatch(el.querySelector('.sv-earlier').innerHTML, /data-epoch="[689]"/, 'and none of them is in earlier');
 });
