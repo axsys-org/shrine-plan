@@ -1,0 +1,296 @@
+- grove_app
+
+' All quantities are whole shares; cash and collateral are integer millionths.
+' A book is the transaction boundary. Goo checks its version before replacing it.
++ branchmap
+  + unit
+    ^ nat
+    1000000
+  + assignment
+    : predicate=nat outcome=nat
+  + market
+    : source=str title=str outcomes=row[str] prices=row[nat] resolved=nat provenance=str
+  + account
+    : id=str cash=nat
+  + position
+    : owner=str verse=row[branchmap/assignment] quantity=nat
+  + receipt
+    : sequence=nat operation=str participant=str quantity=nat detail=str
+  + book
+    : revision=nat markets=row[branchmap/market] accounts=row[branchmap/account]
+      positions=row[branchmap/position] collateral=nat supply=nat receipts=row[branchmap/receipt]
+  + canonical
+    \ assignments=row[branchmap/assignment]
+    ^ maybe[row[branchmap/assignment]]
+    = sorted (list/row[branchmap/assignment] (assignments.stream.sort_by((\ a b (le a.predicate b.predicate)))))
+    % remaining=row[branchmap/assignment] sorted out=row[branchmap/assignment] []
+    ^ maybe[row[branchmap/assignment]]
+    ? (eq remaining.len 0) (./some out)
+    = a remaining.at(0)
+    ? out.len
+      = previous out.at((sub out.len 1))
+      ? (eq a.predicate previous.predicate)
+        ? !(eq a.outcome previous.outcome) .none
+        | _ remaining.drop(1) out
+      | _ remaining.drop(1) out.snoc(a)
+    | _ remaining.drop(1) out.snoc(a)
+  + valid_assignment
+    \ book=branchmap/book a=branchmap/assignment
+    ^ bool
+    ? (ge a.predicate book.markets.len) .false
+    = market book.markets.at(a.predicate)
+    | and (lt a.outcome market.outcomes.len) (eq market.resolved 0)
+  + valid_verse
+    \ book=branchmap/book verse=row[branchmap/assignment]
+    ^ bool
+    | verse.all((\ a (branchmap/valid_assignment book a)))
+  + parse_verse
+    \ text=str
+    ^ maybe[row[branchmap/assignment]]
+    ? (eq text "") (./some [])
+    % parts=row[str] (str/split_byte 44 text) out=row[branchmap/assignment] []
+    ^ maybe[row[branchmap/assignment]]
+    ? (eq parts.len 0) (branchmap/canonical out)
+    = pair (str/split_byte 58 parts.at(0))
+    ? !(eq pair.len 2) .none
+    < p (nat/parse pair.at(0))
+    < o (nat/parse pair.at(1))
+    | _ parts.drop(1) out.snoc((branchmap/assignment p o))
+  + verse_label
+    \ verse=row[branchmap/assignment]
+    ^ str
+    ? (eq verse.len 0) "TOP"
+    | str/join "," (verse.map((\ a (str/cat_all [(nat/show a.predicate) ":" (nat/show a.outcome)]))))
+  + asset_id
+    \ book=branchmap/book verse=row[branchmap/assignment]
+    ^ maybe[str]
+    < verse (branchmap/canonical verse)
+    ? !(verse.all((\ a (lt a.predicate book.markets.len)))) .none
+    | ./some (str/cat_all ["TOY/" (str/join "/" (verse.map((\ a (str/cat_all [book.markets.at(a.predicate).source "=" (nat/show a.outcome)])))))] )
+  + cash
+    \ book=branchmap/book owner=str
+    ^ nat
+    | (book.accounts.keep((\ a (eq a.id owner)))).at(0).cash
+  + has_account
+    \ book=branchmap/book owner=str
+    ^ bool
+    | eq (book.accounts.keep((\ a (eq a.id owner)))).len 1
+  + set_cash
+    \ book=branchmap/book owner=str amount=nat
+    ^ branchmap/book
+    | book.set_accounts((book.accounts.map((\ a (? (eq a.id owner) a.set_cash(amount) a)))))
+  + balance
+    \ book=branchmap/book owner=str verse=row[branchmap/assignment]
+    ^ nat
+    | row/fold[branchmap/position nat] 0 (\ n p (add n p.quantity)) (book.positions.keep((\ p (and (eq p.owner owner) (equal p.verse verse)))))
+  + set_balance
+    \ book=branchmap/book owner=str verse=row[branchmap/assignment] quantity=nat
+    ^ branchmap/book
+    = positions (book.positions.keep((\ p !(and (eq p.owner owner) (equal p.verse verse)))))
+    | book.set_positions((? quantity positions.snoc((branchmap/position owner verse quantity)) positions))
+  + credit
+    \ book=branchmap/book owner=str verse=row[branchmap/assignment] quantity=nat
+    ^ branchmap/book
+    | branchmap/set_balance book owner verse (add (branchmap/balance book owner verse) quantity)
+  + funded
+    \ book=branchmap/book
+    ^ bool
+    | eq (add book.collateral (row/fold[branchmap/account nat] 0 (\ n a (add n a.cash)) book.accounts)) book.supply
+  + split
+    \ book=branchmap/book owner=str parent=row[branchmap/assignment] predicate=nat quantity=nat
+    ^ either[str branchmap/book]
+    ? !(branchmap/has_account book owner) (./err "Unknown account")
+    ?> (./some parent) (branchmap/canonical parent) (./err "Contradictory parent")
+    ? ((eq quantity 0) || (ge predicate book.markets.len)) (./err "Invalid quantity or market")
+    ? !(branchmap/valid_verse book parent) (./err "Unknown or resolved parent")
+    ? (parent.any((\ a (eq a.predicate predicate)))) (./err "Market already assigned")
+    = market book.markets.at(predicate)
+    ? market.resolved (./err "Market already resolved")
+    = value (mul quantity branchmap/unit)
+    ? (and (eq parent.len 0) (lt (branchmap/cash book owner) value)) (./err "Insufficient collateral cash")
+    ? (and (gt parent.len 0) (lt (branchmap/balance book owner parent) quantity)) (./err "Insufficient parent position")
+    = next=branchmap/book
+        ? parent.len (branchmap/set_balance book owner parent (sub (branchmap/balance book owner parent) quantity))
+        | (branchmap/set_cash book owner (sub (branchmap/cash book owner) value)).set_collateral((add book.collateral value))
+    % index=nat 0 next=branchmap/book next
+    ^ either[str branchmap/book]
+    ? (eq index market.outcomes.len) (./ok next)
+    = child (branchmap/canonical parent.snoc((branchmap/assignment predicate index))).fall([])
+    | _ index.inc (branchmap/credit next owner child quantity)
+  + merge
+    \ book=branchmap/book owner=str parent=row[branchmap/assignment] predicate=nat quantity=nat
+    ^ either[str branchmap/book]
+    ? !(branchmap/has_account book owner) (./err "Unknown account")
+    ?> (./some parent) (branchmap/canonical parent) (./err "Contradictory parent")
+    ? ((eq quantity 0) || (ge predicate book.markets.len)) (./err "Invalid quantity or market")
+    ? !(branchmap/valid_verse book parent) (./err "Unknown or resolved parent")
+    ? (parent.any((\ a (eq a.predicate predicate)))) (./err "Market already assigned")
+    = market book.markets.at(predicate)
+    ? market.resolved (./err "Market already resolved")
+    % index=nat 0 next=branchmap/book book
+    ^ either[str branchmap/book]
+    ? (eq index market.outcomes.len)
+      ? parent.len (./ok (branchmap/credit next owner parent quantity))
+      = value (mul quantity branchmap/unit)
+      ? (lt next.collateral value) (./err "Collateral invariant failed")
+      | ./ok ((branchmap/set_cash next owner (add (branchmap/cash next owner) value)).set_collateral((sub next.collateral value)))
+    = child (branchmap/canonical parent.snoc((branchmap/assignment predicate index))).fall([])
+      held (branchmap/balance next owner child)
+    ? (lt held quantity) (./err "Complete sibling quantities required")
+    | _ index.inc (branchmap/set_balance next owner child (sub held quantity))
+  + trade
+    \ book=branchmap/book owner=str predicate=nat outcome=nat quantity=nat selling=bool
+    ^ either[str branchmap/book]
+    ? (!(branchmap/has_account book owner) || (eq owner "house")) (./err "Choose a participant account")
+    ? ((eq quantity 0) || (ge predicate book.markets.len)) (./err "Invalid quantity or market")
+    = market book.markets.at(predicate)
+    ? (market.resolved || (ge outcome market.outcomes.len)) (./err "Unknown outcome or closed market")
+    = verse [(branchmap/assignment predicate outcome)]
+      price=nat market.prices.at(outcome)
+      cost (mul price quantity)
+      seller=str (? selling owner "house")
+      buyer=str (? selling "house" owner)
+      inventory=nat (branchmap/balance book seller verse)
+      available=nat (branchmap/cash book buyer)
+    ? ((eq price 0) || (ge price branchmap/unit)) (./err "No executable interior quote")
+    ? (lt inventory quantity) (./err "Insufficient share inventory")
+    ? (lt available cost) (./err "Insufficient cash")
+    = next (branchmap/set_cash book buyer (sub available cost))
+      next (branchmap/set_cash next seller (add (branchmap/cash next seller) cost))
+      next (branchmap/set_balance next seller verse (sub inventory quantity))
+    | ./ok (branchmap/credit next buyer verse quantity)
+  + normalize
+    \ verse=row[branchmap/assignment] predicate=nat outcome=nat
+    ^ maybe[row[branchmap/assignment]]
+    < verse (branchmap/canonical verse)
+    ? (verse.any((\ a (and (eq a.predicate predicate) !(eq a.outcome outcome))))) .none
+    | ./some (verse.keep((\ a !(eq a.predicate predicate))))
+  + resolve
+    \ book=branchmap/book predicate=nat outcome=nat
+    ^ either[str branchmap/book]
+    ? (ge predicate book.markets.len) (./err "Unknown market")
+    = market book.markets.at(predicate)
+    ? (market.resolved || (ge outcome market.outcomes.len)) (./err "Already resolved or invalid outcome")
+    = markets (book.markets.take(predicate).snoc(market.set_resolved(outcome.inc)).weld(book.markets.drop(predicate.inc)))
+    % remaining=row[branchmap/position] book.positions next=branchmap/book book.set_markets(markets).set_positions([])
+    ^ either[str branchmap/book]
+    ? (eq remaining.len 0) (./ok next)
+    = position remaining.at(0)
+    ?> (./some verse) (branchmap/normalize position.verse predicate outcome)
+      | _ remaining.drop(1) next
+    ? verse.len
+      | _ remaining.drop(1) (branchmap/credit next position.owner verse position.quantity)
+    = payout (mul position.quantity branchmap/unit)
+    ? (lt next.collateral payout) (./err "Redemption exceeds collateral")
+    = next (branchmap/set_cash next position.owner (add (branchmap/cash next position.owner) payout))
+    | _ remaining.drop(1) next.set_collateral((sub next.collateral payout))
+  + open_account
+    \ book=branchmap/book owner=str
+    ^ either[str branchmap/book]
+    ? ((eq owner "") || (gt owner.len 24) || (branchmap/has_account book owner) || (ge book.accounts.len 32)) (./err "Use a new account name, 1-24 bytes; at most 32 accounts")
+    = grant (mul 100 branchmap/unit) cash (branchmap/cash book "house")
+    ? (lt cash grant) (./err "House cannot fund another account")
+    = next (branchmap/set_cash book "house" (sub cash grant))
+    | ./ok next.set_accounts(next.accounts.snoc((branchmap/account owner grant)))
+  + execute
+    \ book=branchmap/book operation=str owner=str market_text=str outcome_text=str quantity_text=str conditions=str
+    ^ either[str branchmap/book]
+    ?> (./some parent) (branchmap/parse_verse conditions) (./err "Conditions must be market:outcome pairs separated by commas")
+    ?> (./some market) (nat/parse market_text) (./err "Market must be a nonnegative integer")
+    ?> (./some outcome) (nat/parse outcome_text) (./err "Outcome must be a nonnegative integer")
+    ?> (./some quantity) (nat/parse quantity_text) (./err "Quantity must be a whole number")
+    ? (gt quantity 100000) (./err "Quantity exceeds demo limit")
+    ? (and (gt parent.len 0) !((eq operation "split") || (eq operation "merge"))) (./err "Only split and merge accept parent conditions; joint claims have no quote")
+    = result=either[str branchmap/book]
+        ? (eq operation "buy") (branchmap/trade book owner market outcome quantity .false)
+        ? (eq operation "sell") (branchmap/trade book owner market outcome quantity .true)
+        ? (eq operation "split") (branchmap/split book owner parent market quantity)
+        ? (eq operation "merge") (branchmap/merge book owner parent market quantity)
+        ? (eq operation "resolve")
+          ? !(eq owner "operator") (./err "Use operator for an explicitly simulated resolution")
+          | branchmap/resolve book market outcome
+        ? (eq operation "open-account") (branchmap/open_account book owner)
+        | ./err "Unknown operation"
+    ?> (./ok next) result result
+    ? !(branchmap/funded next) (./err "Cash plus collateral invariant failed")
+    = cash_detail=str
+        ? (and (branchmap/has_account book owner) (branchmap/has_account next owner))
+          | str/cat_all [" cash " (branchmap/money (branchmap/cash book owner)) " -> " (branchmap/money (branchmap/cash next owner))]
+        ""
+    = detail (str/cat_all ["market=" market_text " outcome=" outcome_text " parent=" (branchmap/verse_label parent) cash_detail])
+      receipt (branchmap/receipt book.revision.inc operation owner quantity detail)
+    | ./ok next.set_revision(book.revision.inc).set_receipts(book.receipts.snoc(receipt))
+  + initial
+    \ markets=row[branchmap/market]
+    ^ branchmap/book
+    = supply (mul 10200 branchmap/unit)
+      accounts [(branchmap/account "house" (mul 10000 branchmap/unit)) (branchmap/account "alice" (mul 100 branchmap/unit)) (branchmap/account "bob" (mul 100 branchmap/unit))]
+    % index=nat 0 book=branchmap/book (branchmap/book 0 markets accounts [] 0 supply [])
+    ^ branchmap/book
+    ? (eq index markets.len) book
+    ?> (./ok next) (branchmap/split book "house" [] index 100)
+      | Seq[branchmap/book] (error (pails/t "Invalid initial market family")) book
+    | _ index.inc next
+  + money
+    \ amount=nat
+    ^ str
+    | str/cat_all [(nat/show (div amount branchmap/unit)) "." ((str/cat_all ["000000" (nat/show (mod amount branchmap/unit))]).slice((nat/show (mod amount branchmap/unit)).len 6))]
+  + accounts_text
+    \ book=branchmap/book
+    ^ str
+    | str/join " | " (book.accounts.map((\ a (str/cat_all [a.id ": " (branchmap/money a.cash) " TOY"]))))
+  + markets_text
+    \ book=branchmap/book
+    ^ str
+    % index=nat 0 lines=row[str] []
+    ^ str
+    ? (eq index book.markets.len) (str/join (str/from_atom 10) lines)
+    = market book.markets.at(index)
+      title (str/cat_all [(nat/show index) ": " market.title (? market.resolved " [SETTLED]" " [local OPEN]")])
+      prices (str/join " | " (market.prices.map((\ price (branchmap/money price)))))
+    | _ index.inc lines.snoc((str/cat_all [title (str/from_atom 10) "Outcomes in order: " (str/join " | " market.outcomes) (str/from_atom 10) "Prices: " prices]))
+  + positions_text
+    \ book=branchmap/book
+    ^ str
+    | str/join (str/from_atom 10) (book.positions.keep((\ p !(eq p.owner "house"))).map((\ p (str/cat_all [p.owner " holds " (nat/show p.quantity) " shares of " (branchmap/verse_label p.verse)]))))
+  + history_text
+    \ book=branchmap/book
+    ^ str
+    | str/join (str/from_atom 10) (book.receipts.drop((sub book.receipts.len 8)).map((\ r (str/cat_all [(nat/show r.sequence) " " r.participant " " r.operation " " (nat/show r.quantity) " " r.detail]))))
+  + card
+    \ title=str content=str
+    ^ myth
+    | (myth/new).put(['sys 'lede] (pails/t title)).put(['sys 'content] (pails/t content))
+  + verses
+    \ book=branchmap/book
+    ^ row[row[branchmap/assignment]]
+    % remaining=row[branchmap/position] book.positions out=row[row[branchmap/assignment]] [[]]
+    ^ row[row[branchmap/assignment]]
+    ? (eq remaining.len 0) out
+    = verse remaining.at(0).verse
+    ? (out.any((\ existing (equal existing verse))))
+      | _ remaining.drop(1) out
+    | _ remaining.drop(1) out.snoc(verse)
+  + project
+    \ book=branchmap/book kind=str
+    ^ axal[myth]
+    = cards=row[myth]
+        ? (eq kind "verses")
+          | (branchmap/verses book).map((\ verse (branchmap/card (branchmap/verse_label verse) (? (gt verse.len 1) "Unpriced conjunction" (? verse.len "Single outcome claim" "Unconditional TOY"))).put(['asset_id] (pails/t (branchmap/asset_id book verse).fall("invalid"))).put(['assignment_count] (pails/n verse.len))))
+        ? (eq kind "accounts")
+          | book.accounts.map((\ a (branchmap/card a.id (branchmap/money a.cash)).put(['cash_millionths] (pails/n a.cash))))
+        ? (eq kind "positions")
+          | book.positions.map((\ p (branchmap/card p.owner (branchmap/verse_label p.verse)).put(['quantity] (pails/n p.quantity)).put(['asset_id] (pails/t (branchmap/asset_id book p.verse).fall("invalid")))))
+        ? (eq kind "markets")
+          | book.markets.map((\ m (branchmap/card m.title (str/join " | " m.outcomes)).put(['source_id] (pails/t m.source)).put(['provenance] (pails/t m.provenance)).put(['local_resolution] (pails/n m.resolved))))
+        | book.receipts.map((\ r (branchmap/card (str/cat_all [r.participant " " r.operation]) r.detail).put(['sequence] (pails/n r.sequence)).put(['quantity] (pails/n r.quantity))))
+    % index=nat 0 out=axal[myth] (axal/new[myth] .none)
+    ^ axal[myth]
+    ? (eq index cards.len) out
+    | _ index.inc out.put([($u index)] cards.at(index))
+  + error_text
+    \ result=either[str branchmap/book]
+    ^ str
+    ? result
+     > (./err message) message
+     > (./ok book) ""

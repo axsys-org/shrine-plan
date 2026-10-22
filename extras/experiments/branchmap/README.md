@@ -1,5 +1,11 @@
 # Branchmap in Shrine
 
+This is the historical October 16 MCP prototype. The active implementation is the
+[native Branchmap mount](../../mounts/branchmap/README.md), which moves the domain
+logic and participant ledger into Shrine and uses goo-egui. The commands below
+apply to the original `000ff1f8` revision; this branch is based on `lf/goo-contracts`
+and does not include that old MCP mount.
+
 This experiment maps seven public Manifold markets to five event contexts,
 sixteen outcomes, eight canonical verses, eight simulated conditional asset
 identities and seven native Shrine cells. GPT-6 Astra built the first world
@@ -78,7 +84,7 @@ Select GPT-6 Astra and give it this task:
 > native reads, contexts and history. Label simulated operations and external
 > controller work explicitly.
 
-The [MCP skill](../../mounts/mcp/skills/shrine-mcp/SKILL.md) documents tool use.
+The [MCP skill](https://github.com/axsys-org/shrine-plan/blob/000ff1f8e00c1f6a2265b1a3cbad281660d58576/extras/mounts/mcp/skills/shrine-mcp/SKILL.md) documents tool use.
 [`shrine_client.py`](shrine_client.py) provides the same JSON-RPC calls for scripts
 and records each completed response. It contains no model API integration; Astra
 was the agent operating the tools. Running the loader does not launch a model.
