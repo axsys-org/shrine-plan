@@ -1,6 +1,7 @@
 - browser_routes
 - goo_browser
 - goo_inspection
+- goo_wire_browser
 
 + explorer_dev
   + interact
@@ -8,10 +9,18 @@
     ^ http_foot/action
     = parts (http_foot/split 63 request.target)
       source (equal parts.at(0) "/goo/source")
-    ? (equal parts.at(0) "/goo/inspect") (explorer_dev/inspect request)
+      wire_fields (http_foot/fields (? (eq request.method "GET") (? (eq parts.len 2) parts.at(1) "") request.body))
+      wires (wire_fields.keep((\ [key value] (eq key "wire"))))
+      wire (http_foot/field "wire" wire_fields)
+    ? ((gt wires.len 1) || !((eq wire "") || (eq wire "protobuf-v2")))
+      | ./reply (http_driver/response 415 "Unsupported Goo wire format")
+    ? (equal parts.at(0) "/goo/inspect")
+      ? (eq wire "protobuf-v2") (./reply (http_driver/response 415 "Inspection captures require their JSON contract"))
+      | explorer_dev/inspect request
     ? (equal parts.at(0) "/goo/patch-query")
       ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
       ? (gt request.body.len 65536) (./reply (http_driver/response 413 "Patch query is too large"))
+      ? (eq wire "protobuf-v2") (./reply (http_driver/response 415 "Patch packets require their JSON contract"))
       | ./snapshot (goo_patch/query_response (http_foot/fields request.body))
     ? (equal parts.at(0) "/goo/edit-value")
       ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
@@ -20,8 +29,10 @@
         get (\ key=str (http_foot/field key fields))
       ?> (./some target) (path_parse (get "target")) (./reply (http_driver/response 400 "Invalid target"))
       ?> (./some expected) (nat/parse (get "expected")) (./reply (http_driver/response 400 "Invalid version"))
-      | ./interact (goo_runtime/request "edit-value" target target [] [] expected 0 0
+      = query (goo_runtime/request "edit-value" target target [] [] expected 0 0
           [["slot" (get "slot")] ["kind" (get "kind")] ["value" (get "value")] ["context" (get "context")]] now)
+      ? (eq wire "protobuf-v2") (./interact_bat query goo_wire/encode)
+      | ./interact query
     ? (equal parts.at(0) "/goo/render") (explorer_dev/render request)
     = receipt (equal parts.at(0) "/goo/operation-status")
       reading ((equal parts.at(0) "/goo/status") || source || receipt)
@@ -60,7 +71,10 @@
       ? !((eq (get "direction") "ltr") || (eq (get "direction") "rtl"))
         | ./reply (http_driver/response 400 "Invalid direction")
       = context (goo_bridge/render_context (goo_fp/integer 240) scale (eq (get "direction") "rtl") (eq (get "pipeline") "1"))
+      ? (eq (get "wire") "protobuf-v2")
+        | ./snapshot_bat (\ state=namespace (goo_wire/result (goo_browser/tree_layouts context query (slots.map((\ slot=str (path_parse slot).fall([])))) state)))
       | ./snapshot (goo_browser/tree_layout_response context query (slots.map((\ slot=str (path_parse slot).fall([])))))
+    ? (eq (get "wire") "protobuf-v2") (./interact_bat query goo_wire/encode)
     | ./interact query
   + inspect
     \ request=http_foot/request
@@ -76,9 +90,11 @@
     ? !((eq (get "direction") "ltr") || (eq (get "direction") "rtl"))
       | ./reply (http_driver/response 400 "Invalid direction")
     = context (goo_bridge/render_context width scale (eq (get "direction") "rtl") .false)
-    ? (goo_inspection/prepare context fields)
+    ? (goo_inspection/prepare context (fields.keep((\ [key value] !(eq key "wire")))))
      > (./err message) (./reply (http_driver/response 400 message))
-     > (./ok value) (./bytes 200 (http_foot/bar (str/to_atom (show value))) "application/json; charset=utf-8")
+     > (./ok value)
+      ? (eq (get "wire") "protobuf-v2") (./bat 200 (goo_wire/encode value) "application/x-protobuf")
+      | ./bytes 200 (http_foot/bar (str/to_atom (show value))) "application/json; charset=utf-8"
   + render_number
     \ text=str
     ^ maybe[goo/scalar]
@@ -107,6 +123,14 @@
     = context (goo_bridge/render_context width scale ((eq direction "rtl") || (eq direction "RTL")) (eq (get "pipeline") "1"))
       node=maybe[row[nat]] (? (get "node").len (./some (indices.map((\ index (nat/parse index).fall(0))))) .none)
       render (? (eq (get "layouts") "pane-v1") goo_browser/pane_layout_response goo_browser/render_response)
+    ? (eq (get "wire") "protobuf-v2")
+      ? context.pipeline (./reply (http_driver/response 415 "Compiler captures require their JSON contract"))
+      | ./snapshot_bat
+        \ state=namespace
+        | goo_wire_browser/result (eq (get "layouts") "pane-v1") context
+          (browser_routes/target (get "target")) (browser_routes/target (get "view"))
+          (browser_routes/target (get "slot")) (browser_routes/target (get "role"))
+          (browser_routes/target (get "workspace")) node state
     | ./snapshot (render context
         (browser_routes/target (get "target")) (browser_routes/target (get "view"))
         (browser_routes/target (get "slot")) (browser_routes/target (get "role"))
