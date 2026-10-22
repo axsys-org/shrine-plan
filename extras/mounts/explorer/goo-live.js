@@ -26,8 +26,8 @@ function mountViewer(el, source, opts = {}) {
     const items = await Promise.all(paths.map(async p => {
       const r = await source.read(p, ev.shown ? (ev.shown.care || 'y') : 'x', ev.shown ? ev.shown.case : 0);
       let line;
-      if (r && r.record === null) line = '<span class="m gone">deleted</span>';
-      else if (r && isCell(r.record)) { const a = await source.answer(p); line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
+      if (r && r.record === null) return '';                                                   // deleted: not listed
+      else if (r && isCell(r.record)) { const a = await source.answer(p); if (a.bad === 'unknown') return ''; line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
       else line = `<span class="m">${r ? lineHTML(r.record) : ''}</span>`;
       return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span>${goHTML(p, folderOf(p), p, 'p')}${line}</summary><div class="body"></div></details>`;
     }));
@@ -70,7 +70,9 @@ function mountViewer(el, source, opts = {}) {
       const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev);
     }
     if (!msg.touched || !msg.touched.length) return;
-    if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return draw(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
+    // the agent's QA stays behind the chip; housekeeping, deletions and unknowns are never shown: when such a line closes
+    // the backlog, the last real event is drawn instead
+    if (qaHidden(msg, views) || quietLine(msg)) { if (!msg.quiet && !state.drawn && state.events.length) return draw(state.events[state.events.length - 1]); return; }
     state.events.push(msg); if (msg.quiet) return;   // quiet: the backlog on load, kept for `earlier` and drawn with the last
     return draw(msg);
   });
@@ -94,6 +96,21 @@ const moved = (source, touched) => { const out = new Set(); for (const t of touc
 // an agent's QA writes stay behind the chip: an event whose every written record sits under /<node>/agent/<name>/qa is
 // drawn only when the page's views folder is that QA folder or inside it; its score still reaches the chip through qa()
 const qaFolderOf = p => { const m = /^([^/]+\/agent\/[^/]+\/qa)(\/|$)/.exec(p); return m ? m[1] : null; };
+// housekeeping: a seen mark, the hands' folder, the person's cursor, the clock, the journal
+const HOUSEKEEPING = /\/agent\/[^/]+\/seen$|\/agent\/hands(\/|$)|\/agent\/person(\/|$)|\/agent\/launcher(\/|$)|\/clock$|\/agent\/journal(\/|$)/;
+const HANDS = /^(clock|source)(_|$)/;
+// a line the page never shows: a hand's, one that only moved housekeeping records, one that only deleted things,
+// or one whose written cells all read unknown; what remains is the person's and the agents' work on the data
+const quietLine = ev => {
+  if (ev.shown) return false;
+  if (HANDS.test(ev.who || '')) return true;
+  const all = ev.touched || [], t = all.filter(p => !/\/agent\/journal(\/|$)/.test(p) && !all.some(q => q !== p && q.startsWith(p + '/')));   // the deepest paths, the journal aside
+  if (t.length > 0 && t.every(p => HOUSEKEEPING.test(p))) return true;
+  const w = ev.with && typeof ev.with === 'object' ? Object.entries(ev.with).filter(([k]) => !/^\/x\/|^\/c\/x\//.test(k)) : [];
+  const nothing = ([k, v]) => !v || v.exists === false || (v.properties && '/sys/weft' in v.properties && ev.with['/x' + k] && ev.with['/x' + k].exists === false);
+  return w.length > 0 && w.every(nothing);
+};
+const cursorLine = quietLine;   // the old name
 const qaHidden = (ev, views) => {
   const recs = ev.records || ev.touched || []; if (ev.shown || !recs.length) return false;
   const folders = recs.map(qaFolderOf); if (folders.includes(null)) return false;
@@ -161,7 +178,7 @@ function slotLayout(slots) {
 async function rowSlots(source, node) {
   let slots = node.slots;
   if (isCell(slots)) { const r = await source.answer(node.path); slots = r.tree ? (Object.keys(r.tree.slots).length ? r.tree.slots : { '': r.tree.kids.length + ' rows' }) : { '': r.note || r.bad }; }
-  return Object.entries(slots).map(([k, v]) => `<span>${k ? `<span class="k">${esc(k)}</span>` : ''}${valueHTML(v, 'v')}</span>`).join('');
+  return Object.entries(slots).filter(([k]) => k !== 'scale' && !k.endsWith('/scale')).map(([k, v]) => `<span>${k ? `<span class="k">${esc(k)}</span>` : ''}${valueHTML(v, 'v')}</span>`).join('');   // a scale rides with its number, it is not a fact of the row
 }
 
 async function kidHTML(source, node, depth, bump) {
@@ -177,13 +194,16 @@ async function recordHTML(source, r, showPath, bump) {
   let body;
   if (r.record === null) body = `<div class="sv-gone">deleted</div>`;
   else if (isCell(node.slots)) {
+    // a cell's card: the result first, at its care (a figure, or the rows), then the formula and its settings folded,
+    // then the chain the result came up, then what was asked of it; what references it follows the card
     const a = await source.answer(node.path);
-    const made = `<details class="sv-made"><summary>made of</summary>${slotLayout(node.slots)}</details>`;
+    const { formula, over, ...settings } = node.slots;
+    const made = `<details class="sv-made"><summary>${esc(formula.slice(16))}${over ? ' over ' + esc(String(over).replace(/^-> /, '')) : ''}</summary>${slotLayout(settings)}</details>${chainHTML(source, node.path)}`;
     if (a.bad) body = `<div class="sv-note bad">${esc(a.bad)}</div>${made}`;
     else if (a.note) body = `<div class="sv-note">${esc(a.note)}</div>${made}`;
     else body = `${slotLayout(a.tree.slots)}${a.tree.kids.length ? `<div class="sv-kids">${(await Promise.all(a.tree.kids.map(k => kidHTML(source, k, 1, bump)))).join('')}</div>` : ''}${made}`;
   } else body = `${slotLayout(node.slots)}${node.kids.length ? `<div class="sv-kids">${(await Promise.all(node.kids.map(k => kidHTML(source, k, 1, bump)))).join('')}</div>` : ''}`;
-  return `<div class="sv-rec ${bump.has(node.path) ? 'bump' : ''}" data-path="${esc(node.path)}" data-case="${r.case || ''}"><div class="sv-head"><span class="n">${esc(node.name)}</span>${showPath ? `<span class="p">${esc(node.path)}</span>` : ''}</div>${fromHTML(source, node.path)}${body}${askedHTML(source, node.path, 1)}</div>`;
+  return `<div class="sv-rec ${bump.has(node.path) ? 'bump' : ''}" data-path="${esc(node.path)}" data-case="${r.case || ''}"><div class="sv-head"><span class="n">${esc(node.name)}</span>${showPath ? `<span class="p">${esc(node.path)}</span>` : ''}</div>${body}${askedHTML(source, node.path, 1)}</div>`;
 }
 
 
@@ -203,6 +223,21 @@ function askedHTML(source, path, depth, seen = new Set()) {
 function fromHTML(source, path) {
   const c = source._cells && source._cells.get(path); if (!c) return '';
   return `<div class="sv-from"><span class="f">${esc(c.formula)}</span>${c.inputs.map(i => { const p = i.path.replace(/^\/x\//, ''); return `<span class="sv-pill ${source._cells.has(p) ? 'cell' : ''}" data-path="${esc(p)}">${esc(source._cells.has(p) ? last(p) : p)}${i.pin ? `<span class="pin">held at ${i.pin}</span>` : ''}${i.view ? '<span class="pin">view</span>' : ''}</span>`; }).join('')}</div>`;
+}
+// the chain a cell's answer came up: one line per stage, walked upward by the tack (the first input) while it is a
+// cell of the folder, the formula and its settings, the input as a link, a pin or a secondary input noted
+function chainHTML(source, path) {
+  const cells = source._cells; if (!cells || !cells.has(path)) return '';
+  const lines = [], seen = new Set(); let p = path;
+  while (cells.has(p) && !seen.has(p) && lines.length < 8) {
+    seen.add(p); const c = cells.get(p);
+    const tack = c.inputs.find(i => !i.view) || c.inputs[0], others = c.inputs.filter(i => i !== tack);
+    const ip = tack ? tack.path.replace(/^\/x\//, '') : '';
+    const link = !ip ? '' : cells.has(ip) ? goHTML(ip, folderOf(ip), last(ip), 'r cell') : goHTML(ip, ip, ip, 'r');
+    lines.push(`<div class="sv-stage"><span class="f">${esc(c.formula)}</span>${c.settings ? `<span class="s">${esc(c.settings)}</span>` : ''}<span class="over">over</span>${link}${tack && tack.pin ? `<span class="pin">held at ${tack.pin}</span>` : ''}${others.map(o => { const op = o.path.replace(/^\/x\//, ''); return `<span class="o">+ ${goHTML(op, cells.has(op) ? folderOf(op) : op, cells.has(op) ? last(op) : op, 'r')}${o.pin ? ` held at ${o.pin}` : ''}</span>`; }).join('')}</div>`);
+    p = ip;
+  }
+  return `<div class="sv-chain">${lines.join('')}</div>`;
 }
 
 // ---------- the world, drawn: what was written on the left growing down, what was asked to the right growing out ----------
@@ -476,7 +511,7 @@ function mcpSource(opts = {}) {
       return deliver(fresh.map(line));
     }
     async function backlog() {   // what happened before the page opened: the last page of history, oldest first, drawn once
-      const page = await rpc('history', { before: 0, limit: 40, ...(who ? { who } : {}) });
+      const page = await rpc('history', { before: 0, limit: 40, with: 'x', ...(who ? { who } : {}) });   // with x: the quiet rule reads what each event wrote
       const events = (page.events || []).filter(e => !e.shown && wanted(e)).reverse();
       for (const e of events) seen(e);
       return deliver(events.map((e, i) => ({ ...eventOf(e), quiet: i < events.length - 1 })));
@@ -505,7 +540,7 @@ function start(doc) {
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
