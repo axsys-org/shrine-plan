@@ -1,14 +1,25 @@
 # Goo Unicode text infrastructure
 
-Deliver a reusable Unicode text system before building the shared document
-editor. Grove applications keep their existing declarative ownership model.
-Goo computes layout and editing geometry on the server. Mash paints prepared
-glyphs and captures input. This specification supplies the T1–T6 tickets in the
-[document workspace plan](goo-document-workspace-plan.md).
+Deliver the shared Unicode shaping and direct-editing infrastructure that
+extends the [native block document plan](goo-document-workspace-plan.md).
+The B0–B4 block authoring prototype can use existing Grove forms and the selected
+branch's rendering coverage before this work is complete. General multilingual
+inline editing requires the qualification gates here. Grove applications keep
+their declarative ownership model; Goo computes server layout and editing
+geometry, and Mash paints prepared glyphs and captures input. This specification
+owns the subsequent T1–T6 infrastructure tickets.
 
 The selected implementation uses a persistent native HarfBuzz/ICU service,
 a pinned Mash font profile, a checked Foil continuation boundary, and an SVG
 glyph-outline painter. These are planned additions, not existing capabilities.
+
+Rebased in scope on 2026-10-22 against `origin/lf/goo-contracts` at `1c3e3e6`.
+Reuse `goo/text`, `goo/runt`, descriptor preservation, codecs and resolved run
+styling from that branch. Extend its language/capability boundary deliberately;
+do not replace its representation or recreate `text.foil` as a different model.
+The branch already uses display version 2 for styled runs, without Unicode
+shaping. The Unicode service protocol, profile and prepared editing capabilities
+must be versioned explicitly; this specification reserves no display version.
 
 ## Ownership
 
@@ -45,7 +56,7 @@ handshake names protocol version, engine revision, ICU data revision, shaping
 features, paint capabilities, and the font bundle revision. A mismatch fails
 before layout starts.
 
-Mash's version 2 profile contains:
+The proposed Unicode-capable Mash profile contains:
 
 - Full font files and hashes, face indexes, licenses and immutable font IDs.
 - Explicit fallback chains by style/script and language policy where relevant.
@@ -57,7 +68,7 @@ Mash's version 2 profile contains:
 
 Use full, pinned fonts covering Latin, Hebrew, Arabic, CJK and monochrome emoji.
 T1 selects and verifies concrete files; a font family name alone is insufficient.
-Preserve the version 1 bundle as a compatibility artifact. Font acquisition and
+Preserve the baseline profile and styled-run bundle as compatibility artifacts. Font acquisition and
 outline extraction happen in the controlled build/runtime service, never by
 browser/system fallback.
 
@@ -177,7 +188,7 @@ infer their offsets from painted DOM spans.
 
 ## Painter and accessibility
 
-Use SVG paths and reusable glyph definitions for the first version 2 painter.
+Use SVG paths and reusable glyph definitions for the first Unicode glyph painter.
 Extract outlines through HarfBuzz's glyph drawing interface, cache them by
 font hash/face/glyph/variation identity, and place them at Goo's prepared
 positions. HarfBuzz exposes a drawing API for extracting glyph shapes.
@@ -185,7 +196,7 @@ positions. HarfBuzz exposes a drawing API for extracting glyph shapes.
 
 The browser may rasterize paths and apply a viewport transform. It does not
 reshape text or choose glyph positions. Do not use SVG `text`, canvas
-`fillText`, CSS wrapping, or DOM range geometry as a fallback for version 2.
+`fillText`, CSS wrapping, or DOM range geometry as a fallback for shaped text.
 Bit-identical antialiasing across operating systems is not an acceptance goal;
 identical layout inputs and prepared geometry are.
 
@@ -252,16 +263,21 @@ Chromium, Firefox and WebKit painting at different widths, text scales and
 canvas transforms. Check caret/hit round trips and that copy preserves logical
 order. Use real OS IME and VoiceOver before declaring the input surface ready.
 
-Retain version 1 geometry tests unchanged. Add version 2 tests that do not
+Retain baseline plain and styled-run geometry tests. Add Unicode tests that do not
 promote arbitrary browser measurements into the expected layout. Cross-check
 pure records, rendered path extents and visible fixtures separately.
 
-Use cold/warm 1 KiB, 20 KiB and mixed-script paragraphs, then the document
-plan's 100/1,000-block fixtures. The local targets remain p95 50 ms incremental
+Use cold/warm 1 KiB, 20 KiB and mixed-script paragraphs, then 100- and 1,000-block
+direct-editing fixtures. These extend the smaller block-authoring prototype's
+scale tests. The direct-editing targets are p95 50 ms incremental
 preparation and 120 ms input-to-matching-paint; report shaping, host transfer,
 Foil fitting and painting separately. These are targets to validate.
 
-## Immediate implementation tickets
+## Infrastructure implementation tickets
+
+These follow the initial B0–B4 document prototype, or may proceed independently
+once representation and capability contracts are fixed. They are not required
+to render and edit blocks through the existing form controls.
 
 **T1: reproducible service and profile contract.** Add the native package,
 length-framed codec, capability handshake, engine/profile manifest and selected
@@ -275,7 +291,14 @@ outline extraction. Run the multilingual corpus directly against the service.
 Exit with verified glyph/cluster results, measured cold/warm costs, and no
 dependency on browser measurement.
 
-T3 integrates Goo's fitting and geometry. T4 proves painting and real input.
-T5 integrates persistent host execution and invalidation. T6 qualifies and
-releases the paired infrastructure. The document prototype starts on that
-released path; it does not introduce a temporary ASCII text model.
+| Ticket | Work | Required evidence |
+| --- | --- | --- |
+| T3 | Goo fitting, line-specific bidi/reshaping and prepared editing geometry | Logical/visual maps, carets, selections and empty-line fixtures |
+| T4 | Shared glyph painter, semantic layer and native input | Exact prepared geometry, keyboard/accessibility and real IME qualification |
+| T5 | Persistent service host, invalidation and incremental caches | Same service on CLI/live paths; late replies refused; measured costs |
+| T6 | Cross-platform corpus, compatibility and paired release | Qualified multilingual direct-editing surface with explicit coverage |
+
+T3 depends on T2; T4 uses T2/T3; T5 integrates their results; T6 qualifies T5.
+The document adopts these capabilities through the same run values and Grove
+actions used by the initial prototype. No second ASCII-only text model or
+application-specific input engine is introduced during the transition.

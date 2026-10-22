@@ -1,11 +1,68 @@
 """MCP acceptance for the lean mount: four tools over the native cards, and a cell."""
 import json
+import http.client
+import socket
 import statistics
 import time
+import urllib.parse
 import urllib.request
+from contextlib import ExitStack
+
+
+def check_connections(base, timeout):
+    """Idle, partial and malformed clients must not block a complete MCP request."""
+    address = urllib.parse.urlsplit(base)
+    timeout = min(timeout, 5)
+    body = json.dumps(dict(jsonrpc='2.0', id=99, method='tools/list', params={})).encode()
+    head = (b'POST /mcp HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n'
+            + b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n')
+
+    def response(sock, status=200):
+        reply = http.client.HTTPResponse(sock)
+        reply.begin()
+        assert reply.status == status, reply.status
+        data = reply.read()
+        reply.close()
+        if status == 200:
+            assert json.loads(data)['result']['tools'], data
+
+    with ExitStack() as stack:
+        def connect():
+            return stack.enter_context(socket.create_connection(
+                (address.hostname, address.port or 80), timeout=timeout))
+
+        # More idle sockets than a small reader pool, like browser preconnects.
+        idle = [connect() for _ in range(8)]
+        header = connect()
+        header.sendall(head[:12])
+        partial_body = connect()
+        partial_body.sendall(head + body[:7])
+
+        complete = connect()
+        complete.sendall(head + body)
+        response(complete)
+
+        # Stalled clients still finish correctly, even in reverse arrival order.
+        partial_body.sendall(body[7:])
+        response(partial_body)
+        header.sendall(head[12:] + body)
+        response(header)
+        idle[0].sendall(head + body)
+        response(idle[0])
+
+        malformed = connect()
+        malformed.sendall(b'GET /bad\x01 HTTP/1.0\r\n\r\n')
+        response(malformed, 400)
+        for sock in idle[1:]:
+            sock.close()
+        healthy = connect()
+        healthy.sendall(head + body)
+        response(healthy)
+    print('HTTP concurrency passed: idle sockets, partial headers/body, malformed input and recovery', flush=True)
 
 
 def check(base, node, timeout):
+    check_connections(base, timeout)
     durations = []
     sequence = 0
 

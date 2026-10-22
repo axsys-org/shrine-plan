@@ -3,6 +3,7 @@ import copy, gzip, json, random, struct, subprocess
 from runtime import GOO, BUILD, invoke
 from adapter import batch, codec_json
 from decimal import Decimal
+from text_contract import legacy_text_fields
 import sys
 sys.path.insert(0,str(GOO/"scripts/porting"))
 from oracle_compare import first
@@ -90,6 +91,7 @@ def cases():
     return out
 
 def comparable(value):
+    value = legacy_text_fields(value)
     # These three fields are Double in the contract. Compare exact IEEE bits,
     # not decimal spellings or tolerances; all other fields remain exact.
     if isinstance(value,dict):return {k:('binary64:'+struct.pack('>d',float(v)).hex() if k in ('maxIdeal','value','max') and type(v) in (int,float) else comparable(v)) for k,v in value.items()}

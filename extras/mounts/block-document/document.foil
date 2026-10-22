@@ -1,0 +1,156 @@
+- grove_role_runtime
+- goo_app/text
+
++ block_document
+  + block
+    : id=nat kind=str runs=goo/text
+  + snapshot
+    : blocks=row[block_document/block]
+  + document
+    : revision=nat serial=nat blocks=row[block_document/block]
+      past=row[block_document/snapshot] future=row[block_document/snapshot]
+  + request
+    : revision=nat operation=str id=nat run=nat offset=nat value=str style=str kind=str
+  + printable
+    \ value=str
+    ^ bool
+    ? (gt value.len 4096) .false
+    | (row/range 0 value.len).all((\ i (and (ge value.at(i) 32) (le value.at(i) 126))))
+  + styles
+    \ value=str
+    ^ maybe[myth]
+    ? (eq value "plain") (./some myth/new)
+    = names=row[str] value.split_byte(32).keep((\ name=str (gt name.len 0)))
+      allowed=row[str] ["bold" "italic" "underline"]
+    ? !(names.len) .none
+    ? !(names.all((\ name=str allowed.has(name)))) .none
+    ? !(eq names.len names.keep((\ name=str (eq 1 names.keep((\ other=str (eq name other))).len))).len) .none
+    = flags=row[modifiers] names.map(block_document/modifier)
+    | ./some (myth/sing ['sys 'modifiers] (pails/modifiers flags.stream))
+  + modifier
+    \ name=str
+    ^ modifiers
+    ? (eq name "bold") (modifiers/bold)
+    ? (eq name "italic") (modifiers/italic)
+    | modifiers/underline
+  + style
+    \ run=goo/runt
+    ^ str
+    ?> (./some held) run.myth.get(['sys 'modifiers]) "plain"
+    ?> held=pails/modifiers held "plain"
+    | str/join " " held.values.map(goo_text/modifier_name).row
+  + at
+    \ doc=block_document/document id=nat
+    ^ maybe[block_document/block]
+    = found doc.blocks.keep((\ b (eq b.id id)))
+    ? found.len (./some found.at(0)) .none
+  + position
+    \ doc=block_document/document id=nat
+    ^ maybe[nat]
+    % i=nat 0
+    ^ maybe[nat]
+    ? (eq i doc.blocks.len) .none
+    ? (eq doc.blocks.at(i).id id) (./some i)
+    | _ i.inc
+  + valid
+    \ blocks=row[block_document/block]
+    ^ bool
+    ? ((eq blocks.len 0) || (gt blocks.len 100)) .false
+    = ids blocks.map((\ b b.id))
+    ? !(eq ids.len ids.keep((\ id (eq 1 ids.keep((\ other (eq id other))).len))).len) .false
+    | blocks.all
+      \ b
+      = kinds=row[str] ["heading" "paragraph" "bullet"]
+      ? !(kinds.has(b.kind)) .false
+      ? ((eq b.runs.len 0) || (gt b.runs.len 64)) .false
+      | b.runs.all((\ r (block_document/printable r.lang.txt)))
+  + finish
+    \ doc=block_document/document blocks=row[block_document/block] serial=nat
+    ^ either[str block_document/document]
+    ? !(block_document/valid blocks) (./err "Document limit or invalid block content")
+    = history doc.past.snoc((block_document/snapshot doc.blocks))
+      history history.drop((? (gt history.len 50) (sub history.len 50) 0))
+    | ./ok (block_document/document doc.revision.inc serial blocks history [])
+  + replace
+    \ blocks=row[block_document/block] block=block_document/block
+    ^ row[block_document/block]
+    | blocks.map((\ old (? (eq old.id block.id) block old)))
+  + apply
+    \ doc=block_document/document req=block_document/request
+    ^ either[str block_document/document]
+    ? !(eq req.revision doc.revision) (./err "Stale document revision; retain and review your draft")
+    ? (eq req.operation "undo")
+      ? !(doc.past.len) (./err "Nothing to undo")
+      = previous doc.past.at(doc.past.len.dec)
+      | ./ok (block_document/document doc.revision.inc doc.serial previous.blocks doc.past.take(doc.past.len.dec) doc.future.snoc((block_document/snapshot doc.blocks)))
+    ? (eq req.operation "redo")
+      ? !(doc.future.len) (./err "Nothing to redo")
+      = next doc.future.at(doc.future.len.dec)
+      | ./ok (block_document/document doc.revision.inc doc.serial next.blocks doc.past.snoc((block_document/snapshot doc.blocks)) doc.future.take(doc.future.len.dec))
+    ?> (./some index) (block_document/position doc req.id) (./err "Block does not exist")
+    = block doc.blocks.at(index)
+    ? (eq req.operation "insert")
+      = next (block_document/block doc.serial "paragraph" (goo/text/en ""))
+      | block_document/finish doc (doc.blocks.take(index.inc).snoc(next).weld(doc.blocks.drop(index.inc))) doc.serial.inc
+    ? (eq req.operation "remove")
+      ? (eq doc.blocks.len 1) (./err "Keep at least one block")
+      | block_document/finish doc (doc.blocks.keep((\ b !(eq b.id req.id)))) doc.serial
+    ? ((eq req.operation "up") || (eq req.operation "down"))
+      ? (and (eq req.operation "up") (eq index 0)) (./err "Already the first block")
+      ? (and (eq req.operation "down") (eq index.inc doc.blocks.len)) (./err "Already the last block")
+      = target (? (eq req.operation "up") index.dec index.inc)
+        others doc.blocks.keep((\ b !(eq b.id req.id)))
+      | block_document/finish doc (others.take(target).snoc(block).weld(others.drop(target))) doc.serial
+    ? (eq req.operation "kind")
+      | block_document/finish doc (block_document/replace doc.blocks block.set_kind(req.kind)) doc.serial
+    ? (eq req.operation "merge")
+      ? (eq index.inc doc.blocks.len) (./err "No following block")
+      = next doc.blocks.at(index.inc)
+      ? !(eq block.kind next.kind) (./err "Only matching block kinds can merge")
+      = merged block.set_runs(block.runs.weld(next.runs))
+      | block_document/finish doc (doc.blocks.take(index).snoc(merged).weld(doc.blocks.drop((add index 2)))) doc.serial
+    ? (eq req.operation "append")
+      | block_document/finish doc (block_document/replace doc.blocks block.set_runs(block.runs.snoc((goo/runt myth/new (goo/lang/en ""))))) doc.serial
+    = run_exists (lt req.run block.runs.len)
+    ? !run_exists (./err "Run does not exist")
+    = run block.runs.at(req.run)
+    ? (eq req.operation "split")
+      ? (gt req.offset run.lang.txt.len) (./err "Split offset is outside this run")
+      = left run.set_lang((goo/lang/en run.lang.txt.slice(0 req.offset)))
+        right run.set_lang((goo/lang/en run.lang.txt.slice(req.offset (sub run.lang.txt.len req.offset))))
+        before block.set_runs(block.runs.take(req.run).snoc(left))
+        after (block_document/block doc.serial block.kind (block.runs.take(0).snoc(right).weld(block.runs.drop(req.run.inc))))
+      | block_document/finish doc (doc.blocks.take(index).snoc(before).snoc(after).weld(doc.blocks.drop(index.inc))) doc.serial.inc
+    ? !(eq req.operation "replace") (./err "Unknown document operation")
+    ? !(block_document/printable req.value) (./err "Use printable ASCII in this profile; split blocks explicitly for new lines")
+    ?> (./some metadata) (block_document/styles req.style) (./err "Style must be plain, bold, italic, underline, or a space-separated combination")
+    ' Change only modifiers. Links, fonts and any other descriptors survive.
+    = metadata
+        ? (eq req.style "plain") run.myth.del(['sys 'modifiers])
+        | run.myth.put(['sys 'modifiers] (metadata.get(['sys 'modifiers]).fall((pails/n 0))))
+      changed (goo/runt metadata (goo/lang/en req.value))
+      runs block.runs.take(req.run).snoc(changed).weld(block.runs.drop(req.run.inc))
+    | block_document/finish doc (block_document/replace doc.blocks block.set_runs(runs)) doc.serial
+  + page
+    \ doc=block_document/document
+    ^ goo/text
+    | doc.blocks.fold (goo/text/en "")
+      \ out=goo/text block=block_document/block
+      ^ goo/text
+      = label=str (str/cat_all ["[" (nat/show block.id) "] " (? (eq block.kind "bullet") "* " "")])
+        runs=goo/text
+          ? !(eq block.kind "heading") block.runs
+          | block.runs.map((\ run=goo/runt run.set_myth(run.myth.put(['sys 'font] (pails/p ['sys 'font 'sans750])))))
+      | out.weld((goo/text/en label)).weld(runs).weld((goo/text/en (str/from_atom 2570)))
+  + initial
+    ^ block_document/document
+    = bold (myth/sing ['sys 'modifiers] (pails/modifiers (list/one (modifiers/bold))))
+      italic (myth/sing ['sys 'modifiers] (pails/modifiers (list/one (modifiers/italic))))
+      link (myth/sing ['sys 'link] (pails/p [($x 17) 'user 'cells]))
+    | block_document/document 0 6
+      [(block_document/block 1 "heading" (goo/text/en "A small native document"))
+       (block_document/block 2 "paragraph" [(goo/runt myth/new (goo/lang/en "This page uses ")) (goo/runt bold (goo/lang/en "Goo text runs")) (goo/runt myth/new (goo/lang/en ", with ")) (goo/runt italic (goo/lang/en "formatting that survives edits."))])
+       (block_document/block 3 "paragraph" (goo/text/en "Select a block and run below, then edit its text. Insert, split, merge, and reorder with the same Grove actions."))
+       (block_document/block 4 "bullet" (goo/text/en "One document. Native Grove views. Pure Foil operations."))
+       (block_document/block 5 "paragraph" [(goo/runt link (goo/lang/en "Structured reference: /0x11/user/cells"))])]
+      [] []

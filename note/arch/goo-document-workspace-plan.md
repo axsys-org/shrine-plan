@@ -1,546 +1,318 @@
-# Goo Grove Mash document workspace implementation plan
+# Native Grove/Foil block document plan
 
-Build one authoritative document in Shrine and expose it simultaneously through
-Goo page, outline, and canvas projections. Grove declares the application,
-types, views, and actions. Goo prepares every content box, line, glyph advance,
-caret stop, and selection rectangle. Mash captures interaction and paints those
-prepared results.
+Build a small block document on the text and presentation contracts in
+`origin/lf/goo-contracts`. Grove declares the document, actions and views; Foil
+implements the model, operations and derived presentations. Shrine owns accepted
+state. Goo prepares the display; the shared host and Mash render it and capture
+input. BlockSuite is a behavioral reference, not a runtime dependency.
 
-The first delivery is reusable Unicode text infrastructure: a versioned Goo
-text service, pinned fonts, prepared editing geometry, and a matching Mash
-painter. The first document prototype uses that infrastructure in all three
-views. The next delivery adds durable storage, history, formatting, and transfer.
-There is no separate ASCII-only editor release.
+The first delivery is a useful **block authoring prototype**: read a formatted
+page, select a block, edit its text and formatting through a Grove form, apply
+one atomic change, and insert, split, merge or reorder blocks. Existing plain
+inputs edit individual run strings; the page renders the resulting rich text.
+Direct rich-text caret editing is a subsequent shared-infrastructure milestone.
 
-The [Unicode infrastructure specification](goo-unicode-text-infrastructure.md)
-defines the service boundary, font policy, painter, and first implementation
-tickets. All new APIs and modules in these documents are proposed work.
+This replaces the previous requirement to deliver Unicode shaping and three
+editable projections before proving a document. Canvas editing and durable
+storage also move to follow-up milestones. The prototype uses the branch's
+actual supported rendering coverage and runs within one sovereign lifetime;
+it is not a general multilingual editor or a durable notes product.
 
-## Scope and decisions
+## Baseline and existing capabilities
 
-1. The document is typed Foil data held by one Grove application record.
-   JSON is a versioned transport and export format.
-2. Application composition is Grove/Goo. Shared interaction code belongs in
-   Mash and the existing Goo host. The application mount has no custom browser
-   editor or layout code.
-3. There is no BlockSuite, ProseMirror, TipTap, Yjs, or independent JavaScript
-   document store in this implementation. Pinned HarfBuzz and ICU libraries
-   provide low-level text services beneath Goo.
-4. Goo retains server layout ownership. Mash may measure its viewport and map
-   pointer coordinates, but may not measure document text, choose wrapping,
-   infer line heights, or use CSS layout as document geometry.
-5. Unicode text infrastructure precedes the editor. The first release qualifies
-   accented Latin, combining marks, Hebrew/English, Arabic, CJK, and emoji
-   sequences against a pinned font bundle. Uncovered glyphs use an explicit
-   prepared fallback without replacing stored text. Font coverage and resource
-   limits remain explicit; an ASCII character whitelist does not define them.
-6. The first writer workflow is local and single-user. Multiple browser tabs
-   use revision checks; conflicting edits remain recoverable and are not
-   automatically merged.
-7. Page order and canvas placement are independent. Reordering a paragraph
-   changes document order. Moving its canvas occurrence changes its placement.
-   Both actions target the same block.
-8. Start with one document, one canvas scene, and at most one canvas occurrence
-   per block. Keep scene and occurrence identities in the protocol so later
-   multiple placements do not require changing block identity.
+Inspected on 2026-10-22 against the local remote-tracking branch
+`origin/lf/goo-contracts`, tip `1c3e3e6cea81af2f33b475d8500efabdb0fa3139`.
+The shared ancestor with this workspace is `f373423`. This plan does not mean
+that branch has been merged or that its tests have been rerun here. Preserve
+ongoing workspace changes when integrating it. Record the selected commit,
+paired Mash revision, assets and profile hashes in the implementation baseline.
 
-First document proof: multilingual paragraph, heading, and code blocks;
-insert/delete text; split and merge; reorder; selection shared across all three
-views; canvas move and width resize. The useful-editor milestone adds bullet
-items, images, basic marks, undo/redo, structured clipboard, export/import, and
-durable restart.
+The branch adds:
 
-Tables, comments, embeds, freehand drawing, rotation, arbitrary connectors,
-multi-document navigation, multiplayer, and offline editing are later work.
-
-## Implementation baseline
-
-The source baseline inspected on 2026-10-20 is Shrine `73166778`, local Mash
-`568b50d`, and standalone Haskell Goo `2f89dc4`. Shrine's Extras configuration pins
-Mash `16b8a9079e8a45dc2681cf3210e1d186e5cbe622`.
-
-Use Shrine's Foil Goo implementation as the production base. Use the Haskell
-checkout only as a reference. Select a Mash development branch containing the
-pinned patch implementation; do not reset the existing local checkout to make
-the versions match. Subsequent paired releases update the immutable pin and
-import the matching renderer profile together.
-
-Useful existing code:
-
-| Existing source | Reuse |
+| Existing contract on the branch | Reuse |
 | --- | --- |
-| [Goo preparation](../../extras/mounts/goo/prepared.foil) and [rendering contract](../../extras/mounts/goo/HTML.md) | Validated geometry and renderer ownership |
-| [Grove views](../../src/foil/grove_views.foil) | Constructor checking, declared panes, explicit selection ports |
-| [Goo runtime](../../src/foil/goo_runtime.foil) | Authority, revision checks, invocation capture, action admission |
-| [Goo session](../../extras/mounts/explorer/goo-session.js) and [panes](../../extras/mounts/explorer/goo-panes.js) | Selection, retained work, composition and departure lifecycle |
-| [Patch host](../../extras/mounts/explorer/goo-patch.js) | Scene admission, occurrence identity, graphical operation bindings |
-| [Hello Grove](../../extras/mounts/hello-grove/main.grove) | Declarative application composition |
-| [Grove playground model](../../extras/mounts/grove-playground/model.foil) | Typed aggregate data with separate placements |
-| [Mash document model](../../../mash/apps/catalog/src/stories/documents-model.ts) | Examples of marks, editing operations, and history fixtures |
-| [Mash workspace architecture](../../../mash/docs/document-workspace-architecture.md) | Document, session, accessory, and projection boundaries |
+| `goo/text = row[goo/runt]`, each run carrying `myth` and `lang` | Canonical rich text, rather than a second span/mark representation |
+| `goo/text/pail` and Explorer text formatting | Carry rich text through namespace values into ordinary presentations |
+| Run-preserving slicing, normalization and wrapping | Keep descriptors and source text connected through preparation |
+| `/sys/font`, `/sys/modifiers`, `/sys/link` | Typed supported font, bold/italic/underline and internal/web-link descriptors |
+| Prepared run fragments with boxes, baselines and resolved styling | Shared renderer paints supplied geometry and verified fonts |
+| Portable paint, semantics, controls and presentation references | Reuse host contracts instead of parsing generated HTML |
+| `pipeline=1` live preparation inspection | Diagnose the actual source-to-display preparation |
 
-Mash's catalog code is a behavioral reference. Its localStorage store, direct
-DOM editing, canvas geometry, and notebook snapshots do not become a second
-authority alongside Shrine.
+Source references below are paths **at the selected branch revision**; some do
+not exist yet in the current checkout:
 
-## Infrastructure before the document editor
+- `extras/mounts/goo/text.foil`, `text_tests.foil`: run values and codecs.
+- `extras/mounts/goo/run_style.foil`, `run_style_tests.foil`: supported styles.
+- `extras/mounts/goo/prepared.foil`, `PORTABLE.md`, `TYPES.md`: prepared output,
+  versioning and limitations.
+- `extras/mounts/explorer/goo_bridge.foil`: rich values and portable bindings.
 
-The shared text service is a persistent native worker built with pinned
-HarfBuzz and ICU. Goo's trusted host connects to it through a checked,
-versioned request/response protocol. Use a worker boundary first; a runtime
-primitive is an optimization only if profiling later justifies it.
+The branch does not provide a rich-text editor. Native inputs remain plain and
+single-line; styled input values are rejected. Only `en` and the existing ASCII
+measurement coverage are supported. Structured links are descriptive metadata;
+they do not supply navigation or invocation authority. HTML paints them as
+non-navigating spans. No general caret, range-selection or IME geometry follows
+from the presence of prepared rich-text fragments.
 
-ICU supplies segmentation, candidate line breaks, and bidi analysis. HarfBuzz
-shapes explicitly selected font runs. Goo chooses actual line breaks, requests
-reshaping at those boundaries, applies per-line bidi ordering, and prepares the
-final positions. The worker has no document mutation API and does not run a
-paragraph or page layout engine.
+Unstyled displays remain version 1; styled displays are version 2. These display
+versions do not identify Unicode shaping capability. A future Unicode service,
+profile and editing contract need their own explicit capability/version choices.
 
-Mash's profile owns the font manifest, fallback order, styles, and paint
-recipes. It identifies the matching engine/data revisions. The server never
-consults installed system fonts or downloads a font during a preparation.
-Version 1 retains its existing ASCII semantics for compatibility; new document
-surfaces explicitly request the Unicode version 2 profile.
+## Smallest useful experience
 
-The initial version 2 painter consumes positioned glyph outlines through SVG
-paths and cached definitions. A semantic text layer and native input capture
-provide accessibility and text operations without driving visual geometry.
-Monochrome emoji are sufficient for the first font bundle; color glyph painting
-is a separately declared capability. Do not pass shaped runs back through
-ordinary browser text rendering.
+A user opens a page containing a heading, two paragraphs, a bullet item and one
+read-only reference block. They select a paragraph and edit it in a side form.
+The form lists its runs as plain text fields with supported formatting controls.
+They can add a run, set bold or italic, and apply the edited block. The formatted
+page updates from the accepted document revision.
 
-Keep workers and fonts loaded. Cache analysis independently of width, shaped
-runs by their complete context, and final preparation by layout context. The
-first multilingual text specimen must pass painting, caret, real IME,
-accessibility, and local latency gates before the document UI is assembled.
+They insert another paragraph, split one at an explicit run/offset boundary,
+merge compatible neighbors, and move a block up or down. A stale second tab
+cannot overwrite their work: its apply is refused and its draft is retained.
+They can undo an applied change and inspect the underlying document through the
+namespace. Closing and reopening a view on the same running sovereign reads the
+same accepted document.
 
-## State and identity
+This form is a deliberate first editing surface, not a promise of inline typing.
+Run boundaries are visible in the form but are not line or word boundaries in
+the page. Do not put styled `goo/text` directly into a native input or flatten a
+formatted block into a string and discard its descriptors on save.
 
-Use a single aggregate document record initially. An operation can then update
-text, structure, placements, history, and its receipt as one staged namespace
-transition. Avoid separately writing each block and repairing partial edits.
+## Scope
 
-The following are proposed logical records, not existing Foil or Grove APIs:
+| Deliver now | Follow-up |
+| --- | --- |
+| One document, one formatted page and one selected-block form | Outline, multiple document navigation and canvas |
+| Heading, paragraph, flat bullet item and read-only reference block | Nested lists, code editor, tables, images and asset management |
+| Supported text runs and explicit formatting controls | Rich-text caret selection, inline toolbars and structured clipboard |
+| Atomic apply, structural operations, bounded undo/redo and stale refusal | Concurrent merge, presence and offline editing |
+| Existing profile coverage, with explicit refusal and recoverable drafts | Qualified Unicode shaping, bidi, grapheme editing and real IME |
+| Namespace state within one sovereign lifetime | Durable commit acknowledgment, crash recovery and retention |
+
+A reference block names a subject and an allowed presentation slot. Start with
+one vetted read-only presentation, for example a cell result. Preserve the
+subject's identity rather than copying its displayed text. Reuse the shared
+presentation host; if the ordinary page cannot embed it safely, add the narrow
+checked adapter or display a reference summary first. Do not claim an actionable
+embed until ownership, capture and retained-host behavior are qualified.
+
+## Document state and identity
+
+Keep the first document in one typed aggregate record. One admitted Grove action
+can replace the document facet atomically while preserving unrelated facets.
+There are no independently writable block mirrors or separate browser document
+store. A document root can later own other namespace children without making
+them part of this aggregate or source synchronization.
+
+Proposed logical shape, not existing Grove declarations:
 
 ```text
 Document
   schemaVersion, documentId, revision, nextBlockId
-  rootChildren: ordered BlockId list
+  order: ordered BlockId list
   blocks: BlockId -> Block
-  scenes: SceneId -> ordered Placement list
-  assets: AssetId -> AssetMetadata
+  undo, redo: bounded document-content checkpoints
 
 Block
-  id, incarnation, kind, schemaVersion
-  props, text, marks, children: ordered BlockId list
+  id, incarnation
+  content:
+    heading(level, goo/text)
+    paragraph(goo/text)
+    bullet(goo/text)
+    reference(subjectReference, presentationSlot)
 
-Placement
-  occurrenceId, blockId, x, y, width, order
-
-TextAnchor
-  documentId, blockId, incarnation, utf8Offset, affinity
-
-EditorSelection
-  text: anchor + focus, or blocks: ordered BlockId list
-
-EditEnvelope
-  documentId, baseRevision, invocationId, clientSessionId, sequence
-  selectionBefore, operations, historyGroup
+Edit request
+  expectedDocumentRevision, blockId, expectedIncarnation
+  operation arguments
+  existing Goo invocation identity and captured receiver evidence
 ```
 
-Block IDs are document-local, allocated by the authority, and never reused.
-Undo restores a removed block's semantic ID with a new incarnation so old
-captures do not regain authority. Goo compiler node IDs and canvas occurrence
-IDs are render identities, never persisted text anchors.
+Publish this as Grove roles and explicit Foil types/codecs where a closed content
+sum is required. Grove's generated conversions and action contracts are the
+schema boundary. JSON is transport/export data, not another document model.
 
-Parentage is defined only by ordered child lists. Validate unique membership,
-reachability, kind-specific nesting, and absence of cycles. Derived parent and
-lookup indexes are caches. An outline initially shows the entire block tree in
-document order; a headings-only outline can be a later filtered projection.
+Text content is exactly `goo/text`; do not add a parallel `text + marks` store.
+The run `myth` holds descriptors, not a writable receiver or executable behavior.
+Support only the branch's validated rendering descriptors in new authoring.
+Preserve valid stored data during failed edits; reject unknown or unsupported
+values explicitly instead of coercing or silently stripping them.
 
-Placement width is authored; content height is derived by Goo. Persist signed,
-finite model coordinates using the checked numeric codecs. Do not copy the
-playground's application-specific biased-coordinate representation.
+Allocate document-local block IDs on the authority and never reuse the allocator
+when restoring history. Undo can restore a deleted semantic ID with a fresh
+incarnation. Checkpoints contain content, not recursive copies of undo/redo or
+invocation receipts. Cap retained checkpoints and report that bound. Coalesce
+adjacent runs only when their complete descriptors and language match.
 
-Text offsets are UTF-8 byte boundaries, matching Foil's byte-oriented strings.
-The input adapter converts browser UTF-16 offsets explicitly. The server
-validates scalar boundaries and requires grapheme boundaries for user cursor
-movement and deletion. It never assumes bytes, code points, UTF-16 units,
-graphemes, and shaping clusters are interchangeable. Normalize CRLF and CR to LF
-on ingestion; do not otherwise normalize Unicode or change content during
-rendering.
+The first model is a flat ordered block list: every block appears exactly once.
+No scenes, assets, nested parent indexes or generic block-plugin registry are
+needed. A run index and offset are meaningful only within the captured document
+revision. Do not persist them as cross-revision annotation anchors.
 
-Selection, scroll position, viewport, active tool, pending input, and composition
-are local session state. History stores the selection before and after an edit
-for restoration. Ordinary selection or camera changes create no undo entries.
+## Grove actions and Foil operations
 
-## Operations and transactions
+Use ordinary declared actions on the document receiver, backed by pure Foil
+validation and transformation. Reuse Goo's authority, publication, revision,
+invocation and receipt mechanisms. A document revision field is not a replacement
+for the existing namespace receiver checks.
 
-Implement one pure operation reducer returning either a complete next state or
-a typed rejection. Initial operations are:
-
-| Operation | Required behavior |
+| Operation | First contract |
 | --- | --- |
-| `replace_text` | Replace a logical range; update marks and anchors |
-| `split_block` | Split content and marks, allocate the following block, move the caret |
-| `merge_blocks` | Merge compatible adjacent blocks and map affected anchors |
-| `insert_blocks` | Allocate IDs and insert a validated slice |
-| `remove_blocks` | Remove a subtree and its placements; select a surviving neighbor |
-| `move_blocks` | Reorder/reparent atomically; reject cycles |
-| `set_block_kind` | Convert only when the target schema can preserve the content |
-| `set_mark` | Add/remove a supported mark over a logical range |
-| `set_placement` | Move or change the width of an existing scene occurrence |
-| `undo` and `redo` | Apply recorded semantic inverses and restore valid selections |
+| Apply block draft | Validate and replace one block's typed content; preserve other blocks and unrelated receiver facets |
+| Insert block | Allocate an ID and insert a supported block at a checked position |
+| Remove block | Remove one block and choose a surviving selection; retain an editable empty paragraph when needed |
+| Move block | Change order with up/down commands; preserve identity and content |
+| Split text block | Split at a checked run/logical-text offset; preserve descriptors and allocate the following block |
+| Merge text blocks | Merge compatible adjacent blocks; retain runs and remove only the merged identity |
+| Change kind | Convert paragraph, heading or bullet without losing its text runs |
+| Undo / redo | Restore a bounded content checkpoint as a new revision; preserve allocator and receipt identity |
 
-Enter splits; Backspace at a block start merges compatible siblings. A
-cross-block deletion is one operation batch with one history entry. Code blocks
-retain Enter as a newline. Initial list nesting is restricted to explicit
-bullet-item children.
+First supported offsets use the baseline's validated ASCII byte boundaries.
+They are not a general Unicode anchor API. If a request is outside supported
+coverage, refuse it with the draft intact. Line breaks require an explicit
+structural operation in this prototype; a single-line input must never silently
+turn pasted multiline content into a different document. A future code block
+and multiline editor require their own qualified input contract.
 
-All toolbar, keyboard, menu, outline, and canvas actions go through the same
-Grove action binding and existing Goo invocation capture. The action validates
-the document revision, block incarnations, schema, and authority. Browser
-properties cannot select a different writable receiver.
+One apply is one document transition and one checkpoint. Edit the form locally
+and commit on explicit Apply rather than making each keystroke a namespace
+mutation. A refusal changes no document content or undo history; shared admission
+may retain its failure outcome. Repeated
+identified invocations follow the shared Goo retry rules; do not implement an
+application-side retry loop that gives an uncertain mutation a new identity.
 
-One mutation is in flight per document session. Buffer subsequent edits as
-ordered logical intents. After acknowledgment, map their anchors through the
-accepted operation results before sending the next batch. A stale base revision
-caused by another writer stops the queue and retains its pending text for
-recovery; this release does not claim concurrent text rebasing.
+The existing invocation journal is finite. Measure it and report exhaustion
+honestly. Use bounded prototype sessions and preserve drafts on refusal. A
+long-running editor requires shared receipt retention/compaction before release;
+full-history storage and a custom task journal are not prototype prerequisites.
 
-History grouping is separate from transport batching. Consecutive typing may
-share a history group; selection changes, block changes, formatting, paste,
-composition completion, and structural commands close the group.
+## Views, drafts and embeds
 
-## Prepared text and document layout
+Use existing Grove views, groups, inputs and actions for the page and editing
+form. Render rich text through the branch's ordinary text carrier. Format controls
+modify the canonical run descriptors through typed operation arguments.
 
-Introduce the version 2 Unicode prepared-text contract and paired Mash profile
-through the infrastructure tickets. Preserve version 1 behavior for existing
-consumers; do not reinterpret the current `lines` field or change legacy
-empty-text sizing.
+Selection is a local block identity plus its captured document revision and
+incarnation. The generic namespace list source cannot automatically enumerate
+logical blocks inside an aggregate. Start with a bounded typed block projection
+and explicit target mapping; add a narrow shared source adapter only where the
+existing view machinery requires it. Do not create four new document pane
+constructors or writable shadow records to get a list.
 
-A prepared text block must carry:
+Shared session machinery retains the selected block and unsaved form values.
+Applying from another tab causes stale refusal and retains the draft for explicit
+review/reapply. Do not silently rebase it. Refresh, width changes and entering a
+reference presentation must not destroy the active input owner. Application
+code must not replace an editing subtree with `innerHTML`.
 
-- Document/block/incarnation identity, document revision, and draft sequence.
-- Profile revision, content hash, available width, scale, and direction.
-- Explicit lines, visual runs, styles, baselines, and advance positions.
-- Glyph/font/paint references and logical text ranges mapped to visual runs.
-- Valid caret stops with affinity and their rectangles.
-- Hit regions and enough range geometry to paint logical selections.
-- An editable empty-line box and a final-newline caret line, even where the
-  static version 1 text primitive has no line box.
+Goo owns page wrapping, line boxes, run positions and paint. The form's existing
+native controls retain their established input behavior; their geometry is not
+used to position text or selections in the formatted page. No application-specific
+contenteditable, canvas text measurer, DOM-range layout or JavaScript rich-text
+store is introduced.
 
-The Unicode service supplies shaped runs and cluster maps for the selected
-fonts, language, script, direction, and style. Goo derives lines and editing
-geometry from them. Store logical-to-visual maps and boundary affinity from the
-start, including ligature caret policy and mixed-direction selections. Rich
-text uses this same path when marked spans are added.
+Pin the code/profile/fonts needed by the selected branch. The client must support
+styled display version 2 before mounting those displays, and diagnose unsupported
+contracts. Metadata on a link or reference grants no action authority. Historical
+views are read-only and use captured references or an explicit unavailable state.
 
-Mash uses explicit positions. It may search prepared hit regions, transform
-coordinates, and paint carets/selections. It may not call `measureText`, derive
-document geometry from DOM `Range` rectangles, or let a contenteditable region
-rewrap the document.
+## Implementation footprint
 
-The page projection prepares an ordered vertical document surface. The outline
-prepares compact block summaries. The canvas prepares each block at its
-placement width. The same block can therefore have different line breaks in the
-page and canvas while sharing all content and identity.
+Start with one mount, proposed as `extras/mounts/block-document/`:
 
-Goo also supplies outline indentation, row heights, disclosure boxes, and row
-positions. Reuse Mash's tree interaction and accessibility conventions without
-using an independently laid-out tree as the geometry authority. Workspace
-chrome may allocate pane rectangles; document content inside those rectangles
-always follows Goo preparation.
-
-Each view is prepared from the same captured document revision. On a commit,
-invalidate all three views. Stage their new displays and publish a coherent
-workspace revision; late responses from another width, profile, incarnation, or
-draft cannot overwrite the current display.
-
-During canvas dragging, Mash may translate the existing prepared occurrence as
-a transient gesture preview. During width resize it shows an outline and
-requests a Goo preview at the proposed width; existing text is not stretched or
-rewrapped by the browser. Goo supplies the accepted height and final geometry.
-Panning and zooming transform the prepared scene without changing text layout.
-
-Cache preparation by content/marks/schema/profile/context. Recompute changed
-blocks and dependent following positions, preserving unaffected occurrence
-shells and active input capture. Start with correctness before virtualization.
-
-## Input and composition
-
-Add a shared Mash `goo-text-editor` element. It contains a native input capture
-surface and a Goo-prepared visual surface. The native control supplies keyboard,
-clipboard, accessibility, and OS composition events; its own layout is never
-used for the visible document. Position the capture surface using Goo's caret
-rectangle, including the canvas transform.
-
-Use `beforeinput`, `input`, and composition events to produce logical intents.
-Retain a fallback for browser event differences. During IME composition, keep
-the native capture node alive and preserve its buffer. Request read-only Goo
-preparation of the draft text to paint preedit content; commit the completed
-composition as one transaction. Cancellation must restore the accepted content.
-Native candidate windows remain OS input UI, not document layout.
-
-The read-only draft operation applies pending intents to an ephemeral copy of
-an authorized document revision and invokes the same Goo preparation. It never
-changes namespace state, history, receipts, or persistence. Bound draft payload
-size and work; accept neither arbitrary HTML nor executable source.
-
-Pending text can advance ahead of the last painted geometry. Only a matching
-Goo response advances visible text and its caret together. Do not invent
-positions for unprepared text. On slow or disconnected responses, retain the
-buffer and show its pending state. Unsupported input remains recoverable without
-being committed as silently altered content. Missing font coverage is handled
-by a Goo-prepared fallback while preserving valid text; it does not invoke a
-browser font fallback.
-
-Use one active text capture session per document workspace. Clicking the same
-block in another view transfers the logical selection and keeps pending edits.
-Toolbars retain that selection without starting another text owner. Browser
-undo is intercepted and translated to document history.
-
-The first input spike must include VoiceOver and keyboard-only use, capture
-focus, copy/paste, and native composition events. A visually correct painter
-with an inaccessible editing surface does not pass.
-
-## Projection and selection integration
-
-Current Goo selection sources describe namespace records or patch occurrences.
-A document's blocks are logical members of an aggregate, so add an explicit
-document-block source adapter. Do not create independently writable mirror
-records merely to make the existing list source accept them.
-
-Register the adapter through trusted host configuration, like the existing
-patch query provider pattern. Its records include document path, document ID,
-block ID, incarnation, order, parent, and revision. Extend capture validation to
-resolve those references against the current aggregate.
-
-Proposed pane constructors are `document_selection`, `document_page`,
-`document_outline`, and `document_canvas`; proposed view content uses
-`editable_text`. These names require compiler, IR, host, and renderer changes
-before they are valid Goo syntax.
-
-The workspace declares one selection owner and passes its port explicitly to
-Page, Outline, and Canvas panes. Text selections identify their containing
-blocks. Canvas occurrence targets map to those block identities before entering
-the shared owner. Preserve encounter/incarnation checks and departure guards.
-
-The current patch population accepts passive Goo content. Extend it with a
-checked editable-text occurrence binding instead of allowing arbitrary actions
-inside scene data. Bind that occurrence to a statically published edit action,
-the document provider, and its current block evidence. The shared text editor
-then follows the same invocation and input lifecycle in both page and canvas.
-
-The outline offers the same reorder commands as the page. Initially use buttons
-and keyboard commands for reorder; semantic drag can reuse the commands after
-the basic contract is proven. Do not rely on the generic physical-child listing
-order or silently truncate a document to its existing finite source limit.
-
-## Repository changes
-
-Names marked new are planned additions. Mount source files remain flat; logical
-module paths are declared in `mount.json`.
-
-| Location | Responsibility |
+| File | Responsibility |
 | --- | --- |
-| `extras/mounts/goo/native/text-service/` — new | Persistent native HarfBuzz/ICU worker, protocol codecs, glyph outline extraction and service tests |
-| `extras/mounts/goo/text.foil`, `text_codec.foil`, `text_layout.foil` — new | Typed text-service continuation, response validation, Goo-owned line fitting and editing geometry |
-| `extras/mounts/goo/host/text_service.py` — new | Shared worker lifecycle, requests, cancellation and revision checks for CLI and live preparation |
-| Goo/root Nix package definitions and locks | Pin service build, HarfBuzz, ICU and Unicode data; include them in production fingerprints |
-| `extras/mounts/document-core/` — new | `model.foil`, `operations.foil`, `selection.foil`, `history.foil`, `codec.foil`, `tests.foil`; typed document rules without DOM or persistence I/O |
-| `extras/mounts/document-workspace/` — new | `main.grove`, `mount.foil`, `projection.foil`, `storage.foil`, `host.py`, fixtures and browser checks; `/document-workspace` entrypoint |
-| `src/foil/goo.foil`, `grove_views.foil`, `goo_runtime.foil` | Declared document constructors, typed source/binding adapters, capture validation, compatible receipt extension |
-| `extras/mounts/goo/types.foil`, `codecs.foil`, `layout.foil`, `prepared.foil`, `html.foil` | Version 2 text integration and profile dispatch; preserve `ascii.foil` for version 1 |
-| `extras/mounts/explorer/goo_document.foil`, `goo-document.js` — new | Generic host lowering, session integration, input/projection reconciliation |
-| Existing Explorer session/actions/panes/patch files | Reuse established lifecycle and operation paths |
-| Mash `packages/shrine-components/src/text/` — new | Reusable version 2 glyph painter, semantic text and native input capture |
-| Mash `packages/shrine-components/src/document/` — new | Document composition, prepared selection overlays and Goo adapter over the shared text element |
-| Mash `packages/goo-profile/` on the selected baseline | Unicode profile, pinned font/fallback bundle, geometry schema and conformance fixtures |
-| `src/foil/eden.foil`, `http_foot.foil`, host mount hooks as needed | Durable commit acknowledgment boundary; no renderer-specific storage logic |
+| `main.grove` | Slots, roles, actions, page/form views and initial document fixture |
+| `document.foil` | Typed content helpers, operation reducer, projection and bounded history helpers |
+| `tests.foil` | Model, operation and integration fixtures |
+| `mount.json` | Flat source registration and explicit dependencies |
 
-`document-core` depends only on core Foil/data facilities. `document-workspace`
-depends on `document-core`, Explorer, and codecs, and installs the domain
-providers. Explorer's shared bridge consumes declared provider contracts rather
-than importing the example application. No reverse dependency from Mash to the
-application is introduced.
+Use the existing host entry/install convention. Add a small mount adapter only
+if required by that convention. Split the Foil module when real complexity
+warrants it; a separate core mount, provider framework, worker process and custom
+application host are not initial deliverables.
 
-## Storage and invocation receipts
-
-Two existing constraints must be addressed before calling this a usable editor:
-the development launcher seeds a fresh namespace on restart, and the generic
-Goo invocation journal rejects new identified actions after 1024 entries.
-Typing must not exhaust that journal or require restarting to continue.
-
-Add a trusted receipt-store capability for document actions while preserving
-the default behavior of existing applications. Store the document revision,
-history transition, request identity/hash, and operation outcome together.
-Repeated identical requests return the same outcome; changed payloads with the
-same identity fail. Compaction must retain non-replayable identity information:
-an expired response cannot turn an old edit into a new mutation.
-
-Provide an explicit state directory through the application host, initially
-`GOO_DOCUMENT_STATE_DIR`. This is a proposed option, not an existing launcher
-feature. The host owns disk I/O; Foil owns the validated record format and
-replay semantics.
-
-Stage one validated transition, append its document/history/receipt record to a
-checksummed durable log, flush it, publish the namespace transition, then
-acknowledge. The document commit path remains serialized throughout. A crash
-after logging but before publication recovers by replay; a crash before durable
-logging cannot have produced a successful acknowledgment.
-
-Checkpoint complete states with atomic replacement and retain enough log to
-recover the last acknowledged operation. On startup, load and validate stored
-state before opening the workspace; seed only a genuinely absent document.
-Reject unsupported schema versions without overwriting them. Export/import is
-useful recovery functionality, but does not substitute for durable restart.
-
-The first durability patch must verify the supervisor's actual effect and
-publication boundary. If the current host cannot enforce the sequence above,
-extend that boundary before exposing a “saved” outcome. A save performed after
-an already successful action response is insufficient.
+Changes outside the mount must be justified by a demonstrated gap: carrying a
+rich value through Grove, rendering a bounded block projection, retaining form
+drafts, or admitting a checked read-only presentation. Place such behavior at the
+shared Goo/Explorer/Mash boundary and test it there. Do not import the example
+application into core runtime code.
 
 ## Delivery sequence
 
-Each row is a reviewable change with a required exit condition. Estimates are
-engineer-days for planning, not commitments. Text infrastructure is delivered
-before the first document prototype. The document model can proceed alongside
-it once the text/anchor contract is fixed.
+| Ticket | Work | Exit evidence |
+| --- | --- | --- |
+| B0 | Integrate the selected goo-contracts revision and matching renderer/assets without disturbing ongoing changes | Baseline and hashes recorded; existing text/style/prepared/profile and host checks pass |
+| B1 | Declare the aggregate, run carriers and pure operations | Round-trip, descriptor preservation, split/merge, ordering, malformed input and bounded undo/redo tests pass |
+| B2 | Render a seeded formatted page and select a block into a Grove form | Bold/italic/link runs survive wrapping; page and form identify the same canonical block |
+| B3 | Wire explicit Apply and structural commands through existing admission | Create/edit/split/merge/reorder/undo works; two-tab stale refusal retains the draft; exact retry cannot duplicate a mutation |
+| B4 | Present one checked read-only reference and qualify the authoring prototype | Referenced result is not copied; refresh/resize preserves input; renderer coverage and session limits documented; repeatable walkthrough |
 
-| Change | Scope | Depends on | Exit condition | Effort |
-| --- | --- | --- | --- | --- |
-| T1 | Compatible baseline, native service packaging, protocol and font manifest | — | Reproducible build; capability handshake identifies every text input dependency; version 1 gates pass | 2–3 |
-| T2 | ICU analysis, pinned fallback and HarfBuzz shaping | T1 | Multilingual analysis/shape fixtures pass with correct UTF-8 maps and no system-font lookup | 5–8 |
-| T3 | Goo line fitting, line-specific bidi/reshaping, prepared editing geometry | T2 | Wrapping, ligatures, empty lines, carets and selections pass the text corpus | 7–12 |
-| T4 | Mash SVG glyph painter, semantic layer and native input spike | T2, T3 | Geometry follows Goo; real IME, copy/paste, focus and VoiceOver work | 6–10 |
-| T5 | Persistent host integration, incremental caches and profile coexistence | T3, T4 | CLI/live paths use the same service; late responses and invalidations are correct; latency measured | 5–8 |
-| T6 | Cross-platform/font/browser qualification and paired infrastructure release | T5 | Required multilingual corpus passes on supported hosts and browsers | 4–6 |
-| D1 | Typed aggregate, IDs, codecs and pure document operations | T1 | Model round-trips; operations preserve Unicode and reject invalid anchors atomically | 4–6 |
-| D2 | Grove document source/selection adapter and three projections | D1, T6 | Same multilingual block selected and rendered in all views from one revision | 4–6 |
-| D3 | Shared edit loop; split/merge, reorder, canvas move/resize | D2 | Page/canvas edits update all views; caret and composition survive projection changes | 5–8 |
-| D4 | History, anchor restoration and durable receipt semantics | D3 | Undo/redo preserve grapheme boundaries; 10,000 edits work; retries never duplicate edits | 4–7 |
-| D5 | Durable host commit and recovery | D4 | Crash/restart tests recover exactly the acknowledged state and receipts | 6–10 |
-| D6 | Marks, bullets and structured text clipboard | D3, D4 | Marked multilingual split/merge and slices round-trip | 5–8 |
-| D7 | Images, asset storage, export and validated import | D5, D6 | IDs/assets remap correctly; semantic export preserves text; import is atomic | 4–7 |
-| D8 | Document-scale, browser/accessibility qualification and paired release | D5, D6, D7 | Full workflow, storage and performance gates pass | 5–8 |
+B0–B4 are the first delivery. A reference summary is acceptable while an embed
+adapter is unfinished, but report that explicitly; an inline embed claim requires
+its actual retained presentation and binding checks. Each row is reviewable;
+these are proposed tickets, not evidence of implemented behavior.
 
-T1–T6 deliver reusable text infrastructure. D1–D3 deliver the first shared
-document proof; D4–D8 deliver the useful editor. For two engineers, use an initial
-budget of 6–10 calendar weeks for infrastructure, 10–16 weeks cumulatively for
-the document proof, and 16–24 weeks for the useful release. Re-estimate after T4
-proves the native-input and exact-painter combination. These broader ranges
-include the Unicode work that the earlier ASCII-first sequence deferred.
+Then choose the next delivery from demonstrated use:
 
-The immediate tickets are T1 and T2. Start D1 once T1 fixes identity, offset,
-and profile contracts. Preserve the text-first gate before assembling the
-document prototype.
+1. Shared direct text editing: prepared carets, logical selections, native input
+   capture and composition, using the same `goo/text` values and document actions.
+2. Unicode shaping/profile qualification from the
+   [Unicode infrastructure specification](goo-unicode-text-infrastructure.md).
+   This is required before claiming general multilingual inline editing.
+3. Durable native commits, long-session receipts and recovery before presenting
+   acknowledged edits as durable saves.
+4. Outline/canvas projections, richer blocks, clipboard and transfer after the
+   page authoring loop is qualified. Canvas geometry is separate from page order.
 
-## Acceptance and performance gates
+The direct-editing and Unicode contracts must be designed together; an ASCII
+editing spike does not establish grapheme, bidi or IME correctness. Preserve
+branch compatibility rather than assigning Unicode the already-used styled
+`display.version = 2`. No calendar estimate is justified until B0/B2 establish
+integration cost and the actual shared editing gap.
 
-The proof fixture contains a heading, multilingual paragraphs, an empty
-paragraph, and a code block. Its text includes the required corpus from the
-infrastructure specification. All three views are open at once.
+## Acceptance
 
-1. Select a paragraph in the outline. Page and canvas indicate the same block.
-2. Type in its page occurrence. The canvas receives the same accepted text.
-3. Continue editing in the canvas with the same logical caret and pending queue.
-4. Press Enter to split, then Backspace to merge. All views agree on identities,
-   order, content and selection.
-5. Reorder in the outline. Page order changes; canvas placement stays fixed.
-6. Move and resize a canvas occurrence. Page order and page width stay fixed;
-   canvas text receives freshly prepared Goo geometry.
-7. Change page width while typing. Stale geometry cannot replace the new
-   context, and focus/composition survive.
-8. Undo text, structure, reorder, and placement after history is added.
-9. Restart the server after storage is added. The same IDs, content, placement,
-   history and acknowledged outcomes return.
+Use a bounded fixture with a heading, an empty paragraph, a paragraph with plain,
+bold and italic runs, a bullet item, a structured link and a read-only cell
+reference. Exercise supported ASCII content and explicit unsupported-input cases.
 
-Automated validation includes pure operation/inverse tests, malformed protocol
-rejection, browser coordinate checks against prepared data, delayed/reordered
-responses, duplicate invocation replay, 10,000 sequential edits, and crash
-injection before/after each durable commit boundary.
+1. Apply a paragraph draft; the formatted page reads exactly the accepted run
+   values. The underlying `myth` descriptors survive wrapping and rereading.
+2. Split within a styled run, merge again, and verify logical text and descriptors.
+   Empty paragraphs remain selectable and editable through the form.
+3. Insert, move, change kind and remove blocks. Order stays valid and IDs are not
+   reused. Undo/redo restores content without restoring old action authority.
+4. Submit concurrent drafts from two sessions. The stale one fails atomically
+   and stays recoverable. A delayed response cannot overwrite a newer display.
+5. Retry an identified Apply after an interrupted reply. It does not apply twice.
+   Bounded journal/history exhaustion produces an explicit recoverable refusal.
+6. Change width and refresh while a form is dirty. Input values, focus and selected
+   block survive. Unsupported rendering/input never strips stored data.
+7. Read the reference subject independently and compare it with the page's
+   presentation. A derived subject remains read-only; metadata alone cannot
+   invoke actions or bypass receiver checks.
+8. Close and reopen the view on the running sovereign. Accepted state remains;
+   unsaved drafts are clearly distinguished. Restart persistence is not claimed.
 
-Retain the existing compatibility checks:
+Run meaningful Foil model tests, branch text/style/profile conformance checks,
+and shared host/browser checks for affected contracts. The example needs a real
+browser walkthrough, not only generated HTML or model tests. Record commands,
+versions and results; branch documentation's historical test counts are not a
+substitute for executing the integrated baseline.
 
-```sh
-python3 extras/mounts/goo/scripts/sync-mash-profile.py --check
-WISP=/path/to/locked/wisp python3 extras/mounts/goo/scripts/check-profile.py
-node --test extras/mounts/explorer/tests/*.test.cjs
-```
+Measure first and warm page preparation, apply-to-display latency and payload
+size on 20- and 100-block fixtures. Initial local target: warm p95 at most 150 ms
+from explicit Apply to matching display on the 100-block fixture, reported with
+hardware and build details. This is a proposed target, not a benchmark claim.
+Report cold compiler/startup time separately. Bound run counts and text sizes;
+refuse excess rather than silently truncating to a generic list source limit.
+Virtualization and 1,000-block editing are follow-up work driven by measurements.
 
-Add `extras/mounts/goo/scripts/check-text.py` in T6 for the native service,
-Unicode conformance corpus, version 2 preparation, and paired painter. This is
-a planned command. Version 1 conformance remains a separate compatibility gate.
+## Completion boundary
 
-Add mount tests and browser drivers as part of the corresponding changes:
-
-```sh
-# Planned commands; the document mounts and driver do not exist yet.
-WISP=/path/to/locked/wisp python3 extras/x/check --mount document-workspace
-node extras/mounts/document-workspace/check-browser.mjs \
-  http://127.0.0.1:8137 /path/to/compatible/mash /tmp/goo-document-check
-```
-
-Use the paired Mash build's browser tooling for renderer conformance and
-cross-browser runs. Run storage crash tests against an isolated state directory.
-
-Use 100-block and 1,000-block documents for scale, including one 20,000-character
-text block. No document may be silently shortened by the generic 64-member
-source limit. Report preparation time, end-to-end input latency, payload size,
-mounted node count and retained input/receipt memory.
-
-Initial local-host targets are p95 at most 50 ms for incremental preparation and
-120 ms from input to a matching painted display on the 100-block fixture.
-Record the hardware, build and sample count with measurements. These are
-acceptance targets, not existing benchmarks. A 1,000-block edit should avoid
-rebuilding every block's text layout. Long code/text lines must remain bounded.
-
-Simulate 150 ms and 500 ms transport delay plus disconnection. Content and
-ordering must remain correct; full WAN typing responsiveness is not promised.
-If the local latency gate fails, profile Foil evaluation, serialization,
-preparation caching and DOM admission before expanding features. Do not solve
-the failure by transferring wrapping to the browser. Running the same Goo
-engine nearer the user is a later deployment option that needs its own
-conformance gate.
-
-Browser qualification covers Chromium, Firefox and WebKit; keyboard-only use;
-VoiceOver; zoom/text scale; focus movement; and real OS IME. Synthetic
-composition events alone are insufficient. Test both page and transformed
-canvas editing. Audit allowed viewport measurements separately from prohibited
-document text measurement.
-
-## Later capabilities
-
-Additional scripts and font styles extend the pinned profile and its
-qualification corpus. Color glyph painting, variable font axes, vertical
-writing, language-specific hyphenation, and browser-side execution of the same
-Goo engine are separate capabilities. They do not justify delaying the
-required multilingual coverage until after the editor.
-
-Exact visual export uses the prepared glyph painter. Semantic HTML export
-preserves Unicode and marks but can reflow in its consuming application; it
-does not claim to reproduce Goo geometry outside the prepared renderer.
-
-Collaboration comes after the single-writer transaction, anchor, receipt, and
-durability contracts are stable. It requires an explicit native merge/rebase
-model, presence separate from document history, selective undo, reconnect and
-offline behavior. Revision rejection alone does not meet that requirement.
-
-Broader canvas tools, comments and tables then use the same operations,
-selection, prepared geometry, assets and persistence contracts.
-
-## Completion criteria
-
-The infrastructure release is complete when T1–T6 pass the required
-multilingual, geometry, input, accessibility, compatibility and performance
-gates.
-
-The first document proof is complete when D1–D3 pass the shared-document
-workflow and local latency gate using that released infrastructure, with no
-application-specific browser editor code.
-
-The useful release is complete when D4–D8 additionally pass durability,
-history, transfer, scale and accessibility qualification. Published font/script
-coverage remains explicit. Full BlockSuite parity is not a completion criterion
-for this sequence.
+B0–B4 complete a native block authoring prototype using real rich-text values,
+existing input contracts and one authority. They do not complete direct rich-text
+editing, Unicode infrastructure, durability or BlockSuite parity. Keep those
+capabilities named separately so the first working document does not grow into
+a workspace framework before anyone can use it.

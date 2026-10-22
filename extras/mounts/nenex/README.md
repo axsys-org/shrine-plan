@@ -4,7 +4,7 @@ A personal wiki with a Goo page library, Mash's pinned renderer profile, and a
 formatted semidoc reader. Run from the repository root:
 
 ```sh
-x/eden --mount nenex --compiler none --port 8131
+x/eden --mount nenex --mount cooperate --compiler none --port 8131
 ```
 
 Open [Nenex](http://127.0.0.1:8131/nenex). Use **Read page** in the library,
@@ -12,6 +12,10 @@ Open [Nenex](http://127.0.0.1:8131/nenex). Use **Read page** in the library,
 Search and creation use the corpus's existing actions. Page names begin with a
 letter or underscore and contain letters, digits, underscores or hyphens;
 creating an existing name never overwrites that page.
+
+The `cooperate` mount adds document-local agent runs through the MCP endpoint at
+`http://127.0.0.1:8131/mcp`. See the [harness interface and client](../cooperate/README.md)
+for captured context, branching traces and reusable results.
 
 The development launcher creates a fresh namespace on each restart. Browser
 reloads preserve edits within that running namespace. This is not durable storage

@@ -1,10 +1,37 @@
 # Shrine cooperative agent substrate implementation plan
 
-Build a cooperative work substrate in Shrine and expose it through Nenex.
-A reusable procedure, a concrete request, its discussion, and its accepted
-result belong to one addressable work graph. Grove roles describe how records
-participate; cells and overlays derive interpretations; declared commands
-admit changes; registered host workers execute authorized effects.
+## Current implementation scope — 2026-10-22
+
+The first deliverable is the backend harness in
+[`extras/mounts/cooperate`](../../extras/mounts/cooperate/README.md). External
+agents use MCP to open work beneath an existing document, capture selected
+namespace inputs, append linked observations and outputs, and finish with a
+typed result that another cell can consume. Shared namespace admission checks
+dependencies and commits each command atomically. Context snapshots, pinned
+branch/reply references and retry keys preserve the trace.
+
+This scope does not require an example application, a new editor, a model
+provider, a scheduler, or a human acceptance step. Completion checks freshness;
+human review can be added by a workflow that needs it. The workspace and research
+stories below are possible applications, not implementation prerequisites.
+The detailed managed-runtime and durable-effect contracts remain later work.
+The mount README records the implemented interface and its current limits.
+
+## Longer-term direction
+
+Build cooperation around a Nenex document that is a functional namespace
+subtree. Its prose, inputs, evidence, cell bindings, work traces and results
+have addressable names. Nenex presents that material to the human; MCP lets
+agents inspect and contribute to the same material; cells derive useful values
+from its declared inputs. A document can consume another document's result by
+reference. This shared document loop is the first deliverable.
+
+The cooperative substrate supplies the rules for contributing to that loop:
+capture what an agent saw, preserve its contributions, detect changed dependencies,
+and admit coherent results. Managed workers, scheduling and durable effect
+recovery extend the loop after it works. Grove describes record roles and
+actions; Foil implements transitions and derivations; shared Goo/Mash components
+present them.
 
 The primary deliverable is functional material: a namespace-resident result
 with declared inputs, contracts and useful behavior that another person or
@@ -12,14 +39,15 @@ procedure can apply or compose. Markdown is a readable projection or supporting
 evidence. Completing a conversation and saving its prose is insufficient to
 demonstrate this substrate.
 
-The first useful workflow is two independent investigations, a synthesis, a
-human correction, and selective recomputation. The same proposal and review
-operations must also improve the procedure that produced that work. Preserve
-the distinction between a definition, an application, an execution attempt,
-and an external effect even when the interface presents them together.
+One illustrative workflow is choosing a workspace: two agents contribute cost
+evidence and a recommendation, the human changes a constraint, live calculations
+change, and an outdated recommendation cannot be accepted. The accepted result
+feeds a budget document; the same comparison logic works on another candidate
+set. Preserve the distinction between definitions, applications, attempts and
+effects wherever those lifecycle facts are needed.
 
-This is an implementation proposal against Shrine `73166778`, inspected on
-2026-10-20, including the uncommitted Nenex interface in this workspace.
+This is an implementation proposal against Shrine `63fa89b`, revised on
+2026-10-21 after inspecting the Nenex, cells and MCP implementations.
 Names, schemas, commands, module paths, and budgets introduced below are
 proposed contracts. Existing behavior is identified separately. Plan review
 completed on 2026-10-21.
@@ -44,18 +72,20 @@ to build a general framework before the example works. Editor or host changes
 are justified only where they block that loop, such as preserving a draft
 during refresh or capturing the right declaration revision.
 
-Start with [architectural decisions](#architectural-decisions), then use the
+Start with the [proof of concept](#proof-of-concept-choose-a-workspace), then use the
 [phased tickets](#phases-and-tickets) for implementation and the
 [verification matrix](#verification-matrix) for release evidence.
 
 ## Outcomes and release boundaries
 
-Deliver two core milestones, with a separate optional editor-alignment track:
+Deliver the visible document proof first, followed by a managed runtime and
+durable release. Keep editor alignment on a separate optional track:
 
 | Milestone | User outcome | Required boundary |
 | --- | --- | --- |
-| Runtime proof | Two fake workers contribute to one result; a correction reruns affected work | Pure transitions, captured inputs, atomic commands, executable failure tests |
-| Cooperative MVP | Humans and real model workers cooperate through Nenex, with review and restart recovery | Durable namespace state, one real worker adapter, Grove work controls, bounded scheduling |
+| Document loop proof | Human and external MCP agents operate on one Nenex subtree; changed criteria invalidate a proposal; accepted output is consumed elsewhere | Safe document ownership, typed cells, bounded atomic captures, immutable proposals, shared revision-checked review; one running sovereign |
+| Managed runtime proof | Shrine assigns and joins work, with deterministic fake workers | Claims, budgets, cancellation, captured effects and executable failure tests |
+| Durable cooperative MVP | Humans and managed model workers cooperate through Nenex, with restart recovery | Durable namespace state, one real worker adapter, Grove work controls, bounded scheduling |
 | Optional Grove Nenex alignment | Existing editing and presentation use shared Grove/Goo infrastructure | Follow the separate shared-editor work where needed; no workspace redesign prerequisite |
 
 ### Functional outputs
@@ -81,8 +111,8 @@ generation remains outside its execution policy.
 The release test must apply a delivered artifact to a second input without
 reconstructing its instructions from prose, and consume its typed output in
 another declared operation. The artifact remains usable after the producing
-attempt finishes and after restart. Reusing only the workflow that produced
-a static report does not satisfy this gate.
+attempt finishes; the durable MVP also proves reuse after restart. Reusing only
+the workflow that produced a static report does not satisfy this gate.
 
 The cooperative MVP may retain the existing Semidoc source-editing route as
 an explicitly transitional interface. Its work, review, and execution controls
@@ -96,10 +126,172 @@ adapter passes the execution contract. Distributed scheduling, tenant isolation,
 arbitrary process migration, autonomous procedure publication, unrestricted
 code generation, and automatic general-purpose merge are later work.
 
+## Proof of concept: choose a workspace
+
+**User story:** I want one working document where I can compare workspaces,
+ask agents to contribute evidence and advice, change my requirements, and see
+which conclusions still hold. When I decide, my budget document can use the
+decision directly. I can apply the comparison to another set of places without
+reconstructing a prompt or copying a report.
+
+### What the human experiences
+
+1. Open **Choose a workspace** in Nenex. The page contains ordinary prose,
+   editable criteria, an evidence table, a live comparison and a review area.
+   Start with a monthly budget of 450, a commute limit of 30 minutes, and a
+   requirement for quiet space. Use three fictional, locally supplied listings
+   so the proof has no dependency on browsing or external purchases.
+2. Ask an agent through MCP to extract costs with citations to those listings.
+   It reads a bounded captured evidence set and submits typed candidate facts
+   under this document. The page shows the proposal; accepting it populates
+   the canonical candidate records. Costs are derived by cells from rent plus
+   fees. The agent does not invent a second copy of the comparison in chat.
+3. Ask a second MCP agent to assess fit and recommend an eligible candidate.
+   Its capture includes accepted facts, current criteria and comparison logic.
+   Keep this recommendation pending while the human edits the document.
+4. Lower the budget to 350. The next live cell read shows **no qualifying
+   workspace**. The pending recommendation is visibly stale and acceptance
+   refuses it even if the UI has not refreshed. The cost evidence stays usable:
+   extracting rent and fees did not depend on the budget. Explicitly request
+   another assessment; changing an input does not itself call a model.
+5. The agent explains the conflict and proposes relaxing the quiet requirement.
+   The human explicitly makes that change. Harbor now qualifies at 300, leaving
+   50. The agent submits a recommendation against this new capture; the human
+   accepts it. The decision records the exact criteria, evidence, logic and
+   selected result. Earlier proposals and decisions remain inspectable.
+6. In **Monthly budget**, bind a cell to that accepted decision's typed monthly
+   cost and subtract it from 350. It displays 50 without parsing the advice.
+   Keep this binding pinned to the decision until the human chooses to advance
+   it; a live binding to the comparison is also possible but visibly distinct.
+7. Apply the same pinned comparison recipe to a second candidate collection
+   with independent criteria. It produces another typed result without another
+   model call or copied instructions. Editing prose or removing an inline
+   occurrence in either document preserves the underlying calculation.
+
+The deterministic fixture is:
+
+| Candidate | Rent | Fees | Total | Commute | Quiet |
+| --- | --- | --- | --- | --- | --- |
+| Cedar | 320 | 40 | 360 | 25 | Yes |
+| Harbor | 280 | 20 | 300 | 20 | No |
+| Loft | 390 | 30 | 420 | 15 | Yes |
+
+The rule is cheapest eligible candidate, with canonical name as a deterministic
+tie-break. Initially Cedar wins. At budget 350 with quiet required, none qualify.
+At budget 350 with quiet optional, Harbor wins. Missing or malformed facts yield
+diagnostics, not zero costs. No-match is a typed result, not an empty name that
+can accidentally be accepted as a recommendation.
+
+### One document namespace, several views
+
+Use named children alongside Nenex's existing numbered content tree. The names
+below are a proposed fixture convention; the numeric-versus-named ownership
+boundary already exists. Every collection used as a pinned input has an
+explicit root record, not just descendants beneath a structural folder.
+
+```text
+/0x11/user/docs/workspace-choice
+  src (slot)               Semidoc source on the page record
+  0/, 1/, ...              Numbered expanded Semidoc content
+  inputs/criteria          Budget, commute, quiet requirement
+  inputs/candidates/       Accepted candidate facts with stable identities
+  evidence/                Listing snapshots and source references
+  logic/comparison         Binding to a pinned published comparison recipe
+  cells/                   Cost, eligibility, ranking and result bindings
+  work/                    Applications, captures and immutable contributions
+  decisions/               Accepted result snapshots and review evidence
+  bindings/                Inline occurrences and referenced subjects
+
+/0x11/user/docs/monthly-budget
+  src (slot), 0/, ...      Existing Semidoc representation
+  bindings/workspace       Reference to one accepted decision above
+  cells/headroom           Subtraction using that decision's monthly cost
+```
+
+These are ownership conventions, not a fixed schema that every document must
+instantiate. Published behavior may live under `gov/cooperate`; shared evidence
+or artifacts may be referenced from elsewhere. Locally produced work belongs
+under the document by default. Containment does not replace dependency edges,
+grant execution authority, or make every referenced record owned by the page.
+
+Nenex edits and displays these names; MCP reads and submits against these same
+names. Cells bind primary and secondary inputs explicitly and expose values at
+`/x` and diagnostics at `/c/x`. They evaluate through native dependency
+resolution. The UI refreshes affected views; no background model execution is
+implied. A proposal carries its captured read-set. A human acceptance checks
+that read-set and writes the decision, canonical changes and receipt together.
+
+Capture dependencies at the declared input boundary: cost extraction depends
+on listings; fit depends on candidate facts, criteria and comparison logic.
+Include collection membership where selection depends on it. Do not invalidate
+every contribution merely because something in its document subtree changed,
+or let a client omit required dependencies to make a proposal appear current.
+
+Distinguish three things in the UI and API: the **live calculated result**, an
+agent's **proposed interpretation**, and a **captured accepted decision**. A
+changed input updates the first, may invalidate the second, and leaves the
+third as historical evidence with an explicit indication of whether it still
+matches current inputs. An accepted claim is not silently rewritten by a cell.
+
+### What exists and what must be built
+
+| Part of the loop | Reuse now | Small required addition |
+| --- | --- | --- |
+| Addressable material | Namespace records, references, history, bounded MCP reads and Nenex's numeric-versus-named child boundary | Document-local ownership convention and preservation tests |
+| Computation | `/x`, `/c/x`, published transforms and standard arithmetic/collection cells | Typed comparison transform with candidates and criteria as explicit inputs, validation and stable result identity |
+| Agent access | MCP `read`, `write`, `history`, `apply` | Shared admitted capture, submit, revise and accept operations with manifests and receipts |
+| Human view | Nenex source editing and reference transclusion; Grove/Goo views | Inline input/result/review bindings, stable occurrences and retained controls |
+| Cooperation | External MCP clients can read and contribute to a running sovereign | Immutable proposals, dependency-specific staleness and human acceptance |
+| Reuse | Named definitions, pinned references and cell composition | A parameterized comparison recipe, second-input fixture and cross-document binding |
+
+Current `between`/`where` predicates use literal parameters; they do not by
+themselves implement a live predicate driven by another criteria record. Add a
+small vetted comparison transform instead of claiming the existing filter can
+already do this. Reuse standard cells where their contracts fit. Preserve
+canonical candidate references through sorting; generated row positions are
+not candidate identities. A reference stored in a field is data until an
+operation explicitly resolves it as an input.
+
+Current MCP `apply` operates on a record; it is not already the atomic
+multi-record acceptance protocol. Add a narrow adapter into shared admission,
+using the same declared commands as Grove. Capture inputs atomically on the
+server; several separately timed MCP reads are not a coherent execution
+snapshot. Restrict raw writes to governed lifecycle fields. `who` is an audit
+label, not authenticated identity; this local proof does not establish isolation
+between mutually untrusted agents.
+
+Nenex reconstructs its page record during expansion, but Semidoc reads only
+numbered children. Named direct children such as `inputs`, `cells` and `work`
+already stay outside source synchronization, and expansion only writes or culls
+source-derived numeric paths. Put harness state beneath those named children,
+not on the reconstructed page record or beneath numbered prose nodes. Test that
+contract; no content relocation or migration adapter is required for this
+backend boundary. A generic namespace explorer alone does not prove the Nenex
+experience.
+
+### Deliberate first-proof limits
+
+Use one human and two manually prompted external MCP sessions. One session can
+exercise the vertical slice first; two distinct contributions complete the
+cooperation demonstration. They submit captured observations and proposals;
+Shrine does not yet manage their model dispatch, credentials, retries or cost.
+Capture provenance describes the material supplied through the protocol, not
+an assertion that an external client's hidden context or execution is known.
+Use scripted equivalent submissions for repeatable correctness tests.
+
+The first proof runs within one sovereign lifetime. It must not claim durable
+acknowledgment or resume after restart. Managed execution, leases, effect
+receipts and native persistence belong to the next milestones. Human review,
+input coherence, stale refusal, document preservation and typed reuse are
+required now. Do not defer them behind a scheduler, new editor, generated code,
+web research, or a general-purpose agent framework.
+
 ## Architectural decisions
 
 1. Shrine owns authoritative work state, history, commands, and receipts.
    Host workers may hold disposable execution state and bounded caches.
+   A Nenex document's subtree is the default home of its locally owned inputs,
+   cells and work; shared material is connected through explicit references.
 2. Foil implements typed values and pure transitions. Grove declares roles,
    norms, actions, views, and panes. Goo prepares presentation and interaction;
    Mash paints and captures input through shared components.
@@ -111,7 +303,8 @@ code generation, and automatic general-purpose merge are later work.
 5. Keep definition identity, application identity, attempt identity, and effect
    identity separate. Retries and revisions must remain distinguishable.
 6. Reads and derived projections never launch effects. A command requests
-   execution; the scheduler admits it; a worker performs an authorized request.
+   execution. The first proof uses explicit external-client requests; managed
+   execution later passes through scheduler admission and a bound worker.
 7. A concrete attempt begins with an immutable execution manifest. Each later
    observation and model request has its own recorded inputs. Live references
    may describe desired work, but never substitute for execution evidence.
@@ -121,7 +314,7 @@ code generation, and automatic general-purpose merge are later work.
    sovereign boundary rather than introducing a separate task database.
 10. Keep computation bounded and paged. Avoid whole-world prompts, whole-world
     subscriptions, deep nested live projections, and repeated full graph scans.
-11. Preserve current Nenex content and URLs through a tested migration adapter.
+11. Preserve current Nenex content and URLs using the existing named-child boundary.
     Editing document content must not rewrite execution history.
 12. Improve reusable procedures by publishing successor revisions after review.
     Already-running attempts keep their original definition.
@@ -299,8 +492,9 @@ supervisor rejects outbound moves; chat tests use a dummy model driver. The
 new runtime must have its own demonstrated adapter and must not depend on
 enabling general outbound routing as an incidental prerequisite.
 
-The current MCP `ask` hand is a reference implementation, not the production
-scheduler. It reads context and live input separately, caps input at one page,
+External MCP sessions can exercise the document loop without adding an internal
+model transport. The current MCP `ask` hand is a reference implementation, not
+the production scheduler. It reads context and live input separately, caps input at one page,
 and stamps only case, prompt, and model. Replace that execution path with
 captured input manifests, distinct attempts, bounded retries, and receipts.
 
@@ -327,16 +521,18 @@ an application.
 
 The proposed mount is `cooperate`. Its source package lives in
 `extras/mounts/cooperate`; declarations publish under `gov/cooperate`.
-The initial installed work records live under `/<node>/app/cooperate`, using separate
-collections for definitions, applications, attempts, contributions, and effects.
-Nenex retains its own installed content. Presentation can combine these
-locations without moving every record into a document subtree.
-These collections are an initial storage convention, not a prerequisite for
-participation: other authorized names can satisfy the same declared contracts.
+Install document-local inputs, cell bindings, applications, contributions and
+decisions beneath the owning document, following the proof's layout. Add
+attempts and effects there when managed execution needs them. Published reusable
+definitions and genuinely shared work may live elsewhere and be bound by
+reference. A global `/<node>/app/cooperate` location may hold runtime policy or
+indexes, but must not become a mandatory alternative home for every document's
+work. Other authorized names can satisfy the same declared contracts.
 
-Namespace containment establishes storage organization and applicable namespace
-authority. Explicit run and execution-owner references govern budget inheritance
-and cancellation across the separate record collections. Give each attempt and
+Namespace containment establishes storage organization; authority comes from
+the admitted bindings and applicable namespace policy. A path alone is not a
+security boundary. Explicit run and execution-owner references govern budget
+inheritance and cancellation across record collections. Give each attempt and
 owned subtask one execution owner; reject ownership cycles.
 
 Dependency, discussion, derivation, review, and presentation-grouping edges
@@ -376,7 +572,9 @@ the `/x` mechanism. The `/o` resolver directly accepts `dyed`, `knit`, `felt`,
 and `sewn`; do not assume every Grove transformation can be used as a raw
 `/o` function. Add a tested adapter only if a concrete use requires it.
 
-The initial projection library contains:
+The eventual projection library contains the following views. The first proof
+needs comparison, context, validation and review; managed readiness and progress
+follow with the scheduler.
 
 | Projection | Inputs | Output |
 | --- | --- | --- |
@@ -428,6 +626,12 @@ dependency closure or an immutable captured input value with its selection
 manifest. Cache entries are never execution evidence.
 
 ## Input capture and reproducibility
+
+The document proof uses bounded atomic input captures and read-set checks from
+this contract. Provider request serialization, budget reservation and adaptive
+effect observations become required when Shrine owns execution. An external
+MCP contribution records its supplied manifest and submitted output without
+pretending to be a managed, replayable model effect.
 
 Capture an attempt's initial inputs in one admitted namespace operation:
 
@@ -529,6 +733,10 @@ must apply equally to UI and MCP invocation.
 
 ## Scheduler and worker lifecycle
 
+This section implements the managed-runtime milestone after the document loop
+proof. Dependency-aware cells and proposal validation do not require a worker
+scheduler. Explicit manual requests are sufficient for the first demonstration.
+
 The scheduler owns eligibility, claims, budgets, dependency wakeups, and
 recovery. It is a small deterministic coordinator; workers own the reasoning
 inside admitted attempts. Agent-planned subtasks use ordinary create/link
@@ -589,10 +797,10 @@ Restoring namespace records does not restore process capabilities. Closing a
 local handle is not worker cancellation; cancellation uses the recorded fencing
 and cooperative interruption protocol.
 
-The first real agent loop supports a bounded set of substrate operations:
+The first managed agent loop supports a bounded set of substrate operations:
 read selected records, propose subtasks, submit contributions, request
 clarification, and request authorized effects. Arbitrary shell execution and
-unrestricted MCP discovery are not required for the first demonstration.
+unrestricted MCP discovery are not required for managed execution.
 Additional tool adapters must declare schemas, authority, timeout, recovery
 policy, and result limits.
 
@@ -650,7 +858,7 @@ effect completed. Replaying committed state must not replay external I/O.
 Do not enable external side effects in a release advertised as recoverable
 until crash tests prove this ordering.
 
-## Nenex content migration
+## Nenex content ownership
 
 Keep content, cooperative metadata, and execution artifacts separately owned.
 Nenex's page root currently mixes Semidoc content with a small set of
@@ -658,13 +866,18 @@ application fields. `expand` reconstructs that root; source regeneration
 filters only known application slots. Adding arbitrary work fields there can
 erase them or render them as source attributes.
 
-Introduce a typed canonical subject with an explicit document reference.
-Adapt existing page records into readable views first. Move content only
-through an idempotent migration with a recorded mapping from old paths to
-new identities. Preserve external links through aliases or forwarding views.
-History at old references remains inspectable.
-Physical relocation is optional: a typed reference to the current canonical
-document location can satisfy the ownership and Grove compliance contracts.
+Keep the current page record and numbered Semidoc children. The existing
+`semidoc/kid_nodes` traversal ignores named children, and `expand` only creates
+or culls paths produced by the numbered source expansion. Named direct children
+`inputs`, `evidence`, `logic`, `cells`, `work`, `decisions` and `bindings` can
+therefore hold ordinary namespace material owned by their respective operations.
+Numeric descendants inside those named subtrees remain outside Semidoc too.
+
+Do not attach harness state to numbered prose nodes: removing such a node can
+cull its whole subtree. Source edits, direct record edits and removal/reordering
+of prose must preserve named work subtrees and exclude them from regenerated
+source. Existing document URLs and historical paths stay unchanged; a `content`
+relocation and compatibility migration are unnecessary for this boundary.
 
 Extract the deletion-aware document transition from `doc_talk` and share it
 with Grove command admission. It receives the current document and previous
@@ -673,7 +886,7 @@ expanded nodes in the same transaction.
 
 Do not replace this with a direct Grove update of `src`: Goo currently commits
 `writ/make`, while Nenex initialization expands with no prior source. The
-migration must explicitly prove deletion and unrelated-facet preservation.
+shared transition must explicitly prove deletion and named-subtree preservation.
 Keep source and expanded records as synchronized representations of one
 document, with one operation contract.
 
@@ -747,7 +960,7 @@ vocabulary, not currently implemented:
 ```text
 ;@ /doc/present ;/0x11/gov/cooperate/inline
 ;@ /doc/occurrence comparison-1
-;/0x11/app/cooperate/applications/comparison
+;/0x11/user/docs/workspace-choice/cells/comparison
 ```
 
 The first attribute selects a declared view slot, the second identifies the
@@ -780,8 +993,9 @@ this guarantee for Grove presentations.
 
 Deliver in two stages:
 
-1. **Cooperative MVP:** inline presentations bind vetted published procedures, typed
-   parameters and upstream references, and expose their results and commands.
+1. **Document loop proof, extended in the MVP:** inline presentations bind vetted
+   published procedures, typed parameters and upstream references, and expose
+   their results and commands.
    Logic inspection is available; editing a composition uses declared operations.
 2. **Source authoring extension:** the shared Unicode editor edits the canonical
    Grove/Foil draft inline. Reuse registered draft, preview and publication
@@ -923,7 +1137,7 @@ The proposed division is:
 | `extras/mounts/cooperate/worker.foil` | Registered host protocol and effect receipts |
 | `extras/mounts/cooperate/host.py` | Initial provider adapter and process integration only |
 | `extras/mounts/cooperate/tests.foil` | Transition laws and deterministic integration fixtures |
-| `extras/mounts/nenex/document.foil` | Extracted document transition and migration adapter |
+| `extras/mounts/nenex/document.foil` | Extracted document transition if shared admission requires it; no content relocation prerequisite |
 | `extras/mounts/nenex/blocks.grove` | Minimal inline input, declaration, result and command presentations |
 | Shared Goo runtime and host | Governed command binding and retained-operation interaction |
 | Sovereign persistence module | Durable state and reachable-value restoration |
@@ -937,34 +1151,57 @@ refactoring unrelated modules while extracting the smallest required seam.
 Ticket IDs below identify implementation work and test evidence. They do not
 prescribe separate user-visible issues or a new project-management store.
 
-### P0 Baseline and contracts
+### P0 Document loop proof
+
+Build one vertical slice before generalizing lifecycle machinery. Existing
+tests and fixtures establish the starting baseline; all exit evidence below
+is work to produce, not a claim about the current implementation.
+
+| Ticket | Depends on | Work | Exit evidence |
+| --- | --- | --- | --- |
+| F0 | Existing Nenex, cells and MCP | Seed the workspace-choice subtree and deterministic listings; define candidate, criteria and result contracts | Explicit collection roots, bounded fixtures, canonical identity and source baseline recorded |
+| F1 | F0 | Qualify Nenex's existing numeric-content/named-work ownership boundary | Saving, deleting and reordering prose preserves named inputs, cells, proposals and decisions; existing URLs stay unchanged |
+| F2 | F0 | Add bounded atomic capture, immutable contribution submission, guarded input revision and atomic acceptance through shared admission | UI/MCP commands use one declaration; raw lifecycle writes refused; stale read-sets, duplicate operation IDs and partial commits tested |
+| F3 | F0 | Publish the typed comparison transform and parameterized cell recipe | Cedar, no-match and Harbor cases pass; missing facts diagnose; secondary criteria dependencies and stable identities verified |
+| F4 | F1, F2, F3 | Bind inline criteria, comparison, proposal review and decision views using retained Grove/Goo controls | Human and two external MCP sessions complete the story; late stale acceptance fails; prose refresh preserves drafts; historical views are read-only |
+| F5 | F4 | Bind an accepted result into the budget document and apply the recipe to a second dataset | Typed headroom is 50; independent inputs share pinned logic; removing an occurrence preserves its subject; repeatable demo instructions |
+
+F5 is the **first end-to-end milestone**. Use scripted client submissions for
+deterministic failure tests and real external MCP sessions to demonstrate the
+interaction. No model-provider adapter, scheduler, durable restore or new editor
+is required. These tickets establish the narrow shared seams that later D and
+U tickets extend; do not build duplicate command or presentation paths.
+
+### P1 Runtime contracts and qualification
 
 | Ticket | Work | Exit evidence |
 | --- | --- | --- |
-| C0 | Define the minimal typed input/output and command contracts for the first working loop | Concrete fixtures and native primitive mapping; no general taxonomy or duplicated workflow engine |
+| C0 | Extend F0/F2 contracts with managed application, attempt and effect lifecycles | Concrete fixtures and native primitive mapping; no general taxonomy or duplicated workflow engine |
 | C1 | Record performance and source baselines | Existing MCP/cell tests, timing report and reproducible fixture |
 | C2 | Prove overlay composition and bounded evaluation | Nested `/o`, typed `/x`, pinned context, input-limit refusal and unsupported-code rejection tests |
 | C3 | Qualify native persistence mechanism | Restore typed continuation state, exact compiled behavior, reachable pins, history identities and receipts |
 
-C0 and C2 establish the interface before worker and UI implementation.
-C3 is the largest feasibility risk and begins immediately. If native restore
-cannot preserve required identities, stop the durable-release track and
+C0 and C2 establish the managed-worker interface after the document proof.
+C3 is the largest durable-release feasibility risk; qualify it before building
+the real provider adapter. It can be investigated alongside the proof without
+blocking that proof. If native restore cannot preserve required identities,
+stop the durable-release track and
 resolve that substrate issue before promising recovery.
 
-### P1 Pure cooperation and document boundaries
+### P2 Managed cooperation contracts
 
 | Ticket | Depends on | Work | Exit evidence |
 | --- | --- | --- | --- |
 | D0 | C0 | Implement typed Foil command/step laws, native behavior adapters and immutable manifests | Legal/illegal transitions, facet preservation and deterministic step replay |
-| D1 | C0 | Separate Nenex content ownership and extract document transition | Source/record round trips, deletion and facet-preservation laws |
+| D1 | C0, F1 | Extend the extracted document transition to managed document proposals | Source/record round trips, deletion and facet-preservation laws |
 | D2 | C2 | Implement candidate, validation, readiness and context projections | Direct and nested composition agree; diagnostics survive |
-| D3 | D0, C2 | Implement atomic context capture and budget reservation | Concurrent edit cannot produce a mixed manifest |
-| D4 | D0, D1, D2 | Implement contribution submission and acceptance, including document proposals | Source/read-set races, stale bases, conflicting proposals, duplicate commands and atomic content/decision/receipt tested |
+| D3 | D0, C2, F2 | Extend atomic context capture with managed manifests and budget reservation | Concurrent edit cannot produce a mixed manifest |
+| D4 | D0, D1, D2, F2 | Extend contribution submission and acceptance to managed attempts and document proposals | Source/read-set races, stale bases, conflicting proposals, duplicate commands and atomic content/decision/receipt tested |
 
 At this phase, fake effects may be injected as recorded inputs. No real
 provider access is needed.
 
-### P2 Scheduler and recovery
+### P3 Scheduler and recovery
 
 | Ticket | Depends on | Work | Exit evidence |
 | --- | --- | --- | --- |
@@ -974,17 +1211,17 @@ provider access is needed.
 | R3 | R1, R2 | Add one real model adapter behind durable effect admission | Captured request, response, usage and errors survive restart; capability checks precede dispatch |
 | R4 | R2, R3 | Qualify bounded substrate tools and effect recovery | Duplicate and unknown-outcome tests; capabilities remain host-bound; no unrestricted tool discovery |
 
-R1 is the first end-to-end milestone. R2 and the shared UI work can proceed
-in parallel once contracts are stable. The cooperative MVP requires R2;
-an in-memory demonstration does not satisfy recovery.
+R1 is the managed runtime proof, extending the already working F5 document
+loop. R2 and the extended UI work can proceed independently once contracts are
+stable. The durable cooperative MVP requires R2; F5 does not satisfy recovery.
 
-### P3 Nenex and Grove integration
+### P4 Extend Nenex and Grove integration
 
 | Ticket | Depends on | Work | Exit evidence |
 | --- | --- | --- | --- |
-| U0 | C0, D0 | Add shared command admission and published action/codec reflection for Grove and MCP | Identical declarations, commands, receipts and refusal reasons; no independently maintained tool schema |
-| U5 | D1, D2, U0 | Add stable inline reference occurrences and retained Grove subject presentations | Duplicate placements, reorder, drafts, stale controls and historical read-only bindings pass |
-| U1 | D1, D2, U0, U5 | Bind inputs, named logic and usable results in existing blocks | A user can apply logic inline and feed its result into another block; no new workspace required |
+| U0 | C0, D0, F2 | Extend shared command admission and action/codec reflection to all managed commands | Identical declarations, commands, receipts and refusal reasons; no independently maintained tool schema |
+| U5 | D1, D2, U0, F4 | Generalize stable inline occurrences and retained presentations across work roles | Duplicate placements, reorder, drafts, stale controls and historical read-only bindings pass |
+| U1 | D1, D2, U0, U5, F5 | Extend input and logic bindings to reviewed procedure revisions | A user can apply logic inline and feed its result into another block; no new workspace required |
 | U2 | D4, R1, U1 | Add inline contribution acceptance, progress, retained drafts and concise inspection | Browser tests for stale views, retries, cancellation, recovery and control provenance |
 | U3 | Shared Unicode text infrastructure, D1, U0 | Optional: align source editing with the shared text component | Multiline/IME tests and removal of custom editor lifecycle |
 | U4 | U1, U2, U3 | Optional: align remaining Nenex composition and qualify compatibility routes | Old links and history work; no unrelated metadata enters Semidoc; relocation only if required |
@@ -995,27 +1232,34 @@ MVP critical path. Do not create another editor or workspace framework.
 Arbitrary inline source authoring is a later extension after its compiler,
 evaluation and shared editing boundaries are qualified.
 
-### P4 Reuse and qualification
+### P5 Procedure improvement and durable qualification
 
 | Ticket | Depends on | Work | Exit evidence |
 | --- | --- | --- | --- |
-| Q0 | D4, R3, U2 | Publish a reviewed definition referencing pinned Foil behavior and a parameterized Grove graph template | Two installations share pinned code, retain independent state and pass native-composition acceptance |
+| Q0 | D4, R3, U2, F5 | Improve and publish a reviewed definition referencing pinned Foil behavior and a parameterized Grove graph template | Successor review uses the same contribution protocol; two installations share pinned code, retain independent state and pass native-composition acceptance |
 | Q1 | R4, U2, Q0 | Run correctness, crash and performance qualification | Reproducible reports and all required gates pass |
 | Q2 | Q1 | Package example workflow and operational instructions | Clean boot, restart, export and restore walkthrough |
 
-The runtime lane is C0/C2 → D0/D3 → R0/R1. Document and projection work
+The first delivery is F0 → F1/F2/F3 → F4 → F5: document ownership,
+calculation and shared review converge in a visible, reusable document.
+The subsequent runtime lane is C0/C2 → D0/D3 → R0/R1. Document and projection work
 D1/D2/D4 joins at R1. Persistence C3/R2 runs alongside it; both lanes must pass
 before R3/R4. The UI lane U0/U5/U1/U2 joins runtime and reuse Q0 at qualification
 Q1. These dependencies define the cooperative MVP; C1 supplies its performance
 baseline and Q2 supplies release instructions. Full editor completion U3/U4
-follows its shared infrastructure dependencies without delaying runtime proof.
+follows its shared infrastructure dependencies without delaying either proof.
 
 Use one integration owner for shared command and persistence boundaries.
-Other implementation lanes can own projections, Nenex migration, worker
+Other implementation lanes can own projections, Nenex ownership tests, worker
 adapter, and evaluation fixtures. Merge small contract-backed increments;
 do not split mutually dependent schema changes across incompatible branches.
 
 ## Verification matrix
+
+F0–F5 require the document-loop acceptance checks below, including the relevant
+document, projection, capture, admission, acceptance, inline and reuse laws.
+The full matrix additionally qualifies managed execution and the durable MVP;
+its crash, lease and effect requirements are not claims made by the first proof.
 
 | Area | Required properties |
 | --- | --- |
@@ -1056,35 +1300,69 @@ correctness depend on model prose. Compare the same task with one worker and
 with cooperation, recording accepted-result quality, cost, elapsed time,
 duplicate work, stale proposals, and recovery success.
 
-## End to end acceptance scenario
+## End to end acceptance scenarios
 
-1. A human opens one readable work item in Nenex and binds two evidence inputs.
-2. A reviewed definition creates two independent investigation applications
-   and one synthesis application.
-3. Two workers receive different bounded manifests and submit evidenced
-   contributions. The synthesis waits for the required accepted results.
-4. The synthesis proposes a parameterized comparison artifact using published
-   operations, plus a document explaining it. Nenex shows candidate and review
-   overlays for both, including provenance and validation.
-5. The human changes one evidence input. Only dependent work becomes outdated;
-   unaffected accepted work remains reusable. Old attempts remain inspectable.
-6. A worker crashes after an effect is dispatched. Restart preserves intent and
-   resolves the outcome according to the effect's recovery policy.
-7. A stale worker submits a late result. It is retained as evidence without
-   overwriting the new application generation.
-8. The human accepts the current proposal. Artifact bindings, content, decision
-   and receipt commit together; source/record synchronization remains correct.
-   Apply the delivered comparison to a second evidence set and pass its typed
-   result into another declared operation without rebuilding a prompt from prose.
-9. The human proposes an improvement to the definition using the same review
-   interface, accepts it, and applies the new revision to another input.
-10. Restart the sovereign and resume the workspace. Accepted results, frozen
-    context, history, pending work and the delivered artifact's usable behavior
-    survive; completed effects are not rerun.
+### Gate A: document loop proof
 
-Passing this scenario, the verification matrix, and performance gates defines
-the cooperative MVP. Broader Nenex editor/composition alignment is tracked
-separately and is not a condition for proving the cooperative block loop.
+Run the workspace-choice story in one sovereign lifetime. Record the exact
+fixture, command receipts and assertions so another developer can repeat it.
+
+1. Nenex and MCP resolve the same criteria, candidate and cell names. A change
+   admitted through either interface appears in the other's next read; there
+   is no second authoritative agent-side document.
+2. An MCP contribution carries a bounded atomic capture and source references.
+   Acceptance populates canonical facts and preserves its immutable proposal.
+   Calculation and review reads create no model requests or namespace writes.
+3. With the initial fixture, comparison returns Cedar at 360. Capture a fit
+   proposal, lower the budget to 350, and observe a typed no-match result.
+   Attempt to accept the old proposal before delivering any invalidation
+   notification: the direct read-set check still refuses it.
+4. The cost extraction remains valid because its declared inputs did not change.
+   The fit proposal is retained as stale evidence. An explicit new assessment
+   may suggest a tradeoff; it cannot silently change the human's criteria.
+5. Relax quiet only through an explicit human revision. The live result becomes
+   Harbor at 300. Accept a proposal captured against that state. Decision,
+   accepted-result reference, canonical changes and receipt commit atomically.
+   Repeating the operation ID returns the original result; changing its payload
+   is refused. Raw writes cannot forge an accepted lifecycle state.
+6. The budget document follows the accepted decision by a pinned binding and
+   calculates 350 minus 300 as 50. Changing the live comparison later preserves
+   that decision and budget value until an explicit binding update. Show current
+   validity separately from historical acceptance.
+7. Bind the same pinned recipe to a second fixture containing Annex (rent 250,
+   fees 25, commute 10, quiet true) with budget 300, commute limit 30 and quiet
+   required. It returns Annex at 275. The first comparison remains independent. No model call or
+   prose reconstruction is required for this reuse.
+8. Edit, reorder and delete prose; remove one of two occurrences of the same
+   result. Inputs, cells, work and decisions survive. Retained controls preserve
+   drafts; old document revisions expose captured read-only bindings or a clear
+   unavailable state. A legacy document URL still resolves.
+9. Reject malformed facts and oversized captures with diagnostics and no partial
+   state changes. Exercise concurrent UI/MCP commands and an interrupted client
+   response. Retrying within the running sovereign cannot duplicate acceptance.
+
+Passing these checks and the real external-client walkthrough completes F5.
+A CLI-only fixture is useful development evidence but does not satisfy the
+Nenex user story. A screenshot of a report does not satisfy computation, stale
+refusal or reuse. Restart recovery is explicitly outside this gate.
+
+### Gate B: managed and durable cooperation
+
+Extend Gate A with two Shrine-managed investigations and a synthesis. The
+scheduler supplies captured manifests, joins accepted dependencies, enforces
+budgets and cancellation, and preserves unaffected accepted work after edits.
+Qualify the fake-worker runtime before introducing a real provider adapter.
+
+Crash after dispatch and recover according to the effect's declared policy.
+Retain a late worker's output without allowing it to overwrite a newer generation.
+Restart the sovereign: accepted decisions, frozen inputs, history, pending work
+and usable comparison behavior survive; completed effects are not repeated.
+Review a proposed improvement to the reusable definition through the same
+contribution protocol, publish its successor, and apply it to fresh inputs while
+existing pinned applications retain their original behavior.
+
+Passing this extension, the full verification matrix and performance gates
+defines the durable cooperative MVP. Broader editor alignment remains separate.
 
 ## Operational limits and deferred work
 
