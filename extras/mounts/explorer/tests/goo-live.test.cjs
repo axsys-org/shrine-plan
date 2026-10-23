@@ -453,3 +453,32 @@ test('a quiet line never becomes the page\'s now and is not listed in earlier', 
   assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'a later click or hand line leaves the now where it was');
   assert.doesNotMatch(el.querySelector('.sv-earlier').innerHTML, /data-epoch="[689]"/, 'and none of them is in earlier');
 });
+
+// ---- the message bar
+test('say writes the next turn under the agent, numbered after the last, signed person', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); calls.push(b.params); const name = b.params.name, a = b.params.arguments;
+    if (name === 'mcp/read') return { json: async () => ({ result: { structuredContent: { path: a.path, children: [{ path: a.path + '/t1' }, { path: a.path + '/t2' }] } } }) };
+    return { json: async () => ({ result: { structuredContent: { epoch: 9 } } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/user', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  const r = await s.say('a', 'hello there');
+  assert.equal(r.epoch, 9);
+  const w = calls.find(c => c.name === 'mcp/write').arguments;
+  assert.equal(w.who, 'person'); assert.deepEqual(w.records, [{ path: '/0x11/agent/a/turns/t3', slots: { said: 'hello there', who: 'person' } }]);
+});
+test('contextTreeHTML draws the reading as indented lines with slots, system slots hidden', () => {
+  const html = live.contextTreeHTML({name: 'context', path: 'a/context', slots: {note: 'n', 'sys/weft': 'x'}, kids: [{name: 'failing', path: 'a/context/failing', slots: {}, kids: [{name: 't1', path: 'a/context/failing/t1', slots: {got: 9, expected: 8}, kids: []}]}]});
+  assert.match(html, /class="n">context</); assert.match(html, /padding-left:14px"><span class="n">failing</); assert.match(html, /padding-left:28px".*got.*9/);
+  assert.doesNotMatch(html, /sys\/weft/);
+});
+test('newChat writes the next agent folder and names it; chats lists the folders that are chats', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); calls.push(b.params); const name = b.params.name, a = b.params.arguments;
+    if (name === 'mcp/read') return { json: async () => ({ result: { structuredContent: { path: a.path, children: [{ path: a.path + '/a' }, { path: a.path + '/a2' }, { path: a.path + '/hands' }, { path: a.path + '/journal' }, { path: a.path + '/b9', exists: false }] } } }) };
+    return { json: async () => ({ result: { structuredContent: { epoch: 3 } } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/agent/a', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  assert.deepEqual(await s.chats(), ['a', 'a2']);
+  assert.equal(await s.newChat(), 'a3');
+  const w = calls.find(c => c.name === 'mcp/write').arguments;
+  assert.equal(w.who, 'person'); assert.deepEqual(w.records, [{ path: '/0x11/agent/a3', slots: { name: 'a3' } }]);
+});

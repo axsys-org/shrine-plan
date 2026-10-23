@@ -1,7 +1,7 @@
 ---
 name: shrine-mcp
 description: >-
-  Keep the person's records, lists, plans, numbers and notes in their world, and answer questions about them from there. Use it whenever the work is data or state: a tracker, a budget, a pipeline, a roster, a log, a decision, anything to remember across sessions, any question whose answer should stay current, anything to show someone. Start every session by reading your plan and what changed since you last looked; keep what matters as records, keep answers worth keeping as cells. Not for one-off code questions or text nobody needs again.
+  Keep the person's records, lists, plans, numbers and notes in their world, and answer questions about them from there. Use it whenever the work is data or state: a tracker, a budget, a pipeline, a roster, a log, a decision, a file or URL or export they hand you, anything to remember across sessions, any question whose answer should stay current, anything to show someone. Start every session by reading your plan and what changed since you last looked; keep what matters as records, keep answers worth keeping as cells. Not for one-off code questions or text nobody needs again.
 ---
 
 # Shrine MCP
@@ -18,6 +18,9 @@ lives. Default to it:
   would guess.
 - You find something out about their data: a cell or a reference that
   keeps answering, never a sentence copied into a slot.
+- They hand you a file, a URL, an export, a repository: a source record
+  with the artifact's own structure under it and the one region the
+  question needs, never the file poured into slots (Sources, below).
 - You answer a question about their data: read the world, not your
   memory of it.
 - A session starts: read `/agent/<name>/plan` and `history after seen`
@@ -47,6 +50,7 @@ it, under your own folder, apart from the person's data.
 | what it is | what to do with it |
 |---|---|
 | a primary fact, a durable decision, an expectation | a record, at its authoritative path |
+| something from outside: a file, a page, an export | a source record, its structure as paths, the regions asked for |
 | a reusable computation or relationship | a cell, or a reference slot, never the number it gives |
 | reasoning, exploration, coordination, confirmation | nothing, unless recovery or audit needs it |
 
@@ -155,7 +159,8 @@ can ever be over the fact alone again.
 So seed in order. First the kinds: a folder per kind within a scope,
 and for each kind its shape chosen once, the slot names, their types,
 the few values a chosen slot may take; the same kind elsewhere reuses
-the same shape. Then the inputs, uniformly, every row the same slots,
+the same shape. Then the inputs, which are the regions of a source
+or what the person told you, uniformly, every row the same slots,
 numbers as numbers, dates as `YYYYMMDD`, keys turned into references
 with `reference` once, text only as quotation or as `notes`. Then the
 views over them, and the views over those, up as far as the questions
@@ -165,6 +170,163 @@ is held to the same shape. What you would have typed into a slot as a
 result is the next cell to write instead. A seed is finished when a
 reader can rebuild every output from the inputs by following the
 cells, and when the inputs carry nothing a cell could have said.
+
+### Sources
+
+Operate freely; ground precisely; compose by default. You are a capable
+agent with the web, the file system, a shell, code and every skill you
+have; the world does not constrain how you investigate, compute, edit or
+act. Its discipline is in what you leave in it: every outside thing
+anchored by a binding that keeps what it is, where and how it was got,
+which version, how to tell it moved and which region a move touches,
+and how to find it again when the work needs to act on it; decomposed
+lazily into axiomatic inputs; and read through views composed over each
+other. The quality of the world is your representational taste as much
+as the kernel's correctness: when to keep a raw observation, when to
+decompose, when to reference a shared thing, when to compose an
+existing view, and when to write nothing.
+
+Chains start at a source. A file, a URL, an export, a repository, a
+mailbox: anything the person hands you or points you at is a source,
+and it enters the world as a record at `/user/<scope>/sources/<artifact>`
+(`where` it is, which `script` binds it, the version `marker` last read,
+`every` for one that changes on its own), with the artifact's own stable
+structure as the paths beneath it: the structure its own citations use
+(paragraph numbers, sheet and row, heading, record id). Pagination,
+offsets, line numbers and the time of reading move between versions, so
+they are slots on a region, never its path. Write the contents eagerly
+(the parts, the sections, the sheets, each a record with only `source`)
+so what exists can be seen and pointed at; write a leaf when a question
+needs it, at the path the structure gives it, and nothing unasked. A
+region never carries prose: it is its position, a digest of its words,
+`source` and `digest`, and the facts the source states there decomposed
+beneath it, names as path segments or references, numbers as numbers,
+dates as days, a quotation only when the words are the fact and short.
+The sentences stay in the file, one read away; a `text` slot holding a
+paragraph is the slop this page is against. What you think about a
+region is a view over it, or a record in the scope that references it.
+
+One question, one region, then the answer in the chat. Work with the
+person the way you always do: read what the question needs, answer,
+keep what is worth keeping. A source does not get swallowed because it
+arrived; three hundred nodes and a hundred footnotes before the first
+question is over-ingestion, and it stalls the person while you import.
+When a whole source is genuinely wanted, say so, and promote it to the
+hand rather than extracting it by hand.
+
+A paste in the chat is a source too. When the person pastes a table, a
+list, a log, a message, a block of text, that is an artifact handed to
+you, not a question: it goes in as a source (`where` is the chat, the
+paste's own structure as paths, a quotation never a paraphrase), and the
+views over it come after. A question in the chat derives a view; a paste
+is input. Tell them apart by what the words are: something the world did
+not have before enters as a source, something it can compute is a read.
+The world informs the work; it does not prescribe its ending. A source
+enters decomposed, views compose over it and over each other, and you
+read the result and continue by the person's actual intent: answer in
+the chat, look further, compose another view, edit a file, change code,
+operate a service, or conclude that nothing needs changing. There is no
+mandatory export, action or write-back stage; a computed result is
+useful when all you do is read it. What the discipline buys is that when
+the work does require changing something outside the world, the
+bindings are there: the change traces back through the views to the
+source region it concerns, and you operate on that region, at that
+scope, never on a derived result as if it were the source. When you have
+changed something outside, re-read that source so the world reflects it.
+Keep what has continuing value; otherwise read, answer, and leave the
+world as it was.
+
+On first contact you are the binding: open the source with whatever you
+read files with, write the skeleton and the one region the question
+needs; the next question extracts the next region, and a hole at a path
+under the artifact is a request for it (`referencing` finds them). The
+binding is code, never records: how a region came to be at its path
+must be reproducible from the path alone. Promote it to a `source` hand
+(`hands.md`) when the source changes without you present, or when you
+find yourself re-extracting it every session. The hand re-reads the
+regions that exist, rewrites only those whose digest moved, with
+`if_case`, culls the ones the source lost, in one event signed
+`source_<artifact>`, and writes nothing when nothing changed; chains
+over untouched regions do not move. `sources.md` beside this page holds
+the rule and a screen per kind of source; read the kind you have met
+before you write its first region.
+
+Acquire freely, structure rigorously. How you get at a source is
+unrestricted: the file system, git, code you run, a parser, a browser,
+an API, a database, several of these in one task, any skill you have.
+The discipline is at the boundary of the world. What enters is anchored
+at its source with its provenance (the artifact record, the locator, the
+version marker) and decomposed by the source's own factual and
+conceptual structure, never by the incidental shape of the format or
+the convenience of the extraction: an entity, an observation, an event,
+a claim, a measurement and a relationship are different things at
+different paths; a nested structure and a one-to-many are kept as they
+are, which is structure, not a schema: `y` and `z` are read cares the
+world already has, the natural shape of a collection, a hierarchy or a
+repeated structure, and they cost nothing to declare. Decompose to the smallest unit
+the source actually supports and no further; the aim is not the most
+records, it is the minimum faithful, addressable structure that allows
+the most composition above it. A response from an API need not be
+materialised whole: the region is the observation, and a view over it
+derives the records a question needs. Keep every independently
+meaningful fact traceable to the field, row, passage or code region it
+came from, so that a change can one day be traced through the views to
+the exact region of the source it concerns and applied there, not by
+regenerating the whole; nothing imported may make that impossible.
+Source evidence stays distinguishable from what was derived from it: a
+region is what the source says, with the period and unit it said it in,
+not a verified or timeless fact; a reading of a region, yours or a
+model's, is an interpretation and stays one, in the scope, referencing
+the region; and editing a view never says how its source should
+change. A region the source lost is culled, so the views
+over it fault rather than go on presenting what it used to say.
+
+A repository, an API, a database, a service: these are external systems
+to understand and operate, not activity logs to copy. Operate them with
+your own tools; anchor the meaningful objects (a file and its symbols at
+a commit; a resource, its fields and an operation's observed effect; a
+row by its key and version) and derive relationships, impact,
+comparisons and risk as views above them. An operation you performed is
+an observation worth a record only when it is evidence, reusable, or
+needed for recovery: the resource it addressed, what was sent, what came
+back, the day, by reference; a successful response is not proof of the
+state you wanted, read the resource. Five hundred commands, forty
+responses and a hundred exploratory queries leave nothing the next agent
+can use; the repository, its dependency view and one test-run
+observation do. After a change outside, re-read the anchors it touched
+and look at the views over them; the database's own transactions and
+the service's own guarantees stay theirs.
+
+The folder is the kind and the views over it are its behaviour; the
+checks (`validate`, `distinct`, `unique`) are cells beside it, and there
+is no other mechanism. A view is addressed by its path and read by its
+shape, so a view over `deals` serves whatever has deals shaped so. Before
+any computation, three questions in order: reuse (does a view already
+answer this; `referencing` and `find` say), refine (can a cell over an
+existing view's `/x`, with the scoped inputs it needs, answer it), create
+(is this genuinely new reusable computation). Never copy a view with one
+setting changed; a y or z result is an ordinary input to the next cell,
+branching, merging, as deep as the questions go and never cyclic;
+nothing propagates by code, a chain's consumers read the live answer
+when their inputs move, and a missing input or a fault stays visible in
+the context rather than being papered over. Pin only to cite.
+
+### What a view is for
+
+A view is a question kept alive. It earns its record in exactly three
+cases: the person will ask it again and the answer must be current then
+(a total, a list, a status board); a check must hold and be seen to hold
+(an expectation at its source and a `diff` or `validate` over the live
+answer, which is what you test your own work against); or the next
+question reads its answer as input (a chain). Outside those three, a
+question is a read with `formula` and an answer in the chat, and nothing
+is written. A view made because a view could be made is noise; a count
+nobody will read again, a group listed by hand, a chain of four cells
+copied five times with one setting changed, are the signs. The point of
+the world is that the next session, the next agent and the page can read
+the same answer without redoing the work, and that a change at the
+source moves every answer above it; a view that nobody reads again
+provides neither.
 
 ### One object, many scopes
 
@@ -218,7 +380,8 @@ The world serves `<world-url>/mcp` on localhost only, with no credential
 (booting one is `SETUP.md` beside this skill). Three verbs; this page is
 the contract and the one form of each verb you use most. Every knob,
 every standard cell and every value rule is on the second page,
-`knobs.md`: read it when you need one, never from memory.
+`knobs.md`: read it when you need one, never from memory. The kinds of
+source, one screen each, are `sources.md`.
 
 ```
 read     path       /user/org/deals            a record, a folder, /x/<cell>, /c/x/<cell>
@@ -261,7 +424,9 @@ page under Values.
   path (`/sys/weft` the formula's reference, `/sys/tack` the input's). From
   then on `/x/<path>` is the answer, live, and a cell over it composes.
   Keep cells beside the data, never inside the folder they read: a cell
-  under its own input is a cycle and reads unknown.
+  under its own input is a cycle and reads unknown. Before writing one,
+  `referencing` and `find` the views already over that folder: a cell
+  that exists is reused by path, not written again with a new name.
 - Scratch under `/agent/<name>/scratch` as one batch, culled as one batch
   at the end; `then` shows the effect in the same call; `from` an earlier
   case changes your mind.
@@ -312,8 +477,6 @@ as the write, so a stale write is refused, never raced. Sign everything with you
 before you act on what you remember; never assume a session is the only
 one.
 
-What is not a formula is an `ask` (on the second page): a cell a model
-answers, stamped with the input's case. "QA mode on" means the third page,
-`qa.md`: expectations as records, checks as diff cells, a score, written
-before you read.
+"QA mode on" means the third page, `qa.md`: expectations as records,
+checks as diff cells, a score, written before you read.
 

@@ -17,9 +17,6 @@ What you cannot guess:
   resumes in seconds.
 - One world per machine. A world holds its namespace in memory, a loaded
   one takes a gigabyte or more, and two at once have crashed a laptop.
-- `ask` cells need a model: an `ask` hand with an OpenAI-compatible
-  endpoint (see step 1). Without it everything else works and an ask stays
-  asking.
 
 ## 1. Run x/setup
 
@@ -37,9 +34,8 @@ case it had. Run it in a terminal of its own, not in the foreground of this
 session.
 
 A hand for a new world is named on its first boot and kept with it:
-`--hand "ask --model <name> --endpoint <chat completions url>"` adds the
-model hand (`OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the environment is
-sent as a bearer); `--port N` picks the port (default 8300).
+`--hand "source --folders /0x11/user/sources"` adds the source runner over
+that folder; `--port N` picks the port (default 8300).
 
 ## 2. Connect your app, load the skill
 
@@ -47,10 +43,11 @@ Add the MCP URL (`http://127.0.0.1:8300/mcp`, HTTP, local only, no
 credential) the way your app adds an HTTP MCP server. It serves four
 tools: `mcp/read`, `mcp/write`, `mcp/history`, `mcp/apply`.
 
-Load the three skill pages the way your app loads instructions:
+Load the four skill pages the way your app loads instructions:
 `extras/mounts/mcp/skills/shrine-mcp/SKILL.md` (the one form of each
-thing you use most), `knobs.md` (every knob) and `qa.md` (QA mode). Link
-the folder, or point your instructions file at it.
+thing you use most), `knobs.md` (every knob), `sources.md` (a screen per
+kind of source) and `qa.md` (QA mode). Link the folder, or point your
+instructions file at it.
 
 If either takes a restart of your app to pick up, say so and stop; the
 person restarts and says "continue".
@@ -83,12 +80,12 @@ Eden: http://127.0.0.1:8300; mounts: mcp, probe, explorer; world: /Users/you/wor
 
 Without `--world` the world lives in a temporary directory and is gone with
 its process; without `explorer` it boots in under a minute and needs no
-Node, and there is no live page. `--hand` names a hand (`clock`, `watch`,
-`export`, `import`, `ask`; `extras/mounts/mcp/hands/hands.md` says what
-each does and how to write one); the launcher starts each after the foot
+Node, and there is no live page. `--hand` names a hand (`clock`, `source`;
+`extras/mounts/mcp/hands/hands.md` says what each does and how to write
+one); the launcher starts each after the foot
 listens, as its own process with its log at `DIR/hands/<name>.log`, and
 stops it at teardown. A world runs the hands its `world.json` names and no
-others, which is the first thing to check when an `ask` never answers.
+others, which is the first thing to check when a source never moves.
 Each hand's config is a record under `/0x11/agent/hands/<name>`.
 
 Connect: Claude Code takes `claude mcp add --transport http shrine

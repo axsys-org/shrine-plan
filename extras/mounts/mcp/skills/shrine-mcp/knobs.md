@@ -17,7 +17,7 @@ find      acme                 the records under path whose name or any slot's t
                                limit of them visited at a time, each with the slot that matched; next continues
 referencing  /user/org/deals  the records under path whose reference slots point at that path or beneath it, in tap
                                order, limit visited at a time: each with the slot, the target, cell (it is a cell) and hole
-                               (a cell waiting there: the target absent, an ask unanswered, a hole, a fault); next continues;
+                               (a cell waiting there: the target absent, a hole, a fault); next continues;
                                plus watchers, the reactive records whose crews depend on it, from the kernel's crew index
 formula   where                run a standard cell over the tree read, settings as its context; nothing written
 settings  {key: "/status", value: "closed"}
@@ -97,7 +97,7 @@ page render `then` uses), and one per presented read, `{shown: {path, care,
 case}}`. A commit never waits on a stream; a stream that stalls is dropped.
 `hands/stream.py` follows it from Python and polls `history after … with x`
 whenever the stream is not there, yielding the same lines either way; the
-ask hand runs on that.
+hands run on that.
 
 ## Write only if unchanged
 
@@ -122,10 +122,12 @@ others; the launcher's `Eden:` line lists them. Config is a record at
 | hand | what runs | how to tell it is not running |
 |---|---|---|
 | `clock` | writes `/clock {day, timezone}` once a day | `/clock` is behind |
-| `watch` | posts to a URL when a watched cell's answer changes (`cells`, `url`) | the value at `/agent/hands/watch/<cell>` is stale |
-| `export` | a request record under `/agent/hands/export/` `{folder, format, path}` becomes a file | the request has no `done` |
-| `import` | `/agent/hands/import/<source>` `{kind, source, folder, key, every}` plus `/map` and `/refs/<slot>`; writes `who: import:<source>` | `ran` on the config does not move |
-| `ask` | answers `ask` cells with a model | `/c/x/<cell>` keeps saying asking |
+| `source` | binds the source records under the folders its config names (`folders`): the contents on first contact, a region when something points at its path, a scoped rewrite when the marker moves, signed `source_<artifact>`; `url` is told of a change | the artifact's `marker` does not move when the file does; a hole under it stays a hole |
+
+A source is a record you write: `/user/<scope>/sources/<artifact> {where,
+script, key, every}`; the first page says what goes under it and
+`sources.md` says it per kind. The hand runs the folders its config names;
+until it does, you are the script.
 
 A line from a hand, or one whose touched paths all sit under `/agent/hands`,
 never makes another hand write: an agent reading history can filter them
@@ -285,7 +287,6 @@ numbers in their own unit and compare as such; a day is the number
 | `match` | `key`, `value`, `op` (contains default, starts, ends) | the rows whose `key` text contains, starts with or ends with `value` |
 | `split` | `slot`, `with` (default a space), `into` (default `slot`) | each row gains `into/1`, `into/2`, … , the slot's text cut at `with` |
 | `date` | `slot`, `into` (default `/day`) | each row gains `into`: the text date `YYYY-MM-DD` (anything after the day ignored) as the natural `YYYYMMDD`, which `sort`, `between`, `latest` and `since` can use |
-| `ask` | `prompt`, `model` (default the hand's) | the stored answer at `<cell>/result` while its stamp (input case, model, prompt) is current; else empty, with `/sys/view/asking` in the context |
 | `when` | `key`, `op` (as `where`), `value`, or `expr`; `then`, `else` (optional), `into` | each row gains `into`: `then` when its `key` matches, else `else`; without `else` a row that does not match is left as it is |
 | `coalesce` | `slot`, `value`, `into` (default `slot`) | each row gains `into`: its `slot` when present, else `value` |
 | `part` | `slot` (a day number `YYYYMMDD` or a text date), `unit` (year, quarter, month, week, weekday), `into` (default `/<unit>`) | each row gains `into`: that part of its day; week counts sevens from January 1st, weekday is 1 Monday to 7 Sunday |

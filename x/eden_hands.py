@@ -23,8 +23,6 @@ def hand_commands(hands, url, node, hands_dir=HANDS_DIR):
     for hand in hands:
         script = Path(hands_dir) / (hand['name'] + '.py')
         if not script.is_file():
-            script = Path(hands_dir) / (hand['name'] + '_.py')      # import is a keyword
-        if not script.is_file():
             raise ValueError(f"no hand called {hand['name']} in {hands_dir}")
         out.append([sys.executable, str(script), url, '--node', node, *hand.get('args', [])])
     return out

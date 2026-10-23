@@ -9,7 +9,7 @@ the coverage note:
 2. Where it left off is a record: /agent/hands/<name>/seen {epoch}. A hand with no seen record starts from the world's
    first event.
 3. It follows the stream, and polls when it cannot (stream.follow): a hand reacts to lines, it never sleeps and re-reads.
-4. Everything it does is a write with its name on it (who: <name>), idempotent: a hand that runs twice over the same
+4. Everything it does is a write with its name on it (who: <name>, or <name>_<artifact>), idempotent: a hand that runs twice over the same
    events writes the same records. update() is write-if-unchanged: it carries the case it read, so two hands on one
    record cannot lose each other's work.
 5. A failure leaves the world honest: the base logs it and retries on the next line; a hand computes its whole answer
@@ -109,7 +109,7 @@ def case_of(reference):
     return int(reference.split('/')[3]) if reference else 0
 
 
-HANDS = ('ask', 'clock', 'watch', 'export', 'import')
+HANDS = ('clock', 'source', 'agent', 'web')
 
 
 class Hand:
@@ -176,11 +176,12 @@ class Hand:
         return done
 
     def quiet(self, item):
-        """A line that never causes a write by itself: one from any hand, or one whose touched paths all sit under
-        /agent/hands (a seen mark, a kept value, a config poke).  Without this rule two hands ping-pong on each
+        """A line that never causes a write by itself: one from any hand (its name, or its name and an underscore, as
+        the source hand signs source_<artifact>), or one whose touched paths all sit under /agent/hands (a seen mark,
+        a kept value, a config poke).  Without this rule two hands ping-pong on each
         other's seen marks forever."""
         who = item.get('who') or ''
-        if who in HANDS or who.split(':', 1)[0] in HANDS or who == self.name:
+        if who in HANDS or who.split('_', 1)[0] in HANDS or who == self.name:
             return True
         touched = item.get('touched') or []
         hands = '/' + self.w.node + '/agent/hands'

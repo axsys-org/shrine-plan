@@ -8,7 +8,52 @@
 
 function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>${opts.chat ? `<form class="sv-chat"><input type="text" autocomplete="off" placeholder="say something to ${esc(opts.chat)}"><button type="submit">send</button><button type="button" class="new" title="start a new chat with a blank context; this one stays">new chat</button></form>` : ''}`;
+  if (opts.chat) {
+    el.querySelector('.sv-main').innerHTML = `<div class="sv-talk"></div><div class="sv-ask"></div><div class="sv-ctx"><div class="sv-ctx-change"></div><div class="sv-ctx-now"></div></div>`;
+    el.querySelector('.sv-ask').append(el.querySelector('.sv-chat'));   // the box sits under the conversation, above the context
+    const node = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11', agent = '/' + node + '/agent/' + opts.chat;
+    let drawing = null;
+    async function drawChat() {
+      if (drawing) return drawing;
+      drawing = (async () => {
+        const turns = await source.read(agent + '/turns', 'y');
+        const ts = (turns && turns.kids || []).map(k => ({ n: Number((/t(\d+)$/.exec(k.path) || [0, 0])[1]), who: k.slots.who || '', said: k.slots.said || '' })).filter(t => t.n).sort((a, b) => a.n - b.n);
+        el.querySelector('.sv-talk').innerHTML = ts.map(t => `<div class="sv-msg ${t.who === 'person' ? 'me' : 'them'}"><span class="w">${esc(t.who)}</span><div class="s">${esc(t.said)}</div></div>`).join('') || '<div class="sv-msg them"><div class="s">nothing said yet</div></div>';
+        const rec = await source.read(agent + '/context', 'x');
+        if (!rec || rec.record === null || !rec.record || !Object.keys(rec.record).length) { el.querySelector('.sv-ctx-now').innerHTML = '<div class="sv-ctx-h">context</div><div class="sv-empty">no lens yet</div>'; el.querySelector('.sv-ctx-change').innerHTML = ''; drawing = null; return; }
+        const now = await source.read('/x' + agent + '/context', 'z');
+        el.querySelector('.sv-ctx-now').innerHTML = contextTreeHTML(now);
+        const lens = k => Object.entries(k || {}).filter(([n]) => n !== 'formula' && n !== 'over' && n !== 'note');
+        const before = rec.case && Number(rec.case) > 1 ? await source.read(agent + '/context', 'x', Number(rec.case) - 1) : null;
+        const was = new Map(lens(before && before.record)), is = new Map(lens(rec.record));
+        const added = [...is].filter(([k]) => !was.has(k)), dropped = [...was].filter(([k]) => !is.has(k)), kept = [...is].filter(([k]) => was.has(k));
+        const chips = added.map(([k]) => `<span class="add">+${esc(k)}</span>`).concat(dropped.map(([k]) => `<span class="drop">−${esc(k)}</span>`), kept.map(([k]) => `<span class="keep">${esc(k)}</span>`)).join(' ');
+        el.querySelector('.sv-ctx-change').innerHTML = `<div class="sv-ctx-h">context, case ${esc(rec.case || '')}${added.length || dropped.length ? ` · ${added.length} in, ${dropped.length} out` : ' · unchanged'}</div><div class="sv-lens">${chips}</div>${rec.record.note ? `<div class="sv-note">${esc(rec.record.note)}</div>` : ''}`;
+        drawing = null;
+      })().catch(() => { drawing = null; });
+      return drawing;
+    }
+    source.follow(msg => { if (msg.shown) return; if ((msg.touched || []).some(t => ('/' + t).startsWith(agent))) drawChat(); });
+    drawChat();
+    const form = el.querySelector('.sv-chat'), input = form.querySelector('input');
+    // new chat: a fresh agent folder, and the page moves to it; the old chat keeps its address
+    const node0 = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11';
+    form.querySelector('button.new').addEventListener('click', async () => {
+      if (!source.newChat) return;
+      let name; try { name = await source.newChat(); } catch (err) { return; }
+      root.location.search = '?chat=' + name + '&views=/' + node0 + '/agent/' + name;
+    });
+    const chatsEl = root.document ? root.document.createElement('span') : null;
+    if (chatsEl) { chatsEl.className = 'sv-chats'; el.querySelector('.sv-bar').insertBefore(chatsEl, el.querySelector('.sv-qa')); }
+    if (source.chats && chatsEl) source.chats().then(list => { chatsEl.innerHTML = 'chats: ' + list.map(c => c === opts.chat ? `<b>${esc(c)}</b>` : `<a href="?chat=${esc(c)}&views=/${node0}/agent/${esc(c)}">${esc(c)}</a>`).join(' · '); }).catch(() => {});
+    form.addEventListener('submit', async e => {
+      e.preventDefault(); const text = input.value.trim(); if (!text || !source.say) return;
+      input.disabled = true;
+      try { await source.say(opts.chat, text); input.value = ''; } catch (err) { input.value = text; }
+      input.disabled = false; input.focus();
+    });
+  }
   const $ = sel => el.querySelector(sel);
   const state = { events: [], shown: null, drawn: false };
   const views = local(opts.views !== undefined ? opts.views : opts.crumb);   // the page's folder: an agent's QA writes show only on the QA folder's page
@@ -135,6 +180,13 @@ function referencedHTML(rb) {
 function qaChipHTML(q) {
   const n = Number(q.changed) || 0;
   return `<a class="sv-chip ${n ? 'off' : 'ok'}" href="?views=/${esc(q.folder)}" title="QA: ${n ? n + ' check' + (n === 1 ? '' : 's') + ' disagree' : 'every check agrees'}">QA ${n}</a>`;
+}
+// the context tree as the agent reads it: a node per line, its slots after it, children indented
+function contextTreeHTML(node, depth = 0) {
+  if (!node) return '';
+  const slots = Object.entries(node.slots || {}).filter(([k]) => !k.startsWith('sys/') && k !== 'formula' && k !== 'over');
+  const line = `<div class="sv-tn" style="padding-left:${depth * 14}px"><span class="n">${esc(depth ? node.name : 'context')}</span>${slots.map(([k, v]) => `<span class="s"><span class="k">${esc(k)}</span> ${valueHTML(v, 'v')}</span>`).join('')}</div>`;
+  return line + (node.kids || []).map(k => contextTreeHTML(k, depth + 1)).join('');
 }
 // the standing outline: every cell of the views folder with what it says now (the scoreboard, the bug list, the plan)
 function cellsHTML(cells) {
@@ -427,6 +479,27 @@ function mcpSource(opts = {}) {
     return j.result.structuredContent;
   }
   const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
+  // a message to an agent: the next turn record under its folder, signed person; the agent hand answers on the stream
+  async function say(agent, text) {
+    const node = local(views).split('/')[0] || '0x11', folder = '/' + node + '/agent/' + agent + '/turns';
+    const page = await rpc('read', { path: folder, care: 'y', limit: 500 });
+    const n = Math.max(0, ...(page.children || []).map(c => { const m = /\/t(\d+)$/.exec(c.path); return m ? Number(m[1]) : 0; }));
+    return rpc('write', { who: 'person', records: [{ path: folder + '/t' + (n + 1), slots: { said: text, who: 'person' } }] });
+  }
+  // a new chat: the agent's folder culled and revived empty in one write; its turns, lens and documents are gone
+  // the chats: every folder under /agent that holds turns; a new chat is the next such folder, the old ones stay
+  async function chats() {
+    const node = local(views).split('/')[0] || '0x11';
+    const page = await rpc('read', { path: '/' + node + '/agent', care: 'y', limit: 200 });
+    return (page.children || []).filter(c => c.exists !== false && /\/agent\/[a-z]\d*$/.test(c.path)).map(c => c.path.split('/').pop()).sort((x, y) => x.length - y.length || (x < y ? -1 : 1));
+  }
+  async function newChat() {
+    const node = local(views).split('/')[0] || '0x11', have = await chats();
+    let n = 2; while (have.includes('a' + n)) n++;
+    const name = have.length ? 'a' + n : 'a';
+    await rpc('write', { who: 'person', records: [{ path: '/' + node + '/agent/' + name, slots: { name } }] });
+    return name;
+  }
   // the person's cursor: one record under the node's /agent/person, signed person, so the agent sees the click as a line
   async function cursor(path) {
     const node = local(path).split('/')[0]; if (!node) return null;
@@ -529,18 +602,18 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc, cursor, referencedBy };
+  return { read, answer, graph, follow, qa, rpc, cursor, say, chats, newChat, referencedBy };
 }
 
 // the page: /live?views=<folder>&who=<writer>
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
-  const views = local(q.get('views') || ''), who = q.get('who') || '';
-  return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
+  const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '';
+  return mountViewer(el, mcpSource({ views, who }), { crumb: views, views, chat });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
