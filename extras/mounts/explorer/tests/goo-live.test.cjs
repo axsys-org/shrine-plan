@@ -513,3 +513,27 @@ test('holesHTML orders holes by when they are due and says it in words', () => {
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.match(html, /due now/); assert.match(html, /until 2027-01-01/); assert.match(html, /in 7 days/); assert.match(html, /holes · 3/);
 });
+
+test('mountRecord draws every page of what is beneath before the backlink walk returns', async () => {
+  const kid = (name, slots) => ({path: '0x11/user/' + name, name, slots, kids: [], case: 1});
+  const pages = {
+    '': {path: '0x11/user', record: {}, kids: [kid('eng', {name: 'engineering'}), kid('orgs', {}), {path: '0x11/user/orgs/a16z', name: 'a16z', slots: {}, kids: []}], case: 1, next: 'p2'},
+    p2: {path: '0x11/user', record: {}, kids: [kid('people', {}), kid('web', {})], case: 1, next: null}};
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const source = {
+    read: async (path, care, cas, next) => pages[next || ''],
+    backlinks: async () => { await gate; return {matches: [{path: '0x11/agent/c1/context', slot: 'user', hole: false}]}; }};
+  const el = fakeEl();
+  const sec = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : null)};
+  el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  live.mountRecord(el, source, {at: '/0x11/user'});
+  for (let i = 0; i < 20 && !/looking/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /beneath · 4/, 'both pages of children, and only direct children');
+  assert.match(main.innerHTML, /people/); assert.match(main.innerHTML, /web/); assert.doesNotMatch(main.innerHTML, /a16z/);
+  assert.match(main.innerHTML, /looking…/, 'drawn before the backlinks come back');
+  release();
+  for (let i = 0; i < 20 && !/c1\/context/.test(sec.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(sec.innerHTML, /pointing here · 1/);
+});

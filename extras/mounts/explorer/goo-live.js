@@ -528,9 +528,9 @@ function mcpSource(opts = {}) {
     const node = local(path).split('/')[0]; if (!node) return null;
     return rpc('write', { who: 'person', records: [{ path: '/' + node + '/agent/person/cursor', slots: { path: world(path) } }] });
   }
-  async function read(path, care, cas) {
-    const w = world(path), held = care === 'x' && !cas ? carried(w) : null;
-    return readOf(held || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 }));
+  async function read(path, care, cas, next) {
+    const w = world(path), held = care === 'x' && !cas && !next ? carried(w) : null;
+    return readOf(held || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200, ...(next ? { next } : {}) }));
   }
   async function answer(path) {
     const w = world(path), x = carried('/x' + w), c = carried('/c/x' + w);
@@ -581,6 +581,14 @@ function mcpSource(opts = {}) {
     return out;
   }
   async function backlinks(path) {
+    // the links hand keeps every reference in memory and answers in milliseconds; the kernel walk below is the fallback
+    if (root.fetch && root.location) {
+      try {
+        const base = opts.links || ('http://' + (root.location.hostname || '127.0.0.1') + ':8312');
+        const r = await (await root.fetch(base + '/links?to=' + encodeURIComponent(world(path)))).json();
+        if (r && r.ready) return { matches: (r.matches || []).map(m => ({ path: local(m.path), slot: m.slot, cell: !!m.cell, hole: !!m.hole })), via: 'links' };
+      } catch (e) { /* the links hand is not running */ }
+    }
     const node = local(path).split('/')[0], self = local(path), out = { matches: [] }, seen = new Set();
     for (const r of ['/' + node + '/user', '/' + node + '/agent']) {
       let next = null;
@@ -648,14 +656,32 @@ function mountRecord(el, source, opts = {}) {
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>`;
   const main = el.querySelector('.sv-recview');
   let timer = null;
+  let drawn = 0;
   async function draw() {
+    const mine = ++drawn;
     const r = await source.read(at, 'y').catch(() => null);
+    if (mine !== drawn) return;
     if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return; }
+    // what is beneath, every page of it: a folder with many children answers in pages
+    const kids = [], seen = new Set();
+    const take = page => { for (const k of page.kids || []) { const lk = local(k.path); if (lk.split('/').length === at.split('/').length + 1 && !seen.has(lk)) { seen.add(lk); kids.push(k); } } };
+    take(r);
+    for (let next = r.next, n = 0; next && n < 20; n++) {
+      const more = await source.read(at, 'y', 0, next).catch(() => null);
+      if (!more || mine !== drawn) break;
+      take(more); next = more.next;
+    }
+    if (mine !== drawn) return;
     const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
-    const kids = (r.kids || []).map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
-    let back = '';
-    if (source.backlinks) { const rb = await source.backlinks(at).catch(() => ({ matches: [] })); back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join(''); }
-    main.innerHTML = card + (kids ? `<div class="sv-sec"><div class="k">beneath</div>${kids}</div>` : '') + `<div class="sv-sec"><div class="k">pointing here</div>${back || '<div class="sv-empty">nothing points here yet</div>'}</div>`;
+    const rows = kids.map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
+    // drawn at once; what points here is a walk over the world, filled in when it comes back
+    main.innerHTML = card + (rows ? `<div class="sv-sec"><div class="k">beneath · ${kids.length}</div>${rows}</div>` : '') + `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>`;
+    if (!source.backlinks) { main.querySelector('.sv-back-sec').remove(); return; }
+    const rb = await source.backlinks(at).catch(() => ({ matches: [] }));
+    if (mine !== drawn) return;
+    const back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join('');
+    const sec = main.querySelector('.sv-back-sec');
+    if (sec) sec.innerHTML = `<div class="k">pointing here${rb.matches.length ? ' · ' + rb.matches.length : ''}</div>${back || '<div class="sv-empty">nothing points here yet</div>'}`;
   }
   draw();
   if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });

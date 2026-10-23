@@ -92,7 +92,7 @@ class CrawlHand(Hand):
     def quiet(self, item):
         """A fill under one of my asks wakes me, though the web hand wrote it."""
         touched = item.get('touched') or []
-        if any(t.startswith(self.folder + '/asks/') and ('/found/' in t or t.endswith('/status')) for t in touched):
+        if any(t.startswith(self.folder + '/asks/') and t.endswith('/status') for t in touched):
             return False
         if any(t.startswith(self.user) and re.search(r'/holes/[^/]+$', t) for t in touched):
             return False                                      # a hole written by any hand is mine to schedule
@@ -232,12 +232,13 @@ class CrawlHand(Hand):
 
     # ---- seeding: stubs become asks
     def open_asks(self):
-        page = self.w.read(self.folder + '/asks', 'y', limit=500)
+        """aid -> integrated?, from one read of the asks folder two levels down (it used to be one read per ask)."""
+        page = self.w.read(self.folder + '/asks', 'z', limit=5000)
         out = {}
         for c in page.get('children', []):
             if not c.get('exists'):
                 continue
-            kids = {k['path'].rsplit('/', 1)[1] for k in (self.w.read(c['path'], 'y', limit=20).get('children') or []) if k.get('exists')}
+            kids = {k['path'].rsplit('/', 1)[1] for k in (c.get('children') or []) if k.get('exists')}
             out[c['path'].rsplit('/', 1)[1]] = 'integrated' in kids
         return out
 
@@ -373,8 +374,14 @@ class CrawlHand(Hand):
                     n += self.register(t)
             if n:
                 n += self.schedule_holes(time.time())
-        if any(t.startswith(self.folder + '/asks/') for t in touched):
-            n += self.integrate_ready()
+        # an ask is ready when the web hand writes its final status: only that ask is integrated, nothing else is read
+        for t in touched:
+            m = re.match(re.escape(self.folder) + r'/asks/([^/]+)/status$', t)
+            if not m:
+                continue
+            st = (self.w.read(t, 'x').get('properties') or {}).get('/state')
+            if st in ('done', 'empty', 'failed') and not self.w.read(f'{self.folder}/asks/{m.group(1)}/integrated', 'x').get('exists'):
+                n += self.integrate(f'{self.folder}/asks/{m.group(1)}')
         return n
 
     def tick(self, now):

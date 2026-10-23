@@ -438,14 +438,14 @@ class WebHand(Hand):
             name = a['path'].rsplit('/', 1)[1]
             if not a.get('exists') or not (re.fullmatch(r'[a-z]\d*', name) or name == 'crawl'):
                 continue
-            asks = self.w.read(a['path'] + '/asks', 'y', limit=500)
+            asks = self.w.read(a['path'] + '/asks', 'z', limit=5000)     # the asks and their children in one read
             for q in asks.get('children', []):
                 if not q.get('exists'):
                     continue
                 props = {k.lstrip('/'): v for k, v in (q.get('properties') or {}).items() if not k.startswith('/sys')}
                 if not props.get('asked') or q['path'] in self.done or q['path'] in self.queued:
                     continue
-                kids = {c['path'].rsplit('/', 1)[1] for c in (self.w.read(q['path'], 'y', limit=20).get('children') or []) if c.get('exists') or c.get('children')}
+                kids = {c['path'].rsplit('/', 1)[1] for c in (q.get('children') or []) if c.get('exists') or c.get('children')}
                 if 'found' in kids or 'taken' in kids:
                     continue
                 prio = 0 if name != 'crawl' else 1 + int(float(props.get('priority') or 1))
@@ -618,8 +618,9 @@ class WebHand(Hand):
         return len(rows)
 
     def line(self, line):
+        # only a new or changed ask itself wakes the queue, not its status, rows, claim or integration
         touched = line.get('touched') or []
-        if not any('/asks/' in t for t in touched):
+        if not any(re.search(r'/agent/[^/]+/asks/[^/]+$', t) for t in touched):
             return 0
         return self.enqueue()
 
