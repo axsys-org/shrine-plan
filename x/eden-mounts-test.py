@@ -248,6 +248,14 @@ class MountTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(launcher), '--srs'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
 
+    def test_upgrade_refuses_to_create_a_replacement_world(self):
+        world = self.root / 'missing-world'
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('eden')),
+                                 '--world', str(world), '--upgrade'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--upgrade requires an existing persistent world', result.stderr)
+        self.assertFalse(world.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

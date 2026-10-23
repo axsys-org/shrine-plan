@@ -3,6 +3,7 @@
 Set WISP and run this file. EDEN_TEST_WORLD may reuse a disposable test world
 to avoid recompiling the initial mount publication. Never select a personal world.
 """
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -116,6 +117,19 @@ class NativeWorldTest(unittest.TestCase):
             def crash():
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
+                # Waiting for the launcher does not reap its killed runtime.
+                # That process intentionally inherits world.lock; wait for its
+                # kernel cleanup before asking a new launcher to take the lock.
+                deadline = time.monotonic() + 10
+                with (world / 'world.lock').open('a') as lock:
+                    while True:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() > deadline:
+                                self.fail('Crashed runtime did not release world.lock')
+                            time.sleep(.02)
 
             name = 'restart_contract_' + uuid.uuid4().hex[:8]
             page = '/0x11/app/nenex/w/' + name
@@ -149,6 +163,18 @@ class NativeWorldTest(unittest.TestCase):
                 saved = {p: client.read(p, care='x') for p in
                          [page, definition, controller + '/cells/work', request, hole]}
                 evidence = client.read('/x' + request + '/evidence', care='z')
+                # Page requests create and retire native HTTP records. Their
+                # ancestor care histories must share old branches, including
+                # when EDEN_TEST_WORLD contains large existing care histories.
+                arena = world / 'snap/arena.dat'
+                growth = []
+                for _ in range(10):
+                    before = arena.stat().st_size
+                    self.assertEqual(recipe, client.source(page))
+                    growth.append(arena.stat().st_size - before)
+                print(f'Native page-request growth: {growth}')
+                self.assertLess(max(growth), 2 * 1024 * 1024,
+                                f'Care histories were recopied: {growth}')
                 marker = uuid.uuid4().hex
                 client.tool('write', records=[{'path': page + '/notes', 'slots': {'text': marker}}])
                 crash()

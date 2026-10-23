@@ -23,6 +23,24 @@ through native `Save` before a write is acknowledged. Restarts reconnect I/O
 services before rescanning evidence; they do not reinstall application seeds or
 replay completed work. `--ephemeral` and `--check` use disposable worlds.
 
+The Eden shell supplies the native runtime with incremental graph sharing.
+After a commit the supervisor adopts the retained native namespace, so later
+updates share unchanged assertion and care-index branches. The x/y/z histories
+and their case mappings keep their existing representation. There is one native
+arena, with no application export or separate history database.
+
+The runtime reads native layout 1 and writes layout 2, which permits immutable
+raw nodes to refer to earlier arena extents. The first successful checkpoint
+retires both layout-1 superblocks, so an older runtime rejects the upgraded
+image instead of selecting a stale root. Use this checkout's Eden shell for an
+upgraded world. Existing records and historical roots remain in the arena.
+
+For worlds created before native state adoption, stop their launcher and run
+`x/eden --upgrade` with the same `--world` selection. This recompiles only the
+private persistence adapter against that world's captured imports, checks the
+complete namespace content hash before committing its new continuation, and
+then starts the world normally. Preparation and diagnostics are in `upgrade.log`.
+
 The default mount sources are this checkout's `extras/` directory.
 `--extras-root` selects another source directory, including its Nix configuration.
 Dependencies are loaded once, before their consumers. Only selected
