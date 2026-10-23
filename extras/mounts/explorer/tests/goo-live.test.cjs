@@ -350,9 +350,9 @@ test('a record path in an action links to its folder and a reference links to it
   mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
   await s.handler(person(5, false));
   const html = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
-  assert.match(html, /<a class="p go" href="\?views=\/0x11\/user\/org\/deals" data-go="0x11\/user\/org\/deals\/d5" data-folder="0x11\/user\/org\/deals">0x11\/user\/org\/deals\/d5<\/a>/);
+  assert.match(html, /<a class="p go" href="\?at=\/0x11\/user\/org\/deals\/d5" data-go="0x11\/user\/org\/deals\/d5" data-folder="0x11\/user\/org\/deals">0x11\/user\/org\/deals\/d5<\/a>/);
   const grid = slotLayout({manager: '-> 0x11/user/org/members/bob', total: '-> /x/0x11/user/org/views/payroll @ 4'});
-  assert.ok(grid.includes('<span class="sv-v ref" data-path="0x11/user/org/members/bob"><a class="r go" href="?views=/0x11/user/org/members/bob" data-go="0x11/user/org/members/bob" data-folder="0x11/user/org/members/bob">-> 0x11/user/org/members/bob</a></span>'), grid);
+  assert.ok(grid.includes('<span class="sv-v ref" data-path="0x11/user/org/members/bob"><a class="r go" href="?at=/0x11/user/org/members/bob" data-go="0x11/user/org/members/bob" data-folder="0x11/user/org/members/bob">-> 0x11/user/org/members/bob</a></span>'), grid);
   assert.match(grid, /data-go="0x11\/user\/org\/views\/payroll" data-folder="0x11\/user\/org\/views\/payroll"/, 'a cell reference drops its /x and keeps its pin in the text');
   assert.equal(adapt.folderOf('0x11/user/org/deals/d5'), '0x11/user/org/deals');
   assert.equal(adapt.folderOf('0x11'), '0x11', 'a node has no folder above it');
@@ -412,7 +412,7 @@ test('referencedBy reads the page folder and /agent with the referencing knob; t
   assert.deepEqual(m.calls.map(c => [c.args.path, c.args.referencing]), [[N, N + '/members'], ['/0x11/agent', N + '/members']]);
   assert.deepEqual(rb.matches.map(x => [x.path, x.cell, x.hole]), [['0x11/user/org/views/payroll', true, false], ['0x11/user/org/views/budget', true, true], ['0x11/user/org/notes/n1', false, false]]);
   const html = live.referencedHTML(rb);
-  assert.match(html, /<div class="sv-refd"><div class="k">referenced by<\/div><div class="sv-refby cell "><a class="ref go" href="\?views=\/0x11\/user\/org\/views" data-go="0x11\/user\/org\/views\/payroll"/);
+  assert.match(html, /<div class="sv-refd"><div class="k">referenced by<\/div><div class="sv-refby cell "><a class="ref go" href="\?at=\/0x11\/user\/org\/views\/payroll" data-go="0x11\/user\/org\/views\/payroll"/);
   assert.match(html, /<div class="sv-refby cell hole">.*<span class="h">waiting<\/span>/);
   assert.match(html, /<div class="sv-refby crew">.*<span class="s">crew, z<\/span>/);
   assert.equal(live.referencedHTML({matches: [], watchers: []}), '');
@@ -481,4 +481,14 @@ test('newChat writes the next agent folder and names it; chats lists the folders
   assert.equal(await s.newChat(), 'a3');
   const w = calls.find(c => c.name === 'mcp/write').arguments;
   assert.equal(w.who, 'person'); assert.deepEqual(w.records, [{ path: '/0x11/agent/a3', slots: { name: 'a3' } }]);
+});
+test('backlinks walks the person\'s things and the agents\' folders, pages through, and leaves out the record and its insides', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); const a = b.params.arguments; calls.push(a);
+    const page = a.path.endsWith('/user') ? (a.next ? { matches: [{ path: '/0x11/user/views/v2', slot: '/sys/tack' }], next: null } : { matches: [{ path: '/0x11/user/orgs/x/repos/r1', slot: '/org' }, { path: '/0x11/user/orgs/x/self', slot: '/up' }], next: 'c1' }) : { matches: [{ path: '/0x11/agent/a/context', slot: '/org' }], next: null };
+    return { json: async () => ({ result: { structuredContent: page } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/user/orgs/x', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  const r = await s.backlinks('0x11/user/orgs/x');
+  assert.deepEqual(r.matches.map(m => m.path), ['0x11/user/orgs/x/repos/r1', '0x11/user/views/v2', '0x11/agent/a/context'].filter(p => !p.startsWith('0x11/user/orgs/x/')).concat([]).length ? ['0x11/user/views/v2', '0x11/agent/a/context'] : []);
+  assert.equal(calls.filter(c => c.path === '/0x11/user').length, 2, 'the second page was read');
 });

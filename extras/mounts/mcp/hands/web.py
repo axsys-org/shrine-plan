@@ -25,6 +25,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 
 _base = importlib.util.spec_from_file_location('hand_base', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand.py'))
@@ -167,6 +168,7 @@ class WebHand(Hand):
         self.w.tool('write', records=[{'path': ask + '/taken', 'slots': {'by': 'web', 'when': int(time.time())}},
                                       {'path': trail, 'slots': {'ask': reference(ask), 'started': int(time.time())}}], who=self.name)
         asked, scope, shape = props.get('asked', ''), props.get('scope', ''), props.get('shape', '')
+        many = str(props.get('many') or '').lower() == 'true'          # a collection: keep reading pages for more items
         queries, seen, rows, nq, nv = [asked + (' ' + scope if scope else '')], set(), [], 0, 0
         pages_read = 0
         while queries and pages_read < MAX_PAGES:
@@ -222,24 +224,42 @@ class WebHand(Hand):
                 for extra in (got.get('queries') or [])[:2]:
                     if extra not in queries and len(queries) < 4:
                         queries.append(extra)
-                if rows:
+                if rows and not many:
                     break
-            if rows:
+            if rows and not many:
                 break
         if rows:
-            self.w.tool('write', records=[{'path': f'{ask}/found/f{i}', 'slots': row} for i, row in enumerate(rows[:12], 1)], who=self.name)
+            cap = 80 if many else 12
+            recs = [{'path': f'{ask}/found/f{i}', 'slots': row} for i, row in enumerate(rows[:cap], 1)]
+            for start in range(0, len(recs), 40):
+                self.w.tool('write', records=recs[start:start + 40], who=self.name)
         self.log(f'web {aid}: {nq} queries, {pages_read} pages, {len(rows)} rows')
         self.done.add(ask)
         return len(rows)
+
+    def dig_all(self):
+        """Every open ask, three at a time; a slow one does not hold up the others."""
+        open_asks = self.asks()
+        if not open_asks:
+            return 0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            return sum(pool.map(lambda ap: self._safe_dig(*ap), open_asks))
+
+    def _safe_dig(self, ask, props):
+        try:
+            return self.dig(ask, props)
+        except Exception as e:
+            self.log(f'web {ask}: {str(e)[:160]}')
+            return 0
 
     def line(self, line):
         touched = line.get('touched') or []
         if not any('/asks/' in t for t in touched):
             return 0
-        return sum(self.dig(a, p) for a, p in self.asks())
+        return self.dig_all()
 
     def tick(self, now):
-        return sum(self.dig(a, p) for a, p in self.asks())
+        return self.dig_all()
 
 
 if __name__ == '__main__':

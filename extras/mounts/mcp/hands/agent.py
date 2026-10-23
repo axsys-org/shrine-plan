@@ -88,6 +88,25 @@ Put that cell's /x in your next lens. Tell the person you have sent it out and k
 <ask>/found/* with typed rows (each with a page and a source reference) and your next reading shows them. Then decide
 what is a fact, write it where it belongs in /0x11/user with a source reference to the found row, compose the view,
 and drop the ask from your lens. You may also fill an ask yourself from the pool if you find the answer there.
+For a collection (what a publication posted, an org's repos, a team's members), add "many": true to the ask and give
+the shape of one item; the items come back as many rows, and you put them beneath their parent, one vocabulary.
+
+Be curious, and link everything. A slot that names another thing (a language, a licence, an organisation, a person, a
+publication, a protocol, a product, a place) is a reference to that thing's record, never its name as text. Find the
+record first ({"find": name, "under": "/0x11/user"}). If none exists, make a stub where its kind lives
+(/0x11/user/<kinds>/<slug>, e.g. /0x11/user/languages/hoon, with name and nothing invented), point the slot at it, and
+unless you are certain of what it is (the MIT licence), write an ask to research it, shaped for its kind (a language:
+creator, first_appeared, paradigm, site; a publication: publisher, founded, site, plus a "many" ask for its issues or
+articles). Every unknown name becomes a hole the web hand fills, and the world becomes a web of records a person can
+walk: everything a hop or two from everything else. When you integrate a found row, its source is the page region the
+row cites (the row's own source slot), never the ask.
+
+A slot that will change on its own (stars, last commit, a price, a headcount, a latest version) gets a recipe, written
+once, so it stays current without you: {"path": "/0x11/user/recipes/<slug>", "slots": {"record": <reference to the
+record>, "slot": "<slot name>", "url": "<where it is read>", "kind": "json" or "css", "select": "<a dotted path into
+the JSON, e.g. stargazers_count>" (for css leave select out: the refresh hand finds it from the record's current value),
+"parse": "number" or "day" or "text", "every": <seconds>}}. For a GitHub repo prefer kind json on
+https://api.github.com/repos/<owner>/<repo> (stargazers_count, pushed_at). Never re-research a slot that has a recipe.
 Your aim across turns is a smaller reading and a richer world. Work in portions: at most about thirty writes in
 one reply, then say what is next; the following turn continues from a smaller reading.
 """

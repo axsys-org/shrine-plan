@@ -126,7 +126,7 @@ function mountViewer(el, source, opts = {}) {
   // moves to that folder; the link itself works without script
   async function go(path, folder) {
     if (source.cursor) await source.cursor(path).catch(() => {});
-    if (opts.flip) opts.flip(folder); else root.location.search = '?views=/' + folder;
+    if (opts.flip) opts.flip(folder); else root.location.search = '?at=/' + local(path) + chatQ();
   }
   el.addEventListener('click', e => {
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
@@ -199,7 +199,10 @@ const last = p => p ? p.split('/').pop() : 'namespace';
 // a record's folder is the one above it; a reference names the thing a cell reads, usually a folder, so it is its own
 const folderOf = p => { const i = String(p).lastIndexOf('/'); return i > 0 ? p.slice(0, i) : p; };
 // a path the person can click: the page moves to `folder`, and the click writes the cursor at `path`
-const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?views=/${esc(folder)}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
+// a path the person can click: the page opens that record (its slots, what is beneath it, what points at it), keeping the
+// chat the person came from; the click also writes the person's cursor so an agent sees where they went
+const chatQ = () => { try { const c = new URLSearchParams(root.location.search).get('chat'); return c ? '&chat=' + encodeURIComponent(c) : ''; } catch (e) { return ''; } };
+const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?at=/${esc(local(path))}${chatQ()}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
 const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
 const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
 
@@ -557,6 +560,18 @@ function mcpSource(opts = {}) {
     }
     return out;
   }
+  async function backlinks(path) {
+    const node = local(path).split('/')[0], self = local(path), out = { matches: [] }, seen = new Set();
+    for (const r of ['/' + node + '/user', '/' + node + '/agent']) {
+      let next = null;
+      for (let page = 0; page < 12; page++) {
+        let a; try { a = await rpc('read', { path: r, referencing: world(path), limit: 400, ...(next ? { next } : {}) }); } catch (e) { break; }
+        for (const m of a.matches || []) { const p = local(m.path); if (p !== self && !p.startsWith(self + '/') && !seen.has(p)) { seen.add(p); out.matches.push({ path: p, slot: m.slot, cell: !!m.cell, hole: !!m.hole }); } }
+        next = a.next; if (!next) break;
+      }
+    }
+    return out;
+  }
   // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
   async function qa() {
     const node = local(views).split('/')[0];
@@ -602,18 +617,46 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc, cursor, say, chats, newChat, referencedBy };
+  return { read, answer, graph, follow, qa, rpc, cursor, say, chats, newChat, referencedBy, backlinks };
 }
 
-// the page: /live?views=<folder>&who=<writer>
+// the record page: one record, its slots (each reference a link), what is beneath it, and what points at it; every
+// thing is a hop from its neighbours, so anything is a few clicks away. Live: a write under it redraws it.
+const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
+function mountRecord(el, source, opts = {}) {
+  const at = local(opts.at), node = at.split('/')[0];
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>`;
+  const main = el.querySelector('.sv-recview');
+  let timer = null;
+  async function draw() {
+    const r = await source.read(at, 'y').catch(() => null);
+    if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return; }
+    const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
+    const kids = (r.kids || []).map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
+    let back = '';
+    if (source.backlinks) { const rb = await source.backlinks(at).catch(() => ({ matches: [] })); back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join(''); }
+    main.innerHTML = card + (kids ? `<div class="sv-sec"><div class="k">beneath</div>${kids}</div>` : '') + `<div class="sv-sec"><div class="k">pointing here</div>${back || '<div class="sv-empty">nothing points here yet</div>'}</div>`;
+  }
+  draw();
+  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });
+  el.addEventListener('click', e => {
+    const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
+    e.preventDefault(); const href = a.getAttribute('href');
+    (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { root.location.search = href.slice(1); });
+  });
+  return { draw };
+}
+
+// the page: /live?views=<folder>&who=<writer>, or ?at=<record> for one record and its neighbours
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
-  const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '';
+  const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
+  if (at) return mountRecord(el, mcpSource({ views: at, who }), { at, chat });
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views, chat });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mountRecord, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
