@@ -503,3 +503,13 @@ test('queueHTML puts working asks first, then waiting by priority (chat before c
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'working, then chat before crawl, then finished');
   assert.match(html, /reading example\.com/); assert.match(html, /4 rows · 6 written/);
 });
+test('holesHTML orders holes by when they are due and says it in words', () => {
+  const now = 1000000;
+  const html = live.holesHTML([
+    { path: 'i/a', record: '0x11/user/orgs/warhound', slot: 'first_delivery', kind: 'until', next: 0, due: 20270101, tries: 0, asked: 'When?', reason: '' },
+    { path: 'i/b', record: '0x11/user/orgs/groundwire_foundation', slot: 'irs_501c3_status', kind: 'watch', next: now + 7 * 86400, tries: 1, asked: 'Granted?', reason: 'nothing found (1 tries)' },
+    { path: 'i/c', record: '0x11/user/people/erik_torenberg', slot: 'profile', kind: 'unknown', next: now - 5, tries: 2, asked: 'Who?', reason: '' } ], now);
+  const order = ['erik torenberg', 'groundwire foundation', 'warhound'].map(t => html.indexOf(t));
+  assert.deepEqual([...order].sort((a, b) => a - b), order);
+  assert.match(html, /due now/); assert.match(html, /until 2027-01-01/); assert.match(html, /in 7 days/); assert.match(html, /holes · 3/);
+});

@@ -87,11 +87,15 @@ class CrawlHand(Hand):
         self.folder = '/' + world.node + '/agent/crawl'
         self.user = '/' + world.node + '/user'
         self.backoff = {}               # record -> when a failed search may be tried again
+        self.scanned = False            # the holes beneath the person's things, found once, then followed on the stream
 
     def quiet(self, item):
         """A fill under one of my asks wakes me, though the web hand wrote it."""
-        if any(t.startswith(self.folder + '/asks/') and ('/found/' in t or t.endswith('/status')) for t in (item.get('touched') or [])):
+        touched = item.get('touched') or []
+        if any(t.startswith(self.folder + '/asks/') and ('/found/' in t or t.endswith('/status')) for t in touched):
             return False
+        if any(t.startswith(self.user) and re.search(r'/holes/[^/]+$', t) for t in touched):
+            return False                                      # a hole written by any hand is mine to schedule
         return super().quiet(item)
 
     # ---- the world's things, by kind
@@ -121,6 +125,110 @@ class CrawlHand(Hand):
         if int(float(props.get('hop') or 0)) > 0:
             return True
         return any(k in props for k in ('role', 'title', 'org', 'known_for', 'leader_of', 'founded', 'position'))
+
+    # ---- holes: a question that stays attached to its thing, looked at again on its schedule
+    def today(self):
+        d = (self.w.read('/' + self.w.node + '/clock', 'x').get('properties') or {}).get('/day') or time.strftime('%Y-%m-%d')
+        return int(re.sub(r'\D', '', str(d))[:8] or 0)
+
+    def hole_id(self, hole):
+        return segment_of(hole.replace(self.user + '/', '').replace('/holes/', '/').replace('/', '_'))
+
+    def scan_holes(self):
+        n = 0
+        for kp in self.kinds():
+            stack = list(self.w.read(kp, 'z', limit=3000).get('children') or [])
+            while stack:
+                c = stack.pop()
+                if re.search(r'/holes/[^/]+$', c['path']):
+                    n += self.register(c['path']) if c.get('exists') else 0
+                else:
+                    stack.extend(c.get('children') or [])
+        self.scanned = True
+        if n:
+            self.log(f'crawl: {n} holes registered')
+        return n
+
+    def register(self, hole):
+        """The index entry the queue page reads: /agent/crawl/holes/<id> mirrors the hole's schedule."""
+        rec = self.w.read(hole, 'x')
+        idx = f'{self.folder}/holes/{self.hole_id(hole)}'
+        if not rec.get('exists'):
+            if self.w.read(idx, 'x').get('exists'):
+                self.w.tool('write', records=[{'path': idx, 'action': 'cull'}], who=self.name)
+            return 0
+        p = {k.lstrip('/'): v for k, v in (rec.get('properties') or {}).items() if not k.startswith('/sys')}
+        record = hole.rsplit('/holes/', 1)[0]
+        self.w.tool('write', records=[{'path': self.folder, 'slots': {'name': 'crawl'}}, {'path': self.folder + '/holes', 'slots': {}},
+            {'path': idx, 'slots': {'hole': ref(hole), 'record': ref(record), 'slot': str(p.get('slot') or hole.rsplit('/', 1)[1]),
+                                    'kind': str(p.get('kind') or 'unknown'), 'next': int(float(p.get('next') or 0)), 'due': int(float(p.get('due') or 0)),
+                                    'tries': int(float(p.get('tries') or 0)), 'asked': str(p.get('asked') or '')[:300], 'reason': str(p.get('reason') or '')[:160]}}], who=self.name)
+        return 1
+
+    def hole_index(self):
+        page = self.w.read(self.folder + '/holes', 'y', limit=500)
+        return [(c['path'], {k.lstrip('/'): v for k, v in (c.get('properties') or {}).items() if not k.startswith('/sys')})
+                for c in page.get('children', []) if c.get('exists')]
+
+    def schedule_holes(self, now):
+        """Every hole whose time has come becomes an ask in the web queue: watch and until ahead of unknown."""
+        page = self.w.read(self.folder + '/asks', 'y', limit=500)
+        open_for = set()
+        done = self.open_asks()
+        for c in page.get('children', []):
+            h = (c.get('properties') or {}).get('/hole')
+            if c.get('exists') and h and not done.get(c['path'].rsplit('/', 1)[1]):
+                open_for.add(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(h)))
+        day, n = None, 0
+        for idx, e in self.hole_index():
+            hole = re.sub(r'^/h/[xyz]/\d+/\d+', '', str(e.get('hole') or ''))
+            record = re.sub(r'^/h/[xyz]/\d+/\d+', '', str(e.get('record') or ''))
+            if not hole or hole in open_for or float(e.get('next') or 0) > now:
+                continue
+            if e.get('kind') == 'until' and int(float(e.get('due') or 0)) > 0:
+                day = day or self.today()
+                if int(float(e['due'])) > day:
+                    continue                                  # its date of expectation has not come
+            rec = self.w.read(hole, 'x')
+            if not rec.get('exists'):
+                self.w.tool('write', records=[{'path': idx, 'action': 'cull'}], who=self.name); continue
+            p = {k.lstrip('/'): v for k, v in (rec.get('properties') or {}).items() if not k.startswith('/sys')}
+            slot = str(p.get('slot') or hole.rsplit('/', 1)[1])
+            name = (self.w.read(record, 'x').get('properties') or {}).get('/name') or record.rsplit('/', 1)[1].replace('_', ' ')
+            slots = {'asked': str(p.get('asked') or f'What is the {slot.replace("_", " ")} of {name}?'), 'shape': str(p.get('shape') or f'{slot}: text, as_of: YYYYMMDD'),
+                     'about': ref(record), 'hole': ref(hole), 'slot': slot, 'priority': 1 if p.get('kind') in ('watch', 'until') else 2}
+            if p.get('query'):
+                slots['query'] = str(p['query'])
+            aid = f'hole_{idx.rsplit("/", 1)[1]}_{int(now)}'
+            self.w.tool('write', records=[{'path': f'{self.folder}/asks/{aid}', 'slots': slots},
+                                          {'path': hole, 'action': 'poke', 'slots': {'last_tried': int(now)}}], who=self.name)
+            n += 1
+        if n:
+            self.log(f'crawl: {n} holes sent to the web queue')
+        return n
+
+    def settle_hole(self, ask, props, landed, found, failed=False):
+        """After a hole's ask: resolved (gone), refreshed (a watch, looked at again after every), or looked at again later."""
+        hole = re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['hole']))
+        idx = f'{self.folder}/holes/{self.hole_id(hole)}'
+        hp = {k.lstrip('/'): v for k, v in (self.w.read(hole, 'x').get('properties') or {}).items() if not k.startswith('/sys')}
+        kind, every, tries, now = str(hp.get('kind') or 'unknown'), float(hp.get('every') or 86400), int(float(hp.get('tries') or 0)), time.time()
+        recs = [{'path': ask, 'action': 'cull'}]
+        if landed and kind != 'watch':
+            recs += [{'path': hole, 'action': 'cull'}, {'path': idx, 'action': 'cull'}]; outcome = 'resolved'
+        else:
+            if failed:
+                nxt, outcome = now + 1800, 'search failed; soon again'
+            elif landed:
+                tries, nxt, outcome = 0, now + every, 'refreshed'
+            else:
+                tries += 1
+                nxt = now + (every if kind in ('watch', 'until') else min(86400 * 2 ** min(tries - 1, 5), 30 * 86400))
+                outcome = f'nothing found ({tries} tries)' if not found else f'rows came back but {props.get("slot")} did not land ({tries} tries)'
+            change = {'next': int(nxt), 'tries': tries, 'last_tried': int(now), 'reason': outcome}
+            recs += [{'path': hole, 'action': 'poke', 'slots': change}, {'path': idx, 'action': 'poke', 'slots': {k: v for k, v in change.items() if k != 'last_tried'}}]
+        self.w.tool('write', records=recs, who=self.name)
+        self.log(f'crawl hole {hole.replace(self.user + "/", "")}: {outcome}')
 
     # ---- seeding: stubs become asks
     def open_asks(self):
@@ -156,7 +264,7 @@ class CrawlHand(Hand):
         recs = []
         for hop, _, kind, path, props, aid in candidates[:room]:
             name = props.get('name') or path.rsplit('/', 1)[1].replace('_', ' ')
-            singular = kind[:-1] if kind.endswith('s') else kind
+            singular = {'people': 'person'}.get(kind) or (kind[:-1] if kind.endswith('s') else kind)
             recs.append({'path': f'{self.folder}/asks/{aid}', 'slots': {
                 'asked': f'What is known about {name} (a {singular})?', 'scope': '', 'shape': SHAPES.get(kind, DEFAULT_SHAPE),
                 'entity': name, 'kind': singular, 'about': ref(path), 'hop': hop, 'priority': hop + 1}})
@@ -172,7 +280,12 @@ class CrawlHand(Hand):
         hop = int(float(props.get('hop') or 0))
         rows = [c for c in (self.w.read(ask + '/found', 'y', limit=100).get('children') or []) if c.get('exists')]
         status = {k.lstrip('/'): v for k, v in (self.w.read(ask + '/status', 'x').get('properties') or {}).items()}
+        is_hole = bool(props.get('hole'))
         if not rows:
+            if is_hole:
+                if status.get('state') in ('failed', 'empty'):
+                    self.settle_hole(ask, props, landed=False, found=0, failed=status.get('state') == 'failed')
+                return 0
             if status.get('state') == 'failed':
                 # the search never answered: the ask goes, the record waits half an hour, then it is asked again
                 self.w.tool('write', records=[{'path': ask, 'action': 'cull'}], who=self.name)
@@ -183,6 +296,7 @@ class CrawlHand(Hand):
                                               {'path': about, 'action': 'poke', 'slots': {'researched': int(time.time())}}], who=self.name)
             return 0
         record = self.w.read(about, 'x')
+        before = {k.lstrip('/'): v for k, v in (record.get('properties') or {}).items()}
         idx = self.name_index()
         names = set()
         for r in rows:
@@ -198,6 +312,8 @@ class CrawlHand(Hand):
             if hits:
                 candidates[n] = [p for p, _ in hits[:4]]
         lines = [f'RESEARCHED RECORD: {about}  (hop {hop})', '\n'.join(render(record)), '', 'ROWS:']
+        if is_hole:
+            lines.insert(1, f'THE HOLE: the slot {props.get("slot")} on this record. When the rows answer it, poke that slot (and as_of: the day the rows state, YYYYMMDD) with its source; otherwise write nothing for it.')
         for r in rows:
             lines.append('  ' + r['path'].rsplit('/', 1)[1] + '  ' + ', '.join(f'{k.lstrip("/")}: {str(v)[:200]}' for k, v in sorted((r.get('properties') or {}).items())))
         lines += ['', 'CANDIDATES (a name in the rows -> records that might be it):'] + ([f'  {n} -> {", ".join(ps)}' for n, ps in sorted(candidates.items())] or ['  (none)'])
@@ -229,6 +345,12 @@ class CrawlHand(Hand):
                 landed += 0 if r.get('refused') else 1
             except Exception as e:
                 self.log(f'crawl {ask}: refused {w.get("path")}: {str(e)[:80]}')
+        if is_hole:
+            after = {k.lstrip('/'): v for k, v in (self.w.read(about, 'x').get('properties') or {}).items()}
+            slot = str(props.get('slot') or '')
+            hit = slot in after and (str(after[slot]) != str(before.get(slot)) or self.w.read(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['hole'])), 'x').get('properties', {}).get('/kind') == 'watch')
+            self.settle_hole(ask, props, landed=hit, found=len(rows))
+            return landed
         self.w.tool('write', records=[{'path': ask + '/integrated', 'slots': {'state': 'done', 'writes': landed, 'when': int(time.time())}},
                                       {'path': about, 'action': 'poke', 'slots': {'researched': int(time.time())}}], who=self.name)
         linked = sum(1 for w in writes if any(isinstance(v, dict) and v.get('type') == 'reference' and v.get('path', '').startswith(self.user) and v.get('path') != about for v in (w.get('slots') or {}).values()))
@@ -243,12 +365,22 @@ class CrawlHand(Hand):
         return n
 
     def line(self, line):
-        if any(t.startswith(self.folder + '/asks/') for t in (line.get('touched') or [])):
-            return self.integrate_ready()
-        return 0
+        touched = line.get('touched') or []
+        n = 0
+        if (line.get('who') or '') != self.name:
+            for t in touched:
+                if t.startswith(self.user) and re.search(r'/holes/[^/]+$', t):
+                    n += self.register(t)
+            if n:
+                n += self.schedule_holes(time.time())
+        if any(t.startswith(self.folder + '/asks/') for t in touched):
+            n += self.integrate_ready()
+        return n
 
     def tick(self, now):
-        return self.integrate_ready() + self.seed()
+        if not self.scanned:
+            self.scan_holes()
+        return self.integrate_ready() + self.schedule_holes(now) + self.seed()
 
 
 if __name__ == '__main__':

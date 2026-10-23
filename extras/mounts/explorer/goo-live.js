@@ -695,12 +695,31 @@ function queueHTML(rows) {
   const sec = (k, rs) => `<div class="sv-sec"><div class="k">${k} · ${rs.length}</div>${rs.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
   return sec('working', working) + sec('waiting', waiting) + sec('finished', done);
 }
+async function holeRows(source, node) {
+  const idx = await source.read('/' + node + '/agent/crawl/holes', 'y').catch(() => null);
+  return (idx && idx.kids || []).map(k => ({ path: k.path, record: String(k.slots.record || '').replace(/^\/h\/[xyz]\/\d+\/\d+\//, ''), slot: k.slots.slot || k.name,
+    kind: k.slots.kind || 'unknown', next: Number(k.slots.next || 0), due: Number(k.slots.due || 0), tries: Number(k.slots.tries || 0), asked: k.slots.asked || '', reason: k.slots.reason || '' }));
+}
+function whenDue(h, now) {
+  if (h.kind === 'until' && h.due) return 'until ' + String(h.due).replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
+  const s = h.next - now;
+  if (s <= 0) return 'due now';
+  if (s < 3600) return 'in ' + Math.round(s / 60) + ' min';
+  if (s < 86400 * 2) return 'in ' + Math.round(s / 3600) + ' h';
+  return 'in ' + Math.round(s / 86400) + ' days';
+}
+function holesHTML(holes, now = Date.now() / 1000) {
+  const at = h => (h.kind === 'until' && h.due) ? Date.UTC(Math.floor(h.due / 10000), Math.floor(h.due / 100) % 100 - 1, h.due % 100) / 1000 : (h.next || 0);
+  const rows = [...holes].sort((a, b) => at(a) - at(b));
+  const row = h => `<div class="sv-qrow hole ${esc(h.kind)}"><span class="pr">${esc(h.kind)}</span><span class="ow">${esc(h.tries ? h.tries + '×' : '')}</span>${goHTML(h.record, h.record, (h.record.split('/').slice(-1)[0] || '').replace(/_/g, ' ') + ' · ' + h.slot, 'q')}<span class="st">${esc(whenDue(h, now))}</span><span class="n">${esc(h.asked)}${h.reason ? ' · ' + esc(h.reason) : ''}</span></div>`;
+  return `<div class="sv-sec"><div class="k">holes · ${rows.length}</div>${rows.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
+}
 function mountQueue(el, source, opts = {}) {
   const node = opts.node || '0x11';
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><b>web queue</b></div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-queue"></div>`;
   const main = el.querySelector('.sv-queue');
   let busy = false;
-  async function draw() { if (busy) return; busy = true; try { main.innerHTML = queueHTML(await queueRows(source, node)); } catch (e) { /* the next tick tries again */ } busy = false; }
+  async function draw() { if (busy) return; busy = true; try { const [asks, holes] = await Promise.all([queueRows(source, node), holeRows(source, node)]); main.innerHTML = queueHTML(asks) + holesHTML(holes); } catch (e) { /* the next tick tries again */ } busy = false; }
   draw();
   (opts.setInterval || root.setInterval)(draw, 3000);
   return { draw };
@@ -716,7 +735,7 @@ function start(doc) {
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views, chat });
 }
 
-const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, holesHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;

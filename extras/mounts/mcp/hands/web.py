@@ -38,6 +38,7 @@ DEFAULT_MODEL = 'anthropic/claude-sonnet-5.5'
 ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'   # the search page answers a browser, not a bot name
 MAX_PAGES = 5            # pages read per ask
+MAX_PAGES_MANY = 30      # pages read for a collection whose site was mapped
 MAX_REGION = 6000        # chars of a region kept
 MAX_PAGE_CHARS = 14000   # chars of a page shown to the extractor
 
@@ -51,6 +52,25 @@ def get(url, timeout=25):
     req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Language': 'en'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode(r.headers.get_content_charset() or 'utf-8', 'replace'), r.headers.get_content_type()
+
+
+STOP = set('''a an the and or but of for on in at to from by with as into than then also about over under is are was were be
+been being has have had do does did done can could would should will may might must not no nor so if any all some there their they
+them it its this that these those what which who whom whose when where why how exactly please cite original reports report
+launched called named known announced according latest recent current new news details detail''' .split())
+
+
+def keywords(asked, limit=7):
+    """A search query from a question: names, numbers and amounts kept, question words dropped. Bing reads a sentence as
+    its words; "Has a company called Warhound…" found pages about has and have."""
+    names, rest, seen = [], [], set()
+    for w in re.findall(r'\$?[\w][\w.\-]*', asked):
+        key = w.lower().strip('.')
+        if not key or key in STOP or key in seen or (len(key) < 3 and not key[0].isdigit() and not w.startswith('$')):
+            continue
+        seen.add(key)
+        (names if (w[0].isupper() or w[0] == '$' or any(ch.isdigit() for ch in w)) else rest).append(w.strip('.'))
+    return ' '.join((names + rest)[:limit]) or asked[:120]      # the names and amounts lead: an engine weighs the first words most
 
 
 # ---- search: several engines, each with its own pace, each rested when it starts refusing; the first that answers wins
@@ -129,7 +149,67 @@ def _wikipedia(q, limit):
     return [('https://en.wikipedia.org/wiki/' + urllib.parse.quote(h['title'].replace(' ', '_')), h['title'], _clean(h.get('snippet', ''))) for h in hits]
 
 
-ENGINES = [Engine('bing', _bing, 2.0), Engine('brave', _brave, 3.0), Engine('duckduckgo', _ddg, 6.0)]
+FIRECRAWL = 'https://api.firecrawl.dev/v1'
+
+
+def firecrawl_key():
+    return os.environ.get('FIRECRAWL_API_KEY') or ''
+
+
+def firecrawl(path, body, timeout=60):
+    req = urllib.request.Request(FIRECRAWL + path, json.dumps(body).encode(),
+                                 {'Authorization': 'Bearer ' + firecrawl_key(), 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _firecrawl(q, limit):
+    """Firecrawl's search: an index with no bot wall, results with a description; the pages are fetched by us."""
+    if not firecrawl_key():
+        raise Refused('no key')
+    d = firecrawl('/search', {'query': q, 'limit': min(limit, 8)})
+    if not d.get('success'):
+        raise Refused(str(d.get('error'))[:80])
+    return [(r.get('url', ''), _clean(r.get('title') or ''), _clean(r.get('description') or '')[:300]) for r in d.get('data') or [] if str(r.get('url', '')).startswith('http')]
+
+
+def fetch_page(url):
+    """A page's html: our own fetch first; when a site refuses us or hands back a shell for scripts to fill, Firecrawl
+    renders it and hands back the raw html, which our extractor then reads the same way."""
+    try:
+        markup, ctype = get(url)
+        if 'html' in (ctype or '') and len(re.sub(r'<[^>]+>', ' ', markup)) > 2000:
+            return markup, ctype
+        shell = markup if 'html' in (ctype or '') else ''
+    except Exception:
+        shell = ''
+    if not firecrawl_key():
+        if shell:
+            return shell, 'text/html'
+        raise RuntimeError('fetch failed and no firecrawl key')
+    d = firecrawl('/scrape', {'url': url, 'formats': ['rawHtml'], 'onlyMainContent': False})
+    html_ = (d.get('data') or {}).get('rawHtml') or ''
+    if not html_:
+        raise RuntimeError('firecrawl scrape gave nothing: ' + str(d.get('error'))[:80])
+    return html_, 'text/html'
+
+
+def rank_links(links, q, cap=40):
+    """The content pages of a mapped site first: deeper paths, and paths that carry a word of the question."""
+    words = {w.lower() for w in re.findall(r'[A-Za-z]{4,}', q)} - STOP
+    seen, out = set(), []
+    for u in links:
+        u = str(u).split('#', 1)[0]
+        if not u.startswith('http') or u in seen or re.search(r'\.(xml|json|css|js|png|jpe?g|gif|svg|ico|woff2?)(\?|$)', u, re.I):
+            continue
+        seen.add(u)
+        path = urllib.parse.urlparse(u).path.strip('/')
+        depth = len([p for p in path.split('/') if p])
+        out.append((depth + (2 if any(w in u.lower() for w in words) else 0), u))
+    return [u for sc, u in sorted(out, key=lambda x: -x[0])[:cap] if sc > 0]
+
+
+ENGINES = [Engine('firecrawl', _firecrawl, 1.0), Engine('bing', _bing, 2.0), Engine('brave', _brave, 3.0), Engine('duckduckgo', _ddg, 6.0)]
 WIKIPEDIA = Engine('wikipedia', _wikipedia, 0.5)
 REST = 900.0
 THROTTLE = threading.Lock()
@@ -160,7 +240,24 @@ def run_engine(e, q, limit):
     return None
 
 
-def search(q, limit=8, entity=None):
+def distinctive(q):
+    """The terms a result must mention to be about the question: names (capitalised), numbers and amounts."""
+    out = []
+    for w in re.findall(r'\$?[\w][\w.\-]*', q):
+        key = w.strip('.').lower()
+        if key in STOP or len(key) < 3:
+            continue
+        if w[0].isupper() or w[0] == '$' or any(ch.isdigit() for ch in w):
+            out.append(key.lstrip('$'))
+    return out
+
+
+def mentions(hit, terms):
+    blob = ' '.join(hit).lower()
+    return not terms or any(t in blob for t in terms)
+
+
+def search(q, limit=8, entity=None, skip=()):
     """[(url, title, snippet)] and the engine that answered. An entity's own article comes first when one exists;
     then the first general engine that answers, in order. No engine answering at all raises NoEngine."""
     out, seen, used = [], set(), []
@@ -173,6 +270,8 @@ def search(q, limit=8, entity=None):
         if hits:
             add(hits); used.append('wikipedia')
     for e in ENGINES:
+        if e.name in skip or (e.name == 'firecrawl' and not firecrawl_key()):
+            continue
         hits = run_engine(e, q, limit)
         if hits is None:
             continue
@@ -394,28 +493,59 @@ class WebHand(Hand):
                                       {'path': trail, 'slots': {'ask': reference(ask), 'started': int(time.time())}}], who=self.name)
         asked, scope, shape = props.get('asked', ''), props.get('scope', ''), props.get('shape', '')
         many = str(props.get('many') or '').lower() == 'true'          # a collection: keep reading pages for more items
-        first = (str(props['entity']) + ' ' + str(props.get('kind') or '')).strip() if props.get('entity') else asked + (' ' + scope if scope else '')
+        if props.get('query'):
+            first = str(props['query'])[:160]                                          # the asker chose the words
+        elif props.get('entity'):
+            first = (str(props['entity']) + ' ' + str(props.get('kind') or '')).strip()
+        else:
+            first = keywords(asked + ' ' + scope)
         queries, seen, rows, nq, nv = [first], set(), [], 0, 0     # an entity is searched by its name, not by the question
         pages_read, failed = 0, ''
-        while queries and pages_read < MAX_PAGES:
-            q = queries.pop(0)
-            self.status(ask, 'searching', step=q[:160], pages=pages_read, queries=nq + 1, rows=len(rows))
+        cap, site, queued = (MAX_PAGES_MANY if many else MAX_PAGES), str(props.get('site') or ''), []
+        if many and not site and props.get('about'):
+            ap = self.w.read(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['about'])), 'x').get('properties') or {}
+            site = str(ap.get('/website') or ap.get('/url') or ap.get('/site') or '')
+        if many and site and firecrawl_key():
+            # a collection with a known site: every url of the site in one call, its content pages read in turn
+            self.status(ask, 'mapping', step=site[:160], pages=0, queries=0, rows=0)
             try:
-                hits, engine = search(q, entity=props.get('entity') if nq == 0 else None)
-            except NoEngine as e:
-                failed = str(e); self.log(f'web {owner}/{aid}: {failed}'); break
+                links = firecrawl('/map', {'url': site if '://' in site else 'https://' + site, 'limit': 500}).get('links') or []
             except Exception as e:
-                self.log(f'web {owner}/{aid}: search failed: {str(e)[:120]}'); hits, engine = [], 'none'
+                self.log(f'web {owner}/{aid}: map of {site} failed: {str(e)[:80]}'); links = []
+            queued = [(u, '', '') for u in rank_links(links, first + ' ' + shape)]
+            if queued:
+                self.log(f'web {owner}/{aid}: mapped {site}: {len(links)} urls, {len(queued)} to read')
+        while (queries or queued) and pages_read < cap:
+            if queued:
+                q, hits, engine, terms, attempts, queued = 'map ' + site, queued, 'firecrawl-map', [], 0, []
+            else:
+                q = queries.pop(0)
+                self.status(ask, 'searching', step=q[:160], pages=pages_read, queries=nq + 1, rows=len(rows))
+                terms, tried, hits, engine, attempts = distinctive(q), set(), [], 'none', 2
+            for attempt in range(attempts):          # an engine whose hits mention none of the names is answering a different question
+                try:
+                    got, engine = search(q, entity=props.get('entity') if nq == 0 else None, skip=tried)
+                except NoEngine as e:
+                    failed = str(e) if not tried else ''; break
+                except Exception as e:
+                    self.log(f'web {owner}/{aid}: search failed: {str(e)[:120]}'); break
+                hits = [h for h in got if mentions(h, terms)]
+                if hits or not got:
+                    break
+                self.log(f'web {owner}/{aid}: {engine} had {len(got)} hits, none mentioning {", ".join(terms[:4])}; trying another engine')
+                tried.update(engine.split('+'))
+            if failed:
+                self.log(f'web {owner}/{aid}: {failed}'); break
             nq += 1
-            self.w.tool('write', records=[{'path': f'{trail}/queries/q{nq}', 'slots': {'q': q, 'engine': engine, 'when': int(time.time()), 'hits': len(hits)}}], who=self.name)
+            self.w.tool('write', records=[{'path': f'{trail}/queries/q{nq}', 'slots': {'q': q, 'engine': engine, 'when': int(time.time()), 'hits': len(hits), 'terms': ' '.join(terms[:6])}}], who=self.name)
             for url, title, snippet in hits:
-                if pages_read >= MAX_PAGES or url in seen:
+                if pages_read >= cap or url in seen:
                     continue
                 seen.add(url)
                 try:
-                    markup, ctype = get(url)
+                    markup, ctype = fetch_page(url)
                 except Exception as e:
-                    continue
+                    self.log(f'web {owner}/{aid}: could not read {url[:60]}: {str(e)[:60]}'); continue
                 if 'html' not in (ctype or ''):
                     continue
                 pages_read += 1
@@ -463,7 +593,26 @@ class WebHand(Hand):
             recs = [{'path': f'{ask}/found/f{i}', 'slots': row} for i, row in enumerate(rows[:cap], 1)]
             for start in range(0, len(recs), 40):
                 self.w.tool('write', records=recs[start:start + 40], who=self.name)
-        self.status(ask, 'done' if rows else ('failed' if failed else 'empty'), pages=pages_read, queries=nq, rows=len(rows), reason=failed or None)
+        why = failed or (None if rows or pages_read else 'no result mentions ' + ', '.join(distinctive(first)[:4]))
+        if not rows and props.get('about') and owner != 'crawl':
+            # the question stays attached to its thing: a hole the crawl hand looks at again on its schedule
+            about = re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['about']))
+            slot = segment_of(str(props.get('slot') or aid))
+            kind = props.get('kind') if props.get('kind') in ('watch', 'until', 'unknown') else 'unknown'
+            every = int(float(props.get('every') or 86400))
+            hole = {'slot': slot, 'asked': asked, 'shape': shape, 'kind': kind, 'every': every, 'made': int(time.time()), 'ask': reference(ask),
+                    'next': int(time.time() + (1800 if failed else every if kind != 'unknown' else 2 * 86400)), 'tries': 0 if failed else 1,
+                    'reason': failed or why or 'nothing found'}
+            if props.get('query'):
+                hole['query'] = str(props['query'])
+            if props.get('due'):
+                hole['due'] = int(float(props['due']))
+            try:
+                self.w.tool('write', records=[{'path': about + '/holes', 'slots': {}}, {'path': f'{about}/holes/{slot}', 'slots': hole}], who=self.name)
+                self.log(f'web {owner}/{aid}: now a hole at {about.split("/user/")[-1]}/holes/{slot} ({kind})')
+            except Exception as e:
+                self.log(f'web {owner}/{aid}: could not write the hole: {str(e)[:80]}')
+        self.status(ask, 'done' if rows else ('failed' if failed else 'empty'), pages=pages_read, queries=nq, rows=len(rows), reason=why)
         self.log(f'web {owner}/{aid}: {nq} queries, {pages_read} pages, {len(rows)} rows')
         self.done.add(ask)
         return len(rows)

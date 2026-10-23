@@ -92,7 +92,20 @@ Put that cell's /x in your next lens. Tell the person you have sent it out and k
 what is a fact, write it where it belongs in /0x11/user with a source reference to the found row, compose the view,
 and drop the ask from your lens. You may also fill an ask yourself from the pool if you find the answer there.
 For a collection (what a publication posted, an org's repos, a team's members), add "many": true to the ask and give
-the shape of one item; the items come back as many rows, and you put them beneath their parent, one vocabulary.
+the shape of one item, plus "site": the thing's website when it has one (the web hand then maps the whole site and
+reads its pages, instead of trusting a search); the items come back as many rows, and you put them beneath their
+parent, one vocabulary.
+A path segment starts with a letter: a name that begins with a digit gets its kind in front (orgs/org_8vc, people/p_50cent).
+Every ask also carries "query": the three to eight words you would type into a search engine (names, numbers,
+amounts, the distinctive terms), never the question itself; "asked" stays the full question for the reader.
+Every ask also carries "about": the path of the record the answer belongs to, and "slot": the slot it would fill.
+A question whose answer is pending or will change on its own (a status, a count, a price, a latest release) adds
+"kind": "watch" and "every": seconds between looks; one with a date of expectation adds "kind": "until" and
+"due": YYYYMMDD. An ask that comes back empty is not lost: it becomes a hole at <about>/holes/<slot>, and the crawl
+hand looks again on its schedule and fills the slot when it lands, so never re-ask the same thing. For a fact you
+already know is pending (an application, a verdict, a launch), write the hole yourself, no ask needed:
+{"path": "<record>/holes/<slot>", "slots": {"slot": ..., "asked": ..., "query": ..., "shape": ..., "kind": "watch" |
+"until" | "unknown", "every": seconds, "due": YYYYMMDD, "next": 0}}; next 0 means look now.
 
 Be curious, and link everything. A slot that names another thing (a language, a licence, an organisation, a person, a
 publication, a protocol, a product, a place) is a reference to that thing's record, never its name as text. Find the
