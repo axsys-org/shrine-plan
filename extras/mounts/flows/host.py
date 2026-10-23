@@ -8,9 +8,10 @@ from pathlib import Path
 import runpy
 import shutil
 
+capture_workspace = None
 
 def scan(root, bag):
-    repo = Path(os.environ.get('SHRINE_FLOW_SOURCE_ROOT') or root.parents[2])
+    repo = Path(os.environ.get('SHRINE_FLOW_SOURCE_ROOT') or capture_workspace or root.parents[2])
     capture = runpy.run_path(str(root / 'client.py'))['prepare']
     bundle = capture(repo, root / 'sources.json')
     for path in root.iterdir():
@@ -21,6 +22,8 @@ def scan(root, bag):
 
 
 def prepare(root, work, check, cleanup, context):
+    global capture_workspace
+    capture_workspace = context.get('workspace')
     bag = work / 'flows' / 'bag'
     bag.mkdir(parents=True)
     scan(root, bag)

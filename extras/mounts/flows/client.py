@@ -172,13 +172,6 @@ class FlowClient(Client):
         return ''.join(form.parts)
 
 
-def save_bundle(path, bundle):
-    path = Path(path)
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
-
-
 def input_bindings(parser, items):
     bindings = {}
     for item in items:

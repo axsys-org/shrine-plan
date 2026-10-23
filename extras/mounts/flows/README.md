@@ -39,8 +39,15 @@ approval requests, and credentials are not part of the flow. Leave the provider
 empty for manual authoring, or bind another published native provider.
 
 The source file seeds a missing authoring page. Edit its saved Semidoc and publish
-to revise the procedure. Export namespace edits before stopping this development
-world: restart recovery is not implemented by this launcher.
+to revise the procedure. Eden saves the complete namespace through the runtime's
+native pinned continuation before acknowledging writes. The same world restores
+documents, cells, holes, frozen attempts, history and their compiled laws.
+`x/eden` defaults to `$XDG_DATA_HOME/shrine/worlds/0x11` (or
+`~/.local/share/shrine/worlds/0x11`); `--world PATH` selects another world.
+Its selected mounts are remembered. `--ephemeral` and `--check` use disposable
+worlds. Restart reconnects I/O services and scans sources changed while offline;
+completed work is not replayed. Interrupted model attempts retain a failed result
+and their original evidence so the existing hole can await new work.
 
 ## Authoring contract
 
@@ -263,10 +270,10 @@ SHA-256; the filesystem client independently calculates it.
 WISP=/path/to/wisp python3 extras/x/check --mount flows
 python3 -m unittest discover -s extras/mounts/flows/tests -p 'test_*.py'
 python3 extras/mounts/flows/tests/revisions_transport.py http://127.0.0.1:8138 --codex
-python3 extras/mounts/flows/tests/maintenance_transport.py http://127.0.0.1:8138
 ```
 
-Transport tests use disposable fixture paths. The earlier address-book/Austin
+Transport tests use disposable fixture paths. The obsolete Python-watcher test
+has been removed. The earlier address-book/Austin
 application, Python import scripts and Nenex domain declarations have been removed.
 Address/OSM remains a proposed representation example in the handbook; it does
 not claim an installed importer.

@@ -107,7 +107,10 @@ instead of a slot for every struct field.
 The filesystem mount captures evidence, with stable-change detection in its native foot; the native hand owns
 invalidation and publication. Missing files block while retaining the last good
 handbook. Model and filesystem I/O require their companions to remain running.
-This development world is process-local. The full shared virtual namespace and
+Eden saves and restores the complete namespace through the runtime's native
+continuation store before acknowledging writes. I/O services reconnect with fresh
+host arguments; interrupted model attempts retain terminal outcomes without
+automatic replay. The full shared virtual namespace and
 arbitrary write-through overlay discussed below are broader design work.
 
 ## Purpose
@@ -307,8 +310,8 @@ For self-maintenance, a crew notification can make an execution eligible to
 refresh; a native transition chooses the next step; pure cells produce a
 candidate; an admitted command commits it. A model call uses explicit suspended
 state and a worker response. Define overlap/coalescing behavior before installing
-automatic refresh. Durable scheduling and restoration still require implementation
-and qualification beyond the current process-local harness.
+automatic refresh. Native world restoration preserves this state and its compiled
+definitions. Date/backoff scheduling remains separate design work.
 
 ## Block sewing and embedded authoring
 

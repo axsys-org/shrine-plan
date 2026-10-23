@@ -14,6 +14,15 @@ x/eden --mount debugger --mount srs
 x/eden --extras-root ../shrine-extras --mount explorer --mount codex
 ```
 
+Eden restores one native world per node from `$XDG_DATA_HOME/shrine/worlds/`
+(default `~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit
+directory; the mount selection and source workspace are remembered there.
+`--workspace PATH` selects the source workspace used by host captures.
+The namespace, history, cells and executable definitions are committed together
+through native `Save` before a write is acknowledged. Restarts reconnect I/O
+services before rescanning evidence; they do not reinstall application seeds or
+replay completed work. `--ephemeral` and `--check` use disposable worlds.
+
 The `shrine-extras` input in `flake.lock` selects the default extras revision.
 `--extras-root` selects an editable checkout, including that checkout's Nix
 configuration. Dependencies are loaded once, before their consumers. Only selected

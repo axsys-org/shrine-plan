@@ -18,7 +18,8 @@ def runtime_exit_status(returncode, log_path):
 
 import re
 def startup_ready(output, returned_marker):
-    return ('HTTP foot listening' in output and bool(re.search(
+    return ('HTTP foot listening' in output and bool(
+        re.search(r'^\((?:0\s+)?"EDEN-WORLD-READY"(?:\s|\))', output, re.M) or re.search(
         r'^\("' + re.escape(returned_marker) + r'"\s+\(0(?:\s|\))', output, re.M)))
 
 def startup_failed(output, returned_marker):

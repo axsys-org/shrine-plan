@@ -13,6 +13,15 @@ x/eden --mount debugger --mount srs --mount codex --check
 x/eden --extras-root /path/to/other/extras --mount explorer
 ```
 
+Eden keeps one native world per node in `$XDG_DATA_HOME/shrine/worlds/` (default
+`~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit directory;
+subsequent launches remember its mount selection. Namespace state, history and
+reachable compiled definitions share the runtime's snapshot root. Commits precede
+write acknowledgments. Restart recreates I/O connections with fresh host
+arguments, without reinstalling application seeds or replaying completed work.
+`--ephemeral` and `--check` use disposable worlds. A world lock prevents two
+launchers from serving the same store concurrently.
+
 `web` owns shared browser routes, page composition and stylesheet.
 `openrouter` supplies the generated client used by Chat; regenerate it with
 `extras/x/generate-openrouter`. `explorer` adds `/ns`.
@@ -53,7 +62,7 @@ legacy declarative source bags; they had no Eden startup entrypoint.
 Mount records and captured sources live under `/<node>/io/fs/<name>`. Definitions
 remain under `/lib` and `/gov`; installed instances remain separate. Rescans
 publish valid candidate outputs atomically and retain the last successful output
-on failure. Activation runs only at startup. Existing instances, HTTP handlers,
+on failure. Application activation runs only when creating the world. Existing instances, HTTP handlers,
 assets and registered drivers remain pinned until explicitly installed or started
 again. No watcher or automatic migration runs.
 

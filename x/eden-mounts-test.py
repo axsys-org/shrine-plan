@@ -21,6 +21,8 @@ class MountTests(unittest.TestCase):
         success = '("DONE" (0 17))\n'
         self.assertFalse(startup_ready(success, 'DONE'))
         self.assertTrue(startup_ready(listening + success, 'DONE'))
+        self.assertTrue(startup_ready(listening + '("EDEN-WORLD-READY" "committed")\n', 'DONE'))
+        self.assertTrue(startup_ready(listening + '(0 "EDEN-WORLD-READY"\n "committed")\n', 'DONE'))
         failure = listening + '("DONE" (1 "activation failed"))\n'
         self.assertFalse(startup_ready(failure, 'DONE'))
         self.assertTrue(startup_failed(failure, 'DONE'))

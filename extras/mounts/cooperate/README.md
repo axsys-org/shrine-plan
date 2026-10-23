@@ -15,8 +15,9 @@ x/eden --mount cooperate --compiler none --port 8131
 ```
 
 Add `--mount nenex` to work against wiki pages. The backend also works against
-ordinary existing records. Starting Eden creates a fresh namespace; this proof
-retains journal/history within that process, without restart recovery.
+ordinary existing records. Eden restores its existing native world, including
+journal/history, captures and compiled definitions. Use `--world PATH` for an
+explicit world or `--ephemeral` for a disposable test.
 
 ## Operations
 
@@ -86,9 +87,10 @@ current attempt and context generation so a late answer cannot close newer work.
 wakes the existing activity once for that changed reading; the activity's hand
 decides what work to perform. An ordinary investigation records the resume
 notification, while a flow's maintenance hand stages and dispatches its next
-attempt. There is no timer or separate queue runner. These records persist in
-the live namespace and its journal, subject to the process lifetime described
-above; this does not add restart recovery or scheduled date/backoff policies.
+attempt. There is no timer or separate queue runner. These records and their
+journal survive restart through Eden's native world continuation. Process I/O
+is reconnected; uncertain external turns are retained as interrupted attempts,
+not replayed. Date/backoff scheduling remains outside this contract.
 
 `/x/<run>/checks/<label>` reports `/unchanged`, comparing current values with
 captured values. Completion additionally checks the revision of directly stored

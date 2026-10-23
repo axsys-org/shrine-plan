@@ -40,9 +40,10 @@ The `cooperate` mount adds document-local agent runs through the MCP endpoint at
 `http://127.0.0.1:8131/mcp`. See the [harness interface and client](../cooperate/README.md)
 for captured context, branching traces and reusable results.
 
-The development launcher creates a fresh namespace on each restart. Browser
-reloads preserve edits within that running namespace. This is not durable storage
-across server restarts.
+Eden restores the same native world across server restarts. Page sources, cells,
+holes, frozen work and namespace history are saved together before a write is
+acknowledged. `--world PATH` selects a world; `--ephemeral` creates a disposable
+one. This uses the runtime's existing snapshot store, with no Nenex save format.
 
 ## Implementation
 
@@ -104,8 +105,8 @@ remain frozen. The current page stays live in either scope.
 The answering provider receives only the bound, bounded context. It does not
 browse or crawl automatically. A fetcher can publish evidence records or cells
 and bind them through the same interface; native answering does not require a
-separate web or Python scheduling loop. This does not add launcher restart
-recovery for development worlds.
+separate web or Python scheduling loop. Questions, captured evidence and unresolved
+holes share the same native world persistence as the rest of the page.
 
 The **Cells** section embeds the existing live Cells renderer over native cells.
 Flow outputs expose their maintenance work here, with status, concept drafts,
