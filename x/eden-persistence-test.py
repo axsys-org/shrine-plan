@@ -22,6 +22,62 @@ api = runpy.run_path(str(ROOT / 'extras/mounts/flows/client.py'))
 
 @unittest.skipUnless(os.environ.get('WISP'), 'Set WISP for the native crash test')
 class NativeWorldTest(unittest.TestCase):
+    def test_checkpoints_reuse_service_closure(self):
+        sys.path.insert(0, str(ROOT / 'x'))
+        import test_runner as runner
+        runtime = os.environ['WISP']
+        template = runner.stage(runtime, False, 180)
+        source_root = Path(os.environ.get('TEST_SOURCE_ROOT', ROOT / 'src'))
+        with tempfile.TemporaryDirectory(prefix='eden-sharing-') as temporary:
+            work = Path(temporary)
+            runner.copy_snapshot(template, work / 'snap')
+            with (work / 'out.log').open('w') as log:
+                process = subprocess.Popen([runtime, '--file-root', str(source_root),
+                    'snap', 'root', '_'], cwd=work, stdin=subprocess.PIPE,
+                    stdout=log, stderr=log, text=True)
+                try:
+                    process.stdin.write('''(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind world (#module eden-world))
+(define (exercise count)
+  (define payload (gen 256 (lambda (i) (Add (Bex (Mul count 1638)) i))))
+  (define (serve commit state args) (Ix (Mod (_0 state) 256) payload))
+  (define saved [0 (Pin payload)])
+  (world:save serve saved)
+  (print "SHARING-BASELINE")
+  (Sleep 1)
+  (define (step state serial)
+    (define next [serial (_1 state)])
+    (Seq (world:save serve next) next))
+  (define result (foldl step saved (gen count (lambda (i) i))))
+  (If (Eq (_0 result) (Dec count)) (print "SHARING-COMPLETE")
+    (error "Checkpoint lost the updated state")))
+(exercise 20)
+''')
+                    process.stdin.flush()
+                    deadline = time.monotonic() + 180
+                    while 'SHARING-BASELINE' not in (work / 'out.log').read_text(errors='replace'):
+                        output = (work / 'out.log').read_text(errors='replace')
+                        if process.poll() is not None or '("ERROR"' in output or time.monotonic() > deadline:
+                            self.fail(output[-6000:])
+                        time.sleep(.02)
+                    baseline = (work / 'snap/arena.dat').stat().st_size
+                    process.stdin.close()
+                    self.assertEqual(0, process.wait(timeout=180))
+                    output = (work / 'out.log').read_text(errors='replace')
+                    self.assertIn('SHARING-COMPLETE', output)
+                    growth = (work / 'snap/arena.dat').stat().st_size - baseline
+                    # Twenty scalar changes must not duplicate the unchanged
+                    # one-megabyte service closure on every checkpoint.
+                    print(f'Native checkpoint growth for 20 updates: {growth} bytes')
+                    self.assertLess(growth, 4 * 1024 * 1024, f'Checkpoint growth: {growth} bytes')
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+
     def test_unresolved_flow_and_completed_history_survive_crash(self):
         with tempfile.TemporaryDirectory(prefix='eden-restart-') as temporary:
             world = Path(os.environ.get('EDEN_TEST_WORLD', temporary + '/world'))

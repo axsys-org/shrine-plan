@@ -23,17 +23,17 @@ through native `Save` before a write is acknowledged. Restarts reconnect I/O
 services before rescanning evidence; they do not reinstall application seeds or
 replay completed work. `--ephemeral` and `--check` use disposable worlds.
 
-The `shrine-extras` input in `flake.lock` selects the default extras revision.
-`--extras-root` selects an editable checkout, including that checkout's Nix
-configuration. Dependencies are loaded once, before their consumers. Only selected
+The default mount sources are this checkout's `extras/` directory.
+`--extras-root` selects another source directory, including its Nix configuration.
+Dependencies are loaded once, before their consumers. Only selected
 mounts and their dependencies prepare host tools or assets. Mash and Node belong
 to the debugger's extras environment, not the core Eden shell.
 
 Each flat bag has a version-1 `mount.json`. It maps logical Foil module names to
 filenames, declares ordered Grove units and their publication roots, and declares
 assets, dependencies and optional activation, HTTP and host entrypoints. See the
-[extras repository](https://github.com/axsys-org/shrine-extras) for the schema and
-application checks. Core rejects unknown names, cycles, core-module overrides,
+[extras guide](extras/README.md) for the schema and application checks.
+Core rejects unknown names, cycles, core-module overrides,
 overlapping publication ownership and duplicate route claims. HTTP dispatch uses
 the longest matching path prefix, with segment boundaries.
 

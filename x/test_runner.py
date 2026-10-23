@@ -147,6 +147,8 @@ def inventory():
     if found_helpers != helpers.keys():
         raise ValueError(f'missing native helpers: {sorted(helpers.keys() - found_helpers)}')
     for command in data['commands']:
+        if not (ROOT / command['target']).is_file():
+            raise ValueError('missing command target: ' + command['target'])
         suites.append(dict(command, kind='command', group=command['name'], enabled=True))
     return suites
 

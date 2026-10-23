@@ -200,6 +200,13 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(suite['entrypoint'], 'run' if name == 'backend' else 'check')
             self.assertEqual(suite['fixture'], ['foil-grove-fixture', 'create'])
 
+    def test_missing_command_target_is_rejected(self):
+        original = Path.is_file
+        target = runner.ROOT / 'extras/mounts/debugger/check-debugger.py'
+        with patch.object(Path, 'is_file', lambda path: False if path == target else original(path)):
+            with self.assertRaisesRegex(ValueError, 'missing command target: extras/mounts/debugger/check-debugger.py'):
+                runner.inventory()
+
     def test_migrated_pure_suites_are_native(self):
         suites = {s['name']: s for s in runner.inventory()}
         for name in ('pact', 'sept', 'semidoc', 'weft'):

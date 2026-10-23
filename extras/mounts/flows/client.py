@@ -4,7 +4,6 @@ Python handles files and the existing MCP transport. Compilation, composition,
 preview, conflict checks and document writes run in native Foil.
 """
 import argparse
-import hashlib
 from html.parser import HTMLParser
 import json
 from pathlib import Path
@@ -16,6 +15,8 @@ from urllib.request import urlopen
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
+_capture = runpy.run_path(str(HERE / 'host.py'))
+validate_bundle = _capture['validate_bundle']
 _transport = runpy.run_path(str(HERE.parent / 'cooperate' / 'client.py'))
 Client = _transport['Client']
 reference = _transport['reference']
@@ -42,54 +43,9 @@ class SourceForm(HTMLParser):
             self.parts.append(data)
 
 
-def validate_bundle(bundle):
-    """Accept a replay only when the source bytes still match its captured hashes."""
-    sources = bundle['sources']
-    if not isinstance(sources, dict) or not 1 <= len(sources) <= 64:
-        raise ValueError('bundle must contain between 1 and 64 named sources')
-    for name, source in sources.items():
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name):
-            raise ValueError('invalid source name: ' + name)
-        if set(source) != {'location', 'title', 'digest', 'format', 'content'} or not all(
-                isinstance(value, str) for value in source.values()):
-            raise ValueError('incomplete source envelope: ' + name)
-        raw = source['content'].encode('utf-8')
-        if not source['location'] or not 0 < len(raw) <= 131072:
-            raise ValueError('invalid source size or location: ' + name)
-        if hashlib.sha256(raw).hexdigest() != source['digest']:
-            raise ValueError('source digest mismatch: ' + name)
-    encoded = json.dumps(sources, ensure_ascii=False, sort_keys=True).encode('utf-8')
-    if len(encoded) > 1500000:
-        raise ValueError('source inventory exceeds the client materialization budget')
-    if hashlib.sha256(encoded).hexdigest() != bundle['digest']:
-        raise ValueError('bundle digest mismatch')
-    return bundle
-
-
 def prepare(repo=REPO, manifest=HERE / 'sources.json'):
-    """Read the entire declared inventory before making any remote changes."""
-    repo = Path(repo).resolve()
-    entries = json.loads(Path(manifest).read_text(encoding='utf-8'))
-    if not isinstance(entries, dict) or not 1 <= len(entries) <= 64:
-        raise ValueError('manifest must contain between 1 and 64 named sources')
-    sources = {}
-    for name, entry in sorted(entries.items()):
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name):
-            raise ValueError('invalid source name: ' + name)
-        path = (repo / entry['path']).resolve()
-        if not path.is_relative_to(repo):
-            raise ValueError('source escapes repository: ' + entry['path'])
-        raw = path.read_bytes()
-        if not 0 < len(raw) <= 131072:
-            raise ValueError('source must contain 1..131072 bytes: ' + entry['path'])
-        sources[name] = dict(location=entry['path'], title=entry.get('title', name),
-                             digest=hashlib.sha256(raw).hexdigest(),
-                             format=path.suffix.lstrip('.') or 'text',
-                             content=raw.decode('utf-8'))
-    encoded = json.dumps(sources, ensure_ascii=False, sort_keys=True).encode('utf-8')
-    if len(encoded) > 1500000:
-        raise ValueError('source inventory exceeds the client materialization budget')
-    return validate_bundle({'digest': hashlib.sha256(encoded).hexdigest(), 'sources': sources})
+    """Capture filesystem evidence through the mount's I/O adapter."""
+    return _capture['capture_sources'](repo, manifest)
 
 
 class FlowClient(Client):
@@ -222,7 +178,7 @@ def main():
     preview.add_argument('--id')
     commit = sub.add_parser('commit')
     commit.add_argument('run')
-    export = sub.add_parser('export', help='save the canonical namespace Semidoc source before stopping a development world')
+    export = sub.add_parser('export', help='export the canonical namespace Semidoc source')
     export.add_argument('author')
     export.add_argument('output', type=Path)
     follow = sub.add_parser('follow', help='attach a reusable native maintenance hand')

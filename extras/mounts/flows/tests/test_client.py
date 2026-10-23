@@ -68,8 +68,7 @@ class InventoryTests(unittest.TestCase):
         host = runpy.run_path(str(Path(__file__).parents[1] / 'host.py'))
         bag = self.root / 'bag'
         bag.mkdir()
-        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}), patch.object(
-                host['runpy'], 'run_path', return_value={'prepare': prepare}):
+        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}):
             host['scan'](self.root, bag)
             first = (bag / 'repository-evidence.json').read_bytes()
             host['scan'](self.root, bag)
@@ -80,8 +79,7 @@ class InventoryTests(unittest.TestCase):
         host = runpy.run_path(str(Path(__file__).parents[1] / 'host.py'))
         bag = self.root / 'bag'
         bag.mkdir()
-        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}), patch.object(
-                host['runpy'], 'run_path', return_value={'prepare': prepare}):
+        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}):
             host['scan'](self.root, bag)
             first = (bag / 'repository-evidence.json').read_bytes()
             self.source.unlink()
