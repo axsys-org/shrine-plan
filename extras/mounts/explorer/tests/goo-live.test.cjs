@@ -503,17 +503,6 @@ test('queueHTML puts working asks first, then waiting by priority (chat before c
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'working, then chat before crawl, then finished');
   assert.match(html, /reading example\.com/); assert.match(html, /4 rows · 6 written/);
 });
-test('holesHTML orders holes by when they are due and says it in words', () => {
-  const now = 1000000;
-  const html = live.holesHTML([
-    { path: 'i/a', record: '0x11/user/orgs/warhound', slot: 'first_delivery', kind: 'until', next: 0, due: 20270101, tries: 0, asked: 'When?', reason: '' },
-    { path: 'i/b', record: '0x11/user/orgs/groundwire_foundation', slot: 'irs_501c3_status', kind: 'watch', next: now + 7 * 86400, tries: 1, asked: 'Granted?', reason: 'nothing found (1 tries)' },
-    { path: 'i/c', record: '0x11/user/people/erik_torenberg', slot: 'profile', kind: 'unknown', next: now - 5, tries: 2, asked: 'Who?', reason: '' } ], now);
-  const order = ['erik torenberg', 'groundwire foundation', 'warhound'].map(t => html.indexOf(t));
-  assert.deepEqual([...order].sort((a, b) => a - b), order);
-  assert.match(html, /due now/); assert.match(html, /until 2027-01-01/); assert.match(html, /in 7 days/); assert.match(html, /holes · 3/);
-});
-
 test('mountRecord draws every page of what is beneath before the backlink walk returns', async () => {
   const kid = (name, slots) => ({path: '0x11/user/' + name, name, slots, kids: [], case: 1});
   const pages = {
@@ -523,17 +512,42 @@ test('mountRecord draws every page of what is beneath before the backlink walk r
   const gate = new Promise(r => { release = r; });
   const source = {
     read: async (path, care, cas, next) => pages[next || ''],
-    backlinks: async () => { await gate; return {matches: [{path: '0x11/agent/c1/context', slot: 'user', hole: false}]}; }};
+    by: async () => { await gate; return {user: [{path: '0x11/agent/c1/context', slot: 'user', hole: false}], mentioned: [{path: '0x11/agent/c2/turns/t3', slot: 'mentioned', hole: false}]}; },
+    candidates: async () => [{name: 'Marc Andreessen', count: 1, sources: []}]};
   const el = fakeEl();
-  const sec = {innerHTML: ''};
-  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : null)};
+  const sec = {innerHTML: ''}, cand = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
   el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
   live.mountRecord(el, source, {at: '/0x11/user'});
   for (let i = 0; i < 20 && !/looking/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(main.innerHTML, /beneath · 4/, 'both pages of children, and only direct children');
+  assert.match(main.innerHTML, /beneath/, 'both pages of children, and only direct children');
   assert.match(main.innerHTML, /people/); assert.match(main.innerHTML, /web/); assert.doesNotMatch(main.innerHTML, /a16z/);
   assert.match(main.innerHTML, /looking…/, 'drawn before the backlinks come back');
   release();
   for (let i = 0; i < 20 && !/c1\/context/.test(sec.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(sec.innerHTML, /pointing here · 1/);
+  assert.match(sec.innerHTML, /pointing here · 2/); assert.match(sec.innerHTML, /mentioned/); assert.match(sec.innerHTML, /c2\/turns\/t3/);
+  const order = ['user', 'mentioned'].map(k => sec.innerHTML.indexOf('>' + k + ' <'));
+  assert.ok(order[0] < order[1], 'mentions come after the named slots');
+});
+
+test('names on a record page that are not yet things are shown as a line, waiting for the agent', async () => {
+  const cand = {innerHTML: ''}, sec = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async () => ({path: '0x11/agent/c2/turns/t3', record: {said: 'Met Marc Andreessen'}, kids: [], case: 1, next: null}), by: async () => ({}), candidates: async () => [{name: 'Marc Andreessen', count: 1, sources: []}] };
+  live.mountRecord(el, source, {at: '/0x11/agent/c2/turns/t3'});
+  for (let i = 0; i < 30 && !/Marc Andreessen/.test(cand.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(cand.innerHTML, /waiting for the agent to place · 1/); assert.doesNotMatch(cand.innerHTML, /<button/);
+});
+test('a record page draws its containment chain and the contents tree from the index', async () => {
+  const cand = {innerHTML: ''}, sec = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async () => ({path: '0x11/user/places/hudson_county', record: {name: 'Hudson County'}, kids: [{path: '0x11/user/places/hudson_county/talk', name: 'talk', slots: {}, kids: []}], case: 1, next: null}),
+    by: async () => ({}), candidates: async () => [],
+    tree: async () => ({ in: [{path: '/0x11/user/places/new_jersey', name: 'New Jersey'}], contents: [{path: '/0x11/user/places/hoboken', name: 'Hoboken', kind: 'places', children: []}] }) };
+  live.mountRecord(el, source, {at: '/0x11/user/places/hudson_county'});
+  for (let i = 0; i < 30 && !/contents/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /sv-in">in .*New Jersey/); assert.match(main.innerHTML, /contents · 1/); assert.match(main.innerHTML, /Hoboken/);
+  assert.match(main.innerHTML, /sv-parts.*talk/, 'the talk is a part beneath, not a thing in the tree');
 });

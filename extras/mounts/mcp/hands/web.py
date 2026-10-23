@@ -200,7 +200,7 @@ def rank_links(links, q, cap=40):
     seen, out = set(), []
     for u in links:
         u = str(u).split('#', 1)[0]
-        if not u.startswith('http') or u in seen or re.search(r'\.(xml|json|css|js|png|jpe?g|gif|svg|ico|woff2?)(\?|$)', u, re.I):
+        if not u.startswith('http') or u in seen or re.search(r'\.(xml|json|css|js|png|jpe?g|gif|svg|ico|woff2?|pdf|zip|tar|gz|bin|dmg|exe)(\?|$)', u, re.I):
             continue
         seen.add(u)
         path = urllib.parse.urlparse(u).path.strip('/')
@@ -360,12 +360,14 @@ def page_path(node, url):
     return f'/{node}/user/web/pages/{host}/{slug}'
 
 
-def relevant(regions, wanted, budget=3000):
+def relevant(regions, wanted, budget=3000, skip=()):
     """Only the regions worth the extractor's tokens: ranked by how many of the ask's words (and the shape's slot names)
     they contain, kept in page order, within a character budget. The index keeps every region; the model sees few."""
     terms = {w for w in re.findall(r'[a-z0-9]{3,}', wanted.lower()) if w not in {'the', 'and', 'what', 'who', 'where', 'when', 'which', 'text', 'number', 'yyyy', 'yyyymmdd', 'true', 'false'}}
     scored = []
     for i, r in enumerate(regions[:60], 1):
+        if i in skip:
+            continue                                        # shown already, with its true index
         blob = (r['heading'] + ' ' + r['text']).lower()
         scored.append((sum(blob.count(t) for t in terms) + (2 if i <= 2 else 0), i, r))
     keep, used = [], 0
@@ -397,7 +399,9 @@ EXTRACT = """You extract facts from web pages into typed rows. You are given a q
 types), and the regions of one page, each with an index. Reply with one JSON object: {"rows": [ {<the shape's slots>,
 "region": <index of the region the row comes from>, "quote": "<the few words that state it>"} ]}. Rules: only rows the
 page actually states; every slot typed as the shape says (numbers as numbers, days as YYYYMMDD, flags true/false, text
-only where the shape says text); no row for a guess; an empty list when the page does not answer. Also reply
+only where the shape says text); no row for a guess; a slot the page does not state is left out of the row rather
+than the row dropped (a person's name without a date is still a row); the title and the lead of a page often answer
+who or what a thing is; an empty list when the page does not answer. Also reply
 "queries": [<up to two better search queries if this page suggests where the answer is>] when the page did not answer."""
 
 
@@ -436,7 +440,7 @@ class WebHand(Hand):
         agents = self.w.read('/' + self.w.node + '/agent', 'y', limit=200)
         for a in agents.get('children', []):
             name = a['path'].rsplit('/', 1)[1]
-            if not a.get('exists') or not (re.fullmatch(r'[a-z]\d*', name) or name == 'crawl'):
+            if not a.get('exists') or not re.fullmatch(r'[a-z]\d*', name):
                 continue
             asks = self.w.read(a['path'] + '/asks', 'z', limit=5000)     # the asks and their children in one read
             for q in asks.get('children', []):
@@ -445,16 +449,31 @@ class WebHand(Hand):
                 props = {k.lstrip('/'): v for k, v in (q.get('properties') or {}).items() if not k.startswith('/sys')}
                 if not props.get('asked') or q['path'] in self.done or q['path'] in self.queued:
                     continue
-                kids = {c['path'].rsplit('/', 1)[1] for c in (q.get('children') or []) if c.get('exists') or c.get('children')}
-                if 'found' in kids or 'taken' in kids:
+                kidmap = {c['path'].rsplit('/', 1)[1]: c for c in (q.get('children') or []) if c.get('exists') or c.get('children')}
+                if 'found' in kidmap:
                     continue
-                prio = 0 if name != 'crawl' else 1 + int(float(props.get('priority') or 1))
+                if 'taken' in kidmap:
+                    # claimed, but by a worker that is gone (a restart, a crash): quiet for ten minutes with no final word, it is taken again
+                    st = (kidmap.get('status') or {}).get('properties') or {}
+                    if st.get('/state') in ('done', 'empty', 'failed') or time.time() - float(st.get('/updated') or (kidmap['taken'].get('properties') or {}).get('/when') or time.time()) < 600:
+                        continue
+                    self.log(f'web: retaking {q["path"].split("/agent/")[-1] if "/agent/" in q["path"] else q["path"]} (claimed, then silent)')
+                prio = int(float(props.get('priority') or 0))
                 out.append((prio, q['path'], props))
         return out
 
-    def enqueue(self):
+    def enqueue(self, paths=()):
         n = 0
-        for prio, path, props in self.asks():
+        found = list(self.asks())
+        for path in paths:                                        # an ask named by the stream, wherever it lives
+            if path in self.done or path in self.queued or any(path == f[1] for f in found):
+                continue
+            q = self.w.read(path, 'y', limit=20)
+            props = {k.lstrip('/'): v for k, v in (q.get('properties') or {}).items() if not k.startswith('/sys')}
+            kids = {c['path'].rsplit('/', 1)[1] for c in (q.get('children') or []) if c.get('exists') or c.get('children')}
+            if q.get('exists') and props.get('asked') and 'found' not in kids and 'taken' not in kids:
+                found.append((int(float(props.get('priority') or 0)), path, props))
+        for prio, path, props in found:
             with self.lock:
                 if path in self.queued:
                     continue
@@ -486,7 +505,7 @@ class WebHand(Hand):
     def dig(self, ask, props):
         node = self.w.node
         aid = ask.rsplit('/', 1)[1]
-        owner = ask.split('/agent/', 1)[1].split('/', 1)[0]
+        owner = ask.split('/agent/', 1)[1].split('/', 1)[0] if '/agent/' in ask and '/talk/' not in ask else 'talk'
         trail = f'/{node}/agent/web/research/{owner}_{aid}'
         # the trail's root first, in the same event as the claim: a culled trail would otherwise refuse its children
         self.w.tool('write', records=[{'path': ask + '/taken', 'slots': {'by': 'web', 'when': int(time.time())}},
@@ -499,22 +518,30 @@ class WebHand(Hand):
             first = (str(props['entity']) + ' ' + str(props.get('kind') or '')).strip()
         else:
             first = keywords(asked + ' ' + scope)
-        queries, seen, rows, nq, nv = [first], set(), [], 0, 0     # an entity is searched by its name, not by the question
+        about_props = {}
+        if props.get('about'):
+            about_props = self.w.read(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['about'])), 'x').get('properties') or {}
+        own_site = re.sub(r'^https?://(www\.)?', '', str(about_props.get('/website') or about_props.get('/url') or about_props.get('/site') or '')).split('/')[0]
+        extra = [first + ' site:' + own_site] if own_site and not many and not props.get('site') else []      # the thing's own site answers first
+        queries, seen, rows, nq, nv = extra + [first], set(), [], 0, 0     # an entity is searched by its name, not by the question
         pages_read, failed = 0, ''
         cap, site, queued = (MAX_PAGES_MANY if many else MAX_PAGES), str(props.get('site') or ''), []
-        if many and not site and props.get('about'):
-            ap = self.w.read(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['about'])), 'x').get('properties') or {}
-            site = str(ap.get('/website') or ap.get('/url') or ap.get('/site') or '')
-        if many and site and firecrawl_key():
+        if not site and props.get('about'):
+            site = str(about_props.get('/github') or '') if many else ''
+            if many and not site:
+                site = str(about_props.get('/website') or about_props.get('/url') or about_props.get('/site') or '')
+        if site and firecrawl_key():
             # a collection with a known site: every url of the site in one call, its content pages read in turn
             self.status(ask, 'mapping', step=site[:160], pages=0, queries=0, rows=0)
             try:
                 links = firecrawl('/map', {'url': site if '://' in site else 'https://' + site, 'limit': 500}).get('links') or []
             except Exception as e:
                 self.log(f'web {owner}/{aid}: map of {site} failed: {str(e)[:80]}'); links = []
-            queued = [(u, '', '') for u in rank_links(links, first + ' ' + shape)]
+            queued = [(u, '', '') for u in rank_links(links, first + ' ' + shape, cap=40 if many else 6)]
             if queued:
-                self.log(f'web {owner}/{aid}: mapped {site}: {len(links)} urls, {len(queued)} to read')
+                self.log(f'web {owner}/{aid}: mapped {site}: {len(links)} urls, {len(queued)} to read first')
+        if queued and not many:
+            cap = max(cap, len(queued))                                   # the site's own pages do not eat the search budget
         while (queries or queued) and pages_read < cap:
             if queued:
                 q, hits, engine, terms, attempts, queued = 'map ' + site, queued, 'firecrawl-map', [], 0, []
@@ -561,7 +588,8 @@ class WebHand(Hand):
                 nv += 1
                 self.w.tool('write', records=[{'path': f'{trail}/visited/v{nv}', 'slots': {'page': reference(ppath), 'why': q[:120]}}], who=self.name)
                 # extraction, to the ask's shape only
-                shown = relevant(regions, asked + ' ' + shape)
+                lead = regions[0] if regions else None
+                shown = f'TITLE: {ptitle or title}\n' + (f'[1] {lead["heading"]}: {lead["text"][:1200]}\n' if lead else '') + relevant(regions, asked + ' ' + shape, skip=(1,) if lead else ())
                 try:
                     got = call_model(self.model, EXTRACT, f'QUESTION: {asked}\nSHAPE: {shape}\nPAGE: {url}\nREGIONS:\n{shown}')
                 except Exception as e:
@@ -594,25 +622,6 @@ class WebHand(Hand):
             for start in range(0, len(recs), 40):
                 self.w.tool('write', records=recs[start:start + 40], who=self.name)
         why = failed or (None if rows or pages_read else 'no result mentions ' + ', '.join(distinctive(first)[:4]))
-        if not rows and props.get('about') and owner != 'crawl':
-            # the question stays attached to its thing: a hole the crawl hand looks at again on its schedule
-            about = re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['about']))
-            slot = segment_of(str(props.get('slot') or aid))
-            kind = props.get('kind') if props.get('kind') in ('watch', 'until', 'unknown') else 'unknown'
-            every = int(float(props.get('every') or 86400))
-            hole = {'slot': slot, 'asked': asked, 'shape': shape, 'kind': kind, 'every': every, 'made': int(time.time()), 'ask': reference(ask),
-                    'next': int(time.time() + (1800 if failed else every if kind != 'unknown' else 2 * 86400)), 'tries': 0 if failed else 1,
-                    'reason': failed or why or 'nothing found'}
-            if props.get('query'):
-                hole['query'] = str(props['query'])
-            if props.get('due'):
-                hole['due'] = int(float(props['due']))
-            try:
-                self.w.tool('write', records=[{'path': about + '/holes', 'slots': {}}, {'path': f'{about}/holes/{slot}', 'slots': hole}], who=self.name)
-                self.log(f'web {owner}/{aid}: now a hole at {about.split("/user/")[-1]}/holes/{slot} ({kind})')
-            except Exception as e:
-                self.log(f'web {owner}/{aid}: could not write the hole: {str(e)[:80]}')
-        self.status(ask, 'done' if rows else ('failed' if failed else 'empty'), pages=pages_read, queries=nq, rows=len(rows), reason=why)
         self.log(f'web {owner}/{aid}: {nq} queries, {pages_read} pages, {len(rows)} rows')
         self.done.add(ask)
         return len(rows)
@@ -620,9 +629,10 @@ class WebHand(Hand):
     def line(self, line):
         # only a new or changed ask itself wakes the queue, not its status, rows, claim or integration
         touched = line.get('touched') or []
-        if not any(re.search(r'/agent/[^/]+/asks/[^/]+$', t) for t in touched):
+        asks = [t for t in touched if re.search(r'/asks/[a-z][a-z0-9_]*$', t)]
+        if not asks:
             return 0
-        return self.enqueue()
+        return self.enqueue(asks)
 
     def tick(self, now):
         return self.enqueue()

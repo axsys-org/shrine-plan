@@ -6,6 +6,44 @@
 (function (root) {
 'use strict';
 
+// the agent's reply as it is written, from the agent hand's stream: the phase (thinking, looking at …, searching the
+// web for … · reading host, writing), the words so far, and a stop button; send is disabled while the agent is busy
+function liveFeed(holder, chat, form, stream) {
+  if (!holder || !root.EventSource || !root.location) return null;
+  const base = stream || ('http://' + (root.location.hostname || '127.0.0.1') + ':8311');
+  let es;
+  try { es = new root.EventSource(base + '/stream/' + chat); } catch (e) { return null; }
+  // from the moment the person sends: "waiting for the agent" at once, and a plain word when nothing picks it up
+  const waiting = () => {
+    holder._expecting = Date.now();
+    holder.innerHTML = `<div class="sv-msg them live"><span class="w">${esc(chat)} · sent, waiting for the agent</span><div class="s"><span class="dots"><i></i><i></i><i></i></span></div></div>`;
+    (root.setTimeout)(() => { if (holder._expecting && Date.now() - holder._expecting >= 15000) { const w = holder.querySelector('.w'); if (w) w.textContent = chat + ' · no answer yet: the agent hand may not be running'; } }, 15500);
+  };
+  if (form) form.addEventListener('submit', () => waiting());
+  es.onmessage = m => {
+    let st; try { st = JSON.parse(m.data); } catch (e) { return; }
+    const send = form ? form.querySelector('button[type=submit]') : null;
+    if (!st.busy) {
+      if (holder._expecting && Date.now() - holder._expecting < 15000) return;   // sent, not yet picked up: keep waiting
+      holder.innerHTML = ''; holder._expecting = null; if (send) send.disabled = false; return;
+    }
+    holder._expecting = null;
+    if (send) send.disabled = true;
+    // the bubble is built once per reply and updated in place, so the stop button stays under the pointer
+    let bubble = holder.querySelector('.sv-msg.live');
+    if (bubble && !bubble.querySelector('.sv-stop')) { holder.innerHTML = ''; bubble = null; }   // the waiting bubble gives way to the live one
+    if (!bubble) {
+      holder.innerHTML = `<div class="sv-msg them live"><span class="w"></span><button type="button" class="sv-stop" title="stop the agent; what it said so far is kept">stop</button><div class="s"></div></div>`;
+      bubble = holder.querySelector('.sv-msg.live');
+      bubble.querySelector('.sv-stop').addEventListener('click', e => { e.target.disabled = true; e.target.textContent = 'stopping'; root.fetch(base + '/stop/' + chat, { method: 'POST' }).catch(() => {}); });
+    }
+    const label = st.phase && st.phase !== 'writing' ? st.phase : (st.said ? 'is writing' : 'is thinking');
+    bubble.querySelector('.w').textContent = chat + ' ' + label;
+    const body = bubble.querySelector('.s');
+    if (st.said) body.textContent = st.said; else if (!body.querySelector('.dots')) body.innerHTML = '<span class="dots"><i></i><i></i><i></i></span>';
+  };
+  return es;
+}
 function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>${opts.chat ? `<form class="sv-chat"><input type="text" autocomplete="off" placeholder="say something to ${esc(opts.chat)}"><button type="submit">send</button><button type="button" class="new" title="start a new chat with a blank context; this one stays">new chat</button></form>` : ''}`;
@@ -13,9 +51,9 @@ function mountViewer(el, source, opts = {}) {
     el.querySelector('.sv-main').innerHTML = `<div class="sv-talk"></div><div class="sv-live"><div class="sv-writing"></div><div class="sv-asks"></div></div><div class="sv-ask"></div><div class="sv-ctx"><div class="sv-ctx-change"></div><div class="sv-ctx-now"></div></div>`;
     el.querySelector('.sv-ask').append(el.querySelector('.sv-chat'));   // the box sits under the conversation, above the context
     const node = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11', agent = '/' + node + '/agent/' + opts.chat;
-    let drawing = null;
+    let drawing = null, again = false;
     async function drawChat() {
-      if (drawing) return drawing;
+      if (drawing) { again = true; return drawing; }
       drawing = (async () => {
         const turns = await source.read(agent + '/turns', 'y');
         const ts = (turns && turns.kids || []).map(k => ({ n: Number((/t(\d+)$/.exec(k.path) || [0, 0])[1]), who: k.slots.who || '', said: k.slots.said || '' })).filter(t => t.n).sort((a, b) => a.n - b.n);
@@ -39,30 +77,20 @@ function mountViewer(el, source, opts = {}) {
         const chips = added.map(([k]) => `<span class="add">+${esc(k)}</span>`).concat(dropped.map(([k]) => `<span class="drop">−${esc(k)}</span>`), kept.map(([k]) => `<span class="keep">${esc(k)}</span>`)).join(' ');
         el.querySelector('.sv-ctx-change').innerHTML = `<div class="sv-ctx-h">context, case ${esc(rec.case || '')}${added.length || dropped.length ? ` · ${added.length} in, ${dropped.length} out` : ' · unchanged'}</div><div class="sv-lens">${chips}</div>${rec.record.note ? `<div class="sv-note">${esc(rec.record.note)}</div>` : ''}`;
         drawing = null;
-      })().catch(() => { drawing = null; });
+        if (again) { again = false; drawChat(); }
+      })().catch(() => { drawing = null; if (again) { again = false; drawChat(); } });
       return drawing;
     }
     source.follow(msg => { if (msg.shown) return; if ((msg.touched || []).some(t => ('/' + t).startsWith(agent))) drawChat(); });
     drawChat();
-    if (root.EventSource && root.location) {
-      const base = opts.stream || ('http://' + (root.location.hostname || '127.0.0.1') + ':8311');
-      try {
-        const es = new root.EventSource(base + '/stream/' + opts.chat);
-        es.onmessage = m => {
-          let st; try { st = JSON.parse(m.data); } catch (e) { return; }
-          const w = el.querySelector('.sv-writing');
-          if (!st.busy) { w.innerHTML = ''; return; }
-          w.innerHTML = `<div class="sv-msg them live"><span class="w">${esc(opts.chat)} ${st.said ? 'is writing' : esc(st.phase || 'is thinking')}</span><div class="s">${st.said ? esc(st.said) : '<span class="dots"><i></i><i></i><i></i></span>'}</div></div>`;
-        };
-      } catch (e) { /* no live stream: the turn still lands as a record */ }
-    }
     const form = el.querySelector('.sv-chat'), input = form.querySelector('input');
+    el._live = liveFeed(el.querySelector('.sv-writing'), opts.chat, form, opts.stream);
     // new chat: a fresh agent folder, and the page moves to it; the old chat keeps its address
     const node0 = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11';
     form.querySelector('button.new').addEventListener('click', async () => {
       if (!source.newChat) return;
       let name; try { name = await source.newChat(); } catch (err) { return; }
-      root.location.search = '?chat=' + name + '&views=/' + node0 + '/agent/' + name;
+      nav('?chat=' + name + '&views=/' + node0 + '/agent/' + name);
     });
     const chatsEl = root.document ? root.document.createElement('span') : null;
     if (chatsEl) { chatsEl.className = 'sv-chats'; el.querySelector('.sv-bar').insertBefore(chatsEl, el.querySelector('.sv-qa')); }
@@ -112,7 +140,7 @@ function mountViewer(el, source, opts = {}) {
     if (!source.qa) return;
     const q = await source.qa();
     $('.sv-qa').innerHTML = q ? qaChipHTML(q) : '';
-    const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else root.location.search = '?views=/' + q.folder; });
+    const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else nav('?views=/' + q.folder); });
   }
   async function draw(ev) {
     state.drawn = true;
@@ -131,7 +159,7 @@ function mountViewer(el, source, opts = {}) {
   source.follow(async msg => {
     if (msg.shown) {
       // presented off this page's folder: the page moves there, so the person sees what the agent showed
-      if (!inside(msg.shown.path)) { const folder = folderOf(msg.shown.path); if (opts.flip) return opts.flip(folder); if (root.location) { root.location.search = '?views=/' + folder; return; } }
+      if (!inside(msg.shown.path)) { const folder = folderOf(msg.shown.path); if (opts.flip) return opts.flip(folder); if (root.location) { nav('?views=/' + folder); return; } }
       const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev);
     }
     if (!msg.touched || !msg.touched.length) return;
@@ -146,7 +174,7 @@ function mountViewer(el, source, opts = {}) {
   // moves to that folder; the link itself works without script
   async function go(path, folder) {
     if (source.cursor) await source.cursor(path).catch(() => {});
-    if (opts.flip) opts.flip(folder); else root.location.search = '?at=/' + local(path) + chatQ();
+    if (opts.flip) opts.flip(folder); else nav('?at=/' + local(path) + chatQ());
   }
   el.addEventListener('click', e => {
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
@@ -163,7 +191,7 @@ const moved = (source, touched) => { const out = new Set(); for (const t of touc
 const qaFolderOf = p => { const m = /^([^/]+\/agent\/[^/]+\/qa)(\/|$)/.exec(p); return m ? m[1] : null; };
 // housekeeping: a seen mark, the hands' folder, the person's cursor, the clock, the journal
 const HOUSEKEEPING = /\/agent\/[^/]+\/seen$|\/agent\/hands(\/|$)|\/agent\/person(\/|$)|\/agent\/launcher(\/|$)|\/clock$|\/agent\/journal(\/|$)/;
-const HANDS = /^(clock|source|web|refresh|crawl)(_|$)/;
+const HANDS = /^(clock|source|web|links)(_|$)/;
 // a line the page never shows: a hand's, one that only moved housekeeping records, one that only deleted things,
 // or one whose written cells all read unknown; what remains is the person's and the agents' work on the data
 const quietLine = ev => {
@@ -221,6 +249,8 @@ const folderOf = p => { const i = String(p).lastIndexOf('/'); return i > 0 ? p.s
 // a path the person can click: the page moves to `folder`, and the click writes the cursor at `path`
 // a path the person can click: the page opens that record (its slots, what is beneath it, what points at it), keeping the
 // chat the person came from; the click also writes the person's cursor so an agent sees where they went
+let navigateTo = null;   // set by start(): in-page navigation; before that, or in a test, the location itself
+const nav = search => { if (navigateTo) navigateTo(search); else root.location.search = search; };
 const chatQ = () => { try { const c = new URLSearchParams(root.location.search).get('chat'); return c ? '&chat=' + encodeURIComponent(c) : ''; } catch (e) { return ''; } };
 const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?at=/${esc(local(path))}${chatQ()}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
 const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
@@ -503,18 +533,29 @@ function mcpSource(opts = {}) {
   }
   const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
   // a message to an agent: the next turn record under its folder, signed person; the agent hand answers on the stream
-  async function say(agent, text) {
-    const node = local(views).split('/')[0] || '0x11', folder = '/' + node + '/agent/' + agent + '/turns';
+  // a talk at a record: the conversation lives beneath the thing it is about, at <record>/talk/turns
+  async function sayAt(at, text) {
+    const folder = world(at) + '/talk/turns';
     const page = await rpc('read', { path: folder, care: 'y', limit: 500 });
     const n = Math.max(0, ...(page.children || []).map(c => { const m = /\/t(\d+)$/.exec(c.path); return m ? Number(m[1]) : 0; }));
     return rpc('write', { who: 'person', records: [{ path: folder + '/t' + (n + 1), slots: { said: text, who: 'person' } }] });
+  }
+  async function say(agent, text, at) {
+    const node = local(views).split('/')[0] || '0x11', folder = '/' + node + '/agent/' + agent + '/turns';
+    const page = await rpc('read', { path: folder, care: 'y', limit: 500 });
+    const n = Math.max(0, ...(page.children || []).map(c => { const m = /\/t(\d+)$/.exec(c.path); return m ? Number(m[1]) : 0; }));
+    const records = [{ path: folder + '/t' + (n + 1), slots: { said: text, who: 'person' } }];
+    // said at a record: the chat remembers where the person is, and the agent works on that record
+    if (at) records.push({ path: '/' + node + '/agent/' + agent, action: 'poke', slots: { at: { type: 'reference', path: world(at), care: 'x', case: 0 } } });
+    return rpc('write', { who: 'person', records });
   }
   // a new chat: the agent's folder culled and revived empty in one write; its turns, lens and documents are gone
   // the chats: every folder under /agent that holds turns; a new chat is the next such folder, the old ones stay
   async function chats() {
     const node = local(views).split('/')[0] || '0x11';
     const page = await rpc('read', { path: '/' + node + '/agent', care: 'y', limit: 200 });
-    return (page.children || []).filter(c => c.exists !== false && /\/agent\/[a-z]\d*$/.test(c.path)).map(c => c.path.split('/').pop()).sort((x, y) => x.length - y.length || (x < y ? -1 : 1));
+    const weave = (page.children || []).some(c => c.exists && /\/agent\/weave$/.test(c.path)) ? ['weave'] : [];
+    return (page.children || []).filter(c => c.exists !== false && /\/agent\/[a-z]\d*$/.test(c.path)).map(c => c.path.split('/').pop()).sort((x, y) => x.length - y.length || (x < y ? -1 : 1)).concat(weave);
   }
   async function newChat() {
     const node = local(views).split('/')[0] || '0x11', have = await chats();
@@ -580,12 +621,26 @@ function mcpSource(opts = {}) {
     }
     return out;
   }
+  const linksBase = () => opts.links || ('http://' + ((root.location && root.location.hostname) || '127.0.0.1') + ':8312');
+  async function index(route) {
+    if (!root.fetch) return null;
+    try { const r = await (await root.fetch(linksBase() + route)).json(); return r && r.ready ? r : null; } catch (e) { return null; }
+  }
+  // pointing here, grouped by the slot the reference came in on ("mentioned" when the text only named it)
+  async function by(path) {
+    const r = await index('/by?to=' + encodeURIComponent(world(path)));
+    if (!r) return null;
+    const out = {};
+    for (const [slot, ms] of Object.entries(r.by || {})) out[slot] = ms.map(m => ({ path: local(m.path), slot, cell: !!m.cell, hole: !!m.hole }));
+    return out;
+  }
+  async function tree(path, depth) { const r = await index('/tree?to=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? { in: r.in || [], contents: r.contents || [] } : null; }
+  async function candidates(path) { const r = await index('/candidates' + (path ? '?in=' + encodeURIComponent(world(path)) : '')); return r ? (r.candidates || []) : []; }
   async function backlinks(path) {
     // the links hand keeps every reference in memory and answers in milliseconds; the kernel walk below is the fallback
     if (root.fetch && root.location) {
       try {
-        const base = opts.links || ('http://' + (root.location.hostname || '127.0.0.1') + ':8312');
-        const r = await (await root.fetch(base + '/links?to=' + encodeURIComponent(world(path)))).json();
+        const r = await (await root.fetch(linksBase() + '/links?to=' + encodeURIComponent(world(path)))).json();
         if (r && r.ready) return { matches: (r.matches || []).map(m => ({ path: local(m.path), slot: m.slot, cell: !!m.cell, hole: !!m.hole })), via: 'links' };
       } catch (e) { /* the links hand is not running */ }
     }
@@ -613,48 +668,86 @@ function mcpSource(opts = {}) {
     }
     return null;
   }
-  // follow: the stream when it answers, the history poll (700 ms, with x) when it does not; one handler, same events
-  function follow(handler) {
-    let last = 0, queue = Promise.resolve(), polling = null, stream = null;
-    const wanted = e => who === 'all' || (who ? e.who === who : e.who !== 'system');
-    const deliver = lines => { for (const l of lines) queue = queue.then(() => handler(l)).catch(() => {}); return queue; };
-    const seen = e => { if (!(e.epoch > last)) return false; last = e.epoch; return true; };
-    const line = e => e.shown ? { shown: { ...e.shown, path: local(e.shown.path) } } : (latest = e.with || null, eventOf(e));
-    async function poll() {
-      const page = await rpc('history', { after: last, limit: 40, with: 'x', ...(who ? { who } : {}) });
-      const fresh = (page.events || []).filter(e => e.shown ? true : seen(e) && wanted(e));
-      if (page.next > last) last = page.next;
-      return deliver(fresh.map(line));
+  // follow: one stream per source, shared by every handler; the backlog (the lastEpoch page of history, with x) runs once
+  // and only for a handler that asks for it (the viewer); a record page never needs it. stop() closes everything.
+  const handlers = new Set();
+  let lastEpoch = 0, queue = Promise.resolve(), polling = null, stream = null, stopped = false, opening = null, backlogged = null;
+  const wanted = e => who === 'all' || (who ? e.who === who : e.who !== 'system');
+  const deliver = lines => { for (const l of lines) queue = queue.then(() => { for (const h of [...handlers]) { try { h(l); } catch (e) { /* one handler's fault is not another's */ } } }).catch(() => {}); return queue; };
+  const seen = e => { if (!(e.epoch > lastEpoch)) return false; lastEpoch = e.epoch; return true; };
+  const line = e => e.shown ? { shown: { ...e.shown, path: local(e.shown.path) } } : (latest = e.with || null, eventOf(e));
+  async function poll() {
+    if (lastEpoch === 0 && !backlogged) {           // no backlog wanted: start from the latest event, not from epoch 0
+      const tip = await rpc('history', { before: 0, limit: 1 });
+      lastEpoch = Math.max(lastEpoch, Number(tip.next || 0), ...((tip.events || []).map(e => Number(e.epoch || 0))));
+      return;
     }
-    async function backlog() {   // what happened before the page opened: the last page of history, oldest first, drawn once
-      const page = await rpc('history', { before: 0, limit: 40, with: 'x', ...(who ? { who } : {}) });   // with x: the quiet rule reads what each event wrote
-      const events = (page.events || []).filter(e => !e.shown && wanted(e)).reverse();
-      for (const e of events) seen(e);
-      return deliver(events.map((e, i) => ({ ...eventOf(e), quiet: i < events.length - 1 })));
-    }
-    const startPoll = () => { if (!polling) polling = every(() => poll().catch(() => {}), 700); };
-    const stopPoll = () => { if (polling) { clear(polling); polling = null; } };
-    function open() {
-      if (!ES) return startPoll();
-      let opened = false;
-      try { stream = new ES(base + '/mcp/stream'); } catch (e) { return startPoll(); }
-      stream.onopen = () => { opened = true; stopPoll(); poll().catch(() => {}); };
-      stream.onmessage = m => { let e; try { e = JSON.parse(m.data); } catch (err) { return; } if (e.shown || (seen(e) && wanted(e))) deliver([line(e)]); };
-      stream.onerror = () => { stream.close(); stream = null; startPoll(); later(open, opened ? 2000 : 30000); };
-    }
-    backlog().catch(() => {}).then(open);
-    return { stop: () => { stopPoll(); if (stream) stream.close(); } };
+    const page = await rpc('history', { after: lastEpoch, limit: 40, with: 'x', ...(who ? { who } : {}) });
+    const fresh = (page.events || []).filter(e => e.shown ? true : seen(e) && wanted(e));
+    if (page.next > lastEpoch) lastEpoch = page.next;
+    return deliver(fresh.map(line));
   }
-  return { read, answer, graph, follow, qa, rpc, cursor, say, chats, newChat, referencedBy, backlinks };
+  async function backlog() {   // what happened before the page opened: the lastEpoch page of history, oldest first, drawn once
+    const page = await rpc('history', { before: 0, limit: 40, with: 'x', ...(who ? { who } : {}) });   // with x: the quiet rule reads what each event wrote
+    const events = (page.events || []).filter(e => !e.shown && wanted(e)).reverse();
+    for (const e of events) seen(e);
+    return deliver(events.map((e, i) => ({ ...eventOf(e), quiet: i < events.length - 1 })));
+  }
+  const startPoll = () => { if (!polling && !stopped) polling = every(() => poll().catch(() => {}), 700); };
+  const stopPoll = () => { if (polling) { clear(polling); polling = null; } };
+  function open() {
+    if (stopped) return;
+    if (!ES) return startPoll();
+    let opened = false;
+    try { stream = new ES(base + '/mcp/stream'); } catch (e) { return startPoll(); }
+    stream.onopen = () => { opened = true; stopPoll(); poll().catch(() => {}); };
+    stream.onmessage = m => { let e; try { e = JSON.parse(m.data); } catch (err) { return; } if (e.shown || (seen(e) && wanted(e))) deliver([line(e)]); };
+    stream.onerror = () => { if (stream) stream.close(); stream = null; if (stopped) return; startPoll(); later(open, opened ? 2000 : 30000); };
+  }
+  function follow(handler, o = {}) {
+    handlers.add(handler);
+    if (o.backlog !== false && !backlogged) backlogged = backlog().catch(() => {});
+    if (!opening) opening = (backlogged || Promise.resolve()).then(open);
+    return { stop: () => handlers.delete(handler) };
+  }
+  function stop() { stopped = true; handlers.clear(); stopPoll(); if (stream) { stream.close(); stream = null; } }
+  // a candidate becomes a starter place: one record under /user/<kind>/<slug> with its name, pointing back at where it was named
+  async function accept(name, kind, from) {
+    const node = local(views).split('/')[0] || '0x11';
+    const slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const path = '/' + node + '/user/' + (kind || 'things') + '/' + (/^[a-z]/.test(slug) ? slug : 'x_' + slug);
+    const slots = { name: String(name) };
+    if (from) slots.named_in = { type: 'reference', path: world(from), care: 'x', case: 0 };
+    await rpc('write', { records: [{ path, slots }], who: who || 'person' });
+    return path;
+  }
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, tree };
 }
 
 // the record page: one record, its slots (each reference a link), what is beneath it, and what points at it; every
 // thing is a hop from its neighbours, so anything is a few clicks away. Live: a write under it redraws it.
 const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
+const talkKey = at => local(at).split('/').slice(1).join('/').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 function mountRecord(el, source, opts = {}) {
   const at = local(opts.at), node = at.split('/')[0];
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${source.sayAt ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
   const main = el.querySelector('.sv-recview');
+  // the talk at this record: its turns live at <record>/talk/turns, its lens at <record>/talk/context
+  if (source.sayAt) {
+    const agent = '/' + at + '/talk', talk = el.querySelector('.sv-talk-here'), form = el.querySelector('.sv-chat');
+    async function drawTalk() {
+      const page = await source.read(agent + '/turns', 'y').catch(() => null);
+      const turns = ((page && page.kids) || []).map(k => ({ n: Number((/\/t(\d+)$/.exec(k.path) || [])[1] || 0), who: k.slots.who, said: k.slots.said })).filter(t => t.n).sort((a, b) => a.n - b.n).slice(-4);
+      talk.innerHTML = turns.map(t => `<div class="sv-msg ${t.who === 'person' ? 'me' : 'them'}"><span class="w">${esc(t.who === 'talk' ? 'agent' : t.who)}</span><div class="s">${esc(t.said || '')}</div></div>`).join('');
+    }
+    form.addEventListener('submit', async e => {
+      e.preventDefault(); const input = form.querySelector('input'); const text = input.value.trim(); if (!text) return;
+      input.value = ''; await source.sayAt(at, text).catch(() => {}); drawTalk();
+    });
+    drawTalk();
+    el._live = liveFeed(el.querySelector('.sv-here .sv-writing'), talkKey(at), form, opts.stream);
+    if (source.follow) source.follow(msg => { if (msg.shown) return; if ((msg.touched || []).some(t => ('/' + local(t)).startsWith(agent + '/turns'))) drawTalk(); }, { backlog: false });
+  }
   let timer = null;
   let drawn = 0;
   async function draw() {
@@ -673,22 +766,45 @@ function mountRecord(el, source, opts = {}) {
     }
     if (mine !== drawn) return;
     const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
-    const rows = kids.map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
-    // drawn at once; what points here is a walk over the world, filled in when it comes back
-    main.innerHTML = card + (rows ? `<div class="sv-sec"><div class="k">beneath · ${kids.length}</div>${rows}</div>` : '') + `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>`;
-    if (!source.backlinks) { main.querySelector('.sv-back-sec').remove(); return; }
-    const rb = await source.backlinks(at).catch(() => ({ matches: [] }));
+    // the hierarchy is computed from the in slots: what this is in (upward) and what is in it (nested)
+    const t = source.tree ? await source.tree(at, 3).catch(() => null) : null;
     if (mine !== drawn) return;
-    const back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join('');
+    const chainHTML = t && t.in.length ? `<div class="sv-in">in ${t.in.map(c => goHTML(local(c.path), local(c.path), c.name, 'n')).join(' <span class="sep">‹</span> ')}</div>` : '';
+    const treeHTML = nodes => `<ul class="sv-tree">${nodes.map(n => `<li>${goHTML(local(n.path), local(n.path), n.name, 'n')}<span class="k">${esc(n.kind || '')}</span>${n.children && n.children.length ? treeHTML(n.children) : ''}</li>`).join('')}</ul>`;
+    const contentsHTML = t ? `<div class="sv-sec"><div class="k">contents${t.contents.length ? ' · ' + t.contents.length : ''}</div>${t.contents.length ? treeHTML(t.contents) : '<div class="sv-empty">nothing is in it yet</div>'}</div>` : '';
+    // physical children: a thing's own parts (talk, mentions, regions, views) sit beneath it; things of their own are in the tree above
+    const inTree = new Set(); (function mark(ns) { for (const n of ns || []) { inTree.add(local(n.path)); mark(n.children); } })(t ? t.contents : []);
+    const parts = kids.filter(k => !inTree.has(local(k.path)));
+    const rows = parts.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
+    // drawn at once; what points here comes from the index, grouped by slot; a walk over the world is the fallback
+    main.innerHTML = chainHTML + card + contentsHTML + `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>` + (rows ? `<div class="sv-sec sv-parts"><div class="k">beneath</div>${rows}</div>` : '') + `<div class="sv-sec sv-cand-sec"></div>`;
+    const hop = m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}${m.hole ? '<span class="h">waiting</span>' : ''}</div>`;
+    let groups = source.by ? await source.by(at).catch(() => null) : null;
+    if (mine !== drawn) return;
+    if (!groups && source.backlinks) {
+      const rb = await source.backlinks(at).catch(() => ({ matches: [] }));
+      if (mine !== drawn) return;
+      groups = {}; for (const m of rb.matches) (groups[m.slot] = groups[m.slot] || []).push(m);
+    }
     const sec = main.querySelector('.sv-back-sec');
-    if (sec) sec.innerHTML = `<div class="k">pointing here${rb.matches.length ? ' · ' + rb.matches.length : ''}</div>${back || '<div class="sv-empty">nothing points here yet</div>'}`;
+    if (sec) {
+      const slots = Object.keys(groups || {}).filter(k => !['in', 'within', 'part_of', 'parent'].includes(k)).sort((a, b) => (a === 'mentioned') - (b === 'mentioned') || a.localeCompare(b));
+      const total = slots.reduce((n, k) => n + groups[k].length, 0);
+      sec.innerHTML = `<div class="k">pointing here${total ? ' · ' + total : ''}</div>` + (slots.map(k => `<div class="sv-by"><div class="sv-by-k">${esc(k)} <span class="n">${groups[k].length}</span></div>${groups[k].map(hop).join('')}</div>`).join('') || '<div class="sv-empty">nothing points here yet</div>');
+    }
+    if (source.candidates) {
+      const cands = await source.candidates(at).catch(() => []);
+      if (mine !== drawn) return;
+      const cs = main.querySelector('.sv-cand-sec');
+      if (cs && cands.length) cs.innerHTML = `<div class="k">named here, waiting for the agent to place · ${cands.length}</div><div class="sv-cands">${cands.map(c => esc(c.name)).join(' · ')}</div>`;
+    }
   }
   draw();
-  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });
+  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } }, { backlog: false });
   el.addEventListener('click', e => {
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
     e.preventDefault(); const href = a.getAttribute('href');
-    (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { root.location.search = href.slice(1); });
+    (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { nav(href.slice(1)); });
   });
   return { draw };
 }
@@ -721,47 +837,49 @@ function queueHTML(rows) {
   const sec = (k, rs) => `<div class="sv-sec"><div class="k">${k} · ${rs.length}</div>${rs.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
   return sec('working', working) + sec('waiting', waiting) + sec('finished', done);
 }
-async function holeRows(source, node) {
-  const idx = await source.read('/' + node + '/agent/crawl/holes', 'y').catch(() => null);
-  return (idx && idx.kids || []).map(k => ({ path: k.path, record: String(k.slots.record || '').replace(/^\/h\/[xyz]\/\d+\/\d+\//, ''), slot: k.slots.slot || k.name,
-    kind: k.slots.kind || 'unknown', next: Number(k.slots.next || 0), due: Number(k.slots.due || 0), tries: Number(k.slots.tries || 0), asked: k.slots.asked || '', reason: k.slots.reason || '' }));
-}
-function whenDue(h, now) {
-  if (h.kind === 'until' && h.due) return 'until ' + String(h.due).replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
-  const s = h.next - now;
-  if (s <= 0) return 'due now';
-  if (s < 3600) return 'in ' + Math.round(s / 60) + ' min';
-  if (s < 86400 * 2) return 'in ' + Math.round(s / 3600) + ' h';
-  return 'in ' + Math.round(s / 86400) + ' days';
-}
-function holesHTML(holes, now = Date.now() / 1000) {
-  const at = h => (h.kind === 'until' && h.due) ? Date.UTC(Math.floor(h.due / 10000), Math.floor(h.due / 100) % 100 - 1, h.due % 100) / 1000 : (h.next || 0);
-  const rows = [...holes].sort((a, b) => at(a) - at(b));
-  const row = h => `<div class="sv-qrow hole ${esc(h.kind)}"><span class="pr">${esc(h.kind)}</span><span class="ow">${esc(h.tries ? h.tries + '×' : '')}</span>${goHTML(h.record, h.record, (h.record.split('/').slice(-1)[0] || '').replace(/_/g, ' ') + ' · ' + h.slot, 'q')}<span class="st">${esc(whenDue(h, now))}</span><span class="n">${esc(h.asked)}${h.reason ? ' · ' + esc(h.reason) : ''}</span></div>`;
-  return `<div class="sv-sec"><div class="k">holes · ${rows.length}</div>${rows.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
-}
 function mountQueue(el, source, opts = {}) {
   const node = opts.node || '0x11';
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><b>web queue</b></div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-queue"></div>`;
   const main = el.querySelector('.sv-queue');
   let busy = false;
-  async function draw() { if (busy) return; busy = true; try { const [asks, holes] = await Promise.all([queueRows(source, node), holeRows(source, node)]); main.innerHTML = queueHTML(asks) + holesHTML(holes); } catch (e) { /* the next tick tries again */ } busy = false; }
+  async function draw() { if (busy) return; busy = true; try { main.innerHTML = queueHTML(await queueRows(source, node)); } catch (e) { /* the next tick tries again */ } busy = false; }
   draw();
-  (opts.setInterval || root.setInterval)(draw, 3000);
+  el._timer = (opts.setInterval || root.setInterval)(draw, 3000);
   return { draw };
 }
 
 // the page: /live?views=<folder>&who=<writer>, or ?at=<record> for one record and its neighbours, or ?queue=1
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
-  const q = new URLSearchParams(doc.location ? doc.location.search : '');
-  const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
-  if (at) return mountRecord(el, mcpSource({ views: at, who }), { at, chat });
-  if (q.get('queue')) return mountQueue(el, mcpSource({ views: '0x11', who }), { chat, node: '0x11' });
-  return mountViewer(el, mcpSource({ views, who }), { crumb: views, views, chat });
+  let current = null;
+  function mount() {
+    // the previous page's stream, timers and live reply feed end; the element is reused; assets are never refetched
+    if (current) { try { current.stop(); } catch (e) { /* already gone */ } current = null; }
+    if (el._live) { try { el._live.close(); } catch (e) { /* closed */ } el._live = null; }
+    if (el._timer) { clearInterval(el._timer); el._timer = null; }
+    el.className = ''; el.innerHTML = '';
+    const q = new URLSearchParams(doc.location ? doc.location.search : '');
+    const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
+    let source, mounted;
+    if (at) { source = mcpSource({ views: at, who }); mounted = mountRecord(el, source, { at, chat }); }
+    else if (q.get('queue')) { source = mcpSource({ views: '0x11', who }); mounted = mountQueue(el, source, { chat, node: '0x11' }); }
+    else { source = mcpSource({ views, who }); mounted = mountViewer(el, source, { crumb: views, views, chat }); }
+    current = { stop: () => { if (source.stop) source.stop(); } };
+    if (root.scrollTo) root.scrollTo(0, 0);
+    return mounted;
+  }
+  if (root.history && root.addEventListener) {
+    navigateTo = search => {
+      const q = String(search || '');
+      root.history.pushState(null, '', (root.location.pathname || '/live') + (q.startsWith('?') ? q : '?' + q));   // the query only; the path stays
+      mount();
+    };
+    root.addEventListener('popstate', () => mount());
+  }
+  return mount();
 }
 
-const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, holesHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
