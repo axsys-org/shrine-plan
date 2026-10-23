@@ -492,3 +492,14 @@ test('backlinks walks the person\'s things and the agents\' folders, pages throu
   assert.deepEqual(r.matches.map(m => m.path), ['0x11/user/orgs/x/repos/r1', '0x11/user/views/v2', '0x11/agent/a/context'].filter(p => !p.startsWith('0x11/user/orgs/x/')).concat([]).length ? ['0x11/user/views/v2', '0x11/agent/a/context'] : []);
   assert.equal(calls.filter(c => c.path === '/0x11/user').length, 2, 'the second page was read');
 });
+test('queueHTML puts working asks first, then waiting by priority (chat before crawl), then finished', () => {
+  const rows = [
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/x', asked: 'about x', priority: 2, state: 'queued', step: '', pages: 0, queries: 0, found: 0, updated: 1, writes: 0 },
+    { owner: 'c1', path: '0x11/agent/c1/asks/y', asked: 'about y', priority: 0, state: 'queued', step: '', pages: 0, queries: 0, found: 0, updated: 2, writes: 0 },
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/z', asked: 'about z', priority: 1, state: 'reading', step: 'https://www.example.com/p', pages: 2, queries: 1, found: 0, updated: 3, writes: 0 },
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/w', asked: 'about w', priority: 2, state: 'integrated', step: '', pages: 3, queries: 1, found: 4, updated: 4, writes: 6 } ];
+  const html = live.queueHTML(rows);
+  const order = ['about z', 'about y', 'about x', 'about w'].map(t => html.indexOf(t));
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'working, then chat before crawl, then finished');
+  assert.match(html, /reading example\.com/); assert.match(html, /4 rows · 6 written/);
+});

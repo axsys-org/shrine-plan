@@ -10,7 +10,7 @@ function mountViewer(el, source, opts = {}) {
   el.classList.add('sv');
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>${opts.chat ? `<form class="sv-chat"><input type="text" autocomplete="off" placeholder="say something to ${esc(opts.chat)}"><button type="submit">send</button><button type="button" class="new" title="start a new chat with a blank context; this one stays">new chat</button></form>` : ''}`;
   if (opts.chat) {
-    el.querySelector('.sv-main').innerHTML = `<div class="sv-talk"></div><div class="sv-ask"></div><div class="sv-ctx"><div class="sv-ctx-change"></div><div class="sv-ctx-now"></div></div>`;
+    el.querySelector('.sv-main').innerHTML = `<div class="sv-talk"></div><div class="sv-live"><div class="sv-writing"></div><div class="sv-asks"></div></div><div class="sv-ask"></div><div class="sv-ctx"><div class="sv-ctx-change"></div><div class="sv-ctx-now"></div></div>`;
     el.querySelector('.sv-ask').append(el.querySelector('.sv-chat'));   // the box sits under the conversation, above the context
     const node = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11', agent = '/' + node + '/agent/' + opts.chat;
     let drawing = null;
@@ -20,6 +20,14 @@ function mountViewer(el, source, opts = {}) {
         const turns = await source.read(agent + '/turns', 'y');
         const ts = (turns && turns.kids || []).map(k => ({ n: Number((/t(\d+)$/.exec(k.path) || [0, 0])[1]), who: k.slots.who || '', said: k.slots.said || '' })).filter(t => t.n).sort((a, b) => a.n - b.n);
         el.querySelector('.sv-talk').innerHTML = ts.map(t => `<div class="sv-msg ${t.who === 'person' ? 'me' : 'them'}"><span class="w">${esc(t.who)}</span><div class="s">${esc(t.said)}</div></div>`).join('') || '<div class="sv-msg them"><div class="s">nothing said yet</div></div>';
+        const asks = await source.read(agent + '/asks', 'z').catch(() => null);
+        const open = (asks && asks.kids || []).map(a => {
+          const kid = n => (a.kids || []).find(k => k.name === n);
+          const st = (kid('status') || {}).slots || {}, found = kid('found');
+          return { name: a.name, asked: a.slots.asked || a.name, state: st.state || 'queued', step: st.step || '', pages: st.pages, found: found ? (found.kids || []).length : 0 };
+        }).filter(a => !a.found && !['done', 'empty', 'failed'].includes(a.state));
+        const host = u => { try { return new URL(u).hostname.replace('www.', ''); } catch (e) { return String(u).slice(0, 60); } };
+        el.querySelector('.sv-asks').innerHTML = open.map(a => `<div class="sv-askline"><span class="dot"></span><span class="w">searching the web</span><span class="q">${esc(a.asked)}</span><span class="st">${esc(a.state === 'reading' ? 'reading ' + host(a.step) : a.state === 'searching' ? 'searching' : a.state)}${a.pages ? ' · ' + esc(a.pages) + ' pages' : ''}</span></div>`).join('') + (open.length ? `<a class="sv-queue-link" href="?queue=1&chat=${esc(opts.chat)}">the web queue</a>` : '');
         const rec = await source.read(agent + '/context', 'x');
         if (!rec || rec.record === null || !rec.record || !Object.keys(rec.record).length) { el.querySelector('.sv-ctx-now').innerHTML = '<div class="sv-ctx-h">context</div><div class="sv-empty">no lens yet</div>'; el.querySelector('.sv-ctx-change').innerHTML = ''; drawing = null; return; }
         const now = await source.read('/x' + agent + '/context', 'z');
@@ -36,6 +44,18 @@ function mountViewer(el, source, opts = {}) {
     }
     source.follow(msg => { if (msg.shown) return; if ((msg.touched || []).some(t => ('/' + t).startsWith(agent))) drawChat(); });
     drawChat();
+    if (root.EventSource && root.location) {
+      const base = opts.stream || ('http://' + (root.location.hostname || '127.0.0.1') + ':8311');
+      try {
+        const es = new root.EventSource(base + '/stream/' + opts.chat);
+        es.onmessage = m => {
+          let st; try { st = JSON.parse(m.data); } catch (e) { return; }
+          const w = el.querySelector('.sv-writing');
+          if (!st.busy) { w.innerHTML = ''; return; }
+          w.innerHTML = `<div class="sv-msg them live"><span class="w">${esc(opts.chat)} ${st.said ? 'is writing' : esc(st.phase || 'is thinking')}</span><div class="s">${st.said ? esc(st.said) : '<span class="dots"><i></i><i></i><i></i></span>'}</div></div>`;
+        };
+      } catch (e) { /* no live stream: the turn still lands as a record */ }
+    }
     const form = el.querySelector('.sv-chat'), input = form.querySelector('input');
     // new chat: a fresh agent folder, and the page moves to it; the old chat keeps its address
     const node0 = local(opts.views !== undefined ? opts.views : (opts.crumb || '')).split('/')[0] || '0x11';
@@ -46,7 +66,7 @@ function mountViewer(el, source, opts = {}) {
     });
     const chatsEl = root.document ? root.document.createElement('span') : null;
     if (chatsEl) { chatsEl.className = 'sv-chats'; el.querySelector('.sv-bar').insertBefore(chatsEl, el.querySelector('.sv-qa')); }
-    if (source.chats && chatsEl) source.chats().then(list => { chatsEl.innerHTML = 'chats: ' + list.map(c => c === opts.chat ? `<b>${esc(c)}</b>` : `<a href="?chat=${esc(c)}&views=/${node0}/agent/${esc(c)}">${esc(c)}</a>`).join(' · '); }).catch(() => {});
+    if (source.chats && chatsEl) source.chats().then(list => { chatsEl.innerHTML = 'chats: ' + list.map(c => c === opts.chat ? `<b>${esc(c)}</b>` : `<a href="?chat=${esc(c)}&views=/${node0}/agent/${esc(c)}">${esc(c)}</a>`).join(' · ') + ` · <a href="?queue=1&chat=${esc(opts.chat)}">web queue</a>`; }).catch(() => {});
     form.addEventListener('submit', async e => {
       e.preventDefault(); const text = input.value.trim(); if (!text || !source.say) return;
       input.disabled = true;
@@ -143,7 +163,7 @@ const moved = (source, touched) => { const out = new Set(); for (const t of touc
 const qaFolderOf = p => { const m = /^([^/]+\/agent\/[^/]+\/qa)(\/|$)/.exec(p); return m ? m[1] : null; };
 // housekeeping: a seen mark, the hands' folder, the person's cursor, the clock, the journal
 const HOUSEKEEPING = /\/agent\/[^/]+\/seen$|\/agent\/hands(\/|$)|\/agent\/person(\/|$)|\/agent\/launcher(\/|$)|\/clock$|\/agent\/journal(\/|$)/;
-const HANDS = /^(clock|source)(_|$)/;
+const HANDS = /^(clock|source|web|refresh|crawl)(_|$)/;
 // a line the page never shows: a hand's, one that only moved housekeeping records, one that only deleted things,
 // or one whose written cells all read unknown; what remains is the person's and the agents' work on the data
 const quietLine = ev => {
@@ -647,16 +667,56 @@ function mountRecord(el, source, opts = {}) {
   return { draw };
 }
 
-// the page: /live?views=<folder>&who=<writer>, or ?at=<record> for one record and its neighbours
+// the web queue: every ask in the world, what the web hand is doing for each, highest priority first
+async function queueRows(source, node) {
+  const agents = await source.read('/' + node + '/agent', 'y');
+  const owners = (agents && agents.kids || []).map(k => k.name).filter(n => /^[a-z]\d*$/.test(n) || n === 'crawl');
+  const rows = [];
+  for (const o of owners) {
+    const asks = await source.read('/' + node + '/agent/' + o + '/asks', 'z').catch(() => null);
+    for (const a of (asks && asks.kids || [])) {
+      const kid = n => (a.kids || []).find(k => k.name === n);
+      const st = (kid('status') || {}).slots || {}, found = kid('found'), integ = kid('integrated');
+      const nfound = found ? (found.kids || []).length : 0;
+      let state = st.state || (nfound ? 'done' : kid('taken') ? 'empty' : 'queued');   // an ask filled before status existed
+      if (integ) state = integ.slots.state === 'empty' ? 'empty' : 'integrated';
+      rows.push({ owner: o, path: a.path, asked: a.slots.asked || a.name, about: a.slots.about || '', priority: o === 'crawl' ? Number(a.slots.priority || 2) : 0,
+        state, step: st.step || '', pages: Number(st.pages || 0), queries: Number(st.queries || 0), found: nfound, updated: Number(st.updated || 0), writes: integ ? Number(integ.slots.writes || 0) : 0 });
+    }
+  }
+  return rows;
+}
+function queueHTML(rows) {
+  const working = rows.filter(r => r.state === 'searching' || r.state === 'reading').sort((a, b) => a.priority - b.priority);
+  const waiting = rows.filter(r => r.state === 'queued').sort((a, b) => a.priority - b.priority);
+  const done = rows.filter(r => ['done', 'integrated', 'empty', 'failed'].includes(r.state)).sort((a, b) => b.updated - a.updated).slice(0, 40);
+  const host = u => { try { return new URL(u).hostname.replace('www.', ''); } catch (e) { return String(u).slice(0, 60); } };
+  const row = r => `<div class="sv-qrow ${esc(r.state)}"><span class="pr">${r.priority === 0 ? 'chat' : 'p' + r.priority}</span><span class="ow">${esc(r.owner)}</span>${goHTML(r.path, r.path, r.asked, 'q')}<span class="st">${esc(r.state)}${r.state === 'reading' ? ' ' + esc(host(r.step)) : r.state === 'searching' ? ' “' + esc(String(r.step).slice(0, 60)) + '”' : ''}</span><span class="n">${r.queries ? r.queries + ' q · ' : ''}${r.pages ? r.pages + ' pages · ' : ''}${r.found} rows${r.writes ? ' · ' + r.writes + ' written' : ''}</span></div>`;
+  const sec = (k, rs) => `<div class="sv-sec"><div class="k">${k} · ${rs.length}</div>${rs.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
+  return sec('working', working) + sec('waiting', waiting) + sec('finished', done);
+}
+function mountQueue(el, source, opts = {}) {
+  const node = opts.node || '0x11';
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><b>web queue</b></div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-queue"></div>`;
+  const main = el.querySelector('.sv-queue');
+  let busy = false;
+  async function draw() { if (busy) return; busy = true; try { main.innerHTML = queueHTML(await queueRows(source, node)); } catch (e) { /* the next tick tries again */ } busy = false; }
+  draw();
+  (opts.setInterval || root.setInterval)(draw, 3000);
+  return { draw };
+}
+
+// the page: /live?views=<folder>&who=<writer>, or ?at=<record> for one record and its neighbours, or ?queue=1
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
   const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
   if (at) return mountRecord(el, mcpSource({ views: at, who }), { at, chat });
+  if (q.get('queue')) return mountQueue(el, mcpSource({ views: '0x11', who }), { chat, node: '0x11' });
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views, chat });
 }
 
-const GooLive = { mountViewer, mountRecord, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;

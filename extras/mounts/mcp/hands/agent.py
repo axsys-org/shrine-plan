@@ -18,6 +18,9 @@ the next context.
 """
 import importlib.util
 import json
+import queue
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import re
 import time
@@ -133,6 +136,114 @@ def render(node, depth=0, out=None, limit=4000):
     return out
 
 
+# ---- live: what each chat's agent is doing right now, pushed to the page over server-sent events
+LIVE = {}                       # chat -> {'said': partial text, 'phase': what it is doing}
+SUBS = {}                       # chat -> [queue]
+LIVE_LOCK = threading.Lock()
+
+
+def publish(chat, **state):
+    with LIVE_LOCK:
+        cur = LIVE.setdefault(chat, {})
+        cur.update(state)
+        data = json.dumps(cur)
+        for q in SUBS.get(chat, []):
+            q.put(data)
+
+
+class LiveHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        m = re.match(r'^/stream/([a-z0-9_]+)$', self.path)
+        if not m:
+            self.send_response(404); self.end_headers(); return
+        chat = m.group(1)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream'); self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*'); self.end_headers()
+        q = queue.Queue()
+        with LIVE_LOCK:
+            SUBS.setdefault(chat, []).append(q)
+            first = json.dumps(LIVE.get(chat, {}))
+        try:
+            self.wfile.write(f'data: {first}\n\n'.encode()); self.wfile.flush()
+            while True:
+                try:
+                    data = q.get(timeout=15)
+                    self.wfile.write(f'data: {data}\n\n'.encode())
+                except queue.Empty:
+                    self.wfile.write(b': keepalive\n\n')
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with LIVE_LOCK:
+                if q in SUBS.get(chat, []):
+                    SUBS[chat].remove(q)
+
+
+def serve_live(port):
+    server = ThreadingHTTPServer(('127.0.0.1', port), LiveHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def partial_said(text):
+    """The said value of a JSON reply still being written: from its opening quote to the last whole character."""
+    m = re.search(r'"said"\s*:\s*"', text)
+    if not m:
+        return None
+    out, i, raw = [], m.end(), text[m.end():]
+    j = 0
+    while j < len(raw):
+        c = raw[j]
+        if c == '\\':
+            if j + 1 >= len(raw):
+                break
+            j += 2; continue
+        if c == '"':
+            raw = raw[:j]; break
+        j += 1
+    try:
+        return json.loads('"' + raw.rstrip('\\') + '"')
+    except Exception:
+        return raw
+
+
+def call_model_stream(endpoint, model, messages, on_text, timeout=180):
+    """call_model with stream: on_text(text so far) as tokens arrive; returns the whole reply."""
+    key = os.environ.get('OPENROUTER_API_KEY') or os.environ.get('OPENAI_API_KEY')
+    headers = {'Content-Type': 'application/json', 'HTTP-Referer': 'https://shrine.local', 'X-Title': 'shrine agent hand'}
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    body = json.dumps({'model': model, 'messages': messages, 'temperature': 0.2, 'max_tokens': 12000, 'stop': ['<invoke', '<parameter'],
+                       'response_format': {'type': 'json_object'}, 'stream': True}).encode()
+    text = ''
+    with urllib.request.urlopen(urllib.request.Request(endpoint, body, headers), timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode('utf-8', 'replace').strip()
+            if not line.startswith('data:'):
+                continue
+            data = line[5:].strip()
+            if data == '[DONE]':
+                break
+            try:
+                delta = (json.loads(data).get('choices') or [{}])[0].get('delta', {}).get('content') or ''
+            except Exception:
+                continue
+            if delta:
+                text += delta
+                on_text(text)
+    raw_log = os.environ.get('AGENT_RAW_LOG')
+    if raw_log:
+        last_user = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), '')
+        with open(raw_log, 'a') as f:
+            f.write('\n===== ' + time.strftime('%H:%M:%S') + ' ' + model + ' (stream)\n--- asked: ' + last_user[-400:].replace('\n', ' ') + '\n--- replied:\n' + text + '\n')
+    return text
+
+
 def call_model(endpoint, model, messages, timeout=180):
     key = os.environ.get('OPENROUTER_API_KEY') or os.environ.get('OPENAI_API_KEY')
     headers = {'Content-Type': 'application/json', 'HTTP-Referer': 'https://shrine.local', 'X-Title': 'shrine agent hand'}
@@ -203,6 +314,11 @@ class AgentHand(Hand):
         self.endpoint = self.setting('endpoint') or DEFAULT_ENDPOINT
         self.folder = '/' + world.node + '/agent/' + self.name
         self.stdlib = None
+        port = int(self.setting('stream_port') or 8311)
+        try:
+            serve_live(port)
+        except OSError as e:
+            self.log(f'agent: live stream not served on {port}: {e}')
 
     def chats(self):
         """Every folder under /agent that is a chat: a single letter and digits, as the page names them."""
@@ -268,11 +384,25 @@ class AgentHand(Hand):
         user = f'YOUR NAME: {self.name}   YOUR FOLDER: {self.folder}   (your asks go under {self.folder}/asks, your views under {self.folder}/views, your lens is {self.folder}/context)\n\nYOUR CONTEXT (the world through your lens, now):\n{reading}\n\nTHE PERSON SAYS:\n{said}'
         messages = [{'role': 'system', 'content': BOOTSTRAP}, {'role': 'user', 'content': user}]
         reply = {}
+        chat = self.name
+        publish(chat, said='', phase='thinking', busy=True)
+        def on_text(t):
+            ps = partial_said(t)
+            if ps is not None:
+                publish(chat, said=ps, phase='writing')
         for round_ in range(MAX_LOOKUPS + 1):
-            text = call_model(self.endpoint, self.model, messages)
+            try:
+                text = call_model_stream(self.endpoint, self.model, messages, on_text)
+            except Exception as e:
+                self.log(f'{self.name}: stream failed ({str(e)[:80]}); asking without it')
+                text = call_model(self.endpoint, self.model, messages)
             if not parse_json(text):
                 self.log(f'{self.name}: no JSON in the reply; asking once more')
-                text = call_model(self.endpoint, self.model, messages + [{'role': 'assistant', 'content': text or '(empty)'}, {'role': 'user', 'content': 'That was not a JSON object. Reply with exactly one JSON object: {"said": ..., "writes": [...], "context": {...}} and nothing else.'}])
+                nudge = messages + [{'role': 'assistant', 'content': text.strip() or '(empty)'}, {'role': 'user', 'content': 'That was not a JSON object. There are no tools: reply with exactly one JSON object, starting with {, holding said, writes and context, and nothing else.'}]
+                try:
+                    text = call_model_stream(self.endpoint, self.model, nudge, on_text)
+                except Exception:
+                    text = call_model(self.endpoint, self.model, nudge)
             try:
                 reply = parse_json(text)
             except Exception as e:
@@ -282,6 +412,7 @@ class AgentHand(Hand):
             reads = reply.get('reads') or []
             if not reads or round_ == MAX_LOOKUPS:
                 break
+            publish(chat, said='', phase='looking at ' + ', '.join((p.get('find') if isinstance(p, dict) else str(p).split('/')[-1]) or '' for p in reads[:4]))
             looked = []
             for p in reads[:6]:
                 try:
@@ -299,7 +430,7 @@ class AgentHand(Hand):
                 except Exception as e:
                     looked.append(f'{p}  (error: {str(e)[:120]})')
             messages.append({'role': 'assistant', 'content': text.lstrip('{') if False else text})
-            messages.append({'role': 'user', 'content': 'LOOKUPS (not kept; put what you want to keep seeing in your next context):\n' + '\n\n'.join(looked) + '\n\nNow reply with your JSON (said, writes, context).'})
+            messages.append({'role': 'user', 'content': 'LOOKUPS (not kept; put what you want to keep seeing in your next context):\n' + '\n\n'.join(looked) + '\n\nThere are no tools to call. Now reply with exactly one JSON object, starting with {, holding said, writes and context.'})
         # the world: what it decided to write, signed by its name
         writes = [w for w in (reply.get('writes') or []) if isinstance(w, dict) and w.get('path')]
         refused = self.apply(writes)
@@ -326,6 +457,7 @@ class AgentHand(Hand):
         if slots:
             records.append({'path': self.folder + '/context', 'slots': dict(slots, **{'sys/weft': {'type': 'reference', 'value': self.stdlib_refs()['gather']}, 'sys/tack': reference(turn, 'x', 0)})})
         self.w.tool('write', records=records, who=self.name)
+        publish(chat, said='', phase='', busy=False)
         self.log(f'{self.name}: turn {n + 1} ({len(writes)} writes, lens of {len(slots)})')
         return 1
 
@@ -379,4 +511,4 @@ class AgentHand(Hand):
 
 
 if __name__ == '__main__':
-    _hand.run(AgentHand, settings=('name', 'model', 'endpoint'))
+    _hand.run(AgentHand, settings=('name', 'model', 'endpoint', 'stream_port'))
