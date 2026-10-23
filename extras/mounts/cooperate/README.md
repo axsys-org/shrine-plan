@@ -2,8 +2,11 @@
 
 This backend keeps work, captured inputs, branching traces and typed results in
 Shrine records. External agents use the existing MCP tools. Foil implements the
-three commands; namespace admission validates and commits each operation as one
-batch. There is no model transport or scheduler in this mount.
+commands; namespace admission validates and commits each operation as one
+batch. The shared `native_work` module owns activity state, captured values, frozen
+cells and the provider request/outcome contract. Flows use those same records.
+The Codex mount supplies a native provider hand; model transport stays in its
+existing bridge.
 
 From the repository root:
 
@@ -32,7 +35,10 @@ for an exact historical reference returned by a read.
 | --- | --- | --- | --- |
 | `open` | Existing document record | `id`, `content`; optional `context/<label>` references, `parent`, `procedure` | Creates `<document>/work/<id>` with captured inputs and optional pinned parent edge |
 | `append` | Open work record | `id`, `kind`, `content`; optional `context/<label>`, `reply_to`, `artifact` | Appends `<run>/trace/<id>`, links the previous head and captures any new observations/artifact |
+| `delegate` | Open work record | `id`, `prompt`, JSON `schema`, `provider` reference, `guard` reference | Installs one native provider activity under `workers/<id>` |
 | `finish` | Open work record | `id`, `content`; optional `artifact` | Rechecks initial and observation inputs, then commits result, receipt and completed state together |
+| `ask` | Subject record | `id`, question in `content`, result `shape`, live `context` reference, `resume` activity path | Retains `<subject>/holes/<id>`; its native hand marks it ready and pokes the activity when that context changes |
+| `resolve_hole` | Hole record | Current `attempt` path, `expected` context generation, explanation in `content` | Marks the demand resolved without deleting it; later changed context can reopen it |
 
 Trace kinds are `message`, `observation`, `tool-result`, and `output`. Parent and
 reply edges pin existing records; opening a branch does not implicitly copy all
@@ -66,6 +72,23 @@ Read `/x` followed by a captured cell's path to obtain its frozen typed value;
 read `/c/x` followed by its path for cell context. Snapshot metadata exposes
 `/source`, `/source_case`, `/source_care` and `/observed_case` where available.
 Reads do not launch agents or change lifecycle state.
+
+Each investigation also has a live `/x/<run>/lens`: the subject and the named
+context references selected at opening. Editing a reference on that cell changes
+the next reading; the existing `context/<label>` cells remain frozen. Flows use
+the same `native_work/lens_view` to expose their draft, brief, prior document,
+captured evidence and live demand. A lens is selected context, not a transcript.
+
+Persistent holes keep their question, expected shape, subject, owner activity,
+latest attempt, observed context and reason in native records. `ask` is
+idempotent and rejects direct context/resume cycles. `resolve_hole` checks the
+current attempt and context generation so a late answer cannot close newer work. A context change
+wakes the existing activity once for that changed reading; the activity's hand
+decides what work to perform. An ordinary investigation records the resume
+notification, while a flow's maintenance hand stages and dispatches its next
+attempt. There is no timer or separate queue runner. These records persist in
+the live namespace and its journal, subject to the process lifetime described
+above; this does not add restart recovery or scheduled date/backoff policies.
 
 `/x/<run>/checks/<label>` reports `/unchanged`, comparing current values with
 captured values. Completion additionally checks the revision of directly stored
@@ -118,9 +141,10 @@ as references; these limits do not bound arbitrary compiler execution.
 
 This is a local trusted-client harness. Existing MCP access can write namespace
 records; these commands provide a consistent protocol, not isolation against a
-caller deliberately replacing its records with raw writes. External tool calls,
-model requests, cost accounting and retries belong to the external client and
-are represented by trace entries only when that client records them. Reads and
+caller deliberately replacing its records with raw writes. Delegated model
+requests run through native provider hands. Other external tool calls appear in
+the trace when their caller explicitly records them; cost accounting and retry
+policy are not supplied by these commands. Reads and
 completion do not prove that an external model used only the captured context.
 
 Native command and ownership checks:
@@ -141,3 +165,34 @@ branch and reply links, idempotent retries, stale observation and input handling
 atomic refused completion, frozen typed results and cell-definition reuse.
 `x/eden --mount cooperate --compiler none --check --port 8132` runs it through
 the mount's test hook alongside the MCP checks in a fresh world.
+
+## Native providers
+
+`delegate` binds a published `native_work/provider` to an open investigation.
+The Codex mount publishes one at `/<node>/io/codex/work_provider`. It uses the
+same request/outcome contract that Semidoc flows use. The guard is a record or
+subtree reference captured before dispatch. Worker state, context and frozen
+result remain below `workers/<id>`; no Python scheduler is needed.
+
+A provider result is evidence, not permission to mutate a domain document.
+The caller's completion operation checks its relevant captures and applies the
+domain's rules. Flow revisions additionally compare current brief/evidence and
+the captured physical draft revision before accepting generated source.
+
+## Answering a retained question
+
+The native `answer` operation takes a subject record and `id`, question in
+`content`, a live `context` reference and a `provider` reference. It creates
+`<subject>/work/questions/<id>` and retains the shaped hole at
+`<subject>/holes/questions/<id>`. The shared answering hand captures context,
+starts the ordinary native provider, and admits a bounded `{answer, note}`
+result. An empty answer retains the note as missing evidence. No model call is
+repeated for the same context, including failed or unresolved answers.
+
+Attempts at `attempts/a_N` retain their frozen `context` and `answer` cells.
+The controller's `answer` cell exposes the most recently admitted result.
+Changed context waits for an in-flight result, rejects that stale result, then
+starts a new capture. `answer_enabled` pauses/resumes the same activity;
+completed provider results wait while paused. Results do not mutate the subject.
+Nenex supplies one UI and context projection for these same operations. Other
+applications can bind their own context cells and use this answering hand.

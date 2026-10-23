@@ -95,15 +95,21 @@
     : id=nat command=iota stage=str thread=str body=json
   + session
     : id=str turn=str busy=bool loaded=bool
+  + completion
+    : thread=str turn=str status=str text=str
+  + completion_key
+    \ thread=str turn=str
+    ^ iota
+    ($ts (str/cat_all ["turn_" (nat/show (str/to_atom thread)) "_" (nat/show (str/to_atom turn))]))
   + effect
     : key=iota id=json thread=str turn=str
   + state
     : ready=bool dead=bool next=nat sequence=nat
       rpcs=row[codex/rpc] sessions=row[codex/session]
-      effects=row[codex/effect] seen=path ended=row[str]
+      effects=row[codex/effect] seen=path ended=row[str] answers=row[codex/completion] quiet=row[str]
   + initial
     ^ codex/state
-    | codex/state .false .false 1 0 [] [] [] [] []
+    | codex/state .false .false 1 0 [] [] [] [] [] [] []
   + write
     : key=iota record=myth
   + batch
@@ -187,7 +193,14 @@
     = b (codex/emit 'driver "driver/error" (json/str reason) b)
       b b.state.rpcs.fold(b codex/fail_rpc)
       b b.state.effects.fold(b codex/fail_effect)
+      b b.state.sessions.fold(b codex/fail_turn)
     | b.set_state(b.state.set_dead(.true).set_ready(.false).set_rpcs([]).set_effects([]))
+  + fail_turn
+    \ out=codex/batch session=codex/session
+    ^ codex/batch
+    ? !(session.turn.len) out
+    | codex/save (codex/completion_key session.id session.turn)
+      (myth/sing codex_slots/result (codex/completion session.id session.turn "unresolved" "")) out
   + command
     \ key=iota kind=str body=json b=codex/batch
     ^ codex/batch
@@ -218,6 +231,9 @@
       params (codex/put "threadId" (json/str thread)
         (codex/put "input" (codex/get "input" body) options))
       b (codex/session_put (codex/session thread "" .true .true) b)
+      quiet b.state.quiet.keep((\ id=str !(equal id thread)))
+      quiet (? (equal[json] (codex/get "retainDeltas" (codex/get "options" body)) (json/boo .false)) quiet.snoc(thread) quiet)
+      b b.set_state(b.state.set_quiet(quiet))
     | codex/request key "turn" thread body "turn/start" params b
   + bad_response
     \ rpc=codex/rpc reason=str b=codex/batch
@@ -245,7 +261,7 @@
         ? (equal rpc.stage "turn")
           = turn (codex/text (codex/get "id" (codex/get "turn" result)))
           ? (eq turn.len 0) (codex/bad_response rpc "turn response missing id" b)
-          ? b.state.ended.any((\ ended=str (equal ended turn)))
+          ? b.state.ended.any((\ ended=str (equal ended (path_show [(codex/completion_key rpc.thread turn)]))))
             | codex/session_put (codex/session rpc.thread "" .false .true) b
           | codex/session_put (codex/session rpc.thread turn .true .true) b
         b
@@ -268,17 +284,34 @@
     = thread (codex/text (codex/get "threadId" params))
       turn (codex/text (codex/get "id" (codex/get "turn" params)))
       b
+        ? (equal method "item/completed")
+          = item (codex/get "item" params)
+            turn (codex/text (codex/get "turnId" params))
+          ? !(and (equal (codex/text (codex/get "type" item)) "agentMessage") (gt turn.len 0)) b
+          ? (equal (codex/text (codex/get "phase" item)) "commentary") b
+          = others b.state.answers.keep((\ answer=codex/completion !(and (equal answer.thread thread) (equal answer.turn turn))))
+          | b.set_state(b.state.set_answers(others.snoc((codex/completion thread turn "running" (codex/text (codex/get "text" item))))))
         ? (equal method "turn/started")
           | codex/session_put (codex/session thread turn .true .true) b
         ? (equal method "turn/completed")
-          = session (codex/session_at thread b.state)
+          = key (codex/completion_key thread turn)
+          ? b.state.ended.any((\ ended=str (equal[str] ended (path_show [key])))) b
+          = answers=row[codex/completion] b.state.answers.keep((\ answer=codex/completion (and (equal answer.thread thread) (equal answer.turn turn))))
+            message=str
+              ? !(answers.len) ""
+              = answer=codex/completion answers.at(0)
+              answer.text
+            status (codex/text (codex/get "status" (codex/get "turn" params)))
+            result (codex/completion thread turn status message)
+            b (codex/save key (myth/sing codex_slots/result result) b)
+            session (codex/session_at thread b.state)
             b
               ? (equal session.turn turn)
                 | codex/session_put session.set_turn("").set_busy(.false) b
               b
           = effects b.state.effects
             b effects.fold(b (codex/clear_turn_effect thread turn))
-          | b.set_state(b.state.set_ended(b.state.ended.snoc(turn)).set_effects(effects.filter((\ effect=codex/effect !(codex/turn_effect thread turn effect)))))
+          | b.set_state(b.state.set_ended(b.state.ended.snoc((path_show [key]))).set_answers(b.state.answers.keep((\ answer=codex/completion !(and (equal answer.thread thread) (equal answer.turn turn))))).set_effects(effects.filter((\ effect=codex/effect !(codex/turn_effect thread turn effect)))))
         b
       b
         ? (equal method "serverRequest/resolved")
@@ -287,7 +320,14 @@
             b effects.fold(b (codex/resolve_effect id))
           | b.set_state(b.state.set_effects(effects.filter((\ effect=codex/effect !(equal id effect.id)))))
         b
+    ' Background work consumes complete messages. Avoid creating a namespace
+    ' transaction for every token while keeping the interactive console stream.
+    ? (and (b.state.quiet.has(thread)) (codex/delta method)) b
     | codex/emit 'driver method params b
+  + delta
+    \ method=str
+    ^ bool
+    | row/has[str] method ["item/agentMessage/delta" "item/reasoning/textDelta" "item/reasoning/summaryTextDelta"]
   + id_ok
     \ id=json
     ^ bool

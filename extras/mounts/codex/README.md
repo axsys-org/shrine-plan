@@ -94,3 +94,23 @@ streaming, answering a request, and interrupting through HTTP.
 
 Run `node extras/mounts/codex/codex_ui_browser_tests.cjs` to check the
 browser submit handler, including form fields that shadow DOM properties.
+
+## Shared harness provider
+
+The mount also publishes `/<node>/io/codex/work_provider`, a native
+`native_work/provider`. `codex_work` is a hand that dispatches one normal bridge
+command, watches its acknowledgment, then subscribes to a stable typed turn
+completion record. It returns a shared work outcome and frozen result with the
+original guard capture. Both `cooperate/delegate` and authored flows can use it.
+There is no additional Python worker loop.
+
+Provider requests select the bridge's internal `retainDeltas: false` option.
+Their final messages, lifecycle events, errors and explicit server requests are
+retained; streamed text/reasoning deltas do not create a namespace write per
+token. Ordinary console requests retain streaming. This option is consumed by
+the native reducer and is not sent as an app-server protocol field.
+
+The reducer records final agent-message text by thread and turn; completion can
+arrive before the start acknowledgment. Failed/interrupted/disconnected turns do
+not become successful work. Provider hands do not automatically replay uncertain
+commands or answer server requests. Domain admission remains with the caller.

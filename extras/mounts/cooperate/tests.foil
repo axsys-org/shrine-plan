@@ -126,4 +126,135 @@
   ^ row[testing/case]
   [(testing/case "document work lifecycle" harness_tests/lifecycle)
    (testing/case "frozen context, staleness and branching" harness_tests/capture)
-   (testing/case "bounded atomic refusal" harness_tests/refusal)]
+   (testing/case "bounded atomic refusal" harness_tests/refusal)
+   (testing/case "shared native delegation" delegation_tests/check)
+   (testing/case "live lenses and persistent subject holes" lens_hole_tests/lifecycle)
+   (testing/case "shared reactive answering hand" answering_tests/lifecycle)]
+
++ delegation_tests
+  + provider
+    \ target=path request=native_work/request
+    ^ myth
+    | native_work/open request.owner "test-provider" (myth/sing ['work 'request] request)
+  + check
+    \ ignored=unit
+    ^ row[testing/check]
+    = opened (harness_tests/apply 'open harness_tests/doc harness_tests/request harness_tests/seed)
+      provider=path [($x 17) 'user 'provider]
+      [state index reply] (helm/supervisor/step provider
+        (writ/make (myth/sing ['work 'provider] (native_work/provider delegation_tests/provider))) 0 0 opened (sovereign_hive opened))
+      guard_input (harness_tests/input).snoc('guarded)
+      [state index reply] (helm/supervisor/step guard_input (writ/make (myth/sing ['amount] (pails/n 7))) 0 0 state (sovereign_hive state))
+      input (myth/sing ['id] (pails/t "first")).put(['prompt] (pails/t "Explain the value.")).put(['schema] (pails/t (native_work/text_schema ["answer"]))).put(['provider] (safe 0 .x provider)).put(['guard] (safe 0 .x guard_input))
+      delegated (harness_tests/apply 'delegate harness_tests/run input state)
+      repeated (harness_tests/apply 'delegate harness_tests/run input delegated)
+      refused (harness_tests/apply 'delegate harness_tests/run input.put(['prompt] (pails/t "Changed")) delegated)
+      worker (harness_tests/get (harness_tests/run).weld(['workers 'first]) delegated)
+      captured (native_work/captured (safe 0 .x guard_input) delegated.case(.x guard_input)
+        (pin (sovereign_care .x guard_input delegated)))
+      capture_path (harness_tests/run).weld(['workers 'first 'context 'guard])
+      [guarded index reply] (helm/supervisor/step capture_path
+        (writ/make (native_work/frozen capture_path captured)) 0 0 delegated (sovereign_hive delegated))
+      [changed index reply] (helm/supervisor/step guard_input (writ/poke (myth/sing ['amount] (pails/n 99))) 0 0 guarded (sovereign_hive guarded))
+      finish (myth/sing ['id] (pails/t "done")).put(['content] (pails/t "Finished"))
+      rejected (harness_tests/apply 'finish harness_tests/run finish changed)
+    [(testing/nat "investigation installs shared native provider request" 1 worker.has(['work 'request]))
+     (testing/nat "provider activity uses shared lifecycle" 1 (maybe/is_some (native_work/state worker)))
+     (testing/nat "delegation identity does not duplicate work" 1 (equal delegated repeated))
+     (testing/nat "changed request cannot reuse delegation identity" 1 (equal delegated refused))
+     (testing/nat "delegated guard participates in parent completion checks" 1 (equal changed rejected))]
+
++ lens_hole_tests
+  + lifecycle
+    \ ignored=unit
+    ^ row[testing/check]
+    = opened (harness_tests/apply 'open harness_tests/doc harness_tests/request harness_tests/seed)
+      lens=path (harness_tests/run).snoc('lens)
+      input (myth/sing ['id] (pails/t "amount")).put(['content] (pails/t "Explain the missing amount")).put(['shape] (pails/t "number")).put(['context] (safe 0 .x harness_tests/input)).put(['resume] (pails/p harness_tests/run))
+      asked (harness_tests/apply 'ask harness_tests/doc input opened)
+      hole=path (harness_tests/doc).weld(['holes 'amount])
+      duplicate (harness_tests/apply 'ask harness_tests/doc input asked)
+      changed (harness_tests/edit 20 asked)
+      current (sovereign_care .z (row/cons[iota] 'x lens) changed)
+      frozen (harness_tests/get (row/cons[iota] 'x (harness_tests/run).weld(['context 'numbers])) changed)
+      resolve (myth/sing ['attempt] (pails/p harness_tests/run)).put(['content] (pails/t "Value supplied")).put(['expected] (pails/n (harness_tests/get hole changed).nat_at(['work 'generation] 0)))
+      settled (harness_tests/apply 'resolve_hole hole resolve changed)
+      repeated (harness_tests/edit 20 settled)
+      fresh (harness_tests/edit 30 settled)
+      stale (cooperate/resolve_hole hole resolve.put(['attempt] (pails/p harness_tests/doc)) fresh)
+    [(testing/nat "shared live lens follows current input" 20 current.get(['numbers]).fall(myth/new).nat_at(['amount] 0))
+     (testing/nat "original attempt capture stays frozen" 10 frozen.nat_at(['amount] 0))
+     (testing/nat "asking the same hole is idempotent" 1 (equal asked duplicate))
+     (testing/text "hole remains attached to the subject" "waiting" (harness_tests/get hole asked).txt_at(['work 'status]))
+     (testing/text "changed evidence makes retained hole ready" "ready" (harness_tests/get hole changed).txt_at(['work 'status]))
+     (testing/nat "native hand wakes existing owner" 1 (equal[pail] (pails/p hole) (harness_tests/get harness_tests/run changed).pail_at(['work 'resume])))
+     (testing/text "explicit resolution retains the hole" "resolved" (harness_tests/get hole settled).txt_at(['work 'status]))
+     (testing/text "same evidence does not reopen resolved work" "resolved" (harness_tests/get hole repeated).txt_at(['work 'status]))
+     (testing/text "new evidence reopens resolved work" "ready" (harness_tests/get hole fresh).txt_at(['work 'status]))
+     (testing/nat "answer from an older reading is refused" 1 (either/is_err (cooperate/resolve_hole hole resolve fresh)))
+     (testing/nat "stale attempt cannot resolve a hole" 1 (either/is_err stale))]
+
++ answering_tests
+  + json
+    \ answer=str note=str
+    ^ str
+    | show (json/obj [(jkv "answer" (json/str answer)) (jkv "note" (json/str note))])
+  + controller
+    ^ path
+    | (harness_tests/doc).weld(['work 'questions 'q1])
+  + hole
+    ^ path
+    | (harness_tests/doc).weld(['holes 'questions 'q1])
+  + attempt
+    \ serial=nat
+    ^ path
+    | (answering_tests/controller).weld(['attempts ($ts (str/cat_all ["a_" (nat/show serial)]))])
+  + reply
+    \ text=str state=namespace
+    ^ namespace
+    = current (harness_tests/get answering_tests/controller state)
+      attempt current.path_at(['work 'attempt]).fall([])
+      saved (harness_tests/get attempt state).pail_at(['capture])
+    ?> capture=native_work/captured saved state
+    = [next index reply] (helm/supervisor/step attempt.snoc('worker)
+        (writ/poke (myth/sing ['work 'outcome] (native_work/outcome "complete" text (pin capture)))) 0 0 state (sovereign_hive state))
+    next
+  + lifecycle
+    \ ignored=unit
+    ^ row[testing/check]
+    = provider=path [($x 17) 'user 'provider]
+      state harness_tests/seed
+      [state index reply] (helm/supervisor/step provider (writ/make (myth/sing ['work 'provider] (native_work/provider delegation_tests/provider))) 0 0 state (sovereign_hive state))
+      input (myth/sing ['id] (pails/t "q1")).put(['content] (pails/t "What is the amount?"))
+      input input.put(['context] (safe 0 .x harness_tests/input)).put(['provider] (safe 0 .x provider))
+      started (harness_tests/apply 'answer harness_tests/doc input state)
+      worker=path (row/snoc[iota] 'worker (answering_tests/attempt 1))
+      worker_record (harness_tests/get worker started)
+      provider_guard=maybe[native_work/captured]
+        ?> request=native_work/request worker_record.pail_at(['work 'request]) .none
+        | native_work/captured_at (sovereign_care request.guard.care request.guard.path started)
+      recursive (answering/start harness_tests/doc input.put(['context] (safe 0 .z harness_tests/doc)) state)
+      repeated (harness_tests/apply 'answer harness_tests/doc input started)
+      changed (harness_tests/edit 20 started)
+      late (answering_tests/reply (answering_tests/json "10" "The amount is ten.") changed)
+      missing (answering_tests/reply (answering_tests/json "" "Need a receipt.") late)
+      same (harness_tests/edit 20 missing)
+      ready (harness_tests/edit 30 same)
+      paused (harness_tests/apply 'answer_enabled answering_tests/controller (myth/sing ['enabled] (pails/b .false)) ready)
+      held (answering_tests/reply (answering_tests/json "30" "The supplied amount is thirty.") paused)
+      done (harness_tests/apply 'answer_enabled answering_tests/controller (myth/sing ['enabled] (pails/b .true)) held)
+      old (sovereign_care .z (row/cons[iota] 'x (row/snoc[iota] 'context (answering_tests/attempt 1))) done)
+      answer (harness_tests/get (row/cons[iota] 'x (row/snoc[iota] 'answer answering_tests/controller)) done)
+    [(testing/text "question creates a native answering activity" "running" (harness_tests/get answering_tests/controller started).txt_at(['work 'status]))
+     (testing/text "question retains a subject hole" "waiting" (harness_tests/get answering_tests/hole started).txt_at(['work 'status]))
+     (testing/nat "provider guard exposes the shared captured-value contract" 1 provider_guard.is_some)
+     (testing/nat "request retries are idempotent" started.local.top repeated.local.top)
+     (testing/nat "context cannot include its own controller and holes" 1 (equal recursive (either/err[iota row[[p=path q=writ]]] 'work_hole_context_cycle)))
+     (testing/nat "late outcome starts a fresh captured attempt" 1 (harness_tests/get (answering_tests/attempt 2) late).has(['capture]))
+     (testing/text "unsupported answer stays unresolved" "waiting" (harness_tests/get answering_tests/hole missing).txt_at(['work 'status]))
+     (testing/text "missing evidence reason survives" "Need a receipt." (harness_tests/get answering_tests/hole missing).txt_at(['work 'reason]))
+     (testing/nat "identical evidence does not replay the provider" 0 (harness_tests/get (answering_tests/attempt 3) same).has(['capture]))
+     (testing/text "pause holds completed provider output" "" (harness_tests/get answering_tests/controller held).txt_at(['answer 'text]))
+     (testing/text "resume admits through the same hand" "resolved" (harness_tests/get answering_tests/hole done).txt_at(['work 'status]))
+     (testing/text "answer is available as an ordinary frozen cell" "30" answer.txt_at(system_vocabulary/content))
+     (testing/nat "original attempt retains its input" 10 old.fil.fall(myth/new).nat_at(['amount] 0))]

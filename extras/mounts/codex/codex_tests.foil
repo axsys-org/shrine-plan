@@ -137,6 +137,53 @@
      (testing/nat "leading zero rejected" 1 ?=((./err _ _) (codex_json/decode "01")))
      (testing/nat "repeated decimal rejected" 1 ?=((./err _ _) (codex_json/decode "1.2.3")))
      (testing/nat "valid exponent accepted" 1 ?=((./ok _ _) (codex_json/decode "[-1.2e+3,0,0.01]")))]
+  + completion
+    \ ignored=unit
+    ^ row[testing/check]
+    = message (codex/object [(jkv "threadId" (json/str "t1")) (jkv "turnId" (json/str "u1"))
+        (jkv "item" (codex/object [(jkv "type" (json/str "agentMessage")) (jkv "text" (json/str "Final result"))]))])
+      b (codex/notification "item/completed" message (codex/begin (codex_tests/started).state))
+      params (codex/object [(jkv "threadId" (json/str "t1"))
+        (jkv "turn" (codex/object [(jkv "id" (json/str "u1")) (jkv "status" (json/str "completed"))]))])
+      done (codex/notification "turn/completed" params (codex/begin b.state))
+      key (codex/completion_key "t1" "u1")
+      records done.writes.keep((\ write=codex/write (eq_iota write.key key)))
+      text=str
+        ?> (./some held) records.at(0).record.get(codex_slots/result) ""
+        ?> result=codex/completion held ""
+        result.text
+      repeated (codex/notification "turn/completed" params (codex/begin done.state))
+      repeat_records repeated.writes.keep((\ write=codex/write (eq_iota write.key key)))
+      disconnected (codex/fail "EOF" (codex/begin (codex_tests/started).state))
+      lost disconnected.writes.keep((\ write=codex/write (eq_iota write.key key)))
+    [(testing/text "final message is retained in stable completion" "Final result" text)
+     (testing/nat "completion publishes once" 1 records.len)
+     (testing/nat "duplicate completion cannot erase final text" 0 repeat_records.len)
+     (testing/nat "completion identity includes thread" 0 (eq_iota key (codex/completion_key "other" "u1")))
+     (testing/nat "disconnect publishes unresolved active turn" 1 lost.len)]
+
+  + background_events
+    \ ignored=unit
+    ^ row[testing/check]
+    = options (codex/object [(jkv "retainDeltas" (json/boo .false))])
+      b (codex/consume 'background (codex/start (json/arr []) options .none) (codex/begin (codex_tests/ready).state))
+      b (codex/incoming (codex_tests/response 2 (codex_tests/thread "t1")) b)
+      b (codex/incoming (codex_tests/response 3 (codex_tests/turn "u1")) b)
+      params (codex/object [(jkv "threadId" (json/str "t1")) (jkv "turnId" (json/str "u1")) (jkv "delta" (json/str "text"))])
+      quiet (codex/notification "item/agentMessage/delta" params (codex/begin b.state))
+      normal (codex/notification "item/agentMessage/delta" params (codex/begin (codex_tests/started).state))
+      other (codex/notification "item/agentMessage/delta" (codex/put "threadId" (json/str "other") params) (codex/begin b.state))
+      final (codex/notification "item/completed"
+        (codex/put "item" (codex/object [(jkv "type" (json/str "agentMessage")) (jkv "text" (json/str "Complete message"))]) params) (codex/begin quiet.state))
+      error (codex/notification "error" params (codex/begin b.state))
+      request (codex/incoming (codex_tests/request (codex/number 7)) (codex/begin b.state))
+    [(testing/nat "background tokens do not create namespace writes" 0 quiet.writes.len)
+     (testing/nat "console streaming is retained" 1 normal.writes.len)
+     (testing/nat "background policy is scoped to its thread" 1 other.writes.len)
+     (testing/text "complete background message is captured" "Complete message" final.state.answers.at(0).text)
+     (testing/nat "background errors remain visible" 1 error.writes.len)
+     (testing/nat "background server requests remain explicit" 1 request.state.effects.len)
+     (testing/nat "retention option is not sent to app-server" 0 (codex/has "retainDeltas" (codex/get "params" b.wire.at(1))))]
 
 + tests
   ^ row[testing/case]
@@ -147,4 +194,6 @@
    (testing/case "failure" codex_tests/failure)
    (testing/case "completion races" codex_tests/races)
    (testing/case "RPC errors" codex_tests/rpc_errors)
-   (testing/case "malformed protocol" codex_tests/malformed)]
+   (testing/case "malformed protocol" codex_tests/malformed)
+   (testing/case "stable turn results" codex_tests/completion)
+   (testing/case "background event retention" codex_tests/background_events)]

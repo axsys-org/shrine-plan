@@ -3,6 +3,28 @@ const assert = require('node:assert/strict');
 const live = require('../goo-live.js');
 const {slotLayout, recordHTML, actionHTML, askedHTML, mcpSource, adapt} = live;
 
+test('native spun overlays use the same cell result renderer without inventing a stdlib law', async () => {
+  const slots = adapt.slotsOf({'/sys/weft': {type: 'code', size: 0}, '/sys/tack': '/h/x/0/3/0x11/user/work'});
+  assert.equal(slots.formula, 'native overlay');
+  const source = {async answer() { return {tree: {slots: {status: 'waiting'}, kids: []}}; }};
+  const html = await recordHTML(source, {path: '0x11/user/work/cells/work', record: slots, kids: []}, false, new Set());
+  assert.match(html, /waiting/);
+  assert.match(html, /made of/);
+  assert.doesNotMatch(html, /stdlib\/\[object Object\]/);
+  assert.match(slotLayout({context: '-> /x/0x11/user/work/view'}), /href="\/live\?views=/);
+});
+
+test('rootless cell collections and transparent folders retain their rows', () => {
+  const path = '/0x11/user/evidence';
+  const x = {path: '/x' + path, exists: false, reference: '/h/z/1/5/x/0x11/user/evidence', properties: {}, children: [
+    {path: '/x' + path + '/source', exists: true, properties: {'/location': 'README.md'}, children: []}
+  ]};
+  const answer = adapt.answerOf(path, x, {properties: {}});
+  assert.equal(answer.bad, undefined);
+  assert.equal(answer.tree.kids[0].slots.location, 'README.md');
+  assert.notEqual(adapt.readOf(x).record, null);
+});
+
 // ---- fixtures: read answers in the mount's own shape (knobs.md: {path, exists, reference, reference_y, reference_z, properties, children, nodes, next})
 const N = '/0x11/user/org';
 const ref = (care, cas, path) => `/h/${care}/${cas}/${path.split('/').length - 1}${path}`;
@@ -316,4 +338,55 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   await s2.handler(person(5, true)); await s2.handler(qaWrite(7, false));
   assert.match(el2.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'on the QA folder the QA write is drawn');
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
+});
+
+test('an explicit overlay view shows immediately, skips backlog, and coalesces history polls', async () => {
+  const path = '/o/1/4/0x11/gov/nenex_ui/record_lens/7/0x11/user/external_records/snapshots/s_one/pages/p_91/record_91412';
+  const calls = [], shown = [], ticks = [];
+  let epoch = 200, release;
+  const fetch = async (url, options) => {
+    const args = JSON.parse(options.body).params.arguments; calls.push(args);
+    if (release === 'hold') await new Promise(resolve => { release = resolve; });
+    return {json: async () => ({result: {structuredContent: {events: [{epoch}], next: null}}})};
+  };
+  const source = mcpSource({views: path, fetch, EventSource: null, setInterval: f => (ticks.push(f), 1), clearInterval() {}});
+  const follow = source.follow(msg => { shown.push(msg.shown.path); if (shown.length === 1) assert.equal(calls.length, 0, 'render before any history request'); });
+  await follow.ready;
+  assert.deepEqual(shown, [path.slice(1)]);
+  assert.deepEqual(calls, [{before: 0, limit: 1}], 'no bulk history and no inlined historic records');
+  release = 'hold'; epoch++;
+  const first = ticks[0](); await ticks[0]();
+  assert.equal(calls.length, 2, 'only one pending poll');
+  release(); await first; await new Promise(r => setImmediate(r));
+  assert.equal(shown.length, 2, 'a new event refreshes derived dependencies');
+  follow.stop(); await ticks[0](); assert.equal(calls.length, 2);
+});
+
+test('address path slots and references have navigable live-view links', () => {
+  const street = '/o/1/4/0x11/gov/nenex_ui/related_lens/7/0x11/user/external_records/snapshots/s_one/street_pages/p_10/s_street';
+  const source = '/0x11/user/external_records/snapshots/s_one/pages/p_91';
+  const html = slotLayout({address_street: street, address_source: source, held: '-> ' + source.slice(1)});
+  assert.ok(html.includes('href="/live?views=' + encodeURIComponent(street) + '"'));
+  assert.equal(html.split('href="/live?views=' + encodeURIComponent(source) + '"').length - 1, 2);
+});
+
+test('overlay views do not interpret the o prefix as a node for QA discovery', async () => {
+  const m = fakeMcp(() => { throw new Error('must not request /o/agent'); });
+  assert.equal(await mcpSource({views: '/o/1/4/0x11/gov/test/lens/1/data', fetch: m.fetch}).qa(), null);
+  assert.equal(m.calls.length, 0);
+});
+
+test('render errors are shown instead of swallowed', async () => {
+  const el = fakeEl(), s = viewerSource();
+  s.graph = async () => { throw new Error('request timed out'); };
+  live.mountViewer(el, s, {views: '/0x11/user/test'});
+  await s.handler({shown: {path: '0x11/user/test', case: 0}});
+  assert.match(el.querySelector('.sv-now').innerHTML, /role="alert">Could not load this view: request timed out/);
+});
+
+test('a stalled MCP request aborts rather than leaving a view pending forever', async () => {
+  const source = mcpSource({timeout: 5, fetch: (url, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('request timed out')), {once: true});
+  })});
+  await assert.rejects(source.read('/0x11/user/test', 'x'), /request timed out/);
 });
