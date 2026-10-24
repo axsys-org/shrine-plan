@@ -256,6 +256,35 @@ class MountTests(unittest.TestCase):
         self.assertIn('--upgrade requires an existing persistent world', result.stderr)
         self.assertFalse(world.exists())
 
+    def test_compaction_requires_an_existing_world(self):
+        world = self.root / 'missing-world'
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('eden')),
+                                 '--world', str(world), '--compact'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('--compact requires an existing persistent world', result.stderr)
+        self.assertFalse(world.exists())
+
+    def test_compaction_rejects_an_inspector_without_the_native_operation(self):
+        world = self.root / 'world'
+        (world / 'snap').mkdir(parents=True)
+        arena = world / 'snap/arena.dat'
+        arena.write_bytes(b'existing native world')
+        (world / 'world.json').write_text(json.dumps(dict(format=1, node='0x11',
+            extras=str(self.root), workspace=str(self.root), compiler='none', mounts=[])))
+        tools = self.root / 'tools'
+        tools.mkdir()
+        for name, body in [('wisp', 'exit 99'), ('scry', 'echo "unknown command compact" >&2; exit 0')]:
+            executable = tools / name
+            executable.write_text('#!/bin/sh\n' + body + '\n')
+            executable.chmod(0o755)
+        launcher = Path(__file__).with_name('eden')
+        env = dict(os.environ, _EDEN_NIX_ROOT=str(launcher.resolve().parent.parent), WISP=str(tools / 'wisp'))
+        result = subprocess.run([sys.executable, str(launcher), '--world', str(world), '--compact'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('Native compaction failed; world was not started', result.stderr)
+        self.assertEqual(arena.read_bytes(), b'existing native world')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -41,6 +41,25 @@ private persistence adapter against that world's captured imports, checks the
 complete namespace content hash before committing its new continuation, and
 then starts the world normally. Preparation and diagnostics are in `upgrade.log`.
 
+To reclaim old arena allocations, stop the launcher and run `x/eden --compact`
+with the same `--world` and port selection. The launcher holds the existing
+world lock and calls the native store collector before restoring the world.
+For offline maintenance without launching, the same operation is available as
+`scry WORLD/snap compact` in the Eden shell.
+
+Compaction traces the current continuation through PINs and shared raw nodes.
+Everything reachable remains, including the namespace's complete x/y/z assertion
+and care histories, captured definitions, work, cells and holes. It collects
+superseded runtime checkpoint roots and derived compiler caches; the physical
+checkpoint journal restarts at 1. Runtime checkpoint numbers are distinct from
+namespace history addresses, whose cases and values remain unchanged.
+The collector rebuilds `arena.dat` in the same directory, checks every retained
+object's content hash and the unchanged root hash, synchronizes it, and atomically
+replaces the original arena. It refuses an active writer. A failure before
+replacement leaves the original arena authoritative; an interrupted collector
+may leave an uninstalled `.compact-*` native candidate. There is no export or
+second application save format.
+
 The default mount sources are this checkout's `extras/` directory.
 `--extras-root` selects another source directory, including its Nix configuration.
 Dependencies are loaded once, before their consumers. Only selected

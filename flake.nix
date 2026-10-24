@@ -17,7 +17,7 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
       runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
-        patches = (old.patches or []) ++ [ ./nix/native-sharing.patch ];
+        patches = (old.patches or []) ++ [ ./nix/native-sharing.patch ./nix/native-compaction.patch ];
         postInstall = (old.postInstall or "") + ''
           $CC -std=c23 -D_GNU_SOURCE -O2 -I$out/include ${./x/eden-native-upgrade.c} \
             -L$out/lib -lplan -laxsys -llmdb -lcrypto -lgmp -lsodium -lblake3 \
