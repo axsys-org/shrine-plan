@@ -1,0 +1,146 @@
+(#bind std (#module std))
+(#import std)
+(#bind prim (#module prim))
+(#import prim)
+(#bind seq (#module seq))
+(#import seq)
+(#bind wrap (#module wrap))
+(#import wrap)
+(#bind diff (#module diff))
+(#import diff)
+
+
+;;; ============================================================================
+;;; A tiny real-looking schema
+;;; ============================================================================
+
+;; AccessUpdate packet:
+;;
+;;   byte version
+;;   byte user-id
+;;   u32  role-byte-length
+;;   byte role[role-byte-length]
+;;
+;; The schema is not self-describing. The biparser is the schema.
+(#bind role-bytes (many byte))
+(#bind role-field (length-prefixed role-bytes))
+(#bind access-update-schema
+    (cons byte
+          (cons byte
+                role-field)))
+
+
+;;; ============================================================================
+;;; Named values so the demo reads like application code
+;;; ============================================================================
+
+;; ASCII bytes:
+;;   "admin" = [97 100 109 105 110]
+;;   "owner" = [111 119 110 101 114]
+(#bind admin-role [97 [100 [109 [105 [110 0]]]]])
+(#bind owner-role [111 [119 [110 [101 [114 0]]]]])
+
+;; Structured value:
+;;   version = 7
+;;   user-id = 42
+;;   role = "admin"
+(#bind access-update [7 [42 admin-role]])
+
+;; Serialized bytes:
+;;   7                  version
+;;   42                 user-id
+;;   5 0 0 0            little-endian role length
+;;   97 100 109 105 110 "admin"
+(#bind access-update-bytes [7 42 5 0 0 0 97 100 109 105 110])
+
+
+;;; ============================================================================
+;;; The same schema parses bytes, prints bytes, and explains byte ownership
+;;; ============================================================================
+
+(#bind parsed-access-update
+    (parse access-update-schema access-update-bytes))
+
+(#bind printed-access-update
+    (pretty access-update-schema access-update))
+
+(#bind access-update-witness
+    (Ix1 (witness access-update-schema 0 access-update)))
+
+
+;;; ============================================================================
+;;; Semantic diffs become byte-level writes
+;;; ============================================================================
+
+;; Change only the user-id field:
+;;
+;;   user-id: 42 -> 99
+;;
+;; Expected byte splice:
+;;
+;;   [[1 1 [99]] 0]
+;;
+;; Meaning:
+;;
+;;   at offset 1, replace 1 byte with [99]
+(#bind change-user-id
+    (diff-cons diff-refl
+        (diff-cons (diff-replace 99)
+                   diff-refl)))
+
+(#bind user-id-write
+    (push-diff access-update-schema
+               access-update-witness
+               access-update
+               change-user-id))
+
+
+;; Change only the role field:
+;;
+;;   role: "admin" -> "owner"
+;;
+;; Expected byte splice:
+;;
+;;   [[2 9 [5 0 0 0 111 119 110 101 114]] 0]
+;;
+;; Meaning:
+;;
+;;   at offset 2, replace the whole length-prefixed role region
+(#bind change-role
+    (diff-cons diff-refl
+        (diff-cons diff-refl
+                   (diff-replace owner-role))))
+
+(#bind role-write
+    (push-diff access-update-schema
+               access-update-witness
+               access-update
+               change-role))
+
+
+;;; ============================================================================
+;;; Demo assertions
+;;; ============================================================================
+
+assert(Equal access-update parsed-access-update)
+assert(Equal access-update-bytes printed-access-update)
+
+assert(Equal 0 (wit-off (wit-at access-update-witness [0])))      ;; version
+assert(Equal 1 (wit-len (wit-at access-update-witness [0])))
+
+assert(Equal 1 (wit-off (wit-at access-update-witness [1 0])))    ;; user-id
+assert(Equal 1 (wit-len (wit-at access-update-witness [1 0])))
+
+assert(Equal 2 (wit-off (wit-at access-update-witness [1 1])))    ;; role field
+assert(Equal 9 (wit-len (wit-at access-update-witness [1 1])))
+
+assert(Equal [[1 1 [99]] 0] user-id-write)
+assert(Equal [7 99 5 0 0 0 97 100 109 105 110]
+             (apply-splices access-update-bytes user-id-write))
+
+assert(Equal [[2 9 [5 0 0 0 111 119 110 101 114]] 0] role-write)
+assert(Equal [7 42 5 0 0 0 111 119 110 101 114]
+             (apply-splices access-update-bytes role-write))
+
+
+"showcase-passed"

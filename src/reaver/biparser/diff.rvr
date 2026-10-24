@@ -1,0 +1,227 @@
+(#bind std (#module std))
+(#import std)
+(#bind k7 (#module k7))
+(#import k7)
+(#bind prim (#module prim))
+(#import prim)
+
+
+;;; ============================================================================
+;;; structural diffs
+;;; ============================================================================
+
+;; Diff values:
+;;   0                         = unchanged
+;;   ["replace" new-value]     = replace this whole structural region
+;;   ["cons" left right]       = product diff
+;;   ["list" per-element]      = aligned list diff
+;;   ["list-edits" ops]        = list edit script
+;;   ["variant" inner]         = same-variant payload diff
+(#bind diff-refl 0)
+
+(define (diff-replace v) ["replace" v])
+(define (diff-cons left right) ["cons" left right])
+(define (diff-list ds) ["list" ds])
+(define (diff-list-edits ops) ["list-edits" ops])
+(define (diff-variant inner) ["variant" inner])
+
+(define (diff-list-keep d) ["keep" d])
+(define (diff-list-delete) ["delete"])
+(define (diff-list-insert v) ["insert" v])
+
+(define (diff-replace? d)
+    (And d (Equal "replace" (_0 d))))
+
+
+;;; ============================================================================
+;;; witness lookup
+;;; ============================================================================
+
+(define (wit-off w) (_0 w))
+(define (wit-len w) (_1 w))
+
+;; Most witnesses are [off len kids]. Tagged/layout witnesses carry a label before
+;; the children: [off len tag kids].
+(define (wit-kids w)
+    (If (Equal 3 (Sz w))
+        (_2 w)
+        (_3 w)))
+
+(define (wit-at w path)
+    (Ifz (Sz path)
+        w
+        (wit-at (Ix (Ix0 path) (wit-kids w)) (drop 1 path))))
+
+
+;;; ============================================================================
+;;; byte splices
+;;; ============================================================================
+
+(define (splice off old-len new-bytes)
+    [off old-len new-bytes])
+
+(define (splice-off s) (_0 s))
+(define (splice-old-len s) (_1 s))
+(define (splice-new-bytes s) (_2 s))
+
+(define (apply-splice bytes s)
+    (#let ((off (splice-off s))
+           (old-len (splice-old-len s))
+           (new-bytes (splice-new-bytes s)))
+        (Weld (Slice 0 off bytes)
+              (Weld new-bytes
+                    (drop (Add off old-len) bytes)))))
+
+;; Splices are emitted left-to-right in original byte offsets. Applying the tail
+;; first keeps later offsets stable when an earlier splice changes byte length.
+(define (apply-splices bytes splices)
+    (Ifz splices
+        bytes
+        (apply-splice (apply-splices bytes (_1 splices)) (_0 splices))))
+
+(define (apply-diff-splices bytes splices)
+    (apply-splices bytes splices))
+
+
+;;; ============================================================================
+;;; applying structural diffs to values
+;;; ============================================================================
+
+(define (apply-diff-cons old d)
+    [(apply-diff-value (Ix0 old) (_1 d))
+     (apply-diff-value (Ix1 old) (_2 d))])
+
+(define (apply-diff-list old ds)
+    (Ifz ds
+        old
+        [(apply-diff-value (Ix0 old) (Ix0 ds))
+         (apply-diff-list (Ix1 old) (Ix1 ds))]))
+
+(define (apply-list-edits old ops)
+    (Ifz ops
+        old
+        (#let ((op (Ix0 ops))
+               (rest (Ix1 ops)))
+            (cond
+                ((Equal (_0 op) "keep")
+                    [(apply-diff-value (Ix0 old) (_1 op))
+                     (apply-list-edits (Ix1 old) rest)])
+                ((Equal (_0 op) "delete")
+                    (apply-list-edits (Ix1 old) rest))
+                ((Equal (_0 op) "insert")
+                    [(_1 op) (apply-list-edits old rest)])
+                (else old)))))
+
+(define (apply-diff-value old d)
+    (Ifz d
+        old
+        (#let ((tag (_0 d)))
+            (cond
+                ((Equal tag "replace") (_1 d))
+                ((Equal tag "cons") (apply-diff-cons old d))
+                ((Equal tag "list") (apply-diff-list old (_1 d)))
+                ((Equal tag "list-edits") (apply-list-edits old (_1 d)))
+                ((Equal tag "variant")
+                    [(Ix0 old) (apply-diff-value (Ix1 old) (_1 d))])
+                (else old)))))
+
+
+;;; ============================================================================
+;;; push-through-witness
+;;; ============================================================================
+
+(define (push-replace p wit new-value)
+    [(splice (wit-off wit)
+             (wit-len wit)
+             (pretty p new-value))
+     0])
+
+;; Convenience escape hatch for demos/debugging: replace a known structural path.
+(define (push-replace-at p root-witness path new-value)
+    (#let ((w (wit-at root-witness path)))
+        (splice (wit-off w)
+                (wit-len w)
+                (pretty p new-value))))
+
+(define (push-replace-at-list p root-witness path new-value)
+    [(push-replace-at p root-witness path new-value) 0])
+
+(define (push-cons-diff p wit old d)
+    (#let ((args (k7-args p))
+           (kids (wit-kids wit)))
+        (lweld (push-diff (Ix0 args) (Ix0 kids) (Ix0 old) (_1 d))
+               (push-diff (Ix1 args) (Ix1 kids) (Ix1 old) (_2 d)))))
+
+(define (push-list-loop p wits vals ds)
+    (Ifz ds
+        0
+        (lweld (push-diff p (Ix0 wits) (Ix0 vals) (Ix0 ds))
+               (push-list-loop p (Ix1 wits) (Ix1 vals) (Ix1 ds)))))
+
+(define (list-insert-off wits end-off)
+    (Ifz wits end-off (wit-off (Ix0 wits))))
+
+(define (push-list-edits-loop p end-off wits vals ops)
+    (Ifz ops
+        0
+        (#let ((op (Ix0 ops))
+               (rest (Ix1 ops))
+               (tag (_0 op)))
+            (cond
+                ((Equal tag "keep")
+                    (lweld (push-diff p (Ix0 wits) (Ix0 vals) (_1 op))
+                           (push-list-edits-loop p end-off (Ix1 wits) (Ix1 vals) rest)))
+                ((Equal tag "delete")
+                    (lweld [(splice (wit-off (Ix0 wits))
+                                     (wit-len (Ix0 wits))
+                                     [])
+                            0]
+                           (push-list-edits-loop p end-off (Ix1 wits) (Ix1 vals) rest)))
+                ((Equal tag "insert")
+                    (lweld [(splice (list-insert-off wits end-off)
+                                     0
+                                     (pretty p (_1 op)))
+                            0]
+                           (push-list-edits-loop p end-off wits vals rest)))
+                (else 0)))))
+
+(define (push-list-diff p wit old d)
+    (#let ((args (k7-args p))
+           (inner (If (Equal (k7-kind p) "many")
+                      (Ix0 args)
+                      (Ix1 args))))
+        (If (Equal (_0 d) "list-edits")
+            (push-list-edits-loop inner (Add (wit-off wit) (wit-len wit)) (wit-kids wit) old (_1 d))
+            (push-list-loop inner (wit-kids wit) old (_1 d)))))
+
+(define (push-tagged-alt-diff p wit old d)
+    (#let ((branches (Ix0 (k7-args p)))
+           (tag (Ix0 old))
+           (inner-diff (_1 d)))
+        (push-diff (Ix tag branches)
+                   (Ix0 (wit-kids wit))
+                   (Ix1 old)
+                   inner-diff)))
+
+;; Length prefixes own both the prefix bytes and their payload. Any nested
+;; payload change reprints the whole length-prefixed region, so the prefix stays
+;; correct when the payload size changes.
+(define (push-length-prefixed-diff p wit old d)
+    (push-replace p wit (apply-diff-value old d)))
+
+(define (push-by-kind p wit old d)
+    (#let ((kind (k7-kind p)))
+        (cond
+            ((Equal kind "cons") (push-cons-diff p wit old d))
+            ((Equal kind "many") (push-list-diff p wit old d))
+            ((Equal kind "take") (push-list-diff p wit old d))
+            ((Equal kind "tagged-alt") (push-tagged-alt-diff p wit old d))
+            ((Equal kind "length-prefixed") (push-length-prefixed-diff p wit old d))
+            (else (push-replace p wit (apply-diff-value old d)))))))
+
+(define (push-diff p wit old d)
+    (Ifz d
+        0
+        (If (diff-replace? d)
+            (push-replace p wit (_1 d))
+            (push-by-kind p wit old d))))
