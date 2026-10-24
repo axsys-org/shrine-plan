@@ -37,6 +37,7 @@ World, Hand, segment_of = _hand.World, _hand.Hand, _hand.segment_of
 DEFAULT_MODEL = 'anthropic/claude-sonnet-5.5'
 ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'   # the search page answers a browser, not a bot name
+EXTRACTOR = 2            # a page indexed by an older extractor is indexed again, whatever its digest
 MAX_PAGES = 5            # pages read per ask
 MAX_PAGES_MANY = 30      # pages read for a collection whose site was mapped
 MAX_REGION = 6000        # chars of a region kept
@@ -178,8 +179,10 @@ def fetch_page(url):
     renders it and hands back the raw html, which our extractor then reads the same way."""
     try:
         markup, ctype = get(url)
-        if 'html' in (ctype or '') and len(re.sub(r'<[^>]+>', ' ', markup)) > 2000:
-            return markup, ctype
+        if 'html' in (ctype or ''):
+            _, regions = page_regions(markup, url)
+            if sum(len(r['text']) for r in regions) >= 600:      # readable: the main content, not the scripts, is long enough
+                return markup, ctype
         shell = markup if 'html' in (ctype or '') else ''
     except Exception:
         shell = ''
@@ -205,7 +208,8 @@ def rank_links(links, q, cap=40):
         seen.add(u)
         path = urllib.parse.urlparse(u).path.strip('/')
         depth = len([p for p in path.split('/') if p])
-        out.append((depth + (2 if any(w in u.lower() for w in words) else 0), u))
+        hits = sum(1 for w in words if w in u.lower())
+        out.append((10 * hits + min(depth, 3), u))              # the question's words first; depth only breaks ties
     return [u for sc, u in sorted(out, key=lambda x: -x[0])[:cap] if sc > 0]
 
 
@@ -282,6 +286,9 @@ def search(q, limit=8, entity=None, skip=()):
     return out[:limit], '+'.join(used)
 
 
+SKIP_TAGS = {'script', 'style', 'noscript', 'template', 'svg', 'head'}
+
+
 class Text(HTMLParser):
     """HTML to regions: a heading starts a region; everything else is its text."""
     def __init__(self):
@@ -312,7 +319,20 @@ except Exception:
     trafilatura = None
 
 
+CODE_TAGS = re.compile(r'<(script|style|noscript|template|svg|iframe)\b[^>]*>.*?</\1\s*>|<!--.*?-->', re.S | re.I)
+
+
+def looks_like_code(text):
+    """A region that is a script, a style sheet or a data blob, not prose: many code symbols, few spaces between words."""
+    t = text[:2000]
+    if not t:
+        return False
+    symbols = sum(t.count(c) for c in ';{}=')                    # prose has citations and brackets; code has these
+    return symbols / len(t) > 0.025 or len(re.findall(r'\bfunction\s*\(|\bvar \w+ =|\bconst \w+ =|window\.\w+|document\.\w+|dataLayer|=>', t)) >= 2
+
+
 def page_regions(markup, url=''):
+    markup = CODE_TAGS.sub(' ', markup or '')                   # no script, style or comment reaches an extractor
     """A page as its main content only (navigation, footers, cookie banners and sidebars gone), split into regions at
     its headings. trafilatura when available, else the plain parser."""
     if trafilatura is not None:
@@ -340,6 +360,7 @@ def page_regions(markup, url=''):
                 if size > 1600:
                     flush(); buf, size = [], 0
             flush()
+            regions = [r for r in regions if not looks_like_code(r['text'])]
             if sum(len(r['text']) for r in regions) >= 400:      # a listing or index page keeps little main content: use all of it
                 return title, regions
         except Exception:
@@ -348,7 +369,7 @@ def page_regions(markup, url=''):
     out = []
     for heading, level, parts in t.regions:
         text = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
-        if len(text) > 40:
+        if len(text) > 40 and not looks_like_code(text):
             out.append({'heading': heading[:160], 'level': level, 'text': text[:MAX_REGION]})
     return t.title.strip()[:200], out
 
@@ -534,14 +555,15 @@ class WebHand(Hand):
             # a collection with a known site: every url of the site in one call, its content pages read in turn
             self.status(ask, 'mapping', step=site[:160], pages=0, queries=0, rows=0)
             try:
-                links = firecrawl('/map', {'url': site if '://' in site else 'https://' + site, 'limit': 500}).get('links') or []
+                links = firecrawl('/map', {'url': site if '://' in site else 'https://' + site, 'limit': 500, **({} if many else {'search': first[:100]})}).get('links') or []
+                links = [l.get('url') if isinstance(l, dict) else l for l in links]
             except Exception as e:
                 self.log(f'web {owner}/{aid}: map of {site} failed: {str(e)[:80]}'); links = []
             queued = [(u, '', '') for u in rank_links(links, first + ' ' + shape, cap=40 if many else 6)]
             if queued:
                 self.log(f'web {owner}/{aid}: mapped {site}: {len(links)} urls, {len(queued)} to read first')
         if queued and not many:
-            cap = max(cap, len(queued))                                   # the site's own pages do not eat the search budget
+            cap = len(queued) + MAX_PAGES                                  # the site's own pages first, then the search still has its budget
         while (queries or queued) and pages_read < cap:
             if queued:
                 q, hits, engine, terms, attempts, queued = 'map ' + site, queued, 'firecrawl-map', [], 0, []
@@ -581,8 +603,10 @@ class WebHand(Hand):
                 digest = hashlib.sha256(markup.encode()).hexdigest()[:16]
                 ppath = page_path(node, url)
                 have = self.w.read(ppath, 'x').get('properties') or {}
-                if have.get('/digest') != digest:                       # the index: a page once, its regions beneath
-                    recs = [{'path': ppath, 'slots': {'url': url, 'title': ptitle or title, 'fetched': int(time.strftime('%Y%m%d')), 'digest': digest, 'regions': len(regions)}}]
+                if have.get('/digest') != digest or int(float(have.get('/extractor') or 1)) < EXTRACTOR:   # the index: a page once, its regions beneath
+                    old = [c['path'] for c in (self.w.read(ppath, 'y', limit=200).get('children') or []) if re.search(r'/r\d+$', c['path'])]
+                    recs = [{'path': c, 'action': 'cull'} for c in old if int(c.rsplit('/r', 1)[1]) > len(regions[:60])]
+                    recs += [{'path': ppath, 'slots': {'url': url, 'title': ptitle or title, 'fetched': int(time.strftime('%Y%m%d')), 'digest': digest, 'regions': len(regions), 'extractor': EXTRACTOR}}]
                     recs += [{'path': f'{ppath}/r{i}', 'slots': {'heading': r['heading'], 'level': r['level'], 'text': r['text']}} for i, r in enumerate(regions[:60], 1)]
                     self.w.tool('write', records=recs, who=self.name)
                 nv += 1

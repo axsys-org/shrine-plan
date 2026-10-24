@@ -634,7 +634,8 @@ function mcpSource(opts = {}) {
     for (const [slot, ms] of Object.entries(r.by || {})) out[slot] = ms.map(m => ({ path: local(m.path), slot, cell: !!m.cell, hole: !!m.hole }));
     return out;
   }
-  async function tree(path, depth) { const r = await index('/tree?to=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? { in: r.in || [], contents: r.contents || [] } : null; }
+  async function unfold(path, depth) { const r = await index('/unfold?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? r.folders || [] : null; }
+  async function around(path, depth) { const r = await index('/around?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 2)); return r ? { real: r.real, ancestors: r.ancestors || [], descendants: r.descendants || [], relations: r.relations || [], refsOut: r.refs_out || [], refsIn: r.refs_in || [], parts: r.parts || [] } : null; }
   async function candidates(path) { const r = await index('/candidates' + (path ? '?in=' + encodeURIComponent(world(path)) : '')); return r ? (r.candidates || []) : []; }
   async function backlinks(path) {
     // the links hand keeps every reference in memory and answers in milliseconds; the kernel walk below is the fallback
@@ -721,7 +722,7 @@ function mcpSource(opts = {}) {
     await rpc('write', { records: [{ path, slots }], who: who || 'person' });
     return path;
   }
-  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, tree };
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, around, unfold };
 }
 
 // the record page: one record, its slots (each reference a link), what is beneath it, and what points at it; every
@@ -766,18 +767,37 @@ function mountRecord(el, source, opts = {}) {
     }
     if (mine !== drawn) return;
     const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
-    // the hierarchy is computed from the in slots: what this is in (upward) and what is in it (nested)
-    const t = source.tree ? await source.tree(at, 3).catch(() => null) : null;
+    // where it sits: under its own path, and under every overlay that places it; beneath it, its children and overlays
+    const t = source.around ? await source.around(at, 3).catch(() => null) : null;
     if (mine !== drawn) return;
-    const chainHTML = t && t.in.length ? `<div class="sv-in">in ${t.in.map(c => goHTML(local(c.path), local(c.path), c.name, 'n')).join(' <span class="sep">‹</span> ')}</div>` : '';
-    const treeHTML = nodes => `<ul class="sv-tree">${nodes.map(n => `<li>${goHTML(local(n.path), local(n.path), n.name, 'n')}<span class="k">${esc(n.kind || '')}</span>${n.children && n.children.length ? treeHTML(n.children) : ''}</li>`).join('')}</ul>`;
-    const contentsHTML = t ? `<div class="sv-sec"><div class="k">contents${t.contents.length ? ' · ' + t.contents.length : ''}</div>${t.contents.length ? treeHTML(t.contents) : '<div class="sv-empty">nothing is in it yet</div>'}</div>` : '';
-    // physical children: a thing's own parts (talk, mentions, regions, views) sit beneath it; things of their own are in the tree above
-    const inTree = new Set(); (function mark(ns) { for (const n of ns || []) { inTree.add(local(n.path)); mark(n.children); } })(t ? t.contents : []);
-    const parts = kids.filter(k => !inTree.has(local(k.path)));
+    const noteText = n => n ? Object.entries(n).filter(([k, v]) => !String(v).startsWith('/')).map(([k, v]) => k === 'note' ? v : k + ' ' + v).join(' · ') : '';
+    const realHere = t && t.real && local(t.real) !== at;
+    const chainHTML = !t ? '' : (realHere ? `<div class="sv-in sv-ov">overlay of ${goHTML(local(t.real), local(t.real), local(t.real).split('/').pop().replace(/_/g, ' '), 'n')}</div>` : '') +
+      t.ancestors.filter(a => local(a.via) !== local(t.real)).map(a => `<div class="sv-in">also under ${a.chain.slice(0, 3).map(c => goHTML(local(c.path), local(c.path), c.name, 'n')).join(' <span class="sep">‹</span> ')} <span class="nt">via ${goHTML(local(a.via), local(a.via), 'overlay', 'n')}${a.note && Object.keys(a.note).length ? ' · ' + esc(noteText(a.note)) : ''}</span></div>`).join('');
+    const tree = nodes => `<ul class="sv-tree">${nodes.map(n => `<li>${goHTML(local(n.path), local(n.path), n.name, 'n')}${n.real ? `<span class="k">overlay${n.note ? ' · ' + esc(noteText(n.note)) : ''}</span>` : ''}${n.next && n.next.length ? tree(n.next) : ''}</li>`).join('')}</ul>`;
+    const count = ns => ns.reduce((a, n) => a + 1 + count(n.next || []), 0);
+    const refs = (rs, word) => rs.length ? `<div class="sv-sec"><div class="k">${word} · ${rs.length}</div>${rs.map(r => `<div class="sv-hop"><span class="lb">${esc(r.label)}</span> ${goHTML(local(r.path), local(r.path), r.name, 'n')}</div>`).join('')}</div>` : '';
+    // relations are read from slots: what this record (or a child record of it) names, and what names it, by label
+    const rel = t ? t.relations : [];
+    const groupBy = (rs, key) => rs.reduce((g, r) => { (g[key(r)] = g[key(r)] || []).push(r); return g; }, {});
+    const has = groupBy(rel.filter(r => r.way === 'out' || r.way === 'has'), r => r.label || 'related');
+    const of = rel.filter(r => r.way === 'in' || r.way === 'of');
+    const relHTML = (Object.keys(has).length || of.length) ? `<div class="sv-sec"><div class="k">relations · ${rel.length}</div>` +
+      Object.entries(has).map(([label, rs]) => `<div class="sv-by"><div class="sv-by-k">${esc(label)} <span class="n">${rs.length}</span></div>${rs.map(r => `<div class="sv-hop">${goHTML(local(r.other), local(r.other), r.name, 'n')}${r.note && Object.keys(r.note).length ? ` <span class="s">${esc(noteText(r.note))}</span>` : ''}</div>`).join('')}</div>`).join('') +
+      of.map(r => `<div class="sv-hop"><span class="lb">${esc((r.label || 'related') + ' of')}</span> ${goHTML(local(r.other), local(r.other), r.name, 'n')}${r.note && Object.keys(r.note).length ? ` <span class="s">${esc(noteText(r.note))}</span>` : ''}</div>`).join('') + '</div>' : '';
+    // the record as a world: its relations unfolded into virtual folders, computed from the facts, nothing stored
+    const u = source.unfold ? await source.unfold(at, 3).catch(() => null) : null;
+    if (mine !== drawn) return;
+    const here = local(at).split('/')[0];
+    const badge = it => (it.world && it.world !== here ? ` <span class="sv-wb" title="this record lives in world ${esc(it.world)}">${esc(it.world)}</span>` : '') + (it.by && it.by !== here && it.by !== it.world ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
+    const world_ = fs => `<ul class="sv-tree sv-world">${fs.map(f => `<li><span class="vf">${esc(f.label)}</span><ul class="sv-tree">${f.items.map(it => `<li>${goHTML(local(it.path), local(it.path), it.name, 'n')}${badge(it)}${it.note && Object.keys(it.note).length ? ` <span class="s">${esc(noteText(it.note))}</span>` : ''}${it.folders && it.folders.length ? world_(it.folders) : ''}</li>`).join('')}</ul></li>`).join('')}</ul>`;
+    const worldHTML = u && u.length ? `<div class="sv-sec"><div class="k">as a world</div>${world_(u)}</div>` : '';
+    const contentsHTML = t ? worldHTML + relHTML + (t.descendants.length ? `<div class="sv-sec"><div class="k">beneath · ${count(t.descendants)}</div>${tree(t.descendants)}</div>` : '') : '';
+    const inTree = new Set();
+    const parts = kids.filter(k => !inTree.has(local(k.path)) && (!t || ['talk', 'mentions', 'views', 'asks'].includes(k.name)));
     const rows = parts.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
     // drawn at once; what points here comes from the index, grouped by slot; a walk over the world is the fallback
-    main.innerHTML = chainHTML + card + contentsHTML + `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>` + (rows ? `<div class="sv-sec sv-parts"><div class="k">beneath</div>${rows}</div>` : '') + `<div class="sv-sec sv-cand-sec"></div>`;
+    main.innerHTML = chainHTML + card + contentsHTML + `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>` + (rows ? `<div class="sv-sec sv-parts"><div class="k">${t ? 'its parts' : 'beneath'}</div>${rows}</div>` : '') + `<div class="sv-sec sv-cand-sec"></div>`;
     const hop = m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}${m.hole ? '<span class="h">waiting</span>' : ''}</div>`;
     let groups = source.by ? await source.by(at).catch(() => null) : null;
     if (mine !== drawn) return;
@@ -788,9 +808,9 @@ function mountRecord(el, source, opts = {}) {
     }
     const sec = main.querySelector('.sv-back-sec');
     if (sec) {
-      const slots = Object.keys(groups || {}).filter(k => !['in', 'within', 'part_of', 'parent'].includes(k)).sort((a, b) => (a === 'mentioned') - (b === 'mentioned') || a.localeCompare(b));
+      const slots = Object.keys(groups || {}).filter(k => k === 'mentioned' || !t).sort((a, b) => (a === 'mentioned') - (b === 'mentioned') || a.localeCompare(b));
       const total = slots.reduce((n, k) => n + groups[k].length, 0);
-      sec.innerHTML = `<div class="k">pointing here${total ? ' · ' + total : ''}</div>` + (slots.map(k => `<div class="sv-by"><div class="sv-by-k">${esc(k)} <span class="n">${groups[k].length}</span></div>${groups[k].map(hop).join('')}</div>`).join('') || '<div class="sv-empty">nothing points here yet</div>');
+      sec.innerHTML = `<div class="k">${t ? 'mentioned in' : 'pointing here'}${total ? ' · ' + total : ''}</div>` + (slots.map(k => `<div class="sv-by"><div class="sv-by-k">${esc(k)} <span class="n">${groups[k].length}</span></div>${groups[k].map(hop).join('')}</div>`).join('') || '<div class="sv-empty">nothing points here yet</div>');
     }
     if (source.candidates) {
       const cands = await source.candidates(at).catch(() => []);
