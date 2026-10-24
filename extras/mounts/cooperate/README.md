@@ -8,6 +8,15 @@ cells and the provider request/outcome contract. Flows use those same records.
 The Codex mount supplies a native provider hand; model transport stays in its
 existing bridge.
 
+Attempt dispatch and settlement now use the same `native_work` transitions as
+answering and document revision. The attempt's retained request is its dispatch
+receipt; provider completion freezes its outcome once. Domain admission checks
+that outcome against the captured guard and applies its own result policy.
+Native activity phases gate hand reactions while dependencies hydrate, so
+controller-local sent/settled booleans do not own another execution lifecycle.
+Investigations remain open across delegated workers until explicit guarded
+completion; a provider result alone does not complete its investigation.
+
 From the repository root:
 
 ```sh

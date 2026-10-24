@@ -75,7 +75,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(first, (bag / 'repository-evidence.json').read_bytes())
         self.assertEqual(json.loads(first)['source']['content'].encode(), self.source.read_bytes())
 
-    def test_incomplete_capture_preserves_last_good_mount_bag(self):
+    def test_failed_evidence_does_not_block_shared_module_scan(self):
         host = runpy.run_path(str(Path(__file__).parents[1] / 'host.py'))
         bag = self.root / 'bag'
         bag.mkdir()
@@ -83,9 +83,12 @@ class InventoryTests(unittest.TestCase):
             host['scan'](self.root, bag)
             first = (bag / 'repository-evidence.json').read_bytes()
             self.source.unlink()
-            with self.assertRaises(FileNotFoundError):
-                host['scan'](self.root, bag)
-        self.assertEqual(first, (bag / 'repository-evidence.json').read_bytes())
+            (self.root / 'main.foil').write_text('+ changed\n  ^ nat\n  2\n')
+            host['scan'](self.root, bag)
+        fault = json.loads((bag / 'repository-evidence.json').read_text())
+        self.assertIn('capture_error', fault)
+        self.assertNotIn('source', fault)
+        self.assertEqual((bag / 'main.foil').read_text(), '+ changed\n  ^ nat\n  2\n')
 
 
 if __name__ == '__main__':

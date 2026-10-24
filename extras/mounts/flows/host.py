@@ -65,12 +65,17 @@ capture_workspace = None
 
 def scan(root, bag):
     repo = Path(os.environ.get('SHRINE_FLOW_SOURCE_ROOT') or capture_workspace or root.parents[2])
-    bundle = capture_sources(repo, root / 'sources.json')
     for path in root.iterdir():
         if path.is_file():
             shutil.copyfile(path, bag / path.name)
+    # A configured inventory is external evidence, not a prerequisite for
+    # installing or recompiling the shared harness in another workspace.
+    try:
+        value = capture_sources(repo, root / 'sources.json')['sources']
+    except (OSError, ValueError, KeyError, UnicodeError) as error:
+        value = {'capture_error': str(error)}
     (bag / 'repository-evidence.json').write_text(
-        json.dumps(bundle['sources'], ensure_ascii=False), encoding='utf-8')
+        json.dumps(value, ensure_ascii=False), encoding='utf-8')
 
 
 def prepare(root, work, check, cleanup, context):
