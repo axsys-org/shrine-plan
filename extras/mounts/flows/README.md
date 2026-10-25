@@ -27,6 +27,27 @@ These forms call `namespace_command/plan` and supervisor admission. They do not
 run Python commands or maintain a browser-owned work queue. Generic Nenex embeds
 and the shared Cells surface remain available to authored documents.
 
+### Nenex pages as live evidence
+
+For a document revision flow, create and edit an evidence page in Nenex. On the
+flow's authoring page, use **Bind Nenex source page**, giving its namespace path
+and the evidence key declared in the procedure's `/flow/uses`. This creates an
+ordinary spun cell at `<author>/cells/<key>_source` and fills the `sources` input
+with `/x/<author>/cells/<key>_source`. Publish and attach using the same page tools.
+
+The cell reads the page's local `x` value. Its source envelope cites the exact
+native historical `x` reference; it does not pretend the page is a captured file
+or manufacture a SHA-256 digest. Existing native dependency tracking wakes the
+maintenance hand when the page changes. Frozen attempts retain their old source
+snapshot, draft, overlay and response. An empty revision result leaves a persistent
+hole; **Retry revision** creates a linked attempt, and changed evidence resumes
+through the same shared lifecycle. There is no page-source hand or scheduler.
+
+The native operation is `bind_page_source` at the author page, with a live `x`
+`source` reference and a one-segment `name` path. Rebinding the same source is
+idempotent; an occupied cell is refused rather than overwritten. File evidence
+continues to use its existing capture digest and source hand.
+
 ## Definition contract
 
 A section marked `/flow/definition NAME` contains a composition.
