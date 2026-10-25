@@ -33,6 +33,103 @@
 (define (prepare version)
   (pub:prepare native-selection (Pin "compiler") read
     [["library" root] ["app" app]] [] (lambda (path) version)))
+;; A rebuilt module keeps exact native type moments, independently of the
+;; record case used to publish its new pinned artifact.
+(define (reuse-tests ignored)
+  (define roots [["model" root] ["consumer" app]])
+  (define (tree text) (rex:ParseRexNormFile text))
+  (define (build text imported retained version)
+    (define prepared (pub:prepare-reusing native-selection (Pin "compiler")
+      (lambda (name) (tree (If (Equal name "model") (strcat [text "
++ recursive (: next=maybe[recursive])
++ accepts
+  \ p=pail
+  ^ nat
+  ? (node/try_from_pail p)
+   > (./some _) 1
+   > .none 0
+"])
+        "- model
++ wrapper (: item=node)
++ value (wrapper (node 5))
+")))
+      roots imported (lambda (path) version) retained))
+    (pub:compile prepared driver:empty-foil-cache))
+  (define original (build
+    "+ node (: n=nat)
++ alias node
++ helper 1
++ value (node 5)
+" [] [] 0))
+  (define old-images (_2 original))
+  (define old-model (Unpin (_1 (_0 old-images))))
+  (define old-consumer (Unpin (_1 (_1 old-images))))
+  (define changed (build
+    "+ node (: n=nat)
++ alias node
++ helper 2
++ value (node 5)
+" [] old-images 1))
+  (define new-model (Unpin (_1 (_0 (_2 changed)))))
+  (define new-consumer (Unpin (_1 (_1 (_2 changed)))))
+  (assert-impl "unchanged record retains its exact brand"
+    (Equal (driver:get-perc ["value"] old-model)
+           (driver:get-perc ["value"] new-model)))
+  (assert-impl "dependent record keeps its brand across helper edits"
+    (Equal (driver:get-perc ["value"] old-consumer)
+           (driver:get-perc ["value"] new-consumer)))
+  (assert-impl "changed function/value is rebuilt"
+    (Eq 2 (driver:get-perc ["helper"] new-model)))
+  (assert-impl "new native projector accepts an old stored record"
+    (Eq 1 ((driver:get-perc ["accepts"] new-model)
+      (driver:get-perc ["value"] old-model))))
+  ;; The retained artifact can predate the latest physical publication case.
+  (define repeated (build
+    "+ node (: n=nat)
++ alias node
++ helper 3
++ value (node 5)
+" [] (_2 changed) 7))
+  (assert-impl "type identity is not the latest record case"
+    (Equal (driver:get-perc ["value"] old-model)
+      (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 repeated)))))))
+  (define schema (build
+    "+ node (: number=nat)
++ alias node
++ helper 2
++ value (node 5)
+" [] old-images 1))
+  (define newer (Unpin (_1 (_0 (_2 schema)))))
+  (define wrapper (Unpin (_1 (_1 (_2 schema)))))
+  (assert-impl "changed record receives a new moment"
+    (Nil (Equal (Hd (driver:get-perc ["value"] old-model))
+      (Hd (driver:get-perc ["value"] newer)))))
+  (assert-impl "schema change propagates across modules"
+    (Nil (Equal (Hd (driver:get-perc ["value"] old-consumer))
+      (Hd (driver:get-perc ["value"] wrapper)))))
+  (assert-impl "changed schema refuses the old record"
+    (Eq 0 ((driver:get-perc ["accepts"] newer)
+      (driver:get-perc ["value"] old-model))))
+  (define imported-change (build "" [["model" (_1 (_0 (_2 schema)))]] old-images 2))
+  (assert-impl "a changed imported schema invalidates a dependent type"
+    (Nil (Equal (Hd (driver:get-perc ["value"] old-consumer))
+      (Hd (driver:get-perc ["value"]
+        (Unpin (_1 (_0 (_2 imported-change)))))))))
+  (define model-unit (subject:sut-context (driver:perc-subject newer)))
+  (assert-impl "an independent recursive type survives a neighboring schema change"
+    (Equal [[(Weld root [["ts" "recursive"]]) 1]]
+      (contexts:find-moment model-unit ["recursive"])))
+  (define aliased (subject:sut-context (driver:perc-subject newer)))
+  (assert-impl "alias follows changed schema"
+    (Equal [[(Weld root [["ts" "alias"]]) 2]]
+      (contexts:find-moment aliased ["alias"])))
+  ;; Definition products still guard against the actual current store case.
+  (assert-impl "reused type publication retains its real predecessor"
+    (all (lambda (record) (Eq 7 (_1 record)))
+      (pub:definition-records repeated)))
+  [original changed])
+(define reuse-products (reuse-tests 0))
+
 (define plan (prepare 0))
 (define compiled (pub:compile plan driver:empty-foil-cache))
 (define artifacts (_2 compiled))
@@ -101,6 +198,18 @@ assert(Equal [[(Weld root [["ts" "tree"] ["ts" "leaf"]]) 1]]
   (Unpin (_1 (need (find (lambda (pair) (Equal "compiler_publication" (_0 pair)))
     (_2 initial-policy-code))))))
 (define empty (driver:get-perc ["sov" "new"] policy))
+(define reuse-first (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_0 reuse-products) 0 0 empty))
+assert(Equal "ok" (Hd reuse-first))
+(define reuse-second (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_1 reuse-products) 0 0 (_0 reuse-first)))
+assert(Equal "ok" (Hd reuse-second))
+assert(Equal "err" (Hd (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_1 reuse-products) 0 0 (_0 reuse-second))))
+
 (define slot [("x" 7) ("ts" "compiler") ("ts" "artifact")])
 (define first (pub:publish policy slot ("x" 7) compiled 0 0 empty))
 assert(Equal "ok" (Hd first))
@@ -185,7 +294,7 @@ assert(Equal (strcat [(show-name (Hd value)) "(12)"])
   (show-value value 0))
 (define empty-brand (brand:encode
   (Weld root [["ts" "tree"] ["ts" "empty"]]) 1))
-assert(Equal (strcat [(show-name empty-brand) "()"])
+assert(Equal (show-name empty-brand)
   (show-value empty-brand 0))
 assert(Equal "12" (show-value 12 0))
 

@@ -161,11 +161,20 @@ initial refresh through the updated flow HTTP handler before their stored page
 tool displays the new control. Captured definitions and old attempts retain their
 chosen laws. Refresh refuses `flow_runtime_requires_type_migration` when live
 controller, claims, question or hole records belong to another nominal type
-moment. Matching field layouts do not make those definitions identical. Native
-publication currently assigns new moments to all declarations in a rebuilt
-module; upgrading such a running world needs native type reuse or an explicit
-migration. This command does not silently rebrand stored values or replace
-captured laws.
+moment. Native source publication compares elaborated type schemes against the
+mount's retained artifacts and reuses unchanged types' exact defining moments.
+The comparison keeps dependencies and opaque constants exact; a schema change
+advances that type and invalidates reuse of its dependent types. Functions and
+values are rebuilt, and publication still checks the actual current record cases
+atomically. A new artifact's publication case is not automatically a new type
+identity. Stored values and captured laws are not rewritten.
+
+An existing saved service captures its compiler. After updating the native
+runtime, stop its writer and use `x/eden --upgrade` to replace the private
+bootstrap publisher, then restart normally and rescan the source mounts. The
+native upgrade verifies the complete retained namespace content hash before
+committing its continuation. It preserves compiler identity pins, documents,
+work records and every x/y/z history; it does not reinstall the world.
 
 Operations under `/<node>/gov/flows/` include `author`, `publish`, `preview`,
 `commit`, `follow`, `submit_revision`, `set_enabled`, `detach`, `import_source`,

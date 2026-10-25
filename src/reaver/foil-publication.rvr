@@ -22,7 +22,7 @@
 ;; previous receives a canonical aura/payload path and returns its current
 ;; x data case (zero when absent). Imports supplied as pinned artifacts reuse
 ;; their assigned moments and are never included in the new revision batch.
-(define (prepare system compiler read-rex roots artifacts previous)
+(define (prepare-reusing system compiler read-rex roots artifacts previous retained)
   (define (artifact name)
     (find (lambda (pair) (Equal name (_0 pair))) artifacts))
   (define source-roots
@@ -79,10 +79,15 @@
       (let ((authority (_0 (_1 (_0 source-roots)))))
         (If (Equal "x" (_0 authority))
           (context:with-who ((_0 authority) (_1 authority)) ctx) ctx))))
-  (force (plan-tag owned sources names expected 0)))
+  ;; Retained artifacts are comparison evidence, never imports. Every source
+  ;; still elaborates in this publication's frozen graph.
+  (force (plan-tag owned sources names expected 0 retained)))
+
+(define (prepare system compiler read-rex roots artifacts previous)
+  (prepare-reusing system compiler read-rex roots artifacts previous []))
 
 (define (checked plan)
-  (If (And (Eq plan-tag (Hd plan)) (Eq 5 (Sz plan))) plan
+  (If (And (Eq plan-tag (Hd plan)) (Or (Eq 5 (Sz plan)) (Eq 6 (Sz plan)))) plan
     (error "invalid-prepared-publication")))
 (define (compilation-context plan) (_0 (checked plan)))
 (define (expected-cases plan) (_3 (checked plan)))
@@ -130,11 +135,11 @@
       (If (ca:getax path out)
         (error ["duplicate-system-definition" path])
         (ca:putax path 0 out))) (expected-cases prepared) core:system-names))
-  (force (plan-tag (_0 prepared) (_1 prepared) (_2 prepared) expected 1)))
+  (force (plan-tag (_0 prepared) (_1 prepared) (_2 prepared) expected 1 [])))
 
 ;; Frozen source trees, including generated modules, are the only loader.
 ;; A missing artifact/source cannot silently fall through to the filesystem.
-(define (compile plan cache)
+(define (compile-once plan cache)
   (define ctx (compilation-context plan))
   (define (read name)
     (define found (find (lambda (pair) (Equal name (_0 pair))) (_1 plan)))
@@ -145,6 +150,91 @@
       [(_0 result) (snoc [(_0 pair) (Pin (_1 result))] (_1 state))])
       [cache []] (_2 plan)))
   (force (compiled-tag (Pin plan) (_0 result) (_1 result))))
+
+;; Compare complete native type schemes. Unlike display reflection this keeps
+;; opaque const arguments (including comparator laws) exact. Private storage
+;; keys are resolved to their defining moments; ordinary literals stay opaque.
+(define (type-identity sut typ)
+  (define (path-key path)
+    (define applied (subject:ty-ap-decode path))
+    (define exact (subject:definition-moment path sut))
+    (cond
+      (applied ["application" (map path-key applied)])
+      (exact ["definition" (_0 exact)])
+      (else path)))
+  (define (walk typ)
+    (If (nt:scheme? typ)
+      (nt:scheme (map (lambda (param)
+        (If (Equal "const" (nt:parameter-kind param))
+          (nt:const-param (nt:parameter-name param)
+            (walk (nt:const-param-type param))) param))
+        (nt:scheme-parameters typ)) (walk (nt:scheme-body typ)))
+      (nt:map-type (lambda (node)
+        (cond
+          ((nt:type-ref? node) (nt:type-ref (path-key (nt:type-ref-path node))))
+          ((nt:type-app? node)
+            (nt:type-app (path-key (nt:ty-app-base node))
+              (nt:ty-app-arguments node)))
+          (else node))) typ)))
+  (walk typ))
+
+;; Start existing type declarations at their retained moments, then withdraw
+;; reuse monotonically until all schemes agree. Recompiling after withdrawals
+;; propagates changes through aliases, records, unions and recursive types.
+;; Functions and values always receive the new publication's moments.
+(define (compile plan cache)
+  (define ctx (compilation-context plan))
+  (define retained (If (Eq 6 (Sz plan)) (Ix 5 plan) []))
+  (define (prior-entry name path)
+    (define found (find (lambda (pair) (Equal name (_0 pair))) retained))
+    (Ifz found 0
+      (let* ((sut (driver:perc-subject (Unpin (_1 (_0 found)))))
+             (unit (subject:sut-context sut))
+             (version (And unit (ca:getax path (_1 unit)))))
+        (Ifz version 0
+          (let* ((local (need (context:local-definition unit [path (_0 version)])))
+                 (tc (entry:ent-tc (entry:entry-parts sut
+                       (subject:root-path sut local)))))
+            (If (And (Eq "TC_TYP" (Hd tc))
+                  (Le (_0 version) (_0 (ca:getax path (expected-cases plan)))))
+              [[(_0 version) (type-identity sut (subject:tc-typ-inner tc))]] 0))))))
+  (define reusable
+    (foldl (lambda (out pair)
+      (foldl (lambda (out path)
+        (define prior (prior-entry (_0 pair) path))
+        (If prior (ca:putax path (_0 prior) out) out)) out (_1 pair)))
+      ca:empty-ax (definition-names plan)))
+  (define (select reuse)
+    (define moments (map (lambda (binding)
+      [(_0 binding) (foldl (lambda (out assignment)
+        (define prior (ca:getax (_0 assignment) reuse))
+        (ca:putax (_0 assignment)
+          (If prior (_0 (_0 prior)) (_1 assignment)) out))
+        ca:empty-ax (rowify (ca:tapax (_1 binding))))])
+      (rowify (ca:tapax (Ix 4 ctx)))))
+    (Up 4 (foldl (lambda (out binding)
+      (ca:putax (_0 binding) (_1 binding) out)) ca:empty-ax moments) ctx))
+  (define (settle reuse cache)
+    (define selected (select reuse))
+    (define candidate (Up 0 selected plan))
+    (define compiled (compile-once candidate cache))
+    (define remaining
+      (foldl (lambda (out binding)
+        (define sut (driver:perc-subject (Unpin (_1 binding))))
+        (define unit (subject:sut-context sut))
+        (foldl (lambda (out assignment)
+          (define path (_0 assignment))
+          (define prior (ca:getax path reuse))
+          (Ifz prior out
+            (let* ((local (need (context:local-definition unit assignment)))
+                   (tc (entry:ent-tc (entry:entry-parts sut (subject:root-path sut local)))))
+              (If (And (Eq "TC_TYP" (Hd tc))
+                    (Equal (_1 (_0 prior))
+                      (type-identity sut (subject:tc-typ-inner tc))))
+                (ca:putax path (_0 prior) out) out)))) out
+          (rowify (ca:tapax (_1 unit))))) ca:empty-ax (_2 compiled)))
+    (If (Equal reuse remaining) compiled (settle remaining (_1 compiled))))
+  (Ifz (Sz retained) (compile-once plan cache) (settle reusable cache)))
 
 ;; Recheck every predecessor against the store selected for commit. Neither
 ;; compiler cache results nor partially built artifacts are a publication.
@@ -184,7 +274,8 @@
       (definition-names plan)))))
     (Weld records (map (lambda (path)
       (define prior (_0 (ca:getax path (expected-cases plan))))
-      (define local (need (context:local-definition unit [path (Inc prior)])))
+      (define local (need (context:local-definition unit
+        [path (_0 (ca:getax path (_1 unit)))])))
       (define key (subject:root-path sut local))
       (define part (entry:entry-parts sut key))
       (define doc (lore:lore-for (driver:perc-lore perc) local))
@@ -213,6 +304,6 @@
     (context:publication-key ctx) slot (force (definition-records compiled))
     now block))
 
-(#export prepare compilation-context expected-cases definition-names
+(#export prepare prepare-reusing compilation-context expected-cases definition-names
          compile verify-predecessors definition-records publish publish-local
          prepare-system assign-system publish-system)

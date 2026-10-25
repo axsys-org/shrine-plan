@@ -20,6 +20,9 @@ static pl_store* destination;
 static pl_thread* thread;
 static pl_val replacement;
 static unsigned replacements;
+static pl_val publisher_before, publisher_after;
+static unsigned publisher_replacements;
+static bool publication_pass;
 
 static int fail(const char* message) {
   fprintf(stderr, "Eden upgrade: %s\n", message);
@@ -42,6 +45,19 @@ static bool bootstrap_module(pl_val value) {
          text_is(pl_app_head(pl_ptr(object)), "/foil/artifact/v3perc") &&
          text_is(pl_app_args(pl_ptr(object))[3], "eden_store");
 }
+/* These are immutable compiler evidence, including the compiler identity pin.
+ * A bootstrap law update must not rewrite their captured import contexts. */
+static bool compiler_evidence(pl_val value) {
+  pl_val object = body(value);
+  if (pl_tag(object) != PL_TAG_APP)
+    return false;
+  pl_val tag = pl_app_head(pl_ptr(object));
+  return text_is(tag, "/foil/artifact/v3perc") ||
+         text_is(tag, "foil/compiled-publication/v2") ||
+         text_is(tag, "foil/prepared-publication/v2") ||
+         text_is(tag, "foil/context/v2") ||
+         text_is(tag, "foil/system-build/v1");
+}
 static pl_val stable(pl_val value) {
   return pl_store_snapshot_normal(thread, pl_nf(thread, value));
 }
@@ -51,11 +67,20 @@ static pl_val copy(pl_val value, bool rewrite) {
   ptrdiff_t at = ax_hmgeti(memo, value);
   if (at >= 0)
     return memo[at].value;
-  if (rewrite && bootstrap_module(value)) {
+  if (rewrite && publication_pass && value == publisher_before) {
+    publisher_replacements++;
+    ax_hmput(memo, value, publisher_after);
+    return publisher_after;
+  }
+  if (rewrite && !publication_pass && bootstrap_module(value)) {
     pl_val next = pl_tag(value) == PL_TAG_PIN ? replacement : body(replacement);
     replacements++;
     ax_hmput(memo, value, next);
     return next;
+  }
+  if (rewrite && publication_pass && compiler_evidence(value)) {
+    ax_hmput(memo, value, value);
+    return value;
   }
   pl_val next = value;
   if (pl_is_nat(value)) {
@@ -125,6 +150,28 @@ static pl_val find_module(pl_val value) {
   return 0;
 }
 
+/* Only the bootstrap's mount-publication law is replaceable. Captured
+ * operation laws inside the retained namespace are never traversed. */
+static pl_val find_publisher(pl_val value, unsigned* count) {
+  if (pl_is_nat(value) || compiler_evidence(value) || ax_hmgeti(memo, value) >= 0)
+    return 0;
+  ax_hmput(memo, value, value);
+  if (pl_tag(value) == PL_TAG_LAW &&
+      text_is(pl_law_name(pl_ptr(value)), "publish-mount")) {
+    (*count)++;
+    return value;
+  }
+  pl_val found = 0;
+  if (pl_tag(value) == PL_TAG_PIN)
+    return find_publisher(body(value), count);
+  for (uint32_t i = 0; i < pl_nf_nfields(value); i++) {
+    pl_val next = find_publisher(pl_nf_field(value, i), count);
+    if (next != 0)
+      found = next;
+  }
+  return found;
+}
+
 int main(int argc, char** argv) {
   if (argc != 4 ||
       (strcmp(argv[1], "export-code") && strcmp(argv[1], "upgrade"))) {
@@ -146,8 +193,12 @@ int main(int argc, char** argv) {
   if (!pl_store_get_root(source, hash))
     return fail("compiler artifact has no root");
   pl_val code = pl_store_load(source_thread, hash), object = body(code);
-  if (pl_tag(object) != PL_TAG_APP || pl_app_n(pl_ptr(object)) != 1 ||
-      !text_is(pl_app_head(pl_ptr(object)), "eden-bootstrap-upgrade/v1") ||
+  bool publication_upgrade = pl_tag(object) == PL_TAG_APP &&
+      pl_app_n(pl_ptr(object)) == 2 &&
+      text_is(pl_app_head(pl_ptr(object)), "eden-bootstrap-upgrade/v2");
+  if (pl_tag(object) != PL_TAG_APP ||
+      !(publication_upgrade || (pl_app_n(pl_ptr(object)) == 1 &&
+        text_is(pl_app_head(pl_ptr(object)), "eden-bootstrap-upgrade/v1"))) ||
       pl_tag(pl_app_args(pl_ptr(object))[0]) != PL_TAG_PIN)
     return fail("not a prepared bootstrap compiler artifact");
 
@@ -200,10 +251,37 @@ int main(int argc, char** argv) {
   replacement = pl_app_args(pl_ptr(compiled))[1];
   if (pl_tag(constructor) != PL_TAG_PIN || !bootstrap_module(replacement))
     return fail("invalid bootstrap replacement; existing root retained");
+  if (publication_upgrade) {
+    unsigned old_count = 0, new_count = 0;
+    publisher_before = find_publisher(service, &old_count);
+    ax_hmfree(memo);
+    publisher_after = find_publisher(pl_app_args(pl_ptr(body(code)))[1], &new_count);
+    ax_hmfree(memo);
+    fprintf(stderr, "Publisher candidates: old=%u new=%u arity=%u/%u\n",
+      old_count, new_count,
+      publisher_before ? pl_law_arity(pl_ptr(publisher_before)) : 0,
+      publisher_after ? pl_law_arity(pl_ptr(publisher_after)) : 0);
+    if (old_count != 1 || new_count != 1 ||
+        pl_law_arity(pl_ptr(publisher_before)) !=
+          pl_law_arity(pl_ptr(publisher_after)))
+      return fail("mount publisher closure ABI differs; existing root retained");
+  }
   pl_val updated = copy(service, true);
   ax_hmfree(memo);
   if (replacements != 1)
     return fail("ambiguous bootstrap module; existing root retained");
+  if (publication_upgrade) {
+    unsigned count = 0;
+    publisher_before = find_publisher(updated, &count);
+    ax_hmfree(memo);
+    if (count != 1)
+      return fail("ambiguous mount publisher; existing root retained");
+    publication_pass = true;
+    updated = copy(updated, true);
+    ax_hmfree(memo);
+    if (publisher_replacements != 1)
+      return fail("mount publisher was not replaced; existing root retained");
+  }
   pl_val partial = pl_apply(thread, body(constructor), updated);
   pl_val prepared = stable(pl_apply(thread, partial, state));
   if (pl_tag(prepared) != PL_TAG_APP || pl_app_n(pl_ptr(prepared)) != 2)
