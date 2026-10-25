@@ -340,26 +340,70 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
 });
 
-test('an explicit overlay view shows immediately, skips backlog, and coalesces history polls', async () => {
-  const path = '/o/1/4/0x11/gov/nenex_ui/record_lens/7/0x11/user/external_records/snapshots/s_one/pages/p_91/record_91412';
+test('an explicit overlay watches its native result, coalesces reads and skips unchanged renders', async () => {
+  const path = '/o/1/4/0x11/gov/example/lens/2/0x11/data';
   const calls = [], shown = [], ticks = [];
-  let epoch = 200, release;
+  let value = 'old', release;
   const fetch = async (url, options) => {
-    const args = JSON.parse(options.body).params.arguments; calls.push(args);
+    const call = JSON.parse(options.body).params; calls.push(call);
+    assert.equal(call.name, 'mcp/read', 'scoped views never request global history');
     if (release === 'hold') await new Promise(resolve => { release = resolve; });
-    return {json: async () => ({result: {structuredContent: {events: [{epoch}], next: null}}})};
+    const node = {path, exists: true, properties: {'/value': value}, children: [], next: null};
+    return {json: async () => ({result: {structuredContent: call.arguments.reads ? {answers: [node]} : node}})};
   };
-  const source = mcpSource({views: path, fetch, EventSource: null, setInterval: f => (ticks.push(f), 1), clearInterval() {}});
-  const follow = source.follow(msg => { shown.push(msg.shown.path); if (shown.length === 1) assert.equal(calls.length, 0, 'render before any history request'); });
-  await follow.ready;
-  assert.deepEqual(shown, [path.slice(1)]);
-  assert.deepEqual(calls, [{before: 0, limit: 1}], 'no bulk history and no inlined historic records');
-  release = 'hold'; epoch++;
+  const source = mcpSource({views: path, fetch, setInterval: f => (ticks.push(f), 1), clearInterval() {}});
+  const following = source.follow(async msg => { source.beginFrame(); shown.push((await source.read(msg.shown.path, 'y')).record.value); });
+  await following.ready;
+  await ticks[0](); assert.deepEqual(shown, ['old']);
+  release = 'hold'; value = 'new';
   const first = ticks[0](); await ticks[0]();
-  assert.equal(calls.length, 2, 'only one pending poll');
-  release(); await first; await new Promise(r => setImmediate(r));
-  assert.equal(shown.length, 2, 'a new event refreshes derived dependencies');
-  follow.stop(); await ticks[0](); assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3, 'only one pending refresh read');
+  release(); await first;
+  assert.deepEqual(shown, ['old', 'new']);
+  following.stop(); const count = calls.length; await ticks[0](); assert.equal(calls.length, count);
+});
+
+test('a live cell refreshes when bound evidence changes without changing the cell definition case', async () => {
+  let value = 2, draws = 0, fail = false;
+  const ticks = [], m = fakeMcp((name, a) => {
+    assert.equal(name, 'mcp/read');
+    const node = p => p === headcount.path ? headcount : p.startsWith('/c/x') ? cOf(headcount.path, {'/sys/tack/case': String(value)}) : xOf(headcount.path, {'/headcount': String(value)});
+    return a.reads || a.paths ? {answers: (a.reads || a.paths).map(r => node(typeof r === 'string' ? r : r.path))} : headcount;
+  });
+  const source = mcpSource({views: headcount.path, fetch: m.fetch, setInterval: f => (ticks.push(f), 1), clearInterval() {}});
+  const following = source.follow(async () => { draws++; source.beginFrame(); await source.graph(); return !fail; });
+  await following.ready;
+  await ticks[0](); assert.equal(draws, 1, 'unrelated world writes do not matter');
+  assert.deepEqual(m.calls.at(-1).args.reads[0], {path: headcount.path, care: 'x', limit: 1}, 'physical subtree uses its native cases, not a full reread');
+  fail = true; value = 3;
+  await ticks[0](); assert.equal(draws, 2);
+  fail = false; await ticks[0](); assert.equal(draws, 3, 'a failed rendering retries without needing another write');
+  await ticks[0](); assert.equal(draws, 3);
+  following.stop();
+});
+
+test('one render reuses the graph record and cell result, and the next render reads fresh evidence', async () => {
+  let value = 2;
+  const m = fakeMcp((name, a) => a.reads || a.paths
+    ? {answers: (a.reads || a.paths).map(p => p.startsWith('/c/x') ? cOf(headcount.path, {}) : xOf(headcount.path, {'/headcount': String(value)}))}
+    : headcount);
+  const source = mcpSource({views: headcount.path, fetch: m.fetch});
+  source.beginFrame(); await source.graph();
+  await source.read(headcount.path, 'x'); await source.read(headcount.path, 'y');
+  assert.equal((await source.answer(headcount.path)).tree.slots.headcount, 2);
+  assert.equal(m.calls.length, 2, 'outline, summary and expanded card share two native reads');
+  value = 3; source.beginFrame(); await source.graph();
+  assert.equal((await source.answer(headcount.path)).tree.slots.headcount, 3);
+  assert.equal(m.calls.length, 4, 'no result cache crosses a render');
+});
+
+test('record read failures stay visible and do not claim the record is absent', async () => {
+  const el = fakeEl();
+  const source = {read: async () => { throw new Error('request timed out'); }, follow(fn) { this.handler = fn; return {stop() {}}; }};
+  live.mountRecord(el, source, {at: N});
+  assert.equal(await source.handler({shown: {path: N}}), false);
+  assert.match(el.querySelector('.sv-recview').innerHTML, /role="alert">Could not load this view/);
+  assert.doesNotMatch(el.querySelector('.sv-recview').innerHTML, /nothing here/);
 });
 
 test('address path slots and references have navigable live-view links', () => {

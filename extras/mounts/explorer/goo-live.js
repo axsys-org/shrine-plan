@@ -50,6 +50,7 @@ function mountViewer(el, source, opts = {}) {
   }
   async function draw(ev) {
     state.drawn = true;
+    source.beginFrame?.();
     await index();
     $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
     chip().catch(() => {});
@@ -62,10 +63,10 @@ function mountViewer(el, source, opts = {}) {
   }
 
   async function show(ev) {
-    try { await draw(ev); }
-    catch (error) { $('.sv-now').innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`; }
+    try { await draw(ev); return true; }
+    catch (error) { $('.sv-now').innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`; return false; }
   }
-  source.follow(async msg => {
+  const following = source.follow(async msg => {
     if (msg.shown) { const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return show(ev); }
     if (!msg.touched || !msg.touched.length) return;
     if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return show(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
@@ -73,7 +74,7 @@ function mountViewer(el, source, opts = {}) {
     return show(msg);
   });
   if (opts.crumb !== undefined) $('.sv-crumb').innerHTML = crumbHTML(opts.crumb);
-  return { draw };
+  return { draw, stop: () => following?.stop() };
 }
 
 // what a write moved: the cells that read any touched path, one hop
@@ -361,6 +362,16 @@ function mcpSource(opts = {}) {
   const doFetch = opts.fetch || ((u, o) => root.fetch(u, o)), ES = 'EventSource' in opts ? opts.EventSource : root.EventSource;
   const every = opts.setInterval || root.setInterval, clear = opts.clearInterval || root.clearInterval, later = opts.setTimeout || root.setTimeout;
   let seq = 0, latest = null;   // latest: the newest event's `with`, keyed by world path; the one payload a read may answer from
+  let frame = null;
+  let watchedRoot = null, watchedCells = new Map();
+  const derived = /^(?:x|c|o|h)\//.test(views);
+  const beginFrame = () => { frame = new Map(); watchedRoot = null; watchedCells = new Map(); };
+  const rootStamp = node => JSON.stringify(derived ? node : [node.reference_z, node.reference_y, node.reference, node.exists, node.properties]);
+  const remember = (node, care) => {
+    if (!frame || !node || node.error || node.paged) return;
+    frame.set(JSON.stringify([node.path, care, 0]), node);
+    frame.set(JSON.stringify([node.path, 'x', 0]), {...node, children: []});
+  };
   async function rpc(name, args) {
     const controller = new AbortController();
     const timeout = root.setTimeout(() => controller.abort(), opts.timeout || 15000);
@@ -375,19 +386,30 @@ function mcpSource(opts = {}) {
   const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
   async function read(path, care, cas) {
     const w = world(path), held = care === 'x' && !cas ? carried(w) : null;
-    return readOf(held || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 }));
+    const key = JSON.stringify([w, care || 'z', cas || 0]);
+    const cached = held || frame?.get(key);
+    const node = cached || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 });
+    if (!cached && !cas && w === world(views)) watchedRoot = {node, care: care || 'z', limit: 200};
+    return readOf(node);
   }
   async function answer(path) {
     const w = world(path), x = carried('/x' + w), c = carried('/c/x' + w);
     if (x && c) return answerOf(path, x, c);
+    const key = 'answer:' + w;
+    if (frame?.has(key)) return frame.get(key);
     const a = await rpc('read', { paths: ['/x' + w, '/c/x' + w], care: 'z', limit: 200 });
-    return answerOf(path, a.answers[0], a.answers[1]);
+    watchedCells.set(w, a.answers);
+    const result = answerOf(path, a.answers[0], a.answers[1]);
+    frame?.set(key, result);
+    return result;
   }
   // the cells under the views folder, three levels down (a plan, a qa tree with its diff and score folders);
   // a folder with a hundred or more children is left unopened
   async function graph() {
     if (!views) return { sources: [], cells: [] };
     const folder = await rpc('read', { path: world(views), care: 'y', limit: 500 });
+    watchedRoot = {node: folder, care: 'y', limit: 500};
+    remember(folder, 'y');
     const cells = [], sources = new Set(), seen = new Set();
     const take = ch => {
       if (!ch.properties || !('/sys/weft' in ch.properties) || seen.has(ch.path)) return;
@@ -410,9 +432,22 @@ function mcpSource(opts = {}) {
     }
     if (cells.length) {
       const a = await rpc('read', { reads: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });
-      cells.forEach((c, i) => { const r = answerOf(c.path, a.answers[2 * i], a.answers[2 * i + 1]); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
+      cells.forEach((c, i) => { const pair = a.answers.slice(2 * i, 2 * i + 2), r = answerOf(c.path, ...pair); watchedCells.set(world(c.path), pair); frame?.set('answer:' + world(c.path), r); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
+  }
+  async function changed() {
+    if (!watchedRoot) return true;
+    const previous = watchedRoot, cells = [...watchedCells];
+    // Physical y/z cases cover the displayed subtree. A live cell's own x case
+    // does NOT advance when its tack changes: compare its native result/context
+    // too. Derived overlays likewise have no physical subtree case to watch.
+    const reads = [{path: world(views), care: derived ? previous.care : 'x', limit: derived ? previous.limit : 1},
+      ...cells.flatMap(([p]) => [{path: '/x' + p, care: 'z', limit: 200}, {path: '/c/x' + p, care: 'z', limit: 200}])];
+    const page = await rpc('read', {reads});
+    if (!page.answers || page.answers.some(a => !a || a.error)) throw new Error('Could not refresh this view');
+    return rootStamp(page.answers[0]) !== rootStamp(previous.node)
+      || cells.some(([, pair], i) => JSON.stringify(pair) !== JSON.stringify(page.answers.slice(2 * i + 1, 2 * i + 3)));
   }
   // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
   async function qa() {
@@ -432,20 +467,18 @@ function mcpSource(opts = {}) {
     // A requested record is a view, not a replay of unrelated global writes.
     // Derived paths are refreshed on writes too: their dependencies may live elsewhere.
     if (views) {
-      let stopped = false, timer = null, busy = false, last = null;
+      let stopped = false, timer = null, busy = false, redraw = true;
       const shown = () => handler({ shown: { path: views, care: 'y', case: 0 } });
       async function poll() {
         if (stopped || busy) return;
         busy = true;
         try {
-          const page = await rpc('history', { before: 0, limit: 1, ...(who ? { who } : {}) });
-          const epoch = (page.events || [])[0]?.epoch || 0;
-          if (last !== null && epoch !== last && !stopped) await shown();
-          last = epoch;
+          // Poll this view, never scan the global journal for a non-system writer.
+          if (!redraw) redraw = await changed();
+          if (redraw && !stopped) redraw = (await shown()) === false;
         } finally { busy = false; }
       }
-      const ready = Promise.resolve().then(shown).then(async () => {
-        if (stopped) return;
+      const ready = Promise.resolve().then(async () => {
         await poll().catch(() => {});
         if (!stopped) timer = every(() => poll().catch(() => {}), 2000);
       });
@@ -482,7 +515,7 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc };
+  return { read, answer, graph, follow, qa, rpc, beginFrame };
 }
 
 const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
@@ -492,22 +525,29 @@ function mountRecord(el, source, opts = {}) {
   const main = el.querySelector('.sv-recview');
   let timer = null;
   async function draw() {
-    const r = await source.read(at, 'y').catch(() => null);
-    if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return; }
+    source.beginFrame?.();
+    try {
+    const r = await source.read(at, 'y');
+    if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return true; }
     const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
     const kids = (r.kids || []).map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
     let back = '';
     if (source.backlinks) { const rb = await source.backlinks(at).catch(() => ({ matches: [] })); back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join(''); }
     main.innerHTML = card + (kids ? `<div class="sv-sec"><div class="k">beneath</div>${kids}</div>` : '') + (source.backlinks ? `<div class="sv-sec"><div class="k">pointing here</div>${back || '<div class="sv-empty">nothing points here yet</div>'}</div>` : '');
+    return true;
+    } catch (error) {
+      main.innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`;
+      return false;
+    }
   }
-  draw();
-  if (source.follow) source.follow(msg => { if (msg.shown) { draw().catch(() => {}); return; } if (msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });
+  const following = source.follow?.(msg => { if (msg.shown) return draw(); if (msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });
+  if (!source.follow) draw();
   el.addEventListener('click', e => {
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
     e.preventDefault(); const href = a.getAttribute('href');
     (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { root.location.search = href.slice(1); });
   });
-  return { draw };
+  return { draw, stop: () => { clearTimeout(timer); following?.stop(); } };
 }
 
 
