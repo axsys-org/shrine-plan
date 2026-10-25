@@ -177,6 +177,8 @@ function mountViewer(el, source, opts = {}) {
     if (opts.flip) opts.flip(folder); else nav('?at=/' + local(path) + chatQ());
   }
   el.addEventListener('click', e => {
+    const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
+    if (o) { e.preventDefault(); if (openFolder) openFolder(o); return; }
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
     e.preventDefault(); go(a.dataset.go, a.dataset.folder);
   });
@@ -635,6 +637,7 @@ function mcpSource(opts = {}) {
     return out;
   }
   async function unfold(path, depth) { const r = await index('/unfold?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? r.folders || [] : null; }
+  async function union(path) { const r = await index('/union?at=' + encodeURIComponent(world(path))); return r && r.ready ? r : null; }
   async function around(path, depth) { const r = await index('/around?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 2)); return r ? { real: r.real, ancestors: r.ancestors || [], descendants: r.descendants || [], relations: r.relations || [], refsOut: r.refs_out || [], refsIn: r.refs_in || [], parts: r.parts || [] } : null; }
   async function candidates(path) { const r = await index('/candidates' + (path ? '?in=' + encodeURIComponent(world(path)) : '')); return r ? (r.candidates || []) : []; }
   async function backlinks(path) {
@@ -722,7 +725,7 @@ function mcpSource(opts = {}) {
     await rpc('write', { records: [{ path, slots }], who: who || 'person' });
     return path;
   }
-  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, around, unfold };
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, around, unfold, union };
 }
 
 // the record page: one record, its slots (each reference a link), what is beneath it, and what points at it; every
@@ -733,6 +736,7 @@ function mountRecord(el, source, opts = {}) {
   const at = local(opts.at), node = at.split('/')[0];
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${source.sayAt ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
   const main = el.querySelector('.sv-recview');
+  let openFolder = null;            // set by draw: opens a closed folder of the unfolded world in place
   // the talk at this record: its turns live at <record>/talk/turns, its lens at <record>/talk/context
   if (source.sayAt) {
     const agent = '/' + at + '/talk', talk = el.querySelector('.sv-talk-here'), form = el.querySelector('.sv-chat');
@@ -789,10 +793,56 @@ function mountRecord(el, source, opts = {}) {
     const u = source.unfold ? await source.unfold(at, 3).catch(() => null) : null;
     if (mine !== drawn) return;
     const here = local(at).split('/')[0];
-    const badge = it => (it.world && it.world !== here ? ` <span class="sv-wb" title="this record lives in world ${esc(it.world)}">${esc(it.world)}</span>` : '') + (it.by && it.by !== here && it.by !== it.world ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
-    const world_ = fs => `<ul class="sv-tree sv-world">${fs.map(f => `<li><span class="vf">${esc(f.label)}</span><ul class="sv-tree">${f.items.map(it => `<li>${goHTML(local(it.path), local(it.path), it.name, 'n')}${badge(it)}${it.note && Object.keys(it.note).length ? ` <span class="s">${esc(noteText(it.note))}</span>` : ''}${it.folders && it.folders.length ? world_(it.folders) : ''}</li>`).join('')}</ul></li>`).join('')}</ul>`;
-    const worldHTML = u && u.length ? `<div class="sv-sec"><div class="k">as a world</div>${world_(u)}</div>` : '';
-    const contentsHTML = t ? worldHTML + relHTML + (t.descendants.length ? `<div class="sv-sec"><div class="k">beneath · ${count(t.descendants)}</div>${tree(t.descendants)}</div>` : '') : '';
+    const badge = it => {
+      const ws = (it.worlds && it.worlds.length ? it.worlds : [it.world]).filter(Boolean);
+      // one badge per world that describes the thing: several badges mean the worlds intersect here
+      return (ws.length > 1 || (ws[0] && ws[0] !== here) ? ws.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}" title="described in world ${esc(w)}">${esc(w)}</span>`).join('') : '') +
+        (it.by && it.by !== here && !ws.includes(it.by) ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
+    };
+    // a reading, not a crawl: folders beyond the subject arrive closed, as counts, and open on demand
+    const folder_ = (f, parent) => f.closed
+      ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}"><span class="vf">${esc(f.label)}</span> <span class="n">${f.more}</span></button></li>`
+      : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => `<li${it.seen ? ' class="seen"' : ''}>${goHTML(local(it.path), local(it.path), it.name, 'n')}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.note && Object.keys(it.note).length ? ` <span class="s">${esc(noteText(it.note))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
+    const world_ = (fs, parent) => `<ul class="sv-tree sv-world">${fs.map(f => folder_(f, parent)).join('')}</ul>`;
+    openFolder = async btn => {
+      btn.disabled = true;
+      const fs = await source.unfold(btn.dataset.open, 1).catch(() => null);
+      const f = (fs || []).find(x => x.label === btn.dataset.label);
+      if (!f) { btn.disabled = false; return; }
+      const li = btn.closest('li'), holder = document.createElement('ul');
+      holder.innerHTML = folder_(f, btn.dataset.open);
+      // "n more" sits inside an open folder: replace the whole folder; a closed folder replaces itself
+      const target = btn.textContent.endsWith('more') ? li.parentElement.closest('li') : li;
+      target.replaceWith(holder.firstElementChild);
+    };
+    const worldHTML = u && u.length ? `<div class="sv-sec"><div class="k">as a world</div>${world_(u, at)}</div>` : '';
+    // one thing, several worlds: the intersection found by same links, then the union of what each world says
+    const un = source.union ? await source.union(at).catch(() => null) : null;
+    if (mine !== drawn) return;
+    const wbs = ws => ws.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}">${esc(w)}</span>`).join('');
+    // collapsed to what the worlds agree and differ on; everything each world says waits behind a second fold
+    const factHTML = f => `<div class="sv-hop${f.all ? ' sv-agree' : ''}"><span class="lb">${esc(f.labels.join(' / '))}</span> ${f.kind === 'relation' ? goHTML(local(f.other), local(f.other), f.name, 'n') : esc(String(f.value))}${wbs(f.worlds)}</div>`;
+    const agree = un ? un.facts.filter(f => f.worlds.length > 1) : [], differ = un ? un.disagreements || [] : [];
+    const unionHTML = un && (un.worlds || []).length > 1 ? `<details class="sv-sec sv-union"><summary><span class="k">in ${un.worlds.length} worlds</span> <span class="s">${agree.length} agreed · ${differ.length} differ · ${un.facts.length} facts in all</span></summary>` +
+      `<div class="s">${un.records.map(m => `${goHTML(local(m.path), local(m.path), m.name, 'n')}${wbs([m.world])}`).join(' · ')}</div>` +
+      (differ.length ? `<div class="sv-by-k">worlds differ</div>` + differ.map(d => `<div class="sv-hop sv-differ"><span class="lb">${esc(d.slot)}</span> ${Object.entries(d.values).map(([v, ws]) => `${esc(v)}${wbs([...new Set(ws.map(w => w.split(' ')[0]))])}`).join(' <span class="s">vs</span> ')}</div>`).join('') : '') +
+      (agree.length ? `<div class="sv-by-k">more than one world says</div>` + agree.map(factHTML).join('') : '') +
+      `<details class="sv-all"><summary class="s">everything each world says · ${un.facts.length}</summary>${un.facts.map(factHTML).join('')}</details></details>` : '';
+    // claims: every value asserted for a slot, with its source and asserter; the one the slot holds is the preferred one
+    const cl = await source.read(at + '/claims', 'y').catch(() => null);
+    if (mine !== drawn) return;
+    const claimsBy = {};
+    for (const k of (cl && cl.kids) || []) { const c = k.slots || {}; if (c.slot && !c.retracted) (claimsBy[c.slot] = claimsBy[c.slot] || []).push(c); }
+    const pref = r.record || {};
+    const claimsHTML = Object.keys(claimsBy).length ? `<div class="sv-sec"><div class="k">claims</div>${Object.entries(claimsBy).map(([slot, cs]) => {
+      const differ = new Set(cs.map(c => String(c.value).trim().toLowerCase())).size > 1;
+      return `<div class="sv-by"><div class="sv-by-k">${esc(slot)}${differ ? ' <span class="sv-differ">sources differ</span>' : ''}</div>${cs.map(c => {
+        const isPref = String(c.value).trim().toLowerCase() === String(pref[slot]).trim().toLowerCase();
+        const src = refOf(c.source);
+        return `<div class="sv-hop${isPref ? ' pref' : ''}">${esc(c.value)}${isPref ? ' <span class="s">preferred</span>' : ''} <span class="s">by ${esc(c.by || '?')}${c.day ? ' · ' + esc(c.day) : ''}</span>${src ? ' ' + goHTML(local(src.path), local(src.path), 'source', 'n') : ''}${c.why ? ` <span class="s">· ${esc(c.why)}</span>` : ''}</div>`;
+      }).join('')}</div>`;
+    }).join('')}</div>` : '';
+    const contentsHTML = t ? claimsHTML + worldHTML + relHTML + (t.descendants.length ? `<div class="sv-sec"><div class="k">beneath · ${count(t.descendants)}</div>${tree(t.descendants)}</div>` : '') + unionHTML : '';
     const inTree = new Set();
     const parts = kids.filter(k => !inTree.has(local(k.path)) && (!t || ['talk', 'mentions', 'views', 'asks'].includes(k.name)));
     const rows = parts.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
@@ -822,6 +872,8 @@ function mountRecord(el, source, opts = {}) {
   draw();
   if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } }, { backlog: false });
   el.addEventListener('click', e => {
+    const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
+    if (o) { e.preventDefault(); if (openFolder) openFolder(o); return; }
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
     e.preventDefault(); const href = a.getAttribute('href');
     (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { nav(href.slice(1)); });

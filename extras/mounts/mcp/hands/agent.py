@@ -125,10 +125,22 @@ descriptive labels with no meaning to the system; reuse labels in use nearby (LA
 consistently. The other direction of a relation is never written: who founded what, who points here, what a thing
 contains by relation, all of it is read from these slots, and you are shown it as relations in and out.
 Other worlds you can read sit at /0x11/<peer>/user (0x12, 0x13 ...); their records are theirs, never written by you.
-When a thing in your world is the same as a thing in another world and the evidence says so (the same name and
-kind, a shared website or handle, texts that agree), join them with a same slot on your record naming the other
-world's record; its facts then appear in your views by union, tagged with the world that asserts them, and nothing is
-copied. A name alone is a candidate, not proof.
+When a thing in your world is the same as a thing in another world and the evidence says so, join them with a judgement
+record beneath your record, <your record>/same/<slug>_<world> (verisk_0x13) {"same": <the other world's record>, "why": <what evidence>};
+your record itself is not changed. When neither record is yours (two other worlds describe one thing), keep the
+judgement in your world at /0x11/user/identities/<slug> {"subject": <one record>, "same": <the other>, "why": ...}.
+The evidence a why names: a shared website, domain,
+ticker or other identifier; the same relation to one thing (both name the same founder); texts or sources that agree.
+Its facts then appear in your views by union, tagged with the world that asserts them, and nothing is copied. A name
+alone is a candidate, not proof: two records called Apple may be a fruit and a company. When the evidence says two
+records are different things despite a shared name, record the judgement the same way with a different slot in place of
+same (<your record>/different/<slug>_<world>, or under identities with a subject), so nobody asks again.
+You are shown candidates with their evidence; judge each, never join on similarity of wording.
+Disagreement is kept, never resolved by overwriting. A slot holds the preferred value; every value asserted for it is
+kept as a claim under <thing>/claims with its value, source and asserter, and the hands write those claims for you
+whenever a value changes. Change a preferred value only when you judge the new one better supported, and add "why":
+"<one line>" to that write; the hands keep the old value as a claim. You are shown the disagreements on the records
+you read: present the preferred answer and say plainly that sources differ.
 A fact's provenance is a slot too: source, holding the name of the region, row or text it came from (sources/<n>
 child records when there are several). Derived things (an inverse, a grouping, a summary, a count) are cells under
 /0x11/user/views, computed on read, never written as records.
@@ -365,6 +377,96 @@ def partial_words(text):
     return (text[:cut.start()] if cut else text).rstrip()
 
 
+# ---- claims: a value that disagrees with what a record holds is kept beside it, with its origin, never lost
+CLAIM_SKIP = {'name', 'description', 'source', 'aliases', 'digested', 'moved_to', 'researched', 'note', 'notes', 'text', 'said'}
+
+
+def _norm(v):
+    return re.sub(r'\s+', ' ', str(v).strip().lower())
+
+
+def claim_slug(slot, value):
+    import hashlib
+    return _hand.segment_of(f'{slot}_' + hashlib.sha1(_norm(value).encode()).hexdigest()[:8])
+
+
+def preserve_claims(world, writes, who, may_prefer):
+    """For each literal a write would change on an existing record, keep both values as claims under the record's
+    claims folder, each with its value, source, asserter and day. A writer that may prefer (the person, the agent)
+    changes the slot; one that may not (a hand reading a source) leaves the slot as it is and only adds its claim.
+    Returns the claim records to write alongside."""
+    extra, today = [], int(time.strftime('%Y%m%d'))
+    for w in writes:
+        path, slots = w.get('path'), w.get('slots') or {}
+        if not path or w.get('action') == 'cull' or '/claims/' in path or '/talk/' in path:
+            continue
+        try:
+            cur = world.read(path, 'x')
+        except Exception:
+            continue
+        if not cur.get('exists'):
+            continue
+        props = {k.lstrip('/'): v for k, v in (cur.get('properties') or {}).items() if not k.startswith('/sys')}
+        new_source = slots.get('source')
+        for k, v in list(slots.items()):
+            if k in CLAIM_SKIP or k not in props or isinstance(v, dict) or str(props[k]).startswith('/h/'):
+                continue
+            old = props[k]
+            if _norm(old) == _norm(v):
+                continue
+            base = path + '/claims'
+            old_claim = {'slot': k, 'value': old, 'by': 'recorded', 'day': today}
+            if props.get('source'):
+                old_claim['source'] = {'type': 'reference', 'path': re.sub(r'^/h/[xyz]/\d+/\d+', '', str(props['source'])), 'care': 'x', 'case': 0}
+            new_claim = {'slot': k, 'value': v, 'by': who, 'day': today}
+            if new_source:
+                new_claim['source'] = new_source
+            if w.get('why'):
+                new_claim['why'] = str(w['why'])[:300]
+            extra.append({'path': f'{base}/{claim_slug(k, old)}', 'slots': old_claim, '_if_absent': True})
+            extra.append({'path': f'{base}/{claim_slug(k, v)}', 'slots': new_claim})
+            if not may_prefer:
+                slots.pop(k)                                  # reading a source is not permission to overwrite what is known
+        w['slots'] = slots
+        w.pop('why', None)
+    out = []
+    for e in extra:
+        if e.pop('_if_absent', False):
+            try:
+                if world.read(e['path'], 'x').get('exists'):
+                    continue
+            except Exception:
+                pass
+        out.append(e)
+    return out
+
+
+def keep_sources(world, writes):
+    """A record already citing one source keeps it: a new source goes beside it as <record>/sources/h<hash>, with the
+    slots this source supports, so every fact still says where it came from and no writer overwrites provenance."""
+    import hashlib
+    extra = []
+    for w in writes:
+        src = (w.get('slots') or {}).get('source')
+        if not src or w.get('action') == 'cull' or not w.get('path'):
+            continue
+        try:
+            cur = world.read(w['path'], 'x')
+        except Exception:
+            continue
+        have = (cur.get('properties') or {}).get('/source') if cur.get('exists') else None
+        if not have:
+            continue
+        new_path = unwrap_path(src.get('path') if isinstance(src, dict) else src)
+        if unwrap_path(have) == new_path:
+            continue
+        w['slots'].pop('source')
+        supports = ' '.join(k for k in w['slots'] if k not in ('source', 'sources'))
+        extra.append({'path': f"{w['path'].rstrip('/')}/sources/h{hashlib.sha1(new_path.encode()).hexdigest()[:10]}",
+                      'slots': {'source': {'type': 'reference', 'path': new_path, 'care': 'x', 'case': 0}, 'supports': supports}})
+    return extra
+
+
 class Stopped(Exception):
     def __init__(self, text):
         super().__init__('stopped'); self.text = text
@@ -514,15 +616,44 @@ class AgentHand(Hand):
                 walk(n.get('next') or [], d + 1)
         if a.get('descendants'):
             lines.append('  beneath it:'); walk(a['descendants'], 2)
+        claims = [c for c in (self.w.read(a.get('real', at) + '/claims', 'y', limit=60).get('children') or []) if c.get('exists') and '/retracted' not in (c.get('properties') or {})]
+        by_slot = {}
+        for c in claims:
+            cp = {k.lstrip('/'): v for k, v in (c.get('properties') or {}).items()}
+            by_slot.setdefault(cp.get('slot'), []).append(cp)
+        for slot_, cs in by_slot.items():
+            if len({_norm(c.get('value')) for c in cs}) > 1:
+                lines.append(f"  sources differ on {slot_}: " + '; '.join(f"{c.get('value')} (by {c.get('by')}{', source ' + re.sub(r'^/h/[xyz]/[0-9]+/[0-9]+', '', str(c.get('source'))) if c.get('source') else ''})" for c in cs))
         rel = a.get('relations') or []
         if rel:
             note = lambda r: (' [' + '; '.join(f'{k}: {v}' for k, v in r['note'].items() if not str(v).startswith('/')) + ']') if r.get('note') else ''
             lines.append('  relations:')
+            here = (a.get('real') or at).split('/')[1]
+            tag = lambda r: f" [asserted by {r['world']}]" if r.get('world') and r['world'] != here else ''
             for r in rel[:30]:
                 if r['way'] == 'out':
-                    lines.append(f"    {r['label']}: {r['name']} ({r['other']}){note(r)}")
+                    lines.append(f"    {r['label']}: {r['name']} ({r['other']}){note(r)}{tag(r)}")
                 else:
-                    lines.append(f"    {r['label']} of: {r['name']} ({r['other']}){note(r)}")
+                    lines.append(f"    {r['label']} of: {r['name']} ({r['other']}){note(r)}{tag(r)}")
+        # the same thing in other worlds: what each world says, where they agree and where they differ
+        u = self.index('/union?at=' + urllib.parse.quote(a.get('real') or at))
+        if len(u.get('worlds') or []) > 1:
+            lines.append('  described by worlds ' + ', '.join(u['worlds']) + ': ' + '; '.join(f"{m['world']} at {m['path']}" for m in u['records']))
+            agree = [f.get('value') or f"{f['labels'][0]} {f['name']}" for f in u['facts'] if f['all']]
+            if agree:
+                lines.append('    all of them say: ' + '; '.join(map(str, agree[:12])))
+            for w in u['worlds']:
+                only = [f"{f['labels'][0]}: {f.get('value') or f['name']}" for f in u['facts'] if f['worlds'] == [w]]
+                if only:
+                    lines.append(f'    only {w} says: ' + '; '.join(only[:10]))
+            for d in u.get('disagreements') or []:
+                lines.append(f"    worlds differ on {d['slot']}: " + '; '.join(f"{v} ({', '.join(ws)})" for v, ws in d['values'].items()))
+        cands = self.index('/identities?at=' + urllib.parse.quote(a.get('real') or at) + '&limit=5').get('candidates') or []
+        if cands:
+            lines.append('  maybe the same thing in another world (judge the evidence; join with same, or record different):')
+            for c in cands:
+                other = c['b'] if c['a'] in (a.get('real'), at) else c['a']
+                lines.append(f"    {other} ({c['b_name'] if other == c['b'] else c['a_name']})" + ' — ' + '; '.join(f"{e['kind']}: {e['detail']}" for e in c['evidence'][:3]) + (' (a name only: not proof)' if c['name_only'] else ''))
         if a.get('refs_in'):
             lines.append('  referred to by: ' + ', '.join(f"{r['label']} of {r['path']}" for r in a['refs_in'][:12]))
         return '\n' + '\n'.join(lines)
@@ -533,7 +664,10 @@ class AgentHand(Hand):
             return ''
         s_ = sg.get('signals') or {}
         lines = []
-        for key, label in (('same_name_across_worlds', 'one name in several worlds, not joined'), ('dangling', 'dangling references'), ('dangling_overlays', 'overlays of missing records'), ('orphans', 'orphans (no edges)'), ('name_as_text', 'names written as text'),
+        ids = self.index('/identities?limit=6').get('candidates') or []
+        if ids:
+            lines.append('  maybe one thing in two worlds: ' + '; '.join(f"{c['a']} ~ {c['b']} ({', '.join(e['kind'] + ' ' + e['detail'] for e in c['evidence'][:2])})" for c in ids))
+        for key, label in (('disagreements', 'sources disagree'), ('same_name_across_worlds', 'one name in several worlds, not joined'), ('dangling', 'dangling references'), ('dangling_overlays', 'overlays of missing records'), ('orphans', 'orphans (no edges)'), ('name_as_text', 'names written as text'),
                            ('numbered_labels', 'numbered labels'), ('shared_literal', 'shared literals'), ('undecomposed', 'texts not yet decomposed')):
             items = s_.get(key) or []
             if items:
@@ -853,6 +987,9 @@ class AgentHand(Hand):
         if not writes:
             return []
         gather = (self.stdlib_refs() or {}).get('gather')
+        writes += preserve_claims(self.w, writes, self.name if self.name != 'talk' else 'agent', may_prefer=True)
+        writes += keep_sources(self.w, writes)                # a record's first source stays; a new one sits beside it
+        writes = [w for w in writes if w.get('slots') or w.get('action') == 'cull']
         for w in writes:
             if w.get('overlay'):
                 real = unwrap_path(str(w.pop('overlay')))
@@ -867,7 +1004,7 @@ class AgentHand(Hand):
                     v['path'] = unwrap_path(v['path'])
                 elif isinstance(v, str) and v.startswith('/h/') and v.count('/h/') > 1:
                     w['slots'][k] = '/h/' + v.split('/h/', 2)[2]          # the innermost reading is the one meant
-                elif isinstance(v, str) and re.match(r'^/0x[0-9a-f]+/[a-z]', v.strip()) and ' ' not in v.strip() and k not in ('sys/weft', 'sys/tack'):
+                elif isinstance(v, str) and re.match(r'^/0x[0-9a-f]+/(0x[0-9a-f]+/)?[a-z]', v.strip()) and ' ' not in v.strip() and k not in ('sys/weft', 'sys/tack'):
                     w['slots'][k] = {'type': 'reference', 'path': v.strip(), 'care': 'x', 'case': 0}   # a path written as text is a reference
             action = w.get('action') or 'make'
             if action in ('make', 'poke'):
@@ -1031,7 +1168,7 @@ class AgentHand(Hand):
         done = sum(self.answer(*p) for p in self.pending())
         if done:
             return done
-        if str(self.setting('background') or os.environ.get('AGENT_BACKGROUND', 'on')).lower() in ('off', '0', 'false', 'no'):
+        if str(self.setting('background') or os.environ.get('AGENT_BACKGROUND', 'off')).lower() in ('off', '0', 'false', 'no'):
             return 0                                          # digest, weave and reform are paused: only what the person says is answered
         return self.weave(now) or self.reform(now)              # the digest hand decomposes texts; the agent places names and tidies
 
