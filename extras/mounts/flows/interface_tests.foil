@@ -157,6 +157,72 @@
      (testing/nat "subject exposes persistent work in Nenex" 1 (cord/has "Persistent work" subject))
      (testing/nat "subject exposes its live context lens" 1 (cord/has "Live context lens" subject))
      (testing/nat "authored flow exposes retained demand links" 1 (cord/has "Persistent hole" author))]
+  + retry
+    \ ignored=unit
+    ^ row[testing/check]
+    = base=namespace flow_revision_tests/prepared
+      target=path (flow_revision_tests/request 1)
+      root (flow_tests/get target base)
+      worker (myth/sing ['work 'outcome] (native_work/outcome "failed" "Connection ended" (pin (native_work/captured (safe 0 .x target) .none (pin flow/empty))))).put(['work 'status] (pails/t "failed"))
+      failed (flow_tests/poke target.snoc('worker) worker base)
+      failed (flow_tests/poke target (native_work/settle "waiting" "flow_worker_failed" root).put(['flow 'refused] (pails/q 'flow_worker_failed)) failed)
+      edited (flow_tests/poke target.snoc('draft) (myth/sing ['src] (pails/t (str/from_atom (joined 10 [";= Retain this edit" "  Human wording."])))) failed)
+      expected (myth/sing ['expected] (pails/n edited.case(.x target).fall(0)))
+      fields=row[[str str]] [["action" "retry"] ["page" (path_show flow_tests/author)] ["request" (path_show target)]]
+      controller=path flow_tests/controller
+      native=namespace
+        = [next index reply] (helm/supervisor/admit (flow_maintenance/retry_revision target expected) edited (sovereign_hive edited))
+        next
+      next=path (flow_revision_tests/request 3)
+      repeated=namespace
+        = [next index reply] (helm/supervisor/admit (flow_maintenance/retry_revision target expected) native (sovereign_hive native))
+        next
+      paused (flow_tests/apply 'set_enabled controller (myth/sing ['enabled] (pails/b .false)) edited)
+      detached (flow_tests/apply 'detach controller myth/new edited)
+      changed (flow_tests/change_source "New evidence" edited)
+      newreply (flow_revision_tests/response next native)
+      half (flow_tests/apply 'submit_revision next newreply native)
+      done (flow_tests/apply 'submit_revision (flow_revision_tests/request 2) (flow_revision_tests/response (flow_revision_tests/request 2) half) half)
+      other=path (flow_revision_tests/request 2)
+      lagged (flow_tests/poke other (native_work/settle "waiting" "failed" (flow_tests/get other edited)).put(['flow 'refused] (pails/q 'flow_worker_failed)) edited)
+      lag_jobs=flow_work/jobs
+        ?> (./some held) (flow_tests/get controller lagged).get(['flow 'jobs]) (flow_work/jobs [] 0)
+        ?> jobs=flow_work/jobs held (flow_work/jobs [] 0)
+        jobs
+      lagged (flow_tests/poke controller (myth/sing ['flow 'jobs] (flow_work/jobs lag_jobs.entries.keep((\ job=flow_work/job (equal[path] job.request other))) lag_jobs.serial)) lagged)
+      lagged_next=namespace
+        = input (myth/sing ['expected] (pails/n lagged.case(.x other).fall(0)))
+          [next index reply] (helm/supervisor/admit (flow_maintenance/retry_revision other input) lagged (sovereign_hive lagged))
+        next
+      ui_controller=path (flow_tests/author).weld(['work 'maintenance_handbook])
+      ui_followed (flow_tests/apply 'follow ui_controller (flow_tests/follow_request).put(['destination] (pails/p [base.self 'app 'nenex 'w 'retry_ui])) base)
+      ui_request=path ui_controller.weld(['work 'revision_1])
+      ui_failed (flow_tests/poke ui_request (native_work/settle "waiting" "failed" (flow_tests/get ui_request ui_followed)).put(['flow 'refused] (pails/q 'flow_worker_failed)) ui_followed)
+      ui_fields=row[[str str]] [["action" "retry"] ["page" (path_show flow_tests/author)] ["request" (path_show ui_request)]]
+      ui_done (flow_ui_tests/act ui_fields ui_failed)
+      foreign (flow_ui/plan [["action" "retry"] ["page" "/0x11/app/nenex/w/other"] ["request" (path_show ui_request)]] ui_failed)
+      rendered (weft/render (weft/el "div" [] (flow_ui/pending_work flow_tests/author ((flow/empty).put(target.drop((flow_tests/author).len) (flow_tests/get target edited))) (flow_work/job 'authored [] (pin (flow/task (flow/page "" [] []) (pin flow/empty))) target .false .false))))
+    [(testing/text "retry uses native admission" "ok" (flow_tests/reason (flow_maintenance/retry_revision target expected edited)))
+     (testing/nat "retry retains failed request exactly" 1 (equal[myth] (flow_tests/get target edited) (flow_tests/get target native)))
+     (testing/nat "retry retains failed worker exactly" 1 (equal[myth] (flow_tests/get target.snoc('worker) edited) (flow_tests/get target.snoc('worker) native)))
+     (testing/nat "retry preserves failed x history identity" edited.case(.x target).fall(0) native.case(.x target).fall(0))
+     (testing/nat "new attempt links retained failure" 1 (equal[maybe[path]] (./some target) (flow_tests/get next native).path_at(['work 'retry_of])))
+     (testing/text "retry carries the edited working draft" (flow_tests/get target.snoc('draft) edited).txt_at(['src]) (flow_tests/get next.snoc('draft) native).txt_at(['src]))
+     (testing/nat "repeated retry cannot dispatch another attempt" native.local.top repeated.local.top)
+     (testing/text "paused controller refuses retry" "flow_controller_paused" (flow_tests/reason (flow_maintenance/retry_revision target expected paused)))
+     (testing/text "detached controller refuses retry" "flow_controller_paused" (flow_tests/reason (flow_maintenance/retry_revision target expected detached)))
+     (testing/text "changed request form refuses retry" "flow_stale_request" (flow_tests/reason (flow_maintenance/retry_revision target (myth/sing ['expected] (pails/n 999)) edited)))
+     (testing/text "changed evidence cannot retry old task" "flow_stale_revision" (flow_tests/reason (flow_maintenance/retry_revision target expected changed)))
+     (testing/text "open requests cannot be retried" "flow_request_not_failed" (flow_tests/reason (flow_maintenance/retry_revision target (myth/sing ['expected] (pails/n base.case(.x target).fall(0))) base)))
+     (testing/text "late manual completion cannot satisfy a replaced attempt" "flow_stale_revision" (flow_tests/reason (flow_maintenance/submit_revision target (flow_revision_tests/response target native) native)))
+     (testing/nat "new native completion unblocks publication" 1 (flow_tests/progress done).generation)
+     (testing/nat "publication leaves failed outcome intact" 1 (equal[myth] (flow_tests/get target.snoc('worker) edited) (flow_tests/get target.snoc('worker) done)))
+     (testing/nat "retry links its own target when another demand also needs staging" 1 (equal[maybe[path]] (./some other) (flow_tests/get (flow_revision_tests/request 4) lagged_next).path_at(['work 'retry_of])))
+     (testing/nat "other newly staged tasks cannot inherit the retry draft or link" 0 (flow_tests/get (flow_revision_tests/request 3) lagged_next).has(['work 'retry_of]))
+     (testing/text "Nenex retry uses the published native operation" "ok" (flow_tests/reason (flow_ui/plan ui_fields ui_failed)))
+     (testing/nat "Nenex retry stages a linked fresh attempt" 1 (flow_tests/get ui_controller.weld(['work 'revision_3]) ui_done).has(['work 'retry_of]))
+     (testing/text "Nenex refuses another page's retry target" "flow_invalid_revision_target" (flow_tests/reason foreign))
+     (testing/nat "Nenex exposes retry alongside retained context" 1 (cord/has "Retry revision" rendered))]
   + sources
     \ ignored=unit
     ^ row[testing/check]
@@ -207,7 +273,8 @@
      (testing/nat "draft exposes native acceptance and Cells context" 1 (and (cord/has "Accept saved draft" rendered) (cord/has "data-native-cell" rendered)))]
 + tests
   ^ row[testing/case]
-  [(testing/case "generic harness installation and composition" flow_ui_tests/generic_install)
+  [(testing/case "Explicit retries retain failed native work" flow_ui_tests/retry)
+   (testing/case "generic harness installation and composition" flow_ui_tests/generic_install)
    (testing/case "Native harness code refresh" flow_ui_tests/refresh)
    (testing/case "Declared example installation" flow_ui_tests/example_install)
    (testing/case "Nenex flow authoring" flow_ui_tests/authoring)

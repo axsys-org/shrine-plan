@@ -308,6 +308,63 @@
     ? (and enabled.b !(equal[maybe[path]] (./some controller) claims.entries.get(config.destination))) (./err 'flow_controller_detached)
     ? (eq enabled.b progress.enabled) (./ok [])
     | ./ok [[controller (writ/poke (myth/sing ['flow 'progress] progress.set_enabled(enabled.b).set_observed(.none)))]]
+  + retry_revision
+    ' Explicitly replace a failed current job with a new native attempt. The
+    ' old request, draft, captured evidence and worker outcome remain untouched.
+    \ target=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(flow_runtime/valid_arguments [['expected]] input) (./err 'flow_invalid_arguments)
+    = record (cooperate/record target state).fall(myth/new)
+    ?> (./some held) record.get(['flow 'request]) (./err 'flow_missing_request)
+    ?> request=flow_work/request held (./err 'flow_missing_request)
+    = controller (cooperate/record request.controller state).fall(myth/new)
+      children=axal[myth] (sovereign_care .y request.controller state)
+      requests=axal[myth] (sovereign_care .y request.controller.snoc('work) state)
+    ' A submitted retry form is safe to repeat, including after publication.
+    ? (row/any[[path myth]] (\ [name card] (equal[maybe[path]] (./some target) card.path_at(['work 'retry_of]))) requests.tap) (./ok [])
+    ?> (./some held) controller.get(['flow 'config]) (./err 'flow_missing_controller)
+    ?> config=flow_maintenance/config held (./err 'flow_missing_controller)
+    ?> (./some held) controller.get(['flow 'progress]) (./err 'flow_missing_controller)
+    ?> progress=flow_maintenance/progress held (./err 'flow_missing_controller)
+    ? !(progress.enabled) (./err 'flow_controller_paused)
+    ?> (./some held) (cooperate/record (flow/key state.self 'claims) state).fall(myth/new).get(['flow 'claims]) (./err 'flow_claims_invalid)
+    ?> claims=flow_maintenance/claims held (./err 'flow_claims_invalid)
+    ? !(equal[maybe[path]] (./some request.controller) claims.entries.get(config.destination)) (./err 'flow_controller_detached)
+    ?> (./some held) controller.get(['flow 'jobs]) (./err 'flow_stale_revision)
+    ?> jobs=flow_work/jobs held (./err 'flow_stale_revision)
+    ? !(jobs.entries.any((\ job=flow_work/job (equal[path] job.request target)))) (./err 'flow_stale_revision)
+    ? !(and (native_work/settled record) record.has(['flow 'refused])) (./err 'flow_request_not_failed)
+    ? !(eq input.nat_at(['expected] 0) state.case(.x target).fall(0)) (./err 'flow_stale_request)
+    = worker (cooperate/record target.snoc('worker) state).fall(myth/new)
+    ? (and (gt worker.tap.len 0) !(worker.has(['work 'outcome]))) (./err 'flow_worker_active)
+    ?> (./known view) (sovereign_view .x 0 (row/cons[iota] 'x request.controller.snoc('view)) state) (./err 'flow_view_unavailable)
+    < proposal (flow_maintenance/candidate_of view)
+    ?> (./some held) (unpin proposal.output.result).fil.fall(myth/new).get(['flow 'pending]) (./err 'flow_stale_revision)
+    ?> pending=flow/pending held (./err 'flow_stale_revision)
+    ?> (./some held) (unpin pending.tasks).get(request.target).fall(myth/new).get(['flow 'task]) (./err 'flow_stale_revision)
+    ?> task=flow/task held (./err 'flow_stale_revision)
+    ? !(and (eq_iota pending.step request.step) (equal[pin[flow/task]] (pin task) request.task)) (./err 'flow_stale_revision)
+    = remaining jobs.entries.keep((\ job=flow_work/job !(equal[path] job.request target)))
+      controller controller.put(['flow 'jobs] (flow_work/jobs remaining jobs.serial)).put(['flow 'progress] progress.set_observed(.none))
+      before (sovereign_care .z config.destination state)
+      b (bowl [] request.controller 0 0 children (mop/empty))
+      staged (flow_work/stage b controller pending before proposal.definition config.provider)
+    ?> (./some held) staged.out.get(['flow 'jobs]) (./err 'flow_retry_unavailable)
+    ?> staged_jobs=flow_work/jobs held (./err 'flow_retry_unavailable)
+    = selected staged_jobs.entries.keep((\ job=flow_work/job (and (eq_iota job.step request.step) (equal[path] job.target request.target))))
+    ? !(eq selected.len 1) (./err 'flow_retry_unavailable)
+    = next=path selected.at(0).request
+      draft (cooperate/record target.snoc('draft) state).fall(myth/new).txt_at(['src])
+      writes=row[[p=path q=writ]]
+        | staged.cards.map
+          \ entry=[p=path q=writ]
+          = [name write] entry
+          ?> (./make card) write [name write]
+          ? (equal[path] name next) [name (writ/make card.put(['work 'retry_of] (pails/p target)))]
+          ? (and (equal[path] name next.snoc('draft)) (gt draft.len 0)) [name (writ/make card.put(['src] (pails/t draft)))]
+          [name write]
+    ? !(row/any[[path writ]] (\ [name write] (equal[path] name next)) writes) (./err 'flow_retry_unavailable)
+    | ./ok writes.snoc([request.controller (writ/make staged.out)])
   + submit_revision
     \ target=path input=myth state=namespace
     ^ either[iota row[[p=path q=writ]]]
@@ -325,6 +382,9 @@
     ?> (./some held) (cooperate/record request.controller state).fall(myth/new).get(['flow 'progress]) (./err 'flow_missing_controller)
     ?> progress=flow_maintenance/progress held (./err 'flow_missing_controller)
     ? !(progress.enabled) (./err 'flow_controller_paused)
+    ?> (./some held) (cooperate/record request.controller state).fall(myth/new).get(['flow 'jobs]) (./err 'flow_stale_revision)
+    ?> jobs=flow_work/jobs held (./err 'flow_stale_revision)
+    ? !(jobs.entries.any((\ job=flow_work/job (equal[path] job.request target)))) (./err 'flow_stale_revision)
     ?> (./known view) (sovereign_view .x 0 (row/cons[iota] 'x request.controller.snoc('view)) state) (./err 'flow_view_unavailable)
     < answer (flow_maintenance/answer request source note view)
     ? !(eq input.nat_at(['expected] 0) state.case(.x target.snoc('draft)).fall(0)) (./err 'flow_draft_edited)

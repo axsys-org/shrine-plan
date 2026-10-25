@@ -97,6 +97,16 @@ brief declares source dependencies. A matching accepted resolution is reused;
 changed briefs or selected evidence produce a new request. Model work is serial
 per controller. Identical evidence does not retry a failed or unsupported result.
 
+Use **Retry revision** in Nenex Page tools → Flows to explicitly retry a refused
+current request. The published native `retry_revision` operation takes the request
+path as receiver and its `expected` x case as input. It stages a fresh monotonically
+numbered attempt through the same hand, carrying the saved working draft and
+linking `/work/retry_of` to the original. The subject keeps its existing hole; the
+failed request, evidence, worker outcome and history stay unchanged. Repeating a
+retry creates no additional work. Paused, detached, active and obsolete requests
+are refused, and replaced attempts cannot submit a late result. Flow details
+expose the retained provider failure message for diagnosis.
+
 A request beneath `<controller>/work/revision_N` has an actual Nenex `draft`,
 `instructions`, frozen `evidence` and `prior`, a draft `guard`, and a spun `view`.
 The view composes the document, brief, prior state, frozen evidence and live demand.
