@@ -149,6 +149,7 @@
       if (view.display && ['width','textScale','direction'].some(key => view.display.context?.[key] !== requested[key])) throw new Error('Goo display context mismatch');
     }
   }
+  function inputContractKey(data) { return JSON.stringify((data.display?.nodes||[]).filter(node=>node.editing).map(node=>[node.id,node.editing.version,node.editing.encoding,node.editing.maxBytes,node.editing.styles?.map(option=>[option.myth,option.resolved?.textStyle?.fontSHA256])])); }
   function presentation(data) {
     const section = document.createElement('section'); section.className = 'preview';
     for (const key of ['view','slot','role']) section.dataset[key] = data[key] || '';
@@ -162,19 +163,31 @@
   function prepareMount(container, data, preserve = false, section = true) {
     const next = section ? presentation(data) : document.createElement('div');
     if (!section) next.innerHTML = data.html;
+    // Mount rich editors only from the checked display contract, never HTML metadata.
+    for (const node of data.display?.nodes || []) if (node.editing) {
+      if (data.display.version !== 3 || !root.GooRichInput) throw new Error('Rich input requires the display-v3 browser adapter');
+      const host=[...next.querySelectorAll('[data-node]')].find(element=>element.dataset.node===node.id);
+      if (!host || !(data.controls||[]).some(control=>control.id===node.id && control.kind==='input')) throw new Error('Unbound rich input');
+      root.GooRichInput.create(host,node);
+    }
     // Preparation never moves a working input or touches the installed DOM.
     return {proposed:next, commit() {
       const active = container.contains(document.activeElement) ? document.activeElement : null;
+      const richActive = active?.closest?.('.goo-rich-input');
+      const richSelection = richActive?.gooEditor?.selection();
       const selection = ['INPUT','TEXTAREA'].includes(active?.tagName) ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
-      const existing = preserve ? new Map([...container.querySelectorAll('input[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
+      const existing = preserve ? new Map([...container.querySelectorAll('[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
       for (const control of data.controls || []) if (control.kind === 'input') {
-        const input = [...next.querySelectorAll('input[data-node]')].find(element => element.dataset.node === control.id);
+        const input = [...next.querySelectorAll('[data-node]')].find(element => element.dataset.node === control.id);
         if (!input) continue;
         input.dataset.inputSlot = control.slot;
         const held = existing.get(control.slot);
         if (!held) continue;
+        const node=data.display?.nodes?.find(node=>node.id===control.id);
+        if ((held.gooEditor || node?.editing) && !root.GooRichInput.compatible(held,node)) throw new Error('Editor format changed. Keep this draft or discard it before refreshing.');
         for (const attr of [...held.attributes]) if (!input.hasAttribute(attr.name)) held.removeAttribute(attr.name);
         for (const attr of [...input.attributes]) held.setAttribute(attr.name,attr.value);
+        if (held.gooEditor) held.gooEditor.reconfigure(node);
         input.replaceWith(held);
       }
       if (preserve) {
@@ -225,6 +238,7 @@
         active.focus({preventScroll:true});
         if (selection && selection[0] !== null) active.setSelectionRange(...selection);
       }
+      if (richSelection && richActive?.isConnected) richActive.gooEditor.restore(richSelection);
       return section ? container.firstElementChild : container;
     }};
   }
@@ -237,6 +251,9 @@
   const outcomes = new Map();
   const outcomeListeners = new Set();
   function captureActivation(container, context, control) {
+    const inputs = [...container.querySelectorAll('[data-input-slot]')];
+    if(inputs.some(input=>input.gooComposing))throw new Error('Finish composing text before saving.');
+    if(inputs.some(input=>input.gooEditor?.pending))throw new Error('Wait for the text command before saving.');
     const operationId = crypto.randomUUID(), activationRef = crypto.randomUUID();
     const captures = context.capture?.(control.captures || [], operationId) || [];
     const snapshot = context.snapshot;
@@ -244,7 +261,7 @@
       view:context.view,control:control.control,expected:snapshot.expected,
       displayed:snapshot.displayed,publication:snapshot.publication,invocation:operationId});
     const savedInputs = new Map();
-    for (const input of container.querySelectorAll('input[data-input-slot]')) {
+    for (const input of inputs) {
       body.append(`input:${input.dataset.inputSlot}`,input.value);savedInputs.set(input.dataset.inputSlot,input.value);
     }
     for (const capture of captures) body.append(`input:${capture.slot}`,JSON.stringify(capture.value));
@@ -373,6 +390,7 @@
         element.dataset.inputSlot = control.slot;
         context.input?.(control.slot, element, binding.signal);
         trackComposition(element,binding.signal);
+        element.gooEditor?.bind(binding.signal,{...context,renderContext:root.GooActions.context(container)});
         continue;
       }
       const actionKey=JSON.stringify([context.target,context.view,context.snapshot.life,context.snapshot.publication,control.control]);
@@ -382,13 +400,14 @@
       element.addEventListener('click', async event => {
         event.stopPropagation();
         if (pendingActions.has(actionKey)) return;
+        if (context.activate) { try { await context.activate(control); } catch (error) { context.report(error.message); } return; }
         try {
           if (control.become && !control.invoke) { await context.become(control.slot); return; }
           const captured=captureActivation(container,context,control);
           // Receipt correlation for hosts invoking an ordinary bound control.
           element.dataset.gooInvocation=captured.operationId;
           pending = {captured,elements:new Map([[element,binding]])}; pendingActions.set(actionKey,pending); element.disabled = true;
-          context.report('Applying…');
+          context.report('Applying...');
           const held=pending;held.unsubscribe=subscribeOutcomes(receipt=>{if(receipt.operationId!==captured.operationId||receipt.outcome==='unknown')return;held.unsubscribe?.();held.unsubscribe=null;if(pendingActions.get(actionKey)===held){pendingActions.delete(actionKey);for(const [element,owner] of held.elements)if(bindings.get(element)===owner)element.disabled=false;}});
           const {result,savedInputs}=await activateCaptured(captured);
           await context.saved?.(result, savedInputs);
@@ -406,16 +425,30 @@
       }, {signal:binding.signal});
     }
   }
-  root.GooActions = {workState, status, load, prepareChildren, adoptLayouts, chooseLayout, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
+  const feedbackRequests=new WeakMap();
+  async function feedback(container,message,width=window.innerWidth) {
+    feedbackRequests.get(container)?.abort();
+    const request=new AbortController();feedbackRequests.set(container,request);
+    container.hidden=!message;
+    if(!message){container.replaceChildren();return;}
+    try {
+      const response=await fetch('/goo/feedback',{method:'POST',signal:request.signal,body:new URLSearchParams({message,width:String(Math.floor(width))})});
+      if(!response.ok)throw Error(await response.text());
+      const html=await response.text();request.signal.throwIfAborted();
+      container.innerHTML=html;
+    }catch(error){if(error.name!=='AbortError')root.alert?.(message);}
+  }
+  root.GooActions = {feedback, inputContractKey, workState, status, load, prepareChildren, adoptLayouts, chooseLayout, bind, context, observe, mount, prepareMount, presentation, metrics, captureActivation, discardCaptured, activateCaptured, subscribeOutcomes, outcome: id => outcomes.get(id), recordOutcome};
   async function start() {
     const main = document.querySelector('main[data-target]'); if (!main) return;
-    const target = main.dataset.target, frames = new Map();
-    const notice = document.createElement('p'); notice.setAttribute('role', 'status'); main.prepend(notice);
-    const report = text => { notice.textContent = text; };
-    const button = document.createElement('button'); button.textContent = 'Refresh views'; button.type = 'button'; notice.after(button);
+    const target = main.dataset.target, frames = new Map(), surface=main.hasAttribute('data-goo-surface');
+    const notice = document.createElement('div'); notice.setAttribute('role', 'status'); main.append(notice);
+    const report = text => { if(surface)feedback(notice,text,main.clientWidth);else notice.textContent=text; };
+    const button = surface?null:document.createElement('button');
+    if(button){button.textContent='Refresh views';button.type='button';notice.after(button);}
     let revision = 0, request;
     async function refresh() {
-      const current = ++revision; request?.abort(); request = new AbortController(); button.disabled = true;
+      const current = ++revision; request?.abort(); request = new AbortController(); if(button)button.disabled = true;
       try {
         const data = await load(target,{...(main.hasAttribute('data-face') ? {slot:'/sys/slot/face'} : {view:main.dataset.view || undefined}),context:context(main),signal:request.signal});
         if (current !== revision) return;
@@ -436,8 +469,8 @@
           } catch (error) {
             if (error.name !== 'AbortError' && current === revision) {
               errors.push(`${view.view}: ${error.message}`);
-              if (!frame.error) { frame.error = document.createElement('p'); frame.error.setAttribute('role','status'); frame.element.prepend(frame.error); }
-              frame.error.textContent = error.message;
+              if (!frame.error) { frame.error = document.createElement('div'); frame.error.setAttribute('role','status'); frame.element.prepend(frame.error); }
+              if(surface)feedback(frame.error,error.message,main.clientWidth);else frame.error.textContent=error.message;
             }
           }
           if (current !== revision) return;
@@ -455,7 +488,7 @@
         }
         report(errors.join(' ') || (visible.length ? '' : 'No Goo views match this entry.'));
       } catch (error) { if (error.name !== 'AbortError' && current === revision) report(error.message); }
-      finally { if (current === revision) button.disabled = false; }
+      finally { if (current === revision && button) button.disabled = false; }
     }
     async function render(frame) {
       if (!frame.view || frame.composing) { frame.pending = true; return; }
@@ -491,13 +524,13 @@
         if(closed && frame.controller===controller) frame.controller=null;
         if(generation!==frame.generation || !frame.element.isConnected || !closed) return;
       }
-      const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication,data.view]);
+      const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication,data.view,inputContractKey(data)]);
       if (frame.lifetime && frame.lifetime !== lifetime && frame.inputs.size) {
         if (!confirm('This view was replaced. Discard its unsaved input?')) return;
         frame.inputs.clear();
       }
       const preserve = frame.lifetime === lifetime; frame.lifetime = lifetime;
-      const next = mount(frame.element,data,preserve);
+      const next = mount(frame.element,data,preserve,!surface);
       bind(next,{actionScope:frame,target,view:data.view,snapshot:data.snapshot,controls:data.controls,report,
         input: (key,input,signal) => {
           if (frame.inputs.has(key)) input.value = frame.inputs.get(key);
@@ -527,7 +560,12 @@
     // Every presentation, including readonly reflection, uses the same live
     // boundary instead of parsing a second whole page.
     for (const node of main.querySelectorAll(':scope > .preview[data-view]')) node.remove();
-    button.addEventListener('click',refresh);
+    button?.addEventListener('click',refresh);
+    if(surface)root.addEventListener('beforeunload',event=>{
+      if([...frames.values()].some(frame=>frame.inputs.size||frame.composing)){
+        event.preventDefault();event.returnValue='';
+      }
+    });
     root.addEventListener('message',event=>{if(event.origin===location.origin&&event.source===root.parent&&event.data?.type==='goo-values-saved')refresh();});
     observe(main,() => refresh());
     await refresh();

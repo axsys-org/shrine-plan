@@ -8,6 +8,7 @@ pub static RESPONSE: Schema = Schema { name: "Response", fields: &[
     Field { name: "snapshot", tag: 5, kind: Kind::Message(&SNAPSHOT), mode: Mode::Optional },
     Field { name: "receipt", tag: 6, kind: Kind::Message(&OPERATIONRECEIPT), mode: Mode::Optional },
     Field { name: "failure", tag: 7, kind: Kind::Message(&FAILURE), mode: Mode::Optional },
+    Field { name: "text_edit", tag: 8, kind: Kind::Message(&TEXTEDIT), mode: Mode::Optional },
 ] };
 pub static PROFILE: Schema = Schema { name: "Profile", fields: &[
     Field { name: "id", tag: 1, kind: Kind::String, mode: Mode::Required },
@@ -74,6 +75,13 @@ pub static TEXTRUN: Schema = Schema { name: "TextRun", fields: &[
 ] };
 pub static TEXTRUNS: Schema = Schema { name: "TextRuns", fields: &[
     Field { name: "values", tag: 1, kind: Kind::Message(&TEXTRUN), mode: Mode::Repeated },
+] };
+pub static TEXTEDIT: Schema = Schema { name: "TextEdit", fields: &[
+    Field { name: "version", tag: 1, kind: Kind::U32, mode: Mode::Required },
+    Field { name: "textRuns", tag: 2, kind: Kind::Message(&TEXTRUN), mode: Mode::Repeated },
+    Field { name: "start", tag: 3, kind: Kind::U64, mode: Mode::Required },
+    Field { name: "end", tag: 4, kind: Kind::U64, mode: Mode::Required },
+    Field { name: "typing", tag: 5, kind: Kind::Message(&MYTH), mode: Mode::Required },
 ] };
 pub static LINK: Schema = Schema { name: "Link", fields: &[
     Field { name: "kind", tag: 1, kind: Kind::String, mode: Mode::Required },
@@ -211,6 +219,7 @@ pub static CONFIG: Schema = Schema { name: "Config", fields: &[
     Field { name: "optionLabel", tag: 6, kind: Kind::String, mode: Mode::Optional },
     Field { name: "value", tag: 7, kind: Kind::Double, mode: Mode::Optional },
     Field { name: "max", tag: 8, kind: Kind::Double, mode: Mode::Optional },
+    Field { name: "aspectRatio", tag: 9, kind: Kind::Double, mode: Mode::Optional },
 ] };
 pub static NODE: Schema = Schema { name: "Node", fields: &[
     Field { name: "id", tag: 1, kind: Kind::String, mode: Mode::Required },

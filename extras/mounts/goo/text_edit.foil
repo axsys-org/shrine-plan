@@ -1,0 +1,122 @@
+- goo_app/editing
+
+' Pure draft transformations. No namespace lookup, write, or action authority.
++ goo_text_edit
+  + result
+    : value=goo/text start=nat end=nat typing=myth
+  + replace
+    \ value=goo/text start=nat end=nat inserted=goo/text
+    ^ goo/text
+    | (goo/text/slice 0 start value).weld(inserted).weld((goo/text/slice end (sub value.plain.len end) value))
+  + line_start
+    \ text=str offset=nat
+    ^ nat
+    ? (eq offset 0) 0
+    ? (eq text.at(offset.dec) 10) offset
+    | goo_text_edit/line_start text offset.dec
+  + line_end
+    \ text=str offset=nat
+    ^ nat
+    ? (ge offset text.len) text.len
+    ? (eq text.at(offset) 10) offset
+    | goo_text_edit/line_end text offset.inc
+  + mark
+    \ modifier=modifiers enabled=bool metadata=myth
+    ^ myth
+    = flags=list[modifiers]
+        ?> (./some held) metadata.get(['sys 'modifiers]) .nil
+        ?> held=pails/modifiers held .nil
+        held.values
+      flags (list/filter[modifiers] (\ flag !(equal flag modifier)) flags)
+      flags (? enabled flags.snoc(modifier) flags)
+    ? flags.is_nil (metadata.del(['sys 'modifiers]))
+    | metadata.put ['sys 'modifiers] (pails/modifiers flags)
+  + face
+    \ name=str metadata=myth
+    ^ myth
+    = metadata metadata.del(['sys 'font])
+    ? (eq name "") metadata
+    | metadata.put ['sys 'font] (pails/p ['sys 'font ($ts name)])
+  + slash_query
+    \ text=str
+    ^ bool
+    ? !(text.len) .false
+    ? !(eq text.at(0) 47) .false
+    % i=nat 1
+    ? (eq i text.len) .true
+    = char text.at(i)
+      letter ((and (ge char 65) (le char 90)) || (and (ge char 97) (le char 122)))
+    ? !((eq char 32) || letter) .false
+    | _ i.inc
+  + apply
+    \ value=goo/text start=nat end=nat command=str typing=myth
+    ^ either[str goo_text_edit/result]
+    ?> (./some checked) (goo_edit/decode (goo/text/pail value)) (./err "Unsupported rich text")
+    ?> (./some style) (goo_edit/decode (goo/text/pail [(goo/runt typing (goo/lang/en ""))])) (./err "Unsupported typing style")
+    = text value.plain
+    ? ((gt start end) || (gt end text.len)) (./err "Invalid text selection")
+    = selected (goo/text/slice start (sub end start) value)
+      point (goo_text_edit/line_start text start)
+      prefix text.slice(point (sub start point))
+      bullet (and (ge prefix.len 2) (eq prefix.slice(0 2) "- "))
+    ? (eq command "paragraph-break")
+      = empty (and (eq prefix "- ") (eq (goo_text_edit/line_end text start) start))
+        from (? empty point start)
+        inserted=str (? empty "" (str/cat_all [(str/from_atom 10) (? bullet "- " "")]))
+        next (goo_text_edit/replace value from end [(goo/runt myth/new (goo/lang/en inserted))])
+        caret (add from inserted.len)
+      | ./ok (goo_text_edit/result next caret caret myth/new)
+    = marks=row[str] ["bold" "italic" "underline" "clear"]
+      blocks=row[str] ["paragraph" "heading" "bullet" "code"]
+    ? (marks.has(command))
+      = modifier (? (eq command "bold") (modifiers/bold) (? (eq command "italic") (modifiers/italic) (modifiers/underline)))
+        enabled=bool
+          ? (eq start end) !(goo_text/modifier modifier typing)
+          | !(selected.all((\ run=goo/runt (goo_text/modifier modifier run.myth))))
+        change
+          \ metadata=myth
+          ^ myth
+          ? (eq command "clear") (metadata.del(['sys 'font]).del(['sys 'modifiers]))
+          | goo_text_edit/mark modifier enabled metadata
+        next (goo_text_edit/replace value start end (selected.map((\ run=goo/runt run.set_myth((change run.myth))))))
+      | ./ok (goo_text_edit/result next start end (change typing))
+    ? !(blocks.has(command)) (./err "Unknown text command")
+    ? !(eq start end) (./err "Block commands require a caret")
+    = query (goo_text_edit/slash_query prefix)
+      next (? query (goo_text_edit/replace value point start []) value)
+      line_end (goo_text_edit/line_end next.plain point)
+      existing_bullet (and (ge (sub line_end point) 2) (eq next.plain.slice(point 2) "- "))
+      next (? existing_bullet (goo_text_edit/replace next point (add point 2) []) next)
+      boundary (goo_text_edit/line_end next.plain point)
+      name=str (? (eq command "heading") "sans750" (? (eq command "code") "mono" ""))
+      span (goo/text/slice point (sub boundary point) next)
+      styled (span.map((\ run=goo/runt run.set_myth((goo_text_edit/face name run.myth)))))
+      next (goo_text_edit/replace next point boundary styled)
+      next (? (eq command "bullet") (goo_text_edit/replace next point point (goo/text/en "- ")) next)
+      caret (add point (? (eq command "bullet") 2 0))
+    | ./ok (goo_text_edit/result next caret caret (goo_text_edit/face name myth/new))
+  + encode
+    \ result=goo_text_edit/result
+    ^ json
+    | json/obj [(jkv "version" (json/num .false 1)) (jkv "textRuns" (goo_text/encode result.value))
+        (jkv "start" (json/num .false result.start)) (jkv "end" (json/num .false result.end))
+        (jkv "typing" (goo_text/encode_myth result.typing))]
+  + request
+    \ fields=row[[str str]]
+    ^ either[str json]
+    = get
+        \ name=str
+        ^ str
+        % i=nat 0
+        ? (eq i fields.len) ""
+        = [key value] fields.at(i)
+        ? (eq key name) value
+        | _ i.inc
+    ?> (./some value) (goo_edit/decode (pails/t (get "value"))) (./err "Invalid text input")
+    ?> (./some start) (nat/parse (get "start")) (./err "Invalid selection start")
+    ?> (./some end) (nat/parse (get "end")) (./err "Invalid selection end")
+    ?> (jres/ok raw rest) (parse (get "typing")) (./err "Invalid typing style")
+    ? !(eq rest "") (./err "Invalid typing style")
+    ?> (./some typing) (goo_text/decode_myth raw) (./err "Invalid typing style")
+    < result (goo_text_edit/apply value.value start end (get "command") typing)
+    | ./ok (goo_text_edit/encode result)

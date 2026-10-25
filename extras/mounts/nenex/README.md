@@ -71,8 +71,56 @@ documents. Source edits replace it in the expansion transaction; direct edits to
 numbered prose still regenerate canonical source. The retained projection is
 excluded from document content and Semidoc export.
 
-The Semidoc source form uses a native multiline textarea and the existing
-`/post` protocol. The original `/ns/<node>/app/nenex` view remains available.
+The reader's **Edit with Goo** link opens `/nenex/edit?path=<namespace path>`.
+The whole document is a continuous sequence of native Grove/Goo block views.
+Each field still belongs to its original `text`, `title`, `lead` or `body` slot.
+Select text for the formatting toolbar; type `/` for Text, Heading, Bullet list,
+Quote and Code. Enter splits a block (inside code it inserts a newline), and
+Shift+Enter inserts a soft newline. Backspace at the start joins compatible
+siblings. The focused block exposes Save, insert-after, move-up/down and Delete.
+Blur saves that block; Ctrl/Cmd+S saves dirty blocks in order. References remain
+links, including their embed descriptors. The shell adds no handwritten CSS.
+
+The slash menu changes real Semidoc node kinds. Heading Enter creates its first
+paragraph child. Moving a container carries its children; deleting a container
+or converting it to a leaf refuses while it has children. Structural edits
+refuse when numbered content contains named descendants, so renumbering cannot
+silently destroy attached work. Named root subtrees (`inputs`, `cells`, `work`,
+named child documents) are excluded from editing and survive every operation.
+Numbered addresses remain positional, as in Semidoc source editing.
+
+The shared `goo-document.js` host keeps only local input drafts, prepared control
+evidence and focus. It reads an ephemeral path manifest and activates published
+Grove controls through `GooActions`; it does not parse Semidoc or store a second
+document model. Structural writes flush other drafts first, freeze editing while
+in flight, and check the whole document epoch. Refusals retain the draft. If a
+reply or the subsequent refresh is lost, Ctrl/Cmd+S resumes the captured change
+with the same invocation. Structural editing stays frozen until it settles. The
+rich-block viewport uses native Goo typography and expands locally with text.
+
+`editor.grove` publishes a native namespace operation from `editor.foil` in
+each block action's metadata, so reloads retain the domain commit path.
+The shared Goo runtime checks the presented receiver, revision, publication and
+bound inputs before invoking it. The operation regenerates source from the
+current page subtree and commits through Nenex's existing expansion transaction.
+There is no editor document record or flattened copy of the page. Named children
+such as `inputs`, `cells`, `work` and nested named documents are outside that
+projection and remain intact.
+
+Rich fields contain the shared `goo/text/pail` value. Semidoc export carries the
+same run value in a reserved `;@ /doc/rich` hexadecimal JSON attribute on that
+node, with its readable text encoded as a JSON string. This preserves blank
+paragraphs, whitespace, newlines and text beginning with Semidoc block markers.
+Import checks the text against the run payload before accepting the source.
+To replace a formatted field manually with plain Semidoc, remove its `/doc/rich`
+attribute and author ordinary text. Inconsistent metadata rejects the source
+transaction and keeps the previous document.
+
+The browser maintains only local rich-input drafts and selection; native Foil
+owns formatting commands and commits. The current editor bounds a document to
+256 numbered nodes and 192 KiB of source, and uses Goo's current ASCII input
+contract. A block outside that contract displays a diagnostic while the remaining
+blocks stay editable; its source is unchanged. The original `/ns/<node>/app/nenex` view remains available.
 
 ## Checks
 

@@ -340,6 +340,19 @@ not supported.
 The development mount includes `dates.grove`; open
 `/grove/dev?selected=/0x11/app/demo/dates/example` for the live example.
 
+## Goo component library
+
+`goo-components` publishes 16 reusable text, image, information, composition, and editing
+recipes with a live gallery at `/goo-components`. Components use ordinary typed
+Grove roles and presentation slots; the shared Goo host supplies rendering and
+save behavior. Full and compact cards project the same source record. See the
+[library guide](extras/mounts/goo-components/README.md) for the role contracts,
+reuse boundaries, and checks.
+
+```sh
+python3 x/eden --mount goo-components --compiler none --ephemeral --port 8144
+```
+
 ## Goo inspector
 
 `goo-inspector` is a small server-rendered Goo workspace with a bounded child

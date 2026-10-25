@@ -42,7 +42,7 @@ async function setup() {
  const pending=[], context={GooSession, console, structuredClone, AbortController, requestAnimationFrame:setImmediate, confirm:()=>true};
  context.document={createElement:tag=>new Element(tag),activeElement:null};
  let invocations=0;
- context.GooActions={context:()=>({width:400,textScale:1,direction:'ltr'}),observe:()=>()=>{},mount:(element,data)=>{element.replaceChildren(data.template.cloneNode(true));},load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
+ context.GooActions={inputContractKey:()=> '[]',context:()=>({width:400,textScale:1,direction:'ltr'}),observe:()=>()=>{},mount:(element,data)=>{element.replaceChildren(data.template.cloneNode(true));},load:target=>{const d=defer(); pending.push({target,...d}); return d.promise;}, choose:templates=>templates[0], bind:()=>{invocations++;},metrics:{dispatches:0}};
  vm.runInNewContext(fs.readFileSync(require.resolve('../goo-topoi.js'),'utf8'),context);
  vm.runInNewContext(fs.readFileSync(require.resolve('../goo-panes.js'),'utf8'),context);
  const controller=new context.GooPanes(new Element(),{target:'/study',view:'/view',report:()=>{}});
