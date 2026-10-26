@@ -76,6 +76,12 @@ it must not roll back already acknowledged work. A first boot retains its
 initial native continuation before serving, so interrupted initialization is
 recoverable through the same saved program.
 
+Semidoc source and Goo editing preserve repeated bindings and authored relationships
+through the existing native document records. Rich-text
+encoding is unchanged. Editing document records preserves the artifact and law references
+they contain; selecting a new implementation requires explicit publication or
+behavior registration, not an editor round trip.
+
 Native command admission uses one budget of 128 reaction rounds after the
 submitted event. Supervisor writes, guarded operations and Grove installation
 share this policy. A quiescent candidate can commit; exhaustion, reaction failure
@@ -364,6 +370,19 @@ not supported.
 
 The development mount includes `dates.grove`; open
 `/grove/dev?selected=/0x11/app/demo/dates/example` for the live example.
+
+## Goo component library
+
+`goo-components` publishes 16 reusable text, image, information, composition, and editing
+recipes with a live gallery at `/goo-components`. Components use ordinary typed
+Grove roles and presentation slots; the shared Goo host supplies rendering and
+save behavior. Full and compact cards project the same source record. See the
+[library guide](extras/mounts/goo-components/README.md) for the role contracts,
+reuse boundaries, and checks.
+
+```sh
+python3 x/eden --mount goo-components --compiler none --ephemeral --port 8144
+```
 
 ## Goo inspector
 

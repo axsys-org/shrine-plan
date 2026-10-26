@@ -5,7 +5,9 @@ legacy JSON. The generic v1 Value/Object protocol is rejected. Requests remain
 URL-encoded and invocation retry bodies remain frozen.
 
 The response oneof carries Presentation, LayoutBundle, Source, Snapshot,
-OperationReceipt, or Failure. Nested messages describe the actual prepared
+OperationReceipt, TextEdit, or Failure. TextEdit carries the pure draft result
+from `/goo/text-command`: structured runs, selection and typing myth. It carries
+no namespace authority. Nested messages describe the actual prepared
 contracts: display nodes and boxes, text lines/runs, resolved fonts and paint,
 editing palettes, accessibility semantics, bindings and pane identities.
 Geometry uses finite IEEE754 binary64 (`double`) in logical CSS pixels.

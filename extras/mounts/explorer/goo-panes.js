@@ -295,7 +295,7 @@
         const data = await this.request(element,this.context.target,{view:this.context.view,node:node.node,workspace:this.context.workspace},JSON.stringify([node.node,this.snapshot]));
         if (!data || !work.live || element.dataset.loadingKey !== key || [...work.inputs.values()].some(value => value.composing)) return;
         if(!this.nativeSnapshotCurrent(data.snapshot)) return;
-        const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication]);
+        const lifetime = JSON.stringify([data.snapshot.subject,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication,root.GooActions.inputContractKey(data)]);
         if (work.lifetime && work.lifetime !== lifetime) {
           if (!(await this.session.depart(work,{kind:'native-replaced'}))) return;
           if (!work.live || !element.isConnected || element.dataset.loadingKey!==key || [...work.inputs.values()].some(value=>value.composing)) return;
@@ -401,7 +401,7 @@
             const data=(bundle && root.GooActions.chooseLayout(bundle,context)) || await this.request(row,member.subject,{slot:node.slot},basis);
             if (!data || !state.live || !work.live || row.dataset.loadingKey!==expected || data.snapshot.life!==member.life || [...work.inputs.values()].some(value=>value.composing)) return;
             if (data.description) throw new Error('Member presentations must be views.');
-            const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication]);
+            const lifetime=JSON.stringify([data.view,data.snapshot.subject||data.snapshot.target,data.snapshot.life,data.snapshot.recipePublication ?? data.snapshot.publication,root.GooActions.inputContractKey(data)]);
             if(work.lifetime && work.lifetime!==lifetime) {
               if(!(await this.session.depart(work,{kind:'member-view-replaced'}))) return;
               if(!work.live || !row.isConnected || row.dataset.loadingKey!==expected || [...work.inputs.values()].some(value=>value.composing)) return;
@@ -595,8 +595,15 @@
         if (data.snapshot.life!==member.life || (data.snapshot.subject||data.snapshot.target)!==member.subject) throw new Error('Selected subject was removed or replaced.');
         if (data.description) throw new Error('Nested local-session member views are not supported.');
         if ([...state.inputs.values()].some(value=>value.composing)) return;
-        const preserve=element.dataset.encounter===String(ticket.encounter);
+        let preserve=element.dataset.encounter===String(ticket.encounter);
+        const inputContract=root.GooActions.inputContractKey(data);
+        if(preserve && state.inputContract!==undefined && state.inputContract!==inputContract) {
+          if(!(await this.session.depart(state,{kind:'input-contract-changed'}))) return;
+          if(!this.session.current(ticket) || this.loading.get(state.id)!==key) return;
+          state.inputs.clear();preserve=false;
+        }
         root.GooActions.mount(element,data,preserve);
+        state.inputContract=inputContract;
         element.dataset.encounter=String(ticket.encounter);
         const scopes=state.spec.scopes.map(id=>this.session.owners.get(id));
         root.GooActions.bind(element,this.actionContext(member.subject,data.view,data.snapshot,data.controls,scopes,state));

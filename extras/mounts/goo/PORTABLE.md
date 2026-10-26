@@ -77,6 +77,13 @@ local. Focus means the HTML-equivalent visible keyboard focus; its outline
 wins over highlight when both apply. A host may provide platform accessibility
 focus separately. Image cover cropping uses the center of the source image;
 image corner clipping applies even when the primitive itself has `clip:false`.
+For media images, optional positive finite `config.aspectRatio` (source width
+divided by source height) makes preparation reserve `width / aspectRatio`
+height. Supplying the actual source ratio displays the complete image with the
+existing cover painter. It overrides the media minimum height; avatar sizing
+and images without the option retain the pinned profile recipe. HTML and native
+clients paint the prepared box and do not discover or recompute its dimensions.
+The field is preserved in JSON and optional protobuf Config field 9.
 
 Paint is generated at build time from the **verified pinned Mash CSS** plus
 profile geometry. Fixed recipes are precomputed constants, so runtime rendering
@@ -442,9 +449,10 @@ and highlight for linked editing text; its placeholder target is descriptive
 and grants no action authority.
 
 Display v3 is required even for an empty rich value. Older native clients must
-reject it rather than flatten it into a plain input. Browser output explicitly
-diagnoses the unavailable editor; it does not expose a plain input pretending to
-edit structured runs. Ordinary plain inputs and v1/v2 displays are unchanged.
+reject it rather than flatten it into a plain input. Static HTML carries an unavailable-editor diagnostic. Explorer's shared
+`goo-rich-input.js` replaces it only when a display-v3 editing descriptor and
+matching input binding are present. Ordinary plain inputs and v1/v2 displays
+are unchanged.
 
 The action input is a serialized Goo run array in the existing `input:<slot>`
 form field. The declaration must use a typed action argument decoder; the mount's
@@ -460,5 +468,65 @@ re-preparations: retain dirty owners and stage the change behind the existing
 loss-of-work guard. Compatible refresh/resize must retain run metadata, caret,
 composition, selection, typing style, undo history and pending invocations.
 Current scope is English/ASCII, bundled fonts, inline modifiers and links;
-clipboard interchange is plain text. No browser/HTML rich editor or UIKit rich
-editor is included.
+clipboard interchange is plain text. Explorer now includes a browser rich input;
+UIKit rich editing remains consumer work.
+
+The browser adapter supports inline replacement, newline insertion/joining,
+range formatting, a contextual slash menu, and bounded local undo/redo. It
+uses the supplied style recipes, retains structured link metadata, and submits
+the exact run-array string through the ordinary input binding. Unsupported text
+is refused before changing the draft. Compatible repreparation retains the
+actual editor DOM and history; a changed input encoding or formatting palette
+participates in the existing owner departure guards. The fixed rich-input
+height is currently 520 logical pixels before text scaling; its contents scroll.
+Its preferred width is 576 logical pixels before text scaling, compressing to
+the host allocation. This keeps action groups from allocating
+the narrow width used for a single-line input.
+The browser owns editing layout inside that prepared box.
+
+The native HTML projection supplies a `data-goo-editable` viewport sized from
+the prepared input height and profile insets. The browser enables contenteditable
+there and projects the supplied run styles. It does not supply input padding,
+borders, fonts or colors. No rich-input stylesheet is required.
+
+Ordinary `data-goo-surface` hosts mount prepared views directly without Explorer
+inspection or pane chrome. The block-document shell is one such Grove view and
+loads only the generated profile/font stylesheets. `/sys/slot/overlay` groups
+export the profile input canvas as their background paint; HTML projects the
+same paint for browser popovers. Platform popovers handle top-layer placement.
+`POST /goo/feedback` prepares bounded runtime messages through Goo and returns
+an HTML fragment without reading or mutating namespace state.
+
+The block-document mount declares ordinary Grove views at
+`/sys/slot/text_toolbar` and `/sys/slot/text_commands`. Explorer requests them
+through normal prepared rendering, anchors the resulting native buttons to
+the platform selection, and interprets their `/sys/edit/<command>` slots.
+These presentations contain no namespace action bindings. The shared adapter
+currently expects these two slots on a rich-input receiver to expose the tools.
+
+`goo_text_edit` implements formatting, paragraph breaks and the Text, Heading,
+Bullet list and Code commands as pure Foil transformations. Headings select
+the supplied sans750 font, bullets insert `- `, and code selects mono.
+`POST /goo/text-command` accepts a draft run array, selection, typing myth and
+command; it returns the transformed draft and selection. JSON and the named
+protobuf-v2 TextEdit response are supported. The endpoint does no namespace
+lookup or mutation and confers no action authority. Keystrokes arriving during
+a command are queued and applied to its result. A document action decides how
+to interpret the saved runs; block-document reconstructs a bounded flat block
+sequence in Foil.
+
+## Native domain saves
+
+A published Grove action can carry a trusted `namespace_op` in its `sys/op`
+slot. After the normal control, receiver, revision, publication and capture
+checks, the shared Goo runtime binds the submitted arguments and invokes that
+operation against the current namespace snapshot. All planned writes and their
+reactions are admitted as one candidate; failure leaves the namespace unchanged.
+Invocation receipts retain the ordinary retry behavior. This lets an editor use
+its domain transaction (for example, Nenex Semidoc expansion) without creating
+an alternate browser write protocol or replacing the target record.
+
+The rich-text value and codec live in core `goo_text`; `goo_app/text` re-exports
+them. The common Goo runtime imports this module before independent mounts
+publish, so all consumers select one set of definition moments. Semidoc and
+mounted Goo controls share the same nominal run value.

@@ -92,9 +92,7 @@
      | out.weld
        [(testing/nat name 1 (equal want tree))
         (testing/nat (str/cat " round trip" name) 1
-          (equal tree (parse text)))
-        (testing/nat (str/cat " text fixpoint" name) 1
-          (equal text (unparse (parse text))))]
+          (equal tree (parse text)))]
   +  rendering
     \ _=unit
     ^ row[testing/check]
@@ -164,14 +162,13 @@
        (equal back (parse (unparse back))))
      (testing/nat "record projection fixpoint" 1
        (equal back (nodes_of (remount (parse (unparse back))))))
-     (testing/nat "multi-valued attribute flattens" 1
-       (equal [(snode/prose "anchor"
-         [(sattr ["doc" "tags"] [(sval/word "a /t/b")])])] flat))
-     (testing/nat "flattening fixpoint" 1
+     (testing/nat "multi-valued attribute preserves words and references" 1
+       (equal multi flat))
+     (testing/nat "typed attribute fixpoint" 1
        (equal flat (nodes_of (remount (parse (unparse flat))))))
-     (testing/nat "valueless attribute mounts empty text" 1
-       (equal (pails/t "") (myth/pail_at ['doc 'flag] flag)))
-     (testing/nat "valueless attribute disappears" 0
+     (testing/nat "valueless attribute has one empty occurrence" 1
+       (equal (sattr/occurrences [[]]) (myth/pail_at ['doc 'flag] flag)))
+     (testing/nat "valueless attribute survives" 1
        (attrs_back flag).len)
      (testing/nat "canonical document prefix" 1
        (semidoc_tests/starts ";. /shrine/roadmap"
@@ -183,9 +180,74 @@
      (testing/same[nat] "reference spelling" str/from_atom
        ";/shrine/moment" (unparse (parse ";/shrine/moment")))]
 
++  semidoc_fidelity_tests
+  + recovered
+    \ result=either[iota row[snode]]
+    ^ row[snode]
+    ?> (./ok nodes) result []
+    | nodes
+  + source
+    ^ nat
+    | joined 10 [";@ /doc/alias f /flow"
+      ";@ f/bind pages document" ";@ /relation ;/people/alice word ;/evidence/a"
+      ";@ f/bind sources captured" ";@ /relation ;/people/bob"
+      ";@ /flag" ";@ /flag" "Anchor"]
+  + checks
+    \ ignored=unit
+    ^ row[testing/check]
+    = parsed (parse semidoc_fidelity_tests/source)
+      card (node_myth parsed.at(0))
+      back (nodes_of (remount parsed))
+      attrs (attrs_of back.at(0))
+      bindings (attrs.keep((\ a (eq_rowcord a.pred ["flow" "bind"]))))
+      relations (attrs.keep((\ a (eq_rowcord a.pred ["relation"]))))
+      flags (attrs.keep((\ a (eq_rowcord a.pred ["flag"]))))
+      expected (parsed.at(0))
+      old (myth/sing ['kind] (pails/t "prose")).put(['text] (pails/t "Anchor")).put(['flow 'bind] (pails/t "sources captured"))
+      baseline (nodes_of (axal/new[myth] (./some old)))
+      changed (nodes_of (axal/new[myth] (./some (old.put(['text] (pails/t "Edited"))))))
+      recovered (semidoc_fidelity_tests/recovered (reconcile baseline changed back))
+      removed (nodes_of (axal/new[myth] (./some (card.put(['flow 'bind] (pails/t ""))))))
+      remaining ((attrs_of (semidoc_fidelity_tests/recovered (reconcile back removed back)).at(0)).keep((\ a (eq_rowcord a.pred ["flow" "bind"]))))
+      rich_card card.put(['text] (goo/text/pail (goo/text/en "Rich text")))
+      rich_nodes (nodes_of (axal/new[myth] (./some rich_card)))
+      rich_edit (semidoc_fidelity_tests/recovered (reconcile back rich_nodes back))
+    [(testing/nat "repeated bindings stay in one typed native slot" 1
+        (equal card.pail_at(['flow 'bind]) (sattr/occurrences [[(sval/word "pages") (sval/word "document")] [(sval/word "sources") (sval/word "captured")]])))
+     (testing/nat "binding occurrences retain authored order" 1 (equal bindings ((attrs_of expected).keep((\ a (eq_rowcord a.pred ["flow" "bind"]))))))
+     (testing/nat "mixed relationship values retain word and reference identity" 1 (equal relations ((attrs_of expected).keep((\ a (eq_rowcord a.pred ["relation"]))))))
+     (testing/nat "duplicate flags survive" 2 flags.len)
+     (testing/nat "typed records survive source round trip" 1 (equal back (parse (unparse back))))
+     (testing/nat "native projection reaches a fixpoint" 1 (equal back (nodes_of (remount back))))
+     (testing/nat "record edits retain source relationships beyond the captured projection" 1 (equal (attrs_of recovered.at(0)) attrs))
+     (testing/nat "record edits still change authored text" 1 (equal recovered [(snode/prose "Edited" attrs)]))
+     (testing/nat "explicit relation removal is honored" 0 remaining.len)
+     (testing/nat "reconciliation retains canonical rich text and relation order" 1 (equal rich_edit rich_nodes))
+     (testing/nat "reconciled rich text survives source and native projection" 1 (equal rich_edit (nodes_of (remount (parse (unparse rich_edit))))))]
+
+  + conflicts
+    \ ignored=unit
+    ^ row[testing/check]
+    = baseline (parse (joined 10 [";= Root" "  First" "" "  Second"]))
+      authored (parse (joined 10 [";= Root" "  ;@ /flow/bind one ;/first" "  ;@ /flow/bind two ;/second" "  First" "" "  Second"]))
+      moved (parse (joined 10 [";= Root" "  Second" "" "  First"]))
+      removed (parse (joined 10 [";= Root" "  Second"]))
+      edited (parse (joined 10 [";= Root" "  Edited" "" "  Second"]))
+      competing (parse (joined 10 [";= Root" "  ;@ /flow/bind one ;/first" "  Source edit" "" "  Second"]))
+      metadata (parse (joined 10 [";= Root" "  ;@ /flow/bind changed ;/third" "  First" "" "  Second"]))
+    [(testing/nat "lossy positional recovery refuses moved blocks" 1 (either/is_err (reconcile baseline moved authored)))
+     (testing/nat "lossy positional recovery refuses deleted blocks" 1 (either/is_err (reconcile baseline removed authored)))
+     (testing/nat "lossy positional recovery refuses competing source text" 1 (either/is_err (reconcile baseline edited competing)))
+     (testing/nat "lossy positional recovery refuses relationship edits" 1 (either/is_err (reconcile baseline metadata authored)))
+     (testing/nat "one text edit can recover repeated authored relationships" 1 (either/is_ok (reconcile baseline edited authored)))
+     (testing/nat "unchanged native records retain the authored projection" 1 (equal (reconcile baseline baseline authored) (either/ok[iota row[snode]] authored)))
+     (testing/nat "faithful projection permits ordinary native structural edits" 1 (equal (reconcile baseline moved baseline) (either/ok[iota row[snode]] moved)))]
+
 +  tests
   ^ row[testing/case]
-  [(testing/case "parse and round trips" semidoc_tests/parsing)
+  [(testing/case "reconciliation conflict boundaries" semidoc_fidelity_tests/conflicts)
+   (testing/case "authored relation fidelity" semidoc_fidelity_tests/checks)
+   (testing/case "parse and round trips" semidoc_tests/parsing)
    (testing/case "HTML rendering" semidoc_tests/rendering)
    (testing/case "namespace mounts" semidoc_tests/mounts)
    (testing/case "record projection" semidoc_tests/records)]

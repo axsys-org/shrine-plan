@@ -37,6 +37,20 @@ test('render transport requires context before making any request',async()=>{
   assert.equal(calls.length,0);
 });
 
+test('native feedback ignores superseded prepared fragments and clears on dismissal',async()=>{
+  const gate=defer();let request=0;
+  const {actions,calls}=setup(()=>++request===1?gate.promise:{ok:true,text:async()=>'<div>Saved</div>'});
+  const container={innerHTML:'',hidden:false,replaceChildren(){this.innerHTML='';}};
+  const first=actions.feedback(container,'Applying',320);
+  await actions.feedback(container,'Saved',320);
+  gate.resolve({ok:true,text:async()=>'<div>Applying</div>'});await first;
+  assert.equal(container.innerHTML,'<div>Saved</div>');
+  assert.equal(calls[0].url,'/goo/feedback');
+  assert.equal(calls[0].options.signal.aborted,true);
+  await actions.feedback(container,'',320);
+  assert.equal(container.hidden,true);assert.equal(container.innerHTML,'');
+});
+
 test('render transport carries explicit context and selector through /goo/render',async()=>{
   const data=envelope(), signal=new AbortController().signal;
   const {actions,calls}=setup(url=>response(url==='/static/goo-profile.json'?profile:data));
@@ -174,11 +188,29 @@ class Control {
 }
 function bindingFixture(actions) {
   const button=new Control('save'), input={dataset:{inputSlot:'/req'},value:'first draft'}, reports=[], saved=[];
-  const container={querySelector:()=>null,querySelectorAll:selector=>selector==='[data-node]'?[button]:selector==='input[data-input-slot]'?[input]:[]};
+  const container={querySelector:()=>null,querySelectorAll:selector=>selector==='[data-node]'?[button]:selector==='[data-input-slot]'?[input]:[]};
   const context={target:'/item',view:'/editor',snapshot,controls:[{kind:'button',id:'save',control:'/save',slot:'/saved'}],
     report:value=>reports.push(value),saved:(...value)=>saved.push(value),capture:()=>[]};
   actions.bind(container,context);return {button,input,container,context,reports,saved};
 }
+
+test('saving waits for a native text command before capturing namespace authority',()=>{
+  const {actions,calls}=setup(()=>{throw Error('unexpected fetch');});
+  const fixture=bindingFixture(actions);let captures=0;
+  fixture.context.capture=()=>{captures++;return [];};
+  fixture.input.gooEditor={pending:true};
+  assert.throws(()=>actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]),/Wait for the text command/);
+  assert.equal(captures,0);assert.equal(calls.length,0);
+  fixture.input.gooEditor.pending=false;
+  const held=actions.captureActivation(fixture.container,fixture.context,fixture.context.controls[0]);
+  assert.equal(captures,1);actions.discardCaptured(held);
+});
+
+test('saving cannot capture an unfinished platform composition',()=>{
+  const {actions}=setup(()=>{throw Error('unexpected fetch');});
+  const container={querySelectorAll:()=>[{gooComposing:true}]};
+  assert.throws(()=>actions.captureActivation(container,{},{}),/Finish composing/);
+});
 
 test('action retries retain one invocation, capture and exact working inputs',async()=>{
   const bodies=[],gate=defer();

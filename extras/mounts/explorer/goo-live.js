@@ -50,9 +50,10 @@ function mountViewer(el, source, opts = {}) {
   }
   async function draw(ev) {
     state.drawn = true;
+    source.beginFrame?.();
     await index();
     $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
-    chip();
+    chip().catch(() => {});
     const nowEl = $('.sv-now'), earlier = $('.sv-earlier');
     nowEl.innerHTML = actionHTML(source, ev, true);
     const det = nowEl.querySelector('details.sv-act'); await fillAction(det, ev, true);
@@ -61,15 +62,19 @@ function mountViewer(el, source, opts = {}) {
     $('.sv-when').innerHTML = ev.shown ? `<span class="shown">shown as is</span>` : `now <b>${ev.epoch}</b>`;
   }
 
-  source.follow(async msg => {
-    if (msg.shown) { const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return draw(ev); }
+  async function show(ev) {
+    try { await draw(ev); return true; }
+    catch (error) { $('.sv-now').innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`; return false; }
+  }
+  const following = source.follow(async msg => {
+    if (msg.shown) { const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return show(ev); }
     if (!msg.touched || !msg.touched.length) return;
-    if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return draw(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
+    if (qaHidden(msg, views)) { if (!msg.quiet && !state.drawn && state.events.length) return show(state.events[state.events.length - 1]); return; }   // the agent's QA stays behind the chip
     state.events.push(msg); if (msg.quiet) return;   // quiet: the backlog on load, kept for `earlier` and drawn with the last
-    return draw(msg);
+    return show(msg);
   });
   if (opts.crumb !== undefined) $('.sv-crumb').innerHTML = crumbHTML(opts.crumb);
-  return { draw };
+  return { draw, stop: () => following?.stop() };
 }
 
 // what a write moved: the cells that read any touched path, one hop
@@ -101,16 +106,20 @@ function cellsHTML(cells) {
   return `<div class="sv-outline">${cells.map(c => `<div class="sv-cell ${c.bad ? 'bad' : c.note ? 'note' : ''}" data-path="${esc(c.path)}"><span class="n">${esc(c.rel || last(c.path))}</span><span class="f">${esc(c.formula)}</span><span class="a">${esc(c.bad || c.note || c.answer || '')}</span></div>`).join('')}</div>`;
 }
 // ---------- rendering ----------
-const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+const liveHref = p => '/live?views=' + encodeURIComponent(world(p));
+const chatQ = () => '';
+const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?at=${encodeURIComponent(world(path))}" data-go="${esc(path)}">${esc(text)}</a>`;
 const last = p => p ? p.split('/').pop() : 'namespace';
-const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
+const isCell = rec => !!rec && typeof rec.formula === 'string' && (rec.formula.startsWith('-> /weft/stdlib/') || rec.formula === 'native overlay');
 const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
 
 // one value, by kind; the only place a value's kind is decided
 function valueHTML(v, cls = 'sv-v') {
   if (typeof v === 'number') return `<span class="${cls}">${v.toLocaleString()}</span>`;
   const s = String(v);
-  const r = refOf(s); if (r) return `<span class="${cls} ref" data-path="${esc(r.path.replace(/^\/x\//, ''))}">${esc(s)}</span>`;
+  const r = refOf(s); if (r) return `<a href="${liveHref(r.path)}"><span class="${cls} ref" data-path="${esc(r.path.replace(/^\/x\//, ''))}">${esc(s)}</span></a>`;
+  if (/^\/(?:0x[0-9a-f]+|o|x|c|h)\//i.test(s)) return `<a class="${cls} ref" href="${liveHref(s)}">${esc(s)}</a>`;
   if (/^blob:/.test(s)) { const [, hash, mime, size] = s.split(':'); return `<span class="${cls} blob">${mime && mime.startsWith('image') ? `<img alt="" src="/blob/${esc(hash)}">` : ''}${esc(hash.slice(0, 8))} &middot; ${esc(size || '')}</span>`; }
   if (s === 'yes' || s === 'no') return `<span class="${cls} flag ${s}">${s}</span>`;
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return `<span class="${cls}">${esc(s)}</span>`;
@@ -294,7 +303,7 @@ function slotsOf(props) {
   const out = {};
   for (const [k, v] of Object.entries(props || {})) {
     const key = k.replace(/^\//, '');
-    if (key === 'sys/weft') { const r = spelling(String(v)); out.formula = '-> /weft/stdlib/' + (r ? r.path.split('/').pop() : String(v)); }
+    if (key === 'sys/weft') { const r = spelling(String(v)); out.formula = r ? '-> /weft/stdlib/' + r.path.split('/').pop() : 'native overlay'; }
     else if (key === 'sys/tack') out.over = valueOf(v);
     else out[key] = valueOf(v);
   }
@@ -308,7 +317,7 @@ function nodeOf(n) {
 // a read answer as the viewer's read: record null for a culled path (no record, but a case), {} for a bare folder
 function readOf(a) {
   const node = nodeOf(a);
-  return { path: node.path, record: a.exists === false ? (a.reference ? null : {}) : node.slots, kids: node.kids, case: node.case, next: a.next || null };
+  return { path: node.path, record: a.exists === false && !node.kids.length ? (a.reference ? null : {}) : node.slots, kids: node.kids, case: node.case, next: a.next || null };
 }
 // a cell's answer from its /x and /c/x: the fault or note from the context, else the tree (unknown when /x is empty)
 function answerOf(path, x, c) {
@@ -317,7 +326,7 @@ function answerOf(path, x, c) {
   if (ctx['/sys/view/fault']) return { bad: ctx['/sys/view/fault'] };
   if (ctx['/sys/view/missing']) return { note: ctx['/sys/view/missing'] };
   if (!x || x.error) return { bad: (x && x.error) || 'unknown' };
-  if (x.exists === false) return ctx['/sys/view/asking'] ? { note: ctx['/sys/view/asking'] } : { bad: 'unknown' };
+  if (x.exists === false && !(x.children || []).length) return ctx['/sys/view/asking'] ? { note: ctx['/sys/view/asking'] } : { bad: 'unknown' };
   const tree = nodeOf(x); tree.path = local(path); tree.name = last(tree.path);
   return { tree };
 }
@@ -353,29 +362,54 @@ function mcpSource(opts = {}) {
   const doFetch = opts.fetch || ((u, o) => root.fetch(u, o)), ES = 'EventSource' in opts ? opts.EventSource : root.EventSource;
   const every = opts.setInterval || root.setInterval, clear = opts.clearInterval || root.clearInterval, later = opts.setTimeout || root.setTimeout;
   let seq = 0, latest = null;   // latest: the newest event's `with`, keyed by world path; the one payload a read may answer from
+  let frame = null;
+  let watchedRoot = null, watchedCells = new Map();
+  const derived = /^(?:x|c|o|h)\//.test(views);
+  const beginFrame = () => { frame = new Map(); watchedRoot = null; watchedCells = new Map(); };
+  const rootStamp = node => JSON.stringify(derived ? node : [node.reference_z, node.reference_y, node.reference, node.exists, node.properties]);
+  const remember = (node, care) => {
+    if (!frame || !node || node.error || node.paged) return;
+    frame.set(JSON.stringify([node.path, care, 0]), node);
+    frame.set(JSON.stringify([node.path, 'x', 0]), {...node, children: []});
+  };
   async function rpc(name, args) {
-    const res = await doFetch(base + '/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method: 'tools/call', params: { name: 'mcp/' + name, arguments: args } }) });
+    const controller = new AbortController();
+    const timeout = root.setTimeout(() => controller.abort(), opts.timeout || 15000);
+    try {
+    const res = await doFetch(base + '/mcp', { signal: controller.signal, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method: 'tools/call', params: { name: 'mcp/' + name, arguments: args } }) });
     const j = await res.json();
     if (j.error) throw new Error(j.error.message || 'rpc failed');
     if (j.result && j.result.isError) throw new Error((j.result.content && j.result.content[0] && j.result.content[0].text) || 'rpc failed');
     return j.result.structuredContent;
+    } finally { root.clearTimeout(timeout); }
   }
   const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
   async function read(path, care, cas) {
     const w = world(path), held = care === 'x' && !cas ? carried(w) : null;
-    return readOf(held || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 }));
+    const key = JSON.stringify([w, care || 'z', cas || 0]);
+    const cached = held || frame?.get(key);
+    const node = cached || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200 });
+    if (!cached && !cas && w === world(views)) watchedRoot = {node, care: care || 'z', limit: 200};
+    return readOf(node);
   }
   async function answer(path) {
     const w = world(path), x = carried('/x' + w), c = carried('/c/x' + w);
     if (x && c) return answerOf(path, x, c);
+    const key = 'answer:' + w;
+    if (frame?.has(key)) return frame.get(key);
     const a = await rpc('read', { paths: ['/x' + w, '/c/x' + w], care: 'z', limit: 200 });
-    return answerOf(path, a.answers[0], a.answers[1]);
+    watchedCells.set(w, a.answers);
+    const result = answerOf(path, a.answers[0], a.answers[1]);
+    frame?.set(key, result);
+    return result;
   }
   // the cells under the views folder, three levels down (a plan, a qa tree with its diff and score folders);
   // a folder with a hundred or more children is left unopened
   async function graph() {
     if (!views) return { sources: [], cells: [] };
     const folder = await rpc('read', { path: world(views), care: 'y', limit: 500 });
+    watchedRoot = {node: folder, care: 'y', limit: 500};
+    remember(folder, 'y');
     const cells = [], sources = new Set(), seen = new Set();
     const take = ch => {
       if (!ch.properties || !('/sys/weft' in ch.properties) || seen.has(ch.path)) return;
@@ -384,8 +418,9 @@ function mcpSource(opts = {}) {
       const o = refOf(slots.over); if (o) inputs.push({ path: o.path, pin: o.pin });
       for (const [k, v] of Object.entries(slots)) { if (k === 'formula' || k === 'over') continue; const r = refOf(v); if (r) inputs.push({ path: r.path, pin: r.pin, view: true }); else settings.push(k + ' ' + v); }
       for (const i of inputs) if (!i.path.startsWith('/x/')) sources.add(i.path);
-      cells.push({ path: local(ch.path), rel: local(ch.path).slice(local(views).length + 1), formula: slots.formula.slice(16), settings: settings.join(' '), inputs });
+      cells.push({ path: local(ch.path), rel: local(ch.path).slice(local(views).length + 1), formula: slots.formula.replace(/^-> \/weft\/stdlib\//, ''), settings: settings.join(' '), inputs });
     };
+    take(folder);
     const folders = f => (f.children || []).filter(ch => ch.exists !== false && !(ch.properties && '/sys/weft' in ch.properties) && (ch.children || []).length < 100 && !(ch.properties && '/sys/tack' in ch.properties));
     let level = [folder];
     for (let depth = 0; depth < 3 && level.length; depth++) {
@@ -397,14 +432,27 @@ function mcpSource(opts = {}) {
     }
     if (cells.length) {
       const a = await rpc('read', { reads: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });
-      cells.forEach((c, i) => { const r = answerOf(c.path, a.answers[2 * i], a.answers[2 * i + 1]); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
+      cells.forEach((c, i) => { const pair = a.answers.slice(2 * i, 2 * i + 2), r = answerOf(c.path, ...pair); watchedCells.set(world(c.path), pair); frame?.set('answer:' + world(c.path), r); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
     }
     return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
+  }
+  async function changed() {
+    if (!watchedRoot) return true;
+    const previous = watchedRoot, cells = [...watchedCells];
+    // Physical y/z cases cover the displayed subtree. A live cell's own x case
+    // does NOT advance when its tack changes: compare its native result/context
+    // too. Derived overlays likewise have no physical subtree case to watch.
+    const reads = [{path: world(views), care: derived ? previous.care : 'x', limit: derived ? previous.limit : 1},
+      ...cells.flatMap(([p]) => [{path: '/x' + p, care: 'z', limit: 200}, {path: '/c/x' + p, care: 'z', limit: 200}])];
+    const page = await rpc('read', {reads});
+    if (!page.answers || page.answers.some(a => !a || a.error)) throw new Error('Could not refresh this view');
+    return rootStamp(page.answers[0]) !== rootStamp(previous.node)
+      || cells.some(([, pair], i) => JSON.stringify(pair) !== JSON.stringify(page.answers.slice(2 * i + 1, 2 * i + 3)));
   }
   // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
   async function qa() {
     const node = local(views).split('/')[0];
-    if (!node) return null;
+    if (!/^0x[0-9a-f]+$/i.test(node)) return null;
     const agents = await rpc('read', { path: '/' + node + '/agent', care: 'y', limit: 50 });
     for (const ch of agents.children || []) {
       const name = last(ch.path);
@@ -416,6 +464,27 @@ function mcpSource(opts = {}) {
   }
   // follow: the stream when it answers, the history poll (700 ms, with x) when it does not; one handler, same events
   function follow(handler) {
+    // A requested record is a view, not a replay of unrelated global writes.
+    // Derived paths are refreshed on writes too: their dependencies may live elsewhere.
+    if (views) {
+      let stopped = false, timer = null, busy = false, redraw = true;
+      const shown = () => handler({ shown: { path: views, care: 'y', case: 0 } });
+      async function poll() {
+        if (stopped || busy) return;
+        busy = true;
+        try {
+          // Poll this view, never scan the global journal for a non-system writer.
+          if (!redraw) redraw = await changed();
+          if (redraw && !stopped) redraw = (await shown()) === false;
+        } finally { busy = false; }
+      }
+      const ready = Promise.resolve().then(async () => {
+        await poll().catch(() => {});
+        if (!stopped) timer = every(() => poll().catch(() => {}), 2000);
+      });
+      ready.catch(() => {});
+      return { ready, stop: () => { stopped = true; if (timer !== null) clear(timer); } };
+    }
     let last = 0, queue = Promise.resolve(), polling = null, stream = null;
     const wanted = e => who === 'all' || (who ? e.who === who : e.who !== 'system');
     const deliver = lines => { for (const l of lines) queue = queue.then(() => handler(l)).catch(() => {}); return queue; };
@@ -446,18 +515,52 @@ function mcpSource(opts = {}) {
     backlog().catch(() => {}).then(open);
     return { stop: () => { stopPoll(); if (stream) stream.close(); } };
   }
-  return { read, answer, graph, follow, qa, rpc };
+  return { read, answer, graph, follow, qa, rpc, beginFrame };
 }
 
-// the page: /live?views=<folder>&who=<writer>
+const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
+function mountRecord(el, source, opts = {}) {
+  const at = local(opts.at), node = at.split('/')[0];
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>`;
+  const main = el.querySelector('.sv-recview');
+  let timer = null;
+  async function draw() {
+    source.beginFrame?.();
+    try {
+    const r = await source.read(at, 'y');
+    if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return true; }
+    const card = r.record === null ? '<div class="sv-gone">deleted</div>' : await recordHTML(source, { ...r, kids: [] }, true, new Set());
+    const kids = (r.kids || []).map(k => `<div class="sv-hop">${goHTML(k.path, k.path, k.name, 'n')}<span class="m">${lineHTML(k.slots)}</span></div>`).join('');
+    let back = '';
+    if (source.backlinks) { const rb = await source.backlinks(at).catch(() => ({ matches: [] })); back = rb.matches.map(m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`).join(''); }
+    main.innerHTML = card + (kids ? `<div class="sv-sec"><div class="k">beneath</div>${kids}</div>` : '') + (source.backlinks ? `<div class="sv-sec"><div class="k">pointing here</div>${back || '<div class="sv-empty">nothing points here yet</div>'}</div>` : '');
+    return true;
+    } catch (error) {
+      main.innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`;
+      return false;
+    }
+  }
+  const following = source.follow?.(msg => { if (msg.shown) return draw(); if (msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } });
+  if (!source.follow) draw();
+  el.addEventListener('click', e => {
+    const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
+    e.preventDefault(); const href = a.getAttribute('href');
+    (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { root.location.search = href.slice(1); });
+  });
+  return { draw, stop: () => { clearTimeout(timer); following?.stop(); } };
+}
+
+
+// the page: /live?views=<folder>&who=<writer> or ?at=<record>
 function start(doc) {
   const el = doc.getElementById('live'); if (!el) return null;
   const q = new URLSearchParams(doc.location ? doc.location.search : '');
-  const views = local(q.get('views') || ''), who = q.get('who') || '';
+  const views = local(q.get('views') || ''), who = q.get('who') || '', at = local(q.get('at') || '');
+  if (at) return mountRecord(el, mcpSource({views: at, who}), {at});
   return mountViewer(el, mcpSource({ views, who }), { crumb: views, views });
 }
 
-const GooLive = { mountViewer, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
+const GooLive = { mountViewer, mountRecord, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
