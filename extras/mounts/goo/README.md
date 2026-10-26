@@ -12,7 +12,8 @@ Rendering uses the `mash-goo` version-1 profile. Mash owns the pinned fonts,
 typography, primitive geometry and HTML recipes; Goo owns semantic interpretation,
 measurement, adjacency, wrapping and layout on the server. Other renderers can
 consume Goo's checked, absolute display list without implementing those layout
-semantics. See [the renderer boundary](HTML.md).
+semantics. See [the renderer boundary](HTML.md) and [portable paint, patch, control
+and host descriptors](PORTABLE.md).
 
 Intermediate Grove/Goo sequences use `list`: Grove declarations and statements,
 role fields and requirements, view arguments and children, pass diagnostics and

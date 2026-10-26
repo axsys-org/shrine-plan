@@ -40,8 +40,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix='hyp-', dir=root / '.check'))
     materialize(root, EXTRAS, work / 'src', ['hyp'])
     (work / 'snap').mkdir()
-    for name in ('data.mdb', 'pins.pack'):
-        shutil.copy2(template / name, work / 'snap' / name)
+    shutil.copy2(template / 'arena.dat', work / 'snap' / 'arena.dat')
     source = f'''(#bind hyp (#module hyp))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind driver (#module foil-new-env))

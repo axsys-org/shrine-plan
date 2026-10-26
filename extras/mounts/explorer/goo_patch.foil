@@ -3,9 +3,14 @@
 - weft
 - http_foot
 - value_read
+- wire_proto
 
-' Server-resolved patch scenes. This is HTML lowering, never a layout solver.
+' Server-resolved patch scenes with parallel portable and HTML occurrence content.
 + goo_patch
+  + error
+    \ message=str
+    ^ json
+    | json/obj [(jkv "ok" (json/boo .false)) (jkv "error" (json/str message))]
   + query_provider
     : target=path read={\ json namespace}either[str json]
   + query_path
@@ -16,17 +21,22 @@
   + query_response
     \ fields=row[[str str]] state=namespace
     ^ [nat str]
+    = [status value] (goo_patch/query_value fields state)
+    | [status (? (eq status 200) (show value) (goo_runtime/json_text (goo_runtime/json_field "error" value)))]
+  + query_value
+    \ fields=row[[str str]] state=namespace
+    ^ [nat json]
     = get (\ key=str (http_foot/field key fields))
       view (http_foot/target (get "view")) target (http_foot/target (get "target"))
-    ?> (./some card) (goo_runtime/record .x (goo_patch/query_path state.self view) state) [404 "No patch query provider"]
-    ?> (./some held) card.get(system_vocabulary/content) [404 "No patch query provider"]
-    ?> provider=goo_patch/query_provider held [409 "Invalid patch query provider"]
-    ? !(equal target provider.target) [409 "Query target does not match its presentation"]
-    ?> (jres/ok query rest) (parse (get "query")) [400 "Invalid query"]
+    ?> (./some card) (goo_runtime/record .x (goo_patch/query_path state.self view) state) [404 (goo_patch/error "No patch query provider")]
+    ?> (./some held) card.get(system_vocabulary/content) [404 (goo_patch/error "No patch query provider")]
+    ?> provider=goo_patch/query_provider held [409 (goo_patch/error "Invalid patch query provider")]
+    ? !(equal target provider.target) [409 (goo_patch/error "Query target does not match its presentation")]
+    ?> (jres/ok query rest) (parse (get "query")) [400 (goo_patch/error "Invalid query")]
     = read provider.read
     ? (read query state)
-     > (./ok response) [200 (show response)]
-     > (./err message) [409 message]
+     > (./ok response) [200 response]
+     > (./err message) [409 (json/obj [(jkv "ok" (json/boo .false)) (jkv "error" (json/str message))])]
   + occurrence
     : kind=str key=str body=list[goo/node]
   + population
@@ -53,9 +63,14 @@
     ? ((lt width 32) || (gt width 2000) || (lt height 32) || (gt height 2000) || (gt top 2000)) (./err "Invalid presentation rectangle")
     = url (str/cat_all ["/goo-presentation?path=" (value_read/percent target) "&slot=" (value_read/percent slot)])
       style (str/cat_all ["position:absolute;left:16px;top:" (nat/show top) "px;width:" (nat/show width) "px;height:" (nat/show height) "px;border:0;background:transparent"])
+      portable (json/obj [(jkv "kind" (json/str "presentation")) (jkv "key" (json/str key))
+        (jkv "label" (json/str label)) (jkv "target" (json/str (path_show subject)))
+        (jkv "slot" (json/str (path_show lexical))) (jkv "units" (json/str "css-px"))
+        (jkv "rect" (json/obj [(jkv "x" (json/num .false 16)) (jkv "y" (json/num .false top))
+          (jkv "width" (json/num .false width)) (jkv "height" (json/num .false height))]))])
     | ./ok (goo_patch/fragment (str/from_atom (weft/render (weft/el "iframe"
         [(weft/att "data-goo-presentation-frame" (str/to_atom key)) (weft/att "title" (str/to_atom label))
-         (weft/att "src" (str/to_atom url)) (weft/att "style" (str/to_atom style))] []))) [])
+         (weft/att "src" (str/to_atom url)) (weft/att "style" (str/to_atom style))] []))) [] [portable])
   + population_contents
     \ context=goo_bridge/render_context published=goo/published card=myth node=goo/node scene=json route=row[nat]
     ^ either[str row[json]]
@@ -79,7 +94,7 @@
     < body (goo_patch/body local published card item.body route.snoc(ordinal) (\ node route []))
     | _ rest.drop(1) ordinal.inc out.snoc((json/obj
         [(jkv "kind" (json/str item.kind)) (jkv "key" (json/str item.key))
-         (jkv "html" (json/str body.html)) (jkv "controls" (json/arr []))
+         (jkv "html" (json/str body.html)) (jkv "controls" (json/arr [])) (jkv "content" (json/arr body.content))
          (jkv "context" (goo_bridge/context_json local))])) keys.snoc(identity)
   + field
     \ name=str value=json
@@ -113,12 +128,13 @@
     ^ bool
     | ((eq node.constructor "patch_port") || (eq node.constructor "patch_handle") || (eq node.constructor "patch_select") || (eq node.constructor "patch_label") || node.children.any(goo_patch/special))
   + fragment
-    : html=str controls=row[json]
+    : html=str controls=row[json] content=row[json]
   + native
     \ context=goo_bridge/render_context published=goo/published card=myth node=goo/node route=row[nat] metadata={\ goo/node row[nat]}row[json]
     ^ either[str goo_patch/fragment]
     = local (published.set_view(published.view.set_name(published.view.name.snoc(($ts (str/cat_all ["patch_" (str/join "_" route.map(nat/show))]))))))
-    < prepared (goo_bridge/prepare context local card local.view.set_children((list/one node)))
+    < compiled (goo_bridge/compile context local card local.view.set_children((list/one node)))
+    = prepared compiled.prepared
     = prefix (str/cat_all [(path_show published.view.name) ":"])
       local_prefix (str/cat_all [(path_show local.view.name) ":"])
       rewrite
@@ -134,13 +150,20 @@
         ^ json
         ?> (json/obj fields) control control
         | json/obj (fields.map(rewrite))
-    | ./ok (goo_patch/fragment (goo_html/fragment prepared) controls)
+    ?> (./some display) (goo_prepared/encode prepared) (./err "Patch body display failed validation.")
+    = controls (goo_bridge/control_descriptors controls display)
+      html (goo_html/fragment prepared)
+      fields=row[jkv] [(jkv "kind" (json/str "body")) (jkv "key" (json/str (str/join "." route.map(nat/show))))
+        (jkv "profile" (goo_profile/metadata unit/unit)) (jkv "context" (goo_bridge/context_json context))
+        (jkv "display" display) (jkv "controls" (json/arr controls))]
+      body (json/obj fields.weld((goo_bridge/pipeline_fields context compiled display html controls)))
+    | ./ok (goo_patch/fragment html controls [body])
   + body
     \ context=goo_bridge/render_context published=goo/published card=myth nodes=list[goo/node] route=row[nat] metadata={\ goo/node row[nat]}row[json]
     ^ either[str goo_patch/fragment]
-    % rest=list[goo/node] nodes ordinal=nat 0 html=str "" controls=row[json] []
+    % rest=list[goo/node] nodes ordinal=nat 0 html=str "" controls=row[json] [] content=row[json] []
     ^ either[str goo_patch/fragment]
-    ? rest.is_nil (./ok (goo_patch/fragment html controls))
+    ? rest.is_nil (./ok (goo_patch/fragment html controls content))
     = node rest.head here route.snoc(ordinal) kind node.constructor
       key (goo_patch/key node) label (goo_patch/property "label" node)
       fragment=either[str goo_patch/fragment]
@@ -158,15 +181,18 @@
             wrapper (weft/el (? (eq kind "patch_port") "goo-patch-port" "span")
               [(weft/att "data-key" (str/to_atom key))
                (weft/att "style" (? (eq kind "patch_port") "" (? (eq kind "patch_select") "position:absolute;inset:0" "position:absolute;bottom:4px;left:4px;z-index:1")))] moves.cons(button))
-          | ./ok (goo_patch/fragment (str/from_atom (weft/render wrapper)) [])
+            portable (json/obj [(jkv "kind" (json/str (? (eq kind "patch_port") "port" (? (eq kind "patch_select") "select" "handle"))))
+              (jkv "key" (json/str key)) (jkv "label" (json/str label))
+              (jkv "moves" (? (eq kind "patch_handle") (goo_patch/move_descriptors label) (json/arr [])))])
+          | ./ok (goo_patch/fragment (str/from_atom (weft/render wrapper)) [] [portable])
         ? (eq kind "patch_label")
           < inside (goo_patch/body context published card node.children here metadata)
           | ./ok (goo_patch/fragment (str/from_atom (weft/render (weft/el "span"
-              [(weft/att "data-patch-label" (str/to_atom key))] [(weft/raw (str/to_atom inside.html))]))) inside.controls)
+              [(weft/att "data-patch-label" (str/to_atom key))] [(weft/raw (str/to_atom inside.html))]))) inside.controls [(json/obj [(jkv "kind" (json/str "label")) (jkv "key" (json/str key)) (jkv "children" (json/arr inside.content))])])
         ? (goo_patch/special node) (./err "Place patch ports/handles/labels directly in their occurrence; ordinary Goo bodies retain their own layout.")
         | goo_patch/native context published card node here metadata
     < fragment fragment
-    | _ rest.tail ordinal.inc (str/cat_all [html fragment.html]) controls.weld(fragment.controls)
+    | _ rest.tail ordinal.inc (str/cat_all [html fragment.html]) controls.weld(fragment.controls) content.weld(fragment.content)
   + prepare
     \ context=goo_bridge/render_context published=goo/published card=myth node=goo/node route=row[nat] metadata={\ goo/node row[nat]}row[json]
     ^ either[str json]
@@ -182,7 +208,8 @@
       | ./ok (json/obj [(jkv "kind" (json/str "patch")) (jkv "key" (json/str (goo_patch/key node)))
           (jkv "node" (json/str (str/join "." route.map(nat/show))))
           (jkv "label" (json/str (goo_patch/property "label" node)))
-          (jkv "scene" scene) (jkv "contents" (json/arr contents))
+          (jkv "scene" scene) (jkv "contentVersion" (json/num .false 1)) (jkv "contents" (json/arr contents))
+          (jkv "connectionControls" (goo_patch/connection_descriptors scene))
           (jkv "controlsHTML" (json/str (str/from_atom (weft/render (goo_patch/connection_controls scene)))))
           (jkv "offerBindings" (json/arr offers)) (jkv "children" (json/arr []))])
     = child children.head kind child.constructor key (goo_patch/key child)
@@ -196,7 +223,7 @@
       local (context.set_width(width))
     < body (goo_patch/body local published card child.children route.snoc(ordinal) metadata)
     = item (json/obj [(jkv "kind" (json/str kind)) (jkv "key" (json/str key))
-        (jkv "html" (json/str body.html)) (jkv "controls" (json/arr body.controls))
+        (jkv "html" (json/str body.html)) (jkv "controls" (json/arr body.controls)) (jkv "content" (json/arr body.content))
         (jkv "context" (goo_bridge/context_json local))])
     ? !(eq kind "patch_operation") (_ children.tail ordinal.inc contents.snoc(item) offers)
     = actions (body.controls.keep((\ control (eq (goo_patch/text (goo_patch/field "kind" control)) "action"))))
@@ -231,34 +258,57 @@
         | weft/el (str/to_atom tag) attrs [(weft/raw (str/to_atom (goo_patch/text (goo_patch/field "html" content))))]
     | weft/el "goo-patch" [(weft/att "role" "region")
         (weft/att "aria-label" (str/to_atom (goo_patch/text (goo_patch/field "label" node))))] children.cons(script)
+  + move_descriptors
+    \ label=str
+    ^ json
+    = directions=row[[str str str]] [["left" "-10" "0"] ["right" "10" "0"] ["up" "0" "-10"] ["down" "0" "10"]]
+      moves=row[json]
+        | directions.map
+          \ [name x y]
+          | json/obj [(jkv "direction" (json/str name)) (jkv "dx" (json/real x)) (jkv "dy" (json/real y))
+              (jkv "label" (json/str (str/cat_all [label " " name])))]
+    | json/arr moves
   + move_controls
     \ label=str
     ^ row[weft/node]
-    = directions=row[[str str str]] [["left" "-10" "0"] ["right" "10" "0"] ["up" "0" "-10"] ["down" "0" "10"]]
-    | directions.map
-      \ [name x y]
+    | (goo_patch/items (goo_patch/move_descriptors label)).map
+      \ move=json
       | weft/leaf "button" [(weft/att "type" "button") (weft/att "data-patch-move" "")
-          (weft/att "data-dx" (str/to_atom x)) (weft/att "data-dy" (str/to_atom y))
-          (weft/att "aria-label" (str/to_atom (str/cat_all [label " " name]))) ]
-          (str/to_atom name)
+          (weft/att "data-dx" (str/to_atom (show (goo_patch/field "dx" move))))
+          (weft/att "data-dy" (str/to_atom (show (goo_patch/field "dy" move))))
+          (weft/att "aria-label" (str/to_atom (goo_patch/text (goo_patch/field "label" move))))]
+          (str/to_atom (goo_patch/text (goo_patch/field "direction" move)))
+  + connection_descriptors
+    \ scene=json
+    ^ json
+    = connections=row[json]
+        | (goo_patch/items (goo_patch/field "connections" scene)).map
+          \ connection=json
+          = key (goo_patch/text (goo_patch/field "key" connection))
+            disconnect (json/obj [(jkv "kind" (json/str "disconnect")) (jkv "connection" (json/str key))
+              (jkv "label" (json/str (str/cat_all ["Disconnect " key])))])
+            reconnects=row[json]
+              | (goo_patch/items (goo_patch/field "endpoints" connection)).map
+                \ endpoint=json
+                = name (goo_patch/text (goo_patch/field "key" endpoint))
+                | json/obj [(jkv "kind" (json/str "reconnect")) (jkv "connection" (json/str key))
+                    (jkv "endpoint" (json/str name)) (jkv "label" (json/str (str/cat_all ["Reconnect " key " " name])))]
+          | json/obj [(jkv "key" (json/str key)) (jkv "controls" (json/arr reconnects.cons(disconnect)))]
+    | json/arr connections
   + connection_controls
     \ scene=json
     ^ weft/node
-    = connections (goo_patch/items (goo_patch/field "connections" scene))
-      rows=row[weft/node]
-        | connections.map
+    = rows=row[weft/node]
+        | (goo_patch/items (goo_patch/connection_descriptors scene)).map
         \ connection=json
-        = key (goo_patch/text (goo_patch/field "key" connection))
-          disconnect (weft/leaf "button" [(weft/att "type" "button")
-            (weft/att "data-patch-connection" (str/to_atom key)) (weft/att "data-patch-disconnect" "")]
-            (str/to_atom (str/cat_all ["Disconnect " key])))
-          endpoints (goo_patch/items (goo_patch/field "endpoints" connection))
-          reconnects=row[weft/node]
-            | endpoints.map
-            \ endpoint=json
-            = name (goo_patch/text (goo_patch/field "key" endpoint))
-            | weft/leaf "button" [(weft/att "type" "button") (weft/att "data-patch-connection" (str/to_atom key))
-                (weft/att "data-patch-reconnect" (str/to_atom name))]
-                (str/to_atom (str/cat_all ["Reconnect " key " " name]))
-        | weft/el "div" [] reconnects.cons(disconnect)
+        = buttons=row[weft/node]
+            | (goo_patch/items (goo_patch/field "controls" connection)).map
+            \ control=json
+            = kind (goo_patch/text (goo_patch/field "kind" control))
+            | weft/leaf "button" [(weft/att "type" "button")
+                (weft/att "data-patch-connection" (str/to_atom (goo_patch/text (goo_patch/field "connection" control))))
+                (weft/att (? (eq kind "disconnect") "data-patch-disconnect" "data-patch-reconnect")
+                  (str/to_atom (goo_patch/text (goo_patch/field "endpoint" control))))]
+                (str/to_atom (goo_patch/text (goo_patch/field "label" control)))
+        | weft/el "div" [] buttons
     | weft/el "div" [(weft/att "aria-label" "Connections")] rows

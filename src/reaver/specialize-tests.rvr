@@ -1,0 +1,134 @@
+(#bind std (#module std))
+(#import std)
+(#bind cg (#module codegen))
+
+;; These definitions exercise the bootstrap Reaver path. The AST below
+;; exercises Foil's source-to-PLAN backend with the same input law.
+(define (walk f x)
+  (Ifz x x [(f (Ix 0 x)) (walk f (Ix 1 x))]))
+(define (double-list x) (walk (Mul 2) x))
+(define foil-double
+  (cg:compile-expr
+    (cg:F 1 0 1 "foil-double" 1
+      (cg:A (cg:A (cg:K walk) (cg:K (Mul 2))) (cg:V 1)))))
+
+(define (law v) (If (IsPin v) (Unpin v) v))
+(define (constant b)
+  (If (And (IsApp b) (And (Equal 0 (Hd b)) (Eq 1 (Sz b)))) (_0 b) b))
+(define (callee f) (law (constant (_0 (Body (law f))))))
+
+;; Pin the residual law, including direct primitive application and a
+;; recursive self call with just the dynamic list argument.
+(define expected-walk
+  (Law 0 "walk"
+    (0 (0 (0 (0 Ifz) 1) 1)
+      (0 (0 (0 0) (0 (0 (0 Mul) (0 2)) (0 (0 (0 Ix) (0 0)) 1)))
+        (0 0 (0 (0 (0 Ix) (0 1)) 1))))))
+assert(Equal expected-walk (callee double-list))
+assert(Equal expected-walk (callee foil-double))
+assert(Equal ~[2 4 6] (double-list ~[1 2 3]))
+assert(Equal ~[2 4 6] (foil-double ~[1 2 3]))
+assert(Equal 0 (double-list 0))
+
+;; A changed callback must use the unspecialized function, not residual self.
+(define (changing f n)
+  (Ifz n (f 10) (changing Inc (Dec n))))
+(define (changed n) (changing (Mul 2) n))
+assert(Eq 20 (changed 0))
+assert(Eq 11 (changed 3))
+
+;; Self can escape as an ordinary value; it retains its original arity.
+(define (escape f n) (Ifz n escape (f n)))
+(define (escaped n) (escape Inc n))
+assert(Equal escape (escaped 0))
+assert(Eq 3 (escaped 2))
+
+;; Static data preceding the callback, local sharing, and forward let refs.
+(define (offset-map offset f x)
+  (define y (f x))
+  (Add offset (Add y y)))
+(define (offset-double x) (offset-map 7 (Mul 2) x))
+assert(Eq 19 (offset-double 3))
+
+;; Nothing may force a saturated callback during specialization, even if
+;; all of its arguments are constants or it sits in an unused branch.
+(define (fail x) (error "specialization forced a callback"))
+(define (lazy-branch f n) (Ifz n 9 (f 0)))
+(define (lazy-specialized n) (lazy-branch fail n))
+assert(Eq 9 (lazy-specialized 0))
+assert(Eq 1 (Hd (Try lazy-specialized 1)))
+
+;; Unknown callbacks and data-only partial applications keep the old path.
+(define (dynamic f x) (walk f x))
+assert(Equal ~[3 6] (dynamic (Mul 3) ~[1 2]))
+(define (data-only x) (Add 2 x))
+assert(Eq 5 (data-only 3))
+(print "specialization tests passed")
+
+;; Callback forwarding (row map -> list map) is specialized to a bounded
+;; depth as well. The remaining arity proves the callback was removed.
+(define (double-row x) (map (Mul 2) x))
+assert(Eq 1 (Arity (callee double-row)))
+assert(Equal [2 4 6] (double-row [1 2 3]))
+
+;; Run the public Foil pipeline, not just its codegen API. Foil's list/map
+;; uses tagged cells, unlike the Reaver list fixture above.
+(#bind cases (#module foil-test-cases))
+(#bind foil (#module foil-new-env))
+(define (check-foil z)
+  (define sut (cases:compile "
++ double
+  \ xs=list[nat]
+  ^ list[nat]
+  xs.map((mul 2))
+"))
+  (define double (foil:source-entry-val ["double"] sut))
+  assert(Eq 1 (Arity (callee double)))
+  assert(Equal ("cons" 2 ("cons" 4 "nil"))
+    (double ("cons" 1 ("cons" 2 "nil"))))
+  assert(Equal "nil" (double "nil"))
+  (print "Foil specialization tests passed")
+  1)
+assert(check-foil 0)
+
+;; Raw laws cover quoting and recursive let slots independently of either
+;; front end's let elimination. Slot 3 refers forward to slot 4.
+(define (call-with-inc name f)
+  (cg:compile-expr
+    (cg:F 1 0 1 name 1 (cg:A (cg:A (cg:K f) (cg:K Inc)) (cg:V 1)))))
+(define forward-law
+  (Law 1 "forward" (1 4 (1 (0 1 2) 3))))
+(define forward-call (call-with-inc "forward-call" forward-law))
+assert(Eq 8 (forward-call 7))
+assert(Eq 1 (Arity (callee forward-call)))
+
+;; A literal that looks exactly like code must not be visited or renumbered.
+(define quoted-law
+  (Law 1 "quoted" (0 (0 (0 Ifz 2) (0 (0 1 2))) (0 1 2))))
+(define quoted-call (call-with-inc "quoted-call" quoted-law))
+assert(Equal (0 1 2) (quoted-call 0))
+assert(Eq 4 (quoted-call 3))
+
+;; A pin-headed PAP literal is not a code application, even though numeric
+;; Eq would coerce its pin head to zero. Its contents must remain untouched.
+(define pap-literal-law
+  (Law 1 "pap-literal" (0 (0 (0 Ifz 2) (Mul 2)) (0 1 2))))
+(define pap-literal-call (call-with-inc "pap-literal-call" pap-literal-law))
+assert(Equal (Mul 2) (pap-literal-call 0))
+assert(Eq 4 (pap-literal-call 3))
+
+;; Carrying a callback as data is not a specialization opportunity.
+(define (carry f x) [f x])
+(define (carry-inc x) (carry Inc x))
+assert(Equal [Inc 3] (carry-inc 3))
+assert(Equal (carry Inc) (constant (_0 (Body (law carry-inc)))))
+
+;; Large functions are left alone instead of multiplying compiler work.
+(define large-law
+  (Law 1 "large"
+    (foldl (lambda (body ignored) (1 (0 0) body))
+      (0 1 2) (Rep 0 0 260))))
+(define large-call (call-with-inc "large-call" large-law))
+assert(Equal (large-law Inc) (constant (_0 (Body (law large-call)))))
+assert(Eq 8 (large-call 7))
+(print "specialization edge cases passed")

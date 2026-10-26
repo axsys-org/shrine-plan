@@ -42,8 +42,7 @@ def main():
     args.template = compiler_template(args.template, args.wisp)
     work = pathlib.Path(tempfile.mkdtemp(prefix='shrine-value-http-'))
     (work / 'snap').mkdir()
-    for name in ('data.mdb', 'pins.pack'):
-        shutil.copyfile(args.template / name, work / 'snap' / name)
+    shutil.copyfile(args.template / 'arena.dat', work / 'snap' / 'arena.dat')
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]

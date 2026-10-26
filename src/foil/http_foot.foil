@@ -7,10 +7,13 @@
     : method=str target=str body=str
   + action
     & http_foot/action/snapshot
+      http_foot/action/snapshot_bat
+      http_foot/action/interact_bat
       http_foot/action/interact
       http_foot/action/develop
       http_foot/action/reply
       http_foot/action/bytes
+      http_foot/action/bat
       http_foot/action/asset
       http_foot/action/install
       http_foot/action/write
@@ -32,6 +35,12 @@
     + look
       ' Named views, read through the supervisor's cache and rendered by the mount.
       : reads=row[view_read] render={\ row[res[axal[myth]]] nat}[nat str]
+    + snapshot_bat
+      : read={\ namespace}[nat any nat]
+    + interact_bat
+      : query=goo_runtime/request encode={\ json}any
+    + bat
+      : status=nat body=any ctype=nat
     + snapshot
       ' Trusted mount callback evaluated against one supervisor state.
       : read={\ namespace}[nat str]
@@ -109,7 +118,10 @@
       feet/task/asset
       feet/task/ack
       feet/task/develop
+      feet/task/binary
       http_foot/action/snapshot
+      http_foot/action/snapshot_bat
+      http_foot/action/interact_bat
       http_foot/action/interact
       http_foot/action/develop
       http_foot/action/install
@@ -131,7 +143,7 @@
       http_foot/action/asset
       http_foot/action/look
   + answer
-    & http_response http_foot/action/bytes
+    & http_response http_foot/action/bytes http_foot/action/bat
   + pending
     ' Text r<serial> keys belong to ordinary HTTP namespace records.
     ' Numeric serial keys correlate read-only supervisor requests.
@@ -350,6 +362,16 @@
        "Content-Type: " (str/from_atom response.ctype) http_foot/crlf
        "Content-Length: " (nat/show (wid response.body)) http_foot/crlf
        "Connection: close" http_foot/crlf http_foot/crlf (str/from_atom response.body)]
+  + encode_bat
+    ' One flatten for header, shared body chunks and the socket bar sentinel.
+    \ status=nat body=any ctype=nat
+    ^ nat
+    = header (str/cat_all
+        ["HTTP/1.0 " (nat/show status) " Response" http_foot/crlf
+         "Content-Type: " (str/from_atom ctype) http_foot/crlf
+         "Content-Length: " (nat/show (bat_size body)) http_foot/crlf
+         "Connection: close" http_foot/crlf http_foot/crlf])
+    | bat_flatten (bat_concat [(bat_text (str/to_atom header)) body (bat_bytes 1 1)])
   + encode_bytes
     ' Body is a byte bar: its sentinel preserves trailing zero bytes.
     \ status=nat body=nat ctype=nat
@@ -395,6 +417,7 @@
        > (./ok action)
         ? action
          > (./reply ready) (./done (http_foot/encode ready))
+         > (./bat status body ctype) (./done (http_foot/encode_bat status body ctype))
          > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
         (./ask action)
   + connection
@@ -541,6 +564,7 @@
     ^ nat
     ? answer
      > response=http_response (http_foot/encode response)
+     > (./bat status body ctype) (http_foot/encode_bat status body ctype)
      > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
   + perform
     ' Ask the foot and encode its answer.  A batch is one commit_many
@@ -554,6 +578,7 @@
         outcome=maybe[pail]
           ? answer
            > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
+           > (./bat status body ctype) .none
            > (./bytes status body ctype) .none
       | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state))))
      > (./batch_told writes finish told)
@@ -561,6 +586,7 @@
         outcome=maybe[pail]
           ? answer
            > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
+           > (./bat status body ctype) .none
            > (./bytes status body ctype) .none
         ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state)))))
         ;line (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace [200 (told outcome state)])))
@@ -568,6 +594,7 @@
           > response=http_response
             = text (http_foot/body_text response)
             ? (gt text.len 0) (Send foot (http_foot/action/broadcast text)) 0
+          > (./bat status body ctype) 0
           > (./bytes status body ctype) 0)
       | ready
      > (./told read line)
@@ -578,8 +605,10 @@
       = ;answer (http_foot/ask foot (http_foot/action/snapshot read))
       ? answer
        > response=http_response (http_foot/perform foot (next response.status (http_foot/body_text response)))
+       > (./bat status body ctype) (http_foot/encode_bat status body ctype)
        > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
      > (./reply response) (http_foot/encode response)
+     > (./bat status body ctype) (http_foot/encode_bat status body ctype)
      > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     | http_foot/encode_answer (http_foot/ask foot action)
   + listener
@@ -704,6 +733,29 @@
       ; (helm/supervisor/close_caps caps.drop(1))
       ; (Send initial.parent (feet/gift/look serial reads render))
       | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/snapshot_bat read)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/snapshot_bat serial read))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (http_foot/action/interact_bat query encode)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/interact_bat serial query encode))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/binary request status body mime)
+      ; (helm/supervisor/close_caps caps)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (Send item.conn (http_foot/action/bat status body mime))
+          out
+      | _ serial left queue
      > (http_foot/action/snapshot read)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)

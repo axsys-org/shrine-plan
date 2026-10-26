@@ -15,7 +15,7 @@ def cases():
     for phase in ('source','core','normalized','visible','semantic'):
         add(phase+'-flow','a=goo/'+phase+'_attrs child=goo/'+phase,'goo/'+phase,
             f'| goo/{phase}/flow a (goo/direction/row) [child]')
-        add(phase+'-text','a=goo/'+phase+'_attrs','goo/'+phase,f'| goo/{phase}/text a "payload"')
+        add(phase+'-text','a=goo/'+phase+'_attrs','goo/'+phase,f'| goo/{phase}/text a (goo/text/en "payload")')
         if phase!='source':
             add(phase+'-group-forbidden','a=goo/'+phase+'_attrs','goo/'+phase,f'| goo/{phase}/group a []','unbound reference')
             add(phase+'-opt-forbidden','a=goo/'+phase+'_attrs','goo/'+phase,f'| goo/{phase}/opt a (goo/rank/full) []','unbound reference')
@@ -31,7 +31,7 @@ def cases():
     for before,after in [('source','core'),('core','normalized'),('normalized','visible'),('visible','semantic')]:
         add(before+'-cannot-be-'+after,'value=goo/'+before,'goo/'+after,'value','type mismatch')
         add(after+'-rejects-'+before+'-child','a=goo/'+after+'_attrs child=goo/'+before,'goo/'+after,f'| goo/{after}/flow a (goo/direction/col) [child]','type mismatch')
-        add(after+'-rejects-'+before+'-attrs','a=goo/'+before+'_attrs','goo/'+after,f'| goo/{after}/text a "payload"','type mismatch')
+        add(after+'-rejects-'+before+'-attrs','a=goo/'+before+'_attrs','goo/'+after,f'| goo/{after}/text a (goo/text/en "payload")','type mismatch')
     add('nominal-id-not-slot','id=goo/node_id','goo/slot','id','type mismatch')
     add('nominal-slot-not-id','slot=goo/slot','goo/node_id','slot','type mismatch')
     add('native-path-not-goo-path','p=path','goo/path','p','type mismatch')
@@ -104,7 +104,7 @@ def check_types(directory=None):
         lines.append(f'(Seq (print ("GOO-TYPE" {i} (If {ok} {yes} {no}))) 0)')
     with tempfile.TemporaryDirectory(prefix='goo-types-') as temp:
         work=Path(temp);(work/'snap').mkdir()
-        for name in ('data.mdb','pins.pack'):shutil.copy2(directory/'snapshot'/name,work/'snap'/name)
+        shutil.copy2(directory/'snapshot'/'arena.dat',work/'snap'/'arena.dat')
         out,err=run([manifest['wisp'],'--file-root',str(directory/'empty'),'snap','root','_'],work,'\n'.join(lines)+'\n')
     log=out+err
     (directory.parent/'last-type-checks.log').write_text(log)

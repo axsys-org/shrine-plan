@@ -1,6 +1,7 @@
 - system_vocabulary
 - goo_browser
 - http_foot
+- browser_routes
 
 ' A mount-owned endpoint configuration. Requests choose only a subject path;
 ' declaration and receiver slot are fixed by the host, never by query input.
@@ -33,18 +34,34 @@
       reply (myth/sing system_vocabulary/content (goo_workspace/session address request.card))
     | yell [[address (writ/make request.card)] [request.request (writ/poke reply)]]
         cur.put(system_vocabulary/content (pails/n number))
+  + query_valid
+    \ target=str
+    ^ bool
+    = parts (http_foot/split 63 target)
+    ? (gt parts.len 2) .false
+    = query=str (? (eq parts.len 2) parts.at(1) "")
+    ? (eq query.len 0) .true
+    ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields query) .false
+    ? (gt fields.len 2) .false
+    ? (gt (fields.keep((\ [key value] (eq key "path")))).len 1) .false
+    ? (gt (fields.keep((\ [key value] (eq key "format")))).len 1) .false
+    | fields.all((\ [key value] (? (eq key "format") (eq value "json") (and (eq key "path") (maybe/is_some (browser_routes/value_path value))))))
   + request
     \ endpoint=goo_workspace/endpoint request=http_foot/request now=nat
     ^ http_foot/action
     ? !(equal[str] request.method "GET")
       | ./reply (http_driver/response 405 "GET required")
     = query (http_foot/fields (http_foot/split 63 request.target).at(1))
-      text (http_foot/field "path" query)
+    ' Preserve the legacy HTML endpoint's ignored query fields. JSON entry is strict.
+    ? (and (gt (http_foot/field "format" query).len 0) !(goo_workspace/query_valid request.target))
+      | ./reply (http_driver/response 400 "Use one canonical path and format=json.")
+    = text (http_foot/field "path" query)
       target=path (? text.len (http_foot/target text) endpoint.initial)
       watch (crew/sing ['view] (dep .y target))
       watch watch.put(['catalog] (dep .x [endpoint.declaration.at(0) 'weft 'view_catalog_cache]))
       record (myth/sing ['goo_workspace] (pails/p endpoint.declaration))
       record record.put(['workspace_target] (pails/p target))
+      record record.put(['workspace_json] (pails/n (? (eq (http_foot/field "format" query) "json") 1 0)))
     | ./wait record.put(crew_slot (cpail watch))
   + describe
     \ endpoint=goo_workspace/endpoint session=goo_workspace/session selected=axal[myth] index=goo_browser/catalog_value
@@ -82,15 +99,27 @@
               [(weft/href (goo_panes/navigation_url (path_show path))) (weft/att "data-goo-navigation" "")] (str/to_atom browse))) content)
           | list/one (weft/el "div" [(weft/cls "goo-member") (weft/att "data-key" (str/to_atom (path_show path)))] content)
     [(weft/el "div" [(weft/att "data-goo-members" "")] rows.row)]
-  + operations
+  + operation_descriptors
     \ endpoint=goo_workspace/endpoint
-    ^ str
+    ^ json
     = entries
         | endpoint.operations.map
           \ [key source]
           | json/obj [(jkv "key" (json/str (path_show key)))
               (jkv "kind" (json/str "mount-rescan")) (jkv "source" (json/str (path_show source)))]
-    | show (json/arr entries)
+    | json/arr entries
+  + operations
+    \ endpoint=goo_workspace/endpoint
+    ^ str
+    | show (goo_workspace/operation_descriptors endpoint)
+  + host_descriptor
+    \ endpoint=goo_workspace/endpoint
+    ^ json
+    | json/obj [(jkv "version" (json/num .false 1)) (jkv "kind" (json/str "workspace"))
+        (jkv "declaration" (json/str (path_show endpoint.declaration)))
+        (jkv "navigation" (json/obj [(jkv "kind" (json/str "workspace-session"))
+          (jkv "sourceSlot" (json/str (path_show endpoint.source_slot)))]))
+        (jkv "operations" (goo_workspace/operation_descriptors endpoint))]
   + content
     \ endpoint=goo_workspace/endpoint session=goo_workspace/session target=path selected=axal[myth] index=goo_browser/catalog_value
     ^ row[weft/node]
@@ -105,6 +134,14 @@
          (weft/att "data-operations" (str/to_atom (goo_workspace/operations endpoint)))]
          [(weft/el "div" [(weft/att "data-goo-body" "")]
            (goo_panes/server_body description (goo_workspace/members target selected index)))])]
+  + entry_json
+    \ endpoint=goo_workspace/endpoint session=goo_workspace/session target=path
+    ^ nat
+    | str/to_atom (show (json/obj [(jkv "version" (json/num .false 1))
+        (jkv "target" (json/str (path_show session.address)))
+        (jkv "source" (json/str (path_show target)))
+        (jkv "view" (json/str (path_show endpoint.declaration)))
+        (jkv "host" (goo_workspace/host_descriptor endpoint))]))
   + talk
     \ endpoint=goo_workspace/endpoint fallback={\ bowl myth myth}yell =bowl cur=myth add=myth
     ^ yell
@@ -135,12 +172,13 @@
           allocation (goo_workspace/allocation bowl.here session.card)
         | yell [[root (writ/poke (myth/sing system_vocabulary/content allocation))]] out
      > (./some session)
-      = body (endpoint.document target (goo_workspace/content endpoint session target selected index))
+      = portable (eq (out.nat_at(['workspace_json] 0)) 1)
+        body (? portable (goo_workspace/entry_json endpoint session target) (endpoint.document target (goo_workspace/content endpoint session target selected index)))
         done
           . out
             put(['res_status] (pd 200))
             put(['res_body] (pd body))
-            put(['res_ctype] (pd "text/html; charset=utf-8"))
+            put(['res_ctype] (pd (? portable "application/json; charset=utf-8" "text/html; charset=utf-8")))
       | yell [] done
   + receiver
     \ endpoint=goo_workspace/endpoint address=path state=namespace
@@ -188,7 +226,7 @@
       [next index reply]
         | helm/supervisor/handle
           (helm/card/step (goo_browser/hosted_path state.self endpoint.declaration)
-            (writ/make (myth/sing system_vocabulary/content host))) next index
+            (writ/make (myth/sing system_vocabulary/content host).put(['sys 'goo 'host] (pails/t (show (goo_workspace/host_descriptor endpoint)))))) next index
     ?> (./ack failure) reply (./err (pails/t "Workspace receiver registration returned no acknowledgement."))
     ? failure
      > (./some why) (./err why)

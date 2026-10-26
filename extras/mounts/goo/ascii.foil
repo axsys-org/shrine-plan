@@ -1,9 +1,10 @@
 - goo_app/profile
+- goo_app/run_style
 - goo_app/measurement
 
 + goo_ascii
   + style
-    : face=goo_fonts/face pixels=goo/scalar leading=goo/scalar tracking=goo/scalar inset_x=goo/scalar inset_y=goo/scalar
+    goo_profile/style
   + kind
     \ tree=goo/semantic
     ^ str
@@ -18,16 +19,33 @@
     \ tree=goo/semantic
     ^ str
     | (str/split_byte 47 tree.attrs.common.slot.text).at(0)
+  + runs
+    \ tree=goo/semantic
+    ^ goo/text
+    ? tree
+     > (./text _ text) text
+     > (./jet _ primitive) primitive.payload
+    []
+  + content_runs
+    \ tree=goo/semantic
+    ^ goo/text
+    = runs (goo_text/normalized goo_profile/tab_text (goo_ascii/runs tree))
+    ? !(!(eq (goo_ascii/kind tree) "text") || !(eq (goo_ascii/role tree) "error")) (goo/text/en goo_profile/error_prefix).weld(runs)
+    runs
   + payload
     \ tree=goo/semantic
     ^ str
     ? tree
-     > (./text _ text) text
-     > (./jet _ primitive) primitive.payload
+     > (./text _ text) text.plain
+     > (./jet _ primitive) primitive.payload.plain
     ""
   + check
     \ tree=goo/semantic
     ^ maybe[str]
+    ? !(goo/text/supported (goo_ascii/runs tree)) (./some (str/cat_all ["Unsupported RunDescriptor properties at node " tree.node_id.text]))
+    ? (and (and (eq (goo_ascii/kind tree) "input") !(eq (goo_ascii/role tree) "rich-input")) (row/any[goo/runt] (\ run !(eq run.myth.size 0)) (goo_ascii/runs tree))) (./some "Styled native editing is not supported")
+    = base (goo_profile/text_style (goo_fp/integer 1) (goo_ascii/kind tree) (goo_ascii/role tree))
+    ? !(row/all[goo/runt] (\ run (goo_run/resolve base run.myth).is_some) (goo_ascii/runs tree)) (./some "Unsupported run font path or font/modifier combination")
     = text (goo_ascii/payload tree)
       valid=bool
         % i=nat 0
@@ -46,7 +64,25 @@
     \ scale=goo/scalar tree=goo/semantic
     ^ goo_ascii/style
     = style (goo_profile/text_style scale (goo_ascii/kind tree) (goo_ascii/role tree))
-    | goo_ascii/style style.face style.pixels style.leading style.tracking style.inset_x style.inset_y
+      extents (goo_ascii/extents style tree)
+      base_height (goo_fp/quotient (goo_fp/integer (add (goo_profile/font_ascent style.face) (goo_profile/font_descent style.face))) (goo_fp/integer (goo_profile/font_units style.face)))
+      extra (goo_fp/maximum (goo/scalar 0) (goo_fp/minus (goo_fp/plus extents.ascent extents.descent) base_height))
+    | style.set_leading((goo_fp/plus style.leading (goo_fp/times style.pixels extra)))
+  + extent
+    : ascent=goo/scalar descent=goo/scalar
+  + extents
+    \ base=goo_profile/style tree=goo/semantic
+    ^ goo_ascii/extent
+    = start (goo_ascii/extent (goo_fp/quotient (goo_fp/integer (goo_profile/font_ascent base.face)) (goo_fp/integer (goo_profile/font_units base.face))) (goo_fp/quotient (goo_fp/integer (goo_profile/font_descent base.face)) (goo_fp/integer (goo_profile/font_units base.face))))
+    | (goo_ascii/runs tree).fold start
+      \ acc run
+      = font (goo_run/font base run.myth)
+      | goo_ascii/extent (goo_fp/maximum acc.ascent (goo_fp/quotient (goo_fp/integer font.ascent) (goo_fp/integer font.info.units))) (goo_fp/maximum acc.descent (goo_fp/quotient (goo_fp/integer font.descent) (goo_fp/integer font.info.units)))
+  + baseline_offset
+    \ style=goo_profile/style tree=goo/semantic
+    ^ goo/scalar
+    = e (goo_ascii/extents style tree)
+    | goo_fp/plus (goo_fp/quotient style.leading (goo_fp/integer 2)) (goo_fp/quotient (goo_fp/times style.pixels (goo_fp/minus e.ascent e.descent)) (goo_fp/integer 2))
   + normalized
     \ text=str
     ^ str
@@ -91,16 +127,17 @@
     ^ goo/scalar
     = kind (goo_ascii/kind tree)
       style (goo_ascii/text_style scale tree)
-      text (goo_ascii/content tree)
+      runs (goo_ascii/content_runs tree)
+      text runs.plain
     ? (goo_profile/natural_width kind)
      > (./some width) width
-    ? (eq kind "button") (goo_fp/plus (goo_ascii/width_of style (goo_ascii/words text)) style.inset_x)
+    ? (eq kind "button") (goo_fp/plus (goo_run/width style (goo_text/words runs)) style.inset_x)
     = paragraphs (str/split_byte 10 text).stream
       widest=goo/scalar
-        % i=nat 0 best=goo/scalar (goo/scalar 0)
+        % i=nat 0 offset=nat 0 best=goo/scalar (goo/scalar 0)
         ? (eq i paragraphs.len) best
-        = width (goo_fp/plus (goo_ascii/width_of style paragraphs.at(i)) (? (eq i 0) (goo_ascii/prefix scale tree) (goo/scalar 0)))
-        | _ i.inc (goo_fp/maximum best width)
+        = width (goo_fp/plus (goo_run/width style (goo/text/slice offset paragraphs.at(i).len runs)) (? (eq i 0) (goo_ascii/prefix scale tree) (goo/scalar 0)))
+        | _ i.inc (add offset paragraphs.at(i).len.inc) (goo_fp/maximum best width)
     | goo_fp/plus widest style.inset_x
   + leaf_size
     \ scale=goo/scalar tree=goo/semantic
@@ -140,12 +177,35 @@
       out out.cons(remaining.slice(0 count))
     ? (ge count remaining.len) out.reverse
     | _ remaining.slice(count (sub remaining.len count)) available out
+  + wrap_runs
+    \ style=goo_ascii/style available=goo/scalar first_room=goo/scalar runs=goo/text
+    ^ list[goo/text]
+    = text runs.plain advances (goo_run/advances style runs)
+    ? (eq text.len 0) (list/one[goo/text] [])
+    % offset=nat 0 room=goo/scalar first_room out=list[goo/text] .nil
+    = fits=nat
+        % i=nat offset total=goo/scalar (goo/scalar 0)
+        ? (eq i text.len) i
+        = next (goo_fp/plus total advances.at(i))
+        ? !(goo_fp/lte next (goo_fp/plus room goo_profile/fit_tolerance)) i
+        | _ i.inc next
+    ? (eq fits text.len) out.cons((goo/text/slice offset (sub fits offset) runs)).reverse
+    = breakpoint=nat
+        % i=nat offset last=nat offset
+        ? (eq i fits) last
+        = c text.at(i)
+        | _ i.inc (? ((eq c 32) || (eq c 45) || (eq c 47)) i.inc last)
+      end (? (eq breakpoint offset) (? (eq fits offset) offset.inc fits) breakpoint)
+      out out.cons((goo/text/slice offset (sub end offset) runs))
+    ? (eq end text.len) out.reverse
+    | _ end available out
   + text_lines
     \ scale=goo/scalar tree=goo/semantic width=goo/scalar
-    ^ maybe[list[str]]
+    ^ maybe[list[goo/text]]
     = kind (goo_ascii/kind tree)
     ? !((eq kind "text") || (eq kind "code")) .none
-    = text (goo_ascii/content tree)
+    = runs (goo_ascii/content_runs tree)
+      text runs.plain
       prefix (goo_ascii/prefix scale tree)
       all (str/split_byte 10 text).stream
       paragraphs=list[str]
@@ -154,16 +214,18 @@
         all
       style (goo_ascii/text_style scale tree)
       available (goo_fp/maximum (goo/scalar 0) (goo_fp/minus width style.inset_x))
-      lines=list[str]
-        % rest=list[str] paragraphs room=goo/scalar (goo_fp/minus available prefix)
-        ^ list[str]
+      lines=list[goo/text]
+        % rest=list[str] paragraphs room=goo/scalar (goo_fp/minus available prefix) offset=nat 0
+        ^ list[goo/text]
         ? rest.is_nil .nil
-        | (goo_ascii/wrap style available room rest.head).weld((_ rest.tail available))
+        = fragments (goo_ascii/wrap_runs style available room (goo/text/slice offset rest.head.len runs))
+        | fragments.weld((_ rest.tail available (add offset rest.head.len.inc)))
     | ./some lines
   + leaf_height
     \ scale=goo/scalar tree=goo/semantic width=goo/scalar
     ^ goo/scalar
     = kind (goo_ascii/kind tree)
+    ? (and (eq kind "input") (eq (goo_ascii/role tree) "rich-input")) (goo_fp/times scale (goo_fp/integer 180))
     ? (goo_profile/fixed_height kind)
      > (./some height) height
     ? (eq kind "media") (goo_fp/maximum goo_profile/media_minimum (goo_fp/quotient width goo_profile/media_aspect_ratio))
