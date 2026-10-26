@@ -10,9 +10,8 @@ dry run). This file is the plan for making that reviewable by Liam; it does not 
    Measured after: `/r` of a thing with 172 incoming edges, 0.18 s through MCP at care z; 0.04 s for a page of five.
 2. **`graph_world/nodes` and `cap` as cell parameters.** Done: `cap`, `deeper`, `nodes` are read from the cell's
    slots with the constants as documented defaults and ceilings (`graph_world/bounds_of`).
-3. **`read_fuel`**: 256 was a budget, 32768 is a loop bound. Either keep the bound and say so in the comment (done),
-   or let a definition declare its budget (`['sys 'view 'fuel]` on the woven record) and fall back to the bound.
-   Liam's call; the PR should offer the second.
+3. **`read_fuel`**: done both ways: 32768 is the ceiling, said so in its comment, and a cell declares a smaller
+   budget of its own at `/sys/view/fuel`, applied in `woven_evaluate_select` (a nesting cell's remaining fuel caps it).
 4. **Type placement constraint written next to the types.** Done: the rule is at the head of `sys/view.foil` and
    above the protocol types in `lain_types.foil`.
 5. **`weft_std` (1,400 lines) placement**: self-contained, in the kernel tree because records cannot hold closures.
