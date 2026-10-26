@@ -566,3 +566,53 @@ extends what can be fetched by writing a scheme and a mapping); value assertions
 the one shape; the web landing at `/user/web/<domain>/<path>`; `gather`/`follow` operators and parameters at the
 embedding slot; a scheduler hand that hands the overlay's signals (islands, dashed lines, empty names, closed
 folders, missing crossings) to subagents.
+
+## The demo: MEP request 2026-536, "who in the United States can make this, with evidence" (2026-10-26, night)
+
+Run as the agent, not by a script. A fresh world from the PR branch (`x/eden --mount mcp --mount explorer --port 8150`,
+main's launcher, a temporary world); one subagent per source running the hand's `--only` stage under its own path
+(USAspending for NAICS 333415, then ECHO, EDGAR with GLEIF, SAM, USPTO, ImportYeti in parallel, MEP for the request);
+then the overlay read from the request, judgements written by hand with their `why`, the candidates named to the
+request in their notes, the view `/user/views/domestic_sources_2026_536` (the overlay over the request and five
+standings), the pages read in the browser. The world's records were snapshotted (333) and replayed into a second
+boot so a page fix was served (`strangers/snapshot.py` and `replay.py`, on this branch).
+
+What the registries state: 25 recipients paid under NAICS 333415 since October 2024, 70 awards, none of which
+says "heat pump"; the federal market under that code is environmental control units, shipboard chillers and
+freezers. Capability for a vapor-compression unit of the heat-pump class, from the awards themselves: Mainstream
+Engineering (ECU, EECU and spares, five orders, $23.8M), HDT Expeditionary Systems (IECUs 9K/18K/36K, Army space
+heaters, ICBM launch-facility chillers, twelve orders, $28.7M), Johnson Controls Navy Systems (MARINEPAK shipboard
+plants and chillers, eighteen orders, $205.6M), Engineered Coil Company (a 1.5-ton modular refrigeration system),
+Snowbird Technologies (ECUs and LCAC air conditioning). Installers and contractors (Four Tribes, TSS-PCS, Accentz,
+TL Services, Aldevra), component and unrelated makers (Janels, Pioneer, TLD, Clayton, Trident, OVC, Biofridge,
+Honeywell's ESPC and aircraft parts, MECCS Mitomo in Tokyo, Cherokee Nation Armored) are not makers of the thing.
+
+Judged from identifiers, each a `same` or a relation with one sentence of why: Mainstream = ECHO 110005273140
+(200 Yellow Pl, Rockledge 32955, NAICS 333415), a second site 4050 Industrial Pines as `plants`; Engineered Coil =
+ECHO 110000440443 and 110071870601 (6060 Highway PP, High Ridge 63049, NAICS 333415, "DBA DRS Marlo Coil"); HDT =
+ECHO 110051414518 (30500 Aurora Rd Ste 100, Solon 44139), its Geneva plant 110042420537 (5455 N River Rd, NAICS
+333415), the ESG site and 30525 Aurora as `plants`, and = ImportYeti's importer at the same street and zip (38
+shipments, 18 from Biemmedue, an Italian heater manufacturer: the BABA question, stated, not answered); Johnson
+Controls Navy Systems' parent = EDGAR CIK 833444, Johnson Controls International plc, SIC 3585, Cork (a parent, not
+the same entity). Left as sentences, unverified: every ECHO match by name alone (TL Services' twelve Florida
+"services" companies, Cherokee Nation's tribal facilities, HDT's "DRS Environmental Systems" in Cincinnati);
+every EDGAR match by first word (Johnson & Johnson, Four Corners, Pioneer Bancorp, Argo Blockchain, On Holding);
+USPTO applicant matches (HDT's eight patents are shelters, not HVAC; Honeywell's are aerospace); Snowbird's
+importer in Atlanta against its Jacksonville registration. Gaps that are facts: SAM answered 429 for all 25 (the
+public key's daily cap), so no registration, CAGE or NAICS claim is verified for any candidate; Engineered Coil's
+stated parent Leonardo S.p.A. has no EDGAR filer in the set; Mainstream, Snowbird and JCI Navy have no ECHO
+facility at their registered address (JCI's York plant was not found by name); nothing states whether HDT's
+Biemmedue shipments are finished heaters or parts.
+
+The pages: the request draws as "Heat Pump · as a world · 5 in prose · named in 5", each candidate a line with
+its city and obligation beside it, beneath it `← recipient N` awards with their descriptions quoted, `plants`,
+`suppliers` through the judged importer, `parent filing`, and `← domestic sources 2026 536` (the view, one line
+opening into its roots). A candidate's page draws its note as prose with the facilities, patents and the request
+as links, then the same folders. The cell's result page (`?at=x/…`) is not drawn yet (the page treats an /x path
+as a record); the result is read through the foot (one root named "Heat Pump · Mainstream … · Snowbird", 6
+standings, 1 component, 0 islands, 258 nodes in 5.7 s) and through the `←` line on every thing it reads.
+
+Found on the way and fixed: `Writer.finish` replaced a recipient's note with the run's own sentences (ImportYeti's
+rerun wiped HDT's and Snowbird's ECHO, USPTO and "could supply" sentences); it appends now. A thing named twice
+sat in the first folder naming it, so the recipient's own prose placed the line and the judgement showed as
+"also": `relations_one` now puts the records beneath a thing before its bare slots (compiled after the demo).
