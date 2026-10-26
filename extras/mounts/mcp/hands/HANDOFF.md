@@ -406,11 +406,15 @@ tentative end to end, and the film stays an island because only established hops
 
 Open, with evidence:
 
-- `beneath` faults (`iota-cmp-bad-quip`, HTTP 500) on its y branch for any record whose children have children;
-  the z branch answers. The page falls back to the record's ordinary read for "beneath". Not located; probe with
-  `/o/<case>/4/0x11/weft/graph/beneath/<n>/<path>` at care y against `people/forbes_mckenzie`.
-- The saved-world migration (`.check/native-views/run_candidate_upgrade.py`) does not publish this kernel: on a
-  fresh clone (`upgrade-clone-v3`, copy-on-write from the stopped world) `publication:publish-local` traps with a
+- (fixed 2026-10-26) `beneath` faulted (`iota-cmp-bad-quip`, HTTP 500) on any folder with children: a row `take`
+  past the row's end traps; the width is a cap, so it is applied only when the row is longer. The page still falls
+  back to the record's ordinary read when a view faults.
+- The saved-world migration: diagnosed by the bisect session on 2026-10-26 before any run: the trap's three arm
+  brands are `shrine/ass/{ker,nul,past}` at definition version 2; a raw `shrine.foil` in the stage sources rebrands
+  `ass`, and Codex's `prepare_upgrade.py` is the step that rewrites the stage sources to alias those types to the old
+  pinned definitions. Mirroring `src/` into `core-upgrade-src` and `retained-src` with rsync skips that rewrite, so
+  every run staged that way traps. Regenerate the stage sources through `prepare_upgrade.py`, never by copying.
+  Earlier evidence, kept for the record: on a fresh clone (`upgrade-clone-v3`, copy-on-write from the stopped world) `publication:publish-local` traps with a
   three-arm `unreachable` (a pail match over values of another brand) and `up-published-result` stays unbound.
   Codex's own baseline source fails the same way on the old clone, which had accumulated state from every run, so
   bisect on fresh clones only (`cp -c -R` of the world's `snap` is instant). Until then a fresh world plus replay is
