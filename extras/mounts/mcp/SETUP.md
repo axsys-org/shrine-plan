@@ -1,116 +1,115 @@
-# Setup
+# Setup: a world, an agent, a browser
 
-Clone, check out the branch, tell your coding agent "read SETUP.md and set
-this up." It does the rest; it may ask you to restart the app once. Then
-open the live page link it gives you and start talking.
+Six steps from a clone to an agent working in a world you can watch. Nothing
+here needs more than Nix, Python 3 and the AI tool you already use.
 
-For the coding agent reading this after a clone, when the person says
-"read SETUP.md and set this up". Three steps; ask the person only when
-you have to, which is usually never.
+## 1. Boot a world
 
-What you cannot guess:
-
-- Nix must be installed. `x/setup` enters its own Nix shell and brings
-  everything else; nothing is set by hand.
-- The first boot builds the runtime and the browser bundles. It takes
-  several minutes, once; later boots take about a minute, and a kept world
-  resumes in seconds.
-- One world per machine. A world holds its namespace in memory, a loaded
-  one takes a gigabyte or more, and two at once have crashed a laptop.
-
-## 1. Run x/setup
+From the checkout, with Nix on the PATH:
 
 ```bash
-python3 x/setup --world ~/worlds/team
+python3 x/eden --mount mcp --mount probe --mount explorer --extras-root $PWD/extras --port 8300
 ```
 
-It boots the world kept in that directory with the `mcp`, `probe` and
-`explorer` mounts and a `clock` hand, waits for the foot, then prints the
-world URL, the MCP URL, the live page link and the skill path, and stays
-attached; Ctrl-C tears the world and its hands down. It notes the world's
-directory and port in `.shrine.json` in the checkout, and `python3 x/setup`
-with no arguments resumes that world in seconds with every record, cell and
-case it had. Run it in a terminal of its own, not in the foreground of this
-session.
+`x/eden` enters its own Nix shell and brings the runtime; you do not set
+`WISP` or anything else. The first boot with `explorer` builds the browser
+bundles and takes a few minutes; later boots take about a minute. Without the
+live page, `--mount mcp --mount probe` boots in under a minute and needs no
+Node. The world is up when it prints its URL:
 
-A hand for a new world is named on its first boot and kept with it:
-`--hand "source --folders /0x11/user/sources"` adds the source runner over
-that folder; `--port N` picks the port (default 8300).
+```
+Eden: http://127.0.0.1:8300; mounts: mcp, probe, explorer
+```
 
-## 2. Connect your app, load the skill
+Run one world at a time on a machine. A world is a process that holds its
+namespace in memory: a loaded one takes a gigabyte or more, and two at once
+have crashed a laptop.
 
-Add the MCP URL (`http://127.0.0.1:8300/mcp`, HTTP, local only, no
-credential) the way your app adds an HTTP MCP server. It serves four
-tools: `mcp/read`, `mcp/write`, `mcp/history`, `mcp/apply`.
+## 2. Connect your tool
 
-Load the four skill pages the way your app loads instructions:
-`extras/mounts/mcp/skills/shrine-mcp/SKILL.md` (the one form of each
-thing you use most), `knobs.md` (every knob), `sources.md` (a screen per
-kind of source) and `qa.md` (QA mode). Link the folder, or point your
-instructions file at it.
+The MCP endpoint is `http://127.0.0.1:8300/mcp`, local only, no credential.
+Four tools: `mcp/read`, `mcp/write`, `mcp/history`, `mcp/apply`.
 
-If either takes a restart of your app to pick up, say so and stop; the
-person restarts and says "continue".
-
-## 3. Open the live page
-
-`http://127.0.0.1:8300/live?views=/0x11/user/<folder>` shows a folder's
-cells with their current answers and every write as it lands. Open it in
-the person's browser when you start and again when the folder you work in
-changes; with no browser, give the link on its own line.
-
-That is the setup. `DEMO.md` beside this page is the ten-minute walk
-through using it.
-
-## By hand
-
-What `x/setup` does, for a person doing it without it.
-
-Boot, from the checkout with Nix on the PATH:
+Claude Code, from the checkout:
 
 ```bash
-python3 x/eden --mount mcp --mount probe --mount explorer --extras-root $PWD/extras --port 8300 --world ~/worlds/team --hand "clock --timezone UTC"
+claude mcp add --transport http shrine http://127.0.0.1:8300/mcp
 ```
 
-The world is up when it prints its line:
+Claude Desktop (the Code tab): Settings, MCP servers, add an HTTP server named
+`shrine` at that URL. Any other client that speaks JSON-RPC over HTTP takes
+the same URL; a `tools/list` call shows the four tools and their descriptions.
 
+## 3. Give the agent the skill
+
+The skill is three pages under `extras/mounts/mcp/skills/shrine-mcp`:
+`SKILL.md` (the one form of each thing you use most), `knobs.md` (every knob)
+and `qa.md` (QA mode).
+
+Claude Code: link it into the project's skills folder and it loads on demand:
+
+```bash
+mkdir -p .claude/skills && ln -s "$PWD/extras/mounts/mcp/skills/shrine-mcp" .claude/skills/shrine-mcp
 ```
-Eden: http://127.0.0.1:8300; mounts: mcp, probe, explorer; world: /Users/you/worlds/team; hands: clock
+
+Any other tool: paste `SKILL.md` into the system prompt, and `knobs.md` when
+the agent asks for a knob it does not have. The pages are plain Markdown and
+stand on their own.
+
+## 4. The live page
+
+`http://127.0.0.1:8300/live?views=/0x11/user/<folder>` shows a folder's cells
+with their current answers and every write as it lands, over the world's
+stream. The agent opens it in your browser when it starts and again when the
+folder it works in changes, closing the old tab; if its tool has no browser,
+it gives you the link on its own line. A green chip in the page header
+appears when an agent keeps a QA tree; a click opens that view, back returns.
+
+## 5. The ask hand, when a cell needs a model
+
+Formulas run in the world. An `ask` cell is answered by a hand, a process you
+start beside the world:
+
+```bash
+OPENAI_API_KEY=... python3 extras/mounts/mcp/hands/ask.py http://127.0.0.1:8300 --model <name> --endpoint <chat completions url>
 ```
 
-Without `--world` the world lives in a temporary directory and is gone with
-its process; without `explorer` it boots in under a minute and needs no
-Node, and there is no live page. `--hand` names a hand (`clock`, `source`;
-`extras/mounts/mcp/hands/hands.md` says what each does and how to write
-one); the launcher starts each after the foot
-listens, as its own process with its log at `DIR/hands/<name>.log`, and
-stops it at teardown. A world runs the hands its `world.json` names and no
-others, which is the first thing to check when a source never moves.
-Each hand's config is a record under `/0x11/agent/hands/<name>`.
+`--fake` answers deterministically without a model, for a try. The hand
+follows the stream, answers every ask that is pending (including those
+written before it started) and writes each answer as `<cell>/result`. Its
+model and endpoint can also live in the world at `/0x11/agent/hands/ask`.
 
-Connect: Claude Code takes `claude mcp add --transport http shrine
-http://127.0.0.1:8300/mcp`; any JSON-RPC client takes the URL, and a
-`tools/list` call shows the tools.
+## 6. Sessions, more than one agent, and what survives
 
-The skill: `mkdir -p .claude/skills && ln -s
-"$PWD/extras/mounts/mcp/skills/shrine-mcp" .claude/skills/shrine-mcp` for
-Claude Code; any other tool takes `SKILL.md` in its instructions and
-`knobs.md` when it needs a knob.
+Every write carries `who`; give each agent its own name and history can be
+filtered by it. An agent keeps its plan, scratch and `seen` epoch under
+`/0x11/agent/<name>` and wakes with `history after <seen> with x`. Several
+agents in one world are fine: a write is one event, admitted whole or refused
+whole, and a cell is computed on read.
 
-Agents: every write carries `who`; give each agent its own name and
-history can be filtered by it. An agent keeps its plan, scratch and `seen`
-epoch under `/0x11/agent/<name>` and wakes with `history after <seen> with
-x`. Several agents in one world are fine: a write is one event, admitted
-whole or refused whole, and a cell is computed on read. The launcher writes
-`/agent/launcher/world` (`kept`, `directory`, `mounts`) at every boot, so
-an agent can ask which kind of world it is in.
+A world lives as long as its process. A new boot is a new world: the standard
+cells and the mounts' seeds are there, your records are not. Until a world is
+proven to keep its records across a reboot, keep what you would not want to
+retype as a batch you can write again (one `records` list is one event), and
+mirror anything you must not lose, such as a QA tree's bugs and score, to a
+file at the end of a stretch. `tests/perf.py` and `tests/product.py` show
+the seeding shape.
 
-Stop a world with Ctrl-C or SIGTERM to the launcher, which takes the
-runtime and the hands down with it; a kill of the runtime itself loses
-nothing admitted before it.
+## Check it
 
-A resume runs the mounts from the checkout: on every restart a kept world
-scans each mount again, publishes what changed and serves the new routes
-and files over the records as they were saved, so a code change reaches a
-kept world on its next restart. A changed `mount.json` needs a fresh
-world.
+With no world up, the compile checks and the Foil suites:
+
+```bash
+bash x/foil-check --node 0x11 lain_peek weft_std http_foot
+python3 extras/x/check --mount mcp --contracts-only
+bash x/check foil:tests/cells
+```
+
+Then one fresh world and the tests against it, in order: `safety`, `stream`,
+`ask`, `library`, `product`, `signature` (the oracle, one seed), each as
+
+```bash
+python3 -I -c "import runpy; runpy.run_path('extras/mounts/mcp/tests/product.py')['check']('http://127.0.0.1:8300', '0x11', 120)"
+```
+
+The walkthrough in `DEMO.md` is the ten-minute version of using it.
