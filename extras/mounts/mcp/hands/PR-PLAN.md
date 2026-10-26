@@ -93,3 +93,23 @@ is in the kernel:
 4. PR text: one section per commit group, in reading order: index and reads; evaluator and cache; views;
    supervisor look and mounts; page; launcher. Each kernel edit with its reason, each number with its rule.
 5. Open only on Ian's word.
+
+## The cut (2026-10-26, 08:00), on `ic-bare-loop-main`
+
+Done, three commits (978d5fa, 0716076, 6b8505c): the `look` card and the view cache out (no caller), `weft_std`
+back to main's, `src/reaver` untouched, the eight view modules folded into one `graph.foil` (op, view, world,
+union, workspace, registry of eight names), the folder-singular guess replaced by "one reference names its
+folder", the cycle walk back to main's rule for stored inputs (main's own cells checks hold), tests trimmed to what
+remains. Whole Foil group on main's runtime: 1,405 pass, 5 fail before the last two fixes; the five suites those
+fixes touch: 123 pass, 0 fail. Kernel diff: 3,475 lines in 33 files (16 non-test) from 5,820 in 46; whole PR 8,821
+from 11,341.
+
+Next pass, agreed with Ian: one name, `overlay(standings)`, whose output is the virtual namespace(s): one root
+per connected component over every reference (a mention is a reference; two roots exist only when nothing
+connects), each root the full as-world unfolding of its standings with cells applied as items that open into
+their result; every hop says its holder (a thing's slot, a `same`, a `mentions` record, a `candidates` record, a
+cell) and its world. No tentative word anywhere; what to draw dashed is the page's choice. Registry: `overlay`,
+`frontier` (depth one, for the folder-open button through `/o`), `referencing`, `identities`, `placements`. Two
+modules (the walker with the overlay; the three primitives). The page reads one name. Proof: a fresh world on the
+new runtime, the records replayed, the registries slice and the Cummins judgements rewritten, the four pages in
+the browser, the three-standing test.
