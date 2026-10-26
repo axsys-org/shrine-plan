@@ -408,6 +408,12 @@ records it carries. What a slot may hold, how numbers, references and
 path segments are spelled, and how big an answer gets are on the second
 page under Values.
 
+## Connecting real things
+
+When the world holds registry records (`/user/registries`), the work is cartography: stand on a thing, read its
+world and the workspace over several, judge candidates into `same` with evidence, fetch where nothing reaches, and
+leave the view. The loop and its rules are in `cartography.md`; read it before the first judgement.
+
 ## Thinking in the world
 
 - Pick a name and write with `who: <name>` every time; history filters by
