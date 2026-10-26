@@ -26,21 +26,25 @@ reference answers unknown with the reason. The view protocol types live in `lain
 the old `sys/*` modules for brand stability and compiles everything else afresh; the rule is written beside the
 types.
 
-## 3. The views (`weft_graph`, `graph_views`, `graph_world`, `graph_union`, `graph_beneath`, `graph_workspace`, `view_ops`, `view_walk`, `view_cache`)
+## 3. The graph overlay (`graph`, one module)
 
-Pure computations over names, registered under `/weft/graph`, each a woven definition any cell can apply. Every
-relation carries its strength: a reference slot or judgement is solid; a stored text's mention, or an unjudged
-candidate, is a mention: drawn, labelled tentative, never followed further. `as_world` unfolds one thing's relations
-as folders, breadth first, each thing once, attributed per hop; `union` gathers what every world says about a thing
-through its `same` judgements; `workspace` reads several standings at once and reports components (joined over
-established hops only), routes with each hop's strength, islands and gaps. Nothing a view draws is written back.
+One module, four sections and a registry: `op` (what every view reads with), `view` (a thing's relations, forward
+from its own slots and backward from the index, through its `same` judgements, each edge attributed to the world
+asserting it and marked solid or mention), `world` (one thing as a world: relations as folders, breadth first, each
+thing once, bounded by `depth`, `cap`, `deeper` and `nodes` read from the cell with documented defaults), `union`
+(what every world says about one thing), `workspace` (several standings at once: components joined only over
+established hops, routes with each hop's strength, islands, gaps with their count of tentative routes). Eight
+names registered under `/weft/graph`: `relations`, `as_world`, `frontier`, `union`, `workspace`, `referencing`,
+`identities`, `placements`. Identity is a contract the records bring, nothing the kernel knows: a reference slot
+or a `same` judgement is solid; a reference from a record named `mentions` (a text naming things) or `candidates`
+(matches nobody judged) is tentative, drawn and never followed. Nothing a view draws is written back.
 
-Bounds (`cap` 24, `deeper` 6, `nodes` 150) are cell slots with those defaults.
+## 4. Not in this PR, on purpose
 
-## 4. The supervisor's `look` card (`helm`, `http_foot`)
-
-Several view reads in one request, answered through the supervisor's in-memory cache and rendered by the mount;
-the page is one call instead of five.
+No supervisor card (a batch-read `look` existed; nothing called it), no change to `weft_std` (main's library as
+it is), no change under `src/reaver` (the saved-world upgrade pipeline lives outside the tree), no in-memory view
+cache (its only reader was that card). The kept-world keep hook (`helm/supervisor/run_keeping`, from the
+persistence work) is the one supervisor change, twelve lines.
 
 ## 5. Mounts and the page (`extras/mounts/mcp`, `extras/mounts/explorer`)
 
