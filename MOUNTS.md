@@ -114,6 +114,12 @@ share this policy. A quiescent candidate can commit; exhaustion, reaction failur
 or unsupported outbound effects discard the candidate and its dependency index.
 The budget limits reaction rounds, not execution time inside an individual hand.
 
+Native arena compaction is currently an interim storage maintenance strategy
+for prototyping. It runs offline and must be requested explicitly. It preserves
+the reachable world and its retained history, but requires downtime and temporary
+disk space for the replacement arena alongside the existing one. Automatic
+reclamation and its performance characteristics remain unresolved.
+
 To reclaim old arena allocations, stop the launcher and run `x/eden --compact`
 with the same `--world` and port selection. The launcher holds the existing
 world lock and calls the native store collector before restoring the world.
