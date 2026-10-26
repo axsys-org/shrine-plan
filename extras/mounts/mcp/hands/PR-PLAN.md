@@ -79,7 +79,12 @@ is in the kernel:
    conflicts (the `look` card beside main's `snapshot_bat`/`interact_bat`; the launcher copies `arena.dat`), and the
    test inventory brought up to date (main's three new reaver suites classified, entries for files that no longer
    exist dropped). Main runs a newer enki (single-file `arena.dat` snapshots, bat primops); the merged branch's
-   Foil runs on it: tests/references 20/20, the full Foil suite is the gate. The saved-world upgrade pipeline is
+   Foil runs on it. Full suite on the new runtime, 2026-10-26 05:30: pristine main 1,277 pass, 0 fail, 4 suite
+   errors of its own (`lain_store`, `lain_fixture`, `grove_publication` need-fail at suite completion; `fs_sync`
+   fails to compile under the new elaborator), 39 suites in 845 s. The merged branch: 851 pass, 0 fail, the same
+   four errors, 33 of 56 suites before the runner's 900 s limit, still progressing when cut (the extra 17 suites are
+   ours); the rest run in a second batch. Main's own `x/check` also trips its inventory gate before any suite runs;
+   the inventory fix on `ic-bare-loop-main` is what lets it run. The saved-world upgrade pipeline is
    LMDB-shaped and has not been tried on the new runtime; the PR does not depend on it.
 2. Fixes 1-4 above, with their doc comments; commit each as its own.
 3. Move the notes and the hands to `ic-bare-loop-notes` / a second branch; the kernel branch keeps `VISION.md`.
