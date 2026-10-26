@@ -487,3 +487,16 @@ Ian turned from web crawling to public registries of real things; the research a
 descriptions as notes, its parent, its candidate facilities, LEIs, CIKs and importer, the subawards that name real
 plants. Next: judge candidates into `same` with evidence (the agent's job), the workspace over a contractor, its
 facility and a plant it supplies, and the ImportYeti supplier chains as their own standings.
+
+## Toward the PR (2026-10-26, 05:00)
+
+Main moved under us: PR #56 and #57 bumped the enki runtime (rev 8961a1d) to a single-file snapshot (`arena.dat`
+instead of LMDB's `data.mdb` + `pins.pack`), added bat primops and protobuf for goo, and the test runner stages
+templates in the new format. Everything on `ic-bare-loop` was built and proven on the old runtime
+(`/nix/store/k3n6…-enki-pgo-0.1.0`). The merge of main is parked on `ic-bare-loop-main` (worktree
+`../shrine-cells-main`): three conflicts, all additive (the `look` card beside main's `snapshot_bat` and
+`interact_bat`; the launcher copies `arena.dat` when the template has it). The new runtime builds from the nix cache
+in under a minute (`nix build github:axsys-org/enki/<rev>`; `/nix/store/y4y0…-enki-pgo-0.1.0/bin/wisp`). What is not
+known yet: whether the saved world's LMDB snapshot can be carried to the new format (the upgrade pipeline is
+LMDB-shaped), and whether our Foil runs unchanged on the new primops; the first suite on the new runtime is the
+test. `ic-bare-loop` stays on the old runtime until that is settled.
