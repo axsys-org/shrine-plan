@@ -73,7 +73,12 @@ registry attached to the contractor: the identity join merged the importer's wor
 
 Speed after the live `/r` fix (ae73407): as_world on Verisk 2.5 s to 0.5 s cold, 0.2 s warm; relations 3.3 s to
 0.3 s; union 2.3 s to 0.5 s; a recipient's world 0.08 s; the film's 500-node world 4.0 s cold, 0.7 s warm. The bare
-`/r` read through MCP is still 2.8 s (a different path than the views take); open.
+`/r` read through MCP measured 2.8 s before the fix and 0.18 s after (172 edges, care z); one path.
+
+After the judgement, the workspace over the recipient, its ECHO facility, the Chief Joseph plant and the Reivax
+subaward reads three components and two islands where it read four and four, the recipient-to-facility route is
+"1 hop, all established, same", and the plant-to-subaward route stays tentative as the pointer. That is the loop
+closing once; the skill (`skills/shrine-mcp/cartography.md`) is the same loop for any standing.
 
 ## Open
 - A workspace route's hops show the other end by its path slug (`candidate n110000426049`); the hop records carry no

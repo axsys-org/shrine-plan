@@ -5,19 +5,16 @@ dry run). This file is the plan for making that reviewable by Liam; it does not 
 
 ## Fix before anyone reads it
 
-1. **One reverse-reference read path.** Views read `/r` in milliseconds through the demand protocol; the direct MCP
-   read of the same `/r` path takes 2.8 s on the saved world. Both end in `store_references`; the direct read's cost
-   is in the reader it builds or in the node rendering, not in the index. Find it, make it one path, and say in
-   `store_references` where epoch selection happens and why a live read never unpins a snapshot (done for the
-   index; the doc comment is there).
-2. **`graph_world/nodes` and `cap` as cell parameters** (`nodes`, `cap`, `deeper` beside `depth`), constants only as
-   defaults. The workspace already takes `depth`; the deck's workspace wants the rest.
+1. **One reverse-reference read path.** Done (ae73407): both the direct `/r` read and a view's read end in
+   `store_references`, and a live read takes the index's current edges instead of unpinning the top snapshot.
+   Measured after: `/r` of a thing with 172 incoming edges, 0.18 s through MCP at care z; 0.04 s for a page of five.
+2. **`graph_world/nodes` and `cap` as cell parameters.** Done: `cap`, `deeper`, `nodes` are read from the cell's
+   slots with the constants as documented defaults and ceilings (`graph_world/bounds_of`).
 3. **`read_fuel`**: 256 was a budget, 32768 is a loop bound. Either keep the bound and say so in the comment (done),
    or let a definition declare its budget (`['sys 'view 'fuel]` on the woven record) and fall back to the bound.
    Liam's call; the PR should offer the second.
-4. **Type placement constraint written next to the types.** `lain_types` holds the view protocol types and
-   `sorge`/`view_project` because the upgrade retains the old `sys/*` modules for brand stability; today that reason
-   lives only in the pipeline script. One paragraph at the head of `lain_types.foil` and one in `sys/view.foil`.
+4. **Type placement constraint written next to the types.** Done: the rule is at the head of `sys/view.foil` and
+   above the protocol types in `lain_types.foil`.
 5. **`weft_std` (1,400 lines) placement**: self-contained, in the kernel tree because records cannot hold closures.
    Offer the mount alternative in the PR text; don't move it without his word.
 6. **The error scan in the pipeline** counts module self-test output as failure (`newtype`); out of the PR's scope but
