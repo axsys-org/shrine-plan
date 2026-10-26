@@ -46,12 +46,21 @@ def ref(path, care='x'):
 
 class Writer:
     def __init__(self, world, who):
-        self.w, self.who, self.batch, self.n, self.written = world, who, [], 0, set()
+        self.w, self.who, self.batch, self.n, self.written, self.merged = world, who, [], 0, set(), {}
     def put(self, path, slots):
         slots = {k: v for k, v in slots.items() if v not in (None, '', [], {})}
-        if path in self.written or not slots: return
+        if not slots: return
+        if path in self.written:
+            # a record several stages add to (a recipient's candidates): the slots merge; the write is a poke, not a set
+            self.merged.setdefault(path, {}).update(slots); return
         self.written.add(path); self.batch.append({'path': path, 'slots': slots, 'action': 'set'})
         if len(self.batch) >= 60: self.flush()
+    def finish(self):
+        self.flush()
+        for path, slots in self.merged.items():
+            try: self.w.tool('write', records=[{'path': path, 'slots': slots, 'action': 'poke'}], who=self.who); self.n += 1
+            except Exception as e: print('  refused', path, str(e)[:120])
+        self.merged = {}
     def flush(self):
         if not self.batch: return
         try: self.w.tool('write', records=self.batch, who=self.who); self.n += len(self.batch)
@@ -348,4 +357,5 @@ if __name__ == '__main__':
         try: stage()
         except Exception as e: print('stage failed:', type(e).__name__, str(e)[:160])
         wr.flush()
+    wr.finish()
     print('written', wr.n, 'records')

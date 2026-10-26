@@ -61,6 +61,17 @@ Seen in the viewer at `usaspending/recipients/lszhmmeg8481` (Cummins Power Gener
 description as a note, and its candidates. Until the kernel with the `candidates` rule is published, a candidates
 record draws as a solid `candidates/<slug>` folder; after it, as a grey `candidate` edge.
 
+## Judged (2026-10-26, as the agent, through MCP)
+
+Cummins Power Generation: its ECHO facility 110000426049 is the same thing (1400 73rd Ave NE 55432 on both, NAICS
+335312 on both; written both ways with `why`); EDGAR CIK 26172 is its parent, not itself (USAspending names Cummins
+Inc. as parent; written as `parent_filing`); the customs importer is the same by name and zip, with the street caveat
+in `why`. Four records at epoch 3149. SAM's public key answers 429 after about ten entity reads a day.
+
+Speed after the live `/r` fix (ae73407): as_world on Verisk 2.5 s to 0.5 s cold, 0.2 s warm; relations 3.3 s to
+0.3 s; union 2.3 s to 0.5 s; a recipient's world 0.08 s; the film's 500-node world 4.0 s cold, 0.7 s warm. The bare
+`/r` read through MCP is still 2.8 s (a different path than the views take); open.
+
 ## Open
 - A workspace route's hops show the other end by its path slug (`candidate n110000426049`); the hop records carry no
   name yet. A title read per hop, as the standings now have, fixes it.
