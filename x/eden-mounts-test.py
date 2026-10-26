@@ -237,25 +237,6 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'belongs to core'):
             select(self.root, ['shadow'])
 
-    def test_help_lists_generic_flags_only(self):
-        launcher = Path(__file__).with_name('eden')
-        result = subprocess.run([sys.executable, str(launcher), '--help'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0)
-        for flag in ('--mount', '--extras-root', '--list-mounts'):
-            self.assertIn(flag, result.stdout)
-        for flag in ('--debug', '--srs', '--codex', '--mash-root'):
-            self.assertNotIn(flag, result.stdout)
-        result = subprocess.run([sys.executable, str(launcher), '--srs'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-
-    def test_upgrade_refuses_to_create_a_replacement_world(self):
-        world = self.root / 'missing-world'
-        result = subprocess.run([sys.executable, str(Path(__file__).with_name('eden')),
-                                 '--world', str(world), '--upgrade'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn('--upgrade requires an existing persistent world', result.stderr)
-        self.assertFalse(world.exists())
-
     def test_compaction_requires_an_existing_world(self):
         world = self.root / 'missing-world'
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('eden')),

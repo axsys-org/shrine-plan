@@ -67,11 +67,12 @@ def check(base, codex=False):
     def wait_finished():
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
-            status = client.read(controller).get('properties', {}).get('/sys/content', '')
-            if status.startswith('Watching'):
+            properties = client.read(controller).get('properties', {})
+            status = properties.get('/work/status', '')
+            if status == 'blocked':
+                raise AssertionError(properties.get('/work/reason', status))
+            if status == 'running' and not pending() and client.read(destination).get('exists'):
                 return
-            if status.startswith('Blocked'):
-                raise AssertionError(status)
             time.sleep(.5)
         raise AssertionError('Native hand did not complete: ' + status)
     with tempfile.TemporaryDirectory(prefix='flow-concepts-') as folder:
@@ -113,7 +114,8 @@ def check(base, codex=False):
             complete(requests)
             before = client.source(destination)
             status = client.source(destination + '/status')
-            assert 'Watching' in client.read(controller)['properties']['/sys/content']
+            assert client.read(controller)['properties']['/work/status'] == 'running'
+            assert not pending()
             client.tool('write', records=[{'path': destination + '/notes', 'slots': {'text': 'Personal annotation'}}])
             (root / 'entries.md').write_text('# Beacon entries\nEach entry has a stable ID and a text label.\nLabels are read-only after creation. To change a displayed label, create a separate alias record.\nEntry IDs remain stable.\n')
             capture()
@@ -122,7 +124,9 @@ def check(base, codex=False):
             assert client.source(destination) == before
             complete(affected, changed=True)
             after = client.source(destination)
-            assert before != after and 'alias' in after.lower(), after
+            assert before != after, after
+            if not codex:
+                assert 'Create a separate alias record' in after, after
             assert client.source(destination + '/status') == status
             assert client.read(destination + '/notes')['properties']['/text'] == 'Personal annotation'
             assert not pending()
@@ -132,8 +136,8 @@ def check(base, codex=False):
             overlay = client.read('/x' + affected[0] + '/view', 'y')
             assert any(row['path'].endswith('/document') for row in overlay.get('children', [])), overlay
             result = {'passed': True, 'codex': codex,
-                      'checks': ['concept synthesis', 'source-scoped invalidation',
-                                 'changed meaning revises prose', 'unchanged concept reused',
+                      'checks': ['revision publication', 'source-scoped invalidation',
+                                 'changed evidence revises prose', 'unchanged concept reused',
                                  'no partial publication', 'notes preserved',
                                  'working overlay', 'unchanged source no-op']}
             print(json.dumps(result), flush=True)

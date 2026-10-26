@@ -71,6 +71,19 @@ documents. Source edits replace it in the expansion transaction; direct edits to
 numbered prose still regenerate canonical source. The retained projection is
 excluded from document content and Semidoc export.
 
+Semidoc attributes retain their cardinality and value types in those same native
+records. A single word or reference uses the existing text/path pail. Repeated,
+multi-value and valueless attributes use `semidoc/sattr/occurrences` in the
+predicate's slot, preserving occurrence order, value boundaries and references.
+Predicate order is canonicalized; lexical aliases remain expanded paths.
+Source and Goo edits therefore preserve authored flow bindings and relationships.
+Native record edits apply their changed slots against the existing captured
+projection and authored source, so an older, less expressive projection cannot
+erase untouched declarations. This uses the existing source and image; it adds
+no document record, history format or migration pass. This is slot reconciliation,
+not a general concurrent merge: source and Goo edits retain their native version
+guards, and block reordering refuses named descendants attached below prose.
+
 The reader's **Edit with Goo** link opens `/nenex/edit?path=<namespace path>`.
 The whole document is a continuous sequence of native Grove/Goo block views.
 Each field still belongs to its original `text`, `title`, `lead` or `body` slot.
@@ -95,7 +108,9 @@ Grove controls through `GooActions`; it does not parse Semidoc or store a second
 document model. Structural writes flush other drafts first, freeze editing while
 in flight, and compare authored content against the captured native epoch.
 The source form uses the same guard and native admission. Work, cell and hole
-updates do not invalidate an otherwise unchanged document; changed source does.
+updates do not invalidate an otherwise unchanged document; changed source or
+numbered document records do, even when a reconciliation conflict retains the
+same source text.
 Refusals retain the draft. If a reply or the subsequent refresh is lost,
 Ctrl/Cmd+S resumes the captured change with the same invocation. Structural
 editing stays frozen until it settles. The
@@ -109,6 +124,19 @@ current page subtree and commits through Nenex's existing expansion transaction.
 There is no editor document record or flattened copy of the page. Named children
 such as `inputs`, `cells`, `work` and nested named documents are outside that
 projection and remain intact.
+
+The retained source projection is a reconciliation baseline, not a concurrent
+merge engine. With a faithful baseline, native edits remain authoritative.
+When an older projection omitted authored relationships, automatic recovery
+accepts only one text-field change at an unchanged position. Structural changes,
+relationship edits, or conflicting source text retain both sides and report a
+conflict instead of transferring hidden bindings to a different block. Goo
+serialization refuses that conflict; submitting a fresh source edit explicitly
+selects the source to expand. Old records and their x/y/z cases remain available.
+Reverting the conflicting native edit also clears the reconciliation error.
+For numbered blocks with named work beneath them, source editing also refuses
+changes beyond a single text edit: positional source cannot safely identify
+which work should follow a moved block. Root-level named children are unaffected.
 
 Rich fields contain the shared `goo/text/pail` value. Semidoc export carries the
 same run value in a reserved `;@ /doc/rich` hexadecimal JSON attribute on that

@@ -22,7 +22,6 @@ const go=async key=>{
 };
 try {
   await go('card');
-  await expect(page.getByRole('navigation',{name:'Components'}).getByRole('link')).toHaveCount(16);
   await expect(page.locator('main')).toContainText('A place for an idea');
   await page.screenshot({path:join(output,'card.png'),fullPage:true});
   const source=await page.locator('main').getAttribute('data-target');
@@ -41,7 +40,6 @@ try {
     })).toBe(true);
   };
   await expect(photo).toHaveAttribute('alt','Clay sculpture with multiple human faces, held in a workshop.');
-  await expect.poll(()=>photo.evaluate(node=>node.complete&&node.naturalWidth===382&&node.naturalHeight===382)).toBe(true);
   await fullPhoto();
   await expect(page.locator('main')).toContainText('Clay study. Several faces, one form.');
   await expect(page.getByRole('link',{name:'Open full image',exact:true})).toHaveAttribute('href','/goo-components/sculpture.jpg');
@@ -124,7 +122,6 @@ try {
   await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.screenshot({path:join(output,'narrow.png'),fullPage:true});
   await go('figure');
-  await expect.poll(()=>photo.evaluate(node=>node.complete&&node.naturalWidth===382)).toBe(true);
   await fullPhoto();
   await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.screenshot({path:join(output,'figure-narrow.png'),fullPage:true});

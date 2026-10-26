@@ -42,49 +42,6 @@ def literal(value):
     return runtime_literal(value)
 
 
-def upgrade_world(runtime, world, timeout):
-    """Upgrade the private continuation, keeping the native namespace verbatim."""
-    utility = Path(runtime).resolve().parent / 'eden-native-upgrade'
-    if not utility.is_file():
-        raise ValueError('--upgrade requires the native runtime from this checkout’s Eden shell')
-    log_path = world / 'upgrade.log'
-    with tempfile.TemporaryDirectory(prefix='eden-upgrade-') as temporary, log_path.open('w') as log:
-        work = Path(temporary)
-        copy_snapshot(stage(runtime, False, timeout), work / 'snap')
-        process = subprocess.Popen([runtime, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
-            cwd=work, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True,
-            start_new_session=True)
-        try:
-            process.stdin.write('(#bind upgrade (#module eden-upgrade))\n(upgrade:export 0)\n')
-            process.stdin.close()
-            deadline = time.monotonic() + timeout
-            while not any(re.fullmatch(r'"EDEN-UPGRADE-PREPARED:[0-9]+"', line.strip())
-                          for line in log_path.read_text(errors='replace').splitlines()):
-                if process.poll() is not None or time.monotonic() > deadline:
-                    raise ValueError(f'Could not prepare bootstrap upgrade; see {log_path}')
-                time.sleep(.1)
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-        code = work / 'code'
-        code.mkdir()
-        for command in [[str(utility), 'export-code', str(work / 'snap'), str(code)],
-                        [str(utility), 'upgrade', str(code), str(world / 'snap')]]:
-            result = subprocess.run(command, stdout=log, stderr=log, timeout=timeout)
-            if result.returncode:
-                raise ValueError(f'Native bootstrap upgrade failed; see {log_path}')
-        for name in ['foil/eden_store.foil', 'reaver/eden-world.rvr',
-                     'reaver/eden.rvr', 'reaver/foil-source.rvr',
-                     'reaver/foil-publication.rvr']:
-            shutil.copyfile(ROOT / 'src' / name, world / 'src' / name)
-    print(f'Native bootstrap upgraded; namespace content hash unchanged. Log: {log_path}', flush=True)
-
-
 def main():
     def terminate(signum, frame):
         raise KeyboardInterrupt
@@ -100,7 +57,6 @@ def main():
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--world', type=Path, help='Native world directory (default: $XDG_DATA_HOME/shrine/worlds/NODE)')
     parser.add_argument('--ephemeral', action='store_true', help='Disposable world; implied by --check')
-    parser.add_argument('--upgrade', action='store_true', help='Upgrade an existing world’s private bootstrap, preserving its namespace and history')
     parser.add_argument('--compact', action='store_true', help='Collect obsolete native checkpoints before starting; preserve the current world and all its history')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
@@ -119,8 +75,6 @@ def main():
         world = (args.world or Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'shrine/worlds' / node).resolve()
         metadata = world / 'world.json'
         recorded = json.loads(metadata.read_text()) if metadata.is_file() and not (args.ephemeral or args.check) else None
-        if args.upgrade and not recorded:
-            raise ValueError('--upgrade requires an existing persistent world')
         if args.compact and not recorded:
             raise ValueError('--compact requires an existing persistent world')
         if recorded and (recorded.get('format') != 1 or recorded.get('node') != node):
@@ -154,10 +108,6 @@ def main():
             except BlockingIOError:
                 raise ValueError(f'This world is already running: {work}')
             restored = (work / 'snap/arena.dat').is_file() and (work / 'world.json').is_file()
-            if args.upgrade:
-                if not restored:
-                    raise ValueError('--upgrade requires a complete native world')
-                upgrade_world(runtime, work, args.startup_timeout)
             if args.compact:
                 if not restored:
                     raise ValueError('--compact requires a complete native world')

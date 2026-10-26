@@ -2,6 +2,7 @@
 - apps/nenex/main [at=wiki]
 - nenex_editor
 - nenex_editor_http
+- nenex_interface
 - semidoc [at=sd]
 - app_test_world
 - testing
@@ -10,7 +11,7 @@
   + result
     \ result=either[iota namespace] fallback=namespace
     ^ namespace
-    ?> (./ok value) result fallback
+    ?> (./ok value) result (Seq[namespace] (error (pails/t "Nenex editor fixture admission failed")) fallback)
     | value
   + root
     ^ path
@@ -39,7 +40,9 @@
       state world.state
       input (myth/sing ['text] (pails/t (show (goo_text/encode nenex_editor_tests/runs))))
       plan (nenex_edit/save ['text] target input state)
-      writes (? (either/is_ok plan) (either/ok_val plan) [])
+      writes
+        ?> (./ok writes) plan (Seq[row[[p=path q=writ]]] (error (pails/t "Nenex editor fixture save failed")) [])
+        writes
       changed (nenex_editor_tests/result (grove_install/changes writes state) state)
       card (nenex_edit/record target changed)
       source (nenex_edit/record root changed).txt_at(['src])
@@ -47,7 +50,8 @@
       wrong (nenex_edit/save ['title] target input state)
       foreign (nenex_edit/save ['text] root.weld(['work 'trace ($u 0)]) input state)
       corrupt (str/cat_all [";@ /doc/rich broken" (str/from_atom 10) "paragraph"])
-      refused (nenex_editor_tests/result (grove_install/change root (writ/poke (myth/sing ['src] (pails/t corrupt))) changed) changed)
+      rejection (grove_install/change root (writ/poke (myth/sing ['src] (pails/t corrupt))) changed)
+      refused (? (either/is_ok rejection) (either/ok_val rejection) changed)
       deleted (nenex_editor_tests/result (grove_install/change root (writ/poke (myth/sing ['src] (pails/t (str/from_atom (weft/join 10 [";. /0x11/app/nenex/w/scratch" "  ;= Short" "    Remaining."]))))) changed) changed)
       literal_payloads=row[str] ["" ";= stays prose" ";/not-a-reference" "  leading and trailing  " (str/from_atom (weft/join 10 ["first" "second" ""])) (str/from_atom (weft/join 10 ["" "  indented" ""]))]
       literal_roundtrips
@@ -181,6 +185,59 @@
      (testing/nat "all captured x/y/z history remains readable" 1 history)
      (testing/text "named work survives edits" "keep" (nenex_edit/record root.weld(['work 'note]) updated.state).txt_at(['sentinel]))]
 
+  + conflicts
+    \ ignored=unit
+    ^ row[testing/check]
+    = root=path nenex_editor_tests/root
+      left=path root.weld([($u 0) ($u 0)])
+      right=path root.weld([($u 0) ($u 1)])
+      source (str/from_atom (sd/joined 10 [";. /0x11/app/nenex/w/scratch" "  ;= Research"
+        "    ;@ /flow/bind pages document" "    ;@ /flow/bind sources captured"
+        "    First" "" "    Second"]))
+      world (app_world/mount wiki/app "apps/nenex/main" ['app 'nenex] app_world/seed)
+      world (app_world/post ['app 'nenex 'w] [['new "scratch"]] world)
+      world (app_world/post root [['src source]] world)
+      initial world.state
+      old (nenex_edit/record left initial).del(['flow 'bind])
+      other (nenex_edit/record right initial)
+      tree (sovereign_care .z root initial).put(left.drop(root.len) old)
+      baseline (wiki/page_nodes tree)
+      setup (grove_install/changes [[left (writ/make old)]
+        [root (writ/poke (myth/sing wiki/image_slot (wiki/document_image (str/to_atom source) (pin baseline))))]] initial)
+      state (nenex_editor_tests/result setup initial)
+      token (nat/show state.local.top)
+      swapped (grove_install/changes [[left (writ/make other)] [right (writ/make old)]] state)
+      conflict (nenex_editor_tests/result swapped state)
+      undone (nenex_editor_tests/result (grove_install/changes [[left (writ/make old)] [right (writ/make other)]] conflict) conflict)
+      input (myth/sing ['src] (pails/t source)).put(['epoch] (pails/t token))
+      stale (nenex_edit/source root input conflict)
+      fresh (nenex_edit/source root input.put(['epoch] (pails/t (nat/show conflict.local.top))) conflict)
+      restored (nenex_editor_tests/result (grove_install/changes (either/ok_val fresh) conflict) conflict)
+      moved (nenex_editor_tests/command "down" left (goo/text/en "First") 0 0 restored)
+      moved_state (nenex_editor_tests/result moved restored)
+      reader (nenex_ui/document conflict.self root (sovereign_care .z root conflict)
+        (sovereign_care .z root.take(root.len.dec) conflict) [] 0 conflict.local.top root [])
+      prior (row/all[care] (\ car (equal (namespace/page car state.case(car root) root state) (namespace/page car state.case(car root) root restored))) [.x .y .z])
+      attached (nenex_editor_tests/result (grove_install/change left.weld(['work 'note]) (writ/make (myth/sing ['sentinel] (pails/t "keep"))) initial) initial)
+      changed_source (str/from_atom (sd/joined 10 [";. /0x11/app/nenex/w/scratch" "  ;= Research" "    Second"]))
+      protected (nenex_edit/source root (myth/sing ['src] (pails/t changed_source)).put(['epoch] (pails/t (nat/show attached.local.top))) attached)
+    [(testing/nat "lossy projection fixture admitted" 1 (either/is_ok setup))
+     (testing/text "lossy projection retains original source" source (nenex_edit/record root state).txt_at(['src]))
+     (testing/nat "native move retained for explicit resolution" 1 (either/is_ok swapped))
+     (testing/text "conflict does not overwrite authored bindings" source (nenex_edit/record root conflict).txt_at(['src]))
+     (testing/nat "ambiguous move reports conflict" 1 (gt (nenex_edit/record root conflict).txt_at(['err]).len 0))
+     (testing/text "native undo clears the resolved conflict" "" (nenex_edit/record root undone).txt_at(['err]))
+     (testing/nat "reader exposes the reconciliation error" 1 (cord/has "Semidoc reconciliation conflict" reader))
+     (testing/nat "Goo cannot silently serialize conflicted blocks" 1 (either/is_err (wiki/authored_nodes (sovereign_care .z root conflict))))
+     (testing/nat "same source text does not make stale native content safe" 1 (either/is_err stale))
+     (testing/nat "fresh source edit explicitly resolves conflict" 1 (either/is_ok fresh))
+     (testing/nat "source resolution restores all repeated bindings" 1 (equal (nenex_edit/record left initial).get(['flow 'bind]) (nenex_edit/record left restored).get(['flow 'bind])))
+     (testing/nat "resolved faithful document can move through Goo" 1 (either/is_ok moved))
+     (testing/nat "Goo move carries all bindings with the block" 1 (equal (nenex_edit/record left initial).get(['flow 'bind]) (nenex_edit/record right moved_state).get(['flow 'bind])))
+     (testing/nat "resolution preserves retained x/y/z cases" 1 prior)
+     (testing/nat "source deletion cannot cull named block work" 1 (either/is_err protected))
+     (testing/text "attached work remains present" "keep" (nenex_edit/record left.weld(['work 'note]) attached).txt_at(['sentinel]))]
+
 + tests
   ^ row[testing/case]
-  [(testing/case "Authored-content guards and native history" nenex_editor_tests/guards) (testing/case "Nenex canonical rich editor" nenex_editor_tests/checks) (testing/case "Nenex structural editing" nenex_editor_tests/block_checks)]
+  [(testing/case "Lossy projection conflicts and source ownership" nenex_editor_tests/conflicts) (testing/case "Authored-content guards and native history" nenex_editor_tests/guards) (testing/case "Nenex canonical rich editor" nenex_editor_tests/checks) (testing/case "Nenex structural editing" nenex_editor_tests/block_checks)]

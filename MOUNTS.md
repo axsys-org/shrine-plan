@@ -35,11 +35,84 @@ retires both layout-1 superblocks, so an older runtime rejects the upgraded
 image instead of selecting a stale root. Use this checkout's Eden shell for an
 upgraded world. Existing records and historical roots remain in the arena.
 
-For worlds created before native state adoption, stop their launcher and run
-`x/eden --upgrade` with the same `--world` selection. This recompiles only the
-private persistence adapter against that world's captured imports, checks the
-complete namespace content hash before committing its new continuation, and
-then starts the world normally. Preparation and diagnostics are in `upgrade.log`.
+A saved world resumes its captured service and compiler. Editing repository
+sources does not alter that saved program, and restarting does not load a new
+core runtime. Bootstrap closure patching and the `--upgrade` path are removed.
+Publication updates namespace definitions and explicit behavior registrations;
+it does not replace the captured service. There is no replacement-service API
+or launcher handoff. A running world's compiler, transport and persistence
+changes cannot be activated by pretending they are mount publications.
+
+The existing publication path has narrower, useful boundaries:
+
+| Change | Existing update path | What stays captured |
+| --- | --- | --- |
+| Mounted Foil modules and Grove definitions | Explicit source scan compiles against selected pinned dependencies and publishes through the native store | Earlier artifacts, typed values and their x/y/z cases |
+| Installed hands, forms and operations | An application's native code-refresh operation rebinds its declared behavior records | Existing flow definitions and attempts keep their chosen laws |
+| HTTP route handlers and post-start hooks | Restart resolves them from the saved mount images under the captured mount contracts | Core HTTP transport, supervisor and compiler closures |
+| A source dependency with no local file change | Publish the dependency, then invalidate the consumer's source-snapshot cache and rescan it | Imports remain explicit; no automatic relinking of existing code |
+| Core Reaver compiler, publication policy, supervisor or persistence code | Validate in disposable worlds built from the changed sources | Existing saved worlds continue running their captured implementations |
+
+Native publication appends new definitions; it does not rewrite historical laws
+or migrate retained record layouts. Type continuity uses one explicit predecessor
+per source module. Shared libraries come from pinned imports, never structural
+matching against other mounts. The compiler corrections in this checkout govern
+newly compiled services; they are not an upgrade to a running saved compiler.
+
+These boundaries are intentional. A live lookup of a behavior record can follow
+its next publication/registration; a captured law or pinned import cannot. Flow
+publication selects operation laws into the definition. Preview pins that
+definition, its input captures and its writer into the attempt. Refreshing
+registered operations does not relink a published definition: republish the
+definition to select new operation laws. New previews select their definition
+and writer; existing attempts keep both for execution and guarded commit.
+`flow_ui/refresh` updates the declared native behavior records and rejects incompatible active runtime
+types; it neither reruns application seeds nor replaces the supervisor. HTTP
+route closures are selected at startup from the saved mount images, under the
+captured mount descriptors; changing repository bytes alone selects nothing.
+The refresh command itself is a law: invoking an older captured refresh closure
+still supplies its older registrations. To activate newly published mount code,
+invoke the new law through its native publication, or resolve the mount's new
+HTTP entrypoint on restart and use its refresh operation. Republishing a mount
+does not retarget an already running HTTP route or an installed operation value.
+
+Startup first computes reconnect and draft reconciliation, constructs and
+validates routes, and resolves provider and foot entrypoints. These pure
+preparations must finish before checkpointing the candidate or spawning the
+supervisor. A preparation failure on restart leaves the prior native root
+unchanged. The supervisor adopts the graph returned by that checkpoint, keeping
+native sharing. Providers then reconnect through ordinary supervisor messages,
+followed by filesystem and HTTP foot registration. This is not a transaction
+over external I/O: a provider/listener failure after checkpointing retains the
+checkpoint and any acknowledged provider writes. Retry reconnects that state;
+it must not roll back already acknowledged work. A first boot retains its
+initial native continuation before serving, so interrupted initialization is
+recoverable through the same saved program.
+
+Semidoc reconciliation is not a general concurrent merge. When the baseline
+faithfully represents the authored source, native edits supply the current
+document. Recovery from an older lossy projection permits only one positional
+text edit with unchanged structure and metadata, and refuses competing source
+text. Ambiguous changes retain source, native records and history, report a
+document error, and refuse Goo serialization until resolved with a fresh source
+edit or by restoring the native blocks. Guards compare source and the numbered
+document projection at the captured epoch; named cells/work do not invalidate an edit. Source and
+Goo operations both protect work attached below numbered blocks. Rich-text
+encoding is unchanged.
+
+The filesystem foot reconciles watcher handles from its existing native binding.
+Source attach/rebind/detach operations derive shared ownership from live native
+dependencies and update the existing capture configuration. Cancellation gates
+stop obsolete reads; generation checks and native admission reject late results.
+The disposable watcher gate covers real file deletion/restoration and retained
+x/y/z cases. This changes newly built feet; it does not replace an implementation
+captured by a running or saved world.
+
+Native command admission uses one budget of 128 reaction rounds after the
+submitted event. Supervisor writes, guarded operations and Grove installation
+share this policy. A quiescent candidate can commit; exhaustion, reaction failure
+or unsupported outbound effects discard the candidate and its dependency index.
+The budget limits reaction rounds, not execution time inside an individual hand.
 
 To reclaim old arena allocations, stop the launcher and run `x/eden --compact`
 with the same `--world` and port selection. The launcher holds the existing

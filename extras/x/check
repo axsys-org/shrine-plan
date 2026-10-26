@@ -10,10 +10,13 @@ import subprocess
 import sys
 import tempfile
 
+from fixture_sources import materialize
+
 ROOT = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--core-root', type=Path, default=ROOT.parent)
 parser.add_argument('--mount', action='append')
+parser.add_argument('--suite', action='append', help='Run only these mounted native suites (repeatable)')
 parser.add_argument('--jobs', type=int, default=2)
 parser.add_argument('--timeout', type=int, default=1200)
 parser.add_argument('--contracts-only', action='store_true', help='Typecheck selected activation, HTTP and driver entrypoints')
@@ -23,6 +26,13 @@ sys.path.insert(0, str(args.core_root.resolve() / 'x'))
 from eden_mounts import select, catalog
 import test_runner as runner
 mounts = select(ROOT, args.mount or list(catalog(ROOT)))
+helpers = {'app_test_world', 'eden_srs', 'eden_debug', 'tests/eden_srs',
+           'tests/debug_http', 'tests/grove_debugger'}
+if args.suite:
+    registered = {name for m in mounts for name in m.manifest.get('tests', {}) if name not in helpers}
+    unknown = set(args.suite) - registered
+    if unknown:
+        parser.error('unknown mounted suites: ' + ', '.join(sorted(unknown)))
 # Mounted Goo consumes the same verified profile as standalone production.
 # Catch stale generated Foil/CSS before a native pass can mask asset drift.
 if any(m.name == 'goo' for m in mounts):
@@ -34,33 +44,14 @@ if any(m.name == 'goo' for m in mounts):
 # Test-only helper dependencies do not become runtime dependencies.
 if any(m.name == 'debugger' for m in mounts):
     mounts = select(ROOT, [m.name for m in mounts] + ['srs'])
-if any(m.name == 'nenex' for m in mounts):
-    # The question suite seeds the shared work lifecycle with tests/flows.
-    mounts = select(ROOT, [m.name for m in mounts] + ['flows'])
 runtime = os.environ.get('WISP') or shutil.which('wisp')
 if not runtime:
     parser.error('Set WISP or enter the core Nix shell')
 template = runner.stage(runtime, False, args.timeout)
-work = Path(tempfile.mkdtemp(prefix='shrine-extras-tests-'))
-shutil.copytree(args.core_root / 'src', work / 'src')
-for mount in mounts:
-    for old, leaf in mount.manifest.get('files', {}).items():
-        if old.startswith('src/'):
-            path = work / old
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(mount.root / leaf, path)
-    for name, leaf in {**mount.manifest.get('modules', {}), **mount.manifest.get('tests', {})}.items():
-        path = work / 'src/foil' / (name + '.foil')
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(mount.root / leaf, path)
-    for path in mount.root.glob('*.rvr'):
-        shutil.copyfile(path, work / 'src/reaver' / path.name)
-# Application tests consume the same checked-in module sources as production.
-# Core's schema-compiler fixtures synthesize these names; extras must not hide a
-# missing or malformed declared OpenRouter dependency behind that fixture reader.
-(work / 'src/reaver/foil-test-deps.rvr').write_text('(#bind std (#module std))\n(#import std)\n(#bind fixture (#module foil-test-context))\n(#bind source (#module foil-source))\n(define (prepare cache mods) (fixture:prepare source:read-module cache mods))\n(define (generated? name) 0)\n(define module-file-stamps [])\n(#export prepare generated? module-file-stamps)\n')
-helpers = {'app_test_world', 'eden_srs', 'eden_debug', 'tests/eden_srs',
-           'tests/debug_http', 'tests/grove_debugger'}
+cache = args.core_root.resolve() / '.check'
+cache.mkdir(exist_ok=True)
+work = Path(tempfile.mkdtemp(prefix='extras-', dir=cache))
+materialize(args.core_root, ROOT, work / 'src', {m.name for m in mounts}, native_tests=True)
 groups = []
 contracts = ['- http_foot']
 declarations = ['+ mount_contracts']
@@ -91,7 +82,8 @@ if len(contracts) > 1:
 for mount in ([] if args.contracts_only else mounts):
     suites = [dict(name='foil:' + name, target=name, kind='native',
                    group=mount.name, timeout=args.timeout)
-              for name in mount.manifest.get('tests', {}) if name not in helpers]
+              for name in mount.manifest.get('tests', {}) if name not in helpers
+              and (not args.suite or name in args.suite)]
     if suites:
         groups.append(suites)
     if mount.name == 'debugger':

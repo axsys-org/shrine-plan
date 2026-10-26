@@ -56,8 +56,11 @@ fixture = '''- grove_views
   [(testing/case "Component declarations" checks)]
 '''.replace('SOURCE_LINES', '\n     '.join(map(cord, source.splitlines())))
 fixture = fixture.replace('VIEW_NAMES', ' '.join(map(cord, names)))
-work = Path(tempfile.mkdtemp(prefix='goo-components-views-'))
-shutil.copytree(ROOT / 'src', work / 'src')
+(ROOT / '.check').mkdir(exist_ok=True)
+work = Path(tempfile.mkdtemp(prefix='goo-components-views-', dir=ROOT / '.check'))
+sys.path.insert(0, str(ROOT / 'extras/x'))
+from fixture_sources import materialize
+materialize(ROOT, ROOT / 'extras', work / 'src', set())
 (work / 'src/foil/tests/goo_components_views.foil').write_text(fixture)
 template = runner.stage(runtime, False, 1200)
 result = runner.run_group([dict(name='foil:tests/goo_components_views',

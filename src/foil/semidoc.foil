@@ -46,6 +46,10 @@
 +  sattr
   '  One attribute: a canonical predicate path and its values.
   :  pred=row[nat] vals=row[sval]
+  + occurrences
+    ' A predicate's ordered occurrences in its native slot. Each occurrence
+    ' keeps its value boundaries and word/reference types, including no values.
+    : values=row[row[sval]]
 +  snode
   '  A compiled document node.  Every variant carries its decorating
   '  attributes.
@@ -578,35 +582,21 @@
   ?  v
    > (./word t=nat)  (pails/t (str/from_atom t))
    > (./ref p=row[nat])  (pails/p (seg_iotas p))
-+  vals_text
-  '  Multi-valued attributes flatten to one text pail: words as
-  '  written, references by their path text.
-  \  vs=row[sval]
-  ^  nat
-  =  parts
-       %    i=nat 0    out=row[nat] []
-       ^  row[nat]
-       ?  (ge i vs.len)
-          out
-       =  v  vs.at(i)
-       ?  v
-        > (./word t=nat)  (_ i.inc out.snoc(t))
-        > (./ref p=row[nat])  (_ i.inc out.snoc((pred_text p)))
-  (joined 32 parts)
 +  put_attrs
-  '  Attributes onto a record: the canonical predicate path IS the
-  '  slot key — an attributed relation is just a slot.
+  ' One native slot per predicate. A lone scalar retains the ordinary text/path
+  ' pail; all other cardinalities keep their typed occurrences in that slot.
   \  as=row[sattr] t0=myth
   ^  myth
-  %    i=nat 0    acc=myth t0
+  %    todo=row[sattr] as    acc=myth t0
   ^  myth
-  ?  (ge i as.len)
-     acc
-  =  a  as.at(i)
-  =  slot  (seg_iotas a.pred)
-  ?  (eq 1 a.vals.len)
-     (_ i.inc acc.put(slot (val_pail a.vals.at(0))))
-  (_ i.inc acc.put(slot (pails/t (str/from_atom (vals_text a.vals)))))
+  ?> (./some pair) todo.pull acc
+  = [a rest] pair
+    same (todo.keep((\ other (eq_rowcord a.pred other.pred))))
+    remaining (rest.keep((\ other !(eq_rowcord a.pred other.pred))))
+    value=pail
+      ? (and (eq same.len 1) (eq a.vals.len 1)) (val_pail a.vals.at(0))
+      | sattr/occurrences (same.map((\ attr attr.vals)))
+  | _ remaining acc.put((seg_iotas a.pred) value)
 +  plain_node_myth
   '  One node's own record: ['kind] names the form, the form's data
   '  rides typed slots, attributes land at their predicate paths.
@@ -794,9 +784,8 @@
   .false
 +  sval_back
   '  A slot pail back to an attribute value, when it reads as one.
-  '  An EMPTY text pail reads back as no value: it is what a
-  '  valueless ;@ mounts as, and the sweep value a withdrawn
-  '  attribute melds down to — either way, not a value.
+  '  Empty text withdraws an attribute (the source sweep's value).
+  '  A valueless declaration instead has one empty typed occurrence.
   \  pl=pail
   ^  maybe[sval]
   ?  pl
@@ -819,6 +808,9 @@
   =  e  entries.at(i)
   ?  (reserved_slot e.key)
      (_ i.inc out)
+  ? e.val
+   > held=sattr/occurrences
+     | _ i.inc out.weld((held.values.map((\ values (sattr (seg_texts e.key) values)))))
   ?  (sval_back e.val)
    > (./some v=sval)
      (_ i.inc out.snoc((sattr (seg_texts e.key) [v])))
@@ -913,6 +905,81 @@
   \  ns=row[snode]
   ^  axal[myth]
   (myths_kids [] ns).fold((axal/new[myth] .none) (\ acc m acc.put(m.p m.t)))
++  reconcile_record
+  \ old=myth current=myth authored=myth
+  ^ myth
+  = changed (old.tap.weld(current.tap))
+  % todo=row[mop/kv[path pail]] changed out=myth authored
+  ^ myth
+  ?> (./some pair) todo.pull out
+  = [entry rest] pair
+  ? (equal (old.get(entry.key)) (current.get(entry.key))) (_ rest out)
+  ?> (./some value) current.get(entry.key) (_ rest out.del(entry.key))
+  | _ rest out.put(entry.key value)
++  remount_back
+  ' node_back returns decoded text, whereas parse returns the quoted source
+  ' payload for /doc/rich. Restore the same native rich value when projecting
+  ' decoded nodes for record comparison; do not reinterpret it as source.
+  \ nodes=row[snode]
+  ^ axal[myth]
+  | (myths_kids [] nodes).fold((axal/new[myth] .none) ;
+    \ out=axal[myth] mount=smount
+    = card mount.t
+      field (text_field (myth/txt_at ['kind] card))
+      native=myth
+        ?> (./some runs) (rich_decode (myth/txt_at ['doc 'rich] card)) card
+        ? !(eq (text_at field card) (str/to_atom runs.plain)) card
+        | card.del(['doc 'rich]).put(field (goo/text/pail runs))
+    | out.put(mount.p native))
++  reconcile
+  ' A current projection is authoritative when it agrees with the authored
+  ' baseline. Recovery from a lossy baseline is narrower: one text edit at an
+  ' unchanged position. Numbered paths cannot identify moved blocks. Never
+  ' guess which moved/replaced node should inherit unprojected relationships.
+  \ before=row[snode] after=row[snode] authored=row[snode]
+  ^ either[iota row[snode]]
+  = baseline (remount_back before)
+    source (remount_back authored)
+    current (remount_back after)
+  ? (equal baseline source) (./ok after)
+  ? (equal baseline current) (./ok authored)
+  ? !(single_text_edit before after) (./err 'semidoc_reconcile_conflict)
+  ? !(equal (baseline.tap.map((\ [at card] at))) (source.tap.map((\ [at card] at)))) (./err 'semidoc_reconcile_conflict)
+  = compatible
+      | current.tap.all
+      \ [at=path card=myth]
+      ?> (./some old) baseline.get(at) .false
+      ?> (./some original) source.get(at) .false
+      ? (equal old card) .true
+      = field (text_field (myth/txt_at ['kind] old))
+      | and (equal old.get(['kind]) original.get(['kind]))
+          ((equal old.get(field) original.get(field)) || (equal card.get(field) original.get(field)))
+  ? !compatible (./err 'semidoc_reconcile_conflict)
+  = merged=axal[myth] (current.tap.fold((axal/new[myth] .none) ;
+      \ out=axal[myth] [at=path card=myth]
+      ^ axal[myth]
+      = next=myth
+          ?> (./some old) baseline.get(at) card
+          ?> (./some original) source.get(at) card
+          | reconcile_record old card original
+      | out.put(at next)))
+  | ./ok (nodes_of merged)
++  single_text_edit
+  ' Conservative positional edit contract, also used when named work makes
+  ' source-level renumbering unsafe. An unchanged projection is allowed.
+  \ before=row[snode] after=row[snode]
+  ^ bool
+  = baseline (remount_back before)
+    current (remount_back after)
+  ? !(eq baseline.tap.len current.tap.len) .false
+  = changed=row[[path myth]] (current.tap.keep((\ [at card] !(equal baseline.get(at) (maybe/some[myth] card)))))
+  ? (gt changed.len 1) .false
+  | changed.all
+    \ [at=path card=myth]
+    ^ bool
+    ?> (./some old) baseline.get(at) .false
+    = field (text_field (myth/txt_at ['kind] old))
+    | and (gt field.len 0) (equal (old.del(field)) (card.del(field)))
 +  split_lines
   '  Every newline-separated run, empties KEPT — unlike /split_byte,
   '  which drops them: a literal body's blank lines must survive as

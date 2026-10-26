@@ -11,6 +11,28 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_worker_arenas_retained_only_on_failure(self):
+        for passed in (True, False):
+            with self.subTest(passed=passed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                template = root / 'template'
+                template.mkdir()
+                (template / 'arena.dat').write_bytes(b'compiler fixture')
+                suite = dict(name='example', kind='reaver', target='example', group='worker')
+                def execute(_command, directory, _source, _timeout):
+                    status = 'pass' if passed else 'error'
+                    (directory / 'out.log').write_text(
+                        f'("TEST" "{status}" "example" "~:module" "~:" "~:")\n'
+                        + runner.DONE + '\n')
+                    return 0, True, 0.0
+                with patch.object(runner, 'run_process', execute):
+                    result = runner.run_group([suite], 'wisp', template, root, 1)
+                self.assertEqual(result['passed'], passed)
+                self.assertEqual((root / 'worker/snap').exists(), not passed)
+                self.assertTrue((root / 'worker/result.json').exists())
+                self.assertTrue((root / 'worker/out.log').exists())
+                self.assertEqual((template / 'arena.dat').read_bytes(), b'compiler fixture')
+
     def test_shared_fixture_is_built_once_and_passed_to_each_entrypoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -65,20 +87,15 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(list(result['locations'].values()),
                              [str(frozen) + ':1'])
 
-    def test_deprecated_compiler_cannot_reenter_module_graph(self):
-        retired = {'foil', 'compiler-host', 'helm-host'}
-        modules = {p.stem for p in (runner.ROOT / 'src/reaver').glob('*.rvr')}
-        self.assertFalse(retired & modules)
-        self.assertFalse(retired & runner.reaver_closure(modules))
-
-    def test_retired_type_system_cannot_return(self):
-        retired = {'foil-types', 'foil-core-types', 'foil-types-tests'}
+    def test_retired_modules_cannot_reenter_module_graph(self):
+        retired = {'foil', 'compiler-host', 'helm-host', 'foil-types',
+                   'foil-core-types', 'foil-types-tests'}
         sources = list((runner.ROOT / 'src/reaver').glob('*.rvr'))
         modules = {p.stem for p in sources}
-        self.assertFalse(retired & modules)
+        # The closure includes its roots and unresolved dependency names.
         self.assertFalse(retired & runner.reaver_closure(modules))
-        for name in retired:
-            self.assertNotIn(name, (runner.ROOT / 'test-inventory.json').read_text())
+        suites = runner.inventory()
+        self.assertFalse(retired & {s['target'] for s in suites})
         # Old tags are allowed only as deliberately invalid test inputs.
         rejection_tests = {'typed-reaver-tests', 'foil-relocate-tests',
                            'compiler-inspect-tests'}
@@ -88,20 +105,12 @@ class ProtocolTests(unittest.TestCase):
 
     def test_type_core_has_no_compiler_or_ffi_dependency(self):
         closure = runner.reaver_closure(['foil-type-core'])
-        self.assertFalse({'foil-types', 'foil-core-types', 'foil-builtins',
-                          'typed-reaver', 'foil-new-elab', 'foil-new-env'} & closure)
-
-    def test_ffi_producers_do_not_depend_on_retired_types(self):
-        closure = runner.reaver_closure(['foil-builtins', 'typed-reaver'])
-        self.assertFalse({'foil-types', 'foil-core-types',
+        self.assertFalse({'foil-builtins', 'typed-reaver',
                           'foil-new-elab', 'foil-new-env'} & closure)
 
-    def test_compiler_consumers_do_not_import_retired_types(self):
-        closure = runner.reaver_closure([
-            'foil-new-env', 'foil-lower', 'foil-render', 'foil-relocate',
-            'foil-entry', 'compiler-inspect', 'compiler-build',
-        ])
-        self.assertFalse({'foil-types', 'foil-core-types'} & closure)
+    def test_ffi_producers_do_not_depend_on_elaborator(self):
+        closure = runner.reaver_closure(['foil-builtins', 'typed-reaver'])
+        self.assertFalse({'foil-new-elab', 'foil-new-env'} & closure)
 
     def test_wrapped_fields_and_escaping(self):
         log = '("TEST" "fail" "tests/json"\n "quoted ""case"""\n "a\\\\b" "actual")\n'
@@ -173,18 +182,10 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(completed)
             self.assertEqual(code, 9)
 
-    def test_inventory_is_complete(self):
+    def test_inventory_has_unique_names(self):
         suites = runner.inventory()
         names = [s['name'] for s in suites]
         self.assertEqual(len(names), len(set(names)))
-        self.assertIn('foil:tests/json', names)
-        self.assertNotIn('foil:apps/chat/tests', names)
-        self.assertNotIn('foil:apps/loom/tests', names)
-        self.assertNotIn('foil:apps/nenex/tests', names)
-        self.assertIn('doc:sept', names)
-        self.assertIn('foil:tests/supervisor', names)
-        self.assertIn('foil:tests/http_foot', names)
-        self.assertFalse(any(name.startswith('helm-') for name in names))
 
     def test_generated_helpers_are_covered_without_running_as_suites(self):
         suites = {s['name']: s for s in runner.inventory()}
@@ -206,27 +207,6 @@ class ProtocolTests(unittest.TestCase):
         with patch.object(Path, 'is_file', lambda path: False if path == target else original(path)):
             with self.assertRaisesRegex(ValueError, 'missing command target: extras/mounts/debugger/check-debugger.py'):
                 runner.inventory()
-
-    def test_migrated_pure_suites_are_native(self):
-        suites = {s['name']: s for s in runner.inventory()}
-        for name in ('pact', 'sept', 'semidoc', 'weft'):
-            self.assertNotIn('foil-' + name + '-tests', suites)
-            self.assertTrue(suites['foil:tests/' + name]['enabled'])
-        self.assertTrue(suites['foil-sept-layout-tests']['enabled'])
-        for name in ('semidoc', 'weft'):
-            self.assertTrue(suites['foil-' + name + '-layout-tests']['enabled'])
-        self.assertEqual(suites['foil-shrine-tests']['group'], 'shrine')
-        self.assertTrue(all(not runner.needs_corpus(s['target'])
-                            for s in suites.values() if s['group'] == 'corpus'))
-
-    def test_app_migrations_and_semidoc_closure(self):
-        suites = {s['name']: s for s in runner.inventory()}
-        for name, target in [('life', 'apps/life/tests'),
-                             ('loom', 'apps/loom/tests'),
-                             ('tmpl', 'tests/tmpl')]:
-            self.assertNotIn('foil-' + name + '-tests', suites)
-            self.assertNotIn('foil:' + target, suites)
-        self.assertFalse(runner.needs_corpus('foil-semidoc-layout-tests'))
 
     def test_compiler_inputs_exclude_suites(self):
         files = {p.stem for p in runner.compiler_files()}

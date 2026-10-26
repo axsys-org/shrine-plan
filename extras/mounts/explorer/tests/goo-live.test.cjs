@@ -406,9 +406,9 @@ test('record read failures stay visible and do not claim the record is absent', 
   assert.doesNotMatch(el.querySelector('.sv-recview').innerHTML, /nothing here/);
 });
 
-test('address path slots and references have navigable live-view links', () => {
-  const street = '/o/1/4/0x11/gov/nenex_ui/related_lens/7/0x11/user/external_records/snapshots/s_one/street_pages/p_10/s_street';
-  const source = '/0x11/user/external_records/snapshots/s_one/pages/p_91';
+test('path slots and references have navigable live-view links', () => {
+  const street = '/o/1/4/0x11/gov/example/lens/2/0x11/evidence';
+  const source = '/0x11/user/evidence';
   const html = slotLayout({address_street: street, address_source: source, held: '-> ' + source.slice(1)});
   assert.ok(html.includes('href="/live?views=' + encodeURIComponent(street) + '"'));
   assert.equal(html.split('href="/live?views=' + encodeURIComponent(source) + '"').length - 1, 2);

@@ -90,14 +90,36 @@ nix develop path:./extras#debugger --command python3 extras/mounts/debugger/chec
 `extras/x/check-goo` is the production compatibility suite, also run by CI.
 It builds the locked Mash Nix artifact and validates native contracts, prepared
 geometry, and a disposable real Eden instance in Chromium. The application gate
-uses production asset hooks and a test-only panes fixture. `goo-inspector` is the
-only deployed Goo view consumer; SRS and Grove-dev retain domain/development
-behavior without Goo views. See the
+uses production asset hooks and a test-only panes fixture. `goo-inspector`
+provides namespace views; SRS and Grove-dev retain their domain/development
+behavior. See the
 [application integration guide](mounts/explorer/APPLICATION-INTEGRATION.md).
 
 The extras test runner assembles a disposable test fixture tree from core and the
 flat descriptors. That compatibility layout exists only inside the test worker.
 The production bootstrap reads namespace source snapshots through mount mappings.
+
+Mounted checks share `x/fixture_sources.py` for staging. To run one suite and its
+mount contracts, use `extras/x/check --mount flows --suite tests/flows` from the
+repository root. Native work/source/retry behavior belongs to `tests/flows`;
+`flow_ui_tests` checks the forms and rendering that invoke it. Nenex question
+tests use Nenex and cooperative work directly, without a flows test dependency.
+Core Goo runtime checks run in the core gate; mounted Goo text, style and view
+checks run in explorer's `test_goo_v2` suite. Block-document checks cover its
+document operations rather than re-registering those shared Goo cases.
+The component browser check owns rich formatting, undo and draft retention;
+the block-document browser check owns structural editing and exact typed
+save/reload. The filesystem actor check owns cancellation acknowledgements;
+the flow watcher integration covers real file changes, dynamic bindings, late
+read rejection and retained history without repeating flow publication.
+
+Mounted workers stage under core’s `.check/`, avoiding large arenas on `/tmp`
+tmpfs. Successful native workers discard their disposable arenas while retaining
+frozen sources, inputs, logs and results. Failed workers retain their arenas for
+diagnosis;
+the compiler template remains cached. This does not clean existing run directories
+or touch persistent user worlds.
+
 Runners default to core in the parent of `extras/`; `--core-root` or
 `SHRINE_CORE_ROOT` can select another core checkout. `migration.json` records
 the original core paths and their destinations relative to this directory.

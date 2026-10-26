@@ -83,6 +83,73 @@
   (assert-impl "new native projector accepts an old stored record"
     (Eq 1 ((driver:get-perc ["accepts"] new-model)
       (driver:get-perc ["value"] old-model))))
+  ;; A retained provider returns the same native type through its older
+  ;; private compiler key. Public field lookup must use the visible revision.
+  (define supplier-plan (pub:prepare native-selection (Pin "compiler")
+    (lambda (name) (tree "- model [at=private]
++ supplied
+  \ ignored=nat
+  ^ private/node
+  | private/node 5
+"))
+    [["model" root] ["supplier" [["x" 7] ["ts" "supplier"]]]]
+    [["model" (Pin old-model)]] (lambda (path) 0)))
+  (define supplier (_1 (_0 (_2 (pub:compile supplier-plan driver:empty-foil-cache)))))
+  (define (consume model text)
+    (pub:compile (pub:prepare native-selection (Pin "compiler")
+      (lambda (name) (tree text))
+      [["model" root] ["supplier" [["x" 7] ["ts" "supplier"]]] ["use" app]]
+      [["model" (Pin model)] ["supplier" supplier]]
+      (lambda (path) 0)) driver:empty-foil-cache))
+  (define shared-method (consume new-model "- model
+- supplier
++ result (supplied 0).n
+"))
+  (assert-impl "public methods follow an unchanged native type across module revisions"
+    (Eq 5 (driver:get-perc ["result"] (Unpin (_1 (_0 (_2 shared-method)))))))
+  ;; Two visible revisions can share the type but offer different methods.
+  ;; An older provider must not choose between them by import traversal order.
+  (define (method-model value version)
+    (Unpin (_1 (_0 (_2 (build (strcat ["+ node
+  : n=nat
+  + answer
+    \ self=node
+    ^ nat
+    | " (showNat value) "
++ value (node 5)
+"]) [] old-images version))))))
+  (define first-method (method-model 11 1))
+  (define second-method (method-model 22 2))
+  (assert-impl "method fixtures keep the provider's native type"
+    (Equal (Hd (driver:get-perc ["value"] first-method))
+      (Hd (driver:get-perc ["value"] old-model))))
+  (assert-impl "fixture publishes the new method"
+    (Eq 11 ((driver:get-perc ["node" "answer"] first-method)
+      (driver:get-perc ["value"] old-model))))
+  (define (consume-both a b text)
+    (pub:compile (pub:prepare native-selection (Pin "compiler")
+      (lambda (name) (tree text))
+      [["a" root] ["b" root] ["supplier" [["x" 7] ["ts" "supplier"]]] ["use" app]]
+      [["a" (Pin a)] ["b" (Pin b)] ["supplier" supplier]]
+      (lambda (path) 0)) driver:empty-foil-cache))
+  (define ambiguous-source "- a
+- b [at=b]
+- supplier
++ result (supplied 0).answer
+")
+  (define (ambiguity a b)
+    (Try (lambda (ignored) (force (consume-both a b ambiguous-source))) 0))
+  (assert-impl "conflicting visible methods refuse identity fallback"
+    (Eq 1 (Hd (ambiguity first-method second-method))))
+  (assert-impl "method ambiguity does not depend on import order"
+    (Eq 1 (Hd (ambiguity second-method first-method))))
+  (define duplicate-alias (consume-both first-method first-method ambiguous-source))
+  (assert-impl "two aliases for the same pinned method are unambiguous"
+    (Eq 11 (driver:get-perc ["result"] (Unpin (_1 (_0 (_2 duplicate-alias)))))))
+  (assert-impl "hidden transitive types cannot supply fallback methods"
+    (Eq 1 (Hd (Try (lambda (ignored) (force (consume first-method "- supplier
++ result (supplied 0).answer
+"))) 0))))
   ;; The retained artifact can predate the latest physical publication case.
   (define repeated (build
     "+ node (: n=nat)
@@ -100,6 +167,11 @@
 + value (node 5)
 " [] old-images 1))
   (define newer (Unpin (_1 (_0 (_2 schema)))))
+  (assert-impl "changed schema cannot lend methods to a different native type moment"
+    (Eq 1 (Hd (Try (lambda (ignored) (consume newer "- model
+- supplier
++ result (supplied 0).number
+")) 0))))
   (define wrapper (Unpin (_1 (_1 (_2 schema)))))
   (assert-impl "changed record receives a new moment"
     (Nil (Equal (Hd (driver:get-perc ["value"] old-model))
@@ -110,6 +182,59 @@
   (assert-impl "changed schema refuses the old record"
     (Eq 0 ((driver:get-perc ["accepts"] newer)
       (driver:get-perc ["value"] old-model))))
+  ;; Equal layouts do not merge two already published nominal identities.
+  ;; Rebuild from the selected predecessor, never from an older other mount.
+  (define duplicate (build "+ node (: n=nat)
++ value (node 5)
+" [] [] 1))
+  (define duplicate-model (Unpin (_1 (_0 (_2 duplicate)))))
+  (define shared (build "+ node (: n=nat)
++ value (node 5)
+" [] (_2 duplicate) 2))
+  (define shared-model (Unpin (_1 (_0 (_2 shared)))))
+  (assert-impl "unchanged rebuild retains its selected predecessor's identity"
+    (Equal (driver:get-perc ["value"] duplicate-model)
+      (driver:get-perc ["value"] shared-model)))
+  (assert-impl "rebuilt projector accepts values stored by its predecessor"
+    (Eq 1 ((driver:get-perc ["accepts"] shared-model)
+      (driver:get-perc ["value"] duplicate-model))))
+  (assert-impl "equal layouts from another publication remain distinct"
+    (Eq 0 ((driver:get-perc ["accepts"] shared-model)
+      (driver:get-perc ["value"] old-model))))
+  (define (ambiguous evidence)
+    (Try (lambda (ignored) (build "+ node (: n=nat)
++ value (node 5)
+" [] evidence 2)) 0))
+  (assert-impl "multiple predecessor candidates refuse instead of canonicalizing"
+    (Eq 1 (Hd (ambiguous (Weld (_2 duplicate) old-images)))))
+  (assert-impl "predecessor ambiguity is independent of candidate order"
+    (Eq 1 (Hd (ambiguous (Weld old-images (_2 duplicate))))))
+  (define later-schema (build "+ node (: number=nat)
++ value (node 5)
+" [] (_2 schema) 2))
+  (assert-impl "unchanged schema retains its explicitly selected identity"
+    (Equal (driver:get-perc ["value"] newer)
+      (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 later-schema)))))))
+  (assert-impl "dependent predecessor survives an unchanged schema rebuild"
+    (Equal (driver:get-perc ["value"] wrapper)
+      (driver:get-perc ["value"] (Unpin (_1 (_1 (_2 later-schema)))))))
+  (assert-impl "mixed historical candidates cannot discard a valid dependent"
+    (Eq 1 (Hd (Try (lambda (ignored) (build "+ node (: number=nat)
++ value (node 5)
+" [] (Weld [["model" (Pin old-model)]] (_2 schema)) 2)) 0))))
+  (define pinned (build "" [["model" (Pin duplicate-model)]] old-images 2))
+  (define pinned-consumer (Unpin (_1 (_0 (_2 pinned)))))
+  (assert-impl "explicit pinned import wins over unrelated predecessor evidence"
+    (Equal (driver:get-perc ["value"] duplicate-model)
+      (_0 (driver:get-perc ["value"] pinned-consumer))))
+  (assert-impl "predecessor must be a pinned artifact"
+    (Eq 1 (Hd (Try (lambda (ignored) (build "+ node (: n=nat)
++ value (node 5)
+" [] [["model" old-model]] 2)) 0))))
+  (assert-impl "predecessor must belong to the selected source root"
+    (Eq 1 (Hd (Try (lambda (ignored) (build "+ node (: n=nat)
++ value (node 5)
+" [] [["model" (Pin old-consumer)]] 2)) 0))))
   (define imported-change (build "" [["model" (_1 (_0 (_2 schema)))]] old-images 2))
   (assert-impl "a changed imported schema invalidates a dependent type"
     (Nil (Equal (Hd (driver:get-perc ["value"] old-consumer))
@@ -401,3 +526,70 @@ assert(Eq 1 (any (matches empty-brand) sum-contract))
 assert(Eq 1 (any (matches value) sum-contract))
 assert(Eq 0 (any (matches
   (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 revised)))))) sum-contract))
+
+
+;; Invoked only by the disposable native restart test. Ordinary suite loading
+;; does not save a continuation or alter its compiler-test arena's root.
+(#bind world (#module eden-world))
+(define (checkpoint-test phase)
+  (define prior (_1 reuse-products))
+  (define saved (_0 reuse-second))
+  (define retained (Pin saved))
+  (define old-model (Unpin (_1 (_0 (_2 prior)))))
+  (define paths (map _0 (pub:definition-records prior)))
+  (define queries (map (lambda (care)
+    [(driver:get-perc ["sov" (strcat [care "_case"])] policy)
+     (driver:get-perc ["sov" (strcat [care "_query"])] policy)]) ["x" "y" "z"]))
+  (define observations
+    (foldl (lambda (out pair)
+      (foldl (lambda (out path)
+        (define last ((_0 pair) path saved))
+        (Weld out (gen (If last (_0 last) 0) (lambda (i)
+          [(_1 pair) (Inc i) path ((_1 pair) (Inc i) path saved)]))))
+        out paths)) [] queries))
+  (define (intact state)
+    (all (lambda (entry)
+      (Equal (Ix 3 entry) ((_0 entry) (_1 entry) (_2 entry) state))) observations))
+  (define (serve commit state args)
+    (If (Equal (_0 args) "initial")
+      ;; The real service consumes its saved state before accepting requests.
+      ;; Force it here too: otherwise lazy evaluation never runs the Save.
+      (Seq state (Seq (print (strcat ["PUBLICATION-CHECKPOINT-READY:" (showNat (Now 0))])) (Sleep 3600)))
+      (let ()
+        (assert-impl "restart retains the complete sovereign graph" (Equal state (Unpin retained)))
+        (assert-impl "restart retains every sampled x/y/z case" (intact state))
+        (define (read name)
+          (rex:ParseRexNormFile (If (Equal name "model")
+            "+ node (: n=nat)
++ alias node
++ recursive (: next=maybe[recursive])
++ helper 3
++ value (node 5)
++ accepts
+  \ p=pail
+  ^ nat
+  ? (node/try_from_pail p)
+   > (./some _) 1
+   > .none 0
+"
+            "- model
++ wrapper (: item=node)
++ value (wrapper (node 5))
+")))
+        (define next (pub:compile (pub:prepare-reusing native-selection (Pin "compiler") read
+          [["model" root] ["consumer" app]] []
+          (lambda (path)
+            (define found (cases (map (lambda (part) ((_0 part) (_1 part))) path) state))
+            (If found (_0 found) 0)) (_2 prior)) driver:empty-foil-cache))
+        (define model (Unpin (_1 (_0 (_2 next)))))
+        (assert-impl "republish after restart accepts retained typed values"
+          (Eq 1 ((driver:get-perc ["accepts"] model) (driver:get-perc ["value"] old-model))))
+        (assert-impl "old compiled behavior remains captured" (Eq 2 (driver:get-perc ["helper"] old-model)))
+        (assert-impl "new compilation uses revised behavior" (Eq 3 (driver:get-perc ["helper"] model)))
+        (define published (pub:publish policy slot ("x" 7) next 0 0 state))
+        (assert-impl "native publication succeeds after restart" (Equal "ok" (Hd published)))
+        (assert-impl "republication preserves every earlier x/y/z case" (intact (_0 published)))
+        (Seq (commit (_0 published))
+          (Seq (print (strcat ["PUBLICATION-RESTART-PASS:" (showNat (Now 0))])) (Sleep 3600))))))
+  (world:run serve saved ["none" phase]))
+(#export checkpoint-test)

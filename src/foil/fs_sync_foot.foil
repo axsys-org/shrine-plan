@@ -66,6 +66,112 @@
      | _ idx.inc
     | _ idx.inc
 
+  + capture
+    \ reader={\ str}either[str row[fs_read/file]] root=str
+    ^ either[str row[fs_read/file]]
+    ?> (./ok result) (Try reader root) (./err "Filesystem watch capture failed")
+    result
+  + ready
+    : key=iota generation=nat
+  + sampled
+    : key=iota generation=nat config=saga value=either[str row[fs_read/file]]
+  + stopped
+    : key=iota generation=nat
+  + task
+    & feet/task/ack feet/task/fact feet/task/admitted
+      fs_foot/ready fs_foot/sampled fs_foot/stopped
+  + registration
+    : key=iota generation=nat handle=nat config=myth
+      before=maybe[either[str row[fs_read/file]]] published=maybe[either[str row[fs_read/file]]]
+      request=nat sent=maybe[either[str row[fs_read/file]]]
+  + stop
+    \ parent=nat key=iota generation=nat
+    ^ nat
+    ; (Send parent (fs_foot/stopped key generation))
+    | CloseHandle parent
+  + watch
+    ' The foot grants each read. A queued stop is consumed before another
+    ' read, even if cancellation arrived during Sleep or an in-flight read.
+    ' Waits are split into one-second cancellation points, so even a long
+    ' configured interval releases an idle worker promptly. Only the worker
+    ' counts its read interval; the foot does not schedule work. Workers have
+    ' no supervisor capability and cannot publish results.
+    \ reader={\ str}either[str row[fs_read/file]] key=iota generation=nat seconds=nat self=nat
+    ^ nat
+    = ;[ignored caps] (Recv[unit] 0)
+      parent caps.at(0)
+    % remaining=nat 0
+    ; (Send parent (fs_foot/ready key generation))
+    = ;[permission caps] (Recv[maybe[saga]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ?> (./some config) permission (fs_foot/stop parent key generation)
+    ? remaining
+      ; (Sleep 1)
+      | _ remaining.dec
+    = ;value (fs_foot/capture reader (unpin config.myth).txt_at(bond/from))
+    ; (Send parent (fs_foot/sampled key generation config value))
+    ; (Sleep 1)
+    | _ seconds.dec
+  + same_watch
+    \ left=myth right=myth
+    ^ bool
+    | and (fs/same_source left right)
+        (eq left.nat_at(['fs 'watch_seconds] 0) right.nat_at(['fs 'watch_seconds] 0))
+  + reconcile
+    ' This is the foot's owned set of actor handles, not retained world data.
+    ' Replacements get a fresh generation; old mailbox results are inert.
+    \ reader={\ str}either[str row[fs_read/file]] tree=axal[saga]
+      held=row[fs_foot/registration] serial=nat
+    ^ [row[fs_foot/registration] nat]
+    = empty=row[fs_foot/registration] []
+      stop=maybe[saga] .none
+      ;kept
+        | held.fold empty
+          \ out item
+          = current (fs_foot/get_root (tree.dip([item.key])))
+          ? (and (fs/watch_enabled current) (fs_foot/same_watch item.config current))
+            = kept item.set_config(current)
+              kept (? (fs_foot/get_pending current) kept.set_published(.none) kept)
+            out.snoc(kept)
+          ; (Send item.handle stop)
+          ; (CloseHandle item.handle)
+          out
+      kids tree.kid_tap
+    % idx=nat 0 out=row[fs_foot/registration] kept next=nat serial
+    ^ [row[fs_foot/registration] nat]
+    ? (eq idx kids.len) [out next]
+    = [key child] kids.at(idx)
+      config (fs_foot/get_root child)
+    ? !(and (is_text key) (fs/watch_enabled config)) (_ idx.inc out next)
+    ? (out.any((\ item (eq_iota item.key key)))) (_ idx.inc out next)
+    = ;worker (Spawn (fs_foot/watch reader key next config.nat_at(['fs 'watch_seconds] 0)))
+    ; (SendCaps worker 0 [0])
+    | _ idx.inc out.snoc((fs_foot/registration key next worker config .none .none 0 .none)) next.inc
+  + plan
+    ' Compare the actual native assertion, including its version: changing
+    ' away and back cannot admit a late capture. Request and completion are
+    ' one ordinary native batch, with fs/talk handling both writes.
+    \ key=iota expected=saga value=either[str row[fs_read/file]] state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    = target=path [state.self 'io 'fs key]
+    ?> (./known tree) (state.page(.x .none target)) (./err 'fs_obsolete_watch)
+    ?> (./some current) tree.fil (./err 'fs_obsolete_watch)
+    ? !(equal[saga] expected current) (./err 'fs_obsolete_watch)
+    = config (unpin current.myth)
+    ? !(fs/watch_enabled config) (./err 'fs_obsolete_watch)
+    ? (fs_foot/get_pending config) (./err 'fs_scan_pending)
+    = epoch config.nat_at(bond/epoch 0).inc
+      result=pail
+        ? value
+         > (./ok files) (fs/batch epoch config files)
+         > (./err why) (fs/failure epoch config why)
+    | ./ok [[target (writ/poke (myth/sing bond/pending (pails/b .true)))]
+        [target (writ/poke (myth/sing bond/res result))]]
+  + finish
+    \ error=maybe[pail] state=namespace
+    ^ [nat str str]
+    ? error.is_some [409 "Obsolete filesystem read" ""]
+    [200 "" ""]
   + run
     \ init=feet/task/init self=nat
     ^ nat
@@ -74,57 +180,51 @@
     \ reader={\ str}either[str row[fs_read/file]]
       init=feet/task/init self=nat
     ^ nat
-    ; (fs_foot/watch_mounts reader init.parent init.ax)
-    ; | %/changed reader init.parent (axal/new[saga] .none) init.ax
-    % old=axal[saga] init.ax
-    = ;[msg caps] | Recv[feet/task[unit]] 0
-    ; | helm/supervisor/close_caps caps
+    = ;[held serial] (fs_foot/reconcile reader init.ax [] 1)
+    ; (fs_foot/changed reader init.parent (axal/new[saga] .none) init.ax)
+    % old=axal[saga] init.ax watches=row[fs_foot/registration] held next=nat serial
+    = ;[msg caps] (Recv[fs_foot/task] 0)
+    ; (helm/supervisor/close_caps caps)
     ? msg
      > (./ack ack)
       ? ack
-       > .none (_ old)
+       > .none (_ old watches next)
        > (./some err)
-        ; | Trace ["filesystem write rejected" err] 0
-        | _ old
+        ; (Trace ["filesystem write rejected" err] 0)
+        | _ old watches next
      > (./fact ax)
-      ; | %/changed reader init.parent old ax
-      | _ ax
-    ; | Trace ["unexpected filesystem message" msg] 0
-    | _ old
-  + capture
-    \ reader={\ str}either[str row[fs_read/file]] root=str
-    ^ either[str row[fs_read/file]]
-    ?> (./ok result) (Try reader root) (./err "Filesystem watch capture failed")
-    result
-  + watch
-    ' Source I/O only. Unchanged bytes produce no namespace event. Domain
-    ' work still runs exclusively in subscribed hands after the normal scan.
-    \ reader={\ str}either[str row[fs_read/file]] key=iota root=str seconds=nat self=nat
-    ^ nat
-    = ;[ignored caps] (Recv[unit] 0)
-      parent caps.at(0)
-      ;first (fs_foot/capture reader root)
-    % before=either[str row[fs_read/file]] first published=either[str row[fs_read/file]] first
-    ; (Sleep seconds)
-    = ;current (fs_foot/capture reader root)
-    ? !(equal[either[str row[fs_read/file]]] before current) (_ current published)
-    ? (equal[either[str row[fs_read/file]]] published current) (_ current published)
-    ; (Send parent (feet/gift/pass [key] (writ/poke (myth/sing bond/pending (pails/b .true)))))
-    | _ current current
-  + watch_mounts
-    ' Startup configuration, owned by the filesystem foot's lifetime. No
-    ' model/work queue, dates or retry policy belongs in this adapter.
-    \ reader={\ str}either[str row[fs_read/file]] parent=nat tree=axal[saga]
-    ^ nat
-    = kids tree.kid_tap
-    % idx=nat 0
-    ^ nat
-    ? (eq idx kids.len) 0
-    = [key child] kids.at(idx)
-      record (fs_foot/get_root child)
-      seconds record.nat_at(['fs 'watch_seconds] 0)
-    ? ((lt seconds 5) || (gt seconds 3600)) (_ idx.inc)
-    = ;watcher (Spawn (fs_foot/watch reader key record.txt_at(bond/from) seconds))
-    ; (SendCaps watcher 0 [parent])
-    ; (CloseHandle watcher)
-    | _ idx.inc
+      = ;[updated serial] (fs_foot/reconcile reader ax watches next)
+      ; (fs_foot/changed reader init.parent old ax)
+      | _ ax updated serial
+     > stopped=fs_foot/stopped
+      | _ old watches next
+     > ready=fs_foot/ready
+      = matching watches.keep((\ item (and (eq_iota item.key ready.key) (eq item.generation ready.generation))))
+      ? !(matching.len) (_ old watches next)
+      = item matching.at(0)
+      ; (Send item.handle (old.get([item.key])))
+      | _ old watches next
+     > sample=fs_foot/sampled
+      = matching watches.keep((\ item (and (eq_iota item.key sample.key) (eq item.generation sample.generation))))
+      ? !(matching.len) (_ old watches next)
+      = item matching.at(0)
+        value=maybe[either[str row[fs_read/file]]] (./some sample.value)
+        stable (equal[maybe[either[str row[fs_read/file]]]] item.before value)
+        changed !(equal[maybe[either[str row[fs_read/file]]]] item.published value)
+        submit (and (and stable changed) (eq item.request 0))
+        updated item.set_before(value)
+        updated (? submit updated.set_request(next).set_sent(value) updated)
+        watches watches.map((\ held (? (eq held.generation item.generation) updated held)))
+      ? !submit (_ old watches next)
+      ; (Send init.parent (feet/gift/admit next (fs_foot/plan item.key sample.config sample.value) fs_foot/finish))
+      | _ old watches next.inc
+     > (./admitted request status body line)
+      = watches
+          | watches.map
+          \ item=fs_foot/registration
+          ? !(eq item.request request) item
+          = value (? (eq status 200) item.sent item.published)
+          | item.set_published(value).set_request(0).set_sent(.none)
+      | _ old watches next
+    ; (Trace ["unexpected filesystem message" msg] 0)
+    | _ old watches next

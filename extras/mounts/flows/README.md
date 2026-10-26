@@ -71,8 +71,10 @@ The implemented composition is ordered and acyclic. Publication checks names,
 bindings and port names and captures the chosen laws. General branching,
 reflective extraction and model operation through Goo are not implemented here.
 Limits are 16 inputs, 16 steps and 32 authored pages. Names are canonical symbols
-up to 64 characters. Use **Edit source** for executable definitions; preservation
-of repeated executable attributes by every block editor is not guaranteed.
+up to 64 characters. **Edit source** authors executable declarations; Nenex's Goo
+editor preserves those declarations when editing text or moving their blocks.
+Repeated bindings occupy one native predicate slot with ordered, typed
+occurrences. Their port/value pairs and reference values survive the round trip.
 
 Pure compositions support native `preview` and guarded, idempotent `commit`.
 Judgment-bearing compositions use `follow`; a pure preview refuses pending
@@ -172,10 +174,42 @@ Repository capture is host I/O. `host.py` captures and hashes configured source
 bytes. Missing evidence is published as a capture fault; it cannot prevent
 installing or recompiling the harness in another workspace. The native source
 hand retains the last good collection and blocks publication while a capture is
-invalid. The example's ordinary filesystem foot watches every 15 seconds and
-requires two matching changed captures. Reading a cell never launches a model.
+invalid. A feed requires its live file to appear in the configured mount's
+current scan report and not in its missing-file list. Retained bytes and an old
+successful report are not current evidence. Returning identical bytes restores
+the feed without deleting its prior captures. Reading a cell never launches a model.
 Other flows can bind namespace evidence directly or use native `watch_sources`
-to connect a captured source file and filesystem mount to a feed.
+to connect one live file under a filesystem mount's destination to a feed.
+
+The filesystem foot reconciles its owned watcher actors whenever its native
+binding changes. A capture configuration has one polling actor, shared by all
+source feeds bound to it. `watch_sources` attaches a feed or, with its current
+native `expected` case, rebinds it. `unwatch_sources` takes that same case guard
+and removes the live dependency while retaining the feed, last good capture and
+history. Ownership is derived from the existing native dependencies, not stored
+in a second owner table. Rebinding releases the old configuration only when no
+other source feed still refers to it. Pausing a maintenance controller does not
+remove its authored source binding.
+
+The existing configuration retains its interval (`fs/watch_seconds`, default
+15 seconds for a newly attached source); `fs/watch_active` records whether its
+source bindings still require polling. Removing or changing a configuration
+cancels its old actor. Every read needs permission from the foot, with at most
+one second between idle cancellation points. An in-flight I/O call may finish,
+but its obsolete generation cannot publish. A completion also checks the exact
+native configuration assertion inside ordinary supervisor admission, then lets
+the existing filesystem hand apply the request and result in one atomic batch.
+Two matching captures stabilize changes; unchanged captures produce no event.
+No work queue or scheduler is added. Captured records and all x/y/z cases remain.
+
+The disposable-world gate is `tests/check-watch-lifecycle.py` (run with `WISP`
+set, or from the core development shell). It uses real file deletion/restoration,
+two authored flows sharing a capture, rebind/detach/reattach, read counters after
+cancellation, and a deliberately blocked read released after detach. The Python
+test driver only changes fixture files; the native supervisor, filesystem foot,
+source hands and cells perform the lifecycle. The core `tests/fs_reconcile` suite
+also checks the worker's termination acknowledgement and rejection of late
+results after an ABA detach/reattach. These tests never open a retained live world.
 
 The small `examples/evidence_resume.semidoc` demonstrates a persistent demand:
 missing `GATE_OPEN` evidence leaves a hole; changed relevant evidence resumes it
@@ -193,31 +227,51 @@ Source publication and installed runtime bindings are distinct in the existing
 mount system. After publishing changed modules, reconnect the HTTP foot with a
 restart and use **Page tools → Flows → Refresh harness code**. This uses the same
 registration records as initial installation and admits only changed code records
-in one native batch. It does not reinstall examples or change controllers,
+in one native batch. This includes Nenex's declared document behaviors and reader;
+it does not replace the supervisor's captured Goo interpreter. It does
+not reinstall application seeds or examples, or change controllers,
 captures, destination claims, documents or holes. The native operation is
 `/<node>/gov/flows/refresh_harness` at `/<node>/gov/flows`. Older worlds need one
 initial refresh through the updated flow HTTP handler before their stored page
 tool displays the new control. Captured definitions and old attempts retain their
 chosen laws. Refresh refuses `flow_runtime_requires_type_migration` when live
 controller, claims, question or hole records belong to another nominal type
-moment. Native source publication compares elaborated type schemes against the
-mount's retained artifacts and reuses unchanged types' exact defining moments.
+moment. Native source publication compares elaborated type schemes against each
+source module's explicitly selected predecessor from that mount. It preserves
+unchanged types' exact defining moments. Shared dependencies use pinned imports;
+other mounts' structurally identical types do not replace existing identities.
+Ambiguous predecessor selections are rejected.
 The comparison keeps dependencies and opaque constants exact; a schema change
 advances that type and invalidates reuse of its dependent types. Functions and
 values are rebuilt, and publication still checks the actual current record cases
 atomically. A new artifact's publication case is not automatically a new type
 identity. Stored values and captured laws are not rewritten.
+Method lookup also follows that exact native moment when a retained provider
+returns a type through an older private compiler key. It uses the current
+source-visible declaration; a different schema moment cannot supply its methods.
+If identity fallback finds competing visible method keys it refuses the ambiguous
+call. Multiple aliases of the same pinned method remain valid.
 
-An existing saved service captures its compiler. After updating the native
-runtime, stop its writer and use `x/eden --upgrade` to replace the private
-bootstrap publisher, then restart normally and rescan the source mounts. The
-native upgrade verifies the complete retained namespace content hash before
-committing its continuation. It preserves compiler identity pins, documents,
-work records and every x/y/z history; it does not reinstall the world.
+Publish dependencies before their consumers. For Semidoc this includes Web,
+Explorer, Nenex, then flows. An unchanged mount-file snapshot skips compilation;
+when only an imported library changed, invalidate that mount's native
+`/sys/fs/source/snapshot` cache before invoking its existing `op/rescan`.
+
+An existing saved service captures its compiler and core runtime. Restart resumes
+that service; publishing mount records does not replace its captured core code.
+Bootstrap law patching, `x/eden --upgrade`, and the experimental whole-service
+activation API have been removed. The compiler corrections described above apply
+to services built with this checkout; ordinary mount publication does not install
+them into an older saved compiler. See [the publication boundaries](../../../MOUNTS.md).
+Validate core changes in disposable worlds. Republish a flow definition to select
+new operation laws; existing attempts retain their pinned definition and writer.
+An already captured refresh command still supplies its old registrations. Use
+the newly published law, or the handler selected from saved mount images on
+restart, to refresh native behavior records. That does not replace the core service.
 
 Operations under `/<node>/gov/flows/` include `author`, `publish`, `preview`,
 `commit`, `follow`, `submit_revision`, `set_enabled`, `detach`, `import_source`,
-`observe`, `source_failed` and `watch_sources`. They use existing namespace
+`observe`, `source_failed`, `watch_sources` and `unwatch_sources`. They use existing namespace
 admission. Native callers do not require MCP; the optional CLI client uses the
 existing generic transport. Clients with unrestricted raw namespace writes can
 bypass this protocol; the helpers are not an isolation boundary against them.
