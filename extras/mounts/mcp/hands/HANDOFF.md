@@ -553,6 +553,14 @@ What changed on `ic-bare-loop-main` since the merge, all uncommitted until the f
   `ARCHITECTURE.md` (four layers, the scheme as the front line, provenance, what was cut, convergence), the skill
   (`cartography.md`: two writes, stand on the place first, no record of any other kind).
 
+Two more things since: every changed definition in `src/foil` carries a one-line doc comment (the audit was: a
+definition with three or more changed lines and no `'` line after its head; graph had 44, the evaluator 14, the
+index 6, the launcher 3, three elsewhere; all written); and `registries.py --only <source>` runs one source against
+the recipients the world already holds, which is what a subagent per source calls. The demo is run as the agent,
+not by a script: one subagent per source writing under its own path through the hand, then the overlay read from
+the request, judgements with their `why`, the view at `/user/views/domestic_sources_<number>`, and the pages read as
+a buyer; `tests/registries/proof.py` stays as the test, nothing else drives.
+
 Next, in order: the scheme as a record under `/user/sources/<name>` read by one generic fetch hand (an agent
 extends what can be fetched by writing a scheme and a mapping); value assertions as folders; `claims` retired into
 the one shape; the web landing at `/user/web/<domain>/<path>`; `gather`/`follow` operators and parameters at the
