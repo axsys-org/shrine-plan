@@ -68,8 +68,7 @@ pristine main shows on the same runtime. The test inventory is brought up to dat
 ## Kept from the Codex review, named as such
 
 `namespace/system_at` (an epoch's own system publication for a frozen computation), `lain_poke`'s trigger
-spelling for `/r`, `sys/slots` and the regenerated catalogue, and in reaver `eden.rvr`'s `mounted-with` (the
-upgrade's boot entry) with the bootstrap test fixtures. Each is needed by the upgrade path or the reads above.
+spelling for `/r`, and `sys/slots` with the regenerated catalogue. Each is needed by the reads above.
 
 ## Not in this PR
 
