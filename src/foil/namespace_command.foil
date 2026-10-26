@@ -1,0 +1,50 @@
+- namespace
+- lain_peek
+- lain_poke
+
+' A trusted published operation may validate a complete read-set and plan
+' several writes against one namespace snapshot. The supervisor admits the
+' plan without yielding to another request. Ordinary record ops stay valid.
++ namespace_op
+  : plan={\ path myth namespace}either[iota row[[p=path q=writ]]]
+
++ namespace_command
+  + plan
+    \ target=path operation=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(state.permitted(target)) (./err 'write_outside_authority)
+    ?> (./some record) (sovereign_care .x operation state).fil
+      | ./err 'warp_op_unknown
+    ?> (./some held) record.get(system_vocabulary/op)
+      | ./err 'warp_op_bad
+    ? held
+     > command=namespace_op
+      = plan command.plan
+      | plan target input state
+     > ordinary=op
+      | ./ok [[target (writ/warp operation input)]]
+    | ./err 'warp_op_bad
+
+  + run
+    ' One submitted event may drive at most 128 reaction rounds. This is the
+    ' shared admission budget for supervisor writes and installed operations;
+    ' it bounds rounds, not arbitrary work performed inside a native hand.
+    ' Only a quiescent candidate with no outbound effects may be committed.
+    \ command=task now=nat block=nat state=namespace index=hive
+    ^ either[iota [namespace hive]]
+    = [result next_index] (sovereign_cycle_with index command 0 128 now block state)
+    ? result
+     > (./fail why) (./err why)
+     > (./spun next moves rounds ack spill)
+      ? spill
+       > (./some why) (./err why)
+      ? moves.len (./err 'outbound_not_supported)
+      | ./ok [next next_index]
+  + admit
+    ' Planning and reactions see one immutable candidate. Refusal publishes none.
+    \ plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
+    ^ either[iota [namespace hive]]
+    ?> (./ok planned) (Try plan state) (./err 'command_plan_failed)
+    < writes planned
+    ? !(writes.len) (./ok [state index])
+    | namespace_command/run (task/vines writes) 0 0 state index

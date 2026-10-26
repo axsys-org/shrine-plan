@@ -7,6 +7,7 @@
     : method=str target=str body=str
   + action
     & http_foot/action/snapshot
+      http_foot/action/admit
       http_foot/action/snapshot_bat
       http_foot/action/interact_bat
       http_foot/action/interact
@@ -31,6 +32,11 @@
       http_foot/action/value
       http_foot/action/physical
       http_foot/action/inspect
+    + admit
+      ' Plan and commit against one state, then render that admitted state.
+      : plan={\ namespace}either[iota row[[p=path q=writ]]]
+        finish={\ maybe[pail] namespace}[nat str]
+        told={\ maybe[pail] namespace}str
     + snapshot_bat
       : read={\ namespace}[nat any nat]
     + interact_bat
@@ -114,8 +120,10 @@
       feet/task/asset
       feet/task/ack
       feet/task/develop
-      feet/task/binary
+      feet/task/admitted
       http_foot/action/snapshot
+      http_foot/action/admit
+      feet/task/binary
       http_foot/action/snapshot_bat
       http_foot/action/interact_bat
       http_foot/action/interact
@@ -379,7 +387,7 @@
            "Connection: close" http_foot/crlf http_foot/crlf]
     | add (str/to_atom header) (mul body (bex (mul 8 header.len)))
   + planned
-    '  What the listener decided for one connection: an encoded reply it
+    '  What the router decided for one connection: an encoded reply it
     '  could finish locally, or an action the foot must answer.
     & http_foot/planned/done
       http_foot/planned/ask
@@ -388,40 +396,29 @@
     + ask
       : action=http_foot/action
   + plan
-    '  Read and route one request in the listener, which holds the
-    '  routes.  Only the fd and this small result cross to the
-    '  connection actor.  (A fresh actor per connection used to receive
-    '  the whole route configuration, every closure with its environment,
-    '  through the message copier on each request: that copy was the
-    '  per-request floor, and it grew with the loaded mounts.  A pool of
-    '  workers spawned once was tried and dropped: a worker waiting for
-    '  the foot's answer shares its mailbox with incoming connections.)
-    \ config=http_foot/config fd=nat
+    '  Route a complete request without socket I/O. One router retains
+    '  the routes, avoiding a copy of every mount closure per connection.
+    \ config=http_foot/config parsed=http_foot/request
     ^ http_foot/planned
-    ? (Try http_foot/read_request fd)
-     > (./err _) (./done (http_foot/encode (http_driver/response 400 "Malformed HTTP request")))
-     > (./ok parsed)
-      = ;attempt
-          | Try[http_foot/request http_foot/action]
-            (\ r=http_foot/request
-              | http_foot/dispatch config.routes r
-                  (div (Now 0) 1000000000))
-            parsed
-      ? attempt
-       > (./err _) (./done (http_foot/encode (http_driver/response 400 "Invalid request")))
-       > (./ok action)
-        ? action
-         > (./reply ready) (./done (http_foot/encode ready))
-         > (./bat status body ctype) (./done (http_foot/encode_bat status body ctype))
-         > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
-        (./ask action)
+    = ;attempt
+        | Try[http_foot/request http_foot/action]
+          (\ r=http_foot/request
+            | http_foot/dispatch config.routes r
+                (div (Now 0) 1000000000))
+          parsed
+    ? attempt
+     > (./err _) (./done (http_foot/encode (http_driver/response 400 "Invalid request")))
+     > (./ok action)
+      ? action
+       > (./reply ready) (./done (http_foot/encode ready))
+       > (./bat status body ctype) (./done (http_foot/encode_bat status body ctype))
+       > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
+      (./ask action)
   + connection
     '  Finish one connection: write a local reply, or ask the foot for
     '  namespace work and write its answer.
-    \ fd=nat planned=http_foot/planned self=nat
+    \ fd=nat planned=http_foot/planned foot=nat
     ^ nat
-    = ;[root caps] (Recv[path] 0)
-      foot caps.at(0)
     = streaming=bool
         ? planned
          > (./ask action)
@@ -543,6 +540,7 @@
     \ why=pail
     ^ str
     ? why
+     > failure=helm/supervisor/rejection (iota_show failure.reason)
      > q=pails/q (iota_show q.q)
      > t=pails/t t.t
      > n=pails/n (nat/show n.n)
@@ -605,16 +603,50 @@
      > (./bat status body ctype) (http_foot/encode_bat status body ctype)
      > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     | http_foot/encode_answer (http_foot/ask foot action)
+  + receive_connection
+    ' A browser may preconnect without sending bytes, or pause midway
+    ' through headers/body. Only this connection waits for its Read.
+    \ fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      router caps.at(0)
+      ;parsed=maybe[http_foot/request]
+        ? (Try http_foot/read_request fd)
+         > (./ok request) (./some request)
+         > (./err _) .none
+    ; (SendCaps router parsed [0])
+    ; (CloseHandle router)
+    = ;[planned reply_caps] (Recv[http_foot/planned] 0)
+    | http_foot/connection fd planned reply_caps.at(0)
+  + router
+    ' Never waits for socket input or a namespace response. Parsed
+    ' requests enter here; each connection owns its response mailbox.
+    \ config=http_foot/config self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      foot caps.at(0)
+    % ignored=nat 0
+    = ;[parsed peers] (Recv[maybe[http_foot/request]] 0)
+      peer peers.at(0)
+      ;planned
+        ? parsed
+         > (./some request) (http_foot/plan config request)
+         > .none (http_foot/planned/done (http_foot/encode (http_driver/response 400 "Malformed HTTP request")))
+    ; (SendCaps peer planned [foot])
+    ; (CloseHandle peer)
+    | _ 0
   + listener
     \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
+      ;router (Spawn (http_foot/router config))
+    ; (SendCaps router root [foot])
+    ; (CloseHandle foot)
     % ignored=nat 0
     = ;connection (Accept fd)
-      ;planned (http_foot/plan config connection)
-      ;actor (Spawn (http_foot/connection connection planned))
-    ; (SendCaps actor root [foot])
+      ;actor (Spawn (http_foot/receive_connection connection))
+    ; (SendCaps actor root [router])
     ; (CloseHandle actor)
     | _ 0
   + reply
@@ -742,6 +774,29 @@
           ^ row[http_foot/pending]
           ? !(eq_iota item.key ($u request)) out.snoc(item)
           ; (Send item.conn (http_foot/action/bat status body mime))
+          out
+      | _ serial left queue
+     > (http_foot/action/admit plan finish told)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+        complete
+          \ outcome=maybe[pail] state=namespace
+          ^ [nat str str]
+          = [status body] (finish outcome state)
+          | [status body (told outcome state)]
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/admit serial plan complete))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/admitted request status body line)
+      ; (helm/supervisor/close_caps caps)
+      ; (? (gt line.len 0) (Send streams (http_foot/stream_msg/line line)) 0)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn (http_response status (str/to_atom body) "application/json; charset=utf-8"))
           out
       | _ serial left queue
      > (http_foot/action/snapshot read)

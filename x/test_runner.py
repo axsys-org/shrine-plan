@@ -147,6 +147,8 @@ def inventory():
     if found_helpers != helpers.keys():
         raise ValueError(f'missing native helpers: {sorted(helpers.keys() - found_helpers)}')
     for command in data['commands']:
+        if not (ROOT / command['target']).is_file():
+            raise ValueError('missing command target: ' + command['target'])
         suites.append(dict(command, kind='command', group=command['name'], enabled=True))
     return suites
 
@@ -259,7 +261,6 @@ def copy_template(source, dest):
 
 def run_group(suites, wisp, template, root, timeout):
     directory = root / suites[0]['group']
-    copy_template(template, directory / 'snap')
     command_suite = suites[0]['kind'] == 'command'
     if command_suite:
         env = dict(os.environ, WISP=wisp, TEST_TEMPLATE=str(template),
@@ -272,6 +273,7 @@ def run_group(suites, wisp, template, root, timeout):
                     and re.search(suites[0]['completion'], log, re.M))
         records = []
     else:
+        copy_template(template, directory / 'snap')
         lines = []
         if any(s.get('entrypoint') for s in suites):
             lines.extend(['(#bind test_std (#module std))', '(#import test_std)'])
@@ -370,6 +372,10 @@ def run_group(suites, wisp, template, root, timeout):
                   completed=complete, returncode=code, suites=[s['name'] for s in suites],
                   records=records, locations=locations, log=str(directory / 'out.log'))
     (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    if good and not command_suite:
+        # Retain frozen sources, inputs and diagnostics, not successful workers'
+        # disposable arenas. The compiler template remains reusable.
+        shutil.rmtree(directory / 'snap')
     print(f'{"PASS" if good else "FAIL"} {result["group"]} ({seconds:.1f}s) — {result["log"]}', flush=True)
     for status, mod, name, want, got in records:
         if status not in ('start', 'pass'):
