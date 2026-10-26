@@ -1,0 +1,99 @@
+- browser_routes
+- apps/nenex/main [at=wiki]
+- semidoc [at=sd]
+- nenex_editor
+- goo_browser
+
++ nenex_editor_http
+  + label
+    \ text=str slot=str
+    ^ weft/node
+    = attrs (goo/semantic_attrs (goo/common (goo/slot slot) (goo/rank/required) goo/config/empty .none) (goo/node_id "navigation") .none)
+      node (goo/semantic/text attrs (goo/text/en text))
+    ?> (./ok prepared) (goo_prepared/prepare (./some node) (goo_fp/integer 720) (goo_fp/integer 1) .false)
+      | weft/tx "Unsupported text"
+    | weft/raw (str/to_atom (goo_html/fragment prepared))
+  + link
+    \ url=str text=str
+    ^ weft/node
+    | weft/el "a" [(weft/href (str/to_atom url))] [(nenex_editor_http/label text "body")]
+  + url
+    \ target=path
+    ^ str
+    | str/cat_all ["/nenex/edit?path=" (value_read/percent (path_show target))]
+  + page
+    \ selected=path state=namespace
+    ^ [nat str]
+    ?> (./some root) (nenex_edit/owner selected state) [404 "Choose existing Nenex document content."]
+    = source (nenex_edit/record root state).txt_at(['src])
+      children (wiki/old_mounts (str/to_atom source))
+    ? (gt children.len 256) [413 "Document exceeds the editor's 256-node limit."]
+    = paths=row[path] (row/weld[path] (children.map((\ m root.weld(m.p)))) [root])
+      editable (paths.keep((\ path (gt (sd/text_field (myth/txt_at ['kind] (nenex_edit/record path state))).len 0))))
+    ? !(editable.len) [400 "This document has no editable text blocks."]
+    = blocks=row[json]
+        | paths.map
+          \ path=path
+          = card (nenex_edit/record path state)
+            field (sd/text_field card.txt_at(['kind]))
+            view=str
+              ? !(field.len) ""
+              | path_show [state.self 'gov 'nenex_editor ($ts (str/cat_all ["edit_" (? (equal[path] field ['lead]) card.txt_at(['kind]) (str/from_atom (quip_val field.at(0))))]))]
+            markup=str
+              ? !(eq card.txt_at(['kind]) "ref") ""
+              = reference (path_show card.path_at(['ref]).fall([]))
+                label (str/cat_all [(? card.path_at(['doc 'embed]).is_some "Embedded reference: " "Reference: ") reference])
+              | str/from_atom (weft/render (nenex_editor_http/link (str/cat_all ["/ns" reference]) label))
+          | json/obj [(jkv "target" (json/str (path_show path))) (jkv "view" (json/str view))
+              (jkv "kind" (json/str card.txt_at(['kind]))) (jkv "markup" (json/str markup))
+              (jkv "depth" (json/num .false path.drop(root.len).len))
+              (jkv "reference" (json/str (path_show card.path_at(['ref]).fall([]))))
+              (jkv "embed" (json/str (path_show card.path_at(['doc 'embed]).fall([]))))]
+      manifest (json/obj [(jkv "root" (json/str (path_show root)))
+        (jkv "epoch" (json/str (nat/show state.local.top)))
+        (jkv "blocks" (json/arr blocks))])
+      body=row[weft/node]
+        [(nenex_editor_http/link (str/cat_all ["/nenex?path=" (value_read/percent (path_show root))]) "Read / Semidoc source")
+         (nenex_editor_http/label "Nenex" "caption")
+         (nenex_editor_http/label "Write together. Type / for blocks; select text to format." "caption")
+         (weft/el "main" [(weft/att "data-goo-document" "")
+           (weft/att "data-manifest" (str/to_atom (show manifest)))] [])]
+      assets (goo_browser/surface_assets).snoc((weft/el "script" [(weft/att "src" "/static/goo-document.js") (weft/att "defer" "defer")] []))
+    | [200 (str/from_atom (weft/page_with_body_attributes "Nenex editor" assets [(weft/cls "goo-surface")] body))]
+  + request
+    \ request=http_foot/request now=nat
+    ^ http_foot/action
+    ? !(eq request.method "GET") (./reply (http_driver/response 405 "GET required"))
+    = pieces (http_foot/split 63 request.target)
+      query=str (? (eq pieces.len 2) pieces.at(1) "")
+    ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields query) (./reply (http_driver/response 400 "Invalid query"))
+    ? !(eq fields.len 1) (./reply (http_driver/response 400 "Choose one document path"))
+    = [key value] fields.at(0)
+    ? !(eq key "path") (./reply (http_driver/response 400 "Choose one document path"))
+    ?> (./some target) (browser_routes/value_path value) (./reply (http_driver/response 400 "Invalid path"))
+    | ./after (nenex_editor_http/page target)
+      \ status=nat body=str
+      | http_foot/action/bytes status (http_foot/bar (str/to_atom body)) "text/html; charset=utf-8"
+
+  + source_plan
+    \ fields=row[[str str]] state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ?> (./some target) (browser_routes/value_path (http_foot/field "page" fields)) (./err 'nenex_not_document_content)
+    = input (myth/sing ['src] (pails/t (http_foot/field "src" fields))).put(['epoch] (pails/t (http_foot/field "epoch" fields)))
+    | nenex_edit/source target input state
+  + source_response
+    \ fields=row[[str str]] refused=maybe[pail] state=namespace
+    ^ [nat str]
+    = message=str
+        ?> (./some why) refused ""
+        | http_foot/reason why
+      redirect (str/cat_all ["/nenex?path=" (value_read/percent (http_foot/field "page" fields))])
+    | [(? refused.is_some 409 200) (show (json/obj [(jkv "error" (json/str message)) (jkv "redirect" (json/str redirect))]))]
+  + source_request
+    \ request=http_foot/request now=nat
+    ^ http_foot/action
+    ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
+    ? (gt request.body.len 1048576) (./reply (http_driver/response 413 "Source form too large"))
+    ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields request.body) (./reply (http_driver/response 400 "Invalid form"))
+    ? !(and (eq fields.len 3) (and (eq (row/uniq[str] (fields.map((\ [key value] key)))).len 3) (fields.all((\ [key value] (row/has[str] key ["page" "epoch" "src"])))))) (./reply (http_driver/response 400 "Expected page, epoch and src"))
+    | ./admit (nenex_editor_http/source_plan fields) (nenex_editor_http/source_response fields) (\ ignored state "")

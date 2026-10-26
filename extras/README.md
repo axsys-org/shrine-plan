@@ -13,6 +13,15 @@ x/eden --mount debugger --mount srs --mount codex --check
 x/eden --extras-root /path/to/other/extras --mount explorer
 ```
 
+Eden keeps one native world per node in `$XDG_DATA_HOME/shrine/worlds/` (default
+`~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit directory;
+subsequent launches remember its mount selection. Namespace state, history and
+reachable compiled definitions share the runtime's snapshot root. Commits precede
+write acknowledgments. Restart recreates I/O connections with fresh host
+arguments, without reinstalling application seeds or replaying completed work.
+`--ephemeral` and `--check` use disposable worlds. A world lock prevents two
+launchers from serving the same store concurrently.
+
 `web` owns shared browser routes, page composition and stylesheet.
 `openrouter` supplies the generated client used by Chat; regenerate it with
 `extras/x/generate-openrouter`. `explorer` adds `/ns`.
@@ -53,7 +62,7 @@ legacy declarative source bags; they had no Eden startup entrypoint.
 Mount records and captured sources live under `/<node>/io/fs/<name>`. Definitions
 remain under `/lib` and `/gov`; installed instances remain separate. Rescans
 publish valid candidate outputs atomically and retain the last successful output
-on failure. Activation runs only at startup. Existing instances, HTTP handlers,
+on failure. Application activation runs only when creating the world. Existing instances, HTTP handlers,
 assets and registered drivers remain pinned until explicitly installed or started
 again. No watcher or automatic migration runs.
 
@@ -81,14 +90,36 @@ nix develop path:./extras#debugger --command python3 extras/mounts/debugger/chec
 `extras/x/check-goo` is the production compatibility suite, also run by CI.
 It builds the locked Mash Nix artifact and validates native contracts, prepared
 geometry, and a disposable real Eden instance in Chromium. The application gate
-uses production asset hooks and a test-only panes fixture. `goo-inspector` is the
-only deployed Goo view consumer; SRS and Grove-dev retain domain/development
-behavior without Goo views. See the
+uses production asset hooks and a test-only panes fixture. `goo-inspector`
+provides namespace views; SRS and Grove-dev retain their domain/development
+behavior. See the
 [application integration guide](mounts/explorer/APPLICATION-INTEGRATION.md).
 
 The extras test runner assembles a disposable test fixture tree from core and the
 flat descriptors. That compatibility layout exists only inside the test worker.
 The production bootstrap reads namespace source snapshots through mount mappings.
+
+Mounted checks share `x/fixture_sources.py` for staging. To run one suite and its
+mount contracts, use `extras/x/check --mount flows --suite tests/flows` from the
+repository root. Native work/source/retry behavior belongs to `tests/flows`;
+`flow_ui_tests` checks the forms and rendering that invoke it. Nenex question
+tests use Nenex and cooperative work directly, without a flows test dependency.
+Core Goo runtime checks run in the core gate; mounted Goo text, style and view
+checks run in explorer's `test_goo_v2` suite. Block-document checks cover its
+document operations rather than re-registering those shared Goo cases.
+The component browser check owns rich formatting, undo and draft retention;
+the block-document browser check owns structural editing and exact typed
+save/reload. The filesystem actor check owns cancellation acknowledgements;
+the flow watcher integration covers real file changes, dynamic bindings, late
+read rejection and retained history without repeating flow publication.
+
+Mounted workers stage under core’s `.check/`, avoiding large arenas on `/tmp`
+tmpfs. Successful native workers discard their disposable arenas while retaining
+frozen sources, inputs, logs and results. Failed workers retain their arenas for
+diagnosis;
+the compiler template remains cached. This does not clean existing run directories
+or touch persistent user worlds.
+
 Runners default to core in the parent of `extras/`; `--core-root` or
 `SHRINE_CORE_ROOT` can select another core checkout. `migration.json` records
 the original core paths and their destinations relative to this directory.

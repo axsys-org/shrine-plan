@@ -1,0 +1,188 @@
+- flow_ops
+
+' A bounded documentation importer, producing ordinary Semidoc nodes.
+' Headings, lists, quotations, fenced examples and pipe tables become structure.
+' Imported text never supplies executable Semidoc attributes.
++ flow_markdown
+  + parsed
+    : nodes=row[snode] next=nat
+  + heading
+    \ text=str
+    ^ nat
+    = n (cord/span_while (\ c (eq c 35)) (str/to_atom text) 0)
+    ? ((eq n 0) || (gt n 6)) 0
+    ? ((eq n text.len) || (eq text.at(n) 32)) n
+    0
+  + marker
+    \ text=str
+    ^ nat
+    ? ((eq text.slice(0 2) "- ") || (eq text.slice(0 2) "* ") || (eq text.slice(0 2) "+ ")) 2
+    = n (cord/span_while (\ c (and (ge c 48) (le c 57))) (str/to_atom text) 0)
+    ? ((eq n 0) || (gt n 9)) 0
+    ? ((eq text.slice(n 2) ". ") || (eq text.slice(n 2) ") ")) (add n 2)
+    0
+  + fence
+    \ text=str
+    ^ nat
+    ? !((eq text.at(0) 96) || (eq text.at(0) 126)) 0
+    = n (cord/span_while (\ c (eq c text.at(0))) (str/to_atom text) 0)
+    ? (ge n 3) n
+    0
+  + inline
+    ' Preserve destinations and identifier punctuation. Only matched wrappers
+    ' are removed; unsupported syntax remains readable text.
+    \ text=str
+    ^ str
+    % i=nat 0 out=str ""
+    ^ str
+    ? (ge i text.len) out
+    = ch text.at(i)
+      width (? (eq text.slice(i 2) "**") 2 (? (eq ch 96) 1 0))
+    ? width
+      = token text.slice(i width)
+      ? text.slice((add i width) text.len).find(token)
+       > (./some end)
+        | _ (add (add i (mul width 2)) end) out.cat(text.slice((add i width) end))
+      | _ (add i width) out.cat(token)
+    ? (eq ch 91)
+      ? text.slice(i.inc text.len).find("](")
+       > (./some middle)
+        = start (add i middle).add(3)
+        ? text.slice(start text.len).find(")")
+         > (./some end)
+          = label text.slice(i.inc middle)
+            target text.slice(start end)
+          | _ (add start end).inc out.cat((str/cat_all [label " (" target ")"]))
+        | _ i.inc out.snoc_byte(ch)
+      | _ i.inc out.snoc_byte(ch)
+    | _ i.inc out.snoc_byte(ch)
+  + prose
+    \ text=str
+    ^ snode
+    = plain (flow_markdown/inline text.trim_ascii)
+      node (snode/prose (str/to_atom plain) [])
+    ? !(rune_of (str/to_atom plain)) node
+    ' Rich-text's quoted source envelope keeps rune-looking prose inert.
+    = encoded (rich_hex (show (goo_text/encode (goo/text/en plain))))
+    | snode/prose (str/to_atom plain) [(sattr rich_pred [(sval/word (str/to_atom encoded))])]
+  + cells
+    \ line=str
+    ^ row[str]
+    = text line.trim_ascii
+      text (? (eq text.at(0) 124) text.slice(1 text.len) text)
+      text (? (and text.len (eq text.at(text.len.dec) 124)) text.slice(0 text.len.dec) text)
+    % i=nat 0 code=bool .false escaped=bool .false part=str "" out=row[str] []
+    ^ row[str]
+    ? (eq i text.len) out.snoc(part.trim_ascii)
+    = ch text.at(i)
+    ? escaped (_ i.inc code .false part.snoc_byte(ch) out)
+    ? (and (eq ch 92) (eq text.at(i.inc) 124)) (_ i.inc code .true part out)
+    ? (eq ch 96) (_ i.inc !code .false part.snoc_byte(ch) out)
+    ? (and (eq ch 124) !code) (_ i.inc code .false "" out.snoc(part.trim_ascii))
+    | _ i.inc code .false part.snoc_byte(ch) out
+  + delimiter_cell
+    \ cell=str
+    ^ bool
+    = bytes=row[nat] (row/range 0 cell.len).map((\ i cell.at(i)))
+      dashes=row[nat] bytes.keep((\ ch (eq ch 45)))
+    | and (ge dashes.len 3) (bytes.all((\ ch ((eq ch 45) || (eq ch 58) || (eq ch 32)))))
+  + divider
+    \ line=str
+    ^ bool
+    = cells=row[str] (flow_markdown/cells line)
+    | cells.all(flow_markdown/delimiter_cell)
+  + table
+    \ lines=row[sline] start=nat
+    ^ either[iota flow_markdown/parsed]
+    = headers (flow_markdown/cells (str/from_atom lines.at(start).txt)).map(flow_markdown/inline)
+    % i=nat (add start 2) out=row[snode] []
+    ^ either[iota flow_markdown/parsed]
+    ? (ge i lines.len) (./ok (flow_markdown/parsed out i))
+    = line lines.at(i)
+    ? (line.blank || !(cord/has "|" line.txt)) (./ok (flow_markdown/parsed out i))
+    = cells (flow_markdown/cells (str/from_atom line.txt)).map(flow_markdown/inline)
+    ? !(eq cells.len headers.len) (./err 'flow_markdown_table_shape)
+    = fields=row[snode] (row/range 1 headers.len).map((\ col=nat (snode/item (str/to_atom (str/cat_all [headers.at(col) ": " cells.at(col)])) [] [])))
+    | _ i.inc out.snoc((snode/item (str/to_atom cells.at(0)) [] fields))
+  + literal
+    \ lines=row[sline] start=nat width=nat
+    ^ either[iota flow_markdown/parsed]
+    = opener (str/from_atom lines.at(start).txt)
+      language opener.slice(width opener.len).trim_ascii
+    % i=nat start.inc body=row[nat] []
+    ^ either[iota flow_markdown/parsed]
+    ? (ge i lines.len) (./err 'flow_markdown_unclosed_fence)
+    = line lines.at(i)
+      text (str/from_atom line.txt)
+      closed (flow_markdown/fence text)
+    ? (and (ge closed width) (and (eq text.at(0) opener.at(0)) (eq text.slice(closed text.len).trim_ascii "")))
+      | ./ok (flow_markdown/parsed [(snode/lit (str/to_atom language) [] (joined 10 body))] i.inc)
+    = raw (? line.blank 0 (cord/cat (spaces (sub line.ind lines.at(start).ind)) line.txt))
+    | _ i.inc body.snoc(raw)
+  + boundary
+    \ lines=row[sline] i=nat
+    ^ bool
+    = line lines.at(i)
+      text (str/from_atom line.txt)
+      table (and (lt i.inc lines.len) (and (cord/has "|" line.txt) (flow_markdown/divider (str/from_atom lines.at(i.inc).txt))))
+    | (line.blank || (gt (flow_markdown/heading text) 0) || (gt (flow_markdown/marker text) 0) || (gt (flow_markdown/fence text) 0) || (eq text.slice(0 2) "> ") || table)
+  + paragraph
+    \ lines=row[sline] start=nat indent=nat
+    ^ flow_markdown/parsed
+    % i=nat start parts=row[str] []
+    ^ flow_markdown/parsed
+    ? ((ge i lines.len) || (lt lines.at(i).ind indent) || (and (gt i start) (flow_markdown/boundary lines i)))
+      | flow_markdown/parsed [(flow_markdown/prose (str/join " " parts))] i
+    | _ i.inc parts.snoc((str/from_atom lines.at(i).txt))
+  + blocks
+    \ lines=row[sline] start=nat heading=nat indent=nat depth=nat
+    ^ either[iota flow_markdown/parsed]
+    ? (gt depth 32) (./err 'flow_markdown_depth)
+    % i=nat start out=row[snode] []
+    ^ either[iota flow_markdown/parsed]
+    ? (ge i lines.len) (./ok (flow_markdown/parsed out i))
+    = line lines.at(i)
+      text (str/from_atom line.txt)
+      level (flow_markdown/heading text)
+    ? line.blank (_ i.inc out)
+    ? ((lt line.ind indent) || (and level (le level heading))) (./ok (flow_markdown/parsed out i))
+    ? level
+      < children (flow_markdown/blocks lines i.inc level indent depth.inc)
+      = title (str/to_atom (flow_markdown/inline text.slice(level text.len).trim_ascii))
+      | _ children.next out.snoc((snode/sect title [] children.nodes))
+    = width (flow_markdown/fence text)
+    ? width
+      < literal (flow_markdown/literal lines i width)
+      | _ literal.next out.weld(literal.nodes)
+    ? (and (lt i.inc lines.len) (and (cord/has "|" line.txt) (flow_markdown/divider (str/from_atom lines.at(i.inc).txt))))
+      < table (flow_markdown/table lines i)
+      | _ table.next out.weld(table.nodes)
+    = marker (flow_markdown/marker text)
+    ? marker
+      < children (flow_markdown/blocks lines i.inc heading (add line.ind marker) depth.inc)
+      = lead (flow_markdown/inline text.slice(marker text.len))
+        lead (? (and (ge text.at(0) 48) (le text.at(0) 57)) (str/cat_all [text.slice(0 marker) lead]) lead)
+      | _ children.next out.snoc((snode/item (str/to_atom lead) [] children.nodes))
+    ? (eq text.slice(0 2) "> ")
+      | _ i.inc out.snoc((snode/quote (str/to_atom (flow_markdown/inline text.slice(2 text.len))) [] []))
+    = paragraph (flow_markdown/paragraph lines i indent)
+    | _ paragraph.next out.weld(paragraph.nodes)
+  + parse
+    \ text=str
+    ^ either[iota row[snode]]
+    = lines (lines_of (str/to_atom text))
+    ? (gt lines.len 8192) (./err 'flow_markdown_size)
+    < result (flow_markdown/blocks lines 0 0 0 0)
+    | ./ok result.nodes
+  + slug
+    \ title=nat
+    ^ iota
+    = text (str/from_atom title).ascii_lower
+    % i=nat 0 out=str "" gap=bool .false
+    ^ iota
+    ? ((eq i text.len) || (ge out.len 56)) ($ts (str/cat_all ["section_" (? out.len out "untitled")]))
+    = ch text.at(i)
+    ? ((and (ge ch 97) (le ch 122)) || (and (ge ch 48) (le ch 57)))
+      = out (? (and gap out.len) out.cat("_") out)
+      | _ i.inc out.snoc_byte(ch) .false
+    | _ i.inc out .true

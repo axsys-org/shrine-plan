@@ -1,0 +1,439 @@
+- codex_slots
+- codex_json
+- helm
+
+'  Codex protocol reducer. No I/O: every transition returns wire messages
+'  and namespace writes. The foot alone commits those effects.
+- codex
+
++ codex_ops
+  + object
+    \ fields=row[jkv]
+    ^ json
+    | json/obj fields
+  + get
+    \ key=str value=json
+    ^ json
+    ? value
+     > (./obj fields)
+      % i=nat 0
+      ? (eq i fields.len) jnull
+      = field fields.at(i)
+      ? (equal field.k key) field.v
+      | _ i.inc
+    jnull
+  + text
+    \ value=json
+    ^ str
+    ? value
+     > (./str s) s
+    ""
+  + has
+    \ key=str value=json
+    ^ bool
+    ? value
+     > (./obj fields) fields.any((\ field=jkv (equal field.k key)))
+    .false
+  + put
+    \ key=str value=json obj=json
+    ^ json
+    = fields=row[jkv]
+        ? obj
+         > (./obj xs) xs.filter((\ field=jkv !(equal field.k key)))
+        []
+    | json/obj fields.snoc((jkv key value))
+  + put_object
+    \ value=json
+    ^ json
+    ? value
+     > (./obj _) value
+    | json/obj []
+  + obj
+    ^ json
+    | json/obj []
+  + number
+    \ n=nat
+    ^ json
+    | json/num .false n
+  + record
+    \ kind=str payload=json
+    ^ myth
+    | (myth/new).put(codex_slots/kind (pails/t kind)).put(codex_slots/payload (pails/t (show payload)))
+  + start
+    '  options has thread and turn objects, matching Codex params.
+    \ input=json options=json thread=maybe[str]
+    ^ myth
+    = body (codex_ops/object [(jkv "input" input) (jkv "options" options)])
+      body
+        ? thread
+         > .none body
+         > (./some id) (codex_ops/put "threadId" (json/str id) body)
+    | codex_ops/record "start" body
+  + steer
+    \ thread=str turn=str input=json
+    ^ myth
+    | codex_ops/record "steer"
+      (codex_ops/object [(jkv "threadId" (json/str thread))
+        (jkv "expectedTurnId" (json/str turn)) (jkv "input" input)])
+  + interrupt
+    \ thread=str turn=str
+    ^ myth
+    | codex_ops/record "interrupt"
+      (codex_ops/object [(jkv "threadId" (json/str thread)) (jkv "turnId" (json/str turn))])
+  + event
+    \ sequence=nat command=iota method=str payload=json
+    ^ myth
+    | (codex_ops/record "event" payload).put(codex_slots/sequence (pd sequence)).put(codex_slots/command (pails/q command)).put(codex_slots/method (pails/t method))
+  + request_effect
+    '  Reply by poking reply_result OR reply_error with JSON text.
+    \ id=json method=str params=json
+    ^ myth
+    | (codex_ops/record "request-effect" params).put(codex_slots/request_id (pails/t (show id))).put(codex_slots/method (pails/t method)).put(codex_slots/resolved (pd 0))
+  + config
+    \ port=nat token=str
+    ^ myth
+    | (myth/new).put(codex_slots/port (pd port)).put(codex_slots/token (pails/t token))
+  + completion_key
+    \ thread=str turn=str
+    ^ iota
+    ($ts (str/cat_all ["turn_" (nat/show (str/to_atom thread)) "_" (nat/show (str/to_atom turn))]))
+  + initial
+    ^ codex/state
+    | codex/state .false .false 1 0 [] [] [] [] [] [] []
+  + begin
+    \ state=codex/state
+    ^ codex/batch
+    | codex/batch state [] []
+  + save
+    \ key=iota record=myth b=codex/batch
+    ^ codex/batch
+    | b.set_writes(b.writes.snoc((codex/write key record)))
+  + emit
+    \ command=iota method=str payload=json b=codex/batch
+    ^ codex/batch
+    = seq b.state.sequence
+      key ($ts (str/cat_all ["event_" (nat/show seq)]))
+      b (codex_ops/save key (codex_ops/event seq command method payload) b)
+    | b.set_state(b.state.set_sequence(seq.inc))
+  + wire
+    \ message=json b=codex/batch
+    ^ codex/batch
+    | b.set_wire(b.wire.snoc(message))
+  + request
+    \ command=iota stage=str thread=str body=json method=str params=json b=codex/batch
+    ^ codex/batch
+    = id b.state.next
+      rpc (codex/rpc id command stage thread body)
+      state b.state.set_next(id.inc).set_rpcs(b.state.rpcs.snoc(rpc))
+    | codex_ops/wire (codex_ops/object [(jkv "id" (codex_ops/number id))
+        (jkv "method" (json/str method)) (jkv "params" params)]) b.set_state(state)
+  + boot
+    ^ codex/batch
+    | codex_ops/request 'driver "initialize" "" codex_ops/obj "initialize"
+      (codex_ops/object [(jkv "clientInfo"
+        (codex_ops/object [(jkv "name" (json/str "foil_helm"))
+          (jkv "version" (json/str "0.1.0"))]))
+        (jkv "capabilities" (codex_ops/object [(jkv "experimentalApi" (json/boo .true))]))]) (codex_ops/begin codex_ops/initial)
+  + session_at
+    \ id=str s=codex/state
+    ^ codex/session
+    % i=nat 0
+    ? (eq i s.sessions.len) (codex/session id "" .false .false)
+    = item s.sessions.at(i)
+    ? (equal item.id id) item
+    | _ i.inc
+  + session_put
+    \ session=codex/session b=codex/batch
+    ^ codex/batch
+    = others b.state.sessions.filter((\ item=codex/session !(equal item.id session.id)))
+    | b.set_state(b.state.set_sessions(others.snoc(session)))
+  + finish
+    \ command=iota ok=bool payload=json b=codex/batch
+    ^ codex/batch
+    = record (myth/new).put(codex_slots/done (pd 1)).put(codex_slots/ok (pd ok)).put(codex_slots/result (pails/t (show payload)))
+      b (codex_ops/save command record b)
+    | codex_ops/emit command (? ok "result" "error") payload b
+  + error
+    \ command=iota reason=str b=codex/batch
+    ^ codex/batch
+    | codex_ops/finish command .false
+      (codex_ops/object [(jkv "message" (json/str reason))]) b
+  + fail_rpc
+    \ out=codex/batch rpc=codex/rpc
+    ^ codex/batch
+    ? (equal rpc.stage "initialize") out
+    | codex_ops/error rpc.command "connection lost; outcome unresolved" out
+  + fail_effect
+    \ out=codex/batch effect=codex/effect
+    ^ codex/batch
+    | codex_ops/save effect.key ((myth/new).put(codex_slots/resolved (pd 1)).put(codex_slots/unresolved (pd 1))) out
+  + resolve_effect
+    \ id=json out=codex/batch effect=codex/effect
+    ^ codex/batch
+    ? !(equal id effect.id) out
+    | codex_ops/save effect.key ((myth/new).put(codex_slots/resolved (pd 1))) out
+  + fail
+    \ reason=str b=codex/batch
+    ^ codex/batch
+    ? b.state.dead b
+    = b (codex_ops/emit 'driver "driver/error" (json/str reason) b)
+      b b.state.rpcs.fold(b codex_ops/fail_rpc)
+      b b.state.effects.fold(b codex_ops/fail_effect)
+      b b.state.sessions.fold(b codex_ops/fail_turn)
+    | b.set_state(b.state.set_dead(.true).set_ready(.false).set_rpcs([]).set_effects([]))
+  + fail_turn
+    \ out=codex/batch session=codex/session
+    ^ codex/batch
+    ? !(session.turn.len) out
+    | codex_ops/save (codex_ops/completion_key session.id session.turn)
+      (myth/sing codex_slots/result (codex/completion session.id session.turn "unresolved" "")) out
+  + command
+    \ key=iota kind=str body=json b=codex/batch
+    ^ codex/batch
+    ? b.state.dead (codex_ops/error key "driver disconnected; outcome unresolved" b)
+    = thread (codex_ops/text (codex_ops/get "threadId" body))
+      session (codex_ops/session_at thread b.state)
+    ? (equal kind "start")
+      ? session.busy (codex_ops/error key "thread already has an active or pending turn" b)
+      = options (codex_ops/get "options" body)
+        thread_options (codex_ops/put_object (codex_ops/get "thread" options))
+        b
+          ? (eq thread.len 0) b
+          | codex_ops/session_put session.set_busy(.true) b
+      ? session.loaded
+        | codex_ops/turn key thread body b
+      | codex_ops/request key "thread" thread body
+        (? (eq thread.len 0) "thread/start" "thread/resume")
+        (? (eq thread.len 0) thread_options (codex_ops/put "threadId" (json/str thread) thread_options)) b
+    = expected
+        | codex_ops/text (codex_ops/get (? (equal kind "steer") "expectedTurnId" "turnId") body)
+    ? ((eq expected.len 0) || !(equal expected session.turn))
+      | codex_ops/error key "no matching active turn" b
+    | codex_ops/request key kind thread body (str/cat_all ["turn/" kind]) body b
+  + turn
+    \ key=iota thread=str body=json b=codex/batch
+    ^ codex/batch
+    = options (codex_ops/get "turn" (codex_ops/get "options" body))
+      params (codex_ops/put "threadId" (json/str thread)
+        (codex_ops/put "input" (codex_ops/get "input" body) options))
+      b (codex_ops/session_put (codex/session thread "" .true .true) b)
+      quiet b.state.quiet.keep((\ id=str !(equal id thread)))
+      quiet (? (equal[json] (codex_ops/get "retainDeltas" (codex_ops/get "options" body)) (json/boo .false)) quiet.snoc(thread) quiet)
+      b b.set_state(b.state.set_quiet(quiet))
+    | codex_ops/request key "turn" thread body "turn/start" params b
+  + bad_response
+    \ rpc=codex/rpc reason=str b=codex/batch
+    ^ codex/batch
+    | codex_ops/fail reason b.set_state(b.state.set_rpcs(b.state.rpcs.snoc(rpc)))
+  + response
+    \ rpc=codex/rpc message=json b=codex/batch
+    ^ codex/batch
+    = result (codex_ops/get "result" message)
+    ? (codex_ops/has "error" message)
+      ? (equal rpc.stage "initialize") (codex_ops/fail "initialize failed" b)
+      = b
+          ? ((equal rpc.stage "thread") || (equal rpc.stage "turn"))
+            | codex_ops/session_put (codex_ops/session_at rpc.thread b.state).set_turn("").set_busy(.false) b
+          b
+      | codex_ops/finish rpc.command .false (codex_ops/get "error" message) b
+    ? (equal rpc.stage "initialize")
+      | codex_ops/wire (codex_ops/object [(jkv "method" (json/str "initialized"))
+          (jkv "params" codex_ops/obj)]) b.set_state(b.state.set_ready(.true))
+    ? (equal rpc.stage "thread")
+      = thread (codex_ops/text (codex_ops/get "id" (codex_ops/get "thread" result)))
+      ? (eq thread.len 0) (codex_ops/bad_response rpc "thread response missing id" b)
+      | codex_ops/turn rpc.command thread rpc.body b
+    = b
+        ? (equal rpc.stage "turn")
+          = turn (codex_ops/text (codex_ops/get "id" (codex_ops/get "turn" result)))
+          ? (eq turn.len 0) (codex_ops/bad_response rpc "turn response missing id" b)
+          ? b.state.ended.any((\ ended=str (equal ended (path_show [(codex_ops/completion_key rpc.thread turn)]))))
+            | codex_ops/session_put (codex/session rpc.thread "" .false .true) b
+          | codex_ops/session_put (codex/session rpc.thread turn .true .true) b
+        b
+    ? b.state.dead b
+    | codex_ops/finish rpc.command .true
+      (codex_ops/put "threadId" (json/str rpc.thread) result) b
+  + turn_effect
+    \ thread=str turn=str effect=codex/effect
+    ^ bool
+    ? !(equal effect.thread thread) .false
+    | equal effect.turn turn
+  + clear_turn_effect
+    \ thread=str turn=str out=codex/batch effect=codex/effect
+    ^ codex/batch
+    ? !(codex_ops/turn_effect thread turn effect) out
+    | codex_ops/save effect.key ((myth/new).put(codex_slots/resolved (pd 1))) out
+  + notification
+    \ method=str params=json b=codex/batch
+    ^ codex/batch
+    = thread (codex_ops/text (codex_ops/get "threadId" params))
+      turn (codex_ops/text (codex_ops/get "id" (codex_ops/get "turn" params)))
+      b
+        ? (equal method "item/completed")
+          = item (codex_ops/get "item" params)
+            turn (codex_ops/text (codex_ops/get "turnId" params))
+          ? !(and (equal (codex_ops/text (codex_ops/get "type" item)) "agentMessage") (gt turn.len 0)) b
+          ? (equal (codex_ops/text (codex_ops/get "phase" item)) "commentary") b
+          = others b.state.answers.keep((\ answer=codex/completion !(and (equal answer.thread thread) (equal answer.turn turn))))
+          | b.set_state(b.state.set_answers(others.snoc((codex/completion thread turn "running" (codex_ops/text (codex_ops/get "text" item))))))
+        ? (equal method "turn/started")
+          | codex_ops/session_put (codex/session thread turn .true .true) b
+        ? (equal method "turn/completed")
+          = key (codex_ops/completion_key thread turn)
+          ? b.state.ended.any((\ ended=str (equal[str] ended (path_show [key])))) b
+          = answers=row[codex/completion] b.state.answers.keep((\ answer=codex/completion (and (equal answer.thread thread) (equal answer.turn turn))))
+            message=str
+              ? !(answers.len) ""
+              = answer=codex/completion answers.at(0)
+              answer.text
+            status (codex_ops/text (codex_ops/get "status" (codex_ops/get "turn" params)))
+            result (codex/completion thread turn status message)
+            b (codex_ops/save key (myth/sing codex_slots/result result) b)
+            session (codex_ops/session_at thread b.state)
+            b
+              ? (equal session.turn turn)
+                | codex_ops/session_put session.set_turn("").set_busy(.false) b
+              b
+          = effects b.state.effects
+            b effects.fold(b (codex_ops/clear_turn_effect thread turn))
+          | b.set_state(b.state.set_ended(b.state.ended.snoc((path_show [key]))).set_answers(b.state.answers.keep((\ answer=codex/completion !(and (equal answer.thread thread) (equal answer.turn turn))))).set_effects(effects.filter((\ effect=codex/effect !(codex_ops/turn_effect thread turn effect)))))
+        b
+      b
+        ? (equal method "serverRequest/resolved")
+          = id (codex_ops/get "requestId" params)
+            effects b.state.effects
+            b effects.fold(b (codex_ops/resolve_effect id))
+          | b.set_state(b.state.set_effects(effects.filter((\ effect=codex/effect !(equal id effect.id)))))
+        b
+    ' Background work consumes complete messages. Avoid creating a namespace
+    ' transaction for every token while keeping the interactive console stream.
+    ? (and (b.state.quiet.has(thread)) (codex_ops/delta method)) b
+    | codex_ops/emit 'driver method params b
+  + delta
+    \ method=str
+    ^ bool
+    | row/has[str] method ["item/agentMessage/delta" "item/reasoning/textDelta" "item/reasoning/summaryTextDelta"]
+  + id_ok
+    \ id=json
+    ^ bool
+    ? id
+     > (./str _) .true
+     > (./num _ _) .true
+    .false
+  + incoming
+    \ message=json b=codex/batch
+    ^ codex/batch
+    ? b.state.dead b
+    = id (codex_ops/get "id" message)
+      method (codex_ops/text (codex_ops/get "method" message))
+      params (codex_ops/get "params" message)
+    ? (codex_ops/has "id" message)
+      ? !(codex_ops/id_ok id) (codex_ops/fail "invalid RPC id" b)
+      | codex_ops/dispatch message id method params b
+    | codex_ops/dispatch message id method params b
+  + dispatch
+    \ message=json id=json method=str params=json b=codex/batch
+    ^ codex/batch
+    ? (codex_ops/has "method" message)
+      ? (eq method.len 0) (codex_ops/fail "invalid RPC method" b)
+      | codex_ops/method message id method params b
+    | codex_ops/result message id b
+  + method
+    \ message=json id=json method=str params=json b=codex/batch
+    ^ codex/batch
+    ? ((codex_ops/has "result" message) || (codex_ops/has "error" message))
+      | codex_ops/fail "method envelope contains a response" b
+    | codex_ops/server_message message id method params b
+  + server_message
+    \ message=json id=json method=str params=json b=codex/batch
+    ^ codex/batch
+    ? (gt method.len 0)
+      ? !(codex_ops/has "id" message) (codex_ops/notification method params b)
+      ? b.state.effects.any((\ effect=codex/effect (equal effect.id id)))
+        | codex_ops/fail "duplicate server request id" b
+      = seq b.state.sequence
+        key ($ts (str/cat_all ["effect_" (nat/show seq)]))
+        effect (codex/effect key id (codex_ops/text (codex_ops/get "threadId" params)) (codex_ops/text (codex_ops/get "turnId" params)))
+        b (codex_ops/save key (codex_ops/request_effect id method params).put(codex_slots/sequence (pd seq)) b)
+      | b.set_state(b.state.set_sequence(seq.inc).set_effects(b.state.effects.snoc(effect)))
+    | codex_ops/result message id b
+  + result
+    \ message=json id=json b=codex/batch
+    ^ codex/batch
+    ? !(codex_ops/has "id" message) (codex_ops/fail "invalid RPC envelope" b)
+    = matches b.state.rpcs.filter((\ rpc=codex/rpc (equal id (codex_ops/number rpc.id))))
+    ? (eq matches.len 0) (codex_ops/fail "unknown RPC response id" b)
+    ? (equal (codex_ops/has "result" message) (codex_ops/has "error" message))
+      | codex_ops/fail "response must have exactly one result or error" b
+    = state b.state.set_rpcs(b.state.rpcs.filter((\ rpc=codex/rpc !(equal id (codex_ops/number rpc.id)))))
+    | codex_ops/response matches.at(0) message b.set_state(state)
+  + consume
+    \ key=iota record=myth b=codex/batch
+    ^ codex/batch
+    = kind record.txt_at(codex_slots/kind)
+    ? ((equal kind "start") || (equal kind "steer") || (equal kind "interrupt"))
+      ? b.state.seen.any((\ seen=iota (equal seen key))) b
+      ? (record.nat_at(codex_slots/done 0)) b
+      ? !(b.state.ready || b.state.dead) b
+      = b b.set_state(b.state.set_seen(b.state.seen.snoc(key)))
+      ? (codex_json/decode record.txt_at(codex_slots/payload))
+       > (./err why offset) (codex_ops/error key why b)
+       > (./ok payload rest) (codex_ops/command key kind payload b)
+    ? !(equal kind "request-effect") b
+    = matches b.state.effects.filter((\ effect=codex/effect (equal effect.key key)))
+    ? (eq matches.len 0) b
+    = success record.has_at(codex_slots/reply_result)
+      failure record.has_at(codex_slots/reply_error)
+    ? !(success || failure) b
+    ? (? success failure .false) (codex_ops/fail "effect reply has both result and error" b)
+    = effect matches.at(0)
+    ? (codex_json/decode record.txt_at((? success codex_slots/reply_result codex_slots/reply_error)))
+     > (./err why rest) (codex_ops/fail "invalid effect reply JSON" b)
+     > (./ok result rest)
+      = b (codex_ops/wire (codex_ops/object [(jkv "id" effect.id)
+            (jkv (? success "result" "error") result)]) b)
+        b (codex_ops/save key ((myth/new).put(codex_slots/resolved (pd 1))) b)
+      | b.set_state(b.state.set_effects(b.state.effects.filter((\ item=codex/effect !(equal item.key key)))))
+  + scan_one
+    \ out=codex/batch entry=[path saga]
+    ^ codex/batch
+    = [pax version] entry
+    ? !(eq pax.len 1) out
+    | codex_ops/consume pax.at(0) (unpin version.myth) out
+  + scan
+    \ binding=axal[saga] b=codex/batch
+    ^ codex/batch
+    | binding.tap.fold b codex_ops/scan_one
+  + sequence_floor
+    \ floor=nat entry=[path saga]
+    ^ nat
+    = [pax version] entry
+      record (unpin version.myth)
+      kind record.txt_at(codex_slots/kind)
+    ? !((equal kind "event") || (equal kind "request-effect")) floor
+    = next record.nat_at(codex_slots/sequence 0).inc
+    ? (gt next floor) next
+    floor
+  + stale_one
+    \ b=codex/batch entry=[path saga]
+    ^ codex/batch
+    = [pax version] entry
+    ? !(eq pax.len 1) b
+    = key pax.at(0)
+      record (unpin version.myth)
+      kind record.txt_at(codex_slots/kind)
+    ? ((equal kind "start") || (equal kind "steer") || (equal kind "interrupt"))
+      = b b.set_state(b.state.set_seen(b.state.seen.snoc(key)))
+      ? record.nat_at(codex_slots/done 0) b
+      | codex_ops/error key "previous connection ended; command not replayed" b
+    ? !(equal kind "request-effect") b
+    ? record.nat_at(codex_slots/resolved 0) b
+    | codex_ops/save key ((myth/new).put(codex_slots/resolved (pd 1)).put(codex_slots/unresolved (pd 1))) b
+  + stale
+    '  Pre-existing work is never replayed when a new foot is registered.
+    \ binding=axal[saga] b=codex/batch
+    ^ codex/batch
+    = floor (row/fold[[path saga] nat] 0 codex_ops/sequence_floor binding.tap)
+      b b.set_state(b.state.set_sequence(floor))
+    | binding.tap.fold b codex_ops/stale_one
