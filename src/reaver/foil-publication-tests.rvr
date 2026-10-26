@@ -361,3 +361,53 @@ assert(Eq 1 (any (matches empty-brand) sum-contract))
 assert(Eq 1 (any (matches value) sum-contract))
 assert(Eq 0 (any (matches
   (driver:get-perc ["value"] (Unpin (_1 (_0 (_2 revised)))))) sum-contract))
+
+
+;; Invoked only by the disposable native restart test. Ordinary suite loading
+;; does not save a continuation or alter its compiler-test arena's root.
+(#bind world (#module eden-world))
+(define (checkpoint-test phase)
+  (define prior (_1 pin-products))
+  (define saved (_0 pin-second))
+  (define retained (Pin saved))
+  (define old-model (Unpin (_1 (_0 (_2 prior)))))
+  (define paths (map _0 (pub:definition-records prior)))
+  (define queries (map (lambda (care)
+    [(driver:get-perc ["sov" (strcat [care "_case"])] policy)
+     (driver:get-perc ["sov" (strcat [care "_query"])] policy)]) ["x" "y" "z"]))
+  (define observations
+    (foldl (lambda (out pair)
+      (foldl (lambda (out path)
+        (define last ((_0 pair) path saved))
+        (Weld out (gen (If last (_0 last) 0) (lambda (i)
+          [(_1 pair) (Inc i) path ((_1 pair) (Inc i) path saved)]))))
+        out paths)) [] queries))
+  (define (intact state)
+    (all (lambda (entry)
+      (Equal (Ix 3 entry) ((_0 entry) (_1 entry) (_2 entry) state))) observations))
+  (define (serve commit state args)
+    (If (Equal (_0 args) "initial")
+      ;; The real service consumes its saved state before accepting requests.
+      ;; Force it here too: otherwise lazy evaluation never runs the Save.
+      (Seq state (Seq (print (strcat ["PUBLICATION-CHECKPOINT-READY:" (showNat (Now 0))])) (Sleep 3600)))
+      (let ()
+        (assert-impl "restart retains the complete sovereign graph" (Equal state (Unpin retained)))
+        (assert-impl "restart retains every sampled x/y/z case" (intact state))
+        (define imports (source:pinned-imports ["model"] (_2 (_0 pin-products))))
+        (define next (pub:compile (pub:prepare native-selection (Pin "compiler")
+          (pin-read 3) [["model" root] ["consumer" app]] imports
+          (lambda (path)
+            (define found (cases (map (lambda (part) ((_0 part) (_1 part))) path) state))
+            (If found (_0 found) 0))) driver:empty-foil-cache))
+        (define model (Unpin (_1 (_0 (_2 next)))))
+        (assert-impl "republish after restart accepts retained typed values"
+          (Eq 1 ((driver:get-perc ["accepts"] model) (driver:get-perc ["value"] old-model))))
+        (assert-impl "old compiled behavior remains captured" (Eq 2 (driver:get-perc ["helper"] old-model)))
+        (assert-impl "new compilation uses revised behavior" (Eq 3 (driver:get-perc ["helper"] model)))
+        (define published (pub:publish policy slot ("x" 7) next 0 0 state))
+        (assert-impl "native publication succeeds after restart" (Equal "ok" (Hd published)))
+        (assert-impl "republication preserves every earlier x/y/z case" (intact (_0 published)))
+        (Seq (commit (_0 published))
+          (Seq (print (strcat ["PUBLICATION-RESTART-PASS:" (showNat (Now 0))])) (Sleep 3600))))))
+  (world:run serve saved ["none" phase]))
+(#export checkpoint-test)

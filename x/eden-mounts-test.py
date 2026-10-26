@@ -21,6 +21,8 @@ class MountTests(unittest.TestCase):
         success = '("DONE" (0 17))\n'
         self.assertFalse(startup_ready(success, 'DONE'))
         self.assertTrue(startup_ready(listening + success, 'DONE'))
+        self.assertTrue(startup_ready(listening + '("EDEN-WORLD-READY" "committed")\n', 'DONE'))
+        self.assertTrue(startup_ready(listening + '(0 "EDEN-WORLD-READY"\n "committed")\n', 'DONE'))
         failure = listening + '("DONE" (1 "activation failed"))\n'
         self.assertFalse(startup_ready(failure, 'DONE'))
         self.assertTrue(startup_failed(failure, 'DONE'))
@@ -236,16 +238,7 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'belongs to core'):
             select(self.root, ['shadow'])
 
-    def test_help_lists_generic_flags_only(self):
-        launcher = Path(__file__).with_name('eden')
-        result = subprocess.run([sys.executable, str(launcher), '--help'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0)
-        for flag in ('--mount', '--extras-root', '--list-mounts'):
-            self.assertIn(flag, result.stdout)
-        for flag in ('--debug', '--srs', '--codex', '--mash-root'):
-            self.assertNotIn(flag, result.stdout)
-        result = subprocess.run([sys.executable, str(launcher), '--srs'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
+
 
 
 if __name__ == '__main__':

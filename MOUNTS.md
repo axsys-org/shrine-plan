@@ -14,6 +14,45 @@ x/eden --mount debugger --mount srs
 x/eden --extras-root ../shrine-extras --mount explorer --mount codex
 ```
 
+Eden restores one native world per node from `$XDG_DATA_HOME/shrine/worlds/`
+(default `~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit
+directory; the mount selection and source workspace are remembered there.
+`--workspace PATH` selects the source workspace used by host captures.
+The namespace, history, cells and executable definitions are committed together
+through native `Save` before a write is acknowledged. Restarts reconnect I/O
+services before rescanning evidence; they do not reinstall application seeds or
+replay completed work. `--ephemeral` and `--check` use disposable worlds.
+
+The world uses the native runtime selected by `flake.lock`. Native `Save` and
+reconnection establish persistence independently of arena-sharing optimizations
+or compaction. This stack does not change the runtime's arena format or install
+prototype storage-maintenance patches. Checkpoint space reclamation remains a
+separate runtime concern; pinning contracts does not solve checkpoint growth.
+
+An existing arena written by the layout-2 sharing prototype still requires a
+layout-2-compatible runtime. Removing that patch from this stack does not downgrade
+or convert the arena, and an older upstream runtime cannot reopen it. Keep the
+compatible runtime for such a world; independent review of storage optimization
+does not remove this existing format dependency.
+
+A saved world resumes its captured service and compiler. Editing repository
+sources does not alter that saved program, and restarting does not load a new
+core runtime. Bootstrap closure patching and the `--upgrade` path are removed.
+Publication updates namespace definitions and explicit behavior registrations;
+it does not replace the captured service. There is no replacement-service API
+or launcher handoff. A running world's compiler, transport and persistence
+changes cannot be activated by pretending they are mount publications.
+
+The existing publication path has narrower, useful boundaries:
+
+| Change | Existing update path | What stays captured |
+| --- | --- | --- |
+| Mounted Foil modules and Grove definitions | Explicit source scan compiles against selected pinned dependencies and publishes through the native store | Earlier artifacts, typed values and their x/y/z cases |
+| Installed hands, forms and operations | An application's native code-refresh operation rebinds its declared behavior records | Existing flow definitions and attempts keep their chosen laws |
+| HTTP route handlers and post-start hooks | Restart resolves them from the saved mount images under the captured mount contracts | Core HTTP transport, supervisor and compiler closures |
+| A source dependency with no local file change | Publish the dependency, then invalidate the consumer's source-snapshot cache and rescan it | Imports remain explicit; no automatic relinking of existing code |
+| Core Reaver compiler, publication policy, supervisor or persistence code | Validate in disposable worlds built from the changed sources | Existing saved worlds continue running their captured implementations |
+
 Native publication appends new definitions; it does not rewrite historical laws
 or infer type identity from unchanged declarations. A mount can list owned
 `pinned_modules` in its descriptor. First publication compiles missing artifacts;
@@ -24,6 +63,18 @@ new explicitly selected module/version and handle compatibility at activation.
 
 The mount descriptor and compiler belong to the saved service. These changes
 govern newly compiled services, not an automatic upgrade of a running saved world.
+
+Startup first computes reconnect and draft reconciliation, constructs and
+validates routes, and resolves provider and foot entrypoints. These pure
+preparations must finish before checkpointing the candidate or spawning the
+supervisor. A preparation failure on restart leaves the prior native root
+unchanged. The supervisor adopts the graph returned by that checkpoint. Providers then reconnect through ordinary supervisor messages,
+followed by filesystem and HTTP foot registration. This is not a transaction
+over external I/O: a provider/listener failure after checkpointing retains the
+checkpoint and any acknowledged provider writes. Retry reconnects that state;
+it must not roll back already acknowledged work. A first boot retains its
+initial native continuation before serving, so interrupted initialization is
+recoverable through the same saved program.
 
 Native command admission uses one budget of 128 reaction rounds after the
 submitted event. Supervisor writes, guarded operations and Grove installation

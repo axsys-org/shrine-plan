@@ -1,0 +1,71 @@
+;;;; The world's root is a runnable native continuation, not an application
+;;;; export. Save retains namespace history, typed values and reachable laws.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind optimizer (#module plangrm))
+
+(define (install tier)
+  (cond
+    ((Equal tier "none") 0)
+    ((Equal tier "P1") (Install optimizer:compileP1))
+    ((Equal tier "P2") (Install optimizer:compileP2))
+    ((Equal tier "P3") (Install optimizer:compileP3))
+    ((Equal tier "P4") (Install optimizer:compileP4))
+    ((Equal tier "P5") (Install optimizer:compileP5))
+    ((Equal tier "P6") (Install optimizer:compileP6))
+    (else (error "Invalid Eden compiler tier"))))
+
+(define (arguments tier port scan-port scan-token specs)
+  (Weld [tier (showNat port) (showNat scan-port) scan-token]
+    (foldl Weld [] (map (lambda (spec)
+      (Weld [(showNat (Sz (Ix 8 spec)))] (Ix 8 spec))) specs))))
+
+(define (session args specs)
+  (If (Lt (Sz args) 3) (error "Missing Eden runtime arguments") 0)
+  (define (hooks remaining pending out)
+    (Ifz (Sz pending)
+      (Ifz (Sz remaining) out (error "Unexpected Eden runtime arguments"))
+      (let ((count (parse-nat (_0 remaining))))
+        (If (Lt (Sz remaining) (Inc count))
+          (error "Missing Eden mount arguments")
+          (hooks (drop (Inc count) remaining) (drop 1 pending)
+            (snoc (take count (drop 1 remaining)) out))))))
+  [(parse-nat (_0 args)) (parse-nat (_1 args)) (_2 args)
+   (hooks (drop 3 args) specs [])])
+
+(define (park ignored)
+  ;; A mailbox may already contain messages. Drain transferred capabilities
+  ;; without acknowledging more work; a single Recv is not a suspension.
+  (define received (Recv 0))
+  (Seq (foldl (lambda (ignored cap) (CloseHandle cap)) 0 (_1 received))
+    (park 0)))
+
+(define (prepare commit serve state)
+  (define service (If (IsPin serve) serve (Pin serve)))
+  (define retained (Pin state))
+  (define (resume commit service retained args)
+    ;; No actor handles are captured. Each restart supplies fresh I/O services.
+    (install (_0 args))
+    (Seq ((Unpin service) (commit service) (Unpin retained) (drop 1 args))
+      (park 0)))
+  ;; The service closes over the compiler and publication context. Retain one
+  ;; pin across checkpoints, rather than copying its unchanged graph each time.
+  [(Pin (resume commit service retained)) retained])
+
+(define (save serve state)
+  (define prepared (prepare save serve state))
+  ;; Save forwards retained to the native namespace. Return that exact graph
+  ;; to the supervisor so its next update can reuse unchanged native nodes.
+  (Seq (Save (_0 prepared)) (Unpin (_1 prepared))))
+
+(define (run serve state args)
+  (define service (Pin serve))
+  (define stored (save service state))
+  (install (_0 args))
+  ;; Keep the REPL from overwriting the world root after the launch form.
+  ((Unpin service) (save service) stored (drop 1 args))
+  (park 0))
+
+(#export arguments session prepare save run)

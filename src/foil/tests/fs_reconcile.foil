@@ -1,9 +1,22 @@
 - fs_sync
+- fs_sync_foot
 - helm
 - tests/namespace [at=fixture]
 - testing
 
 + fs_reconcile_tests
+  + failed_reader
+    \ root=str
+    ^ either[str row[fs_read/file]]
+    ; (Throw root)
+    | ./err root
+  + watch_capture
+    \ ignored=unit
+    ^ row[testing/check]
+    = good (fs_foot/capture (\ root=str (either/ok[str row[fs_read/file]] [(fs_read/file "a" 353)])) "fixture")
+      bad (fs_foot/capture fs_reconcile_tests/failed_reader "fixture")
+    [(testing/nat "watch capture preserves exact file bytes" 1 (equal good (either/ok[str row[fs_read/file]] [(fs_read/file "a" 353)])))
+     (testing/nat "watch capture contains external reader failure" 1 (either/is_err bad))]
   + home
     ^ path
     [($x 1) 'io 'fs ($ta "main")]
@@ -139,8 +152,76 @@
        (equal (%/record %/home fresh) (%/record %/home wrong)))
      (testing/nat "system publication unchanged" 1
        (equal initial.system second.system))]
+  + counted_reader
+    \ root=str
+    ^ either[str row[fs_read/file]]
+    = ;before (ReadFile "foil/tests/fs-watch-reads")
+    ; (WriteFile "foil/tests/fs-watch-reads" before.inc)
+    | ./ok []
+  + await_stop
+    \ ignored=unit
+    ^ bool
+    = ;[event caps] (Recv[fs_foot/task] 0)
+    ; (helm/supervisor/close_caps caps)
+    ? event
+     > stopped=fs_foot/stopped .true
+     > ready=fs_foot/ready (fs_reconcile_tests/await_stop unit)
+    .false
+  + cancelled_actor
+    \ ignored=unit
+    ^ row[testing/check]
+    ; (WriteFile "foil/tests/fs-watch-reads" 256)
+    = ;worker (Spawn (fs_foot/watch fs_reconcile_tests/counted_reader 'probe 1 1))
+    ; (SendCaps worker 0 [0])
+    = ;[ready caps] (Recv[fs_foot/task] 0)
+      config (fs/cfg "fixture" [($x 1) 'sources] (fs/extensions (mop/empty)) [($x 1) 'kook 'fs])
+      state (%/step %/home (writ/make config.del(limb_slot)) fixture/namespace_tests/initial)
+    ?> (./known tree) (state.page(.x .none %/home)) [(testing/nat "cancellation fixture has a filesystem config" 1 0)]
+    ; (Send worker tree.fil)
+    = ;[sample caps] (Recv[fs_foot/task] 0)
+      ;before (ReadFile "foil/tests/fs-watch-reads")
+      stop=maybe[saga] .none
+    ; (Send worker stop)
+    = ;stopped (fs_reconcile_tests/await_stop unit)
+    = ;after (ReadFile "foil/tests/fs-watch-reads")
+    ; (CloseHandle worker)
+    [(testing/nat "watcher performed its one permitted read" 257 before)
+     (testing/nat "sleeping watcher consumes cancellation and acknowledges exit" 1 stopped)
+     (testing/nat "terminated watcher performs no subsequent reads" before after)]
+  + bytes
+    \ record=myth
+    ^ nat
+    | record.nat_at bond/content 0
+  + guarded_watch
+    \ ignored=unit
+    ^ row[testing/check]
+    = hand=path [($x 1) 'kook 'fs]
+      initial (%/step hand (writ/make (myth/sing bond/form fs/form)) fixture/namespace_tests/initial)
+      config (fs/cfg "desk" [($x 1) 'sources] (fs/extensions (mop/empty)) hand).put(['fs 'watch_seconds] (pails/n 5))
+      initial (%/step [($x 1) 'io 'fs] (writ/make myth/new) initial)
+      ready (%/step %/home (writ/make config) initial)
+    ?> (./known tree) (ready.page(.y .none [($x 1) 'io 'fs])) [(testing/nat "watch fixture has filesystem children" 1 0)]
+    ?> (./some expected) tree.get([($ta "main")]) [(testing/nat "watch fixture has a main config" 1 0)]
+    = plan (fs_foot/plan ($ta "main") expected (./ok [(fs_read/file "a" 353)]))
+      [captured index reply] (helm/supervisor/admit plan ready (sovereign_hive ready))
+      paused (%/step %/home (writ/poke (myth/sing ['fs 'watch_active] (pails/b .false))) ready)
+      resumed (%/step %/home (writ/poke (myth/sing ['fs 'watch_active] (pails/b .true))) paused)
+      rebound (%/step %/home (writ/poke (myth/sing bond/from (pails/t "elsewhere"))) captured)
+      [late index reply] (helm/supervisor/admit plan resumed (sovereign_hive resumed))
+      report (%/record %/home captured).get(bond/res).then(fs/report/try_from_pail)
+    [(testing/nat "watch admits request and completion in one native event" 353 (%/bytes (%/record [($x 1) 'sources ($ta "a")] captured)))
+     (testing/nat "watch completion retains report" 1 report.is_some)
+     (testing/nat "watch completion clears pending" 0 (fs_foot/get_pending (%/record %/home captured)))
+     (testing/nat "last detach disables watch" 0 (fs/watch_enabled (%/record %/home paused)))
+     (testing/nat "detach invalidates outstanding epoch" 1 (gt (fs_foot/get_epoch (%/record %/home paused)) (fs_foot/get_epoch config)))
+     (testing/nat "late result cannot publish after detach and reattach" 1 (equal[namespace] resumed late))
+     (testing/nat "rebind invalidates prior report epoch" 1 (gt (fs_foot/get_epoch (%/record %/home rebound)) report.run(fs/report/epoch).fall(0)))
+     (testing/nat "rebind retains captured bytes" 353 (%/bytes (%/record [($x 1) 'sources ($ta "a")] rebound)))]
 
 + tests
   ^ row[testing/case]
-  [(testing/case "filesystem reconciliation"
-     fs_reconcile_tests/checks)]
+  [(testing/case "watcher cancellation protocol" fs_reconcile_tests/cancelled_actor)
+   (testing/case "guarded dynamic filesystem watch" fs_reconcile_tests/guarded_watch)
+   (testing/case "filesystem reconciliation"
+     fs_reconcile_tests/checks)
+   (testing/case "filesystem watch capture" fs_reconcile_tests/watch_capture)]

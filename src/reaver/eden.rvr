@@ -14,6 +14,7 @@
 (#bind abi (#module foil-abi))
 (#bind documentation (#module goo-documentation-bridge))
 (#bind value-editor (#module goo-value-bridge))
+(#bind world (#module eden-world))
 
 (define (module images name)
   (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
@@ -31,9 +32,9 @@
 ;; post-start hook, hook arguments, inspection-provider flag, dependencies,
 ;; required assets, route claims, declarative-workspace flag, pinned modules.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token)
+(define (mounted self system resolve slot port specs scan-port scan-token tier)
   (define local (bootstrap:build-local self system resolve slot
-    ["eden" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
+    ["eden" "eden_store" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
   (define core-code (_1 local))
   (define core-images
     (merge-images (bootstrap:system-images system)
@@ -203,16 +204,24 @@
         (value-editor:compiler policy) documented))))
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
+  (define (serve commit saved runtime-args)
+  (define session (world:session runtime-args specs))
+  ;; Prepare against the retained world without checkpointing a partial start.
+  ;; Route construction and draft reconciliation may fail. Resolve all hook
+  ;; entrypoints before committing or giving an actor the candidate namespace.
+  (define reconnected ((driver:get-perc ["eden_store" "reconnect"] (module core-images "eden_store")) (_0 session) saved))
+  (define state ((draft-tool "reconcile") draft-ports reconnected))
+  (define reader ((tool ["fs_read" "remote"]) (_1 session) (_2 session)))
   (define config
     (foldl (lambda (config spec)
       (Ifz (Or (Sz (_6 spec)) (Ix 13 spec)) config
         (let* ((manual (If (Sz (_6 spec))
-                        ((hook installed spec 6)
-                          ((tool ["source_mount" "snapshot"]) (home self spec) installed)
-                          installed) empty))
+                        ((hook state spec 6)
+                          ((tool ["source_mount" "snapshot"]) (home self spec) state)
+                          state) empty))
                (frozen (If (Ix 13 spec)
-                         ((workspace-tool installed "http")
-                           (home self spec) (_2 spec) installed manual) manual))
+                         ((workspace-tool state "http")
+                           (home self spec) (_2 spec) state manual) manual))
                (extra ((driver:get-perc ["http_foot" "live_assets"] http)
                          (home self spec) (_2 spec) frozen))
                (joined ((driver:get-perc ["http_foot" "add_routes"] http) (_0 extra) config)))
@@ -221,22 +230,34 @@
                    0 (error ["undeclared-mount-routes" (_0 spec)]))
             (If (Ix 9 spec) ((Hd joined) (_0 joined) (_1 extra) (_2 extra)) joined)))))
       empty specs))
-  (define server ((driver:get-perc ["eden" "serve_read"] eden)
-    ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes))
-    reader ((draft-tool "reconcile") draft-ports editable)
-    ((driver:get-perc ["http_foot" "run_with"] http) config)))
+  (define hooks (map (lambda (spec)
+    (Ifz (Sz (_7 spec)) 0 (hook state spec 7))) specs))
+  (define register (driver:get-perc ["eden" "register_foot"] eden))
+  (define registration (abi:constructor core ["helm" "supervisor" "register"]))
+  (define fs-entry ((driver:get-perc ["fs_foot" "run_with"] (module core-images "fs_sync_foot")) reader))
+  (define http-entry ((driver:get-perc ["http_foot" "run_with"] http) config))
+  (define serve-feet (driver:get-perc ["eden" "serve_feet"] eden))
+  (define access
+    ((driver:get-perc ["eden_store" "namespace_access"] (module core-images "eden_store"))
+      ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes)) commit))
+  (DeepSeq [state config hooks register registration fs-entry http-entry serve-feet access] 0)
+  (define stored (commit state))
+  ;; After this point failures are I/O startup failures, not an uncommitted
+  ;; preparation. Restart reconnects again; acknowledged provider writes remain.
+  (define server (Seq stored (serve-feet access stored [])))
   (Seq (print ["Registered HTTP routes" (map _0 (_0 config))]) 0)
-  (Seq server (foldl (lambda (ignored spec)
-    (Ifz (Sz (_7 spec)) 0
-      (Seq ((hook installed spec 7) server (Ix 8 spec)) 0))) 0 specs))
-  server)
+  (Seq server (foldl (lambda (index spec)
+    (Seq (Ifz (Sz (_7 spec)) 0
+      ((Ix index hooks) server (Ix index (_3 session)))) (Inc index))) 0 specs))
+  (Seq (register server (registration [self ("ts" "io") ("ts" "fs")]
+    fs-entry)) 0)
+  (Seq (register server (registration [self ("ts" "io") ("ts" "http")]
+    http-entry)) 0)
+  (Seq (print ["EDEN-WORLD-READY" "native continuation committed"]) server))
+  (world:run serve editable (world:arguments tier port scan-port scan-token specs)))
 
+(define (start-with-tier self system resolve slot port specs scan-port scan-token tier)
+  (mounted self system resolve slot port specs scan-port scan-token tier))
 (define (start self system resolve slot port specs scan-port scan-token)
-  (If (Sz specs)
-    (mounted self system resolve slot port specs scan-port scan-token)
-    (let* ((local (bootstrap:build-local self system resolve slot ["eden"]))
-           (eden (module (_2 (_1 local)) "eden"))
-           (state (need-ok ((driver:get-perc ["eden" "boot"] eden)
-             self (bootstrap:trusted system) (_1 (_0 local)) port))))
-      ((driver:get-perc ["eden" "serve"] eden) state))))
-(#export start)
+  (start-with-tier self system resolve slot port specs scan-port scan-token "none"))
+(#export start start-with-tier)
