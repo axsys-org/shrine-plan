@@ -1,0 +1,87 @@
+# The PR into main: what goes in, what stays out, what to fix first
+
+Branch `ic-bare-loop`, 55 commits and 112 files ahead of main, 19 commits behind it, no merge conflicts (merge-tree
+dry run). This file is the plan for making that reviewable by Liam; it does not itself go in.
+
+## Fix before anyone reads it
+
+1. **One reverse-reference read path.** Views read `/r` in milliseconds through the demand protocol; the direct MCP
+   read of the same `/r` path takes 2.8 s on the saved world. Both end in `store_references`; the direct read's cost
+   is in the reader it builds or in the node rendering, not in the index. Find it, make it one path, and say in
+   `store_references` where epoch selection happens and why a live read never unpins a snapshot (done for the
+   index; the doc comment is there).
+2. **`graph_world/nodes` and `cap` as cell parameters** (`nodes`, `cap`, `deeper` beside `depth`), constants only as
+   defaults. The workspace already takes `depth`; the deck's workspace wants the rest.
+3. **`read_fuel`**: 256 was a budget, 32768 is a loop bound. Either keep the bound and say so in the comment (done),
+   or let a definition declare its budget (`['sys 'view 'fuel]` on the woven record) and fall back to the bound.
+   Liam's call; the PR should offer the second.
+4. **Type placement constraint written next to the types.** `lain_types` holds the view protocol types and
+   `sorge`/`view_project` because the upgrade retains the old `sys/*` modules for brand stability; today that reason
+   lives only in the pipeline script. One paragraph at the head of `lain_types.foil` and one in `sys/view.foil`.
+5. **`weft_std` (1,400 lines) placement**: self-contained, in the kernel tree because records cannot hold closures.
+   Offer the mount alternative in the PR text; don't move it without his word.
+6. **The error scan in the pipeline** counts module self-test output as failure (`newtype`); out of the PR's scope but
+   note it so the retained stage's mtime trick is not mistaken for correctness.
+
+## What goes in
+
+Kernel (`src/foil`), each with a one-paragraph doc comment at the top of the module saying what it is for and why it
+is in the kernel:
+- `reference_index.foil`: the reverse-reference index in `sov`, maintained in `apply`, rebuildable from the journal,
+  bounded snapshots (`span`). `r_spell`: `/r/<len>/<path>`, the `/h` convention.
+- `shrine.foil`: `sov/apply` computes before/after once for the index and the signs; `reindex_references`.
+- `lain_peek.foil`: `/r` and `/o` reads, the woven evaluator with observations, `read_fuel`, the cycle trail,
+  `store_references` with its epoch rule. The largest diff; the PR text walks it.
+- `lain_types.foil`: the view protocol types, `is_r`, `sorge`, `view_project` (see fix 4).
+- `view_cache.foil`, `view_ops.foil`, `view_walk.foil`, `weft_graph.foil`, `graph_views.foil`, `graph_world.foil`,
+  `graph_union.foil`, `graph_beneath.foil`, `graph_workspace.foil`: the views. Pure, named, registered at
+  `/weft/graph`; each file's head says what the view answers and what it never asserts.
+- `helm.foil`, `http_foot.foil`: the supervisor `look` card (several view reads in one call).
+- `eden.foil`: seeds `weft_graph`.
+- `namespace.foil` (`system_at`), `lain_poke.foil` (`is_r`, `r_parse` in triggers), `sys/slots.foil` and the
+  regenerated catalogue: Codex's, kept after review; the PR text names them as such.
+- `src/reaver`: `eden.rvr`'s `mounted-with` (the upgrade boot entry) and the bootstrap test fixtures. Codex's; needed
+  by the upgrade path; say so.
+- Tests in Foil (`src/foil/tests/*`): in. Liam wants tests in Foil, and these are the proof of the views. The
+  Python proof scripts under `extras/mounts/mcp/tests/strangers` and `tests/registries`: in, they are small and
+  they are the acceptance record.
+- Mounts: `extras/mounts/mcp` (the four tools, `look`), `extras/mounts/explorer` (the page), `extras/mounts/hyp`
+  (one line, the cache pass-through).
+- `x/eden`, `x/eden_hands.py`, `x/setup`, `SETUP.md`, `.gitignore`: the kept-world and hands launcher; in.
+
+## What stays out (move to a notes branch or leave untracked)
+
+- `extras/mounts/mcp/hands/*.md` except `VISION.md`: `ASSEMBLY.md`, `COMPOSABLE_NAMESPACE.md`,
+  `REVIEW-2026-10-25.md`, `HANDOFF.md`, `REGISTRIES.md`, `PR-PLAN.md`. They are the thinking, not the change.
+- `extras/mounts/mcp/hands/registries.py`, `web.py`, `digest.py`, `links.py`, `agent.py`, `sync.py`: the Python hands.
+  Liam's line is Foil in the kernel, Python only for what can't be Foil; the hands qualify, but they are a product
+  layer. Propose them as a second PR so the kernel PR is read on its own.
+- `extras/mounts/mcp/skills/*`: the agent skills; second PR with the hands.
+- Anything under `.check/`, `work/`, scratch runners, `.DS_Store`.
+
+## Doc comments the kernel changes need (the picky list)
+
+- Every new top-level `+ name` gets a `'` line saying what it is; every type gets its fields explained where a
+  name is not obvious (`strength`, `soft`, `trail`, `span`).
+- No file carries a comment that explains the conversation ("Codex did", "tonight"); only what the code is for.
+- Numbers get a reason: `span` 64, `cap` 24, `deeper` 6, `nodes` 150, `read_fuel` 32768, `graph_workspace/nodes`
+  120, view cache 256 entries.
+- `?` arms over `care` and `res` stay exhaustive; the `unreachable` trap is the compiler's, not a comment.
+- Names: no `query_*` leftovers (done: `woven_*`); no `_native` suffixes in Foil; no "neuralese".
+
+## Liam's rules, checked
+
+- version 0 never means live for a pinned read: `/h/<care>/0/...` is a live reference by construction, and a
+  `woven_origin` pins it at the reader's epoch when the view is frozen (`e<n>` epochs). Say this in the PR.
+- Dispatch through the namespace: `/r`, `/o`, `/x`, `/c/x`, `/h` are all reads; the MCP tools stay four.
+- Pagination: `look` exists so a page is one call; the z reads page at 500 nodes with `next`.
+- Tests in Foil: 16 suites, 362 checks green on 2026-10-26 (run-14), plus 189 graph checks (run-15).
+
+## Order of work
+
+1. Merge main into the branch (no conflicts), run the full suite once, fix what moves.
+2. Fixes 1-4 above, with their doc comments; commit each as its own.
+3. Move the notes and the hands to `ic-bare-loop-notes` / a second branch; the kernel branch keeps `VISION.md`.
+4. PR text: one section per commit group, in reading order: index and reads; evaluator and cache; views;
+   supervisor look and mounts; page; launcher. Each kernel edit with its reason, each number with its rule.
+5. Open only on Ian's word.
