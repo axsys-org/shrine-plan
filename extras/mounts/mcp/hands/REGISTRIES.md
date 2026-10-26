@@ -18,7 +18,9 @@ promoted until an agent judges it `same`.
 | EIA-860 via PUDL | keyless parquet on S3 (EIA's own site serves HTML to downloads) | plant id, name, city, state, zip, lat/long, operator utility id and name, generators, ownership | Chief Joseph: plant 3921, Bridgeport WA 98813, operator USACE Northwestern Division, 27 units |
 | NIST MEP supplier scouting | public page via Firecrawl | scouting number, item to be scouted, response due, BABA flag; the demand side: what U.S. manufacturers are looking for domestic suppliers of | 63 open opportunities on 2026-10-02: housings, pipe fittings, heat pumps, gantry cranes, stainless tubing... |
 | NHTSA | keyless | manufacturer, campaign, component, summary | vehicle-centric; later |
-| SAM.gov, PatentsView API, EIA API | key required | | USAspending already carries SAM's identifiers; PatentsView bulk files are signed links from its download page |
+| SAM.gov | free key (sam.gov account) | registration behind a UEI: CAGE, legal name, status, registration date, structure, state of incorporation, the NAICS and PSC codes the entity claims, address | Cummins Power Generation: CAGE 44940, registered 2001, Delaware, NAICS 221112 221118 335312 335313 335999 541715; same UEI as USAspending, so the link is solid, not a candidate |
+| USPTO Open Data Portal | free key (USPTO.gov account with MFA); PatentsView's API was retired in March 2026 | patent applications and grants: number, grant date, title, applicants, inventors, CPC; search by first applicant name, filter `Patented Case` | Cummins: 6,000 applications under the name family; granted ones per recipient as candidates |
+| EIA API | free key | monthly generator capacity by plant | PUDL covers the yearly form; the key is in hand for the monthly updates |
 | Open Supply Hub, Thomasnet | subscription / no bulk | | skipped |
 
 ## The routes that exist on first contact
@@ -60,6 +62,8 @@ description as a note, and its candidates. Until the kernel with the `candidates
 record draws as a solid `candidates/<slug>` folder; after it, as a grey `candidate` edge.
 
 ## Open
+- A workspace route's hops show the other end by its path slug (`candidate n110000426049`); the hop records carry no
+  name yet. A title read per hop, as the standings now have, fixes it.
 - (gone) the first load's duplicates died with the clone they were in; the republished clone holds one clean load.
 - From a recipient's own page its `candidates` child drew as solid `candidates/<slug>` folders (an outgoing
   relation of a child record); `graph_views/branch_relations` now labels those `candidate` and marks them

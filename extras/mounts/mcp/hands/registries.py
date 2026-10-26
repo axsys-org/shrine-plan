@@ -13,11 +13,14 @@ as a candidate (a tentative edge the overlay draws grey), and only a judgement w
     /user/registries/importyeti/<slug>                 {name, address, shipments, last_shipment, names, addresses, source}
     /user/registries/importyeti/<slug>/suppliers/<n>   {name, country, shipments}
     /user/registries/eia/plants/<plant_id>             {name, city, state, zip, operator, operator_id, units, latitude, longitude, source}
+    /user/registries/sam/<uei>                         {name, uei, cage, status, registered, structure, naics, psc, address..., recipient -> recipient, source}
+    /user/registries/usaspending/recipients/<uei>/registration {sam -> sam/<uei>}    the same identifier: solid
+    /user/registries/uspto/patents/<number>            {name, patent, granted, filed, applicant, inventors, cpc, source}   a candidate of the recipient
     /user/registries/mep/opportunities/<number>        {name, number, due, build_america_buy_america, listed, source}   what needs making
 
     python3 registries.py <base> [--node 0x11] [--naics 335312] [--since 2024-10-01] [--top 25] [--importers 4] [--pudl DIR]
 """
-import argparse, json, os, re, sys, time, urllib.parse, urllib.request
+import argparse, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib.util
 _spec = importlib.util.spec_from_file_location('hand_base', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand.py'))
@@ -226,6 +229,59 @@ def importyeti_for(root, wr, recipients, limit):
         wr.put(rec['path'] + '/candidates', {'importyeti_' + seg(s): ref(path)})
         print('importyeti:', rec['name'], total, 'shipments,', i, 'suppliers')
 
+# ---- SAM.gov: the registration behind a UEI; the same identifier, so a solid link, not a candidate
+def sam_for(root, wr, recipients):
+    key = os.environ.get('SAM_API_KEY') or ''
+    if not key: print('sam: no SAM_API_KEY, skipped'); return
+    n = 0
+    for uei, rec in recipients.items():
+        try: d = get('https://api.sam.gov/entity-information/v3/entities?api_key=%s&ueiSAM=%s' % (key, uei))
+        except Exception as e:
+            print('  sam failed', uei, str(e)[:80]); continue
+        for e in (d.get('entityData') or [])[:1]:
+            reg, core, gs = e.get('entityRegistration') or {}, e.get('coreData') or {}, (e.get('assertions') or {}).get('goodsAndServices') or {}
+            addr, gen = core.get('physicalAddress') or {}, core.get('generalInformation') or {}
+            path = root + '/sam/' + seg(uei)
+            wr.put(path, {'name': reg.get('legalBusinessName'), 'uei': uei, 'cage': reg.get('cageCode'), 'status': reg.get('registrationStatus'), 'registered': int((reg.get('registrationDate') or '0').replace('-', '')[:8] or 0),
+                          'structure': gen.get('entityStructureDesc'), 'organization': gen.get('organizationStructureDesc'), 'state_of_incorporation': gen.get('stateOfIncorporationCode'),
+                          'street': addr.get('addressLine1'), 'city': addr.get('city'), 'state': addr.get('stateOrProvinceCode'), 'zip': addr.get('zipCode'),
+                          'naics': ' '.join(x.get('naicsCode') for x in (gs.get('naicsList') or []) if x.get('naicsCode')), 'psc': ' '.join(x.get('pscCode') for x in (gs.get('pscList') or []) if x.get('pscCode')),
+                          'recipient': ref(rec['path']), 'source': 'https://sam.gov/entity/' + uei})
+            wr.put(rec['path'] + '/registration', {'sam': ref(path)})
+            n += 1
+        time.sleep(0.3)
+    print('sam: %d registrations written' % n)
+
+# ---- USPTO Open Data Portal: granted patents whose first applicant is named like the recipient; a candidate, the name is a match
+def uspto_for(root, wr, recipients, per=8):
+    key = os.environ.get('USPTO_API_KEY') or ''
+    if not key: print('uspto: no USPTO_API_KEY, skipped'); return
+    n = 0
+    for uei, rec in recipients.items():
+        name = re.sub(r'[^A-Za-z0-9 ]', ' ', rec['name']).strip()
+        body = {'q': 'applicationMetaData.firstApplicantName:"%s"' % name, 'filters': [{'name': 'applicationMetaData.applicationStatusDescriptionText', 'value': ['Patented Case']}],
+                'pagination': {'offset': 0, 'limit': per}, 'sort': [{'field': 'applicationMetaData.grantDate', 'order': 'desc'}]}
+        try: d = get('https://api.uspto.gov/api/v1/patent/applications/search', headers={'X-API-KEY': key}, data=body)
+        except urllib.error.HTTPError as e:
+            if e.code == 404: continue          # no applicant by that name: nothing to write
+            print('  uspto failed', name, str(e)[:80]); continue
+        except Exception as e:
+            print('  uspto failed', name, str(e)[:80]); continue
+        cands = {}
+        first = slug(name).split('_')[0]
+        for w in d.get('patentFileWrapperDataBag') or []:
+            m = w.get('applicationMetaData') or {}
+            if not m.get('patentNumber') or first not in slug(m.get('firstApplicantName') or ''): continue
+            path = root + '/uspto/patents/' + seg(m['patentNumber'])
+            wr.put(path, {'name': (m.get('inventionTitle') or '').strip().title()[:140], 'patent': m['patentNumber'], 'granted': int((m.get('grantDate') or '0').replace('-', '')[:8] or 0), 'filed': int((m.get('filingDate') or '0').replace('-', '')[:8] or 0),
+                          'applicant': m.get('firstApplicantName'), 'inventors': ', '.join(i.get('inventorNameText') for i in (m.get('inventorBag') or []) if i.get('inventorNameText')),
+                          'cpc': ', '.join((c.get('cpcClassification') if isinstance(c, dict) else str(c)).strip() for c in (m.get('cpcClassificationBag') or [])[:4]),
+                          'source': 'https://ppubs.uspto.gov/pubwebapp/external.html?q=' + m['patentNumber'] + '.pn.'})
+            cands['uspto_' + seg(m['patentNumber'])] = ref(path); n += 1
+        if cands: wr.put(rec['path'] + '/candidates', cands)
+        time.sleep(0.3)
+    print('uspto: %d granted patents written' % n)
+
 # ---- NIST MEP supplier scouting: what needs making, as the demand side; open opportunities, through Firecrawl
 MEP = 'https://www.nist.gov/mep/mep-national-network-open-supplier-scouting-opportunities'
 def mep_opportunities(root, wr):
@@ -286,6 +342,7 @@ if __name__ == '__main__':
     wr.put(root, {'name': 'registries', 'description': 'public registries of real things, each record keeping its own identifiers; candidates are unjudged matches'})
     recipients, subawards = usaspending(root, wr, a.naics, a.since, a.top); wr.flush()
     for stage in (lambda: echo_for(root, wr, recipients), lambda: gleif_for(root, wr, recipients), lambda: edgar_for(root, wr, recipients),
+                  lambda: sam_for(root, wr, recipients), lambda: uspto_for(root, wr, recipients),
                   lambda: importyeti_for(root, wr, recipients, a.importers), lambda: mep_opportunities(root, wr),
                   lambda: (eia_mentions(root, wr, subawards, a.pudl) if a.pudl else None)):
         try: stage()
