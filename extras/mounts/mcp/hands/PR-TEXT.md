@@ -56,7 +56,8 @@ from the checkout on every run, the snapshot is the world's.
 
 Foil suites under `src/foil/tests`: references, reference reactivity, reference walk, queries, query transport,
 composition, view publication, working views, cells, overlay cache, value read, supervisor, graph, graph world,
-graph workspace, graph union. On main's runtime after the merge: no failures; the four suite errors
+graph workspace, graph union. On main's runtime after the merge, the whole Foil group: 1,521 checks pass, none
+fail; the four suite errors
 (`lain_store`, `lain_fixture`, `grove_publication` need-fail at completion, `fs_sync` compile) are main's own, as
 pristine main shows on the same runtime. The test inventory is brought up to date so `x/check` runs at all.
 

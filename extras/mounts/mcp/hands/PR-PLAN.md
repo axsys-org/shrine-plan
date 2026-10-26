@@ -83,7 +83,9 @@ is in the kernel:
    errors of its own (`lain_store`, `lain_fixture`, `grove_publication` need-fail at suite completion; `fs_sync`
    fails to compile under the new elaborator), 39 suites in 845 s. The merged branch: 851 pass, 0 fail, the same
    four errors, 33 of 56 suites before the runner's 900 s limit, still progressing when cut (the extra 17 suites are
-   ours); the rest run in a second batch. Main's own `x/check` also trips its inventory gate before any suite runs;
+   ours); the rest run in a second batch; with the runner's limit raised to 45 minutes the whole group completes: 1,521
+   pass, 0 fail, the same four errors, 52 suites in 1,487 s (`run-vqnejq54`). Main's own `x/check` also trips its
+   inventory gate before any suite runs;
    the inventory fix on `ic-bare-loop-main` is what lets it run. The saved-world upgrade pipeline is
    LMDB-shaped and has not been tried on the new runtime; the PR does not depend on it.
 2. Fixes 1-4 above, with their doc comments; commit each as its own.
