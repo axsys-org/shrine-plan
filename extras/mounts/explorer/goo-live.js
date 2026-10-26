@@ -755,8 +755,8 @@ function mcpSource(opts = {}) {
   }
   // around: the relations view for the relations, the beneath view for the stored children
   async function aroundNative(path, depth) {
-    const rdef = await defCase('relations'), bdef = await defCase('beneath');
-    if (!rdef || !bdef) return null;
+    const rdef = await defCase('relations');
+    if (!rdef) return null;
     const rn = await computed({ ...rdef, name: 'relations' }, path);
     if (!rn) return null;
     const relations = [];
@@ -766,7 +766,7 @@ function mcpSource(opts = {}) {
       const note = {}; for (const [k, v] of Object.entries(props)) if (k.startsWith('note/')) note[k.slice(5)] = unref(v) || v;
       relations.push({ way: props.direction === 'in' ? 'in' : 'out', label: String(props.label || '').replace(/^\//, ''), other, name: props.name || other.split('/').pop(), via: unref(props.via) || other, note, world: worldOf(unref(props.via) || other), about: unref(props.about) || world(path) });
     }
-    const bn = await computed({ ...bdef, name: 'beneath' }, path).catch(() => null);   // the stored children are a part; without them the relations still stand
+    const bn = null;   // the stored children come from the record's ordinary read (the page's own kids); no view for them
     const descendants = [];
     if (bn) {
       const build = prefix => Object.entries(bn).filter(([rel]) => rel.startsWith(prefix + '/') && rel.slice(prefix.length + 1).indexOf('/') < 0).map(([rel, props]) => { const node = { path: world(path) + rel, name: props.name || rel.split('/').pop().replace(/_/g, ' '), real: null, note: null }; const kids = build(rel); if (kids.length) node.next = kids; return node; });
