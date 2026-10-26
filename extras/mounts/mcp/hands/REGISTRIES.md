@@ -66,7 +66,10 @@ record draws as a solid `candidates/<slug>` folder; after it, as a grey `candida
 Cummins Power Generation: its ECHO facility 110000426049 is the same thing (1400 73rd Ave NE 55432 on both, NAICS
 335312 on both; written both ways with `why`); EDGAR CIK 26172 is its parent, not itself (USAspending names Cummins
 Inc. as parent; written as `parent_filing`); the customs importer is the same by name and zip, with the street caveat
-in `why`. Four records at epoch 3149. SAM's public key answers 429 after about ten entity reads a day.
+in `why`. Four records at epoch 3149. On the next read the contractor's world shows the parent as a solid hop with
+the judgement's `why` as its note, the unjudged candidates still tentative beside it, and, through the importer
+judgement, a `suppliers` folder (Bharat Forge, Sundram Fasteners, Metaldyne, Shanghai Dong Feng Motor...) that no
+registry attached to the contractor: the identity join merged the importer's world into the contractor's. SAM's public key answers 429 after about ten entity reads a day.
 
 Speed after the live `/r` fix (ae73407): as_world on Verisk 2.5 s to 0.5 s cold, 0.2 s warm; relations 3.3 s to
 0.3 s; union 2.3 s to 0.5 s; a recipient's world 0.08 s; the film's 500-node world 4.0 s cold, 0.7 s warm. The bare
