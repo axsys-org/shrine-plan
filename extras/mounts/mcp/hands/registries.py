@@ -13,6 +13,7 @@ as a candidate (a tentative edge the overlay draws grey), and only a judgement w
     /user/registries/importyeti/<slug>                 {name, address, shipments, last_shipment, names, addresses, source}
     /user/registries/importyeti/<slug>/suppliers/<n>   {name, country, shipments}
     /user/registries/eia/plants/<plant_id>             {name, city, state, zip, operator, operator_id, units, latitude, longitude, source}
+    /user/registries/mep/opportunities/<number>        {name, number, due, build_america_buy_america, listed, source}   what needs making
 
     python3 registries.py <base> [--node 0x11] [--naics 335312] [--since 2024-10-01] [--top 25] [--importers 4] [--pudl DIR]
 """
@@ -225,6 +226,29 @@ def importyeti_for(root, wr, recipients, limit):
         wr.put(rec['path'] + '/candidates', {'importyeti_' + seg(s): ref(path)})
         print('importyeti:', rec['name'], total, 'shipments,', i, 'suppliers')
 
+# ---- NIST MEP supplier scouting: what needs making, as the demand side; open opportunities, through Firecrawl
+MEP = 'https://www.nist.gov/mep/mep-national-network-open-supplier-scouting-opportunities'
+def mep_opportunities(root, wr):
+    key = os.environ.get('FIRECRAWL_API_KEY') or ''
+    if not key: print('mep: no FIRECRAWL_API_KEY, skipped'); return
+    try:
+        d = get('https://api.firecrawl.dev/v1/scrape', headers={'Authorization': 'Bearer ' + key}, data={'url': MEP, 'formats': ['markdown'], 'onlyMainContent': True}, timeout=90)
+        md = (d.get('data') or {}).get('markdown') or ''
+    except Exception as e:
+        print('  mep failed', str(e)[:80]); return
+    updated = (re.search(r'Updated:\s*([A-Za-z]+\.? \d+, \d{4})', md) or [None, None])[1]
+    n = 0
+    for line in md.split('\n'):
+        mm = re.match(r'\| (\d{4}-\d+) \| ([^|]+?) \| (\d{1,2}/\d{1,2}/\d{2}) \|', line)
+        if not mm: continue
+        number, item, due = mm.groups()
+        m, dd, yy = due.split('/')
+        baba = item.startswith('BABA')
+        wr.put(root + '/mep/opportunities/' + seg(number), {'name': re.sub(r'^BABA:?\s*', '', item).strip(), 'number': number, 'due': int('20%s%02d%02d' % (yy, int(m), int(dd))),
+                                                              'build_america_buy_america': baba, 'listed': updated, 'source': MEP})
+        n += 1
+    print('mep: %d open scouting opportunities written (listed %s)' % (n, updated))
+
 # ---- EIA-860 (through PUDL): the plants a description names
 def eia_mentions(root, wr, subawards, pudl):
     try:
@@ -262,7 +286,8 @@ if __name__ == '__main__':
     wr.put(root, {'name': 'registries', 'description': 'public registries of real things, each record keeping its own identifiers; candidates are unjudged matches'})
     recipients, subawards = usaspending(root, wr, a.naics, a.since, a.top); wr.flush()
     for stage in (lambda: echo_for(root, wr, recipients), lambda: gleif_for(root, wr, recipients), lambda: edgar_for(root, wr, recipients),
-                  lambda: importyeti_for(root, wr, recipients, a.importers), lambda: (eia_mentions(root, wr, subawards, a.pudl) if a.pudl else None)):
+                  lambda: importyeti_for(root, wr, recipients, a.importers), lambda: mep_opportunities(root, wr),
+                  lambda: (eia_mentions(root, wr, subawards, a.pudl) if a.pudl else None)):
         try: stage()
         except Exception as e: print('stage failed:', type(e).__name__, str(e)[:160])
         wr.flush()

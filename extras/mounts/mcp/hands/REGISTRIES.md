@@ -16,6 +16,7 @@ promoted until an agent judges it `same`.
 | GLEIF | keyless API | LEI, legal name and address, status, direct and ultimate parent, children; fuzzy name completion | Cummins Inc LEI ZUNI8PYC725B6H8JU438 with parent links; the US subsidiary has no LEI, its UK and Singapore siblings do |
 | ImportYeti | public pages via Firecrawl (plain fetch refused; API metered) | importer address, total sea shipments, "imports under N names and M addresses", suppliers with country, shipment counts, HS codes, goods | Cummins: 74,169 shipments, 310 names, 300 addresses; suppliers Bharat Forge (India, 2,076), Sundram Fasteners, Metaldyne, Shanghai Dong Feng Motor... |
 | EIA-860 via PUDL | keyless parquet on S3 (EIA's own site serves HTML to downloads) | plant id, name, city, state, zip, lat/long, operator utility id and name, generators, ownership | Chief Joseph: plant 3921, Bridgeport WA 98813, operator USACE Northwestern Division, 27 units |
+| NIST MEP supplier scouting | public page via Firecrawl | scouting number, item to be scouted, response due, BABA flag; the demand side: what U.S. manufacturers are looking for domestic suppliers of | 63 open opportunities on 2026-10-02: housings, pipe fittings, heat pumps, gantry cranes, stainless tubing... |
 | NHTSA | keyless | manufacturer, campaign, component, summary | vehicle-centric; later |
 | SAM.gov, PatentsView API, EIA API | key required | | USAspending already carries SAM's identifiers; PatentsView bulk files are signed links from its download page |
 | Open Supply Hub, Thomasnet | subscription / no bulk | | skipped |
