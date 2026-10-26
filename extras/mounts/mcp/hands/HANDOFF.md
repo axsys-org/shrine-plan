@@ -431,3 +431,48 @@ Open, with evidence:
   `UPGRADE-VERISK-REFERENCES 55` is the like-for-like count.
 - Topics as things, and web identity (domain) as a vertex the overlay joins through, are not yet views; mentions
   carry the grey today. Firecrawl stays in the Python web hand; only its results are namespace records.
+
+## 2026-10-26, later: the saved-world upgrade publishes this kernel
+
+The `publish-local` trap was never a module of this tree. Its three arm keys decode (shrine-brand wire: `SHRINE-BRAND`,
+a version byte, the path's segments with strings little-endian, then the case) to `/x/17/lib/shrine/ass/ker`, `ass/nul`
+and `ass/past` at case 2. `foil-publication prepare` gives every definition of a module compiled from source the moment
+`prior + 1`, and a brand is path plus moment (`foil-context runtime-brand`), so a raw `shrine.foil` rebrands `ass`,
+`tome`, `urn` and the rest; the stored history is at case 1, and the first exhaustive `ass` match (`ass/held` under
+`sov/x_at`, `ass/yuga`, `physical_read/record`) falls through to the compiler's `unreachable`.
+
+Codex's pipeline never compiled raw sources. `.check/native-views/prepare_upgrade.py` (last run 21:02 on 10-25, four
+minutes before its passing publication) rewrites `core-upgrade-src`: it strips the retained record types (shrine: `ass`,
+`ass/ker`, `ass/nul`, `ass/past`, `verdict`, `tome`, `urn`, `chest`, `lchunk`, `ledger`; lain_types: `pails/code`; pact,
+source_mount, fs_sync, grove_draft), prefixes `- previous_shrine` and friends so those names resolve to the old pinned
+artifacts (case 1; the `previous_*` entries of `core-retained` in `core-upgrade.rvr`), and gives `namespace` a
+`legacy_system_at`. The bisect helper's rsync of `baseline-1/src` over `core-upgrade-src` and `retained-src` (22:18 on
+10-25) discarded that rewrite, and every run since, "baseline" included, compiled a raw shrine. Control tonight, raw
+baseline on a fresh clone (`upgrade-clone-rawbase`): `RETAINED-TYPE-BRAND 0`, `RETAINED-REFERENCES 0`, the same two
+`unreachable`. The accumulated clone was a red herring; the retained probes read 1 and 55 for any rewritten source.
+
+Recipe, from the repo root: `rsync -a --delete --exclude mounts src/ .check/native-views/core-upgrade-src/`, then
+`python3 .check/native-views/prepare_upgrade.py`, then copy `core-upgrade-src` to `retained-src`. Keep the non-Foil
+directories at the baseline mtimes (`rsync -a` from `baseline-1/src/reaver` etc., same content): new mtimes miss the
+reaver module cache, the modules recompile with their self-tests, and `newtype`'s expected-failure cases print
+`("error"` lines that the pipeline's scan counts as a failed stage (`upgrade-clone-rewrite`, retained, otherwise fine).
+
+Result on this tree (the b165999 source as of 01:54; `graph_views`/`graph_world` edits after that are not in it),
+`upgrade-clone-rewrite2`: migration 218 s (`UPGRADE-VERISK-REFERENCES 55`), retained 125 s (`RETAINED-TYPE-BRAND 1`,
+`RETAINED-REFERENCES 55`), publication 105 s (`UPGRADE-PUBLICATION-EPOCH 3095`, 49 modules, `UPGRADE-RETAINED-*` and
+`UPGRADE-HISTORICAL-SYSTEM` 1, no trap). Boot: `UPGRADE_WORK=upgrade-clone-rewrite2 UPGRADE_MOUNTS=mcp,probe,web,goo,explorer
+python3 .check/native-views/boot_candidate.py` (explorer's manifest declares web and goo; without them the script
+stops before wisp with a KeyError) reached `HTTP foot listening` after about 110 s, 360 MB rss. Through MCP on 8330:
+`/0x11/user/orgs/verisk` exists at `/h/x/1/...` with `name` and `description`; its `as_world` view answers 130 nodes,
+`in/1/mentioned` count 8 with the verisk_com pages. History and cases ride through; this is the first boot of the
+saved world's records on this kernel with their history.
+
+Logs: `upgrade-clone-mig/migration-candidate.log`, `upgrade-clone-rewrite2/{retained,publication}-candidate.log` and
+`boot-upgrade.log`, `upgrade-clone-rawbase/{retained,publication}-candidate.log` (control), all under
+`.check/native-views`. Snaps deleted except `upgrade-clone-rewrite2/snap`, the published clone, kept bootable
+(copy-on-write; delete it when the disk needs it). `core-upgrade-src` and `retained-src` are left as the rewritten
+sources. Nothing committed.
+
+Open: the rewrite's retains list is Codex's hand-written set. A retained record type whose fields change would need a
+real `previous_*` conversion rather than an alias; `reference_index` changing (span, past) is fine because the index
+is rebuilt. The pipeline's error scan should ignore module self-test output.
