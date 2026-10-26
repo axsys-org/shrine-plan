@@ -512,11 +512,10 @@ test('mountRecord draws every page of what is beneath before the backlink walk r
   const gate = new Promise(r => { release = r; });
   const source = {
     read: async (path, care, cas, next) => pages[next || ''],
-    by: async () => { await gate; return {user: [{path: '0x11/agent/c1/context', slot: 'user', hole: false}], mentioned: [{path: '0x11/agent/c2/turns/t3', slot: 'mentioned', hole: false}]}; },
-    candidates: async () => [{name: 'Marc Andreessen', count: 1, sources: []}]};
+    backlinks: async () => { await gate; return {matches: [{path: '0x11/agent/c2/turns/t3', slot: 'said', hole: false}, {path: '0x11/agent/c1/context', slot: 'user', hole: false}]}; }};
   const el = fakeEl();
-  const sec = {innerHTML: ''}, cand = {innerHTML: ''};
-  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
+  const sec = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : null)};
   el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
   live.mountRecord(el, source, {at: '/0x11/user'});
   for (let i = 0; i < 20 && !/looking/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
@@ -525,42 +524,37 @@ test('mountRecord draws every page of what is beneath before the backlink walk r
   assert.match(main.innerHTML, /looking…/, 'drawn before the backlinks come back');
   release();
   for (let i = 0; i < 20 && !/c1\/context/.test(sec.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(sec.innerHTML, /pointing here · 2/); assert.match(sec.innerHTML, /mentioned/); assert.match(sec.innerHTML, /c2\/turns\/t3/);
-  const order = ['user', 'mentioned'].map(k => sec.innerHTML.indexOf('>' + k + ' <'));
-  assert.ok(order[0] < order[1], 'mentions come after the named slots');
+  assert.match(sec.innerHTML, /pointing here · 2/); assert.match(sec.innerHTML, /said/); assert.match(sec.innerHTML, /c2\/turns\/t3/);
+  const order = ['said', 'user'].map(k => sec.innerHTML.indexOf('>' + k + ' <'));
+  assert.ok(order[0] < order[1], 'slots in name order, none singled out');
 });
-
-test('names on a record page that are not yet things are shown as a line, waiting for the agent', async () => {
-  const cand = {innerHTML: ''}, sec = {innerHTML: ''};
-  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
+test('a record page is the thing as a world: folders are slots, lines are names with what the holder says beside them, what references it is a folder under its holder\'s slot, a text that names it is a named-in line with its sentence', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
   const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
-  const source = { read: async () => ({path: '0x11/agent/c2/turns/t3', record: {said: 'Met Marc Andreessen'}, kids: [], case: 1, next: null}), by: async () => ({}), candidates: async () => [{name: 'Marc Andreessen', count: 1, sources: []}] };
-  live.mountRecord(el, source, {at: '/0x11/agent/c2/turns/t3'});
-  for (let i = 0; i < 30 && !/Marc Andreessen/.test(cand.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(cand.innerHTML, /waiting for the agent to place · 1/); assert.doesNotMatch(cand.innerHTML, /<button/);
-});
-test('a record page shows where it sits: also under via overlay with its note, beneath with overlays resolved, references', async () => {
-  const cand = {innerHTML: ''}, sec = {innerHTML: ''};
-  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
-  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
-  const source = { read: async () => ({path: '0x11/user/orgs/mis', record: {name: 'MIS'}, kids: [{path: '0x11/user/orgs/mis/talk', name: 'talk', slots: {}, kids: []}], case: 1, next: null}),
-    by: async () => ({}), candidates: async () => [],
-    around: async () => ({ real: '/0x11/user/orgs/mis', ancestors: [{via: '/0x11/user/orgs/mis', chain: [{path: '/0x11/user/orgs', name: 'orgs'}]}, {via: '/0x11/user/orgs/verisk/acquisitions/mis', note: {note: 'acquired 29 July 2026'}, chain: [{path: '/0x11/user/orgs/verisk/acquisitions', name: 'acquisitions'}, {path: '/0x11/user/orgs/verisk', name: 'Verisk'}]}],
-      descendants: [{path: '/0x11/user/orgs/mis/teams', name: 'teams', next: [{path: '/0x11/user/orgs/mis/teams/geo', name: 'Geospatial team'}]}], refsOut: [{path: '/0x11/user/places/uk/london', name: 'London', label: 'hq'}], refsIn: [], parts: [],
-      relations: [{way: 'out', label: 'leaders', other: '/0x11/user/people/forbes', name: 'Forbes McKenzie', note: {role: 'founder and CEO'}}, {way: 'in', label: 'acquisitions', other: '/0x11/user/orgs/verisk', name: 'Verisk', note: {note: 'acquired 29 July 2026'}}] }) };
+  const source = { read: async p => p === '/x/0x11/user/views/flood_review'
+      ? ({path: 'x/0x11/user/views/flood_review', record: {}, kids: [{path: 'x/0x11/user/views/flood_review/exposure', name: 'exposure', slots: {risk: 'high'}, kids: []}], case: 1, next: null})
+      : ({path: '0x11/user/orgs/mis', record: {name: 'MIS'}, kids: [{path: '0x11/user/orgs/mis/talk', name: 'talk', slots: {}, kids: []}], case: 1, next: null}),
+    unfold: async () => [
+      {dir: 'out', key: 'leaders', label: 'leaders', items: [{path: '/0x11/user/people/forbes', name: 'Forbes McKenzie', note: {role: 'founder and CEO'}, via: '/0x11/user/orgs/mis', world: '0x11'}]},
+      {dir: 'in', key: 'acquisitions', label: '← acquisitions', items: [{path: '/0x11/user/orgs/verisk', name: 'Verisk', note: {note: 'acquired 29 July 2026'}, via: '/0x11/user/orgs/verisk/acquisitions/mis', world: '0x11'}]},
+      {dir: 'in', key: 'flood_review', label: '← flood review', items: [{path: '/x/0x11/user/views/flood_review', name: 'flood review', note: {}, via: '/0x11/user/views/flood_review', world: '0x11'}]},
+      {dir: 'in', key: 'text', label: '← text', items: [{path: '/0x11/user/web/host/page/r1', name: 'A page that names it', note: {text: 'Verisk has completed its purchase of [/0x11/user/orgs/mis]. Terms were not disclosed.'}, via: '/0x11/user/web/host/page/r1', world: '0x11'}]}] };
   live.mountRecord(el, source, {at: '/0x11/user/orgs/mis'});
   for (let i = 0; i < 30 && !/beneath/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(main.innerHTML, /also under .*acquisitions.*Verisk.*via .*overlay.*acquired 29 July 2026/); assert.match(main.innerHTML, /beneath · 2/); assert.match(main.innerHTML, /relations · 2/); assert.match(main.innerHTML, /leaders <span class="n">1/); assert.match(main.innerHTML, /Forbes McKenzie.*founder and CEO/); assert.match(main.innerHTML, /acquisitions of<\/span> .*Verisk/);
-  assert.match(main.innerHTML, /its parts.*talk/);
+  assert.match(main.innerHTML, /as a world.*leaders.*Forbes McKenzie.*founder and CEO/s, 'beside a line: the value, not the slot name');
+  assert.match(main.innerHTML, /← acquisitions<\/span>.*Verisk.*acquired 29 July 2026/s);
+  assert.match(main.innerHTML, /← flood review<\/span>.*flood review.*exposure.*risk high/s, 'a cell reading the thing is a line under its name, its result read once as lines beneath');
+  assert.match(main.innerHTML, /<li class="named"><a[^>]*>A page that names it<\/a> <span class="s">\u201cVerisk has completed its purchase of <a class="n go"[^>]*>mis<\/a>\.\u201d/, 'a text whose prose names the thing is a line with that sentence, the reference a link, no folder label');
+  assert.doesNotMatch(main.innerHTML, /← text</, 'the prose slot is not shown as a folder');
+  assert.doesNotMatch(main.innerHTML, /pointing here/, 'what points here is in the tree');
+  assert.match(main.innerHTML, /beneath<\/div>.*talk/s);
 });
 test('a record page shows the record as a world: relation labels as virtual folders, unfolded', async () => {
-  const cand = {innerHTML: ''}, sec = {innerHTML: ''};
-  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : s === '.sv-cand-sec' ? cand : null)};
+  const main = {innerHTML: '', querySelector: () => null};
   const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
-  const source = { read: async () => ({path: '0x11/user/orgs/verisk', record: {name: 'Verisk'}, kids: [], case: 1, next: null}), by: async () => ({}), candidates: async () => [],
-    around: async () => ({ real: '/0x11/user/orgs/verisk', ancestors: [], descendants: [], relations: [], refsOut: [], refsIn: [], parts: [] }),
+  const source = { read: async () => ({path: '0x11/user/orgs/verisk', record: {name: 'Verisk'}, kids: [], case: 1, next: null}),
     unfold: async () => [{label: 'acquired_by of', items: [{path: '/0x11/user/orgs/mis', name: 'McKenzie Intelligence Services', note: {acquired: '20260729'}, folders: [{label: 'founded of', items: [{path: '/0x11/user/people/forbes', name: 'Forbes McKenzie', note: {}}]}]}]}] };
   live.mountRecord(el, source, {at: '/0x11/user/orgs/verisk'});
   for (let i = 0; i < 30 && !/as a world/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
-  assert.match(main.innerHTML, /as a world.*acquired_by of.*McKenzie Intelligence Services.*acquired 20260729.*founded of.*Forbes McKenzie/s);
+  assert.match(main.innerHTML, /as a world.*acquired_by of.*McKenzie Intelligence Services.*20260729.*founded of.*Forbes McKenzie/s);
 });
