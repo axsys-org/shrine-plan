@@ -124,6 +124,11 @@ def catalog(root):
         if any(not re.fullmatch(r'[A-Za-z0-9_/-]+', module) or '..' in module
                for module in data.get('modules', {})):
             raise ValueError(f'{name}: invalid logical module name')
+        pinned = data.get('pinned_modules', [])
+        if (not isinstance(pinned, list) or
+                any(not isinstance(module, str) or module not in data.get('modules', {})
+                    for module in pinned) or len(set(pinned)) != len(pinned)):
+            raise ValueError(f'{name}: pinned_modules must name distinct owned modules')
         leaves = list(data.get('modules', {}).values()) + list(data.get('assets', {}).values())
         for unit in data.get('grove', []):
             leaves.extend(unit['files'])
@@ -255,7 +260,7 @@ def runtime_specs(prepared, source_root):
                       int(bool(data.get('inspection'))),
                       dependencies(mount),
                       list(data.get('assets', {}).values()), workspace_routes(data),
-                      int(bool(data.get('workspaces')))])
+                      int(bool(data.get('workspaces'))), data.get('pinned_modules', [])])
     return specs
 
 
@@ -304,9 +309,10 @@ class ScanBridge:
         if hasattr(self, 'manifests'):
             current = json.loads((self.originals[name] / 'mount.json').read_text())
             keys = ('version', 'name', 'dependencies', 'modules', 'grove', 'assets', 'roots',
-                    'activate', 'http', 'start', 'host', 'routes', 'inspection', 'workspaces')
+                    'activate', 'http', 'start', 'host', 'routes', 'inspection', 'workspaces',
+                    'pinned_modules')
             if any(current.get(key) != self.manifests[name].get(key) for key in keys):
-                raise ValueError('Mount descriptor changed; restart Eden to change registrations')
+                raise ValueError('Mount descriptor changed; the service retains its captured registrations')
             mount, prepared, module = self.scanners[name]
             if module and hasattr(module, 'scan'):
                 module.scan(mount.root, prepared)

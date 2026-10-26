@@ -49,12 +49,13 @@ class MountTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('WISP'), 'Native descriptor check requires WISP')
     def test_descriptor_bytes_and_entrypoint_positions(self):
         import test_runner as runner
-        bag = self.bag('example', modules={'example': 'main.foil'},
+        bag = self.bag('example', modules={'example': 'main.foil'}, pinned_modules=['example'],
                        http={'module': 'example', 'entry': ['example', 'http']},
                        description='quotes " and slash \\ and café' * 400)
         source = self.root / 'src'
         shutil.copytree(runner.ROOT / 'src', source)
         specs = runtime_specs([(select(self.root, ['example'])[0], bag, [], None)], source)
+        self.assertEqual(specs[0][14], ['example'])
         (source / 'expected.json').write_text(specs[0][2])
         work = self.root / 'worker'
         template = Path(os.environ['TEST_TEMPLATE']) if os.environ.get('TEST_TEMPLATE') else runner.stage(os.environ['WISP'], False, 60)
@@ -63,7 +64,7 @@ class MountTests(unittest.TestCase):
             '(#bind std (#module std))', '(#import std)',
             '(#bind reef (#module reef))',
             '(define spec (_0 ' + runtime_literal(specs) + '))',
-            '(define good (And (Eq (Sz spec) 14) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
+            '(define good (And (Eq (Sz spec) 15) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
             '(print (If good "MOUNT-ENCODING-PASS" "MOUNT-ENCODING-FAIL"))',
             '(print "TEST-RUN-DONE")', ''])
         code, complete, _ = runner.run_process([os.environ['WISP'], '--file-root', str(source), 'snap', 'root', '_'], work, script, 60)
@@ -199,7 +200,7 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Duplicate HTTP route'):
             select(self.root, ['reader', 'other'])
 
-    def test_workspace_descriptor_change_requires_restart_and_retains_scan(self):
+    def test_workspace_descriptor_change_retains_captured_registrations_and_scan(self):
         bag = self.workspace_bag()
         mount = select(self.root, ['reader'])[-1]
         root = self.root / 'runtime'; (root / 'mounts' / 'reader').mkdir(parents=True)
@@ -212,7 +213,7 @@ class MountTests(unittest.TestCase):
         data = json.loads((bag / 'mount.json').read_text())
         data['workspaces'][0]['receiver']['slot'][-1] = 'changed'
         (bag / 'mount.json').write_text(json.dumps(data))
-        with self.assertRaisesRegex(ValueError, 'restart Eden'):
+        with self.assertRaisesRegex(ValueError, 'retains its captured registrations'):
             scanner.refresh('mounts/reader')
         captured = json.loads((root / 'mounts/reader/mount.json').read_text())
         self.assertEqual(captured, mount.manifest)

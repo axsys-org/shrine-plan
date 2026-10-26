@@ -14,17 +14,34 @@ x/eden --mount debugger --mount srs
 x/eden --extras-root ../shrine-extras --mount explorer --mount codex
 ```
 
-The `shrine-extras` input in `flake.lock` selects the default extras revision.
-`--extras-root` selects an editable checkout, including that checkout's Nix
-configuration. Dependencies are loaded once, before their consumers. Only selected
+Native publication appends new definitions; it does not rewrite historical laws
+or infer type identity from unchanged declarations. A mount can list owned
+`pinned_modules` in its descriptor. First publication compiles missing artifacts;
+subsequent scans import those exact artifacts from the mount's existing native
+image record, including their original dependency graphs. Their source files are
+bootstrap inputs, not refresh inputs once pinned. To change a contract, publish a
+new explicitly selected module/version and handle compatibility at activation.
+
+The mount descriptor and compiler belong to the saved service. These changes
+govern newly compiled services, not an automatic upgrade of a running saved world.
+
+Native command admission uses one budget of 128 reaction rounds after the
+submitted event. Supervisor writes, guarded operations and Grove installation
+share this policy. A quiescent candidate can commit; exhaustion, reaction failure
+or unsupported outbound effects discard the candidate and its dependency index.
+The budget limits reaction rounds, not execution time inside an individual hand.
+
+The default mount sources are this checkout's `extras/` directory.
+`--extras-root` selects another source directory, including its Nix configuration.
+Dependencies are loaded once, before their consumers. Only selected
 mounts and their dependencies prepare host tools or assets. Mash and Node belong
 to the debugger's extras environment, not the core Eden shell.
 
 Each flat bag has a version-1 `mount.json`. It maps logical Foil module names to
 filenames, declares ordered Grove units and their publication roots, and declares
 assets, dependencies and optional activation, HTTP and host entrypoints. See the
-[extras repository](https://github.com/axsys-org/shrine-extras) for the schema and
-application checks. Core rejects unknown names, cycles, core-module overrides,
+[extras guide](extras/README.md) for the schema and application checks.
+Core rejects unknown names, cycles, core-module overrides,
 overlapping publication ownership and duplicate route claims. HTTP dispatch uses
 the longest matching path prefix, with segment boundaries.
 
@@ -109,8 +126,8 @@ rejects the candidate and retains the previous published definitions, registrati
 and assets. Installation reuses `goo_workspace/install` and hosted receivers;
 HTTP and hydration continue through the existing Goo boundaries.
 
-Registration changes (including shell and receiver settings) require restarting
-Eden in this first version. Grove and asset rescans retain the existing atomic
+Mount descriptor changes (including shell and receiver settings) require a service
+built with those registrations; restarting a saved service retains its descriptor. Grove and asset rescans retain the existing atomic
 publication behavior. Custom receiver constructors, guards beyond the two
 admission policies, host operation mappings, and custom page shells still use
 the manual Foil endpoint interface. Documentation's compiler-metadata reader is
@@ -159,8 +176,11 @@ migrate instances. New installations can use the newer definitions. Route handle
 remain captured by the running HTTP foot. Declared asset URLs read bytes from
 the latest successful mount publication, so rescan followed by browser reload
 picks up HTML, CSS and JavaScript changes. Failed publication retains the previous
-assets. Restart to select new mounts, change a descriptor's runtime contract
-(including asset URL mappings), or replace handler/driver code.
+assets. Restart can select explicitly published handlers from retained mount images
+under the saved service's existing registrations. New mounts, descriptor contracts
+(including asset URL mappings), or core driver code require a service built with
+those registrations and implementations; restarting the saved service does not
+change them.
 
 Watching, persistence and automatic instance migration are outside this interface.
 
@@ -243,7 +263,7 @@ old instance is retained and the differing published/installed versions remain
 visible. A concurrent instance edit or newer publication rejects a stale request.
 The management controls operate on independent Grove installations below `/app`;
 they cannot remove publication roots or unrelated occupied roots. Core/Foil driver
-changes still require a restart. Browser assets reload through mount rescan;
+changes require a service built with that code; restarting retains the saved service. Browser assets reload through mount rescan;
 the Goo inspector provides a **Reload mount assets** button.
 
 For an automated rehearsal against a disposable demo instance:

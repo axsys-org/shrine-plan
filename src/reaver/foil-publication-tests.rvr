@@ -33,6 +33,63 @@
 (define (prepare version)
   (pub:prepare native-selection (Pin "compiler") read
     [["library" root] ["app" app]] [] (lambda (path) version)))
+;; Persistent contracts are exact imports, never inferred from a new schema.
+(define (pin-read version name)
+  (rex:ParseRexNormFile (If (Equal name "model")
+    "+ node (: n=nat)
++ value (node 5)
+"
+    (strcat ["- model
++ helper " (showNat version) "
++ value (node 5)
++ supplied
+  \ ignored=nat
+  ^ node
+  | node 5
++ accepts
+  \ p=pail
+  ^ nat
+  ?> value=node p 0
+  | 1
+"]))))
+(define (pin-tests ignored)
+  (define roots [["model" root] ["consumer" app]])
+  (define original (pub:compile (pub:prepare native-selection (Pin "compiler")
+    (pin-read 1) roots [] (lambda (path) 0)) driver:empty-foil-cache))
+  (define imports (source:pinned-imports ["model"] (_2 original)))
+  (define old-model (Unpin (_1 (_0 imports))))
+  (define old-consumer (Unpin (_1 (_1 (_2 original)))))
+  (define changed (pub:compile (pub:prepare native-selection (Pin "compiler")
+    (lambda (name)
+      (If (Equal name "model") (error "pinned-source-must-not-be-read")
+        (pin-read 2 name))) roots imports (lambda (path) 1)) driver:empty-foil-cache))
+  (define current (Unpin (_1 (_0 (_2 changed)))))
+  (assert-impl "new implementation reads retained records through pinned types"
+    (Eq 1 ((driver:get-perc ["accepts"] current) (driver:get-perc ["value"] old-model))))
+  (assert-impl "old and new constructors have the exact same identity"
+    (Equal (driver:get-perc ["value"] old-model) (driver:get-perc ["value"] current)))
+  (assert-impl "new implementation is rebuilt" (Eq 2 (driver:get-perc ["helper"] current)))
+  (assert-impl "old implementation remains captured" (Eq 1 (driver:get-perc ["helper"] old-consumer)))
+  (assert-impl "pinned contracts are excluded from the publication write set"
+    (all (lambda (record) (Equal (map (lambda (part) ((_0 part) (_1 part))) app)
+      (take (Sz app) (_0 record)))) (pub:definition-records changed)))
+  (define distinct (pub:compile (pub:prepare native-selection (Pin "compiler")
+    (pin-read 2) roots [] (lambda (path) 1)) driver:empty-foil-cache))
+  (define distinct-consumer (Unpin (_1 (_1 (_2 distinct)))))
+  (assert-impl "identical source republished without a pin is a new type"
+    (Eq 0 ((driver:get-perc ["accepts"] distinct-consumer) (driver:get-perc ["value"] old-model))))
+  (define use (pub:compile (pub:prepare native-selection (Pin "compiler")
+    (lambda (name) (rex:ParseRexNormFile "- model
+- previous
++ result (supplied 0).n
+"))
+    [["model" root] ["previous" app] ["use" [["x" 7] ["ts" "use"]]]]
+    (Weld imports [["previous" (Pin old-consumer)]]) (lambda (path) 0)) driver:empty-foil-cache))
+  (assert-impl "retained provider methods use the exact pinned module key"
+    (Eq 5 (driver:get-perc ["result"] (Unpin (_1 (_0 (_2 use)))))))
+  [original changed])
+(define pin-products (pin-tests 0))
+
 (define plan (prepare 0))
 (define compiled (pub:compile plan driver:empty-foil-cache))
 (define artifacts (_2 compiled))
@@ -101,6 +158,18 @@ assert(Equal [[(Weld root [["ts" "tree"] ["ts" "leaf"]]) 1]]
   (Unpin (_1 (need (find (lambda (pair) (Equal "compiler_publication" (_0 pair)))
     (_2 initial-policy-code))))))
 (define empty (driver:get-perc ["sov" "new"] policy))
+(define pin-first (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_0 pin-products) 0 0 empty))
+assert(Equal "ok" (Hd pin-first))
+(define pin-second (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_1 pin-products) 0 0 (_0 pin-first)))
+assert(Equal "ok" (Hd pin-second))
+assert(Equal "err" (Hd (pub:publish policy
+  [("x" 7) ("ts" "compiler") ("ts" "artifact")] ("x" 7)
+  (_1 pin-products) 0 0 (_0 pin-second))))
+
 (define slot [("x" 7) ("ts" "compiler") ("ts" "artifact")])
 (define first (pub:publish policy slot ("x" 7) compiled 0 0 empty))
 assert(Equal "ok" (Hd first))
@@ -185,7 +254,7 @@ assert(Equal (strcat [(show-name (Hd value)) "(12)"])
   (show-value value 0))
 (define empty-brand (brand:encode
   (Weld root [["ts" "tree"] ["ts" "empty"]]) 1))
-assert(Equal (strcat [(show-name empty-brand) "()"])
+assert(Equal (show-name empty-brand)
   (show-value empty-brand 0))
 assert(Equal "12" (show-value 12 0))
 
