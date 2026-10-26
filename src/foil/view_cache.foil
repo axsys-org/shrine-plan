@@ -1,0 +1,66 @@
+- lain_peek
+
+' Ephemeral, bounded memoization of named reads. Entries contain observations,
+' not assertions; dropping this cache changes cost, never namespace meaning.
++ view_cache
+  : entries=axal[view_cache/entry] order=row[path]
+    evaluations=nat validations=nat hits=nat
+  + entry
+    : epoch=nat authority=pin[any] answer=view_evaluation
+  + new
+    ^ view_cache
+    | view_cache (axal/new[view_cache/entry] .none) [] 0 0 0
+  + key
+    \ request=view_read
+    ^ path
+    = source request.source
+      prefix=path [(care/seg source.care) ($u source.ver) ($u source.path.len)]
+      key prefix.weld(source.path)
+      all=iota 'all
+      names=iota 'names
+      slots=iota 'slots
+    ? request.select
+     > .all key.snoc(all)
+     > .names key.snoc(names)
+     > (./slots keys)
+       | keys.fold key.snoc(slots)
+         \ out slot
+         | out.snoc(($u slot.len)).weld(slot)
+  + keep
+    \ key=path entry=view_cache/entry cache=view_cache
+    ^ view_cache
+    = present (maybe/is_some cache.entries.get(key))
+      order (? present cache.order cache.order.snoc(key))
+      entries cache.entries.put(key entry)
+      bounded
+        ? (le order.len 256) cache.set_entries(entries).set_order(order)
+        | cache.set_entries(entries.del(order.at(0))).set_order(order.drop(1))
+    bounded
+  + read
+    ' The authority token separates namespaces and trusted definition sets.
+    ' An unchanged epoch is a constant-time hit; after a write only the
+    ' observed projections are compared before deciding to rerun a formula.
+    \ request=view_read reader=namespace_reader epoch=nat authority=pin[any] cache=view_cache
+    ^ [view_evaluation view_cache bool]
+    = key (view_cache/key request)
+      reused=maybe[view_cache/entry]
+        ?> (./some previous) (cache.entries.get(key)) .none
+        ? !(equal previous.authority authority) .none
+        ? (eq previous.epoch epoch) (./some previous)
+        ? (woven_valid previous.answer reader) (./some previous)
+        .none
+    ? reused
+     > (./some previous)
+       = changed !(eq previous.epoch epoch)
+         updated (view_cache/keep key previous.set_epoch(epoch) cache)
+       [previous.answer updated.set_validations((add cache.validations changed)).set_hits(cache.hits.inc) .true]
+    = answer (woven_read request reader)
+      next cache.set_evaluations(cache.evaluations.inc)
+      next
+        ? !(?=((./known _) answer.value)) next
+        | view_cache/keep key (view_cache/entry epoch authority answer) next
+    [answer next .false]
+  + namespace_read
+    \ request=view_read state=namespace cache=view_cache
+    ^ [view_evaluation view_cache bool]
+    | view_cache/read request (sovereign_reader state) state.local.top (pin [state.self state.system]) cache

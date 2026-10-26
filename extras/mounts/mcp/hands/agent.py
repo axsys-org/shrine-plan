@@ -467,6 +467,68 @@ def keep_sources(world, writes):
     return extra
 
 
+# ---- the world's own views: relations and the union from the kernel's standard woven cells, read at /o
+def unref(v):
+    m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(v or ''))
+    return m.group(1) if m else (v if isinstance(v, str) and v.startswith('/') else None)
+
+
+def world_of_path(p):
+    segs = [x for x in str(p).split('/') if x]
+    return segs[segs.index('user') - 1] if 'user' in segs and segs.index('user') > 0 else (segs[0] if segs else '')
+
+
+def views_of(world, at):
+    """relations and union for a thing, in the shapes the agent's reading expects, or None without kernel views."""
+    rn = world.view('relations', at)
+    if rn is None:
+        return None
+    relations = []
+    for rel, props in rn.items():
+        m = re.match(r'^/(out|in|part)/(\d+)/(.+)$', rel)
+        if not m or '/assertions/' in rel:
+            continue
+        other = unref(props.get('other'))
+        if not other:
+            continue
+        via = unref(props.get('via')) or other
+        note = {k[5:]: (unref(v) or v) for k, v in props.items() if k.startswith('note/')}
+        relations.append({'way': 'in' if props.get('direction') == 'in' else 'out', 'label': str(props.get('label') or '').lstrip('/'),
+                          'other': other, 'name': props.get('name') or other.rsplit('/', 1)[-1], 'via': via, 'note': note,
+                          'world': world_of_path(via), 'about': unref(props.get('about')) or at})
+    un = world.view('union', at)
+    union = None
+    if un:
+        records = []
+        for rel, props in un.items():
+            m = re.match(r'^/records/(\d+)/(.+)$', rel)
+            if m:
+                p = '/' + m.group(2); records.append({'path': p, 'world': world_of_path(p), 'name': props.get('name') or p.rsplit('/', 1)[-1]})
+        worlds = sorted({r['world'] for r in records})
+        by_slot = {}
+        for rel, props in un.items():
+            m = re.match(r'^/facts/(\d+)/(.+?)/assertions/(\d+)/(.+)$', rel)
+            if not m:
+                continue
+            slot, about, source = m.group(2), unref(props.get('about')), unref(props.get('source')) or ''
+            w = world_of_path(about or source); claim = '/claims/' in source
+            key = re.sub(r'\s+', ' ', str(props.get('value', '')).strip().lower())
+            g = by_slot.setdefault(slot, {}).setdefault(key, {'value': props.get('value'), 'worlds': set(), 'tags': set()})
+            g['tags'].add(w + (f" (claim by {props.get('evidence/by', '?')})" if claim else ''))
+            if not claim:
+                g['worlds'].add(w)
+        facts = [{'kind': 'value', 'value': v['value'], 'labels': [slot], 'worlds': sorted(v['worlds']), 'all': set(worlds) <= v['worlds']}
+                 for slot, vals in by_slot.items() for v in vals.values() if v['worlds']]
+        rels = {}
+        for r in relations:
+            g = rels.setdefault(r['other'], {'kind': 'relation', 'way': r['way'], 'other': r['other'], 'name': r['name'], 'labels': set(), 'worlds': set()})
+            g['labels'].add(r['label'] + (' of' if r['way'] == 'in' else '')); g['worlds'].add(r['world'])
+        facts += [dict(g, labels=sorted(g['labels']), worlds=sorted(g['worlds']), all=set(worlds) <= g['worlds']) for g in rels.values()]
+        disagreements = [{'slot': slot, 'values': {str(v['value']): sorted(v['tags']) for v in vals.values()}} for slot, vals in by_slot.items() if len(vals) > 1]
+        union = {'at': at, 'records': records, 'worlds': worlds, 'facts': facts, 'disagreements': disagreements}
+    return {'relations': relations, 'union': union}
+
+
 class Stopped(Exception):
     def __init__(self, text):
         super().__init__('stopped'); self.text = text
@@ -604,6 +666,9 @@ class AgentHand(Hand):
         """Where a record sits: its ancestors by path and by every overlay that places it, its descendants with overlays
         resolved, and the references in and out."""
         a = self.index('/around?at=' + urllib.parse.quote(at) + f'&depth={depth}')
+        kernel = views_of(self.w, at)
+        if kernel is not None:                                # the world's own relations view, each tagged with the asserting world
+            a = dict(a, relations=kernel['relations'], ready=True, real=a.get('real') or at)
         if not a.get('ready'):
             return ''
         lines = [f"WHERE {at} SITS" + (f" (an overlay of {a['real']})" if a.get('real') and a['real'] != at else '') + ':']
@@ -636,7 +701,7 @@ class AgentHand(Hand):
                 else:
                     lines.append(f"    {r['label']} of: {r['name']} ({r['other']}){note(r)}{tag(r)}")
         # the same thing in other worlds: what each world says, where they agree and where they differ
-        u = self.index('/union?at=' + urllib.parse.quote(a.get('real') or at))
+        u = (kernel or {}).get('union') or self.index('/union?at=' + urllib.parse.quote(a.get('real') or at))
         if len(u.get('worlds') or []) > 1:
             lines.append('  described by worlds ' + ', '.join(u['worlds']) + ': ' + '; '.join(f"{m['world']} at {m['path']}" for m in u['records']))
             agree = [f.get('value') or f"{f['labels'][0]} {f['name']}" for f in u['facts'] if f['all']]

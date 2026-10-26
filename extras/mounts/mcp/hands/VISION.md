@@ -1,5 +1,10 @@
 # Shrine: how the world discovers, organizes, and connects itself
 
+For the cell and overlay implementation, Ian's later
+[`COMPOSABLE_NAMESPACE.md`](COMPOSABLE_NAMESPACE.md) is the governing specification.
+It makes the composable namespace behavior concrete and takes precedence where
+the implementation plans differ. Networking remains a separate phase.
+
 This is the specification the hands are built against, as written by Ian (2026-10-23). Where an implementation
 choice conflicts with it, this document wins. ONTOLOGY.md records the structural scheme that serves it; SYNC.md the
 networking design.

@@ -67,16 +67,18 @@
     ? (and (equal name "mcp/read") (maybe/is_some (mcp_rpc/field "reads" args)))
       = many (mcp_mount/specs self (mcp_rpc/field "reads" args) args)
       ? (eq many.len 0) (mcp_mount/refuse call.id "reads: a list of reads, each a path or {path, care, case, formula, settings, limit, next, present}")
-      | ./snapshot (\ state=namespace (mcp_mount/read_many call.id many state))
+      | mcp_mount/read_many_action call.id many
     ? (and (equal name "mcp/read") (maybe/is_some (mcp_rpc/field "paths" args)))
       = many (mcp_mount/specs self (mcp_rpc/field "paths" args) args)
       ? (eq many.len 0) (mcp_mount/refuse call.id "paths: a list of segmented namespace addresses")
-      | ./snapshot (\ state=namespace (mcp_mount/read_many call.id many state))
+      | mcp_mount/read_many_action call.id many
     ? (equal name "mcp/read")
       ? (mcp_mount/read_spec self args args)
        > (./err why) (mcp_mount/refuse call.id why)
        > (./ok spec)
         ? spec.present (./told (\ state=namespace (mcp_mount/read call.id spec state)) (mcp_mount/shown_line spec))
+        ? (and ((is_xv spec.pax) || ((is_o spec.pax) || (is_r spec.pax))) (and (eq spec.find.len 0) (and (eq spec.referencing.len 0) (eq spec.formula.len 0))))
+          | ./look [(view_read (safe spec.at spec.c spec.pax) .all)] (mcp_mount/look_render call.id (mcp_mount/query_payload spec))
         | ./snapshot (\ state=namespace (mcp_mount/read call.id spec state))
     ?> (./some pax) (mcp_mount/target self first)
       | mcp_mount/refuse call.id mcp_mount/path_rule
@@ -117,7 +119,7 @@
     ?> (./some parsed) (path_parse text) .none
     ? (eq parsed.len 0) (./some [self])
     ? (eq_iota parsed.at(0) self) (./some parsed)
-    ? ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys))))) (./some parsed)
+    ? ((is_r parsed) || ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys)))))) (./some parsed)
     | ./some parsed.cons(self)
   + care
     \ text=str
@@ -133,13 +135,17 @@
     ? (eq_iota seg 'z) (./some .z)
     .none
   + reference
-    ' /h/<care>/<case>/<len>/<path>; case 0 is live.
+    ' Epoch pins retain the complete historical address inside the safe.
+    ' A local record case and a computation snapshot are different clocks.
     \ text=str
     ^ maybe[safe]
     ?> (./some p) (path_parse text) .none
     ? (lt p.len 4) .none
     ? !(eq_iota p.at(0) 'h) .none
     ?> (./some c) (mcp_mount/care_of p.at(1)) .none
+    ? (maybe/is_some (epoch_of p.at(2)))
+      ?> (./some parsed) (h_parse p) .none
+      | ./some (safe 0 c p)
     ?> (./some ver) (dig_of p.at(2)) .none
     ?> (./some ln) (dig_of p.at(3)) .none
     = tgt p.drop(4)
@@ -374,6 +380,8 @@
     ' ride on the root of an answer only.
     \ pax=path tree=axal[myth] state=namespace top=bool
     ^ [row[jkv] nat]
+    ? ((is_xv pax) || ((is_o pax) || (is_r pax)))
+      | mcp_mount/query_node state.local.top pax tree top
     = text (mcp_mount/shown pax)
       x=json
         ?> (./some n) (mcp_mount/case_of pax state) jnull
@@ -408,6 +416,10 @@
     ' page can be re-read.
     \ pax=path tree=axal[myth] state=namespace after=maybe[path] budget=nat top=bool
     ^ [json nat maybe[path] bool nat]
+    | mcp_mount/paged_with pax tree (\ at child top (mcp_mount/node_json at child state top)) after budget top
+  + paged_with
+    \ pax=path tree=axal[myth] node={\ path axal[myth] bool}[row[jkv] nat] after=maybe[path] budget=nat top=bool
+    ^ [json nat maybe[path] bool nat]
     = fresh !(maybe/is_some after)
     ? (and fresh (eq budget 0)) [jnull 0 .none .true 0]
     = none=maybe[path] .none
@@ -421,7 +433,7 @@
         | ./some c.drop(1)
       empty=row[json] []
       [own own_bytes]
-        ? fresh (mcp_mount/node_json pax tree state top)
+        ? fresh (node pax tree top)
         | [[(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "paged" (json/boo .true))] 60]
       ' phase: 0 seeking the cursor's child, 1 rendering, 2 stopped with nodes remaining, 3 past the byte ceiling
       start=[nat row[json] maybe[path] nat nat] [(? fresh budget.dec budget) empty (? fresh (./some pax) none) (? (maybe/is_some seek) 0 1) own_bytes]
@@ -434,7 +446,7 @@
           ? (and (eq ph 0) !on_cursor) acc
           = below=maybe[path] (? on_cursor rest none)
           ? (and !on_cursor (eq l 0)) [l o la 2 b]
-          = [j n la2 m2 b2] (mcp_mount/paged pax.snoc(key) child state below l .false)
+          = [j n la2 m2 b2] (mcp_mount/paged_with pax.snoc(key) child node below l .false)
             total (add b b2)
           ? (gt total mcp_mount/ceiling) [l o la 3 total]
           ' a shell with nothing rendered beneath it (the cursor node itself, say) is not sent again
@@ -485,7 +497,7 @@
     | ./ok (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "find" (json/str text)) (jkv "matches" (json/arr out))
                       (jkv "visited" (json/num .false visited)) (jkv "next" (? more (mcp_mount/cursor_json last more) jnull))])
   + referenced
-    ' referencing: a bounded walk, like find, for the records under the
+    ' referencing: indexed matching holders, paged in path order under the
     ' path whose reference slots point at a thing or beneath it: the
     ' cells over it, the rows that cite it, the questions about it,
     ' written at home by whoever holds them.  Each match names the slot,
@@ -497,7 +509,18 @@
     ^ either[str json]
     = self=iota state.self
       thing=path spec.referencing
-      tree (sorge[myth] .z (sovereign_peek spec.pax state))
+      xs=iota 'x
+      edges=row[reference_edge]
+        | (reference_index/beneath thing state.local.top state.local.references).weld
+          (reference_index/beneath thing.cons(xs) state.local.top state.local.references)
+      tree
+        | edges.fold (axal/new[myth] .none)
+          \ out=axal[myth] edge=reference_edge
+          ? !(pith_prefix spec.pax edge.holder) out
+          = relative edge.holder.drop(spec.pax.len)
+          ? (maybe/is_some out.get(relative)) out
+          ?> (./known record) state.local.x_latest(edge.holder) out
+          | out.put relative record
       empty=row[json] []
       none=maybe[path] .none
       seek=maybe[path] spec.after
@@ -606,6 +629,97 @@
     ? (mcp_mount/answer spec state)
      > (./ok body) [200 (mcp_rpc/result id (mcp_rpc/structured body))]
      > (./err why) (? (equal why "too large, page it") (mcp_mount/too_large id) [200 (mcp_rpc/result id (mcp_rpc/text_content why .true))])
+  + query_node
+    ' Derived answers pin the complete local computation snapshot, not just
+    ' the cell definition's case. All three cares name the same virtual node.
+    \ epoch=nat pax=path tree=axal[myth] top=bool
+    ^ [row[jkv] nat]
+    = text (mcp_mount/shown pax)
+      prefix (str/cat_all ["/h/" "x/e" epoch.show "/" pax.len.show text])
+      ref (json/str prefix)
+      [props bytes]
+        ?> (./some record) tree.fil [(json/obj []) 0]
+        | mcp_mount/record_sized record ref
+      frozen
+        \ care=str
+        ^ json
+        | json/str (str/cat_all ["/h/" care "/e" epoch.show "/" pax.len.show text])
+    [[(jkv "path" (json/str text))
+      (jkv "exists" (json/boo (maybe/is_some tree.fil)))
+      (jkv "reference" ref)
+      (jkv "reference_y" (frozen "y"))
+      (jkv "reference_z" (frozen "z"))
+      (jkv "properties" props)] (add bytes (add (mul 4 text.len) 120))]
+  + look_render
+    ' The mount's payload for a cached read, spliced into the JSON-RPC envelope.
+    \ id=json payload={\ row[res[axal[myth]]] nat}[nat str]
+    ^ {\ row[res[axal[myth]]] nat}[nat str]
+    | (\ values=row[res[axal[myth]]] epoch=nat (mcp_mount/wrapped id payload values epoch))
+  + wrapped
+    \ id=json payload={\ row[res[axal[myth]]] nat}[nat str] values=row[res[axal[myth]]] epoch=nat
+    ^ [nat str]
+    = [status body] (payload values epoch)
+    | mcp_mount/query_wrap id status body
+  + query_wrap
+    \ id=json status=nat body=str
+    ^ [nat str]
+    | [status (mcp_rpc/encoded_result id body)]
+  + query_payload
+    \ spec=mcp_mount/spec values=row[res[axal[myth]]] epoch=nat
+    ^ [nat str]
+    = result=json
+        ? (mcp_mount/query_body spec values.at(0) epoch)
+         > (./ok body) (mcp_rpc/structured body)
+         > (./err why) (mcp_rpc/text_content why .true)
+    | [200 (show result)]
+  + query_body
+    \ spec=mcp_mount/spec value=res[axal[myth]] epoch=nat
+    ^ either[str json]
+    = tree
+        ?> (./known tree) value (axal/new[myth] .none)
+        tree
+      [result nodes last more bytes]
+        | mcp_mount/paged_with spec.pax tree (mcp_mount/query_node epoch) spec.after spec.budget .true
+    ? (gt bytes mcp_mount/ceiling) (./err "too large, page it")
+    = resolution=str
+        ? value
+         > (./known _) "known"
+         > .null "absent"
+        "unresolved"
+    = body=json
+        ?> (./obj fields) result result
+        | json/obj fields.snoc((jkv "nodes" (json/num .false nodes))).snoc((jkv "next" (mcp_mount/cursor_json last more))).snoc((jkv "resolution" (json/str resolution)))
+    | ./ok body
+  + read_many_action
+    ' A batch of computed paths shares both a snapshot and the native cache.
+    ' Mixed searches/formulas retain the existing general snapshot behavior.
+    \ id=json many=row[mcp_mount/entry]
+    ^ http_foot/action
+    = eligible
+        | many.all
+          \ entry=mcp_mount/entry
+          ?> (./some spec) entry.spec .true
+          | and (mcp_mount/derived spec.pax) (and (eq spec.find.len 0) (and (eq spec.referencing.len 0) (eq spec.formula.len 0)))
+    ? !eligible (./snapshot (\ state=namespace (mcp_mount/read_many id many state)))
+    = specs (mcp_mount/wanted many)
+      reads (specs.map((\ spec (view_read (safe spec.at spec.c spec.pax) .all))))
+    | ./look reads (mcp_mount/look_render id (mcp_mount/query_many_payload many))
+  + query_many_payload
+    \ many=row[mcp_mount/entry] values=row[res[axal[myth]]] epoch=nat
+    ^ [nat str]
+    = empty=row[json] []
+      start=[nat row[json]] [0 empty]
+      [count answers]
+        | many.fold start
+          \ [count answers] entry
+          ?> (./some spec) entry.spec
+            | [count answers.snoc((json/obj [(jkv "path" (json/str entry.text)) (jkv "error" (json/str entry.why))]))]
+          = body=json
+              ? (mcp_mount/query_body spec values.at(count) epoch)
+               > (./ok body) body
+               > (./err why) (json/obj [(jkv "path" (json/str entry.text)) (jkv "error" (json/str why))])
+          | [count.inc answers.snoc(body)]
+    | [200 (show (mcp_rpc/structured (json/obj [(jkv "answers" (json/arr answers))])))]
   + too_large
     \ id=json
     ^ [nat str]
@@ -728,7 +842,9 @@
            > (./known t) t
           (axal/new[myth] .none)
       | sorge[myth] spec.c got
-    | sorge[myth] spec.c (sovereign_peek spec.pax state)
+    ? (sovereign_view spec.c 0 spec.pax state)
+     > (./known tree) tree
+    | sorge[myth] spec.c (sovereign_history_prefix spec.pax)
   + answer
     ' The answer to one read: the records found when find is given, the
     ' tree page, or the formula's result with
@@ -781,7 +897,7 @@
   + derived
     \ pax=path
     ^ bool
-    | ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax))))
+    | ((is_r pax) || ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax)))))
   + writes
     ' One writ per record spec, or the reason the whole batch is refused
     ' before any event: a derived path, a bad path, or bad properties.

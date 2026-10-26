@@ -56,6 +56,39 @@ class World:
     def read(self, path, care='x', **more):
         return self.tool('read', path=path, care=care, **more)
 
+    def view(self, name, thing):
+        """A standard woven view (relations, union, as_world, frontier, beneath, links) applied to a thing, read from
+        the world at /o: every node beneath the application keyed by its relative path, slots without the leading
+        slash. None when the world has no such definition (an older kernel) or the view faulted."""
+        node = '/' + self.node
+        case = self._view_cases.get(name) if hasattr(self, '_view_cases') else None
+        if case is None:
+            try:
+                r = self.read(f'{node}/weft/graph/{name}', 'x')
+                m = re.match(r'^/h/x/(\d+)/', str(r.get('reference') or ''))
+                case = int(m.group(1)) if r.get('exists') and m else 0
+            except Exception:
+                case = 0
+            self._view_cases = getattr(self, '_view_cases', {}); self._view_cases[name] = case
+        if not case:
+            return None
+        defn = [self.node, 'weft', 'graph', name]; segs = [x for x in str(thing).split('/') if x]
+        base = f"/o/{case}/{len(defn)}/{'/'.join(defn)}/{len(segs)}/{'/'.join(segs)}"
+        nodes, nxt = {}, None
+        for _ in range(20):
+            r = self.read(base, 'z', limit=500, **({'next': nxt} if nxt else {}))
+            def visit(n):
+                if n.get('path', '').startswith(base):
+                    nodes[n['path'][len(base):]] = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
+                for c in n.get('children') or []:
+                    visit(c)
+            visit(r); nxt = r.get('next')
+            if not nxt:
+                break
+        if not nodes or nodes.get('', {}).get('sys/view/fault'):
+            return None
+        return nodes
+
     def read_all(self, path, care='y'):
         """A folder whole: every page's nodes indexed by path, then one tree rebuilt from the index."""
         nodes, order = {}, {}

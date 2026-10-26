@@ -606,7 +606,7 @@ class WebHand(Hand):
                 if have.get('/digest') != digest or int(float(have.get('/extractor') or 1)) < EXTRACTOR:   # the index: a page once, its regions beneath
                     old = [c['path'] for c in (self.w.read(ppath, 'y', limit=200).get('children') or []) if re.search(r'/r\d+$', c['path'])]
                     recs = [{'path': c, 'action': 'cull'} for c in old if int(c.rsplit('/r', 1)[1]) > len(regions[:60])]
-                    recs += [{'path': ppath, 'slots': {'url': url, 'title': ptitle or title, 'fetched': int(time.strftime('%Y%m%d')), 'digest': digest, 'regions': len(regions), 'extractor': EXTRACTOR}}]
+                    recs += [{'path': ppath, 'slots': {'url': url, 'title': ptitle or title, 'fetched': int(time.strftime('%Y%m%d')), 'digest': digest, 'regions': len(regions), 'extractor': EXTRACTOR, 'domain': urllib.parse.urlparse(url).hostname or '', 'endpoint': urllib.parse.urlparse(url).path or '/'}}]
                     recs += [{'path': f'{ppath}/r{i}', 'slots': {'heading': r['heading'], 'level': r['level'], 'text': r['text']}} for i, r in enumerate(regions[:60], 1)]
                     self.w.tool('write', records=recs, who=self.name)
                 nv += 1

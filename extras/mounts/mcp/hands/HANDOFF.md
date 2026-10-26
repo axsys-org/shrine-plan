@@ -1,9 +1,51 @@
 # Handoff: finishing Shrine's worlds, properly
 
+> Implementation checkpoint, 2026-10-25: native demand cells, indexed incoming
+> references, addressable computed children, local epoch pins and observation
+> caches now have isolated passing tests. The named outline operator reads
+> available names without evaluating the placed records; gather retains an
+> explicit unresolved branch when a member cannot be evaluated. The MCP tests
+> verify shallow reads and reusable computation pins. These changes are not
+> yet deployed to the saved Explorer world. Core publication succeeds in a
+> disposable clone; safe service/mount reconstruction is still being tested.
+> Python graph-policy replacement, chat side panel, and equivalent end-to-end
+> performance comparison remain unfinished. Do not describe the original plan
+> below as the current implementation or claim performance parity.
+>
+> Latest product clarification: distinguish canonical knowledge, an instantiated
+> view, and its reusable definition. New established references should enrich
+> existing live views. Task views may reuse other views directly; they need not
+> first expand As a World. Structure is observable independently of record
+> contents. Coverage is an evidenced claim with an explicit scope, never inferred
+> from the number of results or a missing record. Native discovery and compatible
+> input bindings can automate routine reuse; choosing an interpretation, asserting
+> identity, or judging a source still requires justified semantic decisions.
+
+> Update, 2026-10-25: Ian designated `COMPOSABLE_NAMESPACE.md` as the governing
+> product specification for this work. Read it first. The objective is a
+> composable namespace, including addressable virtual children, reference
+> traversal, complete dependency pins, bounded branch reads, and precise cache
+> invalidation. Explorer is a compatibility target; its JSON does not define
+> the architecture. The special graph routes proposed in step 2 below are
+> superseded by generic kernel mechanisms and named Foil computations. Adding
+> a world within a path contributes its matching locality; it never resets to
+> that world's root. Structural composition and identity joins are distinct.
+> Networking remains out of scope. The five-world example is a target fixture,
+> not a claim about implemented peers.
+
 For the next agent. This is the whole context: what we are making, what exists, what is wrong with it, the kernel
 facts the plan depends on, the plan in order with acceptance checks, and the rules of the house. Written
 2026-10-25 on branch `ic-bare-loop` of the `shrine-cells` checkout, at commit `8386eec` plus the files this handoff
 adds. Read VISION.md (Ian's spec, the authority), then ONTOLOGY.md (the scheme and the split), then this.
+
+
+> **2026-10-25, late.** `ASSEMBLY.md` beside this file is Ian's statement of the finished shape: independent agents
+> discover and write back; the kernel's views reveal the routes by which the pieces connect; the routes are the
+> agent's research signal. It adds two views to build after the ground below is real: a **conjunction** view (several
+> names in, the connecting routes, the shared hub, the disconnected regions with evidence-backed ways forward; the
+> Python `between`/`reach` today) and a **working-world summary** (connected, uncertain, missing, reusable views, next
+> operations, a few hundred tokens), widened by ASSEMBLY.md part two into a **connection workspace**: components over a set of names, every edge labelled established or tentative, candidate bridges, isolated regions; the relation reader must stop dropping `/web/` targets and label them instead. Its guard applies to all of these: rank paths by evidence, never by count or hop
+> distance; a mention or a name match is never an established connection.
 
 ## 0. The point, in one paragraph
 
@@ -339,3 +381,49 @@ x/eden, x/check, x/foil-check          boot a world; run Foil suites
 4. Cost of a z read over `/0x11/user` (5,500 records) inside a formula, for the digest queue as a cell.
 5. Streaming replies: drop, or keep a Python relay. Ian decides.
 6. The SIGABRT in `nat.c pl_limb_view` when several hands restart at once: not root-caused; watch for it.
+
+## State at the end of 2026-10-26 (early hours)
+
+What runs natively now, on a fresh world booted from this tree with records replayed (`extras/mounts/mcp/tests/strangers/replay.py`
+writes a `snapshot.py` fingerprint back through MCP, references live):
+
+- the graph registry at `/weft/graph`, seventeen names, `workspace` new: several standings (the input and
+  `standing/<key>` slots) as one picture: components over established hops, routes between standings with every hop
+  attributed and marked `solid` or `mention`, islands, gaps with the count of tentative routes between the pair;
+- edge strength on every relation (`graph_views/relation.strength`): a reference slot or judgement is solid; a stored
+  text's `/mentions` record naming the thing is a mention, emitted as an `in` relation labelled `mentioned` to the
+  text, drawn tentative in as_world and frontier, never opened further; the walker no longer skips `mentioned`;
+- as_world items carry `tentative`, a text's heading or page title stands in for a missing `name`;
+- the live page draws as-world with its notes, the mentioned folder with tentative items dashed, and a workspace
+  section: add to workspace / drop, meter (components, islands, reached, tentative, opened), islands, routes with
+  their hops and notes (soft hops amber), gaps with their tentative-route count. The page writes the workspace cell
+  at `/<node>/user/views/workspace` and reads `/x` of it, exactly as an agent would;
+- the web hand writes `domain` and `endpoint` on each page record (identity), beside url, title, fetched, digest.
+
+Proof seen in the browser: Verisk, Ian Channer and Double Indemnity as standings: Verisk to Ian is one established
+hop; Verisk to the film is five hops, two through one web text region that names both London and California, drawn
+tentative end to end, and the film stays an island because only established hops join components.
+
+Open, with evidence:
+
+- `beneath` faults (`iota-cmp-bad-quip`, HTTP 500) on its y branch for any record whose children have children;
+  the z branch answers. The page falls back to the record's ordinary read for "beneath". Not located; probe with
+  `/o/<case>/4/0x11/weft/graph/beneath/<n>/<path>` at care y against `people/forbes_mckenzie`.
+- The saved-world migration (`.check/native-views/run_candidate_upgrade.py`) does not publish this kernel: on a
+  fresh clone (`upgrade-clone-v3`, copy-on-write from the stopped world) `publication:publish-local` traps with a
+  three-arm `unreachable` (a pail match over values of another brand) and `up-published-result` stays unbound.
+  Codex's own baseline source fails the same way on the old clone, which had accumulated state from every run, so
+  bisect on fresh clones only (`cp -c -R` of the world's `snap` is instant). Until then a fresh world plus replay is
+  the way to run this kernel over the saved records; history and cases are not carried.
+- `read_fuel` is 32768 (was 256) and `graph_world/nodes` 150 (was 200): a loop bound now, not a budget; as_world
+  on a thing with a hundred relations reads each opened record's frontier, identities and incoming edges.
+- The store answers `unknown`, not `null`, for a name never written. The graph readers (`record`, `frontier`,
+  `incoming`) therefore draw an unknown target as a thing with no record instead of failing the view; before this
+  one dangling reference made a whole as_world unknown. `replay.py` now writes slotless records too (374 of them),
+  since a folder record with no slots is still a record.
+- `relations` names its items by `name` only; a text item shows as its slug there (as_world reads heading/title).
+- The retained-stage probes in the pipeline (`RETAINED-TYPE-BRAND`, `RETAINED-REFERENCES`) compare against the
+  compiler template's kernel and read 0 for any source that differs from Codex's; the migration stage's
+  `UPGRADE-VERISK-REFERENCES 55` is the like-for-like count.
+- Topics as things, and web identity (domain) as a vertex the overlay joins through, are not yet views; mentions
+  carry the grey today. Firecrawl stays in the Python web hand; only its results are namespace records.

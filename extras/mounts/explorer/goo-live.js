@@ -636,9 +636,181 @@ function mcpSource(opts = {}) {
     for (const [slot, ms] of Object.entries(r.by || {})) out[slot] = ms.map(m => ({ path: local(m.path), slot, cell: !!m.cell, hole: !!m.hole }));
     return out;
   }
-  async function unfold(path, depth) { const r = await index('/unfold?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? r.folders || [] : null; }
-  async function union(path) { const r = await index('/union?at=' + encodeURIComponent(world(path))); return r && r.ready ? r : null; }
-  async function around(path, depth) { const r = await index('/around?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 2)); return r ? { real: r.real, ancestors: r.ancestors || [], descendants: r.descendants || [], relations: r.relations || [], refsOut: r.refs_out || [], refsIn: r.refs_in || [], parts: r.parts || [] } : null; }
+  // ---- the views, read from the world: a standard woven cell under /<node>/weft/graph applied to the thing at /o.
+  // Each is a name the kernel computes, bounded and cached; the Python index on 8312 is only the fallback when a
+  // world has no definitions (an old kernel).
+  const defCases = {};
+  async function defCase(name) {
+    const node = local(views).split('/')[0] || '0x11';
+    const key = node + '/' + name;
+    if (key in defCases) return defCases[key];
+    try {
+      const r = await rpc('read', { path: '/' + node + '/weft/graph/' + name, care: 'x' });
+      const m = /^\/h\/x\/(\d+)\//.exec(r && r.reference || '');
+      defCases[key] = r && r.exists && m ? { node, case: Number(m[1]) } : null;
+    } catch (e) { defCases[key] = null; }
+    return defCases[key];
+  }
+  const oPath = (def, thing) => { const d = [def.node, 'weft', 'graph', def.name], t = local(thing).split('/').filter(Boolean); return '/o/' + def.case + '/' + d.length + '/' + d.join('/') + '/' + t.length + '/' + t.join('/'); };
+  const unref = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? m[1] : (typeof v === 'string' && v.startsWith('/') ? v : null); };
+  const worldOf = p => { const segs = local(p).split('/'); const i = segs.indexOf('user'); return i > 0 ? segs[i - 1] : (segs[0] || ''); };
+  // every node of a computed tree, keyed by its path beneath the application, slots with the leading slash dropped
+  async function computed(def, thing) {
+    const base = oPath(def, thing), nodes = {};
+    let next = null;
+    for (let page = 0; page < 20; page++) {
+      const r = await rpc('read', { path: base, care: 'z', limit: 500, ...(next ? { next } : {}) });
+      const visit = n => { if (n && n.path) { const rel = n.path.startsWith(base) ? n.path.slice(base.length) : null; if (rel !== null) nodes[rel] = Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); } for (const c of (n && n.children) || []) visit(c); };
+      visit(r);
+      next = r && r.next; if (!next) break;
+    }
+    if (!Object.keys(nodes).length) return null;
+    if (nodes[''] && nodes['']['sys/view/fault']) return null;
+    return nodes;
+  }
+  // a thing as a world: folders <dir>/<n>/<label...>, items <n>/<name...> beneath them, an item's own folders beneath it
+  function foldersOf(nodes, prefix) {
+    const segsOf = rel => rel.split('/').filter(Boolean);
+    const here = segsOf(prefix);
+    const out = [];
+    for (const [rel, props] of Object.entries(nodes)) {
+      const segs = segsOf(rel);
+      if (segs.length < here.length + 2 || !here.every((h, i) => segs[i] === h)) continue;
+      const dir = segs[here.length], n = Number(segs[here.length + 1]);
+      if (!['out', 'part', 'in'].includes(dir) || !Number.isInteger(n) || segs.length !== here.length + 2 + n) continue;
+      const label = segs.slice(here.length + 2).join('/');
+      const fprefix = '/' + segs.join('/');
+      const items = [];
+      for (const [irel, iprops] of Object.entries(nodes)) {
+        const isegs = segsOf(irel);
+        if (isegs.length <= segs.length || !segs.every((h, i) => isegs[i] === h)) continue;
+        const m = Number(isegs[segs.length]);
+        if (!Number.isInteger(m) || isegs.length !== segs.length + 1 + m) continue;
+        const name = '/' + isegs.slice(segs.length + 1).join('/');
+        const by = String(iprops.by || '').split(' ').filter(Boolean);
+        const note = {}; for (const [k, v] of Object.entries(iprops)) if (k.startsWith('note/')) note[k.slice(5)] = v;
+        const it = { path: name, name: iprops.name || name.split('/').pop().replace(/_/g, ' '), world: iprops.world || worldOf(name), by: by[0] || '', worlds: by.length ? by : [iprops.world || worldOf(name)], note };
+        if (iprops.seen) it.seen = true;
+        if (iprops.tentative) it.tentative = true;
+        if (iprops.also) it.labels = [label].concat(String(iprops.also).split(', '));
+        const sub = foldersOf(nodes, '/' + isegs.join('/'));
+        if (sub.length) it.folders = sub;
+        items.push(it);
+      }
+      const f = { label: dir === 'in' ? label + ' of' : label, items };
+      if (props.more) f.more = Number(props.more);
+      if (props.closed) { f.closed = true; f.more = Number(props.count || 0); }
+      out.push(f);
+    }
+    return out;
+  }
+  async function unfoldNative(path, depth) {
+    const def = await defCase(depth === 1 ? 'frontier' : 'as_world');
+    if (!def) return null;
+    const nodes = await computed({ ...def, name: depth === 1 ? 'frontier' : 'as_world' }, path);
+    return nodes ? foldersOf(nodes, '') : null;
+  }
+  // what every world says: the records joined by same, their facts by value with the worlds asserting each, and the
+  // relations, from the union view's records, facts and relations branches
+  async function unionNative(path) {
+    const def = await defCase('union');
+    if (!def) return null;
+    const nodes = await computed({ ...def, name: 'union' }, path);
+    if (!nodes) return null;
+    const norm = v => String(v).trim().toLowerCase();
+    const records = [];
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/records\/(\d+)\/(.+)$/.exec(rel); if (!m) continue;
+      const p = '/' + m[2]; records.push({ path: p, world: worldOf(p), name: props.name || p.split('/').pop() });
+    }
+    const worlds = [...new Set(records.map(r => r.world))].sort();
+    const facts = [], bySlot = {};
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/facts\/(\d+)\/(.+?)\/assertions\/(\d+)\/(.+)$/.exec(rel); if (!m) continue;
+      const slot = m[2].replace(/\//g, '/'), about = unref(props.about), source = unref(props.source) || '';
+      const w = worldOf(about || source), claim = source.includes('/claims/');
+      const key = norm(props.value);
+      const tag = claim ? w + ' (claim by ' + (props['evidence/by'] || '?') + ')' : w;
+      const g = (bySlot[slot] = bySlot[slot] || {}); (g[key] = g[key] || { value: props.value, worlds: new Set(), tags: new Set() });
+      g[key].tags.add(tag); if (!claim) g[key].worlds.add(w);
+    }
+    for (const [slot, vals] of Object.entries(bySlot)) for (const [k, v] of Object.entries(vals)) {
+      if (!v.worlds.size) continue;
+      facts.push({ kind: 'value', value: v.value, labels: [slot], worlds: [...v.worlds].sort(), all: worlds.every(w => v.worlds.has(w)) });
+    }
+    const rels = {};
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/relations\/(out|in|part)\/(\d+)\/(.+)$/.exec(rel); if (!m || rel.includes('/assertions/')) continue;
+      const other = unref(props.other); if (!other) continue;
+      const w = worldOf(unref(props.via) || other);
+      const label = String(props.label || '').replace(/^\//, '') + (props.direction === 'in' ? ' of' : '');
+      const g = (rels[other] = rels[other] || { kind: 'relation', way: props.direction === 'in' ? 'in' : 'out', other, name: props.name || other.split('/').pop(), labels: new Set(), worlds: new Set() });
+      g.labels.add(label); g.worlds.add(w);
+    }
+    for (const g of Object.values(rels)) facts.push({ ...g, labels: [...g.labels], worlds: [...g.worlds].sort(), all: worlds.every(w => g.worlds.has(w)) });
+    const disagreements = Object.entries(bySlot).filter(([slot, vals]) => Object.keys(vals).length > 1).map(([slot, vals]) => ({ slot, values: Object.fromEntries(Object.values(vals).map(v => [String(v.value), [...v.tags].sort()])) }));
+    return { at: world(path), records, worlds, facts, disagreements, ready: true };
+  }
+  // around: the relations view for the relations, the beneath view for the stored children
+  async function aroundNative(path, depth) {
+    const rdef = await defCase('relations'), bdef = await defCase('beneath');
+    if (!rdef || !bdef) return null;
+    const rn = await computed({ ...rdef, name: 'relations' }, path);
+    if (!rn) return null;
+    const relations = [];
+    for (const [rel, props] of Object.entries(rn)) {
+      const m = /^\/(out|in|part)\/(\d+)\/(.+)$/.exec(rel); if (!m || rel.includes('/assertions/')) continue;
+      const other = unref(props.other); if (!other) continue;
+      const note = {}; for (const [k, v] of Object.entries(props)) if (k.startsWith('note/')) note[k.slice(5)] = unref(v) || v;
+      relations.push({ way: props.direction === 'in' ? 'in' : 'out', label: String(props.label || '').replace(/^\//, ''), other, name: props.name || other.split('/').pop(), via: unref(props.via) || other, note, world: worldOf(unref(props.via) || other), about: unref(props.about) || world(path) });
+    }
+    const bn = await computed({ ...bdef, name: 'beneath' }, path).catch(() => null);   // the stored children are a part; without them the relations still stand
+    const descendants = [];
+    if (bn) {
+      const build = prefix => Object.entries(bn).filter(([rel]) => rel.startsWith(prefix + '/') && rel.slice(prefix.length + 1).indexOf('/') < 0).map(([rel, props]) => { const node = { path: world(path) + rel, name: props.name || rel.split('/').pop().replace(/_/g, ' '), real: null, note: null }; const kids = build(rel); if (kids.length) node.next = kids; return node; });
+      descendants.push(...build(''));
+    }
+    const segs = local(path).split('/'); const chain = []; for (let i = segs.length - 1; i >= 2; i--) chain.push({ path: '/' + segs.slice(0, i).join('/'), name: segs[i - 1].replace(/_/g, ' ') });
+    return { real: world(path), ancestors: [{ via: world(path), chain }], descendants, relations, refsOut: [], refsIn: [], parts: [] };
+  }
+  // the workspace: several standings as one picture. The page keeps the standings and writes them as one cell record
+  // under /<node>/user/views/workspace (sys/weft -> the workspace definition, sys/tack and standing/<k> -> the standings,
+  // live); the kernel computes components, routes, islands and gaps on read, exactly as an agent's own cell would.
+  const wsPath = () => '/' + (local(views).split('/')[0] || '0x11') + '/user/views/workspace';
+  const liveRef = (path, care) => ({ type: 'reference', value: '/h/' + (care || 'y') + '/0/' + local(path).split('/').filter(Boolean).length + '/' + local(path) });
+  async function workspaceNative(standings, depth) {
+    const def = await defCase('workspace');
+    if (!def || !standings.length) return null;
+    const slots = { 'sys/weft': { type: 'reference', value: '/h/x/' + def.case + '/4/' + def.node + '/weft/graph/workspace' }, 'sys/tack': liveRef(standings[0], 'x'), depth: depth || 3 };
+    standings.slice(1).forEach((p, i) => { slots['standing/' + String.fromCharCode(98 + i)] = liveRef(p, 'x'); });
+    await rpc('write', { records: [{ path: wsPath(), slots, action: 'set' }], who: 'person' });
+    const base = '/x' + wsPath(), nodes = {};
+    let next = null;
+    for (let page = 0; page < 20; page++) {
+      const r = await rpc('read', { path: base, care: 'z', limit: 500, ...(next ? { next } : {}) });
+      const visit = n => { if (n && n.path && n.path.startsWith(base)) nodes[n.path.slice(base.length)] = Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); for (const c of (n && n.children) || []) visit(c); };
+      visit(r); next = r && r.next; if (!next) break;
+    }
+    const root = nodes[''] || {};
+    if (root['sys/view/fault']) return { fault: root['sys/view/fault'] };
+    const num = v => Number(v) || 0;
+    const noteOf = p => { const o = {}; for (const [k, v] of Object.entries(p)) if (k.startsWith('note/')) o[k.slice(5)] = unref(v) || v; return o; };
+    const stand = [], routes = [], gaps = [];
+    for (const [rel, p] of Object.entries(nodes)) {
+      let m;
+      if ((m = /^\/standing\/(\d+)$/.exec(rel))) stand[Number(m[1])] = { i: Number(m[1]), path: unref(p.at) || standings[Number(m[1])], world: p.world, component: num(p.component), island: ['yes', 'true', true].includes(p.island) };
+      else if ((m = /^\/route\/(\d+)$/.exec(rel))) routes[Number(m[1])] = { from: num(p.from), to: num(p.to), at: p.at, hops: num(p.hops), soft: num(p.soft), here: [], there: [] };
+      else if ((m = /^\/gap\/(\d+)$/.exec(rel))) gaps.push({ from: num(p.from), to: num(p.to), tentative: num(p.tentative) });
+    }
+    for (const [rel, p] of Object.entries(nodes)) {
+      const m = /^\/route\/(\d+)\/(here|there)\/(\d+)$/.exec(rel); if (!m || !routes[Number(m[1])]) continue;
+      routes[Number(m[1])][m[2]][Number(m[3])] = { label: String(p.label || '').replace(/^\//, ''), other: unref(p.other), by: p.by, strength: p.strength, direction: p.direction, note: noteOf(p) };
+    }
+    return { standings: stand.filter(Boolean), routes: routes.filter(Boolean), gaps, components: num(root.components), islands: num(root.islands), reach: num(root.reach), tentative: num(root.tentative), opened: num(root.opened) };
+  }
+  async function unfold(path, depth) { const n = await unfoldNative(path, depth || 3).catch(() => null); if (n) return n; const r = await index('/unfold?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 3)); return r ? r.folders || [] : null; }
+  async function union(path) { const n = await unionNative(path).catch(() => null); if (n) return n; const r = await index('/union?at=' + encodeURIComponent(world(path))); return r && r.ready ? r : null; }
+  async function around(path, depth) { const n = await aroundNative(path, depth || 2).catch(() => null); if (n) return n; const r = await index('/around?at=' + encodeURIComponent(world(path)) + '&depth=' + (depth || 2)); return r ? { real: r.real, ancestors: r.ancestors || [], descendants: r.descendants || [], relations: r.relations || [], refsOut: r.refs_out || [], refsIn: r.refs_in || [], parts: r.parts || [] } : null; }
   async function candidates(path) { const r = await index('/candidates' + (path ? '?in=' + encodeURIComponent(world(path)) : '')); return r ? (r.candidates || []) : []; }
   async function backlinks(path) {
     // the links hand keeps every reference in memory and answers in milliseconds; the kernel walk below is the fallback
@@ -725,7 +897,7 @@ function mcpSource(opts = {}) {
     await rpc('write', { records: [{ path, slots }], who: who || 'person' });
     return path;
   }
-  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, around, unfold, union };
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, by, candidates, accept, around, unfold, union, workspace: workspaceNative };
 }
 
 // the record page: one record, its slots (each reference a link), what is beneath it, and what points at it; every
@@ -802,7 +974,7 @@ function mountRecord(el, source, opts = {}) {
     // a reading, not a crawl: folders beyond the subject arrive closed, as counts, and open on demand
     const folder_ = (f, parent) => f.closed
       ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}"><span class="vf">${esc(f.label)}</span> <span class="n">${f.more}</span></button></li>`
-      : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => `<li${it.seen ? ' class="seen"' : ''}>${goHTML(local(it.path), local(it.path), it.name, 'n')}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.note && Object.keys(it.note).length ? ` <span class="s">${esc(noteText(it.note))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
+      : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => `<li class="${it.seen ? 'seen' : ''}${it.tentative ? ' tent' : ''}">${goHTML(local(it.path), local(it.path), it.name, 'n')}${it.tentative ? ' <span class="s tent" title="reached only through a text that names it; not counted until digested or judged">tentative</span>' : ''}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.note && Object.keys(it.note).length ? ` <span class="s">${esc(noteText(it.note))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
     const world_ = (fs, parent) => `<ul class="sv-tree sv-world">${fs.map(f => folder_(f, parent)).join('')}</ul>`;
     openFolder = async btn => {
       btn.disabled = true;
@@ -816,6 +988,22 @@ function mountRecord(el, source, opts = {}) {
       target.replaceWith(holder.firstElementChild);
     };
     const worldHTML = u && u.length ? `<div class="sv-sec"><div class="k">as a world</div>${world_(u, at)}</div>` : '';
+    // the workspace: this record beside the standings the person gathered; the kernel says what connects, what is an
+    // island, and where the route goes soft (a hop that exists only because a text names the thing)
+    const wsKey = 'sv-workspace'; let wsList = []; try { wsList = JSON.parse(localStorage.getItem(wsKey) || '[]'); } catch (e) { wsList = []; }
+    const wsAll = [local(at)].concat(wsList.filter(p => p !== local(at)));
+    const ws = source.workspace && wsAll.length > 1 ? await source.workspace(wsAll, 3).catch(e => ({ fault: String(e && e.message || e).slice(0, 120) })) : null;
+    if (mine !== drawn) return;
+    const hopHTML = h => `<span class="sv-ws-hop${h.strength === 'mention' ? ' tent' : ''}"><span class="lb">${esc(h.direction === 'in' ? h.label + ' of' : h.label)}</span> ${goHTML(local(h.other), local(h.other), last(h.other).replace(/_/g, ' '), 'n')}${h.note && Object.keys(h.note).length ? ` <span class="s">${esc(noteText(h.note))}</span>` : ''}${h.by && h.by !== here ? ` <span class="sv-wb by">by ${esc(h.by)}</span>` : ''}</span>`;
+    const standName = i => ws && ws.standings[i] ? last(ws.standings[i].path).replace(/_/g, ' ') : '?';
+    const routeHTML = r => `<div class="sv-hop sv-ws-route${r.soft ? ' tent' : ''}"><span class="lb">${esc(standName(r.from))} → ${esc(standName(r.to))}</span> <span class="s">${r.hops} hop${r.hops === 1 ? '' : 's'}${r.soft ? ` · ${r.soft} through a text` : ' · all established'}</span><div class="sv-ws-path">${r.here.map(hopHTML).join(' <span class="sep">›</span> ')}${r.there.length ? ' <span class="sep">‹</span> ' + r.there.slice().reverse().map(hopHTML).join(' <span class="sep">‹</span> ') : ''}</div></div>`;
+    const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
+    const wsBody = !ws ? '' : ws.fault ? `<div class="sv-note bad">${esc(ws.fault)}</div>` :
+      `<div class="sv-ws-meter"><span><b>${ws.components}</b> component${ws.components === 1 ? '' : 's'}</span><span><b>${ws.islands}</b> island${ws.islands === 1 ? '' : 's'}</span><span><b>${ws.reach}</b> reached</span><span class="tent"><b>${ws.tentative}</b> tentative</span><span class="s">${ws.opened} opened</span></div>` +
+      (ws.standings.filter(st => st.island).length ? `<div class="sv-by-k">islands <span class="s">no established route to another standing at this depth; a tentative route, when drawn below, is the pointer</span></div>` + ws.standings.filter(st => st.island).map(st => `<div class="sv-hop sv-island">${goHTML(st.path, st.path, last(st.path).replace(/_/g, ' '), 'n')}${badge({ world: st.world })}</div>`).join('') : '') +
+      (ws.routes.length ? `<div class="sv-by-k">routes</div>` + ws.routes.map(routeHTML).join('') : '') +
+      (ws.gaps.length ? `<div class="sv-by-k">gaps <span class="s">${ws.gaps.length} pair${ws.gaps.length === 1 ? '' : 's'} with no route</span></div>` + ws.gaps.map(g => `<div class="sv-hop sv-gap"><span class="lb">${esc(standName(g.from))} · ${esc(standName(g.to))}</span>${g.tentative ? ` <span class="s tent">${g.tentative} tentative route${g.tentative === 1 ? '' : 's'}: digest or judge the text to connect them</span>` : ' <span class="s">nothing yet: fetch, digest or judge</span>'}</div>`).join('') : '');
+    const workspaceHTML = `<div class="sv-sec sv-ws"><div class="k">workspace${ws ? ` · ${wsAll.length} standings` : ''}</div>${wsBar}${wsBody}</div>`;
     // one thing, several worlds: the intersection found by same links, then the union of what each world says
     const un = source.union ? await source.union(at).catch(() => null) : null;
     if (mine !== drawn) return;
@@ -842,7 +1030,9 @@ function mountRecord(el, source, opts = {}) {
         return `<div class="sv-hop${isPref ? ' pref' : ''}">${esc(c.value)}${isPref ? ' <span class="s">preferred</span>' : ''} <span class="s">by ${esc(c.by || '?')}${c.day ? ' · ' + esc(c.day) : ''}</span>${src ? ' ' + goHTML(local(src.path), local(src.path), 'source', 'n') : ''}${c.why ? ` <span class="s">· ${esc(c.why)}</span>` : ''}</div>`;
       }).join('')}</div>`;
     }).join('')}</div>` : '';
-    const contentsHTML = t ? claimsHTML + worldHTML + relHTML + (t.descendants.length ? `<div class="sv-sec"><div class="k">beneath · ${count(t.descendants)}</div>${tree(t.descendants)}</div>` : '') + unionHTML : '';
+    // beneath: the stored children, from the beneath view when it answers, else from the ordinary read of this record
+    const stored = t && t.descendants.length ? t.descendants : kids.filter(k => !['talk', 'mentions', 'views', 'asks', 'claims', 'same'].includes(k.name)).map(k => ({ path: local(k.path), name: k.name.replace(/_/g, ' '), real: null, note: null }));
+    const contentsHTML = t ? claimsHTML + worldHTML + workspaceHTML + relHTML + (stored.length ? `<div class="sv-sec"><div class="k">beneath · ${count(stored)}</div>${tree(stored)}</div>` : '') + unionHTML : '';
     const inTree = new Set();
     const parts = kids.filter(k => !inTree.has(local(k.path)) && (!t || ['talk', 'mentions', 'views', 'asks'].includes(k.name)));
     const rows = parts.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
@@ -874,6 +1064,15 @@ function mountRecord(el, source, opts = {}) {
   el.addEventListener('click', e => {
     const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
     if (o) { e.preventDefault(); if (openFolder) openFolder(o); return; }
+    const w = e.target && e.target.closest ? e.target.closest('button.sv-ws-add, button.sv-ws-drop') : null;
+    if (w) {
+      e.preventDefault();
+      let list = []; try { list = JSON.parse(localStorage.getItem('sv-workspace') || '[]'); } catch (x) { list = []; }
+      if (w.dataset.add && !list.includes(w.dataset.add)) list.push(w.dataset.add);
+      if (w.dataset.drop) list = list.filter(p => p !== w.dataset.drop);
+      try { localStorage.setItem('sv-workspace', JSON.stringify(list)); } catch (x) { /* a private window keeps nothing */ }
+      draw(); return;
+    }
     const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
     e.preventDefault(); const href = a.getAttribute('href');
     (source.cursor ? source.cursor(a.dataset.go).catch(() => {}) : Promise.resolve()).then(() => { nav(href.slice(1)); });
