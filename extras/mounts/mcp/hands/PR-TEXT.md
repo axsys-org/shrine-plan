@@ -1,6 +1,8 @@
 # Cells, views and the reverse-reference index: the world computes how things connect
 
-Branch `ic-bare-loop` (merge of main on `ic-bare-loop-main`). Kernel first, then what rides on it. Every number
+Branch `ic-bare-loop-main`: `ic-bare-loop` merged with main and reduced to the kernel, the mounts and the
+launcher; the research hands, skills and notes are on `ic-bare-loop-notes` for a second PR. Kernel first, then
+what rides on it. Every number
 has its reason in the code; every kernel edit has its sentence here.
 
 ## 1. The store knows what points at what (`reference_index`, `shrine`)
@@ -54,8 +56,9 @@ from the checkout on every run, the snapshot is the world's.
 
 Foil suites under `src/foil/tests`: references, reference reactivity, reference walk, queries, query transport,
 composition, view publication, working views, cells, overlay cache, value read, supervisor, graph, graph world,
-graph workspace, graph union; 362 checks on the old runtime (run-14), 189 graph checks (run-15); on main's runtime
-after the merge, see the full-suite run recorded in PR-PLAN.md.
+graph workspace, graph union. On main's runtime after the merge: no failures; the four suite errors
+(`lain_store`, `lain_fixture`, `grove_publication` need-fail at completion, `fs_sync` compile) are main's own, as
+pristine main shows on the same runtime. The test inventory is brought up to date so `x/check` runs at all.
 
 ## Kept from the Codex review, named as such
 

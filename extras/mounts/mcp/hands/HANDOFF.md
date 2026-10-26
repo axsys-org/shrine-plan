@@ -500,3 +500,11 @@ in under a minute (`nix build github:axsys-org/enki/<rev>`; `/nix/store/y4y0…-
 known yet: whether the saved world's LMDB snapshot can be carried to the new format (the upgrade pipeline is
 LMDB-shaped), and whether our Foil runs unchanged on the new primops; the first suite on the new runtime is the
 test. `ic-bare-loop` stays on the old runtime until that is settled.
+
+## Branches (2026-10-26, 06:00)
+
+- `ic-bare-loop`: everything, on the old runtime; the viewer world and the pipelines here run from it.
+- `ic-bare-loop-main`: the PR branch: `ic-bare-loop` merged with main (new runtime), the inventory fixed, the look
+  card's arm restored, the research hands, skills, notes and link-dependent proofs removed. 95 files, +11,341.
+- `ic-bare-loop-notes`: the merge with everything still on it; the second PR (hands, skills, notes) starts here.
+Worktrees: `../shrine-cells-main` (PR branch), `../shrine-main` (pristine main for comparison runs).
