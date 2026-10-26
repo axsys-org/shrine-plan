@@ -93,6 +93,11 @@ Persistent holes keep their question, expected shape, subject, owner activity,
 latest attempt, observed context and reason in native records. `ask` is
 idempotent and rejects direct context/resume cycles. `resolve_hole` checks the
 current attempt and context generation so a late answer cannot close newer work. A context change
+includes removal of the last evidence record. Missing evidence reopens the hole
+as waiting, clears the current answer, and still allows in-flight attempts to
+settle as superseded. Historical answers remain on their attempts. Restored
+evidence wakes the same hand. A completed flow revision explicitly withdraws
+its demand watch; staging another revision reattaches it. A context change
 wakes the existing activity once for that changed reading; the activity's hand
 decides what work to perform. An ordinary investigation records the resume
 notification, while a flow's maintenance hand stages and dispatches its next

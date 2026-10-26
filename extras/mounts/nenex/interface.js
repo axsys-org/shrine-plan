@@ -27,12 +27,13 @@
         body: new URLSearchParams(new FormData(editor)),
         signal: AbortSignal.timeout(30000)
       });
-      if (!response.ok) throw new Error('Save failed');
-      location.assign(editor.querySelector('[name=back]').value);
-    } catch {
+      const result = await response.json();
+      if (!response.ok || result.error) throw new Error(result.error || 'Save failed');
+      location.assign(result.redirect);
+    } catch (error) {
       submitting = false;
       button.disabled = false;
-      status.textContent = 'Could not save. Your draft is still here; please try again.';
+      status.textContent = (error.message || 'Could not save.') + ' Your draft is still here.';
     }
   });
   document.querySelector('#discard')?.addEventListener('click', () => {

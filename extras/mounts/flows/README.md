@@ -146,6 +146,14 @@ generated prose, refuses collisions and page removal requiring migration, and
 preserves named notes, cells, work and holes. A destination claim prevents
 competing maintainers. Paused and detached controllers retain their evidence.
 Old attempts keep their captured definition and inputs after later edits.
+The maintenance projection at `cells/maintenance` is owned by its controller:
+refreshes preserve annotations, foreign cells refuse adoption, and custom
+writers cannot publish into this reserved projection.
+
+Goo, native command admission and installation share `namespace_command`
+planning/cascade admission, including the same bounded 128-round cascade and
+atomic refusal policy. Browser and MCP entry points do not choose separate
+reaction limits.
 
 ## Handbook example
 

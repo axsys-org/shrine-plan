@@ -93,9 +93,12 @@ The shared `goo-document.js` host keeps only local input drafts, prepared contro
 evidence and focus. It reads an ephemeral path manifest and activates published
 Grove controls through `GooActions`; it does not parse Semidoc or store a second
 document model. Structural writes flush other drafts first, freeze editing while
-in flight, and check the whole document epoch. Refusals retain the draft. If a
-reply or the subsequent refresh is lost, Ctrl/Cmd+S resumes the captured change
-with the same invocation. Structural editing stays frozen until it settles. The
+in flight, and compare authored content against the captured native epoch.
+The source form uses the same guard and native admission. Work, cell and hole
+updates do not invalidate an otherwise unchanged document; changed source does.
+Refusals retain the draft. If a reply or the subsequent refresh is lost,
+Ctrl/Cmd+S resumes the captured change with the same invocation. Structural
+editing stays frozen until it settles. The
 rich-block viewport uses native Goo typography and expands locally with text.
 
 `editor.grove` publishes a native namespace operation from `editor.foil` in
