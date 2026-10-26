@@ -76,7 +76,10 @@ class Writer:
     def finish(self):
         self.flush()
         for path, sentences in self.notes.items():
-            self.merged.setdefault(path, {})['note'] = ' '.join(sentences)
+            # a note is appended to, never replaced: what earlier runs and other hands said stays
+            have = str((self.w.read(path, 'x').get('properties') or {}).get('/note') or '').strip()
+            fresh = [x for x in sentences if x not in have]
+            if fresh: self.merged.setdefault(path, {})['note'] = (have + ' ' + ' '.join(fresh)).strip()
         self.notes = {}
         for path, slots in self.merged.items():
             try: self.w.tool('write', records=[{'path': path, 'slots': slots, 'action': 'poke'}], who=self.who); self.n += 1
