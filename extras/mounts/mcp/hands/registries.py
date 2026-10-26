@@ -360,8 +360,24 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('base'); p.add_argument('--node', default='0x11'); p.add_argument('--naics', default='335312'); p.add_argument('--since', default='2024-10-01')
     p.add_argument('--top', type=int, default=25); p.add_argument('--importers', type=int, default=4); p.add_argument('--pudl', default='')
+    p.add_argument('--only', default='', help='one stage against the recipients already in the world: echo, gleif, edgar, sam, uspto, importyeti, mep (a subagent runs one source)')
     a = p.parse_args()
     w = World(a.base, a.node); root = '/' + a.node + '/user/registries'; wr = Writer(w, 'registries')
+    if a.only:
+        # one source, for the recipients the world already holds: what a subagent for that source does
+        recipients, nxt = {}, None
+        for _ in range(20):
+            page = w.read(root + '/usaspending/recipients', 'y', limit=500, **({'next': nxt} if nxt else {}))
+            for c in page.get('children') or []:
+                s = {k.lstrip('/'): v for k, v in (c.get('properties') or {}).items()}
+                if s.get('uei'): recipients[s['uei']] = dict(path=c['path'], name=s.get('name'), state=s.get('state'), city=s.get('city'), parent=s.get('parent'), parent_uei=s.get('parent_uei'), street=s.get('street'), zip=s.get('zip'), uei=s.get('uei'))
+            nxt = page.get('next')
+            if not nxt: break
+        stage = {'echo': lambda: echo_for(root, wr, recipients), 'gleif': lambda: gleif_for(root, wr, recipients), 'edgar': lambda: edgar_for(root, wr, recipients),
+                 'sam': lambda: sam_for(root, wr, recipients), 'uspto': lambda: uspto_for(root, wr, recipients), 'importyeti': lambda: importyeti_for(root, wr, recipients, a.importers),
+                 'mep': lambda: mep_opportunities(root, wr)}[a.only]
+        print('%s: %d recipients in the world' % (a.only, len(recipients)))
+        stage(); wr.finish(); print('written', wr.n, 'records'); sys.exit(0)
     wr.put(root, {'name': 'registries', 'description': 'public registries of real things, each record keeping its own identifiers; what a record may be is a sentence in its note'})
     # the landing places are records: a source is a thing, and what lands there is its parts
     for name in ('usaspending', 'echo', 'gleif', 'edgar', 'importyeti', 'sam', 'uspto', 'mep', 'eia'):

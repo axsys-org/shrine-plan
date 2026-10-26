@@ -11,7 +11,10 @@ A record's reference slots are the only edges the world has. `sov` now carries a
 in `apply` where every change already passes, rebuildable from the journal (`reindex_references`), with bounded
 snapshots (`span` 64) so a pinned read at an older epoch sees the edges of its time and a live read takes the
 current edges without unpinning anything. `/r/<len>/<path>` reads the edges naming a thing, length-prefixed like
-`/h`: nothing is searched for, everything is named.
+`/h`: nothing is searched for, everything is named. A reference inside prose, a path in brackets in any text
+slot (`[/0x11/user/orgs/verisk]`), is collected by the same one function as a reference in a slot, held by the
+slot the prose sits in: a text's names are edges without a second record, and what names a thing is `/r` and
+nothing else.
 
 Why in the kernel: a second store (the Python index we had) would be a copy with its own clock; here the index is
 derived state committed with the epoch that changed it.
@@ -36,11 +39,13 @@ relations as folders, breadth first, each thing once, bounded by `depth`, `cap`,
 the cell with documented defaults), `union` (what every world says about one thing), `overlay` (any number of
 standings as one picture: a breadth-first walk over every reference, standings that meet share a connected
 component, a standing nothing reaches is an island; the result is one virtual root `/<n>` per component with its
-standings unfolded as worlds beneath, a standing reached inside another's unfolding listed as seen). Six names
-registered under `/weft/graph`: `overlay`, `frontier`, `union`, `referencing`, `identities`, `placements`. What
-kind of edge a hop is, is what holds it: a thing's own slot, a `same` judgement, a text's `mentions` record, a
-`candidates` record nobody judged, a cell; the kernel names the holder and invents no vocabulary of its own (no
-`mentioned`, no `_of`), and the page decides what to draw dashed. Nothing a view draws is written back.
+standings unfolded as worlds beneath, a standing reached inside another's unfolding listed as seen; the walk
+follows parts as well as slots, so a bucket reaches its records, and is bounded by the cell's `/nodes`). Three
+names registered under `/weft/graph`: `overlay`, `frontier`, `union`. A folder is the slot the reference sits
+in, as its author spelled it, a note's slot when the reference is in prose, or the cell that reads the thing; the
+kernel invents no vocabulary of its own (no `mentioned`, no `candidate`, no `_of`, no `tentative`), and the page
+decides what to draw dashed. A titled text is a thing. A pinned standing reads its backward edges at its own
+epoch. Nothing a view draws is written back.
 
 ## 4. Not in this PR, on purpose
 
