@@ -260,6 +260,8 @@ const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m
 
 // a number as text: a year (four digits) or a day (eight digits, YYYYMMDD) is drawn as written, a quantity grouped
 const numText = v => (Number.isInteger(v) && (String(v).length === 4 || String(v).length === 8)) ? String(v) : v.toLocaleString();
+// a postal code is a label, not a quantity: drawn as written whatever its length
+const labelled = (k, v) => (Number.isInteger(v) && /(^|[/_])(zip|zip_code|postal|postcode)$/i.test(String(k))) ? String(v) : v;
 // one value, by kind; the only place a value's kind is decided
 function valueHTML(v, cls = 'sv-v') {
   if (typeof v === 'number') return `<span class="${cls}">${numText(v)}</span>`;
@@ -278,14 +280,14 @@ function slotLayout(slots) {
   if (!s.length) return '';
   if (s.length === 1 && typeof s[0][1] === 'number') return `<div class="sv-one">${numText(s[0][1])}<span class="u">${esc(s[0][0])}</span></div>`;
   const long = s.some(([, v]) => typeof v !== 'number' && String(v).length > 80);
-  if (s.length > 6 || long) return `<div class="sv-list">${s.map(([k, v]) => `<span class="sv-k">${esc(k)}</span>${valueHTML(v)}`).join('')}</div>`;
-  return `<div class="sv-grid">${s.map(([k, v]) => `<div class="s ${isShort(v) ? '' : 'wide'}"><span class="sv-k">${esc(k)}</span>${valueHTML(v)}</div>`).join('')}</div>`;
+  if (s.length > 6 || long) return `<div class="sv-list">${s.map(([k, v]) => `<span class="sv-k">${esc(k)}</span>${valueHTML(labelled(k, v))}`).join('')}</div>`;
+  return `<div class="sv-grid">${s.map(([k, v]) => `<div class="s ${isShort(v) ? '' : 'wide'}"><span class="sv-k">${esc(k)}</span>${valueHTML(labelled(k, v))}</div>`).join('')}</div>`;
 }
 
 async function rowSlots(source, node) {
   let slots = node.slots;
   if (isCell(slots)) { const r = await source.answer(node.path); slots = r.tree ? (Object.keys(r.tree.slots).length ? r.tree.slots : { '': r.tree.kids.length + ' rows' }) : { '': r.note || r.bad }; }
-  return Object.entries(slots).filter(([k]) => k !== 'scale' && !k.endsWith('/scale')).map(([k, v]) => `<span>${k ? `<span class="k">${esc(k)}</span>` : ''}${valueHTML(v, 'v')}</span>`).join('');   // a scale rides with its number, it is not a fact of the row
+  return Object.entries(slots).filter(([k]) => k !== 'scale' && !k.endsWith('/scale')).map(([k, v]) => `<span>${k ? `<span class="k">${esc(k)}</span>` : ''}${valueHTML(labelled(k, v), 'v')}</span>`).join('');   // a scale rides with its number, it is not a fact of the row
 }
 
 async function kidHTML(source, node, depth, bump) {
@@ -798,7 +800,7 @@ function mcpSource(opts = {}) {
     const stand = [], routes = [], gaps = [];
     for (const [rel, p] of Object.entries(nodes)) {
       let m;
-      if ((m = /^\/standing\/(\d+)$/.exec(rel))) stand[Number(m[1])] = { i: Number(m[1]), path: unref(p.at) || standings[Number(m[1])], world: p.world, component: num(p.component), island: ['yes', 'true', true].includes(p.island) };
+      if ((m = /^\/standing\/(\d+)$/.exec(rel))) stand[Number(m[1])] = { i: Number(m[1]), path: unref(p.at) || standings[Number(m[1])], name: p.name, world: p.world, component: num(p.component), island: ['yes', 'true', true].includes(p.island) };
       else if ((m = /^\/route\/(\d+)$/.exec(rel))) routes[Number(m[1])] = { from: num(p.from), to: num(p.to), at: p.at, hops: num(p.hops), soft: num(p.soft), here: [], there: [] };
       else if ((m = /^\/gap\/(\d+)$/.exec(rel))) gaps.push({ from: num(p.from), to: num(p.to), tentative: num(p.tentative) });
     }
@@ -995,12 +997,12 @@ function mountRecord(el, source, opts = {}) {
     const ws = source.workspace && wsAll.length > 1 ? await source.workspace(wsAll, 3).catch(e => ({ fault: String(e && e.message || e).slice(0, 120) })) : null;
     if (mine !== drawn) return;
     const hopHTML = h => `<span class="sv-ws-hop${h.strength === 'mention' ? ' tent' : ''}"><span class="lb">${esc(h.direction === 'in' ? h.label + ' of' : h.label)}</span> ${goHTML(local(h.other), local(h.other), last(h.other).replace(/_/g, ' '), 'n')}${h.note && Object.keys(h.note).length ? ` <span class="s">${esc(noteText(h.note))}</span>` : ''}${h.by && h.by !== here ? ` <span class="sv-wb by">by ${esc(h.by)}</span>` : ''}</span>`;
-    const standName = i => ws && ws.standings[i] ? last(ws.standings[i].path).replace(/_/g, ' ') : '?';
+    const standName = i => ws && ws.standings[i] ? (ws.standings[i].name || last(ws.standings[i].path).replace(/_/g, ' ')) : '?';
     const routeHTML = r => `<div class="sv-hop sv-ws-route${r.soft ? ' tent' : ''}"><span class="lb">${esc(standName(r.from))} → ${esc(standName(r.to))}</span> <span class="s">${r.hops} hop${r.hops === 1 ? '' : 's'}${r.soft ? ` · ${r.soft} through a text` : ' · all established'}</span><div class="sv-ws-path">${r.here.map(hopHTML).join(' <span class="sep">›</span> ')}${r.there.length ? ' <span class="sep">‹</span> ' + r.there.slice().reverse().map(hopHTML).join(' <span class="sep">‹</span> ') : ''}</div></div>`;
     const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
     const wsBody = !ws ? '' : ws.fault ? `<div class="sv-note bad">${esc(ws.fault)}</div>` :
       `<div class="sv-ws-meter"><span><b>${ws.components}</b> component${ws.components === 1 ? '' : 's'}</span><span><b>${ws.islands}</b> island${ws.islands === 1 ? '' : 's'}</span><span><b>${ws.reach}</b> reached</span><span class="tent"><b>${ws.tentative}</b> tentative</span><span class="s">${ws.opened} opened</span></div>` +
-      (ws.standings.filter(st => st.island).length ? `<div class="sv-by-k">islands <span class="s">no established route to another standing at this depth; a tentative route, when drawn below, is the pointer</span></div>` + ws.standings.filter(st => st.island).map(st => `<div class="sv-hop sv-island">${goHTML(st.path, st.path, last(st.path).replace(/_/g, ' '), 'n')}${badge({ world: st.world })}</div>`).join('') : '') +
+      (ws.standings.filter(st => st.island).length ? `<div class="sv-by-k">islands <span class="s">no established route to another standing at this depth; a tentative route, when drawn below, is the pointer</span></div>` + ws.standings.filter(st => st.island).map(st => `<div class="sv-hop sv-island">${goHTML(st.path, st.path, st.name || last(st.path).replace(/_/g, ' '), 'n')}${badge({ world: st.world })}</div>`).join('') : '') +
       (ws.routes.length ? `<div class="sv-by-k">routes</div>` + ws.routes.map(routeHTML).join('') : '') +
       (ws.gaps.length ? `<div class="sv-by-k">gaps <span class="s">${ws.gaps.length} pair${ws.gaps.length === 1 ? '' : 's'} with no route</span></div>` + ws.gaps.map(g => `<div class="sv-hop sv-gap"><span class="lb">${esc(standName(g.from))} · ${esc(standName(g.to))}</span>${g.tentative ? ` <span class="s tent">${g.tentative} tentative route${g.tentative === 1 ? '' : 's'}: digest or judge the text to connect them</span>` : ' <span class="s">nothing yet: fetch, digest or judge</span>'}</div>`).join('') : '');
     const workspaceHTML = `<div class="sv-sec sv-ws"><div class="k">workspace${ws ? ` · ${wsAll.length} standings` : ''}</div>${wsBar}${wsBody}</div>`;

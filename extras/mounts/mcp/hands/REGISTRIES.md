@@ -59,9 +59,10 @@ description as a note, and its candidates. Until the kernel with the `candidates
 record draws as a solid `candidates/<slug>` folder; after it, as a grey `candidate` edge.
 
 ## Open
-- The first load wrote recipients under their uppercase UEI and facilities under bare numeric ids before the
-  segment rule was settled; the second load wrote the legal spellings. The earlier ones are duplicates to cull,
-  with Ian's word.
+- (gone) the first load's duplicates died with the clone they were in; the republished clone holds one clean load.
+- From a recipient's own page its `candidates` child drew as solid `candidates/<slug>` folders (an outgoing
+  relation of a child record); `graph_views/branch_relations` now labels those `candidate` and marks them
+  mention-strength, so both ends of a candidate are grey. Needs the next republish.
 
 - The migrated saved world died under the hand's first writes until the boot script kept SIGPIPE ignored, as x/eden
   does (`restore_signals=False`); a client dropping a connection must not kill the runtime. A booted clone is

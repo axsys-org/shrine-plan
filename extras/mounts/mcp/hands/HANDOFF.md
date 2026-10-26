@@ -476,3 +476,14 @@ sources. Nothing committed.
 Open: the rewrite's retains list is Codex's hand-written set. A retained record type whose fields change would need a
 real `previous_*` conversion rather than an alias; `reference_index` changing (span, past) is fine because the index
 is rebuilt. The pipeline's error scan should ignore module self-test output.
+
+## Registries phase (2026-10-26, 02:00 onward)
+
+Ian turned from web crawling to public registries of real things; the research and first load are in
+`REGISTRIES.md` and `registries.py`. The saved world now runs on this kernel with its history
+(`upgrade-clone-final*`): publish with the pipeline (stage sources through `prepare_upgrade.py`), first boot with
+`boot_candidate.py` (`UPGRADE_MOUNTS=mcp,probe,web,goo,explorer`, SIGPIPE kept ignored), every later boot with
+`resume_candidate.py` (seconds). The viewer on 8330 shows a federal contractor as a world: its awards with their
+descriptions as notes, its parent, its candidate facilities, LEIs, CIKs and importer, the subawards that name real
+plants. Next: judge candidates into `same` with evidence (the agent's job), the workspace over a contractor, its
+facility and a plant it supplies, and the ImportYeti supplier chains as their own standings.
