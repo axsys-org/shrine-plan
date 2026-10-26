@@ -9,13 +9,18 @@ never writes a fact into /user; the agent decides what the rows mean.
 
     /agent/<a>/asks/<id>                 {asked, scope, shape}           written by the agent; the hole
     /agent/<a>/asks/<id>/found/<n>       {<shape slots>, source, page}   written by web; typed; a reference to the region
-    /user/web/pages/<host>/<slug>        {url, title, fetched, digest}   the index: a page is a source, once
-    /user/web/pages/<host>/<slug>/<n>    {heading, text, level}          its regions, by heading
+    /user/web/pages/<host>/<slug>              {url, title, fetched, digest}   the index: a page is a source, once
+    /user/web/pages/<host>/<slug>/<heading>…   {heading, level, text}          its regions, keeping the page's own hierarchy
+      a region's text is prose with references in it, each a path in brackets: a hyperlink the author wrote,
+      landed where its scheme says, or a name a reader placed
     /agent/web/research/<id>/queries/<n> {q, engine, when, hits}         the trail: what was asked of the web
     /agent/web/research/<id>/visited/<n> {page: ref, why}                and which pages were read for it
 
     python3 web.py <base> [--node 0x11] [--once] [--model anthropic/claude-sonnet-5.5]
 """
+import json as _json, os as _os
+# where a page lands is the web's scheme (schemes/web.json): host, then page, its regions beneath
+WEB_SCHEME = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'schemes', 'web.json')))
 import hashlib
 import html
 import importlib.util
@@ -337,7 +342,7 @@ def page_regions(markup, url=''):
     its headings. trafilatura when available, else the plain parser."""
     if trafilatura is not None:
         try:
-            md = trafilatura.extract(markup, url=url or None, output_format='markdown', include_tables=True, include_links=False,
+            md = trafilatura.extract(markup, url=url or None, output_format='markdown', include_tables=True, include_links=True,
                                      include_images=False, include_comments=False, include_formatting=True) or ''
             meta = trafilatura.extract_metadata(markup)
             title = (meta.title if meta and meta.title else '')[:200]
@@ -345,9 +350,13 @@ def page_regions(markup, url=''):
             # ranking can hand the extractor only the few that matter and a locator names a small piece of the page
             regions, heading, level, buf, size = [], '', 0, [], 0
             def flush():
-                text = re.sub(r'\s+', ' ', ' '.join(buf)).strip()
+                raw = re.sub(r'\s+', ' ', ' '.join(buf)).strip()
+                # hyperlinks are observed references: the author pointed at a page; the text keeps the words, the
+                # region keeps the links
+                links = [(a.strip(), h) for a, h in re.findall(r'\[([^\]]{1,120})\]\((https?://[^)\s]+)\)', raw)]
+                text = re.sub(r'\[([^\]]*)\]\([^)]*\)', lambda m: '[' + m.group(1) + ']', raw)   # the words keep their brackets: a key
                 if len(text) > 40:
-                    regions.append({'heading': heading[:160], 'level': level, 'text': text[:MAX_REGION]})
+                    regions.append({'heading': heading[:160], 'level': level, 'text': text[:MAX_REGION], 'links': links[:24]})
             for line in md.splitlines():
                 m = re.match(r'^(#{1,6})\s+(.*)$', line)
                 if m:
@@ -374,11 +383,31 @@ def page_regions(markup, url=''):
     return t.title.strip()[:200], out
 
 
+def region_paths(ppath, regions):
+    """Regions keep the page's own hierarchy: each lands beneath the page under its heading, nested by heading
+    level; a further chunk of the same section, or a region with no heading, is numbered beside it."""
+    out, stack, seen = [], [], {}
+    for i, r in enumerate(regions, 1):
+        level = int(r.get('level') or 0); head = segment_of(r.get('heading') or '') if r.get('heading') else ''
+        while stack and level and stack[-1][0] >= level:
+            stack.pop()
+        parent = stack[-1][1] if stack else ppath
+        key = head or 'r%d' % i
+        seen[(parent, key)] = seen.get((parent, key), 0) + 1
+        if seen[(parent, key)] > 1:
+            key = '%s_%d' % (key, seen[(parent, key)])
+        path = parent + '/' + key
+        if level and head:
+            stack.append((level, path))
+        out.append(path)
+    return out
+
+
 def page_path(node, url):
     u = urllib.parse.urlparse(url)
     host = segment_of(u.netloc.replace('www.', ''))
     slug = segment_of((u.path.strip('/') or 'index')[-60:]) or 'index'
-    return f'/{node}/user/web/pages/{host}/{slug}'
+    return '/' + node + '/user' + WEB_SCHEME['land']['page'].format(host=host, slug=slug)
 
 
 def relevant(regions, wanted, budget=3000, skip=()):
@@ -607,7 +636,21 @@ class WebHand(Hand):
                     old = [c['path'] for c in (self.w.read(ppath, 'y', limit=200).get('children') or []) if re.search(r'/r\d+$', c['path'])]
                     recs = [{'path': c, 'action': 'cull'} for c in old if int(c.rsplit('/r', 1)[1]) > len(regions[:60])]
                     recs += [{'path': ppath, 'slots': {'url': url, 'title': ptitle or title, 'fetched': int(time.strftime('%Y%m%d')), 'digest': digest, 'regions': len(regions), 'extractor': EXTRACTOR, 'domain': urllib.parse.urlparse(url).hostname or '', 'endpoint': urllib.parse.urlparse(url).path or '/'}}]
-                    recs += [{'path': f'{ppath}/r{i}', 'slots': {'heading': r['heading'], 'level': r['level'], 'text': r['text']}} for i, r in enumerate(regions[:60], 1)]
+                    # the site is a record: what lands beneath it is its parts, so reading the site as a world lists
+                    # every page fetched there and what each connected to
+                    host_path = ppath.rsplit('/', 1)[0]
+                    if not (self.w.read(host_path, 'x').get('exists')):
+                        recs.append({'path': host_path, 'slots': {'name': host_path.rsplit('/', 1)[1].replace('_', '.'), 'url': 'https://' + urllib.parse.urlparse(url).netloc}})
+                    rpaths = region_paths(ppath, regions[:60])
+                    # a region is a record whose text is prose with references in it: a hyperlink is the author's own
+                    # reference, written into the prose as the path where its scheme lands the page (a page nobody
+                    # fetched is a name, empty until read). The index sees it there; nothing else is written.
+                    for rp, r in zip(rpaths, regions[:60]):
+                        text = r['text']
+                        for anchor, href in r.get('links') or []:
+                            if re.match(r'^(mailto:|javascript:|#)', href): continue
+                            text = text.replace('[' + anchor + ']', anchor + ' [' + page_path(node, href) + ']', 1)
+                        recs.append({'path': rp, 'slots': {'heading': r['heading'], 'level': r['level'], 'text': text}})
                     self.w.tool('write', records=recs, who=self.name)
                 nv += 1
                 self.w.tool('write', records=[{'path': f'{trail}/visited/v{nv}', 'slots': {'page': reference(ppath), 'why': q[:120]}}], who=self.name)
@@ -629,7 +672,7 @@ class WebHand(Hand):
                         continue
                     row['page'] = reference(ppath)
                     if isinstance(idx, int) and 1 <= idx <= len(regions):
-                        row['source'] = reference(f'{ppath}/r{idx}')
+                        row['source'] = reference(region_paths(ppath, regions[:60])[idx - 1] if idx <= 60 else ppath)
                     if quote:
                         row['quote'] = str(quote)[:160]
                     rows.append(row)

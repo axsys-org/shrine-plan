@@ -5,8 +5,8 @@ as a candidate (a tentative edge the overlay draws grey), and only a judgement w
     /user/registries/usaspending/recipients/<uei>      {name, uei, duns, parent, parent_uei, street, city, state, zip, kinds, source}
     /user/registries/usaspending/awards/<id>           {id, recipient -> recipient, agency, amount, description, naics, place_state, source}
     /user/registries/usaspending/subawards/<id>        {id, prime -> award, prime_recipient, subawardee, amount, date, description, source}
-    /user/registries/usaspending/.../mentions          {<slug>: -> a plant or facility the description names}   tentative
-    /user/registries/usaspending/recipients/<uei>/candidates  {<slug>: -> an ECHO facility, LEI, CIK or importer that may be this recipient}
+    a subaward's description names a plant as a path in brackets; a recipient's note says "May be [<path>] (why)" for
+    each facility, LEI, CIK, importer or patent that may be it: references in prose, nothing the kernel knows by name
     /user/registries/echo/facilities/<registry_id>     {name, street, city, state, zip, naics, sic, latitude, longitude, source}
     /user/registries/gleif/<lei>                       {name, city, postal, country, status, parent -> gleif/<lei>, source}
     /user/registries/edgar/<cik>                       {name, sic, sic_description, ein, state_of_incorporation, city, state, source}
@@ -36,6 +36,20 @@ def get(url, headers=None, data=None, timeout=60):
 def slug(s, n=48):
     s = re.sub(r'[^a-z0-9]+', '_', str(s).lower()).strip('_')
     return (s or 'x')[:n]
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEMES = {}
+def scheme(name):
+    """A source's scheme (schemes/<name>.json): where its records land, which slot is their identity, which fields it
+    shares with other sources, and how to fetch. The hand reads placement from it; the code keeps only the parsing."""
+    if name not in SCHEMES:
+        with open(os.path.join(HERE, 'schemes', name + '.json')) as f: SCHEMES[name] = json.load(f)
+    return SCHEMES[name]
+def land(root, source, kind, ident, **more):
+    """Where one record of a source lives: the scheme's template for that kind, the identity as the segment."""
+    return root + scheme(source)['land'][kind].format(id=seg(str(ident)), **more)
+def key_for(source):
+    name = scheme(source)['fetch'].get('key')
+    return (os.environ.get(name) or '') if name else ''
 def seg(s, n=48):
     """A path segment the world accepts: lowercase letters, digits and underscore, starting with a letter; the
     original identifier stays in a slot."""
@@ -46,7 +60,11 @@ def ref(path, care='x'):
 
 class Writer:
     def __init__(self, world, who):
-        self.w, self.who, self.batch, self.n, self.written, self.merged = world, who, [], 0, set(), {}
+        self.w, self.who, self.batch, self.n, self.written, self.merged, self.notes = world, who, [], 0, set(), {}, {}
+    def may(self, path, target, why):
+        """A candidate is a sentence on the record, naming the other record as a path in brackets: a reference in
+        prose, which the index sees and the overlay follows; nothing the kernel knows by a name of its own."""
+        self.notes.setdefault(path, []).append('May be [%s] (%s).' % (target, why))
     def put(self, path, slots):
         slots = {k: v for k, v in slots.items() if v not in (None, '', [], {})}
         if not slots: return
@@ -57,6 +75,9 @@ class Writer:
         if len(self.batch) >= 60: self.flush()
     def finish(self):
         self.flush()
+        for path, sentences in self.notes.items():
+            self.merged.setdefault(path, {})['note'] = ' '.join(sentences)
+        self.notes = {}
         for path, slots in self.merged.items():
             try: self.w.tool('write', records=[{'path': path, 'slots': slots, 'action': 'poke'}], who=self.who); self.n += 1
             except Exception as e: print('  refused', path, str(e)[:120])
@@ -71,7 +92,7 @@ class Writer:
         self.batch = []
 
 # ---- USAspending: who the government pays, and what they pass on
-USA = 'https://api.usaspending.gov/api/v2'
+USA = scheme('usaspending')['fetch']['base']
 def usaspending(root, wr, naics, since, top):
     period = [{'start_date': since, 'end_date': '2026-09-30'}]
     filters = {'naics_codes': {'require': [naics]}, 'time_period': period, 'award_type_codes': ['A', 'B', 'C', 'D']}
@@ -84,7 +105,7 @@ def usaspending(root, wr, naics, since, top):
         try: prof = get(USA + '/recipient/%s/' % r['recipient_id'])
         except Exception as e: print('  profile failed', r.get('name'), str(e)[:80])
         loc = prof.get('location') or {}
-        path = root + '/usaspending/recipients/' + seg(r['uei'])
+        path = land(root, 'usaspending', 'recipients', r['uei'])
         recipients[r['uei']] = dict(path=path, name=prof.get('name') or r['name'], state=loc.get('state_code'), city=loc.get('city_name'), parent=prof.get('parent_name'), parent_uei=prof.get('parent_uei'))
         wr.put(path, {'name': prof.get('name') or r['name'], 'uei': r['uei'], 'duns': prof.get('duns'), 'parent': prof.get('parent_name'), 'parent_uei': prof.get('parent_uei'),
                       'street': loc.get('address_line1'), 'city': loc.get('city_name'), 'state': loc.get('state_code'), 'zip': loc.get('zip'),
@@ -100,7 +121,7 @@ def usaspending(root, wr, naics, since, top):
     for a in awards:
         uei = a.get('Recipient UEI')
         if uei not in recipients: continue
-        path = root + '/usaspending/awards/' + seg(a['Award ID'])
+        path = land(root, 'usaspending', 'awards', a['Award ID'])
         award_paths[a['Award ID']] = path
         wr.put(path, {'name': a['Award ID'], 'id': a['Award ID'], 'recipient': ref(recipients[uei]['path']), 'agency': a.get('Awarding Agency'), 'amount': round(float(a.get('Award Amount') or 0)),
                       'description': (a.get('Description') or '')[:600], 'naics': a.get('NAICS Code') or naics, 'place_state': a.get('Place of Performance State Code'),
@@ -110,7 +131,7 @@ def usaspending(root, wr, naics, since, top):
     subs = get(USA + '/search/spending_by_award/', data={'filters': filters, 'fields': sfields, 'subawards': True, 'limit': 100, 'page': 1, 'sort': 'Sub-Award Amount', 'order': 'desc'})['results']
     subawards = []
     for s in subs:
-        path = root + '/usaspending/subawards/' + seg(s['Sub-Award ID'])
+        path = land(root, 'usaspending', 'subawards', s['Sub-Award ID'])
         slots = {'name': '%s to %s' % (s['Sub-Award ID'], s.get('Sub-Awardee Name') or '?'), 'id': s['Sub-Award ID'], 'subawardee': s.get('Sub-Awardee Name'), 'prime_recipient': s.get('Prime Recipient Name'), 'amount': round(float(s.get('Sub-Award Amount') or 0)),
                  'date': int(str(s.get('Sub-Award Date') or '0').replace('-', '')[:8] or 0), 'description': (s.get('Sub-Award Description') or '')[:600],
                  'source': 'https://www.usaspending.gov/award/%s' % s.get('prime_award_internal_id')}
@@ -120,7 +141,7 @@ def usaspending(root, wr, naics, since, top):
     return recipients, subawards
 
 # ---- EPA ECHO: where regulated facilities are
-ECHO = 'https://echodata.epa.gov/echo/echo_rest_services'
+ECHO = scheme('echo')['fetch']['base']
 def echo_for(root, wr, recipients):
     found = {}
     for uei, rec in recipients.items():
@@ -133,16 +154,14 @@ def echo_for(root, wr, recipients):
             fs = (get(ECHO + '.get_qid?output=JSON&qid=%s&pageno=1' % qid)['Results'].get('Facilities') or [])[:12]
         except Exception as e:
             print('  echo failed', rec['name'], str(e)[:80]); continue
-        cands = {}
         for f in fs:
-            path = root + '/echo/facilities/' + seg(f['RegistryID'])
+            path = land(root, 'echo', 'facilities', f['RegistryID'])
             wr.put(path, {'name': f.get('FacName'), 'street': f.get('FacStreet'), 'city': f.get('FacCity'), 'state': f.get('FacState'), 'zip': f.get('FacZip'),
                           'naics': f.get('FacNAICSCodes'), 'sic': f.get('FacSICCodes'), 'latitude': f.get('FacLat'), 'longitude': f.get('FacLong'),
                           'programs': ', '.join(k[:-4] for k in ('AIRFlag', 'NPDESFlag', 'RCRAFlag', 'SDWISFlag', 'GHGFlag', 'TRIFlag') if f.get(k) and f.get(k) != 'N'),
                           'source': 'https://echo.epa.gov/detailed-facility-report?fid=' + f['RegistryID']})
             found[f['RegistryID']] = (path, f)
-            cands['echo_' + seg(f['RegistryID'])] = ref(path)
-        if cands: wr.put(rec['path'] + '/candidates', cands)
+            wr.may(rec['path'], path, 'the same name in EPA ECHO')
     print('echo: %d facilities written' % len(found))
     return found
 
@@ -154,13 +173,13 @@ def gleif_for(root, wr, recipients):
         try: d = get('https://api.gleif.org/api/v1/lei-records/' + lei, headers={'Accept': 'application/vnd.api+json'})['data']
         except Exception: return None
         e = d['attributes']['entity']; addr = e.get('legalAddress') or {}
-        path = root + '/gleif/' + seg(lei)
+        path = land(root, 'gleif', 'entities', lei)
         slots = {'name': e['legalName']['name'], 'city': addr.get('city'), 'postal': addr.get('postalCode'), 'country': addr.get('country'), 'status': e.get('status'), 'lei': lei, 'source': 'https://search.gleif.org/#/record/' + lei}
         rel = (d.get('relationships') or {}).get('direct-parent', {}).get('links', {}).get('lei-record')
         if rel:
             try:
                 parent = get(rel, headers={'Accept': 'application/vnd.api+json'})['data']['id']
-                if lei_record(parent): slots['parent'] = ref(root + '/gleif/' + seg(parent))
+                if lei_record(parent): slots['parent'] = ref(land(root, 'gleif', 'entities', parent))
             except Exception: pass
         wr.put(path, slots); seen[lei] = path; return path
     for uei, rec in recipients.items():
@@ -168,11 +187,9 @@ def gleif_for(root, wr, recipients):
             hits = get('https://api.gleif.org/api/v1/fuzzycompletions?field=entity.legalName&q=' + urllib.parse.quote(rec['name']), headers={'Accept': 'application/vnd.api+json'})['data'][:3]
         except Exception as e:
             print('  gleif failed', rec['name'], str(e)[:80]); continue
-        cands = {}
         for h in hits:
             lei = ((h.get('relationships') or {}).get('lei-records') or {}).get('data', {}).get('id')
-            if lei and lei_record(lei): cands['gleif_' + seg(lei)] = ref(root + '/gleif/' + seg(lei))
-        if cands: wr.put(rec['path'] + '/candidates', cands)
+            if lei and lei_record(lei): wr.may(rec['path'], land(root, 'gleif', 'entities', lei), 'a GLEIF name match')
     print('gleif: %d entities written' % len(seen))
 
 # ---- SEC EDGAR: public companies by name, with SIC, EIN and state of incorporation
@@ -186,22 +203,20 @@ def edgar_for(root, wr, recipients):
     n = 0
     for uei, rec in recipients.items():
         first = slug(rec['name']).split('_')[0]
-        cands = {}
         for t in by_token.get(first, [])[:2]:
             cik = '%010d' % int(t['cik_str'])
             try: d = get('https://data.sec.gov/submissions/CIK%s.json' % cik)
             except Exception: continue
-            path = root + '/edgar/' + seg(cik); biz = (d.get('addresses') or {}).get('business') or {}
+            path = land(root, 'edgar', 'filers', cik); biz = (d.get('addresses') or {}).get('business') or {}
             wr.put(path, {'name': d.get('name'), 'sic': d.get('sic'), 'sic_description': d.get('sicDescription'), 'ein': d.get('ein'), 'state_of_incorporation': d.get('stateOfIncorporation'),
                           'city': biz.get('city'), 'state': biz.get('stateOrCountry'), 'tickers': ', '.join(d.get('tickers') or []), 'cik': cik, 'source': 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=' + cik})
-            cands['edgar_' + seg(cik)] = ref(path); n += 1
+            wr.may(rec['path'], path, 'the same name in EDGAR'); n += 1
             time.sleep(0.15)
-        if cands: wr.put(rec['path'] + '/candidates', cands)
     print('edgar: %d companies written' % n)
 
 # ---- ImportYeti: who ships to whom, from customs manifests, through Firecrawl (the site refuses plain fetches)
 def importyeti_for(root, wr, recipients, limit):
-    key = os.environ.get('FIRECRAWL_API_KEY') or ''
+    key = key_for('importyeti')
     if not key: print('importyeti: no FIRECRAWL_API_KEY, skipped'); return
     done = 0
     for uei, rec in list(recipients.items()):
@@ -219,7 +234,7 @@ def importyeti_for(root, wr, recipients, limit):
         total = m(r'Total Sea Shipments\s*([\d,]+)'); last = m(r'Last Shipment Spotted\s*([\d/]+)')
         names = m(r'imports under (\d+) names'); addrs = m(r'(\d+) addresses')
         addr = m(r'Address\n\n([^\n]+)')
-        path = root + '/importyeti/' + seg(s)
+        path = land(root, 'importyeti', 'importers', s)
         wr.put(path, {'name': rec['name'], 'address': addr, 'shipments': int(total.replace(',', '')) if total else None, 'last_shipment': last, 'names': int(names) if names else None, 'addresses': int(addrs) if addrs else None, 'source': url})
         # suppliers: a markdown table, one row per supplier:
         # | [Name](.../supplier/<slug>)<br>[City](...), [Country](.../location/supplier/<country>/country) |  | 2,076<br>categories | description<br>HS Codes: ( [8483.10](...) ... ) |
@@ -235,12 +250,12 @@ def importyeti_for(root, wr, recipients, limit):
             wr.put(path + '/suppliers/' + seg(sl), {'name': name.strip(), 'country': country, 'shipments': int(count.replace(',', '')), 'kinds': ', '.join(c.strip() for c in (cats or '').split('<br>') if c.strip() and c.strip() != 'Other'),
                                                     'hs_codes': ', '.join(hs), 'goods': text, 'source': 'https://www.importyeti.com/supplier/' + sl})
             if i >= 20: break
-        wr.put(rec['path'] + '/candidates', {'importyeti_' + seg(s): ref(path)})
+        wr.may(rec['path'], path, 'the same name in customs filings on ImportYeti')
         print('importyeti:', rec['name'], total, 'shipments,', i, 'suppliers')
 
 # ---- SAM.gov: the registration behind a UEI; the same identifier, so a solid link, not a candidate
 def sam_for(root, wr, recipients):
-    key = os.environ.get('SAM_API_KEY') or ''
+    key = key_for('sam')
     if not key: print('sam: no SAM_API_KEY, skipped'); return
     n = 0
     for uei, rec in recipients.items():
@@ -250,7 +265,7 @@ def sam_for(root, wr, recipients):
         for e in (d.get('entityData') or [])[:1]:
             reg, core, gs = e.get('entityRegistration') or {}, e.get('coreData') or {}, (e.get('assertions') or {}).get('goodsAndServices') or {}
             addr, gen = core.get('physicalAddress') or {}, core.get('generalInformation') or {}
-            path = root + '/sam/' + seg(uei)
+            path = land(root, 'sam', 'registrations', uei)
             wr.put(path, {'name': reg.get('legalBusinessName'), 'uei': uei, 'cage': reg.get('cageCode'), 'status': reg.get('registrationStatus'), 'registered': int((reg.get('registrationDate') or '0').replace('-', '')[:8] or 0),
                           'structure': gen.get('entityStructureDesc'), 'organization': gen.get('organizationStructureDesc'), 'state_of_incorporation': gen.get('stateOfIncorporationCode'),
                           'street': addr.get('addressLine1'), 'city': addr.get('city'), 'state': addr.get('stateOrProvinceCode'), 'zip': addr.get('zipCode'),
@@ -263,7 +278,7 @@ def sam_for(root, wr, recipients):
 
 # ---- USPTO Open Data Portal: granted patents whose first applicant is named like the recipient; a candidate, the name is a match
 def uspto_for(root, wr, recipients, per=8):
-    key = os.environ.get('USPTO_API_KEY') or ''
+    key = key_for('uspto')
     if not key: print('uspto: no USPTO_API_KEY, skipped'); return
     n = 0
     for uei, rec in recipients.items():
@@ -276,25 +291,23 @@ def uspto_for(root, wr, recipients, per=8):
             print('  uspto failed', name, str(e)[:80]); continue
         except Exception as e:
             print('  uspto failed', name, str(e)[:80]); continue
-        cands = {}
         first = slug(name).split('_')[0]
         for w in d.get('patentFileWrapperDataBag') or []:
             m = w.get('applicationMetaData') or {}
             if not m.get('patentNumber') or first not in slug(m.get('firstApplicantName') or ''): continue
-            path = root + '/uspto/patents/' + seg(m['patentNumber'])
+            path = land(root, 'uspto', 'patents', m['patentNumber'])
             wr.put(path, {'name': (m.get('inventionTitle') or '').strip().title()[:140], 'patent': m['patentNumber'], 'granted': int((m.get('grantDate') or '0').replace('-', '')[:8] or 0), 'filed': int((m.get('filingDate') or '0').replace('-', '')[:8] or 0),
                           'applicant': m.get('firstApplicantName'), 'inventors': ', '.join(i.get('inventorNameText') for i in (m.get('inventorBag') or []) if i.get('inventorNameText')),
                           'cpc': ', '.join((c.get('cpcClassification') if isinstance(c, dict) else str(c)).strip() for c in (m.get('cpcClassificationBag') or [])[:4]),
                           'source': 'https://ppubs.uspto.gov/pubwebapp/external.html?q=' + m['patentNumber'] + '.pn.'})
-            cands['uspto_' + seg(m['patentNumber'])] = ref(path); n += 1
-        if cands: wr.put(rec['path'] + '/candidates', cands)
+            wr.may(rec['path'], path, 'the recipient named as applicant'); n += 1
         time.sleep(0.3)
     print('uspto: %d granted patents written' % n)
 
 # ---- NIST MEP supplier scouting: what needs making, as the demand side; open opportunities, through Firecrawl
-MEP = 'https://www.nist.gov/mep/mep-national-network-open-supplier-scouting-opportunities'
+MEP = scheme('mep')['fetch']['base']
 def mep_opportunities(root, wr):
-    key = os.environ.get('FIRECRAWL_API_KEY') or ''
+    key = key_for('importyeti')
     if not key: print('mep: no FIRECRAWL_API_KEY, skipped'); return
     try:
         d = get('https://api.firecrawl.dev/v1/scrape', headers={'Authorization': 'Bearer ' + key}, data={'url': MEP, 'formats': ['markdown'], 'onlyMainContent': True}, timeout=90)
@@ -309,7 +322,7 @@ def mep_opportunities(root, wr):
         number, item, due = mm.groups()
         m, dd, yy = due.split('/')
         baba = item.startswith('BABA')
-        wr.put(root + '/mep/opportunities/' + seg(number), {'name': re.sub(r'^BABA:?\s*', '', item).strip(), 'number': number, 'due': int('20%s%02d%02d' % (yy, int(m), int(dd))),
+        wr.put(land(root, 'mep', 'opportunities', number), {'name': re.sub(r'^BABA:?\s*', '', item).strip(), 'number': number, 'due': int('20%s%02d%02d' % (yy, int(m), int(dd))),
                                                               'build_america_buy_america': baba, 'listed': updated, 'source': MEP})
         n += 1
     print('mep: %d open scouting opportunities written (listed %s)' % (n, updated))
@@ -327,20 +340,21 @@ def eia_mentions(root, wr, subawards, pudl):
     names = [(n, pid) for n, pid in zip(ents['plant_name_eia'], ents['plant_id_eia']) if isinstance(n, str) and len(n.split()) >= 2 and len(n) >= 8]
     written = 0
     for path, slots in subawards:
-        text = (slots.get('description') or '').lower()
-        hits = {}
+        desc = slots.get('description') or ''
+        text = desc.lower()
         for n, pid in names:
             if n.lower() in text:
                 e = ents[ents['plant_id_eia'] == pid].iloc[0]; row = sp[sp['plant_id_eia'] == pid]
                 uid = int(row['utility_id_eia'].iloc[0]) if len(row) and str(row['utility_id_eia'].iloc[0]) != 'nan' else None
-                ppath = root + '/eia/plants/' + seg(str(int(pid)))
+                ppath = land(root, 'eia', 'plants', int(pid))
                 units = int((gens[gens['plant_id_eia'] == pid]['report_date'] == gens[gens['plant_id_eia'] == pid]['report_date'].max()).sum()) if len(gens[gens['plant_id_eia'] == pid]) else None
                 wr.put(ppath, {'name': n, 'city': e.get('city'), 'state': e.get('state'), 'zip': e.get('zip_code'), 'operator': uts.get(uid), 'operator_id': uid, 'units': units,
                                'latitude': float(e['latitude']) if str(e.get('latitude')) != 'nan' else None, 'longitude': float(e['longitude']) if str(e.get('longitude')) != 'nan' else None,
                                'source': 'https://data.catalyst.coop/pudl/core_eia__entity_plants?plant_id_eia=' + str(int(pid))})
-                hits['eia_' + str(int(pid))] = ref(ppath); written += 1
-        if hits: wr.put(path + '/mentions', hits)
-    print('eia: %d plant mentions written' % written)
+                # the description names the plant: the name becomes a reference in the prose itself
+                desc = re.sub(re.escape(n), '[' + ppath + ']', desc, count=1, flags=re.I); written += 1
+        if desc != (slots.get('description') or ''): wr.put(path, {'description': desc})
+    print('eia: %d plants named in descriptions' % written)
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,7 +362,13 @@ if __name__ == '__main__':
     p.add_argument('--top', type=int, default=25); p.add_argument('--importers', type=int, default=4); p.add_argument('--pudl', default='')
     a = p.parse_args()
     w = World(a.base, a.node); root = '/' + a.node + '/user/registries'; wr = Writer(w, 'registries')
-    wr.put(root, {'name': 'registries', 'description': 'public registries of real things, each record keeping its own identifiers; candidates are unjudged matches'})
+    wr.put(root, {'name': 'registries', 'description': 'public registries of real things, each record keeping its own identifiers; what a record may be is a sentence in its note'})
+    # the landing places are records: a source is a thing, and what lands there is its parts
+    for name in ('usaspending', 'echo', 'gleif', 'edgar', 'importyeti', 'sam', 'uspto', 'mep', 'eia'):
+        sc = scheme(name); wr.put(root + '/' + name, {'name': name, 'description': sc.get('about'), 'identity': ', '.join(sorted(set(sc['identity'].values()))), 'source': sc['fetch'].get('base') or sc['fetch'].get('via')})
+        for kind, template in sc['land'].items():
+            if template.endswith('/{id}') and template.count('{') == 1:
+                wr.put(root + template[:-len('/{id}')], {'name': kind, 'identity': sc['identity'].get(kind)}) if template[:-len('/{id}')] != '/' + name else None
     recipients, subawards = usaspending(root, wr, a.naics, a.since, a.top); wr.flush()
     for stage in (lambda: echo_for(root, wr, recipients), lambda: gleif_for(root, wr, recipients), lambda: edgar_for(root, wr, recipients),
                   lambda: sam_for(root, wr, recipients), lambda: uspto_for(root, wr, recipients),

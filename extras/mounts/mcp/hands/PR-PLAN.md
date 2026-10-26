@@ -1,5 +1,13 @@
 # The PR into main: what goes in, what stays out, what to fix first
 
+Status 2026-10-26, late: the kernel PR (`ic-bare-loop-main`) is the index with references in prose, the evaluator,
+one graph module with three names, the page as the tree, and the tests; the hands, schemes, skill, proof and notes
+sit on `ic-bare-loop` for the second PR. HANDOFF.md's last section says what changed and what is next. The cut
+recommendation for the kernel PR (Ian's call): move the hand framework (`hands/hand.py`, `source.py`, `clock.py`,
+`sources/*`), the kept-world launcher (`x/eden --world`, `eden_hands.py`, `x/setup`, `tests/resume.py`,
+`tests/hands.py`) and the stdlib oracle additions (`tests/signature.py`, `laws.py`) to the second PR; the kernel PR
+is then `src/foil`, the two mounts' reads, the page and the inventory.
+
 Branch `ic-bare-loop`, 55 commits and 112 files ahead of main, 19 commits behind it, no merge conflicts (merge-tree
 dry run). This file is the plan for making that reviewable by Liam; it does not itself go in.
 

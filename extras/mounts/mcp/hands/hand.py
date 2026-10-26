@@ -57,7 +57,7 @@ class World:
         return self.tool('read', path=path, care=care, **more)
 
     def view(self, name, thing):
-        """A standard woven view (relations, union, as_world, frontier, beneath, links) applied to a thing, read from
+        """A standard woven view (overlay, frontier, union) applied to a thing, read from
         the world at /o: every node beneath the application keyed by its relative path, slots without the leading
         slash. None when the world has no such definition (an older kernel) or the view faulted."""
         node = '/' + self.node

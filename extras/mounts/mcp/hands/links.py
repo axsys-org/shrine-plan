@@ -4,16 +4,16 @@ Three things, answered in milliseconds over HTTP and never by walking the world:
 
   references   who points at a record, and on which slot (explicit references in slots)
   aliases      every spelling of every thing: its name, its slug, its aliases slot, its domain, its handle
-  mentions     which things a text refers to, found by scanning the text against the aliases: no model
+  names        which things a text refers to, found by scanning the text against the aliases, for the fallback index
 
 At write time, every new text (a turn's said, a found row, a page region, a document paragraph, a note) is scanned,
-and the things it names are written beside it as <text>/mentions {slug: reference, ...}, signed links. A record's
+and the things it names are kept for the fallback index; a reference in prose is written by whoever reads the text, as a path in brackets. A record's
 "pointing here" then includes "mentioned" as well as explicit slots: the tree under a thing grows from writes made
 elsewhere by people who only named it. Names that match nothing are kept as candidates, by source and by count,
 for a person or an agent to accept as a new starter place (one record, its subtree to come) or ignore.
 
     GET /links?to=<path>         [{path, slot, cell, hole}]           everything pointing at a record
-    GET /by?to=<path>            {slot: [{path, ...}]}                the same, grouped by slot ("mentioned" for mentions)
+    GET /by?to=<path>            {slot: [{path, ...}]}                the same, grouped by slot (prose slots for entions)
     GET /resolve?text=...        [{path, name, span}]                 what a text refers to
     GET /candidates?in=<path>    [{name, count, sources}]             unresolved names in one text, or everywhere
 
@@ -39,7 +39,7 @@ TALK_TURN = re.compile(r'^(/0x[0-9a-f]+/(?:user|agent)(?:/.+)?/talk)/turns/t(\d+
 REF = re.compile(r'^/h/([xyz])/(\d+)/\d+(/.*)$')
 TEXT_SLOTS = ('/said', '/text', '/quote', '/note', '/notes', '/title', '/heading', '/asked', '/description', '/summary', '/body')
 # a thing is any record under /user, at any depth, except the hands' own folders and a thing's own parts
-PARTS = {'talk', 'turns', 'mentions', 'asks', 'found', 'status', 'taken', 'context', 'views', 'integrated', 'syncs', 'runs', 'repairs', 'identities'}
+PARTS = {'talk', 'turns', 'asks', 'found', 'status', 'taken', 'context', 'views', 'integrated', 'syncs', 'runs', 'repairs', 'identities'}
 THING_ROOT = re.compile(r'^/0x[0-9a-f]+(/0x[0-9a-f]+)?/user/(?!web/|views/|sources/)[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)*$')
 WORLD = re.compile(r'^/(0x[0-9a-f]+)(?:/(0x[0-9a-f]+))?/user(/|$)')
 
@@ -188,7 +188,7 @@ class Index:
                             del lit['values'][v]
             self.labels_of.pop(source, None)
             self.name_text = {x for x in self.name_text if x[0] != source}
-            if props and '/user/' in source and not source.endswith('/mentions') and '/talk/' not in source and '/web/' not in source:
+            if props and '/user/' in source and '/talk/' not in source and '/web/' not in source:
                 mine = {}
                 for k, v in props.items():
                     if k.startswith('/sys') or target_of(v) or not isinstance(v, (str, int, float)) or k in ('/name', '/description', '/text', '/said', '/quote'):
@@ -347,8 +347,8 @@ class Index:
     def by(self, to):
         out = {}
         for m in self.links(to):
-            slot = 'mentioned' if m['path'].endswith('/mentions') else m['slot']
-            path = m['path'][:-len('/mentions')] if m['path'].endswith('/mentions') else m['path']
+            slot = m['slot']
+            path = m['path']
             out.setdefault(slot, []).append(dict(m, path=path))
         return out
 
@@ -360,8 +360,7 @@ class Index:
         return [(t, slot) for t, slot in self.out.get(p_, []) if (labels is None or slot in labels) and not slot.startswith('sys/')]
 
     def _edges_in(self, p_, labels=None):
-        return [(s_, slot) for (s_, slot) in self.into.get(p_, {}) if (labels is None or slot in labels) and not slot.startswith('sys/')
-                and not s_.endswith('/mentions') and '/talk/' not in s_ and not s_.endswith('/context') and '/user/views/' not in s_]
+        return [(s_, slot) for (s_, slot) in self.into.get(p_, {}) if (labels is None or slot in labels) and not slot.startswith('sys/') and '/talk/' not in s_ and not s_.endswith('/context') and '/user/views/' not in s_]
 
     def real(self, p_):
         seen = set()
@@ -720,7 +719,7 @@ class Index:
         prof = {}
         with self.lock:
             for src, refs in self.out.items():
-                if '/user/' not in src or src.endswith('/mentions') or '/talk/' in src:
+                if '/user/' not in src or '/talk/' in src:
                     continue
                 per = {}
                 for t, slot in refs:
@@ -886,7 +885,7 @@ class Index:
                 web = '/user/web/' in t
                 group = t if web else min(self.same_as(t))
                 for (s_, slot) in d:
-                    if slot in ('same', 'different', 'moved_to') or '/claims/' in s_ or s_.endswith('/mentions'):
+                    if slot in ('same', 'different', 'moved_to') or '/claims/' in s_:
                         continue
                     holder, folder = self.holder_of(s_)
                     if not holder or holder == t:
@@ -1036,7 +1035,7 @@ class Index:
         edges = []
         with self.lock:
             for s_, refs in self.out.items():
-                if '/user/web/' in s_ or '/claims/' in s_ or s_.endswith('/mentions') or '/talk/' in s_:
+                if '/user/web/' in s_ or '/claims/' in s_ or '/talk/' in s_:
                     continue
                 holder, label = self.holder_of(s_)
                 if not holder or world_of(holder) not in worlds:
@@ -1228,7 +1227,7 @@ class LinksHand(Hand):
         return ' . '.join(str(props[k]) for k in TEXT_SLOTS if isinstance(props.get(k), str) and len(props[k]) > 2)
 
     def absorb(self, record, write=True):
-        """One record into the index: its references, its names if it is a thing, its mentions if it holds text."""
+        """One record into the index: its references, its names if it is a thing, the names it uses if it holds text."""
         path, props = record['path'], record.get('properties') if record.get('exists', True) else None
         INDEX.put_refs(path, props)
         if THING.match(path):
@@ -1242,7 +1241,7 @@ class LinksHand(Hand):
                 cur = INDEX.talks.get(m.group(1))
                 if not cur or n >= int(cur.get('n') or 0):
                     INDEX.talks[m.group(1)] = {'n': n, 'who': str(props.get('/who') or '')}
-        if props is None or path.endswith('/mentions'):
+        if props is None:
             return
         text = self.text_of(props)
         if not text:
@@ -1267,18 +1266,6 @@ class LinksHand(Hand):
                 INDEX.by_name.setdefault(norm_name(n), set()).add(path)
         if write and INDEX.ready and here == self.node.lstrip('/'):
             self.offer(path, cands, bool(found))
-        if found and write:
-            slots, seen = {}, set()
-            for f in found:
-                if f['path'] == path or path.startswith(f['path'] + '/') or f['path'] in seen:
-                    continue
-                seen.add(f['path'])
-                slots[segment_of(f['path'].rsplit('/', 1)[1])] = {'type': 'reference', 'path': f['path'], 'care': 'x', 'case': 0}
-            if slots:
-                have = {k.lstrip('/'): target_of(v) for k, v in (self.w.read(path + '/mentions', 'x').get('properties') or {}).items()}
-                if {k: v['path'] for k, v in slots.items()} != have:
-                    self.pending.append({'path': path + '/mentions', 'slots': slots})
-
     def save(self):
         if not INDEX.ready:
             return
@@ -1319,7 +1306,7 @@ class LinksHand(Hand):
         self.dirty = True
 
     def reread_named(self, thing):
-        """A thing just appeared: every text that named it without a record gets its mentions now."""
+        """A thing just appeared: every text that named it without a record is re-read now."""
         keys = {k for k in INDEX.aliases_of.get(thing, ()) if k}
         srcs = set()
         with INDEX.lock:
@@ -1395,7 +1382,7 @@ class LinksHand(Hand):
             try:
                 self.w.tool('write', records=batch, who=self.name); n += len(batch)
             except Exception as e:
-                self.log(f'links: mentions refused: {str(e)[:100]}')
+                self.log(f'links: write refused: {str(e)[:100]}')
         return n
 
     def build(self):
@@ -1426,7 +1413,7 @@ class LinksHand(Hand):
         INDEX.ready = True
         for rec in pages:                                          # candidates need the full alias set, so once more, no writes
             props = rec.get('properties') or {}
-            if not rec['path'].endswith('/mentions') and self.text_of(props):
+            if self.text_of(props):
                 INDEX.candidates[rec['path']] = INDEX.unresolved(self.text_of(props), INDEX.resolve(self.text_of(props)))
         written = self.flush()
         self.save()

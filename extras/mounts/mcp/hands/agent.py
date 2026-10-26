@@ -151,7 +151,7 @@ Research only when the person wants to know more or the answer needs it: an ask 
 searches, and the person watches. When you integrate a found row, its source is the page region the row cites (the
 row's own source slot), never the ask.
 Every text you or the person write is scanned against the names in the world, and the things it names are written
-beside it as mentions, so a record's "pointing here" grows from what is said about it; you still write references in
+into its prose as paths in brackets, so a record's "pointing here" grows from what is said about it; you still write references in
 slots yourself, since a mention is weaker than a slot that says what the relation is.
 Your aim across turns is a smaller reading and a richer world. Work in portions: at most about thirty writes in
 one reply, then say what is next; the following turn continues from a smaller reading.
@@ -1101,11 +1101,11 @@ class AgentHand(Hand):
         return refused
 
     def quiet(self, item):
-        """Two hand lines wake me: a web fill under one of my asks, and the index writing the mentions of a new text."""
+        """Two hand lines wake me: a web fill under one of my asks, and the index naming a new text."""
         touched = item.get('touched') or []
         if any(re.search(r'/asks/[^/]+/found/', t) for t in touched):
             return False
-        if (item.get('who') or '') == 'links' and any(t.endswith('/mentions') or '/agent/weave/names/' in t for t in touched):
+        if (item.get('who') or '') == 'links' and any('/agent/weave/names/' in t for t in touched):
             return False
         return super().quiet(item)
 
@@ -1128,8 +1128,7 @@ class AgentHand(Hand):
             page = t['path'].rsplit('/', 1)[0]
             pp = self.w.read(page, 'x').get('properties') or {}
             where = f"page {page} ({pp.get('/title', '')}, {pp.get('/url', '')})" if pp.get('/url') else ''
-            mentions = self.w.read(t['path'] + '/mentions', 'x').get('properties') or {}
-            known = [unwrap_path(str(v)) for k, v in mentions.items() if not k.startswith('/sys')]
+            known = list(dict.fromkeys(re.findall(r'\[(/0x[0-9a-f]+/[^\]\s]+)\]', body)))   # the references its prose holds
             lines = [f"TEXT {t['path']}" + (f'  from {where}' if where else ''), body[:5000], 'THE THINGS IT NAMES THAT ARE ALREADY IN THE WORLD:']
             for k in known[:12]:
                 lines.append('\n'.join('  ' + l for l in render(self.w.read(k, 'x'))))

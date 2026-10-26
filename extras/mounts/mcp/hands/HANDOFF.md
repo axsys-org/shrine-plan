@@ -508,3 +508,53 @@ test. `ic-bare-loop` stays on the old runtime until that is settled.
   card's arm restored, the research hands, skills, notes and link-dependent proofs removed. 95 files, +11,341.
 - `ic-bare-loop-notes`: the merge with everything still on it; the second PR (hands, skills, notes) starts here.
 Worktrees: `../shrine-cells-main` (PR branch), `../shrine-main` (pristine main for comparison runs).
+
+## The overlay pass and the prose references (2026-10-26, late)
+
+What changed on `ic-bare-loop-main` since the merge, all uncommitted until the final group run is green:
+
+- **One read.** `graph.foil` has five sections (op, view, world, union, overlay) and three registered names
+  (`overlay`, `frontier`, `union`). `overlay(standings)` is the virtual namespace: one root `/<n>` per connected
+  component over every reference, each standing unfolded as a world beneath, a standing reached inside another's
+  unfolding listed as seen. A cell that reads a thing is a backward folder under the cell's own name whose one
+  line opens into its result; the walk never evaluates a cell and never crosses a computed name. The walk follows
+  parts too (a bucket reaches its records) and is bounded by the cell's `/nodes`. The routes, gaps, tentative
+  marks, the `mentioned`/`candidate` labels, the `mentions` special case, the `web` rules, `placements`,
+  `identities`, `referencing` and the unused helpers are gone; 100 definitions, every one used.
+- **A reference in prose is a reference.** `reference_index/slots` is the one place references are collected,
+  and it now reads a path in brackets inside any text slot (`[/0x11/user/orgs/verisk]`) as a reference held by
+  that slot. `graph` reads references through it (`refs`, `own_relations`), so a text's prose is its forward
+  folders and a thing's backward folder from a text is labelled by the prose slot. A titled text (name, heading
+  or title) is a thing (`named` uses `title`). A pinned standing reads its backward edges at its own epoch
+  (`incoming` spells the `/r` read inside the standing's `/h` head).
+- **No vocabulary.** The kernel ships no `mentions`, `candidates`, `links`, `mentioned`, `candidate`, `_of`,
+  `tentative`. Labels are slot names somebody wrote, or a cell's name. The page draws `←` for backward, dashed when
+  the holder's slot is prose or a cell's input, the sentence around the bracket beside the line, the bracket as a
+  link named after the record it points at, a `source` folder as attribution, and counts its own prose lines.
+- **Hands (this branch).** Ten schemes as JSON (`hands/schemes/*.json`): placement, identity, shared fields, fetch.
+  `registries.py` lands by scheme, writes a record per source and per kind, writes candidates as sentences in the
+  recipient's note (`May be [<path>] (why)`), and brackets a plant's name inside a subaward's own description.
+  `web.py` lands regions by the page's heading hierarchy, writes hyperlinks into the prose as landed paths, and
+  writes the site record. `links.py` no longer writes anything. `agent.py` and `digest.py` read a text's references
+  out of its prose; the digest rules say note, brackets, one record per sentence. `hand.World.view` names the three
+  views.
+- **Proof.** `tests/registries/proof.py <base>` after `registries.py` and `judge_cummins.py`: sixteen checks
+  (picture, cell folder, bounds, history, provenance across buckets, composition) with timings. On the scratch
+  world of 2026-10-26 (397 records, Cummins judged): twelve pass; the `/nodes` bound, the pinned picture and the
+  bucket meeting fail there because the kernel fixes for them were compiled after that boot, and are covered by
+  `graph_world_tests` (`/nodes`), `graph_workspace_tests` (live join, pinned picture, pinned text edge) and the
+  walk's parts rule; the fourth was the proof reusing names on a reused world, now stamped per run.
+- **Browser.** `/live?at=<path>` draws any path as the tree: the registries bucket (parts to sources, kinds,
+  records), the Cummins recipient (its note with twelve bracketed candidates as links, `← recipient` awards with
+  their slots, `suppliers` from the judged importer, the proof's cells as `←` folders), the ECHO facility beside it
+  in a two-standing workspace (one component, no island), the ECHO bucket as a world. The page served on that run
+  was one iteration behind the file (the mount stages assets at boot): prose links read as ids there and as names now.
+- **Docs.** `DIGESTION.md` (the gradient, brackets, one shape, views as the decomposing method, convergence),
+  `ARCHITECTURE.md` (four layers, the scheme as the front line, provenance, what was cut, convergence), the skill
+  (`cartography.md`: two writes, stand on the place first, no record of any other kind).
+
+Next, in order: the scheme as a record under `/user/sources/<name>` read by one generic fetch hand (an agent
+extends what can be fetched by writing a scheme and a mapping); value assertions as folders; `claims` retired into
+the one shape; the web landing at `/user/web/<domain>/<path>`; `gather`/`follow` operators and parameters at the
+embedding slot; a scheduler hand that hands the overlay's signals (islands, dashed lines, empty names, closed
+folders, missing crossings) to subagents.

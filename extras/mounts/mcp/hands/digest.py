@@ -42,6 +42,9 @@ Structure, and only structure:
 - A relation with several values or with qualifiers is child records of the thing, one per value, each holding the
   path and its qualifiers: {root}/books/walkaway/authors/cory_doctorow {{"author": "{root}/people/cory_doctorow",
   "role": "writer"}}.
+- Prose: a note slot holds the sentence that says it, in the text's own words, with every thing it names written as
+  its path in brackets, [{root}/orgs/verisk]; a reference in prose is a reference. A thing the text names but says
+  nothing about stays a bracket in the text, never a record. Shorten a note only by moving what it says into slots.
 - Provenance: a source slot on what you write, holding the text's path (sources/<n> child records when several).
 - Values: numbers as numbers, days as YYYYMMDD, years as YYYY. Slugs: lowercase letters, digits, underscores.
 - Reuse slot labels already in use; write only what the texts state; skip opinion and colour; nothing already recorded.
@@ -113,8 +116,7 @@ class DigestHand(Hand):
             pp = self.w.read(page, 'x').get('properties') or {}
             bodies.append(str(pp.get('/title') or ''))          # a region speaks under its page's title
             lines = [f'TEXT {t}' + (f"  (from {pp.get('/title', '')}, {pp.get('/url', '')}, fetched {pp.get('/fetched', '')})" if pp.get('/url') else ''), body[:4000]]
-            mentions = self.w.read(t + '/mentions', 'x').get('properties') or {}
-            known = [unwrap_path(str(v)) for k, v in mentions.items() if not k.startswith('/sys')]
+            known = list(dict.fromkeys(re.findall(r'\[(/0x[0-9a-f]+/[^\]\s]+)\]', body)))   # the references its prose holds
             if known:
                 lines.append('REAL RECORDS IT NAMES (reuse these):')
                 for k in known[:10]:
@@ -220,7 +222,7 @@ class DigestHand(Hand):
             self.gather = next((c['reference'] for c in stdlib if c['path'].endswith('/gather')), None)
         for w in writes:
             w['path'] = re.sub(r'/+', '/', str(w['path']).rstrip('/'))
-            w.pop('overlay', None); w.pop('note', None)
+            w.pop('overlay', None)
             slots = {}
             for k, v in (w.get('slots') or {}).items():
                 if isinstance(v, str) and re.match(r'^/0x[0-9a-f]+/(0x[0-9a-f]+/)?[a-z]', v.strip()) and ' ' not in v.strip():

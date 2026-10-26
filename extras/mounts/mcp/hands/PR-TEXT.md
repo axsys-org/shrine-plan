@@ -28,16 +28,19 @@ types.
 
 ## 3. The graph overlay (`graph`, one module)
 
-One module, four sections and a registry: `op` (what every view reads with), `view` (a thing's relations, forward
-from its own slots and backward from the index, through its `same` judgements, each edge attributed to the world
-asserting it and marked solid or mention), `world` (one thing as a world: relations as folders, breadth first, each
-thing once, bounded by `depth`, `cap`, `deeper` and `nodes` read from the cell with documented defaults), `union`
-(what every world says about one thing), `workspace` (several standings at once: components joined only over
-established hops, routes with each hop's strength, islands, gaps with their count of tentative routes). Eight
-names registered under `/weft/graph`: `relations`, `as_world`, `frontier`, `union`, `workspace`, `referencing`,
-`identities`, `placements`. Identity is a contract the records bring, nothing the kernel knows: a reference slot
-or a `same` judgement is solid; a reference from a record named `mentions` (a text naming things) or `candidates`
-(matches nobody judged) is tentative, drawn and never followed. Nothing a view draws is written back.
+One module, five sections and a registry: `op` (what every view reads with), `view` (a thing's relations: forward
+from its own slots, backward from the index, through its `same` judgements; each edge carries its holder, the
+record whose slot points across, and is attributed to the world asserting it; a cell that reads a thing is a
+backward edge under the cell's name whose contents are what the cell computes), `world` (one thing as a world:
+relations as folders, breadth first, each thing once, bounded by `depth`, `cap`, `deeper` and `nodes` read from
+the cell with documented defaults), `union` (what every world says about one thing), `overlay` (any number of
+standings as one picture: a breadth-first walk over every reference, standings that meet share a connected
+component, a standing nothing reaches is an island; the result is one virtual root `/<n>` per component with its
+standings unfolded as worlds beneath, a standing reached inside another's unfolding listed as seen). Six names
+registered under `/weft/graph`: `overlay`, `frontier`, `union`, `referencing`, `identities`, `placements`. What
+kind of edge a hop is, is what holds it: a thing's own slot, a `same` judgement, a text's `mentions` record, a
+`candidates` record nobody judged, a cell; the kernel names the holder and invents no vocabulary of its own (no
+`mentioned`, no `_of`), and the page decides what to draw dashed. Nothing a view draws is written back.
 
 ## 4. Not in this PR, on purpose
 
@@ -48,8 +51,11 @@ persistence work) is the one supervisor change, twelve lines.
 
 ## 5. Mounts and the page (`extras/mounts/mcp`, `extras/mounts/explorer`)
 
-MCP stays four tools (read, write, history, apply). The live page draws a record, its world, its workspace, and
-what points at it, reading only kernel views; the Python index is a fallback for a world without definitions.
+MCP stays four tools (read, write, history, apply). The live page draws a record and the thing as a world from
+the one `overlay` name: folders are slots, lines are things with the source's note beside them, what references
+the thing is a folder under its holder's name marked `←` (a slot, a text's `mentions`, a cell with its result
+beneath), and the standings the person gathers read as components and islands through a workspace cell the page
+writes. No Python index, no fallback routes.
 
 ## 6. Kept worlds and hands (`x/eden`, `x/eden_hands.py`, `SETUP.md`)
 
