@@ -75,7 +75,12 @@ is in the kernel:
 
 ## Order of work
 
-1. Merge main into the branch (no conflicts), run the full suite once, fix what moves.
+1. Merge main into the branch. Done on `ic-bare-loop-main` (worktree `../shrine-cells-main`): three additive
+   conflicts (the `look` card beside main's `snapshot_bat`/`interact_bat`; the launcher copies `arena.dat`), and the
+   test inventory brought up to date (main's three new reaver suites classified, entries for files that no longer
+   exist dropped). Main runs a newer enki (single-file `arena.dat` snapshots, bat primops); the merged branch's
+   Foil runs on it: tests/references 20/20, the full Foil suite is the gate. The saved-world upgrade pipeline is
+   LMDB-shaped and has not been tried on the new runtime; the PR does not depend on it.
 2. Fixes 1-4 above, with their doc comments; commit each as its own.
 3. Move the notes and the hands to `ic-bare-loop-notes` / a second branch; the kernel branch keeps `VISION.md`.
 4. PR text: one section per commit group, in reading order: index and reads; evaluator and cache; views;
