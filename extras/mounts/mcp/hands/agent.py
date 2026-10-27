@@ -46,12 +46,12 @@ Reply in two parts. First, what you say to the person: plain words, short, no ma
 the person as you write them. Then a line holding only --- and then exactly one JSON object, no fence, no XML, no
 tool-call syntax. When you need lookups before you can answer, the words may be a few ("Looking.") or none.
 {
-  "reads":   ["/0x11/...", {"find": "a term", "under": "/0x11/..."}, {"pointing": "/0x11/..."}, {"tree": "/0x11/..."},
+  "reads":   ["/0x11/...", {"find": "a term", "under": "/0x11/..."}, {"tree": "/0x11/..."},
               {"view": "<formula>", "over": "/0x11/...", "care": "y" | "z", "settings": {...}}],
                                             optional. Paths to look at before you answer (a record, a folder, /x/<cell>),
                                             or a search: the records under a folder whose name or any slot holds the
-                                            term, each with the slot that matched; pointing: what references a record, by
-                                            slot; tree: what a record is in and what is in it; view: any formula below run
+                                            term, each with the slot that matched; tree: what a record is in and what is in
+                                            it; view: any formula below run
                                             by the kernel over a folder, nothing written (where, validate, by, select, sort,
                                             top, count, diff, follow ...). You will be asked again with those lookups
                                             attached. At most a few.
@@ -615,23 +615,13 @@ class AgentHand(Hand):
         return sorted(out)
 
     def pending(self):
-        """Every chat whose latest turn is the person's: (folder, n, props). The chats under /agent by reading them;
-        the talks at records from the index, which knows every talk in the world and whose turn is latest."""
+        """Every chat whose latest turn is the person's: (folder, n, props), by reading the chats under /agent."""
         out = []
         for folder in self.chats():
             self.folder = folder
             ts = self.turns()
             if ts and ts[-1][1].get('/who') == 'person':
                 out.append((folder, ts[-1][0], ts[-1][1]))
-        try:
-            talks = json.load(urllib.request.urlopen('http://127.0.0.1:' + str(self.setting('links_port') or 8312) + '/talks', timeout=5))
-            for t in (talks.get('talks') or []) if talks.get('ready') else []:
-                if t.get('who') == 'person':
-                    props = self.w.read(f"{t['folder']}/turns/t{t['n']}", 'x').get('properties') or {}
-                    if props.get('/who') == 'person':
-                        out.append((t['folder'], int(t['n']), props))
-        except Exception:
-            pass                                             # the index is not up: talks are answered from the stream
         return out
 
     def context_reading(self):
@@ -656,32 +646,14 @@ class AgentHand(Hand):
             return lens + ['(your context cannot be read: ' + json.dumps(ctx)[:300] + ')']
         return lens + ['', 'READING:'] + render(tree)
 
-    def index(self, route):
-        try:
-            return json.load(urllib.request.urlopen('http://127.0.0.1:' + str(self.setting('links_port') or 8312) + route, timeout=10))
-        except Exception:
-            return {}
-
-    def tree_reading(self, at, depth=2):
-        """Where a record sits: its ancestors by path and by every overlay that places it, its descendants with overlays
-        resolved, and the references in and out."""
-        a = self.index('/around?at=' + urllib.parse.quote(at) + f'&depth={depth}')
+    def tree_reading(self, at):
+        """Where a record sits: its relations from the world's own view, each tagged with the asserting world, the
+        claims whose sources differ, and what every world says about the same thing."""
         kernel = views_of(self.w, at)
-        if kernel is not None:                                # the world's own relations view, each tagged with the asserting world
-            a = dict(a, relations=kernel['relations'], ready=True, real=a.get('real') or at)
-        if not a.get('ready'):
+        if kernel is None:
             return ''
-        lines = [f"WHERE {at} SITS" + (f" (an overlay of {a['real']})" if a.get('real') and a['real'] != at else '') + ':']
-        for anc in a.get('ancestors') or []:
-            via = 'its own path' if anc['via'] == a.get('real') else f"overlay {anc['via']}" + (f" ({'; '.join(f'{k}: {v}' for k, v in anc['note'].items())})" if anc.get('note') else '')
-            lines.append(f"  under {' < '.join(c['name'] for c in anc['chain']) or '(top)'}  via {via}")
-        def walk(nodes, d):
-            for n in nodes[:30]:
-                lines.append('  ' * d + f"- {n['name']} ({n['path']})" + (f"  overlay of {n['real']}" if n.get('real') else '') + (f"  [{'; '.join(f'{k}: {v}' for k, v in n['note'].items())}]" if n.get('note') else ''))
-                walk(n.get('next') or [], d + 1)
-        if a.get('descendants'):
-            lines.append('  beneath it:'); walk(a['descendants'], 2)
-        claims = [c for c in (self.w.read(a.get('real', at) + '/claims', 'y', limit=60).get('children') or []) if c.get('exists') and '/retracted' not in (c.get('properties') or {})]
+        lines = [f"WHERE {at} SITS:"]
+        claims = [c for c in (self.w.read(at + '/claims', 'y', limit=60).get('children') or []) if c.get('exists') and '/retracted' not in (c.get('properties') or {})]
         by_slot = {}
         for c in claims:
             cp = {k.lstrip('/'): v for k, v in (c.get('properties') or {}).items()}
@@ -689,11 +661,11 @@ class AgentHand(Hand):
         for slot_, cs in by_slot.items():
             if len({_norm(c.get('value')) for c in cs}) > 1:
                 lines.append(f"  sources differ on {slot_}: " + '; '.join(f"{c.get('value')} (by {c.get('by')}{', source ' + re.sub(r'^/h/[xyz]/[0-9]+/[0-9]+', '', str(c.get('source'))) if c.get('source') else ''})" for c in cs))
-        rel = a.get('relations') or []
+        rel = kernel['relations']
         if rel:
             note = lambda r: (' [' + '; '.join(f'{k}: {v}' for k, v in r['note'].items() if not str(v).startswith('/')) + ']') if r.get('note') else ''
             lines.append('  relations:')
-            here = (a.get('real') or at).split('/')[1]
+            here = at.split('/')[1]
             tag = lambda r: f" [asserted by {r['world']}]" if r.get('world') and r['world'] != here else ''
             for r in rel[:30]:
                 if r['way'] == 'out':
@@ -701,7 +673,7 @@ class AgentHand(Hand):
                 else:
                     lines.append(f"    {r['label']} of: {r['name']} ({r['other']}){note(r)}{tag(r)}")
         # the same thing in other worlds: what each world says, where they agree and where they differ
-        u = (kernel or {}).get('union') or self.index('/union?at=' + urllib.parse.quote(a.get('real') or at))
+        u = kernel.get('union') or {}
         if len(u.get('worlds') or []) > 1:
             lines.append('  described by worlds ' + ', '.join(u['worlds']) + ': ' + '; '.join(f"{m['world']} at {m['path']}" for m in u['records']))
             agree = [f.get('value') or f"{f['labels'][0]} {f['name']}" for f in u['facts'] if f['all']]
@@ -713,45 +685,7 @@ class AgentHand(Hand):
                     lines.append(f'    only {w} says: ' + '; '.join(only[:10]))
             for d in u.get('disagreements') or []:
                 lines.append(f"    worlds differ on {d['slot']}: " + '; '.join(f"{v} ({', '.join(ws)})" for v, ws in d['values'].items()))
-        cands = self.index('/identities?at=' + urllib.parse.quote(a.get('real') or at) + '&limit=5').get('candidates') or []
-        if cands:
-            lines.append('  maybe the same thing in another world (judge the evidence; join with same, or record different):')
-            for c in cands:
-                other = c['b'] if c['a'] in (a.get('real'), at) else c['a']
-                lines.append(f"    {other} ({c['b_name'] if other == c['b'] else c['a_name']})" + ' — ' + '; '.join(f"{e['kind']}: {e['detail']}" for e in c['evidence'][:3]) + (' (a name only: not proof)' if c['name_only'] else ''))
-        if a.get('refs_in'):
-            lines.append('  referred to by: ' + ', '.join(f"{r['label']} of {r['path']}" for r in a['refs_in'][:12]))
         return '\n' + '\n'.join(lines)
-
-    def signals_reading(self):
-        sg = self.index('/signals?limit=8')
-        if not sg.get('ready'):
-            return ''
-        s_ = sg.get('signals') or {}
-        lines = []
-        ids = self.index('/identities?limit=6').get('candidates') or []
-        if ids:
-            lines.append('  maybe one thing in two worlds: ' + '; '.join(f"{c['a']} ~ {c['b']} ({', '.join(e['kind'] + ' ' + e['detail'] for e in c['evidence'][:2])})" for c in ids))
-        for key, label in (('disagreements', 'sources disagree'), ('same_name_across_worlds', 'one name in several worlds, not joined'), ('dangling', 'dangling references'), ('dangling_overlays', 'overlays of missing records'), ('orphans', 'orphans (no edges)'), ('name_as_text', 'names written as text'),
-                           ('numbered_labels', 'numbered labels'), ('shared_literal', 'shared literals'), ('undecomposed', 'texts not yet decomposed')):
-            items = s_.get(key) or []
-            if items:
-                lines.append(f'  {label}: ' + '; '.join(' '.join(str(x).replace('/0x11/user/', '') for x in (it if isinstance(it, (list, tuple)) else [it])) for it in items[:6]))
-        return ('STRUCTURAL SIGNALS (candidates for your judgement):\n' + '\n'.join(lines)) if lines else ''
-
-    def profile_reading(self, limit=40):
-        pr = self.index('/profile')
-        if not pr.get('ready'):
-            return ''
-        rows = sorted(pr.get('labels', {}).items(), key=lambda kv: -(kv[1].get('refs', 0) + kv[1].get('literals', 0)))[:limit]
-        def fmt(k, v):
-            parts = []
-            if v.get('refs'):
-                parts.append(f"{v['refs']} refs " + ','.join(f'{a}>{b}' for a in list(v['from'])[:2] for b in list(v['to'])[:2]) + (f", {v['many']} records hold several" if v.get('many') else ''))
-            if v.get('literals'):
-                parts.append(f"{v['literals']} literals, {v.get('distinct')} distinct")
-            return f'{k} ({"; ".join(parts)})'
-        return 'LABELS IN USE (how each slot name is used now; reuse a label rather than invent one):\n  ' + ' · '.join(fmt(k, v) for k, v in rows)
 
     # ---- hygiene as cells: the kernel computes what is wrong with each kind; the agent reads the answers, never the folders
     HYGIENE = (('count', 'count', {}),
@@ -808,38 +742,6 @@ class AgentHand(Hand):
             lines.append(f'  {kind}: ' + '; '.join(parts))
         return ('HYGIENE (from the cells under /0x11/user/views/hygiene; read /x/<cell> for the whole list):\n' + '\n'.join(lines)) if lines else ''
 
-    def named_reading(self, text):
-        """Every record the person's words name, resolved by the index against every name, alias, handle and domain in
-        the world, with the record itself, the tree around it, what points at it by slot, and the texts that mention it:
-        the evidence already in the world, so nothing has to be searched for that the world holds."""
-        if not text or text.startswith('(not the person'):
-            return ''
-        r = self.index('/resolve?text=' + urllib.parse.quote(text[:2000]))
-        hits, seen = [], set()
-        for m in r.get('matches') or []:
-            if m['path'] not in seen:
-                seen.add(m['path']); hits.append(m)
-        if not hits:
-            return ''
-        out = ['\n\nTHE THINGS THE PERSON NAMES, ALREADY IN THE WORLD (use these before searching anything):']
-        for m in hits[:6]:
-            rec = self.w.read(m['path'], 'x')
-            out.append(f"- {m['span']!r} is {m['path']}" + (' (more than one record has this name)' if m.get('ambiguous') else ''))
-            out.append('\n'.join('    ' + l for l in render(rec)))
-            out.append('\n'.join('    ' + l for l in self.tree_reading(m['path'], depth=1).strip().splitlines()))
-            by = self.index('/by?to=' + urllib.parse.quote(m['path'])).get('by') or {}
-            for slot, ms in sorted(by.items()):
-                if slot != 'mentioned':
-                    continue
-                paths = [x['path'] for x in ms if '/talk/' not in x['path'] and not x['path'].endswith('/context')]
-                if not paths:
-                    continue
-                label = 'mentioned in' if slot == 'mentioned' else f'{slot} of'
-                out.append(f'    {label}: ' + ', '.join(paths[:8]) + (f' (+{len(paths) - 8})' if len(paths) > 8 else ''))
-        return '\n'.join(out)
-
-
-
     def stdlib_refs(self):
         if self.stdlib is None:
             self.stdlib = {c['path'].rsplit('/', 1)[1]: c['reference'] for c in self.w.read('/' + self.w.node + '/weft/stdlib', 'y', limit=100)['children']}
@@ -876,9 +778,7 @@ class AgentHand(Hand):
                     'here is a slot on it (a reference to a thing in the world, a fact, a note); a thing it names that has '
                     'no record yet gets one in its kind folder, with in pointing here when it is part of this. Another '
                     'world synced to this path sees what lands here.\nTHE RECORD, NOW:\n' + '\n'.join(render(rec)) + self.tree_reading(at))
-        kinds = self.profile_reading() + '\n' + self.signals_reading()
-        named = self.named_reading(said)
-        user = f'YOUR NAME: {self.name}   YOUR FOLDER: {self.folder}   (your asks go under {self.folder}/asks, your views under {self.folder}/views, your lens is {self.folder}/context)\n\n{kinds}\n\nYOUR CONTEXT (the world through your lens, now):\n{reading}{here}{named}\n\nTHE PERSON SAYS:\n{said}'
+        user = f'YOUR NAME: {self.name}   YOUR FOLDER: {self.folder}   (your asks go under {self.folder}/asks, your views under {self.folder}/views, your lens is {self.folder}/context)\n\nYOUR CONTEXT (the world through your lens, now):\n{reading}{here}\n\nTHE PERSON SAYS:\n{said}'
         messages = [{'role': 'system', 'content': BOOTSTRAP}, {'role': 'user', 'content': user}]
         reply, spoken, stopped, text = {}, [], False, ''
         chat = chat_key(folder)
@@ -925,10 +825,7 @@ class AgentHand(Hand):
                             looked.append(f"VIEW {p['view']} over {p.get('over')} {json.dumps(p.get('settings') or {})}: {len(rows)} rows" + (f' (context: {ctx})' if ctx else '') + '\n' +
                                           '\n'.join(render(res))[:6000])
                         elif isinstance(p, dict) and p.get('tree'):
-                            looked.append(f'TREE AT {p["tree"]}:' + (self.tree_reading(str(p['tree']), depth=4) or ' (the index is not up)'))
-                        elif isinstance(p, dict) and p.get('pointing'):
-                            by = json.load(urllib.request.urlopen('http://127.0.0.1:' + str(self.setting('links_port') or 8312) + '/by?to=' + urllib.parse.quote(str(p['pointing'])), timeout=10)).get('by') or {}
-                            looked.append(f'POINTING AT {p["pointing"]}:\n' + ('\n'.join(f'  {slot}: ' + ', '.join(m['path'] for m in ms[:20]) for slot, ms in sorted(by.items())) or '  nothing'))
+                            looked.append(f'TREE AT {p["tree"]}:' + (self.tree_reading(str(p['tree'])) or ' (no relations view for it)'))
                         elif isinstance(p, dict) and p.get('find'):
                             r = self.w.tool('read', path=p.get('under') or '/' + self.w.node + '/user', care='z', find=str(p['find']), limit=200)
                             hits = r.get('matches') or []
@@ -1101,76 +998,12 @@ class AgentHand(Hand):
         return refused
 
     def quiet(self, item):
-        """Two hand lines wake me: a web fill under one of my asks, and the index naming a new text."""
+        """One hand line wakes me: a web fill under one of my asks."""
         touched = item.get('touched') or []
         if any(re.search(r'/asks/[^/]+/found/', t) for t in touched):
             return False
-        if (item.get('who') or '') == 'links' and any('/agent/weave/names/' in t for t in touched):
-            return False
         return super().quiet(item)
 
-
-    # ---- the digest: every text in the world is decomposed into facts on the things it is about, once
-    def digest(self, now):
-        folder = '/' + self.w.node + '/agent/weave'
-        if now - self.last_look.get('digest', 0) < 90:
-            return 0
-        q = self.index('/undigested?limit=3')
-        texts = q.get('texts') or []
-        if not texts:
-            return 0
-        self.last_look['digest'] = now
-        blocks = []
-        for t in texts:
-            rec = self.w.read(t['path'], 'x')
-            props = rec.get('properties') or {}
-            body = ' '.join(str(props[k]) for k in ('/heading', '/title', '/text', '/said', '/quote', '/note') if isinstance(props.get(k), str))
-            page = t['path'].rsplit('/', 1)[0]
-            pp = self.w.read(page, 'x').get('properties') or {}
-            where = f"page {page} ({pp.get('/title', '')}, {pp.get('/url', '')})" if pp.get('/url') else ''
-            known = list(dict.fromkeys(re.findall(r'\[(/0x[0-9a-f]+/[^\]\s]+)\]', body)))   # the references its prose holds
-            lines = [f"TEXT {t['path']}" + (f'  from {where}' if where else ''), body[:5000], 'THE THINGS IT NAMES THAT ARE ALREADY IN THE WORLD:']
-            for k in known[:12]:
-                lines.append('\n'.join('  ' + l for l in render(self.w.read(k, 'x'))))
-            blocks.append('\n'.join(lines))
-        self.folder = folder
-        ts = self.turns()
-        n = ts[-1][0] if ts else 0
-        prompt = ('(not the person: texts in the world that have not been decomposed yet. For each one, write into the world every '
-                  'fact it states about a thing that matters, the way a careful editor would: one fact, one slot, on the record of the '
-                  'thing it is about, with source pointing at the text. A value is a literal (a year as YYYY, a day as YYYYMMDD); a '
-                  'relation to another thing is a reference to that thing\'s record, made with name and description when the text '
-                  'says something about it; a relation with several values is a child record per value; reuse a label from LABELS IN '
-                  'USE when one fits, and store a relation on the side that holds one value. Skip opinion, colour and anything already '
-                  'recorded. '
-                  'Then poke each text with {"digested": true}. A text with nothing worth keeping is poked digested too.\n\n' + '\n\n'.join(blocks) + ')')
-        self.log(f"agent: digesting {len(texts)} texts ({q.get('waiting')} waiting)")
-        return self.answer(folder, n, {'/said': prompt})
-
-    # ---- the weave: names the index could not resolve, placed when the agent is sure, left when it is not
-    def weave(self, now):
-        folder = '/' + self.w.node + '/agent/weave'
-        names = [c for c in (self.w.read(folder + '/names', 'y', limit=200).get('children') or []) if c.get('exists')]
-        if not names or now - self.last_look.get(folder, 0) < 120:
-            return 0
-        self.last_look[folder] = now
-        lines = []
-        for c in names[:30]:
-            props = c.get('properties') or {}
-            srcs = ', '.join(re.sub(r'^/h/[xyz]/\d+/\d+', '', str(v)) for k, v in sorted(props.items()) if k.startswith('/source_'))
-            lines.append(f"  {c['path']}  name: {props.get('/name')}  seen {props.get('/count')}x  in: {srcs}")
-        self.folder = folder
-        ts = self.turns()
-        n = ts[-1][0] if ts else 0
-        prompt = ('(not the person: names that appeared in texts and match no record, queued at ' + folder + '/names:\n' + '\n'.join(lines) +
-                  '\nFor each one you are sure of: if it is a thing (a person, organisation, place, product, publication, event, language, '
-                  'protocol), find whether it already exists under another spelling ({"find": ...}); if it does, add the spelling to that '
-                  'record\'s aliases slot; if not, make it where its kind lives with name and description, and link it the way its kind links '
-                  '(a place: in -> the place that contains it, making that place too if needed; a person: org; an organisation: parent or hq; '
-                  'a product: maker). Then cull its name record. A name that is not a thing (a fragment, a common word, a date) is culled '
-                  'too. A name you are unsure about is left where it is for a later pass. Nothing is invented: a stub holds only what the '
-                  'texts it appeared in say. Say in one line what you placed and what you left.)')
-        return self.answer(folder, n, {'/said': prompt})
 
     # ---- the reform: one kind folder at a time, on a slow clock, so the world tightens as it grows
     KINDS_SKIP = SYSTEM_KINDS
@@ -1200,8 +1033,6 @@ class AgentHand(Hand):
     def line(self, line):
         touched = line.get('touched') or []
         done = 0
-        if (line.get('who') or '') == 'links':
-            return 0                                         # names and reform run on the tick, in their own time
         # a fill landing under one of my asks is the alert: a turn of my own, unprompted, to integrate it and tell the person
         for t in touched:
             m = re.match(r'^(/' + self.w.node + r'/agent/[a-z]\d*|/' + self.w.node + r'/(?:user|agent)(?:/.+)?/talk)/asks/([^/]+)/found/', t)
@@ -1234,8 +1065,8 @@ class AgentHand(Hand):
             return done
         if str(self.setting('background') or os.environ.get('AGENT_BACKGROUND', 'off')).lower() in ('off', '0', 'false', 'no'):
             return 0                                          # digest, weave and reform are paused: only what the person says is answered
-        return self.weave(now) or self.reform(now)              # the digest hand decomposes texts; the agent places names and tidies
+        return self.reform(now)                                 # the digest hand decomposes texts; the agent tidies
 
 
 if __name__ == '__main__':
-    _hand.run(AgentHand, settings=('name', 'model', 'endpoint', 'stream_port', 'links_port', 'background'))
+    _hand.run(AgentHand, settings=('name', 'model', 'endpoint', 'stream_port', 'background'))

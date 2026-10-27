@@ -1,10 +1,11 @@
 """The digest hand: every text in the world is decomposed into the world, soon after it arrives.
 
-The links index keeps the queue of texts not yet digested, newest first. Four workers take them a few at a time and
-ask a fast model to write what each text states, under the world's structure rules and nothing else: one canonical
-record per thing, a slash only for parts, every relation asserted once as a slot naming the other thing (child
-records when it has several values or qualifiers), and a source slot naming the text. The other direction of a
-relation is never written; the index reads it. The hand then marks each text digested.
+Texts not yet digested come to it as a queue, newest first; workers take them a few at a time and ask a fast model to
+write what each text states, under the world's structure rules and nothing else: one canonical record per thing, a
+slash only for parts, every relation asserted once as a slot naming the other thing (child records when it has several
+values or qualifiers), and a source slot naming the text. The other direction of a relation is never written; the
+kernel's /r reads it. The hand then marks each text digested. The links index that answered the queue is gone, so the
+queue is empty until a source of texts is given to `due`.
 
     python3 digest.py <base> [--node 0x11] [--model anthropic/claude-haiku-5.5] [--workers 4]
 """
@@ -71,21 +72,18 @@ class DigestHand(Hand):
         self.gather = None
         self.log(f'digest: {self.model}, {self.pool._max_workers} workers')
 
-    def index(self, route):
-        try:
-            return json.load(urllib.request.urlopen('http://127.0.0.1:' + str(self.setting('links_port') or 8312) + route, timeout=10))
-        except Exception:
-            return {}
+    def due(self):
+        """The texts not yet digested, newest first. The links index answered this; nothing does yet, so the hand idles."""
+        return []
 
     def quiet(self, item):
-        return True                 # it works from the index's queue, not from the stream
+        return True                 # it works from its queue on the tick, not from the stream
 
     def mark_seen(self):
         pass
 
     def tick(self, now):
-        q = self.index('/undigested?limit=24')
-        texts = [t['path'] for t in (q.get('texts') or [])]
+        texts = self.due()
         with self.lock:
             free = [t for t in texts if now >= self.flight.get(t, 0)]
             for t in free:
@@ -120,13 +118,7 @@ class DigestHand(Hand):
             if known:
                 lines.append('REAL RECORDS IT NAMES (reuse these):')
                 for k in known[:10]:
-                    a = self.index('/around?at=' + urllib.parse.quote(k) + '&depth=1')
-                    own = [r for r in (a.get('relations') or []) if r.get('world', world) == world]      # this world's relations only
-                    rels = '; '.join(f"{r['label']}{' of' if r['way'] == 'in' else ''} {r['other']}" for r in own[:6])
-                    lines.append('  ' + ' | '.join(render(self.w.read(k, 'x'))[:3]) + (f'  relations: {rels}' if rels else ''))
-            cands = [c['name'] for c in (self.index('/candidates?in=' + urllib.parse.quote(t)).get('candidates') or [])]
-            if cands:
-                lines.append('NAMES IN IT WITH NO RECORD YET: ' + ', '.join(cands[:20]))
+                    lines.append('  ' + ' | '.join(render(self.w.read(k, 'x'))[:3]))
             blocks.append('\n'.join(lines))
         user = '\n\n'.join(blocks)
         style = self.w.read(root + '/style', 'x').get('properties') or {}
@@ -257,4 +249,4 @@ class DigestHand(Hand):
 
 
 if __name__ == '__main__':
-    _hand.run(DigestHand, settings=('model', 'workers', 'links_port'))
+    _hand.run(DigestHand, settings=('model', 'workers'))

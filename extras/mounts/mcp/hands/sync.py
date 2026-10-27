@@ -58,16 +58,8 @@ class SyncHand(Hand):
         pass
 
     def roots(self):
-        """This world and every peer world kept under it (/0x11/0x12/user ...), as the links index has seen them on the
-        stream (a listing of the node pages through its whole tree before reaching the peers)."""
-        out = [self.node + '/user']
-        try:
-            port = self.setting('links_port') or 8312
-            seen = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/worlds', timeout=10)).get('worlds') or []
-        except Exception:
-            seen = []
-        out += [w for w in seen if w.startswith(self.node + '/0x') and w not in out]
-        return out
+        """This world's /user. Peer worlds kept under it were listed by the links index; none is listed now."""
+        return [self.node + '/user']
 
     def due(self):
         """Every sync with a run to do: a run left running (resumed where it stopped), or none yet, or a resync asked."""
@@ -192,4 +184,4 @@ class SyncHand(Hand):
 
 
 if __name__ == '__main__':
-    _hand.run(SyncHand, settings=('links_port',))
+    _hand.run(SyncHand, settings=())
