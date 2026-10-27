@@ -14,7 +14,7 @@ What each drop causes, bounded by the world as it stands:
                        writes each mention back as the path in brackets; the index then holds the references and the
                        overlay joins what the text names. The first text that states a purpose names the workspace.
     a topic            a short text with nothing bracketed is searched for: the first pages land by the web scheme, each
-                       written beneath the topic as found -> page with the engine's snippet as the note, so the overlay
+                       written beneath the topic as pages -> page with the engine's snippet as the note, so the overlay
                        walks from the topic to its pages; the first few are then fetched and digested like any url.
     a url              fetch the page and land its regions beneath the input, by the page's own heading hierarchy, each
                        region's hyperlinks kept in its prose; then place the names in the first regions.
@@ -29,10 +29,10 @@ What each drop causes, bounded by the world as it stands:
                        at that name. A thing the workspace already knows is pointed at the same way. The records a
                        standing reaches get the same, a few at a time.
     after a round      compose the reading: what the workspace asks, read against everything it now reaches, as a
-                       table of contents at <ws>/reading: a few sections, each a short heading, under each a few things
+                       table of contents at <ws>/views/reading: a few sections, each a short heading, under each a few things
                        with a short name, one line saying why it is there, and the thing as a reference. The page
                        draws the reading as the tree; the wired world stays beneath every entry. Recomposed after
-                       each round of work as the next version beneath reading/, never while one is running; nothing
+                       each round of work as the next version beneath views/reading/, never while one is running; nothing
                        is culled.
 
 Nothing is stored that the kernel can read off the records; the hand writes only notes with references, judgements,
@@ -281,7 +281,7 @@ class WorkspaceHand(Hand):
         with self.lock:
             self.busy[ws] = self.busy.get(ws, 0) + 1
         self.status(ws, 'Reading new input', True)
-        if fn is not self.compose:
+        if fn != self.compose:            # == : a bound method is a new object on every access
             self.dirty.add(ws)
         def run():
             try:
@@ -592,10 +592,10 @@ class WorkspaceHand(Hand):
         sections = [sec for sec in (reply.get('sections') or []) if isinstance(sec, dict) and str(sec.get('heading') or '').strip()][:6]
         if not sections:
             return
-        # a reading is never culled: each composition is the next version beneath reading/, the page draws the latest
+        # a reading is never culled: each composition is the next version beneath views/reading/, the page draws the latest
         old = [c['path'] for c in (self.w.read(base + '/views/reading', 'y', limit=200).get('children') or [])]
         v = 1 + max([0] + [int(m.group(1)) for p in old for m in [re.search(r'/v(\d+)$', p)] if m])
-        here = base + '/reading/v%d' % v
+        here = base + '/views/reading/v%d' % v
         records = [{'path': here, 'slots': {'name': 'reading %d' % v, 'sections': len(sections)}}]
         seen = set()
         for i, sec in enumerate(sections, 1):
@@ -620,6 +620,8 @@ class WorkspaceHand(Hand):
         wsrec = {k.lstrip('/'): v for k, v in (self.w.read(self.root + ws, 'x').get('properties') or {}).items()}
         untitled = str(wsrec.get('name') or '') in ('', ws, ws.replace('_', ' '))
         if rec.get('url'):
+            if rec.get('fetched'):
+                return                      # digested once, for every workspace: its names and statements are shared
             t = self.task(ws, 'Fetch and digest ' + str(rec['url'])[:60], 'Auto · URL source', about=path)
             try:
                 markup, _ = _web.fetch_page(str(rec['url']))
@@ -650,7 +652,7 @@ class WorkspaceHand(Hand):
             self.search_topic(ws, path, text.strip())
         self.decompose_many(ws, [path], 'Decompose ' + (str(rec.get('name') or 'the text'))[:40])
 
-    # ---- a topic: the web searched, the first pages landed by the scheme and written beneath the topic as found
+    # ---- a topic: the web searched, the first pages landed by the scheme and written beneath the topic as pages
     def search_topic(self, ws, path, text):
         t = self.task(ws, 'Search the web for ' + text[:48], 'Auto · topic', about=path)
         try:
@@ -670,10 +672,10 @@ class WorkspaceHand(Hand):
             if not self.w.read(page, 'x').get('exists'):
                 records.append({'path': page, 'slots': {'name': (title or url.replace('https://', ''))[:80], 'url': url}})
             slug = segment_of((title or url.split('/')[-1] or 'page')[:50]) or 'page'
-            found = {'found': ref(page), 'source': ref(path)}
+            hit = {'pages': ref(page), 'source': ref(path)}
             if snippet:
-                found['note'] = str(snippet)[:300]
-            records.append({'path': path + '/found/' + slug, 'slots': found})
+                hit['note'] = str(snippet)[:300]
+            records.append({'path': path + '/pages/' + slug, 'slots': hit})
             pages.append(page)
         if records:
             self.write(records)
