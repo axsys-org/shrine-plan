@@ -97,7 +97,8 @@ class World:
         return self.tool('write', records=records, who='resume-test')
 
     def pack(self):
-        return (self.directory / 'snap' / 'pins.pack').stat().st_size
+        # The snapshot the runtime keeps: one arena.dat since the 2026-10 enki, data.mdb and pins.pack before it.
+        return sum(f.stat().st_size for f in (self.directory / 'snap').iterdir() if f.is_file())
 
 
 def check(port, directory, timeout, count=20, node='0x11'):
@@ -122,7 +123,7 @@ def check(port, directory, timeout, count=20, node='0x11'):
         times.sort()
         growth = (world.pack() - before) / count / 1024
         print(f'{count} single-record writes: median {1000 * times[count // 2]:.1f} ms, '
-              f'max {1000 * times[-1]:.1f} ms; pack growth {growth:.0f} KiB per event', flush=True)
+              f'max {1000 * times[-1]:.1f} ms; snapshot growth {growth:.0f} KiB per event', flush=True)
         world.write([{'path': f'/user/keep/b{i}', 'slots': {'n': i}} for i in range(100)])
         # A reference's path carries the node, as a read's reference does.
         weft = {'type': 'reference', 'path': f'/{node}/weft/stdlib/count', 'care': 'x',
