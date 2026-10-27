@@ -9,7 +9,6 @@ _hand = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_hand)
 BASE = os.environ.get('STRANGERS_BASE', 'http://127.0.0.1:8300')
 NODE = os.environ.get('STRANGERS_NODE', '0x11')
 W = _hand.World(BASE, NODE)
-stream = _hand._stream
 
 def props(r):
     return {k.lstrip('/'): v for k, v in (r.get('properties') or {}).items() if not k.startswith('/sys')}

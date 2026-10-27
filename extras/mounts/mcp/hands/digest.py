@@ -9,15 +9,11 @@ queue is empty until a source of texts is given to `due`.
 
     python3 digest.py <base> [--node 0x11] [--model anthropic/claude-haiku-5.5] [--workers 4]
 """
-import hashlib
 import importlib.util
 import json
 import os
 import re
 import threading
-import time
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -104,7 +100,6 @@ class DigestHand(Hand):
 
     def batch(self, texts):
         root = root_of(texts[0])
-        world = root.rsplit('/user', 1)[0].rsplit('/', 1)[1]
         blocks, bodies = [], []
         for t in texts:
             props = self.w.read(t, 'x').get('properties') or {}

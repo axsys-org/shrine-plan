@@ -1,6 +1,5 @@
 """The hands a world runs: named in its descriptor (world.json), started after the foot listens, each its own process
 with its log beside the world's, stopped at teardown. A hand not listed does not run."""
-import os
 import shlex
 import subprocess
 import sys
