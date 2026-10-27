@@ -640,8 +640,11 @@ class WorkspaceHand(Hand):
         rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
         note = str(rec.get('note') or '')
         candidates = [c for c in MAYBE.findall(note)][:CANDIDATES]
-        # what the workspace now reaches gets read for its statements, a bounded set nearest to any standing
-        reach = self.reached(ws)
+        # only where the standings do not all meet is what the workspace reaches read for its statements: the agent
+        # works where the perspective has a gap, a bounded set nearest to any standing
+        root = {k.lstrip('/'): v for k, v in (self.world(ws).get('properties') or {}).items()}
+        apart = int(root.get('components') or 0) > 1
+        reach = self.reached(ws) if apart else []
         if reach:
             self.submit(ws, self.decompose_many, ws, reach, 'Read what the workspace reaches')
         if not candidates:
