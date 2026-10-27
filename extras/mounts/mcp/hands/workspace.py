@@ -13,6 +13,9 @@ What each drop causes, bounded by the world as it stands:
     a text or a file   place its names: the model reads the text beside the names the workspace already reaches and
                        writes each mention back as the path in brackets; the index then holds the references and the
                        overlay joins what the text names. The first text that states a purpose names the workspace.
+    a topic            a short text with nothing bracketed is searched for: the first pages land by the web scheme, each
+                       written beneath the topic as found -> page with the engine's snippet as the note, so the overlay
+                       walks from the topic to its pages; the first few are then fetched and digested like any url.
     a url              fetch the page and land its regions beneath the input, by the page's own heading hierarchy, each
                        region's hyperlinks kept in its prose; then place the names in the first regions.
     a path             link what is already known: the record's own note names candidates (May be [path] ...); each is
@@ -75,6 +78,9 @@ def generic(name, kind):
 NOT_RELATIONS = {'name', 'note', 'source', 'sources', 'sys', 'same', 'unresolved', 'unknown', 'status', 'state', 'about', 'is', 'has'}
 WORLD_CACHE = 20.0          # seconds a workspace's world read is reused across jobs
 THINGS = 8                  # things taken out of one record's prose, at most
+TOPIC = 160                 # a text no longer than this, with nothing bracketed, is a topic to search for
+FOUND = 5                   # pages a search lands beneath a topic
+FETCHED = 3                 # of which the first are fetched and digested at once
 CANDIDATES = 6              # candidates judged per path
 BRACKET = re.compile(r'\[(/[^\]\s]+)\]')
 CODELIKE = re.compile(r'^[A-Z]{0,6}\s*\d[\d\-]{4,}$|^(EPA ECHO|NAICS|SIC|CAGE|UEI|DUNS|CIK|LEI)\b', re.I)
@@ -640,7 +646,40 @@ class WorkspaceHand(Hand):
         t = self.task(ws, 'Place the names in ' + (str(rec.get('name') or 'the text'))[:50], 'Auto · reading the text', about=path)
         placed, title = self.place(ws, path, text, untitled)
         self.done(t, f'{placed} name{"" if placed == 1 else "s"} placed' + (f' · named the workspace "{title}"' if title else ''))
+        if len(text.strip()) <= TOPIC and '[/' not in text and not text.strip().startswith('http'):
+            self.search_topic(ws, path, text.strip())
         self.decompose_many(ws, [path], 'Decompose ' + (str(rec.get('name') or 'the text'))[:40])
+
+    # ---- a topic: the web searched, the first pages landed by the scheme and written beneath the topic as found
+    def search_topic(self, ws, path, text):
+        t = self.task(ws, 'Search the web for ' + text[:48], 'Auto · topic', about=path)
+        try:
+            hits, used = _web.search(text, limit=FOUND)
+        except Exception as e:
+            self.done(t, 'no search engine answered: ' + str(e)[:60]); return
+        ref = lambda p: {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(p.split('/')) - 1, p)}
+        records, pages, seen = [], [], set()
+        for url, title, snippet in hits[:FOUND]:
+            try:
+                page = _web.page_path(self.w.node, url)
+            except Exception:
+                continue
+            if page in seen:
+                continue
+            seen.add(page)
+            if not self.w.read(page, 'x').get('exists'):
+                records.append({'path': page, 'slots': {'name': (title or url.replace('https://', ''))[:80], 'url': url}})
+            slug = segment_of((title or url.split('/')[-1] or 'page')[:50]) or 'page'
+            found = {'found': ref(page), 'source': ref(path)}
+            if snippet:
+                found['note'] = str(snippet)[:300]
+            records.append({'path': path + '/found/' + slug, 'slots': found})
+            pages.append(page)
+        if records:
+            self.write(records)
+        self.done(t, f'{len(pages)} page{"" if len(pages) == 1 else "s"} found via {used}')
+        for page in pages[:FETCHED]:
+            self.submit(ws, self.digest_input, ws, page)
 
     def link_path(self, ws, path):
         rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
