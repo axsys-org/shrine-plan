@@ -56,10 +56,22 @@ _web = _load('web')
 ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 DEFAULT_MODEL = os.environ.get('WORKSPACE_MODEL') or 'google/gemini-2.5-flash'
 WORKERS = 4
-REGIONS_PLACED = 3          # the first regions of a fetched page get their names placed; the rest wait for a reader
+REGIONS_PLACED = 8          # the first regions of a fetched page get their names placed; the rest wait for a reader
 REGIONS_DECOMPOSED = 4      # the first regions of a fetched page are decomposed into the things they state
 REACH_BUDGET = 6            # records the workspace reaches that are decomposed per round, nearest to any standing first
 ABSENT = re.compile(r'^(unknown|none|n/?a|not (specified|established|found|available|stated|known)|no (specific|known)?\s*\w*|unspecified|unclear|various|other|tbd)\b', re.I)
+GENERIC = {'company', 'companies', 'contract', 'contracts', 'product', 'products', 'material', 'materials', 'application', 'applications',
+           'institution', 'institutions', 'facility', 'facilities', 'technology', 'technologies', 'equipment', 'system', 'systems', 'solution',
+           'solutions', 'service', 'services', 'market', 'markets', 'capability', 'capabilities', 'research', 'development', 'industry',
+           'customer', 'customers', 'supplier', 'suppliers', 'partner', 'partners', 'people', 'place', 'places', 'thing', 'things', 'item', 'items'}
+
+
+def generic(name, kind):
+    """A word that names a kind, not a thing: 'company', 'materials', 'applications' are never things."""
+    t = same_name(name)
+    return (not t) or t in GENERIC or t == same_name(kind) or t + 's' == same_name(kind) or (len(t.split()) == 1 and str(name).strip()[:1].islower() and len(t) < 14)
+
+
 NOT_RELATIONS = {'name', 'note', 'source', 'sources', 'sys', 'same', 'unresolved', 'unknown', 'status', 'state', 'about', 'is', 'has'}
 WORLD_CACHE = 20.0          # seconds a workspace's world read is reused across jobs
 THINGS = 8                  # things taken out of one record's prose, at most
@@ -104,13 +116,19 @@ def call_model(model, system, user, timeout=120):
     return obj if isinstance(obj, dict) else {}
 
 
-PLACE = """You place names into prose. You are given a text and a list of things the reader already knows, each as a path
-and what it is called (with a few of its stated facts). Rewrite the text so that each mention of a listed thing is
-followed by that thing's path in square brackets, exactly as given, once per mention: "Honeywell [/0x11/user/...]".
-Keep every other character of the text as it is; add nothing else; never bracket a name that is not in the list;
-never invent a path. Also say, if the text states what the reader is trying to do, a short title for that work (at
-most six words, no trailing period), else null. Reply with one JSON object: {"text": "...", "title": "..." | null,
-"placed": <how many brackets you added>}."""
+PLACE = """You find the names in a text: every meaningful thing it mentions, so each can become a name in a world of records.
+You are given the text and the things the reader already knows, each as a path, a name and a kind. Reply with one
+JSON object: {"mentions": [{"text": "<the words as they appear in the text, exactly>", "name": "<the thing's own
+name, spelled so another text about it would spell it the same: a place as 'City, ST' or 'City, Country' or the
+country or region itself; a company by its name; a person by full name; a product, material, component or
+technology by its common name, singular>", "kind": "<one plural word: companies, places, people, products,
+materials, components, technologies, agencies, programs, vehicles, standards, events, and the like>", "path":
+"<the known thing's path when this mention is one of them, else null>"}], "title": "<if the text states what the
+reader is trying to do, a short title for that work, at most six words, else null>"}. Rules: proper nouns and
+meaningful noun phrases, never ordinary words ("cooling" no, "environmental control unit" yes); never an identifier
+alone (an award number, a code) and never an amount or a date; a path only when the mention clearly is that known
+thing, by name and kind, never by resemblance; one entry per distinct thing, the first words it appears as; at most
+twenty-four, the most specific first."""
 
 JUDGE = """You judge whether two registry records are the same real-world thing. You are given the record a person stands on
 and one candidate, each as the facts the registry states (name, street, city, state, zip, identifiers), and the
@@ -312,19 +330,54 @@ class WorkspaceHand(Hand):
         return out
 
     def place(self, ws, path, text, title_wanted):
+        """The names in a text, every meaningful one, each placed: a known thing when the mention clearly is one, a
+        record spelling the same name, else a minimal record at its shared name under the world, with the text as
+        its source. The text is written back with each mention followed by its path in brackets: the index then holds
+        the references, the overlay follows them, and the thing's page says what names it."""
         known = self.reach(ws)
-        reply = call_model(self.model, PLACE, json.dumps({'text': text, 'things': known}))
-        new = str(reply.get('text') or '')
-        placed = len(BRACKET.findall(new)) - len(BRACKET.findall(text))
-        if placed > 0 and len(new) >= len(text) * 0.8:
-            self.write([{'path': path, 'slots': {'text': new}, 'action': 'poke'}])
+        by_name = {}
+        for k in known:
+            by_name.setdefault(same_name(k['name']), k['path'])
+        reply = call_model(self.model, PLACE, json.dumps({'text': text, 'things': [{'path': k['path'], 'name': k['name'], 'kind': k.get('kind') or ''} for k in known[:80]]}))
+        mentions = [m for m in (reply.get('mentions') or []) if isinstance(m, dict) and str(m.get('text') or '').strip() and str(m.get('name') or '').strip()][:24]
+        ref = lambda p: {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(p.split('/')) - 1, p)}
+        records, placed, done, out = [], 0, set(), text
+        for m in mentions:
+            words = str(m['text']).strip()
+            name = str(m['name']).strip()[:60]
+            kind = segment_of(str(m.get('kind') or 'things').strip().lower()) or 'things'
+            if CODELIKE.match(name) or ABSENT.match(name) or generic(name, kind) or kind in ('identifiers', 'codes', 'ids', 'amounts', 'dates'):
+                continue
+            if kind == 'places':
+                name = place_name(name)
+            target = m.get('path') if isinstance(m.get('path'), str) and m['path'].startswith('/') and m['path'] != path and not machinery(m['path']) else None
+            target = target or by_name.get(same_name(name)) or self.shared_names(kind).get(same_name(name))
+            if not target:
+                target = '/' + self.w.node + '/user/' + kind + '/' + (segment_of(name) or 'thing')
+                if target not in done and not self.w.read(target, 'x').get('exists'):
+                    records.append({'path': target, 'slots': {'name': name, 'source': ref(path)}})
+            done.add(target)
+            if '[' + target + ']' in out:
+                continue
+            # the bracket goes after the first occurrence of the words, once
+            i = out.find(words)
+            if i < 0:
+                continue
+            j = i + len(words)
+            if out[j:j + 2] == ' [':
+                continue
+            out = out[:j] + ' [' + target + ']' + out[j:]
+            placed += 1
+        if records:
+            self.write(records)
+        if placed and out != text:
+            self.write([{'path': path, 'slots': {'text': out}, 'action': 'poke'}])
         title = reply.get('title')
         if title_wanted and isinstance(title, str) and 2 < len(title) < 60:
             self.write([{'path': self.root + ws, 'slots': {'name': title.strip()}, 'action': 'poke'}])
-            return max(placed, 0), title.strip()
-        return max(placed, 0), None
+            return placed, title.strip()
+        return placed, None
 
-    # ---- decomposition: the things a record's prose states, each a record beneath it
     def decompose(self, ws, path, known=None):
         rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
         prose = ' '.join(str(rec[k]) for k in ('description', 'text', 'note', 'said', 'quote') if rec.get(k))
@@ -345,7 +398,7 @@ class WorkspaceHand(Hand):
             world, created with its facts the first time."""
             name = str(t.get('name') or '').strip()[:60]
             kind = segment_of(str(t.get('kind') or 'things').strip().lower()) or 'things'
-            if not name or CODELIKE.match(name) or ABSENT.match(name) or kind in ('identifiers', 'codes', 'ids'):
+            if not name or CODELIKE.match(name) or ABSENT.match(name) or generic(name, kind) or kind in ('identifiers', 'codes', 'ids'):
                 return None, None
             if kind == 'places':
                 name = place_name(name)
