@@ -16,7 +16,8 @@ behind them is connected, whether or not either writer knew of the other.
 
 ## The loop
 
-1. **Stand.** Read the thing at `/x` (its own slots), then its world:
+1. **Stand.** A session stands at a path, reads it as a world and writes there, notes and views, nothing else. Read
+   the thing at `/x` (its own slots), then its world:
    `read /o/<case>/4/<node>/weft/graph/overlay/<n>/<path>` at care z, or the page at `/live?at=<path>`. Beneath
    `/0/<path>`: folders are slot names, forward (`out/<n>/<slot>`, what the thing asserts) and backward
    (`in/<n>/<name>`, what references it, under the name of whatever holds the reference: a slot as its author
@@ -32,8 +33,9 @@ behind them is connected, whether or not either writer knew of the other.
    bracketed name reaching into it is a judgement waiting; none means a fetch.
 3. **Digest.** Before reading a new source, stand on its landing place (`/user/web/pages/<host>`, `/user/registries/<source>`)
    as a world: the names its siblings already placed, the crossings they made into other buckets, and the cells
-   left there are what to try first; none of it is a conclusion, all of it is where to look. Then the text: it is
-   prose until its sentences land. Write each thing it names into the prose as its path in brackets,
+   left there are what to try first; none of it is a conclusion, all of it is where to look. The texts still to
+   digest are the ones whose `← source` folder is empty, read from any landing place, so no queue hand is needed. Then
+   the text: it is prose until its sentences land. Write each thing it names into the prose as its path in brackets,
    `[/0x11/user/orgs/verisk]`; that is a reference, the index sees it, the overlay follows it. Then each sentence
    that pins something as a record beneath the thing it is about: the slot it pins, the sentence in the text's
    words with its brackets, `source` → the text. A value that disagrees with another source is a second record under the
