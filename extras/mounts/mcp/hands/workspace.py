@@ -58,8 +58,10 @@ DEFAULT_MODEL = os.environ.get('WORKSPACE_MODEL') or 'google/gemini-2.5-flash'
 WORKERS = 4
 REGIONS_PLACED = 3          # the first regions of a fetched page get their names placed; the rest wait for a reader
 REGIONS_DECOMPOSED = 4      # the first regions of a fetched page are decomposed into the things they state
-REACH_DECOMPOSED = 4        # records a standing reaches that are decomposed, nearest first
-REACH_STANDINGS = 2         # standings per workspace whose reach is decomposed at all
+REACH_DECOMPOSED = 3        # records a standing reaches that are decomposed, nearest first
+REACH_STANDINGS = 1         # standings per workspace whose reach is decomposed at all
+ABSENT = re.compile(r'^(unknown|none|n/?a|not (specified|established|found|available|stated|known)|no (specific|known)?\s*\w*|unspecified|unclear|various|other|tbd)\b', re.I)
+NOT_RELATIONS = {'name', 'note', 'source', 'sources', 'sys', 'same', 'unresolved', 'unknown', 'status', 'state', 'about', 'is', 'has'}
 WORLD_CACHE = 20.0          # seconds a workspace's world read is reused across jobs
 THINGS = 8                  # things taken out of one record's prose, at most
 CANDIDATES = 6              # candidates judged per path
@@ -131,13 +133,18 @@ award's recipient) and is a known thing when one matches; a path is given only w
 things, exactly as listed; names are spelled so another text about the same thing would spell them the same (a
 place as "City, ST", a product or material by its common name, singular, a company by its name); kinds are one
 plural word; facts are the values the clause states (quantities as numbers, identifiers as text, dates as
-YYYYMMDD); an identifier is never a thing; at most eight statements, the most specific first; an empty list when
-the prose states nothing beyond the record's own slots."""
+YYYYMMDD); an identifier is never a thing; an absence is never an object ("unknown", "not specified", "none" are
+not things: leave the statement out); a statement is made only where the prose states it, so most records yield
+few, and a page that only lists or advertises yields none; at most eight statements, the most specific first;
+an empty list when the prose states nothing beyond the record's own slots."""
 
 
 COMPOSE = """You compose the reading of a research workspace: the answer to what the person asked, laid out as a short table of
-contents over what is now known. You are given the person's inputs (texts, in order) and the things the workspace reaches, each with its
-path, its name, a few stated facts and, when one exists, the sentence that connects it. Reply with one JSON object:
+contents over what is now known. You are given the person's inputs (texts, in order) and the things the workspace
+reaches, each with its path, its name, its kind, a few stated facts, and what the world says about it by how it is
+said: "stated" (a relation a record asserts, with its source), "named_in" (texts that merely mention it: nothing
+asserted), "same_as" (identities judged on stated identifiers). Only "stated" and "same_as" are evidence; a mention
+is a lead. Award totals, obligations and revenue are never evidence of what a company can build. Reply with one JSON object:
 {"title": "<the workspace's title, at most six words, or null to keep it>", "sections": [{"heading": "<one to three
 words>", "entries": [{"path": "<a path from the list>", "name": "<the thing in one to four words>", "line": "<at most
 fourteen words: the decisive stated fact, with its number or identifier when there is one>"}]}]}. Rules: at most six
@@ -338,13 +345,13 @@ class WorkspaceHand(Hand):
             world, created with its facts the first time."""
             name = str(t.get('name') or '').strip()[:60]
             kind = segment_of(str(t.get('kind') or 'things').strip().lower()) or 'things'
-            if not name or CODELIKE.match(name) or kind in ('identifiers', 'codes', 'ids'):
+            if not name or CODELIKE.match(name) or ABSENT.match(name) or kind in ('identifiers', 'codes', 'ids'):
                 return None, None
             if kind == 'places':
                 name = place_name(name)
             if isinstance(t.get('path'), str) and t['path'].startswith('/') and t['path'] != path and not machinery(t['path']):
                 return t['path'], name
-            found = by_name.get(same_name(name))
+            found = by_name.get(same_name(name)) or self.shared_names(kind).get(same_name(name))
             if found:
                 return found, name
             shared = '/' + self.w.node + '/user/' + kind + '/' + (segment_of(name) or 'thing')
@@ -354,7 +361,7 @@ class WorkspaceHand(Hand):
             return shared, name
         for t in statements:
             relation = segment_of(str(t.get('relation') or '').strip().lower())
-            if not relation or relation in ('name', 'note', 'source', 'sys', 'same'):
+            if not relation or relation in NOT_RELATIONS:
                 continue
             subject, _ = place_thing(t['subject'])
             obj, obj_name = place_thing(t['object'])
@@ -362,7 +369,7 @@ class WorkspaceHand(Hand):
                 continue
             subject = subject or path                      # a statement with no subject of its own is about the record
             slug = segment_of(obj_name)
-            if (subject, relation, slug) in seen:
+            if (subject, relation, slug) in seen or self.w.read(subject + '/' + relation + '/' + slug, 'x').get('exists'):
                 continue
             seen.add((subject, relation, slug))
             # the one shape, beneath the subject: the relation as the slot that pins the object, the clause, the source
@@ -379,6 +386,24 @@ class WorkspaceHand(Hand):
         if records:
             self.write(records)
         return made
+
+    def shared_names(self, kind):
+        """What already stands under /user/<kind>, by the spelling names share; read once a minute."""
+        with self.lock:
+            had = getattr(self, '_shared', {}).get(kind)
+            if had and time.time() - had[0] < 60:
+                return had[1]
+        names = {}
+        try:
+            for c in (self.w.read('/' + self.w.node + '/user/' + kind, 'y', limit=500).get('children') or []):
+                n = (c.get('properties') or {}).get('/name')
+                if n:
+                    names.setdefault(same_name(n), c['path'])
+        except Exception:
+            pass
+        with self.lock:
+            self._shared = getattr(self, '_shared', {}); self._shared[kind] = (time.time(), names)
+        return names
 
     def decompose_many(self, ws, paths, title):
         t = self.task(ws, title, f'Auto · {len(paths)} record{"" if len(paths) == 1 else "s"} to read', about=paths[0] if len(paths) == 1 else None)
@@ -416,6 +441,17 @@ class WorkspaceHand(Hand):
         return out
 
     # ---- the reading: the agent's own table of contents for the workspace, recomposed after each round
+    def edges(self, nodes):
+        """Every node of the world keyed by its path beneath the cell."""
+        out = []
+        base = nodes.get('path', '')
+        def visit(n):
+            out.append((n.get('path', '')[len(base):], {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}))
+            for c in n.get('children') or []:
+                visit(c)
+        visit(nodes)
+        return out
+
     def compose(self, ws):
         self.status(ws, 'Composing the reading', True)
         base = self.root + ws
@@ -438,9 +474,40 @@ class WorkspaceHand(Hand):
             for c in n.get('children') or []:
                 visit(c)
         visit(nodes)
+        # what the world says about each thing, by how it says it: a stated relation (a record beneath, with its source),
+        # a mention in prose (named in a text, nothing asserted), an identity (judged the same)
+        def visit2(n, rel=''):
+            props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
+            m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
+            here = n.get('path', '')
+            if m and m.group(1) in things:
+                parent = re.search(r'/(\d+)/([^/]+(?:/[^/]+)*?)/(out|in|part|up)/\d+/([^/]+)/\d+/', here + '/')
+            for c in n.get('children') or []:
+                visit2(c)
         for t in things.values():
             segs = t['path'].split('/')
             t['kind'] = segs[-2] if len(segs) > 2 else ''
+            t['stated'], t['named_in'], t['same_as'] = [], [], []
+        # every edge on the page: <thing>/<dir>/<n>/<label...>/<n>/<other>: a label that is a prose slot is a mention,
+        # same is identity, anything else is a stated relation
+        for n_path, props in self.edges(nodes):
+            m = re.match(r'^(.*?)/(out|in|part|up)/(\d+)/(.+?)/(\d+)/(.+)$', n_path)
+            if not m:
+                continue
+            thing, direction, label, other = '/' + m.group(1).split('/', 2)[-1] if m.group(1).count('/') > 1 else '', m.group(2), m.group(4), '/' + m.group(6)
+            subject = things.get(thing)
+            if not subject or other.startswith('/x/') or machinery(other):
+                continue
+            name = str(props.get('name') or other.split('/')[-1])[:60]
+            if label.split('/')[-1] in ('text', 'note', 'description', 'said', 'quote'):
+                subject['named_in'].append(name)
+            elif label == 'same':
+                subject['same_as'].append(name)
+            elif direction in ('out', 'part'):
+                note = str(props.get('note/note') or props.get('note/description') or '')[:120]
+                subject['stated'].append(f'{label}: {name}' + (f' ({note})' if note else ''))
+        for t in things.values():
+            t['stated'] = t['stated'][:8]; t['named_in'] = t['named_in'][:6]; t['same_as'] = t['same_as'][:4]
         listed = list(things.values())[:150]
         if not listed:
             return
