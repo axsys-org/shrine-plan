@@ -2,7 +2,7 @@
 world became. It writes what the page writes (the inputs, the world cell over the standings) and waits for the
 workspace hand to finish a round and compose its reading; the hand must be running against the same world.
 
-    python3 bench_ecu.py http://127.0.0.1:8150 [--node 0x11] [--name bench] [--wait 600]
+    python3 bench_ecu.py http://127.0.0.1:8150 [--node 0x11] [--name bench] [--wait 600] [--reverse]
 
 Six questions, each a number, each read off the records, never off the hand's log:
     things     named things the round landed at shared names under /user/<kind>/ (stable names, not sentences)
@@ -57,7 +57,8 @@ def walk(base, path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('base'); p.add_argument('--node', default='0x11'); p.add_argument('--name', default='bench_%d' % int(time.time()) % 100000); p.add_argument('--wait', type=int, default=600)
+    p.add_argument('base'); p.add_argument('--node', default='0x11'); p.add_argument('--name', default='bench_%d' % (int(time.time()) % 100000)); p.add_argument('--wait', type=int, default=600)
+    p.add_argument('--reverse', action='store_true', help='paste the same inputs in the opposite order: the world should come out the same')
     a = p.parse_args()
     node, base, ws = a.node, a.base, '/' + a.node + '/user/workspaces/' + a.name
     before = {k: len(kids(base, '/' + node + '/user/' + k)) for k in KINDS}
@@ -73,6 +74,8 @@ def main():
     rpc(base, 'write', who='person', records=[{'path': ws, 'slots': {'name': a.name}}, {'path': ws + '/inputs/i1', 'slots': {'name': question[:80], 'text': question}}]
         + [{'path': path, 'slots': {'name': url.replace('https://', ''), 'url': url}} for url, path in pages if not rpc(base, 'read', path=path, care='x').get('exists')])
     standings = [(request, 'x'), (recipients, 'y'), (ws + '/inputs/i1', 'x')] + [(path, 'x') for _, path in pages]
+    if a.reverse:
+        standings = standings[::-1]
     slots = {'sys/weft': {'type': 'reference', 'value': '/h/x/%s/4/%s/weft/graph/overlay' % (case, node)}, 'sys/tack': ref(standings[0][0], standings[0][1]), 'depth': 3, 'nodes': 120, 'cap': 16, 'deeper': 4}
     for i, (path, care) in enumerate(standings[1:]):
         slots['standing/' + chr(98 + i)] = ref(path, care)

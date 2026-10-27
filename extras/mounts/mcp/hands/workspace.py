@@ -58,8 +58,7 @@ DEFAULT_MODEL = os.environ.get('WORKSPACE_MODEL') or 'google/gemini-2.5-flash'
 WORKERS = 4
 REGIONS_PLACED = 3          # the first regions of a fetched page get their names placed; the rest wait for a reader
 REGIONS_DECOMPOSED = 4      # the first regions of a fetched page are decomposed into the things they state
-REACH_DECOMPOSED = 3        # records a standing reaches that are decomposed, nearest first
-REACH_STANDINGS = 1         # standings per workspace whose reach is decomposed at all
+REACH_BUDGET = 6            # records the workspace reaches that are decomposed per round, nearest to any standing first
 ABSENT = re.compile(r'^(unknown|none|n/?a|not (specified|established|found|available|stated|known)|no (specific|known)?\s*\w*|unspecified|unclear|various|other|tbd)\b', re.I)
 NOT_RELATIONS = {'name', 'note', 'source', 'sources', 'sys', 'same', 'unresolved', 'unknown', 'status', 'state', 'about', 'is', 'has'}
 WORLD_CACHE = 20.0          # seconds a workspace's world read is reused across jobs
@@ -176,6 +175,7 @@ class WorkspaceHand(Hand):
         self.dirty = set()          # workspaces whose reading is stale
         self.worlds = {}            # ws -> (time, nodes): the world read, reused for a while across jobs
         self.facts = {}             # path -> the record's few stated facts, read once
+        self.read_once = {}         # ws -> records already read for their statements
         self.root = '/' + world.node + '/user/workspaces/'
         self.settle_interrupted()
 
@@ -369,9 +369,18 @@ class WorkspaceHand(Hand):
                 continue
             subject = subject or path                      # a statement with no subject of its own is about the record
             slug = segment_of(obj_name)
-            if (subject, relation, slug) in seen or self.w.read(subject + '/' + relation + '/' + slug, 'x').get('exists'):
+            if (subject, relation, slug) in seen:
                 continue
             seen.add((subject, relation, slug))
+            there = self.w.read(subject + '/' + relation + '/' + slug, 'x')
+            if there.get('exists'):
+                # one relationship, another observation: the new source lands as evidence beneath the statement,
+                # the first attribution untouched
+                had = str((there.get('properties') or {}).get('/source') or '')
+                if path not in had:
+                    records.append({'path': subject + '/' + relation + '/' + slug + '/evidence/' + segment_of(path.split('/')[-1]), 'slots': {'source': ref(path), 'note': str(t.get('sentence') or '').strip()[:400]}})
+                    made += 1
+                continue
             # the one shape, beneath the subject: the relation as the slot that pins the object, the clause, the source
             slots = {relation: ref(obj), 'source': ref(path)}
             sentence = str(t.get('sentence') or '').strip()[:400]
@@ -416,27 +425,30 @@ class WorkspaceHand(Hand):
                 self.log(f'{self.name}: decompose {p}: {e}')
         self.done(t, f'{made} statement{"" if made == 1 else "s"} out of {len(paths)} record{"" if len(paths) == 1 else "s"}')
 
-    def reached(self, ws, standing):
-        """The records a standing reaches on the page, nearest first, that hold prose and have nothing beneath them yet."""
+    def reached(self, ws):
+        """The records the workspace reaches, nearest to any standing first (the page's own order), that hold prose and
+        have not been read yet; a bounded set per round, no standing privileged."""
         nodes = self.world(ws)
-        base = None; found = []
+        found = []
+        standings = set(self.standings(ws))
         def visit(n, depth):
             props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
             m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
-            if m and not m.group(1).startswith('/x/') and not m.group(1).startswith(self.root):
+            if m and not m.group(1).startswith('/x/') and not machinery(m.group(1)):
                 found.append((depth, m.group(1)))
             for c in n.get('children') or []:
                 visit(c, depth + 1)
         visit(nodes, 0)
+        read = self.read_once.setdefault(ws, set())
         out, seen = [], set()
         for depth, p in sorted(found, key=lambda x: x[0]):
-            if p in seen or p == standing:
+            if p in seen or p in read:
                 continue
             seen.add(p)
             rec = {k.lstrip('/'): v for k, v in (self.w.read(p, 'x').get('properties') or {}).items()}
             if any(len(str(rec.get(k) or '')) >= 40 for k in ('description', 'text', 'note')):
-                out.append(p)
-            if len(out) >= REACH_DECOMPOSED:
+                out.append(p); read.add(p)
+            if len(out) >= REACH_BUDGET:
                 break
         return out
 
@@ -575,10 +587,10 @@ class WorkspaceHand(Hand):
         rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
         note = str(rec.get('note') or '')
         candidates = [c for c in MAYBE.findall(note)][:CANDIDATES]
-        # what the first standings reach gets decomposed too, nearest first, a few at a time
-        reach = self.reached(ws, path) if len(self.known.get(ws, ())) <= REACH_STANDINGS else []
+        # what the workspace now reaches gets read for its statements, a bounded set nearest to any standing
+        reach = self.reached(ws)
         if reach:
-            self.submit(ws, self.decompose_many, ws, reach, 'Decompose what ' + str(rec.get('name') or path.split('/')[-1])[:30] + ' reaches')
+            self.submit(ws, self.decompose_many, ws, reach, 'Read what the workspace reaches')
         if not candidates:
             return
         already = {c['path'].split('/')[-1] for c in (self.w.read(path + '/same', 'y', limit=100).get('children') or [])}
