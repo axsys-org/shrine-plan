@@ -253,7 +253,7 @@ const folderOf = p => { const i = String(p).lastIndexOf('/'); return i > 0 ? p.s
 // chat the person came from; the click also writes the person's cursor so an agent sees where they went
 let navigateTo = null;   // set by start(): in-page navigation; before that, or in a test, the location itself
 const nav = search => { if (navigateTo) navigateTo(search); else root.location.search = search; };
-const chatQ = () => { try { const c = new URLSearchParams(root.location.search).get('chat'); return c ? '&chat=' + encodeURIComponent(c) : ''; } catch (e) { return ''; } };
+const chatQ = () => { try { const q = new URLSearchParams(root.location.search), c = q.get('chat'), a = q.get('asof'); return (c ? '&chat=' + encodeURIComponent(c) : '') + (a ? '&asof=' + encodeURIComponent(a) : ''); } catch (e) { return ''; } };
 const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?at=/${esc(local(path))}${chatQ()}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
 const isCell = rec => !!rec && typeof rec.formula === 'string' && rec.formula.startsWith('-> /weft/stdlib/');
 const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
@@ -670,7 +670,7 @@ function mcpSource(opts = {}) {
       const segs = segsOf(rel);
       if (segs.length < here.length + 2 || !here.every((h, i) => segs[i] === h)) continue;
       const dir = segs[here.length], n = Number(segs[here.length + 1]);
-      if (!['out', 'part', 'in'].includes(dir) || !Number.isInteger(n) || segs.length !== here.length + 2 + n) continue;
+      if (!['out', 'part', 'up', 'in'].includes(dir) || !Number.isInteger(n) || segs.length !== here.length + 2 + n) continue;
       const label = segs.slice(here.length + 2).join('/');
       const items = [];
       for (const [irel, iprops] of Object.entries(nodes)) {
@@ -688,7 +688,7 @@ function mcpSource(opts = {}) {
         if (sub.length) it.folders = sub;
         items.push(it);
       }
-      const f = { dir, key: label, label: (dir === 'in' ? '\u2190 ' : '') + label.replace(/_/g, ' '), items };
+      const f = { dir, key: label, label: (dir === 'in' ? '\u2190 ' : dir === 'up' ? '\u2191 ' : '') + label.replace(/_/g, ' '), items };
       if (props.more) f.more = Number(props.more);
       if (props.closed) { f.closed = true; f.more = Number(props.count || 0); }
       out.push(f);
@@ -749,12 +749,13 @@ function mcpSource(opts = {}) {
   // the kernel answers one virtual root per connected component, each standing unfolded beneath it, as an agent's
   // own cell would.
   const wsPath = () => '/' + (local(views).split('/')[0] || '0x11') + '/user/views/workspace';
-  const liveRef = (path, care) => ({ type: 'reference', value: '/h/' + (care || 'y') + '/0/' + local(path).split('/').filter(Boolean).length + '/' + local(path) });
-  async function workspace(standings, depth) {
+  // a standing: live (case 0), or pinned at an epoch (e<epoch>) when the page reads as of then
+  const liveRef = (path, care, asof) => ({ type: 'reference', value: '/h/' + (care || 'y') + '/' + (asof ? 'e' + asof : '0') + '/' + local(path).split('/').filter(Boolean).length + '/' + local(path) });
+  async function workspace(standings, depth, asof) {
     const def = await defCase('overlay');
     if (!def || !standings.length) return null;
-    const slots = { 'sys/weft': { type: 'reference', value: '/h/x/' + def.case + '/4/' + def.node + '/weft/graph/overlay' }, 'sys/tack': liveRef(standings[0], 'x'), depth: depth || 3 };
-    standings.slice(1).forEach((p, i) => { slots['standing/' + String.fromCharCode(98 + i)] = liveRef(p, 'x'); });
+    const slots = { 'sys/weft': { type: 'reference', value: '/h/x/' + def.case + '/4/' + def.node + '/weft/graph/overlay' }, 'sys/tack': liveRef(standings[0], 'x', asof), depth: depth || 3 };
+    standings.slice(1).forEach((p, i) => { slots['standing/' + String.fromCharCode(98 + i)] = liveRef(p, 'x', asof); });
     await rpc('write', { records: [{ path: wsPath(), slots, action: 'set' }], who: 'person' });
     const nodes = await treeOf('/x' + wsPath());
     const top = nodes[''] || {};
@@ -843,7 +844,14 @@ function mcpSource(opts = {}) {
     return { stop: () => handlers.delete(handler) };
   }
   function stop() { stopped = true; handlers.clear(); stopPoll(); if (stream) { stream.close(); stream = null; } }
-  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, unfold, union, workspace };
+  // a view's result as it is: every node beneath /x/<cell>, keyed by its path beneath the cell
+  async function result(cell) { return treeOf('/x/' + local(cell)); }
+  // the world's clock: the newest epoch, so a page can be read as of an earlier one
+  async function epoch() {
+    const tip = await rpc('history', { before: 0, limit: 1 });
+    return Math.max(Number(tip.next || 0), ...((tip.events || []).map(e => Number(e.epoch || 0))));
+  }
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, unfold, union, workspace, result, epoch };
 }
 
 // the record page: one record, its slots, and the thing as a world: what it asserts, and what references it, under
@@ -851,9 +859,11 @@ function mcpSource(opts = {}) {
 const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
 const talkKey = at => local(at).split('/').slice(1).join('/').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 function mountRecord(el, source, opts = {}) {
-  const at = local(opts.at), node = at.split('/')[0];
+  const at = local(opts.at), asof = String(opts.asof || '').replace(/\D/g, '');
+  const viewAt = at.startsWith('x/');            // a view's own page: the cell's record is the card, its result the world
+  const node = (viewAt ? at.slice(2) : at).split('/')[0];
   const talk = !!(opts.talk && source.sayAt);   // the talk box and its stream only when the page is asked for them (?talk=1)
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${talk ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}${asof ? ` <span class="s">· as of epoch ${esc(asof)} · <a href="?at=/${esc(at)}">now</a></span>` : ''}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${talk ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
   const main = el.querySelector('.sv-recview');
   let openFolder = null;            // set by draw: opens a closed folder of the unfolded world in place
   // the talk at this record: its turns live at <record>/talk/turns, its lens at <record>/talk/context
@@ -876,7 +886,7 @@ function mountRecord(el, source, opts = {}) {
   let drawn = 0;
   async function draw() {
     const mine = ++drawn;
-    const r = await source.read(at, 'y').catch(() => null);
+    const r = await source.read(viewAt ? at.slice(2) : at, 'y').catch(() => null);
     if (mine !== drawn) return;
     if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return; }
     // what is beneath, every page of it: a folder with many children answers in pages
@@ -940,7 +950,7 @@ function mountRecord(el, source, opts = {}) {
     const title = rec.name || rec.heading || rec.title || last(at).replace(/_/g, ' ');
     const rest = Object.fromEntries(Object.entries(rec).filter(([k]) => !PROSE.includes(k)));
     const cardHTML = async () => r.record === null ? '<div class="sv-gone">deleted</div>' : `<div class="sv-title">${esc(title)}</div>${proseOf(rec).map(t => `<div class="sv-prose">${linkify(t)}</div>`).join('')}` + await recordHTML(source, { ...r, record: rest, kids: [] }, true, new Set());
-    const rows = kids.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
+    const rows = viewAt ? '' : kids.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
     main.innerHTML = `<div class="sv-card-sec">${await cardHTML()}</div><div class="sv-sec sv-world-sec"><div class="k">as a world</div><div class="sv-empty">reading…</div></div><div class="sv-sec sv-ws"></div><div class="sv-rest"></div>${rows ? `<div class="sv-sec sv-parts"><div class="k">beneath</div>${rows}</div>` : ''}`;
     // ---- phase 2: the names behind the brackets, read in parallel; the card again when they land
     const paths = bracketsIn(rec);
@@ -952,11 +962,36 @@ function mountRecord(el, source, opts = {}) {
     // ---- phase 3: the thing as a world, or the standings the person gathered as components
     const wsKey = 'sv-workspace'; let wsList = []; try { wsList = JSON.parse(localStorage.getItem(wsKey) || '[]'); } catch (e) { wsList = []; }
     const wsAll = [local(at)].concat(wsList.filter(p => p !== local(at)));
-    const ws = source.workspace && wsAll.length > 1 ? await source.workspace(wsAll, 3).catch(e => ({ fault: String(e && e.message || e).slice(0, 120) })) : null;
+    // as of an epoch, the standings are pinned there: the picture as of then, both ways
+    const ws = !viewAt && source.workspace && (wsAll.length > 1 || asof) ? await source.workspace(wsAll, 3, asof).catch(e => ({ fault: String(e && e.message || e).slice(0, 120) })) : null;
     if (mine !== drawn) return;
-    const u = ws && !ws.fault ? null : (source.unfold ? await source.unfold(at, 3).catch(() => null) : null);
+    const u = viewAt || (ws && !ws.fault) ? null : (source.unfold ? await source.unfold(at, 3).catch(() => null) : null);
+    // a view's own page: its result drawn as the namespace it is, every level, nothing read through a second view
+    const rn = viewAt && source.result ? await source.result(at.slice(2)).catch(() => null) : null;
     if (mine !== drawn) return;
-    const have = !!(ws && !ws.fault) || !!u;
+    const have = !!(ws && !ws.fault) || !!u || !!(rn && Object.keys(rn).length);
+    // the result tree: a folder is a segment of the result's own addressing; a line is a record, named by its name
+    // when it has one, linked to the first thing it references, with a few of its values beside it. A run of empty
+    // folders with one child each reads as one line.
+    const resultHTML = nodes => {
+      const refOf = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? m[1] : null; };
+      const kids = {};
+      for (const rel of Object.keys(nodes)) { if (!rel) continue; const segs = rel.split('/').filter(Boolean); const parent = segs.length > 1 ? '/' + segs.slice(0, -1).join('/') : ''; (kids[parent] = kids[parent] || []).push(rel); }
+      const line = (rel, shown) => {
+        const props = nodes[rel] || {};
+        const name = props.name || shown;
+        const ref = Object.values(props).map(refOf).find(Boolean);
+        const rest = Object.entries(props).filter(([k, v]) => k !== 'name' && !refOf(v)).slice(0, 3).map(([k, v]) => `${esc(k)} ${esc(String(v)).slice(0, 48)}`).join(' · ');
+        return `${ref ? goHTML(local(ref), local(ref), name, 'n') : `<span class="vf">${esc(name)}</span>`}${rest ? ` <span class="s">${rest}</span>` : ''}`;
+      };
+      const item = (rel, depth) => {
+        let shown = rel.split('/').pop(), here = rel;
+        while (!Object.keys(nodes[here] || {}).length && (kids[here] || []).length === 1) { here = kids[here][0]; shown += '/' + here.split('/').pop(); }
+        const ch = kids[here] || [];
+        return `<li>${line(here, shown)}${ch.length && depth < 12 ? `<ul class="sv-tree">${ch.map(c => item(c, depth + 1)).join('')}</ul>` : ''}</li>`;
+      };
+      return `<ul class="sv-tree sv-world">${(kids[''] || []).map(c => item(c, 1)).join('')}</ul>`;
+    };
     const self = ws && !ws.fault ? '/x' + ws.cell : null;
     const fill = async fs => {
       const out = [];
@@ -973,17 +1008,19 @@ function mountRecord(el, source, opts = {}) {
     const uu = u ? await fill(u) : null;
     if (ws && !ws.fault) for (const root of ws.roots) for (const st of root.standings) st.folders = await fill(st.folders);
     if (mine !== drawn) return;
-    const treeHTML = uu && uu.length ? world_(uu, at) : '';
+    const treeHTML = rn && Object.keys(rn).length ? resultHTML(rn) : uu && uu.length ? world_(uu, at) : '';
     const grey = (treeHTML.match(/<li class="[^"]*\bnamed\b/g) || []).length;
-    put('.sv-world-sec', treeHTML ? `<div class="k">as a world${grey ? ` · ${grey} in prose` : ''}</div>${treeHTML}` : (have ? '' : '<div class="k">as a world</div><div class="sv-empty">no view in this world</div>'));
-    const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
+    put('.sv-world-sec', treeHTML ? `<div class="k">${rn ? 'the result' : `as a world${grey ? ` · ${grey} in prose` : ''}`}</div>${treeHTML}` : (have ? '' : `<div class="k">${viewAt ? 'the result' : 'as a world'}</div><div class="sv-empty">${viewAt ? 'nothing yet' : 'no view in this world'}</div>`));
+    const now = source.epoch ? await source.epoch().catch(() => 0) : 0;
+    if (mine !== drawn) return;
+    const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button><label class="sv-asof s">as of epoch <input type="number" min="1"${now ? ` max="${now}"` : ''} value="${esc(asof)}" placeholder="${now || 'now'}"></label>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
     const standing_ = (st, island) => `<div class="sv-standing${island ? ' sv-island' : ''}">${goHTML(st.path, st.path, st.name, 'n')}${badge({ world: st.world })}${island ? ' <span class="s">island: nothing connects it to another standing at this depth</span>' : ''}</div>${st.folders.length ? world_(st.folders, st.path) : ''}`;
     const wsBody = !ws ? '' : ws.fault ? `<div class="sv-note bad">${esc(ws.fault)}</div>` :
       `<div class="sv-ws-meter"><span><b>${ws.components}</b> component${ws.components === 1 ? '' : 's'}</span><span><b>${ws.islands}</b> island${ws.islands === 1 ? '' : 's'}</span></div>` +
       ws.roots.map(root => `<div class="sv-root"><div class="k">${esc(root.name || root.standings.map(st => st.name).join(' · '))}</div>${root.standings.map(st => standing_(st, root.standings.length === 1)).join('')}</div>`).join('');
     put('.sv-ws', `<div class="k">workspace${ws ? ` · ${wsAll.length} standings` : ''}</div>${wsBar}${wsBody}`);
     // ---- phase 4: what every world says, and the claims, as they arrive
-    const [un, cl] = await Promise.all([source.union ? source.union(at).catch(() => null) : null, source.read(at + '/claims', 'y').catch(() => null)]);
+    const [un, cl] = viewAt ? [null, null] : await Promise.all([source.union ? source.union(at).catch(() => null) : null, source.read(at + '/claims', 'y').catch(() => null)]);
     if (mine !== drawn) return;
     const wbs = ws_ => ws_.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}">${esc(w)}</span>`).join('');
     const factHTML = f => `<div class="sv-hop${f.all ? ' sv-agree' : ''}"><span class="lb">${esc(f.labels.join(' / '))}</span> ${f.kind === 'relation' ? goHTML(local(f.other), local(f.other), f.name, 'n') : esc(String(f.value))}${wbs(f.worlds)}</div>`;
@@ -1020,6 +1057,10 @@ function mountRecord(el, source, opts = {}) {
   }
   draw();
   if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } }, { backlog: false });
+  el.addEventListener('change', e => {
+    const i = e.target && e.target.closest ? e.target.closest('.sv-asof input') : null;
+    if (i) nav('?at=/' + at + (i.value ? '&asof=' + encodeURIComponent(i.value) : '') + (opts.chat ? '&chat=' + encodeURIComponent(opts.chat) : ''));
+  });
   el.addEventListener('click', e => {
     const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
     if (o) { e.preventDefault(); if (openFolder) openFolder(o); return; }
@@ -1091,7 +1132,7 @@ function start(doc) {
     const q = new URLSearchParams(doc.location ? doc.location.search : '');
     const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
     let source, mounted;
-    if (at) { source = mcpSource({ views: at, who }); mounted = mountRecord(el, source, { at, chat, talk: params.get('talk') === '1' }); }
+    if (at) { source = mcpSource({ views: at, who }); mounted = mountRecord(el, source, { at, chat, asof: q.get('asof') || '', talk: new URLSearchParams(root.location.search).get('talk') === '1' }); }
     else if (q.get('queue')) { source = mcpSource({ views: '0x11', who }); mounted = mountQueue(el, source, { chat, node: '0x11' }); }
     else { source = mcpSource({ views, who }); mounted = mountViewer(el, source, { crumb: views, views, chat }); }
     current = { stop: () => { if (source.stop) source.stop(); } };

@@ -558,3 +558,28 @@ test('a record page shows the record as a world: relation labels as virtual fold
   for (let i = 0; i < 30 && !/as a world/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
   assert.match(main.innerHTML, /as a world.*acquired_by of.*McKenzie Intelligence Services.*20260729.*founded of.*Forbes McKenzie/s);
 });
+test('where a thing sits is a folder above it, drawn with an arrow up, and a view result is a dashed line', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async () => ({path: '0x11/user/web/pages/host/page/r1', record: {heading: 'Region 1', text: 'The [/0x11/user/orgs/verisk] site.'}, kids: [], case: 1, next: null}),
+    unfold: async () => [{dir: 'up', key: 'page', label: '\u2191 page', items: [{path: '/0x11/user/web/pages/host/page', name: 'The page', note: {}}]},
+      {dir: 'in', key: 'regions_of', label: '\u2190 regions of', items: [{path: '/x/0x11/user/views/regions_of', name: 'regions of', note: {}}]}] };
+  live.mountRecord(el, source, {at: '/0x11/user/web/pages/host/page/r1'});
+  for (let i = 0; i < 30 && !/as a world/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /\u2191 page<\/span>.*The page/s, 'the folder above, labelled by the folder between');
+  assert.match(main.innerHTML, /class="cell">.*regions of/s, 'a view result is a dashed line');
+});
+test('a view\'s own page: the cell is the card, its result is drawn as the namespace it is, every level', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const reads = [];
+  const source = { read: async p => { reads.push(p); return {path: '0x11/user/views/sources', record: {name: 'sources', depth: 3}, kids: [], case: 1, next: null}; },
+    result: async () => ({'': {standings: 2, components: 1}, '/0': {name: 'Atlas · Zone AE', standings: 2}, '/0/0x11': {}, '/0/0x11/user': {}, '/0/0x11/user/carriers': {}, '/0/0x11/user/carriers/atlas': {name: 'Atlas', at: '/h/x/0/4/0x11/user/carriers/atlas', standing: true},
+      '/0/0x11/user/carriers/atlas/out': {}, '/0/0x11/user/carriers/atlas/out/1': {}, '/0/0x11/user/carriers/atlas/out/1/model': {count: 1}, '/0/0x11/user/carriers/atlas/out/1/model/4': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user/models': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user/models/flood': {name: 'Flood v4', at: '/h/x/0/4/0x11/user/models/flood'}}),
+    unfold: async () => { throw new Error('a view\'s page reads no second view'); } };
+  live.mountRecord(el, source, {at: '/x/0x11/user/views/sources'});
+  for (let i = 0; i < 30 && !/the result/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.equal(reads[0], '0x11/user/views/sources', 'the card is the cell record');
+  assert.match(main.innerHTML, /the result.*Atlas · Zone AE.*standings 2.*>Atlas<.*out\/1\/model.*count 1.*Flood v4/s, 'the result tree, deeper than one level, empty folders run together');
+  assert.match(main.innerHTML, /href="\?at=\/0x11\/user\/models\/flood/, 'a line links to the thing it references');
+});
