@@ -544,7 +544,7 @@ test('a record page is the thing as a world: folders are slots, lines are names 
   assert.match(main.innerHTML, /as a world.*leaders.*Forbes McKenzie.*founder and CEO/s, 'beside a line: the value, not the slot name');
   assert.match(main.innerHTML, /← acquisitions<\/span>.*Verisk.*acquired 29 July 2026/s);
   assert.match(main.innerHTML, /← flood review<\/span>.*flood review.*exposure.*risk high/s, 'a cell reading the thing is a line under its name, its result read once as lines beneath');
-  assert.match(main.innerHTML, /<li class="named"><a[^>]*>A page that names it<\/a> <span class="s">\u201cVerisk has completed its purchase of <a class="n go"[^>]*>mis<\/a>\.\u201d/, 'a text whose prose names the thing is a line with that sentence, the reference a link, no folder label');
+  assert.match(main.innerHTML, /<li class="named">(?:<span class="tg">[^<]*<\/span>)?<a[^>]*>A page that names it<\/a> <span class="s">\u201cVerisk has completed its purchase of <a class="n go"[^>]*>mis<\/a>\.\u201d/, 'a text whose prose names the thing is a line with that sentence, the reference a link, no folder label');
   assert.doesNotMatch(main.innerHTML, /← text</, 'the prose slot is not shown as a folder');
   assert.doesNotMatch(main.innerHTML, /pointing here/, 'what points here is in the tree');
   assert.match(main.innerHTML, /beneath<\/div>.*talk/s);
@@ -583,3 +583,83 @@ test('a view\'s own page: the cell is the card, its result is drawn as the names
   assert.match(main.innerHTML, /the result.*Atlas · Zone AE.*standings 2.*>Atlas<.*out\/1\/model.*count 1.*Flood v4/s, 'the result tree, deeper than one level, empty folders run together');
   assert.match(main.innerHTML, /href="\?at=\/0x11\/user\/models\/flood/, 'a line links to the thing it references');
 });
+
+// ---- a workspace: a blank world that takes shape from what you drop into it
+function wsEl() {
+  const kids = {}, listeners = {};
+  const mk = () => ({ classList: { add() {}, remove() {}, toggle() {} }, innerHTML: '', value: '', dataset: {}, disabled: false, addEventListener(n, f) { (listeners[n] = listeners[n] || []).push(f); }, querySelector: s => kids[s] || (kids[s] = mk()), querySelectorAll: () => [] });
+  const el = mk(); el.fire = (n, ev) => (listeners[n] || []).forEach(f => f(ev)); el.kids = kids; return el;
+}
+test('kindOf reads a drop from its text alone: a path with its care, a view, a url, text; a question is text', () => {
+  assert.deepEqual(live.kindOf('/0x11/user/orgs/verisk y'), {kind: 'path', path: '/0x11/user/orgs/verisk', care: 'y', view: false});
+  assert.deepEqual(live.kindOf('/x/0x11/user/views/sources [z]'), {kind: 'path', path: '/x/0x11/user/views/sources', care: 'z', view: true});
+  assert.equal(live.kindOf('https://www.verisk.com/press/x').kind, 'url');
+  assert.equal(live.kindOf('Find domestic transformer suppliers').kind, 'text', 'a question or an ask is an input like any other');
+  assert.equal(live.kindOf('Verisk acquired [/0x11/user/orgs/mis] in July.').kind, 'text');
+  assert.equal(live.kindOf('   '), null);
+});
+test('tabs: every workspace, the open one lit, a blank one a click away; a paste of several paths is several drops, else one', () => {
+  const all = [{path: '0x11/user/workspaces/sourcing', name: 'sourcing'}, {path: '0x11/user/workspaces/untitled', name: 'untitled'}];
+  const html = live.tabsHTML(all, 'sourcing');
+  assert.match(html, /class="tab on" href="\?ws=sourcing"><span class="d"><\/span><span class="tl">sourcing<\/span>.*class="tab" href="\?ws=untitled">.*untitled<.*class="tab new" href="\?ws=untitled_2"/s);
+  assert.match(live.tabsHTML(all, 'fresh_one'), /class="tab on" href="\?ws=fresh_one"/, 'a workspace not yet written still has its tab while open');
+  assert.deepEqual(live.dropsOf('/0x11/user/orgs/verisk y\n/0x11/user/orgs/mis\n').map(d => [d.path, d.care]), [['/0x11/user/orgs/verisk', 'y'], ['/0x11/user/orgs/mis', 'x']]);
+  assert.equal(live.dropsOf('Verisk acquired MIS.\nTerms undisclosed.').length, 1);
+});
+test('a workspace page: the queue with its cares and states, the world as one root per component, what agents took up in the sidebar', async () => {
+  const el = wsEl();
+  const calls = [];
+  const source = {
+    read: async p => ({path: p, record: {name: p.endsWith('verisk') ? 'Verisk' : p.endsWith('i1') ? 'a note' : ''}, kids: [], case: 1, next: null}),
+    wsRead: async () => ({path: '0x11/user/workspaces/sourcing', name: 'sourcing', exists: true, depth: 3,
+      standings: [{key: 'a', path: '0x11/user/orgs/verisk', care: 'y'}, {key: 'b', path: '0x11/user/workspaces/sourcing/inputs/i1', care: 'x'}],
+      inputs: [{path: '0x11/user/workspaces/sourcing/inputs/i1', n: 1, name: 'a note', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.'}],
+      tasks: [{path: '0x11/user/workspaces/sourcing/tasks/t1', n: 1, task: 'Fetch the catalog', who: 'claude', state: 'done'}, {path: '0x11/user/workspaces/sourcing/tasks/t2', n: 2, task: 'Judge the ECHO plant', who: 'claude', state: 'working'}]}),
+    wsStandings: async (ws, standings, depth) => { calls.push({ws, standings, depth}); return {cell: '/0x11/user/workspaces/sourcing/world', components: 1, islands: 0, roots: [{i: 0, name: 'Verisk · a note', standings: [{path: '/0x11/user/orgs/verisk', name: 'Verisk', world: '0x11', folders: [{dir: 'in', key: 'text', label: '← text', items: [{path: '/0x11/user/workspaces/sourcing/inputs/i1', name: 'a note', note: {text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.'}}]}]}, {path: '/0x11/user/workspaces/sourcing/inputs/i1', name: 'a note', world: '0x11', folders: []}]}]}; },
+    unfold: async () => [], follow() {} };
+  live.mountWorkspace(el, source, {ws: 'sourcing', node: '0x11'});
+  for (let i = 0; i < 40 && !/component/.test(el.querySelector('.ws-meter').innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  const inputs = el.querySelector('.ws-inputs').innerHTML;
+  assert.match(inputs, />PATH<.*>Verisk<.*Included · reference.*ws-care.*class="on" data-care="y".*data-copy="\/0x11\/user\/orgs\/verisk"/s, 'a record input on the bus, landed, with its care lit and its path to copy');
+  assert.match(inputs, />TEXT<.*>a note<.*Landed · names placed/s, 'a text input, landed, its names placed');
+  assert.match(el.querySelector('.ws-world-sec').innerHTML, /sv-root.*Verisk · a note.*sv-standing.*>Verisk<.*named in.*class="named".*>a note<.*acquired MIS/s, 'one root, the standings unfolded, the text that names the standing gathered under named in, dashed, its sentence beside it');
+  assert.match(el.querySelector('.ws-meter').innerHTML, /1 component · 0 islands/, 'the meter beside the title');
+  const tasks = el.querySelector('.ws-tasks').innerHTML;
+  assert.match(tasks, /task ok.*Fetch the catalog.*Completed/s);
+  assert.match(tasks, /task run.*Judge the ECHO plant.*Auto · claude/s);
+  assert.deepEqual(calls[0].standings.map(s => s.care), ['y', 'x'], 'the world is read over the standings at their cares');
+});
+test('a drop lands as records: text beneath inputs and stands at x; a path stands at its care; a task asked outright beneath tasks, open', async () => {
+  const written = [];
+  const m = fakeMcp((name, a) => {
+    if (name === 'mcp/write') { written.push(...a.records); return {epoch: 9, records: a.records.map(r => ({path: r.path, written: true}))}; }
+    if (a.path === '/0x11/user/workspaces/sourcing') return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+    if (a.path === '/0x11/user/workspaces/sourcing/inputs') return {path: a.path, exists: false, reference: null, properties: {}, children: [{path: a.path + '/i1', exists: true, properties: {'/name': 'old'}, children: []}]};
+    return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+  });
+  const s = mcpSource({fetch: m.fetch, views: '0x11', EventSource: null});
+  const r = await s.wsDrop('sourcing', {kind: 'text', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.\nTerms undisclosed.'});
+  assert.deepEqual(r, {landed: '0x11/user/workspaces/sourcing/inputs/i2', standing: {path: '0x11/user/workspaces/sourcing/inputs/i2', care: 'x'}});
+  assert.deepEqual(written[0], {path: '/0x11/user/workspaces/sourcing', slots: {name: 'sourcing'}}, 'the workspace record, the first time');
+  assert.deepEqual(written[1], {path: '/0x11/user/workspaces/sourcing/inputs/i2', slots: {name: 'Verisk acquired MIS.', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.\nTerms undisclosed.'}}, 'the name is the first line without its brackets; the text keeps them');
+  const p = await s.wsDrop('sourcing', {kind: 'path', path: '/0x11/user/orgs/verisk', care: 'z'});
+  assert.deepEqual(p.standing, {path: '0x11/user/orgs/verisk', care: 'z'});
+  const t = await s.wsDrop('sourcing', {kind: 'task', text: 'Find domestic suppliers'});
+  assert.equal(t.landed, '0x11/user/workspaces/sourcing/asks/t1');
+  assert.deepEqual(written[written.length - 1].slots, {task: 'Find domestic suppliers', who: 'person', state: 'open'});
+});
+test('wsRead reads the standings off the world cell with their cares, the inputs and the tasks beneath the workspace', async () => {
+  const W = '/0x11/user/workspaces/sourcing';
+  const m = fakeMcp((name, a) => {
+    if (a.path === W) return {path: W, exists: true, reference: ref('x', 1, W), properties: {'/name': 'sourcing'}, children: []};
+    if (a.path === W + '/world') return {path: a.path, exists: true, reference: ref('x', 2, a.path), properties: {'/sys/weft': '/h/x/1/4/0x11/weft/graph/overlay', '/sys/tack': '/h/y/0/4/0x11/user/orgs/verisk', '/standing/b': '/h/x/0/6/0x11/user/workspaces/sourcing/inputs/i1', '/depth': '2'}, children: []};
+    if (a.path === W + '/inputs') return {path: a.path, exists: false, reference: null, properties: {}, children: [{path: a.path + '/i1', exists: true, reference: ref('x', 1, a.path + '/i1'), properties: {'/name': 'a note', '/text': 'Verisk [/0x11/user/orgs/verisk].'}, children: []}]};
+    return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+  });
+  const r = await mcpSource({fetch: m.fetch, views: '0x11', EventSource: null}).wsRead('sourcing');
+  assert.deepEqual(r.standings, [{key: 'a', care: 'y', path: '0x11/user/orgs/verisk'}, {key: 'b', care: 'x', path: '0x11/user/workspaces/sourcing/inputs/i1'}]);
+  assert.equal(r.depth, 2);
+  assert.equal(r.inputs[0].text, 'Verisk [/0x11/user/orgs/verisk].');
+  assert.deepEqual(r.tasks, []);
+});
+

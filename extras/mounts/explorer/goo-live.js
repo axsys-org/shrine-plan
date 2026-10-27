@@ -645,12 +645,13 @@ function mcpSource(opts = {}) {
   const unref = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? m[1] : (typeof v === 'string' && v.startsWith('/') ? v : null); };
   const worldOf = p => { const segs = local(p).split('/'); const i = segs.indexOf('user'); return i > 0 ? segs[i - 1] : (segs[0] || ''); };
   // every node of a computed tree, keyed by its path beneath the application, slots with the leading slash dropped
-  async function treeOf(base) {
+  async function treeOf(base, pages = 20) {
     const nodes = {};
     let next = null;
-    for (let page = 0; page < 20; page++) {
+    for (let page = 0; page < pages; page++) {
       const r = await rpc('read', { path: base, care: 'z', limit: 500, ...(next ? { next } : {}) });
-      const visit = n => { if (n && n.path && n.path.startsWith(base)) nodes[n.path.slice(base.length)] = Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); for (const c of (n && n.children) || []) visit(c); };
+      // a later page repeats the nodes above its slice with no properties: what the first page said about them stays
+      const visit = n => { if (n && n.path && n.path.startsWith(base)) { const key = n.path.slice(base.length), props = Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); if (!nodes[key] || Object.keys(props).length) nodes[key] = props; } for (const c of (n && n.children) || []) visit(c); };
       visit(r);
       next = r && r.next; if (!next) break;
     }
@@ -749,25 +750,123 @@ function mcpSource(opts = {}) {
   // the kernel answers one virtual root per connected component, each standing unfolded beneath it, as an agent's
   // own cell would.
   const wsPath = () => '/' + (local(views).split('/')[0] || '0x11') + '/user/views/workspace';
+  // the roots of an overlay result: one per component, each standing unfolded beneath
+  const rootsOf = (nodes, cell) => {
+    const top = nodes[''] || {};
+    if (top['sys/view/fault']) return { fault: top['sys/view/fault'] };
+    if (top.standings === undefined) return null;          // no root came back: an unreadable moment, not an empty world
+    const num = v => Number(v) || 0;
+    const roots = [];
+    const rootOf = i => (roots[i] = roots[i] || { i, name: String((nodes['/' + i] || {}).name || ''), standings: [], routes: [] });
+    for (const [rel, p] of Object.entries(nodes)) {
+      const m = /^\/(\d+)\/(.+)$/.exec(rel); if (!m || !p.standing) continue;
+      const same = Object.entries(p).filter(([k]) => /^same\/\d+$/.test(k)).map(([, v]) => unref(v)).filter(Boolean);
+      rootOf(Number(m[1])).standings.push({ path: '/' + m[2], name: p.name || last(m[2]).replace(/_/g, ' '), world: p.world, same, folders: foldersOf(nodes, rel) });
+    }
+    // a route: from one standing to the name it came from, the label it crossed, the name met at, and back to the
+    // standing that was there first; each hop labelled, nearest the meeting first
+    for (const [rel, p] of Object.entries(nodes)) {
+      const m = /^\/(\d+)\/routes\/(\d+)$/.exec(rel); if (!m) continue;
+      const steps = side => Object.entries(nodes).filter(([r]) => r.startsWith(rel + '/' + side + '/')).map(([r, q]) => ({ j: Number(r.split('/').pop()), at: unref(q.at), label: String(q.label || '').replace(/^\//, '') })).sort((x, y) => x.j - y.j);
+      rootOf(Number(m[1])).routes.push({ k: Number(m[2]), from: unref(p.from), to: unref(p.to), at: unref(p.at), via: unref(p.via), label: String(p.label || '').replace(/^\//, ''), a: steps('a'), b: steps('b') });
+    }
+    for (const r of roots) if (r) r.routes.sort((x, y) => x.k - y.k);
+    return { cell, roots: roots.filter(Boolean), components: num(top.components), islands: num(top.islands) };
+  };
   // a standing: live (case 0), or pinned at an epoch (e<epoch>) when the page reads as of then
   const liveRef = (path, care, asof) => ({ type: 'reference', value: '/h/' + (care || 'y') + '/' + (asof ? 'e' + asof : '0') + '/' + local(path).split('/').filter(Boolean).length + '/' + local(path) });
   async function workspace(standings, depth, asof) {
+    return workspaceAt(wsPath(), standings.map(path => ({ path, care: 'x' })), depth, asof);
+  }
+  // the overlay cell at `cell` over these standings, each at its care, written then read
+  async function workspaceAt(cell, standings, depth, asof) {
     const def = await defCase('overlay');
     if (!def || !standings.length) return null;
-    const slots = { 'sys/weft': { type: 'reference', value: '/h/x/' + def.case + '/4/' + def.node + '/weft/graph/overlay' }, 'sys/tack': liveRef(standings[0], 'x', asof), depth: depth || 3 };
-    standings.slice(1).forEach((p, i) => { slots['standing/' + String.fromCharCode(98 + i)] = liveRef(p, 'x', asof); });
-    await rpc('write', { records: [{ path: wsPath(), slots, action: 'set' }], who: 'person' });
-    const nodes = await treeOf('/x' + wsPath());
-    const top = nodes[''] || {};
-    if (top['sys/view/fault']) return { fault: top['sys/view/fault'] };
-    const num = v => Number(v) || 0;
-    const roots = [];
-    for (const [rel, p] of Object.entries(nodes)) {
-      const m = /^\/(\d+)\/(.+)$/.exec(rel); if (!m || !p.standing) continue;
-      const i = Number(m[1]);
-      (roots[i] = roots[i] || { i, name: String((nodes['/' + i] || {}).name || ''), standings: [] }).standings.push({ path: '/' + m[2], name: p.name || last(m[2]).replace(/_/g, ' '), world: p.world, folders: foldersOf(nodes, rel) });
+    // bounded so a workspace with many standings (a bucket at y) reads in seconds: a page of the tree, not twenty
+    const slots = { 'sys/weft': { type: 'reference', value: '/h/x/' + def.case + '/4/' + def.node + '/weft/graph/overlay' }, 'sys/tack': liveRef(standings[0].path, standings[0].care || 'x', asof), depth: depth || 3, nodes: 120, cap: 16, deeper: 4 };
+    standings.slice(1).forEach((st, i) => { slots['standing/' + String.fromCharCode(98 + i)] = liveRef(st.path, st.care || 'x', asof); });
+    await rpc('write', { records: [{ path: cell, slots, action: 'set' }], who: 'person' });
+    return rootsOf(await treeOf('/x' + cell, 2), cell);
+  }
+  // ---- a workspace: a record under /<node>/user/workspaces/<name>; what you drop lands beneath it (inputs/<n>: a text
+  // or a file; a url by the web scheme); its world is the overlay cell at <ws>/world over its standings, each a
+  // reference at its care; the agents' own records sit under the segments the kernel treats as machinery (asks/<n>: a
+  // task, status: the main agent's word, views/reading/v<n>: the composed reading), never things, never edges. The
+  // page is a reading of those records and nothing else.
+  const wsRoot = name => '/' + (local(views).split('/')[0] || '0x11') + '/user/workspaces/' + String(name || '').replace(/[^a-z0-9_]/g, '_');
+  const careOf = v => { const m = /^\/h\/([xyz])\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? { care: m[1], path: local(m[2]) } : null; };
+  async function workspaces() {
+    const node = local(views).split('/')[0] || '0x11';
+    const page = await rpc('read', { path: '/' + node + '/user/workspaces', care: 'y', limit: 200 }).catch(() => null);
+    return ((page && page.children) || []).filter(c => c.exists !== false).map(c => ({ path: local(c.path), name: (c.properties || {})['/name'] || last(c.path) }));
+  }
+  async function wsRead(name) {
+    const base = wsRoot(name);
+    // the cell is read raw: a reference must keep its /h/<care>/... spelling, which carries the standing's care
+    const [rec, cell, inputs, tasks, agent, readings] = await Promise.all([read(base, 'x').catch(() => null), rpc('read', { path: base + '/world', care: 'x' }).catch(() => null), read(base + '/inputs', 'y').catch(() => null), read(base + '/asks', 'y').catch(() => null), read(base + '/status', 'x').catch(() => null), read(base + '/views/reading', 'y').catch(() => null)]);
+    // the reading: the agent's table of contents, its latest version, sections in order with their entries
+    let reading = null;
+    const versions = ((readings && readings.kids) || []).map(k => ({ path: k.path, n: Number((/\/v(\d+)$/.exec(k.path) || [])[1] || 0) })).sort((a, b) => b.n - a.n);
+    if (versions.length) {
+      const tree = await rpc('read', { path: '/' + local(versions[0].path), care: 'z', limit: 300 }).catch(() => null);
+      if (tree) {
+        const refOf = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? local(m[1]) : null; };
+        const slotsOfNode = n => Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v]));
+        reading = { version: versions[0].n, sections: (tree.children || []).map(sec => { const sp = slotsOfNode(sec); return { path: local(sec.path), name: sp.name || last(sec.path), order: Number(sp.order) || 0, entries: (sec.children || []).map(e => { const ep = slotsOfNode(e); return { path: local(e.path), name: ep.name || last(e.path), order: Number(ep.order) || 0, line: ep.note || '', about: refOf(ep.about) }; }).sort((a, b) => a.order - b.order) }; }).sort((a, b) => a.order - b.order) };
+      }
     }
-    return { cell: wsPath(), roots: roots.filter(Boolean), components: num(top.components), islands: num(top.islands) };
+    const standings = [];
+    const slots = (cell && cell.exists && cell.properties) || {};
+    for (const [k0, v] of Object.entries(slots)) {
+      const k = k0.replace(/^\//, ''), r = careOf(v); if (!r) continue;
+      if (k === 'sys/tack') standings.unshift({ key: 'a', ...r }); else if (k.startsWith('standing/')) standings.push({ key: k.slice(9), ...r });
+    }
+    const kids = r => ((r && r.kids) || []).map(k => ({ path: local(k.path), n: Number((/\/[a-z]*(\d+)$/.exec(k.path) || [])[1] || 0), ...(k.slots || {}) })).sort((a, b) => a.n - b.n);
+    return { path: local(base), name: (rec && rec.record && rec.record.name) || name, exists: !!(rec && rec.record), standings, inputs: kids(inputs), tasks: kids(tasks), agent: (agent && agent.record) || {}, reading, depth: Number(slots['/depth']) || 3 };
+  }
+  const wsWritten = {};
+  async function wsStandings(name, standings, depth) {
+    const base = wsRoot(name), cell = base + '/world';
+    if (!standings.length) return null;
+    const sig = standings.map(st => st.care + ':' + st.path).join('|') + '#' + (depth || 3);
+    if (wsWritten[name] === sig) return rootsOf(await treeOf('/x' + cell, 2), cell);   // as it stands: no write, no re-evaluation
+    const out = await workspaceAt(cell, standings, depth || 3);
+    wsWritten[name] = sig;
+    return out;
+  }
+  const nextN = async (folder, prefix) => { const page = await rpc('read', { path: folder, care: 'y', limit: 500 }).catch(() => null); return 1 + Math.max(0, ...(((page && page.children) || []).map(c => Number((new RegExp('/' + prefix + '(\\d+)$').exec(c.path) || [])[1] || 0)))); };
+  // where a page lands, by the web scheme (hands/schemes/web.json): /user/web/pages/<host>/<slug>, the url its identity,
+  // so the same page pasted twice, or by two people, is one record
+  const segOf = t => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, 'n$1').slice(0, 60) || 'index';
+  const pagePath = url => { const u = new URL(url); const host = segOf(u.hostname.replace(/^www\./, '')); const slug = segOf((u.pathname.replace(/\/+$/, '').split('/').filter(Boolean).slice(-2).join('_') || 'index') + (u.search ? '_' + u.search.slice(1, 40) : '')); return '/' + (local(views).split('/')[0] || '0x11') + '/user/web/pages/' + host + '/' + slug; };
+  // a drop: what lands where. A path or a view is already a name: it becomes a standing at its care. A url lands at the
+  // web scheme's place for that page and stands at x. Text or a file lands as a record beneath inputs, named, and
+  // stands at x; its brackets are its references. A task, when the person asks for one outright, lands beneath tasks,
+  // open; agents that take something up write their own there.
+  async function wsDrop(name, drop) {
+    const base = wsRoot(name);
+    const records = [];
+    const ws = await rpc('read', { path: base, care: 'x' }).catch(() => null);
+    if (!(ws && ws.exists)) records.push({ path: base, slots: { name: String(name) } });
+    let landed = null, standing = null;
+    if (drop.kind === 'path') standing = { path: local(drop.path), care: drop.care || 'x' };
+    else if (drop.kind === 'task') { const n = await nextN(base + '/asks', 't'); landed = base + '/asks/t' + n; records.push({ path: landed, slots: { task: drop.text, who: 'person', state: 'open' } }); }
+    else if (drop.kind === 'url') {
+      let page; try { page = pagePath(drop.url); } catch (e) { page = null; }
+      if (page) {
+        const there = await rpc('read', { path: page, care: 'x' }).catch(() => null);
+        if (!(there && there.exists)) records.push({ path: page, slots: { name: String(drop.url).replace(/^https?:\/\//, '').slice(0, 80), url: drop.url } });
+        landed = page; standing = { path: local(page), care: 'x' };
+      }
+    }
+    else {
+      const n = await nextN(base + '/inputs', 'i'); landed = base + '/inputs/i' + n;
+      const slots = { name: drop.name || (drop.kind === 'url' ? String(drop.url).replace(/^https?:\/\//, '').slice(0, 80) : String(drop.text || '').split('\n')[0].replace(/\s*\[\/[^\]]*\]/g, '').trim().slice(0, 80)) };
+      if (drop.kind === 'url') slots.url = drop.url; else if (typeof drop.text === 'string' && drop.text.length) slots.text = drop.text.slice(0, 65536); else slots.note = drop.note || 'a file the page could not read as text';
+      records.push({ path: landed, slots }); standing = { path: local(landed), care: 'x' };
+    }
+    if (records.length) await rpc('write', { records, who: 'person' });
+    return { landed: landed ? local(landed) : null, standing };
   }
   async function backlinks(path) {
     // the links hand keeps every reference in memory and answers in milliseconds; the kernel walk below is the fallback
@@ -851,20 +950,79 @@ function mcpSource(opts = {}) {
     const tip = await rpc('history', { before: 0, limit: 1 });
     return Math.max(Number(tip.next || 0), ...((tip.events || []).map(e => Number(e.epoch || 0))));
   }
-  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, unfold, union, workspace, result, epoch };
+  return { read, answer, graph, follow, stop, qa, rpc, cursor, say, sayAt, chats, newChat, referencedBy, backlinks, unfold, union, workspace, workspaceAt, workspaces, wsRead, wsStandings, wsDrop, result, epoch };
 }
 
 // the record page: one record, its slots, and the thing as a world: what it asserts, and what references it, under
 // every line is a hop to the same page from there. Live: a write under it redraws it.
 const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}${chatQ()}">${esc(s)}</a>`).join(' / '); };
 const talkKey = at => local(at).split('/').slice(1).join('/').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+// ---------- the tree, drawn the same on every page ----------
+// A folder is a slot name; a line is a name, what the holder says beside it, and who says so; dashed when the only
+// thing holding it is prose, or it is a cell's result. `here` is the page's world, `names` the titles behind brackets.
+function treeRenderers(source, here, names) {
+  // ---- prose: one renderer, everywhere. A path in brackets is the link it is; the name lands when read.
+  const PROSE = ['text', 'note', 'said', 'quote', 'description'];
+  const linkify = t => esc(t).replace(/\[(\/[^\]\s]+)\]/g, (m, p) => goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n'));
+  const proseOf = o => PROSE.map(k => o && o[k]).filter(v => typeof v === 'string' && v.trim());
+  const bracketsIn = o => [...new Set((proseOf(o).join(' ').match(/\[\/[^\]\s]+\]/g) || []).map(x => local(x.slice(1, -1))))];
+  // ---- beside a line: the holder's prose, else at most two values, never an identifier or a source
+  const IDLIKE = /^(id|.*_id|uei|duns|cik|lei|cage|naics|sic|psc|source|sources|url|digest|fetched|name|level|heading|title|by|judged|within|also|number|patent|case|extractor|regions|identity)$/;
+  const money = (k, v) => /amount|obligated|revenue|total/.test(k) && /^\d+$/.test(String(v)) ? '$' + (Number(v) >= 1e6 ? (Number(v) / 1e6).toFixed(1) + 'M' : Number(v).toLocaleString()) : String(v);
+  const sentence = (t, k) => { const i = t.indexOf(k); if (i < 0) return t.length > 160 ? t.slice(0, 157) + '…' : t; const a = t.lastIndexOf('. ', i) + 1, b = t.indexOf('. ', i + k.length); return t.slice(a > 0 ? a + 1 : 0, b < 0 ? Math.min(t.length, i + 240) : b + 1).trim(); };
+  const beside = (it, parent) => {
+    const n = it.note || {}, prose = proseOf(n);
+      if (prose.length) { const t = sentence(prose.join(' '), '[' + world(parent) + ']'); return `\u201c${linkify(t.length > 110 ? t.slice(0, 107) + '\u2026' : t)}\u201d`; }
+    return Object.entries(n).filter(([k, v]) => !IDLIKE.test(k) && !/^https?:/.test(String(v)) && String(v).length < 80).slice(0, 2).map(([k, v]) => esc(money(k, v))).join(' · ');
+  };
+  const isProse = f => f && PROSE.includes(String(f.key).split('/').pop());
+  const badge = it => {
+    const ws = (it.worlds && it.worlds.length ? it.worlds : [it.world]).filter(Boolean);
+    return (ws.length > 1 || (ws[0] && ws[0] !== here) ? ws.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}" title="described in world ${esc(w)}">${esc(w)}</span>`).join('') : '') +
+      (it.by && it.by !== here && !ws.includes(it.by) ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
+  };
+  // ---- the tree: a folder is a slot name; a line is a name, what the holder says beside it, and who says so;
+  // dashed when the only thing holding it is prose, or it is a cell's result. Backward prose lines gather at the
+  // bottom as "named in". Folders beyond the subject arrive closed, as counts, and open on demand.
+  const item_ = (it, f, parent) => `<li class="${[it.seen ? 'seen' : '', it.path.startsWith('/x/') ? 'cell' : isProse(f) ? 'named' : ''].filter(Boolean).join(' ')}"><span class="tg">${esc(tagOf(it.path))}</span>${goHTML(local(it.path), local(it.path), it.name, 'n')}${(b => b ? ` <span class="s">${b}</span>` : '')(beside(it, parent))}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.lines && it.lines.length ? `<ul class="sv-tree">${it.lines.map(l => `<li>${goHTML(l.path, l.path, l.name, 'n')}${l.note ? ` <span class="s">${l.note}</span>` : ''}</li>`).join('')}</ul>` : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`;
+  const folder_ = (f, parent) => f.label === 'source' || f.label === 'sources'
+    ? `<li class="sv-src"><span class="vf">${esc(f.label)}</span> ${f.items.map(it => goHTML(local(it.path), local(it.path), it.name, 'n')).join(' · ')}</li>`
+    : f.closed
+    ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}"><span class="vf">${esc(f.label)}</span> <span class="n">${f.more}</span></button></li>`
+    : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => item_(it, f, parent)).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
+  // prose folders gather by direction: what names this thing ("named in"), and what this thing's own sentences, or
+  // those of a record beneath it, name ("names"); each line the sentence around the bracket
+  const world_ = (fs, parent) => {
+    const rest = fs.filter(f => !(isProse(f)));
+    const group = (dir, label) => { const named = fs.filter(f => f.dir === dir && isProse(f)); return named.length ? `<li><span class="vf">${label}</span> <span class="n">${named.reduce((n, f) => n + f.items.length, 0)}</span><ul class="sv-tree">${named.map(f => f.items.map(it => item_(it, f, parent)).join('')).join('')}</ul></li>` : ''; };
+    return `<ul class="sv-tree sv-world">${rest.map(f => folder_(f, parent)).join('')}${group('out', 'names')}${group('in', 'named in')}</ul>`;
+  };
+  // a cell's lines beneath its item, read on demand; a folder with nothing in it is dropped; the page's own cell never listed
+  const fill = async (fs, self) => {
+    const out = [];
+    for (const f of fs) {
+      f.items = f.items.filter(it => it.path !== self);
+      for (const it of f.items) {
+        if (it.path.startsWith('/x/')) { const t = await source.read(it.path, 'y').catch(() => null); it.lines = ((t && t.kids) || []).map(k => ({ path: local(k.path), name: String(k.name || last(k.path)).replace(/_/g, ' '), note: lineHTML(k.slots || {}) })); }
+        if (it.folders) it.folders = await fill(it.folders, self);
+      }
+      if (f.closed || f.items.length || f.more) out.push(f);
+    }
+    return out;
+  };
+  // a standing judged the same as others is one subject with several representations: each other record on its line, by world
+  const standing_ = (st, island, extra = '') => `<div class="sv-standing${island ? ' sv-island' : ''}">${goHTML(st.path, st.path, st.name, 'n')}${badge({ world: st.world })}${(st.same || []).map(p => ` <span class="s">= ${goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n')} <span class="tg">${esc(tagOf(p))}</span></span>`).join('')}${extra}${island ? ' <span class="s">island: nothing connects it to another standing yet</span>' : ''}</div>${st.folders.length ? world_(st.folders, st.path) : ''}`;
+  return { PROSE, linkify, proseOf, bracketsIn, beside, isProse, badge, item_, folder_, world_, fill, standing_ };
+}
+
 function mountRecord(el, source, opts = {}) {
   const at = local(opts.at), asof = String(opts.asof || '').replace(/\D/g, '');
   const viewAt = at.startsWith('x/');            // a view's own page: the cell's record is the card, its result the world
   const node = (viewAt ? at.slice(2) : at).split('/')[0];
   const talk = !!(opts.talk && source.sayAt);   // the talk box and its stream only when the page is asked for them (?talk=1)
-  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}${asof ? ` <span class="s">· as of epoch ${esc(asof)} · <a href="?at=/${esc(at)}">now</a></span>` : ''}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${talk ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
+  el.innerHTML = `<div class="ws-tabs"></div><div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}${asof ? ` <span class="s">· as of epoch ${esc(asof)} · <a href="?at=/${esc(at)}">now</a></span>` : ''}</div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-recview"></div>${talk ? `<div class="sv-here"><div class="sv-talk sv-talk-here"></div><div class="sv-writing"></div><form class="sv-chat"><input type="text" autocomplete="off" placeholder="talk about this here; the conversation lives beneath it"><button type="submit">send</button></form></div>` : ''}`;
   const main = el.querySelector('.sv-recview');
+  if (source.workspaces) source.workspaces().then(all => { const b = el.querySelector('.ws-tabs'); if (b) b.innerHTML = tabsHTML(all, ''); }).catch(() => {});
   let openFolder = null;            // set by draw: opens a closed folder of the unfolded world in place
   // the talk at this record: its turns live at <record>/talk/turns, its lens at <record>/talk/context
   if (talk) {
@@ -902,40 +1060,9 @@ function mountRecord(el, source, opts = {}) {
     const rec = r.record || {};
     const here = node;
     const put = (sel, html) => { const el = main.querySelector(sel); if (el) el.innerHTML = html; else main.innerHTML += html; };
-    // ---- prose: one renderer, everywhere. A path in brackets is the link it is; the name lands when read.
-    const PROSE = ['text', 'note', 'said', 'quote', 'description'];
     const names = {};
-    const linkify = t => esc(t).replace(/\[(\/[^\]\s]+)\]/g, (m, p) => goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n'));
-    const proseOf = o => PROSE.map(k => o && o[k]).filter(v => typeof v === 'string' && v.trim());
-    const bracketsIn = o => [...new Set((proseOf(o).join(' ').match(/\[\/[^\]\s]+\]/g) || []).map(x => local(x.slice(1, -1))))];
-    // ---- beside a line: the holder's prose, else at most two values, never an identifier or a source
-    const IDLIKE = /^(id|.*_id|uei|duns|cik|lei|cage|naics|sic|psc|source|sources|url|digest|fetched|name|level|heading|title|by|judged|within|also|number|patent|case|extractor|regions|identity)$/;
-    const money = (k, v) => /amount|obligated|revenue|total/.test(k) && /^\d+$/.test(String(v)) ? '$' + (Number(v) >= 1e6 ? (Number(v) / 1e6).toFixed(1) + 'M' : Number(v).toLocaleString()) : String(v);
-    const sentence = (t, k) => { const i = t.indexOf(k); if (i < 0) return t.length > 160 ? t.slice(0, 157) + '…' : t; const a = t.lastIndexOf('. ', i) + 1, b = t.indexOf('. ', i + k.length); return t.slice(a > 0 ? a + 1 : 0, b < 0 ? Math.min(t.length, i + 240) : b + 1).trim(); };
-    const beside = (it, parent) => {
-      const n = it.note || {}, prose = proseOf(n);
-      if (prose.length) return `“${linkify(sentence(prose.join(' '), '[' + world(parent) + ']'))}”`;
-      return Object.entries(n).filter(([k, v]) => !IDLIKE.test(k) && !/^https?:/.test(String(v)) && String(v).length < 80).slice(0, 2).map(([k, v]) => esc(money(k, v))).join(' · ');
-    };
-    const isProse = f => f && PROSE.includes(String(f.key).split('/').pop());
-    const badge = it => {
-      const ws = (it.worlds && it.worlds.length ? it.worlds : [it.world]).filter(Boolean);
-      return (ws.length > 1 || (ws[0] && ws[0] !== here) ? ws.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}" title="described in world ${esc(w)}">${esc(w)}</span>`).join('') : '') +
-        (it.by && it.by !== here && !ws.includes(it.by) ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
-    };
-    // ---- the tree: a folder is a slot name; a line is a name, what the holder says beside it, and who says so;
-    // dashed when the only thing holding it is prose, or it is a cell's result. Backward prose lines gather at the
-    // bottom as "named in". Folders beyond the subject arrive closed, as counts, and open on demand.
-    const item_ = (it, f, parent) => `<li class="${[it.seen ? 'seen' : '', it.path.startsWith('/x/') ? 'cell' : isProse(f) ? 'named' : ''].filter(Boolean).join(' ')}">${goHTML(local(it.path), local(it.path), it.name, 'n')}${(b => b ? ` <span class="s">${b}</span>` : '')(beside(it, parent))}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.lines && it.lines.length ? `<ul class="sv-tree">${it.lines.map(l => `<li>${goHTML(l.path, l.path, l.name, 'n')}${l.note ? ` <span class="s">${l.note}</span>` : ''}</li>`).join('')}</ul>` : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`;
-    const folder_ = (f, parent) => f.label === 'source' || f.label === 'sources'
-      ? `<li class="sv-src"><span class="vf">${esc(f.label)}</span> ${f.items.map(it => goHTML(local(it.path), local(it.path), it.name, 'n')).join(' · ')}</li>`
-      : f.closed
-      ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}"><span class="vf">${esc(f.label)}</span> <span class="n">${f.more}</span></button></li>`
-      : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => item_(it, f, parent)).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
-    const world_ = (fs, parent) => {
-      const named = fs.filter(f => f.dir === 'in' && isProse(f)), rest = fs.filter(f => !(isProse(f)));
-      return `<ul class="sv-tree sv-world">${rest.map(f => folder_(f, parent)).join('')}${named.length ? `<li><span class="vf">named in</span> <span class="n">${named.reduce((n, f) => n + f.items.length, 0)}</span><ul class="sv-tree">${named.map(f => f.items.map(it => item_(it, f, parent)).join('')).join('')}</ul></li>` : ''}</ul>`;
-    };
+    const R = treeRenderers(source, here, names);
+    const { linkify, proseOf, bracketsIn, isProse, badge, folder_, world_, standing_, PROSE } = R;
     openFolder = async btn => {
       btn.disabled = true;
       const fs = await source.unfold(btn.dataset.open, 1).catch(() => null);
@@ -993,28 +1120,15 @@ function mountRecord(el, source, opts = {}) {
       return `<ul class="sv-tree sv-world">${(kids[''] || []).map(c => item(c, 1)).join('')}</ul>`;
     };
     const self = ws && !ws.fault ? '/x' + ws.cell : null;
-    const fill = async fs => {
-      const out = [];
-      for (const f of fs) {
-        f.items = f.items.filter(it => it.path !== self);
-        for (const it of f.items) {
-          if (it.path.startsWith('/x/')) { const t = await source.read(it.path, 'y').catch(() => null); it.lines = ((t && t.kids) || []).map(k => ({ path: local(k.path), name: String(k.name || last(k.path)).replace(/_/g, ' '), note: lineHTML(k.slots || {}) })); }
-          if (it.folders) it.folders = await fill(it.folders);
-        }
-        if (f.closed || f.items.length || f.more) out.push(f);
-      }
-      return out;
-    };
-    const uu = u ? await fill(u) : null;
-    if (ws && !ws.fault) for (const root of ws.roots) for (const st of root.standings) st.folders = await fill(st.folders);
+    const uu = u ? await R.fill(u, self) : null;
+    if (ws && !ws.fault) for (const root of ws.roots) for (const st of root.standings) st.folders = await R.fill(st.folders, self);
     if (mine !== drawn) return;
     const treeHTML = rn && Object.keys(rn).length ? resultHTML(rn) : uu && uu.length ? world_(uu, at) : '';
     const grey = (treeHTML.match(/<li class="[^"]*\bnamed\b/g) || []).length;
     put('.sv-world-sec', treeHTML ? `<div class="k">${rn ? 'the result' : `as a world${grey ? ` · ${grey} in prose` : ''}`}</div>${treeHTML}` : (have ? '' : `<div class="k">${viewAt ? 'the result' : 'as a world'}</div><div class="sv-empty">${viewAt ? 'nothing yet' : 'no view in this world'}</div>`));
     const now = source.epoch ? await source.epoch().catch(() => 0) : 0;
     if (mine !== drawn) return;
-    const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button><label class="sv-asof s">as of epoch <input type="number" min="1"${now ? ` max="${now}"` : ''} value="${esc(asof)}" placeholder="${now || 'now'}"></label>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
-    const standing_ = (st, island) => `<div class="sv-standing${island ? ' sv-island' : ''}">${goHTML(st.path, st.path, st.name, 'n')}${badge({ world: st.world })}${island ? ' <span class="s">island: nothing connects it to another standing at this depth</span>' : ''}</div>${st.folders.length ? world_(st.folders, st.path) : ''}`;
+    const wsBar = `<div class="sv-ws-bar"><button type="button" class="sv-ws-add" data-add="${esc(local(at))}">${wsList.includes(local(at)) ? 'in the workspace' : 'add to workspace'}</button><a class="s" href="?ws=scratch&add=${esc(local(at))}">open in a workspace</a><label class="sv-asof s">as of epoch <input type="number" min="1"${now ? ` max="${now}"` : ''} value="${esc(asof)}" placeholder="${now || 'now'}"></label>${wsList.length ? wsList.map(p => `<span class="sv-ws-st">${goHTML(p, p, last(p).replace(/_/g, ' '), 'n')} <button type="button" class="sv-ws-drop" data-drop="${esc(p)}" title="drop">×</button></span>`).join('') : '<span class="s">gather standings here from any record; the kernel draws what connects them</span>'}</div>`;
     const wsBody = !ws ? '' : ws.fault ? `<div class="sv-note bad">${esc(ws.fault)}</div>` :
       `<div class="sv-ws-meter"><span><b>${ws.components}</b> component${ws.components === 1 ? '' : 's'}</span><span><b>${ws.islands}</b> island${ws.islands === 1 ? '' : 's'}</span></div>` +
       ws.roots.map(root => `<div class="sv-root"><div class="k">${esc(root.name || root.standings.map(st => st.name).join(' · '))}</div>${root.standings.map(st => standing_(st, root.standings.length === 1)).join('')}</div>`).join('');
@@ -1108,6 +1222,283 @@ function queueHTML(rows) {
   const sec = (k, rs) => `<div class="sv-sec"><div class="k">${k} · ${rs.length}</div>${rs.map(row).join('') || '<div class="sv-empty">none</div>'}</div>`;
   return sec('working', working) + sec('waiting', waiting) + sec('finished', done);
 }
+
+// ---------- a workspace: a blank world that takes shape from what you drop into it ----------
+// What a drop is, read from its text alone: a path (optionally followed by its care, "x", "y" or "z"), a url, or
+// text. A question is text like any other: an input, never a kind of its own; what an agent makes of it is the
+// agent's to write.
+function kindOf(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return null;
+  let m = /^(\/[^\s\[\]]+)\s*(?:\[([xyz])\]|\b([xyz]))?\s*$/.exec(t);
+  if (m) return { kind: 'path', path: m[1], care: m[2] || m[3] || 'x', view: m[1].startsWith('/x/') };
+  m = /^https?:\/\/\S+$/i.exec(t);
+  if (m) return { kind: 'url', url: t };
+  return { kind: 'text', text: t };
+}
+const GLYPH = { path: '◈', view: '⌁', url: '⇗', text: '❝', file: '❐', task: '○' };
+// the tabs: every workspace there is, the open one lit, a dot that pulses while its agent works, and a blank one a
+// click away
+const tabsHTML = (all, active, live = {}) => {
+  const names = all.map(w => last(w.path));
+  let fresh = 'untitled', n = 2; while (names.includes(fresh) || fresh === active) fresh = 'untitled_' + n++;
+  const tabs = names.includes(active) || !active ? names : names.concat(active);
+  const titles = Object.fromEntries(all.map(w => [last(w.path), w.name]));
+  return `<div class="ws-tabbar">${tabs.map(w => `<a class="tab${w === active ? ' on' : ''}${live[w] ? ' live' : ''}" href="?ws=${esc(w)}"><span class="d"></span><span class="tl">${esc((titles[w] || w).replace(/_/g, ' '))}</span></a>`).join('')}<a class="tab new" href="?ws=${esc(fresh)}" title="a blank workspace">+</a></div>`;
+};
+// what a paste or a drop of several lines is: every line a path, each its own drop; otherwise one drop of the whole
+const dropsOf = text => {
+  const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length > 1 && lines.every(l => (kindOf(l) || {}).kind === 'path')) return lines.map(kindOf);
+  const d = kindOf(text); return d ? [d] : [];
+};
+// a thing's tag on a line: the word of the folder it sits in, as its author spelled it
+const tagOf = path => { const segs = local(path).split('/'); if (segs[0] === 'x') return 'view'; const i = segs.indexOf('user'); const rest = segs.slice(i + 1); return rest.length >= 2 ? rest[rest.length - 2] : (rest[0] || ''); };
+function mountWorkspace(el, source, opts = {}) {
+  const ws = String(opts.ws || '').replace(/[^a-z0-9_]/g, '_'), node = opts.node || '0x11';
+  if (!ws) { nav('?ws=untitled'); return el; }
+  el.classList.add('ws-wide');
+  const title0 = ws.replace(/_/g, ' ');
+  el.innerHTML = `<div class="ws-top"><div class="brand"><i></i>shrine</div><div class="worlds">/ worlds</div><div class="ws-tabs"></div></div>` +
+    `<div class="sv-wspage"><div class="ws-center">` +
+    `<div class="wh"><div class="whl"><div class="crumb">worlds / <span class="cc">${esc(title0)}</span></div><h1 class="wt">${esc(title0)}</h1><div class="wm"><span class="ld"></span><span>As a World · Live</span><span class="ws-meter"></span></div></div></div>` +
+    `<div class="ws-body"><div class="tree ws-world-sec"></div><div class="empty"><div class="eg"></div><b>${esc(title0)}</b><span>No standings or source material yet</span></div></div>` +
+    `<form class="ws-drop"><div class="pf"><textarea rows="1" autocomplete="off" placeholder="Paste a path, URL, file, text, or request…"></textarea><button type="button" class="ws-clip" title="a file from disk">⎘</button><input type="file" multiple hidden></div><div class="hint"><kbd>⌘V</kbd> anywhere in this workspace <span class="ws-kind"></span><button type="button" class="ws-astask" title="hand the agents a task outright, instead of an input">task</button></div></form>` +
+    `<div class="insp"><div class="ih"><div class="tr"></div><div class="ix" title="close">×</div></div><div class="ic"></div></div>` +
+    `<div class="dropzone"><div>Drop to add to <b>${esc(title0)}</b></div></div></div>` +
+    `<aside class="ws-side"><div><div class="sh">STANDINGS <span class="c bc">Nothing submitted</span></div><div class="list ws-inputs"></div></div>` +
+    `<div><div class="sh">AGENT WORK <span class="c wc">Idle</span><button type="button" class="ws-addtask" title="hand the agents a task">+</button></div><div class="main"><div class="ring"></div><div><b>Main agent</b><span class="ms">Waiting for the first input</span></div></div><div class="list ws-tasks"></div></div>` +
+    `<div class="hist"><div class="sh">HISTORY <span class="c hc">0</span></div><div class="list hl"></div></div></aside></div>`;
+  const $ = sel => el.querySelector(sel);
+  const names = {}, exists = {};
+  const R = treeRenderers(source, node, names);
+  let state = { standings: [], inputs: [], tasks: [], depth: 3, agent: {} }, world = null, drawn = 0, timer = null, all = [];
+  // what this page session has seen settle: a landed input or a done task stays a moment, then drains into history
+  const settled = {}, hist = [];
+  const tabs = () => (source.workspaces ? source.workspaces() : Promise.resolve([])).then(list => { all = list; const b = $('.ws-tabs'); if (b) b.innerHTML = tabsHTML(all, ws, { [ws]: busy() }); }).catch(() => {});
+  const busy = () => !!(state.agent && state.agent.busy === true) || state.tasks.some(t => t.state === 'working');
+  const histAdd = line => { hist.unshift(line); if (hist.length > 6) hist.pop(); const h = $('.hl'); if (h) h.innerHTML = hist.map((l, i) => `<div class="${i === 0 ? 'new' : ''}">${esc(l)}</div>`).join(''); const c = $('.hc'); if (c) c.textContent = String(hist.length); };
+  // a standing's title; a folder with things beneath it (a bucket at y) counts as a name that exists
+  const titleOf = async path => {
+    if (names[path] !== undefined) return names[path];
+    const t = await source.read(path, 'y').catch(() => null);
+    exists[path] = !!(t && ((t.record && Object.keys(t.record).length) || (t.kids && t.kids.length)));
+    names[path] = (t && t.record && (t.record.name || t.record.heading || t.record.title)) || '';
+    return names[path];
+  };
+  const inputOf = st => state.inputs.find(i => i.path === st.path);
+  const kindOfStanding = st => st.path.startsWith('x/') ? 'view' : (inputOf(st) || {}).url ? 'url' : (inputOf(st) || {}).note ? 'file' : inputOf(st) ? 'text' : 'path';
+  // where an input stands: landed (a name that exists, a text placed), waiting (a url nobody fetched yet, a name
+  // nothing was written at), or still landing
+  const refOf = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? local(m[1]) : (typeof v === 'string' && /^(-> )?\/?(0x[0-9a-f]+|x)\//.test(v) ? local(v.replace(/^-> /, '')) : null); };
+  const working = st => state.tasks.filter(t => t.state === 'working' && refOf(t.about) === st.path);
+  const statusOf = st => {
+    const i = inputOf(st), w = working(st);
+    if (w.length) return ['Digesting · ' + w.map(t => String(t.task || '').split(' ')[0].toLowerCase()).join(', '), false];
+    if (i && i.url && !i.text && !i.fetched) return ['Pending · fetch', false];
+    if (!i && exists[st.path] === false) return ['Pending · nothing at this name yet', false];
+    if (i && i.url) return ['Landed · source', true];
+    if (i) return ['Landed · ' + (/\[\//.test(String(i.text || '')) ? 'names placed' : 'read'), true];
+    return ['Included · reference', true];
+  };
+  const kindLabel = { path: 'PATH', view: 'VIEW', url: 'URL', text: 'TEXT', file: 'FILE' };
+  const controls = st => {
+    const kind = kindOfStanding(st);
+    const cares = kind === 'path' || kind === 'view' ? `<span class="ws-care">${['x', 'y', 'z'].map(c => `<button type="button" class="${c === st.care ? 'on' : ''}" data-care="${c}" data-path="${esc(st.path)}" title="${c === 'x' ? 'the record' : c === 'y' ? 'the record and its children' : 'everything beneath it'}">${c}</button>`).join('')}</span>` : '';
+    return `<span class="ws-ctl">${cares}<button type="button" class="cp" data-copy="/${esc(st.path)}" title="copy the path, to paste into another workspace">⧉</button><button type="button" class="x" data-drop="${esc(st.path)}" title="take it out of the world; nothing is deleted">×</button></span>`;
+  };
+  // the bus is the selection: every input stays, with its state, its care, its path to copy and a way out; it is
+  // what the world is composed over, so nothing drains from it
+  const inputsHTML = () => {
+    const rows = [];
+    for (const st of state.standings) {
+      const [status, ok] = statusOf(st);
+      const kind = kindOfStanding(st), title = names[st.path] || last(st.path).replace(/_/g, ' ');
+      rows.push(`<div class="inp" data-path="${esc(st.path)}" title="/${esc(st.path)}"><span class="k">${kindLabel[kind]}</span><span class="l">${goHTML(st.path, st.path, title, 'n')}</span><span class="s${ok ? ' ok' : ''}">${esc(status)}</span>${controls(st)}</div>`);
+    }
+    if (state.pending) rows.push(`<div class="inp"><span class="k">${kindLabel[state.pending.kind] || 'TEXT'}</span><span class="l">${esc(state.pending.name)}</span><span class="s">Landing…</span></div>`);
+    const pending = state.standings.filter(st => !statusOf(st)[1]).length + (state.pending ? 1 : 0);
+    const bc = $('.bc'); if (bc) { bc.textContent = pending ? `${pending} pending` : (state.standings.length ? `${state.standings.length} standing${state.standings.length === 1 ? '' : 's'}` : 'Nothing submitted'); bc.classList.toggle('act', !!pending); }
+    return rows.join('');
+  };
+  // the agents' side: the main agent's own word on what it is doing, then each task with its state; a done task
+  // stays a moment, then drains into history
+  const taskHTML = t => `<div class="task${t.state === 'done' ? ' ok' : t.state === 'working' ? ' run' : ''}${t.state === 'done' && settled[t.path] && Date.now() - settled[t.path] > 2200 ? ' out' : ''}"><div class="tt"><span class="ic2"></span><b>${goHTML(t.path, t.path, t.task || last(t.path), 'n')}</b></div><div class="ts">${t.state === 'done' ? 'Completed' + (t.found ? ' · ' + esc(String(t.found)) : '') : esc(String(t.detail || (t.who === 'person' ? 'Asked by you' : t.who ? 'Auto · ' + t.who : '')))}</div><div class="tb"><i></i></div></div>`;
+  const tasksHTML = () => {
+    const now = Date.now(), rows = [];
+    for (const t of state.tasks) {
+      if (t.state === 'done') { if (!settled[t.path]) { settled[t.path] = now; setTimeout(drawSide, 2800); } else if (now - settled[t.path] > 2600) { if (!settled[t.path + ' hist']) { settled[t.path + ' hist'] = 1; histAdd((t.task || last(t.path)) + ' → ' + (t.found || 'done')); } continue; } }
+      rows.push(taskHTML(t));
+    }
+    const running = state.tasks.filter(t => t.state === 'working').length;
+    const wc = $('.wc'); if (wc) { wc.textContent = running ? `${running} running` : 'Idle'; wc.classList.toggle('act', !!running); }
+    const m = $('.main'); if (m) { m.classList.toggle('busy', busy()); const ms = m.querySelector('.ms'); const text = (state.agent && state.agent.status) || (state.standings.length ? 'Watching for inputs' : 'Waiting for the first input'); if (ms && ms.textContent !== text) { ms.textContent = text; ms.classList.remove('re'); void ms.offsetWidth; ms.classList.add('re'); } }
+    return rows.join('');
+  };
+  const drawSide = () => { const i = $('.ws-inputs'), t = $('.ws-tasks'); if (i) i.innerHTML = inputsHTML(); if (t) t.innerHTML = tasksHTML(); const b = $('.ws-tabs'); if (b && all.length) b.innerHTML = tabsHTML(all, ws, { [ws]: busy() }); };
+  // a route drawn as one line: standing, hop, hop, the name met at, hop, hop, standing; every name a link
+  const pill = p => goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n');
+  const hop = l => `<span class="hop">${esc(l.replace(/_/g, ' '))}</span>`;
+  const routeHTML = r => {
+    const parts = [pill(r.from)];
+    for (const st of [...r.a].reverse()) parts.push(hop(st.label), pill(st.at));
+    parts.push(hop(r.label), `<b>${pill(r.at)}</b>`);
+    for (let j = 0; j < r.b.length; j++) { const st = r.b[j]; const next = j + 1 < r.b.length ? r.b[j + 1].at : r.to; parts.push(hop(st.label), pill(next)); }
+    return `<div class="rt">${parts.join(' ')}</div>`;
+  };
+  const rawHTML = () => {
+    if (!world || world.fault) return world && world.fault ? `<div class="sv-note bad">${esc(world.fault)}</div>` : '';
+    return world.roots.map(root => `<div class="sv-root"><div class="k">${esc(root.name || root.standings.map(st => st.name).join(' · '))}</div>` +
+      (root.routes && root.routes.length ? `<div class="rts">${root.routes.map(routeHTML).join('')}</div>` : (root.standings.length > 1 ? '' : '')) +
+      root.standings.map(st => { const mine = state.standings.find(x => x.path === local(st.path)); return `<div class="ws-st${root.routes && root.routes.length ? ' folded' : ''}"><button type="button" class="chev" title="the standing's world"></button>${R.standing_(st, root.standings.length === 1 && world.roots.length > 1, mine ? controls(mine) : '')}</div>`; }).join('') + `</div>`).join('');
+  };
+  // the reading drawn as the tree: a section is a heading, an entry a short name with its line, the thing's wired
+  // world folded beneath it, read on demand; the raw world stays a click away
+  let view = 'raw';
+  const readingHTML = () => {
+    const r = state.reading; if (!r || !r.sections.length) return '';
+    return r.sections.map(sec => `<div class="rd-sec"><div class="rd-h">${esc(sec.name)}</div>${sec.entries.map(e => `<div class="rd-e" data-about="${esc(e.about || '')}"><button type="button" class="chev" title="the thing as a world"></button><span class="tg">${esc(tagOf(e.about || e.path))}</span>${e.about ? goHTML(e.about, e.about, e.name, 'n') : `<span class="n">${esc(e.name)}</span>`}${e.line ? ` <span class="s">${esc(e.line)}</span>` : ''}<div class="rd-w"></div></div>`).join('')}</div>`).join('');
+  };
+  const worldHTML = () => {
+    const rd = view === 'reading' ? readingHTML() : '';
+    const toggle = state.reading && state.reading.sections.length ? `<div class="vt"><span class="${view === 'raw' ? 'on' : ''}" data-view="raw">Connections</span><span class="${view === 'reading' ? 'on' : ''}" data-view="reading">Reading</span></div>` : '';
+    return toggle + (rd || rawHTML());
+  };
+  const meter = () => world && !world.fault ? `${world.components} component${world.components === 1 ? '' : 's'} · ${world.islands} island${world.islands === 1 ? '' : 's'}` : '';
+  const setTitle = t => { const wt = $('.wt'); if (wt && wt.textContent !== t) { wt.textContent = t; wt.classList.remove('re'); void wt.offsetWidth; wt.classList.add('re'); } for (const sel of ['.cc', '.empty b', '.dropzone b']) { const x = $(sel); if (x) x.textContent = t; } };
+  // drops and draws take turns, so a draw never reads the cell back while a drop is still writing it
+  let turn = Promise.resolve();
+  const inTurn = fn => { const next = turn.then(fn, fn); turn = next.catch(() => {}); return next; };
+  const draw = () => inTurn(drawNow);
+  // the world is read after the side shows, and the old picture stays, dimmed, until the new one lands
+  async function drawNow() {
+    const mine = ++drawn;
+    state = { ...state, ...(await source.wsRead(ws).catch(() => ({}))) };
+    if (mine !== drawn) return;
+    if (state.name && state.name !== ws) setTitle(state.name);
+    await Promise.all(state.standings.map(st => titleOf(st.path)));
+    if (mine !== drawn) return;
+    drawSide();
+    const sec = $('.ws-world-sec'), empty = $('.empty');
+    if (!state.standings.length) { world = null; sec.innerHTML = ''; if (empty) empty.hidden = false; $('.ws-meter').innerHTML = ''; return; }
+    if (empty) empty.hidden = true;
+    // the reading draws at once from the records; the wired world, slower to read, follows and fills the meter
+    if (state.reading && state.reading.sections.length && view === 'reading') sec.innerHTML = worldHTML();
+    sec.classList.add('stale');
+    const w = await source.wsStandings(ws, state.standings, state.depth).catch(e => ({ fault: String(e && e.message || e).slice(0, 160) }));
+    if (mine !== drawn) return;
+    if (w && !w.fault) { for (const root of w.roots) for (const st of root.standings) st.folders = await R.fill(st.folders, '/x' + w.cell); const along = new Set(); for (const root of w.roots) { for (const st of root.standings) for (const p of st.same || []) along.add(local(p)); for (const r of root.routes || []) for (const p of [r.from, r.to, r.at, r.via].concat(r.a.map(x => x.at), r.b.map(x => x.at))) if (p) along.add(local(p)); } await Promise.all([...along].map(titleOf)); world = w; }
+    else if (!world && w) world = w;         // a failed read keeps the last picture; the first failure says so
+    if (mine !== drawn) return;
+    sec.classList.remove('stale');
+    sec.innerHTML = worldHTML();
+    $('.ws-meter').innerHTML = meter();
+    drawSide();
+  }
+  async function drop(d) {
+    if (!d) return;
+    state.pending = { kind: d.view ? 'view' : d.kind, name: d.path || d.url || d.name || String(d.text || '').split('\n')[0].slice(0, 60) };
+    drawSide();
+    await inTurn(async () => {
+      try {
+        const r = await source.wsDrop(ws, d);
+        // a standing is kept in the world cell, nowhere else: write it there before the page reads itself again
+        if (r && r.standing && !state.standings.some(st => st.path === r.standing.path)) { state.standings.push({ key: '', ...r.standing }); await source.wsStandings(ws, state.standings, state.depth); }
+      } catch (e) { /* the next draw shows what landed */ }
+      state.pending = null;
+    });
+    tabs();
+    draw();
+  }
+  const dropAll = async ds => { for (const d of ds) await drop(d); };
+  const box = $('.ws-drop textarea'), kindChip = $('.ws-kind'), askTask = $('.ws-astask');
+  let asTask = false;
+  const showKind = () => { const ds = dropsOf(box.value), d = ds[0]; kindChip.innerHTML = !d ? '' : asTask ? '○ a task for the agents' : ds.length > 1 ? `${ds.length} paths` : d.view ? 'a view' : d.kind === 'path' ? 'a record, at ' + d.care : d.kind === 'url' ? 'a url' : 'text: its brackets are its references'; };
+  const toggleTask = () => { asTask = !asTask; askTask.classList.toggle('on', asTask); showKind(); box.focus && box.focus(); };
+  askTask.addEventListener('click', toggleTask);
+  $('.ws-addtask').addEventListener('click', toggleTask);
+  const picker = $('.ws-drop input[type=file]');
+  $('.ws-clip').addEventListener('click', () => picker.click && picker.click());
+  picker.addEventListener('change', () => { files([...(picker.files || [])]); picker.value = ''; });
+  box.addEventListener('input', showKind);
+  box.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('.ws-drop').dispatchEvent(new Event('submit', { cancelable: true })); } });
+  $('.ws-drop').addEventListener('submit', e => { e.preventDefault(); const t = box.value; const ds = asTask ? (String(t).trim() ? [{ kind: 'task', text: String(t).trim() }] : []) : dropsOf(t); if (!ds.length) return; box.value = ''; asTask = false; askTask.classList.toggle('on', false); showKind(); dropAll(ds); });
+  // files: text-like ones land whole; any other lands as its name, with a note, for an agent to digest
+  const files = list => {
+    for (const f of list) {
+      const texty = /^text\//.test(f.type) || /\.(md|txt|csv|json|html?|xml|yaml|yml)$/i.test(f.name);
+      if (texty && root.FileReader) { const rd = new root.FileReader(); rd.onload = () => drop({ kind: 'file', name: f.name, text: String(rd.result || '') }); rd.readAsText(f); }
+      else drop({ kind: 'file', name: f.name, note: `${f.type || 'a file'}, ${f.size} bytes; not read as text, for an agent to digest` });
+    }
+  };
+  // a drag over the workspace shows where it lands; a drop lands it
+  const center = $('.ws-center'), zone = $('.dropzone');
+  let dragDepth = 0;
+  center.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; zone.classList.add('on'); });
+  center.addEventListener('dragover', e => { e.preventDefault(); });
+  center.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) zone.classList.remove('on'); });
+  center.addEventListener('drop', e => {
+    e.preventDefault(); dragDepth = 0; zone.classList.remove('on');
+    const fs = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    if (fs.length) files(fs); else { const t = e.dataTransfer && e.dataTransfer.getData && e.dataTransfer.getData('text'); if (t) dropAll(dropsOf(t)); }
+  });
+  // paste anywhere on the page, outside the box, and it lands in the queue; in the box, it is ordinary typing
+  const onPaste = e => {
+    const tag = e.target && e.target.tagName; if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+    const cd = e.clipboardData; if (!cd) return;
+    const fs = [...(cd.files || [])];
+    if (fs.length) { e.preventDefault(); files(fs); return; }
+    const t = cd.getData('text'); const ds = dropsOf(t);
+    if (ds.length) { e.preventDefault(); dropAll(ds); }
+  };
+  if (root.addEventListener) { root.addEventListener('paste', onPaste); el._paste = onPaste; }
+  // the inspector: a name clicked in the world opens beside it, its record read whole, every reference a step further
+  const trail = [];
+  async function inspect(path, push = true) {
+    const insp = $('.insp'); insp.classList.add('open');
+    if (push) { if (trail[trail.length - 1] !== path) trail.push(path); } else { while (trail.length && trail[trail.length - 1] !== path) trail.pop(); if (!trail.length) trail.push(path); }
+    const r = await source.read(path, 'y').catch(() => null);
+    const rec = (r && r.record) || {}, kids = (r && r.kids) || [];
+    const title = rec.name || rec.heading || rec.title || last(path).replace(/_/g, ' ');
+    names[local(path)] = names[local(path)] || title;
+    $('.tr').innerHTML = trail.map((p, i) => `<span class="${i === trail.length - 1 ? 'cur' : 'home'}" data-trail="${esc(p)}">${esc(names[local(p)] || last(p))}</span>`).join('<span>›</span>');
+    const prose = R.proseOf(rec);
+    const fields = Object.entries(rec).filter(([k]) => !R.PROSE.includes(k) && !k.startsWith('sys/')).map(([k, v]) => { const ref = refOf(v); return `<div><dt>${esc(k)}</dt><dd>${ref ? `<a class="lnk" href="?at=/${esc(ref)}" data-inspect="${esc(ref)}">${esc(names[ref] || last(ref).replace(/_/g, ' '))}</a>` : esc(typeof v === 'number' ? v.toLocaleString() : String(v))}</dd></div>`; }).join('');
+    const beneath = kids.length ? `<div><dt>beneath</dt><dd>${kids.slice(0, 12).map(k => `<a class="lnk" href="?at=/${esc(local(k.path))}" data-inspect="${esc(local(k.path))}">${esc(k.name || last(k.path))}</a>`).join(' · ')}${kids.length > 12 ? ` · ${kids.length - 12} more` : ''}</dd></div>` : '';
+    const ic = $('.ic'); ic.classList.remove('in'); void ic.offsetWidth;
+    ic.innerHTML = `<div class="tgs"><span class="tg">${esc(tagOf(path))}</span><a class="chip ref" href="?at=/${esc(local(path))}">open page ↗</a></div><h2>${esc(title)}</h2>${prose.map(t => `<p class="note">${R.linkify(t)}</p>`).join('')}<dl class="fl">${fields}${beneath}</dl>`;
+    ic.classList.add('in');
+    for (const a of ic.querySelectorAll('a.lnk[data-inspect]')) a.addEventListener('click', e => { e.preventDefault(); inspect(a.dataset.inspect); });
+    for (const sp of $('.tr').querySelectorAll('[data-trail]')) sp.addEventListener('click', () => inspect(sp.dataset.trail, false));
+  }
+  $('.ix').addEventListener('click', () => { $('.insp').classList.remove('open'); for (const li of el.querySelectorAll('li.sel')) li.classList.remove('sel'); });
+  el.addEventListener('click', e => {
+    const c = e.target && e.target.closest ? e.target.closest('.ws-care button') : null;
+    if (c) { e.preventDefault(); const st = state.standings.find(x => x.path === c.dataset.path); if (st && st.care !== c.dataset.care) { st.care = c.dataset.care; drawSide(); source.wsStandings(ws, state.standings, state.depth).then(() => draw()).catch(() => draw()); } return; }
+    const cp = e.target && e.target.closest ? e.target.closest('button.cp[data-copy]') : null;
+    if (cp) { e.preventDefault(); if (root.navigator && root.navigator.clipboard) root.navigator.clipboard.writeText(cp.dataset.copy).catch(() => {}); cp.textContent = '✓'; setTimeout(() => { cp.textContent = '⧉'; }, 900); return; }
+    const x = e.target && e.target.closest ? e.target.closest('button.x[data-drop]') : null;
+    if (x) { e.preventDefault(); state.standings = state.standings.filter(st => st.path !== x.dataset.drop); drawSide(); source.wsStandings(ws, state.standings, state.depth).then(() => draw()).catch(() => draw()); return; }
+    const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
+    if (o) { e.preventDefault(); o.disabled = true; source.unfold(o.dataset.open, 1).then(fs => { const f = (fs || []).find(y => y.label === o.dataset.label); if (!f) { o.disabled = false; return; } const li = o.closest('li'), holder = document.createElement('ul'); holder.innerHTML = R.folder_(f, o.dataset.open); (o.textContent.endsWith('more') ? li.parentElement.closest('li') : li).replaceWith(holder.firstElementChild); }).catch(() => { o.disabled = false; }); return; }
+    const vf = e.target && e.target.closest ? e.target.closest('.ws-world-sec .vf') : null;
+    if (vf) { const li = vf.closest('li'); if (li) li.classList.toggle('closed'); return; }
+    const vt = e.target && e.target.closest ? e.target.closest('.vt span[data-view]') : null;
+    if (vt) { view = vt.dataset.view; $('.ws-world-sec').innerHTML = worldHTML(); return; }
+    const sc = e.target && e.target.closest ? e.target.closest('.ws-st > .chev') : null;
+    if (sc) { sc.closest('.ws-st').classList.toggle('folded'); return; }
+    const chev = e.target && e.target.closest ? e.target.closest('.rd-e > .chev') : null;
+    if (chev) { const row = chev.closest('.rd-e'), w = row.querySelector('.rd-w'); if (row.classList.toggle('open') && !w.innerHTML && row.dataset.about) { w.innerHTML = '<span class="s">reading…</span>'; source.unfold(row.dataset.about, 2).then(fs => R.fill(fs || [], null)).then(fs => { w.innerHTML = fs && fs.length ? R.world_(fs, row.dataset.about) : '<span class="s">nothing beneath</span>'; }).catch(() => { w.innerHTML = ''; }); } return; }
+    const a = e.target && e.target.closest ? e.target.closest('.ws-world-sec a.go, .ws-inputs a.go, .ws-tasks a.go') : null;
+    if (a && !(e.metaKey || e.ctrlKey)) { e.preventDefault(); for (const li of el.querySelectorAll('li.sel, .rd-e.sel')) li.classList.remove('sel'); const li = a.closest('li, .rd-e'); if (li) li.classList.add('sel'); inspect(a.dataset.go); }
+  });
+  // anything written beneath the workspace or at a standing redraws it, a moment later; the side at once
+  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; const mine = '/' + node + '/user/workspaces/' + ws; const touched = (msg.touched || []).map(t => '/' + local(t)); if (touched.some(p => p.startsWith(mine) || state.standings.some(st => p === '/' + st.path || p.startsWith('/' + st.path + '/')))) { if (touched.every(p => p.startsWith(mine + '/asks') || p === mine + '/status' || p.startsWith(mine + '/views') || p === mine)) { source.wsRead(ws).then(r => { state = { ...state, ...r }; if (state.name && state.name !== ws) setTitle(state.name); drawSide(); if (state.reading && state.reading.sections.length && view === 'reading') { $('.ws-world-sec').innerHTML = worldHTML(); } }).catch(() => {}); return; } clearTimeout(timer); timer = setTimeout(draw, 2500); } }, { backlog: false });
+  tabs();
+  draw().then(() => { if (opts.add) { const d = kindOf(opts.add); if (d && d.kind === 'path' && !state.standings.some(st => st.path === local(d.path))) drop(d); } });
+  return el;
+}
+
 function mountQueue(el, source, opts = {}) {
   const node = opts.node || '0x11';
   el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><b>web queue</b></div>${opts.chat ? `<a class="sv-back" href="?chat=${esc(opts.chat)}&views=/${esc(node)}/agent/${esc(opts.chat)}">back to chat ${esc(opts.chat)}</a>` : ''}</div><div class="sv-main sv-queue"></div>`;
@@ -1128,11 +1519,13 @@ function start(doc) {
     if (current) { try { current.stop(); } catch (e) { /* already gone */ } current = null; }
     if (el._live) { try { el._live.close(); } catch (e) { /* closed */ } el._live = null; }
     if (el._timer) { clearInterval(el._timer); el._timer = null; }
+    if (el._paste) { root.removeEventListener('paste', el._paste); el._paste = null; }
     el.className = ''; el.innerHTML = '';
     const q = new URLSearchParams(doc.location ? doc.location.search : '');
     const views = local(q.get('views') || ''), who = q.get('who') || '', chat = q.get('chat') || '', at = local(q.get('at') || '');
     let source, mounted;
     if (at) { source = mcpSource({ views: at, who }); mounted = mountRecord(el, source, { at, chat, asof: q.get('asof') || '', talk: new URLSearchParams(root.location.search).get('talk') === '1' }); }
+    else if (q.has('ws')) { const node = local(views).split('/')[0] || '0x11'; source = mcpSource({ views: node, who }); mounted = mountWorkspace(el, source, { ws: q.get('ws') || '', node, add: q.get('add') || '' }); }
     else if (q.get('queue')) { source = mcpSource({ views: '0x11', who }); mounted = mountQueue(el, source, { chat, node: '0x11' }); }
     else { source = mcpSource({ views, who }); mounted = mountViewer(el, source, { crumb: views, views, chat }); }
     current = { stop: () => { if (source.stop) source.stop(); } };
@@ -1150,7 +1543,7 @@ function start(doc) {
   return mount();
 }
 
-const GooLive = { mountViewer, mountRecord, mountQueue, queueHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+const GooLive = { mountViewer, mountRecord, mountWorkspace, kindOf, dropsOf, tabsHTML, tagOf, treeRenderers, mountQueue, queueHTML, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, cursorLine, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
   adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
 root.GooLive = GooLive;
 if (typeof module !== 'undefined') module.exports = GooLive;
