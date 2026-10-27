@@ -150,7 +150,10 @@ award's recipient) and is a known thing when one matches; a path is given only w
 things, exactly as listed; names are spelled so another text about the same thing would spell them the same (a
 place as "City, ST", a product or material by its common name, singular, a company by its name); kinds are one
 plural word; facts are the values the clause states (quantities as numbers, identifiers as text, dates as
-YYYYMMDD); an identifier is never a thing; an absence is never an object ("unknown", "not specified", "none" are
+YYYYMMDD); a slot whose value names a thing is a statement too: the record is the subject, the slot's name the
+relation, the thing the object (city: NEW BRUNSWICK with state: NJ is the record ─city→ "New Brunswick, NJ", a place;
+agency: Department of Defense is the record ─agency→ that agency; parent: a company's name is ─parent→ that company);
+an identifier is never a thing; an absence is never an object ("unknown", "not specified", "none" are
 not things: leave the statement out); a statement is made only where the prose states it, so most records yield
 few, and a page that only lists or advertises yields none; at most eight statements, the most specific first;
 an empty list when the prose states nothing beyond the record's own slots."""
@@ -382,7 +385,9 @@ class WorkspaceHand(Hand):
         rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
         prose = ' '.join(str(rec[k]) for k in ('description', 'text', 'note', 'said', 'quote') if rec.get(k))
         prose = re.sub(r'(May be|Could supply) \[[^\]]*\]( \([^)]*\))?\.?', ' ', prose)      # candidate sentences name, they do not state
-        if len(prose.strip()) < 40:
+        # a record with nothing but identifiers and numbers states nothing; a slot that names something is a statement
+        named_slots = [k for k, v in rec.items() if isinstance(v, str) and k not in ('name', 'note', 'text', 'description', 'source', 'url') and not k.startswith('sys') and re.search(r'[A-Za-z]{3,}', v) and not CODELIKE.match(v) and not v.startswith('/h/')]
+        if len(prose.strip()) < 40 and len(named_slots) < 2:
             return 0
         known = known if known is not None else self.reach(ws)
         by_name = {}
@@ -499,7 +504,8 @@ class WorkspaceHand(Hand):
                 continue
             seen.add(p)
             rec = {k.lstrip('/'): v for k, v in (self.w.read(p, 'x').get('properties') or {}).items()}
-            if any(len(str(rec.get(k) or '')) >= 40 for k in ('description', 'text', 'note')):
+            named = [k for k, v in rec.items() if isinstance(v, str) and k not in ('name', 'source', 'url') and not k.startswith('sys') and re.search(r'[A-Za-z]{3,}', v) and not CODELIKE.match(v) and not v.startswith('/h/')]
+            if any(len(str(rec.get(k) or '')) >= 40 for k in ('description', 'text', 'note')) or len(named) >= 2:
                 out.append(p); read.add(p)
             if len(out) >= REACH_BUDGET:
                 break
