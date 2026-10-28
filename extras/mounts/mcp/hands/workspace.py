@@ -80,11 +80,14 @@ def same_name(name):
     return re.sub(r'\s+', ' ', t).strip()
 
 
+PLURALS = {'people', 'children', 'men', 'women', 'media', 'data', 'series', 'species', 'staff', 'personnel', 'aircraft'}   # plurals the rule below cannot spell
+
+
 def kind_of(word, known=()):
     """The model's kind word as a folder: lowercase, plural, one segment. A singular is spelled plural the way a kind
     already in the namespace spells it, else by the ordinary English rule; a word is never invented."""
     w = segment_of(str(word or '').strip().lower().replace('_', ' ')) or 'things'
-    if w in known or (w.endswith('s') and not w.endswith('ss')):
+    if w in known or w in PLURALS or (w.endswith('s') and not w.endswith('ss')):
         return w
     for cand in (w + 's', w + 'es', (w[:-1] + 'ies') if w.endswith('y') else ''):
         if cand and cand in known:
@@ -467,7 +470,8 @@ class WorkspaceHand(Hand):
         if not key or key in GENERIC or len(key) < 2:
             return None
         with self.lock:
-            had = self.index.get(key)
+            # the same name, or its plural or singular spelling (a concept named once as 'unit', once as 'units')
+            had = self.index.get(key) or self.index.get(key + 's') or (self.index.get(key[:-1]) if key.endswith('s') and not key.endswith('ss') else None)
         if had:
             return had[0]
         with self.lock:
