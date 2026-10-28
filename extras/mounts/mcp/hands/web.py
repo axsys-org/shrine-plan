@@ -404,9 +404,12 @@ def region_paths(ppath, regions):
 
 
 def page_path(node, url):
+    """Where a page stands, spelled the way the live page spells it (one identity per url): the host without www,
+    then the last two segments of the path (index when there are none) and the query's first 40 characters."""
     u = urllib.parse.urlparse(url)
     host = segment_of(u.netloc.replace('www.', ''))
-    slug = segment_of((u.path.strip('/') or 'index')[-60:]) or 'index'
+    tail = '_'.join([seg for seg in u.path.strip('/').split('/') if seg][-2:]) or 'index'
+    slug = segment_of(tail + ('_' + u.query[:40] if u.query else '')) or 'index'
     return '/' + node + '/user' + WEB_SCHEME['land']['page'].format(host=host, slug=slug)
 
 

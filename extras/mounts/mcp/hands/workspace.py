@@ -1,45 +1,40 @@
-"""The workspace hand: the main agent of every workspace. It watches what a person drops into a workspace and does
-the work that follows, each piece in its own thread, writing back into the same world the page is reading:
+"""The workspace hand: the main agent of every workspace. It observes what the workspace holds, reads every source
+the person put in, turns what the sources state into the world's things and statements, researches only what is
+asked and not already answered, and composes the reading.
 
-    /user/workspaces/<ws>/inputs/<n>   a text, a url or a file the person dropped (the page writes it)
-    /user/workspaces/<ws>/world        the overlay cell over the standings (the page writes it)
-    /user/workspaces/<ws>/status       {status, busy}: the main agent's own word on what it is doing (this hand)
-    /user/workspaces/<ws>/asks/t<n>    {task, who, state, detail, found}: one record per piece of delegated work (this hand)
-    /user/workspaces/<ws>/views/reading/v<n>   the composed reading, one version per round (this hand)
-    (asks, status and views are the segments the kernel already treats as machinery beneath a thing: never things,
-    their references never drawn as edges, so the agent's own records never pollute the world they describe)
+The rule: sources are evidence, not ontology. The domain namespace (/user/<kind>/<slug>) holds things of meaning at
+shared names, with their statements beneath them and a source reference on each; the text and bytes of a source live
+in the agent's archive, outside the domain, one click from any statement. Nothing else enters the world: no page
+regions, no excerpts, no name without a statement.
 
-What each drop causes, bounded by the world as it stands:
-    a text or a file   place its names: the model reads the text beside the names the workspace already reaches and
-                       writes each mention back as the path in brackets; the index then holds the references and the
-                       overlay joins what the text names. The first text that states a purpose names the workspace.
-    a topic            a short text with nothing bracketed is searched for: the first pages land by the web scheme, each
-                       written beneath the topic as pages -> page with the engine's snippet as the note, so the overlay
-                       walks from the topic to its pages; the first few are then fetched and digested like any url.
-    a url              fetch the page and land its regions beneath the input, by the page's own heading hierarchy, each
-                       region's hyperlinks kept in its prose; then place the names in the first regions.
-    a path             link what is already known: the record's own note names candidates (May be [path] ...); each is
-                       judged against the record on what both state (street, zip, name, city), and a judgement is
-                       written beneath the record as same -> other, with the sentence of evidence and the source.
-    anything landed    decompose: a record's prose (a description, a note, a region's text) is read for the things it
-                       states. Each thing lands once, at a shared name under the world by its kind and its name
-                       (/user/places/torrance_ca, /user/products/precooler), created with its facts the first time and
-                       kept after; beneath the source a record in the one shape points at it (the kind as the slot, the
-                       clause that states it as the note, the source), so every text that states the same thing meets
-                       at that name. A thing the workspace already knows is pointed at the same way. The records a
-                       standing reaches get the same, a few at a time.
-    after a round      compose the reading: what the workspace asks, read against everything it now reaches, as a
-                       table of contents at <ws>/views/reading: a few sections, each a short heading, under each a few things
-                       with a short name, one line saying why it is there, and the thing as a reference. The page
-                       draws the reading as the tree; the wired world stays beneath every entry. Recomposed after
-                       each round of work as the next version beneath views/reading/, never while one is running; nothing
-                       is culled.
+    /user/workspaces/<ws>                    {name}                                 (the page)
+    /user/workspaces/<ws>/inputs/i<n>        {name, text | url | image} as dropped; this hand adds title, summary, archive
+    /user/workspaces/<ws>/inputs/i<n>/pages/<slug>   {pages: ref(page), note, source}   pages found for a request
+    /user/workspaces/<ws>/asks/t<n>          {task, who, state, detail, found, about}   one record per piece of work, kept
+    /user/workspaces/<ws>/status             {status, busy}
+    /user/workspaces/<ws>/views/reading/v<n> the composed reading, one version per round
+    /user/<kind>/<slug>                      a thing: {name}; the kind is the model's own plural word (people, companies, places...)
+    /user/<kind>/<slug>/<relation>/<slug>    a statement beneath its subject: {<relation>: ref(object) | value, note, source}
+    /user/web/pages/<host>/<slug>            a page's identity: {name, url, title, summary, archive}
+    /agent/hands/workspace/archive/<slug>    the evidence: {text | image, url}, outside the domain
 
-Nothing is stored that the kernel can read off the records; the hand writes only notes with references, judgements,
-its task records and its status line. OPENROUTER_API_KEY in the environment; the model is --model or
-WORKSPACE_MODEL (a fast one by default). python3 workspace.py <base> [--node 0x11] [--model ...] [--once]
+Per line on the stream:
+    an input           observed with the rest of the workspace. A file (image) is transcribed by the vision model; a
+                       url is read; a pasted record's own slots are read as statements; a text is judged: a source is
+                       read like a page, a request is planned against what the workspace already holds, after every
+                       other input has been read.
+    reading a source   the names the source uses are matched against what the namespace already holds (a name already
+                       known, in any kind, is that thing, and the model is told so); one model call per source (long
+                       ones in chunks) yields the things it names, each with its kind, and the statements it makes:
+                       subject, relation, object or value, the sentence as the note; concepts and the things that
+                       instance them are tied by "is a". Statements land beneath the subject, idempotent; a second
+                       source for the same statement lands as evidence beneath it. A thing with no statement never lands.
+    a request          planned against the workspace: sub-questions only for what the inputs do not already answer, none
+                       into a private person's own records; each is searched with the page text returned in the hit,
+                       each hit judged against the question and read in one call; only a page that answered lands (its
+                       identity, its statements, its text archived), referenced beneath the request; one follow-up
+                       round on the gaps; then the reading.
 """
-import concurrent.futures
 import importlib.util
 import json
 import os
@@ -47,6 +42,7 @@ import re
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 _here = os.path.dirname(os.path.abspath(__file__))
 def _load(name):
@@ -58,36 +54,23 @@ _web = _load('web')
 
 ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 DEFAULT_MODEL = os.environ.get('WORKSPACE_MODEL') or 'google/gemini-2.5-flash'
-WORKERS = 4
-REGIONS_PLACED = 8          # the first regions of a fetched page get their names placed; the rest wait for a reader
-REGIONS_DECOMPOSED = 4      # the first regions of a fetched page are decomposed into the things they state
-REACH_BUDGET = 6            # records the workspace reaches that are decomposed per round, nearest to any standing first
-ABSENT = re.compile(r'^(unknown|none|n/?a|not (specified|established|found|available|stated|known)|no (specific|known)?\s*\w*|unspecified|unclear|various|other|tbd)\b', re.I)
-GENERIC = {'company', 'companies', 'contract', 'contracts', 'product', 'products', 'material', 'materials', 'application', 'applications',
-           'institution', 'institutions', 'facility', 'facilities', 'technology', 'technologies', 'equipment', 'system', 'systems', 'solution',
-           'solutions', 'service', 'services', 'market', 'markets', 'capability', 'capabilities', 'research', 'development', 'industry',
-           'customer', 'customers', 'supplier', 'suppliers', 'partner', 'partners', 'people', 'place', 'places', 'thing', 'things', 'item', 'items'}
-
-
-def generic(name, kind):
-    """A word that names a kind, not a thing: 'company', 'materials', 'applications' are never things."""
-    t = same_name(name)
-    return (not t) or t in GENERIC or t == same_name(kind) or t + 's' == same_name(kind) or (len(t.split()) == 1 and str(name).strip()[:1].islower() and len(t) < 14)
-
-
-NOT_RELATIONS = {'name', 'note', 'source', 'sources', 'sys', 'same', 'unresolved', 'unknown', 'status', 'state', 'about', 'is', 'has'}
-WORLD_CACHE = 20.0          # seconds a workspace's world read is reused across jobs
-THINGS = 8                  # things taken out of one record's prose, at most
-TOPIC = 160                 # a text no longer than this, with nothing bracketed, is a topic to search for
-FOUND = 5                   # pages a search lands beneath a topic
-FETCHED = 3                 # of which the first are fetched and digested at once
-CANDIDATES = 6              # candidates judged per path
-BRACKET = re.compile(r'\[(/[^\]\s]+)\]')
-CODELIKE = re.compile(r'^[A-Z]{0,6}\s*\d[\d\-]{4,}$|^(EPA ECHO|NAICS|SIC|CAGE|UEI|DUNS|CIK|LEI)\b', re.I)
-STATES = {'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR', 'california': 'CA', 'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE', 'florida': 'FL', 'georgia': 'GA', 'hawaii': 'HI', 'idaho': 'ID', 'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA', 'kansas': 'KS', 'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD', 'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS', 'missouri': 'MO', 'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH', 'oklahoma': 'OK', 'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC', 'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT', 'vermont': 'VT', 'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV', 'wisconsin': 'WI', 'wyoming': 'WY', 'district of columbia': 'DC'}
-
-
+WORKERS = 8                 # jobs (an input, a request) at once, across workspaces
+SEARCH_LIMIT = 5            # hits per sub-question, each with its page text
+SUBQUESTIONS = 4            # sub-questions a request is split into, at most
+ROUNDS = 2                  # search rounds per request: the plan, then one follow-up on the gaps
+CHUNK = 9000                # characters of a source read in one model call: a reply must fit the model's answer
+TEXT_CAP = 120000           # characters of a source archived
+NOTE = 220
+KNOWN_CAP = 80              # known things shown to the model with a source
+BIG = 400                   # a kind with more records than this is a registry bucket, not consulted whole
 LEGAL = re.compile(r"\b(incorporated|inc|corporation|corp|company|co|llc|l\.l\.c|ltd|limited|plc|lp|llp|gmbh|s\.?p\.?a|s\.?a)\b\.?", re.I)
+GENERIC = {'company', 'companies', 'organization', 'organizations', 'product', 'products', 'material', 'materials', 'thing', 'things',
+           'item', 'items', 'people', 'person', 'place', 'places', 'document', 'documents', 'record', 'records', 'page', 'pages',
+           'system', 'systems', 'service', 'services', 'solution', 'solutions', 'equipment', 'technology', 'technologies',
+           'information', 'data', 'website', 'web site', 'contact', 'contacts', 'other', 'others', 'various', 'none', 'unknown', 'it', 'they'}
+RESERVED = {'name', 'note', 'source', 'sources', 'sys', 'same', 'status', 'state', 'about', 'pages', 'inputs', 'asks', 'views',
+            'world', 'title', 'summary', 'text', 'url', 'image', 'fetched', 'value', 'evidence', 'archive'}
+NOT_KINDS = {'workspaces', 'web', 'registries'}
 
 
 def same_name(name):
@@ -97,95 +80,124 @@ def same_name(name):
     return re.sub(r'\s+', ' ', t).strip()
 
 
-def place_name(name):
-    """A place's identity is its city and state: 'Rockledge, Florida' and 'Rockledge, FL' are one name."""
-    m = re.match(r'^\s*([^,]+?)\s*,\s*([A-Za-z .]+?)\s*$', name)
-    if not m:
-        return name
-    city, st = m.group(1), m.group(2).strip()
-    code = STATES.get(st.lower()) or (st.upper() if len(st) == 2 else None)
-    return f'{city}, {code}' if code else name
-MAYBE = re.compile(r'May be \[(/[^\]\s]+)\]')
+def kind_of(word, known=()):
+    """The model's kind word as a folder: lowercase, plural, one segment. A singular is spelled plural the way a kind
+    already in the namespace spells it, else by the ordinary English rule; a word is never invented."""
+    w = segment_of(str(word or '').strip().lower().replace('_', ' ')) or 'things'
+    if w in known or (w.endswith('s') and not w.endswith('ss')):
+        return w
+    for cand in (w + 's', w + 'es', (w[:-1] + 'ies') if w.endswith('y') else ''):
+        if cand and cand in known:
+            return cand
+    if w.endswith('y') and len(w) > 2 and w[-2] not in 'aeiou':
+        return w[:-1] + 'ies'
+    if w.endswith(('s', 'x', 'z', 'ch', 'sh')):
+        return w + 'es'
+    return w + 's'
 
 
-def call_model(model, system, user, timeout=120):
+def ref(path, care='x'):
+    return {'type': 'reference', 'value': '/h/%s/0/%d%s' % (care, len(path.split('/')) - 1, path)}
+
+
+PART = 8000                 # a value longer than this is kept as parts <slot>/<n>: a read shows a value over 8 KB only by size
+
+
+def whole(rec, key):
+    """A value that may be kept as parts: the slot itself when it is a string, else its parts in order."""
+    v = rec.get(key)
+    if isinstance(v, str):
+        return v
+    parts = sorted(((int(k.rsplit('/', 1)[-1]), rec[k]) for k in rec if k.startswith(key + '/') and k.rsplit('/', 1)[-1].isdigit() and isinstance(rec[k], str)), key=lambda x: x[0])
+    return ''.join(p for _, p in parts)
+
+
+def parted(key, value):
+    """The slots a value is written as: the slot itself when short, else parts."""
+    value = str(value or '')
+    if len(value) <= PART:
+        return {key: value} if value else {}
+    return {key + '/' + str(i): value[j:j + PART] for i, j in enumerate(range(0, len(value), PART))}
+
+
+def call_model(model, system, user, image=None, timeout=150, max_tokens=16000):
+    """One JSON answer from the model; `image` is a data URL shown with the text."""
     key = os.environ.get('OPENROUTER_API_KEY') or ''
     headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key}
-    body = json.dumps({'model': model, 'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
-                       'temperature': 0, 'max_tokens': 4000, 'response_format': {'type': 'json_object'}}).encode()
+    content = user if not image else [{'type': 'text', 'text': user}, {'type': 'image_url', 'image_url': {'url': image}}]
+    body = json.dumps({'model': model, 'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': content}],
+                       'temperature': 0, 'max_tokens': max_tokens, 'response_format': {'type': 'json_object'}}).encode()
     reply = json.load(urllib.request.urlopen(urllib.request.Request(ENDPOINT, body, headers), timeout=timeout))
     text = (reply.get('choices') or [{}])[0].get('message', {}).get('content') or '{}'
     start = text.find('{')
     if start < 0:
         return {}
-    obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return {}
     return obj if isinstance(obj, dict) else {}
 
 
-PLACE = """You find the names in a text: every meaningful thing it mentions, so each can become a name in a world of records.
-You are given the text and the things the reader already knows, each as a path, a name and a kind. Reply with one
-JSON object: {"mentions": [{"text": "<the words as they appear in the text, exactly>", "name": "<the thing's own
-name, spelled so another text about it would spell it the same: a place as 'City, ST' or 'City, Country' or the
-country or region itself; a company by its name; a person by full name; a product, material, component or
-technology by its common name, singular>", "kind": "<one plural word: companies, places, people, products,
-materials, components, technologies, agencies, programs, vehicles, standards, events, and the like>", "path":
-"<the known thing's path when this mention is one of them, else null>"}], "title": "<if the text states what the
-reader is trying to do, a short title for that work, at most six words, else null>"}. Rules: proper nouns and
-meaningful noun phrases, never ordinary words ("cooling" no, "environmental control unit" yes); never an identifier
-alone (an award number, a code) and never an amount or a date; a path only when the mention clearly is that known
-thing, by name and kind, never by resemblance; one entry per distinct thing, the first words it appears as; at most
-twenty-four, the most specific first."""
+READ = """You read one source into the world's ontology: the things it names and the statements it makes about them. Reply with
+one JSON object:
+{"title": "<what the source is, a few words>", "summary": "<one sentence: what it says>",
+ "things": [{"name": "<canonical name>", "kind": "<a plural common noun: people, companies, agencies, places, products,
+   documents, events, programs, laws, materials, concepts, ...>", "aliases": ["<other spellings used in the source>"]}],
+ "statements": [{"subject": "<a thing's name>", "relation": "<a short relation: makes, located in, part of, issued by, born on,
+   is a, works for, capacity, ...>", "object": "<a thing's name>" OR "value": "<a date, number, amount, identifier or short
+   phrase>", "note": "<the sentence or clause of the source that states it>"}]}
+What a thing is: anything the source names specifically and that another source could name again: every person, organization,
+place, product or model, document, event, program, law, and every concept it uses as a class of things (an environmental
+control unit; a military environmental control unit as a narrower concept). A specific product is tied to its concept by an
+"is a" statement, a narrower concept to the broader one the same way. Resolve pronouns and references ("the company", "it",
+"she") to the thing meant. Not things: generic words (customers, the product line), identifiers, dates, amounts, quantities,
+specifications, which are values of a statement (capacity: 5 ton). A thing that is the same as a KNOWN thing is given the
+KNOWN name exactly; spell every other name short and canonical, without descriptions. Every thing appears in at least one
+statement. Every statement is one fact the source states, with its own sentence as the note, never a guess or a summary. Be
+exhaustive: a long source yields many statements. Reply with the JSON only."""
 
-JUDGE = """You judge whether two registry records are the same real-world thing. You are given the record a person stands on
-and one candidate, each as the facts the registry states (name, street, city, state, zip, identifiers), and the
-sentence that proposed the candidate. Two records are the same thing only when their stated identifiers agree
-beyond a shared name: the same street and zip, or the same identifier, or a parent/child relation the records
-themselves state. A name alone is never enough. Reply with one JSON object: {"same": true | false, "why": "<one
-sentence naming the fields that agree, in the records' own words, or why not>"}."""
+OBSERVE = """You are the main agent of a research workspace. You are given the whole workspace: what the person put in (files,
+pages, pasted records, texts, each with what has been read from it so far), the statements the workspace holds, and the new
+text that just arrived. Decide what the new text is and what to do next. Reply with one JSON object:
+{"is": "request" | "source",
+ "about": "<one line: what the request is actually about, naming the specific things in the workspace it concerns>",
+ "answered_by_workspace": true|false,
+ "questions": ["<0-4 web search queries, each precise (names, places, years), only for what the workspace's own sources do
+   not answer; empty when the inputs already answer the request, or when research would mean looking up a private person's
+   own records>"],
+ "title": "<a short name for the workspace if the text states its purpose, else empty>"}
+A request asks the agent to find out, investigate, compare, rank, check, explain or research something. A source states facts
+itself. Search is one operation among others, never the default: a request about a document in the workspace is answered from
+that document first; sub-questions are about the specific things named there, not about the general subject. Never plan a
+search for a private individual's birth, medical, financial or similar personal records; public procedure or the public record
+of organizations is fine."""
 
+JUDGE = """You judge one web page against a question and read it into the world's ontology. Reply with one JSON object:
+{"relevant": true|false, "why": "<one short line: what it says that bears on the question, or why it does not>",
+ "title": "<the page's subject, a few words>", "summary": "<one sentence>",
+ "things": [{"name": "...", "kind": "...", "aliases": []}],
+ "statements": [{"subject": "...", "relation": "...", "object": "..." OR "value": "...", "note": "<the sentence>"}]}
+Things are specifically named people, organizations, places, products, documents, events, programs and the concepts the page
+uses as classes of things; a product is tied to its concept by "is a". Values (dates, amounts, identifiers, specifications)
+belong to statements. A thing the same as a KNOWN thing is given the KNOWN name exactly. Every statement carries the sentence
+that states it as its note; resolve pronouns. Read what bears on the question or on the things the question names; an
+irrelevant page (a directory, an unrelated topic, a login wall, an empty shell) is {"relevant": false, ...} with empty lists."""
 
-DECOMPOSE = """You read a record's prose for the statements it makes, each a subject, a relation and an object. You are given one
-record (its path and its slots, some of them prose) and the things the reader already knows, each with its path, its
-name and its kind. Reply with one JSON object: {"statements": [{"subject": {"name": "...", "kind": "...", "path": "...
-or null"}, "relation": "<one lowercase plural word from the record's own vocabulary: products, applications,
-facilities, suppliers, customers, parts, materials, places, people, dates, amounts, and the like>", "object":
-{"name": "...", "kind": "...", "path": "... or null"}, "facts": {"<slot>": <value>}, "sentence": "<the clause of the
-prose that states it, verbatim>"}]}. Rules: only what the prose states, never a summary or a guess; the subject is
-the thing the clause is about, which is usually the record's own subject (a page's company, a region's topic, an
-award's recipient) and is a known thing when one matches; a path is given only when the thing is one of the known
-things, exactly as listed; names are spelled so another text about the same thing would spell them the same (a
-place as "City, ST", a product or material by its common name, singular, a company by its name); kinds are one
-plural word; facts are the values the clause states (quantities as numbers, identifiers as text, dates as
-YYYYMMDD); a slot whose value names a thing is a statement too: the record is the subject, the slot's name the
-relation, the thing the object (city: NEW BRUNSWICK with state: NJ is the record ─city→ "New Brunswick, NJ", a place;
-agency: Department of Defense is the record ─agency→ that agency; parent: a company's name is ─parent→ that company);
-an identifier is never a thing; an absence is never an object ("unknown", "not specified", "none" are
-not things: leave the statement out); a statement is made only where the prose states it, so most records yield
-few, and a page that only lists or advertises yields none; at most eight statements, the most specific first;
-an empty list when the prose states nothing beyond the record's own slots."""
+GAPS = """You are the main agent of a research workspace. Given the request, the sub-questions already searched, and the
+statements found so far, name what is still missing. Reply with one JSON object: {"questions": ["<0-3 new, more specific web
+search queries that would settle what is still unknown; none if the request is answered, or nothing more can be found on the
+web, or what is missing is a private person's own records>"], "unknown": ["<what remains unknown, one short line each>"]}."""
 
-
-COMPOSE = """You compose the reading of a research workspace: the answer to what the person asked, laid out as a short table of
-contents over what is now known. You are given the person's inputs (texts, in order) and the things the workspace
-reaches, each with its path, its name, its kind, a few stated facts, and what the world says about it by how it is
-said: "stated" (a relation a record asserts, with its source), "named_in" (texts that merely mention it: nothing
-asserted), "same_as" (identities judged on stated identifiers). Only "stated" and "same_as" are evidence; a mention
-is a lead. Award totals, obligations and revenue are never evidence of what a company can build. Reply with one JSON object:
-{"title": "<the workspace's title, at most six words, or null to keep it>", "sections": [{"heading": "<one to three
-words>", "entries": [{"path": "<a path from the list>", "name": "<the thing in one to four words>", "line": "<at most
-fourteen words: the decisive stated fact, with its number or identifier when there is one>"}]}]}. Rules: at most six
-sections, at most six entries each; every path from the list, never invented; the first section answers the
-question directly, ranked best first, holding only things with direct evidence for the very thing asked (an award
-or a product statement for that equipment, a plant judged theirs); related equipment that is not the thing asked
-(a cooling cart is not an environmental control unit) goes under a section named "Related", each line saying how it
-differs; then the sources the answer rests on; then "Unresolved": what is named but not judged, or asked but not
-found, each line saying what would settle it; a thing appears once in the whole reading, where it matters most; a
-line never restates the thing's name or kind; plain words, no jargon, no markdown."""
-
-
-def machinery(path):
-    """A workspace's own reading, tasks and status are never things: they are about things."""
-    return bool(re.search(r'/user/workspaces/[^/]+/(views|asks|status)(/|$)', path))
+COMPOSE = """You compose the reading of a research workspace: the answer to what the person asked (or, with no request, what the
+sources state), as a short table of contents. You are given the request(s), the sources, and the things the workspace holds,
+each with its path and its statements. Reply with one JSON object:
+{"title": "<a short title for the workspace>", "sections": [{"heading": "<a few words>", "entries": [{"path": "<the path of a
+thing from the list>", "name": "<its name>", "line": "<one plain line: the decisive fact about it here, from the statements>"}]}]}
+The first section answers the request directly (ranked, if ranking was asked); later sections hold what supports it; a final
+section "Unresolved" names what the statements do not settle, as things whose line says what is missing. At most five sections,
+at most six entries each; a thing appears once, where it matters most; every path from the list, never invented; lines carry
+facts from the statements, plain words, no jargon, no markdown."""
 
 
 class WorkspaceHand(Hand):
@@ -193,42 +205,35 @@ class WorkspaceHand(Hand):
     every = 30.0
 
     def __init__(self, world, log=print, **overrides):
-        super().__init__(world, log, **overrides)
-        self.model = self.setting('model') or DEFAULT_MODEL
-        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
-        self.lock = threading.Lock()
-        self.known = {}             # ws -> set of standing paths already linked
-        self.busy = {}              # ws -> count of jobs in flight
-        self.dirty = set()          # workspaces whose reading is stale
-        self.worlds = {}            # ws -> (time, nodes): the world read, reused for a while across jobs
-        self.facts = {}             # path -> the record's few stated facts, read once
-        self.read_once = {}         # ws -> records already read for their statements
+        super().__init__(world, log=log, **overrides)
         self.root = '/' + world.node + '/user/workspaces/'
+        self.archive_root = self.home + '/archive/'
+        self.model = self.setting('model', DEFAULT_MODEL)
+        self.pool = ThreadPoolExecutor(int(self.setting('workers', WORKERS)))   # jobs
+        self.inner = ThreadPoolExecutor(12)                                      # sub-questions of a request
+        self.io = ThreadPoolExecutor(24)                                         # model calls over hits and chunks
+        self.lock = threading.Lock()
+        self.busy = {}              # ws -> jobs running
+        self.dirty = set()          # workspaces whose reading is stale
+        self.known = {}             # ws -> set of standings already digested
+        self.index = {}             # same_name -> (path, kind, name): what the namespace holds, by name
+        self.indexed = 0            # when the index was last read whole
+        self.found = {}             # ws -> [statement] landed this session, for the reading
         self.settle_interrupted()
+        self.load_index()
 
-    # ---- a task left working by an earlier run of the hand is over: say so, so the page stops waiting on it
+    # ---- the stream
     def settle_interrupted(self):
+        """Tasks left working by a hand that died are marked so; nothing is taken up twice."""
         try:
             for ws in (self.w.read(self.root.rstrip('/'), 'y', limit=200).get('children') or []):
-                for t in (self.w.read(ws['path'] + '/asks', 'y', limit=200).get('children') or []):
+                for t in (self.w.read(ws['path'] + '/asks', 'y', limit=500).get('children') or []):
                     props = t.get('properties') or {}
                     if props.get('/state') == 'working' and props.get('/who') == self.name:
-                        self.write([{'path': t['path'], 'slots': {'state': 'done', 'found': 'interrupted; taken up again if still needed'}, 'action': 'poke'}])
+                        self.write([{'path': t['path'], 'slots': {'state': 'done', 'found': 'interrupted'}, 'action': 'poke'}])
         except Exception as e:
             self.log(f'{self.name}: settle: {e}')
 
-    def world(self, ws):
-        """The workspace's world, read once and reused for a while: every job in a round reads the same picture."""
-        with self.lock:
-            had = self.worlds.get(ws)
-            if had and time.time() - had[0] < WORLD_CACHE:
-                return had[1]
-        nodes = self.w.read('/x' + self.root + ws + '/world', 'z', limit=500)
-        with self.lock:
-            self.worlds[ws] = (time.time(), nodes)
-        return nodes
-
-    # ---- the world's lines: what a person dropped, and what now stands
     def line(self, item):
         who = item.get('who') or ''
         if who == self.name:
@@ -241,21 +246,14 @@ class WorkspaceHand(Hand):
             rest = p[len(self.root):].split('/')
             ws = rest[0]
             if len(rest) == 3 and rest[1] == 'inputs' and who == 'person':
-                self.submit(ws, self.digest_input, ws, p); did += 1
+                self.submit(ws, self.digest, ws, p); did += 1
             elif len(rest) == 2 and rest[1] == 'world':
-                with self.lock:
-                    self.worlds.pop(ws, None)
                 for st in self.standings(ws):
-                    if st not in self.known.setdefault(ws, set()) and not st.startswith(self.root):
+                    if st not in self.known.setdefault(ws, set()) and not st.startswith(self.root) and not st.startswith('/x/'):
                         self.known[ws].add(st)
-                        # a page landed by the web scheme, not yet fetched, is fetched; any other standing is linked
-                        rec = {k.lstrip('/'): v for k, v in (self.w.read(st, 'x').get('properties') or {}).items()}
-                        if rec.get('url') and not rec.get('fetched') and not rec.get('text'):
-                            self.submit(ws, self.digest_input, ws, st); did += 1
-                        else:
-                            self.submit(ws, self.link_path, ws, st); did += 1
+                        self.submit(ws, self.digest, ws, st); did += 1
         if did:
-            self.mark_seen()        # at once, so a restart does not take the same lines up again
+            self.mark_seen()
         return did
 
     def standings(self, ws):
@@ -267,7 +265,7 @@ class WorkspaceHand(Hand):
                 out.append(m.group(1))
         return out
 
-    # ---- the main agent: a status line, and work delegated to threads
+    # ---- the main agent: a status line, work in threads, a reading when the round ends
     def status(self, ws, text, busy=None):
         slots = {'status': text}
         if busy is not None:
@@ -280,9 +278,9 @@ class WorkspaceHand(Hand):
     def submit(self, ws, fn, *args):
         with self.lock:
             self.busy[ws] = self.busy.get(ws, 0) + 1
-        self.status(ws, 'Reading new input', True)
-        if fn != self.compose:            # == : a bound method is a new object on every access
+        if fn != self.compose:
             self.dirty.add(ws)
+            self.status(ws, 'Reading new input', True)
         def run():
             try:
                 fn(*args)
@@ -305,294 +303,361 @@ class WorkspaceHand(Hand):
             page = self.w.read(folder, 'y', limit=500)
             n = 1 + max([0] + [int(m.group(1)) for c in (page.get('children') or []) for m in [re.search(r'/t(\d+)$', c['path'])] if m])
             path = folder + '/t%d' % n
-            slots = {'task': title, 'who': self.name, 'state': 'working', 'detail': detail}
+            slots = {'task': title[:90], 'who': self.name, 'state': 'working', 'detail': detail[:90]}
             if about:
-                slots['about'] = {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(about.split('/')) - 1, about)}
+                slots['about'] = ref(about)
             self.write([{'path': path, 'slots': slots}])
         return path
 
     def done(self, path, found):
-        self.write([{'path': path, 'slots': {'state': 'done', 'found': found}, 'action': 'poke'}])
+        self.write([{'path': path, 'slots': {'state': 'done', 'found': str(found)[:200]}, 'action': 'poke'}])
 
-    # ---- what the workspace reaches: names with a few facts, for the model to place
-    def reach(self, ws):
-        nodes = self.world(ws)
-        things = {}
-        def visit(n):
-            props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
-            m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
-            # the workspace's own records (its inputs, its tasks, its reading) are not things to name in a text
-            if m and props.get('name') and not m.group(1).startswith('/x/') and not m.group(1).startswith(self.root):
-                things.setdefault(m.group(1), props['name'])
-            for c in n.get('children') or []:
-                visit(c)
-        visit(nodes)
+    def record(self, path):
+        return {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
+
+    def archive(self, key, slots):
+        """The evidence itself, kept outside the domain: the text or image of a source, with its url."""
+        path = self.archive_root + (segment_of(key) or 'source')
+        flat = {}
+        for k, v in slots.items():
+            flat.update(parted(k, v))
+        self.write([{'path': path, 'slots': flat, 'action': 'set'}])
+        return path
+
+    # ---- digesting an input or a standing
+    def digest(self, ws, path):
+        rec = self.record(path)
+        name = str(rec.get('name') or path.rsplit('/', 1)[-1])
+        image = whole(rec, 'image')
+        if image:
+            t = self.task(ws, 'Read ' + name[:60], 'Auto · document', about=path)
+            reply = call_model(self.model, 'You transcribe a document image. Reply JSON {"title": "<what the document is, a few words>", '
+                               '"text": "<everything it says, in reading order, as markdown; tables as tables; stamps, seals and '
+                               'handwriting too, marked [handwritten]; nothing invented>"}', 'Transcribe this document.', image=image)
+            text = str(reply.get('text') or '').strip()
+            if not text:
+                self.done(t, 'nothing legible'); return
+            title = str(reply.get('title') or name)[:120]
+            kept = self.archive(ws + ' ' + path.rsplit('/', 1)[-1] + ' ' + name[:40], {'name': name, 'image': image, 'text': text[:TEXT_CAP]})
+            # the input keeps its identity and what was read; the bytes live in the archive
+            self.write([{'path': path, 'slots': {'name': name, 'title': title, 'archive': ref(kept)}, 'action': 'set'}])
+            self.done(t, f'{title}: {len(text)} characters read')
+            self.read_source(ws, path, text, title, 'Read what ' + title[:40] + ' states')
+            return
+        if rec.get('url') and not rec.get('title'):
+            t = self.task(ws, 'Read ' + str(rec['url'])[:70], 'Auto · page', about=path)
+            try:
+                title, text = self.fetch(str(rec['url']))
+            except Exception as e:
+                self.done(t, 'fetch failed: ' + str(e)[:80]); return
+            kept = self.archive(ws + ' ' + path.rsplit('/', 1)[-1] + ' ' + name[:40], {'name': title[:120], 'url': str(rec['url']), 'text': text[:TEXT_CAP]})
+            self.write([{'path': path, 'slots': {'title': title[:120], 'archive': ref(kept)}, 'action': 'poke'}])
+            self.done(t, f'{len(text)} characters')
+            self.read_source(ws, path, text, title, 'Read what ' + (title or name)[:40] + ' states')
+            return
+        text = whole(rec, 'text')
+        if not text.strip():
+            if not path.startswith(self.root):
+                # a pasted record: its fields are its statements
+                text = '\n'.join(f'{k}: {v}' for k, v in rec.items() if k not in RESERVED and not str(v).startswith('/h/') and str(v).strip())
+                if text:
+                    self.read_source(ws, path, name + '\n' + text, name, 'Read ' + name[:50])
+            return
+        if path.startswith(self.root) and not rec.get('url') and not image and not rec.get('summary'):
+            self.wait_for_reads(ws, path)
+            plan = self.observe(ws, path, text)
+            if plan.get('is') == 'request':
+                self.research(ws, path, text, plan)
+                return
+        self.read_source(ws, path, text, name, 'Read ' + name[:50])
+
+    def wait_for_reads(self, ws, me, limit=150):
+        """A request is planned after every other input of the workspace has been read (a file, a page): the plan sees them."""
+        deadline = time.time() + limit
+        while time.time() < deadline:
+            unread = False
+            for c in (self.w.read(self.root + ws + '/inputs', 'y', limit=100).get('children') or []):
+                pr = c.get('properties') or {}
+                if c['path'] != me and (any(k == '/image' or k.startswith('/image/') for k in pr) or (pr.get('/url') and not pr.get('/title'))):
+                    unread = True
+            if not unread:
+                return
+            time.sleep(3)
+
+    def fetch(self, url):
+        """A page as text: Firecrawl's markdown of the main content; our own fetch when there is no key."""
+        if _web.firecrawl_key():
+            d = _web.firecrawl('/scrape', {'url': url, 'formats': ['markdown'], 'onlyMainContent': True}, timeout=90)
+            data = d.get('data') or {}
+            md = str(data.get('markdown') or '')
+            if md.strip():
+                return str((data.get('metadata') or {}).get('title') or url)[:120], md
+        markup, _ = _web.fetch_page(url)
+        title, regions = _web.page_regions(markup, url)
+        return title or url, '\n\n'.join((('## ' + r['heading'] + '\n') if r.get('heading') else '') + r['text'] for r in regions)
+
+    # ---- what the namespace holds, by name: the guide for every reading
+    def load_index(self):
+        """Every thing under /user/<kind>, by the spelling names share; registry buckets and the web are left out."""
+        index = {}
+        try:
+            for k in (self.w.read('/' + self.w.node + '/user', 'y', limit=200).get('children') or []):
+                kind = k['path'].rsplit('/', 1)[-1]
+                if kind in NOT_KINDS:
+                    continue
+                page = self.w.read(k['path'], 'y', limit=BIG + 1)
+                kids = page.get('children') or []
+                if len(kids) > BIG:
+                    continue
+                for c in kids:
+                    n = (c.get('properties') or {}).get('/name')
+                    if n:
+                        index.setdefault(same_name(n), (c['path'], kind, str(n)))
+        except Exception as e:
+            self.log(f'{self.name}: index: {e}')
+        with self.lock:
+            for key, v in index.items():
+                self.index.setdefault(key, v)
+            self.indexed = time.time()
+
+    def known_in(self, text):
+        """The known things a source mentions: their names appear in its text. The model is told to reuse them."""
+        low = ' ' + re.sub(r'[^a-z0-9 ]+', ' ', str(text).lower()) + ' '
+        low = re.sub(r'\s+', ' ', low)
+        with self.lock:
+            items = list(self.index.items())
         out = []
-        for p, name in list(things.items())[:60]:
-            if p not in self.facts:
-                try:
-                    rec = {k.lstrip('/'): v for k, v in (self.w.read(p, 'x').get('properties') or {}).items()}
-                except Exception:
-                    rec = {}
-                self.facts[p] = {k: str(rec[k])[:60] for k in ('city', 'state', 'zip', 'street', 'uei', 'applicant', 'inventors', 'url', 'agency', 'amount', 'obligated') if rec.get(k)}
-            out.append({'path': p, 'name': str(name)[:80], 'kind': (p.split('/')[-2] if p.count('/') > 2 else ''), 'facts': self.facts[p]})
+        for key, (path, kind, name) in items:
+            if len(key) >= 3 and (' ' + key + ' ') in low:
+                out.append({'name': name, 'kind': kind})
+                if len(out) >= KNOWN_CAP:
+                    break
         return out
 
-    def place(self, ws, path, text, title_wanted):
-        """The names in a text, every meaningful one, each placed: a known thing when the mention clearly is one, a
-        record spelling the same name, else a minimal record at its shared name under the world, with the text as
-        its source. The text is written back with each mention followed by its path in brackets: the index then holds
-        the references, the overlay follows them, and the thing's page says what names it."""
-        known = self.reach(ws)
-        by_name = {}
-        for k in known:
-            by_name.setdefault(same_name(k['name']), k['path'])
-        reply = call_model(self.model, PLACE, json.dumps({'text': text, 'things': [{'path': k['path'], 'name': k['name'], 'kind': k.get('kind') or ''} for k in known[:80]]}))
-        mentions = [m for m in (reply.get('mentions') or []) if isinstance(m, dict) and str(m.get('text') or '').strip() and str(m.get('name') or '').strip()][:24]
-        ref = lambda p: {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(p.split('/')) - 1, p)}
-        records, placed, done, out = [], 0, set(), text
-        for m in mentions:
-            words = str(m['text']).strip()
-            name = str(m['name']).strip()[:60]
-            kind = segment_of(str(m.get('kind') or 'things').strip().lower()) or 'things'
-            if CODELIKE.match(name) or ABSENT.match(name) or generic(name, kind) or kind in ('identifiers', 'codes', 'ids', 'amounts', 'dates'):
-                continue
-            if kind == 'places':
-                name = place_name(name)
-            target = m.get('path') if isinstance(m.get('path'), str) and m['path'].startswith('/') and m['path'] != path and not machinery(m['path']) else None
-            target = target or by_name.get(same_name(name)) or self.shared_names(kind).get(same_name(name))
-            if not target:
-                target = '/' + self.w.node + '/user/' + kind + '/' + (segment_of(name) or 'thing')
-                if target not in done and not self.w.read(target, 'x').get('exists'):
-                    records.append({'path': target, 'slots': {'name': name, 'source': ref(path)}})
-            done.add(target)
-            if '[' + target + ']' in out:
-                continue
-            # the bracket goes after the first occurrence of the words, once
-            i = out.find(words)
-            if i < 0:
-                continue
-            j = i + len(words)
-            if out[j:j + 2] == ' [':
-                continue
-            out = out[:j] + ' [' + target + ']' + out[j:]
-            placed += 1
-        if records:
-            self.write(records)
-        if placed and out != text:
-            self.write([{'path': path, 'slots': {'text': out}, 'action': 'poke'}])
-        title = reply.get('title')
-        if title_wanted and isinstance(title, str) and 2 < len(title) < 60:
-            self.write([{'path': self.root + ws, 'slots': {'name': title.strip()}, 'action': 'poke'}])
-            return placed, title.strip()
-        return placed, None
+    def read_source(self, ws, source, text, title, task_title):
+        t = self.task(ws, task_title, 'Auto · reading', about=source)
+        chunks = [text[i:i + CHUNK] for i in range(0, min(len(text), CHUNK * 4), CHUNK)] or ['']
+        known = self.known_in(text)
+        def one(chunk):
+            # a reply that does not parse (cut off, or refused) is tried again on each half of the chunk
+            try:
+                r = call_model(self.model, READ, json.dumps({'KNOWN': known, 'title': title, 'source': chunk}))
+            except Exception as e:
+                self.log(f'{self.name}: read: {e}'); r = {}
+            if not r.get('statements') and len(chunk) > 2000:
+                h = len(chunk) // 2
+                a, b = one(chunk[:h]), one(chunk[h:])
+                return {'summary': a.get('summary') or b.get('summary') or '', 'things': (a.get('things') or []) + (b.get('things') or []), 'statements': (a.get('statements') or []) + (b.get('statements') or [])}
+            return r
+        replies = list(self.io.map(one, chunks))
+        things, statements, summary = [], [], ''
+        for r in replies:
+            things += [x for x in (r.get('things') or []) if isinstance(x, dict)]
+            statements += [x for x in (r.get('statements') or []) if isinstance(x, dict)]
+            summary = summary or str(r.get('summary') or '')
+        if summary and source.startswith(self.root):
+            self.write([{'path': source, 'slots': {'summary': summary[:300]}, 'action': 'poke'}])
+        landed, stated = self.land(ws, things, statements, source)
+        self.done(t, f'{landed} new things · {stated} statements')
+        return stated
 
-    def decompose(self, ws, path, known=None):
-        rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
-        prose = ' '.join(str(rec[k]) for k in ('description', 'text', 'note', 'said', 'quote') if rec.get(k))
-        prose = re.sub(r'(May be|Could supply) \[[^\]]*\]( \([^)]*\))?\.?', ' ', prose)      # candidate sentences name, they do not state
-        # a record with nothing but identifiers and numbers states nothing; a slot that names something is a statement
-        named_slots = [k for k, v in rec.items() if isinstance(v, str) and k not in ('name', 'note', 'text', 'description', 'source', 'url') and not k.startswith('sys') and re.search(r'[A-Za-z]{3,}', v) and not CODELIKE.match(v) and not v.startswith('/h/')]
-        if len(prose.strip()) < 40 and len(named_slots) < 2:
-            return 0
-        known = known if known is not None else self.reach(ws)
-        by_name = {}
-        for k in known:
-            by_name.setdefault(same_name(k['name']), k['path'])
-        shown = {k: str(v)[:600] for k, v in rec.items() if not k.startswith('sys')}
-        reply = call_model(self.model, DECOMPOSE, json.dumps({'record': {'path': path, 'slots': shown}, 'known': [{'path': k['path'], 'name': k['name'], 'kind': k.get('kind') or k['path'].split('/')[-2]} for k in known[:80]]}))
-        statements = [t for t in (reply.get('statements') or []) if isinstance(t, dict) and isinstance(t.get('subject'), dict) and isinstance(t.get('object'), dict)][:THINGS]
-        ref = lambda p: {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(p.split('/')) - 1, p)}
-        records, made, seen, landed = [], 0, set(), set()
-        def place_thing(t):
-            """Where a named thing is: a known record, a record spelling the same name, or its shared name under the
-            world, created with its facts the first time."""
-            name = str(t.get('name') or '').strip()[:60]
-            kind = segment_of(str(t.get('kind') or 'things').strip().lower()) or 'things'
-            if not name or CODELIKE.match(name) or ABSENT.match(name) or generic(name, kind) or kind in ('identifiers', 'codes', 'ids'):
-                return None, None
-            if kind == 'places':
-                name = place_name(name)
-            if isinstance(t.get('path'), str) and t['path'].startswith('/') and t['path'] != path and not machinery(t['path']):
-                return t['path'], name
-            found = by_name.get(same_name(name)) or self.shared_names(kind).get(same_name(name))
-            if found:
-                return found, name
-            shared = '/' + self.w.node + '/user/' + kind + '/' + (segment_of(name) or 'thing')
-            if shared not in landed and not self.w.read(shared, 'x').get('exists'):
-                records.append({'path': shared, 'slots': {'name': name, 'source': ref(path)}})
-            landed.add(shared)
-            return shared, name
-        for t in statements:
-            relation = segment_of(str(t.get('relation') or '').strip().lower())
-            if not relation or relation in NOT_RELATIONS:
-                continue
-            subject, _ = place_thing(t['subject'])
-            obj, obj_name = place_thing(t['object'])
-            if not obj:
-                continue
-            subject = subject or path                      # a statement with no subject of its own is about the record
-            slug = segment_of(obj_name)
-            if (subject, relation, slug) in seen:
-                continue
-            seen.add((subject, relation, slug))
-            there = self.w.read(subject + '/' + relation + '/' + slug, 'x')
-            if there.get('exists'):
-                # one relationship, another observation: the new source lands as evidence beneath the statement,
-                # the first attribution untouched
-                had = str((there.get('properties') or {}).get('/source') or '')
-                if path not in had:
-                    records.append({'path': subject + '/' + relation + '/' + slug + '/evidence/' + segment_of(path.split('/')[-1]), 'slots': {'source': ref(path), 'note': str(t.get('sentence') or '').strip()[:400]}})
-                    made += 1
-                continue
-            # the one shape, beneath the subject: the relation as the slot that pins the object, the clause, the source
-            slots = {relation: ref(obj), 'source': ref(path)}
-            sentence = str(t.get('sentence') or '').strip()[:400]
-            if sentence:
-                slots['note'] = sentence
-            for k, v in (t.get('facts') or {}).items() if isinstance(t.get('facts'), dict) else []:
-                key = segment_of(str(k).lower())
-                if key and key not in ('name', 'note', 'source', 'sys', relation) and isinstance(v, (str, int, float)) and str(v).strip():
-                    slots[key] = v if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)[:200]
-            records.append({'path': subject + '/' + relation + '/' + slug, 'slots': slots})
-            made += 1
-        if records:
-            self.write(records)
-        return made
-
-    def shared_names(self, kind):
-        """What already stands under /user/<kind>, by the spelling names share; read once a minute."""
+    def thing_path(self, name, kind):
+        """Where a thing stands: the record spelling the same name in any kind, else a new one under /user/<kind>."""
+        key = same_name(name)
+        if not key or key in GENERIC or len(key) < 2:
+            return None
         with self.lock:
-            had = getattr(self, '_shared', {}).get(kind)
-            if had and time.time() - had[0] < 60:
-                return had[1]
-        names = {}
+            had = self.index.get(key)
+        if had:
+            return had[0]
+        with self.lock:
+            known_kinds = {v[1] for v in self.index.values()}
+        k = kind_of(kind, known_kinds)
+        path = '/' + self.w.node + '/user/' + k + '/' + (segment_of(name) or segment_of(key) or 'thing')
+        with self.lock:
+            self.index[key] = (path, k, str(name).strip())
+        return path
+
+    def land(self, ws, things, statements, source):
+        """Things once at shared names, statements beneath their subjects, each with the source; idempotent.
+        A thing with no statement is not landed: a name alone means nothing."""
+        kinds, alias = {}, {}
+        for th in things:
+            n, k = str(th.get('name') or '').strip(), str(th.get('kind') or 'things')
+            if n and same_name(n) not in GENERIC:
+                kinds[same_name(n)] = k
+                for a in th.get('aliases') or []:
+                    if isinstance(a, str) and a.strip() and same_name(a) != same_name(n):
+                        alias[same_name(a)] = n
+        new_things, stmts, paths = {}, [], {}
+        def at(name):
+            name = alias.get(same_name(name), name)
+            key = same_name(name)
+            if key in paths:
+                return paths[key]
+            p = self.thing_path(name, kinds.get(key, 'things'))
+            paths[key] = p
+            if p and p not in new_things and not self.w.read(p, 'x').get('exists'):
+                new_things[p] = {'path': p, 'slots': {'name': str(name).strip()[:100]}}
+            return p
+        used, stated = set(), 0
+        for st in statements:
+            subj, rel = str(st.get('subject') or '').strip(), str(st.get('relation') or '').strip()
+            if not subj or not rel:
+                continue
+            sp = at(subj)
+            if not sp:
+                continue
+            r = segment_of(rel.lower()) or 'relates_to'
+            if r in RESERVED:
+                r = r + '_'
+            note = str(st.get('note') or '')[:NOTE]
+            obj = str(st.get('object') or '').strip()
+            with self.lock:
+                declared = same_name(obj) in kinds or same_name(alias.get(same_name(obj), obj)) in kinds or same_name(obj) in self.index
+            if obj and declared:
+                op = at(obj)
+                if not op or op == sp:
+                    continue
+                tail, slots = op.rsplit('/', 1)[-1], {r: ref(op)}
+                used.add(op)
+            else:
+                val = str(st.get('value') or obj or '').strip()
+                if not val:
+                    continue
+                tail, slots = segment_of(val[:50]) or 'value', {'value': val[:120]}
+            slots['note'] = note
+            slots['source'] = ref(source)
+            path = sp + '/' + r + '/' + tail
+            existing = self.w.read(path, 'x')
+            if existing.get('exists'):
+                had = str((existing.get('properties') or {}).get('/source') or '')
+                if had and not had.endswith(source):
+                    ev = path + '/evidence/' + (segment_of(source.rsplit('/', 1)[-1]) or 'source')
+                    if not self.w.read(ev, 'x').get('exists'):
+                        stmts.append({'path': ev, 'slots': {'source': ref(source), 'note': note}})
+                continue
+            stmts.append({'path': path, 'slots': slots})
+            used.add(sp)
+            stated += 1
+            self.found.setdefault(ws, []).append({'subject': subj, 'path': sp, 'relation': rel, 'object': obj or val, 'note': note})
+        kept = [new_things[p] for p in new_things if p in used] + stmts
+        for i in range(0, len(kept), 40):
+            self.write(kept[i:i + 40])
+        return sum(1 for p in new_things if p in used), stated
+
+    # ---- a request: observe the workspace, plan, search with the page text in hand, judge and read, fill the gaps
+    def observe(self, ws, path, text):
+        inputs = []
         try:
-            for c in (self.w.read('/' + self.w.node + '/user/' + kind, 'y', limit=500).get('children') or []):
-                n = (c.get('properties') or {}).get('/name')
-                if n:
-                    names.setdefault(same_name(n), c['path'])
+            for c in (self.w.read(self.root + ws + '/inputs', 'y', limit=100).get('children') or []):
+                pr = {k.lstrip('/'): v for k, v in (c.get('properties') or {}).items()}
+                if c['path'] == path:
+                    continue
+                what = 'file' if (pr.get('archive') or whole(pr, 'image')) and not pr.get('url') else 'page' if pr.get('url') else 'text'
+                inputs.append({'input': what, 'name': pr.get('title') or pr.get('name'), 'read': bool(pr.get('summary') or pr.get('title')),
+                               'says': pr.get('summary') or str(pr.get('text') or '')[:400]})
         except Exception:
             pass
+        for st in self.known.get(ws, set()):
+            inputs.append({'input': 'record', 'name': st, 'read': True})
         with self.lock:
-            self._shared = getattr(self, '_shared', {}); self._shared[kind] = (time.time(), names)
-        return names
+            found = self.found.get(ws, [])[-80:]
+        reply = call_model(self.model, OBSERVE, json.dumps({'new_text': text[:4000], 'inputs': inputs, 'statements': found}))
+        title = str(reply.get('title') or '').strip()
+        wsrec = self.record(self.root + ws)
+        if title and str(wsrec.get('name') or '') in ('', ws, ws.replace('_', ' ')):
+            self.write([{'path': self.root + ws, 'slots': {'name': title[:60]}, 'action': 'poke'}])
+        return reply
 
-    def decompose_many(self, ws, paths, title):
-        t = self.task(ws, title, f'Auto · {len(paths)} record{"" if len(paths) == 1 else "s"} to read', about=paths[0] if len(paths) == 1 else None)
-        known = self.reach(ws)
-        made = 0
-        for p in paths:
-            try:
-                made += self.decompose(ws, p, known)
-            except Exception as e:
-                self.log(f'{self.name}: decompose {p}: {e}')
-        self.done(t, f'{made} statement{"" if made == 1 else "s"} out of {len(paths)} record{"" if len(paths) == 1 else "s"}')
-
-    def reached(self, ws):
-        """The records the workspace reaches, nearest to any standing first (the page's own order), that hold prose and
-        have not been read yet; a bounded set per round, no standing privileged."""
-        nodes = self.world(ws)
-        found = []
-        standings = set(self.standings(ws))
-        def visit(n, depth):
-            props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
-            m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
-            if m and not m.group(1).startswith('/x/') and not machinery(m.group(1)):
-                found.append((depth, m.group(1)))
-            for c in n.get('children') or []:
-                visit(c, depth + 1)
-        visit(nodes, 0)
-        read = self.read_once.setdefault(ws, set())
-        out, seen = [], set()
-        for depth, p in sorted(found, key=lambda x: x[0]):
-            if p in seen or p in read:
-                continue
-            seen.add(p)
-            rec = {k.lstrip('/'): v for k, v in (self.w.read(p, 'x').get('properties') or {}).items()}
-            named = [k for k, v in rec.items() if isinstance(v, str) and k not in ('name', 'source', 'url') and not k.startswith('sys') and re.search(r'[A-Za-z]{3,}', v) and not CODELIKE.match(v) and not v.startswith('/h/')]
-            if any(len(str(rec.get(k) or '')) >= 40 for k in ('description', 'text', 'note')) or len(named) >= 2:
-                out.append(p); read.add(p)
-            if len(out) >= REACH_BUDGET:
+    def research(self, ws, path, text, plan):
+        questions = [str(q) for q in (plan.get('questions') or []) if str(q).strip()][:SUBQUESTIONS]
+        about = str(plan.get('about') or '')[:160]
+        if not questions:
+            t = self.task(ws, 'Answer from the workspace', 'Auto · request', about=path)
+            self.done(t, (about + ' · ' if about else '') + 'no search needed: the reading answers from what the workspace holds')
+            return
+        asked = []
+        for rnd in range(ROUNDS):
+            if not questions:
                 break
-        return out
+            list(self.inner.map(lambda q: self.search(ws, path, text, q), questions))
+            asked += questions
+            if rnd + 1 < ROUNDS:
+                with self.lock:
+                    found = self.found.get(ws, [])[-80:]
+                reply = call_model(self.model, GAPS, json.dumps({'request': text[:2000], 'about': about, 'searched': asked, 'statements': found}))
+                questions = [str(q) for q in (reply.get('questions') or []) if str(q).strip() and str(q) not in asked][:3]
 
-    # ---- the reading: the agent's own table of contents for the workspace, recomposed after each round
-    def edges(self, nodes):
-        """Every node of the world keyed by its path beneath the cell."""
+    def search(self, ws, path, question, query):
+        t = self.task(ws, 'Search · ' + query[:70], 'Auto · research', about=path)
+        try:
+            hits = self.hits(query)
+        except Exception as e:
+            self.done(t, 'no engine answered: ' + str(e)[:60]); return
+        if not hits:
+            self.done(t, 'nothing found'); return
+        def judge(hit):
+            url, title, md = hit
+            try:
+                r = call_model(self.model, JUDGE, json.dumps({'question': question[:1500], 'query': query, 'KNOWN': self.known_in(md), 'url': url, 'title': title, 'page': md[:CHUNK]}))
+            except Exception as e:
+                r = {'relevant': False, 'why': 'model failed: ' + str(e)[:40]}
+            return (url, title, md, r)
+        read = list(self.io.map(judge, hits))
+        landed = 0
+        for url, title, md, r in read:
+            if not r.get('relevant') or not (r.get('statements') or []):
+                continue
+            page = _web.page_path(self.w.node, url)
+            pt = str(r.get('title') or title or url)[:120]
+            if not self.w.read(page, 'x').get('exists'):
+                kept = self.archive(page[len('/' + self.w.node + '/user/web/pages/'):], {'name': pt, 'url': url, 'text': md[:TEXT_CAP]})
+                self.write([{'path': page, 'slots': {'name': pt, 'url': url, 'title': pt, 'summary': str(r.get('summary') or '')[:300], 'archive': ref(kept)}}])
+            slug = segment_of(pt[:50]) or 'page'
+            self.write([{'path': path + '/pages/' + slug, 'slots': {'pages': ref(page), 'note': str(r.get('why') or '')[:NOTE], 'source': ref(path)}}])
+            self.land(ws, r.get('things') or [], r.get('statements') or [], page)
+            landed += 1
+        self.done(t, f'{landed} of {len(read)} pages answered')
+
+    def hits(self, query):
+        """[(url, title, markdown)]: the engine hands the page text back with the hit."""
+        if _web.firecrawl_key():
+            d = _web.firecrawl('/search', {'query': query, 'limit': SEARCH_LIMIT, 'scrapeOptions': {'formats': ['markdown'], 'onlyMainContent': True}}, timeout=90)
+            data = d.get('data')
+            items = data if isinstance(data, list) else (data or {}).get('web') or []
+            out = [(str(i.get('url') or ''), str(i.get('title') or ''), str(i.get('markdown') or i.get('description') or '')) for i in items if str(i.get('url') or '').startswith('http')]
+            return [h for h in out if len(h[2]) > 200]
+        found, _ = _web.search(query, limit=SEARCH_LIMIT)
         out = []
-        base = nodes.get('path', '')
-        def visit(n):
-            out.append((n.get('path', '')[len(base):], {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}))
-            for c in n.get('children') or []:
-                visit(c)
-        visit(nodes)
+        for url, title, snippet in found:
+            try:
+                tt, text = self.fetch(url)
+                out.append((url, tt or title, text))
+            except Exception:
+                continue
         return out
 
+    # ---- the reading
     def compose(self, ws):
         self.status(ws, 'Composing the reading', True)
         base = self.root + ws
         inputs = [{k.lstrip('/'): v for k, v in (c.get('properties') or {}).items()} for c in (self.w.read(base + '/inputs', 'y', limit=100).get('children') or [])]
-        texts = [str(i.get('text'))[:1500] for i in inputs if i.get('text') and not i.get('url')]
+        requests = [whole(i, 'text')[:1500] for i in inputs if whole(i, 'text') and not i.get('url') and not whole(i, 'image') and not i.get('summary')]
+        sources = [{'title': i.get('title') or i.get('name'), 'summary': i.get('summary')} for i in inputs if i.get('summary')]
         with self.lock:
-            self.worlds.pop(ws, None)          # the reading wants the world as it stands after the round
-        nodes = self.world(ws)
+            found = list(self.found.get(ws, []))
+        if not found:
+            self.status(ws, 'Watching for inputs', False); return
         things = {}
-        def visit(n):
-            props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
-            m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
-            if m and props.get('name') and not m.group(1).startswith('/x/') and not machinery(m.group(1)):
-                t = things.setdefault(m.group(1), {'path': m.group(1), 'name': str(props['name'])[:80], 'facts': {}, 'sentence': ''})
-                for k, v in props.items():
-                    if k.startswith('note/') and k[5:] in ('text', 'note', 'description') and not t['sentence']:
-                        t['sentence'] = str(v)[:240]
-                    elif k.startswith('note/') and k[5:] in ('city', 'state', 'zip', 'amount', 'obligated', 'agency', 'applicant', 'granted', 'heading'):
-                        t['facts'][k[5:]] = str(v)[:60]
-            for c in n.get('children') or []:
-                visit(c)
-        visit(nodes)
-        # what the world says about each thing, by how it says it: a stated relation (a record beneath, with its source),
-        # a mention in prose (named in a text, nothing asserted), an identity (judged the same)
-        def visit2(n, rel=''):
-            props = {k.lstrip('/'): v for k, v in (n.get('properties') or {}).items()}
-            m = re.match(r'^/h/[xyz]/[^/]+/\d+(/.*)$', str(props.get('at') or ''))
-            here = n.get('path', '')
-            if m and m.group(1) in things:
-                parent = re.search(r'/(\d+)/([^/]+(?:/[^/]+)*?)/(out|in|part|up)/\d+/([^/]+)/\d+/', here + '/')
-            for c in n.get('children') or []:
-                visit2(c)
-        for t in things.values():
-            segs = t['path'].split('/')
-            t['kind'] = segs[-2] if len(segs) > 2 else ''
-            t['stated'], t['named_in'], t['same_as'] = [], [], []
-        # every edge on the page: <thing>/<dir>/<n>/<label...>/<n>/<other>: a label that is a prose slot is a mention,
-        # same is identity, anything else is a stated relation
-        for n_path, props in self.edges(nodes):
-            m = re.match(r'^(.*?)/(out|in|part|up)/(\d+)/(.+?)/(\d+)/(.+)$', n_path)
-            if not m:
-                continue
-            thing, direction, label, other = '/' + m.group(1).split('/', 2)[-1] if m.group(1).count('/') > 1 else '', m.group(2), m.group(4), '/' + m.group(6)
-            subject = things.get(thing)
-            if not subject or other.startswith('/x/') or machinery(other):
-                continue
-            name = str(props.get('name') or other.split('/')[-1])[:60]
-            if label.split('/')[-1] in ('text', 'note', 'description', 'said', 'quote'):
-                subject['named_in'].append(name)
-            elif label == 'same':
-                subject['same_as'].append(name)
-            elif direction in ('out', 'part'):
-                note = str(props.get('note/note') or props.get('note/description') or '')[:120]
-                subject['stated'].append(f'{label}: {name}' + (f' ({note})' if note else ''))
-        for t in things.values():
-            t['stated'] = t['stated'][:8]; t['named_in'] = t['named_in'][:6]; t['same_as'] = t['same_as'][:4]
-        listed = list(things.values())[:150]
-        if not listed:
-            return
-        reply = call_model(self.model, COMPOSE, json.dumps({'inputs': texts, 'things': listed}))
-        sections = [sec for sec in (reply.get('sections') or []) if isinstance(sec, dict) and str(sec.get('heading') or '').strip()][:6]
+        for st in found[-400:]:
+            things.setdefault(st['path'], {'path': st['path'], 'name': st['subject'], 'statements': []})
+            things[st['path']]['statements'].append(f"{st['relation']} {st['object']}: {st['note'][:140]}")
+        listed = [{'path': p, 'name': t['name'], 'statements': t['statements'][:12]} for p, t in things.items()][:120]
+        reply = call_model(self.model, COMPOSE, json.dumps({'requests': requests, 'sources': sources, 'things': listed}), max_tokens=5000)
+        sections = [sec for sec in (reply.get('sections') or []) if isinstance(sec, dict) and str(sec.get('heading') or '').strip()][:5]
         if not sections:
-            return
-        # a reading is never culled: each composition is the next version beneath views/reading/, the page draws the latest
+            self.status(ws, 'Watching for inputs', False); return
         old = [c['path'] for c in (self.w.read(base + '/views/reading', 'y', limit=200).get('children') or [])]
         v = 1 + max([0] + [int(m.group(1)) for p in old for m in [re.search(r'/v(\d+)$', p)] if m])
         here = base + '/views/reading/v%d' % v
@@ -600,124 +665,22 @@ class WorkspaceHand(Hand):
         seen = set()
         for i, sec in enumerate(sections, 1):
             head = str(sec['heading']).strip()[:40]; hs = segment_of(head) or ('section_%d' % i)
-            entries = [e for e in (sec.get('entries') or []) if isinstance(e, dict) and str(e.get('path') or '') in things and str(e.get('path')) not in seen][:8]
+            entries = [e for e in (sec.get('entries') or []) if isinstance(e, dict) and str(e.get('path') or '') in things and str(e.get('path')) not in seen][:6]
             if not entries:
                 continue
             records.append({'path': here + '/' + hs, 'slots': {'name': head, 'order': i}})
             for j, e in enumerate(entries, 1):
-                path = str(e.get('path') or '')
-                seen.add(path)
-                name = str(e.get('name') or things[path]['name']).strip()[:60]
-                records.append({'path': here + '/' + hs + '/' + (segment_of(name) or 'e%d' % j), 'slots': {'name': name, 'order': j, 'note': str(e.get('line') or '').strip()[:200], 'about': {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(path.split('/')) - 1, path)}}})
-        title = reply.get('title')
-        if isinstance(title, str) and 2 < len(title.strip()) < 60:
-            records.append({'path': base, 'slots': {'name': title.strip()}, 'action': 'poke'})
-        self.write(records)
-        self.status(ws, f'Reading composed · {len(sections)} sections', False)
-
-    def digest_input(self, ws, path):
-        rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
-        wsrec = {k.lstrip('/'): v for k, v in (self.w.read(self.root + ws, 'x').get('properties') or {}).items()}
-        untitled = str(wsrec.get('name') or '') in ('', ws, ws.replace('_', ' '))
-        if rec.get('url'):
-            if rec.get('fetched'):
-                return                      # digested once, for every workspace: its names and statements are shared
-            t = self.task(ws, 'Fetch and digest ' + str(rec['url'])[:60], 'Auto · URL source', about=path)
-            try:
-                markup, _ = _web.fetch_page(str(rec['url']))
-                title, regions = _web.page_regions(markup, str(rec['url']))
-            except Exception as e:
-                self.done(t, 'fetch failed: ' + str(e)[:80]); return
-            paths = _web.region_paths(path, regions)
-            records = [{'path': path, 'slots': {k: v for k, v in {'title': title, 'fetched': 'yes'}.items() if v}, 'action': 'poke'}]
-            for p, r in zip(paths, regions):
-                records.append({'path': p, 'slots': {'heading': r.get('heading') or '', 'text': r['text'], 'level': int(r.get('level') or 0)}})
-            self.write(records)
-            placed = 0
-            for p, r in list(zip(paths, regions))[:REGIONS_PLACED]:
-                try:
-                    n, _ = self.place(ws, p, r['text'], False); placed += n
-                except Exception as e:
-                    self.log(f'{self.name}: place: {e}')
-            self.done(t, f'{len(regions)} regions · {placed} names placed')
-            self.decompose_many(ws, paths[:REGIONS_DECOMPOSED], 'Decompose the first regions of ' + (title or str(rec['url']))[:40])
-            return
-        text = str(rec.get('text') or '')
-        if not text.strip():
-            return
-        t = self.task(ws, 'Place the names in ' + (str(rec.get('name') or 'the text'))[:50], 'Auto · reading the text', about=path)
-        placed, title = self.place(ws, path, text, untitled)
-        self.done(t, f'{placed} name{"" if placed == 1 else "s"} placed' + (f' · named the workspace "{title}"' if title else ''))
-        if len(text.strip()) <= TOPIC and '[/' not in text and not text.strip().startswith('http'):
-            self.search_topic(ws, path, text.strip())
-        self.decompose_many(ws, [path], 'Decompose ' + (str(rec.get('name') or 'the text'))[:40])
-
-    # ---- a topic: the web searched, the first pages landed by the scheme and written beneath the topic as pages
-    def search_topic(self, ws, path, text):
-        t = self.task(ws, 'Search the web for ' + text[:48], 'Auto · topic', about=path)
-        try:
-            hits, used = _web.search(text, limit=FOUND)
-        except Exception as e:
-            self.done(t, 'no search engine answered: ' + str(e)[:60]); return
-        ref = lambda p: {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(p.split('/')) - 1, p)}
-        records, pages, seen = [], [], set()
-        for url, title, snippet in hits[:FOUND]:
-            try:
-                page = _web.page_path(self.w.node, url)
-            except Exception:
-                continue
-            if page in seen:
-                continue
-            seen.add(page)
-            if not self.w.read(page, 'x').get('exists'):
-                records.append({'path': page, 'slots': {'name': (title or url.replace('https://', ''))[:80], 'url': url}})
-            slug = segment_of((title or url.split('/')[-1] or 'page')[:50]) or 'page'
-            hit = {'pages': ref(page), 'source': ref(path)}
-            if snippet:
-                hit['note'] = str(snippet)[:300]
-            records.append({'path': path + '/pages/' + slug, 'slots': hit})
-            pages.append(page)
-        if records:
-            self.write(records)
-        self.done(t, f'{len(pages)} page{"" if len(pages) == 1 else "s"} found via {used}')
-        for page in pages[:FETCHED]:
-            self.submit(ws, self.digest_input, ws, page)
-
-    def link_path(self, ws, path):
-        rec = {k.lstrip('/'): v for k, v in (self.w.read(path, 'x').get('properties') or {}).items()}
-        note = str(rec.get('note') or '')
-        candidates = [c for c in MAYBE.findall(note)][:CANDIDATES]
-        # only where the standings do not all meet is what the workspace reaches read for its statements: the agent
-        # works where the perspective has a gap, a bounded set nearest to any standing
-        root = {k.lstrip('/'): v for k, v in (self.world(ws).get('properties') or {}).items()}
-        apart = int(root.get('components') or 0) > 1
-        reach = self.reached(ws) if apart else []
-        if reach:
-            self.submit(ws, self.decompose_many, ws, reach, 'Read what the workspace reaches')
-        if not candidates:
-            return
-        already = {c['path'].split('/')[-1] for c in (self.w.read(path + '/same', 'y', limit=100).get('children') or [])}
-        t = self.task(ws, 'Judge ' + str(rec.get('name') or path.split('/')[-1])[:40] + ' against its candidates', f'Auto · {len(candidates)} candidate{"" if len(candidates) == 1 else "s"} named', about=path)
-        shown = {k: str(rec[k])[:80] for k in rec if k not in ('note', 'kinds', 'source')}
-        linked = 0
-        for cand in candidates:
-            slug = segment_of(cand.split('/')[-1])
-            if slug in already:
-                continue
-            other = {k.lstrip('/'): str(v)[:80] for k, v in (self.w.read(cand, 'x').get('properties') or {}).items() if k not in ('/note', '/kinds')}
-            if not other:
-                continue
-            sentence = next((s for s in re.split(r'(?<=\.)\s+', note) if cand in s), '')
-            try:
-                reply = call_model(self.model, JUDGE, json.dumps({'record': shown, 'candidate': other, 'proposed_by': sentence}))
-            except Exception as e:
-                self.log(f'{self.name}: judge: {e}'); continue
-            if reply.get('same') is True and str(reply.get('why') or '').strip():
-                self.write([{'path': path + '/same/' + slug, 'slots': {'same': {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(cand.split('/')) - 1, cand)},
-                                                                        'note': str(reply['why'])[:400], 'source': {'type': 'reference', 'value': '/h/x/0/%d%s' % (len(path.split('/')) - 1, path)}}}])
-                linked += 1
-        self.done(t, f'{linked} linked of {len(candidates)}')
+                p = str(e.get('path')); seen.add(p)
+                nm = str(e.get('name') or things[p]['name']).strip()[:60]
+                records.append({'path': here + '/' + hs + '/' + (segment_of(nm) or 'e%d' % j), 'slots': {'name': nm, 'order': j, 'note': str(e.get('line') or '').strip()[:200], 'about': ref(p)}})
+        title = str(reply.get('title') or '').strip()
+        wsrec = self.record(base)
+        if title and str(wsrec.get('name') or '') in ('', ws, ws.replace('_', ' ')):
+            records.append({'path': base, 'slots': {'name': title[:60]}, 'action': 'poke'})
+        for i in range(0, len(records), 40):
+            self.write(records[i:i + 40])
+        self.status(ws, 'Watching for inputs', False)
 
 
 if __name__ == '__main__':
-    _hand.run(WorkspaceHand, settings=('model',))
+    _hand.run(WorkspaceHand, settings=('model', 'workers'))
