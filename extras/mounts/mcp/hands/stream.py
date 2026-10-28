@@ -26,7 +26,10 @@ class Stream:
 
     def _until(self, marker):
         while marker not in self.buf:
-            chunk = self.sock.recv(65536)
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue                    # an idle world sends nothing; the stream is still open
             if not chunk:
                 raise EOFError('stream closed')
             self.buf += chunk
