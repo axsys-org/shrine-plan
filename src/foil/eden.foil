@@ -14,6 +14,7 @@
 -  http_foot
 - fs_sync_foot
 - weft_std
+- graph
 '  Eden boots the namespace and core services; mounts supply applications.
 '  Base installation runs through Lain before Eden starts actors.
 '  Grove instances install later through the supervisor.
@@ -36,7 +37,7 @@
          (lore/line "Filesystem scan requests."))
        (kook/decl 'ward ward/form (lore/line "Contract adoption."))
        (kook/decl 'fresh fresh/form (lore/line "Live references."))]
-      roots.weld(weft_std/seeds)
+      roots.weld(weft_std/seeds).weld(graph/seeds)
       []
 
   + boot
@@ -117,14 +118,28 @@
     ^ nat
     | eden/serve_read access fs_read/read state entry
   + serve_read
+    ' Serve the foot's reads: files from the reader, under the supervisor's access to the namespace, as one foot task.
     \ access=helm/supervisor/access[namespace]
       reader={\ str}either[str row[fs_read/file]]
       state=namespace entry={\ feet/task/init nat}nat
     ^ nat
+    = idle
+        \ ignored=namespace
+        ^ nat
+        | 0
+    | eden/serve_keeping access reader state entry idle
+  + serve_keeping
+    '  serve_read, and keep sees every admitted state
+    '  (helm/supervisor/run_keeping).
+    \ access=helm/supervisor/access[namespace]
+      reader={\ str}either[str row[fs_read/file]]
+      state=namespace entry={\ feet/task/init nat}nat
+      keep={\ namespace}nat
+    ^ nat
     = start
         \ self=nat
         ^ nat
-        | helm/supervisor/run_with[namespace] access state self
+        | helm/supervisor/run_keeping[namespace] access keep state self
     = ;server (Spawn start)
       registrations=row[helm/supervisor/register]
         [(helm/supervisor/register [state.self 'io 'fs] (fs_foot/run_with reader))
@@ -143,6 +158,77 @@
         > (./some why) (error why)
     | eden/throw "Foot registration failed"
 
+  + serve_saved
+    '  Serve, and save the world as the store root after every event:
+    '  running the snapshot again resumes it (eden/resume).  install
+    '  installs the compiler; the runtime forgets it between processes.
+    '  remount scans the mounts again from the checkout a resumed process
+    '  started from and rebuilds the HTTP entry, so a kept world runs the
+    '  mounts as they are now, over the records as they were saved.
+    \ access=helm/supervisor/access[namespace]
+      reader={\ str}either[str row[fs_read/file]]
+      state=namespace entry={\ feet/task/init nat}nat
+      install={\ nat}nat
+      remount={\ {\ str}either[str row[fs_read/file]] namespace}[namespace {\ feet/task/init nat}nat]
+    ^ nat
+    | eden/serve_keeping access reader state entry
+      (eden/keeper access entry install remount)
+  + keeper
+    '  The keep that saves the world: the store root becomes the program
+    '  that serves this state again.
+    \ access=helm/supervisor/access[namespace]
+      entry={\ feet/task/init nat}nat install={\ nat}nat
+      remount={\ {\ str}either[str row[fs_read/file]] namespace}[namespace {\ feet/task/init nat}nat]
+    ^ {\ namespace}nat
+    \ state=namespace
+    ^ nat
+    | Save (pin (eden/resume access entry install remount state))
+  + resume
+    '  The program a saved world's store root holds.  The runtime applies
+    '  it to its argument row, the scanner port and token (fs_read/remote,
+    '  both optional): it installs the compiler, remounts the mounts from
+    '  the checkout, prints EDEN-RESUMED and serves the state, saving
+    '  after every event as before.
+    \ access=helm/supervisor/access[namespace]
+      entry={\ feet/task/init nat}nat install={\ nat}nat
+      remount={\ {\ str}either[str row[fs_read/file]] namespace}[namespace {\ feet/task/init nat}nat]
+      state=namespace
+    ^ {\ row[str]}nat
+    \ args=row[str]
+    ^ nat
+    = port (eden/arg_nat args 0)
+      token (eden/arg_str args 1)
+      reader
+        \ root=str
+        ^ either[str row[fs_read/file]]
+        | fs_read/remote port token root
+    ; (install 0)
+    = [current fresh] (remount reader state)
+    ; (Trace "EDEN-RESUMED" 0)
+    = ;server (eden/serve_saved access reader current fresh install remount)
+    '  The runtime ends every actor when the root program returns, and
+    '  on a fresh boot it is the repl reading stdin that keeps the world
+    '  alive.  Read stdin the same way: the launcher holds the pipe open,
+    '  and closing it is the stop.  Whatever arrives is ignored.
+    % served=nat server
+    ^ nat
+    = ;got (Input 65536)
+    ? (le got 1) served
+    | _ served
+  + arg_nat
+    ' A launcher argument as a number; 0 when absent or not a number.
+    \ args=row[str] idx=nat
+    ^ nat
+    ? (le args.len idx) 0
+    ? (nat/parse args.at(idx))
+     > (./some n) n
+    0
+  + arg_str
+    ' A launcher argument as text; empty when absent.
+    \ args=row[str] idx=nat
+    ^ str
+    ? (le args.len idx) ""
+    | args.at(idx)
   + main
     \ self=iota system=pin[system_publication] local=sov port=nat
     ^ nat

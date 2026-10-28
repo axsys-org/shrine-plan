@@ -447,13 +447,18 @@
     & http_foot/stream_msg/join
       http_foot/stream_msg/line
       http_foot/stream_msg/streamed
+      http_foot/stream_msg/close
     + join
       :
     + line
       : text=str
     + streamed
       ' A stream acknowledging one written line; the fan-out counts
-      ' lines outstanding per stream and drops one that stalls.
+      ' lines outstanding per stream and lets go of one that stalls.
+      :
+    + close
+      ' The fan-out letting a stream go: the connection closes its
+      ' socket, so the tab learns the stream ended and opens another.
       :
   + stream_head
     ' The event-stream response head: no length, the body runs until
@@ -486,14 +491,20 @@
         ; (helm/supervisor/close_caps caps)
         ; (CloseFd fd)
         0
+     > .close
+      ; (helm/supervisor/close_caps caps)
+      ; (CloseFd fd)
+      0
     ; (helm/supervisor/close_caps caps)
     | _ 0
   + fanout
     ' The stream registry: every open stream's handle with the lines it
     ' has not yet acknowledged.  A line is sent to each with Try; a
-    ' stream whose handle refuses, or that falls more than 64 lines
-    ' behind, is dropped.  Nothing here blocks: a commit hands the line
-    ' over and goes on.
+    ' stream whose handle refuses, or that falls more than 512 lines
+    ' behind (a burst of commits is normal; a reader that never catches
+    ' up is not), is told to close and dropped, so its socket closes
+    ' and the tab opens another instead of listening to silence.
+    ' Nothing here blocks: a commit hands the line over and goes on.
     \ self=nat
     ^ nat
     % streams=row[[h=nat behind=nat]] []
@@ -519,7 +530,9 @@
           | streams.fold none
           \ ;out=row[[h=nat behind=nat]] [h behind]
           ^ row[[h=nat behind=nat]]
-          ? (gt behind 64)
+          ? (gt behind 512)
+            = closing=http_foot/stream_msg .close
+            ; (Try (\ target=nat (Send target closing)) h)
             ; (CloseHandle h)
             out
           = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
