@@ -267,6 +267,7 @@ function valueHTML(v, cls = 'sv-v') {
   if (typeof v === 'number') return `<span class="${cls}">${numText(v)}</span>`;
   const s = String(v);
   const r = refOf(s); if (r) { const p = r.path.replace(/^\/x\//, ''); return `<span class="${cls} ref" data-path="${esc(p)}">${goHTML(p, p, s, 'r')}</span>`; }
+  if (/^data:image\//.test(s)) return `<span class="${cls} blob"><img alt="" src="${esc(s)}" style="max-width:100%;max-height:320px;border-radius:4px"></span>`;
   if (/^blob:/.test(s)) { const [, hash, mime, size] = s.split(':'); return `<span class="${cls} blob">${mime && mime.startsWith('image') ? `<img alt="" src="/blob/${esc(hash)}">` : ''}${esc(hash.slice(0, 8))} &middot; ${esc(size || '')}</span>`; }
   if (s === 'yes' || s === 'no') return `<span class="${cls} flag ${s}">${s}</span>`;
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return `<span class="${cls}">${esc(s)}</span>`;
@@ -464,14 +465,20 @@ function valueOf(v) {
   return /^\d+$/.test(s) ? Number(s) : s;
 }
 // a record's properties as the viewer's slots: keys without their slash; a cell's weft as `formula`, its tack as `over`
+// a value over 8 KB is kept as parts <slot>/<n> (a read shows a longer value only by its size); the parts read as one slot
+const PART = 8000;
+const parted = (key, value) => { const v = String(value || ''); if (v.length <= PART) return v ? { [key]: v } : {}; const out = {}; for (let i = 0, j = 0; j < v.length; i++, j += PART) out[key + '/' + i] = v.slice(j, j + PART); return out; };
 function slotsOf(props) {
-  const out = {};
+  const out = {}, parts = {};
   for (const [k, v] of Object.entries(props || {})) {
     const key = k.replace(/^\//, '');
+    const m = /^(.+)\/(\d+)$/.exec(key);
     if (key === 'sys/weft') { const r = spelling(String(v)); out.formula = '-> /weft/stdlib/' + (r ? r.path.split('/').pop() : String(v)); }
     else if (key === 'sys/tack') out.over = valueOf(v);
+    else if (m && typeof v === 'string' && !(m[1] in out)) (parts[m[1]] = parts[m[1]] || [])[Number(m[2])] = v;
     else out[key] = valueOf(v);
   }
+  for (const [key, ps] of Object.entries(parts)) if (!(key in out)) out[key] = ps.join('');
   return out;
 }
 // a read answer's node as a tree node; a shell (`paged`) is a node with nothing of its own
@@ -837,7 +844,7 @@ function mcpSource(opts = {}) {
   const nextN = async (folder, prefix) => { const page = await rpc('read', { path: folder, care: 'y', limit: 500 }).catch(() => null); return 1 + Math.max(0, ...(((page && page.children) || []).map(c => Number((new RegExp('/' + prefix + '(\\d+)$').exec(c.path) || [])[1] || 0)))); };
   // where a page lands, by the web scheme (hands/schemes/web.json): /user/web/pages/<host>/<slug>, the url its identity,
   // so the same page pasted twice, or by two people, is one record
-  const segOf = t => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, 'n$1').slice(0, 60) || 'index';
+  const segOf = t => String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').replace(/^(\d)/, 'c_$1').slice(0, 60) || 'index';   // the hands' rule: a name starts with a letter, c_ before a digit
   const pagePath = url => { const u = new URL(url); const host = segOf(u.hostname.replace(/^www\./, '')); const slug = segOf((u.pathname.replace(/\/+$/, '').split('/').filter(Boolean).slice(-2).join('_') || 'index') + (u.search ? '_' + u.search.slice(1, 40) : '')); return '/' + (local(views).split('/')[0] || '0x11') + '/user/web/pages/' + host + '/' + slug; };
   // a drop: what lands where. A path or a view is already a name: it becomes a standing at its care. A url lands at the
   // web scheme's place for that page and stands at x. Text or a file lands as a record beneath inputs, named, and
@@ -862,7 +869,7 @@ function mcpSource(opts = {}) {
     else {
       const n = await nextN(base + '/inputs', 'i'); landed = base + '/inputs/i' + n;
       const slots = { name: drop.name || (drop.kind === 'url' ? String(drop.url).replace(/^https?:\/\//, '').slice(0, 80) : String(drop.text || '').split('\n')[0].replace(/\s*\[\/[^\]]*\]/g, '').trim().slice(0, 80)) };
-      if (drop.kind === 'url') slots.url = drop.url; else if (typeof drop.text === 'string' && drop.text.length) slots.text = drop.text.slice(0, 65536); else slots.note = drop.note || 'a file the page could not read as text';
+      if (drop.kind === 'url') slots.url = drop.url; else if (typeof drop.text === 'string' && drop.text.length) Object.assign(slots, parted('text', drop.text.slice(0, 65536))); else if (drop.image) Object.assign(slots, parted('image', drop.image)); else slots.note = drop.note || 'a file the page could not read as text';
       records.push({ path: landed, slots }); standing = { path: local(landed), care: 'x' };
     }
     if (records.length) await rpc('write', { records, who: 'person' });
@@ -1287,7 +1294,7 @@ function mountWorkspace(el, source, opts = {}) {
     return names[path];
   };
   const inputOf = st => state.inputs.find(i => i.path === st.path);
-  const kindOfStanding = st => st.path.startsWith('x/') ? 'view' : (inputOf(st) || {}).url ? 'url' : (inputOf(st) || {}).note ? 'file' : inputOf(st) ? 'text' : 'path';
+  const kindOfStanding = st => { const i = inputOf(st) || {}; return st.path.startsWith('x/') ? 'view' : i.url ? 'url' : (i.note || i.image || (i.archive && !i.text)) ? 'file' : inputOf(st) ? 'text' : 'path'; };
   // where an input stands: landed (a name that exists, a text placed), waiting (a url nobody fetched yet, a name
   // nothing was written at), or still landing
   const refOf = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? local(m[1]) : (typeof v === 'string' && /^(-> )?\/?(0x[0-9a-f]+|x)\//.test(v) ? local(v.replace(/^-> /, '')) : null); };
@@ -1298,6 +1305,8 @@ function mountWorkspace(el, source, opts = {}) {
     if (i && i.url && !i.text && !i.fetched) return ['Pending · fetch', false];
     if (!i && exists[st.path] === false) return ['Pending · nothing at this name yet', false];
     if (i && i.url) return ['Landed · source', true];
+    if (i && i.image) return ['Pending · read', false];
+    if (i && i.archive) return ['Landed · ' + (i.title ? 'read' : 'archived'), true];
     if (i) return ['Landed · ' + (/\[\//.test(String(i.text || '')) ? 'names placed' : 'read'), true];
     return ['Included · reference', true];
   };
@@ -1326,8 +1335,9 @@ function mountWorkspace(el, source, opts = {}) {
   const taskHTML = t => `<div class="task${t.state === 'done' ? ' ok' : t.state === 'working' ? ' run' : ''}${t.state === 'done' && settled[t.path] && Date.now() - settled[t.path] > 2200 ? ' out' : ''}"><div class="tt"><span class="ic2"></span><b>${goHTML(t.path, t.path, t.task || last(t.path), 'n')}</b></div><div class="ts">${t.state === 'done' ? 'Completed' + (t.found ? ' · ' + esc(String(t.found)) : '') : esc(String(t.detail || (t.who === 'person' ? 'Asked by you' : t.who ? 'Auto · ' + t.who : '')))}</div><div class="tb"><i></i></div></div>`;
   const tasksHTML = () => {
     const now = Date.now(), rows = [];
-    for (const t of state.tasks) {
-      if (t.state === 'done') { if (!settled[t.path]) { settled[t.path] = now; setTimeout(drawSide, 2800); } else if (now - settled[t.path] > 2600) { if (!settled[t.path + ' hist']) { settled[t.path + ' hist'] = 1; histAdd((t.task || last(t.path)) + ' → ' + (t.found || 'done')); } continue; } }
+    const order = [...state.tasks.filter(t => t.state === 'working'), ...state.tasks.filter(t => t.state !== 'working').reverse()];
+    for (const t of order) {
+      if (t.state === 'done' && !settled[t.path + ' hist']) { settled[t.path + ' hist'] = 1; histAdd((t.task || last(t.path)) + ' → ' + (t.found || 'done')); }
       rows.push(taskHTML(t));
     }
     const running = state.tasks.filter(t => t.state === 'working').length;
@@ -1428,6 +1438,15 @@ function mountWorkspace(el, source, opts = {}) {
     for (const f of list) {
       const texty = /^text\//.test(f.type) || /\.(md|txt|csv|json|html?|xml|yaml|yml)$/i.test(f.name);
       if (texty && root.FileReader) { const rd = new root.FileReader(); rd.onload = () => drop({ kind: 'file', name: f.name, text: String(rd.result || '') }); rd.readAsText(f); }
+      else if (/^image\//.test(f.type) && root.FileReader && root.Image && root.document) {
+        // an image is shrunk to what a reader needs (1600px, jpeg) so it fits a record; the agent reads it, then archives it
+        const rd = new root.FileReader();
+        rd.onload = () => { const img = new root.Image(); img.onload = () => { let max = 1600, data = '';
+          for (let tries = 0; tries < 3; tries++) { const sc = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight)); const c = root.document.createElement('canvas'); c.width = Math.max(1, Math.round(img.naturalWidth * sc)); c.height = Math.max(1, Math.round(img.naturalHeight * sc)); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); let q = 0.82; data = c.toDataURL('image/jpeg', q); while (data.length > 360000 && q > 0.45) { q -= 0.1; data = c.toDataURL('image/jpeg', q); } if (data.length <= 360000) break; max = Math.round(max * 0.7); }
+          drop({ kind: 'file', name: f.name, image: data }); };
+          img.onerror = () => drop({ kind: 'file', name: f.name, note: `${f.type}, ${f.size} bytes; the page could not decode it` }); img.src = String(rd.result || ''); };
+        rd.readAsDataURL(f);
+      }
       else drop({ kind: 'file', name: f.name, note: `${f.type || 'a file'}, ${f.size} bytes; not read as text, for an agent to digest` });
     }
   };
@@ -1493,7 +1512,7 @@ function mountWorkspace(el, source, opts = {}) {
     if (a && !(e.metaKey || e.ctrlKey)) { e.preventDefault(); for (const li of el.querySelectorAll('li.sel, .rd-e.sel')) li.classList.remove('sel'); const li = a.closest('li, .rd-e'); if (li) li.classList.add('sel'); inspect(a.dataset.go); }
   });
   // anything written beneath the workspace or at a standing redraws it, a moment later; the side at once
-  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; const mine = '/' + node + '/user/workspaces/' + ws; const touched = (msg.touched || []).map(t => '/' + local(t)); if (touched.some(p => p.startsWith(mine) || state.standings.some(st => p === '/' + st.path || p.startsWith('/' + st.path + '/')))) { if (touched.every(p => p.startsWith(mine + '/asks') || p === mine + '/status' || p.startsWith(mine + '/views') || p === mine)) { source.wsRead(ws).then(r => { state = { ...state, ...r }; if (state.name && state.name !== ws) setTitle(state.name); drawSide(); if (state.reading && state.reading.sections.length && view === 'reading') { $('.ws-world-sec').innerHTML = worldHTML(); } }).catch(() => {}); return; } clearTimeout(timer); timer = setTimeout(draw, 2500); } }, { backlog: false });
+  if (source.follow) source.follow(msg => { if (msg.shown || msg.quiet) return; const mine = '/' + node + '/user/workspaces/' + ws; const touched = (msg.touched || []).map(t => '/' + local(t)); if (touched.some(p => p.startsWith(mine) || state.standings.some(st => p === '/' + st.path || p.startsWith('/' + st.path + '/')))) { if (touched.every(p => p.startsWith(mine + '/asks') || p === mine + '/status' || p.startsWith(mine + '/views') || p === mine)) { const hadReading = !!(state.reading && state.reading.sections.length); source.wsRead(ws).then(r => { state = { ...state, ...r }; if (state.name && state.name !== ws) setTitle(state.name); drawSide(); const has = !!(state.reading && state.reading.sections.length); if (has && view === 'reading') { $('.ws-world-sec').innerHTML = worldHTML(); } else if (has && !hadReading) { clearTimeout(timer); timer = setTimeout(draw, 300); } }).catch(() => {}); return; } clearTimeout(timer); timer = setTimeout(draw, 2500); } }, { backlog: false });
   tabs();
   draw().then(() => { if (opts.add) { const d = kindOf(opts.add); if (d && d.kind === 'path' && !state.standings.some(st => st.path === local(d.path))) drop(d); } });
   return el;
