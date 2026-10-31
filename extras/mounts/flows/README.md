@@ -10,8 +10,8 @@ it to evidence and retains its attempts, intermediate values and effects.
 Cells expose the work, overlays provide working views, and hands react to
 dependencies. Holes keep unresolved work attached to its subject.
 The current executor supports ordered compositions, captured child-flow invocations
-and suspended provider requests; automatic extraction of a procedure from exploratory traces is not
-implemented here.
+and suspended provider requests. Retained flow runs can supply selected steps for
+an editable new procedure; arbitrary exploratory activity is not inferred as code.
 The generic installation publishes these capabilities without creating a
 handbook, choosing its evidence, or attaching a provider.
 
@@ -22,8 +22,9 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
 1. Choose **Author a new flow**. **Composition** starts with an ordinary input
    and identity operation. **Document revision** explicitly selects the document
    adapter and its evidence/brief starter.
-2. Edit and save the Semidoc source. Ordinary prose and literal examples stay
-   inert. Only the marked definition is compiled.
+2. Use **Compose an operation or child flow** to select a callable and bind its
+   ports, or edit and save the Semidoc source. Ordinary prose and literal examples
+   stay inert. Only the marked definition is compiled.
 3. **Publish flow** captures the saved definition and selected native laws.
 4. Bind the inputs to namespace paths, choose a destination and a published
    writer, and **Attach maintenance**. `/x/...` can bind a cell or overlay result.
@@ -34,6 +35,80 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
 
 These forms call `namespace_command/plan` and supervisor admission. They do not
 run Python commands or maintain a browser-owned work queue.
+
+### Compose in Nenex
+
+Choose **Compose an operation or child flow**, name the selection, and supply a
+published operation or flow path. The callable's kind is explicit. Selection
+captures the exact native record in `<page>/cells/<selection>` and the form shows
+its declared ports. Each port binds to a named flow input or an earlier step.
+Declare any new input names, choose the step name and result, then **Save composed
+step**. Reusing an existing step name revises that step.
+
+This edits the existing Semidoc AST through the source editor's native guards.
+It preserves unrelated explanation, relationships, repeated bindings and named
+work. The whole resulting procedure must compile before the edit is admitted.
+The source uses native `/h/x/<case>/<length>/...` references for selected laws;
+later publication of the original callable does not retarget them. Publish the
+edited procedure separately. To adopt newer behavior, select it explicitly and
+revise the step. Editing a flow leaves its existing published definition and
+attempts intact until publication.
+
+### Extract a retained run
+
+Page tools show **Extract retained run** for retained previews and completed
+automatic runs beneath the page. Choose executed top-level steps and a new flow
+name. Extraction creates an editable Semidoc page, the original attempt's
+provenance cell, and captured example cells for dependencies outside the selection.
+The procedure retains original dependency order even if the selection is entered
+in another order. Publish it and bind new inputs through the ordinary controls.
+
+Extraction references each exact historical operation or child definition; it
+does not copy an operation registry. Missing historical origins, mismatched laws,
+unknown or unexecuted steps refuse. Nested calls remain child invocations.
+Provider answers remain evidence: they are not turned into hardcoded replay
+steps. This is extraction from the existing typed execution trace, not automatic
+inference of a procedure from arbitrary agent or user activity.
+
+### Declared Goo actions in work
+
+`capture_action` prepares an existing typed `goo_runtime/request` against the
+current native object and declared view. It creates an ordinary frozen value cell
+with the request, an argument preview and object/view snapshots. The pure
+`request_actions` operation takes an `actions` tree of these records and requests
+native work; it never invokes actions while evaluating a cell.
+
+The existing provider hand gives each worker an invocation identity and exposes
+`goo/request` plus `goo/fields` (JSON form fields for the existing `/goo/act`
+endpoint). A native client can submit the typed request through `helm/interact`;
+an agent or person can submit its fields to `/goo/act`. Completion requires the
+existing Goo journal's exact successful request/identity receipt and a current
+work guard. That completion resumes the same flow and resolves its hole. Goo's
+provider time remains bound at invocation; its receipt contract normalizes `now`.
+The argument preview does not freeze that clock. Exact receipt matching refers
+to the view path, control, explicit inputs and revision tokens. Invocation uses
+current declared behavior under Goo's existing guards; the captured preview is
+evidence, not an independently pinned action implementation.
+
+This does not automatically dispatch Goo actions from hands. The current hand
+protocol cannot call the supervisor's interaction boundary; no additional bridge
+or execution loop is installed. Rejected/stale requests leave work unresolved.
+Reprepare and rebind changed object/view evidence to select a fresh request;
+retrying alone does not refresh captured revisions. Distinct retries retain their
+own invocation identities. A receipt proves an action happened, not that its
+target remained unchanged afterward. The existing Goo receipt journal's capacity
+and retention limits still apply.
+The work guard controls receipt acceptance; Goo's object and publication guards
+control execution. Invalidating a work attempt does not revoke an already issued
+Goo request. A later invocation can still have an effect if Goo's own guards pass,
+even though the flow refuses its result.
+
+The existing Goo publication guard versions the whole `/gov` subtree. Flow
+attachment changes claims there, so attach before capturing and binding an
+action; later publication changes require fresh preparation. Two actions that
+modify the same receiver also need separate preparation against the appropriate
+revision. These are native request/receipt operations, not browser capture
+controls or an autonomous sequence of freshly prepared GUI actions.
 
 ### Embed a published flow on another page
 
@@ -180,7 +255,9 @@ Publish the child from Nenex first, then refer to its definition in the caller:
 Each repeated `flow/bind` supplies one child input. Later steps can bind the returned
 value by the invocation's name. Publishing the parent captures the selected child
 definition and its native laws. Republishing the child leaves existing parent
-definitions and attempts intact; explicitly republish the parent to select it.
+definitions and attempts intact. A plain live path selects its current publication
+when the parent is republished; an explicit historical path stays pinned until the
+authored reference changes. Nenex's composition controls author historical paths.
 
 The evaluator runs the child in authored order inside the same parent invocation.
 Each nested step gets a distinct identity, so two calls to the same procedure have
@@ -198,7 +275,8 @@ including the optional pages payload in `flow/definition`, are unchanged.
 
 The implemented composition is ordered and acyclic. Publication checks names,
 bindings and port names and captures the chosen laws. General branching,
-reflective extraction and model operation through Goo are not implemented here.
+inference from arbitrary exploratory traces and automatic Goo action dispatch
+from hands are not implemented here.
 Limits are 16 inputs, 16 steps and 32 authored pages. Names are canonical symbols
 up to 64 characters. **Edit source** authors executable declarations; Nenex's Goo
 editor preserves those declarations when editing text or moving their blocks.

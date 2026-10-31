@@ -1,0 +1,128 @@
+- flow_operations
+- flow_runtime_ops
+- goo_runtime
+
+' Goo supplies the declaration interpreter and admission boundary. A flow only
+' retains a requested action and waits for that boundary's existing receipt.
+' Neither cell evaluation nor a hand replays an action as a side effect.
+' The task guard controls result acceptance, not Goo authority. An external
+' client can still invoke a superseded request if Goo's own guards match;
+' revoking that effect would require a guarded dispatch boundary, absent here.
++ flow_action_ops
+  + valid
+    \ query=goo_runtime/request
+    ^ bool
+    = fields query.inputs.all((\ [key value] (and !(eq key "$invocation") (eq (query.inputs.keep((\ [other ignored] (eq key other)))).len 1))))
+    | and (eq query.operation "act") (and (gt query.control.len 0) (and (le query.inputs.len 64) fields))
+  + prepare
+    ' Select against one native snapshot. Versions are deliberately captured
+    ' here; submission still goes through Goo's current authority and guards.
+    ' Arguments are a preparation preview: Goo's provider clock remains bound
+    ' at invocation, and its existing receipt contract normalizes now to zero.
+    \ query=goo_runtime/request state=namespace
+    ^ either[str axal[myth]]
+    ? !(flow_action_ops/valid query) (./err "Expected a declared Goo action without an invocation identity.")
+    ?> (./some subject) (goo_runtime/target query.target state) (./err "Presentation has no writable source object.")
+    ? !(and (state.permitted(subject)) (pith_prefix [state.self 'app] subject)) (./err "Object is outside application authority.")
+    ?> (./some current) (goo_runtime/record .x subject state) (./err "Object is unavailable.")
+    ?> (./some published) (goo_runtime/record .x query.view state) (./err "View is unavailable.")
+    = query query.set_subject(subject).set_expected(state.case(.x subject).fall(0))
+      query query.set_displayed(state.case(.y query.target).fall(0)).set_publication((goo_runtime/publication state)).set_now(0)
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+    ? !(scope.make.is_some || scope.action.is_some) (./err "Declared control has no action.")
+    < arguments (goo_runtime/prepared query published current state)
+    = root (myth/sing ['goo 'request] query).put(['goo 'arguments] (cell_view (pin (flow_ops/empty).put([] arguments))))
+      root root.put(['goo 'subject] (cell_view (pin (flow_ops/empty).put([] current))))
+      root root.put(['goo 'publication] (cell_view (pin (flow_ops/empty).put([] published))))
+      root root.put(['goo 'origin] (safe state.case(.x query.view).fall(0) .x query.view))
+      root root.put(['goo 'subject_origin] (safe query.expected .x subject))
+    | ./ok (flow_ops/empty).put([] root)
+  + capture
+    \ target=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(flow_runtime_ops/valid_arguments [['goo 'request]] input) (./err 'flow_invalid_arguments)
+    ? !(and (state.permitted(target)) (pith_prefix [state.self 'app] target)) (./err 'write_outside_authority)
+    ? ((state.case(.x target).is_some) || (sovereign_peek target state).wyt) (./err 'flow_action_capture_collision)
+    ?> query=goo_runtime/request input.pail_at(['goo 'request]) (./err 'flow_missing_action)
+    ?> (./ok prepared) (flow_action_ops/prepare query state) (./err 'flow_invalid_action)
+    | ./ok [[target (writ/make (native_work_ops/value state.self (pin prepared)))]]
+  + request
+    \ args=axal[myth]
+    ^ either[iota axal[myth]]
+    = actions args.dip(['actions])
+    ? !(actions.wyt) (./err 'flow_empty_actions)
+    ? (gt actions.wyt 16) (./err 'flow_action_request_limit)
+    % todo=row[[path myth]] actions.tap tasks=axal[myth] flow_ops/empty
+    ^ either[iota axal[myth]]
+    ?> (./some pair) todo.pull
+      | ./ok (axal/new[myth] (./some (myth/sing ['flow 'judgment] (flow/judgment (pin tasks)))))
+    = [entry rest] pair
+      [name card] entry
+    ?> query=goo_runtime/request card.pail_at(['goo 'request]) (./err 'flow_missing_action)
+    ? !(flow_action_ops/valid query) (./err 'flow_invalid_action)
+    = prompt (str/cat_all ["Invoke the retained declared Goo action on " (path_show query.target) "; completion requires its native invocation receipt."])
+      task (myth/sing ['work 'prompt] (pails/t prompt)).put(['work 'schema] (pails/t "{}"))
+      task task.put(['work 'provider] (native_work/provider (flow_action_ops/make query)))
+      task task.put(['work 'evidence] (cell_view (pin (flow_ops/empty).put([] card)))).put(['goo 'request] query)
+    | _ rest tasks.put(name task)
+  + identity
+    \ worker=path
+    ^ str
+    | str/cat_all ["flow:" (path_show worker)]
+  + make
+    \ query=goo_runtime/request target=path request=native_work/request
+    ^ myth
+    = query query.set_now(0).set_inputs(query.inputs.snoc(["$invocation" (flow_action_ops/identity target)]))
+      record (native_work_ops/open request.owner "goo-action" (myth/sing ['work 'request] request))
+      deps (crew/sing ['guard] (dep request.guard.care request.guard.path))
+      deps deps.put(['receipts] (dep .x [target.at(0) 'weft 'goo_receipts]))
+      record record.put(['goo 'request] query).put(['goo 'fields] (pails/t (flow_action_ops/fields query)))
+      record record.put(limb_slot (kook [[target.at(0) 'gov 'flows 'action_work]]))
+    | record.put(crew_slot (cpail deps)).put(system_vocabulary/content (pails/t "Awaiting invocation through the declared Goo action interface"))
+  + fields
+    ' Form fields for the existing /goo/act entry point, not a second action
+    ' protocol. Native clients may pass the typed request to helm/interact.
+    \ query=goo_runtime/request
+    ^ str
+    = inputs query.inputs.map((\ [key value] (jkv (? (eq key "$invocation") "invocation" (str/cat_all ["input:" key])) (json/str value))))
+      fields=row[jkv] [
+        (jkv "target" (json/str (path_show query.target)))
+        (jkv "subject" (json/str (path_show query.subject)))
+        (jkv "view" (json/str (path_show query.view)))
+        (jkv "control" (json/str (str/join "." query.control.map(nat/show))))
+        (jkv "expected" (json/str (nat/show query.expected)))
+        (jkv "displayed" (json/str (nat/show query.displayed)))
+        (jkv "publication" (json/str (nat/show query.publication)))]
+    | show (json/obj fields.weld(inputs))
+  + advance
+    \ b=bowl record=myth
+    ^ yell
+    ? record.has(['work 'outcome]) (yell [] record)
+    ?> query=goo_runtime/request record.pail_at(['goo 'request]) (yell [] record)
+    ?> (./some current) (native_work_ops/captured_at b.crew.gut(['guard] flow_ops/empty)) (yell [] record)
+    = retained=native_work/captured
+        ?> held=native_work/captured record.pail_at(['capture]) current
+        held
+      record record.put(['capture] retained)
+    ? !(equal[pin[native_work/captured]] (pin current) (pin retained))
+      | native_work_ops/result b.here (native_work/outcome "failed" "Action evidence changed; this worker cannot accept its invocation receipt" (pin retained)) record
+    = journal b.crew.gut(['receipts] flow_ops/empty).fil.fall(myth/new)
+    ?> receipts=goo_runtime/receipts journal.pail_at(goo_runtime/receipt_slot) (yell [] record)
+    = matched receipts.entries.keep((\ entry (eq entry.identity (flow_action_ops/identity b.here))))
+    ? !(matched.len) (yell [] record)
+    ? !(and (eq matched.len 1) (equal[goo_runtime/request] matched.head.request query.set_now(0)))
+      | native_work_ops/result b.here (native_work/outcome "failed" "Goo invocation identity was reused with a different request" (pin retained)) record
+    | native_work_ops/result b.here (native_work/outcome "complete" matched.head.body (pin retained)) record
+  + hear
+    \ b=bowl record=myth changes=row[dep]
+    ^ yell
+    | flow_action_ops/advance b record
+  + talk
+    \ b=bowl record=myth input=myth
+    ^ yell
+    | flow_action_ops/advance b record.meld(input)
+  + form
+    ^ form
+    | def_form.set_init(native_work_ops/wake).set_hear(flow_action_ops/hear).set_talk(flow_action_ops/talk)

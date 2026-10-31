@@ -114,9 +114,19 @@ this work does not rebrand retained values or claim to remove that historical fi
 Composition reuses native dispatch and holes, captures child definitions and bindings,
 and gives effects an admitted writer. Evaluation is bounded to eight nested calls
 and 128 executed steps across the whole invocation. Child publication takes effect
-for callers only when they are explicitly republished. Flow extraction from traces,
-ambient inherited bindings and independently scheduled child controllers remain
-outside this implementation.
+for live-path callers only when they are explicitly republished; explicit native
+historical references remain pinned. Nenex composition controls author these
+references and repeated bindings in Semidoc itself. Selected executed steps from
+retained runs can become new Semidoc procedures with external dependencies exposed
+as inputs. Arbitrary exploratory traces, ambient inherited bindings and independently
+scheduled child controllers remain outside this implementation.
+
+Declared Goo actions reuse the existing request interpreter and receipt journal.
+A flow requests native work and its hand observes an exact successful invocation
+receipt before accepting a result. Execution still enters through the existing
+Goo interaction boundary; no hand-side action interpreter or automatic dispatch
+loop is added. Source authoring and extraction belong to the Nenex flow adapter;
+the action work provider belongs to the shared harness.
 
 ## Validation and saved worlds
 
