@@ -1,5 +1,11 @@
 # Native Grove/Foil block document plan
 
+Historical prototype plan. Its implementation now lives in
+[`extras/tests/fixtures/block-document`](../../extras/tests/fixtures/block-document/README.md)
+as a Goo regression fixture. Nenex uses Semidoc/native records rather than this
+prototype's block and snapshot model. See the current
+[extras ownership map](../../extras/HARNESS.md) before extending the harness or editor.
+
 Build a small block document on the text and presentation contracts in
 `origin/lf/goo-contracts`. Grove declares the document, actions and views; Foil
 implements the model, operations and derived presentations. Shrine owns accepted

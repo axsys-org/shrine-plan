@@ -1,81 +1,48 @@
-"""Capture repository evidence through Eden's existing filesystem mount.
+"""Stage declared source bytes for Eden's existing filesystem capture foot.
 
-No work polling, model dispatch, document writes or flow lifecycle lives here.
+No evidence envelopes, hashing, polling or flow execution live in the host.
 """
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
-
-
-def validate_bundle(bundle):
-    """Accept a replay only when the source bytes still match its captured hashes."""
-    sources = bundle['sources']
-    if not isinstance(sources, dict) or not 1 <= len(sources) <= 64:
-        raise ValueError('bundle must contain between 1 and 64 named sources')
-    for name, source in sources.items():
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name):
-            raise ValueError('invalid source name: ' + name)
-        if set(source) != {'location', 'title', 'digest', 'format', 'content'} or not all(
-                isinstance(value, str) for value in source.values()):
-            raise ValueError('incomplete source envelope: ' + name)
-        raw = source['content'].encode('utf-8')
-        if not source['location'] or not 0 < len(raw) <= 131072:
-            raise ValueError('invalid source size or location: ' + name)
-        if hashlib.sha256(raw).hexdigest() != source['digest']:
-            raise ValueError('source digest mismatch: ' + name)
-    encoded = json.dumps(sources, ensure_ascii=False, sort_keys=True).encode('utf-8')
-    if len(encoded) > 1500000:
-        raise ValueError('source inventory exceeds the client materialization budget')
-    if hashlib.sha256(encoded).hexdigest() != bundle['digest']:
-        raise ValueError('bundle digest mismatch')
-    return bundle
-
-
-def capture_sources(repo, manifest):
-    """Capture the complete declared inventory before publishing scan output."""
-    repo = Path(repo).resolve()
-    entries = json.loads(Path(manifest).read_text(encoding='utf-8'))
-    if not isinstance(entries, dict) or not 1 <= len(entries) <= 64:
-        raise ValueError('manifest must contain between 1 and 64 named sources')
-    sources = {}
-    for name, entry in sorted(entries.items()):
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', name):
-            raise ValueError('invalid source name: ' + name)
-        path = (repo / entry['path']).resolve()
-        if not path.is_relative_to(repo):
-            raise ValueError('source escapes repository: ' + entry['path'])
-        raw = path.read_bytes()
-        if not 0 < len(raw) <= 131072:
-            raise ValueError('source must contain 1..131072 bytes: ' + entry['path'])
-        sources[name] = dict(location=entry['path'], title=entry.get('title', name),
-                             digest=hashlib.sha256(raw).hexdigest(),
-                             format=path.suffix.lstrip('.') or 'text',
-                             content=raw.decode('utf-8'))
-    encoded = json.dumps(sources, ensure_ascii=False, sort_keys=True).encode('utf-8')
-    if len(encoded) > 1500000:
-        raise ValueError('source inventory exceeds the client materialization budget')
-    return validate_bundle({'digest': hashlib.sha256(encoded).hexdigest(), 'sources': sources})
 
 
 capture_workspace = None
 
 
 def scan(root, bag):
-    repo = Path(os.environ.get('SHRINE_FLOW_SOURCE_ROOT') or capture_workspace or root.parents[2])
-    for path in root.iterdir():
-        if path.is_file():
-            shutil.copyfile(path, bag / path.name)
-    # A configured inventory is external evidence, not a prerequisite for
-    # installing or recompiling the shared harness in another workspace.
-    try:
-        value = capture_sources(repo, root / 'sources.json')['sources']
-    except (OSError, ValueError, KeyError, UnicodeError) as error:
-        value = {'capture_error': str(error)}
-    (bag / 'repository-evidence.json').write_text(
-        json.dumps(value, ensure_ascii=False), encoding='utf-8')
+    repo = Path(os.environ.get('SHRINE_FLOW_SOURCE_ROOT') or capture_workspace or root.parents[2]).resolve()
+    staged = {path.name: path for path in root.iterdir() if path.is_file()}
+    staged.update({path.name: path for path in (root / 'examples').glob('*.semidoc')})
+    catalogue = root / 'examples.json'
+    examples = json.loads(catalogue.read_text()) if catalogue.is_file() else {}
+    source_files = set()
+    for example in examples.values():
+        for spec in example.get('sources', {}).values():
+            leaf = spec['file']
+            if not leaf or Path(leaf).name != leaf or leaf in ('.', '..'):
+                raise ValueError('Source files must have flat names: ' + leaf)
+            source = (repo / spec['path']).resolve()
+            if not source.is_relative_to(repo):
+                raise ValueError('Source escapes workspace: ' + spec['path'])
+            if leaf in staged and (leaf not in source_files or staged[leaf] != source):
+                raise ValueError('Different source files must have distinct names: ' + leaf)
+            source_files.add(leaf)
+            staged[leaf] = source
+    present = set()
+    for leaf, source in staged.items():
+        try:
+            shutil.copyfile(source, bag / leaf)
+            present.add(leaf)
+        except OSError:
+            # Missing/unreadable bytes must disappear from the current scan.
+            # Native capture history and attempts remain owned by the world.
+            if leaf not in source_files:
+                raise
+    for path in bag.iterdir():
+        if path.is_file() and path.name not in present:
+            path.unlink()
 
 
 def prepare(root, work, check, cleanup, context):
@@ -84,4 +51,4 @@ def prepare(root, work, check, cleanup, context):
     bag = work / 'flows' / 'bag'
     bag.mkdir(parents=True)
     scan(root, bag)
-    return bag, []
+    return bag, [f'/{context["node"]}/io/web']

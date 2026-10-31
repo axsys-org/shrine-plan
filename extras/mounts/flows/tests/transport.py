@@ -3,14 +3,13 @@ import json
 from pathlib import Path
 import runpy
 import sys
-import tempfile
 import uuid
 from urllib.request import urlopen
 from urllib.parse import quote
 from urllib.error import HTTPError
 
-api = runpy.run_path(str(Path(__file__).parents[1] / 'client.py'))
-FlowClient, prepare = api['FlowClient'], api['prepare']
+api = runpy.run_path(str(Path(__file__).parent / 'client.py'))
+FlowClient = api['FlowClient']
 
 
 def check(base):
@@ -46,17 +45,11 @@ def check(base):
       Keep related fields in a cohesive value.
 """ + '\n  ' + ('Source export must preserve complete authored prose. ' * 180) + '\n'
     # Pure import is an independent operation; the shipped handbook uses judgment.
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        (root / 'manual.md').write_text('# Manual\n\n## Authoring\n\nKeep related fields together.\n\n| Field | Meaning |\n| --- | --- |\n| name | Display name |\n')
-        manifest = root / 'sources.json'
-        manifest.write_text(json.dumps({'manual': {'path': 'manual.md'}}))
-        bundle = prepare(root, manifest)
+    manual = '# Manual\n\n## Authoring\n\nKeep related fields together.\n\n| Field | Meaning |\n| --- | --- |\n| name | Display name |\n'
     try:
         c.author(author, source)
         assert len(source.encode()) > 8192 and c.source(author) == source
-        for name, record in bundle['sources'].items():
-            c.apply('import_source', inputs + '/' + name, record)
+        inputs = c.import_texts({'manual': manual})
         definition = c.publish(author, 'import_guide')
         run = c.preview(definition, destination, {'sources': inputs}, ident='first')
         assert not c.read(destination)['exists']

@@ -1,5 +1,9 @@
 # Shrine extras
 
+Start with [Harness, documents, and applications](HARNESS.md) for the ownership
+map: native work, flows, providers, Nenex, their integration, examples and fixtures.
+The harness shares one native world; the handbook is an authored flow.
+
 For a worked example, read [Making a Grove and Goo mount](tutorials/grove-goo-mount.md).
 Its runnable `hello-grove` mount includes a notes list, reader, and editor.
 
@@ -64,7 +68,8 @@ remain under `/lib` and `/gov`; installed instances remain separate. Rescans
 publish valid candidate outputs atomically and retain the last successful output
 on failure. Application activation runs only when creating the world. Existing instances, HTTP handlers,
 assets and registered drivers remain pinned until explicitly installed or started
-again. No watcher or automatic migration runs.
+again. Filesystem source watches are explicitly attached and reconciled by the
+existing foot; a source scan is not an automatic service or world migration.
 
 The debugger's host entrypoint builds through `extras/flake.nix`, whose Mash
 input is pinned separately from core's tools. Source rescans refresh current
@@ -105,8 +110,9 @@ repository root. Native work/source/retry behavior belongs to `tests/flows`;
 `flow_ui_tests` checks the forms and rendering that invoke it. Nenex question
 tests use Nenex and cooperative work directly, without a flows test dependency.
 Core Goo runtime checks run in the core gate; mounted Goo text, style and view
-checks run in explorer's `test_goo_v2` suite. Block-document checks cover its
-document operations rather than re-registering those shared Goo cases.
+checks run in explorer's `test_goo_v2` suite. The test-only `tests/fixtures/block-document` covers its
+small document operations rather than re-registering those shared Goo cases; it
+is not Nenex's document model or a production mount.
 The component browser check owns rich formatting, undo and draft retention;
 the block-document browser check owns structural editing and exact typed
 save/reload. The filesystem actor check owns cancellation acknowledgements;

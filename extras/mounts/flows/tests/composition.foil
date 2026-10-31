@@ -1,0 +1,194 @@
+- tests/flows [at=fixture]
+- flow_request_tests [at=request_fixture]
+
+' Authored invocation uses the existing publication, evaluator and native work
+' lifecycle. These worlds contain no transport process or running application.
++ composition_tests
+  + child
+    ^ path
+    [($x 17) 'app 'nenex 'w 'shared_child]
+  + definition
+    ^ path
+    | (composition_tests/child).weld(['flows 'child])
+  + author
+    \ target=path id=str source=str state=namespace
+    ^ namespace
+    = authored (fixture/flow_tests/apply 'author target
+        (myth/sing ['source] (pails/t source)).put(['expected] (pails/n state.case(.x target).fall(0))) state)
+    | fixture/flow_tests/apply 'publish target
+        (myth/sing ['id] (pails/t id)).put(['expected] (pails/n authored.case(.x target).fall(0))) authored
+  + increment
+    \ amount=nat args=axal[myth]
+    ^ either[iota axal[myth]]
+    = value args.get(['value]).fall(myth/new).nat_at(['amount] 0)
+    | ./ok (axal/new[myth] (./some (myth/sing ['amount] (pails/n (add value amount)))))
+  + pure_child
+    \ operation=nat
+    ^ str
+    | str/from_atom (joined 10
+      [";. /shared_child" "  ;@ /flow/definition child" "  ;= Reusable arithmetic"
+       "    ;@ /flow/input values" "    ;= Input"
+       (cord/cat "    ;@ /flow/step output ;/0x11/gov/flows/operations/" operation)
+       "    ;@ /flow/bind value values" "    ;= Transform"
+       "    ;@ /flow/result output" "    ;= Result"])
+  + pure_parent
+    ^ str
+    | str/from_atom (joined 10
+      [";. /parent" "  ;@ /flow/definition parent" "  ;= Ordered composition"
+       "    ;@ /flow/input values" "    ;= Input"
+       "    ;@ /flow/invoke first ;/0x11/app/nenex/w/shared_child/flows/child"
+       "    ;@ /flow/bind values values" "    ;= First call"
+       "    ;@ /flow/invoke second ;/0x11/app/nenex/w/shared_child/flows/child"
+       "    ;@ /flow/bind values first" "    ;= Second call consumes first"
+       "    ;@ /flow/result second" "    ;= Result"])
+  + evaluated
+    \ definition=flow/definition
+    ^ nat
+    = value (axal/new[myth] (./some (myth/sing ['amount] (pails/n 40))))
+      inputs (axal/new[axal[myth]] .none).put(['values] value)
+    ?> (./ok result) (flow_ops/evaluate definition inputs) 999
+    | (unpin result.result).fil.fall(myth/new).nat_at(['amount] 999)
+  + pure
+    \ ignored=unit
+    ^ row[testing/check]
+    = root=path [($x 17) 'gov 'flows 'operations]
+      state (fixture/flow_tests/poke root.snoc('add_one)
+        (myth/sing (flow_ops/key ($x 17) 'operation) (flow/operation ['value] (composition_tests/increment 1))) fixture/flow_tests/initial)
+      state (fixture/flow_tests/poke root.snoc('add_ten)
+        (myth/sing (flow_ops/key ($x 17) 'operation) (flow/operation ['value] (composition_tests/increment 10))) state)
+      original (composition_tests/author composition_tests/child "child" (composition_tests/pure_child "add_one") state)
+      origin (safe 1 .x [($x 17) 'app 'nenex 'w 'parent])
+    ?> (./ok captured) (flow_ops/compile 'parent origin composition_tests/pure_parent original)
+      [(testing/nat "authored child invocation compiles" 1 0)]
+    = updated (composition_tests/author composition_tests/child "child" (composition_tests/pure_child "add_ten") original)
+    ?> (./ok latest) (flow_ops/compile 'parent origin composition_tests/pure_parent updated)
+      [(testing/nat "parent republishes against current child" 1 0)]
+    = input=axal[myth] (axal/new[myth] (./some (myth/sing ['amount] (pails/n 40))))
+      values=axal[axal[myth]] (axal/new[axal[myth]] .none).put(['values] input)
+    ?> (./ok evaluation) (flow_ops/evaluate captured values)
+      [(testing/nat "captured composition evaluates" 1 0)]
+    = captures=row[flow/event] (evaluation.trace.keep((\ event=flow/event (unpin event.value).fil.fall(myth/new).has(['flow 'invoke]))))
+      unique=bool (evaluation.trace.all((\ event=flow/event (eq 1 (evaluation.trace.keep((\ other=flow/event (equal[iota] event.name other.name)))).len))))
+      captured_input=nat
+        ?> (./some event) (row/pull[flow/event] captures) 999
+        = [first rest] event
+        ?> value=cell_view (unpin first.value).fil.fall(myth/new).pail_at(['input 'values]) 999
+        | (unpin value.tree).fil.fall(myth/new).nat_at(['amount] 999)
+      budget=either[iota [flow/evaluation nat]] (flow_ops/evaluate_scoped captured values flow_ops/empty captured [] 2)
+      depth=either[iota [flow/evaluation nat]] (flow_ops/evaluate_scoped captured values flow_ops/empty captured ['a 'b 'c 'd 'e 'f 'g 'h 'i] 128)
+    [(testing/nat "second invocation consumes first result in authored order" 42 (composition_tests/evaluated captured))
+     (testing/nat "published child replacement does not mutate captured parent" 42 (composition_tests/evaluated captured))
+     (testing/nat "new parent publication explicitly selects new child" 60 (composition_tests/evaluated latest))
+     (testing/nat "invocation origin is the child definition record" 1 (equal[path] captured.steps.at(0).origin.path composition_tests/definition))
+     (testing/nat "child definition reference has an exact retained moment" 1 (gt captured.steps.at(0).origin.ver 0))
+     (testing/nat "republishing child advances selected moment" 0 (equal[safe] captured.steps.at(0).origin latest.steps.at(0).origin))
+     (testing/nat "sibling invocation names cannot share a suspension identity" 0 (equal[iota] (flow_ops/scoped ['first] 'fetched) (flow_ops/scoped ['second] 'fetched)))
+     (testing/nat "nested identity cannot collide with authored symbol" 0 (equal[iota] (flow_ops/scoped ['first] 'fetched) 'first_fetched))
+     (testing/nat "nested segmentation remains unambiguous" 0 (equal[iota] (flow_ops/scoped ['a 'bc] 'd) (flow_ops/scoped ['ab 'c] 'd)))
+     (testing/nat "call captures and step results have distinct trace names" 1 unique)
+     (testing/nat "each invocation retains its definition and bound inputs" 2 captures.len)
+     (testing/nat "first invocation captures exact input" 40 captured_input)
+     (testing/nat "nested evaluation shares a total step budget" 1 (either/is_err budget))
+     (testing/nat "nested evaluation enforces a depth bound" 1 (either/is_err depth))]
+  + request_child
+    ^ str
+    | str/from_atom (joined 10
+      [";. /shared_child" "  ;@ /flow/definition child" "  ;= Shared native request"
+       "    ;@ /flow/input sources" "    ;= Evidence"
+       "    ;@ /flow/step fetched ;/0x11/gov/flows/operations/test_request"
+       "    ;@ /flow/bind value sources" "    ;= Request native work"
+       "    ;@ /flow/result fetched" "    ;= Return response"])
+  + request_parent
+    ^ str
+    | str/from_atom (joined 10
+      [";. /author" "  ;@ /flow/definition handbook" "  ;= Two calls, one shared procedure"
+       "    ;@ /flow/input sources" "    ;= Evidence"
+       "    ;@ /flow/invoke first ;/0x11/app/nenex/w/shared_child/flows/child"
+       "    ;@ /flow/bind sources sources" "    ;= First independent request"
+       "    ;@ /flow/invoke second ;/0x11/app/nenex/w/shared_child/flows/child"
+       "    ;@ /flow/bind sources sources" "    ;= Second independent request"
+       "    ;@ /flow/step pages ;/0x11/gov/flows/operations/test_pages"
+       "    ;@ /flow/bind responses second" "    ;= Publish second result"
+       "    ;@ /flow/result pages" "    ;= Output"])
+  + started
+    ^ namespace
+    = state fixture/flow_tests/prepared
+      state (fixture/flow_tests/poke [($x 17) 'gov 'flows 'request_provider]
+        (myth/sing system_vocabulary/form (def_form.set_init(native_work_ops/wake).set_hear(request_fixture/request_tests/hear).set_talk(request_fixture/request_tests/talk))) state)
+      root=path [($x 17) 'gov 'flows 'operations]
+      state (fixture/flow_tests/poke root.snoc('test_request)
+        (myth/sing (flow_ops/key state.self 'operation) (flow/operation ['value] request_fixture/request_tests/request)) state)
+      state (fixture/flow_tests/poke root.snoc('test_pages)
+        (myth/sing (flow_ops/key state.self 'operation) (flow/operation ['responses] request_fixture/request_tests/pages)) state)
+      state (composition_tests/author composition_tests/child "child" composition_tests/request_child state)
+      state (composition_tests/author fixture/flow_tests/author "handbook" composition_tests/request_parent state)
+    | fixture/flow_tests/apply 'follow fixture/flow_tests/controller fixture/flow_tests/follow_request state
+  + hole
+    \ call=iota
+    ^ path
+    | (fixture/flow_tests/destination).weld(['readme 'holes 'flow_spec (flow_ops/scoped [call] 'fetched)])
+  + retry
+    \ ignored=unit
+    ^ row[testing/check]
+    = first composition_tests/started
+      a (request_fixture/request_tests/attempt 1)
+      initial (fixture/flow_tests/get a first)
+      original_x first.local.x_case(a).fall(0)
+      original_y first.local.y_case(a).fall(0)
+      original_z first.local.z_case(a).fall(0)
+      second (request_fixture/request_tests/deliver a "complete" "First response" first)
+      b (request_fixture/request_tests/attempt 2)
+      failed (request_fixture/request_tests/deliver b "failed" "Second child failed" second)
+      failed_record (fixture/flow_tests/get b failed)
+      retry (myth/sing ['expected] (pails/n failed.case(.x b).fall(0)))
+      retried (fixture/flow_tests/apply 'retry_revision b retry failed)
+      c (request_fixture/request_tests/attempt 3)
+      done (request_fixture/request_tests/deliver c "complete" "Second child recovered" retried)
+      view (sovereign_view .z 0 (row/cons[iota] 'x (fixture/flow_tests/controller).weld(['cells 'work])) done)
+    [(testing/nat "first child dispatches through shared native provider" 1 initial.has(['work 'request]))
+     (testing/nat "later child does not dispatch before first result" 0 (fixture/flow_tests/get b first).has(['work 'request]))
+     (testing/nat "pending first child uses its scoped step" 1 (equal[pail] initial.pail_at(['flow 'request_step]) (pails/q (flow_ops/scoped ['first] 'fetched))))
+     (testing/nat "child pending work creates native context overlay" 1 (fixture/flow_tests/get a.snoc('view) first).has(bond/weft))
+     (testing/nat "first child result cannot resolve identical sibling task" 1 (fixture/flow_tests/get b second).has(['work 'request]))
+     (testing/nat "sibling receives distinct scoped step" 1 (equal[pail] (fixture/flow_tests/get b second).pail_at(['flow 'request_step]) (pails/q (flow_ops/scoped ['second] 'fetched))))
+     (testing/text "first child hole is independently resolved" "resolved" (fixture/flow_tests/get (composition_tests/hole 'first) second).txt_at(['work 'status]))
+     (testing/nat "second child owns separate persistent hole" 1 (fixture/flow_tests/get (composition_tests/hole 'second) second).has(['work 'hole]))
+     (testing/nat "suspended sibling prevents document publication" 0 (fixture/flow_tests/get fixture/flow_tests/destination second).has(['src]))
+     (testing/text "failed child is retained as waiting work" "waiting" failed_record.txt_at(['work 'status]))
+     (testing/nat "retry uses native predecessor link" 1 (equal[maybe[path]] (fixture/flow_tests/get c retried).path_at(['work 'retry_of]) (./some b)))
+     (testing/text "child retry finishes shared work" "complete" (fixture/flow_tests/get c done).txt_at(['work 'status]))
+     (testing/nat "parent publishes exactly after both children finish" 1 (fixture/flow_tests/progress done).generation)
+     (testing/nat "published parent uses second child output" 1 (cord/has "Second child recovered" (str/to_atom (fixture/flow_tests/get fixture/flow_tests/destination done).txt_at(['src]))))
+     (testing/nat "failed attempt retains its capture and refusal" 1 (equal[pail] failed_record.pail_at(['capture]) (fixture/flow_tests/get b done).pail_at(['capture])))
+     (testing/text "failed attempt remains waiting after retry completes" "waiting" (fixture/flow_tests/get b done).txt_at(['work 'status]))
+     (testing/text "retry resolves only its child hole" "resolved" (fixture/flow_tests/get (composition_tests/hole 'second) done).txt_at(['work 'status]))
+     (testing/nat "composed work is readable through ordinary Cells" 1 (?=((./known _) view)))
+     (testing/nat "first child historical x retained" 1 (equal (sov/x_query original_x a first.local) (sov/x_query original_x a done.local)))
+     (testing/nat "first child historical y retained" 1 (equal (sov/y_query original_y a first.local) (sov/y_query original_y a done.local)))
+     (testing/nat "first child historical z retained" 1 (equal (sov/z_query original_z a first.local) (sov/z_query original_z a done.local)))]
+  + changed_evidence
+    \ ignored=unit
+    ^ row[testing/check]
+    = first composition_tests/started
+      a (request_fixture/request_tests/attempt 1)
+      initial (fixture/flow_tests/get a first)
+      changed (fixture/flow_tests/poke fixture/flow_tests/input_path
+        (myth/sing ['flow 'source] (flow/source "README.md" (str/repeat 64 "b") "md" "Changed evidence")) first)
+      b (request_fixture/request_tests/attempt 2)
+      late (request_fixture/request_tests/deliver a "complete" "Obsolete child output" changed)
+      second (request_fixture/request_tests/deliver b "complete" "Current first child" late)
+      c (request_fixture/request_tests/attempt 3)
+      done (request_fixture/request_tests/deliver c "complete" "Current second child" second)
+    [(testing/nat "changed evidence creates fresh child attempt" 1 (flow_request_ops/native (fixture/flow_tests/get b changed)))
+     (testing/text "obsolete child outcome is refused" "waiting" (fixture/flow_tests/get a late).txt_at(['work 'status]))
+     (testing/nat "obsolete child cannot publish parent output" 0 (fixture/flow_tests/get fixture/flow_tests/destination late).has(['src]))
+     (testing/nat "old child capture remains exact" 1 (equal[pail] initial.pail_at(['capture]) (fixture/flow_tests/get a done).pail_at(['capture])))
+     (testing/nat "current first child advances to second call" 1 (equal[pail] (fixture/flow_tests/get c second).pail_at(['flow 'request_step]) (pails/q (flow_ops/scoped ['second] 'fetched))))
+     (testing/nat "current child outputs publish one generation" 1 (fixture/flow_tests/progress done).generation)
+     (testing/nat "fresh parent output excludes obsolete result" 0 (cord/has "Obsolete child output" (str/to_atom (fixture/flow_tests/get fixture/flow_tests/destination done).txt_at(['src]))))]
+
++ tests
+  ^ row[testing/case]
+  [(testing/case "Pinned authored child composition" composition_tests/pure)
+   (testing/case "Composed native requests, holes and retries" composition_tests/retry)
+   (testing/case "Composed requests reject changed evidence" composition_tests/changed_evidence)]

@@ -1,0 +1,154 @@
+- flow_operations
+- flow_web
+- json [at=web_json]
+
++ flow_web_ops
+  + valid_url
+    \ url=str
+    ^ bool
+    = prefix=nat
+        ? (eq url.slice(0 8) "https://") 8
+        ? (eq url.slice(0 7) "http://") 7
+        0
+    ? !(and prefix (and (gt url.len prefix) (le url.len 4096))) .false
+    % i=nat 0
+    ? (eq i url.len) .true
+    ? ((le url.at(i) 32) || (eq url.at(i) 127)) .false
+    | _ i.inc
+  + text
+    \ name=str value=json
+    ^ str
+    ?> (./obj fields) value ""
+    = found fields.keep((\ f (eq f.k name)))
+    ? !(eq found.len 1) ""
+    ?> (./str text) found.at(0).v ""
+    text
+  + url
+    \ prompt=str
+    ^ either[str str]
+    ?> (./ok parsed _) (web_json/parse prompt) (./err "Invalid fetch request")
+    ?> (./obj fields) parsed (./err "Invalid fetch request")
+    ? !(eq fields.len 1) (./err "Fetch accepts exactly url")
+    = url (flow_web_ops/text "url" parsed)
+    ? !(flow_web_ops/valid_url url) (./err "Expected an HTTP or HTTPS URL")
+    | ./ok url
+  + request
+    ' A pure operation declares work. Fetch only runs in the registered foot.
+    \ home=path args=axal[myth]
+    ^ either[iota axal[myth]]
+    = urls args.dip(['urls])
+    ? !(urls.wyt) (./err 'flow_empty_urls)
+    ? (gt urls.wyt 16) (./err 'flow_web_request_limit)
+    % todo=row[[path myth]] urls.tap tasks=axal[myth] flow_ops/empty
+    ^ either[iota axal[myth]]
+    ?> (./some pair) todo.pull
+      | ./ok (axal/new[myth] (./some (myth/sing ['flow 'judgment] (flow/judgment (pin tasks)))))
+    = [entry rest] pair
+      [name card] entry
+      url card.txt_at(['url])
+    ? !(and (eq name.len 1) (flow_web_ops/valid_url url)) (./err 'flow_invalid_url)
+    = prompt (show (json/obj [(jkv "url" (json/str url))]))
+      task (myth/sing ['work 'prompt] (pails/t prompt)).put(['work 'schema] (pails/t "{}"))
+      task task.put(['work 'provider] (native_work/provider (flow_web_ops/make home)))
+      task task.put(['work 'evidence] (cell_view (pin (flow_ops/empty).put([] card))))
+      task task.put(['url] (pails/t url)).put(system_vocabulary/lede (pails/t url))
+    | _ rest tasks.put(name task)
+  + sources
+    ' Convert accepted native results to ordinary source envelopes. A failed
+    ' or malformed response is never returned as current source evidence.
+    \ args=axal[myth]
+    ^ either[iota axal[myth]]
+    % todo=row[[path myth]] args.dip(['responses]).tap sources=axal[myth] flow_ops/empty
+    ^ either[iota axal[myth]]
+    ?> (./some pair) todo.pull (./ok sources)
+    = [entry rest] pair
+      [name card] entry
+    ?> outcome=native_work/outcome card.pail_at(['work 'outcome]) (./err 'flow_web_missing_result)
+    ? !(eq outcome.status "complete") (./err 'flow_web_unavailable)
+    ?> origin=safe card.pail_at(['work 'result]) (./err 'flow_web_missing_provenance)
+    ? !(and origin.ver (equal[care] origin.care .x)) (./err 'flow_web_missing_provenance)
+    ?> (./ok result _) (web_json/parse outcome.text) (./err 'flow_web_invalid_result)
+    ?> (./obj fields) result (./err 'flow_web_invalid_result)
+    = statuses fields.keep((\ f (eq f.k "status")))
+    ? !(eq statuses.len 1) (./err 'flow_web_invalid_result)
+    ?> (./num negative status) statuses.at(0).v (./err 'flow_web_invalid_result)
+    ? !(and !(negative) (and (ge status 200) (lt status 300))) (./err 'flow_web_unavailable)
+    = url (flow_web_ops/text "url" result)
+      content (flow_web_ops/text "content" result)
+      media (flow_web_ops/text "media" result)
+    ? !(and (flow_web_ops/valid_url url) (and content.len (le content.len 131072))) (./err 'flow_web_invalid_result)
+    = format=str
+        ? (str/find "markdown" media).is_some "md"
+        ? (str/find "text/plain" media).is_some "text"
+        ? (str/find "text/html" media).is_some "html"
+        "text"
+      source (flow/source (path_show origin.path) (path_show (safe/spell origin)) format content)
+      record (myth/sing ['flow 'source] source).put(['flow 'origin] origin)
+      record record.put(['url] (pails/t url)).put(system_vocabulary/lede (pails/t url))
+    | _ rest sources.put(name record)
+  + make
+    \ home=path target=path request=native_work/request
+    ^ myth
+    = record (native_work_ops/open request.owner "http-fetch" (myth/sing ['work 'request] request))
+      deps (crew/sing ['guard] (dep request.guard.care request.guard.path))
+    | record.put(['web 'home] (pails/p home)).put(limb_slot (kook [home.weld(['kook 'work])])).put(crew_slot (cpail deps))
+  + encode
+    \ response=flow_web/response
+    ^ str
+    | show (json/obj [(jkv "url" (json/str response.url))
+        (jkv "status" (json/num .false response.status))
+        (jkv "media" (json/str response.media)) (jkv "content" (json/str response.content))])
+  + finish
+    \ target=path guard=pin[native_work/captured] reply=flow_web/reply record=myth
+    ^ yell
+    ? reply.result
+     > (./err why) (native_work_ops/result target (native_work/outcome "failed" why guard) record)
+     > (./ok response)
+      ? !(and (ge response.status 200) (lt response.status 300))
+        | native_work_ops/result target (native_work/outcome "failed" (str/cat_all ["HTTP " (nat/show response.status)]) guard) record
+      ? !(and response.content.len (le response.content.len 131072))
+        | native_work_ops/result target (native_work/outcome "failed" "Empty or oversized HTTP response" guard) record
+      | native_work_ops/result target (native_work/outcome "complete" (flow_web_ops/encode response) guard) record
+  + advance
+    \ b=bowl record=myth
+    ^ yell
+    ? record.has(['work 'outcome]) (yell [] record)
+    ?> request=native_work/request record.pail_at(['work 'request]) (yell [] record)
+    ? record.get(['web 'waiting])
+     > (./some held)
+      ?> waiting=flow_web/waiting held (yell [] record)
+      = command b.crew.gut(['command] flow_ops/empty).fil.fall(myth/new)
+      ?> reply=flow_web/reply command.pail_at(['web 'reply]) (yell [] record)
+      ?> (./ok expected) (flow_web_ops/url request.prompt) (yell [] record)
+      ? !(and (eq reply.requested expected) (eq command.txt_at(['web 'url]) expected)) (yell [] record)
+      | flow_web_ops/finish b.here waiting.guard reply record
+    ?> (./some captured) (native_work_ops/captured_at b.crew.gut(['guard] flow_ops/empty)) (yell [] record)
+    ?> (./ok url) (flow_web_ops/url request.prompt)
+      | native_work_ops/result b.here (native_work/outcome "failed" "Invalid HTTP request" (pin captured)) record
+    ?> (./some home) record.path_at(['web 'home]) (yell [] record)
+    = command home.snoc(($ts (str/cat_all ["fetch_" (nat/show (str/to_atom (path_show b.here)))])))
+      next (native_work_ops/status "running" record).put(['web 'waiting] (flow_web/waiting command (pin captured)))
+      next next.put(crew_slot (cpail (crew/sing ['command] (dep .x command))))
+    | yell [[command (writ/make (myth/sing ['web 'url] (pails/t url)))]] next
+  + hear
+    \ b=bowl record=myth changes=row[dep]
+    ^ yell
+    | flow_web_ops/advance b record
+  + talk
+    \ b=bowl record=myth input=myth
+    ^ yell
+    | flow_web_ops/advance b record.meld(input)
+  + form
+    ^ form
+    | def_form.set_init(native_work_ops/wake).set_hear(flow_web_ops/hear).set_talk(flow_web_ops/talk)
+  + registrations
+    \ state=namespace
+    ^ row[[p=path q=writ]]
+    = home=path [state.self 'io 'web]
+      root (cooperate_ops/record home state).fall(myth/new)
+      root root.put(['web 'home] (pails/p home))
+      entries=row[[path myth]]
+        [[home root]
+         [home.weld(['kook 'work]) (myth/sing system_vocabulary/form flow_web_ops/form)]
+         [home.snoc('provider) (myth/sing ['work 'provider] (native_work/provider (flow_web_ops/make home)))]]
+    | entries.keep((\ [name record] !(equal[maybe[myth]] (cooperate_ops/record name state) (./some record)))).map((\ [name record] [name (writ/make record)]))

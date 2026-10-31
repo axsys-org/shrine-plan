@@ -1,7 +1,16 @@
-# Native block document
+# Goo block-document regression fixture
+
+This is a test-only alternate block model for exercising Goo rich input and
+typed save/reload. It is not Nenex, a Semidoc projection, or a harness dependency.
+Nenex edits the existing Semidoc/native records instead.
+
+Expose this fixture in a disposable extras catalogue, following the
+[tree-pages fixture setup](../tree-pages/README.md), substituting
+`block-document` for `tree-pages`. Pass that catalogue as `--extras-root`.
 
 ```sh
-python3 x/eden --mount block-document --mount mcp --port 8137
+python3 x/eden --extras-root /path/to/fixture-extras \
+  --mount block-document --mount mcp --ephemeral --port 8137
 ```
 
 Open http://127.0.0.1:8137/block-document. The document is
@@ -66,5 +75,6 @@ Checks:
 
 ```sh
 node --test extras/mounts/explorer/tests/*.test.cjs
-WISP=/path/to/locked/wisp python3 extras/x/check --mount block-document --jobs 2
+WISP=/path/to/locked/wisp python3 extras/x/check \
+  --extras-root /path/to/fixture-extras --mount block-document --jobs 2
 ```

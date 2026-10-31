@@ -497,7 +497,7 @@ same paint for browser popovers. Platform popovers handle top-layer placement.
 `POST /goo/feedback` prepares bounded runtime messages through Goo and returns
 an HTML fragment without reading or mutating namespace state.
 
-The block-document mount declares ordinary Grove views at
+The test-only `extras/tests/fixtures/block-document` mount declares ordinary Grove views at
 `/sys/slot/text_toolbar` and `/sys/slot/text_commands`. Explorer requests them
 through normal prepared rendering, anchors the resulting native buttons to
 the platform selection, and interprets their `/sys/edit/<command>` slots.

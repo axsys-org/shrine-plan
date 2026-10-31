@@ -1,5 +1,8 @@
 # Nenex
 
+See the [shared harness ownership map](../../HARNESS.md) for responsibilities
+and integration boundaries.
+
 A personal wiki with a Goo page library, Mash's pinned renderer profile, and a
 formatted semidoc reader. Run from the repository root:
 

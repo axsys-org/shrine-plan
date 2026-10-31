@@ -1,4 +1,3 @@
-import hashlib
 from html import escape
 import json
 from pathlib import Path
@@ -8,81 +7,110 @@ import unittest
 from unittest.mock import patch
 
 host = runpy.run_path(str(Path(__file__).parents[1] / 'host.py'))
-capture, validate_bundle = host['capture_sources'], host['validate_bundle']
 
 
-class CaptureTests(unittest.TestCase):
+class SourceStagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.bag = self.root / 'bag'
+        self.bag.mkdir()
         self.source = self.root / 'source.md'
         self.source.write_bytes('Café\r\nSource evidence\n'.encode('utf-8'))
-        self.manifest = self.root / 'sources.json'
-        self.manifest.write_text(json.dumps({'source': {'path': 'source.md'}}))
+        self.spec = {'source': {'path': 'source.md', 'file': 'evidence-source.md', 'format': 'md'}}
+        self.catalogue = self.root / 'examples.json'
+        self.catalogue.write_text(json.dumps({'sample': {'sources': self.spec}}))
+        self.env = patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
 
-    def test_exact_bytes_and_repeatable_snapshot(self):
-        first = capture(self.root, self.manifest)
-        self.assertEqual(first, capture(self.root, self.manifest))
-        source = first['sources']['source']
-        self.assertEqual(source['content'].encode(), self.source.read_bytes())
-        self.assertEqual(source['digest'], hashlib.sha256(self.source.read_bytes()).hexdigest())
-        self.source.write_text('Changed source')
-        self.assertNotEqual(first['digest'], capture(self.root, self.manifest)['digest'])
+    def scan(self):
+        host['scan'](self.root, self.bag)
 
-    def test_incomplete_inventory_refuses(self):
+    def test_exact_bytes_without_an_evidence_bundle(self):
+        self.scan()
+        self.assertEqual(self.source.read_bytes(), (self.bag / 'evidence-source.md').read_bytes())
+        self.assertFalse((self.bag / 'repository-evidence.json').exists())
+
+    def test_deleted_file_is_released_and_restored(self):
+        original = self.source.read_bytes()
+        self.scan()
         self.source.unlink()
-        with self.assertRaises(FileNotFoundError):
-            capture(self.root, self.manifest)
+        self.scan()
+        self.assertFalse((self.bag / 'evidence-source.md').exists())
+        self.source.write_bytes(original)
+        self.scan()
+        self.assertEqual(original, (self.bag / 'evidence-source.md').read_bytes())
 
-    def test_replay_checks_captured_bytes_and_manifest(self):
-        bundle = capture(self.root, self.manifest)
-        self.source.unlink()
-        self.assertEqual(bundle, validate_bundle(json.loads(json.dumps(bundle))))
-        bundle['sources']['source']['content'] = 'Changed after capture'
-        with self.assertRaisesRegex(ValueError, 'source digest mismatch'):
-            validate_bundle(bundle)
-        bundle['sources']['source']['digest'] = hashlib.sha256(b'Changed after capture').hexdigest()
-        with self.assertRaisesRegex(ValueError, 'bundle digest mismatch'):
-            validate_bundle(bundle)
+    def test_changed_source_binding_releases_obsolete_file(self):
+        self.scan()
+        self.spec['source']['file'] = 'replacement.md'
+        self.catalogue.write_text(json.dumps({'sample': {'sources': self.spec}}))
+        self.scan()
+        self.assertFalse((self.bag / 'evidence-source.md').exists())
+        self.assertEqual(self.source.read_bytes(), (self.bag / 'replacement.md').read_bytes())
 
-    def test_escaped_source_and_oversize_refuse(self):
-        self.manifest.write_text(json.dumps({'source': {'path': '../outside.md'}}))
-        with self.assertRaisesRegex(ValueError, 'escapes repository'):
-            capture(self.root, self.manifest)
-        self.manifest.write_text(json.dumps({'source': {'path': 'source.md'}}))
-        self.source.write_bytes(b'x' * 131073)
-        with self.assertRaisesRegex(ValueError, '131072'):
-            capture(self.root, self.manifest)
+    def test_examples_share_one_staged_source(self):
+        examples = {name: {'sources': self.spec} for name in ['first', 'second']}
+        self.catalogue.write_text(json.dumps(examples))
+        self.scan()
+        self.assertEqual(self.source.read_bytes(), (self.bag / 'evidence-source.md').read_bytes())
+        del examples['first']
+        self.catalogue.write_text(json.dumps(examples))
+        self.scan()
+        self.assertTrue((self.bag / 'evidence-source.md').exists())
+        self.catalogue.write_text('{}')
+        self.scan()
+        self.assertFalse((self.bag / 'evidence-source.md').exists())
 
-    def test_mount_capture_is_repeatable(self):
-        bag = self.root / 'bag'
-        bag.mkdir()
-        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}):
-            host['scan'](self.root, bag)
-            first = (bag / 'repository-evidence.json').read_bytes()
-            host['scan'](self.root, bag)
-        self.assertEqual(first, (bag / 'repository-evidence.json').read_bytes())
-        self.assertEqual(json.loads(first)['source']['content'].encode(), self.source.read_bytes())
+    def test_different_sources_cannot_claim_the_same_staged_name(self):
+        other = dict(self.spec['source'], path='other.md')
+        self.catalogue.write_text(json.dumps({'first': {'sources': self.spec},
+                                             'second': {'sources': {'source': other}}}))
+        with self.assertRaisesRegex(ValueError, 'distinct'):
+            self.scan()
 
-    def test_failed_evidence_does_not_block_shared_module_scan(self):
-        bag = self.root / 'bag'
-        bag.mkdir()
-        with patch.dict('os.environ', {'SHRINE_FLOW_SOURCE_ROOT': str(self.root)}):
-            host['scan'](self.root, bag)
-            self.source.unlink()
-            (self.root / 'main.foil').write_text('+ changed\n  ^ nat\n  2\n')
-            host['scan'](self.root, bag)
-        fault = json.loads((bag / 'repository-evidence.json').read_text())
-        self.assertIn('capture_error', fault)
-        self.assertNotIn('source', fault)
-        self.assertEqual((bag / 'main.foil').read_text(), '+ changed\n  ^ nat\n  2\n')
+    def test_escape_and_name_collision_refuse(self):
+        for field, value, reason in [('path', '../outside.md', 'escapes'),
+                                      ('file', '../outside.md', 'flat'),
+                                      ('file', 'examples.json', 'distinct')]:
+            spec = dict(self.spec['source'], **{field: value})
+            self.catalogue.write_text(json.dumps({'sample': {'sources': {'source': spec}}}))
+            with self.assertRaisesRegex(ValueError, reason):
+                self.scan()
+
+    def test_shared_mount_without_examples_still_stages_modules(self):
+        self.scan()
+        self.catalogue.unlink()
+        (self.root / 'main.foil').write_text('+ independent\n  ^ nat\n  1\n')
+        self.scan()
+        self.assertFalse((self.bag / 'evidence-source.md').exists())
+        self.assertTrue((self.bag / 'main.foil').is_file())
+
+    def test_authored_examples_are_flat_and_removal_releases_staging(self):
+        examples = self.root / 'examples'
+        examples.mkdir()
+        example = examples / 'sample.semidoc'
+        example.write_text(';. /example\n  ;= Example\n')
+        self.scan()
+        self.assertEqual(example.read_bytes(), (self.bag / example.name).read_bytes())
+        self.assertFalse((self.bag / 'examples').exists())
+        example.unlink()
+        self.scan()
+        self.assertFalse((self.bag / example.name).exists())
+
+    def test_prepare_selects_existing_web_foot(self):
+        folder, arguments = host['prepare'](self.root, self.root / 'work', True, None,
+                                           {'node': '0xab', 'workspace': str(self.root)})
+        self.assertTrue((folder / 'evidence-source.md').is_file())
+        self.assertEqual(arguments, ['/0xab/io/web'])
 
 
 class SourceFormTests(unittest.TestCase):
     def test_source_export_preserves_entities_and_line_endings(self):
         text = ';.\r\n  Café & <tags> </textarea>\n' + ('  Long source\n' * 1000)
-        client = runpy.run_path(str(Path(__file__).parents[1] / 'client.py'))
+        client = runpy.run_path(str(Path(__file__).parent / 'client.py'))
         form = client['SourceForm']()
         form.feed('<textarea id="other">ignore</textarea><textarea id="page-source">'
                   + escape(text) + '</textarea><p>ignore</p>')

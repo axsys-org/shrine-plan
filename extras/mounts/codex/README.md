@@ -1,5 +1,8 @@
 # Codex desk
 
+See the [shared harness ownership map](../../HARNESS.md) for responsibilities
+and integration boundaries.
+
 A flat source bag in `extras/mounts/codex`. This desk includes the
 protocol reducer, JSON boundary validation, I/O foot, mount-aware host
 helpers, Python app-server bridge, and regression tests.

@@ -1,8 +1,17 @@
 # Semidoc flows
 
-A flow is an authored Semidoc composition of published native operations.
-Definitions capture their operation laws; attempts retain inputs, intermediate
-values and results. Cells expose that work and hands react to dependencies.
+See the [extras ownership map](../../HARNESS.md) for the boundary between the
+shared harness, Nenex adapters, providers and authored examples.
+
+A flow is a reusable procedure with explicit inputs, operations, dependencies
+and results. Here, Semidoc authors that procedure alongside its explanation;
+publication captures the selected native operation laws. An invocation binds
+it to evidence and retains its attempts, intermediate values and effects.
+Cells expose the work, overlays provide working views, and hands react to
+dependencies. Holes keep unresolved work attached to its subject.
+The current executor supports ordered compositions, captured child-flow invocations
+and suspended provider requests; automatic extraction of a procedure from exploratory traces is not
+implemented here.
 The generic installation publishes these capabilities without creating a
 handbook, choosing its evidence, or attaching a provider.
 
@@ -24,8 +33,43 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
    same native operations as other namespace clients.
 
 These forms call `namespace_command/plan` and supervisor admission. They do not
-run Python commands or maintain a browser-owned work queue. Generic Nenex embeds
-and the shared Cells surface remain available to authored documents.
+run Python commands or maintain a browser-owned work queue.
+
+### Embed a published flow on another page
+
+On an existing Nenex page, use **Page tools → Flows → Select published flow**.
+Give the occurrence a name and the published definition's namespace path, such as
+`/0x11/app/nenex/w/source_outline_flow/flows/source_outline`. Selection captures
+that exact publication in the ordinary cell `<page>/cells/<name>` and shows its
+input ports. Bind those ports, choose an output path and writer, optionally select
+a provider, then choose **Bind and embed flow**.
+
+Attachment and the guarded source edit are admitted together. The added Semidoc
+reference uses the existing document embed vocabulary:
+
+```text
+;@ /doc/embed ;/0x11/gov/flows/occurrence_view
+;/0x11/app/nenex/w/project/work/outline
+```
+
+The occurrence is the existing maintenance controller at `<page>/work/<name>`.
+Its inline view exposes the same bindings, work cell, working overlay, attempts,
+holes and retry actions as Page tools. Two occurrences can select the same
+definition with independent inputs and output destinations. Live input changes
+wake their existing hands; reading the embedded view does not dispatch work.
+
+Selection retains the definition's exact historical reference. Republishing the
+original flow does not change it. Existing **Attach maintenance** controllers keep
+their live-publication behavior; both modes retain each attempt's definition.
+To select a newer publication, create a new named occurrence. In-place adoption
+or reattachment of a detached controller is not implemented.
+
+Removing the reference in source or Goo removes the presentation only. Named
+cells and work survive document edits and remain discoverable in Page tools.
+**Detach and retain history** releases the destination claim and subscriptions while
+retaining attempts, captures and history. The output must not overlap the page's
+controller subtree, so choose a separate output document when using the Nenex
+writer. Selection and controller collisions are refused rather than overwritten.
 
 ### Nenex pages as live evidence
 
@@ -45,8 +89,63 @@ through the same shared lifecycle. There is no page-source hand or scheduler.
 
 The native operation is `bind_page_source` at the author page, with a live `x`
 `source` reference and a one-segment `name` path. Rebinding the same source is
-idempotent; an occupied cell is refused rather than overwritten. File evidence
-continues to use its existing capture digest and source hand.
+idempotent; an occupied cell is refused rather than overwritten.
+
+### Filesystem and HTTP sources
+
+The example catalogue includes **Evidence sources**, **Source outline** and
+**Web source guide**. Create and publish Evidence sources before publishing Source
+outline; the outline invokes that reusable procedure. Open the examples from Page
+tools, save/publish their Semidoc, bind their sources, and
+attach it with the existing Nenex writer. The examples are procedures rather
+than separate applications or Python launchers.
+
+**Bind filesystem source** selects a captured Markdown record and its existing
+filesystem mount. It calls `watch_sources` with `source`, `mount`, `expected`,
+a one-segment `name`, and `format: md`. The resulting source cell fills the
+`sources` input. Its origin is the exact native historical file reference;
+no generated JSON bundle or SHA-256 adapter is needed. The filesystem foot
+retains ownership of polling and cancellation. Shared consumers keep the watch
+alive. Missing files and detached feeds expose no current evidence; their last
+captures and historical records remain.
+
+**Bind web source** writes an ordinary named URL input and fills `urls`.
+`web_fetch` declares a native work request, `web_sources` converts an accepted
+response to a source envelope, and `decompose`/`documents` prepare the output.
+The HTTP foot performs bounded native `Fetch` calls. It owns transport only;
+the shared hand owns attempts, guarded completion and retry. Requests already
+pending at restart are marked interrupted rather than silently replayed.
+Changing a URL input's `revision` slot explicitly requests another capture.
+There is no HTTP polling scheduler. HTTP errors remain failed attempts and do
+not become current evidence.
+
+The first HTTP flow supports named GET requests and Markdown decomposition.
+HTML and other supported text remain literal evidence. Search-engine choice,
+registry-specific interpretation, PDF/CSV adapters and source-file write-back
+are not implemented by these examples; they require explicit operations and
+authored procedures, not an implicit research daemon.
+
+### Native provider steps
+
+Pure operations can return the existing `flow/judgment` task tree containing
+ordinary cards with `work/prompt`, `work/schema`, optional `work/provider`, and
+optional `work/evidence` (`cell_view`). The evaluation suspends as `flow/pending`.
+Document revision tasks keep their existing typed document adapter.
+
+Native request attempts live in the controller's existing `work` subtree.
+They retain their definition and task, expose frozen evidence and a live lens,
+and use `native_work_ops/dispatch`, provider outcomes and subject-owned holes.
+Only the current hole head with matching captured evidence can publish a
+resolution. Returning to an earlier equal input does not revive an obsolete
+attempt. A failed request stays retained; **Retry work** creates a linked attempt.
+Successful steps yield `work/outcome`, a pinned `work/result` reference and the
+attempt path for subsequent pure operations. Reading cells never starts I/O.
+
+Native reverse-reference and graph views can supply the same input/context
+bindings. Their sovereign-state index changes the core `sov` contract. This
+integration is validated in disposable worlds; mounting the flow code is not
+an upgrade mechanism for an older retained kernel. No bootstrap patch or
+automatic conversion of existing worlds is supplied.
 
 ## Definition contract
 
@@ -56,6 +155,7 @@ A section marked `/flow/definition NAME` contains a composition.
 | --- | --- |
 | `/flow/input NAME` | Named namespace-tree input. |
 | `/flow/step NAME ;/operation/path` | Invoke a published native operation. |
+| `/flow/invoke NAME ;/document/flows/definition` | Invoke a captured published flow with explicit port bindings. |
 | `/flow/bind PORT VALUE` | Bind a port to an input or preceding step. Repeat for each port. |
 | `/flow/result NAME` | Select exactly one returned value. |
 | `/flow/page RELATIVE_PATH` | Declare a document template or editorial brief. `/` is the root. |
@@ -66,6 +166,35 @@ uses them as final templates; `revise` uses them as briefs requiring judgment.
 The `identity`, `inventory`, `decompose`, `documents`, `revise` and `evidence`
 operations are independently published. `decompose` is a bounded Markdown import
 operation; it is not an intermediate editing model for Nenex.
+
+### Composing published flows
+
+Publish the child from Nenex first, then refer to its definition in the caller:
+
+```text
+;@ /flow/invoke checked ;/0x11/app/nenex/w/evidence_sources_flow/flows/evidence_sources
+;@ /flow/bind sources sources
+;= Validate the bound evidence
+```
+
+Each repeated `flow/bind` supplies one child input. Later steps can bind the returned
+value by the invocation's name. Publishing the parent captures the selected child
+definition and its native laws. Republishing the child leaves existing parent
+definitions and attempts intact; explicitly republish the parent to select it.
+
+The evaluator runs the child in authored order inside the same parent invocation.
+Each nested step gets a distinct identity, so two calls to the same procedure have
+separate resolutions and holes. Pending child work stops evaluation until the
+existing hand accepts a current result; retries and stale-result rejection use the
+same work lifecycle. The trace retains the child definition, bound inputs, child
+steps and call result as separate events. The parent's selected writer applies the
+final output. Eight nested calls and 128 total executed steps bound expansion.
+
+Revision drafts carry Semidoc source. A writer may declare its native document form
+in `flow/document`; attachment captures that declaration with the selected writer,
+and revision requests retain it. The Nenex writer supplies its document form through
+this boundary. A writer without it gets source-only drafts. Pinned contract shapes,
+including the optional pages payload in `flow/definition`, are unchanged.
 
 The implemented composition is ordered and acyclic. Publication checks names,
 bindings and port names and captures the chosen laws. General branching,
@@ -159,22 +288,30 @@ reaction limits.
 
 ## Handbook example
 
+First use **Page tools → Flow examples → Create Evidence sources reusable flow**
+and publish its `evidence_sources` definition. The handbook and Source outline
+both invoke this published procedure.
+
 **Page tools → Flow examples → Open or install handbook example** explicitly
 creates the authoring page and repository capture feed. Publish the definition,
 then bind sources and attach maintenance. An existing handbook is opened without
 replacing its authored source or history. Its declared input defaults and capture
 control live in the page's named `flows/defaults` child, preserving its Semidoc source.
 
-`handbook.semidoc` holds its briefs and dependency declarations. `sources.json`
-is its repository inventory. `examples.json` declares its source page, input defaults and optional capture
-setup. These remain in the existing flows extra; the generic installer only
-registers the declared example actions.
+`examples/handbook.semidoc` holds its briefs and dependency declarations.
+`examples.json` declares its repository files, source page, input defaults and
+optional capture setup. These remain
+in the existing flows extra; the Nenex integration registers the example actions
+without instantiating them. Native command installation does not read the catalogue.
 
-Repository capture is host I/O. `host.py` captures and hashes configured source
-bytes. Missing evidence is published as a capture fault; it cannot prevent
-installing or recompiling the harness in another workspace. The native source
-hand retains the last good collection and blocks publication while a capture is
-invalid. A feed requires its live file to appear in the configured mount's
+Repository capture is host I/O. `host.py` stages each declared file's exact bytes.
+Native source hands expose each file beneath the authoring page's `inputs/sources`;
+the existing merge cell at `cells/sources` combines their named evidence. The
+handbook's declared source dependencies prevent publishing concepts whose required
+evidence is missing.
+Missing files are omitted from the current scan; they do not prevent installing
+or recompiling the harness in another workspace. Each source hand retains its last
+good capture. A feed requires its live file to appear in the configured mount's
 current scan report and not in its missing-file list. Retained bytes and an old
 successful report are not current evidence. Returning identical bytes restores
 the feed without deleting its prior captures. Reading a cell never launches a model.
@@ -268,6 +405,20 @@ restart, to refresh native behavior records. That does not replace the core serv
 Operations under `/<node>/gov/flows/` include `author`, `publish`, `preview`,
 `commit`, `follow`, `submit_revision`, `set_enabled`, `detach`, `import_source`,
 `observe`, `source_failed`, `watch_sources` and `unwatch_sources`. They use existing namespace
-admission. Native callers do not require MCP; the optional CLI client uses the
-existing generic transport. Clients with unrestricted raw namespace writes can
+admission. Native callers do not require MCP; external callers may use the
+existing generic MCP transport. Clients with unrestricted raw namespace writes can
 bypass this protocol; the helpers are not an isolation boundary against them.
+
+## Source organization
+
+`install.foil` assembles the native command/law catalogue without importing Nenex
+or examples. `sources_ops.foil` owns only source feeds and filesystem ownership.
+`nenex_ops.foil` owns page authoring, page-as-evidence binding and the Nenex writer.
+`interface.foil` contributes those adapters and forms to Nenex; `examples.foil`
+registers optional authored recipes. The mount still packages backend and Nenex
+integration together. Public command addresses and pinned contracts are unchanged.
+
+The handbook CLI workflow and bundle adapter have been removed. `tests/client.py`
+is only the transport helper used by disposable integration tests. Filesystem
+evidence uses native captures directly. See `../../HARNESS.md` for the selected
+document-form boundary, captured child-flow composition and its current limits.

@@ -1,4 +1,7 @@
-# Document-local agent harness
+# Shared native work and cooperation
+
+See the [shared harness ownership map](../../HARNESS.md) for responsibilities
+and integration boundaries.
 
 This backend keeps work, captured inputs, branching traces and typed results in
 Shrine records. External agents use the existing MCP tools. Foil implements the

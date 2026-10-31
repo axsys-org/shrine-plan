@@ -34,13 +34,11 @@ def main():
     for name in ['a', 'b']:
         (files / name).mkdir(parents=True)
 
-    def bundle(name, revision):
-        (files / name / 'bundle').write_text(json.dumps({'source': {
-            'location': name + '/README.md', 'digest': str(revision) * 64,
-            'title': name, 'format': 'md', 'content': f'Source {name} revision {revision}'}}))
+    def source(name, revision):
+        (files / name / 'readme.md').write_text(f'Source {name} revision {revision}')
 
-    bundle('a', 1)
-    bundle('b', 1)
+    source('a', 1)
+    source('b', 1)
     stopped = threading.Event()
     faults = []
 
@@ -56,11 +54,11 @@ def main():
                     continue
                 action = raw[0]
                 if action == 1:
-                    (files / 'b/bundle').unlink()
+                    (files / 'b/readme.md').unlink()
                 elif action == 2:
-                    bundle('b', 1)
+                    source('b', 1)
                 elif action == 3:
-                    bundle('b', 2)
+                    source('b', 2)
                     (files / 'block').write_bytes(b'\x01')
                 elif action == 4:
                     (files / 'block').write_bytes(b'\x00')

@@ -12,7 +12,7 @@ import time
 import uuid
 
 HERE = Path(__file__).parents[1]
-api = runpy.run_path(str(HERE / 'client.py'))
+api = runpy.run_path(str(HERE / 'tests/client.py'))
 
 
 def check(base, codex=False):
@@ -79,12 +79,9 @@ def check(base, codex=False):
         root = Path(folder)
         (root / 'entries.md').write_text('# Beacon entries\nEach entry has a stable ID and a mutable text label.\nUsers can rename the label in place without changing its ID.\n')
         (root / 'status.md').write_text('# Beacon status\nStatus is one typed value in a single status slot.\nIts fields are phase and explanation and are updated together.\n')
-        manifest = root / 'sources.json'
-        manifest.write_text(json.dumps({name: {'path': name + '.md'} for name in ('entries', 'status')}))
-
         def capture():
-            bundle = api['prepare'](root, manifest)
-            imported = client.import_sources(bundle)
+            imported = client.import_texts({name: (root / (name + '.md')).read_text()
+                                            for name in ('entries', 'status')})
             imports.add(imported)
             client.observe(feed, imported)
 

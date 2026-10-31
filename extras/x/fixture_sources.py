@@ -19,6 +19,10 @@ def materialize(core, extras, destination, names=None, *, native_tests=False):
             target = destination / 'foil' / (name + '.foil')
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(bag / leaf, target)
+        for relative, leaf in descriptor.get('test_files', {}).items():
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(bag / leaf, target)
         for path in bag.glob('*.rvr'):
             shutil.copyfile(path, destination / 'reaver' / path.name)
     if native_tests:
