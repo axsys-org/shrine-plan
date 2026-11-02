@@ -146,9 +146,12 @@ def catalog(root):
         for leaf in leaves:
             if not isinstance(leaf, str) or Path(leaf).name != leaf or leaf in ('.', '..'):
                 raise ValueError(f'{name}: mount files must be flat: {leaf!r}')
-        for key in ('activate', 'http', 'start'):
+        for key in ('activate', 'http', 'start', 'terminal'):
             hook = data.get(key)
-            if hook and (hook['module'] not in data.get('modules', {}) or not hook.get('entry')):
+            if hook and (not isinstance(hook, dict) or
+                         hook.get('module') not in data.get('modules', {}) or
+                         not isinstance(hook.get('entry'), list) or not hook['entry'] or
+                         not all(isinstance(part, str) and part for part in hook['entry'])):
                 raise ValueError(f'{name}: invalid {key} entrypoint')
         validate_workspaces(data)
         result[name] = Mount(name, path.parent, data)
@@ -271,7 +274,7 @@ def runtime_specs(prepared, source_root):
                       int(bool(data.get('inspection'))),
                       dependencies(mount),
                       list(data.get('assets', {}).values()), workspace_routes(data),
-                      int(bool(data.get('workspaces')))])
+                      int(bool(data.get('workspaces'))), hook('terminal')])
     return specs
 
 
@@ -320,7 +323,7 @@ class ScanBridge:
         if hasattr(self, 'manifests'):
             current = json.loads((self.originals[name] / 'mount.json').read_text())
             keys = ('version', 'name', 'dependencies', 'modules', 'grove', 'assets', 'roots',
-                    'activate', 'http', 'start', 'host', 'routes', 'inspection', 'workspaces')
+                    'activate', 'http', 'start', 'terminal', 'host', 'routes', 'inspection', 'workspaces')
             if any(current.get(key) != self.manifests[name].get(key) for key in keys):
                 raise ValueError('Mount descriptor changed; restart Eden to change registrations')
             mount, prepared, module = self.scanners[name]

@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from eden_mounts import catalog, select, runtime_specs, ScanBridge, prepare, runtime_literal
-from eden_runtime import startup_ready, startup_failed
+from eden_runtime import startup_ready, startup_failed, terminal_exit_status
 
 
 class MountTests(unittest.TestCase):
@@ -63,7 +63,7 @@ class MountTests(unittest.TestCase):
             '(#bind std (#module std))', '(#import std)',
             '(#bind reef (#module reef))',
             '(define spec (_0 ' + runtime_literal(specs) + '))',
-            '(define good (And (Eq (Sz spec) 14) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
+            '(define good (And (Eq (Sz spec) 15) (And (Eq (_2 spec) (reef:read-text-file "expected.json")) (Equal (_6 spec) ["example" ["example" "http"]]))))',
             '(print (If good "MOUNT-ENCODING-PASS" "MOUNT-ENCODING-FAIL"))',
             '(print "TEST-RUN-DONE")', ''])
         code, complete, _ = runner.run_process([os.environ['WISP'], '--file-root', str(source), 'snap', 'root', '_'], work, script, 60)
@@ -251,11 +251,50 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'belongs to core'):
             select(self.root, ['shadow'])
 
+    def test_terminal_registration_and_preflight(self):
+        from mount_tools import create
+        folder = create(self.root, 'terminal-demo', terminal=True)
+        mount = select(self.root, ['terminal-demo'])[0]
+        self.assertTrue((folder / 'cli.foil').exists())
+        source = self.root / 'src'; source.mkdir()
+        spec = runtime_specs([(mount, folder, [], None)], source)[0]
+        self.assertEqual(spec[14], ['apps/terminal_demo/cli', ['terminal', 'main']])
+        launcher = Path(__file__).with_name('eden')
+        for flags, error in ((['--terminal', 'terminal-demo', '--check'], 'cannot be combined'),
+                             (['--', 'unexpected'], 'require --terminal')):
+            result = subprocess.run([sys.executable, str(launcher), '--extras-root', str(self.root), *flags],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(error, result.stderr)
+        data = json.loads((folder / 'mount.json').read_text())
+        data.pop('terminal')
+        (folder / 'mount.json').write_text(json.dumps(data))
+        result = subprocess.run([sys.executable, str(launcher), '--extras-root', str(self.root),
+                                 '--terminal', 'terminal-demo'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('no terminal entrypoint', result.stderr)
+        data['terminal'] = {'module': 'absent', 'entry': ['main']}
+        (folder / 'mount.json').write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'terminal entrypoint'):
+            catalog(self.root)
+
+    def test_terminal_results(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        result = self.root / 'result.json'
+        for code in (0, 7, 255):
+            result.write_text(json.dumps({'ok': True, 'status': code}))
+            self.assertEqual(terminal_exit_status(0, result, 'log'), code)
+        result.write_text(json.dumps({'ok': False, 'error': 'boom'}))
+        with redirect_stderr(StringIO()) as errors:
+            self.assertEqual(terminal_exit_status(0, result, 'log'), 1)
+        self.assertIn('boom', errors.getvalue())
+
     def test_help_lists_generic_flags_only(self):
         launcher = Path(__file__).with_name('eden')
         result = subprocess.run([sys.executable, str(launcher), '--help'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
-        for flag in ('--mount', '--extras-root', '--list-mounts'):
+        for flag in ('--mount', '--extras-root', '--list-mounts', '--wire-port', '--terminal'):
             self.assertIn(flag, result.stdout)
         for flag in ('--debug', '--srs', '--codex', '--mash-root'):
             self.assertNotIn(flag, result.stdout)

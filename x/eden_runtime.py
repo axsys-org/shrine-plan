@@ -1,5 +1,20 @@
 import signal
 import sys
+import json
+
+
+def terminal_exit_status(returncode, result_path, log_path):
+    if returncode:
+        return runtime_exit_status(returncode, log_path)
+    try:
+        result = json.loads(result_path.read_text())
+        if result.get('ok') and type(result.get('status')) is int and 0 <= result['status'] <= 255:
+            return result['status']
+        reason = result.get('error', 'Invalid terminal result')
+    except (OSError, ValueError):
+        reason = 'Terminal entrypoint did not finish'
+    print(f'{reason}. Log: {log_path}', file=sys.stderr, flush=True)
+    return 1
 
 def runtime_exit_status(returncode, log_path):
     """Keep a native child failure visible to people and calling tools."""

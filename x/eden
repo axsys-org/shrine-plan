@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot Shrine with explicitly selected filesystem source mounts."""
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 import json
 import os
 import re
@@ -13,13 +13,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import urllib.error
 import urllib.request
 from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, runtime_literal
-from eden_runtime import runtime_exit_status, startup_failed, startup_ready
+from eden_runtime import terminal_exit_status, runtime_exit_status, startup_failed, startup_ready
 from eden_hands import parse_hand, start_hands
 from namespace_identity import parse_node_identity
 from test_runner import stage
+from foil_wire import Compiler as WireCompiler, Server as WireServer
+from mount_wire import MountWire, EdenMountBridge
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -30,7 +33,7 @@ def enter_environment(argv):
     nix = shutil.which('nix')
     if not nix:
         raise RuntimeError('x/eden requires Nix on PATH to prepare its tools.')
-    print('Preparing Eden’s Nix environment…', flush=True)
+    print('Preparing Eden’s Nix environment…', file=sys.stderr, flush=True)
     # path:, not git: a worktree or a shallow clone has no revCount for a git input.
     # --profile keeps a garbage-collector root in the checkout, so a nix-collect-garbage between boots does not
     # take the environment with it and turn a seconds-long resume into a rebuild.
@@ -98,7 +101,13 @@ def main():
     parser.add_argument('--hand', action='append', default=[], metavar='"NAME ARGS"',
                         help='a hand the world runs beside it (clock, source) with its arguments, '
                              'started after the foot listens and stopped at teardown; kept in world.json with --world')
+    parser.add_argument('--wire-port', type=int,
+                        help='serve Foil editor requests and live mount save/reload on this loopback port')
+    parser.add_argument('--terminal', metavar='MOUNT',
+                        help='select a mount and run its terminal entrypoint with stdin/stdout')
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('terminal_args', nargs=argparse.REMAINDER,
+                        help='arguments for the terminal entrypoint, after --')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
     parser.add_argument('--compiler', default='P6', metavar='TIER',
@@ -136,7 +145,22 @@ def main():
             for name in catalog(extras):
                 print(name)
             return 0
-        selected = select(extras, mounts) if mounts else []
+        if world and (args.terminal or args.wire_port is not None):
+            raise ValueError('--world currently supports HTTP launch without --terminal or --wire-port')
+        if args.wire_port is not None and (not 1 <= args.wire_port <= 65535 or args.wire_port == port):
+            raise ValueError('--wire-port must be 1..65535 and different from --port')
+        if args.terminal and args.check:
+            raise ValueError('--terminal and --check cannot be combined')
+        if args.terminal_args and not args.terminal:
+            raise ValueError('positional arguments require --terminal')
+        terminal_args = args.terminal_args
+        if terminal_args[:1] == ['--']:
+            terminal_args = terminal_args[1:]
+        names = mounts + ([args.terminal] if args.terminal else [])
+        selected = select(extras, names) if names else []
+        if args.terminal and not next(m for m in selected if m.name == args.terminal).manifest.get('terminal'):
+            raise ValueError(f'{args.terminal}: no terminal entrypoint in mount.json')
+        console = sys.stderr if args.terminal else sys.stdout
         enter_environment(sys.argv[1:])
         runtime = os.environ.get('WISP') or shutil.which('wisp')
         if not runtime or not os.access(runtime, os.X_OK):
@@ -147,7 +171,8 @@ def main():
         else:
             work = Path(tempfile.mkdtemp(prefix='shrine-eden-'))
         if not kept:
-            template = stage(runtime, False, args.startup_timeout)
+            with redirect_stdout(console):
+                template = stage(runtime, False, args.startup_timeout)
             if (work / 'snap').exists():
                 shutil.rmtree(work / 'snap')
             (work / 'snap').mkdir()
@@ -167,8 +192,9 @@ def main():
             (world / 'world.json').write_text(json.dumps(
                 {'mounts': mounts, 'port': port, 'node': node_text, 'hands': hands}) + '\n')
         with ExitStack() as cleanup:
-            prepared = prepare(selected, work, args.check, cleanup,
-                               {"node": node, "timeout": args.startup_timeout})
+            with redirect_stdout(console):
+                prepared = prepare(selected, work, args.check, cleanup,
+                                   {"node": node, "timeout": args.startup_timeout})
             specs = runtime_specs(prepared, work / 'src')
             scanner = cleanup.enter_context(ScanBridge(prepared, work / 'src')) if specs else None
             scan_port = scanner.port if scanner else 0
@@ -235,41 +261,80 @@ def main():
                         raise RuntimeError(f'Startup timed out; inspect {log_path}')
                     time.sleep(.25)
             if process is None:
-                print(f'Compiling Eden. Log: {log_path}', flush=True)
-                process = spawn(False)
+                print(f'Compiling Eden. Log: {log_path}', file=console, flush=True)
+                control = cleanup.enter_context(EdenMountBridge(args.request_timeout)) if args.wire_port else None
                 # The repl re-installs the boot compiler at every session start, so
                 # the requested tier is installed here, per session.  Compiled
                 # code is attached lazily and cached across processes by the
                 # runtime, so only laws the boot actually runs pay for the tier.
-                # The same install thunk travels with the saved world, so a
-                # resumed process compiles at the same tier.
                 install = ''
                 installer = '0'
                 if args.compiler != 'none':
                     install = f'(#bind opt (#module plangrm))\n(Install opt:compile{args.compiler})\n'
                     installer = f'(Install opt:compile{args.compiler})'
-                process.stdin.write(install + f"""(#bind eden (#module eden))
+                start = 'start-terminal' if args.terminal else 'start'
+                terminal_name = ' ' + literal(args.terminal) if args.terminal else ''
+                server = '(_0 eden-started)' if args.terminal else 'eden-started'
+                script = install + f'''(#bind eden (#module eden))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind source (#module foil-source))
 (#bind std (#module std))
 (#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind eden-wire (#module eden-wire))
+(define eden-node {number})
 (define (launch ignored)
   (define (resolve name) (Weld [["x" {number}] ["ts" "lib"]] (source:module-segments name)))
   (define slot [("x" {number}) ("ts" "compiler") ("ts" "artifact")])
   (define system (bootstrap:build-system (Pin eden:start) resolve slot))
   (define (install ignored) {installer})
-  (eden:start ("x" {number}) system resolve slot {port} {literal(specs)} {scan_port} {literal(scan_token)} install))
-(print ("EDEN-LAUNCH-RETURNED" (Try launch 0)))
-""")
-                process.stdin.flush()
+  [system (eden:{start} ("x" {number}) system resolve slot {port} {literal(specs)} {scan_port} {literal(scan_token)} install{terminal_name})])
+(Seq (define eden-session (Try launch 0)) 0)
+(Seq (define eden-system (_0 (_0 eden-session))) 0)
+(Seq (define eden-started (_1 (_0 eden-session))) 0)
+(Seq (define eden-launched (If (Eq 1 (Hd eden-session)) eden-session (0 {server}))) 0)
+(print ("EDEN-LAUNCH-RETURNED" eden-launched))
+'''
+                if control:
+                    script += f'(Seq (If (Eq 1 (Hd eden-launched)) 0 (eden-wire:start eden-system (_0 eden-launched) (\"x\" eden-node) {control.port} {literal(control.token)})) 0)\n'
+                result_path = work / 'src/.eden-terminal-result.json'
+                finished_path = work / 'src/.eden-terminal-finished'
+                if args.terminal:
+                    script += f'''(#bind terminal (#module eden-terminal))
+(Seq (If (Eq 1 (Hd eden-launched)) 0
+  (Seq (write-text-file \".eden-terminal-result.json\"
+    (terminal:run (_1 eden-started) (_0 eden-launched) {literal(terminal_args)}))
+    (write-text-file \".eden-terminal-finished\" \"done\"))) 0)
+'''
+                    (work / 'src/.eden-launch.rvr').write_text(script)
+                command = [runtime, '--file-root', str(work / 'src'), 'snap', 'root', '_']
+                if args.terminal:
+                    command.append('.eden-launch.rvr')
+                process = subprocess.Popen(command, cwd=work,
+                    stdin=None if args.terminal else subprocess.PIPE,
+                    stdout=None if args.terminal else log, stderr=log, text=True, restore_signals=False)
+                cleanup.callback(stop, process)
+                if not args.terminal:
+                    process.stdin.write(script)
+                    process.stdin.flush()
+                deadline = time.monotonic() + args.startup_timeout
                 while True:
                     output = log_path.read_text(errors='replace')
+                    if args.terminal and finished_path.exists():
+                        return terminal_exit_status(0, result_path, log_path)
                     if process.poll() is not None:
+                        if args.terminal and result_path.exists():
+                            return terminal_exit_status(process.returncode, result_path, log_path)
                         return runtime_exit_status(process.returncode, log_path) or 1
                     if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
                         raise RuntimeError(output[-6000:])
-                    if startup_ready(output, 'EDEN-LAUNCH-RETURNED') and listening():
-                        break
+                    if startup_ready(output, 'EDEN-LAUNCH-RETURNED'):
+                        try:
+                            with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                                break
+                        except OSError:
+                            pass
                     if time.monotonic() > deadline:
                         raise RuntimeError(f'Startup timed out; inspect {log_path}')
                     time.sleep(.25)
@@ -279,7 +344,20 @@ def main():
             running = start_hands(hands, url, node, work, cleanup) if hands and not args.check else []
             print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}'
                   + (f'; world: {work}' if world else '')
-                  + (f'; hands: {", ".join(name for name, _, _ in running)}' if running else ''), flush=True)
+                  + (f'; hands: {", ".join(name for name, _, _ in running)}' if running else ''), file=console, flush=True)
+            if args.wire_port is not None:
+                with redirect_stdout(console):
+                    wire = WireCompiler(runtime, ROOT / 'src', selected,
+                                        args.startup_timeout, args.compiler,
+                                        overlays={m.name: folder for m, folder, _, _ in prepared})
+                cleanup.callback(wire.close)
+                mounts_wire = MountWire(wire, selected,
+                    control, args.startup_timeout)
+                wire_server = cleanup.enter_context(WireServer(args.wire_port, mounts_wire))
+                threading.Thread(target=wire_server.serve_forever, daemon=True).start()
+                cleanup.callback(wire_server.shutdown)
+                print(f'Foil editor wire: 127.0.0.1:{args.wire_port} '
+                      f'(isolated compiler, live mount controls); log: {wire.work}/out.log', file=console, flush=True)
             if args.check:
                 for path in ('/__eden_unregistered__',):
                     try:
@@ -298,6 +376,13 @@ def main():
                             raise RuntimeError(f'{mount.name}: {error.code} at {error.url}: {error.read().decode(errors="replace")[:1200]}') from error
                 print('Eden checks passed.', flush=True)
                 return 0
+            if args.terminal:
+                # The supervisor and its feet outlive the terminal function.
+                # Once it returns, cleanup stops them; EOF must not leave an
+                # otherwise finished command waiting on background actors.
+                while process.poll() is None and not finished_path.exists():
+                    time.sleep(.05)
+                return terminal_exit_status(process.returncode or 0, result_path, log_path)
             return runtime_exit_status(process.wait(), log_path)
     except KeyboardInterrupt:
         return 130
