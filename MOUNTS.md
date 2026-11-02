@@ -32,6 +32,150 @@ application checks. Core rejects unknown names, cycles, core-module overrides,
 overlapping publication ownership and duplicate route claims. HTTP dispatch uses
 the longest matching path prefix, with segment boundaries.
 
+## Mount authoring tools
+
+The small commands under `x/` use the same version-1 descriptors as Eden. They
+default to this checkout's `extras/`; pass `--extras-root ../shrine-extras` to
+work on another checkout.
+
+```sh
+x/create-mount clockwork
+x/add-file clockwork actors.grove
+x/add-file clockwork rules.foil
+x/add-file clockwork tests.foil --kind test
+x/add-file clockwork style.css --kind asset --url /clockwork/style.css
+x/list-mounts
+x/show-mount clockwork
+x/eden --mount clockwork --wire-port 8679
+```
+
+`create-mount` writes a manifest, a Foil module, a small Grove tree, and a README.
+Use `--kind foil` to omit Grove, and repeat `--dependency NAME` to select existing
+mount dependencies. `add-file` creates missing files or registers existing ones
+without overwriting their contents. `.foil` and `.grove` infer their kind; other
+files default to unregistered support files. Override Foil names with
+`--module apps/clockwork/rules`, or choose a Grove unit with `--root gov/clockwork`.
+Files appended to a Grove unit compile in their manifest order. `--from FILE`
+(or `--from -` for stdin) supplies initial contents for a new file. Roots are
+updated with the registrations and validated before the descriptor is written.
+Generated module paths use underscores for hyphens in mount/file names so they
+can be written directly in Foil imports (for example, `apps/my_game/main`).
+
+With Eden running, use the same loopback wire endpoint as the editor:
+
+```sh
+# Inspect live publication status and source hashes.
+x/show-mount clockwork --live
+
+# Reload files already edited on disk.
+x/reload-mount clockwork
+
+# Save replacement text through the wire, then reload.
+x/save-mount clockwork main.grove --from /tmp/main.grove
+cat /tmp/main.grove | x/save-mount clockwork main.grove --from -
+```
+
+Wire commands accept `--port` (default `8679`) and `--timeout` in seconds. With no
+`--from`, `save-mount` reads the named file from the local extras checkout. A save
+atomically replaces an existing flat text file in the server's selected mount;
+it never adds a registration or edits `mount.json`. Reload requests Eden's
+filesystem rescan, waits for publication, and then refreshes selected dependent
+mounts in dependency order. It requires no Explorer or HTTP application.
+
+A failed publication returns an error and diagnostics, keeps the previous live
+publication, and leaves the edited source on disk for repair. The response's
+`saved` field tells you whether the disk write succeeded. A timeout can leave a
+reload in progress; inspect live status before retrying. Reload republishes
+definitions and assets; it does not rerun activation or migrate existing
+application instances. Manifest registration changes require an Eden restart.
+
+The standalone `x/repl --mount clockwork` server supports status and
+`save-mount --no-reload`; live reload requires `x/eden --wire-port`. The wire is a
+trusted local development interface, bound to `127.0.0.1`.
+
+For editor clients, requests are newline-terminated JSON, one per TCP connection:
+
+```json
+{"op":"mount/status","mount":"clockwork"}
+{"op":"mount/save","mount":"clockwork","file":"main.grove","text":"…","expected":"SHA-256 from status.files","reload":true}
+{"op":"mount/reload","mount":"clockwork"}
+```
+
+Save requires the last observed SHA-256 in `expected`; a mismatch returns
+`conflict: true` without writing. `reload` defaults to true. Status returns file
+hashes and, on Eden, the current epoch, readiness, publication, and diagnostics.
+Replies use `ok`; descriptor changes return `restart_required: true`. Commands
+exit nonzero on errors and print wire replies as JSON.
+
+## Terminal mounts
+
+Create a mount with a Foil terminal entrypoint and run it directly:
+
+```sh
+x/create-mount clockwork --terminal
+x/eden --terminal clockwork --wire-port 8679
+```
+
+The generated `cli.foil` is an echo loop using `(Input 4096)` and `Output`.
+Replace it with your command parser and application logic. `--terminal NAME`
+selects that mount and its dependencies automatically; `--mount` can select
+additional mounts. Arguments after `--` are passed as a `row[str]`:
+
+```sh
+x/eden --terminal clockwork --wire-port 8679 -- campaign-one
+printf 'look\n' | x/eden --terminal clockwork
+```
+
+For an existing mount, register a Foil module and add a `terminal` entry to
+`mount.json`, using the same entrypoint format as `start`:
+
+```json
+"modules": {
+  "apps/clockwork/cli": "cli.foil"
+},
+"terminal": {
+  "module": "apps/clockwork/cli",
+  "entry": ["terminal", "main"]
+}
+```
+
+Its function has the signature:
+
+```foil
++ terminal
+  + main
+    \ server=nat arguments=row[str]
+    ^ nat
+    ' Read commands, use server to talk to the live supervisor, then return.
+    0
+```
+
+Activation and background `start` hooks run first. The terminal function runs
+on the main actor with the supervisor capability in `server`. Use `SendCaps`
+and `Recv` for live namespace operations. Keep blocking terminal input out of
+background `start` hooks: only the selected `terminal` entrypoint owns stdin.
+
+The runtime inherits stdin and stdout directly, including a real terminal's
+line discipline or a pipeline's bytes. Bootstrap expressions are read from a
+separate file, so command text cannot become Reaver expressions. `Input` takes
+a byte limit and returns a byte bar; reads can be partial, and a value at most
+1 indicates EOF. `Output` writes byte bars to stdout, including prompts without
+a newline. Compiler diagnostics and `Print` output remain in the runtime log;
+launcher messages go to stderr.
+
+Return a number from 0 to 255 as the command's exit status. Returning shuts down
+Eden's background actors; an uncaught error reports failure and exits 1.
+Ctrl-C stops the launcher. Terminal mode cannot be combined with `--check`.
+
+With `--wire-port`, `save-mount` and `reload-mount` continue to work while the
+terminal is waiting in `Input`. Control requests run through a separate actor
+connection. Reload updates published source and assets; the already running
+terminal function retains its compiled code. Restart to run an edited terminal
+loop or change its manifest registration.
+
+The `eden-terminal` suite in `x/check` exercises a real PTY, supervisor calls,
+save/reload while waiting for input, EOF, argument passing, and exit status.
+
 ## Declarative Goo workspaces
 
 An ordinary workspace can use the shared Explorer host instead of writing a

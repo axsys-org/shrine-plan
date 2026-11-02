@@ -11,7 +11,7 @@ files, in this dependency order:
 | 3 | `namespace.foil` | Versioned storage, namespace composition, reads, transactions, dispatch, reactions, and publication primitives. |
 | 4 | `vanes.foil` | Pact, HTTP, fetch, chore, filesystem sync, and schema behaviors. |
 | 5 | `stdlib/runtime.foil` | Helm and Eden, actor adapters, Grove/Goo, presentation, compiler publication, and mount integration. |
-
+o
 Each layer imports its predecessor; `types.foil` imports the required `sys`
 modules. Runtime also imports base with a prefix for JSON parsing, which must
 remain distinct from its own semidoc `parse` declaration. Imports may only point to earlier layers, and the bootstrap import

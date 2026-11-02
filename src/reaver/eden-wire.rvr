@@ -1,0 +1,78 @@
+;;;; Trusted editor access to the running supervisor. Only the local launcher
+;;;; holds the actor capability; no HTTP application or Explorer is required.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind driver (#module foil-new-env))
+(#bind abi (#module foil-abi))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind json (#module wire-json))
+(#bind render (#module foil-render))
+
+(define (request system server self name rescan)
+  (define policy (bootstrap:policy system))
+  (define (tool path) (driver:get-perc path policy))
+  (define home [self ("ts" "io") ("ts" "fs") ((tool ["source_mount" "mount_key"]) name)])
+  (define (exchange card)
+    (define reply (Seq (SendCaps server card [0]) (Recv 0)))
+    (Seq ((tool ["helm" "supervisor" "close_caps"]) (_1 reply)) (_0 reply)))
+  (define (step writ)
+    (define reply (exchange ((abi:constructor policy ["helm" "card" "step"]) home writ)))
+    (If (Equal reply ((abi:constructor policy ["feet" "task" "ack"])
+                      (abi:option policy "none"))) 0
+      (error ["mount-reload-rejected" reply])))
+  (define (run ignored)
+    (Seq (If rescan
+      ;; Explicit reload also recompiles unchanged consumers of changed
+      ;; dependencies. Invalidate only the scan fingerprint; the last good
+      ;; publication and its assets remain available if compilation fails.
+      (Seq (step ((abi:constructor policy ["writ" "poke"])
+          ((tool ["myth" "sing"]) ((tool ["source_mount" "slot"]) ("ts" "snapshot"))
+            ((abi:constructor policy ["pails" "t"]) ""))))
+        (step ((abi:constructor policy ["writ" "warp"])
+          (Weld home [("ts" "op") ("ts" "rescan")]) (tool ["myth" "new"])))) 0) 0)
+    (define (read state)
+      (define status ((tool ["source_mount" "status_at"]) home state))
+      (define record ((tool ["source_mount" "record"]) home state))
+      [200 (json:jobj [["ok" "true"] ["epoch" (showNat (_0 status))]
+        ["ready" (If (_1 status) "true" "false")]
+        ["message" (json:jq (_2 status))] ["publication" (showNat (_3 status))]
+        ["diagnostic" (json:jq ((tool ["myth" "txt_at"])
+          ((tool ["source_mount" "slot"]) ("ts" "diagnostic_text")) record))]])])
+    (define reply (exchange ((abi:constructor policy ["helm" "card" "snapshot"]) 0 read)))
+    (_2 reply))
+  (define result (Try (lambda (ignored) (force (run 0))) 0))
+  (If (Eq 1 (Hd result))
+    (json:jobj [["ok" "false"] ["error" (json:jq (render:diag-text (_0 result)))]])
+    (_0 result)))
+;; Read bounded lines without stealing bytes from the next request. This is
+;; a launcher-owned connection; stdin belongs exclusively to the application.
+(define (line fd)
+  (define (go text size)
+    (define byte (Read fd 1))
+    (If (Le byte 1) 0
+      (let ((ch (bignat-to-text byte)))
+        (If (Eq ch 10) [text]
+          (If (Ge size 256) (error "Eden control line too long")
+            (go (strcat [text ch]) (Inc size)))))))
+  (go "" 0))
+(define (write-line fd text)
+  (define bytes (strcat [text 10]))
+  (Write fd (Set (Mul 8 (Bytes bytes)) bytes)))
+(define (start system server self port token)
+  (define (worker ignored)
+    (define initial (Recv 0))
+    (define supervisor (_0 (_1 initial)))
+    (define fd (Connect 0 "127.0.0.1" port))
+    (define (loop ignored)
+      (define name (line fd))
+      (Ifz name (CloseFd fd)
+        (let ((mode (line fd)))
+          (Ifz mode (CloseFd fd)
+            (Seq (write-line fd (request system supervisor self (_0 name) (Eq "1" (_0 mode))))
+              (loop 0))))))
+    (Seq (write-line fd token) (loop 0)))
+  (define actor (Spawn worker))
+  (Seq (SendCaps actor 0 [server]) actor))
+(#export request start)

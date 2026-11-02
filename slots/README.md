@@ -3,7 +3,7 @@
 A `*.slots.json` file documents shared record keys. `system.slots.json` is the
 canonical catalog for `/sys` and generates compiler declarations in
 `src/foil/sys/slots.foil`, the `system_vocabulary` facade, and the namespace seed
-records in `src/foil/slot_documentation.foil`. Edit the catalog, then run:
+records in `src/foil/stdlib/runtime.foil`. Edit the catalog, then run:
 
 ```sh
 python3 x/slot_catalog.py
@@ -42,7 +42,7 @@ slot/prefix names, and generated-file agreement.
 
 Version 2 replaces the version 1 `payload`, `scope`, and `machinery` fields with
 `title`. Content/presentation filtering is maintained separately in
-`src/foil/slot_presentation.foil`; editing documentation does not change that policy.
+`src/foil/stdlib/runtime.foil`; editing documentation does not change that policy.
 
 The catalog is deliberately about slot keys, not every path in the namespace.
 `/sys/slot/*` and `/sys/slots/*` presentation selectors, Goo labels, application-local

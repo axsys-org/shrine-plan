@@ -1,0 +1,122 @@
+;;;; Editor protocol over the current compiler. This session owns an isolated
+;;;; publication: it never commits editor evaluations into an Eden store.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind parse (#module parse))
+(#import parse)
+(#bind driver (#module foil-new-env))
+(#bind source (#module foil-source))
+(#bind publication (#module foil-publication))
+(#bind context (#module foil-context))
+(#bind bootstrap (#module foil-bootstrap))
+(#bind subject (#module foil-subject))
+(#bind inspect (#module compiler-inspect))
+(#bind entry (#module foil-entry))
+(#bind lore (#module foil-lore))
+(#bind render (#module foil-render))
+(#bind doctest (#module doctest))
+(#bind json (#module wire-json))
+
+(define (ok fields) (json:jobj (Weld [["ok" "true"]] fields)))
+(define compiler (Pin driver:compile-with))
+(define (compile cache name)
+  (define system-plan (publication:prepare-system compiler source:read-module bootstrap:system-roots))
+  (define system (publication:compile system-plan cache))
+  (define images (_2 system))
+  (define (root mod)
+    (define found (find (lambda (pair) (Equal mod (_0 pair))) images))
+    (If found (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
+      (Weld [["x" 17] ["ts" "editor"]] (source:module-segments mod))))
+  (define plan (source:prepare-publication
+    (context:publication-key (publication:compilation-context system-plan))
+    compiler root images (lambda (path) 0) [name]))
+  (define code (publication:compile plan (_1 system)))
+  [(_1 code) (publication:compiled-module code name)])
+
+(define (error-module fallback problem)
+  (define tag (render:diag-tag problem))
+  (cond
+    ((Equal tag "foil-in-module") (error-module (Ix 1 problem) (Ix 2 problem)))
+    ((Equal tag "foil-publication-inputs") (error-module fallback (Ix 2 problem)))
+    (else fallback)))
+(define (error-inner problem)
+  (If (Equal "foil-publication-inputs" (render:diag-tag problem))
+    (error-inner (Ix 2 problem)) problem))
+(define (failure mod problem)
+  (json:jobj [["ok" "false"] ["error" (json:jq (render:diag-text (error-inner problem)))]
+    ["diags" (json:jarr (map (lambda (row)
+      (json:jobj [["module" (json:jq (error-module mod problem))]
+        ["line" (showNat (_0 row))] ["col" (showNat (_1 row))]
+        ["msg" (json:jq (_2 row))]])) (render:diag-rows (error-inner problem))))]]))
+
+(define (owner cache key)
+  (find (lambda (perc) (includes (Equal key) (driver:perc-own-keys perc)))
+    (driver:cache-results cache)))
+(define (node perc key)
+  (strcat ["/boot/" (driver:perc-name perc) "/"
+    (showNat (Sz (inspect:local-path perc key))) "/"
+    (join-str "/" (inspect:local-path perc key))]))
+(define (node-for cache key)
+  (define hit (find (lambda (perc) (includes (Equal key) (driver:perc-own-keys perc)))
+    (driver:cache-results cache)))
+  (If hit [(node (_0 hit) key)] []))
+(define (refs perc key)
+  (map (lambda (ref) (subject:resolve-path (_1 ref)))
+    (entry:collect-refs (subject:got-entry-tc key (driver:perc-subject perc)))))
+(define (describe cache perc name)
+  (define sut (driver:perc-subject perc))
+  (define key (subject:resolve-source-path
+    (render:split-ch 47 (join-str "/" (render:split-ch 46 name))) sut))
+  (define found (owner cache key))
+  (define owning (If found (_0 found) perc))
+  (define part (entry:entry-parts sut key))
+  (define span (driver:perc-entry-span key owning))
+  (define doc (If found (lore:lore-for (driver:perc-lore owning) (inspect:local-path owning key)) 0))
+  (define calls (foldl (lambda (out ref) (Weld out (node-for cache ref))) [] (refs owning key)))
+  (define callers (foldl (lambda (out candidate)
+    (Weld out (foldl (lambda (acc from)
+      (If (includes (Equal key) (refs candidate from))
+        (snoc (node candidate from) acc) acc)) [] (inspect:documented-keys candidate))))
+    [] (driver:cache-results cache)))
+  (ok [["module" (json:jq (driver:perc-name owning))]
+    ["path" (If found (json:jq (node owning key)) "null")]
+    ["kind" (json:jq (entry:entry-kind sut key (entry:ent-tc part)))]
+    ["type" (json:jq (render:ty-text (subject:tc-ty (entry:ent-tc part))))]
+    ["line" (showNat (_0 span))]
+    ["src" (If found (json:jq (inspect:entry-source (inspect:source-info source:read-source owning) owning span)) "null")]
+    ["lede" (If doc (json:jq (lore:lore-head (_0 doc))) "null")]
+    ["calls" (json:jarr-str calls)] ["called_by" (json:jarr-str callers)]]))
+
+(define (dispatch cache perc op text name prefix)
+  (define subj (doctest:bundle-with (driver:perc-world perc) (driver:perc-subject perc)))
+  (cond
+    ((Equal op "compile") (ok [["report" (json:jq (strcat ["Compiled " (driver:perc-name perc)]))]]))
+    ((Equal op "complete")
+      (ok [["names" (json:jarr-str (filter (lambda (name)
+        (Equal prefix (lore:str-slice 0 (Bytes prefix) name)))
+        (map (join-str "/") (filter Sz (inspect:visible-names perc)))))]]))
+    ((Equal op "describe") (describe cache perc name))
+    ((Equal op "eval")
+      (let ((result (doctest:eval-text subj text)))
+        (If (Eq 1 (Hd result)) (failure (driver:perc-name perc) (_0 result))
+          (let ((value (_0 (_0 result))) (ty (_1 (_0 result))))
+            (ok [["value" (json:jq (render:dt-val value))]
+              ["type" (json:jq (render:ty-text ty))]
+              ["law" (If (render:law-like? value) (json:jq (render:render-law value)) "null")]])))))
+    ((Equal op "doctest")
+      (let* ((results (foldl (lambda (out pair)
+                       (Weld out (doctest:run-lore subj pair))) [] (driver:perc-lore perc)))
+             (passed (Sz (filter (lambda (row) (_1 row)) results))))
+        (ok [["passed" (showNat passed)] ["failed" (showNat (Sub (Sz results) passed))]])))
+    (else (error ["unknown-wire-operation" op]))))
+
+;; Failed compiles retain the caller's cache; no partial revision is installed.
+(define (handle cache op mod text name prefix)
+  (define result (Try (lambda (ignored)
+    (define cached (find (lambda (perc) (Equal mod (driver:perc-name perc))) (driver:cache-results cache)))
+    (define compiled (If (And cached (Nil (Equal op "compile"))) [cache (_0 cached)] (compile cache mod)))
+    (force [(_0 compiled) (dispatch (_0 compiled) (_1 compiled) op text name prefix)])) 0))
+  (If (Eq 1 (Hd result)) [cache (failure mod (_0 result))] (_0 result)))
+(#export handle)
