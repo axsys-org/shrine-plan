@@ -81,6 +81,47 @@ Provider answers remain evidence: they are not turned into hardcoded replay
 steps. This is extraction from the existing typed execution trace, not automatic
 inference of a procedure from arbitrary agent or user activity.
 
+### Draft a flow from an investigation
+
+On a page with Cooperate work, **Page tools → Flows → Extract investigation**
+shows its linked retained events in their original order. Select event names
+and create a new flow. The selection is checked against the investigation's
+sequence; an obsolete form, missing event, duplicate selection, malformed trace,
+or occupied destination refuses without creating a partial draft.
+
+The draft is ordinary Semidoc. Each selected event has an `evidence_N` input,
+a frozen provenance cell, and an example input cell. An explicitly recorded
+artifact supplies the example when available; otherwise its named captured
+context is used, falling back to inert note text. References in the draft point
+to the retained provenance cells. Subsequent changes to the original evidence
+do not rewrite those examples. Unselected events are not copied.
+
+The draft deliberately has no executable steps or result yet. Use the existing
+callable selection and composition controls, or edit the Semidoc source, to
+choose operations, dependencies, and the result. Nothing treats a tool result
+or a note as executable code. The ordinary compiler rejects an unfinished draft.
+A native authoring hole watches the draft's source. **Review extracted procedure**
+checks that the procedure compiles and acknowledges that hole; another source
+edit reopens it. Review does not publish or execute anything.
+
+Publish separately, then select and embed the definition in any Nenex document.
+Its binding fields can use new evidence instead of the retained examples. The
+same maintenance hand, cells, overlays, holes, and attempt history apply.
+For a document revision, author a `/flow/page` brief with its `/flow/uses` keys,
+then compose the native `revise` operation with `pages` bound to `document` and
+`sources` bound to the chosen evidence input. On the host page, **Bind Nenex
+source page** creates a live cell at `cells/KEY_source`. Bind an extracted input
+such as `evidence_1` explicitly to `/x/<host>/cells/KEY_source`; the source form
+only supplies a default for an input named `sources`. Leave the provider empty
+for manual revision. **Open draft**, save the authored prose, and **Accept saved
+draft** completes the same native work. Editing the evidence page requests a new
+revision while retaining the earlier attempt and published document history.
+
+Extraction supports explicitly recorded Cooperate investigation traces, up to
+16 selected events per draft. It does not infer dependencies or capture arbitrary
+unrecorded browser/agent actions. Retained flow runs continue to support exact
+executable extraction through **Extract retained run**.
+
 ### Declared Goo actions in work
 
 Use **Page tools → Flows → Inspect declared Goo actions** to inspect an object
