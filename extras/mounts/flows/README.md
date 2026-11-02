@@ -25,7 +25,9 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
 2. Use **Compose an operation or child flow** to select a callable and bind its
    ports, or edit and save the Semidoc source. Ordinary prose and literal examples
    stay inert. Only the marked definition is compiled.
-3. **Publish flow** captures the saved definition and selected native laws.
+3. Enter the authored definition's name in **Publish flow**. This Goo control
+   captures the saved definition and selected native laws. Unsaved source must
+   be saved before it can be published.
 4. Bind the inputs to namespace paths, choose a destination and a published
    writer, and **Attach maintenance**. `/x/...` can bind a cell or overlay result.
    A document composition suggests the Nenex writer and installed Codex provider;
@@ -35,6 +37,10 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
 
 These forms call `namespace_command/plan` and supervisor admission. They do not
 run Python commands or maintain a browser-owned work queue.
+Publication is declared in `authoring.grove`: the embedded browser control and
+reflected/headless control use the same arguments and native publish guard.
+Other authoring controls still use the existing forms. Successful publication
+refreshes the surrounding controls while preserving any unsaved source draft.
 
 ### Compose in Nenex
 
@@ -379,6 +385,18 @@ settlement: request and worker records own those decisions. Controller serials i
 records their history. No new scheduler, queue service or persistence layer is
 introduced.
 
+Current work is selected by the controller's existing crew: exact request and
+guard records, current worker subtrees, and document drafts. Retained attempts are
+not dispatch candidates. Allocation temporarily probes only the prospective
+attempt paths through the same crew before writing them, preserving collision
+checks without reading all prior attempts. Replacing a demand settles its active
+old attempt; late provider evidence remains retained but cannot publish for the
+replacement. Detach releases owned hole subscriptions as well as the controller
+subscription and destination claim. Another consumer of the same evidence keeps
+its own subscriptions.
+Cells displays completed revisions from the existing retained-request projection;
+the hand continues to select only current jobs and live hole heads.
+
 The Codex hand owns app-server dispatch and stable turn completion. Its Python
 companion transports bytes and owns the child process. On restart an interrupted
 external turn becomes a retained failed outcome through `native_work`; uncertain
@@ -419,6 +437,9 @@ The writer publishes when all required revisions are ready. It protects edited
 generated prose, refuses collisions and page removal requiring migration, and
 preserves named notes, cells, work and holes. A destination claim prevents
 competing maintainers. Paused and detached controllers retain their evidence.
+The writer shares Nenex's source-edit attachment guard: named work beneath
+numbered prose prevents structural replacement, while safe text edits remain
+possible. Native authoring and source/Goo editing enforce that same rule.
 Old attempts keep their captured definition and inputs after later edits.
 The maintenance projection at `cells/maintenance` is owned by its controller:
 refreshes preserve annotations, foreign cells refuse adoption, and custom
@@ -507,8 +528,10 @@ Source publication and installed runtime bindings are distinct in the existing
 mount system. After publishing changed modules, reconnect the HTTP foot with a
 restart and use **Page tools → Flows → Refresh harness code**. This uses the same
 registration records as initial installation and admits only changed code records
-in one native batch. This includes Nenex's declared document behaviors and reader;
-it does not replace the supervisor's captured Goo interpreter. It does
+in one native batch. Flow refresh owns flow behavior and its Nenex contribution.
+Cooperate and Nenex activate their own hands, document forms and reader; a flow
+refresh cannot roll those dependencies back to its captured imports. It does not
+replace the supervisor's captured Goo interpreter. It does
 not reinstall application seeds or examples, or change controllers,
 captures, destination claims, documents or holes. The native operation is
 `/<node>/gov/flows/refresh_harness` at `/<node>/gov/flows`. Older worlds need one

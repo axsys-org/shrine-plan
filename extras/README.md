@@ -3,6 +3,8 @@
 Start with [Harness, documents, and applications](HARNESS.md) for the ownership
 map: native work, flows, providers, Nenex, their integration, examples and fixtures.
 The harness shares one native world; the handbook is an authored flow.
+The optional [graph library](mounts/graph/README.md) publishes Foil/Grove evidence
+projections using the existing overlay contracts; it has no service or scheduler.
 
 For a worked example, read [Making a Grove and Goo mount](tutorials/grove-goo-mount.md).
 Its runnable `hello-grove` mount includes a notes list, reader, and editor.

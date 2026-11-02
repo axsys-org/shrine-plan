@@ -18,6 +18,7 @@ authored procedure and its maintained documents, not another application runtime
 | `mounts/flows/sources*.foil` | Evidence adapters and live source bindings using existing filesystem ownership | Filesystem actors, Nenex pages, example installation |
 | `mounts/flows/web*.foil` | Explicit HTTP request/result adapter and native transport foot | Automatic research, polling or application-specific crawling policy |
 | `mounts/codex` | Native provider hand and app-server transport/process lifetime | Deciding when a flow runs or when a domain result is acceptable |
+| `mounts/graph` | Optional Foil/Grove transformations over explicitly supplied evidence, reference projection and conflict-preserving assertion policy | Namespace reads, a graph store, implicit identity, source polling or a work lifecycle |
 | `mounts/nenex` | Semidoc page ownership, source/Goo editing, reader, question/block context and page-tool contributions | The work lifecycle or a flow evaluator |
 | `mounts/flows/nenex*.foil`, `interface.foil` | Flow/Nenex integration: source authoring, page evidence, guarded writer and forms | The generic command catalogue or filesystem-source lifecycle |
 | `mounts/flows/install.foil` | Native flow command/law registration and retained-contract checks | Nenex routes or example catalogue |
@@ -31,12 +32,21 @@ independently installable headless flow mount. Existing pinned module ownership,
 logical names, public commands and retained contract definitions are unchanged by
 this cleanup. We do not move contracts between publishers to tidy directories.
 
+Each mount activates its own behavior records. A flow refresh updates the flow
+commands and its Nenex contribution; it cannot reinstall an older captured
+Cooperate hand or Nenex document form. Dependency installation remains with the
+existing mount ordering and each dependency's own activation.
+
 The flat source bags are a deliberate Eden publication boundary. Keep logical
 responsibilities clear inside them instead of adding a new directory loader,
 umbrella service, or compatibility mount. Runtime modules stay flat; examples and
 test assets can live in subdirectories and are staged by the existing host/gate.
 The flow native suites and transport fixtures are grouped under `flows/tests/`;
 `mount.json` retains their existing logical suite names.
+`flow_test_world` and `flow_request_fixture` provide reusable disposable setup
+without importing executable flow suites. Setup admissions fail visibly; negative
+tests explicitly require rejection and an unchanged world. Pure graph reference
+checks import the production types they use rather than the cell test suites.
 
 ## How the pieces meet
 
@@ -59,6 +69,20 @@ releases its claim and subscriptions. Selected occurrences retain the exact
 definition publication while their input bindings remain live; existing live
 maintenance attachments continue to follow publication.
 
+The hand reconciles its existing crew from current jobs and live owned hole heads,
+selecting the corresponding requests, workers, drafts and guards. It does not
+subscribe to the whole retained work tree. Retained controllers use the same
+derivation; their attempt identities do not need to be rewritten. Allocation checks
+temporarily select the exact prospective attempt subtrees through that same crew;
+the native wake operation resolves those probes before creation. Superseded
+attempts remain retained but cannot block current dispatch or authorize a late
+result. Detach also withdraws the context subscriptions of holes owned by that
+controller, leaving other consumers and historical captures intact.
+Direct adoption and detach derive that same selection before acting, even when a
+retained controller has not reacted yet. The Cells history projection reads
+retained requests independently; displaying completed attempts does not add them
+back to the hand's current jobs or subscriptions.
+
 Nenex's page/block question interface uses the shared answering policy directly;
 it does not need to manufacture a flow. Cooperate investigations use the same
 captures and provider protocol without requiring a document editor. A document
@@ -71,6 +95,25 @@ child in the same invocation, with explicit inputs and scoped step identities.
 Suspended child work uses the parent's native requests, holes and resolutions.
 The parent's selected writer owns final publication. Captures, child step results
 and final call results remain distinct events in the ordinary trace.
+Lens authoring rejects aliases that overlap its primary subject, constructor
+coordinates, or another alias. An intentional replacement belongs in an explicitly
+selected transformation rather than an accidental context name.
+
+Pure calculations compose as Foil functions or published Grove `@sewn`
+transformations with captured input/output norms. Expose an intermediate result as
+an ordinary cell or overlay when it needs an address, subscription or inspection.
+The optional `graph` library follows this boundary: it derives references and
+assertion reports from supplied trees, without a special evaluator or default Eden
+installation. Its explicit assertion policy is not a namespace identity rule.
+
+Ordinary cells resolve their declared inputs eagerly. A narrow tack can avoid a
+sibling dependency; selecting a branch after receiving a whole tree does not make
+that computation lazy. A reference discovered in a result remains a reference.
+Following it requires an explicit binding or an existing authored operation, not
+an implicit namespace read during a pure transformation. Historical virtual-child
+selection must identify its defining root and snapshot; it cannot borrow a local
+case number independently from each possible ancestor. Multi-input overlays do
+not gain a synthetic public case counter.
 
 ## Python and source adapters
 
@@ -110,6 +153,18 @@ resolution semantics; this is not a new behavior publication mechanism.
 `flow/definition` still carries optional document pages in its pinned contract.
 Ordinary compositions leave that payload empty. The contract remains unchanged;
 this work does not rebrand retained values or claim to remove that historical field.
+Trace extraction keeps that recipe only when a selected binding consumes the
+implicit `document` input. It retains the complete recipe in that case because an
+opaque selected law may use any part of it.
+
+Source editing, Goo editing, native flow authoring and the document writer share
+Nenex's attachment invariant. Structural source replacement cannot relocate named
+work beneath positional prose. Safe text edits and independent page-level named
+children retain their existing behavior. The guard complements each entry point's
+freshness and ownership checks; it adds no parallel document representation.
+The generated writer also checks Nenex's existing authored-source reconciliation,
+so an unresolved native edit cannot be overwritten merely because `src` stayed
+unchanged. Explicit source editing remains the way to resolve that conflict.
 
 Composition reuses native dispatch and holes, captures child definitions and bindings,
 and gives effects an admitted writer. Evaluation is bounded to eight nested calls
@@ -129,6 +184,11 @@ the result. Existing emitted moves carry these commands; no action foot, polling
 loop or second interpreter is added. Nenex reflects compiled controls into
 captured cells and exposes their bindings for deliberate selection. Source authoring and extraction belong to the Nenex flow adapter;
 the action work provider belongs to the shared harness.
+The flow publication control is declared in `flows/authoring.grove` and embedded
+through the existing Goo presentation host. Browser and reflected invocation use
+the same declared inputs, native publish operation and admission guards. The other
+flow authoring controls still use their existing forms; this is one proven path,
+not a claim that the entire interface is reflective.
 
 ## Validation and saved worlds
 
@@ -139,9 +199,19 @@ retries, source ownership and document publication. Nenex's suites own source/Go
 fidelity and question context. Codex's suites own provider transport and dispatch.
 The fixture catalogue can be supplied to both Eden and `extras/x/check` with
 `--extras-root`, following `tests/fixtures/tree-pages/README.md`.
+The full flow check also compiles the production authoring Grove declaration and
+compares browser-request decoding, reflected invocation and direct native
+publication. `node extras/mounts/nenex/tests/publication.cjs` checks publication
+frame cleanup and protection of unsaved source drafts.
+The optional `flow-work-cost-tests.rvr` check isolates current crew hydration from
+compilation and world construction. Its comparison with whole-work-tree reads is
+not an end-to-end latency benchmark: the hand still reads its destination view,
+and explicit retry still checks retained retry links.
 
 Validate refactors in disposable worlds. Captured implementations, attempts and
 x/y/z history belong to the saved world, not the source checkout. This cleanup does
 not activate modules, patch a bootstrap, migrate a world or clean its storage.
-The earlier reverse-reference integration changes the core `sov` contract and is
-still not an upgrade path for a world running an older retained kernel.
+Reference projection is an ordinary supplied-tree computation and does not change
+the core `sov` storage contract. Reader fixes still change executable behavior;
+publishing a mount does not replace the retained service/compiler in an existing
+world or establish a safe activation path for it.

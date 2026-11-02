@@ -87,7 +87,38 @@
   };
   addEventListener('hashchange', reveal); reveal();
   document.querySelector('[name=new]')?.setAttribute('pattern', '[A-Za-z_][A-Za-z0-9_-]*');
+  const publicationFrames = new Map();
+  let publicationRefreshPending = false;
   const decorate = () => {
+    for (const [frame, disconnect] of publicationFrames) {
+      if (frame.isConnected) continue;
+      disconnect(); publicationFrames.delete(frame);
+    }
+    for (const frame of shell.querySelectorAll('iframe[data-nenex-publication]')) {
+      if (publicationFrames.has(frame)) continue;
+      let stop;
+      const connect = () => {
+        stop?.();
+        stop = frame.contentWindow?.GooActions?.subscribeOutcomes(receipt => {
+          if (receipt.outcome !== 'accepted' || publicationRefreshPending) return;
+          publicationRefreshPending = true;
+          // Refresh presentation after Goo has settled its saved inputs.
+          requestAnimationFrame(() => {
+            if (!frame.isConnected) { publicationRefreshPending = false; return; }
+            if (dirty()) {
+              publicationRefreshPending = false;
+              frame.parentElement.querySelector('[data-publication-status]').textContent =
+                'Saved source published. Your unsaved source is retained; save or discard it before refreshing the flow controls.';
+              return;
+            }
+            location.reload();
+          });
+        });
+      };
+      frame.addEventListener('load', connect);
+      publicationFrames.set(frame, () => { stop?.(); frame.removeEventListener('load', connect); });
+      connect();
+    }
     for (const form of shell.querySelectorAll('form[data-native-flow]')) {
       if (form.dataset.ready) continue;
       form.dataset.ready = 'true';
