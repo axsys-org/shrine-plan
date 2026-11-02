@@ -6,11 +6,35 @@
 
 local M = {}
 
+-- Mounted source names need not match their published module names.
+local function manifest(bufnr)
+  local path = vim.api.nvim_buf_get_name(bufnr or 0)
+  local file = vim.fn.findfile("mount.json", vim.fn.fnamemodify(path, ":h") .. ";")
+  if file == "" then return nil end
+  local ok, data = pcall(function()
+    return vim.json.decode(table.concat(vim.fn.readfile(file), "\n"))
+  end)
+  if not ok or type(data) ~= "table" then return nil end
+  local dir = vim.fn.fnamemodify(file, ":p:h")
+  local files = {}
+  for _, key in ipairs({ "modules", "tests" }) do
+    if type(data[key]) == "table" then
+      for mod, rel in pairs(data[key]) do
+        if type(rel) == "string" then files[mod] = vim.fn.simplify(dir .. "/" .. rel) end
+      end
+    end
+  end
+  return files
+end
+
 function M.of(bufnr)
   bufnr = bufnr or 0
   local override = vim.b[bufnr].foil_module
   if override and override ~= "" then return override end
   local path = vim.api.nvim_buf_get_name(bufnr)
+  for mod, file in pairs(manifest(bufnr) or {}) do
+    if file == path then return mod end
+  end
   local mod = path:match(".*/foil/(.+)%.foil$")
   if mod then return mod end
   return vim.fn.fnamemodify(path, ":t:r")
@@ -20,7 +44,7 @@ end
 --- files.  nil when the buffer is not under a foil/ tree.
 function M.root(bufnr)
   local path = vim.api.nvim_buf_get_name(bufnr or 0)
-  return path:match("(.*/foil/)") and path:gsub("/foil/.*$", "/foil/") or nil
+  return path:match("(.*/foil/)")
 end
 
 --- A mirror node path "/boot/<mod..>/<n>/<name..>" -> module, name
@@ -43,6 +67,8 @@ end
 
 --- The file for a module, resolved against the current buffer's root.
 function M.file_of(mod, bufnr)
+  local files = manifest(bufnr)
+  if files and files[mod] then return files[mod] end
   local root = M.root(bufnr)
   if not root then return nil end
   return root .. mod .. ".foil"

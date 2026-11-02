@@ -1,0 +1,1 @@
+require('foil.buffer').setup()

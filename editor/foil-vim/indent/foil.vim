@@ -15,6 +15,7 @@ setlocal autoindent
 setlocal nosmartindent
 setlocal indentexpr=GetFoilIndent()
 setlocal indentkeys=o,O,!^F
+let b:undo_indent = 'setlocal autoindent< smartindent< indentexpr< indentkeys<'
 
 if exists("*GetFoilIndent")
   finish
@@ -31,8 +32,8 @@ function! GetFoilIndent() abort
 
   " A `+ name` line on its own (no other content after the name) opens a
   " body that must be indented one shift deeper.
-  if l:prev =~# '^\s*+\s\+[A-Za-z_][A-Za-z0-9_-]*\s*$'
-    return l:ind + &shiftwidth
+  if l:prev =~# '^\s*+\s\+[A-Za-z_][A-Za-z0-9_/-]*\s*\%(''\s.*\)\?$'
+    return l:ind + shiftwidth()
   endif
 
   " A pattern-match arm or let binding clause: `>  ...` -- next line

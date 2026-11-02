@@ -1,5 +1,4 @@
--- Omni-completion over the module's own entries (the mirror's
--- ['entries] slot via the wire's complete op).
+-- Local declaration completion, or module entries through the optional wire.
 
 local wire = require("foil.wire")
 local module = require("foil.module")
@@ -10,18 +9,19 @@ function M.omnifunc(findstart, base)
   if findstart == 1 then
     local line = vim.api.nvim_get_current_line()
     local col = vim.fn.col(".") - 1
-    local start = col
-    while start > 0 and line:sub(start, start):match("[%w_/]") do
-      start = start - 1
-    end
-    return start
+    return require("foil.source").start(line, col)
   end
+  local source = require("foil.source")
+  if not require("foil").uses_wire() then return source.complete(base) end
+  local prefix = source.resolve(base)
   local ok, res = wire.request_sync(
-    { op = "complete", module = module.of(0), prefix = base }, 5000)
+    { op = "complete", module = module.of(0), prefix = prefix })
   if not ok or not res.ok then return {} end
   local items = {}
   for _, name in ipairs(wire.field(res, "names") or {}) do
-    items[#items + 1] = { word = name, menu = "[foil]" }
+    if name:sub(1, #prefix) == prefix then
+      items[#items + 1] = { word = base .. name:sub(#prefix + 1), menu = "[foil]" }
+    end
   end
   return items
 end

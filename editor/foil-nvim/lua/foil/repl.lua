@@ -14,7 +14,7 @@ local module = require("foil.module")
 
 local M = {}
 
-local state = { buf = nil, focus = "sept", vars = {} } -- vars: {name, expr} pairs
+local state = { buf = nil, focus = "stdlib/runtime", vars = {} } -- vars: {name, expr} pairs
 
 local function append(lines)
   if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then return end

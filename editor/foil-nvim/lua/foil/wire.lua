@@ -1,5 +1,5 @@
 -- The wire client: one JSON request per TCP connection, one JSON
--- reply, server closes (doc/buddy-wire.md).  Async with a callback,
+-- reply, server closes. Async with a callback,
 -- plus a vim.wait sync wrapper for omnifunc/gd.
 
 local uv = vim.uv or vim.loop
@@ -9,7 +9,7 @@ local M = {}
 M.config = {
   host = "127.0.0.1",
   port = 8679,
-  timeout = 30000, -- compiles can be slow; evals are not
+  timeout = 120000,
 }
 
 function M.setup(opts)
@@ -23,20 +23,20 @@ function M.request(req, cb)
   local tcp = uv.new_tcp()
   local chunks = {}
   local done = false
+  local timer = uv.new_timer()
   local function finish(ok, res)
     if done then return end
     done = true
+    if not timer:is_closing() then timer:stop(); timer:close() end
     if not tcp:is_closing() then tcp:close() end
     vim.schedule(function() cb(ok, res) end)
   end
-  local timer = uv.new_timer()
   timer:start(M.config.timeout, 0, function()
-    timer:stop(); timer:close()
     finish(false, "wire timeout")
   end)
   tcp:connect(M.config.host, M.config.port, function(err)
     if err then
-      return finish(false, ("connect to %s:%d failed (%s) — is x/repl running?")
+      return finish(false, ("connect to Foil wire server %s:%d failed (%s) — start x/repl")
         :format(M.config.host, M.config.port, err))
     end
     tcp:read_start(function(rerr, chunk)
@@ -46,7 +46,7 @@ function M.request(req, cb)
       else -- EOF: the server wrote its line and closed
         local body = table.concat(chunks)
         local ok, decoded = pcall(vim.json.decode, body)
-        if ok then finish(true, decoded)
+        if ok and type(decoded) == "table" and type(decoded.ok) == "boolean" then finish(true, decoded)
         else finish(false, "undecodable response: " .. body:sub(1, 200)) end
       end
     end)

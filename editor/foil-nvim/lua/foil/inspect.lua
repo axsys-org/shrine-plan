@@ -10,14 +10,9 @@ local M = {}
 --- The entry name under the cursor, dotted for the wire ("cord/eof"
 --- and "cord.eof" both -> "cord.eof").
 function M.name_at_cursor()
-  local line = vim.api.nvim_get_current_line()
-  local col = vim.api.nvim_win_get_cursor(0)[2] + 1
-  local s, e = col, col - 1
-  local function tok(c) return c:match("[%w_%./]") ~= nil end
-  while s > 1 and tok(line:sub(s - 1, s - 1)) do s = s - 1 end
-  while e < #line and tok(line:sub(e + 1, e + 1)) do e = e + 1 end
-  local word = line:sub(s, e):gsub("^[%./]+", ""):gsub("[%./]+$", "")
-  if word == "" then return nil end
+  local source = require("foil.source")
+  local word = source.resolve(source.word())
+  if not word then return nil end
   return (word:gsub("/", "."))
 end
 
@@ -33,6 +28,7 @@ end
 --- K: kind, type, first lore line.  Imported (union-mounted) names
 --- resolve to their owning module — shown when it isn't this buffer's.
 function M.hover()
+  if not require("foil").uses_wire() then return require("foil.source").inspect("") end
   M.describe(nil, function(name, res)
     if not res.ok then
       return ui.notify(wire.field(res, "error") or "unknown entry", vim.log.levels.WARN)
@@ -56,6 +52,7 @@ end
 
 --- :FoilInspect — the whole entry record, source included.
 function M.inspect(name)
+  if not require("foil").uses_wire() then return require("foil.source").inspect(name) end
   M.describe(name ~= "" and name or nil, function(nm, res)
     if not res.ok then
       return ui.notify(wire.field(res, "error") or "unknown entry", vim.log.levels.WARN)
@@ -93,10 +90,11 @@ end
 --- gd: the ['defline] mirror slot.  A union-mounted name's describe
 --- names its OWNING module — jump opens that module's file.
 function M.goto_definition()
+  if not require("foil").uses_wire() then return require("foil.source").goto_definition() end
   local name = M.name_at_cursor()
   if not name then return ui.notify("no name under cursor", vim.log.levels.WARN) end
   local here = module.of(0)
-  local ok, res = wire.request_sync({ op = "describe", module = here, name = name }, 8000)
+  local ok, res = wire.request_sync({ op = "describe", module = here, name = name })
   if not ok then return ui.notify(res, vim.log.levels.WARN) end
   local line = res.ok and wire.field(res, "line")
   if type(line) ~= "number" or line < 1 then
@@ -104,7 +102,7 @@ function M.goto_definition()
   end
   local owner = wire.field(res, "module")
   if owner and owner ~= here then
-    local file = module.file_of(owner, 0)
+    local file = wire.field(res, "file") or module.file_of(owner, 0)
     if not file then
       return ui.notify(("defined in %s:%d (no foil/ root to resolve the file)")
         :format(owner, line), vim.log.levels.WARN)
@@ -136,9 +134,10 @@ function M.xref(key, name)
         item.text = mod .. ":" .. entry
         item.filename = module.file_of(mod, 0)
         local dok, dres = wire.request_sync(
-          { op = "describe", module = mod, name = (entry:gsub("/", ".")) }, 8000)
+          { op = "describe", module = mod, name = (entry:gsub("/", ".")) })
         if dok and dres.ok and type(wire.field(dres, "line")) == "number" then
           item.lnum = dres.line
+          item.filename = wire.field(dres, "file") or item.filename
         end
       end
       items[#items + 1] = item

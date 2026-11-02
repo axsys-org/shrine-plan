@@ -23,5 +23,6 @@ setlocal comments=b:'
 setlocal iskeyword+=-
 
 let b:undo_ftplugin =
+  \ (exists('b:undo_ftplugin') ? b:undo_ftplugin . ' | ' : '') .
   \ "setlocal expandtab< shiftwidth< tabstop< softtabstop< autoindent<" .
   \ " commentstring< comments< iskeyword<"
