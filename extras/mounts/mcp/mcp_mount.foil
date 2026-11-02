@@ -1,5 +1,6 @@
 - http_foot
 - lain_peek
+- lain_poke
 - json
 - mcp_rpc
 - bond
@@ -95,11 +96,7 @@
           ?> (./some w) (path_parse (str/cat who "/")) []
           ? !(eq w.len 1) []
           | [[[self 'agent 'journal w.at(0)] (writ/make (myth/sing ['wrote] (pails/n specs.len)))]]
-      ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
-        | mcp_mount/write_from self call.id specs tag who then
-      ? (mcp_mount/writes self specs)
-       > (./ok writes) (mcp_mount/batch call.id writes tag who then)
-       > (./err why) (mcp_mount/refuse call.id why)
+      | mcp_mount/write_specs self call.id specs tag who then
     ? (equal name "mcp/apply")
       ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
         | mcp_mount/refuse call.id "operation: the address of an op card is required"
@@ -120,7 +117,7 @@
     ?> (./some parsed) (path_parse text) .none
     ? (eq parsed.len 0) (./some [self])
     ? (eq_iota parsed.at(0) self) (./some parsed)
-    ? ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys))))) (./some parsed)
+    ? ((is_r parsed) || ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys)))))) (./some parsed)
     | ./some parsed.cons(self)
   + care
     \ text=str
@@ -136,13 +133,17 @@
     ? (eq_iota seg 'z) (./some .z)
     .none
   + reference
-    ' /h/<care>/<case>/<len>/<path>; case 0 is live.
+    ' Epoch pins retain the complete historical address inside the safe.
+    ' A local record case and a computation snapshot are different clocks.
     \ text=str
     ^ maybe[safe]
     ?> (./some p) (path_parse text) .none
     ? (lt p.len 4) .none
     ? !(eq_iota p.at(0) 'h) .none
     ?> (./some c) (mcp_mount/care_of p.at(1)) .none
+    ? (maybe/is_some (epoch_of p.at(2)))
+      ?> (./some parsed) (h_parse p) .none
+      | ./some (safe 0 c p)
     ?> (./some ver) (dig_of p.at(2)) .none
     ?> (./some ln) (dig_of p.at(3)) .none
     = tgt p.drop(4)
@@ -377,6 +378,8 @@
     ' ride on the root of an answer only.
     \ pax=path tree=axal[myth] state=namespace top=bool
     ^ [row[jkv] nat]
+    ? ((is_xv pax) || ((is_o pax) || (is_r pax)))
+      | mcp_mount/query_node state.local.top pax tree top
     = text (mcp_mount/shown pax)
       x=json
         ?> (./some n) (mcp_mount/case_of pax state) jnull
@@ -411,6 +414,10 @@
     ' page can be re-read.
     \ pax=path tree=axal[myth] state=namespace after=maybe[path] budget=nat top=bool
     ^ [json nat maybe[path] bool nat]
+    | mcp_mount/paged_with pax tree (\ at child top (mcp_mount/node_json at child state top)) after budget top
+  + paged_with
+    \ pax=path tree=axal[myth] node={\ path axal[myth] bool}[row[jkv] nat] after=maybe[path] budget=nat top=bool
+    ^ [json nat maybe[path] bool nat]
     = fresh !(maybe/is_some after)
     ? (and fresh (eq budget 0)) [jnull 0 .none .true 0]
     = none=maybe[path] .none
@@ -424,7 +431,7 @@
         | ./some c.drop(1)
       empty=row[json] []
       [own own_bytes]
-        ? fresh (mcp_mount/node_json pax tree state top)
+        ? fresh (node pax tree top)
         | [[(jkv "path" (json/str (mcp_mount/shown pax))) (jkv "paged" (json/boo .true))] 60]
       ' phase: 0 seeking the cursor's child, 1 rendering, 2 stopped with nodes remaining, 3 past the byte ceiling
       start=[nat row[json] maybe[path] nat nat] [(? fresh budget.dec budget) empty (? fresh (./some pax) none) (? (maybe/is_some seek) 0 1) own_bytes]
@@ -437,7 +444,7 @@
           ? (and (eq ph 0) !on_cursor) acc
           = below=maybe[path] (? on_cursor rest none)
           ? (and !on_cursor (eq l 0)) [l o la 2 b]
-          = [j n la2 m2 b2] (mcp_mount/paged pax.snoc(key) child state below l .false)
+          = [j n la2 m2 b2] (mcp_mount/paged_with pax.snoc(key) child node below l .false)
             total (add b b2)
           ? (gt total mcp_mount/ceiling) [l o la 3 total]
           ' a shell with nothing rendered beneath it (the cursor node itself, say) is not sent again
@@ -445,6 +452,150 @@
       children (jkv "children" (json/arr out))
       shown=json (json/obj own.snoc(children))
     | [shown (sub budget left) last (gt phase 1) (? (eq phase 3) (add mcp_mount/ceiling 1) bytes)]
+  + found
+    ' find: a bounded walk, like a read.  The records under the path (its
+    ' whole subtree, in tap order) whose name or any slot's text contains
+    ' the text, at most budget of them visited per answer, continuing
+    ' after the cursor; each match names the slot that matched (name for
+    ' the record's own name) and its value.  Zero events.
+    \ spec=mcp_mount/spec state=namespace
+    ^ either[str json]
+    = tree (sorge[myth] .z (sovereign_peek spec.pax state))
+      text spec.find
+      empty=row[json] []
+      none=maybe[path] .none
+      seek=maybe[path] spec.after
+      ' phase: 0 seeking the cursor, 1 visiting, 2 stopped with nodes remaining
+      start=[nat row[json] maybe[path] nat nat] [spec.budget empty none (? (maybe/is_some seek) 0 1) 0]
+      [left out last phase visited]
+        | tree.tap.fold start
+          \ acc [p q]
+          = [l o la ph v] acc
+          ? (eq ph 2) acc
+          ? (eq ph 0)
+            ?> (./some c) seek [l o la 1 v]
+            ? (and (eq c.len p.len) (pith_prefix c p)) [l o la 1 v]
+            | acc
+          = record=myth q
+          ? (eq l 0) [l o la 2 v]
+          = hit=maybe[[str str]]
+              ? (and (gt p.len 0) (maybe/is_some (str/find text (mcp_mount/iota_text p.at(p.len.dec))))) (./some ["name" (mcp_mount/iota_text p.at(p.len.dec))])
+              | record.tap.fold (maybe/none[[str str]])
+                \ h [slot held]
+                ? (maybe/is_some h) h
+                = shown (mcp_mount/value_text held)
+                ? (maybe/is_some (str/find text shown)) (./some [(mcp_mount/shown slot) shown])
+                h
+            grown
+              ?> (./some pair) hit o
+              = [slot value] pair
+              | o.snoc((json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax.weld(p)))) (jkv "slot" (json/str slot)) (jkv "value" (json/str value))]))
+          | [l.dec grown (./some spec.pax.weld(p)) 1 v.inc]
+      more (eq phase 2)
+    | ./ok (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "find" (json/str text)) (jkv "matches" (json/arr out))
+                      (jkv "visited" (json/num .false visited)) (jkv "next" (? more (mcp_mount/cursor_json last more) jnull))])
+  + referenced
+    ' referencing: indexed matching holders, paged in path order under the
+    ' path whose reference slots point at a thing or beneath it: the
+    ' cells over it, the rows that cite it, the questions about it,
+    ' written at home by whoever holds them.  Each match names the slot,
+    ' the target, and whether a cell is waiting there (the target
+    ' absent, an ask with no answer, a hole, a fault).  watchers are the
+    ' reactive records whose crews depend on the thing, straight from
+    ' the kernel's crew index.  Zero events.
+    \ spec=mcp_mount/spec state=namespace
+    ^ either[str json]
+    = self=iota state.self
+      thing=path spec.referencing
+      xs=iota 'x
+      edges=row[reference_edge]
+        | (reference_index/beneath thing state.local.top state.local.references).weld
+          (reference_index/beneath thing.cons(xs) state.local.top state.local.references)
+      tree
+        | edges.fold (axal/new[myth] .none)
+          \ out=axal[myth] edge=reference_edge
+          ? !(pith_prefix spec.pax edge.holder) out
+          = relative edge.holder.drop(spec.pax.len)
+          ? (maybe/is_some out.get(relative)) out
+          ?> (./known record) state.local.x_latest(edge.holder) out
+          | out.put relative record
+      empty=row[json] []
+      none=maybe[path] .none
+      seek=maybe[path] spec.after
+      weft_key=path ['sys 'weft]
+      derived=path ['c 'x]
+      hole_key=path ['sys 'view 'hole]
+      asking_key=path ['sys 'view 'asking]
+      fault_key=path ['sys 'view 'fault]
+      start=[nat row[json] maybe[path] nat nat] [spec.budget empty none (? (maybe/is_some seek) 0 1) 0]
+      [left out last phase visited]
+        | tree.tap.fold start
+          \ acc [p q]
+          = [l o la ph v] acc
+          ? (eq ph 2) acc
+          ? (eq ph 0)
+            ?> (./some c) seek [l o la 1 v]
+            ? (and (eq c.len p.len) (pith_prefix c p)) [l o la 1 v]
+            | acc
+          = record=myth q
+          ? (eq l 0) [l o la 2 v]
+          = here=path spec.pax.weld(p)
+            hits=row[json]
+              | record.tap.fold empty
+              \ h [slot held]
+              = found=path
+                  ? held
+                   > pin=safe (mcp_mount/target_of self pin.path)
+                   []
+              ? ((eq found.len 0) || !(pith_prefix thing found)) h
+              = absent=bool
+                  = at (sovereign_peek found state)
+                  | and !(maybe/is_some at.fil) (eq at.kid.size 0)
+                waiting=bool
+                  ? absent .true
+                  ? !(maybe/is_some record.get(weft_key)) .false
+                  = context (sovereign_peek derived.weld(here) state)
+                  ?> (./some ctx) context.fil .false
+                  | ((maybe/is_some ctx.get(asking_key)) || ((maybe/is_some ctx.get(fault_key)) || (ctx.tap.any((\ [k v] (pith_prefix hole_key k))))))
+              | h.snoc((json/obj [(jkv "path" (json/str (mcp_mount/shown here))) (jkv "slot" (json/str (mcp_mount/shown slot))) (jkv "target" (json/str (mcp_mount/shown found)))
+                                  (jkv "cell" (json/boo (maybe/is_some record.get(weft_key)))) (jkv "hole" (json/boo waiting))]))
+          | [l.dec o.weld(hits) (./some here) 1 v.inc]
+      more (eq phase 2)
+      hv (sovereign_hive state).tap
+      watchers
+        % i=nat 0 w=row[json] empty
+        ^ row[json]
+        ? (eq i hv.len) w
+        = [p deps] hv.at(i)
+          on=path
+            % j=nat 0
+            ^ path
+            ? (eq j deps.len) []
+            = d deps.at(j)
+            ? (pith_prefix thing d.p) d.p
+            | _ j.inc
+          c=str
+            % j=nat 0
+            ^ str
+            ? (eq j deps.len) ""
+            = d deps.at(j)
+            ? (pith_prefix thing d.p) (mcp_mount/iota_text (care/seg d.c))
+            | _ j.inc
+        ? (eq on.len 0) (_ i.inc w)
+        | _ i.inc w.snoc((json/obj [(jkv "path" (json/str (mcp_mount/shown p))) (jkv "care" (json/str c)) (jkv "on" (json/str (mcp_mount/shown on)))]))
+    | ./ok (json/obj [(jkv "path" (json/str (mcp_mount/shown spec.pax))) (jkv "referencing" (json/str (mcp_mount/shown thing))) (jkv "matches" (json/arr out))
+                      (jkv "watchers" (json/arr watchers)) (jkv "visited" (json/num .false visited)) (jkv "next" (? more (mcp_mount/cursor_json last more) jnull))])
+  + target_of
+    ' The record a reference points at: its path, a cell's /x stripped.
+    \ self=iota p=path
+    ^ path
+    ? (eq p.len 0) p
+    ? !(equal (mcp_mount/iota_text p.at(0)) "x") p
+    = none=path []
+    % i=nat 1 out=path none
+    ^ path
+    ? (eq i p.len) out
+    | _ i.inc out.snoc(p.at(i))
   + cursor
     ' The cursor of a read: the last path a previous page rendered,
     ' which must lie under the path being read; none when absent.
@@ -476,6 +627,27 @@
     ? (mcp_mount/answer spec state)
      > (./ok body) [200 (mcp_rpc/result id (mcp_rpc/structured body))]
      > (./err why) (? (equal why "too large, page it") (mcp_mount/too_large id) [200 (mcp_rpc/result id (mcp_rpc/text_content why .true))])
+  + query_node
+    ' Derived answers pin the complete local computation snapshot, not just
+    ' the cell definition's case. All three cares name the same virtual node.
+    \ epoch=nat pax=path tree=axal[myth] top=bool
+    ^ [row[jkv] nat]
+    = text (mcp_mount/shown pax)
+      prefix (str/cat_all ["/h/" "x/e" epoch.show "/" pax.len.show text])
+      ref (json/str prefix)
+      [props bytes]
+        ?> (./some record) tree.fil [(json/obj []) 0]
+        | mcp_mount/record_sized record ref
+      frozen
+        \ care=str
+        ^ json
+        | json/str (str/cat_all ["/h/" care "/e" epoch.show "/" pax.len.show text])
+    [[(jkv "path" (json/str text))
+      (jkv "exists" (json/boo (maybe/is_some tree.fil)))
+      (jkv "reference" ref)
+      (jkv "reference_y" (frozen "y"))
+      (jkv "reference_z" (frozen "z"))
+      (jkv "properties" props)] (add bytes (add (mul 4 text.len) 120))]
   + too_large
     \ id=json
     ^ [nat str]
@@ -513,7 +685,7 @@
     ' standard cell over the tree read with settings as its context and
     ' writes nothing; present answers as usual and pushes {shown} on the
     ' stream, journaling nothing.
-    : pax=path c=care at=nat formula=str settings=myth budget=nat after=maybe[path] present=bool
+    : pax=path c=care at=nat formula=str settings=myth budget=nat after=maybe[path] present=bool find=str referencing=path
   + read_spec
     ' base is the call's own arguments: a read given as a plain path
     ' takes its care, case and limit from there.
@@ -534,13 +706,19 @@
       limit (mcp_rpc/num_at "limit" 100 obj)
       budget (? ((eq limit 0) || (gt limit 500)) 500 limit)
       formula (mcp_rpc/text_at "formula" obj)
+      find (mcp_rpc/text_at "find" obj)
       present (mcp_rpc/bool_at "present" .false obj)
+      referencing_text (mcp_rpc/text_at "referencing" obj)
+      referencing=path
+        ? (eq referencing_text.len 0) []
+        ?> (./some t) (mcp_mount/target self referencing_text) []
+        t
       settings=either[str myth]
         ? (eq formula.len 0) (./ok myth/new)
         | mcp_mount/record (mcp_rpc/object_at "settings" obj)
     ?> (./ok given) settings (./err "settings: the formula's parameters, as slot names to values")
     ?> (./some cursor) (mcp_mount/cursor self pinned (mcp_rpc/text_at "next" obj)) (./err "next: the cursor a previous page of this same read answered")
-    | ./ok (mcp_mount/spec pinned c at formula given budget cursor present)
+    | ./ok (mcp_mount/spec pinned c at formula given budget cursor present find referencing)
   + entry
     ' One entry of a reads list: its spec, or why it was refused, with
     ' the path text it named.
@@ -592,12 +770,17 @@
            > (./known t) t
           (axal/new[myth] .none)
       | sorge[myth] spec.c got
-    | sorge[myth] spec.c (sovereign_peek spec.pax state)
+    ? (sovereign_view spec.c 0 spec.pax state)
+     > (./known tree) tree
+    | sorge[myth] spec.c (sovereign_history_prefix spec.pax)
   + answer
-    ' The answer to one read: the tree page, or the formula's result with
+    ' The answer to one read: the records found when find is given, the
+    ' tree page, or the formula's result with
     ' its context, or why not.  Nothing here writes.
     \ spec=mcp_mount/spec state=namespace
     ^ either[str json]
+    ? (gt spec.find.len 0) (mcp_mount/found spec state)
+    ? (gt spec.referencing.len 0) (mcp_mount/referenced spec state)
     ? (eq spec.formula.len 0)
       = tree (mcp_mount/peek_at spec state)
         [view nodes last more bytes] (mcp_mount/paged spec.pax tree state spec.after spec.budget .true)
@@ -642,7 +825,7 @@
   + derived
     \ pax=path
     ^ bool
-    | ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax))))
+    | ((is_r pax) || ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax)))))
   + writes
     ' One writ per record spec, or the reason the whole batch is refused
     ' before any event: a derived path, a bad path, or bad properties.
@@ -659,8 +842,11 @@
       ? (mcp_mount/record (mcp_mount/slots_of spec))
        > (./err why) (./err (str/cat_all [(mcp_mount/shown pax) ": " why]))
        > (./ok record)
-        ? (equal action "poke") (./ok out.snoc([pax (writ/poke record)]))
-        | ./ok out.snoc([pax (writ/make record)])
+        = sure=myth
+            ?> (./some wanted) (mcp_rpc/field "if_case" spec) record
+            | record.put(if_case_slot (pails/n (mcp_rpc/num_at "if_case" 0 spec)))
+        ? (equal action "poke") (./ok out.snoc([pax (writ/poke sure)]))
+        | ./ok out.snoc([pax (writ/make sure)])
   + batch
     ' The records as one event (admitted whole or refused whole), with
     ' the writer's tag record riding in the same event, then the then
@@ -719,11 +905,35 @@
         | then.map (\ s=mcp_mount/spec (jkv (mcp_mount/shown s.pax) (mcp_mount/answer_json s state)))
       reason=str
         ?> (./some why) outcome ""
-        | mcp_mount/value_text why
+        = word (http_foot/reason why)
+        ? !(equal word "stale_case") word
+        | mcp_mount/stale_reason writes state
       body (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "records" (json/arr records)) (jkv "refused" (json/boo refused)) (jkv "reason" (json/str reason)) (jkv "then" (json/obj reads))])
     ? refused
       | [200 (mcp_rpc/result id (mcp_rpc/structured_error body))]
     | [200 (mcp_rpc/result id (mcp_rpc/structured body))]
+  + stale_reason
+    ' Which record moved: the first write whose precondition does not
+    ' hold now, named with the case it is at and the case it wanted.
+    \ writes=row[[path writ]] state=namespace
+    ^ str
+    % i=nat 0
+    ^ str
+    ? (eq i writes.len) "if_case: a record moved; nothing was written"
+    = [pax wit] writes.at(i)
+      carried=maybe[pail]
+        ? wit
+         > (./make m) m.get(if_case_slot)
+         > (./poke m) m.get(if_case_slot)
+         .none
+    ?> (./some held) carried (_ i.inc)
+    = want=nat
+        ? held
+         > n=pails/n n.n
+         0
+      now (mcp_mount/case_of pax state).fall(0)
+    ? (eq want now) (_ i.inc)
+    | str/cat_all ["if_case: " (mcp_mount/shown pax) " is at case " (nat/show now) ", not " (nat/show want) "; nothing was written"]
   + typed_json
     ' A record as {slot: {type, value}}: what write accepts back.
     \ t=myth
@@ -796,6 +1006,16 @@
   + no_json
     ^ row[json]
     []
+  + write_specs
+    ' The specs as a batch: through write_from when any copies an
+    ' earlier case, else straight to one event.
+    \ self=iota id=json specs=row[json] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
+    ^ http_foot/action
+    ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
+      | mcp_mount/write_from self id specs tag who then
+    ? (mcp_mount/writes self specs)
+     > (./ok writes) (mcp_mount/batch id writes tag who then)
+     > (./err why) (mcp_mount/refuse id why)
   + touched_json
     ' The paths one event's diff tree touched, from its log entry: the
     ' first hundred, and the count (a boot event touches a thousand).
@@ -1018,6 +1238,8 @@
         (mcp_mount/p "reads" "array" "Several reads in one call ([a read, ...]): answers in order, each the shape a single read gives; a failed entry answers {path, error} without failing the call.")
         (mcp_mount/p "care" "string" "x | y | z; default y.")
         (mcp_mount/p "case" "number" "0 live (default), or a case to read as of then.")
+        (mcp_mount/p "find" "string" "A text: the answer is the records under path whose name or any slot contains it, at most limit of them in tap order, next to continue; nothing written.")
+        (mcp_mount/p "referencing" "string" "A path: the answer is the records under path whose reference slots point at it or beneath it (cells over it, rows citing it), each with the slot, the target and whether a cell is waiting there, plus the reactive records whose crews depend on it; at most limit visited, next to continue; nothing written.")
         (mcp_mount/p "formula" "string" "A standard cell to run over the tree read; nothing written.")
         (mcp_mount/p "settings" "object" "The formula's parameters, slot names to values.")
         (mcp_mount/p "limit" "number" "Nodes per answer, in tap order (a node, then its children by name). Default 100, never over 500.")
@@ -1025,7 +1247,7 @@
         (mcp_mount/p "present" "boolean" "Answer as usual and push {shown: {path, care, case}} on the stream; nothing journaled, no epoch moves.")]
        [])
      (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch."
-       [(mcp_mount/p "records" "array" "[{path, slots, action}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree).")
+       [(mcp_mount/p "records" "array" "[{path, slots, action, if_case}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree); if_case N admits the batch only while that record is still at x case N (judged by the kernel in the same commit), else the whole batch is refused and the reason names the record and the case it is at.")
         (mcp_mount/p "from" "string" "On a record: /h/x/<case>/<len>/<path>, copy the record as it was at that case (undo, redo).")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")
         (mcp_mount/p "who" "string" "The writer's tag, default mcp; the event carries it.")]

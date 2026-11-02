@@ -42,6 +42,25 @@ test('slotLayout picks the figure, the grid, the list, and wraps long text', () 
   assert.match(slotLayout({held: '-> /x/studio/views/closed @ 4', amount: 5}), /data-path="studio\/views\/closed"/);
 });
 
+// ---- the chain under a cell's card
+test('chainHTML walks a cell upward by its tack, one line per stage, and stops at the data', () => {
+  const cells = new Map([
+    ['org/views/revenue', {path: 'org/views/revenue', formula: 'sum', settings: 'slot /amount into /revenue', inputs: [{path: '/x/org/views/closed', pin: null}]}],
+    ['org/views/closed', {path: 'org/views/closed', formula: 'where', settings: 'key /status value closed', inputs: [{path: 'org/deals', pin: null}]}],
+    ['org/views/priced', {path: 'org/views/priced', formula: 'lookup', settings: 'key /sku', inputs: [{path: 'org/items', pin: 4}, {path: 'org/prices', pin: null, view: true}]}],
+  ]);
+  const html = live.chainHTML({_cells: cells}, 'org/views/revenue');
+  const stages = html.split('<div class="sv-stage">').slice(1);
+  assert.equal(stages.length, 2, 'two stages: sum over closed, where over deals');
+  assert.match(stages[0], /class="f">sum<.*slot \/amount into \/revenue.*over.*data-go="org\/views\/closed".*>closed</s);
+  assert.match(stages[1], /class="f">where<.*data-go="org\/deals".*>org\/deals</s);
+  const pinned = live.chainHTML({_cells: cells}, 'org/views/priced');
+  assert.match(pinned, /held at 4/); assert.match(pinned, /class="o">\+ .*data-go="org\/prices"/);
+  assert.equal(live.chainHTML({_cells: cells}, 'org/deals'), '', 'a record that is not a cell has no chain');
+  const loop = new Map([['a', {path: 'a', formula: 'pick', settings: '', inputs: [{path: '/x/b'}]}], ['b', {path: 'b', formula: 'pick', settings: '', inputs: [{path: '/x/a'}]}]]);
+  assert.equal(live.chainHTML({_cells: loop}, 'a').split('sv-stage').length - 1, 2, 'a cycle ends the walk');
+});
+
 // ---- the record card
 const fakeSource = (answers, asked = new Map(), cells = new Map()) => ({async answer(p) { return answers[p]; }, _asked: asked, _cells: cells});
 test('recordHTML on a cell shows the answer and folds made of', async () => {
@@ -50,13 +69,19 @@ test('recordHTML on a cell shows the answer and folds made of', async () => {
   const html = await recordHTML(source, {path: 'studio/views/payroll', record: cell, kids: [], case: 3}, false, new Set());
   assert.match(html, /<div class="sv-rec " data-path="studio\/views\/payroll" data-case="3">/);
   assert.match(html, /class="sv-one">395<span class="u">total/);
-  assert.match(html, /<details class="sv-made"><summary>made of<\/summary>/);
-  assert.ok(html.indexOf('sv-one') < html.indexOf('sv-made'), 'the answer comes before made of');
-  assert.match(html, /sv-made.*sum.*studio\/people/s);
+  assert.match(html, /<details class="sv-made"><summary>sum over studio\/people<\/summary>/);
+  assert.ok(html.indexOf('sv-one') < html.indexOf('sv-made'), 'the answer comes before the formula');
+  assert.match(html, /sv-made.*sv-k">slot<.*salary/s, 'the fold holds the settings, not the formula again');
+  assert.doesNotMatch(html, /sv-from/, 'no formula line above the result');
   const faulted = await recordHTML(fakeSource({c: {bad: 'cycle through c'}}), {path: 'c', record: cell, kids: []}, false, new Set());
   assert.match(faulted, /<div class="sv-note bad">cycle through c<\/div>/);
   const gone = await recordHTML(fakeSource({}), {path: 'd', record: null, kids: []}, true, new Set());
   assert.match(gone, /<div class="sv-gone">deleted<\/div>/); assert.match(gone, /<span class="p">d<\/span>/);
+});
+test('a row never shows its scale slots', async () => {
+  const r = {path: 'a', record: {title: 'a'}, kids: [{name: 'r1', path: 'a/r1', slots: {count: 10, scale: 0, value: 'x', 'amount/scale': 2}, kids: []}]};
+  const html = await recordHTML(fakeSource({}), r, false, new Set());
+  assert.match(html, /class="k">count</); assert.match(html, /class="k">value</); assert.doesNotMatch(html, /scale/);
 });
 test('recordHTML draws children as rows, nested, folded past three levels, and bumps the touched', async () => {
   const deep = {name: 'l3', path: 'a/l1/l2/l3', slots: {n: 3}, kids: [{name: 'l4', path: 'a/l1/l2/l3/l4', slots: {n: 4}, kids: []}]};
@@ -258,7 +283,7 @@ test('who= filters the poll and the stream; who=all shows system events', async 
   const timers = {setInterval: () => 1, clearInterval: () => {}, setTimeout: () => {}};
   mcpSource({fetch: m.fetch, EventSource: null, who: 'tester', ...timers}).follow(() => {});
   await new Promise(r => setImmediate(r));
-  assert.deepEqual(seenArgs[0], {before: 0, limit: 40, who: 'tester'});
+  assert.deepEqual(seenArgs[0], {before: 0, limit: 40, with: 'x', who: 'tester'});
   // the stream: a fake EventSource handing lines straight to the page
   let es; const log = [];
   class ES { constructor(url) { this.url = url; es = this; } close() {} }
@@ -317,3 +342,324 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   assert.match(el2.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'on the QA folder the QA write is drawn');
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
 });
+
+// ---- clickable paths and the person's cursor
+test('a record path in an action links to its folder and a reference links to itself; both carry the path the click writes', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, false));
+  const html = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.match(html, /<a class="p go" href="\?at=\/0x11\/user\/org\/deals\/d5" data-go="0x11\/user\/org\/deals\/d5" data-folder="0x11\/user\/org\/deals">0x11\/user\/org\/deals\/d5<\/a>/);
+  const grid = slotLayout({manager: '-> 0x11/user/org/members/bob', total: '-> /x/0x11/user/org/views/payroll @ 4'});
+  assert.ok(grid.includes('<span class="sv-v ref" data-path="0x11/user/org/members/bob"><a class="r go" href="?at=/0x11/user/org/members/bob" data-go="0x11/user/org/members/bob" data-folder="0x11/user/org/members/bob">-> 0x11/user/org/members/bob</a></span>'), grid);
+  assert.match(grid, /data-go="0x11\/user\/org\/views\/payroll" data-folder="0x11\/user\/org\/views\/payroll"/, 'a cell reference drops its /x and keeps its pin in the text');
+  assert.equal(adapt.folderOf('0x11/user/org/deals/d5'), '0x11/user/org/deals');
+  assert.equal(adapt.folderOf('0x11'), '0x11', 'a node has no folder above it');
+});
+
+test('a click writes the person\'s cursor under the node\'s /agent/person, signed person, then moves the page', async () => {
+  const m = fakeMcp(() => ({records: [{path: '/0x11/agent/person/cursor'}]}));
+  const s = mcpSource({fetch: m.fetch, EventSource: null});
+  await s.cursor('0x11/user/org/deals/d5');
+  assert.deepEqual(m.calls[0], {url: '/mcp', name: 'mcp/write', args: {who: 'person', records: [{path: '/0x11/agent/person/cursor', slots: {path: '/0x11/user/org/deals/d5'}}]}});
+  const {mountViewer} = live;
+  const flipped = [], written = [];
+  const v = mountViewer(fakeEl(), {...viewerSource(), async cursor(p) { written.push(p); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v.go('0x11/user/org/deals/d5', '0x11/user/org/deals');
+  assert.deepEqual([written, flipped], [['0x11/user/org/deals/d5'], ['0x11/user/org/deals']], 'the cursor is written before the page moves');
+  const v2 = mountViewer(fakeEl(), {...viewerSource(), async cursor() { throw new Error('world away'); }}, {views: '0x11/user/org', flip: f => flipped.push(f)});
+  await v2.go('0x11/user/org/deals', '0x11/user/org/deals');
+  assert.equal(flipped.length, 2, 'a refused cursor write still moves the page');
+});
+
+// ---- a presented path: read at its care, a folder is a folder, off the page's folder the page moves
+test('a presented folder is read at the care it was presented at and draws as a folder, not deleted', async () => {
+  const {mountViewer} = live;
+  const reads = [];
+  const s = viewerSource();
+  s.read = async (p, care, cas) => { reads.push([p, care, cas]); return {path: p, record: {}, kids: [{name: 'd1', path: p + '/d1', slots: {amount: 5}, kids: []}], case: '', next: null}; };
+  const el = fakeEl();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler({shown: {path: '0x11/user/org/views', care: 'z', case: 0}});
+  assert.deepEqual(reads[0], ['0x11/user/org/views', 'z', 0], 'the summary read takes the presented care');
+  const body = el.querySelector('.sv-now').querySelector('details.sv-act').querySelector('.body').innerHTML;
+  assert.doesNotMatch(body, /deleted/); assert.match(body, /data-path="0x11\/user\/org\/views"/);
+  const folder = adapt.readOf({path: '/0x11/user/org/views', exists: false, reference: ref('x', 2, '/0x11/user/org/views'), properties: {}, children: [{path: '/0x11/user/org/views/a', exists: true, reference: ref('x', 1, '/0x11/user/org/views/a'), properties: {'/n': '1'}, children: []}], nodes: 2, next: null});
+  assert.deepEqual([folder.record, folder.kids.length], [{}, 1], 'a path with children and no record of its own is a folder');
+  assert.equal(adapt.readOf(culled).record, null, 'a culled record with nothing beneath is still deleted');
+});
+
+test('a path presented off the page\'s folder moves the page to its folder', async () => {
+  const {mountViewer} = live;
+  const flipped = [];
+  const s = viewerSource();
+  mountViewer(fakeEl(), s, {crumb: '0x11/user/org', views: '0x11/user/org', flip: f => flipped.push(f)});
+  await s.handler({shown: {path: '0x11/user/shrine/views/open_prs', care: 'z', case: 0}});
+  assert.deepEqual(flipped, ['0x11/user/shrine/views']);
+  await s.handler({shown: {path: '0x11/user/org/views/headcount', care: 'x', case: 0}});
+  assert.equal(flipped.length, 1, 'a path inside the page\'s folder draws in place');
+});
+
+// ---- what references a record
+test('referencedBy reads the page folder and /agent with the referencing knob; the strip lists cells and rows, a waiting cell marked', async () => {
+  const m = fakeMcp((name, a) => ({path: a.path, referencing: a.referencing, matches: a.path.endsWith('/agent') ? [] : [
+    {path: N + '/views/payroll', slot: '/sys/tack', target: N + '/members', cell: true, hole: false},
+    {path: N + '/views/budget', slot: '/sys/tack', target: N + '/members/nobody', cell: true, hole: true},
+    {path: N + '/notes/n1', slot: '/about', target: N + '/members', cell: false, hole: false}], watchers: [{path: '/0x11/app/cache', care: 'z', on: N + '/members'}], visited: 3, next: null}));
+  const s = mcpSource({fetch: m.fetch, views: '/0x11/user/org', EventSource: null});
+  const rb = await s.referencedBy('0x11/user/org/members');
+  assert.deepEqual(m.calls.map(c => [c.args.path, c.args.referencing]), [[N, N + '/members'], ['/0x11/agent', N + '/members']]);
+  assert.deepEqual(rb.matches.map(x => [x.path, x.cell, x.hole]), [['0x11/user/org/views/payroll', true, false], ['0x11/user/org/views/budget', true, true], ['0x11/user/org/notes/n1', false, false]]);
+  const html = live.referencedHTML(rb);
+  assert.match(html, /<div class="sv-refd"><div class="k">referenced by<\/div><div class="sv-refby cell "><a class="ref go" href="\?at=\/0x11\/user\/org\/views\/payroll" data-go="0x11\/user\/org\/views\/payroll"/);
+  assert.match(html, /<div class="sv-refby cell hole">.*<span class="h">waiting<\/span>/);
+  assert.match(html, /<div class="sv-refby crew">.*<span class="s">crew, z<\/span>/);
+  assert.equal(live.referencedHTML({matches: [], watchers: []}), '');
+});
+
+test('a year or a day is drawn as written; a quantity is grouped', () => {
+  const html = slotLayout({year: 2005, day: 20041101, amount: 12500, n: 7});
+  assert.match(html, /<span class="sv-v">2005<\/span>/); assert.match(html, /<span class="sv-v">20041101<\/span>/); assert.match(html, /<span class="sv-v">12,500<\/span>/);
+});
+
+// ---- quiet lines: what the page never shows
+const click = (epoch, quiet) => ({epoch, label: 'cursor', who: 'person', touched: ['0x11', '0x11/agent', '0x11/agent/journal', '0x11/agent/journal/person', '0x11/agent/person', '0x11/agent/person/cursor'], records: ['0x11/agent/person/cursor'], quiet});
+test('quietLine: hands, seen marks, the cursor, the clock, deletions and unknown cells are never shown; data is', () => {
+  const {quietLine} = live;
+  const line = (who, touched, w) => ({who, touched, with: w || null});
+  assert.equal(quietLine(click(3)), true, 'the cursor');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/agent', '0x11/agent/claude', '0x11/agent/claude/seen', '0x11/agent/journal', '0x11/agent/journal/claude'])), true, 'an agent seen mark');
+  assert.equal(quietLine(line('clock', ['0x11', '0x11/clock'])), true, 'a hand line');
+  assert.equal(quietLine(line('source_people', ['0x11', '0x11/user/x/sources/people/p1'])), true, 'a source hand line, by its who');
+  assert.equal(quietLine(line('ian', ['0x11', '0x11/clock'])), true, 'the clock record itself');
+  assert.equal(quietLine(line('ian', ['0x11', '0x11/agent', '0x11/agent/hands', '0x11/agent/hands/source'])), true, 'the hands folder');
+  assert.equal(quietLine(line('launcher', ['0x11', '0x11/agent', '0x11/agent/launcher', '0x11/agent/launcher/world'])), true, 'the launcher record at boot');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user', '0x11/user/org'], {'/0x11/user/org': {exists: false}, '/0x11/user': {exists: false}})), true, 'a cull-only event');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/v/c'], {'/0x11/user/v/c': {exists: true, properties: {'/sys/weft': '/h/x/1/4/0x11/weft/stdlib/sum'}}, '/x/0x11/user/v/c': {exists: false}, '/c/x/0x11/user/v/c': {exists: true}})), true, 'a written cell that reads unknown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/v/c'], {'/0x11/user/v/c': {exists: true, properties: {'/sys/weft': '/h/x/1/4/0x11/weft/stdlib/sum'}}, '/x/0x11/user/v/c': {exists: true, properties: {'/total': '3'}}})), false, 'a cell that answers is shown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/org/d1'], {'/0x11/user/org/d1': {exists: true, properties: {'/amount': '5'}}})), false, 'a record written is shown');
+  assert.equal(quietLine(line('claude', ['0x11', '0x11/user/org/d1', '0x11/user/org/d2'], {'/0x11/user/org/d1': {exists: false}, '/0x11/user/org/d2': {exists: true, properties: {'/amount': '5'}}})), false, 'a mixed event is shown');
+  assert.equal(quietLine(line('person', ['0x11', '0x11/agent/person/cursor', '0x11/user/org/deals/d1'])), false, 'a person write that touches data is shown');
+  assert.equal(quietLine({epoch: 'shown', touched: [], shown: {path: 'x', care: 'z', case: 0}}), false, 'a presented read is shown');
+});
+test('a quiet line never becomes the page\'s now and is not listed in earlier', async () => {
+  const {mountViewer} = live;
+  const el = fakeEl(), s = viewerSource();
+  mountViewer(el, s, {crumb: '0x11/user/org', views: '0x11/user/org'});
+  await s.handler(person(5, true)); await s.handler(click(6, false));
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="5" open>/, 'the backlog ends on a click: the last real event is drawn');
+  await s.handler(person(7, false)); await s.handler(click(8, false)); await s.handler({epoch: 9, who: 'clock', touched: ['0x11', '0x11/clock'], records: ['0x11/clock']});
+  assert.match(el.querySelector('.sv-now').innerHTML, /data-epoch="7" open>/, 'a later click or hand line leaves the now where it was');
+  assert.doesNotMatch(el.querySelector('.sv-earlier').innerHTML, /data-epoch="[689]"/, 'and none of them is in earlier');
+});
+
+// ---- the message bar
+test('say writes the next turn under the agent, numbered after the last, signed person', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); calls.push(b.params); const name = b.params.name, a = b.params.arguments;
+    if (name === 'mcp/read') return { json: async () => ({ result: { structuredContent: { path: a.path, children: [{ path: a.path + '/t1' }, { path: a.path + '/t2' }] } } }) };
+    return { json: async () => ({ result: { structuredContent: { epoch: 9 } } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/user', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  const r = await s.say('a', 'hello there');
+  assert.equal(r.epoch, 9);
+  const w = calls.find(c => c.name === 'mcp/write').arguments;
+  assert.equal(w.who, 'person'); assert.deepEqual(w.records, [{ path: '/0x11/agent/a/turns/t3', slots: { said: 'hello there', who: 'person' } }]);
+});
+test('contextTreeHTML draws the reading as indented lines with slots, system slots hidden', () => {
+  const html = live.contextTreeHTML({name: 'context', path: 'a/context', slots: {note: 'n', 'sys/weft': 'x'}, kids: [{name: 'failing', path: 'a/context/failing', slots: {}, kids: [{name: 't1', path: 'a/context/failing/t1', slots: {got: 9, expected: 8}, kids: []}]}]});
+  assert.match(html, /class="n">context</); assert.match(html, /padding-left:14px"><span class="n">failing</); assert.match(html, /padding-left:28px".*got.*9/);
+  assert.doesNotMatch(html, /sys\/weft/);
+});
+test('newChat writes the next agent folder and names it; chats lists the folders that are chats', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); calls.push(b.params); const name = b.params.name, a = b.params.arguments;
+    if (name === 'mcp/read') return { json: async () => ({ result: { structuredContent: { path: a.path, children: [{ path: a.path + '/a' }, { path: a.path + '/a2' }, { path: a.path + '/hands' }, { path: a.path + '/journal' }, { path: a.path + '/b9', exists: false }] } } }) };
+    return { json: async () => ({ result: { structuredContent: { epoch: 3 } } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/agent/a', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  assert.deepEqual(await s.chats(), ['a', 'a2']);
+  assert.equal(await s.newChat(), 'a3');
+  const w = calls.find(c => c.name === 'mcp/write').arguments;
+  assert.equal(w.who, 'person'); assert.deepEqual(w.records, [{ path: '/0x11/agent/a3', slots: { name: 'a3' } }]);
+});
+test('backlinks walks the person\'s things and the agents\' folders, pages through, and leaves out the record and its insides', async () => {
+  const calls = [];
+  const fetch = async (url, o) => { const b = JSON.parse(o.body); const a = b.params.arguments; calls.push(a);
+    const page = a.path.endsWith('/user') ? (a.next ? { matches: [{ path: '/0x11/user/views/v2', slot: '/sys/tack' }], next: null } : { matches: [{ path: '/0x11/user/orgs/x/repos/r1', slot: '/org' }, { path: '/0x11/user/orgs/x/self', slot: '/up' }], next: 'c1' }) : { matches: [{ path: '/0x11/agent/a/context', slot: '/org' }], next: null };
+    return { json: async () => ({ result: { structuredContent: page } }) }; };
+  const s = live.mcpSource({ fetch, EventSource: null, views: '0x11/user/orgs/x', setInterval: () => 0, clearInterval() {}, setTimeout: () => 0 });
+  const r = await s.backlinks('0x11/user/orgs/x');
+  assert.deepEqual(r.matches.map(m => m.path), ['0x11/user/orgs/x/repos/r1', '0x11/user/views/v2', '0x11/agent/a/context'].filter(p => !p.startsWith('0x11/user/orgs/x/')).concat([]).length ? ['0x11/user/views/v2', '0x11/agent/a/context'] : []);
+  assert.equal(calls.filter(c => c.path === '/0x11/user').length, 2, 'the second page was read');
+});
+test('queueHTML puts working asks first, then waiting by priority (chat before crawl), then finished', () => {
+  const rows = [
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/x', asked: 'about x', priority: 2, state: 'queued', step: '', pages: 0, queries: 0, found: 0, updated: 1, writes: 0 },
+    { owner: 'c1', path: '0x11/agent/c1/asks/y', asked: 'about y', priority: 0, state: 'queued', step: '', pages: 0, queries: 0, found: 0, updated: 2, writes: 0 },
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/z', asked: 'about z', priority: 1, state: 'reading', step: 'https://www.example.com/p', pages: 2, queries: 1, found: 0, updated: 3, writes: 0 },
+    { owner: 'crawl', path: '0x11/agent/crawl/asks/w', asked: 'about w', priority: 2, state: 'integrated', step: '', pages: 3, queries: 1, found: 4, updated: 4, writes: 6 } ];
+  const html = live.queueHTML(rows);
+  const order = ['about z', 'about y', 'about x', 'about w'].map(t => html.indexOf(t));
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'working, then chat before crawl, then finished');
+  assert.match(html, /reading example\.com/); assert.match(html, /4 rows · 6 written/);
+});
+test('mountRecord draws every page of what is beneath before the backlink walk returns', async () => {
+  const kid = (name, slots) => ({path: '0x11/user/' + name, name, slots, kids: [], case: 1});
+  const pages = {
+    '': {path: '0x11/user', record: {}, kids: [kid('eng', {name: 'engineering'}), kid('orgs', {}), {path: '0x11/user/orgs/a16z', name: 'a16z', slots: {}, kids: []}], case: 1, next: 'p2'},
+    p2: {path: '0x11/user', record: {}, kids: [kid('people', {}), kid('web', {})], case: 1, next: null}};
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const source = {
+    read: async (path, care, cas, next) => pages[next || ''],
+    backlinks: async () => { await gate; return {matches: [{path: '0x11/agent/c2/turns/t3', slot: 'said', hole: false}, {path: '0x11/agent/c1/context', slot: 'user', hole: false}]}; }};
+  const el = fakeEl();
+  const sec = {innerHTML: ''};
+  const main = {innerHTML: '', querySelector: s => (s === '.sv-back-sec' ? sec : null)};
+  el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  live.mountRecord(el, source, {at: '/0x11/user'});
+  for (let i = 0; i < 20 && !/looking/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /beneath/, 'both pages of children, and only direct children');
+  assert.match(main.innerHTML, /people/); assert.match(main.innerHTML, /web/); assert.doesNotMatch(main.innerHTML, /a16z/);
+  assert.match(main.innerHTML, /looking…/, 'drawn before the backlinks come back');
+  release();
+  for (let i = 0; i < 20 && !/c1\/context/.test(sec.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(sec.innerHTML, /pointing here · 2/); assert.match(sec.innerHTML, /said/); assert.match(sec.innerHTML, /c2\/turns\/t3/);
+  const order = ['said', 'user'].map(k => sec.innerHTML.indexOf('>' + k + ' <'));
+  assert.ok(order[0] < order[1], 'slots in name order, none singled out');
+});
+test('a record page is the thing as a world: folders are slots, lines are names with what the holder says beside them, what references it is a folder under its holder\'s slot, a text that names it is a named-in line with its sentence', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async p => p === '/x/0x11/user/views/flood_review'
+      ? ({path: 'x/0x11/user/views/flood_review', record: {}, kids: [{path: 'x/0x11/user/views/flood_review/exposure', name: 'exposure', slots: {risk: 'high'}, kids: []}], case: 1, next: null})
+      : ({path: '0x11/user/orgs/mis', record: {name: 'MIS'}, kids: [{path: '0x11/user/orgs/mis/talk', name: 'talk', slots: {}, kids: []}], case: 1, next: null}),
+    unfold: async () => [
+      {dir: 'out', key: 'leaders', label: 'leaders', items: [{path: '/0x11/user/people/forbes', name: 'Forbes McKenzie', note: {role: 'founder and CEO'}, via: '/0x11/user/orgs/mis', world: '0x11'}]},
+      {dir: 'in', key: 'acquisitions', label: '← acquisitions', items: [{path: '/0x11/user/orgs/verisk', name: 'Verisk', note: {note: 'acquired 29 July 2026'}, via: '/0x11/user/orgs/verisk/acquisitions/mis', world: '0x11'}]},
+      {dir: 'in', key: 'flood_review', label: '← flood review', items: [{path: '/x/0x11/user/views/flood_review', name: 'flood review', note: {}, via: '/0x11/user/views/flood_review', world: '0x11'}]},
+      {dir: 'in', key: 'text', label: '← text', items: [{path: '/0x11/user/web/host/page/r1', name: 'A page that names it', note: {text: 'Verisk has completed its purchase of [/0x11/user/orgs/mis]. Terms were not disclosed.'}, via: '/0x11/user/web/host/page/r1', world: '0x11'}]}] };
+  live.mountRecord(el, source, {at: '/0x11/user/orgs/mis'});
+  for (let i = 0; i < 30 && !/beneath/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /as a world.*leaders.*Forbes McKenzie.*founder and CEO/s, 'beside a line: the value, not the slot name');
+  assert.match(main.innerHTML, /← acquisitions<\/span>.*Verisk.*acquired 29 July 2026/s);
+  assert.match(main.innerHTML, /← flood review<\/span>.*flood review.*exposure.*risk high/s, 'a cell reading the thing is a line under its name, its result read once as lines beneath');
+  assert.match(main.innerHTML, /<li class="named">(?:<span class="tg">[^<]*<\/span>)?<a[^>]*>A page that names it<\/a> <span class="s">\u201cVerisk has completed its purchase of <a class="n go"[^>]*>mis<\/a>\.\u201d/, 'a text whose prose names the thing is a line with that sentence, the reference a link, no folder label');
+  assert.doesNotMatch(main.innerHTML, /← text</, 'the prose slot is not shown as a folder');
+  assert.doesNotMatch(main.innerHTML, /pointing here/, 'what points here is in the tree');
+  assert.match(main.innerHTML, /beneath<\/div>.*talk/s);
+});
+test('a record page shows the record as a world: relation labels as virtual folders, unfolded', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async () => ({path: '0x11/user/orgs/verisk', record: {name: 'Verisk'}, kids: [], case: 1, next: null}),
+    unfold: async () => [{label: 'acquired_by of', items: [{path: '/0x11/user/orgs/mis', name: 'McKenzie Intelligence Services', note: {acquired: '20260729'}, folders: [{label: 'founded of', items: [{path: '/0x11/user/people/forbes', name: 'Forbes McKenzie', note: {}}]}]}]}] };
+  live.mountRecord(el, source, {at: '/0x11/user/orgs/verisk'});
+  for (let i = 0; i < 30 && !/as a world/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /as a world.*acquired_by of.*McKenzie Intelligence Services.*20260729.*founded of.*Forbes McKenzie/s);
+});
+test('where a thing sits is a folder above it, drawn with an arrow up, and a view result is a dashed line', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const source = { read: async () => ({path: '0x11/user/web/pages/host/page/r1', record: {heading: 'Region 1', text: 'The [/0x11/user/orgs/verisk] site.'}, kids: [], case: 1, next: null}),
+    unfold: async () => [{dir: 'up', key: 'page', label: '\u2191 page', items: [{path: '/0x11/user/web/pages/host/page', name: 'The page', note: {}}]},
+      {dir: 'in', key: 'regions_of', label: '\u2190 regions of', items: [{path: '/x/0x11/user/views/regions_of', name: 'regions of', note: {}}]}] };
+  live.mountRecord(el, source, {at: '/0x11/user/web/pages/host/page/r1'});
+  for (let i = 0; i < 30 && !/as a world/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.match(main.innerHTML, /\u2191 page<\/span>.*The page/s, 'the folder above, labelled by the folder between');
+  assert.match(main.innerHTML, /class="cell">.*regions of/s, 'a view result is a dashed line');
+});
+test('a view\'s own page: the cell is the card, its result is drawn as the namespace it is, every level', async () => {
+  const main = {innerHTML: '', querySelector: () => null};
+  const el = fakeEl(); el.querySelector = s => (s === '.sv-recview' ? main : fakeEl());
+  const reads = [];
+  const source = { read: async p => { reads.push(p); return {path: '0x11/user/views/sources', record: {name: 'sources', depth: 3}, kids: [], case: 1, next: null}; },
+    result: async () => ({'': {standings: 2, components: 1}, '/0': {name: 'Atlas · Zone AE', standings: 2}, '/0/0x11': {}, '/0/0x11/user': {}, '/0/0x11/user/carriers': {}, '/0/0x11/user/carriers/atlas': {name: 'Atlas', at: '/h/x/0/4/0x11/user/carriers/atlas', standing: true},
+      '/0/0x11/user/carriers/atlas/out': {}, '/0/0x11/user/carriers/atlas/out/1': {}, '/0/0x11/user/carriers/atlas/out/1/model': {count: 1}, '/0/0x11/user/carriers/atlas/out/1/model/4': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user/models': {}, '/0/0x11/user/carriers/atlas/out/1/model/4/0x11/user/models/flood': {name: 'Flood v4', at: '/h/x/0/4/0x11/user/models/flood'}}),
+    unfold: async () => { throw new Error('a view\'s page reads no second view'); } };
+  live.mountRecord(el, source, {at: '/x/0x11/user/views/sources'});
+  for (let i = 0; i < 30 && !/the result/.test(main.innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  assert.equal(reads[0], '0x11/user/views/sources', 'the card is the cell record');
+  assert.match(main.innerHTML, /the result.*Atlas · Zone AE.*standings 2.*>Atlas<.*out\/1\/model.*count 1.*Flood v4/s, 'the result tree, deeper than one level, empty folders run together');
+  assert.match(main.innerHTML, /href="\?at=\/0x11\/user\/models\/flood/, 'a line links to the thing it references');
+});
+
+// ---- a workspace: a blank world that takes shape from what you drop into it
+function wsEl() {
+  const kids = {}, listeners = {};
+  const mk = () => ({ classList: { add() {}, remove() {}, toggle() {} }, innerHTML: '', value: '', dataset: {}, disabled: false, addEventListener(n, f) { (listeners[n] = listeners[n] || []).push(f); }, querySelector: s => kids[s] || (kids[s] = mk()), querySelectorAll: () => [] });
+  const el = mk(); el.fire = (n, ev) => (listeners[n] || []).forEach(f => f(ev)); el.kids = kids; return el;
+}
+test('kindOf reads a drop from its text alone: a path with its care, a view, a url, text; a question is text', () => {
+  assert.deepEqual(live.kindOf('/0x11/user/orgs/verisk y'), {kind: 'path', path: '/0x11/user/orgs/verisk', care: 'y', view: false});
+  assert.deepEqual(live.kindOf('/x/0x11/user/views/sources [z]'), {kind: 'path', path: '/x/0x11/user/views/sources', care: 'z', view: true});
+  assert.equal(live.kindOf('https://www.verisk.com/press/x').kind, 'url');
+  assert.equal(live.kindOf('Find domestic transformer suppliers').kind, 'text', 'a question or an ask is an input like any other');
+  assert.equal(live.kindOf('Verisk acquired [/0x11/user/orgs/mis] in July.').kind, 'text');
+  assert.equal(live.kindOf('   '), null);
+});
+test('tabs: every workspace, the open one lit, a blank one a click away; a paste of several paths is several drops, else one', () => {
+  const all = [{path: '0x11/user/workspaces/sourcing', name: 'sourcing'}, {path: '0x11/user/workspaces/untitled', name: 'untitled'}];
+  const html = live.tabsHTML(all, 'sourcing');
+  assert.match(html, /class="tab on" href="\?ws=sourcing"><span class="d"><\/span><span class="tl">sourcing<\/span>.*class="tab" href="\?ws=untitled">.*untitled<.*class="tab new" href="\?ws=untitled_2"/s);
+  assert.match(live.tabsHTML(all, 'fresh_one'), /class="tab on" href="\?ws=fresh_one"/, 'a workspace not yet written still has its tab while open');
+  assert.deepEqual(live.dropsOf('/0x11/user/orgs/verisk y\n/0x11/user/orgs/mis\n').map(d => [d.path, d.care]), [['/0x11/user/orgs/verisk', 'y'], ['/0x11/user/orgs/mis', 'x']]);
+  assert.equal(live.dropsOf('Verisk acquired MIS.\nTerms undisclosed.').length, 1);
+});
+test('a workspace page: the queue with its cares and states, the world as one root per component, what agents took up in the sidebar', async () => {
+  const el = wsEl();
+  const calls = [];
+  const source = {
+    read: async p => ({path: p, record: {name: p.endsWith('verisk') ? 'Verisk' : p.endsWith('i1') ? 'a note' : ''}, kids: [], case: 1, next: null}),
+    wsRead: async () => ({path: '0x11/user/workspaces/sourcing', name: 'sourcing', exists: true, depth: 3,
+      standings: [{key: 'a', path: '0x11/user/orgs/verisk', care: 'y'}, {key: 'b', path: '0x11/user/workspaces/sourcing/inputs/i1', care: 'x'}],
+      inputs: [{path: '0x11/user/workspaces/sourcing/inputs/i1', n: 1, name: 'a note', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.'}],
+      tasks: [{path: '0x11/user/workspaces/sourcing/tasks/t1', n: 1, task: 'Fetch the catalog', who: 'claude', state: 'done'}, {path: '0x11/user/workspaces/sourcing/tasks/t2', n: 2, task: 'Judge the ECHO plant', who: 'claude', state: 'working'}]}),
+    wsStandings: async (ws, standings, depth) => { calls.push({ws, standings, depth}); return {cell: '/0x11/user/workspaces/sourcing/world', components: 1, islands: 0, roots: [{i: 0, name: 'Verisk · a note', standings: [{path: '/0x11/user/orgs/verisk', name: 'Verisk', world: '0x11', folders: [{dir: 'in', key: 'text', label: '← text', items: [{path: '/0x11/user/workspaces/sourcing/inputs/i1', name: 'a note', note: {text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.'}}]}]}, {path: '/0x11/user/workspaces/sourcing/inputs/i1', name: 'a note', world: '0x11', folders: []}]}]}; },
+    unfold: async () => [], follow() {} };
+  live.mountWorkspace(el, source, {ws: 'sourcing', node: '0x11'});
+  for (let i = 0; i < 40 && !/component/.test(el.querySelector('.ws-meter').innerHTML); i++) await new Promise(r => setTimeout(r, 0));
+  const inputs = el.querySelector('.ws-inputs').innerHTML;
+  assert.match(inputs, />PATH<.*>Verisk<.*Included · reference.*ws-care.*class="on" data-care="y".*data-copy="\/0x11\/user\/orgs\/verisk"/s, 'a record input on the bus, landed, with its care lit and its path to copy');
+  assert.match(inputs, />TEXT<.*>a note<.*Landed · names placed/s, 'a text input, landed, its names placed');
+  assert.match(el.querySelector('.ws-world-sec').innerHTML, /sv-root.*Verisk · a note.*sv-standing.*>Verisk<.*named in.*class="named".*>a note<.*acquired MIS/s, 'one root, the standings unfolded, the text that names the standing gathered under named in, dashed, its sentence beside it');
+  assert.match(el.querySelector('.ws-meter').innerHTML, /1 component · 0 islands/, 'the meter beside the title');
+  const tasks = el.querySelector('.ws-tasks').innerHTML;
+  assert.match(tasks, /task ok.*Fetch the catalog.*Completed/s);
+  assert.match(tasks, /task run.*Judge the ECHO plant.*Auto · claude/s);
+  assert.deepEqual(calls[0].standings.map(s => s.care), ['y', 'x'], 'the world is read over the standings at their cares');
+});
+test('a drop lands as records: text beneath inputs and stands at x; a path stands at its care; a task asked outright beneath tasks, open', async () => {
+  const written = [];
+  const m = fakeMcp((name, a) => {
+    if (name === 'mcp/write') { written.push(...a.records); return {epoch: 9, records: a.records.map(r => ({path: r.path, written: true}))}; }
+    if (a.path === '/0x11/user/workspaces/sourcing') return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+    if (a.path === '/0x11/user/workspaces/sourcing/inputs') return {path: a.path, exists: false, reference: null, properties: {}, children: [{path: a.path + '/i1', exists: true, properties: {'/name': 'old'}, children: []}]};
+    return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+  });
+  const s = mcpSource({fetch: m.fetch, views: '0x11', EventSource: null});
+  const r = await s.wsDrop('sourcing', {kind: 'text', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.\nTerms undisclosed.'});
+  assert.deepEqual(r, {landed: '0x11/user/workspaces/sourcing/inputs/i2', standing: {path: '0x11/user/workspaces/sourcing/inputs/i2', care: 'x'}});
+  assert.deepEqual(written[0], {path: '/0x11/user/workspaces/sourcing', slots: {name: 'sourcing'}}, 'the workspace record, the first time');
+  assert.deepEqual(written[1], {path: '/0x11/user/workspaces/sourcing/inputs/i2', slots: {name: 'Verisk acquired MIS.', text: 'Verisk [/0x11/user/orgs/verisk] acquired MIS.\nTerms undisclosed.'}}, 'the name is the first line without its brackets; the text keeps them');
+  const p = await s.wsDrop('sourcing', {kind: 'path', path: '/0x11/user/orgs/verisk', care: 'z'});
+  assert.deepEqual(p.standing, {path: '0x11/user/orgs/verisk', care: 'z'});
+  const t = await s.wsDrop('sourcing', {kind: 'task', text: 'Find domestic suppliers'});
+  assert.equal(t.landed, '0x11/user/workspaces/sourcing/asks/t1');
+  assert.deepEqual(written[written.length - 1].slots, {task: 'Find domestic suppliers', who: 'person', state: 'open'});
+});
+test('wsRead reads the standings off the world cell with their cares, the inputs and the tasks beneath the workspace', async () => {
+  const W = '/0x11/user/workspaces/sourcing';
+  const m = fakeMcp((name, a) => {
+    if (a.path === W) return {path: W, exists: true, reference: ref('x', 1, W), properties: {'/name': 'sourcing'}, children: []};
+    if (a.path === W + '/world') return {path: a.path, exists: true, reference: ref('x', 2, a.path), properties: {'/sys/weft': '/h/x/1/4/0x11/weft/graph/overlay', '/sys/tack': '/h/y/0/4/0x11/user/orgs/verisk', '/standing/b': '/h/x/0/6/0x11/user/workspaces/sourcing/inputs/i1', '/depth': '2'}, children: []};
+    if (a.path === W + '/inputs') return {path: a.path, exists: false, reference: null, properties: {}, children: [{path: a.path + '/i1', exists: true, reference: ref('x', 1, a.path + '/i1'), properties: {'/name': 'a note', '/text': 'Verisk [/0x11/user/orgs/verisk].'}, children: []}]};
+    return {path: a.path, exists: false, reference: null, properties: {}, children: []};
+  });
+  const r = await mcpSource({fetch: m.fetch, views: '0x11', EventSource: null}).wsRead('sourcing');
+  assert.deepEqual(r.standings, [{key: 'a', care: 'y', path: '0x11/user/orgs/verisk'}, {key: 'b', care: 'x', path: '0x11/user/workspaces/sourcing/inputs/i1'}]);
+  assert.equal(r.depth, 2);
+  assert.equal(r.inputs[0].text, 'Verisk [/0x11/user/orgs/verisk].');
+  assert.deepEqual(r.tasks, []);
+});
+
