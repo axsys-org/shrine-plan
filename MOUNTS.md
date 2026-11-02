@@ -166,6 +166,8 @@ launcher messages go to stderr.
 Return a number from 0 to 255 as the command's exit status. Returning shuts down
 Eden's background actors; an uncaught error reports failure and exits 1.
 Ctrl-C stops the launcher. Terminal mode cannot be combined with `--check`.
+Saved-world launch (`--world`) currently supports HTTP only; it cannot be
+combined with `--terminal` or `--wire-port`.
 
 With `--wire-port`, `save-mount` and `reload-mount` continue to work while the
 terminal is waiting in `Input`. Control requests run through a separate actor

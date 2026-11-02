@@ -896,6 +896,8 @@
       :
     + get
       :
+    + route
+      :
   + read_block_kind
     \ text=str tree=rex
     ^ either[;/error ;/block_kind]
@@ -3211,7 +3213,7 @@
     \ source=str
     ^ either[str goo_paths/hunts]
     ? (gt source.len 16384) (./err "Path selections exceed 16 KiB.")
-    > (./ok data _) (parse source) (./err "Invalid path selection JSON.")
+    > (./ok data _) (json_source/parse source) (./err "Invalid path selection JSON.")
     > (./obj fields) data (./err "Path input must be an object.")
     ? !(and (eq fields.len 2) (and (eq (fields.keep((\ f=jkv (eq f.k "version")))).len 1) (eq (fields.keep((\ f=jkv (eq f.k "hunts")))).len 1))) (./err "Unknown or duplicate path input fields.")
     ? !(equal (goo_paths/field "version" data) (json/num .false 1)) (./err "Unsupported path selection version.")
@@ -4167,7 +4169,7 @@
        > (./err why) [state 409 (json/obj [(jkv "error" (json/str why))])]
     ' Action receipts retain their existing persisted representation and equality.
     = [next status body] (goo_runtime/run query state)
-    ? (parse body)
+    ? (json_source/parse body)
      > (jres/ok value rest) [next status value]
     [next status (json/obj [(jkv "error" (json/str body))])]
 
@@ -9379,8 +9381,8 @@
     = card (change_workbench/record export.source compiled.state)
       notes (axal/new[note] .none).put(export.target (note/make card))
     ? (namespace/step notes 0 0 compiled.state)
-     > (./rejected _) (./err "Candidate export failed.")
-     > (./accepted result)
+     > (./err _) (./err "Candidate export failed.")
+     > (./ok result)
       | _ rest.drop(1) (change_workbench/compiled result.state compiled.names.snoc(export.target))
   + build
     \ ports=change_workbench/ports home=path registration=change_workbench/registration state=namespace
@@ -9423,8 +9425,8 @@
       removal=either[str namespace]
         ? !(removed.len) (./ok compiled.state)
         ? (namespace/step changes 0 0 compiled.state)
-         > (./rejected _) (./err "Candidate removal failed.")
-         > (./accepted result) (./ok result.state)
+         > (./err _) (./err "Candidate removal failed.")
+         > (./ok result) (./ok result.state)
       validate adapter.validate
     < branch removal
     < valid (validate registration branch)
@@ -9478,8 +9480,8 @@
           | out.put fixture (note/make (change_workbench/record fixture state))
       fixtures=either[str namespace]
         ? (namespace/step fixture_notes 0 0 candidate.branch)
-         > (./rejected _) (./err "Fixture capture failed; no tests ran.")
-         > (./accepted result) (./ok result.state)
+         > (./err _) (./err "Fixture capture failed; no tests ran.")
+         > (./ok result) (./ok result.state)
       test adapter.test
     < branch fixtures
     = results=row[[nat str]]
@@ -9519,8 +9521,8 @@
         | row/fold[[path myth] axal[note]] (axal/new[note] .none) (\ out [path card] out.put(path (note/make card))) candidate.records
       notes (row/fold[path axal[note]] notes (\ out path out.put(path .cull)) candidate.removed)
     ? (namespace/step notes 0 0 state)
-     > (./rejected _) (./err "Atomic publication rejected; active records were retained.")
-     > (./accepted committed)
+     > (./err _) (./err "Atomic publication rejected; active records were retained.")
+     > (./ok committed)
       = journal journal.set_active(candidate.records.map((\ [path card] path))).set_revision(journal.revision.inc).set_published(journal.candidate)
         next (change_workbench/put home (myth/sing (change_workbench/key 'journal) journal) committed.state)
         next (change_workbench/put registration.control (myth/sing (change_workbench/key 'active) (pails/t (nat/show journal.revision))) next)
@@ -11855,3 +11857,125 @@
      > (./ok next) (./ok next)
      > (./err why) (./err (str/from_atom (iota_show why)))
 
+' --- value_preview ---
+
+' Diagnostic code previews of stored values. Never invoke a stored function.
+' Bound traversal before formatting, not just the resulting string afterward.
++ value_preview
+  + either_true
+    \ left=bool right=bool
+    ^ bool
+    ? left .true right
+  + result
+    : text=str clipped=bool
+  + cut
+    ^ value_preview/result
+    | value_preview/result "..." .true
+  + bounded
+    \ text=str clipped=bool
+    ^ value_preview/result
+    ? (gt text.len 4096) (value_preview/result text.slice(0 4093).cat("...") .true)
+    | value_preview/result text clipped
+  + small
+    ' Admission for the existing type pretty-printer; all descendants must fit.
+    \ value=any depth=nat budget=nat
+    ^ bool
+    ? ((eq depth 0) || (eq budget 0)) .false
+    ? (rep_law value) .false
+    ? (rep_pin value) (value_preview/small (rep_unpin value) depth.dec budget.dec)
+    ? !(rep_app value) (le (wid value) 256)
+    = count (rep_sz value)
+    ? ((gt count 16) || (gt count budget.dec)) .false
+    ? !(value_preview/small (rep_hd value) depth.dec 1) .false
+    % i=nat 0
+    ^ bool
+    ? (eq i count) .true
+    ? !(value_preview/small (rep_ix i value) depth.dec (div budget.dec (? count count 1))) .false
+    | _ i.inc
+  + iota_text
+    \ value=any
+    ^ str
+    | str/from_atom (iota_show value)
+  + render
+    \ value=any depth=nat budget=nat
+    ^ value_preview/result
+    ? ((eq depth 0) || (eq budget 0)) value_preview/cut
+    ? (rep_law value) (value_preview/result "fn { ... }" .true)
+    ? (rep_pin value)
+      = inner (value_preview/render (rep_unpin value) depth.dec budget.dec)
+      | value_preview/bounded (str/cat_all ["pin(" inner.text ")"]) inner.clipped
+    ? !(rep_app value)
+      ? (gt (wid value) 128)
+        | value_preview/result (str/cat_all ["bytes[" (value_read/hex_slice value 0 64) " ...]"]) .true
+      | value_preview/bounded (str/from_atom (show/leaf value)) (and (gt (wid value) 42) (show/textish value))
+    = head (rep_hd value)
+    ? (rep_law head) (value_preview/result "fn { ... }" .true)
+    ? (and (show/aura_tag head) (eq (rep_sz value) 1))
+      ? (and !(rep_app (rep_ix 0 value)) (le (wid (rep_ix 0 value)) 128))
+        ?> (./ok text) (Try value_preview/iota_text value) (value_preview/fields value head depth budget)
+        | value_preview/bounded text .false
+      value_preview/cut
+    ? !(value_preview/either_true (eq head 0) (nominal_brand value)) (value_preview/result "fn { ... }" .true)
+    ? (gt (wid head) 256) value_preview/cut
+    | value_preview/fields value head depth budget
+  + fields
+    \ value=any head=nat depth=nat budget=nat
+    ^ value_preview/result
+    = size (rep_sz value)
+      count (? (gt size 8) 8 size)
+      count (? (gt count budget.dec) budget.dec count)
+      share (div budget.dec (? count count 1))
+      name=str (? head (str/from_atom (show/tail head)) "")
+      fields=row[[face=nat item=type]]
+        ?> (./some shape) (show/reg_of head) []
+        ?> (./rec brand fields) shape []
+        ? !(eq fields.len size) []
+        fields
+    % i=nat 0 parts=row[str] [] clipped=bool (gt size count) used=nat name.len
+    ^ value_preview/result
+    ? (value_preview/either_true (eq i count) (gt used 3600))
+      = clipped (value_preview/either_true clipped (lt i count))
+        parts (? (lt i size) parts.snoc("...") parts)
+        flat (str/cat_all [name (? head "{" "[") (str/join " " parts) (? head "}" "]")])
+      ? (le flat.len 76) (value_preview/bounded flat clipped)
+      = newline (str/from_atom 10)
+        indent newline.cat("  ")
+        indented (parts.map((\ text=str (str/join indent (str/split_nonempty 10 text)))))
+      | value_preview/bounded (str/cat_all [name (? head "{" "[") indent (str/join indent indented) newline (? head "}" "]")]) clipped
+    = item (value_preview/render (rep_ix i value) depth.dec share)
+      face=nat
+        ? fields.len
+          = [face hint] fields.at(i)
+          face
+        i
+      text (? (eq face i) item.text (str/cat_all [(str/from_atom (tyshow/atom_text face)) " = " item.text]))
+    | _ i.inc parts.snoc(text) (value_preview/either_true clipped item.clipped) (add used text.len)
+  + readable
+    ' Preserve non-ASCII bytes as escapes, including malformed stored strings.
+    \ text=str
+    ^ value_preview/result
+    % i=nat 0 parts=row[str] [] size=nat 0
+    ^ value_preview/result
+    ? (eq i text.len) (value_preview/result (str/cat_all parts) .false)
+    ? (gt size 4088) (value_preview/result (str/cat_all parts.snoc("...")) .true)
+    = byte text.at(i)
+      safe (value_preview/either_true (eq byte 10) (and (ge byte 32) (le byte 126)))
+      part (? safe text.slice(i 1) (str/cat_all [(str/from_atom 92) "x" (value_read/hex_slice byte 0 1)]))
+    | _ i.inc parts.snoc(part) (add size part.len)
+  + force
+    \ held=pail
+    ^ value_preview/result
+    = preview=value_preview/result
+        ?> descriptor=pails/ty held (value_preview/render held 6 96)
+        ? !(value_preview/small descriptor.t 12 128) (value_preview/render held 6 96)
+        | value_preview/bounded (str/from_atom (tyshow/pretty descriptor.t)) .false
+      readable (value_preview/readable preview.text)
+      clipped (value_preview/either_true preview.clipped readable.clipped)
+    ; readable.text.len
+    | value_preview/result readable.text clipped
+  + safe
+    \ held=pail
+    ^ maybe[value_preview/result]
+    ? (Try value_preview/force held)
+     > (./ok result) (./some result)
+    .none

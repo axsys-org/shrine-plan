@@ -261,6 +261,8 @@ class MountTests(unittest.TestCase):
         self.assertEqual(spec[14], ['apps/terminal_demo/cli', ['terminal', 'main']])
         launcher = Path(__file__).with_name('eden')
         for flags, error in ((['--terminal', 'terminal-demo', '--check'], 'cannot be combined'),
+                             (['--world', str(self.root / 'world'), '--terminal', 'terminal-demo'], 'currently supports HTTP'),
+                             (['--world', str(self.root / 'world'), '--wire-port', '8679'], 'currently supports HTTP'),
                              (['--', 'unexpected'], 'require --terminal')):
             result = subprocess.run([sys.executable, str(launcher), '--extras-root', str(self.root), *flags],
                                     capture_output=True, text=True)
