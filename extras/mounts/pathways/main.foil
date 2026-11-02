@@ -1,0 +1,185 @@
+- stdlib/runtime
+- stdlib/base [at=json_source]
+
++ pathways
+  ' The atlas is published source data. User cases live in this namespace record.
+  + document
+    : revision=nat receipt=str cases=json
+  + empty
+    ^ pathways/document
+    | pathways/document 0 "" (json/arr [])
+  + root
+    \ self=iota
+    ^ path
+    [self 'app 'pathways]
+  + field
+    \ key=str value=json
+    ^ json
+    | goo_runtime/json_field key value
+  + text
+    \ key=str value=json
+    ^ str
+    | goo_runtime/json_text (pathways/field key value)
+  + fields
+    ' Require exact, unique object keys, including for nested imported data.
+    \ keys=row[str] value=json
+    ^ bool
+    > (json/obj entries) value .false
+    ? !(eq entries.len keys.len) .false
+    | keys.all (\ key (eq (entries.keep((\ entry (eq entry.k key)))).len 1))
+  + text_field
+    \ key=str limit=nat value=json
+    ^ bool
+    > (json/str text) (pathways/field key value) .false
+    | le text.len limit
+  ' Versioned atlas identifiers. check-model verifies these against atlas.json.
+  + node_ids
+    ^ row[str]
+    ["folate" "methionine" "trans" "gsh" "ppp" "nadph" "gsr" "comt" "clock" "melatonin" "sleep" "adhd"]
+  + observation_ids
+    ^ row[str]
+    ["inattention" "impulsivity" "restlessness" "late_sleep" "hard_waking" "sleepiness" "fatigue" "low_folate" "high_hcy" "redox_marker"]
+  + hypothesis_ids
+    ^ row[str]
+    ["circadian_delay" "folate_limit" "redox_limit" "methylation"]
+  + strings
+    \ limit=nat allowed=row[str] value=json
+    ^ bool
+    > (json/arr values) value .false
+    ? (gt values.len limit) .false
+    % rest=row[json] values seen=row[str] []
+    ^ bool
+    ? !(rest.len) .true
+    > (json/str text) rest.at(0) .false
+    ? (!(allowed.has(text)) || seen.has(text)) .false
+    | _ rest.drop(1) seen.snoc(text)
+  + observation
+    \ value=json
+    ^ bool
+    ? !(pathways/fields ["id" "state" "note"] value) .false
+    ? !(pathways/text_field "id" 80 value) .false
+    ? !(row/has[str] (pathways/text "id" value) pathways/observation_ids) .false
+    ? !(pathways/text_field "note" 1000 value) .false
+    = state (pathways/text "state" value)
+    | ((eq state "present") || (eq state "absent") || (eq state "unknown"))
+  + valid_case
+    \ value=json
+    ^ bool
+    ? !(pathways/fields ["id" "title" "observations" "hypotheses" "custom" "notes"] value) .false
+    ? !(pathways/text_field "id" 80 value) .false
+    ? !(pathways/text_field "title" 160 value) .false
+    ? !(pathways/text_field "notes" 8000 value) .false
+    ? !(pathways/strings 16 pathways/hypothesis_ids (pathways/field "hypotheses" value)) .false
+    = custom (pathways/field "custom" value)
+    ? !(pathways/fields ["statement" "targets" "direction" "rationale"] custom) .false
+    ? !(pathways/text_field "statement" 500 custom) .false
+    ? !(pathways/text_field "rationale" 4000 custom) .false
+    ? !(pathways/strings 32 pathways/node_ids (pathways/field "targets" custom)) .false
+    > (json/arr targets) (pathways/field "targets" custom) .false
+    ? (? targets.len (eq (pathways/text "statement" custom).len 0) .false) .false
+    = direction (pathways/text "direction" custom)
+    ? !((eq direction "unspecified") || (eq direction "decreased") || (eq direction "increased") || (eq direction "timing")) .false
+    > (json/arr observations) (pathways/field "observations" value) .false
+    ? (gt observations.len 64) .false
+    % rest=row[json] observations seen=row[str] []
+    ^ bool
+    ? !(rest.len) .true
+    = item rest.at(0) id (pathways/text "id" item)
+    ? (!(pathways/observation item) || !(id.len) || seen.has(id)) .false
+    | _ rest.drop(1) seen.snoc(id)
+  + cases_valid
+    \ value=json
+    ^ bool
+    ? (ge (show value).len 190000) .false
+    > (json/arr cases) value .false
+    ? (gt cases.len 32) .false
+    % rest=row[json] cases seen=row[str] []
+    ^ bool
+    ? !(rest.len) .true
+    = item rest.at(0) id (pathways/text "id" item)
+    ? (!(pathways/valid_case item) || !(id.len) || seen.has(id)) .false
+    | _ rest.drop(1) seen.snoc(id)
+  + decode
+    \ text=str
+    ^ maybe[pathways/document]
+    ? (gt text.len 200000) .none
+    > (jres/ok value rest) (json_source/parse text) .none
+    ? !(pathways/fields ["atlas" "revision" "receipt" "cases"] value) .none
+    ? !(eq (pathways/text "atlas" value) "redox-folate-clock-v1") .none
+    = revision (pathways/text "revision" value) receipt (pathways/text "receipt" value)
+    > (./some number) (nat/parse revision) .none
+    ? !(eq (nat/show number) revision) .none
+    ? ((eq receipt.len 0) || (gt receipt.len 80)) .none
+    ? !(pathways/cases_valid (pathways/field "cases" value)) .none
+    | ./some (pathways/document number receipt (pathways/field "cases" value))
+  + from_record
+    \ record=myth
+    ^ pathways/document
+    > (./some held) record.get(system_vocabulary/content) pathways/empty
+    > doc=pathways/document held pathways/empty
+    doc
+  + save
+    ' Compare revision inside the serialized namespace operation, not in HTTP.
+    ' A stale request is a no-op. Its receipt cannot match the returned document.
+    \ input=myth current=myth
+    ^ myth
+    > (./some held) input.get(system_vocabulary/content) current
+    > request=pathways/document held current
+    = old (pathways/from_record current)
+    ? !(eq old.revision request.revision) current
+    ? !(pathways/cases_valid request.cases) current
+    | current.put system_vocabulary/content
+        (pathways/document old.revision.inc request.receipt request.cases)
+  + encode
+    \ doc=pathways/document
+    ^ str
+    | show (json/obj [(jkv "atlas" (json/str "redox-folate-clock-v1"))
+        (jkv "revision" (json/str (nat/show doc.revision)))
+        (jkv "receipt" (json/str doc.receipt)) (jkv "cases" doc.cases)])
+  + status
+    \ state=namespace
+    ^ [nat str]
+    = record (sovereign_peek (pathways/root state.self).snoc('notebook) state).fil
+    > (./some record) record [404 "Notebook unavailable"]
+    [200 (pathways/encode (pathways/from_record record))]
+  + install
+    \ state=namespace
+    ^ either[pail namespace]
+    = root (pathways/root state.self)
+      operation (op 'save 'notebook [] 'notebook "Save a notebook at its expected revision" pathways/save)
+      records=row[[path myth]]
+        [[root (myth/sing system_vocabulary/lede (pails/t "Pathways research notebook"))]
+         [root.snoc('notebook) (myth/sing system_vocabulary/content pathways/empty)]
+         [root.snoc('save) (myth/sing system_vocabulary/op operation)]]
+    > (./ok next) (grove_install/mount root records state)
+      | ./err (pails/t "Pathways notebook installation failed")
+    | ./ok next
+  + http
+    \ files=row[[str nat]] state=namespace
+    ^ http_foot/config
+    = root (pathways/root state.self)
+      assets=path [state.self 'io 'fs 'pathways]
+      plan
+        \ request=http_foot/request now=nat
+        ^ http_foot/action
+        = url (http_foot/split 63 request.target).at(0)
+        ? (eq url "/pathways/save")
+          ? !(eq request.method "POST") (./reply (http_driver/response 405 "POST required"))
+          > (./some doc) (pathways/decode request.body)
+            | ./reply (http_driver/response 400 "Invalid notebook document")
+          | ./write root.snoc('notebook)
+              (writ/warp root.snoc('save) (myth/sing system_vocabulary/content doc)) "/pathways/state"
+        ? !(eq request.method "GET") (./reply (http_driver/response 405 "GET required"))
+        ? (eq url "/pathways/state") (./snapshot pathways/status)
+        = leaf=str
+            ? ((eq url "/pathways") || (eq url "/pathways/")) "index.html"
+            | url.slice 10 (sub url.len 10)
+          allowed=row[str] ["index.html" "style.css" "app.js" "model.mjs" "atlas.json"]
+        ? !(allowed.has(leaf)) (./reply (http_driver/response 404 "Not found"))
+        = mime=nat
+            ? (eq leaf "index.html") "text/html; charset=utf-8"
+            ? (eq leaf "style.css") "text/css"
+            ? (eq leaf "atlas.json") "application/json"
+            "text/javascript"
+        | ./asset assets leaf mime
+    | http_foot/add_routes [(http_foot/route "/pathways" plan)] http_foot/empty
