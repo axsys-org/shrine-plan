@@ -38,6 +38,15 @@ run Python commands or maintain a browser-owned work queue.
 
 ### Compose in Nenex
 
+**Discover native operations and reflected definitions** captures a namespace
+subtree in an ordinary cell. The default scope contains published flow operations;
+compiler mirror subtrees expose their existing native type descriptors, source
+and decompiled laws. Declared flow inputs are shown with a selection control that
+retains the historical callable. Reflection alone does not grant a raw function
+effects or invent an input contract: those require a declared flow operation or
+Goo control. Inspection uses the existing capture size limits; inspect a narrower
+module subtree when a large compiler mirror exceeds them.
+
 Choose **Compose an operation or child flow**, name the selection, and supply a
 published operation or flow path. The callable's kind is explicit. Selection
 captures the exact native record in `<page>/cells/<selection>` and the form shows
@@ -60,6 +69,8 @@ Page tools show **Extract retained run** for retained previews and completed
 automatic runs beneath the page. Choose executed top-level steps and a new flow
 name. Extraction creates an editable Semidoc page, the original attempt's
 provenance cell, and captured example cells for dependencies outside the selection.
+Those cells populate the existing input defaults; the binding fields can select
+different evidence before invocation.
 The procedure retains original dependency order even if the selection is entered
 in another order. Publish it and bind new inputs through the ordinary controls.
 
@@ -72,43 +83,46 @@ inference of a procedure from arbitrary agent or user activity.
 
 ### Declared Goo actions in work
 
-`capture_action` prepares an existing typed `goo_runtime/request` against the
-current native object and declared view. It creates an ordinary frozen value cell
-with the request, an argument preview and object/view snapshots. The pure
-`request_actions` operation takes an `actions` tree of these records and requests
-native work; it never invokes actions while evaluating a cell.
+Use **Page tools → Flows → Inspect declared Goo actions** to inspect an object
+and its published view. Inspection retains their native records in an ordinary
+captured cell. The document shows the declared action labels, argument bindings,
+and input controls. Declared rich-text inputs use Goo’s existing encoder, so
+the form accepts ordinary prose. **Select action for a flow** prepares a captured action cell;
+bind its `/x/.../cells/<name>` value to the `actions` port of `request_actions`.
+Inspection and selection do not execute anything. A stale inspection is refused;
+inspect again deliberately to select changed behavior. Controls requiring Goo
+selection captures are shown but must use the existing Goo selection interface.
 
-The existing provider hand gives each worker an invocation identity and exposes
-`goo/request` plus `goo/fields` (JSON form fields for the existing `/goo/act`
-endpoint). A native client can submit the typed request through `helm/interact`;
-an agent or person can submit its fields to `/goo/act`. Completion requires the
-existing Goo journal's exact successful request/identity receipt and a current
-work guard. That completion resumes the same flow and resolves its hole. Goo's
-provider time remains bound at invocation; its receipt contract normalizes `now`.
-The argument preview does not freeze that clock. Exact receipt matching refers
-to the view path, control, explicit inputs and revision tokens. Invocation uses
-current declared behavior under Goo's existing guards; the captured preview is
-evidence, not an independently pinned action implementation.
+`request_actions` describes native work. Its provider hand emits a `writ/warp`
+for the published `execute_action` namespace operation. Shared admission consumes
+that emitted command after the current reaction cascade settles. It checks the
+current request, exact evidence capture, hole head, controller/claim, selected
+arguments, receiver, view publication and declared Goo bindings before admitting
+any effect. Paused, detached, superseded or stale work cannot execute through this
+hand. Refused preparations retain a failed outcome and unresolved hole; changed
+evidence or an explicit retry uses the existing request lifecycle.
 
-This does not automatically dispatch Goo actions from hands. The current hand
-protocol cannot call the supervisor's interaction boundary; no additional bridge
-or execution loop is installed. Rejected/stale requests leave work unresolved.
-Reprepare and rebind changed object/view evidence to select a fresh request;
-retrying alone does not refresh captured revisions. Distinct retries retain their
-own invocation identities. A receipt proves an action happened, not that its
-target remained unchanged afterward. The existing Goo receipt journal's capacity
-and retention limits still apply.
-The work guard controls receipt acceptance; Goo's object and publication guards
-control execution. Invalidating a work attempt does not revoke an already issued
-Goo request. A later invocation can still have an effect if Goo's own guards pass,
-even though the flow refuses its result.
+The effect and Goo invocation receipt are planned together through the existing
+Goo interpreter and namespace admission. The hand observes that exact receipt,
+retains an ordinary result cell, and lets the flow consume the outcome in its next
+step. An exact repeated invocation does not repeat the effect. All commands and
+reactions share admission's existing bounded transaction; failures discard its
+candidate namespace and index. There is no action foot, polling loop or external
+work queue. Reading a cell never invokes an action.
 
-The existing Goo publication guard versions the whole `/gov` subtree. Flow
-attachment changes claims there, so attach before capturing and binding an
-action; later publication changes require fresh preparation. Two actions that
-modify the same receiver also need separate preparation against the appropriate
-revision. These are native request/receipt operations, not browser capture
-controls or an autonomous sequence of freshly prepared GUI actions.
+The action's argument preview is captured; execution uses the current declared
+implementation under Goo's publication guards. Native action work supplies time
+zero, as before; it does not introduce an ambient clock. The receipt records
+acceptance, invocation identity and receiver path. It is not a claim that the
+receiver remained unchanged afterward. The existing receipt journal capacity
+still applies. An independently submitted Goo request has ordinary Goo authority;
+the work guard does not globally revoke copies submitted outside this hand.
+
+Goo's publication guard versions the `/gov` subtree. Attach the flow before
+preparing its actions if attachment changes publication claims. Reusing a
+receiver in another action requires preparation against its appropriate revision.
+The catalogue reflects compiled Goo declarations; it is not a general PLAN
+function browser or automatic preparation of an arbitrary GUI action sequence.
 
 ### Embed a published flow on another page
 
@@ -136,8 +150,18 @@ wake their existing hands; reading the embedded view does not dispatch work.
 Selection retains the definition's exact historical reference. Republishing the
 original flow does not change it. Existing **Attach maintenance** controllers keep
 their live-publication behavior; both modes retain each attempt's definition.
-To select a newer publication, create a new named occurrence. In-place adoption
-or reattachment of a detached controller is not implemented.
+To adopt a newer publication, select it into a new captured cell on the same
+page, then supply that cell to the occurrence's **Adopt selected publication**
+control. The command guards the previously selected definition and requires the
+same definition address and input names. Destination, input bindings, captured
+writer and provider stay with the existing controller. A changed input contract
+requires a new occurrence with explicit bindings.
+
+Adoption invalidates current resolution records and pending job references;
+native history, old attempts, captures and the old selection cell remain retained.
+The existing hand evaluates the adopted definition, and stale attempts cannot
+satisfy it. Paused occurrences stay paused. Adoption cannot reattach a detached
+controller; create a new named occurrence for that case.
 
 Removing the reference in source or Goo removes the presentation only. Named
 cells and work survive document edits and remain discoverable in Page tools.
@@ -275,8 +299,8 @@ including the optional pages payload in `flow/definition`, are unchanged.
 
 The implemented composition is ordered and acyclic. Publication checks names,
 bindings and port names and captures the chosen laws. General branching,
-inference from arbitrary exploratory traces and automatic Goo action dispatch
-from hands are not implemented here.
+and inference from arbitrary exploratory traces are not implemented here.
+Declared Goo actions run through shared hands and native admission.
 Limits are 16 inputs, 16 steps and 32 authored pages. Names are canonical symbols
 up to 64 characters. **Edit source** authors executable declarations; Nenex's Goo
 editor preserves those declarations when editing text or moving their blocks.

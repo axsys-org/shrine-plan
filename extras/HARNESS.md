@@ -122,10 +122,12 @@ as inputs. Arbitrary exploratory traces, ambient inherited bindings and independ
 scheduled child controllers remain outside this implementation.
 
 Declared Goo actions reuse the existing request interpreter and receipt journal.
-A flow requests native work and its hand observes an exact successful invocation
-receipt before accepting a result. Execution still enters through the existing
-Goo interaction boundary; no hand-side action interpreter or automatic dispatch
-loop is added. Source authoring and extraction belong to the Nenex flow adapter;
+A flow requests native work; its hand emits a native namespace command. Shared
+admission checks current work and evidence before planning the declared Goo
+action and its receipt together. The hand observes that receipt before accepting
+the result. Existing emitted moves carry these commands; no action foot, polling
+loop or second interpreter is added. Nenex reflects compiled controls into
+captured cells and exposes their bindings for deliberate selection. Source authoring and extraction belong to the Nenex flow adapter;
 the action work provider belongs to the shared harness.
 
 ## Validation and saved worlds
