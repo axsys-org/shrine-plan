@@ -543,7 +543,7 @@ function mcpSource(opts = {}) {
   let seq = 0, latest = null;   // latest: the newest event's `with`, keyed by world path; the one payload a read may answer from
   let frame = null;
   let watchedRoot = null, watchedCells = new Map();
-  const derived = /^(?:x|c|o|h)\//.test(views);
+  const derived = /^(?:r|x|c|o|h)\//.test(views);
   const beginFrame = () => { frame = new Map(); watchedRoot = null; watchedCells = new Map(); };
   const rootStamp = node => JSON.stringify(derived ? node : [node.reference_z, node.reference_y, node.reference, node.exists, node.properties]);
   const remember = (node, care) => {

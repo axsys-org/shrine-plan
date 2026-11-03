@@ -20,6 +20,27 @@ only a `known` tree becomes a known edge collection. A known empty tree is
 therefore different from unavailable evidence. `prose_edges` is a separate,
 opt-in bracketed-path parser. Text never silently becomes a native relationship.
 
+The native `/r/<width>/<target...>` reader supplies incoming edge metadata from
+the selected local store. It has no local care clock; freeze it with an epoch
+reference. Its `holder` and `slot` fields are paths, and its `target` is the
+complete asserted safe. Reading that set never reads holder contents. Missing
+retained index metadata remains unavailable, including through a frozen reader.
+
+`incoming_bindings scope incoming` deliberately turns a supplied reverse-lens
+result into live x-care holder bindings for an ordinary context lens. It selects
+only holder names beneath the explicit scope, deduplicates multiple edges from
+one holder, and length-delimits aliases so a parent and its child do not collide.
+This operation is pure; it does not subscribe, resolve references, or treat a
+frozen set as a frozen reading of holder contents. Selecting live bindings is an
+explicit policy choice. Capture the resulting context when retaining an attempt.
+An authored native hand can apply these bindings with `native_work_ops/lens`.
+When aliases disappear it emits an explicit native replacement for its owned
+context; ordinary hand out-values are patches and cannot remove omitted slots.
+That replacement retains the context's selected constructor and unrelated
+annotations; only the hand's owned evidence aliases are reconciled.
+The hand watches membership, while existing cell dependency expansion supplies
+content subscriptions to context consumers. No second watcher registry is used.
+
 `policy.foil` interprets explicit assertion records. Each record has a `subject`
 safe, a `property` path, a `value`, a `source` safe and a numeric `accepted` marker.
 The policy selects exactly marker `1`; other numbers are not accepted. `report`
@@ -85,6 +106,17 @@ edit resumes it while preserving the old attempt and report capture. This is a
 native lifecycle test, not a live Codex or browser demonstration. The separate
 publication fixture compiles the real Grove source, publishes a changed law,
 and checks retained versus explicitly updated bindings.
+The same fixture now selects its report inputs from a native reverse lens through
+the shared work context. A new incoming claim reopens the retained work; retargeting
+it removes its alias, and later edits to that released holder cannot retrigger the
+context or completed controller. The input scope excludes the flow's own work.
+Returning to an earlier supported report can reuse its retained result. The same
+publication settles the reopened hole, releases obsolete failed jobs and preserves the
+failed attempt. A later return to rejected evidence allocates a new head instead
+of reviving that old failure.
+Its controlled provider inspects the actual frozen assertion report. Matching a
+readiness phrase anywhere in the prompt would incorrectly accept a previous
+draft's prose as evidence for a newly conflicting set.
 
 ## Cost and selection proof
 

@@ -365,8 +365,8 @@ test('the work folder\'s page draws only the person\'s events; a QA write closin
   assert.match(el2.querySelector('.sv-earlier').innerHTML, /data-epoch="5"/, 'and the person\'s event stays in earlier');
 });
 
-test('an explicit overlay watches its native result, coalesces reads and skips unchanged renders', async () => {
-  const path = '/o/1/4/0x11/gov/example/lens/2/0x11/data';
+for (const path of ['/o/1/4/0x11/gov/example/lens/2/0x11/data', '/r/2/0x11/data']) {
+test(`derived view ${path} watches its native result, coalesces reads and skips unchanged renders`, async () => {
   const calls = [], shown = [], ticks = [];
   let value = 'old', release;
   const fetch = async (url, options) => {
@@ -380,6 +380,7 @@ test('an explicit overlay watches its native result, coalesces reads and skips u
   const following = source.follow(async msg => { source.beginFrame(); shown.push((await source.read(msg.shown.path, 'y')).record.value); });
   await following.ready;
   await ticks[0](); assert.deepEqual(shown, ['old']);
+  assert.equal(calls.at(-1).arguments.reads[0].care, 'y', 'derived views retain their displayed care');
   release = 'hold'; value = 'new';
   const first = ticks[0](); await ticks[0]();
   assert.equal(calls.length, 3, 'only one pending refresh read');
@@ -387,6 +388,7 @@ test('an explicit overlay watches its native result, coalesces reads and skips u
   assert.deepEqual(shown, ['old', 'new']);
   following.stop(); const count = calls.length; await ticks[0](); assert.equal(calls.length, count);
 });
+}
 
 test('a live cell refreshes when bound evidence changes without changing the cell definition case', async () => {
   let value = 2, draws = 0, fail = false;

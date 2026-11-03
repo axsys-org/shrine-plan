@@ -83,6 +83,14 @@ retained controller has not reacted yet. The Cells history projection reads
 retained requests independently; displaying completed attempts does not add them
 back to the hand's current jobs or subscriptions.
 
+A complete evaluation may reuse a matching retained resolution. Publication
+settles only owned demands actually fulfilled in its accepted trace, then
+withdraws their live subscriptions. The failed attempt remains failed and its
+captures remain intact. Completion removes obsolete failed job selections while
+retaining the allocation serial and accepted completed jobs. A later unresolved
+demand gets a fresh attempt head.
+An unrelated question or another controller's hole is not a completion.
+
 Nenex's page/block question interface uses the shared answering policy directly;
 it does not need to manufacture a flow. Cooperate investigations use the same
 captures and provider protocol without requiring a document editor. A document
@@ -146,14 +154,35 @@ the original world and x/y/z history remain retained. `reindex_references`
 rebuilds metadata on an already compatible store without replacing its journal,
 assertions or case ledgers; it is not a type conversion or a running-world upgrade.
 
-MCP's current incoming-reference query uses that index. There is no reserved
-`/r` namespace, kernel demand evaluator, implicit prose relationship, or new
-kernel read budget. Optional graph policy remains ordinary published Foil/Grove
+MCP's incoming-reference query and `/r/<width>/<target...>` use the same native
+index reader. The reverse lens is read-only and has no local x/y/z case counter.
+It enumerates the selected local store's incoming edges to the target subtree;
+it does not discover every external authority's references. Each edge carries
+its holder path, slot path and exact asserted target safe. Those holder names
+are data, not dereferenced source contents. Epoch pins select the whole incoming
+set through the existing frozen reader, including its availability limits.
+Membership notifications use the existing native signs and lens/crew machinery;
+they create no record, journal assertion or clock for `/r`.
+There is no kernel demand evaluator, implicit prose relationship, or new kernel
+read budget. Optional graph policy remains ordinary published Foil/Grove
 over explicitly supplied evidence. It currently has narrower capabilities than
 main's connected-world graph policy. Explorer can save workspace bindings without
 that optional policy; it reports the missing definition instead of claiming an
 empty connection graph. Backlinks use the current world's native query, with no
 separate links service or in-memory mirror.
+
+A hand can select holder names from a reverse lens and rebind an ordinary
+`native_work_ops/lens`. Existing cell dependency expansion then watches the
+selected contents. Membership and contents are separate dependencies: an edited
+source with unchanged references does not change the incoming set. The graph
+library's pure `incoming_bindings` helper bounds selection to an explicit holder
+scope, deduplicates holders and creates nonoverlapping live aliases. Removing an
+alias releases that live content dependency; retained captures and attempts stay.
+Hand out-values retain their native patch semantics. A selection hand removes
+owned aliases with the existing explicit replacement card; omission from a patch
+does not delete a slot. It need not change dispatch or invent a removal protocol.
+The authored graph-review regression composes these existing pieces and tests
+new membership, content edits, release, persistent holes and guarded publication.
 
 Opening a workspace only reads its view. Explicit binding edits retain its
 selected constructor, use native compare-and-set, and refuse to replace unrelated

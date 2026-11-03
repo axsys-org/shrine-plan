@@ -1,84 +1,111 @@
-# Cartography: connect real things by judging, never by guessing
+# Cartography: authored research around a thing
 
-The world holds records from independent registries (`/user/registries/...`: USAspending, SAM, EPA ECHO, SEC
-EDGAR, GLEIF, USPTO, ImportYeti, EIA, NIST MEP) and texts the web hand fetched, each with its own identifiers,
-none joined. The kernel draws what connects. Your job is to look, digest, judge, and write back; the picture
-recomposes on the next read. This loop is the same for an industrial atlas, supplier discovery, a corporate
-x-ray, grid intelligence, failure investigation or an invention genealogy: only the standings and the questions
-change. One view is the way of looking: a thing as a world. It is the same picture for you and for the person.
+Cartography is a method for gathering evidence around selected subjects, making
+supported assertions, exposing disagreements and leaving a reusable view. Its
+procedure belongs in authored flows; its working state belongs in the shared
+native work records. A Nenex document can contain the question, flow occurrence,
+evidence cells, proposed assertions, outstanding holes and resulting explanation.
 
-Your whole vocabulary is two writes. A note with references: what you found, in the source's words, every thing
-it names written as its path in brackets. A view: what you want pulled out of what is there, by formula, at a
-name. Everything else is reading: stand on something, read it as a world, see where it is thin. You never edit
-anything shared, so you need no coordination with anyone: you add a note at a source's place or a view at a name,
-and the overlay folds it in for everyone on the next read. The moment two notes reference the same name, the work
-behind them is connected, whether or not either writer knew of the other.
+The current native graph-review regression establishes part of this pattern:
+a Semidoc-authored procedure consumes selected claims, suspends on conflicting
+evidence, resumes through the existing maintenance hand and publishes through
+the guarded Nenex writer. Its context selects incoming holders through `/r`.
+This is a controlled-provider regression, not a complete installed research flow.
+Search, domain extraction and registry adapters still need explicit operations.
+The standalone Python research scripts are not the shared harness's providers.
 
-## The loop
+## The reusable pieces
 
-1. **Stand.** A session stands at a path, reads it as a world and writes there, notes and views, nothing else. Read
-   the thing at `/x` (its own slots), then its world:
-   `read /o/<case>/4/<node>/weft/graph/overlay/<n>/<path>` at care z, or the page at `/live?at=<path>`. Beneath
-   `/0/<path>`: folders are slot names, forward (`out/<n>/<slot>`, what the thing asserts) and backward
-   (`in/<n>/<name>`, what references it, under the name of whatever holds the reference: a slot as its author
-   spelled it, or a cell by its own name; a text that names the thing is a line with its sentence). Each item names its world, the world asserting the hop
-   (`by`) and the holder (`via`); the holder's other slots are the note on the line. A hop whose key sits in brackets
-   in the holder's text is a name, not an assertion: that is the pointer to what to digest or judge next. Folders
-   beyond the subject arrive closed, as counts; read the thing there as a world to open them.
-2. **Choose standings.** For a question over several things, write a cell (`sys/weft` →
-   `/h/x/<case>/4/<node>/weft/graph/overlay`, `sys/tack` → the first standing, `standing/<k>` → the others, `depth`
-   1 to 6) and read `/x/<cell>` at z: `standings`, `components`, `islands`, then one virtual root `/<n>` per
-   connected component with its standings unfolded beneath. Standings meet over any reference; a standing reached
-   inside another's unfolding is listed there as seen. An island (a root of one) is the next thing to connect: a
-   bracketed name reaching into it is a judgement waiting; none means a fetch.
-3. **Digest.** Before reading a new source, stand on its landing place (`/user/web/pages/<host>`, `/user/registries/<source>`)
-   as a world: the names its siblings already placed, the crossings they made into other buckets, and the cells
-   left there are what to try first; none of it is a conclusion, all of it is where to look. The texts still to
-   digest are the ones whose `← source` folder is empty, read from any landing place, so no queue hand is needed. Then
-   the text: it is prose until its sentences land. Write each thing it names into the prose as its path in brackets,
-   `[/0x11/user/orgs/verisk]`; that is a reference, the index sees it, the overlay follows it. Then each sentence
-   that pins something as a record beneath the thing it is about: the slot it pins, the sentence in the text's
-   words with its brackets, `source` → the text. A value that disagrees with another source is a second record under the
-   same folder, never an overwrite. No record of any other kind, no topic: the shared name is the relation. The rules are in `hands/DIGESTION.md`.
-4. **Judge.** A registry record's `candidates`, or a bracketed name reaching into an island, says what might be
-   the same thing. Open
-   both records and compare what the registries *state*: street and zip, NAICS and SIC, CAGE, legal name, parent,
-   state of incorporation. Two records are the same thing when their stated identifiers agree beyond a shared name;
-   a name alone is never enough. Write the judgement beneath the thing, in the one shape every assertion has:
+| Child procedure | Inputs and result | Implementation boundary |
+| --- | --- | --- |
+| Acquire evidence | Selected URLs or registry queries → captured responses with provenance | Existing native HTTP provider supports explicit URL fetches. Search, authenticated registry requests and source-specific transports need narrow adapters. |
+| Structure a source | A capture and its declared format → addressable regions or cohesive typed rows | Reuse the Markdown/Semidoc parser. Port headings, row and numbered-pleading decomposition as pure selected operations. |
+| Propose assertions | Captured regions and the requested shape → cited candidate assertions | Use shaped native requests, the existing provider, retained attempts and holes. Deterministic validation must check the returned shape, references and quotations. |
+| Judge identity | Source-qualified identifiers and candidates → supported identity judgments or unresolved questions | A selected domain policy makes the judgment. A shared name alone is insufficient. Existing explicit group projections can consume the accepted members. |
+| Project a neighborhood | Subjects, incoming membership and selected assertion contents → connected evidence, conflicts and gaps | `/r` supplies edge metadata; ordinary cells and published Foil/Grove laws select and interpret it. |
+| Publish an explanation | Validated evidence and completed judgments → maintained concept documents | Reuse the guarded document writer. Publishing domain assertion records needs an explicitly selected writer for that owned destination. |
 
-       /user/registries/usaspending/recipients/<uei>/same/<slug>   {same -> the other record, note: <the sentence of evidence>, source -> what shows it}
+These are procedure boundaries, not names of already installed child flows.
+Author each child in Semidoc once its selected operations exist, then compose it
+with `/flow/invoke` and explicit `/flow/bind` relationships. Publication captures
+the selected child definitions. Existing attempts retain those definitions when
+a later procedure is published.
 
-   The note is what the overlay shows on the hop (older judgements say `why`; both are read). Keep it concrete:
-   "1400 73rd Ave NE 55432 on both; NAICS 335312 on both; CAGE 44940 at that address".
-5. **Read again.** The judged record's folders now hang under the standing (a facility's permits and inspections,
-   an importer's suppliers, a patent's inventors); the components merge; the islands fall. That change is the proof
-   of the judgement.
-6. **Fetch where nothing reaches.** An island with no hop into it is a gap no registry bridges. Ask the web hand
-   (`/agent/<a>/asks/<id> {asked, scope, shape}`) or the registries hand for the missing record; what comes back
-   lands as a record with a source, and the loop continues from step 1.
-7. **Leave a view when the question recurs.** A perspective worth reusing is a cell under `/user/views/<name>`:
-   the overlay over these standings, a union over a company's identities, a grouping you wanted. It appears on
-   every thing it reads as a backward folder of its own name, holding what it computes; the next agent finds it
-   there and reads it instead of rebuilding. The kernel ships no vocabulary for groupings: the names on the page
-   are the ones you and the person chose.
+## Bind the thing and its evidence
 
-## Writing rules
+1. Select the subject and the collection whose holders may supply evidence.
+   Keep that collection separate from the flow's own generated work and notes.
+2. Bind `/r/<width>/<target...>` as incoming membership. It reports edges from
+   the selected local store to that target subtree; it does not discover every
+   external world's references. An edge contains a holder path, a slot path and
+   the complete asserted target reference. No holder content is read by this query.
+3. Apply `graph_references/incoming_bindings` to the supplied set and the selected
+   holder scope. Multiple references from one holder produce one stable alias.
+   A parent holder and its child have separate, nonoverlapping aliases.
+4. An authored native hand uses those aliases to rebind an ordinary
+   `native_work_ops/lens`. Its crew watches membership. Existing cell dependency
+   expansion supplies the selected content dependencies to consumers of the lens.
+   Removing owned aliases uses an explicit native replacement; omitted fields in
+   a hand's patch output are not deletions.
+5. A new incoming assertion changes membership. Editing an already selected
+   source changes content. Retargeting or removing a holder releases its alias;
+   further edits there cannot feed back into the old context. Captures remain.
 
-- Never write a `same` without its note. Never promote a mention or a candidate by copying its target into a slot.
-- Never invent a relation the sources don't state; "supplies", "operates", "owns" come from a record that says so
-  (a shipment, a permit, a filing, a sentence), cited by `source`.
-- A disagreement between sources is a record too: two `same` judgements with different notes, or two value records
-  under one folder, never a silent choice.
-- Path segments: lowercase letters, digits and underscore, starting with a letter; the registry's identifier stays
-  in a slot.
+Freeze incoming membership with an epoch reference, not a borrowed local case.
+The reverse lens has no local x/y/z clock. Its retained index metadata is bounded;
+an unavailable historical set is not evidence of no connections. A frozen set of
+holder names also is not a frozen reading of their contents: retain an actual
+context capture when beginning an attempt.
 
-## What each case changes
+## Digest without losing the source
 
-| case | standings | what to judge | the view to leave |
-|---|---|---|---|
-| industrial atlas | a manufacturer (recipient or LEI) | its facilities, registrations, importer, patents | the manufacturer as a world |
-| supplier discovery | an MEP opportunity + candidate makers | NAICS/PSC in SAM against the item; facility and awards as capability evidence | overlay: opportunity + candidates |
-| corporate x-ray | a CIK | GLEIF children and parents, recipients sharing its UEI tree, EDGAR Exhibit 21 names | union over its identities |
-| grid intelligence | an EIA plant | its operator against SAM/GLEIF entities; ECHO facility at its address | the plant as a world |
-| failure investigation | an NHTSA campaign | manufacturer against registry entities; component against patents | overlay: campaign + maker + patents |
-| invention genealogy | a patent | assignee against entities; inventors against authors | walk from the patent |
+Keep the original capture and its identity. Decompose its structure, then place
+candidate assertions beside it with the quotation and source reference that
+support each one. A source's domain identifiers stay attached to its data; field
+names and path spelling alone do not establish identity.
+
+The existing graph assertion policy consumes `subject`, `property`, `value`,
+`source` and an explicit accepted marker. Related source fields can stay together
+in a typed value. Addressable assertions are useful where evidence, independent
+judgment or lifetime requires them; importing a table does not require turning
+every field into a child record.
+
+Unassigned prose can appear as a derived residue view. Accepted interpretations
+and placed sentences do not require destructively shortening the original text.
+Bracketed names are annotations until an explicitly selected parser or judgment
+produces relationships; ordinary prose is not silently indexed as a native link.
+
+Conflicting claims remain separate records with their own sources and qualifiers.
+The existing report marks disagreements without choosing a winner. An identity
+judgment can select an explicit group for one projection while retaining every
+original subject and source. A slot called `same` does not itself collapse names.
+
+## Let the shared hand maintain the investigation
+
+A provider result is proposed evidence. Domain validation checks its shape and
+captured guard before it can satisfy a demand or authorize publication. Missing
+evidence leaves a shaped hole attached to its subject. New bound evidence can
+reopen that hole and resume work; an old response cannot satisfy a changed guard.
+Failures and superseded attempts remain inspectable. Unchanged evidence does not
+cause an unbounded retry loop; use the existing explicit retry operation.
+
+The investigation can select another source or request a declared fetch when a
+gap warrants it. Discovery and stopping conditions belong to the authored domain
+procedure. A reference alone does not authorize a network request. No second
+Python queue, stream follower, cursor database or polling scheduler is needed to
+own the work. I/O adapters only execute the requests admitted by native hands.
+
+## Domain variations
+
+| Task | Evidence to acquire | Judgment to retain |
+| --- | --- | --- |
+| Industrial atlas | Manufacturer, facility and regulatory records | Which identifiers support the proposed facility/company relationship |
+| Supplier discovery | Opportunity requirements, registrations and capability evidence | Which stated capabilities satisfy the requirements and which remain unknown |
+| Corporate ownership | Filings, legal identifiers and parent relationships | Ownership, control and proposed identity matches with their specific evidence |
+| Grid intelligence | Plant, operator and regulatory records | Which records actually identify the same operator or facility |
+| Failure investigation | Recall, component, manufacturer and patent sources | Supported relationships and unresolved links, with contradictory evidence intact |
+| Invention genealogy | Patents, assignees, inventors and cited filings | Identity and succession judgments grounded in source identifiers |
+
+The reusable result is both the explanation and the authored way of reaching it.
+Another document can select the same published procedure with different subjects,
+source formats and bindings, while retaining its own work, holes and captures.
