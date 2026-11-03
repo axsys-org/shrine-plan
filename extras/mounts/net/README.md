@@ -19,6 +19,36 @@ segment the publisher chose. The acquired revision is source-attributed, not ver
 remote epoch and case are recorded, and until Mesa and Groundwire the signature is the
 sidecar's to check.
 
+## Publications (phase 1)
+
+What a world exposes is a record under its own root, written by the owner or an agent on the
+owner's behalf, never by the sidecar:
+
+```
+/<self>/net/publications/<name>   one name this world exposes; <name> is one lowercase segment
+   path    required, text         the local path whose revisions are exposed, e.g. /0x11/pub/aluminum
+   to      required, text         "public", or the node id of one peer such as 0x12
+   slots   optional, text         the slot names to expose, space-separated; absent means every slot
+   note    optional, text
+```
+
+The sidecar lists `/<self>/net/publications` (care `y`), reads each child, and watches the record
+at `path`: every new case is bound under the Mesa name `<name>@<case>` and announced to the peers
+`to` names (every configured peer for `public`). Nothing not listed here is ever bound. Visibility
+at this libmesa commit is traffic policy, not authentication: every bind is `Access::Public`, and
+`to` decides only who is told.
+
+The role's contract is judged on every update: a poke or remake that leaves a publication without
+`path` or `to`, or with either not text, is refused (`curb_need`, `curb_type`). The first write of a
+record under the tree is not judged: the tree stamps the contract onto the record in that same write,
+and the kernel treats a new contract as adopted over the record it arrives with (`guard_diffs` in
+`lain_poke.foil`). The sidecar therefore skips a publication that lacks `path` or `to` and says so in
+its log; the next complete poke makes it a publication.
+
+On the acquiring side `/net/names/<publisher>/<name>/current` is written once per acquired
+revision: a sidecar that restarts, or a notice delivered twice, compares `remote_case` with what
+the world already holds and writes nothing for a revision already acquired.
+
 ## Reading the overlay
 
 Over MCP, with the node spelled: `mcp/read path=/x/<self>/net/stale care=y`. Each child is
