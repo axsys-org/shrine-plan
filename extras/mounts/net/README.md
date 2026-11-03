@@ -42,3 +42,23 @@ python3 x/eden --node 0x12 --mount net --mount mcp --mount probe --port 8302 --w
 ```
 
 `mount.json` depends on `codecs` for the Grove `text` type.
+
+## Phase 0, measured (2026-11-02)
+
+`demo/phase0.py` boots two worlds from this checkout (A `0x11` with `mcp probe`, B `0x12` with
+`net mcp probe`), starts the shrine-mesa publisher beside A and the reader beside B
+(`/Users/ianchanner/shrine-mesa`, commit 462745f, libmesa 2e94a13), and asserts the loop:
+
+| what | measured |
+|---|---|
+| A's revision acquired in B (flow notice, signed named read, world write) | 0.16 s (revision 1), 0.11 s (revision 2) |
+| `/x/0x12/net/stale` listing the name after A's next revision | 0.14 s after the write in A |
+| `kill -9` of B's runtime, restart, overlay unchanged | 2.6 s |
+| re-judging at the new case | the overlay empties |
+| runtime footprint after the run | A 69 MB, B 197 MB |
+
+What is real: the acquisition is a publisher-signed Mesa read verified by the reader's engine, the
+notice a durable flow with receipts, the overlay a kernel lens over records, persistence the
+world's own. What is not yet: the bind is `Access::Public` (libmesa's signed-public profile refuses
+any other access at this commit), there is no requester authentication or encryption, the sockets
+are loopback, and the publisher keys are local seed files.
