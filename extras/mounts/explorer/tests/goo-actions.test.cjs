@@ -325,3 +325,49 @@ test('prepared children validate the entire snapshot before seeding the existing
   const page=make();page.members.push({key:'/branch',status:'unavailable',hasChildren:true});
   assert.equal((await actions.prepareChildren(page,['/content'],requested)).size,1,'structural branches need no fabricated view');
 });
+
+test('declared input ownership isolates sibling drafts while sharing inherited inputs',async()=>{
+  const bodies=[],gate=defer();
+  const {actions}=setup((_url,options)=>{bodies.push(new URLSearchParams(options.body));return gate.promise;});
+  const shared=new Control('shared'),outer=new Control('outer'),first=new Control('first'),second=new Control('second');
+  shared.value='common';outer.value='outer draft';first.value='first source';second.value='second source';
+  const a=new Control('save-a'),b=new Control('save-b'),nodes=[shared,outer,first,second,a,b],drafts=new Map();
+  const controls=[
+    {id:'shared',kind:'input',control:'0.0',slot:'/shared',inputBinding:'0:/shared'},
+    {id:'outer',kind:'input',control:'0.1',slot:'/source',inputBinding:'0:/source'},
+    {id:'first',kind:'input',control:'0.2.0',slot:'/source',inputBinding:'0.2:/source'},
+    {id:'second',kind:'input',control:'0.3.0',slot:'/source',inputBinding:'0.3:/source'},
+    {id:'save-a',kind:'action',control:'0.2.1',inputBindings:['0:/shared','0.2:/source']},
+    {id:'save-b',kind:'action',control:'0.3.1',inputBindings:['0:/shared','0.3:/source']}];
+  const container={querySelectorAll:selector=>selector==='[data-node]'?nodes:selector==='[data-input-slot]'?[shared,outer,first,second]:[]};
+  const context={target:'/item',view:'/editor',snapshot,controls,report(){},capture:()=>[],
+    input:(key,input)=>drafts.set(key,{input,dirty:true}),
+    saved:(_result,saved)=>{for(const [key,value] of saved){const draft=drafts.get(key);if(draft.input.value===value)draft.dirty=false;}}};
+  actions.bind(container,context);
+  assert.equal(drafts.size,4,'same argument slots retain distinct authored-control identities');
+  second.gooComposing=true;second.gooEditor={pending:true};
+  const saved=a.fire('click');
+  assert.equal(bodies.length,1,'an unrelated editing group cannot block this action');
+  assert.deepEqual(bodies[0].getAll('input:/source'),['first source']);
+  assert.equal(bodies[0].get('input:/shared'),'common');
+  first.value='newer first draft';gate.resolve(response({ok:true}));await saved;
+  assert.equal(drafts.get('0.0').dirty,false,'only the captured shared value was saved');
+  assert.equal(drafts.get('0.2.0').dirty,true,'a later edit is retained');
+  assert.equal(drafts.get('0.3.0').dirty,true,'the unsubmitted sibling draft is retained');
+  assert.equal(drafts.get('0.1').dirty,true,'the shadowed ancestor draft is retained');
+  second.gooComposing=false;second.gooEditor.pending=false;
+  await b.fire('click');
+  assert.deepEqual(bodies[1].getAll('input:/source'),['second source']);
+  assert.equal(drafts.get('0.3.0').dirty,false);
+  assert.equal(drafts.get('0.2.0').dirty,true);
+});
+
+test('declared no-input controls do not capture unrelated drafts',async()=>{
+  const {actions,calls}=setup(()=>response({ok:true}));
+  const fixture=bindingFixture(actions),control={...fixture.context.controls[0],inputBindings:[]};
+  fixture.input.gooComposing=true;
+  const capture=actions.captureActivation(fixture.container,fixture.context,control);
+  const result=await actions.activateCaptured(capture);
+  assert.equal(calls[0].options.body.has('input:/req'),false);
+  assert.equal(result.savedInputs.size,0);
+});

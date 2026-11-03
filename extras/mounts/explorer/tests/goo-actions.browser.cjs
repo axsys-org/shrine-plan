@@ -7,10 +7,10 @@ async function exerciseActionsMount(page) {
     const data=(id,value)=>({view:'/edit',kind:'view',slot:'/content',role:'/record',context,
       profile:{id:'mash-goo',version:1,revision:'browser-mount-fixture'},
       html:`<fieldset class="goo-preview"><input data-node="${id}" value="${value}" aria-label="Draft"><button data-node="save">Save</button></fieldset>`,
-      controls:[{id,kind:'input',slot:'/draft'}],display:{nodes:[]}});
+      controls:[{id,kind:'input',control:'0.0',slot:'/draft'}],display:{nodes:[]}});
     const oldData=data('input-1','original server text');
     let localInputEvents=0, reboundInputEvents=0, actionEvents=0;
-    const bind=()=>GooActions.bind(container,{controls:[{id:container.querySelector('input').dataset.node,kind:'input',slot:'/draft'}],
+    const bind=()=>GooActions.bind(container,{controls:[{id:container.querySelector('input').dataset.node,kind:'input',control:'0.0',slot:'/draft'}],
       input:(_slot,input,signal)=>input.addEventListener('input',()=>reboundInputEvents++,{signal})});
     GooActions.mount(container,oldData);bind();
     const retained=container.querySelector('input');
@@ -32,7 +32,20 @@ async function exerciseActionsMount(page) {
     localInputEvents:0,reboundInputEvents:0,actionEvents:0,context:{width:520,textScale:1.25,direction:'rtl'},display:true});
   assert.deepEqual(result.listeners,{localInputEvents:1,reboundInputEvents:1});
   assert.deepEqual(result.replacement,{replaced:true,oldDetached:true,value:'fresh lifetime'});
-  return {cases:3};
+  const siblings=await page.evaluate(()=>{
+    const container=document.createElement('section');document.body.append(container);
+    const data=(prefix,reverse=false)=>({view:'/author',kind:'view',slot:'/authoring',context:{width:520,textScale:1,direction:'ltr'},
+      html:(reverse?['b','a']:['a','b']).map(name=>`<input data-node="${prefix}-${name}" value="server ${name}">`).join(''),
+      controls:['a','b'].map((name,index)=>({id:`${prefix}-${name}`,kind:'input',control:`0.${index}.0`,slot:'/source',inputBinding:`0.${index}:/source`})),display:{nodes:[]}});
+    GooActions.mount(container,data('old'));
+    const [a,b]=container.querySelectorAll('input');a.value='draft A';b.value='draft B';
+    GooActions.mount(container,data('new',true),true);
+    const [first,second]=container.querySelectorAll('input');
+    const result={first:first===b,second:second===a,values:[first.value,second.value],keys:[first.dataset.gooInputKey,second.dataset.gooInputKey]};
+    container.remove();return result;
+  });
+  assert.deepEqual(siblings,{first:true,second:true,values:['draft B','draft A'],keys:['0.1.0','0.0.0']});
+  return {cases:4};
 }
 
 module.exports={exerciseActionsMount};

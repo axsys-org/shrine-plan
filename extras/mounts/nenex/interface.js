@@ -12,11 +12,21 @@
   const original = textarea?.value;
   let submitting = false;
   const dirty = () => textarea && textarea.value !== original;
+  const gooDraft = () => [...shell.querySelectorAll('iframe[data-goo-presentation-frame]')].some(frame => {
+    try {
+      const work = frame.contentWindow?.GooActions?.workState?.();
+      return work?.dirty || work?.composing;
+    } catch { return false; }
+  });
   const update = () => { if (status) status.textContent = dirty() ? 'Unsaved changes' : 'No unsaved changes'; };
   textarea?.addEventListener('input', update);
   editor?.addEventListener('submit', async event => {
     event.preventDefault();
     if (submitting) return;
+    if (gooDraft()) {
+      status.textContent = 'Save or discard your action inputs before leaving this page.';
+      return;
+    }
     submitting = true;
     status.textContent = 'Saving page...';
     const button = editor.querySelector('[type=submit]');
@@ -46,8 +56,8 @@
     if (!form) return;
     event.preventDefault();
     if (form.dataset.submitting) return;
-    if (dirty()) {
-      form.querySelector('[data-flow-status]').textContent = 'Save or discard your source changes first.';
+    if (dirty() || gooDraft()) {
+      form.querySelector('[data-flow-status]').textContent = 'Save or discard your source and action inputs first.';
       return;
     }
     form.dataset.submitting = 'true';
@@ -79,7 +89,7 @@
     }
   });
   addEventListener('beforeunload', event => {
-    if (dirty() && !submitting) { event.preventDefault(); event.returnValue = ''; }
+    if ((dirty() || gooDraft()) && !submitting) { event.preventDefault(); event.returnValue = ''; }
   });
   const reveal = () => {
     const target = document.getElementById(location.hash.slice(1));
@@ -94,7 +104,7 @@
       if (frame.isConnected) continue;
       disconnect(); publicationFrames.delete(frame);
     }
-    for (const frame of shell.querySelectorAll('iframe[data-nenex-publication]')) {
+    for (const frame of shell.querySelectorAll('iframe[data-nenex-publication], iframe[data-nenex-action]')) {
       if (publicationFrames.has(frame)) continue;
       let stop;
       const connect = () => {
@@ -105,10 +115,10 @@
           // Refresh presentation after Goo has settled its saved inputs.
           requestAnimationFrame(() => {
             if (!frame.isConnected) { publicationRefreshPending = false; return; }
-            if (dirty()) {
+            if (dirty() || gooDraft()) {
               publicationRefreshPending = false;
-              frame.parentElement.querySelector('[data-publication-status]').textContent =
-                'Saved source published. Your unsaved source is retained; save or discard it before refreshing the flow controls.';
+              frame.parentElement.querySelector('[data-publication-status], [data-action-status]').textContent =
+                'Action completed. Your unsaved source or action inputs are retained; save or discard them before refreshing the controls.';
               return;
             }
             location.reload();

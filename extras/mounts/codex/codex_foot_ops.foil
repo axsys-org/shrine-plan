@@ -1,4 +1,5 @@
 - codex_ops
+- show [at=display]
 
 - codex_foot
 
@@ -61,6 +62,61 @@
     ^ nat
     ? dead 0
     | codex_foot_ops/send fd messages
+  + tool_request
+    \ record=myth
+    ^ bool
+    | and (eq record.txt_at(codex_slots/kind) "request-effect")
+        (and (eq record.txt_at(codex_slots/method) "item/tool/call")
+          !(record.has(codex_slots/reply_result) || record.has(codex_slots/reply_error)
+            || record.nat_at(codex_slots/resolved 0) || record.nat_at(codex_slots/unresolved 0)))
+  + tool_record
+    ' The mounted driver may give incoming tool requests an ordinary native
+    ' hand. Failed or already answered requests never acquire that hand.
+    \ record=myth binding=axal[saga]
+    ^ myth
+    ? !(codex_foot_ops/tool_request record) record
+    ?> (./some root) binding.fil record
+    ?> (./some handler) (unpin root.myth).path_at(['codex 'tool_handler]) record
+    | record.put(limb_slot (kook [handler]))
+  + refused_tool
+    ' Admission rolled back the incoming request and all reactions. Preserve
+    ' that request with a terminal tool reply; the normal transport sends it
+    ' only after this replacement record is admitted. Do not replay the hand.
+    \ cause=pail write=codex/write binding=axal[saga]
+    ^ maybe[codex/write]
+    ? !(codex_foot_ops/tool_request write.record) .none
+    ?> (./some root) binding.fil .none
+    ?> (./some handler) (unpin root.myth).path_at(['codex 'tool_handler]) .none
+    = reason (str/cat_all ["Native admission rejected the tool request: " (str/from_atom (display/show/pail cause))])
+      response (codex_ops/object [(jkv "success" (json/boo .false))
+        (jkv "contentItems" (json/arr [(codex_ops/object
+          [(jkv "type" (json/str "inputText")) (jkv "text" (json/str reason))])]))])
+      record write.record.put(limb_slot (kook [])).put(crew_slot (cpail (mop/empty)))
+      record record.put(codex_slots/reply_result (pails/t (show response)))
+    | ./some (codex/write write.key record)
+  + refused_turn
+    ' A tool can arrive before turn/start's reply. Its hand then wakes when
+    ' that command result is admitted. If those reactions fail, retain failure
+    ' replies for this turn's already pending tools before retrying the result.
+    ' Once answered, these same effect records cannot authorize another retry.
+    \ cause=pail write=codex/write p=codex_foot/pending
+    ^ row[codex/write]
+    ? !(and (write.record.nat_at(codex_slots/done 0)) (write.record.nat_at(codex_slots/ok 0))) []
+    ?> (./some command) p.binding.get([write.key]) []
+    ? !(eq (unpin command.myth).txt_at(codex_slots/kind) "start") []
+    ?> (./ok result rest) (codex_json/decode write.record.txt_at(codex_slots/result)) []
+    = thread (codex_ops/text (codex_ops/get "threadId" result))
+      turn (codex_ops/text (codex_ops/get "id" (codex_ops/get "turn" result)))
+    ? !(and thread.len turn.len) []
+    ?> (./some root) p.binding.fil []
+    ?> (./some handler) (unpin root.myth).path_at(['codex 'tool_handler]) []
+    | p.batch.state.effects.bind
+      \ effect=codex/effect
+      ? !(codex_ops/turn_effect thread turn effect) []
+      ?> (./some retained) p.binding.get([effect.key]) []
+      ? !(equal[pail] (unpin retained.myth).pail_at(limb_slot) (kook [handler])) []
+      ?> (./some reply) (codex_foot_ops/refused_tool cause (codex/write effect.key (unpin retained.myth)) p.binding) []
+      | [reply]
   + flush
     '  Only one unacknowledged namespace write, so ack correlation is exact.
     \ parent=nat p=codex_foot/pending
@@ -68,10 +124,11 @@
     ? p.waiting p
     ? (eq p.batch.writes.len 0) p
     = write p.batch.writes.at(0)
+      record (codex_foot_ops/tool_record write.record p.binding)
       operation=writ
         ? p.binding.get([write.key])
-         > .none (writ/make write.record)
-         > (./some _) (writ/poke write.record)
+         > .none (writ/make record)
+         > (./some _) (writ/poke record)
     ; (Send parent (feet/gift/pass [write.key] operation))
     | p.set_waiting(.true)
   + acknowledge
@@ -82,6 +139,14 @@
      > .none
       | p.set_waiting(.false).set_batch(p.batch.set_writes(p.batch.writes.drop(1)))
      > (./some cause)
+      ? p.batch.writes.len
+        ? (codex_foot_ops/refused_tool cause p.batch.writes.at(0) p.binding)
+         > (./some replacement)
+          | p.set_waiting(.false).set_batch(p.batch.set_writes(p.batch.writes.drop(1).cons(replacement)))
+        = replies (codex_foot_ops/refused_turn cause p.batch.writes.at(0) p)
+        ? replies.len
+          | p.set_waiting(.false).set_batch(p.batch.set_writes(replies.weld(p.batch.writes)))
+        | p.set_waiting(.false).set_batch((codex_ops/fail "namespace write rejected" p.batch.set_writes([])))
       | p.set_waiting(.false).set_batch((codex_ops/fail "namespace write rejected" p.batch.set_writes([])))
   + start_wire
     \ fd=nat token=str ignored=nat

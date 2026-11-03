@@ -30,19 +30,19 @@ async function setup({lostReply=false,failedRefresh=false,normalize=value=>value
     mount(element,_data,preserve){
       if(!preserve||!element.input){
         const input=new Element(),area=new Element();area.focus=()=>{};
-        input.dataset.inputSlot='/text';input.value=saved;
+        input.dataset.inputSlot='/text';input.dataset.gooInputKey='0.1';input.value=saved;
         input.gooEditor={area,selection:()=>({a:2,b:2}),restore:()=>{}};
         element.input=input;
       }
       element.input.setAttribute('value',saved);return element;
     },
-    bind(element,context){contexts.set(context.target,context);context.input('/text',element.input,new AbortController().signal);},
+    bind(element,context){contexts.set(context.target,context);context.input('0.1',element.input,new AbortController().signal);},
     captureActivation(element,_context,control){const capture={value:element.input.value,command:control.editCommand};captures.push(capture);return capture;},
     async activateCaptured(capture,args){
       calls.push({capture,args:JSON.stringify(args)});
       if(!capture.accepted){capture.accepted=true;saved=normalize(capture.value);writes++;manifest.epoch=String(writes+1);}
       if(lostReply){lostReply=false;throw Object.assign(Error('Outcome unknown'),{code:'outcome-unknown'});}
-      return {savedInputs:new Map([['/text',capture.value]])};
+      return {savedInputs:new Map([['0.1',capture.value]])};
     }
   };
   const sandbox={GooActions:api,AbortController,setTimeout,console,

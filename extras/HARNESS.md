@@ -184,11 +184,27 @@ the result. Existing emitted moves carry these commands; no action foot, polling
 loop or second interpreter is added. Nenex reflects compiled controls into
 captured cells and exposes their bindings for deliberate selection. Source authoring and extraction belong to the Nenex flow adapter;
 the action work provider belongs to the shared harness.
-The flow publication control is declared in `flows/authoring.grove` and embedded
-through the existing Goo presentation host. Browser and reflected invocation use
-the same declared inputs, native publish operation and admission guards. The other
-flow authoring controls still use their existing forms; this is one proven path,
-not a claim that the entire interface is reflective.
+Flow publication and authoring controls are declared in `flows/authoring.grove`
+and embedded through the existing Goo presentation host. Source editing, callable
+inspection/selection, composition, occurrences, source bindings, lifecycle controls
+and investigation delegation adapt the existing native operations. Browser and
+agent invocation use those same declarations and admission guards. Rich source
+inputs preserve Semidoc newlines through Goo's existing text codec. Existing forms
+remain usable; the declarations do not replace the native command contracts.
+The same declaration walk identifies each input's binding group. Browser actions
+submit only their declared inputs; drafts belong to authored control routes, so
+sibling actions can use the same argument names without sharing or clearing drafts.
+Headless reflection uses those bindings to distinguish plain and rich text inputs.
+
+The opt-in Codex surface provider connects an investigation to those controls.
+Its three transport tools read native state, discover declared actions and invoke
+them. Requests, replies and trace links use existing work and bridge records;
+native hands in the worker’s retained trace subscribe to the exact worker, command
+and original I/O request. `/io` remains transport evidence, outside native observer
+indexes. The bounded prose-revision provider remains inert. Interactive authority
+currently belongs to explicitly delegated investigations, not arbitrary automatic
+flow requests; namespace authority and action guards are not a per-document
+sandbox. See `mounts/codex/README.md` for protocol and lifecycle boundaries.
 
 ## Validation and saved worlds
 

@@ -76,7 +76,7 @@
       }
       const {savedInputs}=await api.activateCaptured(step.captured,step.arguments);
       step.accepted=true;
-      for(const [slot,value] of savedInputs)if(frame.input?.dataset.inputSlot===slot)frame.input.setAttribute('value',value);
+      for(const [slot,value] of savedInputs)if((frame.input?.dataset.gooInputKey||frame.input?.dataset.inputSlot)===slot)frame.input.setAttribute('value',value);
     }
     async function execute(frame,command,range){
       if(busy)throw Error('Wait for the current document change.');

@@ -85,8 +85,9 @@ interrupt additionally require the active turn ID.
 
 Pending server requests appear as explicit reply forms. Enter the JSON
 result required by the displayed method and parameters, or select Error
-and enter a JSON-RPC error object. Nothing approves or answers a request
-automatically. Drafts survive polling and failed submissions.
+and enter a JSON-RPC error object. Ordinary console requests remain manual;
+the explicitly selected native surface provider answers its own tool calls as
+described below. Drafts survive polling and failed submissions.
 
 The UI hand converts form submissions into ordinary command children,
 and replies into writes on pending request records. `codex_ui.foil`
@@ -115,5 +116,57 @@ the native reducer and is not sent as an app-server protocol field.
 
 The reducer records final agent-message text by thread and turn; completion can
 arrive before the start acknowledgment. Failed/interrupted/disconnected turns do
-not become successful work. Provider hands do not automatically replay uncertain
-commands or answer server requests. Domain admission remains with the caller.
+not become successful work. The default `work_provider` does not automatically
+replay uncertain commands or answer server requests. Domain admission remains
+with the caller.
+
+## Interactive document work
+
+`/<node>/io/codex/surface_provider` is an explicit provider for an open Cooperate
+investigation. Select it through `cooperate/delegate` (also exposed by Nenex's
+declared **Delegate native work** control). Supply a guard on the evidence or
+instructions that authorize the activity. Editing that guard invalidates further
+tool calls; editing the working document need not invalidate an independent guard.
+The ordinary `work_provider` and the inert document-revision policy keep their
+existing behavior.
+
+The surface provider supplies three app-server dynamic tools:
+
+- `shrine_read` reads native records, evaluated cells and overlay projections.
+  Care remains native: x is one record, y its nearest live frontier, z its
+  subtree. Existing `/x` and `/o` paths select computed cells and overlays.
+  Child pages carry a retained local-world epoch and use the existing frozen
+  namespace reader, including its selected system publication, so tool receipts
+  do not invalidate the continuation. An unavailable current source returns failure;
+  an explicitly retained epoch is historical evidence.
+- `shrine_actions` reflects matching published Goo controls, input encodings and
+  the object's current version guards. It uses the browser's catalogue cache
+  when installed. Rich text inputs include an example using the existing codec.
+- `shrine_act` invokes one of those controls through Goo and shared admission.
+  Native work supplies the invocation identity and retains the action receipt.
+
+Each server request remains an ordinary bridge request record. Its initialization
+creates one native task in `<worker>/trace/<effect-key>` and links it into the
+worker’s trace. That hand subscribes to the exact worker, start command and I/O
+request; `/io` itself remains outside native observer indexes. The hand waits for
+the turn acknowledgement, validates thread/turn identity and emits the existing
+native command. Accepted effects, the tool reply and the settled task are admitted
+together. A bridge failure settles the task and removes its subscriptions before
+a retried acknowledgement can replay it. The transport sends the retained reply;
+it does not choose the next action. Codex's existing turn makes that choice.
+Recovery settles retained workers before reinstalling their forms, and uncertain
+turns are never replayed automatically.
+
+This provider currently accepts explicitly delegated investigation workers. It
+does not grant automatic flow-maintenance requests interactive write authority.
+It operates under the mounted sovereign's existing application authority;
+investigation ownership is not a per-document sandbox. There is no additional
+tool registry, provider scheduler or Python agent loop. App-server dynamic tools
+are an experimental protocol feature; the checked schemas come from the installed
+`codex app-server generate-json-schema --experimental` command.
+
+Discovery currently covers ordinary matching views. Hosted pane navigation and
+controls requiring an active Goo selection are not yet a complete headless path;
+selection inputs are marked as such and have no synthetic example. Reads page
+immediate children without counting the whole subtree, but rendering one record's
+values is not a bound on total evaluation or response size.

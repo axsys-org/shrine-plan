@@ -37,10 +37,71 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
 
 These forms call `namespace_command/plan` and supervisor admission. They do not
 run Python commands or maintain a browser-owned work queue.
-Publication is declared in `authoring.grove`: the embedded browser control and
-reflected/headless control use the same arguments and native publish guard.
-Other authoring controls still use the existing forms. Successful publication
-refreshes the surrounding controls while preserving any unsaved source draft.
+`authoring.grove` declares publication and the **Declared authoring actions**
+view. Browser and headless clients invoke those declarations through the same
+native planners. Existing contextual forms remain available beside them.
+Accepted actions refresh the surrounding controls when local drafts allow it;
+unsaved source and Goo input are retained.
+
+### Declared authoring actions
+
+Open **Page tools → Flows → Declared authoring actions**. The view is
+`/0x11/gov/flows/authoring/author_flow`, selected by the
+`/0x11/gov/flows/authoring/authoring` slot. Publication keeps its separate
+`publish_flow` view and `publication` slot.
+
+The declared controls cover these existing operations:
+
+| Work | Controls |
+| --- | --- |
+| Author source | Create Semidoc page; Save Semidoc source |
+| Compose | Inspect callable definitions; Select callable; Compose selected callable |
+| Use a definition | Select published flow; Embed selected flow; Adopt selected publication |
+| Bind evidence | Bind Nenex evidence; Bind filesystem evidence; Bind web evidence |
+| Maintain work | Retry revision; Pause occurrence; Resume occurrence; Detach occurrence |
+| Investigate | Open investigation; Delegate native work; Retain unresolved question |
+
+**Create Semidoc page** takes a page name and complete source, and creates
+`/0x11/app/nenex/w/<name>` only when that destination is empty. It does not append
+`_flow` to the name. **Save Semidoc source** edits the current page. Source and
+composition edits preserve the existing document attachment guards; publishing
+and adopting a definition remain separate actions.
+
+Composition's `bindings` field is a JSON object mapping each selected port to a
+named input or prior step, for example `{"value":"evidence"}`. Embedding's
+`bindings` maps each selected input to a namespace path, for example
+`{"sources":"/x/0x11/app/nenex/w/research/cells/source"}`. Supply exactly the
+selected ports: missing ports, extra ports, duplicate keys and non-string values
+are rejected. Selection version and definition fields must identify the retained
+selection cell. `new_inputs` is a space-separated list of explicitly named inputs.
+
+**Open investigation** accepts `context` as a JSON object from evidence keys to
+live namespace paths, or `{}`. It creates the existing document-local work and
+context lens. **Delegate native work** takes an existing activity, a new worker
+name, an explicit provider and an explicit guard path. Choose independently
+guarded evidence whose changes should invalidate that worker, outside the work
+it will edit. Select the Codex surface provider only for
+an intentional interactive investigation; ordinary prose revision retains its
+bounded response policy. **Retain unresolved question** uses the existing hole
+operation with a live context path and an open activity to resume.
+
+Headless callers discover control addresses, input fields and version tokens
+from Goo, then submit those exact fields through its action protocol. Reinspect
+after a mutation or stale result. The Semidoc `source` fields use the existing
+multiline `rich-code` editor and are reflected as `rich_text`. Their wire value
+is the JSON text produced by `goo_text/encode (goo/text/en source)`, for example:
+
+```json
+[{"myth":{},"lang":{"en":{"txt":";. /example\n  ;= Example\n    Authored source."}}}]
+```
+
+The browser supplies this encoding. A headless caller passes its serialized
+text as `input:/source`; it must not pass raw Semidoc as that field. The adapter
+requires empty run metadata and joins the text without discarding formatting
+silently. `bindings` and investigation `context` remain ordinary string-valued
+JSON objects, independent of the source editor's encoding. These adapters plan
+through the existing flow, Nenex and Cooperate operations; retained definitions,
+cells, attempts and history remain their native records.
 
 ### Compose in Nenex
 

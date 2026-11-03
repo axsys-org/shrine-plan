@@ -1,0 +1,134 @@
+- codex_ops
+- goo_actions
+- goo_browser
+- show [at=display]
+
+' The wire has three operations. Available application actions and their inputs
+' come from published Goo declarations, never a second tool/action registry.
++ codex_surface
+  + object
+    \ worker=path fields=row[str]
+    ^ json
+    = properties fields.map((\ name (jkv name (codex_ops/object [(jkv "type" (json/str "string"))]))))
+      identity (codex_ops/object [(jkv "type" (json/str "string")) (jkv "enum" (json/arr [(json/str (path_show worker))]))])
+    | codex_ops/object [(jkv "type" (json/str "object"))
+        (jkv "properties" (codex_ops/object properties.snoc((jkv "worker" identity))))
+        (jkv "required" (json/arr (fields.snoc("worker").map((\ name=str (json/str name)))))) (jkv "additionalProperties" (json/boo .false))]
+  + tool
+    \ worker=path name=str description=str fields=row[str]
+    ^ json
+    | codex_ops/object [(jkv "type" (json/str "function")) (jkv "name" (json/str name))
+        (jkv "description" (json/str description)) (jkv "inputSchema" (codex_surface/object worker fields))]
+  + tools
+    \ worker=path
+    ^ json
+    | json/arr
+      [(codex_surface/tool worker "shrine_read" "Read a native path, including existing /x cell and /o overlay views. Care x returns one record, y its nearest live frontier, z its subtree. The response pages immediate children. after and epoch are empty on the first page; use returned next and epoch to continue the same retained snapshot. Missing evidence is reported as unavailable. Reflected values are display text, not executable source." ["path" "axis" "after" "epoch"])
+       (codex_surface/tool worker "shrine_actions" "Discover declared Goo actions and required input slots on this object. Copy the returned target, subject, view, control and version fields into shrine_act. Reinspect after each mutation or stale result." ["target"])
+       (codex_surface/tool worker "shrine_act" "Invoke a discovered Goo action through native admission. fields is a JSON object of string fields returned by shrine_actions, plus input:/slot values. Do not invent control addresses or versions. The host supplies invocation identity and retains a receipt." ["fields"])]
+  + fields
+    \ value=json
+    ^ either[str row[[str str]]]
+    ?> (json/obj pairs) value (./err "Expected an object of string fields.")
+    ? !(pairs.all((\ pair (eq (pairs.keep((\ other (eq pair.k other.k)))).len 1)))) (./err "Duplicate field.")
+    % todo=row[jkv] pairs out=row[[str str]] []
+    ^ either[str row[[str str]]]
+    ?> (./some pair) todo.pull (./ok out)
+    = [field rest] pair
+    ?> (json/str value) field.v (./err "Expected string field values.")
+    | _ rest out.snoc([field.k value])
+  + arguments
+    \ value=json names=row[str]
+    ^ either[str row[[str str]]]
+    < fields (codex_surface/fields value)
+    ? !(and (eq fields.len names.len) (fields.all((\ [key value] names.has(key))))) (./err "Unexpected or missing tool argument.")
+    | ./ok fields
+  + read
+    \ args=json state=namespace
+    ^ either[str json]
+    < fields (codex_surface/arguments args ["path" "axis" "after" "epoch"])
+    = field (\ name=str (http_foot/field name fields))
+    ?> (./some target) (path_parse (field "path")) (./err "Invalid namespace path.")
+    = axis (field "axis") epoch_text (field "epoch") after_text (field "after")
+    = axes=row[str] ["x" "y" "z"]
+    ? !(axes.has(axis)) (./err "Axis must be x, y or z.")
+    = selected_epoch=maybe[nat] (? epoch_text.len (nat/parse (field "epoch")) (./some state.local.top))
+    ?> (./some epoch) selected_epoch (./err "Invalid retained epoch.")
+    ? (gt epoch state.local.top) (./err "Future epoch.")
+    ? (and after_text.len !(epoch_text.len)) (./err "Continuation requires its retained epoch.")
+    = care=care (? (eq axis "x") .x (? (eq axis "y") .y .z))
+    = freeze (sovereign_reader state).freeze
+    ?> (./some reader) (freeze epoch) (./err "Retained world epoch is unavailable.")
+    ?> (./known projected) (resolve_view care 0 target reader) (./err "Evidence is unavailable at this epoch.")
+    ? (and projected.fil.is_none (eq projected.kid.size 0)) (./err "Evidence is unavailable at this epoch.")
+    = after=maybe[path]
+        ? !(after_text.len) .none
+        | path_parse (field "after")
+    ? (and after_text.len after.is_none) (./err "Invalid child cursor.")
+    ? (after.run((\ path !(and (pith_prefix target path) (eq path.len target.len.inc)))).fall(.false)) (./err "Child cursor outside target.")
+    = selected projected.kid.range_after(after.run((\ path path.at(target.len))) 65)
+      count (? (gt selected.len 64) 64 selected.len)
+      visible selected.take(count)
+      next=json (? (gt selected.len 64) (json/str (path_show target.snoc(visible.at(63).key))) jnull)
+      card projected.fil
+      slots=row[json]
+        ?> (./some record) card []
+        | record.tap.map((\ entry (codex_ops/object [(jkv "slot" (json/str (path_show entry.key)))
+            (jkv "value" (json/str (str/from_atom (display/show/pail entry.val))))])))
+      children (visible.map((\ entry (codex_ops/object [(jkv "path" (json/str (path_show target.snoc(entry.key))))
+          (jkv "recordAvailable" (json/boo (unpin entry.val.held).fil.is_some))]))))
+    | ./ok (codex_ops/object [(jkv "path" (json/str (path_show target)))
+        (jkv "epoch" (json/str (nat/show epoch))) (jkv "axis" (json/str axis))
+        (jkv "recordAvailable" (json/boo card.is_some)) (jkv "slots" (json/arr slots))
+        (jkv "children" (json/arr children)) (jkv "next" next)])
+  + input
+    \ slot=path card=myth
+    ^ json
+    = kind card.txt_at(slot)
+      example=json
+        ? (eq kind "selection") jnull
+        | json/str (? (eq kind "rich_text") (show (goo_text/encode (goo/text/en "Your text"))) "Your text")
+    | codex_ops/object
+      [(jkv "field" (json/str (str/cat_all ["input:" (path_show slot.take((sub slot.len 2)))])))
+       (jkv "kind" (json/str kind)) (jkv "example" example)]
+  + descriptor
+    \ entry=[path myth]
+    ^ json
+    = [route card] entry
+    = held=pail card.pail_at(['goo 'request])
+    ?> query=goo_runtime/request held jnull
+    = inputs (card.tap.keep((\ field (and (ge field.key.len 2)
+        (equal[path] (field.key.drop((sub field.key.len 2))) ['goo 'input])))))
+    | codex_ops/object [(jkv "label" (json/str card.txt_at(['title])))
+        (jkv "bindings" (json/str card.txt_at(['goo 'bindings])))
+        (jkv "inputs" (json/arr (inputs.map((\ field (codex_surface/input field.key card))))))
+        (jkv "fields" (codex_ops/object
+          [(jkv "target" (json/str (path_show query.target))) (jkv "subject" (json/str (path_show query.subject)))
+           (jkv "view" (json/str (path_show query.view))) (jkv "control" (json/str (str/join "." query.control.map(nat/show))))
+           (jkv "expected" (json/str (nat/show query.expected))) (jkv "displayed" (json/str (nat/show query.displayed)))
+           (jkv "publication" (json/str (nat/show query.publication)))]))]
+  + view_actions
+    \ target=path subject=path current=myth state=namespace view=goo/published
+    ^ row[json]
+    ?> (./ok lowered) (goo_runtime/matching_view view current) []
+    = query (goo_runtime/request "act" target subject view.view.name [] state.case(.x subject).fall(0)
+        state.case(.y target).fall(0) (goo_runtime/publication state) [] 0)
+      controls (goo_actions/controls lowered.children [] (goo_runtime/scope .none .none .nil .none .none)
+        query view.view.binding)
+    | controls.tap.map(codex_surface/descriptor)
+  + actions
+    \ args=json state=namespace
+    ^ either[str json]
+    < fields (codex_surface/arguments args ["target"])
+    = parsed=maybe[path] (path_parse (http_foot/field "target" fields))
+    ?> (./some target) parsed (./err "Invalid target.")
+    = resolved=maybe[path] (goo_runtime/target target state)
+    ?> (./some subject) resolved (./err "No writable source object.")
+    = available=maybe[myth] (goo_runtime/record .x subject state)
+    ?> (./some current) available (./err "Object is unavailable.")
+    = cache (sovereign_care .x [state.self 'weft 'view_catalog_cache] state)
+      catalog=goo_browser/catalog_value
+        ? cache.fil.is_some (goo_browser/cached_index cache)
+        | goo_browser/index (goo_browser/catalog (sovereign_care .z [state.self 'gov] state))
+      views (goo_browser/matching current catalog)
+    | ./ok (json/arr (row/bind[goo/published json] (codex_surface/view_actions target subject current state) views.row))

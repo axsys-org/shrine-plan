@@ -160,6 +160,15 @@
     const body = document.createElement('div'); body.className = 'goo-presentation'; body.innerHTML = data.html;
     section.append(body); return section;
   }
+  // A slot is an operation argument, not a draft identity: sibling action
+  // groups may bind the same slot to independent controls.
+  function inputKey(input) { return input.dataset.gooInputKey || input.dataset.inputSlot; }
+  function describeInput(input, control) {
+    input.dataset.inputSlot = control.slot;
+    input.dataset.gooInputKey = control.control || control.id;
+    if (typeof control.inputBinding === 'string') input.dataset.inputBinding = control.inputBinding;
+    else delete input.dataset.inputBinding;
+  }
   function prepareMount(container, data, preserve = false, section = true) {
     const next = section ? presentation(data) : document.createElement('div');
     if (!section) next.innerHTML = data.html;
@@ -176,12 +185,12 @@
       const richActive = active?.closest?.('.goo-rich-input');
       const richSelection = richActive?.gooEditor?.selection();
       const selection = ['INPUT','TEXTAREA'].includes(active?.tagName) ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
-      const existing = preserve ? new Map([...container.querySelectorAll('[data-input-slot]')].map(input => [input.dataset.inputSlot,input])) : new Map();
+      const existing = preserve ? new Map([...container.querySelectorAll('[data-input-slot]')].map(input => [inputKey(input),input])) : new Map();
       for (const control of data.controls || []) if (control.kind === 'input') {
         const input = [...next.querySelectorAll('[data-node]')].find(element => element.dataset.node === control.id);
         if (!input) continue;
-        input.dataset.inputSlot = control.slot;
-        const held = existing.get(control.slot);
+        describeInput(input, control);
+        const held = existing.get(inputKey(input));
         if (!held) continue;
         const node=data.display?.nodes?.find(node=>node.id===control.id);
         if ((held.gooEditor || node?.editing) && !root.GooRichInput.compatible(held,node)) throw new Error('Editor format changed. Keep this draft or discard it before refreshing.');
@@ -251,7 +260,8 @@
   const outcomes = new Map();
   const outcomeListeners = new Set();
   function captureActivation(container, context, control) {
-    const inputs = [...container.querySelectorAll('[data-input-slot]')];
+    const selected = Array.isArray(control.inputBindings) ? new Set(control.inputBindings) : null;
+    const inputs = [...container.querySelectorAll('[data-input-slot]')].filter(input => !selected || selected.has(input.dataset.inputBinding));
     if(inputs.some(input=>input.gooComposing))throw new Error('Finish composing text before saving.');
     if(inputs.some(input=>input.gooEditor?.pending))throw new Error('Wait for the text command before saving.');
     const operationId = crypto.randomUUID(), activationRef = crypto.randomUUID();
@@ -262,7 +272,7 @@
       displayed:snapshot.displayed,publication:snapshot.publication,invocation:operationId});
     const savedInputs = new Map();
     for (const input of inputs) {
-      body.append(`input:${input.dataset.inputSlot}`,input.value);savedInputs.set(input.dataset.inputSlot,input.value);
+      body.append(`input:${input.dataset.inputSlot}`,input.value);savedInputs.set(inputKey(input),input.value);
     }
     for (const capture of captures) body.append(`input:${capture.slot}`,JSON.stringify(capture.value));
     const handle = Object.freeze({operationId,activationRef});
@@ -387,8 +397,8 @@
       bindings.get(element)?.abort();
       const binding = new AbortController(); bindings.set(element,binding);
       if (control.kind === 'input') {
-        element.dataset.inputSlot = control.slot;
-        context.input?.(control.slot, element, binding.signal);
+        describeInput(element, control);
+        context.input?.(inputKey(element), element, binding.signal);
         trackComposition(element,binding.signal);
         element.gooEditor?.bind(binding.signal,{...context,renderContext:root.GooActions.context(container)});
         continue;
