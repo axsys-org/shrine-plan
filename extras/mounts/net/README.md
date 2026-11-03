@@ -92,3 +92,31 @@ notice a durable flow with receipts, the overlay a kernel lens over records, per
 world's own. What is not yet: the bind is `Access::Public` (libmesa's signed-public profile refuses
 any other access at this commit), there is no requester authentication or encryption, the sockets
 are loopback, and the publisher keys are local seed files.
+
+## Phase 1, measured (2026-11-03)
+
+`demo/phase1.py` boots A (`0x11`) and B (`0x12`), both with `net mcp probe`, writes A's publication
+`{path: /0x11/pub/aluminum, to: 0x12}`, starts one `shrine-mesa serve` beside each world
+(`/Users/ianchanner/shrine-mesa` eb7918e, libmesa 2e94a13), writes 500 revisions at about twenty a
+second while killing with `-9`, at random, each world's runtime and each service five times (a service
+stays down for three revisions and restarts from its state directory; a world is rebooted at once), and
+compares B's acquired history with A's through pinned reads of both records.
+
+| what | measured |
+|---|---|
+| A's 500 cases in B | 500, none lost, none duplicated, in order, every slot matching |
+| the run, first write to last, with the twenty kills | 48.5 s; 5.8 s more to drain after the last write |
+| revision 1 in B, counted from the services' start | 0.22 s |
+| named reads on B, signature and every LSS leaf verified (502 reads across 6 lives) | 12.6 ms on average, 5.0 ms at best |
+| stalled announcements or reads, across 6 lives of each service | 0 |
+| notices delivered again after a kill between the world write and the delivery commit | 4, each recognised and not written |
+| world restart after `kill -9` | 1.6 to 3.6 s |
+| first boot; footprint after the run | 41 s and 88 s; 100 MB and 240 MB RSS |
+
+The first run against the service's first commit (609c14a) did not pass: the publisher bound every
+case in order but announced about four at a time, waited for them to settle, and slept a second on
+every stalled announcement, so B lagged hundreds of cases behind. eb7918e moved the world calls off
+the service loop, widened the flow window to 32 with look-ahead binds, and rearms a stall after 50 ms;
+the run above is the fixed service. What the service holds after 500 revisions is one binding and one
+fence per publication (`RetireBefore` after the peer settles), and a store rotated to a new flow
+generation every 40 rows, since `mesa-store` frees nothing below its 16,384-row cap.
