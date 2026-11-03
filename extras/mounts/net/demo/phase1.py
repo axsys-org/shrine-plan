@@ -138,9 +138,13 @@ try:
     # The kill schedule: KILLS events at distinct revision numbers, each one of four kinds; a burst of
     # revisions is written while a service is down so reconciliation and pending deliveries are exercised.
     kinds = ['world A', 'world B', 'service A', 'service B']
-    schedule = {r: kinds[i % 4] for i, r in enumerate(sorted(rng.sample(range(2, REVISIONS - 5), KILLS)))}
+    picked = []
+    while len(picked) < KILLS:
+        r = rng.randrange(2, REVISIONS - 5)
+        if all(abs(r - q) > 5 for q in picked): picked.append(r)
+    schedule = {r: kinds[i % 4] for i, r in enumerate(sorted(picked))}
     report['kills'] = {k: sum(1 for v in schedule.values() if v == k) for k in kinds}
-    restarts, t_run, down = [], time.monotonic(), None
+    restarts, t_run, down = [], time.monotonic(), {}
     for rev in range(2, REVISIONS + 1):
         A.rpc_retry('write', who='owner', records=[{'path': '/0x11/pub/aluminum', 'action': 'poke', 'slots': {'price': f'{rev / 100:.2f}', 'rev': rev}}])
         kind = schedule.get(rev)
@@ -150,14 +154,17 @@ try:
             B.kill9(); t = B.boot(); restarts.append((kind, t)); log(f'rev {rev}: kill -9 {kind}, back in {t} s')
         elif kind in ('service A', 'service B'):
             svc = SA if kind == 'service A' else SB
-            svc.kill9(); down = (svc, rev + 3); log(f'rev {rev}: kill -9 {kind}; three revisions while it is down')
-        if down and rev >= down[1]:
-            down[0].start(); log(f'rev {rev}: {down[0].tag} service restarted'); down = None
+            svc.kill9(); down[svc.tag] = rev + 3; log(f'rev {rev}: kill -9 {kind}; three revisions while it is down')
+        for tag, at in list(down.items()):
+            if rev >= at:
+                svc = SA if tag == 'a' else SB
+                svc.start(); log(f'rev {rev}: service {tag} restarted'); del down[tag]
         if rev % 50 == 0:
             guard(worlds); log(f'rev {rev}: A case {A.case_of("/0x11/pub/aluminum")}, B acquired {acquired_case(B)}')
         for svc in services:
-            if svc is not (down and down[0]) and not svc.alive(): raise SystemExit(f'service {svc.tag} died: see service-{svc.tag}-{svc.starts}.log')
-    if down: down[0].start(); down = None
+            if svc.tag not in down and not svc.alive(): raise SystemExit(f'service {svc.tag} died: see service-{svc.tag}-{svc.starts}.log')
+    for tag in list(down):
+        (SA if tag == 'a' else SB).start(); log(f'service {tag} restarted after the last revision'); del down[tag]
     final = A.case_of('/0x11/pub/aluminum'); log(f'all revisions written; A at case {final}')
     _, s = wait_for('the last revision in B', lambda: acquired_case(B) == final, 300); report['drain_s'] = s
     report['run_s'] = round(time.monotonic() - t_run, 1); report['restarts'] = restarts
