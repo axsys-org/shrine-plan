@@ -12,12 +12,14 @@ def prepare(root, work, check, cleanup, context):
     for source in root.iterdir():
         if source.is_file():
             (bag / source.name).symlink_to(source)
-    subprocess.run(['nix', '--extra-experimental-features', 'nix-command flakes',
-                    'develop', '--no-update-lock-file', f'path:{root.parent.parent}#debugger',
-                    '--command', 'node', str(root / 'build-topoi.mjs'), str(bag)], check=True)
-    subprocess.run(['nix', '--extra-experimental-features', 'nix-command flakes',
-                    'develop', '--no-update-lock-file', f'path:{root.parent.parent}#debugger',
-                    '--command', 'node', str(root / 'build-patch.mjs'), str(bag)], check=True)
+    # --profile keeps a garbage-collector root for the node toolchain and the workspace in the checkout, so a
+    # nix-collect-garbage between boots does not turn a seconds-long resume into a rebuild of the bundle
+    checkout = root.parent.parent.parent
+    (checkout / '.check').mkdir(exist_ok=True)
+    develop = ['nix', '--extra-experimental-features', 'nix-command flakes', 'develop', '--no-update-lock-file',
+               '--profile', str(checkout / '.check/explorer-env'), f'path:{root.parent.parent}#debugger', '--command']
+    subprocess.run(develop + ['node', str(root / 'build-topoi.mjs'), str(bag)], check=True)
+    subprocess.run(develop + ['node', str(root / 'build-patch.mjs'), str(bag)], check=True)
     return bag, []
 
 

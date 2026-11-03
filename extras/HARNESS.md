@@ -115,6 +115,64 @@ selection must identify its defining root and snapshot; it cannot borrow a local
 case number independently from each possible ancestor. Multi-input overlays do
 not gain a synthetic public case counter.
 
+## Compatibility with the November 2026 main merge
+
+The integration reconciles main `d0deab2` with the shared harness. Raw
+`/sys/if_case` preconditions are checked and consumed by the existing native
+kernel, including mixed batches. Namespace-operation planning, exception
+containment, reacting hands and transaction notifications still use the shared
+admission boundary. MCP accepts only nonnegative integer case guards on make
+and poke; guarded deletion requires a native operation with its read-set guard.
+
+Main's assertion and care-clock history sealing is retained. Sealed chunks are
+native pins; reads follow those chunks rather than interpreting only the open
+tail. This preserves x/y/z history and is separate from arena compaction.
+Native arena compaction remains an explicitly requested offline prototype
+maintenance strategy. It preserves the reachable world and retained history,
+requires downtime and temporary disk space, and does not resolve automatic
+reclamation or its performance characteristics.
+Saving still uses `eden_store` and the retained native service/state continuation,
+before acknowledgement or notification. There is no second save callback,
+automatic remount on restore, or launcher-owned hand scheduler. These core shape
+changes are validated in fresh disposable worlds. They do not upgrade an existing
+saved service; restarting a world resumes its captured core and selected contracts.
+
+The incremental native reference index is derived metadata over typed `safe`
+values. `reference_index/lookup` distinguishes a known empty result from an
+unavailable retained snapshot and rejects future epochs. Epoch zero selects the
+supplied store boundary, including a frozen boundary, rather than the latest
+index's edges. It retains at most 64 index snapshots; older index queries can be unavailable even though
+the original world and x/y/z history remain retained. `reindex_references`
+rebuilds metadata on an already compatible store without replacing its journal,
+assertions or case ledgers; it is not a type conversion or a running-world upgrade.
+
+MCP's current incoming-reference query uses that index. There is no reserved
+`/r` namespace, kernel demand evaluator, implicit prose relationship, or new
+kernel read budget. Optional graph policy remains ordinary published Foil/Grove
+over explicitly supplied evidence. It currently has narrower capabilities than
+main's connected-world graph policy. Explorer can save workspace bindings without
+that optional policy; it reports the missing definition instead of claiming an
+empty connection graph. Backlinks use the current world's native query, with no
+separate links service or in-memory mirror.
+
+Opening a workspace only reads its view. Explicit binding edits retain its
+selected constructor, use native compare-and-set, and refuse to replace unrelated
+authored fields or an inline captured constructor. Removing the final standing
+releases its live references without deleting the record or history. Changing a
+definition remains a separate publication/selection action.
+
+MCP references for computed views pin a complete computation epoch. A later live
+read can therefore return a new snapshot URL for identical values. Retain and
+read the returned epoch reference to inspect the exact original computation;
+this transport reference is not a new native cell case counter.
+
+The upstream research scripts and registry schemes under `mcp/hands` remain
+standalone source, not installed shared-harness hands. Their private `asks`
+records and queues are not consumed or converted by native work. Reusing a parser
+or registry adapter does not imply adopting its scheduler, model loop, or
+write-back policy. Porting those domain capabilities into authored flows is
+separate work; this integration does not claim feature parity with those scripts.
+
 ## Python and source adapters
 
 Keep Python at host/process/transport and test boundaries:

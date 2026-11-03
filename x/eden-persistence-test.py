@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
-api = runpy.run_path(str(ROOT / 'extras/mounts/flows/client.py'))
+api = runpy.run_path(str(ROOT / 'extras/mounts/flows/tests/client.py'))
 
 
 @unittest.skipUnless(os.environ.get('WISP'), 'Set WISP for the native crash test')
@@ -240,13 +240,15 @@ class NativeWorldTest(unittest.TestCase):
                 if isinstance(value, list):
                     return list(map(values, value))
                 return value
+            def evidence_values(node):
+                # Live computed-view references capture the current world epoch.
+                # Compare contents separately; exact pinned views are checked below.
+                return dict(path=node['path'], exists=node.get('exists'),
+                            properties=values(node.get('properties', {})),
+                            children=[evidence_values(c) for c in node.get('children', [])])
             try:
                 start()
-                source = Path(temporary) / 'readiness.txt'
-                source.write_text('Captured evidence before the crash. GATE_OPEN\n')
-                manifest = Path(temporary) / 'sources.json'
-                manifest.write_text(json.dumps({'readiness': {'path': source.name}}))
-                sources = client.import_sources(api['prepare'](temporary, manifest))
+                sources = client.import_texts({'readiness': 'Captured evidence before the crash. GATE_OPEN\n'})
                 client.author(page, recipe)
                 self.assertEqual(recipe, client.source(page))
                 definition = client.publish(page, 'evidence_resume')
@@ -256,6 +258,8 @@ class NativeWorldTest(unittest.TestCase):
                 saved = {p: client.read(p, care='x') for p in
                          [page, definition, controller + '/cells/work', request, hole]}
                 evidence = client.read('/x' + request + '/evidence', care='z')
+                evidence_pin = evidence['reference_z']
+                pinned_evidence = client.read(evidence_pin, care='z')
                 marker = uuid.uuid4().hex
                 client.tool('write', records=[{'path': page + '/notes', 'slots': {'text': marker}}])
                 crash()
@@ -274,7 +278,9 @@ class NativeWorldTest(unittest.TestCase):
                     historical = client.read(before['reference'], care='x')
                     self.assertTrue(historical['exists'], p)
                     self.assertEqual(values(before['properties']), values(historical['properties']), p)
-                self.assertEqual(evidence['children'], client.read('/x' + request + '/evidence', care='z')['children'])
+                self.assertEqual(pinned_evidence, client.read(evidence_pin, care='z'))
+                self.assertEqual(evidence_values(evidence),
+                                 evidence_values(client.read('/x' + request + '/evidence', care='z')))
                 # Executing the retained operation after a cold restore also
                 # proves the saved state retained its actual compiled behavior.
                 client.submit_revision(request, ';= Restart contract\n\n  Captured evidence survived.\n',

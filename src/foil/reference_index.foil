@@ -1,0 +1,104 @@
+- shrine_types
+- sept
+
+' Derived store metadata. Edges retain the complete safe, including care and
+' version; the target trie is only a lookup key and never replaces that identity.
++ reference_edge
+  : holder=path slot=path target=safe
+
++ reference_index
+  ' The current edges by target, and the last `span` snapshots of them, one per epoch that changed an edge.
+  : into=axal[row[reference_edge]] past=uon[pin[axal[row[reference_edge]]]]
+
+  + span
+    ' Snapshots kept; an epoch older than the oldest kept reads unknown.
+    ^ nat
+    64
+
+  + new
+    ' An empty index: no edges, no snapshots.
+    ^ reference_index
+    | reference_index (axal/new[row[reference_edge]] .none) (uon/sing[pin[axal[row[reference_edge]]]] ($u 0) (pin (axal/new[row[reference_edge]] .none)))
+
+  + slots
+    ' Index declared reference values only. Prose interpretation belongs to published policy.
+    \ record=maybe[myth]
+    ^ row[[slot=path target=safe]]
+    ?> (./some record) record []
+    | record.tap.fold []
+      \ out [slot held]
+      ? held
+       > target=safe out.snoc([slot target])
+      out
+
+  + remove
+    ' Drop one holder's edge to a target; a target with no edges left leaves the index.
+    \ holder=path slot=path target=safe into=axal[row[reference_edge]]
+    ^ axal[row[reference_edge]]
+    ?> (./some edges) into.get(target.path) into
+    = remaining
+        | edges.filter
+          \ edge
+          | !(and (equal[path] edge.holder holder) (equal[path] edge.slot slot))
+    ? (eq remaining.len 0) into.del(target.path)
+    | into.put target.path remaining
+
+  + replace
+    ' Called only for records whose own assertion changed, after admission.
+    ' Literal-only changes preserve the index value and its historical clock.
+    \ holder=path before=maybe[myth] after=maybe[myth] into=axal[row[reference_edge]]
+    ^ axal[row[reference_edge]]
+    = old (reference_index/slots before)
+      fresh (reference_index/slots after)
+    ? (equal old fresh) into
+    = removed
+        | old.fold into
+          \ out [slot target]
+          | reference_index/remove holder slot target out
+    | fresh.fold removed
+      \ out [slot target]
+      = edges (out.get(target.path)).fall([])
+      | out.put target.path edges.snoc((reference_edge holder slot target))
+
+  + commit
+    ' Keep this epoch's edges as a snapshot when they changed, and drop the oldest past span.
+    \ epoch=nat into=axal[row[reference_edge]] index=reference_index
+    ^ reference_index
+    ? (equal into index.into) index
+    = past index.past.put(($u epoch) (pin into))
+      entries past.tap
+    ? (le entries.len reference_index/span) (reference_index into past)
+    = [dropped kept] past.del(entries.at(0).key)
+    | reference_index into kept
+
+  + at
+    ' The edges as of an epoch: the current ones at 0 or the top, the snapshot at or before the epoch otherwise, unknown past the span.
+    \ epoch=nat index=reference_index
+    ^ axal[row[reference_edge]]
+    ? (eq epoch 0) index.into
+    ?> (./some entry) index.past.floor(($u epoch))
+      (axal/new[row[reference_edge]] .none)
+    = [version held] entry
+    | unpin held
+
+  + entries
+    \ target=path tree=axal[row[reference_edge]]
+    ^ row[reference_edge]
+    | tree.dip(target).tap.fold []
+      \ out [relative edges]
+      | out.weld edges
+  + beneath
+    ' Low-level enumeration; use lookup when unavailability must be retained.
+    \ target=path epoch=nat index=reference_index
+    ^ row[reference_edge]
+    | reference_index/entries target index.at(epoch)
+  + lookup
+    ' Epoch zero means current at the supplied store boundary, including a
+    ' frozen store. Missing retained metadata stays unknown, never empty.
+    \ target=path epoch=nat top=nat index=reference_index
+    ^ res[row[reference_edge]]
+    ? (gt epoch top) .unknown
+    = selected (? (eq epoch 0) top epoch)
+    ?> (./some entry) index.past.floor(($u selected)) .unknown
+    = [version held] entry
+    | ./known (reference_index/entries target (unpin held))
