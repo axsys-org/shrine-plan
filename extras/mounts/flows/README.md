@@ -153,7 +153,7 @@ inference of a procedure from arbitrary agent or user activity.
 On a page with Cooperate work, **Page tools → Flows → Extract investigation**
 shows its linked retained events in their original order. Select event names
 and create a new flow. The selection is checked against the investigation's
-sequence; an obsolete form, missing event, duplicate selection, malformed trace,
+sequence; a changed sequence, missing event, duplicate selection, malformed trace,
 or occupied destination refuses without creating a partial draft.
 
 Delegated model workers beneath an investigation expose **Extract agent trace**
@@ -163,6 +163,10 @@ including its native effect reference and settled outcome. The tool calls are
 examples for authoring; extraction never replays their effects.
 Pending tool calls refuse extraction. Failed calls remain selectable evidence
 of what was attempted and how it failed.
+The sequence counts appended events, not tool settlement. Extraction checks
+settlement at admission and captures that settled version; it does not certify
+that a result was visible when an earlier form was rendered. Inspect the
+resulting draft's captured examples when authoring its procedure.
 
 The draft is ordinary Semidoc. Each selected event has an `evidence_N` input,
 a frozen provenance cell, and an example input cell. An explicitly recorded
@@ -179,6 +183,10 @@ or a note as executable code. The ordinary compiler rejects an unfinished draft.
 A native authoring hole watches the draft's source. **Review extracted procedure**
 checks that the procedure compiles and acknowledges that hole; another source
 edit reopens it. Review does not publish or execute anything.
+Review and publication forms carrying an older authored source refuse. A change
+to the original evidence does not invalidate its frozen example or silently
+rebind it to the new source. Live bindings on an occurrence are checked by the
+existing work and publication guards when that occurrence executes.
 
 Publish separately, then select and embed the definition in any Nenex document.
 Its binding fields can use new evidence instead of the retained examples. The
