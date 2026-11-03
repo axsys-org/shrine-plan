@@ -148,7 +148,7 @@ Provider answers remain evidence: they are not turned into hardcoded replay
 steps. This is extraction from the existing typed execution trace, not automatic
 inference of a procedure from arbitrary agent or user activity.
 
-### Draft a flow from an investigation
+### Draft a flow from retained work
 
 On a page with Cooperate work, **Page tools → Flows → Extract investigation**
 shows its linked retained events in their original order. Select event names
@@ -156,12 +156,21 @@ and create a new flow. The selection is checked against the investigation's
 sequence; an obsolete form, missing event, duplicate selection, malformed trace,
 or occupied destination refuses without creating a partial draft.
 
+Delegated model workers beneath an investigation expose **Extract agent trace**
+in the same page tools. Select their native tool-call events to draft from what
+the agent actually did. Each selected event retains its exact work record,
+including its native effect reference and settled outcome. The tool calls are
+examples for authoring; extraction never replays their effects.
+Pending tool calls refuse extraction. Failed calls remain selectable evidence
+of what was attempted and how it failed.
+
 The draft is ordinary Semidoc. Each selected event has an `evidence_N` input,
 a frozen provenance cell, and an example input cell. An explicitly recorded
-artifact supplies the example when available; otherwise its named captured
-context is used, falling back to inert note text. References in the draft point
-to the retained provenance cells. Subsequent changes to the original evidence
-do not rewrite those examples. Unselected events are not copied.
+artifact supplies the example when available. Investigation notes otherwise use
+named captured context or inert note text; model tool calls retain their settled
+task record. References in the draft point to the provenance cells. Subsequent
+changes to the original evidence do not rewrite those examples. Unselected
+events are not copied.
 
 The draft deliberately has no executable steps or result yet. Use the existing
 callable selection and composition controls, or edit the Semidoc source, to
@@ -184,10 +193,11 @@ for manual revision. **Open draft**, save the authored prose, and **Accept saved
 draft** completes the same native work. Editing the evidence page requests a new
 revision while retaining the earlier attempt and published document history.
 
-Extraction supports explicitly recorded Cooperate investigation traces, up to
-16 selected events per draft. It does not infer dependencies or capture arbitrary
-unrecorded browser/agent actions. Retained flow runs continue to support exact
-executable extraction through **Extract retained run**.
+Extraction supports explicitly recorded Cooperate investigation and delegated
+model-worker traces, up to 16 selected events per draft. It does not infer
+dependencies or capture arbitrary unrecorded browser/agent actions. Retained
+flow runs continue to support exact executable extraction through **Extract
+retained run**.
 
 ### Declared Goo actions in work
 
