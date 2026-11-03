@@ -180,7 +180,11 @@ def select(root, names):
         for location in locations:
             key = tuple(location)
             for old, owner in roots.items():
-                if key[:len(old)] == old or old[:len(key)] == key:
+                # One mount may publish a vocabulary and a nested view unit.
+                # They reconcile together under the same source owner; only
+                # competing owners (or a duplicate output root) conflict.
+                if key == old or (owner != mount.name and
+                        (key[:len(old)] == old or old[:len(key)] == key)):
                     raise ValueError(f'Conflicting publication roots: {owner} and {mount.name}: {key}')
             roots[key] = mount.name
         def provides_workspace_host(dependency):

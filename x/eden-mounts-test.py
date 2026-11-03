@@ -103,6 +103,24 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'must be flat'):
             catalog(self.root)
 
+    def test_nested_units_share_one_mount_owner(self):
+        units = [dict(root=['gov', 'example'], files=['vocabulary.grove']),
+                 dict(root=['gov', 'example', 'authoring'], files=['authoring.grove'])]
+        self.bag('a', grove=units)
+        self.assertEqual([mount.name for mount in select(self.root, ['a'])], ['a'])
+        self.bag('b', grove=[dict(root=['gov', 'example', 'other'], files=['other.grove'])])
+        with self.assertRaisesRegex(ValueError, 'Conflicting publication'):
+            select(self.root, ['a', 'b'])
+        self.bag('duplicate', grove=[units[0], units[0]])
+        with self.assertRaisesRegex(ValueError, 'Conflicting publication'):
+            select(self.root, ['duplicate'])
+
+    def test_shared_harness_mounts_select(self):
+        extras = Path(__file__).resolve().parent.parent / 'extras'
+        selected = select(extras, ['flows', 'codex'])
+        self.assertEqual(selected[-1].name, 'codex')
+        self.assertEqual(sum(mount.name == 'flows' for mount in selected), 1)
+
     def test_live_scan_and_logical_module_names(self):
         bag = self.bag('app', modules={'apps/app/main': 'main.foil'})
         source = bag / 'main.foil'
