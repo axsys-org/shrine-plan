@@ -182,3 +182,35 @@ the service loop, widened the flow window to 32 with look-ahead binds, and rearm
 the run above is the fixed service. What the service holds after 500 revisions is one binding and one
 fence per publication (`RetireBefore` after the peer settles), and a store rotated to a new flow
 generation every 40 rows, since `mesa-store` frees nothing below its 16,384-row cap.
+
+## Phase 2, measured (2026-11-03)
+
+`demo/phase2.py` runs the whole claim on one laptop against `shrine-mesa host` (`/Users/ianchanner/shrine-mesa`,
+the host commit named in its README): the host boots A (`0x11`, registered with `add-world`), an agent writes
+a need and an outreach request in A over loopback, the owner approves it through the host's token route, the
+host mails one link; a software WebAuthn authenticator (P-256, attestation `none`) stands in for the
+stranger's browser.
+
+| what | measured |
+|---|---|
+| A booted by the host | 43 s |
+| the owner's approval event seen, the invitation mailed, `sent` written | 0.34 s |
+| the recipient world provisioned behind the answer: new node `0x20`, seed, directory, boot | 46 s (one run of the first boot took 239 s) |
+| the answer acquired in A at `/0x11/net/names/0x20/o1/current` | 46.7 s after the POST, all but a second of it the boot |
+| the claim link: mailbox verified, passkey registered, session open | 0.07 s |
+| the owner's edit acquired in A as the next case | 0.35 s |
+| the token: reads its own world; another world 403; absent or unknown 401; `who` forced to `owner` | as required |
+| `kill -9` of the host, both worlds and both services; the host restarted; both worlds back | 4.3 s |
+| a fresh client, no cookie: passkey sign-in, an edit, acquired in A | 0.44 s |
+| A's history of the acquired name after the run | exactly the three answers, newest first |
+| unknown routes on the host, a session used at another node | 404 |
+| the world ports on the machine's LAN address | open: the runtime binds every interface (see Deployment); the host and Mesa sockets loopback only |
+| RSS, two worlds, before the kill and after the restart | 756 MB and 393 MB |
+
+The first run did not pass: the acquired revision carried the answer's `/sys/lash` (the contract a role with
+required slots stamps) and A refused the write ("`/sys/lash`: {type, value} with type str, bool, nat, path or
+reference"); the service now drops system slots on both sides, since a contract is the publisher's, never
+content. What is real: the stranger's words are a record under a node of their own, acquired by the inquirer
+through a signed Mesa read, kept across a kill of everything, and changed only with the passkey; what is
+provisional, and said on the claim page: the host holds the publisher key, and a verified mailbox is the pilot's
+claim of a business.
