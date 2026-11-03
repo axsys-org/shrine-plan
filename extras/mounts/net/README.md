@@ -49,6 +49,68 @@ On the acquiring side `/net/names/<publisher>/<name>/current` is written once pe
 revision: a sidecar that restarts, or a notice delivered twice, compares `remote_case` with what
 the world already holds and writes nothing for a revision already acquired.
 
+## Outreach, answers and self (phase 2)
+
+Three more trees under `/<self>/net`, so that an inquiry can reach a mailbox and come back as a record
+under the answerer's own name. The host service (`shrine-mesa host`) reads and writes them; it knows no
+business terms.
+
+```
+/<self>/net/self                      this world's own statement, seeded by the tree, no contract:
+   name, contact, verified, publisher   poked by the host (who host) and the owner
+/<self>/net/outreach/<id>/request     an agent's proposal: to (a mailbox), about (a local path), note
+/<self>/net/outreach/<id>/approval    the owner's approval: only an event written by `owner` counts; note optional
+/<self>/net/outreach/<id>/sent        written by the host once the mail went: at (a time), note
+/<self>/net/answers/<id>              on the answerer's side: text, to (the inquirer's node), about (the
+                                       inquirer's path); each change is a case the inquirer acquires
+```
+
+One norm two deep covers outreach (`/[id=@tas]/[kind=@tas]`; the parents are structural and stay
+empty, as under `/names`), with one role whose slots are all optional: the three kinds are statements,
+nothing is special-cased, and "an approval is required before mail goes out" is the host's rule about
+writers (it tails the event log and acts on an approval whose `who` is `owner`), not a contract. An
+answer requires `text` and `to` on every update; its first write is unjudged like any create under a
+`#like` tree. `/self` is a tree without `#like`, so its pokes are free.
+
+Two things the probes on a light world showed (2026-11-03). A slot named like an import alias resolves to
+the import: `text: text` with `#import text=lib/grove/types/text` made the lash look for the type's own
+path and refuse every poke with `curb_need`; the key is spelled as an absolute cord, `"/text": text`, which
+`grove_roles/slot` takes literally. And a role whose slots are all optional stamps no contract: records under
+`/outreach` (and under `/names`, whose `observed` role is all-optional too) carry no `/sys/lash`, so
+nothing about them is judged, not the norm's `#here` shape (records one, two and three segments deep
+and an uppercase id were all accepted), not a slot's type (`to: 7` was accepted). A role with a required
+slot stamps the lash on the record, and every later update is judged: presence of the required slots
+(`curb_need`) and the type of every present slot, optional ones included (`curb_type`); `answers` and
+`publications` behave so. The host validates what it acts on (`to` must be a mailbox) and never assumes
+the shape.
+
+## Deployment
+
+The runtime binds a world's HTTP port on every interface at this commit (`lsof` shows `*:<port>`;
+`x/eden` passes only the port), and the MCP mount is unauthenticated, so on a pilot host the firewall is
+the boundary: open 22, 80 and 443, nothing else. nftables, for one:
+
+```
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif lo accept
+    ct state established,related accept
+    tcp dport { 22, 80, 443 } accept
+  }
+}
+```
+
+The host service listens on loopback and Caddy terminates TLS in front of it (the block is in the
+shrine-mesa README); the Mesa sockets are loopback on one host. `demo/phase2.py --firewalled` asserts
+from a second address that the world ports are closed; without the flag it reports which are open.
+
+The answer travels by phase 1: the host writes `/<answerer>/net/publications/<id>` with `path`
+`/<answerer>/net/answers/<id>` and `to` the inquirer's node, and the inquirer's service lands each case
+at `/<inquirer>/net/names/<answerer>/<id>/current`. The host's own records (invitations, claims,
+passkeys, token hashes) are its registry file, not records in a world; what a world knows of itself
+is `/self`.
+
 ## Reading the overlay
 
 Over MCP, with the node spelled: `mcp/read path=/x/<self>/net/stale care=y`. Each child is
