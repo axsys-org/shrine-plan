@@ -91,6 +91,14 @@ retaining the allocation serial and accepted completed jobs. A later unresolved
 demand gets a fresh attempt head.
 An unrelated question or another controller's hole is not a completion.
 
+Authored domain libraries sit above these contracts. The cartography examples
+compose HTTP evidence, cited assertions and document maintenance as captured
+Semidoc child flows. Their optional operations are supplied by the example
+catalogue, not native flow installation. They select an ordinary Grove projection
+instead of copying graph policy. A task can capture a pure `flow/operation`
+validator; the existing acceptance boundary applies it before resolving a hole.
+Validated results use ordinary frozen value cells and retained native receipts.
+
 Nenex's page/block question interface uses the shared answering policy directly;
 it does not need to manufacture a flow. Cooperate investigations use the same
 captures and provider protocol without requiring a document editor. A document

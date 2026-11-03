@@ -6,13 +6,19 @@ procedure belongs in authored flows; its working state belongs in the shared
 native work records. A Nenex document can contain the question, flow occurrence,
 evidence cells, proposed assertions, outstanding holes and resulting explanation.
 
-The current native graph-review regression establishes part of this pattern:
-a Semidoc-authored procedure consumes selected claims, suspends on conflicting
-evidence, resumes through the existing maintenance hand and publishes through
-the guarded Nenex writer. Its context selects incoming holders through `/r`.
-This is a controlled-provider regression, not a complete installed research flow.
-Search, domain extraction and registry adapters still need explicit operations.
-The standalone Python research scripts are not the shared harness's providers.
+The shipped example library now authors one bounded chain: **Web evidence**
+captures declared HTTP URLs and structures Markdown/plain text; **Cited
+assertions** proposes exact quotations and explicit judgments, then applies a
+selected native projection and reviews its conflicts; **Cartography** invokes
+both published children and maintains a concept through the normal Nenex writer.
+Create and publish the children before the parent through Nenex's existing
+Flow examples controls. See the flows README for bindings and authoring steps.
+
+The existing graph-review regression separately proves incoming selection through
+`/r`. The cartography chain operates on its captured work-cell assertions; it
+does not silently admit them as sovereign assertions or discover a global graph.
+Source search, authenticated registries and additional format adapters remain
+domain work. The standalone Python scripts are not shared-harness providers.
 
 ## The reusable pieces
 
@@ -25,11 +31,11 @@ The standalone Python research scripts are not the shared harness's providers.
 | Project a neighborhood | Subjects, incoming membership and selected assertion contents → connected evidence, conflicts and gaps | `/r` supplies edge metadata; ordinary cells and published Foil/Grove laws select and interpret it. |
 | Publish an explanation | Validated evidence and completed judgments → maintained concept documents | Reuse the guarded document writer. Publishing domain assertion records needs an explicitly selected writer for that owned destination. |
 
-These are procedure boundaries, not names of already installed child flows.
-Author each child in Semidoc once its selected operations exist, then compose it
-with `/flow/invoke` and explicit `/flow/bind` relationships. Publication captures
-the selected child definitions. Existing attempts retain those definitions when
-a later procedure is published.
+The three examples implement a bounded subset of these procedure boundaries.
+Compose further children with `/flow/invoke` and explicit `/flow/bind`
+relationships. Publication captures selected child definitions; existing
+attempts retain them when a later procedure is published. Identity matching and
+broader source discovery are not implied by the example chain.
 
 ## Bind the thing and its evidence
 

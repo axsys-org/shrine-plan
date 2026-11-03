@@ -350,12 +350,105 @@ registry-specific interpretation, PDF/CSV adapters and source-file write-back
 are not implemented by these examples; they require explicit operations and
 authored procedures, not an implicit research daemon.
 
+### Cartography as an authored chain
+
+The example catalogue also supplies **Web evidence**, **Cited assertions**, and
+**Cartography**. These are Semidoc procedures using the existing work lifecycle.
+The parent captures two child definitions, then uses the ordinary document
+revision operation and guarded Nenex writer. `cartography.foil` supplies their
+domain operations through the optional example catalogue; native `flow_install`
+does not depend on it or on the optional graph mount.
+
+From Nenex:
+
+1. Create Web evidence and publish `web_evidence`. Create Cited assertions and
+   publish `cited_assertions`. Their pages are `web_evidence_flow` and
+   `cited_assertions_flow`. Create Cartography and publish `cartography` last.
+2. On `cartography_flow`, use **Bind web source** for each named URL. Reserve the
+   name `review`. The control supplies the `urls` binding. Each bound URL has an
+   **Update web source** control. It checks the previously displayed URL before
+   changing that same record, preserves its other metadata, and wakes the
+   existing maintenance hand. An obsolete update form is refused.
+3. Supply the explicit subject and question as a native record. This can be an
+   ordinary Semidoc heading with a path attribute, authored in Nenex:
+
+   ```text
+   ;. /research_subject
+     ;@ /subject ;/0x11/user/company
+     ;= When was this company founded?
+       Investigate the selected sources without merging identities by name.
+   ```
+
+   Bind `subject` to that heading's raw namespace record, whose address is
+   available from the block tools. A typed native `subject` reference plus
+   `question` text is also accepted. A path attribute explicitly selects live
+   x-care identity; the heading supplies the question when no `question` slot
+   is present.
+4. With the optional graph library published, bind `projection` to the raw
+   `/0x11/gov/graph/report` record. Its ordinary compiled `spun` constructor is
+   the selected policy. To retain the selection, use **Inspect native
+   definitions** on that raw record and bind the resulting frozen cell's
+   `/x/...` view. A live raw binding deliberately follows later publication.
+5. Attach maintenance with a new destination, the existing Nenex writer, and
+   the existing native Codex work provider. Inspect its shared work cell,
+   request evidence, validated value cells, revision overlays and holes.
+
+Web evidence captures explicit HTTP URLs and reuses the existing Markdown
+importer. Cartography accepts Markdown/plain-text sources; HTML, binary media,
+search and registry interpretation need selected adapters. A changed URL record
+or `revision` requests a fresh capture; no network polling scheduler is installed.
+
+Cited assertions bounds extraction, checks exact nonempty quotations against
+captured source bytes, and fixes subject/source identities outside the model's
+response. Acceptance and its reason are explicit provider judgments, not proven
+facts. Collected claims have one stable, source-qualified symbol key each, as
+required by the existing Grove claims norm; their source and proposal references
+remain on the records. The selected projection may select and annotate but cannot rewrite claim
+values or qualifiers. A conflicting selected report or an empty report refuses
+review completion even if the provider claims success. Changed evidence resumes
+the same demand through the native hand; unchanged failures use **Retry work**.
+
+The parent authors a concept from reviewed assertions and adds compact source
+provenance children. Exact captures, rejected proposals, accepted claims and
+judgments remain in work history. The claims are native values in addressable
+work cells; publishing them as independent sovereign assertions requires an
+explicit writer policy. `/r` continues to reflect ordinary typed references,
+including work references; selecting assertion holders requires an explicit
+scope. This procedure does not discover all relationships or infer identity groups.
+
+After explicitly rescanning and publishing changed mount sources, use
+**Declared authoring actions → Refresh installed flow operations** to install
+that publication's flow registrations. This published action reuses the existing
+registration planner and pinned contract checks. It does not replace the saved
+HTTP service or compiler. Already captured flow definitions and attempts stay
+captured. Republish the selected child and parent to update a live maintenance
+attachment. A retained occurrence instead keeps its selected moment: capture
+the new publication, then deliberately adopt it when desired. Adoption controls
+are only offered for retained occurrences.
+
+See [cartography validation](tests/cartography-validation.md) for the controlled
+checks, compiled Grove boundary, live HTTP/Codex run and its limits.
+
 ### Native provider steps
 
 Pure operations can return the existing `flow/judgment` task tree containing
 ordinary cards with `work/prompt`, `work/schema`, optional `work/provider`, and
 optional `work/evidence` (`cell_view`). The evaluation suspends as `flow/pending`.
 Document revision tasks keep their existing typed document adapter.
+
+A task may also carry `work/validator`: an ordinary captured `flow/operation`
+with exactly the `response` port. Its pure law receives one native outcome
+record at that port and returns either a rejection reason or validated native
+records. The shared acceptance boundary runs it after the existing guard/head
+checks and before completion writes. A refusal or thrown validator leaves the
+attempt retained and its hole waiting. It does not introduce another worker.
+
+Successful validated records are retained as `work/value` (`cell_view`) in the
+receipt and in an ordinary frozen cell at `<attempt>/value`. The Cells work
+surface links that value. Retained answers pass the same selected validator on
+evaluation; an edited cache cannot bypass it. Requests without a validator keep
+their existing behavior. A JSON output schema guides the provider; this captured
+law supplies deterministic domain validation rather than trusting schema prose.
 
 Native request attempts live in the controller's existing `work` subtree.
 They retain their definition and task, expose frozen evidence and a live lens,
