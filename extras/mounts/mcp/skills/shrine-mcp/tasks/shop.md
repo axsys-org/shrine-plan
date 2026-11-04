@@ -86,10 +86,11 @@ words name a region). Everything above applies, with these rules on top:
   waits on the owner; the owner approves it on the shop's page, or not at
   all. The same for calls and texts, always.
 - Every message to a real business says, in its first lines, exactly this
-  much: that Northstar is a pilot business run by Axiomatic Systems to test
-  a sourcing system; that this is an exploratory request for information and
-  not an order; that an assistant wrote it; and that a person can be reached
-  at the address in `/net/self` (`operator`). Then ask only what any
+  much: that Northstar is a hypothetical small shop defined by Axiomatic
+  Systems to test a sourcing system (never "we are a shop" as if it were
+  real); that this is an exploratory request for information and not an
+  order; that an assistant wrote it; and that a person can be reached at the
+  address in `/net/self` (`operator`). Then ask only what any
   prospective customer would: whether they supply the item, typical lead
   time, a price range or a quote for the stated quantity, and how they
   prefer to be contacted. Plain, short, no pressure, no follow-up for a week.
