@@ -37,8 +37,12 @@ to them so the next agent, and the person, find things where they expect.
 ```
 /needs/<name>                         the owner's words: what is needed, how much, by when, the ceiling
 /needs/<name>/approval                the owner's standing approval: outreach about this need may go out
-/relationships/<peer>                 the folder's own record: peer (a node, when known), refers (the
-                                      need's path); make it first
+/relationships/<peer>                 the folder's own record: refers (the need's path); peer (its node once
+                                      it runs Shrine) or prospective (the node reserved for it before then),
+                                      both written by the host; make it first
+/relationships/<peer>/brief           your standing brief on this peer, poked whenever what you know changes:
+                                      who they are, how we know them, where things stand, what is open, what
+                                      we want next, what not to say; a call is made from it
 /relationships/<peer>/identifiers/<kind>  one way to reach the peer: value (a mailbox, a number, a site);
                                       kind is email, phone, web, …; an association you suspect is a
                                       hypothesis until the peer verifies it at its claim
@@ -52,8 +56,9 @@ to them so the next agent, and the person, find things where they expect.
 /relationships/<peer>/unresolved/<n>  a question still open, with a due
 /her/<peer>/<name>                    what the peer publishes to this world, over Mesa; read-only
 /our/<peer>/<name>                    what this world publishes to the peer: anything written under /our/<peer> is
-                                      published to that peer by the host, each poke a new case (the owner's to write;
-                                      an agent writes there only when the owner's approval or skill says so)
+                                      published to that peer by the host, each poke a new case; the owner's terms
+                                      are the owner's to write; hello, inquiry/<need> and understood/<name> are
+                                      yours (below)
 /her/<gateway>/ports/<port>           what a gateway can do for this world (kind, address, operations)
 /our/<gateway>/requests/<id>          an effect you ask a gateway for; yours to write (below)
 /her/<gateway>/results/<id>           what became of it: sent, failed, or unknown; read-only
@@ -135,6 +140,13 @@ owner's approval, standing on the need or given on the request, carry it:
   relationship: /0x11/relationships/precision     about: /0x11/needs/widgets
 ```
 
+A call is a request too (`do: call`, `to: <number>`, `relationship`, `about`)
+and must carry `purpose`: one sentence on why now, in the peer's terms (what
+changed on their side or ours, what fell due, what we need from them). The
+voice speaks from the relationship's `brief`, the purpose, the last few
+interactions and the open questions, and nothing else; write the brief
+before you ask for a call. A text is `channel: sms`.
+
 The host publishes the request to the gateway once an approval by the owner
 covers it (`/our/<gateway>/requests/<id>/approval`, or the need's), after
 adding a `footer` with the peer's claim link; the gateway attempts each case
@@ -161,23 +173,32 @@ the same standing approval; record the submission as an interaction with
 `channel: form` and what you entered, since the reply may come by mail or
 phone and must land in the same folder.
 
-## The peer's prospective world
+## The peer before it runs Shrine
 
-Before a peer runs Shrine, the host keeps a world reserved for it, named by
-its mailbox, and your tools include that world's corner for you: beside the
-`shrine` server you may find `peer_<node>` servers (`mcp__peer_0x20__mcp/read`,
-`…/mcp/write`), each scoped to `/<node>/proposed/relationships/<WAKE_WORLD>`
-and nothing else. Read `/relationships/<r>` for `peer`, or the `/her` names,
-to know which node is which; a corner you were not given is not yours.
+Before a peer runs Shrine, the host keeps a world reserved for it (one per
+mailbox or number, `prospective` on the relationship) and that world is a
+Mesa peer like any other: whatever you write under `/our/<prospective>/…`
+is published to it and lands there at `/her/<WAKE_WORLD>/…`, signed by this
+world, versioned, attributed to this world and never to the peer. That is
+how the peer's namespace comes to exist before it joins: one `/her/<node>`
+folder per Shrine world that has dealt with it, formed collectively, never
+merged. Write there what you would want them to find, and only that:
 
-Under that scope, and only there, write the relationship as the peer will
-find it when it claims the world: `inquiry` (a reference to the need),
-`interactions/<id>` (the same messages, its side), `proposed_terms/<name>` and
-`proposed_capabilities/<name>` (what you would propose it publishes, each
-with `source` referencing the message it came from). It is your
-representation of the peer, attributed to you; the peer confirms, corrects
-or rejects it at the claim, and your token is revoked then. Nothing you write
-there is the peer's statement, and you must not describe it as one.
+```
+/our/<prospective>/hello                who this world is, how it knows them, what it wants; one record, poked
+/our/<prospective>/inquiry/<need>       what you asked them for: what, how much, by when, a note; never the ceiling
+/our/<prospective>/understood/<name>    what you understood them to have said (a term, a capacity, a date), with
+                                        the date, the channel and `source` naming the interaction; for them to
+                                        confirm or correct, not a statement of theirs
+```
+
+Nothing private of this world crosses: no judgments, no observations, no
+other peer's terms, no prices you will pay. When the peer claims its world
+the host turns `prospective` into `peer`, the peer confirms or corrects by
+publishing `/our/<WAKE_WORLD>/<name>` from its own world, and you read it at
+`/her/<peer>/<name>` from then on instead of asking. The host offers the
+claim link once per way of reaching them (the mail footer, one text after a
+call); you never do.
 
 ## When to be woken again
 
@@ -202,6 +223,16 @@ it leads to still needs the owner's approval and the peer's preferences.
 Tell the owner through `/attention/<n>` (`note`), which the host mails, and
 only when a person must decide or should know: a need satisfied, a peer gone
 quiet, a term outside the ceiling. Nothing else leaves the world.
+
+## One fact in one place
+
+A peer's terms live at `/her/<peer>/<name>`; a judgment or a need's status
+points to them with pinned references (`relies_on`) and restates nothing. A
+wake `on` such a reference is the subscription. The relationship folder
+holds only what has no other home: identifiers, interactions from outside,
+observations off them, open questions, the brief. Read with the care the
+question needs: x the record, y its children, z the subtree; never z on a
+folder you need one record of.
 
 ## Provenance, always
 
