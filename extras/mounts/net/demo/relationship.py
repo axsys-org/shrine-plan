@@ -519,7 +519,9 @@ def many():
         pids = subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True, text=True).stdout.split()
         return sum(int(x) for pid in pids for x in subprocess.run(['ps', '-o', 'rss=', '-p', pid], capture_output=True, text=True).stdout.split()) // 1024
     report['rss_mb_two_worlds'] = wisp_rss()
-    check('the worlds stay under the guard', report['rss_mb_two_worlds'] < 3500, report['rss_mb_two_worlds'])
+    # the guard is the machine's: a fresh world holds about 2.5 GB on the box after its first boot, under 1 GB on the laptop
+    guard = int(os.environ.get('GATE_RSS_MB', '3500'))
+    check('the worlds stay under the guard', report['rss_mb_two_worlds'] < guard, (report['rss_mb_two_worlds'], guard))
     # each inquirer asks the same mailbox about its own need; the host reserves one prospective world for the mailbox
     asks = {A: ('widgets', '500 at 40 per unit'), '0x12': ('brackets', '2000 a quarter, 12 per unit')}
     for node, name in inquirers:
