@@ -214,3 +214,44 @@ content. What is real: the stranger's words are a record under a node of their o
 through a signed Mesa read, kept across a kill of everything, and changed only with the passkey; what is
 provisional, and said on the claim page: the host holds the publisher key, and a verified mailbox is the pilot's
 claim of a business.
+
+## Relationships, /our and /her, wakes (2026-11-04)
+
+The relationship machinery adds no Grove: every record below is free, written by a named principal,
+and its paths are the convention the relationship skill states
+(`extras/mounts/mcp/skills/shrine-mcp/relationships.md`), known to no code in the kernel. The host
+(`shrine-mesa host`, its README section "Relationships") is the external bridge: mail and calls in and
+out, prospective worlds, the wakes, the agent.
+
+```
+/<self>/needs/<name>                           the owner's words; /needs/<name>/approval a standing approval
+/<self>/relationships/<peer>                   own record: contact, refers → a need, peer (a node when known)
+/<self>/relationships/<peer>/conversation/<id> every message either way, by the channel's principal: mail,
+                                               phone, web, or the agent
+/<self>/relationships/<peer>/observations/<n>  one statement off one piece of evidence, source → it, pinned
+/<self>/relationships/<peer>/unresolved/<n>    open questions with a due
+/<self>/judgments/<peer>                       an ask cell over /relationships/<peer> (care z), beside the
+                                               folder: inside it is a cycle; /judgments/<peer>/result the answer
+/<self>/agent/wakes/<id>                       when the agent wants to run again: why, at | on | cell
+/<self>/agent/runs/<id>                        every run the host made, by host
+/<self>/her/<peer>/<name>                      what the peer publishes to this world, landed by the sidecar
+/<self>/our/<peer>/<name>                      what this world publishes to the peer; the publication record is
+                                               /net/publications/<name>_<peer> {path, to}
+/<self>/attention/<n>                          notes the host mails to the owner
+```
+
+On a prospective world (reserved by the host for a mailbox at first contact), each inquirer's agent
+writes only under `/proposed/relationships/<inquirer>/…` (inquiry, conversation, `proposed_terms/<name>`,
+`proposed_capabilities/<name>`) through a token scoped there, revoked at the claim; what the owner
+publishes at the claim is `/our/<inquirer>/<name>`, acquired by the inquirer at `/her/<peer>/<name>`.
+
+Three things the probes and the gate settled: a cell placed inside the folder it reads answers
+`/sys/view/fault: cycle` (so judgments live beside their folders); a path or slot segment is letters,
+digits and underscore (`proposed_terms`, `maximum_price`); and an ask cell's context asks "no answer
+yet" from the moment it is written, so a wake naming it fires at once, which is what a fresh
+relationship wants.
+
+`demo/relationship.py --wake-only` is the wake gate (one world, the stub agent); `demo/relationship.py`
+the relationship gate (the inbox fixture under `demo/fixtures/` playing Precision Works, the gate
+writing what the agent would); both deterministic. The real runs, with a real mailbox, a real call and
+the real agent, are recorded separately.

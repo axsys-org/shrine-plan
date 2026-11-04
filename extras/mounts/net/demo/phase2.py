@@ -1,4 +1,6 @@
-"""Phase-2 gate: hosting and claiming.
+"""Phase-2 gate: hosting and claiming (superseded 2026-11-04 by relationship.py: the host now provisions the
+counterparty's world at first contact and the invitation takes a reply rather than an answer that is published,
+so this script no longer passes as written; it is kept for the measured run recorded in the README).
 
 The host service (`shrine-mesa host`) boots the inquirer's world A (0x11) and, behind a stranger's first
 answer, a recipient world; an agent proposes an outreach in A, the owner approves it through the host's
