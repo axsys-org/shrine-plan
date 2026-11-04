@@ -17,11 +17,14 @@ args = ap.parse_args()
 market = json.load(open(args.market))
 personas = {p['mailbox'].lower(): p for p in market['personas']}
 answered = set()
-started = time.monotonic()
+started = None  # the clock starts at the first message, so slow boots do not advance the story
 os.makedirs(args.inbox, exist_ok=True)
 
 
-def week(): return int((time.monotonic() - started) // args.week_seconds) + 1
+def week():
+    global started
+    if started is None: started = time.monotonic()
+    return int((time.monotonic() - started) // args.week_seconds) + 1
 
 
 def state_of(p):
