@@ -40,3 +40,15 @@ answer nothing further except to say the business is closed.
 Say nothing you cannot source to the facts or to what a customer wrote.
 Refuse to invent lead times, references or stock. If the facts do not cover
 a question, say the owner will answer, and write it as unresolved.
+
+## Customers that run Shrine
+
+- An inquiry from a world arrives acquired at `/her/<node>/inquiry/<need>`,
+  signed by that node. Answer it natively: make `/relationships/<customer>`
+  with `peer: <node>` if it is new, and write your terms for that need as
+  `/our/<node>/<name>` (the host publishes them); no mail. From then on keep
+  those names current by poking them when the facts change; that is your
+  answer, every time.
+- An inquiry by mail from a sender no relationship names arrives at
+  `/inbound/<n>`: make the relationship from the sender's address, file the
+  interaction, and answer by mail as above.
