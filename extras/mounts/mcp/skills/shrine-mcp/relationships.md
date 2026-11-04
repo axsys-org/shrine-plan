@@ -94,7 +94,9 @@ When its context says asking, answer it with one write of
 `/judgments/<peer>/result`: `answer` (your words), `ok` (yes or
 no), `relied_on` (references to the observations and acquired cases you
 used), `case` (the context's `/sys/tack/case`), `prompt` (the cell's, exactly),
-`model`, and `follow_up` (a time) when the answer stops holding. The first
+`model` (the cell's own `model` slot, exactly: the kernel keeps asking while
+the result's differs; put the real model id in `model_id`), and `follow_up` (a
+time) when the answer stops holding. The first
 time, also poke the cell with `result: {type: reference, path: /0x11/judgments/precision/result,
 care: x, case: 0}`. Whether a statement satisfies a need is your reading of
 the need's words; nothing in the world computes it for you.
