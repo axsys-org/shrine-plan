@@ -423,8 +423,10 @@ def full():
         {'path': f'/{A}/agent/wakes/precision_moved', 'slots': {'why': 'precision published or wrote', 'on': live_ref(f'/{A}/her/{peer}', 'z')}}])
     judged = world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x')
     check('the judgment is answered with what it relied on and a follow-up', judged.get('exists') and judged['properties'].get('/ok') == 'yes' and judged['properties'].get('/follow_up') == follow_up, judged)
-    # what Northstar publishes to the person before they join: under its own /our/<peer>, by the convention
-    (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
+    # what Northstar publishes to the person before they join: under its own /our/<peer>, by the convention;
+    # the reservation is a name and a key with no runtime until the person opens a link
+    reservation = next(w for w in registry()['worlds'] if w['node'] == peer)
+    check('the reservation holds no runtime before the person opens the link', reservation.get('dormant') and not up(peer), reservation)
     rel = world_rpc(pa, 'read', path=f'/{A}/relationships/precision', care='x')['properties']
     check('the relationship names the world reserved for the mailbox', rel.get('/prospective') == peer, rel)
     st, _ = proxy(A, agent, 'write', records=[
@@ -432,17 +434,13 @@ def full():
         {'path': f'/{A}/our/{peer}/inquiry/widgets', 'slots': {'what': '500 widgets a month, 6061 anodized', 'by': 'monthly, recurring', 'note': 'the inquiry of ' + rp.get('/at', '')}},
         {'path': f'/{A}/our/{peer}/understood/widgets', 'slots': {'price': '39.50 per unit', 'valid': '30 days', 'capacity': 'unconfirmed', 'channel': 'email', 'source': pinned(conv[1])}}])
     check('Northstar wrote what it publishes to the person under its own /our', st == 200, st)
-    (understood, s) = wait('the publication acquired in the prospective world', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pb, 'read', path=f'/{peer}/her/{A}/understood/widgets', care='x')), 120, 0.5)
-    check("the person's namespace holds it, signed by Northstar, never as the person's statement", understood['properties'].get('/publisher') == A and understood['properties'].get('/capacity') == 'unconfirmed', understood['properties'])
-    provisional = {c['path']: (c['reference'], c['properties']) for c in children(pb, f'/{peer}/her/{A}/understood')}
-    report['proposals'] = len(provisional)
     log('test 1 holds: the relationship exists before the counterparty joins, through a gateway that knows nothing of it')
 
     # --- 2 persistence: kill everything, restart; the records and the wakes are there; an unfinished attempt is reported unknown
     world_rpc(pg, 'write', who='gateway', records=[{'path': f'/{G}/attempts/{A}/ghost', 'slots': {'case': 1, 'status': 'attempting', 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}])
     kill_everything(signal.SIGKILL); log('host, gateway, fixture, worlds and services killed')
     t0 = time.monotonic(); start_host(); start_gateway([A]); start_fixture()
-    wait('the worlds back', lambda: up(A) and up(peer) and up(G), 600, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
+    wait('the worlds back', lambda: up(A) and up(G), 600, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
     check('the interactions, the judgment and the wakes survive', len(interactions(pa)) == 2 and world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x').get('exists')
           and len(children(pa, f'/{A}/agent/wakes')) == 2, 'after restart')
     (ghost, s) = wait('the unknown result', lambda: result_of(pa, A, 'ghost'), 60, 0.5)
@@ -452,8 +450,28 @@ def full():
     # --- 4 claiming: the invitation shows the prospective namespace; claim, passkey, review, publish
     invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
     stranger = Client()
+    stranger.get(invite)
+    # opening the link wakes the reservation; it boots and acquires what was published to it while it slept
+    (pb, s) = wait('the prospective world, woken by its link', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s'); report['wake_s'] = s
+    (understood, s) = wait('the publication acquired in the woken world', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pb, 'read', path=f'/{peer}/her/{A}/understood/widgets', care='x')), 120, 0.5)
+    check("the person's namespace holds it, signed by Northstar, never as the person's statement", understood['properties'].get('/publisher') == A and understood['properties'].get('/capacity') == 'unconfirmed', understood['properties'])
+    report['proposals'] = len(children(pb, f'/{peer}/her/{A}/understood'))
     status, _, page = stranger.get(invite)
     check('the invitation shows the inquiry and what was recorded', status == 200 and 'Northstar' in page and '39.50 per unit' in page and 'understood' in page and 'Claim this world' in page, (status, page[:300]))
+    # the reply page: the agent says what it asks and what to show; the person answers in a few taps, into their own world
+    proxy(A, agent, 'write', records=[{'path': f'/{A}/our/{G}/requests/{rid}', 'action': 'poke', 'slots': {
+        'ask': 'price (number): per piece, at 500 a month\nlead_time (number): days\nterms (choice: net 30 | net 60)', 'show_1': live_ref(f'/{A}/needs/widgets', 'x')}}])
+    status, _, page = stranger.get(invite)
+    check('the reply page asks for the fields the agent chose, prefilled from what was noted, beside what it chose to show',
+          status == 200 and 'name="f.price"' in page and 'Lead time' in page and 'net 60' in page and '39.50' in page and 'Maximum price' in page, page[:600])
+    status, _, page = stranger.form(invite + '/answer', **{'f.price': '39.50', 'f.lead_time': '14', 'f.terms': 'net 30', 'note': 'price holds until December'})
+    check('Send thanks them and offers their page', status == 200 and 'Sent to Northstar' in page and 'Claim your page' in page, page[:300])
+    (answer, s) = wait('the answer acquired by the asker', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{peer}/{rid}', care='x')), 120, 0.5)
+    check("the answer is the person's own publication, signed by their world", answer['properties'].get('/publisher') == peer and answer['properties'].get('/price') == '39.50'
+          and answer['properties'].get('/terms') == 'net 30' and answer['properties'].get('/note') == 'price holds until December', answer['properties'])
+    report['reply_s'] = s
+    status, _, page = stranger.get(invite)
+    check('the page opens again on their answer, to change it', 'You answered this already' in page and 'value="14"' in page, page[:600])
     status, _, page = stranger.form(invite + '/claim')
     check('the claim requests a verification mail', status == 200, (status, page[:200]))
     (claim, s) = wait('the claim mail through the gateway', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 60, 0.3)
@@ -518,7 +536,9 @@ def many():
         (ports[node], s) = wait(f'world {node}', lambda n=node: up(n), 400, 2); log(f'{name} {node} up in {s} s')
         world_rpc(ports[node], 'write', who='owner', records=[{'path': f'/{node}/net/self', 'action': 'poke', 'slots': {'name': name}}])
     def wisp_rss():
-        pids = subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True, text=True).stdout.split()
+        mine = os.path.dirname(STATE)
+        pids = [pid for pid in subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True, text=True).stdout.split()
+                if not os.path.exists('/proc') or mine in open(f'/proc/{pid}/cmdline', 'rb').read().decode(errors='replace')]
         return sum(int(x) for pid in pids for x in subprocess.run(['ps', '-o', 'rss=', '-p', pid], capture_output=True, text=True).stdout.split()) // 1024
     report['rss_mb_two_worlds'] = wisp_rss()
     # the guard is the machine's: a fresh world holds about 2.5 GB on the box after its first boot, under 1 GB on the laptop
@@ -544,7 +564,7 @@ def many():
     for node, name in inquirers:
         (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(interactions(ports[n], f'/{n}/relationships/precision/interactions')), 90, 0.5)
         check(f'{name} received its own threaded reply', conv[0]['properties'].get('/request') == f'{asks[node][0]}_precision', conv[0]['properties'])
-    (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
+    check('the reservation holds no runtime before the person opens a link', next(w for w in registry()['worlds'] if w['node'] == peer).get('dormant') and not up(peer), peer)
     for node, name in inquirers:
         need = asks[node][0]
         st, _ = proxy(node, tokens[node][1], 'write', records=[
@@ -552,6 +572,10 @@ def many():
             {'path': f'/{node}/our/{peer}/inquiry/{need}', 'slots': {'what': f'{need}, as {name} needs them'}},
             {'path': f'/{node}/our/{peer}/understood/{need}', 'slots': {'price': f'{name} was quoted 43 per unit', 'note': f'recorded by {name}\'s agent'}}])
         check(f'{name} published what it understood, under its own /our', st == 200, st)
+    invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
+    stranger = Client()
+    stranger.get(invite)
+    (pb, s) = wait('the prospective world, woken by its link', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
     for node, name in inquirers:
         need = asks[node][0]
         wait(f'{name}\'s publication lands in the prospective world', lambda n=node, d=need: (lambda r: r if r.get('exists') else None)(world_rpc(pb, 'read', path=f'/{peer}/her/{n}/understood/{d}', care='x')), 120, 0.5)
@@ -560,8 +584,6 @@ def many():
     check("what Allied published to the person is nowhere in Northstar's world", not cross.get('exists'), cross)
     before = {c['path']: c['reference'] for c in children(pb, f'/{peer}/her/{A}/understood')}
     # the claim through Northstar's link; the owner reviews all three, publishes to two, relates them, sets one aside
-    invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
-    stranger = Client()
     status, _, page = stranger.get(invite)
     check('the invitation shows only the inquirer whose link it is', status == 200 and 'Northstar' in page and 'Allied Metals' not in page, page[:300])
     stranger.form(invite + '/claim')

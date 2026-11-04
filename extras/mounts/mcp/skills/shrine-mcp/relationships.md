@@ -143,6 +143,21 @@ owner's approval, standing on the need or given on the request, carry it:
   relationship: /0x11/relationships/precision     about: /0x11/needs/widgets
 ```
 
+To someone not on Shrine, a mail that asks for facts should also shape the reply page their link opens,
+so answering takes a few taps instead of a letter. Two optional slots on the request:
+
+- `ask`: one line per answer you need, `name (type): hint`, type `number`, `date`, `yesno`, `text`, or
+  `choice: a | b | c`. Few fields, named as the slot you will read back: `price (number): per piece, at
+  500 a month`, `lead_time (number): days`, `capacity (number): a month`.
+- `show_1`, `show_2`, …: typed references to what they should see beside the question, at the care you
+  want shown (`/h/x/0/<len>/<path>` a record, `/h/y/...` its children): the need, what you understood
+  from them, their last answer. A few, never your judgments or other peers' terms.
+
+The page prefills each field from their last answer at that slot. Their answer arrives as their own
+publication at `/her/<them>/<request id>` (or `/her/<them>/public/<name>` when they answer for everyone),
+with an optional `note`; read it there, like any publication. A correction of something you noted for them
+arrives at `/her/<them>/<name>` with `corrects` referencing your record.
+
 A call is a request too (`do: call`, `to: <number>`, `relationship`, `about`)
 and must carry `purpose`: one sentence on why now, in the peer's terms (what
 changed on their side or ours, what fell due, what we need from them). The
