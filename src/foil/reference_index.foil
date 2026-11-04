@@ -1,0 +1,203 @@
+- shrine_types
+- sept
+
+' The reverse index: what references a name, kept as the store commits.
+' An edge is a slot of one record (its holder) whose value is a reference
+' (a safe) naming a target.  Only typed references are edges: a reference
+' is a reference, and text that mentions a name becomes an edge when a
+' record holds the reference, never by scanning prose.  Each edge keeps the
+' epoch it appeared and the epoch it ended, so the edges at any epoch are
+' exact for the whole history with nothing re-copied; and each name keeps
+' the epoch an edge at or beneath it last changed, its clock, which is the
+' case of its /r listing for live wakes and for catch-up alike.
+'
+' Names are indexed in the publisher's own spelling.  A world's mount of
+' another world's publication sits at /<self>/her/<node>/... and is that
+' world's /<node>/our/<self>/... (its /our/public/... beneath public): the
+' pairwise identity /A/our/B = /B/her/A.  A reference written either way is
+' one edge to one name, held by the world that wrote it.
++ r_spell
+  ' The /r path that lists the references naming a target: /r/<len>/<path>,
+  ' length-prefixed like /h, so a target is looked up, never searched for.
+  \ target=path
+  ^ path
+  = head=path ['r ($u target.len)]
+  | head.weld(target)
+
++ is_r
+  ' Is this path under the reverse lens (/r)?  /r/<len>/<target...> lists
+  ' the references naming the target.  Read only and derived, like /h.
+  \ p=path
+  ^ bool
+  p.starts('r)
+
++ r_parse
+  ' A /r path read back: the target its length names, and what is asked
+  ' beneath the listing.  None when the path is not a whole /r address.
+  \ requested=path
+  ^ maybe[[target=path relative=path]]
+  ? (lt requested.len 3) .none
+  = width=nat
+      ? requested.at(1)
+       > ($u n=nat) n
+      0
+  ? ((eq width 0) || (lt requested.len (add 2 width))) .none
+  | ./some [requested.drop(2).take(width) requested.drop((add 2 width))]
+
++ segment_is
+  ' Two path segments spell the same word.  Compared as spellings: the
+  ' runtime faults comparing a symbol with a numeric segment as iotas.
+  \ a=iota b=iota
+  ^ bool
+  | equal[str] (path_show [a]) (path_show [b])
+
++ canonical
+  ' A name in its publisher's spelling: a mount path of world self is the
+  ' publisher's /our name; every other name is itself.
+  \ self=iota name=path
+  ^ path
+  ? (lt name.len 3) name
+  ? !(reference_index/segment_is name.at(0) self) name
+  ? !(reference_index/segment_is name.at(1) 'her) name
+  = node name.at(2)
+    rest name.drop(3)
+  ? (and (gt rest.len 0) (reference_index/segment_is rest.at(0) 'public))
+    | [node 'our 'public].weld(rest.drop(1))
+  | [node 'our self].weld(rest)
+
++ mounted
+  ' Where world self holds a publisher's name: its /her mount path, or
+  ' none when the name is not published to self (pairwise or public).
+  \ self=iota name=path
+  ^ maybe[path]
+  ? (lt name.len 3) .none
+  ? (reference_index/segment_is name.at(0) self) .none
+  ? !(reference_index/segment_is name.at(1) 'our) .none
+  = node name.at(0)
+    audience name.at(2)
+    rest name.drop(3)
+  ? (reference_index/segment_is audience self) (./some [self 'her node].weld(rest))
+  ? (reference_index/segment_is audience 'public) (./some [self 'her node 'public].weld(rest))
+  .none
+
++ reference_edge
+  ' One slot of one record holding a reference to a target, from the
+  ' epoch it appeared (since) until the epoch it ended (until, 0 while live).
+  : holder=path slot=path target=safe since=nat until=nat
+
++ edge_sign
+  ' The grade a reverse listing gets when its edges change: its members
+  ' moved, so its record and its shape moved.
+  ^ sign
+  | sign 1 2 2
+
++ reference_index
+  : by=axal[row[reference_edge]] clock=axal[nat]
+
+  + new
+    ' No edges, no clocks.
+    ^ reference_index
+    | reference_index (axal/new[row[reference_edge]] .none) (axal/new[nat] .none)
+
+  + slots
+    ' Every typed reference a record holds, as [slot target], the target in
+    ' its publisher's spelling.
+    \ self=iota record=maybe[myth]
+    ^ row[[slot=path target=safe]]
+    = none=row[[slot=path target=safe]] []
+    ?> (./some held) record none
+    | held.tap.fold none
+      \ out [slot value]
+      ? value
+       > target=safe out.snoc([slot (safe target.ver target.care (reference_index/canonical self target.path))])
+      out
+
+  + live
+    ' The edge is open at an epoch: 0 asks for the live edges.
+    \ epoch=nat edge=reference_edge
+    ^ bool
+    ? (eq epoch 0) (eq edge.until 0)
+    ? (gt edge.since epoch) .false
+    | ((eq edge.until 0) || (lt epoch edge.until))
+
+  + touch
+    ' Advance the clock of the target and of every name above it: a deep
+    ' listing beneath any of them has a member that moved.
+    \ target=path epoch=nat clock=axal[nat]
+    ^ axal[nat]
+    % width=nat target.len out=axal[nat] clock
+    ^ axal[nat]
+    ? (eq width 0) out
+    | _ width.dec out.put(target.take(width) epoch)
+
+  + end
+    ' Close the live edge from holder's slot to target at this epoch.
+    \ holder=path slot=path target=safe epoch=nat by=axal[row[reference_edge]]
+    ^ axal[row[reference_edge]]
+    ?> (./some edges) by.get(target.path) by
+    | by.put target.path
+      | edges.map
+        \ edge=reference_edge
+        ^ reference_edge
+        ? (and (eq edge.until 0) (and (equal[path] edge.holder holder) (and (equal[path] edge.slot slot) (equal[safe] edge.target target))))
+          | reference_edge edge.holder edge.slot edge.target edge.since epoch
+        edge
+
+  + apply
+    ' One record's assertion changed at an epoch: end the edges it no longer
+    ' holds, open the ones it now holds, and advance their names' clocks.
+    ' A change that leaves its references as they were touches nothing.
+    \ holder=path before=maybe[myth] after=maybe[myth] epoch=nat index=reference_index
+    ^ reference_index
+    ? (eq holder.len 0) index
+    = self holder.at(0)
+      name (reference_index/canonical self holder)
+      old (reference_index/slots self before)
+      fresh (reference_index/slots self after)
+    ? (equal old fresh) index
+    = held
+        \ pairs=row[[slot=path target=safe]] pair=[slot=path target=safe]
+        ^ bool
+        = [slot target] pair
+        | pairs.any((\ other=[slot=path target=safe] (and (equal[path] other.slot slot) (equal[safe] other.target target))))
+      ended
+        | old.fold index
+          \ out=reference_index pair=[slot=path target=safe]
+          ^ reference_index
+          ? (held fresh pair) out
+          = [slot target] pair
+          | reference_index (reference_index/end name slot target epoch out.by) (reference_index/touch target.path epoch out.clock)
+    | fresh.fold ended
+      \ out=reference_index pair=[slot=path target=safe]
+      ^ reference_index
+      ? (held old pair) out
+      = [slot target] pair
+        edges (out.by.get(target.path)).fall([])
+      | reference_index out.by.put(target.path edges.snoc((reference_edge name slot target epoch 0))) (reference_index/touch target.path epoch out.clock)
+
+  + signs
+    ' The signs a commit adds for its reverse listings: one per name whose
+    ' clock this epoch advanced, at its /r address.
+    \ epoch=nat before=reference_index after=reference_index signs=axal[sign]
+    ^ axal[sign]
+    | after.clock.tap.fold signs
+      \ out [name at]
+      ? !(eq at epoch) out
+      ? (equal (before.clock.get(name)) (./some at)) out
+      | out.put (r_spell name) edge_sign
+
+  + beneath
+    ' Every edge open at an epoch whose target is the name or beneath it.
+    \ target=path epoch=nat index=reference_index
+    ^ row[reference_edge]
+    = none=row[reference_edge] []
+    | (index.by.dip(target)).tap.fold none
+      \ out [relative edges]
+      | out.weld (edges.filter((\ edge=reference_edge (reference_index/live epoch edge))))
+
+  + case
+    ' The case of a name's listing: the epoch an edge at or beneath it last
+    ' appeared or ended; none while nothing ever referenced it.
+    \ target=path index=reference_index
+    ^ maybe[nat]
+    | index.clock.get(target)

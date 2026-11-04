@@ -4,6 +4,7 @@
 -  shrine [order=30]
 -  lain_types [order=31]
 -  namespace [order=32]
+-  reference_index [order=33]
 -  weft_std
 '  Namespace interpretation: committed and in-flight reads, historical
 '  and derived views, their cases, and their dependency triggers.
@@ -224,9 +225,11 @@
 +  namespace_reader
   ' All callbacks receive a fully qualified target. An epoch belongs
   ' to that target's authority; there is no namespace-wide epoch.
+  ' edges answers the references naming a target (in its publisher's
+  ' spelling, see canonical) open at an epoch, 0 for the live ones.
   : page={\ care nat path}res[axal[myth]] epoch={\ care nat path}res[axal[myth]]
     version={\ path}res[axal[myth]] case={\ care path}maybe[nat]
-    culled={\ path}bool
+    culled={\ path}bool edges={\ nat path}res[row[reference_edge]] canonical={\ path}path
 +  sovereign_reader
   \ state=namespace
   ^ namespace_reader
@@ -241,7 +244,15 @@
           values
             | records.run (\ record (unpin record.myth))
         | ./known values
+      = asked target
+        target (state.local_name asked)
+        foreign !(equal[path] asked target)
       ?> (./some history) state.history(target) .unknown
+      '  A publisher's case of a mounted name is the local case that
+      '  acquired it; one never acquired here is unknown, never absent.
+      = pinned c
+        c (? (and foreign (gt pinned 0)) (mount_case pinned target history) pinned)
+      ? (and foreign (and (gt pinned 0) (eq c 0))) .unknown
       = paged (store_page cr c target history)
       '  A y or z read of the latest case beneath a record-less prefix
       '  (a folder with children and no record of its own) is the
@@ -261,23 +272,31 @@
     epoch
       \ cr=care ep=nat target=path
       ^ res[axal[myth]]
+      = target (state.local_name target)
       ?> (./some history) state.history(target) .unknown
       | store_epoch cr ep target history
     version
       \ target=path
       ^ res[axal[myth]]
       ? (eq target.len 0) .unknown
+      = target (state.local_name target)
       ?> (./some history) state.history(target) .unknown
       | ./known (h_ver target history)
     case
       ' The current case of a path at a care, record or folder.
       \ cr=care target=path
       ^ maybe[nat]
-      ? cr
-       > .x state.local.x_case(target)
-       > .y state.local.y_case(target)
-      state.local.z_case(target)
-  | namespace_reader page epoch version case (store_culled state.local)
+      | state.case(cr target)
+    edges
+      \ ep=nat target=path
+      ^ res[row[reference_edge]]
+      ? (gt ep state.local.top) .unknown
+      | ./known (reference_index/beneath target (? (eq ep state.local.top) 0 ep) state.local.references)
+    canonical
+      \ name=path
+      ^ path
+      | reference_index/canonical state.self name
+  | namespace_reader page epoch version case (store_culled state.local) edges canonical
 +  is_h_version
   \ target=path
   ^ bool
@@ -292,6 +311,52 @@
   ? ((eq width 0) || (lt requested.len (add width 3))) []
   = target | requested.drop(3).take(width)
   [(dep .z target) (dep .z target.take(1))]
++  reverse_view
+  ' The references naming a target, at an epoch (0: live), as a listing:
+  ' its own record counts them; each edge is a record at
+  ' <slot width>/<slot...>/<holder...>, so two slots of one holder, or one
+  ' slot of two holders, never collide.  holder, slot and target are the
+  ' edge's own; since is the epoch it appeared.  A holder's first segment
+  ' is the world that asserted it, a mounted record included, since every
+  ' name is in its publisher's spelling.
+  \ epoch=nat target=path reader=namespace_reader
+  ^ res[axal[myth]]
+  = name (reader.canonical target)
+  ?> (./known found) (reader.edges epoch name) .unknown
+  = root (myth/sing ['count] (pails/n found.len))
+  | ./known
+  | found.fold (axal/new[myth] (./some root))
+    \ out=axal[myth] edge=reference_edge
+    ^ axal[myth]
+    = at=path [($u edge.slot.len)]
+      record
+        . (myth/sing ['holder] (safe 0 .x edge.holder))
+          put(['slot] (pails/p edge.slot))
+          put(['target] edge.target)
+          put(['since] (pails/n edge.since))
+    | out.put at.weld(edge.slot).weld(edge.holder) record
++  reverse_triggers
+  ' What a /r read depends on: the clock of its target's listing, which
+  ' moves exactly when an edge at or beneath the target appears or ends.
+  \ requested=path reader=namespace_reader
+  ^ row[dep]
+  ?> (./some address) (r_parse requested) []
+  | [(dep .z (r_spell (reader.canonical address.target)))]
++  mount_case
+  ' The local case of a mounted record holding its publisher's case c: the
+  ' mount keeps the publisher's case in remote_case on each case it wrote.
+  ' 0 when that case was never acquired here.
+  \ c=nat local=path history=sov
+  ^ nat
+  ?> (./some top) history.x_case(local) 0
+  % k=nat 1
+  ^ nat
+  ? (gt k top) 0
+  ? history.x_query(k local)
+   > (./known record)
+     ? (eq (record.nat_at(['remote_case] 0)) c) k
+     | _ k.inc
+  | _ k.inc
 +  resolve_view
   '  THE derived-namespace resolver: the cr-shaped answer for pax at
   '  case c, where c=0 means latest.  Real paths answer from the
@@ -307,6 +372,13 @@
   '  shrug.
   \  cr=care c=nat pax=path reader=namespace_reader
   ^  res[axal[myth]]
+
+  ? (is_r pax)
+     ?> (./some address) (r_parse pax) .unknown
+     ?> (./known tree) (reverse_view c address.target reader) .unknown
+     = below tree.dip(address.relative)
+     ? (and (gt address.relative.len 0) (and !(maybe/is_some below.fil) (eq below.kid.size 0))) .unknown
+     | ./known (sorge[myth] cr below)
 
   ? (is_h_version pax)
      ^ res[axal[myth]]
@@ -452,7 +524,16 @@
       ^ res[axal[myth]]
       ? (eq target.len 0) .unknown
       | ./known (h_ver target s)
-  | resolve_view cr c pax (namespace_reader page epoch version (store_case s) (store_culled s))
+    edges
+      \ ep=nat target=path
+      ^ res[row[reference_edge]]
+      ? (gt ep s.top) .unknown
+      | ./known (reference_index/beneath target (? (eq ep s.top) 0 ep) s.references)
+    canonical
+      \ name=path
+      ^ path
+      name
+  | resolve_view cr c pax (namespace_reader page epoch version (store_case s) (store_culled s) edges canonical)
 +  sovereign_view
   \ cr=care c=nat pax=path state=namespace
   ^ res[axal[myth]]
@@ -1047,13 +1128,14 @@
   ^ axal[myth]
   = structural | sovereign_history_prefix pax
   ? structural.wyt structural
-  ? ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax))))
+  ? ((is_h pax) || ((is_o pax) || ((is_xv pax) || ((is_cx pax) || (is_r pax)))))
     ? (sovereign_view .z 0 pax state)
      > (./known records) records
     | axal/new[myth] .none
   ? (eq pax.len 0)
     = records | state.root .z
     | records.run (\ record (unpin record.myth))
+  = pax (state.local_name pax)
   ?> (./some history) state.history(pax) (axal/new[myth] .none)
   | peek pax history
 +  sovereign_care
@@ -1065,6 +1147,7 @@
     = records | state.root c
     | records.run (\ record (unpin record.myth))
   ? ?=(.x c)
+    = pax (state.local_name pax)
     ? state.history(pax)
      > (./some history)
        = record=maybe[myth]
