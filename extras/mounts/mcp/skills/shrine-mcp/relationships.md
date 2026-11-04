@@ -224,6 +224,20 @@ Tell the owner through `/attention/<n>` (`note`), which the host mails, and
 only when a person must decide or should know: a need satisfied, a peer gone
 quiet, a term outside the ceiling. Nothing else leaves the world.
 
+## Notes on the page
+
+The owner reads the world as a document: every name is a page, and notes sit
+in its margin. A note is a record beneath the name it is about:
+`<name>/talk/<n> {text, by, at}`. When the owner writes one you are run with
+it; read the name it is about, do what it asks under the rules, and answer
+beneath it as `<name>/talk/<n>/r<k> {text, by: agent, at}` saying what you did
+and what happens next. Write a note yourself on the name that moved when the
+owner should see it there (a supplier closed: a note on each need that relied
+on it, found by its references). Short, dated, plain. A note that states a
+standing wish ("always…", "whenever…") becomes a rule: write it under the
+world's rules with typed references to the names it concerns, and say so in
+your answer.
+
 ## One fact in one place
 
 A peer's terms live at `/her/<peer>/<name>`; a judgment or a need's status
