@@ -274,7 +274,7 @@ def result_of(port, node, rid):
 
 
 host, fixture, gateway, host_logs, gateway_logs = None, None, None, 0, 0
-if subprocess.run(['pgrep', '-f', 'relationship-'], capture_output=True).stdout.decode().split() != []: raise SystemExit('an earlier run of this gate is still running')
+if subprocess.run(['pgrep', '-f', r'(x/eden|shrine-mesa (host|gateway)|wisp).*\.check/relationship-'], capture_output=True).stdout.decode().split() != []: raise SystemExit('an earlier run of this gate is still running')
 if not os.access(BIN, os.X_OK): raise SystemExit(f'no shrine-mesa binary at {BIN}')
 for d in (STATE, OUTBOX, INBOX, WORLDS): os.makedirs(d, exist_ok=True)
 
