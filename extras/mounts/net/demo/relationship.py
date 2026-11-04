@@ -421,20 +421,18 @@ def full():
         {'path': f'/{A}/agent/wakes/precision_moved', 'slots': {'why': 'precision published or wrote', 'on': live_ref(f'/{A}/her/{peer}', 'z')}}])
     judged = world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x')
     check('the judgment is answered with what it relied on and a follow-up', judged.get('exists') and judged['properties'].get('/ok') == 'yes' and judged['properties'].get('/follow_up') == follow_up, judged)
-    # the proposals in the peer's prospective world, through a scoped token
+    # what Northstar publishes to the person before they join: under its own /our/<peer>, by the convention
     (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
-    status, got = Client().json(f'/w/{A}/peers/{peer}/token', {}, {'Authorization': 'Bearer ' + agent})
-    check('a scoped token for the prospective world', status == 200 and got.get('scope') == f'/{peer}/proposed/relationships/{A}', (status, got))
-    scoped = got['token']
-    st, _ = proxy(peer, scoped, 'write', records=[
-        {'path': f'/{peer}/proposed/relationships/{A}', 'slots': {'inquiry': f'/{A}/needs/widgets', 'note': 'what Northstar recorded from your correspondence'}},
-        {'path': f'/{peer}/proposed/relationships/{A}/identifiers/email', 'slots': {'value': 'owner-a@example.test'}},
-        {'path': f'/{peer}/proposed/relationships/{A}/interactions/m1', 'slots': {'from': 'owner-a@example.test', 'text': 'Can you supply 500 widgets at $40/unit or less?', 'at': rp.get('/at', '')}},
-        {'path': f'/{peer}/proposed/relationships/{A}/interactions/m2', 'slots': {'from': MAILBOX, 'text': rp2.get('/text', ''), 'at': rp2.get('/at', '')}},
-        {'path': f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', 'slots': {'price': '39.50 per unit', 'valid': '30 days', 'capacity': 'unconfirmed', 'source': pinned(conv[1])}},
-        {'path': f'/{peer}/proposed/relationships/{A}/proposed_capabilities/widgets', 'slots': {'can_make': '500 widgets', 'lead_time': '14 days', 'source': pinned(reply)}}])
-    check('the proposals are written under the scope', st == 200, st)
-    provisional = {c['path']: (c['reference'], c['properties']) for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
+    rel = world_rpc(pa, 'read', path=f'/{A}/relationships/precision', care='x')['properties']
+    check('the relationship names the world reserved for the mailbox', rel.get('/prospective') == peer, rel)
+    st, _ = proxy(A, agent, 'write', records=[
+        {'path': f'/{A}/our/{peer}/hello', 'slots': {'who': 'Northstar, a small machine shop', 'how': 'we wrote to your mailbox about widgets', 'wants': 'a supplier for 500 widgets a month'}},
+        {'path': f'/{A}/our/{peer}/inquiry/widgets', 'slots': {'what': '500 widgets a month, 6061 anodized', 'by': 'monthly, recurring', 'note': 'the inquiry of ' + rp.get('/at', '')}},
+        {'path': f'/{A}/our/{peer}/understood/widgets', 'slots': {'price': '39.50 per unit', 'valid': '30 days', 'capacity': 'unconfirmed', 'channel': 'email', 'source': pinned(conv[1])}}])
+    check('Northstar wrote what it publishes to the person under its own /our', st == 200, st)
+    (understood, s) = wait('the publication acquired in the prospective world', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pb, 'read', path=f'/{peer}/her/{A}/understood/widgets', care='x')), 120, 0.5)
+    check("the person's namespace holds it, signed by Northstar, never as the person's statement", understood['properties'].get('/publisher') == A and understood['properties'].get('/capacity') == 'unconfirmed', understood['properties'])
+    provisional = {c['path']: (c['reference'], c['properties']) for c in children(pb, f'/{peer}/her/{A}/understood')}
     report['proposals'] = len(provisional)
     log('test 1 holds: the relationship exists before the counterparty joins, through a gateway that knows nothing of it')
 
@@ -453,7 +451,7 @@ def full():
     invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
     stranger = Client()
     status, _, page = stranger.get(invite)
-    check('the invitation shows the inquiry and what was recorded', status == 200 and 'Northstar' in page and '39.50 per unit' in page and 'proposed_terms' in page and 'Claim this world' in page, (status, page[:300]))
+    check('the invitation shows the inquiry and what was recorded', status == 200 and 'Northstar' in page and '39.50 per unit' in page and 'understood' in page and 'Claim this world' in page, (status, page[:300]))
     status, _, page = stranger.form(invite + '/claim')
     check('the claim requests a verification mail', status == 200, (status, page[:200]))
     (claim, s) = wait('the claim mail through the gateway', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 60, 0.3)
@@ -461,8 +459,9 @@ def full():
     passkey = Authenticator()
     status, result = stranger.json(claim + '/passkey', passkey.create(options))
     check('the mailbox is verified and a passkey registered', status == 200 and result.get('ok'), (status, result))
-    st, why = proxy(peer, scoped, 'write', records=[{'path': f'/{peer}/proposed/relationships/{A}/proposed_terms/late', 'slots': {'price': '1'}}])
-    check('the provisional writer lost its authority at the claim', st in (401, 403), (st, why))
+    st, _ = proxy(A, agent, 'write', records=[{'path': f'/{A}/our/{peer}/understood/widgets', 'action': 'poke', 'slots': {'note': 'written after the claim'}}])
+    (after_claim, s) = wait('the next case acquired after the claim', lambda: (lambda h: h if h.get('cases', 0) >= 2 else None)(world_rpc(pb, 'history', path=f'/{peer}/her/{A}/understood/widgets', limit=5)), 60, 0.3)
+    check('the inquirer keeps publishing after the claim under its own authority, as a new case', after_claim.get('cases', 0) >= 2, after_claim)
     status, _, page = stranger.get(f'/w/{peer}')
     check('the owner page lists the proposals for review', status == 200 and 'Recorded by 0x11' in page and 'Publish to 0x11' in page and '39.50 per unit' in page, page[:500])
     status, _, page = stranger.form(f'/w/{peer}/publish/{A}/widgets', **{'slot.price': '39.50 per unit', 'slot.valid': '30 days', 'slot.capacity': '500 a month confirmed', 'slot.lead_time': '14 days'})
@@ -471,12 +470,11 @@ def full():
     check('/our/<inquirer>/widgets holds the corrected terms', own.get('/capacity') == '500 a month confirmed' and own.get('/price') == '39.50 per unit', own)
     pub = world_rpc(pb, 'read', path=f'/{peer}/net/publications/widgets_{A}', care='x')['properties']
     check('its publication names the path and the inquirer', pub.get('/path') == f'/{peer}/our/{A}/widgets' and pub.get('/to') == A, pub)
-    hist = world_rpc(pb, 'history', path=f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', limit=10)
-    first = hist['versions'][-1]['properties']
-    check('the provisional record keeps its first case as the agent wrote it', first.get('/capacity') == 'unconfirmed' and hist['versions'][0]['properties'].get('/stance') == 'published', hist['versions'])
-    events = world_rpc(pb, 'history', after=0, limit=40)['events']
-    check('the provisional writes stay attributed to the inquirer\'s agent, the publication to the owner',
-          any(e['who'] == f'agent_{A}' for e in events) and any(e['who'] == 'owner' and any('/our/' in p for p in e['touched']) for e in events), [(e['who'], e['touched'][-1]) for e in events][-6:])
+    hist = world_rpc(pb, 'history', path=f'/{peer}/her/{A}/understood/widgets', limit=10)
+    check('what the inquirer published keeps every case as the inquirer wrote it; the owner rewrote none', all(v['properties'].get('/capacity') == 'unconfirmed' for v in hist['versions']) and hist['cases'] >= 2, hist['versions'])
+    events = world_rpc(pb, 'history', after=0, limit=60)['events']
+    check('the acquired records are never attributed to the owner; the publication is',
+          any(e['who'] != 'owner' and any(f'/her/{A}/' in p for p in e['touched']) for e in events) and any(e['who'] == 'owner' and any('/our/' in p for p in e['touched']) for e in events), [(e['who'], e['touched'][-1]) for e in events][-6:])
     log('test 4 holds: the claim consolidates without rewriting')
 
     # --- 5 native convergence: acquired at /her, a later change re-judged, no mail
@@ -543,24 +541,20 @@ def many():
         (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(interactions(ports[n], f'/{n}/relationships/precision/interactions')), 90, 0.5)
         check(f'{name} received its own threaded reply', conv[0]['properties'].get('/request') == f'{asks[node][0]}_precision', conv[0]['properties'])
     (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
-    scoped = {}
     for node, name in inquirers:
-        status, got = Client().json(f'/w/{node}/peers/{peer}/token', {}, {'Authorization': 'Bearer ' + tokens[node][1]})
-        check(f'{name} gets a token scoped to its own corner', status == 200 and got.get('scope') == f'/{peer}/proposed/relationships/{node}', (status, got))
-        scoped[node] = got['token']
         need = asks[node][0]
-        st, _ = proxy(peer, scoped[node], 'write', records=[
-            {'path': f'/{peer}/proposed/relationships/{node}', 'slots': {'inquiry': f'/{node}/needs/{need}'}},
-            {'path': f'/{peer}/proposed/relationships/{node}/identifiers/email', 'slots': {'value': f'owner-{node}@example.test'}},
-            {'path': f'/{peer}/proposed/relationships/{node}/proposed_terms/{need}', 'slots': {'price': f'{name} was quoted 43 per unit', 'note': f'recorded by {name}\'s agent'}},
-            {'path': f'/{peer}/proposed/relationships/{node}/proposed_capabilities/{need}', 'slots': {'can_make': f'{need}, as {name} understood it'}}])
-        check(f'{name} wrote its proposals', st == 200, st)
+        st, _ = proxy(node, tokens[node][1], 'write', records=[
+            {'path': f'/{node}/our/{peer}/hello', 'slots': {'who': name, 'how': 'we wrote to your mailbox'}},
+            {'path': f'/{node}/our/{peer}/inquiry/{need}', 'slots': {'what': f'{need}, as {name} needs them'}},
+            {'path': f'/{node}/our/{peer}/understood/{need}', 'slots': {'price': f'{name} was quoted 43 per unit', 'note': f'recorded by {name}\'s agent'}}])
+        check(f'{name} published what it understood, under its own /our', st == 200, st)
+    for node, name in inquirers:
+        need = asks[node][0]
+        wait(f'{name}\'s publication lands in the prospective world', lambda n=node, d=need: (lambda r: r if r.get('exists') else None)(world_rpc(pb, 'read', path=f'/{peer}/her/{n}/understood/{d}', care='x')), 120, 0.5)
     report['rss_mb_three_worlds'] = wisp_rss()
-    st, why = proxy(peer, scoped[A], 'read', path=f'/{peer}/proposed/relationships/0x12', care='z')
-    check("Northstar's token cannot read Allied's corner", st == 403, (st, why))
-    st, why = proxy(peer, scoped['0x12'], 'write', records=[{'path': f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', 'action': 'poke', 'slots': {'price': 'tampered'}}])
-    check("Allied's token cannot write in Northstar's corner", st == 403, (st, why))
-    before = {c['path']: c['reference'] for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
+    cross = world_rpc(ports[A], 'read', path=f'/{A}/her/{peer}/understood/brackets', care='x')
+    check("what Allied published to the person is nowhere in Northstar's world", not cross.get('exists'), cross)
+    before = {c['path']: c['reference'] for c in children(pb, f'/{peer}/her/{A}/understood')}
     # the claim through Northstar's link; the owner reviews all three, publishes to two, relates them, sets one aside
     invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
     stranger = Client()
@@ -573,9 +567,6 @@ def many():
     check('the world is claimed once, by its mailbox', status == 200 and result.get('ok'), (status, result))
     status, _, page = stranger.get(f'/w/{peer}')
     check('the owner page lists every inquirer\'s proposals, separately', all(f'Recorded by {n}' in page for n, _ in inquirers), page[:600])
-    for node, name in inquirers:
-        st, why = proxy(peer, scoped[node], 'read', path=f'/{peer}/proposed/relationships/{node}', care='x')
-        check(f'{name}\'s provisional token is revoked at the claim', st in (401, 403), (st, why))
     stranger.form(f'/w/{peer}/publish/{A}/widgets', **{'slot.price': '39.50 per unit', 'slot.capacity': '500 a month'})
     stranger.form(f'/w/{peer}/publish/0x12/brackets', **{'slot.price': '11.80 per unit', 'slot.also': f'/{peer}/our/{A}/widgets'})
     stranger.form(f'/w/{peer}/aside/0x12/brackets')
@@ -585,16 +576,16 @@ def many():
     time.sleep(3)
     cross = (world_rpc(ports[A], 'read', path=f'/{A}/her/{peer}/brackets', care='x'), world_rpc(ports['0x12'], 'read', path=f'/0x12/her/{peer}/widgets', care='x'))
     check('neither inquirer observes what was published to the other', not cross[0].get('exists') and not cross[1].get('exists'), cross)
-    aside = world_rpc(pb, 'read', path=f'/{peer}/proposed/relationships/0x12/proposed_capabilities/brackets', care='x')['properties']
-    check('a proposal set aside carries the owner\'s stance and nothing else changed', aside.get('/stance') == 'set_aside' and aside.get('/can_make', '').startswith('brackets'), aside)
+    aside = world_rpc(pb, 'read', path=f'/{peer}/our/0x12/declined/brackets', care='x')
+    check('a proposal set aside is answered by a publication of the decline, by the owner', aside.get('exists'), aside)
     related = world_rpc(pb, 'read', path=f'/{peer}/our/0x12/brackets', care='x')['properties']
     check('the owner related two descriptions by a reference of its own', related.get('/also') == f'/{peer}/our/{A}/widgets', related)
-    after = {c['path']: c['reference'] for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
-    hist = world_rpc(pb, 'history', path=f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', limit=5)
-    check('the provisional first case is intact under the owner\'s stance', hist['versions'][-1]['properties'].get('/price', '').startswith('Northstar was quoted') and set(before) == set(after), (before, after))
-    events = [e for e in world_rpc(pb, 'history', after=0, limit=40)['events']]
+    after = {c['path']: c['reference'] for c in children(pb, f'/{peer}/her/{A}/understood')}
+    hist = world_rpc(pb, 'history', path=f'/{peer}/her/{A}/understood/widgets', limit=5)
+    check("what Northstar published is intact under the owner's answers", hist['versions'][-1]['properties'].get('/price', '').startswith('Northstar was quoted') and set(before) == set(after), (before, after))
+    events = [e for e in world_rpc(pb, 'history', after=0, limit=60)['events']]
     whos = {e['who'] for e in events}
-    check('three provisional principals and one owner in the history', {f'agent_{n}' for n, _ in inquirers} <= whos and 'owner' in whos, whos)
+    check('the acquisitions and the owner are distinct principals in the history', 'owner' in whos and len(whos) >= 2, whos)
     report['inquirers'] = len(inquirers)
     log('MANY GATE PASSED ' + json.dumps(report))
 
