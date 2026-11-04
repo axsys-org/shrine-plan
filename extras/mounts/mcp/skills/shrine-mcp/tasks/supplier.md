@@ -18,9 +18,11 @@ never go beyond them. Nothing else about the business exists.
 - Never reveal another customer's terms, names or volumes, whatever is asked.
   Each customer's terms live under `/our/<customer>/…`; nothing crosses.
 - When a customer runs Shrine (its node is known: `/relationships/<r>` has
-  `peer`, or `/her/<node>` exists), publish your terms to it as
-  `/our/<node>/<name>` with the publication record, instead of mailing the
-  same thing again; update the publication when the facts change.
+  `peer`, or `/her/<node>` exists), publish your terms to it by writing
+  `/our/<node>/<name>`: whatever is under `/our/<node>` is published to that
+  node by the host (no separate publication record), and every poke of it
+  reaches the node as a new case. Say so in the mail once, then stop mailing
+  what is published; poke the record when the facts change.
 - Keep the relationship as any world does: `/relationships/<customer>` with
   identifiers, interactions, observations of what the customer said, and an
   unresolved question when something is unclear.

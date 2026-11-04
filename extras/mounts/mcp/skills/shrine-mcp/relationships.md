@@ -51,7 +51,9 @@ to them so the next agent, and the person, find things where they expect.
                                       /judgments/<peer>/result is your answer
 /relationships/<peer>/unresolved/<n>  a question still open, with a due
 /her/<peer>/<name>                    what the peer publishes to this world, over Mesa; read-only
-/our/<peer>/<name>                    what the owner publishes to the peer; not yours to write
+/our/<peer>/<name>                    what this world publishes to the peer: anything written under /our/<peer> is
+                                      published to that peer by the host, each poke a new case (the owner's to write;
+                                      an agent writes there only when the owner's approval or skill says so)
 /her/<gateway>/ports/<port>           what a gateway can do for this world (kind, address, operations)
 /our/<gateway>/requests/<id>          an effect you ask a gateway for; yours to write (below)
 /her/<gateway>/results/<id>           what became of it: sent, failed, or unknown; read-only
