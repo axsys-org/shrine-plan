@@ -250,7 +250,8 @@ def start_gateway(serves):
     """The mail gateway process beside its world (registered with the host like any world): the directory transport."""
     global gateway, gateway_logs
     gateway_logs += 1
-    json.dump({'world': f'http://127.0.0.1:{port_of(G)}', 'node': G, 'serves': serves, 'poll_ms': 400, 'transport': {'dir': GWMAIL, 'from': 'gateway@shrine.local'}},
+    json.dump({'world': f'http://127.0.0.1:{port_of(G)}', 'node': G, 'poll_ms': 400,
+               'adapters': [{'kind': 'email', 'id': 'mail', 'bind': serves, 'transport': {'dir': GWMAIL, 'from': 'gateway@shrine.local'}}]},
               open(GWCONFIG, 'w'), indent=1)
     gateway = subprocess.Popen([BIN, 'gateway', '--config', GWCONFIG], stdout=open(os.path.join(TEMP, f'gateway-{gateway_logs}.log'), 'w'), stderr=subprocess.STDOUT, cwd=TEMP, start_new_session=True)
 
@@ -359,8 +360,10 @@ def full():
     (pg, s) = wait('the gateway world', lambda: up(G), 300, 2); log(f'gateway world {G} up in {s} s')
     stdlib = {c['path'].rsplit('/', 1)[1]: pinned(c) for c in world_rpc(pa, 'read', path=f'/{A}/weft/stdlib', care='y', limit=100)['children']}
     world_rpc(pa, 'write', who='owner', records=[{'path': f'/{A}/net/self', 'action': 'poke', 'slots': {'name': 'Northstar'}}])
-    (port_record, s) = wait('the gateway\'s port acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/ports/mail', care='x')), 120, 0.5)
-    check('the gateway advertises send over email, with its address', port_record['properties'].get('/kind') == 'email' and port_record['properties'].get('/operations') == 'send' and '@' in port_record['properties'].get('/address', ''), port_record['properties'])
+    (port_record, s) = wait('the gateway\'s port acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/ports/email', care='x')), 120, 0.5)
+    check('the gateway advertises send over email, with its endpoint', port_record['properties'].get('/kind') == 'email' and port_record['properties'].get('/operations') == 'send' and port_record['properties'].get('/endpoints') == 'mail', port_record['properties'])
+    (binding, s) = wait('the binding acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/bindings/{A}/mail', care='x')), 60, 0.5)
+    check('the world sees its own binding to the endpoint, for send and receive', 'send' in binding['properties'].get('/operations', '') and 'receive' in binding['properties'].get('/operations', ''), binding['properties'])
     log(f'port acquired {s} s after both worlds were up')
 
     # --- 1 the relationship begins: a need, the folder, the standing approval, the first request
@@ -392,7 +395,7 @@ def full():
     events = world_rpc(pa, 'history', after=0, limit=60)['events']
     check('the interaction event carries the gateway as its principal', any(e['who'] == G and any(p.startswith(f'/{A}/relationships/precision/interactions/') for p in e['touched']) for e in events), [(e['who'], e['touched'][-1]) for e in events][-6:])
     attempt = world_rpc(pg, 'read', path=f'/{G}/attempts/{A}/{rid}', care='x')['properties']
-    check('the gateway recorded its attempt before sending and closed it', attempt.get('/status') == 'done' and attempt.get('/message_id') == res.get('/message_id'), attempt)
+    check('the gateway recorded its attempt before sending and closed it', attempt.get('/status') == 'done' and attempt.get('/external_id') == res.get('/message_id') and attempt.get('/endpoint') == 'mail', attempt)
     # the agent's observation, a counter-offer on the same thread
     proxy(A, agent, 'write', records=[
         {'path': f'/{A}/relationships/precision/observations/o1', 'slots': {'about': 'widgets', 'said': 'can make 500; current price 43 per unit', 'by': MAILBOX, 'at': rp.get('/at', ''), 'source': pinned(reply)}},
