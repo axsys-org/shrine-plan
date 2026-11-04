@@ -5,16 +5,22 @@
               fires for the agent's own writes, an unrelated relationship or a culled wake; every run is recorded;
               a wake declared before a kill -9 fires after the restart. One world. No domain words anywhere.
 
-(default)     the relationship before and after adoption, with the inbox fixture playing Precision Works and the
-              gate itself writing what the agent would write (deterministic; the real agent runs in the
-              recording): an approved outreach mails and provisions a prospective world; the reply lands by
-              threading as a conversation record by `mail`; observations cite it; a counter-offer goes out and is
-              answered; the judgment cell beside the folder is answered; proposals are written into the peer's
-              prospective world through a scoped token; everything survives a kill -9 and restart; the invitation
-              shows the prospective namespace; the claim (mailbox, passkey) opens the owner page listing the
-              proposals; publishing one writes /our/<inquirer>/<name> and its publication; the inquirer acquires
-              it at /her/<peer>/<name> over Mesa; the scoped token is revoked; a later change by the owner arrives
-              as the next case and makes the judgment ask again with no mail sent for it.
+(default)     the relationship before and after adoption, through the mail gateway (an ordinary Mesa peer: its own
+              hosted world, its own sidecar, and `shrine-mesa gateway` on the directory transport), with the inbox
+              fixture playing Precision Works by dropping reply files into the gateway's inbox, and the gate itself
+              writing what the agent would write (deterministic; the real agent runs in the recording): a request
+              under /our/<gateway>/requests is published once the standing approval covers it; the gateway
+              acquires it, sends, and publishes the result, acquired at /her/<gateway>/results; the reply arrives as
+              the gateway's inbound, acquired at /her/<gateway>/inbound, and the host files it as an interaction of
+              the relationship by the request it answers, written as the gateway with a source reference;
+              observations cite it; a counter-offer goes out on the same thread and is answered; the judgment cell
+              beside the folder is answered; proposals are written into the peer's prospective world through a
+              scoped token; everything survives a kill -9 and restart, and an attempt the gateway left unfinished
+              comes back as an `unknown` result; the invitation shows the prospective namespace; the claim
+              (mailbox, passkey) opens the owner page listing the proposals; publishing one writes
+              /our/<inquirer>/<name> and its publication; the inquirer acquires it at /her/<peer>/<name> over Mesa;
+              the scoped token is revoked; a later change by the owner arrives as the next case and makes the
+              judgment ask again with no mail sent for it.
 
 Flags: --keep, --bin <shrine-mesa>.
 """
@@ -35,9 +41,10 @@ HOST_PORT = 8400
 ORIGIN = f'http://localhost:{HOST_PORT}'
 RP_ID = 'localhost'
 A = '0x11'
+G = '0x1f'
 MAILBOX = 'precision@example.test'
-SECRET = 'fixture-inbound-secret'
-STATE, OUTBOX, WORLDS, CONFIG = (os.path.join(TEMP, d) for d in ('state', 'outbox', 'worlds', 'host.json'))
+STATE, WORLDS, CONFIG, GWMAIL, GWCONFIG = (os.path.join(TEMP, d) for d in ('state', 'worlds', 'host.json', 'gw-mail', 'gateway.json'))
+OUTBOX, INBOX = os.path.join(GWMAIL, 'out'), os.path.join(GWMAIL, 'in')
 report, t_start = {}, time.monotonic()
 
 
@@ -194,19 +201,20 @@ def link_in(body, kind):
 
 
 def kill_everything(sig=signal.SIGKILL):
-    global host, fixture
-    for p in (host, fixture):
+    global host, fixture, gateway
+    for p in (host, fixture, gateway):
         if p and p.poll() is None:
             os.kill(p.pid, sig); p.wait(timeout=30)
     subprocess.run(['pkill', f'-{int(sig)}', '-x', 'wisp']); time.sleep(1)
     subprocess.run(['pkill', f'-{int(sig)}', '-f', 'x/eden --node']); subprocess.run(['pkill', f'-{int(sig)}', '-f', 'shrine-mesa serve'])
+    subprocess.run(['pkill', f'-{int(sig)}', '-f', 'shrine-mesa gateway'])
     time.sleep(1)
 
 
 def write_config(wake=None):
     cfg = {'listen': f'127.0.0.1:{HOST_PORT}', 'origin': ORIGIN, 'rp_id': RP_ID, 'name': 'Shrine pilot host', 'state': STATE, 'shrine': BASE,
            'mounts': ['net', 'mcp', 'probe'], 'worlds': WORLDS, 'ports': {'world': 8500, 'mesa': 9500, 'flow': 9600}, 'node_base': '0x20',
-           'poll_ms': 300, 'mail': {'dir': OUTBOX, 'inbound_secret': SECRET}}
+           'poll_ms': 300, 'gateways': {'mail': G}}
     if wake: cfg['wake'] = wake
     json.dump(cfg, open(CONFIG, 'w'), indent=1)
 
@@ -226,8 +234,17 @@ def start_host():
 
 def start_fixture():
     global fixture
-    fixture = subprocess.Popen([sys.executable, os.path.join(HERE, 'fixtures', 'counterparty.py'), '--outbox', OUTBOX, '--hook', f'{ORIGIN}/hooks/mail/{SECRET}',
+    fixture = subprocess.Popen([sys.executable, os.path.join(HERE, 'fixtures', 'counterparty.py'), '--outbox', OUTBOX, '--inbox', INBOX,
                                 '--market', os.path.join(HERE, 'fixtures', 'market.json')], stdout=open(os.path.join(TEMP, 'fixture.log'), 'w'), stderr=subprocess.STDOUT)
+
+
+def start_gateway(serves):
+    """The mail gateway process beside its world (registered with the host like any world): the directory transport."""
+    global gateway, gateway_logs
+    gateway_logs += 1
+    json.dump({'world': f'http://127.0.0.1:{port_of(G)}', 'node': G, 'serves': serves, 'poll_ms': 400, 'transport': {'dir': GWMAIL, 'from': 'gateway@shrine.local'}},
+              open(GWCONFIG, 'w'), indent=1)
+    gateway = subprocess.Popen([BIN, 'gateway', '--config', GWCONFIG], stdout=open(os.path.join(TEMP, f'gateway-{gateway_logs}.log'), 'w'), stderr=subprocess.STDOUT, cwd=TEMP)
 
 
 def live_ref(path, care): return {'type': 'reference', 'value': f'/h/{care}/0/{len(path.strip("/").split("/"))}/{path.strip("/")}'}
@@ -239,14 +256,19 @@ def pinned(record): return {'type': 'reference', 'value': record['reference']}
 def children(port, path): return world_rpc(port, 'read', path=path, care='y').get('children', [])
 
 
-def conversation(port, folder=f'/{A}/relationships/precision/conversation'):
+def interactions(port, folder=f'/{A}/relationships/precision/interactions'):
     return sorted(children(port, folder), key=lambda c: c['path'])
 
 
-host, fixture, host_logs = None, None, 0
+def result_of(port, node, rid):
+    r = world_rpc(port, 'read', path=f'/{node}/her/{G}/results/{rid}', care='x')
+    return r['properties'] if r.get('exists') else None
+
+
+host, fixture, gateway, host_logs, gateway_logs = None, None, None, 0, 0
 if subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True).returncode == 0: raise SystemExit('a wisp is already running')
 if not os.access(BIN, os.X_OK): raise SystemExit(f'no shrine-mesa binary at {BIN}')
-for d in (STATE, OUTBOX, WORLDS): os.makedirs(d, exist_ok=True)
+for d in (STATE, OUTBOX, INBOX, WORLDS): os.makedirs(d, exist_ok=True)
 
 
 def stub_markers(port): return [c['properties'] for c in children(port, f'/{A}/agent/stub')]
@@ -264,8 +286,10 @@ def wake_only():
     stdlib = {c['path'].rsplit('/', 1)[1]: pinned(c) for c in world_rpc(port, 'read', path=f'/{A}/weft/stdlib', care='y', limit=100)['children']}
     check('the stdlib ask cell is seeded', 'ask' in stdlib, list(stdlib)[:10])
     proxy(A, agent, 'write', records=[
-        {'path': f'/{A}/relationships/precision', 'slots': {'contact': 'precision@example.test'}},
-        {'path': f'/{A}/relationships/allied', 'slots': {'contact': 'allied@example.test'}},
+        {'path': f'/{A}/relationships/precision', 'slots': {'note': 'a shop'}},
+        {'path': f'/{A}/relationships/precision/identifiers/email', 'slots': {'value': 'precision@example.test'}},
+        {'path': f'/{A}/relationships/allied', 'slots': {'note': 'another shop'}},
+        {'path': f'/{A}/relationships/allied/identifiers/email', 'slots': {'value': 'allied@example.test'}},
         {'path': f'/{A}/judgments/precision', 'slots': {'sys/weft': stdlib['ask'], 'sys/tack': live_ref(f'/{A}/relationships/precision', 'z'),
                                                         'prompt': 'Does this relationship hold? Say ok or not and why.', 'model': 'any'}}])
     at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 6))
@@ -284,9 +308,9 @@ def wake_only():
     wakes = {c['path'].rsplit('/', 1)[1]: c['properties'] for c in children(port, f'/{A}/agent/wakes')}
     check('fired wakes carry fired, the others do not', '/fired' in wakes['clock'] and '/fired' in wakes['cell'] and '/fired' not in wakes['name'] and '/fired' not in wakes['never'], wakes)
     before = len(stub_markers(port))
-    proxy(A, mail, 'write', records=[{'path': f'/{A}/relationships/precision/conversation/m1', 'slots': {'from': 'precision@example.test', 'text': 'We can make 500 at 43.', 'at': at}}])
+    proxy(A, mail, 'write', records=[{'path': f'/{A}/relationships/precision/interactions/m1', 'slots': {'from': 'precision@example.test', 'text': 'We can make 500 at 43.', 'at': at}}])
     (marks, s) = wait('the name wake', lambda: (lambda m: m if len(m) > before else None)(stub_markers(port)), 30, 0.3)
-    check('the name wake fired with the changed path', any(m.get('/why') == 'precision moved' and 'conversation/m1' in m.get('/paths', '') for m in marks), marks)
+    check('the name wake fired with the changed path', any(m.get('/why') == 'precision moved' and 'interactions/m1' in m.get('/paths', '') for m in marks), marks)
     check('the unrelated relationship fired nothing', not any(m.get('/why') == 'allied moved' for m in marks), marks)
     before = len(stub_markers(port))
     proxy(A, agent, 'write', records=[{'path': f'/{A}/agent/wakes/never', 'action': 'cull'},
@@ -302,7 +326,7 @@ def wake_only():
     time.sleep(3)
     answered = world_rpc(port, 'read', path=f'/x/{A}/judgments/precision', care='x')
     check('the answered cell answers its result', answered.get('exists') and answered['properties'].get('/answer') == 'ok', answered)
-    proxy(A, mail, 'write', records=[{'path': f'/{A}/relationships/precision/conversation/m2', 'slots': {'from': 'precision@example.test', 'text': '39.50 for a recurring order.', 'at': at}}])
+    proxy(A, mail, 'write', records=[{'path': f'/{A}/relationships/precision/interactions/m2', 'slots': {'from': 'precision@example.test', 'text': '39.50 for a recurring order.', 'at': at}}])
     wait('the cell to ask again', lambda: (lambda m: m if any(x.get('/why', '').startswith('the judgment asks again') for x in m) else None)(stub_markers(port)), 30, 0.3)
     check('a changed folder makes the answered cell ask again and the wake fire', True)
     (rs, _) = wait('runs recorded', lambda: (lambda r: r if r and all('/ended' in x for x in r) else None)(runs(port)), 20, 0.5)
@@ -320,39 +344,56 @@ def wake_only():
 def full():
     write_config()
     cli('add-world', '--node', A, '--name', 'Northstar', '--contact', 'owner-a@example.test')
+    cli('add-world', '--node', G, '--name', 'mail gateway', '--contact', 'gateway@shrine.local')
     owner = cli('token', '--node', A, '--who', 'owner'); agent = cli('token', '--node', A, '--who', 'agent')
-    start_host(); start_fixture()
+    start_host(); start_gateway([A]); start_fixture()
     (pa, s) = wait('world A', lambda: up(A), 300, 2); log(f'A up in {s} s')
+    (pg, s) = wait('the gateway world', lambda: up(G), 300, 2); log(f'gateway world {G} up in {s} s')
     stdlib = {c['path'].rsplit('/', 1)[1]: pinned(c) for c in world_rpc(pa, 'read', path=f'/{A}/weft/stdlib', care='y', limit=100)['children']}
     world_rpc(pa, 'write', who='owner', records=[{'path': f'/{A}/net/self', 'action': 'poke', 'slots': {'name': 'Northstar'}}])
+    (port_record, s) = wait('the gateway\'s port acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/ports/mail', care='x')), 120, 0.5)
+    check('the gateway advertises send over email, with its address', port_record['properties'].get('/kind') == 'email' and port_record['properties'].get('/operations') == 'send' and '@' in port_record['properties'].get('/address', ''), port_record['properties'])
+    log(f'port acquired {s} s after both worlds were up')
 
-    # --- 1 the relationship begins: a need, the folder, the standing approval, the first message
+    # --- 1 the relationship begins: a need, the folder, the standing approval, the first request
     proxy(A, owner, 'write', records=[
         {'path': f'/{A}/needs/widgets', 'slots': {'want': '500', 'maximum_price': '40 per unit', 'note': 'a supplier able to resume deliveries when production restarts'}},
         {'path': f'/{A}/needs/widgets/approval', 'slots': {'until': '2027-01-01T00:00:00Z', 'note': 'any outreach about widgets while I sleep'}}])
+    rid = 'widgets_precision'
     proxy(A, agent, 'write', records=[
-        {'path': f'/{A}/relationships/precision', 'slots': {'contact': MAILBOX, 'refers': f'/{A}/needs/widgets'}},
+        {'path': f'/{A}/relationships/precision', 'slots': {'refers': f'/{A}/needs/widgets'}},
+        {'path': f'/{A}/relationships/precision/identifiers/email', 'slots': {'value': MAILBOX}},
         {'path': f'/{A}/judgments/precision', 'slots': {'sys/weft': stdlib['ask'], 'sys/tack': live_ref(f'/{A}/relationships/precision', 'z'),
                                                         'prompt': f'Does this relationship satisfy /{A}/needs/widgets? Say ok or not, why, and when to look again.', 'model': 'any'}},
-        {'path': f'/{A}/net/outreach/widgets_precision/request', 'slots': {'to': MAILBOX, 'about': f'/{A}/needs/widgets', 'relationship': f'/{A}/relationships/precision',
-                                                                           'subject': 'widgets', 'note': 'Can you supply 500 widgets at $40/unit or less? We need a supplier who can resume fulfilling orders when production restarts.'}}])
+        {'path': f'/{A}/our/{G}/requests/{rid}', 'slots': {'do': 'send', 'channel': 'email', 'to': MAILBOX, 'about': f'/{A}/needs/widgets', 'relationship': f'/{A}/relationships/precision',
+                                                         'subject': 'widgets', 'text': 'Can you supply 500 widgets at $40/unit or less? We need a supplier who can resume fulfilling orders when production restarts.'}}])
     t0 = time.monotonic()
-    (conv, s) = wait('the reply by mail', lambda: (lambda c: c if c else None)(conversation(pa)), 90, 0.5)
+    (res, s) = wait('the result from the gateway', lambda: result_of(pa, A, rid), 90, 0.5)
+    report['request_to_result_s'] = round(time.monotonic() - t0, 2)
+    check('the result says sent, with the message id, at the request\'s case', res.get('/status') == 'sent' and res.get('/message_id') and res.get('/case') and res.get('/publisher') == G, res)
+    (conv, s) = wait('the reply by mail', lambda: (lambda c: c if c else None)(interactions(pa)), 90, 0.5)
     report['ask_to_reply_s'] = round(time.monotonic() - t0, 2)
     reply = conv[0]; rp = reply['properties']
-    check('the reply landed by threading as a conversation record by mail', rp.get('/channel') == 'email' and rp.get('/outreach') == 'widgets_precision' and rp.get('/in_reply_to') and '$43' in rp.get('/text', ''), rp)
+    check('the reply was filed as an interaction by the request it answers', rp.get('/channel') == 'email' and rp.get('/request') == rid and rp.get('/in_reply_to') and '$43' in rp.get('/text', ''), rp)
+    check('the interaction references the acquired inbound and names the gateway', rp.get('/source', '').startswith(f'/h/x/') and f'/her/{G}/inbound/' in rp.get('/source', '') and rp.get('/gateway') == G, rp)
     check('the reply is attributed and marked simulated', rp.get('/from') == MAILBOX and 'simulated' in rp.get('/text', '') and rp.get('/authenticated') == 'claimed', rp)
-    sent = world_rpc(pa, 'read', path=f'/{A}/net/outreach/widgets_precision/sent', care='x')['properties']
-    peer = sent.get('/peer'); check('sent names the prospective world reserved for the mailbox', peer and peer.startswith('0x'), sent)
-    events = world_rpc(pa, 'history', after=0, limit=40)['events']
-    check('the reply event carries principal mail', any(e['who'] == 'mail' and any(p.startswith(f'/{A}/relationships/precision/conversation/') for p in e['touched']) for e in events), [(e['who'], e['touched'][-1]) for e in events][-5:])
-    # the agent's observation, a counter-offer
+    request = world_rpc(pa, 'read', path=f'/{A}/our/{G}/requests/{rid}', care='x')['properties']
+    check('the host added the claim link as the request\'s footer before publishing', '/i/' in request.get('/footer', ''), request)
+    peer = next((w['node'] for w in registry()['worlds'] if w['contact'] == MAILBOX), None)
+    check('a prospective world is reserved for the mailbox', peer and peer.startswith('0x') and peer not in (A, G), peer)
+    events = world_rpc(pa, 'history', after=0, limit=60)['events']
+    check('the interaction event carries the gateway as its principal', any(e['who'] == G and any(p.startswith(f'/{A}/relationships/precision/interactions/') for p in e['touched']) for e in events), [(e['who'], e['touched'][-1]) for e in events][-6:])
+    attempt = world_rpc(pg, 'read', path=f'/{G}/attempts/{A}/{rid}', care='x')['properties']
+    check('the gateway recorded its attempt before sending and closed it', attempt.get('/status') == 'done' and attempt.get('/message_id') == res.get('/message_id'), attempt)
+    # the agent's observation, a counter-offer on the same thread
     proxy(A, agent, 'write', records=[
         {'path': f'/{A}/relationships/precision/observations/o1', 'slots': {'about': 'widgets', 'said': 'can make 500; current price 43 per unit', 'by': MAILBOX, 'at': rp.get('/at', ''), 'source': pinned(reply)}},
-        {'path': f'/{A}/net/outreach/widgets_precision/request', 'action': 'poke', 'slots': {'note': 'Would you consider $39.50/unit for a recurring arrangement?'}}])
-    (conv, s) = wait('the answer to the counter-offer', lambda: (lambda c: c if len(c) >= 2 else None)(conversation(pa)), 60, 0.5)
+        {'path': f'/{A}/our/{G}/requests/{rid}', 'action': 'poke', 'slots': {'text': 'Would you consider $39.50/unit for a recurring arrangement?', 'in_reply_to': rp.get('/message_id', '')}}])
+    (conv, s) = wait('the answer to the counter-offer', lambda: (lambda c: c if len(c) >= 2 else None)(interactions(pa)), 60, 0.5)
     rp2 = conv[1]['properties']
-    check('the counter-offer was mailed again on the same thread and answered', '39.5' in rp2.get('/text', '') and '30 days' in rp2.get('/text', ''), rp2)
+    check('the counter-offer was sent again on the same thread and answered', '39.5' in rp2.get('/text', '') and '30 days' in rp2.get('/text', '') and rp2.get('/request') == rid, rp2)
+    (res2, s) = wait('the second result', lambda: (lambda r: r if r and int(r.get('/case', 0)) > int(res.get('/case', 0)) else None)(result_of(pa, A, rid)), 30, 0.3)
+    check('one attempt per request case, each with its own result', res2.get('/status') == 'sent' and res2.get('/message_id') != res.get('/message_id'), (res, res2))
     ctx = world_rpc(pa, 'read', path=f'/c/x/{A}/judgments/precision', care='x')['properties']
     check('the judgment cell beside the folder asks', ctx.get('/sys/view/asking', '').startswith('no answer yet'), ctx)
     follow_up = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 26 * 86400))
@@ -375,23 +416,27 @@ def full():
     check('a scoped token for the prospective world', status == 200 and got.get('scope') == f'/{peer}/proposed/relationships/{A}', (status, got))
     scoped = got['token']
     st, _ = proxy(peer, scoped, 'write', records=[
-        {'path': f'/{peer}/proposed/relationships/{A}', 'slots': {'inquiry': f'/{A}/needs/widgets', 'contact': 'owner-a@example.test', 'note': 'what Northstar recorded from your correspondence'}},
-        {'path': f'/{peer}/proposed/relationships/{A}/conversation/m1', 'slots': {'from': 'owner-a@example.test', 'text': 'Can you supply 500 widgets at $40/unit or less?', 'at': rp.get('/at', '')}},
-        {'path': f'/{peer}/proposed/relationships/{A}/conversation/m2', 'slots': {'from': MAILBOX, 'text': rp2.get('/text', ''), 'at': rp2.get('/at', '')}},
+        {'path': f'/{peer}/proposed/relationships/{A}', 'slots': {'inquiry': f'/{A}/needs/widgets', 'note': 'what Northstar recorded from your correspondence'}},
+        {'path': f'/{peer}/proposed/relationships/{A}/identifiers/email', 'slots': {'value': 'owner-a@example.test'}},
+        {'path': f'/{peer}/proposed/relationships/{A}/interactions/m1', 'slots': {'from': 'owner-a@example.test', 'text': 'Can you supply 500 widgets at $40/unit or less?', 'at': rp.get('/at', '')}},
+        {'path': f'/{peer}/proposed/relationships/{A}/interactions/m2', 'slots': {'from': MAILBOX, 'text': rp2.get('/text', ''), 'at': rp2.get('/at', '')}},
         {'path': f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', 'slots': {'price': '39.50 per unit', 'valid': '30 days', 'capacity': 'unconfirmed', 'source': pinned(conv[1])}},
         {'path': f'/{peer}/proposed/relationships/{A}/proposed_capabilities/widgets', 'slots': {'can_make': '500 widgets', 'lead_time': '14 days', 'source': pinned(reply)}}])
     check('the proposals are written under the scope', st == 200, st)
     provisional = {c['path']: (c['reference'], c['properties']) for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
     report['proposals'] = len(provisional)
-    log('test 1 holds: the relationship exists before the counterparty joins')
+    log('test 1 holds: the relationship exists before the counterparty joins, through a gateway that knows nothing of it')
 
-    # --- 2 persistence: kill everything, restart, the records and the wakes are there
-    kill_everything(signal.SIGKILL); log('host, fixture, worlds and services killed')
-    t0 = time.monotonic(); start_host(); start_fixture()
-    wait('both worlds back', lambda: up(A) and up(peer), 300, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
-    check('the conversation, the judgment and the wakes survive', len(conversation(pa)) == 2 and world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x').get('exists')
+    # --- 2 persistence: kill everything, restart; the records and the wakes are there; an unfinished attempt is reported unknown
+    world_rpc(pg, 'write', who='gateway', records=[{'path': f'/{G}/attempts/{A}/ghost', 'slots': {'case': 1, 'status': 'attempting', 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}])
+    kill_everything(signal.SIGKILL); log('host, gateway, fixture, worlds and services killed')
+    t0 = time.monotonic(); start_host(); start_gateway([A]); start_fixture()
+    wait('the worlds back', lambda: up(A) and up(peer) and up(G), 300, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
+    check('the interactions, the judgment and the wakes survive', len(interactions(pa)) == 2 and world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x').get('exists')
           and len(children(pa, f'/{A}/agent/wakes')) == 2, 'after restart')
-    log('test 2 holds: nothing lives in a process')
+    (ghost, s) = wait('the unknown result', lambda: result_of(pa, A, 'ghost'), 60, 0.5)
+    check('an attempt the gateway could not finish comes back as unknown, never sent again', ghost.get('/status') == 'unknown' and 'restart' in ghost.get('/error', ''), ghost)
+    log('test 2 holds: nothing lives in a process, and uncertainty is recorded as such')
 
     # --- 4 claiming: the invitation shows the prospective namespace; claim, passkey, review, publish
     invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
@@ -399,8 +444,8 @@ def full():
     status, _, page = stranger.get(invite)
     check('the invitation shows the inquiry and what was recorded', status == 200 and 'Northstar' in page and '39.50 per unit' in page and 'proposed_terms' in page and 'Claim this world' in page, (status, page[:300]))
     status, _, page = stranger.form(invite + '/claim')
-    check('the claim mails a verification link', status == 200, (status, page[:200]))
-    (claim, s) = wait('the claim mail', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 30, 0.3)
+    check('the claim requests a verification mail', status == 200, (status, page[:200]))
+    (claim, s) = wait('the claim mail through the gateway', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 60, 0.3)
     status, options = stranger.json(claim + '/passkey/options')
     passkey = Authenticator()
     status, result = stranger.json(claim + '/passkey', passkey.create(options))
@@ -454,7 +499,8 @@ def many():
     # two inquirers on this 8 GB laptop (three fresh worlds booting at once took 4.4 GB); booted one after the other
     inquirers = [(A, 'Northstar'), ('0x12', 'Allied Metals')]
     tokens, ports = {}, {}
-    start_host(); start_fixture()
+    cli('add-world', '--node', G, '--name', 'mail gateway', '--contact', 'gateway@shrine.local')
+    start_host(); start_gateway([n for n, _ in inquirers]); start_fixture()
     for node, name in inquirers:
         cli('add-world', '--node', node, '--name', name, '--contact', f'owner-{node}@example.test')
         tokens[node] = (cli('token', '--node', node, '--who', 'owner'), cli('token', '--node', node, '--who', 'agent'))
@@ -471,19 +517,20 @@ def many():
         owner, agent = tokens[node]; need, want = asks[node]
         proxy(node, owner, 'write', records=[{'path': f'/{node}/needs/{need}', 'slots': {'want': want}}, {'path': f'/{node}/needs/{need}/approval', 'slots': {'note': 'standing'}}])
         proxy(node, agent, 'write', records=[
-            {'path': f'/{node}/relationships/precision', 'slots': {'contact': MAILBOX, 'refers': f'/{node}/needs/{need}'}},
-            {'path': f'/{node}/net/outreach/{need}_precision/request', 'slots': {'to': MAILBOX, 'about': f'/{node}/needs/{need}', 'relationship': f'/{node}/relationships/precision',
-                                                                             'subject': need, 'note': f'{name} asks: can you supply {want}?'}}])
-    peers = {}
+            {'path': f'/{node}/relationships/precision', 'slots': {'refers': f'/{node}/needs/{need}'}},
+            {'path': f'/{node}/relationships/precision/identifiers/email', 'slots': {'value': MAILBOX}},
+            {'path': f'/{node}/our/{G}/requests/{need}_precision', 'slots': {'do': 'send', 'channel': 'email', 'to': MAILBOX, 'about': f'/{node}/needs/{need}', 'relationship': f'/{node}/relationships/precision',
+                                                                         'subject': need, 'text': f'{name} asks: can you supply {want}?'}}])
     for node, name in inquirers:
         need = asks[node][0]
-        (sent, s) = wait(f'sent for {node}', lambda n=node, d=need: (lambda r: r if r.get('exists') else None)(world_rpc(ports[n], 'read', path=f'/{n}/net/outreach/{d}_precision/sent', care='x')), 60, 0.5)
-        peers[node] = sent['properties'].get('/peer')
-    check('one prospective world serves every inquirer of the mailbox', len(set(peers.values())) == 1 and all(peers.values()), peers)
-    peer = peers[A]
+        (res, s) = wait(f'the result for {node}', lambda n=node, d=need: result_of(ports[n], n, f'{d}_precision'), 90, 0.5)
+        check(f'{name}\'s request was sent by the gateway', res.get('/status') == 'sent', res)
+    peers = {w['node'] for w in registry()['worlds'] if w['contact'] == MAILBOX}
+    check('one prospective world serves every inquirer of the mailbox', len(peers) == 1, peers)
+    peer = next(iter(peers))
     for node, name in inquirers:
-        (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(conversation(ports[n], f'/{n}/relationships/precision/conversation')), 90, 0.5)
-        check(f'{name} received its own threaded reply', conv[0]['properties'].get('/outreach') == f'{asks[node][0]}_precision', conv[0]['properties'])
+        (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(interactions(ports[n], f'/{n}/relationships/precision/interactions')), 90, 0.5)
+        check(f'{name} received its own threaded reply', conv[0]['properties'].get('/request') == f'{asks[node][0]}_precision', conv[0]['properties'])
     (pb, s) = wait('the prospective world', lambda: up(peer), 400, 2); log(f'peer {peer} up in {s} s')
     scoped = {}
     for node, name in inquirers:
@@ -492,7 +539,8 @@ def many():
         scoped[node] = got['token']
         need = asks[node][0]
         st, _ = proxy(peer, scoped[node], 'write', records=[
-            {'path': f'/{peer}/proposed/relationships/{node}', 'slots': {'inquiry': f'/{node}/needs/{need}', 'contact': f'owner-{node}@example.test'}},
+            {'path': f'/{peer}/proposed/relationships/{node}', 'slots': {'inquiry': f'/{node}/needs/{need}'}},
+            {'path': f'/{peer}/proposed/relationships/{node}/identifiers/email', 'slots': {'value': f'owner-{node}@example.test'}},
             {'path': f'/{peer}/proposed/relationships/{node}/proposed_terms/{need}', 'slots': {'price': f'{name} was quoted 43 per unit', 'note': f'recorded by {name}\'s agent'}},
             {'path': f'/{peer}/proposed/relationships/{node}/proposed_capabilities/{need}', 'slots': {'can_make': f'{need}, as {name} understood it'}}])
         check(f'{name} wrote its proposals', st == 200, st)
@@ -508,7 +556,7 @@ def many():
     status, _, page = stranger.get(invite)
     check('the invitation shows only the inquirer whose link it is', status == 200 and 'Northstar' in page and 'Allied Metals' not in page, page[:300])
     stranger.form(invite + '/claim')
-    (claim, s) = wait('the claim mail', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 30, 0.3)
+    (claim, s) = wait('the claim mail', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 60, 0.3)
     status, options = stranger.json(claim + '/passkey/options'); passkey = Authenticator()
     status, result = stranger.json(claim + '/passkey', passkey.create(options))
     check('the world is claimed once, by its mailbox', status == 200 and result.get('ok'), (status, result))
@@ -550,7 +598,7 @@ try:
 except SystemExit as e:
     print(f'\n{e}', flush=True)
     for name in sorted(os.listdir(TEMP)):
-        if name.startswith('host-') and name.endswith('.log') or name == 'fixture.log':
+        if name.startswith(('host-', 'gateway-')) and name.endswith('.log') or name == 'fixture.log':
             print(f'--- {name} (tail) ---'); print(open(os.path.join(TEMP, name), errors='replace').read()[-2500:])
     raise
 finally:

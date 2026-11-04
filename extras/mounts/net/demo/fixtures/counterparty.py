@@ -1,23 +1,24 @@
 """The controlled inbox fixture, for regression only. It plays the businesses in market.json: it watches the
-host's outbox directory, and for each mail to one of them it posts a reply to the host's inbound hook with
-the headers a real provider would carry (In-Reply-To of the mail's Message-ID, the sender's address, a
-message id of its own). Every reply is marked simulated in its text. A real mailbox later posts the same
-shape to the same hook; nothing in the namespace changes.
+mail gateway's outbox directory, and for each mail to one of them it drops a reply into the gateway's inbox
+directory with the headers a real mailbox would carry (In-Reply-To and References of the mail's Message-ID,
+the sender's address, a message id of its own). Every reply is marked simulated in its text. A real mailbox
+later delivers the same shape over IMAP; nothing in any namespace changes.
 
-  python3 counterparty.py --outbox <dir> --hook <origin>/hooks/mail/<secret> --market market.json [--week-seconds 15]
+  python3 counterparty.py --outbox <gateway dir>/out --inbox <gateway dir>/in --market market.json [--week-seconds 15]
 
 Personas answer from their hidden state by week; the clock starts when the fixture starts.
 """
-import argparse, json, os, re, sys, time, urllib.request
+import argparse, email.utils, json, os, re, time
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--outbox', required=True); ap.add_argument('--hook', required=True); ap.add_argument('--market', required=True)
+ap.add_argument('--outbox', required=True); ap.add_argument('--inbox', required=True); ap.add_argument('--market', required=True)
 ap.add_argument('--week-seconds', type=float, default=15.0); ap.add_argument('--once', action='store_true')
 args = ap.parse_args()
 market = json.load(open(args.market))
 personas = {p['mailbox'].lower(): p for p in market['personas']}
 answered = set()
 started = time.monotonic()
+os.makedirs(args.inbox, exist_ok=True)
 
 
 def week(): return int((time.monotonic() - started) // args.week_seconds) + 1
@@ -65,11 +66,20 @@ def mails():
     return out
 
 
-def post(payload):
-    req = urllib.request.Request(args.hook, json.dumps(payload).encode(), {'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)
+def deliver(persona, headers, text, n):
+    """One reply file in the gateway's inbox, written whole then renamed, as a mail server would hand it over."""
+    parent = headers.get('message-id', '').strip()
+    mid = email.utils.make_msgid(domain=persona['mailbox'].split('@')[1])
+    raw = (f"From: {persona['name']} <{persona['mailbox']}>\r\nTo: {headers.get('from', '')}\r\nSubject: Re: {headers.get('subject', '')}\r\n"
+           f"Date: {email.utils.formatdate(localtime=False)}\r\nMessage-ID: {mid}\r\nIn-Reply-To: {parent}\r\nReferences: {parent}\r\n"
+           f"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n")
+    name = f"{int(time.time() * 1000)}-{n}.eml"
+    temp = os.path.join(args.inbox, name + '.tmp')
+    open(temp, 'w').write(raw); os.rename(temp, os.path.join(args.inbox, name))
+    return name
 
 
+n = 0
 while True:
     for name, headers, body in mails():
         marker = os.path.join(args.outbox, name + '.answered')
@@ -82,12 +92,8 @@ while True:
         text = reply_text(persona, state, headers.get('subject', ''), body)
         if text is None:
             print(f'[{week()}] {persona["name"]}: silent on {name}', flush=True); continue
-        payload = {'from': persona['mailbox'], 'from_name': persona['name'], 'to': headers.get('from', ''), 'subject': 'Re: ' + headers.get('subject', ''),
-                   'text': text, 'message_id': f'<{int(time.time() * 1000)}.{persona["mailbox"]}>', 'in_reply_to': headers.get('message-id', ''),
-                   'authenticated': 'claimed', 'simulated': True}
-        try:
-            answer = post(payload); print(f'[{week()}] {persona["name"]} replied to {name}: {answer}', flush=True)
-        except Exception as e:
-            print(f'[{week()}] {persona["name"]}: hook refused {name}: {e}', flush=True); answered.discard(name)
+        n += 1
+        written = deliver(persona, headers, text, n)
+        print(f'[{week()}] {persona["name"]} replied to {name} as {written}', flush=True)
     if args.once: break
     time.sleep(0.5)

@@ -37,16 +37,25 @@ to them so the next agent, and the person, find things where they expect.
 ```
 /needs/<name>                         the owner's words: what is needed, how much, by when, the ceiling
 /needs/<name>/approval                the owner's standing approval: outreach about this need may go out
-/relationships/<peer>                 the folder's own record: peer (a node, when known), contact (a
-                                      mailbox, a number), refers (the need's path); make it first
-/relationships/<peer>/conversation/<id>   every message either way, as it was: from, to, at, text,
-                                      in_reply_to, message_id, channel, authenticated
+/relationships/<peer>                 the folder's own record: peer (a node, when known), refers (the
+                                      need's path); make it first
+/relationships/<peer>/identifiers/<kind>  one way to reach the peer: value (a mailbox, a number, a site);
+                                      kind is email, phone, web, …; an association you suspect is a
+                                      hypothesis until the peer verifies it at its claim
+/relationships/<peer>/people/<n>      a person at the peer, when one is named
+/relationships/<peer>/interactions/<id>   every message either way, as it was: from, to, at, text,
+                                      in_reply_to, message_id, channel, authenticated, source (the
+                                      gateway's record it came from)
 /relationships/<peer>/observations/<n>    one statement you read off one piece of evidence
 /judgments/<peer>                     an ask cell over the relationship folder, beside it, never inside it;
                                       /judgments/<peer>/result is your answer
 /relationships/<peer>/unresolved/<n>  a question still open, with a due
 /her/<peer>/<name>                    what the peer publishes to this world, over Mesa; read-only
 /our/<peer>/<name>                    what the owner publishes to the peer; not yours to write
+/her/<gateway>/ports/<port>           what a gateway can do for this world (kind, address, operations)
+/our/<gateway>/requests/<id>          an effect you ask a gateway for; yours to write (below)
+/her/<gateway>/results/<id>           what became of it: sent, failed, or unknown; read-only
+/her/<gateway>/inbound/<n>            what the gateway received; the host files it as an interaction
 /agent/wakes/<id>                     when you want to be woken again
 /attention/<n>                        a note the host mails to the owner
 ```
@@ -71,7 +80,7 @@ An **observation** is one statement off one piece of evidence:
   at: 2026-11-03T15:10:00Z
   expires: 2026-12-03             when the statement stops holding, if it said so
   qualified: capacity unconfirmed
-  source: {type: reference, path: /0x11/relationships/precision/conversation/m1793…, care: x, case: 7}
+  source: {type: reference, path: /0x11/relationships/precision/interactions/u7, care: x, case: 1}
 ```
 
 A Mesa acquisition is evidence like a message: when `/her/<peer>/<name>`
@@ -107,29 +116,48 @@ observation's reference in `answered_by` on a last poke first.
 
 ## Talking to a peer
 
-You never send anything. You write what should be said and the owner's
-approval, standing on the need or given on the outreach, lets the host send
-it through the channel the request names:
+You never send anything, and nothing in this world speaks a wire protocol.
+Every way out is a **gateway**: an independent Mesa peer that publishes what
+it can do to this world at `/her/<gateway>/ports/<port>` (`kind: email`,
+`address`, `operations: send`). Read `/her` to find them; do not assume one.
+
+To say something, write the message as a request to the gateway and let the
+owner's approval, standing on the need or given on the request, carry it:
 
 ```
-/net/outreach/<id>/request
-  to: precision@…  (or a number)   channel: email | sms | phone
-  about: /0x11/needs/widgets         relationship: /0x11/relationships/precision
-  subject: widgets                   note: the message, in plain words
+/our/<gateway>/requests/<id>
+  do: send                        channel: email
+  to: precision@…                 subject: widgets
+  text: the message, in plain words
+  in_reply_to: <the message id of what you answer, from the interaction>   (optional)
+  relationship: /0x11/relationships/precision     about: /0x11/needs/widgets
 ```
 
-Poking the request with a new `note` sends again; the host writes `sent`
-with the message id and the peer's node. Replies come back on their own as
-conversation records written by the channel's principal (`mail`, `sms`,
-`phone`, `web`) and wake you. Ask only what the world does not already know:
-if `/her/<peer>/<name>` holds it, read that and do not ask. Ask once; a peer
-who did not answer is a wake for later, not another message tomorrow. Never
-write an approval; approvals are the owner's.
+The host publishes the request to the gateway once an approval by the owner
+covers it (`/our/<gateway>/requests/<id>/approval`, or the need's), after
+adding a `footer` with the peer's claim link; the gateway attempts each case
+once and publishes `/her/<gateway>/results/<id>` with `status` (`sent`,
+`failed`, or `unknown` when it restarted mid-way, which means it may or may
+not have gone) and the `message_id`. Poking the request with a new `text`
+sends again. A publication is not a capability: the gateway acts on nothing
+the host did not publish under an approval. Never write an approval;
+approvals are the owner's.
+
+What the gateway receives arrives as `/her/<gateway>/inbound/<n>`, the
+gateway's observation, signed by the gateway, and the host files it as an
+interaction of the relationship it answers (by the request it replies to,
+else by a matching identifier), written as the gateway with `source` naming
+the acquired record; what matches nothing lands under `/inbound/<n>` for
+you to place. Replies wake you through the relationship folder.
+
+Ask only what the world does not already know: if `/her/<peer>/<name>` holds
+it, read that and do not ask. Ask once; a peer who did not answer is a wake
+for later, not another message tomorrow.
 
 Forms on a peer's site are yours to fill with your browser capability under
-the same standing approval; record the submission as a conversation record
-with `channel: form` and what you entered, since the reply may come by mail
-or phone and must land in the same folder.
+the same standing approval; record the submission as an interaction with
+`channel: form` and what you entered, since the reply may come by mail or
+phone and must land in the same folder.
 
 ## The peer's prospective world
 
@@ -143,7 +171,7 @@ POST <WAKE_HOST>/w/<WAKE_WORLD>/peers/<peer node>/token   (Authorization: Bearer
 
 Under that scope, and only there, write the relationship as the peer will
 find it when it claims the world: `inquiry` (a reference to the need),
-`conversation/<id>` (the same messages, its side), `proposed_terms/<name>` and
+`interactions/<id>` (the same messages, its side), `proposed_terms/<name>` and
 `proposed_capabilities/<name>` (what you would propose it publishes, each
 with `source` referencing the message it came from). It is your
 representation of the peer, attributed to you; the peer confirms, corrects
@@ -180,8 +208,9 @@ quiet, a term outside the ceiling. Nothing else leaves the world.
   of the other's publication) and a statement the peer confirmed under
   `/our` are three different things; never merge them, never write one as the
   other.
-- Two contacts are two relationships until the owner, or the peer at its
-  claim, relates them.
+- Two identifiers are two relationships until the owner, or the peer at its
+  claim, relates them; an identifier you add to a relationship on suspicion
+  says so in `note`.
 - What you do not know is an unresolved question, not a guess written as a
   slot.
 - Write as one batch per decision so history reads as one event.
