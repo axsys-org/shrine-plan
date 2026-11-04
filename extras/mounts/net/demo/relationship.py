@@ -170,7 +170,10 @@ def port_of(node): return next((w['port'] for w in registry()['worlds'] if w['no
 
 def up(node):
     p = port_of(node)
-    return p if p and world_rpc(p, 'read', path='/' + node, care='x').get('exists') else None
+    try:
+        return p if p and world_rpc(p, 'read', path='/' + node, care='x').get('exists') else None
+    except OSError:
+        return None
 
 
 def wait(what, pred, timeout=300, every=1.0):
