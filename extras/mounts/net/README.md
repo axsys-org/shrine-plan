@@ -220,14 +220,17 @@ claim of a business.
 The relationship machinery adds no Grove: every record below is free, written by a named principal,
 and its paths are the convention the relationship skill states
 (`extras/mounts/mcp/skills/shrine-mcp/relationships.md`), known to no code in the kernel. The host
-(`shrine-mesa host`, its README section "Relationships") is the external bridge: mail and calls in and
-out, prospective worlds, the wakes, the agent.
+(`shrine-mesa host`, its README sections "Relationships" and "Gateway") keeps worlds, prospective
+worlds, the wakes and the agent; every way out of a world is a gateway, an ordinary Mesa peer with a
+world of its own (the mail gateway, `shrine-mesa gateway`, since 2026-11-04), reached through requests
+and results that are ordinary records.
 
 ```
 /<self>/needs/<name>                           the owner's words; /needs/<name>/approval a standing approval
-/<self>/relationships/<peer>                   own record: contact, refers → a need, peer (a node when known)
-/<self>/relationships/<peer>/conversation/<id> every message either way, by the channel's principal: mail,
-                                               phone, web, or the agent
+/<self>/relationships/<peer>                   own record: refers → a need, peer (a node when known)
+/<self>/relationships/<peer>/identifiers/<kind> one way to reach the peer: value (a mailbox, a number, a site)
+/<self>/relationships/<peer>/interactions/<id> every message either way: filed by the host as the gateway that
+                                               observed it (source → the acquired case), or by web, phone, agent
 /<self>/relationships/<peer>/observations/<n>  one statement off one piece of evidence, source → it, pinned
 /<self>/relationships/<peer>/unresolved/<n>    open questions with a due
 /<self>/judgments/<peer>                       an ask cell over /relationships/<peer> (care z), beside the
@@ -237,11 +240,16 @@ out, prospective worlds, the wakes, the agent.
 /<self>/her/<peer>/<name>                      what the peer publishes to this world, landed by the sidecar
 /<self>/our/<peer>/<name>                      what this world publishes to the peer; the publication record is
                                                /net/publications/<name>_<peer> {path, to}
-/<self>/attention/<n>                          notes the host mails to the owner
+/<self>/our/<gateway>/requests/<id>            an effect asked of a gateway (do, channel, to, subject, text…);
+                                               /approval beside it, or the need's, lets the host publish it
+/<self>/her/<gateway>/results/<id>             what became of it: sent | failed | unknown, message_id
+/<self>/her/<gateway>/inbound/<n>              what the gateway received, before the host files it
+/<self>/her/<gateway>/ports/<port>             what the gateway does: kind, address, operations
+/<self>/attention/<n>                          notes the host sends the owner, as requests to the mail gateway
 ```
 
 On a prospective world (reserved by the host for a mailbox at first contact), each inquirer's agent
-writes only under `/proposed/relationships/<inquirer>/…` (inquiry, conversation, `proposed_terms/<name>`,
+writes only under `/proposed/relationships/<inquirer>/…` (inquiry, identifiers, interactions, `proposed_terms/<name>`,
 `proposed_capabilities/<name>`) through a token scoped there, revoked at the claim; what the owner
 publishes at the claim is `/our/<inquirer>/<name>`, acquired by the inquirer at `/her/<peer>/<name>`.
 
@@ -252,7 +260,8 @@ yet" from the moment it is written, so a wake naming it fires at once, which is 
 relationship wants.
 
 `demo/relationship.py --wake-only` is the wake gate (one world, the stub agent); `demo/relationship.py`
-the relationship gate (the inbox fixture under `demo/fixtures/` playing Precision Works, the gate
+the relationship gate (the mail gateway on its directory transport, the inbox fixture under
+`demo/fixtures/` playing Precision Works by dropping reply files into the gateway's inbox, the gate
 writing what the agent would); `--many` two inquirers and one prospective world. All deterministic.
 The real runs, with a real mailbox, a real call and the real agent, are recorded separately.
 

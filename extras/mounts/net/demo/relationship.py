@@ -22,7 +22,9 @@
               the scoped token is revoked; a later change by the owner arrives as the next case and makes the
               judgment ask again with no mail sent for it.
 
-Flags: --keep, --bin <shrine-mesa>.
+Flags: --keep, --bin <shrine-mesa>. Environment: GATE_PORTS (a base, 8400; the host, worlds, mesa and flows take
+base, base+100, base+1100, base+1200), SHRINE_BASE (the checkout; default: this file's), SHRINE_MESA (the binary).
+The gate kills only its own process groups, so it runs beside a live pilot on the same machine.
 """
 import base64, hashlib, json, os, re, secrets, shutil, signal, socket, subprocess, sys, tempfile, time
 from http.cookiejar import CookieJar
@@ -31,13 +33,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = '/Users/ianchanner/shrine-base'
+BASE = os.environ.get('SHRINE_BASE', os.path.abspath(os.path.join(HERE, '..', '..', '..', '..')))
 BIN = os.environ.get('SHRINE_MESA', '/Users/ianchanner/shrine-mesa/target/debug/shrine-mesa')
 if '--bin' in sys.argv: BIN = sys.argv[sys.argv.index('--bin') + 1]
 KEEP = '--keep' in sys.argv
 os.makedirs(os.path.join(BASE, '.check'), exist_ok=True)
 TEMP = tempfile.mkdtemp(prefix='relationship-', dir=os.path.join(BASE, '.check'))
-HOST_PORT = 8400
+# ports: the pilot's defaults, or a base from the environment so the gate can run beside a live pilot (GATE_PORTS=8600)
+PORT_BASE = int(os.environ.get('GATE_PORTS', '8400'))
+HOST_PORT, WORLD_PORT, MESA_PORT, FLOW_PORT = PORT_BASE, PORT_BASE + 100, PORT_BASE + 1100, PORT_BASE + 1200
 ORIGIN = f'http://localhost:{HOST_PORT}'
 RP_ID = 'localhost'
 A = '0x11'
@@ -201,19 +205,23 @@ def link_in(body, kind):
 
 
 def kill_everything(sig=signal.SIGKILL):
+    """Only this gate's processes: each of host, gateway and fixture leads its own process group (the host's
+    worlds, runtimes and services are in the host's), so a live pilot on the same machine is untouched."""
     global host, fixture, gateway
     for p in (host, fixture, gateway):
         if p and p.poll() is None:
-            os.kill(p.pid, sig); p.wait(timeout=30)
-    subprocess.run(['pkill', f'-{int(sig)}', '-x', 'wisp']); time.sleep(1)
-    subprocess.run(['pkill', f'-{int(sig)}', '-f', 'x/eden --node']); subprocess.run(['pkill', f'-{int(sig)}', '-f', 'shrine-mesa serve'])
-    subprocess.run(['pkill', f'-{int(sig)}', '-f', 'shrine-mesa gateway'])
+            try: os.killpg(p.pid, sig)
+            except ProcessLookupError: pass
+            try: p.wait(timeout=30)
+            except subprocess.TimeoutExpired: pass
+    # anything of this gate's worlds that outlived its group (a runtime re-parented by a kill -9 of its launcher)
+    subprocess.run(['pkill', f'-{int(sig)}', '-f', TEMP], capture_output=True)
     time.sleep(1)
 
 
 def write_config(wake=None):
     cfg = {'listen': f'127.0.0.1:{HOST_PORT}', 'origin': ORIGIN, 'rp_id': RP_ID, 'name': 'Shrine pilot host', 'state': STATE, 'shrine': BASE,
-           'mounts': ['net', 'mcp', 'probe'], 'worlds': WORLDS, 'ports': {'world': 8500, 'mesa': 9500, 'flow': 9600}, 'node_base': '0x20',
+           'mounts': ['net', 'mcp', 'probe'], 'worlds': WORLDS, 'ports': {'world': WORLD_PORT, 'mesa': MESA_PORT, 'flow': FLOW_PORT}, 'node_base': '0x20',
            'poll_ms': 300, 'gateways': {'mail': G}}
     if wake: cfg['wake'] = wake
     json.dump(cfg, open(CONFIG, 'w'), indent=1)
@@ -223,7 +231,7 @@ def start_host():
     global host, host_logs
     host_logs += 1
     out = open(os.path.join(TEMP, f'host-{host_logs}.log'), 'w')
-    host = subprocess.Popen([BIN, 'host', '--config', CONFIG], stdout=out, stderr=subprocess.STDOUT, cwd=TEMP)
+    host = subprocess.Popen([BIN, 'host', '--config', CONFIG], stdout=out, stderr=subprocess.STDOUT, cwd=TEMP, start_new_session=True)
     def listening():
         if host.poll() is not None: raise SystemExit('host exited: ' + open(out.name).read()[-1500:])
         try:
@@ -235,7 +243,7 @@ def start_host():
 def start_fixture():
     global fixture
     fixture = subprocess.Popen([sys.executable, os.path.join(HERE, 'fixtures', 'counterparty.py'), '--outbox', OUTBOX, '--inbox', INBOX,
-                                '--market', os.path.join(HERE, 'fixtures', 'market.json')], stdout=open(os.path.join(TEMP, 'fixture.log'), 'w'), stderr=subprocess.STDOUT)
+                                '--market', os.path.join(HERE, 'fixtures', 'market.json')], stdout=open(os.path.join(TEMP, 'fixture.log'), 'w'), stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def start_gateway(serves):
@@ -244,7 +252,7 @@ def start_gateway(serves):
     gateway_logs += 1
     json.dump({'world': f'http://127.0.0.1:{port_of(G)}', 'node': G, 'serves': serves, 'poll_ms': 400, 'transport': {'dir': GWMAIL, 'from': 'gateway@shrine.local'}},
               open(GWCONFIG, 'w'), indent=1)
-    gateway = subprocess.Popen([BIN, 'gateway', '--config', GWCONFIG], stdout=open(os.path.join(TEMP, f'gateway-{gateway_logs}.log'), 'w'), stderr=subprocess.STDOUT, cwd=TEMP)
+    gateway = subprocess.Popen([BIN, 'gateway', '--config', GWCONFIG], stdout=open(os.path.join(TEMP, f'gateway-{gateway_logs}.log'), 'w'), stderr=subprocess.STDOUT, cwd=TEMP, start_new_session=True)
 
 
 def live_ref(path, care): return {'type': 'reference', 'value': f'/h/{care}/0/{len(path.strip("/").split("/"))}/{path.strip("/")}'}
@@ -266,7 +274,7 @@ def result_of(port, node, rid):
 
 
 host, fixture, gateway, host_logs, gateway_logs = None, None, None, 0, 0
-if subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True).returncode == 0: raise SystemExit('a wisp is already running')
+if subprocess.run(['pgrep', '-f', 'relationship-'], capture_output=True).stdout.decode().split() != []: raise SystemExit('an earlier run of this gate is still running')
 if not os.access(BIN, os.X_OK): raise SystemExit(f'no shrine-mesa binary at {BIN}')
 for d in (STATE, OUTBOX, INBOX, WORLDS): os.makedirs(d, exist_ok=True)
 
@@ -603,6 +611,6 @@ except SystemExit as e:
     raise
 finally:
     kill_everything(signal.SIGTERM)
-    time.sleep(1); subprocess.run(['pkill', '-x', 'wisp'])
+    time.sleep(1); kill_everything(signal.SIGKILL)
     print('kept at', TEMP if KEEP else '(deleted)', flush=True)
     if not KEEP: shutil.rmtree(TEMP, ignore_errors=True)
