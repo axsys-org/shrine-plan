@@ -253,5 +253,15 @@ relationship wants.
 
 `demo/relationship.py --wake-only` is the wake gate (one world, the stub agent); `demo/relationship.py`
 the relationship gate (the inbox fixture under `demo/fixtures/` playing Precision Works, the gate
-writing what the agent would); both deterministic. The real runs, with a real mailbox, a real call and
-the real agent, are recorded separately.
+writing what the agent would); `--many` two inquirers and one prospective world. All deterministic.
+The real runs, with a real mailbox, a real call and the real agent, are recorded separately.
+
+| measured 2026-11-04, this laptop | |
+|---|---|
+| wake gate: a time, a referenced name, an asking cell; a wake declared before `kill -9` fires after the restart | 5 runs, every cause once, nothing spurious |
+| the reply by mail, threaded home as a conversation record by `mail` | 1.06 s after the request |
+| `kill -9` of host, worlds, services and fixture; everything back | 4.3 s |
+| the owner's publication acquired at `/her/<peer>/<name>` | 0.01 s after it |
+| a later change by the owner, the next case at `/her`, the judgment asking again | 0.33 s, no mail |
+| two inquirers, one prospective world: scoped corners, the claim listing both, publication per inquirer, neither sees the other's | holds; three worlds 803 MB RSS |
+| three fresh worlds booting at once on 8 GB | 4.4 GB RSS: boot them one after the other here, or on the VPS |

@@ -447,9 +447,104 @@ def full():
     log('RELATIONSHIP GATE PASSED ' + json.dumps(report))
 
 
+def many():
+    """Several independent worlds, one previously non-Shrine business: separately attributed histories in one
+    prospective world; the claim shows all; each inquirer sees only its own; publication is per inquirer."""
+    write_config()
+    # two inquirers on this 8 GB laptop (three fresh worlds booting at once took 4.4 GB); booted one after the other
+    inquirers = [(A, 'Northstar'), ('0x12', 'Allied Metals')]
+    tokens, ports = {}, {}
+    start_host(); start_fixture()
+    for node, name in inquirers:
+        cli('add-world', '--node', node, '--name', name, '--contact', f'owner-{node}@example.test')
+        tokens[node] = (cli('token', '--node', node, '--who', 'owner'), cli('token', '--node', node, '--who', 'agent'))
+        (ports[node], s) = wait(f'world {node}', lambda n=node: up(n), 400, 2); log(f'{name} {node} up in {s} s')
+        world_rpc(ports[node], 'write', who='owner', records=[{'path': f'/{node}/net/self', 'action': 'poke', 'slots': {'name': name}}])
+    def wisp_rss():
+        pids = subprocess.run(['pgrep', '-x', 'wisp'], capture_output=True, text=True).stdout.split()
+        return sum(int(x) for pid in pids for x in subprocess.run(['ps', '-o', 'rss=', '-p', pid], capture_output=True, text=True).stdout.split()) // 1024
+    report['rss_mb_two_worlds'] = wisp_rss()
+    check('the worlds stay under the guard', report['rss_mb_two_worlds'] < 3500, report['rss_mb_two_worlds'])
+    # each inquirer asks the same mailbox about its own need; the host reserves one prospective world for the mailbox
+    asks = {A: ('widgets', '500 at 40 per unit'), '0x12': ('brackets', '2000 a quarter, 12 per unit')}
+    for node, name in inquirers:
+        owner, agent = tokens[node]; need, want = asks[node]
+        proxy(node, owner, 'write', records=[{'path': f'/{node}/needs/{need}', 'slots': {'want': want}}, {'path': f'/{node}/needs/{need}/approval', 'slots': {'note': 'standing'}}])
+        proxy(node, agent, 'write', records=[
+            {'path': f'/{node}/relationships/precision', 'slots': {'contact': MAILBOX, 'refers': f'/{node}/needs/{need}'}},
+            {'path': f'/{node}/net/outreach/{need}_precision/request', 'slots': {'to': MAILBOX, 'about': f'/{node}/needs/{need}', 'relationship': f'/{node}/relationships/precision',
+                                                                             'subject': need, 'note': f'{name} asks: can you supply {want}?'}}])
+    peers = {}
+    for node, name in inquirers:
+        need = asks[node][0]
+        (sent, s) = wait(f'sent for {node}', lambda n=node, d=need: (lambda r: r if r.get('exists') else None)(world_rpc(ports[n], 'read', path=f'/{n}/net/outreach/{d}_precision/sent', care='x')), 60, 0.5)
+        peers[node] = sent['properties'].get('/peer')
+    check('one prospective world serves every inquirer of the mailbox', len(set(peers.values())) == 1 and all(peers.values()), peers)
+    peer = peers[A]
+    for node, name in inquirers:
+        (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(conversation(ports[n], f'/{n}/relationships/precision/conversation')), 90, 0.5)
+        check(f'{name} received its own threaded reply', conv[0]['properties'].get('/outreach') == f'{asks[node][0]}_precision', conv[0]['properties'])
+    (pb, s) = wait('the prospective world', lambda: up(peer), 400, 2); log(f'peer {peer} up in {s} s')
+    scoped = {}
+    for node, name in inquirers:
+        status, got = Client().json(f'/w/{node}/peers/{peer}/token', {}, {'Authorization': 'Bearer ' + tokens[node][1]})
+        check(f'{name} gets a token scoped to its own corner', status == 200 and got.get('scope') == f'/{peer}/proposed/relationships/{node}', (status, got))
+        scoped[node] = got['token']
+        need = asks[node][0]
+        st, _ = proxy(peer, scoped[node], 'write', records=[
+            {'path': f'/{peer}/proposed/relationships/{node}', 'slots': {'inquiry': f'/{node}/needs/{need}', 'contact': f'owner-{node}@example.test'}},
+            {'path': f'/{peer}/proposed/relationships/{node}/proposed_terms/{need}', 'slots': {'price': f'{name} was quoted 43 per unit', 'note': f'recorded by {name}\'s agent'}},
+            {'path': f'/{peer}/proposed/relationships/{node}/proposed_capabilities/{need}', 'slots': {'can_make': f'{need}, as {name} understood it'}}])
+        check(f'{name} wrote its proposals', st == 200, st)
+    report['rss_mb_three_worlds'] = wisp_rss()
+    st, why = proxy(peer, scoped[A], 'read', path=f'/{peer}/proposed/relationships/0x12', care='z')
+    check("Northstar's token cannot read Allied's corner", st == 403, (st, why))
+    st, why = proxy(peer, scoped['0x12'], 'write', records=[{'path': f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', 'action': 'poke', 'slots': {'price': 'tampered'}}])
+    check("Allied's token cannot write in Northstar's corner", st == 403, (st, why))
+    before = {c['path']: c['reference'] for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
+    # the claim through Northstar's link; the owner reviews all three, publishes to two, relates them, sets one aside
+    invite = next(link_in(b, 'i') for n, h, b in mails() if link_in(b, 'i'))
+    stranger = Client()
+    status, _, page = stranger.get(invite)
+    check('the invitation shows only the inquirer whose link it is', status == 200 and 'Northstar' in page and 'Allied Metals' not in page, page[:300])
+    stranger.form(invite + '/claim')
+    (claim, s) = wait('the claim mail', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 30, 0.3)
+    status, options = stranger.json(claim + '/passkey/options'); passkey = Authenticator()
+    status, result = stranger.json(claim + '/passkey', passkey.create(options))
+    check('the world is claimed once, by its mailbox', status == 200 and result.get('ok'), (status, result))
+    status, _, page = stranger.get(f'/w/{peer}')
+    check('the owner page lists every inquirer\'s proposals, separately', all(f'Recorded by {n}' in page for n, _ in inquirers), page[:600])
+    for node, name in inquirers:
+        st, why = proxy(peer, scoped[node], 'read', path=f'/{peer}/proposed/relationships/{node}', care='x')
+        check(f'{name}\'s provisional token is revoked at the claim', st in (401, 403), (st, why))
+    stranger.form(f'/w/{peer}/publish/{A}/widgets', **{'slot.price': '39.50 per unit', 'slot.capacity': '500 a month'})
+    stranger.form(f'/w/{peer}/publish/0x12/brackets', **{'slot.price': '11.80 per unit', 'slot.also': f'/{peer}/our/{A}/widgets'})
+    stranger.form(f'/w/{peer}/aside/0x12/brackets')
+    for node, need, expect in [(A, 'widgets', '39.50 per unit'), ('0x12', 'brackets', '11.80 per unit')]:
+        (her, s) = wait(f'{node} acquires at /her', lambda n=node, d=need: (lambda r: r if r.get('exists') else None)(world_rpc(ports[n], 'read', path=f'/{n}/her/{peer}/{d}', care='x')), 120, 0.5)
+        check(f'{node} observes its own publication at /her/{peer}/{need}', her['properties'].get('/price') == expect and her['properties'].get('/publisher') == peer, her['properties'])
+    time.sleep(3)
+    cross = (world_rpc(ports[A], 'read', path=f'/{A}/her/{peer}/brackets', care='x'), world_rpc(ports['0x12'], 'read', path=f'/0x12/her/{peer}/widgets', care='x'))
+    check('neither inquirer observes what was published to the other', not cross[0].get('exists') and not cross[1].get('exists'), cross)
+    aside = world_rpc(pb, 'read', path=f'/{peer}/proposed/relationships/0x12/proposed_capabilities/brackets', care='x')['properties']
+    check('a proposal set aside carries the owner\'s stance and nothing else changed', aside.get('/stance') == 'set_aside' and aside.get('/can_make', '').startswith('brackets'), aside)
+    related = world_rpc(pb, 'read', path=f'/{peer}/our/0x12/brackets', care='x')['properties']
+    check('the owner related two descriptions by a reference of its own', related.get('/also') == f'/{peer}/our/{A}/widgets', related)
+    after = {c['path']: c['reference'] for c in children(pb, f'/{peer}/proposed/relationships/{A}/proposed_terms')}
+    hist = world_rpc(pb, 'history', path=f'/{peer}/proposed/relationships/{A}/proposed_terms/widgets', limit=5)
+    check('the provisional first case is intact under the owner\'s stance', hist['versions'][-1]['properties'].get('/price', '').startswith('Northstar was quoted') and set(before) == set(after), (before, after))
+    events = [e for e in world_rpc(pb, 'history', after=0, limit=40)['events']]
+    whos = {e['who'] for e in events}
+    check('three provisional principals and one owner in the history', {f'agent_{n}' for n, _ in inquirers} <= whos and 'owner' in whos, whos)
+    report['inquirers'] = len(inquirers)
+    log('MANY GATE PASSED ' + json.dumps(report))
+
+
 try:
     if '--wake-only' in sys.argv:
         wake_only()
+    elif '--many' in sys.argv:
+        many()
     else:
         full()
 except SystemExit as e:
