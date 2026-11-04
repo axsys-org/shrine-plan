@@ -23,6 +23,7 @@ authored procedure and its maintained documents, not another application runtime
 | `mounts/flows/nenex*.foil`, `interface.foil` | Flow/Nenex integration: source authoring, page evidence, guarded writer and forms | The generic command catalogue or filesystem-source lifecycle |
 | `mounts/flows/install.foil` | Native flow command/law registration and retained-contract checks | Nenex routes or example catalogue |
 | `mounts/flows/examples.foil`, `examples/`, `examples.json` | Optional authored recipes and their setup data | Runtime policy for all flows |
+| `flow_library` in `mounts/flows/examples.foil` | Pure native-capture and format adapters for the learning, atlas and ingestion recipes, under the existing examples publisher | Work ownership, a parser implementation, instruction adoption or scheduling |
 | `tests/fixtures/block-document` | Goo regression fixture with its own small bounded block model | Nenex's document representation |
 
 `install.foil` can assemble native commands without importing Nenex. The shipped
@@ -98,6 +99,12 @@ catalogue, not native flow installation. They select an ordinary Grove projectio
 instead of copying graph policy. A task can capture a pure `flow/operation`
 validator; the existing acceptance boundary applies it before resolving a hole.
 Validated results use ordinary frozen value cells and retained native receipts.
+Learning and atlas recipes likewise use the existing revision policy, with exact
+own-record inspection captures alongside live source bindings. Learning reads the
+selected run's typed evaluation trace; instruction changes remain proposals.
+Format ingestion reuses the native JSON decoder and Markdown parser, retains a
+cohesive data value and exact source on the returned document projection, and
+requires no model. These helpers are optional catalogue laws, not a new harness.
 
 Nenex's page/block question interface uses the shared answering policy directly;
 it does not need to manufacture a flow. Cooperate investigations use the same

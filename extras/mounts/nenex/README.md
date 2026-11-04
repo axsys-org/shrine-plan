@@ -39,6 +39,14 @@ source syntax and evidence shape. No command-line client is required for these
 actions. Page tools are typed mount contributions, so Nenex itself remains
 independent of a particular flow recipe or provider.
 
+Authored flow embeds present the existing controller's status, bindings,
+holes and native actions in the document. Requests link their captured evidence
+and validated value cells directly. The **Cells** list names the page's native
+bindings and opens the standalone inspector; it does not mount the generic
+Cells viewer or start per-cell polling inside Nenex. Computation and retained
+work still use the same cells, hands and overlays. Domain presentations belong
+to the authored document and its selected views.
+
 The `cooperate` mount adds document-local agent runs through the MCP endpoint at
 `http://127.0.0.1:8131/mcp`. See the [harness interface and client](../cooperate/README.md)
 for captured context, branching traces and reusable results.

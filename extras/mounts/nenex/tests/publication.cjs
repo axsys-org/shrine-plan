@@ -9,6 +9,8 @@ function fixture(kind = "publication") {
   const listeners = new Set(), frames = [], animation = [];
   const status = {textContent: ''}, textarea = {value: 'saved source', addEventListener() {}};
   let mutation, reloads = 0, unsubscriptions = 0;
+  let viewerMounts = 0, viewerSources = 0;
+  const staleCell = {dataset: {nativeCell: '/0x11/app/nenex/w/procedure/cells/work'}, closest() {return {open: true};}};
   const work = {dirty: false, composing: false}, globalEvents = new Map();
   const events = new Map();
   const frame = {
@@ -24,7 +26,11 @@ function fixture(kind = "publication") {
   frames.push(frame);
   const shell = {
     dataset: {page: '/0x11/app/nenex/w/procedure', corpus: '/0x11/app/nenex/w'},
-    querySelectorAll(selector) { return selector === 'iframe[data-goo-presentation-frame]' || selector.split(', ').includes(`iframe[data-nenex-${kind}]`) ? frames : []; },
+    querySelectorAll(selector) {
+      if (selector === '[data-native-cell]') return [staleCell];
+      if (selector === 'iframe[data-goo-presentation-frame]' || selector.split(', ').includes(`iframe[data-nenex-${kind}]`)) return frames;
+      return [];
+    },
     addEventListener() {}
   };
   const document = {
@@ -34,7 +40,7 @@ function fixture(kind = "publication") {
     addEventListener() {}, getElementById() { return null; }
   };
   const context = {
-    document, window: {}, location: {hash: '', reload() { reloads++; }},
+    document, window: {GooLive: {mcpSource() {viewerSources++;}, mountViewer() {viewerMounts++;}}}, location: {hash: '', reload() { reloads++; }},
     addEventListener(name, callback) { globalEvents.set(name, callback); }, requestAnimationFrame(callback) { animation.push(callback); },
     MutationObserver: class { constructor(callback) { mutation = callback; } observe() {} },
     URL, Map
@@ -45,11 +51,13 @@ function fixture(kind = "publication") {
     outcome(outcome) { for (const listener of [...listeners]) listener({outcome}); },
     settle() { while (animation.length) animation.shift()(); },
     remove() { frame.isConnected = false; frames.length = 0; mutation(); },
+    viewerCounts() { return {mounts: viewerMounts, sources: viewerSources}; },
     counts() { return {reloads, unsubscriptions, listeners: listeners.size}; }};
 }
 
 const clean = fixture();
 clean.decorate(); clean.decorate();
+assert.deepEqual(clean.viewerCounts(), {mounts: 0, sources: 0}, 'page initialization and decoration never start a generic Cells viewer, even with retained old markup');
 assert.equal(clean.listeners.size, 1, 'decoration does not duplicate subscriptions');
 clean.outcome('unknown'); clean.outcome('rejected'); clean.settle();
 assert.equal(clean.counts().reloads, 0, 'uncertain or rejected actions cannot refresh the page');
@@ -85,4 +93,4 @@ for (const pending of ['dirty', 'composing']) {
   draft.globalEvents.get('beforeunload')({preventDefault() {prevented = true;}});
   assert.equal(prevented, true, `leaving protects ${pending} iframe inputs`);
 }
-console.log('PASS Nenex declared action chrome (17 assertions)');
+console.log('PASS Nenex declared action chrome and cell navigation');

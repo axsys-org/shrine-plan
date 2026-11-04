@@ -161,3 +161,24 @@ Earlier failed fixture candidates and compilation timeouts are not counted as
 passes. This run establishes the bounded lifecycle, not general research quality,
 latency, load capacity, or storage performance. Cold startup and publication took
 minutes; native arena growth is outside this library's scope.
+
+The subsequent Nenex presentation change retires automatic generic Cells viewer
+embedding. Authored flow occurrences retain their existing status, bindings,
+holes and controls. Cell bindings, captured evidence and validated values link
+to the standalone inspector. The embedded-pane failure recorded above describes
+the earlier presentation; the flow does not depend on that viewer being mounted
+inside the document.
+
+That presentation change passed 121 native assertions: 67 interface checks,
+36 authored-occurrence checks and 18 provider/hole/retry checks, including exact
+retained x/y/z history. The production mount-contract gate and action-chrome
+regression passed. The native worker emitted every passing record and its
+completion marker, then exited; its command wrapper had been terminated before
+writing the usual result report, so an overall wrapper PASS is not claimed.
+Earlier malformed fixture candidates are excluded. Deadlines were unchanged.
+
+In a fresh disposable world on 8332, the existing Evidence sources example was
+created through Nenex, published through its Goo action, and selected into an
+ordinary frozen cell. The reader loaded no generic Cells viewer scripts or
+mounts. Its inspection link opened that same captured definition in standalone
+Cells, retaining source x-case 1. Existing worlds were not restarted or modified.

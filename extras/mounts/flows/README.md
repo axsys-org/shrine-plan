@@ -113,6 +113,11 @@ retains the historical callable. Reflection alone does not grant a raw function
 effects or invent an input contract: those require a declared flow operation or
 Goo control. Inspection uses the existing capture size limits; inspect a narrower
 module subtree when a large compiler mirror exceeds them.
+In **Declared authoring actions → Inspect callable definitions**, **Inspection
+care** selects `z` for a subtree or `x` for its own record. The default remains
+`z`. Select `x` when supplying a single native definition or
+settled work record to the library examples. This uses the existing capture
+operation and native care; it does not introduce another kind of snapshot.
 
 Choose **Compose an operation or child flow**, name the selection, and supply a
 published operation or flow path. The callable's kind is explicit. Selection
@@ -326,13 +331,128 @@ attach it with the existing Nenex writer. The examples are procedures rather
 than separate applications or Python launchers.
 
 **Bind filesystem source** selects a captured Markdown record and its existing
-filesystem mount. It calls `watch_sources` with `source`, `mount`, `expected`,
-a one-segment `name`, and `format: md`. The resulting source cell fills the
+filesystem mount. **Declared authoring actions → Bind filesystem evidence** also
+offers an explicit **Source format** (default `md`). Both call `watch_sources`
+with `source`, `mount`, `expected`, a one-segment `name` and format. Supported
+source labels are `md`, `markdown`, `text`, `txt`, `foil`, `rvr` and `json`;
+the selected flow still decides which formats it can decode. The resulting source cell fills the
 `sources` input. Its origin is the exact native historical file reference;
 no generated JSON bundle or SHA-256 adapter is needed. The filesystem foot
 retains ownership of polling and cancellation. Shared consumers keep the watch
 alive. Missing files and detached feeds expose no current evidence; their last
 captures and historical records remain.
+
+### Learning, technical atlas and format ingestion
+
+All three are available under **Page tools → Flow examples**. Creating an example
+authors its shipped Semidoc and binds its declared repository files through the
+existing filesystem source hands. It does not publish, attach, dispatch a model
+or overwrite an existing example page. Publish its named definition, bind any
+remaining inputs, select the Nenex writer and a separate destination, then attach
+maintenance or embed a selected occurrence using the ordinary controls.
+The three examples reuse the handbook catalogue's `/0x11/io/fs/flow_sources`
+capture. Atlas sources reuse the same file entries as the handbook, rather than
+staging duplicate copies under new names. Native source-feed dependencies keep
+that capture watched while any consumer still needs it.
+Source keys also name generated reference documents. Use `cell_examples` for
+the Cells source: `cells`, `work`, `inputs`, `flows` and `holes` are reserved
+by the native document writer, including beneath `reference`.
+
+| Example | Definition / author page | Remaining input | Result |
+| --- | --- | --- | --- |
+| Task learning | `task_learning` / `task_learning_flow` | `capture`: a selected settled native work record | Lesson, proposed instruction change and reusable-procedure brief |
+| Technical atlas | `technical_atlas` / `technical_atlas_flow` | `capture`: a selected native definition or compiler mirror entry | Concept tree relating language/runtime, interfaces and computation |
+| Format ingestion | `format_ingestion` / `format_ingestion_flow` | None for the bundled JSON sample | Deterministic source document projection; decoded values retained in the step trace |
+
+For either `capture` input, open **Declared authoring actions → Inspect callable
+definitions**, name the inspection, enter the source record path and set
+**Inspection care** to `x`. Bind the flow input to the **raw**
+`<author>/cells/<inspection>` path, without `/x`. This supplies the existing
+`native_work/captured` record. The adapter refuses collection care, absent
+versions and empty readings instead of treating a collection's epoch as its
+root record's identity. The exact typed capture remains beside a bounded display
+produced by the existing native value renderer. Source text and type descriptors
+are inspectable evidence; a decompiled law is not evidence that it ran.
+
+The inspection is frozen. Later source publication does not retarget it; inspect
+and rebind deliberately to adopt another definition or task outcome. Ordinary
+manual/document sources remain live bindings and wake the existing maintenance
+hand on change. An attempt retains both readings. The raw cell path and its
+`/x/...` computed projection have different meanings here; the adapter requires
+the former, not a new kind of flow input.
+
+**Task learning** uses native settled-work semantics: an open/running activity
+refuses; a completed, failed or otherwise settled attempt can supply evidence,
+including an attempt whose subject-owned hole still needs work. Its `sources`
+collection contains `task` and `instructions`. The catalogue binds clearly
+labelled sample documents. Replace these with the actual goal and current
+instructions before adopting a real lesson. A provider or person authors three
+proposals through the shared revision hand. The flow does not mutate instruction
+files, infer a runnable procedure from opaque results, or install a global
+after-task hook. Use existing trace extraction and callable composition to turn
+an accepted proposal into a separately reviewed and published procedure.
+For a completed flow, select its retained `work/<generation>` record. The adapter
+walks its existing typed evaluation trace explicitly, including each step's
+named results, instead of relying on a truncated rendering of the enclosing
+run. Other native work contributes the fields actually present in its selected
+record; this does not follow arbitrary investigation links or infer missing
+actions. Every display remains a view of the original retained capture.
+
+**Technical atlas** binds the existing Shrine, Grove, Goo, Nenex, flow-harness,
+reflection, cell, hand and view sources. Its `example` step actually runs the
+existing inventory operation; that captured input/result is inspectable in the
+trace. Concept drafts also use the explicitly selected native definition. The
+result is authored explanation with provenance, not README replication. It is
+not a full Enki manual, nor a claim that arbitrary code examples were executed.
+Other callable examples can be deliberately composed or embedded through the
+existing Nenex controls.
+
+**Format ingestion** requires no provider. The sample binds one JSON source as
+`data`; rebinding another format uses the explicit format field in the declared
+Goo action. `library/decode_sources` validates the existing
+source envelopes, selects JSON/Markdown/literal-text handling, and returns source
+cards. A JSON card adds one `data` slot containing its existing native JSON
+variant record (`json/obj`, `json/arr`, and so on). `flow_library/json_value`
+reads it back as the parser's sum; neither a new wrapper nor a code carrier is used.
+The source remains beside it. Another operation or child flow can consume this
+decoded tree; no per-key namespace records, schema registry or entity merge are
+created. `library/project_sources` uses the existing `documents` operation for
+readable reference pages and retains the JSON value and original source on each
+JSON reference record in the returned tree. Another flow can consume that complete
+result. The Nenex writer writes those pages; typed decoded values remain in the
+retained step/result cells, not as editable data slots on generated prose documents.
+
+This example stops at decoding and document projection. Selecting useful domain
+structures, derived cells and Grove/Goo views remains authoring work. An explicit
+mapping can supply that next step before other flows consume the structured data.
+
+The native JSON decoder retains ordered object members (including duplicates),
+nulls, exact signed integers and real-number source lexemes. It has a permissive
+numeric dialect, including malformed real lexemes described in `src/foil/json.foil`;
+this adapter is **not** strict RFC validation or domain validation. Original bytes
+remain authoritative evidence. Parse failures, trailing content, unsupported
+formats and unavailable sources refuse before publication. CSV, OSM and domain
+schema adapters are still separate authoring work. No parser is copied into the
+flow library.
+
+These optional pure operations live under `/0x11/gov/flows/operations/library`
+and are registered by the existing example catalogue. They reuse native
+captures, JSON values and `flow/page`; there is no new persistent contract,
+work interpreter, provider, watcher or scheduling layer.
+The helpers are exported by the existing `flow_examples` module. Extending the
+library therefore leaves the service's captured mount descriptor unchanged.
+The added input choices belong to the published Goo declarations. The compact
+subtree/Markdown forms keep their existing defaults because an already running
+HTTP handler retains its captured implementation. Refreshing published behavior
+does not replace that service; no restart or bootstrap patch is needed for the
+declared actions.
+
+The focused native check is `extras/x/check --mount flows --suite flow_library_tests`.
+`--suite flow-authoring-only-tests` compiles the production authoring Grove and
+checks its browser/headless actions, including JSON format and own-record care,
+without loading the Codex surface fixture. The existing
+`--suite flow-reflected-authoring-tests` retains the combined authoring and
+Codex surface coverage; its provider fixture is an explicit test dependency.
 
 **Bind web source** writes an ordinary named URL input and fills `urls`.
 `web_fetch` declares a native work request, `web_sources` converts an accepted
@@ -458,6 +578,11 @@ resolution. Returning to an earlier equal input does not revive an obsolete
 attempt. A failed request stays retained; **Retry work** creates a linked attempt.
 Successful steps yield `work/outcome`, a pinned `work/result` reference and the
 attempt path for subsequent pure operations. Reading cells never starts I/O.
+
+Nenex's existing occurrence presentation keeps status, bindings, holes and native
+controls inline. Requests link their captured evidence and validated values;
+the page's cell list opens the standalone Cells inspector. The document does not
+mount a generic Cells viewer or start a separate read loop for every cell.
 
 Native reverse-reference and graph views can supply the same input/context
 bindings. Their sovereign-state index changes the core `sov` contract. This

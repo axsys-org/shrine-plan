@@ -134,12 +134,6 @@
       form.dataset.ready = 'true';
       form.querySelector('[type=submit]').disabled = false;
     }
-    for (const cell of shell.querySelectorAll('[data-native-cell]')) {
-      if (cell.dataset.mounted || !window.GooLive || !cell.closest('details')?.open) continue;
-      cell.dataset.mounted = 'true';
-      const path = cell.dataset.nativeCell;
-      window.GooLive.mountViewer(cell, window.GooLive.mcpSource({views: path}), {crumb: path, views: path});
-    }
     for (const row of shell.querySelectorAll('.goo-topos-member, .goo-member[data-key]')) {
       const selected = (row.getAttribute('subject') || row.dataset.key) === page;
       row.toggleAttribute('data-current', selected);
@@ -161,6 +155,5 @@
     }
   };
   new MutationObserver(decorate).observe(shell, {childList: true, subtree: true});
-  shell.addEventListener('toggle', decorate, true);
   decorate();
 })();
