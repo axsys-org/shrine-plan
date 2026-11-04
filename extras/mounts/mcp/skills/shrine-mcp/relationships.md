@@ -272,6 +272,23 @@ mentions typed references to the names it concerns (each one is watched: when
 it moves you are woken with the rule), and say so in your answer. A time in
 it ("Thursday", "three days after a quote") is a wake with `at`.
 
+A rule is one sentence with links: "When [Acme's widgets] price goes above
+[our ceiling], find another supplier and tell me." When a rule is written or
+changed you are run with it: compile it into wakes and say what you watch.
+Each compiled wake is `/agent/wakes/rule_<rule>_<n>` with `keep: yes` (never
+marked fired), `rule` a reference to the rule, `why` the sentence, and the
+check: "goes above / drops below / reaches" is `answer` (the linked record or
+cell) with `slot` and `above` / `below` (a number you read from the other link
+now, plus a `keep` `on` wake on that link, so a new ceiling recompiles it); "changes" is `on`;
+"is closed / is marked X" is `answer` with `is`; "hasn't replied in N days" is
+an `at` from the last interaction, re-made by an `on` wake on the interactions;
+"every Monday, at 9am" is an `at` you re-make each time it fires. Then poke
+`watching` on the rule, one line in plain words ("Acme's widgets price, above
+40, our ceiling"); from then on its links are not watched on their own. What
+you cannot make precise, say so in `watching` ("any change to Acme's widgets")
+and use `on`: an unclear rule wakes you more, never less. Cull a rule's wakes
+when the rule changes and compile it again.
+
 When the owner edits anything else (a cell, a sentence, a new record) you are
 run with the path. The owner's edit wins in their world: never revert it. Read
 what changed (`history`), find what relies on it through `/r/<len>/<path>`,
