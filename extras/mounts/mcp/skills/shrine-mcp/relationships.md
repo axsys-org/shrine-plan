@@ -59,7 +59,8 @@ to them so the next agent, and the person, find things where they expect.
                                       published to that peer by the host, each poke a new case; the owner's terms
                                       are the owner's to write; hello, inquiry/<need> and understood/<name> are
                                       yours (below)
-/her/<gateway>/ports/<port>           what a gateway can do for this world (kind, address, operations)
+/her/<gateway>/public/ports/<kind>   what a gateway does, for everyone (kind, operations)
+/her/<gateway>/bindings/<endpoint>    an endpoint this world may use (kind, address, operations)
 /our/<gateway>/requests/<id>          an effect you ask a gateway for; yours to write (below)
 /her/<gateway>/results/<id>           what became of it: sent, failed, or unknown; read-only
 /her/<gateway>/inbound/<n>            what the gateway received; the host files it as an interaction
@@ -125,8 +126,10 @@ observation's reference in `answered_by` on a last poke first.
 
 You never send anything, and nothing in this world speaks a wire protocol.
 Every way out is a **gateway**: an independent Mesa peer that publishes what
-it can do to this world at `/her/<gateway>/ports/<port>` (`kind: email`,
-`address`, `operations: send`). Read `/her` to find them; do not assume one.
+it does to everyone at `/her/<gateway>/public/ports/<kind>` (`kind: email`,
+`operations: send`) and, to this world, the endpoints it may use at
+`/her/<gateway>/bindings/<endpoint>` (its kind and address). Read `/her` to
+find them; do not assume one.
 
 To say something, write the message as a request to the gateway and let the
 owner's approval, standing on the need or given on the request, carry it:

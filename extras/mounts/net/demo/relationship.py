@@ -360,10 +360,12 @@ def full():
     (pg, s) = wait('the gateway world', lambda: up(G), 300, 2); log(f'gateway world {G} up in {s} s')
     stdlib = {c['path'].rsplit('/', 1)[1]: pinned(c) for c in world_rpc(pa, 'read', path=f'/{A}/weft/stdlib', care='y', limit=100)['children']}
     world_rpc(pa, 'write', who='owner', records=[{'path': f'/{A}/net/self', 'action': 'poke', 'slots': {'name': 'Northstar'}}])
-    (port_record, s) = wait('the gateway\'s port acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/ports/email', care='x')), 120, 0.5)
-    check('the gateway advertises send over email, with its endpoint', port_record['properties'].get('/kind') == 'email' and port_record['properties'].get('/operations') == 'send' and port_record['properties'].get('/endpoints') == 'mail', port_record['properties'])
-    (binding, s) = wait('the binding acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/bindings/{A}/mail', care='x')), 60, 0.5)
-    check('the world sees its own binding to the endpoint, for send and receive', 'send' in binding['properties'].get('/operations', '') and 'receive' in binding['properties'].get('/operations', ''), binding['properties'])
+    (port_record, s) = wait('the gateway\'s port acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/public/ports/email', care='x')), 120, 0.5)
+    check('the gateway advertises send over email to everyone, under its /our/public', port_record['properties'].get('/kind') == 'email' and port_record['properties'].get('/operations') == 'send' and port_record['properties'].get('/publisher') == G, port_record['properties'])
+    (binding, s) = wait('the binding acquired at /her', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{G}/bindings/mail', care='x')), 60, 0.5)
+    check('the world sees its own binding to the endpoint, for send and receive, with its address', 'send' in binding['properties'].get('/operations', '') and 'receive' in binding['properties'].get('/operations', '') and binding['properties'].get('/kind') == 'email', binding['properties'])
+    other = world_rpc(pa, 'read', path=f'/{A}/her/{G}/endpoints', care='y')
+    check('the gateway keeps its own bookkeeping to itself', not other.get('children'), other)
     log(f'port acquired {s} s after both worlds were up')
 
     # --- 1 the relationship begins: a need, the folder, the standing approval, the first request
