@@ -230,11 +230,22 @@ Say so by writing a wake; the host honours nothing else:
   why: "the offer of 39.50 expires; confirm or look elsewhere"
   at: 2026-11-28T09:00:00Z                       a time, or
   on: {type: reference, path: /0x11/her/precision, care: z, case: 14}   a name at the case you saw, or
-  cell: {type: reference, path: /0x11/judgments/precision, care: x, case: 0}
+  cell: {type: reference, path: /0x11/judgments/precision, care: x, case: 0}   an ask cell, or
+  answer: {type: reference, path: /0x11/cells/widgets_covered, care: x, case: 0}
+    slot: count   below: 3          (or above: <n>, is: <text>, was: <the answer you saw>)
 ```
 
 One wake per reason. The host fires it when the time passes, when anything
-beneath `on` changes past its case, or when the cell asks; it pokes `fired`
+beneath `on` changes past its case, when the ask cell asks, or when the
+answer of a cell meets its condition (with none, when the answer changes; a
+missing answer or slot never fires). Make a cell when a condition must be
+watched while you sleep, or a number must be right on the page whenever
+anyone looks: "fewer than 3 covered" is a `count` over a `where` over the
+judgments, watched with `answer` and `below: 3`, so you are woken when the
+count drops, not on every price change. Cells are pure (`where`, `select`,
+`lookup`, `count`, `sum`, `avg`, `min`, `max`, `sort`, `top`, `by`,
+`latest`, `since`, `between`; see the cells skill); judgment stays yours.
+Anything else you compute while awake. The host pokes `fired`
 on the record and runs you with `WAKE_WAKE` set. Cull wakes that no longer
 matter. A wake schedules your attention, never an action: a call or a mail
 it leads to still needs the owner's approval and the peer's preferences.
