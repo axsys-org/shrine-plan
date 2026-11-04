@@ -162,12 +162,11 @@ phone and must land in the same folder.
 ## The peer's prospective world
 
 Before a peer runs Shrine, the host keeps a world reserved for it, named by
-its mailbox, and gives you a token scoped to your inquirer's corner of it:
-
-```
-POST <WAKE_HOST>/w/<WAKE_WORLD>/peers/<peer node>/token   (Authorization: Bearer <WAKE_TOKEN>)
-  -> {token, mcp, scope: /<peer>/proposed/relationships/<WAKE_WORLD>}
-```
+its mailbox, and your tools include that world's corner for you: beside the
+`shrine` server you may find `peer_<node>` servers (`mcp__peer_0x20__mcp/read`,
+`…/mcp/write`), each scoped to `/<node>/proposed/relationships/<WAKE_WORLD>`
+and nothing else. Read `/relationships/<r>` for `peer`, or the `/her` names,
+to know which node is which; a corner you were not given is not yours.
 
 Under that scope, and only there, write the relationship as the peer will
 find it when it claims the world: `inquiry` (a reference to the need),
@@ -210,7 +209,10 @@ quiet, a term outside the ceiling. Nothing else leaves the world.
   other.
 - Two identifiers are two relationships until the owner, or the peer at its
   claim, relates them; an identifier you add to a relationship on suspicion
-  says so in `note`.
+  says so in `note`. An address at a company's own domain is grounds to
+  propose that it belongs to the company, in a note on the identifier, never
+  to merge: the person who writes from it is a person, the domain is a
+  resource, and the claim is theirs to make.
 - What you do not know is an unresolved question, not a guess written as a
   slot.
 - Write as one batch per decision so history reads as one event.
