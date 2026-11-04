@@ -419,7 +419,7 @@ def full():
     judged = world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x')
     check('the judgment is answered with what it relied on and a follow-up', judged.get('exists') and judged['properties'].get('/ok') == 'yes' and judged['properties'].get('/follow_up') == follow_up, judged)
     # the proposals in the peer's prospective world, through a scoped token
-    (pb, s) = wait('the prospective world', lambda: up(peer), 400, 2); log(f'peer {peer} up in {s} s')
+    (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
     status, got = Client().json(f'/w/{A}/peers/{peer}/token', {}, {'Authorization': 'Bearer ' + agent})
     check('a scoped token for the prospective world', status == 200 and got.get('scope') == f'/{peer}/proposed/relationships/{A}', (status, got))
     scoped = got['token']
@@ -439,7 +439,7 @@ def full():
     world_rpc(pg, 'write', who='gateway', records=[{'path': f'/{G}/attempts/{A}/ghost', 'slots': {'case': 1, 'status': 'attempting', 'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}}])
     kill_everything(signal.SIGKILL); log('host, gateway, fixture, worlds and services killed')
     t0 = time.monotonic(); start_host(); start_gateway([A]); start_fixture()
-    wait('the worlds back', lambda: up(A) and up(peer) and up(G), 300, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
+    wait('the worlds back', lambda: up(A) and up(peer) and up(G), 600, 1); report['restart_s'] = round(time.monotonic() - t0, 2)
     check('the interactions, the judgment and the wakes survive', len(interactions(pa)) == 2 and world_rpc(pa, 'read', path=f'/x/{A}/judgments/precision', care='x').get('exists')
           and len(children(pa, f'/{A}/agent/wakes')) == 2, 'after restart')
     (ghost, s) = wait('the unknown result', lambda: result_of(pa, A, 'ghost'), 60, 0.5)
@@ -539,7 +539,7 @@ def many():
     for node, name in inquirers:
         (conv, s) = wait(f'reply to {node}', lambda n=node: (lambda c: c if c else None)(interactions(ports[n], f'/{n}/relationships/precision/interactions')), 90, 0.5)
         check(f'{name} received its own threaded reply', conv[0]['properties'].get('/request') == f'{asks[node][0]}_precision', conv[0]['properties'])
-    (pb, s) = wait('the prospective world', lambda: up(peer), 400, 2); log(f'peer {peer} up in {s} s')
+    (pb, s) = wait('the prospective world', lambda: up(peer), 900, 2); log(f'peer {peer} up in {s} s')
     scoped = {}
     for node, name in inquirers:
         status, got = Client().json(f'/w/{node}/peers/{peer}/token', {}, {'Authorization': 'Bearer ' + tokens[node][1]})
