@@ -84,7 +84,7 @@ words name a region). Everything above applies, with these rules on top:
 - Nothing reaches a real business without the owner's hand: write each
   inquiry as a request with no approval, and say in the judgment that it
   waits on the owner; the owner approves it on the shop's page, or not at
-  all. The same for calls and texts, always.
+  all. The same for calls, always. Never texts.
 - Every message to a real business says, in its first lines, exactly this
   much: that Northstar is a hypothetical small shop defined by Axiomatic
   Systems to test a sourcing system (never "we are a shop" as if it were

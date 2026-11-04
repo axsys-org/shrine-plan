@@ -148,7 +148,9 @@ and must carry `purpose`: one sentence on why now, in the peer's terms (what
 changed on their side or ours, what fell due, what we need from them). The
 voice speaks from the relationship's `brief`, the purpose, the last few
 interactions and the open questions, and nothing else; write the brief
-before you ask for a call. A text is `channel: sms`.
+before you ask for a call. Never send texts: outbound SMS is off (US carriers
+refuse unregistered automated texting). A text that arrives is filed like
+anything else; answer it by mail or by a call, never by text.
 
 The host publishes the request to the gateway once an approval by the owner
 covers it (`/our/<gateway>/requests/<id>/approval`, or the need's), after
@@ -200,8 +202,9 @@ other peer's terms, no prices you will pay. When the peer claims its world
 the host turns `prospective` into `peer`, the peer confirms or corrects by
 publishing `/our/<WAKE_WORLD>/<name>` from its own world, and you read it at
 `/her/<peer>/<name>` from then on instead of asking. The host offers the
-claim link once per way of reaching them (the mail footer, one text after a
-call); you never do.
+claim link once per way of reaching them (the mail footer; after a call, one
+mail when you know their address, and otherwise the voice says on the call that
+a link will follow by mail); you never do.
 
 ## When to be woken again
 
