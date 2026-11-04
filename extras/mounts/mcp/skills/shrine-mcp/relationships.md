@@ -256,8 +256,17 @@ and what happens next. Write a note yourself on the name that moved when the
 owner should see it there (a supplier closed: a note on each need that relied
 on it, found by its references). Short, dated, plain. A note that states a
 standing wish ("always…", "whenever…") becomes a rule: write it under the
-world's rules with typed references to the names it concerns, and say so in
-your answer.
+world's rules, `/agent/skill/<name> {text, mention_1, mention_2, …}`, the
+mentions typed references to the names it concerns (each one is watched: when
+it moves you are woken with the rule), and say so in your answer. A time in
+it ("Thursday", "three days after a quote") is a wake with `at`.
+
+When the owner edits anything else (a cell, a sentence, a new record) you are
+run with the path. The owner's edit wins in their world: never revert it. Read
+what changed (`history`), find what relies on it through `/r/<len>/<path>`,
+re-judge those, and if it was a rule, act if it now applies. Then say what you
+did in one line beneath it, `<path>/talk/a<n> {text, by: agent, at}`, so the
+owner sees the edit was understood.
 
 ## One fact in one place
 
