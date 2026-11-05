@@ -18,14 +18,45 @@
       plan
         \ request=http_foot/request now=nat
         ^ http_foot/action
-        = url (http_foot/split 63 request.target).at(0)
-          opening=http_foot/action .stream
-        ? (and (equal request.method "GET") (equal url "/mcp/stream")) opening
+        = parts (http_foot/split 63 request.target)
+          url parts.at(0)
+        ? (and (equal request.method "GET") (equal url "/mcp/stream"))
+          | mcp_mount/stream self (? (eq parts.len 2) parts.at(1) "")
         ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
         ? (mcp_rpc/parse_call request.body)
          > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
          > (./ok call) (mcp_mount/dispatch self call)
     | http_foot/add_routes [(http_foot/route "/mcp" plan)] http_foot/empty
+  + stream
+    ' GET /mcp/stream: server-sent events, one per commit from any
+    ' writer, pushed by the supervisor as it commits (mcp_mount/notice),
+    ' each with its epoch as the event id.  ?after=<epoch> resumes past
+    ' an epoch already seen, from the journal, with no gap and no
+    ' repeat; without it the stream starts at the top.
+    \ self=iota query=str
+    ^ http_foot/action
+    = given (http_foot/field "after" (http_foot/fields query))
+      after=maybe[nat] (? (eq given.len 0) .none (nat/parse given))
+    | http_foot/action/stream after (\ n=nat state=namespace (mcp_mount/notice self n state))
+  + notice
+    ' The stream's event for one epoch, from its log entry: {epoch, who,
+    ' touched, touched_count, woke, woke_count}.  woke is the cells the
+    ' commit woke through the reverse index (cell_wakes): those it wrote
+    ' and those reading what it changed, transitively.  touched and woke
+    ' carry their first hundred.  Empty for an epoch with no entry.
+    \ self=iota n=nat state=namespace
+    ^ str
+    = entry (sovereign_peek [self 'log ($u n)] state)
+    ?> (./some record) entry.fil ""
+    ?> (./some held) record.get(['sys 'content]) ""
+    ?> event=namespace_event held ""
+    = [touched count] (mcp_mount/touched_json entry)
+      woke (cell_wakes (unpin event.changes).tap n state)
+      named (? (gt woke.len 100) woke.take(100) woke)
+    | show (json/obj [(jkv "epoch" (json/num .false n)) (jkv "who" (json/str (mcp_mount/who_of self entry)))
+                      (jkv "touched" touched) (jkv "touched_count" (json/num .false count))
+                      (jkv "woke" (json/arr named.map((\ p=path (json/str (mcp_mount/shown p))))))
+                      (jkv "woke_count" (json/num .false woke.len))])
   + json
     \ body=str
     ^ http_response
@@ -114,7 +145,7 @@
         | http_foot/action/admit
             (namespace_command/plan pax op input)
             (\ outcome=maybe[pail] state=namespace (mcp_mount/finished call.id writes then outcome state))
-            mcp_mount/command_told_line
+            (\ outcome=maybe[pail] state=namespace "")
     | mcp_mount/refuse call.id "Unknown tool"
   ' ---- addresses and values
   + path_rule
@@ -714,53 +745,11 @@
     ' The records as one event (admitted whole or refused whole), with
     ' the writer's tag record riding in the same event, then the then
     ' reads on the admitted state, in one answer that lists the records
-    ' asked for.
+    ' asked for.  The stream hears of it from the supervisor's push.
     \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
     ^ http_foot/action
-    | ./batch_told writes.weld(tag)
+    | ./batch writes.weld(tag)
         (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
-        (\ outcome=maybe[pail] state=namespace (mcp_mount/told_line writes who outcome state))
-  + command_told_line
-    ' A namespace operation may write more than its receiver. Report the
-    ' committed journal paths, using the normal stream rendering budget.
-    ' The supervisor suppresses this callback's line when no epoch advanced.
-    \ outcome=maybe[pail] state=namespace
-    ^ str
-    ? (maybe/is_some outcome) ""
-    = entry (sovereign_peek [state.self 'log ($u state.local.top)] state)
-    ?> (./some record) entry.fil ""
-    ?> (./some held) record.get(system_vocabulary/content) ""
-    ?> event=namespace_event held ""
-    = writes=row[[path writ]]
-        | (unpin event.changes).tap.fold []
-          \ acc=row[[path writ]] [p q]
-          ? (eq p.len 0) acc
-          | acc.snoc([p (writ/poke myth/new)])
-    | mcp_mount/told_line writes "mcp" outcome state
-  + told_line
-    ' The line every open stream receives for an admitted write:
-    ' {epoch, label, who, touched, with}, with the written records
-    ' rendered on the admitted snapshot through the same page render
-    ' then uses (50 nodes each, 500 for the line, the first hundred
-    ' records of a wider batch); nothing on refusal.
-    \ writes=row[[path writ]] who=str outcome=maybe[pail] state=namespace
-    ^ str
-    ? (maybe/is_some outcome) ""
-    = none=maybe[path] .none
-      empty=row[jkv] []
-      label=str (? (eq writes.len 1) "write" (str/cat_all ["batch of " (nat/show writes.len)]))
-      touched (json/arr writes.map((\ [pax wit] (json/str (mcp_mount/shown pax)))))
-      start=[row[jkv] nat] [empty 500]
-      shown_writes (? (gt writes.len 100) writes.take(100) writes)
-      [kvs left]
-        | shown_writes.fold start
-          \ acc [pax wit]
-          = [out l] acc
-          ? (eq l 0) acc
-          = [view nodes last more bytes] (mcp_mount/paged pax (sorge[myth] .x (sovereign_peek pax state)) state none (? (lt l 50) l 50) .true)
-          | [out.snoc((jkv (mcp_mount/shown pax) view)) (sub l nodes)]
-    | show (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "label" (json/str label)) (jkv "who" (json/str who))
-                      (jkv "touched" touched) (jkv "with" (json/obj kvs))])
   + shown_line
     ' The line a presented read pushes: {shown: {path, care, case}}.
     \ spec=mcp_mount/spec

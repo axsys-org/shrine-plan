@@ -21,7 +21,6 @@
       http_foot/action/commit
       http_foot/action/commit_many
       http_foot/action/batch
-      http_foot/action/batch_told
       http_foot/action/told
       http_foot/action/stream
       http_foot/action/broadcast
@@ -73,20 +72,18 @@
       ' receives the event's outcome and that state.  The connection
       ' actor runs the pair; the foot sees one commit and a snapshot.
       : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str]
-    + batch_told
-      ' A batch, plus one line for the open streams. After the commit,
-      ' told runs on the new state and returns the line to send; an
-      ' empty string sends nothing.
-      : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str] told={\ maybe[pail] namespace}str
     + told
       ' A read that also sends a fixed line to the open streams. Nothing
       ' is written to the journal.
       : read={\ namespace}[nat str] line=str
     + stream
       ' A GET that stays open. The connection sends the event-stream
-      ' head, registers with the fan-out, and then writes each line it
-      ' is given until the socket closes. Commits never wait for it.
-      :
+      ' head, registers with the fan-out, and then, on every commit,
+      ' writes the epochs after the last it sent, each rendered by line
+      ' from the journal (an empty line skips the epoch), until the
+      ' socket closes.  after resumes past an epoch already seen; none
+      ' starts at the top.  Commits never wait for it.
+      : after=maybe[nat] line={\ nat namespace}str
     + broadcast
       ' One line for every open stream, from a connection to the foot.
       : line=str
@@ -121,6 +118,7 @@
       feet/task/ack
       feet/task/develop
       feet/task/admitted
+      feet/task/committed
       http_foot/action/snapshot
       http_foot/action/admit
       feet/task/binary
@@ -133,7 +131,6 @@
       http_foot/action/commit
       http_foot/action/commit_many
       http_foot/action/batch
-      http_foot/action/batch_told
       http_foot/action/told
       http_foot/action/stream
       http_foot/action/broadcast
@@ -419,19 +416,19 @@
     '  namespace work and write its answer.
     \ fd=nat planned=http_foot/planned foot=nat
     ^ nat
-    = streaming=bool
+    = opened=maybe[http_foot/action/stream]
         ? planned
          > (./ask action)
           ? action
-           > .stream .true
-          .false
-        .false
+           > opening=http_foot/action/stream (./some opening)
+          .none
+        .none
       joining=http_foot/action .join
-    ? streaming
+    ? opened
+     > (./some opening)
       ; (Try (\ wire=nat (Write fd wire)) (http_foot/bar http_foot/stream_head))
       ; (SendCaps foot joining [0])
-      ; (CloseHandle foot)
-      | http_foot/streaming fd
+      | http_foot/streaming fd foot opening.line opening.after
     = encoded=nat
         ? planned
          > (./done ready) ready
@@ -443,15 +440,26 @@
     ' What a stream connection and the fan-out exchange.
     & http_foot/stream_msg/join
       http_foot/stream_msg/line
+      http_foot/stream_msg/tick
       http_foot/stream_msg/streamed
     + join
       :
     + line
+      ' A fixed line (a presented read): written as it is.
       : text=str
+    + tick
+      ' Something committed: render the epochs not yet sent.  From the
+      ' foot id is 0; to a stream it is the stream's own, for its acks.
+      : id=nat
     + streamed
-      ' A stream acknowledging one written line; the fan-out counts
-      ' lines outstanding per stream and drops one that stalls.
-      :
+      ' A stream acknowledging the message it was sent; until then the
+      ' fan-out sends it nothing more.
+      : id=nat
+  + subscriber
+    ' One open stream in the fan-out: its handle, whether it holds a
+    ' message not yet acknowledged, whether a commit came meanwhile, and
+    ' the fixed lines waiting for it.
+    : id=nat h=nat busy=bool dirty=bool lines=row[str]
   + stream_head
     ' The event-stream response head: no length, the body runs until
     ' the socket closes.
@@ -462,71 +470,187 @@
     \ text=str
     ^ nat
     | http_foot/bar (str/cat_all ["data: " text http_foot/crlf http_foot/crlf])
-  + streaming
-    ' A stream connection after its head is written: receive lines from
-    ' the fan-out, write each to the socket, acknowledge it; a failed
-    ' write (the tab went away) ends the connection.
-    \ fd=nat
-    ^ nat
-    % ignored=nat 0
-    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+  + page
+    ' One page of a stream, read on one snapshot: the events for the
+    ' epochs after last, at most 64 of them, each with its epoch as the
+    ' event id, as "<through> <top>" on the first line and the events
+    ' after it.  A stream opened at the top (none) is through the top
+    ' and says so once, as the comment ": at <top>", so a client that
+    ' opened live knows the epoch to resume after.
+    \ line={\ nat namespace}str last=maybe[nat] state=namespace
+    ^ [nat str]
+    = top state.local.top
+      from
+        ?> (./some n) last top
+        n
+      upto (? (gt top (add from 64)) (add from 64) top)
+      head (str/cat_all [(nat/show upto) " " (nat/show top) http_foot/crlf])
+      opening=row[str]
+        ? (maybe/is_some last) [head]
+        [head (str/cat_all [": at " (nat/show top) http_foot/crlf http_foot/crlf])]
+    % n=nat from.inc out=row[str] opening
+    ^ [nat str]
+    ? (gt n upto) [200 (str/cat_all out)]
+    = text (line n state)
+    ? (eq text.len 0) (_ n.inc out)
+    | _ n.inc out.snoc((str/cat_all ["id: " (nat/show n) http_foot/crlf "data: " text http_foot/crlf http_foot/crlf]))
+  + unpage
+    ' A page read back: the epoch it is through, the top, its events.
+    \ text=str
+    ^ maybe[[nat nat str]]
+    ?> (./some end) (http_foot/find http_foot/crlf text) .none
+    = head (http_foot/split 32 text.slice(0 end))
+    ? !(eq head.len 2) .none
+    ?> (./some through) (nat/parse head.at(0)) .none
+    ?> (./some top) (nat/parse head.at(1)) .none
+    | ./some [through top text.slice((add end 2) text.len)]
+  + catch_up
+    ' Write the epochs after last, a page per snapshot, until a page is
+    ' through the top it was read at: the epoch now sent through, and
+    ' whether every write went out.
+    \ fd=nat foot=nat line={\ nat namespace}str last=maybe[nat]
+    ^ [bool maybe[nat]]
+    % last=maybe[nat] last
+    ^ [bool maybe[nat]]
+    = ;answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (http_foot/page line last state))))
+      text=str
+        ? answer
+         > response=http_response (http_foot/body_text response)
+        ""
+    ? (http_foot/unpage text)
+     > .none [.true last]
+     > (./some got)
+      = [through top events] got
+        sent=maybe[nat] (./some through)
+      ? (eq events.len 0)
+        ? (lt through top) (_ sent)
+        [.true sent]
+      = ;wrote (Try (\ wire=nat (Write fd wire)) (http_foot/bar events))
+      ? wrote
+       > (./err _) [.false last]
+       > (./ok _)
+        ? (lt through top) (_ sent)
+        [.true sent]
+  + stream_step
+    ' One message from the fan-out: a line written as it is, or a tick
+    ' caught up from the journal.  Whether the socket took it, and the
+    ' last epoch sent.
+    \ fd=nat foot=nat line={\ nat namespace}str last=maybe[nat] message=http_foot/stream_msg
+    ^ [bool maybe[nat]]
     ? message
      > (./line text)
       = ;wrote (Try (\ wire=nat (Write fd wire)) (http_foot/frame text))
       ? wrote
-       > (./ok _)
-        = acked=http_foot/stream_msg .streamed
-        ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
-        ; (helm/supervisor/close_caps caps)
-        | _ 0
-       > (./err _)
-        ; (helm/supervisor/close_caps caps)
-        ; (CloseFd fd)
-        0
+       > (./ok _) [.true last]
+       > (./err _) [.false last]
+     > (./tick id) (http_foot/catch_up fd foot line last)
+    [.true last]
+  + streaming
+    ' A stream connection after its head is written.  It keeps the last
+    ' epoch it sent (none until its first catch-up, which starts at the
+    ' top) and acknowledges each message once it is written, so the
+    ' fan-out never queues a second one and the foot's answers are the
+    ' only other mail.  A failed write (the client went away) is
+    ' acknowledged too, so the fan-out's next send finds the stream gone.
+    \ fd=nat foot=nat line={\ nat namespace}str after=maybe[nat]
+    ^ nat
+    % last=maybe[nat] after id=nat 0
+    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+      mine
+        ? message
+         > (./tick given) (? (eq id 0) given id)
+        id
+      ;[ok next] (http_foot/stream_step fd foot line last message)
+      acked (http_foot/stream_msg/streamed mine)
+    ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
     ; (helm/supervisor/close_caps caps)
-    | _ 0
+    ? ok (_ next mine)
+    ; (CloseFd fd)
+    | CloseHandle foot
+  + offer
+    ' Send a stream its next message if it is idle: a waiting line first,
+    ' then a tick when a commit came.  None when its handle refuses.
+    \ s=http_foot/subscriber
+    ^ maybe[http_foot/subscriber]
+    ? s.busy (./some s)
+    = sending=maybe[http_foot/stream_msg]
+        ? (gt s.lines.len 0) (./some (http_foot/stream_msg/line s.lines.at(0)))
+        ? s.dirty (./some (http_foot/stream_msg/tick s.id))
+        .none
+    ?> (./some message) sending (./some s)
+    = ;sent (Try (\ target=nat (SendCaps target message [0])) s.h)
+    ? sent
+     > (./err _)
+      ; (Try (\ target=nat (CloseHandle target)) s.h)
+      .none
+     > (./ok _)
+      ? (gt s.lines.len 0) (./some (http_foot/subscriber s.id s.h .true s.dirty s.lines.drop(1)))
+      | ./some (http_foot/subscriber s.id s.h .true .false s.lines)
+  + offer_all
+    ' Offer every stream its next message; drop the ones that refuse.
+    \ streams=row[http_foot/subscriber]
+    ^ row[http_foot/subscriber]
+    = none=row[http_foot/subscriber] []
+    | streams.fold none
+      \ ;out=row[http_foot/subscriber] s=http_foot/subscriber
+      ^ row[http_foot/subscriber]
+      = ;offered (http_foot/offer s)
+      ?> (./some kept) offered out
+      | out.snoc(kept)
   + fanout
-    ' The stream registry: every open stream's handle with the lines it
-    ' has not yet acknowledged.  A line is sent to each with Try; a
-    ' stream whose handle refuses, or that falls more than 64 lines
-    ' behind, is dropped.  Nothing here blocks: a commit hands the line
-    ' over and goes on.
+    ' The stream registry.  Each stream is sent one message at a time and
+    ' acknowledges it: a tick when a commit comes (or when it joins), or
+    ' a fixed line.  Commits while a stream is busy coalesce into one
+    ' tick, so a slow stream renders more epochs per page and never
+    ' falls behind or loses one.  A stream with more than 64 lines
+    ' waiting, or whose handle refuses, is dropped.  Nothing here
+    ' blocks: a commit hands the tick over and goes on.
     \ self=nat
     ^ nat
-    % streams=row[[h=nat behind=nat]] []
+    % streams=row[http_foot/subscriber] [] serial=nat 1
     = ;[message caps] (Recv[http_foot/stream_msg] 0)
     ? message
      > .join
-      ? (eq caps.len 0) (_ streams)
+      ? (eq caps.len 0) (_ streams serial)
       ; (helm/supervisor/close_caps caps.drop(1))
-      | _ streams.snoc([caps.at(0) 0])
-     > .streamed
-      ? (eq caps.len 0) (_ streams)
-      = from caps.at(0)
-        eased
-          | streams.map
-            \ [h behind]
-            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind)]
+      = waiting=row[str] []
+        joined (http_foot/subscriber serial caps.at(0) .false .true waiting)
+        ;kept (http_foot/offer_all streams.snoc(joined))
+      | _ kept serial.inc
+     > (./streamed id)
       ; (helm/supervisor/close_caps caps)
-      | _ eased
+      = eased
+          | streams.map
+            \ s=http_foot/subscriber
+            ^ http_foot/subscriber
+            ? (eq s.id id) (http_foot/subscriber s.id s.h .false s.dirty s.lines)
+            s
+        ;kept (http_foot/offer_all eased)
+      | _ kept serial
+     > (./tick id)
+      ; (helm/supervisor/close_caps caps)
+      = marked
+          | streams.map
+            \ s=http_foot/subscriber
+            ^ http_foot/subscriber
+            | http_foot/subscriber s.id s.h s.busy .true s.lines
+        ;kept (http_foot/offer_all marked)
+      | _ kept serial
      > (./line text)
       ; (helm/supervisor/close_caps caps)
-      = none=row[[h=nat behind=nat]] []
-        ;kept
+      = none=row[http_foot/subscriber] []
+        ;queued
           | streams.fold none
-          \ ;out=row[[h=nat behind=nat]] [h behind]
-          ^ row[[h=nat behind=nat]]
-          ? (gt behind 64)
-            ; (CloseHandle h)
+          \ ;out=row[http_foot/subscriber] s=http_foot/subscriber
+          ^ row[http_foot/subscriber]
+          ? (gt s.lines.len 64)
+            ; (Try (\ target=nat (CloseHandle target)) s.h)
             out
-          = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
-          ? sent
-           > (./ok _) out.snoc([h behind.inc])
-           > (./err _)
-            ; (Try (\ target=nat (CloseHandle target)) h)
-            out
-      | _ kept
-    | _ streams
+          | out.snoc((http_foot/subscriber s.id s.h s.busy s.dirty s.lines.snoc(text)))
+        ;kept (http_foot/offer_all queued)
+      | _ kept serial
+    ; (helm/supervisor/close_caps caps)
+    | _ streams serial
   + outcome
     ' The commit answer a batch step reads: 200 admitted, or 409 with
     ' the kernel's reason as the body.
@@ -573,22 +697,6 @@
            > (./bat status body ctype) .none
            > (./bytes status body ctype) .none
       | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state))))
-     > (./batch_told writes finish told)
-      = ;answer (http_foot/ask foot (http_foot/action/commit_many writes http_foot/outcome))
-        outcome=maybe[pail]
-          ? answer
-           > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
-           > (./bat status body ctype) .none
-           > (./bytes status body ctype) .none
-        ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state)))))
-        ;line (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace [200 (told outcome state)])))
-      ; (? line
-          > response=http_response
-            = text (http_foot/body_text response)
-            ? (gt text.len 0) (Send foot (http_foot/action/broadcast text)) 0
-          > (./bat status body ctype) 0
-          > (./bytes status body ctype) 0)
-      | ready
      > (./told read line)
       = ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot read)))
       ; (? (gt line.len 0) (Send foot (http_foot/action/broadcast line)) 0)
@@ -846,20 +954,20 @@
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > (http_foot/action/batch_told writes finish told)
-      ? (eq caps.len 0) (_ serial pending queue)
-      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
-      ; (helm/supervisor/close_caps caps.drop(1))
-      | _ serial pending queue
      > (http_foot/action/told read line)
       ? (eq caps.len 0) (_ serial pending queue)
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A told read is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > .stream
+     > (http_foot/action/stream after line)
       ? (eq caps.len 0) (_ serial pending queue)
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A stream is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (feet/task/committed top)
+      ' a commit, from the supervisor: every stream renders what it has not sent
+      ; (helm/supervisor/close_caps caps)
+      ; (Send streams (http_foot/stream_msg/tick 0))
       | _ serial pending queue
      > .join
       ' a stream connection joining: its handle goes to the fan-out
