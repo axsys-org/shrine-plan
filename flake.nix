@@ -16,11 +16,17 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+      # the world runtime: enki as pinned, with the fix for stale thunk update targets kept as GC roots
+      # (enki PR #50, rebased on main), which made long-lived worlds grow without bound under reads
+      runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [ ./nix/enki-update-targets.patch ];
+      });
     in {
+      packages = forAllSystems (system: { runtime = runtimeFor system; });
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = runtimeFor system;
           edenTools = [ enkiPkg pkgs.python3 pkgs.lsof ];
 
           hsPkgs = pkgs.haskellPackages.override {
@@ -52,7 +58,7 @@
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          enkiPkg = enki.packages.${system}.default;
+          enkiPkg = runtimeFor system;
         in {
           default = pkgs.runCommand "reaver-tests" {
             nativeBuildInputs = [ enkiPkg pkgs.python3 ];
