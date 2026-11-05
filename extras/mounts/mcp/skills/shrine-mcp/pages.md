@@ -205,6 +205,17 @@ request with no `to`: the owner's page shows it red under "Needs you", with a
 field to add one. A blank may also ask in words (`text`): keep the answer as
 said, and interpret it afterwards (set values citing it, or open a question).
 
+An answer by mail or by phone arrives as the gateway's observation
+(`/her/<gateway>/inbound/<n>`, filed as an interaction) with `answers` naming
+the request it replies to, and their words as said (a call's `heard` values
+are what the assistant read back, still unverified). Fill the request's bound
+blanks from their words yourself: each value only where their words say it,
+with `source` the interaction and `/filled` ("Keystone, by email" or "by
+phone"); leave a blank they did not answer. Then publish what you understood
+to them, `/our/<them>/understood/<request id>` with the values and their
+words, so they confirm or correct it on their page. Never write it as their
+answer: what a gateway heard is evidence, not their statement.
+
 Their answer arrives at `/her/<them>/<request id>`. Fill the record's blanks
 from it: each slot typed as the blank asked, its unit beside it, the blank's
 `/hole` removed; keep their `note` as text. Put a mark on the record only
