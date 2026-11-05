@@ -70,35 +70,9 @@ VRAM is available (say "ready to resume"); a need drops below `want` and no
 candidate answered within a week; a supplier's terms change outside the
 ceiling. Otherwise work quietly.
 
-## Real counterparties
+## Counterparties are never real businesses
 
-Some needs are for real businesses (the need says so in `note`, or the owner's
-words name a region). Everything above applies, with these rules on top:
-
-- Candidates come from the web when no listing or history has them: search,
-  then read the supplier's own site. Take only a sales or info mailbox the
-  site publishes; never a web form, never a personal address, never a giant
-  with no small-order business. Prefer suppliers in the owner's region (the
-  need's `region`). At most two candidates per need per pass; one message
-  per supplier per need.
-- Nothing reaches a real business without the owner's hand: write each
-  inquiry as a request with no approval, and say in the judgment that it
-  waits on the owner; the owner approves it on the shop's page, or not at
-  all. The same for calls, always. Never texts.
-- Every message to a real business says, in its first lines, exactly this
-  much: that Northstar is a hypothetical small shop defined by Axiomatic
-  Systems to test a sourcing system (never "we are a shop" as if it were
-  real); that this is an exploratory request for information and not an
-  order; that an assistant wrote it; and that a person can be reached at the
-  address in `/net/self` (`operator`). Then ask only what any
-  prospective customer would: whether they supply the item, typical lead
-  time, a price range or a quote for the stated quantity, and how they
-  prefer to be contacted. Plain, short, no pressure, no follow-up for a week.
-- To schedule a call, ask by mail for a time; record the time they give as
-  an unresolved question, and when it comes write the call request for the
-  owner to approve.
-- A reply that asks not to be contacted is honored at once: poke
-  `/relationships/<r> {do_not_contact: yes, since}` and never write another
-  request to it; say so in the judgment.
-- A real supplier's reply is evidence like any other, with the same
-  provenance rules; a quote is a statement by that mailbox, unverified.
+Every supplier in this pilot is a Shrine world or an agent playing one on our
+own mailboxes and numbers. Never search for, write to, call or text a real
+business, and never draft a request to one; if a need seems to want one, say
+so in its status and stop.
