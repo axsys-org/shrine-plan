@@ -2,7 +2,6 @@
 - goo_text
 - system_vocabulary
 - grove_role_runtime
-- grove_install
 - grove_view_publication
 - json
 - goo_value
@@ -112,7 +111,31 @@
   + publication
     \ state=namespace
     ^ nat
-    | (state.case(.z [state.self 'gov])).fall(0)
+    | state.local.top
+  + declaration_current
+    ' Publication tokens capture a native snapshot epoch. Check the selected
+    ' assertion's own history, wherever it lives; unrelated writes do not stale
+    ' an action. Old uncommitted /gov-case tokens may require re-preparation.
+    \ captured=nat declaration=path state=namespace
+    ^ bool
+    ? (gt captured state.local.top) .false
+    ?> (./some history) state.history(declaration) .false
+    ? (declaration.starts('sys))
+      ?> (./some publication) (namespace/system_at captured state) .false
+      = previous (unpin publication).state
+      | and (equal (previous.x_case(declaration)) (history.x_case(declaration)))
+          (equal (previous.x_latest(declaration)) (history.x_latest(declaration)))
+    ?> (./some version) state.case(.x declaration) .false
+    ?> (./some changed) (namespace/epoch .x (./some version) declaration history) .false
+    | le changed captured
+  + publication_current
+    \ query=goo_runtime/request scope=goo_runtime/scope state=namespace
+    ^ bool
+    ? !(goo_runtime/declaration_current query.publication query.view state) .false
+    = declarations=row[path]
+        (scope.action.run(goo_runtime/read_path).fall(.none)).run((\ name=path [name])).fall([])
+      declarations declarations.weld((scope.role.run(goo_runtime/read_path).fall(.none)).run((\ name=path [name])).fall([]))
+    | row/all[path] (\ name=path (goo_runtime/declaration_current query.publication name state)) declarations
   + lifetime
     ' x.shape changes on removal/recreation, never on an ordinary live edit.
     \ target=path state=namespace
@@ -278,6 +301,10 @@
   + status_value
     \ query=goo_runtime/request state=namespace
     ^ json
+    | goo_runtime/status_covered query state ((goo_runtime/receipts_for query.target state).map((\ entry (json/str entry.identity))).row)
+  + status_covered
+    \ query=goo_runtime/request state=namespace covered=row[json]
+    ^ json
     = target (goo_runtime/target query.target state)
       expected=nat
         ? target
@@ -285,7 +312,7 @@
         0
     | json/obj
       [(jkv "projectionSeq" (json/num .false state.local.rec.len))
-       (jkv "coveredOperationIds" (json/arr ((goo_runtime/journal state).keep((\ entry (equal entry.request.target query.target))).map((\ entry (json/str entry.identity))).row)))
+       (jkv "coveredOperationIds" (json/arr covered))
        (jkv "life" (json/str (nat/show (goo_runtime/lifetime query.target state))))
        (jkv "subject" (json/str (path_show query.target)))
        (jkv "target" (json/str (path_show target.fall([]))))
@@ -558,13 +585,6 @@
     ?> (./some action) scope.action (./err "Action group requires an action.")
     < arguments (goo_runtime/prepared query published current state)
     | goo_runtime/dispatch action arguments current view.contract state
-  + create
-    \ query=goo_runtime/request published=myth current=myth state=namespace scope=goo_runtime/scope
-    ^ either[str namespace]
-    < writes (goo_runtime/create_plan query published current state scope)
-    ? (grove_install/changes writes state)
-     > (./ok next) (./ok next)
-     > (./err why) (./err (str/from_atom (iota_show why)))
   + create_plan
     \ query=goo_runtime/request published=myth current=myth state=namespace scope=goo_runtime/scope
     ^ either[str row[[p=path q=writ]]]
@@ -582,30 +602,33 @@
     = next arguments.put(system_vocabulary/lash contract)
     ? (maybe/is_some (fit_check next)) (./err "Initial fields violate the creation role.")
     | ./ok [[target (writ/make next)]]
-  + apply
-    \ query=goo_runtime/request state=namespace
-    ^ either[str namespace]
-    < writes (goo_runtime/plan query state)
-    ? (grove_install/changes writes state)
-     > (./ok next) (./ok next)
-     > (./err why) (./err (str/from_atom (iota_show why)))
+  + apply_indexed
+    \ query=goo_runtime/request state=namespace index=hive
+    ^ either[str [namespace hive]]
+    | goo_runtime/admit (goo_runtime/plan query) state index
+  + admit
+    ' Keep the complete Goo planner within native exception containment. The
+    ' supervisor supplies its existing index; no receipt-history scan rebuilds it.
+    \ plan={\ namespace}either[str row[[p=path q=writ]]] state=namespace index=hive
+    ^ either[str [namespace hive]]
+    = planner
+        \ candidate=namespace
+        ^ either[iota row[[p=path q=writ]]]
+        ? (plan candidate)
+         > (./ok writes) (./ok writes)
+         > (./err why) (./err ($ts why))
+    ? (namespace_command/admit planner state index)
+     > (./ok pair) (./ok pair)
+     > (./err why)
+      ? (eq (aura_tag why) "ts") (./err (str/from_atom (quip_val why)))
+      | ./err (str/from_atom (iota_show why))
   + plan
     ' Browser interaction and native work share these exact declaration,
     ' receiver, publication and argument checks before admitting any writes.
     \ query=goo_runtime/request state=namespace
     ^ either[str row[[p=path q=writ]]]
-    ? !(eq query.publication (goo_runtime/publication state)) (./err "Views changed; refresh before submitting.")
-    ? !(eq query.displayed (state.case(.y query.target)).fall(0)) (./err "Object changed; refresh before submitting.")
-    ?> (./some target) (goo_runtime/target query.target state) (./err "This presentation has no writable source object.")
-    ? !(equal[path] target query.subject) (./err "The presentation now refers to a different object; refresh before submitting.")
-    ? !(state.permitted(target)) (./err "Object is outside this namespace's authority.")
-    ? !(pith_prefix [state.self 'app] target) (./err "Only application objects are writable here.")
-    ? !(eq query.expected (state.case(.x target)).fall(0)) (./err "Object changed; refresh before submitting.")
-    ?> (./some current) (goo_runtime/record .x target state) (./err "Object no longer exists.")
-    ?> (./some published) (goo_runtime/record .x query.view state) (./err "View no longer exists.")
-    < view (goo_runtime/published published)
-    < found (goo_runtime/control query view current)
-    = [node scope] found
+    < checked (goo_runtime/current query state)
+    = [current published scope] checked
     ? (maybe/is_some scope.make) (goo_runtime/create_plan query published current state scope)
     ' A published namespace operation uses the same bound controls, captures,
     ' revisions and receipts, but may commit a domain transaction atomically.
@@ -617,11 +640,28 @@
         | ./some operation
     ? (maybe/is_some operation)
       < arguments (goo_runtime/prepared query published current state)
-      ? (namespace_command/plan target operation.fall([]) arguments state)
+      ? (namespace_command/plan query.subject operation.fall([]) arguments state)
        > (./ok writes) (./ok writes)
        > (./err why) (./err (str/from_atom (iota_show why)))
     < next (goo_runtime/updated query published current state)
-    | ./ok [[target (writ/make next)]]
+    | ./ok [[query.subject (writ/make next)]]
+  + current
+    ' Inspect the same receiver/control guards without executing its planner.
+    \ query=goo_runtime/request state=namespace
+    ^ either[str [myth myth goo_runtime/scope]]
+    ? !(eq query.displayed (state.case(.y query.target)).fall(0)) (./err "Object changed; refresh before submitting.")
+    ?> (./some target) (goo_runtime/target query.target state) (./err "This presentation has no writable source object.")
+    ? !(equal[path] target query.subject) (./err "The presentation now refers to a different object; refresh before submitting.")
+    ? !(state.permitted(target)) (./err "Object is outside this namespace's authority.")
+    ? !(pith_prefix [state.self 'app] target) (./err "Only application objects are writable here.")
+    ? !(eq query.expected (state.case(.x target)).fall(0)) (./err "Object changed; refresh before submitting.")
+    ?> (./some current) (goo_runtime/record .x target state) (./err "Object no longer exists.")
+    ?> (./some published) (goo_runtime/record .x query.view state) (./err "View no longer exists.")
+    < view (goo_runtime/published published)
+    < found (goo_runtime/control query view current)
+    = [node scope] found
+    ? !(goo_runtime/publication_current query scope state) (./err "Views changed; refresh before submitting.")
+    | ./ok [current published scope]
   + receipt
     : identity=str request=goo_runtime/request body=str
   + receipts
@@ -629,15 +669,58 @@
   + receipt_slot
     ^ path
     system_vocabulary/goo/receipts
-  + journal
+  + legacy_journal
     \ state=namespace
     ^ list[goo_runtime/receipt]
     = record (goo_runtime/record .x [state.self 'weft 'goo_receipts] state).fall(myth/new)
-    ?> (./some held) record.get(goo_runtime/receipt_slot) .nil
-    ?> receipts=goo_runtime/receipts held .nil
+    ?> receipts=goo_runtime/receipts record.pail_at(goo_runtime/receipt_slot) .nil
     receipts.entries
+  + receipt_path
+    ' Length and bytes are the identity, not a hash or a display spelling.
+    ' The length distinguishes strings containing trailing zero bytes too.
+    \ self=iota identity=str
+    ^ path
+    [self 'weft 'goo_receipts 'by_identity ($u identity.len) ($u (str/to_atom identity))]
+  + receipt_from
+    ' Both retained journal records and addressed records keep their exact
+    ' original contracts. Reading them never rewrites historical receipts.
+    \ record=myth identity=str
+    ^ maybe[goo_runtime/receipt]
+    = held record.pail_at(goo_runtime/receipt_slot)
+    ? held
+     > receipt=goo_runtime/receipt
+      ? (eq receipt.identity identity) (./some receipt)
+      .none
+     > receipts=goo_runtime/receipts
+      = found receipts.entries.keep((\ entry (eq entry.identity identity)))
+      ? !(eq found.len 1) .none
+      | ./some found.head
+    .none
+  + receipt_at
+    \ identity=str state=namespace
+    ^ maybe[goo_runtime/receipt]
+    = address (goo_runtime/receipt_path state.self identity)
+      addressed (goo_runtime/record .x address state).fall(myth/new)
+    ? (goo_runtime/receipt_from addressed identity)
+     > (./some receipt) (./some receipt)
+    | goo_runtime/receipt_from (goo_runtime/record .x [state.self 'weft 'goo_receipts] state).fall(myth/new) identity
+  + receipts_for
+    ' Receipt target references participate in the existing native /r index.
+    ' Enumerate just this receiver's receipts; no parallel ownership registry.
+    \ target=path state=namespace
+    ^ list[goo_runtime/receipt]
+    = prior (goo_runtime/legacy_journal state).keep((\ receipt (equal[path] receipt.request.target target)))
+    | (state.local.references.into.get(target)).fall([]).fold prior
+      \ out=list[goo_runtime/receipt] edge=reference_edge
+      ? !(equal[path] edge.slot ['sys 'goo 'receipt_target]) out
+      ? !(pith_prefix [state.self 'weft 'goo_receipts 'by_identity] edge.holder) out
+      = record (goo_runtime/record .x edge.holder state).fall(myth/new)
+      ?> receipt=goo_runtime/receipt record.pail_at(goo_runtime/receipt_slot) out
+      ? !(equal[path] receipt.request.target target) out
+      | out.snoc(receipt)
   + receipt_plan
-    ' The same retained invocation journal serves browser and native callers.
+    ' The same native receipts serve browser and native callers. New identities
+    ' occupy independent records; the retained journal remains replay evidence.
     ' An empty plan is an exact replay; callers must not execute it again.
     \ query=goo_runtime/request body=str state=namespace
     ^ either[str row[[p=path q=writ]]]
@@ -645,16 +728,18 @@
     ? !(eq identities.len 1) (./err "Expected one invocation identity.")
     = [key identity] identities.at(0)
     ? !(identity.len) (./err "Expected a nonempty invocation identity.")
-    = entries (goo_runtime/journal state)
-      prior entries.keep((\ entry (eq entry.identity identity)))
+    = prior (goo_runtime/receipt_at identity state)
       request query.set_now(0)
-    ? prior.len
-      ? (and (eq prior.len 1) (equal request prior.head.request)) (./ok [])
+    ? prior
+     > (./some receipt)
+      ? (equal request receipt.request) (./ok [])
       | ./err "Invocation identity was reused with changed arguments."
-    ? (ge entries.len 1024) (./err "Invocation journal is full.")
-    = home=path [state.self 'weft 'goo_receipts]
-      journal (goo_runtime/record .x home state).fall(myth/new)
-      record journal.put(goo_runtime/receipt_slot (goo_runtime/receipts entries.snoc((goo_runtime/receipt identity request body))))
+    = home (goo_runtime/receipt_path state.self identity)
+      previous (goo_runtime/record .x home state)
+      old (goo_runtime/legacy_journal state).keep((\ entry (eq entry.identity identity)))
+    ? (previous.is_some || old.len) (./err "Invocation receipt is occupied or ambiguous.")
+    = record (myth/sing goo_runtime/receipt_slot (goo_runtime/receipt identity request body))
+      record record.put(['sys 'goo 'receipt_target] (safe 0 .x query.target))
     | ./ok [[home (writ/make record)]]
   + operation_status
     \ query=goo_runtime/request state=namespace
@@ -669,43 +754,67 @@
         ? !(eq ids.len 1) ""
         = [key value] ids.at(0)
         value
-      matches ((goo_runtime/journal state).keep((\ entry (and (eq entry.identity identity) (equal entry.request.target query.target)))))
+      saved (goo_runtime/receipt_at identity state)
+      accepted=bool
+        ?> (./some receipt) saved .false
+        | equal[path] receipt.request.target query.target
     | json/obj [(jkv "operationId" (json/str identity))
-        (jkv "outcome" (json/str (? matches.is_nil "unknown" "accepted")))]
+        (jkv "outcome" (json/str (? accepted "accepted" "unknown")))]
 
   + act
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]
+    = [next index status body] (goo_runtime/act_indexed query state (sovereign_hive state))
+    | [next status body]
+  + act_indexed
+    \ query=goo_runtime/request state=namespace index=hive
+    ^ [namespace hive nat str]
     = identities (query.inputs.keep((\ [key value] (eq key "$invocation"))))
       identity=str
         ? (eq identities.len 1)
           = [key value] identities.at(0)
           value
         ""
-      home=path [state.self 'weft 'goo_receipts]
-      journal (goo_runtime/record .x home state).fall(myth/new)
-      entries=list[goo_runtime/receipt]
-        ?> (./some held) journal.get(goo_runtime/receipt_slot) .nil
-        ?> receipts=goo_runtime/receipts held .nil
-        receipts.entries
-      prior (entries.keep((\ entry (eq entry.identity identity))))
+      prior (goo_runtime/receipt_at identity state)
       request query.set_now(0)
-    ? (and (gt identity.len 0) (gt prior.len 0))
-      ? (equal request prior.head.request) [state 200 prior.head.body]
-      [state 409 (show (json/obj [(jkv "error" (json/str "Invocation identity was reused with changed arguments."))]))]
+    ? (and (gt identities.len 0) ((gt identities.len 1) || (eq identity.len 0)))
+      [state index 409 (show (json/obj [(jkv "error" (json/str "Expected one nonempty invocation identity."))]))]
+    ? prior
+     > (./some receipt)
+      ? (equal request receipt.request) [state index 200 receipt.body]
+      [state index 409 (show (json/obj [(jkv "error" (json/str "Invocation identity was reused with changed arguments."))]))]
     = check=either[str row[[p=path q=writ]]] (? identity.len (goo_runtime/receipt_plan query "" state) (./ok []))
     ?> (./ok _) check
-      [state 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
-    ? (goo_runtime/apply query state)
-     > (./ok next)
-      = body (goo_runtime/status query next)
-      ? (eq identity.len 0) [next 200 body]
-      ?> (./ok writes) (goo_runtime/receipt_plan query body next)
-        [state 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
-      ? (grove_install/changes writes next)
-       > (./ok committed) [committed 200 body]
-       > (./err _) [state 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
-     > (./err why) [state 409 (show (json/obj [(jkv "error" (json/str why))]))]
+      [state index 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
+    ? (goo_runtime/apply_indexed query state index)
+     > (./ok pair)
+      = [next next_index] pair
+      ' An action reply acknowledges this invocation. Retaining the complete
+      ' receiver receipt list in every reply would grow quadratically.
+      = body (show (goo_runtime/status_covered query next (? identity.len [(json/str identity)] [])))
+      ? (eq identity.len 0) [next next_index 200 body]
+      ? (goo_runtime/admit (goo_runtime/receipt_plan query body) next next_index)
+       > (./ok committed)
+        = [saved saved_index] committed
+        | [saved saved_index 200 body]
+       > (./err _) [state index 409 (show (json/obj [(jkv "error" (json/str "Unable to retain invocation receipt."))]))]
+     > (./err why) [state index 409 (show (json/obj [(jkv "error" (json/str why))]))]
+  + run_indexed
+    \ query=goo_runtime/request state=namespace index=hive
+    ^ [namespace hive nat str]
+    ? (eq query.operation "act") (goo_runtime/act_indexed query state index)
+    = [next status body] (goo_runtime/run query state)
+    | [next (? (eq next.local.top state.local.top) index (sovereign_hive next)) status body]
+  + run_value_indexed
+    \ query=goo_runtime/request state=namespace index=hive
+    ^ [namespace hive nat json]
+    ? !(eq query.operation "act")
+      = [next status body] (goo_runtime/run_value query state)
+      | [next (? (eq next.local.top state.local.top) index (sovereign_hive next)) status body]
+    = [next next_index status body] (goo_runtime/act_indexed query state index)
+    ? (parse body)
+     > (jres/ok value rest) [next next_index status value]
+    | [next next_index status (json/obj [(jkv "error" (json/str body))])]
   + run
     \ query=goo_runtime/request state=namespace
     ^ [namespace nat str]

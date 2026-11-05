@@ -27,7 +27,7 @@ def main():
     root = Path(tempfile.mkdtemp(prefix='watch-lifecycle-', dir=ROOT / '.check'))
     sys.path.insert(0, str(ROOT / 'extras/x'))
     from fixture_sources import materialize
-    mounts = select(ROOT / 'extras', ['flows'])
+    mounts = select(ROOT / 'extras', ['flow-authoring'])
     materialize(ROOT, ROOT / 'extras', root / 'src', {m.name for m in mounts}, native_tests=True)
     shutil.copyfile(Path(__file__).with_name('watch_lifecycle.foil'), root / 'src/foil/tests/watch_lifecycle.foil')
     files = root / 'src/watch'

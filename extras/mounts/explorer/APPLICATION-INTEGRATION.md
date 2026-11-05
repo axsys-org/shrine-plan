@@ -26,10 +26,11 @@ records the clean build's revision and Nix store path, verifies the vendored
 profile against it, and uses the unchanged production Explorer/debugger build
 hooks. Production topoi builds also verify profile identity and bytes.
 
-`goo-inspector` is the only production Goo view consumer. The gate adds
+The gate exercises the production `goo-inspector` view and adds
 `extras/tests/fixtures/panes` to a disposable mount catalogue for interaction
-regressions. That specimen is unavailable in the production catalogue. The
-shared Explorer rendering and namespace infrastructure remains in production.
+regressions. The panes specimen is unavailable in the production catalogue. Other
+Goo consumers, including Nenex, have their own domain suites. Shared Explorer
+rendering and namespace infrastructure remains in production.
 
 The browser scenarios cover:
 
@@ -73,84 +74,26 @@ This gate complements the renderer-only
 Node session/adapter tests. It does not replace font/geometry conformance or
 claim hardware IME coverage; composition events are dispatched in Chromium.
 
-## Prepared child-page regression (2026-10-05)
+## Coverage and limits
 
-`check-tree-browser.mjs` now delays a real prepared child-page response, checks
-that existing rows remain visible, and observes DOM mutations to reject any
-available row attached without its Goo presentation. It also exercises the
-64-child continuation, deferred grandchildren, retained row identities and
-cached size variants with no individual child-summary render requests.
-Structural branches still display their namespace path.
+| Gate | Behavior exercised |
+| --- | --- |
+| `check-tree-browser.mjs` | Delayed prepared child pages, inert hydration, 64-child continuation, deferred grandchildren, retained row identities and cached size variants without individual child-summary requests |
+| Native prepared-page tests | Missing/duplicate packets, profile and subject/lifetime/epoch mismatch, multiple slots, snapshot consistency and a failed refresh retaining the installed tree |
+| Native path tests and tree browser gate | Canonical path fallback when a record has no lede, typed root paths, nested presentations, SSR/hydration identity and synthetic follower headings |
+| `check-inspection-browser.mjs` | Real `/goo/inspect` responses, recapture, ordering, bounded self-inspection and inspecting an editable view during composition |
 
-Verified against the compiled `tree-pages` and `panes` fixture on port 8097:
+Available rows must arrive with their Goo presentation. Structural branches display
+their namespace path. Action versions belong to the resolved writable receiver,
+not its projection. The path constructor reuses native formatting; authored
+root-only `'/` literals remain a known Grove compilation limitation, while typed
+root paths render `/`.
 
-- Node adapter/session/transport tests: 74 passed.
-- Native mount checks: 649 passed (Explorer 484, web 135, debugger 28,
-  mount contracts 1, Grove debugger 1).
-- Tree hydration and layout browser gates: Chromium 151.0.7922.34,
-  Firefox 153.0, WebKit 26.5, all passed. The tree gate also runs nine
-  shared topology cases in each engine.
+Inspection checks namespace/selection stability, source links, late-response
+rejection, excluded draft contents, and retained input identity, caret and
+composition. Inspection records are transient browser observations rendered through
+Goo's synthetic pipeline. They are not persisted assertions or execution traces;
+historical replay and per-branch explanations are outside this gate.
 
-- Full Chromium application gate: 10 scenarios passed, 95 real render responses
-  and one deliberate domain action, including saved input, stale responses,
-  instance replacement and native input identity/composition preservation.
-
-The prepared-page tests cover missing/duplicate packets, profile mismatch,
-subject/lifetime/epoch mismatch, multiple slots, snapshot consistency and a
-failed refresh retaining the installed tree. Action versions remain those of
-the resolved writable receiver; they are not replaced by projection versions.
-
-## Path constructor regression (2026-10-05)
-
-The compiled `tree-pages` fixture includes a record with no lede. The tree gate
-checks that its canonical namespace path is present in the initial SSR HTML and
-remains its Goo presentation after hydration. Selecting it loads the real
-synthetic follower, whose slot heading uses the shared path formatter.
-
-Verified against the compiled application on port 8098:
-
-- Node adapter/session/transport tests: 74 passed.
-- Native checks: 664 passed (Explorer 499, web 135, debugger 28, mount contracts
-  1, Grove debugger 1), including all 15 new path cases. The final Explorer
-  suite was rerun after correcting the generated test document and testing the
-  root through a typed field; the other mount suites passed unchanged.
-- Tree/path and layout browser gates: Chromium 151.0.7922.34, Firefox 153.0,
-  WebKit 26.5, all passed; nine shared topology cases per engine.
-- Full Chromium application gate: 10 scenarios passed, 95 real render responses
-  and one deliberate save action.
-
-The native path cases cover receiver fallback, lede precedence, typed fields,
-path literals, a typed root path, missing optional fields, nested `present`, live and
-SSR identity binding, synthetic slot labels, and invalid arguments.
-
-Known upstream boundary: authored root-only `'/` literals currently fail Grove
-compilation. Typed root paths still render `/`; the constructor does not add a
-second literal parser.
-
-
-## Presentation inspection regression (2026-10-05)
-
-`check-inspection-browser.mjs` exercises the actual `/goo/inspect` formatter and
-installed render packets. It delays an actual response for ordering coverage;
-it supplies no mocked domain decisions. Each engine captures a tree summary,
-recaptures it, inspects the inspector's generated presentation, supersedes a
-pending capture, and inspects an editable view during composition.
-
-Verified on the compiled `goo-inspector`, `tree-pages` and `panes` application at
-port 8100; served inspection JavaScript matched the checkout:
-
-- 80 Node tests passed, including six capture identity/privacy/lifetime tests.
-- 679 native checks passed: Explorer 514, web 135, debugger 28, mount contracts
-  1, Grove debugger 1. Explorer was rerun with the final observation schema.
-  Fifteen new native cases include actual HTTP JSON byte framing, typed path
-  rendering, provenance, no domain controls, and malformed/duplicate fields.
-- Chromium 151.0.7922.34, Firefox 153.0 and WebKit 26.5 each passed six real
-  inspection captures. Checks cover unchanged namespace/selection, source links,
-  late response rejection, bounded self-inspection, excluded draft contents, and
-  retained input identity, caret and composition. No domain action was sent.
-- Full Chromium application gate: ten scenarios passed, 102 real render
-  responses and one deliberate save action in the disposable fixture.
-
-The inspection records are browser observations rendered through Goo's existing
-synthetic pipeline. They are not persisted namespace assertions or execution
-traces; no historical replay or per-branch explanation is claimed.
+Retain each run's logs and JSON results with `--output`. Coverage descriptions here
+are not a claim that a particular checkout or browser version has passed.

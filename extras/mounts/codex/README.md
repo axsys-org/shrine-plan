@@ -122,8 +122,8 @@ with the caller.
 
 ## Interactive document work
 
-`/<node>/io/codex/surface_provider` is an explicit provider for an open Cooperate
-investigation. Select it through `cooperate/delegate` (also exposed by Nenex's
+`/<node>/io/codex/surface_provider` is an explicit native agent capability for an
+open Cooperate investigation or a deliberately authored interactive flow task. Select it through `cooperate/delegate` (also exposed by Nenex's
 declared **Delegate native work** control). Supply a guard on the evidence or
 instructions that authorize the activity. Editing that guard invalidates further
 tool calls; editing the working document need not invalidate an independent guard.
@@ -157,8 +157,16 @@ it does not choose the next action. Codex's existing turn makes that choice.
 Recovery settles retained workers before reinstalling their forms, and uncertain
 turns are never replayed automatically.
 
-This provider currently accepts explicitly delegated investigation workers. It
-does not grant automatic flow-maintenance requests interactive write authority.
+Flows select this capability through `flow_request_ops/interactive_requests`, with
+`tasks` and `provider` inputs. Each task is an ordinary record containing the
+existing `work/prompt` and `work/schema` fields; the provider input is the selected
+record containing `work/provider`. The operation captures the selection in the
+same native request, hole, worker, evidence and result records as other flow steps.
+A captured native authorization operation checks that the controller remains
+attached and enabled, the task is still current and the hole still selects this
+attempt before each tool call. Pausing, detaching, changing evidence or settling
+the request removes that authority. Failures and retries retain the same normal
+work history. Document-revision requests do not acquire this delegation.
 It operates under the mounted sovereign's existing application authority;
 investigation ownership is not a per-document sandbox. There is no additional
 tool registry, provider scheduler or Python agent loop. App-server dynamic tools

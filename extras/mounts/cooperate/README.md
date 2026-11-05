@@ -17,6 +17,15 @@ receipt; provider completion freezes its outcome once. Domain admission checks
 that outcome against the captured guard and applies its own result policy.
 Native activity phases gate hand reactions while dependencies hydrate, so
 controller-local sent/settled booleans do not own another execution lifecycle.
+
+New attempts, workers and holes require an observed vacant subtree; a missing
+root with existing children is occupied. Answering and flows use the same guard
+and existing crew watches to wait for release. An existing hole must match its
+owner, subject and context; unrelated annotations remain. Repeated dispatch also
+requires the matching worker receipt, so a lost worker is not treated as sent.
+This protects allocation. Within an already owned attempt, result/value cells and
+the controller's current answer are maintained projections, not arbitrary editable
+notes. Document drafts have their separate source/attachment guards.
 Investigations remain open across delegated workers until explicit guarded
 completion; a provider result alone does not complete its investigation.
 
@@ -102,7 +111,9 @@ settle as superseded. Historical answers remain on their attempts. Restored
 evidence wakes the same hand. A completed flow revision explicitly withdraws
 its demand watch; staging another revision reattaches it. A context change
 wakes the existing activity once for that changed reading; the activity's hand
-decides what work to perform. An ordinary investigation records the resume
+decides what work to perform. The hole also watches its exact owner record. If
+that owner is absent, it retains the pending reading and waits; restoring the
+owner resumes through that same watch without writing to the deleted activity. An ordinary investigation records the resume
 notification, while a flow's maintenance hand stages and dispatches its next
 attempt. There is no timer or separate queue runner. These records and their
 journal survive restart through Eden's native world continuation. Process I/O
@@ -209,9 +220,20 @@ result. An empty answer retains the note as missing evidence. No model call is
 repeated for the same context, including failed or unresolved answers.
 
 Attempts at `attempts/a_N` retain their frozen `context` and `answer` cells.
-The controller's `answer` cell exposes the most recently admitted result.
-Changed context waits for an in-flight result, rejects that stale result, then
-starts a new capture. `answer_enabled` pauses/resumes the same activity;
+Before creating an attempt, the hand observes its entire destination subtree
+through its ordinary crew. An occupied root or descendant blocks allocation;
+removing the obstruction wakes the same hand. The shared dispatcher likewise
+requires an observed vacant worker subtree. A repeated dispatch is harmless
+only when the attempt and worker retain the same request receipt. These checks
+preserve foreign current records as well as earlier attempts and history.
+The same subtree check applies when creating or recreating a hole. Removing
+its root does not make foreign descendants available for adoption. Existing
+owned holes keep their annotations when a new attempt becomes their head.
+The controller's `answer` cell compares that admitted result with its current
+bound context. Changed or unavailable evidence suppresses the old answer there,
+including while the answering hand is paused; frozen attempt answers remain
+readable. Changed context waits for an in-flight result, rejects that stale
+result, then starts a new capture. `answer_enabled` pauses/resumes the same activity;
 completed provider results wait while paused. Results do not mutate the subject.
 Nenex supplies one UI and context projection for these same operations. Other
 applications can bind their own context cells and use this answering hand.

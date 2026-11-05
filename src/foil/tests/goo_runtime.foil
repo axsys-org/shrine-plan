@@ -1,6 +1,7 @@
 - system_vocabulary
 - goo_runtime
 - testing
+- helm
 - tests/grove_install [at=installer]
 - tests/grove_template [at=fixture]
 
@@ -36,9 +37,22 @@
     \ target=path arguments=myth state=namespace
     ^ either[iota row[[p=path q=writ]]]
     | ./err 'refused
-  + native_actions
-    \ ignored=unit
-    ^ row[testing/check]
+  + native_throw
+    \ target=path arguments=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    | Seq[either[iota row[[p=path q=writ]]]] (error (pails/t "Intentional namespace planner failure")) (./ok [])
+  + native_noop
+    \ target=path arguments=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    | ./ok []
+  + native_receipt_collision
+    \ target=path arguments=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    | ./ok [[target (writ/poke arguments)]
+        [(goo_runtime/receipt_path state.self "receipt_collision") (writ/make (myth/sing ['unowned] (pails/b .true)))]]
+  + operation_setup
+    \ operation=namespace_op
+    ^ [namespace goo_runtime/request]
     = [state query] (goo_runtime_checks/setup [])
       action=path [state.self 'gov 'interactive 'save]
       record (goo_runtime/record .x query.view state).fall(myth/new)
@@ -49,8 +63,159 @@
       view published.view.set_children((list/one group.set_arguments(args)))
       published published.set_view(view).set_result((./ok view))
       state (fixture/grove_template_checks/seed query.view (note/make record.put(system_vocabulary/grove/view published)) state)
-      state (fixture/grove_template_checks/seed action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_plan))) state)
-      query query.set_publication((goo_runtime/publication state))
+      state (fixture/grove_template_checks/seed action (note/make (myth/sing system_vocabulary/op operation)) state)
+    | [state query.set_publication((goo_runtime/publication state))]
+  + containment
+    \ ignored=unit
+    ^ row[testing/check]
+    = [state query] (goo_runtime_checks/operation_setup (namespace_op goo_runtime_checks/native_throw))
+      index (sovereign_hive state)
+      [next status body] (goo_runtime/run query state)
+      [supervised next_index reply] (helm/supervisor/handle (helm/card/interact 1 query) state index)
+      [binary binary_index binary_reply] (helm/supervisor/handle (helm/card/interact_bat 2 query (\ value=json (wire_proto/failure "unused"))) state index)
+      [collision collision_query] (goo_runtime_checks/operation_setup (namespace_op goo_runtime_checks/native_receipt_collision))
+      collision_query collision_query.set_inputs(collision_query.inputs.snoc(["$invocation" "receipt_collision"]))
+      collision_index (sovereign_hive collision)
+      [rolled_back rollback_index collision_reply] (helm/supervisor/handle (helm/card/interact 3 collision_query) collision collision_index)
+    [(testing/nat "namespace planner exception refuses one Goo request" 409 status)
+     (testing/nat "planner exception preserves namespace" 1 (equal[namespace] state next))
+     (testing/nat "supervisor contains Goo planner exception" 1 (equal[namespace] state supervised))
+     (testing/nat "supervisor preserves index on Goo planner exception" 1 (equal[hive] index next_index))
+     (testing/nat "binary supervisor contains Goo planner exception" 1 (equal[namespace] state binary))
+     (testing/nat "binary supervisor preserves dependency index" 1 (equal[hive] index binary_index))
+     (testing/nat "receipt admission failure rolls back domain writes" 1 (equal[namespace] collision rolled_back))
+     (testing/nat "receipt admission failure rolls back candidate index" 1 (equal[hive] collision_index rollback_index))]
+  + publication_guards
+    \ ignored=unit
+    ^ row[testing/check]
+    = [state query] (goo_runtime_checks/operation_setup (namespace_op goo_runtime_checks/native_noop))
+      action=path [state.self 'gov 'interactive 'save]
+      claim=path [state.self 'gov 'flows 'claims 'another_flow]
+      attached (fixture/grove_template_checks/seed claim (note/make myth/new) state)
+      admissible (goo_runtime/plan query attached)
+      changed (fixture/grove_template_checks/seed action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_refuse))) attached)
+      restored (fixture/grove_template_checks/seed action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_noop))) changed)
+      view (goo_runtime/record .x query.view attached).fall(myth/new)
+      recompiled (fixture/grove_template_checks/seed query.view (note/make view.put(['publication_note] (pails/t "republished"))) attached)
+      other_action=path [state.self 'app 'declarations 'save]
+      other_view=path [state.self 'app 'declarations 'edit]
+      published (either/ok_val (goo_runtime/published view))
+      group published.view.children.head
+      args (group.arguments.keep((\ arg (maybe/is_none (goo_runtime/named "action" (list/one arg))))))
+      args args.snoc((rex/rune "=" [(rex/word "action") (rex/quip (str/cat_all ["'" (path_show other_action)]))]))
+      declared published.view.set_name(other_view).set_children((list/one group.set_arguments(args)))
+      other_record view.put(system_vocabulary/grove/view published.set_view(declared).set_result((./ok declared)))
+      outside (fixture/grove_template_checks/seed other_view (note/make other_record) attached)
+      outside (fixture/grove_template_checks/seed other_action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_noop))) outside)
+      selected query.set_view(other_view).set_publication((goo_runtime/publication outside))
+      unrelated (fixture/grove_template_checks/seed [state.self 'app 'unrelated] (note/make myth/new) outside)
+      action_changed (fixture/grove_template_checks/seed other_action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_refuse))) unrelated)
+      action_restored (fixture/grove_template_checks/seed other_action (note/make (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_noop))) action_changed)
+      view_changed (fixture/grove_template_checks/seed other_view (note/poke (myth/sing ['note] (pails/t "changed"))) unrelated)
+      view_restored (fixture/grove_template_checks/seed other_view (note/make other_record) view_changed)
+    [(testing/nat "unrelated flow claim preserves prepared action" 1 (either/is_ok admissible))
+     (testing/nat "action implementation change invalidates preparation" 1 (either/is_err (goo_runtime/plan query changed)))
+     (testing/nat "implementation A to B to A does not revive preparation" 1 (either/is_err (goo_runtime/plan query restored)))
+     (testing/nat "selected view publication change invalidates preparation" 1 (either/is_err (goo_runtime/plan query recompiled)))
+     (testing/nat "declarations outside gov can prepare" 1 (either/is_ok (goo_runtime/plan selected outside)))
+     (testing/nat "unrelated application write preserves preparation" 1 (either/is_ok (goo_runtime/plan selected unrelated)))
+     (testing/nat "outside-gov action change invalidates preparation" 1 (either/is_err (goo_runtime/plan selected action_changed)))
+     (testing/nat "outside-gov action A to B to A stays stale" 1 (either/is_err (goo_runtime/plan selected action_restored)))
+     (testing/nat "outside-gov view change invalidates preparation" 1 (either/is_err (goo_runtime/plan selected view_changed)))
+     (testing/nat "outside-gov view A to B to A stays stale" 1 (either/is_err (goo_runtime/plan selected view_restored)))]
+  + receipt_capacity
+    \ ignored=unit
+    ^ row[testing/check]
+    = [state query] (goo_runtime_checks/operation_setup (namespace_op goo_runtime_checks/native_noop))
+      finished=[namespace hive]
+        % i=nat 0 current=namespace state index=hive (sovereign_hive state)
+        ^ [namespace hive]
+        ? (eq i 1026) [current index]
+        = invoked query.set_inputs(query.inputs.snoc(["$invocation" (str/cat "receipt_" (nat/show i))]))
+          [next next_index reply] (helm/supervisor/handle (helm/card/interact i invoked) current index)
+          status=nat
+            ?> (feet/task/develop request status body) reply 0
+            status
+        ? !(eq status 200)
+          | Seq[[namespace hive]] (error (pails/t "Distinct Goo invocation refused")) [current index]
+        | _ i.inc next next_index
+      [completed completed_index] finished
+      first query.set_inputs(query.inputs.snoc(["$invocation" (str/cat "receipt_" (nat/show 0))]))
+      [retried retry_status retry_body] (goo_runtime/run first completed)
+      changed first.set_inputs(first.inputs.map((\ [key value] [key (? (eq key "/sys/req") "Changed" value)])))
+      [refused refused_status refused_body] (goo_runtime/run changed completed)
+      home=path [state.self 'weft 'goo_receipts]
+      legacy_query query.set_inputs(query.inputs.snoc(["$invocation" "retained_old"]))
+      legacy (goo_runtime/receipt "retained_old" legacy_query.set_now(0) "retained old response")
+      old (fixture/grove_template_checks/seed home (note/make (myth/sing goo_runtime/receipt_slot (goo_runtime/receipts (list/one legacy)))) completed)
+      [replayed replay_status replay_body] (goo_runtime/run legacy_query old)
+      next_query query.set_inputs(query.inputs.snoc(["$invocation" "after_old_journal"]))
+      [after_old after_status after_body] (goo_runtime/run next_query old)
+    [(testing/nat "more than 1024 distinct actions retain independent receipts" 1026 (goo_runtime/receipts_for query.target completed).len)
+     (testing/nat "supervisor retains its coherent native subscription index" 1 (equal[hive] completed_index (sovereign_hive completed)))
+     (testing/nat "receipts do not rewrite a world-global journal" 1 (equal (state.case(.x home)) (completed.case(.x home))))
+     (testing/nat "old addressed invocation retries successfully" 200 retry_status)
+     (testing/nat "addressed retry does not execute or journal again" 1 (equal[namespace] completed retried))
+     (testing/nat "changed arguments cannot reuse addressed identity" 409 refused_status)
+     (testing/nat "conflicting replay preserves namespace" 1 (equal[namespace] completed refused))
+     (testing/nat "retained original journal still replays" 200 replay_status)
+     (testing/text "retained original response stays exact" "retained old response" replay_body)
+     (testing/nat "legacy replay does not migrate receipts" 1 (equal[namespace] old replayed))
+     (testing/nat "new action succeeds alongside original journal" 200 after_status)
+     (testing/nat "new action preserves original journal assertion" 1 (equal (old.case(.x home)) (after_old.case(.x home))))
+     (testing/nat "receiver coverage uses native addressed receipt references" 1028 (goo_runtime/receipts_for query.target after_old).len)
+     (testing/nat "addressed writes preserve all old journal axes" 1
+       (row/all[care] (\ axis=care (equal (namespace/page axis (old.case(axis home)) home old)
+         (namespace/page axis (old.case(axis home)) home after_old))) [.x .y .z]))]
+  + system_seed
+    ' Disposable publication fixture; this does not activate a running service.
+    \ name=path record=myth state=namespace
+    ^ namespace
+    ?> (./accepted pair) (sov/step (axal/new[note] .none).put(name (note/make record)) 0 0 (unpin state.system).state)
+      | Seq[namespace] (error (pails/t "System fixture refused")) state
+    = [shared signs] pair
+    | state.set_system((pin (system_publication shared.top shared (system_publication/assigned shared))))
+  + system_guards
+    \ ignored=unit
+    ^ row[testing/check]
+    = [initial query] (goo_runtime_checks/setup [])
+      action=path ['sys 'interactive 'save]
+      view_path=path ['sys 'interactive 'edit]
+      record (goo_runtime/record .x query.view initial).fall(myth/new)
+      published (either/ok_val (goo_runtime/published record))
+      group published.view.children.head
+      args (group.arguments.keep((\ arg (maybe/is_none (goo_runtime/named "action" (list/one arg))))))
+      args args.snoc((rex/rune "=" [(rex/word "action") (rex/quip (str/cat_all ["'" (path_show action)]))]))
+      view published.view.set_name(view_path).set_children((list/one group.set_arguments(args)))
+      record record.put(system_vocabulary/grove/view published.set_view(view).set_result((./ok view)))
+      operation (myth/sing system_vocabulary/op (namespace_op goo_runtime_checks/native_noop))
+      state (goo_runtime_checks/system_seed action operation initial)
+      state (goo_runtime_checks/system_seed view_path record state)
+      ' Capture the selected system pin through a real local journal event.
+      state (fixture/grove_template_checks/seed [state.self 'user 'system_epoch] (note/make myth/new) state)
+      query query.set_view(view_path).set_publication((goo_runtime/publication state))
+      unrelated (goo_runtime_checks/system_seed ['sys 'unrelated] myth/new state)
+      changed (goo_runtime_checks/system_seed action operation.put(['note] (pails/t "revised")) unrelated)
+      restored (goo_runtime_checks/system_seed action operation changed)
+      view_changed (goo_runtime_checks/system_seed view_path record.put(['note] (pails/t "revised")) unrelated)
+      [refused ri reply] (helm/supervisor/handle (helm/card/interact 4 query) changed (sovereign_hive changed))
+      refreshed (fixture/grove_template_checks/seed [state.self 'user 'next_epoch] (note/make myth/new) changed)
+      fresh query.set_publication((goo_runtime/publication refreshed))
+    [(testing/nat "system declarations prepare against their recorded publication" 1 (either/is_ok (goo_runtime/plan query state)))
+     (testing/nat "unrelated system declaration preserves preparation" 1 (either/is_ok (goo_runtime/plan query unrelated)))
+     (testing/nat "changed system action invalidates preparation" 1 (either/is_err (goo_runtime/plan query changed)))
+     (testing/nat "system action A to B to A remains stale" 1 (either/is_err (goo_runtime/plan query restored)))
+     (testing/nat "changed system view invalidates preparation" 1 (either/is_err (goo_runtime/plan query view_changed)))
+     (testing/nat "stale system action refusal preserves namespace and index" 1
+       (and (equal[namespace] changed refused) (equal[hive] ri (sovereign_hive changed))))
+     (testing/nat "fresh journal capture accepts the selected system action" 1 (either/is_ok (goo_runtime/plan fresh refreshed)))
+     (testing/nat "earlier local event retains its exact system publication" 1
+       (equal (maybe/some[pin[system_publication]] state.system) (namespace/system_at query.publication refreshed)))]
+  + native_actions
+    \ ignored=unit
+    ^ row[testing/check]
+    = [state query] (goo_runtime_checks/operation_setup (namespace_op goo_runtime_checks/native_plan))
+      action=path [state.self 'gov 'interactive 'save]
       [next status response] (goo_runtime/run query state)
       [stale stale_status stale_body] (goo_runtime/run query next)
       once_query query.set_inputs(query.inputs.snoc(["$invocation" "native-once"]))
@@ -104,6 +269,12 @@
       invalid (fixture/grove_template_checks/seed role_path (note/make (myth/sing system_vocabulary/grove/role_contract stricter)) state)
       invalid_query query.set_publication((goo_runtime/publication invalid))
       [invalid_next invalid_status body] (goo_runtime/run invalid_query invalid)
+      role_record (goo_runtime/record .x role_path state).fall(myth/new)
+      republished (fixture/grove_template_checks/seed role_path (note/make role_record.put(['note] (pails/t "republished"))) state)
+      [stale_role stale_role_status body] (goo_runtime/run query republished)
+      [fresh_role fresh_role_status body] (goo_runtime/run query.set_publication((goo_runtime/publication republished)) republished)
+      restored_role (fixture/grove_template_checks/seed role_path (note/make role_record) republished)
+      [restored_refused restored_status body] (goo_runtime/run query restored_role)
       retry_query query.set_inputs(query.inputs.snoc(["$invocation" "create-once"]))
       [once once_status once_body] (goo_runtime/run retry_query state)
       [twice twice_status twice_body] (goo_runtime/run retry_query once)
@@ -123,6 +294,11 @@
      (testing/nat "subtree rejection preserves state" 1 (equal child blocked))
      (testing/nat "make enforces destination role" 409 invalid_status)
      (testing/nat "role rejection preserves state" 1 (equal invalid invalid_next))
+     (testing/nat "republished creation role invalidates prepared control" 409 stale_role_status)
+     (testing/nat "stale role refusal leaves destination absent and world unchanged" 1 (equal[namespace] republished stale_role))
+     (testing/nat "fresh preparation can use the republished role" 200 fresh_role_status)
+     (testing/nat "creation role A to B to A stays stale" 409 restored_status)
+     (testing/nat "restored role refusal preserves its history" 1 (equal[namespace] restored_role restored_refused))
      (testing/nat "make retry returns success" 200 twice_status)
      (testing/nat "make retry does not repeat write" 1 (equal once twice))]
   + grade
@@ -367,6 +543,10 @@
 + tests
   ^ row[testing/case]
   [(testing/case "Incremental tree pages" goo_runtime_checks/tree_pages)
+   (testing/case "Native planner exception containment" goo_runtime_checks/containment)
+   (testing/case "Selected declaration publication guards" goo_runtime_checks/publication_guards)
+   (testing/case "Selected system publication guards" goo_runtime_checks/system_guards)
+   (testing/case "Addressed durable invocation receipts" goo_runtime_checks/receipt_capacity)
    (testing/case "Create-only Goo actions" goo_runtime_checks/creation)
    (testing/case "Native namespace operations" goo_runtime_checks/native_actions)
    (testing/case "Selection capture and invocation retry" goo_runtime_checks/captures)

@@ -4,10 +4,10 @@ From the checkout, with Nix on `PATH`, create a world at an explicit directory:
 
 ```sh
 python3 x/eden --world "$HOME/.local/share/shrine/worlds/lab" \
-  --mount flows --extras-root "$PWD/extras" --port 8300
+  --mount flow-authoring --extras-root "$PWD/extras" --port 8300
 ```
 
-The `flows` mount selects Nenex, Cooperate, Cells, Goo and MCP through its
+The `flow-authoring` mount selects Nenex, Cooperate, Cells, Goo and MCP through its
 dependencies. Add `--mount codex` when creating the world to select the native
 Codex provider and its existing app-server transport. No separate Python hand
 or hand manager is needed. Provider setup is documented in the
@@ -18,8 +18,15 @@ or hand manager is needed. Provider setup is documented in the
 can take several minutes. Wait for the `Eden:` readiness line before opening:
 
 - [Nenex](http://127.0.0.1:8300/nenex)
-- [Cells](http://127.0.0.1:8300/live?views=/0x11/user)
 - [MCP](http://127.0.0.1:8300/mcp)
+
+For the optional [read-only Cells and history inspector](../inspector/README.md),
+include `--mount inspector` when creating the world, then open
+[`/live?views=/0x11/user`](http://127.0.0.1:8300/live?views=/0x11/user).
+It is separate from the declared Goo document and namespace views. Selecting
+`mcp` or `flows` alone does not install `/live`; direct native MCP operations
+remain usable without that interface. Existing saved worlds retain their recorded
+mount selection; adding this flag is not an in-place interface upgrade.
 
 Use another free port and a different directory for a separate world. A world
 directory is exclusively locked while running. Compilation and retained arenas
@@ -58,10 +65,10 @@ checks writes and operation inputs; accepted reactions share the transaction.
 An agent can inspect cells, discover declared controls, invoke native operations
 and retain work in the same world as the browser. See
 [Cooperate](../cooperate/README.md), [flow authoring](../flows/README.md)
-and [Nenex](../nenex/README.md) for those contracts. The standalone research
-scripts and `cartography.md` describe an upstream research protocol, not
-installed shared-harness providers or a generally available graph overlay.
-Prose mentions do not create native references; use typed reference values.
+and [Nenex](../nenex/README.md) for those contracts. The optional
+[flow examples](../flow-examples/README.md) include authored web-evidence and
+cartography procedures using those same contracts. Prose mentions do not create
+native references; use typed reference values.
 
 ## Check a disposable world
 
@@ -69,7 +76,7 @@ Run selected native suites and the checked mount-entrypoint gate:
 
 ```sh
 bash x/check foil:tests/namespace_command foil:tests/semidoc
-python3 extras/x/check --mount flows --mount codex --contracts-only
+python3 extras/x/check --mount flow-authoring --mount codex --contracts-only
 ```
 
 These prepare disposable test fixtures. Existing saved worlds are not test

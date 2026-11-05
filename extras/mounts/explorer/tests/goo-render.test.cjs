@@ -1,5 +1,5 @@
 // Deterministic adapter tests: use the real follow/gesture adapter with a tiny
-// DOM port. Real browser rehearsal is separately recorded in PANES-VERIFICATION.
+// DOM port. Browser rehearsal commands are in APPLICATION-INTEGRATION.md.
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm');

@@ -7,13 +7,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
 import os
-import shutil
 import sys
 import threading
 
 REPO = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(REPO / 'x'))
+sys.path[:0] = [str(REPO / 'x'), str(REPO / 'extras/x')]
 import test_runner
+from eden_mounts import select
+from fixture_sources import materialize
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -32,27 +33,12 @@ class Fixture(BaseHTTPRequestHandler):
 def check():
     root = Path(os.environ['TEST_RUN_DIR']) / 'native-fetch'
     root.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(os.environ['TEST_SOURCE_ROOT'], root / 'src', dirs_exist_ok=True)
-    # The shared host gate stages core; mounted module aliases are taken from
-    # the materialized source when present. Direct runs may supply that source.
-    needed = set()
-    def add(name):
-        if name in needed:
-            return
-        needed.add(name)
-        mount = REPO / 'extras/mounts' / name
-        manifest = json.loads((mount / 'mount.json').read_text())
-        for dep in manifest.get('dependencies', []):
-            add(dep)
-        for alias, filename in manifest.get('modules', {}).items():
-            dest = root / 'src/foil' / (alias + '.foil')
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if not dest.exists():
-                shutil.copyfile(mount / filename, dest)
-    add('flows')
-    shutil.copyfile(REPO / 'extras/mounts/flows/tests/web.foil', root / 'src/foil/flow_web_tests.foil')
-    shutil.copyfile(REPO / 'extras/mounts/flows/tests/lifecycle.foil', root / 'src/foil/tests/flows.foil')
-    shutil.copyfile(REPO / 'extras/mounts/flows/examples/web-source-guide.semidoc', root / 'src/web-source-guide.semidoc')
+    # Use the same mount catalogue and fixture projection as the native gate;
+    # aliases, shared test helpers and authored recipe bytes have one owner.
+    mounts = select(REPO / 'extras', ['flows', 'flow-examples'])
+    source_root = Path(os.environ['TEST_SOURCE_ROOT'])
+    materialize(source_root.parent, REPO / 'extras', root / 'src',
+                {mount.name for mount in mounts}, native_tests=True)
     server = ThreadingHTTPServer(('127.0.0.1', 0), Fixture)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -61,7 +47,7 @@ def check():
         module = root / 'src/foil/web_transport_test.foil'
         module.write_text('- flow_web_tests\n'
                           '+ authored\n  \\ ignored=unit\n  ^ row[testing/check]\n'
-                          '  = ;bytes (ReadFile "web-source-guide.semidoc")\n'
+                          '  = ;bytes (ReadFile "examples/web-source-guide.semidoc")\n'
                           '  | flow_web_tests/authored (flow_web_foot/unbar bytes) ignored\n'
                           '+ tests\n  ^ row[testing/case]\n'
                           '  [(testing/case "native HTTP loopback" '

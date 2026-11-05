@@ -84,6 +84,30 @@ class MountTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Cyclic'):
             select(self.root, ['a'])
 
+    def test_explicit_core_contract_retention_has_one_publication_owner(self):
+        bag = self.bag('documents', pinned_imports=['semidoc'])
+        mounts = select(self.root, ['documents'])
+        (self.root / 'src').mkdir()
+        specs = runtime_specs([(mounts[0], bag, [], None)], self.root / 'src')
+        self.assertEqual(specs[0][14], ['semidoc'])
+        self.bag('duplicate', pinned_imports=['semidoc'])
+        with self.assertRaisesRegex(ValueError, 'Conflicting publication roots'):
+            select(self.root, ['documents', 'duplicate'])
+
+    def test_retained_import_cannot_select_an_unowned_extra_artifact(self):
+        self.bag('bad', pinned_imports=['flow'])
+        with self.assertRaisesRegex(ValueError, 'distinct core modules'):
+            catalog(self.root)
+
+    def test_retained_import_requires_a_relative_logical_module_name(self):
+        bag = self.bag('bad')
+        for name in ['/semidoc', 'semidoc/', 'tests//semidoc', '../semidoc']:
+            with self.subTest(name=name):
+                (bag / 'mount.json').write_text(json.dumps(dict(
+                    version=1, name='bad', modules={}, pinned_imports=[name])))
+                with self.assertRaisesRegex(ValueError, 'distinct core modules'):
+                    catalog(self.root)
+
     def test_conflicting_ownership_and_routes(self):
         self.bag('a', modules={'common': 'a.foil'})
         self.bag('b', modules={'common': 'b.foil'})
@@ -120,6 +144,23 @@ class MountTests(unittest.TestCase):
         selected = select(extras, ['flows', 'codex'])
         self.assertEqual(selected[-1].name, 'codex')
         self.assertEqual(sum(mount.name == 'flows' for mount in selected), 1)
+
+    def test_flow_execution_and_integrations_select_independently(self):
+        extras = Path(__file__).resolve().parent.parent / 'extras'
+        native = select(extras, ['flows'])
+        self.assertEqual({m.name for m in native}, {'mcp', 'codecs', 'cooperate', 'flows'})
+        flow = next(m for m in native if m.name == 'flows')
+        self.assertNotIn('start', flow.manifest)
+        self.assertNotIn('flow_interface', flow.manifest['modules'])
+        authoring = select(extras, ['flow-authoring'])
+        self.assertIn('nenex', {m.name for m in authoring})
+        self.assertNotIn('flow-web', {m.name for m in authoring})
+        web = select(extras, ['flow-web'])
+        self.assertNotIn('nenex', {m.name for m in web})
+        self.assertIn('flow-web', {m.name for m in web})
+        # Exact retained artifacts keep their existing mount owner.
+        self.assertTrue({'flow', 'flow_runtime', 'flow_work', 'flow_maintenance',
+                         'flow_nenex', 'flow_sources', 'flow_web'} <= set(flow.manifest['pinned_modules']))
 
     def test_live_scan_and_logical_module_names(self):
         bag = self.bag('app', modules={'apps/app/main': 'main.foil'})

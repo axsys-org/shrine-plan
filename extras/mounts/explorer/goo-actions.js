@@ -403,28 +403,31 @@
         element.gooEditor?.bind(binding.signal,{...context,renderContext:root.GooActions.context(container)});
         continue;
       }
-      const actionKey=JSON.stringify([context.target,context.view,context.snapshot.life,context.snapshot.publication,control.control]);
+      const actionKey=JSON.stringify([context.target,context.view,context.snapshot.life,context.snapshot.recipePublication ?? context.snapshot.publication,control.control]);
       const existing=pendingActions.get(actionKey);
-      if(existing) { element.disabled=true; existing.elements.set(element,binding); }
+      if(existing) { element.disabled=existing.inFlight || outcomes.get(existing.captured.operationId)?.outcome!=='unknown'; existing.elements.set(element,binding); }
       let pending = null;
       element.addEventListener('click', async event => {
         event.stopPropagation();
-        if (pendingActions.has(actionKey)) return;
+        const previous=pendingActions.get(actionKey);
+        if (previous && (previous.inFlight || outcomes.get(previous.captured.operationId)?.outcome!=='unknown')) return;
         if (context.activate) { try { await context.activate(control); } catch (error) { context.report(error.message); } return; }
         try {
           if (control.become && !control.invoke) { await context.become(control.slot); return; }
-          const captured=captureActivation(container,context,control);
+          const captured=previous?.captured || captureActivation(container,context,control);
           // Receipt correlation for hosts invoking an ordinary bound control.
           element.dataset.gooInvocation=captured.operationId;
-          pending = {captured,elements:new Map([[element,binding]])}; pendingActions.set(actionKey,pending); element.disabled = true;
-          context.report('Applying...');
-          const held=pending;held.unsubscribe=subscribeOutcomes(receipt=>{if(receipt.operationId!==captured.operationId||receipt.outcome==='unknown')return;held.unsubscribe?.();held.unsubscribe=null;if(pendingActions.get(actionKey)===held){pendingActions.delete(actionKey);for(const [element,owner] of held.elements)if(bindings.get(element)===owner)element.disabled=false;}});
+          pending = previous || {captured,elements:new Map()}; pending.elements.set(element,binding);pending.inFlight=true;pendingActions.set(actionKey,pending); element.disabled = true;
+          context.report(previous?'Reconciling the captured change...':'Applying...');
+          const held=pending;held.unsubscribe ||= subscribeOutcomes(receipt=>{if(receipt.operationId!==captured.operationId||receipt.outcome==='unknown')return;held.unsubscribe?.();held.unsubscribe=null;if(pendingActions.get(actionKey)===held){pendingActions.delete(actionKey);for(const [element,owner] of held.elements)if(bindings.get(element)===owner)element.disabled=false;}});
           const {result,savedInputs}=await activateCaptured(captured);
           await context.saved?.(result, savedInputs);
           if (control.become) await context.become(control.slot);
           context.report('Saved.');
-        } catch (error) { context.report(error.message); }
+        } catch (error) { context.report(error.code==='outcome-unknown'?error.message+' Activate this control again to reconcile the same change.':error.message); }
         finally {
+          if(pending)pending.inFlight=false;
+          if(pending && outcomes.get(pending.captured.operationId)?.outcome==='unknown')for(const [held,owner]of pending.elements)if(bindings.get(held)===owner)held.disabled=false;
           if (pending && pendingActions.get(actionKey) === pending && outcomes.get(pending.captured.operationId)?.outcome!=='unknown') {
             pending.unsubscribe?.();
             pendingActions.delete(actionKey);

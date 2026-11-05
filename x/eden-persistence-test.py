@@ -186,7 +186,7 @@ class NativeWorldTest(unittest.TestCase):
                 nonlocal process
                 offset = log.seek(0, os.SEEK_END)
                 env = dict(os.environ, _EDEN_NIX_ROOT=str(ROOT))
-                selection = [] if (world / 'world.json').exists() else ['--mount', 'flows']
+                selection = [] if (world / 'world.json').exists() else ['--mount', 'flow-authoring']
                 process = subprocess.Popen([sys.executable, str(ROOT / 'x/eden'),
                     '--world', str(world), *selection, '--compiler', 'P1', '--port', str(port)], env=env, stdout=log, stderr=log,
                     start_new_session=True)
@@ -230,7 +230,7 @@ class NativeWorldTest(unittest.TestCase):
             output = page + '_output'
             request = controller + '/work/revision_1'
             hole = output + '/holes/' + name + '/concepts'
-            recipe = (ROOT / 'extras/mounts/flows/examples/evidence_resume.semidoc').read_text()
+            recipe = (ROOT / 'extras/mounts/flow-examples/examples/evidence_resume.semidoc').read_text()
             def values(value):
                 # Historical read projections intentionally omit the transport
                 # handle for opaque code. Execution below checks its behavior.

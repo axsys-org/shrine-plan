@@ -122,7 +122,8 @@
 
 + tests
   ^ row[testing/case]
-  [(testing/case "removed evidence reopens holes" evidence_removal_tests/holes)
+  [(testing/case "orphan hole waits for its owner" evidence_removal_tests/orphan)
+   (testing/case "removed evidence reopens holes" evidence_removal_tests/holes)
    (testing/case "answers survive evidence removal and restoration" evidence_removal_tests/answering)
    (testing/case "shared native dispatch and settlement" work_transition_tests/lifecycle)
    (testing/case "document work lifecycle" harness_tests/lifecycle)
@@ -246,6 +247,18 @@
       done (harness_tests/apply 'answer_enabled answering_tests/controller (myth/sing ['enabled] (pails/b .true)) held)
       old (sovereign_care .z (row/cons[iota] 'x (row/snoc[iota] 'context (answering_tests/attempt 1))) done)
       answer (harness_tests/get (row/cons[iota] 'x (row/snoc[iota] 'answer answering_tests/controller)) done)
+      paused_done (harness_tests/apply 'answer_enabled answering_tests/controller (myth/sing ['enabled] (pails/b .false)) done)
+      changed_done (harness_tests/edit 40 paused_done)
+      unavailable (harness_tests/get (row/cons[iota] 'x (row/snoc[iota] 'answer answering_tests/controller)) changed_done)
+      retained (harness_tests/get (row/cons[iota] 'x (answering_tests/attempt 3).snoc('answer)) changed_done)
+      old_value (myth/sing system_vocabulary/content (pails/t "30")).put(['work 'reason] (pails/t "The supplied amount is thirty.")).put(['work 'status] (pails/t "resolved"))
+      old_cell (native_work_ops/value ($x 17) (pin (axal/new[myth] (./some old_value)))).put(['annotation] (pails/t "keep"))
+      [old_world old_index old_reply] (helm/supervisor/step (answering_tests/controller).snoc('answer) (writ/make old_cell) 0 0 paused_done (sovereign_hive paused_done))
+      old_changed (harness_tests/edit 40 old_world)
+      old_answer (harness_tests/get (row/cons[iota] 'x (answering_tests/controller).snoc('answer)) old_changed)
+      edited_cell old_cell.put(['source_case] (pails/n 99))
+      [edited_world edited_index edited_reply] (helm/supervisor/step (answering_tests/controller).snoc('answer) (writ/make edited_cell) 0 0 paused_done (sovereign_hive paused_done))
+      edited_changed (harness_tests/edit 40 edited_world)
     [(testing/text "question creates a native answering activity" "running" (harness_tests/get answering_tests/controller started).txt_at(['work 'status]))
      (testing/text "question retains a subject hole" "waiting" (harness_tests/get answering_tests/hole started).txt_at(['work 'status]))
      (testing/nat "provider guard exposes the shared captured-value contract" 1 provider_guard.is_some)
@@ -257,7 +270,13 @@
      (testing/nat "identical evidence does not replay the provider" 0 (harness_tests/get (answering_tests/attempt 3) same).has(['capture]))
      (testing/text "pause holds completed provider output" "" (harness_tests/get answering_tests/controller held).txt_at(['answer 'text]))
      (testing/text "resume admits through the same hand" "resolved" (harness_tests/get answering_tests/hole done).txt_at(['work 'status]))
-     (testing/text "answer is available as an ordinary frozen cell" "30" answer.txt_at(system_vocabulary/content))
+     (testing/text "answer is available as an ordinary reactive cell" "30" answer.txt_at(system_vocabulary/content))
+     (testing/text "paused answer cannot expose stale evidence as current" "" unavailable.txt_at(system_vocabulary/content))
+     (testing/text "historic attempt answer remains frozen" "30" retained.txt_at(system_vocabulary/content))
+     (testing/text "old frozen current answer becomes unavailable while paused" "" old_answer.txt_at(system_vocabulary/content))
+     (testing/text "owned current output upgrade preserves annotation" "keep" (harness_tests/get (answering_tests/controller).snoc('answer) old_changed).txt_at(['annotation]))
+     (testing/nat "edited old current output is not replaced" 1 (equal[myth] edited_cell (harness_tests/get (answering_tests/controller).snoc('answer) edited_changed)))
+     (testing/nat "edited output collision remains explicit" 1 (gt (harness_tests/get answering_tests/controller edited_changed).txt_at(['answer 'error]).len 0))
      (testing/nat "original attempt retains its input" 10 old.fil.fall(myth/new).nat_at(['amount] 0))]
 
 + work_transition_tests
@@ -270,18 +289,19 @@
       worker (harness_tests/run).snoc('worker)
       request (native_work/request harness_tests/run "Read the evidence" "{}" source)
       provider (native_work/provider delegation_tests/provider)
-    ?> (./ok sent) (native_work_ops/dispatch worker request provider record) [(testing/nat "fixture dispatch admitted" 1 0)]
+    ?> (./ok sent) (native_work_ops/dispatch worker request provider record (./some native_work_ops/empty)) [(testing/nat "fixture dispatch admitted" 1 0)]
     = [claimed writes] sent
-      repeated (native_work_ops/dispatch worker request provider claimed)
+      occupied (native_work_ops/empty).put([] (native_work_ops/start_provider worker request provider))
+      repeated (native_work_ops/dispatch worker request provider claimed (./some occupied))
       repeat_count=nat
         ?> (./ok pair) repeated 99
         = [record writes] pair
         writes.len
-      conflict (native_work_ops/dispatch worker request.set_prompt("Different request") provider claimed)
+      conflict (native_work_ops/dispatch worker request.set_prompt("Different request") provider claimed (./some occupied))
       guard (native_work_ops/empty).put([] (myth/sing ['capture] capture))
       outcome (native_work/outcome "complete" "Accepted evidence" (pin capture))
       stale outcome.set_guard((pin capture.set_observed((./some 8))))
-      provider_record (native_work_ops/start_provider worker request provider)
+      provider_record (native_work_ops/start_provider worker request provider).put(crew_slot (cpail (crew/sing ['guard] (dep .x source.path))))
       finished (native_work_ops/result worker outcome provider_record)
       late (native_work_ops/result worker outcome.set_text("Late conflicting result") finished.out)
       waiting (native_work_ops/settle "waiting" "Need more evidence" claimed)
@@ -290,14 +310,37 @@
      (testing/nat "dispatch receipt is on the retained attempt" 1 claimed.has(['work 'request]))
      (testing/nat "a repeated dispatch creates no worker" 0 repeat_count)
      (testing/nat "a dispatch ID cannot acquire another request" 1 (either/is_err conflict))
+     (testing/nat "unobserved allocation cannot dispatch" 1 (either/is_err (native_work_ops/dispatch worker request provider record .none)))
+     (testing/nat "occupied worker root cannot dispatch" 1 (either/is_err (native_work_ops/dispatch worker request provider record (./some occupied))))
+     (testing/nat "occupied worker descendants cannot dispatch" 1 (either/is_err (native_work_ops/dispatch worker request provider record (./some (native_work_ops/empty).put(['child] myth/new)))))
+     (testing/nat "receipt does not adopt a foreign worker" 1 (either/is_err (native_work_ops/dispatch worker request provider claimed (./some (native_work_ops/empty).put([] myth/new)))))
+     (testing/nat "receipt does not replay a missing worker" 1 (either/is_err (native_work_ops/dispatch worker request provider claimed (./some native_work_ops/empty))))
      (testing/nat "matching captured guard admits provider evidence" 1 (either/is_ok (native_work_ops/check_outcome outcome guard)))
      (testing/nat "same value with another observed case is stale" 1 (either/is_err (native_work_ops/check_outcome stale guard)))
      (testing/nat "provider completion freezes one result" 1 finished.cards.len)
+     (testing/nat "terminal provider releases subscriptions" 1 (equal[pail] finished.out.pail_at(crew_slot) (cpail (mop/empty))))
      (testing/nat "late provider completion cannot overwrite evidence" 0 late.cards.len)
      (testing/nat "a waiting attempt is settled while its demand remains open" 1 (native_work_ops/settled waiting))
      (testing/text "domain admission can resolve an unresolved attempt" "complete" accepted.txt_at(['work 'status]))]
 
 + evidence_removal_tests
+  + orphan
+    \ ignored=unit
+    ^ row[testing/check]
+    = opened (harness_tests/apply 'open harness_tests/doc harness_tests/request harness_tests/seed)
+      input (myth/sing ['id] (pails/t "amount")).put(['content] (pails/t "Explain amount")).put(['shape] (pails/t "number")).put(['context] (safe 0 .x harness_tests/input)).put(['resume] (pails/p harness_tests/run))
+      asked (harness_tests/apply 'ask harness_tests/doc input opened)
+      hole (harness_tests/doc).weld(['holes 'amount])
+      owner (harness_tests/get harness_tests/run asked)
+      version asked.case(.x harness_tests/run)
+      [removed removed_index removed_reply] (helm/supervisor/step harness_tests/run .cull 0 0 asked (sovereign_hive asked))
+      changed (harness_tests/edit 20 removed)
+      [restored restored_index restored_reply] (helm/supervisor/step harness_tests/run (writ/make owner) 0 0 changed (sovereign_hive changed))
+    [(testing/nat "unrelated evidence update remains admitted" 20 (harness_tests/get harness_tests/input changed).nat_at(['amount] 0))
+     (testing/nat "orphan hole cannot recreate removed owner" 0 (sovereign_care .x harness_tests/run changed).wyt)
+     (testing/text "retained hole waits for missing owner" "waiting" (harness_tests/get hole changed).txt_at(['work 'status]))
+     (testing/nat "restored owner receives pending evidence resume" 1 (harness_tests/get harness_tests/run restored).has(['work 'resume]))
+     (testing/nat "owner history survives" 1 (equal (namespace/page .x version harness_tests/run asked) (namespace/page .x version harness_tests/run restored)))]
   + gone
     \ state=namespace
     ^ namespace

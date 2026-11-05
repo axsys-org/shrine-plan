@@ -226,17 +226,38 @@ test('action retries retain one invocation, capture and exact working inputs',as
   assert.equal(actions.metrics.activations,1);assert.equal(actions.metrics.dispatches,2);assert.equal(fixture.button.disabled,false);
 });
 
-test('rebinding a retained action removes its stale listener and keeps pending invocation unique',async()=>{
+test('rebinding a retained action across snapshot epochs keeps its pending invocation unique',async()=>{
   const gate=defer();let dispatched=0;
   const {actions}=setup(()=>{dispatched++;return gate.promise;});
   const fixture=bindingFixture(actions);
+  fixture.context.snapshot={...snapshot,recipePublication:'3'};
   actions.bind(fixture.container,fixture.context);
   const first=fixture.button.fire('click');assert.equal(dispatched,1);
+  fixture.context.snapshot={...snapshot,publication:'4',recipePublication:'3'};
   actions.bind(fixture.container,fixture.context);
   const second=fixture.button.fire('click');
   assert.equal(dispatched,1,'a layout refresh cannot admit the pending action a second time');
   gate.resolve(response({ok:true}));await Promise.all([first,second]);
   assert.equal(actions.metrics.activations,1);assert.equal(fixture.saved.length,1);
+});
+
+test('ordinary bound actions retry unknown outcomes with their original capture after rebind',async()=>{
+  const bodies=[];let online=false;
+  const {actions}=setup((_url,options)=>{bodies.push(options.body.toString());if(!online)throw Error('offline');return response({ok:true});});
+  const fixture=bindingFixture(actions);fixture.context.actionScope={};
+  actions.bind(fixture.container,fixture.context);
+  await fixture.button.fire('click');
+  assert.equal(fixture.button.disabled,false,'uncertainty must leave the same control usable for reconciliation');
+  const original=new URLSearchParams(bodies[0]);
+  fixture.input.value='later unsaved input';fixture.context.snapshot={...snapshot,expected:'99'};
+  actions.bind(fixture.container,fixture.context);
+  assert.equal(fixture.button.disabled,false);
+  online=true;await fixture.button.fire('click');
+  assert.equal(new Set(bodies).size,1,'retry resubmits the exact captured body, inputs, revisions and invocation identity');
+  assert.equal(actions.metrics.activations,1);assert.equal(fixture.saved.length,1);
+  assert.equal(fixture.saved[0][1].get('/req'),'first draft');
+  assert.equal(fixture.input.value,'later unsaved input');
+  assert.equal(actions.outcome(original.get('invocation')).outcome,'accepted');
 });
 
 test('independent action owners may invoke the same control with their own working inputs',async()=>{

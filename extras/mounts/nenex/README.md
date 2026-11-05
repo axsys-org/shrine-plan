@@ -3,18 +3,24 @@
 See the [shared harness ownership map](../../HARNESS.md) for responsibilities
 and integration boundaries.
 
-A personal wiki with a Goo page library, Mash's pinned renderer profile, and a
-formatted semidoc reader. Run from the repository root:
+Nenex presents existing namespace documents as a continuous Grove/Goo page tree:
 
 ```sh
 x/eden --mount nenex --mount cooperate --compiler none --port 8131
 ```
 
-Open [Nenex](http://127.0.0.1:8131/nenex). Use **Read page** in the library,
-**Edit source** to edit multiline semidoc, and **Save page** to commit a revision.
-Search and creation use the corpus's existing actions. Page names begin with a
+Open [Nenex](http://127.0.0.1:8131/nenex). The library opens its native page
+frontier; pages prepare their existing block controls as they enter the viewport.
+Expand a page's **Child pages** disclosure to open its next native frontier.
+**Load more pages** follows the native child cursor. Opening the library does not
+walk every page, work attempt or capture in the world. Accepted page actions
+refresh their existing native frontiers, keeping unchanged open pages and drafts.
+
+Each page's **Page actions** offers Semidoc source editing, page/block questions,
+and creation. The library also offers creation and native search; its record
+inspector exposes the retained query and result paths. Page names begin with a
 letter or underscore and contain letters, digits, underscores or hyphens;
-creating an existing name never overwrites that page.
+creating an existing name never overwrites it.
 
 Named child documents can be opened through `?path=` and linked from their parent.
 Numbered prose children remain part of the containing page. The
@@ -22,30 +28,37 @@ Numbered prose children remain part of the containing page. The
 concept documents from editorial briefs and captured source material:
 
 ```sh
-x/eden --mount flows --mount codex --compiler none --port 8300
+x/eden --mount flow-examples --mount codex --compiler none --port 8300
 ```
 
-Open `/nenex?path=/0x11/app/nenex/w/handbook_flow` and attach maintenance.
-Nenex and `/live` Cells run in the same world. Eden captures repository evidence;
+Open Nenex's example catalogue, create the **handbook** example, publish its
+saved definition and attach maintenance. An existing `handbook_flow` page is not
+assumed. Nenex and its native cell surfaces run in the same world; add the
+optional `inspector` mount if you also want the standalone `/live` view.
+Eden captures repository evidence;
 the native filesystem foot notices stable changes and existing hands maintain
 the handbook. No standalone observer or Python work runner is needed.
 
-With `flows` mounted, **Page tools → Flows** creates a Semidoc authoring page,
-publishes its saved definitions and attaches the shared native maintenance hand.
-Input fields come from the published definition. Status and links expose the
-output, revision drafts and working overlay; pause/resume use the same native
-operations as other clients. See the flow harness's authoring contract for the
-source syntax and evidence shape. No command-line client is required for these
-actions. Page tools are typed mount contributions, so Nenex itself remains
-independent of a particular flow recipe or provider.
+With `flows` mounted, its declared page-tool views author and publish Semidoc
+flows and attach the shared native maintenance hand. These views invoke the same
+native operations as reflected/headless clients. Optional examples come from the
+separate `flow-examples` mount; Nenex does not assume any flow recipe or provider.
 
-Authored flow embeds present the existing controller's status, bindings,
-holes and native actions in the document. Requests link their captured evidence
-and validated value cells directly. The **Cells** list names the page's native
-bindings and opens the standalone inspector; it does not mount the generic
-Cells viewer or start per-cell polling inside Nenex. Computation and retained
-work still use the same cells, hands and overlays. Domain presentations belong
-to the authored document and its selected views.
+An authored embed retains its reference and descriptor on the original Semidoc
+block. A descriptor can explicitly name a published Goo view through
+`/goo/view`; the view receives the referenced native object. Optional
+`/goo/cells` path rows select relative native cells for read-only inspection.
+Repeated occurrences share their receiver, while each occurrence keeps its own
+block address and local presentation. An unavailable or incompatible descriptor
+leaves its reference inspectable and its source intact.
+
+Question controls bind the native question controller. Current answer text comes
+from its reactive `/x/<controller>/answer` cell, so changed or missing evidence
+does not expose a retained answer as current. A conflicted current output remains
+inspectable with its native error. Native cells, context, holes, connections and
+history are lazy related views over their real namespace paths. They use the
+shared Goo host and `/ns` inspector; the optional standalone `/live` viewer is
+not required.
 
 The `cooperate` mount adds document-local agent runs through the MCP endpoint at
 `http://127.0.0.1:8131/mcp`. See the [harness interface and client](../cooperate/README.md)
@@ -58,22 +71,25 @@ one. This uses the runtime's existing snapshot store, with no Nenex save format.
 
 ## Implementation
 
-- `library.grove` declares the library's role, summary and local selection.
-  The shared Goo host prepares its views, and the existing topology adapter
-  renders and hydrates its members using Mash's profile. Navigation links open
-  the formatted page; selecting a library row does not write wiki state.
-- `interface.foil` registers `/nenex` and builds a workspace receiver rooted at
-  the existing wiki corpus. Its browser responder delegates library construction
-  to `goo_workspace`. The reader uses the existing live document fragment,
-  backlinks, source form and history scrubber.
-- `style.css` styles the reader shell and Semidoc source form. It does not
-  change the measured geometry or typography of Goo's prepared surfaces.
-- `interface.js` handles disclosure anchors, active-page decoration, local wiki
-  links and the source form's unsaved-change warning. It submits the existing
-  source form with progress and failure feedback, preserving the draft on errors.
-  It does not interpret Goo layouts or maintain a second library model.
-- `main.foil` retains the wiki domain. The derived `sys/lede` slot feeds the
-  Goo summary and is excluded from semidoc's record/source synchronization.
+- `main.foil` owns wiki source expansion, reconciliation, links and search.
+- `editor.foil` and `editor.grove` expose native per-block operations. Source
+  and rich editing update those same records through normal admission.
+- `tools.foil` and `tools.grove` declare page/library, answering and hole controls.
+  The adapters hold no work, document, retry or watcher state.
+- `editor_http.foil` exposes one ephemeral manifest per page and a paged native
+  `.y` frontier. The shared `explorer/goo-document.js` keeps only local prepared
+  controls, input drafts and focus. Refreshing one page fetches only that page's
+  manifest; each page retains its own epoch and structural-edit scope.
+- `interface.foil` routes `/nenex` and `/nenex/edit` to this same document surface.
+  The former reader application script, stylesheet and handwritten forms are
+  removed. The original native Weft face remains available through `/ns`; it is
+  not a second primary Nenex route.
+
+Mounts contribute optional tools at `/gov/nenex_ui/tools/<name>` with an explicit
+`/goo/view` path, optional `/goo/target` receiver (default: current page), and
+`/sys/lede` label. Tool views prepare when opened, rather than mounting every
+form for every page. Page children, source blocks, work and cells remain native
+namespace ownership boundaries.
 
 Document expansion retains the normalized source projection in native system
 metadata. Synchronization reuses that projection while the source is unchanged,
@@ -95,15 +111,15 @@ no document record, history format or migration pass. This is slot reconciliatio
 not a general concurrent merge: source and Goo edits retain their native version
 guards, and block reordering refuses named descendants attached below prose.
 
-The reader's **Edit with Goo** link opens `/nenex/edit?path=<namespace path>`.
-The whole document is a continuous sequence of native Grove/Goo block views.
+`/nenex?path=<namespace path>` and `/nenex/edit?path=<namespace path>` open
+the same native editor. The whole document is a continuous sequence of native Grove/Goo block views.
 Each field still belongs to its original `text`, `title`, `lead` or `body` slot.
 Select text for the formatting toolbar; type `/` for Text, Heading, Bullet list,
 Quote and Code. Enter splits a block (inside code it inserts a newline), and
 Shift+Enter inserts a soft newline. Backspace at the start joins compatible
 siblings. The focused block exposes Save, insert-after, move-up/down and Delete.
-Blur saves that block; Ctrl/Cmd+S saves dirty blocks in order. References remain
-links, including their embed descriptors. The shell adds no handwritten CSS.
+Blur saves that block; Ctrl/Cmd+S saves dirty blocks in order. References retain their original targets and explicit embed descriptors;
+compatible declared Goo embeds are interactive. The shell adds no handwritten CSS.
 
 The slash menu changes real Semidoc node kinds. Heading Enter creates its first
 paragraph child. Moving a container carries its children; deleting a container
@@ -118,7 +134,7 @@ evidence and focus. It reads an ephemeral path manifest and activates published
 Grove controls through `GooActions`; it does not parse Semidoc or store a second
 document model. Structural writes flush other drafts first, freeze editing while
 in flight, and compare authored content against the captured native epoch.
-The source form uses the same guard and native admission. Work, cell and hole
+The declared source action uses the same guard and native admission. Work, cell and hole
 updates do not invalidate an otherwise unchanged document; changed source or
 numbered document records do, even when a reconciliation conflict retains the
 same source text.
@@ -135,6 +151,11 @@ current page subtree and commits through Nenex's existing expansion transaction.
 There is no editor document record or flattened copy of the page. Named children
 such as `inputs`, `cells`, `work` and nested named documents are outside that
 projection and remain intact.
+
+A retained source projection from an unknown publication is never treated as
+proof of an intentional native deletion. Faithful unchanged content remains
+readable; a disagreement preserves source and records and requires explicit
+resolution through a fresh source edit.
 
 The retained source projection is a reconciliation baseline, not a concurrent
 merge engine. With a faithful baseline, native edits remain authoritative.
@@ -170,26 +191,30 @@ blocks stay editable; its source is unchanged. The original `/ns/<node>/app/nene
 WISP=/path/to/wisp python3 extras/x/check --mount nenex
 ```
 
-The wiki checks cover links, search, source/record synchronization, derived
-library titles, browser form line endings and duplicate/invalid page names. Browser verification should
-cover library navigation, create/search, multiline save, discard, dirty departure,
-history, and a narrow viewport against a disposable development namespace.
+Native checks cover links, repeated relationship occurrences, search,
+source/record synchronization, retained image ownership, source and Goo guards,
+named attachments and prior x/y/z history. The `nenex-document-tests` gate
+compiles the production Grove source and block editors, invokes their actual
+controls for source, block editing, creation, questions and holes, and checks
+native frontier continuation and independent page manifests. The shared document
+host tests cover page-local drafts/epochs, native embed receivers, lazy tools and
+same-invocation recovery after a lost response.
 
 ## Page and block questions
 
-The reader's **Ask** link opens **Questions**. Ask about the page or select a
-block quotation; optionally bind additional namespace paths or `/x/...` cell
-results. With Codex mounted, its existing native work provider is preselected.
-The form submits one native operation. A shared answering hand owns dispatch,
-captured attempts, missing-evidence holes and re-answering when context changes.
-The answer is an ordinary cell and a live reader fragment, with inspection links
-for the context and attempts. Pause/resume uses the same native operation.
+Choose **Page actions → Ask about a page or block**. Supply a question name,
+question, `page` or a numbered block path, and optional additional evidence paths
+(one per line). With Codex mounted, its native work provider is the default.
+The declared action invokes shared answering; its hand owns captured attempts,
+missing-evidence holes and re-answering. Question controls pause/resume and
+explicitly rebind the quoted selection. Hole controls resolve the exact current
+attempt and generation. Current answer output and retained attempts stay separate.
 
 The primary lens projects authored page source, excluding backlinks, work and
 answer metadata to prevent self-triggering. Block questions keep their original
 quote and original location under the page's named work/cell subtrees. Numbered
 block paths are positional: reordering or deleting prose cannot silently change
-that quote. **Change the quoted selection** explicitly rebinds it; prior attempts
+that quote. **Bind current page or block selection** explicitly rebinds it; prior attempts
 remain frozen. The current page stays live in either scope.
 
 The answering provider receives only the bound, bounded context. It does not
@@ -198,10 +223,6 @@ and bind them through the same interface; native answering does not require a
 separate web or Python scheduling loop. Questions, captured evidence and unresolved
 holes share the same native world persistence as the rest of the page.
 
-The **Cells** section embeds the existing live Cells renderer over native cells.
-Flow outputs expose their maintenance work here, with status, concept drafts,
-evidence bindings and persistent holes. Opening a draft exposes its working
-overlay and **Accept saved draft**, which calls the same guarded native revision
-operation used by providers. Reading or navigating cells never executes work.
-The reader subscribes only to the corpus root for search state, avoiding a
-subscription to every capture and attempt in the wiki.
+Related native cell views are read-only inspection surfaces. Flow occurrence
+controls come from the flow's declared view and operate on its existing work
+controller. Reading a cell or opening a document does not invoke a flow.

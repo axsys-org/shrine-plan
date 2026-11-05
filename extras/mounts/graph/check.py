@@ -23,7 +23,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix='graph-', dir=ROOT / '.check'))
     materialize(ROOT, ROOT / 'extras', work / 'src', native_tests=True)
     suites = [dict(name='foil:' + name, target=name, kind='native', group='policy', timeout=1200)
-              for name in ['graph_reference_tests', 'graph_policy_tests', 'graph_reactivity_tests', 'graph_flow_tests']]
+              for name in ['graph_reference_tests', 'graph_policy_tests', 'graph_reactivity_tests', 'graph_demand_tests', 'graph_flow_tests']]
     results = [runner.run_group(suites, runtime, template, work, 1200)]
     publication = dict(name='graph-publication-tests', target='graph-publication-tests',
                        kind='reaver', group='publication', entrypoint='check', timeout=1200)

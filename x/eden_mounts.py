@@ -129,6 +129,16 @@ def catalog(root):
                 any(not isinstance(module, str) or module not in data.get('modules', {})
                     for module in pinned) or len(set(pinned)) != len(pinned)):
             raise ValueError(f'{name}: pinned_modules must name distinct owned modules')
+        # A mount may explicitly own retention of a core contract it imports.
+        # This selects its own predecessor's exact artifact, never a similarly
+        # named artifact found by searching unrelated mounts.
+        imports = data.get('pinned_imports', [])
+        core = Path(__file__).resolve().parent.parent / 'src/foil'
+        if (not isinstance(imports, list) or
+                any(not isinstance(module, str) or not re.fullmatch(r'[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*', module)
+                    or not (core / (module + '.foil')).is_file()
+                    for module in imports) or len(set(imports)) != len(imports)):
+            raise ValueError(f'{name}: pinned_imports must name distinct core modules')
         leaves = list(data.get('modules', {}).values()) + list(data.get('assets', {}).values())
         for unit in data.get('grove', []):
             leaves.extend(unit['files'])
@@ -174,6 +184,7 @@ def select(root, names):
                 raise ValueError(f'Module {name} is owned by both {modules[name]} and {mount.name}')
             modules[name] = mount.name
         locations = [['lib', name] for name in data.get('modules', {})]
+        locations += [['lib', name] for name in data.get('pinned_imports', [])]
         locations += [unit['root'] for unit in data.get('grove', [])]
         if data.get('roots', locations) != locations:
             raise ValueError(f'{mount.name}: publication roots do not match declared outputs')
@@ -264,7 +275,8 @@ def runtime_specs(prepared, source_root):
                       int(bool(data.get('inspection'))),
                       dependencies(mount),
                       list(data.get('assets', {}).values()), workspace_routes(data),
-                      int(bool(data.get('workspaces'))), data.get('pinned_modules', [])])
+                      int(bool(data.get('workspaces'))),
+                      data.get('pinned_modules', []) + data.get('pinned_imports', [])])
     return specs
 
 
@@ -314,7 +326,7 @@ class ScanBridge:
             current = json.loads((self.originals[name] / 'mount.json').read_text())
             keys = ('version', 'name', 'dependencies', 'modules', 'grove', 'assets', 'roots',
                     'activate', 'http', 'start', 'host', 'routes', 'inspection', 'workspaces',
-                    'pinned_modules')
+                    'pinned_modules', 'pinned_imports')
             if any(current.get(key) != self.manifests[name].get(key) for key in keys):
                 raise ValueError('Mount descriptor changed; the service retains its captured registrations')
             mount, prepared, module = self.scanners[name]

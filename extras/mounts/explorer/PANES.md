@@ -207,13 +207,27 @@ An empty/unavailable selection fails. Server-side validation checks membership,
 the published lexical selection source, source and subject lifetimes, current data version, existence and application
 authority before the existing typed action handler/receiver checks run.
 
-`/goo/act` stores successful invocation identities and exact request payloads in
-`/<self>/weft/goo_receipts`. Identical retries return the original response;
-changed payloads using the same ID are rejected. Recording the receipt and
-exposing the candidate domain state succeed together. This development journal
-is bounded to 1024 invocations per namespace; the page capture cache is bounded
-to 128. Exhaustion is an explicit error, not silent receipt eviction. Legacy
-requests without an invocation ID remain compatible.
+`/goo/act` stores successful invocation identities and exact request payloads as
+ordinary addressed records beneath `/<self>/weft/goo_receipts/by_identity`.
+The address encodes the identity's byte length and bytes, without hashing it.
+Identical retries return the original response; changed payloads using the same
+ID are rejected. Recording the receipt and exposing the candidate domain state
+succeed together. New invocations do not rewrite a global list or exhaust a
+world-lifetime quota. Existing journal records remain intact and still supply
+their original replay responses; reading them does not migrate or rewrite them.
+Current receiver coverage uses their ordinary native reference edges. The page
+capture cache remains bounded to 128. Requests without an invocation ID remain
+compatible.
+
+The request's `publication` number now identifies its native local snapshot epoch.
+Admission checks the selected view, action and creation-role assertions against
+that snapshot, including declarations outside `/gov`; unrelated writes and flow
+claims do not invalidate a prepared action. System declarations use the system
+publication retained by that native event. Changing a declaration and restoring
+its former value still requires fresh preparation. Existing committed receipts
+replay before these freshness checks. Older uncommitted requests carrying the
+former `/gov` case token can be conservatively refused and need explicit
+preparation again; their captures and history remain intact.
 
 Existing grading/provider actions retain their card receiver and normal
 admission. Selection gives no additional mutation authority. The specimen's
@@ -259,7 +273,9 @@ explorer reflection, and Goo v2 rendering/layout regressions. Browser rehearsal
 must additionally exercise the actual row/button/input/deck DOM; isolated owner
 tests alone are not evidence of rendered integration.
 
-See [verification and rehearsal](PANES-VERIFICATION.md) for observed results and coverage boundaries.
+See [application integration](APPLICATION-INTEGRATION.md) for the disposable
+specimen, automated checks and browser rehearsal commands. The DOM tests do not
+establish hardware IME behavior, browser stacking, or every owner-removal case.
 The [real application integration gate](APPLICATION-INTEGRATION.md) boots Eden,
 compiles Grove and exercises these production adapters with actual Mash components.
 
@@ -503,8 +519,9 @@ This is a **browser-reported observation**, including the copied server metadata
 it is not a fresh or independently verified namespace read. Namespace cases and
 browser revisions remain separate. References open current records in another
 tab. The source location refers to the published declaration; a zero location
-means unavailable/generated. The existing publication token describes the view
-catalogue version, not a newly invented per-declaration version.
+means unavailable/generated. The publication token names the native snapshot used
+for declaration freshness checks; `recipePublication` remains the selected view's
+own case for presentation and input lifetime.
 
 Observations are transient: capture IDs and owner IDs are page-local, not durable
 namespace paths. The panel's generated presentation can itself be inspected, with

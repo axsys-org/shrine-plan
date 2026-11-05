@@ -1,7 +1,7 @@
-# Supplied evidence projections
+# Published evidence and demand policies
 
-This optional library publishes ordinary Foil functions and Grove tree
-transformations. It has no activation, HTTP route, provider, watcher, index or
+This optional library publishes ordinary Foil functions, Grove tree
+transformations and native demand constructors. It has no activation, HTTP route, provider, watcher, index or
 worker. Loading its source publishes declarations; it does not install work or
 change another document. Nenex, flows and other applications can select its
 published implementations through ordinary cells and overlays.
@@ -72,7 +72,7 @@ publication/binding, not a string dispatched by the current kernel. A captured
 cell keeps its selected implementation while another cell can select a later
 publication. Publishing this library does not update retained cells by itself.
 
-These are eager supplied-tree transformations. Reference extraction visits the
+The reference and assertion operations above are eager supplied-tree transformations. Reference extraction visits the
 supplied records and slots once. Conflict annotation groups assertions in an
 invocation-local native `axal`, keeping a representative value and disagreement
 bit per exact subject/property key. A second pass annotates the original records.
@@ -84,9 +84,33 @@ Work scales with input size, key traversal and value equality cost rather than
 all assertion pairs; long keys and large values still cost work. Selecting a
 virtual child does not promise selective evaluation of this whole-tree report.
 There is no authority-wide reverse scan, implicit identity closure, navigation
-layout, complete-component claim or traversal budget. Dynamic namespace reads,
-if needed by a future consumer, must use an independently justified native
-reader boundary rather than a private scheduler inside this library.
+layout, complete-component claim or traversal budget in these policies.
+
+`demand.foil` additionally supplies `children_card` and `gather_card`, ordinary
+records containing native `woven` constructors. Publish a chosen record at an
+ordinary definition address and bind a cell's `/sys/weft` to that record's pinned
+x-care reference. `children` grafts its explicit tack; `gather` places explicit
+secondary safe references beneath their authored slot names. Neither invents
+relationships from prose or names. Constructor publication does not rewrite
+existing cell bindings.
+
+These constructors return the existing `view_plan` protocol. Selecting one
+placement reads that branch; requesting names does not read member contents.
+The native reader resolves reads and grafts, records actual observations, and
+uses ordinary dependencies. Graph policy owns placement and missing-member
+presentation. Native `unknown` is marked `unresolved`; native `null` is marked
+`absent`. These states depend on the requested care: an exact x-care read of a
+culled record returns `null`, while a z-care subtree read whose root is no longer
+a node remains `unknown`. Neither becomes an apparently current empty evidence
+record. A pinned subtree's child is selected inside that snapshot, never by
+borrowing its local case as a child's case.
+
+The evaluator contains no graph-name registry or graph-specific provenance
+rewriting. Its constructor contracts are retained in `sys/demand`, independently of the
+unchanged `sys/view` cell contracts. Changing that native implementation is a core runtime update;
+publishing this optional policy cannot replace the reader in a saved service.
+The supplied collection and assertion policies do not claim parity with every
+connected-world navigation or equivalence policy previously supplied in main.
 
 Tests live in `tests/` and run through the existing mounted test infrastructure.
 Publication tests separately exercise actual compiled Grove laws and retained

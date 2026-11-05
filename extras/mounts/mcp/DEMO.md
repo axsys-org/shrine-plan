@@ -12,12 +12,14 @@ the first boot with the explorer builds the browser bundles and takes a few
 minutes):
 
 ```bash
-python3 x/eden --mount mcp --mount probe --mount explorer --extras-root $PWD/extras --port 8300
+python3 x/eden --ephemeral --mount mcp --mount probe --mount explorer --mount inspector --extras-root "$PWD/extras" --port 8300
 ```
 
 The world prints `Eden: http://127.0.0.1:8300; mounts: ...` when it is up. The
-MCP endpoint is `http://127.0.0.1:8300/mcp`, local only, no credential. One
-world at a time. `SETUP.md` has the rest: the skill, the hand, sessions.
+MCP endpoint is `http://127.0.0.1:8300/mcp`, local only, no credential. This
+creates a disposable world. [SETUP.md](SETUP.md) explains durable worlds, resuming them
+and connecting native providers. This walkthrough writes sample data; use a
+free port and a disposable world.
 
 ## 2. Connect an agent
 
@@ -27,11 +29,10 @@ Claude Code:
 claude mcp add --transport http shrine http://127.0.0.1:8300/mcp
 ```
 
-Any MCP client that speaks JSON-RPC over HTTP works the same way. The skill
-at `skills/shrine-mcp/SKILL.md` tells the agent the shape of a cell, the
-three verbs, the numbers convention and how to keep the live page in front
-of you; `knobs.md` has every formula. Link it into `.claude/skills/` for
-Claude Code, or paste it into the system prompt (`SETUP.md`, step 3).
+Any MCP client that speaks JSON-RPC over HTTP works the same way. Use
+`tools/list` for the current tool schemas and read `/weft/stdlib` to inspect the
+installed cell definitions. The [harness guide](../../HARNESS.md) explains
+captures, cells and the native work lifecycle.
 
 ## 3. The walkthrough, as tool calls
 
@@ -99,9 +100,9 @@ mcp/read   path=/c/x/user/demo/cells/amended care=x   ->  /sys/view/note/n1 when
 ## 4. See it
 
 The live page at `http://127.0.0.1:8300/live?views=/0x11/user/demo/cells`
-shows the cells with their current answers and every write as it lands; the
-agent opens it for you when it starts. `history after <epoch> with x` is the
-same story as records.
+is the optional read-only inspector selected above. It shows cells and retained
+history; `mcp/history` also exposes that history as records. Authoring and work
+controls belong to the declared Goo surfaces in Nenex and the native MCP tools.
 
 ## 5. Check the whole library in one go
 

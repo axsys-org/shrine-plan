@@ -1,38 +1,17 @@
 """Transport assertions for disposable tests; not a production flow runner."""
-from html.parser import HTMLParser
 from pathlib import Path
 import re
+import json
 import hashlib
 import runpy
 import uuid
-from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 HERE = Path(__file__).resolve().parents[1]
 _transport = runpy.run_path(str(HERE.parent / 'cooperate' / 'client.py'))
 Client = _transport['Client']
 reference = _transport['reference']
-
-
-class SourceForm(HTMLParser):
-    """The existing Nenex source form carries the complete escaped source."""
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.active = False
-        self.found = False
-        self.parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag == 'textarea' and dict(attrs).get('id') == 'page-source':
-            self.active = self.found = True
-
-    def handle_endtag(self, tag):
-        if tag == 'textarea':
-            self.active = False
-
-    def handle_data(self, data):
-        if self.active:
-            self.parts.append(data)
 
 
 class FlowClient(Client):
@@ -102,16 +81,29 @@ class FlowClient(Client):
                           {'source': source, 'note': note, 'expected': expected})
 
     def source(self, author):
-        # MCP renders text above 8 KiB as a reference. The normal source editor
-        # supplies the whole source in one response, without a debugger mount.
+        """Read the complete authored value through its ordinary Goo input."""
         if not author.startswith('/' + self.node + '/'):
             raise ValueError('source export must address this local publisher')
-        with urlopen(self.base + '/nenex?path=' + quote(author, safe=''), timeout=self.timeout) as response:
-            html = response.read(2097153)
-        if len(html) > 2097152:
-            raise ValueError('source form exceeds the export limit')
-        form = SourceForm()
-        form.feed(html.decode('utf-8'))
-        if not form.found or form.active:
-            raise ValueError('the selected page has no complete source form')
-        return ''.join(form.parts)
+        body = urlencode(dict(target=author, view=f'/{self.node}/gov/nenex_tools/source_view',
+                              width=720, textScale=1, direction='ltr')).encode()
+        request = Request(self.base + '/goo/render', data=body,
+                          headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        with urlopen(request, timeout=self.timeout) as response:
+            encoded = response.read(2097153)
+        if len(encoded) > 2097152:
+            raise ValueError('source view exceeds the export limit')
+        rendered = json.loads(encoded)
+        controls = [control for control in rendered.get('controls', [])
+                    if control.get('kind') == 'input' and control.get('slot') == '/source']
+        if len(controls) != 1:
+            raise ValueError('the selected page has no unique source input')
+        nodes = [node for node in rendered.get('display', {}).get('nodes', [])
+                 if node.get('id') == controls[0]['id']]
+        if len(nodes) != 1 or nodes[0].get('editing', {}).get('encoding') != 'goo-text-v1':
+            raise ValueError('the source input has no native text value')
+        runs = nodes[0].get('textRuns')
+        if not isinstance(runs, list) or any(
+                run.get('myth') != {} or not isinstance(run.get('lang', {}).get('en', {}).get('txt'), str)
+                for run in runs):
+            raise ValueError('the source input must contain plain text')
+        return ''.join(run['lang']['en']['txt'] for run in runs)

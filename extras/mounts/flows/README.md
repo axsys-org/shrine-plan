@@ -15,12 +15,51 @@ an editable new procedure; arbitrary exploratory activity is not inferred as cod
 The generic installation publishes these capabilities without creating a
 handbook, choosing its evidence, or attaching a provider.
 
+## Mount boundaries
+
+`flows` installs publication, invocation, maintenance, source bindings and shared
+request hands without Nenex, Explorer or an HTTP provider. The native command
+addresses remain `/0x11/gov/flows/...`; selecting the smaller mount does not
+introduce a different work lifecycle.
+
+- [`flow-authoring`](../flow-authoring/README.md) adds Nenex writers, declared Goo
+  controls, occurrences, reflection and trace authoring over those commands.
+- [`flow-web`](../flow-web/README.md) adds the HTTP provider and existing native
+  foot. It can be selected without a document application.
+- `flow-examples` selects both integrations and publishes the example catalogue.
+
+All persistent flow contracts retain their existing `flows` module owner,
+including the document-ownership and HTTP-result contracts. The optional mounts
+publish implementation modules and views, not replacement record types.
+
+The document revision path captures a draft writer using the same
+`flow_runtime/writer` contract as final result publication. Final Nenex publication
+owns generated corpus pages; a revision draft instead lives under retained work.
+Their write policies differ, but both use the captured writer's `materialize`
+operation and native admission. Nenex supplies its existing attachment protection
+through the draft writer. The shared executor does not import the Nenex editor.
+A document-form request missing its captured draft writer fails closed, as does
+an unrecognized explicitly captured draft writer. That
+includes older attempts authored before this writer declaration existed; their
+records and captures are retained, but this executor does not silently upgrade
+them. Existing attempts are never silently rebound to whatever writer is currently published;
+selecting new policy requires a new attachment with that policy explicitly
+captured, while old attempts remain inspectable. Retrying an existing attachment
+keeps its captured policy. There is no writer-policy update or receipt handoff
+operation yet; a replacement attachment uses a new destination when the old
+one has retained publication provenance.
+
+Native-only verification is `extras/x/check --mount flows --suite flow_install_tests`.
+This stages no Nenex or Explorer sources and runs a custom writer through normal
+publication, follow, evidence change and retained x/y/z readings. Integration checks
+use `--mount flow-authoring`; the full example set uses `--mount flow-examples`.
+
 ## Author and run
 
-With `flows` mounted, open Nenex and use **Page tools → Flows**:
+With `flow-authoring` mounted, open a Nenex page and expand **Author flows**:
 
-1. Choose **Author a new flow**. **Composition** starts with an ordinary input
-   and identity operation. **Document revision** explicitly selects the document
+1. Use **Create flow starter** with kind `composition`. This starts with an ordinary input
+   and identity operation. Kind `document` explicitly selects the document
    adapter and its evidence/brief starter.
 2. Use **Compose an operation or child flow** to select a callable and bind its
    ports, or edit and save the Semidoc source. Ordinary prose and literal examples
@@ -29,23 +68,23 @@ With `flows` mounted, open Nenex and use **Page tools → Flows**:
    captures the saved definition and selected native laws. Unsaved source must
    be saved before it can be published.
 4. Bind the inputs to namespace paths, choose a destination and a published
-   writer, and **Attach maintenance**. `/x/...` can bind a cell or overlay result.
-   A document composition suggests the Nenex writer and installed Codex provider;
-   a plain composition requires an explicit writer. Providers are optional.
+   writer, and **Attach published flow**. `/x/...` can bind a cell or overlay result.
+   Choose `/0x11/gov/flows/nenex` for document publication. Providers are optional
+   and explicitly selected; ordinary revisions use the inert work provider.
 5. Inspect the work cell, attempts and output. Pause, resume and detach use the
    same native operations as other namespace clients.
 
-These forms call `namespace_command/plan` and supervisor admission. They do not
+These declared controls call `namespace_command/plan` and supervisor admission. They do not
 run Python commands or maintain a browser-owned work queue.
-`authoring.grove` declares publication and the **Declared authoring actions**
-view. Browser and headless clients invoke those declarations through the same
-native planners. Existing contextual forms remain available beside them.
+`../flow-authoring/authoring.grove` owns the controls for publication, composition, extraction,
+source binding and maintenance. Browser and headless clients invoke those same
+native planners.
 Accepted actions refresh the surrounding controls when local drafts allow it;
 unsaved source and Goo input are retained.
 
 ### Declared authoring actions
 
-Open **Page tools → Flows → Declared authoring actions**. The view is
+Open **Author flows** in the Goo document surface. The view is
 `/0x11/gov/flows/authoring/author_flow`, selected by the
 `/0x11/gov/flows/authoring/authoring` slot. Publication keeps its separate
 `publish_flow` view and `publication` slot.
@@ -80,9 +119,9 @@ live namespace paths, or `{}`. It creates the existing document-local work and
 context lens. **Delegate native work** takes an existing activity, a new worker
 name, an explicit provider and an explicit guard path. Choose independently
 guarded evidence whose changes should invalidate that worker, outside the work
-it will edit. Select the Codex surface provider only for
-an intentional interactive investigation; ordinary prose revision retains its
-bounded response policy. **Retain unresolved question** uses the existing hole
+it will edit. Select the Codex surface provider for an intentional interactive
+investigation or an explicitly authored `interactive_requests` step. Ordinary
+prose revision retains its bounded response policy. **Retain unresolved question** uses the existing hole
 operation with a live context path and an open activity to resume.
 
 Headless callers discover control addresses, input fields and version tokens
@@ -113,7 +152,7 @@ retains the historical callable. Reflection alone does not grant a raw function
 effects or invent an input contract: those require a declared flow operation or
 Goo control. Inspection uses the existing capture size limits; inspect a narrower
 module subtree when a large compiler mirror exceeds them.
-In **Declared authoring actions → Inspect callable definitions**, **Inspection
+In **Author flows → Inspect callable definitions**, **Inspection
 care** selects `z` for a subtree or `x` for its own record. The default remains
 `z`. Select `x` when supplying a single native definition or
 settled work record to the library examples. This uses the existing capture
@@ -214,11 +253,13 @@ retained run**.
 
 ### Declared Goo actions in work
 
-Use **Page tools → Flows → Inspect declared Goo actions** to inspect an object
+Use **Author flows → Inspect declared Goo actions** to inspect an object
 and its published view. Inspection retains their native records in an ordinary
 captured cell. The document shows the declared action labels, argument bindings,
 and input controls. Declared rich-text inputs use Goo’s existing encoder, so
-the form accepts ordinary prose. **Select action for a flow** prepares a captured action cell;
+the control accepts ordinary prose. **Capture declared action** accepts a JSON
+object from canonical input paths to text, such as `{"/sys/req":"Revised text"}`,
+and prepares a captured action cell;
 bind its `/x/.../cells/<name>` value to the `actions` port of `request_actions`.
 Inspection and selection do not execute anything. A stale inspection is refused;
 inspect again deliberately to select changed behavior. Controls requiring Goo
@@ -245,13 +286,16 @@ The action's argument preview is captured; execution uses the current declared
 implementation under Goo's publication guards. Native action work supplies time
 zero, as before; it does not introduce an ambient clock. The receipt records
 acceptance, invocation identity and receiver path. It is not a claim that the
-receiver remained unchanged afterward. The existing receipt journal capacity
-still applies. An independently submitted Goo request has ordinary Goo authority;
+receiver remained unchanged afterward. New receipts are native child records
+addressed by invocation identity; they no longer rewrite a global list or exhaust
+a 1,024-action lifetime allowance. Retained legacy receipts remain replayable. An independently submitted Goo request has ordinary Goo authority;
 the work guard does not globally revoke copies submitted outside this hand.
 
-Goo's publication guard versions the `/gov` subtree. Attach the flow before
-preparing its actions if attachment changes publication claims. Reusing a
-receiver in another action requires preparation against its appropriate revision.
+Goo captures a native snapshot epoch and checks the selected view, action and
+receiver-role declarations against it. Unrelated claims or writes do not stale
+prepared actions. Changed declarations and receiver revisions do. Old uncommitted
+requests carrying a `/gov` case token may conservatively require re-preparation;
+an exact committed receipt replays before freshness validation.
 The catalogue reflects compiled Goo declarations; it is not a general PLAN
 function browser or automatic preparation of an arbitrary GUI action sequence.
 
@@ -330,9 +374,8 @@ tools, save/publish their Semidoc, bind their sources, and
 attach it with the existing Nenex writer. The examples are procedures rather
 than separate applications or Python launchers.
 
-**Bind filesystem source** selects a captured Markdown record and its existing
-filesystem mount. **Declared authoring actions → Bind filesystem evidence** also
-offers an explicit **Source format** (default `md`). Both call `watch_sources`
+**Author flows → Bind filesystem evidence** selects a native filesystem record,
+its existing mount and a **Source format** (default `md`). It calls `watch_sources`
 with `source`, `mount`, `expected`, a one-segment `name` and format. Supported
 source labels are `md`, `markdown`, `text`, `txt`, `foil`, `rvr` and `json`;
 the selected flow still decides which formats it can decode. The resulting source cell fills the
@@ -342,212 +385,8 @@ retains ownership of polling and cancellation. Shared consumers keep the watch
 alive. Missing files and detached feeds expose no current evidence; their last
 captures and historical records remain.
 
-### Learning, technical atlas and format ingestion
-
-All three are available under **Page tools → Flow examples**. Creating an example
-authors its shipped Semidoc and binds its declared repository files through the
-existing filesystem source hands. It does not publish, attach, dispatch a model
-or overwrite an existing example page. Publish its named definition, bind any
-remaining inputs, select the Nenex writer and a separate destination, then attach
-maintenance or embed a selected occurrence using the ordinary controls.
-The three examples reuse the handbook catalogue's `/0x11/io/fs/flow_sources`
-capture. Atlas sources reuse the same file entries as the handbook, rather than
-staging duplicate copies under new names. Native source-feed dependencies keep
-that capture watched while any consumer still needs it.
-Source keys also name generated reference documents. Use `cell_examples` for
-the Cells source: `cells`, `work`, `inputs`, `flows` and `holes` are reserved
-by the native document writer, including beneath `reference`.
-
-| Example | Definition / author page | Remaining input | Result |
-| --- | --- | --- | --- |
-| Task learning | `task_learning` / `task_learning_flow` | `capture`: a selected settled native work record | Lesson, proposed instruction change and reusable-procedure brief |
-| Technical atlas | `technical_atlas` / `technical_atlas_flow` | `capture`: a selected native definition or compiler mirror entry | Concept tree relating language/runtime, interfaces and computation |
-| Format ingestion | `format_ingestion` / `format_ingestion_flow` | None for the bundled JSON sample | Deterministic source document projection; decoded values retained in the step trace |
-
-For either `capture` input, open **Declared authoring actions → Inspect callable
-definitions**, name the inspection, enter the source record path and set
-**Inspection care** to `x`. Bind the flow input to the **raw**
-`<author>/cells/<inspection>` path, without `/x`. This supplies the existing
-`native_work/captured` record. The adapter refuses collection care, absent
-versions and empty readings instead of treating a collection's epoch as its
-root record's identity. The exact typed capture remains beside a bounded display
-produced by the existing native value renderer. Source text and type descriptors
-are inspectable evidence; a decompiled law is not evidence that it ran.
-
-The inspection is frozen. Later source publication does not retarget it; inspect
-and rebind deliberately to adopt another definition or task outcome. Ordinary
-manual/document sources remain live bindings and wake the existing maintenance
-hand on change. An attempt retains both readings. The raw cell path and its
-`/x/...` computed projection have different meanings here; the adapter requires
-the former, not a new kind of flow input.
-
-**Task learning** uses native settled-work semantics: an open/running activity
-refuses; a completed, failed or otherwise settled attempt can supply evidence,
-including an attempt whose subject-owned hole still needs work. Its `sources`
-collection contains `task` and `instructions`. The catalogue binds clearly
-labelled sample documents. Replace these with the actual goal and current
-instructions before adopting a real lesson. A provider or person authors three
-proposals through the shared revision hand. The flow does not mutate instruction
-files, infer a runnable procedure from opaque results, or install a global
-after-task hook. Use existing trace extraction and callable composition to turn
-an accepted proposal into a separately reviewed and published procedure.
-For a completed flow, select its retained `work/<generation>` record. The adapter
-walks its existing typed evaluation trace explicitly, including each step's
-named results, instead of relying on a truncated rendering of the enclosing
-run. Other native work contributes the fields actually present in its selected
-record; this does not follow arbitrary investigation links or infer missing
-actions. Every display remains a view of the original retained capture.
-
-**Technical atlas** binds the existing Shrine, Grove, Goo, Nenex, flow-harness,
-reflection, cell, hand and view sources. Its `example` step actually runs the
-existing inventory operation; that captured input/result is inspectable in the
-trace. Concept drafts also use the explicitly selected native definition. The
-result is authored explanation with provenance, not README replication. It is
-not a full Enki manual, nor a claim that arbitrary code examples were executed.
-Other callable examples can be deliberately composed or embedded through the
-existing Nenex controls.
-
-**Format ingestion** requires no provider. The sample binds one JSON source as
-`data`; rebinding another format uses the explicit format field in the declared
-Goo action. `library/decode_sources` validates the existing
-source envelopes, selects JSON/Markdown/literal-text handling, and returns source
-cards. A JSON card adds one `data` slot containing its existing native JSON
-variant record (`json/obj`, `json/arr`, and so on). `flow_library/json_value`
-reads it back as the parser's sum; neither a new wrapper nor a code carrier is used.
-The source remains beside it. Another operation or child flow can consume this
-decoded tree; no per-key namespace records, schema registry or entity merge are
-created. `library/project_sources` uses the existing `documents` operation for
-readable reference pages and retains the JSON value and original source on each
-JSON reference record in the returned tree. Another flow can consume that complete
-result. The Nenex writer writes those pages; typed decoded values remain in the
-retained step/result cells, not as editable data slots on generated prose documents.
-
-This example stops at decoding and document projection. Selecting useful domain
-structures, derived cells and Grove/Goo views remains authoring work. An explicit
-mapping can supply that next step before other flows consume the structured data.
-
-The native JSON decoder retains ordered object members (including duplicates),
-nulls, exact signed integers and real-number source lexemes. It has a permissive
-numeric dialect, including malformed real lexemes described in `src/foil/json.foil`;
-this adapter is **not** strict RFC validation or domain validation. Original bytes
-remain authoritative evidence. Parse failures, trailing content, unsupported
-formats and unavailable sources refuse before publication. CSV, OSM and domain
-schema adapters are still separate authoring work. No parser is copied into the
-flow library.
-
-These optional pure operations live under `/0x11/gov/flows/operations/library`
-and are registered by the existing example catalogue. They reuse native
-captures, JSON values and `flow/page`; there is no new persistent contract,
-work interpreter, provider, watcher or scheduling layer.
-The helpers are exported by the existing `flow_examples` module. Extending the
-library therefore leaves the service's captured mount descriptor unchanged.
-The added input choices belong to the published Goo declarations. The compact
-subtree/Markdown forms keep their existing defaults because an already running
-HTTP handler retains its captured implementation. Refreshing published behavior
-does not replace that service; no restart or bootstrap patch is needed for the
-declared actions.
-
-The focused native check is `extras/x/check --mount flows --suite flow_library_tests`.
-`--suite flow-authoring-only-tests` compiles the production authoring Grove and
-checks its browser/headless actions, including JSON format and own-record care,
-without loading the Codex surface fixture. The existing
-`--suite flow-reflected-authoring-tests` retains the combined authoring and
-Codex surface coverage; its provider fixture is an explicit test dependency.
-
-**Bind web source** writes an ordinary named URL input and fills `urls`.
-`web_fetch` declares a native work request, `web_sources` converts an accepted
-response to a source envelope, and `decompose`/`documents` prepare the output.
-The HTTP foot performs bounded native `Fetch` calls. It owns transport only;
-the shared hand owns attempts, guarded completion and retry. Requests already
-pending at restart are marked interrupted rather than silently replayed.
-Changing a URL input's `revision` slot explicitly requests another capture.
-There is no HTTP polling scheduler. HTTP errors remain failed attempts and do
-not become current evidence.
-
-The first HTTP flow supports named GET requests and Markdown decomposition.
-HTML and other supported text remain literal evidence. Search-engine choice,
-registry-specific interpretation, PDF/CSV adapters and source-file write-back
-are not implemented by these examples; they require explicit operations and
-authored procedures, not an implicit research daemon.
-
-### Cartography as an authored chain
-
-The example catalogue also supplies **Web evidence**, **Cited assertions**, and
-**Cartography**. These are Semidoc procedures using the existing work lifecycle.
-The parent captures two child definitions, then uses the ordinary document
-revision operation and guarded Nenex writer. `cartography.foil` supplies their
-domain operations through the optional example catalogue; native `flow_install`
-does not depend on it or on the optional graph mount.
-
-From Nenex:
-
-1. Create Web evidence and publish `web_evidence`. Create Cited assertions and
-   publish `cited_assertions`. Their pages are `web_evidence_flow` and
-   `cited_assertions_flow`. Create Cartography and publish `cartography` last.
-2. On `cartography_flow`, use **Bind web source** for each named URL. Reserve the
-   name `review`. The control supplies the `urls` binding. Each bound URL has an
-   **Update web source** control. It checks the previously displayed URL before
-   changing that same record, preserves its other metadata, and wakes the
-   existing maintenance hand. An obsolete update form is refused.
-3. Supply the explicit subject and question as a native record. This can be an
-   ordinary Semidoc heading with a path attribute, authored in Nenex:
-
-   ```text
-   ;. /research_subject
-     ;@ /subject ;/0x11/user/company
-     ;= When was this company founded?
-       Investigate the selected sources without merging identities by name.
-   ```
-
-   Bind `subject` to that heading's raw namespace record, whose address is
-   available from the block tools. A typed native `subject` reference plus
-   `question` text is also accepted. A path attribute explicitly selects live
-   x-care identity; the heading supplies the question when no `question` slot
-   is present.
-4. With the optional graph library published, bind `projection` to the raw
-   `/0x11/gov/graph/report` record. Its ordinary compiled `spun` constructor is
-   the selected policy. To retain the selection, use **Inspect native
-   definitions** on that raw record and bind the resulting frozen cell's
-   `/x/...` view. A live raw binding deliberately follows later publication.
-5. Attach maintenance with a new destination, the existing Nenex writer, and
-   the existing native Codex work provider. Inspect its shared work cell,
-   request evidence, validated value cells, revision overlays and holes.
-
-Web evidence captures explicit HTTP URLs and reuses the existing Markdown
-importer. Cartography accepts Markdown/plain-text sources; HTML, binary media,
-search and registry interpretation need selected adapters. A changed URL record
-or `revision` requests a fresh capture; no network polling scheduler is installed.
-
-Cited assertions bounds extraction, checks exact nonempty quotations against
-captured source bytes, and fixes subject/source identities outside the model's
-response. Acceptance and its reason are explicit provider judgments, not proven
-facts. Collected claims have one stable, source-qualified symbol key each, as
-required by the existing Grove claims norm; their source and proposal references
-remain on the records. The selected projection may select and annotate but cannot rewrite claim
-values or qualifiers. A conflicting selected report or an empty report refuses
-review completion even if the provider claims success. Changed evidence resumes
-the same demand through the native hand; unchanged failures use **Retry work**.
-
-The parent authors a concept from reviewed assertions and adds compact source
-provenance children. Exact captures, rejected proposals, accepted claims and
-judgments remain in work history. The claims are native values in addressable
-work cells; publishing them as independent sovereign assertions requires an
-explicit writer policy. `/r` continues to reflect ordinary typed references,
-including work references; selecting assertion holders requires an explicit
-scope. This procedure does not discover all relationships or infer identity groups.
-
-After explicitly rescanning and publishing changed mount sources, use
-**Declared authoring actions → Refresh installed flow operations** to install
-that publication's flow registrations. This published action reuses the existing
-registration planner and pinned contract checks. It does not replace the saved
-HTTP service or compiler. Already captured flow definitions and attempts stay
-captured. Republish the selected child and parent to update a live maintenance
-attachment. A retained occurrence instead keeps its selected moment: capture
-the new publication, then deliberately adopt it when desired. Adoption controls
-are only offered for retained occurrences.
-
-See [cartography validation](tests/cartography-validation.md) for the controlled
-checks, compiled Grove boundary, live HTTP/Codex run and its limits.
+See the optional [authored example library](../flow-examples/README.md) for learning,
+atlas, ingestion, web evidence, and Cartography recipes.
 
 ### Native provider steps
 
@@ -585,7 +424,8 @@ the page's cell list opens the standalone Cells inspector. The document does not
 mount a generic Cells viewer or start a separate read loop for every cell.
 
 Native reverse-reference and graph views can supply the same input/context
-bindings. Their sovereign-state index changes the core `sov` contract. This
+bindings. Reverse references use the native sovereign-state index; compatibility
+with an existing world depends on its retained core contract. This
 integration is validated in disposable worlds; mounting the flow code is not
 an upgrade mechanism for an older retained kernel. No bootstrap patch or
 automatic conversion of existing worlds is supplied.
@@ -636,9 +476,12 @@ steps and call result as separate events. The parent's selected writer applies t
 final output. Eight nested calls and 128 total executed steps bound expansion.
 
 Revision drafts carry Semidoc source. A writer may declare its native document form
-in `flow/document`; attachment captures that declaration with the selected writer,
-and revision requests retain it. The Nenex writer supplies its document form through
-this boundary. A writer without it gets source-only drafts. Pinned contract shapes,
+in `flow/document` and its materializer in `flow/draft_writer`, using the existing
+writer contract. Attachment captures both; revision requests retain them. The
+Nenex integration supplies its source/attachment-guarded materializer through this
+boundary. A document form without a valid captured materializer fails closed;
+undeclared document forms use source-only drafts. Existing controllers cannot
+silently adopt a new writer policy. Pinned contract shapes,
 including the optional pages payload in `flow/definition`, are unchanged.
 
 The implemented composition is ordered and acyclic. Publication checks names,
@@ -662,8 +505,9 @@ Investigations, answering, document revision and providers use `native_work`:
 - `attempt` opens an activity with its captured reading. `event_record` and
   `append` retain the controller's attempt history.
 - `dispatch` records the exact provider request on the attempt and creates its
-  worker in the same card batch. Repeated dispatch is a no-op; a different request
-  cannot reuse its receipt. `start_provider` also serves direct investigation
+  worker in the same card batch. Repeated dispatch requires the matching retained
+  worker receipt; a different request or missing worker cannot reuse it.
+  `start_provider` also serves direct investigation
   delegation.
 - `result` freezes a provider outcome once. A late or repeated completion cannot
   replace the retained result. `check_outcome` checks successful execution and
@@ -692,7 +536,12 @@ replacement. Detach releases owned hole subscriptions as well as the controller
 subscription and destination claim. Another consumer of the same evidence keeps
 its own subscriptions.
 Cells displays completed revisions from the existing retained-request projection;
-the hand continues to select only current jobs and live hole heads.
+the hand continues to select only current jobs and live hole heads. Adoption and
+detach derive that selection even when a retained controller has not reacted yet.
+Publication settles only owned demands fulfilled in the accepted trace and releases
+their live subscriptions. It removes obsolete failed job selections while retaining
+the allocation serial, accepted jobs and failed attempts. A later unresolved demand
+gets a fresh head; another controller's hole or an unrelated question cannot satisfy it.
 
 The Codex hand owns app-server dispatch and stable turn completion. Its Python
 companion transports bytes and owns the child process. On restart an interrupted
@@ -734,6 +583,11 @@ The writer publishes when all required revisions are ready. It protects edited
 generated prose, refuses collisions and page removal requiring migration, and
 preserves named notes, cells, work and holes. A destination claim prevents
 competing maintainers. Paused and detached controllers retain their evidence.
+The destination's `flows/latest` receipt is also owned: only the same producer
+and source definition can advance it, preserving annotations. Detaching releases
+the claim but retains that provenance. Attaching a different producer to the same
+destination currently refuses at publication; explicit provenance handoff is not
+implemented. Choose a new destination instead of deleting retained receipts.
 The writer shares Nenex's source-edit attachment guard: named work beneath
 numbered prose prevents structural replacement, while safe text edits remain
 possible. Native authoring and source/Goo editing enforce that same rule.
@@ -747,71 +601,11 @@ planning/cascade admission, including the same bounded 128-round cascade and
 atomic refusal policy. Browser and MCP entry points do not choose separate
 reaction limits.
 
-## Handbook example
+## Authored examples
 
-First use **Page tools → Flow examples → Create Evidence sources reusable flow**
-and publish its `evidence_sources` definition. The handbook and Source outline
-both invoke this published procedure.
-
-**Page tools → Flow examples → Open or install handbook example** explicitly
-creates the authoring page and repository capture feed. Publish the definition,
-then bind sources and attach maintenance. An existing handbook is opened without
-replacing its authored source or history. Its declared input defaults and capture
-control live in the page's named `flows/defaults` child, preserving its Semidoc source.
-
-`examples/handbook.semidoc` holds its briefs and dependency declarations.
-`examples.json` declares its repository files, source page, input defaults and
-optional capture setup. These remain
-in the existing flows extra; the Nenex integration registers the example actions
-without instantiating them. Native command installation does not read the catalogue.
-
-Repository capture is host I/O. `host.py` stages each declared file's exact bytes.
-Native source hands expose each file beneath the authoring page's `inputs/sources`;
-the existing merge cell at `cells/sources` combines their named evidence. The
-handbook's declared source dependencies prevent publishing concepts whose required
-evidence is missing.
-Missing files are omitted from the current scan; they do not prevent installing
-or recompiling the harness in another workspace. Each source hand retains its last
-good capture. A feed requires its live file to appear in the configured mount's
-current scan report and not in its missing-file list. Retained bytes and an old
-successful report are not current evidence. Returning identical bytes restores
-the feed without deleting its prior captures. Reading a cell never launches a model.
-Other flows can bind namespace evidence directly or use native `watch_sources`
-to connect one live file under a filesystem mount's destination to a feed.
-
-The filesystem foot reconciles its owned watcher actors whenever its native
-binding changes. A capture configuration has one polling actor, shared by all
-source feeds bound to it. `watch_sources` attaches a feed or, with its current
-native `expected` case, rebinds it. `unwatch_sources` takes that same case guard
-and removes the live dependency while retaining the feed, last good capture and
-history. Ownership is derived from the existing native dependencies, not stored
-in a second owner table. Rebinding releases the old configuration only when no
-other source feed still refers to it. Pausing a maintenance controller does not
-remove its authored source binding.
-
-The existing configuration retains its interval (`fs/watch_seconds`, default
-15 seconds for a newly attached source); `fs/watch_active` records whether its
-source bindings still require polling. Removing or changing a configuration
-cancels its old actor. Every read needs permission from the foot, with at most
-one second between idle cancellation points. An in-flight I/O call may finish,
-but its obsolete generation cannot publish. A completion also checks the exact
-native configuration assertion inside ordinary supervisor admission, then lets
-the existing filesystem hand apply the request and result in one atomic batch.
-Two matching captures stabilize changes; unchanged captures produce no event.
-No work queue or scheduler is added. Captured records and all x/y/z cases remain.
-
-The disposable-world gate is `tests/check-watch-lifecycle.py` (run with `WISP`
-set, or from the core development shell). It uses real file deletion/restoration,
-two authored flows sharing a capture, rebind/detach/reattach, read counters after
-cancellation, and a deliberately blocked read released after detach. The Python
-test driver only changes fixture files; the native supervisor, filesystem foot,
-source hands and cells perform the lifecycle. The core `tests/fs_reconcile` suite
-also checks the worker's termination acknowledgement and rejection of late
-results after an ABA detach/reattach. These tests never open a retained live world.
-
-The small `examples/evidence_resume.semidoc` demonstrates a persistent demand:
-missing `GATE_OPEN` evidence leaves a hole; changed relevant evidence resumes it
-through the same hand. No wall-clock work scheduler is involved.
+The [flow-examples mount](../flow-examples/README.md) supplies the handbook and
+other recipes. Mounting `flows` alone installs neither example helper laws nor
+a catalogue. Example documents still use these same operations and records.
 
 ## World and operations
 
@@ -821,49 +615,36 @@ restore together. `x/eden` uses `$XDG_DATA_HOME/shrine/worlds/NODE` by default;
 `--world PATH` selects another world. Restarts reconnect I/O; completed work is
 not replayed. `--ephemeral` and `--check` use disposable worlds.
 
-Source publication and installed runtime bindings are distinct in the existing
-mount system. After publishing changed modules, reconnect the HTTP foot with a
-restart and use **Page tools → Flows → Refresh harness code**. This uses the same
-registration records as initial installation and admits only changed code records
-in one native batch. Flow refresh owns flow behavior and its Nenex contribution.
-Cooperate and Nenex activate their own hands, document forms and reader; a flow
-refresh cannot roll those dependencies back to its captured imports. It does not
-replace the supervisor's captured Goo interpreter. It does
-not reinstall application seeds or examples, or change controllers,
-captures, destination claims, documents or holes. The native operation is
-`/<node>/gov/flows/refresh_harness` at `/<node>/gov/flows`. Older worlds need one
-initial refresh through the updated flow HTTP handler before their stored page
-tool displays the new control. Captured definitions and old attempts retain their
-chosen laws. Refresh refuses `flow_runtime_requires_type_migration` when live
-controller, claims, question or hole records belong to another nominal type
-moment. Persistent contracts are imported from the mount's explicitly selected
-`pinned_modules`; source scans rebuild their separate `_ops` implementations.
-Once a contract artifact exists, refresh does not read its bootstrap source or
-infer identity from a matching schema. The original module root, type moments,
-and captured dependency graph remain exact. An older combined module can supply
-these types too, so retaining existing work needs no record rewrite.
+Source publication and installed behavior records are distinct. **Refresh harness
+code** admits the selected flow implementation's registrations in one native batch.
+Its native address is `/<node>/gov/flows/refresh_harness`, with
+`/<node>/gov/flows` as receiver. It owns flow commands and their Nenex contribution;
+Cooperate and Nenex activate their own behavior. It preserves controllers, captures,
+claims, documents and holes. A captured refresh command retains its old registrations;
+select the newly published law deliberately. Republish a flow definition separately
+to select new operation laws; old attempts retain their definition and writer.
 
-A deliberately republished contract has new nominal identities. The compatibility
-guard still refuses an incompatible activation. Retained providers and current
-implementations use the same pinned declarations and their ordinary methods;
-there is no cross-revision method fallback or automatic type reuse.
+Persistent declarations come from the mount's explicit `pinned_modules`; their
+separate `_ops` implementations can follow publication. Retention preserves the
+exact module root, type moments and dependency graph, including declarations from
+an older combined module. It does not infer identity from schema equality or read
+bootstrap source once the retained artifact exists. A deliberately republished
+contract has new nominal identities: incompatible live records cause
+`flow_runtime_requires_type_migration`. There is no cross-revision method fallback.
 
-Publish dependencies before their consumers. For Semidoc this includes Web,
-Explorer, Nenex, then flows. An unchanged mount-file snapshot skips compilation;
-when only an imported library changed, invalidate that mount's native
-`/sys/fs/source/snapshot` cache before invoking its existing `op/rescan`.
+Publish dependencies before consumers: Cooperate precedes native `flows`;
+`flow-authoring` additionally follows Nenex and its Web/Explorer dependencies.
+The optional `flow-web` provider follows `flows` independently of Nenex. An unchanged
+mount-file snapshot skips compilation. When only an imported library changed,
+invalidate that mount's `/sys/fs/source/snapshot` cache before invoking its existing
+`op/rescan`. HTTP handlers selected from saved mount images reconnect on restart;
+that is distinct from admitting the new registrations into the namespace.
 
-An existing saved service captures its compiler and core runtime. Restart resumes
-that service; publishing mount records does not replace its captured core code.
-Bootstrap law patching, `x/eden --upgrade`, and the experimental whole-service
-activation API have been removed. The compiler corrections described above apply
-to services built with this checkout; ordinary mount publication does not install
-them into an older saved compiler. See [the publication boundaries](../../../MOUNTS.md).
-Validate core changes in disposable worlds. Republish a flow definition to select
-new operation laws; existing attempts retain their pinned definition and writer.
-An already captured refresh command still supplies its old registrations. Use
-the newly published law, or the handler selected from saved mount images on
-restart, to refresh native behavior records. That does not replace the core service.
+The saved service captures its compiler and core runtime. Restart resumes it;
+mount publication and flow refresh do not replace that captured core. Validate core
+changes in disposable worlds. See [mount publication](../../../MOUNTS.md) and
+[native boundaries](../../HARNESS.md#native-boundaries) for the service, persistence
+and prototype storage-maintenance limits.
 
 Operations under `/<node>/gov/flows/` include `author`, `publish`, `preview`,
 `commit`, `follow`, `submit_revision`, `set_enabled`, `detach`, `import_source`,
@@ -874,14 +655,19 @@ bypass this protocol; the helpers are not an isolation boundary against them.
 
 ## Source organization
 
-`install.foil` assembles the native command/law catalogue without importing Nenex
-or examples. `sources_ops.foil` owns only source feeds and filesystem ownership.
-`nenex_ops.foil` owns page authoring, page-as-evidence binding and the Nenex writer.
-`interface.foil` contributes those adapters and forms to Nenex; `examples.foil`
-registers optional authored recipes. The mount still packages backend and Nenex
-integration together. Public command addresses and pinned contracts are unchanged.
+`install.foil` assembles native commands and laws without routes or examples.
+Document revision invokes its captured draft writer; Nenex supplies its canonical
+guard for attached block work through that writer.
+`sources_ops.foil` owns only source feeds and filesystem ownership.
+`../flow-authoring/nenex_ops.foil` owns page authoring, page-as-evidence binding
+and the Nenex writers. Its `interface.foil` holds document registrations, starter
+templates and shared path/name helpers. `author_controls.foil` is the single
+input adapter for declared authoring actions; `authoring.grove` owns their
+presentation and embedded occurrence controls. `../flow-web/` owns HTTP foot
+activation and transport. The
+optional sibling `flow-examples` owns recipes, pure helper laws, catalogue, evidence
+selection and staging I/O. Public command addresses and pinned contracts are unchanged.
 
-The handbook CLI workflow and bundle adapter have been removed. `tests/client.py`
-is only the transport helper used by disposable integration tests. Filesystem
-evidence uses native captures directly. See `../../HARNESS.md` for the selected
-document-form boundary, captured child-flow composition and its current limits.
+`tests/world.foil` supplies disposable setup and test data shorthand that calls the
+production handlers. `tests/client.py` supplies test transport. Neither defines a
+second production authoring entrypoint. Filesystem evidence uses native captures.

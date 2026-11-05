@@ -1,0 +1,993 @@
+// Native namespace inspection through the mounted /mcp transport.
+// mountViewer(element, source) draws the record the last write touched, resolved, with its flow above.
+// source: { read(path, care, case), answer(path), graph(), follow(handler) }; all requests are native reads.
+// Everything in the renderer is a pure function from data to HTML, reconciled by data-path and data-case.
+// mcpSource({views, who}) is that source over the mount's JSON-RPC at /mcp and its stream at /mcp/stream.
+(function (root) {
+'use strict';
+
+function mountViewer(el, source, opts = {}) {
+  el.classList.add('sv');
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb"><span data-path="">namespace</span></div><div class="sv-qa"></div><div class="sv-when"></div></div><div class="sv-cells"></div><div class="sv-main"><div class="sv-now"></div><div class="sv-earlier"></div></div>`;
+  const $ = sel => el.querySelector(sel);
+  const state = { events: [], shown: null, drawn: false };
+  const views = local(opts.views !== undefined ? opts.views : opts.crumb);   // the page's folder: an agent's QA writes show only on the QA folder's page
+
+  async function index() {
+    const g = await source.graph();
+    const asked = new Map();
+    for (const c of g.cells) for (const i of c.inputs) { const k = i.path.replace(/^\/x\//, ''); (asked.get(k) || asked.set(k, []).get(k)).push({ ...c, pin: i.pin, view: !!i.view }); }
+    source._asked = asked; source._cells = new Map(g.cells.map(c => [c.path, c]));
+  }
+  async function fillAction(det, ev, openRecords) {
+    const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
+    const paths = ev.shown ? [ev.shown.path] : (ev.records || ev.touched);
+    openRecords = openRecords && paths.length <= 8;   // a big batch opens record by record, on a click
+    const items = await Promise.all(paths.map(async p => {
+      const r = await source.read(p, ev.shown ? (ev.shown.care || 'y') : 'x', ev.shown ? ev.shown.case : 0);
+      let line;
+      if (r && r.record === null) return '';                                                   // deleted: not listed
+      else if (r && isCell(r.record)) { const a = await source.answer(p); if (a.bad === 'unknown') return ''; line = `<span class="m ${a.bad ? 'bad' : a.note ? 'note' : ''}">${esc(a.bad || a.note || (a.tree ? summary(a.tree) : ''))}</span>`; }
+      else line = `<span class="m">${r ? lineHTML(r.record) : ''}</span>`;
+      return `<details class="sv-recd" data-path="${esc(p)}" ${openRecords ? 'open' : ''}><summary><span class="n">${esc(last(p))}</span>${goHTML(p, folderOf(p), p, 'p')}${line}</summary><div class="body"></div></details>`;
+    }));
+    body.innerHTML = items.join('');
+    for (const d of body.querySelectorAll('details.sv-recd')) { if (d.open) await fillRecord(d, ev, 'y'); d.addEventListener('toggle', () => d.open && fillRecord(d, ev, 'z')); }
+  }
+  // a record opened by the page shows itself and its children (y); one the person opens shows its whole subtree (z)
+  async function fillRecord(det, ev, care) {
+    const body = det.querySelector('.body'); if (body.dataset.filled) return; body.dataset.filled = '1';
+    const r = await source.read(det.dataset.path, ev.shown && ev.shown.care === 'z' ? 'z' : care, ev.shown ? ev.shown.case : 0);
+    body.innerHTML = r ? await recordHTML(source, r, false, new Set()) : '';
+    if (r && source.referencedBy) { try { body.innerHTML += referencedHTML(await source.referencedBy(det.dataset.path)); } catch (e) { /* a mount without the knob */ } }
+  }
+
+  // the QA chip: the score of an agent's QA tree, when one exists; a click flips the page to that folder
+  async function chip() {
+    if (!source.qa) return;
+    const q = await source.qa();
+    $('.sv-qa').innerHTML = q ? qaChipHTML(q) : '';
+    const a = $('.sv-qa a'); if (a) a.addEventListener('click', e => { e.preventDefault(); if (opts.flip) opts.flip(q.folder); else nav('?views=/' + q.folder); });
+  }
+  async function draw(ev) {
+    state.drawn = true;
+    source.beginFrame?.();
+    await index();
+    $('.sv-cells').innerHTML = cellsHTML([...source._cells.values()]);
+    chip().catch(() => {});
+    const nowEl = $('.sv-now'), earlier = $('.sv-earlier');
+    nowEl.innerHTML = actionHTML(source, ev, true);
+    const det = nowEl.querySelector('details.sv-act'); await fillAction(det, ev, true);
+    earlier.innerHTML = state.events.filter(e => e !== ev).slice().reverse().map(e => actionHTML(source, e, false)).join('');
+    for (const d of earlier.querySelectorAll('details.sv-act')) d.addEventListener('toggle', () => { if (!d.open) return; const e = state.events.find(x => String(x.epoch) === d.dataset.epoch); fillAction(d, e, false); });
+    $('.sv-when').innerHTML = ev.shown ? `<span class="shown">shown as is</span>` : `now <b>${ev.epoch}</b>`;
+  }
+
+  async function show(ev) {
+    try { await draw(ev); return true; }
+    catch (error) { $('.sv-now').innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`; return false; }
+  }
+  const inside = p => !views || p === views || p.startsWith(views + '/');
+  const following = source.follow(async msg => {
+    if (msg.shown) {
+      // presented off this page's folder: the page moves there, so the person sees what the agent showed
+      if (!inside(msg.shown.path)) { const folder = folderOf(msg.shown.path); if (opts.flip) return opts.flip(folder); if (root.location) { nav('?views=/' + folder); return; } }
+      const ev = { epoch: 'shown', label: 'show ' + msg.shown.path, who: 'agent', touched: [], shown: msg.shown }; return show(ev);
+    }
+    if (!msg.touched || !msg.touched.length) return;
+    // the agent's QA stays behind the chip; housekeeping, deletions and unknowns are never shown: when such a line closes
+    // the backlog, the last real event is drawn instead
+    if (qaHidden(msg, views) || quietLine(msg)) { if (!msg.quiet && !state.drawn && state.events.length) return show(state.events[state.events.length - 1]); return; }
+    state.events.push(msg); if (msg.quiet) return;   // quiet: the backlog on load, kept for `earlier` and drawn with the last
+    return show(msg);
+  });
+  if (opts.crumb !== undefined) $('.sv-crumb').innerHTML = crumbHTML(opts.crumb);
+  // Navigation is local to the inspector. Native state is never written.
+  async function go(path, folder) {
+    if (opts.flip) opts.flip(folder); else nav('?at=/' + local(path));
+  }
+  el.addEventListener('click', e => {
+    const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
+    e.preventDefault(); go(a.dataset.go, a.dataset.folder);
+  });
+  return { draw, go, stop: () => following?.stop() };
+}
+
+// what a write moved: the cells that read any touched path, one hop
+const moved = (source, touched) => { const out = new Set(); for (const t of touched) for (const q of (source._asked.get(t) || [])) out.add(last(q.path) + (q.answer ? ' ' + q.answer : '')); for (const t of touched) { const seg = t.split('/'); for (let i = seg.length - 1; i > 0; i--) for (const q of (source._asked.get(seg.slice(0, i).join('/')) || [])) out.add(last(q.path) + (q.answer ? ' ' + q.answer : '')); } return [...out]; };
+
+// an agent's QA writes stay behind the chip: an event whose every written record sits under /<node>/agent/<name>/qa is
+// drawn only when the page's views folder is that QA folder or inside it; its score still reaches the chip through qa()
+const qaFolderOf = p => { const m = /^([^/]+\/agent\/[^/]+\/qa)(\/|$)/.exec(p); return m ? m[1] : null; };
+// housekeeping: a seen mark, the hands' folder, the person's cursor, the clock, the journal
+const HOUSEKEEPING = /\/agent\/[^/]+\/seen$|\/agent\/hands(\/|$)|\/agent\/person(\/|$)|\/agent\/launcher(\/|$)|\/clock$|\/agent\/journal(\/|$)/;
+const HANDS = /^(clock|source|web|links)(_|$)/;
+// a line the page never shows: a hand's, one that only moved housekeeping records, one that only deleted things,
+// or one whose written cells all read unknown; what remains is the person's and the agents' work on the data
+const quietLine = ev => {
+  if (ev.shown) return false;
+  if (HANDS.test(ev.who || '')) return true;
+  const all = ev.touched || [], t = all.filter(p => !/\/agent\/journal(\/|$)/.test(p) && !all.some(q => q !== p && q.startsWith(p + '/')));   // the deepest paths, the journal aside
+  if (t.length > 0 && t.every(p => HOUSEKEEPING.test(p))) return true;
+  const w = ev.with && typeof ev.with === 'object' ? Object.entries(ev.with).filter(([k]) => !/^\/x\/|^\/c\/x\//.test(k)) : [];
+  const nothing = ([k, v]) => !v || v.exists === false || (v.properties && '/sys/weft' in v.properties && ev.with['/x' + k] && ev.with['/x' + k].exists === false);
+  return w.length > 0 && w.every(nothing);
+};
+const qaHidden = (ev, views) => {
+  const recs = ev.records || ev.touched || []; if (ev.shown || !recs.length) return false;
+  const folders = recs.map(qaFolderOf); if (folders.includes(null)) return false;
+  const at = local(views); return !folders.some(f => at === f || at.startsWith(f + '/'));
+};
+// one action: a line; opens into its records, each a line that opens into the card
+function actionHTML(source, ev, open) {
+  const n = (ev.records || ev.touched).length, more = ev.count && ev.count > n + 3 ? '+' : '', mv = moved(source, ev.touched);
+  const sum = `<summary><span class="ep">${ev.shown ? 'shown' : ev.epoch}</span><span class="lab">${esc(ev.label)}</span><span class="who">${esc(ev.who)}</span><span class="cnt">${ev.shown ? esc(ev.shown.path) : n + more + (n === 1 ? ' record' : ' records')}</span>${mv.length ? `<span class="mv">${esc(mv.slice(0, 3).join(' · '))}${mv.length > 3 ? ' …' : ''}</span>` : ''}</summary>`;
+  return `<details class="sv-act" data-epoch="${ev.epoch}" ${open ? 'open' : ''}>${sum}<div class="body"></div></details>`;
+}
+
+// what references a record: cells and rows as links, a cell waiting there marked; nothing when nothing does
+function referencedHTML(rb) {
+  const ms = rb.matches || [], ws = rb.watchers || [];
+  if (!ms.length && !ws.length) return '';
+  const row = m => `<div class="sv-refby ${m.cell ? 'cell' : 'rec'} ${m.hole ? 'hole' : ''}">${goHTML(m.path, folderOf(m.path), last(m.path), 'ref')}<span class="s">${esc(m.slot)}</span>${m.hole ? '<span class="h">waiting</span>' : ''}</div>`;
+  return `<div class="sv-refd"><div class="k">referenced by</div>${ms.map(row).join('')}${ws.map(w => `<div class="sv-refby crew">${goHTML(w.path, folderOf(w.path), last(w.path), 'ref')}<span class="s">crew, ${esc(w.care)}</span></div>`).join('')}</div>`;
+}
+
+// the QA chip: green and quiet at zero, the count otherwise; the href is the QA folder on this same page
+function qaChipHTML(q) {
+  const n = Number(q.changed) || 0;
+  return `<a class="sv-chip ${n ? 'off' : 'ok'}" href="?views=/${esc(q.folder)}" title="QA: ${n ? n + ' check' + (n === 1 ? '' : 's') + ' disagree' : 'every check agrees'}">QA ${n}</a>`;
+}
+// the context tree as the agent reads it: a node per line, its slots after it, children indented
+function contextTreeHTML(node, depth = 0) {
+  if (!node) return '';
+  const slots = Object.entries(node.slots || {}).filter(([k]) => !k.startsWith('sys/') && k !== 'formula' && k !== 'over');
+  const line = `<div class="sv-tn" style="padding-left:${depth * 14}px"><span class="n">${esc(depth ? node.name : 'context')}</span>${slots.map(([k, v]) => `<span class="s"><span class="k">${esc(k)}</span> ${valueHTML(v, 'v')}</span>`).join('')}</div>`;
+  return line + (node.kids || []).map(k => contextTreeHTML(k, depth + 1)).join('');
+}
+// the standing outline: every cell of the views folder with what it says now (the scoreboard, the bug list, the plan)
+function cellsHTML(cells) {
+  if (!cells.length) return '';
+  return `<div class="sv-outline">${cells.map(c => `<div class="sv-cell ${c.bad ? 'bad' : c.note ? 'note' : ''}" data-path="${esc(c.path)}"><span class="n">${esc(c.rel || last(c.path))}</span><span class="f">${esc(c.formula)}</span><span class="a">${esc(c.bad || c.note || c.answer || '')}</span></div>`).join('')}</div>`;
+}
+// ---------- rendering ----------
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+const liveHref = p => '/live?views=' + encodeURIComponent(world(p));
+const last = p => p ? p.split('/').pop() : 'namespace';
+// a record's folder is the one above it; a reference names the thing a cell reads, usually a folder, so it is its own
+const folderOf = p => { const i = String(p).lastIndexOf('/'); return i > 0 ? p.slice(0, i) : p; };
+// Native paths remain ordinary links in the read-only inspector.
+// a path the person can click: the page opens that record (its slots, what is beneath it, what points at it), keeping the
+// Navigating does not change the namespace or an agent's context.
+let navigateTo = null;   // set by start(): in-page navigation; before that, or in a test, the location itself
+const nav = search => { if (navigateTo) navigateTo(search); else root.location.search = search; };
+const goHTML = (path, folder, text, cls) => `<a class="${cls} go" href="?at=/${esc(local(path))}" data-go="${esc(path)}" data-folder="${esc(folder)}">${esc(text)}</a>`;
+const isCell = rec => !!rec && typeof rec.formula === 'string' && (rec.formula.startsWith('-> /weft/stdlib/') || rec.formula === 'native overlay');
+const refOf = s => { const m = /^-> (\S+)(?: @ (\d+))?$/.exec(s || ''); return m ? { path: m[1], pin: m[2] ? Number(m[2]) : null } : null; };
+
+// a number as text: a year (four digits) or a day (eight digits, YYYYMMDD) is drawn as written, a quantity grouped
+const numText = v => (Number.isInteger(v) && (String(v).length === 4 || String(v).length === 8)) ? String(v) : v.toLocaleString();
+// a postal code is a label, not a quantity: drawn as written whatever its length
+const labelled = (k, v) => (Number.isInteger(v) && /(^|[/_])(zip|zip_code|postal|postcode)$/i.test(String(k))) ? String(v) : v;
+// one value, by kind; the only place a value's kind is decided
+function valueHTML(v, cls = 'sv-v') {
+  if (typeof v === 'number') return `<span class="${cls}">${numText(v)}</span>`;
+  const s = String(v);
+  const r = refOf(s); if (r) { const p = r.path.replace(/^\/x\//, ''); return `<span class="${cls} ref" data-path="${esc(p)}">${goHTML(p, p, s, 'r')}</span>`; }
+  if (/^data:image\//.test(s)) return `<span class="${cls} blob"><img alt="" src="${esc(s)}" style="max-width:100%;max-height:320px;border-radius:4px"></span>`;
+  if (/^\/(?:0x[0-9a-f]+|o|x|c|h)\//i.test(s)) return `<a class="${cls} ref" href="${liveHref(s)}">${esc(s)}</a>`;
+  if (/^blob:/.test(s)) { const [, hash, mime, size] = s.split(':'); return `<span class="${cls} blob">${mime && mime.startsWith('image') ? `<img alt="" src="/blob/${esc(hash)}">` : ''}${esc(hash.slice(0, 8))} &middot; ${esc(size || '')}</span>`; }
+  if (s === 'yes' || s === 'no') return `<span class="${cls} flag ${s}">${s}</span>`;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return `<span class="${cls}">${esc(s)}</span>`;
+  return `<span class="${cls} text">${esc(s)}</span>`;
+}
+const isShort = v => typeof v === 'number' || String(v).length < 24;
+
+// the record body: layout chosen from the slots handed in (GUIDE.md section 2)
+function slotLayout(slots) {
+  const s = Object.entries(slots || {});
+  if (!s.length) return '';
+  if (s.length === 1 && typeof s[0][1] === 'number') return `<div class="sv-one">${numText(s[0][1])}<span class="u">${esc(s[0][0])}</span></div>`;
+  const long = s.some(([, v]) => typeof v !== 'number' && String(v).length > 80);
+  if (s.length > 6 || long) return `<div class="sv-list">${s.map(([k, v]) => `<span class="sv-k">${esc(k)}</span>${valueHTML(labelled(k, v))}`).join('')}</div>`;
+  return `<div class="sv-grid">${s.map(([k, v]) => `<div class="s ${isShort(v) ? '' : 'wide'}"><span class="sv-k">${esc(k)}</span>${valueHTML(labelled(k, v))}</div>`).join('')}</div>`;
+}
+
+async function rowSlots(source, node) {
+  let slots = node.slots;
+  if (isCell(slots)) { const r = await source.answer(node.path); slots = r.tree ? (Object.keys(r.tree.slots).length ? r.tree.slots : { '': r.tree.kids.length + ' rows' }) : { '': r.note || r.bad }; }
+  return Object.entries(slots).filter(([k]) => k !== 'scale' && !k.endsWith('/scale')).map(([k, v]) => `<span>${k ? `<span class="k">${esc(k)}</span>` : ''}${valueHTML(labelled(k, v), 'v')}</span>`).join('');   // a scale rides with its number, it is not a fact of the row
+}
+
+async function kidHTML(source, node, depth, bump) {
+  const s = Object.keys(node.slots || {}).length;
+  const row = `<div class="sv-row ${bump.has(node.path) ? 'bump' : ''}" data-path="${esc(node.path)}" data-case="${node.case || ''}"><span class="n ${s ? '' : 'folder'}">${esc(node.name)}</span><span class="sl">${await rowSlots(source, node)}</span></div>`;
+  const kids = node.kids || [];
+  const inner = !kids.length ? '' : depth >= 3 ? `<div class="sv-row"><span class="more">${kids.length} beneath</span></div>` : (await Promise.all(kids.map(k => kidHTML(source, k, depth + 1, bump)))).join('');
+  return `<div class="sv-kid">${row}${askedHTML(source, node.path, 1)}${inner}</div>`;
+}
+
+async function recordHTML(source, r, showPath, bump) {
+  const node = { name: last(r.path), path: r.path, slots: r.record || {}, kids: r.kids || [] };
+  let body;
+  if (r.record === null) body = `<div class="sv-gone">deleted</div>`;
+  else if (isCell(node.slots)) {
+    // a cell's card: the result first, at its care (a figure, or the rows), then the formula and its settings folded,
+    // then the chain the result came up, then what was asked of it; what references it follows the card
+    const a = await source.answer(node.path);
+    const { formula, over, ...settings } = node.slots;
+    const made = `<details class="sv-made"><summary>${formula === "native overlay" ? "made of " : esc(formula.slice(16))}${over ? ' over ' + esc(String(over).replace(/^-> /, '')) : ''}</summary>${slotLayout(settings)}</details>${chainHTML(source, node.path)}`;
+    if (a.bad) body = `<div class="sv-note bad">${esc(a.bad)}</div>${made}`;
+    else if (a.note) body = `<div class="sv-note">${esc(a.note)}</div>${made}`;
+    else body = `${slotLayout(a.tree.slots)}${a.tree.kids.length ? `<div class="sv-kids">${(await Promise.all(a.tree.kids.map(k => kidHTML(source, k, 1, bump)))).join('')}</div>` : ''}${made}`;
+  } else body = `${slotLayout(node.slots)}${node.kids.length ? `<div class="sv-kids">${(await Promise.all(node.kids.map(k => kidHTML(source, k, 1, bump)))).join('')}</div>` : ''}`;
+  return `<div class="sv-rec ${bump.has(node.path) ? 'bump' : ''}" data-path="${esc(node.path)}" data-case="${r.case || ''}"><div class="sv-head"><span class="n">${esc(node.name)}</span>${showPath ? `<span class="p">${esc(node.path)}</span>` : ''}</div>${body}${askedHTML(source, node.path, 1)}</div>`;
+}
+
+
+
+
+// ---------- the composition as an outline: what was asked of a thing hangs beneath it ----------
+function askedHTML(source, path, depth, seen = new Set()) {
+  const qs = (source._asked && source._asked.get(path)) || [];
+  if (!qs.length || depth > 4 || seen.has(path)) return '';
+  seen = new Set(seen); seen.add(path);
+  return `<div class="sv-asked">${qs.map(q => {
+    const other = q.inputs.filter(i => i.path.replace(/^\/x\//, '') !== path).map(i => `<span class="o">+ ${esc(last(i.path.replace(/^\/x\//, '')))}</span>`).join('');
+    const meta = q.bad ? `<span class="m bad">${esc(q.bad)}</span>` : q.note ? `<span class="m note">${esc(q.note)}</span>` : `<span class="m">${esc(q.answer || '')}</span>`;
+    return `<div class="sv-q"><div class="l" data-path="${esc(q.path)}"><span class="f">${esc(q.view ? 'view' : q.formula)}${q.pin ? ` · held at ${q.pin}` : ''}</span><span class="n">${esc(last(q.path))}</span>${other}${meta}</div>${askedHTML(source, q.path, depth + 1, seen)}</div>`;
+  }).join('')}</div>`;
+}
+function fromHTML(source, path) {
+  const c = source._cells && source._cells.get(path); if (!c) return '';
+  return `<div class="sv-from"><span class="f">${esc(c.formula)}</span>${c.inputs.map(i => { const p = i.path.replace(/^\/x\//, ''); return `<span class="sv-pill ${source._cells.has(p) ? 'cell' : ''}" data-path="${esc(p)}">${esc(source._cells.has(p) ? last(p) : p)}${i.pin ? `<span class="pin">held at ${i.pin}</span>` : ''}${i.view ? '<span class="pin">view</span>' : ''}</span>`; }).join('')}</div>`;
+}
+// the chain a cell's answer came up: one line per stage, walked upward by the tack (the first input) while it is a
+// cell of the folder, the formula and its settings, the input as a link, a pin or a secondary input noted
+function chainHTML(source, path) {
+  const cells = source._cells; if (!cells || !cells.has(path)) return '';
+  const lines = [], seen = new Set(); let p = path;
+  while (cells.has(p) && !seen.has(p) && lines.length < 8) {
+    seen.add(p); const c = cells.get(p);
+    const tack = c.inputs.find(i => !i.view) || c.inputs[0], others = c.inputs.filter(i => i !== tack);
+    const ip = tack ? tack.path.replace(/^\/x\//, '') : '';
+    const link = !ip ? '' : cells.has(ip) ? goHTML(ip, folderOf(ip), last(ip), 'r cell') : goHTML(ip, ip, ip, 'r');
+    lines.push(`<div class="sv-stage"><span class="f">${esc(c.formula)}</span>${c.settings ? `<span class="s">${esc(c.settings)}</span>` : ''}<span class="over">over</span>${link}${tack && tack.pin ? `<span class="pin">held at ${tack.pin}</span>` : ''}${others.map(o => { const op = o.path.replace(/^\/x\//, ''); return `<span class="o">+ ${goHTML(op, cells.has(op) ? folderOf(op) : op, cells.has(op) ? last(op) : op, 'r')}${o.pin ? ` held at ${o.pin}` : ''}</span>`; }).join('')}</div>`);
+    p = ip;
+  }
+  return `<div class="sv-chain">${lines.join('')}</div>`;
+}
+
+// ---------- the world, drawn: what was written on the left growing down, what was asked to the right growing out ----------
+// g = { sources: [{path, meta}], cells: [{path, formula, settings, answer, note, bad, inputs: [{path, pin, view}]}] }
+const W = { col: 224, row: 38, pillW: 168, pillH: 24, padX: 18, padY: 10 };
+function worldGraphHTML(g, focus, bump) {
+  const byPath = new Map();
+  for (const s of g.sources) byPath.set(s.path, { ...s, kind: 'data', depth: 0, ins: [] });
+  for (const c of g.cells) byPath.set(c.path, { ...c, kind: 'cell', depth: null, ins: c.inputs.map(i => ({ ...i, path: i.path.replace(/^\/x\//, '') })) });
+  // depth: longest path from a source; unknown inputs count as depth 0 sources
+  for (const n of byPath.values()) for (const i of n.ins) if (!byPath.has(i.path)) byPath.set(i.path, { path: i.path, meta: '', kind: 'data', depth: 0, ins: [] });
+  let changed = true, guard = 0;
+  while (changed && guard++ < 50) { changed = false; for (const n of byPath.values()) { if (n.kind !== 'cell') continue; const ds = n.ins.map(i => byPath.get(i.path).depth); if (ds.some(d => d === null)) continue; const d = Math.max(0, ...ds) + 1; if (n.depth !== d) { n.depth = d; changed = true; } } }
+  for (const n of byPath.values()) if (n.depth === null) n.depth = 1;   // a cycle: park it in column one
+  // rows: sources in path order; a cell wants the mean of its inputs' rows, then is pushed down past the last in its column
+  const cols = new Map();
+  for (const n of byPath.values()) (cols.set(n.depth, cols.get(n.depth) || []), cols.get(n.depth).push(n));
+  const D = Math.max(...cols.keys());
+  cols.get(0).sort((a, b) => a.path.localeCompare(b.path)).forEach((n, i) => n.y = i);
+  for (let d = 1; d <= D; d++) {
+    const col = (cols.get(d) || []).map(n => ({ n, want: n.ins.length ? n.ins.reduce((a, i) => a + (byPath.get(i.path).y || 0), 0) / n.ins.length : 0 })).sort((a, b) => a.want - b.want || a.n.path.localeCompare(b.n.path));
+    let lastY = -1; for (const { n, want } of col) { n.y = Math.max(want, lastY + 1); lastY = n.y; }
+  }
+  const nodes = [...byPath.values()], maxY = Math.max(0, ...nodes.map(n => n.y));
+  const X = n => W.padX + n.depth * W.col, Y = n => W.padY + n.y * W.row;
+  const width = W.padX * 2 + D * W.col + W.pillW, height = W.padY * 2 + maxY * W.row + W.pillH;
+  const edges = [];
+  for (const n of nodes) if (n.kind === 'cell') n.ins.forEach((i, k) => edges.push({ from: byPath.get(i.path), to: n, label: i.view ? 'view' : n.formula, sub: i.view ? '' : (n.settings || ''), pin: i.pin }));
+  const paths = edges.map(e => {
+    const x1 = X(e.from) + W.pillW, y1 = Y(e.from) + W.pillH / 2, x2 = X(e.to), y2 = Y(e.to) + W.pillH / 2, mx = (x1 + x2) / 2;
+    const lit = bump.has(e.to.path) || bump.has(e.from.path);
+    // the label sits three quarters along the curve, so labels of edges into different targets separate
+    const t = 0.74, u = 1 - t, lx = u * u * u * x1 + 3 * u * u * t * mx + 3 * u * t * t * mx + t * t * t * x2, ly = u * u * u * y1 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y2;
+    return `<path class="${lit ? 'lit' : ''}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/><text x="${lx}" y="${ly - 4}" text-anchor="middle"><title>${esc(e.sub)}</title>${esc(e.label)}${e.pin ? ` · held at ${e.pin}` : ''}</text>`;
+  }).join('');
+  const pills = nodes.map(n => {
+    const here = n.path === focus, cls = (n.kind === 'cell' ? 'cell' : 'data') + (here ? ' here' : '') + (bump.has(n.path) ? ' bump' : '') + (n.bad ? ' bad' : n.note ? ' note' : '');
+    const label = n.kind === 'cell' ? last(n.path) : n.path, meta = n.kind === 'cell' ? (n.bad || n.note || n.answer) : n.meta;
+    return `<span class="sv-pill ${cls}" data-path="${esc(n.path)}" style="left:${X(n)}px;top:${Y(n)}px;width:${W.pillW}px"><span class="l">${esc(label)}</span><span class="m">${esc(meta || '')}</span></span>`;
+  }).join('');
+  return `<div class="sv-tree" style="width:${width}px;height:${height}px"><svg width="${width}" height="${height}" aria-hidden="true">${paths}</svg>${pills}</div>`;
+}
+
+// ---------- the context tree: upstream to the left, the focus, what reads it to the right ----------
+const G = { col: 236, row: 40, pillW: 172, pillH: 24, padX: 18, padY: 10 };
+function graphHTML(root, deps) {
+  // upstream layout: leaves get rows first, a node sits at the mean of its inputs; depth = longest path from a leaf
+  const nodes = [], edges = []; let rows = 0;
+  const place = node => {
+    const ins = node.kind === 'cell' ? node.inputs : [];
+    const placed = ins.map(place);
+    const y = placed.length ? placed.reduce((a, c) => a + c.y, 0) / placed.length : rows++;
+    const depth = placed.length ? Math.max(...placed.map(c => c.depth)) + 1 : 0;
+    const me = { ...node, y, depth, id: nodes.length }; nodes.push(me);
+    for (const c of placed) edges.push({ from: c, to: me, label: node.formula, sub: node.settings || '' });
+    return me;
+  };
+  const focus = place(root); focus.here = true;
+  const D = focus.depth;
+  // downstream: cells that read the focus, one column to the right, centred on the focus
+  const start = focus.y - (deps.length - 1) / 2;
+  deps.forEach((d, i) => { const me = { kind: 'cell', path: d.path, answer: d.answer, formula: d.formula, settings: d.settings, y: start + i, depth: D + 1, id: nodes.length }; nodes.push(me); edges.push({ from: focus, to: me, label: d.formula, sub: d.settings || '' }); });
+  const minY = Math.min(...nodes.map(n => n.y)), maxY = Math.max(...nodes.map(n => n.y));
+  const X = n => G.padX + n.depth * G.col, Y = n => G.padY + (n.y - minY) * G.row;
+  const W = G.padX * 2 + (D + (deps.length ? 1 : 0)) * G.col + G.pillW, H = G.padY * 2 + (maxY - minY) * G.row + G.pillH;
+  const paths = edges.map(e => {
+    const x1 = X(e.from) + G.pillW, y1 = Y(e.from) + G.pillH / 2, x2 = X(e.to), y2 = Y(e.to) + G.pillH / 2, mx = (x1 + x2) / 2;
+    return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/><text x="${mx}" y="${(y1 + y2) / 2 - 3}" text-anchor="middle"><title>${esc(e.sub)}</title>${esc(e.label)}</text>`;
+  }).join('');
+  const pills = nodes.map(n => {
+    const cls = n.kind === 'cell' ? 'cell' + (n.here ? ' here' : '') : (n.here ? 'here' : '');
+    const label = n.kind === 'cell' ? last(n.path) : n.path, meta = n.kind === 'cell' ? n.answer : n.meta;
+    return `<span class="sv-pill ${cls}" data-path="${esc(n.path)}" style="left:${X(n)}px;top:${Y(n)}px;width:${G.pillW}px"><span class="l">${esc(label)}</span>${n.pin ? `<span class="pin">held at ${n.pin}</span>` : ''}<span class="m">${esc(meta || '')}</span></span>`;
+  }).join('');
+  return `<div class="sv-tree" style="width:${W}px;height:${H}px"><svg width="${W}" height="${H}" aria-hidden="true">${paths}</svg>${pills}</div>`;
+}
+
+function stripHTML(node, here) {
+  const pill = (cls, path, label, meta, pin) => `<span class="sv-pill ${cls}" data-path="${esc(path)}">${esc(label)}${pin ? `<span class="pin">held at ${pin}</span>` : ''}<span class="m">${esc(meta)}</span></span>`;
+  if (node.kind === 'data') return pill('', node.path, node.path, node.meta, node.pin);
+  const ins = node.inputs.length === 1 ? stripHTML(node.inputs[0], false) : `<span class="sv-join">${node.inputs.map(i => `<span class="sv-branch">${stripHTML(i, false)}</span>`).join('')}</span>`;
+  return `${ins}<span class="sv-arrow"><span class="f">${esc(node.formula)}</span><span class="a"></span></span>${pill('cell' + (here ? ' here' : ''), node.path, last(node.path), node.answer, node.pin)}`;
+}
+
+function crumbHTML(p) {
+  const parts = p ? p.split('/') : [];
+  return `<span data-path="">namespace</span>` + parts.map((c, n) => n === parts.length - 1 ? `<span class="sep">/</span><span class="here">${esc(c)}</span>` : `<span class="sep">/</span><span data-path="${esc(parts.slice(0, n + 1).join('/'))}">${esc(c)}</span>`).join('');
+}
+
+// keep DOM for nodes whose (path, case) did not change; replace the rest
+function reconcile(container, html) {
+  const next = document.createElement('div'); next.innerHTML = html;
+  const old = new Map();
+  for (const n of container.querySelectorAll('[data-path][data-case]')) if (n.dataset.case) old.set(n.dataset.path + '@' + n.dataset.case, n);
+  for (const n of next.querySelectorAll('[data-path][data-case]')) {
+    const k = n.dataset.path + '@' + n.dataset.case; const prev = old.get(k);
+    if (prev && !n.classList.contains('bump') && prev.outerHTML.length === n.outerHTML.length) n.replaceWith(prev);
+  }
+  container.replaceChildren(...next.childNodes);
+}
+
+// ---------- read-only adapter over the mounted native MCP transport ----------
+// Paths in the viewer are world paths without their leading slash (`0x11/user/org/deals`), the demo's spelling, so
+// `/x/` + path is a cell's answer; `world()` puts the slash back for the wire and `local()` takes it off.
+const world = p => '/' + String(p || '').replace(/^\//, '');
+const local = p => String(p || '').replace(/^\//, '');
+// a reference's spelling: /h/<care>/<case>/<len>/<path>, case 0 live, e<epoch> as of an epoch
+const spelling = s => { const m = /^\/h\/([xyz])\/(e?\d+)\/\d+(\/.*)$/.exec(String(s)); return m ? { care: m[1], case: m[2], path: m[3] } : null; };
+const asInput = p => p.startsWith('/x/') ? '/x/' + local(p.slice(3)) : local(p);
+// one value: a number as text becomes a number, a reference `-> path @ case`, a large or typed value its text
+function valueOf(v) {
+  if (v && typeof v === 'object') return v.size !== undefined ? `${v.type}, ${Number(v.size).toLocaleString()} bytes` : valueOf(v.value);
+  const s = String(v), r = spelling(s);
+  if (r) return '-> ' + asInput(r.path) + (r.case !== '0' ? ' @ ' + r.case.replace(/^e/, '') : '');
+  return /^\d+$/.test(s) ? Number(s) : s;
+}
+// a record's properties as the viewer's slots: keys without their slash; a cell's weft as `formula`, its tack as `over`
+// a value over 8 KB is kept as parts <slot>/<n> (a read shows a longer value only by its size); the parts read as one slot
+function slotsOf(props) {
+  const out = {}, parts = {};
+  for (const [k, v] of Object.entries(props || {})) {
+    const key = k.replace(/^\//, '');
+    const m = /^(.+)\/(\d+)$/.exec(key);
+    if (key === 'sys/weft') { const r = spelling(String(v)); out.formula = r ? '-> /weft/stdlib/' + r.path.split('/').pop() : 'native overlay'; }
+    else if (key === 'sys/tack') out.over = valueOf(v);
+    else if (m && typeof v === 'string' && !(m[1] in out)) (parts[m[1]] = parts[m[1]] || [])[Number(m[2])] = v;
+    else out[key] = valueOf(v);
+  }
+  for (const [key, ps] of Object.entries(parts)) if (!(key in out)) out[key] = ps.join('');
+  return out;
+}
+// a read answer's node as a tree node; a shell (`paged`) is a node with nothing of its own
+function nodeOf(n) {
+  const path = local(n.path), c = spelling(n.reference || '');
+  return { name: last(path), path, slots: n.paged ? {} : slotsOf(n.properties), kids: (n.children || []).map(nodeOf), case: c ? c.case : '' };
+}
+// a read answer as the viewer's read: record null for a culled path (no record, but a case), {} for a bare folder
+function readOf(a) {
+  const node = nodeOf(a);
+  return { path: node.path, record: a.exists === false && !node.kids.length ? (a.reference ? null : {}) : node.slots, kids: node.kids, case: node.case, next: a.next || null };
+}
+// a cell's answer from its /x and /c/x: the fault or note from the context, else the tree (unknown when /x is empty)
+function answerOf(path, x, c) {
+  const ctx = (c && c.properties) || {};
+  if (c && c.error) return { bad: c.error };
+  if (ctx['/sys/view/fault']) return { bad: ctx['/sys/view/fault'] };
+  if (ctx['/sys/view/missing']) return { note: ctx['/sys/view/missing'] };
+  if (!x || x.error) return { bad: (x && x.error) || 'unknown' };
+  if (x.exists === false && !(x.children || []).length) return ctx['/sys/view/asking'] ? { note: ctx['/sys/view/asking'] } : { bad: 'unknown' };
+  const tree = nodeOf(x); tree.path = local(path); tree.name = last(tree.path);
+  return { tree };
+}
+// what an answer is, in a few words: its first figure, else its first telling slot, else its row count;
+// the input's own title and scale ride on a result's root and say nothing about it
+const telling = slots => Object.entries(slots || {}).filter(([k]) => !/^(scale|title|sys\/)/.test(k) && !k.endsWith('/scale'));
+const summary = t => {
+  const sl = t.slots || {};
+  if ('added' in sl && 'removed' in sl && 'changed' in sl) { const d = ['added', 'removed', 'changed'].filter(k => Number(sl[k])).map(k => sl[k] + ' ' + k); return d.length ? d.join(' · ') : 'agree'; }
+  const s = telling(sl), num = s.find(([, v]) => typeof v === 'number');
+  return num ? num[1].toLocaleString() + ' ' + num[0] : s.length ? String(s[0][1]).slice(0, 24) + ' ' + s[0][0] : t.kids.length + (t.kids.length === 1 ? ' row' : ' rows');
+};
+// a record's line: the slots that tell what it is first (text, title, name, what, asked, word), two of them, with room
+const TELLING = ['text', 'title', 'name', 'what', 'asked', 'word', 'question', 'error', 'cause', 'about'];
+const lineSlots = rec => { const e = Object.entries(rec || {}); const first = TELLING.flatMap(k => e.filter(([kk]) => kk === k)); const rest = e.filter(([k]) => !TELLING.includes(k)); return first.concat(rest).slice(0, first.length ? 2 : 3); };
+const lineHTML = rec => lineSlots(rec).map(([k, v]) => esc(k) + ' ' + (typeof v === 'number' ? v.toLocaleString() : esc(String(v)).slice(0, 48))).join(' · ');
+// the records an event wrote, as the page lists them: the keys of its `with` (the written records; a cell's
+// /x and /c/x ride along and are left out), else its touched paths without the node root, the writer's
+// journal tag and the ancestors whose cases moved (a touched path that is a proper prefix of another)
+const writtenOf = e => {
+  const t = (e.touched || []).map(local);
+  const out = t.filter(p => p.includes('/') && !/^[^/]+\/agent\/journal\//.test(p) && !t.some(q => q !== p && q.startsWith(p + '/')));
+  const w = e.with && typeof e.with === 'object' ? Object.keys(e.with).filter(k => !/^\/x\/|^\/c\/x\//.test(k)).map(local) : [];
+  for (const p of w) if (!out.includes(p)) out.push(p);
+  return out.sort();
+};
+// a journaled event as the viewer's event; the label the line carries, else the first written record's tail (+N)
+const labelOf = written => written.length ? last(written[0]) + (written.length > 1 ? ` (+${written.length - 1})` : '') : 'write';
+const eventOf = e => { const records = writtenOf(e); return { epoch: e.epoch, label: e.label || labelOf(records), who: e.who || 'agent', touched: (e.touched || []).map(local), records, count: e.touched_count, with: e.with || null }; };
+
+function mcpSource(opts = {}) {
+  const base = opts.base || '', views = local(opts.views), who = opts.who || '';
+  const doFetch = opts.fetch || ((u, o) => root.fetch(u, o)), ES = 'EventSource' in opts ? opts.EventSource : root.EventSource;
+  const every = opts.setInterval || root.setInterval, clear = opts.clearInterval || root.clearInterval, later = opts.setTimeout || root.setTimeout;
+  let seq = 0, latest = null;   // latest: the newest event's `with`, keyed by world path; the one payload a read may answer from
+  let frame = null;
+  let watchedRoot = null, watchedCells = new Map();
+  const derived = /^(?:r|x|c|o|h)\//.test(views);
+  const beginFrame = () => { frame = new Map(); watchedRoot = null; watchedCells = new Map(); };
+  const rootStamp = node => JSON.stringify(derived ? node : [node.reference_z, node.reference_y, node.reference, node.exists, node.properties]);
+  const remember = (node, care) => {
+    if (!frame || !node || node.error || node.paged) return;
+    frame.set(JSON.stringify([node.path, care, 0]), node);
+    frame.set(JSON.stringify([node.path, 'x', 0]), {...node, children: []});
+  };
+  async function rpc(name, args) {
+    const controller = new AbortController();
+    const timeout = root.setTimeout(() => controller.abort(), opts.timeout || 15000);
+    try {
+    const res = await doFetch(base + '/mcp', { signal: controller.signal, method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method: 'tools/call', params: { name: 'mcp/' + name, arguments: args } }) });
+    const j = await res.json();
+    if (j.error) throw new Error(j.error.message || 'rpc failed');
+    if (j.result && j.result.isError) throw new Error((j.result.content && j.result.content[0] && j.result.content[0].text) || 'rpc failed');
+    return j.result.structuredContent;
+    } finally { root.clearTimeout(timeout); }
+  }
+  const carried = p => { const n = latest && latest[p]; return n && !n.poked && !n.paged ? n : null; };
+  async function read(path, care, cas, next) {
+    const w = world(path), held = care === 'x' && !cas && !next ? carried(w) : null;
+    const key = JSON.stringify([w, care || 'z', cas || 0]);
+    const cached = held || (!next && frame?.get(key));
+    const node = cached || await rpc('read', { path: w, care: care || 'z', case: cas || 0, limit: 200, ...(next ? {next} : {}) });
+    if (!cached && !cas && w === world(views)) watchedRoot = {node, care: care || 'z', limit: 200};
+    return readOf(node);
+  }
+  async function answer(path) {
+    const w = world(path), x = carried('/x' + w), c = carried('/c/x' + w);
+    if (x && c) return answerOf(path, x, c);
+    const key = 'answer:' + w;
+    if (frame?.has(key)) return frame.get(key);
+    const a = await rpc('read', { paths: ['/x' + w, '/c/x' + w], care: 'z', limit: 200 });
+    watchedCells.set(w, a.answers);
+    const result = answerOf(path, a.answers[0], a.answers[1]);
+    frame?.set(key, result);
+    return result;
+  }
+  // the cells under the views folder, three levels down (a plan, a qa tree with its diff and score folders);
+  // a folder with a hundred or more children is left unopened
+  async function graph() {
+    if (!views) return { sources: [], cells: [] };
+    const folder = await rpc('read', { path: world(views), care: 'y', limit: 500 });
+    watchedRoot = {node: folder, care: 'y', limit: 500};
+    remember(folder, 'y');
+    const cells = [], sources = new Set(), seen = new Set();
+    const take = ch => {
+      if (!ch.properties || !('/sys/weft' in ch.properties) || seen.has(ch.path)) return;
+      seen.add(ch.path);
+      const slots = slotsOf(ch.properties), inputs = [], settings = [];
+      const o = refOf(slots.over); if (o) inputs.push({ path: o.path, pin: o.pin });
+      for (const [k, v] of Object.entries(slots)) { if (k === 'formula' || k === 'over') continue; const r = refOf(v); if (r) inputs.push({ path: r.path, pin: r.pin, view: true }); else settings.push(k + ' ' + v); }
+      for (const i of inputs) if (!i.path.startsWith('/x/')) sources.add(i.path);
+      cells.push({ path: local(ch.path), rel: local(ch.path).slice(local(views).length + 1), formula: slots.formula.replace(/^-> \/weft\/stdlib\//, ''), settings: settings.join(' '), inputs });
+    };
+    take(folder);
+    const folders = f => (f.children || []).filter(ch => ch.exists !== false && !(ch.properties && '/sys/weft' in ch.properties) && (ch.children || []).length < 100 && !(ch.properties && '/sys/tack' in ch.properties));
+    let level = [folder];
+    for (let depth = 0; depth < 3 && level.length; depth++) {
+      for (const f of level) for (const ch of f.children || []) take(ch);
+      const below = level.flatMap(folders).filter(ch => depth < 2 && (ch.children || []).length);
+      if (!below.length) break;
+      const pages = await rpc('read', { reads: below.map(ch => ({ path: ch.path, care: 'y', limit: 100 })) });
+      level = (pages.answers || []).filter(a => a && !a.error);
+    }
+    if (cells.length) {
+      const a = await rpc('read', { reads: cells.flatMap(c => ['/x' + world(c.path), '/c/x' + world(c.path)]), care: 'z', limit: 200 });
+      cells.forEach((c, i) => { const pair = a.answers.slice(2 * i, 2 * i + 2), r = answerOf(c.path, ...pair); watchedCells.set(world(c.path), pair); frame?.set('answer:' + world(c.path), r); Object.assign(c, { answer: r.tree ? summary(r.tree) : '', note: r.note, bad: r.bad }); });
+    }
+    return { sources: [...sources].map(path => ({ path, meta: '' })), cells };
+  }
+  async function changed() {
+    if (!watchedRoot) return true;
+    const previous = watchedRoot, cells = [...watchedCells];
+    // Physical y/z cases cover the displayed subtree. A live cell's own x case
+    // does NOT advance when its tack changes: compare its native result/context
+    // too. Derived overlays likewise have no physical subtree case to watch.
+    const reads = [{path: world(views), care: derived ? previous.care : 'x', limit: derived ? previous.limit : 1},
+      ...cells.flatMap(([p]) => [{path: '/x' + p, care: 'z', limit: 200}, {path: '/c/x' + p, care: 'z', limit: 200}])];
+    const page = await rpc('read', {reads});
+    if (!page.answers || page.answers.some(a => !a || a.error)) throw new Error('Could not refresh this view');
+    return rootStamp(page.answers[0]) !== rootStamp(previous.node)
+      || cells.some(([, pair], i) => JSON.stringify(pair) !== JSON.stringify(page.answers.slice(2 * i + 1, 2 * i + 3)));
+  }
+  // what references a path: the records and cells under the page's folder (and under /agent) whose reference slots point
+  // at it or beneath it, each with the slot and whether a cell is waiting there; plus the kernel's crews on it
+  async function referencedBy(path) {
+    const node = local(views).split('/')[0], roots = [world(views)].concat(node ? ['/' + node + '/agent'] : []);
+    const out = { matches: [], watchers: [] };
+    for (const r of roots) {
+      const a = await rpc('read', { path: r, referencing: world(path), limit: 200 });
+      out.matches.push(...(a.matches || []).map(m => ({ path: local(m.path), slot: m.slot, cell: !!m.cell, hole: !!m.hole })));
+      if (!out.watchers.length) out.watchers = (a.watchers || []).map(w => ({ path: local(w.path), care: w.care }));
+    }
+    return out;
+  }
+  // Optional installed graph definitions are read through native /o overlays.
+  // Inspection never installs a definition or binds a cell.
+  const defCases = {};
+  async function defCase(name) {
+    const node = local(views).split('/')[0] || '0x11';
+    const key = node + '/' + name;
+    if (defCases[key]) return defCases[key];
+    try {
+      const r = await rpc('read', { path: '/' + node + '/weft/graph/' + name, care: 'x' });
+      const m = /^\/h\/x\/(\d+)\//.exec(r && r.reference || '');
+      defCases[key] = r && r.exists && m ? { node, case: Number(m[1]) } : null;
+    } catch (e) { defCases[key] = null; }
+    return defCases[key];
+  }
+  const oPath = (def, thing) => { const d = [def.node, 'weft', 'graph', def.name], t = local(thing).split('/').filter(Boolean); return '/o/' + def.case + '/' + d.length + '/' + d.join('/') + '/' + t.length + '/' + t.join('/'); };
+  const unref = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? m[1] : (typeof v === 'string' && v.startsWith('/') ? v : null); };
+  const worldOf = p => { const segs = local(p).split('/'); const i = segs.indexOf('user'); return i > 0 ? segs[i - 1] : (segs[0] || ''); };
+  // every node of a computed tree, keyed by its path beneath the application, slots with the leading slash dropped
+  async function treeOf(base, pages = 20) {
+    const nodes = {};
+    let next = null;
+    for (let page = 0; page < pages; page++) {
+      const r = await rpc('read', { path: base, care: 'z', limit: 500, ...(next ? { next } : {}) });
+      // a later page repeats the nodes above its slice with no properties: what the first page said about them stays
+      const visit = n => { if (n && n.path && n.path.startsWith(base)) { const key = n.path.slice(base.length), props = Object.fromEntries(Object.entries(n.properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); if (!nodes[key] || Object.keys(props).length) nodes[key] = props; } for (const c of (n && n.children) || []) visit(c); };
+      visit(r);
+      next = r && r.next; if (!next) break;
+    }
+    return nodes;
+  }
+  async function computed(def, thing) {
+    const nodes = await treeOf(oPath(def, thing));
+    if (!Object.keys(nodes).length || (nodes[''] && nodes['']['sys/view/fault'])) return null;
+    return nodes;
+  }
+  // a thing as a world: folders <dir>/<n>/<label...>, items <n>/<name...> beneath them, an item's own folders beneath it.
+  function foldersOf(nodes, prefix) {
+    const segsOf = rel => rel.split('/').filter(Boolean);
+    const here = segsOf(prefix);
+    const out = [];
+    for (const [rel, props] of Object.entries(nodes)) {
+      const segs = segsOf(rel);
+      if (segs.length < here.length + 2 || !here.every((h, i) => segs[i] === h)) continue;
+      const dir = segs[here.length], n = Number(segs[here.length + 1]);
+      if (!['out', 'part', 'up', 'in'].includes(dir) || !Number.isInteger(n) || segs.length !== here.length + 2 + n) continue;
+      const label = segs.slice(here.length + 2).join('/');
+      const items = [];
+      for (const [irel, iprops] of Object.entries(nodes)) {
+        const isegs = segsOf(irel);
+        if (isegs.length <= segs.length || !segs.every((h, i) => isegs[i] === h)) continue;
+        const m = Number(isegs[segs.length]);
+        if (!Number.isInteger(m) || isegs.length !== segs.length + 1 + m) continue;
+        const name = '/' + isegs.slice(segs.length + 1).join('/');
+        const by = String(iprops.by || '').split(' ').filter(Boolean);
+        const note = {}; for (const [k, v] of Object.entries(iprops)) if (k.startsWith('note/')) note[k.slice(5)] = v;
+        const it = { path: name, name: iprops.name || name.split('/').pop().replace(/_/g, ' '), world: iprops.world || worldOf(name), by: by[0] || '', worlds: by.length ? by : [iprops.world || worldOf(name)], note, via: unref(iprops.via) || '' };
+        if (iprops.seen) it.seen = true;
+        if (iprops.also) it.labels = [label].concat(String(iprops.also).split(', '));
+        const sub = foldersOf(nodes, '/' + isegs.join('/'));
+        if (sub.length) it.folders = sub;
+        items.push(it);
+      }
+      const f = { dir, key: label, label: (dir === 'in' ? '\u2190 ' : dir === 'up' ? '\u2191 ' : '') + label.replace(/_/g, ' '), items };
+      if (props.more) f.more = Number(props.more);
+      if (props.closed) { f.closed = true; f.more = Number(props.count || 0); }
+      out.push(f);
+    }
+    return out;
+  }
+  // one thing as a world: the overlay applied to it alone, one virtual root
+  async function unfold(path, depth) {
+    const name = depth === 1 ? 'frontier' : 'overlay';
+    const def = await defCase(name);
+    if (!def) return null;
+    const nodes = await computed({ ...def, name }, path);
+    return nodes ? foldersOf(nodes, '/0/' + local(path)) : null;
+  }
+  // what every world says: the records joined by same, their facts by value with the worlds asserting each, and the
+  // relations, from the union view's records, facts and relations branches
+  async function union(path) {
+    const def = await defCase('union');
+    if (!def) return null;
+    const nodes = await computed({ ...def, name: 'union' }, path);
+    if (!nodes) return null;
+    const norm = v => String(v).trim().toLowerCase();
+    const records = [];
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/records\/(\d+)\/(.+)$/.exec(rel); if (!m) continue;
+      const p = '/' + m[2]; records.push({ path: p, world: worldOf(p), name: props.name || p.split('/').pop() });
+    }
+    const worlds = [...new Set(records.map(r => r.world))].sort();
+    const facts = [], bySlot = {};
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/facts\/(\d+)\/(.+?)\/assertions\/(\d+)\/(.+)$/.exec(rel); if (!m) continue;
+      const slot = m[2].replace(/\//g, '/'), about = unref(props.about), source = unref(props.source) || '';
+      const w = worldOf(about || source), claim = source.includes('/claims/');
+      const key = norm(props.value);
+      const tag = claim ? w + ' (claim by ' + (props['evidence/by'] || '?') + ')' : w;
+      const g = (bySlot[slot] = bySlot[slot] || {}); (g[key] = g[key] || { value: props.value, worlds: new Set(), tags: new Set() });
+      g[key].tags.add(tag); if (!claim) g[key].worlds.add(w);
+    }
+    for (const [slot, vals] of Object.entries(bySlot)) for (const [k, v] of Object.entries(vals)) {
+      if (!v.worlds.size) continue;
+      facts.push({ kind: 'value', value: v.value, labels: [slot], worlds: [...v.worlds].sort(), all: worlds.every(w => v.worlds.has(w)) });
+    }
+    const rels = {};
+    for (const [rel, props] of Object.entries(nodes)) {
+      const m = /^\/relations\/(out|in|part)\/(\d+)\/(.+)$/.exec(rel); if (!m || rel.includes('/assertions/')) continue;
+      const other = unref(props.other); if (!other) continue;
+      const w = worldOf(unref(props.via) || other);
+      const label = (props.direction === 'in' ? '\u2190 ' : '') + String(props.label || '').replace(/^\//, '');
+      const g = (rels[other] = rels[other] || { kind: 'relation', way: props.direction === 'in' ? 'in' : 'out', other, name: props.name || other.split('/').pop(), labels: new Set(), worlds: new Set() });
+      g.labels.add(label); g.worlds.add(w);
+    }
+    for (const g of Object.values(rels)) facts.push({ ...g, labels: [...g.labels], worlds: [...g.worlds].sort(), all: worlds.every(w => g.worlds.has(w)) });
+    const disagreements = Object.entries(bySlot).filter(([slot, vals]) => Object.keys(vals).length > 1).map(([slot, vals]) => ({ slot, values: Object.fromEntries(Object.values(vals).map(v => [String(v.value), [...v.tags].sort()])) }));
+    return { at: world(path), records, worlds, facts, disagreements, ready: true };
+  }
+  async function backlinks(path) {
+    // Incoming references come from this world's native index.
+    const node = local(path).split('/')[0], self = local(path), out = { matches: [] }, seen = new Set();
+    for (const r of ['/' + node + '/user', '/' + node + '/agent']) {
+      let next = null;
+      for (let page = 0; page < 12; page++) {
+        const a = await rpc('read', { path: r, referencing: world(path), limit: 400, ...(next ? { next } : {}) });
+        for (const m of a.matches || []) { const p = local(m.path); if (p !== self && !p.startsWith(self + '/') && !seen.has(p)) { seen.add(p); out.matches.push({ path: p, slot: m.slot, cell: !!m.cell, hole: !!m.hole }); } }
+        next = a.next; if (!next) break;
+      }
+    }
+    return out;
+  }
+  // the QA tree, if an agent keeps one under this node: the first /agent/<name>/qa/score that answers, with its folder
+  async function qa() {
+    const node = local(views).split('/')[0];
+    if (!/^0x[0-9a-f]+$/i.test(node)) return null;
+    const agents = await rpc('read', { path: '/' + node + '/agent', care: 'y', limit: 50 });
+    for (const ch of agents.children || []) {
+      const name = last(ch.path);
+      if (name === 'journal' || name === 'hands') continue;
+      const score = await rpc('read', { path: '/x/' + node + '/agent/' + name + '/qa/score', care: 'x' });
+      if (score && score.exists) return { folder: node + '/agent/' + name + '/qa', changed: (score.properties || {})['/changed'] || '0' };
+    }
+    return null;
+  }
+  // follow: one stream per source, shared by every handler; the backlog (the lastEpoch page of history, with x) runs once
+  // and only for a handler that asks for it (the viewer); a record page never needs it. stop() closes everything.
+  const handlers = new Set();
+  let lastEpoch = 0, queue = Promise.resolve(), polling = null, stream = null, stopped = false, opening = null, backlogged = null;
+  const wanted = e => who === 'all' || (who ? e.who === who : e.who !== 'system');
+  const deliver = lines => { for (const l of lines) queue = queue.then(() => { for (const h of [...handlers]) { try { h(l); } catch (e) { /* one handler's fault is not another's */ } } }).catch(() => {}); return queue; };
+  const seen = e => { if (!(e.epoch > lastEpoch)) return false; lastEpoch = e.epoch; return true; };
+  const line = e => e.shown ? { shown: { ...e.shown, path: local(e.shown.path) } } : (latest = e.with || null, eventOf(e));
+  async function poll() {
+    if (lastEpoch === 0 && !backlogged) {           // no backlog wanted: start from the latest event, not from epoch 0
+      const tip = await rpc('history', { before: 0, limit: 1 });
+      lastEpoch = Math.max(lastEpoch, Number(tip.next || 0), ...((tip.events || []).map(e => Number(e.epoch || 0))));
+      return;
+    }
+    const page = await rpc('history', { after: lastEpoch, limit: 40, with: 'x', ...(who ? { who } : {}) });
+    const fresh = (page.events || []).filter(e => e.shown ? true : seen(e) && wanted(e));
+    if (page.next > lastEpoch) lastEpoch = page.next;
+    return deliver(fresh.map(line));
+  }
+  async function backlog() {   // what happened before the page opened: the lastEpoch page of history, oldest first, drawn once
+    const page = await rpc('history', { before: 0, limit: 40, with: 'x', ...(who ? { who } : {}) });   // with x: the quiet rule reads what each event wrote
+    const events = (page.events || []).filter(e => !e.shown && wanted(e)).reverse();
+    for (const e of events) seen(e);
+    return deliver(events.map((e, i) => ({ ...eventOf(e), quiet: i < events.length - 1 })));
+  }
+  const startPoll = () => { if (!polling && !stopped) polling = every(() => poll().catch(() => {}), 700); };
+  const stopPoll = () => { if (polling) { clear(polling); polling = null; } };
+  function open() {
+    if (stopped) return;
+    if (!ES) return startPoll();
+    let opened = false;
+    try { stream = new ES(base + '/mcp/stream'); } catch (e) { return startPoll(); }
+    stream.onopen = () => { opened = true; stopPoll(); poll().catch(() => {}); };
+    stream.onmessage = m => { let e; try { e = JSON.parse(m.data); } catch (err) { return; } if (e.shown || (seen(e) && wanted(e))) deliver([line(e)]); };
+    stream.onerror = () => { if (stream) stream.close(); stream = null; if (stopped) return; startPoll(); later(open, opened ? 2000 : 30000); };
+  }
+  const scopedStops = new Set();
+  function follow(handler, o = {}) {
+    if (views && o.backlog !== false) {
+      let stopped = false, timer = null, busy = false, redraw = true;
+      const shown = () => handler({ shown: { path: views, care: 'y', case: 0 } });
+      async function poll() {
+        if (stopped || busy) return;
+        busy = true;
+        try {
+          // Poll this view, never scan the global journal for a non-system writer.
+          if (!redraw) redraw = await changed();
+          if (redraw && !stopped) redraw = (await shown()) === false;
+        } finally { busy = false; }
+      }
+      const ready = Promise.resolve().then(async () => {
+        await poll().catch(() => {});
+        if (!stopped) timer = every(() => poll().catch(() => {}), 2000);
+      });
+      ready.catch(() => {});
+      const stopScoped = () => { stopped = true; if (timer !== null) clear(timer); scopedStops.delete(stopScoped); };
+      scopedStops.add(stopScoped);
+      return { ready, stop: stopScoped };
+    }
+    handlers.add(handler);
+    if (o.backlog !== false && !backlogged) backlogged = backlog().catch(() => {});
+    if (!opening) opening = (backlogged || Promise.resolve()).then(open);
+    return { stop: () => handlers.delete(handler) };
+  }
+  function stop() { stopped = true; for (const halt of scopedStops) halt(); handlers.clear(); stopPoll(); if (stream) { stream.close(); stream = null; } }
+  // a view's result as it is: every node beneath /x/<cell>, keyed by its path beneath the cell
+  async function result(cell) { return treeOf('/x/' + local(cell)); }
+  return { read, answer, graph, follow, stop, qa, beginFrame, referencedBy, backlinks, unfold, union, result };
+}
+
+// the record page: one record, its slots, and the thing as a world: what it asserts, and what references it, under
+// every line is a hop to the same page from there. Live: a write under it redraws it.
+const atCrumbHTML = p => { const seg = local(p).split('/'); return seg.map((s, i) => i === seg.length - 1 ? `<b>${esc(s)}</b>` : `<a href="?at=/${esc(seg.slice(0, i + 1).join('/'))}">${esc(s)}</a>`).join(' / '); };
+// ---------- the tree, drawn the same on every page ----------
+// A folder is a slot name; a line is a name, what the holder says beside it, and who says so; dashed when the only
+// thing holding it is prose, or it is a cell's result. `here` is the page's world, `names` the titles behind brackets.
+function treeRenderers(source, here, names) {
+  // ---- prose: one renderer, everywhere. A path in brackets is the link it is; the name lands when read.
+  const PROSE = ['text', 'note', 'said', 'quote', 'description'];
+  const linkify = t => esc(t).replace(/\[(\/[^\]\s]+)\]/g, (m, p) => goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n'));
+  const proseOf = o => PROSE.map(k => o && o[k]).filter(v => typeof v === 'string' && v.trim());
+  const bracketsIn = o => [...new Set((proseOf(o).join(' ').match(/\[\/[^\]\s]+\]/g) || []).map(x => local(x.slice(1, -1))))];
+  // ---- beside a line: the holder's prose, else at most two values, never an identifier or a source
+  const IDLIKE = /^(id|.*_id|uei|duns|cik|lei|cage|naics|sic|psc|source|sources|url|digest|fetched|name|level|heading|title|by|judged|within|also|number|patent|case|extractor|regions|identity)$/;
+  const money = (k, v) => /amount|obligated|revenue|total/.test(k) && /^\d+$/.test(String(v)) ? '$' + (Number(v) >= 1e6 ? (Number(v) / 1e6).toFixed(1) + 'M' : Number(v).toLocaleString()) : String(v);
+  const sentence = (t, k) => { const i = t.indexOf(k); if (i < 0) return t.length > 160 ? t.slice(0, 157) + '…' : t; const a = t.lastIndexOf('. ', i) + 1, b = t.indexOf('. ', i + k.length); return t.slice(a > 0 ? a + 1 : 0, b < 0 ? Math.min(t.length, i + 240) : b + 1).trim(); };
+  const beside = (it, parent) => {
+    const n = it.note || {}, prose = proseOf(n);
+      if (prose.length) { const t = sentence(prose.join(' '), '[' + world(parent) + ']'); return `\u201c${linkify(t.length > 110 ? t.slice(0, 107) + '\u2026' : t)}\u201d`; }
+    return Object.entries(n).filter(([k, v]) => !IDLIKE.test(k) && !/^https?:/.test(String(v)) && String(v).length < 80).slice(0, 2).map(([k, v]) => esc(money(k, v))).join(' · ');
+  };
+  const isProse = f => f && PROSE.includes(String(f.key).split('/').pop());
+  const badge = it => {
+    const ws = (it.worlds && it.worlds.length ? it.worlds : [it.world]).filter(Boolean);
+    return (ws.length > 1 || (ws[0] && ws[0] !== here) ? ws.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}" title="described in world ${esc(w)}">${esc(w)}</span>`).join('') : '') +
+      (it.by && it.by !== here && !ws.includes(it.by) ? ` <span class="sv-wb by" title="asserted by world ${esc(it.by)}">by ${esc(it.by)}</span>` : '');
+  };
+  // ---- the tree: a folder is a slot name; a line is a name, what the holder says beside it, and who says so;
+  // dashed when the only thing holding it is prose, or it is a cell's result. Backward prose lines gather at the
+  // bottom as "named in". Folders beyond the subject arrive closed, as counts, and open on demand.
+  const item_ = (it, f, parent) => `<li class="${[it.seen ? 'seen' : '', it.path.startsWith('/x/') ? 'cell' : isProse(f) ? 'named' : ''].filter(Boolean).join(' ')}"><span class="tg">${esc(tagOf(it.path))}</span>${goHTML(local(it.path), local(it.path), it.name, 'n')}${(b => b ? ` <span class="s">${b}</span>` : '')(beside(it, parent))}${badge(it)}${it.labels && it.labels.length > 1 ? ` <span class="s also">also ${esc(it.labels.slice(1).join(', '))}</span>` : ''}${it.seen ? ' <span class="s">shown above</span>' : ''}${it.lines && it.lines.length ? `<ul class="sv-tree">${it.lines.map(l => `<li>${goHTML(l.path, l.path, l.name, 'n')}${l.note ? ` <span class="s">${l.note}</span>` : ''}</li>`).join('')}</ul>` : ''}${it.folders && it.folders.length ? world_(it.folders, it.path) : ''}</li>`;
+  const folder_ = (f, parent) => f.label === 'source' || f.label === 'sources'
+    ? `<li class="sv-src"><span class="vf">${esc(f.label)}</span> ${f.items.map(it => goHTML(local(it.path), local(it.path), it.name, 'n')).join(' · ')}</li>`
+    : f.closed
+    ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}"><span class="vf">${esc(f.label)}</span> <span class="n">${f.more}</span></button></li>`
+    : `<li><span class="vf">${esc(f.label)}</span> <span class="n">${f.items.length + (f.more || 0)}</span><ul class="sv-tree">${f.items.map(it => item_(it, f, parent)).join('')}${f.more ? `<li><button type="button" class="sv-open" data-open="${esc(parent)}" data-label="${esc(f.label)}">${f.more} more</button></li>` : ''}</ul></li>`;
+  // prose folders gather by direction: what names this thing ("named in"), and what this thing's own sentences, or
+  // those of a record beneath it, name ("names"); each line the sentence around the bracket
+  const world_ = (fs, parent) => {
+    const rest = fs.filter(f => !(isProse(f)));
+    const group = (dir, label) => { const named = fs.filter(f => f.dir === dir && isProse(f)); return named.length ? `<li><span class="vf">${label}</span> <span class="n">${named.reduce((n, f) => n + f.items.length, 0)}</span><ul class="sv-tree">${named.map(f => f.items.map(it => item_(it, f, parent)).join('')).join('')}</ul></li>` : ''; };
+    return `<ul class="sv-tree sv-world">${rest.map(f => folder_(f, parent)).join('')}${group('out', 'names')}${group('in', 'named in')}</ul>`;
+  };
+  // a cell's lines beneath its item, read on demand; a folder with nothing in it is dropped; the page's own cell never listed
+  const fill = async (fs, self) => {
+    const out = [];
+    for (const f of fs) {
+      f.items = f.items.filter(it => it.path !== self);
+      for (const it of f.items) {
+        if (it.path.startsWith('/x/')) { const t = await source.read(it.path, 'y').catch(() => null); it.lines = ((t && t.kids) || []).map(k => ({ path: local(k.path), name: String(k.name || last(k.path)).replace(/_/g, ' '), note: lineHTML(k.slots || {}) })); }
+        if (it.folders) it.folders = await fill(it.folders, self);
+      }
+      if (f.closed || f.items.length || f.more) out.push(f);
+    }
+    return out;
+  };
+  // a standing judged the same as others is one subject with several representations: each other record on its line, by world
+  const standing_ = (st, island, extra = '') => `<div class="sv-standing${island ? ' sv-island' : ''}">${goHTML(st.path, st.path, st.name, 'n')}${badge({ world: st.world })}${(st.same || []).map(p => ` <span class="s">= ${goHTML(local(p), local(p), names[local(p)] || last(p).replace(/_/g, ' '), 'n')} <span class="tg">${esc(tagOf(p))}</span></span>`).join('')}${extra}${island ? ' <span class="s">island: nothing connects it to another standing yet</span>' : ''}</div>${st.folders.length ? world_(st.folders, st.path) : ''}`;
+  return { PROSE, linkify, proseOf, bracketsIn, beside, isProse, badge, item_, folder_, world_, fill, standing_ };
+}
+
+function mountRecord(el, source, opts = {}) {
+  const at = local(opts.at);
+  const viewAt = at.startsWith('x/');            // a view's own page: the cell's record is the card, its result the world
+  const node = (viewAt ? at.slice(2) : at).split('/')[0];
+  el.innerHTML = `<div class="sv-bar"><div class="sv-crumb">${atCrumbHTML(at)}</div></div><div class="sv-main sv-recview"></div>`;
+  const main = el.querySelector('.sv-recview');
+  let openFolder = null;            // set by draw: opens a closed folder of the unfolded world in place
+  let timer = null;
+  let drawn = 0;
+  async function draw() {
+    source.beginFrame?.();
+    const mine = ++drawn;
+    try {
+    const r = await source.read(viewAt ? at.slice(2) : at, 'y');
+    if (mine !== drawn) return;
+    if (!r) { main.innerHTML = '<div class="sv-empty">nothing here</div>'; return; }
+    // what is beneath, every page of it: a folder with many children answers in pages
+    const kids = [], seen = new Set();
+    const take = page => { for (const k of page.kids || []) { const lk = local(k.path); if (lk.split('/').length === at.split('/').length + 1 && !seen.has(lk)) { seen.add(lk); kids.push(k); } } };
+    take(r);
+    for (let next = r.next, n = 0; next && n < 20; n++) {
+      const more = await source.read(at, 'y', 0, next).catch(() => null);
+      if (!more || mine !== drawn) break;
+      take(more); next = more.next;
+    }
+    if (mine !== drawn) return;
+    const rec = r.record || {};
+    const here = node;
+    const put = (sel, html) => { const el = main.querySelector(sel); if (el) el.innerHTML = html; else main.innerHTML += html; };
+    const names = {};
+    const R = treeRenderers(source, here, names);
+    const { linkify, proseOf, bracketsIn, isProse, badge, folder_, world_, standing_, PROSE } = R;
+    openFolder = async btn => {
+      btn.disabled = true;
+      const fs = await source.unfold(btn.dataset.open, 1).catch(() => null);
+      const f = (fs || []).find(x => x.label === btn.dataset.label);
+      if (!f) { btn.disabled = false; return; }
+      const li = btn.closest('li'), holder = document.createElement('ul');
+      holder.innerHTML = folder_(f, btn.dataset.open);
+      const target = btn.textContent.endsWith('more') ? li.parentElement.closest('li') : li;
+      target.replaceWith(holder.firstElementChild);
+    };
+    // ---- phase 1: the card, at once. Its prose with links, written once; its other slots beneath.
+    const title = rec.name || rec.heading || rec.title || last(at).replace(/_/g, ' ');
+    const rest = Object.fromEntries(Object.entries(rec).filter(([k]) => !PROSE.includes(k)));
+    const cardHTML = async () => r.record === null ? '<div class="sv-gone">deleted</div>' : `<div class="sv-title">${esc(title)}</div>${proseOf(rec).map(t => `<div class="sv-prose">${linkify(t)}</div>`).join('')}` + await recordHTML(source, { ...r, record: rest, kids: [] }, true, new Set());
+    const rows = viewAt ? '' : kids.map(k => `<span class="sv-part">${goHTML(k.path, k.path, k.name, 'n')}</span>`).join(' · ');
+    main.innerHTML = `<div class="sv-card-sec">${await cardHTML()}</div><div class="sv-sec sv-world-sec"><div class="k">as a world</div><div class="sv-empty">reading…</div></div><div class="sv-rest"></div>${rows ? `<div class="sv-sec sv-parts"><div class="k">beneath</div>${rows}</div>` : ''}`;
+    // ---- phase 2: the names behind the brackets, read in parallel; the card again when they land
+    const paths = bracketsIn(rec);
+    if (paths.length) {
+      await Promise.all(paths.map(p => source.read(p, 'x').then(t => { names[p] = t && t.record ? (t.record.name || t.record.heading || t.record.title || '') : ''; }).catch(() => { names[p] = ''; })));
+      if (mine !== drawn) return;
+      put('.sv-card-sec', await cardHTML());
+    }
+    // Native overlays are read-only projections; inspecting them never binds a workspace.
+    const u = viewAt ? null : (source.unfold ? await source.unfold(at, 3).catch(() => null) : null);
+    // a view's own page: its result drawn as the namespace it is, every level, nothing read through a second view
+    const rn = viewAt && source.result ? await source.result(at.slice(2)).catch(() => null) : null;
+    if (mine !== drawn) return;
+    const have = !!u || !!(rn && Object.keys(rn).length);
+    // the result tree: a folder is a segment of the result's own addressing; a line is a record, named by its name
+    // when it has one, linked to the first thing it references, with a few of its values beside it. A run of empty
+    // folders with one child each reads as one line.
+    const resultHTML = nodes => {
+      const refOf = v => { const m = /^\/h\/[xyz]\/[^/]+\/\d+(\/.*)$/.exec(String(v || '')); return m ? m[1] : null; };
+      const kids = {};
+      for (const rel of Object.keys(nodes)) { if (!rel) continue; const segs = rel.split('/').filter(Boolean); const parent = segs.length > 1 ? '/' + segs.slice(0, -1).join('/') : ''; (kids[parent] = kids[parent] || []).push(rel); }
+      const line = (rel, shown) => {
+        const props = nodes[rel] || {};
+        const name = props.name || shown;
+        const ref = Object.values(props).map(refOf).find(Boolean);
+        const rest = Object.entries(props).filter(([k, v]) => k !== 'name' && !refOf(v)).slice(0, 3).map(([k, v]) => `${esc(k)} ${esc(String(v)).slice(0, 48)}`).join(' · ');
+        return `${ref ? goHTML(local(ref), local(ref), name, 'n') : `<span class="vf">${esc(name)}</span>`}${rest ? ` <span class="s">${rest}</span>` : ''}`;
+      };
+      const item = (rel, depth) => {
+        let shown = rel.split('/').pop(), here = rel;
+        while (!Object.keys(nodes[here] || {}).length && (kids[here] || []).length === 1) { here = kids[here][0]; shown += '/' + here.split('/').pop(); }
+        const ch = kids[here] || [];
+        return `<li>${line(here, shown)}${ch.length && depth < 12 ? `<ul class="sv-tree">${ch.map(c => item(c, depth + 1)).join('')}</ul>` : ''}</li>`;
+      };
+      return `<ul class="sv-tree sv-world">${(kids[''] || []).map(c => item(c, 1)).join('')}</ul>`;
+    };
+    const uu = u ? await R.fill(u, null) : null;
+    if (mine !== drawn) return;
+    const treeHTML = rn && Object.keys(rn).length ? resultHTML(rn) : uu && uu.length ? world_(uu, at) : '';
+    const grey = (treeHTML.match(/<li class="[^"]*\bnamed\b/g) || []).length;
+    put('.sv-world-sec', treeHTML ? `<div class="k">${rn ? 'the result' : `as a world${grey ? ` · ${grey} in prose` : ''}`}</div>${treeHTML}` : (have ? '' : `<div class="k">${viewAt ? 'the result' : 'as a world'}</div><div class="sv-empty">${viewAt ? 'nothing yet' : 'no view in this world'}</div>`));
+    // ---- phase 4: what every world says, and the claims, as they arrive
+    const [un, cl] = viewAt ? [null, null] : await Promise.all([source.union ? source.union(at).catch(() => null) : null, source.read(at + '/claims', 'y').catch(() => null)]);
+    if (mine !== drawn) return;
+    const wbs = ws_ => ws_.map(w => ` <span class="sv-wb${w === here ? ' here' : ''}">${esc(w)}</span>`).join('');
+    const factHTML = f => `<div class="sv-hop${f.all ? ' sv-agree' : ''}"><span class="lb">${esc(f.labels.join(' / '))}</span> ${f.kind === 'relation' ? goHTML(local(f.other), local(f.other), f.name, 'n') : esc(String(f.value))}${wbs(f.worlds)}</div>`;
+    const agree = un ? un.facts.filter(f => f.worlds.length > 1) : [], differ = un ? un.disagreements || [] : [];
+    const unionHTML = un && (un.worlds || []).length > 1 ? `<details class="sv-sec sv-union"><summary><span class="k">in ${un.worlds.length} worlds</span> <span class="s">${agree.length} agreed · ${differ.length} differ · ${un.facts.length} facts in all</span></summary>` +
+      `<div class="s">${un.records.map(m => `${goHTML(local(m.path), local(m.path), m.name, 'n')}${wbs([m.world])}`).join(' · ')}</div>` +
+      (differ.length ? `<div class="sv-by-k">worlds differ</div>` + differ.map(d => `<div class="sv-hop sv-differ"><span class="lb">${esc(d.slot)}</span> ${Object.entries(d.values).map(([v, ws_]) => `${esc(v)}${wbs([...new Set(ws_.map(w => w.split(' ')[0]))])}`).join(' <span class="s">vs</span> ')}</div>`).join('') : '') +
+      (agree.length ? `<div class="sv-by-k">more than one world says</div>` + agree.map(factHTML).join('') : '') +
+      `<details class="sv-all"><summary class="s">everything each world says · ${un.facts.length}</summary>${un.facts.map(factHTML).join('')}</details></details>` : '';
+    const claimsBy = {};
+    for (const k of (cl && cl.kids) || []) { const c = k.slots || {}; if (c.slot && !c.retracted) (claimsBy[c.slot] = claimsBy[c.slot] || []).push(c); }
+    const claimsHTML = Object.keys(claimsBy).length ? `<div class="sv-sec"><div class="k">claims</div>${Object.entries(claimsBy).map(([slot, cs]) => {
+      const differs = new Set(cs.map(c => String(c.value).trim().toLowerCase())).size > 1;
+      return `<div class="sv-by"><div class="sv-by-k">${esc(slot)}${differs ? ' <span class="sv-differ">sources differ</span>' : ''}</div>${cs.map(c => {
+        const isPref = String(c.value).trim().toLowerCase() === String(rec[slot]).trim().toLowerCase();
+        const src = refOf(c.source);
+        return `<div class="sv-hop${isPref ? ' pref' : ''}">${esc(c.value)}${isPref ? ' <span class="s">preferred</span>' : ''} <span class="s">by ${esc(c.by || '?')}${c.day ? ' · ' + esc(c.day) : ''}</span>${src ? ' ' + goHTML(local(src.path), local(src.path), 'source', 'n') : ''}${c.why ? ` <span class="s">· ${esc(c.why)}</span>` : ''}</div>`;
+      }).join('')}</div>`;
+    }).join('')}</div>` : '';
+    put('.sv-rest', claimsHTML + unionHTML + (have ? '' : `<div class="sv-sec sv-back-sec"><div class="k">pointing here</div><div class="sv-empty">looking…</div></div>`));
+    // without the views (an old world), what points here comes from a walk, grouped by the slot it came in on
+    if (!have && source.backlinks) {
+      const rb = await source.backlinks(at);
+      if (mine !== drawn) return;
+      const groups = {}; for (const m of rb.matches) (groups[m.slot] = groups[m.slot] || []).push(m);
+      const sec = main.querySelector('.sv-back-sec');
+      if (sec) {
+        const hop = m => `<div class="sv-hop">${goHTML(m.path, m.path, m.path.replace(node + '/', ''), 'n')}${m.hole ? '<span class="h">waiting</span>' : ''}</div>`;
+        const slots = Object.keys(groups).sort();
+        const total = slots.reduce((n, k) => n + groups[k].length, 0);
+        sec.innerHTML = `<div class="k">pointing here${total ? ' · ' + total : ''}</div>` + (slots.map(k => `<div class="sv-by"><div class="sv-by-k">${esc(k)} <span class="n">${groups[k].length}</span></div>${groups[k].map(hop).join('')}</div>`).join('') || '<div class="sv-empty">nothing points here yet</div>');
+      }
+    }
+    return true;
+    } catch (error) {
+      main.innerHTML = `<div class="sv-note bad" role="alert">Could not load this view: ${esc(error.message || error)}</div>`;
+      return false;
+    }
+  }
+  draw();
+  if (source.follow) source.follow(msg => { if (msg.shown) return draw(); if (msg.quiet) return; if ((msg.touched || []).some(t => local(t) === at || local(t).startsWith(at + '/'))) { clearTimeout(timer); timer = setTimeout(draw, 300); } }, { backlog: false });
+  el.addEventListener('click', e => {
+    const o = e.target && e.target.closest ? e.target.closest('button.sv-open') : null;
+    if (o) { e.preventDefault(); if (openFolder) openFolder(o); return; }
+    const a = e.target && e.target.closest ? e.target.closest('a[data-go]') : null; if (!a) return;
+    e.preventDefault(); const href = a.getAttribute('href');
+    nav(href.slice(1));
+  });
+  return { draw };
+}
+
+const tagOf = path => { const segs = local(path).split('/'); if (segs[0] === 'x') return 'view'; const i = segs.indexOf('user'); const rest = segs.slice(i + 1); return rest.length >= 2 ? rest[rest.length - 2] : (rest[0] || ''); };
+
+// The optional inspector: /live?views=<folder>&who=<writer>, or ?at=<record>.
+function start(doc) {
+  const el = doc.getElementById('live'); if (!el) return null;
+  let current = null;
+  function mount() {
+    // The previous page's read subscription ends; assets are never refetched.
+    if (current) { try { current.stop(); } catch (e) { /* already gone */ } current = null; }
+    if (el._timer) { clearInterval(el._timer); el._timer = null; }
+    el.className = ''; el.innerHTML = '';
+    const q = new URLSearchParams(doc.location ? doc.location.search : '');
+    const views = local(q.get('views') || ''), who = q.get('who') || '', at = local(q.get('at') || '');
+    const source = mcpSource({views: at || views, who});
+    const mounted = at ? mountRecord(el, source, {at}) : mountViewer(el, source, {crumb: views, views});
+    current = { stop: () => { if (source.stop) source.stop(); } };
+    if (root.scrollTo) root.scrollTo(0, 0);
+    return mounted;
+  }
+  if (root.history && root.addEventListener) {
+    navigateTo = search => {
+      const q = String(search || '');
+      root.history.pushState(null, '', (root.location.pathname || '/live') + (q.startsWith('?') ? q : '?' + q));   // the query only; the path stays
+      mount();
+    };
+    root.addEventListener('popstate', () => mount());
+  }
+  return mount();
+}
+
+const GooLive = { mountViewer, mountRecord, tagOf, treeRenderers, mcpSource, start, slotLayout, recordHTML, actionHTML, moved, askedHTML, fromHTML, chainHTML, quietLine, contextTreeHTML, worldGraphHTML, graphHTML, stripHTML, crumbHTML, cellsHTML, lineHTML, qaChipHTML, qaHidden, qaFolderOf, referencedHTML,
+  adapt: { valueOf, slotsOf, nodeOf, readOf, answerOf, eventOf, labelOf, writtenOf, summary, world, local, spelling, folderOf, goHTML } };
+root.GooLive = GooLive;
+if (typeof module !== 'undefined') module.exports = GooLive;
+if (typeof document !== 'undefined') { if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => start(document)); else start(document); }
+})(globalThis);

@@ -1,10 +1,8 @@
 # Goo Unicode text infrastructure
 
-Deliver the shared Unicode shaping and direct-editing infrastructure that
-extends the [native block document plan](goo-document-workspace-plan.md).
-The B0–B4 block authoring prototype can use existing Grove forms and the selected
-branch's rendering coverage before this work is complete. General multilingual
-inline editing requires the qualification gates here. Grove applications keep
+Proposal for shared Unicode shaping and direct-editing infrastructure beyond
+the current [Goo document surface](../../extras/mounts/nenex/README.md).
+General multilingual inline editing requires the qualification gates here. Grove applications keep
 their declarative ownership model; Goo computes server layout and editing
 geometry, and Mash paints prepared glyphs and captures input. This specification
 owns the subsequent T1–T6 infrastructure tickets.
