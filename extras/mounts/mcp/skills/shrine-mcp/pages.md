@@ -130,6 +130,23 @@ filled slot carries `/filled`. Re-judge what relies on the record (`/r`). An
 answer that changes something elsewhere (a covered count, another page's
 need) changes it there; the page that asked keeps its words.
 
+## Where things live
+
+Facts about a thing live on that thing's own record (a supplier's price on the
+supplier), and the page links to it; what belongs to one page only lives
+beneath that page; shared things (people, businesses, needs) live at their own
+path, reused by every page that names them; what another world said stays in
+its mount, never copied into your facts. Suggest associations you notice
+("Keystone and Keystone Supply share a domain: same business?", "three pages
+mention anodizing: one page for it?") as marks with Accept; never merge or
+move anything on your own.
+
+A Shrine counterparty (a record with `peer`) is asked in its own world: the
+blanks are published to it as `/our/<peer>/ask/<id> {ask, text, about}`, its
+owner or agent answers by publishing back, and the answer fills the blanks
+here. Everyone else gets email (the questions and the reply link), a call
+when the owner or a rule says so, or a link the owner sends themself.
+
 ## Tidy, Send, and marks
 
 - **Tidy** (`<page>/tidy {at, selection?, why?}`, written when the owner presses

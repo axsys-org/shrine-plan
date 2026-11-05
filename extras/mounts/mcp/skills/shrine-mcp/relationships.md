@@ -243,9 +243,8 @@ answer of a cell meets its condition (with none, when the answer changes).
 With a check, an `on` wake runs you only when the check holds: a price
 change that stays under the ceiling wakes no one. A value nobody can read
 (a missing slot, an unacquired record, a threshold that is not a number) is
-unknown, and unknown wakes you: a check never silently skips. Make a cell when a condition must be
-watched while you sleep, or a number must be right on the page whenever
-anyone looks: "fewer than 3 covered" is a `count` over a `where` over the
+unknown, and unknown wakes you: a check never silently skips. Prefer an `on` wake with one check; make a cell only when a real case needs
+a computed condition watched while you sleep: "fewer than 3 covered" is a `count` over a `where` over the
 judgments, watched with `answer` and `below: 3`, so you are woken when the
 count drops, not on every price change. Cells are pure (`where`, `select`,
 `lookup`, `count`, `sum`, `avg`, `min`, `max`, `sort`, `top`, `by`,
