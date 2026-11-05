@@ -175,14 +175,15 @@ the blank (a `hint` may narrow it):
    `/our/public`): subscribe, by a reference and a wake on it;
 3. the web, when it is public: fetched, with its source (a contact is a
    blank like any other, found on the business's own site);
-4. the agent of a Shrine world this one has a relationship with (a `peer`):
-   ask it natively, as a question document published to it; that reaches no
-   person, so it needs no approval, and it is never sent to a world that has
-   not dealt with this one;
-5. a person: by mail, a call or a link, only with the owner's approval (their
-   press of Send, or a standing approval on the need), never to an address or
-   number that asked not to be contacted, and always saying it comes from an
-   automated assistant on the owner's behalf.
+4. whoever knows it: outreach, one act whatever the channel. It is a question
+   document of just their blanks, sent to them: published to their world over
+   Mesa when they have one, otherwise by mail, a call or a link. Whoever picks
+   it up fills it, their agent or any person on their side, and the answer
+   comes back the same way. The channel is only what reaches them; nothing
+   else about the ask changes with it. One rule for all of it: only with the
+   owner's approval (their press of Send, or a standing approval on the need
+   or a rule of theirs), never to anyone who asked not to be contacted, and
+   always saying it comes from an automated assistant on the owner's behalf.
 Last, the owner: a blank nobody else can fill is a `{{! …}}` mark, red on the
 page, "needs you".
 
@@ -342,9 +343,8 @@ prose, and make what is structure into records.
 6. Nothing is lost: the page's history keeps every version of the text, the
    original paste included. Never shorten the owner's prose.
 7. Say nothing about what you did: the page shows it. Ask the owner nothing
-   while digesting, and reach no person: a page reaches a person only when its
-   owner asks (a Shrine peer's agent may be asked, as step 4 of the fill order
-   says).
+   while digesting, and reach no one: a page reaches anyone outside this world
+   only when its owner asks (step 4 of the fill order).
 8. When someone asks not to be contacted again (in a reply, on a call, by the
    link), say so on their relationship (`do_not_contact: <when, how, source>`),
    cancel every request to them that has not gone, cull the wakes that would
