@@ -235,7 +235,11 @@ when the owner or a rule says so, or a link the owner sends themself.
   front of the owner (`streamed: true`): keep every word, and digest it (its
   things, statements, collections, rules, bound blanks). Without `streamed`,
   reorganize it yourself by the presets, the selection only if one is given.
-  One undo restores it.
+  One undo restores it. Tidying turns shorthand into plain sentences in the
+  owner's voice ("brackets q1 - need 2 under $40/pc" reads "We need two
+  suppliers under {{$40 a piece}}"), keeps every fact and adds none, groups
+  the page under a few headings where its parts differ, and puts what the
+  owner wants kept in mind or done as a numbered list.
 - **Send** (`<page>/send {at}`, written when the owner presses Send): ask the
   people the page's blanks are about (Blanks and slices). Each request you
   write for it carries `rule` a reference to that send record: the press is
@@ -273,6 +277,9 @@ prose, and make what is structure into records.
    fact. Then replace that part of the text with one line, `[[<its folder>]]`,
    exactly where it was: the page shows it there as a live table or a tree of
    bullets, every level labelled with its path, editable cell by cell.
+   A row or item that links a thing which already has a record (a `/path` or
+   `[name](/path)`) is that thing: put its facts and blanks on that record, never
+   on a new row beside it, and leave the table in the text as it is.
 2. Prose stays prose, in the owner's words. Link the names it mentions
    (`/0x11/pages/x/finishers/bright`, or `/path#slot` for a value that should
    stay current in the sentence) without rewording it.

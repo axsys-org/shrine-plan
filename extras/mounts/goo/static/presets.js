@@ -13,7 +13,7 @@
     const on = new Set(listed.filter((n) => IMPLEMENTED.includes(n)));
     listed.filter((n) => !IMPLEMENTED.includes(n)).forEach((n) => console.error(`Goo preset ${n} is listed but this renderer cannot draw it`));
     const h = Object.assign({
-      link: (p) => `<a href="#${esc(p)}" data-path="${esc(p)}">${esc(p.split("/").filter(Boolean).pop() || p)}</a>`,
+      link: (p, label) => `<a href="#${esc(p)}" data-path="${esc(p)}"${label ? ` data-label="${esc(label)}"` : ""}>${esc(label || p.split("/").filter(Boolean).pop() || p)}</a>`,
       live: (p, s) => `<span class="chip" contenteditable="false" data-live="${esc(p)}" data-slot="${esc(s)}">${esc(s)}</span>`,
       hole: (hint, bind) => `<span class="hole" contenteditable="false" data-hole="${esc(hint)}" data-bind="${esc(bind)}">${esc(hint || "blank")}</span>`,
       embed: (p) => `<div class="embed" contenteditable="false" data-embed="${esc(p)}"></div>`,
@@ -30,6 +30,7 @@
         return m;
       });
       if (on.has("hole")) t = t.replace(/_{3,}/g, () => put(h.hole("", "")));
+      if (on.has("link")) t = t.replace(/\[([^\]]+)\]\((\/[^)\s]+)\)/g, (m, label, p) => put(h.link(p, label)));
       if (on.has("source")) t = t.replace(/\^\[([^\]]+)\]/g, (m, b) => put(`<span class="src" contenteditable="false" data-src="${esc(b)}">${esc(b)}</span>`));
       if (on.has("code")) t = t.replace(/`([^`]+)`/g, (m, c) => put(`<code>${esc(c)}</code>`));
       t = esc(t);
@@ -104,7 +105,7 @@
           else if (d.missing !== undefined) s += `{{! ${d.missing}}}`;
           else if (d.src !== undefined) s += `^[${d.src}]`;
           else if (d.by) s += `— ${inl(n)}`;
-          else if (t === "A" && d.path) s += d.path;
+          else if (t === "A" && d.path) s += d.label ? `[${n.textContent}](${d.path})` : d.path;
           else if (t === "STRONG" || t === "B") s += `**${inl(n)}**`;
           else if (t === "EM" || t === "I") s += `*${inl(n)}*`;
           else if (t === "CODE") s += "`" + n.textContent + "`";
