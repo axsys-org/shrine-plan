@@ -17,9 +17,15 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
       # the world runtime: enki as pinned, with the fix for stale thunk update targets kept as GC roots
-      # (enki PR #50, rebased on main), which made long-lived worlds grow without bound under reads
+      # (enki PR #50, rebased on main), which made long-lived worlds grow without bound under reads;
+      # halted actors freed (each kept its thread and heap until exit); and the store collected while an
+      # actor waits in a syscall (a world always waits in Accept, so its store was never collected again)
       runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
-        patches = (old.patches or [ ]) ++ [ ./nix/enki-update-targets.patch ];
+        patches = (old.patches or [ ]) ++ [
+          ./nix/enki-update-targets.patch
+          ./nix/enki-free-halted-actors.patch
+          ./nix/enki-collect-while-parked.patch
+        ];
       });
     in {
       packages = forAllSystems (system: { runtime = runtimeFor system; });
