@@ -226,7 +226,7 @@ def kill_everything(sig=signal.SIGKILL):
 def write_config(wake=None):
     cfg = {'listen': f'127.0.0.1:{HOST_PORT}', 'origin': ORIGIN, 'rp_id': RP_ID, 'name': 'Shrine pilot host', 'state': STATE, 'shrine': BASE,
            'mounts': ['net', 'mcp', 'probe'], 'worlds': WORLDS, 'ports': {'world': WORLD_PORT, 'mesa': MESA_PORT, 'flow': FLOW_PORT}, 'node_base': '0x20',
-           'poll_ms': 300, 'gateways': {'mail': G}}
+           'poll_ms': 300, 'gateways': {'mail': G}, 'limits': {'fresh_lock': os.path.join(TEMP, 'fresh.lock')}}
     if wake: cfg['wake'] = wake
     json.dump(cfg, open(CONFIG, 'w'), indent=1)
 
