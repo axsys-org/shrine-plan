@@ -38,7 +38,8 @@ BIN = os.environ.get('SHRINE_MESA', '/Users/ianchanner/shrine-mesa/target/debug/
 if '--bin' in sys.argv: BIN = sys.argv[sys.argv.index('--bin') + 1]
 KEEP = '--keep' in sys.argv
 os.makedirs(os.path.join(BASE, '.check'), exist_ok=True)
-TEMP = tempfile.mkdtemp(prefix='relationship-', dir=os.path.join(BASE, '.check'))
+# GATE_TMP keeps the gate's worlds out of the source tree, which every world boot copies into the Nix store
+TEMP = tempfile.mkdtemp(prefix='relationship-', dir=os.environ.get('GATE_TMP') or os.path.join(BASE, '.check'))
 # ports: the pilot's defaults, or a base from the environment so the gate can run beside a live pilot (GATE_PORTS=8600)
 PORT_BASE = int(os.environ.get('GATE_PORTS', '8400'))
 HOST_PORT, WORLD_PORT, MESA_PORT, FLOW_PORT = PORT_BASE, PORT_BASE + 100, PORT_BASE + 1100, PORT_BASE + 1200

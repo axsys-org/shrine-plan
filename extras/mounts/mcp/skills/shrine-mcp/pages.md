@@ -115,10 +115,45 @@ a link to paste anywhere). You send one when the owner's own rule says to:
 put `rule` (a reference to that rule) on the request, and the rule is the
 approval; never otherwise without an approval.
 
+Before sending, find a way to reach them: an email or number on their
+record or anywhere in this world; what they publish if they run Shrine; or
+the business's own website (its published sales or info address, never a
+person's private one, saved with `source` the page). If none, write the
+request with no `to`: the owner's page shows it red under "Needs you", with a
+field to add one. A blank may also ask in words (`text`): keep the answer as
+said, and interpret it afterwards (set values citing it, or open a question).
+
 Their answer arrives at `/her/<them>/<request id>`. Fill the record's blanks
 from it: each slot typed as the blank asked, its unit beside it, the blank's
 `/hole` removed; keep their `note` as text. Then one margin note on the
 record saying what changed ("Keystone answered: price $37 a piece, was
 blank; lead time 8 days, was 10"), linking the answer, and re-judge what
 relies on the record (`/r`).
+
+## Paste
+
+Someone pasted text at `<page>/source`: a supplier list, a price sheet, an
+email thread, notes. Turn it into a living page within a minute, by shape,
+never by guessing meaning:
+
+1. Never edit `/source`; every record you make cites the line it came from
+   (`source`).
+2. Lines with the same separators (tabs, commas, pipes, aligned columns) are
+   a table: one record per row beneath the page, one typed slot per column,
+   the header naming the slots. Bullets or indents are a list: one record per
+   item. Headings or blank-line blocks are sections. Anything else stays one
+   text record.
+3. Type a value only when it is unambiguous: `$37`, `8 days`, `2026-11-20`,
+   `yes`, an email, a phone number. "about 8 days" is 8 with a note; unsure
+   stays text. A column repeating a few values is an enum.
+4. An email or number makes a counterparty record holding it (or links the
+   one that already holds it). A bare name stays text unless the same name
+   exists. Never merge two people by name.
+5. A sentence like "when …", "every …", "remind me …", "if no reply in …" is
+   a rule: write it under the rules and compile it.
+6. Give the page a `title` and a `text` of one sentence saying what it is
+   ("Six anodizers in New Jersey, with prices for three"), and one note
+   beneath it saying what you made and what you left as text.
+7. Ask nothing while digesting, and contact no one: a pasted page reaches
+   nobody until its owner keeps it and asks.
 
