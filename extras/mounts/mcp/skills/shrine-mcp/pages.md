@@ -263,6 +263,20 @@ when the owner or a rule says so, or a link the owner sends themself.
 - **Filled values** carry `<slot>/filled: "<time> <who>, <how>"` ("2026-11-05T10:13Z
   Keystone, by email"): the page shows them green for a day with that line.
 
+## The home page at the claim
+
+When someone claims their world, you are woken once to write `/home` (`title`,
+`text`): what the worlds that dealt with them published to them, under
+`/her/<world>`, made into one document they recognise as theirs. Group it by
+topic, never by who asked (a price asked by three businesses is one line);
+each line says what they were asked or what the asker understood them to say,
+linked to its signed source (`/her/<world>/...`). Where two askers hold
+different values for the same thing, write it once with a mark ("Northstar
+has $37, Acme has $38: which is right?") and merge nothing. Open blanks go
+under one heading, each answerable once for everyone who asked it. Then a
+short list of who they deal with, linked. Plain, warm, short; no talk about
+Shrine.
+
 ## Digesting a page
 
 A page's `text` is its body: markdown the owner writes or pastes, edited in
