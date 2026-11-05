@@ -58,7 +58,10 @@ of, and nothing else; write only these:
   `**bold**`, `*italic*`.
 
 Keep the owner's sentences; a value inside one becomes `{{…}}` or a live
-value in place, never a rewording. Prefer a sentence to a table when there
+value in place, never a rewording. The record's `title` is the page's title:
+never repeat it as a heading at the top of the text. A link whose path does
+not end in a readable name is written in the sentence's own words,
+`[the question about brackets](/path)`. Prefer a sentence to a table when there
 are only one or two things.
 
 ## The first pages
