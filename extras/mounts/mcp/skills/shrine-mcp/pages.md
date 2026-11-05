@@ -9,6 +9,58 @@ in ten seconds; the next useful step is one click or one sentence; it keeps
 its promise while nobody looks; who said each thing, and when, is visible;
 and it makes the next question, for this owner or anyone else, easier.
 
+## Every input is a source
+
+Whatever arrives (a paste, a dropped PDF or photo, a mail thread, a sheet, a
+chat export, meeting notes, a card, a page fetched from a site) is someone
+saying something, about things, at a time. Keep the source; take out its
+things and statements; everything else (tables, lists, the page itself) is a
+view over those. Four primitives:
+
+- a **source**: the original, never edited (`/sources/<hash> {name, kind,
+  size, at}`, its bytes kept by the host);
+- a **thing**: anything with a name or an identifier (a person, a business,
+  a part, a need, a place), a record with its identifier slots;
+- a **statement**: someone said X about a thing, at a time. What the owner
+  says is a fact on the thing's slots. What anyone else says stays theirs:
+  `{text, by, at, about, source}`, the source pinned to the span (a page, a
+  line, a message); a slot you derive from it carries `source` back to it;
+- a **collection**: several things sharing slots, a folder, shown as a table
+  or a list.
+
+Three tests for every part of every input, and nothing else is needed: is it
+a thing (a name or an identifier)? whose word is it (the owner's is a fact,
+anyone else's an attributed statement)? is it many of one shape (a
+collection)? When no test fires it stays text. Structure is earned: a name
+that matches a thing becomes a reference, a value with a unit a typed slot,
+a blank a hole, a repeated shape a collection; a bare document stays its
+headings and paragraphs. They blend: a mail with a quote attached is a
+thread of the sender's statements, a vendor's PDF of theirs with its page
+spans, a photo of a whiteboard the owner's notes; a to-do in meeting notes
+("ask Bob about anodizing") is a blank sent to Bob. These are examples, not
+rules to match: judge each input by the three tests.
+
+## The presets
+
+A page is drawn from one small library, the same pieces Goo's views are made
+of, and nothing else; write only these:
+
+- blocks: `#`, `##`, `###` headings; paragraphs; `-` lists, nested by two
+  spaces; `1.` numbered lists; a table (`| a | b |`, a header row) for a
+  collection; a quote (`> ` lines, the last one `> — Dana at Acme · email, 4
+  Nov`) for another's statement; `[[/path]]` for a record or folder shown
+  live where it stands; `---` a divider.
+- inline: `/path` a link (it shows the thing's name); `/path#slot` a live
+  value; `{{$37}}` a stated value (a number with its unit, a date, yes or
+  no); `{{? lead time}}` a blank, `{{? days /path#lead_time}}` a blank bound
+  to the slot its answer fills; `{{! no contact}}` something missing that
+  needs the owner; `^[quote p.1]` the source of the fact just before it;
+  `**bold**`, `*italic*`.
+
+Keep the owner's sentences; a value inside one becomes `{{…}}` or a live
+value in place, never a rewording. Prefer a sentence to a table when there
+are only one or two things.
+
 ## The first pages
 
 A business keeps four pages; make the ones that are missing, each a record
@@ -149,14 +201,26 @@ when the owner or a rule says so, or a link the owner sends themself.
 
 ## Tidy, Send, and marks
 
-- **Tidy** (`<page>/tidy {at, selection?, why?}`, written when the owner presses
-  Tidy or pastes a pile of text): the one time you reorganize the text
-  itself, by the rules below, the selection only if one is given. One undo
-  restores it.
+- **Tidy** (`<page>/tidy {at, selection?, why?, streamed?}`, written when the
+  owner presses Tidy, pastes a pile of text or drops a file): the one time the
+  text itself is reorganized. Usually the page has already streamed it in
+  front of the owner (`streamed: true`): keep every word, and digest it (its
+  things, statements, collections, rules, bound blanks). Without `streamed`,
+  reorganize it yourself by the presets, the selection only if one is given.
+  One undo restores it.
 - **Send** (`<page>/send {at}`, written when the owner presses Send): ask the
   people the page's blanks are about (Blanks and slices). Each request you
   write for it carries `rule` a reference to that send record: the press is
   the approval.
+- **Questions are documents.** Send makes one page per recipient beneath the
+  page, `<page>/asks/<name> {title, text, to, peer?, request?, at}`: its text
+  the questions as sentences with bound blanks (`Lead time: {{? days
+  /…/keystone#lead_time}}`), a reply to them, not a form. The recipient opens
+  the same page in their own world (`/her/<sender>/ask/<id>`) or on the reply
+  link, fills the blanks in place, and may write more beneath them; the owner
+  may add more questions to it later, and Send sends what is new. Their
+  answers and their added words are their statements; fill the bound slots
+  from them, and leave their words on the question page as said.
 - **Marks** are the only way you speak on a page, and only when you must: no
   way to reach someone, an answer that contradicts what the owner wrote, a
   suggestion ("Keystone and Keystone Supply share a domain: same business?").
