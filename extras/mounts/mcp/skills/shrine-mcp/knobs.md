@@ -85,13 +85,16 @@ stream line is its only one.
 ## The stream
 
 `GET <world-url>/mcp/stream` keeps the connection open as `text/event-stream`
-and receives one line per admitted write, `{epoch, label, who, touched,
-with}` (the written records rendered on the admitted snapshot, the same
-page render `then` uses), and one per presented read, `{shown: {path, care,
-case}}`. A commit never waits on a stream; a stream that stalls is dropped.
-`hands/stream.py` follows it from Python and polls `history after … with x`
-whenever the stream is not there, yielding the same lines either way; the
-ask hand runs on that.
+and receives one event per commit, from any writer, pushed as the world
+commits: `{epoch, who, touched, touched_count, woke, woke_count}` with the
+epoch as the event id (`woke`: the cells the commit wrote or whose inputs it
+changed, through the reverse index), and one per presented read, `{shown:
+{path, care, case}}`. `?after=<epoch>` replays every commit after that epoch
+from the journal before going live, so a reconnect misses nothing and repeats
+nothing; a live open says where it started as the comment `: at <epoch>`. A
+commit never waits on a stream; a slow stream catches up, it is not dropped.
+`hands/stream.py` follows it from Python (no polling); the ask hand runs on
+it. `PUSH.md` beside the mount has the whole contract.
 
 ## Apply
 

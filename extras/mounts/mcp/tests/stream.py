@@ -1,6 +1,6 @@
 """The stream in the foot, end to end: two clients hold GET /mcp/stream open, one write reaches both as one line within the
 write's own latency; a closed socket is dropped and the next write still reaches the other; a presented read arrives as
-{shown} and journals nothing.
+{shown} and journals nothing. (tests/push.py covers resuming, other writers and woke.)
 
 Usage: python3 -I -c "import runpy; runpy.run_path('extras/mounts/mcp/tests/stream.py')['check']('http://127.0.0.1:8300', '0x11', 120)"
 """
@@ -79,7 +79,7 @@ def check(base, node, timeout):
     t0 = time.perf_counter(); lb = b.event(); tb = 1000 * (time.perf_counter() - t0)
     expect('1 both streams got the write as one line: epoch, who, touched', (la['epoch'], lb['epoch'], la['who'], home + '/r1' in la['touched'], la == lb), (written['epoch'], written['epoch'], 'tester', True, True))
     expect('1 the line arrived within the write\'s own latency', ta < write_ms + 50 and tb < write_ms + 50, True)
-    expect('1 the line carries the written record under with', la['with'][home + '/r1']['properties']['/n'], '1')
+    expect('1 the line names the event id and what the commit woke (nothing here)', (la['touched_count'] >= 1, la['woke'], la['woke_count']), (True, [], 0))
 
     # 2. a closed socket is dropped; the next write still reaches the other stream and the write is not slowed
     b.close()

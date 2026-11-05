@@ -1,25 +1,33 @@
-"""Follow a world's stream: GET /mcp/stream as server-sent events, one JSON line per admitted write ({epoch, label, who,
-touched, with}) and per presented read ({shown}); when the stream cannot be opened or closes, fall back to polling
-`history after <seen> with x` and hand the same lines over, so a hand works the same either way.
+"""Follow a world's commits: GET /mcp/stream as server-sent events, pushed by the world as it commits, one per commit
+from any writer (MCP, a page, a mount, the filesystem, a reaction): {epoch, who, touched, touched_count, woke,
+woke_count}, with the epoch as the event id; and {shown} (no epoch) for a presented read. `woke` is the cells the
+commit woke through the reverse index: the cells it wrote and the cells reading what it changed, transitively.
 
-    for line in follow(base, node, seen=epoch_now):
+A stream opened without `after` starts at the top and says where, as the comment ": at <epoch>". A stream opened with
+?after=<epoch> first replays every commit after that epoch from the world's journal, then goes live, with no gap and
+no repeat. follow() keeps the last epoch it yielded and reconnects with it, so a dropped connection or a restarted
+world loses nothing. Nothing here polls: between commits the socket is silent.
+
+    for line in follow(base, seen=epoch):     # seen None: from now
         ...
-
-follow() yields lines in order and never returns; it reconnects to the stream after a close, polling meanwhile.
 """
 import json
 import socket
 import time
 import urllib.parse
-import urllib.request
 
 
 class Stream:
-    def __init__(self, base, timeout=30):
+    """A raw socket on GET /mcp/stream[?after=<epoch>]; at is the epoch a live open started from."""
+
+    def __init__(self, base, after=None, timeout=None):
         u = urllib.parse.urlparse(base)
-        self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
-        self.sock.sendall(b'GET /mcp/stream HTTP/1.0\r\nHost: localhost\r\n\r\n')
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=30)
+        self.sock.settimeout(timeout)
+        target = '/mcp/stream' + ('' if after is None else '?after=' + str(int(after)))
+        self.sock.sendall(('GET ' + target + ' HTTP/1.0\r\nHost: localhost\r\n\r\n').encode())
         self.buf = b''
+        self.at = after
         head = self._until(b'\r\n\r\n')
         if b'200' not in head.split(b'\r\n')[0] or b'text/event-stream' not in head:
             raise OSError('no stream at /mcp/stream')
@@ -34,11 +42,23 @@ class Stream:
         return head
 
     def event(self):
+        """The next event's data, parsed; a ": at <epoch>" comment sets self.at on the way."""
         while True:
-            block = self._until(b'\r\n\r\n').decode()
-            data = [l[6:] for l in block.split('\r\n') if l.startswith('data: ')]
+            lines = self._until(b'\r\n\r\n').decode().split('\r\n')
+            for l in lines:
+                if l.startswith(': at '):
+                    self.at = int(l[5:])
+            data = [l[6:] for l in lines if l.startswith('data: ')]
             if data:
                 return json.loads(''.join(data))
+
+    def opened_at(self):
+        """The epoch a live open started from: the ": at" comment, sent before any event."""
+        while self.at is None:
+            for l in self._until(b'\r\n\r\n').decode().split('\r\n'):
+                if l.startswith(': at '):
+                    self.at = int(l[5:])
+        return self.at
 
     def close(self):
         try:
@@ -47,53 +67,28 @@ class Stream:
             pass
 
 
-def poll(base, node, seen, timeout=120, limit=40):
-    """One page of events after `seen`, with x, as stream-shaped lines; returns (lines, new seen). A page the world
-    refuses as too large (events that wrote many big records) is asked for again with half the limit, down to one."""
-    while True:
-        body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': 'mcp/history', 'arguments': {'after': seen, 'limit': limit, 'with': 'x'}})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
-        result = json.load(urllib.request.urlopen(req, timeout=timeout))['result']
-        if 'structuredContent' in result:
-            page = result['structuredContent']
-            break
-        text = ''.join(c.get('text', '') for c in result.get('content', []))
-        if 'too large' in text and limit > 1:
-            limit = max(1, limit // 2)
-            continue
-        raise OSError('history refused: ' + text[:200])
-    lines = [{'epoch': e['epoch'], 'label': 'history', 'who': e.get('who'), 'touched': e['touched'], 'with': e.get('with') or {}} for e in page['events']]
-    return lines, (page.get('next') or (lines[-1]['epoch'] if lines else seen))
-
-
-def follow(base, node, seen=0, interval=2.0, log=print):
-    """Yield lines forever: from the stream while it is open, from the poll while it is not."""
+def follow(base, seen=None, log=print, retry=1.0):
+    """Yield lines forever, in epoch order, each commit once. seen is the last epoch already handled (None: from now);
+    after a drop the stream is reopened with after=<last epoch yielded>, retrying the connection every `retry` seconds
+    while the world is down (a retry on failure, not a wait for change)."""
     while True:
         stream = None
         try:
-            stream = Stream(base)
-            log('following /mcp/stream')
-            # anything that happened between the last line seen and the stream opening comes from one poll
-            lines, seen = poll(base, node, seen)
-            for line in lines:
-                yield line
+            stream = Stream(base, seen)
             while True:
                 line = stream.event()
+                if seen is None:
+                    seen = stream.at
                 if 'epoch' in line:
-                    seen = max(seen, line['epoch'])
+                    if seen is not None and line['epoch'] <= seen:
+                        continue
+                    seen = line['epoch']
                 yield line
         except (OSError, EOFError, ValueError) as e:
-            log(f'stream unavailable ({e}); polling')
+            if seen is None and stream is not None:
+                seen = stream.at
+            log(f'stream dropped ({e}); reconnecting after {seen}')
         finally:
             if stream:
                 stream.close()
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                lines, seen = poll(base, node, seen)
-            except Exception as e:
-                log(f'poll failed: {e}')
-                lines = []
-            for line in lines:
-                yield line
-            time.sleep(interval)
+        time.sleep(retry)

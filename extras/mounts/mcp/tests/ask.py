@@ -45,7 +45,7 @@ def check(base, node, timeout):
     e0 = epoch(); answered = hand.tick(); e1 = epoch()
     answer = w.read('/x' + cell, 'x')
     expect('2 the hand answered the ask once', answered, 1)
-    expect('2 one event for the answer plus one for the hand\'s seen mark', e1 - e0, 2)
+    expect('2 one event for the answer, nothing else written', e1 - e0, 1)
     expect('2 /x is the result record: the answer with its stamp (case, model, prompt)',
            (answer['exists'], answer['properties']['/answer'].startswith('3 records, amount total 600'), answer['properties']['/model'], answer['properties']['/prompt'], answer['properties']['/case']),
            (True, True, 'fake', 'How are the deals going?', ctx['/sys/tack/case']))
@@ -77,12 +77,11 @@ def check(base, node, timeout):
     expect('6 the hand answers a cell with no model slot', hand.tick(), 1)
     expect('6 and the cell shows the answer, stamped with the hand\'s model', (w.read('/x' + nomodel, 'x')['exists'], w.read('/x' + nomodel, 'x')['properties'].get('/model')), (True, 'fake'))
 
-    # 7. a fresh hand's first run answers what was already asking
+    # 7. a fresh hand's first run finds, through the reverse index, what was already asking
     waiting = home + '/views/waiting'
     w.tool('write', records=[{'path': waiting, 'slots': {'sys/weft': stdlib['ask'], 'sys/tack': tack, 'prompt': 'Still there?'}}])
-    w.tool('write', records=[{'path': '/' + node + '/agent/hands/ask/seen', 'action': 'cull'}], who='ask')
     fresh = ask_hand.Hand(w, model='fake', fake=True, log=lambda *a: None)
-    expect('7 a hand with no seen record starts from epoch 0', fresh.seen, 0)
-    expect('7 and its first tick answers the ask written before it existed', fresh.tick() >= 1, True)
+    expect('7 the reverse index lists every ask cell written so far', {cell, nomodel, waiting} <= fresh.discover(), True)
+    expect('7 and its first tick answers the ask written before it existed', fresh.pending() >= 1, True)
     expect('7 the waiting cell shows its answer', w.read('/x' + waiting, 'x')['exists'], True)
     print(json.dumps({'checks': len(checks), 'hand_calls': w.seq}), flush=True)
