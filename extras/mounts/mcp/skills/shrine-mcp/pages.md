@@ -130,30 +130,43 @@ record saying what changed ("Keystone answered: price $37 a piece, was
 blank; lead time 8 days, was 10"), linking the answer, and re-judge what
 relies on the record (`/r`).
 
-## Paste
+## Digesting a page
 
-Someone pasted text at `<page>/source`: a supplier list, a price sheet, an
-email thread, notes. Turn it into a living page within a minute, by shape,
-never by guessing meaning:
+A page's `text` is its body: markdown the owner writes or pastes, edited in
+place like any document. When it changes you are woken with the page. The
+text is a compact view of the world, not the world: keep what is prose as
+prose, and make what is structure into records.
 
-1. Never edit `/source`; every record you make cites the line it came from
-   (`source`).
-2. Lines with the same separators (tabs, commas, pipes, aligned columns) are
-   a table: one record per row beneath the page, one typed slot per column,
-   the header naming the slots. Bullets or indents are a list: one record per
-   item. Headings or blank-line blocks are sections. Anything else stays one
-   text record.
-3. Type a value only when it is unambiguous: `$37`, `8 days`, `2026-11-20`,
-   `yes`, an email, a phone number. "about 8 days" is 8 with a note; unsure
-   stays text. A column repeating a few values is an enum.
-4. An email or number makes a counterparty record holding it (or links the
-   one that already holds it). A bare name stays text unless the same name
-   exists. Never merge two people by name.
-5. A sentence like "when …", "every …", "remind me …", "if no reply in …" is
-   a rule: write it under the rules and compile it.
-6. Give the page a `title` and a `text` of one sentence saying what it is
-   ("Six anodizers in New Jersey, with prices for three"), and one note
-   beneath it saying what you made and what you left as text.
-7. Ask nothing while digesting, and contact no one: a pasted page reaches
-   nobody until its owner keeps it and asks.
+1. Structure becomes records. Bullets, nested bullets, numbered lists (nested
+   too) and tables are things: one record per item or row beneath the page
+   (a list or table gets its own folder, named for what it holds, e.g.
+   `<page>/finishers`), nesting as children, one typed slot per column or
+   fact. Then replace that part of the text with one line, `[[<its folder>]]`,
+   exactly where it was: the page shows it there as a live table or a tree of
+   bullets, every level labelled with its path, editable cell by cell.
+2. Prose stays prose, in the owner's words. Link the names it mentions
+   (`/0x11/pages/x/finishers/bright`, or `/path#slot` for a value that should
+   stay current in the sentence) without rewording it.
+3. A sentence that says what should happen ("ask anyone with no price",
+   "tell me when two are under $5", "every Monday…") is an instruction for
+   things near it or for this page. Compile it like a rule (a rule record
+   with `page` a reference to this page, its wakes, its `watching`) and put
+   `[[<the rule>]]` on the line after the sentence, so its status shows there.
+   Leave the sentence itself as written.
+4. Type a value only when it is unambiguous: `$37`, `8 days`, `2026-11-20`,
+   `yes`, an email, a number. "about 8 days" is 8 with a note; unsure stays
+   text. A column repeating a few values is an enum.
+5. An email or number makes or reuses a counterparty record holding it. A
+   bare name links only to a record that already has that exact name. Never
+   merge two people by name.
+6. Nothing is lost: the page's history keeps every version of the text, the
+   original paste included. Never shorten the owner's prose.
+7. Say what you did in one note beneath the page. Ask nothing while
+   digesting, and contact no one: a page reaches nobody until its owner asks.
+
+A page asking someone something is a page with blanks: the blanks are its
+questions, the request carries them, and their answer fills them where they
+are, with the effect shown on the line. Treat a counterparty's reply page as
+the other side of the same document: what they answer is their record,
+published to you, shown beside yours.
 
