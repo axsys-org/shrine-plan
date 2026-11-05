@@ -147,7 +147,7 @@ To someone not on Shrine, a mail that asks for facts should also shape the reply
 so answering takes a few taps instead of a letter. Two optional slots on the request:
 
 - `ask`: one line per answer you need, `name (type): hint`, type `number`, `date`, `yesno`, `text`, or
-  `choice: a | b | c`. Few fields, named as the slot you will read back: `price (number): per piece, at
+  `choice: a | b | c`, or `reference: Keystone /path | Acme /path` (which thing, among names you offer; the answer is the path). Few fields, named as the slot you will read back: `price (number): per piece, at
   500 a month`, `lead_time (number): days`, `capacity (number): a month`.
 - `show_1`, `show_2`, …: typed references to what they should see beside the question, at the care you
   want shown (`/h/x/0/<len>/<path>` a record, `/h/y/...` its children): the need, what you understood

@@ -86,7 +86,7 @@ they have been asked, their rules.
 
 One fact, one slot; the slot's name is the fact in lower_snake, generic and
 reusable (`price`, `lead_time`, `capacity`, `min_quantity`, `valid_until`,
-`taking_orders`, `finish`), never a sentence and never a unit. Four kinds:
+`taking_orders`, `finish`), never a sentence and never a unit. Five kinds:
 
 - a number, with its unit beside it: `price: 37.50` and `price/unit:
   USD/each`; `lead_time: 8`, `lead_time/unit: day`; `capacity: 1000`,
@@ -97,6 +97,7 @@ reusable (`price`, `lead_time`, `capacity`, `min_quantity`, `valid_until`,
 - an enum: a short value (`anodized_clear`) with `finish/enum` a reference
   to one record the world owns listing every value and its label
   (`/enums/finish {anodized_clear: "Anodized, clear", raw: "Raw"}`).
+- a reference, for which thing: a typed reference to the record it means.
 - text, for what does not decompose: notes, descriptions, a rule.
 
 Dates are `YYYY-MM-DD` (a time `YYYY-MM-DDTHH:MM:SSZ`); a slot whose
@@ -153,10 +154,37 @@ like any publication, and keep their wording as the `source`.
 
 ## Blanks and slices
 
-A blank is a fact asked for and not yet known: `<slot>/hole` on the record,
-its kind in the `ask` grammar (`number USD/each: at 500 a month`, `date`,
-`yesno`, `choice: a | b`, `text`), the slot itself absent. The page shows it
-as a blank. Make blanks where a fact a need or a rule depends on is missing.
+Everything is one shape: a name with slots and children. A slot with a
+value is something known; a slot without one is a blank, and blanks are where
+behaviour starts (filling, asking, watching). A blank is `<slot>/hole` on
+the record, its kind in the `ask` grammar (`number USD/each: at 500 a month`,
+`date`, `yesno`, `choice: a | b`, `reference: Keystone /path | Acme /path`,
+`text`), the slot itself absent. The page shows it as a blank; an inline
+`{{? …}}` in prose is only a view of that slot. Make blanks where a fact a
+need or a rule depends on is missing. A blank with a "when" (by Friday, on a
+change, after an answer) is a wake on that slot: blanks and wakes are the
+whole behaviour layer, both ordinary records.
+
+Where a blank is filled from, in this order, and you never need it written on
+the blank (a `hint` may narrow it): this world (another page or name already
+knows it, so reference it); a related world that publishes it (subscribe);
+a person who knows it (asked, their contact from this world, a relationship,
+or the business's own site); the web, when it is public (fetched, with its
+source). Last, the owner: a blank nobody else can fill is a `{{! …}}` mark,
+red on the page, "needs you".
+
+Whose word a fill is decides where it is written. The owner's fill is a fact
+on the slot. Anyone else's (a person's answer, another world's publication,
+a page on the web) is their statement (`text, by, at, source`), and the slot
+gets a value derived from it carrying `source` back to it, so correcting one
+never silently rewrites the other. A value that has gone stale (older than a
+rule allows, or a published case moved on) keeps its value and its age, and
+gets a blank beside it again: the old answer is what the next ask prefills
+("last time you said $37").
+
+Effects are not a thing to build: a fill is a write to a name, everything
+that references the name sees it, and whatever watches it wakes, and may open
+new blanks, ask someone else, or fill another blank.
 
 A slice is a record's blanks sent to someone: a request with `ask` built
 from the blanks, `show_1` the record, `relationship` the record, and the
