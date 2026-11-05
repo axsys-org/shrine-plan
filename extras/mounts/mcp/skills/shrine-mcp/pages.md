@@ -168,13 +168,23 @@ need or a rule depends on is missing. A blank with a "when" (by Friday, on a
 change, after an answer) is a wake on that slot: blanks and wakes are the
 whole behaviour layer, both ordinary records.
 
-Where a blank is filled from, in this order, and you never need it written on
-the blank (a `hint` may narrow it): this world (another page or name already
-knows it, so reference it); a related world that publishes it (subscribe);
-a person who knows it (asked, their contact from this world, a relationship,
-or the business's own site); the web, when it is public (fetched, with its
-source). Last, the owner: a blank nobody else can fill is a `{{! …}}` mark,
-red on the page, "needs you".
+Where a blank is filled from, cheapest first, and you never need it written on
+the blank (a `hint` may narrow it):
+1. this world: another page or name already knows it, so reference it;
+2. a world that publishes it to this one (`/her/<peer>/…`, or a peer's
+   `/our/public`): subscribe, by a reference and a wake on it;
+3. the web, when it is public: fetched, with its source (a contact is a
+   blank like any other, found on the business's own site);
+4. the agent of a Shrine world this one has a relationship with (a `peer`):
+   ask it natively, as a question document published to it; that reaches no
+   person, so it needs no approval, and it is never sent to a world that has
+   not dealt with this one;
+5. a person: by mail, a call or a link, only with the owner's approval (their
+   press of Send, or a standing approval on the need), never to an address or
+   number that asked not to be contacted, and always saying it comes from an
+   automated assistant on the owner's behalf.
+Last, the owner: a blank nobody else can fill is a `{{! …}}` mark, red on the
+page, "needs you".
 
 Whose word a fill is decides where it is written. The owner's fill is a fact
 on the slot. Anyone else's (a person's answer, another world's publication,
@@ -331,8 +341,15 @@ prose, and make what is structure into records.
    merge two people by name.
 6. Nothing is lost: the page's history keeps every version of the text, the
    original paste included. Never shorten the owner's prose.
-7. Say nothing about what you did: the page shows it. Ask nothing while
-   digesting, and contact no one: a page reaches nobody until its owner asks.
+7. Say nothing about what you did: the page shows it. Ask the owner nothing
+   while digesting, and reach no person: a page reaches a person only when its
+   owner asks (a Shrine peer's agent may be asked, as step 4 of the fill order
+   says).
+8. When someone asks not to be contacted again (in a reply, on a call, by the
+   link), say so on their relationship (`do_not_contact: <when, how, source>`),
+   cancel every request to them that has not gone, cull the wakes that would
+   reach them, and never write another request to that address or number. The
+   gateway refuses them too; you say it first.
 
 A page asking someone something is a page with blanks: the blanks are its
 questions, the request carries them, and their answer fills them where they
