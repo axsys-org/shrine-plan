@@ -298,9 +298,9 @@ when the rule changes and compile it again.
 When the owner edits anything else (a cell, a sentence, a new record) you are
 run with the path. The owner's edit wins in their world: never revert it. Read
 what changed (`history`), find what relies on it through `/r/<len>/<path>`,
-re-judge those, and if it was a rule, act if it now applies. Then say what you
-did in one line beneath it, `<path>/talk/a<n> {text, by: agent, at}`, so the
-owner sees the edit was understood.
+re-judge those, and if it was a rule, act if it now applies. Say nothing
+about it: the page shows what changed (see the page skill, Tidy, Send, and
+marks).
 
 ## One fact in one place
 
