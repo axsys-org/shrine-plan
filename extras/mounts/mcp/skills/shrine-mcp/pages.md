@@ -99,3 +99,26 @@ USD/each)`, `ready (yesno)`, `finish (enum /0x11/enums/finish)`), so their
 answer comes back typed and the reply page shows each field with its unit.
 Their answer lands at `/her/<them>/<request>`: digest it into your records
 like any publication, and keep their wording as the `source`.
+
+## Blanks and slices
+
+A blank is a fact asked for and not yet known: `<slot>/hole` on the record,
+its kind in the `ask` grammar (`number USD/each: at 500 a month`, `date`,
+`yesno`, `choice: a | b`, `text`), the slot itself absent. The page shows it
+as a blank. Make blanks where a fact a need or a rule depends on is missing.
+
+A slice is a record's blanks sent to someone: a request with `ask` built
+from the blanks, `show_1` the record, `relationship` the record, and the
+question in plain words. The owner sends one from the page ("Ask by email",
+which is their approval, or "Copy link", which sends nothing and gives them
+a link to paste anywhere). You send one when the owner's own rule says to:
+put `rule` (a reference to that rule) on the request, and the rule is the
+approval; never otherwise without an approval.
+
+Their answer arrives at `/her/<them>/<request id>`. Fill the record's blanks
+from it: each slot typed as the blank asked, its unit beside it, the blank's
+`/hole` removed; keep their `note` as text. Then one margin note on the
+record saying what changed ("Keystone answered: price $37 a piece, was
+blank; lead time 8 days, was 10"), linking the answer, and re-judge what
+relies on the record (`/r`).
+
