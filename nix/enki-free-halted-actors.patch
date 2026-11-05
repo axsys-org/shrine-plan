@@ -1,0 +1,186 @@
+diff --git a/pkg/enki/src/actor.c b/pkg/enki/src/actor.c
+index 8488840..8e62ce2 100644
+--- a/pkg/enki/src/actor.c
++++ b/pkg/enki/src/actor.c
+@@ -64,9 +64,12 @@ static _Thread_local er_mt_worker* er_current_worker;
+ static void er_gc2_roots(pl_root_visit visit, void* ctx, void* source) {
+   er_scheduler* sys = source;
+   pthread_mutex_lock(&sys->mu);
+-  for (er_actor* a = sys->all_head; a; a = a->all_next)
++  for (er_actor* a = sys->all_head; a; a = a->all_next) {
+     for (er_msg* m = a->mbox_head; m; m = m->next)
+       visit(&m->payload, ctx);
++    if (a->reaped)
++      visit(&a->result, ctx);
++  }
+   pthread_mutex_unlock(&sys->mu);
+ }
+ 
+@@ -160,8 +163,10 @@ void er_scheduler_free(er_scheduler* sys) {
+       m = mn;
+     }
+     free(a->handle_v);
+-    a->t->host = NULL; /* the backpointer dies with the actor */
+-    a->t->rplan_effect_f = NULL;
++    if (a->t != NULL) {
++      a->t->host = NULL; /* the backpointer dies with the actor */
++      a->t->rplan_effect_f = NULL;
++    }
+     if (!a->adopted) { /* adopted threads/heaps stay with the embedder */
+       pl_thread_free(a->t);
+       pl_heap_free(a->heap);
+@@ -198,7 +203,7 @@ er_actor* er_scheduler_actor_by_id(er_scheduler* sys, uint64_t id) {
+ 
+ pl_val er_actor_result(er_actor* a) {
+   ax_assume(a->status == ER_ACTOR_HALTED, "er_actor_result: not halted");
+-  return pl_thread_result(a->t);
++  return a->reaped ? a->result : pl_thread_result(a->t);
+ }
+ 
+ /* ── Run queue / handle table ──────────────────────────────────────────── */
+@@ -736,6 +741,42 @@ static void er_service(er_scheduler* sys, er_actor* a, bool locked) {
+ 
+ /* ── The executor loop ─────────────────────────────────────────────────── */
+ 
++static bool er_pin_payload(er_actor* a, pl_val v, pl_val* out);
++
++/*
++ * A halted spawned actor is never resumed and nothing reads its thread or
++ * heap again: free them, its unread mailbox and its handle table, keeping
++ * only the result (snapshotted into the store and rooted by er_gc2_roots)
++ * and the actor record that handles and ids still name.  Without this every
++ * actor ever spawned kept its thread stacks and trimmed semispaces until
++ * er_scheduler_free, so a program spawning one per request grew without
++ * bound.  Runs inside the store mutator scope of the slice that finished;
++ * the store lock pl_heap_free takes nests inside sys->mu as it does
++ * elsewhere (the collector, which takes them the other way round, cannot
++ * mark while this scope is open).
++ */
++static void er_reap(er_actor* a) {
++  if (a->adopted || a->reaped)
++    return;
++  (void)er_pin_payload(a, pl_thread_result(a->t), &a->result);
++  for (er_msg* m = a->mbox_head; m != NULL;) {
++    er_msg* mn = m->next;
++    free(m);
++    m = mn;
++  }
++  a->mbox_head = a->mbox_tail = NULL;
++  free(a->handle_v);
++  a->handle_v = NULL;
++  a->handle_cap = 0;
++  a->t->host = NULL;
++  a->t->rplan_effect_f = NULL;
++  pl_thread_free(a->t);
++  pl_heap_free(a->heap);
++  a->t = NULL;
++  a->heap = NULL;
++  a->reaped = true;
++}
++
+ /* One scheduling step of a spawned (scheduler-owned) actor. */
+ static void er_step(er_scheduler* sys, er_actor* a, pl_run_status s,
+                     bool locked) {
+@@ -744,8 +785,8 @@ static void er_step(er_scheduler* sys, er_actor* a, pl_run_status s,
+     er_enqueue(a); /* round-robin fairness */
+     break;
+   case PL_RUN_DONE:
+-    a->status = ER_ACTOR_HALTED; /* result discarded (kept for tests) */
+-    pl_gc_trim(a->t);
++    a->status = ER_ACTOR_HALTED;
++    er_reap(a); /* the result stays readable (er_actor_result) */
+     break;
+   case PL_RUN_EXN:
+     er_crash(a);
+diff --git a/pkg/enki/src/actor_internal.h b/pkg/enki/src/actor_internal.h
+index 9a623a5..5c6bb33 100644
+--- a/pkg/enki/src/actor_internal.h
++++ b/pkg/enki/src/actor_internal.h
+@@ -40,6 +40,8 @@ struct er_actor {
+   er_http_xfer* http;  /* non-NULL: parked on a Fetch, not on Recv */
+   bool effectful;      /* has initiated a descriptor-marked host effect */
+   er_mt_worker* owner; /* dedicated MT worker after the first effect */
++  bool reaped;   /* halted: thread, heap, mailbox and handles freed */
++  pl_val result; /* a reaped actor's result, store-resident (a GC2 root) */
+   er_actor* qnext;
+   er_actor* all_next;
+ };
+diff --git a/tests/unit/test_enki_actor.c b/tests/unit/test_enki_actor.c
+index 649c89e..57cb80e 100644
+--- a/tests/unit/test_enki_actor.c
++++ b/tests/unit/test_enki_actor.c
+@@ -934,15 +934,70 @@ TEST(actor, halted_actor_releases_unreachable_scratch) {
+     ASSERT_EQ(er_scheduler_run(sys), ER_RUN_IDLE);
+     ASSERT_EQ(er_actor_state(a), ER_ACTOR_HALTED);
+     ASSERT_EQ(er_actor_result(a), 42);
+-    ASSERT(pl_gc_live_cells(t->heap) < 64,
+-           "terminated actor retains only its live result, not scratch");
+-    ASSERT(pl_gc_headroom(t) + pl_gc_live_cells(t->heap) <= 8192,
+-           "terminated actor releases its oversized physical semispaces");
++    ASSERT(er_actor_thread(a) == NULL,
++           "terminated actor releases its thread and semispaces entirely");
+   }
+   er_scheduler_free(sys);
+   test_rt_free(&rt);
+ }
+ 
++static size_t resident_kib(void) {
++  FILE* f = fopen("/proc/self/statm", "r");
++  if (f == NULL)
++    return 0;
++  unsigned long size = 0, resident = 0;
++  int got = fscanf(f, "%lu %lu", &size, &resident);
++  fclose(f);
++  return got == 2 ? resident * (size_t)sysconf(_SC_PAGESIZE) / 1024 : 0;
++}
++
++/* A program that spawns an actor per request (a connection, a read) must not
++ * keep each finished actor: thousands of actors that grew their heaps and
++ * halted leave only their results, under both executors. */
++TEST(actor, halted_actors_do_not_accumulate) {
++  for (unsigned mt = 0; mt < 2; mt++) {
++    test_rt rt = test_rt_new();
++    er_scheduler* sys =
++        er_scheduler_new(rt.store, (er_config){.heap_cells = 65536});
++    er_mt_executor* ex =
++        mt ? er_mt_executor_new(sys, (er_mt_config){.workers = 4}) : NULL;
++    size_t before = 0;
++    enum { ROUNDS = 20, PER = 50 };
++    for (unsigned r = 0; r < ROUNDS; r++) {
++      er_actor* actors[PER];
++      for (unsigned i = 0; i < PER; i++) {
++        er_actor* a = actors[i] = er_scheduler_actor(sys);
++        pl_thread* t = er_actor_thread(a);
++        size_t base = t->vsp;
++        pl_vpush(t, 0);
++        for (size_t j = 0; j < 64; j++)
++          t->vstack[base] = test_app2(t, 0, j, t->vstack[base]);
++        t->vsp = base;
++        er_actor_start(a, actor_fn(t, 1000 + r * PER + i));
++      }
++      ASSERT_EQ(mt ? er_mt_executor_run(ex) : er_scheduler_run(sys),
++                ER_RUN_IDLE);
++      for (unsigned i = 0; i < PER; i++) {
++        ASSERT_EQ(er_actor_state(actors[i]), ER_ACTOR_HALTED);
++        ASSERT_EQ(er_actor_result(actors[i]), 1000 + r * PER + i);
++        ASSERT(er_actor_thread(actors[i]) == NULL,
++               "a halted actor keeps its thread");
++      }
++      if (r == 1)
++        before = resident_kib();
++    }
++    size_t after = resident_kib();
++    /* 900 actors past the baseline: kept, each holds at least its trimmed
++     * semispace pair (64 KiB) and its stacks, over 60 MB in all.  Few
++     * allocations each, so the test stays cheap under GC_STRESS. */
++    ASSERT(after < before + 24 * 1024,
++           "finished actors accumulate resident memory");
++    er_mt_executor_free(ex);
++    er_scheduler_free(sys);
++    test_rt_free(&rt);
++  }
++}
++
+ /* GC2 must see messages and suspended roots while different workers take
+  * turns requesting collections. Keep the allocation budget deliberately tiny.
+  */

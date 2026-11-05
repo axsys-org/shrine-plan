@@ -1,0 +1,269 @@
+diff --git a/pkg/enki/src/actor.c b/pkg/enki/src/actor.c
+index 8e62ce2..abb8c48 100644
+--- a/pkg/enki/src/actor.c
++++ b/pkg/enki/src/actor.c
+@@ -708,8 +708,10 @@ static void er_service(er_scheduler* sys, er_actor* a, bool locked) {
+       uint64_t secs = pl_nat_u64_clamp(args[0]);
+       struct timespec ts = {.tv_sec = (time_t)secs, .tv_nsec = 0}, rem;
+       er_service_unlock(sys, locked);
++      pl_store_mutator_park(sys->store);
+       while (nanosleep(&ts, &rem) == -1 && errno == EINTR)
+         ts = rem;
++      pl_store_mutator_unpark(sys->store);
+       er_service_relock(sys, locked);
+     }
+     pl_thread_deposit(t, 0);
+diff --git a/pkg/enki/src/http.c b/pkg/enki/src/http.c
+index a4ca3ee..67aef39 100644
+--- a/pkg/enki/src/http.c
++++ b/pkg/enki/src/http.c
+@@ -1065,7 +1065,9 @@ bool er_http_mt_pump(er_scheduler* sys) {
+   pthread_mutex_unlock(&sys->mu);
+   int running = 0;
+   curl_multi_perform(sys->curlm, &running);
++  pl_store_mutator_park(sys->store);
+   curl_multi_poll(sys->curlm, NULL, 0, 100, NULL); /* bounded: stay stealable */
++  pl_store_mutator_unpark(sys->store);
+   curl_multi_perform(sys->curlm, &running);
+   pthread_mutex_lock(&sys->mu);
+   sys->http_pumping = false;
+@@ -1087,7 +1089,9 @@ static void er_http_wait_for_done(er_scheduler* sys) {
+     er_http_harvest(sys);
+     if (sys->http_done_head != NULL)
+       break;
++    pl_store_mutator_park(sys->store);
+     curl_multi_poll(sys->curlm, NULL, 0, 1000, NULL);
++    pl_store_mutator_unpark(sys->store);
+   }
+ }
+ 
+diff --git a/pkg/plan/include/plan/store.h b/pkg/plan/include/plan/store.h
+index 68c55ea..d68bc2b 100644
+--- a/pkg/plan/include/plan/store.h
++++ b/pkg/plan/include/plan/store.h
+@@ -149,6 +149,15 @@ void pl_store_mutator_leave(pl_store* s);
+  * outermost scope exits. Existing waiters reopen the gate so other actors
+  * can finish the effect. No-op when there is no enclosing scope. */
+ void pl_store_mutator_blocking(pl_store* s);
++/* Around the syscall alone of a blocking host effect (accept, read into a
++ * malloc buffer, write from rooted bytes, sleep, curl's poll): nothing in the
++ * heap or the store is touched until unpark, so the collector may mark
++ * without this mutator, and unpark waits out a mark in progress.  A blocking
++ * scope that is parked no longer defers collection: without this a server,
++ * always parked in Accept somewhere, never collected the store again.
++ * No-op outside a scope. */
++void pl_store_mutator_park(pl_store* s);
++void pl_store_mutator_unpark(pl_store* s);
+ void pl_store_gc_add_roots(pl_store* s, pl_root_source fn, void* ctx);
+ void pl_store_gc_del_roots(pl_store* s, pl_root_source fn, void* ctx);
+ void pl_store_gc_request(pl_store* s);
+diff --git a/pkg/plan/src/gc2.c b/pkg/plan/src/gc2.c
+index 097e6e0..3c1dc96 100644
+--- a/pkg/plan/src/gc2.c
++++ b/pkg/plan/src/gc2.c
+@@ -55,6 +55,7 @@ typedef struct gc2_scope {
+   pl_store* store;
+   size_t depth;
+   bool blocking;
++  bool parked; /* inside a syscall that touches neither heap nor store */
+   struct gc2_scope* next;
+ } gc2_scope;
+ static _Thread_local gc2_scope* scopes;
+@@ -125,6 +126,40 @@ void pl_store_mutator_blocking(pl_store* s) {
+   pthread_mutex_unlock(&g->world_mu);
+ }
+ 
++void pl_store_mutator_park(pl_store* s) {
++  if (!s)
++    return;
++  gc2_scope* sc = scope_for(s);
++  if (!sc || sc->parked)
++    return;
++  struct pl_gc2* g = s->gc2;
++  pthread_mutex_lock(&g->world_mu);
++  sc->parked = true;
++  ax_assume(g->active != 0, "gc2 park without an active scope");
++  g->active--;
++  if (sc->blocking)
++    g->blocking--;
++  pthread_cond_broadcast(&g->world_cv);
++  pthread_mutex_unlock(&g->world_mu);
++}
++
++void pl_store_mutator_unpark(pl_store* s) {
++  if (!s)
++    return;
++  gc2_scope* sc = scope_for(s);
++  if (!sc || !sc->parked)
++    return;
++  struct pl_gc2* g = s->gc2;
++  pthread_mutex_lock(&g->world_mu);
++  while (g->stopped)
++    pthread_cond_wait(&g->world_cv, &g->world_mu);
++  g->active++;
++  if (sc->blocking)
++    g->blocking++;
++  sc->parked = false;
++  pthread_mutex_unlock(&g->world_mu);
++}
++
+ void pl_store_gc_add_roots(pl_store* s, pl_root_source fn, void* ctx) {
+   pl_store_mutator_enter(s);
+   pthread_mutex_lock(&s->mu);
+diff --git a/pkg/plan/src/rplan.c b/pkg/plan/src/rplan.c
+index 359ae4a..ff26e1a 100644
+--- a/pkg/plan/src/rplan.c
++++ b/pkg/plan/src/rplan.c
+@@ -24,6 +24,7 @@
+ #include "internal.h"
+ #include "plan/nat.h"
+ #include "plan/rplan.h"
++#include "plan/store.h"
+ #include "plan/xtract.h"
+ 
+ /*
+@@ -48,10 +49,14 @@
+ 
+ #define ARG(i) (t->vstack[ab + (i)])
+ 
+-static int rp_write_all(int fd, const uint8_t* bytes, size_t len) {
++static int rp_write_all(pl_thread* t, int fd, const uint8_t* bytes,
++                        size_t len) {
++  pl_store* s = pl_heap_store(t->heap);
+   size_t off = 0;
+   while (off < len) {
++    pl_store_mutator_park(s); /* bytes belong to a rooted argument */
+     ssize_t r = write(fd, bytes + off, len - off);
++    pl_store_mutator_unpark(s);
+     if (r < 0) {
+       if (errno == EINTR)
+         continue;
+@@ -292,7 +297,7 @@ static pl_val rp_output_fd(pl_thread* t, size_t ab, size_t handle) {
+     free(b);
+     pl_raise_msg(t, "Output: closed");
+   }
+-  int rc = rp_write_all(fd, b, n);
++  int rc = rp_write_all(t, fd, b, n);
+   int write_errno = errno;
+   (void)ax_fd_release(handle);
+   errno = write_errno;
+@@ -318,7 +323,7 @@ pl_val pl_op82_print(pl_thread* t, size_t ab) {
+     free(b);
+     pl_raise_msg(t, "Print: closed");
+   }
+-  int rc = rp_write_all(fd, b, n);
++  int rc = rp_write_all(t, fd, b, n);
+   int write_errno = errno;
+   (void)ax_fd_release(STDOUT_FILENO);
+   errno = write_errno;
+@@ -549,7 +554,7 @@ pl_val pl_op82_write_file(pl_thread* t, size_t ab) {
+   free(path);
+   size_t n;
+   uint8_t* b = rp_nat_bytes(rp_want_nat(t, ARG(1)), true, &n);
+-  int rc = rp_write_all(fd, b, n);
++  int rc = rp_write_all(t, fd, b, n);
+   free(b);
+   if (rc < 0) {
+     perror("failed to write file");
+@@ -715,7 +720,9 @@ pl_val pl_op82_accept(pl_thread* t, size_t ab) {
+   int listen_fd;
+   if (ax_fd_acquire((size_t)h, &listen_fd) < 0)
+     pl_raise_msg(t, "Accept: bad handle");
++  pl_store_mutator_park(pl_heap_store(t->heap));
+   int client_fd = accept(listen_fd, NULL, NULL);
++  pl_store_mutator_unpark(pl_heap_store(t->heap));
+   int accept_errno = errno;
+   (void)ax_fd_release((size_t)h);
+   errno = accept_errno;
+@@ -740,10 +747,12 @@ pl_val pl_op82_read(pl_thread* t, size_t ab) {
+   uint8_t* buf = malloc(n ? n : 1);
+   ax_assume(buf != NULL, "oom");
+   ssize_t r;
++  pl_store_mutator_park(pl_heap_store(t->heap));
+   do {
+     r = read(fd, buf, n);
+   } while (r < 0 && errno == EINTR);
+   int read_errno = errno;
++  pl_store_mutator_unpark(pl_heap_store(t->heap));
+   (void)ax_fd_release((size_t)h);
+   errno = read_errno;
+   if (r < 0) {
+@@ -767,7 +776,7 @@ pl_val pl_op82_write(pl_thread* t, size_t ab) {
+     pl_raise_msg(t, "Write: bad handle");
+   size_t n;
+   uint8_t* b = rp_nat_bytes(ARG(1), true, &n);
+-  int rc = rp_write_all(fd, b, n);
++  int rc = rp_write_all(t, fd, b, n);
+   int write_errno = errno;
+   (void)ax_fd_release((size_t)h);
+   errno = write_errno;
+diff --git a/tests/unit/test_plan_gc2.c b/tests/unit/test_plan_gc2.c
+index 210988f..a7bb430 100644
+--- a/tests/unit/test_plan_gc2.c
++++ b/tests/unit/test_plan_gc2.c
+@@ -237,6 +237,7 @@ typedef struct handshake {
+   bool ready, release;
+   atomic_bool collecting, done;
+   pl_val value;
++  pl_thread* t;
+ } handshake;
+ static void* mutator(void* arg) {
+   handshake* h = arg;
+@@ -321,6 +322,57 @@ static void* blocking_mutator(void* arg) {
+   pl_store_mutator_leave(h->s);
+   return NULL;
+ }
++static void* parked_mutator(void* arg) {
++  handshake* h = arg;
++  pl_store_mutator_enter(h->s);
++  pl_store_mutator_blocking(h->s);
++  pl_store_mutator_park(h->s); /* as in Accept: waiting in the syscall */
++  pthread_mutex_lock(&h->mu);
++  h->ready = true;
++  pthread_cond_broadcast(&h->cv);
++  while (!h->release)
++    pthread_cond_wait(&h->cv, &h->mu);
++  pthread_mutex_unlock(&h->mu);
++  pl_store_mutator_unpark(h->s);
++  pl_vpush(h->t, app(h->s, 31)); /* allocates again after the collection */
++  pl_store_mutator_leave(h->s);
++  return NULL;
++}
++/* A server always has some actor waiting in Accept or Read.  Parked inside
++ * the syscall it must not defer collection, or the store keeps every answer
++ * a world ever sent (garbage allocated while it waits comes back). */
++TEST(gc2, parked_blocking_mutator_does_not_defer_collection) {
++  test_rt rt = test_rt_new();
++  handshake h = {.s = rt.store, .t = rt.t};
++  pthread_mutex_init(&h.mu, NULL);
++  pthread_cond_init(&h.cv, NULL);
++  pthread_t mut;
++  ASSERT_EQ(pthread_create(&mut, NULL, parked_mutator, &h), 0);
++  pthread_mutex_lock(&h.mu);
++  while (!h.ready)
++    pthread_cond_wait(&h.cv, &h.mu);
++  pthread_mutex_unlock(&h.mu);
++  pl_store_mutator_enter(rt.store);
++  for (unsigned i = 0; i < 4096; i++)
++    (void)app(rt.store, i); /* answer-sized garbage, unrooted */
++  pl_store_mutator_leave(rt.store);
++  ASSERT(pl_store_gc_stats(rt.store).allocated_bytes > 0);
++  pl_store_gc_request(rt.store);
++  ASSERT(pl_store_gc_poll(rt.store));
++  pl_store_gc_wait(rt.store);
++  ASSERT_EQ(pl_store_gc_stats(rt.store).allocated_bytes, 0);
++  pthread_mutex_lock(&h.mu);
++  h.release = true;
++  pthread_cond_broadcast(&h.cv);
++  pthread_mutex_unlock(&h.mu);
++  ASSERT_EQ(pthread_join(mut, NULL), 0);
++  ASSERT_EQ(pl_app_args(pl_ptr(rt.t->vstack[rt.t->vsp - 1]))[0], 31);
++  rt.t->vsp = 0;
++  pthread_cond_destroy(&h.cv);
++  pthread_mutex_destroy(&h.mu);
++  test_rt_free(&rt);
++}
++
+ TEST(gc2, blocking_effect_defers_gc_without_stopping_other_mutators) {
+   test_rt rt = test_rt_new();
+   handshake h = {.s = rt.store};
