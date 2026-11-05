@@ -10,6 +10,7 @@ authored procedure and its maintained documents, not another application runtime
 | Location | Owns | Does not own |
 | --- | --- | --- |
 | `src/foil` and `src/reaver` | Namespace reads/writes, admission, reactions, cells/views, filesystem I/O, publication, Semidoc and native persistence | Application-specific work policies and handbook recipes |
+| `mounts/codecs` | Shared Grove value codecs and explicit retention of the core Semidoc artifact used by Flows and Nenex | Another Semidoc implementation or automatic type matching |
 | `mounts/cooperate/work*.foil` (`native_work`, `native_work_ops`) | Captures, activities, events, provider dispatch receipts/outcomes, context lenses and persistent holes | Document structure, source polling, provider transport |
 | `mounts/cooperate/main*.foil`, `answer*.foil` | Investigation and question-answering policies over native work | Another attempt lifecycle or private work store |
 | `mounts/flows/flow*.foil`, `runtime*.foil` | Semidoc procedure compilation, pinned operation selection, evaluation, preview and guarded commit | Browser state or provider processes |
@@ -24,6 +25,7 @@ authored procedure and its maintained documents, not another application runtime
 | `mounts/mcp` | Direct native read, write, history and admitted-operation transport | A private agent loop, work queue or browser application |
 | `mounts/inspector` | Optional read-only `/live` records, cells, overlays and history over MCP | Chat, task execution, raw writes, cursor records or workspace binding |
 | `mounts/flow-authoring` | Flow/Nenex integration: source authoring, page evidence, guarded writer and declared Goo controls | The generic command catalogue or filesystem-source lifecycle |
+| `mounts/conversation` | Conversation turn bindings, scoped graph context and inline Nenex projections | A message-body model, provider loop, attempt lifecycle or store |
 | `mounts/flows/install.foil` | Native flow command/law registration and retained-contract checks | Nenex routes or example catalogue |
 | `mounts/flow-examples/examples.foil`, `examples/`, `examples.json` | Optional authored recipes and their setup data | Runtime policy for all flows |
 | `flow_library` in `mounts/flow-examples/examples.foil` | Pure native-capture and format adapters for the learning, atlas and ingestion recipes, under the existing examples publisher | Work ownership, a parser implementation, instruction adoption or scheduling |
@@ -31,10 +33,20 @@ authored procedure and its maintained documents, not another application runtime
 
 `flows` is independently installable with Cooperate and its native dependencies.
 `flow-authoring` adds Nenex, the document writer and declared Goo controls;
-`flow-web` adds the HTTP provider foot. `flow-examples` selects both integrations.
+`flow-web` adds the HTTP provider foot. `conversation` arranges native Nenex
+messages and shared flow occurrences as a chat/composer surface. `flow-examples`
+selects these integrations for its authored recipes.
 Persistent contract artifacts stay owned by `flows`, including the small document
 and web contracts. Logical module names and public operation addresses stay the
 same. Splitting source ownership does not move or convert retained world data.
+
+Semidoc's artifact is explicitly pinned by `codecs`, a common dependency of
+Cooperate/Flows and Web/Nenex. Its `snode` and `sval` types cross those boundaries.
+Compiling a separate copy in each branch of that dependency graph creates
+different contracts, even when the source bytes match. Validate this boundary
+with separately published mounts; a combined test compilation cannot establish
+that their imported type identities agree. Existing worlds retain their selected
+artifacts; changing a mount manifest alone is not a historical-data conversion.
 
 The document adapter supplies a captured draft writer using the existing writer
 contract. Draft completion calls that selected materializer; generic maintenance
@@ -69,6 +81,12 @@ The chosen writer admits changes through the same namespace admission as other t
 The policy that permits adopting an unwritten document containing only its owned
 holes lives with that Nenex writer, not in the shared native work module.
 Nenex exposes those records, drafts and commands to a person.
+
+A [conversation](mounts/conversation/README.md) uses that same boundary: its
+authored response is a Nenex document projected inline. The conversation retains
+message order and explicitly selected context; an ordinary published flow owns
+the response work. Source/Goo edits address the same response document, and the
+conversation wiki is an ordinary named Nenex descendant.
 
 Nenex uses the shared Goo document and tree surface. The separately selected
 `inspector` mount retains `/live` for read-only inspection of the same world; its

@@ -1,6 +1,6 @@
 # Authored flow examples
 
-This optional mount selects `flow-authoring` and `flow-web`, which use the shared
+This optional mount selects `flow-authoring`, `flow-web` and `conversation`, which use the shared
 `flows` execution mount. It owns recipes and domain policy, not a
 second harness. `x/eden --mount flow-examples --ephemeral` creates a disposable
 world for trying them; add `--mount codex` for a real interactive provider.
@@ -22,6 +22,12 @@ publishes a flow or overwrites an existing source document automatically.
 Authored default-node references are rebound through Semidoc's parsed reference
 values at creation. Prose and literal examples are left intact. Each child-flow
 dependency must be created and published explicitly before its parent.
+
+`conversation_response` is the initial conversation procedure. Create its page,
+publish `respond`, then choose that definition and an interactive provider at
+`/conversation`. The supplied policy authors Semidoc; its response is projected
+Nenex, with shared native requests, cells, holes and guarded publication. See the
+[conversation boundary](../conversation/README.md) for context selection and limits.
 
 ## Interactive surface investigation
 
