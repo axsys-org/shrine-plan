@@ -521,6 +521,29 @@ def full():
     hist = world_rpc(pa, 'history', path=f'/{A}/her/{peer}/widgets', limit=5)
     check('/her keeps every acquired case', hist['cases'] >= 2, hist)
     log('test 5 holds: the observation source changed from mail to Mesa at the same relationship')
+
+    # --- 6 a slice: a blank on any record, a copied link that sends nothing, the stranger answers into their own world
+    stranger_box = 'quotes@anodizer.example.test'
+    proxy(A, owner, 'write', records=[{'path': f'/{A}/vendors/anodizer', 'slots': {'name': 'Bright Anodizing', 'email': stranger_box, 'text': 'A finisher a colleague mentioned.',
+                                                                             'price/hole': 'number USD/each: per plate, type II clear', 'turnaround/hole': 'number day'}}])
+    sid = 'ask_anodizer_1'
+    proxy(A, owner, 'write', records=[{'path': f'/{A}/our/{G}/requests/{sid}', 'slots': {'do': 'send', 'channel': 'email', 'to': stranger_box, 'subject': 'A few questions from Northstar',
+        'text': 'Northstar would like to know a few things.', 'ask': 'price (number USD/each): per plate, type II clear\nturnaround (number day)', 'show_1': live_ref(f'/{A}/vendors/anodizer', 'x'),
+        'relationship': f'/{A}/vendors/anodizer', 'about': f'/{A}/vendors/anodizer'}}])
+    mails_now = len(mails())
+    status, text = http('POST', f'{ORIGIN}/w/{A}/link', json.dumps({'request': f'/{A}/our/{G}/requests/{sid}'}).encode(), {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + owner}, 60)
+    link = json.loads(text).get('link') if status == 200 else None
+    check('copy link gives a reply link and sends nothing', bool(link) and '/i/' in link and len(mails()) == mails_now, (status, text[:300]))
+    slice_peer = world_rpc(pa, 'read', path=f'/{A}/vendors/anodizer', care='x')['properties'].get('/prospective')
+    check('the record, outside /relationships, learns the world reserved for the address', bool(slice_peer), slice_peer)
+    other = Client()
+    status, _, page = other.get(link[len(ORIGIN):])
+    check('the link opens a page asking for exactly the blanks, typed', status == 200 and 'name="f.price"' in page and 'name="f.turnaround"' in page and 'a piece' in page and 'days' in page, page[:500])
+    status, _, page = other.form(link[len(ORIGIN):] + '/answer', **{'f.price': '4.80', 'f.turnaround': '5'})
+    check('their answer is sent', status == 200 and 'Sent to' in page, page[:300])
+    (sl, s) = wait('the slice answered into the asker', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{slice_peer}/{sid}', care='x')), 300, 1)
+    check("the answer is the stranger's own publication, typed", sl['properties'].get('/publisher') == slice_peer and sl['properties'].get('/price') == '4.80' and sl['properties'].get('/turnaround/unit') == 'day', sl['properties'])
+    report['slice_s'] = s
     report['mails'] = len(mails())
     log('RELATIONSHIP GATE PASSED ' + json.dumps(report))
 
