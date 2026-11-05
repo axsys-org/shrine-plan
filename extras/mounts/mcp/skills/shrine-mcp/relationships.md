@@ -231,14 +231,19 @@ Say so by writing a wake; the host honours nothing else:
   at: 2026-11-28T09:00:00Z                       a time, or
   on: {type: reference, path: /0x11/her/precision, care: z, case: 14}   a name at the case you saw, or
   cell: {type: reference, path: /0x11/judgments/precision, care: x, case: 0}   an ask cell, or
-  answer: {type: reference, path: /0x11/cells/widgets_covered, care: x, case: 0}
-    slot: count   below: 3          (or above: <n>, is: <text>, was: <the answer you saw>)
+  answer: {type: reference, path: /0x11/cells/widgets_covered, care: x, case: 0}   a cell's answer
+and on `on` or `answer`, optionally one check:
+    slot: price   above: 40         (or below, is: <text>, was: <the value you saw>;
+                                     a threshold may be another record's slot: above: /0x11/needs/widgets#maximum_price)
 ```
 
 One wake per reason. The host fires it when the time passes, when anything
 beneath `on` changes past its case, when the ask cell asks, or when the
-answer of a cell meets its condition (with none, when the answer changes; a
-missing answer or slot never fires). Make a cell when a condition must be
+answer of a cell meets its condition (with none, when the answer changes).
+With a check, an `on` wake runs you only when the check holds: a price
+change that stays under the ceiling wakes no one. A value nobody can read
+(a missing slot, an unacquired record, a threshold that is not a number) is
+unknown, and unknown wakes you: a check never silently skips. Make a cell when a condition must be
 watched while you sleep, or a number must be right on the page whenever
 anyone looks: "fewer than 3 covered" is a `count` over a `where` over the
 judgments, watched with `answer` and `below: 3`, so you are woken when the
@@ -277,9 +282,10 @@ A rule is one sentence with links: "When [Acme's widgets] price goes above
 changed you are run with it: compile it into wakes and say what you watch.
 Each compiled wake is `/agent/wakes/rule_<rule>_<n>` with `keep: yes` (never
 marked fired), `rule` a reference to the rule, `why` the sentence, and the
-check: "goes above / drops below / reaches" is `answer` (the linked record or
-cell) with `slot` and `above` / `below` (a number you read from the other link
-now, plus a `keep` `on` wake on that link, so a new ceiling recompiles it); "changes" is `on`;
+check: "goes above / drops below / reaches" is `on` the linked record with
+`slot` and `above` / `below`, the threshold the other link's slot itself
+(`above: /0x11/needs/widgets#maximum_price`), so a new ceiling needs no
+recompiling (`answer` only when the value is a cell's); "changes" is `on`;
 "is closed / is marked X" is `answer` with `is`; "hasn't replied in N days" is
 an `at` from the last interaction, re-made by an `on` wake on the interactions;
 "every Monday, at 9am" is an `at` you re-make each time it fires. Then poke
