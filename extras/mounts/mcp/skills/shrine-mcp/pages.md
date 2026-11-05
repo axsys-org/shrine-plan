@@ -20,7 +20,10 @@ know (never invent):
 - who it deals with: one record per counterparty (`/relationships/<name>` is
   the usual place, any place works), kept current (below);
 - what it needs: one record per need in progress, the answers arriving
-  beneath it;
+  beneath it, and on the need itself, kept current, `have` (a number: how
+  many sources are good) beside `want`, `covered` (true or false) and a
+  one-line `text` saying where it stands ("2 of 3: Keystone at $37, Acme at
+  $38; Precision is over the ceiling"), so the table of needs is the answer;
 - its rules (`/agent/skill/<name>`): one sentence each, "when this happens,
   do that".
 
