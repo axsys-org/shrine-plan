@@ -178,3 +178,11 @@ controls requiring an active Goo selection are not yet a complete headless path;
 selection inputs are marked as such and have no synthetic example. Reads page
 immediate children without counting the whole subtree, but rendering one record's
 values is not a bound on total evaluation or response size.
+
+`shrine_actions` includes native Grove argument schema information when available,
+plus exact action/view/receiver-role historical read and documentation addresses.
+The `incoming` path navigates current `/r` relationships to the declaration path;
+it does not assert that related prose applies to the captured version. These fields
+come from the same discovery used by document action catalogue cells. Actions
+without an independent declaration have no action schema. Invocation still uses
+only the existing guarded `fields`; discovery runs no action or operation planner.

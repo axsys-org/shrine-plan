@@ -237,3 +237,16 @@ result, then starts a new capture. `answer_enabled` pauses/resumes the same acti
 completed provider results wait while paused. Results do not mutate the subject.
 Nenex supplies one UI and context projection for these same operations. Other
 applications can bind their own context cells and use this answering hand.
+
+### Scoped reference contexts
+
+`cooperate` now selects the existing `graph` mount for its pure reference
+projection. Graph adds no host, HTTP server or polling process.
+
+`native_context` is the shared context hand used by conversations and connected
+Goo action contexts. It reuses `native_work_ops/lens`: the primary `safe` reference
+may be live or historical, explicit secondary bindings are ordinary cell inputs,
+and `/r` membership supplies scoped `evidence` bindings. The hand only reconciles
+those bindings. It does not dispatch work, infer relevance, or maintain a separate
+graph index. See [action contexts](../flow-authoring/README.md#connect-an-action-to-cells-and-a-wiki)
+for selection, version and removal behavior.
