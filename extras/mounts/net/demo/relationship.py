@@ -463,18 +463,19 @@ def full():
     check('the invitation shows the inquiry and what was recorded', status == 200 and 'Northstar' in page and '39.50 per unit' in page and 'understood' in page and 'Claim this world' in page, (status, page[:300]))
     # the reply page: the agent says what it asks and what to show; the person answers in a few taps, into their own world
     proxy(A, agent, 'write', records=[{'path': f'/{A}/our/{G}/requests/{rid}', 'action': 'poke', 'slots': {
-        'ask': 'price (number): per piece, at 500 a month\nlead_time (number): days\nterms (choice: net 30 | net 60)', 'show_1': live_ref(f'/{A}/needs/widgets', 'x')}}])
+        'ask': 'price (number USD/each): at 500 a month\nlead_time (number day)\nterms (choice: net 30 | net 60)', 'show_1': live_ref(f'/{A}/needs/widgets', 'x')}}])
     status, _, page = stranger.get(invite)
     check('the reply page asks for the fields the agent chose, prefilled from what was noted, beside what it chose to show',
-          status == 200 and 'name="f.price"' in page and 'Lead time' in page and 'net 60' in page and '39.50' in page and 'Maximum price' in page, page[:600])
+          status == 200 and 'name="f.price"' in page and '<span class="unit">$</span>' in page and 'a piece' in page and 'Lead time' in page and 'net 60' in page and '39.50' in page and 'Maximum price' in page and 'noted' in page, page[:600])
     status, _, page = stranger.form(invite + '/answer', **{'f.price': '39.50', 'f.lead_time': '14', 'f.terms': 'net 30', 'note': 'price holds until December'})
     check('Send thanks them and offers their page', status == 200 and 'Sent to Northstar' in page and 'Claim your page' in page, page[:300])
     (answer, s) = wait('the answer acquired by the asker', lambda: (lambda r: r if r.get('exists') else None)(world_rpc(pa, 'read', path=f'/{A}/her/{peer}/{rid}', care='x')), 120, 0.5)
-    check("the answer is the person's own publication, signed by their world", answer['properties'].get('/publisher') == peer and answer['properties'].get('/price') == '39.50'
+    check("the answer is the person's own publication, signed by their world, typed: a number with its unit", answer['properties'].get('/publisher') == peer and answer['properties'].get('/price') == '39.50'
+          and answer['properties'].get('/price/unit') == 'USD/each' and answer['properties'].get('/lead_time/unit') == 'day'
           and answer['properties'].get('/terms') == 'net 30' and answer['properties'].get('/note') == 'price holds until December', answer['properties'])
     report['reply_s'] = s
     status, _, page = stranger.get(invite)
-    check('the page opens again on their answer, to change it', 'You answered this already' in page and 'value="14"' in page, page[:600])
+    check('the page opens again on their answer, to change it, and says where the values came from', 'You answered this already' in page and 'value="14"' in page and 'your answer' in page and 'Filled in from' in page, page[:600])
     status, _, page = stranger.form(invite + '/claim')
     check('the claim requests a verification mail', status == 200, (status, page[:200]))
     (claim, s) = wait('the claim mail through the gateway', lambda: next((link_in(b, 'c') for n, h, b in mails() if link_in(b, 'c')), None), 60, 0.3)
@@ -615,6 +616,27 @@ def many():
     events = [e for e in world_rpc(pb, 'history', after=0, limit=60)['events']]
     whos = {e['who'] for e in events}
     check('the acquisitions and the owner are distinct principals in the history', 'owner' in whos and len(whos) >= 2, whos)
+    # one person, one world: Allied reaches a second address of theirs; opened on the device that claimed the
+    # first, the link offers to add it, one click folds the reservation in, and Allied's record names the world
+    second_box, (o2, a2) = 'sales@precision-two.example.test', tokens['0x12']
+    proxy('0x12', a2, 'write', records=[
+        {'path': '/0x12/suppliers/precision_sales', 'slots': {'refers': '/0x12/needs/brackets', 'note': 'their sales desk; anywhere in the world, not under /relationships'}},
+        {'path': '/0x12/suppliers/precision_sales/identifiers/email', 'slots': {'value': second_box}},
+        {'path': f'/0x12/our/{G}/requests/brackets_sales', 'slots': {'do': 'send', 'channel': 'email', 'to': second_box, 'about': '/0x12/needs/brackets', 'relationship': '/0x12/suppliers/precision_sales',
+                                                                   'subject': 'brackets', 'text': 'Allied Metals asks your sales desk too.'}}])
+    (res2, s) = wait('the result for the second address', lambda: result_of(ports['0x12'], '0x12', 'brackets_sales'), 90, 0.5)
+    second = next(w['node'] for w in registry()['worlds'] if w['contact'] == second_box)
+    check('the second address is a reservation of its own until the person says otherwise', second != peer, (second, peer))
+    invite2 = next(link_in(b, 'i') for n, h, b in mails() if second_box in h.get('to', '') and link_in(b, 'i'))
+    stranger.form(invite2 + '/claim')
+    (claim2, s) = wait('the claim mail to the second address', lambda: next((link_in(b, 'c') for n, h, b in mails() if second_box in h.get('to', '') and link_in(b, 'c')), None), 60, 0.3)
+    status, _, page = stranger.get(claim2)
+    check('opened where they are signed in, the link offers to add the address to their world', status == 200 and 'Add sales@precision-two.example.test' in page and 'separate world' in page, page[:400])
+    status, _, page = stranger.form(claim2 + '/fold')
+    folded = next(w for w in registry()['worlds'] if w['node'] == second)
+    check('one click folds the reservation into the world', folded.get('folded_into') == peer and second_box in next(w for w in registry()['worlds'] if w['node'] == peer).get('identifiers', []), folded)
+    (named, s) = wait("Allied's record names the person's world", lambda: (lambda r: r if r.get('/peer') == peer else None)(world_rpc(ports['0x12'], 'read', path='/0x12/suppliers/precision_sales', care='x').get('properties', {})), 30, 0.5)
+    check('the inquirer learns the world from its own record, wherever that record is', named.get('/folded_from') == second, named)
     report['inquirers'] = len(inquirers)
     log('MANY GATE PASSED ' + json.dumps(report))
 
