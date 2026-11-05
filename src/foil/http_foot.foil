@@ -711,21 +711,6 @@
      > (./bat status body ctype) (http_foot/encode_bat status body ctype)
      > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     | http_foot/encode_answer (http_foot/ask foot action)
-  + receive_connection
-    ' A browser may preconnect without sending bytes, or pause midway
-    ' through headers/body. Only this connection waits for its Read.
-    \ fd=nat self=nat
-    ^ nat
-    = ;[root caps] (Recv[path] 0)
-      router caps.at(0)
-      ;parsed=maybe[http_foot/request]
-        ? (Try http_foot/read_request fd)
-         > (./ok request) (./some request)
-         > (./err _) .none
-    ; (SendCaps router parsed [0])
-    ; (CloseHandle router)
-    = ;[planned reply_caps] (Recv[http_foot/planned] 0)
-    | http_foot/connection fd planned reply_caps.at(0)
   + router
     ' Never waits for socket input or a namespace response. Parsed
     ' requests enter here; each connection owns its response mailbox.
@@ -743,7 +728,60 @@
     ; (SendCaps peer planned [foot])
     ; (CloseHandle peer)
     | _ 0
+  + pool_msg
+    ' What an acceptor tells the listener.
+    & http_foot/pool_msg/took
+      http_foot/pool_msg/freed
+    + took
+      :
+    + freed
+      :
+  + streams
+    ' Will this planned connection stay open as a stream?
+    \ planned=http_foot/planned
+    ^ bool
+    ? planned
+     > (./ask action)
+      ? action
+       > opening=http_foot/action/stream .true
+      .false
+    .false
+  + acceptor
+    ' One of the listener's connection actors.  It waits in Accept on the
+    ' shared socket, serves the connection it gets, and goes back to
+    ' Accept, so one actor serves request after request: enki keeps a
+    ' halted actor's thread and heap until the scheduler is freed, and an
+    ' actor per connection leaked one per request.  It tells the listener
+    ' when it takes a connection and when it is free again.  A stream
+    ' holds its acceptor for the stream's life; when the stream ends the
+    ' acceptor exits rather than reuse a mailbox the fan-out may still
+    ' write to.  A stalled client stalls only its own acceptor.
+    \ fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      router caps.at(0)
+      listener caps.at(1)
+      took=http_foot/pool_msg .took
+      freed=http_foot/pool_msg .freed
+    % ignored=nat 0
+    = ;connection (Accept fd)
+    ; (Send listener took)
+    = ;parsed=maybe[http_foot/request]
+        ? (Try http_foot/read_request connection)
+         > (./ok request) (./some request)
+         > (./err _) .none
+    ; (SendCaps router parsed [0])
+    = ;[planned reply_caps] (Recv[http_foot/planned] 0)
+    ? (http_foot/streams planned)
+      | http_foot/connection connection planned reply_caps.at(0)
+    ; (http_foot/connection connection planned reply_caps.at(0))
+    ; (Send listener freed)
+    | _ 0
   + listener
+    ' Keeps an acceptor waiting in Accept: it starts one more whenever the
+    ' last free one takes a connection, so the pool grows to the most
+    ' connections ever open at once (idle preconnects and streams
+    ' included) and never shrinks.
     \ config=http_foot/config fd=nat self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
@@ -751,12 +789,17 @@
       ;router (Spawn (http_foot/router config))
     ; (SendCaps router root [foot])
     ; (CloseHandle foot)
-    % ignored=nat 0
-    = ;connection (Accept fd)
-      ;actor (Spawn (http_foot/receive_connection connection))
-    ; (SendCaps actor root [router])
-    ; (CloseHandle actor)
-    | _ 0
+    % free=nat 0
+    ? (eq free 0)
+      = ;fresh (Spawn (http_foot/acceptor fd))
+      ; (SendCaps fresh root [router 0])
+      ; (CloseHandle fresh)
+      | _ 1
+    = ;[message ignored] (Recv[http_foot/pool_msg] 0)
+    ? message
+     > .took (_ free.dec)
+     > .freed (_ free.inc)
+    | _ free
   + reply
     \ conn=nat response=http_response
     ^ nat

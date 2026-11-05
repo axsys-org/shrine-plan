@@ -9,6 +9,7 @@ import socket
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 
 class StreamClient:
@@ -65,7 +66,7 @@ def check(base, node, timeout):
         checks.append((label, got, want, got == want))
         assert got == want, (label, got, want)
 
-    home = '/' + node + '/user/streamed'
+    home = '/' + node + '/user/streamed_' + uuid.uuid4().hex[:8]     # fresh each run: an identical write commits nothing
     a, b = StreamClient(base, timeout), StreamClient(base, timeout)
     time.sleep(0.2)
     # the very first line a world sends after boot has arrived late once (over 50 ms after its write, every later one within

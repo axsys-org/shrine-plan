@@ -94,6 +94,14 @@
         helm/card/inspect
         helm/card/asset
         helm/supervisor/register
+        helm/supervisor/idle
+    +  idle
+      '  A pooled reader done with its read card, by its number.
+      : id=nat
+    +  pooled
+      '  A reader in the supervisor's pool: its number, its handle, and
+      '  whether it holds a read card.
+      : id=nat h=nat busy=bool
     +  register
       '  Explicit bootstrap registration; duplicate or absent paths fail.
       '  A foot that hears is told each commit's epoch (feet/task/committed).
@@ -257,6 +265,7 @@
         index={\ s}hive
         version={\ s}nat
         permit={\ path s}bool
+        read={\ helm/card s}feet/task[unit]
 
     + local_access
       ^ helm/supervisor/access[namespace]
@@ -264,6 +273,63 @@
         namespace/page helm/supervisor/handle
         sovereign_hive (\ state state.local.top)
         (\ target state (namespace/permitted target state))
+        helm/supervisor/read
+
+    + read
+      '  A read card's answer on one committed state, as the supervisor
+      '  would give it; a read never consults the crew index.
+      \ card=helm/card state=namespace
+      ^ feet/task[unit]
+      = none=hive (axal/new[row[dep]] .none)
+        [next next_index answer] (helm/supervisor/handle card state none)
+      answer
+
+    +  reader
+      (@ s)
+      '  A reader in the supervisor's pool.  It answers one read card at a
+      '  time on the state committed when the card arrived, so a slow read
+      '  holds up neither the supervisor nor a write nor another read, and
+      '  reads run in parallel on the executor's workers.  It answers the
+      '  foot whose capability rides with the card, tells the supervisor it
+      '  is idle, and waits for the next.  Readers live as long as the
+      '  world: enki keeps a halted actor's thread and heap until the
+      '  scheduler is freed, so a reader per read would leak one each.
+      \ read={\ helm/card s}feet/task[unit] id=nat self=nat
+      ^ nat
+      = ;[ignored first] (Recv[nat] 0)
+        supervisor first.at(0)
+      % ignored=nat 0
+      = ;[job caps] (Recv[[helm/card s]] 0)
+        [card state] job
+        ;answer (read card state)
+      ; (? (gt caps.len 0) (Send caps.at(0) answer) 0)
+      ; (helm/supervisor/close_caps caps)
+      ; (Send supervisor (helm/supervisor/idle id))
+      | _ 0
+
+    +  hand_read
+      (@ s)
+      '  Give a read card and the state to an idle reader, starting a new
+      '  reader when every one is busy (the pool grows to the most reads
+      '  ever in flight at once); the foot's capability rides along.
+      \ read={\ helm/card s}feet/task[unit] readers=row[helm/supervisor/pooled]
+        card=helm/card state=s foot=nat
+      ^ row[helm/supervisor/pooled]
+      = idle (readers.filter((\ r=helm/supervisor/pooled !(r.busy))))
+        job=[helm/card s] [card state]
+      ? (gt idle.len 0)
+        = chosen idle.at(0)
+        ; (SendCaps chosen.h job [foot])
+        | readers.map
+          \ r=helm/supervisor/pooled
+          ^ helm/supervisor/pooled
+          ? (eq r.id chosen.id) (helm/supervisor/pooled r.id r.h .true)
+          r
+      = id readers.len
+        ;fresh (Spawn (helm/supervisor/reader[s] read id))
+      ; (SendCaps fresh 0 [0])
+      ; (SendCaps fresh job [foot])
+      | readers.snoc((helm/supervisor/pooled id fresh .true))
 
     +  close_caps
       \ caps=row[nat]
@@ -378,14 +444,40 @@
       = index_of access.index
       % state=s initial index=hive (index_of initial)
         members=row[helm/supervisor/member] []
+        readers=row[helm/supervisor/pooled] []
       = ;[message caps] (Recv[helm/supervisor/request] 0)
+      ? message
+       > (helm/supervisor/idle id)
+        ; (helm/supervisor/close_caps caps)
+        = eased
+            | readers.map
+              \ r=helm/supervisor/pooled
+              ^ helm/supervisor/pooled
+              ? (eq r.id id) (helm/supervisor/pooled r.id r.h .false)
+              r
+        | _ state index members eased
       ? (eq caps.len 0)
-        | _ state index members
+        | _ state index members readers
+      ' A read goes to a pooled reader with the current state (store-
+      ' resident since its last commit, so handing it over copies nothing);
+      ' writes and registrations stay here, in order.
+      = reading=maybe[helm/card]
+          ? message
+           > card=helm/card/snapshot (./some card)
+           > card=helm/card/snapshot_bat (./some card)
+          .none
+      ? reading
+       > (./some card)
+        = ;handed (helm/supervisor/hand_read[s] access.read readers card state caps.at(0))
+        ; (helm/supervisor/close_caps caps)
+        | _ state index members handed
       = ;[next next_index joined answer]
           ? message
            > req=helm/supervisor/register
             = ;[roster ack] (helm/supervisor/enroll_with[s] access req state members)
             [state index roster ack]
+           > idle=helm/supervisor/idle
+            [state index members (feet/task/ack .none)]
            > card=helm/card/admit
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/snapshot_bat
@@ -418,7 +510,7 @@
             | helm/supervisor/advance_with[s] access card state index members
       ; (Send caps.at(0) answer)
       ; (helm/supervisor/close_caps caps)
-      | _ next next_index joined
+      | _ next next_index joined readers
     + run
       \ initial=namespace self=nat
       ^ nat
