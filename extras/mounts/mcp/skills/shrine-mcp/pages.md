@@ -265,6 +265,16 @@ when the owner or a rule says so, or a link the owner sends themself.
   suppliers under {{$40 a piece}}"), keeps every fact and adds none, groups
   the page under a few headings where its parts differ, and puts what the
   owner wants kept in mind or done as a numbered list.
+  When you are the stream itself (the page sends you its text and sources and
+  shows your words as they come), you write the page: its presets only, the
+  owner's meaning and every fact kept, every source's facts and statements in
+  place with their source tag, structure only where it is earned. Every fact
+  in the input (each need, name, number, address, date, note and question)
+  appears in the page, reworded or in a table, never dropped and never moved
+  elsewhere unless you link it there. Link a name this world already has by
+  its path when the text means it; never invent one. Output nothing but the
+  page's markdown: no preamble, no code fence, no closing remark, and no title
+  repeated as a heading. With a selection, write only that part, rewritten.
 - **Send** (`<page>/send {at}`, written when the owner presses Send): ask the
   people the page's blanks are about (Blanks and slices). Each request you
   write for it carries `rule` a reference to that send record: the press is
