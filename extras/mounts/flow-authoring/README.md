@@ -44,6 +44,33 @@ those selections do not become runtime dependencies of the native `flows` mount.
 HTTP source work is optional: select [`flow-web`](../flow-web/README.md) separately,
 or use `flow-examples`, which selects both integrations.
 
+## Attach a captured flow
+
+Use **Select published flow** on the containing page, choosing a stable occurrence
+name. This captures the exact published definition in `<page>/cells/<name>`.
+Open that cell's **Attach selected flow** Goo view. Its only inputs are the result
+destination, writer, optional provider, and port-to-evidence bindings. New
+selection cells include a JSON binding template derived from their captured
+ports; native validation always checks the captured definition itself. The
+selection cell is the guarded action receiver. No source text or definition
+version has to be copied into the form.
+
+The controller lives at `<page>/work/<name>`, the same address used by embedding
+that selection. Repeating an identical attachment reuses the controller.
+Replaying an embed with current source guards leaves an already present
+reference unchanged. Changed requests are conflicts; detached work is not
+reactivated. Removing a reference does not silently authorize a retry to add it
+back. Existing pause/resume, detach and deliberate adoption operations retain
+their roles.
+
+Binding identity compares slots and values, independent of map construction
+order. Retained request maps and captures keep their original representation.
+
+Selection captures remain pinned when a definition is republished. Deliberately
+select another publication to adopt it; refreshing a form does not replace the
+captured contract. The form's binding template is advisory presentation metadata
+on the existing cell, not a second definition or a catalogue.
+
 ## Connect an action to cells and a wiki
 
 **Inspect declared Goo actions** still creates a frozen catalogue at

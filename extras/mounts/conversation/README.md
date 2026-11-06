@@ -41,6 +41,69 @@ person or agent can grow the conversation's wiki through the same guarded source
 authoring operation. Named children are documents; positional source blocks and
 internal work/flow/cell branches are not document destinations.
 
+## Named wiki roots at startup
+
+The declared **Start conversation** action accepts **Wiki roots**, a JSON object
+from names to existing namespace record paths, for example:
+
+```json
+{"procedures":"/0x11/app/nenex/w/team_procedures","project":"/0x11/app/nenex/w/customer_onboarding"}
+```
+
+The native `conversation/start` operation accepts the same selection as typed
+`roots/<name>` references. Each must select one record (`x`); native callers may
+select a live or historical reference. The GUI selects live records. Aliases are
+canonical flow names, at most sixteen; missing roots, duplicate GUI aliases,
+subtree captures and roots within the newly allocated conversation are refused.
+An existing conversation cannot silently adopt a different startup selection.
+
+The selection stays on its ordinary configuration record at
+`<conversation>/conversation`, under `chat/roots/<name>`. Every turn adds those
+references to its existing Cooperate context lens at `roots/<name>`. Its `startup`
+binding pins the configuration record observed for that turn, exposing the root
+addresses without a second inventory. A root edit updates current context through
+native cell dependencies; deleted roots contribute no current content, and
+restoration reconnects the same binding. Captured attempts retain their readings.
+The startup binding is pinned so advancing the conversation sequence does not
+invalidate old work. Root records are read shallowly; children are browsed with
+`shrine_read` rather than eagerly imported into every prompt.
+
+An agent can browse a selected root, discover another agent's authored child,
+read its Semidoc and exact published definition, inspect its ports, and invoke the
+existing declared flow controls. Creating a child does not publish or invoke its
+flow implicitly. Other agents see shared documents through the same native paths;
+there is no per-agent copy or skill registry. The mounted example catalogue is
+optional and is not required for discovering user-authored flows.
+
+Root selection provides navigation and evidence, not additional authority or
+instructions overriding the task. The existing scoped `/r` context still selects
+explicitly related evidence independently. Selecting a root does not recursively
+follow every link or subscribe to every child; graph traversal and selection
+policy can be authored as flows. Ordinary source edits, published definitions,
+work records, action receipts and x/y/z history remain the existing representations.
+
+An invocation which edits its own watched wiki can invalidate its answering
+attempt. The lifecycle retains that attempt and resumes against the new context.
+Every interactive request exposes `<attempt>/resumption`, an ordinary work cell
+linking the hole's previous attempt and that worker's action trace. The provider
+prompt directs the agent to inspect it before further effects. The predecessor
+retains its own resumption address, so older work remains navigable without
+scanning or copying the complete execution history into each prompt.
+
+This work view is separate from the evidence lens. Appending action receipts or
+reading prior work does not invalidate the current demand. The wiki record and
+explicitly bound evidence still participate in freshness checks: a self-edit or
+external evidence change must be revalidated before publishing an answer.
+An accepted action remains accepted when its surrounding answer becomes stale.
+
+Reuse the existing selection cell and occurrence address when resuming the same
+intended work. Identical selection, attachment and existing embedding requests
+are no-ops; changed bindings conflict, detached controllers remain detached,
+and stale source/view guards still refuse writes. Different occurrence names
+represent deliberately different work; these rules do not infer semantic
+identity between arbitrary model-generated actions. Goo continues to retain
+receipts for individual invocations.
+
 ## Native layout
 
 For a conversation page `P`:

@@ -148,7 +148,11 @@ class MountTests(unittest.TestCase):
     def test_flow_execution_and_integrations_select_independently(self):
         extras = Path(__file__).resolve().parent.parent / 'extras'
         native = select(extras, ['flows'])
-        self.assertEqual({m.name for m in native}, {'mcp', 'codecs', 'cooperate', 'flows'})
+        # Shared context lenses use the ordinary graph reference projection.
+        # Graph adds published modules, not a UI, provider or polling process.
+        self.assertEqual({m.name for m in native}, {'mcp', 'codecs', 'graph', 'cooperate', 'flows'})
+        graph = next(m for m in native if m.name == 'graph')
+        self.assertFalse({'host', 'http', 'start'} & graph.manifest.keys())
         flow = next(m for m in native if m.name == 'flows')
         self.assertNotIn('start', flow.manifest)
         self.assertNotIn('flow_interface', flow.manifest['modules'])

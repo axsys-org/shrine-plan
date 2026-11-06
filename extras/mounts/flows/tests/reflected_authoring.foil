@@ -185,7 +185,7 @@
       face=path [state.self 'gov 'flows 'authoring 'author_flow]
       rendered (author_browser/goo_browser/render_result author_bridge/goo_bridge/initial_context page face [] [] [] .none state)
     ?> (./ok value) rendered
-      [(testing/nat "authoring input ownership is rendered" 1 0)]
+      [(testing/text "authoring input ownership is rendered" "ok" (either/err_val rendered))]
     = controls=row[json]
         ?> (json/arr values) (goo_runtime/json_field "controls" value) []
         values
@@ -219,6 +219,7 @@
       page=path [base.self 'app 'nenex 'w 'second]
       face=path [base.self 'gov 'flows 'authoring 'author_flow]
       catalog (flow_reflected_authoring_tests/catalogue home 'author_flow base)
+      labels (catalog.tap.map((\ [path card] card.txt_at(['title]))))
       rendered (author_browser/goo_browser/render_result author_bridge/goo_bridge/initial_context home face [] [] [] .none base)
       source=str (str/from_atom (joined 10 [";. /second" "  ;= Working document" "    An authored working surface."]))
       create_fields=row[[str str]] [["new_name" "second"] ["source" source]]
@@ -278,7 +279,9 @@
       styled (flow_author_controls/source_input (myth/sing ['source] (pails/t (show (goo_text/encode styled_runs)))))
       extra (flow_author_controls/ports [["value" "evidence"] ["unused" "evidence"]] ['value])
     [(testing/nat "authoring view renders through the existing Goo host" 1 (either/is_ok rendered))
-     (testing/nat "document, flow and context authoring actions are reflected" 31 catalog.wyt)
+     (testing/nat "document, flow and context authoring actions are reflected" 1
+       (row/all[str] (\ label=str (row/has[str] label labels)) ["Create Semidoc page" "Select published flow" "Open investigation" "Retain unresolved question"]))
+     (testing/nat "page authoring no longer asks for a pasted attachment definition" 0 (row/has[str] "Attach published flow" labels))
      (testing/text "declared source creation succeeds" "200" (? (eq create_code 200) "200" create_body))
      (testing/nat "browser creation and headless creation are identical" 1 (and (eq click_code 200) (equal[namespace] clicked created)))
      (testing/nat "creation cannot overwrite an existing page" 409 collision_code)
@@ -436,22 +439,38 @@
     = source (flow_tests/book_source "A declared example")
       bytes (\ text=str (add (str/to_atom text) (bex (mul 8 text.len))))
       source_home=path [base.self 'io 'fs (source_mount/mount_key "flow-examples") 'source]
-      catalog=str "{""sample"":{""title"":""Example"",""source"":""sample.semidoc""}}"
+      catalog=str "{""sample"":{""title"":""Example"",""source"":""sample.semidoc""},""handbook"":{""title"":""Invokable example"",""source"":""sample.semidoc""}}"
       seeded (flow_tests/poke source_home.snoc(($ta "examples.json")) (myth/sing bond/content (pails/n (bytes catalog))) base)
       seeded (flow_tests/poke source_home.snoc(($ta "sample.semidoc")) (myth/sing bond/content (pails/n (bytes source))) seeded)
     ?> (./ok installed) (flow_examples/install seeded)
       [(testing/nat "optional example registration admits" 1 0)]
     = target=path [base.self 'app 'flow_examples 'catalogue]
       face=path [base.self 'gov 'flow_examples 'browse]
-      controls (flow_reflected_authoring_tests/catalogue_at target face installed).tap.keep((\ [path card] card.has(['goo 'request])))
-    ? !(eq controls.len 1) [(testing/nat "example catalogue declares one creation action" 1 controls.len)]
+      all_controls (flow_reflected_authoring_tests/catalogue_at target face installed).tap
+      controls all_controls.keep((\ [path card] (eq card.txt_at(['title]) "Create example document")))
+      invoke_controls all_controls.keep((\ [path card] (eq card.txt_at(['title]) "Publish and invoke example")))
+    ? !(and (eq controls.len 1) (eq invoke_controls.len 1)) [(testing/nat "catalogue exposes creation and invocation" 2 (add controls.len invoke_controls.len))]
     = [_ card] controls.at(0)
     ?> query=goo_runtime/request card.pail_at(['goo 'request]) [(testing/nat "example action reflects a native request" 1 0)]
     = [created code body] (goo_runtime/act query.set_inputs([["/name" "sample"]]) installed)
       page=path [base.self 'app 'nenex 'w 'sample_flow]
       [reopened again again_body] (goo_runtime/act query.set_inputs([["/name" "sample"]]) created)
       display (author_browser/goo_browser/render_result author_bridge/goo_bridge/initial_context target face [] [] [] .none installed)
-    | [(testing/nat "example catalogue renders a production Goo view" 1 (either/is_ok display))
+      with_sources (flow_tests/apply 'import_source flow_tests/input_path flow_tests/source_record created)
+      [_ invocation_card] invoke_controls.at(0)
+    ?> invocation=goo_runtime/request invocation_card.pail_at(['goo 'request]) [(testing/nat "invocation reflects a native request" 1 0)]
+    = destination=path [base.self 'app 'nenex 'w 'invoked_example]
+      bindings (str/cat_all ["{""sources"":""" (path_show (flow_tests/input_path).take((flow_tests/input_path).len.dec)) """}"])
+      [assembled invoked invoke_body] (goo_runtime/act invocation.set_inputs([["/name" "handbook"] ["/destination" (path_show destination)] ["/bindings" bindings] ["/writer" ""]]) with_sources)
+      data_destination=path [base.self 'user 'goo_data]
+      [retained retained_code retained_body] (goo_runtime/act invocation.set_inputs([["/name" "handbook"] ["/destination" (path_show data_destination)] ["/bindings" bindings] ["/writer" (path_show [base.self 'gov 'flow_examples 'retain_result])]]) with_sources)
+    | [(testing/text "Goo can invoke with a data-only writer" "200" (? (eq retained_code 200) "200" retained_body))
+       (testing/nat "data-only invocation exposes ordinary maintenance cells" 1 (flow_tests/get data_destination.weld(['cells 'maintenance]) retained).has(bond/tack))
+       (testing/nat "data-only writer does not force a Nenex page" 0 (flow_tests/get data_destination retained).has(['src]))
+       (testing/text "one reflected action assembles an ordinary non-WWI example" "200" (? (eq invoked 200) "200" invoke_body))
+       (testing/nat "reflected invocation publishes the destination document" 1 (flow_tests/get destination assembled).has(['src]))
+       (testing/nat "reflected invocation publishes its child document" 1 (flow_tests/get destination.snoc('child) assembled).has(['src]))
+       (testing/nat "example catalogue renders a production Goo view" 1 (either/is_ok display))
        (testing/text "example creation uses declared native admission" "200" (? (eq code 200) "200" body))
        (testing/nat "example creation authors an ordinary Semidoc document" 1 (flow_tests/get page created).has(['src]))
        (testing/nat "the harness is not required to instantiate examples" 0 (flow_tests/get page base).has(['src]))

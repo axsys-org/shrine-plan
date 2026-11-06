@@ -67,8 +67,10 @@ With `flow-authoring` mounted, open a Nenex page and expand **Author flows**:
 3. Enter the authored definition's name in **Publish flow**. This Goo control
    captures the saved definition and selected native laws. Unsaved source must
    be saved before it can be published.
-4. Bind the inputs to namespace paths, choose a destination and a published
-   writer, and **Attach published flow**. `/x/...` can bind a cell or overlay result.
+4. Use **Select published flow** with a stable occurrence name. Open the resulting
+   `cells/<name>` and use **Attach selected flow**: bind inputs to namespace paths
+   and choose a destination and a published writer. The cell supplies the exact
+   captured definition. `/x/...` can bind a cell or overlay result.
    Choose `/0x11/gov/flows/nenex` for document publication. Providers are optional
    and explicitly selected; ordinary revisions use the inert work provider.
 5. Inspect the work cell, attempts and output. Pause, resume and detach use the
@@ -671,3 +673,14 @@ selection and staging I/O. Public command addresses and pinned contracts are unc
 `tests/world.foil` supplies disposable setup and test data shorthand that calls the
 production handlers. `tests/client.py` supplies test transport. Neither defines a
 second production authoring entrypoint. Filesystem evidence uses native captures.
+
+### Resuming interactive requests
+
+A new interactive attempt gets a `<attempt>/resumption` cell using the existing
+native lens. Its `previous` binding follows the subject hole's retained head and
+its `actions` binding reads that predecessor's worker trace. The attempt carries
+a `work/resumption` navigation path. This is work history, outside the evidence
+capture and its guard; it does not subscribe the controller to all old attempts.
+The provider prompt points to the cell before requesting more effects. Current
+evidence, ownership, hole-head and publication checks continue to authorize each
+action and final result. Supersession preserves accepted effects and receipts.

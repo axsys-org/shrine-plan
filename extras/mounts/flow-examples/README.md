@@ -10,7 +10,7 @@ these files. Deliberate publication and activation remain separate operations.
 `examples/` contains authored Semidoc procedures and sample evidence.
 `examples.json` selects evidence and recipes. `examples.foil` installs native
 instantiate operations and supplies pure example adapters; `cartography.foil`
-contains the cited-assertion policy. The only Python stages declared bytes for
+contains the cited-assertion policy. `query_sources.foil` selects explicitly bound named endpoints and arguments. The only Python stages declared bytes for
 the existing filesystem foot. It does not poll, schedule, execute flows or save
 application state. The shared `flow-web/host.py` only supplies its native HTTP foot
 address.
@@ -349,3 +349,155 @@ results after an ABA detach/reattach. These tests never open a retained live wor
 The small `examples/evidence_resume.semidoc` demonstrates a persistent demand:
 missing `GATE_OPEN` evidence leaves a hole; changed relevant evidence resumes it
 through the same hand. No wall-clock work scheduler is involved.
+
+## Working with Shrine
+
+Create `working_with_shrine` through **Flow examples**. The source page contains
+**two separately publishable definitions** using existing operations:
+
+- `working_with_shrine` checks captured sources and publishes the authored guide
+  to a destination such as `/0x11/app/nenex/w/working_with_shrine`. Select the Nenex
+  writer and the example's default `sources`; no provider is needed. Its children
+  cover discovery, contracts/context, preparation, an author/publish exercise and
+  receipt inspection. This is authored guidance, not generated README prose.
+- `author_publish` prepares a scoped task, delegates to the existing interactive
+  provider, and publishes a report with evidence. Bind `sources` containing
+  `task`, `authoring` and `actions`, and bind `provider` to the raw selected provider
+  record (for Codex, `/0x11/io/codex/surface_provider`). Use a distinct report
+  destination. The bundled task is inspect-only; an author/publish task must name
+  an existing receiver, unused child name, complete source and definition name.
+
+Publish each definition by its name on the source page. Attach or embed the chosen
+publication using the existing controls. Creation and publication do not attach
+it automatically. The guide's example produces a reusable evidence-checking flow;
+its result is source data, not input for the Nenex document writer.
+
+Guide pages can participate in scoped action contexts through **Set action
+relationship**. The guide explains which native action declarations to reference
+and how to connect a catalogue selection, receiver and optional cell bindings.
+These explicit native attachments are separate from navigable Semidoc links;
+installing the recipe does not silently add typed relationships or context cells.
+
+This is an authored procedure over shared hands, cells, overlays and receipts.
+The guide flow is deterministic; the interactive procedure includes agent judgment.
+Native guards validate action admission. A brief does not reduce the provider's
+namespace authority, and validating a report does not prove its claims. Interactive
+calls may have effects before the final report is accepted. Inspect the retained
+receipts and resulting records, including on failed/retried attempts. Rediscover
+publication after creating or editing the receiver instead of reusing stale guards.
+
+## Live structured data
+
+`live_data` reuses HTTP capture, native source envelopes, the JSON decoder and
+the Nenex projection. Its step cells retain cohesive decoded values for further
+composition. Bind explicit URLs and revisions; it does not poll a SQL database.
+The optional [`sql-source`](../sql-source/README.md) companion exposes configured
+parameterized reads. The [WWI profile](examples/wwi/README.md) supplies order and
+schema queries for a real local business case study. No SQL credentials belong
+in the namespace. Different captures are not a single multi-query SQL snapshot.
+
+## Compose incoming-data flows
+
+These are independently authored and published Semidoc procedures. The same
+native definition records expose their input names and retained implementations
+through **Author flows → Inspect callables / Select published flow**. Each
+catalogue operation links its captured source under `example/source` and its
+publication collection under `example/publications`; its children exist only
+after publication. A recipe may declare differently named or multiple definitions. Discovery does not silently instantiate a whole business app.
+
+| Procedure | Inputs | Result |
+| --- | --- | --- |
+| `select_queries` | `catalogue`, `selection` | Named URL records with explicit arguments and revisions |
+| `capture_sources` | `urls` | Successful source captures with native provenance; shared holes/retries on failure |
+| `decode_sources` | `sources` | Cohesive decoded values alongside original evidence |
+| `project_sources` | `pages`, `sources` | Authored document projections retaining decoded data |
+
+Create and publish each component through the existing example and authoring
+controls. Then publish a parent using `/flow/invoke` and explicit `/flow/bind`
+relationships. The parent captures exact child publications. Updating a child
+does not silently change a retained parent or an existing occurrence.
+
+`business_workspace` is one editable composition of all four. It supplies generic
+overview, model, records, investigations and procedures briefs. It binds no
+business names, SQL queries or paging defaults. `live_data` is the smaller
+capture → decode → project composition for already selected URLs. Filesystem
+captures can enter at `decode_sources`; projection can be omitted entirely.
+The existing `format_ingestion` example remains a direct decoding/projection
+example with a small local JSON fixture.
+
+Current decoding supports JSON, Markdown and text. This is not CSV/Parquet
+support, automatic entity mapping, database change capture or a scale claim.
+An LLM can author a domain-specific mapping or validation flow and compose it
+between decoding and projection; that mapping must explicitly preserve keys,
+relationships, nulls, dates and business rules. Similar-looking customer or order
+fields across datasets are not evidence of a shared identity.
+
+### Invoke components independently
+
+**Flow examples → Publish and invoke example** accepts name, destination, bindings
+(JSON input names to namespace paths) and an optional writer path. Blank writer
+selects the existing Nenex writer. For a data-only component use
+`/0x11/gov/flow_examples/retain_result` and an unused destination such as
+`/0x11/user/outputs/selected_queries`. This writer contributes no document writes;
+the existing lifecycle retains results, traces, captures, receipts and ordinary
+maintenance cells. It introduces no result store or alternate executor.
+
+The source page's occurrence is `<name>_flow/work/<destination-last-segment>`.
+Its retained successful run has a normal `result` cell. Bind another invocation
+to that projected result path (the `/x/.../work/<generation>/result` view) to use
+its values. A selected generation is stable; use a parent `/flow/invoke` chain
+when dependencies should recompute together from changing evidence. Different
+components can be invoked, inspected and composed independently.
+
+The invocation shortcut selects the definition matching the example name. For
+recipes with differently named or multiple definitions, use the existing
+authoring controls to select one explicitly. Native deferred commands keep
+creation, publication and attachment in one admission. A later refusal exposes none of the earlier source/publication edits.
+Repeating the same invocation keeps its exact retained request and definition,
+even after source edits. Different bindings/writers require a deliberate new
+occurrence; explicit adoption remains the existing operation. Occupied unclaimed
+destinations and colliding controller names are refused. No existing world is
+updated merely by changing these files.
+
+### Bind a business profile
+
+For `select_queries`, bind `catalogue` to the captured `endpoint.json` record from
+a configured source transport. Bind `selection` to a tree with one record per
+chosen output name. Each selection record has:
+
+- `query`: text naming an entry in the catalogue.
+- `argument/<name>`: optional text arguments, encoded as URL query parameters.
+- `revision`: optional numeric revision for deliberate recapture.
+
+The catalogue record's revision also invalidates selections. Unknown queries,
+duplicate catalogue entries, malformed selections and invalid URLs refuse. The
+transport validates its own named-query parameters and bounds. This selector
+performs no I/O, creates no credentials and starts no polling service.
+
+For the WWI example, selection records can be `model` with query `catalog`, and
+`orders` with query `orders`, argument/after `"0"`, argument/limit `"10"`.
+Those are profile data, not defaults in the procedure. Bind `business_workspace`
+with `catalogue` and `selection`, choose a fresh Nenex destination and leave its
+writer blank. Publish the four components first. The original WWI SQL profile
+remains under [examples/wwi](examples/wwi/README.md).
+
+For a CRM source, selection might instead be `accounts` → `accounts_page` with
+an explicit region argument, and `opportunities` → `pipeline_page` with a bounded
+page size. The disposable tests invoke all four components separately with
+those names and connect the retained result cells, as well as exercising the
+composed workspace with the WWI-shaped selection.
+
+### Dataset examples and actual boundaries
+
+- [Northwind's linked sample](https://learn.microsoft.com/en-us/power-apps/maker/canvas-apps/northwind-install)
+  uses Dataverse. It needs a Dataverse transport or an explicitly chosen export;
+  our SQL Server adapter is not a Dataverse connector.
+- [AdventureWorks](https://learn.microsoft.com/en-us/sql/samples/adventureworks-install-configure)
+  can use the SQL Server transport with its own declared queries and bounds.
+  WWI SQL files are not an AdventureWorks import profile.
+- [Contoso's generator](https://github.com/sql-bi/Contoso-Data-Generator-V2),
+  [Maven CRM](https://mavenanalytics.io/data-playground/crm-sales-opportunities)
+  and [dunnhumby](https://www.dunnhumby.com/source-files/) are candidate inputs,
+  not integrated datasets. File formats need explicit decoders and large imports
+  need measured bounded ingestion. No automatic pagination or whole-business
+  import is supplied by these example flows.

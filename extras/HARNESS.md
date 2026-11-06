@@ -87,6 +87,13 @@ authored response is a Nenex document projected inline. The conversation retains
 message order and explicitly selected context; an ordinary published flow owns
 the response work. Source/Goo edits address the same response document, and the
 conversation wiki is an ordinary named Nenex descendant.
+Named startup wiki roots are ordinary references on the conversation's existing
+configuration record. Its per-turn Cooperate lens binds each root shallowly and
+pins the observed startup selection; agents browse children through native reads.
+Shared authored procedures are discovered through those documents and selected
+through the existing published-flow controls. There is no skill registry or
+per-agent copy of the shared tree. Root selection does not recursively import a
+subtree or replace the separate scoped graph-evidence policy.
 
 Nenex uses the shared Goo document and tree surface. The separately selected
 `inspector` mount retains `/live` for read-only inspection of the same world; its
