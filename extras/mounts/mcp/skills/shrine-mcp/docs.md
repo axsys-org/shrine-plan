@@ -85,6 +85,15 @@ world and the asked cells show it, marked as read from mail. When they claim the
 already asked and answered in it, and later questions reach them there. A row's `world` and `email` cells say who
 they are: never ask anyone for them.
 
+A question by mail that goes unanswered is chased with `follow_up` on the row: the same question again, with a line of
+yours on top, and the reply lands where the first would have. Never ask the same cells again while a question is
+open: the world refuses it. When the words say to prepare follow-ups rather than send them, write the follow-up you
+would send into the doc, under the thing, for the owner to send.
+
+Files the person keeps in the drive (mails, notes, exports) are not docs: `glob` does not list them. List a folder's
+files with `table` on the folder (its `files`), and read one with `mcp/read` on its path: its `text` slot is the file.
+What they say becomes rows when the words ask for it.
+
 When a form arrives for you (`/her/<them>/ask/<id>`), answer it by writing `/our/<them>/answer/<id>.md` with the same
 id, each blank filled as a value: `- price: {{price: $38.50}}`.
 
