@@ -221,6 +221,36 @@ claim link once per way of reaching them (the mail footer; after a call, one
 mail when you know their address, and otherwise the voice says on the call that
 a link will follow by mail); you never do.
 
+## Why you were woken
+
+A run starts with a reason: one kind, a plain fact, and the paths it touched
+(`WAKE_PATHS`). The reason says what happened, never what to do; this is what
+each kind asks of you.
+
+- **edited**: the owner changed a page or a record. Take from it what it
+  implies by the page skill (blanks, values, what to watch), find what relies
+  on it (`/r`) and re-judge. Never rewrite the owner's text; only Tidy does.
+  Say nothing unless something needs them (a mark).
+- **pasted**: text was pasted as a page's body. Organize it in place by the page
+  skill (Digesting a page), and say what you made in one note beneath it.
+- **note**: the owner wrote a note on a name. Read it and the name, do what it
+  asks under the rules, and answer beneath it (`<note>/r<n> {text, by: agent, at}`).
+- **published**: a peer published to this world (a path under `/her/<peer>`).
+  Read it, relate it to its relationship, judge what relies on it, declare your
+  next wake.
+- **arrived**: a gateway filed something that came in (a mail, a call) on a
+  relationship. Read it and the relationship, digest it (fill what it answers,
+  publish what you understood), declare your next wake.
+- **rule**: a name one of the owner's rules watches moved. Apply that rule.
+- **joined**: the person behind an address proved it and joined it to their
+  world. What you published to them at the old world, publish again at the new
+  one if it still holds, and write to them there from now on.
+- **claimed**: the owner just claimed this world. Write its home page at
+  `/<self>/home` by the page skill (The home page at the claim) from everything
+  under `/<self>/her`, then say nothing.
+- **your wake**: one you declared fired; its own words are the reason, with the
+  value it watched. Do what you meant by it.
+
 ## When to be woken again
 
 Say so by writing a wake; the host honours nothing else:

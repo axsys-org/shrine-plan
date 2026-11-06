@@ -226,7 +226,7 @@ def kill_everything(sig=signal.SIGKILL):
 def write_config(wake=None):
     cfg = {'listen': f'127.0.0.1:{HOST_PORT}', 'origin': ORIGIN, 'rp_id': RP_ID, 'name': 'Shrine pilot host', 'state': STATE, 'shrine': BASE,
            'mounts': ['net', 'mcp', 'probe'], 'worlds': WORLDS, 'ports': {'world': WORLD_PORT, 'mesa': MESA_PORT, 'flow': FLOW_PORT}, 'node_base': '0x20',
-           'poll_ms': 300, 'gateways': {'mail': G}}
+           'poll_ms': 300, 'gateways': {'mail': G}, 'limits': {'fresh_lock': os.path.join(TEMP, 'fresh.lock')}}
     if wake: cfg['wake'] = wake
     json.dump(cfg, open(CONFIG, 'w'), indent=1)
 
@@ -279,7 +279,8 @@ def result_of(port, node, rid):
 
 
 host, fixture, gateway, host_logs, gateway_logs = None, None, None, 0, 0
-if subprocess.run(['pgrep', '-f', r'(x/eden|shrine-mesa (host|gateway)|wisp).*\.check/relationship-'], capture_output=True).stdout.decode().split() != []: raise SystemExit('an earlier run of this gate is still running')
+# an earlier run from this same temp directory only: other checkouts' runs have their own ports and temp directories
+if subprocess.run(['pgrep', '-f', r'(x/eden|shrine-mesa (host|gateway)|wisp).*' + re.escape(os.path.join(os.path.dirname(TEMP), 'relationship-'))], capture_output=True).stdout.decode().split() != []: raise SystemExit('an earlier run of this gate is still running')
 if not os.access(BIN, os.X_OK): raise SystemExit(f'no shrine-mesa binary at {BIN}')
 for d in (STATE, OUTBOX, INBOX, WORLDS): os.makedirs(d, exist_ok=True)
 
