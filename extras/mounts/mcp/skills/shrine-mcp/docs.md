@@ -97,6 +97,23 @@ What they say becomes rows when the words ask for it.
 When a form arrives for you (`/her/<them>/ask/<id>`), answer it by writing `/our/<them>/answer/<id>.md` with the same
 id, each blank filled as a value: `- price: {{price: $38.50}}`.
 
+## Cells keep where they came from; holes keep their work
+
+- Every value you write says where it came from (`source` on `set`: a reference where there is one, else words);
+  when is recorded for you. A value with no source but the owner is the owner's, and is not a hole.
+- `none` is an answer ("no supplier stocks this"): write it, with its source, instead of asking again.
+- A filled cell that no longer holds is opened again, never silently changed or blanked: `set` with no value and
+  `open` saying why. Only four reasons open a cell: something it rests on changed; an instruction says it is wrong;
+  it is older than the words allow; two sources disagree. A new value closes it.
+- A row's work is its steps table, `/<row>/steps`: one row a step, columns `for` (the columns it serves), `step`,
+  `who`, `how`, `when`, `done`, `got` (what came back: a reference where you can). `ask_row` and `follow_up` write
+  theirs. Write your own plan as steps (`done: no`, and in `step` what it waits on), and tick them as you go (`done:
+  yes`, `got`). Steps stay under their row; put them in a doc only when the words ask.
+- `table` gives each cell's state: a value (source, when), open again (why), answered (by whom, when), asked (whom,
+  since when), waiting (on which open step), or a hole. A hole that only judgement sees (a row the words want and the
+  table lacks, a column the job implies, a question an answer raised) you write down as an empty row, column or a
+  step, so it becomes an ordinary hole.
+
 ## Answers stand
 
 An answer you gave is a standing answer: whoever asked sees it live in their own tables. When your docs change
