@@ -751,59 +751,46 @@
     | ./batch writes.weld(tag)
         (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
   + write_batch
-    ' A batch with conditions (require, forbid, if_case) is planned against
-    ' the very state it is admitted on and refused whole when one fails, so
-    ' a write can depend on what else is true without a race; a batch with
-    ' none is a plain batch.
+    ' A batch with conditions (require, forbid, if_case), or one writing an
+    ' ask, is planned against the very state it is admitted on and refused
+    ' whole when a condition fails, so a write can depend on what else is
+    ' true without a race; any other batch is a plain batch.
     \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec] self=iota args=json
     ^ http_foot/action
-    ?> (./some why) (mcp_mount/unguarded_ask self writes args)
-      (? (mcp_mount/conditional args)
-        (http_foot/action/admit
+    ? ((mcp_mount/conditional args) || (mcp_mount/asks writes))
+      | http_foot/action/admit
           (\ state=namespace (mcp_mount/guard self args writes.weld(tag) state))
           (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
-          (\ outcome=maybe[pail] state=namespace ""))
-        (mcp_mount/batch id writes tag who then))
-    | mcp_mount/refuse id why
-  + unguarded_ask
-    ' An ask (/<self>/our/<recipient>/ask/<id>) is written only with its
-    ' guard: an approval under /<self>/approvals required, and the
-    ' recipient's opt-out (/<self>/optouts/<recipient>) forbidden.  Why a
-    ' batch's ask is not, or none.
-    \ self=iota writes=row[[path writ]] args=json
-    ^ maybe[str]
-    = required (mcp_mount/listed self "require" args)
-      forbidden (mcp_mount/listed self "forbid" args)
-      none=maybe[str] .none
-    | writes.fold none
-      \ out=maybe[str] [pax change]
-      ^ maybe[str]
-      ? (maybe/is_some out) out
-      ? !(mcp_mount/is_ask pax) out
-      ? !(required.any((\ p=path (mcp_mount/approval_path p))))
-        | ./some "an ask is written only with an owner approval required (require: a path under /approvals): use send"
-      = to pax.at(2)
-      ? !(forbidden.any((\ p=path (mcp_mount/optout_path p to))))
-        | ./some "an ask is written only with the recipient's opt-out forbidden (forbid: /optouts/<recipient>): use send"
-      out
-  + approval_path
-    ' /<self>/approvals/<…>: an approval, written only by the owner (the host's door enforces who).
-    \ p=path
+          (\ outcome=maybe[pail] state=namespace "")
+    | mcp_mount/batch id writes tag who then
+  + asks
+    ' Whether a batch writes an ask.
+    \ writes=row[[path writ]]
     ^ bool
-    ? (lt p.len 3) .false
-    | eq_iota p.at(1) 'approvals
-  + optout_path
-    ' /<self>/optouts/<recipient>, exactly.
-    \ p=path to=iota
+    % i=nat 0
     ^ bool
-    ? !(eq p.len 3) .false
-    ? !(eq_iota p.at(1) 'optouts) .false
-    | eq_iota p.at(2) to
+    ? (eq i writes.len) .false
+    = [p w] writes.at(i)
+    ? (mcp_mount/is_ask p) .true
+    | _ i.inc
   + is_ask
+    ' /<self>/our/<recipient>/ask/<id>: a question to someone.
     \ p=path
     ^ bool
     ? (lt p.len 5) .false
     | and (eq_iota p.at(1) 'our) (eq_iota p.at(3) 'ask)
+  + opted_out
+    ' The first ask in a batch whose recipient asked not to be contacted
+    ' (/<self>/optouts/<recipient>): the world's own rule, whoever writes.
+    \ self=iota writes=row[[path writ]] state=namespace
+    ^ bool
+    % i=nat 0
+    ^ bool
+    ? (eq i writes.len) .false
+    = [p w] writes.at(i)
+    ? !(mcp_mount/is_ask p) (_ i.inc)
+    ? (mcp_mount/present [self 'optouts p.at(2)] state) .true
+    | _ i.inc
   + conditional
     \ args=json
     ^ bool
@@ -815,6 +802,8 @@
     ' its case (care z: the whole subtree); otherwise why not.
     \ self=iota args=json writes=row[[path writ]] state=namespace
     ^ either[iota row[[p=path q=writ]]]
+    ? (mcp_mount/opted_out self writes state)
+      | ./err 'opted_out
     ? (mcp_mount/listed self "require" args).any((\ p=path !(mcp_mount/present p state)))
       | ./err 'requires_missing
     ? (mcp_mount/listed self "forbid" args).any((\ p=path (mcp_mount/present p state)))
