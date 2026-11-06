@@ -77,11 +77,35 @@ agreement between the two worlds: which cells are asked, and where the answer go
 wherever the cell appears. Nothing is copied: the cell is the answer.
 
 The world refuses an ask to anyone who opted out, and a second ask for the same cells while the first is open.
-Anyone can be asked: a Shrine world directly; a person without Shrine by email or phone, carried by a gateway as the
-same form.
+Anyone can be asked the same way: a row with a `world` cell is asked in that world; a row with only an `email` cell
+is asked by mail (`ask_row` does it): the same form goes to their mailbox with a link, and waits for them in a world
+kept for their address. They reply in their own words or answer at the link; either way the answer lands in that
+world and the asked cells show it, marked as read from mail. When they claim the world it is theirs, with everything
+already asked and answered in it, and later questions reach them there. A row's `world` and `email` cells say who
+they are: never ask anyone for them.
 
 When a form arrives for you (`/her/<them>/ask/<id>`), answer it by writing `/our/<them>/answer/<id>.md` with the same
 id, each blank filled as a value: `- price: {{price: $38.50}}`.
+
+## Answers stand
+
+An answer you gave is a standing answer: whoever asked sees it live in their own tables. When your docs change
+what it says (a price, a lead time), rewrite it, the same `/our/<them>/answer/<id>.md`, and their table follows. An
+answer from someone on Shrine is followed this way, with nothing to check; one read from mail (`at` says when it came)
+ages, and is asked again when the words say it is too old.
+
+## Terms
+
+When the words set terms (a price ceiling, a lead time, domestic only, how old a quote may be, how many suppliers
+must meet them), judge every row against them and keep a column saying so: `in_terms`, `yes` or `no: <why>`. When a
+row falls out of terms, do what the words say (ask again, find another, tell the owner). When the words cannot be
+met, say so first, at the top of the doc's notes: that is the one thing the owner must see.
+
+## Time
+
+To be woken later, write `/clock/<name>` with `in` (`5 minutes`, `30 days`) or `at` (a time) and `why`. When it is
+due you are woken, told which clock; do what its `why` says, and write it again if the words ask for it to repeat.
+Your world may sleep until then: nothing else is needed to keep it.
 
 ## When you are woken
 
