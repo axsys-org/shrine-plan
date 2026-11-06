@@ -1,0 +1,162 @@
+;;;; Restricted PLAN v0: inspect executable laws, then run them on PLAN.
+;;;; The trusted operation table is closed; artifact declarations never extend it.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+
+(define WORD 1)
+(define RESULT 2)
+(define LIMIT (Bex 256))
+(define MAX_DEFS 64)
+(define MAX_ARGS 16)
+(define MAX_DEPTH 128)
+(define MAX_VISITS 4096)
+
+;; Pure reference operations. Results are [0 word] or [1 fault-code].
+;; The order of these guards is observable when both operands fail.
+(define (word? x) (And (IsNat x) (Lt x LIMIT)))
+(define (lift x) (If (word? x) [0 x] [1 1]))
+(define (plus a b)
+  (If (_0 a) a (If (_0 b) b
+    (let ((n (Add (_1 a) (_1 b)))) (If (Lt n LIMIT) [0 n] [1 2])))))
+(define (minus a b)
+  (If (_0 a) a (If (_0 b) b
+    (If (Lt (_1 a) (_1 b)) [1 3] [0 (Sub (_1 a) (_1 b))]))))
+(define (times a b)
+  (If (_0 a) a (If (_0 b) b
+    (let ((n (Mul (_1 a) (_1 b)))) (If (Lt n LIMIT) [0 n] [1 2])))))
+(define (quotient a b)
+  (If (_0 a) a (If (_0 b) b
+    (Ifz (_1 b) [1 4] [0 (Div (_1 a) (_1 b))]))))
+(define (equals a b)
+  (If (_0 a) a (If (_0 b) b [0 (Eq (_1 a) (_1 b))])))
+(define (less a b)
+  (If (_0 a) a (If (_0 b) b [0 (Lt (_1 a) (_1 b))])))
+(define (choose condition yes no)
+  (If (_0 condition) condition
+    (If (Gt (_1 condition) 1) [1 1] (If (_1 condition) yes no))))
+
+(define library
+  [[lift [WORD] RESULT]
+   [plus [RESULT RESULT] RESULT]
+   [minus [RESULT RESULT] RESULT]
+   [times [RESULT RESULT] RESULT]
+   [quotient [RESULT RESULT] RESULT]
+   [equals [RESULT RESULT] RESULT]
+   [less [RESULT RESULT] RESULT]
+   [choose [RESULT RESULT RESULT] RESULT]])
+
+;; PLAN rows and law-body calls share a representation, so each boundary checks
+;; shape before projection. Bare 0 is the empty row, never a nonempty record.
+(define (row? x)
+  (Or (Equal x 0) (And (IsApp x) (Equal (Hd x) 0))))
+(define (record? n x) (And (row? x) (Eq (Sz x) n)))
+(define (base f) (If (IsPin f) (Unpin f) f))
+(define (function? f) (IsLaw (base f)))
+(define (same-function? a b) (Equal (base a) (base b)))
+(define (type? t) (Or (Equal t WORD) (Equal t RESULT)))
+(define (signature? d)
+  (And (record? 3 d)
+    (And (function? (_0 d))
+      (And (row? (_1 d))
+        (And (And (Gt (Sz (_1 d)) 0) (Le (Sz (_1 d)) MAX_ARGS))
+          (And (Eq (Arity (base (_0 d))) (Sz (_1 d)))
+            (And (all type? (_1 d)) (type? (_2 d)))))))))
+(define (lookup f defs)
+  (find (lambda (d) (same-function? f (_0 d))) defs))
+(define (trusted f)
+  (find (lambda (d) (Equal f (_0 d))) library))
+(define (quote? e) (And (IsApp e) (And (Equal (Hd e) 0) (Eq (Sz e) 1))))
+(define (call? e) (And (IsApp e) (And (Equal (Hd e) 0) (Eq (Sz e) 2))))
+(define (constant e) (If (quote? e) (_0 e) e))
+(define (unwind e args)
+  (Ifz (call? e) [e args]
+    (If (Ge (Sz args) MAX_ARGS) 0
+      (unwind (_0 e) (cons (_1 e) args)))))
+
+;; Each recursive visit consumes a shared artifact budget. Helper bodies are
+;; revisited at each call site, including calls in unselected branches.
+;; Success is [1 inferred-type fuel-left]; failure is [0 diagnostic fuel-left].
+(define (good typ fuel) [1 typ fuel])
+(define (bad code fuel) [0 code fuel])
+(define (typed expected actual fuel)
+  (If (Eq expected actual) (good actual fuel) (bad "type" fuel)))
+(define (visit defs stack types expected target fuel depth definition?)
+  (define (expression e want remaining)
+    (visit defs stack types want e remaining (Inc depth) 0))
+  (define (arguments args wants i remaining ret)
+    (If (Eq i (Sz args)) (typed expected ret remaining)
+      (let ((r (expression (Ix i args) (Ix i wants) remaining)))
+        (Ifz (_0 r) r (arguments args wants (Inc i) (_2 r) ret)))))
+  (cond
+    ((Eq fuel 0) (bad "budget" 0))
+    ((Gt depth MAX_DEPTH) (bad "depth" fuel))
+    (definition?
+      (let ((f (_0 target)))
+        (If (includes (same-function? f) stack) (bad "recursion" fuel)
+          (visit defs (snoc f stack) (_1 target) (_2 target)
+            (Body (base f)) (Dec fuel) (Inc depth) 0))))
+    ((IsNat target)
+      (cond
+        ((Eq target 0) (bad "self" fuel))
+        ((Le target (Sz types)) (typed expected (Ix (Dec target) types) (Dec fuel)))
+        ((word? target) (typed expected WORD (Dec fuel)))
+        (else (bad "literal" fuel))))
+    ((quote? target)
+      (If (word? (_0 target)) (typed expected WORD (Dec fuel)) (bad "literal" fuel)))
+    ((call? target)
+      (let ((spine (unwind target [])))
+        (Ifz spine (bad "arity" fuel)
+          (let* ((head (_0 spine)) (args (_1 spine)) (f (constant head)))
+            (cond
+              ((And (IsNat head) (Le head (Sz types)))
+                (bad (Ifz head "self" "dynamic") fuel))
+              ((call? head) (bad "dynamic" fuel))
+              (else
+                (let* ((native (trusted f))
+                       (user (If native 0 (lookup f defs)))
+                       (hit (Or native user)))
+                  (Ifz hit (bad "callee" fuel)
+                    (let ((sig (_0 hit)))
+                      (If (Ne (Sz args) (Sz (_1 sig))) (bad "arity" fuel)
+                        (let ((checked
+                                (If native (good (_2 sig) (Dec fuel))
+                                  (visit defs stack [] 0 sig (Dec fuel) (Inc depth) 1))))
+                          (Ifz (_0 checked) checked
+                            (arguments args (_1 sig) 0 (_2 checked) (_2 sig))))))))))))))
+    (else (bad "literal" fuel))))
+
+;; Do not infer trust from a law name or a caller-supplied manifest. Every
+;; declaration is checked before lookup, and every declared body is visited.
+(define (validate artifact)
+  (define (duplicates defs i)
+    (And (Lt i (Sz defs))
+      (Or (lookup (_0 (Ix i defs)) (take i defs)) (duplicates defs (Inc i)))))
+  (define (bodies defs i fuel)
+    (If (Eq i (Sz defs)) [1 fuel]
+      (let ((r (visit defs [] [] 0 (Ix i defs) fuel 0 1)))
+        (Ifz (_0 r) [0 (_1 r)] (bodies defs (Inc i) (_2 r))))))
+  (cond
+    ((Nil (record? 3 artifact)) [0 "shape"])
+    ((Nil (Equal (_0 artifact) "restricted-plan/0")) [0 "version"])
+    ((Nil (row? (_2 artifact))) [0 "shape"])
+    ((Or (Eq (Sz (_2 artifact)) 0) (Gt (Sz (_2 artifact)) MAX_DEFS)) [0 "shape"])
+    ((Nil (all signature? (_2 artifact))) [0 "signature"])
+    ((duplicates (_2 artifact) 0) [0 "duplicate"])
+    (else
+      (let ((entry (lookup (_1 artifact) (_2 artifact))))
+        (cond
+          ((Nil entry) [0 "entry"])
+          ((Or (Ne (_2 (_0 entry)) RESULT)
+               (Nil (all (Eq WORD) (_1 (_0 entry))))) [0 "entry_type"])
+          (else (bodies (_2 artifact) 0 MAX_VISITS)))))))
+
+(define (run artifact args)
+  (define admitted (validate artifact))
+  (Ifz (_0 admitted) ["rejected" (_1 admitted)]
+    (cond
+      ((Nil (row? args)) ["input" "shape"])
+      ((Ne (Sz args) (Arity (base (_1 artifact)))) ["input" "arity"])
+      ((Nil (all word? args)) ["input" "word"])
+      (else ["executed" (foldl (lambda (f arg) (f arg)) (_1 artifact) args)]))))

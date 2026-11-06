@@ -1,0 +1,189 @@
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rp (#module restricted-plan))
+(#bind cg (#module codegen))
+
+;; These build actual PLAN law bodies, not a substitute AST evaluator.
+(define W rp:WORD)
+(define R rp:RESULT)
+(define (q x) (0 x))
+(define (call f args) (foldl (lambda (body arg) (0 body arg)) f args))
+(define (lift x) (call rp:lift [x]))
+(define (law name argc body) (Law (Dec argc) name body))
+(define (def f args ret) [f args ret])
+(define (art f defs) ["restricted-plan/0" f defs])
+(define (one f) (art f [(def f [W] R)]))
+(define (expect label want got)
+  (If (Equal want got) 1 (error ["restricted-plan-test" label want got])))
+(define (accept label a)
+  (expect label 1 (_0 (rp:validate a))))
+(define (reject label reason a)
+  (expect label [0 reason] (rp:validate a)))
+(define (exec label a args result)
+  (expect label ["executed" result] (rp:run a args)))
+
+(define identity (law "identity" 1 (lift 1)))
+assert(accept "actual law" (one identity))
+assert(exec "identity executes PLAN" (one identity) [42] [0 42])
+(define pinned (Pin identity))
+assert(accept "pinned law" (one pinned))
+assert(exec "pinned execution" (one pinned) [7] [0 7])
+(define zero (law "zero" 1 (lift (q 0))))
+assert(exec "quoted zero is not self" (one zero) [99] [0 0])
+(define two (law "two" 1 (lift 2)))
+assert(exec "large body nat is literal" (one two) [99] [0 2])
+
+(define add (law "add" 2 (call rp:plus [(lift 1) (lift 2)])))
+(define add-art (art add [(def add [W W] R)]))
+assert(exec "addition" add-art [7 3] [0 10])
+assert(exec "checked addition" add-art [(Dec (Bex 256)) 1] [1 2])
+(define bad-product (call rp:times [(lift (q (Dec (Bex 256)))) (lift (q 2))]))
+(define ratio (law "ratio" 1 (call rp:quotient [bad-product (lift (q 2))])))
+assert(exec "product overflow precedes quotient" (one ratio) [0] [1 2])
+(define divzero (call rp:quotient [(lift (q 1)) (lift (q 0))]))
+(define underflow (call rp:minus [(lift (q 0)) (lift (q 1))]))
+(define ordered (law "ordered" 1 (call rp:plus [underflow divzero])))
+assert(exec "left failure wins" (one ordered) [0] [1 3])
+(define select (law "select" 1 (call rp:choose [(lift 1) (lift (q 9)) divzero])))
+assert(accept "both safe branches admitted" (one select))
+assert(exec "unselected failure does not propagate" (one select) [1] [0 9])
+assert(exec "selected failure propagates" (one select) [0] [1 4])
+assert(exec "condition must be boolean" (one select) [2] [1 1])
+(define condition-fails (law "condition" 1 (call rp:choose [underflow divzero (lift (q 9))])))
+assert(exec "condition failure wins" (one condition-fails) [0] [1 3])
+;; Direct probes of trusted functions make demand observable. The error thunk
+;; is test instrumentation and is never admitted as an artifact dependency.
+assert(expect "choose does not demand unused branch" [0 9]
+  (rp:choose [0 1] [0 9] (error "unselected branch demanded")))
+assert(expect "left failure does not demand right operand" [1 3]
+  (rp:plus [1 3] (error "right operand demanded")))
+
+(define helper (law "helper" 1 1))
+(define caller (law "caller" 1 (lift (call helper [1]))))
+(define helper-art (art caller [(def caller [W] R) (def helper [W] W)]))
+assert(accept "closed helper dependency" helper-art)
+assert(exec "helper executes" helper-art [19] [0 19])
+assert(reject "missing helper" "callee" (one caller))
+assert(reject "false helper signature" "type" (art caller [(def caller [W] R) (def helper [W] R)]))
+(define first (law "first" 2 1))
+(define lazy-call (law "lazy-call" 1 (call first [(lift (q 9)) divzero])))
+assert(exec "helper retains lazy argument demand"
+  (art lazy-call [(def lazy-call [W] R) (def first [R R] R)]) [0] [0 9])
+
+;; Exact identity, not Name or claimed signature, admits trusted operations.
+(define fake (law (Name (Unpin rp:lift)) 1 (call Now [(q 0)])))
+(define fake-caller (law "fake-caller" 1 (call fake [1])))
+assert(reject "forged library name" "callee" (one fake-caller))
+assert(reject "declared effectful helper" "callee"
+  (art fake-caller [(def fake-caller [W] R) (def fake [W] R)]))
+(define effect (law "effect" 1 (call Now [(q 0)])))
+assert(reject "direct host clock" "callee" (one effect))
+(define hidden (law "hidden" 1 (call rp:choose [(lift (q 1)) (lift (q 7)) (call effect [1])])))
+assert(reject "unselected effect is still rejected" "callee"
+  (art hidden [(def hidden [W] R) (def effect [W] R)]))
+assert(reject "unused definition is checked" "callee"
+  (art identity [(def identity [W] R) (def effect [W] R)]))
+(define dynamic (law "dynamic" 2 (0 1 2)))
+assert(reject "call through argument" "dynamic" (art dynamic [(def dynamic [W W] R)]))
+(define self (law "self" 1 (0 0 1)))
+assert(reject "recursive self call" "self" (one self))
+(define escaping (law "escape" 1 0))
+assert(reject "self as result" "self" (one escaping))
+(define partial (law "partial" 1 (call rp:plus [(lift 1)])))
+assert(reject "partial application" "arity" (one partial))
+(define over (law "over" 1 (call rp:lift [1 (q 0)])))
+assert(reject "overapplication" "arity" (one over))
+(define wrong-type (law "wrong-type" 1 (call rp:plus [1 (lift 1)])))
+assert(reject "word passed as result" "type" (one wrong-type))
+(define raw-add (law "raw-add" 1 (lift (call Add [1 (q 1)]))))
+assert(reject "raw arithmetic cannot bypass checks" "callee" (one raw-add))
+(define forged-result (law "forged-result" 1 (q [0 7])))
+assert(reject "result row cannot be forged" "literal" (one forged-result))
+(define too-big (law "too-big" 1 (lift (q (Bex 256)))))
+assert(reject "literal range" "literal" (one too-big))
+(define let-law (law "let" 1 (1 (q 7) (lift 2))))
+assert(reject "let must be normalized" "literal" (one let-law))
+assert(reject "unknown version" "version" ["restricted-plan/1" identity [(def identity [W] R)]])
+assert(reject "malformed artifact" "shape" 0)
+assert(reject "declared arity differs" "signature" (art identity [(def identity [W W] R)]))
+assert(reject "duplicate law through pin" "duplicate" (art identity [(def identity [W] R) (def pinned [W] R)]))
+assert(reject "entry missing" "entry" (art identity [(def helper [W] W)]))
+assert(reject "entry must return result" "entry_type" (art helper [(def helper [W] W)]))
+assert(reject "result inputs cannot enter from outside" "entry_type" (art identity [(def identity [R] R)]))
+assert(reject "unknown type" "signature" (art identity [(def identity [99] R)]))
+assert(reject "signature must be a record" "signature" (art identity [7]))
+assert(reject "definition must contain a function" "signature" (art identity [(def 42 [W] R)]))
+(define too-many-args (law "many-args" 17 (lift 1)))
+assert(reject "arity ceiling" "signature" (art too-many-args [(def too-many-args (gen 17 (lambda (i) W)) R)]))
+assert(expect "input count" ["input" "arity"] (rp:run (one identity) []))
+assert(expect "input range" ["input" "word"] (rp:run (one identity) [(Bex 256)]))
+assert(expect "input cannot be a function" ["input" "word"] (rp:run (one identity) [Now]))
+assert(expect "rejected code is never run" ["rejected" "callee"] (rp:run (one effect) [0]))
+
+;; The existing compiler backend emits the same executable PLAN profile.
+(define generated (cg:compile-expr (cg:F 1 0 0 "generated" 1 (cg:A (cg:K rp:lift) (cg:V 1)))))
+assert(accept "existing PLAN codegen output" (one generated))
+assert(exec "generated law executes" (one generated) [23] [0 23])
+
+;; Repeated helper expansion and deeply nested expressions are bounded.
+(define (nested n body)
+  (Ifz n body (nested (Dec n) (call rp:plus [(lift (q 0)) body]))))
+(define deep (law "deep" 1 (nested 130 (lift 1))))
+assert(reject "depth bound" "depth" (one deep))
+(define (wide n body)
+  (Ifz n body (let ((kid (wide (Dec n) body))) (call rp:plus [kid kid]))))
+(define huge (law "huge" 1 (wide 11 (lift 1))))
+assert(reject "expanded visit budget" "budget" (one huge))
+(define shallow (law "shallow" 1 (nested 12 (lift 1))))
+assert(exec "bounded expression executes" (one shallow) [5] [0 5])
+;; A compact dependency DAG must not evade the expanded budget.
+(define (diamond n defs previous)
+  (Ifz n (art previous defs)
+    (let* ((body (call rp:plus [(call previous [1]) (call previous [1])]))
+           (next (law (Add 2000 n) 1 body)))
+      (diamond (Dec n) (snoc (def next [W] R) defs) next))))
+assert(exec "small dependency DAG" (diamond 3 [(def identity [W] R)] identity) [3] [0 24])
+assert(reject "dependency expansion is charged" "budget" (diamond 11 [(def identity [W] R)] identity))
+(define many (gen 65 (lambda (i) (def (law (Add 1000 i) 1 (lift 1)) [W] R))))
+assert(reject "definition count" "shape" (art (_0 (_0 many)) many))
+(define max-defs (take 64 many))
+assert(accept "64 definitions fit" (art (_0 (_0 max-defs)) max-defs))
+
+;; Arithmetic fixtures cover each trusted operation, both operand positions,
+;; and values around uint256 boundaries. Each is executed through an admitted
+;; binary PLAN law, so signature checking and application are also exercised.
+(define (operation f)
+  (define executable (law "operation" 2 (call f [(lift 1) (lift 2)])))
+  (art executable [(def executable [W W] R)]))
+(define arithmetic
+  [[rp:plus 0 0 [0 0]]
+   [rp:plus (Dec (Bex 256)) 0 [0 (Dec (Bex 256))]]
+   [rp:minus 7 3 [0 4]]
+   [rp:minus 0 1 [1 3]]
+   [rp:minus 7 7 [0 0]]
+   [rp:times (Dec (Bex 256)) 1 [0 (Dec (Bex 256))]]
+   [rp:times (Bex 128) (Bex 128) [1 2]]
+   [rp:times (Bex 255) 0 [0 0]]
+   [rp:quotient 7 2 [0 3]]
+   [rp:quotient 1 0 [1 4]]
+   [rp:equals 7 7 [0 1]]
+   [rp:equals 7 8 [0 0]]
+   [rp:less 7 8 [0 1]]
+   [rp:less 8 7 [0 0]]])
+assert(all (lambda (case)
+  (exec "arithmetic fixture" (operation (_0 case)) [(_1 case) (_2 case)] (_3 case))) arithmetic)
+;; Compare independently compiled Foil helpers against admitted PLAN laws.
+(#bind cases (#module foil-test-cases))
+(#bind foil (#module foil-new-env))
+(define reference (cases:compile-module "test_fixtures/ethereum_word_reference"))
+(define operations
+  [[rp:plus "plus"] [rp:minus "minus"] [rp:times "times"] [rp:quotient "quotient"]])
+(define words [0 1 2 7 (Bex 128) (Bex 255) (Dec (Bex 256))])
+assert(all (lambda (op)
+  (define native (foil:source-entry-val ["ethereum_word_reference" (_1 op)] reference))
+  (define a (operation (_0 op)))
+  (all (lambda (x)
+    (all (lambda (y) (exec "Foil arithmetic agreement" a [x y] (native x y))) words)) words)) operations)
+(print "restricted PLAN acceptance tests passed; 196 Foil arithmetic comparisons")

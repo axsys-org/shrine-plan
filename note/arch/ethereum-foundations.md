@@ -96,7 +96,10 @@ are not a deployable wallet, complete application, or settlement contract.
 
 ## Next records and acceptance gates
 
-1. Specify the restricted PLAN subset and test it against reference execution.
+1. Establish the restricted PLAN admission boundary. The
+   [pure word profile](restricted-plan-v0.md) now has a specification, executable
+   checker, reference runner, and passing acceptance tests. Contract effects and
+   general Foil lowering remain subsequent compiler work.
 2. Specify canonical application state and signed command encoding; port state
    transitions and check them against Paramutuel's existing Solidity tests.
 3. Specify the Ethereum driver and signer protocols; test crash recovery around
@@ -129,5 +132,6 @@ constructors. No runtime or compiler behavior was changed.
 
 The slice establishes executable reference helpers, not complete protocol
 coverage. No Solidity differential run or cryptographic security claim follows
-from these source-derived fixtures. The next implementation record should define
-the restricted PLAN subset before adding an EVM backend or driver effects.
+from these source-derived fixtures. The
+[restricted PLAN record](restricted-plan-v0.md) specifies the next completed
+foundation and its acceptance evidence before EVM or driver effects.
