@@ -1,0 +1,101 @@
+;;;; Lower admitted executable PLAN to symbolic EVM instructions.
+;;;; Python only assembles these instructions and supplies the ABI envelope.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind rp (#module restricted-plan))
+
+;; State = [instructions next-memory next-label]. Tokens are opcodes, [0 word]
+;; PUSH, [1 label] JUMPDEST, or [2 label] fixed-width PUSH2 label reference.
+;; Memory 0/32 holds RESULT; memory 64 belongs to the ABI envelope.
+(define (emit s code)
+  (If (Gt (Add (Sz (_0 s)) (Sz code)) 8192)
+    (error "EVM expansion exceeds instruction budget")
+    [(Weld (_0 s) code) (_1 s) (_2 s)]))
+(define (alloc s) [[(_0 s) (Add (_1 s) 32) (_2 s)] (_1 s)])
+(define (label s) [[(_0 s) (_1 s) (Inc (_2 s))] (_2 s)])
+(define (load slot) [[0 slot] 81])
+(define (save slot) [[0 slot] 82])
+(define (copy s from to) (emit s (Weld (load from) (save to))))
+;; Consume a fault predicate. Failure jumps straight to the RESULT epilogue.
+(define (guard s code)
+  (define l (label s))
+  (emit (_0 l) [21 [2 (_1 l)] 87 [0 code] [0 32] 82
+    [0 1] [0 0] 82 [2 0] 86 [1 (_1 l)]]))
+(define (binary s op a b)
+  (define out (alloc s))
+  (define dst (_1 out))
+  (define initial (_0 out))
+  (define safe
+    (cond
+      ((Equal op rp:minus) (guard (emit initial (Weld (load b) (Weld (load a) [16]))) 3))
+      ((Equal op rp:quotient) (guard (emit initial (Weld (load b) [21])) 4))
+      (else initial)))
+  (define opcode
+    (cond ((Equal op rp:plus) 1) ((Equal op rp:minus) 3)
+      ((Equal op rp:times) 2) ((Equal op rp:quotient) 4)
+      ((Equal op rp:equals) 20) ((Equal op rp:less) 16)
+      (else (error "unsupported EVM operation"))))
+  (define applied (emit safe (Weld (load b) (Weld (load a) (cons opcode (save dst))))))
+  (define checked
+    (cond
+      ((Equal op rp:plus)
+        (guard (emit applied (Weld (load a) (Weld (load dst) [16]))) 2))
+      ((Equal op rp:times)
+        (let* ((skip (label applied))
+               (zero (emit (_0 skip) (Weld (load a) [21 [2 (_1 skip)] 87])))
+               (test (emit zero (Weld (load b) (Weld (load a) (Weld (load dst) [4 20 21]))))))
+          (emit (guard test 2) [[1 (_1 skip)]])))
+      (else applied)))
+  [checked dst])
+
+;; Argument bindings are suspended [1 expression lexical-environment] values.
+;; Inlining substitutes these without evaluating them. This preserves PLAN's
+;; lazy helper arguments and branch selection, including ignored failures.
+(define (expression defs e env state)
+  (cond
+    ((IsNat e)
+      (If (Le e (Sz env))
+        (let ((binding (Ix (Dec e) env)))
+          (Ifz (_0 binding)
+            (let ((out (alloc state)))
+              [(emit (_0 out) [[0 (Add 4 (Mul 32 (_1 binding)))] 53 [0 (_1 out)] 82]) (_1 out)])
+            (expression defs (_1 binding) (_2 binding) state)))
+        (let ((out (alloc state)))
+          [(emit (_0 out) [[0 e] [0 (_1 out)] 82]) (_1 out)])))
+    ((rp:quote? e)
+      (let ((out (alloc state)))
+        [(emit (_0 out) [[0 (_0 e)] [0 (_1 out)] 82]) (_1 out)]))
+    (else
+      (let* ((spine (rp:unwind e []))
+             (f (rp:constant (_0 spine))) (args (_1 spine))
+             (native (rp:trusted f)))
+        (Ifz native
+          (let ((definition (_0 (rp:lookup f defs))))
+            (expression defs (Body (rp:base (_0 definition)))
+              (map (lambda (arg) [1 arg env]) args) state))
+          (cond
+            ((Equal f rp:lift) (expression defs (_0 args) env state))
+            ((Equal f rp:choose)
+              (let* ((condition (expression defs (_0 args) env state))
+                     (safe (guard (emit (_0 condition) (cons [0 1] (Weld (load (_1 condition)) [17]))) 1))
+                     (out (alloc safe)) (dst (_1 out))
+                     (no (label (_0 out))) (end (label (_0 no)))
+                     (branch (emit (_0 end) (Weld (load (_1 condition)) [21 [2 (_1 no)] 87])))
+                     (yes-result (expression defs (_1 args) env branch))
+                     (yes-end (emit (copy (_0 yes-result) (_1 yes-result) dst)
+                       [[2 (_1 end)] 86 [1 (_1 no)]]))
+                     (no-result (expression defs (_2 args) env yes-end)))
+                [(emit (copy (_0 no-result) (_1 no-result) dst) [[1 (_1 end)]]) dst]))
+            (else
+              (let* ((a (expression defs (_0 args) env state))
+                     (b (expression defs (_1 args) env (_0 a))))
+                (binary (_0 b) f (_1 a) (_1 b))))))))))
+(define (compile artifact)
+  (define admission (rp:validate artifact))
+  (Ifz (_0 admission) (error ["EVM admission" (_1 admission)])
+    (let* ((entry (_1 artifact))
+           (args (gen (Arity (rp:base entry)) (lambda (i) [0 i])))
+           (out (expression (_2 artifact) (Body (rp:base entry)) args [[] 96 1])))
+      (_0 (emit (copy (_0 out) (_1 out) 32) [[1 0]])))))

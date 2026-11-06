@@ -102,9 +102,13 @@ are not a deployable wallet, complete application, or settlement contract.
    general Foil lowering remain subsequent compiler work.
 2. Specify canonical application state and signed command encoding; port state
    transitions and check them against Paramutuel's existing Solidity tests.
-3. Specify the Ethereum driver and signer protocols; test crash recovery around
-   nonce reservation, signing, broadcast, and receipt recording.
-4. Emit EVM bytecode and compare behavior with the same PLAN program.
+3. Establish the Ethereum driver and signer protocols. The
+   [Sepolia slice](foil-sepolia-v0.md) now has durable signed intents, broadcast
+   retry, receipt checks, event replay, and a Foil transport. A mounted wallet
+   application and world-commit integration remain future work.
+4. Emit EVM bytecode and compare behavior with the same PLAN program. The pure
+   word backend now passes differential tests and runs a test contract on
+   Sepolia. Storage and application effects remain future profiles.
 5. Measure disclosure and private-proof dispute prototypes on identical batches.
 6. Choose settlement, availability, exit, and upgrade rules from that evidence.
 

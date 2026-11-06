@@ -144,8 +144,8 @@ nix develop .#eden --command sh x/check restricted-plan-tests foil:tests/ethereu
 ```
 
 This evidence establishes admission and PLAN execution for the pure word
-profile. It does not establish EVM equivalence, safe decoding of hostile bytes,
-or a general Foil contract frontend. The next compiler slice should lower a
-small Foil contract expression into this profile and compare its PLAN result
-with emitted EVM bytecode. Storage and transaction effects need their own
-specified extension. Privacy and settlement remain independent decisions.
+profile. The subsequent [Foil/Sepolia slice](foil-sepolia-v0.md) adds an embedded
+contract language, an EVM backend, differential tests, and a testnet deployment.
+Safe decoding of hostile bytes and a general Foil contract frontend remain
+future work. Storage and transaction effects need their own specified extension.
+Privacy and settlement remain independent decisions.
