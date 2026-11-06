@@ -131,7 +131,7 @@
         | mcp_mount/write_from self call.id specs tag who then
       ? (mcp_mount/writes self specs)
        > (./ok writes)
-        ?> (./some why) (mcp_mount/refused self writes who) (mcp_mount/batch call.id writes tag who then)
+        ?> (./some why) (mcp_mount/refused self writes who) (mcp_mount/write_batch call.id writes tag who then self args)
         | mcp_mount/refuse call.id why
        > (./err why) (mcp_mount/refuse call.id why)
     ? (equal name "mcp/apply")
@@ -750,6 +750,124 @@
     ^ http_foot/action
     | ./batch writes.weld(tag)
         (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+  + write_batch
+    ' A batch with conditions (require, forbid, if_case) is planned against
+    ' the very state it is admitted on and refused whole when one fails, so
+    ' a write can depend on what else is true without a race; a batch with
+    ' none is a plain batch.
+    \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec] self=iota args=json
+    ^ http_foot/action
+    ?> (./some why) (mcp_mount/unguarded_ask self writes args)
+      (? (mcp_mount/conditional args)
+        (http_foot/action/admit
+          (\ state=namespace (mcp_mount/guard self args writes.weld(tag) state))
+          (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+          (\ outcome=maybe[pail] state=namespace ""))
+        (mcp_mount/batch id writes tag who then))
+    | mcp_mount/refuse id why
+  + unguarded_ask
+    ' An ask (/<self>/our/<recipient>/ask/<id>) is written only with its
+    ' guard: an approval under /<self>/approvals required, and the
+    ' recipient's opt-out (/<self>/optouts/<recipient>) forbidden.  Why a
+    ' batch's ask is not, or none.
+    \ self=iota writes=row[[path writ]] args=json
+    ^ maybe[str]
+    = required (mcp_mount/listed self "require" args)
+      forbidden (mcp_mount/listed self "forbid" args)
+      none=maybe[str] .none
+    | writes.fold none
+      \ out=maybe[str] [pax change]
+      ^ maybe[str]
+      ? (maybe/is_some out) out
+      ? !(mcp_mount/is_ask pax) out
+      ? !(required.any((\ p=path (mcp_mount/approval_path p))))
+        | ./some "an ask is written only with an owner approval required (require: a path under /approvals): use send"
+      = to pax.at(2)
+      ? !(forbidden.any((\ p=path (mcp_mount/optout_path p to))))
+        | ./some "an ask is written only with the recipient's opt-out forbidden (forbid: /optouts/<recipient>): use send"
+      out
+  + approval_path
+    ' /<self>/approvals/<…>: an approval, written only by the owner (the host's door enforces who).
+    \ p=path
+    ^ bool
+    ? (lt p.len 3) .false
+    | eq_iota p.at(1) 'approvals
+  + optout_path
+    ' /<self>/optouts/<recipient>, exactly.
+    \ p=path to=iota
+    ^ bool
+    ? !(eq p.len 3) .false
+    ? !(eq_iota p.at(1) 'optouts) .false
+    | eq_iota p.at(2) to
+  + is_ask
+    \ p=path
+    ^ bool
+    ? (lt p.len 5) .false
+    | and (eq_iota p.at(1) 'our) (eq_iota p.at(3) 'ask)
+  + conditional
+    \ args=json
+    ^ bool
+    ? (maybe/is_some (mcp_rpc/field "require" args)) .true
+    ? (maybe/is_some (mcp_rpc/field "forbid" args)) .true
+    | maybe/is_some (mcp_rpc/field "if_case" args)
+  + guard
+    ' Every require exists, no forbid exists, every if_case path is still at
+    ' its case (care z: the whole subtree); otherwise why not.
+    \ self=iota args=json writes=row[[path writ]] state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? (mcp_mount/listed self "require" args).any((\ p=path !(mcp_mount/present p state)))
+      | ./err 'requires_missing
+    ? (mcp_mount/listed self "forbid" args).any((\ p=path (mcp_mount/present p state)))
+      | ./err 'forbidden_present
+    ? (mcp_mount/moved self args state)
+      | ./err 'case_moved
+    | ./ok writes
+  + moved
+    ' Whether some if_case path is no longer at its case.
+    \ self=iota args=json state=namespace
+    ^ bool
+    = cs (mcp_mount/cases self args)
+    % i=nat 0
+    ^ bool
+    ? (eq i cs.len) .false
+    = [p c] cs.at(i)
+    ? !(eq c (state.case(.z p).fall(0))) .true
+    | _ i.inc
+  + present
+    \ p=path state=namespace
+    ^ bool
+    | maybe/is_some (sovereign_care .x p state).fil
+  + listed
+    ' The paths a list of texts names, relative to the node or absolute.
+    \ self=iota key=str args=json
+    ^ row[path]
+    = none=row[path] []
+    ?> (./some field) (mcp_rpc/field key args) none
+    ? field
+     > (./arr xs)
+      | xs.fold none
+        \ out=row[path] x=json
+        ^ row[path]
+        ? x
+         > (./str s)
+          ?> (./some p) (mcp_mount/target self s) out
+          | out.snoc(p)
+        out
+    none
+  + cases
+    ' The if_case list: each {path, case}.
+    \ self=iota args=json
+    ^ row[[p=path c=nat]]
+    = none=row[[p=path c=nat]] []
+    ?> (./some field) (mcp_rpc/field "if_case" args) none
+    ? field
+     > (./arr xs)
+      | xs.fold none
+        \ out=row[[p=path c=nat]] x=json
+        ^ row[[p=path c=nat]]
+        ?> (./some p) (mcp_mount/target self (mcp_rpc/text_at "path" x)) out
+        | out.snoc([p (mcp_rpc/num_at "case" 0 x)])
+    none
   + shown_line
     ' The line a presented read pushes: {shown: {path, care, case}}.
     \ spec=mcp_mount/spec
@@ -1081,7 +1199,7 @@
         (mcp_mount/p "next" "string" "The next cursor a previous page of this same read answered: the page after it.")
         (mcp_mount/p "present" "boolean" "Answer as usual and push {shown: {path, care, case}} on the stream; nothing journaled, no epoch moves.")]
        [])
-     (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch."
+     (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch. Conditions, checked against the state the batch is admitted on: require (paths that must exist), forbid (paths that must not), if_case ([{path, case}]: each subtree still at that case); one failing refuses the batch whole."
        [(mcp_mount/p "records" "array" "[{path, slots, action}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree).")
         (mcp_mount/p "from" "string" "On a record: /h/x/<case>/<len>/<path>, copy the record as it was at that case (undo, redo).")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")
