@@ -107,6 +107,9 @@ id, each blank filled as a value: `- price: {{price: $38.50}}`.
 - A filled cell that no longer holds is opened again, never silently changed or blanked: `set` with no value and
   `open` saying why. Four reasons open a cell: something it rests on changed; an instruction says it is wrong; it is
   older than the words allow; two sources disagree. A new value closes it.
+- What is a hole is computed, never judged: a blank cell, a name that does not exist, a reference that resolves only
+  partly (`read` says how far). You never mark or unmark those; fill them. Judgement is only for holes no record
+  shows (below).
 - `table` gives each cell's state: a value (source, when, and the other answers that came for it), open again (why),
   a hole with an answer that came and is not taken yet, asked (whom, since when), left out of an answer, or a hole.
 
