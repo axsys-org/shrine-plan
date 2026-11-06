@@ -8,7 +8,8 @@ repository, one file per page: `docs/brackets.md`), and you use your own Read, E
 |---|---|
 | `read` `/docs/brackets.md` | see a page: its blocks, values, blanks, sources, references, embeds and wakes |
 | `edit` `/docs/brackets.md`, old → new | change one exact snippet; it fails if the snippet is not there once (someone changed the page: read it again) |
-| `write` `/docs/new.md` | write a whole page |
+| `write` `/docs/new.md` | write a whole page; pass `if_case` (the case you read) and a page that changed since keeps both writers' changes |
+| `write_stream` `/docs/new.md`, chunk | write a piece at a time; stop whenever you like, read and search, resume with `at` |
 | `glob` `/docs/*.md`, `grep` `Keystone` | find pages and lines |
 | `history` `/docs/brackets.md` | see who changed a page and when |
 | `send` | ask someone for a page's open blanks: writes the ask file below for you |
@@ -48,6 +49,18 @@ after `→` what to do when it fires. Put them in the page's `## Watch` section 
 Deleting the line removes the wake. Passive things need no wake: references keep pages live and blanks fill
 themselves. Declare a wake only where a judgment is needed.
 
+## Writing as you think
+
+`write_stream` takes chunks. Every paragraph or table that closes (a blank line) is written at once; the unfinished
+rest is the page's draft, which others see as pending (`<!-- draft · agent is writing here -->`). Stop at any point:
+read, grep, glob or look at history, then resume with `at` set to the anchor the last answer gave you. If someone
+changed the page meanwhile, what you write still goes after that anchor. `done: true` writes the rest. A `[[` or
+`{{` you have not closed is just text in the draft until you close it.
+
+Every write takes the world's turn, one at a time and numbered (`seq` in the answer). Nothing is lost to a race:
+a write planned on an older case is replayed onto the page as it is, block by block, and only a block you and
+someone else both changed is refused, by name, with the page as it is now.
+
 ## Saving
 
 A save is one write of the whole file. If the world refuses it (malformed syntax, someone changed the page while you
@@ -55,6 +68,26 @@ edited, an ask to someone who opted out), the file is put back as the world has 
 it as `<file>.rej`, with what you saved: read the reason, fix, save again. A good save removes the `.rej`. Half-typed
 syntax is text, so a draft never fails; only finished constructs bind. Deleting a file retires its page (it stays
 in history). Files under `her/` are other worlds' publications: read-only; quote them, or ask them.
+
+## Lines that do things
+
+A line that starts with `@someone` (after an optional `when`, `at`, `after`, `if` or `every` clause) is an action,
+and gets a card, `/cards/<page>__<anchor>`, in the same write. Its state shows after its anchor
+(`<!-- do:a01 · done · asked 0x40 -->`).
+
+| Line | What happens |
+|---|---|
+| `@0x40 lead time for 500 a month? {{lead_time: ? days}}` | asks them for the blanks on the line; the blank is bound to their answer |
+| `@0x40 fyi: we moved the start to Jan 5` | tells them; no blank |
+| `@agent find 3 anodizing shops near Newark → below` | a task for the agent edge; the answer is written under the line |
+| `@agent fetch https://acme.example/pricing → below` | the page's words are written under the line, with where they came from |
+| `when [[#lead_time]] appears @0x40 and the price? {{price: ? $}}` | waits, then asks |
+| `at {{2026-11-08 09:00}} @0x40 still on? {{still_on: ? yes/no}}` | waits until then (UTC) |
+
+The target is a world (`@0x40`) or a name with a contact record (`/contacts/keystone` with `world`); a name with no
+way to reach them fails the card and says so. Rewording a line updates its card; changing what it asks sets it
+going again; deleting a line takes back a card not yet acted on. The same line written twice is asked once. Someone
+mentioned inside a sentence (`I asked @0x40 already`) is just text.
 
 ## Asking
 
