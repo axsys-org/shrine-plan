@@ -114,6 +114,36 @@ id, each blank filled as a value: `- price: {{price: $38.50}}`.
   table lacks, a column the job implies, a question an answer raised) you write down as an empty row, column or a
   step, so it becomes an ordinary hole.
 
+## A step can try several things at once
+
+- A hole can be found many ways: this world's own tables and files, other docs, the web, history, relationships,
+  another world (a handshake: an introduction and a first request), a person. Cheapest first; several at once when
+  they are cheap or the words are in a hurry.
+- Each way is an option under its step, `/<row>/steps/<id>/options/<o>`, columns `try`, `how`, `to`, `started`,
+  `state` (waiting, partial, nothing, refused, no scope, held, stopped, answered), `got`, `role`. Write them with
+  `set`; `ask_row` with `step` files the ask as an option of that step (name the `columns` when the cells are already
+  asked of someone else). Say the step's `mode`: first good answer (the default), gather all, or fallback (an option
+  `held` until another fails, its `try` saying when).
+- When a step is settled by one option, stop the others (`state: stopped`); a person you asked is thanked and told,
+  never left waiting.
+- What settles a hole is its bar (who may answer it, with what authority: a signed record, a written confirmation,
+  a payment); a hole can also be a thing to do (send the order): its step does it and `got` is the confirmation.
+  Give each hole a budget (time, cost, asks); past it, say so in the doc and stop.
+
+## Answers accumulate; the cell chooses
+
+- Every answer is kept where it landed. A cell's primary is what its `source` points at, and only a write sets or
+  switches it. When the first answer that meets the bar lands on an empty cell, take it: `set` the cell to it, with
+  `source` the answer's path, once. Until someone does, `table` shows it as a hint on the hole, not as a value. Later
+  answers only add to the options; they are the cell's alternates (`table` lists them) and wake nothing.
+- Judge every new answer against the one the cell rests on: fit to the words' terms, trust (a world's signed record
+  over a mail, a call or a page), freshness, authority, and what already rests on the current one. To switch, `set`
+  the cell to the new value with `source` the answer's path and say why in the option's `role`
+  (`primary: signed, 5¢ cheaper`); mark the old one `alternate: …`. To keep it, mark the new one `alternate: why`. A
+  close call, or a switch after something was done on the old answer, goes to the person the words name.
+- When the answer a cell rests on breaks (withdrawn, too old, the sender stops publishing), set the best alternate
+  that still holds, with the reason in `open` cleared and the switch said in its role; never leave the cell blank.
+
 ## Answers stand
 
 An answer you gave is a standing answer: whoever asked sees it live in their own tables. When your docs change
