@@ -36,7 +36,8 @@ There is no other syntax. Keep anchors (`<!-- b:… -->`) where they are; a bloc
 - The same table in any doc is the same rows. Editing a cell in any doc writes that cell; adding a row adds it. A row
   left out of a doc is not removed (removing is done in the table, on purpose).
 - Make a new table whenever something has rows: write it with its path, and its rows are written there.
-- Read a whole table with `table` (`/suppliers`): every cell with its source, or what it is waiting on.
+- Read a whole table with `table` (`/suppliers`): every cell with its source, or what it is waiting on, and for an
+  answer, when it came (`at`).
 - When your read was a while ago, pass the `row_cases` your `read` answered to `write`: a cell someone else changed
   since, and you did not, is then left alone.
 
@@ -103,8 +104,10 @@ met, say so first, at the top of the doc's notes: that is the one thing the owne
 
 ## Time
 
-To be woken later, write `/clock/<name>` with `in` (`5 minutes`, `30 days`) or `at` (a time) and `why`. When it is
-due you are woken, told which clock; do what its `why` says, and write it again if the words ask for it to repeat.
+To be woken later, write one record (with `mcp/write`, not a page): `{"path": "/<you>/clock/<name>", "action":
+"make", "slots": {"in": "5 minutes", "why": "what to do then"}}` (`in`: `90 s`, `5 minutes`, `30 days`; or `at`: a
+time). When it is due you are woken, told which clock; do what its `why` says, and write it again (the same record) if
+the words ask for it to repeat.
 Your world may sleep until then: nothing else is needed to keep it.
 
 ## When you are woken
@@ -112,8 +115,7 @@ Your world may sleep until then: nothing else is needed to keep it.
 You are woken when something you watch changes (a doc, or something arriving from another world under `/her`). The
 prompt says which, why and what changed. Read first, then act. When you are done, reply with what you did and found, ending with two lines: `ok: yes` or
 `ok: no` (does what the cell asks hold now) and `relied on: <the paths you used>`. Your reply is recorded as the
-cell's answer; never write the cell yourself. If your writes changed what the cell watches, you will be woken once
-more to see them; reply then without writing again.
+cell's answer; never write the cell yourself. Your own writes never wake you.
 
 ## Never
 
