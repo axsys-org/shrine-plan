@@ -96,8 +96,12 @@ into the file (its path, and the page, sheet, line or time). Never transcribe a 
 evidence. `glob` lists docs only: list a folder's files with `table` on the folder (its `files`), and read a text file
 with `mcp/read` on its path (its `text` slot).
 
-When a form arrives for you (`/her/<them>/ask/<id>`), answer it by writing `/our/<them>/answer/<id>.md` with the same
-id, each blank filled as a value: `- price: {{price: $38.50}}`.
+When a question arrives for you (`/her/<them>/ask/<id>`), it is a table: a row of holes about a thing (`about`,
+then a column for each), or names they expected in your world (`asked`, `where it is`). Answer by writing
+`/our/<them>/answer/<id>.md` with a table headed by that path: the same columns, one row, each cell the value you
+stand behind, `none` with a reason where there is nothing, empty where you do not know. For names, say where each is
+in your world (a path; write a `forward` from the name they used when it helps them), its value, or none. Never
+answer in any other spelling.
 
 ## Cells keep where they came from
 
