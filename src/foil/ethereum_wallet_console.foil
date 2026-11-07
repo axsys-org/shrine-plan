@@ -1,0 +1,102 @@
+- ethereum_wallet_foot
+
+' Local JSON-lines control surface. The first line supplies transient I/O
+' capabilities. Namespace state contains neither RPC credentials nor keys.
++ ethereum_wallet_console
+  + line
+    \ ignored=nat
+    ^ str
+    % out=str ""
+    = ;byte (Input 1)
+    ? (le byte 1) out
+    = char (mod byte 256)
+    ? (eq char 10) out
+    ? (gt out.len 131072) (ethereum_bytes/fail_text "input line too long")
+    | _ out.snoc_byte(char)
+  + decode
+    \ text=str
+    ^ json
+    ?> (jres/ok value rest) (parse text)
+        ; (error (pails/t "invalid command JSON"))
+        jnull
+    value
+  + emit
+    \ value=json
+    ^ nat
+    | Output (ethereum_driver/bar (str/to_atom (str/cat_all [(show value) (str/from_atom 10)])))
+  + intent_json
+    \ i=ethereum_wallet/intent
+    ^ json
+    | json/obj [(jkv "id" (json/str i.id)) (jkv "phase" (json/num .false i.phase))
+      (jkv "digest" (json/str i.digest)) (jkv "raw" (json/str i.raw))
+      (jkv "hash" (json/str i.hash)) (jkv "receipt" i.receipt)]
+  + batch_json
+    \ b=ethereum_wallet/batch
+    ^ json
+    | json/obj [(jkv "sequence" (json/num .false b.sequence))
+      (jkv "added" (json/arr b.added)) (jkv "removed" (json/arr b.removed))]
+  + stream_json
+    \ s=ethereum_wallet/stream
+    ^ json
+    | json/obj [(jkv "id" (json/str s.id)) (jkv "cursor" (json/str (ethereum_wallet/cursor s)))
+      (jkv "acknowledged" (json/num .false s.acknowledged))
+      (jkv "batches" (json/arr (s.batches.map(ethereum_wallet_console/batch_json))))]
+  + status
+    \ state=ethereum_wallet/state
+    ^ json
+    | json/obj [(jkv "address" (json/str state.address))
+      (jkv "chain" (json/num .false state.chain))
+      (jkv "nextNonce" (json/num .false state.next_nonce))
+      (jkv "intents" (json/arr (state.intents.map(ethereum_wallet_console/intent_json))))
+      (jkv "streams" (json/arr (state.streams.map(ethereum_wallet_console/stream_json))))]
+  + command
+    \ message=json
+    ^ ethereum_wallet/command
+    = op (ethereum_rpc/text (ethereum_rpc/get "op" message))
+      id (ethereum_rpc/text (ethereum_rpc/get "id" message))
+    ? (equal op "prepare")
+      | ethereum_wallet/command/prepare id (ethereum_rpc/text (ethereum_rpc/get "to" message))
+        (ethereum_rpc/text (ethereum_rpc/get "data" message))
+    ? (equal op "subscribe")
+      | ethereum_wallet/command/subscribe id (ethereum_rpc/text (ethereum_rpc/get "address" message))
+        (ethereum_rpc/number (ethereum_rpc/get "start" message))
+        (ethereum_rpc/number (ethereum_rpc/get "confirmations" message))
+    ? (equal op "ack")
+      | ethereum_wallet/command/ack id (ethereum_rpc/number (ethereum_rpc/get "sequence" message))
+    ; (error (pails/t "unknown wallet command"))
+    | ethereum_wallet/command/tick
+  + handle
+    \ config=ethereum_wallet_foot/config server=nat home=path message=json
+    ^ json
+    = op (ethereum_rpc/text (ethereum_rpc/get "op" message))
+    ; (? (equal op "status") 0
+        (? (equal op "cycle") (ethereum_wallet_foot/cycle config server home)
+          (ethereum_wallet_foot/commit server home (ethereum_wallet_console/command message))))
+    | ethereum_wallet_console/status (ethereum_wallet_foot/snapshot server home)
+  + serve
+    \ state=namespace keep={\ namespace}nat
+    ^ nat
+    ; (keep state)
+    ; (ethereum_wallet_console/emit (json/str "wallet-config"))
+    = ;input (ethereum_wallet_console/line 0)
+      settings (ethereum_wallet_console/decode input)
+      config
+        | ethereum_wallet_foot/config
+          (ethereum_rpc/text (ethereum_rpc/get "rpc" settings))
+          (ethereum_rpc/number (ethereum_rpc/get "signerPort" settings))
+          (ethereum_rpc/text (ethereum_rpc/get "signerToken" settings)) 1000
+      ;server (Spawn (helm/supervisor/run_keeping[namespace] ethereum_wallet_app/access keep state))
+      home=path [state.self 'app 'ethereum]
+    ; (ethereum_wallet_console/emit (json/str "wallet-ready"))
+    % count=nat 0
+    ^ nat
+    = ;line (ethereum_wallet_console/line 0)
+    ? (eq line.len 0) count
+    = ;answer (Try (\ line=str (ethereum_wallet_console/handle config server home (ethereum_wallet_console/decode line))) line)
+    = ;emitted
+        ? answer
+         > (./ok result)
+          | ethereum_wallet_console/emit (json/obj [(jkv "ok" (json/boo .true)) (jkv "result" result)])
+         > (./err why)
+          | ethereum_wallet_console/emit (json/obj [(jkv "ok" (json/boo .false)) (jkv "error" (json/str "wallet command rejected"))])
+    | _ count.inc

@@ -1,0 +1,188 @@
+- ethereum_wallet_app
+- ethereum_rpc
+- ethereum_driver
+
++ ethereum_wallet_foot
+  + config
+    : rpc=str signer_port=nat signer_token=str interval=nat
+  + sign
+    \ config=ethereum_wallet_foot/config item=ethereum_wallet/intent
+    ^ ethereum_wallet/command
+    = message | json/obj [(jkv "op" (json/str "sign")) (jkv "digest" (json/str item.digest))]
+      ;reply (ethereum_driver/request config.signer_port config.signer_token message)
+    ?> (./ok response) reply
+        ; (error (pails/t "signer transport failed"))
+        | ethereum_wallet/command/tick
+    ? !(equal (ethereum_rpc/get "ok" response) (json/boo .true))
+      ; (error (pails/t "signer rejected request"))
+      | ethereum_wallet/command/tick
+    = result (ethereum_rpc/get "result" response)
+    | ethereum_wallet/command/signed item.id (ethereum_rpc/text (ethereum_rpc/get "digest" result))
+      (ethereum_rpc/number (ethereum_rpc/get "parity" result))
+      (ethereum_rpc/number (ethereum_rpc/get "r" result))
+      (ethereum_rpc/number (ethereum_rpc/get "s" result))
+  + observe
+    \ config=ethereum_wallet_foot/config state=ethereum_wallet/state item=ethereum_wallet/intent
+    ^ ethereum_wallet/command
+    = rpc config.rpc
+      ;chain (ethereum_rpc/number (ethereum_rpc/request rpc "eth_chainId" []))
+    ? !(eq chain state.chain)
+      ; (error (pails/t "RPC chain mismatch"))
+      | ethereum_wallet/command/tick
+    ? (eq item.phase 0)
+      = ;identity (ethereum_driver/request config.signer_port config.signer_token
+          (json/obj [(jkv "op" (json/str "identity"))]))
+      ?> (./ok identity) identity
+          ; (error (pails/t "signer unavailable"))
+          | ethereum_wallet/command/tick
+      = address (ethereum_rpc/text (ethereum_rpc/get "address" (ethereum_rpc/get "result" identity)))
+        ;nonce (ethereum_rpc/number (ethereum_rpc/request rpc "eth_getTransactionCount" [(json/str state.address) (json/str "pending")]))
+        ;block (ethereum_rpc/request rpc "eth_getBlockByNumber" [(json/str "latest") (json/boo .false)])
+        base (ethereum_rpc/number (ethereum_rpc/get "baseFeePerGas" block))
+        ;priority (ethereum_rpc/number (ethereum_rpc/request rpc "eth_maxPriorityFeePerGas" []))
+        tip (? (gt priority 2000000000) 2000000000 priority)
+        candidate (ethereum_transaction chain nonce tip (add (mul 2 base) tip) 0 item.to item.data)
+        ;estimate (ethereum_rpc/number (ethereum_rpc/request rpc "eth_estimateGas" [(ethereum_transaction/rpc state.address candidate)]))
+        ;balance (ethereum_rpc/number (ethereum_rpc/request rpc "eth_getBalance" [(json/str state.address) (json/str "latest")]))
+      | ethereum_wallet/command/quote item.id chain address nonce base priority estimate balance
+    ? (eq item.phase 1) (ethereum_wallet_foot/sign config item)
+    ? (eq item.phase 2)
+      = ;known (ethereum_rpc/request rpc "eth_getTransactionByHash" [(json/str item.hash)])
+      ? !(equal known jnull) (ethereum_wallet/command/sent item.id (ethereum_rpc/text (ethereum_rpc/get "hash" known)))
+      = ;hash (ethereum_rpc/text (ethereum_rpc/request rpc "eth_sendRawTransaction" [(json/str item.raw)]))
+      | ethereum_wallet/command/sent item.id hash
+    = ;receipt (ethereum_rpc/request rpc "eth_getTransactionReceipt" [(json/str item.hash)])
+    ? (equal receipt jnull)
+      | ethereum_wallet/command/receipt item.id jnull "" ""
+    ? !(equal (ethereum_rpc/text (ethereum_rpc/get "transactionHash" receipt)) item.hash)
+      ; (error (pails/t "receipt transaction mismatch"))
+      | ethereum_wallet/command/tick
+    = block_hash (ethereum_rpc/text (ethereum_rpc/get "blockHash" receipt))
+      number (ethereum_rpc/number (ethereum_rpc/get "blockNumber" receipt))
+      ;canonical (ethereum_rpc/block rpc number)
+    | ethereum_wallet/command/receipt item.id receipt block_hash (ethereum_rpc/text (ethereum_rpc/get "hash" canonical))
+  + scan
+    \ config=ethereum_wallet_foot/config stream=ethereum_wallet/stream
+    ^ ethereum_wallet/command
+    = rpc config.rpc
+      ;head (ethereum_rpc/number (ethereum_rpc/request rpc "eth_blockNumber" []))
+      ;retained=nat (ethereum_wallet_foot/retained rpc stream.blocks head)
+      ancestor=nat (? (eq retained 0) stream.start.dec stream.blocks.at(retained.dec).number)
+      anchor=str (? (eq retained 0) "" stream.blocks.at(retained.dec).hash)
+      end=nat (? (gt (sub head stream.confirmations) (add ancestor 128)) (add ancestor 128) (sub head stream.confirmations))
+      ;blocks=row[ethereum_wallet/log_block] (ethereum_wallet_foot/blocks rpc stream.address ancestor anchor end)
+    ? (gt retained 0)
+      = ;current (ethereum_rpc/block rpc ancestor)
+      ? !(equal (ethereum_rpc/text (ethereum_rpc/get "hash" current)) anchor)
+        ; (error (pails/t "cursor changed during event scan"))
+        | ethereum_wallet/command/tick
+      | ethereum_wallet_foot/finish_scan config stream ancestor anchor blocks
+    | ethereum_wallet_foot/finish_scan config stream ancestor anchor blocks
+  + retained
+    \ rpc=str blocks=row[ethereum_wallet/log_block] head=nat
+    ^ nat
+    % count=nat blocks.len
+    ^ nat
+    ? (eq count 0) count
+    = block blocks.at(count.dec)
+    ? (gt block.number head) (_ count.dec)
+    = ;current (ethereum_rpc/block rpc block.number)
+    ? (equal (ethereum_rpc/text (ethereum_rpc/get "hash" current)) block.hash) count
+    | _ count.dec
+  + blocks
+    \ rpc=str address=str ancestor=nat anchor=str end=nat
+    ^ row[ethereum_wallet/log_block]
+    % number=nat ancestor.inc parent=str anchor out=row[ethereum_wallet/log_block] []
+    ^ row[ethereum_wallet/log_block]
+    ? (gt number end) out
+    = ;header (ethereum_rpc/block rpc number)
+      hash (ethereum_rpc/text (ethereum_rpc/get "hash" header))
+      previous (ethereum_rpc/text (ethereum_rpc/get "parentHash" header))
+    ? (and !(equal parent "") !(equal parent previous))
+      ; (error (pails/t "chain changed during event scan"))
+      []
+    = filter | json/obj [(jkv "address" (json/str address))
+        (jkv "fromBlock" (json/str (ethereum_transaction/quantity number)))
+        (jkv "toBlock" (json/str (ethereum_transaction/quantity number)))
+        (jkv "topics" (json/arr [(json/str (ethereum_keccak/hex (ethereum_bytes/ascii "Result(uint256,uint256)")))]))]
+      ;logs (ethereum_rpc/array (ethereum_rpc/request rpc "eth_getLogs" [filter]))
+    ? !(logs.all((\ log=json (equal (ethereum_rpc/text (ethereum_rpc/get "blockHash" log)) hash))))
+      ; (error (pails/t "event block mismatch"))
+      []
+    | _ number.inc hash out.snoc((ethereum_wallet/log_block number hash previous logs))
+  + finish_scan
+    \ config=ethereum_wallet_foot/config stream=ethereum_wallet/stream
+      ancestor=nat anchor=str blocks=row[ethereum_wallet/log_block]
+    ^ ethereum_wallet/command
+    ? (gt blocks.len 0)
+      = last blocks.at(blocks.len.dec)
+        ;current (ethereum_rpc/block config.rpc last.number)
+      ? !(equal (ethereum_rpc/text (ethereum_rpc/get "hash" current)) last.hash)
+        ; (error (pails/t "event head changed during scan"))
+        | ethereum_wallet/command/tick
+      | ethereum_wallet/command/scan stream.id (ethereum_wallet/cursor stream) ancestor anchor blocks
+    | ethereum_wallet/command/scan stream.id (ethereum_wallet/cursor stream) ancestor anchor blocks
+  + snapshot
+    \ server=nat home=path
+    ^ ethereum_wallet/state
+    ; (SendCaps server (helm/card/peek .x .none home) [0])
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ?> (./page path answer) reply
+        ; (error (pails/t "wallet snapshot failed"))
+        | ethereum_wallet/initial "0x0000000000000000000000000000000000000000"
+    ?> (./known binding) answer
+        ; (error (pails/t "wallet absent"))
+        | ethereum_wallet/initial "0x0000000000000000000000000000000000000000"
+    ?> (./some record) binding.fil
+        ; (error (pails/t "wallet absent"))
+        | ethereum_wallet/initial "0x0000000000000000000000000000000000000000"
+    | ethereum_wallet_app/read (unpin record.myth)
+  + commit
+    \ server=nat home=path command=ethereum_wallet/command
+    ^ nat
+    ; (SendCaps server (helm/card/step home (writ/poke (ethereum_wallet_app/command command))) [0])
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ?> (./ack err) reply (error (pails/t "wallet commit failed"))
+    ? err
+     > (./some why) (error why)
+     > .none 1
+  + cycle
+    ' Re-read after every committed transition. Only signed namespace state
+    ' can request broadcast; no transient signature is passed straight to RPC.
+    \ config=ethereum_wallet_foot/config server=nat home=path
+    ^ nat
+    = ;initial (ethereum_wallet_foot/snapshot server home)
+      ;chain (ethereum_rpc/number (ethereum_rpc/request config.rpc "eth_chainId" []))
+    ? !(eq chain initial.chain) (error (pails/t "RPC chain mismatch"))
+    % index=nat 0
+    ^ nat
+    ? (eq index initial.intents.len)
+      | ethereum_wallet_foot/streams config server home initial.streams
+    = ;current (ethereum_wallet_foot/snapshot server home)
+      item (ethereum_wallet/find initial.intents.at(index).id current)
+      ;result (Try (ethereum_wallet_foot/observe config current) item)
+    ? result
+     > (./err _) (error (pails/t "wallet observation failed; retry cycle"))
+     > (./ok command)
+      ; (ethereum_wallet_foot/commit server home command)
+      | _ index.inc
+  + streams
+    \ config=ethereum_wallet_foot/config server=nat home=path streams=row[ethereum_wallet/stream]
+    ^ nat
+    % index=nat 0
+    ? (eq index streams.len) 1
+    = ;result (Try (ethereum_wallet_foot/scan config) streams.at(index))
+    ? result
+     > (./err _) (error (pails/t "wallet observation failed; retry cycle"))
+     > (./ok command)
+      ; (ethereum_wallet_foot/commit server home command)
+      | _ index.inc
+  + run
+    \ config=ethereum_wallet_foot/config server=nat home=path self=nat
+    ^ nat
+    % iteration=nat 0
+    = ;result (Try (\ ignored=nat (ethereum_wallet_foot/cycle config server home)) 0)
+    ; (Sleep config.interval)
+    | _ iteration.inc

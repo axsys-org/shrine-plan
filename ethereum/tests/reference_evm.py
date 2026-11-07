@@ -1,4 +1,4 @@
-"""Assemble PLAN backend output and wrap it in a fixed, nonpayable ABI."""
+"""Frozen Python assembler oracle; tests only. Production assembly is PLAN."""
 from eth_utils import keccak
 
 ALLOWED = {1, 2, 3, 4, 16, 17, 20, 21, 53, 81, 82, 86, 87}

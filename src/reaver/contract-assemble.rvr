@@ -1,0 +1,92 @@
+;;;; Pure PLAN assembly, ABI envelope, init code and artifact encoding.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind json (#module wire-json))
+(#bind parse (#module parse))
+(#bind source (#module contract-source))
+(#bind foil (#module foil-new-env))
+(#bind rp (#module restricted-plan))
+(define crypto (source:load "ethereum_keccak"))
+(define digest (foil:source-entry-val ["ethereum_keccak" "digest"] crypto))
+(define (ascii text) (gen (Bytes text) (lambda (i) (Load8 i text))))
+(define (integer bytes) (foldl (lambda (out b) (Add (Mul out 256) b)) 0 bytes))
+(define (big n value)
+  (If (Ge value (Bex (Mul n 8))) (error "integer exceeds byte width")
+    (gen n (lambda (i) (Mod (Rsh value (Mul 8 (Sub n (Inc i)))) 256)))))
+(define (hex bytes)
+  (strcat (cons "0x" (map (lambda (b)
+    (If (Ge b 256) (error "invalid byte")
+      (strWeld (json:hexd (Div b 16)) (json:hexd (Mod b 16))))) bytes))))
+(define (push n)
+  (Ifz (rp:word? n) (error "invalid PUSH")
+    (let ((width (Ifz n 1 (Bytes n)))) (cons (Add 95 width) (big width n)))))
+(define (scan tokens i pc labels)
+  (If (Eq i (Sz tokens)) labels
+    (let* ((t (Ix i tokens))
+           (width (If (IsNat t) 1
+             (cond ((Equal (_0 t) 0) (Sz (push (_1 t))))
+               ((Equal (_0 t) 1) 1) ((Equal (_0 t) 2) 3)
+               (else (error "invalid assembly token")))))
+           (next (If (And (IsApp t) (Equal (_0 t) 1))
+             (If (find (lambda (p) (Equal (_0 p) (_1 t))) labels)
+               (error "duplicate assembly label") (snoc [(_1 t) pc] labels)) labels)))
+      (scan tokens (Inc i) (Add pc width) next))))
+(define (assemble tokens)
+  (define labels (scan tokens 0 0 []))
+  (Seq (DeepSeq labels 0)
+  (foldl (lambda (out t)
+    (Weld out (If (IsNat t)
+      (If (Lt t 256) [t] (error "invalid opcode"))
+      (cond ((Equal (_0 t) 0) (push (_1 t)))
+        ((Equal (_0 t) 1) [91])
+        (else (let ((hit (find (lambda (p) (Equal (_0 p) (_1 t))) labels)))
+          (Ifz hit (error "unknown label") (cons 97 (big 2 (_1 (_0 hit))))))))))) [] tokens)))
+(define (signature name arity)
+  (strcat [name "(" (parse:join-str "," (gen arity (lambda (i) "uint256"))) ")"]))
+(define (selector name arity) (take 4 (digest (ascii (signature name arity)))))
+(define topic (digest (ascii "Result(uint256,uint256)")))
+(define (calldata name args)
+  (foldl (lambda (out n) (Weld out (big 32 n))) (selector name (Sz args)) args))
+(define (body-token? t)
+  (If (IsNat t) (any (lambda (n) (Eq n t)) [1 2 3 4 16 17 20 21 53 81 82 86 87])
+    (And (rp:record? 2 t) (And (IsNat (_1 t))
+      (any (lambda (tag) (Equal tag (_0 t))) [0 1 2])))))
+(define (runtime arity body)
+  (Ifz (And (rp:row? body) (all body-token? body)) (error "invalid backend instruction")
+  (Ifz (And (IsNat arity) (And (Gt arity 0) (Le arity 16))) (error "invalid arity")
+    (let* ((evaluate (integer (selector "evaluate" arity)))
+           (record (integer (selector "record" arity)))
+           (prefix [52 21 [2 "value-ok"] 87 [0 0] [0 0] 253
+             [1 "value-ok"] 54 [0 (Add 4 (Mul 32 arity))] 20 [2 "size-ok"] 87 [0 0] [0 0] 253
+             [1 "size-ok"] [0 0] 53 [0 224] 28 128 [0 evaluate] 20 [2 "evaluate"] 87
+             [0 record] 20 [2 "record"] 87 [0 0] [0 0] 253
+             [1 "evaluate"] 80 [0 0] [0 64] 82 [2 "body"] 86
+             [1 "record"] [0 1] [0 64] 82 [1 "body"]])
+           (suffix [[0 64] 81 21 [2 "return"] 87 [0 (integer topic)] [0 64] [0 0] 161
+             [1 "return"] [0 64] [0 0] 243])
+           (code (assemble (Weld prefix (Weld body suffix)))))
+      (If (Eq evaluate record) (error "selector collision")
+        (If (Gt (Sz code) 24576) (error "EVM code size limit") code))))))
+(define (creation code)
+  (Weld [52 21 97 0 11 87 96 0 96 0 253 91 97]
+    (Weld (big 2 (Sz code)) (Weld [97 0 27 96 0 57 97]
+      (Weld (big 2 (Sz code)) (Weld [96 0 243] code))))))
+(define (field name) (json:jobj [["name" (json:jq name)] ["type" (json:jq "uint256")]]))
+(define outputs (json:jarr [(field "status") (field "value")]))
+(define (abi arity)
+  (define inputs (json:jarr (gen arity (lambda (i) (field (strWeld "arg" (showNat i)))))))
+  (json:jarr (Weld
+    (map (lambda (pair) (json:jobj [["type" (json:jq "function")] ["name" (json:jq (_0 pair))]
+      ["inputs" inputs] ["outputs" outputs] ["stateMutability" (json:jq (_1 pair))]]))
+      [["evaluate" "pure"] ["record" "nonpayable"]])
+    [(json:jobj [["type" (json:jq "constructor")] ["inputs" "[]"] ["stateMutability" (json:jq "nonpayable")]])
+     (json:jobj [["type" (json:jq "event")] ["name" (json:jq "Result")] ["anonymous" "false"]
+       ["inputs" (json:jarr (map (lambda (name) (json:jobj [["name" (json:jq name)]
+         ["type" (json:jq "uint256")] ["indexed" "false"]])) ["status" "value"]))]])])))
+(define (artifact arity instructions)
+  (define code (runtime arity instructions))
+  (json:jobj [["format" (json:jq "shrine-contract/1")] ["arity" (showNat arity)]
+    ["abi" (abi arity)] ["runtime" (json:jq (hex code))]
+    ["bytecode" (json:jq (hex (creation code)))] ["runtimeKeccak" (json:jq (hex (digest code)))]]))

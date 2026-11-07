@@ -1,5 +1,8 @@
 # Foil contracts and Sepolia v0
 
+Historical implementation record. The compiler and wallet boundaries below are
+superseded by [the namespace wallet migration](ethereum-namespace-wallet.md).
+
 Status: implemented, tested, and deployed to Sepolia on 2026-11-06.
 
 ## Scope

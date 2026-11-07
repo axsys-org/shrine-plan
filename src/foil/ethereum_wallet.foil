@@ -1,0 +1,190 @@
+- ethereum_transaction
+- lain_types
+
+' Wallet policy and durable state. All functions here are deterministic.
++ ethereum_wallet
+  + intent
+    : id=str to=str data=str phase=nat tx=maybe[ethereum_transaction]
+      digest=str raw=str hash=str receipt=json
+  + log_block
+    : number=nat hash=str parent=str logs=row[json]
+  + batch
+    : sequence=nat added=row[json] removed=row[json]
+  + stream
+    : id=str address=str start=nat confirmations=nat blocks=row[ethereum_wallet/log_block]
+      batches=row[ethereum_wallet/batch] acknowledged=nat sequence=nat
+  + state
+    : chain=nat address=str next_nonce=nat intents=row[ethereum_wallet/intent]
+      streams=row[ethereum_wallet/stream] tick=nat
+  + command
+    & ethereum_wallet/command/prepare ethereum_wallet/command/quote
+      ethereum_wallet/command/signed ethereum_wallet/command/sent
+      ethereum_wallet/command/receipt ethereum_wallet/command/subscribe
+      ethereum_wallet/command/scan ethereum_wallet/command/ack ethereum_wallet/command/tick
+    + prepare : id=str to=str data=str
+    + quote : id=str chain=nat address=str pending=nat base_fee=nat priority=nat estimate=nat balance=nat
+    + signed : id=str digest=str parity=nat r=nat s=nat
+    + sent : id=str hash=str
+    + receipt : id=str receipt=json block_hash=str canonical_hash=str
+    + subscribe : id=str address=str start=nat confirmations=nat
+    + scan : id=str cursor=str ancestor=nat anchor=str blocks=row[ethereum_wallet/log_block]
+    + ack : id=str sequence=nat
+    + tick :
+  + initial
+    \ address=str
+    ^ ethereum_wallet/state
+    ? !(eq (ethereum_bytes/unhex address).len 20)
+      ; (error (pails/t "wallet address must be 20 bytes"))
+      | ethereum_wallet/state 11155111 "" 0 [] [] 0
+    | ethereum_wallet/state 11155111 (ethereum_bytes/hex (ethereum_bytes/unhex address)) 0 [] [] 0
+  + intent_at
+    \ id=str items=row[ethereum_wallet/intent]
+    ^ maybe[ethereum_wallet/intent]
+    % i=nat 0
+    ^ maybe[ethereum_wallet/intent]
+    ? (eq i items.len) .none
+    = item items.at(i)
+    ? (equal item.id id) (./some item)
+    | _ i.inc
+  + stream_at
+    \ id=str items=row[ethereum_wallet/stream]
+    ^ maybe[ethereum_wallet/stream]
+    % i=nat 0
+    ^ maybe[ethereum_wallet/stream]
+    ? (eq i items.len) .none
+    = item items.at(i)
+    ? (equal item.id id) (./some item)
+    | _ i.inc
+  + find
+    \ id=str state=ethereum_wallet/state
+    ^ ethereum_wallet/intent
+    ?> (./some item) (ethereum_wallet/intent_at id state.intents)
+        ; (error (pails/t "unknown intent"))
+        | ethereum_wallet/intent "" "0x" "0x" 0 .none "" "" "" jnull
+    item
+  + replace
+    \ item=ethereum_wallet/intent state=ethereum_wallet/state
+    ^ ethereum_wallet/state
+    | state.set_intents(state.intents.map((\ old=ethereum_wallet/intent (? (equal old.id item.id) item old))))
+  + cursor
+    \ stream=ethereum_wallet/stream
+    ^ str
+    ? (eq stream.blocks.len 0) ""
+    stream.blocks.at(stream.blocks.len.dec).hash
+  + logs
+    \ blocks=row[ethereum_wallet/log_block]
+    ^ row[json]
+    | row/fold[ethereum_wallet/log_block row[json]] []
+      (\ out=row[json] block=ethereum_wallet/log_block out.weld(block.logs)) blocks
+  + reject
+    \ why=str state=ethereum_wallet/state
+    ^ ethereum_wallet/state
+    ; (error (pails/t why))
+    state
+  + apply
+    \ command=ethereum_wallet/command state=ethereum_wallet/state
+    ^ ethereum_wallet/state
+    ? command
+     > .tick state.set_tick(state.tick.inc)
+     > (./prepare id to data)
+      ? ((eq id.len 0) || (gt id.len 128)) (ethereum_wallet/reject "invalid intent id" state)
+      = destination (ethereum_bytes/unhex to)
+        payload (ethereum_bytes/unhex data)
+        to (ethereum_bytes/hex destination)
+        data (ethereum_bytes/hex payload)
+      ? !((eq destination.len 0) || (eq destination.len 20)) (ethereum_wallet/reject "invalid destination" state)
+      ? (gt payload.len 49152) (ethereum_wallet/reject "transaction data too large" state)
+      ? (ethereum_wallet/intent_at id state.intents)
+       > (./some item)
+        ? (and (equal item.to to) (equal item.data data)) state
+        | ethereum_wallet/reject "intent id conflict" state
+       > .none
+        ? (ge state.intents.len 1024) (ethereum_wallet/reject "intent capacity" state)
+        | state.set_intents(state.intents.snoc((ethereum_wallet/intent id to data 0 .none "" "" "" jnull)))
+     > (./quote id chain address pending base_fee priority estimate balance)
+      = item (ethereum_wallet/find id state)
+      ? !(eq item.phase 0) state
+      ? (!(eq chain state.chain) || !(equal (ethereum_bytes/hex (ethereum_bytes/unhex address)) state.address))
+        | ethereum_wallet/reject "chain or signer mismatch" state
+      = tip (? (gt priority 2000000000) 2000000000 priority)
+        fee (add (mul 2 base_fee) tip)
+        gas (div (add (mul estimate 12) 9) 10)
+        nonce (? (gt pending state.next_nonce) pending state.next_nonce)
+      ? ((eq gas 0) || (gt gas 1000000) || (gt fee 30000000000) ||
+          (gt (mul gas fee) 2000000000000000) || (gt (mul gas fee) balance) || (ge nonce (bex 64)))
+        | ethereum_wallet/reject "wallet fee gas balance or nonce limit" state
+      = tx (ethereum_transaction chain nonce tip fee gas item.to item.data)
+        next item.set_phase(1).set_tx((./some tx)).set_digest((ethereum_transaction/digest tx))
+      | ethereum_wallet/replace next state.set_next_nonce(nonce.inc)
+     > (./signed id digest parity r s)
+      = item (ethereum_wallet/find id state)
+      ? !(equal digest item.digest) (ethereum_wallet/reject "signature response mismatch" state)
+      ?> (./some tx) item.tx (ethereum_wallet/reject "unsigned intent has no transaction" state)
+      = raw (ethereum_transaction/signed tx parity r s)
+      ? !(eq item.phase 1)
+        ? (equal raw item.raw) state
+        | ethereum_wallet/reject "conflicting signature" state
+      = hash (ethereum_keccak/hex (ethereum_bytes/unhex raw))
+      | ethereum_wallet/replace item.set_phase(2).set_raw(raw).set_hash(hash) state
+     > (./sent id hash)
+      = item (ethereum_wallet/find id state)
+      ? (!(equal hash item.hash) || (lt item.phase 2)) (ethereum_wallet/reject "broadcast hash mismatch" state)
+      ? (ge item.phase 3) state
+      | ethereum_wallet/replace item.set_phase(3) state
+     > (./receipt id receipt block_hash canonical_hash)
+      = item (ethereum_wallet/find id state)
+      ? (lt item.phase 2) (ethereum_wallet/reject "receipt before signed bytes" state)
+      ? ((equal block_hash "") || !(equal block_hash canonical_hash))
+        | ethereum_wallet/replace item.set_phase(2).set_receipt(jnull) state
+      | ethereum_wallet/replace item.set_phase(4).set_receipt(receipt) state
+     > (./subscribe id address start confirmations)
+      = address (ethereum_bytes/hex (ethereum_bytes/unhex address))
+      ? ((eq id.len 0) || (gt id.len 128) || !(eq (ethereum_bytes/unhex address).len 20) || (eq start 0))
+        | ethereum_wallet/reject "invalid stream" state
+      ? (ethereum_wallet/stream_at id state.streams)
+       > (./some prior)
+        ? (and (equal prior.address address) (and (eq prior.start start) (eq prior.confirmations confirmations))) state
+        | ethereum_wallet/reject "stream settings conflict" state
+       > .none
+        | state.set_streams(state.streams.snoc((ethereum_wallet/stream id address start confirmations [] [] 0 0)))
+     > (./ack id sequence)
+      ?> (./some stream) (ethereum_wallet/stream_at id state.streams)
+          | ethereum_wallet/reject "unknown stream" state
+      ? (gt sequence stream.sequence) (ethereum_wallet/reject "unknown event batch" state)
+      ? (le sequence stream.acknowledged) state
+      = next stream.set_acknowledged(sequence).set_batches(stream.batches.filter((\ b=ethereum_wallet/batch (gt b.sequence sequence))))
+      | state.set_streams(state.streams.map((\ old=ethereum_wallet/stream (? (equal old.id id) next old))))
+     > (./scan id cursor ancestor anchor blocks)
+      ?> (./some stream) (ethereum_wallet/stream_at id state.streams)
+          | ethereum_wallet/reject "unknown stream" state
+      ? !(equal cursor (ethereum_wallet/cursor stream)) (ethereum_wallet/reject "stale event scan" state)
+      = kept | stream.blocks.filter (\ b=ethereum_wallet/log_block (le b.number ancestor))
+        removed | stream.blocks.filter (\ b=ethereum_wallet/log_block (gt b.number ancestor))
+      ? (and (eq kept.len 0) !(eq ancestor stream.start.dec)) (ethereum_wallet/reject "event start mismatch" state)
+      ? (gt kept.len 0)
+        ? !(eq kept.at(kept.len.dec).number ancestor) (ethereum_wallet/reject "event ancestor mismatch" state)
+        ? !(equal kept.at(kept.len.dec).hash anchor) (ethereum_wallet/reject "event anchor mismatch" state)
+        | ethereum_wallet/scan_commit stream kept removed ancestor anchor blocks state
+      ? !(equal anchor "") (ethereum_wallet/reject "unexpected event anchor" state)
+      | ethereum_wallet/scan_commit stream kept removed ancestor anchor blocks state
+  + scan_commit
+    \ stream=ethereum_wallet/stream kept=row[ethereum_wallet/log_block]
+      removed=row[ethereum_wallet/log_block] ancestor=nat anchor=str
+      blocks=row[ethereum_wallet/log_block] state=ethereum_wallet/state
+    ^ ethereum_wallet/state
+    ? (gt blocks.len 128) (ethereum_wallet/reject "event batch too large" state)
+    = valid
+        % i=nat 0 number=nat ancestor hash=str anchor
+        ? (eq i blocks.len) .true
+        = block blocks.at(i)
+        ? (!(eq block.number number.inc) || (? (equal hash "") .false !(equal hash block.parent))) .false
+        | _ i.inc block.number block.hash
+    ? !valid (ethereum_wallet/reject "non-contiguous event scan" state)
+    = added (ethereum_wallet/logs blocks)
+      gone (ethereum_wallet/logs removed)
+      changed ((gt added.len 0) || (gt gone.len 0))
+    ? (and changed (ge stream.batches.len 1024)) (ethereum_wallet/reject "unacknowledged event capacity" state)
+    = sequence (? changed stream.sequence.inc stream.sequence)
+      batches (? changed stream.batches.snoc((ethereum_wallet/batch sequence added gone)) stream.batches)
+      next stream.set_blocks(kept.weld(blocks)).set_batches(batches).set_sequence(sequence)
+    | state.set_streams(state.streams.map((\ old=ethereum_wallet/stream (? (equal old.id stream.id) next old))))

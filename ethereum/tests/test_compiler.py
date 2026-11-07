@@ -3,7 +3,7 @@ import random
 import pytest
 from eth_tester.exceptions import TransactionFailed
 from web3 import Web3, EthereumTesterProvider
-from evm import wrap, calldata, TOPIC, assemble
+from reference_evm import wrap, calldata, TOPIC
 from plan import compile_contract, run
 
 
@@ -28,7 +28,7 @@ def reports():
 
 def deployed(report):
     w3 = Web3(EthereumTesterProvider())
-    artifact = wrap(report)
+    artifact = report['artifact']
     receipt = w3.eth.wait_for_transaction_receipt(w3.eth.send_transaction(
         {'from': w3.eth.accounts[0], 'data': artifact['bytecode'], 'gas': 4_000_000}))
     assert receipt.status == 1
@@ -117,12 +117,19 @@ assert(Eq 1 (Hd (Try evm:compile ["restricted-plan/0" effect [[effect [rp:WORD] 
 
 
 def test_assembler_rejects_duplicate_and_oversized_code():
-    with pytest.raises(ValueError):
-        assemble([[1, 0], [1, 0]])
-    with pytest.raises(ValueError):
-        wrap({'arity': 1, 'instructions': [0xf1]})
-    with pytest.raises(ValueError):
-        wrap({'arity': 1, 'instructions': [1] * 24576})
+    result = run('''(#bind asm (#module contract-assemble))
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+assert(Eq 1 (Hd (Try asm:assemble [[1 0] [1 0]])))
+assert(Eq 1 (Hd (Try asm:assemble [[2 99]])))
+assert(Eq 1 (Hd (Try asm:assemble [[0 (Bex 256)]])))
+assert(Eq 1 (Hd (Try (asm:runtime 1) [241])))
+assert(Eq 1 (Hd (Try (asm:runtime 1) [[3 0]])))
+assert(Eq 1 (Hd (Try (asm:runtime 1) (gen 24576 (lambda (i) 1)))))
+(print ["CONTRACT-OUTPUT" "[1]"])''')
+    assert result == [1]
 
 
 def test_choose_condition_and_expansion_budget():
@@ -147,3 +154,33 @@ assert(Eq 1 (Hd (Try evm:compile huge)))
     for args, reference in report['reference']:
         got = w3.eth.call({'to': address, 'data': calldata('evaluate', args)})
         assert list(w3.codec.decode(['uint256', 'uint256'], got)) == reference
+
+
+def test_native_artifact_matches_deployed_and_python_oracle():
+    from plan import ROOT
+    artifact = compile_contract()['artifact']
+    historical = json.loads((ROOT / 'ethereum/artifacts/checked.json').read_text())
+    for key in ('runtime', 'bytecode', 'runtimeKeccak', 'abi'):
+        assert artifact[key] == historical[key]
+    report = compile_contract()
+    reference = wrap(report)
+    for key in ('runtime', 'bytecode', 'runtimeKeccak', 'abi'):
+        assert report['artifact'][key] == reference[key]
+
+
+def test_native_keccak_padding_and_multiblock_vectors():
+    from eth_utils import keccak
+    vectors = [bytes(i % 256 for i in range(n)) for n in (0, 1, 31, 32, 64, 135, 136, 137, 271, 272, 400)]
+    rows = '[' + ' '.join('[' + ' '.join(map(str, v)) + ']' for v in vectors) + ']'
+    hashes = run(f'''(#bind source (#module contract-source))
+(#bind foil (#module foil-new-env))
+(#bind build (#module contract-build))
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind json (#module wire-json))
+(define crypto (source:load "ethereum_keccak"))
+(define digest (foil:source-entry-val ["ethereum_keccak" "digest"] crypto))
+(print ["CONTRACT-OUTPUT" (json:jarr (map (lambda (bytes) (build:numbers (digest bytes))) {rows}))])''')
+    assert [bytes(h) for h in hashes] == [keccak(v) for v in vectors]
