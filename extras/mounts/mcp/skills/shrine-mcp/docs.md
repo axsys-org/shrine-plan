@@ -35,7 +35,9 @@ sheet, line, time), never transcribe them.
 
 ## What you can reach
 
-- **This world:** `read`, `edit` and `write` docs as markdown files; `glob`, `grep` and `history`; `table` shows a
+- **This world:** a doc at `/docs/plan` is the file `/docs/plan.md`; the names beneath it (`/docs/plan/p01`,
+  `/docs/plan/t01/…`) are its blocks and rows, so when a wake names them, read the doc they belong to. `read`, `edit`
+  and `write` docs as markdown files; `glob`, `grep` and `history`; `table` shows a
   folder's rows with each cell's state (a value and its source, answers that came for it, asked and whom, a hole);
   `set` writes one cell with where it came from, or opens it again with why.
 - **The web:** WebSearch and WebFetch.
