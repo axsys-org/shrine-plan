@@ -30,174 +30,169 @@ publish `respond`, then choose that definition and an interactive provider at
 Nenex, with shared native requests, cells, holes and guarded publication. See the
 [conversation boundary](../conversation/README.md) for context selection and limits.
 
-## Interactive surface investigation
+## Independently invokable stages
 
-`surface_investigation` composes an authored task, the shared `interactive_requests`
-operation, a validated report and document publication. Bind `sources` to evidence
-named `task`, and `provider` to the raw native
-`/0x11/io/codex/surface_provider` record. Use the normal Nenex writer. Its initial
-brief discovers and describes actions without invoking mutations; edit and
-publish the brief deliberately to authorize other work.
+The library separates proposals, native effects, observations and document
+projection. A stage returns ordinary native records through the existing result
+cells. A downstream flow binds those values directly; it does not parse a report.
+The authored stages and compositions live in `examples/*.semidoc`. The pure
+adapters in `stages.foil` construct existing judgments or inspect supplied
+records. They introduce no persistent types, provider, queue or work lifecycle.
 
-The provider uses native `shrine_read`, `shrine_actions` and `shrine_act`, with the
-same Goo admission and request receipts used elsewhere. This is an invocation
-path through the existing provider; it does not require the old `/live` chat box
-or a separate external MCP server. External clients can independently use the
-existing `mcp` mount. The provider retains its namespace authority, so the authored
-brief must not be mistaken for a capability sandbox.
-
-The current request, controller, destination claim, captured definition, evidence
-and persistent hole head authorize each tool call. Paused, detached, superseded
-or stale work cannot keep invoking actions. Outcomes and action receipts remain
-attached to the attempt; rejected responses use the same retry operation. This
-is bounded by the normal provider/request limits, not a new autonomous scheduler.
-
-## Agent helpers: orientation, continuation and verified actions
-
-These are authored procedures in the **Flow examples** catalogue, using the same
-interactive provider and writer as `surface_investigation`. Create the recipe,
-publish its same-named definition, bind `capture` and `provider`, and attach it
-to a separate report destination. Use **Author flows → Inspect callable
-definitions**, care `x`, to select the subject; bind the raw inspection cell,
-without `/x`. The default task is authored in the flow's Semidoc; there are no
-separate task files for these recipes. The catalogue binds `sources` to the
-existing authoring and action guides. To supply a per-invocation assignment,
-author a Nenex page and use **Bind Nenex evidence**, source name `task`, on the
-flow's author page. This selects the existing task-source cell as the default
-`sources` input, replacing the bundled reference-guide collection. These guides
-are optional context; the procedure itself remains in Semidoc. Choose this
-binding before attaching: changing defaults does not retarget already running
-work. Once the task page is bound, its edits wake that same hand. The request
-captures and cites its explicitly bound sources. Reusing a published procedure does not
-require republishing it for each assignment.
-
-| Recipe | Subject and task | Intended result |
+| Composition | Separately invokable components | Native result |
 | --- | --- | --- |
-| `orient_here` | Any exact native subject; read-only orientation scope | A compact map of useful cells, work, holes, declared actions and linked flows |
-| `resume_work` | Original native work, including unresolved work; explicit continuation and authority | Continue through that work's existing controls, with a report linking the original work and results |
-| `invoke_and_verify` | Action subject; explicit effect, input values and observable postcondition | Discover, invoke and read back a declared action, retaining references to its native evidence |
+| `orient_here` | `inspect_subject` | Summary, questions, next action proposal; exact context and source captures |
+| `surface_investigation` | `inspect_subject` over supplied source context | The same structured read-only assessment |
+| `investigation_handoff` | `assess_work` then `plan_continuation` | Original owner/status/capture and a continuation proposal |
+| `resume_work` | `assess_work`, selected original-work action, `prepare_action`, `invoke_action`, `verify_action` | Receipts and exact postcondition observations |
+| `invoke_and_verify` | `prepare_action` then `invoke_action` then `verify_action` | Verified captures with their check and receipt evidence |
+| `grove_app_authoring` | `grove_source`, native draft argument preparation, `invoke_action`, `inspect_grove_draft` | Actual compiled draft record, source, revision and capture |
+| `save_grove_draft` | Revision-checked source preparation, `invoke_action`, `inspect_grove_draft` | Observed compiled revision of an existing draft |
+| `publish_grove_draft` | Revision-checked preparation, `invoke_action`, native publication observation | Observed published revision; independent of authoring |
+| `procedure_extraction` | `extract_procedure` then `inspect_procedure` | Actual authored Nenex record/source and native receipts |
+| `task_learning` | `extract_lessons`, `propose_instruction`, `propose_procedure` | Three independently consumable proposal records |
+| Guide's `author_publish` | `create_document`, receipt dependency, `publish_flow` | Native publication receipts |
 
-The last two authored briefs intentionally leave the effect unspecified. They
-permit discovery but require clarification before mutation. This is authored
-provider policy, not a capability sandbox: the selected surface provider retains
-its namespace authority. The orientation brief forbids `shrine_act`; that is a
-provider instruction, not an enforced tool restriction.
+`author_document` separately proposes Semidoc source. `create_document` writes
+that proposal through a selected creation control. `publish_flow` publishes its
+named definition through an explicitly selected publication control.
+`project_result` is an optional final document projection for any of these
+results. Source fields are literal text, not executable document attributes.
+The handbook, atlas and authored wiki retain their document-producing contracts;
+chapters are not artificially turned into separate procedures.
 
-`library/agent_task` constructs an ordinary native interactive request with the
-existing `source`/`note` response convention. A completed response contains one
-Semidoc section and an explanation. The validator allows inert prose and plain
-native reference blocks, preserves the brief's evidence bindings, and rejects
-document headers, executable attributes and oversized responses. It validates
-the report's structure, not the truth of a model's statements. Actual reads,
-action receipts and result records establish what happened.
+### Publication and binding
 
-An empty `source` and specific question in `note` produce the existing
-`flow_revision_unresolved` result. The current hole remains unresolved and the
-worker retains the full response. Update the bound task/evidence to wake the
-same controller, or use **Retry failed request** when a retry is justified.
-Editing the bound Nenex task uses this same evidence path. The existing hand
-retains the predecessor and resumption cell and resolves the
-same hole when a current response succeeds. These examples do not add a generic
-chat answer box: when resuming another application's work, discover and use
-that application's existing answer control. The helper's own clarification is
-not automatically an answer to the original work's hole.
+Create each needed component through **Flow examples**, then publish its named
+Semidoc definition before publishing a parent that invokes it. Publish in the
+order in the table's component column. Components such as `prepare_action`,
+`invoke_action` and `verify_action` are reused across parents. A parent's
+publication captures exact child definitions; later edits do not retarget it or
+old attempts. Deliberately republish/adopt when selecting different behavior.
 
-Before effects, the authored procedures inspect the request's resumption links,
-prior action traces and current target. A completed action is not undone by an
-obsolete report. Host-generated invocation identities and native receipts
-deduplicate the same invocation; a different tool call or request has a new
-identity. A missing reply therefore requires inspection, not blind replay.
-An accepted `shrine_act` response proves admission, not async completion or a
-business postcondition. Unverified required results stay unresolved.
+For native-result flows, explicitly select
+`/0x11/gov/flow_examples/retain_result` as the writer. This uses the existing
+work result cell and receipt without writing a document or another result store.
+For `project_result`, bind `value` to the producer's result and select the
+Nenex writer. Invoke a child with `/flow/invoke` to recompute together, or bind
+an explicitly retained generation result when it should stay fixed.
+After a standalone invocation publishes, its receipt identifies the retained run
+at `<controller>/work/<generation>`. The computed result is at
+`/x/<controller>/work/<generation>/result`. For example, bind `lessons` in
+`propose_instruction` to an `extract_lessons` run's result, or bind `value` in
+`project_result` to that same result. Use the actual generation named by the
+receipt. The raw `result` record is the cell definition, not its output.
 
-The subject inspection is frozen. Live navigation reads do not automatically
-become watched evidence: reports describe the observations made during that
-attempt. Bind relevant live sources explicitly when maintenance should react
-to them. Unavailable current sources remain unavailable even if an older
-capture survives. Scope and authority changes require deliberate task or
-definition changes; the procedures do not silently adopt new hands.
+Judgment stages bind `provider` to the raw native provider record, commonly
+`/0x11/io/codex/surface_provider`. Their default instructions are in Semidoc.
+A per-invocation assignment can be a Nenex page bound as source evidence using
+**Bind Nenex evidence**. This replaces the default source collection; choose the
+binding before attachment. Default changes do not retarget an existing controller.
+The task captures the actual supplied source and prior-stage records.
 
-`flow_agent_qol_tests` executes all three shipped recipes with controlled
-provider responses: paused/detached/stale authority, unresolved input, bound
-evidence resumption, retries, report publication and retained x/y/z history.
-The existing `flow-reflected-authoring-tests` gate separately exercises real
-Goo declarations, surface tool admission, receipts and resumption after an
-accepted effect. Neither establishes that a live model will correctly carry
-out every task described by these briefs.
+The structured schema is specific to the stage: for example `grove_source`
+returns `name`, `source`, `note`; `extract_lessons` returns `observation`,
+`interpretation`, `rule`, `counterexample`, `note`. Required empty fields
+produce `flow_revision_unresolved` and retain the existing request hole.
+Evidence edits or **Retry failed request** resume through the same native hand.
+Duplicate/unknown fields, non-text values and oversized results are refused.
+A validated proposal is still a proposal; it is not proof that a tool ran.
 
-## Library limits
+These stages instruct the interactive provider to avoid mutations. This is task
+policy, not a new capability sandbox. Native request/owner/definition/evidence
+and hole-head checks still authorize every tool call, including after pause or
+detach. No separate MCP loop or browser-specific action implementation is added.
 
-The page navigator in `nenex/library.grove` is a navigation presentation.
-`flow_library` here is a set of pure adapters: retaining exact captured records,
-checking settled task evidence, decoding explicit JSON/Markdown/text, projecting
-results and constructing this example's interactive report task. It is not a
-second evaluator or a store. Format ingestion does not guess domain schemas;
-learning proposes instructions and does not silently install an after-task hook.
+### Actions and verification
 
-## Extraction, handoff, Grove apps and the authoring wiki
+`prepare_action` accepts a captured declared control as `selection` and one
+native record of text argument slots as `arguments`. It uses the existing Goo
+input metadata to encode rich text. It keeps the selected control, receiver and
+publication guards. A newly discovered selection is an explicit new input.
+`invoke_action` delegates to the existing `request_actions` operation and
+native action provider. The provider supplies guarded admission and a retained
+invocation identity. The result retains the actual outcome, result reference,
+request and receipt identity. An agent's report cannot substitute for that result.
 
-Create these by name in the existing **Flow examples** catalogue. Publish the
-same-named definition, bind the remaining inputs, and select a separate Nenex
-destination. All four bind their declared repository sources using the existing
-source capture and its shared ownership. There is no new execution loop.
+`verify_action` has three inputs: `receipts`, `checks`, `observations`.
+Each named check record contains:
 
-| Recipe | Remaining selection | Result |
-| --- | --- | --- |
-| `procedure_extraction` | Raw own-record `capture`; `provider` input; task with receiver, unused flow name and selected steps/events | Calls existing extraction controls and reports the resulting editable Semidoc draft |
-| `investigation_handoff` | Raw own-record `capture`; revision provider in attachment settings, or manual revision | Three handoff pages: summary, evidence and continuation of the original work |
-| `grove_app_authoring` | `provider` input | Authors Grove through native draft controls, checks the preview, and reports native addresses/receipts |
-| `authoring_wiki` | No provider; default captured sources | 24 authored concept pages plus compact source provenance |
+- `target`: native path of the record to observe.
+- `after`: optional exclusive lower bound for its x version.
+- `expect/<slot path>`: one or more expected native values, compared by pail equality.
 
-For a capture, use **Author flows → Inspect callable definitions** with care `x`
-on the original work record. Bind the raw resulting inspection cell, without
-`/x`. This retains the exact native value and its version. Handoff accepts
-unresolved native work; task learning still requires settled work. A handoff is
-an as-of document: it never clones a controller, reassigns authority or completes
-the original investigation. The next participant rereads its current holes and
-continues through their existing controls.
+The correspondingly named observation contains an existing native own-record
+capture, retaining the exact value and version. For a frozen inspection, bind
+the raw cell record. To follow changes, use **Create observation cell** in the
+Flow examples tool: choose an owning Nenex page, unused cell name and source
+record path. This installs the existing native watching cell. Bind its computed
+output at `/x/<page>/cells/<name>`, not its raw definition. It can be created
+before the source exists. Deletion makes the current observation unavailable;
+restoration updates it through ordinary cell dependencies. Earlier captures
+remain retained in attempts and history. A frozen inspection is deliberately an
+as-of reading and does not establish current availability.
+Missing, stale, wrong-target or mismatching observations refuse verification.
+They can be corrected by changing that binding, without repeating the action.
+Verification inputs are deliberately excluded from the action task's evidence.
+The checks establish only the declared postcondition at the captured version.
 
-Extraction distinguishes executable flow traces from investigation evidence.
-The former retains captured laws and exposes omitted dependencies as explicit
-inputs. The latter creates a draft and authoring hole, requiring composition and
-deliberate review. Neither automatically publishes. The bundled extraction task
-intentionally asks for the missing receiver/name/selection before mutating
-anything. Replace its task source with those explicit choices. Provider reports
-are prose; the extracted page, native receipts and captures establish the effects.
+`assess_work` exposes the original typed work, owner and as-of status. Handoff
+and continuation consume this same value. `resume_work` requires an explicitly
+selected action on the original work, its owner or its recorded hole. It refuses
+to dispatch active or completed work again. A waiting/failed attempt can still
+have unresolved work on its original hole. The selected control decides whether
+the requested continuation is admissible. This flow does not choose authority, copy a
+controller, patch status fields or adopt a new definition. Use
+`plan_continuation` independently when the missing input or next action needs
+judgment; its result does not itself resume work.
+For `resume_work`, keep `capture` fixed to the inspection used to select the
+continuation action. Bind the resulting state separately through `observations`;
+otherwise the action's own progress would change the requested continuation.
 
-The app recipe's bundled task authors `field_notes`, edits a preview sample and
-leaves publication explicit. The source surface lives at
-`/0x11/app/grove_authoring`, with `new_draft` and `editor` views under
-`/0x11/gov/grove_authoring`. Each draft is
-`/0x11/app/grove_authoring/drafts/<name>`. It uses the existing `grove_draft/job`,
-host-owned registrations, mounted compiler, candidate installation and native
-publication. The new mount contributes only create/save/publish admission and
-declared Goo controls. It adds no compiler, scheduler, watcher or browser bundle.
+### Grove authoring and procedure extraction
 
-Inspect `revision`, `attempted`, `ready`, `published`, `message` and `line` on the
-job, or read `/x/0x11/app/grove_authoring/drafts/<name>/status`. This ordinary
-cell projects the job's source and diagnostic fields; it is not another status
-record to synchronize. Accepted creation is not successful compilation. Failed source remains
-editable, while the previous successful preview stays installed. Publishing
-requires the current successfully compiled revision and installs into the
-draft's separate `published` instance. That replaces the sample instance; it is
-not a migration of existing business data. On retries, check prior receipts and
-ownership before reusing a draft. The source compiler is a trusted native
-authoring capability, not a sandbox for untrusted Grove/Foil.
+`grove_source` authors source only. Bind task requirements and existing Grove
+contracts through `sources`; the proposal is available for editing/reuse before
+any effect. `grove_app_authoring` additionally binds `selection` to the native
+**Create and compile draft** control on `/0x11/app/grove_authoring`, and
+`capture` to an own-record capture of `/0x11/app/grove_authoring/drafts/<name>`.
+Create the observation cell before invoking when the draft does not yet exist.
+The same hand reevaluates
+when its observation changes. There is no polling loop in the example.
 
-The [wiki source](examples/authoring-wiki.semidoc) is the canonical longer guide:
-records and codecs, views and actions, panes, cells and overlay constructors,
-native arms and dependencies, composition, extraction, handoff, mount packaging,
-declarative workspaces, pinned publication, snapshots and verification. It emits
-authored prose rather than reproducing READMEs. Its examples remain literal.
-Source changes refresh provenance through attached maintenance; they do not
-silently rewrite or certify the guide. Edit/review the Semidoc and deliberately
-publish/adopt the revision, or use the existing revision mechanism for proposals.
+`inspect_grove_draft` checks that source equals the proposal and that the native
+job's `revision`, `attempted` and `ready` agree. An old successful preview
+does not certify a newer source. Exercise preview controls separately with
+`invoke_and_verify`. Compilation is not a claim about arbitrary app behavior.
+`save_grove_draft` revises an existing draft. Its `before` input is the frozen
+capture used to select the save control; `capture` separately follows the
+compiled result. A changed result cannot silently change the revision being saved.
+`publish_grove_draft` requires a publication control selected for the exact
+verified draft version, then observes `published == revision`. It replaces the
+sample published instance; it does not migrate existing business data.
 
-The registered `flow_authoring_recipes_tests` suite exercises the shipped source,
-shared request guards/retries, handoff preservation and wiki publication. The
-native `grove_authoring_tests` suite covers draft allocation and revision guards.
-These use controlled provider responses and do not establish a live model's
-ability to complete every extraction or app authoring task.
+`extract_procedure` takes an explicitly selected existing extraction control
+and its argument record. Native extraction retains laws and omitted input
+bindings for executed flow steps. Investigation extraction creates an editable
+proposal and an authoring hole. `inspect_procedure` returns the actual observed
+Nenex source/record with receipts; inspect its existing provenance/input children
+for further review. Neither stage publishes or resolves the authoring hole.
+
+The authored wiki remains a separate document flow: 24 concept pages plus
+compact provenance. Its examples are inert, and source changes refresh evidence
+without silently rewriting or certifying prose. It uses the same native
+`grove_draft/job`, compiler, records, hands, overlays and publication boundary.
+
+### Validation boundaries
+
+`flow_stage_tests` covers component publication, structured results, receipt
+validation, explicit observation checks, Grove revision checks, original-work
+selection, composed invocation without replay, and composed learning.
+`flow_agent_qol_tests` covers actual composed orientation with controlled
+responses: missing input, refusal, retry, changed evidence, pause/detach, result
+cells, overlays and retained x/y/z history. Existing action and Grove suites
+retain their admission/compiler tests. These fixtures do not establish that a
+live model will produce valid Grove code or a correct assessment for every task.
 
 ### Learning, technical atlas and format ingestion
 
@@ -205,7 +200,7 @@ All three are available under **Flow examples**. Creating an example
 authors its shipped Semidoc and binds its declared repository files through the
 existing filesystem source hands. It does not publish, attach, dispatch a model
 or overwrite an existing example page. Publish its named definition, bind any
-remaining inputs, select the Nenex writer and a separate destination, then attach
+remaining inputs, select the result-appropriate writer and a separate destination, then attach
 maintenance or embed a selected occurrence using the ordinary controls.
 The three examples reuse the handbook catalogue's `/0x11/io/fs/flow_sources`
 capture. Atlas sources reuse the same file entries as the handbook, rather than
@@ -217,7 +212,7 @@ by the native document writer, including beneath `reference`.
 
 | Example | Definition / author page | Remaining input | Result |
 | --- | --- | --- | --- |
-| Task learning | `task_learning` / `task_learning_flow` | `capture`: a selected settled native work record | Lesson, proposed instruction change and reusable-procedure brief |
+| Task learning | `task_learning` / `task_learning_flow` | `capture`: settled native work; `provider`: selected native provider | Structured lesson, instruction proposal and procedure proposal |
 | Technical atlas | `technical_atlas` / `technical_atlas_flow` | `capture`: a selected native definition or compiler mirror entry | Concept tree relating language/runtime, interfaces and computation |
 | Format ingestion | `format_ingestion` / `format_ingestion_flow` | None for the bundled JSON sample | Deterministic source document projection; decoded values retained in the step trace |
 
@@ -243,8 +238,9 @@ refuses; a completed, failed or otherwise settled attempt can supply evidence,
 including an attempt whose subject-owned hole still needs work. Its `sources`
 collection contains `task` and `instructions`. The catalogue binds clearly
 labelled sample documents. Replace these with the actual goal and current
-instructions before adopting a real lesson. A provider or person authors three
-proposals through the shared revision hand. The flow does not mutate instruction
+instructions before adopting a real lesson. Three separately invokable stages produce native proposals through the shared
+request hand. The instruction and procedure proposals each depend on the
+structured lesson, rather than independently reinterpreting the original task. The flow does not mutate instruction
 files, infer a runnable procedure from opaque results, or install a global
 after-task hook. Use existing trace extraction and callable composition to turn
 an accepted proposal into a separately reviewed and published procedure.
@@ -296,8 +292,9 @@ These optional pure operations live under `/0x11/gov/flows/operations/library`
 and are registered by the existing example catalogue. They reuse native
 captures, JSON values and `flow/page`; there is no new persistent contract,
 work interpreter, provider, watcher or scheduling layer.
-The helpers are exported by the existing `flow_examples` module. Extending the
-library therefore leaves the service's captured mount descriptor unchanged.
+The example mount publishes `flow_examples` and `flow_stages` as ordinary modules.
+Adding the stage module requires normal mount publication; this does not replace
+a saved service or silently activate anything in an existing world.
 The added input choices belong to the published Goo declarations. Existing worlds retain their captured HTTP handlers. Updating published actions
 does not replace those handlers or install this new page host in a running
 world. This consolidation is validated in disposable worlds.
@@ -336,7 +333,8 @@ does not depend on it or on the optional graph mount.
 
 From Nenex:
 
-1. Create Web evidence and publish `web_evidence`. Create Cited assertions and
+1. Create Capture sources and publish `capture_sources`, then create Web evidence
+   and publish `web_evidence`. Create Cited assertions and
    publish `cited_assertions`. Their pages are `web_evidence_flow` and
    `cited_assertions_flow`. Create Cartography and publish `cartography` last.
 2. On `cartography_flow`, use **Bind web source** for each named URL. Reserve the
@@ -499,12 +497,12 @@ Create `working_with_shrine` through **Flow examples**. The source page contains
   writer and the example's default `sources`; no provider is needed. Its children
   cover discovery, contracts/context, preparation, an author/publish exercise and
   receipt inspection. This is authored guidance, not generated README prose.
-- `author_publish` prepares a scoped task, delegates to the existing interactive
-  provider, and publishes a report with evidence. Bind `sources` containing
-  `task`, `authoring` and `actions`, and bind `provider` to the raw selected provider
-  record (for Codex, `/0x11/io/codex/surface_provider`). Use a distinct report
-  destination. The bundled task is inspect-only; an author/publish task must name
-  an existing receiver, unused child name, complete source and definition name.
+- `author_publish` consumes `proposal`, `author_selection` and
+  `publication_selection`. It calls `create_document`, then `publish_flow`.
+  Source-writing receipts establish the dependency; select the publication
+  control after creation and update only that binding. Its result is native
+  receipts. Use `author_document`
+  for source proposals, and `project_result` for optional document presentation.
 
 Publish each definition by its name on the source page. Attach or embed the chosen
 publication using the existing controls. Creation and publication do not attach
@@ -518,7 +516,8 @@ These explicit native attachments are separate from navigable Semidoc links;
 installing the recipe does not silently add typed relationships or context cells.
 
 This is an authored procedure over shared hands, cells, overlays and receipts.
-The guide flow is deterministic; the interactive procedure includes agent judgment.
+The guide flow and selected-action composition are deterministic; source proposal
+stages may use an agent.
 Native guards validate action admission. A brief does not reduce the provider's
 namespace authority, and validating a report does not prove its claims. Interactive
 calls may have effects before the final report is accepted. Inspect the retained
