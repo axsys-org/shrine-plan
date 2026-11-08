@@ -113,6 +113,9 @@ Assume they don't know how any of this works. The doc teaches them by what it do
   February date firm? Type the answer under this, or drop the purchase order here." One or two at a time, the ones
   that unblock the most. The page highlights these lines. When they answer (under it, in a cell, with a file), fold
   the answer in, credited to them, and remove the question.
+- **A hole only they can fill goes to them where it is.** In a table, `set` the cell with no value, `for: "you"`
+  and `open` saying what to put ("the date it must be fixed by"); the page highlights it as theirs, and what they
+  type there fills it, credited to them. In prose, a **Question:** line.
 - **Never leave them waiting on nothing**: when you are blocked on someone else, say on whom and since when, and
   what they can do meanwhile.
 
