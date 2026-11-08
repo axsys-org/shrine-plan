@@ -37,6 +37,9 @@ watch.
 - **An edit of your text is an instruction.** When they change a line you wrote, rewrite it in place to what they
   now want, and act on it.
 - **Answer in the doc, close to what they wrote**, in small edits, quickly: they are watching it change.
+- **Words in a cell are a request.** A cell holding words instead of a value ("find a domestic one", "ask Dana",
+  a reference to something not there yet) asks you to fill it: do it, then put the value there with its source, or
+  leave it a hole with a line saying what you are waiting on.
 
 ## Expect little; find what it is for
 
