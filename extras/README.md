@@ -20,14 +20,14 @@ x/eden --mount debugger --mount srs --mount codex --check
 x/eden --extras-root /path/to/other/extras --mount explorer
 ```
 
-Eden keeps one native world per node in `$XDG_DATA_HOME/shrine/worlds/` (default
-`~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit directory;
-subsequent launches remember its mount selection. Namespace state, history and
-reachable compiled definitions share the runtime's snapshot root. Commits precede
-write acknowledgments. Restart recreates I/O connections with fresh host
-arguments, without reinstalling application seeds or replaying completed work.
-`--ephemeral` and `--check` use disposable worlds. A world lock prevents two
-launchers from serving the same store concurrently.
+Eden uses a disposable native snapshot by default. Add `--snapshot PATH` to
+create or resume an arena explicitly, repeating the same mount selection each
+time. Namespace state, history and reachable compiled definitions share the
+runtime's snapshot root. Commits precede write acknowledgments. Restart recreates
+I/O connections with fresh host arguments, without reinstalling application
+seeds or replaying completed work. Enki owns writer exclusion; no world manifest,
+extra launcher lock or persistent source-copy directory is needed. See
+[the snapshot boundary](../MOUNTS.md) for exactly what remains captured.
 
 `web` owns shared browser routes, page composition and stylesheet.
 `openrouter` supplies the generated client used by Chat; regenerate it with
@@ -100,6 +100,10 @@ application sources. There is no external extras repository input or pin.
 
 ## Validation
 
+See [the native test guide](../TESTING.md) for suite ownership, namespace reports,
+disposable-world boundaries and the distinction between native verdicts and
+launcher diagnostics.
+
 From the repository root, enter core's Nix shell (or set `WISP`) for Foil checks:
 
 ```sh
@@ -113,7 +117,7 @@ python3 extras/mounts/codex/codex_bridge_tests.py
 nix develop path:./extras#debugger --command python3 extras/mounts/debugger/check-debugger.py
 ```
 
-`extras/x/check-goo` is the production compatibility suite, also run by CI.
+`extras/x/check-goo` is the explicit production compatibility suite.
 It builds the locked Mash Nix artifact and validates native contracts, prepared
 geometry, and a disposable real Eden instance in Chromium. The application gate
 uses production asset hooks and a test-only panes fixture. `goo-inspector`

@@ -2,8 +2,6 @@
 """Boot Shrine with explicitly selected filesystem source mounts."""
 import argparse
 from contextlib import ExitStack
-import fcntl
-import json
 import os
 import re
 from pathlib import Path
@@ -50,18 +48,18 @@ def main():
     parser.add_argument('--mount', action='append', default=[], metavar='NAME')
     parser.add_argument('--extras-root', type=Path,
                         help='Mount source directory (default: this checkout’s extras/)')
-    parser.add_argument('--workspace', type=Path, help='Source workspace for host captures (remembered by the world)')
+    parser.add_argument('--workspace', type=Path, help='Source workspace for host captures (default: this checkout)')
     parser.add_argument('--list-mounts', action='store_true')
     parser.add_argument('--node', default='0x11')
     parser.add_argument('--port', type=int, default=8130)
     parser.add_argument('--check', action='store_true')
-    parser.add_argument('--world', type=Path, help='Native world directory (default: $XDG_DATA_HOME/shrine/worlds/NODE)')
-    parser.add_argument('--ephemeral', action='store_true', help='Disposable world; implied by --check')
+    parser.add_argument('--snapshot', type=Path, help='Native snapshot directory containing arena.dat; created if absent')
+    parser.add_argument('--ephemeral', action='store_true', help='Disposable snapshot (the default); cannot use --snapshot')
     parser.add_argument('--startup-timeout', type=int, default=2400)
     parser.add_argument('--request-timeout', type=int, default=120)
-    parser.add_argument('--compiler', metavar='TIER',
+    parser.add_argument('--compiler', default='P6', metavar='TIER',
                         help='plangrm compiler tier to Install for the session '
-                             '(P1..P6, or none; default the world’s creation tier, initially P6)')
+                             '(P1..P6, or none; default P6)')
     args = parser.parse_args()
     try:
         number, node = parse_node_identity(args.node)
@@ -69,65 +67,50 @@ def main():
             raise ValueError('--port must be between 1 and 65535')
         if args.startup_timeout <= 0 or args.request_timeout <= 0:
             raise ValueError('Timeouts must be positive')
-        if args.world and (args.ephemeral or args.check):
-            raise ValueError('--world cannot be combined with --ephemeral or --check')
-        world = (args.world or Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'shrine/worlds' / node).resolve()
-        metadata = world / 'world.json'
-        recorded = json.loads(metadata.read_text()) if metadata.is_file() and not (args.ephemeral or args.check) else None
-        if recorded and (recorded.get('format') != 1 or recorded.get('node') != node):
-            raise ValueError(f'Incompatible world identity: {metadata}')
-        args.compiler = args.compiler or (recorded.get('compiler', 'P6') if recorded else 'P6')
+        if args.snapshot and (args.ephemeral or args.check):
+            raise ValueError('--snapshot cannot be combined with --ephemeral or --check')
+        snapshot = args.snapshot.resolve() if args.snapshot else None
         if args.compiler != 'none' and not re.fullmatch(r'P[1-6]', args.compiler):
             raise ValueError('--compiler must be P1..P6 or none')
-        extras = (args.extras_root or (Path(recorded['extras']) if recorded else ROOT / 'extras')).resolve()
-        workspace = (args.workspace or Path(recorded.get('workspace', ROOT) if recorded else ROOT)).resolve()
+        extras = (args.extras_root or ROOT / 'extras').resolve()
+        workspace = (args.workspace or ROOT).resolve()
         if args.list_mounts:
             for name in catalog(extras):
                 print(name)
             return 0
-        names = args.mount or (recorded['mounts'] if recorded else [])
+        names = args.mount or []
         selected = select(extras, names) if names else []
-        if recorded and [m.name for m in selected] != recorded['mounts']:
-            raise ValueError('The selected mounts differ from this world; use its existing selection')
         enter_environment(sys.argv[1:])
         runtime = os.environ.get('WISP') or shutil.which('wisp')
         if not runtime or not os.access(runtime, os.X_OK):
             raise ValueError('Set WISP to a working runtime executable')
         with ExitStack() as cleanup:
-            if args.ephemeral or args.check:
-                work = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='shrine-eden-')))
-            else:
-                work = world
-                work.mkdir(parents=True, exist_ok=True, mode=0o700)
-            lock = cleanup.enter_context((work / 'world.lock').open('a'))
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ValueError(f'This world is already running: {work}')
-            restored = (work / 'snap/arena.dat').is_file() and (work / 'world.json').is_file()
+            # The arena is the only persistent store. Source staging, bridge
+            # credentials, build products and logs belong to this process.
+            work = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='shrine-eden-')))
+            snapshot = snapshot or work / 'snap'
+            restored = (snapshot / 'arena.dat').is_file()
             if not restored:
-                if (work / 'snap').exists() or (work / 'src').exists():
-                    raise ValueError(f'Incomplete world retained at {work}; refusing to replace it')
+                if snapshot.exists():
+                    raise ValueError(f'No native arena in {snapshot}; refusing to replace this directory')
                 template = stage(runtime, False, args.startup_timeout)
-                shutil.copytree(ROOT / 'src', work / 'src')
-                copy_snapshot(template, work / 'snap')
-                (work / 'world.json').write_text(json.dumps(dict(format=1, node=node,
-                    extras=str(extras), workspace=str(workspace), compiler=args.compiler,
-                    mounts=[m.name for m in selected]), indent=2) + '\n')
-            session = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='session-', dir=work)))
-            prepared = prepare(selected, session, args.check, cleanup,
+                copy_snapshot(template, snapshot)
+                snapshot.chmod(0o700)
+            if snapshot != work / 'snap':
+                (work / 'snap').symlink_to(snapshot, target_is_directory=True)
+            shutil.copytree(ROOT / 'src', work / 'src')
+            prepared = prepare(selected, work, args.check, cleanup,
                                {"node": node, "timeout": args.startup_timeout, "workspace": str(workspace)})
             specs = runtime_specs(prepared, work / 'src')
             scanner = cleanup.enter_context(ScanBridge(prepared, work / 'src')) if specs else None
             scan_port = scanner.port if scanner else 0
             scan_token = scanner.token if scanner else ''
             log_path = work / 'out.log'
-            print(f'{"Restoring" if restored else "Booting"} Eden world: {work}. Log: {log_path}', flush=True)
-            log = cleanup.enter_context(log_path.open('a' if restored else 'w'))
-            log_start = log_path.stat().st_size
-            runtime_args = [args.compiler, str(args.port), str(scan_port), scan_token]
+            print(f'{"Resuming" if restored else "Booting"} Eden snapshot: {snapshot}. Log: {log_path}', flush=True)
+            log = cleanup.enter_context(log_path.open('w'))
+            runtime_args = [args.compiler, str(number), str(args.port), str(scan_port), scan_token]
             for spec in specs:
-                runtime_args.extend([str(len(spec[8])), *map(str, spec[8])])
+                runtime_args.extend([spec[2], str(len(spec[8])), *map(str, spec[8])])
             # The repl re-installs the boot compiler at every session start, so
             # the requested tier is installed here, per session.  Compiled
             # code is attached lazily and cached across processes by the
@@ -135,11 +118,11 @@ def main():
             install = ''
             if args.compiler != 'none':
                 install = f'(#bind opt (#module plangrm))\n(Install opt:compile{args.compiler})\n'
-            # A saved world continuation ignores stdin. If the first boot was
+            # A native Eden continuation ignores stdin. If the first boot was
             # interrupted before its first native Save, the retained compiler
             # REPL consumes this same bootstrap; no arena is ever replaced.
             # A file avoids blocking on a full pipe when the saved world ignores it.
-            bootstrap_input = cleanup.enter_context((session / 'boot.rvr').open('w+'))
+            bootstrap_input = cleanup.enter_context((work / 'boot.rvr').open('w+'))
             bootstrap_input.write(install + f'''(#bind eden (#module eden))
 (#bind bootstrap (#module foil-bootstrap))
 (#bind std (#module std))
@@ -156,8 +139,7 @@ def main():
             process = subprocess.Popen([runtime, '--file-root', str(work / 'src'),
                                         'snap', 'root', '_', *runtime_args], cwd=work,
                                        stdin=bootstrap_input, stdout=log, stderr=log,
-                                       text=True, restore_signals=False,
-                                       pass_fds=(lock.fileno(),))
+                                       text=True, restore_signals=False)
             def stop():
                 if process.poll() is None:
                     process.terminate()
@@ -169,10 +151,9 @@ def main():
             cleanup.callback(stop)
             deadline = time.monotonic() + args.startup_timeout
             while True:
-                with log_path.open('rb') as current_log:
-                    current_log.seek(log_start)
-                    output = current_log.read().decode(errors='replace')
+                output = log_path.read_text(errors='replace')
                 if process.poll() is not None:
+                    print(output[-6000:], file=sys.stderr)
                     return runtime_exit_status(process.returncode, log_path) or 1
                 if startup_failed(output, 'EDEN-LAUNCH-RETURNED'):
                     raise RuntimeError(output[-6000:])
@@ -183,7 +164,7 @@ def main():
                     except OSError:
                         pass
                 if time.monotonic() > deadline:
-                    raise RuntimeError(f'Startup timed out; inspect {log_path}')
+                    raise RuntimeError(f'Startup timed out. Last native output:\n{output[-6000:]}')
                 time.sleep(.25)
             url = f'http://127.0.0.1:{args.port}'
             print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}', flush=True)
@@ -205,7 +186,10 @@ def main():
                             raise RuntimeError(f'{mount.name}: {error.code} at {error.url}: {error.read().decode(errors="replace")[:1200]}') from error
                 print('Eden checks passed.', flush=True)
                 return 0
-            return runtime_exit_status(process.wait(), log_path)
+            status = process.wait()
+            if status:
+                print(log_path.read_text(errors='replace')[-6000:], file=sys.stderr)
+            return runtime_exit_status(status, log_path)
     except KeyboardInterrupt:
         return 130
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as error:

@@ -74,6 +74,7 @@ def main():
             hosted = [] if args.panes_only else ['--mount', 'goo-inspector']
             process = subprocess.Popen([sys.executable, str(ROOT / 'x/eden'), '--mount', 'panes', *hosted,
                                         '--extras-root', str(extras), '--port', str(port),
+                                        '--snapshot', str(output / 'snap'),
                                         '--startup-timeout', str(args.startup_timeout)],
                                        cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)

@@ -14,7 +14,50 @@
 (#bind abi (#module foil-abi))
 (#bind documentation (#module goo-documentation-bridge))
 (#bind value-editor (#module goo-value-bridge))
-(#bind world (#module eden-world))
+(#bind optimizer (#module plangrm))
+
+;; Native snapshots resume a program. Keep only the service's required laws
+;; and the namespace pin in that root; I/O capabilities arrive with this run.
+(define (park ignored)
+  (define received (Recv 0))
+  (Seq (foldl (lambda (ignored cap) (CloseHandle cap)) 0 (_1 received))
+    (park 0)))
+(define (resume service retained args)
+  (define (commit state)
+    (define next (Pin state))
+    (Seq (Save (Pin (resume service next))) (Unpin next)))
+  (define tier (_0 args))
+  (cond
+    ((Equal tier "none") 0)
+    ((Equal tier "P1") (Install optimizer:compileP1))
+    ((Equal tier "P2") (Install optimizer:compileP2))
+    ((Equal tier "P3") (Install optimizer:compileP3))
+    ((Equal tier "P4") (Install optimizer:compileP4))
+    ((Equal tier "P5") (Install optimizer:compileP5))
+    ((Equal tier "P6") (Install optimizer:compileP6))
+    (else (error "Invalid Eden compiler tier")))
+  ;; The service preflights reconnect before committing or starting actors.
+  ;; Stay in this root actor: returning would let the caller's REPL Save its
+  ;; earlier environment over the supervisor's last acknowledged state.
+  (Seq ((Unpin service) commit (Unpin retained) (drop 1 args)) (park 0)))
+
+(define (read-session self args specs)
+  (If (Lt (Sz args) 4) (error "Missing Eden runtime arguments") 0)
+  (If (Eq (parse-nat (_0 args)) (_0 self)) 0
+    (error "Snapshot node differs from the launch selection"))
+  (define (hooks remaining pending out)
+    (Ifz (Sz pending)
+      (Ifz (Sz remaining) out (error "Unexpected Eden mount selection"))
+      (let ((count (parse-nat (_1 remaining))))
+        (If (Or (Lt (Sz remaining) 2)
+                (Nil (Equal (_0 remaining) (_2 (_0 pending)))))
+          (error "Snapshot mount descriptor differs from the launch selection")
+          (If (Lt (Sz remaining) (Add 2 count))
+            (error "Missing Eden mount arguments")
+            (hooks (drop (Add 2 count) remaining) (drop 1 pending)
+              (snoc (take count (drop 2 remaining)) out)))))))
+  [(parse-nat (_1 args)) (parse-nat (_2 args)) (_3 args)
+   (hooks (drop 4 args) specs [])])
 
 (define (module images name)
   (Unpin (_1 (need (find (lambda (pair) (Equal name (_0 pair))) images)))))
@@ -32,10 +75,20 @@
 ;; post-start hook, hook arguments, inspection-provider flag, dependencies,
 ;; required assets, route claims, declarative-workspace flag, pinned modules.
 ;; Every source read below comes from the mount's captured namespace records.
-(define (mounted self system resolve slot port specs scan-port scan-token tier)
+(define (mounted self system resolve slot port supplied scan-port scan-token tier)
+  ;; Mount contracts are captured; host ports, tokens and provider arguments
+  ;; are process resources. Never retain the latter in the saved service.
+  (define specs (map (Up 8 []) supplied))
+  (define runtime-args
+    (Weld [tier (showNat (_0 self)) (showNat port) (showNat scan-port) scan-token]
+      (foldl Weld [] (map (lambda (spec)
+        (Weld [(_2 spec) (showNat (Sz (Ix 8 spec)))] (Ix 8 spec))) supplied))))
   (define local (bootstrap:build-local self system resolve slot
     ["eden" "eden_store" "source_mount" "grove_backend" "grove_role_runtime" "grove_draft"]))
   (define core-code (_1 local))
+  (define core-plan (_0 core-code))
+  (define code-tag (Hd core-code))
+  (define policy (bootstrap:policy system))
   (define core-images
     (merge-images (bootstrap:system-images system)
       (merge-images (_2 (bootstrap:publisher-code system)) (_2 core-code))))
@@ -88,16 +141,18 @@
       (If found
         (_0 (subject:sut-context (driver:perc-subject (Unpin (_1 (_0 found))))))
         (resolve name)))
-    (define origin (publication:compilation-context (Unpin (_0 core-code))))
+    (define origin (publication:compilation-context (Unpin core-plan)))
     (define prepared (source:prepare-publication-with read
       (context:publication-key origin) (context:compiler-key origin)
       root imported (previous state)
       (Weld (map _0 own) (filter (lambda (name)
         (Nil (find (lambda (binding) (Equal name (_0 binding))) own))) pinned))))
-    (define code (publication:compile prepared (_1 core-code)))
+    ;; Imports already supply the exact retained artifacts. Bootstrap's
+    ;; compilation memo is not part of a running namespace's state.
+    (define code (publication:compile prepared driver:empty-foil-cache))
     (define candidate
       (If (Or (Sz own) (Sz pinned))
-        (_0 (need-ok (publication:publish-local (bootstrap:policy system)
+        (_0 (need-ok (publication:publish-local policy
           slot code 0 0 state))) state))
     (define all-images (merge-images (_2 code) imported))
     (define complete ((Hd code) (_0 code) (_1 code) all-images))
@@ -139,7 +194,7 @@
   (define draft-policy (module core-images "grove_draft"))
   (define (draft-tool name) (driver:get-perc ["grove_draft" name] draft-policy))
   (define (compile-draft root text prelude state)
-    (define complete ((Hd core-code) (_0 core-code) (_1 core-code) (images state)))
+    (define complete (code-tag core-plan driver:empty-foil-cache (images state)))
     (define prepared (backend:prepare-with complete prelude))
     (define policy (_1 prepared))
     (define (lookup requested)
@@ -207,7 +262,7 @@
   (define http (module core-images "http_foot"))
   (define empty (driver:get-perc ["http_foot" "empty"] http))
   (define (serve commit saved runtime-args)
-  (define session (world:session runtime-args specs))
+  (define session (read-session self runtime-args specs))
   ;; Prepare against the retained world without checkpointing a partial start.
   ;; Route construction and draft reconciliation may fail. Resolve all hook
   ;; entrypoints before committing or giving an actor the candidate namespace.
@@ -242,7 +297,7 @@
   (define access
     ((driver:get-perc ["eden_store" "namespace_access"] (module core-images "eden_store"))
       ((draft-tool "access") draft-ports ((tool ["source_mount" "access"]) ports homes)) commit))
-  (DeepSeq [state config hooks register registration fs-entry http-entry serve-feet access] 0)
+  (DeepSeq [session state config hooks register registration fs-entry http-entry serve-feet access] 0)
   (define stored (commit state))
   ;; After this point failures are I/O startup failures, not an uncommitted
   ;; preparation. Restart reconnects again; acknowledged provider writes remain.
@@ -255,11 +310,11 @@
     fs-entry)) 0)
   (Seq (register server (registration [self ("ts" "io") ("ts" "http")]
     http-entry)) 0)
-  (Seq (print ["EDEN-WORLD-READY" "native continuation committed"]) server))
-  (world:run serve editable (world:arguments tier port scan-port scan-token specs)))
+  (Seq (print ["EDEN-READY" "native snapshot committed"]) server))
+  (resume (Pin serve) (Pin editable) runtime-args))
 
 (define (start-with-tier self system resolve slot port specs scan-port scan-token tier)
   (mounted self system resolve slot port specs scan-port scan-token tier))
 (define (start self system resolve slot port specs scan-port scan-token)
   (start-with-tier self system resolve slot port specs scan-port scan-token "none"))
-(#export start start-with-tier)
+(#export start start-with-tier resume)

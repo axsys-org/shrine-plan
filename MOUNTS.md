@@ -14,14 +14,20 @@ x/eden --mount debugger --mount srs
 x/eden --extras-root ../shrine-extras --mount explorer --mount codex
 ```
 
-Eden restores one native world per node from `$XDG_DATA_HOME/shrine/worlds/`
-(default `~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit
-directory; the mount selection and source workspace are remembered there.
-`--workspace PATH` selects the source workspace used by host captures.
+Eden is disposable by default. `--snapshot PATH` explicitly creates or resumes
+a native snapshot directory containing `arena.dat`; the runtime owns its writer
+and commit locks. Repeat the mount selection on each launch. The native entry
+checks the node and mount descriptors against its captured contracts before
+reconnecting or committing. `--workspace PATH` selects the current source
+workspace used by host captures. No `world.json`, per-node storage registry,
+launcher lock or remembered checkout settings are used.
+
 The namespace, history, cells and executable definitions are committed together
-through native `Save` before a write is acknowledged. Restarts reconnect I/O
-services before rescanning evidence; they do not reinstall application seeds or
-replay completed work. `--ephemeral` and `--check` use disposable worlds.
+through native `Save` before a changed supervisor state is acknowledged.
+`eden_store` retains that boundary and reconnects process resources. Source
+staging, browser builds, bridge credentials and logs live in a temporary session
+directory, removed when the launcher exits. `--ephemeral` explicitly selects
+the default disposable behavior; `--check` also uses a disposable snapshot.
 
 The world uses the native runtime selected by `flake.lock`. Native `Save` and
 reconnection establish persistence independently of arena-sharing optimizations
@@ -35,13 +41,27 @@ or convert the arena, and an older upstream runtime cannot reopen it. Keep the
 compatible runtime for such a world; independent review of storage optimization
 does not remove this existing format dependency.
 
-A saved world resumes its captured service and compiler. Editing repository
-sources does not alter that saved program, and restarting does not load a new
-core runtime. Bootstrap closure patching and the `--upgrade` path are removed.
-Publication updates namespace definitions and explicit behavior registrations;
-it does not replace the captured service. There is no replacement-service API
-or launcher handoff. A running world's compiler, transport and persistence
-changes cannot be activated by pretending they are mount publications.
+A native snapshot resumes an executable root. Eden's root contains a pin to
+the namespace and a pin to the code needed to serve it, using `eden:resume`.
+There is no separate world wrapper or service-replacement interface. Initial
+startup and reconnect prepare routes and hooks before the first commit; a
+failed preflight leaves the saved root unchanged. After each commit the
+supervisor adopts the exact graph returned by native storage.
+
+The captured closure has been reduced to its serving dependencies. Exact core
+artifacts, publication policy, module roots, and mount contracts are required
+to interpret retained typed values and compile explicit publications against
+their original identities. The initial bootstrap compilation memo and the full
+system-build result are not retained by that closure. Mount hook arguments
+(including old host ports/tokens) are removed from captured descriptors and
+supplied afresh on every invocation. Native definitions and their provenance
+remain reachable through the namespace.
+
+This deliberately does not promise that restarting selects a new core compiler
+or transport from the checkout. Those are executable laws captured by the
+native snapshot; changing them requires a separately defined compatibility
+operation. Mounted behavior still follows explicit publication. No snapshot
+rewriting, bootstrap patching, type matching or migration shim is introduced.
 
 The existing publication path has narrower, useful boundaries:
 

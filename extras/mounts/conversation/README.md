@@ -22,12 +22,83 @@ its `respond` definition with the existing page actions. Then open
 interactive provider (normally `/<node>/io/codex/surface_provider`). The composer
 and creation form are declared Goo actions, also discoverable headlessly.
 
+The chat history scrolls independently of the docked composer. Enter activates
+the declared Send control; Shift+Enter inserts a newline. Keyboard submission
+waits for text composition and pending editor operations, and uses Goo's normal
+in-flight/receipt handling. The composer accepts plain multiline messages;
+formatted runs are still rejected by the native message input contract.
+
+New responses follow the bottom while you are there. Reading or editing earlier
+documents pauses following; **Jump to latest** or sending a message resumes it.
+Window resizing prepares Goo at its new allocation while preserving drafts.
+Each turn's disclosure opens the existing work projection, with links to its
+response document and native trace. Closing the tab stops presentation reads
+and disconnects layout observation.
+
+The chat skin adapts the video study's white canvas, compact composer, quiet
+message cards and collapsible work summaries. The native manifest derives status
+from the controller and its current crew-selected requests and workers:
+
+- **Working**: provider preparation, active execution or result admission.
+- **Waiting for input**: an unresolved answer, manual revision or waiting provider.
+  A retained clarification note is shown when available.
+- **Blocked**: admission, allocation, provider, validation or publication failure.
+- **Watching for changes**: the flow has published and is following its evidence.
+- **Paused**: the native controller is disabled or detached.
+
+The browser renders these labels directly. It stores no status transitions and
+does not inspect the retained attempt subtree to infer progress. Old failed
+attempts cannot override a current retry; a published reply can still have a new
+blocker. The manifest retains the raw controller status/reason for inspection.
+
+An unresolved conversation response offers **Answer and resume** inline, beside
+the retained explanation. Its rich-text input and action are declared Goo
+controls. The docked **Send** button still starts a new turn.
+
+Answering writes a Nenex clarification beneath the original message and binds
+it into that turn's existing context lens. The native operation checks the
+request version, current hole head, controller ownership and destination claim;
+it refuses paused, superseded or non-clarification work and occupied addresses.
+The same hole and maintenance hand react to the changed evidence and create a
+new attempt. The answer itself does not resolve the hole or overwrite the old
+attempt, message, provider result or captured definition. Validated completion
+publishes to the original response document. Another missing-input response can
+ask for another clarification through the same path.
+
+One request accepts one answer receipt; repeating the same admission is a no-op,
+and a conflicting duplicate is refused. Receipts retain the original request
+and hole references. Later conversation turns pin the clarification documents
+visible when they begin. Replies are scoped to their original context cell,
+so answering one turn does not broadcast new evidence to every conversation
+occurrence. Goo preserves an unsent draft if its request is superseded; it does
+not silently move that text onto a different request.
+
+Nenex is still projected by `GooDocument`: chat requests compact content without
+the wiki header or tool catalogue. The writer's terminal section containing only
+the page's own flow receipt is omitted from this projection; **Work and trace**
+opens the full response document and retained work. No source or history is
+deleted. Text, embeds, edit guards, local drafts and native actions remain in the
+same renderer. Send's row has an 8 px gap above it, a 6 px inset and aligns right
+at all widths. The dock reserves 12 px on each side and 16 px below the composer;
+its content still aligns with the chat column on larger screens. The small **I**
+inspector sits opposite Send and retains its accessible name.
+CSS supplies host layout and control paint, while Goo owns measured typography,
+control geometry, input contracts and action dispatch. The video demo's simulated
+PR state, unconnected attachment and voice controls are not part of this view.
+
 After publishing changes to this mount, **Select published conversation
 operations** explicitly admits its current registrations through the existing
 namespace boundary. Republish an authored response flow to capture those laws,
 then select that definition when creating a conversation. Existing conversations
-and attempts retain their selected definitions. This updates native operation
+can explicitly advance future turns with `conversation/select_definition`, supplying
+the previous and new pinned definition references. Existing occurrences adopt a
+new definition separately through the ordinary flow operation. Start receipts,
+attempts and prior publications retain their selections. This updates native operation
 records, not the saved HTTP service or compiler.
+JS/CSS assets follow the published source bundle. The HTTP view handler is
+selected when serving the world: after publishing a handler change, an ordinary
+restart from the same native continuation selects it. Publishing alone does not
+replace the running foot's captured route closure.
 
 The response policy asks for Semidoc with a heading and accepts sections, rich
 text, native references and declared embed relationships. It validates and
@@ -118,10 +189,17 @@ For a conversation page `P`:
 | `P/work/<id>` | Existing flow maintenance controller and retained work |
 | `P/conversation` | Selected definition/provider references and next sequence |
 | `P/conversation/turns/<id>` | Idempotent receipt, sequence and document/work references |
+| `P/messages/<id>/clarifications/<request>` | Nenex answer, explicitly bound to the original context lens |
+| `P/conversation/turns/<id>/clarifications/<request>` | Answer receipt with retained request/hole references |
 
 The selected definition and provider are pinned when the conversation starts.
 Earlier messages and available replies are pinned to the versions visible when
-a later turn is sent. The current message, wiki subject and explicitly selected
+a later turn is sent. The response prompt includes the current message; the full
+context is exposed through the request's ordinary frozen `context` cell, linked
+from `work/context`. The interactive provider reads relevant branches through
+`shrine_read`. No history is truncated or copied wholesale into the prompt, and
+later source changes cannot alter an earlier attempt's captured context.
+The current message, wiki subject and explicitly selected
 incoming evidence remain live. Editing them changes the demand through native
 cell dependencies. Old attempts retain their readings; obsolete provider results
 cannot satisfy current work. Edited generated response prose is protected by the
@@ -147,9 +225,9 @@ not include this conversation's reply/work trees.
   never dispatch work. Closing the browser stops them; native work continues.
 - This first view reads conversation turn metadata and explicitly selected
   message context. It does not claim unbounded chat history, automatic relevance,
-  automatic summarization or semantic skill selection. Existing flow/request
-  input limits still apply; large contexts fail visibly rather than being
-  silently truncated.
+  automatic summarization or semantic skill selection. Prompt/schema limits
+  still apply to instructions. Evidence is read from retained cells rather
+  than silently truncated; selecting relevant context is still model work.
 - Wiki edits during an active turn can invalidate its evidence and start a fresh
   attempt. Agents must treat that wiki as shared evidence, not a private scratch
   buffer. Retained prior-turn captures stay unchanged.
@@ -168,8 +246,16 @@ draft handling. The native cases use controlled provider responses. They cover
 literal multiline messages, native reply references, repeated bindings through
 source/Goo edits, retained turn order, graph-context removal/restoration, stale
 result rejection, holes/retries, occupied-address guards and retained x/y/z
-history. Existing document-boundary cases check source ownership and captured
-writers alongside those additions.
+history. Status cases distinguish active workers, clarification, provider and
+validation failures, retries, pause, allocation collisions and publication
+guards without treating historical work as current. The input/resumption pass
+verified 101 conversation checks and 17 browser checks. It covers same-hole
+resumption, the declared Goo adapter, guarded and duplicate submissions,
+clarification capture in subsequent turns, and retained x/y/z history. The edited
+response case delivers to the crew-selected current request and checks the exact
+`flow_generated_page_edited` refusal, not merely the overloaded controller status.
+Existing document-boundary cases check source ownership and captured writers
+alongside those additions.
 
 A separately mounted world is also required for integration validation: the
 combined fixture shares one compilation context, whereas deployed mounts must

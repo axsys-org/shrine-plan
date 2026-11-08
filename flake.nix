@@ -70,10 +70,15 @@
               report="$out/$(basename "$run")"
               mkdir -p "$report"
               cp "$run/results.json" "$report/"
+              cp -R "$run/src" "$report/src"
               for group in "$run"/*/; do
+                [ -f "$group/result.json" ] || continue
                 dest="$report/$(basename "$group")"
                 mkdir -p "$dest"
                 cp "$group/input" "$group/out.log" "$group/result.json" "$dest/"
+                if [ -d "$group/snap" ]; then
+                  cp -R "$group/snap" "$dest/"
+                fi
               done
             done
           '';

@@ -11,7 +11,7 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_worker_arenas_retained_only_on_failure(self):
+    def test_worker_arenas_retain_native_reports_on_success_and_failure(self):
         for passed in (True, False):
             with self.subTest(passed=passed), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -23,12 +23,15 @@ class ProtocolTests(unittest.TestCase):
                     status = 'pass' if passed else 'error'
                     (directory / 'out.log').write_text(
                         f'("TEST" "{status}" "example" "~:module" "~:" "~:")\n'
+                        + f'("TEST-SUMMARY" {int(passed)} 1)\n'
                         + runner.DONE + '\n')
                     return 0, True, 0.0
                 with patch.object(runner, 'run_process', execute):
                     result = runner.run_group([suite], 'wisp', template, root, 1)
                 self.assertEqual(result['passed'], passed)
-                self.assertEqual((root / 'worker/snap').exists(), not passed)
+                self.assertTrue((root / 'worker/snap').exists())
+                self.assertNotIn('records', result)
+                self.assertEqual(result['namespace_report']['path'], '/0x11/tests/run')
                 self.assertTrue((root / 'worker/result.json').exists())
                 self.assertTrue((root / 'worker/out.log').exists())
                 self.assertEqual((template / 'arena.dat').read_bytes(), b'compiler fixture')
@@ -46,7 +49,7 @@ class ProtocolTests(unittest.TestCase):
                 captured.append(source)
                 (directory / 'out.log').write_text(
                     ''.join(f'("TEST" "pass" "{suite["name"]}" "~:module" "~:" "~:")\n'
-                            for suite in suites) + runner.DONE + '\n')
+                            for suite in suites) + '("TEST-SUMMARY" 1 2)\n' + runner.DONE + '\n')
                 return 0, True, 0.0
             with patch.object(runner, 'copy_template', copy), \
                  patch.object(runner, 'run_process', execute):
@@ -76,16 +79,17 @@ class ProtocolTests(unittest.TestCase):
                 target.mkdir(parents=True)
             def execute(_command, directory, _input, _timeout):
                 (directory / 'out.log').write_text(
-                    '("TEST" "pass" "example" "~:1: ?= ((add 1 1) 2)" '
-                    '"~:2" "~:2")\n' + runner.DONE + '\n')
+                    '("TEST" "fail" "example" "~:1: ?= ((add 1 1) 2)" '
+                    '"~:2" "~:1")\n("TEST-SUMMARY" 0 1)\n' + runner.DONE + '\n')
                 return 0, True, 0.0
             with patch.object(runner, 'ROOT', root / 'checkout'), \
                  patch.object(runner, 'copy_template', copy), \
-                 patch.object(runner, 'run_process', execute):
+                 patch.object(runner, 'run_process', execute), \
+                 patch('builtins.print') as printed:
                 result = runner.run_group([suite], 'wisp', root, root, 1)
-            self.assertTrue(result['passed'])
-            self.assertEqual(list(result['locations'].values()),
-                             [str(frozen) + ':1'])
+            self.assertFalse(result['passed'])
+            self.assertTrue(any(str(frozen) + ':1' in str(call) for call in printed.call_args_list))
+            self.assertNotIn('records', result)
 
     def test_retired_modules_cannot_reenter_module_graph(self):
         retired = {'foil', 'compiler-host', 'helm-host', 'foil-types',
@@ -130,6 +134,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(runner.verdict(runner.DONE, 0)[0])
         self.assertFalse(runner.verdict(runner.DONE, -6)[0])
         self.assertFalse(runner.verdict(runner.DONE, 0, False)[0])
+
+    def test_native_verdict_is_required_and_cannot_be_overruled_by_exit_zero(self):
+        passed = '("TEST" "pass" "m" "~:case" "~:1" "~:1")\n'
+        for summary, expected in [('', False), ('("TEST-SUMMARY" 0 1)\n', False),
+                                  ('("TEST-SUMMARY" 1 1)\n', True),
+                                  ('("TEST-SUMMARY" 1 "B")\n', True),
+                                  ('("TEST-SUMMARY" 1 "1")\n', True),
+                                  ('("TEST-SUMMARY" 1 "")\n', False),
+                                  ('("TEST-SUMMARY" 1 0)\n', False),
+                                  ('("TEST-SUMMARY" 1 1)\n' * 2, False),
+                                  ('("TEST-SUMMARY" broken)\n', False)]:
+            log = passed + summary + runner.DONE + '\n'
+            self.assertEqual(runner.verdict(log, 0, native=True)[0], expected)
+
+    def test_native_counts_follow_plan_atom_spelling(self):
+        for token, count in [('66', 66), ('"B"', 66), ('"1"', 49),
+                             ('""', 0), ('"AB"', 16961),
+                             ('""""', 34), ('"\\\\"', 92)]:
+            self.assertEqual(runner.decode_nat(token), count)
 
     def test_caught_error_trace_is_not_uncaught_error(self):
         self.assertTrue(runner.verdict('("Error" "expected")\n' + runner.DONE, 0)[0])
@@ -196,7 +219,7 @@ class ProtocolTests(unittest.TestCase):
                                     for name in runner.reaver_closure(['foil-grove-tree-tests'])
                                     if (runner.ROOT / 'src/reaver' / (name + '.rvr')).exists()))
         self.assertTrue(suites['foil-grove-tree-tests']['enabled'])
-        for name in ('backend', 'action', 'norm', 'role', 'sewn', 'tree'):
+        for name in ('backend', 'action', 'norm', 'role', 'sewn', 'tree', 'context'):
             suite = suites['foil-grove-' + name + '-tests']
             self.assertEqual(suite['entrypoint'], 'run' if name == 'backend' else 'check')
             self.assertEqual(suite['fixture'], ['foil-grove-fixture', 'create'])
@@ -267,6 +290,14 @@ class RuntimeTests(unittest.TestCase):
             result = runner.run_group(suites, os.environ['WISP'],
                                       Path(os.environ['TEST_TEMPLATE']), root, 180)
             self.assertTrue(result['passed'], (root / 'exec/out.log').read_text()[-6000:])
+            # Reopen the saved runtime, then read the report through native
+            # namespace operations. No JSON report is imported or reconstructed.
+            (root / 'exec/src').symlink_to(root / 'src')
+            self.probe(root / 'exec', """
+(#bind report_checks (#module testing-report-fixture))
+assert(report_checks:check test_report_started test_report_completed
+  ["probe_one" "probe_two"] ["pass" "pass"])
+""")
             # A failed entrypoint must not prevent later shared-fixture suites.
             (modules / 'probe_one.rvr').write_text(
                 '(#bind std (#module std))\n(#import std)\n'
@@ -278,8 +309,52 @@ class RuntimeTests(unittest.TestCase):
             result = runner.run_group(suites, os.environ['WISP'],
                                       Path(os.environ['TEST_TEMPLATE']), failed_root, 180)
             self.assertFalse(result['passed'])
-            self.assertTrue(any(r[:2] == ('error', 'probe_one') for r in result['records']))
-            self.assertTrue(any(r[:2] == ('pass', 'probe_two') for r in result['records']))
+            records = runner.events(Path(result['log']).read_text())
+            self.assertTrue(any(r[:2] == ('error', 'probe_one') for r in records))
+            self.assertTrue(any(r[:2] == ('pass', 'probe_two') for r in records))
+            (failed_root / 'exec/src').symlink_to(root / 'src')
+            self.probe(failed_root / 'exec', """
+(#bind report_checks (#module testing-report-fixture))
+assert(report_checks:check test_report_started test_report_completed
+  ["probe_one" "probe_two"] ["error" "pass"])
+""")
+
+    def test_migrated_assertion_is_a_retained_native_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copytree(runner.ROOT / 'src', root / 'src')
+            module = root / 'src/reaver/foil-publication-tests.rvr'
+            # Break a real migrated assertion only in the disposable source.
+            module.write_text(module.read_text().replace(
+                '(Eq 1 ((driver:get-perc ["accepts"] current) (driver:get-perc ["value"] old-model)))',
+                '(Eq 0 ((driver:get-perc ["accepts"] current) (driver:get-perc ["value"] old-model)))'))
+            layout = root / 'src/reaver/foil-semidoc-layout-tests.rvr'
+            # Also break the final assertion of the Semidoc layout check. This
+            # catches accidental loss of evaluation after the first assertions.
+            layout.write_text(layout.read_text().replace(
+                '[["ts" "sattr"] ["ts" "occurrences"]]) 1) [[]])',
+                '[["ts" "sattr"] ["ts" "occurrences"]]) 1) [])'))
+            template = Path(os.environ['TEST_TEMPLATE'])
+            runner.copy_template(template, root / 'snap')
+            # A failing suite must still be importable without running its body.
+            self.probe(root, '(#bind early (#module foil-publication-tests))\n'
+                             '(#bind late (#module foil-semidoc-layout-tests))')
+            names = ['foil-publication-tests', 'foil-semidoc-layout-tests',
+                     'foil-demand-publication-tests']
+            inventory = {s['name']: s for s in runner.inventory()}
+            suites = [dict(inventory[name], group='exec') for name in names]
+            result = runner.run_group(suites, os.environ['WISP'], template, root,
+                                      max(suite['timeout'] for suite in suites))
+            self.assertFalse(result['passed'])
+            # Native report contents, continuation and history are checked in
+            # Reaver after reopening the saved worker, not inferred from stdout.
+            (root / 'exec/src').symlink_to(root / 'src')
+            self.probe(root / 'exec', """
+(#bind report_checks (#module testing-report-fixture))
+assert(report_checks:check test_report_started test_report_completed
+  ["foil-publication-tests" "foil-semidoc-layout-tests" "foil-demand-publication-tests"]
+  ["error" "error" "pass"])
+""")
 
     def test_workers_read_preserved_timestamp_edits(self):
         with tempfile.TemporaryDirectory() as temp:

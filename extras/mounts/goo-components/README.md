@@ -14,7 +14,8 @@ python3 x/eden --mount goo-components --compiler none --ephemeral --port 8144
 
 Open [the component gallery](http://127.0.0.1:8144/goo-components). The gallery's
 editing examples save to its sample records. `--ephemeral` gives this invocation
-a disposable world. Omit it or choose `--world PATH` when persistence is wanted.
+a disposable snapshot (also the default). Choose `--snapshot PATH` and repeat
+the mount selection when persistence is wanted.
 
 The gallery stylesheet controls its navigation and surrounding page only.
 Component appearance comes from the existing pinned Mash/Goo profile. Resize

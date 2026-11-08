@@ -19,13 +19,13 @@ def runtime_exit_status(returncode, log_path):
 import re
 def startup_ready(output, returned_marker):
     return ('HTTP foot listening' in output and bool(
-        re.search(r'^\((?:0\s+)?"EDEN-WORLD-READY"(?:\s|\))', output, re.M) or re.search(
+        re.search(r'^\((?:0\s+)?"EDEN-READY"(?:\s|\))', output, re.M) or re.search(
         r'^\("' + re.escape(returned_marker) + r'"\s+\(0(?:\s|\))', output, re.M)))
 
 def startup_failed(output, returned_marker):
-    # Try returns (0 value) on success and (1 reason) on failure. Eden's entry
-    # returns its spawned supervisor actor ID before the HTTP foot listens.
-    # Success is not readiness: the caller must still prove the live listener.
+    # Initial launch reports failures through Try; a resumed native root can
+    # fail directly. Readiness separately requires the committed startup marker
+    # and a listening HTTP foot.
     return bool(re.search(r'^\("ERROR"(?:\s|\))', output, re.M)
                 or re.search(r'^\("' + re.escape(returned_marker) + r'"\s+\(1(?:\s|\))', output, re.M)
                 or 'pump: listen failed' in output or 'bind/listen failed' in output)

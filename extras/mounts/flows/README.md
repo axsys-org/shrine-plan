@@ -126,6 +126,13 @@ investigation or an explicitly authored `interactive_requests` step. Ordinary
 prose revision retains its bounded response policy. **Retain unresolved question** uses the existing hole
 operation with a live context path and an open activity to resume.
 
+Task cards may retain `work/evidence` as a native `cell_view`. The shared request
+hand exposes that exact value at the attempt's frozen `context` cell, linked by
+`work/context`. Interactive requests receive its `/x` address for selective,
+paged reads instead of copying the evidence into the prompt. Noninteractive
+provider protocols retain their exact prompt bytes. Previous captures and
+contexts remain readable after source changes, retries and later publications.
+
 Headless callers discover control addresses, input fields and version tokens
 from Goo, then submit those exact fields through its action protocol. Reinspect
 after a mutation or stale result. The Semidoc `source` fields use the existing
@@ -613,9 +620,10 @@ a catalogue. Example documents still use these same operations and records.
 
 Eden saves the complete namespace through its native continuation before
 acknowledging writes. Documents, cells, holes, captured laws and work history
-restore together. `x/eden` uses `$XDG_DATA_HOME/shrine/worlds/NODE` by default;
-`--world PATH` selects another world. Restarts reconnect I/O; completed work is
-not replayed. `--ephemeral` and `--check` use disposable worlds.
+restore together. `x/eden --snapshot PATH` selects an explicit native arena;
+repeat the mount selection when resuming. Restarts reconnect I/O; completed work
+is not replayed. Invocations without `--snapshot`, including `--check`, are
+disposable. The runtime owns persistence and writer exclusion.
 
 Source publication and installed behavior records are distinct. **Refresh harness
 code** admits the selected flow implementation's registrations in one native batch.

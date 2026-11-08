@@ -45,7 +45,9 @@
   if(typeof module!=='undefined')module.exports=root.GooInspection;
   if(!root.document)return;
   const el=(tag,text)=>{const node=document.createElement(tag);if(text)node.textContent=text;return node;};
-  const picker=el('button','Inspect a presentation');picker.type='button';picker.className='goo-inspect-picker';
+  let pickerLabel='Inspect a presentation';
+  const picker=el('button',pickerLabel);picker.type='button';picker.className='goo-inspect-picker';
+  picker.setAttribute('aria-label','Inspect a presentation');
   picker.setAttribute('aria-pressed','false');picker.title='Choose a presentation, or press Alt+I while focused inside one.';
   const panel=el('aside');panel.className='goo-inspect-panel';panel.hidden=true;panel.setAttribute('aria-label','Presentation inspection');
   const title=el('h2','Inspect this presentation'), provenance=el('p','Frozen browser observation. Namespace links open current records.');
@@ -53,7 +55,8 @@
   close.type=refresh.type='button';links.setAttribute('aria-label','Inspection references');status.setAttribute('role','status');body.className='goo-inspect-content';
   panel.append(title,close,refresh,provenance,links,status,body);document.body.append(picker,panel);
   let picking=false,selected,observation,request,revision=0,returnFocus,stopObserving;
-  const pick=value=>{picking=value;picker.setAttribute('aria-pressed',String(value));picker.textContent=value?'Cancel inspection pick':'Inspect a presentation';document.documentElement.classList.toggle('goo-inspect-picking',value);};
+  const pick=value=>{picking=value;picker.setAttribute('aria-pressed',String(value));picker.setAttribute('aria-label',value?'Cancel inspection pick':'Inspect a presentation');picker.textContent=value&&pickerLabel==='Inspect a presentation'?'Cancel inspection pick':pickerLabel;document.documentElement.classList.toggle('goo-inspect-picking',value);};
+  root.GooInspection.setPickerLabel=label=>{pickerLabel=label||'Inspect a presentation';pick(picking);};
   const current=()=>selected?.isConnected && installed.has(selected);
   async function render() {
     if(!observation||panel.hidden)return;

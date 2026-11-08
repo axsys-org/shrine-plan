@@ -174,6 +174,76 @@ test('page tool views prepare on disclosure and use the shared action binding',a
   assert.equal(typeof context.saved,'function');
 });
 
+test('compact documents keep native content and embeds live while page controls prepare on disclosure',async()=>{
+  const host=composableHost(),main=new host.Element();
+  const manifest={root:'/page',epoch:'1',blocks:[
+    {target:'/page',view:'/header',kind:'presentation'},
+    {target:'/page/0',view:'/edit',kind:'prose'},
+    {key:'/page/1',target:'/flow',view:'/occurrence',kind:'ref',editor:false}
+  ],tools:[{target:'/source',view:'/source',kind:'presentation',label:'Source'}]};
+  await host.mount(main,manifest,async()=>manifest,async()=>{},{compact:true});
+  assert.deepEqual(host.loads.map(load=>load.target),['/page/0','/flow']);
+  const [body,inspector]=main.children,inspection=inspector.children[1];
+  const original=body.children[0];original.input.value='working prose';
+  inspector.open=true;await inspector.handlers.toggle();
+  assert.equal(body.children[0],original);assert.equal(original.input.value,'working prose');
+  assert.ok(host.loads.some(load=>load.target==='/page'));
+  assert.ok(!host.loads.some(load=>load.target==='/source'));
+  const source=inspection.children[1];source.open=true;source.handlers.toggle();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(host.contexts.get('/source').activate,undefined);
+  assert.equal(typeof host.contexts.get('/source').saved,'function');
+  await host.contexts.get('/page/0').activate({editCommand:'save'});
+  assert.equal(host.writes[0].captured.target,'/page/0');
+  assert.equal(host.writes[0].captured.value,'working prose');
+});
+
+test('closing compact inspection retains page-action drafts and still guards receiver replacement',async()=>{
+  const host=composableHost(),main=new host.Element();
+  const header={target:'/page',view:'/header',kind:'presentation'};
+  const manifest={root:'/page',epoch:'1',blocks:[header]};
+  const view=await host.mount(main,manifest,async()=>manifest,async()=>{},{compact:true});
+  const inspector=main.children[1];inspector.open=true;await inspector.handlers.toggle();
+  const frame=inspector.children[1].children[0];frame.input.value='unsubmitted action';
+  inspector.open=false;await inspector.handlers.toggle();
+  await view.update({...manifest,epoch:'2'});
+  assert.equal(frame.input.value,'unsubmitted action');assert.equal(view.dirty(),true);
+  await assert.rejects(view.update({...manifest,blocks:[]}),/unsaved draft/);
+});
+
+test('content-only documents omit wiki chrome while retaining native edits and authored embeds',async()=>{
+  const host=composableHost(),main=new host.Element();
+  const manifest={root:'/page',epoch:'8',blocks:[
+    {target:'/page',view:'/header',kind:'presentation'},
+    {target:'/page/0',view:'/edit',kind:'prose'},
+    {key:'/page/1',target:'/flow',view:'/occurrence',kind:'ref',editor:false}
+  ],tools:[{target:'/history',view:'/history',kind:'presentation',label:'History'}]};
+  const view=await host.mount(main,manifest,async()=>manifest,async()=>{},{compact:true,chrome:false});
+  assert.equal(main.children.length,1);assert.deepEqual(host.loads.map(load=>load.target),['/page/0','/flow']);
+  assert.equal(host.contexts.get('/flow').activate,undefined);
+  const prose=main.children[0].children[0];prose.input.value='draft';
+  await assert.rejects(view.update({...manifest,blocks:[]}),/unsaved draft/);
+  await host.contexts.get('/page/0').activate({editCommand:'save'});
+  assert.equal(host.writes[0].captured.target,'/page/0');assert.equal(host.writes[0].captured.value,'draft');
+  assert.equal(host.writes[0].args.find(([slot])=>slot==='/epoch')[1],'8');
+});
+
+test('closed tool views retain drafts without preparing at zero width and refresh on reopening',async()=>{
+  const host=composableHost(),main=new host.Element();
+  const manifest={root:'/page',epoch:'1',blocks:[],tools:[{target:'/source',view:'/source',kind:'presentation',label:'Source'}]};
+  const view=await host.mount(main,manifest,async()=>manifest);
+  const disclosure=main.children[0];disclosure.open=true;disclosure.handlers.toggle();
+  await new Promise(resolve=>setImmediate(resolve));
+  const frame=disclosure.children[1];frame.input.value='unsaved source';
+  disclosure.open=false;frame.clientWidth=0;
+  const before=host.loads.length;await view.update({...manifest,epoch:'2'});
+  assert.equal(host.loads.length,before);assert.equal(view.dirty(),true);
+  frame.clientWidth=390;disclosure.open=true;disclosure.handlers.toggle();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(host.loads.at(-1).selector.context.width,390);
+  assert.equal(frame.input.value,'unsaved source');
+});
+
 test('replacing an embedded receiver refuses before dropping its local input',async()=>{
   const host=composableHost(),main=new host.Element();
   const manifest={root:'/page',epoch:'1',blocks:[{key:'/page/0',target:'/old',view:'/declared',kind:'ref',editor:false}]};

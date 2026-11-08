@@ -1,0 +1,56 @@
+;;;; Native test execution and verdicts. The launcher owns processes, not checks.
+(#bind std (#module std))
+(#import std)
+(#bind reef (#module reef))
+(#import reef)
+(#bind render (#module foil-render))
+
+;; Results are ordinary rows: [status module name expected actual]. Progress is
+;; printed separately, so a start event cannot count as a completed check.
+(define (report status mod name want got)
+  (Seq (print ("TEST" status mod (strWeld "~:" name)
+                (strWeld "~:" want) (strWeld "~:" got)))
+    [status mod name want got]))
+
+(define (attempt render mod name body)
+  (Seq (report "start" mod name "" "")
+    (let ((outcome (Try (lambda (ignored)
+                         (let ((results (body 0))) (DeepSeq results results))) 0)))
+      (If (Eq 1 (Hd outcome))
+        [(report "error" mod name "completed case" (render (_0 outcome)))]
+        (If (Sz (_0 outcome)) (_0 outcome)
+          [(report "fail" mod name "at least one check" "empty case")])))))
+
+(define (exception value)
+  (render:render-plain value))
+
+;; Reaver entrypoints return exactly 1 on success; exceptions and other values
+;; fail this entry without preventing the next independent entry from running.
+(define (entry mod body)
+  (attempt exception mod "module"
+    (lambda (ignored)
+      (let ((value (body 0)))
+        [(report (If (Eq 1 value) "pass" "fail") mod "module"
+           "1" (If (Eq 1 value) "1" "entrypoint did not return 1"))]))))
+
+(define (passed results)
+  (And (Sz results) (all (lambda (r) (Equal "pass" (_0 r))) results)))
+
+;; Missing selected suites and an empty selection fail natively. Callers may
+;; compose results from several independently compiled publication contexts.
+(define (complete expected results)
+  (If (Sz expected)
+    (foldl (lambda (out mod)
+      (If (any (lambda (r) (Equal mod (_1 r))) out) out
+        (snoc (report "error" mod "suite" "selected suite results" "missing suite") out)))
+      results expected)
+    (snoc (report "fail" "selection" "suite" "at least one suite" "empty selection") results)))
+
+(define (finish expected results)
+  (define checked (complete expected results))
+  (DeepSeq checked
+    (let ((ok (passed checked)))
+      (Seq (print ("TEST-SUMMARY" ok (Sz checked)))
+        (Seq (print "TEST-RUN-DONE") ok)))))
+
+(#export report attempt exception entry passed complete finish)

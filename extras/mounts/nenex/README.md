@@ -64,10 +64,11 @@ The `cooperate` mount adds document-local agent runs through the MCP endpoint at
 `http://127.0.0.1:8131/mcp`. See the [harness interface and client](../cooperate/README.md)
 for captured context, branching traces and reusable results.
 
-Eden restores the same native world across server restarts. Page sources, cells,
+An explicit Eden snapshot restores the namespace across server restarts. Page sources, cells,
 holes, frozen work and namespace history are saved together before a write is
-acknowledged. `--world PATH` selects a world; `--ephemeral` creates a disposable
-one. This uses the runtime's existing snapshot store, with no Nenex save format.
+acknowledged. Use `--snapshot PATH` and repeat the mount selection to resume it;
+without this option the invocation is disposable. This uses the runtime's
+existing snapshot store, with no Nenex save format.
 
 ## Implementation
 

@@ -15,6 +15,15 @@ receiver guards, cells, holes and attempts are the same ones used by headless
 invocation. `/gov/flows/nenex` supplies the final writer and the captured draft
 writer; the latter applies Nenex's existing source/attachment protection.
 
+Interactive requests with captured evidence expose it as an ordinary frozen cell
+at `<request>/context`. Read `/x/<request>/context` to inspect the exact evidence
+given to that attempt, selecting branches and paging through children. The
+provider prompt carries this address instead of repeating the whole evidence
+tree. Later wiki edits and retries do not replace the earlier cell or its history.
+An admission rejected before a request was allocated has no such cell; inspect
+the occurrence's reason instead (`flow_prompt_limit` identifies oversized
+instructions).
+
 The vocabulary and authoring Grove units share this mount's publication owner.
 Public addresses and logical module names remain unchanged. Persistent flow
 contracts remain in `flows`, so installing document integration does not create

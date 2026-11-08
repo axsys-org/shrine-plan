@@ -36,9 +36,9 @@ x/eden --mount cooperate --compiler none --port 8131
 ```
 
 Add `--mount nenex` to work against wiki pages. The backend also works against
-ordinary existing records. Eden restores its existing native world, including
-journal/history, captures and compiled definitions. Use `--world PATH` for an
-explicit world or `--ephemeral` for a disposable test.
+ordinary existing records. Use `--snapshot PATH` to retain journal/history,
+captures and compiled definitions in an explicit native arena, and repeat the
+mount selection to resume it. The default invocation is disposable.
 
 ## Operations
 

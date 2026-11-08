@@ -1,4 +1,4 @@
-"""Boot, write, stop, boot, read: a world kept with `x/eden --world DIR` resumes with its records.
+"""Boot, write, stop, boot, read: `x/eden --snapshot DIR` resumes native records.
 
 Unlike the other tests here this one boots its own worlds (two of them, one after the other, never two at
 once), so it needs the checkout and a runtime, not a running world:
@@ -38,7 +38,7 @@ class World:
 
     def boot(self):
         command = [sys.executable, str(ROOT / 'x/eden'), '--mount', 'mcp', '--mount', 'probe',
-                   '--extras-root', str(self.extras), '--port', str(self.port), '--world', str(self.directory)]
+                   '--extras-root', str(self.extras), '--port', str(self.port), '--snapshot', str(self.directory)]
         env = dict(os.environ, _EDEN_NIX_ROOT=str(ROOT))
         t0 = time.perf_counter()
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, env=env, text=True)
@@ -97,8 +97,7 @@ class World:
         return self.tool('write', records=records, who='resume-test')
 
     def pack(self):
-        # The snapshot the runtime keeps: one arena.dat since the 2026-10 enki, data.mdb and pins.pack before it.
-        return sum(f.stat().st_size for f in (self.directory / 'snap').iterdir() if f.is_file())
+        return (self.directory / 'arena.dat').stat().st_size
 
 
 def check(port, directory, timeout, count=20, node='0x11'):
@@ -132,7 +131,6 @@ def check(port, directory, timeout, count=20, node='0x11'):
         cell = world.write([{'path': '/user/views/kept', 'slots': {'sys/weft': weft, 'sys/tack': tack}}])
         epoch_before = cell['epoch']
         expect('writes before the stop land', world.read('/user/keep/r3')['properties'].get('/n'), '3')
-        expect('the launcher says this world is kept', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         expect('a cell counts the folder before the stop', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
         scanned = int(world.read('/io/fs/mcp')['properties'].get('/sys/epoch') or 0)
         world.stop()
@@ -140,15 +138,14 @@ def check(port, directory, timeout, count=20, node='0x11'):
         resume = world.boot()
         print(f'resume: {resume:.1f} s', flush=True)
         expect('the records are back after the reboot', world.read('/user/keep/r3')['properties'].get('/n'), '3')
-        expect('the resume scanned the mounts again', int(world.read('/io/fs/mcp')['properties'].get('/sys/epoch') or 0), scanned + 1)
+        expect('restart preserves the published program capture', int(world.read('/io/fs/mcp')['properties'].get('/sys/epoch') or 0), scanned)
         expect('the batch is back', world.read('/user/keep/b99')['properties'].get('/n'), '99')
         expect('the cell still counts every record', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '121')
-        expect('the world record is written again on resume', world.read('/agent/launcher/world')['properties'].get('/kept'), 'true')
         history = world.tool('history', after=epoch_before - 1)
         expect('history continues from the saved epoch', history['events'][0]['epoch'], epoch_before)
-        # the remount is a few events of its own (a scan, a batch and a status per mount), all under /io/fs
+        # Reconnect retires stale HTTP connections and installs the current port.
         resumed_at = json.loads(world.get(f'/probe/read?path=/{node}'))['epoch']
-        expect('the remount spent its events on the mounts, nothing else', (resumed_at > epoch_before, all(t.startswith(f'/{node}/io/fs') or t == f'/{node}' or t == f'/{node}/io' for e in world.tool('history', after=epoch_before)['events'] for t in e['touched'])), (True, True))
+        expect('reconnect only changes process I/O records', (resumed_at >= epoch_before, all(t.startswith(f'/{node}/io/http') or t == f'/{node}' or t == f'/{node}/io' for e in world.tool('history', after=epoch_before)['events'] for t in e['touched'])), (True, True))
         after = world.write([{'path': '/user/keep/again', 'slots': {'n': 1}}])
         expect('the next epoch continues the count', after['epoch'], resumed_at + 1)
         expect('the cell is live after the resume', world.read(f'/x/{node}/user/views/kept', 'x')['properties'].get('/count'), '122')
@@ -163,9 +160,7 @@ def check(port, directory, timeout, count=20, node='0x11'):
     finally:
         world.stop()
         log.close()
-    # A kept directory that saw nothing but its boot still resumes: the launcher's own world record is the
-    # first event of every kept world, so the saved root is never the boot repl. (The launcher keeps its probe
-    # for a directory whose boot was cut before that write.)
+    # Startup commits the native root even before an external admission arrives.
     empty = directory.parent / (directory.name + '-empty')
     log2 = (directory.parent / (empty.name + '.log')).open('w')
     world = World(empty, port, log2, timeout)
@@ -174,13 +169,12 @@ def check(port, directory, timeout, count=20, node='0x11'):
         world.stop()
         world.boot()
         expect('a kept world that saw only its boot resumes', world.read('/weft/stdlib/count')['exists'], True)
-        expect('and the launcher said so', 'Resuming the world kept in' in Path(log2.name).read_text(), True)
+        expect('and the launcher said so', 'Resuming Eden snapshot:' in Path(log2.name).read_text(), True)
     finally:
         world.stop()
         log2.close()
-    # A resumed world runs the mounts as the checkout has them now: a change to a mount's code between the stop
-    # and the resume is published on the resume, and its routes serve it. The mounts are copied so the change
-    # touches nothing in the checkout.
+    # Reconnection serves the captured route implementation. Changing host source
+    # is not an implicit replacement of that service. Use disposable source bags.
     extras = directory.parent / (directory.name + '-extras')
     for name in ('mcp', 'probe'):
         shutil.copytree(ROOT / 'extras/mounts' / name, extras / 'mounts' / name)
@@ -195,7 +189,7 @@ def check(port, directory, timeout, count=20, node='0x11'):
         source = extras / 'mounts/probe/probe.foil'
         source.write_text(source.read_text().replace('(http_driver/response 200 "ok")', '(http_driver/response 200 "ok again")'))
         world.boot()
-        expect('a mount changed between the stop and the resume serves its new code', world.get(f'/probe/ok?path=/{node}'), 'ok again')
+        expect('restart retains the captured route despite changed host source', world.get(f'/probe/ok?path=/{node}'), 'ok')
         expect('over the records as they were saved', world.read('/user/keep/one')['properties'].get('/n'), '1')
     finally:
         world.stop()
@@ -207,13 +201,17 @@ def check(port, directory, timeout, count=20, node='0x11'):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--port', type=int, default=8450)
-    parser.add_argument('--world', type=Path, help='the directory to keep the world in (default: a fresh temporary one)')
+    parser.add_argument('--snapshot', type=Path, help='a new native snapshot directory (default: disposable)')
     parser.add_argument('--timeout', type=int, default=600)
     args = parser.parse_args()
-    directory = args.world.resolve() if args.world else Path(tempfile.mkdtemp(prefix='shrine-resume-'))
-    if directory.exists() and any(directory.iterdir()):
-        raise SystemExit(f'{directory} is not empty; the test wants a fresh directory')
-    check(args.port, directory, args.timeout)
+    if args.snapshot:
+        directory = args.snapshot.resolve()
+        if directory.exists():
+            raise SystemExit(f'{directory} exists; the test wants a new snapshot directory')
+        check(args.port, directory, args.timeout)
+    else:
+        with tempfile.TemporaryDirectory(prefix='shrine-resume-') as temporary:
+            check(args.port, Path(temporary) / 'snap', args.timeout)
     return 0
 
 

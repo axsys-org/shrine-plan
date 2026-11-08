@@ -27,7 +27,7 @@ Pass the printed directory to the standard Eden launcher:
 
 ```sh
 nix develop .#eden --command python3 x/eden --mount tree-pages \
-  --extras-root /tmp/goo-tree-fixture-REPLACE --port 8094
+  --extras-root /tmp/goo-tree-fixture-REPLACE --ephemeral --port 8094
 node extras/mounts/explorer/scripts/check-tree-browser.mjs \
   http://127.0.0.1:8094 /path/to/mash /tmp/goo-tree-results
 ```

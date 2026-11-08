@@ -1,8 +1,4 @@
-"""Crash/restart regression against the real native world, not a JSON export.
-
-Set WISP and run this file. EDEN_TEST_WORLD may reuse a disposable test world
-to avoid recompiling the initial mount publication. Never select a personal world.
-"""
+"""Crash/restart regressions in disposable native snapshots. Set WISP to run."""
 import fcntl
 import json
 import os
@@ -25,7 +21,7 @@ api = runpy.run_path(str(ROOT / 'extras/mounts/flows/tests/client.py'))
 
 
 @unittest.skipUnless(os.environ.get('WISP'), 'Set WISP for the native crash test')
-class NativeWorldTest(unittest.TestCase):
+class NativeSnapshotTest(unittest.TestCase):
     def test_startup_preflight_failure_preserves_saved_root(self):
         """Real mounted restart: failed route preparation must not checkpoint.
 
@@ -40,10 +36,20 @@ class NativeWorldTest(unittest.TestCase):
                 version=1, name='contract', dependencies=[],
                 modules={'startup_contract': 'main.foil'},
                 roots=[['lib', 'startup_contract']], routes=['/contract'],
+                host='host.py', start=dict(module='startup_contract', entry=['startup_contract', 'start']),
                 http=dict(module='startup_contract', entry=['startup_contract', 'http']))))
+            (bag / 'host.py').write_text('''import os
+def prepare(root, work, check, cleanup, context):
+    return root, [os.environ['EDEN_TEST_SESSION']]
+''')
             module = bag / 'main.foil'
             module.write_text('''- http_foot
 + startup_contract
+  + start
+    \\ server=nat arguments=row[str]
+    ^ nat
+    ; (Print (str/cat_all ["SESSION-HOOK " arguments.at(0) (str/from_atom 10)]))
+    server
   + http
     \\ files=row[[str nat]] state=namespace
     ^ http_foot/config
@@ -55,10 +61,11 @@ class NativeWorldTest(unittest.TestCase):
         | ./reply (http_driver/response 200 (str/cat_all ["captured:" (nat/show port)]))
     | http_foot/add_routes [(http_foot/route "/contract" request)] http_foot/empty
 ''')
-            world = work / 'world'
+            snapshot = work / 'snap'
             runtime = os.environ['WISP']
             inspector = Path(runtime).resolve().parent / 'scry'
             process = None
+            hook_sessions = []
 
             def free_port():
                 with socket.socket() as sock:
@@ -70,25 +77,24 @@ class NativeWorldTest(unittest.TestCase):
                     process.terminate()
                     process.wait(timeout=20)
 
-            def launch(port, fail=False):
+            def launch(port, fail=False, selection=None):
                 nonlocal process
-                log = world / 'out.log'
-                offset = log.stat().st_size if log.exists() else 0
                 output = work / ('launcher-' + str(port) + '.log')
+                hook_session = uuid.uuid4().hex
                 with output.open('w') as stream:
                     process = subprocess.Popen([sys.executable, str(ROOT / 'x/eden'),
-                        '--world', str(world), '--extras-root', str(work / 'extras'),
-                        '--mount', 'contract', '--compiler', 'P1', '--port', str(port),
+                        '--snapshot', str(snapshot), '--extras-root', str(work / 'extras'),
+                        *(['--mount', 'contract'] if selection is None else selection), '--compiler', 'P1', '--port', str(port),
                         '--startup-timeout', '900'],
-                        env=dict(os.environ, _EDEN_NIX_ROOT=str(ROOT)),
+                        env=dict(os.environ, _EDEN_NIX_ROOT=str(ROOT), EDEN_TEST_SESSION=hook_session),
                         stdout=stream, stderr=stream)
                 deadline = time.monotonic() + 900
                 last_probe_error = None
                 while time.monotonic() < deadline:
-                    text = log.read_text(errors='replace')[offset:] if log.exists() else ''
+                    text = output.read_text(errors='replace')
                     if fail and process.poll() is not None:
                         self.assertNotEqual(process.returncode, 0, text[-4000:])
-                        self.assertIn('startup-contract-route-failure', text)
+                        self.assertIn('startup-contract-route-failure' if selection is None else 'Snapshot mount descriptor', text)
                         return
                     self.assertIsNone(process.poll(), text[-4000:] + output.read_text()[-1000:])
                     if not fail and 'Eden: http://' in output.read_text(errors='replace'):
@@ -108,17 +114,27 @@ class NativeWorldTest(unittest.TestCase):
                             last_probe_error = error
                         else:
                             self.assertEqual(body, 'captured:' + str(port))
+                            native_log = Path(re.search(r'\. Log: (.+)', text).group(1)).read_text(errors='replace')
+                            self.assertIn('SESSION-HOOK ' + hook_session, native_log)
+                            for old in hook_sessions:
+                                self.assertNotIn('SESSION-HOOK ' + old, native_log)
+                            hook_sessions.append(hook_session)
                             return
                     time.sleep(.1)
-                self.fail(f'Startup timed out: {log}; last HTTP probe: {last_probe_error}')
+                self.fail(f'Startup timed out: {output}; last HTTP probe: {last_probe_error}')
 
             def root_hash():
-                return subprocess.check_output([str(inspector), str(world / 'snap'), 'root'], text=True)
+                return subprocess.check_output([str(inspector), str(snapshot), 'root'], text=True)
 
             try:
                 launch(free_port())
                 stop()
                 retained = root_hash()
+                self.assertFalse((snapshot / 'world.json').exists())
+                self.assertFalse((snapshot / 'src').exists())
+                self.assertFalse((snapshot / 'world.lock').exists())
+                launch(free_port(), fail=True, selection=[])
+                self.assertEqual(root_hash(), retained)
                 # Neither changed host bytes nor a failed reconnect may rewrite
                 # the saved program or any namespace/history reachable from it.
                 module.write_text('+ deliberately_invalid_host_replacement unknown_name\n')
@@ -126,7 +142,7 @@ class NativeWorldTest(unittest.TestCase):
                 self.assertEqual(root_hash(), retained)
                 launch(free_port())
                 stop()
-                print('Startup preflight failure retained the exact native root; captured-service retry passed.')
+                print('Native snapshot alone resumed; selection and startup failures retained its exact root.')
             finally:
                 stop()
 
@@ -174,23 +190,26 @@ class NativeWorldTest(unittest.TestCase):
 
     def test_unresolved_flow_and_completed_history_survive_crash(self):
         with tempfile.TemporaryDirectory(prefix='eden-restart-') as temporary:
-            world = Path(os.environ.get('EDEN_TEST_WORLD', temporary + '/world'))
+            snapshot = Path(temporary) / 'snap'
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
                 port = sock.getsockname()[1]
             client = api['FlowClient']('http://127.0.0.1:' + str(port), timeout=120)
             process = None
             log = open(temporary + '/launcher.log', 'w+')
+            # One startup deadline for the test and launcher. Use the normal
+            # compiler tier; HTTP and shutdown keep their shorter deadlines.
+            startup_timeout = 900
 
             def start():
                 nonlocal process
                 offset = log.seek(0, os.SEEK_END)
                 env = dict(os.environ, _EDEN_NIX_ROOT=str(ROOT))
-                selection = [] if (world / 'world.json').exists() else ['--mount', 'flow-authoring']
                 process = subprocess.Popen([sys.executable, str(ROOT / 'x/eden'),
-                    '--world', str(world), *selection, '--compiler', 'P1', '--port', str(port)], env=env, stdout=log, stderr=log,
+                    '--snapshot', str(snapshot), '--mount', 'flow-authoring', '--port', str(port),
+                    '--startup-timeout', str(startup_timeout)], env=env, stdout=log, stderr=log,
                     start_new_session=True)
-                deadline = time.monotonic() + 900
+                deadline = time.monotonic() + startup_timeout
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
                         log.seek(0)
@@ -205,23 +224,23 @@ class NativeWorldTest(unittest.TestCase):
                             return
                     except OSError:
                         time.sleep(.2)
-                self.fail('World did not become ready: ' + str(world / 'out.log'))
+                self.fail('Snapshot did not become ready:\n' + Path(temporary + '/launcher.log').read_text(errors='replace')[-6000:])
 
             def crash():
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
                 # Waiting for the launcher does not reap its killed runtime.
-                # That process intentionally inherits world.lock; wait for its
-                # kernel cleanup before asking a new launcher to take the lock.
+                # The native store owns writer exclusion. Wait for the killed
+                # runtime to release it; there is no second launcher lock.
                 deadline = time.monotonic() + 10
-                with (world / 'world.lock').open('a') as lock:
+                with (snapshot / 'arena.writer.lock').open('a') as lock:
                     while True:
                         try:
                             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
                         except BlockingIOError:
                             if time.monotonic() > deadline:
-                                self.fail('Crashed runtime did not release world.lock')
+                                self.fail('Crashed runtime did not release its native writer lock')
                             time.sleep(.02)
 
             name = 'restart_contract_' + uuid.uuid4().hex[:8]
@@ -231,6 +250,14 @@ class NativeWorldTest(unittest.TestCase):
             request = controller + '/work/revision_1'
             hole = output + '/holes/' + name + '/concepts'
             recipe = (ROOT / 'extras/mounts/flow-examples/examples/evidence_resume.semidoc').read_text()
+            def source_record(path):
+                # Persistence concerns the native authored record. A rendered
+                # Goo input is a separate projection with its own UI checks.
+                record = client.read(path, care='x')
+                self.assertTrue(record['exists'], path)
+                source = record['properties']['/src']
+                self.assertIsInstance(source, str)
+                return source
             def values(value):
                 # Historical read projections intentionally omit the transport
                 # handle for opaque code. Execution below checks its behavior.
@@ -250,7 +277,7 @@ class NativeWorldTest(unittest.TestCase):
                 start()
                 sources = client.import_texts({'readiness': 'Captured evidence before the crash. GATE_OPEN\n'})
                 client.author(page, recipe)
-                self.assertEqual(recipe, client.source(page))
+                self.assertEqual(recipe, source_record(page))
                 definition = client.publish(page, 'evidence_resume')
                 client.follow(controller, definition, output, {'sources': sources})
                 # The acknowledgement is the durability boundary. No graceful
@@ -264,12 +291,12 @@ class NativeWorldTest(unittest.TestCase):
                 client.tool('write', records=[{'path': page + '/notes', 'slots': {'text': marker}}])
                 crash()
                 start()
-                self.assertEqual(recipe, client.source(page))
+                self.assertEqual(recipe, source_record(page))
                 self.assertEqual(marker, client.read(page + '/notes', care='x')['properties']['/text'])
-                locked = subprocess.run([sys.executable, str(ROOT / 'x/eden'), '--world', str(world)],
+                locked = subprocess.run([sys.executable, str(ROOT / 'x/eden'), '--snapshot', str(snapshot), '--mount', 'flow-authoring'],
                     env=dict(os.environ, _EDEN_NIX_ROOT=str(ROOT)), capture_output=True, text=True, timeout=20)
                 self.assertNotEqual(0, locked.returncode)
-                self.assertIn('already running', locked.stderr)
+                self.assertIn('already has a writer', locked.stderr)
                 for p, before in saved.items():
                     self.assertTrue(before['exists'], p)
                     after = client.read(p, care='x')
@@ -290,16 +317,26 @@ class NativeWorldTest(unittest.TestCase):
                 completed = client.read(request, care='x')
                 crash()
                 start()
-                self.assertIn('Captured evidence survived.', client.source(output))
+                self.assertIn('Captured evidence survived.', source_record(output))
                 self.assertEqual(published['reference'], client.read(output, care='x')['reference'])
                 self.assertEqual(completed['properties'], client.read(request, care='x')['properties'])
                 self.assertEqual('resolved', client.read(hole, care='x')['properties']['/work/status'])
+            except BaseException:
+                # Keep the failed native arena and launch receipt, not an export.
+                # Stop its writer before retaining the disposable fixture.
+                import shutil
+                if process is not None and process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=20)
+                failure = Path(tempfile.mkdtemp(prefix='snapshot-restart-failure-', dir=ROOT / '.check'))
+                shutil.copytree(temporary, failure, dirs_exist_ok=True)
+                print('Failed native restart fixture retained at ' + str(failure), flush=True)
+                raise
             finally:
                 if process is not None and process.poll() is None:
                     os.killpg(process.pid, signal.SIGTERM)
                     process.wait(timeout=20)
                 log.flush()
-                (world / 'restart-test-launcher.log').write_text(Path(temporary + '/launcher.log').read_text(errors='replace'))
                 log.close()
 
 

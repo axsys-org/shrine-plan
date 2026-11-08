@@ -1,9 +1,9 @@
-# Setup: one durable world
+# Setup: native snapshots
 
-From the checkout, with Nix on `PATH`, create a world at an explicit directory:
+From the checkout, with Nix on `PATH`, choose an explicit native snapshot directory:
 
 ```sh
-python3 x/eden --world "$HOME/.local/share/shrine/worlds/lab" \
+python3 x/eden --snapshot "$PWD/.check/lab/snap" \
   --mount flow-authoring --extras-root "$PWD/extras" --port 8300
 ```
 
@@ -25,35 +25,38 @@ include `--mount inspector` when creating the world, then open
 [`/live?views=/0x11/user`](http://127.0.0.1:8300/live?views=/0x11/user).
 It is separate from the declared Goo document and namespace views. Selecting
 `mcp` or `flows` alone does not install `/live`; direct native MCP operations
-remain usable without that interface. Existing saved worlds retain their recorded
-mount selection; adding this flag is not an in-place interface upgrade.
+remain usable without that interface. The native root captures its mount contracts;
+adding this flag on restart is not an in-place interface upgrade.
 
 Use another free port and a different directory for a separate world. A world
-directory is exclusively locked while running. Compilation and retained arenas
+snapshot is exclusively locked by the runtime while running. Compilation and retained arenas
 can require substantial memory and disk; do not use an occupied live directory
 for a disposable check.
 
 ## Resume the same world
 
-Stop with Ctrl-C. Resume with the same directory and node:
+Stop with Ctrl-C. Resume with the same snapshot, node and mount selection:
 
 ```sh
-python3 x/eden --world "$HOME/.local/share/shrine/worlds/lab" --port 8300
+python3 x/eden --snapshot "$PWD/.check/lab/snap" \
+  --mount flow-authoring --extras-root "$PWD/extras" --port 8300
 ```
 
 The native saved continuation retains records, x/y/z history, cells, work,
 holes and captured definitions. Admission saves changed state before
 acknowledgement. The launcher reconnects process resources; it does not replay
 an export, replace the retained service/compiler, or upgrade old core types.
-Restoring uses the world's recorded mount selection and source locations.
+Supply mount selection and source locations explicitly on each launch. The
+native root checks the node and mount descriptors before any new commit.
 Behavior publication follows the explicit contracts described in the harness
 guide. A checkout update alone is not a saved-core upgrade.
 
-For the smaller MCP/probe/explorer selection, `python3 x/setup --world DIR`
-wraps this same launcher. It remembers the directory and port in `.shrine.json`;
-`python3 x/setup` resumes that selection. Use `x/eden` to select a document
-world at creation. `--ephemeral` and `--check` are explicitly disposable modes
-and cannot be combined with `--world`.
+For the smaller MCP/probe/explorer selection, `python3 x/setup --snapshot DIR`
+wraps this same launcher. Neither launcher remembers directories or settings.
+Without `--snapshot`, the run is disposable. `--ephemeral` explicitly selects
+that default; `--check` validates a disposable run. Both reject `--snapshot`.
+Only the native arena and its lock files persist at the selected path; temporary
+source copies, host credentials and launch logs are cleaned up when the process exits.
 
 ## Connect an agent
 

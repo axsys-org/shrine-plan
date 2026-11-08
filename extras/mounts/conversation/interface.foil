@@ -4,20 +4,135 @@
 ' Read-only conversation arrangement. All writes use declared Goo actions;
 ' all message bodies are the existing Nenex document projection.
 + conversation_ui
+  + current_requests
+    \ record=myth
+    ^ row[path]
+    ?> subscriptions=cpail record.pail_at(crew_slot) []
+    | subscriptions.crew.tap.bind
+      \ entry
+      ? !(and (eq entry.key.len 2) (eq_iota entry.key.at(0) 'request)) []
+      | [entry.val.p]
+  + needs_input
+    \ why=iota
+    ^ bool
+    | row/has[iota] why ['conversation_unresolved 'flow_revision_unresolved]
+  + request_status
+    ' Presentation of the selected native attempt and its worker. A settled
+    ' attempt marked waiting may be a validation failure, not a request for input.
+    \ target=path provider=bool state=namespace
+    ^ [str str]
+    = request=myth (cooperate_ops/record target state).fall(myth/new)
+      worker=myth (cooperate_ops/record target.snoc('worker) state).fall(myth/new)
+      reason=str request.txt_at(system_vocabulary/content)
+    ?> activity=native_work/activity request.pail_at(['work 'activity]) ["blocked" "Current request is unavailable."]
+    ? request.pail_at(['flow 'refused])
+     > why=pails/q
+      ? !(conversation_ui/needs_input why.q) ["blocked" reason]
+      = note=str
+          ?> outcome=native_work/outcome worker.pail_at(['work 'outcome]) ""
+          ?> (./ok pair) (flow_work_ops/decode outcome.text) ""
+          pair.at(1)
+      | ["waiting" (? note.len note "More input or evidence is needed.")]
+    ? (eq activity.status "complete") ["complete" ""]
+    ? request.pail_at(['work 'request])
+     > receipt=native_work/request
+      ? !(equal[pail] receipt worker.pail_at(['work 'request])) ["blocked" "Current provider worker is unavailable or belongs to different work."]
+      ? worker.pail_at(['work 'outcome])
+       > outcome=native_work/outcome
+        ? !(eq outcome.status "complete") ["blocked" "The provider failed. Open work and trace for the retained result."]
+        | ["working" "Checking the provider result."]
+      ? (native_work_ops/active worker) ["working" "The native provider is working."]
+      ? (eq worker.txt_at(['work 'status]) "waiting") ["waiting" "The provider is waiting for input."]
+      | ["blocked" "The provider stopped before completing this request."]
+    ? (native_work_ops/active request)
+      ? (provider || request.has(['work 'provider])) ["working" "Preparing native provider work."]
+      | ["waiting" "A revision or input is needed to continue."]
+    ? (eq activity.status "waiting") ["waiting" reason]
+    | ["blocked" reason]
+  + status
+    ' Read only current crew-selected requests, never the retained work subtree.
+    ' This is a projection of native state: no saved UI phase, timer or transition.
+    \ record=myth state=namespace
+    ^ [str str]
+    = reason=str record.txt_at(system_vocabulary/content)
+    ?> progress=flow_maintenance/progress record.pail_at(['flow 'progress]) ["blocked" "Native flow work is unavailable."]
+    ? !(progress.enabled) ["paused" reason]
+    = fault=bool
+        ?> (./some why) progress.reason .false
+        | !(conversation_ui/needs_input why)
+    ? fault ["blocked" reason]
+    ? (and progress.observed.is_none (eq record.txt_at(['work 'status]) "blocked")) ["blocked" reason]
+    = provider=bool
+        ?> config=flow_maintenance/config record.pail_at(['flow 'config]) .false
+        | !(config.provider.is_none)
+      requests=row[[str str]]
+        | (conversation_ui/current_requests record).map((\ target=path (conversation_ui/request_status target provider state)))
+      fallback=[str str]
+        ? !(progress.reason.is_none) ["waiting" "More input or evidence is needed."]
+        ? (eq record.txt_at(['work 'status]) "blocked")
+          ? requests.len ["working" "Finishing native work."]
+          | ["blocked" reason]
+        ? (gt progress.generation 0) ["watching" "Watching for evidence changes."]
+        | ["working" "Preparing the response flow."]
+    % priorities=row[str] ["blocked" "working" "waiting"]
+    ^ [str str]
+    ?> (./some pair) priorities.pull fallback
+    = [kind rest] pair
+      selected=row[[str str]] requests.keep((\ item=[str str] (eq item.at(0) kind)))
+    ? selected.len selected.at(0)
+    | _ rest
+  + status_label
+    \ status=str
+    ^ str
+    ? (eq status "working") "Working"
+    ? (eq status "waiting") "Waiting for input"
+    ? (eq status "paused") "Paused"
+    ? (eq status "watching") "Watching for changes"
+    "Blocked"
   + reference_path
     \ slot=path record=myth
     ^ path
     ?> reference=safe record.pail_at(slot) []
     reference.path
+  + input_view
+    \ controller=path state=namespace
+    ^ json
+    = record (cooperate_ops/record controller state).fall(myth/new)
+      enabled=bool
+        ?> progress=flow_maintenance/progress record.pail_at(['flow 'progress]) .false
+        | progress.enabled
+      blocks=row[json]
+        ? !enabled []
+        | (conversation_ui/current_requests record).bind
+          \ target=path
+          ? !(conversation_ops/unresolved (cooperate_ops/record target state).fall(myth/new)) []
+          | [(nenex_editor_http/presentation target [state.self 'gov 'conversation 'answer_input] "" .false)]
+    | json/obj [(jkv "root" (json/str (path_show controller))) (jkv "blocks" (json/arr blocks)) (jkv "tools" (json/arr []))]
+  + inputs
+    \ controller=path state=namespace
+    ^ [nat str]
+    | [200 (show (conversation_ui/input_view controller state))]
+  + clarification
+    \ state=namespace entry=[path myth]
+    ^ json
+    = [id record] entry
+      message (conversation_ui/reference_path ['chat 'message] record)
+    | json/obj [(jkv "message" (json/str (path_show message)))
+        (jkv "version" (json/str (nat/show state.case(.z message).fall(0))))
+        (jkv "sequence" (json/num .false record.nat_at(['chat 'sequence] 0)))]
   + turn
     \ state=namespace entry=[path myth]
     ^ json
     = [id turn] entry
       message (conversation_ui/reference_path ['chat 'message] turn)
       reply (conversation_ui/reference_path ['chat 'reply] turn)
-      controller turn.path_at(['chat 'controller]).fall([])
+      controller=path turn.path_at(['chat 'controller]).fall([])
       record (cooperate_ops/record controller state).fall(myth/new)
       response (cooperate_ops/record reply state).fall(myth/new)
+      [status reason] (conversation_ui/status record state)
+      page=path controller.take(controller.len.dec.dec)
+      receipts=path (row/weld[iota] (row/weld[iota] page ['conversation 'turns]) (row/snoc[iota] 'clarifications id))
+      answers (sovereign_care .y receipts state).tap.map((conversation_ui/clarification state))
     | json/obj [(jkv "id" (json/str (path_show id)))
         (jkv "sequence" (json/num .false turn.nat_at(['chat 'sequence] 0)))
         (jkv "message" (json/str (path_show message))) (jkv "reply" (json/str (path_show reply)))
@@ -25,8 +140,12 @@
         (jkv "messageVersion" (json/str (nat/show state.case(.z message).fall(0))))
         (jkv "replyVersion" (json/str (nat/show state.case(.z reply).fall(0))))
         (jkv "workVersion" (json/str (nat/show state.case(.z controller).fall(0))))
-        (jkv "status" (json/str record.txt_at(['work 'status])))
-        (jkv "reason" (json/str record.txt_at(system_vocabulary/content)))
+        (jkv "status" (json/str status)) (jkv "statusLabel" (json/str (conversation_ui/status_label status)))
+        (jkv "reason" (json/str reason))
+        (jkv "controllerStatus" (json/str record.txt_at(['work 'status])))
+        (jkv "controllerReason" (json/str record.txt_at(system_vocabulary/content)))
+        (jkv "input" (conversation_ui/input_view controller state))
+        (jkv "clarifications" (json/arr answers))
         (jkv "controller" (json/str (path_show controller)))]
   + manifest
     \ page=path state=namespace
@@ -47,14 +166,13 @@
       attributes [(weft/att "id" "conversation") (weft/att "data-page" (str/to_atom page.run(path_show).fall("")))
         (weft/att "data-create" (str/to_atom (path_show app)))
         (weft/att "data-vocabulary" (str/to_atom (path_show [self 'gov 'conversation])))]
-      navigation (weft/el "nav" [(weft/cls "conversation-nav")] [
-        (weft/el "a" [(weft/href "/nenex")] [(weft/tx "Nenex")])
-        (weft/el "a" [(weft/href "/conversation")] [(weft/tx "New conversation")])
-        (weft/el "a" [(weft/att "id" "conversation-wiki") (weft/href "/nenex")] [(weft/tx "Conversation wiki")])])
-      body [navigation (weft/el "main" attributes [
-        (weft/el "div" [(weft/att "id" "conversation-notice") (weft/att "role" "status")] [])
-        (weft/el "section" [(weft/att "id" "conversation-turns") (weft/att "aria-label" "Conversation")] [])
-        (weft/el "section" [(weft/att "id" "conversation-composer") (weft/att "aria-label" "Composer")] [])])]
+      body [(weft/el "main" attributes [
+        (weft/el "div" [(weft/att "id" "conversation-history") (weft/att "tabindex" "0") (weft/att "aria-label" "Conversation history")] [
+          (weft/el "section" [(weft/att "id" "conversation-turns") (weft/att "aria-label" "Messages")] [])])
+        (weft/el "footer" [(weft/cls "conversation-dock")] [
+          (weft/el "button" [(weft/att "id" "conversation-latest") (weft/att "type" "button") (weft/att "hidden" "hidden")] [(weft/tx "Jump to latest ↓")])
+          (weft/el "div" [(weft/att "id" "conversation-notice") (weft/att "role" "status")] [])
+          (weft/el "section" [(weft/att "id" "conversation-composer") (weft/att "aria-label" "Composer")] [])])])]
       assets (goo_browser/presentation_assets).weld([
         (weft/el "link" [(weft/att "rel" "stylesheet") (weft/att "href" "/conversation/style.css")] [])
         (weft/el "script" [(weft/att "src" "/static/goo-document.js") (weft/att "defer" "defer")] [])
@@ -93,7 +211,7 @@
           ? !(matches.len) (./reply (http_driver/response 404 "Asset unavailable"))
           = [key bytes] matches.at(0)
           | ./bytes 200 bytes (? (eq name "app.js") "application/javascript" "text/css")
-        ? !(row/has[str] route ["/conversation" "/conversation/" "/conversation/manifest" "/conversation/work"]) (./reply (http_driver/response 404 "Not found"))
+        ? !(row/has[str] route ["/conversation" "/conversation/" "/conversation/manifest" "/conversation/work" "/conversation/inputs"]) (./reply (http_driver/response 404 "Not found"))
         = query=str (? (eq parts.len 2) parts.at(1) "")
         ?> (./ok fields) (Try[str row[[str str]]] http_foot/fields query) (./reply (http_driver/response 400 "Invalid query"))
         = fields=row[[str str]] (? query.len fields [])
@@ -101,9 +219,12 @@
         = text (http_foot/field "path" fields)
           selected=maybe[path] (? text.len (browser_routes/value_path text) .none)
         ? (and text.len selected.is_none) (./reply (http_driver/response 400 "Invalid page path"))
-        ? ((eq route "/conversation/manifest") || (eq route "/conversation/work"))
+        ? (row/has[str] route ["/conversation/manifest" "/conversation/work" "/conversation/inputs"])
           ?> (./some page) selected (./reply (http_driver/response 400 "Choose a conversation"))
-          = read (? (eq route "/conversation/work") (conversation_ui/work page) (conversation_ui/manifest page))
+          = read={\ namespace}[nat str]
+              ? (eq route "/conversation/work") (conversation_ui/work page)
+              ? (eq route "/conversation/inputs") (conversation_ui/inputs page)
+              | conversation_ui/manifest page
           | ./after read
             \ status=nat text=str
             | ./bytes status (http_foot/bar (str/to_atom text)) "application/json; charset=utf-8"

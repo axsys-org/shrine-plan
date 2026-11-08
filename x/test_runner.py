@@ -1,4 +1,4 @@
-"""Inventory-driven Reaver, Foil and doctest gate (stdlib Python only)."""
+"""Launch isolated native test workers; Reaver/Foil execute and judge checks."""
 import argparse
 import concurrent.futures
 import fcntl
@@ -20,6 +20,7 @@ ATOM = r'("(?:[^"\\]|\\.|"")*"|[0-9]+)'
 EVENT = re.compile(r'^\("TEST"\s+' + r'\s+'.join([ATOM] * 5) + r'\s*\)', re.M)
 ERROR = re.compile(r'^\("ERROR"|Assertion .* failed|arena exhausted|deadlock', re.M)
 DONE = '"TEST-RUN-DONE"'
+SUMMARY = re.compile(r'^\("TEST-SUMMARY"\s+([01])\s+' + ATOM + r'\s*\)$', re.M)
 
 
 def decode_atom(token):
@@ -31,12 +32,20 @@ def decode_atom(token):
     return value.to_bytes((value.bit_length() + 7) // 8, 'little').decode('utf-8', 'replace')
 
 
+def decode_nat(token):
+    # The printer also spells a numeric count as a cord when its bytes are
+    # printable: 66 prints as "B", and 49 as "1" (not the decimal count 1).
+    if token.startswith('"'):
+        return int.from_bytes(decode_atom(token).encode('utf-8'), 'little')
+    return int(token)
+
+
 def events(log):
     rows = [tuple(decode_atom(x) for x in m.groups()) for m in EVENT.finditer(log)]
     return [r[:2] + tuple(x[2:] if x.startswith('~:') else x for x in r[2:]) for r in rows]
 
 
-def verdict(log, returncode, completed=True):
+def verdict(log, returncode, completed=True, *, native=False):
     records = events(log)
     faults = [r for r in records if r[0] not in ('start', 'pass')]
     well_formed = len(records) == len(re.findall(r'^\("TEST"', log, re.M))
@@ -47,6 +56,14 @@ def verdict(log, returncode, completed=True):
     done = re.search(r'^' + re.escape(DONE) + r'$', log, re.M)
     good = bool(all_finished and well_formed and completed and returncode == 0
                 and done and not ERROR.search(log) and not faults)
+    if native:
+        # Decode the native verdict; never infer success from a zero process
+        # exit or missing results. The remaining log checks reject transport
+        # damage and uncaught legacy import-time assertions.
+        summaries = SUMMARY.findall(log)
+        good &= (len(summaries) == 1 and summaries[0][0] == '1'
+                 and decode_nat(summaries[0][1]) > 0
+                 and len(re.findall(r'^\("TEST-SUMMARY"', log, re.M)) == 1)
     return good, records
 
 
@@ -62,7 +79,7 @@ def report_log(path):
     context = 0
     with path.open(errors='replace') as source:
         for line in source:
-            if line.startswith('("TEST"'):
+            if line.startswith(('("TEST"', '("TEST-SUMMARY"')):
                 record = True
             elif record and line and not line[0].isspace():
                 record = False
@@ -274,15 +291,19 @@ def run_group(suites, wisp, template, root, timeout):
         records = []
     else:
         copy_template(template, directory / 'snap')
-        lines = []
-        if any(s.get('entrypoint') for s in suites):
-            lines.extend(['(#bind test_std (#module std))', '(#import test_std)'])
+        lines = ['(#bind test_std (#module std))', '(#import test_std)',
+                 '(#bind testing (#module testing))',
+                 '(#bind test_report (#module testing-report))']
+        mods = '[' + ' '.join(rvr_string(s['target']) for s in suites) + ']'
+        specs = '[' + ' '.join('[' + rvr_string(s['kind']) + ' ' + rvr_string(s['target']) + ']'
+                               for s in suites) + ']'
         if any(s['kind'] != 'reaver' for s in suites):
             lines.append('(#bind runner (#module foil-test-runner))')
-            mods = '[' + ' '.join(rvr_string(s['target']) for s in suites) + ']'
-            lines.append(f'(runner:run 0 {rvr_string(suites[0]["kind"])} {mods})')
+            lines.append('(define (test_execution ignored) '
+                         f'(runner:evaluate 0 {rvr_string(suites[0]["kind"])} {mods}))')
         fixtures = {}
         fixture_calls = []
+        entries = []
         for suite in suites:
             mod = rvr_string(suite['target'])
             if suite['kind'] == 'reaver':
@@ -299,28 +320,24 @@ def run_group(suites, wisp, template, root, timeout):
                             fixture_calls.append(f'(define {binding} ({binding}_module:{entry} 0))')
                             fixtures[fixture] = binding
                         argument = fixtures[fixture]
-                    call = (f'(test_std:assert-impl "{suite["target"]}" '
-                            f'({suite["target"]}:{suite["entrypoint"]} {argument}))')
-                    if suite.get('fixture'):
-                        fixture_calls.extend([
-                            f'(print ("TEST" "start" {mod} "~:module" "~:" "~:"))',
-                            f'(define outcome (Try (lambda (ignored) {call}) 0))',
-                            f'(If (Eq 1 (Hd outcome)) '
-                            f'(Seq (print outcome) (print ("TEST" "error" {mod} "~:module" "~:passing entrypoint" "~:caught failure"))) '
-                            f'(print ("TEST" "pass" {mod} "~:module" "~:" "~:")))'])
-                        continue
-                    lines.append(call)
-                lines.append(f'(print ("TEST" "pass" {mod} "~:module" "~:" "~:"))')
-        if fixture_calls:
+                    call = f'({suite["target"]}:{suite["entrypoint"]} {argument})'
+                else:
+                    call = '1'  # Legacy assertions ran while importing the module.
+                entries.append(f'(testing:entry {mod} (lambda (ignored) {call}))')
+        if entries:
             # Compiler products stay local to this call, outside snapshot state.
             lines.append('(define (test_fixture_run ignored)')
             lines.extend('  ' + call for call in fixture_calls)
-            lines.extend(['  1)', '(test_fixture_run 0)'])
-        lines.append('(print "TEST-RUN-DONE")')
+            lines.extend(['  (cat [' + '\n        '.join(entries) + ']))',
+                          '(define (test_execution ignored) '
+                          '[test_fixture_run (test_fixture_run 0)])'])
+        lines.extend([f'(Seq (define test_report_started (test_report:begin {specs} test_execution)) 0)',
+                      '(Seq (define test_report_completed (test_report:execute test_report_started test_execution)) 0)',
+                      '(test_report:finish test_report_completed)'])
         code, complete, seconds = run_process([wisp, '--file-root', str(root / 'src'), 'snap', 'root', '_'],
                                                directory, '\n'.join(lines) + '\n', timeout)
         log = report_log(directory / 'out.log')
-        good, records = verdict(log, code, complete)
+        good, records = verdict(log, code, complete, native=True)
         # A legacy module may return control after a failed top-level form.
         # Attribute the uncaught error to that module, not a false PASS.
         matches = list(EVENT.finditer(log))
@@ -338,8 +355,7 @@ def run_group(suites, wisp, template, root, timeout):
                     if error:
                         records[i] = ('error', record[1], record[2], 'passing module',
                                       log[error.start():error.start()+800])
-        # A completely missing adapter output must never look green.
-        good &= all(any(r[1] == s['target'] and r[0] != 'start' for r in records) for s in suites)
+        # Missing selected suites are rejected by testing:finish in the worker.
     # The REPL echoes a top-level print's result; nested prints do not.
     records = [r for i, r in enumerate(records) if i == 0 or r != records[i-1]]
     for suite in suites:
@@ -370,12 +386,15 @@ def run_group(suites, wisp, template, root, timeout):
                 locations[key] = str(path) + ':' + str(by_text[text].pop(0))
     result = dict(group=suites[0]['group'], passed=bool(good), seconds=round(seconds, 3),
                   completed=complete, returncode=code, suites=[s['name'] for s in suites],
-                  records=records, locations=locations, log=str(directory / 'out.log'))
+                  log=str(directory / 'out.log'))
+    if not command_suite:
+        result['namespace_report'] = dict(arena=str(directory / 'snap'),
+                                         path='/0x11/tests/run',
+                                         started='test_report_started',
+                                         completed='test_report_completed')
     (directory / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
-    if good and not command_suite:
-        # Retain frozen sources, inputs and diagnostics, not successful workers'
-        # disposable arenas. The compiler template remains reusable.
-        shutil.rmtree(directory / 'snap')
+    # This arena now owns the namespace report, including successful runs.
+    # Never delete it as though it were only a disposable compiler cache.
     print(f'{"PASS" if good else "FAIL"} {result["group"]} ({seconds:.1f}s) — {result["log"]}', flush=True)
     for status, mod, name, want, got in records:
         if status not in ('start', 'pass'):

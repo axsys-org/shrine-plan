@@ -2,10 +2,25 @@
    This host holds only prepared controls, their input drafts and platform focus. */
 (function(root){
   'use strict';
-  async function mountDocument(main,initial,reload,onSaved=async()=>{}){
+  async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true}={}){
     const api=root.GooActions, frames=new Map();let manifest=initial, busy=false, failed=false, pendingChange=null;
-    const notice=document.createElement('div');notice.setAttribute('role','status');main.before(notice);
-    const report=message=>api.feedback(notice,message,720);
+    const notice=document.createElement('div');notice.className='goo-document-notice';notice.setAttribute('role','status');main.before(notice);
+    const report=message=>{notice.hidden=compact&&message==='Ready';return api.feedback(notice,notice.hidden?'':message,Math.min(main.clientWidth,720));};
+    // Embedded documents keep the same frames, bindings and edit guards. Only
+    // their page presentations and tools move into a lazy disclosure.
+    let body=main,inspector,inspection;
+    if(compact){
+      body=document.createElement('div');body.className='goo-document-body';main.append(body);
+    }
+    if(compact&&chrome){
+      inspector=document.createElement('details');inspector.className='goo-document-inspector';
+      const summary=document.createElement('summary');summary.textContent='Document';inspector.append(summary);
+      inspection=document.createElement('div');inspector.append(inspection);main.append(inspector);
+      inspector.addEventListener('toggle',async()=>{if(!inspector.open)return;
+        try{for(const frame of frames.values())if(frame.holder.parentNode===inspection&&(!frame.block.label||frame.holder.open))await render(frame,Boolean(frame.data));}
+        catch(error){report(error.message);}
+      });
+    }
     const editable=frame=>frame.block.editor!==false && frame.block.kind!=='presentation';
     const dirty=frame=>frame.inputs?[...frame.inputs.values()].some(input=>input.value!==input.getAttribute('value')):Boolean(frame.input && frame.input.value!==frame.input.getAttribute('value'));
     async function readManifest(){
@@ -19,7 +34,7 @@
     function navigate(frame,direction){const list=ordered(),at=list.indexOf(frame),next=list[at+direction];if(next)focus(next,direction<0?root.GooRichInput.text(next.input.gooEditor.runs).length:0);}
     async function render(frame,preserve,ownCommit=false){
       const selector=frame.recipe?{slot:frame.recipe}:frame.block.view?{view:frame.block.view}:{slot:'/sys/slot/synthetic'};
-      const data=await api.load(frame.block.target,{...selector,context:{...api.context(main),width:Math.min(main.clientWidth,720),layout:undefined}});
+      const data=await api.load(frame.block.target,{...selector,context:{...api.context(frame.element),width:Math.min(frame.element.clientWidth,720),layout:undefined}});
       if(preserve && frame.data && (frame.data.snapshot.life!==data.snapshot.life || (!ownCommit && frame.data.snapshot.expected!==data.snapshot.expected)) && dirty(frame))throw Error('A block was replaced. Your draft is retained.');
       const retainDraft=preserve&&dirty(frame);
       const content=api.mount(frame.element,data,preserve,false);frame.data=data;
@@ -40,38 +55,47 @@
       else{const link=document.createElement('a');link.href='/ns'+frame.block.target;await api.feedback(link,'Inspect this native record and its history',720);frame.element.append(link);}
       // Block chrome is itself a prepared Grove row. Platform focus reveals it.
       const chrome=frame.element.querySelector('[data-slot="/sys/slot/block_actions"]');
-      if(chrome&&editable(frame)){const anchor=document.createComment('native block controls');chrome.before(anchor);
+      if(chrome&&editable(frame)){
+        // The prepared row's gap belongs to its controls. A compact projection
+        // hides that row as a unit instead of leaving an empty spacer behind.
+        const chromeHost=compact&&chrome.parentElement?.classList.contains('goo-row')&&chrome.parentElement.childElementCount===1?chrome.parentElement:chrome;
+        const anchor=document.createComment('native block controls');chromeHost.before(anchor);
         frame.chromeBinding?.abort();frame.chromeBinding=new AbortController();
-        frame.element.addEventListener('focusin',()=>{if(!chrome.isConnected)anchor.after(chrome);},{signal:frame.chromeBinding.signal});
-        frame.element.addEventListener('focusout',event=>{if(!frame.element.contains(event.relatedTarget))chrome.remove();},{signal:frame.chromeBinding.signal});
+        frame.element.addEventListener('focusin',()=>{if(!chromeHost.isConnected)anchor.after(chromeHost);},{signal:frame.chromeBinding.signal});
+        frame.element.addEventListener('focusout',event=>{if(!frame.element.contains(event.relatedTarget))chromeHost.remove();},{signal:frame.chromeBinding.signal});
         for(const control of data.controls||[])if(control.kind==='action'){
           const button=[...chrome.querySelectorAll('[data-node]')].find(node=>node.dataset.node===control.id);
           if(button && ['split','merge','paragraph','heading','bullet','quote','code'].includes(control.editCommand))button.remove();
         }
-        if(!frame.element.contains(document.activeElement))chrome.remove();
+        if(!frame.element.contains(document.activeElement))chromeHost.remove();
       }
     }
     async function reconcile(next,structural=false,ownCommit=null){
       if(structural && [...frames.values()].some(dirty))throw Error('Unsaved edits must be saved before changing block structure.');
-      const nextParts=[...next.blocks,...(next.tools||[])],nextByKey=new Map(nextParts.map(block=>[block.key||block.target,block]));
+      const parts=chrome?[...next.blocks,...(next.tools||[])]:next.blocks.filter(block=>block.kind!=='presentation');
+      const nextByKey=new Map(parts.map(block=>[block.key||block.target,block]));
       for(const [key,frame]of frames){const block=nextByKey.get(key);if(dirty(frame)&&(!block||frame.block.target!==block.target||frame.block.view!==block.view))throw Error('A removed or replaced block has an unsaved draft.');}
       manifest=next;
-      const seen=new Set();let position=0;
-      const parts=[...manifest.blocks,...(manifest.tools||[])];
+      const seen=new Set(),positions=new Map();
+      const tools=new Set(manifest.tools||[]);
       for(const block of parts){
         const key=block.key||block.target;seen.add(key);let frame=frames.get(key);
         if(frame && (structural || frame.block.view!==block.view || frame.block.target!==block.target)){frame.holder.remove();frames.delete(key);frame=null;}
         if(!frame){const element=document.createElement('section');element.setAttribute('aria-label',`${block.kind} ${block.target}`);let holder=element;
           if(block.label){holder=document.createElement('details');const summary=document.createElement('summary');holder.append(summary);await api.feedback(summary,block.label,720);holder.append(element);}
-          main.append(holder);frame={block,element,holder};frames.set(key,frame);
-          if(block.label)holder.addEventListener('toggle',()=>{if(holder.open&&!frame.data)render(frame,false).catch(error=>report(error.message));});
+          body.append(holder);frame={block,element,holder};frames.set(key,frame);
+          if(block.label)holder.addEventListener('toggle',()=>{if(holder.open)render(frame,Boolean(frame.data)).catch(error=>report(error.message));});
         }
-        frame.block=block;const at=main.children[position++];if(at!==frame.holder)main.insertBefore(frame.holder,at||null);
-        if((block.view||block.readonly)&&(!block.label||frame.holder.open||frame.data)){
+        frame.block=block;
+        const parent=compact&&(tools.has(block)||block.kind==='presentation')?inspection:body;
+        const position=positions.get(parent)||0,at=parent.children[position];positions.set(parent,position+1);
+        if(at!==frame.holder)parent.insertBefore(frame.holder,at||null);
+        if(parent===inspection&&!inspector.open)continue;
+        if((block.view||block.readonly)&&(!block.label||frame.holder.open)){
           try{await render(frame,Boolean(frame.data),frame===ownCommit);}
           catch(error){if(frame.data)throw error;frame.error=error.message;await api.feedback(frame.element,`Block ${block.target}: ${error.message}`,720);}
         }
-        else if(!block.view&&!block.readonly&&block.reference){const link=document.createElement('a');link.href='/ns'+block.reference;await api.feedback(link,(block.descriptor?'Presentation unavailable; source descriptor retained. ':'')+block.reference,720);frame.element.replaceChildren(link);}
+        else if(!block.view&&!block.readonly&&block.reference){const link=document.createElement('a');link.href='/ns'+block.reference;await api.feedback(link,(block.descriptor?'Presentation unavailable; source descriptor retained. ':'')+block.reference,Math.min(frame.element.clientWidth,720));frame.element.replaceChildren(link);}
 
       }
       for(const [key,frame] of frames)if(!seen.has(key)){if(dirty(frame))throw Error('A removed block has an unsaved draft.');frame.holder.remove();frames.delete(key);}
