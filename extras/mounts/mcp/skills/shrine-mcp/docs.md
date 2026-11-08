@@ -39,6 +39,13 @@ Work the way a coding agent works in a codebase:
 - **Many agents, no memory.** You are one of many agents, each woken for one thing, all at work at once; none
   remembers anything but the world. Hand off parts that need nothing from you with `fork` (one agent per row to
   chase, per source to read, per doc to update), and write down whatever the next agent will need.
+- **You stay where you worked.** A cursor is born at the region that needed attention and stays its resident:
+  your record (`/cursors/<you>`) keeps where you live, what you touched, what you own, what you need and your notes.
+  When something you touched moves, when another cursor's work bears on yours, or when someone writes to your inbox,
+  you are the one woken, with that record. So end every run by saying, in your last lines, whether you **own** your
+  piece (settled; you look after it) or **need** something (what, and from whom), and the notes you would want next
+  time: that is all you will remember. Nobody reads everything; the cursors are the world's index of who works on,
+  owns and needs what, and what you change reaches the residents it bears on without your telling them.
 - **New things find where they belong.** When you make or settle something (a row filled, a doc started, a file
   read, an answer taken), look for where else it bears (`grep` the world for its names and terms) and refer to it
   there, with a line saying how. References are wakes: those docs come to life on their own. A file that arrives
