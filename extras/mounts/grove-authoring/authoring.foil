@@ -1,0 +1,109 @@
+- grove_draft
+- namespace_command
+
+' Source authoring over the existing host-owned draft compiler. No compiler,
+' execution queue, watcher, or publication contract is stored in a draft.
++ grove_authoring
+  + root
+    \ self=iota
+    ^ path
+    [self 'app 'grove_authoring]
+  + schema
+    \ self=iota
+    ^ path
+    [self 'gov 'grove_authoring]
+  + job_slot
+    \ self=iota
+    ^ path
+    | (grove_authoring/schema self).snoc('job)
+  + registration_path
+    \ self=iota name=str
+    ^ path
+    | (grove_draft/registry self).snoc(($ts (str/cat_all ["authoring_" name])))
+  + arguments
+    \ names=row[path] input=myth
+    ^ bool
+    | input.tap.all((\ [name value] names.has(name)))
+  + source
+    \ input=myth
+    ^ either[iota str]
+    = source input.txt_at(['source])
+    ? ((eq source.len 0) || (gt source.len 131072)) (./err 'grove_source_size)
+    | ./ok source
+  + status
+    ' Presentation of the authoritative job, computed by an ordinary cell.
+    \ self=iota context=myth input=axal[myth]
+    ^ [myth axal[myth]]
+    = empty (axal/new[myth] .none)
+    ?> job=grove_draft/job input.fil.fall(myth/new).pail_at((grove_authoring/job_slot self)) [context empty]
+    = display (myth/sing ['source] (pails/t job.source)).put(['revision] (pails/t (nat/show job.revision)))
+      display display.put(['attempted] (pails/t (nat/show job.attempted))).put(['ready] (pails/t (nat/show job.ready)))
+      display display.put(['published] (pails/t (nat/show job.published))).put(['message] (pails/t job.message)).put(['line] (pails/t (nat/show job.line)))
+    | [context empty.put([] display)]
+  + create
+    \ target=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(equal[path] target (grove_authoring/root state.self)) (./err 'grove_authoring_target)
+    ? !(grove_authoring/arguments [['name] ['source]] input) (./err 'grove_authoring_arguments)
+    = name input.txt_at(['name])
+    ?> (./some names) (path_parse (str/cat_all ["/" name])) (./err 'grove_draft_name)
+    ? !(and (eq names.len 1) (and (le name.len 64) (eq (path_show names) (str/cat_all ["/" name])))) (./err 'grove_draft_name)
+    ? ((eq name ".") || (eq name "..")) (./err 'grove_draft_name)
+    < source (grove_authoring/source input)
+    = draft=path (grove_authoring/root state.self).weld(['drafts]).weld(names)
+      definitions=path (grove_authoring/schema state.self).weld(['drafts]).weld(names)
+      registration_path=path (grove_authoring/registration_path state.self name)
+    ? ((sovereign_peek draft state).wyt || (sovereign_peek definitions state).wyt || (sovereign_peek registration_path state).wyt)
+      | ./err 'grove_draft_collision
+    = registration (grove_draft/registration draft (grove_authoring/job_slot state.self)
+        definitions.snoc('preview) draft.snoc('preview) definitions.snoc('published) draft.snoc('published) "grove_role_runtime")
+      card (myth/sing (grove_authoring/job_slot state.self) (grove_draft/job source 1 0 0 0 0 "Not compiled" 0))
+      card card.put((grove_authoring/schema state.self).snoc('status_path) (pails/p (row/cons[iota] 'x draft.snoc('status))))
+      view (myth/sing system_vocabulary/weft (cell (grove_authoring/status state.self))).put(system_vocabulary/tack (safe 0 .x draft))
+    | ./ok [[draft (writ/make card)]
+        [draft.snoc('status) (writ/make view)]
+        [registration_path (writ/make (myth/sing grove_draft/slot registration))]]
+  + job
+    \ target=path state=namespace
+    ^ either[iota grove_draft/job]
+    = root (grove_authoring/root state.self).snoc('drafts)
+    ? !(and (eq target.len root.len.inc) (pith_prefix root target)) (./err 'grove_authoring_target)
+    = card (sovereign_peek target state).fil.fall(myth/new)
+    ?> job=grove_draft/job card.pail_at((grove_authoring/job_slot state.self)) (./err 'grove_missing_draft)
+    | ./ok job
+  + revision
+    \ input=myth job=grove_draft/job
+    ^ either[iota nat]
+    ?> (./some revision) (nat/parse input.txt_at(['revision])) (./err 'grove_draft_revision)
+    ? !(eq revision job.revision) (./err 'grove_stale_draft)
+    | ./ok revision
+  + save
+    \ target=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(grove_authoring/arguments [['source] ['revision]] input) (./err 'grove_authoring_arguments)
+    < job (grove_authoring/job target state)
+    < revision (grove_authoring/revision input job)
+    < source (grove_authoring/source input)
+    ? (eq source job.source) (./ok [])
+    = next job.set_source(source).set_revision(revision.inc).set_request(0)
+    | ./ok [[target (writ/poke (myth/sing (grove_authoring/job_slot state.self) next))]]
+  + publish
+    \ target=path input=myth state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? !(grove_authoring/arguments [['revision]] input) (./err 'grove_authoring_arguments)
+    < job (grove_authoring/job target state)
+    < revision (grove_authoring/revision input job)
+    ? !(and (gt revision job.published) (and (eq revision job.ready) (eq revision job.attempted)))
+      | ./err 'grove_uncompiled_draft
+    | ./ok [[target (writ/poke (myth/sing (grove_authoring/job_slot state.self) job.set_request(revision)))]]
+  + install
+    \ state=namespace
+    ^ either[pail namespace]
+    = source (grove_authoring/schema state.self)
+    ?> (./some version) state.case(.x source) (./err (pails/t "Grove authoring publication missing"))
+    = checked (grove_draft/validate_views (sovereign_peek source state).tap)
+    ? checked
+     > (./err why) (./err (pails/t why.message))
+    ? (grove_install/instantiate source version (grove_authoring/root state.self) state)
+     > (./ok next) (./ok next)
+     > (./err why) (./err (pails/q why))

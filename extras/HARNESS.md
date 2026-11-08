@@ -25,6 +25,7 @@ authored procedure and its maintained documents, not another application runtime
 | `mounts/mcp` | Direct native read, write, history and admitted-operation transport | A private agent loop, work queue or browser application |
 | `mounts/inspector` | Optional read-only `/live` records, cells, overlays and history over MCP | Chat, task execution, raw writes, cursor records or workspace binding |
 | `mounts/flow-authoring` | Flow/Nenex integration: source authoring, page evidence, guarded writer and declared Goo controls | The generic command catalogue or filesystem-source lifecycle |
+| `mounts/grove-authoring` | Named source drafts and declared create/save/publish controls over the existing native draft compiler | A compiler, work scheduler, browser app or business-data migration mechanism |
 | `mounts/conversation` | Conversation turn bindings, scoped graph context and inline Nenex projections | A message-body model, provider loop, attempt lifecycle or store |
 | `mounts/flows/install.foil` | Native flow command/law registration and retained-contract checks | Nenex routes or example catalogue |
 | `mounts/flow-examples/examples.foil`, `examples/`, `examples.json` | Optional authored recipes and their setup data | Runtime policy for all flows |

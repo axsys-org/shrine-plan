@@ -1,6 +1,7 @@
 # Authored flow examples
 
-This optional mount selects `flow-authoring`, `flow-web` and `conversation`, which use the shared
+This optional mount selects `flow-authoring`, `flow-web`, `conversation` and
+`grove-authoring`. The procedures use the shared
 `flows` execution mount. It owns recipes and domain policy, not a
 second harness. `x/eden --mount flow-examples --ephemeral` creates a disposable
 world for trying them; add `--mount codex` for a real interactive provider.
@@ -51,6 +52,79 @@ or stale work cannot keep invoking actions. Outcomes and action receipts remain
 attached to the attempt; rejected responses use the same retry operation. This
 is bounded by the normal provider/request limits, not a new autonomous scheduler.
 
+## Agent helpers: orientation, continuation and verified actions
+
+These are authored procedures in the **Flow examples** catalogue, using the same
+interactive provider and writer as `surface_investigation`. Create the recipe,
+publish its same-named definition, bind `capture` and `provider`, and attach it
+to a separate report destination. Use **Author flows → Inspect callable
+definitions**, care `x`, to select the subject; bind the raw inspection cell,
+without `/x`. The default task is authored in the flow's Semidoc; there are no
+separate task files for these recipes. The catalogue binds `sources` to the
+existing authoring and action guides. To supply a per-invocation assignment,
+author a Nenex page and use **Bind Nenex evidence**, source name `task`, on the
+flow's author page. This selects the existing task-source cell as the default
+`sources` input, replacing the bundled reference-guide collection. These guides
+are optional context; the procedure itself remains in Semidoc. Choose this
+binding before attaching: changing defaults does not retarget already running
+work. Once the task page is bound, its edits wake that same hand. The request
+captures and cites its explicitly bound sources. Reusing a published procedure does not
+require republishing it for each assignment.
+
+| Recipe | Subject and task | Intended result |
+| --- | --- | --- |
+| `orient_here` | Any exact native subject; read-only orientation scope | A compact map of useful cells, work, holes, declared actions and linked flows |
+| `resume_work` | Original native work, including unresolved work; explicit continuation and authority | Continue through that work's existing controls, with a report linking the original work and results |
+| `invoke_and_verify` | Action subject; explicit effect, input values and observable postcondition | Discover, invoke and read back a declared action, retaining references to its native evidence |
+
+The last two authored briefs intentionally leave the effect unspecified. They
+permit discovery but require clarification before mutation. This is authored
+provider policy, not a capability sandbox: the selected surface provider retains
+its namespace authority. The orientation brief forbids `shrine_act`; that is a
+provider instruction, not an enforced tool restriction.
+
+`library/agent_task` constructs an ordinary native interactive request with the
+existing `source`/`note` response convention. A completed response contains one
+Semidoc section and an explanation. The validator allows inert prose and plain
+native reference blocks, preserves the brief's evidence bindings, and rejects
+document headers, executable attributes and oversized responses. It validates
+the report's structure, not the truth of a model's statements. Actual reads,
+action receipts and result records establish what happened.
+
+An empty `source` and specific question in `note` produce the existing
+`flow_revision_unresolved` result. The current hole remains unresolved and the
+worker retains the full response. Update the bound task/evidence to wake the
+same controller, or use **Retry failed request** when a retry is justified.
+Editing the bound Nenex task uses this same evidence path. The existing hand
+retains the predecessor and resumption cell and resolves the
+same hole when a current response succeeds. These examples do not add a generic
+chat answer box: when resuming another application's work, discover and use
+that application's existing answer control. The helper's own clarification is
+not automatically an answer to the original work's hole.
+
+Before effects, the authored procedures inspect the request's resumption links,
+prior action traces and current target. A completed action is not undone by an
+obsolete report. Host-generated invocation identities and native receipts
+deduplicate the same invocation; a different tool call or request has a new
+identity. A missing reply therefore requires inspection, not blind replay.
+An accepted `shrine_act` response proves admission, not async completion or a
+business postcondition. Unverified required results stay unresolved.
+
+The subject inspection is frozen. Live navigation reads do not automatically
+become watched evidence: reports describe the observations made during that
+attempt. Bind relevant live sources explicitly when maintenance should react
+to them. Unavailable current sources remain unavailable even if an older
+capture survives. Scope and authority changes require deliberate task or
+definition changes; the procedures do not silently adopt new hands.
+
+`flow_agent_qol_tests` executes all three shipped recipes with controlled
+provider responses: paused/detached/stale authority, unresolved input, bound
+evidence resumption, retries, report publication and retained x/y/z history.
+The existing `flow-reflected-authoring-tests` gate separately exercises real
+Goo declarations, surface tool admission, receipts and resumption after an
+accepted effect. Neither establishes that a live model will correctly carry
+out every task described by these briefs.
+
 ## Library limits
 
 The page navigator in `nenex/library.grove` is a navigation presentation.
@@ -59,6 +133,71 @@ checking settled task evidence, decoding explicit JSON/Markdown/text, projecting
 results and constructing this example's interactive report task. It is not a
 second evaluator or a store. Format ingestion does not guess domain schemas;
 learning proposes instructions and does not silently install an after-task hook.
+
+## Extraction, handoff, Grove apps and the authoring wiki
+
+Create these by name in the existing **Flow examples** catalogue. Publish the
+same-named definition, bind the remaining inputs, and select a separate Nenex
+destination. All four bind their declared repository sources using the existing
+source capture and its shared ownership. There is no new execution loop.
+
+| Recipe | Remaining selection | Result |
+| --- | --- | --- |
+| `procedure_extraction` | Raw own-record `capture`; `provider` input; task with receiver, unused flow name and selected steps/events | Calls existing extraction controls and reports the resulting editable Semidoc draft |
+| `investigation_handoff` | Raw own-record `capture`; revision provider in attachment settings, or manual revision | Three handoff pages: summary, evidence and continuation of the original work |
+| `grove_app_authoring` | `provider` input | Authors Grove through native draft controls, checks the preview, and reports native addresses/receipts |
+| `authoring_wiki` | No provider; default captured sources | 24 authored concept pages plus compact source provenance |
+
+For a capture, use **Author flows → Inspect callable definitions** with care `x`
+on the original work record. Bind the raw resulting inspection cell, without
+`/x`. This retains the exact native value and its version. Handoff accepts
+unresolved native work; task learning still requires settled work. A handoff is
+an as-of document: it never clones a controller, reassigns authority or completes
+the original investigation. The next participant rereads its current holes and
+continues through their existing controls.
+
+Extraction distinguishes executable flow traces from investigation evidence.
+The former retains captured laws and exposes omitted dependencies as explicit
+inputs. The latter creates a draft and authoring hole, requiring composition and
+deliberate review. Neither automatically publishes. The bundled extraction task
+intentionally asks for the missing receiver/name/selection before mutating
+anything. Replace its task source with those explicit choices. Provider reports
+are prose; the extracted page, native receipts and captures establish the effects.
+
+The app recipe's bundled task authors `field_notes`, edits a preview sample and
+leaves publication explicit. The source surface lives at
+`/0x11/app/grove_authoring`, with `new_draft` and `editor` views under
+`/0x11/gov/grove_authoring`. Each draft is
+`/0x11/app/grove_authoring/drafts/<name>`. It uses the existing `grove_draft/job`,
+host-owned registrations, mounted compiler, candidate installation and native
+publication. The new mount contributes only create/save/publish admission and
+declared Goo controls. It adds no compiler, scheduler, watcher or browser bundle.
+
+Inspect `revision`, `attempted`, `ready`, `published`, `message` and `line` on the
+job, or read `/x/0x11/app/grove_authoring/drafts/<name>/status`. This ordinary
+cell projects the job's source and diagnostic fields; it is not another status
+record to synchronize. Accepted creation is not successful compilation. Failed source remains
+editable, while the previous successful preview stays installed. Publishing
+requires the current successfully compiled revision and installs into the
+draft's separate `published` instance. That replaces the sample instance; it is
+not a migration of existing business data. On retries, check prior receipts and
+ownership before reusing a draft. The source compiler is a trusted native
+authoring capability, not a sandbox for untrusted Grove/Foil.
+
+The [wiki source](examples/authoring-wiki.semidoc) is the canonical longer guide:
+records and codecs, views and actions, panes, cells and overlay constructors,
+native arms and dependencies, composition, extraction, handoff, mount packaging,
+declarative workspaces, pinned publication, snapshots and verification. It emits
+authored prose rather than reproducing READMEs. Its examples remain literal.
+Source changes refresh provenance through attached maintenance; they do not
+silently rewrite or certify the guide. Edit/review the Semidoc and deliberately
+publish/adopt the revision, or use the existing revision mechanism for proposals.
+
+The registered `flow_authoring_recipes_tests` suite exercises the shipped source,
+shared request guards/retries, handoff preservation and wiki publication. The
+native `grove_authoring_tests` suite covers draft allocation and revision guards.
+These use controlled provider responses and do not establish a live model's
+ability to complete every extraction or app authoring task.
 
 ### Learning, technical atlas and format ingestion
 
