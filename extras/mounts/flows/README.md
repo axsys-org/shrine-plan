@@ -618,6 +618,14 @@ a catalogue. Example documents still use these same operations and records.
 
 ## World and operations
 
+Native data-only flows select `/<node>/gov/flows/retain_result` as their writer.
+The ordinary work result cell retains the value and the normal destination
+receipt identifies its generation. This writer adds no copy of the result at
+the destination and needs neither Nenex nor the example library. Read
+`/x/<receipt.attempt.path>/result` to bind that retained generation downstream.
+Document projection is a separate flow/writer choice. Existing attempts keep
+their captured writer even when new registrations are published.
+
 Eden saves the complete namespace through its native continuation before
 acknowledging writes. Documents, cells, holes, captured laws and work history
 restore together. `x/eden --snapshot PATH` selects an explicit native arena;

@@ -28,6 +28,31 @@ contract identity. Keep explicit publication tests alongside those native cases.
 Test-only dependencies and several specialist gates still have ad hoc registration;
 this pass has not made every listed boundary part of one default command.
 
+The shared staging recipe installs the existing `plangrm:compileP6` before
+loading the Foil compiler closure, and each worker selects it again because
+`Install` is process-local. Its template key includes both compilers' source
+dependencies. This only prepares disposable test snapshots; it does not
+patch a running application or upgrade a retained world. Mounted checks use the
+same staged template, without a temporary runtime wrapper.
+
+Reproduce the flow library checks with the normal entrypoints:
+
+```sh
+extras/x/check --mount flows --suite flow_install_tests --jobs 1
+extras/x/check --mount flow-examples --suite flow_library_publication_tests \
+  --suite flow_stage_tests --suite flow_agent_qol_tests \
+  --suite flow_cartography_lifecycle_tests --suite flow_library_tests \
+  --suite flow_workspace_tests --jobs 2
+extras/x/check --mount flow-examples --suite flow-reflected-authoring-tests --jobs 2
+x/check flow-web-transport --jobs 1
+```
+
+The stage and library suites' compiled Goo fixtures explicitly select the
+existing graph test dependency, even when run individually. This does not add
+graph to the native flows runtime mount.
+The HTTP command uses a local fixture server; fetch, lifecycle assertions and
+report verdicts execute natively. These checks need no model account.
+
 ## Reports are namespace records
 
 Each native worker retains its own disposable namespace at `/0x11/tests/run`:

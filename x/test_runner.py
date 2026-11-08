@@ -113,7 +113,7 @@ def needs_corpus(mod):
 
 def compiler_files():
     # Test sources are loaded in disposable workers, never into this key.
-    mods = reaver_closure(['foil-new-env', 'std', 'quip'])
+    mods = reaver_closure(['plangrm', 'foil-new-env', 'std', 'quip'])
     return [ROOT / 'src/reaver' / (m + '.rvr') for m in mods
             if (ROOT / 'src/reaver' / (m + '.rvr')).exists()]
 
@@ -208,7 +208,7 @@ def copy_snapshot(source, dest):
 def compiler_key(wisp):
     inputs = [*compiler_files(), *(ROOT / 'src/plan').glob('*.plan'),
               Path(wisp), ROOT / 'x/stage-lib']
-    return 'compiler-sovereign-v3-' + digest(inputs)
+    return 'compiler-sovereign-v4-p6-' + digest(inputs)
 
 
 def stage(wisp, fresh, timeout):
@@ -243,7 +243,12 @@ def stage(wisp, fresh, timeout):
                 shutil.rmtree(boot)
             copy_snapshot(directory / 'snap', boot)
         module = 'foil-new-env'
-        source = f'(#bind stage (#module {module}))\n(print "TEST-RUN-DONE")\n'
+        # Select the existing optimizing Reaver compiler before loading Foil's
+        # compiler closure. The boot snapshot intentionally has no serve-time
+        # compiler install; warming modules alone does not change that choice.
+        source = ('(#bind stage_compiler (#module plangrm))\n'
+                  '(Install stage_compiler:compileP6)\n'
+                  f'(#bind stage (#module {module}))\n(print "TEST-RUN-DONE")\n')
         code, complete, _ = run_process([wisp, '--file-root', str(ROOT / 'src'), 'snap', 'root', '_'],
                                         directory, source, timeout)
         log = (directory / 'out.log').read_text(errors='replace')
@@ -291,7 +296,11 @@ def run_group(suites, wisp, template, root, timeout):
         records = []
     else:
         copy_template(template, directory / 'snap')
-        lines = ['(#bind test_std (#module std))', '(#import test_std)',
+        # Install is process-local: resuming even an optimized compiler
+        # template restores the REPL's default compiler. Select P6 per worker.
+        lines = ['(#bind test_compiler (#module plangrm))',
+                 '(Install test_compiler:compileP6)',
+                 '(#bind test_std (#module std))', '(#import test_std)',
                  '(#bind testing (#module testing))',
                  '(#bind test_report (#module testing-report))']
         mods = '[' + ' '.join(rvr_string(s['target']) for s in suites) + ']'

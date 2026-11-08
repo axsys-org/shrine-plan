@@ -21,8 +21,9 @@ create its `<name>_flow` page, then open that page, publish the authored definit
 bind its explicit inputs and attach through **Author flows**. Creation never
 publishes a flow or overwrites an existing source document automatically.
 Authored default-node references are rebound through Semidoc's parsed reference
-values at creation. Prose and literal examples are left intact. Each child-flow
-dependency must be created and published explicitly before its parent.
+values at creation. Prose and literal examples are left intact. Child dependencies
+can be prepared together through the inspected publication procedure below,
+or created and published individually.
 
 `conversation_response` is the initial conversation procedure. Create its page,
 publish `respond`, then choose that definition and an interactive provider at
@@ -63,15 +64,48 @@ chapters are not artificially turned into separate procedures.
 
 ### Publication and binding
 
-Create each needed component through **Flow examples**, then publish its named
-Semidoc definition before publishing a parent that invokes it. Publish in the
-order in the table's component column. Components such as `prepare_action`,
-`invoke_action` and `verify_action` are reused across parents. A parent's
-publication captures exact child definitions; later edits do not retarget it or
-old attempts. Deliberately republish/adopt when selecting different behavior.
+In **Flow examples**, enter the parent recipe name and a fresh inspection name,
+then choose **Inspect publication dependencies**. The optional definition name
+defaults to the recipe name; use `respond` for `conversation_response`.
+The native inspection reads
+the selected Semidoc definition's actual invocation references. It lists missing
+children before their consumers, deduplicates shared children, checks live
+cycles, and shows each existing publication's captured references alongside the
+currently selected ones. Exact historical references remain pinned and are not
+recursively upgraded. The existing compiler supplies validation and diagnostics.
+
+The inspection is a frozen cell at
+`/<node>/app/flow_examples/catalogue/cells/<inspection>`. Its computed value
+contains the ordered records, source/publication captures, dependency captures,
+and full authored/shipped source comparison. Inspection creates no authored
+page, publication or running flow. The Goo panel shows the summary and both
+versions of the selected root's source; inspect child entries through that cell.
+
+**Publish inspected authored sources** checks those captures, creates missing
+catalogue recipes and publishes dependencies before consumers in one existing
+native admission using deferred commands. A changed source, dependency,
+publication, recipe or publisher refuses the stale inspection. A later command
+failure rejects the entire admission. This is not an install queue or another
+work lifecycle. It does not bind inputs, invoke a provider or attach occurrences.
+Current recipe bytes come from the existing filesystem snapshot report. A
+missing file may remain in namespace history, but cannot be offered or created
+as a current template. Deletion also invalidates an outstanding inspection;
+restoration permits a fresh review using the same native source records.
+
+Existing source documents always win over shipped templates. A difference is a
+review prompt, not permission to overwrite or merge. Use the existing Nenex
+source/Goo editor to apply the desired changes, then inspect again. Older pages
+need no baseline marker or migration: the comparison does not pretend to know
+whether a difference is a local edit or an upstream template change. Existing
+external publications without available source are kept rather than rebuilt.
+
+Individual creation/publication remains available. A parent captures exact child
+definitions; later edits do not retarget old attempts or pinned occurrences.
+Deliberate occurrence adoption stays separate. Live-publication maintenance
+attachments retain their existing behavior when a definition is republished.
 
 For native-result flows, explicitly select
-`/0x11/gov/flow_examples/retain_result` as the writer. This uses the existing
+`/0x11/gov/flows/retain_result` as the writer. This uses the existing
 work result cell and receipt without writing a document or another result store.
 For `project_result`, bind `value` to the producer's result and select the
 Nenex writer. Invoke a child with `/flow/invoke` to recompute together, or bind
@@ -575,7 +609,7 @@ fields across datasets are not evidence of a shared identity.
 **Flow examples → Publish and invoke example** accepts name, destination, bindings
 (JSON input names to namespace paths) and an optional writer path. Blank writer
 selects the existing Nenex writer. For a data-only component use
-`/0x11/gov/flow_examples/retain_result` and an unused destination such as
+`/0x11/gov/flows/retain_result` and an unused destination such as
 `/0x11/user/outputs/selected_queries`. This writer contributes no document writes;
 the existing lifecycle retains results, traces, captures, receipts and ordinary
 maintenance cells. It introduces no result store or alternate executor.
