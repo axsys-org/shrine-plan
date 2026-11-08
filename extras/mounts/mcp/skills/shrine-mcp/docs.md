@@ -57,6 +57,9 @@ watch.
 - **An edit of your text is an instruction.** When they change a line you wrote, rewrite it in place to what they
   now want, and act on it.
 - **Answer in the doc, close to what they wrote**, in small edits, quickly: they are watching it change.
+- **Never stop at a question.** Do the most the words allow now (search with what you have, broadly if you must;
+  fill what you find, with sources), and ask what would narrow it beside the work, not instead of it. A table you
+  make gets rows with what you found, not empty placeholders.
 - **Change the state, don't narrate it.** Most runs should end with cells filled, rows added, a hole made or a
   question removed, not a new paragraph. A question they ask is answered where they asked it, in a sentence, and
   the answer goes into the doc's state (rename a column, add a source column, fill the cells); then their question
