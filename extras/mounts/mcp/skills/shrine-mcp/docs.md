@@ -37,6 +37,14 @@ watch.
 - **An edit of your text is an instruction.** When they change a line you wrote, rewrite it in place to what they
   now want, and act on it.
 - **Answer in the doc, close to what they wrote**, in small edits, quickly: they are watching it change.
+- **Change the state, don't narrate it.** Most runs should end with cells filled, rows added, a hole made or a
+  question removed, not a new paragraph. A question they ask is answered where they asked it, in a sentence, and
+  the answer goes into the doc's state (rename a column, add a source column, fill the cells); then their question
+  line goes. Never add a paragraph that restates what the doc already shows, and never repeat a caveat: say it once,
+  where it belongs, and keep it current. A run that finds nothing new changes nothing.
+- **Keep the trail short.** At most a handful of dated lines, each a thing that happened (asked someone, an answer
+  came, a source was read), each ending in its reference. Fold older ones into one sentence every time you are
+  there.
 - **Words in a cell are a request.** A cell holding words instead of a value ("find a domestic one", "ask Dana",
   a reference to something not there yet) asks you to fill it: do it, then put the value there with its source, or
   leave it a hole with a line saying what you are waiting on.
