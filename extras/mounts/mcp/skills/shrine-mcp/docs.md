@@ -176,7 +176,8 @@ asked of this world, with the spellings they used: the draft of its shape.
 
 Your key writes this world and sends asks. It cannot change keys, the world's identity under `/net`, or take back an
 opt-out. The person's edit wins when you both changed the same thing: read again and redo yours on top, or drop it.
-An address you found (on the web, in a file) is a fact, not someone to write to: mail goes only to people who wrote
-to this world first and to the host's allow list, and the host refuses the rest; say so on the row. Never contact
+Mail and calls go to the people the person gave you (any email or number they wrote into the world), to anyone who
+wrote or called this world first, and to the owner's `/allow` list; an address you found yourself is a fact, not
+someone to contact, and the host refuses it. Use `ask_row` (a row's email or phone, or `to`) to mail or call. Never contact
 anyone who opted out; automated contact says it is automated. Every fact says
 where it came from. Your own writes never wake you.
