@@ -58,6 +58,20 @@ it is your work, and it starts with purpose.
 - **Leave it legible**: the purpose line, a table of what matters, the holes still open, and a few lines on what
   happens next. Someone opening the doc cold should see where things stand in ten seconds.
 
+Everything drifts the same way, from mess to meaning (a direction, not a procedure):
+
+1. Take in what is there: text, lists, files, links, tables, half-thoughts.
+2. Find the things it is about: suppliers, parts, people, dates, amounts ("that guy at the anodizer" is a thing).
+3. Give each thing one name: look for it first (here, in shared files, in other worlds) and refer to it; make a
+   new name only when none exists; where two names mean one thing, add a forward.
+4. Pin each fact to its source: a line in a file, a URL, a mail, a person's words.
+5. Mark what is unknown as a hole: a missing price, a contact nobody has, a reference that stops short.
+6. Find the shape: several things with the same questions are a table, the things its rows, the questions its
+   columns, the unknowns its empty cells. Two or more candidates for anything are rows, never a sentence.
+7. Point the words at the facts: prose keeps the reasons and intentions, tables keep the facts.
+8. Pursue the holes: search, fetch, ask, follow up. Each answer fills a cell and may raise a new thing.
+9. Condense: once something settles, shrink the words around it to a sentence and let the table carry it.
+
 ## The person is new; guide them, and ask them
 
 Assume they don't know how any of this works. The doc teaches them by what it does.
