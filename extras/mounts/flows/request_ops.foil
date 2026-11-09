@@ -1,5 +1,5 @@
 - flow_runtime_ops
-- flow_work
+- flow_work_ops
 - flow_maintenance
 
 ' Effectful steps use the same native requests, attempts, holes and providers
@@ -31,7 +31,7 @@
     ' declared actions and explicitly delegated interactive provider work.
     \ target=path owner=myth state=namespace
     ^ either[iota unit]
-    ?> (./some controller_path) owner.path_at(['flow 'request_controller]) (./err 'flow_missing_controller)
+    ?> (./some controller_path) (flow_request_ops/owner owner) (./err 'flow_missing_controller)
     = controller (cooperate_ops/record controller_path state).fall(myth/new)
     ?> config=flow_maintenance/config controller.pail_at(['flow 'config]) (./err 'flow_missing_controller)
     ?> progress=flow_maintenance/progress controller.pail_at(['flow 'progress]) (./err 'flow_missing_controller)
@@ -78,6 +78,12 @@
     = key request.at(request.len.dec)
       deps deps.put(['request key] (dep .x request)).put(['worker key] (dep .z request.snoc('worker)))
     | deps.put(['guard key] (dep .x (row/cons[iota] 'x request.snoc('guard))))
+  + task_dependencies
+    \ deps=crew request=path task=myth
+    ^ crew
+    = deps (flow_request_ops/dependency deps request)
+    ? !(task.has(['flow 'task])) deps
+    | deps.put(['draft request.at(request.len.dec)] (dep .z request.snoc('draft)))
   + retire
     ' Replaced current attempts become settled before their subscriptions are
     ' removed. A late provider keeps its outcome under the old worker; it can
@@ -111,24 +117,38 @@
           | selected.has(['request attempt.at(attempt.len.dec)])
       ? retained []
       | [[destination.weld(name) (writ/poke (myth/sing crew_slot (cpail (mop/empty))))]]
-  + task
-    \ card=myth
-    ^ bool
-    | card.has(['work 'prompt])
   + saved_task
     \ record=myth
     ^ myth
+    ? record.has(['flow 'request])
+      ?> saved=native_work/captured record.pail_at(['capture]) myth/new
+      | (unpin saved.value).fil.fall(myth/new)
     ?> saved=cell_view record.pail_at(['flow 'request_task]) myth/new
     | (unpin saved.tree).fil.fall(myth/new)
+  + owner
+    \ record=myth
+    ^ maybe[path]
+    ?> request=flow_work/request record.pail_at(['flow 'request]) record.path_at(['flow 'request_controller])
+    | ./some request.controller
+  + target
+    \ record=myth
+    ^ maybe[path]
+    ?> request=flow_work/request record.pail_at(['flow 'request]) record.path_at(['flow 'request_target])
+    | ./some request.target
+  + step
+    \ record=myth
+    ^ pail
+    ?> request=flow_work/request record.pail_at(['flow 'request]) record.pail_at(['flow 'request_step])
+    | pails/q request.step
   + native
     \ record=myth
     ^ bool
-    | record.has(['flow 'request_task])
+    | (record.has(['flow 'request_task]) || record.has(['flow 'request]))
   + same
     \ step=iota target=path task=myth record=myth
     ^ bool
-    | and (equal record.pail_at(['flow 'request_step]) (pails/q step))
-      (and (equal[maybe[path]] record.path_at(['flow 'request_target]) (./some target))
+    | and (equal (flow_request_ops/step record) (pails/q step))
+      (and (equal[maybe[path]] (flow_request_ops/target record) (./some target))
         (equal[myth] task (flow_request_ops/saved_task record)))
   + demand_view
     \ context=myth input=axal[myth]
@@ -143,7 +163,7 @@
     ?> candidate=flow_maintenance/candidate seen.fil.fall(myth/new).pail_at(['flow 'candidate]) .false
     ?> (./ok proposal) candidate.result .false
     ?> pending=flow/pending (unpin proposal.output.result).fil.fall(myth/new).pail_at(['flow 'pending]) .false
-    ?> (./some target) record.path_at(['flow 'request_target]) .false
+    ?> (./some target) (flow_request_ops/target record) .false
     ?> (./some task) (unpin pending.tasks).get(target) .false
     | and (equal[pail] record.pail_at(['flow 'definition]) (unpin proposal.definition))
       (flow_request_ops/same pending.step target task record)
@@ -157,7 +177,7 @@
     = held before.get(hole.drop(destination.len)).fall(myth/new)
     ?> config=native_work/hole held.pail_at(['work 'hole]) .false
     ?> captured=native_work/captured record.pail_at(['capture]) .false
-    ? !(and (equal[maybe[path]] (./some config.owner) record.path_at(['flow 'request_controller])) (equal[safe] config.context captured.source)) .false
+    ? !(and (equal[maybe[path]] (./some config.owner) (flow_request_ops/owner record)) (equal[safe] config.context captured.source)) .false
     ?> progress=native_work/hole_state held.pail_at(['work 'hole_state]) .false
     | equal[maybe[path]] progress.attempt (./some target)
   + blocked
@@ -199,40 +219,58 @@
     ^ yell
     ?> (./some destination) record.path_at(['flow 'destination]) (yell [] record)
     = requests=axal[myth] (flow_request_ops/requests b)
+      previous=flow_work/jobs
+        ?> jobs=flow_work/jobs record.pail_at(['flow 'jobs]) (flow_work/jobs [] 0)
+        jobs
       deps (crew/sing ['candidate] (dep .x (row/cons[iota] 'x b.here.snoc('view))))
       deps deps.put(['destination] (dep .z destination))
-    % todo=row[[path myth]] (unpin pending.tasks).tap current=myth record writes=row[[path writ]] [] deps=crew deps probes=crew (mop/empty)
+    % todo=row[[path myth]] (unpin pending.tasks).tap current=myth record writes=row[[path writ]] [] deps=crew deps probes=crew (mop/empty) jobs=row[flow_work/job] [] serial=nat previous.serial
     ^ yell
-    ?> (./some pair) todo.pull (flow_request_ops/finish_stage b record current deps probes writes)
+    ?> (./some pair) todo.pull (flow_request_ops/finish_stage b record current deps probes writes jobs serial)
     = [entry rest] pair
       [target task] entry
+      document=maybe[flow/task]
+        ?> held=flow/task task.pail_at(['flow 'task]) .none
+        | ./some held
       prior=row[[path myth]] (requests.tap.keep((\ [name held] (and (eq name.len 1) (flow_request_ops/same pending.step target task held)))))
       usable=row[[path myth]] (prior.keep((\ [name held] (and (flow_request_ops/head b.here.snoc('work).weld(name) held destination before)
         (and !(held.has(['work 'retry_requested])) (equal[pail] held.pail_at(['flow 'definition]) (unpin definition)))))))
     ? usable.len
       = [name held] usable.at(0)
-      | _ rest current writes (flow_request_ops/dependency deps b.here.snoc('work).weld(name)) probes
+      = request=path b.here.snoc('work).weld(name)
+        jobs=row[flow_work/job]
+          ?> (./some task) document jobs
+          | jobs.snoc((flow_work/job pending.step target (pin task) request .false .false))
+      | _ rest current writes (flow_request_ops/task_dependencies deps request task) probes jobs serial
     = sequence (native_work_ops/state current).fall((native_work/activity b.here "flow" "open" 0 .none)).sequence.inc
-      name=iota ($ts (str/cat_all ["request_" sequence.show]))
+      serial (? document.is_some serial.inc serial)
+      name=iota ($ts (str/cat_all [(? document.is_some "revision_" "request_") (? document.is_some serial sequence).show]))
       request=path b.here.weld(['work name])
       subject=path destination.weld(target)
       hole=path subject.weld(['holes (unpin definition).source.path.at((unpin definition).source.path.len.dec) pending.step])
       lens=path hole.snoc('context)
       context (myth/sing ['flow 'demand] (flow_work/demand pending.step target)).put(bond/weft (spun flow_request_ops/demand_view .none)).put(bond/tack (safe 0 .x (row/cons[iota] 'x b.here.snoc('view))))
-      config (native_work/hole b.here subject (safe 0 .z (row/cons[iota] 'x lens)) task.txt_at(['work 'prompt]) task.txt_at(['work 'schema]))
+      prompt=str
+        ?> (./some revision) document task.txt_at(['work 'prompt])
+        | str/from_atom revision.brief.title
+      config (native_work/hole b.here subject (safe 0 .z (row/cons[iota] 'x lens)) prompt
+        (? document.is_some (native_work_ops/text_schema ["source" "note"]) task.txt_at(['work 'schema])))
       captured (native_work/captured config.context .none (pin (axal/new[myth] (./some task))))
       vacant b.crew.get(['probe name])
     ?> (./ok available) (native_work_ops/vacant vacant)
-      | flow_request_ops/blocked record "Native work request collision"
+      | flow_request_ops/blocked record (? document.is_some "Document revision request collision" "Native work request collision")
     = probes (? available probes (probes.put(['probe name] (dep .z request))))
     = admitted (flow_request_ops/retain_demand hole config context captured.value request before.dip(hole.drop(destination.len)))
     ? admitted
      > (./err reason) (flow_request_ops/blocked record reason)
     = held (either/ok_val admitted)
-    = root (native_work_ops/event_record b.here "attempt" current (native_work_ops/attempt b.here "flow_request" captured myth/new))
+    = root (native_work_ops/event_record b.here "attempt" current (native_work_ops/attempt b.here (? document.is_some "revision" "flow_request") captured myth/new))
       root root.put(['work 'resumption] (pails/p request.snoc('resumption)))
-      root root.put(['flow 'request_controller] (pails/p b.here)).put(['flow 'request_step] (pails/q pending.step)).put(['flow 'request_target] (pails/p target))
-      root root.put(['flow 'request_task] (cell_view captured.value)).put(['flow 'definition] (unpin definition)).put(['work 'hole_path] (pails/p hole))
+      root=myth
+        ? document.is_some root
+        | root.put(['flow 'request_controller] (pails/p b.here)).put(['flow 'request_step] (pails/q pending.step)).put(['flow 'request_target] (pails/p target))
+      root (? document.is_some root root.put(['flow 'request_task] (cell_view captured.value)))
+      root root.put(['flow 'definition] (unpin definition)).put(['work 'hole_path] (pails/p hole))
       root=myth
         ?> evidence=cell_view task.pail_at(['work 'evidence]) root
         | root.put(['work 'context] (safe 0 .z (row/cons[iota] 'x request.snoc('context))))
@@ -247,6 +285,7 @@
         ? !(retried.len) root
         = [name ignored] retried.at(retried.len.dec)
         | root.put(['work 'retry_of] (pails/p b.here.snoc('work).weld(name)))
+      previous_writes writes
       view (native_work_ops/lens (safe 0 .x request) 'attempt
         [[['evidence] (safe 0 .z (row/cons[iota] 'x request.snoc('evidence)))]
          [['live] config.context]])
@@ -258,14 +297,23 @@
       writes=row[[path writ]]
         ?> evidence=cell_view task.pail_at(['work 'evidence]) writes
         | writes.snoc([request.snoc('context) (writ/make (native_work_ops/value b.here.at(0) evidence.tree))])
-    | _ rest (native_work_ops/append request current) writes (flow_request_ops/dependency deps request) probes
+      writes=row[[path writ]]
+        ?> (./some revision) document writes
+        = retry_source=str
+            ?> (./some previous) root.path_at(['work 'retry_of]) ""
+            | requests.get([previous.at(previous.len.dec) 'draft]).fall(myth/new).txt_at(['src])
+          shared=row[[path writ]] [[hole (writ/make held)] [lens (writ/make context)]
+            [request.snoc('resumption) (writ/make (flow_request_ops/resumption request before.get(hole.drop(destination.len)).fall(myth/new)))]]
+        | shared.weld((flow_work_ops/materialize record root b.here pending.step target request hole revision before retry_source)).weld(previous_writes)
+      jobs=row[flow_work/job]
+        ?> (./some revision) document jobs
+        | jobs.snoc((flow_work/job pending.step target (pin revision) request .false .false))
+    | _ rest (native_work_ops/append request current) writes (flow_request_ops/task_dependencies deps request task) probes jobs serial
   + finish_stage
-    \ b=bowl original=myth record=myth deps=crew probes=crew writes=row[[path writ]]
+    \ b=bowl original=myth record=myth deps=crew probes=crew writes=row[[path writ]] jobs=row[flow_work/job] serial=nat
     ^ yell
     ? probes.tap.len (flow_request_ops/probe b original probes)
-    = current=myth
-        ?> jobs=flow_work/jobs record.pail_at(['flow 'jobs]) record
-        | record.put(['flow 'jobs] (flow_work/jobs [] jobs.serial))
+    = current (? (jobs.len || record.has(['flow 'jobs])) (record.put(['flow 'jobs] (flow_work/jobs jobs serial))) record)
       withdrawn=row[[path writ]]
         ?> (./some destination) record.path_at(['flow 'destination]) []
         | flow_request_ops/withdraw_holes b.here destination b.crew.gut(['destination] flow_ops/empty) deps
@@ -309,6 +357,10 @@
     \ b=bowl record=myth seen=axal[myth]
     ^ maybe[yell]
     = requests=axal[myth] (flow_request_ops/requests b)
+      active_document=bool
+        | requests.tap.any
+          \ [name other]
+          | and (eq name.len 1) (and other.has(['flow 'request]) (and (native_work_ops/active other) other.has(['work 'request])))
     % todo=row[[path myth]] requests.tap
     ^ maybe[yell]
     ?> (./some pair) todo.pull .none
@@ -320,27 +372,42 @@
     ? !(flow_request_ops/current attempt seen) (_ rest)
     ?> (./some destination) record.path_at(['flow 'destination]) (_ rest)
     ? !(flow_request_ops/head b.here.snoc('work).weld(name) attempt destination b.crew.gut(['destination] flow_ops/empty)) (_ rest)
-    ?> provider=native_work/provider attempt.pail_at(['work 'provider]) (_ rest)
+    = fallback=maybe[native_work/provider]
+        ?> config=flow_maintenance/config record.pail_at(['flow 'config]) .none
+        ?> (./some held) config.provider .none
+        | ./some (unpin held)
+      selected=maybe[native_work/provider]
+        ?> provider=native_work/provider attempt.pail_at(['work 'provider]) fallback
+        | ./some provider
+    ?> (./some provider) selected (_ rest)
+    = document=bool attempt.has(['flow 'request])
+    ? (and document active_document) (_ rest)
     ?> (./some guard) (native_work_ops/captured_at b.crew.gut(['guard name.at(0)] flow_ops/empty)) (_ rest)
     ?> captured=native_work/captured attempt.pail_at(['capture]) (_ rest)
-    ? !(and (equal[safe] guard.source captured.source) (equal[pin[axal[myth]]] guard.value captured.value)) (_ rest)
+    ? (and !document !(and (equal[safe] guard.source captured.source) (equal[pin[axal[myth]]] guard.value captured.value))) (_ rest)
     = target=path b.here.snoc('work).weld(name)
       task (flow_request_ops/saved_task attempt)
       request (native_work/request target (flow_request_ops/prompt task attempt) task.txt_at(['work 'schema]) (safe 0 .x (row/cons[iota] 'x target.snoc('guard))))
+      request=native_work/request
+        ?> revision=flow_work/request attempt.pail_at(['flow 'request]) request
+        | flow_work_ops/provider_request target (unpin revision.task) requests.get(name.snoc('draft)).fall(myth/new).txt_at(['src])
     ?> (./ok pair) (native_work_ops/dispatch target.snoc('worker) request provider attempt b.crew.get(['worker name.at(0)]))
       | ./some (yell [] (native_work_ops/status "blocked" record).put(system_vocabulary/content (pails/t "Native work worker collision")))
     = [claimed writes] pair
     | ./some (yell (row/snoc[[path writ]] [target (writ/make claimed)] writes) record)
   + accept
-    \ target=path record=myth outcome=native_work/outcome guard=axal[myth] seen=axal[myth] destination=path before=axal[myth]
+    \ target=path record=myth outcome=native_work/outcome guard=axal[myth] seen=axal[myth] destination=path before=axal[myth] draft=axal[myth]
     ^ either[iota row[[path writ]]]
+    ? record.has(['flow 'request])
+      ? !(and (flow_request_ops/current record seen) (flow_request_ops/head target record destination before)) (./err 'flow_stale_revision)
+      | flow_work_ops/outcome target record outcome guard draft
     < checked (native_work_ops/check_outcome outcome guard)
     ?> captured=native_work/captured record.pail_at(['capture]) (./err 'flow_missing_capture)
     ? !(and (equal[safe] (unpin outcome.guard).source captured.source) (equal[pin[axal[myth]]] (unpin outcome.guard).value captured.value)) (./err 'flow_stale_request)
     ? !(flow_request_ops/current record seen) (./err 'flow_stale_request)
     ? !(flow_request_ops/head target record destination before) (./err 'flow_stale_request)
     < validated (flow_ops/validate_response (flow_request_ops/saved_task record) outcome)
-    ?> (./some controller) record.path_at(['flow 'request_controller]) (./err 'flow_missing_controller)
+    ?> (./some controller) (flow_request_ops/owner record) (./err 'flow_missing_controller)
     ?> step=pails/q record.pail_at(['flow 'request_step]) (./err 'flow_missing_request)
     ?> (./some relative) record.path_at(['flow 'request_target]) (./err 'flow_missing_request)
     ?> (./some hole) record.path_at(['work 'hole_path]) (./err 'flow_missing_request)
@@ -350,8 +417,7 @@
         | value.put(['work 'value] (cell_view selected))
       resolution value.put(['work 'task] record.pail_at(['flow 'request_task])).put(['flow 'definition] record.pail_at(['flow 'definition]))
       settled (native_work_ops/settle "complete" "Native work completed" record).put(['flow 'response] (cell_view (pin (axal/new[myth] (./some value)))))
-      resolved (native_work_ops/status "resolved" before.get(hole.drop(destination.len)).fall(myth/new))
-      patch (myth/sing ['work 'status] (pails/t "resolved")).put(['work 'activity] resolved.pail_at(['work 'activity])).put(['work 'reason] (pails/t "Native work completed")).put(crew_slot (cpail (mop/empty)))
+      patch (myth/sing ['work 'status] (pails/t "resolved")).put(['work 'reason] (pails/t "Native work completed")).put(crew_slot (cpail (mop/empty)))
       writes=row[[path writ]] [[target (writ/make settled)]
         [target.snoc('result) (writ/make (native_work_ops/value target.at(0) (pin (axal/new[myth] (./some value)))))]
         [controller.weld(['resolutions step.q]).weld(relative) (writ/make resolution)]
@@ -376,11 +442,16 @@
     ? !(equal[pail] requests.get(name.snoc('worker)).fall(myth/new).pail_at(['work 'request]) receipt) (_ rest)
     ?> (./some outcome) (native_work_ops/outcome_at requests.dip(name.snoc('worker))) (_ rest)
     = target=path b.here.snoc('work).weld(name)
-      result (flow_request_ops/accept target attempt outcome b.crew.gut(['guard name.at(0)] flow_ops/empty) seen destination b.crew.gut(['destination] flow_ops/empty))
+      result (flow_request_ops/accept target attempt outcome b.crew.gut(['guard name.at(0)] flow_ops/empty) seen destination b.crew.gut(['destination] flow_ops/empty) b.crew.gut(['draft name.at(0)] flow_ops/empty))
     ? result
      > (./ok writes) (./some (yell writes record))
      > (./err why)
-      = reason (str/from_atom (quip_val why))
+      = reason=str
+          ? (and attempt.has(['flow 'request]) (eq_iota why 'flow_revision_unresolved))
+            ?> (./ok pair) (flow_work_ops/decode outcome.text) (str/from_atom (quip_val why))
+            = [source note] pair
+            note
+          | str/from_atom (quip_val why)
         refused (native_work_ops/settle "waiting" reason attempt).put(['flow 'refused] (pails/q why)).put(system_vocabulary/content (pails/t reason))
         writes=row[[path writ]] [[target (writ/make refused)]]
         writes=row[[path writ]]
@@ -388,6 +459,10 @@
           ? !(flow_request_ops/head target attempt destination b.crew.gut(['destination] flow_ops/empty)) writes
           ?> (./some hole) attempt.path_at(['work 'hole_path]) writes
           | writes.snoc((native_work_ops/hole_result hole "waiting" reason))
+        record=myth
+          ? !(attempt.has(['flow 'request])) record
+          ?> progress=flow_maintenance/progress record.pail_at(['flow 'progress]) record
+          | record.put(['flow 'progress] progress.set_reason((./some why)))
       | ./some (yell writes record)
   + retry
     \ target=path input=myth state=namespace
@@ -398,7 +473,9 @@
     ? record.has(['work 'retry_requested]) (./ok [])
     ? !(eq input.nat_at(['expected] 0) state.case(.x target).fall(0)) (./err 'flow_stale_request)
     ? !(and (native_work_ops/settled record) record.has(['flow 'refused])) (./err 'flow_request_not_failed)
-    ?> (./some owner) record.path_at(['flow 'request_controller]) (./err 'flow_missing_controller)
+    = worker (cooperate_ops/record target.snoc('worker) state).fall(myth/new)
+    ? (and (gt worker.tap.len 0) !(worker.has(['work 'outcome]))) (./err 'flow_worker_active)
+    ?> (./some owner) (flow_request_ops/owner record) (./err 'flow_missing_controller)
     = controller (cooperate_ops/record owner state).fall(myth/new)
     ?> config=flow_maintenance/config controller.pail_at(['flow 'config]) (./err 'flow_missing_controller)
     ?> progress=flow_maintenance/progress controller.pail_at(['flow 'progress]) (./err 'flow_missing_controller)
@@ -408,7 +485,7 @@
     ?> (./known seen) (sovereign_view .x 0 (row/cons[iota] 'x owner.snoc('view)) state) (./err 'flow_view_unavailable)
     ? !(flow_request_ops/current record seen) (./err 'flow_stale_request)
     ? !(flow_request_ops/head target record config.destination (sovereign_peek config.destination state)) (./err 'flow_stale_request)
-    ' Like document retries, plan the replacement against this admission's
+    ' Plan the replacement against this admission's
     ' namespace. A flag followed by a controller poke can read the prior crew
     ' and record the candidate as observed before the retry flag reaches it.
     ?> candidate=flow_maintenance/candidate seen.fil.fall(myth/new).pail_at(['flow 'candidate]) (./err 'flow_view_unavailable)
@@ -416,9 +493,14 @@
     ?> pending=flow/pending (unpin proposal.output.result).fil.fall(myth/new).pail_at(['flow 'pending]) (./err 'flow_stale_request)
     = marked record.put(['work 'retry_requested] (pails/b .true))
       views (sovereign_crew_of (./some controller) state).put(['request target.at(target.len.dec)] (axal/new[myth] (./some marked)))
-      serial (native_work_ops/state controller).fall((native_work/activity owner "flow" "open" 0 .none)).sequence
-      views (flow_request_ops/allocation_views owner "request_" serial (unpin pending.tasks).wyt state views)
-      b (bowl [] owner 0 0 flow_ops/empty views)
+      document=bool record.has(['flow 'request])
+      sequence (native_work_ops/state controller).fall((native_work/activity owner "flow" "open" 0 .none)).sequence
+      serial=nat
+        ? !document sequence
+        ?> jobs=flow_work/jobs controller.pail_at(['flow 'jobs]) 0
+        jobs.serial
+      views (flow_request_ops/allocation_views owner (? document "revision_" "request_") serial (unpin pending.tasks).wyt state views)
+      b (bowl [] owner 0 0 (sovereign_care .y owner state) views)
       staged (flow_request_ops/stage b controller.put(['flow 'progress] progress.set_observed(.none)) pending
         (sovereign_peek config.destination state) proposal.definition config.provider)
       linked=bool

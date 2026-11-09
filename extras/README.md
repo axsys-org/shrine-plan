@@ -81,8 +81,11 @@ legacy declarative source bags; they had no Eden startup entrypoint.
   explicit scans, and `check(url, node, timeout)` for integration checks. Register
   companion cleanup on the supplied `ExitStack`.
 - `inspection`: selects the bounded inspection and journal response renderer.
-- `tests` and `files`: test module mappings and original-path migration inventory.
-  These are not overlaid into core at runtime.
+- `tests`: executable native test modules; `test_files`: fixture-only sources.
+- `test_suites`: additional Reaver gates, with optional `dependencies` and
+  `manual` selection; `test_dependencies`: shared test-only mount imports.
+- `files`: original-path migration inventory. Test inputs are never overlaid
+  into core at runtime. See [TESTING.md](../TESTING.md) for selection and reports.
 
 Mount records and captured sources live under `/<node>/io/fs/<name>`. Definitions
 remain under `/lib` and `/gov`; installed instances remain separate. Rescans
@@ -137,12 +140,10 @@ Native work/source/retry integration belongs to `tests/flows`;
 `flow_ui_tests` checks native document adapters; the reflected authoring gate compiles the production Grove controls and compares browser/headless invocation. Nenex question
 tests use Nenex and cooperative work directly, without a flows test dependency.
 Core Goo runtime checks run in the core gate; mounted Goo text, style and view
-checks run in explorer's `test_goo_v2` suite. The test-only `tests/fixtures/block-document` covers its
-small document operations rather than re-registering those shared Goo cases; it
-is not Nenex's document model or a production mount.
+checks run in explorer's `test_goo_v2` suite.
 The component browser check owns rich formatting, undo and draft retention;
-the block-document browser check owns structural editing and exact typed
-save/reload. The filesystem actor check owns cancellation acknowledgements;
+Nenex's document checks own Semidoc editing, relationships and typed save/reload.
+The filesystem actor check owns cancellation acknowledgements;
 the flow watcher integration covers real file changes, dynamic bindings, late
 read rejection and retained history without repeating flow publication.
 

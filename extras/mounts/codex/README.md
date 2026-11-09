@@ -23,6 +23,11 @@ activation and the host companion. Set `CODEX_BIN` to select the executable.
 `--check` uses the fake server. The host entrypoint owns bridge cleanup.
 Rescans publish source changes; replacing the live driver requires a restart.
 
+The interactive provider's `shrine_actions` descriptions include `help` from
+each captured Goo action declaration's `/sys/help` slot. This is the same
+declaration retained by the native action catalogue; the adapter does not keep
+a separate instruction registry or look up newer prose for an older capture.
+
 For manual embedding, use the bridge and driver entrypoints below.
 
 Run `python3 /path/to/shrine/extras/mounts/codex/bridge.py` from the workspace Codex should
@@ -127,8 +132,10 @@ open Cooperate investigation or a deliberately authored interactive flow task. S
 declared **Delegate native work** control). Supply a guard on the evidence or
 instructions that authorize the activity. Editing that guard invalidates further
 tool calls; editing the working document need not invalidate an independent guard.
-The ordinary `work_provider` and the inert document-revision policy keep their
-existing behavior.
+Both provider selections use `codex_work_ops/form` for dispatch and completion,
+and `codex_work_ops/recover` after restart. Tool admission and completion share its
+acknowledged thread/turn parser. The surface adapter adds tool handling and
+options; it does not install a second provider lifecycle.
 
 The surface provider supplies three app-server dynamic tools:
 

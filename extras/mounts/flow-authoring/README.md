@@ -15,6 +15,30 @@ receiver guards, cells, holes and attempts are the same ones used by headless
 invocation. `/gov/flows/nenex` supplies the final writer and the captured draft
 writer; the latter applies Nenex's existing source/attachment protection.
 
+Attach inputs to the values they consume. A computed evidence collection lives
+at `/x/<cell path>`; the physical cell record describes the computation. Inspect
+the computed collection before attaching. An occurrence keeps its original
+bindings. Use a fresh selection name to replace bindings or a detached occurrence;
+the previous controller, captures and attempts remain addressable.
+A retained `work/<run>/result` belongs to that run even when read through `/x`.
+Use `/flow/invoke` with current source inputs when a maintained flow must rerun
+a captured child definition. Reading an old result does not subscribe to future
+runs of a separate occurrence.
+
+`bind_page_source` accepts named documents inside a conversation wiki as well as
+top-level pages. It projects the selected document's current Semidoc into an
+ordinary source cell and records its exact historical origin. A missing document
+produces no current evidence. For example, bind an owner's clarification as
+`policy`, decode a separate JSON collection, then invoke
+`/gov/flows/operations/combine_sources` with `left` and `right` before `revise`.
+Include both source names in `/flow/uses`. The pure operation validates both
+collections and refuses duplicate names; it does not fetch sources or own work.
+These names are the source collection keys, not the input port names: binding
+an `owner_policy` source collection to a `policy` input still requires
+`/flow/uses owner_policy`.
+Changes to either binding wake the existing maintenance hand, while each attempt
+retains the policy and data it actually read.
+
 Interactive requests with captured evidence expose it as an ordinary frozen cell
 at `<request>/context`. Read `/x/<request>/context` to inspect the exact evidence
 given to that attempt, selecting branches and paging through children. The

@@ -11,6 +11,33 @@ import test_runner as runner
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_command_uses_frozen_driver_and_mount_sources_after_checkout_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / 'checkout'
+            frozen = Path(temporary) / 'run'
+            for name in ('src', 'x', 'extras'):
+                (checkout / name).mkdir(parents=True)
+            (checkout / 'test-inventory.json').write_text('{}')
+            (checkout / 'src/value').write_text('core-before')
+            (checkout / 'extras/value').write_text('mount-before')
+            driver = checkout / 'extras/check.py'
+            driver.write_text('from pathlib import Path\nimport os\n'
+                              'root = Path(os.environ["SHRINE_CORE_ROOT"])\n'
+                              'print((root / "src/value").read_text())\n'
+                              'print((root / "extras/value").read_text())\n'
+                              'print("FROZEN-DRIVER-PASS")\n')
+            suite = dict(name='host', kind='command', target='extras/check.py',
+                         group='host', completion='^FROZEN-DRIVER-PASS$')
+            with patch.object(runner, 'ROOT', checkout):
+                runner.freeze_sources(frozen, commands=True)
+                driver.write_text('raise RuntimeError("live driver executed")\n')
+                (checkout / 'src/value').write_text('core-after')
+                (checkout / 'extras/value').write_text('mount-after')
+                result = runner.run_group([suite], sys.executable, frozen, frozen, 5)
+            self.assertTrue(result['passed'])
+            self.assertEqual(Path(result['log']).read_text(),
+                             'core-before\nmount-before\nFROZEN-DRIVER-PASS\n')
+
     def test_worker_arenas_retain_native_reports_on_success_and_failure(self):
         for passed in (True, False):
             with self.subTest(passed=passed), tempfile.TemporaryDirectory() as temporary:
@@ -26,7 +53,7 @@ class ProtocolTests(unittest.TestCase):
                         + f'("TEST-SUMMARY" {int(passed)} 1)\n'
                         + runner.DONE + '\n')
                     return 0, True, 0.0
-                with patch.object(runner, 'run_process', execute):
+                with patch.object(runner, 'run_process', execute), patch('builtins.print'):
                     result = runner.run_group([suite], 'wisp', template, root, 1)
                 self.assertEqual(result['passed'], passed)
                 self.assertTrue((root / 'worker/snap').exists())
@@ -209,6 +236,9 @@ class ProtocolTests(unittest.TestCase):
         suites = runner.inventory()
         names = [s['name'] for s in suites]
         self.assertEqual(len(names), len(set(names)))
+        watch = next(s for s in suites if s['name'] == 'flow-watch-lifecycle')
+        self.assertFalse(watch['enabled'])
+        self.assertEqual(watch['kind'], 'command')
 
     def test_generated_helpers_are_covered_without_running_as_suites(self):
         suites = {s['name']: s for s in runner.inventory()}

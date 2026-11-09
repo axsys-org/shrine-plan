@@ -96,10 +96,12 @@ test('another participant advances the native composer selection while preservin
 });
 
 test('creation follows the admitted Goo input contract instead of guessing a slot-keyed receipt',async()=>{
-  const app=await setup({create:true});app.input.value='my_chat';await app.save('my_chat');
+  const app=await setup({create:true});app.input.value='my_chat';
+  let warned=false;app.events.beforeunload({preventDefault(){warned=true;}});assert.equal(warned,true);
+  await app.save('my_chat');
   const url=new URL(app.navigation,'http://localhost');assert.equal(url.pathname,'/conversation');
   assert.equal(url.searchParams.get('path'),'/0x11/app/nenex/w/my_chat');
-  let warned=false;app.events.beforeunload({preventDefault(){warned=true;}});assert.equal(warned,false);
+  warned=false;app.events.beforeunload({preventDefault(){warned=true;}});assert.equal(warned,false);
 });
 
 test('selecting published operations retains the creation draft',async()=>{
@@ -111,23 +113,11 @@ test('selecting published operations retains the creation draft',async()=>{
 test('opening work uses the existing native work projection; closing stops presentation reads',async()=>{
   const app=await setup();app.addTurn();await app.tick();
   const article=app.nodes.get('conversation-turns').children[0];const details=article.children.find(node=>node.events.toggle);
-  details.open=true;await details.events.toggle();assert.ok(app.mounts.includes('/0x11/app/nenex/w/chat/work/first'));
+  details.open=true;await Promise.all([details.events.toggle(),details.events.toggle()]);
+  assert.ok(app.mounts.includes('/0x11/app/nenex/w/chat/work/first'));
+  assert.equal(app.reads.filter(url=>url.startsWith('/conversation/work?')).length,1);
   app.events.pagehide();const count=app.reads.length;await app.tick();assert.equal(app.reads.length,count);
   assert.equal(app.resizes[0].disconnected,true);
-});
-
-test('the compact conversation keeps native work status distinct from a retained published response',async()=>{
-  const app=await setup();app.addTurn();app.state.turns[0].status='blocked';
-  app.state.turns[0].statusLabel='Blocked';
-  app.state.turns[0].reason='New evidence needs review';await app.tick();
-  const article=app.nodes.get('conversation-turns').children[0];
-  assert.deepEqual(article.children.map(node=>node.className),['conversation-message','conversation-work','conversation-reply']);
-  const work=article.children[1];
-  assert.equal(work.dataset.status,'blocked');
-  assert.equal(work.children[0].children[1].textContent,'Published · Blocked');
-  assert.equal(work.children[1].textContent,'New evidence needs review');
-  work.open=true;await Promise.all([work.events.toggle(),work.events.toggle()]);
-  assert.equal(app.reads.filter(url=>url.startsWith('/conversation/work?')).length,1);
 });
 
 test('chat renders each native status snapshot without inferring a UI lifecycle',async()=>{
@@ -142,11 +132,14 @@ test('chat renders each native status snapshot without inferring a UI lifecycle'
     ['watching','Watching for changes','Watching for evidence changes.']
   ]) {
     Object.assign(turn,{status,statusLabel,reason});await app.tick();
-    const work=app.nodes.get('conversation-turns').children[0].children[1];
+    const work=app.nodes.get('conversation-turns').children[0].children.find(node=>node.events.toggle);
     assert.equal(work.dataset.status,status);
     assert.equal(work.children[0].children[1].textContent,statusLabel);
     assert.equal(work.children[1].textContent,reason);
   }
+  Object.assign(turn,{published:true,status:'blocked',statusLabel:'Blocked'});await app.tick();
+  const work=app.nodes.get('conversation-turns').children[0].children.find(node=>node.events.toggle);
+  assert.equal(work.children[0].children[1].textContent,'Published · Blocked');
   // Status does not need to open/read the retained work and trace subtree.
   assert.equal(app.reads.filter(url=>url.startsWith('/conversation/work?')).length,0);
 });
@@ -187,8 +180,7 @@ test('admitted clarification projects a Nenex answer and retains the same respon
   await form.onSaved();assert.equal(form.updates.length,1);assert.equal(form.updates[0].blocks.length,0);
   assert.ok(app.mounts.includes(answer));assert.equal(app.docs.get(answer).options.compact,true);
   turn.published=true;turn.status='watching';turn.replyVersion='2';await app.tick();
-  assert.ok(app.mounts.includes(reply));assert.equal(turn.controller,'/0x11/app/nenex/w/chat/work/first');
-  assert.equal(app.state.turns.length,1);assert.ok(app.reads.every(url=>!url.includes('/op/')));
+  assert.ok(app.mounts.includes(reply));assert.ok(app.reads.every(url=>!url.includes('/op/')));
 });
 
 test('responses follow the bottom until someone reads earlier work; explicit latest resumes following',async()=>{
@@ -221,12 +213,4 @@ test('a resize retains the composer draft and refreshes only clean projections',
   assert.equal(app.input.value,'Keep this draft');assert.equal(reply.updates.length,0);
   assert.equal(app.loads.at(-1)[1].context.width,320);
   reply.edited=false;await app.tick();assert.equal(reply.updates.length,1);
-});
-
-test('creation has its own scrollable form and warns before discarding a draft',async()=>{
-  const app=await setup({create:true});
-  assert.equal(app.nodes.get('conversation').dataset.mode,'create');
-  app.input.value='unfinished';let warned=false;
-  app.events.beforeunload({preventDefault(){warned=true;}});assert.equal(warned,true);
-  assert.equal(app.reads.length,0);
 });

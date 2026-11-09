@@ -10,13 +10,15 @@ remains Python. Application work is exercised through the real native operations
 | Boundary | Definition / owner | Entry point |
 | --- | --- | --- |
 | Core language and namespace | `test-inventory.json`, `src/foil/tests`, Reaver suites | `x/check --list`; `x/check SUITE` |
-| Mounted application behavior | Mount `tests` and `test_files` declarations | `extras/x/check --mount NAME --suite SUITE` |
+| Mounted application behavior | Mount `tests`, `test_files`, and `test_suites` declarations | `extras/x/check --mount NAME --suite SUITE` |
 | Independent publication | Explicit Reaver publication fixtures | `x/check foil-semidoc-publication-tests foil-demand-publication-tests` |
-| Filesystem lifecycle | Native watch fixture and external file mutations | `extras/mounts/flows/tests/check-watch-lifecycle.py` |
+| Filesystem lifecycle | Native watch fixture and external file mutations | `x/check flow-watch-lifecycle` (explicit selection) |
 | Native crash/restart | External process driver, disposable native snapshots | `x/eden-persistence-test.py` |
 | Actual Goo/browser interaction | Explorer application gate and fixture mounts | `extras/x/check-goo` |
 
 Commands that execute native code require `WISP` or the repository's Nix shell.
+`x/check` first runs its host failure-path checks. `extras/x/check-goo` includes
+the conversation adapter checks for draft retention, refresh and Goo submission.
 `x/check --fast` selects the existing fast inventory; it does not establish
 mounted-world, browser or provider integration. The root Nix check runs `x/check`.
 Live Codex demonstrations and cost measurements are separate, explicitly chosen
@@ -25,8 +27,15 @@ checks. Controlled provider responses do not establish model reliability.
 `extras/x/check` reuses the core worker launcher. Its combined fixture is useful
 for application behavior, but cannot establish separately published mounts'
 contract identity. Keep explicit publication tests alongside those native cases.
-Test-only dependencies and several specialist gates still have ad hoc registration;
-this pass has not made every listed boundary part of one default command.
+Each mount declares executable native modules in `tests`, fixture-only sources
+in `test_files`, and additional Reaver entrypoints in `test_suites`. Shared test
+imports belong in `test_dependencies`; a specialist suite can declare its own
+`dependencies`. These extend the disposable source tree, never runtime mount
+dependencies. `manual: true` keeps cost probes out of the default run while
+allowing explicit `--suite` selection. External transport, restart and browser
+gates retain their separate launchers.
+Command gates run frozen copies of their drivers, mount descriptors and extras
+sources alongside the frozen core tree; queued execution never rereads the checkout.
 
 The shared staging recipe installs the existing `plangrm:compileP6` before
 loading the Foil compiler closure, and each worker selects it again because
@@ -47,9 +56,10 @@ extras/x/check --mount flow-examples --suite flow-reflected-authoring-tests --jo
 x/check flow-web-transport --jobs 1
 ```
 
-The stage and library suites' compiled Goo fixtures explicitly select the
-existing graph test dependency, even when run individually. This does not add
-graph to the native flows runtime mount.
+The stage fixture reads the shipped catalogue and uses the native library
+inspection/publication operations to publish only each case's requested recipes
+and their dependencies. Its compiled Goo fixtures select graph through the
+flow-examples test descriptor, including when run individually.
 The HTTP command uses a local fixture server; fetch, lifecycle assertions and
 report verdicts execute natively. These checks need no model account.
 

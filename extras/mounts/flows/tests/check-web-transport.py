@@ -33,11 +33,12 @@ class Fixture(BaseHTTPRequestHandler):
 def check():
     root = Path(os.environ['TEST_RUN_DIR']) / 'native-fetch'
     root.mkdir(parents=True, exist_ok=True)
-    # Use the same mount catalogue and fixture projection as the native gate;
-    # aliases, shared test helpers and authored recipe bytes have one owner.
-    mounts = select(REPO / 'extras', ['flows', 'flow-examples'])
+    # The runner freezes this driver, the mount catalogue and authored bytes
+    # beside the core sources before launching any groups.
     source_root = Path(os.environ['TEST_SOURCE_ROOT'])
-    materialize(source_root.parent, REPO / 'extras', root / 'src',
+    extras = source_root.parent / 'extras'
+    mounts = select(extras, ['flows', 'flow-examples'])
+    materialize(source_root.parent, extras, root / 'src',
                 {mount.name for mount in mounts}, native_tests=True)
     server = ThreadingHTTPServer(('127.0.0.1', 0), Fixture)
     worker = threading.Thread(target=server.serve_forever, daemon=True)

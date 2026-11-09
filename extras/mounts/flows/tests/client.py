@@ -41,21 +41,6 @@ class FlowClient(Client):
         self.apply('publish', author, {'id': name, 'expected': version})
         return author + '/flows/' + name
 
-    def preview(self, definition, destination, bindings, *, ident=None, writer=None):
-        ident = ident or 'run_' + uuid.uuid4().hex
-        inputs = {'id': ident, 'destination': {'type': 'path', 'value': destination},
-                  'writer': reference(writer or self.publisher + '/nenex')}
-        inputs.update({'input/' + name: value if isinstance(value, dict) else reference(value, 'z')
-                       for name, value in bindings.items()})
-        self.apply('preview', definition, inputs)
-        return definition + '/work/' + ident
-
-    def commit(self, run):
-        return self.apply('commit', run, {})
-
-    def observe(self, feed, source):
-        return self.apply('observe', feed, {'source': reference(source, 'z')})
-
     def follow(self, controller, definition, destination, bindings, *, writer=None, provider=None):
         inputs = {'definition': reference(definition),
                   'destination': {'type': 'path', 'value': destination},
@@ -66,12 +51,6 @@ class FlowClient(Client):
                        for name, value in bindings.items()})
         self.apply('follow', controller, inputs)
         return controller
-
-    def set_enabled(self, controller, enabled):
-        return self.apply('set_enabled', controller, {'enabled': enabled})
-
-    def source_failed(self, feed, reason):
-        return self.apply('source_failed', feed, {'reason': reason[:1500]})
 
     def submit_revision(self, request, source, note, expected=None):
         if expected is None:

@@ -490,14 +490,14 @@ there and projects the supplied run styles. It does not supply input padding,
 borders, fonts or colors. No rich-input stylesheet is required.
 
 Ordinary `data-goo-surface` hosts mount prepared views directly without Explorer
-inspection or pane chrome. The block-document shell is one such Grove view and
-loads only the generated profile/font stylesheets. `/sys/slot/overlay` groups
+inspection or pane chrome. Nenex uses these hosts for its document views.
+`/sys/slot/overlay` groups
 export the profile input canvas as their background paint; HTML projects the
 same paint for browser popovers. Platform popovers handle top-layer placement.
 `POST /goo/feedback` prepares bounded runtime messages through Goo and returns
 an HTML fragment without reading or mutating namespace state.
 
-The test-only `extras/tests/fixtures/block-document` mount declares ordinary Grove views at
+Rich-input receivers can declare ordinary Grove views at
 `/sys/slot/text_toolbar` and `/sys/slot/text_commands`. Explorer requests them
 through normal prepared rendering, anchors the resulting native buttons to
 the platform selection, and interprets their `/sys/edit/<command>` slots.
@@ -512,8 +512,8 @@ command; it returns the transformed draft and selection. JSON and the named
 protobuf-v2 TextEdit response are supported. The endpoint does no namespace
 lookup or mutation and confers no action authority. Keystrokes arriving during
 a command are queued and applied to its result. A document action decides how
-to interpret the saved runs; block-document reconstructs a bounded flat block
-sequence in Foil.
+to interpret the saved runs; Nenex reconciles them against authored Semidoc
+through its native document operations.
 
 ## Native domain saves
 

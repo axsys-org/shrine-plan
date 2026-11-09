@@ -166,7 +166,9 @@ def inventory():
     for command in data['commands']:
         if not (ROOT / command['target']).is_file():
             raise ValueError('missing command target: ' + command['target'])
-        suites.append(dict(command, kind='command', group=command['name'], enabled=True))
+        suites.append(dict(command, kind='command', group=command['name'],
+                           enabled=command.get('enabled', True),
+                           reason=command.get('reason', 'Explicit selection only.')))
     return suites
 
 
@@ -281,14 +283,25 @@ def copy_template(source, dest):
         copy_snapshot(source, dest)
 
 
+def freeze_sources(root, commands=False):
+    """Freeze native modules and, for host gates, their drivers and mount inputs."""
+    shutil.copytree(ROOT / 'src', root / 'src')
+    if commands:
+        for name in ('x', 'extras'):
+            shutil.copytree(ROOT / name, root / name,
+                            ignore=shutil.ignore_patterns('__pycache__', 'node_modules', '.check'))
+        shutil.copyfile(ROOT / 'test-inventory.json', root / 'test-inventory.json')
+
+
 def run_group(suites, wisp, template, root, timeout):
     directory = root / suites[0]['group']
     command_suite = suites[0]['kind'] == 'command'
     if command_suite:
         env = dict(os.environ, WISP=wisp, TEST_TEMPLATE=str(template),
+                   SHRINE_CORE_ROOT=str(root),
                    TEST_SOURCE_ROOT=str(root / 'src'),
                    TEST_RUN_DIR=str(directory), PATH=str(Path(wisp).parent) + os.pathsep + os.environ.get('PATH', ''))
-        code, complete, seconds = run_process([sys.executable, str(ROOT / suites[0]['target'])],
+        code, complete, seconds = run_process([sys.executable, str(root / suites[0]['target'])],
                                                directory, '', timeout, env)
         log = (directory / 'out.log').read_text(errors='replace')
         good = bool(code == 0 and complete and not ERROR.search(log)
@@ -450,7 +463,7 @@ def main():
     compiler = stage(wisp, args.fresh, args.timeout or 900)
     # Modules load lazily, sometimes minutes into a group. Preserve one source
     # revision for all runtime groups while work continues in the checkout.
-    shutil.copytree(ROOT / 'src', root / 'src')
+    freeze_sources(root, commands=any(s['kind'] == 'command' for s in selected))
     phases = {'compiler_seconds': round(time.monotonic() - started, 3)}
     (root / 'phases.json').write_text(json.dumps(phases, indent=2) + '\n')
     print('Setup: ' + json.dumps(phases), flush=True)

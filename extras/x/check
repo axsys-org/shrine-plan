@@ -18,7 +18,7 @@ parser.add_argument('--core-root', type=Path, default=ROOT.parent)
 parser.add_argument('--extras-root', type=Path, default=ROOT,
                     help='Mount catalogue, including explicitly selected test fixtures')
 parser.add_argument('--mount', action='append')
-parser.add_argument('--suite', action='append', help='Run only these mounted native suites (repeatable)')
+parser.add_argument('--suite', action='append', help='Run only these registered mounted suites (repeatable)')
 parser.add_argument('--jobs', type=int, default=2)
 parser.add_argument('--timeout', type=int, default=1200)
 parser.add_argument('--contracts-only', action='store_true', help='Typecheck selected activation, HTTP and driver entrypoints')
@@ -29,20 +29,35 @@ sys.path.insert(0, str(args.core_root.resolve() / 'x'))
 from eden_mounts import select, catalog
 import test_runner as runner
 mounts = select(ROOT, args.mount or list(catalog(ROOT)))
-helpers = {'app_test_world', 'eden_srs', 'eden_debug', 'tests/eden_srs',
-           'tests/debug_http', 'tests/grove_debugger'}
-if any(m.name == 'flow-authoring' for m in mounts) and not args.contracts_only:
-    # These suites include authored examples and the optional HTTP provider.
-    mounts = select(ROOT, [m.name for m in mounts] + ['flow-examples'])
+# Test-only source dependencies stay in their owners' descriptors. They never
+# become runtime mount dependencies or select additional provider processes.
+if not args.contracts_only:
+    while True:
+        names = {m.name for m in mounts}
+        required = {dep for m in mounts for dep in m.manifest.get('test_dependencies', [])}
+        if required <= names:
+            break
+        mounts = select(ROOT, sorted(names | required))
+suites = []
+for mount in mounts:
+    suites.extend(dict(name='foil:' + name, target=name, kind='native',
+                       selection=name, group=mount.name, timeout=args.timeout)
+                  for name in mount.manifest.get('tests', {}))
+    suites.extend(dict(dict(name=name, target=name, group=name, timeout=args.timeout),
+                       **spec, selection=name)
+                  for name, spec in mount.manifest.get('test_suites', {}).items())
 if args.suite:
-    registered = {name for m in mounts for name in m.manifest.get('tests', {}) if name not in helpers}
-    if any(m.name == 'nenex' for m in mounts):
-        registered.add('nenex-document-tests')
-    if any(m.name == 'flow-authoring' for m in mounts):
-        registered.update(['flow-reflected-authoring-tests', 'flow-authoring-only-tests', 'cartography-publication-tests', 'flow-boundary-cost-tests'])
-    unknown = set(args.suite) - registered
+    unknown = set(args.suite) - {s['selection'] for s in suites}
     if unknown:
         parser.error('unknown mounted suites: ' + ', '.join(sorted(unknown)))
+if args.contracts_only:
+    suites = []
+elif args.suite:
+    suites = [s for s in suites if s['selection'] in args.suite]
+else:
+    suites = [s for s in suites if not s.get('manual')]
+mounts = select(ROOT, sorted({m.name for m in mounts} |
+    {dep for suite in suites for dep in suite.get('dependencies', [])}))
 # Mounted Goo consumes the same verified profile as standalone production.
 # Catch stale generated Foil/CSS before a native pass can mask asset drift.
 if any(m.name == 'goo' for m in mounts):
@@ -51,23 +66,6 @@ if any(m.name == 'goo' for m in mounts):
                             ('generate-fonts.py', ['--check']),
                             ('test-sync-mash-profile.py', [])]:
         subprocess.run([sys.executable, str(profile_scripts / script), *options], check=True)
-# Test-only helper dependencies do not become runtime dependencies.
-if any(m.name == 'debugger' for m in mounts):
-    mounts = select(ROOT, [m.name for m in mounts] + ['srs'])
-if any(m.name == 'flow-authoring' for m in mounts) and not args.contracts_only and (
-        not args.suite or any(name in args.suite for name in ['flow-reflected-authoring-tests', 'flow-boundary-cost-tests'])):
-    # The reflected authoring fixture includes the Codex surface. This is a
-    # test dependency even when that one suite is selected explicitly.
-    mounts = select(ROOT, [m.name for m in mounts] + ['codex'])
-    if not args.suite or 'flow-reflected-authoring-tests' in args.suite:
-        mounts = select(ROOT, [m.name for m in mounts] + ['conversation'])
-if any(m.name == 'flow-authoring' for m in mounts) and not args.contracts_only and (
-        not args.suite or any(name.startswith('flow_cartography') or name in [
-            'cartography-publication-tests', 'flow_stage_tests', 'flow_library_tests'
-        ] for name in args.suite)):
-    # Stage/library fixtures and cartography compile the graph-enabled Goo
-    # boundary. This remains a test dependency of the selected suites.
-    mounts = select(ROOT, [m.name for m in mounts] + ['graph'])
 runtime = os.environ.get('WISP') or shutil.which('wisp')
 if not runtime:
     parser.error('Set WISP or enter the core Nix shell')
@@ -104,31 +102,10 @@ if len(contracts) > 1:
 ''')
     groups.append([dict(name='extras-mount-contract-tests', target='extras-mount-contract-tests',
                         kind='reaver', group='mount-contracts', entrypoint='check', timeout=args.timeout)])
-for mount in ([] if args.contracts_only else mounts):
-    suites = [dict(name='foil:' + name, target=name, kind='native',
-                   group=mount.name, timeout=args.timeout)
-              for name in mount.manifest.get('tests', {}) if name not in helpers
-              and (not args.suite or name in args.suite)]
-    if suites:
-        groups.append(suites)
-    if mount.name == 'debugger':
-        groups.append([dict(name='foil-grove-debugger-tests', target='foil-grove-debugger-tests',
-                            kind='reaver', group='grove-debugger', timeout=args.timeout)])
-    if mount.name == 'nenex' and (not args.suite or 'nenex-document-tests' in args.suite):
-        groups.append([dict(name='nenex-document-tests', target='nenex-document-tests', kind='reaver',
-                            group='nenex-document', entrypoint='check', timeout=args.timeout)])
-    if mount.name == 'flow-authoring':
-        if args.suite and 'flow-boundary-cost-tests' in args.suite:
-            groups.append([dict(name='flow-boundary-cost-tests', target='flow-boundary-cost-tests',
-                                kind='reaver', group='flow-boundary-cost', entrypoint='check', timeout=args.timeout)])
-        if args.suite and 'flow-authoring-only-tests' in args.suite:
-            groups.append([dict(name='flow-authoring-only-tests', target='flow-reflected-authoring-tests',
-                                kind='reaver', group='flow-authoring-only', entrypoint='check-authoring', timeout=args.timeout)])
-        for name, group in [('flow-reflected-authoring-tests', 'flow-authoring-reflected'),
-                            ('cartography-publication-tests', 'cartography-publication')]:
-            if not args.suite or name in args.suite:
-                groups.append([dict(name=name, target=name, kind='reaver',
-                                    group=group, entrypoint='check', timeout=args.timeout)])
+by_group = {}
+for suite in suites:
+    by_group.setdefault(suite['group'], []).append(suite)
+groups.extend(by_group.values())
 print('Extras test results: ' + str(work), flush=True)
 with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
     futures = [pool.submit(runner.run_group, group, runtime, template, work, args.timeout)

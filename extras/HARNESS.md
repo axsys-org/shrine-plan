@@ -30,7 +30,6 @@ authored procedure and its maintained documents, not another application runtime
 | `mounts/flows/install.foil` | Native flow command/law registration and retained-contract checks | Nenex routes or example catalogue |
 | `mounts/flow-examples/examples.foil`, `examples/`, `examples.json` | Optional authored recipes and their setup data | Runtime policy for all flows |
 | `flow_library` in `mounts/flow-examples/examples.foil` | Pure native-capture and format adapters for the learning, atlas and ingestion recipes, under the existing examples publisher | Work ownership, a parser implementation, instruction adoption or scheduling |
-| `tests/fixtures/block-document` | Goo regression fixture with its own small bounded block model | Nenex's document representation |
 
 `flows` is independently installable with Cooperate and its native dependencies.
 `flow-authoring` adds Nenex, the document writer and declared Goo controls;
@@ -263,8 +262,8 @@ Those decisions belong to existing native records and reactions.
 `mounts/` contains optional application and capability mounts. Demonstrations such
 as `hello-grove`, `goo-moodboard`, `life` and `patch-demo` are optional examples,
 not dependencies of the harness. Browser/native conformance specimens belong in
-`tests/fixtures/`; block-document is now there alongside panes and tree-pages.
-Do not delete a regression merely because its fixture resembles an application.
+`tests/fixtures/`, including panes and tree-pages. Document editing checks use
+Nenex's actual Semidoc records; rich-input checks use the shared Goo controls.
 
 The revision policy in `work_ops.foil` constructs Semidoc draft records. The selected
 writer may declare an existing native `kook` in `flow/document`; attachment captures
@@ -329,11 +328,6 @@ drafts, uncertain outcomes and refresh without repeating admitted writes. The
 optional `/live` inspector has its own native route suite (`tests/inspector`),
 read-only adapter tests under `mounts/inspector/tests/`, and packaged-asset host
 checks. Its tests do not stand in for headless declared-action conformance.
-The optional `flow-work-cost-tests.rvr` check isolates current crew hydration from
-compilation and world construction. Its comparison with whole-work-tree reads is
-not an end-to-end latency benchmark: the hand still reads its destination view,
-and explicit retry still checks retained retry links.
-
 `flow-boundary-cost-tests.rvr` measures complete evidence-change through controlled
 provider completion and writer publication, varying retained attempts, destination
 records, unselected holes and the width of one bound source subtree separately.
@@ -368,9 +362,10 @@ committed six events. That bounds this selection, not the complete transaction:
 destination inspection, history filtering, authority recovery scans and document
 serialization still have costs that grow with their inputs.
 
-Unit state-machine tests may simulate write application or use fixture input
-shorthand. They supplement native admission and compiled Grove tests; they do not
-replace them. Controlled provider results establish lifecycle behavior, not a
+Focused tests supply controlled records or compact argument spelling, call the
+production handlers explicitly and admit writes through the native namespace.
+Compiled Grove tests separately establish control selection and wiring.
+Controlled provider results establish lifecycle behavior, not a
 fresh end-to-end live Codex run. Keep regressions for retained capabilities beside
 the implementation, including pinned cycles and occupied allocation descendants.
 

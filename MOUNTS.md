@@ -29,17 +29,35 @@ staging, browser builds, bridge credentials and logs live in a temporary session
 directory, removed when the launcher exits. `--ephemeral` explicitly selects
 the default disposable behavior; `--check` also uses a disposable snapshot.
 
-The world uses the native runtime selected by `flake.lock`. Native `Save` and
-reconnection establish persistence independently of arena-sharing optimizations
-or compaction. This stack does not change the runtime's arena format or install
-prototype storage-maintenance patches. Checkpoint space reclamation remains a
-separate runtime concern; pinning contracts does not solve checkpoint growth.
+The world uses the native runtime selected by `flake.lock`, now pinned to the
+existing Enki native-body-sharing change (`2f50ab3`). This runtime reads layout-1
+arenas and writes layout-2 sharing references. Native `Save` and reconnection
+establish persistence independently of this space optimization. The pin does
+not include prototype compaction; checkpoint space reclamation remains a
+separate runtime concern. Pinning contracts does not solve checkpoint growth.
 
-An existing arena written by the layout-2 sharing prototype still requires a
-layout-2-compatible runtime. Removing that patch from this stack does not downgrade
-or convert the arena, and an older upstream runtime cannot reopen it. Keep the
-compatible runtime for such a world; independent review of storage optimization
-does not remove this existing format dependency.
+An arena written by the layout-2 sharing runtime requires a compatible runtime
+on subsequent restarts. Changing the dependency back to the older layout-1
+runtime does not downgrade or convert the arena. Keep a compatible reader for
+the world; review of storage optimization does not remove this format dependency.
+
+Grove publication retains the compiled artifact and selected exports on each
+published member so later imports can use their original definitions. The
+compiler freezes its completed product once with native `Ice`, then returns
+`Unpin` of that product. The bundle layout and PLAN values stay unchanged;
+native body sharing can reuse the artifact, descriptors and exported values
+across the individual record pins instead of serializing their raw graphs
+again for every member. No history or provenance is discarded.
+
+That space optimization requires both the sharing runtime and the compiler's
+`Ice` boundary. `Ice` alone does not prevent the older store from copying raw
+bodies across pins. The launcher also accepts an explicit runtime through its
+existing `WISP` override. This compiler boundary applies to newly built services:
+an existing snapshot keeps its captured compiler on restart. Runtime sharing
+alone leaves the old compiler's duplication between newly published records.
+Neither changing the checkout nor selecting a sharing runtime replaces that
+compiler or reclaims old extents. The existing mount publication interface does
+not provide an operation to replace that captured compiler.
 
 A native snapshot resumes an executable root. Eden's root contains a pin to
 the namespace and a pin to the code needed to serve it, using `eden:resume`.

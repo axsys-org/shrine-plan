@@ -73,7 +73,7 @@ def main():
     worker.start()
     print(f'Disposable watch world: {root}', flush=True)
     try:
-        template = runner.stage(runtime, False, 1200)
+        template = Path(os.environ['TEST_TEMPLATE']) if os.environ.get('TEST_TEMPLATE') else runner.stage(runtime, False, 1200)
         suites = [dict(name='foil:' + name, target=name, kind='native',
                        group='native', timeout=1200)
                   for name in ['tests/watch_lifecycle']]
@@ -83,7 +83,10 @@ def main():
         worker.join()
     print(json.dumps({'passed': result['passed'], 'fixture_errors': faults,
                       'results': str(root / 'native/result.json')}, indent=2))
-    return 0 if result['passed'] and not faults else 1
+    if result['passed'] and not faults:
+        print('NATIVE-WATCH-LIFECYCLE-PASS', flush=True)
+        return 0
+    return 1
 
 
 if __name__ == '__main__':

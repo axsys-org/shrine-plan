@@ -32,6 +32,14 @@ All persistent flow contracts retain their existing `flows` module owner,
 including the document-ownership and HTTP-result contracts. The optional mounts
 publish implementation modules and views, not replacement record types.
 
+`flow_request_ops` owns allocation, current-demand subscriptions, dispatch,
+completion, retirement and retry for both document revisions and other effectful
+steps. `flow_work_ops` supplies document policy: Semidoc validation, the inert
+revision prompt, drafts and the captured document writer. The retained
+`flow_work/jobs` record supplies document navigation and its allocation serial;
+its old dispatch flags do not schedule work. Dispatch receipts and outcomes live
+on the native attempts and workers.
+
 The document revision path captures a draft writer using the same
 `flow_runtime/writer` contract as final result publication. Final Nenex publication
 owns generated corpus pages; a revision draft instead lives under retained work.
@@ -547,10 +555,17 @@ its own subscriptions.
 Cells displays completed revisions from the existing retained-request projection;
 the hand continues to select only current jobs and live hole heads. Adoption and
 detach derive that selection even when a retained controller has not reacted yet.
+The work cell and each request's draft overlay supply presentation. Execution
+does not maintain copied queue, workspace or overview documents, or a second
+status/target string. Existing records at those former presentation paths remain
+untouched; draft documents, captured instructions, evidence and receipts remain.
 Publication settles only owned demands fulfilled in the accepted trace and releases
 their live subscriptions. It removes obsolete failed job selections while retaining
 the allocation serial, accepted jobs and failed attempts. A later unresolved demand
 gets a fresh head; another controller's hole or an unrelated question cannot satisfy it.
+The hole hand updates its own native activity when it receives a status change.
+Flow completion also withdraws that demand's subscriptions; ordinary answering
+holes keep theirs so changed evidence can reopen the question.
 
 The Codex hand owns app-server dispatch and stable turn completion. Its Python
 companion transports bytes and owns the child process. On restart an interrupted

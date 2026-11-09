@@ -160,7 +160,7 @@ counts pages against explicit node and byte limits and refuses an incomplete
 result instead of silently truncating it. It is not a prompt generator or model
 provider adapter.
 
-The native proof bounds context capture to 16 aliases, 64 records and 64 KiB of
+The native commands bound context capture to 16 aliases, 64 records and 64 KiB of
 accounted data per command. An optional artifact has its own 64-record/64-KiB
 budget, so an append with context and an artifact may retain up to 128 records
 and 128 KiB. Command content is limited to 16 KiB, and a run to 128 trace entries.

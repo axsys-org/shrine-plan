@@ -242,32 +242,24 @@ host process, filesystem store, scheduler, provider loop or save format.
 Run `extras/x/check --mount conversation --suite conversation_tests
 --suite flow_document_boundary_tests` with the native runtime available, and
 `node --test extras/mounts/conversation/app.test.cjs` for presentation refresh and
-draft handling. The native cases use controlled provider responses. They cover
+draft handling (also included in `extras/x/check-goo`). The native cases use controlled provider responses. They cover
 literal multiline messages, native reply references, repeated bindings through
 source/Goo edits, retained turn order, graph-context removal/restoration, stale
 result rejection, holes/retries, occupied-address guards and retained x/y/z
 history. Status cases distinguish active workers, clarification, provider and
 validation failures, retries, pause, allocation collisions and publication
-guards without treating historical work as current. The input/resumption pass
-verified 101 conversation checks and 17 browser checks. It covers same-hole
+guards without treating historical work as current. Input/resumption checks cover same-hole
 resumption, the declared Goo adapter, guarded and duplicate submissions,
 clarification capture in subsequent turns, and retained x/y/z history. The edited
 response case delivers to the crew-selected current request and checks the exact
 `flow_generated_page_edited` refusal, not merely the overloaded controller status.
-Existing document-boundary cases check source ownership and captured writers
-alongside those additions.
+Document-boundary cases check source ownership and captured writers.
 
 A separately mounted world is also required for integration validation: the
 combined fixture shares one compilation context, whereas deployed mounts must
 explicitly import the same Semidoc contract. `codecs` owns that pinned artifact
 for both Flows and Web/Nenex. No runtime type matching is involved.
 
-The November 2026 validation passed 48 conversation checks, 43 existing document
-boundary checks and six browser-adapter checks. In a separate persisted world,
-the live Codex provider read wiki evidence and published a response with a native
-reference. A second turn discovered Goo controls, created a named wiki child,
-read it back and published a response linking to it. An earlier malformed
-response remained in its failed attempt; the declared retry created a linked
-attempt, published successfully and resolved the original hole. Those live cases
-exercise the provider boundary; they are not a claim of model reliability,
-automatic skill selection or broad performance validation.
+Controlled provider responses do not establish live-model reliability, automatic
+skill selection or performance. Check the retained native reports for the actual
+suites and outcomes of each validation run.
