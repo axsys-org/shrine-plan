@@ -5,7 +5,10 @@
     flake = false;
   };
   inputs.enki = {
-    url = "github:axsys-org/enki/main";
+    # ct/native-arena-sharing: cross-record body sharing, native arena layout 2.
+    # Paired with the completed Grove product's Ice boundary. See MOUNTS.md
+    # for restart compatibility; this revision does not include compaction.
+    url = "github:axsys-org/enki/2f50ab3d07c70eb9403ade276af2ff2d43b104a0";
   };
   outputs = { self, nixpkgs, rex, enki }:
     let

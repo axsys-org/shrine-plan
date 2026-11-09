@@ -29,17 +29,23 @@ staging, browser builds, bridge credentials and logs live in a temporary session
 directory, removed when the launcher exits. `--ephemeral` explicitly selects
 the default disposable behavior; `--check` also uses a disposable snapshot.
 
-The world uses the native runtime selected by `flake.lock`, now pinned to the
-existing Enki native-body-sharing change (`2f50ab3`). This runtime reads layout-1
-arenas and writes layout-2 sharing references. Native `Save` and reconnection
+The world uses the native runtime selected by `flake.nix` and `flake.lock`:
+[Enki `2f50ab3`](https://github.com/axsys-org/enki/commit/2f50ab3d07c70eb9403ade276af2ff2d43b104a0),
+the `ct/native-arena-sharing` revision. This explicitly selects the separate
+storage change rather than following Enki `main`. The lock fixes the
+source hash as well as the revision. This runtime reads layout-1 arenas and
+writes layout-2 sharing references. Native `Save` and reconnection
 establish persistence independently of this space optimization. The pin does
 not include prototype compaction; checkpoint space reclamation remains a
 separate runtime concern. Pinning contracts does not solve checkpoint growth.
 
-An arena written by the layout-2 sharing runtime requires a compatible runtime
-on subsequent restarts. Changing the dependency back to the older layout-1
-runtime does not downgrade or convert the arena. Keep a compatible reader for
-the world; review of storage optimization does not remove this format dependency.
+Opening a layout-1 arena for reading does not upgrade it. The sharing writer's
+next checkpoint commits layout 2, including both superblock slots, so an older
+reader rejects the arena rather than silently selecting an obsolete checkpoint.
+The reachable root and retained history remain. Subsequent restarts require a
+compatible runtime: changing the dependency back to the older layout-1 runtime
+does not downgrade or convert the arena. `WISP` overrides must respect this
+format dependency too.
 
 Grove publication retains the compiled artifact and selected exports on each
 published member so later imports can use their original definitions. The
@@ -58,6 +64,15 @@ alone leaves the old compiler's duplication between newly published records.
 Neither changing the checkout nor selecting a sharing runtime replaces that
 compiler or reclaims old extents. The existing mount publication interface does
 not provide an operation to replace that captured compiler.
+
+A controlled production-authoring publication measured 3.28 GiB of arena growth
+with the raw compiler product and 43 MiB with the iced product, using the same
+sharing runtime. Before and after namespace root hashes matched between the
+variants, and both native images passed verification. These are measurements of
+that publication fixture, not general scaling guarantees. Reproduce semantic
+coverage through `x/check foil-grove-backend-tests foil-grove-pin-tests
+foil-publication-tests` and the `flow-reflected-authoring-tests` mounted suite;
+those suites check behavior, not a fixed byte threshold.
 
 A native snapshot resumes an executable root. Eden's root contains a pin to
 the namespace and a pin to the code needed to serve it, using `eden:resume`.
