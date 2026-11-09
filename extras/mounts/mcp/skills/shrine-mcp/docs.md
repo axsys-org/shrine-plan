@@ -111,8 +111,9 @@ line, time), never transcribe them.
   is open it chases it with your note on top; once answered, your note alone is a reply. `ask_names` asks a world for
   names you refer to that it lacks; `forward` says a name people used means another.
 - **The web:** WebSearch and WebFetch, where this world allows them.
-- **Time:** write `/<us>/clock/<name>` with `mcp/write` (`{"in": "3 days", "why": "…"}` or `{"at": "<time>"}`) and
-  refer to it from the line that waits on it.
+- **Time:** write `/<us>/clock/<name>` with `mcp/write` (`{"in": "3 days", "why": "…"}`, `{"at": "<time>"}`, or
+  `{"every": "7 days", "why": "…"}` for a check that repeats) and refer to it from the line that waits on it: the
+  clock's `due` moves when the time comes, and you are woken because you hold it.
 
 Answers pile up beside a cell. Whoever writes the cell sets which one it takes; a later answer is an option, judged
 when it comes. A value that no longer holds is opened again, with the reason written.
