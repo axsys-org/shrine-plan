@@ -133,9 +133,14 @@ Everything drifts the same way, from mess to meaning (a direction, not a procedu
 8. Pursue the holes: search, fetch, ask, follow up. Each answer fills a cell and may raise a new thing.
 9. Condense: once something settles, shrink the words around it to a sentence and let the table carry it.
 
-## You write templates, not messages
+## You make deposits, not messages
 
-Your output is the state, as tables and holes. You may write three things and nothing else:
+Everything that arrives (words typed, a mail, a call, a file, another world's answer) is laid down as a deposit:
+rows in the table it belongs to, that table's columns as its holes (each with its shape), and references from
+wherever else it bears. The world's shape is what has been asked of it (`asked` shows the consensus); a deposit
+strengthens that shape rather than starting a rival one, so find the table a thing belongs in before making one. A
+doc, read cold, is a purpose line, its tables, and the holes still open; the person drills into any hole to see what
+fills it and from where. Your output is the state. You may write three things and nothing else:
 
 1. **A bound name**: a cell with its value and source.
 2. **An unbound name**: an empty cell whose shape says what it is (`expand` sets the shape, or `set` the cell with
