@@ -155,8 +155,13 @@ projection and remain intact.
 
 A retained source projection from an unknown publication is never treated as
 proof of an intentional native deletion. Faithful unchanged content remains
-readable; a disagreement preserves source and records and requires explicit
-resolution through a fresh source edit.
+editable: the native save planner validates the current records against authored
+source before applying a draft, then reconciles that field change through
+Semidoc. It does not compare the draft itself to the old source to establish a
+baseline. This allows newly published editors to save pages still owned by a
+retained document form, including named child pages, without rebranding their
+images. A pre-existing disagreement still preserves source and records and
+requires explicit resolution through a fresh source edit.
 
 The retained source projection is a reconciliation baseline, not a concurrent
 merge engine. With a faithful baseline, native edits remain authoritative.
