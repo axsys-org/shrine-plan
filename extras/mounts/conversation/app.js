@@ -11,11 +11,17 @@
   const turns = document.getElementById('conversation-turns'), frames = new Map();
   const history = document.getElementById('conversation-history');
   const latest = document.getElementById('conversation-latest');
+  const navigation=document.getElementById('conversation-navigation');
+  const panel=document.getElementById('conversation-panel'),panelNotice=document.getElementById('conversation-panel-notice');
+  const wiki=document.getElementById('conversation-wiki'),work=document.getElementById('conversation-work');
   const page = host.dataset.page, vocabulary = host.dataset.vocabulary;
   const inputs = new Map(), actionScope = {};
+  const navigationScope={},views={chat:'/sys/slot/conversation_chat',wiki:'/sys/slot/conversation_wiki',work:'/sys/slot/conversation_work'};
+  let selected='chat',navigationKey,wikiTree,wikiLoading,emptyWork;
   let refreshing = null, composerData, composerVersion, composerWidth, closed = false, following = true, followedTop = null;
   let lastNotice='', refreshError='';
   host.dataset.mode = page ? 'chat' : 'create';
+  navigation.hidden=!page;
   composer.textContent='Opening composer…';
   composer.setAttribute('aria-busy','true');
   const composerDirty = () => [...inputs.values()].some(input=>input.value!==input.getAttribute('value'));
@@ -40,10 +46,62 @@
   };
   const readWork = path => read('/conversation/work', path);
   const readInputs = path => read('/conversation/inputs', path);
+  const panelReport=text=>api.feedback(panelNotice,text,Math.min(panelNotice.clientWidth||panel.clientWidth||720,720));
+  async function renderNavigation(target){
+    const context=api.context(navigation),slot=views[selected],width=context.width,key=slot+':'+width;
+    if(!width||navigationKey===key)return;
+    const data=await api.load(target,{slot,context:{...context,width:Math.min(width,720),layout:undefined}});
+    if(slot!==views[selected])return;
+    const content=api.mount(navigation,data,true,false);navigationKey=key;
+    api.bind(content,{target,view:data.view,snapshot:data.snapshot,controls:data.controls,actionScope:navigationScope,report:panelReport,become:selectView});
+  }
+  function arrangeWork(){
+    for(const frame of frames.values()){
+      if(selected==='work'){if(frame.details.parentNode!==work)work.append(frame.details);}
+      else if(frame.details.parentNode!==frame.element)frame.element.insertBefore(frame.details,frame.element.children[frame.message?1:0]||null);
+    }
+  }
+  async function selectView(slot){
+    const choice=Object.keys(views).find(key=>views[key]===slot);
+    if(!choice)throw Error('This conversation view is unavailable.');
+    selected=choice;host.dataset.panel=choice;panel.hidden=choice==='chat';wiki.hidden=choice!=='wiki';work.hidden=choice!=='work';
+    arrangeWork();
+    if(choice==='work'&&frames.size&&![...frames.values()].some(frame=>frame.details.open))[...frames.values()].at(-1).details.open=true;
+    await panelReport('');await refresh();
+  }
+  async function renderPanel(state){
+    if(selected==='wiki'){
+      if(!wikiTree){
+        wikiLoading ||= (async()=>{
+          const [document,frontier]=await Promise.all([read('/nenex/document',state.wiki),read('/nenex/children',state.wiki)]);
+          wikiTree=await documents.mountTree(wiki,{root:state.wiki,pages:[document],frontier,documentUrl:'/nenex/document',childrenUrl:'/nenex/children'});
+        })().finally(()=>{wikiLoading=null;});
+        await wikiLoading;
+      }else await wikiTree.refresh();
+    }
+    if(selected==='work'){
+      if(!frames.size&&!emptyWork){emptyWork=document.createElement('div');work.append(emptyWork);await api.feedback(emptyWork,'No work yet. Send a message to begin.',Math.min(work.clientWidth,720));}
+      if(frames.size&&emptyWork){emptyWork.remove();emptyWork=null;}
+    }
+  }
+  async function renderWork(frame){
+    if(!frame.details.open||frame.loadingWork||!frame.trace.clientWidth||frame.work?.dirty())return;
+    const version=frame.turn.workVersion,width=frame.trace.clientWidth;
+    if(frame.work&&frame.workVersion===version&&frame.workWidth===width)return;
+    frame.loadingWork=true;
+    try{
+      const manifest=await readWork(frame.turn.controller);
+      if(frame.work)await frame.work.update(manifest);
+      else frame.work=await documents.mount(frame.trace,manifest,readWork,refresh);
+      frame.workVersion=version;frame.workWidth=width;
+    }catch(error){await (selected==='work'?panelReport:report)(error.message);}
+    finally{frame.loadingWork=false;}
+  }
   function link(label, path) {
     const a = document.createElement('a'); a.textContent = label; a.href = href(path); return a;
   }
   function follow() {
+    if(!history.clientWidth)return;
     // Reading or editing an earlier document must never be interrupted by a
     // response or by a later refresh of the same turn.
     if (following && !turns.contains(document.activeElement)) {
@@ -124,21 +182,23 @@
   async function projection(frame, kind, path, version) {
     const prior = frame[kind];
     const width=history.clientWidth;
+    if(!width)return;
     if (prior && ((prior.version===version && prior.width===width) || prior.view.dirty())) return;
     const manifest = await readDocument(path);
     if (prior) { await prior.view.update(manifest); prior.version=version; prior.width=width; return; }
     const wrapper=document.createElement('div');wrapper.className='conversation-'+kind;
     wrapper.setAttribute('aria-label',kind==='reply'?'Assistant response':kind==='clarification'?'Your clarification':'Your message');
     const holder = document.createElement('section');wrapper.append(holder);
-    if(kind==='message'&&frame.details)frame.element.insertBefore(wrapper,frame.details);else frame.element.append(wrapper);
+    if(kind==='message'&&frame.details?.parentNode===frame.element)frame.element.insertBefore(wrapper,frame.details);else frame.element.append(wrapper);
     const view = await documents.mount(holder, manifest, readDocument, refresh,{compact:true,chrome:false});
-    frame[kind] = {view, version, width};
+    frame[kind] = {view, version, width,wrapper};
   }
   async function update() {
     if (!page) {await renderComposer(host.dataset.create,true);return;}
     const state = await read('/conversation/manifest', page);
+    await renderNavigation(state.composer);
     // The input is usable while earlier documents prepare their native views.
-    if (!composerData || composerVersion!==state.composerVersion || composerWidth!==composer.clientWidth) {
+    if (composer.clientWidth && (!composerData || composerVersion!==state.composerVersion || composerWidth!==composer.clientWidth)) {
       await renderComposer(state.composer,false);composerVersion=state.composerVersion;
     }
     for (const turn of state.turns.sort((a,b)=>a.sequence-b.sequence)) {
@@ -151,14 +211,10 @@
         const reason=document.createElement('p');reason.className='conversation-work-reason';
         const trace=document.createElement('section');details.append(summary,reason,trace);element.append(details);turns.append(element);
         frame={element,details,summary,status,reason,trace};frames.set(turn.id,frame);
-        details.addEventListener('toggle',async()=>{if(!details.open||frame.work||frame.loadingWork)return;
-          frame.loadingWork=true;
-          try {
-            const manifest=await readWork(turn.controller);
-            frame.work=await documents.mount(trace,manifest,readWork,refresh);
-          } catch(error) { report(error.message); } finally {frame.loadingWork=false;}
-        });
+        label.textContent='Turn '+(turn.sequence+1)+' - Work and trace';
+        details.addEventListener('toggle',()=>renderWork(frame));
       }
+      frame.turn=turn;
       // The native manifest projects current requests/workers. Rendering has
       // no lifecycle of its own; retained publication remains independent.
       frame.status.textContent=(turn.published?'Published · ':'')+(turn.statusLabel||turn.status||'Pending');
@@ -167,7 +223,7 @@
       await projection(frame, 'message', turn.message, turn.messageVersion);
       // These are ordinary Nenex answers and declared Goo controls. Their
       // admission, stale-target checks, drafts and receipts stay with Goo.
-      if (turn.clarifications?.length || turn.input?.blocks.length || frame.continuation) {
+      if (history.clientWidth && (turn.clarifications?.length || turn.input?.blocks.length || frame.continuation)) {
         if (!frame.continuation) {
           frame.continuation=document.createElement('section');frame.continuation.className='conversation-continuation';
           frame.answers=document.createElement('div');frame.answerForm=document.createElement('section');
@@ -192,13 +248,12 @@
         }
       }
       if (turn.published) await projection(frame, 'reply', turn.reply, turn.replyVersion);
-      if (!frame.links) {frame.links=document.createElement('div');frame.links.className='conversation-links';const work=link('Work and trace',turn.controller);work.href='/ns'+turn.controller;frame.replyLink=link('Open response document',turn.reply);frame.links.append(frame.replyLink,work);frame.details.append(frame.links);}
+      if (!frame.links) {frame.links=document.createElement('div');frame.links.className='conversation-links';const record=link('Browse attempts and tool traces',turn.controller);record.href='/views'+turn.controller+'/work';frame.replyLink=link('Open response document',turn.reply);frame.links.append(frame.replyLink,record);frame.details.append(frame.links);}
       frame.replyLink.hidden=!turn.published;
-      if (frame.work && frame.details.open && frame.workVersion!==turn.workVersion && !frame.work.dirty()) {
-        const manifest=await readWork(turn.controller);
-        await frame.work.update(manifest);frame.workVersion=turn.workVersion;
-      }
     }
+    arrangeWork();
+    for(const frame of frames.values())await renderWork(frame);
+    try{await renderPanel(state);}catch(error){await panelReport(error.message);}
     follow();
   }
   function refresh() {
@@ -216,7 +271,7 @@
     }).finally(()=>{
       refreshing=null;
       // A resize during a native render leaves another width to prepare.
-      if (!failed && !closed && composerWidth!==composer.clientWidth) return refresh();
+      if (!failed && !closed && composer.clientWidth && composerWidth!==composer.clientWidth) return refresh();
     });
     return refreshing;
   }
@@ -224,14 +279,15 @@
     await refresh();
     // Reflow native presentations when their allocated width changes. Height
     // changes only adjust following; they never rerender a working draft.
-    let width=composer.clientWidth;
+    let width=[composer.clientWidth,panel.clientWidth,navigation.clientWidth].join(':');
     const resize=new ResizeObserver(() => {
       follow();
-      if (width===composer.clientWidth || closed) return;
-      width=composer.clientWidth;
+      const next=[composer.clientWidth,panel.clientWidth,navigation.clientWidth].join(':');
+      if (width===next || closed) return;
+      width=next;
       refresh();
     });
-    resize.observe(composer);resize.observe(turns);resize.observe(history);
+    resize.observe(composer);resize.observe(turns);resize.observe(history);resize.observe(panel);resize.observe(navigation);
     // Only an open, visible presentation reads for changes. Closing this tab
     // stops these reads; native work continues independently in the world.
     async function observe() {

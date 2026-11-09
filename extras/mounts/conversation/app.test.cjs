@@ -6,8 +6,10 @@ const vm=require('node:vm');
 async function setup({create=false}={}) {
   class Element {
     constructor(){this.children=[];this.dataset={};this.events={};this.attrs={};this.clientWidth=680;this.clientHeight=400;this.scrollHeight=400;this.scrollTop=0;}
-    append(...nodes){this.children.push(...nodes);for(const node of nodes)node.parent=this;}
-    insertBefore(node,at){this.children.splice(this.children.indexOf(at),0,node);node.parent=this;}
+    get parentNode(){return this.parent;}
+    remove(){if(this.parent){this.parent.children=this.parent.children.filter(child=>child!==this);this.parent=null;}}
+    append(...nodes){for(const node of nodes){node.remove();this.children.push(node);node.parent=this;}}
+    insertBefore(node,at){if(node===at)return;node.remove();const index=this.children.indexOf(at);this.children.splice(index<0?this.children.length:index,0,node);node.parent=this;}
     addEventListener(name,fn){this.events[name]=fn;}
     getAttribute(name){return this.attrs[name];}
     setAttribute(name,value){this.attrs[name]=value;}
@@ -19,22 +21,22 @@ async function setup({create=false}={}) {
     querySelectorAll(){return this.children.flatMap(child=>[child,...child.querySelectorAll()]);}
   }
   const page='/0x11/app/nenex/w/chat', nodes=new Map();
-  for(const id of ['conversation','conversation-notice','conversation-composer','conversation-turns','conversation-history','conversation-latest'])nodes.set(id,new Element());
+  for(const id of ['conversation','conversation-notice','conversation-composer','conversation-turns','conversation-history','conversation-latest','conversation-navigation','conversation-panel','conversation-panel-notice','conversation-wiki','conversation-work'])nodes.set(id,new Element());
   nodes.get('conversation').dataset={page:create?'':page,create:'/0x11/app/conversation',vocabulary:'/0x11/gov/conversation'};
   let input=new Element();input.dataset.inputSlot=create?'/name':'/source';input.value='';input.attrs.value='';
   const button=new Element();button.dataset.node='send';
   const doc={hidden:false,body:new Element(),getElementById:id=>nodes.get(id),createElement:()=>new Element()};doc.activeElement=doc.body;
-  let bound, target, navigate, serial=1;
+  let bound, navigationBinding, target, navigate, serial=1;
   const timers=[],events={},notices=[],feedbackWidths=[],loads=[],mounts=[],reads=[],resizes=[];
   const state={page,composer:page+'/conversation',composerVersion:'1',wiki:page+'/wiki',turns:[]};
   const docs=new Map(),manifests=new Map();
   const api={context:()=>({width:720}),feedback:async(_el,text,width)=>{notices.push(text);feedbackWidths.push(width);},
-    load:async(name,options)=>{target=name;loads.push([name,options]);return {view:options.view,snapshot:{expected:String(serial++)},controls:[{kind:'action',id:'send'}]};},
-    mount:(element,_data,preserve)=>{if(!preserve){input=new Element();input.dataset.inputSlot=create?'/name':'/source';input.value='';input.attrs.value='';}element.children=[];element.append(input,button);return element;},
-    bind:(_element,context)=>{bound=context;context.input('native-input-contract',input);}
+    load:async(name,options)=>{target=name;loads.push([name,options]);return {view:options.view||options.slot,snapshot:{expected:String(serial++)},controls:[{kind:'action',id:'send'}]};},
+    mount:(element,_data,preserve)=>{if(element===nodes.get('conversation-navigation'))return element;if(!preserve){input=new Element();input.dataset.inputSlot=create?'/name':'/source';input.value='';input.attrs.value='';}element.children=[];element.append(input,button);return element;},
+    bind:(_element,context)=>{if(context.become){navigationBinding=context;return;}bound=context;context.input('native-input-contract',input);}
   };
   const sandbox={URLSearchParams,Map,console,GooActions:api,
-    GooDocument:{mount:async(element,manifest,reload,onSaved,options)=>{const control={manifest,options,reload,onSaved,dirty:()=>control.edited,edited:false,updates:[],update:async value=>control.updates.push(value)};mounts.push(manifest.root);docs.set(manifest.root,control);return control;}},
+    GooDocument:{mount:async(element,manifest,reload,onSaved,options)=>{const control={manifest,options,reload,onSaved,dirty:()=>control.edited,edited:false,updates:[],update:async value=>control.updates.push(value)};mounts.push(manifest.root);docs.set(manifest.root,control);return control;},mountTree:async(element,manifest)=>{const tree={manifest,refreshes:0,refresh:async()=>tree.refreshes++,dirty:()=>tree.edited};mounts.push(manifest.root);docs.set(manifest.root,tree);return tree;}},
     document:doc,
     ResizeObserver:class {constructor(callback){this.callback=callback;resizes.push(this);}observe(){}disconnect(){this.disconnected=true;}},
     location:{assign:value=>navigate=value},addEventListener:(name,fn)=>events[name]=fn,
@@ -48,6 +50,7 @@ async function setup({create=false}={}) {
     get input(){return input;},get navigation(){return navigate;},
     save:value=>bound.saved({},new Map([['native-input-contract',value]])),
     selectOperations:()=>bound.saved({},new Map()),
+    selectView:name=>navigationBinding.become('/sys/slot/conversation_'+name),
     tick:async()=>{const next=timers.shift();if(next)await next();},
     addTurn:()=>state.turns.push({id:'/first',sequence:0,message:page+'/messages/first',reply:page+'/replies/first',
       controller:page+'/work/first',published:true,messageVersion:'1',replyVersion:'1',workVersion:'1',status:'running',reason:'Watching published definition and source inputs'})};
@@ -217,4 +220,42 @@ test('a resize retains the composer draft and refreshes only clean projections',
   assert.equal(app.loads.at(-1)[1].context.width,320);
   assert.equal(app.feedbackWidths.at(-1),320);assert.equal(app.notices.at(-1),'The send was rejected.');
   reply.edited=false;await app.tick();assert.equal(reply.updates.length,1);
+});
+
+test('native navigation keeps the composer and wiki mounted, and hidden wiki stops refreshing',async()=>{
+  const app=await setup();app.input.value='Unsent message';const input=app.input;
+  assert.ok(app.loads.some(([,selector])=>selector.slot==='/sys/slot/conversation_chat'));
+  await app.selectView('wiki');
+  const tree=app.docs.get(app.state.wiki);tree.edited=true;
+  assert.equal(tree.manifest.frontier.root,app.state.wiki);
+  assert.equal(tree.manifest.documentUrl,'/nenex/document');
+  assert.equal(app.nodes.get('conversation-panel').hidden,false);
+  await app.selectView('chat');const refreshed=tree.refreshes;
+  await app.tick();assert.equal(tree.refreshes,refreshed);
+  await app.selectView('wiki');assert.equal(app.mounts.filter(root=>root===app.state.wiki).length,1);
+  assert.equal(app.input,input);assert.equal(input.value,'Unsent message');assert.equal(tree.edited,true);
+});
+
+test('work panel reuses the exact turn controls and refreshes stale work when reopened',async()=>{
+  const app=await setup();app.addTurn();await app.tick();
+  const article=app.nodes.get('conversation-turns').children[0],details=article.children.find(node=>node.events.toggle);
+  await app.selectView('work');
+  assert.equal(details.parentNode,app.nodes.get('conversation-work'));assert.equal(details.open,true);
+  const view=app.docs.get(app.state.turns[0].controller);view.edited=true;
+  await app.selectView('chat');assert.equal(details.parentNode,article);
+  assert.equal(app.docs.get(app.state.turns[0].controller),view);
+  details.open=false;view.edited=false;app.state.turns[0].workVersion='2';
+  const reads=app.reads.length;await app.tick();assert.equal(app.reads.slice(reads).some(url=>url.startsWith('/conversation/work?')),false);
+  details.open=true;await details.events.toggle();assert.equal(view.updates.length,1);
+  assert.equal(app.mounts.filter(path=>path===app.state.turns[0].controller).length,1);
+});
+
+test('narrow wiki mode does not prepare the hidden composer at zero width',async()=>{
+  const app=await setup();app.input.value='Keep this draft';
+  app.nodes.get('conversation-composer').clientWidth=0;app.nodes.get('conversation-history').clientWidth=0;
+  await app.selectView('wiki');
+  assert.equal(app.loads.some(([,selector])=>selector.context.width===0),false);
+  app.nodes.get('conversation-composer').clientWidth=320;app.nodes.get('conversation-history').clientWidth=320;
+  await app.selectView('chat');assert.equal(app.input.value,'Keep this draft');
+  assert.equal(app.loads.at(-1)[1].context.width,320);
 });

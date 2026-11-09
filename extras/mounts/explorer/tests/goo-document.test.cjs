@@ -323,3 +323,18 @@ test('accepted page actions refresh a complete native frontier without remountin
   assert.equal(calls.filter(url=>url==='/document?path=%2Ftree%2Ffirst').length,1,'unchanged page content is not reloaded');
   assert.equal(calls.filter(url=>url==='/children?path=%2Ftree').length,1,'the existing complete frontier is re-read after acceptance');
 });
+
+test('embedded trees refresh changed native versions without replacing drafts or rereading unchanged pages',async()=>{
+  const calls=[];let version='1';
+  const frontier=()=>({root:'/wiki',epoch:version,version,life:'1',hasChildren:false,next:null,members:[]});
+  const page=()=>({root:'/wiki',epoch:version,blocks:[{target:'/wiki/0',view:'/edit',kind:'prose'}]});
+  const host=composableHost({fetch:async url=>{calls.push(url);return {ok:true,json:async()=>url.startsWith('/children')?frontier():page()};}});
+  const element=new host.Element(),tree=await host.mountTree(element,{root:'/wiki',pages:[page()],frontier:frontier(),documentUrl:'/document',childrenUrl:'/children'});
+  await tree.refresh();assert.equal(calls.some(url=>url.startsWith('/document')),false);
+  const input=element.children[0].children[0].input;input.value='Local wiki draft';version='2';
+  await tree.refresh();assert.equal(tree.dirty(),true);assert.equal(input.value,'Local wiki draft');
+  assert.equal(calls.some(url=>url.startsWith('/document')),false);
+  input.value=input.getAttribute('value');await tree.refresh();
+  assert.equal(calls.filter(url=>url.startsWith('/document')).length,1);assert.equal(tree.dirty(),false);
+  await tree.refresh();assert.equal(calls.filter(url=>url.startsWith('/document')).length,1);
+});

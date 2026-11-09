@@ -98,6 +98,28 @@ CSS supplies host layout and control paint, while Goo owns measured typography,
 control geometry, input contracts and action dispatch. Only supported controls
 are shown; the reference's attachment, mention and mode controls are not added.
 
+**Wiki** and **Work and trace** open a panel beside the chat. Below 960 px the
+panel occupies the reading area; **Chat** returns to the retained composer.
+These navigation controls are declared Grove views using Goo's existing
+`become` transitions. Selection is local presentation state and writes nothing
+to the namespace. Switching views keeps the mounted controls and drafts.
+
+Wiki mounts the existing Nenex page tree at the conversation's wiki address.
+Child pages, source editing and creation use its existing native controls and
+paged frontiers. The visible tree follows native subtree versions, refreshing
+changed clean documents and keeping dirty documents untouched. Hidden wiki
+views stop presentation reads. No copied wiki, navigation index or document
+renderer is introduced.
+
+Work moves each turn's existing disclosure into the panel and opens the latest
+turn initially. The ordinary occurrence controls and crew-selected current
+requests expose their holes and native actions. The work cell and native history
+overlay are lazy inspections; a link opens retained attempts and tool traces in
+the existing namespace browser. Reopening
+a disclosure refreshes its native version; closing it stops work-view reads.
+Current status still comes from the native manifest, independently of whether
+any inspection is open.
+
 After publishing changes to this mount, **Select published conversation
 operations** explicitly admits its current registrations through the existing
 namespace boundary. Republish an authored response flow to capture those laws,

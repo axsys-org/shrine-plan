@@ -60,7 +60,7 @@
           documentNavigate:direction=>navigate(frame,direction)}:{})
       };
       frame.context=context;if(!frame.block.readonly)api.bind(content,context);
-      else{const link=document.createElement('a');link.href='/ns'+frame.block.target;await api.feedback(link,'Inspect this native record and its history',720);frame.element.append(link);}
+      else{const link=document.createElement('a');link.href='/ns'+frame.block.target;await api.feedback(link,'Inspect this native record and its history',feedbackWidth());frame.element.append(link);}
       // Block chrome is itself a prepared Grove row. Platform focus reveals it.
       const chrome=frame.element.querySelector('[data-slot="/sys/slot/block_actions"]');
       if(chrome&&editable(frame)){
@@ -90,11 +90,12 @@
         const key=block.key||block.target;seen.add(key);let frame=frames.get(key);
         if(frame && (structural || frame.block.view!==block.view || frame.block.target!==block.target)){frame.holder.remove();frames.delete(key);frame=null;}
         if(!frame){const element=document.createElement('section');element.setAttribute('aria-label',`${block.kind} ${block.target}`);let holder=element;
-          if(block.label){holder=document.createElement('details');const summary=document.createElement('summary');holder.append(summary);await api.feedback(summary,block.label,720);holder.append(element);}
-          body.append(holder);frame={block,element,holder};frames.set(key,frame);
+          if(block.label){holder=document.createElement('details');const summary=document.createElement('summary');holder.append(summary);await api.feedback(summary,block.label,feedbackWidth());holder.append(element);}
+          body.append(holder);frame={block,element,holder,labelWidth:feedbackWidth()};frames.set(key,frame);
           if(block.label)holder.addEventListener('toggle',()=>{if(holder.open)render(frame,Boolean(frame.data)).catch(error=>report(error.message));});
         }
         frame.block=block;
+        if(block.label&&frame.labelWidth!==feedbackWidth()){await api.feedback(frame.holder.querySelector('summary'),block.label,feedbackWidth());frame.labelWidth=feedbackWidth();}
         const parent=compact&&(tools.has(block)||block.kind==='presentation')?inspection:body;
         const position=positions.get(parent)||0,at=parent.children[position];positions.set(parent,position+1);
         if(at!==frame.holder)parent.insertBefore(frame.holder,at||null);
@@ -174,12 +175,20 @@
   }
   async function mountTree(tree,manifest){
     if(!Array.isArray(manifest.pages)||!manifest.frontier)throw Error('Expected native page manifests and a frontier.');
-    const api=root.GooActions;
+    const api=root.GooActions,feedbackWidth=()=>Math.min(tree.clientWidth||720,720);
     async function read(url,params){
       const response=await fetch(url+'?'+new URLSearchParams(params),{cache:'no-store'});
       if(!response.ok)throw Error(await response.text());return response.json();
     }
     const readDocument=path=>read(manifest.documentUrl,{path});
+    // Hosts may hide a tree without unmounting it. Refresh only on their demand;
+    // retain the same document controls, open frontiers and unsaved drafts.
+    async function refreshPage(entry,version){
+      if(!entry.document || entry.document.dirty() || !entry.holder.clientWidth)return;
+      const width=entry.holder.clientWidth;
+      if(version===entry.version && width===entry.width)return;
+      await entry.document.update(await readDocument(entry.root));entry.version=version;entry.width=width;
+    }
     async function frontier(container,initial,onSaved=async()=>{}){
       let cached=initial,current,refreshing=null,recover=false;
       const entries=new Map();
@@ -187,12 +196,12 @@
       const loader=new root.GooTopoi.TreeSource(initial.root,'y',async(params)=>{
         const page=!params.after&&cached?(cached):await read(manifest.childrenUrl,{path:initial.root,...(params.after?{after:params.after,epoch:params.epoch}:{})});cached=null;
         const members=page.members.map(member=>({...member,key:member.root,parent:page.root,status:member.document?'available':'unavailable'}));
-        if(!params.after)members.unshift({key:page.root,parent:null,life:page.life,hasChildren:page.hasChildren,status:'available'});
+        if(!params.after)members.unshift({key:page.root,parent:null,life:page.life,version:page.version,hasChildren:page.hasChildren,status:'available'});
         return {id:page.root,axis:'y',topology:'tree',incremental:true,life:page.life,epoch:page.epoch,parent:page.root,members,next:page.next};
       });
       async function reconcile(source){
         const members=source.members.filter(member=>member.key!==source.id),seen=new Set(members.map(member=>member.key));
-        for(const [key,entry]of entries){const next=members.find(member=>member.key===key);if(entry.document?.dirty()&&(!next||entry.life!==next.life))throw Error('A removed or replaced page has an unsaved draft. Its original page and inputs are retained.');}
+        for(const [key,entry]of entries){const next=members.find(member=>member.key===key);if((entry.document?.dirty()||entry.frontier?.dirty())&&(!next||entry.life!==next.life))throw Error('A removed or replaced page has an unsaved draft. Its original page and inputs are retained.');}
         for(const [key,entry]of entries)if(!seen.has(key)){entry.stop?.();entry.holder.remove();entries.delete(key);}
         let position=0;
         for(const member of members){
@@ -200,28 +209,30 @@
           if(entry&&entry.life!==member.life){entry.stop?.();entry.holder.remove();entries.delete(member.key);entry=null;}
           if(!entry){
             const holder=document.createElement('section');holder.setAttribute('aria-label',member.root);container.insertBefore(holder,more.parentNode===container?more:null);
-            entry={holder,life:member.life};entries.set(member.key,entry);
-            let opening,refreshChildren;
+            entry={holder,root:member.root,life:member.life,version:member.version};entries.set(member.key,entry);
+            let opening;
             const open=()=>opening||=(async()=>{
-              if(member.document){holder.replaceChildren();entry.document=await mountDocument(holder,await readDocument(member.root),readDocument,async()=>{await refreshAfterWrite();await onSaved();await refreshChildren?.();});}
-              const branch=document.createElement('details'),summary=document.createElement('summary');branch.append(summary);holder.append(branch);await api.feedback(summary,member.document?'Child pages':member.label||member.root,720);
+              if(member.document){holder.replaceChildren();const page=await readDocument(member.root);entry.document=await mountDocument(holder,page,readDocument,async()=>{await refreshAfterWrite();await onSaved();});entry.width=holder.clientWidth;}
+              const branch=document.createElement('details'),summary=document.createElement('summary');branch.append(summary);holder.append(branch);await api.feedback(summary,member.document?'Child pages':member.label||member.root,feedbackWidth());
+              entry.branch=branch;entry.summary=summary;entry.label=member.document?'Child pages':member.label||member.root;entry.labelWidth=feedbackWidth();
               let expanded=false,pending=false;
-              branch.addEventListener('toggle',async()=>{if(!branch.open||expanded||pending)return;pending=true;try{const page=await read(manifest.childrenUrl,{path:member.root});refreshChildren=await frontier(branch,page,async()=>{await refreshAfterWrite();await onSaved();});expanded=true;}catch(error){await api.feedback(summary,error.message,720);}finally{pending=false;}});
-            })().catch(async error=>{opening=null;await api.feedback(holder,error.message,720);});
-            if(member.document){await api.feedback(holder,member.label||member.root,720);if(typeof root.IntersectionObserver==='function'){const observer=new root.IntersectionObserver(events=>{if(events.some(event=>event.isIntersecting)){observer.disconnect();open();}},{rootMargin:'720px'});entry.stop=()=>observer.disconnect();observer.observe(holder);}else await open();}
+              branch.addEventListener('toggle',async()=>{if(!branch.open||pending)return;pending=true;try{if(expanded)await entry.frontier.refresh();else{const page=await read(manifest.childrenUrl,{path:member.root});entry.frontier=await frontier(branch,page,async()=>{await refreshAfterWrite();await onSaved();});expanded=true;}}catch(error){await api.feedback(summary,error.message,feedbackWidth());}finally{pending=false;}});
+            })().catch(async error=>{opening=null;await api.feedback(holder,error.message,feedbackWidth());});
+            if(member.document){await api.feedback(holder,member.label||member.root,feedbackWidth());if(typeof root.IntersectionObserver==='function'){const observer=new root.IntersectionObserver(events=>{if(events.some(event=>event.isIntersecting)){observer.disconnect();open();}},{rootMargin:'720px'});entry.stop=()=>observer.disconnect();observer.observe(holder);}else await open();}
             else await open();
           }
           const at=[...container.children].filter(node=>node!==more&&node.tagName!=='SUMMARY')[position++];if(at!==entry.holder)container.insertBefore(entry.holder,at||more.parentNode===container&&more||null);
+          if(entry.summary&&entry.labelWidth!==feedbackWidth()){await api.feedback(entry.summary,entry.label,feedbackWidth());entry.labelWidth=feedbackWidth();}
         }
         current=source;loader.commit(source);
-        if(source.members.find(member=>member.key===source.id)?.moreChildren){container.append(more);await api.feedback(more,'Load more pages',720);}else more.remove();
+        if(source.members.find(member=>member.key===source.id)?.moreChildren){container.append(more);await api.feedback(more,'Load more pages',feedbackWidth());}else more.remove();
       }
       async function refresh(advance){
         if(refreshing)return refreshing;
         refreshing=(async()=>{
           more.disabled=true;
-          try{if(advance)loader.request(current.members.find(member=>member.key===current.id),true);await reconcile(await loader.read());recover=false;}
-          catch(error){recover=true;container.append(more);await api.feedback(more,error.message+' Activate again to refresh the native frontier.',720);}
+          try{if(advance)loader.request(current.members.find(member=>member.key===current.id),true);await reconcile(await loader.read());for(const [key,entry] of entries){await refreshPage(entry,current.members.find(member=>member.key===key)?.version);if(entry.branch?.open)await entry.frontier?.refresh();}recover=false;}
+          catch(error){recover=true;container.append(more);await api.feedback(more,error.message+' Activate again to refresh the native frontier.',feedbackWidth());}
           finally{more.disabled=false;}
         })();
         try{await refreshing;}finally{refreshing=null;}
@@ -231,12 +242,14 @@
       async function refreshAfterWrite(){await refreshing;await refresh(false);}
       more.addEventListener('click',()=>refresh(!recover));
       await refresh(false);
-      return refreshAfterWrite;
+      return {refresh:refreshAfterWrite,get version(){return current.members.find(member=>member.key===current.id)?.version;},dirty:()=>[...entries.values()].some(entry=>entry.document?.dirty()||entry.frontier?.dirty())};
     }
     let ready;
     const frontierReady=new Promise(resolve=>ready=resolve);
-    for(const page of manifest.pages){const holder=document.createElement('section');holder.setAttribute('aria-label',page.root);tree.append(holder);await mountDocument(holder,page,readDocument,async()=>{await (await frontierReady)();});}
-    const pages=document.createElement('section');tree.append(pages);ready(await frontier(pages,manifest.frontier));
+    const roots=[];
+    for(const page of manifest.pages){const holder=document.createElement('section');holder.setAttribute('aria-label',page.root);tree.append(holder);const projection=await mountDocument(holder,page,readDocument,async()=>{await (await frontierReady).refresh();});roots.push({holder,root:page.root,document:projection,version:manifest.frontier.version,width:holder.clientWidth});}
+    const pages=document.createElement('section');tree.append(pages);const children=await frontier(pages,manifest.frontier);ready(children);
+    return {async refresh(){await children.refresh();for(const entry of roots)await refreshPage(entry,children.version);},dirty:()=>roots.some(entry=>entry.document.dirty())||children.dirty()};
   }
   async function start(){
     const tree=document.querySelector('main[data-goo-document-tree]');
