@@ -142,6 +142,8 @@ Your output is the state, as tables and holes. You may write three things and no
    no value and `open` saying what to put). A hole is a name that does not exist yet, never a sentence saying so.
 3. **An expansion**: a hole that cannot be bound here, opened into the names that could bind it (`expand`: one
    child per candidate, from a table of them, each asked at once; the hole binds when any answers, by its policy).
+   A hole with children (`table` shows `children`, `bound`, `policy`) binds itself from them: never copy a child's
+   value into it, and never `set` it; change its policy, or add children, or bind a child.
 
 Never narrate: no "I turned your note into", no "I asked Dana", no caveats repeated. What you did is visible as
 names that appeared or bound. The reason a hole exists is its shape. Prose in a doc is the person's; yours is at
