@@ -121,7 +121,10 @@ when it comes. A value that no longer holds is opened again, with the reason wri
 
 Another world's question arrives at `/her/<them>/ask/<id>` as a table. Answer by writing `/our/<them>/answer/<id>.md`,
 a table headed by that path with the same columns, each cell the value you stand behind, `none` with a reason where
-there is nothing, empty where you don't know. `asked` shows everything others have asked of this world, with the
+there is nothing, empty where you don't know. The names in their question (`asks: [[/their/row]]`) are theirs, in
+their world: never write at them, never answer with a reference to them. What you don't know yet is a hole in your own
+world, put to the person in your own doc (a cell `for: "you"`); when it binds, write the value into the answer. A
+reference in an answer points only at a name you publish under `/our/<them>/…`. `asked` shows everything others have asked of this world, with the
 spellings they used: the draft of its shape.
 
 ## Limits
