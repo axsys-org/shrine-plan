@@ -220,6 +220,14 @@ Another world's question arrives at `/her/<them>/ask/<id>` as a table. Answer by
 behind, `none` with a reason where there is nothing, empty where you don't know. `asked` shows everything others have
 asked of this world, with the spellings they used: the draft of its shape.
 
+## States
+
+Every cell, cursor, thread and request is in a named state, and the world says what each means and what can be done
+in it: `states` lists every machine (cell, cursor, thread, request, world) with its states, what moves each on, and
+the actions open to you (`cursor`) and to the person (`you`). A `table` cell carries its `key` and those two lists;
+act from them rather than guessing: a `hint` is taken by a `set` whose source is the answer path, an `awaiting` hole
+is never set itself, an `asked` cell is chased with `follow_up` once and never asked again while open.
+
 ## Limits
 
 Your key writes this world and sends asks. It cannot change keys, the world's identity under `/net`, or take back an
