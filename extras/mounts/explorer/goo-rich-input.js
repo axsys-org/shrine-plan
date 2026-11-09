@@ -252,6 +252,9 @@
     // Document listeners exist only while this input has an admitted binding.
     function bind(ownerSignal,context){
       hostSignal=ownerSignal;hostContext=context;
+      // Preparation paints detached DOM. Measure wrapped text only after the
+      // admitted input is mounted at its real width, including the first bind.
+      resizeBlock();
       if(!toolbar.isConnected)document.body.append(toolbar,menu,notice);
       const key=JSON.stringify([context.target,context.snapshot.publication,context.renderContext.textScale,context.renderContext.direction]);
       if(key!==toolsKey){toolsKey=key;loadedTools='';commandButtons=[];toolbar.replaceChildren();menu.replaceChildren();toolsRequest=null;}

@@ -124,13 +124,13 @@ function composableHost({fetch,intersection=false}={}){
     captureActivation(element,context,control){return {target:context.target,value:element.input.value,command:control.editCommand};},
     async activateCaptured(captured,args){writes.push({captured,args});values.set(captured.target,captured.value);revisions.set(captured.target,(revisions.get(captured.target)||1)+1);return {savedInputs:new Map([['0.1',captured.value]])};}
   };
-  const observers=[],messages=[];api.feedback=async(_element,message)=>messages.push(message);
+  const observers=[],messages=[],feedbackWidths=[];api.feedback=async(_element,message,width)=>{messages.push(message);feedbackWidths.push(width);};
   const sandbox={GooActions:api,AbortController,setTimeout,console,URLSearchParams,fetch,addEventListener:(k,f)=>events[k]=f};
   if(intersection)sandbox.IntersectionObserver=class{constructor(callback){this.callback=callback;observers.push(this);}observe(target){this.target=target;}disconnect(){}};
   vm.runInNewContext(fs.readFileSync(require.resolve('../goo-topoi.js'),'utf8'),sandbox);
   vm.runInNewContext(fs.readFileSync(require.resolve('../goo-document.js'),'utf8'),sandbox);
   sandbox.document={createElement:tag=>new Element(tag),activeElement:null};
-  return {Element,contexts,loads,writes,values,revisions,events,observers,messages,mount:sandbox.GooDocument.mount,mountTree:sandbox.GooDocument.mountTree};
+  return {Element,contexts,loads,writes,values,revisions,events,observers,messages,feedbackWidths,mount:sandbox.GooDocument.mount,mountTree:sandbox.GooDocument.mountTree};
 }
 
 test('composed native pages retain independent drafts, epochs and structural scopes',async()=>{
@@ -164,7 +164,7 @@ test('an authored embed prepares the declared view against the real receiver',as
 test('page tool views prepare on disclosure and use the shared action binding',async()=>{
   const host=composableHost(),main=new host.Element();
   const manifest={root:'/page',epoch:'1',blocks:[],tools:[{key:'source',target:'/page',view:'/source',kind:'presentation',label:'Source'}]};
-  await host.mount(main,manifest,async()=>manifest);
+  const view=await host.mount(main,manifest,async()=>manifest);
   assert.equal(host.loads.length,0);
   const disclosure=main.children[0];disclosure.open=true;disclosure.handlers.toggle();
   await new Promise(resolve=>setImmediate(resolve));
@@ -172,6 +172,13 @@ test('page tool views prepare on disclosure and use the shared action binding',a
   const context=host.contexts.get('/page');
   assert.equal(context.activate,undefined);assert.equal(context.textCommand,undefined);
   assert.equal(typeof context.saved,'function');
+  // Completion can remove the last action form. Its sibling feedback still
+  // uses the visible host allocation rather than the now-hidden form's zero.
+  manifest.tools=[];main.clientWidth=0;main.parentElement={clientWidth:360};
+  await context.saved({},new Map());await context.report('Saved.');
+  assert.equal(host.feedbackWidths.at(-1),360);
+  main.parentElement.clientWidth=320;await view.update(manifest);
+  assert.equal(host.feedbackWidths.at(-1),320);assert.equal(host.messages.at(-1),'Saved.');
 });
 
 test('compact documents keep native content and embeds live while page controls prepare on disclosure',async()=>{

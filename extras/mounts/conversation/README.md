@@ -35,8 +35,12 @@ Each turn's disclosure opens the existing work projection, with links to its
 response document and native trace. Closing the tab stops presentation reads
 and disconnects layout observation.
 
-The chat skin adapts the video study's white canvas, compact composer, quiet
-message cards and collapsible work summaries. The native manifest derives status
+The chat shell takes its layout reference from Astryx's
+[AI Chat Conversation playground template](https://astryx.atmeta.com/playground):
+a white canvas, centered reading column, trailing message bubbles, rounded
+composer and collapsible work summaries. It uses the existing native Goo and
+Nenex renderers rather than importing Astryx's React chat components.
+The native manifest derives status
 from the controller and its current crew-selected requests and workers:
 
 - **Working**: provider preparation, active execution or result admission.
@@ -79,12 +83,20 @@ the page's own flow receipt is omitted from this projection; **Work and trace**
 opens the full response document and retained work. No source or history is
 deleted. Text, embeds, edit guards, local drafts and native actions remain in the
 same renderer. Send's row has an 8 px gap above it, a 6 px inset and aligns right
-at all widths. The dock reserves 12 px on each side and 16 px below the composer;
-its content still aligns with the chat column on larger screens. The small **I**
-inspector sits opposite Send and retains its accessible name.
+at all widths. Its padding fits within the prepared width rather than enlarging
+the row. The dock reserves 12 px on each side and 16 px below the composer,
+honoring device safe areas. It participates in the page layout, so growing the
+draft reduces the history viewport instead of covering messages. The reading
+column is capped at 720 px; phone gutters are 16 px below 600 px viewport width.
+Message bubbles use a leading gutter in pixels so fractional widths do not introduce
+scrollbars around prepared blocks. Rich inputs measure wrapped content on their
+existing bind step, once the prepared DOM is mounted at its actual width.
+Feedback prepares at the available width and reflows with the composer. A
+fulfilled, hidden clarification form uses its parent allocation for its notice.
+The small **I** inspector retains its accessible name.
 CSS supplies host layout and control paint, while Goo owns measured typography,
-control geometry, input contracts and action dispatch. The video demo's simulated
-PR state, unconnected attachment and voice controls are not part of this view.
+control geometry, input contracts and action dispatch. Only supported controls
+are shown; the reference's attachment, mention and mode controls are not added.
 
 After publishing changes to this mount, **Select published conversation
 operations** explicitly admits its current registrations through the existing

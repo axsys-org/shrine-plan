@@ -19,7 +19,7 @@
   composer.textContent='Opening composer…';
   composer.setAttribute('aria-busy','true');
   const composerDirty = () => [...inputs.values()].some(input=>input.value!==input.getAttribute('value'));
-  const report = text => {lastNotice=text;return api.feedback(notice, text, 720);};
+  const report = text => {lastNotice=text;return api.feedback(notice, text, Math.min(composer.clientWidth,720));};
   const href = path => '/nenex?'+new URLSearchParams({path});
   async function read(url, path) {
     const response = await fetch(url+'?'+new URLSearchParams({path}), {cache:'no-store'});
@@ -68,6 +68,7 @@
     if (composerData && preserve && composerDirty() && composerData.snapshot.life!==data.snapshot.life) throw Error('The conversation was replaced. Your draft is retained.');
     const content = api.mount(composer, data, preserve, false); composerData = data; composerWidth=width;
     composer.setAttribute('aria-busy','false');
+    if (lastNotice) await report(lastNotice);
     inputs.clear();
     api.bind(content, {target, view:data.view, snapshot:data.snapshot, controls:data.controls, actionScope, report,
       input:(key, input) => {
@@ -127,6 +128,7 @@
     const manifest = await readDocument(path);
     if (prior) { await prior.view.update(manifest); prior.version=version; prior.width=width; return; }
     const wrapper=document.createElement('div');wrapper.className='conversation-'+kind;
+    wrapper.setAttribute('aria-label',kind==='reply'?'Assistant response':kind==='clarification'?'Your clarification':'Your message');
     const holder = document.createElement('section');wrapper.append(holder);
     if(kind==='message'&&frame.details)frame.element.insertBefore(wrapper,frame.details);else frame.element.append(wrapper);
     const view = await documents.mount(holder, manifest, readDocument, refresh,{compact:true,chrome:false});
@@ -183,10 +185,10 @@
         if (!frame.input && turn.input?.blocks.length) {
           frame.inputReason.textContent=turn.reason||'';
           frame.input=await documents.mount(frame.answerForm,turn.input,readInputs,refresh);
-          frame.inputVersion=turn.workVersion;
-        } else if (frame.input && frame.inputVersion!==turn.workVersion && !frame.input.dirty()) {
+          frame.inputVersion=turn.workVersion;frame.inputWidth=history.clientWidth;
+        } else if (frame.input && (frame.inputVersion!==turn.workVersion || frame.inputWidth!==history.clientWidth) && !frame.input.dirty()) {
           frame.inputReason.textContent=turn.input?.blocks.length?(turn.reason||''):'';
-          await frame.input.update(turn.input);frame.inputVersion=turn.workVersion;
+          await frame.input.update(turn.input);frame.inputVersion=turn.workVersion;frame.inputWidth=history.clientWidth;
         }
       }
       if (turn.published) await projection(frame, 'reply', turn.reply, turn.replyVersion);

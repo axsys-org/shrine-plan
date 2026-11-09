@@ -5,7 +5,15 @@
   async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true}={}){
     const api=root.GooActions, frames=new Map();let manifest=initial, busy=false, failed=false, pendingChange=null;
     const notice=document.createElement('div');notice.className='goo-document-notice';notice.setAttribute('role','status');main.before(notice);
-    const report=message=>{notice.hidden=compact&&message==='Ready';return api.feedback(notice,notice.hidden?'':message,Math.min(main.clientWidth,720));};
+    let noticeMessage='',noticeWidth;
+    const feedbackWidth=()=>Math.min(main.clientWidth||main.parentElement?.clientWidth||720,720);
+    const report=message=>{
+      notice.hidden=compact&&message==='Ready';
+      // A fulfilled action can leave an empty, hidden document host. Its
+      // sibling notice still owns a visible allocation; never prepare it at 0.
+      noticeMessage=message;noticeWidth=feedbackWidth();
+      return api.feedback(notice,notice.hidden?'':message,noticeWidth);
+    };
     // Embedded documents keep the same frames, bindings and edit guards. Only
     // their page presentations and tools move into a lazy disclosure.
     let body=main,inspector,inspection;
@@ -161,7 +169,8 @@
     report("Opening document...");
     await reconcile(manifest);
     report([...frames.values()].some(frame=>frame.error)?"Some blocks require a renderer that supports their content. Their source is preserved.":"Ready");
-    return {update:reconcile,dirty:()=>busy||Boolean(pendingChange)||[...frames.values()].some(dirty)};
+    return {async update(...args){await reconcile(...args);if(noticeWidth!==feedbackWidth())await report(noticeMessage);},
+      dirty:()=>busy||Boolean(pendingChange)||[...frames.values()].some(dirty)};
   }
   async function mountTree(tree,manifest){
     if(!Array.isArray(manifest.pages)||!manifest.frontier)throw Error('Expected native page manifests and a frontier.');

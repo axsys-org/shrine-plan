@@ -25,10 +25,10 @@ async function setup({create=false}={}) {
   const button=new Element();button.dataset.node='send';
   const doc={hidden:false,body:new Element(),getElementById:id=>nodes.get(id),createElement:()=>new Element()};doc.activeElement=doc.body;
   let bound, target, navigate, serial=1;
-  const timers=[],events={},notices=[],loads=[],mounts=[],reads=[],resizes=[];
+  const timers=[],events={},notices=[],feedbackWidths=[],loads=[],mounts=[],reads=[],resizes=[];
   const state={page,composer:page+'/conversation',composerVersion:'1',wiki:page+'/wiki',turns:[]};
   const docs=new Map(),manifests=new Map();
-  const api={context:()=>({width:720}),feedback:async(_el,text)=>notices.push(text),
+  const api={context:()=>({width:720}),feedback:async(_el,text,width)=>{notices.push(text);feedbackWidths.push(width);},
     load:async(name,options)=>{target=name;loads.push([name,options]);return {view:options.view,snapshot:{expected:String(serial++)},controls:[{kind:'action',id:'send'}]};},
     mount:(element,_data,preserve)=>{if(!preserve){input=new Element();input.dataset.inputSlot=create?'/name':'/source';input.value='';input.attrs.value='';}element.children=[];element.append(input,button);return element;},
     bind:(_element,context)=>{bound=context;context.input('native-input-contract',input);}
@@ -43,7 +43,7 @@ async function setup({create=false}={}) {
       return {ok:true,json:async()=>query.pathname==='/conversation/manifest'?structuredClone(state):structuredClone(manifests.get(path)||{root:path,blocks:[],tools:[]})};}
   };
   await vm.runInNewContext(fs.readFileSync(require.resolve('./app.js'),'utf8'),sandbox);
-  return {state,nodes,docs,manifests,mounts,reads,loads,events,notices,button,resizes,doc,api,
+  return {state,nodes,docs,manifests,mounts,reads,loads,events,notices,feedbackWidths,button,resizes,doc,api,
     report:message=>bound.report(message),
     get input(){return input;},get navigation(){return navigate;},
     save:value=>bound.saved({},new Map([['native-input-contract',value]])),
@@ -169,6 +169,8 @@ test('waiting input mounts declared Goo and never moves a draft to a replacement
   form.edited=true;turn.workVersion='2';turn.input.blocks[0].target=turn.controller+'/work/request_2';
   await app.tick();assert.equal(form.updates.length,0);assert.ok(form.manifest.blocks[0].target.endsWith('/request_1'));
   form.edited=false;await app.tick();assert.equal(form.updates.length,1);assert.ok(form.updates[0].blocks[0].target.endsWith('/request_2'));
+  app.nodes.get('conversation-history').clientWidth=320;await app.tick();
+  assert.equal(form.updates.length,2);assert.ok(form.updates[1].blocks[0].target.endsWith('/request_2'));
 });
 
 test('admitted clarification projects a Nenex answer and retains the same response destination',async()=>{
@@ -207,10 +209,12 @@ test('incremental document rendering does not mistake an earlier automatic scrol
 test('a resize retains the composer draft and refreshes only clean projections',async()=>{
   const app=await setup();app.addTurn();await app.tick();
   app.input.value='Keep this draft';app.input.focus();
+  await app.report('The send was rejected.');
   const reply=app.docs.get(app.mounts[1]);reply.edited=true;
   app.nodes.get('conversation-history').clientWidth=350;app.nodes.get('conversation-composer').clientWidth=320;
   await app.tick();
   assert.equal(app.input.value,'Keep this draft');assert.equal(reply.updates.length,0);
   assert.equal(app.loads.at(-1)[1].context.width,320);
+  assert.equal(app.feedbackWidths.at(-1),320);assert.equal(app.notices.at(-1),'The send was rejected.');
   reply.edited=false;await app.tick();assert.equal(reply.updates.length,1);
 });
