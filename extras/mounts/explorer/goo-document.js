@@ -2,11 +2,11 @@
    This host holds only prepared controls, their input drafts and platform focus. */
 (function(root){
   'use strict';
-  async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true}={}){
+  async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true,inspectionLabel='Document'}={}){
     const api=root.GooActions, frames=new Map();let manifest=initial, busy=false, failed=false, pendingChange=null;
     const notice=document.createElement('div');notice.className='goo-document-notice';notice.setAttribute('role','status');main.before(notice);
     let noticeMessage='',noticeWidth;
-    const feedbackWidth=()=>Math.min(main.clientWidth||main.parentElement?.clientWidth||720,720);
+    const feedbackWidth=()=>Math.min(notice.clientWidth||main.clientWidth||main.parentElement?.clientWidth||720,720);
     const report=message=>{
       notice.hidden=compact&&message==='Ready';
       // A fulfilled action can leave an empty, hidden document host. Its
@@ -22,7 +22,7 @@
     }
     if(compact&&chrome){
       inspector=document.createElement('details');inspector.className='goo-document-inspector';
-      const summary=document.createElement('summary');summary.textContent='Document';inspector.append(summary);
+      const summary=document.createElement('summary');summary.textContent=inspectionLabel;inspector.append(summary);
       inspection=document.createElement('div');inspector.append(inspection);main.append(inspector);
       inspector.addEventListener('toggle',async()=>{if(!inspector.open)return;
         try{for(const frame of frames.values())if(frame.holder.parentNode===inspection&&(!frame.block.label||frame.holder.open))await render(frame,Boolean(frame.data));}
@@ -170,12 +170,13 @@
     report("Opening document...");
     await reconcile(manifest);
     report([...frames.values()].some(frame=>frame.error)?"Some blocks require a renderer that supports their content. Their source is preserved.":"Ready");
-    return {async update(...args){await reconcile(...args);if(noticeWidth!==feedbackWidth())await report(noticeMessage);},
+    return {async update(next=manifest,...args){await reconcile(next,...args);if(noticeWidth!==feedbackWidth())await report(noticeMessage);},
       dirty:()=>busy||Boolean(pendingChange)||[...frames.values()].some(dirty)};
   }
-  async function mountTree(tree,manifest){
+  async function mountTree(tree,manifest,{compact=false}={}){
     if(!Array.isArray(manifest.pages)||!manifest.frontier)throw Error('Expected native page manifests and a frontier.');
     const api=root.GooActions,feedbackWidth=()=>Math.min(tree.clientWidth||720,720);
+    const pageOptions={compact,inspectionLabel:'Inspect page'};
     async function read(url,params){
       const response=await fetch(url+'?'+new URLSearchParams(params),{cache:'no-store'});
       if(!response.ok)throw Error(await response.text());return response.json();
@@ -184,8 +185,14 @@
     // Hosts may hide a tree without unmounting it. Refresh only on their demand;
     // retain the same document controls, open frontiers and unsaved drafts.
     async function refreshPage(entry,version){
-      if(!entry.document || entry.document.dirty() || !entry.holder.clientWidth)return;
+      if(!entry.document || !entry.holder.clientWidth || (compact&&entry.holder.tagName==='DETAILS'&&!entry.holder.open))return;
       const width=entry.holder.clientWidth;
+      if(entry.document.dirty()){
+        // Re-layout the retained manifest, never replace it with a new source
+        // snapshot just because the host resized. Native edit guards still apply.
+        if(width!==entry.width){await entry.document.update();entry.width=width;}
+        return;
+      }
       if(version===entry.version && width===entry.width)return;
       await entry.document.update(await readDocument(entry.root));entry.version=version;entry.width=width;
     }
@@ -193,6 +200,8 @@
       let cached=initial,current,refreshing=null,recover=false;
       const entries=new Map();
       const more=document.createElement('button');more.type='button';
+      const heading=compact?document.createElement('h3'):null;
+      if(heading){heading.textContent='Pages';container.className='goo-document-children';container.append(heading);}
       const loader=new root.GooTopoi.TreeSource(initial.root,'y',async(params)=>{
         const page=!params.after&&cached?(cached):await read(manifest.childrenUrl,{path:initial.root,...(params.after?{after:params.after,epoch:params.epoch}:{})});cached=null;
         const members=page.members.map(member=>({...member,key:member.root,parent:page.root,status:member.document?'available':'unavailable'}));
@@ -208,23 +217,50 @@
           let entry=entries.get(member.key);
           if(entry&&entry.life!==member.life){entry.stop?.();entry.holder.remove();entries.delete(member.key);entry=null;}
           if(!entry){
-            const holder=document.createElement('section');holder.setAttribute('aria-label',member.root);container.insertBefore(holder,more.parentNode===container?more:null);
+            const holder=document.createElement(compact?'details':'section');holder.setAttribute('aria-label',member.root);container.insertBefore(holder,more.parentNode===container?more:null);
             entry={holder,root:member.root,life:member.life,version:member.version};entries.set(member.key,entry);
+            const content=compact?document.createElement('div'):holder;
+            if(compact){
+              holder.className='goo-document-page';content.className='goo-document-page-content';
+              entry.title=document.createElement('summary');holder.append(entry.title);holder.append(content);
+            }
             let opening;
+            const report=async error=>{
+              if(!compact){await api.feedback(holder,error.message,feedbackWidth());return;}
+              entry.error ||= document.createElement('div');holder.append(entry.error);await api.feedback(entry.error,error.message,feedbackWidth());
+            };
             const open=()=>opening||=(async()=>{
-              if(member.document){holder.replaceChildren();const page=await readDocument(member.root);entry.document=await mountDocument(holder,page,readDocument,async()=>{await refreshAfterWrite();await onSaved();});entry.width=holder.clientWidth;}
-              const branch=document.createElement('details'),summary=document.createElement('summary');branch.append(summary);holder.append(branch);await api.feedback(summary,member.document?'Child pages':member.label||member.root,feedbackWidth());
+              if(member.document&&!entry.document){content.replaceChildren();const page=await readDocument(member.root);entry.document=await mountDocument(content,page,readDocument,async()=>{await refreshAfterWrite();await onSaved();},pageOptions);entry.width=holder.clientWidth;}
+              const branch=entry.children ||= document.createElement(compact?'section':'details');
+              if(compact){
+                holder.append(branch);entry.branch=holder;
+                const page=await read(manifest.childrenUrl,{path:member.root});
+                entry.frontier=await frontier(branch,page,async()=>{await refreshAfterWrite();await onSaved();});
+                entry.error?.remove();entry.error=null;
+                return;
+              }
+              const summary=document.createElement('summary');branch.append(summary);holder.append(branch);await api.feedback(summary,member.document?'Child pages':member.label||member.root,feedbackWidth());
               entry.branch=branch;entry.summary=summary;entry.label=member.document?'Child pages':member.label||member.root;entry.labelWidth=feedbackWidth();
               let expanded=false,pending=false;
               branch.addEventListener('toggle',async()=>{if(!branch.open||pending)return;pending=true;try{if(expanded)await entry.frontier.refresh();else{const page=await read(manifest.childrenUrl,{path:member.root});entry.frontier=await frontier(branch,page,async()=>{await refreshAfterWrite();await onSaved();});expanded=true;}}catch(error){await api.feedback(summary,error.message,feedbackWidth());}finally{pending=false;}});
-            })().catch(async error=>{opening=null;await api.feedback(holder,error.message,feedbackWidth());});
-            if(member.document){await api.feedback(holder,member.label||member.root,feedbackWidth());if(typeof root.IntersectionObserver==='function'){const observer=new root.IntersectionObserver(events=>{if(events.some(event=>event.isIntersecting)){observer.disconnect();open();}},{rootMargin:'720px'});entry.stop=()=>observer.disconnect();observer.observe(holder);}else await open();}
+            })().catch(async error=>{opening=null;await report(error);});
+            if(compact)holder.addEventListener('toggle',async()=>{
+              if(!holder.open)return;
+              try{if(entry.frontier){await refreshPage(entry,entry.currentVersion);await entry.frontier.refresh();}else await open();}
+              catch(error){await report(error);}
+            });
+            else if(member.document){await api.feedback(holder,member.label||member.root,feedbackWidth());if(typeof root.IntersectionObserver==='function'){const observer=new root.IntersectionObserver(events=>{if(events.some(event=>event.isIntersecting)){observer.disconnect();open();}},{rootMargin:'720px'});entry.stop=()=>observer.disconnect();observer.observe(holder);}else await open();}
             else await open();
           }
-          const at=[...container.children].filter(node=>node!==more&&node.tagName!=='SUMMARY')[position++];if(at!==entry.holder)container.insertBefore(entry.holder,at||more.parentNode===container&&more||null);
+          entry.currentVersion=member.version;
+          const title=member.label||member.root.split('/').filter(Boolean).at(-1);
+          const titleWidth=Math.max(1,Math.min(entry.holder.clientWidth||feedbackWidth(),720)-48);
+          if(entry.title&&(entry.titleText!==title||entry.titleWidth!==titleWidth)){await api.feedback(entry.title,title,titleWidth);entry.titleText=title;entry.titleWidth=titleWidth;}
+          const at=[...container.children].filter(node=>node!==more&&node!==heading&&node.tagName!=='SUMMARY')[position++];if(at!==entry.holder)container.insertBefore(entry.holder,at||more.parentNode===container&&more||null);
           if(entry.summary&&entry.labelWidth!==feedbackWidth()){await api.feedback(entry.summary,entry.label,feedbackWidth());entry.labelWidth=feedbackWidth();}
         }
         current=source;loader.commit(source);
+        container.hidden=compact&&!members.length&&!source.members.find(member=>member.key===source.id)?.moreChildren;
         if(source.members.find(member=>member.key===source.id)?.moreChildren){container.append(more);await api.feedback(more,'Load more pages',feedbackWidth());}else more.remove();
       }
       async function refresh(advance){
@@ -232,7 +268,7 @@
         refreshing=(async()=>{
           more.disabled=true;
           try{if(advance)loader.request(current.members.find(member=>member.key===current.id),true);await reconcile(await loader.read());for(const [key,entry] of entries){await refreshPage(entry,current.members.find(member=>member.key===key)?.version);if(entry.branch?.open)await entry.frontier?.refresh();}recover=false;}
-          catch(error){recover=true;container.append(more);await api.feedback(more,error.message+' Activate again to refresh the native frontier.',feedbackWidth());}
+          catch(error){recover=true;container.hidden=false;container.append(more);await api.feedback(more,error.message+' Activate again to refresh the native frontier.',feedbackWidth());}
           finally{more.disabled=false;}
         })();
         try{await refreshing;}finally{refreshing=null;}
@@ -247,7 +283,7 @@
     let ready;
     const frontierReady=new Promise(resolve=>ready=resolve);
     const roots=[];
-    for(const page of manifest.pages){const holder=document.createElement('section');holder.setAttribute('aria-label',page.root);tree.append(holder);const projection=await mountDocument(holder,page,readDocument,async()=>{await (await frontierReady).refresh();});roots.push({holder,root:page.root,document:projection,version:manifest.frontier.version,width:holder.clientWidth});}
+    for(const page of manifest.pages){const holder=document.createElement('section');holder.setAttribute('aria-label',page.root);tree.append(holder);const projection=await mountDocument(holder,page,readDocument,async()=>{await (await frontierReady).refresh();},pageOptions);roots.push({holder,root:page.root,document:projection,version:manifest.frontier.version,width:holder.clientWidth});}
     const pages=document.createElement('section');tree.append(pages);const children=await frontier(pages,manifest.frontier);ready(children);
     return {async refresh(){await children.refresh();for(const entry of roots)await refreshPage(entry,children.version);},dirty:()=>roots.some(entry=>entry.document.dirty())||children.dirty()};
   }

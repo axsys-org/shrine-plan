@@ -104,6 +104,15 @@ These navigation controls are declared Grove views using Goo's existing
 `become` transitions. Selection is local presentation state and writes nothing
 to the namespace. Switching views keeps the mounted controls and drafts.
 
+The wiki panel uses the existing page tree's compact presentation. Child pages
+are titled disclosures; opening one prepares its Nenex document and immediate
+native child frontier. Closing it keeps its editor and drafts mounted. Nested
+pages work the same way, and leaf pages have no empty child-pages control.
+Each page's **Inspect page** disclosure contains its native page actions, flow
+examples, connections and version metadata. These views prepare only when
+opened. Browser disclosures and CSS arrange the surface; authored content and
+all document actions still use the same Nenex/Goo projections and guards.
+
 Wiki mounts the existing Nenex page tree at the conversation's wiki address.
 Child pages, source editing and creation use its existing native controls and
 paged frontiers. The visible tree follows native subtree versions, refreshing

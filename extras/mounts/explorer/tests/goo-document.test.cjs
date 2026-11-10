@@ -104,7 +104,7 @@ function composableHost({fetch,intersection=false}={}){
     setAttribute(k,v){this.attrs[k]=v;}
     getAttribute(k){return this.attrs[k];}
     addEventListener(k,f){this.handlers[k]=f;}
-    before(){}
+    before(node){this.previousSibling=node;}
     append(node){node.remove();node.parent=this;this.children.push(node);}
     remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);this.parent=null;}
     insertBefore(node,at){node.remove();node.parent=this;this.children.splice(at?this.children.indexOf(at):this.children.length,0,node);}
@@ -174,10 +174,10 @@ test('page tool views prepare on disclosure and use the shared action binding',a
   assert.equal(typeof context.saved,'function');
   // Completion can remove the last action form. Its sibling feedback still
   // uses the visible host allocation rather than the now-hidden form's zero.
-  manifest.tools=[];main.clientWidth=0;main.parentElement={clientWidth:360};
+  manifest.tools=[];main.clientWidth=0;main.parentElement={clientWidth:360};main.previousSibling.clientWidth=336;
   await context.saved({},new Map());await context.report('Saved.');
-  assert.equal(host.feedbackWidths.at(-1),360);
-  main.parentElement.clientWidth=320;await view.update(manifest);
+  assert.equal(host.feedbackWidths.at(-1),336,'feedback uses its own allocation, including panel insets');
+  main.parentElement.clientWidth=320;main.previousSibling.clientWidth=320;await view.update(manifest);
   assert.equal(host.feedbackWidths.at(-1),320);assert.equal(host.messages.at(-1),'Saved.');
 });
 
@@ -337,4 +337,47 @@ test('embedded trees refresh changed native versions without replacing drafts or
   input.value=input.getAttribute('value');await tree.refresh();
   assert.equal(calls.filter(url=>url.startsWith('/document')).length,1);assert.equal(tree.dirty(),false);
   await tree.refresh();assert.equal(calls.filter(url=>url.startsWith('/document')).length,1);
+});
+
+test('compact wiki children navigate lazily, retain closed drafts and disclose native inspection',async()=>{
+  const calls=[];let version='1',removed=false;
+  const child='/wiki/notes',grandchild=child+'/sources';
+  const member=root=>({root,document:true,label:root===child?(version==='1'?'Notes':'Project notes'):'Sources',life:'1',version,hasChildren:true});
+  const frontier=root=>({root,epoch:version,version,life:'1',next:null,members:root==='/wiki'?(removed?[]:[member(child)]):root===child?[member(grandchild)]:[]});
+  const page=root=>({root,epoch:version,blocks:[{target:root,view:'/header',kind:'presentation'},
+    {target:root+'/0',view:'/edit',kind:'prose'}],tools:[
+      {target:root+'/examples',view:'/examples',kind:'presentation',label:'Flow examples'},
+      {target:root+'/history',view:'/history',kind:'presentation',label:'Version metadata'}]});
+  const host=composableHost({fetch:async url=>{calls.push(url);const query=new URL(url,'http://fixture'),path=query.searchParams.get('path');
+    return {ok:true,json:async()=>query.pathname==='/children'?frontier(path):page(path)};}});
+  const main=new host.Element(),tree=await host.mountTree(main,{root:'/wiki',pages:[page('/wiki')],frontier:frontier('/wiki'),documentUrl:'/document',childrenUrl:'/children'},{compact:true});
+  const pages=main.children[1],notes=pages.children[1],content=notes.children[1];
+  assert.equal(notes.tagName,'DETAILS');assert.equal(calls.length,0);
+  assert.deepEqual(host.loads.map(read=>read.target),['/wiki/0']);
+  assert.equal(main.children[0].children[1].children[0].textContent,'Inspect page');
+  notes.open=true;await notes.handlers.toggle();
+  assert.equal(calls.length,2,'only the opened document and its direct native frontier are read');
+  assert.ok(!host.loads.some(read=>read.selector.view==='/examples'||read.selector.view==='/history'));
+  const input=content.children[0].children[0].input;input.value='Keep this child draft';
+  notes.open=false;await notes.handlers.toggle();version='2';await tree.refresh();
+  assert.equal(content.children[0].children[0].input,input);assert.equal(input.value,'Keep this child draft');
+  assert.equal(tree.dirty(),true);assert.ok(host.messages.includes('Project notes'),'native title changes refresh the outline');
+  assert.equal(calls.filter(url=>url.startsWith('/document?path=%2Fwiki%2Fnotes')).length,1);
+  notes.open=true;await notes.handlers.toggle();
+  notes.clientWidth=390;content.children[0].children[0].clientWidth=340;
+  await tree.refresh();
+  assert.equal(host.loads.filter(read=>read.target===child+'/0').at(-1).selector.context.width,340);
+  assert.equal(input.value,'Keep this child draft');
+  assert.equal(calls.filter(url=>url.startsWith('/document?path=%2Fwiki%2Fnotes')).length,1,'resizing a draft never fetches a replacement document');
+  const inspector=content.children[1];inspector.open=true;await inspector.handlers.toggle();
+  const flowTools=inspector.children[1].children[1];flowTools.open=true;await flowTools.handlers.toggle();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(host.contexts.get(child+'/examples').activate,undefined,'inspection uses the existing native action binding');
+  assert.equal(input.value,'Keep this child draft');
+  const sources=notes.children.at(-1).children[1];sources.open=true;await sources.handlers.toggle();
+  assert.equal(sources.children.at(-1).hidden,true,'a leaf has no empty child-pages disclosure');
+  notes.open=false;removed=true;await tree.refresh();
+  assert.ok(pages.children.includes(notes));assert.equal(input.value,'Keep this child draft');
+  assert.ok(host.messages.some(message=>message.includes('unsaved draft')));
+  assert.equal(host.writes.length,0,'outline and inspection never create work or edit documents');
 });

@@ -36,7 +36,7 @@ async function setup({create=false}={}) {
     bind:(_element,context)=>{if(context.become){navigationBinding=context;return;}bound=context;context.input('native-input-contract',input);}
   };
   const sandbox={URLSearchParams,Map,console,GooActions:api,
-    GooDocument:{mount:async(element,manifest,reload,onSaved,options)=>{const control={manifest,options,reload,onSaved,dirty:()=>control.edited,edited:false,updates:[],update:async value=>control.updates.push(value)};mounts.push(manifest.root);docs.set(manifest.root,control);return control;},mountTree:async(element,manifest)=>{const tree={manifest,refreshes:0,refresh:async()=>tree.refreshes++,dirty:()=>tree.edited};mounts.push(manifest.root);docs.set(manifest.root,tree);return tree;}},
+    GooDocument:{mount:async(element,manifest,reload,onSaved,options)=>{const control={manifest,options,reload,onSaved,dirty:()=>control.edited,edited:false,updates:[],update:async value=>control.updates.push(value)};mounts.push(manifest.root);docs.set(manifest.root,control);return control;},mountTree:async(element,manifest,options)=>{const tree={manifest,options,refreshes:0,refresh:async()=>tree.refreshes++,dirty:()=>tree.edited};mounts.push(manifest.root);docs.set(manifest.root,tree);return tree;}},
     document:doc,
     ResizeObserver:class {constructor(callback){this.callback=callback;resizes.push(this);}observe(){}disconnect(){this.disconnected=true;}},
     location:{assign:value=>navigate=value},addEventListener:(name,fn)=>events[name]=fn,
@@ -229,6 +229,7 @@ test('native navigation keeps the composer and wiki mounted, and hidden wiki sto
   const tree=app.docs.get(app.state.wiki);tree.edited=true;
   assert.equal(tree.manifest.frontier.root,app.state.wiki);
   assert.equal(tree.manifest.documentUrl,'/nenex/document');
+  assert.equal(tree.options.compact,true);
   assert.equal(app.nodes.get('conversation-panel').hidden,false);
   await app.selectView('chat');const refreshed=tree.refreshes;
   await app.tick();assert.equal(tree.refreshes,refreshed);

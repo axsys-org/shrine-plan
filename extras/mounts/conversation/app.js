@@ -74,7 +74,7 @@
       if(!wikiTree){
         wikiLoading ||= (async()=>{
           const [document,frontier]=await Promise.all([read('/nenex/document',state.wiki),read('/nenex/children',state.wiki)]);
-          wikiTree=await documents.mountTree(wiki,{root:state.wiki,pages:[document],frontier,documentUrl:'/nenex/document',childrenUrl:'/nenex/children'});
+          wikiTree=await documents.mountTree(wiki,{root:state.wiki,pages:[document],frontier,documentUrl:'/nenex/document',childrenUrl:'/nenex/children'},{compact:true});
         })().finally(()=>{wikiLoading=null;});
         await wikiLoading;
       }else await wikiTree.refresh();
