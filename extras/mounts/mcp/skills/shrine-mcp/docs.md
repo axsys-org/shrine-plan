@@ -104,9 +104,10 @@ line, time), never transcribe them.
   state (a value and its source, answers that came for it, asked and whom, a hole, its children); `set` writes one
   cell with where it came from, or opens it again with why; `expand` drills a hole.
 - **Other worlds:** read `/her/<world>/…`. `ask_row` writes a question for a row's holes under `/our/<them>/ask/<id>`
-  and the answer lands at `/her/<them>/answer/<id>`, which the asked cells refer to; it goes by Mesa to a world, by
-  mail or a call to someone not on Shrine (through a world kept for them until they claim it; the answer lands the
-  same way). Always give `message`: what you say to them in your own words above the question (who you write for,
+  and the answer lands at `/her/<them>/answer/<id>`, which the asked cells refer to; it goes by Mesa to a world. Someone
+  not on Shrine is a name under the mail provider: the question is written at `/our/<provider>/<address as a
+  name>/ask/<id>`, carried by mail, and the answer lands at `/her/<provider>/<address>/answer/<id>/<thing>`, signed by
+  the provider, until they claim a world of their own. Always give `message`: what you say to them in your own words above the question (who you write for,
   what it is about, why; they know nothing of this world). `follow_up` writes again on a question's thread: while it
   is open it chases it with your note on top; once answered, your note alone is a reply. `ask_names` asks a world for
   names you refer to that it lacks; `forward` says a name people used means another.
