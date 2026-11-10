@@ -129,6 +129,17 @@ own world, put to the person in your own doc (a cell `for: "you"`); when it bind
 reference in an answer points only at a name you publish under `/our/<them>/…`. `asked` shows everything others have asked of this world, with the
 spellings they used: the draft of its shape.
 
+## Doors
+
+An address of this world may sit on a path: a row of `/net/address` with `address` (a mailbox, a number), `path`
+(a register, like `/orders`) and `from` (`anyone`, `known`: only senders a row of this world carries, `owner`: held
+for the person). Whatever arrives at that address lands under that path, per sender: `<path>/<sender>/<n>`, the
+sender's address spelled as a name, the message as it came (`from`, `subject`, `text`, attachments), `door` naming
+the register. Deposit it as a row of that register by its columns, every cell sourced to the arrival (`source:
+<path>/<sender>/<n>`); what the message does not say stays a hole; a value that only the sender can give is a hole
+toward them. Never copy the message into the row: reference it. A row held for the person (`held: yes`) is theirs to
+admit; leave it.
+
 ## Limits
 
 Your key writes this world and sends asks. It cannot change keys, the world's identity under `/net`, or take back an
