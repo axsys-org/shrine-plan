@@ -121,13 +121,27 @@ views stop presentation reads. No copied wiki, navigation index or document
 renderer is introduced.
 
 Work moves each turn's existing disclosure into the panel and opens the latest
-turn initially. The ordinary occurrence controls and crew-selected current
-requests expose their holes and native actions. The work cell and native history
-overlay are lazy inspections; a link opens retained attempts and tool traces in
-the existing namespace browser. Reopening
-a disclosure refreshes its native version; closing it stops work-view reads.
-Current status still comes from the native manifest, independently of whether
-any inspection is open.
+turn initially. Current crew-selected requests appear first; attempts and
+publications follow the native activity/event links, newest first. Each outline
+reads at most 24 event headers. **Earlier** links on those records and **Browse
+all retained work** keep older history reachable. Captures and worker subtrees
+are not read to discover the outline.
+
+Open an attempt to inspect its agent activity, current subject hole, captured
+evidence and predecessor. Open agent activity to see its recorded tool calls;
+each call exposes the original arguments and result. This shows recorded work,
+not inferred model progress or private reasoning. An old attempt marked
+`waiting` is labelled **Unresolved result**; the hole owns waiting for new
+evidence. Its current state is labelled separately from the retained attempt.
+
+Flow controls, retry, hole resolution, cells and version history use the
+existing declared Goo actions and native projections. Publication alone does
+not replace their captured implementations or guards. Closed inspections stop
+reads and retain their mounted drafts. Open inspections of linked holes refresh
+their own state, even though the hole lives outside the controller's subtree.
+Current turn status still comes from the native manifest, independently of which
+inspections are open. The browser holds disclosure/focus state and drafts;
+it adds no work records, status transitions, scheduler or history index.
 
 After publishing changes to this mount, **Select published conversation
 operations** explicitly admits its current registrations through the existing

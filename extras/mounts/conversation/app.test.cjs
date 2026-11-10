@@ -260,3 +260,31 @@ test('narrow wiki mode does not prepare the hidden composer at zero width',async
   await app.selectView('chat');assert.equal(app.input.value,'Keep this draft');
   assert.equal(app.loads.at(-1)[1].context.width,320);
 });
+
+test('work inspection loads opened native attempts and holes, retains drafts and stops closed reads',async()=>{
+  const app=await setup();app.addTurn();const controller=app.state.turns[0].controller;
+  const attempt=controller+'/work/request_1',worker=attempt+'/worker',hole='/0x11/subject/holes/response';
+  const manifest=(root,items=[])=>({root,version:'1',blocks:[],tools:[],items});
+  app.manifests.set(controller,manifest(controller,[{path:attempt,label:'Attempt 1',status:'waiting',current:true}]));
+  app.manifests.set(attempt,manifest(attempt,[{path:worker,label:'Agent activity',status:'complete'},{path:hole,label:'Subject hole',status:'waiting'}]));
+  app.manifests.set(hole,manifest(hole));
+  await app.tick();await app.selectView('work');
+  const turn=app.nodes.get('conversation-work').children[0];
+  const outline=node=>node.children.find(child=>child.className==='conversation-inspections');
+  const row=outline(turn).children[1];
+  assert.equal(app.docs.has(attempt),false,'collapsed attempts do not load their captures or worker');
+  row.open=true;await row.events.toggle();
+  assert.equal(app.docs.has(attempt),true);assert.equal(app.docs.has(worker),false);
+  const holeRow=outline(row).children[2];holeRow.open=true;await holeRow.events.toggle();
+  const form=app.docs.get(hole);form.edited=true;
+  app.manifests.get(hole).version='2';await app.tick();
+  assert.equal(form.updates.length,0,'a changed hole does not replace a resolution draft');
+  row.open=false;const reads=app.reads.length;await app.tick();
+  assert.equal(app.reads.slice(reads).some(url=>url.includes(encodeURIComponent(hole))),false);
+  row.open=true;await row.events.toggle();assert.equal(app.docs.get(hole),form);
+  form.edited=false;await app.tick();assert.equal(form.updates.length,1);
+  assert.equal(app.mounts.filter(path=>path===hole).length,1,'inspection reuses the same native controls');
+  app.manifests.get(controller).items=[];app.state.turns[0].workVersion='2';form.edited=true;await app.tick();
+  assert.ok(outline(turn).children.includes(row),'removing a branch cannot discard a nested draft');
+  assert.ok(app.notices.some(text=>text.includes('draft is retained')));
+});

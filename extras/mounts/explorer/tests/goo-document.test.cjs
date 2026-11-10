@@ -166,7 +166,10 @@ test('page tool views prepare on disclosure and use the shared action binding',a
   const manifest={root:'/page',epoch:'1',blocks:[],tools:[{key:'source',target:'/page',view:'/source',kind:'presentation',label:'Source'}]};
   const view=await host.mount(main,manifest,async()=>manifest);
   assert.equal(host.loads.length,0);
-  const disclosure=main.children[0];disclosure.open=true;disclosure.handlers.toggle();
+  const disclosure=main.children[0];disclosure.children[0].clientWidth=240;
+  await view.update(manifest);
+  assert.equal(host.feedbackWidths[host.messages.lastIndexOf('Source')],240,'a nested label uses its own allocation rather than the wider notice');
+  disclosure.open=true;disclosure.handlers.toggle();
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(host.loads.length,1);
   const context=host.contexts.get('/page');

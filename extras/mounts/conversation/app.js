@@ -84,16 +84,52 @@
       if(frames.size&&emptyWork){emptyWork.remove();emptyWork=null;}
     }
   }
+  const dirtyWork=frame=>Boolean(frame.work?.dirty()||[...(frame.inspections?.values()||[])].some(dirtyWork));
   async function renderWork(frame){
-    if(!frame.details.open||frame.loadingWork||!frame.trace.clientWidth||frame.work?.dirty())return;
-    const version=frame.turn.workVersion,width=frame.trace.clientWidth;
-    if(frame.work&&frame.workVersion===version&&frame.workWidth===width)return;
+    if(!frame.details.open||frame.loadingWork||!frame.trace.clientWidth)return;
     frame.loadingWork=true;
     try{
-      const manifest=await readWork(frame.turn.controller);
-      if(frame.work)await frame.work.update(manifest);
-      else frame.work=await documents.mount(frame.trace,manifest,readWork,refresh);
-      frame.workVersion=version;frame.workWidth=width;
+      const target=frame.turn?.controller||frame.target,width=frame.trace.clientWidth;
+      // Only a turn has an external subtree version. Nested inspections may
+      // follow a hole outside that subtree, so read their own native manifest.
+      if(!frame.work||!frame.turn||frame.workVersion!==frame.turn.workVersion||frame.workWidth!==width){
+        const manifest=await readWork(target),version=manifest.version||frame.turn?.workVersion;
+        if(!frame.work)frame.work=await documents.mount(frame.trace,manifest,readWork,refresh,{quiet:true});
+        else if(!frame.work.dirty()&&(frame.workVersion!==version||frame.workWidth!==width))await frame.work.update(manifest);
+        else if(frame.work.dirty()&&frame.workWidth!==width){await frame.work.update();frame.workWidth=width;}
+        if(!frame.work.dirty()){frame.workVersion=version;frame.workWidth=width;}
+        if(frame.note){frame.note.textContent=manifest.note||'';frame.note.hidden=!manifest.note;frame.status.textContent=manifest.status||'';}
+        if(!frame.inspections){
+          frame.inspections=new Map();frame.outline=document.createElement('div');frame.outline.className='conversation-inspections';
+          frame.heading=document.createElement('h3');frame.outline.append(frame.heading);frame.details.insertBefore(frame.outline,frame.trace);
+        }
+        frame.heading.textContent=manifest.itemsLabel||'Retained work';
+        const items=[...(manifest.items||[]),...(manifest.previous||[]).map(item=>({...item,label:'Earlier: '+item.label}))];
+        const wanted=new Set(items.map(item=>item.path));
+        for(const [path,child] of frame.inspections)if(!wanted.has(path)){
+          if(dirtyWork(child))throw Error('An inspected work record changed. Your draft is retained.');
+          child.details.remove();frame.inspections.delete(path);
+        }
+        let position=1;
+        for(const item of items){
+          let child=frame.inspections.get(item.path);
+          if(!child){
+            const details=document.createElement('details');details.className='conversation-inspection';
+            const summary=document.createElement('summary'),label=document.createElement('span'),status=document.createElement('span');
+            status.className='conversation-inspection-status';summary.append(label,status);
+            const note=document.createElement('p');note.className='conversation-work-reason';
+            const trace=document.createElement('section');details.append(summary,note,trace);
+            child={target:item.path,details,label,status,note,trace};frame.inspections.set(item.path,child);
+            details.addEventListener('toggle',()=>renderWork(child));
+          }
+          child.label.textContent=(item.current?'Current · ':'')+item.label;
+          child.status.textContent=item.status||'';child.details.dataset.current=String(Boolean(item.current));
+          const at=frame.outline.children[position++];
+          if(at!==child.details)frame.outline.insertBefore(child.details,at||null);
+        }
+        frame.outline.hidden=!items.length;
+      }
+      for(const child of frame.inspections?.values()||[])await renderWork(child);
     }catch(error){await (selected==='work'?panelReport:report)(error.message);}
     finally{frame.loadingWork=false;}
   }
@@ -248,7 +284,7 @@
         }
       }
       if (turn.published) await projection(frame, 'reply', turn.reply, turn.replyVersion);
-      if (!frame.links) {frame.links=document.createElement('div');frame.links.className='conversation-links';const record=link('Browse attempts and tool traces',turn.controller);record.href='/views'+turn.controller+'/work';frame.replyLink=link('Open response document',turn.reply);frame.links.append(frame.replyLink,record);frame.details.append(frame.links);}
+      if (!frame.links) {frame.links=document.createElement('div');frame.links.className='conversation-links';const record=link('Browse all retained work',turn.controller);record.href='/views'+turn.controller+'/work';frame.replyLink=link('Open response document',turn.reply);frame.links.append(frame.replyLink,record);frame.details.append(frame.links);}
       frame.replyLink.hidden=!turn.published;
     }
     arrangeWork();

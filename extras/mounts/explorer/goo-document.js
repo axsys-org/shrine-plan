@@ -2,13 +2,13 @@
    This host holds only prepared controls, their input drafts and platform focus. */
 (function(root){
   'use strict';
-  async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true,inspectionLabel='Document'}={}){
+  async function mountDocument(main,initial,reload,onSaved=async()=>{},{compact=false,chrome=true,inspectionLabel='Document',quiet=false}={}){
     const api=root.GooActions, frames=new Map();let manifest=initial, busy=false, failed=false, pendingChange=null;
     const notice=document.createElement('div');notice.className='goo-document-notice';notice.setAttribute('role','status');main.before(notice);
     let noticeMessage='',noticeWidth;
     const feedbackWidth=()=>Math.min(notice.clientWidth||main.clientWidth||main.parentElement?.clientWidth||720,720);
     const report=message=>{
-      notice.hidden=compact&&message==='Ready';
+      notice.hidden=(compact||quiet)&&message==='Ready';
       // A fulfilled action can leave an empty, hidden document host. Its
       // sibling notice still owns a visible allocation; never prepare it at 0.
       noticeMessage=message;noticeWidth=feedbackWidth();
@@ -89,16 +89,17 @@
       for(const block of parts){
         const key=block.key||block.target;seen.add(key);let frame=frames.get(key);
         if(frame && (structural || frame.block.view!==block.view || frame.block.target!==block.target)){frame.holder.remove();frames.delete(key);frame=null;}
-        if(!frame){const element=document.createElement('section');element.setAttribute('aria-label',`${block.kind} ${block.target}`);let holder=element;
-          if(block.label){holder=document.createElement('details');const summary=document.createElement('summary');holder.append(summary);await api.feedback(summary,block.label,feedbackWidth());holder.append(element);}
-          body.append(holder);frame={block,element,holder,labelWidth:feedbackWidth()};frames.set(key,frame);
+        if(!frame){const element=document.createElement('section');element.setAttribute('aria-label',`${block.kind} ${block.target}`);let holder=element,summary;
+          if(block.label){holder=document.createElement('details');summary=document.createElement('summary');holder.append(summary);holder.append(element);}
+          body.append(holder);frame={block,element,holder,summary};frames.set(key,frame);
           if(block.label)holder.addEventListener('toggle',()=>{if(holder.open)render(frame,Boolean(frame.data)).catch(error=>report(error.message));});
         }
         frame.block=block;
-        if(block.label&&frame.labelWidth!==feedbackWidth()){await api.feedback(frame.holder.querySelector('summary'),block.label,feedbackWidth());frame.labelWidth=feedbackWidth();}
         const parent=compact&&(tools.has(block)||block.kind==='presentation')?inspection:body;
         const position=positions.get(parent)||0,at=parent.children[position];positions.set(parent,position+1);
         if(at!==frame.holder)parent.insertBefore(frame.holder,at||null);
+        if(block.label){const summary=frame.summary,width=Math.min(summary.clientWidth||main.clientWidth||feedbackWidth(),720);
+          if(frame.labelWidth!==width){await api.feedback(summary,block.label,width);frame.labelWidth=width;}}
         if(parent===inspection&&!inspector.open)continue;
         if((block.view||block.readonly)&&(!block.label||frame.holder.open)){
           try{await render(frame,Boolean(frame.data),frame===ownCommit);}
