@@ -1,6 +1,7 @@
 """Once per world: the mesa hand into its hands.foil, compiled by the hands mount; taken up on the world's next boot.
-   python3 install_mesa.py 0x58 [0x53 ...]   (the hand text beside this script as mesa_hand.foil)"""
-import http.client, json, re, sys, time
+   python3 install_mesa.py 0x58 [0x53 ...]   (the hand text beside this script as mesa_hand.foil)
+   WHO=owner for a world with no agent token (its owner token is used instead)."""
+import http.client, json, os, re, sys, time
 from pathlib import Path
 NODES = sys.argv[1:]
 reg = json.load(open("/opt/shrine/v13/pilot/state/registry.json"))
@@ -14,7 +15,7 @@ def add(text, head, item):
 NODE = {"n": ""}
 def call(name, **a):
     node = NODE["n"]
-    tok = open(f"/opt/shrine/v13/pilot/state/{node}.agent.token").read().strip()
+    tok = open(f"/opt/shrine/v13/pilot/state/{node}.{os.environ.get("WHO", "agent")}.token").read().strip()
     c = http.client.HTTPConnection("127.0.0.1", 18400, timeout=600)
     c.request("POST", f"/w/{node}/mcp", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": a}}), {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
     r = json.loads(c.getresponse().read())["result"]
@@ -31,7 +32,6 @@ for node in NODES:
         text = text.replace("  +  app\n", hand.lstrip("\n") + "  +  app\n", 1)
         text = add(text, "kooks=row[kook/decl] ", KOOK)
         text = add(text, "seeds=row[[p=path t=myth]] ", SEED)
-    import os
     if os.environ.get("MERGE_TO"):
         # check only: the merged module written where x/foil-check reads it; the world untouched
         Path(os.environ["MERGE_TO"]).write_text(text); print(f"{node}: merged to {os.environ['MERGE_TO']}"); continue
