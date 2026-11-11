@@ -107,7 +107,9 @@ line, time), never transcribe them.
   and the answer lands at `/her/<them>/answer/<id>`, which the asked cells refer to; it goes by Mesa to a world. Someone
   not on Shrine is a name under the mail provider: the question is written at `/our/<provider>/<address as a
   name>/ask/<id>`, carried by mail, and the answer lands at `/her/<provider>/<address>/answer/<id>/<thing>`, signed by
-  the provider, until they claim a world of their own. Always give `message`: what you say to them in your own words above the question (who you write for,
+  the provider, until they claim a world of their own. When they do, their answers move with them (the provider's
+  `/her/<provider>/<address>/world` names the world), and a mailbox that is a claimed world's is asked as that world:
+  `ask_row` goes to it over Mesa and the answer lands at `/her/<world>/answer/<id>`. Always give `message`: what you say to them in your own words above the question (who you write for,
   what it is about, why; they know nothing of this world). `follow_up` writes again on a question's thread: while it
   is open it chases it with your note on top; once answered, your note alone is a reply. `ask_names` asks a world for
   names you refer to that it lacks; `forward` says a name people used means another.
