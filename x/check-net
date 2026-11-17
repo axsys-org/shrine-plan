@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Two worlds on one machine, talking through their Mesa feet.
+
+Boots world A (0x51) and world B (0x52) as two processes, each with the mcp and mesa mounts, gives each the
+other's key and address, and checks through their own doors that what A writes for B arrives in B: a first
+commit, a change, an addition, a removal, what is public, a restart of the reader, and that the reader's
+journal names its Mesa foot as the one that brought each landing in. Nothing is read from a world's files.
+
+    x/check-net [--keep] [--base-port 8451]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PKCS8 = bytes.fromhex('302e020100300506032b657004220420')
+
+
+def public_key(seed):
+    """The Ed25519 public key of a 32-byte seed, as the number a card holds: its bytes and a top marker."""
+    der = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-pubout', '-outform', 'DER'],
+                         input=PKCS8 + seed, capture_output=True, check=True).stdout
+    return int.from_bytes(der[-32:], 'little') + (1 << 256)
+
+
+class World:
+    def __init__(self, node, http, mesa, home, seed, peers):
+        self.node, self.http, self.mesa, self.home, self.seed, self.peers = node, http, mesa, home, seed, peers
+        self.process = None
+        self.count = 0
+
+    def start(self, timeout):
+        config = self.home / 'mesa.json'
+        config.write_text(json.dumps(dict(port=self.mesa, peers=self.peers)))
+        env = dict(os.environ, SHRINE_MESA=str(config), SHRINE_MESA_SEED=self.seed.hex())
+        self.log = (self.home / 'eden.log').open('a')
+        self.process = subprocess.Popen(
+            [sys.executable, str(ROOT / 'x/eden'), '--node', self.node, '--port', str(self.http),
+             '--world', str(self.home / 'world'), '--mount', 'mcp', '--mount', 'mesa',
+             '--extras-root', str(ROOT / 'extras'), '--startup-timeout', str(timeout)],
+            env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(f'{self.node} exited while starting; see {self.home}/eden.log')
+            try:
+                self.tool('read', path='/' + self.node + '/io/mesa', care='x')
+                return
+            except Exception:
+                time.sleep(2)
+        raise RuntimeError(f'{self.node} did not start in {timeout}s; see {self.home}/eden.log')
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+        self.process = None
+
+    def tool(self, name, **arguments):
+        self.count += 1
+        body = json.dumps(dict(jsonrpc='2.0', id=self.count, method='tools/call',
+                               params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
+        request = urllib.request.Request(f'http://127.0.0.1:{self.http}/mcp', body,
+                                         {'Content-Type': 'application/json'})
+        reply = json.load(urllib.request.urlopen(request, timeout=60))
+        result = reply['result']
+        if result.get('isError'):
+            raise RuntimeError(json.dumps(result)[:400])
+        return result.get('structuredContent', result)
+
+    def write(self, *records):
+        return self.tool('write', records=list(records))
+
+    def read(self, path, care='x'):
+        try:
+            return self.tool('read', path=path, care=care)
+        except Exception as error:
+            return {'error': str(error)}
+
+
+def holds(answer, slot, value):
+    """Whether a read's answer holds a slot with a value. The door gives every value as text."""
+    properties = answer.get('properties') or {}
+    found = properties.get('/' + slot, properties.get(slot))
+    return found is not None and str(found) == str(value)
+
+
+def until(condition, seconds=90):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(1)
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the two world directories')
+    parser.add_argument('--base-port', type=int, default=8451)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-net-'))
+    seeds = [bytes([17]) * 32, bytes([18]) * 32]
+    keys = [public_key(seed) for seed in seeds]
+    ports = dict(a=(args.base_port, args.base_port + 1000), b=(args.base_port + 1, args.base_port + 1001))
+    (base / 'a').mkdir()
+    (base / 'b').mkdir()
+    a = World('0x51', *ports['a'], base / 'a', seeds[0],
+              [dict(node='0x52', key=keys[1], host='127.0.0.1', port=ports['b'][1])])
+    b = World('0x52', *ports['b'], base / 'b', seeds[1],
+              [dict(node='0x51', key=keys[0], host='127.0.0.1', port=ports['a'][1])])
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:500]), flush=True)
+
+    try:
+        a.start(args.timeout)
+        b.start(args.timeout)
+        own = a.read('/0x51/io/mesa')
+        row('the foot publishes its own key on its record', str(keys[0]) in json.dumps(own), own)
+
+        a.write(dict(path='/0x51/our/0x52', slots={'title': 'for b'}),
+                dict(path='/0x51/our/0x52/doc', slots={'value': 10}),
+                dict(path='/0x51/our/0x52/a/b', slots={'value': 20}),
+                dict(path='/0x51/our/public', slots={'title': 'public'}),
+                dict(path='/0x51/our/public/note', slots={'value': 40}))
+        row('a first commit arrives', until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 10)),
+            b.read('/0x52/her/0x51/doc'))
+        row('with its deep name', holds(b.read('/0x52/her/0x51/a/b'), 'value', 20), b.read('/0x52/her/0x51/a/b'))
+        row('and what is public', until(lambda: holds(b.read('/0x52/her/0x51/public/note'), 'value', 40)),
+            b.read('/0x52/her/0x51/public/note'))
+        card = b.read('/0x52/io/mesa/0x51')
+        row('the reader keeps where the mount stands on its card', 'head' in json.dumps(card), card)
+
+        a.write(dict(path='/0x51/our/0x52/doc', action='poke', slots={'value': 11}),
+                dict(path='/0x51/our/0x52/c', slots={'value': 30}),
+                dict(path='/0x51/our/0x52/a/b', action='cull'))
+        row('a change arrives', until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 11)),
+            b.read('/0x52/her/0x51/doc'))
+        row('an addition arrives', holds(b.read('/0x52/her/0x51/c'), 'value', 30), b.read('/0x52/her/0x51/c'))
+        row('a removal arrives', not holds(b.read('/0x52/her/0x51/a/b'), 'value', 20), b.read('/0x52/her/0x51/a/b'))
+
+        journal = [b.read('/0x52/log', care=care) for care in ('y', 'z')]
+        row("the reader's journal names its Mesa foot as what brought the landings in",
+            any('/0x52/io/mesa' in json.dumps(answer) for answer in journal), json.dumps(journal[0])[:900])
+
+        b.write(dict(path='/0x52/our/0x51', slots={'title': 'for a'}),
+                dict(path='/0x52/our/0x51/reply', slots={'value': 77}))
+        row('the other direction works too', until(lambda: holds(a.read('/0x51/her/0x52/reply'), 'value', 77)),
+            a.read('/0x51/her/0x52/reply'))
+
+        b.stop()
+        a.write(dict(path='/0x51/our/0x52/doc', action='poke', slots={'value': 12}))
+        time.sleep(5)
+        row('the publisher survives a peer that is down', holds(a.read('/0x51/our/0x52/doc'), 'value', 12),
+            a.read('/0x51/our/0x52/doc'))
+        b.start(args.timeout)
+        row('a reader that was away catches up when it returns',
+            until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 12), 180), b.read('/0x52/her/0x51/doc'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        a.stop()
+        b.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

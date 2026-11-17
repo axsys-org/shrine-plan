@@ -4,8 +4,10 @@
     url = "github:liam-fitzgerald/rex/lf/remove-quip-poems";
     flake = false;
   };
+  # Liam's wormholes branch (enki PR #59): actor and Mesa handles are host capabilities, and
+  # libmesa is in the runtime as opset-83 operations.
   inputs.enki = {
-    url = "github:axsys-org/enki/main";
+    url = "github:axsys-org/enki/lf/wormholes";
   };
   outputs = { self, nixpkgs, rex, enki }:
     let
@@ -18,13 +20,23 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
       # the world runtime: enki as pinned, with the fix for stale thunk update targets kept as GC roots
       # (enki PR #50, rebased on main), which made long-lived worlds grow without bound under reads;
-      # halted actors freed (each kept its thread and heap until exit); and the store collected while an
-      # actor waits in a syscall (a world always waits in Accept, so its store was never collected again)
+      # halted actors freed (each kept its thread and heap until exit; ported to the wormholes branch,
+      # where a handle is a capability and not a table index); the store collected while an actor waits
+      # in a syscall (a world always waits in Accept, so its store was never collected again); and
+      # SeqHost, the demand that sequences on a host capability, which Seq rejects (codegen.rvr lowers
+      # every demanded let to it, so a spawn that must happen now can be demanded); and the store's
+      # address space reserved without commit, as on main: the wormholes branch dropped MAP_NORESERVE, so
+      # on Linux with the default overcommit rule the 256 GiB reservation is refused and nothing starts;
+      # and pins as values: PinHash, PinBytes and PinFrom, so a value leaves one store and arrives in
+      # another as the same pin under the same hash (a stream holding a law is refused)
       runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
           ./nix/enki-update-targets.patch
           ./nix/enki-free-halted-actors.patch
           ./nix/enki-collect-while-parked.patch
+          ./nix/enki-seq-host.patch
+          ./nix/enki-reserve-without-commit.patch
+          ./nix/enki-pin-ops.patch
         ];
       });
     in {

@@ -600,3 +600,27 @@ receives an acknowledgement (or rejection). For a command to self or to a kid
 there is no separate ack: a kid's effect is acknowledged by the **gift** that
 flows back up when the kid changes (the gift is, in effect, the ack), and a
 self-command resolves within the same transaction.
+
+## Between worlds
+
+Two worlds never write into each other. Each publishes names of its own and holds the other's exactly as
+published. The rules are pure (`src/foil/net.foil`, `src/foil/pass.foil`); one foot, registered at
+`/<self>/io/mesa`, carries them over Mesa (`src/foil/mesa_foot.foil`, `src/foil/mesa_wire.foil`).
+
+| Term | Meaning |
+|---|---|
+| published root | `/<self>/our/<peer>`: what this world publishes to one peer. `/<self>/our/public`: to every peer it knows. |
+| mount | `/<self>/her/<publisher>`: where a reader holds a publisher's root, name for name (`/A/our/B` is `/B/her/A`). The public root is held at `/<self>/her/<publisher>/public`. A held record runs none of the reader's behaviours. |
+| card | `/<self>/io/mesa/<publisher>`: what the reader knows of a publisher (`key`, `host`, `port`) and how the mount stands (`head`, or `refused` and `why`). The standing is never written into the mount. |
+| stamp | a published version: rift × 2^32 + case. A restore raises the rift, so a stamp names one content for ever. |
+| moment | the statement "this name of this world, at this stamp, is the content with this hash", signed by the publisher. A held record keeps it in its version header (`oath`: signature and stamp); the record itself is the publisher's pin, byte for byte. |
+| epic (between worlds) | a consistent change of one published root from one stamp to another, signed as a whole. It travels without its records; each record follows by its content hash. It lands as one event or not at all. |
+| hint | a packet that says where a root stands. It carries no data and is not believed: its receiver compares and then reads. |
+| shown | a record shown to a world it was not published to: its name, its publisher's statement and the record, checkable against the publisher's key by anyone. |
+| name, custody, live key | a world's name commits to a custody key; custody signs a log of statements, each naming the live key that signs pages from then on. Claiming an unclaimed world is one such statement. |
+
+What a reader refuses, it refuses whole and notes on the card: an epic from a world whose key it does not hold
+(`net_stranger`), one that key did not sign (`net_forged`), one that reaches outside its root (`net_outside`),
+one with a record missing or unsound (`net_missing`, `net_unfit`), one from a name whose custody signed two
+futures (`net_forked`), and one the kernel's own contracts reject. The mount is left as it was and a later epic
+lands from where it stands. The journal names the foot that submitted each landing (`/sys/by`).

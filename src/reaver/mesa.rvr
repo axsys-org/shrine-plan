@@ -1,0 +1,156 @@
+;;;; The Mesa bridge as the kernel uses it. This is the only file that names a
+;;;; bridge call (enki pkg/mesa/API.md). Every call takes a row of handles and a
+;;;; data row and answers [status data handles]. A handle is a live capability:
+;;;; it is passed along and never forced, saved or sent.
+;;;;
+;;;; Bytes are bars: the bytes followed by a 0x01 terminator, as a nat.
+(#bind std (#module std))
+(#import std)
+(#bind bplan (#module bplan))
+(#import bplan)
+(#bind reef (#module reef))
+(#import reef)
+
+(define (call name handles data) (S (name handles data)))
+
+(define (bar bytes n) (Add bytes (Lsh 1 (Mul 8 n))))
+(define (bar-len b) (Dec (Bytes b)))
+(define (bar-nat b) (Sub b (Lsh 1 (Mul 8 (bar-len b)))))
+
+(define (ok reply)
+  (If (Ix 0 reply) (error ["mesa" (Ix 1 reply)]) reply))
+(define (made reply) (Ix 0 (Ix 2 (ok reply))))
+(define (told reply) (Ix 1 (ok reply)))
+
+;; The interim domain. A name's domain is part of its identity; this one is a
+;; placeholder until worlds are named in a real one.
+(define domain (bar "gw-btc" 6))
+
+(define (peer id key-id life rift)
+  (made (call "MesaPeer" 0 [id domain life rift key-id 1])))
+
+;; Limits: [max_packet max_path max_fragment]. The signed-public profile fixes
+;; fragments at 1 KiB, so a longer name is bought only with a larger packet.
+;; The engine's other bounds are raised from Mesa's defaults, which are sized
+;; for a handful of pages: bindings 3 (count) and 4 (bytes), one read 5,
+;; reassembly 6, reads in flight 8. An engine holds 64 MiB of bound pages, the
+;; most the bridge allows, after which the foot starts a new one. A page stays
+;; at most 1 MiB (1024 fragments of 1 KiB): the signed-public profile fixes
+;; that, so a larger value crosses as pins of at most that size each.
+(define (config limits)
+  (#let ((base (made (call "MesaConfig" 0 0))))
+    (#let ((fields (told (call "MesaConfigFields" [base] 0))))
+      (made (call "MesaConfig" 0
+              (Up 8 1024 (Up 6 67108864
+                (Up 4 67108864 (Up 3 65536 (Up 0 limits fields))))))))))
+
+;; An engine for one world: its signing seed, and each peer as [id key-bytes].
+;; Peers take key ids and attachments 1, 2, ... in the order given; the world
+;; itself is key 0. The key table is fixed for the engine's life, so a new
+;; peer means a new engine, which is free: the engine holds no durable state.
+(define (engine self seed limits others)
+  (#let ((keypair (made (call "MesaKeyFromSeed" 0 [seed]))))
+    (#let ((publics (map (lambda (other) (made (call "MesaPublicKey" 0 [(Ix 1 other)]))) others)))
+      (#let ((protection
+               (made (call "MesaProtection" (Weld [keypair] publics)
+                       [0 (gen (Sz others) (lambda (i) (Inc i)))]))))
+        (#let ((made-engine
+                 (made (call "MesaEngine" [(config limits) (peer self 0 1 0) protection] 0))))
+          (Seq
+            (foldl (lambda (count other)
+                     (Seq (ok (call "MesaEngineInstallPeer"
+                                [made-engine (peer (Ix 0 other) (Inc count) 1 0)] 0))
+                       (Seq (ok (call "MesaEngineSetAttachment" [made-engine]
+                                  [(Ix 0 other) [(Inc count)]]))
+                         (Inc count))))
+                   0 others)
+            made-engine))))))
+
+;; What an engine asks of its host, as plain rows:
+;;   [1 peer attachment packet]   send these bytes
+;;   [2 request status bytes]     a read finished (status 0: the page)
+;;   [3 0 0 text]                 something was dropped
+;;   [4 0 0 0]                    anything else (timers are driven by advance)
+;;   [5 0 0 text]                 the engine refused the call itself
+(define send-tag (bar "Send" 4))
+(define finished-tag (bar "ReadFinished" 12))
+(define dropped-tag (bar "Dropped" 7))
+(define (action raw)
+  (#let ((tag (Ix 0 raw)))
+    (If (Eq tag send-tag) [1 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
+      (If (Eq tag finished-tag) [2 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
+        (If (Eq tag dropped-tag) [3 0 0 (Ix 1 raw)]
+          [4 0 0 0])))))
+(define (drain-from actions out)
+  (#let ((next (Ix 1 (call "MesaActionsNext" actions 0))))
+    (If (IsNat next) out
+      (drain-from actions (Weld out [(action next)])))))
+(define (step name made-engine data)
+  (#let ((reply (call name [made-engine] data)))
+    (If (Ix 0 reply) [[5 0 0 (Ix 1 reply)]]
+      (drain-from (Ix 2 reply) []))))
+
+(define (read made-engine request peer-id path)
+  (step "MesaEngineRead" made-engine [request peer-id path]))
+(define (bind made-engine path bytes)
+  (step "MesaEngineBind" made-engine [path bytes 0]))
+(define (receive made-engine from attachment bytes)
+  (step "MesaEngineReceive" made-engine [from attachment bytes]))
+(define (advance made-engine tick)
+  (step "MesaEngineAdvanceTo" made-engine [tick]))
+
+;; What a packet is, before the engine sees it: [kind path other]. Kind 0 is
+;; an ask for the page at path; 2 is a hint, whose two names are what the
+;; sender holds of ours (path) and what it offers (other); 9 is not a packet.
+(define (look bytes limits)
+  (#let ((decoded (call "MesaWireDecode" 0 [bytes limits])))
+    (If (Ix 0 decoded) [9 0 0]
+      (#let ((body (Ix 1 (Ix 1 (call "MesaPacketFields" (Ix 2 decoded) 0)))))
+        (#let ((kind (Ix 0 body)))
+          [kind (Ix 5 (Ix 1 body)) (If (Eq kind 2) (Ix 5 (Ix 2 body)) 0)])))))
+
+;; A hint: no data and no trust, only two names. The receiver compares them
+;; with what it holds and reads what it wants in the ordinary, signed way.
+(define (name-of publisher path) [publisher domain 0 13 [0 0] path])
+(define (hint me them held offered limits)
+  (#let ((nothing [0 [0 (bar 0 0)] (bar 0 0)]))
+    (#let ((packet (made (call "MesaPacket" 0
+                           [0 [2 (name-of them held) (name-of me offered) nothing] limits]))))
+      (told (call "MesaWireEncode" [packet] 0)))))
+
+;; Page names. A page the kernel serves is named by a one-letter kind and
+;; three numbers, in the signed-public space: publ/<kind>|<a>|<b>|<c>. What
+;; the kinds and numbers mean is the caller's (src/foil/mesa_foot.foil).
+(define (digits n) (showNat n))
+(define (name kind a b c)
+  (#let ((text (strWeld "publ/"
+                 (strWeld kind
+                   (strWeld "|" (strWeld (digits a)
+                     (strWeld "|" (strWeld (digits b)
+                       (strWeld "|" (digits c))))))))))
+    (bar text (Bytes text))))
+(define (digit? b) (And (Ge b 48) (Le b 57)))
+(define (number-go text at size value)
+  (If (And (Lt at size) (digit? (Load8 at text)))
+    (number-go text (Inc at) size (Add (Mul value 10) (Sub (Load8 at text) 48)))
+    [value at]))
+(define (number text from)
+  ;; [value next] reading digits from an offset, or [] when there is none.
+  (#let ((size (Bytes text)))
+    (If (Or (Ge from size) (Nil (digit? (Load8 from text)))) []
+      (number-go text from size 0))))
+;; [kind a b c], or [] when the name is not one of ours.
+(define (parse path)
+  (#let ((text (bar-nat path)))
+    (If (Or (Lt (Bytes text) 8)
+            (Nil (And (Eq 112 (Load8 0 text)) (And (Eq 117 (Load8 1 text))
+              (And (Eq 98 (Load8 2 text)) (And (Eq 108 (Load8 3 text))
+                (And (Eq 47 (Load8 4 text)) (Eq 124 (Load8 6 text)))))))))
+      []
+      (#let ((a (number text 7)))
+        (If (Or (Nil (Sz a)) (Nil (Eq 124 (Load8 (Ix 1 a) text)))) []
+          (#let ((b (number text (Inc (Ix 1 a)))))
+            (If (Or (Nil (Sz b)) (Nil (Eq 124 (Load8 (Ix 1 b) text)))) []
+              (#let ((c (number text (Inc (Ix 1 b)))))
+                (If (Or (Nil (Sz c)) (Nil (Eq (Ix 1 c) (Bytes text)))) []
+                  [(Load8 5 text) (Ix 0 a) (Ix 0 b) (Ix 0 c)])))))))))

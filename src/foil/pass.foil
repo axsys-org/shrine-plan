@@ -1,0 +1,256 @@
+- net
+
+' Identity as data. A name commits to a custody key. Custody signs a log of
+' statements, each saying which key signs the name's pages from then on. A
+' reader that holds a name's founding and its log knows the name's key by
+' checking signatures, and asks no registry. These are the rules, pure: what
+' a name is, what follows what, what a reader keeps on its card for a peer,
+' and how a world that nobody has claimed yet comes to be someone's.
+'
+' Two keys, with different work. The live key signs pages and moments and
+' lives where the world runs. The custody key signs only this log and is
+' kept off the host: a host that is robbed, or dishonest, can speak for the
+' name until custody says otherwise, and can never take the name.
++ pass
+  + founding
+    ' What a name commits to: its first custody key, and a number its maker
+    ' binds in with it (an invitation, an identifier's hash, or nothing).
+    : custody=nat dat=nat
+  + name
+    ' The name a founding makes: the low 128 bits of its hash, the width
+    ' Mesa gives a name. A name therefore proves its own first custody key.
+    \ made=pass/founding
+    ^ nat
+    = said=[c=nat d=nat] [made.custody made.dat]
+    | mod (PinHash (pin said)) 340282366920938463463374607431768211456
+  + statement
+    ' One entry of a name's log, signed by the custody key in force before
+    ' it. seq numbers the entries from 1 and prev is the hash of the entry
+    ' before (0 for the first), so a log is one chain. It states the key
+    ' that signs from now (live), the life and rift that key speaks under,
+    ' and the key that has custody from now.
+    : seq=nat life=nat rift=nat live=nat custody=nat prev=nat sig=nat
+  + word
+    ' What a statement's signature is made over: the name and everything
+    ' the statement says, as a plain row.
+    \ name=nat seq=nat life=nat rift=nat live=nat custody=nat prev=nat
+    ^ nat
+    = said=[n=nat s=nat l=nat r=nat k=nat c=nat p=nat] [name seq life rift live custody prev]
+    | PinHash (pin said)
+  + link
+    ' The hash the next statement chains to: this one, signature included.
+    \ s=pass/statement
+    ^ nat
+    = said=[s=nat l=nat r=nat k=nat c=nat p=nat g=nat] [s.seq s.life s.rift s.live s.custody s.prev s.sig]
+    | PinHash (pin said)
+  + standing
+    ' Where a name stands after its log: the number and hash of the last
+    ' statement, and what it stated.
+    : seq=nat last=nat life=nat rift=nat live=nat custody=nat
+  + born
+    ' A name before any statement: it has custody and no live key.
+    \ made=pass/founding
+    ^ pass/standing
+    | pass/standing 0 0 0 0 0 made.custody
+  + state
+    ' Sign the statement that follows a standing, with the seed of the
+    ' custody key in force.
+    \ seed=nat name=nat at=pass/standing life=nat rift=nat live=nat custody=nat
+    ^ pass/statement
+    = seq at.seq.inc
+      sig (Ed25519Sign seed (pass/word name seq life rift live custody at.last))
+    | pass/statement seq life rift live custody at.last sig
+  + next
+    ' The standing a statement leaves, when it follows: the next number,
+    ' chained to the last, signed by the custody in force. Nothing goes
+    ' back, the first life is 1, and a new live key takes a new life, so a
+    ' life names one key for ever.
+    \ name=nat at=pass/standing s=pass/statement
+    ^ either[iota pass/standing]
+    ? !(eq s.seq at.seq.inc) (./err 'pass_gap)
+    ? !(eq s.prev at.last) (./err 'pass_fork)
+    ? !(eq 1 (Ed25519Verify at.custody (pass/word name s.seq s.life s.rift s.live s.custody s.prev) s.sig)) (./err 'pass_forged)
+    ? (eq 0 s.life) (./err 'pass_back)
+    ? (lt s.life at.life) (./err 'pass_back)
+    ? (lt s.rift at.rift) (./err 'pass_back)
+    ? (and (eq s.life at.life) !(eq s.live at.live)) (./err 'pass_key)
+    | ./ok (pass/standing s.seq (pass/link s) s.life s.rift s.live s.custody)
+  + read
+    ' Where a name stands after a whole log, checked from its founding.
+    \ name=nat made=pass/founding log=row[pass/statement]
+    ^ either[iota pass/standing]
+    ? !(eq name (pass/name made)) (./err 'pass_name)
+    = start=either[iota pass/standing] (./ok (pass/born made))
+    | log.fold start
+      \ acc=either[iota pass/standing] s=pass/statement
+      ^ either[iota pass/standing]
+      ? acc
+       > (./err why) acc
+       > (./ok at) (pass/next name at s)
+  + forked
+    ' Two statements that both follow one standing and differ: proof that
+    ' custody signed two futures. A reader keeps both and follows neither.
+    \ name=nat at=pass/standing a=pass/statement b=pass/statement
+    ^ bool
+    ? (equal[pass/statement] a b) .false
+    ? (either/is_err (pass/next name at a)) .false
+    | either/is_ok (pass/next name at b)
+  + lives
+    ' Every live key a log has given its name, oldest first.
+    \ log=row[pass/statement]
+    ^ row[nat]
+    = none=row[nat] []
+    | log.fold none
+      \ out=row[nat] s=pass/statement
+      ^ row[nat]
+      ? (out.any((\ seen=nat (eq seen s.live)))) out
+      | out.snoc(s.live)
+  + custody
+    ' The custody seed an invitation's secret makes. Whoever holds the
+    ' invitation holds custody; whoever only runs the world does not.
+    \ secret=nat
+    ^ nat
+    | Sha256 secret
+  + minted
+    : name=nat made=pass/founding first=pass/statement
+  + mint
+    ' A name for a world nobody has claimed yet. Custody is the invitation's
+    ' secret; the first statement gives the live key to whoever runs the
+    ' world until it is claimed. The name is whole from this moment: others
+    ' can address it, publish to it and cite it, and it will not change
+    ' when it is claimed.
+    \ secret=nat dat=nat live=nat
+    ^ pass/minted
+    = seed (pass/custody secret)
+      made (pass/founding (Ed25519PublicKey seed) dat)
+      name (pass/name made)
+    | pass/minted name made (pass/state seed name (pass/born made) 1 0 live (Ed25519PublicKey seed))
+  + claim
+    ' Claiming is one statement, signed with the invitation's secret: the
+    ' claimant's own custody key and a new live key, under the next life.
+    ' Whoever ran the world before cannot make it, and after it their key
+    ' signs nothing this name will be believed for.
+    \ secret=nat name=nat at=pass/standing custody=nat live=nat
+    ^ pass/statement
+    | pass/state (pass/custody secret) name at at.life.inc at.rift live custody
+  + record
+    ' A statement as a record.
+    \ s=pass/statement
+    ^ myth
+    . (myth/sing ['seq] (pails/n s.seq))
+      put(['life] (pails/n s.life))
+      put(['rift] (pails/n s.rift))
+      put(['live] (pails/n s.live))
+      put(['custody] (pails/n s.custody))
+      put(['prev] (pails/n s.prev))
+      put(['sig] (pails/n s.sig))
+  + of
+    \ record=myth
+    ^ pass/statement
+    | pass/statement record.nat_at(['seq] 0) record.nat_at(['life] 0) record.nat_at(['rift] 0) record.nat_at(['live] 0) record.nat_at(['custody] 0) record.nat_at(['prev] 0) record.nat_at(['sig] 0)
+  + at
+    ' Where a card keeps a name's log: its founding at <card>/pass and each
+    ' statement beneath it by number.
+    \ card=path seq=nat
+    ^ path
+    = base=path card.snoc('pass)
+    ? (eq 0 seq) base
+    | base.snoc(($u seq))
+  + kept
+    \ name=path state=namespace
+    ^ maybe[myth]
+    | (sovereign_care .x name state).fil
+  + number
+    ' The name a card is for: the number of the world it is kept under.
+    \ card=path
+    ^ nat
+    ? (lt card.len 4) 0
+    | quip_val card.at(3)
+  + held
+    ' Where a card says its name stands; none while it holds no log.
+    \ card=path state=namespace
+    ^ maybe[pass/standing]
+    = none=maybe[pass/standing] .none
+    ?> (./some record) (pass/kept card state) none
+    ? (eq 0 record.nat_at(['seq] 0)) none
+    | ./some (pass/standing record.nat_at(['seq] 0) record.nat_at(['last] 0) record.nat_at(['life] 0) record.nat_at(['rift] 0) record.nat_at(['key] 0) record.nat_at(['custody] 0))
+  + mark
+    ' A standing as the slots a card keeps. key is the live key: the one
+    ' landings are checked against (net/key).
+    \ now=pass/standing
+    ^ myth
+    . (myth/sing ['seq] (pails/n now.seq))
+      put(['last] (pails/n now.last))
+      put(['life] (pails/n now.life))
+      put(['rift] (pails/n now.rift))
+      put(['key] (pails/n now.live))
+      put(['custody] (pails/n now.custody))
+  + meet
+    ' First contact: keep a name's founding and log on the card for it. The
+    ' log is checked against the name the card is kept under, so nothing an
+    ' introducer says is taken on trust but the name itself.
+    \ card=path made=pass/founding log=row[pass/statement] state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? (maybe/is_some (pass/held card state)) (./err 'pass_met)
+    ? (eq 0 log.len) (./err 'pass_empty)
+    ? (pass/read (pass/number card) made log)
+     > (./err why) (./err why)
+     > (./ok now)
+      = born=myth (myth/sing ['custody] (pails/n made.custody)).put(['dat] (pails/n made.dat))
+        first=row[[p=path q=writ]] [[(pass/at card 0) (writ/make born)]]
+        entries
+          | log.fold first
+            \ out=row[[p=path q=writ]] s=pass/statement
+            ^ row[[p=path q=writ]]
+            | out.snoc([(pass/at card s.seq) (writ/make (pass/record s))])
+        stand=writ
+          ? (maybe/is_some (pass/kept card state)) (writ/poke (pass/mark now))
+          | writ/make (pass/mark now)
+        head=row[[p=path q=writ]] [[card stand]]
+      | ./ok head.weld(entries)
+  + before
+    ' Where the kept log stood before one of its statements.
+    \ card=path seq=nat state=namespace
+    ^ maybe[pass/standing]
+    = none=maybe[pass/standing] .none
+    ?> (./some born) (pass/kept (pass/at card 0) state) none
+    = made (pass/founding born.nat_at(['custody] 0) born.nat_at(['dat] 0))
+      name (pass/number card)
+    % k=nat 1
+      at=pass/standing (pass/born made)
+    ^ maybe[pass/standing]
+    ? (ge k seq) (./some at)
+    ?> (./some record) (pass/kept (pass/at card k) state) none
+    ? (pass/next name at (pass/of record))
+     > (./err why) none
+     > (./ok now) (_ k.inc now)
+  + turn
+    ' A statement arrived for a name whose log is kept. One that follows
+    ' is kept and the card moves to it. One already kept changes nothing.
+    ' One that differs from what is kept at its number, and is custody's
+    ' too, is a fork: it is kept beside the other as evidence, the card
+    ' says so, and nothing is believed of the name until someone decides.
+    ' Statements are their own proof, so it does not matter who brought it.
+    \ card=path s=pass/statement state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ?> (./some at) (pass/held card state) (./err 'pass_unmet)
+    = name (pass/number card)
+    ? (gt s.seq at.seq.inc) (./err 'pass_gap)
+    ? (eq s.seq at.seq.inc)
+      ? (pass/next name at s)
+       > (./err why) (./err why)
+       > (./ok now)
+        | ./ok [[(pass/at card s.seq) (writ/make (pass/record s))] [card (writ/poke (pass/mark now))]]
+    ?> (./some record) (pass/kept (pass/at card s.seq) state) (./err 'pass_known)
+    = was (pass/of record)
+    ? (equal[pass/statement] was s) (./err 'pass_known)
+    ?> (./some then) (pass/before card s.seq state) (./err 'pass_known)
+    ? !(pass/forked name then was s) (./err 'pass_forged)
+    | ./ok [[(pass/at card s.seq).snoc('other) (writ/make (pass/record s))] [card (writ/poke (myth/sing ['fork] (pails/n s.seq)))]]
+  + attested
+    ' Whether a record, at the version its header states, is what a name
+    ' said under any key its log has given it. A third world that was shown
+    ' the record, its header and the log checks it without asking anyone.
+    \ log=row[pass/statement] name=path said=oath record=myth
+    ^ bool
+    | (pass/lives log).any((\ key=nat (net/attested key name said record)))

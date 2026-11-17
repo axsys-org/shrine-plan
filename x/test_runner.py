@@ -275,6 +275,13 @@ def run_group(suites, wisp, template, root, timeout):
     else:
         copy_template(template, directory / 'snap')
         lines = []
+        # X_CHECK_TIER=P6 runs the suites under the optimizer tier worlds use (x/eden's default). The
+        # default leaves the boot compiler in place.
+        tier = os.environ.get('X_CHECK_TIER', '')
+        if tier:
+            if not re.fullmatch(r'P[1-6]', tier):
+                raise ValueError('X_CHECK_TIER must be P1..P6')
+            lines.extend(['(#bind test_tier (#module plangrm))', f'(Install test_tier:compile{tier})'])
         if any(s.get('entrypoint') for s in suites):
             lines.extend(['(#bind test_std (#module std))', '(#import test_std)'])
         if any(s['kind'] != 'reaver' for s in suites):

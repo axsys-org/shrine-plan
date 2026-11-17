@@ -1,0 +1,354 @@
+- helm
+- net
+- mesa_foot
+
+' The actors that give the foot at /io/mesa a socket and a clock, and the
+' loop that runs its rules (mesa_foot). Nothing here decides anything: it
+' carries bytes, tells the rules what arrived, and does what they ask.
+'
+' The foot's own record, /<self>/io/mesa, says where it listens and where
+' its two files are: `port`, `ring` (the world's signing seed, 32 bytes) and
+' `mark` (its rift and the highest epoch it has announced). Both files are
+' outside the world on purpose: the seed is never a record, and the mark
+' must survive a restore of the world to show that one happened. Each
+' peer's card, /<self>/io/mesa/<peer>, says its `key`, and its `host` and
+' `port`.
+'
+' Bytes cross as short connections. One connection is: the sender's number
+' in 16 bytes, then each packet behind its length in 4. Who a connection
+' claims to be from is not believed for anything but where an answer goes:
+' an answer is sent to the address this world holds for that peer, never
+' back along the connection, and every page is signed.
+'
+' The foot stops when its record is removed or holds `stop`: it stops its
+' clock and its acceptors, closes its listening socket and ends.
++ mesa_wire
+  + heard
+    ' The packets of one connection and the number their sender gave.
+    : from=nat packets=row[nat]
+  + tick
+    : now=nat
+  + task
+    & feet/task/ack
+      feet/task/fact
+      feet/task/admitted
+      feet/task/committed
+      feet/task/state
+      mesa_wire/heard
+      mesa_wire/tick
+  + frames
+    ' One connection's bytes.
+    \ me=nat packets=row[nat]
+    ^ nat
+    % at=nat 0
+      raw=nat (mod me (bex 128))
+      size=nat 16
+    ^ nat
+    ? (ge at packets.len) (add raw (bex (mul 8 size)))
+    = packet packets.at(at)
+      len (dec (wid packet))
+      body (mod packet (bex (mul 8 len)))
+      headed (add raw (lsh len (mul 8 size)))
+    | _ at.inc (add headed (lsh body (mul 8 (add size 4)))) (add size (add 4 len))
+  + unframe
+    ' The packets in one connection's bytes; none when they are not frames.
+    \ bytes=nat
+    ^ maybe[mesa_wire/heard]
+    = none=maybe[mesa_wire/heard] .none
+      empty=row[nat] []
+      size (dec (wid bytes))
+    ? (lt size 16) none
+    = from (loadvar 0 16 bytes)
+    % at=nat 16
+      out=row[nat] empty
+    ^ maybe[mesa_wire/heard]
+    ? (eq at size) (./some (mesa_wire/heard from out))
+    ? (gt (add at 4) size) none
+    = len (loadvar at 4 bytes)
+      end (add (add at 4) len)
+    ? (gt end size) none
+    | _ end out.snoc((add (loadvar (add at 4) len bytes) (bex (mul 8 len))))
+  + acceptor
+    ' Waits on the shared listening socket, reads one connection to its
+    ' end, tells the foot what it carried, and waits again when the foot
+    ' says to go on. The foot's answer is what stops it: a foot that is
+    ' stopping connects to itself to wake each acceptor and answers no.
+    \ fd=nat self=nat
+    ^ nat
+    = ;[hello caps] (Recv[nat] 0)
+      foot caps.at(0)
+      nothing=row[nat] []
+      none=maybe[mesa_wire/heard] .none
+    % ignored=nat 0
+    = ;connection (Accept fd)
+      ;bytes (ReadAll connection 16777216)
+      got=maybe[mesa_wire/heard] (? (eq 0 bytes) none (mesa_wire/unframe bytes))
+      carried got.fall((mesa_wire/heard 0 nothing))
+    ; (CloseFd connection)
+    ; (SendCaps foot carried [0])
+    = ;[go more] (Recv[nat] 0)
+    ; (helm/supervisor/close_caps more)
+    ? !(go) 0
+    | _ 0
+  + sender
+    ' Carries what the foot sends to one peer: each batch is one
+    ' connection. A peer that cannot be reached loses the batch; the
+    ' engine asks again and hints repeat, so nothing is queued.
+    \ host=str port=nat me=nat self=nat
+    ^ nat
+    % ignored=nat 0
+    = ;[batch caps] (Recv[row[nat]] 0)
+    ; (helm/supervisor/close_caps caps)
+    ; (SendTo 0 host port (mesa_wire/frames me batch))
+    | _ 0
+  + ticker
+    ' Tells the foot the time each second, for as long as the foot says
+    ' to go on.
+    \ self=nat
+    ^ nat
+    = ;[hello caps] (Recv[nat] 0)
+      foot caps.at(0)
+    % ignored=nat 0
+    ; (Sleep 1)
+    ; (SendCaps foot (mesa_wire/tick (div (Now 0) 1000000)) [0])
+    = ;[go more] (Recv[nat] 0)
+    ; (helm/supervisor/close_caps more)
+    ? !(go) 0
+    | _ 0
+  + route
+    ' A peer as the foot's binding gives it, with where it is reached.
+    : peer=mesa_foot/peer host=str port=nat
+  + routes
+    ' The peers a binding names: each child that holds a key and an address.
+    \ binding=axal[saga]
+    ^ row[mesa_wire/route]
+    = none=row[mesa_wire/route] []
+    | binding.kid_tap.fold none
+      \ out=row[mesa_wire/route] [key tree]
+      ^ row[mesa_wire/route]
+      ?> (./some version) tree.fil out
+      = card (unpin version.myth)
+        held card.nat_at(['key] 0)
+        port card.nat_at(['port] 0)
+      ? (eq 0 held) out
+      ? (eq 0 port) out
+      | out.snoc((mesa_wire/route (mesa_foot/peer key (quip_val key) held) card.txt_at(['host]) port))
+  + own
+    \ binding=axal[saga]
+    ^ myth
+    ?> (./some version) binding.fil myth/new
+    | unpin version.myth
+  + link
+    ' A sender for one peer, and the handle the foot reaches it by.
+    : id=nat host=str port=nat handle=nat
+  + wire
+    ' Senders for the peers a binding names, keeping those whose address
+    ' did not change.
+    \ me=nat wanted=row[mesa_wire/route] had=row[mesa_wire/link]
+    ^ row[mesa_wire/link]
+    = none=row[mesa_wire/link] []
+      ;kept
+        | had.fold none
+          \ ;out=row[mesa_wire/link] item=mesa_wire/link
+          ^ row[mesa_wire/link]
+          ? (wanted.any((\ want=mesa_wire/route (and (eq want.peer.id item.id) (and (equal[str] want.host item.host) (eq want.port item.port)))))) out.snoc(item)
+          ; (CloseHandle item.handle)
+          out
+    | wanted.fold kept
+      \ ;out=row[mesa_wire/link] want=mesa_wire/route
+      ^ row[mesa_wire/link]
+      ? (out.any((\ item=mesa_wire/link (eq item.id want.peer.id)))) out
+      = ;handle (Spawn (mesa_wire/sender want.host want.port me))
+      | out.snoc((mesa_wire/link want.peer.id want.host want.port handle))
+  + answer
+    ' How a landing went, as the supervisor's answer carries it: 200 when
+    ' the event was admitted, else 409 and the reason as a number.
+    \ outcome=maybe[pail] now=namespace
+    ^ [nat str str]
+    ?> (./some refusal) outcome [200 "" ""]
+    ?> (./some said) (pail/as[helm/supervisor/rejection] refusal) [409 "0" ""]
+    | [409 (nat/show (quip_val said.reason)) ""]
+  + why
+    \ status=nat body=str
+    ^ maybe[iota]
+    = none=maybe[iota] .none
+      unknown=iota 'net_refused
+    ? (eq status 200) none
+    ?> (./some n) (nat/parse body) (./some unknown)
+    ? (eq 0 n) (./some unknown)
+    = reason=iota ($ts n)
+    | ./some reason
+  + act
+    ' Do what the rules ask: hand each peer's packets to its sender as one
+    ' batch, and ask the world to admit each landing.
+    \ parent=nat links=row[mesa_wire/link] does=row[mesa_foot/effect]
+    ^ nat
+    = empty=row[nat] []
+      ;sent
+        | links.fold 0
+          \ ;done=nat item=mesa_wire/link
+          ^ nat
+          = batch
+              | does.fold empty
+                \ out=row[nat] effect=mesa_foot/effect
+                ^ row[nat]
+                ?> (./send to packet) effect out
+                ? !(eq to item.id) out
+                | out.snoc(packet)
+          ? !(batch.len) done
+          ; (Send item.handle batch)
+          done.inc
+    | does.fold sent
+      \ ;done=nat effect=mesa_foot/effect
+      ^ nat
+      ?> (./admit request plan) effect done
+      ; (Send parent (feet/gift/admit request plan mesa_wire/answer))
+      done.inc
+  + marked
+    ' The rift and the highest announced epoch a mark file holds; zeros
+    ' when there is none yet.
+    \ file=str
+    ^ mesa_wire/mark
+    = ;bytes (Try ReadFile file)
+    ? bytes
+     > (./err _) (mesa_wire/mark 0 0)
+     > (./ok held)
+      ? (lt (wid held) 17) (mesa_wire/mark 0 0)
+      | mesa_wire/mark (loadvar 0 8 held) (loadvar 8 8 held)
+  + mark
+    : rift=nat top=nat
+  + remark
+    \ file=str rift=nat top=nat
+    ^ nat
+    = raw (add (mod rift (bex 64)) (lsh (mod top (bex 64)) 64))
+    | WriteFile file (add raw (bex 128))
+  + run
+    ' The foot. It waits for the world as it stands, reads its seed and
+    ' its mark, raises its rift when the world is behind what it once
+    ' announced, and then runs the rules for whatever arrives.
+    \ init=feet/task/init self=nat
+    ^ nat
+    = record (mesa_wire/own init.ax)
+      port record.nat_at(['port] 0)
+      ring record.txt_at(['ring])
+      file record.txt_at(['mark])
+      ;seed (ReadFile ring)
+    ; (Send init.parent (feet/gift/state 0))
+    = ;world
+        % ignored=nat 0
+        ^ namespace
+        = ;[message caps] (Recv[mesa_wire/task] 0)
+        ; (helm/supervisor/close_caps caps)
+        ?> (./state request held) message (_ 0)
+        held
+      ;was (mesa_wire/marked file)
+      rift (? (lt world.local.top was.top) was.rift.inc was.rift)
+      ;noted (mesa_wire/remark file rift (nmax was.top world.local.top))
+      me (mesa_foot/id world.self)
+      first (mesa_wire/routes init.ax)
+      none=row[mesa_wire/link] []
+      no_links=row[mesa_wire/link] []
+      no_routes=row[mesa_wire/route] []
+      ;links (mesa_wire/wire me first none)
+      ;clock (Spawn mesa_wire/ticker)
+      ;door (? (eq 0 port) 0 (Listen port))
+      helpers (? (eq 0 port) 1 5)
+    ; (SendCaps clock 0 [0])
+    ; (? (eq 0 port) 0 (mesa_wire/listen door 4))
+    ; (Send init.parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['key] (pails/n (Ed25519PublicKey seed))))))
+    ; (Trace ["mesa foot listening" port] 0)
+    = begun (mesa_foot/start world.self seed rift first.map((\ item=mesa_wire/route item.peer)))
+      ;opening (mesa_foot/tick (div (Now 0) 1000000) world begun)
+    ; (mesa_wire/act init.parent links opening.does)
+    % foot=mesa_foot/foot opening.foot
+      view=namespace world
+      reach=row[mesa_wire/link] links
+      top=nat (nmax was.top world.local.top)
+      beat=nat 0
+      left=nat 0
+    = ;[message caps] (Recv[mesa_wire/task] 0)
+      helper
+        ? message
+         > carried=mesa_wire/heard .true
+         > time=mesa_wire/tick .true
+        .false
+    ; (? (and helper (gt caps.len 0)) (Send caps.at(0) (? left 0 1)) 0)
+    ; (helm/supervisor/close_caps caps)
+    ? (and helper (eq left 1)) (? (eq 0 door) 0 (CloseFd door))
+    ? (and helper (gt left 1)) (_ foot view reach top beat left.dec)
+    ? (gt left 0) (_ foot view reach top beat left)
+    ? message
+     > (./committed epoch)
+      ; (Send init.parent (feet/gift/state epoch))
+      | _ foot view reach top beat left
+     > (./state request held)
+      = ;turn (mesa_foot/turned held foot)
+        ;higher (nmax top held.local.top)
+      ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
+      ; (mesa_wire/act init.parent reach turn.does)
+      | _ turn.foot held reach higher beat left
+     > (./fact binding)
+      ? (mesa_wire/stopped binding)
+        ; (mesa_wire/wake port 4)
+        ; (mesa_wire/wire me no_routes reach)
+        | _ foot view no_links top beat helpers
+      = wanted (mesa_wire/routes binding)
+        peers wanted.map((\ item=mesa_wire/route item.peer))
+        ;next (mesa_wire/wire me wanted reach)
+      ? (equal[row[mesa_foot/peer]] peers foot.peers) (_ foot view next top beat left)
+      = ;again (mesa_foot/tick (div (Now 0) 1000000) view (mesa_foot/start view.self seed foot.rift peers))
+      ; (mesa_wire/act init.parent next again.does)
+      | _ again.foot view next top beat left
+     > carried=mesa_wire/heard
+      = ;turn
+          | carried.packets.fold (mesa_foot/quiet foot)
+            \ ;acc=mesa_foot/turn packet=nat
+            ^ mesa_foot/turn
+            | mesa_foot/after acc
+              \ now=mesa_foot/foot
+              ^ mesa_foot/turn
+              | mesa_foot/heard carried.from packet view now
+      ; (mesa_wire/act init.parent reach turn.does)
+      | _ turn.foot view reach top beat left
+     > time=mesa_wire/tick
+      = again (eq 0 (mod beat.inc 15))
+        ;turn (? again (mesa_foot/tick time.now view foot) (mesa_foot/clock time.now view foot))
+      ; (mesa_wire/act init.parent reach turn.does)
+      | _ turn.foot view reach top beat.inc left
+     > (./admitted request status body line)
+      = ;turn (mesa_foot/landed request (mesa_wire/why status body) foot)
+      ; (mesa_wire/act init.parent reach turn.does)
+      | _ turn.foot view reach top beat left
+     > (./ack err) (_ foot view reach top beat left)
+    | _ foot view reach top beat left
+  + here
+    ^ path
+    []
+  + stopped
+    ' Whether the foot's record says to stop: it is gone, or holds `stop`.
+    \ binding=axal[saga]
+    ^ bool
+    ?> (./some version) binding.fil .true
+    | gt (unpin version.myth).nat_at(['stop] 0) 0
+  + wake
+    ' Connect to this world's own port, once for each acceptor, so that
+    ' each stops waiting and asks the foot whether to go on.
+    \ port=nat count=nat
+    ^ nat
+    = nothing=row[nat] []
+    % left=nat count
+    ^ nat
+    ? (eq 0 port) 0
+    ? !(left) 0
+    ; (SendTo 0 "127.0.0.1" port (mesa_wire/frames 0 nothing))
+    | _ left.dec
+  + listen
+    ' Start the acceptors that share the listening socket.
+    \ fd=nat count=nat
+    ^ nat
+    % left=nat count
+    ^ nat
+    ? !(left) 0
+    = ;one (Spawn (mesa_wire/acceptor fd))
+    ; (SendCaps one 0 [0])
+    | _ left.dec
