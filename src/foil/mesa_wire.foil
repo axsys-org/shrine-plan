@@ -226,18 +226,47 @@
     ^ nat
     = raw (add (mod rift (bex 64)) (lsh (mod top (bex 64)) 64))
     | WriteFile file (add raw (bex 128))
+  + named
+    ' A file's path as the foot's record gives it, or where it is kept when
+    ' the record says nothing.
+    \ said=str kept=str
+    ^ str
+    ? (eq 0 said.len) kept
+    said
+  + seed
+    ' The world's signing seed, from its ring file. A world that has never
+    ' stated a key and has no ring is given one: 32 bytes of the runtime's
+    ' entropy, written where the ring is kept, in a folder of the world's
+    ' own. A world that has stated a key is never given another: without
+    ' its ring it stays silent, because a new seed would be a new identity.
+    \ ring=str stated=bool
+    ^ nat
+    = ;held (Try ReadFile ring)
+      found
+        ? held
+         > (./err _) 0
+         > (./ok bytes) bytes
+    ? !(eq 0 (mesa_wire/public found)) found
+    ? stated 0
+    = ;folder (Folder "io/mesa")
+      ;fresh (Entropy 32)
+      ;wrote (WriteFile ring fresh)
+    fresh
   + run
     ' The foot. It waits for the world as it stands, reads its seed and
     ' its mark, raises its rift when the world is behind what it once
     ' announced, and then runs the rules for whatever arrives.
+    ' It listens where its record says: a port that appears on a record
+    ' that had none is taken up when it appears, and a foot that is
+    ' listening keeps its port until it is stopped.
     \ init=feet/task/init self=nat
     ^ nat
     = record (mesa_wire/own init.ax)
       port record.nat_at(['port] 0)
-      ring record.txt_at(['ring])
-      file record.txt_at(['mark])
-      ;seed (ReadFile ring)
+      ring (mesa_wire/named record.txt_at(['ring]) "io/mesa/ring")
+      file (mesa_wire/named record.txt_at(['mark]) "io/mesa/mark")
       claimed (gt record.nat_at(['seq] 0) 0)
+      ;seed (mesa_wire/seed ring (claimed || (gt record.nat_at(['key] 0) 0)))
       silent (and claimed !(eq record.nat_at(['key] 0) (mesa_wire/public seed)))
     ? (eq 0 (mesa_wire/public seed))
       ; (Trace ["mesa foot: the ring file holds no seed" ring] 0)
@@ -277,6 +306,8 @@
       left=nat 0
       key=nat seed
       mute=bool silent
+      at=nat port
+      ear=nat door
     = ;[message caps] (Recv[mesa_wire/task] 0)
       helper
         ? message
@@ -285,25 +316,31 @@
         .false
     ; (? (and helper (gt caps.len 0)) (Send caps.at(0) (? left 0 1)) 0)
     ; (helm/supervisor/close_caps caps)
-    ? (and helper (eq left 1)) (? (eq 0 door) 0 (CloseFd door))
-    ? (and helper (gt left 1)) (_ foot view reach top beat left.dec key mute)
-    ? (gt left 0) (_ foot view reach top beat left key mute)
-    ? (and mute helper) (_ foot view reach top beat left key mute)
+    ? (and helper (eq left 1)) (? (eq 0 ear) 0 (CloseFd ear))
+    ? (and helper (gt left 1)) (_ foot view reach top beat left.dec key mute at ear)
+    ? (gt left 0) (_ foot view reach top beat left key mute at ear)
+    ? (and mute helper) (_ foot view reach top beat left key mute at ear)
     ? message
      > (./committed epoch)
       ; (Send init.parent (feet/gift/state epoch))
-      | _ foot view reach top beat left key mute
+      | _ foot view reach top beat left key mute at ear
      > (./state request held)
       = ;turn (mesa_foot/turned held foot)
         ;higher (nmax top held.local.top)
       ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
       ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot held reach higher beat left key mute
+      | _ turn.foot held reach higher beat left key mute at ear
      > (./fact binding)
+      = wish (mesa_wire/own binding).nat_at(['port] 0)
+        opens (and (eq 0 at) (gt wish 0))
+        ;heard (? opens (Listen wish) ear)
+        now (? opens wish at)
+      ; (? opens (mesa_wire/listen heard 4) 0)
+      ; (? opens (Trace ["mesa foot listening" wish] 0) 0)
       ? (mesa_wire/stopped binding)
-        ; (mesa_wire/wake port 4)
+        ; (mesa_wire/wake now 4)
         ; (mesa_wire/wire me no_routes reach)
-        | _ foot view no_links top beat helpers key mute
+        | _ foot view no_links top beat (? (eq 0 now) 1 5) key mute now heard
       = wanted (mesa_wire/routes binding)
         peers wanted.map((\ item=mesa_wire/route item.peer))
         ;next (mesa_wire/wire me wanted reach)
@@ -312,11 +349,11 @@
         want own.nat_at(['key] 0)
         ;fresh (? (and stated !(eq want (mesa_wire/public key))) (ReadFile ring) key)
         agrees (? stated (eq want (mesa_wire/public fresh)) .true)
-      ? !agrees (_ foot view next top beat left key .true)
-      ? (and (eq fresh key) (and !mute (equal[row[mesa_foot/peer]] peers foot.peers))) (_ foot view next top beat left key mute)
+      ? !agrees (_ foot view next top beat left key .true now heard)
+      ? (and (eq fresh key) (and !mute (equal[row[mesa_foot/peer]] peers foot.peers))) (_ foot view next top beat left key mute now heard)
       = ;again (mesa_foot/tick (div (Now 0) 1000000) view (mesa_foot/start view.self fresh foot.rift peers))
       ; (mesa_wire/act init.parent next again.does)
-      | _ again.foot view next top beat left fresh .false
+      | _ again.foot view next top beat left fresh .false now heard
      > carried=mesa_wire/heard
       = ;turn
           | carried.packets.fold (mesa_foot/quiet foot)
@@ -327,18 +364,18 @@
               ^ mesa_foot/turn
               | mesa_foot/heard carried.from packet view now
       ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat left key mute
+      | _ turn.foot view reach top beat left key mute at ear
      > time=mesa_wire/tick
       = again (eq 0 (mod beat.inc 15))
         ;turn (? again (mesa_foot/tick time.now view foot) (mesa_foot/clock time.now view foot))
       ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat.inc left key mute
+      | _ turn.foot view reach top beat.inc left key mute at ear
      > (./admitted request status body line)
       = ;turn (mesa_foot/landed request (mesa_wire/why status body) foot)
       ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat left key mute
-     > (./ack err) (_ foot view reach top beat left key mute)
-    | _ foot view reach top beat left key mute
+      | _ turn.foot view reach top beat left key mute at ear
+     > (./ack err) (_ foot view reach top beat left key mute at ear)
+    | _ foot view reach top beat left key mute at ear
   + here
     ^ path
     []

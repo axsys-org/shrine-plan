@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Two worlds on one machine, talking through their Mesa feet.
 
-Boots world A (0x51) and world B (0x52) as two processes, each with the mcp and mesa mounts, gives each the
-other's key and address, and checks through their own doors that what A writes for B arrives in B: a first
+Boots world A (0x51) and world B (0x52) as two processes, each with the mcp and mesa mounts. Nothing outside
+tells a world anything: each foot makes its own seed, and this script then writes, through each world's own
+door, the port its foot is to listen on and a card for the other world, with the key that world's foot
+published. It checks through their doors that what A writes for B arrives in B: a first
 commit, a change, an addition, a removal, what is public, a restart of the reader, and that the reader's
 journal names its Mesa foot as the one that brought each landing in. Nothing is read from a world's files.
 
@@ -22,32 +24,21 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PKCS8 = bytes.fromhex('302e020100300506032b657004220420')
-
-
-def public_key(seed):
-    """The Ed25519 public key of a 32-byte seed, as the number a card holds: its bytes and a top marker."""
-    der = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-pubout', '-outform', 'DER'],
-                         input=PKCS8 + seed, capture_output=True, check=True).stdout
-    return int.from_bytes(der[-32:], 'little') + (1 << 256)
 
 
 class World:
-    def __init__(self, node, http, mesa, home, seed, peers):
-        self.node, self.http, self.mesa, self.home, self.seed, self.peers = node, http, mesa, home, seed, peers
+    def __init__(self, node, http, mesa, home):
+        self.node, self.http, self.mesa, self.home = node, http, mesa, home
         self.process = None
         self.count = 0
 
     def start(self, timeout):
-        config = self.home / 'mesa.json'
-        config.write_text(json.dumps(dict(port=self.mesa, peers=self.peers)))
-        env = dict(os.environ, SHRINE_MESA=str(config), SHRINE_MESA_SEED=self.seed.hex())
         self.log = (self.home / 'eden.log').open('a')
         self.process = subprocess.Popen(
             [sys.executable, str(ROOT / 'x/eden'), '--node', self.node, '--port', str(self.http),
              '--world', str(self.home / 'world'), '--mount', 'mcp', '--mount', 'mesa',
              '--extras-root', str(ROOT / 'extras'), '--startup-timeout', str(timeout)],
-            env=env, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.process.poll() is not None:
@@ -90,6 +81,26 @@ class World:
             return {'error': str(error)}
 
 
+def slot_of(answer, slot):
+    """A slot's value in a read's answer, as the door gives it, or None."""
+    properties = answer.get('properties') or {}
+    return properties.get('/' + slot, properties.get(slot))
+
+
+def key_of(world, seconds=180):
+    """The key a world's foot published on its own record, once it has made its seed."""
+    found = []
+
+    def there():
+        value = slot_of(world.read('/' + world.node + '/io/mesa'), 'key')
+        if value is None:
+            return False
+        found.append(int(str(value)))
+        return True
+
+    return found[-1] if until(there, seconds) else 0
+
+
 def holds(answer, slot, value):
     """Whether a read's answer holds a slot with a value. The door gives every value as text."""
     properties = answer.get('properties') or {}
@@ -113,15 +124,11 @@ def main():
     parser.add_argument('--timeout', type=int, default=1800)
     args = parser.parse_args()
     base = Path(tempfile.mkdtemp(prefix='shrine-net-'))
-    seeds = [bytes([17]) * 32, bytes([18]) * 32]
-    keys = [public_key(seed) for seed in seeds]
     ports = dict(a=(args.base_port, args.base_port + 1000), b=(args.base_port + 1, args.base_port + 1001))
     (base / 'a').mkdir()
     (base / 'b').mkdir()
-    a = World('0x51', *ports['a'], base / 'a', seeds[0],
-              [dict(node='0x52', key=keys[1], host='127.0.0.1', port=ports['b'][1])])
-    b = World('0x52', *ports['b'], base / 'b', seeds[1],
-              [dict(node='0x51', key=keys[0], host='127.0.0.1', port=ports['a'][1])])
+    a = World('0x51', *ports['a'], base / 'a')
+    b = World('0x52', *ports['b'], base / 'b')
     rows = []
 
     def row(name, passed, detail=''):
@@ -131,8 +138,16 @@ def main():
     try:
         a.start(args.timeout)
         b.start(args.timeout)
-        own = a.read('/0x51/io/mesa')
-        row('the foot publishes its own key on its record', str(keys[0]) in json.dumps(own), own)
+        keys = [key_of(a), key_of(b)]
+        row('each foot makes its own seed and publishes its key on its record',
+            keys[0] > 0 and keys[1] > 0 and keys[0] != keys[1], keys)
+        a.write(dict(path='/0x51/io/mesa', action='poke', slots={'port': ports['a'][1]}),
+                dict(path='/0x51/io/mesa/0x52', slots={'key': keys[1], 'host': '127.0.0.1', 'port': ports['b'][1]}))
+        b.write(dict(path='/0x52/io/mesa', action='poke', slots={'port': ports['b'][1]}),
+                dict(path='/0x52/io/mesa/0x51', slots={'key': keys[0], 'host': '127.0.0.1', 'port': ports['a'][1]}))
+        row('a port and a card written through the door are taken up: the world holds them',
+            holds(a.read('/0x51/io/mesa'), 'port', ports['a'][1]) and
+            holds(b.read('/0x52/io/mesa/0x51'), 'port', ports['a'][1]))
 
         a.write(dict(path='/0x51/our/0x52', slots={'title': 'for b'}),
                 dict(path='/0x51/our/0x52/doc', slots={'value': 10}),
