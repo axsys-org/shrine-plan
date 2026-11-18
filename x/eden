@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 from eden_mounts import catalog, select, prepare, runtime_specs, ScanBridge, runtime_literal
 from eden_runtime import runtime_exit_status, startup_failed, startup_ready
+from eden_hands import parse_hand, start_hands
 from namespace_identity import parse_node_identity
 from test_runner import stage, copy_snapshot
 
@@ -46,6 +47,24 @@ def literal(value):
     return runtime_literal(value)
 
 
+def announce_world(url, work, kept, mounts, timeout):
+    """Write /agent/launcher/world so an agent can tell a kept world from a temporary one."""
+    if 'mcp' not in mounts:
+        return
+    record = {'path': '/agent/launcher/world',
+              'slots': {'kept': kept, 'directory': str(work), 'mounts': ' '.join(mounts)}}
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                       'params': {'name': 'mcp/write', 'arguments': {'records': [record], 'who': 'launcher'}}}).encode()
+    request = urllib.request.Request(url + '/mcp', body, {'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            reply = json.load(response)
+        if 'error' in reply or reply.get('result', {}).get('isError'):
+            print(f'The world record was refused: {reply}', file=sys.stderr, flush=True)
+    except (OSError, ValueError) as error:
+        print(f'The world record was not written: {error}', file=sys.stderr, flush=True)
+
+
 def main():
     def terminate(signum, frame):
         raise KeyboardInterrupt
@@ -58,6 +77,9 @@ def main():
     parser.add_argument('--list-mounts', action='store_true')
     parser.add_argument('--node', default='0x11')
     parser.add_argument('--port', type=int, default=8130)
+    parser.add_argument('--hand', action='append', default=[], metavar='"NAME ARGS"',
+                        help='a hand the world runs beside it (clock, source) with its arguments, '
+                             'started after the foot listens and stopped at teardown; remembered by the world')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--world', type=Path, help='Native world directory (default: $XDG_DATA_HOME/shrine/worlds/NODE)')
     parser.add_argument('--ephemeral', action='store_true', help='Disposable world; implied by --check')
@@ -93,6 +115,11 @@ def main():
         selected = select(extras, names) if names else []
         if recorded and [m.name for m in selected] != recorded['mounts']:
             raise ValueError('The selected mounts differ from this world; use its existing selection')
+        hands = [parse_hand(text) for text in args.hand]
+        if recorded:
+            if args.hand and hands != recorded.get('hands', []):
+                raise ValueError('The selected hands differ from this world; use its existing selection')
+            hands = recorded.get('hands', [])
         enter_environment(sys.argv[1:])
         runtime = os.environ.get('WISP') or shutil.which('wisp')
         if not runtime or not os.access(runtime, os.X_OK):
@@ -115,9 +142,10 @@ def main():
                 template = stage(runtime, False, args.startup_timeout)
                 shutil.copytree(ROOT / 'src', work / 'src')
                 copy_snapshot(template, work / 'snap')
+                # hands: the hands this world runs beside it, when it has any.
                 (work / 'world.json').write_text(json.dumps(dict(format=1, node=node,
                     extras=str(extras), workspace=str(workspace), compiler=args.compiler,
-                    mounts=[m.name for m in selected]), indent=2) + '\n')
+                    mounts=[m.name for m in selected], **({'hands': hands} if hands else {})), indent=2) + '\n')
             session = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='session-', dir=work)))
             prepared = prepare(selected, session, args.check, cleanup,
                                {"node": node, "timeout": args.startup_timeout, "workspace": str(workspace)})
@@ -190,7 +218,14 @@ def main():
                     raise RuntimeError(f'Startup timed out; inspect {log_path}')
                 time.sleep(.25)
             url = f'http://127.0.0.1:{args.port}'
-            print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}', flush=True)
+            # The hands the descriptor names run beside the world, each its own process, each with its log.
+            # A world with hands also says which kind of world it is, for the agents beside it.
+            running = []
+            if hands and not args.check:
+                announce_world(url, work, not args.ephemeral, [m.name for m in selected], args.request_timeout)
+                running = start_hands(hands, url, node, work, cleanup)
+            print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}'
+                  + (f'; hands: {", ".join(name for name, _, _ in running)}' if running else ''), flush=True)
             if args.check:
                 for path in ('/__eden_unregistered__',):
                     try:
