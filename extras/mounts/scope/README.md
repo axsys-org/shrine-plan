@@ -10,6 +10,7 @@ Registers the foot at `/<self>/io/scope`, which runs a scope's rules whenever th
   when the place asks.
 
 A record beneath `/<self>/io/scope` says what the foot tends. One with a reference in `root` is a scope this
-world keeps: places are records beneath `<root>/places` and the catalog is `<root>/catalog/<world>`. One with
+world keeps: a place is any record beneath the root that holds an invitation's number in `invite`, wherever a
+pack puts it, and the catalog is `<root>/catalog/<world>`. One with
 a number in `scope` is a scope this world is listed in: the worlds it lists become cards of this world's own,
 each checked against its name.
