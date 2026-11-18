@@ -1,10 +1,12 @@
 """World processes for the cross-process checks: start one, talk to its door, stop it."""
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -30,8 +32,10 @@ def until(condition, seconds=120):
 
 
 class World:
-    def __init__(self, node, http, mesa, home, mounts=('mcp', 'mesa', 'scope')):
+    def __init__(self, node, http, mesa, home, mounts=('mcp', 'mesa', 'scope'), founding=''):
         self.node, self.http, self.mesa, self.home, self.mounts = node, http, mesa, home, mounts
+        self.founding = founding
+        self.session = None
         self.process = None
         self.count = 0
 
@@ -41,6 +45,8 @@ class World:
         command = [sys.executable, str(ROOT / 'x/eden'), '--node', self.node, '--port', str(self.http),
                    '--world', str(self.home / 'world'), '--extras-root', str(ROOT / 'extras'),
                    '--startup-timeout', str(timeout)]
+        if self.founding:
+            command += ['--founding', self.founding]
         for mount in self.mounts:
             command += ['--mount', mount]
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -64,12 +70,65 @@ class World:
                 os.killpg(self.process.pid, signal.SIGKILL)
         self.process = None
 
+    def headers(self, session=None):
+        session = session or self.session
+        return {'Content-Type': 'application/json', **({'Authorization': 'Bearer ' + session} if session else {})}
+
+    def post(self, route, body='', session=None, nobody=False):
+        """One request at the door, as the session this world was let in under, another, or nobody.
+        Returns the status and the text."""
+        headers = {'Content-Type': 'text/plain'} if nobody else self.headers(session)
+        request = urllib.request.Request(f'http://127.0.0.1:{self.http}{route}', body.encode(), headers)
+        try:
+            reply = urllib.request.urlopen(request, timeout=60)
+            return reply.status, reply.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    def files(self):
+        """The world's file root. Only whoever is at the machine, and the host, look here."""
+        return self.home / 'world' / 'src'
+
+    def owner(self, seconds=240):
+        """The first session of a world that is its own, read from the file its foot left: whoever
+        is at the machine is the owner, and this script is."""
+        left = self.files() / 'io' / 'mesa' / 'out' / 'session'
+        if not until(lambda: left.exists() and left.stat().st_size > 0, seconds):
+            raise RuntimeError(f'{self.node} left no first session at {left}')
+        self.session = left.read_text().strip()
+        return self.session
+
+    def link(self, invite, seconds=120):
+        """The link to an invitation this world minted, with its secret, from its door, as its owner."""
+        if not self.session:
+            self.owner()
+        deadline = time.time() + seconds
+        said = None
+        while time.time() < deadline:
+            said = self.post(f'/scope/link/{invite}')
+            if said[0] == 200:
+                return said[1].strip()
+            if said[0] != 202:
+                break
+            time.sleep(1)
+        raise RuntimeError(f'the door of {self.node} gave no link to invitation {invite}: {said}')
+
+    def join(self, link, session=None, nobody=False, seconds=60):
+        """Hand a link over at this world's door. Returns the last status and text."""
+        deadline = time.time() + seconds
+        said = None
+        while time.time() < deadline:
+            said = self.post('/scope/join', link, session=session, nobody=nobody)
+            if not (said[0] == 409 and 'still being answered' in said[1]):
+                break
+            time.sleep(1)
+        return said
+
     def tool(self, name, **arguments):
         self.count += 1
         body = json.dumps(dict(jsonrpc='2.0', id=self.count, method='tools/call',
                                params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        request = urllib.request.Request(f'http://127.0.0.1:{self.http}/mcp', body,
-                                         {'Content-Type': 'application/json'})
+        request = urllib.request.Request(f'http://127.0.0.1:{self.http}/mcp', body, self.headers())
         reply = json.load(urllib.request.urlopen(request, timeout=60))
         result = reply['result']
         if result.get('isError'):
@@ -104,6 +163,12 @@ class World:
         return '' if value is None else str(value)
 
 
+def founding_of(link):
+    """What a host starts a world under a link's name with: the last four parts of the link itself
+    (the name's founding and first statement), and never its secret."""
+    return ','.join(link.split(',')[7:11])
+
+
 def meet(worlds, seconds=180):
     """Each world listens on its port and holds a card for every other: the stand-in for joining, which
     x/check-community covers."""
@@ -128,42 +193,29 @@ def numbers(slots):
 
 
 def prepared(maker, place, invite, http, mesa, home, timeout, mounts=('mcp', 'mesa', 'scope')):
-    """A world prepared for a place and claimed, as x/check-community does it step by step: the place's
-    invitation is minted, a world is started under the minted name with its founding and first statement,
-    it is handed the invitation's secret and claims itself, and it is brought before the maker. This
-    function plays the door (it moves the secret between file roots) and the host (it starts the world).
-    Returns the world, or raises with what did not happen."""
+    """A world prepared for a place and claimed, as x/check-community does it step by step. The maker's
+    door gives the link to its owner. A world is started under the link's name with the name's founding
+    and told where it is reached: that much is the host, played here. Then the link is handed over at the
+    new world's door by nobody, with a session this function makes, and everything else is the worlds'
+    own: the claim, the session let in, the scope met, the introduction, the place filled. Returns the
+    world, let in under that session, or raises with what did not happen."""
     if not until(lambda: maker.number(place, 'name') > 0, 240):
         raise RuntimeError(f'no invitation was minted for {place}: {maker.read(place)}')
     name = maker.number(place, 'name')
-    node = spell(name)
-    card = '/' + maker.node + '/io/mesa/' + node
-    ask = '/' + maker.node + '/io/mesa/ask/link' + str(invite)
-    maker.write(dict(path=ask, slots={'want': 'link', 'id': invite}))
-    left = maker.home / 'world' / 'src' / 'io' / 'mesa' / 'out' / str(invite)
-    if not until(lambda: left.exists() and left.stat().st_size == 32, 90):
-        raise RuntimeError(f'the secret of invitation {invite} was not left for the door: {maker.read(ask)}')
-    secret = left.read_bytes()
-    world = World(node, http, mesa, home, mounts)
+    link = maker.link(invite)
+    world = World(spell(name), http, mesa, home, mounts, founding=founding_of(link))
     world.start(timeout)
-    here = '/' + node + '/io/mesa'
-    until(lambda: world.number(here, 'key') > 0, 180)
-    standing = numbers({k: v for k, v in maker.slots(card).items()
-                        if k in ('seq', 'last', 'life', 'rift', 'key', 'custody')})
-    world.write(dict(path=here + '/pass', slots=numbers(maker.slots(card + '/pass'))),
-                dict(path=here + '/pass/1', slots=numbers(maker.slots(card + '/pass/1'))))
-    world.write(dict(path=here, action='poke', slots=dict(standing, port=mesa)),
-                dict(path=here + '/' + maker.node,
-                     slots={'key': maker.number('/' + maker.node + '/io/mesa', 'key'),
-                            'host': '127.0.0.1', 'port': maker.mesa}))
-    handed = home / 'world' / 'src' / 'io' / 'mesa' / 'in'
-    handed.mkdir(parents=True, exist_ok=True)
-    (handed / '1').write_bytes(secret)
-    world.write(dict(path=here + '/ask/claim', slots={'want': 'claim', 'name': name, 'handed': 1}))
+    here = '/' + world.node + '/io/mesa'
+    if not until(lambda: world.number(here, 'seq') == 1, 180):
+        raise RuntimeError(f'{world.node} did not keep the founding it was started with: {world.read(here)}')
+    world.write(dict(path=here, action='poke', slots={'host': '127.0.0.1', 'port': mesa}))
+    session = secrets.token_hex(16)
+    said = world.join(link, session=session)
+    if said[0] != 202:
+        raise RuntimeError(f'the door of {world.node} did not take the link: {said}')
+    world.session = session
     if not until(lambda: world.number(here, 'seq') == 2, 180):
-        raise RuntimeError(f'{node} did not claim itself: {world.read(here + "/ask/claim")}')
-    world.write(dict(path=here + '/ask/bring',
-                     slots={'want': 'bring', 'to': number_of(maker.node), 'host': '127.0.0.1', 'port': mesa}))
+        raise RuntimeError(f'{world.node} did not claim itself: {world.read(here)}')
     if not until(lambda: maker.number(place, 'world') == name, 300):
-        raise RuntimeError(f'{place} was not filled by {node}: {maker.read(place)} {maker.read(card)}')
+        raise RuntimeError(f'{place} was not filled by {world.node}: {maker.read(place)}')
     return world

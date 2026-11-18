@@ -14,3 +14,20 @@ world keeps: a place is any record beneath the root that holds an invitation's n
 pack puts it, and the catalog is `<root>/catalog/<world>`. One with
 a number in `scope` is a scope this world is listed in: the worlds it lists become cards of this world's own,
 each checked against its name.
+
+A record with a number in `to` is a joining: what the door wrote when it was handed a link. Once the claim it
+asked for is made, the scope the link named is met, the record takes `maker`, `scope` and `side`, and the world
+asks to be brought before the scope.
+
+## The door's two routes
+
+- `POST /scope/link/<number>`, from someone this world let in: the link to the invitation minted under that
+  number, with its secret after it, as one line of text. The first request answers 202 while the foot leaves
+  the secret; a later one answers 200 with the link, once, and the file is emptied.
+- `POST /scope/join`, with a link as the body: this world claims the link's name and joins. Someone this world
+  let in may hand over any link. Nobody may hand over only the link to this world's own name, while the world
+  has let nobody in: that is a world prepared for the place. The session such a request showed
+  (`Authorization: Bearer <secret>`) is the one the claim lets in.
+
+A secret passes between a request and a file of the foot's (`io/mesa/out/<number>`, `io/mesa/in/<name>`) and is
+in no record.
