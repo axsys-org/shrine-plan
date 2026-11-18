@@ -7,8 +7,8 @@ recomposes on the next read. This loop is the same for an industrial atlas, supp
 x-ray, grid intelligence, failure investigation or an invention genealogy: only the standings and the questions
 change. One view is the way of looking: a thing as a world. It is the same picture for you and for the person.
 
-Your whole vocabulary is two writes. A note with references: what you found, in the source's words, every thing
-it names written as its path in brackets. A view: what you want pulled out of what is there, by formula, at a
+Your whole vocabulary is two writes. A note with references: what you found, in the source's words, and beside
+the words one reference in a slot for every thing they name. A view: what you want pulled out of what is there, by formula, at a
 name. Everything else is reading: stand on something, read it as a world, see where it is thin. You never edit
 anything shared, so you need no coordination with anyone: you add a note at a source's place or a view at a name,
 and the overlay folds it in for everyone on the next read. The moment two notes reference the same name, the work
@@ -22,25 +22,27 @@ behind them is connected, whether or not either writer knew of the other.
    `/0/<path>`: folders are slot names, forward (`out/<n>/<slot>`, what the thing asserts) and backward
    (`in/<n>/<name>`, what references it, under the name of whatever holds the reference: a slot as its author
    spelled it, or a cell by its own name; a text that names the thing is a line with its sentence). Each item names its world, the world asserting the hop
-   (`by`) and the holder (`via`); the holder's other slots are the note on the line. A hop whose key sits in brackets
-   in the holder's text is a name, not an assertion: that is the pointer to what to digest or judge next. Folders
+   (`by`) and the holder (`via`); the holder's other slots are the note on the line. A hop whose holder is a text
+   is a name, not an assertion: that is the pointer to what to digest or judge next. Folders
    beyond the subject arrive closed, as counts; read the thing there as a world to open them.
 2. **Choose standings.** For a question over several things, write a cell (`sys/weft` →
    `/h/x/<case>/4/<node>/weft/graph/overlay`, `sys/tack` → the first standing, `standing/<k>` → the others, `depth`
    1 to 6) and read `/x/<cell>` at z: `standings`, `components`, `islands`, then one virtual root `/<n>` per
    connected component with its standings unfolded beneath. Standings meet over any reference; a standing reached
    inside another's unfolding is listed there as seen. An island (a root of one) is the next thing to connect: a
-   bracketed name reaching into it is a judgement waiting; none means a fetch.
+   text's reference reaching into it is a judgement waiting; none means a fetch.
 3. **Digest.** Before reading a new source, stand on its landing place (`/user/web/pages/<host>`, `/user/registries/<source>`)
    as a world: the names its siblings already placed, the crossings they made into other buckets, and the cells
    left there are what to try first; none of it is a conclusion, all of it is where to look. The texts still to
    digest are the ones whose `← source` folder is empty, read from any landing place, so no queue hand is needed. Then
-   the text: it is prose until its sentences land. Write each thing it names into the prose as its path in brackets,
-   `[/0x11/user/orgs/verisk]`; that is a reference, the index sees it, the overlay follows it. Then each sentence
+   the text: it is prose until its sentences land. Hold each thing it names as a reference in a slot of the text's
+   record, beside the prose (`names/1` → `/0x11/user/orgs/verisk`, or a slot named for what the text says of it).
+   That is a reference: the index holds it and the overlay follows it. A path typed inside the prose is only
+   characters; it links nothing. Then each sentence
    that pins something as a record beneath the thing it is about: the slot it pins, the sentence in the text's
-   words with its brackets, `source` → the text. A value that disagrees with another source is a second record under the
+   words, `source` → the text. A value that disagrees with another source is a second record under the
    same folder, never an overwrite. No record of any other kind, no topic: the shared name is the relation. The rules are in `hands/DIGESTION.md`.
-4. **Judge.** A registry record's `candidates`, or a bracketed name reaching into an island, says what might be
+4. **Judge.** A registry record's `candidates`, or a text's reference reaching into an island, says what might be
    the same thing. Open
    both records and compare what the registries *state*: street and zip, NAICS and SIC, CAGE, legal name, parent,
    state of incorporation. Two records are the same thing when their stated identifiers agree beyond a shared name;

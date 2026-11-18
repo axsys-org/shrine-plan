@@ -1,5 +1,11 @@
 # Shrine: the architecture
 
+> **Changed 2026-11-18.** A reference is a value in a slot, in the overlay as in the index. A path in brackets
+> inside prose is no longer a reference: nothing scans text (`reference_index.foil`). Where this document says a
+> name is written into the prose as its path in brackets, read: the text's record holds a reference to the thing
+> in a slot beside its prose. The reason is the network: what a world publishes and asks is derived from the
+> index, so a path in pasted or received text must not be able to make a link.
+
 The world is records at names, with references. The kernel indexes references both ways and evaluates cells.
 Everything else is somebody writing. The overlay reads all of it as one tree from wherever you stand.
 
