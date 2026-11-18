@@ -121,3 +121,49 @@ def meet(worlds, seconds=180):
                                     slots={'key': keys[other.node], 'host': '127.0.0.1', 'port': other.mesa}))
         world.write(*records)
     return keys
+
+
+def numbers(slots):
+    return {name: int(str(value)) for name, value in slots.items()}
+
+
+def prepared(maker, place, invite, http, mesa, home, timeout, mounts=('mcp', 'mesa', 'scope')):
+    """A world prepared for a place and claimed, as x/check-community does it step by step: the place's
+    invitation is minted, a world is started under the minted name with its founding and first statement,
+    it is handed the invitation's secret and claims itself, and it is brought before the maker. This
+    function plays the door (it moves the secret between file roots) and the host (it starts the world).
+    Returns the world, or raises with what did not happen."""
+    if not until(lambda: maker.number(place, 'name') > 0, 240):
+        raise RuntimeError(f'no invitation was minted for {place}: {maker.read(place)}')
+    name = maker.number(place, 'name')
+    node = spell(name)
+    card = '/' + maker.node + '/io/mesa/' + node
+    ask = '/' + maker.node + '/io/mesa/ask/link' + str(invite)
+    maker.write(dict(path=ask, slots={'want': 'link', 'id': invite}))
+    left = maker.home / 'world' / 'src' / 'io' / 'mesa' / 'out' / str(invite)
+    if not until(lambda: left.exists() and left.stat().st_size == 32, 90):
+        raise RuntimeError(f'the secret of invitation {invite} was not left for the door: {maker.read(ask)}')
+    secret = left.read_bytes()
+    world = World(node, http, mesa, home, mounts)
+    world.start(timeout)
+    here = '/' + node + '/io/mesa'
+    until(lambda: world.number(here, 'key') > 0, 180)
+    standing = numbers({k: v for k, v in maker.slots(card).items()
+                        if k in ('seq', 'last', 'life', 'rift', 'key', 'custody')})
+    world.write(dict(path=here + '/pass', slots=numbers(maker.slots(card + '/pass'))),
+                dict(path=here + '/pass/1', slots=numbers(maker.slots(card + '/pass/1'))))
+    world.write(dict(path=here, action='poke', slots=dict(standing, port=mesa)),
+                dict(path=here + '/' + maker.node,
+                     slots={'key': maker.number('/' + maker.node + '/io/mesa', 'key'),
+                            'host': '127.0.0.1', 'port': maker.mesa}))
+    handed = home / 'world' / 'src' / 'io' / 'mesa' / 'in'
+    handed.mkdir(parents=True, exist_ok=True)
+    (handed / '1').write_bytes(secret)
+    world.write(dict(path=here + '/ask/claim', slots={'want': 'claim', 'name': name, 'handed': 1}))
+    if not until(lambda: world.number(here, 'seq') == 2, 180):
+        raise RuntimeError(f'{node} did not claim itself: {world.read(here + "/ask/claim")}')
+    world.write(dict(path=here + '/ask/bring',
+                     slots={'want': 'bring', 'to': number_of(maker.node), 'host': '127.0.0.1', 'port': mesa}))
+    if not until(lambda: maker.number(place, 'world') == name, 300):
+        raise RuntimeError(f'{place} was not filled by {node}: {maker.read(place)} {maker.read(card)}')
+    return world
