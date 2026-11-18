@@ -32,6 +32,9 @@
       # another as the same pin under the same hash, and a stream holding a law is refused; sockets that
       # answer instead of raising (ReadAll, SendTo), since a raise from Connect ends the process; and
       # the key two worlds share and seal with (BoxKey, SecretSeal, SecretOpen, over libsodium)
+      # and what a machine's own world may execute (nix/enki-host-ops.patch): entropy, usage, and a host
+      # handle, given once to a process started with a worlds root, that makes a world's directory as a
+      # copy of a staged one, starts this same runtime there, stops it and asks whether it is alive
       runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
           ./nix/enki-update-targets.patch
@@ -40,6 +43,7 @@
           ./nix/enki-seq-host.patch
           ./nix/enki-reserve-without-commit.patch
           ./nix/enki-pin-ops.patch
+          ./nix/enki-host-ops.patch
         ];
       });
     in {
