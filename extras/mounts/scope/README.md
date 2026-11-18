@@ -19,7 +19,7 @@ A record with a number in `to` is a joining: what the door wrote when it was han
 asked for is made, the scope the link named is met, the record takes `maker`, `scope` and `side`, and the world
 asks to be brought before the scope.
 
-## The door's two routes
+## The door's routes
 
 - `POST /scope/link/<number>`, from someone this world let in: the link to the invitation minted under that
   number, with its secret after it, as one line of text. The first request answers 202 while the foot leaves
@@ -28,6 +28,11 @@ asks to be brought before the scope.
   let in may hand over any link. Nobody may hand over only the link to this world's own name, while the world
   has let nobody in: that is a world prepared for the place. The session such a request showed
   (`Authorization: Bearer <secret>`) is the one the claim lets in.
+
+- `GET /scope/view/<record>`, from someone this world let in: a composition this world takes part in, as it
+  stands for this world, one line a place: `held`, `todo`, `may` or `waits`; the place; where this world holds
+  the record or would write it; and the world that writes there. `<record>` is the name of the record beneath
+  `/<self>/io/scope` that says the world takes part. It is a reading (`weave/laid`) and writes nothing.
 
 A secret passes between a request and a file of the foot's (`io/mesa/out/<number>`, `io/mesa/in/<name>`) and is
 in no record.

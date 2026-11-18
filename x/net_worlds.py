@@ -85,6 +85,16 @@ class World:
         except urllib.error.HTTPError as error:
             return error.code, error.read().decode()
 
+    def get(self, route, session=None, nobody=False):
+        """One reading at the door. Returns the status and the text."""
+        headers = {} if nobody else {k: v for k, v in self.headers(session).items() if k == 'Authorization'}
+        request = urllib.request.Request(f'http://127.0.0.1:{self.http}{route}', headers=headers)
+        try:
+            reply = urllib.request.urlopen(request, timeout=60)
+            return reply.status, reply.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
     def files(self):
         """The world's file root. Only whoever is at the machine, and the host, look here."""
         return self.home / 'world' / 'src'
