@@ -22,44 +22,46 @@
 (define (made reply) (Ix 0 (Ix 2 (ok reply))))
 (define (told reply) (Ix 1 (ok reply)))
 
-;; The interim domain. A name's domain is part of its identity; this one is a
-;; placeholder until worlds are named in a real one.
-(define domain (bar "gw-btc" 6))
+;; This file decides nothing. The domain, the life and rift an engine is told,
+;; its bounds and retry policy, and the names of pages are the caller's
+;; (src/foil/mesa_foot.foil); what is here is the bridge's own shape.
 
-(define (peer id key-id life rift)
-  (made (call "MesaPeer" 0 [id domain life rift key-id 1])))
+;; realm is [domain life rift]: what the engine is told of every world.
+(define (peer realm id key-id)
+  (made (call "MesaPeer" 0 [id (Ix 0 realm) (Ix 1 realm) (Ix 2 realm) key-id 1])))
 
-;; Limits: [max_packet max_path max_fragment]. The signed-public profile fixes
-;; fragments at 1 KiB, so a longer name is bought only with a larger packet.
-;; The engine's other bounds are raised from Mesa's defaults, which are sized
-;; for a handful of pages: bindings 3 (count) and 4 (bytes), one read 5,
-;; reassembly 6, reads in flight 8. An engine holds 64 MiB of bound pages, the
-;; most the bridge allows, after which the foot starts a new one. A page stays
-;; at most 1 MiB (1024 fragments of 1 KiB): the signed-public profile fixes
-;; that, so a larger value crosses as pins of at most that size each.
-(define (config limits)
+;; A config from Mesa's defaults with the caller's numbers in their places.
+;; core_config is [wire_limits bloq max_peers max_bindings max_binding_bytes
+;; max_read_bytes max_reassembly_bytes max_unverified_bytes max_reads
+;; max_fragments window retry_after read_timeout max_attempts] (API.md).
+;; limits is the wire's [max_packet max_path max_fragment]; bounds is
+;; [max_bindings max_binding_bytes max_reassembly_bytes max_reads retry_after
+;; read_timeout max_attempts].
+(define (config limits bounds)
   (#let ((base (made (call "MesaConfig" 0 0))))
     (#let ((fields (told (call "MesaConfigFields" [base] 0))))
       (made (call "MesaConfig" 0
-              (Up 8 1024 (Up 6 67108864
-                (Up 4 67108864 (Up 3 65536 (Up 0 limits fields))))))))))
+              (Up 13 (Ix 6 bounds) (Up 12 (Ix 5 bounds) (Up 11 (Ix 4 bounds)
+                (Up 8 (Ix 3 bounds) (Up 6 (Ix 2 bounds)
+                  (Up 4 (Ix 1 bounds) (Up 3 (Ix 0 bounds)
+                    (Up 0 limits fields)))))))))))))
 
 ;; An engine for one world: its signing seed, and each peer as [id key-bytes].
-;; Peers take key ids and attachments 1, 2, ... in the order given; the world
-;; itself is key 0. The key table is fixed for the engine's life, so a new
-;; peer means a new engine, which is free: the engine holds no durable state.
-(define (engine self seed limits others)
+;; The bridge takes the keys as one table, the world's own first, so peers
+;; have key ids and attachments 1, 2, ... in the order given. The table is
+;; fixed for the engine's life.
+(define (engine self seed realm limits bounds others)
   (#let ((keypair (made (call "MesaKeyFromSeed" 0 [seed]))))
     (#let ((publics (map (lambda (other) (made (call "MesaPublicKey" 0 [(Ix 1 other)]))) others)))
       (#let ((protection
                (made (call "MesaProtection" (Weld [keypair] publics)
                        [0 (gen (Sz others) (lambda (i) (Inc i)))]))))
         (#let ((made-engine
-                 (made (call "MesaEngine" [(config limits) (peer self 0 1 0) protection] 0))))
+                 (made (call "MesaEngine" [(config limits bounds) (peer realm self 0) protection] 0))))
           (Seq
             (foldl (lambda (count other)
                      (Seq (ok (call "MesaEngineInstallPeer"
-                                [made-engine (peer (Ix 0 other) (Inc count) 1 0)] 0))
+                                [made-engine (peer realm (Ix 0 other) (Inc count))] 0))
                        (Seq (ok (call "MesaEngineSetAttachment" [made-engine]
                                   [(Ix 0 other) [(Inc count)]]))
                          (Inc count))))
@@ -110,50 +112,11 @@
           [kind (Ix 5 (Ix 1 body)) (If (Eq kind 2) (Ix 5 (Ix 2 body)) 0)
            (If (Eq kind 2) (Ix 2 (Ix 3 body)) 0)])))))
 
-;; A hint: no trust, two names, and a few bytes that are their own proof or
-;; nothing (a statement of the sender's identity log). The receiver compares
-;; the names with what it holds and reads what it wants in the ordinary,
-;; signed way.
-(define (name-of publisher path) [publisher domain 0 13 [0 0] path])
-(define (hint me them held offered data limits)
+;; A hint, as the bridge shapes one: two names and a few bytes. What the names
+;; and the bytes mean is the caller's.
+(define (name-of domain publisher path) [publisher domain 0 13 [0 0] path])
+(define (hint domain me them held offered data limits)
   (#let ((carried [(bar-len data) [0 (bar 0 0)] data]))
     (#let ((packet (made (call "MesaPacket" 0
-                           [0 [2 (name-of them held) (name-of me offered) carried] limits]))))
+                           [0 [2 (name-of domain them held) (name-of domain me offered) carried] limits]))))
       (told (call "MesaWireEncode" [packet] 0)))))
-
-;; Page names. A page the kernel serves is named by a one-letter kind and
-;; three numbers, in the signed-public space: publ/<kind>|<a>|<b>|<c>. What
-;; the kinds and numbers mean is the caller's (src/foil/mesa_foot.foil).
-(define (digits n) (showNat n))
-(define (name kind a b c)
-  (#let ((text (strWeld "publ/"
-                 (strWeld kind
-                   (strWeld "|" (strWeld (digits a)
-                     (strWeld "|" (strWeld (digits b)
-                       (strWeld "|" (digits c))))))))))
-    (bar text (Bytes text))))
-(define (digit? b) (And (Ge b 48) (Le b 57)))
-(define (number-go text at size value)
-  (If (And (Lt at size) (digit? (Load8 at text)))
-    (number-go text (Inc at) size (Add (Mul value 10) (Sub (Load8 at text) 48)))
-    [value at]))
-(define (number text from)
-  ;; [value next] reading digits from an offset, or [] when there is none.
-  (#let ((size (Bytes text)))
-    (If (Or (Ge from size) (Nil (digit? (Load8 from text)))) []
-      (number-go text from size 0))))
-;; [kind a b c], or [] when the name is not one of ours.
-(define (parse path)
-  (#let ((text (bar-nat path)))
-    (If (Or (Lt (Bytes text) 8)
-            (Nil (And (Eq 112 (Load8 0 text)) (And (Eq 117 (Load8 1 text))
-              (And (Eq 98 (Load8 2 text)) (And (Eq 108 (Load8 3 text))
-                (And (Eq 47 (Load8 4 text)) (Eq 124 (Load8 6 text)))))))))
-      []
-      (#let ((a (number text 7)))
-        (If (Or (Nil (Sz a)) (Nil (Eq 124 (Load8 (Ix 1 a) text)))) []
-          (#let ((b (number text (Inc (Ix 1 a)))))
-            (If (Or (Nil (Sz b)) (Nil (Eq 124 (Load8 (Ix 1 b) text)))) []
-              (#let ((c (number text (Inc (Ix 1 b)))))
-                (If (Or (Nil (Sz c)) (Nil (Eq (Ix 1 c) (Bytes text)))) []
-                  [(Load8 5 text) (Ix 0 a) (Ix 0 b) (Ix 0 c)])))))))))
