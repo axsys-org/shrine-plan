@@ -42,14 +42,12 @@
 +#include "silo_internal.h"
 +#include "store_internal.h"
  #include "plan/rplan.h"
+ #include "plan/store.h"
  #include "plan/xtract.h"
- 
-@@ -901,8 +906,289 @@
-   crypto_hash_sha256(digest, message, (unsigned long long)n);
-   free(message);
+@@ -912,6 +917,287 @@
    return rp_bar(t, digest, sizeof(digest));
-+}
-+
+ }
+ 
 +/* ------------------------------------------------------------------ */
 +/* Pins as values: a pin's content hash, its canonical stream, and a pin
 + * rebuilt from a stream.  Together they let a value leave one store and
@@ -192,8 +190,8 @@
 +  PL_GC_ALLOW(t);
 +  t->vsp = base;
 +  return row;
- }
- 
++}
++
 +/* PinParts pin -> the pins a pin holds directly, as a row in the order its
 + * stream names them; 0 when it holds none. */
 +pl_val pl_op83_pin_parts(pl_thread* t, size_t ab) {
@@ -334,9 +332,113 @@
  /* Blake3Keyed key message -> 32-byte MAC bar, using BLAKE3's native
   * keyed mode.  This is not the HMAC construction. */
  pl_val pl_op83_blake3_keyed(pl_thread* t, size_t ab) {
+@@ -1018,6 +1304,103 @@
+   return rc == 0 ? 1 : 0;
+ }
+ 
++/* BoxKey seed peer -> the 32-byte key two worlds share: X25519 between this
++ * world's Ed25519 seed and a peer's Ed25519 public key, each in its
++ * Curve25519 form, hashed as crypto_box does.  Both sides derive the same
++ * key.  0 when the seed or the peer's key is not one.  Never raises on its
++ * arguments. */
++pl_val pl_op83_box_key(pl_thread* t, size_t ab) {
++  size_t sn, pn;
++  if (!rp_crypto_bar_size(ARG(0), &sn) ||
++      sn != crypto_sign_ed25519_SEEDBYTES ||
++      !rp_crypto_bar_size(ARG(1), &pn) ||
++      pn != crypto_sign_ed25519_PUBLICKEYBYTES)
++    return 0;
++  rp_crypto_init(t);
++  uint8_t pk[crypto_sign_ed25519_PUBLICKEYBYTES];
++  uint8_t sk[crypto_sign_ed25519_SECRETKEYBYTES];
++  uint8_t peer[crypto_sign_ed25519_PUBLICKEYBYTES];
++  uint8_t xsk[crypto_scalarmult_curve25519_BYTES];
++  uint8_t xpk[crypto_scalarmult_curve25519_BYTES];
++  uint8_t shared[crypto_box_BEFORENMBYTES];
++  rp_ed25519_keypair(ARG(0), pk, sk);
++  rp_crypto_copy(ARG(1), peer, sizeof(peer));
++  bool ok = crypto_sign_ed25519_sk_to_curve25519(xsk, sk) == 0 &&
++            crypto_sign_ed25519_pk_to_curve25519(xpk, peer) == 0 &&
++            crypto_box_beforenm(shared, xpk, xsk) == 0;
++  pl_val out = ok ? rp_bar(t, shared, sizeof(shared)) : 0;
++  sodium_memzero(sk, sizeof(sk));
++  sodium_memzero(xsk, sizeof(xsk));
++  sodium_memzero(shared, sizeof(shared));
++  return out;
++}
++
++/* SecretSeal key nonce name message -> the message sealed under a 32-byte
++ * key and a 24-byte nonce (XChaCha20-Poly1305), bound to name: bytes that
++ * are authenticated with it and not hidden.  The result is the ciphertext
++ * and its 16-byte tag.  0 when the key or nonce has the wrong length. */
++pl_val pl_op83_secret_seal(pl_thread* t, size_t ab) {
++  size_t kn, nn, an, mn;
++  if (!rp_crypto_bar_size(ARG(0), &kn) ||
++      kn != crypto_aead_xchacha20poly1305_ietf_KEYBYTES ||
++      !rp_crypto_bar_size(ARG(1), &nn) ||
++      nn != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES ||
++      !rp_crypto_bar_size(ARG(2), &an) || !rp_crypto_bar_size(ARG(3), &mn))
++    return 0;
++  rp_crypto_init(t);
++  uint8_t key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
++  uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
++  rp_crypto_copy(ARG(0), key, sizeof(key));
++  rp_crypto_copy(ARG(1), nonce, sizeof(nonce));
++  uint8_t* name = rp_nat_bytes(ARG(2), true, &an);
++  uint8_t* message = rp_nat_bytes(ARG(3), true, &mn);
++  uint8_t* sealed = malloc(mn + crypto_aead_xchacha20poly1305_ietf_ABYTES);
++  ax_assume(sealed != NULL, "oom");
++  unsigned long long sealed_n = 0;
++  (void)crypto_aead_xchacha20poly1305_ietf_encrypt(
++      sealed, &sealed_n, message, (unsigned long long)mn, name,
++      (unsigned long long)an, NULL, nonce, key);
++  pl_val out = rp_bar(t, sealed, (size_t)sealed_n);
++  sodium_memzero(key, sizeof(key));
++  free(name);
++  free(message);
++  free(sealed);
++  return out;
++}
++
++/* SecretOpen key nonce name sealed -> the message, when the tag verifies for
++ * this key, nonce and name; 0 otherwise.  An empty message is the bar 1, so
++ * it is not mistaken for a refusal.  Never raises on its arguments. */
++pl_val pl_op83_secret_open(pl_thread* t, size_t ab) {
++  size_t kn, nn, an, cn;
++  if (!rp_crypto_bar_size(ARG(0), &kn) ||
++      kn != crypto_aead_xchacha20poly1305_ietf_KEYBYTES ||
++      !rp_crypto_bar_size(ARG(1), &nn) ||
++      nn != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES ||
++      !rp_crypto_bar_size(ARG(2), &an) || !rp_crypto_bar_size(ARG(3), &cn) ||
++      cn < crypto_aead_xchacha20poly1305_ietf_ABYTES)
++    return 0;
++  rp_crypto_init(t);
++  uint8_t key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
++  uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
++  rp_crypto_copy(ARG(0), key, sizeof(key));
++  rp_crypto_copy(ARG(1), nonce, sizeof(nonce));
++  uint8_t* name = rp_nat_bytes(ARG(2), true, &an);
++  uint8_t* sealed = rp_nat_bytes(ARG(3), true, &cn);
++  uint8_t* message = malloc(cn);
++  ax_assume(message != NULL, "oom");
++  unsigned long long message_n = 0;
++  bool ok = crypto_aead_xchacha20poly1305_ietf_decrypt(
++                message, &message_n, NULL, sealed, (unsigned long long)cn, name,
++                (unsigned long long)an, nonce, key) == 0;
++  pl_val out = ok ? rp_bar(t, message, (size_t)message_n) : 0;
++  sodium_memzero(key, sizeof(key));
++  free(name);
++  free(sealed);
++  free(message);
++  return out;
++}
++
+ pl_val pl_op82_self(pl_thread* t, size_t ab) {
+   if (ARG(0) != 0)
+     pl_raise_msg(t, "Self expects 0");
 --- a/pkg/plan/src/internal.h
 +++ b/pkg/plan/src/internal.h
-@@ -115,6 +115,13 @@
+@@ -115,6 +115,16 @@
  pl_val pl_op83_sleep(pl_thread* t, size_t ab);
  pl_val pl_op83_blake3(pl_thread* t, size_t ab);
  pl_val pl_op83_sha256(pl_thread* t, size_t ab);
@@ -347,12 +449,15 @@
 +pl_val pl_op83_pin_parts(pl_thread* t, size_t ab);
 +pl_val pl_op83_send_to(pl_thread* t, size_t ab);
 +pl_val pl_op83_read_all(pl_thread* t, size_t ab);
++pl_val pl_op83_box_key(pl_thread* t, size_t ab);
++pl_val pl_op83_secret_seal(pl_thread* t, size_t ab);
++pl_val pl_op83_secret_open(pl_thread* t, size_t ab);
  pl_val pl_op83_blake3_keyed(pl_thread* t, size_t ab);
  pl_val pl_op83_hmac_sha256(pl_thread* t, size_t ab);
  pl_val pl_op83_ed25519_public_key(pl_thread* t, size_t ab);
 --- a/pkg/plan/src/op.c
 +++ b/pkg/plan/src/op.c
-@@ -1259,6 +1259,16 @@
+@@ -1259,6 +1259,20 @@
       * the demand a caller uses when the effect, not the value, must happen. */
      {66, ax_s7('S', 'e', 'q', 'H', 'o', 's', 't'), NULL, 2, 0, 0, 0b01, 0, false,
       false, op_seq},
@@ -366,10 +471,14 @@
 +    /* Sockets that answer instead of raising: indices 152 and 153. */
 +    {83, 0, "ReadAll", 2, 0b11, 0, 0, 0, true, false, pl_op83_read_all},
 +    {83, 0, "SendTo", 4, 0b1111, 0, 0, 0, true, false, pl_op83_send_to},
++    /* What two worlds share and seal with: indices 154 to 156. */
++    OP83_LOCAL("BoxKey", 2, 0b11, pl_op83_box_key),
++    OP83_LOCAL("SecretSeal", 4, 0b1111, pl_op83_secret_seal),
++    OP83_LOCAL("SecretOpen", 4, 0b1111, pl_op83_secret_open),
  /* Mesa: handle row elements use host observation; data is normal. */
  #define MESA_OP(name)                                                          \
    {83, 0, name, 2, 0, 0b10, 0, 0b1, true, false, pl_op83_mesa},
-@@ -1308,11 +1318,12 @@
+@@ -1308,11 +1322,12 @@
  static const uint16_t pl_op82_argc2[] = {109, 116, 117, 119};
  static const uint16_t pl_op82_argc3[] = {120, 123};
  
@@ -379,10 +488,10 @@
 +static const uint16_t pl_op83_argc1[] = {124, 126, 127, 128, 132, 134, 135,
 +                                         136, 142, 144, 147, 148, 149,
 +                                         150, 151};
-+static const uint16_t pl_op83_argc2[] = {125, 137, 139, 140, 143, 152};
++static const uint16_t pl_op83_argc2[] = {125, 137, 139, 140, 143, 152, 154};
  static const uint16_t pl_op83_argc3[] = {138};
 -static const uint16_t pl_op83_argc4[] = {131};
-+static const uint16_t pl_op83_argc4[] = {131, 153};
++static const uint16_t pl_op83_argc4[] = {131, 153, 155, 156};
  
  static pl_opbucket pl_op_lookup_bucket(uint64_t opset, uint32_t argc) {
    switch (opset) {

@@ -615,9 +615,11 @@ published. The rules are pure (`src/foil/net.foil`, `src/foil/pass.foil`); one f
 | stamp | a published version: rift × 2^32 + case. A restore raises the rift, so a stamp names one content for ever. |
 | moment | the statement "this name of this world, at this stamp, is the content with this hash", signed by the publisher. A held record keeps it in its version header (`oath`: signature and stamp); the record itself is the publisher's pin, byte for byte. |
 | epic (between worlds) | a consistent change of one published root from one stamp to another, signed as a whole. It travels without its records; each record follows by its content hash. It lands as one event or not at all. |
-| hint | a packet that says where a root stands. It carries no data and is not believed: its receiver compares and then reads. |
+| hint | a packet that says where a root stands and how far each identity log has come. It is not believed: its receiver compares and then reads. It may carry one statement of the sender's identity log, which is its own proof. |
+| sealed | what is published to one peer is sealed for that peer under a key the two derive, each from its own seed and the other's public key. A page is bound to its name, and a pin is asked for by a keyed alias of its hash. What is public is sent as it is. |
+| slice | a page longer than Mesa carries as one (1 MiB) is read in slices and put together before it is opened or checked. |
 | shown | a record shown to a world it was not published to: its name, its publisher's statement and the record, checkable against the publisher's key by anyone. |
-| name, custody, live key | a world's name commits to a custody key; custody signs a log of statements, each naming the live key that signs pages from then on. Claiming an unclaimed world is one such statement. |
+| name, custody, live key | a world's name commits to a custody key; custody signs a log of statements, each naming the live key that signs pages from then on. Claiming an unclaimed world is one such statement. A world takes a statement of its own log from any packet that carries it, moves to the new key when its ring file holds it, and its peers follow from hints. |
 
 What a reader refuses, it refuses whole and notes on the card: an epic from a world whose key it does not hold
 (`net_stranger`), one that key did not sign (`net_forged`), one that reaches outside its root (`net_outside`),

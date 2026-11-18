@@ -27,8 +27,11 @@
       # every demanded let to it, so a spawn that must happen now can be demanded); and the store's
       # address space reserved without commit, as on main: the wormholes branch dropped MAP_NORESERVE, so
       # on Linux with the default overcommit rule the 256 GiB reservation is refused and nothing starts;
-      # and pins as values: PinHash, PinBytes and PinFrom, so a value leaves one store and arrives in
-      # another as the same pin under the same hash (a stream holding a law is refused)
+      # and what the kernel's networking needs of the runtime (nix/enki-pin-ops.patch): pins as values
+      # (PinHash, PinBytes, PinFrom, PinNames, PinParts), so a value leaves one store and arrives in
+      # another as the same pin under the same hash, and a stream holding a law is refused; sockets that
+      # answer instead of raising (ReadAll, SendTo), since a raise from Connect ends the process; and
+      # the key two worlds share and seal with (BoxKey, SecretSeal, SecretOpen, over libsodium)
       runtimeFor = system: enki.packages.${system}.default.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
           ./nix/enki-update-targets.patch
