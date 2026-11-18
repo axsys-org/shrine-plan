@@ -1,10 +1,13 @@
 - helm
 - http_response
 - http
+- door
 
 + http_foot
   + request
-    : method=str target=str body=str
+    ' who is the session a request speaks for, as the hash of the secret
+    ' it carried, or 0 for nobody. The secret itself stops at the parser.
+    : method=str target=str body=str who=nat
   + action
     & http_foot/action/snapshot
       http_foot/action/admit
@@ -297,11 +300,32 @@
         (error (http_foot/fault "Invalid Content-Length"))
     ? (gt n 1048576) (error (http_foot/fault "Request body too large"))
     | _ i.inc (./some n)
+  + session
+    ' The session a request speaks for: the hash of the secret after
+    ' "Bearer" in its Authorization header, or nothing. The secret is
+    ' hashed here and goes no further: no route, no record and no log
+    ' holds it.
+    \ headers=str
+    ^ nat
+    = lines (http_foot/split 10 headers)
+    % i=nat 1
+    ^ nat
+    ? (ge i lines.len) 0
+    = line (http_foot/trim lines.at(i))
+    ?> (./some colon) (http_foot/find ":" line) (_ i.inc)
+    = name (http_foot/ascii_lower line.slice(0 colon))
+      value (http_foot/trim line.slice(colon.inc line.len))
+    ? !(equal[str] name "authorization") (_ i.inc)
+    ? (lt value.len 8) 0
+    ? !(equal[str] (http_foot/ascii_lower value.slice(0 7)) "bearer ") 0
+    = secret (http_foot/trim value.slice(7 value.len))
+    ? (eq 0 secret.len) 0
+    | door/named secret
   + bad_request
     \ reason=str
     ^ http_foot/request
     ; (error (http_foot/fault reason))
-    | http_foot/request "" "" ""
+    | http_foot/request "" "" "" 0
   + request_line_valid
     ' Validate before splitting/packing a target ending in NUL, which
     ' would otherwise lose that byte and alias a different request.
@@ -335,6 +359,7 @@
      > (./some at)
       ? (gt at 65536) (http_foot/bad_request "Headers too large")
       = length (http_foot/content_length input.slice(0 at))
+        who (http_foot/session input.slice(0 at))
       ? (ge input.len (add at length))
         = line (http_foot/split 10 input).at(0)
         ? !(http_foot/request_line_valid line) (http_foot/bad_request "Invalid request target bytes")
@@ -343,8 +368,8 @@
         ? !(equal[str] words.at(2) "HTTP/1.0")
           ? !(equal[str] words.at(2) "HTTP/1.1")
             (http_foot/bad_request "Unsupported HTTP version")
-          | http_foot/request words.at(0) words.at(1) input.slice(at length)
-        | http_foot/request words.at(0) words.at(1) input.slice(at length)
+          | http_foot/request words.at(0) words.at(1) input.slice(at length) who
+        | http_foot/request words.at(0) words.at(1) input.slice(at length) who
       = ;bytes (Read fd 16384)
       ? (eq bytes 0) (http_foot/bad_request "Incomplete request body")
       | _ input.cat((http_foot/request_chunk bytes))
@@ -392,6 +417,26 @@
       : encoded=nat
     + ask
       : action=http_foot/action
+  + guard
+    ' The door. A request that speaks for no session goes to its route as
+    ' nobody. One that names a session is first checked against the world:
+    ' the session opens the door when the world keeps a grant for it that
+    ' its own custody signed and that has not ended (door.foil). A session
+    ' that does not is made nobody, and the request goes on. What a route
+    ' requires of who asks is the route's own to say.
+    \ routes=row[http_foot/route] r=http_foot/request now=nat
+    ^ http_foot/action
+    ? (eq 0 r.who) (http_foot/dispatch routes r now)
+    = asked r.who
+      reader
+        \ state=namespace
+        ^ [nat str]
+        [(? (door/open asked now state) 1 0) ""]
+      next
+        \ ok=nat ignored=str
+        ^ http_foot/action
+        | http_foot/dispatch routes (? (eq ok 1) r r.set_who(0)) now
+    | http_foot/action/after reader next
   + plan
     '  Route a complete request without socket I/O. One router retains
     '  the routes, avoiding a copy of every mount closure per connection.
@@ -400,7 +445,7 @@
     = ;attempt
         | Try[http_foot/request http_foot/action]
           (\ r=http_foot/request
-            | http_foot/dispatch config.routes r
+            | http_foot/guard config.routes r
                 (div (Now 0) 1000000000))
           parsed
     ? attempt
