@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""A machine that runs the worlds its records say it should: one machine world, a supervisor, three worlds.
+
+0x61 is a machine's own world. It keeps a host composition, made from the host template (extras/mounts/host,
+Grove alone), and seats itself as a tenant that may have two worlds running. Through its agent door, a
+tenant asks for worlds: a record that names a world and says it is to run. x/host supervises the machine:
+it reads the composition at that door, starts and stops launchers to match, and writes where each world is
+reached back through the same door. It is run here one turn at a time, so each row can see what one reading
+of the records did.
+
+It checks that a world asked for is started and answers at its own door, and that where it is reached is
+written beneath the ask; that a second is started beside it; that a third is refused for the tenant's limit,
+with why; that a turn with nothing new starts nothing; that an ask turned off stops its world, and the world
+that was refused then runs; and that a world whose launcher died is started again where it was. Nothing is
+told to the supervisor but the door, a session and a directory: it holds no state between turns.
+
+    x/check-host [--keep] [--base-port 8421]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, number_of, until  # noqa: E402
+
+
+def call(world, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call',
+                           params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + world.session})
+    result = json.load(urllib.request.urlopen(request, timeout=60))['result']
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', []))
+
+
+def answers(port):
+    """Whether a world's door answers at a port: anything it says, a refusal included."""
+    try:
+        urllib.request.urlopen(f'http://127.0.0.1:{port}/mcp', b'{}', timeout=5)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8421)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-host-'))
+    machine = World('0x61', args.base_port, args.base_port + 1000, base / 'machine',
+                    mounts=('mcp', 'mesa', 'scope', 'codecs', 'host'))
+    worlds = base / 'worlds'
+    first = args.base_port + 1
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:700]), flush=True)
+
+    def turn():
+        """One turn of the supervisor: what it printed."""
+        done = subprocess.run(
+            [sys.executable, str(ROOT / 'x/host'), '--door', f'http://127.0.0.1:{machine.http}',
+             '--session-file', str(machine.files() / 'io' / 'mesa' / 'out' / 'session'), '--worlds', str(worlds),
+             '--base-port', str(first), '--startup-timeout', str(args.timeout), '--once'],
+            capture_output=True, text=True, timeout=300)
+        return done.stdout + done.stderr
+
+    def ask(label, name, run=1):
+        return call(machine, 'scope/fill', composition='host', place='/tenants/own/worlds/' + label,
+                    slots={'name': name, 'founding': '', 'mounts': 'mcp mesa scope', 'run': run})
+
+    def at(label):
+        return machine.slots('/0x61/app/host/tenants/own/worlds/' + label + '/at')
+
+    def launcher(name):
+        kept = worlds / name / 'host.pid'
+        return int(kept.read_text()) if kept.exists() else 0
+
+    try:
+        machine.start(args.timeout)
+        made = call(machine, 'scope/make', pack='host', name='host')
+        row('a machine world makes a host from the host pack', not made[0]
+            and until(lambda: 'held / ' in call(machine, 'scope/seen')[1], 300), [made, call(machine, 'scope/seen')])
+        seated = call(machine, 'scope/fill', composition='host', place='/tenants/own',
+                      slots={'title': 'This machine', 'limit': 2, 'world': number_of('0x61')})
+        row('it seats itself as a tenant that may have two worlds running', not seated[0]
+            and until(lambda: 'held /tenants/own ' in call(machine, 'scope/seen')[1], 120), seated)
+
+        asked = ask('a', '0x71')
+        row('a tenant asks for a world: a record that names it and says it is to run', not asked[0], asked)
+        said = turn()
+        row('the supervisor reads the records and starts it', 'HOST started 0x71' in said, said)
+        row('where it is reached is written beneath the ask, by the machine world',
+            until(lambda: at('a').get('http') == str(first), 120), at('a'))
+        row('and the world answers at its own door', until(lambda: answers(first), args.timeout), at('a'))
+
+        ask('b', '0x72')
+        said = turn()
+        row('a second world is started beside it, at another port',
+            'HOST started 0x72' in said and until(lambda: at('b').get('http') == str(first + 1), 120), [said, at('b')])
+        ask('c', '0x73')
+        said = turn()
+        row("a third is not started: the tenant may have two, and the answer says why",
+            'HOST refused 0x73' in said and until(lambda: 'as many worlds' in str(at('c').get('why')), 120)
+            and at('c').get('http') == '0', [said, at('c')])
+
+        before = (launcher('0x71'), launcher('0x72'))
+        said = turn()
+        row('a turn with nothing new does nothing: no world is started twice',
+            'HOST' not in said and (launcher('0x71'), launcher('0x72')) == before and before[0] > 0, said)
+
+        ask('a', '0x71', run=0)
+        said = turn()
+        row('an ask turned off stops its world',
+            'HOST stopped 0x71' in said and until(lambda: not answers(first), 120), said)
+        said = said + turn()
+        row('and the world that was refused now runs: there is room for it',
+            'HOST started 0x73' in said and until(lambda: at('c').get('http') not in (None, '0'), 120), [said, at('c')])
+
+        until(lambda: answers(first + 1), args.timeout)
+        os.killpg(launcher('0x72'), signal.SIGKILL)
+        time.sleep(5)
+        said = turn()
+        row('a world whose launcher died is started again, where it was',
+            'HOST restarted 0x72' in said and at('b').get('http') == str(first + 1)
+            and until(lambda: answers(first + 1), args.timeout), [said, at('b')])
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for kept in worlds.glob('*/host.pid'):
+            try:
+                os.killpg(int(kept.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        machine.stop()
+        time.sleep(5)
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
