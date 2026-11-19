@@ -15,6 +15,8 @@ import threading
 import time
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 
 def rss_mb(pid):
     with open('/proc/%d/status' % pid) as f:
@@ -49,7 +51,7 @@ def check(base, node, timeout):
     def tool(name, **arguments):
         seq[0] += 1                                   # ids only label requests; a race between clients is harmless
         body = json.dumps(dict(jsonrpc='2.0', id=seq[0], method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         result = json.load(urllib.request.urlopen(req, timeout=timeout))['result']
         assert not result.get('isError'), json.dumps(result)[:300]
         return result['structuredContent']

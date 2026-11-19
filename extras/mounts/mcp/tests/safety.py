@@ -8,6 +8,8 @@ import os
 import time
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 
 def check(base, node, timeout):
     seq = [0]
@@ -16,7 +18,7 @@ def check(base, node, timeout):
     def rpc(name, **arguments):
         seq[0] += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq[0], method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         t0 = time.perf_counter()
         reply = json.load(urllib.request.urlopen(req, timeout=timeout))
         return reply['result'], 1000 * (time.perf_counter() - t0)
@@ -26,7 +28,7 @@ def check(base, node, timeout):
         assert got == want, (label, got, want)
 
     def epoch():
-        with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
             return json.load(r)['epoch']
 
     def walk(view):

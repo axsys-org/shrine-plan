@@ -16,6 +16,8 @@ import threading
 import time
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 
 def check(base, node, timeout):
     seq = [0]
@@ -26,7 +28,7 @@ def check(base, node, timeout):
             seq[0] += 1
             n = seq[0]
         body = json.dumps(dict(jsonrpc='2.0', id=n, method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         t0 = time.perf_counter()
         reply = json.load(urllib.request.urlopen(req, timeout=timeout))
         ms = 1000 * (time.perf_counter() - t0)

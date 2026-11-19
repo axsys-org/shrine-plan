@@ -8,6 +8,9 @@ import uuid
 import urllib.parse
 import urllib.request
 from contextlib import ExitStack
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 
 def check_connections(base, timeout):
@@ -16,6 +19,7 @@ def check_connections(base, timeout):
     timeout = min(timeout, 5)
     body = json.dumps(dict(jsonrpc='2.0', id=99, method='tools/list', params={})).encode()
     head = (b'POST /mcp HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n'
+            + ''.join(f'{k}: {v}\r\n' for k, v in SESSION.items()).encode()
             + b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n')
 
     def response(sock, status=200):
@@ -73,7 +77,7 @@ def check(base, node, timeout):
         body = json.dumps(dict(jsonrpc='2.0', id=sequence if ident is None else ident,
                                method=method, params=params or {})).encode()
         start = time.perf_counter()
-        request = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        request = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             answer = json.load(response)
         durations.append(time.perf_counter() - start)

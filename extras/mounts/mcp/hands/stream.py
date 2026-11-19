@@ -12,6 +12,7 @@ world loses nothing. Nothing here polls: between commits the socket is silent.
         ...
 """
 import json
+import os
 import socket
 import time
 import urllib.parse
@@ -25,7 +26,9 @@ class Stream:
         self.sock = socket.create_connection((u.hostname, u.port), timeout=30)
         self.sock.settimeout(timeout)
         target = '/mcp/stream' + ('' if after is None else '?after=' + str(int(after)))
-        self.sock.sendall(('GET ' + target + ' HTTP/1.0\r\nHost: localhost\r\n\r\n').encode())
+        # The door lets in only a session; a hand is given its world's in SHRINE_SESSION by whoever started it.
+        session = os.environ.get('SHRINE_SESSION')
+        self.sock.sendall(('GET ' + target + ' HTTP/1.0\r\nHost: localhost\r\n' + ('Authorization: Bearer ' + session + '\r\n' if session else '') + '\r\n').encode())
         self.buf = b''
         self.at = after
         head = self._until(b'\r\n\r\n')

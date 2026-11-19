@@ -8,6 +8,8 @@ import json
 import os
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 
 def check(base, node, timeout):
     here = os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +23,7 @@ def check(base, node, timeout):
         assert got == want, (label, got, want)
 
     def epoch():
-        with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
             return json.load(r).get('epoch')
 
     home = '/' + node + '/agent/asker'

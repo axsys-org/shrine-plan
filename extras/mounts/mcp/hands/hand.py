@@ -32,6 +32,8 @@ import re
 import time
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 _spec = importlib.util.spec_from_file_location('stream_hand', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream.py'))
 _stream = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_stream)
 
@@ -41,7 +43,7 @@ def stream_poll(base, node, seen, timeout=120, limit=40):
     refuses as too large (events that wrote many big records) is asked for again with half the limit, down to one."""
     while True:
         body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': 'mcp/history', 'arguments': {'after': seen, 'limit': limit, 'with': 'x'}})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         result = json.load(urllib.request.urlopen(req, timeout=timeout))['result']
         if 'structuredContent' in result:
             page = result['structuredContent']
@@ -69,7 +71,7 @@ class World:
     def tool(self, name, **arguments):
         self.seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=self.seq, method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         reply = json.load(urllib.request.urlopen(req, timeout=self.timeout))
         result = reply.get('result') or {}
         if 'error' in reply or result.get('isError'):
@@ -140,7 +142,7 @@ class World:
         return build(root)
 
     def epoch(self):
-        with urllib.request.urlopen(self.base + '/probe/read?path=/' + self.node, timeout=self.timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(self.base + '/probe/read?path=/' + self.node, headers=SESSION), timeout=self.timeout) as r:
             return int(json.load(r).get('epoch') or 0)
 
 

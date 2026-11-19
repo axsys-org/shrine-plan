@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+
 ROOT = Path(__file__).resolve().parent.parent
 NODE = '0x11'
 HOME = f'/{NODE}/user/kill_test'
@@ -40,6 +41,7 @@ class World:
         self.base = f'http://127.0.0.1:{port}'
         self.launcher = self.wisp = None
         self.boots = 0
+        self.session = {}
 
     def boot(self):
         self.boots += 1
@@ -48,14 +50,17 @@ class World:
         with log.open('w') as stream:
             self.launcher = subprocess.Popen(
                 [sys.executable, str(ROOT / 'x/eden'), '--world', str(self.directory),
-                 '--extras-root', str(ROOT / 'extras'), '--mount', 'mcp', '--mount', 'probe',
+                 '--extras-root', str(ROOT / 'extras'), '--mount', 'mcp', '--mount', 'probe', '--mount', 'mesa',
                  '--port', str(self.port), '--startup-timeout', '1500'],
                 env=dict(os.environ, _EDEN_NIX_ROOT=str(ROOT)), stdout=stream, stderr=stream)
         deadline = started + 1600
         while time.monotonic() < deadline:
             if self.launcher.poll() is not None:
                 raise RuntimeError(f'launcher exited {self.launcher.returncode}: {log.read_text()[-3000:]}')
-            if 'Eden: http://' in log.read_text(errors='replace'):
+            # The door lets in only a session: the world leaves its first one for whoever is at the machine.
+            left = self.directory / 'src' / 'io' / 'mesa' / 'out' / 'session'
+            if 'Eden: http://' in log.read_text(errors='replace') and left.is_file() and left.stat().st_size:
+                self.session = {'Authorization': 'Bearer ' + left.read_text().strip()}
                 try:
                     self.read('/' + NODE)
                     break
@@ -85,7 +90,7 @@ class World:
 
     def request(self, method, target, body=None):
         data = body.encode() if body is not None else None
-        request = urllib.request.Request(self.base + target, data=data, method=method)
+        request = urllib.request.Request(self.base + target, data=data, method=method, headers=self.session)
         try:
             with urllib.request.urlopen(request, timeout=60) as reply:
                 return reply.status, reply.read().decode(errors='replace')
@@ -102,7 +107,7 @@ class World:
     def tool(self, name, **arguments):
         body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                            'params': {'name': 'mcp/' + name, 'arguments': arguments}}).encode()
-        request = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json'})
+        request = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json', **self.session})
         with urllib.request.urlopen(request, timeout=60) as reply:
             result = json.load(reply)['result']
         if result.get('isError'):

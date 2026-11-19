@@ -11,6 +11,9 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 
 def check(base, node, timeout):
@@ -20,7 +23,7 @@ def check(base, node, timeout):
 
     def epoch():
         try:
-            with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+            with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
                 return json.load(r).get('epoch')
         except Exception:
             return None
@@ -29,7 +32,7 @@ def check(base, node, timeout):
         nonlocal seq
         seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq, method=method, params=params)).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         e0 = epoch() if kind else None
         start = time.perf_counter()
         with urllib.request.urlopen(req, timeout=timeout) as response:

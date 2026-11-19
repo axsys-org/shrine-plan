@@ -14,6 +14,9 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 # ============================================================================ the tree model
 # A tree is {'props': {slot: text}, 'kids': {name: tree}, 'rec': bool}; props are rendered as a read renders them
@@ -973,7 +976,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
 
     def epoch():
         try:
-            with urllib.request.urlopen(base + '/probe/read?path=/' + node_, timeout=timeout) as r:
+            with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node_, headers=SESSION), timeout=timeout) as r:
                 return json.load(r).get('epoch')
         except Exception:
             return None
@@ -981,7 +984,7 @@ def check(base, node_, timeout, seed=None, cases=1000, group=25, max_mismatch=10
     def rpc(method, params):
         seq[0] += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq[0], method=method, params=params)).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.load(response)
 
