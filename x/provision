@@ -15,6 +15,10 @@ fetches the seat's link from the keeper (it is given once), leaves it in a file 
 x/machine there under the seat's founding. The machine's world then claims itself, fills the seat, and
 tells the keeper where it is and how much room it has. Nothing else is done to it from here.
 
+With --watch it stays and does the same for every seat that asks, with nobody asked each time: that is a
+standing permission to spend, so it must be given a cap (--most) and is meant to run only where whoever pays
+has put a credential for it, themselves.
+
 With --network the server joins that private network and says its address there, so what passes between
 the front and a machine does not cross the open internet.
 """
@@ -70,39 +74,8 @@ def price(kind, place):
     return 'no price listed for that place'
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--door', required=True, help="the fleet keeper's door")
-    parser.add_argument('--session-file', type=Path, required=True)
-    parser.add_argument('--fleet', default='fleet')
-    parser.add_argument('--yes', default='', metavar='SEAT', help='create the server for this one seat')
-    parser.add_argument('--key', default='shrine-pilot-host', help="the provider's name for the key the new server lets in")
-    parser.add_argument('--identity', type=Path, default=Path.home() / '.ssh' / 'id_ed25519_shrine')
-    parser.add_argument('--network', default='', help='a private network the server joins')
-    parser.add_argument('--firewall', default='', help="a firewall of the provider's the server is put behind")
-    parser.add_argument('--image', default='ubuntu-24.04')
-    parser.add_argument('--flake', type=Path, default=ROOT, help="the directory holding the runtime's flake")
-    parser.add_argument('--mounts', default='mcp mesa scope codecs host fleet')
-    parser.add_argument('--limit', type=int, default=4)
-    parser.add_argument('--open', type=int, default=4)
-    parser.add_argument('--port', type=int, default=8600)
-    args = parser.parse_args()
-    session = args.session_file.read_text().strip()
-    wanted = asked(args.door, session, args.fleet)
-    have = {server['name'] for server in hcloud('server', 'list')}
-    todo = {seat: slots for seat, slots in wanted.items() if 'shrine-' + seat not in have}
-    if not todo:
-        print('Every machine the fleet asks for has a server, or it asks for none.')
-        return 0
-    for seat, slots in sorted(todo.items()):
-        print(f"seat {seat}: would create server shrine-{seat}, {slots.get('kind')} in {slots.get('place')}: {price(str(slots.get('kind')), str(slots.get('place')))}")
-    if not args.yes:
-        print('Nothing was created. Name one seat with --yes to create its server.')
-        return 0
-    if args.yes not in todo:
-        print(f'{args.yes} is not a seat that asks for a machine and has none.', file=sys.stderr)
-        return 1
-    seat, slots = args.yes, todo[args.yes]
+def create(args, session, seat, slots):
+    """Create the server for one seat and start its machine. Returns whether it did."""
     name, kind, place = int(str(slots['name'])), str(slots['kind']), str(slots['place'])
 
     # The link is given once, so it is fetched before anything is paid for and kept only in memory here.
@@ -112,11 +85,11 @@ def main():
         link = call(args.door, session, 'scope/link', invitation=int(str(slots['invite'])))[1].strip()
         time.sleep(2)
     if len(link.split(',')) != 12:
-        print("The keeper gave no link for that seat (it is given once: has it been taken?). Nothing was created.", file=sys.stderr)
-        return 1
+        print(f"The keeper gave no link for seat {seat} (it is given once: has it been taken?). Nothing was created.", file=sys.stderr)
+        return False
 
-    create = ['server', 'create', '--name', 'shrine-' + seat, '--type', kind, '--location', place, '--image', args.image, '--ssh-key', args.key]
-    made = hcloud(*create, *(['--network', args.network] if args.network else []), *(['--firewall', args.firewall] if args.firewall else []))
+    order = ['server', 'create', '--name', 'shrine-' + seat, '--type', kind, '--location', place, '--image', args.image, '--ssh-key', args.key]
+    made = hcloud(*order, *(['--network', args.network] if args.network else []), *(['--firewall', args.firewall] if args.firewall else []))
     server = made['server']
     public = server['public_net']['ipv4']['ip']
     private = (server.get('private_net') or [{}])[0].get('ip') or public
@@ -166,8 +139,66 @@ WantedBy=multi-user.target
     on('cat > /etc/shrine/machine.sh && chmod 755 /etc/shrine/machine.sh', text=script)
     on('cat > /etc/systemd/system/shrine-machine.service && systemctl daemon-reload && systemctl enable -q --now shrine-machine', text=unit)
     print(f'shrine-{seat} is starting its machine. The seat is filled when its world has claimed itself; '
-          f'the first start builds the runtime and can take a long while.')
-    return 0
+          f'the first start builds the runtime and can take a long while.', flush=True)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--door', required=True, help="the fleet keeper's door")
+    parser.add_argument('--session-file', type=Path, required=True)
+    parser.add_argument('--fleet', default='fleet')
+    parser.add_argument('--yes', default='', metavar='SEAT', help='create the server for this one seat')
+    parser.add_argument('--watch', action='store_true',
+                        help='stay, and create a server for every seat that asks, with nobody asked each time; needs --most')
+    parser.add_argument('--most', type=int, default=0, help='with --watch: never let more servers of this fleet exist than this')
+    parser.add_argument('--interval', type=float, default=60)
+    parser.add_argument('--key', default='shrine-pilot-host', help="the provider's name for the key the new server lets in")
+    parser.add_argument('--identity', type=Path, default=Path.home() / '.ssh' / 'id_ed25519_shrine')
+    parser.add_argument('--network', default='', help='a private network the server joins')
+    parser.add_argument('--firewall', default='', help="a firewall of the provider's the server is put behind")
+    parser.add_argument('--image', default='ubuntu-24.04')
+    parser.add_argument('--flake', type=Path, default=ROOT, help="the directory holding the runtime's flake")
+    parser.add_argument('--mounts', default='mcp mesa scope codecs host fleet')
+    parser.add_argument('--limit', type=int, default=4)
+    parser.add_argument('--open', type=int, default=4)
+    parser.add_argument('--port', type=int, default=8600)
+    args = parser.parse_args()
+    session = args.session_file.read_text().strip()
+    if args.watch:
+        if args.most <= 0:
+            parser.error('--watch needs --most: how many servers of this fleet may ever exist')
+        print(f'watching the fleet at {args.door}: a server is created for each seat that asks, up to {args.most} in all', flush=True)
+        while True:
+            try:
+                ours = {server['name'] for server in hcloud('server', 'list') if server['name'].startswith('shrine-')}
+                for seat, slots in sorted(asked(args.door, session, args.fleet).items()):
+                    if 'shrine-' + seat in ours:
+                        continue
+                    if len(ours) >= args.most:
+                        print(f'seat {seat} asks for a machine, and {len(ours)} of {args.most} servers exist: not created', flush=True)
+                        continue
+                    print(f"seat {seat}: creating shrine-{seat}, {slots.get('kind')} in {slots.get('place')}: {price(str(slots.get('kind')), str(slots.get('place')))}", flush=True)
+                    if create(args, session, seat, slots):
+                        ours.add('shrine-' + seat)
+            except (RuntimeError, OSError, subprocess.SubprocessError, KeyError, ValueError) as error:
+                print(f'this turn did nothing: {error}', flush=True)
+            time.sleep(args.interval)
+    wanted = asked(args.door, session, args.fleet)
+    have = {server['name'] for server in hcloud('server', 'list')}
+    todo = {seat: slots for seat, slots in wanted.items() if 'shrine-' + seat not in have}
+    if not todo:
+        print('Every machine the fleet asks for has a server, or it asks for none.')
+        return 0
+    for seat, slots in sorted(todo.items()):
+        print(f"seat {seat}: would create server shrine-{seat}, {slots.get('kind')} in {slots.get('place')}: {price(str(slots.get('kind')), str(slots.get('place')))}")
+    if not args.yes:
+        print('Nothing was created. Name one seat with --yes to create its server.')
+        return 0
+    if args.yes not in todo:
+        print(f'{args.yes} is not a seat that asks for a machine and has none.', file=sys.stderr)
+        return 1
+    return 0 if create(args, session, args.yes, todo[args.yes]) else 1
 
 
 if __name__ == '__main__':
