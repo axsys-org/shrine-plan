@@ -14,17 +14,85 @@ x/eden --mount debugger --mount srs
 x/eden --extras-root ../shrine-extras --mount explorer --mount codex
 ```
 
-The `shrine-extras` input in `flake.lock` selects the default extras revision.
-`--extras-root` selects an editable checkout, including that checkout's Nix
-configuration. Dependencies are loaded once, before their consumers. Only selected
+Eden restores one native world per node from `$XDG_DATA_HOME/shrine/worlds/`
+(default `~/.local/share/shrine/worlds/`). `--world PATH` selects an explicit
+directory; the mount selection and source workspace are remembered there.
+`--workspace PATH` selects the source workspace used by host captures.
+The namespace, history, cells and executable definitions are committed together
+through native `Save` before a write is acknowledged. Restarts reconnect I/O
+services before rescanning evidence; they do not reinstall application seeds or
+replay completed work. `--ephemeral` and `--check` use disposable worlds.
+
+The world uses the native runtime selected by `flake.lock`. Native `Save` and
+reconnection establish persistence independently of arena-sharing optimizations
+or compaction. This stack does not change the runtime's arena format or install
+prototype storage-maintenance patches. Checkpoint space reclamation remains a
+separate runtime concern; pinning contracts does not solve checkpoint growth.
+
+An existing arena written by the layout-2 sharing prototype still requires a
+layout-2-compatible runtime. Removing that patch from this stack does not downgrade
+or convert the arena, and an older upstream runtime cannot reopen it. Keep the
+compatible runtime for such a world; independent review of storage optimization
+does not remove this existing format dependency.
+
+A saved world resumes its captured service and compiler. Editing repository
+sources does not alter that saved program, and restarting does not load a new
+core runtime. Bootstrap closure patching and the `--upgrade` path are removed.
+Publication updates namespace definitions and explicit behavior registrations;
+it does not replace the captured service. There is no replacement-service API
+or launcher handoff. A running world's compiler, transport and persistence
+changes cannot be activated by pretending they are mount publications.
+
+The existing publication path has narrower, useful boundaries:
+
+| Change | Existing update path | What stays captured |
+| --- | --- | --- |
+| Mounted Foil modules and Grove definitions | Explicit source scan compiles against selected pinned dependencies and publishes through the native store | Earlier artifacts, typed values and their x/y/z cases |
+| Installed hands, forms and operations | An application's native code-refresh operation rebinds its declared behavior records | Existing flow definitions and attempts keep their chosen laws |
+| HTTP route handlers and post-start hooks | Restart resolves them from the saved mount images under the captured mount contracts | Core HTTP transport, supervisor and compiler closures |
+| A source dependency with no local file change | Publish the dependency, then invalidate the consumer's source-snapshot cache and rescan it | Imports remain explicit; no automatic relinking of existing code |
+| Core Reaver compiler, publication policy, supervisor or persistence code | Validate in disposable worlds built from the changed sources | Existing saved worlds continue running their captured implementations |
+
+Native publication appends new definitions; it does not rewrite historical laws
+or infer type identity from unchanged declarations. A mount can list owned
+`pinned_modules` in its descriptor. First publication compiles missing artifacts;
+subsequent scans import those exact artifacts from the mount's existing native
+image record, including their original dependency graphs. Their source files are
+bootstrap inputs, not refresh inputs once pinned. To change a contract, publish a
+new explicitly selected module/version and handle compatibility at activation.
+
+The mount descriptor and compiler belong to the saved service. These changes
+govern newly compiled services, not an automatic upgrade of a running saved world.
+
+Startup first computes reconnect and draft reconciliation, constructs and
+validates routes, and resolves provider and foot entrypoints. These pure
+preparations must finish before checkpointing the candidate or spawning the
+supervisor. A preparation failure on restart leaves the prior native root
+unchanged. The supervisor adopts the graph returned by that checkpoint. Providers then reconnect through ordinary supervisor messages,
+followed by filesystem and HTTP foot registration. This is not a transaction
+over external I/O: a provider/listener failure after checkpointing retains the
+checkpoint and any acknowledged provider writes. Retry reconnects that state;
+it must not roll back already acknowledged work. A first boot retains its
+initial native continuation before serving, so interrupted initialization is
+recoverable through the same saved program.
+
+Native command admission uses one budget of 128 reaction rounds after the
+submitted event. Supervisor writes, guarded operations and Grove installation
+share this policy. A quiescent candidate can commit; exhaustion, reaction failure
+or unsupported outbound effects discard the candidate and its dependency index.
+The budget limits reaction rounds, not execution time inside an individual hand.
+
+The default mount sources are this checkout's `extras/` directory.
+`--extras-root` selects another source directory, including its Nix configuration.
+Dependencies are loaded once, before their consumers. Only selected
 mounts and their dependencies prepare host tools or assets. Mash and Node belong
 to the debugger's extras environment, not the core Eden shell.
 
 Each flat bag has a version-1 `mount.json`. It maps logical Foil module names to
 filenames, declares ordered Grove units and their publication roots, and declares
 assets, dependencies and optional activation, HTTP and host entrypoints. See the
-[extras repository](https://github.com/axsys-org/shrine-extras) for the schema and
-application checks. Core rejects unknown names, cycles, core-module overrides,
+[extras guide](extras/README.md) for the schema and application checks.
+Core rejects unknown names, cycles, core-module overrides,
 overlapping publication ownership and duplicate route claims. HTTP dispatch uses
 the longest matching path prefix, with segment boundaries.
 
@@ -109,8 +177,8 @@ rejects the candidate and retains the previous published definitions, registrati
 and assets. Installation reuses `goo_workspace/install` and hosted receivers;
 HTTP and hydration continue through the existing Goo boundaries.
 
-Registration changes (including shell and receiver settings) require restarting
-Eden in this first version. Grove and asset rescans retain the existing atomic
+Mount descriptor changes (including shell and receiver settings) require a service
+built with those registrations; restarting a saved service retains its descriptor. Grove and asset rescans retain the existing atomic
 publication behavior. Custom receiver constructors, guards beyond the two
 admission policies, host operation mappings, and custom page shells still use
 the manual Foil endpoint interface. Documentation's compiler-metadata reader is
@@ -159,8 +227,11 @@ migrate instances. New installations can use the newer definitions. Route handle
 remain captured by the running HTTP foot. Declared asset URLs read bytes from
 the latest successful mount publication, so rescan followed by browser reload
 picks up HTML, CSS and JavaScript changes. Failed publication retains the previous
-assets. Restart to select new mounts, change a descriptor's runtime contract
-(including asset URL mappings), or replace handler/driver code.
+assets. Restart can select explicitly published handlers from retained mount images
+under the saved service's existing registrations. New mounts, descriptor contracts
+(including asset URL mappings), or core driver code require a service built with
+those registrations and implementations; restarting the saved service does not
+change them.
 
 Watching, persistence and automatic instance migration are outside this interface.
 
@@ -243,7 +314,7 @@ old instance is retained and the differing published/installed versions remain
 visible. A concurrent instance edit or newer publication rejects a stale request.
 The management controls operate on independent Grove installations below `/app`;
 they cannot remove publication roots or unrelated occupied roots. Core/Foil driver
-changes still require a restart. Browser assets reload through mount rescan;
+changes require a service built with that code; restarting retains the saved service. Browser assets reload through mount rescan;
 the Goo inspector provides a **Reload mount assets** button.
 
 For an automated rehearsal against a disposable demo instance:
