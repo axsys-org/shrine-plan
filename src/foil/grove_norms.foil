@@ -3,6 +3,15 @@
 - sept
 
 ' A single path pattern and role constraints describe occupied records.
+'
+' A stencil is a norm that also says whose the records are: which world
+' writes there (#by) and which worlds read (#for, one or several). It may
+' name an action a record there asks for (#apply) and the place of what a
+' record there must show (#shows). Each names the maker, or a quoted path
+' of seats whose captures are [name]. They are checked here and carried on
+' the stencil's record as plain text (by, for, apply, shows), so nothing
+' that reads a table knows how one was spelled. They say who, and nothing
+' else: a condition is typed state that a hand reads.
 + grove_norms
   + is_norm
     \ body=list[grove/statement]
@@ -10,8 +19,100 @@
     | body.any
     \ stmt
     ? stmt
-     > (grove/tag span kind) (equal kind (grove/tag_kind/norm))
+     > (grove/tag span kind)
+      | ((equal kind (grove/tag_kind/norm)) || (equal kind (grove/tag_kind/stencil)))
     .false
+  + placing_kind
+    ' Which of a stencil's own directives a statement is: 1 by, 2 for,
+    ' 3 apply, 4 shows; 0 when it is none of them.
+    \ stmt=grove/statement
+    ^ nat
+    ? stmt
+     > (grove/directive at kind tree)
+      ? (equal kind (grove/directive_kind/by)) 1
+      ? (equal kind (grove/directive_kind/for)) 2
+      ? (equal kind (grove/directive_kind/apply)) 3
+      ? (equal kind (grove/directive_kind/shows)) 4
+      0
+    0
+  + placing_tree
+    \ stmt=grove/statement other=rex
+    ^ rex
+    ? stmt
+     > (grove/directive at kind tree) tree
+    other
+  + who
+    ' Who or where a stencil's directive names, as a table's row spells
+    ' it: the word maker, or a quoted path whose parts are names and
+    ' captures written [name].
+    \ tree=rex
+    ^ either[grove/error str]
+    > (./leaf span shape text) tree
+      | grove_roles/fail[str] tree.span
+        "Name the maker, or a quoted path."
+    = made=str "maker"
+    ? (equal tree.leaf_kind (maybe/some[str] "word"))
+      ? (eq text made) (./ok made)
+      | grove_roles/fail[str] span "Name the maker, or a quoted path."
+    = cord (equal tree.leaf_kind (maybe/some[str] "cord"))
+      quip (equal tree.leaf_kind (maybe/some[str] "quip"))
+    ? !(cord || quip)
+      | grove_roles/fail[str] span "Name the maker, or a quoted path."
+    = prefix=str (? cord "/" "'/")
+    ? !(eq (str/slice 0 prefix.len text) prefix)
+      | grove_roles/fail[str] span "A stencil's paths begin at the top: '/seats/[s]."
+    = source (str/slice prefix.len (sub text.len prefix.len) text)
+    ? (eq source "")
+      | grove_roles/fail[str] span "Name the maker, or a quoted path."
+    % rest=row[str] (str/split_byte 47 source)
+    ^ either[grove/error str]
+    ? (eq rest.len 0) (./ok source)
+    = part rest.at(0)
+      held (and (gt part.len 2) (and (eq (str/slice 0 1 part) "[") (eq (str/slice (dec part.len) 1 part) "]")))
+      word (? held (str/slice 1 (sub part.len 2) part) part)
+    > (./some name) (str/sym word)
+      | grove_roles/fail[str] span "A part of a stencil's path is a name, or a capture written [name]."
+    | _ rest.drop(1)
+  + named
+    ' The action a stencil's #apply names: one word.
+    \ tree=rex
+    ^ either[grove/error str]
+    > (./leaf span shape text) tree
+      | grove_roles/fail[str] tree.span "#apply names an action of this unit."
+    > (./some name) (str/sym text)
+      | grove_roles/fail[str] span "#apply names an action of this unit."
+    | ./ok text
+  + prop
+    \ span=rex/source_span key=str value=str
+    ^ grove/statement
+    | grove/property span (rex/word key) (rex/cord value)
+  + props
+    \ span=rex/source_span by=str readers=row[str] apply=str shows=str
+    ^ list[grove/statement]
+    = none=list[grove/statement] .nil
+      one (? (eq by.len 0) none none.snoc((grove_norms/prop span "by" by)))
+      two (? (eq readers.len 0) one one.snoc((grove_norms/prop span "for" (str/join " " readers))))
+      three (? (eq apply.len 0) two two.snoc((grove_norms/prop span "apply" apply)))
+    | ? (eq shows.len 0) three three.snoc((grove_norms/prop span "shows" shows))
+  + placing
+    ' What a stencil says beyond a norm, as the properties its record
+    ' carries. Nothing, for a norm that says none of it.
+    \ span=rex/source_span body=list[grove/statement]
+    ^ either[grove/error list[grove/statement]]
+    = nothing=str ""
+      nobody=row[str] []
+    % rest=list[grove/statement] body
+      by=str nothing readers=row[str] nobody apply=str nothing shows=str nothing
+    ^ either[grove/error list[grove/statement]]
+    ? (eq rest.len 0) (./ok (grove_norms/props span by readers apply shows))
+    = kind (grove_norms/placing_kind rest.at(0))
+    ? (eq kind 0) (_ rest.drop(1) by readers apply shows)
+    = tree (grove_norms/placing_tree rest.at(0) (rex/word "maker"))
+    < said (? (eq kind 3) (grove_norms/named tree) (grove_norms/who tree))
+    ? (eq kind 1) (_ rest.drop(1) said readers apply shows)
+    ? (eq kind 2) (_ rest.drop(1) by readers.snoc(said) apply shows)
+    ? (eq kind 3) (_ rest.drop(1) by readers said shows)
+    | _ rest.drop(1) by readers apply said
   + segment
     \ span=rex/source_span text=str
     ^ either[grove/error grove_norm_segment]
@@ -95,6 +196,7 @@
     ? rest.at(0)
      > (grove/tag at kind)
       ? ((equal kind (grove/tag_kind/norm)) ||
+         (equal kind (grove/tag_kind/stencil)) ||
          (equal kind (grove/tag_kind/slot)))
         | _ rest.drop(1) target
       | grove_roles/fail[rex] at "Incompatible norm tag."
@@ -114,7 +216,8 @@
     ? stmt
      > (grove/tag span kind) .false
      > (grove/directive span kind target)
-      | ! (equal kind (grove/directive_kind/here))
+      ? (equal kind (grove/directive_kind/here)) .false
+      | eq 0 (grove_norms/placing_kind stmt)
     .true
   + segment_code
     \ segment=grove_norm_segment
@@ -189,6 +292,7 @@
       | grove_roles/fail[grove/document] span "Norms need a name."
     < target (grove_norms/body span body)
     < segments (grove_norms/pattern target)
+    < placed (grove_norms/placing span body)
     < shape (grove_roles/analyze root doc lookup [] text
         (grove_norms/role_body body))
     = kept
@@ -202,8 +306,12 @@
       schema (grove_roles/member ["schema"] (rex/path [text]))
       prop=grove/statement
         | grove/property span (rex/cord (path_show system_vocabulary/grove/norm)) schema
+      holder=row[[str rex]] [["ITEM" (grove_roles/member ["item"] (rex/path [text]))]]
+      contract=grove/statement
+        | grove/property span (rex/cord (path_show system_vocabulary/grove/role_contract))
+          (grove_roles/template span "ITEM/spec" holder)
       meta=grove/statement
-        | grove/block span (grove/block_kind/meta) (list/one prop)
+        | grove/block span (grove/block_kind/meta) placed.cons(contract).cons(prop)
       trees (grove_norms/code span text segments shape)
       code=grove/statement
         | grove/implementation span
