@@ -1,0 +1,193 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Home</title>
+<style>
+  :root { --ink:#1b1b1b; --soft:#6b6b6b; --line:#e3e1dc; --paper:#fbfaf7; --card:#fff; --go:#1f5f4a; --warn:#9a4a00; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#ecebe7; --soft:#a09e98; --line:#34332f; --paper:#181816; --card:#21211e; --go:#7fc8ad; --warn:#e2a15a; } }
+  body { font:16px/1.45 system-ui,sans-serif; color:var(--ink); background:var(--paper); max-width:46rem; margin:2.5rem auto; padding:0 1rem; }
+  h1 { font-size:1.5rem; margin:0 0 .25rem; } h2 { font-size:1.15rem; margin:0 0 .5rem; }
+  .soft { color:var(--soft); } .warn { color:var(--warn); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem; margin:1rem 0; }
+  .place { border-top:1px solid var(--line); padding:.55rem 0; } .place:first-of-type { border-top:0; }
+  .name { font-weight:600; } .tag { font-size:.8rem; color:var(--soft); margin-left:.4rem; }
+  .slots { margin:.15rem 0 0; } .slots span { color:var(--soft); }
+  form { margin:.4rem 0 0; display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; }
+  input, select, button { font:inherit; padding:.35rem .55rem; border:1px solid var(--line); border-radius:6px; background:var(--paper); color:var(--ink); }
+  button { cursor:pointer; border-color:var(--go); color:var(--go); background:transparent; }
+  .link { word-break:break-all; font-family:ui-monospace,monospace; font-size:.85rem; background:var(--paper); border:1px solid var(--line); border-radius:6px; padding:.5rem; margin-top:.4rem; }
+  #say { min-height:1.4rem; }
+</style>
+<h1>Your world</h1>
+<p id="say" class="soft">Reading…</p>
+<div id="parts"></div>
+<section>
+  <h2>Start something</h2>
+  <p class="soft" id="nopacks" hidden>This world holds no packs to start from.</p>
+  <form id="make" hidden><select id="pack"></select><input id="called" placeholder="a name for it, one word" required pattern="[a-z][a-z0-9]*"><button>Make it</button></form>
+</section>
+<section>
+  <h2>Take a seat you were invited to</h2>
+  <form id="join"><input id="link" placeholder="paste the invitation" style="flex:1;min-width:14rem" required><button>Take it</button></form>
+</section>
+<section>
+  <h2>Getting back in, and agents</h2>
+  <p class="soft">This browser is let in by a session it keeps. An agent uses the same one.</p>
+  <p><button id="way">Show my way back in</button></p>
+  <div id="ways" hidden>
+    <div class="soft">Open this in another browser to be let in there. Keep it to yourself.</div><div class="link" id="back"></div>
+    <div class="soft" style="margin-top:.6rem">For an agent: its door, and the header it sends.</div><div class="link" id="agent"></div>
+  </div>
+</section>
+<script>
+// This page decides nothing. It reads what an agent reads (what this world takes part in, how each
+// place stands, the shape of each row) and does what an agent does (write a record at a place, make a
+// composition from a pack, fetch or take an invitation), through the same door, under this browser's session.
+const $ = (tag, attrs = {}, ...kids) => { const e = document.createElement(tag); for (const [k, v] of Object.entries(attrs)) k === 'text' ? e.textContent = v : k in e ? e[k] = v : e.setAttribute(k, v); e.append(...kids); return e; };
+const say = text => { document.getElementById('say').textContent = text; };
+let seq = 0;
+async function call(name, args = {}) {
+  const reply = await fetch('/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++seq, method: 'tools/call', params: { name, arguments: args } }) });
+  if (reply.status === 401) { location.href = '/door'; throw new Error('not let in'); }
+  const result = (await reply.json()).result || {};
+  return { bad: !!result.isError, text: (result.content || []).map(b => b.text || '').join(' '), data: result.structuredContent };
+}
+const spelled = n => { let b = BigInt(n), s = ''; while (b > 0n) { s += ('0' + (b & 255n).toString(16)).slice(-2); b >>= 8n; } return '0x' + s; };
+const brief = (v, n = 18) => { const s = String(v); return s.length > n ? s.slice(0, n - 4) + '…' : s; };
+const words = place => place === '/' ? '' : place.slice(1).split('/').map(w => brief(w.replace(/_/g, ' '))).join(' › ');
+const domain = () => { const h = location.hostname, d = h.split('.').slice(1).join('.'); return !d || /^[0-9.]+$/.test(h) ? '' : d; };
+const address = link => domain() ? `${location.protocol}//${spelled(link.split(',')[6])}.${domain()}/door#${encodeURIComponent(link)}` : link;
+
+function compositions(text) {
+  const found = []; let current = null;
+  for (const line of text.split('\n')) {
+    const parts = line.split(' ');
+    if (line.startsWith('composition /')) found.push(current = { name: line.slice(13), places: [], why: {} });
+    else if (current && parts[0] === 'why') current.why[parts[1]] = parts.slice(2).join(' ').replace(/-/g, ' ');
+    else if (current && parts.length === 4) current.places.push({ kind: parts[0], place: parts[1], held: parts[2], by: parts[3] });
+  }
+  return found;
+}
+function rows(text) {
+  return text.split('\n').filter(l => l.startsWith('row /')).map(line => {
+    const f = Object.fromEntries(line.split(' | ').map(part => { const i = part.indexOf(' '); return i < 0 ? [part, ''] : [part.slice(0, i), part.slice(i + 1).trim()]; }));
+    return { path: f.row === '/' ? [] : f.row.slice(1).split('/'), by: f.by || '', readers: (f.for || '').split(' ').filter(Boolean), apply: f.apply || '', slots: (f.slots || '').split(' ').filter(Boolean) };
+  });
+}
+const free = seg => /^\[.*\]$/.test(seg);
+const fits = (pattern, place) => { const segs = place === '/' ? [] : place.slice(1).split('/'); return pattern.length === segs.length && pattern.every((p, i) => free(p) || p === segs[i]); };
+const typed = v => /^[0-9]+$/.test(v) ? Number(v) : v;
+
+async function fill(composition, place, inputs, note) {
+  const raw = Object.fromEntries(inputs.filter(i => i.value.trim()).map(i => [i.name, i.value.trim()]));
+  note.textContent = 'Writing…';
+  let done = await call('scope/fill', { composition, place, slots: Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, typed(v)])) });
+  if (done.bad && /shape/.test(done.text)) done = await call('scope/fill', { composition, place, slots: raw });
+  note.textContent = done.bad ? done.text : 'Written.';
+  if (!done.bad) { inputs.forEach(i => { i.value = ''; }); document.activeElement.blur(); setTimeout(() => show().catch(() => {}), 1200); }
+}
+function form(composition, place, row, label, pick) {
+  const note = $('span', { className: 'soft' });
+  const key = pick ? $('input', { placeholder: 'a name, one word', required: true, pattern: '[a-z][a-z0-9]*' }) : null;
+  const inputs = row.slots.map(s => $('input', { name: s.replace(/\?$/, ''), placeholder: s.replace(/\?$/, ' (optional)'), required: !s.endsWith('?') }));
+  const f = $('form', {}, ...(key ? [key] : []), ...inputs, $('button', { text: label }), note);
+  f.onsubmit = e => { e.preventDefault(); fill(composition, key ? (place === '/' ? '' : place) + '/' + key.value.trim() : place, inputs, note); };
+  return f;
+}
+async function invite(composition, place, n, out) {
+  out.textContent = 'Making the invitation…';
+  if (!n) {
+    const asked = await call('scope/invite', { composition, place: place.place });
+    if (asked.bad) { out.textContent = asked.text; return; }
+  }
+  let last = '';
+  for (let i = 0; i < 120; i++) {
+    if (!n) n = Number(((await call('mcp/read', { path: place.held, care: 'x' })).data || {}).properties?.['/invite'] || 0);
+    const got = n ? await call('scope/link', { invitation: n }) : { bad: true, text: '' };
+    if (!got.bad && got.text.split(',').length === 12) {
+      out.replaceChildren($('div', { text: 'Send this to whoever is to take the seat. It is shown once: copy it now.' }), $('div', { className: 'link', text: address(got.text.trim()) }));
+      return;
+    }
+    last = got.text;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  out.textContent = last || 'The invitation was not made in time. Try again.';
+}
+
+async function show() {
+  const seen = await call('scope/seen');
+  const found = compositions(seen.text);
+  const me = (found.flatMap(c => c.places).map(p => p.held.split('/')[1]).find(Boolean)) || '';
+  const parts = document.getElementById('parts');
+  const drawn = [];
+  for (const c of found) {
+    const table = rows((await call('scope/shape', { composition: c.name })).text);
+    const records = {};
+    await Promise.all(c.places.filter(p => p.kind !== 'todo' && p.kind !== 'may' && p.kind !== 'waits').map(async p => { const r = await call('mcp/read', { path: p.held, care: 'x' }); records[p.place] = Object.fromEntries(Object.entries((r.data || {}).properties || {}).map(([k, v]) => [k.replace(/^\//, ''), v])); }));
+    const top = records['/'] || {};
+    const keeper = (c.places.find(p => p.place === '/') || {}).by === me;
+    const mine = c.places.filter(p => (records[p.place] || {}).world && spelled((records[p.place] || {}).world) === me).map(p => p.place);
+    const seats = [...new Set(table.flatMap(r => [r.by, ...r.readers]).filter(w => w && w !== 'maker'))].map(w => w.split('/'));
+    const writes = row => row.by === 'maker' ? keeper : mine.some(seat => fits(row.by.split('/'), seat));
+    const box = $('section', {}, $('h2', { text: top.title || c.name }), $('p', { className: 'soft', text: keeper ? 'You keep this.' : mine.length ? 'You take part in this as ' + mine.map(words).join(', ') + '.' : 'You take part in this.' }));
+    for (const p of c.places.filter(p => p.place !== '/').sort((a, b) => a.place.localeCompare(b.place))) {
+      const record = records[p.place] || {}, row = table.find(r => fits(r.path, p.place)) || { slots: [], by: '', apply: '' };
+      const depth = p.place.split('/').length - 2;
+      const line = $('div', { className: 'place', style: `padding-left:${depth * 1.1}rem` }, $('span', { className: 'name', text: record.title || words(p.place).split(' › ').pop() }), $('span', { className: 'tag', text: record.title ? words(p.place) : '' }));
+      const shown = Object.entries(record).filter(([k, v]) => !['title', 'invite', 'name', 'world', 'ticket', 'proof', 'open'].includes(k) && !k.includes('/') && String(v) !== '');
+      if (shown.length) line.append($('div', { className: 'slots' }, ...shown.flatMap(([k, v]) => [$('span', { text: k + ' ' }), brief(v, 48), '   '])));
+      if (p.kind === 'todo') line.append($('div', { className: 'soft', text: 'Yours to write.' }), form(c.name, p.place, row, 'Write'));
+      if (p.kind === 'may') line.append($('div', { className: 'soft', text: 'You may ask here' + (row.apply ? ': ' + row.apply : '') + '.' }), form(c.name, p.place, row, 'Ask'));
+      if (p.kind === 'waits') line.append($('div', { className: 'soft', text: 'Waiting on ' + (p.by === me ? 'you' : 'another member') + '.' }));
+      if (p.kind === 'unproven' || p.kind === 'unfit') line.append($('div', { className: 'warn', text: (p.kind === 'unfit' ? 'This does not have the shape asked for here.' : 'This is not yet shown to be true') + (c.why[p.place] ? ' (' + c.why[p.place] + ')' : '') }));
+      if (keeper && p.kind === 'held' && !record.world && (record.invite || seats.some(s => fits(s, p.place)))) { const out = $('div', { className: 'soft' }); const b = $('button', { text: 'Invite someone to this seat' }); b.onclick = () => invite(c.name, p, Number(record.invite || 0), out); line.append($('div', {}, b), out); }
+      if (record.invite && record.world) line.append($('div', { className: 'soft', text: spelled(record.world) === me ? 'This is your seat.' : 'Taken.' }));
+      box.append(line);
+    }
+    // A row whose last name is free is one its writer adds to: offered where its parent stands and this world writes it.
+    for (const row of table.filter(r => r.path.length && free(r.path[r.path.length - 1]) && !r.by.includes(r.path[r.path.length - 1]) && writes(r))) {
+      const above = row.path.slice(0, -1);
+      const parents = above.some(free) ? c.places.filter(p => p.kind === 'held' && fits(above, p.place)).map(p => p.place) : ['/' + above.join('/')];
+      for (const parent of parents)
+        box.append($('div', { className: 'place' }, $('span', { className: 'name', text: 'Add to ' + (words(parent) || 'this') }), form(c.name, parent, row, 'Add', true)));
+    }
+    drawn.push(box);
+  }
+  parts.replaceChildren(...drawn);
+  if (!found.length) say('You take part in nothing yet. Start something below, or take a seat you were invited to.');
+  else if (/^(Reading|You take part in nothing|This world could not)/.test(document.getElementById('say').textContent)) say('');
+  const packs = (await call('scope/packs')).text.split('\n').filter(Boolean);
+  document.getElementById('nopacks').hidden = packs.length > 0;
+  document.getElementById('make').hidden = packs.length === 0;
+  document.getElementById('pack').replaceChildren(...packs.map(p => $('option', { value: p, text: p.replace(/_/g, ' ') })));
+}
+document.getElementById('make').onsubmit = async e => {
+  e.preventDefault();
+  const made = await call('scope/make', { pack: document.getElementById('pack').value, name: document.getElementById('called').value.trim() });
+  say(made.bad ? made.text : 'Making it…');
+  if (!made.bad) { document.getElementById('called').value = ''; document.activeElement.blur(); }
+};
+document.getElementById('join').onsubmit = async e => {
+  e.preventDefault();
+  const field = document.getElementById('link'); let link = field.value.trim();
+  if (link.includes('#')) link = decodeURIComponent(link.slice(link.indexOf('#') + 1));
+  const took = await call('scope/join', { link });
+  say(took.bad ? took.text : 'Taking the seat. It appears above once the other side has answered.');
+  if (!took.bad) { field.value = ''; document.activeElement.blur(); }
+};
+document.getElementById('way').onclick = () => {
+  const session = (document.cookie.split('; ').find(c => c.startsWith('session=')) || '').slice(8);
+  document.getElementById('back').textContent = location.origin + '/door#' + session;
+  document.getElementById('agent').textContent = location.origin + '/mcp     Authorization: Bearer ' + session;
+  document.getElementById('ways').hidden = false;
+};
+// What others write arrives by itself, so the reading is taken again every little while; never while
+// something is being typed, and a reading that fails is tried again.
+const idle = () => !['INPUT', 'SELECT', 'TEXTAREA'].includes((document.activeElement || {}).tagName) && ![...document.querySelectorAll('#parts input')].some(i => i.value);
+(async () => {
+  for (;;) {
+    if (idle()) { try { await show(); } catch (error) { say('This world could not be read just now. Trying again.'); } }
+    await new Promise(r => setTimeout(r, document.hidden ? 30000 : 10000));
+  }
+})();
+</script>
