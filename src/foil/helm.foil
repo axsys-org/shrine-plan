@@ -43,16 +43,33 @@
       ' This is the card for the full world as it is now. It is for a foot
       ' that derives what it does from the world. A committed world is in the
       ' store. Thus the transfer of the world copies no data.
+      '
+      ' The Mesa foot uses this card. The rules of the foot take the
+      ' namespace as a value. A read card gives only the records at one path.
       : request=nat
     + sent
       ' This is a card from a foot, with the path where the foot is
       ' registered. Only the supervisor's endpoint for a foot makes this card.
       ' Thus a foot cannot select the path. The journal keeps the path with
       ' what the card wrote.
+      '
+      ' The reason for this card is provenance. A record that lands from a
+      ' different world is an outside write. The journal must show that the
+      ' Mesa foot brought it in, and that no other writer did. Without this
+      ' card, each outside write has the same source, and that source has no
+      ' name.
       : by=path card=helm/card
     + admit
       ' This is a card with a trusted planner and response. The two run in one
-      ' supervisor admission.
+      ' supervisor admission. The supervisor runs the planner on the state
+      ' that it has at that moment, and it commits the writes that the planner
+      ' gives. Then it runs the response on the committed state.
+      '
+      ' The reason for this card is that a plan made on an older state can be
+      ' wrong. A landing compares an epic with the mount as the mount is now.
+      ' With a step card, a different write can come between the read and the
+      ' write, and then the foot commits a plan that is out of date. With this
+      ' card, no write can come between the two.
       : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
         finish={\ maybe[pail] namespace}[nat str str]
     + snapshot_bat
@@ -110,16 +127,6 @@
         helm/card/sent
         helm/card/state
         helm/supervisor/register
-        helm/supervisor/idle
-    +  idle
-      '  This is a pooled reader that completed its read card. Its number
-      '  identifies it.
-      : id=nat
-    +  pooled
-      '  This is a reader in the supervisor's pool. It gives the number of the
-      '  reader, the handle of the reader, and if the reader holds a read
-      '  card.
-      : id=nat h=nat busy=bool
     +  register
       '  This is an explicit bootstrap registration. A registration with a
       '  duplicate path or an absent path fails. If a foot hears, the
@@ -157,15 +164,19 @@
         | [next next_index (feet/task/ack .none)]
 
     + admit
+      ' This function is admit_by for a caller that is not a foot. It gives
+      ' the empty path as by. The tests use it, and a card that no foot sent
+      ' comes here through admitted.
       \ plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
       ^ [state=namespace index=hive reply=feet/task[unit]]
-      ? (namespace_command/admit plan state index)
-       > (./err why) [state index (helm/supervisor/denied why)]
-       > (./ok pair)
-        = [next next_index] pair
-        | [next next_index (feet/task/ack .none)]
+      = nobody=path []
+      | helm/supervisor/admit_by nobody plan state index
 
     + admit_by
+      ' This function admits the writes of a planner as one event. The planner
+      ' reads the same state that the writes go to. by is the path where the
+      ' foot that sent the card is registered, or the empty path when no foot
+      ' sent it. The journal keeps by with the event (/sys/by).
       \ by=path plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
       ^ [state=namespace index=hive reply=feet/task[unit]]
       ? (namespace_command/admit_by by plan state index)
@@ -176,6 +187,11 @@
     + admitted
       ' This function does one admission and gives its answer. by is the path
       ' of the foot that asked. by is empty when no foot asked.
+      '
+      ' The function makes the answer from the committed state, in the same
+      ' supervisor turn. Thus the answer agrees with what the world holds. An
+      ' answer made from a later read can show the writes of a different
+      ' event.
       \ by=path request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
         finish={\ maybe[pail] namespace}[nat str str] state=namespace index=hive
       ^ [namespace hive feet/task[unit]]
@@ -314,7 +330,6 @@
         index={\ s}hive
         version={\ s}nat
         permit={\ path s}bool
-        read={\ helm/card s}feet/task[unit]
 
     + local_access
       ^ helm/supervisor/access[namespace]
@@ -322,68 +337,6 @@
         namespace/page helm/supervisor/handle
         sovereign_hive (\ state state.local.top)
         (\ target state (namespace/permitted target state))
-        helm/supervisor/read
-
-    + read
-      '  This function gives the answer to a read card on one committed state,
-      '  as the supervisor gives it. A read does not use the crew index.
-      \ card=helm/card state=namespace
-      ^ feet/task[unit]
-      = none=hive (axal/new[row[dep]] .none)
-        [next next_index answer] (helm/supervisor/handle card state none)
-      answer
-
-    +  reader
-      (@ s)
-      '  This is a reader in the supervisor's pool. It answers one read card
-      '  at a time, on the state that was committed when the card arrived.
-      '  Thus the supervisor, a write and a different read do not wait for a
-      '  slow read. The reads run in parallel on the executor's workers.
-      '
-      '  The capability of a foot comes with the card. The reader answers that
-      '  foot, tells the supervisor that it is idle, and waits for the next
-      '  card.
-      '
-      '  Readers stay for the life of the world. enki keeps the thread and the
-      '  heap of a halted actor until the scheduler is released. Thus, if each
-      '  read gets a new reader, each read leaks one reader.
-      \ read={\ helm/card s}feet/task[unit] id=nat self=nat
-      ^ nat
-      = ;[ignored first] (Recv[nat] 0)
-        supervisor first.at(0)
-      % ignored=nat 0
-      = ;[job caps] (Recv[[helm/card s]] 0)
-        [card state] job
-        ;answer (read card state)
-      ; (? (gt caps.len 0) (Send caps.at(0) answer) 0)
-      ; (helm/supervisor/close_caps caps)
-      ; (Send supervisor (helm/supervisor/idle id))
-      | _ 0
-
-    +  hand_read
-      (@ s)
-      '  This function gives a read card and the state to an idle reader. When
-      '  all readers are busy, it starts a new reader. (The pool increases to
-      '  the largest number of reads that were in progress at the same time.)
-      '  The foot's capability goes with the card and the state.
-      \ read={\ helm/card s}feet/task[unit] readers=row[helm/supervisor/pooled]
-        card=helm/card state=s foot=nat
-      ^ row[helm/supervisor/pooled]
-      = idle (readers.filter((\ r=helm/supervisor/pooled !(r.busy))))
-        job=[helm/card s] [card state]
-      ? (gt idle.len 0)
-        = chosen idle.at(0)
-        ; (SendCaps chosen.h job [foot])
-        | readers.map
-          \ r=helm/supervisor/pooled
-          ^ helm/supervisor/pooled
-          ? (eq r.id chosen.id) (helm/supervisor/pooled r.id r.h .true)
-          r
-      = id readers.len
-        ;fresh (Spawn (helm/supervisor/reader[s] read id))
-      ; (SendCaps fresh 0 [0])
-      ; (SendCaps fresh job [foot])
-      | readers.snoc((helm/supervisor/pooled id fresh .true))
 
     +  close_caps
       \ caps=row[nat]
@@ -502,41 +455,14 @@
         version access.version
       % state=s initial index=hive (index_of initial)
         members=row[helm/supervisor/member] []
-        readers=row[helm/supervisor/pooled] []
       = ;[message caps] (Recv[helm/supervisor/request] 0)
-      ? message
-       > (helm/supervisor/idle id)
-        ; (helm/supervisor/close_caps caps)
-        = eased
-            | readers.map
-              \ r=helm/supervisor/pooled
-              ^ helm/supervisor/pooled
-              ? (eq r.id id) (helm/supervisor/pooled r.id r.h .false)
-              r
-        | _ state index members eased
       ? (eq caps.len 0)
-        | _ state index members readers
-      ' A read goes to a pooled reader with the current state. The current
-      ' state is in the store from the time of its last commit. Thus the
-      ' transfer of the state copies no data. Writes and registrations stay
-      ' here, in sequence.
-      = reading=maybe[helm/card]
-          ? message
-           > card=helm/card/snapshot (./some card)
-           > card=helm/card/snapshot_bat (./some card)
-          .none
-      ? reading
-       > (./some card)
-        = ;handed (helm/supervisor/hand_read[s] access.read readers card state caps.at(0))
-        ; (helm/supervisor/close_caps caps)
-        | _ state index members handed
+        | _ state index members
       = ;[next next_index joined answer]
           ? message
            > req=helm/supervisor/register
             = ;[roster ack] (helm/supervisor/enroll_with[s] access req state members)
             [state index roster ack]
-           > idle=helm/supervisor/idle
-            [state index members (feet/task/ack .none)]
            > card=helm/card/admit
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/snapshot_bat
@@ -574,17 +500,17 @@
       ; (? (eq (version next) (version state)) 0 (keep next))
       ; (Send caps.at(0) answer)
       ; (helm/supervisor/close_caps caps)
-      | _ next next_index joined readers
+      | _ next next_index joined
     +  run_with
       (@ s)
       '  Only bootstrap code receives this handle. Feet use endpoints.
       \ access=helm/supervisor/access[s] initial=s self=nat
       ^ nat
-      = unkept
+      = idle
           \ ignored=s
           ^ nat
           | 0
-      | helm/supervisor/run_keeping[s] access unkept initial self
+      | helm/supervisor/run_keeping[s] access idle initial self
     + run
       \ initial=namespace self=nat
       ^ nat

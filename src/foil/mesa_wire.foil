@@ -4,10 +4,17 @@
 - mesa_foot
 - desk
 
-' These are the actors that give the foot at /io/mesa a socket and a clock,
-' and the loop that runs its rules (mesa_foot). No code here makes a decision.
-' The code moves bytes, tells the rules what arrived, and does what the rules
-' ask.
+' This module is the packet pump of the foot at /io/mesa. It has the actors
+' that own the socket and the clock, and the loop that runs the rules of the
+' foot. The pump does these things:
+' - It reads the bytes of each connection and gives the packets to the rules.
+' - It sends the packets that the rules ask it to send.
+' - It tells the rules the time, one tick after the other.
+' - It asks the supervisor to admit the writes that the rules plan.
+' - It keeps the secret files of the foot, and it signs when the desk asks
+'   (desk.foil).
+'
+' No code here makes a decision. The rules are in mesa_foot, net and pass.
 '
 ' The record of the foot, /<self>/io/mesa, tells where the foot listens and
 ' where its two files are:
@@ -63,19 +70,20 @@
       mesa_wire/heard
       mesa_wire/tick
   + frames
-    ' This function gives the bytes of one connection.
+    ' This function gives the bytes of one connection: the 16 bytes of the
+    ' sender, and then each packet after the 4 bytes of its length. It makes a
+    ' byte tree of these parts (bat_concat), and the runtime flattens the tree
+    ' in one pass.
     \ me=nat packets=row[nat]
     ^ nat
-    % at=nat 0
-      raw=nat (mod me (bex 128))
-      size=nat 16
-    ^ nat
-    ? (ge at packets.len) (add raw (bex (mul 8 size)))
-    = packet packets.at(at)
-      len (dec (wid packet))
-      body (mod packet (bex (mul 8 len)))
-      headed (add raw (lsh len (mul 8 size)))
-    | _ at.inc (add headed (lsh body (mul 8 (add size 4)))) (add size (add 4 len))
+    = head=row[any] [(bat_bytes (mod me (bex 128)) 16)]
+      parts
+        | packets.fold head
+          \ out=row[any] packet=nat
+          ^ row[any]
+          = len (dec (wid packet))
+          | out.snoc((bat_bytes len 4)).snoc((bat_bar packet))
+    | bat_flatten (bat_concat parts.snoc((bat_bytes 1 1)))
   + unframe
     ' This function gives the packets in the bytes of one connection. It gives
     ' none when the bytes are not frames.
@@ -584,3 +592,49 @@
     = ;one (Spawn (mesa_wire/acceptor fd))
     ; (SendCaps one 0 [0])
     | _ left.dec
+  + accepted
+    ' This function tells if the supervisor accepted a write or a
+    ' registration.
+    \ reply=feet/task[unit]
+    ^ bool
+    ? reply
+     > (./ack err)
+      ? err
+       > .none .true
+       > (./some _) .false
+    .false
+  + submit
+    ' This function sends one write and tells if the world accepted it.
+    \ server=nat target=path change=writ
+    ^ bool
+    ; (SendCaps server (helm/card/step target change) [0])
+    = ;[reply caps] (Recv[feet/task[unit]] 0)
+    ; (helm/supervisor/close_caps caps)
+    | mesa_wire/accepted reply
+  + present
+    ' If the world has no record of the foot, this function makes an empty
+    ' one. It does not change a record that is there. The port, the key and
+    ' all other data that the record holds stay the same. An empty poke makes
+    ' no change. The world does not accept an empty poke in one case only:
+    ' when there is no record. A make replaces the record.
+    \ server=nat target=path
+    ^ bool
+    ? (mesa_wire/submit server target (writ/poke myth/new)) .true
+    | mesa_wire/submit server target (writ/make myth/new)
+  + start
+    ' This function starts the foot of a world: it makes sure that the record
+    ' /<self>/io/mesa is there, and it registers the foot at that path. The
+    ' foot hears each commit. A world calls this function one time, when it
+    ' starts. The mesa mount is the switch that makes a world call it.
+    \ server=nat self=iota arguments=row[str]
+    ^ nat
+    = home=path [self 'io 'mesa]
+    ? !(mesa_wire/present server home)
+      (error (pails/t "Mesa foot record refused"))
+    = registration | helm/supervisor/register home mesa_wire/run .true
+    ; (SendCaps server registration [0])
+    = ;[reply caps] | Recv[feet/task[unit]] 0
+    ; | helm/supervisor/close_caps caps
+    ? !(mesa_wire/accepted reply)
+      (error (pails/t "Mesa foot registration failed"))
+    0
