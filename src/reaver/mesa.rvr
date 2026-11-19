@@ -1,9 +1,10 @@
-;;;; The Mesa bridge as the kernel uses it. This is the only file that names a
-;;;; bridge call (enki pkg/mesa/API.md). Every call takes a row of handles and a
-;;;; data row and answers [status data handles]. A handle is a live capability:
-;;;; it is passed along and never forced, saved or sent.
+;;;; This file is the Mesa bridge as the kernel uses it. It is the only file
+;;;; that names a bridge call (enki pkg/mesa/API.md). Each call takes a row of
+;;;; handles and a data row, and it answers [status data handles]. A handle is
+;;;; a live capability: the kernel passes it along and does not force, save or
+;;;; send it.
 ;;;;
-;;;; Bytes are bars: the bytes followed by a 0x01 terminator, as a nat.
+;;;; Bytes are bars: the bytes and then a 0x01 terminator, as a nat.
 (#bind std (#module std))
 (#import std)
 (#bind bplan (#module bplan))
@@ -22,21 +23,27 @@
 (define (made reply) (Ix 0 (Ix 2 (ok reply))))
 (define (told reply) (Ix 1 (ok reply)))
 
-;; This file decides nothing. The domain, the life and rift an engine is told,
-;; its bounds and retry policy, and the names of pages are the caller's
-;; (src/foil/mesa_foot.foil); what is here is the bridge's own shape.
+;; This file makes no decision. These items belong to the caller
+;; (src/foil/mesa_foot.foil):
+;; - the domain
+;; - the life and the rift that an engine is told
+;; - the bounds and the retry policy of an engine
+;; - the names of pages
+;;
+;; What is here is the shape of the bridge.
 
-;; realm is [domain life rift]: what the engine is told of every world.
+;; realm is [domain life rift]. It is what the engine is told about each
+;; world.
 (define (peer realm id key-id)
   (made (call "MesaPeer" 0 [id (Ix 0 realm) (Ix 1 realm) (Ix 2 realm) key-id 1])))
 
-;; A config from Mesa's defaults with the caller's numbers in their places.
-;; core_config is [wire_limits bloq max_peers max_bindings max_binding_bytes
-;; max_read_bytes max_reassembly_bytes max_unverified_bytes max_reads
-;; max_fragments window retry_after read_timeout max_attempts] (API.md).
-;; limits is the wire's [max_packet max_path max_fragment]; bounds is
-;; [max_bindings max_binding_bytes max_reassembly_bytes max_reads retry_after
-;; read_timeout max_attempts].
+;; This function makes a config from the defaults of Mesa, with the numbers of
+;; the caller in their places. core_config is [wire_limits bloq max_peers
+;; max_bindings max_binding_bytes max_read_bytes max_reassembly_bytes
+;; max_unverified_bytes max_reads max_fragments window retry_after
+;; read_timeout max_attempts] (API.md). limits is the [max_packet max_path
+;; max_fragment] of the wire. bounds is [max_bindings max_binding_bytes
+;; max_reassembly_bytes max_reads retry_after read_timeout max_attempts].
 (define (config limits bounds)
   (#let ((base (made (call "MesaConfig" 0 0))))
     (#let ((fields (told (call "MesaConfigFields" [base] 0))))
@@ -46,10 +53,11 @@
                   (Up 4 (Ix 1 bounds) (Up 3 (Ix 0 bounds)
                     (Up 0 limits fields)))))))))))))
 
-;; An engine for one world: its signing seed, and each peer as [id key-bytes].
-;; The bridge takes the keys as one table, the world's own first, so peers
-;; have key ids and attachments 1, 2, ... in the order given. The table is
-;; fixed for the engine's life.
+;; This function makes an engine for one world from the seed that the world
+;; signs with, and from each peer as [id key-bytes]. The bridge takes the keys
+;; as one table, with the key of the world first. Thus peers have key ids and
+;; attachments 1, 2, ... in the given order. The table does not change during
+;; the life of the engine.
 (define (engine self seed realm limits bounds others)
   (#let ((keypair (made (call "MesaKeyFromSeed" 0 [seed]))))
     (#let ((publics (map (lambda (other) (made (call "MesaPublicKey" 0 [(Ix 1 other)]))) others)))
@@ -68,12 +76,12 @@
                    0 others)
             made-engine))))))
 
-;; What an engine asks of its host, as plain rows:
+;; This is what an engine asks of its host, as plain rows:
 ;;   [1 peer attachment packet]   send these bytes
-;;   [2 request status bytes]     a read finished (status 0: the page)
+;;   [2 request status bytes]     a read stopped (status 0: the page)
 ;;   [3 0 0 text]                 something was dropped
-;;   [4 0 0 0]                    anything else (timers are driven by advance)
-;;   [5 0 0 text]                 the engine refused the call itself
+;;   [4 0 0 0]                    any other action (advance drives the timers)
+;;   [5 0 0 text]                 the engine did not accept the call
 (define send-tag (bar "Send" 4))
 (define finished-tag (bar "ReadFinished" 12))
 (define dropped-tag (bar "Dropped" 7))
@@ -101,10 +109,11 @@
 (define (advance made-engine tick)
   (step "MesaEngineAdvanceTo" made-engine [tick]))
 
-;; What a packet is, before the engine sees it: [kind path other data who].
-;; Kind 0 is an ask for the page at path; 2 is a hint, whose two names are
-;; what the sender holds of ours (path) and what it offers (other), with the
-;; publisher the offered name is under (who); 9 is not a packet.
+;; This function tells what a packet is, before the engine sees it: [kind path
+;; other data who]. Kind 0 is an ask for the page at path. Kind 2 is a hint.
+;; The two names of a hint are what the sender holds of ours (path) and what
+;; the sender offers (other). who is the publisher that the offered name is
+;; under. Kind 9 is not a packet.
 (define (look bytes limits)
   (#let ((decoded (call "MesaWireDecode" 0 [bytes limits])))
     (If (Ix 0 decoded) [9 0 0 0 0]
@@ -114,8 +123,8 @@
            (If (Eq kind 2) (Ix 2 (Ix 3 body)) 0)
            (If (Eq kind 2) (Ix 0 (Ix 2 body)) 0)])))))
 
-;; A hint, as the bridge shapes one: two names and a few bytes. What the names
-;; and the bytes mean is the caller's.
+;; As the bridge shapes it, a hint is two names and a small number of bytes.
+;; The caller selects what the names and the bytes mean.
 (define (name-of domain publisher path) [publisher domain 0 13 [0 0] path])
 (define (hint domain me them held offered data limits)
   (#let ((carried [(bar-len data) [0 (bar 0 0)] data]))
