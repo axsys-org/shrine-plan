@@ -47,15 +47,27 @@ def literal(value):
     return runtime_literal(value)
 
 
-def announce_world(url, work, kept, mounts, timeout):
+def first_session(work, timeout):
+    """The first session a world that is its own leaves for whoever is at the machine, or nothing.
+    A world nobody has claimed has let nobody in, the launcher included."""
+    left = Path(work) / 'src' / 'io' / 'mesa' / 'out' / 'session'
+    deadline = time.time() + min(timeout, 30)
+    while not (left.exists() and left.stat().st_size > 0) and time.time() < deadline:
+        time.sleep(1)
+    return left.read_text().strip() if left.exists() and left.stat().st_size > 0 else None
+
+
+def announce_world(url, work, kept, mounts, session, timeout):
     """Write /agent/launcher/world so an agent can tell a kept world from a temporary one."""
-    if 'mcp' not in mounts:
+    if 'mcp' not in mounts or not session:
         return
     record = {'path': '/agent/launcher/world',
               'slots': {'kept': kept, 'directory': str(work), 'mounts': ' '.join(mounts)}}
     body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
                        'params': {'name': 'mcp/write', 'arguments': {'records': [record], 'who': 'launcher'}}}).encode()
-    request = urllib.request.Request(url + '/mcp', body, {'Content-Type': 'application/json'})
+    # The launcher is whoever is at the machine: it shows the first session the world left there.
+    headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + session}
+    request = urllib.request.Request(url + '/mcp', body, headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             reply = json.load(response)
@@ -75,6 +87,9 @@ def main():
                         help="first start only: start the world under a name someone else minted, given "
                              "the name's founding and first statement as one line (the last four parts "
                              "of a link). The world lets nobody in until it is claimed.")
+    parser.add_argument('--address', default='', metavar='HOST:PORT',
+                        help="Where this world's Mesa foot is reached and listens: handed to the foot at every "
+                             "start, so a world started somewhere else says so itself.")
     parser.add_argument('--extras-root', type=Path,
                         help='Mount source directory (default: this checkout’s extras/)')
     parser.add_argument('--workspace', type=Path, help='Source workspace for host captures (remembered by the world)')
@@ -156,6 +171,13 @@ def main():
                 (work / 'world.json').write_text(json.dumps(dict(format=1, node=node,
                     extras=str(extras), workspace=str(workspace), compiler=args.compiler,
                     mounts=[m.name for m in selected], **({'hands': hands} if hands else {})), indent=2) + '\n')
+            if args.address:
+                host, _, mesa_port = args.address.rpartition(':')
+                if not host or not mesa_port.isdigit():
+                    raise ValueError('--address is HOST:PORT')
+                kept = work / 'src' / 'io' / 'mesa'
+                kept.mkdir(parents=True, exist_ok=True, mode=0o700)
+                (kept / 'address').write_text(f'{host} {mesa_port}')
             session = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix='session-', dir=work)))
             prepared = prepare(selected, session, args.check, cleanup,
                                {"node": node, "timeout": args.startup_timeout, "workspace": str(workspace)})
@@ -232,8 +254,11 @@ def main():
             # A world with hands also says which kind of world it is, for the agents beside it.
             running = []
             if hands and not args.check:
-                announce_world(url, work, not args.ephemeral, [m.name for m in selected], args.request_timeout)
-                running = start_hands(hands, url, node, work, cleanup)
+                # A hand is let in as whoever started it. A world with no door of its own (no mesa mount)
+                # or one nobody has claimed lets no hand in, and its hands say so in their logs.
+                session = first_session(work, args.request_timeout)
+                announce_world(url, work, not args.ephemeral, [m.name for m in selected], session, args.request_timeout)
+                running = start_hands(hands, url, node, work, cleanup, session=session)
             print(f'Eden: {url}; mounts: {", ".join(m.name for m in selected) or "none"}'
                   + (f'; hands: {", ".join(name for name, _, _ in running)}' if running else ''), flush=True)
             if args.check:
@@ -241,10 +266,12 @@ def main():
                     try:
                         urllib.request.urlopen(url + path, timeout=args.request_timeout)
                     except urllib.error.HTTPError as error:
-                        if error.code != 404:
+                        # Nobody is answered only at the door: a world that is up refuses this, or,
+                        # where it lets the asker in, says the route is not there.
+                        if error.code not in (401, 404):
                             raise
                     else:
-                        raise RuntimeError('Unregistered route did not return 404')
+                        raise RuntimeError('Unregistered route was answered')
                 for mount, folder, arguments, module in prepared:
                     if module and hasattr(module, 'check'):
                         print(f'Checking mount: {mount.name}', flush=True)

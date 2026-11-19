@@ -45,6 +45,7 @@ class World:
         command = [sys.executable, str(ROOT / 'x/eden'), '--node', self.node, '--port', str(self.http),
                    '--world', str(self.home / 'world'), '--extras-root', str(ROOT / 'extras'),
                    '--startup-timeout', str(timeout)]
+        command += ['--address', f'127.0.0.1:{self.mesa}']
         if self.founding:
             command += ['--founding', self.founding]
         for mount in self.mounts:
@@ -56,10 +57,17 @@ class World:
                 raise RuntimeError(f'{self.node} exited while starting; see {self.home}/eden.log')
             try:
                 self.tool('read', path='/' + self.node + '/io/mesa', care='x')
-                return
+                break
+            except urllib.error.HTTPError:
+                break  # the door answered and let nobody in: the world is up
             except Exception:
                 time.sleep(2)
-        raise RuntimeError(f'{self.node} did not start in {timeout}s; see {self.home}/eden.log')
+        else:
+            raise RuntimeError(f'{self.node} did not start in {timeout}s; see {self.home}/eden.log')
+        # A world that is its own leaves its first session for whoever is at the machine, which this
+        # script is. A world started under a name nobody has claimed lets nobody in until it is claimed.
+        if not self.founding and not self.session:
+            self.owner()
 
     def stop(self):
         if self.process and self.process.poll() is None:
@@ -128,7 +136,7 @@ class World:
         deadline = time.time() + seconds
         said = None
         while time.time() < deadline:
-            said = self.post('/scope/join', link, session=session, nobody=nobody)
+            said = self.post('/door/join', link, session=session, nobody=nobody)
             if not (said[0] == 409 and 'still being answered' in said[1]):
                 break
             time.sleep(1)
@@ -205,7 +213,7 @@ def numbers(slots):
 def prepared(maker, place, invite, http, mesa, home, timeout, mounts=('mcp', 'mesa', 'scope')):
     """A world prepared for a place and claimed, as x/check-community does it step by step. The maker's
     door gives the link to its owner. A world is started under the link's name with the name's founding
-    and told where it is reached: that much is the host, played here. Then the link is handed over at the
+    and its address: that much is the host, played here. Then the link is handed over at the
     new world's door by nobody, with a session this function makes, and everything else is the worlds'
     own: the claim, the session let in, the scope met, the introduction, the place filled. Returns the
     world, let in under that session, or raises with what did not happen."""
@@ -216,9 +224,6 @@ def prepared(maker, place, invite, http, mesa, home, timeout, mounts=('mcp', 'me
     world = World(spell(name), http, mesa, home, mounts, founding=founding_of(link))
     world.start(timeout)
     here = '/' + world.node + '/io/mesa'
-    if not until(lambda: world.number(here, 'seq') == 1, 180):
-        raise RuntimeError(f'{world.node} did not keep the founding it was started with: {world.read(here)}')
-    world.write(dict(path=here, action='poke', slots={'host': '127.0.0.1', 'port': mesa}))
     session = secrets.token_hex(16)
     said = world.join(link, session=session)
     if said[0] != 202:

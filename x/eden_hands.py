@@ -1,5 +1,6 @@
 """The hands a world runs: named in its descriptor (world.json), started after the foot listens, each its own process
 with its log beside the world's, stopped at teardown. A hand not listed does not run."""
+import os
 import shlex
 import subprocess
 import sys
@@ -27,14 +28,16 @@ def hand_commands(hands, url, node, hands_dir=HANDS_DIR):
     return out
 
 
-def start_hands(hands, url, node, work, cleanup, hands_dir=HANDS_DIR):
-    """Start every listed hand as its own process, logging to <work>/hands/<name>.log; stopped through cleanup."""
+def start_hands(hands, url, node, work, cleanup, hands_dir=HANDS_DIR, session=None):
+    """Start every listed hand as its own process, logging to <work>/hands/<name>.log; stopped through cleanup.
+    A hand is let in at the door as whoever started it: it is given that session, and holds no other."""
+    env = dict(os.environ, **({'SHRINE_SESSION': session} if session else {}))
     started = []
     logs = Path(work) / 'hands'
     logs.mkdir(exist_ok=True)
     for hand, command in zip(hands, hand_commands(hands, url, node, hands_dir)):
         log = cleanup.enter_context((logs / (hand['name'] + '.log')).open('a'))
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=work, text=True)
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, cwd=work, text=True, env=env)
         cleanup.callback(stop_hand, process)
         started.append((hand['name'], process, logs / (hand['name'] + '.log')))
     return started
