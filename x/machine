@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Bring one machine up: its own world, the host it keeps, and the supervisor.
+
+    x/machine --home /var/lib/shrine/machine --node 0xa1 --port 8600 --address 203.0.113.7 \\
+              [--mounts "mcp mesa scope codecs host ..."] [--limit 8] [--open 20] \\
+              [--domain example.org --name host --also new --tls CERT,KEY --starting wait --reload CMD]
+
+It starts the machine's own world with the launcher and waits for the first session that world leaves for
+whoever is at the machine. Through the world's own door it then makes sure of three things, each only if it
+is not so already: the world keeps a host (made from the host pack); it fills a tenant's seat there, so it
+asks itself for the worlds of what it keeps; and, with --open, anyone at its door may take a tenant's seat,
+up to that many, each starting with the limit --limit gives. Then it runs the supervisor (x/host) until it is stopped, and stops the world with it.
+
+Everything it sets is a record in the machine's world, written through the door like anyone's. Run again on
+a machine that is already set up, it changes nothing and carries on.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import number_of  # noqa: E402
+
+
+def call(url, session, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(url + '/mcp', body, {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + session})
+    result = json.load(urllib.request.urlopen(request, timeout=120))['result']
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', [])), result.get('structuredContent') or {}
+
+
+def until(condition, seconds, what):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            if condition():
+                return
+        except (OSError, ValueError, KeyError):
+            pass
+        time.sleep(2)
+    raise RuntimeError('timed out waiting for ' + what)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--home', type=Path, required=True, help='where the machine keeps its world and the worlds it runs')
+    parser.add_argument('--node', default='0xa1', help="the machine world's own name")
+    parser.add_argument('--port', type=int, default=8600, help="the machine world's door; its peers reach it 1000 above")
+    parser.add_argument('--address', default='127.0.0.1', help='the address other machines reach this one at')
+    parser.add_argument('--mounts', default='mcp mesa scope codecs host', help='what the machine world and the worlds it runs start with')
+    parser.add_argument('--limit', type=int, default=8, help='how many worlds a tenant may have running')
+    parser.add_argument('--own-limit', type=int, default=64, help='how many worlds the machine may run for itself')
+    parser.add_argument('--open', type=int, default=0, help="how many tenant's seats anyone at the door may take")
+    parser.add_argument('--base-port', type=int, default=8700)
+    parser.add_argument('--startup-timeout', type=int, default=1800)
+    parser.add_argument('--domain', default='')
+    parser.add_argument('--name', default='', help="the name the machine world is reached under, beneath the domain")
+    parser.add_argument('--also', action='append', default=[])
+    parser.add_argument('--tls', default='public')
+    parser.add_argument('--starting', default='')
+    parser.add_argument('--reload', default='')
+    args = parser.parse_args()
+
+    args.home.mkdir(parents=True, exist_ok=True)
+    url = f'http://127.0.0.1:{args.port}'
+    world = args.home / 'machine' / 'world'
+    world.parent.mkdir(parents=True, exist_ok=True)
+    launch = [sys.executable, str(ROOT / 'x/eden'), '--node', args.node, '--port', str(args.port), '--world', str(world),
+              '--extras-root', str(ROOT / 'extras'), '--address', f'{args.address}:{args.port + 1000}',
+              '--startup-timeout', str(args.startup_timeout)] + sum((['--mount', m] for m in args.mounts.split()), [])
+    running = [subprocess.Popen(launch, stdout=(args.home / 'machine' / 'eden.log').open('a'), stderr=subprocess.STDOUT, start_new_session=True)]
+
+    def stop(*_):
+        for process in running:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    try:
+        left = world / 'src' / 'io' / 'mesa' / 'out' / 'session'
+        until(lambda: running[0].poll() is None and left.is_file() and left.stat().st_size > 0, args.startup_timeout, 'the machine world to start')
+        session = left.read_text().strip()
+        until(lambda: call(url, session, 'scope/seen')[0] is False, 300, "the machine world's door")
+        seen = lambda: call(url, session, 'scope/seen')[1]
+        if 'composition /host' not in seen():
+            refused, said, _ = call(url, session, 'scope/make', pack='host', name='host')
+            if refused:
+                raise RuntimeError('the machine world would not make a host: ' + said)
+            until(lambda: 'composition /host' in seen(), 600, 'the host to be made')
+        if 'held /tenants/own ' not in seen():
+            refused, said, _ = call(url, session, 'scope/fill', composition='host', place='/tenants/own',
+                                    slots={'title': 'This machine', 'limit': args.own_limit, 'world': number_of(args.node)})
+            if refused:
+                raise RuntimeError("the machine world would not take its own tenant's seat: " + said)
+            until(lambda: 'held /tenants/own ' in seen(), 300, "the machine's own seat")
+        tenants = f'/{args.node}/app/host/tenants'
+        held = (call(url, session, 'mcp/read', path=tenants, care='x')[2].get('properties') or {})
+        offer = {'open': args.open, 'title': 'a world of your own', 'limit': args.limit}
+        if any(str(held.get('/' + slot, '')) != str(value) for slot, value in offer.items()):
+            call(url, session, 'mcp/write', records=[dict(path=tenants, action='poke', slots=offer)])
+        print(f'machine: {args.node} at {url}; host kept; {args.open} seat(s) open', flush=True)
+
+        supervise = [sys.executable, str(ROOT / 'x/host'), '--door', url, '--session-file', str(left), '--worlds', str(args.home / 'worlds'),
+                     '--address', args.address, '--base-port', str(args.base_port), '--startup-timeout', str(args.startup_timeout),
+                     '--mounts', args.mounts, '--limit', str(args.limit)]
+        if args.domain:
+            supervise += ['--domain', args.domain, '--machine', args.name or args.node, '--tls', args.tls]
+            supervise += sum((['--also', name] for name in args.also), [])
+            supervise += (['--starting', args.starting] if args.starting else []) + (['--reload', args.reload] if args.reload else [])
+        running.append(subprocess.Popen(supervise, start_new_session=True))
+        while all(process.poll() is None for process in running):
+            time.sleep(2)
+        raise RuntimeError('the machine world or its supervisor stopped')
+    finally:
+        for process in running:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

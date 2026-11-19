@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Supervise one machine: make the worlds that are running match what the machine's own world says.
+
+The machine's world keeps a host composition (extras/mounts/host). Its records say which worlds each tenant
+asks to have run. This script reads that composition at the machine world's agent door, starts and stops
+launchers to match, and writes where each world is reached back through the same door, as the machine
+world. It decides nothing that is not in those records and keeps no state of its own: stopped and started
+again it reads the same records and comes to the same answer. The only thing it leaves on disk is each
+world's own directory, with the process number of its launcher beside it.
+
+    x/host --door http://127.0.0.1:8601 --session-file <machine world>/src/io/mesa/out/session \\
+           --worlds /var/lib/shrine/worlds [--record host] [--address 127.0.0.1] [--base-port 8700] [--once]
+
+With --domain it also keeps the front's routes: one line a world it runs, from the world's name under the
+domain to where its door listens on this machine, in a file the web server in front (Caddy) imports. So
+every world is reached at https://<its name>.<domain>/ whatever machine it is on, an invitation is taken at
+https://<name>.<domain>/door#<link>, and an agent's door is https://<name>.<domain>/mcp. The file is written
+again only when it changes, and the web server is then told to read it.
+
+It is the one thing on a machine that starts processes. Everything else is the worlds' own.
+"""
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ASK = re.compile(r'^/tenants/([^/]+)/worlds/([^/]+)$')
+
+
+class Door:
+    def __init__(self, url, session):
+        self.url, self.session, self.count = url.rstrip('/'), session, 0
+
+    def call(self, name, **arguments):
+        self.count += 1
+        body = json.dumps(dict(jsonrpc='2.0', id=self.count, method='tools/call',
+                               params={'name': name, 'arguments': arguments})).encode()
+        request = urllib.request.Request(self.url + '/mcp', body, {
+            'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.session})
+        return json.load(urllib.request.urlopen(request, timeout=60))['result']
+
+    def said(self, name, **arguments):
+        result = self.call(name, **arguments)
+        text = ' '.join(block.get('text', '') for block in result.get('content', []))
+        return bool(result.get('isError')), text
+
+    def slots(self, path):
+        result = self.call('mcp/read', path=path, care='x')
+        body = result.get('structuredContent', result)
+        return {name.lstrip('/'): value for name, value in (body.get('properties') or {}).items()}
+
+
+def number(value):
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def listening(port):
+    with socket.socket() as probe:
+        probe.settimeout(1)
+        return probe.connect_ex(('127.0.0.1', port)) == 0
+
+
+def places(door, record):
+    """The host composition as the machine's world reads it: each place, how it stands, where it is held."""
+    refused, text = door.said('scope/seen')
+    if refused:
+        raise RuntimeError('the door did not show what this world takes part in: ' + text)
+    found, inside = {}, False
+    for line in text.splitlines():
+        if line.startswith('composition '):
+            inside = line.strip() == 'composition /' + record
+            continue
+        parts = line.split(' ')
+        if inside and len(parts) == 4:
+            found[parts[1]] = (parts[0], parts[2])
+    return found
+
+
+def start(args, name, http, mesa, founding, mounts, log):
+    home = args.worlds / name
+    mounts = mounts.strip() or args.mounts   # what a world starts with is this host's to say, where the ask leaves it out
+    home.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(ROOT / 'x/eden'), '--node', name, '--port', str(http),
+               '--world', str(home / 'world'), '--extras-root', str(ROOT / 'extras'),
+               '--address', f'{args.address}:{mesa}', '--startup-timeout', str(args.startup_timeout)]
+    if founding:
+        command += ['--founding', founding]
+    for mount in mounts.split():
+        command += ['--mount', mount]
+    process = subprocess.Popen(command, stdout=(home / 'eden.log').open('a'), stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    (home / 'host.pid').write_text(str(process.pid))
+    log(f'started {name} at {http} (launcher {process.pid})')
+
+
+def stop(args, name, log):
+    kept = args.worlds / name / 'host.pid'
+    if not kept.exists():
+        return
+    try:
+        os.killpg(int(kept.read_text().strip()), signal.SIGTERM)
+        log(f'stopped {name}')
+    except (ProcessLookupError, ValueError):
+        pass
+    kept.unlink()
+
+
+def launched(args, name):
+    """Whether the launcher this script started for a world is still alive."""
+    kept = args.worlds / name / 'host.pid'
+    if not kept.exists():
+        return False
+    try:
+        os.kill(int(kept.read_text().strip()), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+
+
+def turn(args, door, log):
+    """One reading of the records, and whatever is missing done. Returns what it did, for whoever asks."""
+    did = []
+    seen = places(door, args.record)
+    asks = {}
+    for place, (kind, held) in seen.items():
+        match = ASK.match(place)
+        if match and kind == 'held':
+            asks[place] = (match.group(1), door.slots(held))
+    placed = {}
+    for place in asks:
+        kind, held = seen.get(place + '/at', ('', ''))
+        placed[place] = door.slots(held) if kind == 'held' else None
+    taken = {number(at.get(slot)) for at in placed.values() if at for slot in ('http', 'mesa')}
+
+    def running(tenant):
+        return sum(1 for place, (owner, ask) in asks.items()
+                   if owner == tenant and number(ask.get('run')) == 1
+                   and placed[place] and number(placed[place].get('http')) > 0)
+
+    for place, (tenant, ask) in sorted(asks.items()):
+        name, at = str(ask.get('name', '')), placed[place]
+        wanted = number(ask.get('run')) == 1
+        http = number(at.get('http')) if at else 0
+        if not re.fullmatch(r'0x[0-9a-f]+', name):
+            continue
+        if not wanted:
+            if http and (launched(args, name) or listening(http)):
+                stop(args, name, log)
+                did.append('stopped ' + name)
+            continue
+        if http:
+            if not launched(args, name) and not listening(http):
+                start(args, name, http, number(at.get('mesa')), str(ask.get('founding', '')),
+                      str(ask.get('mounts', '')), log)
+                did.append('restarted ' + name)
+            continue
+        limit = number(door.slots(seen.get('/tenants/' + tenant, ('', ''))[1]).get('limit')) or args.limit
+        if running(tenant) >= limit:
+            why = 'this tenant already has as many worlds running as it may'
+            if not at or str(at.get('why', '')) != why:
+                door.said('scope/fill', composition=args.record, place=place + '/at',
+                          slots={'host': '', 'http': 0, 'mesa': 0, 'why': why})
+                did.append('refused ' + name)
+            continue
+        http = args.base_port
+        while http in taken or http + 1000 in taken or listening(http) or listening(http + 1000):
+            http += 1
+        taken.update((http, http + 1000))
+        start(args, name, http, http + 1000, str(ask.get('founding', '')), str(ask.get('mounts', '')), log)
+        refused, text = door.said('scope/fill', composition=args.record, place=place + '/at',
+                                  slots={'host': args.address, 'http': http, 'mesa': http + 1000, 'why': ''})
+        if refused:
+            raise RuntimeError(f'the machine world would not take where {name} is reached: {text}')
+        placed[place] = {'http': http, 'mesa': http + 1000}
+        did.append('started ' + name)
+    return did
+
+
+def routes(args, door, log):
+    """The front's routes for the worlds this machine runs, from the same records: written when they change."""
+    seen = places(door, args.record)
+    lines = []
+    if args.machine:
+        lines += [(name, int(args.door.rsplit(':', 1)[1].strip('/'))) for name in [args.machine, *args.also]]
+    for place, (kind, held) in sorted(seen.items()):
+        if ASK.match(place) and kind == 'held':
+            ask = door.slots(held)
+            state, where = seen.get(place + '/at', ('', ''))
+            http = number(door.slots(where).get('http')) if state == 'held' else 0
+            name = str(ask.get('name', ''))
+            if http and number(ask.get('run')) == 1 and re.fullmatch(r'0x[0-9a-f]+', name):
+                lines.append((name, http))
+    tls = '' if args.tls == 'public' else '\n\ttls ' + args.tls.replace(',', ' ')
+    starting = f'\n\thandle_errors {{\n\t\timport {args.starting}\n\t}}' if args.starting else ''
+    text = ''.join(f'{name}.{args.domain} {{{tls}\n\treverse_proxy 127.0.0.1:{http}{starting}\n}}\n' for name, http in lines)
+    if (args.routes.read_text() if args.routes.exists() else '') == text:
+        return False
+    args.routes.parent.mkdir(parents=True, exist_ok=True)
+    if text:
+        args.routes.write_text(text)
+    else:
+        args.routes.unlink()  # the web server imports every file of the folder, and an empty one stops it
+    log(f'routes: {len(lines)} world(s) under {args.domain}')
+    if args.reload:
+        subprocess.run(args.reload, shell=True, check=False)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--door', required=True, help="the machine world's own door: http://127.0.0.1:<port>")
+    parser.add_argument('--session-file', type=Path, required=True,
+                        help='the file that holds a session the machine world let in')
+    parser.add_argument('--worlds', type=Path, required=True, help='the directory the worlds live in')
+    parser.add_argument('--record', default='host', help="the name the machine world's composition goes by")
+    parser.add_argument('--address', default='127.0.0.1', help='where worlds on this machine are reached')
+    parser.add_argument('--base-port', type=int, default=8700)
+    parser.add_argument('--interval', type=float, default=5)
+    parser.add_argument('--startup-timeout', type=int, default=1800)
+    parser.add_argument('--once', action='store_true', help='one reading, then stop')
+    parser.add_argument('--domain', default='', help='serve every world this machine runs at <name>.<domain>')
+    parser.add_argument('--routes', type=Path, default=Path('/var/lib/shrine/routes/worlds.caddy'),
+                        help="the file of routes the web server in front imports")
+    parser.add_argument('--machine', default='', help="the machine world's own name, to give it a route too")
+    parser.add_argument('--mounts', default='mcp mesa scope', help='what a world starts with, where its ask does not say')
+    parser.add_argument('--limit', type=int, default=0, help="how many worlds a tenant may have running, where its seat does not say")
+    parser.add_argument('--also', action='append', default=[], metavar='NAME',
+                        help="one more name the machine world is reached under, such as the one people start from")
+    parser.add_argument('--starting', default='', metavar='SNIPPET',
+                        help="a snippet of the web server's own, answered while a world it routes to does not answer yet")
+    parser.add_argument('--tls', default='public', metavar='public|internal|CERT,KEY',
+                        help='public: the web server gets a certificate for each name; internal: it signs its own, '
+                             'for a domain not pointed here yet; CERT,KEY: the files of one certificate that covers '
+                             'every name under the domain')
+    parser.add_argument('--reload', default='', help='the command that tells the web server to read its routes')
+    args = parser.parse_args()
+    door = Door(args.door, args.session_file.read_text().strip())
+    args.worlds.mkdir(parents=True, exist_ok=True)
+
+    def log(text):
+        print(text, flush=True)
+
+    while True:
+        try:
+            for done in turn(args, door, log):
+                log('HOST ' + done)
+            if args.domain:
+                routes(args, door, log)
+        except (urllib.error.URLError, RuntimeError, OSError) as error:
+            log(f'this turn did nothing: {error}')
+            if args.once:
+                return 1
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
