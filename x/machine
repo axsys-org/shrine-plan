@@ -91,12 +91,21 @@ def main():
               '--extras-root', str(ROOT / 'extras'), '--address', f'{args.address}:{args.port + 1000}',
               '--startup-timeout', str(args.startup_timeout)] + sum((['--mount', m] for m in args.mounts.split()), [])
     launch += ['--founding', args.founding] if args.founding else []
-    running = [subprocess.Popen(launch, stdout=(args.home / 'machine' / 'eden.log').open('a'), stderr=subprocess.STDOUT, start_new_session=True)]
+    def launched():
+        return subprocess.Popen(launch, stdout=(args.home / 'machine' / 'eden.log').open('a'), stderr=subprocess.STDOUT, start_new_session=True)
+    running = [launched()]
 
     def stop(*_):
+        # The world is given time to stop before this returns: a machine started again at once would
+        # otherwise find its world still held by the one going down.
         for process in running:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
+        for process in running:
+            try:
+                process.wait(timeout=80)
+            except subprocess.TimeoutExpired:
+                pass
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -122,7 +131,13 @@ def main():
                         raise
                 until(handed, args.startup_timeout, "the machine world's door to take its link")
                 args.link_file.write_text('')
-        until(lambda: running[0].poll() is None and left.is_file() and left.stat().st_size > 0, args.startup_timeout, 'the machine world to start')
+        def up():
+            if running[0].poll() is not None:   # the launcher gave up: most often the world was still stopping
+                time.sleep(10)
+                running[0] = launched()
+                return False
+            return left.is_file() and left.stat().st_size > 0
+        until(up, args.startup_timeout, 'the machine world to start')
         session = left.read_text().strip()
         until(lambda: call(url, session, 'scope/seen')[0] is False, 600, "the machine world's door")
         seen = lambda: call(url, session, 'scope/seen')[1]
@@ -166,7 +181,9 @@ def main():
             until(lambda: mine() is not None, 900, "this machine's seat in a fleet")
             fleet, seat = mine()
             door = {'name': args.node, 'host': args.address, 'http': args.port}
-            if f'held {seat}/worlds/own ' not in seen():
+            own = next((line.split(' ')[2] for line in seen().splitlines() if line.startswith(f'held {seat}/worlds/own ')), '')
+            said_so = (call(url, session, 'mcp/read', path=own, care='x')[2].get('properties') or {}) if own else {}
+            if any(str(said_so.get('/' + slot, '')) != str(value) for slot, value in door.items()):
                 refused, said, _ = call(url, session, 'scope/fill', composition=fleet, place=seat + '/worlds/own', slots=door)
                 if refused:
                     raise RuntimeError('the machine world would not say where its own door is: ' + said)
