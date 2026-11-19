@@ -1,0 +1,124 @@
+;;;; The Mesa bridge as the kernel uses it. This is the only file that names a
+;;;; bridge call (enki pkg/mesa/API.md). Every call takes a row of handles and a
+;;;; data row and answers [status data handles]. A handle is a live capability:
+;;;; it is passed along and never forced, saved or sent.
+;;;;
+;;;; Bytes are bars: the bytes followed by a 0x01 terminator, as a nat.
+(#bind std (#module std))
+(#import std)
+(#bind bplan (#module bplan))
+(#import bplan)
+(#bind reef (#module reef))
+(#import reef)
+
+(define (call name handles data) (S (name handles data)))
+
+(define (bar bytes n) (Add bytes (Lsh 1 (Mul 8 n))))
+(define (bar-len b) (Dec (Bytes b)))
+(define (bar-nat b) (Sub b (Lsh 1 (Mul 8 (bar-len b)))))
+
+(define (ok reply)
+  (If (Ix 0 reply) (error ["mesa" (Ix 1 reply)]) reply))
+(define (made reply) (Ix 0 (Ix 2 (ok reply))))
+(define (told reply) (Ix 1 (ok reply)))
+
+;; This file decides nothing. The domain, the life and rift an engine is told,
+;; its bounds and retry policy, and the names of pages are the caller's
+;; (src/foil/mesa_foot.foil); what is here is the bridge's own shape.
+
+;; realm is [domain life rift]: what the engine is told of every world.
+(define (peer realm id key-id)
+  (made (call "MesaPeer" 0 [id (Ix 0 realm) (Ix 1 realm) (Ix 2 realm) key-id 1])))
+
+;; A config from Mesa's defaults with the caller's numbers in their places.
+;; core_config is [wire_limits bloq max_peers max_bindings max_binding_bytes
+;; max_read_bytes max_reassembly_bytes max_unverified_bytes max_reads
+;; max_fragments window retry_after read_timeout max_attempts] (API.md).
+;; limits is the wire's [max_packet max_path max_fragment]; bounds is
+;; [max_bindings max_binding_bytes max_reassembly_bytes max_reads retry_after
+;; read_timeout max_attempts].
+(define (config limits bounds)
+  (#let ((base (made (call "MesaConfig" 0 0))))
+    (#let ((fields (told (call "MesaConfigFields" [base] 0))))
+      (made (call "MesaConfig" 0
+              (Up 13 (Ix 6 bounds) (Up 12 (Ix 5 bounds) (Up 11 (Ix 4 bounds)
+                (Up 8 (Ix 3 bounds) (Up 6 (Ix 2 bounds)
+                  (Up 4 (Ix 1 bounds) (Up 3 (Ix 0 bounds)
+                    (Up 0 limits fields)))))))))))))
+
+;; An engine for one world: its signing seed, and each peer as [id key-bytes].
+;; The bridge takes the keys as one table, the world's own first, so peers
+;; have key ids and attachments 1, 2, ... in the order given. The table is
+;; fixed for the engine's life.
+(define (engine self seed realm limits bounds others)
+  (#let ((keypair (made (call "MesaKeyFromSeed" 0 [seed]))))
+    (#let ((publics (map (lambda (other) (made (call "MesaPublicKey" 0 [(Ix 1 other)]))) others)))
+      (#let ((protection
+               (made (call "MesaProtection" (Weld [keypair] publics)
+                       [0 (gen (Sz others) (lambda (i) (Inc i)))]))))
+        (#let ((made-engine
+                 (made (call "MesaEngine" [(config limits bounds) (peer realm self 0) protection] 0))))
+          (Seq
+            (foldl (lambda (count other)
+                     (Seq (ok (call "MesaEngineInstallPeer"
+                                [made-engine (peer realm (Ix 0 other) (Inc count))] 0))
+                       (Seq (ok (call "MesaEngineSetAttachment" [made-engine]
+                                  [(Ix 0 other) [(Inc count)]]))
+                         (Inc count))))
+                   0 others)
+            made-engine))))))
+
+;; What an engine asks of its host, as plain rows:
+;;   [1 peer attachment packet]   send these bytes
+;;   [2 request status bytes]     a read finished (status 0: the page)
+;;   [3 0 0 text]                 something was dropped
+;;   [4 0 0 0]                    anything else (timers are driven by advance)
+;;   [5 0 0 text]                 the engine refused the call itself
+(define send-tag (bar "Send" 4))
+(define finished-tag (bar "ReadFinished" 12))
+(define dropped-tag (bar "Dropped" 7))
+(define (action raw)
+  (#let ((tag (Ix 0 raw)))
+    (If (Eq tag send-tag) [1 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
+      (If (Eq tag finished-tag) [2 (Ix 1 raw) (Ix 2 raw) (Ix 3 raw)]
+        (If (Eq tag dropped-tag) [3 0 0 (Ix 1 raw)]
+          [4 0 0 0])))))
+(define (drain-from actions out)
+  (#let ((next (Ix 1 (call "MesaActionsNext" actions 0))))
+    (If (IsNat next) out
+      (drain-from actions (Weld out [(action next)])))))
+(define (step name made-engine data)
+  (#let ((reply (call name [made-engine] data)))
+    (If (Ix 0 reply) [[5 0 0 (Ix 1 reply)]]
+      (drain-from (Ix 2 reply) []))))
+
+(define (read made-engine request peer-id path)
+  (step "MesaEngineRead" made-engine [request peer-id path]))
+(define (bind made-engine path bytes)
+  (step "MesaEngineBind" made-engine [path bytes 0]))
+(define (receive made-engine from attachment bytes)
+  (step "MesaEngineReceive" made-engine [from attachment bytes]))
+(define (advance made-engine tick)
+  (step "MesaEngineAdvanceTo" made-engine [tick]))
+
+;; What a packet is, before the engine sees it: [kind path other data who].
+;; Kind 0 is an ask for the page at path; 2 is a hint, whose two names are
+;; what the sender holds of ours (path) and what it offers (other), with the
+;; publisher the offered name is under (who); 9 is not a packet.
+(define (look bytes limits)
+  (#let ((decoded (call "MesaWireDecode" 0 [bytes limits])))
+    (If (Ix 0 decoded) [9 0 0 0 0]
+      (#let ((body (Ix 1 (Ix 1 (call "MesaPacketFields" (Ix 2 decoded) 0)))))
+        (#let ((kind (Ix 0 body)))
+          [kind (Ix 5 (Ix 1 body)) (If (Eq kind 2) (Ix 5 (Ix 2 body)) 0)
+           (If (Eq kind 2) (Ix 2 (Ix 3 body)) 0)
+           (If (Eq kind 2) (Ix 0 (Ix 2 body)) 0)])))))
+
+;; A hint, as the bridge shapes one: two names and a few bytes. What the names
+;; and the bytes mean is the caller's.
+(define (name-of domain publisher path) [publisher domain 0 13 [0 0] path])
+(define (hint domain me them held offered data limits)
+  (#let ((carried [(bar-len data) [0 (bar 0 0)] data]))
+    (#let ((packet (made (call "MesaPacket" 0
+                           [0 [2 (name-of domain them held) (name-of domain me offered) carried] limits]))))
+      (told (call "MesaWireEncode" [packet] 0)))))

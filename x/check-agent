@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""A composition made, joined and worked by an agent, through the agent door alone: three world processes.
+
+0x62 keeps a course, made from the course template. The agent's world is already its own: it was prepared
+for a place a house (0x61) keeps and claimed, so it is founded under its own name, as any world a host
+starts is. Everything
+here is done with the tools the agent door lists, under each world's own session: the course is made from
+its pack, its table and the slots of each row are read, the link to the chair's seat is given, the second
+world takes the seat as itself, sees the course as it stands for it, and sets an assignment. Nothing is
+written through any other route. A place that is not the caller's, a record of the wrong shape, and a call
+with no session are each refused.
+
+No tool here knows what a course is: the same six would drive any pack.
+
+    x/check-agent [--keep] [--base-port 8431]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, number_of, prepared, until  # noqa: E402
+
+
+def call(world, tool, session=True, **arguments):
+    """One tool of the agent door. Returns (refused, text): the tool's own verdict and what it said."""
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call',
+                           params={'name': tool, 'arguments': arguments})).encode()
+    headers = {'Content-Type': 'application/json'}
+    if session:
+        headers['Authorization'] = 'Bearer ' + world.session
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, headers)
+    try:
+        result = json.load(urllib.request.urlopen(request, timeout=60))['result']
+    except urllib.error.HTTPError as error:
+        return True, f'HTTP {error.code}'
+    text = ' '.join(block.get('text', '') for block in result.get('content', []))
+    return bool(result.get('isError')), text
+
+
+def listed(world):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/list')).encode()
+    headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + world.session}
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, headers)
+    return [tool['name'] for tool in json.load(urllib.request.urlopen(request, timeout=60))['result']['tools']]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8431)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-agent-'))
+    mounts = ('mcp', 'mesa', 'scope', 'codecs', 'course')
+    house = World('0x61', args.base_port, args.base_port + 1000, base / 'house')
+    maker = World('0x62', args.base_port + 1, args.base_port + 1001, base / 'maker', mounts=mounts)
+    worlds = [house, maker]
+    rows = []
+    place = '/0x61/app/home/rooms/agent'
+    seat = '/0x62/app/course/chair'
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:700]), flush=True)
+
+    try:
+        house.start(args.timeout)
+        maker.start(args.timeout)
+        house.write(dict(path='/0x61/io/scope/home',
+                         slots={'root': dict(type='reference', path='/0x61/app/home', care='x', case=0)}),
+                    dict(path=place, slots={'title': 'A room for an agent', 'invite': 1}))
+        agent = prepared(house, place, 1, args.base_port + 2, args.base_port + 1002, base / 'agent', args.timeout,
+                         mounts=mounts)
+        worlds.append(agent)
+        tools = listed(agent)
+        row('the agent door lists what an agent can do with a composition, beside reading and writing records',
+            all('scope/' + verb in tools for verb in ('seen', 'shape', 'fill', 'make', 'link', 'join')), tools)
+        row('and tells nobody: a call that shows no session is refused',
+            call(agent, 'scope/seen', session=False) == (True, 'HTTP 401'), call(agent, 'scope/seen', session=False))
+
+        made = call(maker, 'scope/make', pack='course', name='course')
+        row('a composition is made from a pack by one call that names the pack', not made[0], made)
+        row('and is then seen, as it stands for the world that made it',
+            until(lambda: 'composition /course' in call(maker, 'scope/seen')[1]
+                  and 'held /chair ' in call(maker, 'scope/seen')[1], 300), call(maker, 'scope/seen'))
+        shape = call(maker, 'scope/shape', composition='course')
+        line = [text for text in shape[1].splitlines() if text.startswith('row /assignments/[a] |')]
+        row("its table is read a line a row: who writes, who reads, and the slots a record there may hold",
+            not shape[0] and len(line) == 1 and '| by chair |' in line[0] and line[0].rstrip().endswith('slots title due'),
+            shape)
+        row('a pack this world does not hold makes nothing', call(maker, 'scope/make', pack='nothing', name='x')[0],
+            call(maker, 'scope/make', pack='nothing', name='x'))
+
+        until(lambda: maker.number(seat, 'name') > 0, 300)
+        link = (True, '')
+        deadline = time.time() + 180
+        while time.time() < deadline and len(link[1].split(',')) != 12:
+            link = call(maker, 'scope/link', invitation=1)
+            time.sleep(2)
+        row("the link to the chair's seat is given to its owner by a call", not link[0] and len(link[1].split(',')) == 12,
+            [link[0], link[1].split(',')[:7]])
+
+        took = call(agent, 'scope/join', link=link[1])
+        row('a world that is already its own takes the seat by handing the link to its own agent door', not took[0], took)
+        row('and fills it as itself', until(lambda: maker.number(seat, 'world') == number_of(agent.node), 400),
+            maker.read(seat))
+        row('the agent then sees the course as it stands for the chair',
+            until(lambda: 'held /chair ' in call(agent, 'scope/seen')[1]
+                  and 'held /seats/first ' in call(agent, 'scope/seen')[1], 400), call(agent, 'scope/seen'))
+        name, current = '', ''
+        for text in call(agent, 'scope/seen')[1].splitlines():
+            if text.startswith('composition /'):
+                current = text.split('/')[1]
+            elif text.startswith('held /chair '):
+                name = current
+
+        wrote = call(agent, 'scope/fill', composition=name, place='/assignments/essay',
+                     slots={'title': 'An essay', 'due': 10})
+        row('it sets an assignment: a record written at a place that is the chair\'s to write', not wrote[0], wrote)
+        row('which then stands in its reading',
+            until(lambda: 'held /assignments/essay ' in call(agent, 'scope/seen')[1], 120), call(agent, 'scope/seen'))
+        theirs = call(agent, 'scope/fill', composition=name, place='/seats/third', slots={'title': 'A seat'})
+        row('a place that is another world\'s to write is refused, and says so',
+            theirs[0] and "not this world's to write" in theirs[1], theirs)
+        bad = call(agent, 'scope/fill', composition=name, place='/assignments/second', slots={'title': 'No date'})
+        row('a record that has not the shape its row gives is refused, and says so',
+            bad[0] and 'shape' in bad[1], bad)
+        row('and neither left anything behind',
+            '/assignments/second' not in call(agent, 'scope/seen')[1]
+            and '/seats/third' not in call(agent, 'scope/seen')[1],
+            call(agent, 'scope/seen'))
+        row('the maker, who does not read assignments, was sent none of it',
+            'essay' not in call(maker, 'scope/seen')[1], call(maker, 'scope/seen'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for world in worlds:
+            world.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

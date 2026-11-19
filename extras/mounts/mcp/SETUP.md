@@ -25,6 +25,11 @@ Run one world at a time on a machine. A world is a process that holds its
 namespace in memory: a loaded one takes a gigabyte or more, and two at once
 have crashed a laptop.
 
+For document-local agent runs, add `--mount cooperate`. It uses these same four
+MCP tools for captured context, branching traces and reusable cell results.
+See the [harness interface and client](../cooperate/README.md); add `--mount nenex`
+when the documents are wiki pages.
+
 ## 2. Connect your tool
 
 The MCP endpoint is `http://127.0.0.1:8300/mcp`, local only, no credential.

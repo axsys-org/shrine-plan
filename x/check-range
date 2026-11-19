@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Three plain templates on one keeper, to show what kind of system a template makes: three world processes.
+
+0x61 keeps three compositions, each made from a pack by one call: a forum (one world keeps the
+conversation), a circle (each member keeps their own part) and an accord (an agreement of two). Two worlds
+take part in all three. They are prepared for the forum's two seats and claimed; for the circle and the
+accord each brings itself, by handing the link to its own agent door. Everything after the worlds start is
+done with the tools the agent door lists.
+
+The forum: a member hands a message in; only the keeper reads it; the keeper's own hand accepts it into the
+conversation under the next number; every member reads the conversation in the keeper's order; nobody but
+the keeper can write it.
+
+The circle: a member writes its own message and the other reads it; the keeper is sent none of it; nothing
+orders one member's messages against the other's.
+
+The accord: the keeper writes the terms; each party writes its own yes, naming the version of the terms it
+read; both hold the other's yes under the other's signature; the accord holds while both name the version
+the terms stand at, and stops holding when the terms change.
+
+The same kernel, the same Mesa and the same six tools drive all three. What differs is two lines of each
+template: who writes a position and who reads it.
+
+    x/check-range [--keep] [--base-port 8401]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, number_of, prepared, spell, until  # noqa: E402
+
+
+def call(world, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call',
+                           params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + world.session})
+    try:
+        result = json.load(urllib.request.urlopen(request, timeout=120))['result']
+    except urllib.error.HTTPError as error:
+        return True, f'HTTP {error.code}'
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', []))
+
+
+def seen(world):
+    """What a world takes part in: {composition name: {place: (kind, where held, by)}}."""
+    found, current = {}, None
+    for line in call(world, 'scope/seen')[1].splitlines():
+        if line.startswith('composition /'):
+            current = found.setdefault(line.split('/')[1], {})
+        elif current is not None and len(line.split(' ')) == 4:
+            kind, place, held, by = line.split(' ')
+            current[place] = (kind, held, by)
+    return found
+
+
+def named(world, place):
+    """The name a world knows the composition by that shows this place."""
+    for name, places in seen(world).items():
+        if place in places:
+            return name
+    return ''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8401)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-range-'))
+    mounts = ('mcp', 'mesa', 'scope', 'codecs', 'forum', 'circle', 'accord')
+    keeper = World('0x61', args.base_port, args.base_port + 1000, base / 'keeper', mounts=mounts)
+    worlds = [keeper]
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:4000]), flush=True)
+
+    def link(invite):
+        deadline, said = time.time() + 240, (True, '')
+        while time.time() < deadline and len(said[1].split(',')) != 12:
+            said = call(keeper, 'scope/link', invitation=invite)
+            time.sleep(2)
+        return said[1]
+
+    def bring(world, seat):
+        if not until(lambda: keeper.number(seat, 'name') > 0, 300):
+            raise RuntimeError(f'no name was minted for {seat}: {keeper.read(seat)}')
+        took = call(world, 'scope/join', link=link(keeper.number(seat, 'invite')))
+        if took[0]:
+            raise RuntimeError(f'{world.node} did not take the link to {seat}: {took}')
+        if not until(lambda: keeper.number(seat, 'world') == number_of(world.node), 600):
+            name = keeper.number(seat, 'name')
+            raise RuntimeError(f'{seat} was not filled by {world.node}: the seat {keeper.slots(seat)}; the keeper\'s card '
+                               f'for the world {keeper.slots("/0x61/io/mesa/" + world.node)}; its card for the name '
+                               f'{keeper.slots("/0x61/io/mesa/" + spell(name))}; the world\'s card for the keeper '
+                               f'{world.slots("/" + world.node + "/io/mesa/0x61")}; its joining '
+                               f'{world.slots("/" + world.node + "/io/scope/" + spell(name))}')
+
+    try:
+        keeper.start(args.timeout)
+        made = [call(keeper, 'scope/make', pack=pack, name=pack) for pack in ('forum', 'circle', 'accord')]
+        row('one world makes three compositions, each from a pack by one call', not any(m[0] for m in made)
+            and until(lambda: {'forum', 'circle', 'accord'} <= set(seen(keeper)), 400), [made, seen(keeper)])
+        seats = [f'/0x61/app/{pack}/{kind}/{which}' for pack, kind in (('forum', 'members'), ('circle', 'members'),
+                 ('accord', 'parties')) for which in ('first', 'second')]
+        row('each pack numbers its invitations from 1; kept by one world, no two seats share a number',
+            until(lambda: all(keeper.number(seat, 'name') > 0 for seat in seats), 600)
+            and len({keeper.number(seat, 'invite') for seat in seats}) == 6
+            and len({keeper.number(seat, 'name') for seat in seats}) == 6,
+            [(seat, keeper.number(seat, 'invite')) for seat in seats])
+        first = prepared(keeper, seats[0], keeper.number(seats[0], 'invite'), args.base_port + 1,
+                         args.base_port + 1001, base / 'first', args.timeout, mounts=mounts)
+        worlds.append(first)
+        second = prepared(keeper, seats[1], keeper.number(seats[1], 'invite'), args.base_port + 2,
+                          args.base_port + 1002, base / 'second', args.timeout, mounts=mounts)
+        worlds.append(second)
+        row('two worlds are prepared for the forum and claimed',
+            keeper.number('/0x61/app/forum/members/second', 'world') == number_of(second.node), '')
+
+        # ---- the forum: one world keeps the conversation
+        until(lambda: named(first, '/members/first') and named(second, '/members/second'), 400)
+        forum = (named(first, '/members/first'), named(second, '/members/second'))
+        said = call(first, 'scope/fill', composition=forum[0], place='/members/first/said/a', slots={'said': 'hello'})
+        row('forum: a member hands a message in', not said[0], said)
+        row("the keeper's own hand accepts it into the conversation, under the first number",
+            until(lambda: keeper.text('/0x61/app/forum/messages/1', 'said') == 'hello'
+                  and keeper.text('/0x61/app/forum/messages/1', 'from') == '/first', 300),
+            keeper.read('/0x61/app/forum/messages/1'))
+        call(second, 'scope/fill', composition=forum[1], place='/members/second/said/a', slots={'said': 'hello back'})
+        call(first, 'scope/fill', composition=forum[0], place='/members/first/said/b', slots={'said': 'and again'})
+        row('every message has a place in one order, the keeper\'s, and none is accepted twice',
+            until(lambda: keeper.there('/0x61/app/forum/messages/3'), 300)
+            and not keeper.there('/0x61/app/forum/messages/4')
+            and sorted(keeper.text(f'/0x61/app/forum/messages/{n}', 'said') for n in (1, 2, 3))
+            == ['and again', 'hello', 'hello back'],
+            [keeper.read(f'/0x61/app/forum/messages/{n}') for n in (1, 2, 3)])
+        row('both members read the same conversation in the same order',
+            until(lambda: all(seen(w).get(f, {}).get(f'/messages/{n}', ('',))[0] == 'held'
+                              for w, f in ((first, forum[0]), (second, forum[1])) for n in (1, 2, 3)), 400),
+            [seen(first).get(forum[0]), seen(second).get(forum[1])])
+        row('what a member handed in is not sent to the other member: only the keeper reads it',
+            '/members/first/said/a' not in seen(second).get(forum[1], {}), seen(second).get(forum[1]))
+        theirs = call(first, 'scope/fill', composition=forum[0], place='/messages/9',
+                      slots={'said': 'mine', 'from': '/first', 'at': '/z'})
+        row('nobody but the keeper can write the conversation', theirs[0] and "not this world's" in theirs[1], theirs)
+
+        # ---- the circle: each member keeps their own part
+        bring(first, '/0x61/app/circle/members/first')
+        bring(second, '/0x61/app/circle/members/second')
+        until(lambda: named(first, '/members/first/messages') or True, 5)
+        circle = lambda w, seat: next((n for n, p in seen(w).items() if seat in p and '/messages/1' not in p
+                                       and '/terms' not in p and n not in forum), '')
+        until(lambda: circle(first, '/members/first') and circle(second, '/members/second'), 400)
+        ring = (circle(first, '/members/first'), circle(second, '/members/second'))
+        wrote = call(first, 'scope/fill', composition=ring[0], place='/members/first/messages/a', slots={'said': 'round'})
+        row('circle: the same two worlds take seats in a second composition as themselves, and one writes its '
+            'own message', not wrote[0], [ring, wrote])
+        row('the other member reads it, from the member that wrote it',
+            until(lambda: seen(second).get(ring[1], {}).get('/members/first/messages/a', ('', '', ''))[0] == 'held'
+                  and seen(second)[ring[1]]['/members/first/messages/a'][2] == first.node, 400),
+            seen(second).get(ring[1]))
+        call(second, 'scope/fill', composition=ring[1], place='/members/second/messages/a', slots={'said': 'robin'})
+        row('each member holds its own messages and the other\'s; the keeper, who reads none, was sent none',
+            until(lambda: seen(first).get(ring[0], {}).get('/members/second/messages/a', ('',))[0] == 'held', 400)
+            and not any('/messages/' in place for place in seen(keeper).get('circle', {})),
+            [seen(first).get(ring[0]), seen(keeper).get('circle')])
+        other = call(second, 'scope/fill', composition=ring[1], place='/members/first/messages/b', slots={'said': 'no'})
+        row("a member cannot write another member's messages", other[0] and "not this world's" in other[1], other)
+
+        # ---- the accord: an agreement of two
+        bring(first, '/0x61/app/accord/parties/first')
+        bring(second, '/0x61/app/accord/parties/second')
+        terms = call(keeper, 'scope/fill', composition='accord', place='/terms', slots={'words': 'Ten, on Friday'})
+        deal = lambda w: next((n for n, p in seen(w).items() if '/terms' in p), '')
+        row('accord: the keeper writes the terms and both parties hold them', not terms[0]
+            and until(lambda: all(seen(w).get(deal(w), {}).get('/terms', ('',))[0] == 'held' for w in (first, second)),
+                      400), [terms, seen(first)])
+
+        def version(world):
+            """The version of the terms as this world holds them: its publisher's own number for them."""
+            held = seen(world)[deal(world)]['/terms'][1]
+            return int(world.read(held).get('version', 0))
+
+        mine = int(keeper.read('/0x61/app/accord/terms')['reference'].split('/')[3])
+        row('both parties hold the terms at the same version, the keeper\'s own number for them',
+            version(first) == version(second) == mine and mine > 0, [version(first), version(second), mine])
+        for world, seat in ((first, 'first'), (second, 'second')):
+            call(world, 'scope/fill', composition=deal(world), place='/terms/yes/' + seat,
+                 slots={'word': 'yes', 'at': version(world)})
+
+        def holds(world):
+            places = seen(world).get(deal(world), {})
+            said = [world.slots(places[p][1]) for p in ('/terms/yes/first', '/terms/yes/second')
+                    if places.get(p, ('',))[0] == 'held']
+            return len(said) == 2 and all(int(s.get('at', 0)) == version(world) for s in said)
+
+        row('each party writes its own yes, naming that version; each holds the other\'s, from the other',
+            until(lambda: holds(first) and holds(second), 400)
+            and seen(first)[deal(first)]['/terms/yes/second'][2] == second.node
+            and seen(second)[deal(second)]['/terms/yes/first'][2] == first.node, [seen(first), seen(second)])
+        forged = call(first, 'scope/fill', composition=deal(first), place='/terms/yes/second',
+                      slots={'word': 'yes', 'at': version(first)})
+        row('neither can write the other\'s yes', forged[0] and "not this world's" in forged[1], forged)
+        call(keeper, 'scope/fill', composition='accord', place='/terms', slots={'words': 'Twelve, on Friday'})
+        row('the terms change: they are a new version, and the two yeses, which name the old one, no longer '
+            'make an accord', until(lambda: version(first) > mine and not holds(first) and not holds(second), 400),
+            [version(first), mine, seen(first).get(deal(first))])
+        call(first, 'scope/fill', composition=deal(first), place='/terms/yes/first',
+             slots={'word': 'yes', 'at': version(first)})
+        row('one party says yes again: still no accord, until the other does',
+            until(lambda: int(second.slots(seen(second)[deal(second)]['/terms/yes/first'][1]).get('at', 0))
+                  == version(second), 400) and not holds(second), seen(second).get(deal(second)))
+        call(second, 'scope/fill', composition=deal(second), place='/terms/yes/second',
+             slots={'word': 'yes', 'at': version(second)})
+        row('and then it holds again, for both', until(lambda: holds(first) and holds(second), 400),
+            [seen(first).get(deal(first)), seen(second).get(deal(second))])
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for world in worlds:
+            world.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

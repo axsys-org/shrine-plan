@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""An invitation whose world is already running when it is taken: a machine world, its supervisor, and
+the worlds it starts.
+
+0x61 is a machine's own world. It keeps a host (the host pack) and is its own tenant. It also keeps a
+course, made from the course pack. It asks for worlds where it fills a tenant's seat, which is here. The
+course's chair and first seat each hold an invitation. Their names are minted with nothing asked of
+anyone, and the host pack's foot asks the host to run the world prepared for each. x/host, run one turn at
+a time, starts them under their foundings. Nothing in this script starts a world but the machine's own.
+
+Each link is then handed over at the door of the world that is already running for it, where the host's
+answer says it is reached, and that world claims itself and fills its seat. The chair sets an assignment
+through its agent door and it reaches the seat. So the whole of joining, from a pack to a working seat,
+is the worlds' own and the supervisor's, and "the host is played by this script" is gone.
+
+    x/check-hosted [--keep] [--base-port 8411]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import os
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, number_of, spell, until  # noqa: E402
+
+
+def call(world, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call',
+                           params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + world.session})
+    try:
+        result = json.load(urllib.request.urlopen(request, timeout=120))['result']
+    except urllib.error.HTTPError as error:
+        return True, f'HTTP {error.code}'
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', []))
+
+
+def answers(port):
+    try:
+        urllib.request.urlopen(f'http://127.0.0.1:{port}/mcp', b'{}', timeout=5)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8411)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-hosted-'))
+    mounts = ('mcp', 'mesa', 'scope', 'codecs', 'host', 'course')
+    machine = World('0x61', args.base_port, args.base_port + 1000, base / 'machine', mounts=mounts)
+    worlds = base / 'worlds'
+    first = args.base_port + 1
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:700]), flush=True)
+
+    def turn():
+        done = subprocess.run(
+            [sys.executable, str(ROOT / 'x/host'), '--door', f'http://127.0.0.1:{machine.http}',
+             '--session-file', str(machine.files() / 'io' / 'mesa' / 'out' / 'session'), '--worlds', str(worlds),
+             '--base-port', str(first), '--startup-timeout', str(args.timeout), '--mounts', ' '.join(mounts), '--once'],
+            capture_output=True, text=True, timeout=300)
+        return done.stdout + done.stderr
+
+    def link(invite):
+        deadline, said = time.time() + 240, (True, '')
+        while time.time() < deadline and len(said[1].split(',')) != 12:
+            said = call(machine, 'scope/link', invitation=invite)
+            time.sleep(2)
+        return said[1]
+
+    def taken(seat, invite):
+        """The world running for a seat is handed the seat's link at its own door, by nobody."""
+        name = machine.number(seat, 'name')
+        at = machine.slots(f'/0x61/app/host/tenants/own/worlds/n{name}/at')
+        port = int(at.get('http', 0))
+        world = World(spell(name), port, int(at.get('mesa', 0)), worlds / spell(name), mounts=mounts[:3] + mounts[3:])
+        if not until(lambda: answers(port), args.timeout):
+            raise RuntimeError(f'the world for {seat} never answered at {port}: {at}')
+        world.session = secrets.token_hex(16)
+        said = world.join(link(invite), session=world.session)
+        if said[0] != 202:
+            raise RuntimeError(f'the door of {world.node} did not take the link: {said}')
+        if not until(lambda: machine.number(seat, 'world') == name, 600):
+            raise RuntimeError(f'{seat} was not filled: {machine.read(seat)}')
+        return world
+
+    try:
+        machine.start(args.timeout)
+        call(machine, 'scope/make', pack='host', name='host')
+        until(lambda: 'held / ' in call(machine, 'scope/seen')[1], 300)
+        seated = call(machine, 'scope/fill', composition='host', place='/tenants/own',
+                      slots={'title': 'This machine', 'limit': 4, 'world': number_of('0x61')})
+        row('a machine world keeps a host and is its own tenant: it fills a seat there, and so asks itself for worlds', not seated[0]
+            and until(lambda: 'held /tenants/own ' in call(machine, 'scope/seen')[1], 120), seated)
+
+        made = call(machine, 'scope/make', pack='course', name='course')
+        chair, seat = '/0x61/app/course/chair', '/0x61/app/course/seats/first'
+        row('it makes a course from the course pack: the chair and the first seat take their names', not made[0]
+            and until(lambda: machine.number(chair, 'name') > 0 and machine.number(seat, 'name') > 0, 400),
+            [made, machine.read(chair)])
+        names = (machine.number(chair, 'name'), machine.number(seat, 'name'))
+        asked = '/0x61/app/host/tenants/own/worlds/n'
+        row("the host pack's foot asks the host to run the world prepared for each, with nothing asked of anyone",
+            until(lambda: all(machine.text(asked + str(n), 'name') == spell(n) for n in names), 180),
+            call(machine, 'scope/seen'))
+        row('each ask carries the founding its world starts under, and no secret',
+            all(len(machine.text(asked + str(n), 'founding').split(',')) == 4 for n in names),
+            machine.read(asked + str(names[0])))
+        said = turn()
+        row('the supervisor starts both, under their names',
+            all('HOST started ' + spell(n) in said for n in names), said)
+        row('a seat nobody is invited to has no world: nothing was asked for it',
+            'worlds/n' not in ''.join(line for line in call(machine, 'scope/seen')[1].splitlines()
+                                      if 'second' in line), call(machine, 'scope/seen'))
+
+        teacher = taken(chair, 1)
+        row("the chair's link is handed over at the door of the world already running for it: it claims itself and "
+            'fills the chair', machine.number(chair, 'world') == names[0], machine.read(chair))
+        student = taken(seat, 2)
+        row('and the same for the first seat', machine.number(seat, 'world') == names[1], machine.read(seat))
+        row('a turn after both joined starts nothing', 'HOST' not in turn(), turn())
+
+        until(lambda: 'held /chair ' in call(teacher, 'scope/seen')[1], 400)
+        seen = call(teacher, 'scope/seen')[1]
+        named, current = '', ''
+        for text in seen.splitlines():
+            if text.startswith('composition /'):
+                current = text.split('/')[1]
+            elif text.startswith('held /chair '):
+                named = current
+        wrote = call(teacher, 'scope/fill', composition=named, place='/assignments/essay',
+                     slots={'title': 'An essay', 'due': 10})
+        row('the chair sets an assignment through its agent door', not wrote[0], [wrote, seen])
+        row('and it reaches the seat, in a world the machine started',
+            until(lambda: 'held /assignments/essay ' in call(student, 'scope/seen')[1], 400),
+            call(student, 'scope/seen'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for kept in worlds.glob('*/host.pid'):
+            try:
+                os.killpg(int(kept.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        machine.stop()
+        time.sleep(5)
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

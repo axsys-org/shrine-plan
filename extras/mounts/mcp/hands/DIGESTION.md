@@ -1,5 +1,11 @@
 # Digestion: prose becomes the namespace, progressively
 
+> **Changed 2026-11-18.** A reference is a value in a slot, in the overlay as in the index. A path in brackets
+> inside prose is no longer a reference: nothing scans text (`reference_index.foil`). Where this document says a
+> name is written into the prose as its path in brackets, read: the text's record holds a reference to the thing
+> in a slot beside its prose. The reason is the network: what a world publishes and asks is derived from the
+> index, so a path in pasted or received text must not be able to make a link.
+
 One shape. A thing is a record at a path. Everything said about it is a record beneath it with one slot (a
 reference or a value), the sentence that says it, in the source's words, and the source. A text is a record too:
 its prose is a note, and a reference inside the prose is the path in brackets. Nothing else. The kernel reads that shape as it reads everything: a slot is a folder, a

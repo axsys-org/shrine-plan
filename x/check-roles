@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""A course between three world processes, driven by nothing but its table.
+
+0x61 keeps the course. 0x62 fills its chair and 0x63 its first seat; the second seat is empty. Each world has
+the mcp, mesa and scope mounts. The course's table is seven records the maker writes: for each position, who
+writes it and who reads it. A position is a seat because some row names it as a writer or a reader. Each world's foot at /io/scope is told, by one record, which composition it
+takes part in and where it keeps its own side; from then on it writes into the other worlds' roots exactly
+what the table says. Nothing in the kernel, the feet or this script says what an assignment, a submission or
+a mark is, or who may see one.
+
+It checks that the table and the seats reach whoever sits; that the chair's assignment reaches the seat and
+is not sent to the maker; that the seat's work reaches the chair and nobody else; that the mark reaches that
+seat; and that what a world writes where the table gives it no place is sent to nobody.
+
+Joining is played by this script: it writes each world a card for the others and fills the seats by hand.
+x/check-community covers an invitation claimed across processes. Who is believed, what there is to do and
+who is waited on are checked by the kernel suite (tests/weave), since nothing yet draws them through a door.
+
+    x/check-roles [--keep] [--base-port 8471]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, meet, number_of, until  # noqa: E402
+
+TABLE = [
+    # path, by, for
+    ('table/[n]', 'maker', 'chair seats/[any]'),
+    ('', 'maker', 'chair seats/[any]'),
+    ('chair', 'maker', 'chair seats/[any]'),
+    ('seats/[s]', 'maker', 'chair seats/[any]'),
+    ('assignments/[a]', 'chair', 'seats/[any]'),
+    ('assignments/[a]/work/[s]', 'seats/[s]', 'chair'),
+    ('assignments/[a]/work/[s]/mark', 'chair', 'seats/[s]'),
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8471)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-roles-'))
+    maker = World('0x61', args.base_port, args.base_port + 1000, base / 'maker')
+    chair = World('0x62', args.base_port + 1, args.base_port + 1001, base / 'chair')
+    seat = World('0x63', args.base_port + 2, args.base_port + 1002, base / 'seat')
+    worlds = [maker, chair, seat]
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:600]), flush=True)
+
+    def sits(world, side):
+        """One record tells a world's foot the composition it takes part in and where its side is."""
+        world.write(dict(path='/' + world.node + '/io/scope/course',
+                         slots={'maker': number_of('0x61'), 'rel': '/app/course',
+                                'side': dict(type='reference', path=side, care='x', case=0)}))
+
+    def held(world, writer, rel):
+        """Where a world holds what another wrote of the course."""
+        return '/' + world.node + '/her/' + writer.node + '/0x61/app/course' + rel
+
+    try:
+        for world in worlds:
+            world.start(args.timeout)
+        meet(worlds)
+        course = '/0x61/app/course'
+        records = [dict(path=course, slots={'title': 'CS396'}),
+                   dict(path=course + '/chair', slots={'world': number_of('0x62')}),
+                   dict(path=course + '/seats/1', slots={'world': number_of('0x63')}),
+                   dict(path=course + '/seats/2', slots={'lede': 'a seat nobody fills yet'})]
+        for n, (where, by, readers) in enumerate(TABLE, 1):
+            records.append(dict(path=f'{course}/table/{n}', slots={'path': where, 'by': by, 'for': readers}))
+        maker.write(*records)
+        sits(maker, course)
+        sits(chair, '/0x62/mine/course')
+        sits(seat, '/0x63/mine/course')
+
+        row('the table reaches whoever sits, as records the maker writes',
+            until(lambda: chair.there(held(chair, maker, '/table/7')) and seat.there(held(seat, maker, '/table/7')), 240),
+            [chair.read(held(chair, maker, '/table/7')), seat.read(held(seat, maker, '/table/7'))])
+        row('and so do the seats, the empty one too',
+            until(lambda: chair.number(held(chair, maker, '/seats/1'), 'world') == number_of('0x63')
+                  and seat.there(held(seat, maker, '/seats/2')), 120),
+            [chair.read(held(chair, maker, '/seats/1')), seat.read(held(seat, maker, '/seats/2'))])
+
+        chair.write(dict(path='/0x62/mine/course/assignments/3', slots={'title': 'Assignment 3'}))
+        row("the chair's assignment reaches the seat, because the table says seats read assignments",
+            until(lambda: seat.text(held(seat, chair, '/assignments/3'), 'title') == 'Assignment 3', 180),
+            seat.read(held(seat, chair, '/assignments/3')))
+
+        seat.write(dict(path='/0x63/mine/course/assignments/3/work/1', slots={'work': 'an essay'}))
+        row("the seat's work reaches the chair, because the table says the chair reads work",
+            until(lambda: chair.text(held(chair, seat, '/assignments/3/work/1'), 'work') == 'an essay', 180),
+            chair.read(held(chair, seat, '/assignments/3/work/1')))
+
+        chair.write(dict(path='/0x62/mine/course/assignments/3/work/1/mark', slots={'grade': 'A-'}))
+        row('the mark reaches that seat',
+            until(lambda: seat.text(held(seat, chair, '/assignments/3/work/1/mark'), 'grade') == 'A-', 180),
+            seat.read(held(seat, chair, '/assignments/3/work/1/mark')))
+
+        seat.write(dict(path='/0x63/mine/course/assignments/4', slots={'title': 'not hers to set'}))
+        time.sleep(30)
+        row('the maker was sent none of it: it reads neither assignments, work nor marks',
+            not maker.there(held(maker, chair, '/assignments/3'))
+            and not maker.there(held(maker, seat, '/assignments/3/work/1'))
+            and not maker.there(held(maker, chair, '/assignments/3/work/1/mark')),
+            [maker.read(held(maker, chair, '/assignments/3')), maker.read(held(maker, seat, '/assignments/3/work/1'))])
+        row('what a world writes where the table gives it no place is sent to nobody',
+            not chair.there(held(chair, seat, '/assignments/4')) and not maker.there(held(maker, seat, '/assignments/4')),
+            chair.read(held(chair, seat, '/assignments/4')))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for world in worlds:
+            world.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed; joining is played by this script', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

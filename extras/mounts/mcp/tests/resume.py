@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.request
 
+
 ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -37,7 +38,7 @@ class World:
         self.lines = []
 
     def boot(self):
-        command = [sys.executable, str(ROOT / 'x/eden'), '--mount', 'mcp', '--mount', 'probe',
+        command = [sys.executable, str(ROOT / 'x/eden'), '--mount', 'mcp', '--mount', 'probe', '--mount', 'mesa',
                    '--extras-root', str(self.extras), '--port', str(self.port), '--world', str(self.directory)]
         env = dict(os.environ, _EDEN_NIX_ROOT=str(ROOT))
         t0 = time.perf_counter()
@@ -54,6 +55,13 @@ class World:
             if time.monotonic() > deadline:
                 raise RuntimeError(f'the world did not listen within {self.timeout}s; see {self.log.name}')
             time.sleep(.25)
+        # The door lets in only a session: the world leaves its first one for whoever is at the machine.
+        left = Path(self.directory) / 'src' / 'io' / 'mesa' / 'out' / 'session'
+        while not (left.is_file() and left.stat().st_size):
+            if time.monotonic() > deadline:
+                raise RuntimeError(f'the world left no first session within {self.timeout}s; see {self.log.name}')
+            time.sleep(.25)
+        self.session = {'Authorization': 'Bearer ' + left.read_text().strip()}
         # The MCP mount answers once its routes are up; the first call warms it.
         for _ in range(200):
             try:
@@ -77,7 +85,7 @@ class World:
         self.seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=self.seq, method='tools/call',
                                params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json', **self.session})
         with urllib.request.urlopen(req, timeout=self.timeout) as response:
             reply = json.load(response)
         assert 'error' not in reply, reply
@@ -86,7 +94,7 @@ class World:
         return result['structuredContent']
 
     def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=self.timeout) as response:
+        with urllib.request.urlopen(urllib.request.Request(self.base + path, headers=self.session), timeout=self.timeout) as response:
             return response.read().decode()
 
     def read(self, path, care='y'):

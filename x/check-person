@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""One person's world in two compositions: three world processes.
+
+0x61 is a house: a world that keeps a place for Bob. 0x62 keeps a course, made from the course template, with
+a seat that holds an invitation. Bob's world is prepared for the house's place and claimed, as
+x/check-community covers; from then it is his own, founded under its own name, with his session.
+
+Then the course's link for the seat is handed over at Bob's door, under Bob's session. His world does not
+become the seat's name. It claims the name (custody of it becomes a key his world derives), keeps the name's
+log on a card, meets the course at the address the link gave, takes its part, and is brought before the
+course by the name it claimed. The course fills the seat with Bob's world, not with the name, lists it, and
+the course's table reaches it. Bob's world still stands in the house. One world, one custody, two places:
+that is a role one already has, brought to a second composition.
+
+Played by this script, and so not counted toward the finish line: the host (it starts Bob's world under the
+house's minted name and tells it where it is reached).
+
+    x/check-person [--keep] [--base-port 8491]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, number_of, prepared, spell, until  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8491)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-person-'))
+    house = World('0x61', args.base_port, args.base_port + 1000, base / 'house')
+    school = World('0x62', args.base_port + 1, args.base_port + 1001, base / 'school',
+                   mounts=('mcp', 'mesa', 'scope', 'codecs', 'course'))
+    worlds = [house, school]
+    rows = []
+    place = '/0x61/app/home/people/bob'
+    course = '/0x62/app/course'
+    seat = course + '/seats/first'
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:700]), flush=True)
+
+    try:
+        house.start(args.timeout)
+        school.start(args.timeout)
+        for world in (house, school):
+            here = '/' + world.node + '/io/mesa'
+            until(lambda: world.number(here, 'key') > 0, 180)
+        house.write(dict(path='/0x61/io/scope/home',
+                         slots={'root': dict(type='reference', path='/0x61/app/home', care='x', case=0)}),
+                    dict(path=place, slots={'title': 'A room for Bob', 'invite': 1}))
+        school.write(dict(path='/0x62/io/scope/course',
+                          slots={'make': dict(type='reference', path='/0x62/gov/course', care='x', case=0),
+                                 'rel': '/app/course'}))
+
+        bob = prepared(house, place, 1, args.base_port + 2, args.base_port + 1002, base / 'bob', args.timeout)
+        worlds.append(bob)
+        me = number_of(bob.node)
+        home = '/' + bob.node + '/io/mesa'
+        own_custody = bob.number(home, 'custody')
+        row("Bob's world is claimed in the house and is his own: founded under its name, with his session",
+            bob.number(home, 'seq') == 2 and own_custody > 0 and bob.post('/scope/link/9')[0] == 404, bob.read(home))
+
+        row('the course is made, and its first seat asks for its invitation and takes a name',
+            until(lambda: school.number(seat, 'name') > 0, 300), school.read(seat))
+        name = school.number(seat, 'name')
+        named = spell(name)
+        link = school.link(2)
+        row("the course's door gives its owner the link to that seat", len(link.split(',')) == 12
+            and int(link.split(',')[6]) == name and link.split(',')[5] == '/app/course', link.split(',')[:7])
+
+        row("nobody may hand that link to Bob's world: it is not the link the world was prepared for",
+            bob.join(link, nobody=True)[0] == 401 and bob.join(link, session='not his')[0] == 401,
+            bob.join(link, nobody=True))
+        said = bob.join(link)
+        card = home + '/' + named
+        row('Bob hands it over under his own session, and his world claims the name',
+            said[0] == 202 and until(lambda: bob.number(card, 'seq') == 2, 180),
+            [said, bob.read(card), bob.read(home + '/ask/join/' + named)])
+        row("custody of the name is a key Bob's world derives for it, not his own, and his world is still itself",
+            bob.number(card, 'custody') not in (0, own_custody) and bob.number(home, 'custody') == own_custody
+            and bob.number(home, 'seq') == 2, [bob.read(card), bob.read(home)])
+        handed = bob.files() / 'io' / 'mesa' / 'in' / str(name)
+        row("the secret's file is emptied once the claim is made",
+            until(lambda: handed.exists() and handed.stat().st_size == 0, 60),
+            bob.read(home + '/ask/join/' + named))
+
+        joining = '/' + bob.node + '/io/scope/' + named
+        row('his world meets the course at the address the link gave and takes its part',
+            until(lambda: bob.number(joining, 'scope') == number_of('0x62')
+                  and bob.number(home + '/0x62', 'port') == school.mesa, 180),
+            [bob.read(joining), bob.read(home + '/0x62')])
+        row('it asks to be brought before the course by the name it claimed',
+            until(lambda: bob.number(home + '/ask/bring/' + named, 'by') == name
+                  and bob.number(home + '/ask/bring/' + named, 'done') == 1, 180),
+            bob.read(home + '/ask/bring/' + named))
+
+        row("the course takes the claim of the seat's name from a world it does not hear",
+            until(lambda: school.number('/0x62/io/mesa/' + named, 'seq') == 2, 300),
+            school.read('/0x62/io/mesa/' + named))
+        row("and fills the seat with Bob's world, not with the name he claimed",
+            until(lambda: school.number(seat, 'world') == me, 300),
+            [school.read(seat), school.read('/0x62/io/mesa/' + bob.node)])
+        row('whose card holds the address its own custody and the name both signed',
+            school.number('/0x62/io/mesa/' + bob.node, 'port') == bob.mesa, school.read('/0x62/io/mesa/' + bob.node))
+        row('the course lists it',
+            until(lambda: school.number(course + '/catalog/' + bob.node, 'world') == me, 180),
+            school.read(course + '/catalog', care='y'))
+        row("the course's table reaches Bob's world, as records the course writes",
+            until(lambda: bob.there('/' + bob.node + '/her/0x62/0x62/app/course/table/9'), 300),
+            bob.read('/' + bob.node + '/her/0x62/0x62/app/course/table', care='y'))
+        row('and so does the seat that says his world fills it',
+            until(lambda: bob.number('/' + bob.node + '/her/0x62/0x62/app/course/seats/first', 'world') == me, 180),
+            bob.read('/' + bob.node + '/her/0x62/0x62/app/course/seats/first'))
+
+        row('Bob still stands in the house: one world, two places',
+            house.number(place, 'world') == me and bob.number('/' + bob.node + '/io/scope/' + bob.node, 'scope')
+            == number_of('0x61') and bob.number(joining, 'maker') == number_of('0x62'),
+            [house.read(place), bob.read('/' + bob.node + '/io/scope', care='y')])
+        house.write(dict(path='/0x61/our/' + bob.node + '/note', slots={'value': 7}))
+        row('and still hears the house',
+            until(lambda: bob.number('/' + bob.node + '/her/0x61/note', 'value') == 7, 180),
+            bob.read('/' + bob.node + '/her/0x61/note'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for world in worlds:
+            world.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed; the host is played by this script', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,6 +1,6 @@
 """The stream in the foot, end to end: two clients hold GET /mcp/stream open, one write reaches both as one line within the
 write's own latency; a closed socket is dropped and the next write still reaches the other; a presented read arrives as
-{shown} and journals nothing.
+{shown} and journals nothing. (tests/push.py covers resuming, other writers and woke.)
 
 Usage: python3 -I -c "import runpy; runpy.run_path('extras/mounts/mcp/tests/stream.py')['check']('http://127.0.0.1:8300', '0x11', 120)"
 """
@@ -9,6 +9,10 @@ import socket
 import time
 import urllib.parse
 import urllib.request
+import uuid
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 
 class StreamClient:
@@ -17,7 +21,7 @@ class StreamClient:
     def __init__(self, base, timeout):
         u = urllib.parse.urlparse(base)
         self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
-        self.sock.sendall(b'GET /mcp/stream HTTP/1.0\r\nHost: localhost\r\n\r\n')
+        self.sock.sendall(('GET /mcp/stream HTTP/1.0\r\nHost: localhost\r\n' + ''.join(f'{k}: {v}\r\n' for k, v in SESSION.items()) + '\r\n').encode())
         self.buf = b''
         head = self.read_until(b'\r\n\r\n')
         assert b'200' in head.split(b'\r\n')[0] and b'text/event-stream' in head, head
@@ -52,20 +56,20 @@ def check(base, node, timeout):
     def rpc(name, **arguments):
         seq[0] += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq[0], method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         t0 = time.perf_counter()
         reply = json.load(urllib.request.urlopen(req, timeout=timeout))
         return reply['result']['structuredContent'], 1000 * (time.perf_counter() - t0)
 
     def epoch():
-        with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
             return json.load(r)['epoch']
 
     def expect(label, got, want):
         checks.append((label, got, want, got == want))
         assert got == want, (label, got, want)
 
-    home = '/' + node + '/user/streamed'
+    home = '/' + node + '/user/streamed_' + uuid.uuid4().hex[:8]     # fresh each run: an identical write commits nothing
     a, b = StreamClient(base, timeout), StreamClient(base, timeout)
     time.sleep(0.2)
     # the very first line a world sends after boot has arrived late once (over 50 ms after its write, every later one within
@@ -79,7 +83,7 @@ def check(base, node, timeout):
     t0 = time.perf_counter(); lb = b.event(); tb = 1000 * (time.perf_counter() - t0)
     expect('1 both streams got the write as one line: epoch, who, touched', (la['epoch'], lb['epoch'], la['who'], home + '/r1' in la['touched'], la == lb), (written['epoch'], written['epoch'], 'tester', True, True))
     expect('1 the line arrived within the write\'s own latency', ta < write_ms + 50 and tb < write_ms + 50, True)
-    expect('1 the line carries the written record under with', la['with'][home + '/r1']['properties']['/n'], '1')
+    expect('1 the line names the event id and what the commit woke (nothing here)', (la['touched_count'] >= 1, la['woke'], la['woke_count']), (True, [], 0))
 
     # 2. a closed socket is dropped; the next write still reaches the other stream and the write is not slowed
     b.close()

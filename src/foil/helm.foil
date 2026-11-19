@@ -12,6 +12,7 @@
 - physical_projection
 - inspect_read
 - mount_assets
+- namespace_command
 
 +  helm
   +  journal_page
@@ -22,6 +23,7 @@
 
   +  card
     &  helm/card/snapshot
+       helm/card/admit
        helm/card/snapshot_bat
        helm/card/interact_bat
        helm/card/interact
@@ -35,6 +37,22 @@
        helm/card/asset
        helm/card/step
        helm/card/steps
+       helm/card/sent
+       helm/card/state
+    + state
+      ' The world as it stands, whole, for a foot that derives what it does
+      ' from it. A committed world is in the store, so handing it over
+      ' copies nothing.
+      : request=nat
+    + sent
+      ' A card from a foot, with the path the foot is registered at. Only
+      ' the supervisor's endpoint for a foot makes one, so a foot cannot
+      ' choose the path; the journal keeps it beside what the card wrote.
+      : by=path card=helm/card
+    + admit
+      ' Trusted planner and response run within one supervisor admission.
+      : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
+        finish={\ maybe[pail] namespace}[nat str str]
     + snapshot_bat
       : request=nat read={\ namespace}[nat any nat]
     + interact_bat
@@ -73,6 +91,7 @@
     '  until outbound routing is installed. No persistence or actor discovery.
     +  request
       & helm/card/snapshot
+        helm/card/admit
        helm/card/snapshot_bat
        helm/card/interact_bat
         helm/card/interact
@@ -86,12 +105,23 @@
         helm/card/physical
         helm/card/inspect
         helm/card/asset
+        helm/card/sent
+        helm/card/state
         helm/supervisor/register
+        helm/supervisor/idle
+    +  idle
+      '  A pooled reader done with its read card, by its number.
+      : id=nat
+    +  pooled
+      '  A reader in the supervisor's pool: its number, its handle, and
+      '  whether it holds a read card.
+      : id=nat h=nat busy=bool
     +  register
       '  Explicit bootstrap registration; duplicate or absent paths fail.
-      : pax=path entry={\ feet/task/init nat}nat
+      '  A foot that hears is told each commit's epoch (feet/task/committed).
+      : pax=path entry={\ feet/task/init nat}nat hears=bool
     +  member
-      : pax=path actor=nat binding=axal[saga]
+      : pax=path actor=nat binding=axal[saga] hears=bool
 
     +  rejection
       : reason=iota
@@ -115,19 +145,53 @@
       ' Unsupported transport or a failed cascade discards that candidate.
       \ command=task now=nat block=nat state=namespace index=hive
       ^ [state=namespace index=hive reply=feet/task[unit]]
-      = [result next_index]
-          | sovereign_cycle_with index command 0 8 now block state
-      ? result
-       > (./fail why) [state index (helm/supervisor/denied why)]
-       > (./spun next moves rounds ack spill)
-         = problem=maybe[iota]
-             ? spill
-              > (./some why) (./some why)
-             ? moves.len (./some 'outbound_not_supported)
-             .none
-         ? problem
-          > (./some why) [state index (helm/supervisor/denied why)]
-          > .none [next next_index (feet/task/ack .none)]
+      ? (namespace_command/run command now block state index)
+       > (./err why) [state index (helm/supervisor/denied why)]
+       > (./ok pair)
+        = [next next_index] pair
+        | [next next_index (feet/task/ack .none)]
+
+    + admit
+      \ plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
+      ^ [state=namespace index=hive reply=feet/task[unit]]
+      ? (namespace_command/admit plan state index)
+       > (./err why) [state index (helm/supervisor/denied why)]
+       > (./ok pair)
+        = [next next_index] pair
+        | [next next_index (feet/task/ack .none)]
+
+    + admit_by
+      \ by=path plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
+      ^ [state=namespace index=hive reply=feet/task[unit]]
+      ? (namespace_command/admit_by by plan state index)
+       > (./err why) [state index (helm/supervisor/denied why)]
+       > (./ok pair)
+        = [next next_index] pair
+        | [next next_index (feet/task/ack .none)]
+    + admitted
+      ' One admission and its answer. by is the path of the foot that asked,
+      ' empty when none did.
+      \ by=path request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
+        finish={\ maybe[pail] namespace}[nat str str] state=namespace index=hive
+      ^ [namespace hive feet/task[unit]]
+      = [next next_index reply] (helm/supervisor/admit_by by plan state index)
+        outcome=maybe[pail]
+          ? reply
+           > (./ack why) why
+          | ./some (pails/q 'command_reply_invalid)
+        render
+          \ current=namespace
+          ^ [nat str str]
+          | finish outcome current
+        answered=[nat str str]
+          ? (Try render next)
+           > (./ok response) response
+           > (./err _) [500 "Command response failed" ""]
+        [status body line] answered
+        ' A successful retry may plan no writes. Its response is useful,
+        ' but it must not report the preceding epoch as a fresh commit.
+        stream_line=str (? (eq next.local.top state.local.top) "" line)
+      [next next_index (feet/task/admitted request status body stream_line)]
 
     + journal_key
       \ entry=bee/kv[axal/k[tome]]
@@ -167,6 +231,21 @@
       \ card=helm/card state=namespace index=hive
       ^ [namespace hive feet/task[unit]]
       ? card
+       > (./admit request plan finish)
+         = nobody=path []
+         | helm/supervisor/admitted nobody request plan finish state index
+       > (./state request)
+         [state index (feet/task/state request state)]
+       > (./sent by inner)
+         ? inner
+          > (./admit request plan finish)
+            | helm/supervisor/admitted by request plan finish state index
+          > (./step target command)
+            = one=row[[p=path w=writ]] [[target command]]
+            | helm/supervisor/run_task (task/sent by one) 0 0 state index
+          > (./steps writes)
+            | helm/supervisor/run_task (task/sent by writes) 0 0 state index
+         | helm/supervisor/handle inner state index
        > (./snapshot_bat request read)
          = answered=[nat any nat]
              ? (Try read state)
@@ -229,6 +308,7 @@
         index={\ s}hive
         version={\ s}nat
         permit={\ path s}bool
+        read={\ helm/card s}feet/task[unit]
 
     + local_access
       ^ helm/supervisor/access[namespace]
@@ -236,6 +316,63 @@
         namespace/page helm/supervisor/handle
         sovereign_hive (\ state state.local.top)
         (\ target state (namespace/permitted target state))
+        helm/supervisor/read
+
+    + read
+      '  A read card's answer on one committed state, as the supervisor
+      '  would give it; a read never consults the crew index.
+      \ card=helm/card state=namespace
+      ^ feet/task[unit]
+      = none=hive (axal/new[row[dep]] .none)
+        [next next_index answer] (helm/supervisor/handle card state none)
+      answer
+
+    +  reader
+      (@ s)
+      '  A reader in the supervisor's pool.  It answers one read card at a
+      '  time on the state committed when the card arrived, so a slow read
+      '  holds up neither the supervisor nor a write nor another read, and
+      '  reads run in parallel on the executor's workers.  It answers the
+      '  foot whose capability rides with the card, tells the supervisor it
+      '  is idle, and waits for the next.  Readers live as long as the
+      '  world: enki keeps a halted actor's thread and heap until the
+      '  scheduler is freed, so a reader per read would leak one each.
+      \ read={\ helm/card s}feet/task[unit] id=nat self=nat
+      ^ nat
+      = ;[ignored first] (Recv[nat] 0)
+        supervisor first.at(0)
+      % ignored=nat 0
+      = ;[job caps] (Recv[[helm/card s]] 0)
+        [card state] job
+        ;answer (read card state)
+      ; (? (gt caps.len 0) (Send caps.at(0) answer) 0)
+      ; (helm/supervisor/close_caps caps)
+      ; (Send supervisor (helm/supervisor/idle id))
+      | _ 0
+
+    +  hand_read
+      (@ s)
+      '  Give a read card and the state to an idle reader, starting a new
+      '  reader when every one is busy (the pool grows to the most reads
+      '  ever in flight at once); the foot's capability rides along.
+      \ read={\ helm/card s}feet/task[unit] readers=row[helm/supervisor/pooled]
+        card=helm/card state=s foot=nat
+      ^ row[helm/supervisor/pooled]
+      = idle (readers.filter((\ r=helm/supervisor/pooled !(r.busy))))
+        job=[helm/card s] [card state]
+      ? (gt idle.len 0)
+        = chosen idle.at(0)
+        ; (SendCaps chosen.h job [foot])
+        | readers.map
+          \ r=helm/supervisor/pooled
+          ^ helm/supervisor/pooled
+          ? (eq r.id chosen.id) (helm/supervisor/pooled r.id r.h .true)
+          r
+      = id readers.len
+        ;fresh (Spawn (helm/supervisor/reader[s] read id))
+      ; (SendCaps fresh 0 [0])
+      ; (SendCaps fresh job [foot])
+      | readers.snoc((helm/supervisor/pooled id fresh .true))
 
     +  close_caps
       \ caps=row[nat]
@@ -288,6 +425,19 @@
       ; (Send member.actor (feet/task/fact binding))
       | out.snoc member.set_binding(binding)
 
+    +  tell
+      '  Tell every member that hears the epoch a commit reached: the push
+      '  a stream renders from, so nothing outside reads the log to learn
+      '  that something changed.  After the bindings, before the reply.
+      \ top=nat members=row[helm/supervisor/member]
+      ^ nat
+      | members.fold 0
+        \ ;out=nat member=helm/supervisor/member
+        ^ nat
+        ? !(member.hears) out
+        ; (Send member.actor (feet/task/committed top))
+        out
+
     +  enroll_with
       (@ s)
       '  Validate once, then spawn and transfer the bound endpoint.
@@ -309,7 +459,7 @@
       ; (SendCaps port 0 [0 foot])
       ; (SendCaps foot (feet/task/init binding 0) [port])
       ; (CloseHandle port)
-      = member (helm/supervisor/member req.pax foot binding)
+      = member (helm/supervisor/member req.pax foot binding req.hears)
       [members.snoc(member) (feet/task/ack .none)]
 
     +  advance_with
@@ -326,6 +476,7 @@
         ;updated
           ? (eq (version next) (version state)) members
           | helm/supervisor/notify_with[s] access next members
+      ; (? (eq (version next) (version state)) 0 (helm/supervisor/tell (version next) updated))
       [next next_index updated answer]
 
     +  run_keeping
@@ -339,14 +490,42 @@
         version access.version
       % state=s initial index=hive (index_of initial)
         members=row[helm/supervisor/member] []
+        readers=row[helm/supervisor/pooled] []
       = ;[message caps] (Recv[helm/supervisor/request] 0)
+      ? message
+       > (helm/supervisor/idle id)
+        ; (helm/supervisor/close_caps caps)
+        = eased
+            | readers.map
+              \ r=helm/supervisor/pooled
+              ^ helm/supervisor/pooled
+              ? (eq r.id id) (helm/supervisor/pooled r.id r.h .false)
+              r
+        | _ state index members eased
       ? (eq caps.len 0)
-        | _ state index members
+        | _ state index members readers
+      ' A read goes to a pooled reader with the current state (store-
+      ' resident since its last commit, so handing it over copies nothing);
+      ' writes and registrations stay here, in order.
+      = reading=maybe[helm/card]
+          ? message
+           > card=helm/card/snapshot (./some card)
+           > card=helm/card/snapshot_bat (./some card)
+          .none
+      ? reading
+       > (./some card)
+        = ;handed (helm/supervisor/hand_read[s] access.read readers card state caps.at(0))
+        ; (helm/supervisor/close_caps caps)
+        | _ state index members handed
       = ;[next next_index joined answer]
           ? message
            > req=helm/supervisor/register
             = ;[roster ack] (helm/supervisor/enroll_with[s] access req state members)
             [state index roster ack]
+           > idle=helm/supervisor/idle
+            [state index members (feet/task/ack .none)]
+           > card=helm/card/admit
+            | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/snapshot_bat
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/interact_bat
@@ -363,6 +542,10 @@
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/steps
             | helm/supervisor/advance_with[s] access card state index members
+           > card=helm/card/sent
+            | helm/supervisor/advance_with[s] access card state index members
+           > card=helm/card/state
+            | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/peek
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/journal
@@ -378,17 +561,17 @@
       ; (? (eq (version next) (version state)) 0 (keep next))
       ; (Send caps.at(0) answer)
       ; (helm/supervisor/close_caps caps)
-      | _ next next_index joined
+      | _ next next_index joined readers
     +  run_with
       (@ s)
       '  Only bootstrap code receives this handle. Feet use endpoints.
       \ access=helm/supervisor/access[s] initial=s self=nat
       ^ nat
-      = idle
+      = unkept
           \ ignored=s
           ^ nat
           | 0
-      | helm/supervisor/run_keeping[s] access idle initial self
+      | helm/supervisor/run_keeping[s] access unkept initial self
     + run
       \ initial=namespace self=nat
       ^ nat
@@ -413,9 +596,15 @@
       feet/task/inspect
       feet/task/asset
       feet/task/develop
+      feet/task/admitted
       feet/task/binary
+      feet/task/committed
+      feet/task/state
       feet/task/ack
       t
+    + state
+      '  Answer to gift/state: the world as it stood when asked.
+      : request=nat state=namespace
     +  init
       '  Initial %y binding and recipient-local coordinator handle.
       '  The startup wrapper resolves parent through capability transfer.
@@ -443,6 +632,11 @@
       : request=nat status=nat body=any mime=nat
     + develop
       : request=nat status=nat body=str
+    + admitted
+      : request=nat status=nat body=str line=str
+    +  committed
+      '  A commit reached this epoch (to a foot registered to hear).
+      : top=nat
     +  ack
       '  Write result: none on success, some error on rejection.
       : err=maybe[pail]
@@ -450,6 +644,7 @@
     '  Namespace requests sent to the parent supplied by task/init.
     (@ t)
     & feet/gift/interact
+      feet/gift/admit
       feet/gift/develop
       feet/gift/install
       feet/gift/poke
@@ -464,12 +659,18 @@
       feet/gift/snapshot_bat
       feet/gift/interact_bat
       feet/gift/asset
+      feet/gift/state
       t
+    + state
+      '  Ask for the world as it stands; answered by task/state.
+      : request=nat
     +  normalize
       '  The endpoint supplies the registered location, never the foot.
       \ home=path gift=feet/gift[unit]
       ^ maybe[helm/card]
       ? gift
+       > (./admit request plan finish)
+        | ./some (helm/card/sent home (helm/card/admit request plan finish))
        > (./snapshot_bat request read)
         | ./some (helm/card/snapshot_bat request read)
        > (./interact_bat request query encode)
@@ -482,9 +683,9 @@
         | ./some (helm/card/develop request query)
        > (./install source version target)
         | ./some (helm/card/install source version target)
-       > (./poke pax wit) (./some (helm/card/step pax wit))
-       > (./batch writes) (./some (helm/card/steps writes))
-       > (./pass pax wit) (./some (helm/card/step home.weld(pax) wit))
+       > (./poke pax wit) (./some (helm/card/sent home (helm/card/step pax wit)))
+       > (./batch writes) (./some (helm/card/sent home (helm/card/steps writes)))
+       > (./pass pax wit) (./some (helm/card/sent home (helm/card/step home.weld(pax) wit)))
        > (./peek pax) (./some (helm/card/peek .y .none pax))
        > (./journal request before limit)
         | ./some (helm/card/journal request before limit)
@@ -496,7 +697,11 @@
         | ./some (helm/card/asset request home name mime)
        > (./inspect request query)
         | ./some (helm/card/inspect request query)
+       > (./state request) (./some (helm/card/state request))
       .none
+    + admit
+      : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
+        finish={\ maybe[pail] namespace}[nat str str]
     + snapshot_bat
       : request=nat read={\ namespace}[nat any nat]
     + interact_bat

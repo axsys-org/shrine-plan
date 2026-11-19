@@ -6,10 +6,13 @@
 - bond
 - weft_std
 - namespace
+- namespace_command
+- net
+- scope_mount
 
 ' MCP over the native cards and nothing else: a read is one snapshot
 ' (no event), a write is one poke (one event), history is a snapshot
-' over the record's cases, apply is one warp (one event).  Local only.
+' over the record's cases, apply admits a declared operation. Local only.
 + mcp_mount
   + http
     \ files=row[[str nat]] state=namespace
@@ -18,14 +21,49 @@
       plan
         \ request=http_foot/request now=nat
         ^ http_foot/action
-        = url (http_foot/split 63 request.target).at(0)
-          opening=http_foot/action .stream
-        ? (and (equal request.method "GET") (equal url "/mcp/stream")) opening
+        = parts (http_foot/split 63 request.target)
+          url parts.at(0)
+        ' This door is opened by a session and by nothing else: whoever
+        ' asks must show one this world's custody granted (door/open).
+        ' Being on the same machine opens nothing.
+        ? (eq 0 request.who) (./reply (http_driver/response 401 "Only someone this world has let in may use this door."))
+        ? (and (equal request.method "GET") (equal url "/mcp/stream"))
+          | mcp_mount/stream self (? (eq parts.len 2) parts.at(1) "")
         ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
         ? (mcp_rpc/parse_call request.body)
          > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
-         > (./ok call) (mcp_mount/dispatch self call)
+         > (./ok call) (mcp_mount/dispatch self call request now)
     | http_foot/add_routes [(http_foot/route "/mcp" plan)] http_foot/empty
+  + stream
+    ' GET /mcp/stream: server-sent events, one per commit from any
+    ' writer, pushed by the supervisor as it commits (mcp_mount/notice),
+    ' each with its epoch as the event id.  ?after=<epoch> resumes past
+    ' an epoch already seen, from the journal, with no gap and no
+    ' repeat; without it the stream starts at the top.
+    \ self=iota query=str
+    ^ http_foot/action
+    = given (http_foot/field "after" (http_foot/fields query))
+      after=maybe[nat] (? (eq given.len 0) .none (nat/parse given))
+    | http_foot/action/stream after (\ n=nat state=namespace (mcp_mount/notice self n state))
+  + notice
+    ' The stream's event for one epoch, from its log entry: {epoch, who,
+    ' touched, touched_count, woke, woke_count}.  woke is the cells the
+    ' commit woke through the reverse index (cell_wakes): those it wrote
+    ' and those reading what it changed, transitively.  touched and woke
+    ' carry their first hundred.  Empty for an epoch with no entry.
+    \ self=iota n=nat state=namespace
+    ^ str
+    = entry (sovereign_peek [self 'log ($u n)] state)
+    ?> (./some record) entry.fil ""
+    ?> (./some held) record.get(['sys 'content]) ""
+    ?> event=namespace_event held ""
+    = [touched count] (mcp_mount/touched_json entry)
+      woke (cell_wakes (unpin event.changes).tap n state)
+      named (? (gt woke.len 100) woke.take(100) woke)
+    | show (json/obj [(jkv "epoch" (json/num .false n)) (jkv "who" (json/str (mcp_mount/who_of self entry)))
+                      (jkv "touched" touched) (jkv "touched_count" (json/num .false count))
+                      (jkv "woke" (json/arr named.map((\ p=path (json/str (mcp_mount/shown p))))))
+                      (jkv "woke_count" (json/num .false woke.len))])
   + json
     \ body=str
     ^ http_response
@@ -43,8 +81,46 @@
     \ id=json message=str
     ^ http_foot/action
     | mcp_mount/reply id (mcp_rpc/text_content message .true)
+  + said
+    \ id=json status=nat text=str
+    ^ http_response
+    | mcp_mount/json (mcp_rpc/result id (mcp_rpc/text_content text (ge status 400)))
+  + wrapped
+    \ id=json status=nat text=str
+    ^ [nat str]
+    [200 (mcp_rpc/result id (mcp_rpc/text_content text (ge status 400)))]
+  + voice
+    ' How the acts of a scope answer an agent's call: as a tool's result,
+    ' an error where the act refused.
+    \ id=json
+    ^ scope_mount/voice
+    | scope_mount/voice (\ status=nat text=str (mcp_mount/said id status text)) (\ status=nat text=str (mcp_mount/wrapped id status text))
+  + posed
+    ' A request at this world's door as the caller of a tool makes it:
+    ' under the session the call itself showed.
+    \ request=http_foot/request target=str body=str
+    ^ http_foot/request
+    | http_foot/request "POST" target body request.who request.asked
+  + scoped
+    ' The compositions this world takes part in, for an agent: the same
+    ' acts a person's request reaches (scope_mount), under the same
+    ' rules, answered as a tool's result. Nothing here decides anything.
+    \ self=iota id=json name=str args=json request=http_foot/request now=nat
+    ^ http_foot/action
+    = v (mcp_mount/voice id)
+    ? (equal name "scope/seen") (scope_mount/seeing v)
+    ? (equal name "scope/packs") (scope_mount/packing v)
+    ? (equal name "scope/invite") (scope_mount/inviting (mcp_rpc/text_at "composition" args) (mcp_rpc/text_at "place" args) v)
+    ? (equal name "scope/shape") (scope_mount/shaping (mcp_rpc/text_at "composition" args) v)
+    ? (equal name "scope/make") (scope_mount/making self (mcp_rpc/text_at "pack" args) (mcp_rpc/text_at "name" args) v)
+    ? (equal name "scope/link") (scope_mount/linking self (mcp_mount/posed request (str/cat_all ["/scope/link/" (nat/show (mcp_rpc/num_at "invitation" 0 args))]) "") now v)
+    ? (equal name "scope/join") (scope_mount/joining (mcp_mount/posed request "/scope/join" (mcp_rpc/text_at "link" args)) now v)
+    ? !(equal name "scope/fill") (mcp_mount/refuse id "Unknown tool")
+    ? (mcp_mount/record (mcp_rpc/object_at "slots" args))
+     > (./err why) (mcp_mount/refuse id (str/cat_all ["slots: " why]))
+     > (./ok record) (scope_mount/filling (mcp_rpc/text_at "composition" args) (mcp_rpc/text_at "place" args) record v)
   + dispatch
-    \ self=iota call=mcp_rpc/call
+    \ self=iota call=mcp_rpc/call request=http_foot/request now=nat
     ^ http_foot/action
     ? (equal call.method "initialize") (mcp_mount/reply call.id (mcp_rpc/initialize "shrine"))
     ? (equal call.method "notifications/initialized") (./reply (http_driver/response 202 ""))
@@ -58,6 +134,7 @@
         ? many
          > (./arr xs) (? (eq xs.len 0) "" (mcp_rpc/text_at "path" xs.at(0)))
         (mcp_rpc/text_at "path" args)
+    ? (and (ge name.len 6) (equal[str] name.slice(0 6) "scope/")) (mcp_mount/scoped self call.id name args request now)
     ? (and (equal name "mcp/history") (eq first.len 0))
       = with_text (mcp_rpc/text_at "with" args)
         with=maybe[care] (? (eq with_text.len 0) .none (./some (mcp_mount/care with_text)))
@@ -96,14 +173,25 @@
           ?> (./some w) (path_parse (str/cat who "/")) []
           ? !(eq w.len 1) []
           | [[[self 'agent 'journal w.at(0)] (writ/make (myth/sing ['wrote] (pails/n specs.len)))]]
-      | mcp_mount/write_specs self call.id specs tag who then
+      ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
+        | mcp_mount/write_from self call.id specs tag who then
+      ? (mcp_mount/writes self specs)
+       > (./ok writes)
+        ?> (./some why) (mcp_mount/refused self writes) (mcp_mount/write_batch call.id writes tag who then self args)
+        | mcp_mount/refuse call.id why
+       > (./err why) (mcp_mount/refuse call.id why)
     ? (equal name "mcp/apply")
       ?> (./some op) (mcp_mount/target self (mcp_rpc/text_at "operation" args))
         | mcp_mount/refuse call.id "operation: the address of an op card is required"
       ? (mcp_mount/record (mcp_rpc/object_at "inputs" args))
        > (./err why) (mcp_mount/refuse call.id (str/cat_all ["inputs: " why]))
        > (./ok input)
-        | mcp_mount/batch call.id [[pax (writ/warp op input)]] [] "mcp" (mcp_mount/wanted (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj [])))
+        = writes=row[[path writ]] [[pax (writ/warp op input)]]
+          then (mcp_mount/wanted (mcp_mount/specs self (mcp_rpc/field "then" args) (json/obj [])))
+        | http_foot/action/admit
+            (namespace_command/plan pax op input)
+            (\ outcome=maybe[pail] state=namespace (mcp_mount/finished call.id writes then outcome state))
+            (\ outcome=maybe[pail] state=namespace "")
     | mcp_mount/refuse call.id "Unknown tool"
   ' ---- addresses and values
   + path_rule
@@ -117,7 +205,9 @@
     ?> (./some parsed) (path_parse text) .none
     ? (eq parsed.len 0) (./some [self])
     ? (eq_iota parsed.at(0) self) (./some parsed)
-    ? ((is_r parsed) || ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || (eq_iota parsed.at(0) 'sys)))))) (./some parsed)
+    ? ((is_h parsed) || ((is_o parsed) || ((is_xv parsed) || ((is_cx parsed) || ((is_r parsed) || (eq_iota parsed.at(0) 'sys)))))) (./some parsed)
+    ' Another world's name, read through this world's mount of it.
+    ? (equal (aura_tag parsed.at(0)) "x") (./some parsed)
     | ./some parsed.cons(self)
   + care
     \ text=str
@@ -258,6 +348,7 @@
     \ held=pail
     ^ str
     ? held
+     > failure=helm/supervisor/rejection (mcp_mount/iota_text failure.reason)
      > x=pails/t x.t
      > n=pails/n (nat/show n.n)
      > z=pails/z (str/cat_all ["-" (nat/show z.n)])
@@ -375,7 +466,10 @@
     ' One node's own fields, without its children.  The path is printed
     ' once and the references spelled from it.  Every node carries its
     ' pinned x reference; the y and z references, which a tack pins,
-    ' ride on the root of an answer only.
+    ' ride on the root of an answer only.  A record held from another world
+    ' says the version its publisher gave it (version): the one number
+    ' every reader of it holds alike, so two of them can name the same
+    ' one. 0 for a record of this world's own.
     \ pax=path tree=axal[myth] state=namespace top=bool
     ^ [row[jkv] nat]
     ? ((is_xv pax) || ((is_o pax) || (is_r pax)))
@@ -400,6 +494,7 @@
         (jkv "reference" x)
         (jkv "reference_y" y)
         (jkv "reference_z" z)
+        (jkv "version" (json/num .false (net/version pax state)))
         (jkv "properties" props)]
        (add pbytes (add (mul 4 text.len) 120))]
   + paged
@@ -718,7 +813,9 @@
         | mcp_mount/record (mcp_rpc/object_at "settings" obj)
     ?> (./ok given) settings (./err "settings: the formula's parameters, as slot names to values")
     ?> (./some cursor) (mcp_mount/cursor self pinned (mcp_rpc/text_at "next" obj)) (./err "next: the cursor a previous page of this same read answered")
-    | ./ok (mcp_mount/spec pinned c at formula given budget cursor present find referencing)
+    ' A plain path pinned here already carries its case in the spelling;
+    ' only a derived path is viewed at the case given (peek_at).
+    | ./ok (mcp_mount/spec pinned c (? (mcp_mount/derived pax) at 0) formula given budget cursor present find referencing)
   + entry
     ' One entry of a reads list: its spec, or why it was refused, with
     ' the path text it named.
@@ -770,9 +867,18 @@
            > (./known t) t
           (axal/new[myth] .none)
       | sorge[myth] spec.c got
-    ? (sovereign_view spec.c 0 spec.pax state)
-     > (./known tree) tree
-    | sorge[myth] spec.c (sovereign_history_prefix spec.pax)
+    ' Use the native frontier for y, rather than materializing all descendants
+    ' before trimming them. The reader also handles transparent prefixes.
+    ? ?=(.y spec.c)
+      ? !(mcp_mount/derived spec.pax)
+        ?> (./some history) state.history(spec.pax) (sovereign_care .y spec.pax state)
+        = records (namespace/frontier history.top spec.pax history)
+        | records.run (\ record (unpin record.myth))
+      ? (sovereign_view .y 0 spec.pax state)
+       > (./known t) t
+      | axal/new[myth] .none
+    ' Exact x reads likewise use the native index, not a discarded subtree.
+    | sovereign_care spec.c spec.pax state
   + answer
     ' The answer to one read: the records found when find is given, the
     ' tree page, or the formula's result with
@@ -825,7 +931,30 @@
   + derived
     \ pax=path
     ^ bool
-    | ((is_r pax) || ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax)))))
+    | ((is_h pax) || ((is_o pax) || ((is_xv pax) || ((is_cx pax) || (is_r pax)))))
+  + refused
+    ' The first write of a batch that is not this door's to make.
+    \ self=iota writes=row[[path writ]]
+    ^ maybe[str]
+    = none=maybe[str] .none
+    | writes.fold none
+      \ out=maybe[str] [pax change]
+      ^ maybe[str]
+      ? (maybe/is_some out) out
+      | mcp_mount/foreign_write self pax
+  + foreign_write
+    ' Why a write is not this door's to make, or none: another world's
+    ' name is never written here, and what another world published
+    ' (/<self>/her/<node>/...) lands only through this world's Mesa foot.
+    \ self=iota pax=path
+    ^ maybe[str]
+    ? (eq pax.len 0) .none
+    ? !(eq_iota pax.at(0) self)
+      | ./some (str/cat_all ["path: " (mcp_mount/shown pax) " is another world's name; write your own and reference it"])
+    ? (lt pax.len 3) .none
+    ? !(equal (path_show [pax.at(1)]) "/her") .none
+    = publisher (path_show [pax.at(2)])
+    | ./some (str/cat_all ["path: " (mcp_mount/shown pax) " is " (str/slice 1 publisher.len publisher) "'s publication, acquired over Mesa; it is read only"])
   + writes
     ' One writ per record spec, or the reason the whole batch is refused
     ' before any event: a derived path, a bad path, or bad properties.
@@ -842,8 +971,11 @@
       ? (mcp_mount/record (mcp_mount/slots_of spec))
        > (./err why) (./err (str/cat_all [(mcp_mount/shown pax) ": " why]))
        > (./ok record)
+        '  A list here is the batch's own condition (cases), judged by guard.
         = sure=myth
             ?> (./some wanted) (mcp_rpc/field "if_case" spec) record
+            ? wanted
+             > (./arr xs) record
             | record.put(if_case_slot (pails/n (mcp_rpc/num_at "if_case" 0 spec)))
         ? (equal action "poke") (./ok out.snoc([pax (writ/poke sure)]))
         | ./ok out.snoc([pax (writ/make sure)])
@@ -851,36 +983,216 @@
     ' The records as one event (admitted whole or refused whole), with
     ' the writer's tag record riding in the same event, then the then
     ' reads on the admitted state, in one answer that lists the records
-    ' asked for.
+    ' asked for.  The stream hears of it from the supervisor's push.
     \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
     ^ http_foot/action
-    | ./batch_told writes.weld(tag)
+    | ./batch writes.weld(tag)
         (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
-        (\ outcome=maybe[pail] state=namespace (mcp_mount/told_line writes who outcome state))
-  + told_line
-    ' The line every open stream receives for an admitted write:
-    ' {epoch, label, who, touched, with}, with the written records
-    ' rendered on the admitted snapshot through the same page render
-    ' then uses (50 nodes each, 500 for the line, the first hundred
-    ' records of a wider batch); nothing on refusal.
-    \ writes=row[[path writ]] who=str outcome=maybe[pail] state=namespace
-    ^ str
-    ? (maybe/is_some outcome) ""
-    = none=maybe[path] .none
-      empty=row[jkv] []
-      label=str (? (eq writes.len 1) "write" (str/cat_all ["batch of " (nat/show writes.len)]))
-      touched (json/arr writes.map((\ [pax wit] (json/str (mcp_mount/shown pax)))))
-      start=[row[jkv] nat] [empty 500]
-      shown_writes (? (gt writes.len 100) writes.take(100) writes)
-      [kvs left]
-        | shown_writes.fold start
-          \ acc [pax wit]
-          = [out l] acc
-          ? (eq l 0) acc
-          = [view nodes last more bytes] (mcp_mount/paged pax (sorge[myth] .x (sovereign_peek pax state)) state none (? (lt l 50) l 50) .true)
-          | [out.snoc((jkv (mcp_mount/shown pax) view)) (sub l nodes)]
-    | show (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "label" (json/str label)) (jkv "who" (json/str who))
-                      (jkv "touched" touched) (jkv "with" (json/obj kvs))])
+  + write_batch
+    ' A batch with conditions (require, forbid, if_case), or one writing an
+    ' ask, is planned against the very state it is admitted on and refused
+    ' whole when a condition fails, so a write can depend on what else is
+    ' true without a race; any other batch is a plain batch.
+    \ id=json writes=row[[path writ]] tag=row[[path writ]] who=str then=row[mcp_mount/spec] self=iota args=json
+    ^ http_foot/action
+    ? ((mcp_mount/conditional args) || (mcp_mount/asks writes))
+      | http_foot/action/admit
+          (\ state=namespace (mcp_mount/guard self args writes.weld(tag) state))
+          (\ outcome=maybe[pail] state=namespace (mcp_mount/finished id writes then outcome state))
+          (\ outcome=maybe[pail] state=namespace "")
+    | mcp_mount/batch id writes tag who then
+  + asks
+    ' Whether a batch writes an ask.
+    \ writes=row[[path writ]]
+    ^ bool
+    % i=nat 0
+    ^ bool
+    ? (eq i writes.len) .false
+    = [p w] writes.at(i)
+    ? (mcp_mount/is_ask p) .true
+    | _ i.inc
+  + is_ask
+    ' /<self>/our/<recipient>/ask/<id>: a question to someone.
+    \ p=path
+    ^ bool
+    ? (lt p.len 5) .false
+    | and (eq_iota p.at(1) 'our) (eq_iota p.at(3) 'ask)
+  + opted_out
+    ' The first ask in a batch whose recipient asked not to be contacted
+    ' (/<self>/optouts/<recipient>): the world's own rule, whoever writes.
+    \ self=iota writes=row[[path writ]] state=namespace
+    ^ bool
+    % i=nat 0
+    ^ bool
+    ? (eq i writes.len) .false
+    = [p w] writes.at(i)
+    ? !(mcp_mount/is_ask p) (_ i.inc)
+    ? (mcp_mount/present [self 'optouts p.at(2)] state) .true
+    | _ i.inc
+  + hole_slots
+    ' The blanks a block record holds: each slot <name>/hole, as [name].
+    \ t=myth
+    ^ row[path]
+    = es t.tap
+    % i=nat 0 out=row[path] []
+    ^ row[path]
+    ? (eq i es.len) out
+    = e es.at(i)
+    = k e.key
+    ? (eq k.len 2)
+      ? (eq_iota k.at(1) 'hole) (_ i.inc out.snoc(k.take(1)))
+      | _ i.inc out
+    | _ i.inc out
+  + same_holes
+    \ a=row[path] b=row[path]
+    ^ bool
+    ? !(eq a.len b.len) .false
+    | a.all((\ x=path (b.any((\ y=path (equal[path] x y))))))
+  + made_by
+    ' The record a write makes or pokes, if it does.
+    \ w=writ
+    ^ maybe[myth]
+    ? w
+     > (./make t=myth) (./some t)
+     > (./poke t=myth) (./some t)
+    .none
+  + asks_of
+    ' The page an ask asks (its asks reference), or the empty path.
+    \ t=myth
+    ^ path
+    ?> (./some held) t.get(['asks]) []
+    ? held
+     > sf=safe sf.path
+    []
+  + new_holes
+    ' The blanks a batch writes on the blocks of one ask.
+    \ ask=path writes=row[[path writ]]
+    ^ row[path]
+    % i=nat 0 out=row[path] []
+    ^ row[path]
+    ? (eq i writes.len) out
+    = [p w] writes.at(i)
+    ? !(eq p.len ask.len.inc) (_ i.inc out)
+    ? !(pith_prefix ask p) (_ i.inc out)
+    ?> (./some t) (mcp_mount/made_by w) (_ i.inc out)
+    | _ i.inc out.weld((mcp_mount/hole_slots t))
+  + held_holes
+    ' The blanks the blocks of an ask the world holds ask.
+    \ ask=path state=namespace
+    ^ row[path]
+    = es (sovereign_care .z ask state).tap
+    % i=nat 0 out=row[path] []
+    ^ row[path]
+    ? (eq i es.len) out
+    = [p t] es.at(i)
+    ? !(eq p.len 1) (_ i.inc out)
+    | _ i.inc out.weld((mcp_mount/hole_slots t))
+  + open_twin
+    ' Another ask to the same recipient, about the same page, for the same
+    ' blanks, still without an answer: the one a new ask would repeat.
+    \ self=iota ask=path page=path holes=row[path] state=namespace
+    ^ bool
+    = folder ask.take(4)
+      id ask.at(4)
+      to ask.at(2)
+    = es (sovereign_care .y folder state).tap
+    % i=nat 0
+    ^ bool
+    ? (eq i es.len) .false
+    = [p t] es.at(i)
+    ? !(eq p.len 1) (_ i.inc)
+    ? (eq_iota p.at(0) id) (_ i.inc)
+    = other folder.weld(p)
+    ? !(equal[path] (mcp_mount/asks_of t) page) (_ i.inc)
+    ? (mcp_mount/present [self 'her to 'answer p.at(0)] state) (_ i.inc)
+    ? (mcp_mount/same_holes holes (mcp_mount/held_holes other state)) .true
+    | _ i.inc
+  + duplicate
+    ' The world's own rule, whoever writes: no second ask to the same person
+    ' for the same blanks of the same page while the first is open.
+    \ self=iota writes=row[[path writ]] state=namespace
+    ^ bool
+    % i=nat 0
+    ^ bool
+    ? (eq i writes.len) .false
+    = [p w] writes.at(i)
+    ? !(eq p.len 5) (_ i.inc)
+    ? !(mcp_mount/is_ask p) (_ i.inc)
+    ?> (./some t) (mcp_mount/made_by w) (_ i.inc)
+    = page (mcp_mount/asks_of t)
+    ? (eq page.len 0) (_ i.inc)
+    = holes (mcp_mount/new_holes p writes)
+    ? (eq holes.len 0) (_ i.inc)
+    ? (mcp_mount/open_twin self p page holes state) .true
+    | _ i.inc
+  + conditional
+    \ args=json
+    ^ bool
+    ? (maybe/is_some (mcp_rpc/field "require" args)) .true
+    ? (maybe/is_some (mcp_rpc/field "forbid" args)) .true
+    | maybe/is_some (mcp_rpc/field "if_case" args)
+  + guard
+    ' Every require exists, no forbid exists, every if_case path is still at
+    ' its case (care z: the whole subtree); otherwise why not.
+    \ self=iota args=json writes=row[[path writ]] state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    ? (mcp_mount/opted_out self writes state)
+      | ./err 'opted_out
+    ? (mcp_mount/duplicate self writes state)
+      | ./err 'duplicate_ask
+    ? (mcp_mount/listed self "require" args).any((\ p=path !(mcp_mount/present p state)))
+      | ./err 'requires_missing
+    ? (mcp_mount/listed self "forbid" args).any((\ p=path (mcp_mount/present p state)))
+      | ./err 'forbidden_present
+    ? (mcp_mount/moved self args state)
+      | ./err 'case_moved
+    | ./ok writes
+  + moved
+    ' Whether some if_case path is no longer at its case.
+    \ self=iota args=json state=namespace
+    ^ bool
+    = cs (mcp_mount/cases self args)
+    % i=nat 0
+    ^ bool
+    ? (eq i cs.len) .false
+    = [p c] cs.at(i)
+    ? !(eq c (state.case(.z p).fall(0))) .true
+    | _ i.inc
+  + present
+    \ p=path state=namespace
+    ^ bool
+    | maybe/is_some (sovereign_care .x p state).fil
+  + listed
+    ' The paths a list of texts names, relative to the node or absolute.
+    \ self=iota key=str args=json
+    ^ row[path]
+    = none=row[path] []
+    ?> (./some field) (mcp_rpc/field key args) none
+    ? field
+     > (./arr xs)
+      | xs.fold none
+        \ out=row[path] x=json
+        ^ row[path]
+        ? x
+         > (./str s)
+          ?> (./some p) (mcp_mount/target self s) out
+          | out.snoc(p)
+        out
+    none
+  + cases
+    ' The if_case list: each {path, case}.
+    \ self=iota args=json
+    ^ row[[p=path c=nat]]
+    = none=row[[p=path c=nat]] []
+    ?> (./some field) (mcp_rpc/field "if_case" args) none
+    ? field
+     > (./arr xs)
+      | xs.fold none
+        \ out=row[[p=path c=nat]] x=json
+        ^ row[[p=path c=nat]]
+        ?> (./some p) (mcp_mount/target self (mcp_rpc/text_at "path" x)) out
+        | out.snoc([p (mcp_rpc/num_at "case" 0 x)])
+    none
   + shown_line
     ' The line a presented read pushes: {shown: {path, care, case}}.
     \ spec=mcp_mount/spec
@@ -905,7 +1217,7 @@
         | then.map (\ s=mcp_mount/spec (jkv (mcp_mount/shown s.pax) (mcp_mount/answer_json s state)))
       reason=str
         ?> (./some why) outcome ""
-        = word (http_foot/reason why)
+        = word (mcp_mount/value_text why)
         ? !(equal word "stale_case") word
         | mcp_mount/stale_reason writes state
       body (json/obj [(jkv "epoch" (json/num .false state.local.top)) (jkv "records" (json/arr records)) (jkv "refused" (json/boo refused)) (jkv "reason" (json/str reason)) (jkv "then" (json/obj reads))])
@@ -1000,22 +1312,14 @@
           = filled=row[json]
               | sources.map (\ e=jkv (mcp_mount/from_filled e))
           ? (mcp_mount/writes self filled)
-           > (./ok writes) (mcp_mount/batch id writes tag who then)
+           > (./ok writes)
+            ?> (./some why) (mcp_mount/refused self writes) (mcp_mount/batch id writes tag who then)
+            | mcp_mount/refuse id why
            > (./err why) (mcp_mount/refuse id why)
     | ./after read next
   + no_json
     ^ row[json]
     []
-  + write_specs
-    ' The specs as a batch: through write_from when any copies an
-    ' earlier case, else straight to one event.
-    \ self=iota id=json specs=row[json] tag=row[[path writ]] who=str then=row[mcp_mount/spec]
-    ^ http_foot/action
-    ? (specs.any((\ spec=json (gt (mcp_rpc/text_at "from" spec).len 0))))
-      | mcp_mount/write_from self id specs tag who then
-    ? (mcp_mount/writes self specs)
-     > (./ok writes) (mcp_mount/batch id writes tag who then)
-     > (./err why) (mcp_mount/refuse id why)
   + touched_json
     ' The paths one event's diff tree touched, from its log entry: the
     ' first hundred, and the count (a boot event touches a thousand).
@@ -1151,6 +1455,9 @@
      > (./make m)
        = [props b] (mcp_mount/record_sized m ref)
        | [(json/obj head.snoc((jkv "exists" (json/boo .true))).snoc((jkv "properties" props))) (add b (add text.len 80))]
+     > (./hold m said)
+       = [props b] (mcp_mount/record_sized m ref)
+       | [(json/obj head.snoc((jkv "exists" (json/boo .true))).snoc((jkv "properties" props))) (add b (add text.len 80))]
      > (./poke m)
        = [props b] (mcp_mount/record_sized m ref)
        | [(json/obj head.snoc((jkv "exists" (json/boo .true))).snoc((jkv "poked" (json/boo .true))).snoc((jkv "properties" props))) (add b (add text.len 80))]
@@ -1246,7 +1553,7 @@
         (mcp_mount/p "next" "string" "The next cursor a previous page of this same read answered: the page after it.")
         (mcp_mount/p "present" "boolean" "Answer as usual and push {shown: {path, care, case}} on the stream; nothing journaled, no epoch moves.")]
        [])
-     (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch."
+     (mcp_mount/tool "mcp/write" "Write: one event however many records; admitted whole or refused whole. Values are text, numbers, booleans, or {type, value} with type nat, str, bool, path or reference (/h/<care>/<case>/<len>/<path>; case 0 is live). A culled path refuses writes beneath it until the culled record is written again: delete-and-recreate is one batch. Conditions, checked against the state the batch is admitted on: require (paths that must exist), forbid (paths that must not), if_case ([{path, case}]: each subtree still at that case); one failing refuses the batch whole."
        [(mcp_mount/p "records" "array" "[{path, slots, action, if_case}, ...]: action make (default: the whole record, creating or replacing it), poke (merge slots), cull (delete the subtree); if_case N admits the batch only while that record is still at x case N (judged by the kernel in the same commit), else the whole batch is refused and the reason names the record and the case it is at.")
         (mcp_mount/p "from" "string" "On a record: /h/x/<case>/<len>/<path>, copy the record as it was at that case (undo, redo).")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")
@@ -1260,11 +1567,39 @@
         (mcp_mount/p "with" "string" "x or y: each event's written records ride in it as of that epoch, 500 nodes per event.")
         (mcp_mount/p "who" "string" "Writers to list: absent, every writer but system; all; or one writer's id.")]
        [])
-     (mcp_mount/tool "mcp/apply" "Apply a declared /op to the record with transient inputs: one event. then takes reads."
+     (mcp_mount/tool "mcp/apply" "Apply a declared /op with transient inputs. Namespace commands validate and commit a batch atomically; ordinary record ops remain supported. then reads the admitted state."
        [mcp_mount/path_param (mcp_mount/p "operation" "string" "Address of the op card.")
         (mcp_mount/p "inputs" "object" "Argument slots to values, encoded as for write.")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")]
-       ["path" "operation"])]
+       ["path" "operation"])
+     (mcp_mount/tool "scope/seen" "Every composition this world keeps or takes part in, as it stands for this world: one line a place, with how it stands (held, todo: yours to write, may: yours to ask, waits: another's, unproven, unfit, more: yours to add to, where the last name of the place stands for one you choose), the place, where the record is held or would be written, and the world that writes there. A why line follows a record that does not stand."
+       []
+       [])
+     (mcp_mount/tool "scope/packs" "The packs this world holds, a name a line: what scope/make makes a composition from."
+       []
+       [])
+     (mcp_mount/tool "scope/shape" "The table of one composition: a line a row, with where it sits, who writes, who reads, the action a record there asks for, what it must show, and the slots a record there may hold (a name ending in ? may be left out)."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")]
+       ["composition"])
+     (mcp_mount/tool "scope/fill" "Write a record at a place of a composition. The place must be this world's to write now and the record must have the shape its row gives. Filling a place and asking for an action are this one act: an ask is a record at a row that applies one."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")
+        (mcp_mount/p "place" "string" "The place by its path in the composition, as scope/seen spells it: /items/3")
+        (mcp_mount/p "slots" "object" "Slot names to values, encoded as for mcp/write.")]
+       ["composition" "place" "slots"])
+     (mcp_mount/tool "scope/make" "Make a composition from a pack this world holds: its tree, its table and its seats. A seat that holds an invitation is given a name and a link."
+       [(mcp_mount/p "pack" "string" "The pack's name.")
+        (mcp_mount/p "name" "string" "One word to call the composition by.")]
+       ["pack" "name"])
+     (mcp_mount/tool "scope/invite" "Give a place of a composition an invitation, where the place stands, is this world's to write and holds none: the next number this world has not used is put on its record (slot invite). A name is then minted for it, and scope/link gives its link."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")
+        (mcp_mount/p "place" "string" "The place by its path in the composition: /seats/third")]
+       ["composition" "place"])
+     (mcp_mount/tool "scope/link" "The link to an invitation this world minted, with its secret, to hand to whoever is to take the seat. Asked once it answers that the link is being made; asked again it gives the link."
+       [(mcp_mount/p "invitation" "number" "The invitation's number, as the seat's record holds it.")]
+       ["invitation"])
+     (mcp_mount/tool "scope/join" "Take a seat by a link this world was handed: this world claims the name the link carries and is brought before the scope as itself."
+       [(mcp_mount/p "link" "string" "The link, with its secret after it.")]
+       ["link"])]
   + param_json
     \ param=mcp_mount/param
     ^ jkv

@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Two worlds on one machine, talking through their Mesa feet.
+
+Boots world A (0x51) and world B (0x52) as two processes, each with the mcp and mesa mounts. Nothing outside
+tells a world anything: each foot makes its own seed, and this script then writes, through each world's own
+door, the port its foot is to listen on and a card for the other world, with the key that world's foot
+published. It checks through their doors that what A writes for B arrives in B: a first
+commit, a change, an addition, a removal, what is public, a restart of the reader, and that the reader's
+journal names its Mesa foot as the one that brought each landing in, and that the foot's desk answers records
+that ask it to sign. Nothing is read from a world's files.
+
+    x/check-net [--keep] [--base-port 8451]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class World:
+    def __init__(self, node, http, mesa, home):
+        self.node, self.http, self.mesa, self.home = node, http, mesa, home
+        self.process = None
+        self.count = 0
+        self.session = None
+
+    def start(self, timeout):
+        self.log = (self.home / 'eden.log').open('a')
+        self.process = subprocess.Popen(
+            [sys.executable, str(ROOT / 'x/eden'), '--node', self.node, '--port', str(self.http),
+             '--world', str(self.home / 'world'), '--mount', 'mcp', '--mount', 'mesa',
+             '--extras-root', str(ROOT / 'extras'), '--startup-timeout', str(timeout)],
+            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(f'{self.node} exited while starting; see {self.home}/eden.log')
+            try:
+                self.tool('read', path='/' + self.node + '/io/mesa', care='x')
+                return
+            except urllib.error.HTTPError:
+                break  # the door answered and let nobody in: the world is up
+            except Exception:
+                time.sleep(2)
+        else:
+            raise RuntimeError(f'{self.node} did not start in {timeout}s; see {self.home}/eden.log')
+        # The world is its own: it leaves its first session for whoever is at the machine.
+        left = self.home / 'world' / 'src' / 'io' / 'mesa' / 'out' / 'session'
+        while time.time() < deadline and not (left.exists() and left.stat().st_size > 0):
+            time.sleep(1)
+        if not (left.exists() and left.stat().st_size > 0):
+            raise RuntimeError(f'{self.node} left no first session at {left}')
+        self.session = left.read_text().strip()
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+        self.process = None
+
+    def tool(self, name, **arguments):
+        self.count += 1
+        body = json.dumps(dict(jsonrpc='2.0', id=self.count, method='tools/call',
+                               params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
+        headers = {'Content-Type': 'application/json'}
+        if self.session:
+            headers['Authorization'] = 'Bearer ' + self.session
+        request = urllib.request.Request(f'http://127.0.0.1:{self.http}/mcp', body, headers)
+        reply = json.load(urllib.request.urlopen(request, timeout=60))
+        result = reply['result']
+        if result.get('isError'):
+            raise RuntimeError(json.dumps(result)[:400])
+        return result.get('structuredContent', result)
+
+    def write(self, *records):
+        return self.tool('write', records=list(records))
+
+    def read(self, path, care='x'):
+        try:
+            return self.tool('read', path=path, care=care)
+        except Exception as error:
+            return {'error': str(error)}
+
+
+def slot_of(answer, slot):
+    """A slot's value in a read's answer, as the door gives it, or None."""
+    properties = answer.get('properties') or {}
+    return properties.get('/' + slot, properties.get(slot))
+
+
+def key_of(world, seconds=180):
+    """The key a world's foot published on its own record, once it has made its seed."""
+    found = []
+
+    def there():
+        value = slot_of(world.read('/' + world.node + '/io/mesa'), 'key')
+        if value is None:
+            return False
+        found.append(int(str(value)))
+        return True
+
+    return found[-1] if until(there, seconds) else 0
+
+
+def holds(answer, slot, value):
+    """Whether a read's answer holds a slot with a value. The door gives every value as text."""
+    properties = answer.get('properties') or {}
+    found = properties.get('/' + slot, properties.get(slot))
+    return found is not None and str(found) == str(value)
+
+
+def until(condition, seconds=90):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(1)
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the two world directories')
+    parser.add_argument('--base-port', type=int, default=8451)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-net-'))
+    ports = dict(a=(args.base_port, args.base_port + 1000), b=(args.base_port + 1, args.base_port + 1001))
+    (base / 'a').mkdir()
+    (base / 'b').mkdir()
+    a = World('0x51', *ports['a'], base / 'a')
+    b = World('0x52', *ports['b'], base / 'b')
+    rows = []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:500]), flush=True)
+
+    try:
+        a.start(args.timeout)
+        b.start(args.timeout)
+        keys = [key_of(a), key_of(b)]
+        def bare(world, session=None):
+            headers = {'Content-Type': 'application/json'}
+            if session:
+                headers['Authorization'] = 'Bearer ' + session
+            body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/list')).encode()
+            try:
+                return urllib.request.urlopen(
+                    urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, headers), timeout=30).status
+            except urllib.error.HTTPError as error:
+                return error.code
+
+        row('the agent door is opened by a session and by nothing else: a caller on the same machine that shows '
+            'none, or another, is refused',
+            bare(a) == 401 and bare(b) == 401 and bare(a, 'not the session') == 401 and bare(a, a.session) == 200,
+            [bare(a), bare(a, 'not the session')])
+        row('each foot makes its own seed and publishes its key on its record',
+            keys[0] > 0 and keys[1] > 0 and keys[0] != keys[1], keys)
+        a.write(dict(path='/0x51/io/mesa', action='poke', slots={'port': ports['a'][1]}),
+                dict(path='/0x51/io/mesa/0x52', slots={'key': keys[1], 'host': '127.0.0.1', 'port': ports['b'][1]}))
+        b.write(dict(path='/0x52/io/mesa', action='poke', slots={'port': ports['b'][1]}),
+                dict(path='/0x52/io/mesa/0x51', slots={'key': keys[0], 'host': '127.0.0.1', 'port': ports['a'][1]}))
+        row('a port and a card written through the door are taken up: the world holds them',
+            holds(a.read('/0x51/io/mesa'), 'port', ports['a'][1]) and
+            holds(b.read('/0x52/io/mesa/0x51'), 'port', ports['a'][1]))
+
+        a.write(dict(path='/0x51/our/0x52', slots={'title': 'for b'}),
+                dict(path='/0x51/our/0x52/doc', slots={'value': 10}),
+                dict(path='/0x51/our/0x52/a/b', slots={'value': 20}),
+                dict(path='/0x51/our/public', slots={'title': 'public'}),
+                dict(path='/0x51/our/public/note', slots={'value': 40}))
+        row('a first commit arrives', until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 10)),
+            b.read('/0x52/her/0x51/doc'))
+        row('with its deep name', holds(b.read('/0x52/her/0x51/a/b'), 'value', 20), b.read('/0x52/her/0x51/a/b'))
+        row('and what is public', until(lambda: holds(b.read('/0x52/her/0x51/public/note'), 'value', 40)),
+            b.read('/0x52/her/0x51/public/note'))
+        card = b.read('/0x52/io/mesa/0x51')
+        row('the reader keeps where the mount stands on its card', 'head' in json.dumps(card), card)
+
+        a.write(dict(path='/0x51/our/0x52/doc', action='poke', slots={'value': 11}),
+                dict(path='/0x51/our/0x52/c', slots={'value': 30}),
+                dict(path='/0x51/our/0x52/a/b', action='cull'))
+        row('a change arrives', until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 11)),
+            b.read('/0x52/her/0x51/doc'))
+        row('an addition arrives', holds(b.read('/0x52/her/0x51/c'), 'value', 30), b.read('/0x52/her/0x51/c'))
+        row('a removal arrives', not holds(b.read('/0x52/her/0x51/a/b'), 'value', 20), b.read('/0x52/her/0x51/a/b'))
+
+        journal = [b.read('/0x52/log', care=care) for care in ('y', 'z')]
+        row("the reader's journal names its Mesa foot as what brought the landings in",
+            any('/0x52/io/mesa' in json.dumps(answer) for answer in journal), json.dumps(journal[0])[:900])
+
+        b.write(dict(path='/0x52/our/0x51', slots={'title': 'for a'}),
+                dict(path='/0x52/our/0x51/reply', slots={'value': 77}))
+        row('the other direction works too', until(lambda: holds(a.read('/0x51/her/0x52/reply'), 'value', 77)),
+            a.read('/0x51/her/0x52/reply'))
+
+        a.write(dict(path='/0x51/io/mesa/ask/1', slots={'want': 'mint', 'id': 7}))
+        row('the foot answers a record that asks it to mint an invitation, and tells it the name',
+            until(lambda: holds(a.read('/0x51/io/mesa/ask/1'), 'done', 1) and
+                  slot_of(a.read('/0x51/io/mesa/ask/1'), 'name') is not None, 60),
+            a.read('/0x51/io/mesa/ask/1'))
+        a.write(dict(path='/0x51/io/mesa/ask/2', slots={'want': 'grant', 'session': 123456789, 'until': 99999999999}))
+        row('and signs a door grant when a record asks',
+            until(lambda: slot_of(a.read('/0x51/io/mesa/ask/2'), 'sig') is not None, 60),
+            a.read('/0x51/io/mesa/ask/2'))
+        a.write(dict(path='/0x51/io/mesa/ask/3', slots={'want': 'sing'}))
+        row('an ask its desk does not know is marked refused, with why',
+            until(lambda: holds(a.read('/0x51/io/mesa/ask/3'), 'done', 2), 60), a.read('/0x51/io/mesa/ask/3'))
+
+        b.stop()
+        a.write(dict(path='/0x51/our/0x52/doc', action='poke', slots={'value': 12}))
+        time.sleep(5)
+        row('the publisher survives a peer that is down', holds(a.read('/0x51/our/0x52/doc'), 'value', 12),
+            a.read('/0x51/our/0x52/doc'))
+        b.start(args.timeout)
+        row('a reader that was away catches up when it returns',
+            until(lambda: holds(b.read('/0x52/her/0x51/doc'), 'value', 12), 180), b.read('/0x52/her/0x51/doc'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        a.stop()
+        b.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

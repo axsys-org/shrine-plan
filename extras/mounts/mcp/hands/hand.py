@@ -32,9 +32,35 @@ import re
 import time
 import urllib.request
 
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
+
 _spec = importlib.util.spec_from_file_location('stream_hand', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream.py'))
 _stream = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_stream)
-stream_follow, stream_poll = _stream.follow, _stream.poll
+
+
+def stream_poll(base, node, seen, timeout=120, limit=40):
+    """One page of events after `seen`, with x, as stream-shaped lines; returns (lines, new seen). A page the world
+    refuses as too large (events that wrote many big records) is asked for again with half the limit, down to one."""
+    while True:
+        body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': 'mcp/history', 'arguments': {'after': seen, 'limit': limit, 'with': 'x'}})).encode()
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
+        result = json.load(urllib.request.urlopen(req, timeout=timeout))['result']
+        if 'structuredContent' in result:
+            page = result['structuredContent']
+            break
+        text = ''.join(c.get('text', '') for c in result.get('content', []))
+        if 'too large' in text and limit > 1:
+            limit = max(1, limit // 2)
+            continue
+        raise OSError('history refused: ' + text[:200])
+    lines = [{'epoch': e['epoch'], 'label': 'history', 'who': e.get('who'), 'touched': e['touched'], 'with': e.get('with') or {}} for e in page['events']]
+    return lines, (page.get('next') or (lines[-1]['epoch'] if lines else seen))
+
+
+def stream_follow(base, node, seen=0, interval=2.0, log=print):
+    """Lines forever, each commit once, from the world's push (stream.follow): the stream replays what was committed
+    after `seen` from the journal and then goes live, so nothing here polls. node and interval stay for the callers."""
+    return _stream.follow(base, seen=seen, log=log)
 
 
 class World:
@@ -45,7 +71,7 @@ class World:
     def tool(self, name, **arguments):
         self.seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=self.seq, method='tools/call', params={'name': 'mcp/' + name, 'arguments': arguments})).encode()
-        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(self.base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         reply = json.load(urllib.request.urlopen(req, timeout=self.timeout))
         result = reply.get('result') or {}
         if 'error' in reply or result.get('isError'):
@@ -116,7 +142,7 @@ class World:
         return build(root)
 
     def epoch(self):
-        with urllib.request.urlopen(self.base + '/probe/read?path=/' + self.node, timeout=self.timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(self.base + '/probe/read?path=/' + self.node, headers=SESSION), timeout=self.timeout) as r:
             return int(json.load(r).get('epoch') or 0)
 
 

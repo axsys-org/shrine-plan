@@ -16,6 +16,9 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 SIZES = [500, 400, 300, 250, 200, 150, 100, 50, 40, 10]     # children per folder, ten folders per kind: 2,000 records a kind
 KINDS = ['deals', 'people', 'invoices', 'notes']
@@ -35,7 +38,7 @@ def check(base, node, timeout, seed=None, calls=2000):
 
     def epoch():
         try:
-            with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+            with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
                 return json.load(r).get('epoch')
         except Exception:
             return None
@@ -45,7 +48,7 @@ def check(base, node, timeout, seed=None, calls=2000):
         nonlocal seq
         seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq, method=method, params=params)).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         e0 = epoch() if kind else None
         start = time.perf_counter()
         with urllib.request.urlopen(req, timeout=timeout) as response:

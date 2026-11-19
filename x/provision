@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Create the server a fleet's seat asks for, and start that machine under the seat's link.
+
+    x/provision --door https://<keeper>.<domain> --session-file FILE [--fleet fleet]        # says what it would do
+    x/provision ... --yes <seat>                                                            # does it, for that one seat
+
+A fleet (extras/mounts/fleet) seats machines. A seat that holds an invitation and no world is a machine
+somebody asked for: its record says what kind of server (kind) and where (place). This script reads the
+fleet at its keeper's agent door and, for each such seat with no server yet, says what it would create and
+what that costs. It creates nothing unless told to, one seat at a time, by name: a server is money.
+
+Told to, it creates the server through the provider's own command line (hcloud, as whoever runs this is
+signed in to it: this script holds no credential and puts none on any machine), copies this checkout to it,
+fetches the seat's link from the keeper (it is given once), leaves it in a file only root reads, and starts
+x/machine there under the seat's founding. The machine's world then claims itself, fills the seat, and
+tells the keeper where it is and how much room it has. Nothing else is done to it from here.
+
+With --watch it stays and does the same for every seat that asks, with nobody asked each time: that is a
+standing permission to spend, so it must be given a cap (--most) and is meant to run only where whoever pays
+has put a credential for it, themselves.
+
+With --network the server joins that private network and says its address there, so what passes between
+the front and a machine does not cross the open internet.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import founding_of, spell  # noqa: E402
+
+
+def call(url, session, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call', params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(url.rstrip('/') + '/mcp', body, {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + session})
+    result = json.load(urllib.request.urlopen(request, timeout=120))['result']
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', [])), result.get('structuredContent') or {}
+
+
+def hcloud(*words, parse=True):
+    done = subprocess.run(['hcloud', *words] + (['-o', 'json'] if parse else []), capture_output=True, text=True)
+    if done.returncode:
+        raise RuntimeError(f'hcloud {" ".join(words[:3])}: {done.stderr.strip()[:400]}')
+    return json.loads(done.stdout) if parse else done.stdout
+
+
+def asked(url, session, fleet):
+    """The machines a fleet asks for and has not got: {seat: its record}, for seats with a name and no world."""
+    refused, text, _ = call(url, session, 'scope/seen')
+    if refused:
+        raise RuntimeError('the keeper did not show what it takes part in: ' + text)
+    found, inside = {}, False
+    for line in text.splitlines():
+        if line.startswith('composition /'):
+            inside = line.strip() == 'composition /' + fleet
+            continue
+        parts = line.split(' ')
+        if inside and len(parts) == 4 and parts[0] == 'held' and parts[1].count('/') == 2 and parts[1].startswith('/machines/'):
+            slots = {k.lstrip('/'): v for k, v in (call(url, session, 'mcp/read', path=parts[2], care='x')[2].get('properties') or {}).items()}
+            if int(str(slots.get('name') or 0)) and not int(str(slots.get('world') or 0)) and int(str(slots.get('invite') or 0)):
+                found[parts[1].split('/')[2]] = slots
+    return found
+
+
+def price(kind, place):
+    for entry in hcloud('server-type', 'describe', kind).get('prices', []):
+        if entry.get('location') == place:
+            return f"EUR {float(entry['price_hourly']['gross']):.4f} an hour, at most EUR {float(entry['price_monthly']['gross']):.2f} a month"
+    return 'no price listed for that place'
+
+
+def create(args, session, seat, slots):
+    """Create the server for one seat and start its machine. Returns whether it did."""
+    name, kind, place = int(str(slots['name'])), str(slots['kind']), str(slots['place'])
+
+    # The link is given once, so it is fetched before anything is paid for and kept only in memory here.
+    link = ''
+    deadline = time.time() + 300
+    while time.time() < deadline and len(link.split(',')) != 12:
+        link = call(args.door, session, 'scope/link', invitation=int(str(slots['invite'])))[1].strip()
+        time.sleep(2)
+    if len(link.split(',')) != 12:
+        print(f"The keeper gave no link for seat {seat} (it is given once: has it been taken?). Nothing was created.", file=sys.stderr)
+        return False
+
+    order = ['server', 'create', '--name', 'shrine-' + seat, '--type', kind, '--location', place, '--image', args.image, '--ssh-key', args.key]
+    made = hcloud(*order, *(['--network', args.network] if args.network else []), *(['--firewall', args.firewall] if args.firewall else []))
+    server = made['server']
+    public = server['public_net']['ipv4']['ip']
+    private = (server.get('private_net') or [{}])[0].get('ip') or public
+    print(f'created shrine-{seat} at {public}' + (f' ({private} on {args.network})' if args.network else ''), flush=True)
+    ssh = ['ssh', '-i', str(args.identity), '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=10', 'root@' + public]
+
+    def on(command, text=None, timeout=3600):
+        return subprocess.run(ssh + [command], input=text, text=True, timeout=timeout, check=True)
+
+    deadline = time.time() + 600
+    while subprocess.run(ssh + ['true'], capture_output=True).returncode and time.time() < deadline:
+        time.sleep(5)
+    on('export DEBIAN_FRONTEND=noninteractive; apt-get update -q && apt-get install -y -q nix-bin nix-setup-systemd rsync '
+       '&& mkdir -p /opt/shrine/live /opt/shrine/flake /etc/shrine /var/lib/shrine/machine '
+       "&& grep -q flakes /etc/nix/nix.conf || echo 'experimental-features = nix-command flakes' >> /etc/nix/nix.conf")
+    carry = ['rsync', '-az', '--delete', '-e', f'ssh -i {args.identity} -o StrictHostKeyChecking=accept-new']
+    subprocess.run(carry + ['--exclude', '.check', '--exclude', '.git', '--exclude', 'result*', '--exclude', '__pycache__',
+                            str(ROOT) + '/', f'root@{public}:/opt/shrine/live/'], check=True)
+    subprocess.run(carry + [str(args.flake / 'flake.nix'), str(args.flake / 'flake.lock'), str(args.flake / 'nix'),
+                            f'root@{public}:/opt/shrine/flake/'], check=True)
+    on('umask 077; cat > /etc/shrine/link', text=link)
+    script = f'''#!/bin/sh
+# What this machine runs: its own world, the host it keeps, and the supervisor. Written by x/provision.
+cd /opt/shrine/live
+exec nix develop path:/opt/shrine/flake#eden --command python3 x/machine \\
+  --home /var/lib/shrine/machine --node {spell(name)} --port {args.port} --address {private} \\
+  --mounts "{args.mounts}" --limit {args.limit} --open {args.open} \\
+  --founding {founding_of(link)} --link-file /etc/shrine/link
+'''
+    unit = '''[Unit]
+Description=This machine: its own world and the supervisor of the worlds it runs
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/shrine/live
+Environment=HOME=/root
+Environment=_EDEN_NIX_ROOT=/opt/shrine/live
+ExecStart=/etc/shrine/machine.sh
+Restart=on-failure
+RestartSec=20
+KillMode=process
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
+'''
+    on('cat > /etc/shrine/machine.sh && chmod 755 /etc/shrine/machine.sh', text=script)
+    on('cat > /etc/systemd/system/shrine-machine.service && systemctl daemon-reload && systemctl enable -q --now shrine-machine', text=unit)
+    print(f'shrine-{seat} is starting its machine. The seat is filled when its world has claimed itself; '
+          f'the first start builds the runtime and can take a long while.', flush=True)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--door', required=True, help="the fleet keeper's door")
+    parser.add_argument('--session-file', type=Path, required=True)
+    parser.add_argument('--fleet', default='fleet')
+    parser.add_argument('--yes', default='', metavar='SEAT', help='create the server for this one seat')
+    parser.add_argument('--watch', action='store_true',
+                        help='stay, and create a server for every seat that asks, with nobody asked each time; needs --most')
+    parser.add_argument('--most', type=int, default=0, help='with --watch: never let more servers of this fleet exist than this')
+    parser.add_argument('--interval', type=float, default=60)
+    parser.add_argument('--key', default='shrine-pilot-host', help="the provider's name for the key the new server lets in")
+    parser.add_argument('--identity', type=Path, default=Path.home() / '.ssh' / 'id_ed25519_shrine')
+    parser.add_argument('--network', default='', help='a private network the server joins')
+    parser.add_argument('--firewall', default='', help="a firewall of the provider's the server is put behind")
+    parser.add_argument('--image', default='ubuntu-24.04')
+    parser.add_argument('--flake', type=Path, default=ROOT, help="the directory holding the runtime's flake")
+    parser.add_argument('--mounts', default='mcp mesa scope codecs host fleet')
+    parser.add_argument('--limit', type=int, default=4)
+    parser.add_argument('--open', type=int, default=4)
+    parser.add_argument('--port', type=int, default=8600)
+    args = parser.parse_args()
+    session = args.session_file.read_text().strip()
+    if args.watch:
+        if args.most <= 0:
+            parser.error('--watch needs --most: how many servers of this fleet may ever exist')
+        print(f'watching the fleet at {args.door}: a server is created for each seat that asks, up to {args.most} in all', flush=True)
+        while True:
+            try:
+                ours = {server['name'] for server in hcloud('server', 'list') if server['name'].startswith('shrine-')}
+                for seat, slots in sorted(asked(args.door, session, args.fleet).items()):
+                    if 'shrine-' + seat in ours:
+                        continue
+                    if len(ours) >= args.most:
+                        print(f'seat {seat} asks for a machine, and {len(ours)} of {args.most} servers exist: not created', flush=True)
+                        continue
+                    print(f"seat {seat}: creating shrine-{seat}, {slots.get('kind')} in {slots.get('place')}: {price(str(slots.get('kind')), str(slots.get('place')))}", flush=True)
+                    if create(args, session, seat, slots):
+                        ours.add('shrine-' + seat)
+            except (RuntimeError, OSError, subprocess.SubprocessError, KeyError, ValueError) as error:
+                print(f'this turn did nothing: {error}', flush=True)
+            time.sleep(args.interval)
+    wanted = asked(args.door, session, args.fleet)
+    have = {server['name'] for server in hcloud('server', 'list')}
+    todo = {seat: slots for seat, slots in wanted.items() if 'shrine-' + seat not in have}
+    if not todo:
+        print('Every machine the fleet asks for has a server, or it asks for none.')
+        return 0
+    for seat, slots in sorted(todo.items()):
+        print(f"seat {seat}: would create server shrine-{seat}, {slots.get('kind')} in {slots.get('place')}: {price(str(slots.get('kind')), str(slots.get('place')))}")
+    if not args.yes:
+        print('Nothing was created. Name one seat with --yes to create its server.')
+        return 0
+    if args.yes not in todo:
+        print(f'{args.yes} is not a seat that asks for a machine and has none.', file=sys.stderr)
+        return 1
+    return 0 if create(args, session, args.yes, todo[args.yes]) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

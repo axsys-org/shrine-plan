@@ -1,12 +1,20 @@
 - helm
 - http_response
 - http
+- door
 
 + http_foot
   + request
-    : method=str target=str body=str
+    ' asked is the session a request showed, as the hash of the secret it
+    ' carried, or 0 for none. The secret itself stops at the parser. who
+    ' is the session the door let in: asked, when this world keeps a grant
+    ' for it, and 0 for nobody otherwise. A route that requires someone
+    ' reads who. asked alone proves nothing; it is there for the one who
+    ' is about to be let in.
+    : method=str target=str body=str who=nat asked=nat
   + action
     & http_foot/action/snapshot
+      http_foot/action/admit
       http_foot/action/snapshot_bat
       http_foot/action/interact_bat
       http_foot/action/interact
@@ -20,7 +28,6 @@
       http_foot/action/commit
       http_foot/action/commit_many
       http_foot/action/batch
-      http_foot/action/batch_told
       http_foot/action/told
       http_foot/action/stream
       http_foot/action/broadcast
@@ -31,6 +38,11 @@
       http_foot/action/value
       http_foot/action/physical
       http_foot/action/inspect
+    + admit
+      ' Plan and commit against one state, then render that admitted state.
+      : plan={\ namespace}either[iota row[[p=path q=writ]]]
+        finish={\ maybe[pail] namespace}[nat str]
+        told={\ maybe[pail] namespace}str
     + snapshot_bat
       : read={\ namespace}[nat any nat]
     + interact_bat
@@ -67,20 +79,18 @@
       ' receives the event's outcome and that state.  The connection
       ' actor runs the pair; the foot sees one commit and a snapshot.
       : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str]
-    + batch_told
-      ' A batch, plus one line for the open streams. After the commit,
-      ' told runs on the new state and returns the line to send; an
-      ' empty string sends nothing.
-      : writes=row[[pax=path wit=writ]] finish={\ maybe[pail] namespace}[nat str] told={\ maybe[pail] namespace}str
     + told
       ' A read that also sends a fixed line to the open streams. Nothing
       ' is written to the journal.
       : read={\ namespace}[nat str] line=str
     + stream
       ' A GET that stays open. The connection sends the event-stream
-      ' head, registers with the fan-out, and then writes each line it
-      ' is given until the socket closes. Commits never wait for it.
-      :
+      ' head, registers with the fan-out, and then, on every commit,
+      ' writes the epochs after the last it sent, each rendered by line
+      ' from the journal (an empty line skips the epoch), until the
+      ' socket closes.  after resumes past an epoch already seen; none
+      ' starts at the top.  Commits never wait for it.
+      : after=maybe[nat] line={\ nat namespace}str
     + broadcast
       ' One line for every open stream, from a connection to the foot.
       : line=str
@@ -114,8 +124,11 @@
       feet/task/asset
       feet/task/ack
       feet/task/develop
-      feet/task/binary
+      feet/task/admitted
+      feet/task/committed
       http_foot/action/snapshot
+      http_foot/action/admit
+      feet/task/binary
       http_foot/action/snapshot_bat
       http_foot/action/interact_bat
       http_foot/action/interact
@@ -125,7 +138,6 @@
       http_foot/action/commit
       http_foot/action/commit_many
       http_foot/action/batch
-      http_foot/action/batch_told
       http_foot/action/told
       http_foot/action/stream
       http_foot/action/broadcast
@@ -292,11 +304,55 @@
         (error (http_foot/fault "Invalid Content-Length"))
     ? (gt n 1048576) (error (http_foot/fault "Request body too large"))
     | _ i.inc (./some n)
+  + cookie
+    ' The session a browser shows: the secret after session= in its Cookie
+    ' header, or nothing. A page cannot always set a header of its own, so
+    ' the door takes the same secret either way, and hashes it here as it
+    ' does a header's.
+    \ headers=str
+    ^ nat
+    = lines (http_foot/split 10 headers)
+    % i=nat 1
+    ^ nat
+    ? (ge i lines.len) 0
+    = line (http_foot/trim lines.at(i))
+    ?> (./some colon) (http_foot/find ":" line) (_ i.inc)
+    = name (http_foot/ascii_lower line.slice(0 colon))
+    ? !(equal[str] name "cookie") (_ i.inc)
+    = parts (http_foot/split 59 line.slice(colon.inc line.len))
+    % k=nat 0
+    ^ nat
+    ? (ge k parts.len) 0
+    = part (http_foot/trim parts.at(k))
+    ? (lt part.len 9) (_ k.inc)
+    ? !(equal[str] part.slice(0 8) "session=") (_ k.inc)
+    | door/named (http_foot/trim part.slice(8 part.len))
+  + session
+    ' The session a request speaks for: the hash of the secret after
+    ' "Bearer" in its Authorization header, or of the one its Cookie
+    ' header shows (http_foot/cookie), or nothing. The secret is hashed
+    ' here and goes no further: no route, no record and no log holds it.
+    \ headers=str
+    ^ nat
+    = lines (http_foot/split 10 headers)
+    % i=nat 1
+    ^ nat
+    ? (ge i lines.len) (http_foot/cookie headers)
+    = line (http_foot/trim lines.at(i))
+    ?> (./some colon) (http_foot/find ":" line) (_ i.inc)
+    = name (http_foot/ascii_lower line.slice(0 colon))
+      value (http_foot/trim line.slice(colon.inc line.len))
+    ? !(equal[str] name "authorization") (_ i.inc)
+    ? (lt value.len 8) 0
+    ? !(equal[str] (http_foot/ascii_lower value.slice(0 7)) "bearer ") 0
+    = secret (http_foot/trim value.slice(7 value.len))
+    ? (eq 0 secret.len) 0
+    | door/named secret
   + bad_request
     \ reason=str
     ^ http_foot/request
     ; (error (http_foot/fault reason))
-    | http_foot/request "" "" ""
+    | http_foot/request "" "" "" 0 0
   + request_line_valid
     ' Validate before splitting/packing a target ending in NUL, which
     ' would otherwise lose that byte and alias a different request.
@@ -330,6 +386,7 @@
      > (./some at)
       ? (gt at 65536) (http_foot/bad_request "Headers too large")
       = length (http_foot/content_length input.slice(0 at))
+        asked (http_foot/session input.slice(0 at))
       ? (ge input.len (add at length))
         = line (http_foot/split 10 input).at(0)
         ? !(http_foot/request_line_valid line) (http_foot/bad_request "Invalid request target bytes")
@@ -338,8 +395,8 @@
         ? !(equal[str] words.at(2) "HTTP/1.0")
           ? !(equal[str] words.at(2) "HTTP/1.1")
             (http_foot/bad_request "Unsupported HTTP version")
-          | http_foot/request words.at(0) words.at(1) input.slice(at length)
-        | http_foot/request words.at(0) words.at(1) input.slice(at length)
+          | http_foot/request words.at(0) words.at(1) input.slice(at length) 0 asked
+        | http_foot/request words.at(0) words.at(1) input.slice(at length) 0 asked
       = ;bytes (Read fd 16384)
       ? (eq bytes 0) (http_foot/bad_request "Incomplete request body")
       | _ input.cat((http_foot/request_chunk bytes))
@@ -379,7 +436,7 @@
            "Connection: close" http_foot/crlf http_foot/crlf]
     | add (str/to_atom header) (mul body (bex (mul 8 header.len)))
   + planned
-    '  What the listener decided for one connection: an encoded reply it
+    '  What the router decided for one connection: an encoded reply it
     '  could finish locally, or an action the foot must answer.
     & http_foot/planned/done
       http_foot/planned/ask
@@ -387,54 +444,65 @@
       : encoded=nat
     + ask
       : action=http_foot/action
+  + guard
+    ' The door. A request that shows no session goes to its route as
+    ' nobody. One that shows a session is first checked against the world:
+    ' the session opens the door when the world keeps a grant for it that
+    ' its own custody signed and that has not ended (door.foil), and the
+    ' request goes on as that session. One that does not goes on as
+    ' nobody, and nobody is answered only at the door itself
+    ' (http_foot/dispatch).
+    \ routes=row[http_foot/route] r=http_foot/request now=nat
+    ^ http_foot/action
+    = nobody r.set_who(0)
+    ? (eq 0 r.asked) (http_foot/dispatch routes nobody now)
+    = asked r.asked
+      reader
+        \ state=namespace
+        ^ [nat str]
+        [(? (door/open asked now state) 1 0) ""]
+      next
+        \ ok=nat ignored=str
+        ^ http_foot/action
+        | http_foot/dispatch routes (? (eq ok 1) r.set_who(asked) nobody) now
+    | http_foot/action/after reader next
   + plan
-    '  Read and route one request in the listener, which holds the
-    '  routes.  Only the fd and this small result cross to the
-    '  connection actor.  (A fresh actor per connection used to receive
-    '  the whole route configuration, every closure with its environment,
-    '  through the message copier on each request: that copy was the
-    '  per-request floor, and it grew with the loaded mounts.  A pool of
-    '  workers spawned once was tried and dropped: a worker waiting for
-    '  the foot's answer shares its mailbox with incoming connections.)
-    \ config=http_foot/config fd=nat
+    '  Route a complete request without socket I/O. One router retains
+    '  the routes, avoiding a copy of every mount closure per connection.
+    \ config=http_foot/config parsed=http_foot/request
     ^ http_foot/planned
-    ? (Try http_foot/read_request fd)
-     > (./err _) (./done (http_foot/encode (http_driver/response 400 "Malformed HTTP request")))
-     > (./ok parsed)
-      = ;attempt
-          | Try[http_foot/request http_foot/action]
-            (\ r=http_foot/request
-              | http_foot/dispatch config.routes r
-                  (div (Now 0) 1000000000))
-            parsed
-      ? attempt
-       > (./err _) (./done (http_foot/encode (http_driver/response 400 "Invalid request")))
-       > (./ok action)
-        ? action
-         > (./reply ready) (./done (http_foot/encode ready))
-         > (./bat status body ctype) (./done (http_foot/encode_bat status body ctype))
-         > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
-        (./ask action)
+    = ;attempt
+        | Try[http_foot/request http_foot/action]
+          (\ r=http_foot/request
+            | http_foot/guard config.routes r
+                (div (Now 0) 1000000000))
+          parsed
+    ? attempt
+     > (./err _) (./done (http_foot/encode (http_driver/response 400 "Invalid request")))
+     > (./ok action)
+      ? action
+       > (./reply ready) (./done (http_foot/encode ready))
+       > (./bat status body ctype) (./done (http_foot/encode_bat status body ctype))
+       > (./bytes status body ctype) (./done (http_foot/encode_bytes status body ctype))
+      (./ask action)
   + connection
     '  Finish one connection: write a local reply, or ask the foot for
     '  namespace work and write its answer.
-    \ fd=nat planned=http_foot/planned self=nat
+    \ fd=nat planned=http_foot/planned foot=nat
     ^ nat
-    = ;[root caps] (Recv[path] 0)
-      foot caps.at(0)
-    = streaming=bool
+    = opened=maybe[http_foot/action/stream]
         ? planned
          > (./ask action)
           ? action
-           > .stream .true
-          .false
-        .false
+           > opening=http_foot/action/stream (./some opening)
+          .none
+        .none
       joining=http_foot/action .join
-    ? streaming
+    ? opened
+     > (./some opening)
       ; (Try (\ wire=nat (Write fd wire)) (http_foot/bar http_foot/stream_head))
       ; (SendCaps foot joining [0])
-      ; (CloseHandle foot)
-      | http_foot/streaming fd
+      | http_foot/streaming fd foot opening.line opening.after
     = encoded=nat
         ? planned
          > (./done ready) ready
@@ -446,20 +514,26 @@
     ' What a stream connection and the fan-out exchange.
     & http_foot/stream_msg/join
       http_foot/stream_msg/line
+      http_foot/stream_msg/tick
       http_foot/stream_msg/streamed
-      http_foot/stream_msg/close
     + join
       :
     + line
+      ' A fixed line (a presented read): written as it is.
       : text=str
+    + tick
+      ' Something committed: render the epochs not yet sent.  From the
+      ' foot id is 0; to a stream it is the stream's own, for its acks.
+      : id=nat
     + streamed
-      ' A stream acknowledging one written line; the fan-out counts
-      ' lines outstanding per stream and lets go of one that stalls.
-      :
-    + close
-      ' The fan-out letting a stream go: the connection closes its
-      ' socket, so the tab learns the stream ended and opens another.
-      :
+      ' A stream acknowledging the message it was sent; until then the
+      ' fan-out sends it nothing more.
+      : id=nat
+  + subscriber
+    ' One open stream in the fan-out: its handle, whether it holds a
+    ' message not yet acknowledged, whether a commit came meanwhile, and
+    ' the fixed lines waiting for it.
+    : id=nat h=nat busy=bool dirty=bool lines=row[str]
   + stream_head
     ' The event-stream response head: no length, the body runs until
     ' the socket closes.
@@ -470,79 +544,187 @@
     \ text=str
     ^ nat
     | http_foot/bar (str/cat_all ["data: " text http_foot/crlf http_foot/crlf])
-  + streaming
-    ' A stream connection after its head is written: receive lines from
-    ' the fan-out, write each to the socket, acknowledge it; a failed
-    ' write (the tab went away) ends the connection.
-    \ fd=nat
-    ^ nat
-    % ignored=nat 0
-    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+  + page
+    ' One page of a stream, read on one snapshot: the events for the
+    ' epochs after last, at most 64 of them, each with its epoch as the
+    ' event id, as "<through> <top>" on the first line and the events
+    ' after it.  A stream opened at the top (none) is through the top
+    ' and says so once, as the comment ": at <top>", so a client that
+    ' opened live knows the epoch to resume after.
+    \ line={\ nat namespace}str last=maybe[nat] state=namespace
+    ^ [nat str]
+    = top state.local.top
+      from
+        ?> (./some n) last top
+        n
+      upto (? (gt top (add from 64)) (add from 64) top)
+      head (str/cat_all [(nat/show upto) " " (nat/show top) http_foot/crlf])
+      opening=row[str]
+        ? (maybe/is_some last) [head]
+        [head (str/cat_all [": at " (nat/show top) http_foot/crlf http_foot/crlf])]
+    % n=nat from.inc out=row[str] opening
+    ^ [nat str]
+    ? (gt n upto) [200 (str/cat_all out)]
+    = text (line n state)
+    ? (eq text.len 0) (_ n.inc out)
+    | _ n.inc out.snoc((str/cat_all ["id: " (nat/show n) http_foot/crlf "data: " text http_foot/crlf http_foot/crlf]))
+  + unpage
+    ' A page read back: the epoch it is through, the top, its events.
+    \ text=str
+    ^ maybe[[nat nat str]]
+    ?> (./some end) (http_foot/find http_foot/crlf text) .none
+    = head (http_foot/split 32 text.slice(0 end))
+    ? !(eq head.len 2) .none
+    ?> (./some through) (nat/parse head.at(0)) .none
+    ?> (./some top) (nat/parse head.at(1)) .none
+    | ./some [through top text.slice((add end 2) text.len)]
+  + catch_up
+    ' Write the epochs after last, a page per snapshot, until a page is
+    ' through the top it was read at: the epoch now sent through, and
+    ' whether every write went out.
+    \ fd=nat foot=nat line={\ nat namespace}str last=maybe[nat]
+    ^ [bool maybe[nat]]
+    % last=maybe[nat] last
+    ^ [bool maybe[nat]]
+    = ;answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (http_foot/page line last state))))
+      text=str
+        ? answer
+         > response=http_response (http_foot/body_text response)
+        ""
+    ? (http_foot/unpage text)
+     > .none [.true last]
+     > (./some got)
+      = [through top events] got
+        sent=maybe[nat] (./some through)
+      ? (eq events.len 0)
+        ? (lt through top) (_ sent)
+        [.true sent]
+      = ;wrote (Try (\ wire=nat (Write fd wire)) (http_foot/bar events))
+      ? wrote
+       > (./err _) [.false last]
+       > (./ok _)
+        ? (lt through top) (_ sent)
+        [.true sent]
+  + stream_step
+    ' One message from the fan-out: a line written as it is, or a tick
+    ' caught up from the journal.  Whether the socket took it, and the
+    ' last epoch sent.
+    \ fd=nat foot=nat line={\ nat namespace}str last=maybe[nat] message=http_foot/stream_msg
+    ^ [bool maybe[nat]]
     ? message
      > (./line text)
       = ;wrote (Try (\ wire=nat (Write fd wire)) (http_foot/frame text))
       ? wrote
-       > (./ok _)
-        = acked=http_foot/stream_msg .streamed
-        ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
-        ; (helm/supervisor/close_caps caps)
-        | _ 0
-       > (./err _)
-        ; (helm/supervisor/close_caps caps)
-        ; (CloseFd fd)
-        0
-     > .close
-      ; (helm/supervisor/close_caps caps)
-      ; (CloseFd fd)
-      0
+       > (./ok _) [.true last]
+       > (./err _) [.false last]
+     > (./tick id) (http_foot/catch_up fd foot line last)
+    [.true last]
+  + streaming
+    ' A stream connection after its head is written.  It keeps the last
+    ' epoch it sent (none until its first catch-up, which starts at the
+    ' top) and acknowledges each message once it is written, so the
+    ' fan-out never queues a second one and the foot's answers are the
+    ' only other mail.  A failed write (the client went away) is
+    ' acknowledged too, so the fan-out's next send finds the stream gone.
+    \ fd=nat foot=nat line={\ nat namespace}str after=maybe[nat]
+    ^ nat
+    % last=maybe[nat] after id=nat 0
+    = ;[message caps] (Recv[http_foot/stream_msg] 0)
+      mine
+        ? message
+         > (./tick given) (? (eq id 0) given id)
+        id
+      ;[ok next] (http_foot/stream_step fd foot line last message)
+      acked (http_foot/stream_msg/streamed mine)
+    ; (? (gt caps.len 0) (Send caps.at(0) acked) 0)
     ; (helm/supervisor/close_caps caps)
-    | _ 0
+    ? ok (_ next mine)
+    ; (CloseFd fd)
+    | CloseHandle foot
+  + offer
+    ' Send a stream its next message if it is idle: a waiting line first,
+    ' then a tick when a commit came.  None when its handle refuses.
+    \ s=http_foot/subscriber
+    ^ maybe[http_foot/subscriber]
+    ? s.busy (./some s)
+    = sending=maybe[http_foot/stream_msg]
+        ? (gt s.lines.len 0) (./some (http_foot/stream_msg/line s.lines.at(0)))
+        ? s.dirty (./some (http_foot/stream_msg/tick s.id))
+        .none
+    ?> (./some message) sending (./some s)
+    = ;sent (Try (\ target=nat (SendCaps target message [0])) s.h)
+    ? sent
+     > (./err _)
+      ; (Try (\ target=nat (CloseHandle target)) s.h)
+      .none
+     > (./ok _)
+      ? (gt s.lines.len 0) (./some (http_foot/subscriber s.id s.h .true s.dirty s.lines.drop(1)))
+      | ./some (http_foot/subscriber s.id s.h .true .false s.lines)
+  + offer_all
+    ' Offer every stream its next message; drop the ones that refuse.
+    \ streams=row[http_foot/subscriber]
+    ^ row[http_foot/subscriber]
+    = none=row[http_foot/subscriber] []
+    | streams.fold none
+      \ ;out=row[http_foot/subscriber] s=http_foot/subscriber
+      ^ row[http_foot/subscriber]
+      = ;offered (http_foot/offer s)
+      ?> (./some kept) offered out
+      | out.snoc(kept)
   + fanout
-    ' The stream registry: every open stream's handle with the lines it
-    ' has not yet acknowledged.  A line is sent to each with Try; a
-    ' stream whose handle refuses, or that falls more than 512 lines
-    ' behind (a burst of commits is normal; a reader that never catches
-    ' up is not), is told to close and dropped, so its socket closes
-    ' and the tab opens another instead of listening to silence.
-    ' Nothing here blocks: a commit hands the line over and goes on.
+    ' The stream registry.  Each stream is sent one message at a time and
+    ' acknowledges it: a tick when a commit comes (or when it joins), or
+    ' a fixed line.  Commits while a stream is busy coalesce into one
+    ' tick, so a slow stream renders more epochs per page and never
+    ' falls behind or loses one.  A stream with more than 64 lines
+    ' waiting, or whose handle refuses, is dropped.  Nothing here
+    ' blocks: a commit hands the tick over and goes on.
     \ self=nat
     ^ nat
-    % streams=row[[h=nat behind=nat]] []
+    % streams=row[http_foot/subscriber] [] serial=nat 1
     = ;[message caps] (Recv[http_foot/stream_msg] 0)
     ? message
      > .join
-      ? (eq caps.len 0) (_ streams)
+      ? (eq caps.len 0) (_ streams serial)
       ; (helm/supervisor/close_caps caps.drop(1))
-      | _ streams.snoc([caps.at(0) 0])
-     > .streamed
-      ? (eq caps.len 0) (_ streams)
-      = from caps.at(0)
-        eased
-          | streams.map
-            \ [h behind]
-            | [h (? (and (eq h from) (gt behind 0)) behind.dec behind)]
+      = waiting=row[str] []
+        joined (http_foot/subscriber serial caps.at(0) .false .true waiting)
+        ;kept (http_foot/offer_all streams.snoc(joined))
+      | _ kept serial.inc
+     > (./streamed id)
       ; (helm/supervisor/close_caps caps)
-      | _ eased
+      = eased
+          | streams.map
+            \ s=http_foot/subscriber
+            ^ http_foot/subscriber
+            ? (eq s.id id) (http_foot/subscriber s.id s.h .false s.dirty s.lines)
+            s
+        ;kept (http_foot/offer_all eased)
+      | _ kept serial
+     > (./tick id)
+      ; (helm/supervisor/close_caps caps)
+      = marked
+          | streams.map
+            \ s=http_foot/subscriber
+            ^ http_foot/subscriber
+            | http_foot/subscriber s.id s.h s.busy .true s.lines
+        ;kept (http_foot/offer_all marked)
+      | _ kept serial
      > (./line text)
       ; (helm/supervisor/close_caps caps)
-      = none=row[[h=nat behind=nat]] []
-        ;kept
+      = none=row[http_foot/subscriber] []
+        ;queued
           | streams.fold none
-          \ ;out=row[[h=nat behind=nat]] [h behind]
-          ^ row[[h=nat behind=nat]]
-          ? (gt behind 512)
-            = closing=http_foot/stream_msg .close
-            ; (Try (\ target=nat (Send target closing)) h)
-            ; (CloseHandle h)
+          \ ;out=row[http_foot/subscriber] s=http_foot/subscriber
+          ^ row[http_foot/subscriber]
+          ? (gt s.lines.len 64)
+            ; (Try (\ target=nat (CloseHandle target)) s.h)
             out
-          = ;sent (Try (\ target=nat (SendCaps target (http_foot/stream_msg/line text) [0])) h)
-          ? sent
-           > (./ok _) out.snoc([h behind.inc])
-           > (./err _)
-            ; (Try (\ target=nat (CloseHandle target)) h)
-            out
-      | _ kept
-    | _ streams
+          | out.snoc((http_foot/subscriber s.id s.h s.busy s.dirty s.lines.snoc(text)))
+        ;kept (http_foot/offer_all queued)
+      | _ kept serial
+    ; (helm/supervisor/close_caps caps)
+    | _ streams serial
   + outcome
     ' The commit answer a batch step reads: 200 admitted, or 409 with
     ' the kernel's reason as the body.
@@ -556,6 +738,7 @@
     \ why=pail
     ^ str
     ? why
+     > failure=helm/supervisor/rejection (iota_show failure.reason)
      > q=pails/q (iota_show q.q)
      > t=pails/t t.t
      > n=pails/n (nat/show n.n)
@@ -588,22 +771,6 @@
            > (./bat status body ctype) .none
            > (./bytes status body ctype) .none
       | http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state))))
-     > (./batch_told writes finish told)
-      = ;answer (http_foot/ask foot (http_foot/action/commit_many writes http_foot/outcome))
-        outcome=maybe[pail]
-          ? answer
-           > response=http_response (? (eq response.status 200) .none (./some (pails/t (http_foot/body_text response))))
-           > (./bat status body ctype) .none
-           > (./bytes status body ctype) .none
-        ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace (finish outcome state)))))
-        ;line (http_foot/ask foot (http_foot/action/snapshot (\ state=namespace [200 (told outcome state)])))
-      ; (? line
-          > response=http_response
-            = text (http_foot/body_text response)
-            ? (gt text.len 0) (Send foot (http_foot/action/broadcast text)) 0
-          > (./bat status body ctype) 0
-          > (./bytes status body ctype) 0)
-      | ready
      > (./told read line)
       = ;ready (http_foot/encode_answer (http_foot/ask foot (http_foot/action/snapshot read)))
       ; (? (gt line.len 0) (Send foot (http_foot/action/broadcast line)) 0)
@@ -618,18 +785,95 @@
      > (./bat status body ctype) (http_foot/encode_bat status body ctype)
      > (./bytes status body ctype) (http_foot/encode_bytes status body ctype)
     | http_foot/encode_answer (http_foot/ask foot action)
-  + listener
-    \ config=http_foot/config fd=nat self=nat
+  + router
+    ' Never waits for socket input or a namespace response. Parsed
+    ' requests enter here; each connection owns its response mailbox.
+    \ config=http_foot/config self=nat
     ^ nat
     = ;[root caps] (Recv[path] 0)
       foot caps.at(0)
     % ignored=nat 0
-    = ;connection (Accept fd)
-      ;planned (http_foot/plan config connection)
-      ;actor (Spawn (http_foot/connection connection planned))
-    ; (SendCaps actor root [foot])
-    ; (CloseHandle actor)
+    = ;[parsed peers] (Recv[maybe[http_foot/request]] 0)
+      peer peers.at(0)
+      ;planned
+        ? parsed
+         > (./some request) (http_foot/plan config request)
+         > .none (http_foot/planned/done (http_foot/encode (http_driver/response 400 "Malformed HTTP request")))
+    ; (SendCaps peer planned [foot])
+    ; (CloseHandle peer)
     | _ 0
+  + pool_msg
+    ' What an acceptor tells the listener.
+    & http_foot/pool_msg/took
+      http_foot/pool_msg/freed
+    + took
+      :
+    + freed
+      :
+  + streams
+    ' Will this planned connection stay open as a stream?
+    \ planned=http_foot/planned
+    ^ bool
+    ? planned
+     > (./ask action)
+      ? action
+       > opening=http_foot/action/stream .true
+      .false
+    .false
+  + acceptor
+    ' One of the listener's connection actors.  It waits in Accept on the
+    ' shared socket, serves the connection it gets, and goes back to
+    ' Accept, so one actor serves request after request: enki keeps a
+    ' halted actor's thread and heap until the scheduler is freed, and an
+    ' actor per connection leaked one per request.  It tells the listener
+    ' when it takes a connection and when it is free again.  A stream
+    ' holds its acceptor for the stream's life; when the stream ends the
+    ' acceptor exits rather than reuse a mailbox the fan-out may still
+    ' write to.  A stalled client stalls only its own acceptor.
+    \ fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      router caps.at(0)
+      listener caps.at(1)
+      took=http_foot/pool_msg .took
+      freed=http_foot/pool_msg .freed
+    % ignored=nat 0
+    = ;connection (Accept fd)
+    ; (Send listener took)
+    = ;parsed=maybe[http_foot/request]
+        ? (Try http_foot/read_request connection)
+         > (./ok request) (./some request)
+         > (./err _) .none
+    ; (SendCaps router parsed [0])
+    = ;[planned reply_caps] (Recv[http_foot/planned] 0)
+    ? (http_foot/streams planned)
+      | http_foot/connection connection planned reply_caps.at(0)
+    ; (http_foot/connection connection planned reply_caps.at(0))
+    ; (Send listener freed)
+    | _ 0
+  + listener
+    ' Keeps an acceptor waiting in Accept: it starts one more whenever the
+    ' last free one takes a connection, so the pool grows to the most
+    ' connections ever open at once (idle preconnects and streams
+    ' included) and never shrinks.
+    \ config=http_foot/config fd=nat self=nat
+    ^ nat
+    = ;[root caps] (Recv[path] 0)
+      foot caps.at(0)
+      ;router (Spawn (http_foot/router config))
+    ; (SendCaps router root [foot])
+    ; (CloseHandle foot)
+    % free=nat 0
+    ? (eq free 0)
+      = ;fresh (Spawn (http_foot/acceptor fd))
+      ; (SendCaps fresh root [router 0])
+      ; (CloseHandle fresh)
+      | _ 1
+    = ;[message ignored] (Recv[http_foot/pool_msg] 0)
+    ? message
+     > .took (_ free.dec)
+     > .freed (_ free.inc)
+    | _ free
   + reply
     \ conn=nat response=http_response
     ^ nat
@@ -757,6 +1001,29 @@
           ; (Send item.conn (http_foot/action/bat status body mime))
           out
       | _ serial left queue
+     > (http_foot/action/admit plan finish told)
+      ? (eq caps.len 0) (_ serial pending queue)
+      = conn caps.at(0)
+        complete
+          \ outcome=maybe[pail] state=namespace
+          ^ [nat str str]
+          = [status body] (finish outcome state)
+          | [status body (told outcome state)]
+      ; (helm/supervisor/close_caps caps.drop(1))
+      ; (Send initial.parent (feet/gift/admit serial plan complete))
+      | _ serial.inc pending.snoc((http_foot/pending ($u serial) conn)) queue
+     > (feet/task/admitted request status body line)
+      ; (helm/supervisor/close_caps caps)
+      ; (? (gt line.len 0) (Send streams (http_foot/stream_msg/line line)) 0)
+      = empty=row[http_foot/pending] []
+        ;left
+          | pending.fold empty
+          \ ;out=row[http_foot/pending] item=http_foot/pending
+          ^ row[http_foot/pending]
+          ? !(eq_iota item.key ($u request)) out.snoc(item)
+          ; (http_foot/reply item.conn (http_response status (str/to_atom body) "application/json; charset=utf-8"))
+          out
+      | _ serial left queue
      > (http_foot/action/snapshot read)
       ? (eq caps.len 0) (_ serial pending queue)
       = conn caps.at(0)
@@ -804,20 +1071,20 @@
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > (http_foot/action/batch_told writes finish told)
-      ? (eq caps.len 0) (_ serial pending queue)
-      ; (http_foot/reply caps.at(0) (http_driver/response 500 "A batch is run by the connection, not the foot"))
-      ; (helm/supervisor/close_caps caps.drop(1))
-      | _ serial pending queue
      > (http_foot/action/told read line)
       ? (eq caps.len 0) (_ serial pending queue)
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A told read is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
       | _ serial pending queue
-     > .stream
+     > (http_foot/action/stream after line)
       ? (eq caps.len 0) (_ serial pending queue)
       ; (http_foot/reply caps.at(0) (http_driver/response 500 "A stream is run by the connection, not the foot"))
       ; (helm/supervisor/close_caps caps.drop(1))
+      | _ serial pending queue
+     > (feet/task/committed top)
+      ' a commit, from the supervisor: every stream renders what it has not sent
+      ; (helm/supervisor/close_caps caps)
+      ; (Send streams (http_foot/stream_msg/tick 0))
       | _ serial pending queue
      > .join
       ' a stream connection joining: its handle goes to the fan-out
@@ -1016,6 +1283,11 @@
     \ routes=row[http_foot/route] request=http_foot/request now=nat
     ^ http_foot/action
     = url (http_foot/split 63 request.target).at(0)
+    ' Nobody is answered anywhere but at the door itself (/door), where a
+    ' session or a link is shown. Every other route, whatever mount it
+    ' belongs to, is reached only by a session this world let in. Being
+    ' on the same machine opens nothing.
+    ? (and (eq 0 request.who) !(http_foot/matches "/door" url)) (./reply (http_driver/response 401 "Only someone this world has let in is answered here. A link or a session is shown at /door."))
     % idx=nat 0 best=maybe[http_foot/route] .none
     ^ http_foot/action
     ? (eq idx routes.len)

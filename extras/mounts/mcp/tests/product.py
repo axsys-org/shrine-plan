@@ -11,6 +11,9 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import os
+
+SESSION = {'Authorization': 'Bearer ' + os.environ['SHRINE_SESSION']} if os.environ.get('SHRINE_SESSION') else {}   # the door lets in only a session
 
 
 def check(base, node, timeout):
@@ -20,7 +23,7 @@ def check(base, node, timeout):
 
     def epoch():
         try:
-            with urllib.request.urlopen(base + '/probe/read?path=/' + node, timeout=timeout) as r:
+            with urllib.request.urlopen(urllib.request.Request(base + '/probe/read?path=/' + node, headers=SESSION), timeout=timeout) as r:
                 return json.load(r).get('epoch')
         except Exception:
             return None
@@ -29,7 +32,7 @@ def check(base, node, timeout):
         nonlocal seq
         seq += 1
         body = json.dumps(dict(jsonrpc='2.0', id=seq, method=method, params=params)).encode()
-        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json'})
+        req = urllib.request.Request(base + '/mcp', body, {'Content-Type': 'application/json', **SESSION})
         e0 = epoch() if kind else None
         start = time.perf_counter()
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -237,6 +240,10 @@ def check(base, node, timeout):
     hist = tool('history', 'history', path=members + '/alice')
     expect('13 history lists the cases newest first', [v['case'] for v in hist['versions']] == sorted([v['case'] for v in hist['versions']], reverse=True) and hist['cases'] >= 2, True)
     expect('13 the newest case holds the latest write', hist['versions'][0]['properties']['/salary'], '150')
+    at = tool('read', 'read (at a case)', path=members + '/alice', care='x', case=hist['versions'][0]['case'])
+    expect('13 a read at the newest case answers that case, not a pin of the pin', (at['exists'], at['properties'].get('/salary')), (True, '150'))
+    first = tool('read', 'read (at the first case)', path=members + '/alice', care='x', case=hist['versions'][-1]['case'])
+    expect('13 a read at the first case answers the first write', (first['exists'], first['properties'].get('/salary')), (True, hist['versions'][-1]['properties'].get('/salary')))
     expect('13 apply on a record without that op is refused, no event', tool_error('apply', path=members + '/alice', operation=members + '/alice/op/missing', inputs={}), True)
     log = tool('history', 'history (events)', limit=5)
     expect('13 events newest first, each with its epoch and touched paths', [e['epoch'] for e in log['events']] == sorted([e['epoch'] for e in log['events']], reverse=True) and all(e['touched'] for e in log['events']), True)

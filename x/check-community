@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""An invitation, claimed, on one machine: a community and the world prepared for one of its places.
+
+Boots a community world (0x61) and, once its foot has minted the invitation for a place, a second world
+under the minted name. Each has the mcp, mesa and scope mounts. It checks that the community's first session
+is left for whoever is at the machine and opens its door; that the place asks for its invitation and takes
+the name; that the door gives the link, with its secret, to the owner and to nobody else, once, and the
+secret is in no record; that a world started under the name lets nobody in; that handed the link at its own
+door it claims itself, lets in the session that came with the link, meets the community and asks to be
+brought before it; that the community takes the claim from a world it does not yet hear, gives that world
+an address from the introduction its custody signed, fills the place and lists it; and that the two then
+publish to each other.
+
+One part of the finished system is played by this script, and each row that leans on it says so:
+
+    the host   A prepared world is started by a host with the name's founding (the last four parts of the
+               link, never its secret) and is told where it is reached. The script starts the process
+               with `x/eden --founding` and writes the address through the new world's door.
+
+Joining with a world one already has needs a world founded under its own name, which the launcher cannot
+start yet. The foot's suite covers it (tests/mesa_foot, case joining).
+
+    x/check-community [--keep] [--base-port 8461]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job.
+"""
+import argparse
+import json
+import secrets
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, founding_of, number_of, spell, until  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8461)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-community-'))
+    c = World('0x61', args.base_port, args.base_port + 1000, base / 'c')
+    n = None
+    rows = []
+    place = '/0x61/app/community/members/alice'
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:600]), flush=True)
+
+    try:
+        c.start(args.timeout)
+        until(lambda: c.number('/0x61/io/mesa', 'key') > 0, 180)
+        c_key = c.number('/0x61/io/mesa', 'key')
+        c.owner()
+        row("a world that is its own leaves its first session for whoever is at the machine, and it opens the door",
+            c.post('/scope/link/9')[0] == 404 and c.post('/scope/link/9', nobody=True)[0] == 401
+            and c.post('/scope/link/9', session='not the session')[0] == 401,
+            [c.post('/scope/link/9'), c.post('/scope/link/9', nobody=True)])
+        c.write(dict(path='/0x61/io/scope/community',
+                     slots={'root': dict(type='reference', path='/0x61/app/community', care='x', case=0)}),
+                dict(path=place, slots={'lede': 'a seat for Alice', 'invite': 1}))
+        row("a record that holds an invitation's number is a place: it asks, the foot mints, and it takes the name",
+            until(lambda: c.number(place, 'name') > 0, 180), c.read(place))
+        name = c.number(place, 'name')
+        node = spell(name)
+        card = '/0x61/io/mesa/' + node
+        row("the community keeps the minted name's card, with its first statement and no address",
+            c.number(card, 'seq') == 1 and c.number(card, 'port') == 0, c.read(card))
+
+        row('the door gives the link to nobody', c.post('/scope/link/1', nobody=True)[0] == 401,
+            c.post('/scope/link/1', nobody=True))
+        link = c.link(1)
+        parts = link.split(',')
+        row("and to the owner: the scope's address, the name with its founding, and the secret after them",
+            len(parts) == 12 and int(parts[1]) == number_of('0x61') and int(parts[4]) == c.mesa
+            and parts[5] == '/app/community' and int(parts[6]) == name, parts[:7])
+        left = c.files() / 'io' / 'mesa' / 'out' / '1'
+        secret = int(parts[11]) if len(parts) == 12 else 0
+        told = json.dumps([c.read('/0x61/io/mesa/ask/link/1'), c.read('/0x61/io/mesa/ask/invite/1'), c.read(place),
+                           c.read('/0x61/io/mesa/ask', care='y')])
+        row('the secret is in no record, and the file it passed through is emptied',
+            secret > 0 and str(secret) not in told and left.exists() and left.stat().st_size == 0, told)
+
+        n = World(node, args.base_port + 1, args.base_port + 1001, base / 'n', founding=founding_of(link))
+        n.start(args.timeout)
+        home = '/' + node + '/io/mesa'
+        invited = c.number(card, 'custody')
+        row('[the host: played by this script] started under the name and handed its address, the world lets '
+            'nobody in: no first session is left, and its doors answer nobody, the agent door included',
+            not (n.files() / 'io' / 'mesa' / 'out' / 'session').exists()
+            and 'error' in n.read(home) and n.post('/scope/link/9', nobody=True)[0] == 401, n.read(home))
+
+        session = secrets.token_hex(16)
+        n.session = session
+        wrong = ','.join(parts[:11] + [str(secret + 1)])
+        said = n.join(wrong, session=session)
+        ask = home + '/ask/join/' + node
+        row('handed the link with another secret, it claims nothing and lets nobody in',
+            said[0] == 202 and not until(lambda: n.post('/scope/link/9', session=session)[0] != 401, 30)
+            and 'error' in n.read(home), [said, n.read(ask)])
+        said = n.join(link, session=session)
+        row('handed the link at its own door by nobody, the prepared world claims itself',
+            said[0] == 202 and until(lambda: n.number(home, 'seq') == 2, 120), [said, n.read(home), n.read(ask)])
+        row('custody is then its own',
+            n.number(home, 'custody') not in (0, invited) and n.number(home, 'key') != c_key, n.read(home))
+        row('the session that came with the link is let in, and no other',
+            until(lambda: n.post('/scope/link/9', session=session)[0] == 404, 60)
+            and n.post('/scope/link/9', session='another')[0] == 401
+            and n.post('/scope/link/9', nobody=True)[0] == 401,
+            n.post('/scope/link/9', session=session))
+        n.session = session
+        handed = n.files() / 'io' / 'mesa' / 'in' / str(name)
+        row("the secret's file is emptied once the claim is made, and the ask says so",
+            until(lambda: n.number(ask, 'spent') == 1 and handed.stat().st_size == 0, 60), n.read(ask))
+        row('a link is not handed over twice', n.join(link)[0] == 409, n.join(link))
+        joining = '/' + node + '/io/scope/' + node
+        row('the claim made, the world meets the community at the address the link gave and takes its part',
+            until(lambda: n.number(joining, 'scope') == number_of('0x61')
+                  and n.number(home + '/0x61', 'port') == c.mesa, 120),
+            [n.read(joining), n.read(home + '/0x61')])
+        row('the claim reaches the community from a world it does not hear',
+            until(lambda: c.number(card, 'seq') == 2, 180), [c.read(card), n.read(home + '/ask/bring/' + node)])
+        row('and the introduction its custody signed gives its card an address',
+            until(lambda: c.number(card, 'port') == n.mesa, 180), c.read(card))
+        row('the place is filled by the name that was claimed',
+            until(lambda: c.number(place, 'world') == name, 120), c.read(place))
+        entry = '/0x61/app/community/catalog/' + node
+        row('and is listed at once', until(lambda: c.number(entry, 'world') == name, 120), c.read(entry))
+
+        c.write(dict(path='/0x61/our/' + node + '/welcome', slots={'value': 1}))
+        row('what the community publishes to its new member arrives, sealed for it',
+            until(lambda: n.number('/' + node + '/her/0x61/welcome', 'value') == 1, 180),
+            n.read('/' + node + '/her/0x61/welcome'))
+        n.write(dict(path='/' + node + '/our/0x61', slots={'title': 'for the community'}),
+                dict(path='/' + node + '/our/0x61/hello', slots={'value': 2}))
+        row('and what the member publishes to the community arrives',
+            until(lambda: c.number('/0x61/her/' + node + '/hello', 'value') == 2, 180),
+            c.read('/0x61/her/' + node + '/hello'))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        c.stop()
+        if n:
+            n.stop()
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed; the host is played by this script (one row)', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

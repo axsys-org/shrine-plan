@@ -1,10 +1,10 @@
-"""The MCP mount is local only: it listens with the world on 127.0.0.1 and has no credential."""
+"""The MCP mount is opened by a session and nothing else: a caller shows one the world's custody granted."""
 from pathlib import Path
 
 
 def prepare(root, work, check, cleanup, context):
     if not check:
-        print('MCP at /mcp of the world\'s URL (local, no credential); the live page at /live?views=/0x11/user/<folder>; setup in extras/mounts/mcp/SETUP.md', flush=True)
+        print('MCP at /mcp of the world\'s URL (send the session as Authorization: Bearer; the first one is left in <world>/src/io/mesa/out/session); the live page at /live?views=/0x11/user/<folder>; setup in extras/mounts/mcp/SETUP.md', flush=True)
     return root, []
 
 
