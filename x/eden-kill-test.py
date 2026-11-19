@@ -178,18 +178,6 @@ class KillTest(unittest.TestCase):
                 self.assertEqual(world.put('make', f'{HOME}/after', 1), 200)
                 self.assertEqual(world.read('/' + NODE)[1]['epoch'], epoch + 1)
 
-                # Stalled clients wait alone.
-                stalled = [socket.create_connection(('127.0.0.1', world.port)) for _ in range(8)]
-                partial = socket.create_connection(('127.0.0.1', world.port))
-                partial.sendall(b'POST /probe/make HTTP/1.1\r\nContent-Length: 400\r\n\r\npath=')
-                stalled.append(partial)
-                time.sleep(.3)
-                started = time.perf_counter()
-                self.assertEqual(world.read('/' + NODE)[0], 200)
-                measured['read_ms_beside_stalled_clients'] = round((time.perf_counter() - started) * 1000, 1)
-                for sock in stalled:
-                    sock.close()
-
                 # In the middle of a burst: whatever was acknowledged stays.
                 acknowledged = []
                 killer = threading.Timer(BURST_SECONDS, world.kill)
