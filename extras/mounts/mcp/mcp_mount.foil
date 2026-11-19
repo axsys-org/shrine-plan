@@ -7,6 +7,8 @@
 - weft_std
 - namespace
 - namespace_command
+- net
+- scope_mount
 
 ' MCP over the native cards and nothing else: a read is one snapshot
 ' (no event), a write is one poke (one event), history is a snapshot
@@ -21,12 +23,16 @@
         ^ http_foot/action
         = parts (http_foot/split 63 request.target)
           url parts.at(0)
+        ' This door is opened by a session and by nothing else: whoever
+        ' asks must show one this world's custody granted (door/open).
+        ' Being on the same machine opens nothing.
+        ? (eq 0 request.who) (./reply (http_driver/response 401 "Only someone this world has let in may use this door."))
         ? (and (equal request.method "GET") (equal url "/mcp/stream"))
           | mcp_mount/stream self (? (eq parts.len 2) parts.at(1) "")
         ? !(equal request.method "POST") (./reply (http_driver/response 405 "POST required"))
         ? (mcp_rpc/parse_call request.body)
          > (./err why) (./reply (mcp_mount/json (mcp_rpc/failure jnull 32700 why)))
-         > (./ok call) (mcp_mount/dispatch self call)
+         > (./ok call) (mcp_mount/dispatch self call request now)
     | http_foot/add_routes [(http_foot/route "/mcp" plan)] http_foot/empty
   + stream
     ' GET /mcp/stream: server-sent events, one per commit from any
@@ -75,8 +81,46 @@
     \ id=json message=str
     ^ http_foot/action
     | mcp_mount/reply id (mcp_rpc/text_content message .true)
+  + said
+    \ id=json status=nat text=str
+    ^ http_response
+    | mcp_mount/json (mcp_rpc/result id (mcp_rpc/text_content text (ge status 400)))
+  + wrapped
+    \ id=json status=nat text=str
+    ^ [nat str]
+    [200 (mcp_rpc/result id (mcp_rpc/text_content text (ge status 400)))]
+  + voice
+    ' How the acts of a scope answer an agent's call: as a tool's result,
+    ' an error where the act refused.
+    \ id=json
+    ^ scope_mount/voice
+    | scope_mount/voice (\ status=nat text=str (mcp_mount/said id status text)) (\ status=nat text=str (mcp_mount/wrapped id status text))
+  + posed
+    ' A request at this world's door as the caller of a tool makes it:
+    ' under the session the call itself showed.
+    \ request=http_foot/request target=str body=str
+    ^ http_foot/request
+    | http_foot/request "POST" target body request.who request.asked
+  + scoped
+    ' The compositions this world takes part in, for an agent: the same
+    ' acts a person's request reaches (scope_mount), under the same
+    ' rules, answered as a tool's result. Nothing here decides anything.
+    \ self=iota id=json name=str args=json request=http_foot/request now=nat
+    ^ http_foot/action
+    = v (mcp_mount/voice id)
+    ? (equal name "scope/seen") (scope_mount/seeing v)
+    ? (equal name "scope/packs") (scope_mount/packing v)
+    ? (equal name "scope/invite") (scope_mount/inviting (mcp_rpc/text_at "composition" args) (mcp_rpc/text_at "place" args) v)
+    ? (equal name "scope/shape") (scope_mount/shaping (mcp_rpc/text_at "composition" args) v)
+    ? (equal name "scope/make") (scope_mount/making self (mcp_rpc/text_at "pack" args) (mcp_rpc/text_at "name" args) v)
+    ? (equal name "scope/link") (scope_mount/linking self (mcp_mount/posed request (str/cat_all ["/scope/link/" (nat/show (mcp_rpc/num_at "invitation" 0 args))]) "") now v)
+    ? (equal name "scope/join") (scope_mount/joining (mcp_mount/posed request "/scope/join" (mcp_rpc/text_at "link" args)) now v)
+    ? !(equal name "scope/fill") (mcp_mount/refuse id "Unknown tool")
+    ? (mcp_mount/record (mcp_rpc/object_at "slots" args))
+     > (./err why) (mcp_mount/refuse id (str/cat_all ["slots: " why]))
+     > (./ok record) (scope_mount/filling (mcp_rpc/text_at "composition" args) (mcp_rpc/text_at "place" args) record v)
   + dispatch
-    \ self=iota call=mcp_rpc/call
+    \ self=iota call=mcp_rpc/call request=http_foot/request now=nat
     ^ http_foot/action
     ? (equal call.method "initialize") (mcp_mount/reply call.id (mcp_rpc/initialize "shrine"))
     ? (equal call.method "notifications/initialized") (./reply (http_driver/response 202 ""))
@@ -90,6 +134,7 @@
         ? many
          > (./arr xs) (? (eq xs.len 0) "" (mcp_rpc/text_at "path" xs.at(0)))
         (mcp_rpc/text_at "path" args)
+    ? (and (ge name.len 6) (equal[str] name.slice(0 6) "scope/")) (mcp_mount/scoped self call.id name args request now)
     ? (and (equal name "mcp/history") (eq first.len 0))
       = with_text (mcp_rpc/text_at "with" args)
         with=maybe[care] (? (eq with_text.len 0) .none (./some (mcp_mount/care with_text)))
@@ -421,7 +466,10 @@
     ' One node's own fields, without its children.  The path is printed
     ' once and the references spelled from it.  Every node carries its
     ' pinned x reference; the y and z references, which a tack pins,
-    ' ride on the root of an answer only.
+    ' ride on the root of an answer only.  A record held from another world
+    ' says the version its publisher gave it (version): the one number
+    ' every reader of it holds alike, so two of them can name the same
+    ' one. 0 for a record of this world's own.
     \ pax=path tree=axal[myth] state=namespace top=bool
     ^ [row[jkv] nat]
     ? ((is_xv pax) || ((is_o pax) || (is_r pax)))
@@ -446,6 +494,7 @@
         (jkv "reference" x)
         (jkv "reference_y" y)
         (jkv "reference_z" z)
+        (jkv "version" (json/num .true (net/version pax state)))
         (jkv "properties" props)]
        (add pbytes (add (mul 4 text.len) 120))]
   + paged
@@ -1522,7 +1571,35 @@
        [mcp_mount/path_param (mcp_mount/p "operation" "string" "Address of the op card.")
         (mcp_mount/p "inputs" "object" "Argument slots to values, encoded as for write.")
         (mcp_mount/p "then" "array" "[a read, ...] answered on the admitted state in the same reply.")]
-       ["path" "operation"])]
+       ["path" "operation"])
+     (mcp_mount/tool "scope/seen" "Every composition this world keeps or takes part in, as it stands for this world: one line a place, with how it stands (held, todo: yours to write, may: yours to ask, waits: another's, unproven, unfit), the place, where the record is held or would be written, and the world that writes there. A why line follows a record that does not stand."
+       []
+       [])
+     (mcp_mount/tool "scope/packs" "The packs this world holds, a name a line: what scope/make makes a composition from."
+       []
+       [])
+     (mcp_mount/tool "scope/shape" "The table of one composition: a line a row, with where it sits, who writes, who reads, the action a record there asks for, what it must show, and the slots a record there may hold (a name ending in ? may be left out)."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")]
+       ["composition"])
+     (mcp_mount/tool "scope/fill" "Write a record at a place of a composition. The place must be this world's to write now and the record must have the shape its row gives. Filling a place and asking for an action are this one act: an ask is a record at a row that applies one."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")
+        (mcp_mount/p "place" "string" "The place by its path in the composition, as scope/seen spells it: /items/3")
+        (mcp_mount/p "slots" "object" "Slot names to values, encoded as for mcp/write.")]
+       ["composition" "place" "slots"])
+     (mcp_mount/tool "scope/make" "Make a composition from a pack this world holds: its tree, its table and its seats. A seat that holds an invitation is given a name and a link."
+       [(mcp_mount/p "pack" "string" "The pack's name.")
+        (mcp_mount/p "name" "string" "One word to call the composition by.")]
+       ["pack" "name"])
+     (mcp_mount/tool "scope/invite" "Give a place of a composition an invitation, where the place stands, is this world's to write and holds none: the next number this world has not used is put on its record (slot invite). A name is then minted for it, and scope/link gives its link."
+       [(mcp_mount/p "composition" "string" "The name scope/seen gives the composition.")
+        (mcp_mount/p "place" "string" "The place by its path in the composition: /seats/third")]
+       ["composition" "place"])
+     (mcp_mount/tool "scope/link" "The link to an invitation this world minted, with its secret, to hand to whoever is to take the seat. Asked once it answers that the link is being made; asked again it gives the link."
+       [(mcp_mount/p "invitation" "number" "The invitation's number, as the seat's record holds it.")]
+       ["invitation"])
+     (mcp_mount/tool "scope/join" "Take a seat by a link this world was handed: this world claims the name the link carries and is brought before the scope as itself."
+       [(mcp_mount/p "link" "string" "The link, with its secret after it.")]
+       ["link"])]
   + param_json
     \ param=mcp_mount/param
     ^ jkv
