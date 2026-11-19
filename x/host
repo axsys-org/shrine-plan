@@ -189,22 +189,43 @@ def turn(args, door, log):
 
 
 def routes(args, door, log):
-    """The front's routes for the worlds this machine runs, from the same records: written when they change."""
-    seen = places(door, args.record)
+    """The front's routes, written when they change: each name under the domain, and where it is sent.
+    Without a fleet they are the worlds this machine runs, from the host records. With one (--fleet) they
+    are what every machine of the fleet says it runs, and --start names what is sent to the door of the
+    machine with the most room, so whoever comes for a world of their own is always given one where there
+    is room for it."""
     lines = []
-    if args.machine:
-        lines += [(name, int(args.door.rsplit(':', 1)[1].strip('/'))) for name in [args.machine, *args.also]]
-    for place, (kind, held) in sorted(seen.items()):
-        if ASK.match(place) and kind == 'held':
-            ask = door.slots(held)
-            state, where = seen.get(place + '/at', ('', ''))
-            http = number(door.slots(where).get('http')) if state == 'held' else 0
-            name = str(ask.get('name', ''))
-            if http and number(ask.get('run')) == 1 and re.fullmatch(r'0x[0-9a-f]+', name):
-                lines.append((name, http))
+    if args.fleet:
+        rooms = []
+        for place, (kind, held) in sorted(places(door, args.fleet).items()):
+            if kind != 'held':
+                continue
+            said = door.slots(held)
+            if re.fullmatch(r'/machines/[^/]+/worlds/[^/]+', place):
+                name, http = str(said.get('name', '')), number(said.get('http'))
+                if http and re.fullmatch(r'0x[0-9a-f]+', name):
+                    lines.append((name, str(said.get('host') or '127.0.0.1'), http))
+            elif re.fullmatch(r'/machines/[^/]+/room', place):
+                rooms.append((number(said.get('seats')), str(said.get('door', ''))))
+        best = max((room for room in rooms if room[0] > 0), default=None)
+        at = next((line for line in lines if best and line[0] == best[1]), None)
+        if args.start and at:
+            lines.append((args.start, at[1], at[2]))
+    else:
+        seen = places(door, args.record)
+        if args.machine:
+            lines += [(name, '127.0.0.1', int(args.door.rsplit(':', 1)[1].strip('/'))) for name in [args.machine, *args.also]]
+        for place, (kind, held) in sorted(seen.items()):
+            if ASK.match(place) and kind == 'held':
+                ask = door.slots(held)
+                state, where = seen.get(place + '/at', ('', ''))
+                http = number(door.slots(where).get('http')) if state == 'held' else 0
+                name = str(ask.get('name', ''))
+                if http and number(ask.get('run')) == 1 and re.fullmatch(r'0x[0-9a-f]+', name):
+                    lines.append((name, '127.0.0.1', http))
     tls = '' if args.tls == 'public' else '\n\ttls ' + args.tls.replace(',', ' ')
     starting = f'\n\thandle_errors {{\n\t\timport {args.starting}\n\t}}' if args.starting else ''
-    text = ''.join(f'{name}.{args.domain} {{{tls}\n\treverse_proxy 127.0.0.1:{http}{starting}\n}}\n' for name, http in lines)
+    text = ''.join(f'{name}.{args.domain} {{{tls}\n\treverse_proxy {host}:{http}{starting}\n}}\n' for name, host, http in sorted(set(lines)))
     if (args.routes.read_text() if args.routes.exists() else '') == text:
         return False
     args.routes.parent.mkdir(parents=True, exist_ok=True)
@@ -234,6 +255,10 @@ def main():
     parser.add_argument('--routes', type=Path, default=Path('/var/lib/shrine/routes/worlds.caddy'),
                         help="the file of routes the web server in front imports")
     parser.add_argument('--machine', default='', help="the machine world's own name, to give it a route too")
+    parser.add_argument('--fleet', default='', metavar='RECORD',
+                        help="the fleet this machine's world keeps: routes are then what every machine in it says it runs")
+    parser.add_argument('--start', default='', metavar='NAME',
+                        help='with --fleet: a name sent to the door of the machine with the most room')
     parser.add_argument('--mounts', default='mcp mesa scope', help='what a world starts with, where its ask does not say')
     parser.add_argument('--limit', type=int, default=0, help="how many worlds a tenant may have running, where its seat does not say")
     parser.add_argument('--also', action='append', default=[], metavar='NAME',

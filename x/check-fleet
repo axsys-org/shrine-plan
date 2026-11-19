@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Two machines, one front: a fleet whose machines are seats.
+
+Two machines are brought up by x/machine, on one computer, each with its own world, host and supervisor. The
+first keeps a fleet and is a machine in it; it also keeps the front's routes. A seat is made in the fleet
+for a second machine and given an invitation. The second machine is started under that seat's founding and
+handed the seat's link at its own door: it claims itself and fills the seat, with nothing done to it by
+hand. Its own foot then tells the fleet's keeper where its door is, how much room it has, and each world it
+comes to run.
+
+So the front sends each name to the machine that runs it, whichever machine that is, and the name people
+start from goes to the door of the machine with the most room. A seat is taken there; the world started for
+it on the second machine is in the front's routes without the front having been told anything but records.
+
+    x/check-fleet [--keep] [--base-port 8521]
+
+Exit 0 when every row passes. Run it on the build machine, never beside another heavy job. It creates no
+server: x/provision does that, and only when told to.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from net_worlds import World, founding_of, number_of, spell, until  # noqa: E402
+
+
+def call(world, tool, **arguments):
+    body = json.dumps(dict(jsonrpc='2.0', id=1, method='tools/call',
+                           params={'name': tool, 'arguments': arguments})).encode()
+    request = urllib.request.Request(f'http://127.0.0.1:{world.http}/mcp', body, {
+        'Content-Type': 'application/json', 'Authorization': 'Bearer ' + world.session})
+    try:
+        result = json.load(urllib.request.urlopen(request, timeout=120))['result']
+    except (urllib.error.HTTPError, OSError) as error:
+        return True, repr(error)
+    return bool(result.get('isError')), ' '.join(block.get('text', '') for block in result.get('content', []))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--keep', action='store_true', help='keep the world directories')
+    parser.add_argument('--base-port', type=int, default=8521)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='shrine-fleet-'))
+    mounts = 'mcp mesa scope codecs host fleet'
+    one, two = args.base_port, args.base_port + 20
+    routes = base / 'routes.caddy'
+    rows, machines = [], []
+
+    def row(name, passed, detail=''):
+        rows.append(passed)
+        print(('PASS  ' if passed else 'FAIL  ') + name + ('' if passed else '   ' + str(detail)[:1500]), flush=True)
+
+    def machine(home, *more):
+        log = (home.parent / (home.name + '.log')).open('a')
+        process = subprocess.Popen([sys.executable, str(ROOT / 'x/machine'), '--home', str(home), '--address', '127.0.0.1',
+                                    '--mounts', mounts, '--limit', '2', '--startup-timeout', str(args.timeout), *more],
+                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        machines.append(process)
+        return process
+
+    def said(home):
+        return (home.parent / (home.name + '.log')).read_text(errors='replace')
+
+    def told(world, place, slot):
+        """A number a world holds at a place of whichever composition shows it, from whoever writes there."""
+        for line in call(world, 'scope/seen')[1].splitlines():
+            parts = line.split(' ')
+            if len(parts) == 4 and parts[0] == 'held' and parts[1] == place:
+                return world.number(parts[2], slot)
+        return -1
+
+    def routed():
+        """The front's routes as written: {name: where it is sent}."""
+        text = routes.read_text() if routes.exists() else ''
+        return dict(re.findall(r'^(\S+)\.fleet\.test \{\n(?:\t.*\n)*?\treverse_proxy (\S+)', text, re.M))
+
+    try:
+        machine(base / 'one', '--node', '0x61', '--port', str(one), '--base-port', str(one + 1), '--open', '1',
+                '--fleet', 'fleet', '--start', 'new', '--domain', 'fleet.test', '--tls', 'internal', '--routes', str(routes))
+        front = World('0x61', one, one + 1000, base / 'one' / 'machine', mounts=tuple(mounts.split()))
+        if not until(lambda: 'machine: 0x61' in said(base / 'one') or machines[0].poll() is not None, args.timeout):
+            raise RuntimeError('the first machine did not come up: ' + said(base / 'one')[-800:])
+        front.owner()
+        seen = lambda world: call(world, 'scope/seen')[1]
+        row('the first machine keeps a fleet and is a machine in it: it says where its own door is, and its room',
+            until(lambda: 'held /machines/own/worlds/own ' in seen(front) and 'held /machines/own/room ' in seen(front), 300),
+            [seen(front), said(base / 'one')[-600:]])
+        row('the front sends its name, and the name people start from, to its door',
+            until(lambda: routed().get('0x61') == f'127.0.0.1:{one}' and routed().get('new') == f'127.0.0.1:{one}', 120),
+            [routed(), routes.read_text() if routes.exists() else ''])
+
+        seated = call(front, 'scope/fill', composition='fleet', place='/machines/two',
+                      slots={'title': 'A second machine', 'kind': 'any', 'place': 'beside the first'})
+        invited = call(front, 'scope/invite', composition='fleet', place='/machines/two')
+        seat = '/0x61/app/fleet/machines/two'
+        row('a seat is made for a second machine and given an invitation: its name is minted', not seated[0]
+            and not invited[0] and until(lambda: front.number(seat, 'name') > 0, 400), [seated, invited, front.read(seat)])
+        name = front.number(seat, 'name')
+        deadline, link = time.time() + 300, (True, '')
+        while time.time() < deadline and len(link[1].split(',')) != 12:
+            link = call(front, 'scope/link', invitation=front.number(seat, 'invite'))
+            time.sleep(2)
+        (base / 'link').touch(mode=0o600)
+        (base / 'link').write_text(link[1])
+
+        machine(base / 'two', '--node', spell(name), '--port', str(two), '--base-port', str(two + 1), '--open', '2',
+                '--founding', founding_of(link[1]), '--link-file', str(base / 'link'))
+        row('the second machine, started under the seat\'s founding and handed its link, claims itself and fills '
+            'the seat', until(lambda: front.number(seat, 'world') == name or machines[1].poll() is not None, args.timeout)
+            and front.number(seat, 'world') == name, [front.read(seat), said(base / 'two')[-800:]])
+        row('the link it was handed is gone from the file once taken', (base / 'link').read_text() == '')
+        row('its own foot tells the keeper where its door is and that it has room for two',
+            until(lambda: 'held /machines/two/worlds/own ' in seen(front) and 'held /machines/two/room ' in seen(front), 600)
+            and until(lambda: told(front, '/machines/two/room', 'seats') == 2, 300),
+            [seen(front), said(base / 'two')[-600:]])
+        row('the front sends the second machine\'s name to it, and now sends whoever starts to it: it has the most room',
+            until(lambda: routed().get(spell(name)) == f'127.0.0.1:{two}' and routed().get('new') == f'127.0.0.1:{two}', 180),
+            routed())
+
+        second = World(spell(name), two, two + 1000, base / 'two' / 'machine', mounts=tuple(mounts.split()))
+        ticket = secrets.token_hex(16)
+        took = second.post('/door/open/host/tenants', '', session=ticket)
+        got = (0, '')
+        deadline = time.time() + 400
+        while time.time() < deadline and not (got[0] == 200 and len(got[1].split(',')) == 12):
+            got = second.post('/door/ticket', '', session=ticket)
+            time.sleep(2)
+        tenant = int(got[1].split(',')[6]) if got[0] == 200 else 0
+        row('a seat is taken at the second machine\'s door, and its supervisor starts that world there',
+            took[0] == 202 and tenant > 0 and until(lambda: 'started ' + spell(tenant) in said(base / 'two'), 600),
+            [took, got[0], said(base / 'two')[-600:]])
+        row('the second machine tells the keeper it runs that world, and the front sends its name there: to a '
+            'port of the second machine\'s', until(lambda: routed().get(spell(tenant), '').startswith('127.0.0.1:')
+                                                   and two < int(routed()[spell(tenant)].split(':')[1]) <= two + 19, 600),
+            [routed(), seen(front)])
+        row('and the second machine now says it has room for one', until(lambda: told(front, '/machines/two/room', 'seats') == 1, 300),
+            seen(front))
+    except Exception as error:
+        row('the run completed', False, repr(error))
+    finally:
+        for process in machines:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+        time.sleep(8)
+        for kept in base.glob('*/worlds/*/host.pid'):
+            try:
+                os.killpg(int(kept.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        time.sleep(5)
+        if args.keep or not all(rows):
+            print(f'worlds kept at {base}', flush=True)
+        else:
+            subprocess.run(['rm', '-rf', str(base)])
+    print(f'{sum(rows)} of {len(rows)} rows passed', flush=True)
+    return 0 if rows and all(rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
