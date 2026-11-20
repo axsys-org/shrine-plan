@@ -625,4 +625,4 @@ What a reader refuses, it refuses whole and notes on the card: an epic from a wo
 (`net_stranger`), one that key did not sign (`net_forged`), one that reaches outside its root (`net_outside`),
 one with a record missing or unsound (`net_missing`, `net_unfit`), one from a name whose custody signed two
 futures (`net_forked`), and one the kernel's own contracts reject. The mount is left as it was and a later epic
-lands from where it stands. The journal names the foot that submitted each landing (`/sys/by`).
+lands from where it stands.
