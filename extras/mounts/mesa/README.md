@@ -10,7 +10,7 @@ Registers the foot at `/<self>/io/mesa`: the one place a world meets other world
 
 What is published to one peer is sealed for that peer; what is public is sent as it is; every page is signed.
 A world publishes what it writes beneath `/<self>/our/<peer>` to that peer and beneath `/<self>/our/public` to
-everyone it knows. A reader holds a publisher's names at `/<self>/her/<publisher>`, exactly as published, and
+everyone it knows. A reader holds a publisher's names at `/<self>/her/<publisher>`, with the content that was published, and
 keeps how each mount stands on the card `/<self>/io/mesa/<publisher>`. A peer is a card with a `key`, a `host`
 and a `port`.
 
