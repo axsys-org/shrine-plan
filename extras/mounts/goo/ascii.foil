@@ -19,13 +19,19 @@
     \ tree=goo/semantic
     ^ str
     | (str/split_byte 47 tree.attrs.common.slot.text).at(0)
-  + runs
+  + raw_runs
     \ tree=goo/semantic
     ^ goo/text
     ? tree
      > (./text _ text) text
      > (./jet _ primitive) primitive.payload
     []
+  + runs
+    \ tree=goo/semantic
+    ^ goo/text
+    = raw (goo_ascii/raw_runs tree)
+    ? (eq (goo_ascii/kind tree) "input") raw
+    | raw.map(goo_run/fallback)
   + content_runs
     \ tree=goo/semantic
     ^ goo/text
@@ -39,21 +45,36 @@
      > (./text _ text) text.plain
      > (./jet _ primitive) primitive.payload.plain
     ""
+  + value_input_error
+    \ tree=goo/semantic
+    ^ maybe[str]
+    ? !(eq (goo_ascii/kind tree) "input") .none
+    = role (goo_ascii/role tree) text (goo_ascii/payload tree)
+    ? (eq role "colorwell")
+      ? ((eq text "") || (goo/design/color text)) .none (./some "Color input requires #RRGGBB or an empty value.")
+    ? !(eq role "slider") .none
+    ?> (./some limit) tree.attrs.common.config.max (./some "Slider requires max.")
+    ?> (./some max) (goo_number/integer (goo_number/encode limit)) (./some "Slider max must be a whole number.")
+    ? ((eq max 0) || (gt max 65535)) (./some "Slider max must be 1..65535.")
+    ? (eq text "") .none
+    ?> (./some n) (nat/parse text) (./some "Slider requires a whole number.")
+    ? (gt n max) (./some "Slider value exceeds max.") .none
   + check
     \ tree=goo/semantic
     ^ maybe[str]
+    = design tree.attrs.common.config.design kind (goo_ascii/kind tree)
+    ? (and !(equal[goo/design] design goo/design/empty) !((eq kind "text") || (eq kind "code") || (eq kind "button") || (eq kind "input"))) (./some "Style override requires text, code, button, or input.")
+    ? (goo_ascii/value_input_error tree)
+     > (./some why) (./some why)
+    ? !(goo/design/valid design) (./some "Invalid style override.")
     ? !(goo/text/supported (goo_ascii/runs tree)) (./some (str/cat_all ["Unsupported RunDescriptor properties at node " tree.node_id.text]))
     ? (and (and (eq (goo_ascii/kind tree) "input") !(eq (goo_ascii/role tree) "rich-input")) (row/any[goo/runt] (\ run !(eq run.myth.size 0)) (goo_ascii/runs tree))) (./some "Styled native editing is not supported")
     = base (goo_profile/text_style (goo_fp/integer 1) (goo_ascii/kind tree) (goo_ascii/role tree))
     ? !(row/all[goo/runt] (\ run (goo_run/resolve base run.myth).is_some) (goo_ascii/runs tree)) (./some "Unsupported run font path or font/modifier combination")
     = text (goo_ascii/payload tree)
-      valid=bool
-        % i=nat 0
-        ? (eq i text.len) .true
-        = c text.at(i)
-        ? !((eq c 9) || (eq c 10) || (eq c 13) || !((lt c 32) || (gt c 126))) .false
-        | _ i.inc
-    ? !valid (./some (str/cat_all ["ASCII measurement does not support non-ASCII text at node " tree.node_id.text]))
+    ? !(goo_run/supported_text text) (./some (str/cat_all ["Unsupported text repertoire at node " tree.node_id.text]))
+    ? (and !(eq (goo_ascii/kind tree) "input") (row/any[goo/runt] (\ run (and (goo_run/has_hebrew run.lang.txt) !(eq (goo_run/font base run.myth).id "hebrew"))) (goo_ascii/runs tree)))
+      | ./some "Hebrew letters require the pinned Hebrew run font."
     % i=nat 0
     ^ maybe[str]
     ? (eq i tree.children.len) .none
@@ -64,6 +85,13 @@
     \ scale=goo/scalar tree=goo/semantic
     ^ goo_ascii/style
     = style (goo_profile/text_style scale (goo_ascii/kind tree) (goo_ascii/role tree))
+      design tree.attrs.common.config.design
+      style=goo_profile/style
+        ?> (./some px) design.pad_x style
+        | style.set_inset_x((goo_fp/integer (mul 2 px)))
+      style=goo_profile/style
+        ?> (./some px) design.pad_y style
+        | style.set_inset_y((goo_fp/integer (mul 2 px)))
       extents (goo_ascii/extents style tree)
       base_height (goo_fp/quotient (goo_fp/integer (add (goo_profile/font_ascent style.face) (goo_profile/font_descent style.face))) (goo_fp/integer (goo_profile/font_units style.face)))
       extra (goo_fp/maximum (goo/scalar 0) (goo_fp/minus (goo_fp/plus extents.ascent extents.descent) base_height))
@@ -144,12 +172,14 @@
     ^ goo_measure/size
     = kind (goo_ascii/kind tree)
       slot tree.attrs.common.slot.text
+      padded_button (and (eq kind "button") (maybe/is_some tree.attrs.common.config.design.pad_x))
+      natural (goo_ascii/natural_width scale tree)
       cap=goo/scalar
         ? tree.attrs.common.config.max_ideal
          > (./some value) value
-        (goo_profile/preferred_cap slot)
-      pref (goo_fp/ceil (goo_fp/minimum cap (goo_ascii/natural_width scale tree)))
-      fixed (goo_profile/fixed kind slot)
+        ? padded_button natural (goo_profile/preferred_cap slot)
+      pref (goo_fp/ceil (goo_fp/minimum cap natural))
+      fixed (and !padded_button (goo_profile/fixed kind slot))
       floor (goo_profile/minimum_width slot)
     | goo_measure/size (? fixed pref (goo_fp/minimum pref floor)) pref !fixed
   + fit
@@ -188,14 +218,14 @@
         ? (eq i text.len) i
         = next (goo_fp/plus total advances.at(i))
         ? !(goo_fp/lte next (goo_fp/plus room goo_profile/fit_tolerance)) i
-        | _ i.inc next
+        | _ (add i (goo_run/step text i)) next
     ? (eq fits text.len) out.cons((goo/text/slice offset (sub fits offset) runs)).reverse
     = breakpoint=nat
         % i=nat offset last=nat offset
         ? (eq i fits) last
         = c text.at(i)
         | _ i.inc (? ((eq c 32) || (eq c 45) || (eq c 47)) i.inc last)
-      end (? (eq breakpoint offset) (? (eq fits offset) offset.inc fits) breakpoint)
+      end (? (eq breakpoint offset) (? (eq fits offset) (add offset (goo_run/step text offset)) fits) breakpoint)
       out out.cons((goo/text/slice offset (sub end offset) runs))
     ? (eq end text.len) out.reverse
     | _ end available out
@@ -203,8 +233,10 @@
     \ scale=goo/scalar tree=goo/semantic width=goo/scalar
     ^ maybe[list[goo/text]]
     = kind (goo_ascii/kind tree)
-    ? !((eq kind "text") || (eq kind "code")) .none
-    = runs (goo_ascii/content_runs tree)
+    = padded_button (and (eq kind "button") (maybe/is_some tree.attrs.common.config.design.pad_x))
+    ? !((eq kind "text") || (eq kind "code") || padded_button) .none
+    = raw (goo_ascii/content_runs tree)
+      runs (? padded_button (goo_text/words raw) raw)
       text runs.plain
       prefix (goo_ascii/prefix scale tree)
       all (str/split_byte 10 text).stream

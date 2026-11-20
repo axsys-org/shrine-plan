@@ -2,6 +2,15 @@
 
 For a worked example, read [Making a Grove and Goo mount](tutorials/grove-goo-mount.md).
 Its runnable `hello-grove` mount includes a notes list, reader, and editor.
+For a bilingual study application with persistent Goo actions, see
+[Beit Midrash](mounts/torah-study/README.md): a cited sugya, a kushya, reusable
+distinctions, and forked readings.
+
+Explore the shared component styles in the [Goo style zoo](mounts/goo-style-zoo/README.md).
+
+For the foundations and refactor choices, read [Goo and Shrine from records to
+interfaces](design/goo-shrine-elements-and-topoi.md): current view/pane contracts,
+native elements, selection, topoi, and proposed boundaries for new capabilities.
 
 Optional applications shipped in the core repository. Each directory under
 `extras/mounts/` is a flat source bag. From the repository root, `x/eden` reads
