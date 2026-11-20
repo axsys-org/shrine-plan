@@ -10,8 +10,8 @@
 ' - It reads the bytes of each connection and gives the packets to the rules.
 ' - It sends the packets that the rules ask it to send.
 ' - It tells the rules the time, one tick after the other.
-' - It asks the world to admit the writes that the rules plan, one plan after
-'   the other (mesa_wire/wish).
+' - It asks its node to do what the rules ask, one errand after the other
+'   (mesa_wire/wish).
 ' - It keeps the secret files of the foot, and it signs when the desk asks
 '   (desk.foil).
 '
@@ -70,73 +70,47 @@
       mesa_wire/tick
       mesa_wire/wish
   + wish
-    ' This is a write that a part of the foot asks for. The foot sends it to
-    ' its own mailbox. Thus each part of the foot can ask, and the loop of
-    ' the foot does one write at a time.
+    ' This is an errand that a part of the foot has for the world
+    ' (mesa_foot/errand). The foot sends it to its own mailbox. Thus each part
+    ' of the foot can ask, and the loop of the foot does one errand at a
+    ' time.
     '
-    ' The foot has one way to write: a poke on its node, /<self>/io/mesa. The
-    ' hand of the node makes the writes in the event of that poke (net/talk).
-    ' The answer to the poke is the answer of the kernel to the event. The
-    ' foot sends no other poke until that answer comes. Thus each answer is
-    ' the answer to the first wish that waits.
-    '
-    ' A wish holds what to poke (word), or it holds a plan. A plan is a
-    ' function of the world that gives writes. The foot runs a plan with a
-    ' read card on the world as it is at that time, and then pokes the writes
-    ' (net/batch).
-    : request=nat ready=bool word=myth plan={\ namespace}either[iota row[[p=path q=writ]]]
-  + idle
-    ' This is the plan of a wish that holds a word.
-    \ state=namespace
-    ^ either[iota row[[p=path q=writ]]]
-    = none=row[[p=path q=writ]] []
-    | ./ok none
-  + say
-    ' This function gives the wish that pokes a word on the node of the foot.
-    \ request=nat word=myth
-    ^ mesa_wire/wish
-    | mesa_wire/wish request .true word mesa_wire/idle
+    ' The foot has one way to write: it pokes the errand on its node,
+    ' /<self>/io/mesa. The hand of the node does what the errand says and
+    ' makes the writes in the event of that poke (mesa_foot/talk). The answer
+    ' to the poke is the answer of the kernel to that event. The foot sends
+    ' no other poke until that answer comes. Thus each answer is the answer
+    ' to the first wish that waits.
+    : request=nat errand=mesa_foot/errand
   + whole
     ' This is the read that gives the world as it is now. A committed world
     ' is in the store. Thus the transfer of the world copies no data.
     \ state=namespace
     ^ [nat any nat]
-    [100 state 0]
+    [200 state 0]
   + world
     ' This function gives the answer of mesa_wire/whole its type.
     \ body=any
     ^ namespace
     body
-  + writes
-    ' This function gives the answer of mesa_wire/planning its type.
-    \ body=any
-    ^ row[[p=path q=writ]]
-    body
-  + planning
-    ' This function gives the read that runs a plan. The answer of the read
-    ' is one of these:
-    ' - 200 and the writes
-    ' - 409 and the reason, as a number, why the rules do not accept
-    ' - 500 when the plan failed
-    \ plan={\ namespace}either[iota row[[p=path q=writ]]]
-    ^ {\ namespace}[nat any nat]
-    \ state=namespace
-    ^ [nat any nat]
-    ? (Try plan state)
-     > (./err _) [500 0 0]
-     > (./ok planned)
-      ? planned
-       > (./err why) [409 0 (quip_val why)]
-       > (./ok writes) [200 writes 0]
+  + look
+    ' This function asks the supervisor for the world as it is now.
+    \ parent=nat
+    ^ nat
+    | Send parent (feet/gift/snapshot_bat 0 mesa_wire/whole)
   + ask
-    ' This function starts the first wish that waits, if there is one. It
-    ' pokes the word of the wish, or it runs the plan of the wish.
+    ' This function pokes the first errand that waits, if there is one.
     \ parent=nat queue=row[mesa_wire/wish]
     ^ nat
     ? !(queue.len) 0
-    = first queue.at(0)
-    ? first.ready (Send parent (feet/gift/pass mesa_wire/here (writ/poke first.word)))
-    | Send parent (feet/gift/snapshot_bat first.request (mesa_wire/planning first.plan))
+    | Send parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['errand] queue.at(0).errand)))
+  + note
+    ' This function gives the errand that pokes a record on the node of the
+    ' foot.
+    \ home=path word=myth
+    ^ mesa_foot/errand
+    = writes=row[[p=path q=writ]] [[home (writ/poke word)]]
+    | mesa_foot/bid (mesa_foot/order/write writes)
   + frames
     ' This function gives the bytes of one connection: the 16 bytes of the
     ' sender, and then each packet after the 4 bytes of its length. It makes a
@@ -267,17 +241,6 @@
       ? (out.any((\ item=mesa_wire/link (eq item.id want.peer.id)))) out
       = ;handle (Spawn (mesa_wire/sender want.host want.port me))
       | out.snoc((mesa_wire/link want.peer.id want.host want.port handle))
-  + reason
-    ' This function gives the reason that a plan gave, from the answer of the
-    ' read that ran the plan (mesa_wire/planning).
-    \ status=nat number=nat
-    ^ maybe[iota]
-    = none=maybe[iota] .none
-      unknown=iota 'net_refused
-    ? (eq status 200) none
-    ? (eq 0 number) (./some unknown)
-    = reason=iota ($ts number)
-    | ./some reason
   + why
     ' This function gives the reason that the kernel gave when it did not
     ' accept a poke. It gives none when the kernel accepted the poke.
@@ -290,7 +253,7 @@
     | ./some said.reason
   + act
     ' This function does what the rules ask. It gives the packets of each peer
-    ' to the sender of that peer as one batch. It puts each plan in the
+    ' to the sender of that peer as one batch. It puts each errand in the
     ' mailbox of the foot (mesa_wire/wish).
     \ links=row[mesa_wire/link] does=row[mesa_foot/effect]
     ^ nat
@@ -312,14 +275,9 @@
     | does.fold sent
       \ ;done=nat effect=mesa_foot/effect
       ^ nat
-      ? effect
-       > (./admit request plan)
-        ; (Send 0 (mesa_wire/wish request .false myth/new plan))
-        done.inc
-       > (./land request item)
-        ; (Send 0 (mesa_wire/say request (myth/sing ['land] item)))
-        done.inc
-      done
+      ?> (./admit request errand) effect done
+      ; (Send 0 (mesa_wire/wish request errand))
+      done.inc
   + marked
     ' This function gives the rift and the highest announced epoch that a mark
     ' file holds. It gives zeros when there is no mark file at that time.
@@ -464,7 +422,7 @@
       used (desk/used foot.self state)
       lone (desk/doorless foot.self state)
     ? (and (and (eq 0 asks.len) (eq 0 used.len)) !lone) 0
-    = home (pass/kept (mesa_foot/home foot) state).fall(myth/new)
+    = home (pass/kept (mesa_foot/home foot) (net/sees state)).fall(myth/new)
       ;given (? (and lone (eq 0 home.nat_at(['seq] 0))) (mesa_wire/took "io/mesa/founding") 0)
       prepared (gt (wid given) 1)
       ;kept (? prepared (mesa_wire/born links given foot) 0)
@@ -518,7 +476,7 @@
     ? (eq 0 (mesa_wire/public seed))
       ; (Trace ["mesa foot: the ring file holds no seed" ring] 0)
       0
-    ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
+    ; (mesa_wire/look init.parent)
     = ;world
         % ignored=nat 0
         ^ namespace
@@ -540,8 +498,8 @@
       helpers (? (eq 0 port) 1 (add 1 mesa_foot/acceptors))
     ; (SendCaps clock 0 [0])
     ; (? (eq 0 port) 0 (mesa_wire/listen door mesa_foot/acceptors))
-    ; (? claimed 0 (Send 0 (mesa_wire/say 0 (myth/sing ['key] (pails/n (Ed25519PublicKey seed))))))
-    ; (? (eq 0 given) 0 (Send 0 (mesa_wire/say 0 (myth/sing ['port] (pails/n given)).put(['host] (pails/t host)))))
+    ; (? claimed 0 (Send 0 (mesa_wire/wish 0 (mesa_wire/note [world.self 'io 'mesa] (myth/sing ['key] (pails/n (Ed25519PublicKey seed)))))))
+    ; (? (eq 0 given) 0 (Send 0 (mesa_wire/wish 0 (mesa_wire/note [world.self 'io 'mesa] (myth/sing ['port] (pails/n given)).put(['host] (pails/t host))))))
     ; (Trace ["mesa foot listening" port] 0)
     = begun (mesa_foot/start world.self seed rift first.map((\ item=mesa_wire/route item.peer)))
       ;opening (mesa_foot/tick (div (Now 0) 1000000) world begun)
@@ -575,24 +533,16 @@
       ; (? (queue.len) 0 (mesa_wire/ask init.parent [wanted]))
       | _ foot view reach top beat left key mute at ear queue.snoc(wanted)
      > (./binary request status body mime)
-      ? (eq status 100)
-        = held (mesa_wire/world body)
-        ? (eq held.local.top view.local.top) (_ foot view reach top beat left key mute at ear queue)
-        = ;turn (mesa_foot/turned held foot)
-          ;higher (nmax top held.local.top)
-        ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
-        ; (mesa_wire/act reach turn.does)
-        ; (mesa_wire/desk reach key held turn.foot)
-        | _ turn.foot held reach higher beat left key mute at ear queue
-      ? (and (eq status 200) (gt (mesa_wire/writes body).len 0))
-        ; (Send init.parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['do] (net/batch (mesa_wire/writes body))))))
-        | _ foot view reach top beat left key mute at ear queue
-      = ;turn (mesa_foot/landed request (mesa_wire/reason status mime) foot)
-        rest queue.drop(1)
+      = held (mesa_wire/world body)
+      ? (eq held.local.top view.local.top) (_ foot view reach top beat left key mute at ear queue)
+      = ;turn (mesa_foot/turned held foot)
+        ;higher (nmax top held.local.top)
+      ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
       ; (mesa_wire/act reach turn.does)
-      ; (mesa_wire/ask init.parent rest)
-      | _ turn.foot view reach top beat left key mute at ear rest
+      ; (mesa_wire/desk reach key held turn.foot)
+      | _ turn.foot held reach higher beat left key mute at ear queue
      > (./fact binding)
+      ; (mesa_wire/look init.parent)
       = wish (mesa_wire/own binding).nat_at(['port] 0)
         opens (and (eq 0 at) (gt wish 0))
         ;heard (? opens (Listen wish) ear)
@@ -631,7 +581,6 @@
       = again (eq 0 (mod beat.inc mesa_foot/every))
         ;turn (? again (mesa_foot/tick time.now view foot) (mesa_foot/clock time.now view foot))
       ; (mesa_wire/act reach turn.does)
-      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
       | _ turn.foot view reach top beat.inc left key mute at ear queue
      > (./ack err)
       ? !(queue.len) (_ foot view reach top beat left key mute at ear queue)
@@ -639,7 +588,7 @@
         rest queue.drop(1)
       ; (mesa_wire/act reach turn.does)
       ; (mesa_wire/ask init.parent rest)
-      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
+      ; (mesa_wire/look init.parent)
       | _ turn.foot view reach top beat left key mute at ear rest
     | _ foot view reach top beat left key mute at ear queue
   + here
@@ -713,15 +662,23 @@
     ? (mesa_wire/submit server target (writ/poke myth/new)) .true
     | mesa_wire/submit server target (writ/make myth/new)
   + seat
-    ' This function gives the node of the foot its hand. It makes the record
-    ' that holds the hand (net/form), and it puts the behaviour and the crew
-    ' on the node (net/seat). It does this at each start. Thus the node has
-    ' the hand of the code that runs.
+    ' This function gives two nodes their hands. It does this at each start.
+    ' Thus the nodes have the hands of the code that runs.
+    ' - The node of the foot, /<self>/io/mesa, gets the hand that does the
+    '   errands of the foot (mesa_foot/form, net/seat).
+    ' - /<self>/our gets the hand that tells the foot of news (net/herald,
+    '   net/watch). The two names that this hand hears must hold a record:
+    '   the kernel counts changes only below a name that holds one.
     \ server=nat self=iota
     ^ bool
     = home=path [self 'io 'mesa]
-    ? !(mesa_wire/submit server (net/hand self) (writ/make (form/card net/form (lore/line "The hand of the Mesa foot")))) .false
-    | mesa_wire/submit server home (writ/poke (net/seat self))
+      ours=path [self 'our]
+    ? !(mesa_wire/present server ours) .false
+    ? !(mesa_wire/present server home.snoc('ask)) .false
+    ? !(mesa_wire/submit server (net/hand self) (writ/make (form/card mesa_foot/form (lore/line "The hand of the Mesa foot")))) .false
+    ? !(mesa_wire/submit server (net/horn self) (writ/make (form/card net/herald (lore/line "Tells the Mesa foot of news")))) .false
+    ? !(mesa_wire/submit server home (writ/poke (net/seat self))) .false
+    | mesa_wire/submit server ours (writ/poke (net/watch self))
   + start
     ' This function starts the foot of a world: it makes sure that the record
     ' /<self>/io/mesa is there and has its hand, and it registers the foot at
