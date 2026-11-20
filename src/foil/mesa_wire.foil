@@ -18,7 +18,7 @@
 ' where its two files are:
 ' - `port`
 ' - `ring` (the seed that the world signs with, 32 bytes)
-' - `mark` (its rift and the highest epoch that it announced)
+' - `mark` (its rift and the highest epoch that it announced, as two files)
 '
 ' The two files are intentionally outside the world. The seed is not a record.
 ' The mark must stay through a restore of the world, to show that a restore
@@ -258,24 +258,93 @@
       ?> (./admit request errand) effect done
       ; (Send 0 (mesa_wire/wish request errand))
       done.inc
-  + marked
-    ' This function gives the rift and the highest announced epoch that a mark
-    ' file holds. It gives zeros when there is no mark file at that time.
-    \ file=str
-    ^ mesa_wire/mark
-    = ;bytes (Try ReadFile file)
-    ? bytes
-     > (./err _) (mesa_wire/mark 0 0)
-     > (./ok held)
-      ? (lt (wid held) 17) (mesa_wire/mark 0 0)
-      | mesa_wire/mark (loadvar 0 8 held) (loadvar 8 8 held)
   + mark
+    ' This is the rift of a world and the highest epoch that the world
+    ' announced.
     : rift=nat top=nat
+  + check
+    ' This function gives the 8 bytes that show that the 16 bytes of a mark
+    ' are whole.
+    \ body=nat
+    ^ nat
+    | mod (Sha256 (add (mod body (bex 128)) (bex 128))) (bex 64)
+  + slot
+    ' This function reads one of the two files that keep the mark. It gives
+    ' the kind of what it found, and the mark:
+    ' - 0: there is no file (the runtime gives an error or no bytes at all)
+    ' - 1: the file holds a whole mark
+    ' - 2: the file is there and does not hold a whole mark
+    \ file=str
+    ^ [kind=nat held=mesa_wire/mark]
+    = none (mesa_wire/mark 0 0)
+      ;bytes (Try ReadFile file)
+    ? bytes
+     > (./err _) [0 none]
+     > (./ok held)
+      ? (eq 0 held) [0 none]
+      ? !(eq (wid held) 25) [2 none]
+      ? !(eq (loadvar 16 8 held) (mesa_wire/check held)) [2 none]
+      [1 (mesa_wire/mark (loadvar 0 8 held) (loadvar 8 8 held))]
+  + later
+    ' This function tells if the first mark is not before the second mark.
+    \ a=mesa_wire/mark b=mesa_wire/mark
+    ^ bool
+    ? (gt a.rift b.rift) .true
+    ? (lt a.rift b.rift) .false
+    | ge a.top b.top
+  + marked
+    ' This function gives the rift and the highest announced epoch that the
+    ' mark of a world holds.
+    '
+    ' The mark is two files, <file>.a and <file>.b. The foot writes the one
+    ' and then the other, and each has a check of its bytes. The runtime
+    ' makes a file empty before it writes the file. Thus, if the process
+    ' stops in a write, one file is not whole, and the other file still holds
+    ' the mark from before. The function gives the later of the whole marks.
+    '
+    ' When no file holds a whole mark, the function gives zeros in two cases
+    ' only: there is no file, or the first file is there and the second file
+    ' was never made (the first write of all did not finish). In all other
+    ' cases it gives none: the mark is lost, and zeros would let the world use
+    ' again a version that it published before.
+    \ file=str
+    ^ maybe[mesa_wire/mark]
+    = ;[akind a] (mesa_wire/slot (str/cat_all [file ".a"]))
+      ;[bkind b] (mesa_wire/slot (str/cat_all [file ".b"]))
+      zeros (mesa_wire/mark 0 0)
+    ? (and (eq akind 1) (eq bkind 1)) (./some (? (mesa_wire/later a b) a b))
+    ? (eq akind 1) (./some a)
+    ? (eq bkind 1) (./some b)
+    ? (eq bkind 0) (./some zeros)
+    .none
   + remark
+    ' This function writes a mark. It writes the file that does not hold the
+    ' later whole mark, and then it reads the file again. It gives 1 when the
+    ' file then holds the mark, and 0 when it does not.
     \ file=str rift=nat top=nat
     ^ nat
-    = raw (add (mod rift (bex 64)) (lsh (mod top (bex 64)) 64))
-    | WriteFile file (add raw (bex 128))
+    = one (str/cat_all [file ".a"])
+      two (str/cat_all [file ".b"])
+      ;[akind a] (mesa_wire/slot one)
+      ;[bkind b] (mesa_wire/slot two)
+      first
+        ? !(eq akind 1) .true
+        ? !(eq bkind 1) .false
+        | !(mesa_wire/later a b)
+      target (? first one two)
+      body (add (mod rift (bex 64)) (lsh (mod top (bex 64)) 64))
+      whole (add (add body (lsh (mesa_wire/check body) 128)) (bex 192))
+      ;wrote (Try (\ ignored=nat (WriteFile target whole)) 0)
+      ;[kind now] (mesa_wire/slot target)
+    ? !(eq kind 1) 0
+    ? (and (eq now.rift (mod rift (bex 64))) (eq now.top (mod top (bex 64)))) 1
+    0
+  + halt
+    ' This function tells why the foot does not run, and stops the foot.
+    \ why=str file=str
+    ^ nat
+    ; (Trace [why file] 0)
+    0
   + named
     ' This function gives the path of a file as the foot's record gives it.
     ' When the record gives no path, the function gives the path where the
@@ -363,10 +432,12 @@
         ; (helm/supervisor/close_caps caps)
         ?> (./binary request status body mime) message (_ 0)
         | mesa_wire/world body
-      ;was (mesa_wire/marked file)
-      rift (? (lt world.local.top was.top) was.rift.inc was.rift)
+      ;found (mesa_wire/marked file)
+    ?> (./some was) found (mesa_wire/halt "mesa foot: the mark files are not whole, and the foot does not run" file)
+    = rift (? (lt world.local.top was.top) was.rift.inc was.rift)
       ;noted (mesa_wire/remark file rift (nmax was.top world.local.top))
-      me (mesa_foot/id world.self)
+    ? !(noted) (mesa_wire/halt "mesa foot: the mark was not written, and the foot does not run" file)
+    = me (mesa_foot/id world.self)
       first (mesa_wire/routes init.ax)
       none=row[mesa_wire/link] []
       no_links=row[mesa_wire/link] []
@@ -412,8 +483,10 @@
       = held (mesa_wire/world body)
       ? (eq held.local.top view.local.top) (_ foot view reach top beat left key at ear queue)
       = ;turn (mesa_foot/turned held foot)
-        ;higher (nmax top held.local.top)
-      ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
+        seen (nmax top held.local.top)
+        ;kept (? (gt seen top) (mesa_wire/remark file foot.rift seen) 1)
+        higher (? kept seen top)
+      ; (? kept 0 (Trace ["mesa foot: the mark was not written" file] 0))
       ; (mesa_wire/act reach turn.does)
       | _ turn.foot held reach higher beat left key at ear queue
      > (./fact binding)
