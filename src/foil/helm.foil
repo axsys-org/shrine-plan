@@ -12,7 +12,6 @@
 - physical_projection
 - inspect_read
 - mount_assets
-- namespace_command
 
 +  helm
   +  journal_page
@@ -23,7 +22,6 @@
 
   +  card
     &  helm/card/snapshot
-       helm/card/admit
        helm/card/snapshot_bat
        helm/card/interact_bat
        helm/card/interact
@@ -37,28 +35,6 @@
        helm/card/asset
        helm/card/step
        helm/card/steps
-       helm/card/state
-    + state
-      ' This is the card for the full world as it is now. It is for a foot
-      ' that derives what it does from the world. A committed world is in the
-      ' store. Thus the transfer of the world copies no data.
-      '
-      ' The Mesa foot uses this card. The rules of the foot take the
-      ' namespace as a value. A read card gives only the records at one path.
-      : request=nat
-    + admit
-      ' This is a card with a trusted planner and response. The two run in one
-      ' supervisor admission. The supervisor runs the planner on the state
-      ' that it has at that moment, and it commits the writes that the planner
-      ' gives. Then it runs the response on the committed state.
-      '
-      ' The reason for this card is that a plan made on an older state can be
-      ' wrong. A landing compares an epic with the mount as the mount is now.
-      ' With a step card, a different write can come between the read and the
-      ' write, and then the foot commits a plan that is out of date. With this
-      ' card, no write can come between the two.
-      : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
-        finish={\ maybe[pail] namespace}[nat str str]
     + snapshot_bat
       : request=nat read={\ namespace}[nat any nat]
     + interact_bat
@@ -97,7 +73,6 @@
     '  until outbound routing is installed. No persistence or actor discovery.
     +  request
       & helm/card/snapshot
-        helm/card/admit
        helm/card/snapshot_bat
        helm/card/interact_bat
         helm/card/interact
@@ -111,15 +86,12 @@
         helm/card/physical
         helm/card/inspect
         helm/card/asset
-        helm/card/state
         helm/supervisor/register
     +  register
-      '  This is an explicit bootstrap registration. A registration with a
-      '  duplicate path or an absent path fails. If a foot hears, the
-      '  supervisor tells it the epoch of each commit (feet/task/committed).
-      : pax=path entry={\ feet/task/init nat}nat hears=bool
+      '  Explicit bootstrap registration; duplicate or absent paths fail.
+      : pax=path entry={\ feet/task/init nat}nat
     +  member
-      : pax=path actor=nat binding=axal[saga] hears=bool
+      : pax=path actor=nat binding=axal[saga]
 
     +  rejection
       : reason=iota
@@ -143,51 +115,19 @@
       ' Unsupported transport or a failed cascade discards that candidate.
       \ command=task now=nat block=nat state=namespace index=hive
       ^ [state=namespace index=hive reply=feet/task[unit]]
-      ? (namespace_command/run command now block state index)
-       > (./err why) [state index (helm/supervisor/denied why)]
-       > (./ok pair)
-        = [next next_index] pair
-        | [next next_index (feet/task/ack .none)]
-
-    + admit
-      ' This function admits the writes of a planner as one event. The planner
-      ' reads the same state that the writes go to.
-      \ plan={\ namespace}either[iota row[[p=path q=writ]]] state=namespace index=hive
-      ^ [state=namespace index=hive reply=feet/task[unit]]
-      ? (namespace_command/admit plan state index)
-       > (./err why) [state index (helm/supervisor/denied why)]
-       > (./ok pair)
-        = [next next_index] pair
-        | [next next_index (feet/task/ack .none)]
-    + admitted
-      ' This function does one admission and gives its answer.
-      '
-      ' The function makes the answer from the committed state, in the same
-      ' supervisor turn. Thus the answer agrees with what the world holds. An
-      ' answer made from a later read can show the writes of a different
-      ' event.
-      \ request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
-        finish={\ maybe[pail] namespace}[nat str str] state=namespace index=hive
-      ^ [namespace hive feet/task[unit]]
-      = [next next_index reply] (helm/supervisor/admit plan state index)
-        outcome=maybe[pail]
-          ? reply
-           > (./ack why) why
-          | ./some (pails/q 'command_reply_invalid)
-        render
-          \ current=namespace
-          ^ [nat str str]
-          | finish outcome current
-        answered=[nat str str]
-          ? (Try render next)
-           > (./ok response) response
-           > (./err _) [500 "Command response failed" ""]
-        [status body line] answered
-        ' It is possible that a successful retry plans no writes. Its response
-        ' is useful, but the response must not report the previous epoch as a
-        ' new commit.
-        stream_line=str (? (eq next.local.top state.local.top) "" line)
-      [next next_index (feet/task/admitted request status body stream_line)]
+      = [result next_index]
+          | sovereign_cycle_with index command 0 8 now block state
+      ? result
+       > (./fail why) [state index (helm/supervisor/denied why)]
+       > (./spun next moves rounds ack spill)
+         = problem=maybe[iota]
+             ? spill
+              > (./some why) (./some why)
+             ? moves.len (./some 'outbound_not_supported)
+             .none
+         ? problem
+          > (./some why) [state index (helm/supervisor/denied why)]
+          > .none [next next_index (feet/task/ack .none)]
 
     + journal_key
       \ entry=bee/kv[axal/k[tome]]
@@ -227,10 +167,6 @@
       \ card=helm/card state=namespace index=hive
       ^ [namespace hive feet/task[unit]]
       ? card
-       > (./admit request plan finish)
-         | helm/supervisor/admitted request plan finish state index
-       > (./state request)
-         [state index (feet/task/state request state)]
        > (./snapshot_bat request read)
          = answered=[nat any nat]
              ? (Try read state)
@@ -352,20 +288,6 @@
       ; (Send member.actor (feet/task/fact binding))
       | out.snoc member.set_binding(binding)
 
-    +  tell
-      '  This function sends the epoch that a commit reached to each member
-      '  that hears. This is the push that a stream renders from. Thus no
-      '  outside code reads the log to know that a change occurred. The
-      '  function sends the epoch after the bindings and before the reply.
-      \ top=nat members=row[helm/supervisor/member]
-      ^ nat
-      | members.fold 0
-        \ ;out=nat member=helm/supervisor/member
-        ^ nat
-        ? !(member.hears) out
-        ; (Send member.actor (feet/task/committed top))
-        out
-
     +  enroll_with
       (@ s)
       '  Validate once, then spawn and transfer the bound endpoint.
@@ -387,7 +309,7 @@
       ; (SendCaps port 0 [0 foot])
       ; (SendCaps foot (feet/task/init binding 0) [port])
       ; (CloseHandle port)
-      = member (helm/supervisor/member req.pax foot binding req.hears)
+      = member (helm/supervisor/member req.pax foot binding)
       [members.snoc(member) (feet/task/ack .none)]
 
     +  advance_with
@@ -404,7 +326,6 @@
         ;updated
           ? (eq (version next) (version state)) members
           | helm/supervisor/notify_with[s] access next members
-      ; (? (eq (version next) (version state)) 0 (helm/supervisor/tell (version next) updated))
       [next next_index updated answer]
 
     +  run_keeping
@@ -426,8 +347,6 @@
            > req=helm/supervisor/register
             = ;[roster ack] (helm/supervisor/enroll_with[s] access req state members)
             [state index roster ack]
-           > card=helm/card/admit
-            | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/snapshot_bat
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/interact_bat
@@ -443,8 +362,6 @@
            > card=helm/card/step
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/steps
-            | helm/supervisor/advance_with[s] access card state index members
-           > card=helm/card/state
             | helm/supervisor/advance_with[s] access card state index members
            > card=helm/card/peek
             | helm/supervisor/advance_with[s] access card state index members
@@ -496,16 +413,9 @@
       feet/task/inspect
       feet/task/asset
       feet/task/develop
-      feet/task/admitted
       feet/task/binary
-      feet/task/committed
-      feet/task/state
       feet/task/ack
       t
-    + state
-      '  This is the answer to gift/state. It gives the world as it was when
-      '  the foot asked.
-      : request=nat state=namespace
     +  init
       '  Initial %y binding and recipient-local coordinator handle.
       '  The startup wrapper resolves parent through capability transfer.
@@ -533,12 +443,6 @@
       : request=nat status=nat body=any mime=nat
     + develop
       : request=nat status=nat body=str
-    + admitted
-      : request=nat status=nat body=str line=str
-    +  committed
-      '  This is the message that a commit reached this epoch. It goes to a
-      '  foot that is registered to hear.
-      : top=nat
     +  ack
       '  Write result: none on success, some error on rejection.
       : err=maybe[pail]
@@ -546,7 +450,6 @@
     '  Namespace requests sent to the parent supplied by task/init.
     (@ t)
     & feet/gift/interact
-      feet/gift/admit
       feet/gift/develop
       feet/gift/install
       feet/gift/poke
@@ -561,19 +464,12 @@
       feet/gift/snapshot_bat
       feet/gift/interact_bat
       feet/gift/asset
-      feet/gift/state
       t
-    + state
-      '  This is a request for the world as it is now. The answer comes as
-      '  task/state.
-      : request=nat
     +  normalize
       '  The endpoint supplies the registered location, never the foot.
       \ home=path gift=feet/gift[unit]
       ^ maybe[helm/card]
       ? gift
-       > (./admit request plan finish)
-        | ./some (helm/card/admit request plan finish)
        > (./snapshot_bat request read)
         | ./some (helm/card/snapshot_bat request read)
        > (./interact_bat request query encode)
@@ -600,11 +496,7 @@
         | ./some (helm/card/asset request home name mime)
        > (./inspect request query)
         | ./some (helm/card/inspect request query)
-       > (./state request) (./some (helm/card/state request))
       .none
-    + admit
-      : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
-        finish={\ maybe[pail] namespace}[nat str str]
     + snapshot_bat
       : request=nat read={\ namespace}[nat any nat]
     + interact_bat

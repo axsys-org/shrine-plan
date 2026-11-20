@@ -4,7 +4,6 @@
 -  shrine [order=30]
 -  lain_types [order=31]
 -  namespace [order=32]
--  reference_index [order=33]
 -  weft_std
 - graph
 '  Namespace interpretation: committed and in-flight reads, historical
@@ -192,6 +191,17 @@
   '  smaller budget of its own at /sys/view/fuel (woven_evaluate_select).
   ^  nat
   32768
++  r_parse
+  '  Parse /r/<len>/<target...>/<relative...>: the target whose
+  '  references are read, by its length, and the relative segments
+  '  that pick one edge (<slot len>/<slot...>/<holder...>).  Length-
+  '  prefixed only, like /h and /o: a target is never found by search.
+  \  requested=path
+  ^  maybe[[target=path relative=path]]
+  ?  (lt requested.len 2) .none
+  ?> (./some width) (dig_of requested.at(1)) .none
+  ?  ((eq width 0) || (lt requested.len (add width 2))) .none
+  |  ./some [requested.drop(2).take(width) requested.drop((add width 2))]
 +  store_page
   \ cr=care c=nat pax=path s=sov
   ^ res[axal[myth]]
@@ -231,22 +241,11 @@
      | ./known tree
   found
 +  namespace_reader
-  ' All callbacks of this reader get a fully qualified target. An epoch
-  ' belongs to the authority of that target. There is no epoch for the full
-  ' namespace.
-  '
-  ' edges gives the references that name a target and are open at an epoch.
-  ' Epoch 0 gives the live references. The target is as its publisher spells
-  ' it (see canonical).
-  '
-  ' freeze gives the same reader as it was at an epoch that the reader still
-  ' holds. A read of /h/<care>/e<epoch>/... uses this reader, and this
-  ' includes derived names. cut is that epoch, or 0 for a live reader. fuel is
-  ' the number of reads that a derived read can still make. trail gives the
-  ' cells that are in evaluation.
+  ' All callbacks receive a fully qualified target. An epoch belongs
+  ' to that target's authority; there is no namespace-wide epoch.
   : page={\ care nat path}res[axal[myth]]
     version={\ path}res[axal[myth]] case={\ care path}maybe[nat]
-    culled={\ path}bool edges={\ nat path}res[row[reference_edge]] canonical={\ path}path
+    culled={\ path}bool references={\ nat path}res[row[reference_edge]]
     freeze={\ nat}maybe[namespace_reader] fuel=nat cut=nat trail=row[path]
 +  sovereign_reader
   '  A reader over a namespace state: its pages, its references by epoch, its freezes, with the full fuel.
@@ -263,10 +262,8 @@
           values
             | records.run (\ record (unpin record.myth))
         | ./known values
-      = asked target
-        target state.local_name(asked)
       ?> (./some history) state.history(target) .unknown
-      = paged (store_page cr c target history)
+      = paged (store_visible cr c target history)
       '  A y or z read of the latest case beneath a record-less prefix
       '  (a folder with children and no record of its own) is the
       '  committed subtree, as sovereign_peek already answers it.
@@ -286,44 +283,79 @@
       \ target=path
       ^ res[axal[myth]]
       ? (eq target.len 0) .unknown
-      = asked target
-        target state.local_name(asked)
       ?> (./some history) state.history(target) .unknown
       | ./known (h_ver target history)
     case
       ' The current case of a path at a care, record or folder.
       \ cr=care target=path
       ^ maybe[nat]
-      | state.case(cr target)
-    edges
-      \ ep=nat target=path
-      ^ res[row[reference_edge]]
-      ? (gt ep state.local.top) .unknown
-      | ./known (reference_index/beneath target (? (eq ep state.local.top) 0 ep) state.local.references)
-    canonical
-      \ name=path
-      ^ path
-      | reference_index/canonical state.self name
+      ?> (./some history) state.history(target) .none
+      = read (store_case history)
+      | read cr target
+    references (store_references state.local)
     freeze
       \ epoch=nat
       ^ maybe[namespace_reader]
       ? ((eq epoch 0) || (gt epoch state.local.top)) .none
       = frozen state.set_local(state.local.set_top(epoch)).set_system((namespace/system_at epoch state))
       | ./some (sovereign_reader frozen).set_cut(epoch)
-  | namespace_reader page version case (store_culled state.local) edges canonical freeze read_fuel 0 []
+  | namespace_reader page version case (store_culled state.local) references freeze read_fuel 0 []
+
++ store_references
+  '  The edges that name a target as of an epoch: the index's current edges at 0 or the top epoch, the snapshot at that epoch otherwise, unknown past the kept span or beyond the top.
+  \ state=sov
+  ^ {\ nat path}res[row[reference_edge]]
+  \ epoch=nat target=path
+  ^ res[row[reference_edge]]
+  ? (gt epoch state.top) .unknown
+  = kept state.references.past.tap
+    first=nat
+      ? (eq kept.len 0) 0
+      ?> (./some n) (dig_of kept.at(0).key) 0
+      n
+  ? (and (gt epoch 0) (lt epoch first)) .unknown
+  '  A live read takes the index's current edges; only a pinned epoch unpins
+  '  a snapshot.  The snapshot at the top epoch is the current edges anyway,
+  '  and unpinning it on every read cost seconds on a long history.
+  | ./known (reference_index/beneath target (? ((eq epoch 0) || (ge epoch state.top)) 0 epoch) state.references)
+
++ reverse_triggers
+  '  What a /r read depends on: the index at its target.
+  \ requested=path
+  ^ row[dep]
+  ?> (./some address) (r_parse requested) []
+  = [target relative] address
+  | [(dep .z (r_spell target))]
 
 + woven_triggers
   '  What a run depends on: one dependency per observation it made.
-  \ answer=view_evaluation reader=namespace_reader
+  \ answer=view_evaluation
   ^ row[dep]
   | answer.observations.fold []
     \ out observed
     = ref observed.read.source
     ? (gt ref.ver 0) out
     ? (is_h ref.path) out.weld((h_version_triggers ref.path))
-    ? (is_r ref.path) out.weld((reverse_triggers ref.path reader))
+    ? (is_r ref.path) out.weld((reverse_triggers ref.path))
     | out.snoc (dep ref.care ref.path)
 
++ reverse_view
+  ' Each edge has an unambiguous address made from its slot width, slot and
+  ' holder. The complete target safe is data, so pinned and live links differ.
+  \ epoch=nat target=path reader=namespace_reader
+  ^ res[axal[myth]]
+  = read_edges reader.references
+  ?> (./known edges) (read_edges epoch target) .unknown
+  = reader (? (eq epoch 0) reader reader.set_cut(epoch))
+    root (myth/sing ['count] (pails/n edges.len))
+  | ./known
+  | edges.fold (axal/new[myth] (./some root))
+    \ out edge
+    = width=path [($u edge.slot.len)]
+      at width.weld(edge.slot).weld(edge.holder)
+      record
+        | (myth/sing ['holder] (woven_origin (safe 0 .x edge.holder) reader)).put(['slot] (pails/p edge.slot)).put(['target] edge.target)
+    | out.put at record
 +  is_h_version
   \ target=path
   ^ bool
@@ -338,96 +370,6 @@
   ? ((eq width 0) || (lt requested.len (add width 3))) []
   = target | requested.drop(3).take(width)
   [(dep .z target) (dep .z target.take(1))]
-+  reverse_view
-  ' This function answers a read of /r/<len>/<target...>. A cell or a hand
-  ' reads that path to find each record that refers to a target, and it wakes
-  ' when a reference comes or goes. The listing includes the references in
-  ' the records that this world holds for other worlds. Thus a world can find
-  ' who refers to one of its names in what a peer published to it.
-  '
-  ' This function gives the references that name a target at an epoch, as a
-  ' listing. Epoch 0 gives the live references. The listing's own record counts
-  ' the references. Each edge is a record at <slot
-  ' width>/<slot...>/<holder...>. Thus two slots of one holder, or one slot of
-  ' two holders, do not get the same path.
-  '
-  ' holder, slot and target are those of the edge. since is the epoch when the
-  ' edge appeared. The first segment of a holder is the world that asserted
-  ' it. This is also true for a mounted record, because each name is as its
-  ' publisher spells it. When a frozen reader reads the listing, a holder
-  ' keeps the snapshot of that reader (woven_origin).
-  \ epoch=nat target=path reader=namespace_reader
-  ^ res[axal[myth]]
-  = name (reader.canonical target)
-  ?> (./known found) (reader.edges epoch name) .unknown
-  = root (myth/sing ['count] (pails/n found.len))
-  | ./known
-  | found.fold (axal/new[myth] (./some root))
-    \ out=axal[myth] edge=reference_edge
-    ^ axal[myth]
-    = at=path [($u edge.slot.len)]
-      record
-        . (myth/sing ['holder] (woven_origin (safe 0 .x edge.holder) reader))
-          put(['slot] (pails/p edge.slot))
-          put(['target] edge.target)
-          put(['since] (pails/n edge.since))
-    | out.put at.weld(edge.slot).weld(edge.holder) record
-+  reverse_triggers
-  ' This function gives what a /r read depends on. This is the clock of the
-  ' listing of its target. The clock moves exactly when an edge at or below
-  ' the target appears or stops.
-  \ requested=path reader=namespace_reader
-  ^ row[dep]
-  ?> (./some address) (r_parse requested) []
-  | [(dep .z (r_spell (reader.canonical address.target)))]
-+  cell_wakes
-  ' This function gives the cells that a commit at an epoch wakes:
-  ' - each cell that the commit wrote
-  ' - each cell that holds a reference that is open at that epoch and that
-  '   reads a name that the commit changed (reference_index/readers)
-  ' - then the cells that read the /x of those cells, to the end of the chain
-  '
-  ' The function finds these cells through the reverse index. It does not scan
-  ' cells. A cell is a record that has a /sys/weft.
-  \ changes=row[[path note]] epoch=nat state=namespace
-  ^ row[path]
-  = x=path ['x]
-    none=row[[path bool]] []
-    nobody=row[path] []
-    cell
-      \ p=path
-      ^ bool
-      ?> (./some record) (sovereign_care .x p state).fil .false
-      | maybe/is_some record.get(bond/weft)
-    derived
-      \ cells=row[path]
-      ^ row[[path bool]]
-      | cells.fold none
-        \ acc=row[[path bool]] p=path
-        ^ row[[path bool]]
-        | acc.snoc([x.weld(p) .false])
-    changed
-      | changes.fold none
-        \ acc=row[[path bool]] [p q]
-        ^ row[[path bool]]
-        | acc.snoc([p ?=(.cull q)])
-    written
-      | changes.fold nobody
-        \ acc=row[path] [p q]
-        ^ row[path]
-        ? (cell p) acc.snoc(p)
-        acc
-  % frontier=row[[path bool]] changed.weld((derived written)) woke=row[path] written rounds=nat 0
-  ^ row[path]
-  ? ((eq frontier.len 0) || (eq rounds 16)) woke
-  = fresh
-      | (reference_index/readers state.self frontier epoch state.local.references).fold nobody
-        \ acc=row[path] p=path
-        ^ row[path]
-        ? (woke.any((\ w=path (equal[path] w p)))) acc
-        ? (cell p) acc.snoc(p)
-        acc
-  | _ (derived fresh) woke.weld(fresh) rounds.inc
 +  resolve_view
   '  THE derived-namespace resolver: the cr-shaped answer for pax at
   '  case c, where c=0 means latest.  Real paths answer from the
@@ -448,10 +390,11 @@
 
   ? (is_r pax)
      ?> (./some address) (r_parse pax) .unknown
-     ?> (./known tree) (reverse_view c address.target reader) .unknown
-     = below tree.dip(address.relative)
-     ? (and (gt address.relative.len 0) (and !(maybe/is_some below.fil) (eq below.kid.size 0))) .unknown
-     | ./known (sorge[myth] cr below)
+     = [target relative] address
+     ?> (./known tree) (reverse_view c target reader) .unknown
+     = subtree tree.dip(relative)
+     ? (and (gt relative.len 0) (and !(maybe/is_some subtree.fil) (eq subtree.kid.size 0))) .unknown
+     | ./known (sorge[myth] cr subtree)
 
   ? (is_h_version pax)
      ^ res[axal[myth]]
@@ -587,25 +530,6 @@
 
   = read_page reader.page
   | read_page cr c pax
-+  store_edges
-  '  This function gives the edges that the reader of a raw store answers
-  '  with: the reverse index of the store at an epoch.
-  \ s=sov
-  ^ {\ nat path}res[row[reference_edge]]
-  \ ep=nat target=path
-  ^ res[row[reference_edge]]
-  ? (gt ep s.top) .unknown
-  | ./known (reference_index/beneath target (? (eq ep s.top) 0 ep) s.references)
-+  store_names
-  '  This function is the canonical callback of a reader over a raw store
-  '  (namespace_reader). That callback gives the name that the publisher of
-  '  a record uses for it. A reader over a namespace changes a name below
-  '  /<self>/her/<publisher> to the publisher's name. A raw store has no self
-  '  and thus no mounts. As a result, this function gives each name as it is
-  '  written.
-  \ name=path
-  ^ path
-  name
 
 +  woven_start
   '  Start a plan over the whole selection.
@@ -897,7 +821,7 @@
       ? (eq target.len 0) .unknown
       | ./known (h_ver target s)
   | namespace_reader page version (store_case s) (store_culled s)
-      (store_edges s) store_names
+      (store_references s)
       (store_freeze s) read_fuel 0 []
 +  view
   '  Read a view at a care and case through a reader over the store.
@@ -1166,8 +1090,7 @@
         (\ target=path (./known (h_ver target s)))
         (store_case s)
         (store_culled s)
-        (store_edges s)
-        store_names
+        (store_references s)
         (store_freeze s) read_fuel 0 []
   | o_trigger_reader pax reader
 +  x_marks
@@ -1238,10 +1161,10 @@
   '  a watcher wakes when a reverse edge or a dynamic input moves.
   ? (woven_start record .z relative reader)
    > (./some plan)
-     | woven_triggers (woven_evaluate 0 vp .z relative reader) reader
+     | woven_triggers (woven_evaluate 0 vp .z relative reader)
   |  (live_references record).fold own
      \ acc pin=safe
-     ?  (tack_cycle vp pin.care pin.path reader) acc
+     ?  (tack_cycle vp pin.path reader) acc
      ?  (is_xv pin.path) acc.weld((xv_trigger_reader pin.path reader))
      |  acc.snoc((dep pin.care pin.path))
 +  view_fault
@@ -1300,7 +1223,7 @@
   '  that leads back here, is a cycle.
   ? (and (eq 0 pin.ver) (gt c 0))
      (view_fault "live: a live input has no pinned case")
-  ? (and (eq 0 pin.ver) (tack_cycle vp pin.care pin.path reader))
+  ? (and (eq 0 pin.ver) (tack_cycle vp pin.path reader))
      (view_fault "cycle: the input contains this cell")
   ? (reader.culled pin.path)
      (view_fault "tack: the input was culled")
@@ -1407,41 +1330,29 @@
      ? !(eq 0 pin.ver) acc
      acc.snoc(pin)
 +  tack_cycle
-  '  This function tells if a live input at target contains the cell at vp.
-  '  The input can contain the cell directly, or through a chain of live
-  '  references between cells. The walk has a limit: a walk of more than 64
-  '  edges is a cycle for this function. A plain .x ancestor reads only that
-  '  record. It does not read this descendant. Collection reads keep the
-  '  conservative containment check, because the frontier of .y can go through
-  '  any number of paths without records.
-  \  vp=path scope=care target=path reader=namespace_reader
+  '  Does a live input at target contain the cell at vp, directly or
+  '  through a chain of live references between cells?  Bounded: a
+  '  walk of more than 64 edges counts as a cycle.
+  \  vp=path target=path reader=namespace_reader
   ^  bool
-  %  i=nat 0 work=row[safe] [(safe 0 scope target)]
+  %  i=nat 0 work=row[path] [target]
   ?  (eq i 64) .true
   ?  (eq work.len 0) .false
-  =  reference work.at(0)
-     at=path reference.path
+  =  at work.at(0)
      rest work.drop(1)
-  '  An application reads all of its input. Thus the walk continues into the
-  '  input.
   ? (is_o at)
     ?> (./some overlay) (o_parse at) (_ i.inc rest)
     = [version definition input relative] overlay
-    | _ i.inc rest.snoc((safe 0 .z input))
-  ?  !(is_xv at)
-     = contains=bool
-         ? !(pith_prefix at vp) .false
-         ? reference.care
-          > .x (eq at.len vp.len)
-          > .y .true
-          > .z .true
-     | ? contains .true (_ i.inc rest)
+    | _ i.inc rest.snoc(input)
+  '  A stored input that contains the cell is a cycle, as on main: the
+  '  cell would read its own record.
+  ?  !(is_xv at) (? (pith_prefix at vp) .true (_ i.inc rest))
   ?> (./some address) (cell_address 0 at.drop(1) reader) (_ i.inc rest)
   =  [cell relative] address
   ?  (pith_prefix cell vp) .true
   ?> (./known fat) (resolve_view .x 0 cell reader) (_ i.inc rest)
   ?> (./some record) fat.fil (_ i.inc rest)
-  |  _ i.inc rest.weld((live_references record))
+  |  _ i.inc rest.weld((live_references record).map((\ pin=safe pin.path)))
 +  cell_inputs
   '  Secondary inputs: every reference slot other than the weft and the
   '  tack is read at its case and handed to the ctor as a cell_view at
@@ -1456,7 +1367,7 @@
      ? (eq_pith slot bond/tack) acc
      ?> ref=safe held acc
      ? (and (eq 0 ref.ver) (gt c 0)) (./err 'pinned)
-     ? (and (eq 0 ref.ver) (tack_cycle vp ref.care ref.path reader)) (./err 'cycle)
+     ? (and (eq 0 ref.ver) (tack_cycle vp ref.path reader)) (./err 'cycle)
      '  A live reference that resolves to nothing (a folder emptied, a
      '  table not yet filled) is an empty view, said so in the context;
      '  a pinned reference names a case that must exist.
@@ -1501,8 +1412,7 @@
         (\ target=path (./known (h_ver target s)))
         (store_case s)
         (store_culled s)
-        (store_edges s)
-        store_names
+        (store_references s)
         (store_freeze s) read_fuel 0 []
   | xv_trigger_reader pax reader
 +  peek
@@ -1601,14 +1511,13 @@
   ^ axal[myth]
   = structural | sovereign_history_prefix pax
   ? structural.wyt structural
-  ? ((is_h pax) || ((is_o pax) || ((is_xv pax) || ((is_cx pax) || (is_r pax)))))
+  ? ((is_r pax) || ((is_h pax) || ((is_o pax) || ((is_xv pax) || (is_cx pax)))))
     ? (sovereign_view .z 0 pax state)
      > (./known records) records
     | axal/new[myth] .none
   ? (eq pax.len 0)
     = records | state.root .z
     | records.run (\ record (unpin record.myth))
-  = pax state.local_name(pax)
   ?> (./some history) state.history(pax) (axal/new[myth] .none)
   | peek pax history
 +  sovereign_care
@@ -1620,7 +1529,6 @@
     = records | state.root c
     | records.run (\ record (unpin record.myth))
   ? ?=(.x c)
-    = pax state.local_name(pax)
     ? state.history(pax)
      > (./some history)
        = record=maybe[myth]

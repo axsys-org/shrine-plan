@@ -10,7 +10,8 @@
 ' - It reads the bytes of each connection and gives the packets to the rules.
 ' - It sends the packets that the rules ask it to send.
 ' - It tells the rules the time, one tick after the other.
-' - It asks the supervisor to admit the writes that the rules plan.
+' - It asks the world to admit the writes that the rules plan, one plan after
+'   the other (mesa_wire/wish).
 ' - It keeps the secret files of the foot, and it signs when the desk asks
 '   (desk.foil).
 '
@@ -64,11 +65,78 @@
   + task
     & feet/task/ack
       feet/task/fact
-      feet/task/admitted
-      feet/task/committed
-      feet/task/state
+      feet/task/binary
+      feet/task/develop
       mesa_wire/heard
       mesa_wire/tick
+      mesa_wire/wish
+  + wish
+    ' This is a plan that the rules ask the world to admit. The foot sends it
+    ' to its own mailbox. Thus each part of the foot can ask, and the loop of
+    ' the foot admits one plan at a time.
+    '
+    ' The supervisor has no card that plans and writes in one step. The foot
+    ' gets the same result with the cards that there are:
+    ' - A read card runs the plan on the world as it is at that time, and
+    '   gives the writes (mesa_wire/planning).
+    ' - A batch card admits the writes as one event.
+    ' - A second read card tells if the event is in (mesa_wire/check).
+    '
+    ' The foot sends no other plan until the second read answers. Thus each
+    ' plan reads what the plan before it wrote. No other writer writes the
+    ' names that these plans write: the mounts and the cards of the foot.
+    : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
+  + whole
+    ' This is the read that gives the world as it is now. A committed world
+    ' is in the store. Thus the transfer of the world copies no data.
+    \ state=namespace
+    ^ [nat any nat]
+    [100 state 0]
+  + world
+    ' This function gives the answer of mesa_wire/whole its type.
+    \ body=any
+    ^ namespace
+    body
+  + writes
+    ' This function gives the answer of mesa_wire/planning its type.
+    \ body=any
+    ^ row[[p=path q=writ]]
+    body
+  + planning
+    ' This function gives the read that runs a plan. The answer of the read
+    ' is one of these:
+    ' - 200, the writes, and the case of the last name that they write
+    ' - 409 and the reason, as a number, why the rules do not accept
+    ' - 500 when the plan failed
+    \ plan={\ namespace}either[iota row[[p=path q=writ]]]
+    ^ {\ namespace}[nat any nat]
+    \ state=namespace
+    ^ [nat any nat]
+    ? (Try plan state)
+     > (./err _) [500 0 0]
+     > (./ok planned)
+      ? planned
+       > (./err why) [409 0 (quip_val why)]
+       > (./ok writes)
+        ? !(writes.len) [200 writes 0]
+        = [name change] writes.at(writes.len.dec)
+        [200 writes state.case(.x name).fall(0)]
+  + check
+    ' This function gives the read that tells if a batch is in. A batch is in
+    ' when the last name that it writes has a different case.
+    \ name=path was=nat
+    ^ {\ namespace}[nat str]
+    \ state=namespace
+    ^ [nat str]
+    ? (eq was state.case(.x name).fall(0)) [409 "0"]
+    [200 ""]
+  + ask
+    ' This function sends the first plan that waits, if there is one.
+    \ parent=nat queue=row[mesa_wire/wish]
+    ^ nat
+    ? !(queue.len) 0
+    = first queue.at(0)
+    | Send parent (feet/gift/snapshot_bat first.request (mesa_wire/planning first.plan))
   + frames
     ' This function gives the bytes of one connection: the 16 bytes of the
     ' sender, and then each packet after the 4 bytes of its length. It makes a
@@ -199,15 +267,17 @@
       ? (out.any((\ item=mesa_wire/link (eq item.id want.peer.id)))) out
       = ;handle (Spawn (mesa_wire/sender want.host want.port me))
       | out.snoc((mesa_wire/link want.peer.id want.host want.port handle))
-  + answer
-    ' This function gives the result of a landing, as the supervisor's answer
-    ' contains it. The result is 200 when the world admitted the event. If
-    ' not, the result is 409 and the reason as a number.
-    \ outcome=maybe[pail] now=namespace
-    ^ [nat str str]
-    ?> (./some refusal) outcome [200 "" ""]
-    ?> (./some said) (pail/as[helm/supervisor/rejection] refusal) [409 "0" ""]
-    | [409 (nat/show (quip_val said.reason)) ""]
+  + reason
+    ' This function gives the reason that a plan gave, from the answer of the
+    ' read that ran the plan (mesa_wire/planning).
+    \ status=nat number=nat
+    ^ maybe[iota]
+    = none=maybe[iota] .none
+      unknown=iota 'net_refused
+    ? (eq status 200) none
+    ? (eq 0 number) (./some unknown)
+    = reason=iota ($ts number)
+    | ./some reason
   + why
     \ status=nat body=str
     ^ maybe[iota]
@@ -220,9 +290,9 @@
     | ./some reason
   + act
     ' This function does what the rules ask. It gives the packets of each peer
-    ' to the sender of that peer as one batch. It asks the world to admit each
-    ' landing.
-    \ parent=nat links=row[mesa_wire/link] does=row[mesa_foot/effect]
+    ' to the sender of that peer as one batch. It puts each plan in the
+    ' mailbox of the foot (mesa_wire/wish).
+    \ links=row[mesa_wire/link] does=row[mesa_foot/effect]
     ^ nat
     = empty=row[nat] []
       ;sent
@@ -243,7 +313,7 @@
       \ ;done=nat effect=mesa_foot/effect
       ^ nat
       ?> (./admit request plan) effect done
-      ; (Send parent (feet/gift/admit request plan mesa_wire/answer))
+      ; (Send 0 (mesa_wire/wish request plan))
       done.inc
   + marked
     ' This function gives the rift and the highest announced epoch that a mark
@@ -353,23 +423,23 @@
     ' here and leaves the secret as text in io/mesa/out/session for the person
     ' who is at the machine. Then it asks the world for the grant for that
     ' secret (desk/first).
-    \ parent=nat links=row[mesa_wire/link] k=desk/keys state=namespace foot=mesa_foot/foot
+    \ links=row[mesa_wire/link] k=desk/keys state=namespace foot=mesa_foot/foot
     ^ nat
     = ;folder (Folder "io/mesa/out")
       ;fresh (Entropy 32)
       token (nat/show fresh)
       ;wrote (WriteFile "io/mesa/out/session" (add (str/to_atom token) (bex (mul 8 token.len))))
       turn (desk/first k token (div (Now 0) 1000000000) state foot)
-    ; (mesa_wire/act parent links turn.does)
+    ; (mesa_wire/act links turn.does)
     1
   + born
     ' With this function, a world that was started under a name keeps the
     ' founding that its host left for it (desk/founded).
-    \ parent=nat links=row[mesa_wire/link] given=nat foot=mesa_foot/foot
+    \ links=row[mesa_wire/link] given=nat foot=mesa_foot/foot
     ^ nat
     = text (str/from_atom (mod given (bex (mul 8 (dec (wid given))))))
       turn (desk/founded text foot)
-    ; (mesa_wire/act parent links turn.does)
+    ; (mesa_wire/act links turn.does)
     1
   + desk
     ' This function answers the asks that the world holds for the desk of its
@@ -383,7 +453,7 @@
     ' under a name that someone else minted. If the file is there, the world
     ' keeps the founding and waits for a claim. If there is no file, the world
     ' is its own and gets its first session.
-    \ parent=nat links=row[mesa_wire/link] live=nat state=namespace foot=mesa_foot/foot
+    \ links=row[mesa_wire/link] live=nat state=namespace foot=mesa_foot/foot
     ^ nat
     = asks (desk/pending foot.self state)
       used (desk/used foot.self state)
@@ -392,11 +462,11 @@
     = home (pass/kept (mesa_foot/home foot) state).fall(myth/new)
       ;given (? (and lone (eq 0 home.nat_at(['seq] 0))) (mesa_wire/took "io/mesa/founding") 0)
       prepared (gt (wid given) 1)
-      ;kept (? prepared (mesa_wire/born parent links given foot) 0)
+      ;kept (? prepared (mesa_wire/born links given foot) 0)
       ;custody (? (and (eq 0 asks.len) !lone) 0 (mesa_wire/secret (mesa_wire/named home.txt_at(['custody_file]) "io/mesa/custody")))
       ;maker (? (eq 0 asks.len) 0 (mesa_wire/secret (mesa_wire/named home.txt_at(['maker]) "io/mesa/maker")))
       k (desk/keys live custody maker)
-      ;opened (? (and (and lone !prepared) (desk/own k state foot)) (mesa_wire/opening parent links k state foot) 0)
+      ;opened (? (and (and lone !prepared) (desk/own k state foot)) (mesa_wire/opening links k state foot) 0)
       ;answered
         | asks.fold 0
           \ ;done=nat item=[at=path ask=myth]
@@ -406,7 +476,7 @@
             ;given (? (eq 0 n) 0 (mesa_wire/took (mesa_wire/handed n)))
             ;left (? (equal[str] ask.txt_at(['want]) "link") (mesa_wire/leave k ask.nat_at(['id] 0)) 0)
             turn (desk/answer k given where ask state foot)
-          ; (mesa_wire/act parent links turn.does)
+          ; (mesa_wire/act links turn.does)
           done.inc
     | used.fold answered
       \ ;done=nat item=[at=path handed=nat]
@@ -415,7 +485,7 @@
         ;folder (Folder "io/mesa/in")
         ;emptied (WriteFile (mesa_wire/handed n) 1)
         gone=row[[p=path q=writ]] [[where (writ/poke (myth/sing ['spent] (pails/n 1)))]]
-      ; (mesa_wire/act parent links (desk/say gone foot).does)
+      ; (mesa_wire/act links (desk/say gone foot).does)
       done.inc
   + run
     ' This function is the foot. It waits for the world as it is now, and
@@ -443,14 +513,14 @@
     ? (eq 0 (mesa_wire/public seed))
       ; (Trace ["mesa foot: the ring file holds no seed" ring] 0)
       0
-    ; (Send init.parent (feet/gift/state 0))
+    ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
     = ;world
         % ignored=nat 0
         ^ namespace
         = ;[message caps] (Recv[mesa_wire/task] 0)
         ; (helm/supervisor/close_caps caps)
-        ?> (./state request held) message (_ 0)
-        held
+        ?> (./binary request status body mime) message (_ 0)
+        | mesa_wire/world body
       ;was (mesa_wire/marked file)
       rift (? (lt world.local.top was.top) was.rift.inc was.rift)
       ;noted (mesa_wire/remark file rift (nmax was.top world.local.top))
@@ -470,8 +540,8 @@
     ; (Trace ["mesa foot listening" port] 0)
     = begun (mesa_foot/start world.self seed rift first.map((\ item=mesa_wire/route item.peer)))
       ;opening (mesa_foot/tick (div (Now 0) 1000000) world begun)
-    ; (mesa_wire/act init.parent links opening.does)
-    ; (mesa_wire/desk init.parent links seed world opening.foot)
+    ; (mesa_wire/act links opening.does)
+    ; (mesa_wire/desk links seed world opening.foot)
     % foot=mesa_foot/foot opening.foot
       view=namespace world
       reach=row[mesa_wire/link] links
@@ -482,6 +552,7 @@
       mute=bool silent
       at=nat port
       ear=nat door
+      queue=row[mesa_wire/wish] []
     = ;[message caps] (Recv[mesa_wire/task] 0)
       helper
         ? message
@@ -491,20 +562,41 @@
     ; (? (and helper (gt caps.len 0)) (Send caps.at(0) (? left 0 1)) 0)
     ; (helm/supervisor/close_caps caps)
     ? (and helper (eq left 1)) (? (eq 0 ear) 0 (CloseFd ear))
-    ? (and helper (gt left 1)) (_ foot view reach top beat left.dec key mute at ear)
-    ? (gt left 0) (_ foot view reach top beat left key mute at ear)
-    ? (and mute helper) (_ foot view reach top beat left key mute at ear)
+    ? (and helper (gt left 1)) (_ foot view reach top beat left.dec key mute at ear queue)
+    ? (gt left 0) (_ foot view reach top beat left key mute at ear queue)
+    ? (and mute helper) (_ foot view reach top beat left key mute at ear queue)
     ? message
-     > (./committed epoch)
-      ; (Send init.parent (feet/gift/state epoch))
-      | _ foot view reach top beat left key mute at ear
-     > (./state request held)
-      = ;turn (mesa_foot/turned held foot)
-        ;higher (nmax top held.local.top)
-      ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
-      ; (mesa_wire/act init.parent reach turn.does)
-      ; (mesa_wire/desk init.parent reach key held turn.foot)
-      | _ turn.foot held reach higher beat left key mute at ear
+     > wanted=mesa_wire/wish
+      ; (? (queue.len) 0 (mesa_wire/ask init.parent [wanted]))
+      | _ foot view reach top beat left key mute at ear queue.snoc(wanted)
+     > (./binary request status body mime)
+      ? (eq status 100)
+        = held (mesa_wire/world body)
+        ? (eq held.local.top view.local.top) (_ foot view reach top beat left key mute at ear queue)
+        = ;turn (mesa_foot/turned held foot)
+          ;higher (nmax top held.local.top)
+        ; (? (gt higher top) (mesa_wire/remark file foot.rift higher) 0)
+        ; (mesa_wire/act reach turn.does)
+        ; (mesa_wire/desk reach key held turn.foot)
+        | _ turn.foot held reach higher beat left key mute at ear queue
+      ? (and (eq status 200) (gt (mesa_wire/writes body).len 0))
+        = planned (mesa_wire/writes body)
+          [name change] planned.at(planned.len.dec)
+        ; (Send init.parent (feet/gift/batch planned))
+        ; (Send init.parent (feet/gift/snapshot request (mesa_wire/check name mime)))
+        | _ foot view reach top beat left key mute at ear queue
+      = ;turn (mesa_foot/landed request (mesa_wire/reason status mime) foot)
+        rest queue.drop(1)
+      ; (mesa_wire/act reach turn.does)
+      ; (mesa_wire/ask init.parent rest)
+      | _ turn.foot view reach top beat left key mute at ear rest
+     > (./develop request status body)
+      = ;turn (mesa_foot/landed request (mesa_wire/why status body) foot)
+        rest queue.drop(1)
+      ; (mesa_wire/act reach turn.does)
+      ; (mesa_wire/ask init.parent rest)
+      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
+      | _ turn.foot view reach top beat left key mute at ear rest
      > (./fact binding)
       = wish (mesa_wire/own binding).nat_at(['port] 0)
         opens (and (eq 0 at) (gt wish 0))
@@ -515,7 +607,7 @@
       ? (mesa_wire/stopped binding)
         ; (mesa_wire/wake now mesa_foot/acceptors)
         ; (mesa_wire/wire me no_routes reach)
-        | _ foot view no_links top beat (? (eq 0 now) 1 (add 1 mesa_foot/acceptors)) key mute now heard
+        | _ foot view no_links top beat (? (eq 0 now) 1 (add 1 mesa_foot/acceptors)) key mute now heard queue
       = wanted (mesa_wire/routes binding)
         peers wanted.map((\ item=mesa_wire/route item.peer))
         ;next (mesa_wire/wire me wanted reach)
@@ -524,11 +616,11 @@
         want own.nat_at(['key] 0)
         ;fresh (? (and stated !(eq want (mesa_wire/public key))) (ReadFile ring) key)
         agrees (? stated (eq want (mesa_wire/public fresh)) .true)
-      ? !agrees (_ foot view next top beat left key .true now heard)
-      ? (and (eq fresh key) (and !mute (equal[row[mesa_foot/peer]] peers foot.peers))) (_ foot view next top beat left key mute now heard)
+      ? !agrees (_ foot view next top beat left key .true now heard queue)
+      ? (and (eq fresh key) (and !mute (equal[row[mesa_foot/peer]] peers foot.peers))) (_ foot view next top beat left key mute now heard queue)
       = ;again (mesa_foot/tick (div (Now 0) 1000000) view (mesa_foot/start view.self fresh foot.rift peers))
-      ; (mesa_wire/act init.parent next again.does)
-      | _ again.foot view next top beat left fresh .false now heard
+      ; (mesa_wire/act next again.does)
+      | _ again.foot view next top beat left fresh .false now heard queue
      > carried=mesa_wire/heard
       = ;turn
           | carried.packets.fold (mesa_foot/quiet foot)
@@ -538,19 +630,16 @@
               \ now=mesa_foot/foot
               ^ mesa_foot/turn
               | mesa_foot/heard carried.from packet view now
-      ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat left key mute at ear
+      ; (mesa_wire/act reach turn.does)
+      | _ turn.foot view reach top beat left key mute at ear queue
      > time=mesa_wire/tick
       = again (eq 0 (mod beat.inc mesa_foot/every))
         ;turn (? again (mesa_foot/tick time.now view foot) (mesa_foot/clock time.now view foot))
-      ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat.inc left key mute at ear
-     > (./admitted request status body line)
-      = ;turn (mesa_foot/landed request (mesa_wire/why status body) foot)
-      ; (mesa_wire/act init.parent reach turn.does)
-      | _ turn.foot view reach top beat left key mute at ear
-     > (./ack err) (_ foot view reach top beat left key mute at ear)
-    | _ foot view reach top beat left key mute at ear
+      ; (mesa_wire/act reach turn.does)
+      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
+      | _ turn.foot view reach top beat.inc left key mute at ear queue
+     > (./ack err) (_ foot view reach top beat left key mute at ear queue)
+    | _ foot view reach top beat left key mute at ear queue
   + here
     ^ path
     []
@@ -623,15 +712,15 @@
     | mesa_wire/submit server target (writ/make myth/new)
   + start
     ' This function starts the foot of a world: it makes sure that the record
-    ' /<self>/io/mesa is there, and it registers the foot at that path. The
-    ' foot hears each commit. A world calls this function one time, when it
+    ' /<self>/io/mesa is there, and it registers the foot at that path. A
+    ' world calls this function one time, when it
     ' starts. The mesa mount is the switch that makes a world call it.
     \ server=nat self=iota arguments=row[str]
     ^ nat
     = home=path [self 'io 'mesa]
     ? !(mesa_wire/present server home)
       (error (pails/t "Mesa foot record refused"))
-    = registration | helm/supervisor/register home mesa_wire/run .true
+    = registration | helm/supervisor/register home mesa_wire/run
     ; (SendCaps server registration [0])
     = ;[reply caps] | Recv[feet/task[unit]] 0
     ; | helm/supervisor/close_caps caps
