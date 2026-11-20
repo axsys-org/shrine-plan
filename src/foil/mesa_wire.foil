@@ -66,26 +66,36 @@
     & feet/task/ack
       feet/task/fact
       feet/task/binary
-      feet/task/develop
       mesa_wire/heard
       mesa_wire/tick
       mesa_wire/wish
   + wish
-    ' This is a plan that the rules ask the world to admit. The foot sends it
-    ' to its own mailbox. Thus each part of the foot can ask, and the loop of
-    ' the foot admits one plan at a time.
+    ' This is a write that a part of the foot asks for. The foot sends it to
+    ' its own mailbox. Thus each part of the foot can ask, and the loop of
+    ' the foot does one write at a time.
     '
-    ' The supervisor has no card that plans and writes in one step. The foot
-    ' gets the same result with the cards that there are:
-    ' - A read card runs the plan on the world as it is at that time, and
-    '   gives the writes (mesa_wire/planning).
-    ' - A batch card admits the writes as one event.
-    ' - A second read card tells if the event is in (mesa_wire/check).
+    ' The foot has one way to write: a poke on its node, /<self>/io/mesa. The
+    ' hand of the node makes the writes in the event of that poke (net/talk).
+    ' The answer to the poke is the answer of the kernel to the event. The
+    ' foot sends no other poke until that answer comes. Thus each answer is
+    ' the answer to the first wish that waits.
     '
-    ' The foot sends no other plan until the second read answers. Thus each
-    ' plan reads what the plan before it wrote. No other writer writes the
-    ' names that these plans write: the mounts and the cards of the foot.
-    : request=nat plan={\ namespace}either[iota row[[p=path q=writ]]]
+    ' A wish holds what to poke (word), or it holds a plan. A plan is a
+    ' function of the world that gives writes. The foot runs a plan with a
+    ' read card on the world as it is at that time, and then pokes the writes
+    ' (net/batch).
+    : request=nat ready=bool word=myth plan={\ namespace}either[iota row[[p=path q=writ]]]
+  + idle
+    ' This is the plan of a wish that holds a word.
+    \ state=namespace
+    ^ either[iota row[[p=path q=writ]]]
+    = none=row[[p=path q=writ]] []
+    | ./ok none
+  + say
+    ' This function gives the wish that pokes a word on the node of the foot.
+    \ request=nat word=myth
+    ^ mesa_wire/wish
+    | mesa_wire/wish request .true word mesa_wire/idle
   + whole
     ' This is the read that gives the world as it is now. A committed world
     ' is in the store. Thus the transfer of the world copies no data.
@@ -105,7 +115,7 @@
   + planning
     ' This function gives the read that runs a plan. The answer of the read
     ' is one of these:
-    ' - 200, the writes, and the case of the last name that they write
+    ' - 200 and the writes
     ' - 409 and the reason, as a number, why the rules do not accept
     ' - 500 when the plan failed
     \ plan={\ namespace}either[iota row[[p=path q=writ]]]
@@ -117,25 +127,15 @@
      > (./ok planned)
       ? planned
        > (./err why) [409 0 (quip_val why)]
-       > (./ok writes)
-        ? !(writes.len) [200 writes 0]
-        = [name change] writes.at(writes.len.dec)
-        [200 writes state.case(.x name).fall(0)]
-  + check
-    ' This function gives the read that tells if a batch is in. A batch is in
-    ' when the last name that it writes has a different case.
-    \ name=path was=nat
-    ^ {\ namespace}[nat str]
-    \ state=namespace
-    ^ [nat str]
-    ? (eq was state.case(.x name).fall(0)) [409 "0"]
-    [200 ""]
+       > (./ok writes) [200 writes 0]
   + ask
-    ' This function sends the first plan that waits, if there is one.
+    ' This function starts the first wish that waits, if there is one. It
+    ' pokes the word of the wish, or it runs the plan of the wish.
     \ parent=nat queue=row[mesa_wire/wish]
     ^ nat
     ? !(queue.len) 0
     = first queue.at(0)
+    ? first.ready (Send parent (feet/gift/pass mesa_wire/here (writ/poke first.word)))
     | Send parent (feet/gift/snapshot_bat first.request (mesa_wire/planning first.plan))
   + frames
     ' This function gives the bytes of one connection: the 16 bytes of the
@@ -279,15 +279,15 @@
     = reason=iota ($ts number)
     | ./some reason
   + why
-    \ status=nat body=str
+    ' This function gives the reason that the kernel gave when it did not
+    ' accept a poke. It gives none when the kernel accepted the poke.
+    \ err=maybe[pail]
     ^ maybe[iota]
     = none=maybe[iota] .none
       unknown=iota 'net_refused
-    ? (eq status 200) none
-    ?> (./some n) (nat/parse body) (./some unknown)
-    ? (eq 0 n) (./some unknown)
-    = reason=iota ($ts n)
-    | ./some reason
+    ?> (./some refusal) err none
+    ?> (./some said) (pail/as[helm/supervisor/rejection] refusal) (./some unknown)
+    | ./some said.reason
   + act
     ' This function does what the rules ask. It gives the packets of each peer
     ' to the sender of that peer as one batch. It puts each plan in the
@@ -312,9 +312,14 @@
     | does.fold sent
       \ ;done=nat effect=mesa_foot/effect
       ^ nat
-      ?> (./admit request plan) effect done
-      ; (Send 0 (mesa_wire/wish request plan))
-      done.inc
+      ? effect
+       > (./admit request plan)
+        ; (Send 0 (mesa_wire/wish request .false myth/new plan))
+        done.inc
+       > (./land request item)
+        ; (Send 0 (mesa_wire/say request (myth/sing ['land] item)))
+        done.inc
+      done
   + marked
     ' This function gives the rift and the highest announced epoch that a mark
     ' file holds. It gives zeros when there is no mark file at that time.
@@ -535,8 +540,8 @@
       helpers (? (eq 0 port) 1 (add 1 mesa_foot/acceptors))
     ; (SendCaps clock 0 [0])
     ; (? (eq 0 port) 0 (mesa_wire/listen door mesa_foot/acceptors))
-    ; (? claimed 0 (Send init.parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['key] (pails/n (Ed25519PublicKey seed)))))))
-    ; (? (eq 0 given) 0 (Send init.parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['port] (pails/n given)).put(['host] (pails/t host))))))
+    ; (? claimed 0 (Send 0 (mesa_wire/say 0 (myth/sing ['key] (pails/n (Ed25519PublicKey seed))))))
+    ; (? (eq 0 given) 0 (Send 0 (mesa_wire/say 0 (myth/sing ['port] (pails/n given)).put(['host] (pails/t host)))))
     ; (Trace ["mesa foot listening" port] 0)
     = begun (mesa_foot/start world.self seed rift first.map((\ item=mesa_wire/route item.peer)))
       ;opening (mesa_foot/tick (div (Now 0) 1000000) world begun)
@@ -580,22 +585,12 @@
         ; (mesa_wire/desk reach key held turn.foot)
         | _ turn.foot held reach higher beat left key mute at ear queue
       ? (and (eq status 200) (gt (mesa_wire/writes body).len 0))
-        = planned (mesa_wire/writes body)
-          [name change] planned.at(planned.len.dec)
-        ; (Send init.parent (feet/gift/batch planned))
-        ; (Send init.parent (feet/gift/snapshot request (mesa_wire/check name mime)))
+        ; (Send init.parent (feet/gift/pass mesa_wire/here (writ/poke (myth/sing ['do] (net/batch (mesa_wire/writes body))))))
         | _ foot view reach top beat left key mute at ear queue
       = ;turn (mesa_foot/landed request (mesa_wire/reason status mime) foot)
         rest queue.drop(1)
       ; (mesa_wire/act reach turn.does)
       ; (mesa_wire/ask init.parent rest)
-      | _ turn.foot view reach top beat left key mute at ear rest
-     > (./develop request status body)
-      = ;turn (mesa_foot/landed request (mesa_wire/why status body) foot)
-        rest queue.drop(1)
-      ; (mesa_wire/act reach turn.does)
-      ; (mesa_wire/ask init.parent rest)
-      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
       | _ turn.foot view reach top beat left key mute at ear rest
      > (./fact binding)
       = wish (mesa_wire/own binding).nat_at(['port] 0)
@@ -638,7 +633,14 @@
       ; (mesa_wire/act reach turn.does)
       ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
       | _ turn.foot view reach top beat.inc left key mute at ear queue
-     > (./ack err) (_ foot view reach top beat left key mute at ear queue)
+     > (./ack err)
+      ? !(queue.len) (_ foot view reach top beat left key mute at ear queue)
+      = ;turn (mesa_foot/landed queue.at(0).request (mesa_wire/why err) foot)
+        rest queue.drop(1)
+      ; (mesa_wire/act reach turn.does)
+      ; (mesa_wire/ask init.parent rest)
+      ; (Send init.parent (feet/gift/snapshot_bat 0 mesa_wire/whole))
+      | _ turn.foot view reach top beat left key mute at ear rest
     | _ foot view reach top beat left key mute at ear queue
   + here
     ^ path
@@ -710,16 +712,28 @@
     ^ bool
     ? (mesa_wire/submit server target (writ/poke myth/new)) .true
     | mesa_wire/submit server target (writ/make myth/new)
+  + seat
+    ' This function gives the node of the foot its hand. It makes the record
+    ' that holds the hand (net/form), and it puts the behaviour and the crew
+    ' on the node (net/seat). It does this at each start. Thus the node has
+    ' the hand of the code that runs.
+    \ server=nat self=iota
+    ^ bool
+    = home=path [self 'io 'mesa]
+    ? !(mesa_wire/submit server (net/hand self) (writ/make (form/card net/form (lore/line "The hand of the Mesa foot")))) .false
+    | mesa_wire/submit server home (writ/poke (net/seat self))
   + start
     ' This function starts the foot of a world: it makes sure that the record
-    ' /<self>/io/mesa is there, and it registers the foot at that path. A
-    ' world calls this function one time, when it
-    ' starts. The mesa mount is the switch that makes a world call it.
+    ' /<self>/io/mesa is there and has its hand, and it registers the foot at
+    ' that path. A world calls this function one time, when it starts. The
+    ' mesa mount is the switch that makes a world call it.
     \ server=nat self=iota arguments=row[str]
     ^ nat
     = home=path [self 'io 'mesa]
     ? !(mesa_wire/present server home)
       (error (pails/t "Mesa foot record refused"))
+    ? !(mesa_wire/seat server self)
+      (error (pails/t "Mesa foot hand refused"))
     = registration | helm/supervisor/register home mesa_wire/run
     ; (SendCaps server registration [0])
     = ;[reply caps] | Recv[feet/task[unit]] 0
