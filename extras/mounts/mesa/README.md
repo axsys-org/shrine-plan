@@ -9,9 +9,12 @@ Registers the foot at `/<self>/io/mesa`: the one place a world meets other world
 
 What is published to one peer is sealed for that peer; what is public is sent as it is; every page is signed.
 A world publishes what it writes beneath `/<self>/our/<peer>` to that peer and beneath `/<self>/our/public` to
-everyone it knows. A reader holds a publisher's names at `/<self>/her/<publisher>`, with the content that was published, and
-keeps where each mount stands below the card, at `/<self>/io/mesa/<publisher>/stand`. A peer is a card with a
-`key`, a `host` and a `port`. The foot reads the card and does not write it.
+everyone it knows. A reader holds a publisher's names under those same names, in a store that it keeps for
+that publisher beside its own (`namespace.peers`): what `A` writes at `/A/our/B/doc`, `B` reads at
+`/A/our/B/doc`. That store is not part of the reader's names, and the reader runs no behaviour and judges no
+contract in it. What the reader knows about it is in the reader's own records below the card: where each root
+stands (`/<self>/io/mesa/<publisher>/stand`) and what the publisher said of each name (`.../said/...`). A peer
+is a card with a `key`, a `host` and a `port`. The foot reads the card and does not write it.
 
 Nothing outside tells a world anything. The foot's record, `/<self>/io/mesa`, says where its two files are
 kept (`ring`, the seed; `mark`, the rift and the highest epoch it announced; both in `io/mesa/` under the

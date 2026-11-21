@@ -610,16 +610,16 @@ published. The rules are pure (`src/foil/net.foil`); one foot, registered at
 | Term | Meaning |
 |---|---|
 | published root | `/<self>/our/<peer>`: what this world publishes to one peer. `/<self>/our/public`: to every peer it knows. |
-| mount | `/<self>/her/<publisher>`: where a reader holds a publisher's root, name for name (`/A/our/B` is `/B/her/A`). The public root is held at `/<self>/her/<publisher>/public`. A held record runs none of the reader's behaviours. |
-| card | `/<self>/io/mesa/<publisher>`: who a publisher is and where it is reached (`key`, `host`, `port`). The networking believes the `key` and does not write the card: the one that decides whose key is whose writes it. Where the mount stands (`head`, or `refused` and `why`) is a record below the card, `stand` (`public` for the public root), and the foot writes it. |
+| peer store | One store for each publisher, beside the world's own (`namespace.peers`). It holds the publisher's names as the publisher spells them: what `A` publishes at `/A/our/B`, `B` reads at `/A/our/B`. It is not part of `B`'s names, `B` does not write it, and the kernel runs no behaviour and judges no contract there. Its cases count what `B` received. It advances only by the land command (`helm/card/land`), which also makes `B`'s own writes about it in the same admission. A node of `B` whose crew names a name of `A` hears when it changes. |
+| card | `/<self>/io/mesa/<publisher>`: who a publisher is and where it is reached (`key`, `host`, `port`). The networking believes the `key` and does not write the card: the one that decides whose key is whose writes it. Where a root stands (`head`, or `refused` and `why`) is a record below the card, `stand` (`public` for the public root), and the foot writes it. |
 | stamp | a published version: rift × 2^32 + case. A restore raises the rift, so a stamp names one content for ever. |
-| moment | the statement "this name of this world, at this stamp, is the content with this hash", signed by the publisher. The reader keeps it as a record of its own at `/<self>/io/mesa/<publisher>/said/...` (stamp, signature, content hash), beside the card and with its own case. The record that landed is an ordinary record of the reader with a local case; its content is the publisher's, byte for byte, so its pin has the publisher's hash. |
-| epic (between worlds) | a consistent change of one published root from one stamp to another, signed as a whole. It travels without its records; each record follows by its content hash. It lands as one event or not at all. |
+| moment | the statement "this name of this world, at this stamp, is the content with this hash", signed by the publisher. The reader keeps it as a record of its own at `/<self>/io/mesa/<publisher>/said/...` (stamp, signature, content hash), beside the card and with its own case. The record that landed is in the peer store, with a case of that store; its content is the publisher's, byte for byte., so its pin has the publisher's hash. |
+| epic (between worlds) | a consistent change of one published root from one stamp to another, signed as a whole. It travels without its records; each record follows by its content hash. It lands as one admission or not at all. |
 | hint | a packet that says where a root stands. It is not believed: its receiver compares and then reads. |
 | sealed | what is published to one peer is sealed for that peer under a key the two derive, each from its own seed and the other's public key. A page is bound to its name, and a pin is asked for by a keyed alias of its hash. What is public is sent as it is. |
 | slice | a page longer than Mesa carries as one (1 MiB) is read in slices and put together before it is opened or checked. |
 
-What a reader refuses, it refuses whole and notes on the card: an epic from a world whose key it does not hold
-(`net_stranger`), one that key did not sign (`net_forged`), one that reaches outside its root (`net_outside`),
-one with a record missing or unsound (`net_missing`, `net_unfit`), and one the kernel's own contracts reject. The mount is left as it was and a later epic
-lands from where it stands.
+What a reader refuses, it refuses whole and notes beside the card: an epic from a world whose key it does not
+hold (`net_stranger`), one that key did not sign (`net_forged`), one for a name of its own (`net_outside`), and
+one with a record missing or unsound (`net_missing`, `net_unfit`). The peer store is left as it was and a later
+epic lands from where the root stands.
